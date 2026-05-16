@@ -35,6 +35,8 @@ const OBSIDIAN_PLUGINS = [
   { id: "obsidian-kanban", name: "Kanban", purpose: "Board view for goals, follow-ups, and work states" },
   { id: "obsidian-icon-folder", name: "Iconize", purpose: "Icons for folders, files, and note labels" },
   { id: "obsidian-mind-map", name: "Mind Map", purpose: "Markdown heading trees as interactive mind maps" },
+  { id: "smart-connections", name: "Smart Connections", purpose: "RAG-based automated semantic note linking" },
+  { id: "smart-composer", name: "Smart Composer", purpose: "AI chat and composing with vault context and MCP support" },
 ];
 
 export interface BootstrapProjectOptions {
@@ -474,6 +476,11 @@ export class MemoryBootstrapService {
         "- Kanban boards live in `12_Kanban/`.",
         "- Iconize can decorate the numbered folders.",
         "- Mind Map notes live in `14_Mindmaps/` and should use heading hierarchy.",
+        "",
+        "## AI / Smart Stack",
+        "",
+        "- Smart Composer provides writing assistance and chat using vault context and MCP support.",
+        "- Smart Connections uses RAG to automatically find and link related notes across the vault.",
         "",
       ].join("\n")],
       ["00_Index/AI-Client-Setup.md", frontmatter({

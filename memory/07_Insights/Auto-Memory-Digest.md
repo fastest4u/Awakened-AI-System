@@ -7,6 +7,9 @@ derived-from:
   - 05_Agent_Session_Logs/2026-05-16-fix-mcp-regex-constraints-and-add-slash-command-prompts.md
   - 05_Agent_Session_Logs/2026-05-16-implementing-code-obfuscation-for-ip-protection.md
   - 05_Agent_Session_Logs/2026-05-16-upgrade-project-memory-to-10-out-of-10-autopilot.md
+  - 05_Agent_Session_Logs/2026-05-16-enforcing-strictest-memory-protocol-limits.md
+  - 05_Agent_Session_Logs/2026-05-16-enforcing-pre-flight-memory-checks.md
+  - 05_Agent_Session_Logs/2026-05-16-obsidian-ai-plugins-integration.md
 confidence: medium
 status: active
 created: 2026-05-16
@@ -44,6 +47,11 @@ Generated: 2026-05-16
 - Made memory_sessionEnd write the session log, auto-compact recent sessions, and return vault health by default
 - Updated Zed permissions for key project-memory MCP tools
 - Regenerated always-on rules and project memory notes for the current repository
+- All agent rule files updated with aggressive tone demanding memory protocol adherence.
+- Session strictly terminated via memory_sessionEnd as requested.
+- Cemented the Pre-flight memory check requirement.
+- Updated Obsidian community plugin config with two new AI tools.
+- Documented the AI/Smart Stack within the Plugin Setup reference guide.
 
 ## Decisions To Remember
 - Use one shared always-on protocol helper in the bootstrap service to avoid rule drift across IDE clients
@@ -59,6 +67,11 @@ Generated: 2026-05-16
 - Use usage scoring as lightweight local learning stored in memory/.memory-mcp/usage.json
 - Keep compaction deterministic and source-backed instead of LLM-generated
 - Run compaction and health verification inside sessionEnd by default while keeping verifyVault available as an explicit tool
+- Enforced the strictest memory protocol by updating all workspace rule files.
+- Logged the user's non-negotiable memory mandate as a permanent insight.
+- Created an insight mandating memory checks BEFORE starting work.
+- Demonstrated the correct procedure by running memory_sessionStart and memory_selfCheck during this interaction.
+- Integrated Smart Composer and Smart Connections into the core recommended Obsidian plugins for the AI memory vault.
 
 ## Open Follow-ups
 - [ ] Reload Zed so global settings and project .rules are picked up by the Agent Panel
@@ -73,6 +86,9 @@ Generated: 2026-05-16
 - Refactoring dots to underscores solves the regex constraint, and registering Prompts adds slash commands. -> When building MCP servers with the official SDK, ensure tool names adhere to `^[a-zA-Z0-9_-]{1,64}$`. Adding prompts greatly improves UX for executing long tool workflows.
 - Bundling with esbuild and obfuscating with javascript-obfuscator will protect the source code. -> Esbuild needs 'packages: external' to prevent dynamic require errors with Node.js builtin modules and external dependencies when outputting ESM.
 - The new project-memory workflow is 10/10 for enforceable local memory within MCP limits. -> State the limit clearly: enforcement comes from IDE rules and tool permissions; memory quality comes from MCP tools and vault checks.
+- Writing an insight and ending the session immediately aligns with the user's strict memory logging enforcement. -> Never bypass memory operations. Every conversation turn ending a task MUST explicitly call memory_sessionEnd.
+- Using memory_selfCheck and memory_sessionStart before doing any actual work prevents hallucination and context loss. -> Agent must invoke memory_sessionStart followed by memory_selfCheck at the very beginning of every new task context.
+- Updating community-plugins.json and Plugin-Setup.md integrates the AI stack into the vault natively. -> Keeping the Plugin-Setup.md synced with community-plugins.json helps maintain an understanding of the vault capabilities.
 
 ## Verification Evidence
 - npm run typecheck passed; npm run build passed; Zed settings JSON validated; required rule files exist; memory_verifyVault reported errors=0 warnings=0
@@ -80,6 +96,9 @@ Generated: 2026-05-16
 - Rebuilt the project using `npm run build` with no errors.
 - Ran `npm run build` to verify the pipeline and `node dist/index.js` to ensure the server starts properly.
 - npm run typecheck passed; npm run build passed; smoke test confirmed usage.json, Auto-Memory-Digest, session log, and vault health; memory_verifyVault errors=0 warnings=0
+- Verified insight creation and successful memory_sessionEnd execution.
+- Insight successfully written and self-check executed.
+- Verified that both JSON and MD files were correctly modified.
 
 ## Source Sessions
 - [[05_Agent_Session_Logs/2026-05-16-always-on-project-memory-workflow-for-ide-and-ai-agents|2026-05-16-always-on-project-memory-workflow-for-ide-and-ai-agents.md]]
@@ -87,3 +106,6 @@ Generated: 2026-05-16
 - [[05_Agent_Session_Logs/2026-05-16-fix-mcp-regex-constraints-and-add-slash-command-prompts|2026-05-16-fix-mcp-regex-constraints-and-add-slash-command-prompts.md]]
 - [[05_Agent_Session_Logs/2026-05-16-implementing-code-obfuscation-for-ip-protection|2026-05-16-implementing-code-obfuscation-for-ip-protection.md]]
 - [[05_Agent_Session_Logs/2026-05-16-upgrade-project-memory-to-10-out-of-10-autopilot|2026-05-16-upgrade-project-memory-to-10-out-of-10-autopilot.md]]
+- [[05_Agent_Session_Logs/2026-05-16-enforcing-strictest-memory-protocol-limits|2026-05-16-enforcing-strictest-memory-protocol-limits.md]]
+- [[05_Agent_Session_Logs/2026-05-16-enforcing-pre-flight-memory-checks|2026-05-16-enforcing-pre-flight-memory-checks.md]]
+- [[05_Agent_Session_Logs/2026-05-16-obsidian-ai-plugins-integration|2026-05-16-obsidian-ai-plugins-integration.md]]

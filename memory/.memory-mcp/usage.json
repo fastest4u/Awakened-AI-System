@@ -1,13 +1,13 @@
 {
   "version": 1,
-  "updatedAt": "2026-05-16T05:25:43.085Z",
+  "updatedAt": "2026-05-16T05:56:06.669Z",
   "records": {
     "00_Index/Memory-Autopilot.md": {
       "path": "00_Index/Memory-Autopilot.md",
-      "selectedCount": 2,
+      "selectedCount": 4,
       "contexts": {
         "10": 2,
-        "memory": 2,
+        "memory": 4,
         "autopilot": 1,
         "usage": 1,
         "scoring": 1,
@@ -16,45 +16,67 @@
         "mcp": 1,
         "ide": 1,
         "workflow": 1,
-        "strict-pr-review": 2
+        "strict-pr-review": 2,
+        "rule": 2,
+        "enforcement": 2,
+        "and": 2,
+        "verification": 2,
+        "obsidian": 2,
+        "plugin": 2,
+        "configuration": 2
       },
-      "lastSelectedAt": "2026-05-16T05:25:43.085Z"
+      "lastSelectedAt": "2026-05-16T05:54:15.017Z"
     },
     "05_Agent_Session_Logs/2026-05-16-always-on-project-memory-workflow-for-ide-and-ai-agents.md": {
       "path": "05_Agent_Session_Logs/2026-05-16-always-on-project-memory-workflow-for-ide-and-ai-agents.md",
-      "selectedCount": 2,
+      "selectedCount": 4,
       "contexts": {
         "10": 2,
-        "memory": 2,
+        "memory": 4,
         "autopilot": 1,
         "usage": 1,
         "scoring": 1,
         "auto": 1,
         "compaction": 1,
-        "mcp": 1,
+        "mcp": 3,
         "ide": 1,
         "workflow": 1,
-        "strict-pr-review": 2
+        "strict-pr-review": 2,
+        "rule": 2,
+        "enforcement": 2,
+        "and": 2,
+        "verification": 2,
+        "bootstrap": 2,
+        "analysis": 2
       },
-      "lastSelectedAt": "2026-05-16T05:25:43.085Z"
+      "lastSelectedAt": "2026-05-16T05:56:06.669Z"
     },
     "05_Agent_Session_Logs/2026-05-16-bootstrap-project-local-obsidian-memory-mcp-and-ide-integration-pack.md": {
       "path": "05_Agent_Session_Logs/2026-05-16-bootstrap-project-local-obsidian-memory-mcp-and-ide-integration-pack.md",
-      "selectedCount": 2,
+      "selectedCount": 5,
       "contexts": {
         "10": 2,
-        "memory": 2,
+        "memory": 4,
         "autopilot": 1,
         "usage": 1,
         "scoring": 1,
         "auto": 1,
         "compaction": 1,
-        "mcp": 1,
+        "mcp": 3,
         "ide": 1,
         "workflow": 1,
-        "strict-pr-review": 2
+        "strict-pr-review": 2,
+        "rule": 2,
+        "enforcement": 2,
+        "and": 2,
+        "verification": 2,
+        "obsidian": 2,
+        "plugin": 2,
+        "configuration": 2,
+        "bootstrap": 2,
+        "analysis": 2
       },
-      "lastSelectedAt": "2026-05-16T05:25:43.085Z"
+      "lastSelectedAt": "2026-05-16T05:56:06.669Z"
     },
     "01_Project_Rules/Always-On-Memory-Protocol.md": {
       "path": "01_Project_Rules/Always-On-Memory-Protocol.md",
@@ -76,28 +98,37 @@
     },
     "13_Diagrams/Memory-System-Map.md": {
       "path": "13_Diagrams/Memory-System-Map.md",
-      "selectedCount": 2,
+      "selectedCount": 5,
       "contexts": {
         "10": 2,
-        "memory": 2,
+        "memory": 4,
         "autopilot": 1,
         "usage": 1,
         "scoring": 1,
         "auto": 1,
         "compaction": 1,
-        "mcp": 1,
+        "mcp": 3,
         "ide": 1,
         "workflow": 1,
-        "strict-pr-review": 2
+        "strict-pr-review": 2,
+        "rule": 2,
+        "enforcement": 2,
+        "and": 2,
+        "verification": 2,
+        "obsidian": 2,
+        "plugin": 2,
+        "configuration": 2,
+        "bootstrap": 2,
+        "analysis": 2
       },
-      "lastSelectedAt": "2026-05-16T05:25:43.085Z"
+      "lastSelectedAt": "2026-05-16T05:56:06.669Z"
     },
     "00_Index/Memory-Digest.md": {
       "path": "00_Index/Memory-Digest.md",
-      "selectedCount": 1,
+      "selectedCount": 2,
       "contexts": {
         "10": 2,
-        "memory": 2,
+        "memory": 4,
         "autopilot": 1,
         "usage": 1,
         "scoring": 1,
@@ -105,16 +136,20 @@
         "compaction": 1,
         "mcp": 1,
         "ide": 1,
-        "workflow": 1
+        "workflow": 1,
+        "rule": 2,
+        "enforcement": 2,
+        "and": 2,
+        "verification": 2
       },
-      "lastSelectedAt": "2026-05-16T04:37:48.249Z"
+      "lastSelectedAt": "2026-05-16T05:44:47.645Z"
     },
     "14_Mindmaps/Memory-Mindmap.md": {
       "path": "14_Mindmaps/Memory-Mindmap.md",
-      "selectedCount": 2,
+      "selectedCount": 4,
       "contexts": {
         "10": 2,
-        "memory": 2,
+        "memory": 4,
         "autopilot": 1,
         "usage": 1,
         "scoring": 1,
@@ -123,13 +158,20 @@
         "mcp": 1,
         "ide": 1,
         "workflow": 1,
-        "strict-pr-review": 2
+        "strict-pr-review": 2,
+        "rule": 2,
+        "enforcement": 2,
+        "and": 2,
+        "verification": 2,
+        "obsidian": 2,
+        "plugin": 2,
+        "configuration": 2
       },
-      "lastSelectedAt": "2026-05-16T05:25:43.085Z"
+      "lastSelectedAt": "2026-05-16T05:54:15.017Z"
     },
     "AGENT-IDENTITY.md": {
       "path": "AGENT-IDENTITY.md",
-      "selectedCount": 2,
+      "selectedCount": 4,
       "contexts": {
         "10": 2,
         "memory": 2,
@@ -138,12 +180,17 @@
         "scoring": 1,
         "auto": 1,
         "compaction": 1,
-        "mcp": 1,
+        "mcp": 3,
         "ide": 1,
         "workflow": 1,
-        "strict-pr-review": 2
+        "strict-pr-review": 2,
+        "obsidian": 2,
+        "plugin": 2,
+        "configuration": 2,
+        "bootstrap": 2,
+        "analysis": 2
       },
-      "lastSelectedAt": "2026-05-16T05:25:43.085Z"
+      "lastSelectedAt": "2026-05-16T05:56:06.669Z"
     },
     "12_Kanban/Memory-Kanban.md": {
       "path": "12_Kanban/Memory-Kanban.md",
@@ -164,29 +211,108 @@
     },
     "AGENTS.md": {
       "path": "AGENTS.md",
-      "selectedCount": 2,
+      "selectedCount": 5,
       "contexts": {
         "10": 2,
-        "memory": 2,
+        "memory": 4,
         "autopilot": 1,
         "usage": 1,
         "scoring": 1,
         "auto": 1,
         "compaction": 1,
-        "mcp": 1,
+        "mcp": 3,
         "ide": 1,
         "workflow": 1,
-        "strict-pr-review": 2
+        "strict-pr-review": 2,
+        "rule": 2,
+        "enforcement": 2,
+        "and": 2,
+        "verification": 2,
+        "obsidian": 2,
+        "plugin": 2,
+        "configuration": 2,
+        "bootstrap": 2,
+        "analysis": 2
       },
-      "lastSelectedAt": "2026-05-16T05:25:43.085Z"
+      "lastSelectedAt": "2026-05-16T05:56:06.669Z"
     },
     "00_Index/Goals.md": {
       "path": "00_Index/Goals.md",
+      "selectedCount": 2,
+      "contexts": {
+        "strict-pr-review": 2,
+        "obsidian": 2,
+        "plugin": 2,
+        "configuration": 2
+      },
+      "lastSelectedAt": "2026-05-16T05:54:15.017Z"
+    },
+    "07_Insights/mandatory-always-record-memory-at-task-completion.md": {
+      "path": "07_Insights/mandatory-always-record-memory-at-task-completion.md",
       "selectedCount": 1,
       "contexts": {
-        "strict-pr-review": 2
+        "rule": 2,
+        "enforcement": 2,
+        "and": 2,
+        "memory": 2,
+        "verification": 2
       },
-      "lastSelectedAt": "2026-05-16T05:25:43.085Z"
+      "lastSelectedAt": "2026-05-16T05:44:47.645Z"
+    },
+    "00_Index/Inbox.md": {
+      "path": "00_Index/Inbox.md",
+      "selectedCount": 1,
+      "contexts": {
+        "rule": 2,
+        "enforcement": 2,
+        "and": 2,
+        "memory": 2,
+        "verification": 2
+      },
+      "lastSelectedAt": "2026-05-16T05:44:47.645Z"
+    },
+    "00_Index/Plugin-Setup.md": {
+      "path": "00_Index/Plugin-Setup.md",
+      "selectedCount": 1,
+      "contexts": {
+        "obsidian": 2,
+        "plugin": 2,
+        "configuration": 2
+      },
+      "lastSelectedAt": "2026-05-16T05:54:15.017Z"
+    },
+    "04_Architecture_Decisions/adr-obfuscate-production-build-using-esbuild-and-javascript-obfuscator.md": {
+      "path": "04_Architecture_Decisions/adr-obfuscate-production-build-using-esbuild-and-javascript-obfuscator.md",
+      "selectedCount": 2,
+      "contexts": {
+        "obsidian": 2,
+        "plugin": 2,
+        "configuration": 2,
+        "mcp": 2,
+        "bootstrap": 2,
+        "analysis": 2
+      },
+      "lastSelectedAt": "2026-05-16T05:56:06.669Z"
+    },
+    "05_Agent_Session_Logs/2026-05-16-fix-mcp-regex-constraints-and-add-slash-command-prompts.md": {
+      "path": "05_Agent_Session_Logs/2026-05-16-fix-mcp-regex-constraints-and-add-slash-command-prompts.md",
+      "selectedCount": 1,
+      "contexts": {
+        "mcp": 2,
+        "bootstrap": 2,
+        "analysis": 2
+      },
+      "lastSelectedAt": "2026-05-16T05:56:06.669Z"
+    },
+    "00_Index/AI-Client-Setup.md": {
+      "path": "00_Index/AI-Client-Setup.md",
+      "selectedCount": 1,
+      "contexts": {
+        "mcp": 2,
+        "bootstrap": 2,
+        "analysis": 2
+      },
+      "lastSelectedAt": "2026-05-16T05:56:06.669Z"
     }
   }
 }
