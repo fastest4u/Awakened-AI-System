@@ -1,0 +1,24 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "instructions": [
+    "AGENTS.md",
+    ".rules",
+    "memory/AGENTS.md",
+    "memory/01_Project_Rules/Always-On-Memory-Protocol.md",
+    "memory/00_Index/Retrieval-Protocol.md",
+    "memory/00_Index/AI-Client-Setup.md"
+  ],
+  "mcp": {
+    "project-memory": {
+      "type": "local",
+      "command": [
+        "node",
+        "C:/Users/Server/Desktop/Awakened-AI-System/dist/index.js"
+      ],
+      "enabled": true,
+      "environment": {
+        "MEMORY_PROJECT_ROOT": "C:/Users/Server/Desktop/Awakened-AI-System"
+      }
+    }
+  }
+}

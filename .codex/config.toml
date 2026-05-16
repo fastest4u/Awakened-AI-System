@@ -1,0 +1,9 @@
+[mcp_servers.project-memory]
+command = "node"
+args = ["C:/Users/Server/Desktop/Awakened-AI-System/dist/index.js"]
+startup_timeout_sec = 20
+tool_timeout_sec = 60
+enabled = true
+
+[mcp_servers.project-memory.env]
+MEMORY_PROJECT_ROOT = "C:/Users/Server/Desktop/Awakened-AI-System"

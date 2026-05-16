@@ -1,0 +1,25 @@
+{
+  "name": "awakened-ai-memory-mcp",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "MCP server for an Obsidian-based memory vault",
+  "main": "dist/index.js",
+  "scripts": {
+    "dev": "npm run build && node dist/index.js",
+    "start": "node dist/index.js",
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "lint": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "fast-glob": "^3.3.3",
+    "gray-matter": "^4.0.3",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@types/node": "^20.17.32",
+    "typescript": "^5.8.3"
+  }
+}

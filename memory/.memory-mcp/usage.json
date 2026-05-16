@@ -1,0 +1,192 @@
+{
+  "version": 1,
+  "updatedAt": "2026-05-16T05:25:43.085Z",
+  "records": {
+    "00_Index/Memory-Autopilot.md": {
+      "path": "00_Index/Memory-Autopilot.md",
+      "selectedCount": 2,
+      "contexts": {
+        "10": 2,
+        "memory": 2,
+        "autopilot": 1,
+        "usage": 1,
+        "scoring": 1,
+        "auto": 1,
+        "compaction": 1,
+        "mcp": 1,
+        "ide": 1,
+        "workflow": 1,
+        "strict-pr-review": 2
+      },
+      "lastSelectedAt": "2026-05-16T05:25:43.085Z"
+    },
+    "05_Agent_Session_Logs/2026-05-16-always-on-project-memory-workflow-for-ide-and-ai-agents.md": {
+      "path": "05_Agent_Session_Logs/2026-05-16-always-on-project-memory-workflow-for-ide-and-ai-agents.md",
+      "selectedCount": 2,
+      "contexts": {
+        "10": 2,
+        "memory": 2,
+        "autopilot": 1,
+        "usage": 1,
+        "scoring": 1,
+        "auto": 1,
+        "compaction": 1,
+        "mcp": 1,
+        "ide": 1,
+        "workflow": 1,
+        "strict-pr-review": 2
+      },
+      "lastSelectedAt": "2026-05-16T05:25:43.085Z"
+    },
+    "05_Agent_Session_Logs/2026-05-16-bootstrap-project-local-obsidian-memory-mcp-and-ide-integration-pack.md": {
+      "path": "05_Agent_Session_Logs/2026-05-16-bootstrap-project-local-obsidian-memory-mcp-and-ide-integration-pack.md",
+      "selectedCount": 2,
+      "contexts": {
+        "10": 2,
+        "memory": 2,
+        "autopilot": 1,
+        "usage": 1,
+        "scoring": 1,
+        "auto": 1,
+        "compaction": 1,
+        "mcp": 1,
+        "ide": 1,
+        "workflow": 1,
+        "strict-pr-review": 2
+      },
+      "lastSelectedAt": "2026-05-16T05:25:43.085Z"
+    },
+    "01_Project_Rules/Always-On-Memory-Protocol.md": {
+      "path": "01_Project_Rules/Always-On-Memory-Protocol.md",
+      "selectedCount": 2,
+      "contexts": {
+        "10": 2,
+        "memory": 2,
+        "autopilot": 1,
+        "usage": 1,
+        "scoring": 1,
+        "auto": 1,
+        "compaction": 1,
+        "mcp": 1,
+        "ide": 1,
+        "workflow": 1,
+        "strict-pr-review": 2
+      },
+      "lastSelectedAt": "2026-05-16T05:25:43.085Z"
+    },
+    "13_Diagrams/Memory-System-Map.md": {
+      "path": "13_Diagrams/Memory-System-Map.md",
+      "selectedCount": 2,
+      "contexts": {
+        "10": 2,
+        "memory": 2,
+        "autopilot": 1,
+        "usage": 1,
+        "scoring": 1,
+        "auto": 1,
+        "compaction": 1,
+        "mcp": 1,
+        "ide": 1,
+        "workflow": 1,
+        "strict-pr-review": 2
+      },
+      "lastSelectedAt": "2026-05-16T05:25:43.085Z"
+    },
+    "00_Index/Memory-Digest.md": {
+      "path": "00_Index/Memory-Digest.md",
+      "selectedCount": 1,
+      "contexts": {
+        "10": 2,
+        "memory": 2,
+        "autopilot": 1,
+        "usage": 1,
+        "scoring": 1,
+        "auto": 1,
+        "compaction": 1,
+        "mcp": 1,
+        "ide": 1,
+        "workflow": 1
+      },
+      "lastSelectedAt": "2026-05-16T04:37:48.249Z"
+    },
+    "14_Mindmaps/Memory-Mindmap.md": {
+      "path": "14_Mindmaps/Memory-Mindmap.md",
+      "selectedCount": 2,
+      "contexts": {
+        "10": 2,
+        "memory": 2,
+        "autopilot": 1,
+        "usage": 1,
+        "scoring": 1,
+        "auto": 1,
+        "compaction": 1,
+        "mcp": 1,
+        "ide": 1,
+        "workflow": 1,
+        "strict-pr-review": 2
+      },
+      "lastSelectedAt": "2026-05-16T05:25:43.085Z"
+    },
+    "AGENT-IDENTITY.md": {
+      "path": "AGENT-IDENTITY.md",
+      "selectedCount": 2,
+      "contexts": {
+        "10": 2,
+        "memory": 2,
+        "autopilot": 1,
+        "usage": 1,
+        "scoring": 1,
+        "auto": 1,
+        "compaction": 1,
+        "mcp": 1,
+        "ide": 1,
+        "workflow": 1,
+        "strict-pr-review": 2
+      },
+      "lastSelectedAt": "2026-05-16T05:25:43.085Z"
+    },
+    "12_Kanban/Memory-Kanban.md": {
+      "path": "12_Kanban/Memory-Kanban.md",
+      "selectedCount": 1,
+      "contexts": {
+        "10": 2,
+        "memory": 2,
+        "autopilot": 1,
+        "usage": 1,
+        "scoring": 1,
+        "auto": 1,
+        "compaction": 1,
+        "mcp": 1,
+        "ide": 1,
+        "workflow": 1
+      },
+      "lastSelectedAt": "2026-05-16T04:37:48.249Z"
+    },
+    "AGENTS.md": {
+      "path": "AGENTS.md",
+      "selectedCount": 2,
+      "contexts": {
+        "10": 2,
+        "memory": 2,
+        "autopilot": 1,
+        "usage": 1,
+        "scoring": 1,
+        "auto": 1,
+        "compaction": 1,
+        "mcp": 1,
+        "ide": 1,
+        "workflow": 1,
+        "strict-pr-review": 2
+      },
+      "lastSelectedAt": "2026-05-16T05:25:43.085Z"
+    },
+    "00_Index/Goals.md": {
+      "path": "00_Index/Goals.md",
+      "selectedCount": 1,
+      "contexts": {
+        "strict-pr-review": 2
+      },
+      "lastSelectedAt": "2026-05-16T05:25:43.085Z"
+    }
+  }
+}
