@@ -6,6 +6,8 @@ const baseListSchema = z.object({
   offset: z.number().int().nonnegative().default(0),
 });
 
+const contextPackModeSchema = z.enum(["auto", "coding", "debugging", "review", "deploy", "planning", "docs"]);
+
 export const searchInputSchema = z.object({
   query: z.string().min(1),
   tags: z.array(z.string()).default([]),
@@ -182,6 +184,7 @@ export const bootstrapProjectInputSchema = z.object({
 
 export const sessionStartInputSchema = z.object({
   taskArea: z.string().optional(),
+  mode: contextPackModeSchema.default("auto"),
   recentLimit: z.number().int().positive().max(10).default(5),
   maxItems: z.number().int().positive().max(30).default(12),
   maxChars: z.number().int().positive().max(20000).default(6000),
@@ -190,12 +193,13 @@ export const sessionStartInputSchema = z.object({
 export const contextPackInputSchema = z.object({
   query: z.string().optional(),
   taskArea: z.string().optional(),
+  mode: contextPackModeSchema.default("auto"),
   maxItems: z.number().int().positive().max(30).default(10),
   maxChars: z.number().int().positive().max(20000).default(5000),
-  includeRecentSessions: z.boolean().default(true),
-  includeMistakes: z.boolean().default(true),
-  includeAdrs: z.boolean().default(true),
-  includeRunbooks: z.boolean().default(true),
+  includeRecentSessions: z.boolean().optional(),
+  includeMistakes: z.boolean().optional(),
+  includeAdrs: z.boolean().optional(),
+  includeRunbooks: z.boolean().optional(),
 });
 
 export const sessionEndInputSchema = z.object({
@@ -223,6 +227,18 @@ export const selfCheckInputSchema = z.object({
   task: z.string().min(1),
   area: z.string().optional(),
   riskLevel: z.enum(["low", "medium", "high"]).default("medium"),
+});
+
+export const lifecycleStatusInputSchema = z.object({
+  includeHistory: z.boolean().default(false),
+});
+
+export const followUpRadarInputSchema = z.object({
+  query: z.string().optional(),
+  taskArea: z.string().optional(),
+  mode: contextPackModeSchema.default("auto"),
+  folders: z.array(z.string()).default([]),
+  limit: z.number().int().positive().max(100).default(20),
 });
 
 export const awakenInputSchema = z.object({

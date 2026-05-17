@@ -7,3 +7,6 @@ enabled = true
 
 [mcp_servers.project-memory.env]
 MEMORY_PROJECT_ROOT = "C:/Users/Server/Desktop/Awakened-AI-System"
+
+[mcp_servers.project-memory.tools.memory_sessionStart]
+approval_mode = "approve"

@@ -1,5 +1,5 @@
 import type { z } from "zod";
-import { awakenInputSchema, contextPackInputSchema, selfCheckInputSchema, sessionEndInputSchema, sessionStartInputSchema } from "../schemas/memory.js";
+import { awakenInputSchema, contextPackInputSchema, followUpRadarInputSchema, lifecycleStatusInputSchema, selfCheckInputSchema, sessionEndInputSchema, sessionStartInputSchema } from "../schemas/memory.js";
 import type { MemoryWorkflowService } from "../services/memory-workflow.service.js";
 import type { ToolResponseService } from "../services/tool-response.service.js";
 
@@ -8,10 +8,12 @@ export class WorkflowController {
 
   register(server: { registerTool: Function, registerPrompt?: Function }) {
     server.registerTool("memory_sessionStart", { description: "Load SPX-style startup context for the current project and update lightweight usage scoring.", inputSchema: sessionStartInputSchema, annotations: {} }, this.sessionStart.bind(this));
-    server.registerTool("memory_contextPack", { description: "Build a token-budgeted SPX-style context pack for a task and learn which notes are selected.", inputSchema: contextPackInputSchema, annotations: {} }, this.contextPack.bind(this));
+    server.registerTool("memory_contextPack", { description: "Build a token-budgeted SPX-style context pack for a task using auto, coding, debugging, review, deploy, planning, or docs mode.", inputSchema: contextPackInputSchema, annotations: {} }, this.contextPack.bind(this));
     server.registerTool("memory_awaken", { description: "Assess memory state, risks, and next actions from vault evidence.", inputSchema: awakenInputSchema, annotations: {} }, this.awaken.bind(this));
     server.registerTool("memory_selfCheck", { description: "Run an SPX-style confidence and mistake-awareness checklist before risky work.", inputSchema: selfCheckInputSchema, annotations: { readOnlyHint: true, idempotentHint: true } }, this.selfCheck.bind(this));
     server.registerTool("memory_sessionEnd", { description: "Close meaningful work by writing a session log.", inputSchema: sessionEndInputSchema, annotations: { destructiveHint: true } }, this.sessionEnd.bind(this));
+    server.registerTool("memory_lifecycleStatus", { description: "Inspect the current memory lifecycle guardrail state and recent quality gates.", inputSchema: lifecycleStatusInputSchema, annotations: { readOnlyHint: true, idempotentHint: true } }, this.lifecycleStatus.bind(this));
+    server.registerTool("memory_followUpRadar", { description: "Find relevant open follow-ups from unchecked tasks and follow-up sections across the memory vault.", inputSchema: followUpRadarInputSchema, annotations: { readOnlyHint: true, idempotentHint: true } }, this.followUpRadar.bind(this));
 
     if (server.registerPrompt) {
       server.registerPrompt("session_start", {
@@ -43,13 +45,13 @@ export class WorkflowController {
   async sessionStart(input: z.infer<typeof sessionStartInputSchema>) {
     const startedAt = Date.now();
     const context = await this.workflows.sessionStart(input);
-    return this.responses.buildOk("memory_sessionStart", startedAt, context);
+    return this.responses.buildOk("memory_sessionStart", startedAt, context, context.lifecycle.warnings);
   }
 
   async contextPack(input: z.infer<typeof contextPackInputSchema>) {
     const startedAt = Date.now();
     const result = await this.workflows.contextPack(input);
-    return this.responses.buildOk("memory_contextPack", startedAt, result);
+    return this.responses.buildOk("memory_contextPack", startedAt, result, result.lifecycle.warnings);
   }
 
   async awaken(input: z.infer<typeof awakenInputSchema>) {
@@ -61,12 +63,24 @@ export class WorkflowController {
   async selfCheck(input: z.infer<typeof selfCheckInputSchema>) {
     const startedAt = Date.now();
     const result = await this.workflows.selfCheck(input);
-    return this.responses.buildOk("memory_selfCheck", startedAt, result);
+    return this.responses.buildOk("memory_selfCheck", startedAt, result, result.lifecycle.warnings);
   }
 
   async sessionEnd(input: z.infer<typeof sessionEndInputSchema>) {
     const startedAt = Date.now();
     const result = await this.workflows.sessionEnd(input);
-    return this.responses.buildOk("memory_sessionEnd", startedAt, result);
+    return this.responses.buildOk("memory_sessionEnd", startedAt, result, result.qualityGate.warnings);
+  }
+
+  async lifecycleStatus(input: z.infer<typeof lifecycleStatusInputSchema>) {
+    const startedAt = Date.now();
+    const result = await this.workflows.lifecycleStatus(input);
+    return this.responses.buildOk("memory_lifecycleStatus", startedAt, result);
+  }
+
+  async followUpRadar(input: z.infer<typeof followUpRadarInputSchema>) {
+    const startedAt = Date.now();
+    const result = await this.workflows.followUpRadar(input);
+    return this.responses.buildOk("memory_followUpRadar", startedAt, result);
   }
 }

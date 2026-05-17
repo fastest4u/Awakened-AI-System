@@ -11,6 +11,8 @@ import { NoteRepository } from "./repositories/note.repository.js";
 import { AuditService } from "./services/audit.service.js";
 import { MemoryCompactionService } from "./services/memory-compaction.service.js";
 import { MemoryBootstrapService } from "./services/memory-bootstrap.service.js";
+import { MemoryFollowUpService } from "./services/memory-follow-up.service.js";
+import { MemoryLifecycleService } from "./services/memory-lifecycle.service.js";
 import { MemoryQueryService } from "./services/memory-query.service.js";
 import { MemoryTemplateService } from "./services/memory-template.service.js";
 import { MemoryUsageService } from "./services/memory-usage.service.js";
@@ -35,7 +37,9 @@ export async function bootstrap() {
   const health = new VaultHealthService(vault);
   const usage = new MemoryUsageService(vaultRoot);
   const compactor = new MemoryCompactionService(query, notes);
-  const workflows = new MemoryWorkflowService(vault, query, health, notes, templates, audit, usage, compactor);
+  const lifecycle = new MemoryLifecycleService(vaultRoot);
+  const followUps = new MemoryFollowUpService(vault);
+  const workflows = new MemoryWorkflowService(vault, query, health, notes, templates, audit, usage, compactor, lifecycle, followUps);
 
   new NoteController(query, responses).register(server);
   new WriteController(notes, responses, audit, templates).register(server);
