@@ -1,8 +1,4 @@
 ---
-description: strict-pr-review-8-category
----
-
----
 name: strict-pr-review-8-category
 description: ดำเนิน workflow ตรวจโค้ดแบบเข้มงวดผ่าน Pull Request โดยอัตโนมัติ — ตรวจ uncommitted/unpushed commits, จัดการ branch strategy, push, สร้าง PR ผ่าน GitHub MCP, รีวิวโค้ด 8 หมวดพร้อมจัดระดับ P0-P3, แก้ไขอัตโนมัติ, สรุปผลภาษาไทย, และ merge เฉพาะเมื่อไม่มีประเด็นค้าง. ใช้สำหรับโปรเจกต์ Awakened-AI-System (MCP Server).
 ---
