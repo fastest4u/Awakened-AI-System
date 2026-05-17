@@ -117,7 +117,7 @@ git push
 ### 5) Maintainability & Readability
 
 - **P2**: TypeScript ในโปรเจกต์นี้ใช้ `moduleResolution: "NodeNext"` ดังนั้นการ import ไฟล์ local **ต้องมีนามสกุล `.js` ต่อท้าย** (เช่น `import { env } from './env.js'`)
-- SRP — ไม่ให้ไฟล์ยาวเกินความจำเป็น 
+- SRP — ไม่ให้ไฟล์ยาวเกินความจำเป็น
 
 ### 6) Architecture & Design (MCP Server Rules)
 
@@ -187,4 +187,3 @@ PR: #<number> — <link>
 
 1. **ห้าม merge เด็ดขาด**
 2. แจ้ง user เพื่อขอคำตัดสินใจ
-
