@@ -256,7 +256,7 @@ export class MemoryLifecycleService {
     ];
 
     return {
-      ok: missingRequiredSteps.length === 0 && score >= 85 && (!health || health.errors === 0),
+      ok: missingRequiredSteps.length === 0 && score >= 85 && health !== null && health.errors === 0,
       score,
       grade: this.grade(score),
       riskyWork,
@@ -284,6 +284,7 @@ export class MemoryLifecycleService {
     if (missingRequiredSteps.includes("memory_contextPack")) actions.push("Retrieve a task-specific memory_contextPack before making changes.");
     if (missingRequiredSteps.includes("memory_selfCheck")) actions.push("Run memory_selfCheck before risky or multi-file work.");
     if (warnings.some((warning) => warning.includes("verification note"))) actions.push("Record the concrete build, test, or manual verification result in sessionEnd.verification.");
+    if (warnings.some((warning) => warning.includes("vault verification ran"))) actions.push("Run memory_verifyVault or end with verify enabled before considering the session complete.");
     if (health && health.warnings > 0) actions.push("Review vault warnings or create explicit follow-ups for deferred cleanup.");
     if (actions.length === 0) actions.push("Lifecycle quality gate passed; continue with normal memory hygiene.");
     return actions;

@@ -104,7 +104,7 @@ export class MemoryFollowUpService {
 
     for (const file of files) {
       const path = this.vault.relativePath(file);
-      if (folders.length > 0 && !folders.some((folder) => path.includes(folder))) continue;
+      if (folders.length > 0 && !folders.some((folder) => this.matchesFolder(path, folder))) continue;
       scannedFiles += 1;
       const note = this.vault.load(path);
       const title = String(note.parsed.data.title ?? basename(file, ".md"));
@@ -230,6 +230,11 @@ export class MemoryFollowUpService {
       deduped.push(candidate);
     }
     return deduped;
+  }
+
+  private matchesFolder(path: string, folder: string) {
+    const normalized = folder.replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
+    return normalized.length === 0 || path === normalized || path.startsWith(`${normalized}/`);
   }
 
   private isFollowUpHeading(value?: string) {
