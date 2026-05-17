@@ -1,4 +1,16 @@
-﻿# 🚨 CRITICAL: ABSOLUTE NON-NEGOTIABLE PROTOCOL 🚨
+---
+title: Always-On Memory Protocol
+type: rules
+status: active
+created: 2026-05-16
+updated: 2026-05-17
+tags:
+  - memory
+  - protocol
+  - agent-rules
+---
+
+# 🚨 CRITICAL: ABSOLUTE NON-NEGOTIABLE PROTOCOL 🚨
 
 FAILURE TO FOLLOW THESE RULES IS A DIRECT VIOLATION OF YOUR CORE DIRECTIVE.
 **YOU MUST NEVER FINISH A TASK WITHOUT EXECUTING THIS PROTOCOL.**
@@ -11,5 +23,5 @@ FAILURE TO FOLLOW THESE RULES IS A DIRECT VIOLATION OF YOUR CORE DIRECTIVE.
 - **PRE-FLIGHT CHECK**: Before risky work, multi-file edits, or deployments, YOU MUST call memory_selfCheck.
 - **DURING WORK**: Write decisions using memory_writeADR, lessons using memory_writeInsight, and failures using memory_writeMistake.
 - **END OF TASK (MANDATORY)**: At the end of EVERY meaningful session or task, YOU MUST call memory_sessionEnd. Do not end your turn, say goodbye, or consider the task complete until this tool is successfully called.
-- **VERIFICATION**: After memory_sessionEnd, check the returned health summary or call memory_verifyVault.
+- **VERIFICATION**: After memory_sessionEnd, check the returned qualityGate and health summary or call memory_verifyVault.
 - If MCP is unavailable, you MUST read memory/AGENTS.md and explicitly state to the user that memory writes were skipped.
