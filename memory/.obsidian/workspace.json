@@ -13,12 +13,12 @@
             "state": {
               "type": "markdown",
               "state": {
-                "file": "00_Index/Inbox.md",
+                "file": "README.md",
                 "mode": "source",
                 "source": false
               },
               "icon": "lucide-file",
-              "title": "Inbox"
+              "title": "README"
             }
           }
         ]
@@ -185,6 +185,16 @@
   },
   "active": "03b4b935771ff9c4",
   "lastOpenFiles": [
+    "05_Agent_Session_Logs/2026-05-23-add-kiro-to-ide-product-dirs.md",
+    "05_Agent_Session_Logs/2026-05-23-add-zed-sqlite-workspace-detection.md",
+    "04_Architecture_Decisions/add-zed-sqlite-workspace-detection.md",
+    "AGENTS.md",
+    "README.md",
+    "05_Agent_Session_Logs/2026-05-23-extend-workspace-detection-to-antigravity-and-opencode.md",
+    "04_Architecture_Decisions/extend-workspace-detection-to-antigravity-and-opencode.md",
+    "05_Agent_Session_Logs/2026-05-23-add-ide-state-based-workspace-auto-detection-to-memory-config.md",
+    "04_Architecture_Decisions/add-ide-state-based-workspace-auto-detection.md",
+    "00_Index/Inbox.md",
     "00_Index/Goals.md",
     "00_Index/Daily-Notes.md",
     "00_Index/AI-Client-Setup.md"

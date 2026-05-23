@@ -1,0 +1,1208 @@
+{
+  "version": 1,
+  "updatedAt": "2026-05-23T15:53:33.365Z",
+  "activeSession": {
+    "id": "memory-1779551613360",
+    "startedAt": "2026-05-23T15:53:33.360Z",
+    "updatedAt": "2026-05-23T15:53:33.365Z",
+    "startedBy": "memory_sessionStart",
+    "counts": {
+      "sessionStart": 1,
+      "contextPack": 1,
+      "selfCheck": 0,
+      "sessionEnd": 0
+    },
+    "events": [
+      {
+        "tool": "memory_sessionStart",
+        "at": "2026-05-23T15:53:33.361Z",
+        "details": {}
+      },
+      {
+        "tool": "memory_contextPack",
+        "at": "2026-05-23T15:53:33.365Z",
+        "details": {}
+      }
+    ],
+    "missingSessionStart": false
+  },
+  "recentSessions": [
+    {
+      "id": "memory-1779531131060",
+      "startedAt": "2026-05-23T10:12:11.060Z",
+      "updatedAt": "2026-05-23T10:12:48.134Z",
+      "taskArea": "zed project-memory mcp config",
+      "startedBy": "memory_sessionStart",
+      "counts": {
+        "sessionStart": 1,
+        "contextPack": 1,
+        "selfCheck": 0,
+        "sessionEnd": 1
+      },
+      "events": [
+        {
+          "tool": "memory_sessionStart",
+          "at": "2026-05-23T10:12:11.060Z",
+          "details": {
+            "taskArea": "zed project-memory mcp config"
+          }
+        },
+        {
+          "tool": "memory_contextPack",
+          "at": "2026-05-23T10:12:11.061Z",
+          "details": {
+            "query": "zed project-memory mcp config",
+            "taskArea": "zed project-memory mcp config"
+          }
+        },
+        {
+          "tool": "memory_sessionEnd",
+          "at": "2026-05-23T10:12:48.134Z",
+          "details": {
+            "topic": "Check and fix Zed project-memory dynamic config",
+            "verify": false
+          }
+        }
+      ],
+      "missingSessionStart": false,
+      "topic": "Check and fix Zed project-memory dynamic config",
+      "endedAt": "2026-05-23T10:12:48.134Z",
+      "lastQualityGate": {
+        "ok": false,
+        "score": 78,
+        "grade": "C",
+        "warnings": [
+          "selfCheck for risky work: Risky, deployment-like, decision-heavy, or multi-file work needs memory_selfCheck.",
+          "vault verification ran: End-of-task protocol expects vault verification after memory_sessionEnd."
+        ]
+      }
+    },
+    {
+      "id": "memory-1779530621114",
+      "startedAt": "2026-05-23T10:03:41.114Z",
+      "updatedAt": "2026-05-23T10:10:16.788Z",
+      "taskArea": "MCP configuration across user and project config files",
+      "startedBy": "memory_sessionStart",
+      "counts": {
+        "sessionStart": 1,
+        "contextPack": 2,
+        "selfCheck": 1,
+        "sessionEnd": 1
+      },
+      "events": [
+        {
+          "tool": "memory_sessionStart",
+          "at": "2026-05-23T10:03:41.114Z",
+          "details": {
+            "taskArea": "project-memory dynamic workspace detection all projects"
+          }
+        },
+        {
+          "tool": "memory_contextPack",
+          "at": "2026-05-23T10:03:41.116Z",
+          "details": {
+            "query": "project-memory dynamic workspace detection all projects",
+            "taskArea": "project-memory dynamic workspace detection all projects"
+          }
+        },
+        {
+          "tool": "memory_contextPack",
+          "at": "2026-05-23T10:03:41.311Z",
+          "details": {
+            "query": "Make MEMORY_PROJECT_ROOT dynamic across all MCP configs and projects",
+            "taskArea": "project-memory dynamic workspace detection all projects"
+          }
+        },
+        {
+          "tool": "memory_selfCheck",
+          "at": "2026-05-23T10:03:50.464Z",
+          "details": {
+            "task": "Set MEMORY_PROJECT_ROOT=dynamic across all MCP configs and projects",
+            "area": "MCP configuration across user and project config files",
+            "riskLevel": "medium"
+          }
+        },
+        {
+          "tool": "memory_sessionEnd",
+          "at": "2026-05-23T10:10:16.788Z",
+          "details": {
+            "topic": "Set MEMORY_PROJECT_ROOT dynamic across all MCP configs and projects",
+            "verify": false
+          }
+        }
+      ],
+      "missingSessionStart": false,
+      "topic": "Set MEMORY_PROJECT_ROOT dynamic across all MCP configs and projects",
+      "endedAt": "2026-05-23T10:10:16.788Z",
+      "lastQualityGate": {
+        "ok": false,
+        "score": 90,
+        "grade": "B",
+        "warnings": [
+          "vault verification ran: End-of-task protocol expects vault verification after memory_sessionEnd."
+        ]
+      }
+    },
+    {
+      "id": "memory-1779530141676",
+      "startedAt": "2026-05-23T09:55:41.676Z",
+      "updatedAt": "2026-05-23T10:02:51.607Z",
+      "taskArea": "project-memory MCP configuration and runtime root detection",
+      "startedBy": "memory_sessionStart",
+      "counts": {
+        "sessionStart": 1,
+        "contextPack": 2,
+        "selfCheck": 1,
+        "sessionEnd": 1
+      },
+      "events": [
+        {
+          "tool": "memory_sessionStart",
+          "at": "2026-05-23T09:55:41.676Z",
+          "details": {
+            "taskArea": "project-memory dynamic workspace detection"
+          }
+        },
+        {
+          "tool": "memory_contextPack",
+          "at": "2026-05-23T09:55:41.677Z",
+          "details": {
+            "query": "project-memory dynamic workspace detection",
+            "taskArea": "project-memory dynamic workspace detection"
+          }
+        },
+        {
+          "tool": "memory_contextPack",
+          "at": "2026-05-23T09:55:42.099Z",
+          "details": {
+            "query": "Implement dynamic workspace detection for MEMORY_PROJECT_ROOT in project-memory MCP",
+            "taskArea": "project-memory dynamic workspace detection"
+          }
+        },
+        {
+          "tool": "memory_selfCheck",
+          "at": "2026-05-23T09:55:53.279Z",
+          "details": {
+            "task": "Implement dynamic workspace detection for project-memory MCP MEMORY_PROJECT_ROOT and update MCP configs",
+            "area": "project-memory MCP configuration and runtime root detection",
+            "riskLevel": "medium"
+          }
+        },
+        {
+          "tool": "memory_sessionEnd",
+          "at": "2026-05-23T10:02:51.607Z",
+          "details": {
+            "topic": "Implement dynamic MEMORY_PROJECT_ROOT detection for project-memory MCP",
+            "verify": false
+          }
+        }
+      ],
+      "missingSessionStart": false,
+      "topic": "Implement dynamic MEMORY_PROJECT_ROOT detection for project-memory MCP",
+      "endedAt": "2026-05-23T10:02:51.607Z",
+      "lastQualityGate": {
+        "ok": false,
+        "score": 90,
+        "grade": "B",
+        "warnings": [
+          "vault verification ran: End-of-task protocol expects vault verification after memory_sessionEnd."
+        ]
+      }
+    },
+    {
+      "id": "memory-1779529936504",
+      "startedAt": "2026-05-23T09:52:16.504Z",
+      "updatedAt": "2026-05-23T09:53:38.061Z",
+      "taskArea": "project-memory dynamic workspace detection",
+      "startedBy": "memory_sessionStart",
+      "counts": {
+        "sessionStart": 1,
+        "contextPack": 2,
+        "selfCheck": 0,
+        "sessionEnd": 1
+      },
+      "events": [
+        {
+          "tool": "memory_sessionStart",
+          "at": "2026-05-23T09:52:16.504Z",
+          "details": {
+            "taskArea": "project-memory dynamic workspace detection"
+          }
+        },
+        {
+          "tool": "memory_contextPack",
+          "at": "2026-05-23T09:52:16.506Z",
+          "details": {
+            "query": "project-memory dynamic workspace detection",
+            "taskArea": "project-memory dynamic workspace detection"
+          }
+        },
+        {
+          "tool": "memory_contextPack",
+          "at": "2026-05-23T09:52:16.650Z",
+          "details": {
+            "query": "Does project-memory MCP use Dynamic Workspace Detection now?",
+            "taskArea": "project-memory dynamic workspace detection"
+          }
+        },
+        {
+          "tool": "memory_sessionEnd",
+          "at": "2026-05-23T09:53:38.061Z",
+          "details": {
+            "topic": "Check whether project-memory MCP uses Dynamic Workspace Detection",
+            "verify": false
+          }
+        }
+      ],
+      "missingSessionStart": false,
+      "topic": "Check whether project-memory MCP uses Dynamic Workspace Detection",
+      "endedAt": "2026-05-23T09:53:38.061Z",
+      "lastQualityGate": {
+        "ok": false,
+        "score": 90,
+        "grade": "B",
+        "warnings": [
+          "vault verification ran: End-of-task protocol expects vault verification after memory_sessionEnd."
+        ]
+      }
+    },
+    {
+      "id": "memory-1779528895997",
+      "startedAt": "2026-05-23T09:34:55.997Z",
+      "updatedAt": "2026-05-23T09:44:11.144Z",
+      "startedBy": "memory_sessionStart",
+      "counts": {
+        "sessionStart": 1,
+        "contextPack": 2,
+        "selfCheck": 1,
+        "sessionEnd": 1
+      },
+      "events": [
+        {
+          "tool": "memory_sessionStart",
+          "at": "2026-05-23T09:34:55.997Z",
+          "details": {}
+        },
+        {
+          "tool": "memory_contextPack",
+          "at": "2026-05-23T09:34:55.999Z",
+          "details": {}
+        },
+        {
+          "tool": "memory_contextPack",
+          "at": "2026-05-23T09:34:58.511Z",
+          "details": {
+            "taskArea": "settings-api"
+          }
+        },
+        {
+          "tool": "memory_selfCheck",
+          "at": "2026-05-23T09:35:36.931Z",
+          "details": {
+            "task": "verify AI Provider settings UI changes in memory-only DB environment",
+            "riskLevel": "medium"
+          }
+        },
+        {
+          "tool": "memory_sessionEnd",
+          "at": "2026-05-23T09:44:11.144Z",
+          "details": {
+            "topic": "Refactored OpenAI provider settings UI (codex-device only)",
+            "verify": false
+          }
+        }
+      ],
+      "missingSessionStart": false,
+      "taskArea": "settings-api",
+      "topic": "Refactored OpenAI provider settings UI (codex-device only)",
+      "endedAt": "2026-05-23T09:44:11.144Z",
+      "lastQualityGate": {
+        "ok": false,
+        "score": 90,
+        "grade": "B",
+        "warnings": [
+          "vault verification ran: End-of-task protocol expects vault verification after memory_sessionEnd."
+        ]
+      }
+    },
+    {
+      "id": "memory-1779527806300",
+      "startedAt": "2026-05-23T09:16:46.300Z",
+      "updatedAt": "2026-05-23T09:19:30.629Z",
+      "taskArea": "testing",
+      "startedBy": "memory_selfCheck",
+      "counts": {
+        "sessionStart": 0,
+        "contextPack": 0,
+        "selfCheck": 1,
+        "sessionEnd": 1
+      },
+      "events": [
+        {
+          "tool": "memory_selfCheck",
+          "at": "2026-05-23T09:16:46.300Z",
+          "details": {
+            "task": "E2E frontend test for all pages using chrome-devtools-mcp after swapping .env with .env.test",
+            "area": "testing",
+            "riskLevel": "low"
+          }
+        },
+        {
+          "tool": "memory_sessionEnd",
+          "at": "2026-05-23T09:19:30.629Z",
+          "details": {
+            "topic": "Run E2E frontend testing for all main system pages",
+            "verify": false
+          }
+        }
+      ],
+      "missingSessionStart": true,
+      "topic": "Run E2E frontend testing for all main system pages",
+      "endedAt": "2026-05-23T09:19:30.629Z",
+      "lastQualityGate": {
+        "ok": false,
+        "score": 52,
+        "grade": "F",
+        "warnings": [
+          "sessionStart recorded: Every task should begin with memory_sessionStart.",
+          "contextPack recorded: Each task should retrieve a task-specific memory_contextPack.",
+          "verification note recorded: Session logs should say what verification was run or why it was skipped.",
+          "vault verification ran: End-of-task protocol expects vault verification after memory_sessionEnd."
+        ]
+      }
+    },
+    {
+      "id": "memory-1779527458837",
+      "startedAt": "2026-05-23T09:10:58.837Z",
+      "updatedAt": "2026-05-23T09:14:44.010Z",
+      "taskArea": "e2e-testing",
+      "startedBy": "memory_sessionStart",
+      "counts": {
+        "sessionStart": 1,
+        "contextPack": 1,
+        "selfCheck": 0,
+        "sessionEnd": 1
+      },
+      "events": [
+        {
+          "tool": "memory_sessionStart",
+          "at": "2026-05-23T09:10:58.837Z",
+          "details": {
+            "taskArea": "e2e-testing"
+          }
+        },
+        {
+          "tool": "memory_contextPack",
+          "at": "2026-05-23T09:10:58.840Z",
+          "details": {
+            "query": "e2e-testing",
+            "taskArea": "e2e-testing"
+          }
+        },
+        {
+          "tool": "memory_sessionEnd",
+          "at": "2026-05-23T09:14:44.010Z",
+          "details": {
+            "topic": "Demonstrate E2E browser automation using chrome-devtools-mcp",
+            "verify": false
+          }
+        }
+      ],
+      "missingSessionStart": false,
+      "topic": "Demonstrate E2E browser automation using chrome-devtools-mcp",
+      "endedAt": "2026-05-23T09:14:44.010Z",
+      "lastQualityGate": {
+        "ok": false,
+        "score": 82,
+        "grade": "C",
+        "warnings": [
+          "verification note recorded: Session logs should say what verification was run or why it was skipped.",
+          "vault verification ran: End-of-task protocol expects vault verification after memory_sessionEnd."
+        ]
+      }
+    },
+    {
+      "id": "memory-1779513848004",
+      "startedAt": "2026-05-23T05:24:08.004Z",
+      "updatedAt": "2026-05-23T05:25:33.143Z",
+      "startedBy": "memory_sessionStart",
+      "counts": {
+        "sessionStart": 1,
+        "contextPack": 2,
+        "selfCheck": 0,
+        "sessionEnd": 1
+      },
+      "events": [
+        {
+          "tool": "memory_sessionStart",
+          "at": "2026-05-23T05:24:08.004Z",
+          "details": {}
+        },
+        {
+          "tool": "memory_contextPack",
+          "at": "2026-05-23T05:24:08.006Z",
+          "details": {}
+        },
+        {
+          "tool": "memory_contextPack",
+          "at": "2026-05-23T05:24:10.347Z",
+          "details": {
+            "taskArea": "skills"
+          }
+        },
+        {
+          "tool": "memory_sessionEnd",
+          "at": "2026-05-23T05:25:33.143Z",
+          "details": {
+            "topic": "Symlink-Vercel-React-Best-Practices",
+            "verify": true
+          }
+        }
+      ],
+      "missingSessionStart": false,
+      "taskArea": "skills",
+      "topic": "Symlink-Vercel-React-Best-Practices",
+      "endedAt": "2026-05-23T05:25:33.143Z",
+      "lastQualityGate": {
+        "ok": false,
+        "score": 68,
+        "grade": "D",
+        "warnings": [
+          "selfCheck for risky work: Risky, deployment-like, decision-heavy, or multi-file work needs memory_selfCheck.",
+          "verification note recorded: Session logs should say what verification was run or why it was skipped.",
+          "vault has no errors: Vault health: 2 errors, 0 warnings."
+        ]
+      }
+    },
+    {
+      "id": "memory-1779511577077",
+      "startedAt": "2026-05-23T04:46:17.077Z",
+      "updatedAt": "2026-05-23T04:50:40.156Z",
+      "startedBy": "memory_sessionStart",
+      "counts": {
+        "sessionStart": 1,
+        "contextPack": 2,
+        "selfCheck": 0,
+        "sessionEnd": 1
+      },
+      "events": [
+        {
+          "tool": "memory_sessionStart",
+          "at": "2026-05-23T04:46:17.077Z",
+          "details": {}
+        },
+        {
+          "tool": "memory_contextPack",
+          "at": "2026-05-23T04:46:17.081Z",
+          "details": {}
+        },
+        {
+          "tool": "memory_contextPack",
+          "at": "2026-05-23T04:46:26.037Z",
+          "details": {
+            "taskArea": "skills"
+          }
+        },
+        {
+          "tool": "memory_sessionEnd",
+          "at": "2026-05-23T04:50:40.156Z",
+          "details": {
+            "topic": "Symlink-Fastify-Best-Practices",
+            "verify": true
+          }
+        }
+      ],
+      "missingSessionStart": false,
+      "taskArea": "skills",
+      "topic": "Symlink-Fastify-Best-Practices",
+      "endedAt": "2026-05-23T04:50:40.156Z",
+      "lastQualityGate": {
+        "ok": false,
+        "score": 68,
+        "grade": "D",
+        "warnings": [
+          "selfCheck for risky work: Risky, deployment-like, decision-heavy, or multi-file work needs memory_selfCheck.",
+          "verification note recorded: Session logs should say what verification was run or why it was skipped.",
+          "vault has no errors: Vault health: 2 errors, 0 warnings."
+        ]
+      }
+    },
+    {
+      "id": "memory-1779506778771",
+      "startedAt": "2026-05-23T03:26:18.771Z",
+      "updatedAt": "2026-05-23T03:31:35.527Z",
+      "taskArea": "auto-accept notification / job click diagnostics",
+      "startedBy": "memory_sessionStart",
+      "counts": {
+        "sessionStart": 1,
+        "contextPack": 2,
+        "selfCheck": 1,
+        "sessionEnd": 1
+      },
+      "events": [
+        {
+          "tool": "memory_sessionStart",
+          "at": "2026-05-23T03:26:18.771Z",
+          "details": {
+            "taskArea": "auto-accept job 32829911"
+          }
+        },
+        {
+          "tool": "memory_contextPack",
+          "at": "2026-05-23T03:26:18.773Z",
+          "details": {
+            "query": "auto-accept job 32829911",
+            "taskArea": "auto-accept job 32829911"
+          }
+        },
+        {
+          "tool": "memory_contextPack",
+          "at": "2026-05-23T03:26:19.031Z",
+          "details": {
+            "query": "why job 32829911 reported not clicked / auto-accept did not click",
+            "taskArea": "auto-accept job 32829911"
+          }
+        },
+        {
+          "tool": "memory_selfCheck",
+          "at": "2026-05-23T03:26:24.661Z",
+          "details": {
+            "task": "Investigate why auto-accept/job click did not happen for SPX job 32829911 using logs and DB evidence without changing notify-rules or secrets.",
+            "area": "auto-accept notification / job click diagnostics",
+            "riskLevel": "medium"
+          }
+        },
+        {
+          "tool": "memory_sessionEnd",
+          "at": "2026-05-23T03:31:35.527Z",
+          "details": {
+            "topic": "Investigate auto-accept not clicking request 32829911",
+            "verify": false
+          }
+        }
+      ],
+      "missingSessionStart": false,
+      "topic": "Investigate auto-accept not clicking request 32829911",
+      "endedAt": "2026-05-23T03:31:35.527Z",
+      "lastQualityGate": {
+        "ok": false,
+        "score": 90,
+        "grade": "B",
+        "warnings": [
+          "vault verification ran: End-of-task protocol expects vault verification after memory_sessionEnd."
+        ]
+      }
+    },
+    {
+      "id": "memory-1779419155002",
+      "startedAt": "2026-05-22T03:05:55.002Z",
+      "updatedAt": "2026-05-22T03:38:36.466Z",
+      "startedBy": "memory_sessionStart",
+      "counts": {
+        "sessionStart": 1,
+        "contextPack": 2,
+        "selfCheck": 1,
+        "sessionEnd": 1
+      },
+      "events": [
+        {
+          "tool": "memory_sessionStart",
+          "at": "2026-05-22T03:05:55.003Z",
+          "details": {}
+        },
+        {
+          "tool": "memory_contextPack",
+          "at": "2026-05-22T03:05:55.006Z",
+          "details": {}
+        },
+        {
+          "tool": "memory_contextPack",
+          "at": "2026-05-22T03:05:59.148Z",
+          "details": {
+            "taskArea": "prod-server-verification"
+          }
+        },
+        {
+          "tool": "memory_selfCheck",
+          "at": "2026-05-22T03:06:17.364Z",
+          "details": {
+            "task": "SSH to PROD server as root using SSH key to verify server configuration",
+            "riskLevel": "medium"
+          }
+        },
+        {
+          "tool": "memory_sessionEnd",
+          "at": "2026-05-22T03:38:36.466Z",
+          "details": {
+            "topic": "LINE Bot notifications and image serving bugs fixed",
+            "verify": true
+          }
+        }
+      ],
+      "missingSessionStart": false,
+      "taskArea": "prod-server-verification",
+      "topic": "LINE Bot notifications and image serving bugs fixed",
+      "endedAt": "2026-05-22T03:38:36.466Z",
+      "lastQualityGate": {
+        "ok": false,
+        "score": 70,
+        "grade": "D",
+        "warnings": [
+          "outcomes recorded: Session logs should include concrete outcomes.",
+          "verification note recorded: Session logs should say what verification was run or why it was skipped.",
+          "vault has no errors: Vault health: 2 errors, 0 warnings."
+        ]
+      }
+    },
+    {
+      "id": "memory-1779413478656",
+      "startedAt": "2026-05-22T01:31:18.656Z",
+      "updatedAt": "2026-05-22T01:40:25.369Z",
+      "taskArea": "line image extraction history api frontend table",
+      "startedBy": "memory_sessionStart",
+      "counts": {
+        "sessionStart": 1,
+        "contextPack": 2,
+        "selfCheck": 1,
+        "sessionEnd": 1
+      },
+      "events": [
+        {
+          "tool": "memory_sessionStart",
+          "at": "2026-05-22T01:31:18.656Z",
+          "details": {
+            "taskArea": "line image extraction history api frontend table"
+          }
+        },
+        {
+          "tool": "memory_contextPack",
+          "at": "2026-05-22T01:31:18.657Z",
+          "details": {
+            "query": "line image extraction history api frontend table",
+            "taskArea": "line image extraction history api frontend table"
+          }
+        },
+        {
+          "tool": "memory_contextPack",
+          "at": "2026-05-22T01:31:18.792Z",
+          "details": {
+            "query": "Implement REST API and frontend table for saved line_image_extractions history with filters pagination image path",
+            "taskArea": "line image extraction history api frontend table"
+          }
+        },
+        {
+          "tool": "memory_selfCheck",
+          "at": "2026-05-22T01:31:52.616Z",
+          "details": {
+            "task": "Implement LINE image extraction history REST API, repository query, static image access, frontend API/types, navigation, and table page.",
+            "area": "line image extraction history api frontend table",
+            "riskLevel": "medium"
+          }
+        },
+        {
+          "tool": "memory_sessionEnd",
+          "at": "2026-05-22T01:40:25.369Z",
+          "details": {
+            "topic": "LINE image extraction history API and frontend table",
+            "verify": true
+          }
+        }
+      ],
+      "missingSessionStart": false,
+      "topic": "LINE image extraction history API and frontend table",
+      "endedAt": "2026-05-22T01:40:25.369Z",
+      "lastQualityGate": {
+        "ok": false,
+        "score": 88,
+        "grade": "B",
+        "warnings": [
+          "vault has no errors: Vault health: 1 errors, 0 warnings."
+        ]
+      }
+    },
+    {
+      "id": "memory-1779413411818",
+      "startedAt": "2026-05-22T01:30:11.818Z",
+      "updatedAt": "2026-05-22T01:30:25.963Z",
+      "taskArea": "line image extraction history api frontend table",
+      "startedBy": "memory_sessionStart",
+      "counts": {
+        "sessionStart": 1,
+        "contextPack": 2,
+        "selfCheck": 0,
+        "sessionEnd": 1
+      },
+      "events": [
+        {
+          "tool": "memory_sessionStart",
+          "at": "2026-05-22T01:30:11.818Z",
+          "details": {
+            "taskArea": "line image extraction history api frontend table"
+          }
+        },
+        {
+          "tool": "memory_contextPack",
+          "at": "2026-05-22T01:30:11.820Z",
+          "details": {
+            "query": "line image extraction history api frontend table",
+            "taskArea": "line image extraction history api frontend table"
+          }
+        },
+        {
+          "tool": "memory_contextPack",
+          "at": "2026-05-22T01:30:11.951Z",
+          "details": {
+            "query": "Plan REST API and frontend table for saved LINE image extraction DB history by date/month/trip route",
+            "taskArea": "line image extraction history api frontend table"
+          }
+        },
+        {
+          "tool": "memory_sessionEnd",
+          "at": "2026-05-22T01:30:25.963Z",
+          "details": {
+            "topic": "Plan LINE image extraction history API and table",
+            "verify": true
+          }
+        }
+      ],
+      "missingSessionStart": false,
+      "topic": "Plan LINE image extraction history API and table",
+      "endedAt": "2026-05-22T01:30:25.963Z",
+      "lastQualityGate": {
+        "ok": false,
+        "score": 88,
+        "grade": "B",
+        "warnings": [
+          "vault has no errors: Vault health: 1 errors, 0 warnings."
+        ]
+      }
+    },
+    {
+      "id": "memory-1779412592805",
+      "startedAt": "2026-05-22T01:16:32.805Z",
+      "updatedAt": "2026-05-22T01:16:40.727Z",
+      "taskArea": "codex image read Bad Request",
+      "startedBy": "memory_selfCheck",
+      "counts": {
+        "sessionStart": 0,
+        "contextPack": 0,
+        "selfCheck": 1,
+        "sessionEnd": 1
+      },
+      "events": [
+        {
+          "tool": "memory_selfCheck",
+          "at": "2026-05-22T01:16:32.806Z",
+          "details": {
+            "task": "Post-fix review of Codex image reader Bad Request changes touching auth provider bridge and image processing service.",
+            "area": "codex image read Bad Request",
+            "riskLevel": "medium"
+          }
+        },
+        {
+          "tool": "memory_sessionEnd",
+          "at": "2026-05-22T01:16:40.727Z",
+          "details": {
+            "topic": "Post-fix self-check for Codex image read Bad Request",
+            "verify": true
+          }
+        }
+      ],
+      "missingSessionStart": true,
+      "topic": "Post-fix self-check for Codex image read Bad Request",
+      "endedAt": "2026-05-22T01:16:40.727Z",
+      "lastQualityGate": {
+        "ok": false,
+        "score": 58,
+        "grade": "F",
+        "warnings": [
+          "sessionStart recorded: Every task should begin with memory_sessionStart.",
+          "contextPack recorded: Each task should retrieve a task-specific memory_contextPack.",
+          "vault has no errors: Vault health: 1 errors, 0 warnings."
+        ]
+      }
+    },
+    {
+      "id": "memory-1779411961983",
+      "startedAt": "2026-05-22T01:06:01.983Z",
+      "updatedAt": "2026-05-22T01:16:24.741Z",
+      "taskArea": "codex image read Bad Request",
+      "startedBy": "memory_sessionStart",
+      "counts": {
+        "sessionStart": 1,
+        "contextPack": 2,
+        "selfCheck": 0,
+        "sessionEnd": 1
+      },
+      "events": [
+        {
+          "tool": "memory_sessionStart",
+          "at": "2026-05-22T01:06:01.983Z",
+          "details": {
+            "taskArea": "codex image read Bad Request"
+          }
+        },
+        {
+          "tool": "memory_contextPack",
+          "at": "2026-05-22T01:06:01.984Z",
+          "details": {
+            "query": "codex image read Bad Request",
+            "taskArea": "codex image read Bad Request"
+          }
+        },
+        {
+          "tool": "memory_contextPack",
+          "at": "2026-05-22T01:06:02.121Z",
+          "details": {
+            "query": "Codex image reading Bad Request AI SDK codex-device provider image OCR",
+            "taskArea": "codex image read Bad Request"
+          }
+        },
+        {
+          "tool": "memory_sessionEnd",
+          "at": "2026-05-22T01:16:24.741Z",
+          "details": {
+            "topic": "Fix Codex image read Bad Request",
+            "verify": true
+          }
+        }
+      ],
+      "missingSessionStart": false,
+      "topic": "Fix Codex image read Bad Request",
+      "endedAt": "2026-05-22T01:16:24.741Z",
+      "lastQualityGate": {
+        "ok": false,
+        "score": 76,
+        "grade": "C",
+        "warnings": [
+          "selfCheck for risky work: Risky, deployment-like, decision-heavy, or multi-file work needs memory_selfCheck.",
+          "vault has no errors: Vault health: 1 errors, 0 warnings."
+        ]
+      }
+    },
+    {
+      "id": "memory-1779411401198",
+      "startedAt": "2026-05-22T00:56:41.198Z",
+      "updatedAt": "2026-05-22T01:01:08.193Z",
+      "taskArea": "auth provider OpenAI OAuth direct integration",
+      "startedBy": "memory_sessionStart",
+      "counts": {
+        "sessionStart": 1,
+        "contextPack": 2,
+        "selfCheck": 1,
+        "sessionEnd": 1
+      },
+      "events": [
+        {
+          "tool": "memory_sessionStart",
+          "at": "2026-05-22T00:56:41.198Z",
+          "details": {
+            "taskArea": "codex auth explicit user-selected mode"
+          }
+        },
+        {
+          "tool": "memory_contextPack",
+          "at": "2026-05-22T00:56:41.201Z",
+          "details": {
+            "query": "codex auth explicit user-selected mode",
+            "taskArea": "codex auth explicit user-selected mode"
+          }
+        },
+        {
+          "tool": "memory_contextPack",
+          "at": "2026-05-22T00:56:41.375Z",
+          "details": {
+            "query": "Make Codex auth not use fallback/default; user explicitly chooses browser or device code mode",
+            "taskArea": "codex auth explicit user-selected mode"
+          }
+        },
+        {
+          "tool": "memory_selfCheck",
+          "at": "2026-05-22T00:56:41.483Z",
+          "details": {
+            "task": "Change Codex auth start behavior to require an explicit user-selected mode instead of defaulting/fallback behavior.",
+            "area": "auth provider OpenAI OAuth direct integration",
+            "riskLevel": "medium"
+          }
+        },
+        {
+          "tool": "memory_sessionEnd",
+          "at": "2026-05-22T01:01:08.193Z",
+          "details": {
+            "topic": "Require explicit Codex auth login mode",
+            "verify": true
+          }
+        }
+      ],
+      "missingSessionStart": false,
+      "topic": "Require explicit Codex auth login mode",
+      "endedAt": "2026-05-22T01:01:08.193Z",
+      "lastQualityGate": {
+        "ok": false,
+        "score": 88,
+        "grade": "B",
+        "warnings": [
+          "vault has no errors: Vault health: 1 errors, 0 warnings."
+        ]
+      }
+    },
+    {
+      "id": "memory-1779410990198",
+      "startedAt": "2026-05-22T00:49:50.198Z",
+      "updatedAt": "2026-05-22T00:55:37.881Z",
+      "taskArea": "auth provider OpenAI OAuth direct integration",
+      "startedBy": "memory_sessionStart",
+      "counts": {
+        "sessionStart": 1,
+        "contextPack": 2,
+        "selfCheck": 1,
+        "sessionEnd": 1
+      },
+      "events": [
+        {
+          "tool": "memory_sessionStart",
+          "at": "2026-05-22T00:49:50.198Z",
+          "details": {
+            "taskArea": "opencode-style codex auth without codex cli"
+          }
+        },
+        {
+          "tool": "memory_contextPack",
+          "at": "2026-05-22T00:49:50.199Z",
+          "details": {
+            "query": "opencode-style codex auth without codex cli",
+            "taskArea": "opencode-style codex auth without codex cli"
+          }
+        },
+        {
+          "tool": "memory_contextPack",
+          "at": "2026-05-22T00:49:50.284Z",
+          "details": {
+            "query": "OpenCode desktop Codex auth without Codex CLI direct OAuth codeauth implementation",
+            "taskArea": "opencode-style codex auth without codex cli"
+          }
+        },
+        {
+          "tool": "memory_selfCheck",
+          "at": "2026-05-22T00:50:31.842Z",
+          "details": {
+            "task": "Align SPX Codex auth provider with OpenCode desktop/plugin direct auth implementation without Codex CLI, including headers and browser/headless OAuth behavior.",
+            "area": "auth provider OpenAI OAuth direct integration",
+            "riskLevel": "high"
+          }
+        },
+        {
+          "tool": "memory_sessionEnd",
+          "at": "2026-05-22T00:55:37.881Z",
+          "details": {
+            "topic": "Implement OpenCode-style Codex auth without Codex CLI",
+            "verify": true
+          }
+        }
+      ],
+      "missingSessionStart": false,
+      "topic": "Implement OpenCode-style Codex auth without Codex CLI",
+      "endedAt": "2026-05-22T00:55:37.881Z",
+      "lastQualityGate": {
+        "ok": false,
+        "score": 88,
+        "grade": "B",
+        "warnings": [
+          "vault has no errors: Vault health: 1 errors, 0 warnings."
+        ]
+      }
+    },
+    {
+      "id": "memory-1779410451773",
+      "startedAt": "2026-05-22T00:40:51.773Z",
+      "updatedAt": "2026-05-22T00:49:01.717Z",
+      "taskArea": "auth provider external endpoint",
+      "startedBy": "memory_sessionStart",
+      "counts": {
+        "sessionStart": 1,
+        "contextPack": 2,
+        "selfCheck": 1,
+        "sessionEnd": 1
+      },
+      "events": [
+        {
+          "tool": "memory_sessionStart",
+          "at": "2026-05-22T00:40:51.773Z",
+          "details": {
+            "taskArea": "codex device code auth 404 start failure"
+          }
+        },
+        {
+          "tool": "memory_contextPack",
+          "at": "2026-05-22T00:40:51.774Z",
+          "details": {
+            "query": "codex device code auth 404 start failure",
+            "taskArea": "codex device code auth 404 start failure"
+          }
+        },
+        {
+          "tool": "memory_contextPack",
+          "at": "2026-05-22T00:40:51.852Z",
+          "details": {
+            "query": "Codex device code auth start 404 auth0.openai.com oauth device code",
+            "taskArea": "codex device code auth 404 start failure"
+          }
+        },
+        {
+          "tool": "memory_selfCheck",
+          "at": "2026-05-22T00:41:00.959Z",
+          "details": {
+            "task": "Fix Codex device-code start 404 by validating OpenAI OAuth endpoint candidates and updating auth URLs without exposing stored tokens.",
+            "area": "auth provider external endpoint",
+            "riskLevel": "high"
+          }
+        },
+        {
+          "tool": "memory_sessionEnd",
+          "at": "2026-05-22T00:49:01.717Z",
+          "details": {
+            "topic": "fix Codex device-code start 404 by using official Codex deviceauth endpoints",
+            "verify": false
+          }
+        }
+      ],
+      "missingSessionStart": false,
+      "topic": "fix Codex device-code start 404 by using official Codex deviceauth endpoints",
+      "endedAt": "2026-05-22T00:49:01.717Z",
+      "lastQualityGate": {
+        "ok": false,
+        "score": 90,
+        "grade": "B",
+        "warnings": [
+          "vault verification ran: End-of-task protocol expects vault verification after memory_sessionEnd."
+        ]
+      }
+    },
+    {
+      "id": "memory-1779410208351",
+      "startedAt": "2026-05-22T00:36:48.351Z",
+      "updatedAt": "2026-05-22T00:39:44.034Z",
+      "taskArea": "auth provider AI SDK secrets runtime",
+      "startedBy": "memory_sessionStart",
+      "counts": {
+        "sessionStart": 1,
+        "contextPack": 2,
+        "selfCheck": 1,
+        "sessionEnd": 1
+      },
+      "events": [
+        {
+          "tool": "memory_sessionStart",
+          "at": "2026-05-22T00:36:48.351Z",
+          "details": {
+            "taskArea": "codex device auth 403 login failure"
+          }
+        },
+        {
+          "tool": "memory_contextPack",
+          "at": "2026-05-22T00:36:48.353Z",
+          "details": {
+            "query": "codex device auth 403 login failure",
+            "taskArea": "codex device auth 403 login failure"
+          }
+        },
+        {
+          "tool": "memory_contextPack",
+          "at": "2026-05-22T00:36:48.518Z",
+          "details": {
+            "query": "Codex device auth OAuth token exchange failed 403 after local callback",
+            "taskArea": "codex device auth 403 login failure"
+          }
+        },
+        {
+          "tool": "memory_selfCheck",
+          "at": "2026-05-22T00:36:59.628Z",
+          "details": {
+            "task": "Fix Codex device auth 403 token exchange failure by replacing redirect callback OAuth path with device code flow if current code still uses PKCE callback.",
+            "area": "auth provider AI SDK secrets runtime",
+            "riskLevel": "high"
+          }
+        },
+        {
+          "tool": "memory_sessionEnd",
+          "at": "2026-05-22T00:39:44.034Z",
+          "details": {
+            "topic": "fix Codex auth 403 by routing login to device code flow",
+            "verify": false
+          }
+        }
+      ],
+      "missingSessionStart": false,
+      "topic": "fix Codex auth 403 by routing login to device code flow",
+      "endedAt": "2026-05-22T00:39:44.034Z",
+      "lastQualityGate": {
+        "ok": false,
+        "score": 90,
+        "grade": "B",
+        "warnings": [
+          "vault verification ran: End-of-task protocol expects vault verification after memory_sessionEnd."
+        ]
+      }
+    },
+    {
+      "id": "memory-1779381954133",
+      "startedAt": "2026-05-21T16:45:54.133Z",
+      "updatedAt": "2026-05-21T16:48:09.448Z",
+      "startedBy": "memory_sessionStart",
+      "counts": {
+        "sessionStart": 1,
+        "contextPack": 2,
+        "selfCheck": 1,
+        "sessionEnd": 1
+      },
+      "events": [
+        {
+          "tool": "memory_sessionStart",
+          "at": "2026-05-21T16:45:54.133Z",
+          "details": {}
+        },
+        {
+          "tool": "memory_contextPack",
+          "at": "2026-05-21T16:45:54.134Z",
+          "details": {}
+        },
+        {
+          "tool": "memory_contextPack",
+          "at": "2026-05-21T16:45:56.253Z",
+          "details": {
+            "taskArea": "codex-device-auth"
+          }
+        },
+        {
+          "tool": "memory_selfCheck",
+          "at": "2026-05-21T16:47:53.111Z",
+          "details": {
+            "task": "Refactor deprecated ImagePart to FilePart in codex-image-reader",
+            "riskLevel": "medium"
+          }
+        },
+        {
+          "tool": "memory_sessionEnd",
+          "at": "2026-05-21T16:48:09.448Z",
+          "details": {
+            "topic": "Migrated deprecated ImagePart to unified FilePart for Codex Image Reader using Context7 verification",
+            "verify": true
+          }
+        }
+      ],
+      "missingSessionStart": false,
+      "taskArea": "codex-device-auth",
+      "topic": "Migrated deprecated ImagePart to unified FilePart for Codex Image Reader using Context7 verification",
+      "endedAt": "2026-05-21T16:48:09.448Z",
+      "lastQualityGate": {
+        "ok": false,
+        "score": 80,
+        "grade": "C",
+        "warnings": [
+          "verification note recorded: Session logs should say what verification was run or why it was skipped.",
+          "vault has no errors: Vault health: 1 errors, 0 warnings."
+        ]
+      }
+    }
+  ]
+}

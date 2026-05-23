@@ -6,7 +6,7 @@
         "C:/Users/Server/Desktop/Awakened-AI-System/dist/index.js"
       ],
       "env": {
-        "MEMORY_PROJECT_ROOT": "C:/Users/Server/Desktop/Awakened-AI-System"
+        "MEMORY_PROJECT_ROOT": "dynamic"
       }
     }
   }
