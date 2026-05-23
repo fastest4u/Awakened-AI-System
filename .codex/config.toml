@@ -6,7 +6,7 @@ tool_timeout_sec = 60
 enabled = true
 
 [mcp_servers.project-memory.env]
-MEMORY_PROJECT_ROOT = "C:/Users/Server/Desktop/Awakened-AI-System"
+MEMORY_PROJECT_ROOT = "dynamic"
 
 [mcp_servers.project-memory.tools.memory_sessionStart]
 approval_mode = "approve"

@@ -119,7 +119,7 @@ export class MemoryBootstrapService {
           command: "node",
           args: [this.serverEntrypoint],
           env: {
-            MEMORY_PROJECT_ROOT: this.projectRoot.replace(/\\/g, "/"),
+            MEMORY_PROJECT_ROOT: "dynamic",
           },
         },
       },
@@ -141,7 +141,7 @@ export class MemoryBootstrapService {
           command: ["node", this.serverEntrypoint],
           enabled: true,
           environment: {
-            MEMORY_PROJECT_ROOT: this.projectRoot.replace(/\\/g, "/"),
+            MEMORY_PROJECT_ROOT: "dynamic",
           },
         },
       },
@@ -163,7 +163,7 @@ export class MemoryBootstrapService {
             command: "node",
             args: [this.serverEntrypoint],
             env: {
-              MEMORY_PROJECT_ROOT: this.projectRoot.replace(/\\/g, "/"),
+              MEMORY_PROJECT_ROOT: "dynamic",
             },
           },
         },
@@ -203,7 +203,6 @@ export class MemoryBootstrapService {
 
   private codexConfigToml() {
     const server = this.tomlString(this.serverEntrypoint);
-    const root = this.tomlString(this.projectRoot.replace(/\\/g, "/"));
     return [
       "[mcp_servers.project-memory]",
       "command = \"node\"",
@@ -213,7 +212,7 @@ export class MemoryBootstrapService {
       "enabled = true",
       "",
       "[mcp_servers.project-memory.env]",
-      `MEMORY_PROJECT_ROOT = ${root}`,
+      "MEMORY_PROJECT_ROOT = \"dynamic\"",
       "",
     ].join("\n");
   }

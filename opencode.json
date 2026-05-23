@@ -17,7 +17,7 @@
       ],
       "enabled": true,
       "environment": {
-        "MEMORY_PROJECT_ROOT": "C:/Users/Server/Desktop/Awakened-AI-System"
+        "MEMORY_PROJECT_ROOT": "dynamic"
       }
     }
   }
