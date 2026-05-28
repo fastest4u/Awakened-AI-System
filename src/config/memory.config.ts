@@ -465,21 +465,36 @@ function readIdeWorkspaceCandidates(
  *   4. Otherwise, give up and let the caller fall back to `cwd`.
  */
 function pickIdeActiveWorkspace(candidates: IdeWorkspaceCandidate[]): string | undefined {
-  const seen = new Set<string>();
-  const unique = candidates.filter((c) => {
+  const byPath = new Map<string, IdeWorkspaceCandidate>();
+  for (const c of candidates) {
     const key = resolve(c.path).toLowerCase();
-    if (seen.has(key)) return false;
-    seen.add(key);
-    return existsSync(c.path);
-  });
+    if (!existsSync(c.path)) continue;
+    const previous = byPath.get(key);
+    if (!previous) {
+      byPath.set(key, c);
+      continue;
+    }
+    byPath.set(key, {
+      path: previous.path,
+      lastActive: previous.lastActive || c.lastActive,
+      mtimeMs: Math.max(previous.mtimeMs, c.mtimeMs),
+    });
+  }
+
+  const unique = Array.from(byPath.values());
+  const byBestSignal = (a: IdeWorkspaceCandidate, b: IdeWorkspaceCandidate) => {
+    if (a.lastActive !== b.lastActive) return a.lastActive ? -1 : 1;
+    return b.mtimeMs - a.mtimeMs;
+  };
 
   const withVault = unique.filter((c) => hasVaultMarker(c.path));
   if (withVault.length > 0) {
-    const active = withVault.find((c) => c.lastActive);
-    return active?.path ?? withVault[0].path;
+    return withVault.sort(byBestSignal)[0].path;
   }
 
-  const lastActiveWithMarker = unique.find((c) => c.lastActive && hasWorkspaceMarker(c.path));
+  const lastActiveWithMarker = unique
+    .filter((c) => c.lastActive && hasWorkspaceMarker(c.path))
+    .sort(byBestSignal)[0];
   if (lastActiveWithMarker) {
     return lastActiveWithMarker.path;
   }

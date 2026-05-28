@@ -516,6 +516,27 @@ describe("pickIdeActiveWorkspace + auto-detect (real fs)", () => {
     ]);
     assert.equal(resolve(result!), resolve(vault));
   });
+
+  it("uses newest mtime as a tiebreaker between equally active vaults", () => {
+    const older = makeProject("older-vault", { vault: true });
+    const newer = makeProject("newer-vault", { vault: true });
+    const result = pickIdeActiveWorkspace([
+      { path: older, lastActive: true, mtimeMs: 10 },
+      { path: newer, lastActive: true, mtimeMs: 20 },
+    ]);
+    assert.equal(resolve(result!), resolve(newer));
+  });
+
+  it("keeps the freshest signal when deduplicating the same workspace path", () => {
+    const stale = makeProject("stale-vault", { vault: true });
+    const fresh = makeProject("fresh-vault", { vault: true });
+    const result = pickIdeActiveWorkspace([
+      { path: stale, lastActive: true, mtimeMs: 10 },
+      { path: fresh, lastActive: false, mtimeMs: 100 },
+      { path: fresh, lastActive: true, mtimeMs: 200 },
+    ]);
+    assert.equal(resolve(result!), resolve(fresh));
+  });
 });
 
 describe("findIdeActiveWorkspace (storage.json on disk)", () => {
