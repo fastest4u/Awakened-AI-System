@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "project-memory": {
+      "command": "node",
+      "args": [
+        "C:/Users/Server/Desktop/Awakened-AI-System/dist/index.js"
+      ],
+      "env": {
+        "MEMORY_PROJECT_ROOT": "dynamic"
+      },
+      "disabledTools": [],
+      "disabled": false
+    }
+  }
+}
