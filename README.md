@@ -1,4 +1,4 @@
-# Awakened AI Memory MCP Server
+co# Awakened AI Memory MCP Server
 
 MCP Server สำหรับระบบความจำแบบ project-local ที่เก็บข้อมูลเป็น Markdown vault สไตล์ SPX และออกแบบให้ AI agent หลายตัวใช้ความจำชุดเดียวกันได้ผ่าน MCP tools โดยไม่ต้องผูกกับ slash command เฉพาะ IDE ใด IDE หนึ่ง
 
@@ -106,60 +106,16 @@ npm run build
 | `npm run typecheck` | ตรวจ TypeScript โดยไม่ emit |
 | `npm run lint` | alias ของ typecheck |
 | `npm run dev` | build แล้วรัน server |
-| `npm run test` | compile + รัน unit tests ผ่าน Node built-in test runner |
 
 ## Environment Variables
 
 | ตัวแปร | รายละเอียด |
 | --- | --- |
-| `MEMORY_PROJECT_ROOT` | path ของโปรเจกต์ที่ต้องการให้มี `memory/` หรือใส่ค่าพิเศษ `auto` / `dynamic` / `detect` / `workspace` เพื่อให้ตรวจหา workspace อัตโนมัติ |
+| `MEMORY_PROJECT_ROOT` | path ของโปรเจกต์ที่ต้องการให้มี `memory/` |
 | `MEMORY_VAULT_DIR` | ชื่อโฟลเดอร์ vault ค่าเริ่มต้นคือ `memory` |
 | `MEMORY_VAULT_PATH` | path ของ vault แบบชัดเจน ใช้แทน `MEMORY_PROJECT_ROOT` + `MEMORY_VAULT_DIR` |
 
-### Auto-detect Workspace
-
-เมื่อใช้ค่า `MEMORY_PROJECT_ROOT=auto` (หรือชื่ออื่น `dynamic` / `detect` / `workspace`) server จะหา workspace ปัจจุบันตามลำดับนี้:
-
-1. **Explicit env override** เช่น `MEMORY_WORKSPACE_ROOT`, `WORKSPACE_ROOT`, `PROJECT_ROOT`, `INIT_CWD`, `PWD`, `OLDPWD`
-2. **IDE state file** อ่านสถานะ workspace จาก IDE ตามแพลตฟอร์ม:
-   - **VS Code-derived IDE** (Windsurf, Windsurf-Next, Cursor, Code, VSCodium, Antigravity, Antigravity IDE, Kiro): `windowsState.lastActiveWindow.folder` และ `backupWorkspaces.folders[]` จาก `<app-data>/<IDE>/User/globalStorage/storage.json`
-   - **OpenCode (Tauri desktop)**: `notification.list[].directory` จาก `<app-data>/ai.opencode.desktop/opencode.global.dat`
-   - **Zed (SQLite)**: `workspaces.paths` (sorted by `timestamp DESC`) จาก `<local-data>/Zed/db/0-{stable,preview,dev}/db.sqlite` — ใช้ Node 22.5+'s built-in `node:sqlite` (ไม่ต้องติด native dep)
-   - แพลตฟอร์ม-specific data root:
-     - Windows: `%APPDATA%` (VS Code-like, OpenCode), `%LOCALAPPDATA%` (Zed)
-     - macOS: `~/Library/Application Support`
-     - Linux: `$XDG_CONFIG_HOME` หรือ `~/.config` (VS Code-like, OpenCode); `$XDG_DATA_HOME` หรือ `~/.local/share` (Zed)
-3. **CWD walk-up** เดินขึ้นจาก `process.cwd()` หา marker `.git`, `AGENTS.md`, `GEMINI.md`, `package.json`, `memory/AGENTS.md`
-
-ในกรณีเปิด IDE หลายหน้าต่างพร้อมกัน server จะ **เลือก workspace ที่มี `memory/AGENTS.md` (vault marker) เป็นอันดับแรก** เพราะนั่นคือ project ที่ user opt-in ใช้ memory MCP ไว้แล้ว ถ้ามีหลายอัน จะใช้ window ที่ active ล่าสุดตามที่ IDE บันทึก
-
-> **Node version note**: Zed detection ใช้ `node:sqlite` ซึ่ง stable ตั้งแต่ Node 22.5 (built-in, no flag ใน Node 24+). ถ้ารันบน Node เก่ากว่านี้ Zed detection จะ silently no-op และ server จะ fallback ไป IDE state อื่นหรือ cwd walk-up
-
-### IDE Compatibility Matrix
-
-| IDE / Client | Auto-detect via cwd (per-project config) | Auto-detect via IDE state file | สถานะ |
-| --- | :---: | :---: | --- |
-| **Windsurf** | ❌ (cwd = Windsurf install dir) | ✅ `Windsurf` storage.json | ทำงาน (หลัง reload) |
-| **Windsurf-Next** | ❌ | ✅ `Windsurf-Next` storage.json | ทำงาน |
-| **Cursor** | ✅ (`.cursor/mcp.json` per-project) | ✅ `Cursor` storage.json | ทำงาน 2 ทาง |
-| **VS Code / VSCodium** | ✅ | ✅ `Code` / `VSCodium` storage.json | ทำงาน 2 ทาง |
-| **Antigravity** (Google, ทั้ง legacy + IDE) | ❌ (เหมือน Windsurf) | ✅ `Antigravity` + `Antigravity IDE` storage.json | ทำงาน |
-| **Kiro** (AWS) | ✅ (`.kiro/settings/mcp.json` user-level หรือ project-level) | ✅ `Kiro` storage.json | ทำงาน 2 ทาง |
-| **OpenCode** (Tauri) | ✅ (`opencode.json` per-project) | ✅ `ai.opencode.desktop/opencode.global.dat` | ทำงาน 2 ทาง |
-| **Zed** | ✅ (`.zed/settings.json` per-project) | ✅ SQLite ที่ `Zed/db/0-{stable,preview,dev}/db.sqlite` (Node 22.5+) | ทำงาน 2 ทาง |
-| **Codex CLI** | ✅ (`.codex/config.toml`, launched from project) | n/a (CLI ไม่มี persistent state file) | ทำงานผ่าน cwd |
-| **GitHub Copilot / Antigravity user-level** | ⚠️ ขึ้นกับการ install MCP | ✅ ถ้าเป็น Antigravity | varies |
-
-> **หลักการ**: ถ้า MCP client launch server ด้วย `cwd = project root` (กรณี per-project config) — auto-detect ทำงานง่ายผ่าน cwd walk-up โดยไม่ต้องพึ่ง IDE state file. ถ้า MCP client launch จาก install dir (กรณี global config เช่น Windsurf) — server จะอ่าน IDE state file แทน.
-
-### เมื่อไหร่ควรตั้งค่าเป็น path แบบชัดเจน
-
-- ใช้ workflow ที่เปิดหลายโปรเจกต์พร้อมกันและทุกโปรเจกต์มี vault — auto-detect ใช้ heuristic ของ "last active window" ซึ่งอาจ stale ในเสี้ยววินาทีที่สลับ window
-- รัน MCP server แบบไม่ผ่าน IDE (เช่น CI, agent runner) ที่ไม่มี IDE state file
-- รันบน Node เก่ากว่า 22.5 (Zed detection ปิดเอง)
-- ต้องการ deterministic behavior 100%
-
-ในกรณีเหล่านี้ตั้ง `MEMORY_PROJECT_ROOT` เป็น absolute path ของ project ตรงๆ จะชนะ auto-detect เสมอ
+ถ้า MCP client ไม่ได้ start server จาก workspace root ให้ตั้ง `MEMORY_PROJECT_ROOT` เสมอ เพื่อไม่ให้ vault ถูกสร้างผิดที่
 
 ## MCP Client Setup
 
@@ -477,9 +433,7 @@ memory_compactVault
 
 ### Vault ถูกสร้างผิดที่
 
-1. ตรวจ env ที่ MCP client ส่งให้ — ใช้ `MEMORY_PROJECT_ROOT=auto` (หรือ `dynamic`) เพื่อให้ server detect workspace จาก IDE state อัตโนมัติ ดูหัวข้อ [Auto-detect Workspace](#auto-detect-workspace)
-2. ถ้ายัง resolve ผิดอยู่ ให้ตั้ง `MEMORY_PROJECT_ROOT` เป็น absolute path ของ project ตรง ๆ ใน MCP config — explicit value ชนะ auto-detect เสมอ
-3. หลังเปลี่ยน config ต้อง **restart MCP client (เช่น reload Windsurf)** เพื่อให้ MCP server โหลด env ใหม่
+ตั้ง `MEMORY_PROJECT_ROOT` ให้ชัดเจนใน MCP config ของ client
 
 ### Client ไม่เห็น tool ใหม่
 

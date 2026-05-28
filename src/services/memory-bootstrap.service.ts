@@ -184,6 +184,9 @@ export class MemoryBootstrapService {
       [".windsurf/workflows/follow-up-radar.md", this.commandDoc("follow-up-radar", "Use MCP server `project-memory`. Call `memory_followUpRadar` with `query`, `taskArea`, and `mode` to surface relevant open follow-ups before starting new work.")],
       [".windsurf/rules/project-memory.md", this.windsurfRule()],
       [".windsurf/mcp_config.example.json", `${JSON.stringify(mcpJson, null, 2)}\n`],
+      [".antigravity/AGENTS.md", this.antigravityRule(projectName)],
+      [".antigravity/mcp.json", `${JSON.stringify(mcpJson, null, 2)}\n`],
+      [".antigravity/mcp_config.json", `${JSON.stringify(mcpJson, null, 2)}\n`],
       [".antigravity/mcp.example.json", `${JSON.stringify(mcpJson, null, 2)}\n`],
     ];
   }
@@ -250,6 +253,23 @@ export class MemoryBootstrapService {
       "---",
       "",
       "# Project Memory",
+      "",
+      ...this.alwaysOnMemoryProtocol(),
+      "",
+    ].join("\n");
+  }
+
+  private antigravityRule(projectName: string) {
+    return [
+      "# Antigravity Project Memory",
+      "",
+      `This is the project-local Antigravity memory rule for ${projectName}.`,
+      "",
+      "Use MCP server `project-memory` on every substantive task or turn that touches code, config, infra, tests, project docs, or durable decisions.",
+      "",
+      "## Routing",
+      "",
+      "`MEMORY_PROJECT_ROOT` is `dynamic`. The first `memory_*` call returns `vaultRoot`; it must point at this workspace's `memory/` directory. If it points at another project, stop before editing files and report the bad route.",
       "",
       ...this.alwaysOnMemoryProtocol(),
       "",
@@ -523,6 +543,9 @@ export class MemoryBootstrapService {
         "- `../.windsurf/rules/project-memory.md`: Windsurf always-on memory rule.",
         "- `../.windsurf/workflows/`: Windsurf workflow prompts.",
         "- `../.windsurf/mcp_config.example.json`: Windsurf MCP example for user-level import.",
+        "- `../.antigravity/AGENTS.md`: Google Antigravity project memory rule.",
+        "- `../.antigravity/mcp.json`: Google Antigravity project MCP configuration.",
+        "- `../.antigravity/mcp_config.json`: Google Antigravity compatibility MCP configuration.",
         "- `../.antigravity/mcp.example.json`: Google Antigravity MCP example for user-level import.",
         "",
         "## Required Flow",
