@@ -79,6 +79,8 @@ export interface RollbackSummary {
   vaultRoot: string;
   dryRun: boolean;
   backupDir: string | null;
+  /** Where the pre-rollback snapshot of current content was written (if any). */
+  snapshotDir: string | null;
   restored: number;
   results: RollbackOutcome[];
 }
@@ -216,15 +218,27 @@ export class FrontmatterService {
     const backupDir = options.backupDir ?? this.latestBackupDir(backupsRoot);
     const results: RollbackOutcome[] = [];
     if (!backupDir || !existsSync(backupDir)) {
-      return { vaultRoot: this.vault.vaultRoot, dryRun, backupDir: null, restored: 0, results };
+      return { vaultRoot: this.vault.vaultRoot, dryRun, backupDir: null, snapshotDir: null, restored: 0, results };
     }
+    // Snapshot the current (pre-rollback) content of any note we are about to
+    // overwrite so the rollback is itself reversible — a user who restored by
+    // mistake (or had edited after the fix) can recover. Created lazily.
+    let snapshotDir: string | null = null;
     for (const absolute of this.listFilesRecursive(backupDir)) {
       const rel = relative(backupDir, absolute).replace(/\\/g, "/");
+      const restoredContent = readFileSync(absolute, "utf8");
       if (!dryRun) {
         try {
           const target = this.vault.noteFullPath(rel);
+          if (existsSync(target)) {
+            const current = readFileSync(target, "utf8");
+            if (current !== restoredContent) {
+              snapshotDir = snapshotDir ?? this.makeSnapshotDir();
+              this.backupFileVerified(rel, current, snapshotDir);
+            }
+          }
           mkdirSync(dirname(target), { recursive: true });
-          this.writeFileAtomic(target, readFileSync(absolute, "utf8"));
+          this.writeFileAtomic(target, restoredContent);
         } catch {
           // Skip a single un-restorable file rather than abort the whole
           // restore and leave the vault in a half-rolled-back state.
@@ -233,7 +247,7 @@ export class FrontmatterService {
       }
       results.push({ path: rel, status: dryRun ? "would-restore" : "restored" });
     }
-    return { vaultRoot: this.vault.vaultRoot, dryRun, backupDir, restored: results.length, results };
+    return { vaultRoot: this.vault.vaultRoot, dryRun, backupDir, snapshotDir, restored: results.length, results };
   }
 
   async migrate(options: { dryRun?: boolean; paths?: string[]; backup?: boolean } = {}): Promise<MigrateSummary> {
@@ -425,7 +439,11 @@ export class FrontmatterService {
 
   private latestBackupDir(backupsRoot: string): string | undefined {
     if (!existsSync(backupsRoot)) return undefined;
+    // Only fix/migrate backups are ISO-timestamped at the top level. Exclude
+    // note-overwrite-* (NoteRepository) and pre-rollback-* (snapshot) dirs so a
+    // default rollback never restores FROM a snapshot it just created.
     const dirs = readdirSync(backupsRoot)
+      .filter((name) => /^\d{4}-\d{2}-\d{2}T/.test(name))
       .map((name) => join(backupsRoot, name))
       .filter((full) => {
         try {
@@ -488,6 +506,14 @@ export class FrontmatterService {
   private makeBackupDir(): string {
     const stamp = new Date().toISOString().replace(/[:.]/g, "-");
     const dir = join(this.vault.vaultRoot, ".memory-mcp", "backups", stamp);
+    mkdirSync(dir, { recursive: true });
+    return dir;
+  }
+
+  /** Pre-rollback snapshot dir; prefixed so latestBackupDir never selects it. */
+  private makeSnapshotDir(): string {
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+    const dir = join(this.vault.vaultRoot, ".memory-mcp", "backups", `pre-rollback-${stamp}`);
     mkdirSync(dir, { recursive: true });
     return dir;
   }

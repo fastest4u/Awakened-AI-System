@@ -277,6 +277,23 @@ describe("FrontmatterService safety hardening", () => {
     assert.match(fixed, /created: "2026-01-02"/); // alias still canonicalized
     assert.doesNotMatch(fixed, /created_at/);
   });
+
+  it("rollback snapshots current content before restoring (a reversible rollback)", async () => {
+    writeFileSync(join(root, "alias.md"), `---\ntitle: "A"\ntype: note\ncreated_at: 2026-01-02\nupdated: "2026-01-03"\n---\n\n# A\n`);
+    const fix = await service.fix({ dryRun: false });
+    assert.ok(fix.backupDir);
+
+    // The user edits the fixed note afterwards.
+    const edited = `${readFileSync(join(root, "alias.md"), "utf8")}extra line\n`;
+    writeFileSync(join(root, "alias.md"), edited);
+
+    const rollback = await service.rollback({ dryRun: false });
+    // The pre-rollback (edited) content is preserved so the rollback is reversible.
+    assert.ok(rollback.snapshotDir && existsSync(rollback.snapshotDir));
+    assert.equal(readFileSync(join(rollback.snapshotDir!, "alias.md"), "utf8"), edited);
+    // And the note is restored to the original pre-fix content.
+    assert.match(readFileSync(join(root, "alias.md"), "utf8"), /created_at/);
+  });
 });
 
 describe("FrontmatterService semantic exemption policy", () => {
