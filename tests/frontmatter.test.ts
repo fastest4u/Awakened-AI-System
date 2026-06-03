@@ -92,6 +92,13 @@ describe("parseFrontmatter — structural diagnostics", () => {
     const result = parseFrontmatter(`---\ntitle: One\ntype: note\n---\n\n---\ntitle: Two\n---\n\nbody\n`);
     assert.ok(codes(result.raw).includes("FRONTMATTER_MULTIPLE_BLOCKS"));
   });
+
+  it("maps each top-level key to its 1-based source line", () => {
+    const result = parseFrontmatter(`---\ntitle: X\ntype: note\ncreated: nope\n---\n\nbody\n`);
+    assert.equal(result.fieldLines.title, 2);
+    assert.equal(result.fieldLines.type, 3);
+    assert.equal(result.fieldLines.created, 4);
+  });
 });
 
 describe("yamlScalar", () => {

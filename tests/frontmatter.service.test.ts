@@ -233,6 +233,36 @@ describe("FrontmatterService safety hardening", () => {
     assert.equal(readFileSync(join(root, "multi.md"), "utf8"), multi);
   });
 
+  it("migrate refuses to downgrade a note whose schema-version is newer than current", async () => {
+    const future = `---\ntitle: "F"\ntype: note\nschema-version: "2"\ncreated: "2026-01-01"\nupdated: "2026-01-01"\n---\n\n# F\n`;
+    writeFileSync(join(root, "future.md"), future);
+    const result = await service.migrate({ dryRun: false });
+    const outcome = result.results.find((r) => r.path === "future.md");
+    assert.equal(outcome?.status, "skipped");
+    assert.match(outcome?.reason ?? "", /newer/);
+    assert.equal(readFileSync(join(root, "future.md"), "utf8"), future);
+  });
+
+  it("migrate skips a note whose schema-version is not a recognized integer", async () => {
+    const garbage = `---\ntitle: "G"\ntype: note\nschema-version: "v1.2"\ncreated: "2026-01-01"\nupdated: "2026-01-01"\n---\n\n# G\n`;
+    writeFileSync(join(root, "garbage.md"), garbage);
+    const result = await service.migrate({ dryRun: false });
+    const outcome = result.results.find((r) => r.path === "garbage.md");
+    assert.equal(outcome?.status, "skipped");
+    assert.match(outcome?.reason ?? "", /[Uu]nrecognized/);
+    assert.equal(readFileSync(join(root, "garbage.md"), "utf8"), garbage);
+  });
+
+  it("migrate stamps a legacy (version 0) note up to the current version", async () => {
+    writeFileSync(join(root, "legacy.md"), `---\ntitle: "L"\ntype: note\ncreated: "2026-01-01"\nupdated: "2026-01-01"\n---\n\n# L\n`);
+    const result = await service.migrate({ dryRun: false });
+    const outcome = result.results.find((r) => r.path === "legacy.md");
+    assert.equal(outcome?.status, "fixed");
+    assert.equal(outcome?.fromVersion, "0");
+    assert.equal(outcome?.toVersion, "1");
+    assert.match(readFileSync(join(root, "legacy.md"), "utf8"), /schema-version: 1/);
+  });
+
   it("fix preserves CRLF line endings and body indentation", async () => {
     writeFileSync(
       join(root, "crlf.md"),

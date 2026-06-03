@@ -7,6 +7,73 @@ import { REQUIRED_FIELDS_BY_TYPE, VALID_NOTE_TYPES } from "./memory-format.js";
  */
 export const FRONTMATTER_SCHEMA_VERSION = "1";
 
+/** Numeric form of a schema-version, or null when it is not a non-negative integer. */
+export function parseSchemaVersion(value: unknown): number | null {
+  const str = String(value ?? "0").trim();
+  if (!/^\d+$/.test(str)) return null;
+  const numeric = Number(str);
+  return Number.isInteger(numeric) && numeric >= 0 ? numeric : null;
+}
+
+/** The current schema version as a number (parsed once from the string constant). */
+export const CURRENT_SCHEMA_VERSION = parseSchemaVersion(FRONTMATTER_SCHEMA_VERSION) ?? 0;
+
+/** One ordered upgrade step that transforms note data toward the current shape. */
+export interface SchemaMigration {
+  /** Version this step upgrades FROM. */
+  from: number;
+  /** Version this step upgrades TO (must be from + 1). */
+  to: number;
+  /** Short, stable label recorded in the migration report. */
+  describe: string;
+  /** Pure transform of the frontmatter data. */
+  transform: (data: Record<string, unknown>) => Record<string, unknown>;
+}
+
+/**
+ * Ordered registry of per-version data transforms. Empty today because v0 -> v1
+ * needed no shape change (canonicalization handles it); future shape changes
+ * register an entry here so `migrate` carries a real data transformation
+ * instead of a bare version bump. Entries must be ordered by ascending `from`.
+ */
+export const FRONTMATTER_MIGRATIONS: readonly SchemaMigration[] = [];
+
+export type MigrationPlan =
+  | { action: "migrate"; from: number; to: number; steps: string[] }
+  | { action: "skip"; recognized: boolean; reason: string };
+
+/** Decide what migrate() should do for a note whose schema-version is `raw`. */
+export function planSchemaMigration(raw: unknown): MigrationPlan {
+  const from = parseSchemaVersion(raw);
+  if (from === null) {
+    return { action: "skip", recognized: false, reason: `Unrecognized schema-version '${String(raw)}'; fix by hand.` };
+  }
+  if (from > CURRENT_SCHEMA_VERSION) {
+    return { action: "skip", recognized: true, reason: `schema-version ${from} is newer than the supported ${CURRENT_SCHEMA_VERSION}; refusing to downgrade.` };
+  }
+  if (from === CURRENT_SCHEMA_VERSION) {
+    return { action: "skip", recognized: true, reason: "Already at the current schema-version." };
+  }
+  const steps = FRONTMATTER_MIGRATIONS.filter((m) => m.from >= from && m.to <= CURRENT_SCHEMA_VERSION).map((m) => m.describe);
+  return { action: "migrate", from, to: CURRENT_SCHEMA_VERSION, steps };
+}
+
+/** Apply the registered transforms in order from `from` up to current. Pure. */
+export function applySchemaMigrations(
+  data: Record<string, unknown>,
+  from: number,
+): { data: Record<string, unknown>; applied: string[] } {
+  let out: Record<string, unknown> = { ...data };
+  const applied: string[] = [];
+  for (const migration of FRONTMATTER_MIGRATIONS) {
+    if (migration.from >= from && migration.to <= CURRENT_SCHEMA_VERSION) {
+      out = migration.transform(out);
+      applied.push(migration.describe);
+    }
+  }
+  return { data: out, applied };
+}
+
 export interface FrontmatterSchema {
   version: string;
   validTypes: readonly string[];
@@ -240,6 +307,8 @@ export interface ValidateContext {
   hasFrontmatter: boolean;
   /** Root meta files (README/AGENTS) are allowed to omit frontmatter. */
   isExempt?: boolean;
+  /** Top-level key -> 1-based source line, used to locate field diagnostics. */
+  fieldLines?: Record<string, number>;
 }
 
 const AUTO_FIXABLE_REQUIRED = new Set(["created", "updated", "status", "schema-version"]);
@@ -255,6 +324,7 @@ export function validateFrontmatter(
   schema: FrontmatterSchema = defaultFrontmatterSchema(),
 ): FrontmatterDiagnostic[] {
   const diagnostics: FrontmatterDiagnostic[] = [];
+  const lineOf = (field: string): number | undefined => context.fieldLines?.[field];
 
   if (!context.hasFrontmatter) {
     if (!context.isExempt) {
@@ -275,6 +345,7 @@ export function validateFrontmatter(
       code: "INVALID_TYPE",
       severity: "error",
       field: "type",
+      line: lineOf("type"),
       message: `Invalid note type: ${type}`,
       suggestion: `Use one of: ${schema.validTypes.join(", ")}.`,
       autoFixAvailable: false,
@@ -290,6 +361,7 @@ export function validateFrontmatter(
         code: "MISSING_REQUIRED_FIELD",
         severity: "error",
         field,
+        line: lineOf(field),
         message: `Missing required field for type ${type}: ${field}`,
         suggestion: AUTO_FIXABLE_REQUIRED.has(field)
           ? `Add '${field}' (the fixer can fill a safe default).`
@@ -306,6 +378,7 @@ export function validateFrontmatter(
         code: "INVALID_DATE_FORMAT",
         severity: "warning",
         field,
+        line: lineOf(field),
         message: `Field '${field}' is not in YYYY-MM-DD format.`,
         suggestion: "Use a quoted YYYY-MM-DD date string.",
         autoFixAvailable: normalizeDateValue(data[field]) !== null,
@@ -318,6 +391,7 @@ export function validateFrontmatter(
       code: "INVALID_TAGS",
       severity: "warning",
       field: "tags",
+      line: lineOf("tags"),
       message: "'tags' should be a YAML list.",
       suggestion: "Convert tags to a list of strings.",
       autoFixAvailable: typeof data.tags === "string",
@@ -332,6 +406,7 @@ export function validateFrontmatter(
           code: "UNKNOWN_FIELD",
           severity: "info",
           field: key,
+          line: lineOf(key),
           message: `Unknown frontmatter field '${key}'.`,
           suggestion: "Remove it or move the information into the note body.",
           autoFixAvailable: false,

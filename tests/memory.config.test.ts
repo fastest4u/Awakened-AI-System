@@ -685,6 +685,22 @@ describe("diagnoseMemoryConfig", () => {
     assert.deepEqual(diagnostic.build, { builtAt: "2026-06-01T00:00:00.000Z", version: "0.1.0-test" });
     assert.equal(diagnostic.runtime.nodeVersion, "v-test");
     assert.equal(diagnostic.runtime.pid, 123);
+    assert.equal(diagnostic.vaultWithinProject, true);
+  });
+
+  it("reports vaultWithinProject=false when MEMORY_VAULT_PATH points outside the project", () => {
+    const project = join(tmpRoot, "proj");
+    mkdirSync(join(project, "memory"), { recursive: true });
+    writeFileSync(join(project, "memory", "AGENTS.md"), "# vault\n");
+    const external = join(tmpRoot, "external-vault");
+    mkdirSync(external, { recursive: true });
+
+    const diagnostic = diagnoseMemoryConfig(
+      { MEMORY_PROJECT_ROOT: project, MEMORY_VAULT_PATH: external } as NodeJS.ProcessEnv,
+      tmpRoot,
+    );
+
+    assert.equal(diagnostic.vaultWithinProject, false);
   });
 });
 

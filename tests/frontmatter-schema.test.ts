@@ -2,14 +2,54 @@ import { strict as assert } from "node:assert";
 import { describe, it } from "node:test";
 import {
   canonicalizeFrontmatter,
+  CURRENT_SCHEMA_VERSION,
   defaultFrontmatterSchema,
   isCanonicalDate,
   mergeFrontmatterSchema,
   normalizeDateValue,
+  parseSchemaVersion,
+  planSchemaMigration,
   validateFrontmatter,
 } from "../src/utils/frontmatter-schema.js";
 
 const codesOf = (diags: { code: string }[]) => diags.map((d) => d.code);
+
+describe("validateFrontmatter field line numbers", () => {
+  it("attaches the source line to a field diagnostic from fieldLines", () => {
+    const diags = validateFrontmatter(
+      { title: "X", type: "note", created: "nope", updated: "2026-01-01" },
+      { hasFrontmatter: true, fieldLines: { type: 3, created: 4 } },
+    );
+    assert.equal(diags.find((d) => d.code === "INVALID_DATE_FORMAT")?.line, 4);
+  });
+
+  it("leaves the line undefined when fieldLines has no entry (e.g. a missing field)", () => {
+    const diags = validateFrontmatter(
+      { title: "X", type: "insight", created: "2026-01-01", updated: "2026-01-01" },
+      { hasFrontmatter: true, fieldLines: {} },
+    );
+    assert.equal(diags.find((d) => d.code === "MISSING_REQUIRED_FIELD")?.line, undefined);
+  });
+});
+
+describe("schema-version planning", () => {
+  it("parses non-negative integers and rejects non-integer junk", () => {
+    assert.equal(parseSchemaVersion("0"), 0);
+    assert.equal(parseSchemaVersion("1"), 1);
+    assert.equal(parseSchemaVersion(undefined), 0);
+    assert.equal(parseSchemaVersion("v1"), null);
+    assert.equal(parseSchemaVersion("1.2"), null);
+  });
+
+  it("migrates legacy, skips current/newer/unrecognized", () => {
+    assert.equal(planSchemaMigration("0").action, "migrate");
+    assert.equal(planSchemaMigration(String(CURRENT_SCHEMA_VERSION)).action, "skip");
+    const newer = planSchemaMigration(String(CURRENT_SCHEMA_VERSION + 1));
+    assert.equal(newer.action === "skip" && newer.recognized, true);
+    const junk = planSchemaMigration("abc");
+    assert.equal(junk.action === "skip" && junk.recognized, false);
+  });
+});
 
 describe("normalizeDateValue", () => {
   it("converts a Date to YYYY-MM-DD", () => {

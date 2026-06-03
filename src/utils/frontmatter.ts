@@ -11,9 +11,38 @@ import matter from "gray-matter";
  */
 export type FrontmatterSeverity = "info" | "warning" | "error" | "critical";
 
+/**
+ * Single source of truth for every frontmatter diagnostic code. Emitters, the
+ * fixer, reports, tests, and docs all reference these so a typo cannot silently
+ * diverge — `FrontmatterDiagnostic.code` is typed to this union, so an unknown
+ * code is a compile error.
+ */
+export const FRONTMATTER_CODES = {
+  BOM: "FRONTMATTER_BOM",
+  NOT_AT_START: "FRONTMATTER_NOT_AT_START",
+  UNCLOSED: "FRONTMATTER_UNCLOSED",
+  EMPTY: "FRONTMATTER_EMPTY",
+  MULTIPLE_BLOCKS: "FRONTMATTER_MULTIPLE_BLOCKS",
+  DUPLICATE_KEY: "FRONTMATTER_DUPLICATE_KEY",
+  BAD_INDENTATION: "FRONTMATTER_BAD_INDENTATION",
+  UNQUOTED_VALUE: "FRONTMATTER_UNQUOTED_VALUE",
+  INVALID_YAML: "FRONTMATTER_INVALID_YAML",
+  FIELD_ALIASED: "FIELD_ALIASED",
+  DATE_NORMALIZED: "DATE_NORMALIZED",
+  TAGS_COERCED: "TAGS_COERCED",
+  MISSING_FRONTMATTER: "MISSING_FRONTMATTER",
+  INVALID_TYPE: "INVALID_TYPE",
+  MISSING_REQUIRED_FIELD: "MISSING_REQUIRED_FIELD",
+  INVALID_DATE_FORMAT: "INVALID_DATE_FORMAT",
+  INVALID_TAGS: "INVALID_TAGS",
+  UNKNOWN_FIELD: "UNKNOWN_FIELD",
+} as const;
+
+export type FrontmatterCode = (typeof FRONTMATTER_CODES)[keyof typeof FRONTMATTER_CODES];
+
 export interface FrontmatterDiagnostic {
-  /** Stable machine code, e.g. FRONTMATTER_UNCLOSED. */
-  code: string;
+  /** Stable machine code from FRONTMATTER_CODES, e.g. FRONTMATTER_UNCLOSED. */
+  code: FrontmatterCode;
   severity: FrontmatterSeverity;
   /** Human-readable, suggestion-oriented message. */
   message: string;
@@ -38,6 +67,8 @@ export interface ParsedFrontmatter {
   raw: string;
   /** Dominant line ending of the source ("\r\n" if any CRLF present, else "\n"). */
   eol: string;
+  /** Top-level frontmatter key (as written) -> 1-based source line number. */
+  fieldLines: Record<string, number>;
   /** Structural diagnostics discovered while parsing. Never throws. */
   diagnostics: FrontmatterDiagnostic[];
 }
@@ -83,7 +114,7 @@ export function parseFrontmatter(input: unknown): ParsedFrontmatter {
   // frontmatter. Whether that is a problem depends on note type/policy, which
   // is decided by validateFrontmatter, not here.
   if (firstNonEmptyIdx === -1 || !DELIMITER.test(lines[firstNonEmptyIdx])) {
-    return { hasFrontmatter: false, data: {}, body: raw, raw, eol, diagnostics };
+    return { hasFrontmatter: false, data: {}, body: raw, raw, eol, fieldLines: {}, diagnostics };
   }
 
   const openIdx = firstNonEmptyIdx;
@@ -116,10 +147,17 @@ export function parseFrontmatter(input: unknown): ParsedFrontmatter {
       suggestion: "Add a closing '---' line directly after the frontmatter fields.",
       autoFixAvailable: false,
     });
-    return { hasFrontmatter: true, data: {}, body: raw, raw, eol, diagnostics };
+    return { hasFrontmatter: true, data: {}, body: raw, raw, eol, fieldLines: {}, diagnostics };
   }
 
   const innerLines = lines.slice(openIdx + 1, closeIdx);
+  // Map each top-level key (column 0, no indentation) to its 1-based file line
+  // so schema-layer diagnostics (invalid type/date/tags) can point at the field.
+  const fieldLines: Record<string, number> = {};
+  innerLines.forEach((innerLine, index) => {
+    const match = /^([A-Za-z0-9_][A-Za-z0-9_-]*)\s*:/.exec(innerLine);
+    if (match) fieldLines[match[1]] = openIdx + 2 + index;
+  });
   if (innerLines.every((line) => line.trim().length === 0)) {
     diagnostics.push({
       code: "FRONTMATTER_EMPTY",
@@ -160,10 +198,10 @@ export function parseFrontmatter(input: unknown): ParsedFrontmatter {
     (matter as unknown as { clearCache?: () => void }).clearCache?.();
     const result = matter(toParse);
     const data = result.data && typeof result.data === "object" ? (result.data as Record<string, unknown>) : {};
-    return { hasFrontmatter: true, data, body: result.content ?? "", raw, eol, diagnostics };
+    return { hasFrontmatter: true, data, body: result.content ?? "", raw, eol, fieldLines, diagnostics };
   } catch (error) {
     diagnostics.push(classifyYamlError(error, openIdx));
-    return { hasFrontmatter: true, data: {}, body: lines.slice(closeIdx + 1).join("\n"), raw, eol, diagnostics };
+    return { hasFrontmatter: true, data: {}, body: lines.slice(closeIdx + 1).join("\n"), raw, eol, fieldLines, diagnostics };
   }
 }
 

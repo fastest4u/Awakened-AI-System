@@ -12,8 +12,10 @@ import {
   type FrontmatterPolicy,
 } from "../config/vault-policy.js";
 import {
+  applySchemaMigrations,
   canonicalizeFrontmatter,
   defaultFrontmatterSchema,
+  planSchemaMigration,
   validateFrontmatter,
   FRONTMATTER_SCHEMA_VERSION,
   type FrontmatterSchema,
@@ -243,12 +245,13 @@ export class FrontmatterService {
 
     for (const relativePath of targets) {
       const scan = this.scanFile(relativePath);
-      const fromVersion = String(scan.data["schema-version"] ?? "0");
+      const fromVersionRaw = scan.data["schema-version"] ?? "0";
+      const fromVersion = String(fromVersionRaw);
       if (scan.hasCritical) {
         results.push({ path: relativePath, status: "manual", reason: "Unparseable YAML; fix by hand.", appliedFixes: [], fromVersion, toVersion: fromVersion });
         continue;
       }
-      if (scan.isExempt || fromVersion === FRONTMATTER_SCHEMA_VERSION) continue;
+      if (scan.isExempt) continue;
       // Migration only stamps notes that already declare frontmatter. It must
       // NOT invent a block (title/created) for a body-only note — that would
       // persist guessed data. Adding frontmatter is the `fix` command's job.
@@ -263,12 +266,20 @@ export class FrontmatterService {
         });
         continue;
       }
+      // Numeric guard: skip notes already current, and refuse to "downgrade" a
+      // note whose schema-version is newer than (or not a known integer) ours.
+      const plan = planSchemaMigration(fromVersionRaw);
+      if (plan.action === "skip") {
+        if (plan.recognized && plan.reason.startsWith("Already at")) continue;
+        results.push({ path: relativePath, status: "skipped", reason: plan.reason, appliedFixes: [], fromVersion, toVersion: fromVersion });
+        continue;
+      }
       const blockReason = this.rewriteBlockReason(scan);
       if (blockReason) {
         results.push({ path: relativePath, status: "manual", reason: blockReason, appliedFixes: [], fromVersion, toVersion: fromVersion });
         continue;
       }
-      const { content, appliedFixes } = this.computeRewrite(scan, { stampVersion: true });
+      const { content, appliedFixes } = this.computeRewrite(scan, { stampVersion: true, migrateFrom: plan.from });
       if (content === scan.raw) continue;
       if (!dryRun) {
         try {
@@ -283,7 +294,7 @@ export class FrontmatterService {
         status: dryRun ? "would-fix" : "fixed",
         appliedFixes: [...appliedFixes, "STAMP_SCHEMA_VERSION"],
         fromVersion,
-        toVersion: FRONTMATTER_SCHEMA_VERSION,
+        toVersion: String(plan.to),
       });
     }
 
@@ -337,6 +348,7 @@ export class FrontmatterService {
           path: relativePath,
           hasFrontmatter: parsed.hasFrontmatter,
           isExempt,
+          fieldLines: parsed.fieldLines,
         }, this.schema);
     return {
       path: relativePath,
@@ -351,10 +363,20 @@ export class FrontmatterService {
     };
   }
 
-  private computeRewrite(scan: ScanResult, options: { stampVersion?: boolean; unsafe?: boolean } = {}): { content: string; appliedFixes: string[] } {
+  private computeRewrite(
+    scan: ScanResult,
+    options: { stampVersion?: boolean; unsafe?: boolean; migrateFrom?: number } = {},
+  ): { content: string; appliedFixes: string[] } {
     const applied = new Set<string>();
-    const data: Record<string, unknown> = { ...scan.data };
+    let data: Record<string, unknown> = { ...scan.data };
     const today = todayIso();
+
+    // Apply any registered per-version data transforms before canonicalization.
+    if (options.migrateFrom !== undefined) {
+      const migrated = applySchemaMigrations(data, options.migrateFrom);
+      data = migrated.data;
+      for (const step of migrated.applied) applied.add(step);
+    }
 
     for (const diagnostic of scan.diagnostics) {
       if (CANONICALIZE_FIX_CODES.has(diagnostic.code)) applied.add(diagnostic.code);

@@ -44,6 +44,12 @@ export interface MemoryConfigDiagnostic {
     startedAt: string;
   };
   build: MemoryBuildInfo | null;
+  /**
+   * True when the resolved vault lives inside the project root. False usually
+   * means MEMORY_VAULT_PATH points elsewhere on purpose — surfaced (not
+   * enforced) so a mis-resolved root is debuggable.
+   */
+  vaultWithinProject: boolean;
 }
 
 export interface MemoryBuildInfo {
@@ -157,6 +163,13 @@ function isDynamicRootValue(value: string | undefined): boolean {
 
 function hasWorkspaceMarker(directory: string): boolean {
   return workspaceMarkers.some((marker) => existsSync(resolve(directory, marker)));
+}
+
+/** True when `child` resolves to `parent` or a path nested under it. */
+function isPathWithin(parent: string, child: string): boolean {
+  const base = resolve(parent);
+  const target = resolve(child);
+  return target === base || target.startsWith(`${base}/`) || target.startsWith(`${base}\\`);
 }
 
 function hasVaultMarker(directory: string): boolean {
@@ -726,6 +739,7 @@ export function diagnoseMemoryConfig(
       startedAt: runtime.startedAt ?? MODULE_STARTED_AT,
     },
     build: runtime.buildInfo ?? readBuildInfo(runtime.buildInfoPath),
+    vaultWithinProject: isPathWithin(config.projectRoot, config.vaultRoot),
   };
 }
 
