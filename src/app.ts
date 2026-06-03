@@ -36,11 +36,11 @@ export async function bootstrap() {
   const templates = new MemoryTemplateService();
   const bootstrapper = new MemoryBootstrapService(vaultRoot);
   const index = new IndexRepository();
-  const query = new MemoryQueryService(vault, index);
+  const usage = new MemoryUsageService(vaultRoot);
+  const query = new MemoryQueryService(vault, index, usage);
   const frontmatterConfig = loadFrontmatterConfig(vaultRoot);
   const health = new VaultHealthService(vault, frontmatterConfig.policy);
   const frontmatter = new FrontmatterService(vault, frontmatterConfig.schema, frontmatterConfig.sources, frontmatterConfig.policy);
-  const usage = new MemoryUsageService(vaultRoot);
   const compactor = new MemoryCompactionService(query, notes);
   const lifecycle = new MemoryLifecycleService(vaultRoot);
   const followUps = new MemoryFollowUpService(vault);

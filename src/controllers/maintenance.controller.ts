@@ -28,7 +28,8 @@ export class MaintenanceController {
 
   async reindex(_: z.infer<typeof reindexInputSchema>) {
     const startedAt = Date.now();
-    const records = await this.query.snapshotIndex();
+    // Explicit reindex forces a full rebuild (ignores the incremental mtime cache).
+    const records = await this.query.snapshotIndex({ force: true });
     return this.responses.buildOk("memory_reindex", startedAt, { indexedCount: records.length, durationMs: Date.now() - startedAt });
   }
 
