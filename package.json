@@ -5,10 +5,14 @@
   "type": "module",
   "description": "MCP server for an Obsidian-based memory vault",
   "main": "dist/index.js",
+  "bin": {
+    "memory-vault": "dist/cli.js"
+  },
   "scripts": {
     "dev": "npm run build && node dist/index.js",
     "start": "node dist/index.js",
     "build": "node scripts/build.js",
+    "memory-vault": "node dist/cli.js",
     "typecheck": "tsc --noEmit",
     "lint": "tsc --noEmit",
     "test:build": "tsc -p tsconfig.test.json",

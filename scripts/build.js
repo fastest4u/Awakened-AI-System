@@ -9,6 +9,7 @@ const __dirname = path.dirname(__filename);
 
 const outDir = path.resolve(__dirname, '../dist');
 const outFile = path.join(outDir, 'index.js');
+const packageJson = JSON.parse(readFileSync(path.resolve(__dirname, '../package.json'), 'utf8'));
 
 async function build() {
     // Ensure dist directory exists
@@ -64,8 +65,30 @@ async function build() {
     });
 
     writeFileSync(outFile, obfuscationResult.getObfuscatedCode(), 'utf8');
-    
-    console.log('✅ Build and obfuscation completed successfully! Output saved to: dist/index.js');
+
+    console.log('🧰 Step 3: Bundling CLI (dist/cli.js)...');
+    await esbuild.build({
+        entryPoints: ['src/cli.ts'],
+        bundle: true,
+        platform: 'node',
+        format: 'esm',
+        outfile: path.join(outDir, 'cli.js'),
+        target: 'es2022',
+        minify: true,
+        packages: 'external',
+        banner: { js: '#!/usr/bin/env node' },
+    });
+
+    writeFileSync(
+        path.join(outDir, 'build-info.json'),
+        `${JSON.stringify({
+            builtAt: new Date().toISOString(),
+            version: packageJson.version,
+        }, null, 2)}\n`,
+        'utf8'
+    );
+
+    console.log('✅ Build completed successfully! Output: dist/index.js (MCP server) + dist/cli.js (memory-vault CLI)');
 }
 
 build().catch((error) => {

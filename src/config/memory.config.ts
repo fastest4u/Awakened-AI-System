@@ -2,12 +2,74 @@ import { existsSync, readFileSync, statSync } from "node:fs";
 import { createRequire } from "node:module";
 import { platform as nodePlatform } from "node:os";
 import { dirname, join, parse, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
 export interface MemoryConfig {
   projectRoot: string;
   vaultRoot: string;
   vaultDirName: string;
 }
+
+export interface WorkspaceDiagnosticCandidate {
+  source: string;
+  value: string;
+  dynamic: boolean;
+  exists: boolean;
+  workspaceRoot?: string;
+  hasWorkspaceMarker: boolean;
+  hasVaultMarker: boolean;
+  selected: boolean;
+}
+
+export interface MemoryConfigDiagnostic {
+  config: MemoryConfig;
+  workspace: {
+    source: string;
+    candidates: WorkspaceDiagnosticCandidate[];
+  };
+  env: {
+    MEMORY_PROJECT_ROOT?: string;
+    MEMORY_WORKSPACE_ROOT?: string;
+    WORKSPACE_ROOT?: string;
+    PROJECT_ROOT?: string;
+    MEMORY_VAULT_DIR?: string;
+    MEMORY_VAULT_PATH?: string;
+  };
+  runtime: {
+    cwd: string;
+    argv: string[];
+    nodeVersion: string;
+    pid: number;
+    platform: NodeJS.Platform;
+    startedAt: string;
+  };
+  build: MemoryBuildInfo | null;
+  /**
+   * True when the resolved vault lives inside the project root. False usually
+   * means MEMORY_VAULT_PATH points elsewhere on purpose — surfaced (not
+   * enforced) so a mis-resolved root is debuggable.
+   */
+  vaultWithinProject: boolean;
+}
+
+export interface MemoryBuildInfo {
+  builtAt: string;
+  version: string;
+  gitSha?: string;
+}
+
+interface RuntimeDiagnosticOptions {
+  argv?: string[];
+  buildInfo?: MemoryBuildInfo | null;
+  buildInfoPath?: string;
+  nodeVersion?: string;
+  pid?: number;
+  platform?: NodeJS.Platform;
+  startedAt?: string;
+}
+
+const MODULE_STARTED_AT = new Date().toISOString();
+const DEFAULT_BUILD_INFO_PATH = join(dirname(fileURLToPath(import.meta.url)), "build-info.json");
 
 const firstDefined = (...values: Array<string | undefined>) => values.find((value) => value && value.trim().length > 0);
 
@@ -101,6 +163,13 @@ function isDynamicRootValue(value: string | undefined): boolean {
 
 function hasWorkspaceMarker(directory: string): boolean {
   return workspaceMarkers.some((marker) => existsSync(resolve(directory, marker)));
+}
+
+/** True when `child` resolves to `parent` or a path nested under it. */
+function isPathWithin(parent: string, child: string): boolean {
+  const base = resolve(parent);
+  const target = resolve(child);
+  return target === base || target.startsWith(`${base}/`) || target.startsWith(`${base}\\`);
 }
 
 function hasVaultMarker(directory: string): boolean {
@@ -517,16 +586,31 @@ function findIdeActiveWorkspace(
 }
 
 function resolveDynamicProjectRoot(env: NodeJS.ProcessEnv, cwd: string): string {
-  const ideWorkspace = findIdeActiveWorkspace(env);
+  // Order matters:
+  //   1. Explicit env values win.
+  //   2. If cwd is already inside an initialized memory workspace, trust it.
+  //      This keeps the CLI pointed at the directory it was launched from.
+  //   3. IDE state fills the MCP-server case where cwd is usually the client
+  //      install directory rather than the user's project.
+  const envCandidates = candidateEnvNames
+    .map((name) => env[name])
+    .filter((value): value is string => Boolean(value && value.trim().length > 0 && !isDynamicRootValue(value)));
 
-  // Order matters: explicit env > IDE state > cwd walk-up.
-  // IDE state beats cwd because MCP servers are typically spawned with
-  // cwd = IDE install directory, not the user's project.
-  const candidates = [
-    ...candidateEnvNames.map((name) => env[name]),
-    ideWorkspace,
-    cwd,
-  ].filter((value): value is string => Boolean(value && value.trim().length > 0 && !isDynamicRootValue(value)));
+  for (const candidate of envCandidates) {
+    const workspaceRoot = findWorkspaceRoot(candidate);
+    if (workspaceRoot) {
+      return workspaceRoot;
+    }
+  }
+
+  const cwdWorkspace = findWorkspaceRoot(cwd);
+  if (cwdWorkspace && hasVaultMarker(cwdWorkspace)) {
+    return cwdWorkspace;
+  }
+
+  const ideWorkspace = findIdeActiveWorkspace(env);
+  const candidates = [ideWorkspace, cwd]
+    .filter((value): value is string => Boolean(value && value.trim().length > 0 && !isDynamicRootValue(value)));
 
   for (const candidate of candidates) {
     const workspaceRoot = findWorkspaceRoot(candidate);
@@ -558,6 +642,107 @@ export function loadMemoryConfig(env: NodeJS.ProcessEnv = process.env, cwd = pro
   };
 }
 
+function configuredRootSource(env: NodeJS.ProcessEnv): string | undefined {
+  for (const name of ["MEMORY_PROJECT_ROOT", "PROJECT_ROOT", "WORKSPACE_ROOT"] as const) {
+    const value = env[name];
+    if (value && value.trim().length > 0) return name;
+  }
+  return undefined;
+}
+
+function candidateFromValue(source: string, value: string, selectedRoot: string): WorkspaceDiagnosticCandidate {
+  const dynamic = isDynamicRootValue(value);
+  const workspaceRoot = dynamic ? undefined : findWorkspaceRoot(value);
+  const candidatePath = dynamic ? value : resolve(value);
+  const resolvedWorkspace = workspaceRoot ? resolve(workspaceRoot) : undefined;
+  return {
+    source,
+    value,
+    dynamic,
+    exists: dynamic ? false : existsSync(candidatePath),
+    workspaceRoot: resolvedWorkspace,
+    hasWorkspaceMarker: dynamic ? false : hasWorkspaceMarker(candidatePath),
+    hasVaultMarker: dynamic ? false : hasVaultMarker(candidatePath),
+    selected: resolvedWorkspace !== undefined && resolvedWorkspace.toLowerCase() === resolve(selectedRoot).toLowerCase(),
+  };
+}
+
+function workspaceDiagnosticCandidates(env: NodeJS.ProcessEnv, cwd: string, selectedRoot: string): WorkspaceDiagnosticCandidate[] {
+  const candidates: WorkspaceDiagnosticCandidate[] = [];
+  const names = [...new Set(["MEMORY_PROJECT_ROOT", "PROJECT_ROOT", "WORKSPACE_ROOT", ...candidateEnvNames])];
+  for (const name of names) {
+    const value = env[name];
+    if (value && value.trim().length > 0) {
+      candidates.push(candidateFromValue(name, value, selectedRoot));
+    }
+  }
+
+  const ideWorkspace = findIdeActiveWorkspace(env);
+  if (ideWorkspace) {
+    candidates.push(candidateFromValue("IDE_STATE", ideWorkspace, selectedRoot));
+  }
+
+  candidates.push(candidateFromValue("cwd", cwd, selectedRoot));
+  return candidates;
+}
+
+function readBuildInfo(path = DEFAULT_BUILD_INFO_PATH): MemoryBuildInfo | null {
+  if (!existsSync(path)) return null;
+  try {
+    const parsed: unknown = JSON.parse(readFileSync(path, "utf8"));
+    if (!parsed || typeof parsed !== "object") return null;
+    const data = parsed as Record<string, unknown>;
+    if (typeof data.builtAt !== "string" || typeof data.version !== "string") return null;
+    return {
+      builtAt: data.builtAt,
+      version: data.version,
+      gitSha: typeof data.gitSha === "string" ? data.gitSha : undefined,
+    };
+  } catch {
+    return null;
+  }
+}
+
+export function diagnoseMemoryConfig(
+  env: NodeJS.ProcessEnv = process.env,
+  cwd = process.cwd(),
+  runtime: RuntimeDiagnosticOptions = {},
+): MemoryConfigDiagnostic {
+  const config = loadMemoryConfig(env, cwd);
+  const candidates = workspaceDiagnosticCandidates(env, cwd, config.projectRoot);
+  const selected = candidates.find((candidate) => candidate.selected);
+  const configuredSource = configuredRootSource(env);
+  const explicitSource = configuredSource && !isDynamicRootValue(env[configuredSource])
+    ? configuredSource
+    : undefined;
+
+  return {
+    config,
+    workspace: {
+      source: explicitSource ?? selected?.source ?? "fallback-cwd",
+      candidates,
+    },
+    env: {
+      MEMORY_PROJECT_ROOT: env.MEMORY_PROJECT_ROOT,
+      MEMORY_WORKSPACE_ROOT: env.MEMORY_WORKSPACE_ROOT,
+      WORKSPACE_ROOT: env.WORKSPACE_ROOT,
+      PROJECT_ROOT: env.PROJECT_ROOT,
+      MEMORY_VAULT_DIR: env.MEMORY_VAULT_DIR,
+      MEMORY_VAULT_PATH: env.MEMORY_VAULT_PATH,
+    },
+    runtime: {
+      cwd,
+      argv: runtime.argv ?? process.argv,
+      nodeVersion: runtime.nodeVersion ?? process.version,
+      pid: runtime.pid ?? process.pid,
+      platform: runtime.platform ?? nodePlatform(),
+      startedAt: runtime.startedAt ?? MODULE_STARTED_AT,
+    },
+    build: runtime.buildInfo ?? readBuildInfo(runtime.buildInfoPath),
+    vaultWithinProject: isPathWithin(config.projectRoot, config.vaultRoot),
+  };
+}
+
 // Internal API exposed for tests. Keep this list tight and explicit so the
 // public surface (`loadMemoryConfig`) stays the supported entry point.
 export const __internals = {
@@ -574,6 +759,7 @@ export const __internals = {
   pickIdeActiveWorkspace,
   findIdeActiveWorkspace,
   resolveDynamicProjectRoot,
+  readBuildInfo,
   hasWorkspaceMarker,
   hasVaultMarker,
   findWorkspaceRoot,

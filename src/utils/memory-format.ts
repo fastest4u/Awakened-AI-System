@@ -1,3 +1,5 @@
+import { yamlScalar } from "./frontmatter.js";
+
 export const VALID_NOTE_TYPES = [
   "note",
   "index",
@@ -75,12 +77,6 @@ export function inferTypeFromPath(path: string): MemoryNoteType {
   if (normalized.includes("06_Sources")) return "source";
   if (normalized.includes("00_Index")) return "index";
   return "note";
-}
-
-function yamlScalar(value: string | number | boolean) {
-  if (typeof value === "number" || typeof value === "boolean") return String(value);
-  if (/^[a-zA-Z0-9_./@# -]+$/.test(value) && !value.includes(":")) return value;
-  return JSON.stringify(value);
 }
 
 export function frontmatter(fields: Record<string, string | number | boolean | string[] | undefined>) {
