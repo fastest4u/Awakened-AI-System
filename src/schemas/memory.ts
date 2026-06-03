@@ -149,6 +149,26 @@ export const verifyVaultInputSchema = z.object({
   includeWarnings: z.boolean().default(true),
 });
 
+export const validateFrontmatterInputSchema = z.object({
+  paths: z.array(z.string()).default([]),
+  format: z.enum(["text", "json", "markdown"]).default("json"),
+});
+
+export const fixFrontmatterInputSchema = z.object({
+  paths: z.array(z.string()).default([]),
+  dryRun: z.boolean().default(true),
+  backup: z.boolean().default(true),
+  unsafe: z.boolean().default(false),
+  confirm: z.boolean().default(false),
+});
+
+export const migrateFrontmatterInputSchema = z.object({
+  paths: z.array(z.string()).default([]),
+  dryRun: z.boolean().default(true),
+  backup: z.boolean().default(true),
+  rollback: z.boolean().default(false),
+});
+
 export const reindexInputSchema = z.object({
   full: z.boolean().default(true),
 });
@@ -175,6 +195,8 @@ export const importInputSchema = z.object({
   format: z.enum(["markdown", "zip", "json"]).default("markdown"),
   targetFolder: z.string().min(1),
 });
+
+export const diagnoseWorkspaceInputSchema = z.object({});
 
 export const bootstrapProjectInputSchema = z.object({
   projectName: z.string().min(1).optional(),

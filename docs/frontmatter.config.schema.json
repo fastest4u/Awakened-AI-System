@@ -1,0 +1,61 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://awakened-ai-memory-mcp.local/frontmatter.config.schema.json",
+  "title": "Memory Vault frontmatter config",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "$schema": {
+      "type": "string"
+    },
+    "aliases": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string"
+      },
+      "description": "Map alternate frontmatter field names to canonical field names."
+    },
+    "requiredFieldsByType": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "description": "Override required fields per note type."
+    },
+    "dateFields": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Additional fields that should be normalized as YYYY-MM-DD dates."
+    },
+    "validTypes": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Additional valid note types for this vault."
+    },
+    "semanticExemptPaths": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Vault-relative glob patterns that skip semantic frontmatter validation/fix/migration."
+    },
+    "keyOrder": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Preferred frontmatter key order when rewriting notes."
+    },
+    "strictUnknownFields": {
+      "type": "boolean",
+      "description": "When true, unknown fields are reported as info diagnostics."
+    }
+  }
+}

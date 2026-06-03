@@ -4,7 +4,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
-import { __internals, loadMemoryConfig } from "../src/config/memory.config.js";
+import { __internals, diagnoseMemoryConfig, loadMemoryConfig } from "../src/config/memory.config.js";
 
 type FsLike = { existsSync: typeof ExistsSync; readFileSync: typeof ReadFileSync };
 
@@ -613,6 +613,28 @@ describe("loadMemoryConfig", () => {
     assert.equal(resolve(result.projectRoot), resolve(project));
   });
 
+  it("prefers the cwd workspace when it already has a vault, even if IDE state points elsewhere", () => {
+    const cwdProject = join(tmpRoot, "cwd-project");
+    mkdirSync(join(cwdProject, "memory"), { recursive: true });
+    writeFileSync(join(cwdProject, "memory", "AGENTS.md"), "# cwd vault\n");
+
+    const ideProject = join(tmpRoot, "ide-project");
+    mkdirSync(join(ideProject, "memory"), { recursive: true });
+    writeFileSync(join(ideProject, "memory", "AGENTS.md"), "# ide vault\n");
+
+    const appData = join(tmpRoot, "appdata");
+    const storageFile = join(appData, "Windsurf", "User", "globalStorage", "storage.json");
+    mkdirSync(join(appData, "Windsurf", "User", "globalStorage"), { recursive: true });
+    writeFileSync(storageFile, JSON.stringify({ windowsState: { lastActiveWindow: { folder: toFileUri(ideProject) } } }));
+
+    const result = loadMemoryConfig(
+      { MEMORY_PROJECT_ROOT: "dynamic", APPDATA: appData } as NodeJS.ProcessEnv,
+      cwdProject,
+    );
+
+    assert.equal(resolve(result.projectRoot), resolve(cwdProject));
+  });
+
   it("MEMORY_VAULT_PATH overrides the resolved vault location", () => {
     const project = join(tmpRoot, "p");
     const vault = join(tmpRoot, "external-vault");
@@ -623,6 +645,46 @@ describe("loadMemoryConfig", () => {
       tmpRoot,
     );
     assert.equal(resolve(result.vaultRoot), resolve(vault));
+  });
+});
+
+describe("diagnoseMemoryConfig", () => {
+  let tmpRoot: string;
+
+  beforeEach(() => {
+    tmpRoot = mkdtempSync(join(tmpdir(), "memcfg-diag-"));
+  });
+
+  afterEach(() => {
+    rmSync(tmpRoot, { recursive: true, force: true });
+  });
+
+  it("reports the selected workspace source, candidates, config, and runtime metadata", () => {
+    const project = join(tmpRoot, "explicit");
+    mkdirSync(join(project, "memory"), { recursive: true });
+    writeFileSync(join(project, "memory", "AGENTS.md"), "# vault\n");
+
+    const diagnostic = diagnoseMemoryConfig(
+      { MEMORY_PROJECT_ROOT: project } as NodeJS.ProcessEnv,
+      tmpRoot,
+      {
+        argv: ["node", "dist/index.js"],
+        buildInfo: { builtAt: "2026-06-01T00:00:00.000Z", version: "0.1.0-test" },
+        nodeVersion: "v-test",
+        pid: 123,
+        startedAt: "2026-06-01T00:00:00.000Z",
+      },
+    );
+
+    assert.equal(resolve(diagnostic.config.projectRoot), resolve(project));
+    assert.equal(resolve(diagnostic.config.vaultRoot), resolve(project, "memory"));
+    assert.equal(diagnostic.workspace.source, "MEMORY_PROJECT_ROOT");
+    assert.equal(diagnostic.workspace.candidates[0].source, "MEMORY_PROJECT_ROOT");
+    assert.equal(diagnostic.workspace.candidates[0].selected, true);
+    assert.deepEqual(diagnostic.runtime.argv, ["node", "dist/index.js"]);
+    assert.deepEqual(diagnostic.build, { builtAt: "2026-06-01T00:00:00.000Z", version: "0.1.0-test" });
+    assert.equal(diagnostic.runtime.nodeVersion, "v-test");
+    assert.equal(diagnostic.runtime.pid, 123);
   });
 });
 

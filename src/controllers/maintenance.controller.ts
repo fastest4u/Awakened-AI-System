@@ -1,5 +1,6 @@
 import type { z } from "zod";
-import { bootstrapProjectInputSchema, compactVaultInputSchema, exportInputSchema, importInputSchema, indexNoteInputSchema, reindexInputSchema } from "../schemas/memory.js";
+import { diagnoseMemoryConfig } from "../config/memory.config.js";
+import { bootstrapProjectInputSchema, compactVaultInputSchema, diagnoseWorkspaceInputSchema, exportInputSchema, importInputSchema, indexNoteInputSchema, reindexInputSchema } from "../schemas/memory.js";
 import type { IndexRepository } from "../repositories/index.repository.js";
 import type { MemoryCompactionService } from "../services/memory-compaction.service.js";
 import type { MemoryBootstrapService } from "../services/memory-bootstrap.service.js";
@@ -22,6 +23,7 @@ export class MaintenanceController {
     server.registerTool("memory_compactVault", { description: "Compact session logs into insights.", inputSchema: compactVaultInputSchema, annotations: { destructiveHint: true } }, this.compactVault.bind(this));
     server.registerTool("memory_export", { description: "Export a curated memory bundle.", inputSchema: exportInputSchema, annotations: { readOnlyHint: true, idempotentHint: true } }, this.export.bind(this));
     server.registerTool("memory_import", { description: "Import notes into the vault.", inputSchema: importInputSchema, annotations: { destructiveHint: true } }, this.import.bind(this));
+    server.registerTool("memory_diagnoseWorkspace", { description: "Diagnose project root, vault root, workspace detection candidates, and runtime metadata.", inputSchema: diagnoseWorkspaceInputSchema, annotations: { readOnlyHint: true, idempotentHint: true } }, this.diagnoseWorkspace.bind(this));
   }
 
   async reindex(_: z.infer<typeof reindexInputSchema>) {
@@ -59,5 +61,10 @@ export class MaintenanceController {
 
   async import(input: z.infer<typeof importInputSchema>) {
     return this.responses.buildOk("memory_import", Date.now(), { importedCount: 0, warnings: [], source: input.source, format: input.format, targetFolder: input.targetFolder });
+  }
+
+  async diagnoseWorkspace(_: z.infer<typeof diagnoseWorkspaceInputSchema>) {
+    const startedAt = Date.now();
+    return this.responses.buildOk("memory_diagnoseWorkspace", startedAt, diagnoseMemoryConfig());
   }
 }

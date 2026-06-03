@@ -1,8 +1,10 @@
 import { existsSync, readFileSync } from "node:fs";
 import { relative, resolve } from "node:path";
 import fg from "fast-glob";
-import matter from "gray-matter";
 import type { VaultNote } from "../models/note.model.js";
+import { DEFAULT_MARKDOWN_IGNORE } from "../config/vault-policy.js";
+import { parseFrontmatter } from "../utils/frontmatter.js";
+import { canonicalizeFrontmatter } from "../utils/frontmatter-schema.js";
 import { asStringArray } from "../utils/memory-format.js";
 
 export class VaultService {
@@ -12,7 +14,7 @@ export class VaultService {
     return fg(["**/*.md"], {
       cwd: this.vaultRoot,
       absolute: true,
-      ignore: [".obsidian/**", "node_modules/**", "dist/**", "build/**"],
+      ignore: [...DEFAULT_MARKDOWN_IGNORE],
     });
   }
 
@@ -33,10 +35,20 @@ export class VaultService {
     return existsSync(this.noteFullPath(relativePath));
   }
 
+  readRaw(relativePath: string) {
+    return readFileSync(this.noteFullPath(relativePath), "utf8");
+  }
+
   load(relativePath: string) {
-    const raw = readFileSync(this.noteFullPath(relativePath), "utf8");
-    const parsed = matter(raw);
-    return { raw, parsed };
+    const raw = this.readRaw(relativePath);
+    const parsed = parseFrontmatter(raw);
+    const { data } = canonicalizeFrontmatter(parsed.data);
+    return {
+      raw,
+      parsed: { data, content: parsed.body },
+      diagnostics: parsed.diagnostics,
+      hasFrontmatter: parsed.hasFrontmatter,
+    };
   }
 
   toNote(relativePath: string): VaultNote {
@@ -46,8 +58,8 @@ export class VaultService {
       title: String(parsed.data.title ?? relativePath),
       type: String(parsed.data.type ?? "note"),
       tags: asStringArray(parsed.data.tags),
-      created: parsed.data.created,
-      updated: parsed.data.updated,
+      created: parsed.data.created === undefined ? undefined : String(parsed.data.created),
+      updated: parsed.data.updated === undefined ? undefined : String(parsed.data.updated),
       content: parsed.content,
     };
   }
