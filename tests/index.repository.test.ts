@@ -15,6 +15,7 @@ function rec(over: Partial<StoredRecord> & { path: string }): StoredRecord {
     excerpt: over.excerpt ?? "",
     mtimeMs: over.mtimeMs ?? 0,
     searchText: over.searchText ?? "",
+    outgoingLinks: over.outgoingLinks ?? [],
     id: over.id,
   };
 }
@@ -48,10 +49,72 @@ describe("IndexRepository ranked search", () => {
     assert.equal(index.rank(tokenize("beta")).length, 0);
   });
 
-  it("toPublicRecord strips internal mtimeMs/searchText", () => {
-    const pub = toPublicRecord(rec({ path: "a.md", title: "x", searchText: "secret-body", mtimeMs: 999 }));
+  it("toPublicRecord strips internal mtimeMs/searchText/outgoingLinks", () => {
+    const pub = toPublicRecord(rec({ path: "a.md", title: "x", searchText: "secret-body", mtimeMs: 999, outgoingLinks: ["b"] }));
     assert.equal("searchText" in pub, false);
     assert.equal("mtimeMs" in pub, false);
+    assert.equal("outgoingLinks" in pub, false);
     assert.equal(pub.path, "a.md");
+  });
+});
+
+describe("IndexRepository backlink graph", () => {
+  it("resolves outgoing wikilinks to incoming backlinks by basename/title/alias", () => {
+    const index = new IndexRepository();
+    index.upsert(rec({ path: "04_Architecture_Decisions/adr-x.md", title: "ADR X", outgoingLinks: ["target-note", "By Title"] }));
+    index.upsert(rec({ path: "07_Insights/another.md", title: "Another", outgoingLinks: ["target-note"] }));
+    index.upsert(rec({ path: "notes/target-note.md", title: "Target", aliases: ["By Title"] }));
+
+    // adr-x links via basename + alias (deduped to one edge); another links via basename.
+    assert.deepEqual(index.incomingLinks("notes/target-note.md"), [
+      "04_Architecture_Decisions/adr-x.md",
+      "07_Insights/another.md",
+    ]);
+  });
+
+  it("ignores self-links and unresolved targets, and updates when a source is deleted", () => {
+    const index = new IndexRepository();
+    index.upsert(rec({ path: "a.md", title: "A", outgoingLinks: ["a", "ghost", "b"] }));
+    index.upsert(rec({ path: "b.md", title: "B" }));
+    assert.deepEqual(index.incomingLinks("b.md"), ["a.md"]); // a -> b
+    assert.deepEqual(index.incomingLinks("a.md"), []);        // self-link "a" + unresolved "ghost"
+    index.delete("a.md");
+    assert.deepEqual(index.incomingLinks("b.md"), []);        // backlink gone after source removed
+  });
+
+  it("resolves backlinks by frontmatter id", () => {
+    const index = new IndexRepository();
+    index.upsert(rec({ path: "src.md", title: "Src", outgoingLinks: ["adr-007"] }));
+    index.upsert(rec({ path: "notes/by-id.md", title: "ById", id: "adr-007" }));
+    assert.deepEqual(index.incomingLinks("notes/by-id.md"), ["src.md"]);
+  });
+
+  it("lets a note's own path/basename win over another note's title (precedence tiers)", () => {
+    const index = new IndexRepository();
+    // glossary.md is merely TITLED "Setup"; guide/setup.md IS the note named setup.
+    index.upsert(rec({ path: "glossary.md", title: "Setup" }));
+    index.upsert(rec({ path: "guide/setup.md", title: "Guide" }));
+    index.upsert(rec({ path: "ref.md", title: "Ref", outgoingLinks: ["setup"] }));
+    // [[setup]] must land on the basename match, not the earlier-sorted title match.
+    assert.deepEqual(index.incomingLinks("guide/setup.md"), ["ref.md"]);
+    assert.deepEqual(index.incomingLinks("glossary.md"), []);
+  });
+
+  it("resolves an ambiguous basename to the sorted-first path (deterministic)", () => {
+    const index = new IndexRepository();
+    index.upsert(rec({ path: "z/dup.md", title: "Z" }));
+    index.upsert(rec({ path: "a/dup.md", title: "A" }));
+    index.upsert(rec({ path: "src.md", outgoingLinks: ["dup"] }));
+    assert.deepEqual(index.incomingLinks("a/dup.md"), ["src.md"]);
+    assert.deepEqual(index.incomingLinks("z/dup.md"), []);
+  });
+
+  it("rebuilds backlinks when a source note's outgoing links change (re-upsert)", () => {
+    const index = new IndexRepository();
+    index.upsert(rec({ path: "a.md", title: "A", outgoingLinks: ["b"] }));
+    index.upsert(rec({ path: "b.md", title: "B" }));
+    assert.deepEqual(index.incomingLinks("b.md"), ["a.md"]); // populate the cache
+    index.upsert(rec({ path: "a.md", title: "A", outgoingLinks: [] })); // edit: drop the link
+    assert.deepEqual(index.incomingLinks("b.md"), []);
   });
 });

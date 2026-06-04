@@ -7,6 +7,7 @@ import {
 import type { FrontmatterDiagnostic } from "../utils/frontmatter.js";
 import { parseFrontmatter } from "../utils/frontmatter.js";
 import { canonicalizeFrontmatter, validateFrontmatter } from "../utils/frontmatter-schema.js";
+import { extractWikilinks } from "../utils/links.js";
 import { asStringArray, basenameWithoutExtension, inferTypeFromPath } from "../utils/memory-format.js";
 import type { VaultService } from "./vault.service.js";
 
@@ -292,13 +293,7 @@ export class VaultHealthService {
   }
 
   private findWikilinks(content: string) {
-    const links: string[] = [];
-    for (const match of content.matchAll(/\[\[([^\]|#]+)(?:[#|][^\]]*)?\]\]/g)) {
-      const target = match[1]?.trim();
-      if (!target || target.endsWith("/")) continue;
-      links.push(target.replace(/\.md$/i, ""));
-    }
-    return links;
+    return extractWikilinks(content);
   }
 
   private extractClaimLines(content: string) {

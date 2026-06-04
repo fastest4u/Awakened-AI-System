@@ -3,14 +3,20 @@ import { dirname, join } from "node:path";
 import type { IndexRepository, IndexRecord, StoredRecord } from "../repositories/index.repository.js";
 import { toPublicRecord } from "../repositories/index.repository.js";
 import { tokenize } from "../utils/bm25.js";
+import { extractWikilinks } from "../utils/links.js";
+import { bestSection, type SectionMatch } from "../utils/sections.js";
 import { asStringArray, basenameWithoutExtension, inferTypeFromPath, normalizeMarkdownPath } from "../utils/memory-format.js";
 import type { MemoryUsageService } from "./memory-usage.service.js";
 import type { VaultService } from "./vault.service.js";
 
 const SEARCH_TEXT_LIMIT = 4000;
+const INDEX_VERSION = 2;
+
+/** A search result, optionally annotated with the best-matching section anchor. */
+export type SearchHit = IndexRecord & { match?: SectionMatch };
 
 interface PersistedIndex {
-  version: 1;
+  version: typeof INDEX_VERSION;
   updatedAt: string;
   records: Record<string, StoredRecord>;
 }
@@ -73,7 +79,7 @@ export class MemoryQueryService {
     return this.index.list();
   }
 
-  async search(query: string, tags: string[], folder?: string, type?: string, limit = 10, offset = 0): Promise<IndexRecord[]> {
+  async search(query: string, tags: string[], folder?: string, type?: string, limit = 10, offset = 0, includeSections = false): Promise<SearchHit[]> {
     await this.snapshotIndex();
     const matchesFilters = (record: StoredRecord) =>
       (tags.length === 0 || tags.some((tag) => record.tags.includes(tag))) &&
@@ -94,7 +100,21 @@ export class MemoryQueryService {
       ranked = this.index.rank(terms, boost).filter(matchesFilters);
     }
 
-    return ranked.slice(offset, offset + limit).map(toPublicRecord);
+    const page = ranked.slice(offset, offset + limit);
+    if (!includeSections || terms.length === 0) return page.map(toPublicRecord);
+    return page.map((record) => {
+      const match = this.sectionMatchFor(record.path, terms);
+      return match ? { ...toPublicRecord(record), match } : toPublicRecord(record);
+    });
+  }
+
+  /** Best-matching section anchor for one note, loaded lazily (opt-in via includeSections). */
+  private sectionMatchFor(path: string, terms: string[]): SectionMatch | undefined {
+    try {
+      return bestSection(this.vault.load(path).parsed.content, terms) ?? undefined;
+    } catch {
+      return undefined;
+    }
   }
 
   async recent(folders: string[], types: string[], sortBy: "updated" | "created", limit: number): Promise<IndexRecord[]> {
@@ -113,6 +133,8 @@ export class MemoryQueryService {
   }
 
   async get(reference: string) {
+    // resolveReference snapshots the index up front (all branches), so the
+    // backlink graph below is already current for incomingLinks.
     const relativePath = await this.resolveReference(reference);
     const note = this.vault.load(relativePath);
     return {
@@ -121,17 +143,20 @@ export class MemoryQueryService {
       type: String(note.parsed.data.type ?? inferTypeFromPath(relativePath)),
       frontmatter: note.parsed.data,
       body: note.parsed.content,
-      outgoingLinks: Array.from(note.raw.matchAll(/\[\[([^\]]+)\]\]/g)).map((m) => m[1]),
-      incomingLinks: [],
+      outgoingLinks: extractWikilinks(note.parsed.content),
+      incomingLinks: this.index.incomingLinks(relativePath),
     };
   }
 
   async resolveReference(reference: string) {
+    // Snapshot once, up front, so the index and backlink graph are current for
+    // every resolution path — a direct-path hit would otherwise skip the refresh
+    // and leave get()'s incomingLinks stale.
+    const records = await this.snapshotIndex();
     const normalized = normalizeMarkdownPath(reference);
     if (this.vault.exists(normalized)) return normalized;
 
     const withoutExtension = reference.replace(/\\/g, "/").replace(/\.md$/i, "");
-    const records = await this.snapshotIndex();
     const normalizedLookup = withoutExtension.toLowerCase();
     const found = records.find((record) => {
       const pathNoExt = record.path.replace(/\.md$/i, "").toLowerCase();
@@ -165,6 +190,7 @@ export class MemoryQueryService {
       excerpt: body.slice(0, 360),
       mtimeMs,
       searchText: body.slice(0, SEARCH_TEXT_LIMIT),
+      outgoingLinks: extractWikilinks(body),
     };
   }
 
@@ -182,8 +208,8 @@ export class MemoryQueryService {
     if (!existsSync(this.indexPath)) return;
     try {
       const parsed = JSON.parse(readFileSync(this.indexPath, "utf8")) as PersistedIndex;
-      // Ignore corrupt / foreign / future-schema caches; mtimes rebuild lazily.
-      if (!parsed || parsed.version !== 1 || !parsed.records) return;
+      // Ignore corrupt / foreign / stale-schema caches; mtimes rebuild lazily.
+      if (!parsed || parsed.version !== INDEX_VERSION || !parsed.records) return;
       const records = Object.values(parsed.records)
         .filter((record): record is StoredRecord => Boolean(record && record.path))
         .map((record) => this.normalizeStored(record));
@@ -210,6 +236,7 @@ export class MemoryQueryService {
       createdAt: String(record.createdAt ?? ""),
       excerpt: String(record.excerpt ?? ""),
       searchText: String(record.searchText ?? ""),
+      outgoingLinks: asStringArray(record.outgoingLinks),
       mtimeMs: typeof record.mtimeMs === "number" ? record.mtimeMs : 0,
     };
   }
@@ -218,7 +245,7 @@ export class MemoryQueryService {
     try {
       const records: Record<string, StoredRecord> = {};
       for (const record of this.index.list()) records[record.path] = record;
-      const payload: PersistedIndex = { version: 1, updatedAt: new Date().toISOString(), records };
+      const payload: PersistedIndex = { version: INDEX_VERSION, updatedAt: new Date().toISOString(), records };
       mkdirSync(dirname(this.indexPath), { recursive: true });
       // Write to a per-process temp file then atomically rename. The vault is
       // shared across agents/processes, so a concurrent or interrupted write
