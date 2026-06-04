@@ -44,7 +44,7 @@ describe("MemoryQueryService incremental + ranked index", () => {
     const cache = join(root, ".memory-mcp", "index.json");
     assert.ok(existsSync(cache));
     const parsed = JSON.parse(readFileSync(cache, "utf8"));
-    assert.equal(parsed.version, 1);
+    assert.equal(parsed.version, 2);
     assert.ok(parsed.records["a.md"]);
   });
 
@@ -106,7 +106,7 @@ describe("MemoryQueryService incremental + ranked index", () => {
     writeFileSync(
       join(root, ".memory-mcp", "index.json"),
       JSON.stringify({
-        version: 1,
+        version: 2,
         updatedAt: "2026-01-01T00:00:00.000Z",
         records: { "a.md": { path: "a.md", title: "Backup safety", type: "insight", searchText: "atomic backup", mtimeMs } },
       }),
@@ -116,11 +116,12 @@ describe("MemoryQueryService incremental + ranked index", () => {
     assert.ok(results.some((r) => r.path === "a.md"));
   });
 
-  it("ignores a future-schema persisted cache instead of trusting it", async () => {
+  it("ignores a stale-schema (old version) persisted cache instead of trusting it", async () => {
     mkdirSync(join(root, ".memory-mcp"), { recursive: true });
+    // A Tier-1 (version 1) cache is now stale; it must be ignored and rebuilt by mtime.
     writeFileSync(
       join(root, ".memory-mcp", "index.json"),
-      JSON.stringify({ version: 2, updatedAt: "2026-01-01T00:00:00.000Z", records: { "ghost.md": { path: "ghost.md" } } }),
+      JSON.stringify({ version: 1, updatedAt: "2026-01-01T00:00:00.000Z", records: { "ghost.md": { path: "ghost.md" } } }),
     );
     const reopened = new MemoryQueryService(new VaultService(root), new IndexRepository());
     const records = await reopened.snapshotIndex();
@@ -133,5 +134,32 @@ describe("MemoryQueryService incremental + ranked index", () => {
     const dir = join(root, ".memory-mcp");
     assert.ok(existsSync(join(dir, "index.json")));
     assert.deepEqual(readdirSync(dir).filter((f) => f.endsWith(".tmp")), []);
+  });
+
+  it("get() returns real backlinks resolved from the wikilink graph", async () => {
+    writeFileSync(
+      join(root, "c.md"),
+      `---\ntitle: "Linker"\ntype: note\ncreated: "2026-01-01"\nupdated: "2026-01-05"\n---\n\nSee [[Backup safety]] for details.\n`,
+    );
+    const note = await query.get("a.md");
+    // c.md links to a.md via its title "Backup safety"; a.md links to nothing.
+    assert.deepEqual(note.incomingLinks, ["c.md"]);
+    assert.deepEqual(note.outgoingLinks, []);
+  });
+
+  it("search with includeSections attaches the best-matching section anchor", async () => {
+    writeFileSync(
+      join(root, "doc.md"),
+      `---\ntitle: "Doc"\ntype: note\ncreated: "2026-01-01"\nupdated: "2026-01-06"\n---\n\nIntro.\n\n## Setup\ninstall steps.\n\n## Elephant care\nfeed the elephant daily.\n`,
+    );
+    const withSections = await query.search("elephant", [], undefined, undefined, 10, 0, true);
+    const hit = withSections.find((r) => r.path === "doc.md");
+    assert.ok(hit, "doc.md should match 'elephant'");
+    assert.equal(hit!.match?.section, "Elephant care");
+    assert.ok((hit!.match?.line ?? 0) > 0);
+
+    // Default (no includeSections) leaves results lean — no match field.
+    const lean = await query.search("elephant", [], undefined, undefined, 10, 0);
+    assert.equal("match" in (lean.find((r) => r.path === "doc.md") ?? {}), false);
   });
 });

@@ -15,7 +15,7 @@ export class NoteController {
 
   async search(input: z.infer<typeof searchInputSchema>) {
     const startedAt = Date.now();
-    const results = await this.query.search(input.query, input.tags, input.folder, input.type, input.limit, input.offset);
+    const results = await this.query.search(input.query, input.tags, input.folder, input.type, input.limit, input.offset, input.includeSections);
     return this.responses.buildOk("memory_search", startedAt, { results, total: results.length, query: input.query, nextOffset: input.offset + input.limit });
   }
 
@@ -24,7 +24,7 @@ export class NoteController {
     try {
       const reference = `${input.path ?? input.title ?? input.id}`;
       const note = await this.query.get(reference);
-      return this.responses.buildOk("memory_get", startedAt, { note: { ...note, body: input.includeBody ? note.body : undefined, outgoingLinks: input.includeLinks ? note.outgoingLinks : [], incomingLinks: [] } });
+      return this.responses.buildOk("memory_get", startedAt, { note: { ...note, body: input.includeBody ? note.body : undefined, outgoingLinks: input.includeLinks ? note.outgoingLinks : [], incomingLinks: input.includeLinks ? note.incomingLinks : [] } });
     } catch (error) {
       return this.responses.buildError("memory_get", startedAt, "NOT_FOUND", error instanceof Error ? error.message : "Note not found");
     }

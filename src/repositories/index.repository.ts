@@ -1,4 +1,5 @@
 import { Bm25Index, tokenize, weighted } from "../utils/bm25.js";
+import { basenameWithoutExtension } from "../utils/memory-format.js";
 
 /** Public, lean index record returned to callers (search/list/recent results). */
 export interface IndexRecord {
@@ -22,21 +23,27 @@ export interface IndexRecord {
 export interface StoredRecord extends IndexRecord {
   mtimeMs: number;
   searchText: string;
+  /** Normalized `[[wikilink]]` targets in this note's body (for the backlink graph). */
+  outgoingLinks: string[];
 }
 
 export function toPublicRecord(stored: StoredRecord): IndexRecord {
-  const { mtimeMs: _mtimeMs, searchText: _searchText, ...rest } = stored;
+  const { mtimeMs: _mtimeMs, searchText: _searchText, outgoingLinks: _outgoingLinks, ...rest } = stored;
   return rest;
 }
 
 export class IndexRepository {
   private readonly records = new Map<string, StoredRecord>();
   private bm25: Bm25Index<StoredRecord> | undefined;
-  private dirty = true;
+  private bm25Revision = -1;
+  private linkGraph: Map<string, string[]> | undefined;
+  private linkRevision = -1;
+  /** Bumped on every mutation; cached derivations (BM25, link graph) rebuild when their stamp lags. */
+  private revision = 0;
 
   upsert(record: StoredRecord) {
     this.records.set(record.path, record);
-    this.dirty = true;
+    this.revision += 1;
   }
 
   bulkUpsert(records: StoredRecord[]) {
@@ -44,12 +51,12 @@ export class IndexRepository {
   }
 
   delete(path: string) {
-    if (this.records.delete(path)) this.dirty = true;
+    if (this.records.delete(path)) this.revision += 1;
   }
 
   clear() {
     this.records.clear();
-    this.dirty = true;
+    this.revision += 1;
   }
 
   get(path: string) {
@@ -79,12 +86,61 @@ export class IndexRepository {
       .map((entry) => entry.doc);
   }
 
+  /** Backlinks: paths of notes whose body `[[wikilink]]`s resolve to `path`. */
+  incomingLinks(path: string): string[] {
+    return this.ensureLinkGraph().get(path) ?? [];
+  }
+
   private ensureBm25(): Bm25Index<StoredRecord> {
-    if (this.bm25 && !this.dirty) return this.bm25;
+    if (this.bm25 && this.bm25Revision === this.revision) return this.bm25;
     const items = this.list().map((doc) => ({ doc, terms: this.documentTerms(doc) }));
     this.bm25 = new Bm25Index(items);
-    this.dirty = false;
+    this.bm25Revision = this.revision;
     return this.bm25;
+  }
+
+  /**
+   * Build the reverse-link (backlink) map: for each note, resolve its outgoing
+   * `[[wikilink]]` targets against the indexed notes (by path, basename, title,
+   * id, or alias — case-insensitive) and record the edge target -> [sources].
+   * Resolution is deterministic (notes scanned in sorted-path order, first
+   * registration of a key wins) and self-links are ignored. Cached until the
+   * record set changes.
+   */
+  private ensureLinkGraph(): Map<string, string[]> {
+    if (this.linkGraph && this.linkRevision === this.revision) return this.linkGraph;
+    const sorted = [...this.records.values()].sort((a, b) => a.path.localeCompare(b.path));
+
+    const resolve = new Map<string, string>();
+    const register = (key: string | undefined, path: string) => {
+      const k = key?.trim().toLowerCase().replace(/\.md$/i, "");
+      if (k && !resolve.has(k)) resolve.set(k, path);
+    };
+    for (const record of sorted) {
+      register(record.path, record.path);
+      register(basenameWithoutExtension(record.path), record.path);
+      register(record.title, record.path);
+      register(record.id, record.path);
+      for (const alias of record.aliases) register(alias, record.path);
+    }
+
+    const incoming = new Map<string, Set<string>>();
+    for (const record of sorted) {
+      for (const target of record.outgoingLinks) {
+        const targetPath = resolve.get(target.trim().toLowerCase().replace(/\.md$/i, ""));
+        if (!targetPath || targetPath === record.path) continue;
+        let sources = incoming.get(targetPath);
+        if (!sources) {
+          sources = new Set();
+          incoming.set(targetPath, sources);
+        }
+        sources.add(record.path);
+      }
+    }
+
+    this.linkGraph = new Map([...incoming].map(([path, sources]) => [path, [...sources].sort()]));
+    this.linkRevision = this.revision;
+    return this.linkGraph;
   }
 
   /** Field-weighted token bag for a document (title > tags/aliases > type/body). */

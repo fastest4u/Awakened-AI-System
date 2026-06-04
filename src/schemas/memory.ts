@@ -18,6 +18,7 @@ export const searchInputSchema = z.object({
   sortBy: sortSchema.default("relevance"),
   scope: scopeSchema.default("vault"),
   includeBody: z.boolean().default(false),
+  includeSections: z.boolean().default(false),
 });
 
 export const getInputSchema = z.object({
