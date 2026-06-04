@@ -1,5 +1,5 @@
 import { strict as assert } from "node:assert";
-import { existsSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
@@ -74,5 +74,64 @@ describe("MemoryQueryService incremental + ranked index", () => {
     const results = await query.search("", [], undefined, undefined, 10, 0);
     // b.md updated 2026-01-03 is newer than a.md 2026-01-02.
     assert.equal(results[0].path, "b.md");
+  });
+
+  it("falls back to newest-first for a non-empty query that tokenizes to nothing", async () => {
+    // Punctuation/single-char queries drop to zero terms; they must not silently
+    // return an empty result (the substring-search behaviour they replaced did not).
+    const results = await query.search("?", [], undefined, undefined, 10, 0);
+    assert.equal(results.length, 2);
+    assert.equal(results[0].path, "b.md");
+  });
+
+  it("skips a note that fails to read instead of breaking the whole index", async () => {
+    class FlakyVault extends VaultService {
+      load(relative: string) {
+        if (relative === "a.md") throw new Error("EBUSY: simulated lock");
+        return super.load(relative);
+      }
+    }
+    const flaky = new MemoryQueryService(new FlakyVault(root), new IndexRepository());
+    const results = await flaky.search("parser", [], undefined, undefined, 10, 0);
+    // a.md throws on read and is skipped; b.md still indexes and ranks.
+    assert.deepEqual(results.map((r) => r.path), ["b.md"]);
+  });
+
+  it("survives a shape-wrong persisted record (no tags) without throwing in BM25", async () => {
+    await query.search("backup", [], undefined, undefined, 10, 0); // seed a real cache + mtimes
+    const mtimeMs = statSync(join(root, "a.md")).mtimeMs;
+    // Tamper the cache: a.md matches the file mtime (so it is NOT re-read) but is
+    // missing tags/aliases — unguarded this crashes documentTerms (`tags.join`).
+    mkdirSync(join(root, ".memory-mcp"), { recursive: true });
+    writeFileSync(
+      join(root, ".memory-mcp", "index.json"),
+      JSON.stringify({
+        version: 1,
+        updatedAt: "2026-01-01T00:00:00.000Z",
+        records: { "a.md": { path: "a.md", title: "Backup safety", type: "insight", searchText: "atomic backup", mtimeMs } },
+      }),
+    );
+    const reopened = new MemoryQueryService(new VaultService(root), new IndexRepository());
+    const results = await reopened.search("backup", [], undefined, undefined, 10, 0);
+    assert.ok(results.some((r) => r.path === "a.md"));
+  });
+
+  it("ignores a future-schema persisted cache instead of trusting it", async () => {
+    mkdirSync(join(root, ".memory-mcp"), { recursive: true });
+    writeFileSync(
+      join(root, ".memory-mcp", "index.json"),
+      JSON.stringify({ version: 2, updatedAt: "2026-01-01T00:00:00.000Z", records: { "ghost.md": { path: "ghost.md" } } }),
+    );
+    const reopened = new MemoryQueryService(new VaultService(root), new IndexRepository());
+    const records = await reopened.snapshotIndex();
+    assert.ok(!records.some((r) => r.path === "ghost.md"));
+    assert.equal(records.length, 2);
+  });
+
+  it("writes the index cache atomically (no leftover temp file)", async () => {
+    await query.search("backup", [], undefined, undefined, 10, 0);
+    const dir = join(root, ".memory-mcp");
+    assert.ok(existsSync(join(dir, "index.json")));
+    assert.deepEqual(readdirSync(dir).filter((f) => f.endsWith(".tmp")), []);
   });
 });
