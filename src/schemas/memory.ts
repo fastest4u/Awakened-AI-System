@@ -18,7 +18,7 @@ export const searchInputSchema = z.object({
   sortBy: sortSchema.default("relevance"),
   scope: scopeSchema.default("vault"),
   includeBody: z.boolean().default(false),
-  includeSections: z.boolean().default(false),
+  includeSections: z.boolean().default(false).describe("Attach the best-matching heading anchor (section, line, snippet) to each hit"),
 });
 
 export const getInputSchema = z.object({

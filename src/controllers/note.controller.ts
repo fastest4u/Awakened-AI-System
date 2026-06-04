@@ -7,8 +7,8 @@ export class NoteController {
   constructor(private readonly query: MemoryQueryService, private readonly responses: ToolResponseService) {}
 
   register(server: { registerTool: Function }) {
-    server.registerTool("memory_search", { description: "Search notes by text, tags, folder, or type.", inputSchema: searchInputSchema, annotations: { readOnlyHint: true, idempotentHint: true } }, (input: z.infer<typeof searchInputSchema>) => this.search(input));
-    server.registerTool("memory_get", { description: "Get a note by path, id, or title.", inputSchema: getInputSchema, annotations: { readOnlyHint: true, idempotentHint: true } }, (input: z.infer<typeof getInputSchema>) => this.get(input));
+    server.registerTool("memory_search", { description: "Search notes by text, tags, folder, or type. Set includeSections to attach the best-matching heading anchor (section, line, snippet) to each hit.", inputSchema: searchInputSchema, annotations: { readOnlyHint: true, idempotentHint: true } }, (input: z.infer<typeof searchInputSchema>) => this.search(input));
+    server.registerTool("memory_get", { description: "Get a note by path, id, or title. Returns outgoing and incoming wikilinks (backlinks) when includeLinks is true.", inputSchema: getInputSchema, annotations: { readOnlyHint: true, idempotentHint: true } }, (input: z.infer<typeof getInputSchema>) => this.get(input));
     server.registerTool("memory_list", { description: "List notes by folder, type, or tag.", inputSchema: listInputSchema, annotations: { readOnlyHint: true, idempotentHint: true } }, (input: z.infer<typeof listInputSchema>) => this.list(input));
     server.registerTool("memory_recent", { description: "Get recently updated or created notes.", inputSchema: recentInputSchema, annotations: { readOnlyHint: true, idempotentHint: true } }, (input: z.infer<typeof recentInputSchema>) => this.recent(input));
   }

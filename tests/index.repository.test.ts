@@ -81,4 +81,40 @@ describe("IndexRepository backlink graph", () => {
     index.delete("a.md");
     assert.deepEqual(index.incomingLinks("b.md"), []);        // backlink gone after source removed
   });
+
+  it("resolves backlinks by frontmatter id", () => {
+    const index = new IndexRepository();
+    index.upsert(rec({ path: "src.md", title: "Src", outgoingLinks: ["adr-007"] }));
+    index.upsert(rec({ path: "notes/by-id.md", title: "ById", id: "adr-007" }));
+    assert.deepEqual(index.incomingLinks("notes/by-id.md"), ["src.md"]);
+  });
+
+  it("lets a note's own path/basename win over another note's title (precedence tiers)", () => {
+    const index = new IndexRepository();
+    // glossary.md is merely TITLED "Setup"; guide/setup.md IS the note named setup.
+    index.upsert(rec({ path: "glossary.md", title: "Setup" }));
+    index.upsert(rec({ path: "guide/setup.md", title: "Guide" }));
+    index.upsert(rec({ path: "ref.md", title: "Ref", outgoingLinks: ["setup"] }));
+    // [[setup]] must land on the basename match, not the earlier-sorted title match.
+    assert.deepEqual(index.incomingLinks("guide/setup.md"), ["ref.md"]);
+    assert.deepEqual(index.incomingLinks("glossary.md"), []);
+  });
+
+  it("resolves an ambiguous basename to the sorted-first path (deterministic)", () => {
+    const index = new IndexRepository();
+    index.upsert(rec({ path: "z/dup.md", title: "Z" }));
+    index.upsert(rec({ path: "a/dup.md", title: "A" }));
+    index.upsert(rec({ path: "src.md", outgoingLinks: ["dup"] }));
+    assert.deepEqual(index.incomingLinks("a/dup.md"), ["src.md"]);
+    assert.deepEqual(index.incomingLinks("z/dup.md"), []);
+  });
+
+  it("rebuilds backlinks when a source note's outgoing links change (re-upsert)", () => {
+    const index = new IndexRepository();
+    index.upsert(rec({ path: "a.md", title: "A", outgoingLinks: ["b"] }));
+    index.upsert(rec({ path: "b.md", title: "B" }));
+    assert.deepEqual(index.incomingLinks("b.md"), ["a.md"]); // populate the cache
+    index.upsert(rec({ path: "a.md", title: "A", outgoingLinks: [] })); // edit: drop the link
+    assert.deepEqual(index.incomingLinks("b.md"), []);
+  });
 });

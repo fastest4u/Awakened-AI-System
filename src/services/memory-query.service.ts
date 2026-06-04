@@ -133,10 +133,9 @@ export class MemoryQueryService {
   }
 
   async get(reference: string) {
+    // resolveReference snapshots the index up front (all branches), so the
+    // backlink graph below is already current for incomingLinks.
     const relativePath = await this.resolveReference(reference);
-    // resolveReference can short-circuit on a direct path hit without touching
-    // the index; ensure it is current so the backlink graph is populated.
-    await this.snapshotIndex();
     const note = this.vault.load(relativePath);
     return {
       path: relativePath,
@@ -150,11 +149,14 @@ export class MemoryQueryService {
   }
 
   async resolveReference(reference: string) {
+    // Snapshot once, up front, so the index and backlink graph are current for
+    // every resolution path — a direct-path hit would otherwise skip the refresh
+    // and leave get()'s incomingLinks stale.
+    const records = await this.snapshotIndex();
     const normalized = normalizeMarkdownPath(reference);
     if (this.vault.exists(normalized)) return normalized;
 
     const withoutExtension = reference.replace(/\\/g, "/").replace(/\.md$/i, "");
-    const records = await this.snapshotIndex();
     const normalizedLookup = withoutExtension.toLowerCase();
     const found = records.find((record) => {
       const pathNoExt = record.path.replace(/\.md$/i, "").toLowerCase();

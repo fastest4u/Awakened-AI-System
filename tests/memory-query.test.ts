@@ -162,4 +162,31 @@ describe("MemoryQueryService incremental + ranked index", () => {
     const lean = await query.search("elephant", [], undefined, undefined, 10, 0);
     assert.equal("match" in (lean.find((r) => r.path === "doc.md") ?? {}), false);
   });
+
+  it("includeSections omits the match field for a hit with no overlapping section", async () => {
+    // a.md ranks for "safety" via its title/tag, but no body section contains the term.
+    const results = await query.search("safety", [], undefined, undefined, 10, 0, true);
+    const aHit = results.find((r) => r.path === "a.md");
+    assert.ok(aHit, "a.md should match 'safety' via title/tag");
+    assert.equal("match" in aHit!, false);
+  });
+
+  it("includeSections survives a note that becomes unreadable during the lazy section load", async () => {
+    // Indexes a.md on the first load, then throws on the SECOND (the lazy section
+    // read in sectionMatchFor) — exercising its swallow-and-continue branch.
+    class LazyFlakyVault extends VaultService {
+      private loads = new Map<string, number>();
+      load(relative: string) {
+        const n = (this.loads.get(relative) ?? 0) + 1;
+        this.loads.set(relative, n);
+        if (relative === "a.md" && n > 1) throw new Error("EBUSY: simulated lock");
+        return super.load(relative);
+      }
+    }
+    const flaky = new MemoryQueryService(new LazyFlakyVault(root), new IndexRepository());
+    const results = await flaky.search("backup", [], undefined, undefined, 10, 0, true);
+    const aHit = results.find((r) => r.path === "a.md");
+    assert.ok(aHit, "a.md is still returned despite the lazy-load failure");
+    assert.equal("match" in aHit!, false);
+  });
 });

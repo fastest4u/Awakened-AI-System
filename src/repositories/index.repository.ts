@@ -103,9 +103,14 @@ export class IndexRepository {
    * Build the reverse-link (backlink) map: for each note, resolve its outgoing
    * `[[wikilink]]` targets against the indexed notes (by path, basename, title,
    * id, or alias — case-insensitive) and record the edge target -> [sources].
-   * Resolution is deterministic (notes scanned in sorted-path order, first
-   * registration of a key wins) and self-links are ignored. Cached until the
-   * record set changes.
+   *
+   * Keys are registered in precedence tiers across ALL notes — path/basename
+   * first, then title/id, then aliases — so a note's own strong identity always
+   * wins over another note's weaker keys (e.g. a bare `[[setup]]` resolves to the
+   * note named `setup`, not one merely titled "Setup"). Within a tier a collision
+   * goes to the sorted-first path, so a duplicate basename in two folders resolves
+   * to the lexicographically first (a bare `[[link]]` cannot disambiguate folder).
+   * Self-links are ignored. Cached until the record set changes.
    */
   private ensureLinkGraph(): Map<string, string[]> {
     if (this.linkGraph && this.linkRevision === this.revision) return this.linkGraph;
@@ -116,18 +121,27 @@ export class IndexRepository {
       const k = key?.trim().toLowerCase().replace(/\.md$/i, "");
       if (k && !resolve.has(k)) resolve.set(k, path);
     };
+    // Tier 1 — strong identity (path, then basename) for every note.
     for (const record of sorted) {
       register(record.path, record.path);
       register(basenameWithoutExtension(record.path), record.path);
+    }
+    // Tier 2 — declared identity (title, then id); fills only keys no path/basename claimed.
+    for (const record of sorted) {
       register(record.title, record.path);
       register(record.id, record.path);
+    }
+    // Tier 3 — aliases (weakest); fills only what remains.
+    for (const record of sorted) {
       for (const alias of record.aliases) register(alias, record.path);
     }
 
     const incoming = new Map<string, Set<string>>();
     for (const record of sorted) {
       for (const target of record.outgoingLinks) {
-        const targetPath = resolve.get(target.trim().toLowerCase().replace(/\.md$/i, ""));
+        // Targets come from extractWikilinks, which already strips `.md`; only the
+        // register() side needs the strip (record.path keys retain their `.md`).
+        const targetPath = resolve.get(target.trim().toLowerCase());
         if (!targetPath || targetPath === record.path) continue;
         let sources = incoming.get(targetPath);
         if (!sources) {

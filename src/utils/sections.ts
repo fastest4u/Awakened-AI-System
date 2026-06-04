@@ -21,12 +21,14 @@ export interface SectionMatch {
 }
 
 const HEADING_RE = /^(#{1,6})\s+(.*\S)\s*$/;
+const FENCE_RE = /^\s*(```|~~~)/;
 
 export function splitSections(body: string): Section[] {
   const lines = String(body ?? "").split(/\r?\n/);
   const sections: Section[] = [];
   let current: Section | null = null;
   let buf: string[] = [];
+  let inFence = false;
 
   const flush = () => {
     if (!current) return;
@@ -36,7 +38,16 @@ export function splitSections(body: string): Section[] {
   };
 
   lines.forEach((line, i) => {
-    const m = HEADING_RE.exec(line);
+    if (FENCE_RE.test(line)) {
+      // A ``` / ~~~ delimiter toggles fenced-code state; the delimiter and its
+      // contents are body, never headings (a `# comment` inside a code block is
+      // not a section), so they would otherwise fragment a real section.
+      inFence = !inFence;
+      if (!current) current = { heading: "", level: 0, line: 1, text: "" };
+      buf.push(line);
+      return;
+    }
+    const m = inFence ? null : HEADING_RE.exec(line);
     if (m) {
       flush();
       current = { heading: m[2].trim(), level: m[1].length, line: i + 1, text: "" };
@@ -65,11 +76,17 @@ export function bestSection(body: string, queryTerms: string[]): SectionMatch | 
     let score = 0;
     for (const token of tokenize(section.text)) if (terms.has(token)) score += 1;
     for (const token of tokenize(section.heading)) if (terms.has(token)) score += 2;
-    if (score > 0 && (!best || score > best.score)) best = { section, score };
+    // Higher score wins; on a tie prefer a real heading over the level-0 intro
+    // so the anchor points at the named section, not the top of the note.
+    const better = !best || score > best.score || (score === best.score && best.section.level === 0 && section.level > 0);
+    if (score > 0 && better) best = { section, score };
   }
   if (!best) return null;
 
   const { section } = best;
-  const snippet = (section.text || section.heading).replace(/\s+/g, " ").trim().slice(0, 160);
+  const sliced = (section.text || section.heading).replace(/\s+/g, " ").trim().slice(0, 160);
+  // slice() counts UTF-16 code units; drop a dangling lone high surrogate so the
+  // snippet never ends mid-character (astral chars like emoji are 2 code units).
+  const snippet = /[\uD800-\uDBFF]$/.test(sliced) ? sliced.slice(0, -1) : sliced;
   return { section: section.heading || "(intro)", line: section.line, snippet };
 }
