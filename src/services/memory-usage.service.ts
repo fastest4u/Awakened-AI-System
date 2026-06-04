@@ -59,13 +59,24 @@ export class MemoryUsageService {
   }
 
   scoreBoost(path: string, terms: string[]) {
-    const record = this.readState().records[path];
-    if (!record) return 0;
+    return this.buildBooster(terms)(path);
+  }
 
-    const useBoost = Math.min(8, Math.log2(record.selectedCount + 1) * 2);
-    const termBoost = Math.min(6, terms.reduce((sum, term) => sum + (record.contexts[term] ?? 0), 0));
-    const recencyBoost = this.recencyBoost(record.lastSelectedAt);
-    return Math.round((useBoost + termBoost + recencyBoost) * 10) / 10;
+  /**
+   * Build a per-path boost function for one query, reading usage.json exactly
+   * once. Use this when scoring many paths (e.g. ranking a search) so the state
+   * file is not re-read per document.
+   */
+  buildBooster(terms: string[]): (path: string) => number {
+    const state = this.readState();
+    return (path: string) => {
+      const record = state.records[path];
+      if (!record) return 0;
+      const useBoost = Math.min(8, Math.log2(record.selectedCount + 1) * 2);
+      const termBoost = Math.min(6, terms.reduce((sum, term) => sum + (record.contexts[term] ?? 0), 0));
+      const recencyBoost = this.recencyBoost(record.lastSelectedAt);
+      return Math.round((useBoost + termBoost + recencyBoost) * 10) / 10;
+    };
   }
 
   statsFor(path: string) {

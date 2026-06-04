@@ -1,6 +1,8 @@
 node_modules/
 dist/
 dist-test/
+memory/.memory-mcp/backups/
+memory/.memory-mcp/index.json*
 .env
 .env.*
 *.log
