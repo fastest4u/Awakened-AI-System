@@ -2,11 +2,9 @@
 title: Extend workspace auto-detection to Antigravity and OpenCode
 type: adr
 status: accepted
-decision-date: 2026-05-23
 confidence: high
+decision-date: "2026-05-23"
 supersedes: []
-created: 2026-05-23
-updated: 2026-05-23
 tags:
   - mcp
   - memory-config
@@ -14,7 +12,10 @@ tags:
   - antigravity
   - opencode
   - cross-ide
+created: "2026-05-23"
+updated: "2026-05-23"
 ---
+
 ## Context
 The earlier ADR `add-ide-state-based-workspace-auto-detection.md` added IDE-state reading for VS Code-derived products (Windsurf, Windsurf-Next, Cursor, Code, VSCodium). The user asked whether **Windsurf, Zed, Antigravity, and OpenCode** would all work without explicit `MEMORY_PROJECT_ROOT`.
 

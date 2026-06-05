@@ -1,8 +1,8 @@
 ---
-title: 2026-05-22 - Fix Codex image read Bad Request
+title: "2026-05-22 - Fix Codex image read Bad Request"
 type: session-log
-session-date: 2026-05-22
 agent: codex
+session-date: "2026-05-22"
 duration-minutes: 25
 outcomes:
   - Diagnosed LINE image read failure as a Codex endpoint request-shape issue rather than LINE/E2EE failure.
@@ -10,12 +10,13 @@ outcomes:
   - "Updated codex-device fetch to add default instructions, force store:false and stream:true for ChatGPT Codex responses, and convert Codex SSE responses to JSON for non-stream generateText calls even when content-type is missing."
   - Added a regression test for Codex image reader request requirements and SSE conversion.
   - Verified real image smoke test with 439805.jpg now returns 200 and OCR text.
-created: 2026-05-22
-updated: 2026-05-22
 tags:
   - session-log
   - project/general
+created: "2026-05-22"
+updated: "2026-05-22"
 ---
+
 # 2026-05-22 - Fix Codex image read Bad Request
 
 ## TL;DR

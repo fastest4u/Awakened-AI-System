@@ -1,20 +1,21 @@
 ---
-title: 2026-05-20 - Fix memory vault health errors
+title: "2026-05-20 - Fix memory vault health errors"
 type: session-log
-session-date: 2026-05-20
 agent: gpt-5.5
+session-date: "2026-05-20"
 duration-minutes: 5
 outcomes:
   - Fixed the two vault health errors caused by empty session-log outcomes fields.
   - "Updated both affected session logs with non-empty, evidence-backed outcomes and matching TL;DR / What Was Done bullets."
   - "Verified vault health is now score 90, grade B, with 0 errors and 0 warnings."
   - Verified both edited notes individually and reindexed the 72-note vault.
-created: 2026-05-20
-updated: 2026-05-20
 tags:
   - session-log
   - project/general
+created: "2026-05-20"
+updated: "2026-05-20"
 ---
+
 # 2026-05-20 - Fix memory vault health errors
 
 ## TL;DR

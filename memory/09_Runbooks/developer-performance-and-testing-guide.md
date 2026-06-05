@@ -2,18 +2,18 @@
 title: Developer Performance and Testing Guide
 type: runbook
 status: active
-created: 2026-05-20
-updated: 2026-05-20
-last-verified: 2026-05-20
-verified-by: antigravity
-source: "Manual analysis of project-memory configuration and testing rules inside app/ and tests/"
 confidence: high
+source: Manual analysis of project-memory configuration and testing rules inside app/ and tests/
+verified-by: antigravity
+last-verified: "2026-05-20"
 tags:
   - runbook
   - development
   - performance
   - testing
   - laravel
+created: "2026-05-20"
+updated: "2026-05-20"
 ---
 
 # Developer Performance and Testing Guide

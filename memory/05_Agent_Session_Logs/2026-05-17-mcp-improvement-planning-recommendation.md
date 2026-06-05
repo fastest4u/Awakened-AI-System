@@ -1,19 +1,20 @@
 ---
-title: 2026-05-17 - MCP improvement planning recommendation
+title: "2026-05-17 - MCP improvement planning recommendation"
 type: session-log
-session-date: 2026-05-17
 agent: Codex
+session-date: "2026-05-17"
 duration-minutes: 4
 outcomes:
   - Reviewed project-memory context for MCP improvement planning.
   - "Identified reliability, lifecycle enforcement, retrieval quality, follow-up surfacing, and observability as the highest-value next roadmap areas."
   - Recorded an insight about reducing dependency on agent discipline.
-created: 2026-05-17
-updated: 2026-05-17
 tags:
   - session-log
   - project/general
+created: "2026-05-17"
+updated: "2026-05-17"
 ---
+
 # 2026-05-17 - MCP improvement planning recommendation
 
 ## TL;DR

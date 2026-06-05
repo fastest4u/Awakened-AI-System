@@ -1,18 +1,19 @@
 ---
-title: 2026-05-22 - Plan LINE image extraction history API and table
+title: "2026-05-22 - Plan LINE image extraction history API and table"
 type: session-log
-session-date: 2026-05-22
 agent: codex
+session-date: "2026-05-22"
 duration-minutes: 4
 outcomes:
   - Assessed that adding a REST API and frontend table for saved line_image_extractions is a good next step and matches an existing open follow-up from the persistence work.
   - "Identified a practical first version: paginated/filterable history by date/month, route, agency, vehicle type, driver, with thumbnail/link to stored image and summary metrics."
-created: 2026-05-22
-updated: 2026-05-22
 tags:
   - session-log
   - project/general
+created: "2026-05-22"
+updated: "2026-05-22"
 ---
+
 # 2026-05-22 - Plan LINE image extraction history API and table
 
 ## TL;DR

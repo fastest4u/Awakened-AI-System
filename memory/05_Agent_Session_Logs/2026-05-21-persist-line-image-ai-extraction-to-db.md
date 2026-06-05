@@ -1,8 +1,8 @@
 ---
-title: 2026-05-21 - persist LINE image AI extraction to DB
+title: "2026-05-21 - persist LINE image AI extraction to DB"
 type: session-log
-session-date: 2026-05-21
 agent: codex
+session-date: "2026-05-21"
 duration-minutes: 22
 outcomes:
   - Added line_image_extractions schema/migration support for MySQL and memory DB.
@@ -10,12 +10,13 @@ outcomes:
   - Added repository insert path for saved LINE image extraction records.
   - "Updated LINE image listener to save valid images under data/line-images/YYYY-MM and persist relative image_path plus extracted fields to DB, while replying with saved/not-saved status."
   - Adjusted dynamic import handling in LINE listener to work with both ESM and CommonJS namespace shapes under tsx/dev runtime.
-created: 2026-05-21
-updated: 2026-05-21
 tags:
   - session-log
   - project/general
+created: "2026-05-21"
+updated: "2026-05-21"
 ---
+
 # 2026-05-21 - persist LINE image AI extraction to DB
 
 ## TL;DR

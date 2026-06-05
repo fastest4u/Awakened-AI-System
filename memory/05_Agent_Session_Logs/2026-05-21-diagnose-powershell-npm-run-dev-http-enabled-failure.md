@@ -1,18 +1,19 @@
 ---
-title: 2026-05-21 - Diagnose PowerShell npm run dev HTTP_ENABLED failure
+title: "2026-05-21 - Diagnose PowerShell npm run dev HTTP_ENABLED failure"
 type: session-log
-session-date: 2026-05-21
 agent: Codex
+session-date: "2026-05-21"
 duration-minutes: 2
 outcomes:
   - "Explained npm run dev fails on PowerShell/Windows because package script uses POSIX env assignment syntax HTTP_ENABLED=true."
   - Provided immediate PowerShell-compatible backend and frontend startup commands.
-created: 2026-05-21
-updated: 2026-05-21
 tags:
   - session-log
   - project/general
+created: "2026-05-21"
+updated: "2026-05-21"
 ---
+
 # 2026-05-21 - Diagnose PowerShell npm run dev HTTP_ENABLED failure
 
 ## TL;DR

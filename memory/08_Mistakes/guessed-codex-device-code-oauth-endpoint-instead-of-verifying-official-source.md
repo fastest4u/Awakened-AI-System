@@ -1,18 +1,19 @@
 ---
 title: Guessed Codex Device Code OAuth Endpoint Instead of Verifying Official Source
 type: mistake
-severity: medium
 status: open
-occurred-date: 2026-05-22
+severity: medium
+confidence: high
 agent: Codex
 area: auth provider integration
-confidence: high
-created: 2026-05-22
-updated: 2026-05-22
+occurred-date: "2026-05-22"
 tags:
   - area/auth provider integration
   - topic/memory-vault
+created: "2026-05-22"
+updated: "2026-05-22"
 ---
+
 ## Problem
 Codex device auth was first implemented against a guessed Auth0 OAuth device-code endpoint, causing CODEX_AUTH_START_FAILED with 404/403 responses.
 

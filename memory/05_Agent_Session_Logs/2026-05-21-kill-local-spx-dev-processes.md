@@ -1,18 +1,19 @@
 ---
-title: 2026-05-21 - Kill local SPX dev processes
+title: "2026-05-21 - Kill local SPX dev processes"
 type: session-log
-session-date: 2026-05-21
 agent: Codex
+session-date: "2026-05-21"
 duration-minutes: 2
 outcomes:
   - "Checked ports 3000, 5173, and 5174 for SPX-owned listeners."
   - "No remaining SPX dev listeners were found; ports are free."
-created: 2026-05-21
-updated: 2026-05-21
 tags:
   - session-log
   - project/general
+created: "2026-05-21"
+updated: "2026-05-21"
 ---
+
 # 2026-05-21 - Kill local SPX dev processes
 
 ## TL;DR

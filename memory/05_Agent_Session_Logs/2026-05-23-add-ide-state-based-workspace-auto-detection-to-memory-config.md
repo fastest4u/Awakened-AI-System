@@ -1,27 +1,28 @@
 ---
-title: 2026-05-23 - Add IDE-state-based workspace auto-detection to memory config
+title: "2026-05-23 - Add IDE-state-based workspace auto-detection to memory config"
 type: session-log
-session-date: 2026-05-23
 agent: cascade
+session-date: "2026-05-23"
 duration-minutes: 35
 outcomes:
   - "Added IDE-state-based workspace auto-detection to project-memory MCP. resolveDynamicProjectRoot() now probes VS Code-derived IDE storage files (Windsurf, Windsurf-Next, Cursor, Code, VSCodium) for the active workspace when env/cwd-based detection yields nothing."
   - "Implemented decodeFileUri() with proper handling of Windows drive-letter URIs (file:///c%3A/...) and POSIX URIs."
-  - "Added a vault-marker-first ranking so multi-window IDE setups still pick the project the user has opted-in to memory MCP."
+  - Added a vault-marker-first ranking so multi-window IDE setups still pick the project the user has opted-in to memory MCP.
   - "Added Node built-in test runner suite tests/memory.config.test.ts covering 28 cases across decodeFileUri, ideStorageFiles, readIdeWorkspaceCandidates, pickIdeActiveWorkspace, findIdeActiveWorkspace, loadMemoryConfig, and resolveDynamicProjectRoot priority order. All 28 pass on Windows."
   - "Added tsconfig.test.json plus npm scripts test:build and test that compile to dist-test/ and run node --test."
   - "Updated README with new Auto-detect Workspace section, troubleshooting guidance, and documented the npm run test command."
   - "Verified behaviour with a direct loadMemoryConfig probe: simulated Windsurf-install cwd resolved to projectRoot=c:/Users/Server/Desktop/Awakened-AI-System and vaultRoot=.../memory."
   - "Built dist/index.js (esbuild + obfuscator) successfully. MCP server initialized JSON-RPC handshake without errors."
-created: 2026-05-23
-updated: 2026-05-23
 tags:
   - session-log
   - mcp
   - memory-config
   - workspace-detection
   - project/awakened-ai-system
+created: "2026-05-23"
+updated: "2026-05-23"
 ---
+
 # 2026-05-23 - Add IDE-state-based workspace auto-detection to memory config
 
 ## TL;DR

@@ -1,8 +1,8 @@
 ---
-title: 2026-05-20 - Investigate slow Laravel API responses and query latency
+title: "2026-05-20 - Investigate slow Laravel API responses and query latency"
 type: session-log
-session-date: 2026-05-20
 agent: codex
+session-date: "2026-05-20"
 duration-minutes: 25
 outcomes:
   - Checked project memory and relevant performance runbook/follow-ups.
@@ -11,12 +11,13 @@ outcomes:
   - "Found production runtime optimization gaps: config/routes/events/views are not cached in the local production environment and Octane is configured but not running."
   - "Found CLI DB connectivity to MySQL host fails from this workspace, preventing local migrate status and performance_schema slow-query inspection, while public health endpoint reports database healthy."
   - "Identified likely protected-endpoint hotspots: WorkAssignment index aggregate+pagination queries, AdminProfitLoss N+1 loops, dashboard response cache not showing stored keys, and unpaginated/date/LIKE query patterns."
-created: 2026-05-20
-updated: 2026-05-20
 tags:
   - session-log
   - project/general
+created: "2026-05-20"
+updated: "2026-05-20"
 ---
+
 # 2026-05-20 - Investigate slow Laravel API responses and query latency
 
 ## TL;DR

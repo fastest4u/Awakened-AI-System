@@ -1,8 +1,8 @@
 ---
-title: 2026-05-21 - implement codex device auth provider without Codex CLI
+title: "2026-05-21 - implement codex device auth provider without Codex CLI"
 type: session-log
-session-date: 2026-05-21
 agent: Codex
+session-date: "2026-05-21"
 duration-minutes: 35
 outcomes:
   - Added direct Codex OAuth/PKCE auth flow modeled on Codex/OpenCode behavior without shelling out to Codex CLI.
@@ -11,12 +11,13 @@ outcomes:
   - Added DB-backed CODEX_IMAGE_PROVIDER setting and Settings UI provider selector.
   - "Added Settings UI controls for Codex device auth login, complete callback, and logout."
   - "Configured image reader to use codex-device when forced, or automatically when a stored Codex token exists."
-created: 2026-05-21
-updated: 2026-05-21
 tags:
   - session-log
   - project/general
+created: "2026-05-21"
+updated: "2026-05-21"
 ---
+
 # 2026-05-21 - implement codex device auth provider without Codex CLI
 
 ## TL;DR

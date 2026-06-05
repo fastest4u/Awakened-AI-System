@@ -2,17 +2,18 @@
 title: Add IDE-state-based workspace auto-detection for project-memory MCP
 type: adr
 status: accepted
-decision-date: 2026-05-23
 confidence: high
+decision-date: "2026-05-23"
 supersedes: []
-created: 2026-05-23
-updated: 2026-05-23
 tags:
   - mcp
   - memory-config
   - workspace-detection
   - cross-ide
+created: "2026-05-23"
+updated: "2026-05-23"
 ---
+
 ## Context
 The earlier "dynamic" mode added in `2026-05-23-implement-dynamic-memory-project-root-detection-for-project-memory-mcp.md` resolved `MEMORY_PROJECT_ROOT=dynamic|auto|detect|workspace` by walking up from `process.cwd()` and a small set of workspace-related env vars (`MEMORY_WORKSPACE_ROOT`, `WORKSPACE_ROOT`, `PROJECT_ROOT`, `INIT_CWD`, `PWD`, `OLDPWD`).
 

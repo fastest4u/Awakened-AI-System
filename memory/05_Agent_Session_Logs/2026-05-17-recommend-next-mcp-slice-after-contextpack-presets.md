@@ -1,19 +1,20 @@
 ---
-title: 2026-05-17 - Recommend next MCP slice after contextPack presets
+title: "2026-05-17 - Recommend next MCP slice after contextPack presets"
 type: session-log
-session-date: 2026-05-17
 agent: Codex
+session-date: "2026-05-17"
 duration-minutes: 4
 outcomes:
   - Reviewed roadmap context after lifecycle guardrails and task-aware contextPack presets.
   - Recommended follow-up radar as the next highest-value implementation slice.
   - Recorded an insight documenting the recommendation and rationale.
-created: 2026-05-17
-updated: 2026-05-17
 tags:
   - session-log
   - project/general
+created: "2026-05-17"
+updated: "2026-05-17"
 ---
+
 # 2026-05-17 - Recommend next MCP slice after contextPack presets
 
 ## TL;DR

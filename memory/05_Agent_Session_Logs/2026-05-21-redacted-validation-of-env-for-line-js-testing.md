@@ -1,19 +1,20 @@
 ---
-title: 2026-05-21 - Redacted validation of .env for LINE JS testing
+title: "2026-05-21 - Redacted validation of .env for LINE JS testing"
 type: session-log
-session-date: 2026-05-21
 agent: Codex
+session-date: "2026-05-21"
 duration-minutes: 4
 outcomes:
   - Validated .env without printing secrets or full chat IDs.
   - "Found HTTP_ENABLED=true, LINEJS_TEST_ENABLED=true, LINEJS_TEST_DEVICE=IOSIPAD, LINEJS_TEST_STORAGE_PATH set, and LINE_IMAGE_LISTENER_CHAT_ID has plausible group MID format."
   - "Found LINEJS_TEST_TARGET_ID empty, CODEX_IMAGE_TIMEOUT_MS missing, CODEX_IMAGE_MAX_BYTES missing, and NODE_ENV=production."
-created: 2026-05-21
-updated: 2026-05-21
 tags:
   - session-log
   - project/general
+created: "2026-05-21"
+updated: "2026-05-21"
 ---
+
 # 2026-05-21 - Redacted validation of .env for LINE JS testing
 
 ## TL;DR

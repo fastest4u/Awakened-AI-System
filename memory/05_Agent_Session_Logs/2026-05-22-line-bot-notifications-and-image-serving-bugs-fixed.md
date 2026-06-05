@@ -1,15 +1,17 @@
 ---
-title: 2026-05-22 - LINE Bot notifications and image serving bugs fixed
+title: "2026-05-22 - LINE Bot notifications and image serving bugs fixed"
 type: session-log
-session-date: 2026-05-22
 agent: codex
-outcomes: []
-created: 2026-05-22
-updated: 2026-05-22
+session-date: "2026-05-22"
+outcomes:
+  - LINE Bot notifications and image serving bugs fixed
 tags:
   - session-log
   - project/general
+created: "2026-05-22"
+updated: "2026-05-22"
 ---
+
 # 2026-05-22 - LINE Bot notifications and image serving bugs fixed
 
 ## TL;DR

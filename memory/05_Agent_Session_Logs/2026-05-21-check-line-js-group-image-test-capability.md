@@ -1,19 +1,20 @@
 ---
-title: 2026-05-21 - Check LINE JS group image test capability
+title: "2026-05-21 - Check LINE JS group image test capability"
 type: session-log
-session-date: 2026-05-21
 agent: Codex
+session-date: "2026-05-21"
 duration-minutes: 3
 outcomes:
   - Confirmed LINE JS text sending to group is supported via /api/line-bot/send and dashboard /line-bot.
   - Confirmed image listener exists for inbound group images via LINE_IMAGE_LISTENER_CHAT_ID and startImageListener.
   - Confirmed outbound image sending to LINE group is not currently exposed in service/controller/UI.
-created: 2026-05-21
-updated: 2026-05-21
 tags:
   - session-log
   - project/general
+created: "2026-05-21"
+updated: "2026-05-21"
 ---
+
 # 2026-05-21 - Check LINE JS group image test capability
 
 ## TL;DR

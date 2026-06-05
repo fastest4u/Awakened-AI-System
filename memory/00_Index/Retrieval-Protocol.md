@@ -2,17 +2,18 @@
 title: Retrieval Protocol
 type: reference
 status: active
-created: 2026-05-16
-updated: 2026-05-17
+confidence: medium
+source: memory-mcp bootstrap
+verified-by: memory-mcp
+last-verified: "2026-05-17"
 tags:
   - retrieval
   - token-economy
   - project/general
-last-verified: 2026-05-17
-verified-by: memory-mcp
-source: memory-mcp bootstrap
-confidence: medium
+created: "2026-05-16"
+updated: "2026-05-17"
 ---
+
 # Retrieval Protocol
 
 > [!important]

@@ -1,17 +1,18 @@
 ---
-title: 2026-05-16 - Updating MCP Bootstrap Defaults
+title: "2026-05-16 - Updating MCP Bootstrap Defaults"
 type: session-log
-session-date: 2026-05-16
 agent: Antigravity
+session-date: "2026-05-16"
 duration-minutes: 5
 outcomes:
   - "Any new project bootstrapped using this MCP server will now automatically receive the complete plugin configuration, including the AI stack."
-created: 2026-05-16
-updated: 2026-05-16
 tags:
   - session-log
   - project/general
+created: "2026-05-16"
+updated: "2026-05-16"
 ---
+
 # 2026-05-16 - Updating MCP Bootstrap Defaults
 
 ## TL;DR

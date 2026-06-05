@@ -1,19 +1,20 @@
 ---
-title: 2026-05-16 - Fix MCP Regex Constraints and Add Slash Command Prompts
+title: "2026-05-16 - Fix MCP Regex Constraints and Add Slash Command Prompts"
 type: session-log
-session-date: 2026-05-16
 agent: Antigravity
+session-date: "2026-05-16"
 duration-minutes: 30
 outcomes:
   - Resolved MCP regex validation errors.
   - "Added UI slash commands for 5 key memory functions (session_start, session_end, self_check, awaken, write_adr)."
   - Successfully compiled the codebase.
-created: 2026-05-16
-updated: 2026-05-16
 tags:
   - session-log
   - project/general
+created: "2026-05-16"
+updated: "2026-05-16"
 ---
+
 # 2026-05-16 - Fix MCP Regex Constraints and Add Slash Command Prompts
 
 ## TL;DR

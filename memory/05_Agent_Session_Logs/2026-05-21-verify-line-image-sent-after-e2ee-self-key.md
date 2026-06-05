@@ -1,19 +1,20 @@
 ---
-title: 2026-05-21 - verify LINE image sent after E2EE self key
+title: "2026-05-21 - verify LINE image sent after E2EE self key"
 type: session-log
-session-date: 2026-05-21
 agent: codex
+session-date: "2026-05-21"
 duration-minutes: 8
 outcomes:
   - Checked LINEJS storage after another LINE ID sent an image into the group.
   - Confirmed backend is running on port 3000 and /health returns ok.
   - "Confirmed E2EE storage now has self, group, and public key entries; no backend log file exists, so terminal output is still needed to verify image processing result."
-created: 2026-05-21
-updated: 2026-05-21
 tags:
   - session-log
   - project/general
+created: "2026-05-21"
+updated: "2026-05-21"
 ---
+
 # 2026-05-21 - verify LINE image sent after E2EE self key
 
 ## TL;DR

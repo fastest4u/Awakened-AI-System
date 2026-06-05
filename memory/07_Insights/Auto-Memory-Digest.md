@@ -2,40 +2,40 @@
 title: Auto Memory Digest
 type: insight
 derived-from:
-  - 05_Agent_Session_Logs/2026-05-20-draft-performance-optimization-plan.md
-  - 05_Agent_Session_Logs/2026-05-20-final-verification-and-vault-health-optimization.md
-  - 05_Agent_Session_Logs/2026-05-20-finalize-slow-api-investigation-response.md
-  - 05_Agent_Session_Logs/2026-05-20-fix-memory-vault-health-errors.md
-  - 05_Agent_Session_Logs/2026-05-20-implement-safe-laravel-api-performance-diagnostics-and-query-optimizations.md
-  - 05_Agent_Session_Logs/2026-05-20-investigate-slow-laravel-api-responses-and-query-latency.md
-  - 05_Agent_Session_Logs/2026-05-20-performance-optimization-2.md
-  - 05_Agent_Session_Logs/2026-05-20-performance-optimization.md
-  - 05_Agent_Session_Logs/2026-05-20-present-performance-optimization-plan-to-user.md
-  - 05_Agent_Session_Logs/2026-05-20-refining-performance-optimization-plan.md
-  - 05_Agent_Session_Logs/2026-05-20-skill-symlink-setup-for-laravel-project.md
-  - 05_Agent_Session_Logs/2026-05-20-ssh-into-production-and-run-laravel-post-deploy-verification.md
-  - 05_Agent_Session_Logs/2026-05-20-strict-pr-review-8-category-for-refactor-optimize-queries-dashboard-endpoints.md
-  - 05_Agent_Session_Logs/2026-05-20-study-and-distill-laravel-caching-performance-and-testing-architecture-2.md
-  - 05_Agent_Session_Logs/2026-05-20-study-and-distill-laravel-caching-performance-and-testing-architecture.md
-  - 05_Agent_Session_Logs/2026-05-20-system-exploration-and-vault-health-optimization.md
-  - 05_Agent_Session_Logs/2026-05-21-added-context7-mcp-to-ide-config.md
-  - 05_Agent_Session_Logs/2026-05-21-check-ai-sdk-provider-config-ui.md
-  - 05_Agent_Session_Logs/2026-05-21-check-incoming-line-image-from-other-id-after-relogin.md
-  - 05_Agent_Session_Logs/2026-05-21-check-line-js-group-image-test-capability.md
-  - 05_Agent_Session_Logs/2026-05-21-clarify-and-improve-line-receive-images-e2ee-requirement.md
-  - 05_Agent_Session_Logs/2026-05-21-clarify-line-image-to-ai-bidding-flow.md
-  - 05_Agent_Session_Logs/2026-05-21-codex-pkce-auth-improvements.md
-  - 05_Agent_Session_Logs/2026-05-21-configured-context7-mcp-in-active-gemini-config.md
-  - 05_Agent_Session_Logs/2026-05-21-context7-cli-usage-demo.md
-  - 05_Agent_Session_Logs/2026-05-21-context7-setup-for-antigravity.md
-  - 05_Agent_Session_Logs/2026-05-21-create-mcp-config-json-in-antigravity-folder.md
-  - 05_Agent_Session_Logs/2026-05-21-diagnose-powershell-npm-run-dev-http-enabled-failure.md
-  - 05_Agent_Session_Logs/2026-05-21-explain-how-to-test-line-image-listener-in-group.md
-  - 05_Agent_Session_Logs/2026-05-21-fix-codex-auth-route-to-use-device-code-flow.md
+  - 05_Agent_Session_Logs/2026-06-05-continue-memory-index-tier-3-hybrid-embedding-search.md
+  - 05_Agent_Session_Logs/2026-06-05-answer-compact-memory-behavior-in-project-memory-mcp.md
+  - 05_Agent_Session_Logs/2026-06-05-answer-claude-code-integration-status.md
+  - 05_Agent_Session_Logs/2026-06-05-recommend-next-project-memory-mcp-improvements.md
+  - 05_Agent_Session_Logs/2026-06-05-implement-mcp-doctor-client-diagnostics-v2.md
+  - 05_Agent_Session_Logs/2026-06-05-add-mcp-doctor-remediation-suggestions.md
+  - 05_Agent_Session_Logs/2026-06-05-recommend-next-project-memory-mcp-roadmap-step.md
+  - 05_Agent_Session_Logs/2026-06-05-runtime-verification-strict-review-and-commit-preparation-for-tier-3-embeddings-mcp-doctor.md
+  - 05_Agent_Session_Logs/2026-06-04-review-harden-and-ship-memory-index-tier-2-backlink-graph-section-anchors-via-pr-6.md
+  - 05_Agent_Session_Logs/2026-06-03-add-claude-md-onboarding-guide-for-claude-code.md
+  - 05_Agent_Session_Logs/2026-06-03-add-full-auto-project-memory-operating-protocol-directive-to-claude-md.md
+  - 05_Agent_Session_Logs/2026-06-03-analyze-memory-index-retrieval-and-propose-efficiency-roadmap-tier-1-3.md
+  - 05_Agent_Session_Logs/2026-06-03-audit-memory-vault-frontmatter-system-vs-15-section-thai-prompt-survey-gap-risk-no-code-edits.md
+  - 05_Agent_Session_Logs/2026-06-03-implement-steps-1-6-frontmatter-safety-hardening-fix-gray-matter-cache-non-idempotency.md
+  - 05_Agent_Session_Logs/2026-06-03-implement-tier-1-memory-index-incremental-persistent-index-bm25-ranked-search.md
+  - 05_Agent_Session_Logs/2026-06-03-make-rollback-reversible-snapshot-before-restore-scope-latestbackupdir-to-fix-migrate-backups.md
+  - 05_Agent_Session_Logs/2026-06-03-post-merge-cleanup-fix-claude-md-dist-claim-delete-merged-branch-sync-local-main.md
+  - 05_Agent_Session_Logs/2026-06-03-step-7-frontmatter-enhancements-versioned-migration-central-codes-diagnostic-line-numbers-vault-containment.md
+  - 05_Agent_Session_Logs/2026-06-02-memory-vault-full-refactor.md
+  - 05_Agent_Session_Logs/2026-06-01-add-project-local-frontmatter-config-json-schema-and-verify-reusable-init-flow.md
+  - 05_Agent_Session_Logs/2026-06-01-close-prompt-checklist-gaps-cli-safe-unsafe-confirm-migrate-rollback-validfiles-report-count-and-missing-tests-unknown-fields-config-fallback-override.md
+  - 05_Agent_Session_Logs/2026-06-01-confirm-runtime-mcp-blocker-for-frontmatter-completion.md
+  - 05_Agent_Session_Logs/2026-06-01-document-runtime-refresh-workflow-for-stale-project-memory-mcp-frontmatter-diagnostics.md
+  - 05_Agent_Session_Logs/2026-06-01-harden-frontmatter-warning-system-and-safety-defaults.md
+  - 05_Agent_Session_Logs/2026-06-01-implement-option-c-hybrid-frontmatter-system-for-project-memory-mcp-safe-parser-schema-fix-migrate-report-cli-mcp-tools-tests.md
+  - 05_Agent_Session_Logs/2026-06-01-memory-vault-analysis-quality-gate-check.md
+  - 05_Agent_Session_Logs/2026-06-01-memory-vault-frontmatter-system-analysis-and-standardization-design.md
+  - 05_Agent_Session_Logs/2026-06-01-memory-vault-system-structure-analysis.md
+  - 05_Agent_Session_Logs/2026-06-01-populate-empty-outcomes-in-2-stub-session-logs-to-clear-missing-required-field-errors.md
+  - 05_Agent_Session_Logs/2026-06-01-re-verify-after-mcp-restart-99-templates-warnings-fix-confirmed-0-warnings.md
 confidence: medium
 status: active
-created: 2026-05-23
-updated: 2026-05-23
+created: "2026-06-05"
+updated: "2026-06-05"
 tags:
   - digest
   - auto-compact
@@ -43,167 +43,171 @@ tags:
 ---
 # Auto Memory Digest
 
-Generated: 2026-05-23
+Generated: 2026-06-05
 
 > [!important]
 > This note is generated from recent session logs. Keep durable architectural choices in ADRs and keep repeated lessons here or in dedicated insight notes.
 
 ## High-Signal Outcomes
-- Researched system architecture and modules in app/ and memory vault
-- Created detailed, structured performance optimization plan artifact implementation_plan.md covering Database, Cache, Laravel Octane, Queues, and Serialization layers
-- Successfully resolved all frontmatter errors in developer runbook
-- Verified vault health score is 90 with 0 errors and 0 warnings
-- Successfully ran full test suite with 276 tests and 812 assertions passing at 100%
-- Successfully ran static analysis (Larastan) on all 720 files with 0 errors
-- Ran required self-check before finalizing production performance findings.
-- Prepared to present findings without applying production changes.
-- Fixed the two vault health errors caused by empty session-log outcomes fields.
-- Updated both affected session logs with non-empty, evidence-backed outcomes and matching TL;DR / What Was Done bullets.
-- Verified vault health is now score 90, grade B, with 0 errors and 0 warnings.
-- Verified both edited notes individually and reindexed the 72-note vault.
-- Added opt-in production slow query and query-count monitoring using DB_SLOW_QUERY_LOG_ENABLED, DB_SLOW_QUERY_THRESHOLD_MS, and DB_QUERY_COUNT_WARNING_THRESHOLD.
-- Redacted slow-query bindings by logging binding counts/types instead of values.
-- Changed query-count tracking to request attributes to avoid static memory growth under Octane.
-- Made WorkAssignment date scopes/filtering index-friendly by avoiding whereDate on date columns.
-- Reduced AdminProfitLoss monthly/export N+1 query patterns by batch-loading Turboroute costs and deductions per result set.
-- Added missing DashboardController endpoint methods for routes already registered, preventing method-not-found 500s on dashboard APIs.
-- Ran formatting, static analysis, diagnostics, and full PHPUnit suite.
-- Checked project memory and relevant performance runbook/follow-ups.
-- Inspected Laravel route, middleware, health check, work assignment, dashboard, cache, and performance command code paths.
-- Measured public health endpoint and unauthenticated protected endpoint latency; base API path is fast.
-- Found production runtime optimization gaps: config/routes/events/views are not cached in the local production environment and Octane is configured but not running.
-- Found CLI DB connectivity to MySQL host fails from this workspace, preventing local migrate status and performance_schema slow-query inspection, while public health endpoint reports database healthy.
-- Identified likely protected-endpoint hotspots: WorkAssignment index aggregate+pagination queries, AdminProfitLoss N+1 loops, dashboard response cache not showing stored keys, and unpaginated/date/LIKE query patterns.
-- Presented the comprehensive 5-layer performance optimization plan to the user
-- Verified 100% green test suite (281 tests, 821 assertions) and clean static analysis (0 errors) on PHP 8.4
-- Staged but uncommitted optimization code in the repository ready for integration
-- Drafted and updated a comprehensive 5-layer performance optimization plan in implementation_plan.md.
-- Successfully verified the fully coded optimizations across all 5 layers in the workspace.
+- Completed opt-in Tier 3 hybrid search plumbing with MEMORY_EMBEDDINGS config, hash/http providers, vector cache signatures, RRF fusion, and lexical-only fallback.
+- Added Thai/CJK character n-gram recall across index and section matching while preserving Latin/code token behavior.
+- Hardened embedding refresh with bounded document batches and cooldown on endpoint errors or malformed provider responses.
+- Documented embedding environment variables in README and recorded the Tier 3 retrieval ADR.
+- Checked project docs and source for memory compaction/token-economy behavior.
+- Confirmed project-memory MCP supports token-budgeted context packs, manual memory_compactVault, and sessionEnd autoCompact.
+- Checked CLAUDE.md and .claude/settings.local.json for Claude Code integration status.
+- Confirmed CLAUDE.md contains Full-Auto project-memory protocol and .claude/settings.local.json enables project-memory with core memory tool allowlist.
+- Reviewed roadmap and follow-up context for project-memory MCP improvements.
+- Prepared prioritized recommendation focused on runtime diagnostics, token economy, retrieval quality, multi-agent safety, and import/export completion.
+- Extended memory_diagnoseWorkspace with an additive doctor section for project/vault/build checks and AI client MCP config diagnostics.
+- Added read-only diagnostics for Claude Code, Codex, Cursor, Windsurf, Zed, OpenCode, and Antigravity local config files.
+- Added machine-readable issue codes including VAULT_AGENT_RULES_MISSING, CLIENT_CONFIG_MISSING_PROJECT_MEMORY, CLIENT_CONFIG_PARSE_ERROR, and CLAUDE_MCP_SERVER_DEFINITION_NOT_LOCAL.
+- Handled UTF-8 BOM-prefixed JSON client configs to avoid false parse-error warnings.
+- Updated the maintenance tool description and README documentation for MCP Doctor output.
+- Added optional doctor.issues[].remediation to MCP Doctor diagnostics with summary/path/snippet/command fields.
+- Added client-specific project-memory config snippets for Codex TOML, Zed context_servers JSON, OpenCode JSON, and mcpServers JSON clients.
+- Added remediation guidance for missing project root, missing vault, missing vault AGENTS.md, vault outside project, missing build info, client parse errors, missing project-memory client configs, missing Claude Code project-local .mcp.json, and no local client configs found.
+- Updated README documentation for the remediation field.
+- Verified built CLI diagnose now includes remediation for the Claude Code project-local .mcp.json info issue.
+- Reviewed current roadmap/follow-up context after MCP Doctor and remediation work.
+- Prepared recommendation to stabilize and verify the newly built MCP Doctor across real clients before starting another feature slice.
+- Confirmed active project-memory MCP runtime is using this repo's dist/index.js and current build info; runtime frontmatter validation for 99_Templates/Template-Daily-Note.md is warning-clean.
+- Strict-reviewed Tier 3 hybrid embedding search and MCP Doctor diagnostics/remediation before starting memory_export/import work.
+- Found and fixed two Tier 3 review defects: vector arm cap was applied before folder/type/tag eligibility, and stale vectors could remain persisted after disabling/changing the embedder signature.
+- Found and fixed one MCP Doctor review defect: inactive example configs could raise parse-error warnings or influence enabled-state inference.
+- Added regression coverage for filtered vector recall, vector cache scrubbing, and inactive example parse errors.
+- Committed implementation as a focused code/docs commit: a20cf48 feat: add hybrid embeddings and MCP doctor diagnostics.
+- Shipped Tier 2 (backlink graph + section-anchor search) to main via PR #6, squash-merged as ac8a8b4.
+- Ran a 6-dimension adversarial multi-agent review of the Tier 2 diff (25 agents); 17 findings confirmed (each independently verified), 2 rejected as correct-by-design.
 
 ## Decisions To Remember
-- Proposing indexed stored generated column for driver fuzzy searches
-- Proposing integration of Swoole Table or Redis for TurboRoute IP rate limiting
-- Proposing Octane concurrency for logistics Flash Express and Turboroute parallel processing
-- Added missing required frontmatter metadata fields to runbook guide to ensure total compliance with the vault schema
-- Keep response diagnostic and request approval before running production optimization or editing code.
-- Resolved the validation failures by replacing empty outcomes arrays with concise non-empty outcomes rather than weakening validation or removing the session logs.
-- Kept wording conservative and based on each note's title and Files Touched section to avoid inventing unverified work.
-- Do not touch pre-existing AGENTS.md working tree modification.
-- Keep production slow query logging disabled by default and opt-in only.
-- Use request attributes instead of static arrays for per-request query counts to stay safer with long-running Octane workers.
-- Preserve AdminProfitLoss business calculations while changing query shape from N+1 to batched preloads.
-- Do not modify production code or run cache/route optimization commands without user approval because the app reports production environment.
-- Do not read .env secrets; rely on artisan/about, public health output, and code inspection.
-- Adopted stored generated columns for O(1) driver search normalization to avoid dynamic runtime functions in Laravel Octane environment
-- Designed two-level cache (L1 Swoole + L2 Redis) with automatic per-request state flushes to avoid cross-request contamination in long-lived Octane workers
-- Refined the 5-layer performance optimization plan artifact with actual codebase paths and exact current implementation status
-- Ran only the specific performance migration instead of all pending migrations to avoid unrelated production schema changes.
-- Left remaining unrelated pending migrations untouched.
-- Did not attempt to fix view cache/config/view.php on production during SSH session because API health is healthy and optimize partially succeeded for config/routes/events.
-- Maintained clean separation of concern inside model files and database accessors
-- Decided to copy and index the developer performance runbook into the active Awakened-AI-System memory vault
-- Standardized on SQLite in-memory dynamic schema creation for local test execution to maintain perfect velocity and bypass heavy database I/O.
-- Standardized on cursor-based non-blocking SCAN commands via RedisCacheHelper for custom caching/invalidation rules, fully eliminating production Redis command blocking.
-- Used the project-memory MCP selfCheck protocol before making structural modifications to the memory vault.
-- Linked the logistics architecture insight directly to the bootstrap session log in the derived-from metadata for accurate lineage.
-- Added context7 MCP server directly to C:\\Users\\Server\\.gemini\\antigravity-ide\\mcp_config.json to make it appear in the IDE's Installed MCP Servers list
-- Updated C:\\Users\\Server\\.gemini\\config\\mcp_config.json via Node script because direct file tools were blocked by platform boundaries. Added context7 configuration successfully.
-- Configured Context7 using API key credentials for multiple agents
-- Created mcp_config.json inside C:\\Users\\Server\\.gemini\\antigravity\\mcp_config.json with context7, github-mcp-server, and project-memory configurations
-- Swapped app.post('/codex-auth/start') to call startDeviceCodeAuth() instead of startCodexDeviceAuth() in src/controllers/ai-controller.ts. This activates the RFC 8628 Device Code Grant flow instead of the legacy auth code flow which was blocked by Cloudflare (403).
+- Embeddings remain off by default; lexical/BM25 behavior remains the default local-first path.
+- Hybrid ranking fuses BM25, vector cosine, and usage arms by Reciprocal Rank Fusion instead of comparing raw scores.
+- Document vectors are persisted only with an active embedder signature and stripped from public search/get/list results.
+- Embedding provider failures and malformed responses degrade to lexical-only rather than failing MCP search tools.
+- Kept diagnostics on the existing memory_diagnoseWorkspace tool instead of adding a separate tool, preserving the empty input schema and backward compatibility.
+- Reported Claude Code missing root .mcp.json as info rather than warning because the server definition may intentionally live in a global config.
+- Made client diagnostics file-based and read-only; no client processes are started or modified.
+- Kept remediation additive and optional on each issue to preserve existing memory_diagnoseWorkspace consumers.
+- Kept diagnostics read-only; remediation provides snippets and commands but does not modify client files.
+- Recommended runtime/client verification and review/commit hygiene ahead of new feature work because the current diagnostic improvements are built but client processes may still be stale until reloaded.
+- Keep memory_export/memory_import implementation for the next task after review/commit stabilization.
+- Keep Doctor remediation read-only; provide snippets/commands but no auto-write behavior yet.
+- Group implementation source/tests/README separately from memory vault notes and agent docs so PR review can separate runtime behavior from repository memory artifacts.
+- Register link-graph resolution keys in precedence tiers (path/basename -> title/id -> aliases) across all notes instead of a flat per-note first-wins loop.
+- Track fenced-code-block state in splitSections so heading detection is suppressed inside ``` / ~~~ fences.
+- Snapshot the index once up front in resolveReference (all branches) rather than a second time in get().
+- Defer duplicate-basename folder-aware (Obsidian shortest-path) resolution to a follow-up — LOW severity, does not occur in the current vault; documented in the ensureLinkGraph docstring.
+- Kept broken-link warning dedup and full link-graph rebuild-on-mutation unchanged (both correct-by-design per the review).
+- Documentation-only single-file change; selfCheck intentionally skipped per low-risk criteria
+- Kept README's Thai-language note as the fullest tool-surface reference rather than duplicating it in CLAUDE.md
+- Placed the protocol as an imperative directive at the top of CLAUDE.md (read first) rather than a descriptive note at the bottom, because Claude Code loads CLAUDE.md preferentially and needs the instruction early
+- Kept AGENTS.md/.rules/ADR as the cited source of truth rather than restating every rule verbatim, to avoid drift
+- Advisory/planning task: did not edit code; presented a tiered roadmap and will ask the user which tier to implement
+- Keep everything local-first and feature-flag the embedding tier so the default stays zero-dependency (consistent with the vault's no-lock-in principle)
+- Did NOT edit code this turn, per the prompt's section 15 (survey -> report -> propose plan first)
+- Recovered workflow data from disk transcripts instead of re-running agents, to avoid re-hitting the session limit
+- Spot-verified the two HIGH findings and the duplicate-key hypothesis myself rather than trusting agent output, because the findings are decision-heavy and one agent claim was plausibly wrong
+- Implemented sequentially (not via parallel workflow) because the 6 steps mutate overlapping files (frontmatter.service.ts, frontmatter.ts) and must be verified in order
+- Made backup non-optional on writes rather than just warning, to fully satisfy the prompt's section-11 rule 'never overwrite memory without backup'
+- Kept created=today fabrication in `fix` (the prompt sanctions 'add missing frontmatter / fill created_at' as a SAFE fix) but removed it from `migrate` (which should only stamp versions)
 
 ## Open Follow-ups
-- [ ] Obtain user feedback and approval on the drafted performance optimization plan
-- [ ] Reload MCP-capable clients in the Laravel project so they pick up latest project-memory configurations
-- [ ] Ensure future module developments follow the strict N+1 query prevention rules by avoiding $appends array and using preloaded checks
-- [ ] If user approves, perform targeted profiling on the exact slow authenticated endpoint and apply safe optimizations.
-- [ ] No new follow-ups from this repair; existing unrelated vault follow-ups remain outside the scope of this task.
-- [ ] Deploy with env DB_SLOW_QUERY_LOG_ENABLED=true and an appropriate DB_SLOW_QUERY_THRESHOLD_MS only when ready to collect production slow-query samples.
-- [ ] After deployment, run php artisan optimize and restart PHP/Octane workers as appropriate.
-- [ ] Use production DB host access to run migrate:status and confirm performance indexes are applied.
-- [ ] Profile the exact slow authenticated endpoint with the new logs and consider deeper aggregation-level SQL optimization if needed.
-- [ ] Ask user for the exact slow endpoint, request parameters, and an auth token or sanitized timing/log sample if they want live profiling of protected APIs.
-- [ ] With approval, run production-safe optimization commands such as php artisan optimize and verify route/config cache status.
-- [ ] With DB access from the actual production host, run migrate:status and db:monitor-slow-queries or EXPLAIN on slow endpoint SQL.
-- [ ] Consider implementing opt-in production slow-query logging with redacted bindings and fixing dashboard route/controller mismatches.
-- [ ] Obtain user approval to stage, commit, and run the strict PR review workflow `/strict-pr-review-8-category` for integration
-- [ ] Advise server/DevOps team to configure PHP 8.4 JIT, OPcache, and Redis Memory Max Policies (allkeys-lru)
-- [ ] Obtain user approval to commit and merge the drafted and fully tested performance optimizations.
-- [ ] Once approved, create task.md to track development progress
-- [ ] Implement database layer optimization (composite indexes, generated stored column for fuzzy search)
-- [ ] Implement cache layer (warm-up, API caching, Swoole table for rate limiting)
-- [ ] Implement concurrency with Octane
-- [ ] Implement asynchronous payroll queue jobs
-- [ ] Implement sparse fieldsets and Nginx Gzip/Brotli compression
-- [ ] Obtain user feedback and approval on the refined 5-layer performance optimization plan
-- [ ] Once approved, implement Swoole table rate limiter integration in TurboRouteRateLimiter.php
-- [ ] Once approved, implement Octane concurrently in FlashExpressService.php
-- [ ] Once approved, create CalculatePayrollJob.php for asynchronous background queue execution
-- [ ] Monitor storage/logs/laravel-2026-05-20.log for [SLOW QUERY] and [POTENTIAL N+1] entries after real user traffic hits slow endpoints.
-- [ ] Consider adding config/view.php or excluding view cache from deploy optimize flow for API-only deployment.
-- [ ] Review remaining pending migrations before running full php artisan migrate --force.
-- [ ] Fix scheduler Docker healthcheck by installing procps/ps or changing healthcheck to a command available in the image.
+- [ ] Review/commit the branch worktree separately; git status still contains broad pre-existing memory vault and AGENTS.md changes outside the Tier 3 implementation surface.
+- [ ] Consider a PR for feat/memory-index-tier3-embeddings once the user is ready to ship.
+- [ ] If user wants 100% Claude Code setup audit, inspect Claude Code global/project MCP server definition because this repo has .claude/settings.local.json but no root .mcp.json file visible in the workspace.
+- [ ] Consider adding optional remediation suggestions to doctor.issues, such as the exact config path and snippet to add when a client config is missing project-memory.
+- [ ] Implement memory_export and memory_import so README no longer lists them as placeholders.
+- [ ] Add safe Doctor Auto-Repair as dry-run plan/apply flow, not automatic file mutation.
+- [ ] Optionally add a project-local .mcp.json if this repo should be self-contained for Claude Code; current Doctor reports this as info-only because the server definition may live globally.
+- [ ] Tier 3: optional embedding hybrid search (next memory-index roadmap slice).
+- [ ] Backlink graph: duplicate-basename folder-aware resolution (Obsidian shortest-path) so a bare `dup` link in b/dup.md resolves to b's own folder rather than the lexicographically-first path — LOW, currently documented + deferred.
+- [ ] Optional: add ADR recording the decision to commit obfuscated dist/ output, if not already captured
+- [ ] Pre-existing: 99_Templates/Template-Daily-Note.md has 2 INVALID_DATE_FORMAT placeholder-date warnings (unrelated to this task)
+- [ ] AWAITING USER DECISION: which index roadmap tier to implement first (recommended Tier 1: persistent incremental index + BM25 ranked search fused with usage scoreBoost)
+- [ ] Consider writing an ADR for the index architecture direction once the tier is chosen
+- [ ] Tier 1.1 persistent index should reuse the safe parseFrontmatter + handle add/modify/delete via mtime; Tier 1.2 should fold in MemoryUsageService.scoreBoost so ranking is unified across memory_search and contextPack
+- [ ] Implement Step 1-2 (HIGH safety): make backup mandatory on non-dry-run writes (frontmatter.service.ts + note.service/repository); migrate() skip !hasFrontmatter notes and stop fabricating created=today
+- [ ] Step 3-6: preserve body bytes/line-endings in buildNoteContent; verify+atomic backup; CLI exit codes + --format whitelist; tighten tests (pin DUPLICATE_KEY, add BAD_INDENTATION/INVALID_YAML/tab-indent fixtures) + MigrateSummary renderer
+- [ ] Step 7 long-term: versioned migration registry, numeric schema-version compare, central code/severity enum, line numbers on schema-layer diagnostics, vaultRoot subset-of projectRoot check
+- [ ] Decide how to commit: the frontmatter subsystem (frontmatter.ts/.service.ts/cli.ts/config + tests) is untracked from a prior session and entangled with other uncommitted src changes (app.ts, vault.service.ts, vault-health.service.ts, memory.config.ts) — needs a strict-pr-review pass before committing per the existing follow-up
+- [ ] dist/ was rebuilt locally (obfuscated) to make the MCP runtime reflect the hardening; decide whether to commit the rebuilt bundle per the repo's commit-dist convention
+- [ ] Step 7 (long-term, not done): versioned migration registry (from->to transforms), numeric schema-version comparison, central code/severity enum, line numbers on schema-layer diagnostics, vaultRoot subset-of projectRoot containment check
+- [ ] Optional: snapshot-before-restore in rollback() (currently atomic+skip-on-error but still overwrites live edits without a pre-restore backup)
+- [ ] Decide whether to open a PR for feat/incremental-bm25-index (Tier 1) and/or continue to Tier 2 (backlink graph + section-level chunks) / Tier 3 (optional embedding hybrid search)
+- [ ] Recommend gitignoring .memory-mcp/index.json (derived cache, churns on edits) like dist/ — not done to avoid entangling with the already-dirty .gitignore
+- [ ] Tier 2: real incomingLinks via a link graph built during indexing (the wikilink data is already cheap to capture); section-level chunk index returning section + line anchor
+- [ ] AWAITING EXPLICIT USER CONFIRMATION to squash-merge PR #4 into main (auto-merge denied earlier; needs a clear go-ahead). PR now has 3 commits, 139 tests green, no P0-P3 blockers remaining
+- [ ] The PR #4 squash (frontmatter system + Steps 1-6 + Step 7 + rollback) is now on main; 158 unrelated files remain uncommitted in the working tree (memory/ vault notes, README/AGENTS/CLAUDE.md/.gitignore) — the user's call when/whether to commit those
+- [ ] Optional: commit CLAUDE.md (onboarding doc, currently untracked) if the project wants it in the repo
+- [ ] Optional: add ADR recording that dist/ is a gitignored artifact (not committed), to prevent the confusion that produced the wrong CLAUDE.md line
+- [ ] AWAITING EXPLICIT USER CONFIRMATION to squash-merge PR #4 into main (auto-merge was denied by the classifier; needs a clear go-ahead)
+- [ ] Remaining minor: rollback() still overwrites live edits without a snapshot-before-restore (atomic + skip-on-error mitigate; LOW)
 
 ## Confidence Lessons
-- The proposed optimizations cover all major bottlenecks in logistics ERP -> Comprehensive performance strategy requires balancing db, caching, concurrent processing, and async jobs
-- All vault errors are resolved and vault score is B (90) -> Runbooks must have required frontmatter fields like last-verified, verified-by, source, and confidence
-- The two reported vault errors were caused by empty outcomes fields in two session-log notes. -> For this vault, an empty outcomes array is treated as missing for session-log validation.
-- The WorkAssignment date filter change is safe because schema defines work_assignments.work_date as date, so direct comparisons are equivalent and more index-friendly than whereDate. -> Check schema before replacing whereDate with direct comparisons.
-- AdminProfitLoss optimization preserves business logic while removing N+1 query behavior. -> For financial performance refactors, add endpoint-level regression tests when possible.
-- Base public API and infrastructure are not the primary bottleneck because /api/health responds quickly and reports DB/Redis/storage healthy. -> Use public health and unauthorized protected endpoint timings to separate base app/network latency from protected controller/query latency.
-- Protected data slowness cannot be fully profiled without an authenticated request or DB access from the production runtime. -> Static code inspection can identify likely hotspots, but actual endpoint timing needs auth context and production DB visibility.
-- Production SSH access works with root and existing SSH key. -> Use BatchMode and ConnectTimeout for non-interactive production SSH checks.
-- Targeted performance migration is applied in production. -> For production, prefer targeted migration when unrelated pending migrations exist.
-- All unit and feature tests pass successfully -> SQLite in-memory schema builder makes test suite run incredibly fast and reliably
-- Larastan static analysis has no errors -> Running PHPStan with --memory-limit=1G ensures the large analysis runs smoothly without crashing
+- Generated project configs now reference a real local JSON Schema artifact. -> A local schema artifact is better for project-agnostic reuse than a placeholder remote URL.
+- The original full objective is complete. -> Completion must include runtime evidence for the MCP process, not only rebuilt dist/CLI evidence.
+- validFiles addition keeps the suite green without re-running -> Additive, well-typed fields are low-risk, but state explicitly when a final test re-run was skipped so verification status stays honest
+- PowerShell pipes to Select-String/node -e were the cause of hangs, not the code -> Avoid piping npm/node --test through PowerShell filters; run bare commands to prevent child-handle deadlocks
+- The active MCP runtime is stale and not using the rebuilt frontmatter code. -> When MCP and CLI disagree after build, process ownership/creation time is decisive runtime evidence.
+- Killing the Codex-owned project-memory process from this session is safe. -> Prefer client-level MCP restart over process termination from inside an active agent session.
+- The frontmatter source/bundle behavior is warning-clean for template placeholders. -> Use CLI/new-bundle verification to distinguish source correctness from active MCP process freshness.
+- The overall goal can be marked complete now. -> Completion evidence must include the actual runtime surface the user relies on, not only rebuilt artifacts.
+- The rebuilt CLI validation no longer reports template placeholder warnings. -> Template placeholders should be handled as a semantic exemption, not by trying to coerce placeholder dates into the normal date schema.
+- The running MCP frontmatter tool reflects the rebuilt behavior immediately after build. -> Building dist is necessary but not sufficient for active MCP tools; runtime restart is a separate verification step.
+- parseFrontmatter never throws across all gray-matter failure modes -> Pre-checking raw delimiters before calling gray-matter makes failure classification reliable
+- Changes preserve the existing 88/B vault health score -> Separating advisory info from the scoring gate avoids breaking backward-compatible health metrics
 
 ## Verification Evidence
-- Created and verified implementation_plan.md artifact without modifying source code.
-- Executed composer test (276 tests, 812 assertions passed successfully) and vendor/bin/phpstan analyse --memory-limit=1G (analyzed 720 files, 0 errors). Both checks passed 100% green.
-- memory_selfCheck completed for finalization; no code changes made.
-- Ran memory_verifyVault after edits: score 90, grade B, ok true, 0 errors, 0 warnings. Ran memory_verifyNote on both edited notes: valid true, no issues. Ran memory_reindex full: indexed 72 notes.
-- php -l on touched PHP/config files; php artisan route:list --path=api/dashboard; vendor/bin/pint on touched files; vendor/bin/phpstan analyse touched files --memory-limit=1G (no errors); diagnostics on touched files (no warnings); php artisan test --compact (281 tests, 821 assertions passed, existing PHP 8.5 PDO deprecations).
-- php artisan about; php artisan performance:phase1 --check; php artisan performance:phase3 --check; php artisan db:monitor-slow-queries --threshold=100 --limit=15 (blocked by CLI DB connectivity); php artisan route:list --path=api/work-assignments; php artisan route:list --path=api/dashboard; curl timing for https://tms.pathwaylogistic.com/api/health and /api/work-assignments unauthenticated; php artisan performance:cache-stats
-- Not recorded
-- SSH whoami/hostname succeeded; docker exec laravel-octane-api php artisan about; migrate:status before/after targeted migration; php artisan config:show database.monitoring; php artisan octane:reload; php artisan queue:restart; curl https://tms.pathwaylogistic.com/api/health returned healthy; curl /api/work-assignments returned expected 401 unauthenticated.
-- Executed full test suite (276 tests, 812 assertions passing successfully). Run PHPStan static analysis (0 errors across 720 files). Ran memory_verifyVault which returned 0 errors and score 90.
-- Ran memory_verifyVault which returned a clean, error-free result. Executed composer test in Laravel workspace to verify that all 276 feature/unit tests are perfectly passing.
-- Read src/services/settings.ts, src/frontend/routes/settings.tsx, src/frontend/components/SettingsLineBotSection.tsx, and src/frontend/types/index.ts.
-- Read redacted counts from data/linejs-storage.json, checked port 3000 owner process, and called http://localhost:3000/health successfully.
-- Inspected src/services/line-bot.ts, src/controllers/line-bot-controller.ts, src/services/http-server.ts, src/frontend/routes/line-bot.tsx, and src/frontend/lib/api.ts. No code changes made.
-- Redacted storage inspection showed TotalKeys=0 and E2EESelfKeys=0; npm run typecheck passed after code changes.
-- Read src/services/line-bot.ts, src/services/codex-image-reader.ts, and src/controllers/ai-controller.ts relevant snippets.
-- No code changes; diagnosis based on user terminal output and package script behavior.
-- Answered from inspected code and prior session context; no code changes made.
+- Ran targeted Node tests for memory-query and retrieval helpers, then ran full `npm test` after the final README edit: 237 tests passed, 0 failed. Ran `npm run build` after the final README edit: build completed successfully for dist/index.js and dist/cli.js.
+- Read README.md, memory notes, src/services/memory-compaction.service.ts, src/services/memory-workflow.service.ts, and src/schemas/memory.ts via rg/Get-Content. No code changes or tests were needed for this explanatory answer.
+- Read CLAUDE.md, .claude/settings.local.json, AI Client setup notes, and related session logs using Get-Content/rg. No code changes or tests were needed for this explanatory answer.
+- Used memory_sessionStart planning mode plus memory_followUpRadar, memory_search, and rg over src/README to ground recommendations in current roadmap, source, and known placeholders. No code changes or tests were needed.
+- TDD red/green completed. Ran npm run test:build, node --test --test-reporter=spec dist-test/tests/memory.config.test.js, npm test (240 tests passed), npm run build, git diff --check, and node dist/cli.js diagnose via child_process summary. Built diagnose reported doctor.ok=true, configuredClients=7/7, issueCount=1 info-only CLAUDE_MCP_SERVER_DEFINITION_NOT_LOCAL.
+- TDD red/green completed. Ran npm run test:build, node --test --test-reporter=spec dist-test/tests/memory.config.test.js, npm test (240 tests passed), npm run build, node dist/cli.js diagnose summary confirming doctor.ok=true and remediation present, and git diff --check.
+- Planning-only session; no files changed. Used memory_sessionStart with planning context and reviewed returned followUps/ADRs.
+- memory_diagnoseWorkspace active MCP: argv dist/index.js, build builtAt 2026-06-05T09:41:46.336Z, doctor.ok=true with one info-only CLAUDE_MCP_SERVER_DEFINITION_NOT_LOCAL; memory_validateFrontmatter on 99_Templates/Template-Daily-Note.md returned 0 issues; memory_verifyVault score 88/B with 0 warnings/errors; node dist/cli.js diagnose matched Doctor OK; npm test passed 243/243; npm run build succeeded; git diff --cached --check and git diff --check returned no whitespace errors (Windows CRLF warnings only).
+- npm run typecheck clean; npm test 183/183 pass (was 172); npm run build green (obfuscated dist/index.js + dist/cli.js). PR #6 squash-merged to main (ac8a8b4); local main fast-forwarded and re-ran suite 183/183 on main; feature branch deleted local + remote.
+- Documentation-only change; CLAUDE.md authored from reading src/app.ts, scripts/build.js, config/memory.config.ts, package.json, tsconfig*. No code changed, so npm build/test not run. MCP Full-Auto confirmed live via memory_diagnoseWorkspace + memory_sessionStart returning ok:true.
+- Documentation-only edit to CLAUDE.md; two Edit operations applied cleanly. No source code changed, so npm build/test not run. Protocol wording cross-checked against context-pack notes 01_Project_Rules/Always-On-Memory-Protocol.md and the full-auto invocation ADR.
+- Analysis grounded in reading src/repositories/index.repository.ts, src/services/memory-query.service.ts, src/services/memory-usage.service.ts (full files). No code changed; no tests run (advisory).
+- Empirical: Node probe of installed gray-matter@4.0.3 confirmed throw/no-throw behavior for duplicate-key, unquoted-colon, bad-indent, tab-indent. Code reads confirmed migrate->computeRewrite fabrication path (frontmatter.service.ts:217-257,294-342) and body-strip (utils/frontmatter.ts:250-254). Live MCP validateFrontmatter + verifyVault rechecked (clean). No code changed.
+- npm test => 129 pass / 0 fail (35 suites). tsc --noEmit clean. npm run build green (esbuild + obfuscator, dist rebuilt). Live CLI smoke on ./memory: validate 151/151 valid 0 issues; migrate dry-run text renderer shows would-migrate 143 manual 0; validate --format xml -> 'Invalid --format' exit 2; fix --apply --no-backup -> mandatory-backup warning. No live vault note was mutated (all dry-run/read-only).
+- tsc --noEmit clean; npm test 158 pass / 0 fail (42 suites); npm run build green; perf smoke (dist-test, 200-file temp vault): cold 114ms (build index), warm ~28ms/query (no re-parse of unchanged files). Live vault not mutated (tests/smoke used temp dirs).
+- tsc --noEmit clean; npm test 139 pass / 0 fail (37 suites); npm run build green. New test asserts rollback writes the edited content to snapshotDir and restores the original. No live vault note mutated.
+- git diff --stat HEAD origin/main was empty before switching (trees identical). After: git branch --show-current=main, git log -1=88e1ea3, git rev-list --left-right --count origin/main...HEAD = 0 0, git status dirty count unchanged at 158. .gitignore confirmed dist/ is ignored.
+- tsc --noEmit clean; npm test 138 pass / 0 fail (37 suites); npm run build green; live CLI smoke: `diagnose` -> vaultWithinProject:true, `migrate --vault ./memory` dry-run -> 145 would-migrate, 0 manual. No live vault note mutated. Changes committed (8486881) + pushed to origin PR #4.
+- npm test passed (118 tests, 33 suites). npm run typecheck passed. npm run build passed and emitted dist/build-info.json. node dist\cli.js diagnose selected C:\Users\Server\Desktop\Awakened-AI-System from cwd and included build version metadata. node dist\cli.js validate --format json passed with 146/146 valid and zero diagnostics. memory_validateFrontmatter passed with 146/146 valid and zero info/warning/error/critical diagnostics. memory_verifyVault passed with score 88 grade B and 0 warnings/errors.
+- npm test passed 111/111; npm run typecheck passed; npm run build passed; node dist/cli.js init --vault <temp> created both .memory-mcp/frontmatter.config.json and .memory-mcp/frontmatter.config.schema.json with ConfigSchema=./frontmatter.config.schema.json and SchemaTitle='Memory Vault frontmatter config'; node dist/cli.js validate --format json on the real vault reports critical=0,error=0,warning=0,info=380,blockedFiles=0; node dist/cli.js validate --path 99_Templates/Template-Daily-Note.md reports 0 issues; memory_verifyVault reports score=88/B with 0 critical, 0 errors, 0 warnings.
 
 ## Source Sessions
-- [[05_Agent_Session_Logs/2026-05-20-draft-performance-optimization-plan|2026-05-20-draft-performance-optimization-plan.md]]
-- [[05_Agent_Session_Logs/2026-05-20-final-verification-and-vault-health-optimization|2026-05-20-final-verification-and-vault-health-optimization.md]]
-- [[05_Agent_Session_Logs/2026-05-20-finalize-slow-api-investigation-response|2026-05-20-finalize-slow-api-investigation-response.md]]
-- [[05_Agent_Session_Logs/2026-05-20-fix-memory-vault-health-errors|2026-05-20-fix-memory-vault-health-errors.md]]
-- [[05_Agent_Session_Logs/2026-05-20-implement-safe-laravel-api-performance-diagnostics-and-query-optimizations|2026-05-20-implement-safe-laravel-api-performance-diagnostics-and-query-optimizations.md]]
-- [[05_Agent_Session_Logs/2026-05-20-investigate-slow-laravel-api-responses-and-query-latency|2026-05-20-investigate-slow-laravel-api-responses-and-query-latency.md]]
-- [[05_Agent_Session_Logs/2026-05-20-performance-optimization-2|2026-05-20-performance-optimization-2.md]]
-- [[05_Agent_Session_Logs/2026-05-20-performance-optimization|2026-05-20-performance-optimization.md]]
-- [[05_Agent_Session_Logs/2026-05-20-present-performance-optimization-plan-to-user|2026-05-20-present-performance-optimization-plan-to-user.md]]
-- [[05_Agent_Session_Logs/2026-05-20-refining-performance-optimization-plan|2026-05-20-refining-performance-optimization-plan.md]]
-- [[05_Agent_Session_Logs/2026-05-20-skill-symlink-setup-for-laravel-project|2026-05-20-skill-symlink-setup-for-laravel-project.md]]
-- [[05_Agent_Session_Logs/2026-05-20-ssh-into-production-and-run-laravel-post-deploy-verification|2026-05-20-ssh-into-production-and-run-laravel-post-deploy-verification.md]]
-- [[05_Agent_Session_Logs/2026-05-20-strict-pr-review-8-category-for-refactor-optimize-queries-dashboard-endpoints|2026-05-20-strict-pr-review-8-category-for-refactor-optimize-queries-dashboard-endpoints.md]]
-- [[05_Agent_Session_Logs/2026-05-20-study-and-distill-laravel-caching-performance-and-testing-architecture-2|2026-05-20-study-and-distill-laravel-caching-performance-and-testing-architecture-2.md]]
-- [[05_Agent_Session_Logs/2026-05-20-study-and-distill-laravel-caching-performance-and-testing-architecture|2026-05-20-study-and-distill-laravel-caching-performance-and-testing-architecture.md]]
-- [[05_Agent_Session_Logs/2026-05-20-system-exploration-and-vault-health-optimization|2026-05-20-system-exploration-and-vault-health-optimization.md]]
-- [[05_Agent_Session_Logs/2026-05-21-added-context7-mcp-to-ide-config|2026-05-21-added-context7-mcp-to-ide-config.md]]
-- [[05_Agent_Session_Logs/2026-05-21-check-ai-sdk-provider-config-ui|2026-05-21-check-ai-sdk-provider-config-ui.md]]
-- [[05_Agent_Session_Logs/2026-05-21-check-incoming-line-image-from-other-id-after-relogin|2026-05-21-check-incoming-line-image-from-other-id-after-relogin.md]]
-- [[05_Agent_Session_Logs/2026-05-21-check-line-js-group-image-test-capability|2026-05-21-check-line-js-group-image-test-capability.md]]
-- [[05_Agent_Session_Logs/2026-05-21-clarify-and-improve-line-receive-images-e2ee-requirement|2026-05-21-clarify-and-improve-line-receive-images-e2ee-requirement.md]]
-- [[05_Agent_Session_Logs/2026-05-21-clarify-line-image-to-ai-bidding-flow|2026-05-21-clarify-line-image-to-ai-bidding-flow.md]]
-- [[05_Agent_Session_Logs/2026-05-21-codex-pkce-auth-improvements|2026-05-21-codex-pkce-auth-improvements.md]]
-- [[05_Agent_Session_Logs/2026-05-21-configured-context7-mcp-in-active-gemini-config|2026-05-21-configured-context7-mcp-in-active-gemini-config.md]]
-- [[05_Agent_Session_Logs/2026-05-21-context7-cli-usage-demo|2026-05-21-context7-cli-usage-demo.md]]
-- [[05_Agent_Session_Logs/2026-05-21-context7-setup-for-antigravity|2026-05-21-context7-setup-for-antigravity.md]]
-- [[05_Agent_Session_Logs/2026-05-21-create-mcp-config-json-in-antigravity-folder|2026-05-21-create-mcp-config-json-in-antigravity-folder.md]]
-- [[05_Agent_Session_Logs/2026-05-21-diagnose-powershell-npm-run-dev-http-enabled-failure|2026-05-21-diagnose-powershell-npm-run-dev-http-enabled-failure.md]]
-- [[05_Agent_Session_Logs/2026-05-21-explain-how-to-test-line-image-listener-in-group|2026-05-21-explain-how-to-test-line-image-listener-in-group.md]]
-- [[05_Agent_Session_Logs/2026-05-21-fix-codex-auth-route-to-use-device-code-flow|2026-05-21-fix-codex-auth-route-to-use-device-code-flow.md]]
+- [[05_Agent_Session_Logs/2026-06-05-continue-memory-index-tier-3-hybrid-embedding-search|2026-06-05-continue-memory-index-tier-3-hybrid-embedding-search.md]]
+- [[05_Agent_Session_Logs/2026-06-05-answer-compact-memory-behavior-in-project-memory-mcp|2026-06-05-answer-compact-memory-behavior-in-project-memory-mcp.md]]
+- [[05_Agent_Session_Logs/2026-06-05-answer-claude-code-integration-status|2026-06-05-answer-claude-code-integration-status.md]]
+- [[05_Agent_Session_Logs/2026-06-05-recommend-next-project-memory-mcp-improvements|2026-06-05-recommend-next-project-memory-mcp-improvements.md]]
+- [[05_Agent_Session_Logs/2026-06-05-implement-mcp-doctor-client-diagnostics-v2|2026-06-05-implement-mcp-doctor-client-diagnostics-v2.md]]
+- [[05_Agent_Session_Logs/2026-06-05-add-mcp-doctor-remediation-suggestions|2026-06-05-add-mcp-doctor-remediation-suggestions.md]]
+- [[05_Agent_Session_Logs/2026-06-05-recommend-next-project-memory-mcp-roadmap-step|2026-06-05-recommend-next-project-memory-mcp-roadmap-step.md]]
+- [[05_Agent_Session_Logs/2026-06-05-runtime-verification-strict-review-and-commit-preparation-for-tier-3-embeddings-mcp-doctor|2026-06-05-runtime-verification-strict-review-and-commit-preparation-for-tier-3-embeddings-mcp-doctor.md]]
+- [[05_Agent_Session_Logs/2026-06-04-review-harden-and-ship-memory-index-tier-2-backlink-graph-section-anchors-via-pr-6|2026-06-04-review-harden-and-ship-memory-index-tier-2-backlink-graph-section-anchors-via-pr-6.md]]
+- [[05_Agent_Session_Logs/2026-06-03-add-claude-md-onboarding-guide-for-claude-code|2026-06-03-add-claude-md-onboarding-guide-for-claude-code.md]]
+- [[05_Agent_Session_Logs/2026-06-03-add-full-auto-project-memory-operating-protocol-directive-to-claude-md|2026-06-03-add-full-auto-project-memory-operating-protocol-directive-to-claude-md.md]]
+- [[05_Agent_Session_Logs/2026-06-03-analyze-memory-index-retrieval-and-propose-efficiency-roadmap-tier-1-3|2026-06-03-analyze-memory-index-retrieval-and-propose-efficiency-roadmap-tier-1-3.md]]
+- [[05_Agent_Session_Logs/2026-06-03-audit-memory-vault-frontmatter-system-vs-15-section-thai-prompt-survey-gap-risk-no-code-edits|2026-06-03-audit-memory-vault-frontmatter-system-vs-15-section-thai-prompt-survey-gap-risk-no-code-edits.md]]
+- [[05_Agent_Session_Logs/2026-06-03-implement-steps-1-6-frontmatter-safety-hardening-fix-gray-matter-cache-non-idempotency|2026-06-03-implement-steps-1-6-frontmatter-safety-hardening-fix-gray-matter-cache-non-idempotency.md]]
+- [[05_Agent_Session_Logs/2026-06-03-implement-tier-1-memory-index-incremental-persistent-index-bm25-ranked-search|2026-06-03-implement-tier-1-memory-index-incremental-persistent-index-bm25-ranked-search.md]]
+- [[05_Agent_Session_Logs/2026-06-03-make-rollback-reversible-snapshot-before-restore-scope-latestbackupdir-to-fix-migrate-backups|2026-06-03-make-rollback-reversible-snapshot-before-restore-scope-latestbackupdir-to-fix-migrate-backups.md]]
+- [[05_Agent_Session_Logs/2026-06-03-post-merge-cleanup-fix-claude-md-dist-claim-delete-merged-branch-sync-local-main|2026-06-03-post-merge-cleanup-fix-claude-md-dist-claim-delete-merged-branch-sync-local-main.md]]
+- [[05_Agent_Session_Logs/2026-06-03-step-7-frontmatter-enhancements-versioned-migration-central-codes-diagnostic-line-numbers-vault-containment|2026-06-03-step-7-frontmatter-enhancements-versioned-migration-central-codes-diagnostic-line-numbers-vault-containment.md]]
+- [[05_Agent_Session_Logs/2026-06-02-memory-vault-full-refactor|2026-06-02-memory-vault-full-refactor.md]]
+- [[05_Agent_Session_Logs/2026-06-01-add-project-local-frontmatter-config-json-schema-and-verify-reusable-init-flow|2026-06-01-add-project-local-frontmatter-config-json-schema-and-verify-reusable-init-flow.md]]
+- [[05_Agent_Session_Logs/2026-06-01-close-prompt-checklist-gaps-cli-safe-unsafe-confirm-migrate-rollback-validfiles-report-count-and-missing-tests-unknown-fields-config-fallback-override|2026-06-01-close-prompt-checklist-gaps-cli-safe-unsafe-confirm-migrate-rollback-validfiles-report-count-and-missing-tests-unknown-fields-config-fallback-override.md]]
+- [[05_Agent_Session_Logs/2026-06-01-confirm-runtime-mcp-blocker-for-frontmatter-completion|2026-06-01-confirm-runtime-mcp-blocker-for-frontmatter-completion.md]]
+- [[05_Agent_Session_Logs/2026-06-01-document-runtime-refresh-workflow-for-stale-project-memory-mcp-frontmatter-diagnostics|2026-06-01-document-runtime-refresh-workflow-for-stale-project-memory-mcp-frontmatter-diagnostics.md]]
+- [[05_Agent_Session_Logs/2026-06-01-harden-frontmatter-warning-system-and-safety-defaults|2026-06-01-harden-frontmatter-warning-system-and-safety-defaults.md]]
+- [[05_Agent_Session_Logs/2026-06-01-implement-option-c-hybrid-frontmatter-system-for-project-memory-mcp-safe-parser-schema-fix-migrate-report-cli-mcp-tools-tests|2026-06-01-implement-option-c-hybrid-frontmatter-system-for-project-memory-mcp-safe-parser-schema-fix-migrate-report-cli-mcp-tools-tests.md]]
+- [[05_Agent_Session_Logs/2026-06-01-memory-vault-analysis-quality-gate-check|2026-06-01-memory-vault-analysis-quality-gate-check.md]]
+- [[05_Agent_Session_Logs/2026-06-01-memory-vault-frontmatter-system-analysis-and-standardization-design|2026-06-01-memory-vault-frontmatter-system-analysis-and-standardization-design.md]]
+- [[05_Agent_Session_Logs/2026-06-01-memory-vault-system-structure-analysis|2026-06-01-memory-vault-system-structure-analysis.md]]
+- [[05_Agent_Session_Logs/2026-06-01-populate-empty-outcomes-in-2-stub-session-logs-to-clear-missing-required-field-errors|2026-06-01-populate-empty-outcomes-in-2-stub-session-logs-to-clear-missing-required-field-errors.md]]
+- [[05_Agent_Session_Logs/2026-06-01-re-verify-after-mcp-restart-99-templates-warnings-fix-confirmed-0-warnings|2026-06-01-re-verify-after-mcp-restart-99-templates-warnings-fix-confirmed-0-warnings.md]]

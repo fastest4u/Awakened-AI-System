@@ -1,20 +1,21 @@
 ---
-title: 2026-05-21 - Fix npm run dev on Windows PowerShell
+title: "2026-05-21 - Fix npm run dev on Windows PowerShell"
 type: session-log
-session-date: 2026-05-21
 agent: Codex
+session-date: "2026-05-21"
 duration-minutes: 8
 outcomes:
   - "Added scripts/dev-backend.mjs cross-platform backend launcher that sets HTTP_ENABLED=true before running tsx src/app.ts."
   - "Updated package.json dev and dev:backend scripts to use node scripts/dev-backend.mjs instead of POSIX env assignment."
   - "Confirmed npm run dev no longer fails with HTTP_ENABLED not recognized; startup reached Vite ready, HTTP server started, LINE token restored, and image listener started."
   - Removed temporary startup check log.
-created: 2026-05-21
-updated: 2026-05-21
 tags:
   - session-log
   - project/general
+created: "2026-05-21"
+updated: "2026-05-21"
 ---
+
 # 2026-05-21 - Fix npm run dev on Windows PowerShell
 
 ## TL;DR

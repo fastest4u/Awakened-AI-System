@@ -1,19 +1,20 @@
 ---
-title: 2026-05-16 - Implementing Code Obfuscation for IP Protection
+title: "2026-05-16 - Implementing Code Obfuscation for IP Protection"
 type: session-log
-session-date: 2026-05-16
 agent: Antigravity
+session-date: "2026-05-16"
 duration-minutes: 10
 outcomes:
   - Replaced standard tsc build with an obfuscated build pipeline.
   - Added build script to bundle using esbuild and obfuscate the generated file.
   - Verified the obfuscated server starts successfully without module loading errors.
-created: 2026-05-16
-updated: 2026-05-16
 tags:
   - session-log
   - project/general
+created: "2026-05-16"
+updated: "2026-05-16"
 ---
+
 # 2026-05-16 - Implementing Code Obfuscation for IP Protection
 
 ## TL;DR

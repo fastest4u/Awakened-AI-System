@@ -2,17 +2,18 @@
 title: Plugin Setup
 type: reference
 status: active
-created: 2026-05-16
-updated: 2026-05-16
+confidence: medium
+source: "file:.obsidian/community-plugins.json"
+verified-by: memory-mcp
+last-verified: "2026-05-16"
 tags:
   - obsidian
   - plugins
   - project/general
-last-verified: 2026-05-16
-verified-by: memory-mcp
-source: "file:.obsidian/community-plugins.json"
-confidence: medium
+created: "2026-05-16"
+updated: "2026-05-16"
 ---
+
 # Plugin Setup
 
 > [!important]

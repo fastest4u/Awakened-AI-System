@@ -1,8 +1,8 @@
 ---
-title: 2026-05-20 - SSH into production and run Laravel post-deploy verification
+title: "2026-05-20 - SSH into production and run Laravel post-deploy verification"
 type: session-log
-session-date: 2026-05-20
 agent: codex
+session-date: "2026-05-20"
 duration-minutes: 15
 outcomes:
   - Connected to production via SSH as root using existing SSH key.
@@ -15,12 +15,13 @@ outcomes:
   - Verified public health endpoint remains healthy after changes.
   - "Checked slow query monitor command; performance_schema access is denied for DB user pmauser."
   - "Inspected scheduler container health: Docker healthcheck is unhealthy because ps is missing, but scheduler logs show scheduled jobs are running."
-created: 2026-05-20
-updated: 2026-05-20
 tags:
   - session-log
   - project/general
+created: "2026-05-20"
+updated: "2026-05-20"
 ---
+
 # 2026-05-20 - SSH into production and run Laravel post-deploy verification
 
 ## TL;DR

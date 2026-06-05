@@ -1,18 +1,19 @@
 ---
-title: 2026-05-21 - replace Codex CLI with OpenCode-style Codex device auth
+title: "2026-05-21 - replace Codex CLI with OpenCode-style Codex device auth"
 type: session-log
-session-date: 2026-05-21
 agent: codex
+session-date: "2026-05-21"
 duration-minutes: 4
 outcomes:
   - Explained feasibility of replacing Codex CLI dependency with an OpenCode-style direct Codex device auth adapter.
   - "Identified this as possible but substantially larger than a provider swap because it requires implementing/maintaining OAuth device flow, token storage/refresh, API request adapter, and AI SDK LanguageModel provider compatibility."
-created: 2026-05-21
-updated: 2026-05-21
 tags:
   - session-log
   - project/general
+created: "2026-05-21"
+updated: "2026-05-21"
 ---
+
 # 2026-05-21 - replace Codex CLI with OpenCode-style Codex device auth
 
 ## TL;DR

@@ -1,20 +1,21 @@
 ---
-title: 2026-05-16 - Always-on project-memory workflow for IDE and AI agents
+title: "2026-05-16 - Always-on project-memory workflow for IDE and AI agents"
 type: session-log
-session-date: 2026-05-16
 agent: codex
+session-date: "2026-05-16"
 outcomes:
   - Added a shared always-on memory protocol to the bootstrap generator
   - "Generated root .rules for Zed, .windsurfrules, GEMINI.md, GitHub Copilot instructions, Cursor rule, Windsurf rule, and project AGENTS.md"
   - Updated OpenCode instructions to include the always-on memory protocol note
   - Added memory/01_Project_Rules/Always-On-Memory-Protocol.md as the durable vault rule
   - Allowed key project-memory MCP tools in global Zed tool permissions
-created: 2026-05-16
-updated: 2026-05-16
 tags:
   - session-log
   - project/general
+created: "2026-05-16"
+updated: "2026-05-16"
 ---
+
 # 2026-05-16 - Always-on project-memory workflow for IDE and AI agents
 
 ## TL;DR

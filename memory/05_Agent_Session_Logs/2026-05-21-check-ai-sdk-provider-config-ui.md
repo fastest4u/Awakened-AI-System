@@ -1,18 +1,19 @@
 ---
-title: 2026-05-21 - check AI SDK provider config UI
+title: "2026-05-21 - check AI SDK provider config UI"
 type: session-log
-session-date: 2026-05-21
 agent: codex
+session-date: "2026-05-21"
 duration-minutes: 4
 outcomes:
   - Checked backend settings whitelist and frontend Settings page/LINE Bot section for AI SDK provider/model configuration.
   - "Confirmed current UI settings only cover API, notification, and LINE Bot runtime settings; CODEX_IMAGE_MODEL, CODEX_IMAGE_TIMEOUT_MS, CODEX_IMAGE_MAX_BYTES, and provider selection are not in SETTINGS_KEYS or EnvSettings UI."
-created: 2026-05-21
-updated: 2026-05-21
 tags:
   - session-log
   - project/general
+created: "2026-05-21"
+updated: "2026-05-21"
 ---
+
 # 2026-05-21 - check AI SDK provider config UI
 
 ## TL;DR

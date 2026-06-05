@@ -2,16 +2,17 @@
 title: Memory Mindmap
 type: reference
 status: active
-created: 2026-05-16
-updated: 2026-05-16
+confidence: medium
+source: memory-mcp bootstrap
+verified-by: memory-mcp
+last-verified: "2026-05-16"
 tags:
   - mindmap
   - project/general
-last-verified: 2026-05-16
-verified-by: memory-mcp
-source: memory-mcp bootstrap
-confidence: medium
+created: "2026-05-16"
+updated: "2026-05-16"
 ---
+
 # Memory Mindmap
 
 ## Project Memory

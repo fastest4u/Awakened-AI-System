@@ -1,8 +1,8 @@
 ---
-title: 2026-05-20 - Implement safe Laravel API performance diagnostics and query optimizations
+title: "2026-05-20 - Implement safe Laravel API performance diagnostics and query optimizations"
 type: session-log
-session-date: 2026-05-20
 agent: codex
+session-date: "2026-05-20"
 duration-minutes: 55
 outcomes:
   - "Added opt-in production slow query and query-count monitoring using DB_SLOW_QUERY_LOG_ENABLED, DB_SLOW_QUERY_THRESHOLD_MS, and DB_QUERY_COUNT_WARNING_THRESHOLD."
@@ -12,12 +12,13 @@ outcomes:
   - "Reduced AdminProfitLoss monthly/export N+1 query patterns by batch-loading Turboroute costs and deductions per result set."
   - "Added missing DashboardController endpoint methods for routes already registered, preventing method-not-found 500s on dashboard APIs."
   - "Ran formatting, static analysis, diagnostics, and full PHPUnit suite."
-created: 2026-05-20
-updated: 2026-05-20
 tags:
   - session-log
   - project/general
+created: "2026-05-20"
+updated: "2026-05-20"
 ---
+
 # 2026-05-20 - Implement safe Laravel API performance diagnostics and query optimizations
 
 ## TL;DR

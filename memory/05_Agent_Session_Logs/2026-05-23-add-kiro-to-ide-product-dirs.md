@@ -1,17 +1,15 @@
 ---
-title: 2026-05-23 - Add Kiro to IDE_PRODUCT_DIRS
+title: "2026-05-23 - Add Kiro to IDE_PRODUCT_DIRS"
 type: session-log
-session-date: 2026-05-23
 agent: cascade
+session-date: "2026-05-23"
 duration-minutes: 8
 outcomes:
   - "Confirmed Kiro (AWS VS Code fork) uses identical VS Code-derived layout: User/globalStorage/storage.json with windowsState.lastActiveWindow.folder + backupWorkspaces.folders[]."
   - "Added 'Kiro' as an 8th entry in IDE_PRODUCT_DIRS - one-line list change. No new helper functions or schema work needed; the existing readIdeWorkspaceCandidates() handles Kiro immediately."
-  - "Updated existing ideStorageFiles test to assert /Kiro/User/globalStorage/storage.json is probed."
+  - Updated existing ideStorageFiles test to assert /Kiro/User/globalStorage/storage.json is probed.
   - "Updated README compatibility matrix: Kiro now shows ✅ on both cwd and IDE-state columns (per-project + user-level .kiro/settings/mcp.json + Kiro storage.json)."
   - "Live verification: 8 IDE storage files probed, Kiro FOUND, candidates list grew from 9 to 11 (Kiro contributed lastActive=SPX + backup=SPX)."
-created: 2026-05-23
-updated: 2026-05-23
 tags:
   - session-log
   - mcp
@@ -19,7 +17,10 @@ tags:
   - workspace-detection
   - kiro
   - project/awakened-ai-system
+created: "2026-05-23"
+updated: "2026-05-23"
 ---
+
 # 2026-05-23 - Add Kiro to IDE_PRODUCT_DIRS
 
 ## TL;DR

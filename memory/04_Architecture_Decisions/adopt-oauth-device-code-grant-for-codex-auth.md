@@ -2,13 +2,14 @@
 title: Adopt OAuth Device Code Grant for Codex Auth
 type: adr
 status: accepted
-decision-date: 2026-05-21
 confidence: high
+decision-date: "2026-05-21"
 supersedes: []
-created: 2026-05-21
-updated: 2026-05-21
 tags: []
+created: "2026-05-21"
+updated: "2026-05-21"
 ---
+
 ## Context
 PKCE auth flow required local callback capture which often failed on restricted network environments or remote developer workspaces.
 

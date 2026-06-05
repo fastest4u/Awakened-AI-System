@@ -1,18 +1,19 @@
 ---
-title: 2026-05-17 - Update README to comprehensive Thai documentation
+title: "2026-05-17 - Update README to comprehensive Thai documentation"
 type: session-log
-session-date: 2026-05-17
 agent: codex
+session-date: "2026-05-17"
 duration-minutes: 12
 outcomes:
   - "Rewrote README.md in Thai with comprehensive coverage of architecture, installation, environment variables, MCP client setup, bootstrap behavior, workflow protocol, context modes, lifecycle guardrails, Follow-up Radar, Obsidian profile, tools, response envelope, troubleshooting, and roadmap."
   - Verified the documentation update did not break the TypeScript project build.
-created: 2026-05-17
-updated: 2026-05-17
 tags:
   - session-log
   - project/general
+created: "2026-05-17"
+updated: "2026-05-17"
 ---
+
 # 2026-05-17 - Update README to comprehensive Thai documentation
 
 ## TL;DR

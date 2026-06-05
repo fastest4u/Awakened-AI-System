@@ -2,13 +2,14 @@
 title: Memory Vault Entry Point
 type: rules
 status: active
-created: 2026-05-16
-updated: 2026-05-16
 tags:
   - meta
   - agent-rules
   - entry-point
+created: "2026-05-16"
+updated: "2026-05-16"
 ---
+
 # AGENTS.md
 
 Every AI agent should read this file at session start.

@@ -1,20 +1,21 @@
 ---
-title: 2026-05-21 - Clarify and improve LINE receive-images E2EE requirement
+title: "2026-05-21 - Clarify and improve LINE receive-images E2EE requirement"
 type: session-log
-session-date: 2026-05-21
 agent: Codex
+session-date: "2026-05-21"
 duration-minutes: 4
 outcomes:
   - Explained that DB auth token is enough for outbound text but not enough for receiving/decrypting images from other users in E2EE chats.
   - "Verified current data/linejs-storage.json has zero keys, zero E2EE self keys, zero group keys, and zero public keys, so incoming media decrypt cannot work yet."
   - "Added guard: when LINE_IMAGE_LISTENER_CHAT_ID is configured and storage lacks E2EE keys, line-bot skips DB/file token restore and starts QR login instead."
   - Kept prior reset support so clearStorage also deletes DB session and UI has Reset button.
-created: 2026-05-21
-updated: 2026-05-21
 tags:
   - session-log
   - project/general
+created: "2026-05-21"
+updated: "2026-05-21"
 ---
+
 # 2026-05-21 - Clarify and improve LINE receive-images E2EE requirement
 
 ## TL;DR

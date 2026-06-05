@@ -2,18 +2,19 @@
 title: Memory Autopilot
 type: reference
 status: active
-created: 2026-05-16
-updated: 2026-05-17
+confidence: medium
+source: memory-mcp bootstrap
+verified-by: memory-mcp
+last-verified: "2026-05-17"
 tags:
   - autopilot
   - project-memory
   - token-economy
   - project/general
-last-verified: 2026-05-17
-verified-by: memory-mcp
-source: memory-mcp bootstrap
-confidence: medium
+created: "2026-05-16"
+updated: "2026-05-17"
 ---
+
 # Memory Autopilot
 
 Memory autopilot is the strongest supported workflow for this vault.

@@ -1,20 +1,21 @@
 ---
-title: 2026-05-23 - Check and fix Zed project-memory dynamic config
+title: "2026-05-23 - Check and fix Zed project-memory dynamic config"
 type: session-log
-session-date: 2026-05-23
 agent: codex
+session-date: "2026-05-23"
 duration-minutes: 4
 outcomes:
   - Checked Zed project-memory MCP settings across user-level and project-level config files.
   - Found global Zed settings still used a hard-coded Awakened-AI-System MEMORY_PROJECT_ROOT and changed it to dynamic.
   - "Added missing SPX project-local .zed/settings.json with project-memory and MEMORY_PROJECT_ROOT=dynamic."
   - Verified Zed JSON configs parse and all checked Zed MEMORY_PROJECT_ROOT values are dynamic.
-created: 2026-05-23
-updated: 2026-05-23
 tags:
   - session-log
   - project/general
+created: "2026-05-23"
+updated: "2026-05-23"
 ---
+
 # 2026-05-23 - Check and fix Zed project-memory dynamic config
 
 ## TL;DR

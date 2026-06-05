@@ -1,8 +1,8 @@
 ---
-title: 2026-05-18 - Bootstrap project-memory MCP into Laravel project
+title: "2026-05-18 - Bootstrap project-memory MCP into Laravel project"
 type: session-log
-session-date: 2026-05-18
 agent: codex
+session-date: "2026-05-18"
 duration-minutes: 28
 outcomes:
   - "Bootstrapped the project-local memory vault into C:\\Users\\Server\\Desktop\\laravel using the Awakened AI Memory MCP server."
@@ -11,12 +11,13 @@ outcomes:
   - Updated memory/AGENTS.md in the Laravel vault as the fallback MCP protocol entry point.
   - "Corrected generated client configs to point at C:/Users/Server/Desktop/Awakened-AI-System/dist/index.js with MEMORY_PROJECT_ROOT set to C:/Users/Server/Desktop/laravel."
   - "Verified the Laravel MCP server connection, tool registration, context retrieval, vault health, and lifecycle quality gate."
-created: 2026-05-18
-updated: 2026-05-18
 tags:
   - session-log
   - project/general
+created: "2026-05-18"
+updated: "2026-05-18"
 ---
+
 # 2026-05-18 - Bootstrap project-memory MCP into Laravel project
 
 ## TL;DR

@@ -1,8 +1,8 @@
 ---
-title: 2026-05-21 - Check incoming LINE image from other ID after relogin
+title: "2026-05-21 - Check incoming LINE image from other ID after relogin"
 type: session-log
-session-date: 2026-05-21
 agent: Codex
+session-date: "2026-05-21"
 duration-minutes: 3
 outcomes:
   - Checked local LINEJS storage after user sent image from another ID.
@@ -10,12 +10,13 @@ outcomes:
   - No logs directory entries were available for backend event review.
   - Backend is running on port 3000 and health endpoint is OK.
   - Likely next step is restart backend after QR login because image listener startup may have failed before login and is only started during server startup.
-created: 2026-05-21
-updated: 2026-05-21
 tags:
   - session-log
   - project/general
+created: "2026-05-21"
+updated: "2026-05-21"
 ---
+
 # 2026-05-21 - Check incoming LINE image from other ID after relogin
 
 ## TL;DR

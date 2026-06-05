@@ -1,18 +1,19 @@
 ---
-title: 2026-05-18 - Explain MEMORY_PROJECT_ROOT relationship to open project
+title: "2026-05-18 - Explain MEMORY_PROJECT_ROOT relationship to open project"
 type: session-log
-session-date: 2026-05-18
 agent: codex
+session-date: "2026-05-18"
 duration-minutes: 3
 outcomes:
   - "Clarified that MEMORY_PROJECT_ROOT should normally point to the root of the project whose memory vault should be used, which is usually the project currently opened in the MCP-capable client."
   - Clarified that the MCP server executable path can live in a different repository from the target project memory root.
-created: 2026-05-18
-updated: 2026-05-18
 tags:
   - session-log
   - project/general
+created: "2026-05-18"
+updated: "2026-05-18"
 ---
+
 # 2026-05-18 - Explain MEMORY_PROJECT_ROOT relationship to open project
 
 ## TL;DR

@@ -1,20 +1,21 @@
 ---
-title: 2026-05-21 - Resolve npm run dev EADDRINUSE on port 3000
+title: "2026-05-21 - Resolve npm run dev EADDRINUSE on port 3000"
 type: session-log
-session-date: 2026-05-21
 agent: Codex
+session-date: "2026-05-21"
 duration-minutes: 3
 outcomes:
   - "Diagnosed current npm run dev failure as port collision, not script failure."
   - Found node.exe PID 14596 running src/app.ts from this SPX project on port 3000.
   - Found node.exe PID 14664 running Vite from this SPX project on port 5173.
   - "Stopped both stale dev server processes; ports 3000 and 5173 are now free."
-created: 2026-05-21
-updated: 2026-05-21
 tags:
   - session-log
   - project/general
+created: "2026-05-21"
+updated: "2026-05-21"
 ---
+
 # 2026-05-21 - Resolve npm run dev EADDRINUSE on port 3000
 
 ## TL;DR
