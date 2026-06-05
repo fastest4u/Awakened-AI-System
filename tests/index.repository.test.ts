@@ -17,6 +17,7 @@ function rec(over: Partial<StoredRecord> & { path: string }): StoredRecord {
     searchText: over.searchText ?? "",
     outgoingLinks: over.outgoingLinks ?? [],
     id: over.id,
+    vector: over.vector,
   };
 }
 
@@ -49,11 +50,12 @@ describe("IndexRepository ranked search", () => {
     assert.equal(index.rank(tokenize("beta")).length, 0);
   });
 
-  it("toPublicRecord strips internal mtimeMs/searchText/outgoingLinks", () => {
-    const pub = toPublicRecord(rec({ path: "a.md", title: "x", searchText: "secret-body", mtimeMs: 999, outgoingLinks: ["b"] }));
+  it("toPublicRecord strips internal mtimeMs/searchText/outgoingLinks/vector", () => {
+    const pub = toPublicRecord(rec({ path: "a.md", title: "x", searchText: "secret-body", mtimeMs: 999, outgoingLinks: ["b"], vector: [0.1, 0.2] }));
     assert.equal("searchText" in pub, false);
     assert.equal("mtimeMs" in pub, false);
     assert.equal("outgoingLinks" in pub, false);
+    assert.equal("vector" in pub, false);
     assert.equal(pub.path, "a.md");
   });
 });
@@ -116,5 +118,50 @@ describe("IndexRepository backlink graph", () => {
     assert.deepEqual(index.incomingLinks("b.md"), ["a.md"]); // populate the cache
     index.upsert(rec({ path: "a.md", title: "A", outgoingLinks: [] })); // edit: drop the link
     assert.deepEqual(index.incomingLinks("b.md"), []);
+  });
+});
+
+describe("IndexRepository hybrid (RRF) search", () => {
+  it("falls back to plain rank() when no query vector is given", () => {
+    const index = new IndexRepository();
+    index.upsert(rec({ path: "a.md", title: "Backup", searchText: "atomic backup verify", vector: [1, 0, 0] }));
+    index.upsert(rec({ path: "b.md", title: "Parser", searchText: "yaml parse", vector: [0, 1, 0] }));
+    assert.deepEqual(index.rankHybrid(tokenize("backup"), undefined).map((r) => r.path), ["a.md"]);
+  });
+
+  it("falls back to plain rank() when no document carries a vector", () => {
+    const index = new IndexRepository();
+    index.upsert(rec({ path: "a.md", title: "Backup", searchText: "atomic backup" }));
+    index.upsert(rec({ path: "b.md", title: "Parser", searchText: "yaml parse" }));
+    assert.deepEqual(index.rankHybrid(tokenize("backup"), [1, 0, 0]).map((r) => r.path), ["a.md"]);
+  });
+
+  it("surfaces a semantically-near note that shares no query term", () => {
+    const index = new IndexRepository();
+    index.upsert(rec({ path: "a.md", title: "Backup", searchText: "atomic backup", vector: [1, 0, 0] }));
+    index.upsert(rec({ path: "b.md", title: "Recovery", searchText: "restore process", vector: [0, 1, 0] }));
+    // Query vector aligns with b.md; query term 'backup' only matches a.md.
+    const hits = index.rankHybrid(tokenize("backup"), [0, 1, 0]).map((r) => r.path);
+    assert.ok(hits.includes("a.md"), "lexical match present");
+    assert.ok(hits.includes("b.md"), "semantic-only match surfaced");
+  });
+
+  it("ranks a doc matched by both arms above docs matched by one", () => {
+    const index = new IndexRepository();
+    index.upsert(rec({ path: "both.md", title: "Backup", searchText: "atomic backup", vector: [1, 0, 0] }));
+    index.upsert(rec({ path: "lexonly.md", title: "Backup", searchText: "atomic backup process", vector: [0, 1, 0] }));
+    index.upsert(rec({ path: "veconly.md", title: "Other", searchText: "unrelated content", vector: [1, 0, 0] }));
+    const hits = index.rankHybrid(tokenize("backup"), [1, 0, 0]).map((r) => r.path);
+    assert.equal(hits[0], "both.md");
+  });
+
+  it("usage arm only re-orders candidates — never injects an unrelated note", () => {
+    const index = new IndexRepository();
+    index.upsert(rec({ path: "match.md", title: "Backup", searchText: "atomic backup", vector: [1, 0, 0] }));
+    index.upsert(rec({ path: "popular.md", title: "Unrelated", searchText: "nothing here", vector: [0, 1, 0] }));
+    // popular.md matches neither the term 'backup' nor the (orthogonal) query vector,
+    // so a huge usage boost must not pull it into the results.
+    const hits = index.rankHybrid(tokenize("backup"), [1, 0, 0], (path) => (path === "popular.md" ? 1000 : 0)).map((r) => r.path);
+    assert.deepEqual(hits, ["match.md"]);
   });
 });

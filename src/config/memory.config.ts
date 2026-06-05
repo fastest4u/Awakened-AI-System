@@ -21,6 +21,71 @@ export interface WorkspaceDiagnosticCandidate {
   selected: boolean;
 }
 
+export type MemoryClientName =
+  | "claude-code"
+  | "codex"
+  | "cursor"
+  | "windsurf"
+  | "zed"
+  | "opencode"
+  | "antigravity";
+
+export type MemoryDoctorIssueSeverity = "info" | "warning";
+
+export interface MemoryDoctorRemediation {
+  summary: string;
+  path?: string;
+  snippet?: string;
+  command?: string;
+}
+
+export interface MemoryClientConfigDiagnostic {
+  path: string;
+  active: boolean;
+  exists: boolean;
+  hasProjectMemory: boolean;
+  hasMemoryProjectRoot: boolean;
+  memoryProjectRoot?: string;
+  parseError?: string;
+}
+
+export interface MemoryClientDiagnostic {
+  client: MemoryClientName;
+  displayName: string;
+  configured: boolean;
+  enabled?: boolean;
+  allowedTools: string[];
+  configs: MemoryClientConfigDiagnostic[];
+  issues: string[];
+}
+
+export interface MemoryDoctorIssue {
+  severity: MemoryDoctorIssueSeverity;
+  code: string;
+  message: string;
+  client?: MemoryClientName;
+  path?: string;
+  remediation?: MemoryDoctorRemediation;
+}
+
+export interface MemoryDoctorDiagnostic {
+  ok: boolean;
+  summary: {
+    clientsChecked: number;
+    configuredClients: number;
+    issueCount: number;
+  };
+  checks: {
+    projectRootExists: boolean;
+    vaultRootExists: boolean;
+    vaultHasAgentRules: boolean;
+    vaultWithinProject: boolean;
+    buildInfoPresent: boolean;
+  };
+  clients: MemoryClientDiagnostic[];
+  issues: MemoryDoctorIssue[];
+}
+
 export interface MemoryConfigDiagnostic {
   config: MemoryConfig;
   workspace: {
@@ -50,6 +115,7 @@ export interface MemoryConfigDiagnostic {
    * enforced) so a mis-resolved root is debuggable.
    */
   vaultWithinProject: boolean;
+  doctor: MemoryDoctorDiagnostic;
 }
 
 export interface MemoryBuildInfo {
@@ -102,6 +168,81 @@ const workspaceMarkers = [
 // When auto-detecting across multiple open IDE windows, prefer a workspace
 // that the user has already initialized for memory MCP usage.
 const VAULT_MARKER = "memory/AGENTS.md";
+
+interface ClientConfigProbe {
+  relativePath: string;
+  active: boolean;
+  format: "json" | "toml" | "text";
+}
+
+interface ClientDefinition {
+  client: MemoryClientName;
+  displayName: string;
+  probes: ClientConfigProbe[];
+}
+
+interface InspectedClientConfig {
+  diagnostic: MemoryClientConfigDiagnostic;
+  text?: string;
+  json?: unknown;
+}
+
+const CLIENT_DEFINITIONS: ClientDefinition[] = [
+  {
+    client: "claude-code",
+    displayName: "Claude Code",
+    probes: [
+      { relativePath: ".claude/settings.local.json", active: true, format: "json" },
+      { relativePath: ".mcp.json", active: true, format: "json" },
+      { relativePath: "CLAUDE.md", active: false, format: "text" },
+    ],
+  },
+  {
+    client: "codex",
+    displayName: "Codex",
+    probes: [
+      { relativePath: ".codex/config.toml", active: true, format: "toml" },
+    ],
+  },
+  {
+    client: "cursor",
+    displayName: "Cursor",
+    probes: [
+      { relativePath: ".cursor/mcp.json", active: true, format: "json" },
+    ],
+  },
+  {
+    client: "windsurf",
+    displayName: "Windsurf",
+    probes: [
+      { relativePath: ".windsurf/mcp.json", active: true, format: "json" },
+      { relativePath: ".windsurf/mcp_config.example.json", active: false, format: "json" },
+    ],
+  },
+  {
+    client: "zed",
+    displayName: "Zed",
+    probes: [
+      { relativePath: ".zed/settings.json", active: true, format: "json" },
+    ],
+  },
+  {
+    client: "opencode",
+    displayName: "OpenCode",
+    probes: [
+      { relativePath: "opencode.json", active: true, format: "json" },
+    ],
+  },
+  {
+    client: "antigravity",
+    displayName: "Antigravity",
+    probes: [
+      { relativePath: ".antigravity/mcp.json", active: true, format: "json" },
+      { relativePath: ".antigravity/mcp_config.json", active: true, format: "json" },
+      { relativePath: ".antigravity/mcp.example.json", active: false, format: "json" },
+    ],
+  },
+];
 
 // VS Code-derived IDEs persist `windowsState.lastActiveWindow.folder` and
 // `backupWorkspaces.folders[]` inside `<app-data>/<IDE>/User/globalStorage/storage.json`.
@@ -703,6 +844,401 @@ function readBuildInfo(path = DEFAULT_BUILD_INFO_PATH): MemoryBuildInfo | null {
   }
 }
 
+function clientConfigAbsolutePath(projectRoot: string, relativePath: string): string {
+  return join(projectRoot, ...relativePath.split("/"));
+}
+
+function safeExists(path: string): boolean {
+  try {
+    return existsSync(path);
+  } catch {
+    return false;
+  }
+}
+
+function safeReadText(path: string): { text?: string; error?: string } {
+  try {
+    return { text: readFileSync(path, "utf8") };
+  } catch (error) {
+    return { error: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+function parseJsonConfig(text: string): { json?: unknown; error?: string } {
+  try {
+    return { json: JSON.parse(text.replace(/^\uFEFF/, "")) };
+  } catch (error) {
+    return { error: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
+}
+
+function stringArray(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
+}
+
+function extractMemoryProjectRoot(text: string): string | undefined {
+  const match = text.match(/["']?MEMORY_PROJECT_ROOT["']?\s*[:=]\s*["']([^"']+)["']/);
+  return match?.[1];
+}
+
+function configPathForSnippet(path: string): string {
+  return path.replace(/\\/g, "/");
+}
+
+function projectMemoryCommandArgs(projectRoot: string): string[] {
+  return ["node", configPathForSnippet(join(projectRoot, "dist", "index.js"))];
+}
+
+function projectMemoryJsonServer(projectRoot: string): Record<string, unknown> {
+  const [command, serverPath] = projectMemoryCommandArgs(projectRoot);
+  return {
+    command,
+    args: [serverPath],
+    env: {
+      MEMORY_PROJECT_ROOT: "dynamic",
+    },
+  };
+}
+
+function projectMemorySnippet(client: MemoryClientName, projectRoot: string): string {
+  const server = projectMemoryJsonServer(projectRoot);
+  if (client === "codex") {
+    const [command, serverPath] = projectMemoryCommandArgs(projectRoot);
+    return [
+      "[mcp_servers.project-memory]",
+      `command = "${command}"`,
+      `args = ["${serverPath}"]`,
+      "enabled = true",
+      "",
+      "[mcp_servers.project-memory.env]",
+      "MEMORY_PROJECT_ROOT = \"dynamic\"",
+    ].join("\n");
+  }
+  if (client === "zed") {
+    return JSON.stringify({ context_servers: { "project-memory": server } }, null, 2);
+  }
+  if (client === "opencode") {
+    const [command, serverPath] = projectMemoryCommandArgs(projectRoot);
+    return JSON.stringify(
+      {
+        mcp: {
+          "project-memory": {
+            type: "local",
+            command: [command, serverPath],
+            enabled: true,
+            environment: {
+              MEMORY_PROJECT_ROOT: "dynamic",
+            },
+          },
+        },
+      },
+      null,
+      2,
+    );
+  }
+  return JSON.stringify({ mcpServers: { "project-memory": server } }, null, 2);
+}
+
+function inspectClientConfig(projectRoot: string, probe: ClientConfigProbe): InspectedClientConfig {
+  const absolutePath = clientConfigAbsolutePath(projectRoot, probe.relativePath);
+  if (!safeExists(absolutePath)) {
+    return {
+      diagnostic: {
+        path: absolutePath,
+        active: probe.active,
+        exists: false,
+        hasProjectMemory: false,
+        hasMemoryProjectRoot: false,
+      },
+    };
+  }
+
+  const readResult = safeReadText(absolutePath);
+  const text = readResult.text ?? "";
+  const memoryProjectRoot = extractMemoryProjectRoot(text);
+  const parsed = probe.format === "json" && readResult.text !== undefined
+    ? parseJsonConfig(text)
+    : {};
+
+  return {
+    diagnostic: {
+      path: absolutePath,
+      active: probe.active,
+      exists: true,
+      hasProjectMemory: text.includes("project-memory"),
+      hasMemoryProjectRoot: text.includes("MEMORY_PROJECT_ROOT"),
+      memoryProjectRoot,
+      parseError: readResult.error ?? parsed.error,
+    },
+    text: readResult.text,
+    json: parsed.json,
+  };
+}
+
+function inferEnabledFromText(inspected: InspectedClientConfig[]): boolean | undefined {
+  const joined = inspected
+    .map((config) => config.text)
+    .filter((text): text is string => typeof text === "string")
+    .join("\n");
+
+  if (/["']?disabled["']?\s*[:=]\s*true/i.test(joined)) return false;
+  if (/["']?enabled["']?\s*[:=]\s*false/i.test(joined)) return false;
+  if (/["']?disabled["']?\s*[:=]\s*false/i.test(joined)) return true;
+  if (/["']?enabled["']?\s*[:=]\s*true/i.test(joined)) return true;
+  return undefined;
+}
+
+function diagnoseClientIntegration(projectRoot: string, definition: ClientDefinition): MemoryClientDiagnostic {
+  const inspected = definition.probes.map((probe) => inspectClientConfig(projectRoot, probe));
+  const activeInspected = inspected.filter((config) => config.diagnostic.active);
+  const configs = inspected.map((config) => config.diagnostic);
+  const activeConfigs = configs.filter((config) => config.active && config.exists);
+  const issues: string[] = [];
+  let configured = activeConfigs.some((config) => config.hasProjectMemory);
+  let enabled = inferEnabledFromText(activeInspected);
+  let allowedTools: string[] = [];
+
+  for (const config of activeConfigs) {
+    if (config.parseError) {
+      issues.push("CLIENT_CONFIG_PARSE_ERROR");
+      break;
+    }
+  }
+
+  if (definition.client === "claude-code") {
+    const settings = inspected.find((config) => config.diagnostic.path.endsWith(join(".claude", "settings.local.json")));
+    const settingsRecord = asRecord(settings?.json);
+    const enabledServers = stringArray(settingsRecord?.enabledMcpjsonServers);
+    const permissions = asRecord(settingsRecord?.permissions);
+    allowedTools = stringArray(permissions?.allow)
+      .filter((tool) => tool.startsWith("mcp__project-memory__"));
+    if (settings?.diagnostic.exists) {
+      enabled = enabledServers.includes("project-memory");
+      configured = configured || enabled;
+    }
+
+    const projectMcp = inspected.find((config) => config.diagnostic.path.endsWith(join(projectRoot, ".mcp.json")));
+    if (enabled && !projectMcp?.diagnostic.exists) {
+      issues.push("CLAUDE_MCP_SERVER_DEFINITION_NOT_LOCAL");
+    }
+  }
+
+  if (activeConfigs.length > 0 && !configured) {
+    issues.push("CLIENT_CONFIG_MISSING_PROJECT_MEMORY");
+  }
+
+  return {
+    client: definition.client,
+    displayName: definition.displayName,
+    configured,
+    enabled,
+    allowedTools,
+    configs,
+    issues: [...new Set(issues)],
+  };
+}
+
+function addDoctorIssue(
+  issues: MemoryDoctorIssue[],
+  severity: MemoryDoctorIssueSeverity,
+  code: string,
+  message: string,
+  client?: MemoryClientName,
+  path?: string,
+  remediation?: MemoryDoctorRemediation,
+): void {
+  issues.push({ severity, code, message, client, path, remediation });
+}
+
+function clientIssueMessage(code: string, client: MemoryClientDiagnostic): string {
+  switch (code) {
+    case "CLIENT_CONFIG_MISSING_PROJECT_MEMORY":
+      return `${client.displayName} has an active config file, but it does not mention project-memory.`;
+    case "CLIENT_CONFIG_PARSE_ERROR":
+      return `${client.displayName} has a config file that could not be parsed.`;
+    case "CLAUDE_MCP_SERVER_DEFINITION_NOT_LOCAL":
+      return "Claude Code enables project-memory locally, but this project has no root .mcp.json; the server definition may live in a global config.";
+    default:
+      return `${client.displayName} reported ${code}.`;
+  }
+}
+
+function clientIssueSeverity(code: string): MemoryDoctorIssueSeverity {
+  return code === "CLAUDE_MCP_SERVER_DEFINITION_NOT_LOCAL" ? "info" : "warning";
+}
+
+function firstIssuePath(client: MemoryClientDiagnostic): string | undefined {
+  return client.configs.find((config) => config.exists)?.path;
+}
+
+function clientIssueRemediation(
+  code: string,
+  client: MemoryClientDiagnostic,
+  projectRoot: string,
+): MemoryDoctorRemediation | undefined {
+  const path = code === "CLAUDE_MCP_SERVER_DEFINITION_NOT_LOCAL"
+    ? join(projectRoot, ".mcp.json")
+    : firstIssuePath(client);
+
+  switch (code) {
+    case "CLIENT_CONFIG_MISSING_PROJECT_MEMORY":
+      return {
+        summary: `Add a project-memory MCP server entry to ${client.displayName}'s active config.`,
+        path,
+        snippet: projectMemorySnippet(client.client, projectRoot),
+      };
+    case "CLIENT_CONFIG_PARSE_ERROR":
+      return {
+        summary: "Fix the config syntax, then rerun memory_diagnoseWorkspace.",
+        path,
+      };
+    case "CLAUDE_MCP_SERVER_DEFINITION_NOT_LOCAL":
+      return {
+        summary: "Add a project-local .mcp.json if this repo should be self-contained for Claude Code.",
+        path,
+        snippet: projectMemorySnippet("claude-code", projectRoot),
+      };
+    default:
+      return undefined;
+  }
+}
+
+function buildMemoryDoctorDiagnostic(
+  config: MemoryConfig,
+  build: MemoryBuildInfo | null,
+  vaultWithinProject: boolean,
+): MemoryDoctorDiagnostic {
+  const checks = {
+    projectRootExists: safeExists(config.projectRoot),
+    vaultRootExists: safeExists(config.vaultRoot),
+    vaultHasAgentRules: safeExists(join(config.vaultRoot, "AGENTS.md")),
+    vaultWithinProject,
+    buildInfoPresent: build !== null,
+  };
+  const clients = CLIENT_DEFINITIONS.map((definition) => diagnoseClientIntegration(config.projectRoot, definition));
+  const issues: MemoryDoctorIssue[] = [];
+
+  if (!checks.projectRootExists) {
+    addDoctorIssue(
+      issues,
+      "warning",
+      "PROJECT_ROOT_MISSING",
+      "The resolved project root does not exist.",
+      undefined,
+      config.projectRoot,
+      {
+        summary: "Set MEMORY_PROJECT_ROOT to an existing workspace, or open the project root before launching the MCP client.",
+        path: config.projectRoot,
+      },
+    );
+  }
+  if (!checks.vaultRootExists) {
+    addDoctorIssue(
+      issues,
+      "warning",
+      "VAULT_ROOT_MISSING",
+      "The resolved memory vault directory does not exist.",
+      undefined,
+      config.vaultRoot,
+      {
+        summary: "Create the vault directory with memory_bootstrapProject or point MEMORY_VAULT_PATH at an existing vault.",
+        path: config.vaultRoot,
+      },
+    );
+  }
+  if (checks.vaultRootExists && !checks.vaultHasAgentRules) {
+    const rulesPath = join(config.vaultRoot, "AGENTS.md");
+    addDoctorIssue(
+      issues,
+      "warning",
+      "VAULT_AGENT_RULES_MISSING",
+      "The resolved memory vault is missing AGENTS.md.",
+      undefined,
+      rulesPath,
+      {
+        summary: "Create the vault rule file so agents can discover the memory protocol.",
+        path: rulesPath,
+        snippet: "# Project Memory Rules\n\nUse memory_sessionStart at task start and memory_sessionEnd at task completion.\n",
+      },
+    );
+  }
+  if (!checks.vaultWithinProject) {
+    addDoctorIssue(
+      issues,
+      "warning",
+      "VAULT_OUTSIDE_PROJECT",
+      "The resolved memory vault is outside the project root.",
+      undefined,
+      config.vaultRoot,
+      {
+        summary: "Unset MEMORY_VAULT_PATH or set it to a vault inside the resolved project root if this was not intentional.",
+        path: config.vaultRoot,
+      },
+    );
+  }
+  if (!checks.buildInfoPresent) {
+    addDoctorIssue(
+      issues,
+      "info",
+      "BUILD_INFO_MISSING",
+      "dist/build-info.json was not found for this runtime.",
+      undefined,
+      undefined,
+      {
+        summary: "Run the project build so runtime diagnostics include build metadata.",
+        command: "npm run build",
+      },
+    );
+  }
+
+  for (const client of clients) {
+    for (const code of client.issues) {
+      addDoctorIssue(
+        issues,
+        clientIssueSeverity(code),
+        code,
+        clientIssueMessage(code, client),
+        client.client,
+        firstIssuePath(client),
+        clientIssueRemediation(code, client, config.projectRoot),
+      );
+    }
+  }
+
+  if (!clients.some((client) => client.configs.some((configFile) => configFile.active && configFile.exists))) {
+    addDoctorIssue(
+      issues,
+      "warning",
+      "NO_CLIENT_CONFIGS_FOUND",
+      "No known local AI client MCP config files were found.",
+      undefined,
+      undefined,
+      {
+        summary: "Create a local client MCP config or run memory_bootstrapProject with IDE config generation enabled.",
+        snippet: projectMemorySnippet("cursor", config.projectRoot),
+      },
+    );
+  }
+
+  return {
+    ok: !issues.some((issue) => issue.severity === "warning"),
+    summary: {
+      clientsChecked: clients.length,
+      configuredClients: clients.filter((client) => client.configured).length,
+      issueCount: issues.length,
+    },
+    checks,
+    clients,
+    issues,
+  };
+}
+
 export function diagnoseMemoryConfig(
   env: NodeJS.ProcessEnv = process.env,
   cwd = process.cwd(),
@@ -715,6 +1251,8 @@ export function diagnoseMemoryConfig(
   const explicitSource = configuredSource && !isDynamicRootValue(env[configuredSource])
     ? configuredSource
     : undefined;
+  const build = runtime.buildInfo ?? readBuildInfo(runtime.buildInfoPath);
+  const vaultWithinProject = isPathWithin(config.projectRoot, config.vaultRoot);
 
   return {
     config,
@@ -738,8 +1276,9 @@ export function diagnoseMemoryConfig(
       platform: runtime.platform ?? nodePlatform(),
       startedAt: runtime.startedAt ?? MODULE_STARTED_AT,
     },
-    build: runtime.buildInfo ?? readBuildInfo(runtime.buildInfoPath),
-    vaultWithinProject: isPathWithin(config.projectRoot, config.vaultRoot),
+    build,
+    vaultWithinProject,
+    doctor: buildMemoryDoctorDiagnostic(config, build, vaultWithinProject),
   };
 }
 

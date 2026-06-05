@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import { IndexRepository } from "../src/repositories/index.repository.js";
+import type { EmbeddingProvider } from "../src/services/embedding/embedding-provider.js";
 import { MemoryQueryService } from "../src/services/memory-query.service.js";
 import { VaultService } from "../src/services/vault.service.js";
 
@@ -188,5 +189,172 @@ describe("MemoryQueryService incremental + ranked index", () => {
     const aHit = results.find((r) => r.path === "a.md");
     assert.ok(aHit, "a.md is still returned despite the lazy-load failure");
     assert.equal("match" in aHit!, false);
+  });
+});
+
+/** Deterministic stub: steer doc/query vectors by keyword so similarity is testable offline. */
+class StubEmbedder implements EmbeddingProvider {
+  readonly id: string;
+  readonly dimensions = 3;
+  calls = 0;
+  batchSizes: number[] = [];
+  constructor(id = "stub:test:3") {
+    this.id = id;
+  }
+  embed(texts: string[]): Promise<number[][]> {
+    this.calls += texts.length;
+    this.batchSizes.push(texts.length);
+    return Promise.resolve(texts.map((text) => {
+      const s = text.toLowerCase();
+      if (s.includes("backup") || s.includes("rollback")) return [1, 0, 0];
+      if (s.includes("parser") || s.includes("yaml")) return [0, 1, 0];
+      return [0, 0, 1];
+    }));
+  }
+}
+
+class BadShapeEmbedder implements EmbeddingProvider {
+  readonly id = "bad-shape:1";
+  readonly dimensions = 3;
+  calls = 0;
+  embed(): Promise<number[][]> {
+    this.calls += 1;
+    return Promise.resolve([]);
+  }
+}
+
+class BrokenEmbedder implements EmbeddingProvider {
+  readonly id = "broken:1";
+  readonly dimensions = 0;
+  embed(): Promise<number[][]> {
+    return Promise.reject(new Error("endpoint down"));
+  }
+}
+
+describe("MemoryQueryService hybrid search (embedder enabled)", () => {
+  let root: string;
+  let embedder: StubEmbedder;
+  let query: MemoryQueryService;
+
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "mem-hybrid-"));
+    writeFileSync(join(root, "a.md"), NOTE_A); // backup/rollback -> [1,0,0]
+    writeFileSync(join(root, "b.md"), NOTE_B); // parser/yaml     -> [0,1,0]
+    embedder = new StubEmbedder();
+    query = new MemoryQueryService(new VaultService(root), new IndexRepository(), undefined, embedder);
+  });
+
+  afterEach(() => {
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  it("persists per-note vectors and the embedder signature in the cache", async () => {
+    await query.search("backup", [], undefined, undefined, 10, 0);
+    const parsed = JSON.parse(readFileSync(join(root, ".memory-mcp", "index.json"), "utf8"));
+    assert.equal(parsed.embedder, "stub:test:3");
+    assert.deepEqual(parsed.records["a.md"].vector, [1, 0, 0]);
+    assert.deepEqual(parsed.records["b.md"].vector, [0, 1, 0]);
+  });
+
+  it("never leaks the vector into public results", async () => {
+    const results = await query.search("backup", [], undefined, undefined, 10, 0);
+    assert.ok(results.length > 0);
+    assert.equal("vector" in results[0], false);
+  });
+
+  it("does not embed on get()/recent() lookups (only search embeds)", async () => {
+    await query.get("a.md");
+    await query.recent([], [], "updated", 10);
+    assert.equal(embedder.calls, 0);
+  });
+
+  it("re-embeds under a new signature when the embedder changes", async () => {
+    await query.search("backup", [], undefined, undefined, 10, 0); // seed stub:test:3
+    const other = new StubEmbedder("stub:other:3");
+    const reopened = new MemoryQueryService(new VaultService(root), new IndexRepository(), undefined, other);
+    await reopened.search("backup", [], undefined, undefined, 10, 0);
+    assert.ok(other.calls > 0, "cached vectors dropped and re-embedded under the new signature");
+    const parsed = JSON.parse(readFileSync(join(root, ".memory-mcp", "index.json"), "utf8"));
+    assert.equal(parsed.embedder, "stub:other:3");
+  });
+
+  it("degrades to lexical-only when the provider throws", async () => {
+    const broken = new MemoryQueryService(new VaultService(root), new IndexRepository(), undefined, new BrokenEmbedder());
+    const results = await broken.search("backup", [], undefined, undefined, 10, 0);
+    assert.equal(results[0].path, "a.md"); // lexical ranking still works
+  });
+
+  it("batches document embedding requests before embedding the query", async () => {
+    for (let i = 0; i < 35; i += 1) {
+      writeFileSync(
+        join(root, `extra-${i}.md`),
+        `---\ntitle: "Backup extra ${i}"\ntype: note\ncreated: "2026-01-01"\nupdated: "2026-01-02"\n---\n\nbackup rollback ${i}\n`,
+      );
+    }
+    await query.search("backup", [], undefined, undefined, 10, 0);
+    assert.ok(embedder.batchSizes.length >= 3, "document embeddings are split before the query embedding call");
+    assert.ok(embedder.batchSizes.slice(0, -1).every((size) => size <= 32), "document embedding batches stay bounded");
+    assert.equal(embedder.batchSizes.at(-1), 1, "query vector is embedded separately");
+  });
+
+  it("cooldowns after a malformed provider response instead of retrying immediately", async () => {
+    const bad = new BadShapeEmbedder();
+    const withBadProvider = new MemoryQueryService(new VaultService(root), new IndexRepository(), undefined, bad);
+    assert.equal((await withBadProvider.search("backup", [], undefined, undefined, 10, 0))[0].path, "a.md");
+    assert.equal(bad.calls, 1, "malformed document embedding response starts cooldown before query embedding");
+    assert.equal((await withBadProvider.search("backup", [], undefined, undefined, 10, 0))[0].path, "a.md");
+    assert.equal(bad.calls, 1, "second search stays lexical-only during cooldown");
+  });
+
+  it("applies folder filters before the capped vector arm", async () => {
+    for (let i = 0; i < 30; i += 1) {
+      writeFileSync(
+        join(root, `aaa-outside-${i}.md`),
+        `---\ntitle: "Outside ${i}"\ntype: note\ncreated: "2026-01-01"\nupdated: "2026-01-02"\n---\n\nrollback-only outside note ${i}\n`,
+      );
+    }
+    mkdirSync(join(root, "target"), { recursive: true });
+    writeFileSync(
+      join(root, "target", "hit.md"),
+      `---\ntitle: "Target"\ntype: note\ncreated: "2026-01-01"\nupdated: "2026-01-02"\n---\n\nrollback-only target note\n`,
+    );
+
+    const results = await query.search("backup", [], "target", undefined, 10, 0);
+    assert.deepEqual(results.map((r) => r.path), ["target/hit.md"]);
+  });
+
+  it("persists vector removal when reopening a cache with embeddings disabled", async () => {
+    await query.search("backup", [], undefined, undefined, 10, 0);
+
+    const lexicalOnly = new MemoryQueryService(new VaultService(root), new IndexRepository());
+    await lexicalOnly.search("backup", [], undefined, undefined, 10, 0);
+
+    const parsed = JSON.parse(readFileSync(join(root, ".memory-mcp", "index.json"), "utf8"));
+    assert.equal(parsed.embedder, "none");
+    assert.equal(parsed.records["a.md"].vector, undefined);
+  });
+});
+
+describe("MemoryQueryService Thai recall via n-grams (no embedder)", () => {
+  it("matches a Thai substring query against a longer Thai word", async () => {
+    const root = mkdtempSync(join(tmpdir(), "mem-thai-"));
+    try {
+      writeFileSync(
+        join(root, "th.md"),
+        `---\ntitle: "หน่วยความจำ"\ntype: note\ncreated: "2026-01-01"\nupdated: "2026-01-02"\n---\n\nระบบหน่วยความจำของโครงการ\n`,
+      );
+      writeFileSync(
+        join(root, "other.md"),
+        `---\ntitle: "Frontmatter parser"\ntype: note\ncreated: "2026-01-01"\nupdated: "2026-01-03"\n---\n\nNever-throw yaml parser.\n`,
+      );
+      const query = new MemoryQueryService(new VaultService(root), new IndexRepository());
+      // The old whitespace tokenizer collapsed Thai into one token, so "ความจำ"
+      // (a substring of "หน่วยความจำ") never matched. N-grams fix that.
+      const results = await query.search("ความจำ", [], undefined, undefined, 10, 0);
+      assert.ok(results.some((r) => r.path === "th.md"), "Thai substring query matches the longer Thai word");
+      assert.ok(!results.some((r) => r.path === "other.md"), "unrelated English note does not match");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });

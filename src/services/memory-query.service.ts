@@ -3,14 +3,25 @@ import { dirname, join } from "node:path";
 import type { IndexRepository, IndexRecord, StoredRecord } from "../repositories/index.repository.js";
 import { toPublicRecord } from "../repositories/index.repository.js";
 import { tokenize } from "../utils/bm25.js";
+import { searchTokens } from "../utils/ngram.js";
 import { extractWikilinks } from "../utils/links.js";
 import { bestSection, type SectionMatch } from "../utils/sections.js";
 import { asStringArray, basenameWithoutExtension, inferTypeFromPath, normalizeMarkdownPath } from "../utils/memory-format.js";
+import type { EmbeddingProvider } from "./embedding/embedding-provider.js";
 import type { MemoryUsageService } from "./memory-usage.service.js";
 import type { VaultService } from "./vault.service.js";
 
 const SEARCH_TEXT_LIMIT = 4000;
 const INDEX_VERSION = 2;
+/** Signature persisted when no embedding provider is active. */
+const NO_EMBEDDER = "none";
+/** Characters of (title + body) embedded per note. */
+const EMBED_TEXT_LIMIT = 2000;
+/** Max records embedded per provider call; keeps first-search requests bounded. */
+const EMBED_BATCH_SIZE = 32;
+/** After a provider failure, skip embedding attempts for this long (ms) so a
+ *  down endpoint can't make every query pay a doomed round-trip. */
+const EMBED_COOLDOWN_MS = 60_000;
 
 /** A search result, optionally annotated with the best-matching section anchor. */
 export type SearchHit = IndexRecord & { match?: SectionMatch };
@@ -18,27 +29,46 @@ export type SearchHit = IndexRecord & { match?: SectionMatch };
 interface PersistedIndex {
   version: typeof INDEX_VERSION;
   updatedAt: string;
+  /** Signature of the embedder whose vectors are stored here ("none" if off).
+   *  On load, a mismatch with the active embedder drops the cached vectors so
+   *  vectors from different embedding spaces are never mixed. */
+  embedder?: string;
   records: Record<string, StoredRecord>;
+}
+
+/** Keep a persisted/returned vector only when it is a non-empty all-finite number array. */
+function coerceVector(value: unknown): number[] | undefined {
+  if (!Array.isArray(value) || value.length === 0) return undefined;
+  const vec = value.map((x) => Number(x));
+  return vec.every((x) => Number.isFinite(x)) ? vec : undefined;
 }
 
 export class MemoryQueryService {
   private readonly indexPath: string;
+  private readonly embedderId: string;
   private loaded = false;
+  private embedCooldownUntil = 0;
+  private cacheNeedsPersist = false;
 
   constructor(
     private readonly vault: VaultService,
     private readonly index: IndexRepository,
     private readonly usage?: MemoryUsageService,
+    private readonly embedder?: EmbeddingProvider,
   ) {
     this.indexPath = join(this.vault.vaultRoot, ".memory-mcp", "index.json");
+    this.embedderId = embedder?.id ?? NO_EMBEDDER;
   }
 
   /**
    * Refresh the index incrementally: re-parse only files whose mtime changed
    * (or that are new), drop deleted files, and persist the cache when anything
-   * changed. Pass { force: true } to rebuild every record from scratch.
+   * changed. Pass { force: true } to rebuild every record from scratch, or
+   * { embed: true } to also (re-)embed any records missing a vector when an
+   * embedding provider is enabled (search passes this; get/recent do not, so a
+   * lookup never triggers an embedding pass).
    */
-  async snapshotIndex(options: { force?: boolean } = {}): Promise<StoredRecord[]> {
+  async snapshotIndex(options: { force?: boolean; embed?: boolean } = {}): Promise<StoredRecord[]> {
     if (options.force) {
       this.index.clear();
       this.loaded = true;
@@ -75,35 +105,45 @@ export class MemoryQueryService {
       }
     }
 
-    if (changed || options.force) this.persist();
+    const embedded = options.embed ? await this.embedMissing() : false;
+
+    if (changed || embedded || options.force || this.cacheNeedsPersist) {
+      this.persist();
+      this.cacheNeedsPersist = false;
+    }
     return this.index.list();
   }
 
   async search(query: string, tags: string[], folder?: string, type?: string, limit = 10, offset = 0, includeSections = false): Promise<SearchHit[]> {
-    await this.snapshotIndex();
+    await this.snapshotIndex({ embed: true });
     const matchesFilters = (record: StoredRecord) =>
       (tags.length === 0 || tags.some((tag) => record.tags.includes(tag))) &&
       (!folder || record.path.includes(folder)) &&
       (!type || record.type === type);
 
     const trimmed = (query ?? "").trim();
-    const terms = trimmed ? tokenize(trimmed) : [];
+    // Word tokens key the usage booster (kept aligned with MemoryUsageService);
+    // rankTerms add Thai/CJK n-grams so those scripts are actually searchable.
+    const wordTerms = trimmed ? tokenize(trimmed) : [];
+    const rankTerms = trimmed ? searchTokens(trimmed) : [];
     let ranked: StoredRecord[];
-    if (terms.length === 0) {
-      // No usable query terms — either an empty query (e.g. memory_list) or a
-      // query whose tokens were all dropped (single chars / punctuation / a
-      // script the tokenizer does not segment). Newest-first is stable and
-      // avoids silently returning nothing for a non-empty query.
+    if (rankTerms.length === 0) {
+      // No usable query terms — an empty query (e.g. memory_list) or one whose
+      // tokens were all dropped (single chars / punctuation). Newest-first is
+      // stable and avoids silently returning nothing for a non-empty query.
       ranked = this.index.list().filter(matchesFilters).sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt)));
     } else {
-      const boost = this.usage ? this.usage.buildBooster(terms) : () => 0;
-      ranked = this.index.rank(terms, boost).filter(matchesFilters);
+      const boost = this.usage ? this.usage.buildBooster(wordTerms) : () => 0;
+      // Undefined unless an embedder is enabled -> rankHybrid falls back to the
+      // plain lexical rank(), so the default path is unchanged.
+      const queryVector = await this.embedQuery(trimmed);
+      ranked = this.index.rankHybrid(rankTerms, queryVector, boost, matchesFilters);
     }
 
     const page = ranked.slice(offset, offset + limit);
-    if (!includeSections || terms.length === 0) return page.map(toPublicRecord);
+    if (!includeSections || rankTerms.length === 0) return page.map(toPublicRecord);
     return page.map((record) => {
-      const match = this.sectionMatchFor(record.path, terms);
+      const match = this.sectionMatchFor(record.path, rankTerms);
       return match ? { ...toPublicRecord(record), match } : toPublicRecord(record);
     });
   }
@@ -175,6 +215,73 @@ export class MemoryQueryService {
 
   // ---------- index internals ----------
 
+  /**
+   * Embed any records still missing a vector (new/modified notes, or all of
+   * them after an embedder change) in bounded batches. Best-effort: a provider
+   * error or malformed response degrades to lexical-only and starts a short
+   * cooldown so a down endpoint can't make every query retry. Returns true if
+   * any vector was stored.
+   */
+  private async embedMissing(): Promise<boolean> {
+    if (!this.embedder || Date.now() < this.embedCooldownUntil) return false;
+    const pending = this.index.list().filter((record) => !record.vector || record.vector.length === 0);
+    if (pending.length === 0) return false;
+    let stored = false;
+    for (let i = 0; i < pending.length; i += EMBED_BATCH_SIZE) {
+      const batch = pending.slice(i, i + EMBED_BATCH_SIZE);
+      try {
+        const vectors = await this.embedder.embed(batch.map((record) => this.embedText(record)));
+        if (vectors.length !== batch.length) {
+          this.recordEmbedFailure();
+          return stored;
+        }
+        const coerced = vectors.map(coerceVector);
+        if (coerced.some((vector) => !vector)) {
+          this.recordEmbedFailure();
+          return stored;
+        }
+        batch.forEach((record, j) => {
+          this.index.upsert({ ...record, vector: coerced[j] as number[] });
+          stored = true;
+        });
+      } catch {
+        this.recordEmbedFailure();
+        return stored;
+      }
+    }
+    return stored;
+  }
+
+  private recordEmbedFailure() {
+    this.embedCooldownUntil = Date.now() + EMBED_COOLDOWN_MS;
+  }
+
+  /** Embed the query for the semantic arm; undefined when off or on failure. */
+  private async embedQuery(text: string): Promise<number[] | undefined> {
+    if (!this.embedder || Date.now() < this.embedCooldownUntil) return undefined;
+    try {
+      const vectors = await this.embedder.embed([text]);
+      if (vectors.length !== 1) {
+        this.recordEmbedFailure();
+        return undefined;
+      }
+      const vector = coerceVector(vectors[0]);
+      if (!vector) {
+        this.recordEmbedFailure();
+        return undefined;
+      }
+      return vector;
+    } catch {
+      this.recordEmbedFailure();
+      return undefined;
+    }
+  }
+
+  /** Text embedded for a note: title + a body prefix, capped. */
+  private embedText(record: StoredRecord): string {
+    return [record.title, record.searchText].filter(Boolean).join("\n").slice(0, EMBED_TEXT_LIMIT);
+  }
+
   private buildRecord(relative: string, mtimeMs: number): StoredRecord {
     const raw = this.vault.load(relative);
     const body = raw.parsed.content.trim();
@@ -210,9 +317,15 @@ export class MemoryQueryService {
       const parsed = JSON.parse(readFileSync(this.indexPath, "utf8")) as PersistedIndex;
       // Ignore corrupt / foreign / stale-schema caches; mtimes rebuild lazily.
       if (!parsed || parsed.version !== INDEX_VERSION || !parsed.records) return;
+      // Vectors from a different embedder (or none) are incomparable to the
+      // active one — keep the cheap lexical fields, drop the vectors, and let
+      // the next search re-embed. Lexical data is embedder-independent.
+      const sameEmbedder = (parsed.embedder ?? NO_EMBEDDER) === this.embedderId;
+      if (!sameEmbedder) this.cacheNeedsPersist = true;
       const records = Object.values(parsed.records)
         .filter((record): record is StoredRecord => Boolean(record && record.path))
-        .map((record) => this.normalizeStored(record));
+        .map((record) => this.normalizeStored(record))
+        .map((record) => (sameEmbedder ? record : { ...record, vector: undefined }));
       this.index.bulkUpsert(records);
     } catch {
       // Corrupt or outdated cache — ignore; mtimes will rebuild it lazily.
@@ -238,6 +351,7 @@ export class MemoryQueryService {
       searchText: String(record.searchText ?? ""),
       outgoingLinks: asStringArray(record.outgoingLinks),
       mtimeMs: typeof record.mtimeMs === "number" ? record.mtimeMs : 0,
+      vector: coerceVector(record.vector),
     };
   }
 
@@ -245,7 +359,7 @@ export class MemoryQueryService {
     try {
       const records: Record<string, StoredRecord> = {};
       for (const record of this.index.list()) records[record.path] = record;
-      const payload: PersistedIndex = { version: INDEX_VERSION, updatedAt: new Date().toISOString(), records };
+      const payload: PersistedIndex = { version: INDEX_VERSION, updatedAt: new Date().toISOString(), embedder: this.embedderId, records };
       mkdirSync(dirname(this.indexPath), { recursive: true });
       // Write to a per-process temp file then atomically rename. The vault is
       // shared across agents/processes, so a concurrent or interrupted write

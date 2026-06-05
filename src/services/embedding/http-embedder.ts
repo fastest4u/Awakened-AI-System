@@ -1,0 +1,90 @@
+/**
+ * Optional HTTP embedding provider (opt-in, OFF by default). Targets the common
+ * OpenAI-compatible `/v1/embeddings` shape (`{ model, input: string[] }` ->
+ * `{ data: [{ embedding }] }`) and also accepts Ollama's `{ embeddings }` /
+ * `{ embedding }` shapes, so a local model server (Ollama, llama.cpp, LM Studio)
+ * or a hosted endpoint both work. This is the path to true cross-lingual
+ * (Thai<->English) semantic recall; it requires network/an external service, so
+ * it is never enabled unless the operator configures it explicitly.
+ */
+import { l2normalize } from "../../utils/vector.js";
+import type { EmbeddingProvider } from "./embedding-provider.js";
+
+type FetchLike = (input: string, init: RequestInit) => Promise<Response>;
+
+export interface HttpEmbedderOptions {
+  endpoint: string;
+  model: string;
+  apiKey?: string;
+  dimensions?: number;
+  timeoutMs?: number;
+  /** Injectable for tests; defaults to the global fetch (Node >= 18). */
+  fetchImpl?: FetchLike;
+}
+
+/** Pull vectors out of the known response shapes, defensively. */
+export function extractVectors(json: unknown): number[][] {
+  if (!json || typeof json !== "object") return [];
+  const obj = json as Record<string, unknown>;
+  // OpenAI: { data: [{ embedding: number[] }, ...] }
+  if (Array.isArray(obj.data)) {
+    return obj.data.map((entry) => {
+      const embedding = (entry as { embedding?: unknown })?.embedding;
+      return Array.isArray(embedding) ? embedding.map(Number) : [];
+    });
+  }
+  // Ollama /api/embed (batch): { embeddings: number[][] }
+  if (Array.isArray(obj.embeddings)) {
+    return obj.embeddings.map((vec) => (Array.isArray(vec) ? vec.map(Number) : []));
+  }
+  // Ollama /api/embeddings (single): { embedding: number[] }
+  if (Array.isArray(obj.embedding)) {
+    return [obj.embedding.map(Number)];
+  }
+  return [];
+}
+
+export class HttpEmbedder implements EmbeddingProvider {
+  readonly id: string;
+  readonly dimensions: number;
+  private readonly endpoint: string;
+  private readonly model: string;
+  private readonly apiKey?: string;
+  private readonly timeoutMs: number;
+  private readonly fetchImpl: FetchLike;
+
+  constructor(options: HttpEmbedderOptions) {
+    this.endpoint = options.endpoint;
+    this.model = options.model;
+    this.apiKey = options.apiKey;
+    this.dimensions = options.dimensions ?? 0;
+    this.timeoutMs = options.timeoutMs ?? 15_000;
+    const provided = options.fetchImpl ?? (globalThis.fetch as FetchLike | undefined);
+    if (!provided) throw new Error("HttpEmbedder requires a fetch implementation (global fetch unavailable)");
+    this.fetchImpl = provided;
+    // Identity keys on the model (the vector space), not the endpoint, so moving
+    // the same model between hosts does not needlessly invalidate the cache.
+    this.id = `http:${this.model}`;
+  }
+
+  async embed(texts: string[]): Promise<number[][]> {
+    if (texts.length === 0) return [];
+    const response = await this.fetchImpl(this.endpoint, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        ...(this.apiKey ? { authorization: `Bearer ${this.apiKey}` } : {}),
+      },
+      body: JSON.stringify({ model: this.model, input: texts }),
+      signal: AbortSignal.timeout(this.timeoutMs),
+    });
+    if (!response.ok) {
+      throw new Error(`embedding endpoint ${this.endpoint} returned HTTP ${response.status}`);
+    }
+    const vectors = extractVectors(await response.json());
+    if (vectors.length !== texts.length) {
+      throw new Error(`embedding endpoint returned ${vectors.length} vectors for ${texts.length} inputs`);
+    }
+    return vectors.map((vec) => l2normalize(vec));
+  }
+}

@@ -1,5 +1,13 @@
 import { Bm25Index, tokenize, weighted } from "../utils/bm25.js";
 import { basenameWithoutExtension } from "../utils/memory-format.js";
+import { searchTokens } from "../utils/ngram.js";
+import { cosine, reciprocalRankFusion } from "../utils/vector.js";
+
+/** RRF dampening constant (standard default) for fusing hybrid arms. */
+const RRF_K = 60;
+/** Max docs the vector arm contributes — bounds semantic-only injection so a
+ *  weakly-similar tail can't drown out lexical matches (RRF ranks the rest). */
+const VECTOR_ARM_LIMIT = 25;
 
 /** Public, lean index record returned to callers (search/list/recent results). */
 export interface IndexRecord {
@@ -25,10 +33,16 @@ export interface StoredRecord extends IndexRecord {
   searchText: string;
   /** Normalized `[[wikilink]]` targets in this note's body (for the backlink graph). */
   outgoingLinks: string[];
+  /**
+   * Optional L2-normalized embedding for the body (Tier 3 hybrid search).
+   * Present only when an embedding provider is enabled; stripped from public
+   * results. Tagged with the active embedder signature in the persisted index.
+   */
+  vector?: number[];
 }
 
 export function toPublicRecord(stored: StoredRecord): IndexRecord {
-  const { mtimeMs: _mtimeMs, searchText: _searchText, outgoingLinks: _outgoingLinks, ...rest } = stored;
+  const { mtimeMs: _mtimeMs, searchText: _searchText, outgoingLinks: _outgoingLinks, vector: _vector, ...rest } = stored;
   return rest;
 }
 
@@ -84,6 +98,77 @@ export class IndexRepository {
       .filter((entry) => entry.matched)
       .sort((a, b) => b.score - a.score)
       .map((entry) => entry.doc);
+  }
+
+  /**
+   * Hybrid ranked search: fuse a lexical (BM25) arm, a semantic (cosine vs the
+   * query vector) arm, and a usage arm via Reciprocal Rank Fusion. Because the
+   * three signals are on incomparable scales, RANK — not raw score — is fused.
+   *
+   * Falls back to the plain additive-boost `rank()` (byte-identical behavior)
+   * whenever there is no usable query vector or no document carries a vector, so
+   * the lexical-only/default path is never disturbed by enabling this method.
+   *
+   * The usage arm only re-orders documents already surfaced lexically or
+   * semantically (never injects a popular-but-irrelevant note), and the vector
+   * arm is capped so a weakly-similar tail cannot dominate exact matches.
+   */
+  rankHybrid(
+    queryTerms: string[],
+    queryVector: number[] | undefined,
+    boost: (path: string) => number = () => 0,
+    eligible: (record: StoredRecord) => boolean = () => true,
+  ): StoredRecord[] {
+    const hasVectorArm = Array.isArray(queryVector)
+      && queryVector.length > 0
+      && this.hasAnyVector(eligible);
+    if (!hasVectorArm) return this.rank(queryTerms, boost).filter(eligible);
+
+    const lexical = this.rank(queryTerms).filter(eligible).map((doc) => doc.path); // pure BM25 order, matched-only
+    const vector = this.vectorRank(queryVector as number[], eligible);
+    const candidates = new Set<string>([...lexical, ...vector]);
+    const usage = this.usageRank(boost, candidates); // re-rank within candidates only
+
+    const fused = reciprocalRankFusion([lexical, vector, usage], RRF_K);
+    return [...fused.keys()]
+      .map((path) => this.records.get(path))
+      .filter((doc): doc is StoredRecord => Boolean(doc))
+      .sort((a, b) => {
+        const diff = (fused.get(b.path) ?? 0) - (fused.get(a.path) ?? 0);
+        if (diff !== 0) return diff;
+        return String(b.updatedAt).localeCompare(String(a.updatedAt));
+      });
+  }
+
+  private hasAnyVector(eligible: (record: StoredRecord) => boolean): boolean {
+    for (const record of this.records.values()) {
+      if (eligible(record) && record.vector && record.vector.length > 0) return true;
+    }
+    return false;
+  }
+
+  /** Top documents by cosine similarity to the query vector (capped, score > 0). */
+  private vectorRank(queryVector: number[], eligible: (record: StoredRecord) => boolean): string[] {
+    const scored: Array<{ path: string; score: number }> = [];
+    for (const record of this.records.values()) {
+      if (!eligible(record)) continue;
+      if (!record.vector || record.vector.length === 0) continue;
+      const score = cosine(queryVector, record.vector);
+      if (score > 0) scored.push({ path: record.path, score });
+    }
+    scored.sort((a, b) => b.score - a.score);
+    return scored.slice(0, VECTOR_ARM_LIMIT).map((entry) => entry.path);
+  }
+
+  /** Candidate paths ordered by usage boost (descending); boost-0 paths dropped. */
+  private usageRank(boost: (path: string) => number, candidates: Set<string>): string[] {
+    const scored: Array<{ path: string; score: number }> = [];
+    for (const path of candidates) {
+      const score = boost(path);
+      if (score > 0) scored.push({ path, score });
+    }
+    scored.sort((a, b) => b.score - a.score);
+    return scored.map((entry) => entry.path);
   }
 
   /** Backlinks: paths of notes whose body `[[wikilink]]`s resolve to `path`. */
@@ -157,14 +242,20 @@ export class IndexRepository {
     return this.linkGraph;
   }
 
-  /** Field-weighted token bag for a document (title > tags/aliases > type/body). */
+  /**
+   * Field-weighted token bag for a document (title > tags/aliases > type/body).
+   * Text fields use `searchTokens` so Thai/CJK content (which has no inter-word
+   * spaces) contributes character n-grams and becomes searchable; for Latin/code
+   * `searchTokens` is identical to `tokenize`, so that ranking is unchanged. The
+   * `type` enum is always ASCII, so plain `tokenize` is enough there.
+   */
   private documentTerms(record: StoredRecord): string[] {
     return [
-      ...weighted(tokenize(record.title), 3),
-      ...weighted(tokenize(record.tags.join(" ")), 2),
-      ...weighted(tokenize(record.aliases.join(" ")), 2),
+      ...weighted(searchTokens(record.title), 3),
+      ...weighted(searchTokens(record.tags.join(" ")), 2),
+      ...weighted(searchTokens(record.aliases.join(" ")), 2),
       ...tokenize(record.type),
-      ...tokenize(record.searchText),
+      ...searchTokens(record.searchText),
     ];
   }
 }

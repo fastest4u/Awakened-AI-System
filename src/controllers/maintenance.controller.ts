@@ -23,7 +23,7 @@ export class MaintenanceController {
     server.registerTool("memory_compactVault", { description: "Compact session logs into insights.", inputSchema: compactVaultInputSchema, annotations: { destructiveHint: true } }, this.compactVault.bind(this));
     server.registerTool("memory_export", { description: "Export a curated memory bundle.", inputSchema: exportInputSchema, annotations: { readOnlyHint: true, idempotentHint: true } }, this.export.bind(this));
     server.registerTool("memory_import", { description: "Import notes into the vault.", inputSchema: importInputSchema, annotations: { destructiveHint: true } }, this.import.bind(this));
-    server.registerTool("memory_diagnoseWorkspace", { description: "Diagnose project root, vault root, workspace detection candidates, and runtime metadata.", inputSchema: diagnoseWorkspaceInputSchema, annotations: { readOnlyHint: true, idempotentHint: true } }, this.diagnoseWorkspace.bind(this));
+    server.registerTool("memory_diagnoseWorkspace", { description: "Diagnose project root, vault root, workspace detection candidates, runtime metadata, and local AI client MCP configs.", inputSchema: diagnoseWorkspaceInputSchema, annotations: { readOnlyHint: true, idempotentHint: true } }, this.diagnoseWorkspace.bind(this));
   }
 
   async reindex(_: z.infer<typeof reindexInputSchema>) {

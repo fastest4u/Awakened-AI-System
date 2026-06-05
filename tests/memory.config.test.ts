@@ -702,6 +702,175 @@ describe("diagnoseMemoryConfig", () => {
 
     assert.equal(diagnostic.vaultWithinProject, false);
   });
+
+  it("reports MCP Doctor diagnostics for configured local AI clients", () => {
+    const project = join(tmpRoot, "doctor-project");
+    mkdirSync(join(project, "memory"), { recursive: true });
+    mkdirSync(join(project, ".claude"), { recursive: true });
+    mkdirSync(join(project, ".codex"), { recursive: true });
+    mkdirSync(join(project, ".cursor"), { recursive: true });
+    mkdirSync(join(project, ".windsurf"), { recursive: true });
+    mkdirSync(join(project, ".zed"), { recursive: true });
+    mkdirSync(join(project, ".antigravity"), { recursive: true });
+    writeFileSync(join(project, "memory", "AGENTS.md"), "# vault\n");
+    writeFileSync(join(project, "CLAUDE.md"), "# Claude rules\nproject-memory\n");
+    writeFileSync(
+      join(project, ".claude", "settings.local.json"),
+      JSON.stringify({
+        permissions: { allow: ["mcp__project-memory__memory_sessionStart"] },
+        enabledMcpjsonServers: ["project-memory"],
+      }),
+    );
+    writeFileSync(
+      join(project, ".codex", "config.toml"),
+      [
+        "[mcp_servers.project-memory]",
+        "command = \"node\"",
+        "",
+        "[mcp_servers.project-memory.env]",
+        "MEMORY_PROJECT_ROOT = \"dynamic\"",
+      ].join("\n"),
+    );
+    writeFileSync(
+      join(project, ".cursor", "mcp.json"),
+      JSON.stringify({ mcpServers: { "project-memory": { env: { MEMORY_PROJECT_ROOT: "dynamic" } } } }),
+    );
+    writeFileSync(
+      join(project, ".windsurf", "mcp.json"),
+      JSON.stringify({ mcpServers: { "project-memory": { env: { MEMORY_PROJECT_ROOT: "dynamic" } } } }),
+    );
+    writeFileSync(
+      join(project, ".zed", "settings.json"),
+      JSON.stringify({ context_servers: { "project-memory": { env: { MEMORY_PROJECT_ROOT: "dynamic" } } } }),
+    );
+    writeFileSync(
+      join(project, ".antigravity", "mcp.json"),
+      JSON.stringify({ mcpServers: { "project-memory": { env: { MEMORY_PROJECT_ROOT: "dynamic" } } } }),
+    );
+    writeFileSync(
+      join(project, "opencode.json"),
+      JSON.stringify({ mcp: { "project-memory": { environment: { MEMORY_PROJECT_ROOT: "dynamic" } } } }),
+    );
+
+    const diagnostic = diagnoseMemoryConfig(
+      { MEMORY_PROJECT_ROOT: project } as NodeJS.ProcessEnv,
+      tmpRoot,
+      { buildInfo: { builtAt: "2026-06-01T00:00:00.000Z", version: "0.1.0-test" } },
+    );
+    const doctor = (diagnostic as any).doctor;
+
+    assert.equal(doctor.checks.projectRootExists, true);
+    assert.equal(doctor.checks.vaultRootExists, true);
+    assert.equal(doctor.checks.vaultHasAgentRules, true);
+    assert.equal(doctor.checks.buildInfoPresent, true);
+    assert.equal(doctor.summary.clientsChecked, 7);
+    assert.equal(doctor.summary.configuredClients, 7);
+    assert.equal(
+      doctor.issues.some((issue: { code: string }) => issue.code === "CLAUDE_MCP_SERVER_DEFINITION_NOT_LOCAL"),
+      true,
+    );
+
+    const claude = doctor.clients.find((client: { client: string }) => client.client === "claude-code");
+    assert.equal(claude.configured, true);
+    assert.equal(claude.enabled, true);
+    assert.deepEqual(claude.allowedTools, ["mcp__project-memory__memory_sessionStart"]);
+    assert.equal(claude.configs[0].hasProjectMemory, true);
+    assert.equal(claude.configs[0].hasMemoryProjectRoot, false);
+
+    const codex = doctor.clients.find((client: { client: string }) => client.client === "codex");
+    assert.equal(codex.configured, true);
+    assert.equal(codex.configs[0].hasMemoryProjectRoot, true);
+    assert.equal(codex.configs[0].memoryProjectRoot, "dynamic");
+  });
+
+  it("accepts BOM-prefixed JSON client configs", () => {
+    const project = join(tmpRoot, "bom-project");
+    mkdirSync(join(project, "memory"), { recursive: true });
+    mkdirSync(join(project, ".cursor"), { recursive: true });
+    writeFileSync(join(project, "memory", "AGENTS.md"), "# vault\n");
+    writeFileSync(
+      join(project, ".cursor", "mcp.json"),
+      `\uFEFF${JSON.stringify({ mcpServers: { "project-memory": { env: { MEMORY_PROJECT_ROOT: "dynamic" } } } })}`,
+    );
+
+    const diagnostic = diagnoseMemoryConfig(
+      { MEMORY_PROJECT_ROOT: project } as NodeJS.ProcessEnv,
+      tmpRoot,
+      { buildInfo: { builtAt: "2026-06-01T00:00:00.000Z", version: "0.1.0-test" } },
+    );
+    const doctor = (diagnostic as any).doctor;
+    const cursor = doctor.clients.find((client: { client: string }) => client.client === "cursor");
+
+    assert.equal(cursor.configured, true);
+    assert.equal(cursor.configs[0].parseError, undefined);
+    assert.equal(doctor.issues.some((issue: { code: string }) => issue.code === "CLIENT_CONFIG_PARSE_ERROR"), false);
+  });
+
+  it("does not raise Doctor warnings for parse errors in inactive example configs", () => {
+    const project = join(tmpRoot, "inactive-example-project");
+    mkdirSync(join(project, "memory"), { recursive: true });
+    mkdirSync(join(project, ".windsurf"), { recursive: true });
+    writeFileSync(join(project, "memory", "AGENTS.md"), "# vault\n");
+    writeFileSync(
+      join(project, ".windsurf", "mcp.json"),
+      JSON.stringify({ mcpServers: { "project-memory": { env: { MEMORY_PROJECT_ROOT: "dynamic" } } } }),
+    );
+    writeFileSync(join(project, ".windsurf", "mcp_config.example.json"), "{ not json");
+
+    const diagnostic = diagnoseMemoryConfig(
+      { MEMORY_PROJECT_ROOT: project } as NodeJS.ProcessEnv,
+      tmpRoot,
+      { buildInfo: { builtAt: "2026-06-01T00:00:00.000Z", version: "0.1.0-test" } },
+    );
+    const doctor = (diagnostic as any).doctor;
+
+    assert.equal(doctor.ok, true);
+    assert.equal(doctor.issues.some((issue: { code: string }) => issue.code === "CLIENT_CONFIG_PARSE_ERROR"), false);
+    const windsurf = doctor.clients.find((client: { client: string }) => client.client === "windsurf");
+    assert.equal(windsurf.configs[1].active, false);
+    assert.ok(windsurf.configs[1].parseError);
+  });
+
+  it("flags missing vault rules and client configs that omit project-memory", () => {
+    const project = join(tmpRoot, "broken-project");
+    const externalVault = join(tmpRoot, "external-vault");
+    mkdirSync(project, { recursive: true });
+    mkdirSync(externalVault, { recursive: true });
+    mkdirSync(join(project, ".cursor"), { recursive: true });
+    writeFileSync(join(project, ".cursor", "mcp.json"), JSON.stringify({ mcpServers: {} }));
+
+    const diagnostic = diagnoseMemoryConfig(
+      { MEMORY_PROJECT_ROOT: project, MEMORY_VAULT_PATH: externalVault } as NodeJS.ProcessEnv,
+      tmpRoot,
+    );
+    const doctor = (diagnostic as any).doctor;
+    const codes = doctor.issues.map((issue: { code: string }) => issue.code);
+
+    assert.equal(doctor.ok, false);
+    assert.equal(doctor.checks.vaultRootExists, true);
+    assert.equal(doctor.checks.vaultHasAgentRules, false);
+    assert.equal(doctor.checks.vaultWithinProject, false);
+    assert.ok(codes.includes("VAULT_AGENT_RULES_MISSING"));
+    assert.ok(codes.includes("VAULT_OUTSIDE_PROJECT"));
+    assert.ok(codes.includes("CLIENT_CONFIG_MISSING_PROJECT_MEMORY"));
+
+    const missingRules = doctor.issues.find((issue: { code: string }) => issue.code === "VAULT_AGENT_RULES_MISSING");
+    assert.equal(missingRules.remediation.path, join(externalVault, "AGENTS.md"));
+    assert.match(missingRules.remediation.summary, /Create/);
+
+    const cursorIssue = doctor.issues.find(
+      (issue: { code: string; client?: string }) =>
+        issue.code === "CLIENT_CONFIG_MISSING_PROJECT_MEMORY" && issue.client === "cursor",
+    );
+    assert.equal(cursorIssue.remediation.path, join(project, ".cursor", "mcp.json"));
+    assert.match(cursorIssue.remediation.snippet, /"project-memory"/);
+    assert.match(cursorIssue.remediation.snippet, /"MEMORY_PROJECT_ROOT": "dynamic"/);
+
+    const cursor = doctor.clients.find((client: { client: string }) => client.client === "cursor");
+    assert.equal(cursor.configured, false);
+    assert.equal(cursor.configs[0].exists, true);
+    assert.deepEqual(cursor.issues, ["CLIENT_CONFIG_MISSING_PROJECT_MEMORY"]);
+  });
 });
 
 describe("resolveDynamicProjectRoot priority order", () => {
