@@ -39,10 +39,30 @@ describe("HttpEmbedder", () => {
     const embedder = new HttpEmbedder({ endpoint: "http://x/embeddings", model: "m", fetchImpl });
     const [v] = await embedder.embed(["hi"]);
     assert.equal(seenUrl, "http://x/embeddings");
+    // No dimensions configured -> no `dimensions` request field, and dims 0 in the id.
     assert.deepEqual(seenBody, { model: "m", input: ["hi"] });
     assert.ok(Math.abs(Math.hypot(...v) - 1) < 1e-9, "vector is normalized");
     assert.ok(Math.abs(v[0] - 0.6) < 1e-9);
-    assert.equal(embedder.id, "http:m");
+    assert.equal(embedder.id, "http:m:0");
+  });
+
+  it("sends `dimensions` and keys its id on it when explicitly configured", async () => {
+    let seenBody: unknown;
+    const fetchImpl = (async (_url: string, init: RequestInit) => {
+      seenBody = JSON.parse(String(init.body));
+      return response({ data: [{ embedding: [1, 0] }] });
+    }) as unknown as typeof fetch;
+    const embedder = new HttpEmbedder({ endpoint: "http://x", model: "m", dimensions: 512, fetchImpl });
+    await embedder.embed(["hi"]);
+    assert.deepEqual(seenBody, { model: "m", input: ["hi"], dimensions: 512 });
+    // A dim change must invalidate cached vectors via the embedder signature.
+    assert.equal(embedder.id, "http:m:512");
+  });
+
+  it("throws a descriptive error when returned vectors differ in length", async () => {
+    const fetchImpl = (async () => response({ data: [{ embedding: [1, 2, 3] }, { embedding: [1, 2] }] })) as unknown as typeof fetch;
+    const embedder = new HttpEmbedder({ endpoint: "http://x", model: "m", fetchImpl });
+    await assert.rejects(() => embedder.embed(["a", "b"]), /differing lengths \(3 vs 2\)/);
   });
 
   it("sends a bearer token only when an apiKey is set", async () => {

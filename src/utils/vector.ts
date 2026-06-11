@@ -15,13 +15,16 @@ export function l2normalize(v: number[]): number[] {
 }
 
 /**
- * Cosine similarity in [-1, 1]; 0 when either vector is empty or zero-length.
- * Computes its own magnitudes so it is correct for un-normalized inputs too.
+ * Cosine similarity in [-1, 1]; 0 when either vector is empty or zero, and 0
+ * when the lengths differ — mismatched dimensions mean different embedding
+ * spaces, and silently truncating to the shorter length would produce a
+ * meaningless score. Computes its own magnitudes so it is correct for
+ * un-normalized inputs too.
  */
 export function cosine(a: number[], b: number[]): number {
-  const n = Math.min(a.length, b.length);
+  if (a.length !== b.length) return 0;
   let dot = 0;
-  for (let i = 0; i < n; i += 1) dot += a[i] * b[i];
+  for (let i = 0; i < a.length; i += 1) dot += a[i] * b[i];
   let na = 0;
   for (const x of a) na += x * x;
   let nb = 0;

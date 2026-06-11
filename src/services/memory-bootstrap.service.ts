@@ -45,13 +45,32 @@ export interface BootstrapProjectOptions {
   ideConfigs?: boolean;
 }
 
+/**
+ * Resolve the runnable MCP server bundle at `<packageRoot>/dist/index.js`.
+ *
+ * `import.meta.url` points at different depths depending on how this module is
+ * loaded (bundled: `dist/index.js`; tsc test build: `dist-test/src/services/`;
+ * raw source: `src/services/`), so a fixed number of `..` segments cannot work.
+ * Instead walk up to the nearest directory containing `package.json` (the
+ * package root — `dist/` itself never contains one) and join `dist/index.js`.
+ */
+export function resolveServerEntrypoint(moduleUrl: string = import.meta.url): string {
+  let dir = dirname(fileURLToPath(moduleUrl));
+  while (!existsSync(join(dir, "package.json"))) {
+    const parent = dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return resolve(dir, "dist", "index.js").replace(/\\/g, "/");
+}
+
 export class MemoryBootstrapService {
   private readonly projectRoot: string;
   private readonly serverEntrypoint: string;
 
   constructor(private readonly vaultRoot: string) {
     this.projectRoot = dirname(resolve(vaultRoot));
-    this.serverEntrypoint = resolve(dirname(fileURLToPath(import.meta.url)), "..", "index.js").replace(/\\/g, "/");
+    this.serverEntrypoint = resolveServerEntrypoint();
   }
 
   bootstrap(options: BootstrapProjectOptions = {}) {
@@ -112,6 +131,16 @@ export class MemoryBootstrapService {
     return "created";
   }
 
+  /**
+   * Literal absolute root of the project being bootstrapped, posix-normalized
+   * for config files. Pinning beats the `dynamic` sentinel: MCP clients spawn
+   * servers from their own install dir, so auto-detection can route writes to
+   * the wrong workspace. `dynamic` stays available as a documented opt-in.
+   */
+  private projectRootEnv() {
+    return this.projectRoot.replace(/\\/g, "/");
+  }
+
   private projectIntegrationFiles(projectName: string): Array<[string, string]> {
     const mcpJson = {
       mcpServers: {
@@ -119,7 +148,7 @@ export class MemoryBootstrapService {
           command: "node",
           args: [this.serverEntrypoint],
           env: {
-            MEMORY_PROJECT_ROOT: "dynamic",
+            MEMORY_PROJECT_ROOT: this.projectRootEnv(),
           },
         },
       },
@@ -141,7 +170,7 @@ export class MemoryBootstrapService {
           command: ["node", this.serverEntrypoint],
           enabled: true,
           environment: {
-            MEMORY_PROJECT_ROOT: "dynamic",
+            MEMORY_PROJECT_ROOT: this.projectRootEnv(),
           },
         },
       },
@@ -163,7 +192,7 @@ export class MemoryBootstrapService {
             command: "node",
             args: [this.serverEntrypoint],
             env: {
-              MEMORY_PROJECT_ROOT: "dynamic",
+              MEMORY_PROJECT_ROOT: this.projectRootEnv(),
             },
           },
         },
@@ -215,7 +244,8 @@ export class MemoryBootstrapService {
       "enabled = true",
       "",
       "[mcp_servers.project-memory.env]",
-      "MEMORY_PROJECT_ROOT = \"dynamic\"",
+      "# Pinned to this project's absolute root. Set to \"dynamic\" to opt into workspace auto-detection instead.",
+      `MEMORY_PROJECT_ROOT = ${this.tomlString(this.projectRootEnv())}`,
       "",
     ].join("\n");
   }
@@ -269,7 +299,7 @@ export class MemoryBootstrapService {
       "",
       "## Routing",
       "",
-      "`MEMORY_PROJECT_ROOT` is `dynamic`. The first `memory_*` call returns `vaultRoot`; it must point at this workspace's `memory/` directory. If it points at another project, stop before editing files and report the bad route.",
+      `\`MEMORY_PROJECT_ROOT\` is pinned to this project's absolute root (\`${this.projectRootEnv()}\`) in the generated MCP configs; set it to \`dynamic\` to opt into workspace auto-detection instead. The first \`memory_*\` call returns \`vaultRoot\`; it must point at this workspace's \`memory/\` directory. If it points at another project, stop before editing files and report the bad route.`,
       "",
       ...this.alwaysOnMemoryProtocol(),
       "",
@@ -547,6 +577,10 @@ export class MemoryBootstrapService {
         "- `../.antigravity/mcp.json`: Google Antigravity project MCP configuration.",
         "- `../.antigravity/mcp_config.json`: Google Antigravity compatibility MCP configuration.",
         "- `../.antigravity/mcp.example.json`: Google Antigravity MCP example for user-level import.",
+        "",
+        "## MEMORY_PROJECT_ROOT",
+        "",
+        "Generated MCP configs pin `MEMORY_PROJECT_ROOT` to this project's absolute root so the server always routes to this vault, regardless of the client's spawn directory. Set it to `dynamic` in any config to opt into workspace auto-detection instead.",
         "",
         "## Required Flow",
         "",

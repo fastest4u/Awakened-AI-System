@@ -1,3 +1,4 @@
+import { searchTokens } from "../utils/ngram.js";
 import type { AuditService } from "./audit.service.js";
 import type { MemoryFollowUpService } from "./memory-follow-up.service.js";
 import type { MemoryLifecycleService } from "./memory-lifecycle.service.js";
@@ -10,6 +11,13 @@ import type { VaultHealthService } from "./vault-health.service.js";
 import type { VaultService } from "./vault.service.js";
 
 type ContextPackMode = "auto" | "coding" | "debugging" | "review" | "deploy" | "planning" | "docs";
+
+/** Record shape returned by MemoryQueryService.snapshotIndex(). */
+type IndexedRecord = Awaited<ReturnType<MemoryQueryService["snapshotIndex"]>>[number];
+
+/** Multiplier lifting a BM25 rank score above the type-weight scale (max ~17),
+ *  so genuine relevance always outranks a type-weight-only admission. */
+const RANK_SCORE_SCALE = 10;
 
 interface ContextPackIncludes {
   includeRecentSessions: boolean;
@@ -111,6 +119,21 @@ const CONTEXT_PACK_PRESETS: Record<ContextPackMode, ContextPackPreset> = {
   },
 };
 
+/**
+ * Auto-mode inference keywords, checked in order. English keywords match whole
+ * tokens only (so "pr" no longer matches "project", nor "prod" "product");
+ * Thai keywords and multi-word phrases match as substrings because Thai is
+ * written without word separators.
+ */
+const MODE_KEYWORDS: Array<{ mode: Exclude<ContextPackMode, "auto">; keywords: string[] }> = [
+  { mode: "deploy", keywords: ["deploy", "production", "prod", "release", "rollback", "migration", "database", "schema", "ดีพลอย", "ปล่อย", "รีลีส"] },
+  { mode: "debugging", keywords: ["debug", "bug", "error", "exception", "failure", "failing", "regression", "broken", "fix", "ดีบัก", "แก้บั๊ก", "บั๊ก"] },
+  { mode: "review", keywords: ["review", "audit", "pr", "pull request", "risk", "quality", "regression test", "รีวิว", "ตรวจโค้ด"] },
+  { mode: "docs", keywords: ["docs", "documentation", "readme", "guide", "setup", "reference", "protocol", "เอกสาร"] },
+  { mode: "planning", keywords: ["plan", "roadmap", "design", "architecture", "prioritize", "strategy", "decide", "วางแผน", "แผน"] },
+  { mode: "coding", keywords: ["code", "implement", "build", "feature", "refactor", "test", "api", "component", "typescript", "เขียนโค้ด", "พัฒนา"] },
+];
+
 export class MemoryWorkflowService {
   constructor(
     private readonly vault: VaultService,
@@ -127,28 +150,38 @@ export class MemoryWorkflowService {
 
   async sessionStart(input: { taskArea?: string; mode?: ContextPackMode; recentLimit: number; maxItems: number; maxChars: number }) {
     const lifecycleStart = this.lifecycle.start({ taskArea: input.taskArea });
-    const contextPack = await this.contextPack({
+    const pack = await this.contextPack({
       query: input.taskArea,
       taskArea: input.taskArea,
       mode: input.mode,
       maxItems: input.maxItems,
       maxChars: input.maxChars,
     });
-    const coreFiles = ["AGENTS.md", "AGENT-IDENTITY.md", "00_Index/MOC-Home.md", "00_Index/Goals.md", "00_Index/Open-Followups.md"];
+    // followUps/lifecycle/recommendedReads are kept ONCE at top level; the
+    // embedded pack must not serialize duplicate copies of them.
+    const { followUps, lifecycle, ...contextPack } = pack;
+    const { recommendedReads, ...mode } = pack.mode;
 
     return {
       vaultRoot: this.vault.vaultRoot,
-      files: contextPack.totalIndexed,
-      coreFiles: coreFiles.map((path) => ({ path, exists: this.vault.exists(path) })),
-      contextPack,
-      followUps: contextPack.followUps,
-      lifecycle: { session: contextPack.lifecycle.session, warnings: this.uniqueStrings([...lifecycleStart.warnings, ...contextPack.lifecycle.warnings]) },
-      recommendedReads: contextPack.mode.recommendedReads,
+      files: pack.totalIndexed,
+      coreFiles: this.coreFileStatus(),
+      contextPack: { ...contextPack, mode },
+      followUps,
+      lifecycle: { session: lifecycle.session, warnings: this.uniqueStrings([...lifecycleStart.warnings, ...lifecycle.warnings]) },
+      recommendedReads,
     };
   }
 
   async contextPack(input: ContextPackInput) {
     const lifecycle = this.lifecycle.recordContextPack({ query: input.query, taskArea: input.taskArea });
+    const pack = await this.buildContextPack(input);
+    return { ...pack, lifecycle };
+  }
+
+  /** Pack construction without lifecycle recording, so read-only callers
+   *  (memory_awaken) can build context without mutating the active session. */
+  private async buildContextPack(input: ContextPackInput) {
     const mode = this.resolveContextMode(input.mode, input.query, input.taskArea);
     const preset = CONTEXT_PACK_PRESETS[mode.resolved];
     const includes = this.effectiveIncludes(input, preset);
@@ -158,16 +191,24 @@ export class MemoryWorkflowService {
       mode: mode.resolved,
       limit: 8,
     });
-    const records = await this.query.snapshotIndex();
     const queryTerms = this.queryTerms(input.query, input.taskArea);
     const scoringTerms = this.uniqueTerms([...queryTerms, ...preset.extraTerms]);
+    // rank terms add Thai/CJK n-grams so non-space-delimited body text is
+    // reachable by BM25; rankFor dedupes and applies the capped usage boost.
+    const rankTerms = this.uniqueTerms([...searchTokens(`${input.query ?? ""} ${input.taskArea ?? ""}`), ...preset.extraTerms]);
+    const rankScores: Record<string, number> = scoringTerms.length > 0 ? await this.query.rankFor(rankTerms) : {};
+    const records = await this.query.snapshotIndex();
     const scored = records
       .filter((record) => this.shouldInclude(record.type, includes))
+      // Relevance gate: when scoring terms exist, type weight alone must not
+      // admit a record — it needs a BM25 match or a direct title/path/tag hit.
+      .filter((record) => scoringTerms.length === 0
+        || (rankScores[record.path] ?? 0) > 0
+        || this.hasDirectTermHit(record, scoringTerms))
       .map((record) => ({
         record,
-        score: this.scoreRecord(record, scoringTerms, preset),
+        score: this.scoreRecord(record, preset, rankScores[record.path] ?? 0),
       }))
-      .filter((item) => item.score > 0 || scoringTerms.length === 0)
       .sort((a, b) => b.score - a.score || String(b.record.updatedAt).localeCompare(String(a.record.updatedAt)));
 
     const selected = [];
@@ -210,7 +251,6 @@ export class MemoryWorkflowService {
         updatedAt: usageState.updatedAt,
       },
       followUps,
-      lifecycle,
       retrievalRules: [
         "Use contextPack first; call memory_get only for selected paths that need full body.",
         "Prefer ADRs, runbooks, open mistakes, and recent sessions over broad vault reads.",
@@ -221,11 +261,25 @@ export class MemoryWorkflowService {
   }
 
   async awaken(input: { focus?: string }) {
-    const context = await this.sessionStart({ taskArea: input.focus, recentLimit: 5, maxItems: 12, maxChars: 6000 });
+    // Read-only assessment: builds the pack directly and only READS lifecycle
+    // state. Routing through sessionStart silently superseded the in-flight
+    // session, so awaken must never start, rotate, or end one.
+    const contextPack = await this.buildContextPack({
+      query: input.focus,
+      taskArea: input.focus,
+      maxItems: 12,
+      maxChars: 6000,
+    });
     const health = await this.health.verifyVault({ includeWarnings: true });
     return {
       focus: input.focus,
-      context,
+      context: {
+        vaultRoot: this.vault.vaultRoot,
+        files: contextPack.totalIndexed,
+        coreFiles: this.coreFileStatus(),
+        contextPack,
+      },
+      lifecycle: this.lifecycle.status({}),
       health: {
         ok: health.ok,
         score: health.score,
@@ -233,17 +287,23 @@ export class MemoryWorkflowService {
         errors: health.errors,
         warnings: health.warnings,
       },
-      nextActions: this.nextActions(health.errors, health.warnings, context.contextPack.selected.filter((item) => item.type === "mistake").length),
+      nextActions: this.nextActions(health.errors, health.warnings, contextPack.selected.filter((item) => item.type === "mistake").length),
     };
   }
 
   async selfCheck(input: { task: string; area?: string; riskLevel: "low" | "medium" | "high" }) {
     const lifecycle = this.lifecycle.recordSelfCheck(input);
+    const terms = this.uniqueTerms(searchTokens(`${input.task} ${input.area ?? ""}`));
+    const rankScores: Record<string, number> = terms.length > 0 ? await this.query.rankFor(terms) : {};
     const records = await this.query.snapshotIndex();
-    const area = input.area?.toLowerCase();
-    const matchingMistakes = area
-      ? records.filter((record) => record.type === "mistake" && `${record.path} ${record.title} ${record.tags.join(" ")}`.toLowerCase().includes(area)).slice(0, 10)
-      : records.filter((record) => record.type === "mistake").slice(0, 5);
+    // Compact projection only — raw StoredRecords (searchText/mtimeMs/vector)
+    // must never reach the wire. Ranked matches first, then newest.
+    const matchingMistakes = records
+      .filter((record) => record.type === "mistake")
+      .map((record) => ({ record, score: Math.round((rankScores[record.path] ?? 0) * 10) / 10 }))
+      .sort((a, b) => b.score - a.score || String(b.record.updatedAt).localeCompare(String(a.record.updatedAt)))
+      .slice(0, input.area ? 10 : 5)
+      .map((item) => this.compactRecord(item.record, item.score));
 
     return {
       task: input.task,
@@ -271,7 +331,9 @@ export class MemoryWorkflowService {
         fromFolder: "05_Agent_Session_Logs",
         targetFolder: "07_Insights",
         maxSessions: 30,
-        minSessions: 1,
+        // minSessions 1 rewrote the digest on EVERY sessionEnd; require a real
+        // backlog before churning it (compact() reports candidateCount/paths).
+        minSessions: 5,
         dryRun: false,
       });
     const health = input.verify === false
@@ -341,20 +403,29 @@ export class MemoryWorkflowService {
       .filter((term) => term.length > 1);
   }
 
-  private scoreRecord(record: Awaited<ReturnType<MemoryQueryService["snapshotIndex"]>>[number], terms: string[], preset: ContextPackPreset) {
-    let score = 0;
+  private scoreRecord(record: IndexedRecord, preset: ContextPackPreset, rankScore: number) {
     const haystack = `${record.path} ${record.title} ${record.type} ${record.tags.join(" ")} ${record.aliases.join(" ")} ${record.excerpt}`.toLowerCase();
-    for (const term of terms) {
-      if (record.title.toLowerCase().includes(term)) score += 8;
-      if (record.path.toLowerCase().includes(term)) score += 6;
-      if (record.tags.some((tag) => tag.toLowerCase().includes(term))) score += 5;
-      if (haystack.includes(term)) score += 3;
-    }
-    score += this.typeWeight(record.type, preset);
-    score += this.usage.scoreBoost(record.path, terms);
+    // rankFor already folds in the capped usage boost, so no per-record
+    // usage.scoreBoost call (that re-read usage.json once per record).
+    let score = rankScore * RANK_SCORE_SCALE + this.typeWeight(record.type, preset);
     if (record.type === "mistake" && !haystack.includes("resolved")) score += 5;
     if (record.type === "adr" && !haystack.includes("superseded")) score += 4;
-    return score;
+    return Math.round(score * 10) / 10;
+  }
+
+  /** Direct (substring) term hit on title/path/tags — the gate's second door
+   *  for notes whose match is narrower than a BM25 token (e.g. "auth" inside
+   *  "authentication"). */
+  private hasDirectTermHit(record: IndexedRecord, terms: string[]) {
+    const title = record.title.toLowerCase();
+    const path = record.path.toLowerCase();
+    const tags = record.tags.map((tag) => tag.toLowerCase());
+    return terms.some((term) => title.includes(term) || path.includes(term) || tags.some((tag) => tag.includes(term)));
+  }
+
+  private coreFileStatus() {
+    const coreFiles = ["AGENTS.md", "AGENT-IDENTITY.md", "00_Index/MOC-Home.md", "00_Index/Goals.md", "00_Index/Open-Followups.md"];
+    return coreFiles.map((path) => ({ path, exists: this.vault.exists(path) }));
   }
 
   private typeWeight(type: string, preset: ContextPackPreset) {
@@ -376,30 +447,25 @@ export class MemoryWorkflowService {
     return (weights[type] ?? 1) + (preset.typeWeights[type] ?? 0);
   }
 
-  private resolveContextMode(mode: ContextPackMode | undefined, query?: string, taskArea?: string) {
+  private resolveContextMode(mode: ContextPackMode | undefined, query?: string, taskArea?: string): { requested: ContextPackMode; resolved: ContextPackMode } {
     const requested = mode ?? "auto";
     if (requested !== "auto") return { requested, resolved: requested };
 
     const text = `${query ?? ""} ${taskArea ?? ""}`.toLowerCase();
-    if (this.hasAny(text, ["deploy", "production", "prod", "release", "rollback", "migration", "database", "schema"])) {
-      return { requested, resolved: "deploy" as const };
+    const tokens = new Set(text.split(/[^a-z0-9ก-๙_-]+/i).filter(Boolean));
+    for (const candidate of MODE_KEYWORDS) {
+      if (candidate.keywords.some((keyword) => this.matchesKeyword(tokens, text, keyword))) {
+        return { requested, resolved: candidate.mode };
+      }
     }
-    if (this.hasAny(text, ["debug", "bug", "error", "exception", "failure", "failing", "regression", "broken", "fix"])) {
-      return { requested, resolved: "debugging" as const };
-    }
-    if (this.hasAny(text, ["review", "audit", "pr", "pull request", "risk", "quality", "regression test"])) {
-      return { requested, resolved: "review" as const };
-    }
-    if (this.hasAny(text, ["docs", "documentation", "readme", "guide", "setup", "reference", "protocol"])) {
-      return { requested, resolved: "docs" as const };
-    }
-    if (this.hasAny(text, ["plan", "roadmap", "design", "architecture", "prioritize", "strategy", "decide"])) {
-      return { requested, resolved: "planning" as const };
-    }
-    if (this.hasAny(text, ["code", "implement", "build", "feature", "refactor", "test", "api", "component", "typescript"])) {
-      return { requested, resolved: "coding" as const };
-    }
-    return { requested, resolved: "auto" as const };
+    return { requested, resolved: "auto" };
+  }
+
+  /** Thai keywords and multi-word phrases cannot be token-matched (Thai has no
+   *  word separators), so they fall back to substring matching on the raw text. */
+  private matchesKeyword(tokens: Set<string>, text: string, keyword: string) {
+    if (keyword.includes(" ") || /[ก-๙]/.test(keyword)) return text.includes(keyword);
+    return tokens.has(keyword);
   }
 
   private effectiveIncludes(input: ContextPackInput, preset: ContextPackPreset): ContextPackIncludes {
@@ -426,11 +492,10 @@ export class MemoryWorkflowService {
     return [...new Set(values.filter((value) => value.length > 0))];
   }
 
-  private hasAny(text: string, terms: string[]) {
-    return terms.some((term) => text.includes(term));
-  }
-
-  private compactRecord(record: Awaited<ReturnType<MemoryQueryService["snapshotIndex"]>>[number], score: number) {
+  /** Wire shape for one selected note. No usage telemetry: the per-note usage
+   *  record (up to a 3KB contexts map) billed against maxChars and displaced
+   *  real excerpts — the score already reflects the usage boost. */
+  private compactRecord(record: IndexedRecord, score: number) {
     return {
       path: record.path,
       title: record.title,
@@ -438,7 +503,6 @@ export class MemoryWorkflowService {
       score,
       tags: record.tags.slice(0, 6),
       updatedAt: record.updatedAt,
-      usage: this.usage.statsFor(record.path),
       excerpt: this.truncate(record.excerpt, record.type === "session-log" ? 180 : 260),
     };
   }

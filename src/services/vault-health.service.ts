@@ -7,8 +7,9 @@ import {
 import type { FrontmatterDiagnostic } from "../utils/frontmatter.js";
 import { parseFrontmatter } from "../utils/frontmatter.js";
 import { canonicalizeFrontmatter, validateFrontmatter } from "../utils/frontmatter-schema.js";
-import { extractWikilinks } from "../utils/links.js";
+import { buildWikilinkResolver, extractWikilinks } from "../utils/links.js";
 import { asStringArray, basenameWithoutExtension, inferTypeFromPath } from "../utils/memory-format.js";
+import { charNgrams } from "../utils/ngram.js";
 import type { VaultService } from "./vault.service.js";
 
 export interface VaultIssue {
@@ -20,6 +21,13 @@ export interface VaultIssue {
   field?: string;
   suggestion?: string;
   autoFixAvailable?: boolean;
+}
+
+/** Which per-note checks `verifyNote` runs; every flag defaults to true. */
+export interface VerifyNoteOptions {
+  checkLinks?: boolean;
+  checkFrontmatter?: boolean;
+  checkStaleness?: boolean;
 }
 
 interface NoteHealthRecord {
@@ -78,7 +86,8 @@ export class VaultHealthService {
     };
   }
 
-  async verifyNote(reference: string) {
+  async verifyNote(reference: string, options: VerifyNoteOptions = {}) {
+    const { checkFrontmatter = true, checkLinks = true, checkStaleness = true } = options;
     const notes = await this.readNotes();
     const note = notes.find((item) => item.path === reference || item.base === basenameWithoutExtension(reference));
     if (!note) {
@@ -88,7 +97,15 @@ export class VaultHealthService {
       };
     }
 
-    const issues = this.collectIssues(notes).filter((issue) => issue.path === note.path);
+    // Scoped to the one note: its frontmatter, its outgoing links (resolved
+    // against a vault-wide map built once), and its staleness — not a
+    // full-vault verification filtered down to one path.
+    const issues: VaultIssue[] = [];
+    if (!this.isSemanticExempt(note.path)) {
+      if (checkFrontmatter) issues.push(...this.collectNoteFrontmatterIssues(note));
+      if (checkLinks) issues.push(...this.collectNoteBrokenLinks(note, this.buildLinkResolver(notes)));
+    }
+    if (checkStaleness) issues.push(...this.collectNoteStalenessIssues(note));
     return {
       valid: issues.every((issue) => issue.severity !== "error" && issue.severity !== "critical"),
       issues,
@@ -102,23 +119,68 @@ export class VaultHealthService {
       .slice(0, limit);
   }
 
-  async findDuplicates() {
+  async findDuplicates(similarityThreshold = 0.85) {
     const notes = await this.readNotes();
     const byBase = new Map<string, string[]>();
     const byTitle = new Map<string, string[]>();
+    const titled: Array<{ path: string; title: string }> = [];
 
     for (const note of notes) {
       if (!["readme", "index", "_index"].includes(note.base.toLowerCase())) {
         this.pushMap(byBase, note.base.toLowerCase(), note.path);
       }
       const title = note.frontmatter?.title;
-      if (title) this.pushMap(byTitle, String(title).toLowerCase(), note.path);
+      if (title) {
+        this.pushMap(byTitle, String(title).toLowerCase(), note.path);
+        titled.push({ path: note.path, title: String(title) });
+      }
+    }
+
+    // Near-duplicate titles: frequency-aware Dice over character bigrams, so
+    // "Deploy Runbook" vs "Deploy Runbooks" registers while unrelated titles
+    // stay far below any sensible threshold. Exact (case-insensitive) matches
+    // are already reported under duplicateTitles, so they are skipped here.
+    const similarTitles: Array<{ paths: string[]; titles: string[]; similarity: number }> = [];
+    for (let i = 0; i < titled.length; i += 1) {
+      for (let j = i + 1; j < titled.length; j += 1) {
+        const a = titled[i];
+        const b = titled[j];
+        if (a.title.toLowerCase() === b.title.toLowerCase()) continue;
+        const similarity = this.titleSimilarity(a.title.toLowerCase(), b.title.toLowerCase());
+        if (similarity >= similarityThreshold) {
+          similarTitles.push({
+            paths: [a.path, b.path],
+            titles: [a.title, b.title],
+            similarity: Math.round(similarity * 1000) / 1000,
+          });
+        }
+      }
     }
 
     return {
       duplicateBasenames: [...byBase.entries()].filter(([, paths]) => paths.length > 1).map(([name, paths]) => ({ name, paths })),
       duplicateTitles: [...byTitle.entries()].filter(([, paths]) => paths.length > 1).map(([title, paths]) => ({ title, paths })),
+      similarTitles,
     };
+  }
+
+  /** Dice coefficient over character-bigram multisets of two (lowercased) titles. */
+  private titleSimilarity(a: string, b: string) {
+    if (a === b) return 1;
+    const gramsA = charNgrams(a, 2, 2);
+    const gramsB = charNgrams(b, 2, 2);
+    if (gramsA.length === 0 || gramsB.length === 0) return 0;
+    const counts = new Map<string, number>();
+    for (const gram of gramsA) counts.set(gram, (counts.get(gram) ?? 0) + 1);
+    let overlap = 0;
+    for (const gram of gramsB) {
+      const remaining = counts.get(gram) ?? 0;
+      if (remaining > 0) {
+        overlap += 1;
+        counts.set(gram, remaining - 1);
+      }
+    }
+    return (2 * overlap) / (gramsA.length + gramsB.length);
   }
 
   async checkStaleness(folders: string[] = [], olderThanDays = 90) {
@@ -181,37 +243,42 @@ export class VaultHealthService {
 
   private collectIssues(notes: NoteHealthRecord[]) {
     const issues: VaultIssue[] = [];
-
     for (const note of notes) {
       if (this.isSemanticExempt(note.path)) continue;
-      const isRootMeta = ["README", "AGENTS", "AGENT-IDENTITY"].includes(note.base) && !note.path.includes("/");
-
-      // Structural parse diagnostics (unclosed / duplicate-key / unquoted colon)
-      // are surfaced directly with their line numbers and suggestions.
-      const hasCritical = note.diagnostics.some((diagnostic) => diagnostic.severity === "critical");
-      for (const diagnostic of note.diagnostics) {
-        if (diagnostic.severity === "info") continue;
-        issues.push(this.toIssue(diagnostic, note.path));
-      }
-
-      // A file we cannot parse cannot be schema-validated meaningfully; skip the
-      // required-field checks so one YAML error does not cascade into noise.
-      if (hasCritical) continue;
-
-      const validationDiagnostics = validateFrontmatter(note.frontmatter ?? {}, {
-        type: inferTypeFromPath(note.path),
-        path: note.path,
-        hasFrontmatter: note.hasFrontmatter,
-        isExempt: isRootMeta,
-      });
-      for (const diagnostic of validationDiagnostics) {
-        if (diagnostic.severity === "info") continue;
-        issues.push(this.toIssue(diagnostic, note.path));
-      }
+      issues.push(...this.collectNoteFrontmatterIssues(note));
     }
-
     issues.push(...this.collectBrokenLinks(notes));
     issues.push(...this.collectDuplicateIssues(notes));
+    return issues;
+  }
+
+  /** Structural + schema frontmatter issues for ONE note. */
+  private collectNoteFrontmatterIssues(note: NoteHealthRecord): VaultIssue[] {
+    const issues: VaultIssue[] = [];
+    const isRootMeta = ["README", "AGENTS", "AGENT-IDENTITY"].includes(note.base) && !note.path.includes("/");
+
+    // Structural parse diagnostics (unclosed / duplicate-key / unquoted colon)
+    // are surfaced directly with their line numbers and suggestions.
+    const hasCritical = note.diagnostics.some((diagnostic) => diagnostic.severity === "critical");
+    for (const diagnostic of note.diagnostics) {
+      if (diagnostic.severity === "info") continue;
+      issues.push(this.toIssue(diagnostic, note.path));
+    }
+
+    // A file we cannot parse cannot be schema-validated meaningfully; skip the
+    // required-field checks so one YAML error does not cascade into noise.
+    if (hasCritical) return issues;
+
+    const validationDiagnostics = validateFrontmatter(note.frontmatter ?? {}, {
+      type: inferTypeFromPath(note.path),
+      path: note.path,
+      hasFrontmatter: note.hasFrontmatter,
+      isExempt: isRootMeta,
+    });
+    for (const diagnostic of validationDiagnostics) {
+      if (diagnostic.severity === "info") continue;
+      issues.push(this.toIssue(diagnostic, note.path));
+    }
     return issues;
   }
 
@@ -229,26 +296,61 @@ export class VaultHealthService {
   }
 
   private collectBrokenLinks(notes: NoteHealthRecord[]) {
-    const basenames = new Set(notes.map((note) => note.base));
-    const titles = new Set<string>();
-    const aliases = new Set<string>();
-
-    for (const note of notes) {
-      if (!note.frontmatter) continue;
-      if (note.frontmatter.title) titles.add(String(note.frontmatter.title).split(" - ")[0].trim());
-      for (const alias of asStringArray(note.frontmatter.aliases)) aliases.add(alias);
-    }
-
+    const resolveLink = this.buildLinkResolver(notes);
     const issues: VaultIssue[] = [];
     for (const note of notes) {
       if (this.isSemanticExempt(note.path)) continue;
-      for (const link of this.findWikilinks(note.raw)) {
-        if (basenames.has(link) || titles.has(link) || aliases.has(link)) continue;
-        if (PLACEHOLDER_LINKS.has(link)) continue;
-        if (link.includes("/") || link.startsWith(".")) continue;
-        if (/^(ADR|Mistake|YYYY-MM-DD|G-NNN|Runbook-NNN|Template-NNN|NNN)/.test(link)) continue;
-        issues.push({ severity: "warning", code: "BROKEN_WIKILINK", message: `Broken wikilink: [[${link}]]`, path: note.path });
-      }
+      issues.push(...this.collectNoteBrokenLinks(note, resolveLink));
+    }
+    return issues;
+  }
+
+  /**
+   * Vault-wide wikilink resolver with the shared index semantics
+   * (path/basename > title/id > aliases, case-insensitive, lexicographic
+   * tie-break), so this scan can never disagree with the backlink graph.
+   */
+  private buildLinkResolver(notes: NoteHealthRecord[]) {
+    return buildWikilinkResolver(notes.map((note) => ({
+      path: note.path,
+      title: note.frontmatter?.title === undefined ? undefined : String(note.frontmatter.title),
+      id: note.frontmatter?.id === undefined ? undefined : String(note.frontmatter.id),
+      aliases: asStringArray(note.frontmatter?.aliases),
+    })));
+  }
+
+  /**
+   * Broken outgoing wikilinks for ONE note. Targets resolve by full title (no
+   * " - " truncation), id, alias, basename, or vault-relative path — so a
+   * path-style link to a missing note is now flagged instead of skipped.
+   */
+  private collectNoteBrokenLinks(note: NoteHealthRecord, resolveLink: (target: string) => string | undefined): VaultIssue[] {
+    const issues: VaultIssue[] = [];
+    for (const link of this.findWikilinks(note.raw)) {
+      if (resolveLink(link)) continue;
+      if (PLACEHOLDER_LINKS.has(link)) continue;
+      if (/^(ADR|Mistake|YYYY-MM-DD|G-NNN|Runbook-NNN|Template-NNN|NNN)/.test(link)) continue;
+      issues.push({ severity: "warning", code: "BROKEN_WIKILINK", message: `Broken wikilink: [[${link}]]`, path: note.path });
+    }
+    return issues;
+  }
+
+  /** Staleness of ONE note's `updated` / `last-verified` dates, as advisory issues. */
+  private collectNoteStalenessIssues(note: NoteHealthRecord, olderThanDays = 90): VaultIssue[] {
+    const issues: VaultIssue[] = [];
+    for (const field of ["updated", "last-verified"] as const) {
+      const date = this.parseDate(note.frontmatter?.[field]);
+      if (!date) continue;
+      const ageDays = this.ageDays(date);
+      if (ageDays <= olderThanDays) continue;
+      issues.push({
+        severity: "warning",
+        code: "STALE_NOTE",
+        message: `'${field}' is ${ageDays} days old (older than ${olderThanDays} days)`,
+        path: note.path,
+        field,
+        suggestion: "Re-verify the note's content and refresh its date fields.",
+      });
     }
     return issues;
   }

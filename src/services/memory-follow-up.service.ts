@@ -1,3 +1,4 @@
+import { statSync } from "node:fs";
 import { basename } from "node:path";
 import { asStringArray, inferTypeFromPath } from "../utils/memory-format.js";
 import type { VaultService } from "./vault.service.js";
@@ -24,6 +25,13 @@ interface FollowUpCandidate {
   source: "checkbox" | "follow-up-section";
 }
 
+/** Cached per-file extraction; valid while the file's mtime AND size match. */
+interface CachedExtraction {
+  mtimeMs: number;
+  sizeBytes: number;
+  candidates: FollowUpCandidate[];
+}
+
 const MODE_TERMS: Record<FollowUpMode, string[]> = {
   auto: [],
   coding: ["code", "implementation", "api", "component", "service", "schema", "test"],
@@ -44,7 +52,27 @@ const MODE_WEIGHTS: Record<FollowUpMode, Record<string, number>> = {
   docs: { reference: 5, rules: 4, index: 3, runbook: 2 },
 };
 
+/**
+ * Auto-mode inference keywords, checked in order (kept aligned with the
+ * context-pack presets). English keywords match whole tokens only (so "pr" no
+ * longer matches "project", nor "prod" "product"); Thai keywords and
+ * multi-word phrases match as substrings because Thai is written without word
+ * separators.
+ */
+const MODE_KEYWORDS: Array<{ mode: Exclude<FollowUpMode, "auto">; keywords: string[] }> = [
+  { mode: "deploy", keywords: ["deploy", "production", "prod", "release", "rollback", "migration", "database", "schema", "ดีพลอย", "ปล่อย", "รีลีส"] },
+  { mode: "debugging", keywords: ["debug", "bug", "error", "exception", "failure", "failing", "regression", "broken", "fix", "ดีบัก", "แก้บั๊ก", "บั๊ก"] },
+  { mode: "review", keywords: ["review", "audit", "pr", "pull request", "risk", "quality", "regression test", "รีวิว", "ตรวจโค้ด"] },
+  { mode: "docs", keywords: ["docs", "documentation", "readme", "guide", "setup", "reference", "protocol", "เอกสาร"] },
+  { mode: "planning", keywords: ["plan", "roadmap", "design", "architecture", "prioritize", "strategy", "decide", "วางแผน", "แผน"] },
+  { mode: "coding", keywords: ["code", "implement", "build", "feature", "refactor", "test", "api", "component", "typescript", "เขียนโค้ด", "พัฒนา"] },
+];
+
 export class MemoryFollowUpService {
+  /** path -> cached follow-up extraction, so an unchanged file is not re-read
+   *  and re-parsed on every radar call. */
+  private readonly extractionCache = new Map<string, CachedExtraction>();
+
   constructor(private readonly vault: VaultService) {}
 
   async radar(input: FollowUpRadarInput) {
@@ -57,10 +85,19 @@ export class MemoryFollowUpService {
         score: this.score(candidate, terms, mode.resolved),
         matchedTerms: this.matchedTerms(candidate, terms),
       }))
-      .filter((candidate) => candidate.score > 0 || terms.length === 0)
       .sort((a, b) => b.score - a.score || String(b.updatedAt).localeCompare(String(a.updatedAt)));
 
-    const followUps = scored.slice(0, input.limit).map((candidate) => ({
+    // With query terms, an item matching NO term ranks strictly below every
+    // termed match (base score alone admitted everything before); if nothing
+    // matches at all, return none so the "none matched" guidance can fire.
+    let ordered = scored;
+    if (terms.length > 0) {
+      const matched = scored.filter((candidate) => candidate.matchedTerms.length > 0);
+      const unmatched = scored.filter((candidate) => candidate.matchedTerms.length === 0);
+      ordered = matched.length === 0 ? [] : [...matched, ...unmatched];
+    }
+
+    const followUps = ordered.slice(0, input.limit).map((candidate) => ({
       path: candidate.path,
       title: candidate.title,
       type: candidate.type,
@@ -100,21 +137,60 @@ export class MemoryFollowUpService {
   private async extractCandidates(folders: string[]) {
     const files = await this.vault.listMarkdownFiles();
     const candidates: FollowUpCandidate[] = [];
+    const seen = new Set<string>();
     let scannedFiles = 0;
 
     for (const file of files) {
       const path = this.vault.relativePath(file);
+      seen.add(path);
       if (folders.length > 0 && !folders.some((folder) => this.matchesFolder(path, folder))) continue;
       scannedFiles += 1;
-      const note = this.vault.load(path);
-      const title = String(note.parsed.data.title ?? basename(file, ".md"));
-      const type = String(note.parsed.data.type ?? inferTypeFromPath(path));
-      const tags = asStringArray(note.parsed.data.tags);
-      const updatedAt = String(note.parsed.data.updated ?? note.parsed.data["session-date"] ?? note.parsed.data.created ?? "");
-      candidates.push(...this.extractFromBody(note.parsed.content, { path, title, type, tags, updatedAt }));
+      candidates.push(...this.extractFile(file, path));
+    }
+
+    // Drop cache entries for files no longer in the vault.
+    for (const path of this.extractionCache.keys()) {
+      if (!seen.has(path)) this.extractionCache.delete(path);
     }
 
     return { candidates: this.dedupe(candidates), scannedFiles };
+  }
+
+  /** Follow-up candidates for one file, served from the mtime+size cache when
+   *  the file is unchanged (mtime AND size, so a same-millisecond rewrite is
+   *  still caught). Cached entries are never mutated by callers. */
+  private extractFile(fullPath: string, path: string): FollowUpCandidate[] {
+    const stat = this.statOf(fullPath);
+    const cached = this.extractionCache.get(path);
+    if (cached && stat && cached.mtimeMs === stat.mtimeMs && cached.sizeBytes === stat.sizeBytes) {
+      return cached.candidates;
+    }
+
+    let extracted: FollowUpCandidate[];
+    try {
+      const note = this.vault.load(path);
+      const title = String(note.parsed.data.title ?? basename(fullPath, ".md"));
+      const type = String(note.parsed.data.type ?? inferTypeFromPath(path));
+      const tags = asStringArray(note.parsed.data.tags);
+      const updatedAt = String(note.parsed.data.updated ?? note.parsed.data["session-date"] ?? note.parsed.data.created ?? "");
+      extracted = this.extractFromBody(note.parsed.content, { path, title, type, tags, updatedAt });
+    } catch {
+      // Transiently unreadable (deleted/locked between enumeration and read):
+      // fall back to the stale cached extraction rather than failing the radar.
+      return cached ? cached.candidates : [];
+    }
+
+    if (stat) this.extractionCache.set(path, { ...stat, candidates: extracted });
+    return extracted;
+  }
+
+  private statOf(fullPath: string): { mtimeMs: number; sizeBytes: number } | undefined {
+    try {
+      const stat = statSync(fullPath);
+      return { mtimeMs: stat.mtimeMs, sizeBytes: stat.size };
+    } catch {
+      return undefined;
+    }
   }
 
   private extractFromBody(body: string, metadata: Omit<FollowUpCandidate, "line" | "section" | "text" | "source">) {
@@ -185,30 +261,25 @@ export class MemoryFollowUpService {
     return terms.filter((term) => haystack.includes(term)).slice(0, 12);
   }
 
-  private resolveMode(mode: FollowUpMode | undefined, query?: string, taskArea?: string) {
+  private resolveMode(mode: FollowUpMode | undefined, query?: string, taskArea?: string): { requested: FollowUpMode; resolved: FollowUpMode } {
     const requested = mode ?? "auto";
     if (requested !== "auto") return { requested, resolved: requested };
 
     const text = `${query ?? ""} ${taskArea ?? ""}`.toLowerCase();
-    if (this.hasAny(text, ["deploy", "production", "prod", "release", "rollback", "migration", "database", "schema"])) {
-      return { requested, resolved: "deploy" as const };
+    const tokens = new Set(text.split(/[^a-z0-9ก-๙_-]+/i).filter(Boolean));
+    for (const candidate of MODE_KEYWORDS) {
+      if (candidate.keywords.some((keyword) => this.matchesKeyword(tokens, text, keyword))) {
+        return { requested, resolved: candidate.mode };
+      }
     }
-    if (this.hasAny(text, ["debug", "bug", "error", "exception", "failure", "failing", "regression", "broken", "fix"])) {
-      return { requested, resolved: "debugging" as const };
-    }
-    if (this.hasAny(text, ["review", "audit", "pr", "pull request", "risk", "quality", "regression test"])) {
-      return { requested, resolved: "review" as const };
-    }
-    if (this.hasAny(text, ["docs", "documentation", "readme", "guide", "setup", "reference", "protocol"])) {
-      return { requested, resolved: "docs" as const };
-    }
-    if (this.hasAny(text, ["plan", "roadmap", "design", "architecture", "prioritize", "strategy", "decide"])) {
-      return { requested, resolved: "planning" as const };
-    }
-    if (this.hasAny(text, ["code", "implement", "build", "feature", "refactor", "test", "api", "component", "typescript"])) {
-      return { requested, resolved: "coding" as const };
-    }
-    return { requested, resolved: "auto" as const };
+    return { requested, resolved: "auto" };
+  }
+
+  /** Thai keywords and multi-word phrases cannot be token-matched (Thai has no
+   *  word separators), so they fall back to substring matching on the raw text. */
+  private matchesKeyword(tokens: Set<string>, text: string, keyword: string) {
+    if (keyword.includes(" ") || /[ก-๙]/.test(keyword)) return text.includes(keyword);
+    return tokens.has(keyword);
   }
 
   private recommendedActions(returned: number, totalOpen: number) {
@@ -274,9 +345,5 @@ export class MemoryFollowUpService {
     if (ageDays <= 7) return 2;
     if (ageDays <= 30) return 1;
     return 0;
-  }
-
-  private hasAny(text: string, terms: string[]) {
-    return terms.some((term) => text.includes(term));
   }
 }

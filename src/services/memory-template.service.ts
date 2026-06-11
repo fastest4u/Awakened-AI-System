@@ -28,14 +28,16 @@ export interface SessionLogTemplateInput {
   verification?: string;
 }
 
+const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
+
 export class MemoryTemplateService {
   sessionLogPath(input: SessionLogTemplateInput) {
-    const date = input.date ?? todayIso();
+    const date = this.safeDate(input.date, "date");
     return `${TYPE_FOLDERS["session-log"]}/${date}-${slugify(input.topic)}.md`;
   }
 
   sessionLog(input: SessionLogTemplateInput) {
-    const date = input.date ?? todayIso();
+    const date = this.safeDate(input.date, "date");
     const outcomes = input.outcomes ?? [];
     const filesTouched = input.filesTouched ?? [];
     const decisionsMade = input.decisionsMade ?? [];
@@ -85,11 +87,29 @@ export class MemoryTemplateService {
       "|---|---|---|---|",
       ...(
         confidenceLog.length
-          ? confidenceLog.map((item) => `| ${item.claim} | ${item.statedConfidence} | ${item.actualResult} | ${item.lesson} |`)
+          ? confidenceLog.map((item) =>
+            `| ${this.tableCell(item.claim)} | ${this.tableCell(item.statedConfidence)} | ${this.tableCell(item.actualResult)} | ${this.tableCell(item.lesson)} |`)
           : ["| None | n/a | n/a | n/a |"]
       ),
       "",
     ].join("\n");
+  }
+
+  /** Escape characters that break a one-row markdown table cell. */
+  private tableCell(value: string) {
+    return value.replace(/\r?\n/g, " ").replace(/\|/g, "\\|");
+  }
+
+  /**
+   * Validate a caller-supplied date. Anything that is not strict YYYY-MM-DD
+   * falls back to today with a stderr warning — the raw value must never reach
+   * a file path ("2026/06/10" nests folders; ":" is EINVAL on Windows).
+   */
+  private safeDate(value: string | undefined, field: string) {
+    if (value === undefined) return todayIso();
+    if (ISO_DATE.test(value)) return value;
+    console.error(`[memory-mcp] ${field} ${JSON.stringify(value)} is not YYYY-MM-DD; using today's date instead.`);
+    return todayIso();
   }
 
   insight(title: string, content: string, confidence: string, derivedFrom: string[], tags: string[]) {
@@ -118,17 +138,18 @@ export class MemoryTemplateService {
     avoidance: string;
     references: string[];
   }) {
+    const occurredDate = this.safeDate(input.occurredDate, "occurredDate");
     return frontmatter({
       title: input.title,
       type: "mistake",
       severity: input.severity,
       status: "open",
-      "occurred-date": input.occurredDate,
+      "occurred-date": occurredDate,
       agent: input.agent,
       area: input.area,
       confidence: input.confidence,
-      created: input.occurredDate,
-      updated: input.occurredDate,
+      created: occurredDate,
+      updated: occurredDate,
       tags: [`area/${input.area}`, "topic/memory-vault"],
     }) + [
       "## Problem",
@@ -157,15 +178,16 @@ export class MemoryTemplateService {
     supersedes: string[];
     tags: string[];
   }) {
+    const decisionDate = this.safeDate(input.decisionDate, "decisionDate");
     return frontmatter({
       title: input.title,
       type: "adr",
       status: input.status,
-      "decision-date": input.decisionDate,
+      "decision-date": decisionDate,
       confidence: input.confidence,
       supersedes: input.supersedes,
-      created: input.decisionDate,
-      updated: input.decisionDate,
+      created: decisionDate,
+      updated: decisionDate,
       tags: input.tags,
     }) + [
       "## Context",
@@ -182,7 +204,7 @@ export class MemoryTemplateService {
 
   fromTemplate(template: string, values: Record<string, unknown>) {
     const title = String(values.title ?? values.name ?? "Untitled");
-    const date = String(values.date ?? todayIso());
+    const date = this.safeDate(values.date === undefined ? undefined : String(values.date), "date");
     const content = String(values.content ?? "");
 
     if (template === "session-log") {

@@ -56,22 +56,17 @@ export function charNgrams(run: string, minN = MIN_N, maxN = MAX_N): string[] {
 
 /**
  * Word tokens plus character n-grams for any non-space-delimited (Thai/CJK)
- * runs in the text. De-duplicates the appended n-grams; word tokens keep their
- * multiplicity (BM25 term frequency depends on it). Returns the plain word
- * tokens unchanged when the text has no such runs.
+ * runs in the text. Every n-gram occurrence is kept (NOT de-duplicated): BM25
+ * term frequency needs a keyword appearing 10x to emit its grams 10x, or that
+ * document ranks no higher than one mentioning it once. Query-side callers
+ * that want a distinct term list must dedupe it themselves. Returns the plain
+ * word tokens unchanged when the text has no such runs.
  */
 export function searchTokens(text: unknown): string[] {
   const words = tokenize(text);
   const runs = String(text ?? "").toLowerCase().match(CJK_THAI_RUN);
   if (!runs) return words;
   const out = [...words];
-  const seen = new Set<string>();
-  for (const run of runs) {
-    for (const gram of charNgrams(run)) {
-      if (seen.has(gram)) continue;
-      seen.add(gram);
-      out.push(gram);
-    }
-  }
+  for (const run of runs) out.push(...charNgrams(run));
   return out;
 }

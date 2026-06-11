@@ -23,7 +23,11 @@ export class VerifyController {
 
   async verifyNote(input: z.infer<typeof verifyNoteInputSchema>) {
     const startedAt = Date.now();
-    const result = await this.health.verifyNote(input.path);
+    const result = await this.health.verifyNote(input.path, {
+      checkLinks: input.checkLinks,
+      checkFrontmatter: input.checkFrontmatter,
+      checkStaleness: input.checkStaleness,
+    });
     return this.responses.buildOk("memory_verifyNote", startedAt, result);
   }
 
@@ -41,7 +45,7 @@ export class VerifyController {
 
   async findDuplicates(input: z.infer<typeof findDuplicatesInputSchema>) {
     const startedAt = Date.now();
-    const duplicates = await this.health.findDuplicates();
+    const duplicates = await this.health.findDuplicates(input.similarityThreshold);
     return this.responses.buildOk("memory_findDuplicates", startedAt, { duplicates, scope: input.scope, similarityThreshold: input.similarityThreshold });
   }
 

@@ -17,6 +17,7 @@ import {
   defaultFrontmatterSchema,
   planSchemaMigration,
   validateFrontmatter,
+  CURRENT_SCHEMA_VERSION,
   FRONTMATTER_SCHEMA_VERSION,
   type FrontmatterSchema,
 } from "../utils/frontmatter-schema.js";
@@ -430,7 +431,9 @@ export class FrontmatterService {
     }
 
     if (options.stampVersion) {
-      data["schema-version"] = FRONTMATTER_SCHEMA_VERSION;
+      // Stamp the numeric form so the YAML emitter writes `schema-version: 1`
+      // unquoted (the string "1" would now be quoted as a number-lookalike).
+      data["schema-version"] = CURRENT_SCHEMA_VERSION;
     }
 
     const content = buildNoteContent(data, scan.body, this.schema.keyOrder, scan.eol);

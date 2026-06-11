@@ -6,10 +6,17 @@ import { afterEach, beforeEach, describe, it } from "node:test";
 import { IndexRepository } from "../src/repositories/index.repository.js";
 import type { EmbeddingProvider } from "../src/services/embedding/embedding-provider.js";
 import { MemoryQueryService } from "../src/services/memory-query.service.js";
+import { MemoryUsageService } from "../src/services/memory-usage.service.js";
 import { VaultService } from "../src/services/vault.service.js";
 
 const NOTE_A = `---\ntitle: "Backup safety"\ntype: insight\ncreated: "2026-01-01"\nupdated: "2026-01-02"\ntags:\n  - safety\n---\n\nAtomic backup verify and rollback snapshot.\n`;
 const NOTE_B = `---\ntitle: "Frontmatter parser"\ntype: insight\ncreated: "2026-01-01"\nupdated: "2026-01-03"\n---\n\nNever-throw yaml parser.\n`;
+
+/** Decode the base64 Float32Array wire form vectors use in index.json v3. */
+function decodeB64Vector(value: string): number[] {
+  const bytes = Buffer.from(value, "base64");
+  return Array.from(new Float32Array(new Uint8Array(bytes).buffer));
+}
 
 describe("MemoryQueryService incremental + ranked index", () => {
   let root: string;
@@ -33,6 +40,8 @@ describe("MemoryQueryService incremental + ranked index", () => {
     // Internal index fields must not leak into results.
     assert.equal("searchText" in results[0], false);
     assert.equal("mtimeMs" in results[0], false);
+    assert.equal("sizeBytes" in results[0], false);
+    assert.equal("bodyLineOffset" in results[0], false);
   });
 
   it("searches body text, not just the title", async () => {
@@ -40,12 +49,22 @@ describe("MemoryQueryService incremental + ranked index", () => {
     assert.deepEqual(results.map((r) => r.path), ["a.md"]);
   });
 
+  it("indexes body text past the old 4k cap (search text limit raised to 12000)", async () => {
+    const filler = "filler ".repeat(800); // ~5600 chars, beyond the old 4000-char cap
+    writeFileSync(
+      join(root, "long.md"),
+      `---\ntitle: "Long"\ntype: note\ncreated: "2026-01-01"\nupdated: "2026-01-02"\n---\n\n${filler}xylophone\n`,
+    );
+    const results = await query.search("xylophone", [], undefined, undefined, 10, 0);
+    assert.deepEqual(results.map((r) => r.path), ["long.md"]);
+  });
+
   it("persists the index cache to .memory-mcp/index.json", async () => {
     await query.search("backup", [], undefined, undefined, 10, 0);
     const cache = join(root, ".memory-mcp", "index.json");
     assert.ok(existsSync(cache));
     const parsed = JSON.parse(readFileSync(cache, "utf8"));
-    assert.equal(parsed.version, 2);
+    assert.equal(parsed.version, 3);
     assert.ok(parsed.records["a.md"]);
   });
 
@@ -64,6 +83,20 @@ describe("MemoryQueryService incremental + ranked index", () => {
     rmSync(join(root, "b.md"));
     const parser = await query.search("parser", [], undefined, undefined, 10, 0);
     assert.equal(parser.length, 0);
+  });
+
+  it("detects a same-millisecond edit when the file size changes", async () => {
+    const fixed = new Date(Date.now() + 5_000);
+    utimesSync(join(root, "a.md"), fixed, fixed);
+    await query.search("backup", [], undefined, undefined, 10, 0); // index v1
+
+    // Rewrite with different content AND restore the exact same mtime; only the
+    // size differs, which mtime-only change detection used to miss.
+    writeFileSync(join(root, "a.md"), NOTE_A.replace("rollback snapshot", "zebra snapshot padding"));
+    utimesSync(join(root, "a.md"), fixed, fixed);
+
+    const results = await query.search("zebra", [], undefined, undefined, 10, 0);
+    assert.deepEqual(results.map((r) => r.path), ["a.md"]);
   });
 
   it("force reindex rebuilds from scratch", async () => {
@@ -85,6 +118,84 @@ describe("MemoryQueryService incremental + ranked index", () => {
     assert.equal(results[0].path, "b.md");
   });
 
+  it("folder filter is case-insensitive and segment-aware", async () => {
+    mkdirSync(join(root, "07_Insights"), { recursive: true });
+    writeFileSync(
+      join(root, "07_Insights", "ins.md"),
+      `---\ntitle: "Insight note"\ntype: insight\ncreated: "2026-01-01"\nupdated: "2026-01-02"\n---\n\nbackup lessons learned.\n`,
+    );
+
+    const caseInsensitive = await query.search("backup", [], "07_insights", undefined, 10, 0);
+    assert.deepEqual(caseInsensitive.map((r) => r.path), ["07_Insights/ins.md"]);
+
+    // A raw substring / partial segment used to match — it must not anymore.
+    const partialSegment = await query.search("backup", [], "Insights", undefined, 10, 0);
+    assert.equal(partialSegment.length, 0);
+
+    const recent = await query.recent(["07_INSIGHTS"], [], "updated", 10);
+    assert.deepEqual(recent.map((r) => r.path), ["07_Insights/ins.md"]);
+  });
+
+  it("honors sortBy for ranked search and list-style empty queries", async () => {
+    writeFileSync(
+      join(root, "c.md"),
+      `---\ntitle: "Aardvark backup mention"\ntype: note\ncreated: "2026-02-01"\nupdated: "2026-02-02"\n---\n\nbackup once.\n`,
+    );
+
+    const byTitle = await query.search("backup", [], undefined, undefined, 10, 0, false, { sortBy: "title" });
+    assert.deepEqual(byTitle.map((r) => r.path), ["c.md", "a.md"]); // "Aardvark…" < "Backup safety"
+
+    const byCreated = await query.search("", [], undefined, undefined, 10, 0, false, { sortBy: "createdAt" });
+    assert.equal(byCreated[0].path, "c.md"); // newest created first
+
+    const byPath = await query.search("", [], undefined, undefined, 10, 0, false, { sortBy: "path" });
+    assert.deepEqual(byPath.map((r) => r.path), ["a.md", "b.md", "c.md"]);
+  });
+
+  it("scope restricts matching to title or tags", async () => {
+    // a.md: title "Backup safety", tags ["safety"], body contains "rollback".
+    const titleMiss = await query.search("rollback", [], undefined, undefined, 10, 0, false, { scope: "title" });
+    assert.equal(titleMiss.length, 0, "body-only term does not match in title scope");
+
+    const titleHit = await query.search("backup", [], undefined, undefined, 10, 0, false, { scope: "title" });
+    assert.deepEqual(titleHit.map((r) => r.path), ["a.md"]);
+
+    const tagHit = await query.search("safety", [], undefined, undefined, 10, 0, false, { scope: "tags" });
+    assert.deepEqual(tagHit.map((r) => r.path), ["a.md"]);
+
+    const tagMiss = await query.search("backup", [], undefined, undefined, 10, 0, false, { scope: "tags" });
+    assert.equal(tagMiss.length, 0, "title/body term does not match in tags scope");
+  });
+
+  it("includeBody attaches the full note body to hits", async () => {
+    const withBody = await query.search("backup", [], undefined, undefined, 10, 0, false, { includeBody: true });
+    assert.ok(withBody[0].body?.includes("Atomic backup verify"));
+
+    const lean = await query.search("backup", [], undefined, undefined, 10, 0);
+    assert.equal("body" in lean[0], false);
+  });
+
+  it("rankFor returns path -> positive relevance scores for matching notes only", async () => {
+    const scores = await query.rankFor(["backup"]);
+    assert.ok(scores["a.md"] > 0);
+    assert.equal(scores["b.md"], undefined);
+    assert.deepEqual(await query.rankFor([]), {});
+  });
+
+  it("rankFor dedupes repeated query terms", async () => {
+    assert.deepEqual(await query.rankFor(["backup", "backup", "backup"]), await query.rankFor(["backup"]));
+  });
+
+  it("rankFor applies the usage boost, capped at 0.75x the BM25 score", async () => {
+    const plain = await query.rankFor(["backup"]);
+    const usage = new MemoryUsageService(root);
+    usage.recordContextPack([{ path: "a.md" }], { query: "backup" });
+    const boosted = new MemoryQueryService(new VaultService(root), new IndexRepository(), usage);
+    const scores = await boosted.rankFor(["backup"]);
+    assert.ok(scores["a.md"] > plain["a.md"], "usage boost increases the score");
+    assert.ok(scores["a.md"] <= plain["a.md"] * 1.75 + 1e-9, "boost is capped at 0.75x BM25");
+  });
+
   it("skips a note that fails to read instead of breaking the whole index", async () => {
     class FlakyVault extends VaultService {
       load(relative: string) {
@@ -99,17 +210,17 @@ describe("MemoryQueryService incremental + ranked index", () => {
   });
 
   it("survives a shape-wrong persisted record (no tags) without throwing in BM25", async () => {
-    await query.search("backup", [], undefined, undefined, 10, 0); // seed a real cache + mtimes
-    const mtimeMs = statSync(join(root, "a.md")).mtimeMs;
-    // Tamper the cache: a.md matches the file mtime (so it is NOT re-read) but is
-    // missing tags/aliases — unguarded this crashes documentTerms (`tags.join`).
+    await query.search("backup", [], undefined, undefined, 10, 0); // seed a real cache + stats
+    const stat = statSync(join(root, "a.md"));
+    // Tamper the cache: a.md matches the file mtime+size (so it is NOT re-read)
+    // but is missing tags/aliases — unguarded this crashes documentTerms (`tags.join`).
     mkdirSync(join(root, ".memory-mcp"), { recursive: true });
     writeFileSync(
       join(root, ".memory-mcp", "index.json"),
       JSON.stringify({
-        version: 2,
+        version: 3,
         updatedAt: "2026-01-01T00:00:00.000Z",
-        records: { "a.md": { path: "a.md", title: "Backup safety", type: "insight", searchText: "atomic backup", mtimeMs } },
+        records: { "a.md": { path: "a.md", title: "Backup safety", type: "insight", searchText: "atomic backup", mtimeMs: stat.mtimeMs, sizeBytes: stat.size } },
       }),
     );
     const reopened = new MemoryQueryService(new VaultService(root), new IndexRepository());
@@ -117,12 +228,26 @@ describe("MemoryQueryService incremental + ranked index", () => {
     assert.ok(results.some((r) => r.path === "a.md"));
   });
 
+  it("coerces a corrupt non-string id from the cache instead of crashing memory_get", async () => {
+    await query.search("backup", [], undefined, undefined, 10, 0); // seed a real cache
+    const cachePath = join(root, ".memory-mcp", "index.json");
+    const parsed = JSON.parse(readFileSync(cachePath, "utf8"));
+    parsed.records["a.md"].id = 123; // hand-corrupted index.json
+    parsed.records["a.md"].bodyLineOffset = -7; // and a negative numeric field
+    writeFileSync(cachePath, JSON.stringify(parsed));
+    const reopened = new MemoryQueryService(new VaultService(root), new IndexRepository());
+    // Resolving b.md by title iterates past a.md and evaluates its id; a
+    // non-string id used to throw in resolveReference and the link graph.
+    const note = await reopened.get("Frontmatter parser");
+    assert.equal(note.path, "b.md");
+  });
+
   it("ignores a stale-schema (old version) persisted cache instead of trusting it", async () => {
     mkdirSync(join(root, ".memory-mcp"), { recursive: true });
-    // A Tier-1 (version 1) cache is now stale; it must be ignored and rebuilt by mtime.
+    // A Tier-2 (version 2) cache is now stale; it must be ignored and rebuilt by stats.
     writeFileSync(
       join(root, ".memory-mcp", "index.json"),
-      JSON.stringify({ version: 1, updatedAt: "2026-01-01T00:00:00.000Z", records: { "ghost.md": { path: "ghost.md" } } }),
+      JSON.stringify({ version: 2, updatedAt: "2026-01-01T00:00:00.000Z", records: { "ghost.md": { path: "ghost.md" } } }),
     );
     const reopened = new MemoryQueryService(new VaultService(root), new IndexRepository());
     const records = await reopened.snapshotIndex();
@@ -137,6 +262,16 @@ describe("MemoryQueryService incremental + ranked index", () => {
     assert.deepEqual(readdirSync(dir).filter((f) => f.endsWith(".tmp")), []);
   });
 
+  it("cleans up the temp file when the index.json rename fails", async () => {
+    const dir = join(root, ".memory-mcp");
+    // Make the rename target an (unreplaceable) directory so renameSync throws.
+    mkdirSync(join(dir, "index.json"), { recursive: true });
+    const blocked = new MemoryQueryService(new VaultService(root), new IndexRepository());
+    const results = await blocked.search("backup", [], undefined, undefined, 10, 0);
+    assert.ok(results.length > 0, "search still works when the cache cannot be written");
+    assert.deepEqual(readdirSync(dir).filter((f) => f.endsWith(".tmp")), []);
+  });
+
   it("get() returns real backlinks resolved from the wikilink graph", async () => {
     writeFileSync(
       join(root, "c.md"),
@@ -148,7 +283,7 @@ describe("MemoryQueryService incremental + ranked index", () => {
     assert.deepEqual(note.outgoingLinks, []);
   });
 
-  it("search with includeSections attaches the best-matching section anchor", async () => {
+  it("search with includeSections attaches a file-accurate section anchor", async () => {
     writeFileSync(
       join(root, "doc.md"),
       `---\ntitle: "Doc"\ntype: note\ncreated: "2026-01-01"\nupdated: "2026-01-06"\n---\n\nIntro.\n\n## Setup\ninstall steps.\n\n## Elephant care\nfeed the elephant daily.\n`,
@@ -157,7 +292,9 @@ describe("MemoryQueryService incremental + ranked index", () => {
     const hit = withSections.find((r) => r.path === "doc.md");
     assert.ok(hit, "doc.md should match 'elephant'");
     assert.equal(hit!.match?.section, "Elephant care");
-    assert.ok((hit!.match?.line ?? 0) > 0);
+    // "## Elephant care" sits on FILE line 13 (5 frontmatter lines + delimiters
+    // precede the body); the anchor used to report the body-relative line.
+    assert.equal(hit!.match?.line, 13);
 
     // Default (no includeSections) leaves results lean — no match field.
     const lean = await query.search("elephant", [], undefined, undefined, 10, 0);
@@ -248,12 +385,35 @@ describe("MemoryQueryService hybrid search (embedder enabled)", () => {
     rmSync(root, { recursive: true, force: true });
   });
 
-  it("persists per-note vectors and the embedder signature in the cache", async () => {
+  it("persists per-note vectors (base64 Float32) and the embedder signature in the cache", async () => {
     await query.search("backup", [], undefined, undefined, 10, 0);
     const parsed = JSON.parse(readFileSync(join(root, ".memory-mcp", "index.json"), "utf8"));
     assert.equal(parsed.embedder, "stub:test:3");
-    assert.deepEqual(parsed.records["a.md"].vector, [1, 0, 0]);
-    assert.deepEqual(parsed.records["b.md"].vector, [0, 1, 0]);
+    assert.equal(typeof parsed.records["a.md"].vector, "string");
+    assert.deepEqual(decodeB64Vector(parsed.records["a.md"].vector), [1, 0, 0]);
+    assert.deepEqual(decodeB64Vector(parsed.records["b.md"].vector), [0, 1, 0]);
+  });
+
+  it("round-trips persisted vectors so an unchanged vault is not re-embedded", async () => {
+    await query.search("backup", [], undefined, undefined, 10, 0);
+    const second = new StubEmbedder(); // same signature stub:test:3
+    const reopened = new MemoryQueryService(new VaultService(root), new IndexRepository(), undefined, second);
+    const results = await reopened.search("backup", [], undefined, undefined, 10, 0);
+    assert.equal(results[0].path, "a.md");
+    assert.deepEqual(second.batchSizes, [1], "only the query embeds — doc vectors came from the cache");
+  });
+
+  it("drops just an undecodable persisted vector and re-embeds that one note", async () => {
+    await query.search("backup", [], undefined, undefined, 10, 0);
+    const cachePath = join(root, ".memory-mcp", "index.json");
+    const parsed = JSON.parse(readFileSync(cachePath, "utf8"));
+    parsed.records["a.md"].vector = "@@not-base64@@"; // decodes to a non-multiple-of-4 byte length
+    writeFileSync(cachePath, JSON.stringify(parsed));
+    const second = new StubEmbedder();
+    const reopened = new MemoryQueryService(new VaultService(root), new IndexRepository(), undefined, second);
+    const results = await reopened.search("backup", [], undefined, undefined, 10, 0);
+    assert.equal(results[0].path, "a.md");
+    assert.deepEqual(second.batchSizes, [1, 1], "only the corrupted note re-embeds (plus the query)");
   });
 
   it("never leaks the vector into public results", async () => {
@@ -266,6 +426,20 @@ describe("MemoryQueryService hybrid search (embedder enabled)", () => {
     await query.get("a.md");
     await query.recent([], [], "updated", 10);
     assert.equal(embedder.calls, 0);
+  });
+
+  it("does not embed for empty-query list-style calls", async () => {
+    await query.search("", [], undefined, undefined, 10, 0); // memory_list routes here
+    assert.equal(embedder.calls, 0);
+  });
+
+  it("caches the query vector across repeated searches (LRU)", async () => {
+    await query.search("backup", [], undefined, undefined, 10, 0);
+    const afterFirst = embedder.calls;
+    await query.search("backup", [], undefined, undefined, 10, 0);
+    assert.equal(embedder.calls, afterFirst, "repeating the same query embeds nothing new");
+    await query.search("parser", [], undefined, undefined, 10, 0);
+    assert.equal(embedder.calls, afterFirst + 1, "a new query embeds exactly one vector");
   });
 
   it("re-embeds under a new signature when the embedder changes", async () => {
@@ -297,6 +471,21 @@ describe("MemoryQueryService hybrid search (embedder enabled)", () => {
     assert.equal(embedder.batchSizes.at(-1), 1, "query vector is embedded separately");
   });
 
+  it("bounds backlog embedding to 4 batches (128 docs) per call", async () => {
+    for (let i = 0; i < 130; i += 1) {
+      writeFileSync(
+        join(root, `bulk-${i}.md`),
+        `---\ntitle: "Bulk ${i}"\ntype: note\ncreated: "2026-01-01"\nupdated: "2026-01-02"\n---\n\nbackup bulk note ${i}\n`,
+      );
+    }
+    // 132 docs pending; the first search must stop after 4 full batches.
+    await query.search("backup", [], undefined, undefined, 10, 0);
+    assert.deepEqual(embedder.batchSizes, [32, 32, 32, 32, 1], "4 doc batches + 1 query embed");
+    // The next search drains the remainder (the query vector is LRU-cached).
+    await query.search("backup", [], undefined, undefined, 10, 0);
+    assert.deepEqual(embedder.batchSizes.slice(5), [4]);
+  });
+
   it("cooldowns after a malformed provider response instead of retrying immediately", async () => {
     const bad = new BadShapeEmbedder();
     const withBadProvider = new MemoryQueryService(new VaultService(root), new IndexRepository(), undefined, bad);
@@ -323,15 +512,19 @@ describe("MemoryQueryService hybrid search (embedder enabled)", () => {
     assert.deepEqual(results.map((r) => r.path), ["target/hit.md"]);
   });
 
-  it("persists vector removal when reopening a cache with embeddings disabled", async () => {
-    await query.search("backup", [], undefined, undefined, 10, 0);
+  it("a lexical-only process preserves another embedder's vectors and tag", async () => {
+    await query.search("backup", [], undefined, undefined, 10, 0); // seed stub:test:3 vectors
 
+    // Force the lexical-only process to rewrite the cache (a new note changed
+    // the index); it must NOT wipe the embedding process's vectors or re-tag
+    // the cache as "none".
+    writeFileSync(join(root, "new.md"), `---\ntitle: "New"\ntype: note\ncreated: "2026-01-04"\nupdated: "2026-01-04"\n---\n\nbrand new note.\n`);
     const lexicalOnly = new MemoryQueryService(new VaultService(root), new IndexRepository());
     await lexicalOnly.search("backup", [], undefined, undefined, 10, 0);
 
     const parsed = JSON.parse(readFileSync(join(root, ".memory-mcp", "index.json"), "utf8"));
-    assert.equal(parsed.embedder, "none");
-    assert.equal(parsed.records["a.md"].vector, undefined);
+    assert.equal(parsed.embedder, "stub:test:3");
+    assert.deepEqual(decodeB64Vector(parsed.records["a.md"].vector), [1, 0, 0]);
   });
 });
 

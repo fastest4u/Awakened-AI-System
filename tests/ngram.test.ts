@@ -49,6 +49,22 @@ describe("searchTokens", () => {
     assert.ok(tokens.length >= 1);
   });
 
+  it("preserves term frequency across repeated runs (no dedup) so BM25 TF works", () => {
+    // The same Thai word twice must emit each of its n-grams twice, or a doc
+    // mentioning a keyword 10x ranks no higher than one mentioning it once.
+    const tokens = searchTokens("ความจำ ความจำ");
+    const count = (term: string) => tokens.filter((token) => token === term).length;
+    assert.equal(count("คว"), 2);
+    assert.equal(count("ความ".slice(0, 3)), 2); // 3-gram "ควา"
+    assert.equal(count("ความจำ"), 2, "word tokens keep their frequency too");
+  });
+
+  it("preserves a repeated n-gram WITHIN a single run", () => {
+    // "นานา": bigrams are นา, าน, นา — the duplicate "นา" must not collapse.
+    const tokens = searchTokens("นานา");
+    assert.equal(tokens.filter((token) => token === "นา").length, 2);
+  });
+
   it("handles non-strings safely", () => {
     assert.deepEqual(searchTokens(undefined), []);
   });

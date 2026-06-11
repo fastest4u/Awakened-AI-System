@@ -1,7 +1,22 @@
 import type { z } from "zod";
 import { getInputSchema, listInputSchema, recentInputSchema, searchInputSchema } from "../schemas/memory.js";
-import type { MemoryQueryService } from "../services/memory-query.service.js";
+import type { MemoryQueryService, SearchSortBy } from "../services/memory-query.service.js";
 import type { ToolResponseService } from "../services/tool-response.service.js";
+
+// Tool-facing sort names -> MemoryQueryService sort keys ("recent" aliases "updated").
+const SEARCH_SORT_BY: Record<z.infer<typeof searchInputSchema>["sortBy"], SearchSortBy> = {
+  relevance: "relevance",
+  recent: "updatedAt",
+  updated: "updatedAt",
+  created: "createdAt",
+  name: "title",
+};
+
+const LIST_SORT_BY: Record<z.infer<typeof listInputSchema>["sortBy"], SearchSortBy> = {
+  name: "title",
+  updated: "updatedAt",
+  created: "createdAt",
+};
 
 export class NoteController {
   constructor(private readonly query: MemoryQueryService, private readonly responses: ToolResponseService) {}
@@ -15,7 +30,11 @@ export class NoteController {
 
   async search(input: z.infer<typeof searchInputSchema>) {
     const startedAt = Date.now();
-    const results = await this.query.search(input.query, input.tags, input.folder, input.type, input.limit, input.offset, input.includeSections);
+    const results = await this.query.search(input.query, input.tags, input.folder, input.type, input.limit, input.offset, input.includeSections, {
+      sortBy: SEARCH_SORT_BY[input.sortBy],
+      scope: input.scope,
+      includeBody: input.includeBody,
+    });
     return this.responses.buildOk("memory_search", startedAt, { results, total: results.length, query: input.query, nextOffset: input.offset + input.limit });
   }
 
@@ -32,7 +51,7 @@ export class NoteController {
 
   async list(input: z.infer<typeof listInputSchema>) {
     const startedAt = Date.now();
-    const items = await this.query.search("", input.tag ? [input.tag] : [], input.folder, input.type, input.limit, input.offset);
+    const items = await this.query.search("", input.tag ? [input.tag] : [], input.folder, input.type, input.limit, input.offset, false, { sortBy: LIST_SORT_BY[input.sortBy] });
     return this.responses.buildOk("memory_list", startedAt, { items });
   }
 

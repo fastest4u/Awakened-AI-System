@@ -26,15 +26,12 @@ describe("cosine", () => {
     assert.equal(cosine([], [1, 1]), 0);
   });
 
-  it("treats a shorter vector as zero-padded (extra trailing zeros don't change it)", () => {
-    assert.ok(Math.abs(cosine([3, 4], [3, 4, 0]) - 1) < 1e-9);
-  });
-
-  it("counts a longer vector's extra magnitude (so it is no longer identical)", () => {
-    // dot over the shared prefix, magnitudes over each full vector.
-    const value = cosine([1, 0, 5], [1, 0]);
-    assert.ok(value > 0 && value < 1);
-    assert.ok(Math.abs(value - 1 / Math.sqrt(26)) < 1e-9);
+  it("returns 0 on a length mismatch instead of silently truncating", () => {
+    // Mismatched dimensions mean different embedding spaces; any non-zero
+    // score from a truncated dot product would be meaningless.
+    assert.equal(cosine([3, 4], [3, 4, 0]), 0);
+    assert.equal(cosine([1, 0, 5], [1, 0]), 0);
+    assert.equal(cosine([1], []), 0);
   });
 });
 

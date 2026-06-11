@@ -41,8 +41,10 @@ const errorEnvelope = (
   meta: { tool, elapsedMs: Date.now() - startedAt },
 });
 
+// Compact JSON: the text copy is re-sent to the model on every tool call, so
+// pretty-printing adds 10-20% token overhead across all tools for no benefit.
 const textResult = <T>(payload: ToolEnvelope<T>): ToolTextResult<T> => ({
-  content: [{ type: "text", text: JSON.stringify(payload, null, 2) }],
+  content: [{ type: "text", text: JSON.stringify(payload) }],
   structuredContent: payload,
 });
 

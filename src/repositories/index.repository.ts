@@ -8,6 +8,12 @@ const RRF_K = 60;
 /** Max docs the vector arm contributes — bounds semantic-only injection so a
  *  weakly-similar tail can't drown out lexical matches (RRF ranks the rest). */
 const VECTOR_ARM_LIMIT = 25;
+/** Vector-arm floor: candidates below this cosine similarity are noise (the
+ *  hash-embedder arm otherwise injects zero-term notes into the top results). */
+const VECTOR_MIN_SIMILARITY = 0.15;
+/** Usage boost ceiling, as a fraction of the doc's own BM25 score. Uncapped,
+ *  the boost (up to +18) let popular-but-irrelevant notes beat exact matches. */
+const USAGE_BOOST_CAP = 0.75;
 
 /** Public, lean index record returned to callers (search/list/recent results). */
 export interface IndexRecord {
@@ -30,7 +36,13 @@ export interface IndexRecord {
  */
 export interface StoredRecord extends IndexRecord {
   mtimeMs: number;
+  /** File size in bytes at index time; paired with mtimeMs so a same-millisecond
+   *  edit that changes the size is still detected by the incremental scan. */
+  sizeBytes: number;
   searchText: string;
+  /** Raw file lines preceding the body (the frontmatter block), so body-relative
+   *  section-anchor line numbers can be shifted to file-accurate ones. */
+  bodyLineOffset: number;
   /** Normalized `[[wikilink]]` targets in this note's body (for the backlink graph). */
   outgoingLinks: string[];
   /**
@@ -42,7 +54,15 @@ export interface StoredRecord extends IndexRecord {
 }
 
 export function toPublicRecord(stored: StoredRecord): IndexRecord {
-  const { mtimeMs: _mtimeMs, searchText: _searchText, outgoingLinks: _outgoingLinks, vector: _vector, ...rest } = stored;
+  const {
+    mtimeMs: _mtimeMs,
+    sizeBytes: _sizeBytes,
+    searchText: _searchText,
+    bodyLineOffset: _bodyLineOffset,
+    outgoingLinks: _outgoingLinks,
+    vector: _vector,
+    ...rest
+  } = stored;
   return rest;
 }
 
@@ -92,12 +112,21 @@ export class IndexRepository {
    * only when the record set changed.
    */
   rank(queryTerms: string[], boost: (path: string) => number = () => 0): StoredRecord[] {
+    return this.rankScored(queryTerms, boost).map((entry) => entry.doc);
+  }
+
+  /**
+   * Like rank(), but keeps the relevance score per doc. The boost is applied
+   * ONLY to docs whose BM25 score > 0 (it can never resurrect a non-match) and
+   * is capped at USAGE_BOOST_CAP x that doc's own BM25 score, so popularity can
+   * re-order genuine matches but never drown out a stronger lexical match.
+   */
+  rankScored(queryTerms: string[], boost: (path: string) => number = () => 0): Array<{ doc: StoredRecord; score: number }> {
     return this.ensureBm25()
       .score(queryTerms)
-      .map(({ doc, score }) => ({ doc, score: score + boost(doc.path), matched: score > 0 }))
-      .filter((entry) => entry.matched)
-      .sort((a, b) => b.score - a.score)
-      .map((entry) => entry.doc);
+      .filter(({ score }) => score > 0)
+      .map(({ doc, score }) => ({ doc, score: score + Math.min(boost(doc.path), score * USAGE_BOOST_CAP) }))
+      .sort((a, b) => b.score - a.score);
   }
 
   /**
@@ -147,14 +176,14 @@ export class IndexRepository {
     return false;
   }
 
-  /** Top documents by cosine similarity to the query vector (capped, score > 0). */
+  /** Top documents by cosine similarity to the query vector (capped, above the noise floor). */
   private vectorRank(queryVector: number[], eligible: (record: StoredRecord) => boolean): string[] {
     const scored: Array<{ path: string; score: number }> = [];
     for (const record of this.records.values()) {
       if (!eligible(record)) continue;
       if (!record.vector || record.vector.length === 0) continue;
       const score = cosine(queryVector, record.vector);
-      if (score > 0) scored.push({ path: record.path, score });
+      if (score >= VECTOR_MIN_SIMILARITY) scored.push({ path: record.path, score });
     }
     scored.sort((a, b) => b.score - a.score);
     return scored.slice(0, VECTOR_ARM_LIMIT).map((entry) => entry.path);

@@ -2,7 +2,7 @@ import { strict as assert } from "node:assert";
 import type { existsSync as ExistsSync, readFileSync as ReadFileSync } from "node:fs";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { join, parse, resolve } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import { __internals, diagnoseMemoryConfig, loadMemoryConfig } from "../src/config/memory.config.js";
 
@@ -25,6 +25,9 @@ const {
   pickIdeActiveWorkspace,
   findIdeActiveWorkspace,
   resolveDynamicProjectRoot,
+  findWorkspaceRoot,
+  findVaultWorkspaceRoot,
+  isPathWithin,
   isDynamicRootValue,
   tryLoadSqlite,
 } = __internals;
@@ -635,6 +638,30 @@ describe("loadMemoryConfig", () => {
     assert.equal(resolve(result.projectRoot), resolve(cwdProject));
   });
 
+  it("reports resolution provenance for explicit, vault-detected, and fallback roots", () => {
+    const explicit = join(tmpRoot, "prov-explicit");
+    mkdirSync(join(explicit, "memory"), { recursive: true });
+    writeFileSync(join(explicit, "memory", "AGENTS.md"), "# vault\n");
+    const explicitResult = loadMemoryConfig(
+      { MEMORY_PROJECT_ROOT: explicit } as NodeJS.ProcessEnv,
+      tmpRoot,
+    );
+    assert.deepEqual(explicitResult.resolution, { source: "env-explicit", vaultMarkerFound: true });
+
+    const vaultProject = join(tmpRoot, "prov-vault");
+    mkdirSync(join(vaultProject, "memory"), { recursive: true });
+    writeFileSync(join(vaultProject, "memory", "AGENTS.md"), "# vault\n");
+    const dynamicResult = loadMemoryConfig({} as NodeJS.ProcessEnv, vaultProject);
+    assert.deepEqual(dynamicResult.resolution, { source: "env-vault-marker", vaultMarkerFound: true });
+
+    // The filesystem root has no markers and is never adopted via walk-up, so
+    // resolution degrades to the raw-cwd fallback.
+    const fsRoot = parse(resolve(tmpRoot)).root;
+    const fallbackResult = loadMemoryConfig({} as NodeJS.ProcessEnv, fsRoot);
+    assert.equal(fallbackResult.resolution.source, "fallback");
+    assert.equal(fallbackResult.resolution.vaultMarkerFound, false);
+  });
+
   it("MEMORY_VAULT_PATH overrides the resolved vault location", () => {
     const project = join(tmpRoot, "p");
     const vault = join(tmpRoot, "external-vault");
@@ -678,6 +705,7 @@ describe("diagnoseMemoryConfig", () => {
 
     assert.equal(resolve(diagnostic.config.projectRoot), resolve(project));
     assert.equal(resolve(diagnostic.config.vaultRoot), resolve(project, "memory"));
+    assert.deepEqual(diagnostic.resolution, { source: "env-explicit", vaultMarkerFound: true });
     assert.equal(diagnostic.workspace.source, "MEMORY_PROJECT_ROOT");
     assert.equal(diagnostic.workspace.candidates[0].source, "MEMORY_PROJECT_ROOT");
     assert.equal(diagnostic.workspace.candidates[0].selected, true);
@@ -864,12 +892,138 @@ describe("diagnoseMemoryConfig", () => {
     );
     assert.equal(cursorIssue.remediation.path, join(project, ".cursor", "mcp.json"));
     assert.match(cursorIssue.remediation.snippet, /"project-memory"/);
-    assert.match(cursorIssue.remediation.snippet, /"MEMORY_PROJECT_ROOT": "dynamic"/);
+    // Snippets recommend the literal resolved root; "dynamic" is only offered
+    // as a fallback in the summary text.
+    assert.ok(
+      cursorIssue.remediation.snippet.includes(`"MEMORY_PROJECT_ROOT": "${toPosix(resolve(project))}"`),
+      `snippet should pin the literal project root, got: ${cursorIssue.remediation.snippet}`,
+    );
+    assert.match(cursorIssue.remediation.summary, /"dynamic"/);
 
     const cursor = doctor.clients.find((client: { client: string }) => client.client === "cursor");
     assert.equal(cursor.configured, false);
     assert.equal(cursor.configs[0].exists, true);
     assert.deepEqual(cursor.issues, ["CLIENT_CONFIG_MISSING_PROJECT_MEMORY"]);
+  });
+
+  it("warns PROJECT_ROOT_UNVERIFIED when the root is guessed without a vault marker", () => {
+    const plain = join(tmpRoot, "guessed");
+    mkdirSync(plain, { recursive: true });
+
+    const diagnostic = diagnoseMemoryConfig(
+      {} as NodeJS.ProcessEnv,
+      plain,
+      { buildInfo: { builtAt: "2026-06-01T00:00:00.000Z", version: "0.1.0-test" } },
+    );
+
+    assert.equal(diagnostic.resolution.source, "fallback");
+    assert.equal(diagnostic.resolution.vaultMarkerFound, false);
+    const doctor = (diagnostic as any).doctor;
+    const issue = doctor.issues.find((entry: { code: string }) => entry.code === "PROJECT_ROOT_UNVERIFIED");
+    assert.ok(issue, "expected a PROJECT_ROOT_UNVERIFIED issue");
+    assert.equal(issue.severity, "warning");
+    assert.match(issue.remediation.summary, /MEMORY_PROJECT_ROOT/);
+  });
+
+  it("does not warn PROJECT_ROOT_UNVERIFIED when the detected root has a vault", () => {
+    const project = join(tmpRoot, "guessed-vault");
+    mkdirSync(join(project, "memory"), { recursive: true });
+    writeFileSync(join(project, "memory", "AGENTS.md"), "# vault\n");
+
+    const diagnostic = diagnoseMemoryConfig(
+      {} as NodeJS.ProcessEnv,
+      project,
+      { buildInfo: { builtAt: "2026-06-01T00:00:00.000Z", version: "0.1.0-test" } },
+    );
+
+    assert.equal(diagnostic.resolution.source, "env-vault-marker");
+    assert.equal(diagnostic.resolution.vaultMarkerFound, true);
+    const doctor = (diagnostic as any).doctor;
+    assert.equal(doctor.issues.some((entry: { code: string }) => entry.code === "PROJECT_ROOT_UNVERIFIED"), false);
+  });
+
+  it("treats a project-memory entry in the global ~/.claude.json as configured (scope global)", () => {
+    const project = join(tmpRoot, "global-claude-project");
+    mkdirSync(join(project, "memory"), { recursive: true });
+    writeFileSync(join(project, "memory", "AGENTS.md"), "# vault\n");
+
+    const home = join(tmpRoot, "home");
+    mkdirSync(home, { recursive: true });
+    writeFileSync(
+      join(home, ".claude.json"),
+      JSON.stringify({
+        projects: {
+          [project]: { mcpServers: { "project-memory": { command: "node" } } },
+        },
+      }),
+    );
+
+    const diagnostic = diagnoseMemoryConfig(
+      { MEMORY_PROJECT_ROOT: project, HOME: home } as NodeJS.ProcessEnv,
+      tmpRoot,
+      { buildInfo: { builtAt: "2026-06-01T00:00:00.000Z", version: "0.1.0-test" } },
+    );
+    const doctor = (diagnostic as any).doctor;
+    const claude = doctor.clients.find((client: { client: string }) => client.client === "claude-code");
+
+    assert.equal(claude.configured, true);
+    const globalConfig = claude.configs.find((config: { scope?: string }) => config.scope === "global");
+    assert.ok(globalConfig, "expected the global ~/.claude.json to be scanned");
+    assert.equal(globalConfig.exists, true);
+    assert.equal(globalConfig.hasProjectMemory, true);
+    assert.equal(
+      doctor.issues.some(
+        (issue: { code: string; client?: string }) =>
+          issue.code === "CLIENT_CONFIG_MISSING_PROJECT_MEMORY" && issue.client === "claude-code",
+      ),
+      false,
+    );
+    assert.equal(doctor.issues.some((issue: { code: string }) => issue.code === "NO_CLIENT_CONFIGS_FOUND"), false);
+  });
+
+  it("recognizes top-level mcpServers in the global ~/.claude.json", () => {
+    const project = join(tmpRoot, "global-top-level");
+    mkdirSync(join(project, "memory"), { recursive: true });
+    writeFileSync(join(project, "memory", "AGENTS.md"), "# vault\n");
+
+    const home = join(tmpRoot, "home-top");
+    mkdirSync(home, { recursive: true });
+    writeFileSync(
+      join(home, ".claude.json"),
+      JSON.stringify({ mcpServers: { "project-memory": { command: "node" } } }),
+    );
+
+    const diagnostic = diagnoseMemoryConfig(
+      { MEMORY_PROJECT_ROOT: project, HOME: home } as NodeJS.ProcessEnv,
+      tmpRoot,
+      { buildInfo: { builtAt: "2026-06-01T00:00:00.000Z", version: "0.1.0-test" } },
+    );
+    const doctor = (diagnostic as any).doctor;
+    const claude = doctor.clients.find((client: { client: string }) => client.client === "claude-code");
+
+    assert.equal(claude.configured, true);
+    assert.equal(claude.configs.find((config: { scope?: string }) => config.scope === "global").hasProjectMemory, true);
+  });
+
+  it("still reports NO_CLIENT_CONFIGS_FOUND when the global config lacks project-memory", () => {
+    const project = join(tmpRoot, "global-without-pm");
+    mkdirSync(join(project, "memory"), { recursive: true });
+    writeFileSync(join(project, "memory", "AGENTS.md"), "# vault\n");
+
+    const home = join(tmpRoot, "home-empty");
+    mkdirSync(home, { recursive: true });
+    writeFileSync(join(home, ".claude.json"), JSON.stringify({ projects: {} }));
+
+    const diagnostic = diagnoseMemoryConfig(
+      { MEMORY_PROJECT_ROOT: project, HOME: home } as NodeJS.ProcessEnv,
+      tmpRoot,
+      { buildInfo: { builtAt: "2026-06-01T00:00:00.000Z", version: "0.1.0-test" } },
+    );
+    const doctor = (diagnostic as any).doctor;
+    const issue = doctor.issues.find((entry: { code: string }) => entry.code === "NO_CLIENT_CONFIGS_FOUND");
+
+    assert.ok(issue, "expected NO_CLIENT_CONFIGS_FOUND despite the global config existing");
+    assert.match(issue.message, /partially scanned/);
   });
 });
 
@@ -899,7 +1053,9 @@ describe("resolveDynamicProjectRoot priority order", () => {
       { WORKSPACE_ROOT: explicit } as NodeJS.ProcessEnv,
       cwdProject,
     );
-    assert.equal(resolve(result), resolve(explicit));
+    assert.equal(resolve(result.root), resolve(explicit));
+    assert.equal(result.source, "env-vault-marker");
+    assert.equal(result.vaultMarkerFound, true);
   });
 
   it("returns the workspace root when cwd is inside a marked project", () => {
@@ -912,6 +1068,136 @@ describe("resolveDynamicProjectRoot priority order", () => {
     writeFileSync(join(project, "package.json"), "{}\n");
 
     const result = resolveDynamicProjectRoot({} as NodeJS.ProcessEnv, inner);
-    assert.equal(resolve(result), resolve(project));
+    assert.equal(resolve(result.root), resolve(project));
+    assert.equal(result.source, "fallback");
+    assert.equal(result.vaultMarkerFound, false);
+  });
+
+  it("a vault-bearing cwd beats a stale PWD pointing at a generic workspace", () => {
+    const pwdProject = join(tmpRoot, "stale-pwd");
+    mkdirSync(join(pwdProject, ".git"), { recursive: true });
+
+    const cwdProject = join(tmpRoot, "cwd-vault");
+    mkdirSync(join(cwdProject, "memory"), { recursive: true });
+    writeFileSync(join(cwdProject, "memory", "AGENTS.md"), "# vault\n");
+
+    const result = resolveDynamicProjectRoot({ PWD: pwdProject } as NodeJS.ProcessEnv, cwdProject);
+    assert.equal(resolve(result.root), resolve(cwdProject));
+    assert.equal(result.source, "env-vault-marker");
+    assert.equal(result.vaultMarkerFound, true);
+  });
+
+  it("intentional env (INIT_CWD) with a generic marker beats PWD residue", () => {
+    const initProject = join(tmpRoot, "init-cwd-proj");
+    mkdirSync(join(initProject, ".git"), { recursive: true });
+    const pwdProject = join(tmpRoot, "pwd-proj");
+    mkdirSync(join(pwdProject, ".git"), { recursive: true });
+
+    // The filesystem root never carries markers, so cwd contributes nothing.
+    const fsRoot = parse(resolve(tmpRoot)).root;
+    const result = resolveDynamicProjectRoot(
+      { INIT_CWD: initProject, PWD: pwdProject } as NodeJS.ProcessEnv,
+      fsRoot,
+    );
+    assert.equal(resolve(result.root), resolve(initProject));
+    assert.equal(result.source, "env-workspace-marker");
+    assert.equal(result.vaultMarkerFound, false);
+  });
+
+  it("falls back to PWD only after IDE state and cwd (incidental-env source)", () => {
+    const pwdProject = join(tmpRoot, "pwd-only-proj");
+    mkdirSync(join(pwdProject, ".git"), { recursive: true });
+
+    const fsRoot = parse(resolve(tmpRoot)).root;
+    const result = resolveDynamicProjectRoot({ PWD: pwdProject } as NodeJS.ProcessEnv, fsRoot);
+    assert.equal(resolve(result.root), resolve(pwdProject));
+    assert.equal(result.source, "incidental-env");
+  });
+
+  it("never adopts the home directory even when env points inside it", () => {
+    const outer = join(tmpRoot, "outer");
+    const home = join(outer, "home");
+    const start = join(home, "sub");
+    mkdirSync(start, { recursive: true });
+    // Stray markers directly in "home" must be skipped; the walk continues to
+    // the marked directory above it.
+    writeFileSync(join(home, "package.json"), "{}\n");
+    writeFileSync(join(outer, "package.json"), "{}\n");
+
+    const result = resolveDynamicProjectRoot(
+      { INIT_CWD: start } as NodeJS.ProcessEnv,
+      start,
+      home,
+    );
+    assert.equal(resolve(result.root), resolve(outer));
+    assert.equal(result.source, "env-workspace-marker");
+  });
+});
+
+describe("findWorkspaceRoot home-dir rejection", () => {
+  let tmpRoot: string;
+
+  beforeEach(() => {
+    tmpRoot = mkdtempSync(join(tmpdir(), "memcfg-home-"));
+  });
+
+  afterEach(() => {
+    rmSync(tmpRoot, { recursive: true, force: true });
+  });
+
+  it("skips a home directory carrying generic markers and keeps walking", () => {
+    const outer = join(tmpRoot, "outer");
+    const home = join(outer, "home");
+    const start = join(home, "sub");
+    mkdirSync(start, { recursive: true });
+    writeFileSync(join(outer, "package.json"), "{}\n");
+    writeFileSync(join(home, "AGENTS.md"), "# stray rules in home\n");
+    writeFileSync(join(home, "package.json"), "{}\n");
+
+    const result = findWorkspaceRoot(start, home);
+    assert.ok(result, "expected the walk to continue past home");
+    assert.equal(resolve(result!), resolve(outer));
+  });
+
+  it("skips a home directory carrying a leftover ~/memory vault", () => {
+    const outer = join(tmpRoot, "outer");
+    const home = join(outer, "home");
+    const start = join(home, "sub");
+    mkdirSync(start, { recursive: true });
+    mkdirSync(join(outer, "memory"), { recursive: true });
+    writeFileSync(join(outer, "memory", "AGENTS.md"), "# real vault\n");
+    mkdirSync(join(home, "memory"), { recursive: true });
+    writeFileSync(join(home, "memory", "AGENTS.md"), "# leftover broken-run vault\n");
+
+    const result = findVaultWorkspaceRoot(start, home);
+    assert.equal(resolve(result!), resolve(outer));
+  });
+
+  it("still finds a project nested under home", () => {
+    const home = join(tmpRoot, "home");
+    const project = join(home, "code", "proj");
+    const inner = join(project, "src");
+    mkdirSync(inner, { recursive: true });
+    writeFileSync(join(project, "package.json"), "{}\n");
+
+    const result = findWorkspaceRoot(inner, home);
+    assert.equal(resolve(result!), resolve(project));
+  });
+});
+
+describe("isPathWithin", () => {
+  it("treats win32 paths as case-insensitive", () => {
+    assert.equal(isPathWithin("C:\\Users\\Me\\proj", "c:\\users\\me\\PROJ\\memory", "win32"), true);
+    assert.equal(isPathWithin("C:\\Users\\Me\\proj", "c:\\Users\\Me\\PROJ", "win32"), true);
+  });
+
+  it("stays case-sensitive on POSIX platforms", () => {
+    assert.equal(isPathWithin("/home/me/proj", "/home/me/PROJ/memory", "linux"), false);
+    assert.equal(isPathWithin("/home/me/proj", "/home/me/proj/memory", "linux"), true);
+  });
+
+  it("rejects sibling paths on every platform", () => {
+    assert.equal(isPathWithin("C:\\Users\\Me\\proj", "C:\\Users\\Me\\proj-other", "win32"), false);
+    assert.equal(isPathWithin("/home/me/proj", "/home/me/proj-other", "linux"), false);
   });
 });

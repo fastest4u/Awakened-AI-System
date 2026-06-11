@@ -22,6 +22,11 @@ export type EmbeddingProviderKind = "none" | "hash" | "http";
 export interface EmbeddingConfig {
   provider: EmbeddingProviderKind;
   dimensions: number;
+  /** True when MEMORY_EMBEDDINGS_DIM was set explicitly. The http provider only
+   *  sends a `dimensions` request field (and keys its cache id on it) when the
+   *  operator actually chose one — `dimensions` alone always carries the
+   *  default, so it cannot distinguish "configured 256" from "unset". */
+  dimensionsExplicit: boolean;
   endpoint?: string;
   model?: string;
   apiKey?: string;
@@ -50,9 +55,11 @@ export function loadEmbeddingConfig(env: NodeJS.ProcessEnv = process.env): Embed
     const v = value?.trim();
     return v && v.length > 0 ? v : undefined;
   };
+  const rawDim = trimmed(env.MEMORY_EMBEDDINGS_DIM);
   return {
     provider: parseProvider(env.MEMORY_EMBEDDINGS),
     dimensions: parseInt32(env.MEMORY_EMBEDDINGS_DIM, DEFAULT_DIM),
+    dimensionsExplicit: rawDim !== undefined && Number.isFinite(Number.parseInt(rawDim, 10)),
     endpoint: trimmed(env.MEMORY_EMBEDDINGS_ENDPOINT),
     model: trimmed(env.MEMORY_EMBEDDINGS_MODEL),
     apiKey: trimmed(env.MEMORY_EMBEDDINGS_API_KEY),
@@ -80,7 +87,9 @@ export function createEmbeddingProvider(config: EmbeddingConfig): EmbeddingProvi
         endpoint: config.endpoint,
         model: config.model,
         apiKey: config.apiKey,
-        dimensions: config.dimensions,
+        // Only an explicitly configured dim is forwarded; the fallback default
+        // (256) is a hash-embedder concern, not a request to reshape the model.
+        dimensions: config.dimensionsExplicit ? config.dimensions : undefined,
         timeoutMs: config.timeoutMs,
       });
     case "none":

@@ -1,13 +1,29 @@
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { createRequire } from "node:module";
-import { platform as nodePlatform } from "node:os";
+import { homedir, platform as nodePlatform } from "node:os";
 import { dirname, join, parse, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+
+export type MemoryResolutionSource =
+  | "env-explicit"
+  | "env-vault-marker"
+  | "env-workspace-marker"
+  | "ide-state"
+  | "incidental-env"
+  | "fallback";
+
+export interface MemoryConfigResolution {
+  /** Which detection tier produced the project root. */
+  source: MemoryResolutionSource;
+  /** True when the resolved root contains the vault marker (memory/AGENTS.md). */
+  vaultMarkerFound: boolean;
+}
 
 export interface MemoryConfig {
   projectRoot: string;
   vaultRoot: string;
   vaultDirName: string;
+  resolution: MemoryConfigResolution;
 }
 
 export interface WorkspaceDiagnosticCandidate {
@@ -42,6 +58,8 @@ export interface MemoryDoctorRemediation {
 export interface MemoryClientConfigDiagnostic {
   path: string;
   active: boolean;
+  /** Where the config lives; global configs are only partially scanned. */
+  scope?: "project" | "global";
   exists: boolean;
   hasProjectMemory: boolean;
   hasMemoryProjectRoot: boolean;
@@ -88,6 +106,8 @@ export interface MemoryDoctorDiagnostic {
 
 export interface MemoryConfigDiagnostic {
   config: MemoryConfig;
+  /** Provenance of the resolved project root (mirrors `config.resolution`). */
+  resolution: MemoryConfigResolution;
   workspace: {
     source: string;
     candidates: WorkspaceDiagnosticCandidate[];
@@ -141,14 +161,19 @@ const firstDefined = (...values: Array<string | undefined>) => values.find((valu
 
 const dynamicRootValues = new Set(["auto", "detect", "dynamic", "workspace"]);
 
-const candidateEnvNames = [
+// Env vars that carry a deliberately communicated workspace location.
+const intentionalEnvNames = [
   "MEMORY_WORKSPACE_ROOT",
   "WORKSPACE_ROOT",
   "PROJECT_ROOT",
   "INIT_CWD",
-  "PWD",
-  "OLDPWD",
 ];
+
+// Shell residue inherited from whatever shell spawned the client. Often stale,
+// so these must never outrank a vault-bearing cwd or live IDE state.
+const incidentalEnvNames = ["PWD", "OLDPWD"];
+
+const candidateEnvNames = [...intentionalEnvNames, ...incidentalEnvNames];
 
 // Discriminating markers only. Bare IDE config dirs (.codex / .cursor / .kiro /
 // .windsurf) and a bare "memory" folder are intentionally NOT used here:
@@ -253,6 +278,7 @@ const CLIENT_DEFINITIONS: ClientDefinition[] = [
 // Kiro (AWS) is also a VS Code fork and uses the same layout.
 const IDE_PRODUCT_DIRS = [
   "Windsurf",
+  "devin",
   "Windsurf-Next",
   "Cursor",
   "Code",
@@ -307,9 +333,16 @@ function hasWorkspaceMarker(directory: string): boolean {
 }
 
 /** True when `child` resolves to `parent` or a path nested under it. */
-function isPathWithin(parent: string, child: string): boolean {
-  const base = resolve(parent);
-  const target = resolve(child);
+function isPathWithin(parent: string, child: string, platform: NodeJS.Platform = nodePlatform()): boolean {
+  // win32 filesystems are case-insensitive; compare lowercased so casing drift
+  // between env-provided and IDE-provided paths (C:\Users vs c:\users) does
+  // not flag VAULT_OUTSIDE_PROJECT spuriously.
+  const normalize = (value: string) => {
+    const resolved = resolve(value);
+    return platform === "win32" ? resolved.toLowerCase() : resolved;
+  };
+  const base = normalize(parent);
+  const target = normalize(child);
   return target === base || target.startsWith(`${base}/`) || target.startsWith(`${base}\\`);
 }
 
@@ -317,12 +350,34 @@ function hasVaultMarker(directory: string): boolean {
   return existsSync(resolve(directory, VAULT_MARKER));
 }
 
-function findWorkspaceRoot(start: string): string | undefined {
+/**
+ * True when `directory` must never be adopted as a workspace root: the user
+ * home (stray ~/AGENTS.md or ~/package.json files — and ~/memory leftovers
+ * from broken vault runs — would otherwise turn the home directory into a
+ * vault location) or a filesystem root.
+ */
+function isForbiddenWorkspaceRoot(directory: string, homeDir: string): boolean {
+  const resolved = resolve(directory);
+  if (resolved === parse(resolved).root) {
+    return true;
+  }
+  const home = resolve(homeDir);
+  if (nodePlatform() === "win32") {
+    return resolved.toLowerCase() === home.toLowerCase();
+  }
+  return resolved === home;
+}
+
+function walkUpForMarker(
+  start: string,
+  matches: (directory: string) => boolean,
+  homeDir: string,
+): string | undefined {
   let current = resolve(start);
   const root = parse(current).root;
 
   while (true) {
-    if (hasWorkspaceMarker(current)) {
+    if (!isForbiddenWorkspaceRoot(current, homeDir) && matches(current)) {
       return current;
     }
 
@@ -332,6 +387,15 @@ function findWorkspaceRoot(start: string): string | undefined {
 
     current = dirname(current);
   }
+}
+
+function findWorkspaceRoot(start: string, homeDir: string = homedir()): string | undefined {
+  return walkUpForMarker(start, hasWorkspaceMarker, homeDir);
+}
+
+/** Walk up looking specifically for the vault marker (`memory/AGENTS.md`). */
+function findVaultWorkspaceRoot(start: string, homeDir: string = homedir()): string | undefined {
+  return walkUpForMarker(start, hasVaultMarker, homeDir);
 }
 
 /**
@@ -726,53 +790,96 @@ function findIdeActiveWorkspace(
   return pickIdeActiveWorkspace([...vscodeLike, ...opencode, ...zed]);
 }
 
-function resolveDynamicProjectRoot(env: NodeJS.ProcessEnv, cwd: string): string {
-  // Order matters:
-  //   1. Explicit env values win.
-  //   2. If cwd is already inside an initialized memory workspace, trust it.
-  //      This keeps the CLI pointed at the directory it was launched from.
-  //   3. IDE state fills the MCP-server case where cwd is usually the client
-  //      install directory rather than the user's project.
-  const envCandidates = candidateEnvNames
-    .map((name) => env[name])
-    .filter((value): value is string => Boolean(value && value.trim().length > 0 && !isDynamicRootValue(value)));
+interface DynamicRootResolution {
+  root: string;
+  source: Exclude<MemoryResolutionSource, "env-explicit">;
+  vaultMarkerFound: boolean;
+}
 
-  for (const candidate of envCandidates) {
-    const workspaceRoot = findWorkspaceRoot(candidate);
-    if (workspaceRoot) {
-      return workspaceRoot;
+function resolveDynamicProjectRoot(
+  env: NodeJS.ProcessEnv,
+  cwd: string,
+  homeDir: string = homedir(),
+): DynamicRootResolution {
+  const envValue = (name: string): string | undefined => {
+    const value = env[name];
+    return value && value.trim().length > 0 && !isDynamicRootValue(value) ? value : undefined;
+  };
+
+  // Pass 1 — strongest dynamic signal: any env candidate or cwd whose walk-up
+  // reaches a directory already containing the vault marker (memory/AGENTS.md).
+  // An initialized vault always beats generic workspace markers.
+  const vaultStarts = [...candidateEnvNames.map(envValue), cwd]
+    .filter((value): value is string => Boolean(value && value.trim().length > 0));
+  for (const start of vaultStarts) {
+    const vaultWorkspace = findVaultWorkspaceRoot(start, homeDir);
+    if (vaultWorkspace) {
+      return { root: vaultWorkspace, source: "env-vault-marker", vaultMarkerFound: true };
     }
   }
 
-  const cwdWorkspace = findWorkspaceRoot(cwd);
-  if (cwdWorkspace && hasVaultMarker(cwdWorkspace)) {
-    return cwdWorkspace;
+  // Pass 2 — intentionally communicated env locations (NOT PWD/OLDPWD, which
+  // are just shell residue): accept any generic workspace marker.
+  for (const name of intentionalEnvNames) {
+    const value = envValue(name);
+    if (!value) continue;
+    const workspaceRoot = findWorkspaceRoot(value, homeDir);
+    if (workspaceRoot) {
+      return { root: workspaceRoot, source: "env-workspace-marker", vaultMarkerFound: hasVaultMarker(workspaceRoot) };
+    }
   }
 
+  // Pass 3 — IDE state fills the MCP-server case where cwd is usually the
+  // client install directory rather than the user's project.
   const ideWorkspace = findIdeActiveWorkspace(env);
-  const candidates = [ideWorkspace, cwd]
-    .filter((value): value is string => Boolean(value && value.trim().length > 0 && !isDynamicRootValue(value)));
-
-  for (const candidate of candidates) {
-    const workspaceRoot = findWorkspaceRoot(candidate);
+  if (ideWorkspace) {
+    const workspaceRoot = findWorkspaceRoot(ideWorkspace, homeDir);
     if (workspaceRoot) {
-      return workspaceRoot;
+      return { root: workspaceRoot, source: "ide-state", vaultMarkerFound: hasVaultMarker(workspaceRoot) };
     }
   }
 
-  // Last resort: trust the IDE state path itself even if the marker walk
-  // didn't find one (e.g. brand-new project without a vault yet).
-  if (ideWorkspace) {
-    return resolve(ideWorkspace);
+  // cwd walk-up to a generic marker keeps the CLI pointed at the project it
+  // was launched from. It stays above PWD/OLDPWD because cwd is at least the
+  // directory this process actually runs in.
+  const cwdWorkspace = findWorkspaceRoot(cwd, homeDir);
+  if (cwdWorkspace) {
+    return { root: cwdWorkspace, source: "fallback", vaultMarkerFound: hasVaultMarker(cwdWorkspace) };
   }
-  return resolve(cwd);
+
+  // Pass 4 — incidental shell residue is the LAST env tier: a stale PWD must
+  // never outrank a vault-bearing cwd or live IDE state.
+  for (const name of incidentalEnvNames) {
+    const value = envValue(name);
+    if (!value) continue;
+    const workspaceRoot = findWorkspaceRoot(value, homeDir);
+    if (workspaceRoot) {
+      return { root: workspaceRoot, source: "incidental-env", vaultMarkerFound: hasVaultMarker(workspaceRoot) };
+    }
+  }
+
+  // Pass 5 — last resort: trust the IDE state path itself even if the marker
+  // walk didn't find one (e.g. brand-new project without a vault yet).
+  if (ideWorkspace) {
+    const root = resolve(ideWorkspace);
+    return { root, source: "ide-state", vaultMarkerFound: hasVaultMarker(root) };
+  }
+  const root = resolve(cwd);
+  return { root, source: "fallback", vaultMarkerFound: hasVaultMarker(root) };
 }
 
 export function loadMemoryConfig(env: NodeJS.ProcessEnv = process.env, cwd = process.cwd()): MemoryConfig {
   const configuredProjectRoot = firstDefined(env.MEMORY_PROJECT_ROOT, env.PROJECT_ROOT, env.WORKSPACE_ROOT);
-  const projectRoot = configuredProjectRoot && !isDynamicRootValue(configuredProjectRoot)
-    ? resolve(configuredProjectRoot)
-    : resolveDynamicProjectRoot(env, cwd);
+  let projectRoot: string;
+  let resolution: MemoryConfigResolution;
+  if (configuredProjectRoot && !isDynamicRootValue(configuredProjectRoot)) {
+    projectRoot = resolve(configuredProjectRoot);
+    resolution = { source: "env-explicit", vaultMarkerFound: hasVaultMarker(projectRoot) };
+  } else {
+    const dynamic = resolveDynamicProjectRoot(env, cwd);
+    projectRoot = dynamic.root;
+    resolution = { source: dynamic.source, vaultMarkerFound: dynamic.vaultMarkerFound };
+  }
   const vaultDirName = firstDefined(env.MEMORY_VAULT_DIR) ?? "memory";
   const vaultRoot = env.MEMORY_VAULT_PATH ? resolve(env.MEMORY_VAULT_PATH) : resolve(projectRoot, vaultDirName);
 
@@ -780,6 +887,7 @@ export function loadMemoryConfig(env: NodeJS.ProcessEnv = process.env, cwd = pro
     projectRoot,
     vaultRoot,
     vaultDirName,
+    resolution,
   };
 }
 
@@ -897,11 +1005,13 @@ function projectMemoryCommandArgs(projectRoot: string): string[] {
 
 function projectMemoryJsonServer(projectRoot: string): Record<string, unknown> {
   const [command, serverPath] = projectMemoryCommandArgs(projectRoot);
+  // Pin the literal project root: auto-detection ("dynamic") can mis-resolve
+  // when the client spawns the server from its own install directory.
   return {
     command,
     args: [serverPath],
     env: {
-      MEMORY_PROJECT_ROOT: "dynamic",
+      MEMORY_PROJECT_ROOT: configPathForSnippet(projectRoot),
     },
   };
 }
@@ -917,7 +1027,7 @@ function projectMemorySnippet(client: MemoryClientName, projectRoot: string): st
       "enabled = true",
       "",
       "[mcp_servers.project-memory.env]",
-      "MEMORY_PROJECT_ROOT = \"dynamic\"",
+      `MEMORY_PROJECT_ROOT = "${configPathForSnippet(projectRoot)}"`,
     ].join("\n");
   }
   if (client === "zed") {
@@ -933,7 +1043,7 @@ function projectMemorySnippet(client: MemoryClientName, projectRoot: string): st
             command: [command, serverPath],
             enabled: true,
             environment: {
-              MEMORY_PROJECT_ROOT: "dynamic",
+              MEMORY_PROJECT_ROOT: configPathForSnippet(projectRoot),
             },
           },
         },
@@ -943,6 +1053,55 @@ function projectMemorySnippet(client: MemoryClientName, projectRoot: string): st
     );
   }
   return JSON.stringify({ mcpServers: { "project-memory": server } }, null, 2);
+}
+
+const CLAUDE_GLOBAL_CONFIG_FILE = ".claude.json";
+
+/**
+ * Locate the global Claude Code config (`~/.claude.json`). Resolved from env
+ * (like ideAppDataRoots) so tests can point HOME at a fixture directory.
+ */
+function claudeGlobalConfigPath(env: NodeJS.ProcessEnv): string | undefined {
+  const home = env.HOME || env.USERPROFILE;
+  return home ? join(home, CLAUDE_GLOBAL_CONFIG_FILE) : undefined;
+}
+
+function recordHasProjectMemoryServer(value: unknown): boolean {
+  const servers = asRecord(asRecord(value)?.mcpServers);
+  return servers !== undefined && "project-memory" in servers;
+}
+
+/**
+ * Partial scan of the global Claude Code config: project-memory may be
+ * registered at the top-level `mcpServers` or per-project under
+ * `projects[*].mcpServers`. Only this one global location is probed — other
+ * clients' global configs are not scanned at all.
+ */
+function inspectClaudeGlobalConfig(path: string): InspectedClientConfig | undefined {
+  if (!safeExists(path)) {
+    return undefined;
+  }
+  const readResult = safeReadText(path);
+  const text = readResult.text ?? "";
+  const parsed = readResult.text !== undefined ? parseJsonConfig(text) : {};
+  const root = asRecord(parsed.json);
+  const projects = asRecord(root?.projects);
+  const hasProjectMemory = recordHasProjectMemoryServer(root)
+    || (projects !== undefined && Object.values(projects).some(recordHasProjectMemoryServer));
+  return {
+    diagnostic: {
+      path,
+      active: true,
+      scope: "global",
+      exists: true,
+      hasProjectMemory,
+      hasMemoryProjectRoot: text.includes("MEMORY_PROJECT_ROOT"),
+      memoryProjectRoot: extractMemoryProjectRoot(text),
+      parseError: readResult.error ?? parsed.error,
+    },
+    text: readResult.text,
+    json: parsed.json,
+  };
 }
 
 function inspectClientConfig(projectRoot: string, probe: ClientConfigProbe): InspectedClientConfig {
@@ -994,7 +1153,11 @@ function inferEnabledFromText(inspected: InspectedClientConfig[]): boolean | und
   return undefined;
 }
 
-function diagnoseClientIntegration(projectRoot: string, definition: ClientDefinition): MemoryClientDiagnostic {
+function diagnoseClientIntegration(
+  projectRoot: string,
+  definition: ClientDefinition,
+  env: NodeJS.ProcessEnv,
+): MemoryClientDiagnostic {
   const inspected = definition.probes.map((probe) => inspectClientConfig(projectRoot, probe));
   const activeInspected = inspected.filter((config) => config.diagnostic.active);
   const configs = inspected.map((config) => config.diagnostic);
@@ -1026,6 +1189,19 @@ function diagnoseClientIntegration(projectRoot: string, definition: ClientDefini
     const projectMcp = inspected.find((config) => config.diagnostic.path.endsWith(join(projectRoot, ".mcp.json")));
     if (enabled && !projectMcp?.diagnostic.exists) {
       issues.push("CLAUDE_MCP_SERVER_DEFINITION_NOT_LOCAL");
+    }
+
+    // The global ~/.claude.json can also register project-memory. Appended
+    // after the project-local probes so existing config indexes stay stable,
+    // and deliberately kept out of activeConfigs/inferEnabledFromText: a
+    // partial scan must not raise parse warnings or flip the enabled signal.
+    const globalPath = claudeGlobalConfigPath(env);
+    const globalConfig = globalPath ? inspectClaudeGlobalConfig(globalPath) : undefined;
+    if (globalConfig) {
+      configs.push(globalConfig.diagnostic);
+      if (globalConfig.diagnostic.hasProjectMemory) {
+        configured = true;
+      }
     }
   }
 
@@ -1089,7 +1265,7 @@ function clientIssueRemediation(
   switch (code) {
     case "CLIENT_CONFIG_MISSING_PROJECT_MEMORY":
       return {
-        summary: `Add a project-memory MCP server entry to ${client.displayName}'s active config.`,
+        summary: `Add a project-memory MCP server entry to ${client.displayName}'s active config. The snippet pins MEMORY_PROJECT_ROOT to this project's path; set it to "dynamic" to fall back to auto-detection.`,
         path,
         snippet: projectMemorySnippet(client.client, projectRoot),
       };
@@ -1109,10 +1285,13 @@ function clientIssueRemediation(
   }
 }
 
+const UNVERIFIED_RESOLUTION_SOURCES: MemoryResolutionSource[] = ["ide-state", "incidental-env", "fallback"];
+
 function buildMemoryDoctorDiagnostic(
   config: MemoryConfig,
   build: MemoryBuildInfo | null,
   vaultWithinProject: boolean,
+  env: NodeJS.ProcessEnv,
 ): MemoryDoctorDiagnostic {
   const checks = {
     projectRootExists: safeExists(config.projectRoot),
@@ -1121,8 +1300,23 @@ function buildMemoryDoctorDiagnostic(
     vaultWithinProject,
     buildInfoPresent: build !== null,
   };
-  const clients = CLIENT_DEFINITIONS.map((definition) => diagnoseClientIntegration(config.projectRoot, definition));
+  const clients = CLIENT_DEFINITIONS.map((definition) => diagnoseClientIntegration(config.projectRoot, definition, env));
   const issues: MemoryDoctorIssue[] = [];
+
+  if (UNVERIFIED_RESOLUTION_SOURCES.includes(config.resolution.source) && !config.resolution.vaultMarkerFound) {
+    addDoctorIssue(
+      issues,
+      "warning",
+      "PROJECT_ROOT_UNVERIFIED",
+      `The project root was auto-detected (${config.resolution.source}) without finding a memory vault marker; it may point at the wrong workspace.`,
+      undefined,
+      config.projectRoot,
+      {
+        summary: `Set MEMORY_PROJECT_ROOT to the intended workspace path (e.g. "${configPathForSnippet(config.projectRoot)}" if this detection is correct); "dynamic" re-enables auto-detection.`,
+        path: config.projectRoot,
+      },
+    );
+  }
 
   if (!checks.projectRootExists) {
     addDoctorIssue(
@@ -1211,16 +1405,22 @@ function buildMemoryDoctorDiagnostic(
     }
   }
 
-  if (!clients.some((client) => client.configs.some((configFile) => configFile.active && configFile.exists))) {
+  // Global configs are only partially scanned (currently just Claude Code's
+  // ~/.claude.json), so they only count as "found" when they actually register
+  // project-memory.
+  const anyClientConfigFound = clients.some((client) =>
+    client.configs.some((configFile) =>
+      configFile.active && configFile.exists && (configFile.scope !== "global" || configFile.hasProjectMemory)));
+  if (!anyClientConfigFound) {
     addDoctorIssue(
       issues,
       "warning",
       "NO_CLIENT_CONFIGS_FOUND",
-      "No known local AI client MCP config files were found.",
+      "No known project-local AI client MCP config files were found (global client configs are only partially scanned).",
       undefined,
       undefined,
       {
-        summary: "Create a local client MCP config or run memory_bootstrapProject with IDE config generation enabled.",
+        summary: "Create a local client MCP config or run memory_bootstrapProject with IDE config generation enabled. The snippet pins MEMORY_PROJECT_ROOT to this project's path; set it to \"dynamic\" to fall back to auto-detection.",
         snippet: projectMemorySnippet("cursor", config.projectRoot),
       },
     );
@@ -1256,6 +1456,7 @@ export function diagnoseMemoryConfig(
 
   return {
     config,
+    resolution: config.resolution,
     workspace: {
       source: explicitSource ?? selected?.source ?? "fallback-cwd",
       candidates,
@@ -1278,7 +1479,7 @@ export function diagnoseMemoryConfig(
     },
     build,
     vaultWithinProject,
-    doctor: buildMemoryDoctorDiagnostic(config, build, vaultWithinProject),
+    doctor: buildMemoryDoctorDiagnostic(config, build, vaultWithinProject, env),
   };
 }
 
@@ -1302,6 +1503,8 @@ export const __internals = {
   hasWorkspaceMarker,
   hasVaultMarker,
   findWorkspaceRoot,
+  findVaultWorkspaceRoot,
+  isPathWithin,
   isDynamicRootValue,
   tryLoadSqlite,
 };

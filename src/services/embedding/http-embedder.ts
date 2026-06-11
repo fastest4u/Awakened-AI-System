@@ -16,6 +16,9 @@ export interface HttpEmbedderOptions {
   endpoint: string;
   model: string;
   apiKey?: string;
+  /** Set only when the operator explicitly configured a dimensionality; it is
+   *  then sent as `dimensions` in the request body (OpenAI shape) and baked
+   *  into the embedder id so changing it invalidates cached vectors. */
   dimensions?: number;
   timeoutMs?: number;
   /** Injectable for tests; defaults to the global fetch (Node >= 18). */
@@ -62,9 +65,10 @@ export class HttpEmbedder implements EmbeddingProvider {
     const provided = options.fetchImpl ?? (globalThis.fetch as FetchLike | undefined);
     if (!provided) throw new Error("HttpEmbedder requires a fetch implementation (global fetch unavailable)");
     this.fetchImpl = provided;
-    // Identity keys on the model (the vector space), not the endpoint, so moving
-    // the same model between hosts does not needlessly invalidate the cache.
-    this.id = `http:${this.model}`;
+    // Identity keys on the model AND its dimensionality (the vector space), not
+    // the endpoint, so moving the same model between hosts does not needlessly
+    // invalidate the cache — but a dim change does (0 = endpoint default).
+    this.id = `http:${this.model}:${this.dimensions}`;
   }
 
   async embed(texts: string[]): Promise<number[][]> {
@@ -75,7 +79,9 @@ export class HttpEmbedder implements EmbeddingProvider {
         "content-type": "application/json",
         ...(this.apiKey ? { authorization: `Bearer ${this.apiKey}` } : {}),
       },
-      body: JSON.stringify({ model: this.model, input: texts }),
+      // `dimensions` is sent only when explicitly configured; endpoints that do
+      // not support it would otherwise reject the request.
+      body: JSON.stringify({ model: this.model, input: texts, ...(this.dimensions > 0 ? { dimensions: this.dimensions } : {}) }),
       signal: AbortSignal.timeout(this.timeoutMs),
     });
     if (!response.ok) {
@@ -84,6 +90,13 @@ export class HttpEmbedder implements EmbeddingProvider {
     const vectors = extractVectors(await response.json());
     if (vectors.length !== texts.length) {
       throw new Error(`embedding endpoint returned ${vectors.length} vectors for ${texts.length} inputs`);
+    }
+    // Mixed dimensionality means at least one vector is malformed/truncated —
+    // cosine over mismatched lengths would silently compare garbage.
+    const dims = vectors[0]?.length ?? 0;
+    const mismatch = vectors.find((vec) => vec.length !== dims);
+    if (mismatch) {
+      throw new Error(`embedding endpoint returned vectors of differing lengths (${dims} vs ${mismatch.length}); expected a uniform dimensionality`);
     }
     return vectors.map((vec) => l2normalize(vec));
   }
