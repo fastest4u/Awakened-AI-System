@@ -478,7 +478,9 @@ export class FrontmatterService {
       case "status":
         return inferTypeFromPath(path) === "mistake" ? "open" : "active";
       case "schema-version":
-        return FRONTMATTER_SCHEMA_VERSION;
+        // Numeric form, matching the stampVersion path — the YAML emitter
+        // quotes the string "1" as a number-lookalike.
+        return CURRENT_SCHEMA_VERSION;
       default:
         return today;
     }

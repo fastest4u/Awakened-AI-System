@@ -25,16 +25,38 @@ export interface HttpEmbedderOptions {
   fetchImpl?: FetchLike;
 }
 
-/** Pull vectors out of the known response shapes, defensively. */
+/** Pull vectors out of the known response shapes, defensively. Throws only for
+ *  an index-tagged OpenAI response whose indices are inconsistent (duplicate,
+ *  out-of-range, or present on some entries but not others) — callers treat a
+ *  throw like any other provider failure (catch + cooldown). */
 export function extractVectors(json: unknown): number[][] {
   if (!json || typeof json !== "object") return [];
   const obj = json as Record<string, unknown>;
-  // OpenAI: { data: [{ embedding: number[] }, ...] }
+  // OpenAI: { data: [{ embedding: number[], index?: number }, ...] }
   if (Array.isArray(obj.data)) {
-    return obj.data.map((entry) => {
-      const embedding = (entry as { embedding?: unknown })?.embedding;
+    const entries = obj.data;
+    const toVector = (entry: unknown) => {
+      const embedding = (entry as { embedding?: unknown } | null)?.embedding;
       return Array.isArray(embedding) ? embedding.map(Number) : [];
-    });
+    };
+    const indexOf = (entry: unknown) => (entry as { index?: unknown } | null)?.index;
+    // No index fields -> positional order (Ollama-style lookalikes and older shapes).
+    if (!entries.some((entry) => typeof indexOf(entry) === "number")) return entries.map(toVector);
+    // OpenAI tags each entry with its input position and does not guarantee
+    // array order; place each vector at its declared index. Inconsistent
+    // indices (duplicate, out-of-range, missing on some entries) are malformed.
+    const out = new Array<number[]>(entries.length);
+    for (const entry of entries) {
+      const index = indexOf(entry);
+      if (typeof index !== "number" || !Number.isInteger(index) || index < 0 || index >= entries.length) {
+        throw new Error(`embedding response entry has an invalid index (${String(index)})`);
+      }
+      if (out[index] !== undefined) {
+        throw new Error(`embedding response repeats index ${index}`);
+      }
+      out[index] = toVector(entry);
+    }
+    return out;
   }
   // Ollama /api/embed (batch): { embeddings: number[][] }
   if (Array.isArray(obj.embeddings)) {

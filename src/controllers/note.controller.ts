@@ -40,6 +40,11 @@ export class NoteController {
 
   async get(input: z.infer<typeof getInputSchema>) {
     const startedAt = Date.now();
+    // Enforced here, not via .refine on getInputSchema: the MCP SDK advertises
+    // a ZodEffects as an empty JSON schema, hiding the contract from clients.
+    if (!input.path && !input.id && !input.title) {
+      return this.responses.buildError("memory_get", startedAt, "INVALID_INPUT", "Provide path, id, or title");
+    }
     try {
       const reference = `${input.path ?? input.title ?? input.id}`;
       const note = await this.query.get(reference);

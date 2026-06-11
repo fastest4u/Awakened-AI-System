@@ -30,20 +30,21 @@ export const searchInputSchema = z.object({
   limit: z.number().int().positive().max(100).default(10),
   offset: z.number().int().nonnegative().default(0),
   sortBy: sortSchema.default("relevance"),
-  scope: searchScopeSchema.default("all").describe("Which fields must match: all (title+tags+aliases+type+body), title, or tags"),
+  scope: searchScopeSchema.default("all").describe("Which fields must match: all (title+tags+aliases+type+body), title, or tags. Applies only when the query yields searchable tokens; a query that tokenizes to nothing falls back to a newest-first listing"),
   includeBody: z.boolean().default(false),
   includeSections: z.boolean().default(false).describe("Attach the best-matching heading anchor (section, line, snippet) to each hit"),
 }).strict();
 
+// No .refine here: a ZodEffects wrapper is advertised to MCP clients as an
+// empty JSON schema while .strict() still hard-fails unknown keys. The
+// "at least one of path/id/title" rule is enforced in NoteController.get.
 export const getInputSchema = z.object({
   path: z.string().optional(),
   id: z.string().optional(),
   title: z.string().optional(),
   includeBody: z.boolean().default(true),
   includeLinks: z.boolean().default(true),
-}).strict().refine((value) => value.path || value.id || value.title, {
-  message: "Provide path, id, or title",
-});
+}).strict();
 
 export const listInputSchema = baseListSchema.extend({
   folder: z.string().optional(),
@@ -57,22 +58,6 @@ export const recentInputSchema = z.object({
   sortBy: z.enum(["updated", "created"]).default("updated"),
   folders: z.array(z.string()).default([]),
   types: z.array(noteTypeSchema).default([]),
-}).strict();
-
-export const relatedInputSchema = z.object({
-  path: z.string().optional(),
-  query: z.string().optional(),
-  limit: z.number().int().positive().max(20).default(10),
-  mode: z.enum(["links", "tags", "text", "hybrid"]).default("hybrid"),
-}).strict().refine((value) => value.path || value.query, {
-  message: "Provide path or query",
-});
-
-export const summarizeContextInputSchema = z.object({
-  paths: z.array(z.string()).min(1),
-  question: z.string().optional(),
-  maxTokens: z.number().int().positive().max(8000).default(1200),
-  style: z.enum(["brief", "detailed", "bullet"]).default("brief"),
 }).strict();
 
 export const writeSessionLogInputSchema = z.object({

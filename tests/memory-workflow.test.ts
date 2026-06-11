@@ -115,6 +115,24 @@ describe("MemoryWorkflowService context pack and lifecycle workflows", () => {
     );
   });
 
+  it("applies the relevance gate to CJK-only queries via n-gram rank terms", async () => {
+    // A Japanese query yields zero word tokens; only its character n-grams can
+    // drive ranking, so the gate must be keyed on rank terms.
+    writeFileSync(
+      join(root, "07_Insights", "DB-Migration-JA.md"),
+      `---\ntitle: "データベース移行の手順"\ntype: insight\ncreated: "2026-04-01"\nupdated: "2026-04-02"\ntags:\n  - migration\n---\n\nデータベース移行は必ずバックアップを取得してから実行する。\n`,
+      "utf8",
+    );
+    const pack = await workflows.contextPack({ query: "データベース移行", maxItems: 10, maxChars: 8000 });
+    const paths = pack.selected.map((item) => item.path);
+    assert.ok(paths.includes("07_Insights/DB-Migration-JA.md"), "the matching Japanese note must be ranked and selected");
+    assert.equal(
+      paths.includes("01_Project_Rules/Project-Working-Agreements.md"),
+      false,
+      "type weight alone must not admit unrelated notes when the query is CJK-only",
+    );
+  });
+
   it("keeps type-weight ordering as the fallback when no scoring terms exist", async () => {
     const pack = await workflows.contextPack({ maxItems: 10, maxChars: 8000 });
     const paths = pack.selected.map((item) => item.path);
@@ -163,11 +181,35 @@ describe("MemoryWorkflowService context pack and lifecycle workflows", () => {
         "utf8",
       );
     }
-    const noArea = await workflows.selfCheck({ task: "general cleanup", riskLevel: "low" });
+    // "filler"/"incident" match the six extras plus the elephant mistake (tag
+    // "incident"), so 7 mistakes pass the relevance gate before the cap.
+    const noArea = await workflows.selfCheck({ task: "filler incident", riskLevel: "low" });
     assert.equal(noArea.pastMistakesToAvoid.length, 5);
-    const withArea = await workflows.selfCheck({ task: "general cleanup", area: "vault", riskLevel: "low" });
+    const withArea = await workflows.selfCheck({ task: "filler incident", area: "incident", riskLevel: "low" });
     assert.ok(withArea.pastMistakesToAvoid.length > 5);
     assert.ok(withArea.pastMistakesToAvoid.length <= 10);
+  });
+
+  it("selfCheck keeps substring area matches and drops unmatched mistakes", async () => {
+    // Older than both seeded mistakes, and "auth" never BM25-matches the
+    // token "authentication" — only the direct title/path hit can admit it.
+    writeFileSync(
+      join(root, "08_Mistakes", "Mistake-009-authentication-timeout.md"),
+      `---\ntitle: "Authentication timeout"\ntype: mistake\ncreated: "2026-02-20"\nupdated: "2026-02-20"\n---\n\nToken refresh raced the expiry window.\n`,
+      "utf8",
+    );
+    const result = await workflows.selfCheck({ task: "rotate credentials", area: "auth", riskLevel: "high" });
+    const paths = result.pastMistakesToAvoid.map((item) => item.path);
+    assert.ok(paths.includes("08_Mistakes/Mistake-009-authentication-timeout.md"), "substring area match must be kept");
+    assert.equal(result.pastMistakesToAvoid[0].path, "08_Mistakes/Mistake-009-authentication-timeout.md");
+    assert.equal(paths.includes("08_Mistakes/Mistake-001-elephant-stampede.md"), false, "newer unmatched mistakes must not crowd the list");
+    assert.equal(paths.includes("08_Mistakes/Mistake-002-parser-crash.md"), false);
+  });
+
+  it("selfCheck falls back to newest mistakes when no terms are derivable", async () => {
+    const result = await workflows.selfCheck({ task: "??", riskLevel: "low" });
+    assert.equal(result.pastMistakesToAvoid.length, 2);
+    assert.equal(result.pastMistakesToAvoid[0].path, "08_Mistakes/Mistake-002-parser-crash.md", "newest mistake first");
   });
 
   it("awaken does not end, rotate, or create lifecycle sessions", async () => {
@@ -199,6 +241,11 @@ describe("MemoryWorkflowService context pack and lifecycle workflows", () => {
     // A genuine standalone token still matches.
     const review = await workflows.contextPack({ query: "pr feedback", maxItems: 4, maxChars: 2000 });
     assert.equal(review.mode.resolved, "review");
+  });
+
+  it("infers mode from kebab-case slug fragments", async () => {
+    const deploy = await workflows.contextPack({ query: "deploy-pipeline cleanup", maxItems: 4, maxChars: 2000 });
+    assert.equal(deploy.mode.resolved, "deploy");
   });
 
   it("infers mode from Thai keywords", async () => {

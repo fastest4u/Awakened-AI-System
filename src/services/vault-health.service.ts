@@ -40,6 +40,9 @@ interface NoteHealthRecord {
   diagnostics: FrontmatterDiagnostic[];
 }
 
+/** Max near-duplicate title pairs reported, strongest first. */
+const SIMILAR_TITLES_LIMIT = 50;
+
 const PLACEHOLDER_LINKS = new Set([
   "Note Name",
   "Note",
@@ -140,13 +143,23 @@ export class VaultHealthService {
     // "Deploy Runbook" vs "Deploy Runbooks" registers while unrelated titles
     // stay far below any sensible threshold. Exact (case-insensitive) matches
     // are already reported under duplicateTitles, so they are skipped here.
+    // Each title's bigram multiset is built once up front (the pairwise loop
+    // is O(n^2)), and the output is capped at the strongest pairs so a low
+    // threshold cannot return an unbounded result.
+    const prepared = titled.map((entry) => {
+      const lower = entry.title.toLowerCase();
+      const grams = charNgrams(lower, 2, 2);
+      const counts = new Map<string, number>();
+      for (const gram of grams) counts.set(gram, (counts.get(gram) ?? 0) + 1);
+      return { ...entry, lower, total: grams.length, counts };
+    });
     const similarTitles: Array<{ paths: string[]; titles: string[]; similarity: number }> = [];
-    for (let i = 0; i < titled.length; i += 1) {
-      for (let j = i + 1; j < titled.length; j += 1) {
-        const a = titled[i];
-        const b = titled[j];
-        if (a.title.toLowerCase() === b.title.toLowerCase()) continue;
-        const similarity = this.titleSimilarity(a.title.toLowerCase(), b.title.toLowerCase());
+    for (let i = 0; i < prepared.length; i += 1) {
+      for (let j = i + 1; j < prepared.length; j += 1) {
+        const a = prepared[i];
+        const b = prepared[j];
+        if (a.lower === b.lower) continue;
+        const similarity = this.titleSimilarity(a, b);
         if (similarity >= similarityThreshold) {
           similarTitles.push({
             paths: [a.path, b.path],
@@ -156,31 +169,28 @@ export class VaultHealthService {
         }
       }
     }
+    similarTitles.sort((a, b) => b.similarity - a.similarity);
 
     return {
       duplicateBasenames: [...byBase.entries()].filter(([, paths]) => paths.length > 1).map(([name, paths]) => ({ name, paths })),
       duplicateTitles: [...byTitle.entries()].filter(([, paths]) => paths.length > 1).map(([title, paths]) => ({ title, paths })),
-      similarTitles,
+      similarTitles: similarTitles.slice(0, SIMILAR_TITLES_LIMIT),
     };
   }
 
-  /** Dice coefficient over character-bigram multisets of two (lowercased) titles. */
-  private titleSimilarity(a: string, b: string) {
-    if (a === b) return 1;
-    const gramsA = charNgrams(a, 2, 2);
-    const gramsB = charNgrams(b, 2, 2);
-    if (gramsA.length === 0 || gramsB.length === 0) return 0;
-    const counts = new Map<string, number>();
-    for (const gram of gramsA) counts.set(gram, (counts.get(gram) ?? 0) + 1);
+  /** Dice coefficient over precomputed character-bigram count multisets. */
+  private titleSimilarity(
+    a: { counts: Map<string, number>; total: number },
+    b: { counts: Map<string, number>; total: number },
+  ) {
+    if (a.total === 0 || b.total === 0) return 0;
+    const [small, large] = a.counts.size <= b.counts.size ? [a, b] : [b, a];
     let overlap = 0;
-    for (const gram of gramsB) {
-      const remaining = counts.get(gram) ?? 0;
-      if (remaining > 0) {
-        overlap += 1;
-        counts.set(gram, remaining - 1);
-      }
+    for (const [gram, count] of small.counts) {
+      const other = large.counts.get(gram);
+      if (other) overlap += Math.min(count, other);
     }
-    return (2 * overlap) / (gramsA.length + gramsB.length);
+    return (2 * overlap) / (a.total + b.total);
   }
 
   async checkStaleness(folders: string[] = [], olderThanDays = 90) {
@@ -313,8 +323,10 @@ export class VaultHealthService {
   private buildLinkResolver(notes: NoteHealthRecord[]) {
     return buildWikilinkResolver(notes.map((note) => ({
       path: note.path,
-      title: note.frontmatter?.title === undefined ? undefined : String(note.frontmatter.title),
-      id: note.frontmatter?.id === undefined ? undefined : String(note.frontmatter.id),
+      // `== null` (not `=== undefined`): a YAML-null title/id must not
+      // register the literal key "null" as a resolvable link target.
+      title: note.frontmatter?.title == null ? undefined : String(note.frontmatter.title),
+      id: note.frontmatter?.id == null ? undefined : String(note.frontmatter.id),
       aliases: asStringArray(note.frontmatter?.aliases),
     })));
   }

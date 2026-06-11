@@ -77,7 +77,8 @@ export class MemoryFollowUpService {
 
   async radar(input: FollowUpRadarInput) {
     const mode = this.resolveMode(input.mode, input.query, input.taskArea);
-    const terms = this.uniqueTerms([...this.queryTerms(input.query, input.taskArea), ...MODE_TERMS[mode.resolved]]);
+    const queryTerms = this.uniqueTerms(this.queryTerms(input.query, input.taskArea));
+    const terms = this.uniqueTerms([...queryTerms, ...MODE_TERMS[mode.resolved]]);
     const { candidates, scannedFiles } = await this.extractCandidates(input.folders ?? []);
     const scored = candidates
       .map((candidate) => ({
@@ -87,14 +88,16 @@ export class MemoryFollowUpService {
       }))
       .sort((a, b) => b.score - a.score || String(b.updatedAt).localeCompare(String(a.updatedAt)));
 
-    // With query terms, an item matching NO term ranks strictly below every
-    // termed match (base score alone admitted everything before); if nothing
-    // matches at all, return none so the "none matched" guidance can fire.
+    // With terms, an item matching NO term ranks strictly below every termed
+    // match (base score alone admitted everything before). Only user-supplied
+    // query/taskArea terms may empty the result so the "none matched" guidance
+    // can fire; MODE_TERMS alone are for scoring/ordering, so an explicit mode
+    // without a query must still surface every open follow-up.
     let ordered = scored;
     if (terms.length > 0) {
       const matched = scored.filter((candidate) => candidate.matchedTerms.length > 0);
       const unmatched = scored.filter((candidate) => candidate.matchedTerms.length === 0);
-      ordered = matched.length === 0 ? [] : [...matched, ...unmatched];
+      ordered = matched.length === 0 && queryTerms.length > 0 ? [] : [...matched, ...unmatched];
     }
 
     const followUps = ordered.slice(0, input.limit).map((candidate) => ({
@@ -267,6 +270,13 @@ export class MemoryFollowUpService {
 
     const text = `${query ?? ""} ${taskArea ?? ""}`.toLowerCase();
     const tokens = new Set(text.split(/[^a-z0-9ก-๙_-]+/i).filter(Boolean));
+    // Kebab/snake slugs ("deploy-pipeline") also contribute their fragments so
+    // single-word keywords match; the full token is kept for exact matches.
+    for (const token of [...tokens]) {
+      for (const fragment of token.split(/[-_]/)) {
+        if (fragment.length > 0) tokens.add(fragment);
+      }
+    }
     for (const candidate of MODE_KEYWORDS) {
       if (candidate.keywords.some((keyword) => this.matchesKeyword(tokens, text, keyword))) {
         return { requested, resolved: candidate.mode };

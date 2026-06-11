@@ -52,8 +52,13 @@ export class MemoryCompactionService {
       this.extractSession(session.path, session.title, session.body ?? ""));
 
     const targetPath = `${options.targetFolder}/Auto-Memory-Digest.md`;
-    const digest = this.buildDigest(extracted, await this.existingCreated(targetPath));
-    const shouldWrite = extracted.length >= options.minSessions && !options.dryRun;
+    const existing = await this.existingDigest(targetPath);
+    const digest = this.buildDigest(extracted, existing?.created ?? null);
+    // Steady state: an identical body means only the frontmatter `updated`
+    // stamp would change — skip the write so unchanged digests stop churning
+    // mtime and overwrite backups on every sessionEnd.
+    const unchanged = existing !== null && existing.body.trim() === digest.body.trim();
+    const shouldWrite = extracted.length >= options.minSessions && !options.dryRun && !unchanged;
     const savedPath = shouldWrite ? this.notes.create(targetPath, digest.content, true) : null;
 
     return {
@@ -66,25 +71,32 @@ export class MemoryCompactionService {
       candidatePaths: sessions.slice(0, MAX_CANDIDATE_PATHS).map((session) => session.path),
       sessionsRead: extracted.length,
       extracted: digest.counts,
+      digestUnchanged: unchanged,
       preview: options.dryRun ? digest.content : undefined,
       recommendation: extracted.length < options.minSessions
         ? `Need at least ${options.minSessions} session log(s) before compaction.`
-        : "Review Auto-Memory-Digest.md and promote stable decisions into ADRs when they become architectural.",
+        : unchanged
+          ? "Digest is already up to date with the recent session logs; write skipped."
+          : "Review Auto-Memory-Digest.md and promote stable decisions into ADRs when they become architectural.",
     };
   }
 
-  /** created date of the existing digest note, so a rewrite never resets its
-   *  recency (a fresh `created` every run kept the digest atop recency ranks). */
-  private async existingCreated(targetPath: string): Promise<string | null> {
+  /** created date + body of the existing digest note: `created` is preserved so
+   *  a rewrite never resets its recency (a fresh `created` every run kept the
+   *  digest atop recency ranks); the body lets compact() skip no-op rewrites. */
+  private async existingDigest(targetPath: string): Promise<{ created: string | null; body: string } | null> {
     try {
       const existing = await this.query.get(targetPath);
-      const value = existing.frontmatter?.created;
-      if (value instanceof Date) return value.toISOString().slice(0, 10);
-      const text = String(value ?? "").trim();
-      return /^\d{4}-\d{2}-\d{2}/.test(text) ? text.slice(0, 10) : null;
+      return { created: this.createdDate(existing.frontmatter?.created), body: existing.body };
     } catch {
       return null;
     }
+  }
+
+  private createdDate(value: unknown): string | null {
+    if (value instanceof Date) return value.toISOString().slice(0, 10);
+    const text = String(value ?? "").trim();
+    return /^\d{4}-\d{2}-\d{2}/.test(text) ? text.slice(0, 10) : null;
   }
 
   private extractSession(path: string, title: string, body: string): ExtractedSession {
@@ -108,16 +120,7 @@ export class MemoryCompactionService {
     const confidenceLessons = this.unique(sessions.flatMap((session) => session.confidenceLessons)).slice(0, 20);
     const verification = this.unique(sessions.flatMap((session) => session.verification)).slice(0, 20);
 
-    const content = frontmatter({
-      title: "Auto Memory Digest",
-      type: "insight",
-      "derived-from": sourcePaths,
-      confidence: "medium",
-      status: "active",
-      created: existingCreated ?? date,
-      updated: date,
-      tags: ["digest", "auto-compact", "project/general"],
-    }) + [
+    const body = [
       "# Auto Memory Digest",
       "",
       `Generated: ${date}`,
@@ -148,8 +151,20 @@ export class MemoryCompactionService {
       "",
     ].join("\n");
 
+    const content = frontmatter({
+      title: "Auto Memory Digest",
+      type: "insight",
+      "derived-from": sourcePaths,
+      confidence: "medium",
+      status: "active",
+      created: existingCreated ?? date,
+      updated: date,
+      tags: ["digest", "auto-compact", "project/general"],
+    }) + body;
+
     return {
       content,
+      body,
       counts: {
         outcomes: outcomes.length,
         decisions: decisions.length,
@@ -225,13 +240,15 @@ export class MemoryCompactionService {
     return result;
   }
 
-  /** Unicode-safe dedupe key. slugify() strips every non-ASCII character, which
-   *  collapsed all distinct Thai lessons into one "untitled" bucket. */
+  /** NFKC-normalized fuzzy key for spotting near-duplicate text — a different
+   *  job from slugify()'s filename slugs. Keeps \p{M}: Thai vowels and tone
+   *  marks are combining marks, and stripping them collides distinct items
+   *  (e.g. สิทธิ์ vs สุทธิ both reduce to สทธ). */
   private dedupeKey(value: string) {
     const key = value
       .normalize("NFKC")
       .toLowerCase()
-      .replace(/[^\p{L}\p{N}]+/gu, "-")
+      .replace(/[^\p{L}\p{M}\p{N}]+/gu, "-")
       .replace(/^-+|-+$/g, "");
     return key || value;
   }

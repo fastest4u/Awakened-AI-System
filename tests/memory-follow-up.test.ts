@@ -89,6 +89,15 @@ describe("MemoryFollowUpService radar", () => {
     assert.equal(result.followUps[0].path, "00_Index/Open-Followups.md");
   });
 
+  it("returns open follow-ups for an explicit mode without a query", async () => {
+    // No candidate matches a review MODE_TERM; mode terms alone must order,
+    // never hide, the open follow-ups behind the none-matched guidance.
+    const result = await service.radar({ mode: "review", limit: 10 });
+    assert.equal(result.totalOpen, 2);
+    assert.equal(result.returned, 2);
+    assert.equal(result.recommendedActions.some((action) => action.includes("none matched")), false);
+  });
+
   it("caches per-file extraction and only re-parses changed files", async () => {
     let loads = 0;
     const originalLoad = vault.load.bind(vault);
@@ -131,5 +140,10 @@ describe("MemoryFollowUpService radar", () => {
     assert.equal(auto.mode.resolved, "auto");
     const debugging = await service.radar({ query: "ดีบักระบบล็อกอิน", limit: 5 });
     assert.equal(debugging.mode.resolved, "debugging");
+  });
+
+  it("infers mode from kebab-case slug fragments", async () => {
+    const deploy = await service.radar({ query: "deploy-pipeline", limit: 5 });
+    assert.equal(deploy.mode.resolved, "deploy");
   });
 });

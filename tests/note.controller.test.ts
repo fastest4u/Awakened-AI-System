@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, it } from "node:test";
 import { NoteController } from "../src/controllers/note.controller.js";
 import { IndexRepository } from "../src/repositories/index.repository.js";
 import {
+  getInputSchema,
   searchInputSchema,
   sessionEndInputSchema,
   writeAdRInputSchema,
@@ -56,6 +57,16 @@ describe("NoteController memory_get link/body gating", () => {
     assert.equal(res.content[0].text, JSON.stringify(res.structuredContent));
     assert.ok(!res.content[0].text.includes("\n")); // no pretty-printing
   });
+
+  it("returns an INVALID_INPUT error envelope when none of path/id/title is given", async () => {
+    // The requirement lives in the controller, not a schema .refine, so the
+    // registered schema stays a plain strict object the MCP SDK can advertise.
+    const res = await controller.get({ includeBody: true, includeLinks: true });
+    assert.ok("isError" in res && res.isError === true);
+    assert.equal(res.structuredContent.ok, false);
+    assert.equal(res.structuredContent.error?.code, "INVALID_INPUT");
+    assert.equal(res.structuredContent.error?.message, "Provide path, id, or title");
+  });
 });
 
 describe("NoteController search/list option wire-through", () => {
@@ -91,6 +102,14 @@ describe("tool input schema hardening", () => {
     // A typo'd "outcomes" used to be dropped silently, saving an empty session log.
     assert.equal(sessionEndInputSchema.safeParse({ topic: "wrap up", outcoms: ["done"] }).success, false);
     assert.equal(searchInputSchema.safeParse({ query: "x", quary: "x" }).success, false);
+  });
+
+  it("keeps memory_get a plain strict object the MCP SDK can advertise", () => {
+    // A .refine would wrap this in a ZodEffects, advertised as an empty JSON
+    // schema; the path/id/title rule is enforced in NoteController.get instead.
+    assert.equal(typeof getInputSchema.shape, "object"); // ZodObject, not ZodEffects
+    assert.equal(getInputSchema.safeParse({}).success, true);
+    assert.equal(getInputSchema.safeParse({ path: "a.md", pth: "a.md" }).success, false);
   });
 
   it("rejects non-YYYY-MM-DD dates that would corrupt vault paths", () => {

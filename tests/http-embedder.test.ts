@@ -20,6 +20,21 @@ describe("extractVectors", () => {
     assert.deepEqual(extractVectors(null), []);
     assert.deepEqual(extractVectors("nope"), []);
   });
+
+  it("honors OpenAI index fields when the response arrives out of order", () => {
+    assert.deepEqual(
+      extractVectors({ data: [{ index: 1, embedding: [3, 4] }, { index: 0, embedding: [1, 2] }] }),
+      [[1, 2], [3, 4]],
+    );
+  });
+
+  it("throws on duplicate, out-of-range, non-integer, or partially-missing indices", () => {
+    assert.throws(() => extractVectors({ data: [{ index: 0, embedding: [1] }, { index: 0, embedding: [2] }] }), /repeats index 0/);
+    assert.throws(() => extractVectors({ data: [{ index: 0, embedding: [1] }, { index: 2, embedding: [2] }] }), /invalid index \(2\)/);
+    assert.throws(() => extractVectors({ data: [{ index: 0.5, embedding: [1] }, { index: 1, embedding: [2] }] }), /invalid index \(0\.5\)/);
+    // Index present on one entry but missing on another is malformed, not positional.
+    assert.throws(() => extractVectors({ data: [{ index: 0, embedding: [1] }, { embedding: [2] }] }), /invalid index \(undefined\)/);
+  });
 });
 
 type FakeResponse = { ok: boolean; status: number; json: () => Promise<unknown> };
@@ -79,6 +94,13 @@ describe("HttpEmbedder", () => {
     const fetchImpl = (async () => response({}, false, 500)) as unknown as typeof fetch;
     const embedder = new HttpEmbedder({ endpoint: "http://x", model: "m", fetchImpl });
     await assert.rejects(() => embedder.embed(["hi"]), /HTTP 500/);
+  });
+
+  it("returns input-ordered vectors for an index-tagged out-of-order response", async () => {
+    const fetchImpl = (async () => response({ data: [{ index: 1, embedding: [0, 2] }, { index: 0, embedding: [2, 0] }] })) as unknown as typeof fetch;
+    const embedder = new HttpEmbedder({ endpoint: "http://x", model: "m", fetchImpl });
+    // Without index handling, "a" would get b's vector and vice versa.
+    assert.deepEqual(await embedder.embed(["a", "b"]), [[1, 0], [0, 1]]);
   });
 
   it("throws when the vector count does not match the input count", async () => {

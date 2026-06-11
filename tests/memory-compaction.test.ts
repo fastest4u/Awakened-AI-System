@@ -1,5 +1,5 @@
 import { strict as assert } from "node:assert";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
@@ -109,6 +109,46 @@ describe("MemoryCompactionService digest generation", () => {
     // ASCII-only slugify collapsed every Thai item into one "untitled" bucket.
     assert.ok(preview.includes("ปรับปรุงฐานข้อมูลผู้ใช้"));
     assert.ok(preview.includes("แก้ไขรหัสผ่านผู้ดูแล"));
+  });
+
+  it("keeps Thai items that differ only in combining marks distinct (สิทธิ์ vs สุทธิ)", async () => {
+    writeFileSync(join(root, "05_Agent_Session_Logs", "2026-01-03-c.md"), `---
+title: "2026-01-03 - Thai marks"
+type: session-log
+created: "2026-01-03"
+updated: "2026-01-03"
+---
+
+## TL;DR
+- ตรวจสิทธิ์
+- ตรวจสุทธิ
+`, "utf8");
+
+    const result = await compactor.compact({ ...OPTIONS, dryRun: true });
+    const preview = result.preview!;
+    // Stripping combining marks reduced both items to "ตรวจสทธ", so the second
+    // one was dropped as a duplicate.
+    assert.ok(preview.includes("ตรวจสิทธิ์"));
+    assert.ok(preview.includes("ตรวจสุทธิ"));
+  });
+
+  it("skips rewriting the digest when the regenerated body is unchanged", async () => {
+    const first = await compactor.compact({ ...OPTIONS, dryRun: false });
+    assert.equal(first.compacted, true);
+    assert.equal(first.digestUnchanged, false);
+
+    const digestPath = join(root, "07_Insights", "Auto-Memory-Digest.md");
+    // Simulate a digest written on an earlier day: only the frontmatter
+    // `updated` stamp differs from what a rewrite would produce today.
+    const doctored = readFileSync(digestPath, "utf8").replace(`updated: "${todayIso()}"`, 'updated: "2020-01-01"');
+    writeFileSync(digestPath, doctored, "utf8");
+
+    const second = await compactor.compact({ ...OPTIONS, dryRun: false });
+    assert.equal(second.compacted, false);
+    assert.equal(second.digestUnchanged, true);
+    assert.equal(second.path, null);
+    assert.equal(readFileSync(digestPath, "utf8"), doctored, "an unchanged digest body must not be rewritten");
+    assert.equal(existsSync(join(root, ".memory-mcp", "backups")), false, "no overwrite-backup churn for unchanged digests");
   });
 
   it("preserves the existing digest's created date across rewrites", async () => {

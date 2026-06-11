@@ -1,5 +1,5 @@
 import { Bm25Index, tokenize, weighted } from "../utils/bm25.js";
-import { basenameWithoutExtension } from "../utils/memory-format.js";
+import { buildWikilinkResolver } from "../utils/links.js";
 import { searchTokens } from "../utils/ngram.js";
 import { cosine, reciprocalRankFusion } from "../utils/vector.js";
 
@@ -215,47 +215,25 @@ export class IndexRepository {
 
   /**
    * Build the reverse-link (backlink) map: for each note, resolve its outgoing
-   * `[[wikilink]]` targets against the indexed notes (by path, basename, title,
-   * id, or alias — case-insensitive) and record the edge target -> [sources].
-   *
-   * Keys are registered in precedence tiers across ALL notes — path/basename
-   * first, then title/id, then aliases — so a note's own strong identity always
-   * wins over another note's weaker keys (e.g. a bare `[[setup]]` resolves to the
-   * note named `setup`, not one merely titled "Setup"). Within a tier a collision
-   * goes to the sorted-first path, so a duplicate basename in two folders resolves
-   * to the lexicographically first (a bare `[[link]]` cannot disambiguate folder).
-   * Self-links are ignored. Cached until the record set changes.
+   * `[[wikilink]]` targets against the indexed notes and record the edge
+   * target -> [sources]. Resolution (precedence tiers — path/basename, then
+   * title/id, then aliases — with sorted-first collision handling) is delegated
+   * to the shared `buildWikilinkResolver`, the single implementation also used
+   * by the vault-health broken-link scan, so the two cannot drift. Self-links
+   * are excluded here, at the graph call site. Cached until the record set
+   * changes.
    */
   private ensureLinkGraph(): Map<string, string[]> {
     if (this.linkGraph && this.linkRevision === this.revision) return this.linkGraph;
-    const sorted = [...this.records.values()].sort((a, b) => a.path.localeCompare(b.path));
-
-    const resolve = new Map<string, string>();
-    const register = (key: string | undefined, path: string) => {
-      const k = key?.trim().toLowerCase().replace(/\.md$/i, "");
-      if (k && !resolve.has(k)) resolve.set(k, path);
-    };
-    // Tier 1 — strong identity (path, then basename) for every note.
-    for (const record of sorted) {
-      register(record.path, record.path);
-      register(basenameWithoutExtension(record.path), record.path);
-    }
-    // Tier 2 — declared identity (title, then id); fills only keys no path/basename claimed.
-    for (const record of sorted) {
-      register(record.title, record.path);
-      register(record.id, record.path);
-    }
-    // Tier 3 — aliases (weakest); fills only what remains.
-    for (const record of sorted) {
-      for (const alias of record.aliases) register(alias, record.path);
-    }
+    const records = [...this.records.values()];
+    // StoredRecord structurally satisfies the resolver's note-keys shape
+    // (path/title/id/aliases); the resolver sorts and tiers the keys itself.
+    const resolve = buildWikilinkResolver(records);
 
     const incoming = new Map<string, Set<string>>();
-    for (const record of sorted) {
+    for (const record of records) {
       for (const target of record.outgoingLinks) {
-        // Targets come from extractWikilinks, which already strips `.md`; only the
-        // register() side needs the strip (record.path keys retain their `.md`).
-        const targetPath = resolve.get(target.trim().toLowerCase());
+        const targetPath = resolve(target);
         if (!targetPath || targetPath === record.path) continue;
         let sources = incoming.get(targetPath);
         if (!sources) {

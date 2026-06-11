@@ -2,7 +2,7 @@ import { strict as assert } from "node:assert";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, it } from "node:test";
+import { afterEach, beforeEach, describe, it, mock } from "node:test";
 import { IndexRepository } from "../src/repositories/index.repository.js";
 import type { EmbeddingProvider } from "../src/services/embedding/embedding-provider.js";
 import { MemoryQueryService } from "../src/services/memory-query.service.js";
@@ -16,6 +16,12 @@ const NOTE_B = `---\ntitle: "Frontmatter parser"\ntype: insight\ncreated: "2026-
 function decodeB64Vector(value: string): number[] {
   const bytes = Buffer.from(value, "base64");
   return Array.from(new Float32Array(new Uint8Array(bytes).buffer));
+}
+
+/** Encode the base64 Float32Array wire form (inverse of decodeB64Vector). */
+function encodeB64Vector(values: number[]): string {
+  const floats = new Float32Array(values);
+  return Buffer.from(floats.buffer, 0, floats.byteLength).toString("base64");
 }
 
 describe("MemoryQueryService incremental + ranked index", () => {
@@ -368,6 +374,29 @@ class BrokenEmbedder implements EmbeddingProvider {
   }
 }
 
+/** Deterministically fails any batch containing the poison doc; succeeds otherwise. */
+class PoisonEmbedder implements EmbeddingProvider {
+  readonly id = "poison:1";
+  readonly dimensions = 3;
+  attempts: string[][] = [];
+  embed(texts: string[]): Promise<number[][]> {
+    this.attempts.push(texts);
+    if (texts.some((text) => text.includes("poison"))) return Promise.reject(new Error("deterministic per-doc failure"));
+    return Promise.resolve(texts.map(() => [1, 0, 0]));
+  }
+}
+
+/** Emits 3-dim vectors but declares dimensions = 0 (unknown until the first call). */
+class DimlessEmbedder implements EmbeddingProvider {
+  readonly id = "dimless:1";
+  readonly dimensions = 0;
+  batchSizes: number[] = [];
+  embed(texts: string[]): Promise<number[][]> {
+    this.batchSizes.push(texts.length);
+    return Promise.resolve(texts.map(() => [1, 0, 0]));
+  }
+}
+
 describe("MemoryQueryService hybrid search (embedder enabled)", () => {
   let root: string;
   let embedder: StubEmbedder;
@@ -525,6 +554,101 @@ describe("MemoryQueryService hybrid search (embedder enabled)", () => {
     const parsed = JSON.parse(readFileSync(join(root, ".memory-mcp", "index.json"), "utf8"));
     assert.equal(parsed.embedder, "stub:test:3");
     assert.deepEqual(decodeB64Vector(parsed.records["a.md"].vector), [1, 0, 0]);
+  });
+
+  it("lexical persist passes through vectors another process wrote AFTER it loaded", async () => {
+    // The long-lived lexical-only service loads (and persists) BEFORE any vectors exist.
+    const lexical = new MemoryQueryService(new VaultService(root), new IndexRepository());
+    await lexical.search("backup", [], undefined, undefined, 10, 0);
+
+    // A concurrent embedding process now writes vectors + its tag to disk.
+    await query.search("backup", [], undefined, undefined, 10, 0);
+
+    // Touch a note so the lexical service rewrites index.json from its
+    // (vectorless) in-memory state — this used to clobber the vectors above.
+    writeFileSync(join(root, "a.md"), NOTE_A.replace("rollback snapshot.", "rollback snapshot edited."));
+    const future = new Date(Date.now() + 10_000);
+    utimesSync(join(root, "a.md"), future, future);
+    await lexical.search("backup", [], undefined, undefined, 10, 0);
+
+    const parsed = JSON.parse(readFileSync(join(root, ".memory-mcp", "index.json"), "utf8"));
+    assert.equal(parsed.embedder, "stub:test:3", "on-disk embedder tag passes through");
+    assert.deepEqual(decodeB64Vector(parsed.records["b.md"].vector), [0, 1, 0], "unchanged note keeps its on-disk vector");
+    assert.equal(parsed.records["a.md"].vector, undefined, "changed note's stale vector still drops");
+  });
+
+  it("sidelines a deterministically-failing batch so later passes drain the rest", async () => {
+    mock.timers.enable({ apis: ["Date"], now: Date.now() });
+    try {
+      writeFileSync(join(root, "poison.md"), `---\ntitle: "Poison"\ntype: note\ncreated: "2026-01-01"\nupdated: "2026-01-02"\n---\n\npoison payload.\n`);
+      const poison = new PoisonEmbedder();
+      const service = new MemoryQueryService(new VaultService(root), new IndexRepository(), undefined, poison);
+
+      // Pass 1: the only batch contains the poison doc -> fails, cooldown starts.
+      await service.search("backup", [], undefined, undefined, 10, 0);
+      assert.equal(poison.attempts.length, 1, "one failed doc batch; query embed blocked by cooldown");
+
+      // Past the global cooldown but before the failed batch's retry marker
+      // expires: a new note drains while the failed records are skipped.
+      mock.timers.setTime(Date.now() + 61_000);
+      writeFileSync(join(root, "fresh.md"), `---\ntitle: "Fresh backup"\ntype: note\ncreated: "2026-01-03"\nupdated: "2026-01-03"\n---\n\nfresh backup note.\n`);
+      await service.search("backup", [], undefined, undefined, 10, 0);
+      const passTwo = poison.attempts.slice(1);
+      assert.ok(passTwo.length > 0, "embedding resumed after the cooldown");
+      assert.ok(passTwo.every((texts) => texts.every((t) => !t.includes("poison"))), "failed records are skipped, not retried first");
+      const parsed = JSON.parse(readFileSync(join(root, ".memory-mcp", "index.json"), "utf8"));
+      assert.equal(typeof parsed.records["fresh.md"].vector, "string", "backlog drains past the failing batch");
+
+      // Once the per-record backoff expires the failed records retry (transient
+      // failures heal; only the deterministic one keeps failing).
+      mock.timers.setTime(Date.now() + 65_000);
+      await service.search("backup", [], undefined, undefined, 10, 0);
+      const passThree = poison.attempts.slice(1 + passTwo.length);
+      assert.ok(passThree.some((texts) => texts.some((t) => t.includes("poison"))), "failed records retry after the backoff");
+    } finally {
+      mock.timers.reset();
+    }
+  });
+
+  it("re-embeds stored vectors whose length differs from the provider's dimensionality", async () => {
+    await query.search("backup", [], undefined, undefined, 10, 0); // seed 3-dim vectors
+    const cachePath = join(root, ".memory-mcp", "index.json");
+    const parsed = JSON.parse(readFileSync(cachePath, "utf8"));
+    // Simulate an endpoint-side dim change under the SAME embedder id: the
+    // stored vectors are now 2-dim while the provider emits 3-dim.
+    parsed.records["a.md"].vector = encodeB64Vector([1, 0]);
+    parsed.records["b.md"].vector = encodeB64Vector([0, 1]);
+    writeFileSync(cachePath, JSON.stringify(parsed));
+
+    const second = new StubEmbedder(); // dimensions = 3, same signature
+    const reopened = new MemoryQueryService(new VaultService(root), new IndexRepository(), undefined, second);
+    await reopened.search("backup", [], undefined, undefined, 10, 0);
+    assert.deepEqual(second.batchSizes, [2, 1], "both wrong-length docs re-embed (plus the query)");
+    const after = JSON.parse(readFileSync(cachePath, "utf8"));
+    assert.deepEqual(decodeB64Vector(after.records["a.md"].vector), [1, 0, 0]);
+    assert.deepEqual(decodeB64Vector(after.records["b.md"].vector), [0, 1, 0]);
+  });
+
+  it("learns the expected dims from the first embedded vector when the provider declares none", async () => {
+    const seed = new DimlessEmbedder();
+    const seeded = new MemoryQueryService(new VaultService(root), new IndexRepository(), undefined, seed);
+    await seeded.search("backup", [], undefined, undefined, 10, 0); // 3-dim vectors under "dimless:1"
+
+    const cachePath = join(root, ".memory-mcp", "index.json");
+    const parsed = JSON.parse(readFileSync(cachePath, "utf8"));
+    parsed.records["a.md"].vector = encodeB64Vector([1, 0]); // endpoint-side dim change
+    writeFileSync(cachePath, JSON.stringify(parsed));
+
+    const second = new DimlessEmbedder();
+    const reopened = new MemoryQueryService(new VaultService(root), new IndexRepository(), undefined, second);
+    // First search: expected dims unknown until the query embeds (sets session dims).
+    await reopened.search("backup", [], undefined, undefined, 10, 0);
+    assert.deepEqual(second.batchSizes, [1], "no doc re-embed before the session learns the dims");
+    // Second search: the 2-dim stored vector mismatches the 3-dim session dims.
+    await reopened.search("backup", [], undefined, undefined, 10, 0);
+    assert.deepEqual(second.batchSizes, [1, 1], "wrong-length doc re-embeds (query vector is LRU-cached)");
+    const after = JSON.parse(readFileSync(cachePath, "utf8"));
+    assert.deepEqual(decodeB64Vector(after.records["a.md"].vector), [1, 0, 0]);
   });
 });
 

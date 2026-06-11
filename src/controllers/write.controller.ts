@@ -33,9 +33,11 @@ export class WriteController {
   async writeSessionLog(input: z.infer<typeof writeSessionLogInputSchema>) {
     const startedAt = Date.now();
     const date = input.date ?? todayIso();
-    const path = this.notes.create(this.templates.sessionLogPath(input), this.templates.sessionLog(input));
+    const warnings: string[] = [];
+    const path = this.notes.create(this.templates.sessionLogPath(input, warnings), this.templates.sessionLog(input, warnings));
     this.audit.record("memory_writeSessionLog", { path, title: `${date} - ${input.topic}` });
-    return this.responses.buildOk("memory_writeSessionLog", startedAt, { created: true, path, title: `${date} - ${input.topic}` });
+    // sessionLogPath + sessionLog both validate the same date; dedupe the shared message.
+    return this.responses.buildOk("memory_writeSessionLog", startedAt, { created: true, path, title: `${date} - ${input.topic}` }, [...new Set(warnings)]);
   }
 
   async writeInsight(input: z.infer<typeof writeInsightInputSchema>) {
@@ -47,22 +49,25 @@ export class WriteController {
 
   async writeMistake(input: z.infer<typeof writeMistakeInputSchema>) {
     const startedAt = Date.now();
-    const path = this.notes.create(`${TYPE_FOLDERS.mistake}/${slugify(input.title)}.md`, this.templates.mistake(input));
+    const warnings: string[] = [];
+    const path = this.notes.create(`${TYPE_FOLDERS.mistake}/${slugify(input.title)}.md`, this.templates.mistake(input, warnings));
     this.audit.record("memory_writeMistake", { path, title: input.title, area: input.area });
-    return this.responses.buildOk("memory_writeMistake", startedAt, { created: true, path });
+    return this.responses.buildOk("memory_writeMistake", startedAt, { created: true, path }, warnings);
   }
 
   async writeADR(input: z.infer<typeof writeAdRInputSchema>) {
     const startedAt = Date.now();
-    const path = this.notes.create(`${TYPE_FOLDERS.adr}/${slugify(input.title)}.md`, this.templates.adr(input));
+    const warnings: string[] = [];
+    const path = this.notes.create(`${TYPE_FOLDERS.adr}/${slugify(input.title)}.md`, this.templates.adr(input, warnings));
     this.audit.record("memory_writeADR", { path, title: input.title, status: input.status });
-    return this.responses.buildOk("memory_writeADR", startedAt, { created: true, path });
+    return this.responses.buildOk("memory_writeADR", startedAt, { created: true, path }, warnings);
   }
 
   async createFromTemplate(input: z.infer<typeof createFromTemplateInputSchema>) {
     const startedAt = Date.now();
-    const path = this.notes.create(input.path, this.templates.fromTemplate(input.template, input.values));
+    const warnings: string[] = [];
+    const path = this.notes.create(input.path, this.templates.fromTemplate(input.template, input.values, warnings));
     this.audit.record("memory_createFromTemplate", { path, template: input.template });
-    return this.responses.buildOk("memory_createFromTemplate", startedAt, { created: true, path, template: input.template, values: input.values });
+    return this.responses.buildOk("memory_createFromTemplate", startedAt, { created: true, path, template: input.template, values: input.values }, warnings);
   }
 }

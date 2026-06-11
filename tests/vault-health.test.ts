@@ -76,6 +76,26 @@ describe("VaultHealthService broken-link scan (shared resolver semantics)", () =
   });
 });
 
+describe("VaultHealthService link resolver with YAML-null identity fields", () => {
+  it("does not register a null title/id as the literal link target 'null'", async () => {
+    const { root, health } = makeVault({
+      // Bare `title:` / `id:` parse to YAML null; they must contribute no
+      // resolver key, so a [[null]] link stays broken instead of resolving here.
+      "notes/null-title.md": note(["title:", "id:", "type: note", `created: "${TODAY}"`, `updated: "${TODAY}"`], "Body."),
+      "notes/null-linker.md": note(['title: "Null Linker"', "type: note", `created: "${TODAY}"`, `updated: "${TODAY}"`], "See [[null]]"),
+    });
+    try {
+      const broken = await health.findBrokenLinks();
+      assert.ok(
+        broken.some((issue) => issue.message.includes("[[null]]") && issue.path === "notes/null-linker.md"),
+        `[[null]] must be flagged as broken, got: ${JSON.stringify(broken)}`,
+      );
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("VaultHealthService.verifyNote (scoped verification)", () => {
   let root: string;
   let health: VaultHealthService;
@@ -177,5 +197,30 @@ describe("VaultHealthService.findDuplicates (similarity threshold)", () => {
       !result.similarTitles.some((entry) => entry.titles.every((title) => title === "Same Title")),
       "exact matches are excluded from the similarity bucket",
     );
+  });
+
+  it("caps similarTitles to the strongest 50 pairs, sorted by similarity desc", async () => {
+    const files: Record<string, string> = {};
+    for (let i = 0; i < 12; i += 1) {
+      const suffix = String(i).padStart(2, "0");
+      files[`bulk/note-${suffix}.md`] = note(
+        [`title: "Shared Long Title ${suffix}"`, "type: note", `created: "${TODAY}"`, `updated: "${TODAY}"`],
+        "body",
+      );
+    }
+    const { root: bulkRoot, health: bulkHealth } = makeVault(files);
+    try {
+      // 12 distinct titles -> 66 pairs, all above a low threshold -> capped.
+      const result = await bulkHealth.findDuplicates(0.1);
+      assert.equal(result.similarTitles.length, 50);
+      for (let i = 1; i < result.similarTitles.length; i += 1) {
+        assert.ok(
+          result.similarTitles[i - 1].similarity >= result.similarTitles[i].similarity,
+          "pairs must be ordered by similarity desc",
+        );
+      }
+    } finally {
+      rmSync(bulkRoot, { recursive: true, force: true });
+    }
   });
 });

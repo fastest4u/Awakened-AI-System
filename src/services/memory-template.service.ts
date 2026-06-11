@@ -31,13 +31,17 @@ export interface SessionLogTemplateInput {
 const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
 
 export class MemoryTemplateService {
-  sessionLogPath(input: SessionLogTemplateInput) {
-    const date = this.safeDate(input.date, "date");
+  // Methods that validate caller-supplied dates accept an optional `warnings`
+  // collector: safeDate pushes its substitution message there so controllers
+  // can surface it in the tool envelope. The parameter is optional so existing
+  // call shapes (e.g. memory-workflow.service.ts) keep compiling unchanged.
+  sessionLogPath(input: SessionLogTemplateInput, warnings?: string[]) {
+    const date = this.safeDate(input.date, "date", warnings);
     return `${TYPE_FOLDERS["session-log"]}/${date}-${slugify(input.topic)}.md`;
   }
 
-  sessionLog(input: SessionLogTemplateInput) {
-    const date = this.safeDate(input.date, "date");
+  sessionLog(input: SessionLogTemplateInput, warnings?: string[]) {
+    const date = this.safeDate(input.date, "date", warnings);
     const outcomes = input.outcomes ?? [];
     const filesTouched = input.filesTouched ?? [];
     const decisionsMade = input.decisionsMade ?? [];
@@ -103,12 +107,16 @@ export class MemoryTemplateService {
   /**
    * Validate a caller-supplied date. Anything that is not strict YYYY-MM-DD
    * falls back to today with a stderr warning — the raw value must never reach
-   * a file path ("2026/06/10" nests folders; ":" is EINVAL on Windows).
+   * a file path ("2026/06/10" nests folders; ":" is EINVAL on Windows). The
+   * same message goes into the optional `warnings` collector so the silent
+   * substitution also shows up in the tool envelope.
    */
-  private safeDate(value: string | undefined, field: string) {
+  private safeDate(value: string | undefined, field: string, warnings?: string[]) {
     if (value === undefined) return todayIso();
     if (ISO_DATE.test(value)) return value;
-    console.error(`[memory-mcp] ${field} ${JSON.stringify(value)} is not YYYY-MM-DD; using today's date instead.`);
+    const message = `${field} ${JSON.stringify(value)} is not YYYY-MM-DD; using today's date instead.`;
+    warnings?.push(message);
+    console.error(`[memory-mcp] ${message}`);
     return todayIso();
   }
 
@@ -137,8 +145,8 @@ export class MemoryTemplateService {
     rootCause: string;
     avoidance: string;
     references: string[];
-  }) {
-    const occurredDate = this.safeDate(input.occurredDate, "occurredDate");
+  }, warnings?: string[]) {
+    const occurredDate = this.safeDate(input.occurredDate, "occurredDate", warnings);
     return frontmatter({
       title: input.title,
       type: "mistake",
@@ -177,8 +185,8 @@ export class MemoryTemplateService {
     consequences: string[];
     supersedes: string[];
     tags: string[];
-  }) {
-    const decisionDate = this.safeDate(input.decisionDate, "decisionDate");
+  }, warnings?: string[]) {
+    const decisionDate = this.safeDate(input.decisionDate, "decisionDate", warnings);
     return frontmatter({
       title: input.title,
       type: "adr",
@@ -202,9 +210,9 @@ export class MemoryTemplateService {
     ].join("\n");
   }
 
-  fromTemplate(template: string, values: Record<string, unknown>) {
+  fromTemplate(template: string, values: Record<string, unknown>, warnings?: string[]) {
     const title = String(values.title ?? values.name ?? "Untitled");
-    const date = this.safeDate(values.date === undefined ? undefined : String(values.date), "date");
+    const date = this.safeDate(values.date === undefined ? undefined : String(values.date), "date", warnings);
     const content = String(values.content ?? "");
 
     if (template === "session-log") {
@@ -213,7 +221,7 @@ export class MemoryTemplateService {
         topic: title,
         agent: String(values.agent ?? "agent"),
         outcomes: [],
-      });
+      }, warnings);
     }
 
     return frontmatter({

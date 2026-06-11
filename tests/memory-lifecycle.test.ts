@@ -71,9 +71,15 @@ describe("MemoryLifecycleService", () => {
       assert.equal(riskyWorkFor({ topic: "refactor auth flow" }), true);
     });
 
-    it("does not flag keywords inside hyphenated slugs or negated phrases", () => {
+    it("flags risk keywords inside hyphenated compounds", () => {
+      assert.equal(riskyWorkFor({ topic: "run the schema-migration script" }), true);
+      assert.equal(riskyWorkFor({ topic: "tighten the auth-flow checks" }), true);
+    });
+
+    it("does not flag negated keywords, plain or inside hyphenated slugs", () => {
       assert.equal(riskyWorkFor({ topic: "update docs", outcomes: ["no refactor needed"] }), false);
       assert.equal(riskyWorkFor({ topic: "rename the no-refactor-needed note" }), false);
+      assert.equal(riskyWorkFor({ topic: "no schema-migration this sprint" }), false);
       assert.equal(riskyWorkFor({ topic: "documentation cleanup" }), false);
     });
 

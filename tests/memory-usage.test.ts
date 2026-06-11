@@ -46,8 +46,8 @@ describe("MemoryUsageService state safety", () => {
     assert.equal(onDisk.records["a.md"].selectedCount, 2);
   });
 
-  it("caps a record's contexts at the top 40 terms (count desc, ties keep lexicographically smaller)", () => {
-    const fillers = Array.from({ length: 45 }, (_, index) => `t${String(index + 1).padStart(2, "0")}`);
+  it("prunes contexts only past the hysteresis threshold (48), down to the top 40", () => {
+    const fillers = Array.from({ length: 55 }, (_, index) => `t${String(index + 1).padStart(2, "0")}`);
     usage.recordContextPack([{ path: "a.md" }], { query: `hot hot hot ${fillers.join(" ")}` });
 
     const record = usage.statsFor("a.md");
@@ -59,7 +59,27 @@ describe("MemoryUsageService state safety", () => {
     assert.equal("t01" in record!.contexts, true);
     assert.equal("t39" in record!.contexts, true);
     assert.equal("t40" in record!.contexts, false);
-    assert.equal("t45" in record!.contexts, false);
+    assert.equal("t55" in record!.contexts, false);
+  });
+
+  it("lets new terms accumulate on a saturated record and survive the next prune", () => {
+    const fillers = Array.from({ length: 41 }, (_, index) => `t${String(index + 1).padStart(2, "0")}`);
+    usage.recordContextPack([{ path: "a.md" }], { query: fillers.join(" ") });
+    // 41 terms: past the old hard cap of 40, but under the prune threshold.
+    assert.equal(Object.keys(usage.statsFor("a.md")!.contexts).length, 41);
+
+    // The old top-40 hard cap rejected any count-1 newcomer on a full record.
+    usage.recordContextPack([{ path: "a.md" }], { query: "fresh fresh" });
+    let record = usage.statsFor("a.md")!;
+    assert.equal(record.contexts.fresh, 2);
+    assert.equal(Object.keys(record.contexts).length, 42);
+
+    // Crossing the threshold prunes to 40; the accumulated newcomer outranks count-1 fillers.
+    const more = Array.from({ length: 10 }, (_, index) => `u${String(index + 1).padStart(2, "0")}`);
+    usage.recordContextPack([{ path: "a.md" }], { query: more.join(" ") });
+    record = usage.statsFor("a.md")!;
+    assert.equal(Object.keys(record.contexts).length, 40);
+    assert.equal(record.contexts.fresh, 2);
   });
 
   it("warns on stderr and falls back to empty state when usage.json is corrupt", () => {
@@ -78,5 +98,18 @@ describe("MemoryUsageService state safety", () => {
     // The final file is complete, parseable JSON.
     const parsed = JSON.parse(readFileSync(join(root, ".memory-mcp", "usage.json"), "utf8"));
     assert.equal(parsed.version, 1);
+  });
+
+  it("does not fail the tool call when the usage.json rename is blocked (telemetry is best-effort)", () => {
+    // A directory at the target path makes renameSync throw on every platform.
+    mkdirSync(join(root, ".memory-mcp", "usage.json"), { recursive: true });
+
+    const { errors } = captureStderr(() => {
+      assert.doesNotThrow(() => usage.recordContextPack([{ path: "a.md" }], { query: "memory" }));
+    });
+    assert.ok(errors.some((line) => line.includes("usage.json write skipped")), "one stderr warning explains the skipped write");
+    // The staged temp file is still cleaned up.
+    const entries = readdirSync(join(root, ".memory-mcp"));
+    assert.deepEqual(entries.filter((name) => name.includes(".tmp")), []);
   });
 });

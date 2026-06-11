@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 export type MemoryResolutionSource =
   | "env-explicit"
   | "env-vault-marker"
+  | "cwd-vault-marker"
   | "env-workspace-marker"
   | "ide-state"
   | "incidental-env"
@@ -208,6 +209,7 @@ interface ClientDefinition {
 
 interface InspectedClientConfig {
   diagnostic: MemoryClientConfigDiagnostic;
+  format: ClientConfigProbe["format"];
   text?: string;
   json?: unknown;
 }
@@ -218,6 +220,7 @@ const CLIENT_DEFINITIONS: ClientDefinition[] = [
     displayName: "Claude Code",
     probes: [
       { relativePath: ".claude/settings.local.json", active: true, format: "json" },
+      { relativePath: ".claude/settings.json", active: true, format: "json" },
       { relativePath: ".mcp.json", active: true, format: "json" },
       { relativePath: "CLAUDE.md", active: false, format: "text" },
     ],
@@ -806,16 +809,23 @@ function resolveDynamicProjectRoot(
     return value && value.trim().length > 0 && !isDynamicRootValue(value) ? value : undefined;
   };
 
-  // Pass 1 — strongest dynamic signal: any env candidate or cwd whose walk-up
-  // reaches a directory already containing the vault marker (memory/AGENTS.md).
-  // An initialized vault always beats generic workspace markers.
-  const vaultStarts = [...candidateEnvNames.map(envValue), cwd]
-    .filter((value): value is string => Boolean(value && value.trim().length > 0));
-  for (const start of vaultStarts) {
-    const vaultWorkspace = findVaultWorkspaceRoot(start, homeDir);
+  // Pass 1 — strongest dynamic signal: an intentional env candidate, then cwd,
+  // whose walk-up reaches a directory already containing the vault marker
+  // (memory/AGENTS.md). An initialized vault always beats generic workspace
+  // markers. PWD/OLDPWD are deliberately NOT consulted here: stale shell
+  // residue must not outrank the real cwd or live IDE state even when it
+  // points at a vault-bearing project (see pass 4).
+  for (const name of intentionalEnvNames) {
+    const value = envValue(name);
+    if (!value) continue;
+    const vaultWorkspace = findVaultWorkspaceRoot(value, homeDir);
     if (vaultWorkspace) {
       return { root: vaultWorkspace, source: "env-vault-marker", vaultMarkerFound: true };
     }
+  }
+  const cwdVaultWorkspace = findVaultWorkspaceRoot(cwd, homeDir);
+  if (cwdVaultWorkspace) {
+    return { root: cwdVaultWorkspace, source: "cwd-vault-marker", vaultMarkerFound: true };
   }
 
   // Pass 2 — intentionally communicated env locations (NOT PWD/OLDPWD, which
@@ -839,16 +849,28 @@ function resolveDynamicProjectRoot(
     }
   }
 
+  // Pass 4 — incidental env (PWD/OLDPWD) vault check, demoted below cwd and
+  // IDE state: a vault marker still outranks the generic-marker walks below,
+  // but stale shell residue must never beat the tiers above.
+  for (const name of incidentalEnvNames) {
+    const value = envValue(name);
+    if (!value) continue;
+    const vaultWorkspace = findVaultWorkspaceRoot(value, homeDir);
+    if (vaultWorkspace) {
+      return { root: vaultWorkspace, source: "incidental-env", vaultMarkerFound: true };
+    }
+  }
+
   // cwd walk-up to a generic marker keeps the CLI pointed at the project it
-  // was launched from. It stays above PWD/OLDPWD because cwd is at least the
-  // directory this process actually runs in.
+  // was launched from. It stays above the PWD/OLDPWD generic check because
+  // cwd is at least the directory this process actually runs in.
   const cwdWorkspace = findWorkspaceRoot(cwd, homeDir);
   if (cwdWorkspace) {
     return { root: cwdWorkspace, source: "fallback", vaultMarkerFound: hasVaultMarker(cwdWorkspace) };
   }
 
-  // Pass 4 — incidental shell residue is the LAST env tier: a stale PWD must
-  // never outrank a vault-bearing cwd or live IDE state.
+  // Pass 5 — incidental shell residue is the LAST env tier: a stale PWD with
+  // only generic markers must never outrank cwd or live IDE state.
   for (const name of incidentalEnvNames) {
     const value = envValue(name);
     if (!value) continue;
@@ -858,7 +880,7 @@ function resolveDynamicProjectRoot(
     }
   }
 
-  // Pass 5 — last resort: trust the IDE state path itself even if the marker
+  // Pass 6 — last resort: trust the IDE state path itself even if the marker
   // walk didn't find one (e.g. brand-new project without a vault yet).
   if (ideWorkspace) {
     const root = resolve(ideWorkspace);
@@ -904,6 +926,14 @@ function candidateFromValue(source: string, value: string, selectedRoot: string)
   const workspaceRoot = dynamic ? undefined : findWorkspaceRoot(value);
   const candidatePath = dynamic ? value : resolve(value);
   const resolvedWorkspace = workspaceRoot ? resolve(workspaceRoot) : undefined;
+  // The vault walk can resolve higher than the generic-marker walk (e.g. a
+  // nested dir with its own package.json under a vault-bearing root), so
+  // `selected` must consider both walks or it can contradict `resolution`.
+  const vaultWorkspaceRoot = dynamic ? undefined : findVaultWorkspaceRoot(value);
+  const resolvedVaultWorkspace = vaultWorkspaceRoot ? resolve(vaultWorkspaceRoot) : undefined;
+  const selectedTarget = resolve(selectedRoot).toLowerCase();
+  const matchesSelected = (candidate: string | undefined) =>
+    candidate !== undefined && candidate.toLowerCase() === selectedTarget;
   return {
     source,
     value,
@@ -912,7 +942,7 @@ function candidateFromValue(source: string, value: string, selectedRoot: string)
     workspaceRoot: resolvedWorkspace,
     hasWorkspaceMarker: dynamic ? false : hasWorkspaceMarker(candidatePath),
     hasVaultMarker: dynamic ? false : hasVaultMarker(candidatePath),
-    selected: resolvedWorkspace !== undefined && resolvedWorkspace.toLowerCase() === resolve(selectedRoot).toLowerCase(),
+    selected: matchesSelected(resolvedWorkspace) || matchesSelected(resolvedVaultWorkspace),
   };
 }
 
@@ -999,12 +1029,30 @@ function configPathForSnippet(path: string): string {
   return path.replace(/\\/g, "/");
 }
 
-function projectMemoryCommandArgs(projectRoot: string): string[] {
-  return ["node", configPathForSnippet(join(projectRoot, "dist", "index.js"))];
+/**
+ * Resolve the runnable MCP server bundle at `<packageRoot>/dist/index.js`.
+ * Walks up from this module to the nearest package.json (same logic as
+ * memory-bootstrap.service.ts) because `import.meta.url` sits at different
+ * depths per build (bundled dist/, tsc dist-test/, raw src/). Snippets must
+ * point at THIS installation's bundle — `<projectRoot>/dist/index.js` is
+ * wrong for every project except this repo itself.
+ */
+function resolveServerEntrypoint(moduleUrl: string = import.meta.url): string {
+  let dir = dirname(fileURLToPath(moduleUrl));
+  while (!existsSync(join(dir, "package.json"))) {
+    const parent = dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return resolve(dir, "dist", "index.js").replace(/\\/g, "/");
+}
+
+function projectMemoryCommandArgs(): string[] {
+  return ["node", resolveServerEntrypoint()];
 }
 
 function projectMemoryJsonServer(projectRoot: string): Record<string, unknown> {
-  const [command, serverPath] = projectMemoryCommandArgs(projectRoot);
+  const [command, serverPath] = projectMemoryCommandArgs();
   // Pin the literal project root: auto-detection ("dynamic") can mis-resolve
   // when the client spawns the server from its own install directory.
   return {
@@ -1019,7 +1067,7 @@ function projectMemoryJsonServer(projectRoot: string): Record<string, unknown> {
 function projectMemorySnippet(client: MemoryClientName, projectRoot: string): string {
   const server = projectMemoryJsonServer(projectRoot);
   if (client === "codex") {
-    const [command, serverPath] = projectMemoryCommandArgs(projectRoot);
+    const [command, serverPath] = projectMemoryCommandArgs();
     return [
       "[mcp_servers.project-memory]",
       `command = "${command}"`,
@@ -1034,7 +1082,7 @@ function projectMemorySnippet(client: MemoryClientName, projectRoot: string): st
     return JSON.stringify({ context_servers: { "project-memory": server } }, null, 2);
   }
   if (client === "opencode") {
-    const [command, serverPath] = projectMemoryCommandArgs(projectRoot);
+    const [command, serverPath] = projectMemoryCommandArgs();
     return JSON.stringify(
       {
         mcp: {
@@ -1057,6 +1105,10 @@ function projectMemorySnippet(client: MemoryClientName, projectRoot: string): st
 
 const CLAUDE_GLOBAL_CONFIG_FILE = ".claude.json";
 
+// ~/.claude.json also accumulates prompt history and every other project's
+// MCP entries, so it can grow without bound; cap the structured scan.
+const CLAUDE_GLOBAL_CONFIG_MAX_BYTES = 5 * 1024 * 1024;
+
 /**
  * Locate the global Claude Code config (`~/.claude.json`). Resolved from env
  * (like ideAppDataRoots) so tests can point HOME at a fixture directory.
@@ -1072,6 +1124,26 @@ function recordHasProjectMemoryServer(value: unknown): boolean {
 }
 
 /**
+ * Collect every project-memory server object registered in the global Claude
+ * Code config (top-level `mcpServers` plus `projects[*].mcpServers`). Used to
+ * scope env extraction to project-memory entries: a whole-file regex would
+ * pick up other projects' servers or prompt history stored in the same file.
+ */
+function projectMemoryServersInClaudeGlobal(root: Record<string, unknown> | undefined): Array<Record<string, unknown>> {
+  const servers: Array<Record<string, unknown>> = [];
+  const top = asRecord(asRecord(root?.mcpServers)?.["project-memory"]);
+  if (top) servers.push(top);
+  const projects = asRecord(root?.projects);
+  if (projects) {
+    for (const project of Object.values(projects)) {
+      const server = asRecord(asRecord(asRecord(project)?.mcpServers)?.["project-memory"]);
+      if (server) servers.push(server);
+    }
+  }
+  return servers;
+}
+
+/**
  * Partial scan of the global Claude Code config: project-memory may be
  * registered at the top-level `mcpServers` or per-project under
  * `projects[*].mcpServers`. Only this one global location is probed — other
@@ -1081,6 +1153,26 @@ function inspectClaudeGlobalConfig(path: string): InspectedClientConfig | undefi
   if (!safeExists(path)) {
     return undefined;
   }
+  let sizeBytes: number | undefined;
+  try {
+    sizeBytes = statSync(path).size;
+  } catch {
+    sizeBytes = undefined;
+  }
+  if (sizeBytes !== undefined && sizeBytes > CLAUDE_GLOBAL_CONFIG_MAX_BYTES) {
+    return {
+      diagnostic: {
+        path,
+        active: true,
+        scope: "global",
+        exists: true,
+        hasProjectMemory: false,
+        hasMemoryProjectRoot: false,
+        parseError: "too large, partially scanned",
+      },
+      format: "json",
+    };
+  }
   const readResult = safeReadText(path);
   const text = readResult.text ?? "";
   const parsed = readResult.text !== undefined ? parseJsonConfig(text) : {};
@@ -1088,6 +1180,12 @@ function inspectClaudeGlobalConfig(path: string): InspectedClientConfig | undefi
   const projects = asRecord(root?.projects);
   const hasProjectMemory = recordHasProjectMemoryServer(root)
     || (projects !== undefined && Object.values(projects).some(recordHasProjectMemoryServer));
+  const memoryProjectRoot = projectMemoryServersInClaudeGlobal(root)
+    .map((server) => {
+      const value = asRecord(server.env)?.MEMORY_PROJECT_ROOT;
+      return typeof value === "string" ? value : undefined;
+    })
+    .find((value) => value !== undefined);
   return {
     diagnostic: {
       path,
@@ -1095,10 +1193,11 @@ function inspectClaudeGlobalConfig(path: string): InspectedClientConfig | undefi
       scope: "global",
       exists: true,
       hasProjectMemory,
-      hasMemoryProjectRoot: text.includes("MEMORY_PROJECT_ROOT"),
-      memoryProjectRoot: extractMemoryProjectRoot(text),
+      hasMemoryProjectRoot: memoryProjectRoot !== undefined,
+      memoryProjectRoot,
       parseError: readResult.error ?? parsed.error,
     },
+    format: "json",
     text: readResult.text,
     json: parsed.json,
   };
@@ -1115,6 +1214,7 @@ function inspectClientConfig(projectRoot: string, probe: ClientConfigProbe): Ins
         hasProjectMemory: false,
         hasMemoryProjectRoot: false,
       },
+      format: probe.format,
     };
   }
 
@@ -1135,21 +1235,67 @@ function inspectClientConfig(projectRoot: string, probe: ClientConfigProbe): Ins
       memoryProjectRoot,
       parseError: readResult.error ?? parsed.error,
     },
+    format: probe.format,
     text: readResult.text,
     json: parsed.json,
   };
 }
 
-function inferEnabledFromText(inspected: InspectedClientConfig[]): boolean | undefined {
-  const joined = inspected
-    .map((config) => config.text)
-    .filter((text): text is string => typeof text === "string")
-    .join("\n");
+// project-memory server entries live under different container keys per
+// client: mcpServers (Claude/Cursor/Windsurf/Antigravity), mcp (OpenCode),
+// context_servers (Zed).
+const PROJECT_MEMORY_SERVER_CONTAINER_KEYS = ["mcpServers", "mcp", "context_servers"] as const;
 
-  if (/["']?disabled["']?\s*[:=]\s*true/i.test(joined)) return false;
-  if (/["']?enabled["']?\s*[:=]\s*false/i.test(joined)) return false;
-  if (/["']?disabled["']?\s*[:=]\s*false/i.test(joined)) return true;
-  if (/["']?enabled["']?\s*[:=]\s*true/i.test(joined)) return true;
+function findProjectMemoryServer(json: unknown): Record<string, unknown> | undefined {
+  const root = asRecord(json);
+  if (!root) return undefined;
+  for (const key of PROJECT_MEMORY_SERVER_CONTAINER_KEYS) {
+    const server = asRecord(asRecord(root[key])?.["project-memory"]);
+    if (server) return server;
+  }
+  return undefined;
+}
+
+function enabledFlagFromServer(server: Record<string, unknown>): boolean | undefined {
+  if (server.disabled === true || server.enabled === false) return false;
+  if (server.disabled === false || server.enabled === true) return true;
+  return undefined;
+}
+
+/**
+ * Scoped TOML scan: only key/value lines inside the
+ * `[mcp_servers.project-memory]` table count, so enabled/disabled flags of
+ * unrelated servers in the same file are ignored.
+ */
+function enabledFlagFromToml(text: string): boolean | undefined {
+  const lines = text.split(/\r?\n/);
+  const start = lines.findIndex((line) =>
+    /^\s*\[mcp_servers\.(?:"project-memory"|'project-memory'|project-memory)\]\s*(?:#.*)?$/.test(line));
+  if (start === -1) return undefined;
+  const block: string[] = [];
+  for (let index = start + 1; index < lines.length; index += 1) {
+    if (/^\s*\[/.test(lines[index])) break;
+    block.push(lines[index]);
+  }
+  const scoped = block.join("\n");
+  if (/^\s*disabled\s*=\s*true\b/m.test(scoped) || /^\s*enabled\s*=\s*false\b/m.test(scoped)) return false;
+  if (/^\s*disabled\s*=\s*false\b/m.test(scoped) || /^\s*enabled\s*=\s*true\b/m.test(scoped)) return true;
+  return undefined;
+}
+
+function inferProjectMemoryEnabled(inspected: InspectedClientConfig[]): boolean | undefined {
+  for (const config of inspected) {
+    if (config.format === "toml") {
+      if (typeof config.text !== "string") continue;
+      const enabled = enabledFlagFromToml(config.text);
+      if (enabled !== undefined) return enabled;
+      continue;
+    }
+    const server = findProjectMemoryServer(config.json);
+    if (!server) continue;
+    const enabled = enabledFlagFromServer(server);
+    if (enabled !== undefined) return enabled;
+  }
   return undefined;
 }
 
@@ -1164,7 +1310,7 @@ function diagnoseClientIntegration(
   const activeConfigs = configs.filter((config) => config.active && config.exists);
   const issues: string[] = [];
   let configured = activeConfigs.some((config) => config.hasProjectMemory);
-  let enabled = inferEnabledFromText(activeInspected);
+  let enabled = inferProjectMemoryEnabled(activeInspected);
   let allowedTools: string[] = [];
 
   for (const config of activeConfigs) {
@@ -1175,25 +1321,47 @@ function diagnoseClientIntegration(
   }
 
   if (definition.client === "claude-code") {
-    const settings = inspected.find((config) => config.diagnostic.path.endsWith(join(".claude", "settings.local.json")));
-    const settingsRecord = asRecord(settings?.json);
-    const enabledServers = stringArray(settingsRecord?.enabledMcpjsonServers);
-    const permissions = asRecord(settingsRecord?.permissions);
-    allowedTools = stringArray(permissions?.allow)
-      .filter((tool) => tool.startsWith("mcp__project-memory__"));
-    if (settings?.diagnostic.exists) {
-      enabled = enabledServers.includes("project-memory");
+    const projectMcp = inspected.find((config) => config.diagnostic.path.endsWith(join(projectRoot, ".mcp.json")));
+    // Both settings files contribute: shared .claude/settings.json and the
+    // per-developer .claude/settings.local.json override.
+    const settingsConfigs = inspected.filter((config) =>
+      config.diagnostic.path.endsWith(join(".claude", "settings.local.json"))
+      || config.diagnostic.path.endsWith(join(".claude", "settings.json")));
+    const enabledServers = new Set<string>();
+    const allowed = new Set<string>();
+    let enableAllProjectMcpServers = false;
+    let settingsExist = false;
+    for (const settings of settingsConfigs) {
+      if (!settings.diagnostic.exists) continue;
+      settingsExist = true;
+      const settingsRecord = asRecord(settings.json);
+      if (!settingsRecord) continue;
+      for (const server of stringArray(settingsRecord.enabledMcpjsonServers)) {
+        enabledServers.add(server);
+      }
+      const permissions = asRecord(settingsRecord.permissions);
+      for (const tool of stringArray(permissions?.allow)) {
+        if (tool.startsWith("mcp__project-memory__")) allowed.add(tool);
+      }
+      if (settingsRecord.enableAllProjectMcpServers === true) {
+        enableAllProjectMcpServers = true;
+      }
+    }
+    allowedTools = [...allowed];
+    if (settingsExist) {
+      const projectMcpHasServer = Boolean(projectMcp?.diagnostic.exists && projectMcp.diagnostic.hasProjectMemory);
+      enabled = enabledServers.has("project-memory")
+        || (enableAllProjectMcpServers && projectMcpHasServer);
       configured = configured || enabled;
     }
 
-    const projectMcp = inspected.find((config) => config.diagnostic.path.endsWith(join(projectRoot, ".mcp.json")));
     if (enabled && !projectMcp?.diagnostic.exists) {
       issues.push("CLAUDE_MCP_SERVER_DEFINITION_NOT_LOCAL");
     }
 
     // The global ~/.claude.json can also register project-memory. Appended
     // after the project-local probes so existing config indexes stay stable,
-    // and deliberately kept out of activeConfigs/inferEnabledFromText: a
+    // and deliberately kept out of activeConfigs/inferProjectMemoryEnabled: a
     // partial scan must not raise parse warnings or flip the enabled signal.
     const globalPath = claudeGlobalConfigPath(env);
     const globalConfig = globalPath ? inspectClaudeGlobalConfig(globalPath) : undefined;
@@ -1499,6 +1667,7 @@ export const __internals = {
   pickIdeActiveWorkspace,
   findIdeActiveWorkspace,
   resolveDynamicProjectRoot,
+  resolveServerEntrypoint,
   readBuildInfo,
   hasWorkspaceMarker,
   hasVaultMarker,

@@ -323,12 +323,23 @@ export class MemoryLifecycleService {
     ].join(" ").toLowerCase();
 
     // Whole-token matching instead of a raw regex: hyphens stay inside a token
-    // so "multi-file" still matches while slugs like "no-refactor-needed" do
-    // not, and a keyword directly negated by the previous token is ignored.
+    // so "multi-file" matches as one keyword, and a keyword directly negated by
+    // the previous token is ignored.
+    const negated = (previous: string | undefined) => NEGATING_TOKENS.has(previous ?? "");
     const tokens = text.split(/[^a-z0-9_-]+/).filter(Boolean);
-    if (tokens.some((token, index) => RISK_KEYWORDS.has(token) && !NEGATING_TOKENS.has(tokens[index - 1] ?? ""))) {
+    if (tokens.some((token, index) => RISK_KEYWORDS.has(token) && !negated(tokens[index - 1]))) {
       return true;
     }
+    // Hyphenated compounds ("schema-migration", "auth-flow") hide keywords from
+    // the whole-token pass, so test their parts too. Negation applies at part
+    // level ("no-refactor-needed" stays suppressed), and a negating previous
+    // token suppresses the whole compound ("no schema-migration").
+    const compoundHit = tokens.some((token, index) => {
+      if (!token.includes("-") || negated(tokens[index - 1])) return false;
+      const parts = token.split("-").filter(Boolean);
+      return parts.some((part, partIndex) => RISK_KEYWORDS.has(part) && !negated(parts[partIndex - 1]));
+    });
+    if (compoundHit) return true;
     // Thai is written without word separators, so Thai risk keywords are
     // matched as substrings of the raw text rather than as tokens.
     return THAI_RISK_KEYWORDS.some((keyword) => text.includes(keyword));

@@ -196,13 +196,15 @@ export class MemoryWorkflowService {
     // rank terms add Thai/CJK n-grams so non-space-delimited body text is
     // reachable by BM25; rankFor dedupes and applies the capped usage boost.
     const rankTerms = this.uniqueTerms([...searchTokens(`${input.query ?? ""} ${input.taskArea ?? ""}`), ...preset.extraTerms]);
-    const rankScores: Record<string, number> = scoringTerms.length > 0 ? await this.query.rankFor(rankTerms) : {};
+    // Keyed on rankTerms, not scoringTerms: word tokens are empty for a
+    // CJK-only query while its n-grams are not, and ranking must still run.
+    const rankScores: Record<string, number> = rankTerms.length > 0 ? await this.query.rankFor(rankTerms) : {};
     const records = await this.query.snapshotIndex();
     const scored = records
       .filter((record) => this.shouldInclude(record.type, includes))
-      // Relevance gate: when scoring terms exist, type weight alone must not
+      // Relevance gate: when rank terms exist, type weight alone must not
       // admit a record — it needs a BM25 match or a direct title/path/tag hit.
-      .filter((record) => scoringTerms.length === 0
+      .filter((record) => rankTerms.length === 0
         || (rankScores[record.path] ?? 0) > 0
         || this.hasDirectTermHit(record, scoringTerms))
       .map((record) => ({
@@ -293,14 +295,20 @@ export class MemoryWorkflowService {
 
   async selfCheck(input: { task: string; area?: string; riskLevel: "low" | "medium" | "high" }) {
     const lifecycle = this.lifecycle.recordSelfCheck(input);
+    const wordTerms = this.uniqueTerms(this.queryTerms(input.task, input.area));
     const terms = this.uniqueTerms(searchTokens(`${input.task} ${input.area ?? ""}`));
     const rankScores: Record<string, number> = terms.length > 0 ? await this.query.rankFor(terms) : {};
     const records = await this.query.snapshotIndex();
     // Compact projection only — raw StoredRecords (searchText/mtimeMs/vector)
-    // must never reach the wire. Ranked matches first, then newest.
+    // must never reach the wire. When terms are derivable, only mistakes with
+    // a BM25 match or a direct word-term hit qualify (substring, so area
+    // "auth" still finds "authentication"), ranked matches first then newest;
+    // unmatched mistakes must never crowd out a relevant one. Newest-N is the
+    // fallback only when no terms are derivable.
     const matchingMistakes = records
       .filter((record) => record.type === "mistake")
       .map((record) => ({ record, score: Math.round((rankScores[record.path] ?? 0) * 10) / 10 }))
+      .filter((item) => terms.length === 0 || item.score > 0 || this.hasDirectTermHit(item.record, wordTerms))
       .sort((a, b) => b.score - a.score || String(b.record.updatedAt).localeCompare(String(a.record.updatedAt)))
       .slice(0, input.area ? 10 : 5)
       .map((item) => this.compactRecord(item.record, item.score));
@@ -331,8 +339,10 @@ export class MemoryWorkflowService {
         fromFolder: "05_Agent_Session_Logs",
         targetFolder: "07_Insights",
         maxSessions: 30,
-        // minSessions 1 rewrote the digest on EVERY sessionEnd; require a real
-        // backlog before churning it (compact() reports candidateCount/paths).
+        // minSessions 1 rewrote the digest on EVERY sessionEnd; the threshold
+        // only delays that churn rather than eliminating it — old logs keep
+        // counting, so once 5+ logs accumulate each sessionEnd still rewrites
+        // the digest (compact() reports candidateCount/paths).
         minSessions: 5,
         dryRun: false,
       });
@@ -453,6 +463,13 @@ export class MemoryWorkflowService {
 
     const text = `${query ?? ""} ${taskArea ?? ""}`.toLowerCase();
     const tokens = new Set(text.split(/[^a-z0-9ก-๙_-]+/i).filter(Boolean));
+    // Kebab/snake slugs ("deploy-pipeline") also contribute their fragments so
+    // single-word keywords match; the full token is kept for exact matches.
+    for (const token of [...tokens]) {
+      for (const fragment of token.split(/[-_]/)) {
+        if (fragment.length > 0) tokens.add(fragment);
+      }
+    }
     for (const candidate of MODE_KEYWORDS) {
       if (candidate.keywords.some((keyword) => this.matchesKeyword(tokens, text, keyword))) {
         return { requested, resolved: candidate.mode };

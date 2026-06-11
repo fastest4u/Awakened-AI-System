@@ -2,8 +2,13 @@ import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileS
 import { dirname, join } from "node:path";
 import { todayIso } from "../utils/memory-format.js";
 
-/** Max context terms kept per record; unbounded maps made usage.json grow forever. */
+/** Context terms kept per record after a prune; unbounded maps made usage.json grow forever. */
 const MAX_CONTEXT_TERMS = 40;
+
+/** Prune only past this size (hysteresis): pruning at exactly MAX_CONTEXT_TERMS
+ *  kept a saturated record permanently full, so every new count-1 term was
+ *  rejected before it could ever accumulate a competitive count. */
+const CONTEXT_PRUNE_THRESHOLD = 48;
 
 interface UsageRecord {
   path: string;
@@ -98,10 +103,11 @@ export class MemoryUsageService {
     return 0;
   }
 
-  /** Keep only the top MAX_CONTEXT_TERMS terms (highest count first; ties keep the lexicographically smaller term). */
+  /** Let terms grow to CONTEXT_PRUNE_THRESHOLD, then keep only the top
+   *  MAX_CONTEXT_TERMS (highest count first; ties keep the lexicographically smaller term). */
   private capContexts(contexts: Record<string, number>): Record<string, number> {
     const entries = Object.entries(contexts);
-    if (entries.length <= MAX_CONTEXT_TERMS) return contexts;
+    if (entries.length <= CONTEXT_PRUNE_THRESHOLD) return contexts;
     entries.sort(([termA, countA], [termB, countB]) => countB - countA || termA.localeCompare(termB));
     return Object.fromEntries(entries.slice(0, MAX_CONTEXT_TERMS));
   }
@@ -134,13 +140,18 @@ export class MemoryUsageService {
     try {
       renameSync(tmp, this.usagePath);
     } catch (error) {
-      // Don't leak the temp file when the rename fails (e.g. target locked).
+      // Usage data is telemetry: a failed rename (e.g. target locked) must not
+      // fail the user-facing tool call (contextPack/sessionStart/awaken) that
+      // triggered it. Warn once and continue — unlike lifecycle.json, which
+      // stays loud because it carries the session state itself.
+      const message = error instanceof Error ? error.message : String(error);
+      console.error(`[memory-mcp] usage.json write skipped (${message}); usage stats may lag: ${this.usagePath}`);
+      // Don't leak the temp file when the rename fails.
       try {
         unlinkSync(tmp);
       } catch {
         // Best-effort cleanup only.
       }
-      throw error;
     }
   }
 

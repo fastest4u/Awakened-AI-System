@@ -53,7 +53,10 @@ interface PersistedIndex {
   updatedAt: string;
   /** Signature of the embedder whose vectors are stored here ("none" if off).
    *  On load, an embedding process drops vectors whose signature mismatches; a
-   *  lexical-only process preserves them (and this tag) untouched. */
+   *  lexical-only process preserves them. On persist, a lexical-only process
+   *  re-reads this file and passes through its tag plus the vectors of records
+   *  unchanged on disk, so it never clobbers vectors a concurrent embedding
+   *  process wrote after this process loaded. */
   embedder?: string;
   records: Record<string, PersistedRecord>;
 }
@@ -124,13 +127,24 @@ function recordComparator(sortBy: Exclude<SearchSortBy, "relevance">): (a: Store
 export class MemoryQueryService {
   private readonly indexPath: string;
   private readonly embedderId: string;
-  /** Embedder tag written to index.json. Tracks the loaded cache's tag when no
-   *  provider is active, so a lexical-only process never wipes another
-   *  process's vectors by re-tagging the cache as "none". */
+  /** Fallback embedder tag for persist() when the on-disk cache is unusable.
+   *  Tracks the loaded cache's tag when no provider is active; persist() itself
+   *  prefers the CURRENT on-disk tag (see readForeignVectorState), so a
+   *  lexical-only process never re-tags the cache as "none" over another
+   *  process's vectors. */
   private persistedEmbedderId: string;
   private loaded = false;
   private embedCooldownUntil = 0;
   private cacheNeedsPersist = false;
+  /** Per-record embed-failure markers (path -> earliest retry, ms epoch). A
+   *  failed batch is marked to retry one cooldown AFTER the global cooldown
+   *  expires, so the first pass past the cooldown skips it and drains the rest
+   *  of the backlog — one deterministically-failing doc cannot head-of-line
+   *  block every other pending record forever. */
+  private readonly embedRetryAfter = new Map<string, number>();
+  /** Length of the first vector this session's provider returned; the expected
+   *  dimensionality when the provider does not declare `dimensions` (> 0). */
+  private sessionDims = 0;
   private readonly queryVectorCache = new Map<string, number[]>();
 
   constructor(
@@ -357,17 +371,24 @@ export class MemoryQueryService {
 
   /**
    * Embed records still missing a vector (new/modified notes, or all of them
-   * after an embedder change) in bounded batches — at most EMBED_MAX_BATCHES
-   * batches per call; the remainder is drained by subsequent searches.
-   * Best-effort: a provider error or malformed response degrades to
-   * lexical-only and starts a short cooldown so a down endpoint can't make
-   * every query retry. Returns true if any vector was stored.
+   * after an embedder change) — or whose stored vector's length no longer
+   * matches the expected dimensionality (an endpoint-side dim change under the
+   * same model id would otherwise disable the semantic arm forever) — in
+   * bounded batches: at most EMBED_MAX_BATCHES batches per call; the remainder
+   * is drained by subsequent searches. Best-effort: a provider error or
+   * malformed response degrades to lexical-only, starts a short cooldown, and
+   * sidelines the failed batch's records past that cooldown so a
+   * deterministically-failing doc cannot wedge the rest of the backlog.
+   * Returns true if any vector was stored.
    */
   private async embedMissing(): Promise<boolean> {
     if (!this.embedder || Date.now() < this.embedCooldownUntil) return false;
+    const now = Date.now();
+    const expectedDims = this.embedder.dimensions > 0 ? this.embedder.dimensions : this.sessionDims;
     const pending = this.index
       .list()
-      .filter((record) => !record.vector || record.vector.length === 0)
+      .filter((record) => !record.vector || record.vector.length === 0 || (expectedDims > 0 && record.vector.length !== expectedDims))
+      .filter((record) => (this.embedRetryAfter.get(record.path) ?? 0) <= now)
       .slice(0, EMBED_BATCH_SIZE * EMBED_MAX_BATCHES);
     if (pending.length === 0) return false;
     let stored = false;
@@ -376,20 +397,23 @@ export class MemoryQueryService {
       try {
         const vectors = await this.embedder.embed(batch.map((record) => this.embedText(record)));
         if (vectors.length !== batch.length) {
-          this.recordEmbedFailure();
+          this.recordBatchFailure(batch);
           return stored;
         }
         const coerced = vectors.map(coerceVector);
         if (coerced.some((vector) => !vector)) {
-          this.recordEmbedFailure();
+          this.recordBatchFailure(batch);
           return stored;
         }
         batch.forEach((record, j) => {
-          this.index.upsert({ ...record, vector: coerced[j] as number[] });
+          const vector = coerced[j] as number[];
+          if (this.sessionDims === 0) this.sessionDims = vector.length;
+          this.embedRetryAfter.delete(record.path);
+          this.index.upsert({ ...record, vector });
           stored = true;
         });
       } catch {
-        this.recordEmbedFailure();
+        this.recordBatchFailure(batch);
         return stored;
       }
     }
@@ -398,6 +422,16 @@ export class MemoryQueryService {
 
   private recordEmbedFailure() {
     this.embedCooldownUntil = Date.now() + EMBED_COOLDOWN_MS;
+  }
+
+  /** A failed batch starts the global cooldown AND marks its records to retry
+   *  one further cooldown later: passes can only resume once the global
+   *  cooldown expires, so a marker expiring WITH it would put the same failing
+   *  batch first again — the extra cooldown gives the first resumed pass a
+   *  window to skip those records and drain the rest of the backlog. */
+  private recordBatchFailure(batch: StoredRecord[]) {
+    this.recordEmbedFailure();
+    for (const record of batch) this.embedRetryAfter.set(record.path, this.embedCooldownUntil + EMBED_COOLDOWN_MS);
   }
 
   /** Embed the query for the semantic arm; undefined when off or on failure.
@@ -423,6 +457,9 @@ export class MemoryQueryService {
         this.recordEmbedFailure();
         return undefined;
       }
+      // A query vector also reveals the endpoint's true dimensionality, so a
+      // dim change is caught even before any document batch succeeds.
+      if (this.sessionDims === 0) this.sessionDims = vector.length;
       this.queryVectorCache.set(text, vector);
       if (this.queryVectorCache.size > QUERY_VECTOR_CACHE_SIZE) {
         const oldest = this.queryVectorCache.keys().next().value as string;
@@ -486,8 +523,9 @@ export class MemoryQueryService {
       // Vectors from a different embedder are incomparable to the active one —
       // an embedding process drops them and re-embeds under its own signature.
       // A lexical-only process (no provider) instead PRESERVES foreign vectors
-      // and their tag, so it can never wipe a concurrent embedding process's
-      // vector cache just by refreshing the lexical fields.
+      // and their tag; persist() additionally passes through the LATEST on-disk
+      // vectors (readForeignVectorState), so refreshing lexical fields cannot
+      // wipe what a concurrent embedding process wrote after this load.
       const lexicalOnly = this.embedderId === NO_EMBEDDER;
       const keepVectors = lexicalOnly || persistedEmbedder === this.embedderId;
       if (lexicalOnly) this.persistedEmbedderId = persistedEmbedder;
@@ -530,11 +568,50 @@ export class MemoryQueryService {
     };
   }
 
+  /**
+   * Current on-disk embedder tag + per-record vectors (kept in wire form — no
+   * decode/encode round-trip) for the lexical-only persist pass-through.
+   * Undefined when there is no usable disk cache; persist() then falls back to
+   * the load-time tag and in-memory vectors, which were loaded under that tag.
+   */
+  private readForeignVectorState(): { embedder: string; vectorFor: (record: StoredRecord) => string | undefined } | undefined {
+    try {
+      if (!existsSync(this.indexPath)) return undefined;
+      const parsed = JSON.parse(readFileSync(this.indexPath, "utf8")) as PersistedIndex;
+      if (!parsed || parsed.version !== INDEX_VERSION || !parsed.records) return undefined;
+      const embedder = typeof parsed.embedder === "string" && parsed.embedder ? parsed.embedder : NO_EMBEDDER;
+      const onDisk = parsed.records;
+      return {
+        embedder,
+        vectorFor: (record) => {
+          const disk = onDisk[record.path];
+          if (!disk || typeof disk.vector !== "string" || disk.vector.length === 0) return undefined;
+          // A vector for a since-changed note is stale — drop it.
+          return disk.mtimeMs === record.mtimeMs && disk.sizeBytes === record.sizeBytes ? disk.vector : undefined;
+        },
+      };
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * Write the in-memory index to disk. A lexical-only process first re-reads
+   * the on-disk cache and passes through its embedder tag plus the stored
+   * vector of every record whose mtime+size is unchanged — the disk state is
+   * authoritative for vectors this process does not own, so a long-running
+   * lexical process cannot clobber vectors a concurrent embedding process
+   * wrote AFTER this process loaded (a changed record's stale vector still
+   * drops, exactly as an embedding process would drop it).
+   */
   private persist() {
     try {
+      const foreign = this.embedderId === NO_EMBEDDER ? this.readForeignVectorState() : undefined;
       const records: Record<string, PersistedRecord> = {};
-      for (const record of this.index.list()) records[record.path] = { ...record, vector: encodeVector(record.vector) };
-      const payload: PersistedIndex = { version: INDEX_VERSION, updatedAt: new Date().toISOString(), embedder: this.persistedEmbedderId, records };
+      for (const record of this.index.list()) {
+        records[record.path] = { ...record, vector: foreign ? foreign.vectorFor(record) : encodeVector(record.vector) };
+      }
+      const payload: PersistedIndex = { version: INDEX_VERSION, updatedAt: new Date().toISOString(), embedder: foreign?.embedder ?? this.persistedEmbedderId, records };
       mkdirSync(dirname(this.indexPath), { recursive: true });
       // Write to a per-process temp file then atomically rename. The vault is
       // shared across agents/processes, so a concurrent or interrupted write
