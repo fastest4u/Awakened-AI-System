@@ -1,16 +1,17 @@
 ---
-title: 2026-05-21 - Create mcp_config.json in antigravity folder
+title: "2026-05-21 - Create mcp_config.json in antigravity folder"
 type: session-log
-session-date: 2026-05-21
 agent: antigravity
+session-date: "2026-05-21"
 outcomes:
   - Successfully created the active antigravity MCP configuration file containing Context7
-created: 2026-05-21
-updated: 2026-05-21
 tags:
   - session-log
   - project/general
+created: "2026-05-21"
+updated: "2026-05-21"
 ---
+
 # 2026-05-21 - Create mcp_config.json in antigravity folder
 
 ## TL;DR

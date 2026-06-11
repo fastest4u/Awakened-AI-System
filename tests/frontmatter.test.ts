@@ -120,6 +120,54 @@ describe("yamlScalar", () => {
   it("renders a Date as a quoted YYYY-MM-DD", () => {
     assert.equal(yamlScalar(new Date("2026-06-01T00:00:00Z")), '"2026-06-01"');
   });
+
+  it("quotes values containing '#' (an unquoted '#' starts a YAML comment)", () => {
+    assert.equal(yamlScalar("Issue #42"), '"Issue #42"');
+    assert.equal(yamlScalar("#tag"), '"#tag"');
+  });
+
+  it("quotes leading/trailing whitespace and the empty string", () => {
+    assert.equal(yamlScalar(" padded"), '" padded"');
+    assert.equal(yamlScalar("padded "), '"padded "');
+    assert.equal(yamlScalar(""), '""');
+  });
+
+  it("quotes boolean/null lookalikes so they round-trip as strings", () => {
+    for (const word of ["true", "false", "yes", "no", "on", "off", "null", "~", "True", "NO"]) {
+      assert.equal(yamlScalar(word), JSON.stringify(word), `expected ${word} to be quoted`);
+    }
+  });
+
+  it("quotes number lookalikes so they round-trip as strings", () => {
+    for (const num of ["42", "-7", "3.14", "1e5", "0x1F", "0o17", "0b101", ".inf", ".nan", "1_000"]) {
+      assert.equal(yamlScalar(num), JSON.stringify(num), `expected ${num} to be quoted`);
+    }
+  });
+
+  it("quotes values starting with a YAML indicator character", () => {
+    for (const value of ["- item", "? key", "[a]", "{a}", "&anchor", "*star", "!tag", "|block", "> fold", "%pct", "@at", "`tick", '"dq', "'sq"]) {
+      assert.equal(yamlScalar(value), JSON.stringify(value), `expected ${JSON.stringify(value)} to be quoted`);
+    }
+  });
+
+  it("'#' values survive a write + reparse roundtrip (truncation regression)", () => {
+    // Regression: an unquoted '#' starts a comment, so a reparse used to
+    // silently truncate "Fix #12 - escaping" down to "Fix".
+    const data = {
+      title: "Fix #12 - escaping",
+      type: "note",
+      status: "true",
+      version: "1.20",
+      tags: ["#inbox", "release: 2026"],
+    };
+    const content = buildNoteContent(data, "body\n", ["title", "type"]);
+    const parsed = parseFrontmatter(content);
+    assert.equal(parsed.diagnostics.length, 0);
+    assert.equal(parsed.data.title, "Fix #12 - escaping");
+    assert.equal(parsed.data.status, "true", "boolean lookalike stays a string");
+    assert.equal(parsed.data.version, "1.20", "number lookalike stays a string (trailing zero kept)");
+    assert.deepEqual(parsed.data.tags, ["#inbox", "release: 2026"]);
+  });
 });
 
 describe("serializeFrontmatter + buildNoteContent", () => {

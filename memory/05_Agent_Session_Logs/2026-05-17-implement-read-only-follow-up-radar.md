@@ -1,8 +1,8 @@
 ---
-title: 2026-05-17 - Implement read-only follow-up radar
+title: "2026-05-17 - Implement read-only follow-up radar"
 type: session-log
-session-date: 2026-05-17
 agent: Codex
+session-date: "2026-05-17"
 duration-minutes: 32
 outcomes:
   - Added MemoryFollowUpService to extract open unchecked tasks and bullet items under follow-up sections from vault markdown notes.
@@ -10,12 +10,13 @@ outcomes:
   - Surfaced compact followUps in memory_sessionStart and memory_contextPack responses.
   - "Wired follow-up radar into app bootstrap, workflow controller, workflow service, and schemas."
   - "Updated README, bootstrap-generated client docs, Retrieval Protocol, Memory Autopilot, and AI Client Setup notes to document follow-up radar."
-created: 2026-05-17
-updated: 2026-05-17
 tags:
   - session-log
   - project/general
+created: "2026-05-17"
+updated: "2026-05-17"
 ---
+
 # 2026-05-17 - Implement read-only follow-up radar
 
 ## TL;DR

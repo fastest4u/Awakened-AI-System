@@ -1,11 +1,11 @@
 ---
-title: 2026-05-23 - Add Zed SQLite-based workspace detection
+title: "2026-05-23 - Add Zed SQLite-based workspace detection"
 type: session-log
-session-date: 2026-05-23
 agent: cascade
+session-date: "2026-05-23"
 duration-minutes: 30
 outcomes:
-  - "Closed Zed coverage gap from previous ADR. Zed users now get full auto-detect via SQLite workspaces table read - same first-class status as Cursor and OpenCode."
+  - Closed Zed coverage gap from previous ADR. Zed users now get full auto-detect via SQLite workspaces table read - same first-class status as Cursor and OpenCode.
   - "Discovered Node 22.5+'s built-in node:sqlite makes a SQLite reader feasible without breaking the zero-runtime-dep philosophy. Node 24 (current) has it stable without flags."
   - "Added tryLoadSqlite() with createRequire-based feature detection so older Node runtimes (pre-22.5) silently no-op rather than crash."
   - "Added zedAppDataRoots() / zedDbFiles() for cross-platform paths - Windows uses LOCALAPPDATA + 'Zed', macOS uses Library/Application Support + 'Zed', Linux uses XDG_DATA_HOME or ~/.local/share + lowercase 'zed'. Probes 0-stable / 0-preview / 0-dev release channels."
@@ -15,8 +15,6 @@ outcomes:
   - "Added 13 new unit tests (52 total, all green): zedDbFiles paths across platforms, decodeZedPathsColumn for various shapes, readZedWorkspaceCandidates with mocked sqlite covering success path, missing sqlite, throwing prepare/all, and throwing constructor."
   - "Updated README: refreshed compatibility matrix to show Zed with both ✅ marks (cwd + IDE state), added Node 22.5 minimum-version note, removed prior 'ทำงานผ่าน cwd เท่านั้น' caveat for Zed."
   - "Built dist/index.js. Live verification: readZedWorkspaceCandidates() returned [SPX (lastActive), laravel, Awakened-AI-System] from the user's real Zed 0-stable database, exactly matching Zed's recent-workspaces UI."
-created: 2026-05-23
-updated: 2026-05-23
 tags:
   - session-log
   - mcp
@@ -25,7 +23,10 @@ tags:
   - zed
   - sqlite
   - project/awakened-ai-system
+created: "2026-05-23"
+updated: "2026-05-23"
 ---
+
 # 2026-05-23 - Add Zed SQLite-based workspace detection
 
 ## TL;DR

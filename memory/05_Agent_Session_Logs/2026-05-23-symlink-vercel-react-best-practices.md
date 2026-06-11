@@ -1,17 +1,18 @@
 ---
-title: 2026-05-23 - Symlink-Vercel-React-Best-Practices
+title: "2026-05-23 - Symlink-Vercel-React-Best-Practices"
 type: session-log
-session-date: 2026-05-23
 agent: codex
+session-date: "2026-05-23"
 duration-minutes: 5
 outcomes:
   - Created symlink for the global vercel-react-best-practices skill into the workspace
-created: 2026-05-23
-updated: 2026-05-23
 tags:
   - session-log
   - project/general
+created: "2026-05-23"
+updated: "2026-05-23"
 ---
+
 # 2026-05-23 - Symlink-Vercel-React-Best-Practices
 
 ## TL;DR

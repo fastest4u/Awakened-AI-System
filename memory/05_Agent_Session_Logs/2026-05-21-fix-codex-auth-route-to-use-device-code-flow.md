@@ -1,16 +1,17 @@
 ---
-title: 2026-05-21 - Fix Codex auth route to use Device Code flow
+title: "2026-05-21 - Fix Codex auth route to use Device Code flow"
 type: session-log
-session-date: 2026-05-21
 agent: antigravity
+session-date: "2026-05-21"
 outcomes:
   - "Codex authentication corrected to use the fully non-interactive Device Code flow, resolving the 403 authorization error"
-created: 2026-05-21
-updated: 2026-05-21
 tags:
   - session-log
   - project/general
+created: "2026-05-21"
+updated: "2026-05-21"
 ---
+
 # 2026-05-21 - Fix Codex auth route to use Device Code flow
 
 ## TL;DR

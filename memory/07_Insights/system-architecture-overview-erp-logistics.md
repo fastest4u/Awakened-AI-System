@@ -1,18 +1,19 @@
 ---
 title: "System Architecture Overview (ERP & Logistics)"
 type: insight
+status: active
+confidence: high
 derived-from:
   - 05_Agent_Session_Logs/2026-05-18-bootstrap-project-memory-mcp-into-laravel-project.md
-confidence: high
-status: active
-created: 2026-05-18
-updated: 2026-05-18
 tags:
   - architecture
   - erp
   - logistics
   - overview
+created: "2026-05-18"
+updated: "2026-05-18"
 ---
+
 # System Architecture Overview: Awakened AI System (Laravel ERP & Logistics)
 
 ## Core Technologies

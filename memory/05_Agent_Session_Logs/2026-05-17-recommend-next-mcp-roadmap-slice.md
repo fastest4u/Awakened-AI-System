@@ -1,19 +1,20 @@
 ---
-title: 2026-05-17 - Recommend next MCP roadmap slice
+title: "2026-05-17 - Recommend next MCP roadmap slice"
 type: session-log
-session-date: 2026-05-17
 agent: Codex
+session-date: "2026-05-17"
 duration-minutes: 3
 outcomes:
   - Reviewed current memory context after lifecycle guardrails implementation.
   - Recommended task-aware contextPack presets as the next highest-value MCP improvement.
   - Recorded an insight capturing this roadmap decision.
-created: 2026-05-17
-updated: 2026-05-17
 tags:
   - session-log
   - project/general
+created: "2026-05-17"
+updated: "2026-05-17"
 ---
+
 # 2026-05-17 - Recommend next MCP roadmap slice
 
 ## TL;DR

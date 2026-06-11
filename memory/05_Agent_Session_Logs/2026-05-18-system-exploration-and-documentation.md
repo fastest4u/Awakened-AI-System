@@ -1,18 +1,19 @@
 ---
-title: 2026-05-18 - System Exploration and Documentation
+title: "2026-05-18 - System Exploration and Documentation"
 type: session-log
-session-date: 2026-05-18
 agent: Antigravity
+session-date: "2026-05-18"
 duration-minutes: 5
 outcomes:
   - "Explored system directories, routes, and composer dependencies to understand the project architecture."
   - Written an insight detailing the ERP and Logistics modules within the Laravel 12 API.
-created: 2026-05-18
-updated: 2026-05-18
 tags:
   - session-log
   - project/general
+created: "2026-05-18"
+updated: "2026-05-18"
 ---
+
 # 2026-05-18 - System Exploration and Documentation
 
 ## TL;DR

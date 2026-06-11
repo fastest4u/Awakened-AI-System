@@ -1,18 +1,19 @@
 ---
-title: 2026-05-21 - clarify LINE image to AI bidding flow
+title: "2026-05-21 - clarify LINE image to AI bidding flow"
 type: session-log
-session-date: 2026-05-21
 agent: codex
+session-date: "2026-05-21"
 duration-minutes: 3
 outcomes:
   - "Clarified current LINE image listener flow from code: incoming group image is downloaded, sent to Codex image reader with default 5-field SPX runsheet prompt, and the extracted text is replied to LINE."
   - Confirmed current code does not automatically pass AI output into bidding accept/matching logic.
-created: 2026-05-21
-updated: 2026-05-21
 tags:
   - session-log
   - project/general
+created: "2026-05-21"
+updated: "2026-05-21"
 ---
+
 # 2026-05-21 - clarify LINE image to AI bidding flow
 
 ## TL;DR

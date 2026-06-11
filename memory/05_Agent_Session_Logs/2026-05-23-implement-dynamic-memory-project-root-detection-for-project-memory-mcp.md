@@ -1,8 +1,8 @@
 ---
-title: 2026-05-23 - Implement dynamic MEMORY_PROJECT_ROOT detection for project-memory MCP
+title: "2026-05-23 - Implement dynamic MEMORY_PROJECT_ROOT detection for project-memory MCP"
 type: session-log
-session-date: 2026-05-23
 agent: codex
+session-date: "2026-05-23"
 duration-minutes: 18
 outcomes:
   - "Added dynamic root resolution to project-memory MCP: MEMORY_PROJECT_ROOT values auto/detect/dynamic/workspace now trigger workspace discovery from workspace-related env vars and cwd by walking up to project markers."
@@ -10,12 +10,13 @@ outcomes:
   - "Updated memory_bootstrapProject generated MCP configs to emit MEMORY_PROJECT_ROOT=dynamic instead of hard-coded project paths."
   - "Updated SPX Codex/Kiro/Windsurf project configs and several user/client MCP configs to use MEMORY_PROJECT_ROOT=dynamic."
   - Rebuilt project-memory MCP dist/index.js after changes.
-created: 2026-05-23
-updated: 2026-05-23
 tags:
   - session-log
   - project/general
+created: "2026-05-23"
+updated: "2026-05-23"
 ---
+
 # 2026-05-23 - Implement dynamic MEMORY_PROJECT_ROOT detection for project-memory MCP
 
 ## TL;DR

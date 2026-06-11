@@ -1,16 +1,17 @@
 ---
-title: 2026-05-20 - Strict PR Review 8 Category for refactor/optimize-queries-dashboard-endpoints
+title: "2026-05-20 - Strict PR Review 8 Category for refactor/optimize-queries-dashboard-endpoints"
 type: session-log
-session-date: 2026-05-20
 agent: codex
+session-date: "2026-05-20"
 outcomes:
   - Captured strict PR review work for dashboard endpoint query optimization and listed the touched controller.
-created: 2026-05-20
-updated: 2026-05-20
 tags:
   - session-log
   - project/general
+created: "2026-05-20"
+updated: "2026-05-20"
 ---
+
 # 2026-05-20 - Strict PR Review 8 Category for refactor/optimize-queries-dashboard-endpoints
 
 ## TL;DR

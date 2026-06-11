@@ -1,19 +1,20 @@
 ---
-title: 2026-05-21 - Prepare safe PowerShell LINE JS dev environment launcher
+title: "2026-05-21 - Prepare safe PowerShell LINE JS dev environment launcher"
 type: session-log
-session-date: 2026-05-21
 agent: Codex
+session-date: "2026-05-21"
 duration-minutes: 5
 outcomes:
   - Did not read or edit .env because repository instructions prohibit editing .env and exposing secrets.
   - Added scripts/dev-linejs.ps1 to set PowerShell-compatible dev environment variables for LINE JS testing and run backend plus Vite via concurrently.
   - Script accepts -ChatId to set LINE_IMAGE_LISTENER_CHAT_ID for group image listener testing.
-created: 2026-05-21
-updated: 2026-05-21
 tags:
   - session-log
   - project/general
+created: "2026-05-21"
+updated: "2026-05-21"
 ---
+
 # 2026-05-21 - Prepare safe PowerShell LINE JS dev environment launcher
 
 ## TL;DR

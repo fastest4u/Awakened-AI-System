@@ -5,7 +5,7 @@
  * instead of just the note. Any text before the first heading is kept as an
  * intro section anchored at line 1.
  */
-import { tokenize } from "./bm25.js";
+import { searchTokens } from "./ngram.js";
 
 export interface Section {
   heading: string;
@@ -74,8 +74,8 @@ export function bestSection(body: string, queryTerms: string[]): SectionMatch | 
   let best: { section: Section; score: number } | null = null;
   for (const section of sections) {
     let score = 0;
-    for (const token of tokenize(section.text)) if (terms.has(token)) score += 1;
-    for (const token of tokenize(section.heading)) if (terms.has(token)) score += 2;
+    for (const token of searchTokens(section.text)) if (terms.has(token)) score += 1;
+    for (const token of searchTokens(section.heading)) if (terms.has(token)) score += 2;
     // Higher score wins; on a tie prefer a real heading over the level-0 intro
     // so the anchor points at the named section, not the top of the note.
     const better = !best || score > best.score || (score === best.score && best.section.level === 0 && section.level > 0);

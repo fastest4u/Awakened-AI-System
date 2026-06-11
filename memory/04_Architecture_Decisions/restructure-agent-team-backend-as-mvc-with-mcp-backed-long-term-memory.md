@@ -2,11 +2,9 @@
 title: Restructure agent-team backend as MVC with MCP-backed long-term memory
 type: adr
 status: accepted
-decision-date: 2026-05-24
 confidence: high
+decision-date: "2026-05-24"
 supersedes: []
-created: 2026-05-24
-updated: 2026-05-24
 tags:
   - architecture
   - mvc
@@ -14,7 +12,10 @@ tags:
   - agents
   - bun
   - memory
+created: "2026-05-24"
+updated: "2026-05-24"
 ---
+
 ## Context
 User wants a Bun-based multi-agent backend (orchestrator + role-based team) restructured into a full MVC layout, and integrated with the project_memory MCP server so agents share durable long-term memory (insights, ADRs, session logs, runbooks) across runs. Initial flat layout under src/core/ was good as a sketch but conflates persistence, transport, and domain logic.
 

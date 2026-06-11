@@ -1,19 +1,20 @@
 ---
-title: 2026-05-22 - fix Codex auth 403 by routing login to device code flow
+title: "2026-05-22 - fix Codex auth 403 by routing login to device code flow"
 type: session-log
-session-date: 2026-05-22
 agent: Codex
+session-date: "2026-05-22"
 duration-minutes: 10
 outcomes:
   - Diagnosed 403 token exchange as old authorization-code callback flow still being used by /api/ai/codex-auth/start.
   - "Changed /api/ai/codex-auth/start to call startDeviceCodeAuth() so the Settings UI uses OAuth Device Code flow instead of localhost callback token exchange."
   - Started a fresh local dev server so backend code changes are active.
-created: 2026-05-22
-updated: 2026-05-22
 tags:
   - session-log
   - project/general
+created: "2026-05-22"
+updated: "2026-05-22"
 ---
+
 # 2026-05-22 - fix Codex auth 403 by routing login to device code flow
 
 ## TL;DR

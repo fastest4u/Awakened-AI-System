@@ -1,18 +1,19 @@
 ---
-title: 2026-05-16 - Obsidian AI Plugins Integration
+title: "2026-05-16 - Obsidian AI Plugins Integration"
 type: session-log
-session-date: 2026-05-16
 agent: Antigravity
+session-date: "2026-05-16"
 duration-minutes: 5
 outcomes:
   - Updated Obsidian community plugin config with two new AI tools.
   - Documented the AI/Smart Stack within the Plugin Setup reference guide.
-created: 2026-05-16
-updated: 2026-05-16
 tags:
   - session-log
   - project/general
+created: "2026-05-16"
+updated: "2026-05-16"
 ---
+
 # 2026-05-16 - Obsidian AI Plugins Integration
 
 ## TL;DR

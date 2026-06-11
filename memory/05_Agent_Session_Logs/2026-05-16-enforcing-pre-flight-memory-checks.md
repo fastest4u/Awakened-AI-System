@@ -1,17 +1,18 @@
 ---
-title: 2026-05-16 - Enforcing Pre-Flight Memory Checks
+title: "2026-05-16 - Enforcing Pre-Flight Memory Checks"
 type: session-log
-session-date: 2026-05-16
 agent: Antigravity
+session-date: "2026-05-16"
 duration-minutes: 5
 outcomes:
   - Cemented the Pre-flight memory check requirement.
-created: 2026-05-16
-updated: 2026-05-16
 tags:
   - session-log
   - project/general
+created: "2026-05-16"
+updated: "2026-05-16"
 ---
+
 # 2026-05-16 - Enforcing Pre-Flight Memory Checks
 
 ## TL;DR

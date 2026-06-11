@@ -2,17 +2,18 @@
 title: Add Read-Only Follow-up Radar
 type: adr
 status: accepted
-decision-date: 2026-05-17
 confidence: medium
+decision-date: "2026-05-17"
 supersedes: []
-created: 2026-05-17
-updated: 2026-05-17
 tags:
   - mcp
   - followups
   - automation
   - retrieval
+created: "2026-05-17"
+updated: "2026-05-17"
 ---
+
 ## Context
 The MCP server now tracks lifecycle compliance and retrieves task-aware context, but unresolved work can still remain buried in session logs, Open Follow-ups notes, and unchecked task lists. The next roadmap slice should surface relevant open work at task start without mutating notes.
 

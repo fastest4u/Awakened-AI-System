@@ -1,8 +1,8 @@
 ---
-title: 2026-05-22 - Implement OpenCode-style Codex auth without Codex CLI
+title: "2026-05-22 - Implement OpenCode-style Codex auth without Codex CLI"
 type: session-log
-session-date: 2026-05-22
 agent: codex
+session-date: "2026-05-22"
 duration-minutes: 45
 outcomes:
   - "Changed SPX Codex auth start endpoint to default to browser OAuth with localhost callback, matching OpenCode desktop behavior without invoking Codex CLI."
@@ -10,12 +10,13 @@ outcomes:
   - Updated the AI SDK custom Codex fetch to use OpenCode-like originator/User-Agent headers and direct Codex API bearer auth from stored tokens.
   - Updated Settings UI to expose Browser Login and Code Login actions for the codex-device provider.
   - "Verified npm run typecheck, npm run build, browser/device auth smoke starts, backend health, and local dev server startup."
-created: 2026-05-22
-updated: 2026-05-22
 tags:
   - session-log
   - project/general
+created: "2026-05-22"
+updated: "2026-05-22"
 ---
+
 # 2026-05-22 - Implement OpenCode-style Codex auth without Codex CLI
 
 ## TL;DR

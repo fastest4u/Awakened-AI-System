@@ -21,9 +21,9 @@ export class MaintenanceController {
     server.registerTool("memory_reindex", { description: "Rebuild the whole vault index.", inputSchema: reindexInputSchema, annotations: { destructiveHint: true } }, this.reindex.bind(this));
     server.registerTool("memory_indexNote", { description: "Index a single note.", inputSchema: indexNoteInputSchema, annotations: { destructiveHint: true } }, this.indexNote.bind(this));
     server.registerTool("memory_compactVault", { description: "Compact session logs into insights.", inputSchema: compactVaultInputSchema, annotations: { destructiveHint: true } }, this.compactVault.bind(this));
-    server.registerTool("memory_export", { description: "Export a curated memory bundle.", inputSchema: exportInputSchema, annotations: { readOnlyHint: true, idempotentHint: true } }, this.export.bind(this));
-    server.registerTool("memory_import", { description: "Import notes into the vault.", inputSchema: importInputSchema, annotations: { destructiveHint: true } }, this.import.bind(this));
-    server.registerTool("memory_diagnoseWorkspace", { description: "Diagnose project root, vault root, workspace detection candidates, and runtime metadata.", inputSchema: diagnoseWorkspaceInputSchema, annotations: { readOnlyHint: true, idempotentHint: true } }, this.diagnoseWorkspace.bind(this));
+    server.registerTool("memory_export", { description: "Export a curated memory bundle. (NOT IMPLEMENTED yet)", inputSchema: exportInputSchema, annotations: { readOnlyHint: true, idempotentHint: true } }, this.export.bind(this));
+    server.registerTool("memory_import", { description: "Import notes into the vault. (NOT IMPLEMENTED yet)", inputSchema: importInputSchema, annotations: { destructiveHint: true } }, this.import.bind(this));
+    server.registerTool("memory_diagnoseWorkspace", { description: "Diagnose project root, vault root, workspace detection candidates, runtime metadata, and local AI client MCP configs.", inputSchema: diagnoseWorkspaceInputSchema, annotations: { readOnlyHint: true, idempotentHint: true } }, this.diagnoseWorkspace.bind(this));
   }
 
   async reindex(_: z.infer<typeof reindexInputSchema>) {
@@ -56,12 +56,14 @@ export class MaintenanceController {
     return this.responses.buildOk("memory_compactVault", startedAt, result);
   }
 
-  async export(input: z.infer<typeof exportInputSchema>) {
-    return this.responses.buildOk("memory_export", Date.now(), { artifactPath: "", format: input.format });
+  async export(_: z.infer<typeof exportInputSchema>) {
+    const startedAt = Date.now();
+    return this.responses.buildError("memory_export", startedAt, "NOT_IMPLEMENTED", "memory_export is not implemented yet");
   }
 
-  async import(input: z.infer<typeof importInputSchema>) {
-    return this.responses.buildOk("memory_import", Date.now(), { importedCount: 0, warnings: [], source: input.source, format: input.format, targetFolder: input.targetFolder });
+  async import(_: z.infer<typeof importInputSchema>) {
+    const startedAt = Date.now();
+    return this.responses.buildError("memory_import", startedAt, "NOT_IMPLEMENTED", "memory_import is not implemented yet");
   }
 
   async diagnoseWorkspace(_: z.infer<typeof diagnoseWorkspaceInputSchema>) {

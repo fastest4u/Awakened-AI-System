@@ -1,16 +1,17 @@
 ---
-title: 2026-05-20 - Skill symlink setup for Laravel project
+title: "2026-05-20 - Skill symlink setup for Laravel project"
 type: session-log
-session-date: 2026-05-20
 agent: codex
+session-date: "2026-05-20"
 outcomes:
   - Captured Laravel project skill symlink setup and listed the touched skill paths.
-created: 2026-05-20
-updated: 2026-05-20
 tags:
   - session-log
   - project/general
+created: "2026-05-20"
+updated: "2026-05-20"
 ---
+
 # 2026-05-20 - Skill symlink setup for Laravel project
 
 ## TL;DR

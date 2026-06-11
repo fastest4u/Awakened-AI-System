@@ -1,5 +1,6 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { createEmbeddingProvider, loadEmbeddingConfig } from "./config/embedding.config.js";
 import { loadFrontmatterConfig } from "./config/frontmatter.config.js";
 import { loadMemoryConfig } from "./config/memory.config.js";
 import { FrontmatterController } from "./controllers/frontmatter.controller.js";
@@ -37,7 +38,15 @@ export async function bootstrap() {
   const bootstrapper = new MemoryBootstrapService(vaultRoot);
   const index = new IndexRepository();
   const usage = new MemoryUsageService(vaultRoot);
-  const query = new MemoryQueryService(vault, index, usage);
+  // Optional embedding provider for Tier 3 hybrid search; OFF unless configured
+  // via MEMORY_EMBEDDINGS. A misconfigured provider must not break startup.
+  let embedder;
+  try {
+    embedder = createEmbeddingProvider(loadEmbeddingConfig());
+  } catch (error) {
+    console.error(`[memory] embedding provider disabled: ${(error as Error).message}`);
+  }
+  const query = new MemoryQueryService(vault, index, usage, embedder);
   const frontmatterConfig = loadFrontmatterConfig(vaultRoot);
   const health = new VaultHealthService(vault, frontmatterConfig.policy);
   const frontmatter = new FrontmatterService(vault, frontmatterConfig.schema, frontmatterConfig.sources, frontmatterConfig.policy);

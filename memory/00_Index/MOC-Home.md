@@ -1,12 +1,13 @@
 ---
 title: MOC Home
 type: moc
-created: 2026-05-16
-updated: 2026-05-16
 tags:
   - moc
   - project/general
+created: "2026-05-16"
+updated: "2026-05-16"
 ---
+
 # MOC Home
 
 - [[Goals]]

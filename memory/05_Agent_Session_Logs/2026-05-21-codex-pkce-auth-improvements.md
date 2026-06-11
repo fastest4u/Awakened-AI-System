@@ -1,15 +1,17 @@
 ---
-title: 2026-05-21 - Codex PKCE Auth improvements
+title: "2026-05-21 - Codex PKCE Auth improvements"
 type: session-log
-session-date: 2026-05-21
 agent: codex
-outcomes: []
-created: 2026-05-21
-updated: 2026-05-21
+session-date: "2026-05-21"
+outcomes:
+  - Codex PKCE Auth improvements
 tags:
   - session-log
   - project/general
+created: "2026-05-21"
+updated: "2026-05-21"
 ---
+
 # 2026-05-21 - Codex PKCE Auth improvements
 
 ## TL;DR

@@ -2,17 +2,18 @@
 title: Add Non-Blocking Lifecycle Guardrails to Project-Memory MCP
 type: adr
 status: accepted
-decision-date: 2026-05-17
 confidence: medium
+decision-date: "2026-05-17"
 supersedes: []
-created: 2026-05-17
-updated: 2026-05-17
 tags:
   - mcp
   - project-memory
   - lifecycle
   - quality-gate
+created: "2026-05-17"
+updated: "2026-05-17"
 ---
+
 ## Context
 The project-memory MCP already supports sessionStart, contextPack, selfCheck, sessionEnd, compaction, and vault verification, but the protocol still depends on agents remembering to call tools in the right order. Hard-failing calls would be brittle because MCP clients may call tools standalone or after server restarts.
 

@@ -1,8 +1,8 @@
 ---
-title: 2026-05-17 - Implement task-aware contextPack presets
+title: "2026-05-17 - Implement task-aware contextPack presets"
 type: session-log
-session-date: 2026-05-17
 agent: Codex
+session-date: "2026-05-17"
 duration-minutes: 28
 outcomes:
   - "Added task-aware memory_contextPack modes: auto, coding, debugging, review, deploy, planning, and docs."
@@ -10,12 +10,13 @@ outcomes:
   - "Added preset-specific include defaults, type weight boosts, extra scoring terms, recommended reads, checklist hints, and retrieval rules in contextPack responses."
   - Extended memory_sessionStart to accept mode and pass it into its startup contextPack.
   - "Updated README, bootstrap-generated integration docs, Retrieval Protocol, and Memory Autopilot notes to document task-aware modes."
-created: 2026-05-17
-updated: 2026-05-17
 tags:
   - session-log
   - project/general
+created: "2026-05-17"
+updated: "2026-05-17"
 ---
+
 # 2026-05-17 - Implement task-aware contextPack presets
 
 ## TL;DR

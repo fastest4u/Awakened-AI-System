@@ -2,17 +2,18 @@
 title: Add Task-Aware Context Pack Presets
 type: adr
 status: accepted
-decision-date: 2026-05-17
 confidence: medium
+decision-date: "2026-05-17"
 supersedes: []
-created: 2026-05-17
-updated: 2026-05-17
 tags:
   - mcp
   - context-pack
   - retrieval
   - presets
+created: "2026-05-17"
+updated: "2026-05-17"
 ---
+
 ## Context
 The MCP server already has contextPack retrieval with static type weights and include flags. After lifecycle guardrails, the next improvement is to make context retrieval adapt to the work type without breaking older clients that call memory_contextPack with only query/taskArea.
 

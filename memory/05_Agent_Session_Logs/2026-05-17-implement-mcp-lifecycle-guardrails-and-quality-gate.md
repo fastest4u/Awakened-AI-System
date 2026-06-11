@@ -1,8 +1,8 @@
 ---
-title: 2026-05-17 - Implement MCP lifecycle guardrails and quality gate
+title: "2026-05-17 - Implement MCP lifecycle guardrails and quality gate"
 type: session-log
-session-date: 2026-05-17
 agent: Codex
+session-date: "2026-05-17"
 duration-minutes: 38
 outcomes:
   - "Added a durable MemoryLifecycleService that records sessionStart, contextPack, selfCheck, sessionEnd, active lifecycle state, recent lifecycle history, and end-of-task quality gate results."
@@ -10,12 +10,13 @@ outcomes:
   - "Extended memory_sessionEnd responses with a qualityGate that flags missing lifecycle steps, skipped verification, weak log content, risky work without selfCheck, and vault health warnings."
   - Updated README and bootstrap-generated client instructions to mention qualityGate and memory_lifecycleStatus.
   - Fixed missing frontmatter in memory/01_Project_Rules/Always-On-Memory-Protocol.md so vault health is clean.
-created: 2026-05-17
-updated: 2026-05-17
 tags:
   - session-log
   - project/general
+created: "2026-05-17"
+updated: "2026-05-17"
 ---
+
 # 2026-05-17 - Implement MCP lifecycle guardrails and quality gate
 
 ## TL;DR

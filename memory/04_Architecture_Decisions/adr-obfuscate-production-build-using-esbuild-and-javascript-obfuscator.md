@@ -2,17 +2,18 @@
 title: "ADR: Obfuscate Production Build using esbuild and javascript-obfuscator"
 type: adr
 status: accepted
-decision-date: 2026-05-16
 confidence: high
+decision-date: "2026-05-16"
 supersedes: []
-created: 2026-05-16
-updated: 2026-05-16
 tags:
   - architecture
   - security
   - build-system
   - obfuscation
+created: "2026-05-16"
+updated: "2026-05-16"
 ---
+
 ## Context
 The project's Node.js MCP Server code was easily readable after compilation because tsc only removes types and outputs standard JavaScript. The user requested code encryption/protection (obfuscation) to prevent reverse engineering.
 

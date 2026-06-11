@@ -1,12 +1,13 @@
 ---
 title: Vault Dashboard
 type: dashboard
-created: 2026-05-16
-updated: 2026-05-16
 tags:
   - dashboard
   - project/general
+created: "2026-05-16"
+updated: "2026-05-16"
 ---
+
 # Vault Dashboard
 
 Use `memory_verifyVault` for MCP-side health. In Obsidian, Dataview and Tasks make the vault browsable.

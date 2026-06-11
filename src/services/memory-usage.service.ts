@@ -1,6 +1,14 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { todayIso } from "../utils/memory-format.js";
+
+/** Context terms kept per record after a prune; unbounded maps made usage.json grow forever. */
+const MAX_CONTEXT_TERMS = 40;
+
+/** Prune only past this size (hysteresis): pruning at exactly MAX_CONTEXT_TERMS
+ *  kept a saturated record permanently full, so every new count-1 term was
+ *  rejected before it could ever accumulate a competitive count. */
+const CONTEXT_PRUNE_THRESHOLD = 48;
 
 interface UsageRecord {
   path: string;
@@ -50,6 +58,7 @@ export class MemoryUsageService {
       for (const term of terms) {
         record.contexts[term] = (record.contexts[term] ?? 0) + 1;
       }
+      record.contexts = this.capContexts(record.contexts);
       state.records[item.path] = record;
     }
 
@@ -94,6 +103,15 @@ export class MemoryUsageService {
     return 0;
   }
 
+  /** Let terms grow to CONTEXT_PRUNE_THRESHOLD, then keep only the top
+   *  MAX_CONTEXT_TERMS (highest count first; ties keep the lexicographically smaller term). */
+  private capContexts(contexts: Record<string, number>): Record<string, number> {
+    const entries = Object.entries(contexts);
+    if (entries.length <= CONTEXT_PRUNE_THRESHOLD) return contexts;
+    entries.sort(([termA, countA], [termB, countB]) => countB - countA || termA.localeCompare(termB));
+    return Object.fromEntries(entries.slice(0, MAX_CONTEXT_TERMS));
+  }
+
   private readState(): UsageState {
     if (!existsSync(this.usagePath)) return { ...EMPTY_STATE, records: {} };
     try {
@@ -103,14 +121,38 @@ export class MemoryUsageService {
         updatedAt: parsed.updatedAt ?? todayIso(),
         records: parsed.records ?? {},
       };
-    } catch {
+    } catch (error) {
+      // A torn/corrupt file must not be reset silently: the next writeState
+      // would permanently wipe all accumulated usage data without a trace.
+      const message = error instanceof Error ? error.message : String(error);
+      console.error(`[memory-mcp] usage.json unreadable (${message}); falling back to empty usage state: ${this.usagePath}`);
       return { ...EMPTY_STATE, records: {} };
     }
   }
 
   private writeState(state: UsageState) {
     mkdirSync(dirname(this.usagePath), { recursive: true });
-    writeFileSync(this.usagePath, `${JSON.stringify(state, null, 2)}\n`, "utf8");
+    // Atomic write: stage to a per-process temp file, then rename over the
+    // target. The vault is shared across agents/processes, so a concurrent or
+    // interrupted write must never leave a torn usage.json for the next reader.
+    const tmp = `${this.usagePath}.${process.pid}.tmp`;
+    writeFileSync(tmp, `${JSON.stringify(state, null, 2)}\n`, "utf8");
+    try {
+      renameSync(tmp, this.usagePath);
+    } catch (error) {
+      // Usage data is telemetry: a failed rename (e.g. target locked) must not
+      // fail the user-facing tool call (contextPack/sessionStart/awaken) that
+      // triggered it. Warn once and continue — unlike lifecycle.json, which
+      // stays loud because it carries the session state itself.
+      const message = error instanceof Error ? error.message : String(error);
+      console.error(`[memory-mcp] usage.json write skipped (${message}); usage stats may lag: ${this.usagePath}`);
+      // Don't leak the temp file when the rename fails.
+      try {
+        unlinkSync(tmp);
+      } catch {
+        // Best-effort cleanup only.
+      }
+    }
   }
 
   private queryTerms(query?: string, taskArea?: string) {

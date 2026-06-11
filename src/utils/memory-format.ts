@@ -49,11 +49,22 @@ export function todayIso(date = new Date()) {
 }
 
 export function slugify(value: string) {
-  return value
-    .trim()
-    .replace(/[^a-z0-9]+/gi, "-")
-    .replace(/^-+|-+$/g, "")
-    .toLowerCase() || "untitled";
+  // Keep Unicode letters/marks/digits (Thai vowels and tone marks are \p{M},
+  // not \p{L} — dropping them would mangle Thai words); everything else
+  // (whitespace, punctuation) collapses to a single '-'. Thai/Unicode filenames
+  // are valid on Windows/macOS/Linux, and ASCII-only slugs collapsed every Thai
+  // title into the same 'untitled' name.
+  const slug = String(value ?? "")
+    .toLocaleLowerCase()
+    .replace(/[^\p{L}\p{M}\p{N}]+/gu, "-")
+    .replace(/^-+|-+$/g, "");
+  if (!slug) return "untitled";
+  // Cap at 80 UTF-16 units without splitting a surrogate pair (an astral
+  // character is 2 units; cutting between them leaves an invalid lone surrogate).
+  let capped = slug.slice(0, 80);
+  const lastUnit = capped.charCodeAt(capped.length - 1);
+  if (lastUnit >= 0xd800 && lastUnit <= 0xdbff) capped = capped.slice(0, -1);
+  return capped.replace(/-+$/, "") || "untitled";
 }
 
 export function normalizeMarkdownPath(path: string) {

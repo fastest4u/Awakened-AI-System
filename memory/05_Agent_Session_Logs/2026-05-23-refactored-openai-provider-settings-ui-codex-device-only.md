@@ -1,20 +1,21 @@
 ---
 title: "2026-05-23 - Refactored OpenAI provider settings UI (codex-device only)"
 type: session-log
-session-date: 2026-05-23
 agent: codex
+session-date: "2026-05-23"
 outcomes:
   - Implemented inline SVG OpenAILogo
   - "Redesigned CodexAuthSection to render list row with logo, connect button, and connection status"
   - "Implemented Radix UI Dialog modal with selection of browser, headless, and API key (disabled)"
   - Rendered active/pending auth callback and device code screens inside the Dialog with ArrowLeft back button
   - Verified via dev server and E2E browser automation that the Dialog displays and aborts/resets correctly
-created: 2026-05-23
-updated: 2026-05-23
 tags:
   - session-log
   - project/general
+created: "2026-05-23"
+updated: "2026-05-23"
 ---
+
 # 2026-05-23 - Refactored OpenAI provider settings UI (codex-device only)
 
 ## TL;DR

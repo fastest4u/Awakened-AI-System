@@ -1,20 +1,21 @@
 ---
-title: 2026-05-22 - LINE image extraction history API and frontend table
+title: "2026-05-22 - LINE image extraction history API and frontend table"
 type: session-log
-session-date: 2026-05-22
 agent: Codex
+session-date: "2026-05-22"
 duration-minutes: 45
 outcomes:
   - Implemented paginated REST API for saved LINE image extraction records with filters and sorting.
   - Exposed saved LINE images from data/line-images via /line-images/ static route.
   - "Added frontend LINE Runsheets table page with filters, image previews, pagination, and sidebar/mobile navigation."
   - "Verified focused API test, typecheck, production build, frontend route HTTP 200, and backend health."
-created: 2026-05-22
-updated: 2026-05-22
 tags:
   - session-log
   - project/general
+created: "2026-05-22"
+updated: "2026-05-22"
 ---
+
 # 2026-05-22 - LINE image extraction history API and frontend table
 
 ## TL;DR

@@ -1,20 +1,21 @@
 ---
-title: 2026-05-21 - Fix LINE image listener E2EE key not saved path
+title: "2026-05-21 - Fix LINE image listener E2EE key not saved path"
 type: session-log
-session-date: 2026-05-21
 agent: Codex
+session-date: "2026-05-21"
 duration-minutes: 8
 outcomes:
   - "Diagnosed E2EE image failure: LINEJS session had auth token but no stored E2EE self key, so msg.getData() cannot decrypt image content."
   - "Confirmed LINEJS QR login can decode/save E2EE key when e2eeInfo is returned, but current app restored DB auth token before QR login, preventing a fresh E2EE-capable login."
   - "Added deleteLineBotSession() and made logout(clearStorage=true) delete DB token as well as file storage/auth token."
   - "Added Reset button in LINE Bot settings to call logout(true), so user can clear stored auth/E2EE data from UI and QR login again."
-created: 2026-05-21
-updated: 2026-05-21
 tags:
   - session-log
   - project/general
+created: "2026-05-21"
+updated: "2026-05-21"
 ---
+
 # 2026-05-21 - Fix LINE image listener E2EE key not saved path
 
 ## TL;DR

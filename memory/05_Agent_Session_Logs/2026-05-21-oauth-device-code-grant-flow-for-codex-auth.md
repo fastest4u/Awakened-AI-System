@@ -1,18 +1,19 @@
 ---
-title: 2026-05-21 - OAuth Device Code Grant flow for Codex Auth
+title: "2026-05-21 - OAuth Device Code Grant flow for Codex Auth"
 type: session-log
-session-date: 2026-05-21
 agent: codex
+session-date: "2026-05-21"
 outcomes:
   - Successfully implemented standard OAuth Device Code Grant in codex-device-auth.ts and Fastify controller.
   - Updated frontend types and developed interactive pending UI dashboard showing user activation code with automatic 3s polling.
-  - Successfully verified clean TypeScript compilation (npm run typecheck) and bundle creation (npm run build).
-created: 2026-05-21
-updated: 2026-05-21
+  - "Successfully verified clean TypeScript compilation (npm run typecheck) and bundle creation (npm run build)."
 tags:
   - session-log
   - project/general
+created: "2026-05-21"
+updated: "2026-05-21"
 ---
+
 # 2026-05-21 - OAuth Device Code Grant flow for Codex Auth
 
 ## TL;DR

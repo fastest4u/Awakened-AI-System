@@ -1,16 +1,14 @@
 ---
 title: "Laravel Caching, Performance and Testing Architecture"
 type: insight
+status: active
+confidence: high
 derived-from:
   - app/Support/RedisCacheHelper.php
   - app/Services/Cache/CacheInvalidationService.php
   - app/Models/WorkAssignment.php
   - tests/DatabaseTestCase.php
   - app/Services/TurboRoute/TurboRouteRateLimiter.php
-confidence: high
-status: active
-created: 2026-05-20
-updated: 2026-05-20
 tags:
   - laravel
   - performance
@@ -18,7 +16,10 @@ tags:
   - testing
   - redis
   - sqlite
+created: "2026-05-20"
+updated: "2026-05-20"
 ---
+
 # Laravel Caching, Performance, and Testing Architecture
 
 An in-depth analysis of the Laravel project's core design patterns, database testing efficiency, non-blocking cache invalidation mechanisms, and database-level query optimization.

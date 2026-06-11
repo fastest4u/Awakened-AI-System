@@ -1,18 +1,19 @@
 ---
-title: 2026-05-23 - Demonstrate E2E browser automation using chrome-devtools-mcp
+title: "2026-05-23 - Demonstrate E2E browser automation using chrome-devtools-mcp"
 type: session-log
-session-date: 2026-05-23
 agent: codex
+session-date: "2026-05-23"
 outcomes:
   - Started dev server and opened the dashboard
   - "Logged out, focused username and password fields, entered admin credentials"
   - "Logged in successfully to the dashboard, took screenshots, and stopped the dev server"
-created: 2026-05-23
-updated: 2026-05-23
 tags:
   - session-log
   - project/general
+created: "2026-05-23"
+updated: "2026-05-23"
 ---
+
 # 2026-05-23 - Demonstrate E2E browser automation using chrome-devtools-mcp
 
 ## TL;DR

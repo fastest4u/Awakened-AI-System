@@ -1,8 +1,8 @@
 ---
-title: 2026-05-23 - Set MEMORY_PROJECT_ROOT dynamic across all MCP configs and projects
+title: "2026-05-23 - Set MEMORY_PROJECT_ROOT dynamic across all MCP configs and projects"
 type: session-log
-session-date: 2026-05-23
 agent: codex
+session-date: "2026-05-23"
 duration-minutes: 10
 outcomes:
   - "Swept C:\\Users\\Server for JSON/TOML/YAML MCP-related configs containing MEMORY_PROJECT_ROOT and changed all configured values to dynamic."
@@ -10,12 +10,13 @@ outcomes:
   - "Added MEMORY_PROJECT_ROOT=dynamic to Gemini/Antigravity project-memory configs that previously had project-memory without an env block."
   - Updated Laravel project MCP configs and examples to use dynamic instead of hard-coded project paths.
   - Verified no scanned MEMORY_PROJECT_ROOT assignment remains with a non-dynamic value.
-created: 2026-05-23
-updated: 2026-05-23
 tags:
   - session-log
   - project/general
+created: "2026-05-23"
+updated: "2026-05-23"
 ---
+
 # 2026-05-23 - Set MEMORY_PROJECT_ROOT dynamic across all MCP configs and projects
 
 ## TL;DR

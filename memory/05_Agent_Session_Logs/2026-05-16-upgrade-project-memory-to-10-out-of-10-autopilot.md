@@ -1,20 +1,21 @@
 ---
-title: 2026-05-16 - Upgrade project-memory to 10 out of 10 autopilot
+title: "2026-05-16 - Upgrade project-memory to 10 out of 10 autopilot"
 type: session-log
-session-date: 2026-05-16
 agent: codex
+session-date: "2026-05-16"
 outcomes:
   - Added lightweight usage scoring that boosts repeatedly selected notes in future context packs
   - Implemented deterministic session-log compaction into 07_Insights/Auto-Memory-Digest.md
   - "Made memory_sessionEnd write the session log, auto-compact recent sessions, and return vault health by default"
   - Updated Zed permissions for key project-memory MCP tools
   - Regenerated always-on rules and project memory notes for the current repository
-created: 2026-05-16
-updated: 2026-05-16
 tags:
   - session-log
   - project/general
+created: "2026-05-16"
+updated: "2026-05-16"
 ---
+
 # 2026-05-16 - Upgrade project-memory to 10 out of 10 autopilot
 
 ## TL;DR

@@ -1,8 +1,8 @@
 ---
-title: 2026-05-23 - Investigate auto-accept not clicking request 32829911
+title: "2026-05-23 - Investigate auto-accept not clicking request 32829911"
 type: session-log
-session-date: 2026-05-23
 agent: codex
+session-date: "2026-05-23"
 duration-minutes: 12
 outcomes:
   - Checked production SPX container and DB evidence for request 32829911.
@@ -10,12 +10,13 @@ outcomes:
   - "Confirmed no auto_accept_history row exists for request 32829911, so auto-accept did not call/record accept for that request."
   - "Found matching rule 'ยโส' was already fulfilled=1 before this request window, so active auto-accept rule selection skipped it."
   - "Also observed later production poll failures with HTTP 401 login credentials expired and session-expiry alerts at 2026-05-23T03:03Z and 03:13Z."
-created: 2026-05-23
-updated: 2026-05-23
 tags:
   - session-log
   - project/general
+created: "2026-05-23"
+updated: "2026-05-23"
 ---
+
 # 2026-05-23 - Investigate auto-accept not clicking request 32829911
 
 ## TL;DR

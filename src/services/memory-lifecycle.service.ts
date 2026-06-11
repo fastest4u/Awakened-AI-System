@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type { SessionLogTemplateInput } from "./memory-template.service.js";
 
@@ -22,18 +22,23 @@ interface LifecycleSession {
   startedAt: string;
   updatedAt: string;
   endedAt?: string;
+  /** Why the session ended without memory_sessionEnd (e.g. replaced by a newer start). */
+  endReason?: "superseded";
   taskArea?: string;
   topic?: string;
   startedBy: LifecycleTool;
   missingSessionStart?: boolean;
   counts: LifecycleCounts;
   events: LifecycleEvent[];
+  /** Session-level warnings (e.g. supersede note); distinct from gate warnings. */
+  warnings?: string[];
+  /** null = the session ended without a gate ever being computed (no fabricated grades). */
   lastQualityGate?: {
     ok: boolean;
     score: number;
     grade: string;
     warnings: string[];
-  };
+  } | null;
 }
 
 interface LifecycleState {
@@ -66,6 +71,19 @@ const EMPTY_COUNTS: LifecycleCounts = {
   sessionEnd: 0,
 };
 
+const RISK_KEYWORDS = new Set([
+  "deploy", "production", "prod", "migration", "schema", "database",
+  "security", "secret", "auth", "payment", "multi-file", "refactor",
+]);
+
+/** A risk keyword preceded by one of these is an explicit non-signal ("no refactor needed"). */
+const NEGATING_TOKENS = new Set(["no", "not", "non", "without", "never"]);
+
+const THAI_RISK_KEYWORDS = [
+  "ดีพลอย", "โปรดักชัน", "ไมเกรชัน", "สคีมา", "ฐานข้อมูล", "ความปลอดภัย",
+  "รหัสผ่าน", "ยืนยันตัวตน", "สิทธิ์", "ชำระเงิน", "รีแฟคเตอร์",
+];
+
 export class MemoryLifecycleService {
   private readonly lifecyclePath: string;
 
@@ -79,12 +97,15 @@ export class MemoryLifecycleService {
     if (state.activeSession) {
       const abandoned = state.activeSession;
       abandoned.endedAt = new Date().toISOString();
-      abandoned.lastQualityGate = {
-        ok: false,
-        score: 0,
-        grade: "F",
-        warnings: ["Lifecycle was replaced by a new memory_sessionStart before memory_sessionEnd."],
-      };
+      abandoned.endReason = "superseded";
+      // No gate was ever computed for this session (it never reached
+      // memory_sessionEnd) — concurrent agents legitimately supersede each
+      // other, so do not fabricate a grade-F gate in the history.
+      abandoned.lastQualityGate = null;
+      abandoned.warnings = [
+        ...(abandoned.warnings ?? []),
+        "Lifecycle was replaced by a new memory_sessionStart before memory_sessionEnd.",
+      ];
       state.recentSessions = [abandoned, ...state.recentSessions].slice(0, 20);
       warnings.push("Previous memory lifecycle was still active and was archived before starting a new one.");
     }
@@ -291,6 +312,8 @@ export class MemoryLifecycleService {
   }
 
   private infersRisk(input: SessionLogTemplateInput) {
+    if ((input.filesTouched?.length ?? 0) > 1) return true;
+
     const text = [
       input.topic,
       ...(input.outcomes ?? []),
@@ -299,8 +322,27 @@ export class MemoryLifecycleService {
       ...(input.filesTouched ?? []),
     ].join(" ").toLowerCase();
 
-    return (input.filesTouched?.length ?? 0) > 1
-      || /\b(deploy|production|prod|migration|schema|database|security|secret|auth|payment|multi-file|refactor)\b/.test(text);
+    // Whole-token matching instead of a raw regex: hyphens stay inside a token
+    // so "multi-file" matches as one keyword, and a keyword directly negated by
+    // the previous token is ignored.
+    const negated = (previous: string | undefined) => NEGATING_TOKENS.has(previous ?? "");
+    const tokens = text.split(/[^a-z0-9_-]+/).filter(Boolean);
+    if (tokens.some((token, index) => RISK_KEYWORDS.has(token) && !negated(tokens[index - 1]))) {
+      return true;
+    }
+    // Hyphenated compounds ("schema-migration", "auth-flow") hide keywords from
+    // the whole-token pass, so test their parts too. Negation applies at part
+    // level ("no-refactor-needed" stays suppressed), and a negating previous
+    // token suppresses the whole compound ("no schema-migration").
+    const compoundHit = tokens.some((token, index) => {
+      if (!token.includes("-") || negated(tokens[index - 1])) return false;
+      const parts = token.split("-").filter(Boolean);
+      return parts.some((part, partIndex) => RISK_KEYWORDS.has(part) && !negated(parts[partIndex - 1]));
+    });
+    if (compoundHit) return true;
+    // Thai is written without word separators, so Thai risk keywords are
+    // matched as substrings of the raw text rather than as tokens.
+    return THAI_RISK_KEYWORDS.some((keyword) => text.includes(keyword));
   }
 
   private createImplicitSession(tool: LifecycleTool, taskArea: string | undefined, warnings: string[]) {
@@ -334,12 +376,15 @@ export class MemoryLifecycleService {
       startedAt: session.startedAt,
       updatedAt: session.updatedAt,
       endedAt: session.endedAt,
+      endReason: session.endReason,
       taskArea: session.taskArea,
       topic: session.topic,
       startedBy: session.startedBy,
       missingSessionStart: Boolean(session.missingSessionStart),
       counts: session.counts,
-      lastQualityGate: session.lastQualityGate,
+      warnings: session.warnings,
+      // null = ended without a gate (e.g. superseded); readers must not assume a grade.
+      lastQualityGate: session.lastQualityGate ?? null,
     };
   }
 
@@ -353,7 +398,11 @@ export class MemoryLifecycleService {
         activeSession: parsed.activeSession ?? null,
         recentSessions: parsed.recentSessions ?? [],
       };
-    } catch {
+    } catch (error) {
+      // A torn/corrupt file must not be reset silently: the next writeState
+      // would permanently wipe the recorded session history without a trace.
+      const message = error instanceof Error ? error.message : String(error);
+      console.error(`[memory-mcp] lifecycle.json unreadable (${message}); falling back to empty lifecycle state: ${this.lifecyclePath}`);
       return this.emptyState();
     }
   }
@@ -361,7 +410,22 @@ export class MemoryLifecycleService {
   private writeState(state: LifecycleState) {
     state.updatedAt = new Date().toISOString();
     mkdirSync(dirname(this.lifecyclePath), { recursive: true });
-    writeFileSync(this.lifecyclePath, `${JSON.stringify(state, null, 2)}\n`, "utf8");
+    // Atomic write: stage to a per-process temp file, then rename over the
+    // target. The vault is shared across agents/processes, so a concurrent or
+    // interrupted write must never leave a torn lifecycle.json for the next reader.
+    const tmp = `${this.lifecyclePath}.${process.pid}.tmp`;
+    writeFileSync(tmp, `${JSON.stringify(state, null, 2)}\n`, "utf8");
+    try {
+      renameSync(tmp, this.lifecyclePath);
+    } catch (error) {
+      // Don't leak the temp file when the rename fails (e.g. target locked).
+      try {
+        unlinkSync(tmp);
+      } catch {
+        // Best-effort cleanup only.
+      }
+      throw error;
+    }
   }
 
   private emptyState(): LifecycleState {

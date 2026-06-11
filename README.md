@@ -114,8 +114,16 @@ npm run build
 | `MEMORY_PROJECT_ROOT` | path ของโปรเจกต์ที่ต้องการให้มี `memory/` |
 | `MEMORY_VAULT_DIR` | ชื่อโฟลเดอร์ vault ค่าเริ่มต้นคือ `memory` |
 | `MEMORY_VAULT_PATH` | path ของ vault แบบชัดเจน ใช้แทน `MEMORY_PROJECT_ROOT` + `MEMORY_VAULT_DIR` |
+| `MEMORY_EMBEDDINGS` | optional hybrid search provider: `none`, `hash`, หรือ `http`; ค่าเริ่มต้นคือ `none` |
+| `MEMORY_EMBEDDINGS_DIM` | ขนาด vector สำหรับ `hash` และ hint สำหรับ `http`; ค่าเริ่มต้นคือ `256` |
+| `MEMORY_EMBEDDINGS_ENDPOINT` | endpoint สำหรับ `MEMORY_EMBEDDINGS=http` |
+| `MEMORY_EMBEDDINGS_MODEL` | model name สำหรับ `MEMORY_EMBEDDINGS=http` |
+| `MEMORY_EMBEDDINGS_API_KEY` | bearer token สำหรับ HTTP embedding endpoint ถ้าต้องใช้ |
+| `MEMORY_EMBEDDINGS_TIMEOUT_MS` | timeout ต่อ HTTP embedding request; ค่าเริ่มต้นคือ `15000` |
 
 ถ้า MCP client ไม่ได้ start server จาก workspace root ให้ตั้ง `MEMORY_PROJECT_ROOT` เสมอ เพื่อไม่ให้ vault ถูกสร้างผิดที่
+
+Embeddings ปิดอยู่โดยค่าเริ่มต้นเพื่อให้ server ทำงานแบบ local-first/offline เหมือนเดิม ถ้าตั้ง `MEMORY_EMBEDDINGS=hash` จะใช้ deterministic local hash embeddings; ถ้าตั้ง `http` ต้องมี endpoint/model แบบ OpenAI-compatible หรือ local embedding server. ถ้า provider ล่มหรือส่ง response ผิดรูปแบบ search จะ fallback เป็น lexical-only ชั่วคราวและไม่ทำให้ MCP tool fail
 
 ## MCP Client Setup
 
@@ -328,10 +336,18 @@ MCP สร้าง config และ note ให้เท่านั้น ไ�
 | `memory_bootstrapProject` | สร้าง vault และ client integration pack |
 | `memory_reindex` | rebuild index ทั้ง vault |
 | `memory_indexNote` | index note เดี่ยว |
+| `memory_diagnoseWorkspace` | ตรวจ project root, vault root, workspace candidates, runtime metadata และ MCP Doctor สำหรับ config client |
 | `memory_export` | placeholder สำหรับ export curated memory bundle |
 | `memory_import` | placeholder สำหรับ import note เข้าสู่ vault |
 
 หมายเหตุ: `memory_export` และ `memory_import` ถูก register แล้ว แต่ปัจจุบันยังเป็น placeholder สำหรับ implementation รอบถัดไป
+
+`memory_diagnoseWorkspace` คืนค่า `doctor` เพิ่มเติมสำหรับไล่ปัญหา MCP client integration:
+
+- `doctor.checks`: ตรวจ project root, vault root, `memory/AGENTS.md`, build info และ vault อยู่ใน project หรือไม่
+- `doctor.clients`: ตรวจ config ของ Claude Code, Codex, Cursor, Windsurf, Zed, OpenCode และ Antigravity ว่าพบ `project-memory` และ `MEMORY_PROJECT_ROOT` หรือไม่
+- `doctor.issues`: issue code แบบอ่านโดย agent ได้ เช่น `VAULT_AGENT_RULES_MISSING`, `CLIENT_CONFIG_MISSING_PROJECT_MEMORY`, `CLAUDE_MCP_SERVER_DEFINITION_NOT_LOCAL`
+- `doctor.issues[].remediation`: คำแนะนำแก้ไขแบบ machine-readable เช่น `summary`, `path`, `snippet` หรือ `command`
 
 ## Input สำคัญของ Workflow
 

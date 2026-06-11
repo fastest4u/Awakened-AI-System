@@ -2,12 +2,12 @@
 title: Always-On Memory Protocol
 type: rules
 status: active
-created: 2026-05-16
-updated: 2026-05-17
 tags:
   - memory
   - protocol
   - agent-rules
+created: "2026-05-16"
+updated: "2026-05-17"
 ---
 
 # 🚨 CRITICAL: ABSOLUTE NON-NEGOTIABLE PROTOCOL 🚨

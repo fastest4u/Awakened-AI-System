@@ -1,8 +1,8 @@
 ---
-title: 2026-05-23 - Extend workspace detection to Antigravity and OpenCode
+title: "2026-05-23 - Extend workspace detection to Antigravity and OpenCode"
 type: session-log
-session-date: 2026-05-23
 agent: cascade
+session-date: "2026-05-23"
 duration-minutes: 25
 outcomes:
   - "Added Antigravity (legacy) and Antigravity IDE (current) to IDE_PRODUCT_DIRS — both use VS Code-derived layout so existing readIdeWorkspaceCandidates() handles them immediately."
@@ -13,8 +13,6 @@ outcomes:
   - "Updated README with full IDE compatibility matrix showing each IDE's detection path (cwd, IDE state file, both, or neither)."
   - "Documented Zed limitation (SQLite-based, not yet supported) and the practical workaround (cwd walk-up via per-project .zed/settings.json works for typical Zed launch behavior)."
   - "Built dist/index.js. Verified live: findIdeActiveWorkspace() detected c:/Users/Server/Desktop/Awakened-AI-System on a machine running Windsurf, Cursor, Antigravity, Antigravity IDE, and OpenCode simultaneously."
-created: 2026-05-23
-updated: 2026-05-23
 tags:
   - session-log
   - mcp
@@ -23,7 +21,10 @@ tags:
   - antigravity
   - opencode
   - project/awakened-ai-system
+created: "2026-05-23"
+updated: "2026-05-23"
 ---
+
 # 2026-05-23 - Extend workspace detection to Antigravity and OpenCode
 
 ## TL;DR

@@ -1,16 +1,17 @@
 ---
-title: 2026-05-21 - Added Context7 MCP to IDE config
+title: "2026-05-21 - Added Context7 MCP to IDE config"
 type: session-log
-session-date: 2026-05-21
 agent: antigravity
+session-date: "2026-05-21"
 outcomes:
   - "Context7 MCP server successfully configured in the IDE's active MCP configuration file"
-created: 2026-05-21
-updated: 2026-05-21
 tags:
   - session-log
   - project/general
+created: "2026-05-21"
+updated: "2026-05-21"
 ---
+
 # 2026-05-21 - Added Context7 MCP to IDE config
 
 ## TL;DR

@@ -1,18 +1,19 @@
 ---
-title: 2026-05-21 - Explain how to test LINE image listener in group
+title: "2026-05-21 - Explain how to test LINE image listener in group"
 type: session-log
-session-date: 2026-05-21
 agent: Codex
+session-date: "2026-05-21"
 duration-minutes: 2
 outcomes:
   - "Provided test flow for inbound LINE group image listener: enable LINEJS, login, get group MID, set LINE_IMAGE_LISTENER_CHAT_ID, run server, send image, verify reply/logs."
   - Clarified outbound image sending remains a follow-up because no sendImage endpoint/script exists yet.
-created: 2026-05-21
-updated: 2026-05-21
 tags:
   - session-log
   - project/general
+created: "2026-05-21"
+updated: "2026-05-21"
 ---
+
 # 2026-05-21 - Explain how to test LINE image listener in group
 
 ## TL;DR

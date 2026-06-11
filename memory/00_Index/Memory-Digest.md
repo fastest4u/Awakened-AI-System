@@ -1,13 +1,14 @@
 ---
 title: Memory Digest
 type: dashboard
-created: 2026-05-16
-updated: 2026-05-16
 tags:
   - digest
   - token-economy
   - project/general
+created: "2026-05-16"
+updated: "2026-05-16"
 ---
+
 # Memory Digest
 
 This page is the compact map agents should update when repeated lessons become durable.

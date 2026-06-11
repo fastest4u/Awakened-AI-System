@@ -1,8 +1,8 @@
 ---
-title: 2026-05-22 - Require explicit Codex auth login mode
+title: "2026-05-22 - Require explicit Codex auth login mode"
 type: session-log
-session-date: 2026-05-22
 agent: codex
+session-date: "2026-05-22"
 duration-minutes: 18
 outcomes:
   - Changed /api/ai/codex-auth/start so it no longer defaults to browser mode when mode is omitted.
@@ -10,12 +10,13 @@ outcomes:
   - Renamed the second settings button to Device Code Login so users explicitly choose Browser Login or Device Code Login.
   - Removed Codex CLI fallback wording from Codex login provider-unavailable errors.
   - Added a controller-level smoke test proving an omitted mode returns CODEX_AUTH_MODE_REQUIRED instead of starting a login flow.
-created: 2026-05-22
-updated: 2026-05-22
 tags:
   - session-log
   - project/general
+created: "2026-05-22"
+updated: "2026-05-22"
 ---
+
 # 2026-05-22 - Require explicit Codex auth login mode
 
 ## TL;DR

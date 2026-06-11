@@ -1,18 +1,19 @@
 ---
-title: 2026-05-20 - Finalize slow API investigation response
+title: "2026-05-20 - Finalize slow API investigation response"
 type: session-log
-session-date: 2026-05-20
 agent: codex
+session-date: "2026-05-20"
 duration-minutes: 2
 outcomes:
   - Ran required self-check before finalizing production performance findings.
   - Prepared to present findings without applying production changes.
-created: 2026-05-20
-updated: 2026-05-20
 tags:
   - session-log
   - project/general
+created: "2026-05-20"
+updated: "2026-05-20"
 ---
+
 # 2026-05-20 - Finalize slow API investigation response
 
 ## TL;DR

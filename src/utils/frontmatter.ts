@@ -255,8 +255,11 @@ function classifyYamlError(error: unknown, openIdx: number): FrontmatterDiagnost
 
 /**
  * Serialize a single scalar for YAML output. Numbers/booleans pass through;
- * date-like strings and anything containing ':' or YAML-significant characters
- * are double-quoted so they round-trip as strings (no Date coercion).
+ * any string that would not round-trip as the same string is double-quoted:
+ * date-like values (no Date coercion), values containing ':' or '#' (an
+ * unquoted '#' starts a comment and silently truncates the value on the next
+ * parse), leading/trailing whitespace, boolean/null-looking keywords,
+ * number-looking strings, and values starting with a YAML indicator character.
  */
 export function yamlScalar(value: unknown): string {
   if (typeof value === "number" || typeof value === "boolean") return String(value);
@@ -264,9 +267,27 @@ export function yamlScalar(value: unknown): string {
     return JSON.stringify(Number.isNaN(value.getTime()) ? "" : value.toISOString().slice(0, 10));
   }
   const str = String(value ?? "");
-  if (/^\d{4}-\d{2}-\d{2}/.test(str)) return JSON.stringify(str);
-  if (/^[a-zA-Z0-9_./@# -]+$/.test(str) && !str.includes(":")) return str;
-  return JSON.stringify(str);
+  return needsYamlQuoting(str) ? JSON.stringify(str) : str;
+}
+
+/** js-yaml (1.1 schema) parses these back as booleans/null instead of strings. */
+const YAML_KEYWORD_LIKE = /^(?:true|false|yes|no|on|off|null|~)$/i;
+/** Int/float shapes (with optional '_' separators and exponent). */
+const YAML_NUMBER_LIKE = /^[+-]?(?:\d[\d_]*(?:\.[\d_]*)?|\.[\d_]*\d)(?:[eE][+-]?\d+)?$/;
+/** Special numeric forms: .inf/.nan and hex/octal/binary prefixes. */
+const YAML_SPECIAL_NUMBER_LIKE = /^(?:[+-]?\.inf|\.nan|[+-]?0[xob][0-9a-fA-F_]+)$/i;
+/** A YAML indicator in the first character makes a plain scalar unsafe. */
+const YAML_LEADING_INDICATOR = /^[-?\[\]{}&*!|>%@`"']/;
+/** Conservative plain-scalar whitelist; NOTE: '#' is deliberately excluded. */
+const YAML_SAFE_PLAIN = /^[a-zA-Z0-9_./@ -]+$/;
+
+function needsYamlQuoting(str: string): boolean {
+  if (str.length === 0 || str !== str.trim()) return true;
+  if (/^\d{4}-\d{2}-\d{2}/.test(str)) return true;
+  if (str.includes(":") || str.includes("#")) return true;
+  if (YAML_LEADING_INDICATOR.test(str)) return true;
+  if (YAML_KEYWORD_LIKE.test(str) || YAML_NUMBER_LIKE.test(str) || YAML_SPECIAL_NUMBER_LIKE.test(str)) return true;
+  return !YAML_SAFE_PLAIN.test(str);
 }
 
 function orderedKeys(keys: string[], keyOrder: readonly string[]): string[] {

@@ -1,19 +1,20 @@
 ---
-title: 2026-05-16 - Bootstrap project-local Obsidian memory MCP and IDE integration pack
+title: "2026-05-16 - Bootstrap project-local Obsidian memory MCP and IDE integration pack"
 type: session-log
-session-date: 2026-05-16
 agent: codex
+session-date: "2026-05-16"
 outcomes:
   - Created project-local memory vault for the MCP server root
   - "Generated OpenCode, Codex, Zed, Cursor, Windsurf, and Google Antigravity MCP integration files"
   - Added AI client setup note and README documentation
   - Verified vault health with zero warnings
-created: 2026-05-16
-updated: 2026-05-16
 tags:
   - session-log
   - project/general
+created: "2026-05-16"
+updated: "2026-05-16"
 ---
+
 # 2026-05-16 - Bootstrap project-local Obsidian memory MCP and IDE integration pack
 
 ## TL;DR

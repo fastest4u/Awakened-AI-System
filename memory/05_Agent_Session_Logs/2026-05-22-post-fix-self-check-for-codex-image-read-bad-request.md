@@ -1,17 +1,18 @@
 ---
-title: 2026-05-22 - Post-fix self-check for Codex image read Bad Request
+title: "2026-05-22 - Post-fix self-check for Codex image read Bad Request"
 type: session-log
-session-date: 2026-05-22
 agent: codex
+session-date: "2026-05-22"
 duration-minutes: 1
 outcomes:
   - "Ran the missed self-check after the Codex image read Bad Request fix and confirmed the implemented change had already been verified through tests, real image smoke test, typecheck, build, and dev restart."
-created: 2026-05-22
-updated: 2026-05-22
 tags:
   - session-log
   - project/general
+created: "2026-05-22"
+updated: "2026-05-22"
 ---
+
 # 2026-05-22 - Post-fix self-check for Codex image read Bad Request
 
 ## TL;DR

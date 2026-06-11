@@ -2,18 +2,19 @@
 title: Add Zed SQLite-based workspace detection
 type: adr
 status: accepted
-decision-date: 2026-05-23
 confidence: high
+decision-date: "2026-05-23"
 supersedes: []
-created: 2026-05-23
-updated: 2026-05-23
 tags:
   - mcp
   - memory-config
   - workspace-detection
   - zed
   - sqlite
+created: "2026-05-23"
+updated: "2026-05-23"
 ---
+
 ## Context
 The previous ADR `extend-workspace-detection-to-antigravity-and-opencode.md` deferred Zed support because Zed stores workspace history in SQLite (`%LOCALAPPDATA%\Zed\db\0-stable\db.sqlite` on Windows; equivalent paths on macOS/Linux), and adding a SQLite dependency contradicted this project's zero-runtime-dep philosophy. The user pushed back: "Zed ไม่รองรับ project root หรอ" — flagging that the README compatibility matrix made Zed feel like a second-class citizen even though cwd walk-up handled it for typical setups.
 

@@ -1,20 +1,21 @@
 ---
-title: 2026-05-21 - Make npm run dev use local development NODE_ENV
+title: "2026-05-21 - Make npm run dev use local development NODE_ENV"
 type: session-log
-session-date: 2026-05-21
 agent: Codex
+session-date: "2026-05-21"
 duration-minutes: 4
 outcomes:
   - "Added scripts/dev-frontend.mjs to run Vite with NODE_ENV=development without editing .env."
   - "Updated scripts/dev-backend.mjs to set NODE_ENV=development as well as HTTP_ENABLED=true."
   - "Updated package.json dev and dev:frontend scripts to use the launcher so npm run dev is Windows-compatible and local-dev oriented."
   - Fixed Windows Node v24 spawn EINVAL by using cmd.exe /d /s /c for npx commands on Windows.
-created: 2026-05-21
-updated: 2026-05-21
 tags:
   - session-log
   - project/general
+created: "2026-05-21"
+updated: "2026-05-21"
 ---
+
 # 2026-05-21 - Make npm run dev use local development NODE_ENV
 
 ## TL;DR
