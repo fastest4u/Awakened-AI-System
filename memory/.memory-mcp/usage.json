@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "updatedAt": "2026-06-05T07:57:55.274Z",
+  "updatedAt": "2026-06-11T13:24:41.594Z",
   "records": {
     "00_Index/Memory-Autopilot.md": {
       "path": "00_Index/Memory-Autopilot.md",
@@ -371,7 +371,7 @@
     },
     "01_Project_Rules/Always-On-Memory-Protocol.md": {
       "path": "01_Project_Rules/Always-On-Memory-Protocol.md",
-      "selectedCount": 19,
+      "selectedCount": 20,
       "contexts": {
         "10": 2,
         "memory": 9,
@@ -454,9 +454,11 @@
         "economy": 1,
         "code": 2,
         "integration": 2,
-        "status": 2
+        "status": 2,
+        "docs": 2,
+        "claude-md": 2
       },
-      "lastSelectedAt": "2026-06-05T05:34:19.675Z"
+      "lastSelectedAt": "2026-06-11T07:48:42.175Z"
     },
     "13_Diagrams/Memory-System-Map.md": {
       "path": "13_Diagrams/Memory-System-Map.md",
@@ -738,7 +740,7 @@
     },
     "00_Index/Plugin-Setup.md": {
       "path": "00_Index/Plugin-Setup.md",
-      "selectedCount": 7,
+      "selectedCount": 8,
       "contexts": {
         "obsidian": 2,
         "plugin": 2,
@@ -755,13 +757,15 @@
         "workspace": 2,
         "detection": 2,
         "now": 1,
-        "memory-vault-analysis-quality-gate-check": 2
+        "memory-vault-analysis-quality-gate-check": 2,
+        "docs": 2,
+        "claude-md": 2
       },
-      "lastSelectedAt": "2026-06-01T17:07:02.588Z"
+      "lastSelectedAt": "2026-06-11T07:48:42.175Z"
     },
     "04_Architecture_Decisions/adr-obfuscate-production-build-using-esbuild-and-javascript-obfuscator.md": {
       "path": "04_Architecture_Decisions/adr-obfuscate-production-build-using-esbuild-and-javascript-obfuscator.md",
-      "selectedCount": 55,
+      "selectedCount": 57,
       "contexts": {
         "12": 2,
         "obsidian": 2,
@@ -790,7 +794,7 @@
         "notes": 3,
         "pain": 1,
         "points": 1,
-        "automation": 1,
+        "automation": 3,
         "verification": 2,
         "ide": 1,
         "integration": 1,
@@ -894,9 +898,14 @@
         "skills": 2,
         "e2e-testing": 2,
         "memory-vault-structure-analysis": 2,
-        "runtime-review-commit": 2
+        "runtime-review-commit": 2,
+        "auto-accept": 2,
+        "job": 2,
+        "scoring": 2,
+        "design": 2,
+        "bidding-speed-optimization": 2
       },
-      "lastSelectedAt": "2026-06-05T07:57:37.001Z"
+      "lastSelectedAt": "2026-06-10T11:15:53.793Z"
     },
     "05_Agent_Session_Logs/2026-05-16-fix-mcp-regex-constraints-and-add-slash-command-prompts.md": {
       "path": "05_Agent_Session_Logs/2026-05-16-fix-mcp-regex-constraints-and-add-slash-command-prompts.md",
@@ -1053,7 +1062,7 @@
     },
     "00_Index/AI-Client-Setup.md": {
       "path": "00_Index/AI-Client-Setup.md",
-      "selectedCount": 19,
+      "selectedCount": 20,
       "contexts": {
         "mcp": 14,
         "bootstrap": 2,
@@ -1087,7 +1096,7 @@
         "readme": 1,
         "ภาษาไทย": 1,
         "comprehensive": 1,
-        "docs": 3,
+        "docs": 5,
         "tools": 1,
         "setup": 2,
         "docs-readme-thai": 1,
@@ -1156,9 +1165,10 @@
         "main": 2,
         "answer": 2,
         "integration": 2,
-        "status": 2
+        "status": 2,
+        "claude-md": 2
       },
-      "lastSelectedAt": "2026-06-05T05:34:19.675Z"
+      "lastSelectedAt": "2026-06-11T07:48:42.175Z"
     },
     "05_Agent_Session_Logs/2026-05-16-updating-mcp-bootstrap-defaults.md": {
       "path": "05_Agent_Session_Logs/2026-05-16-updating-mcp-bootstrap-defaults.md",
@@ -1895,7 +1905,7 @@
     },
     "07_Insights/next-roadmap-slice-after-lifecycle-guardrails.md": {
       "path": "07_Insights/next-roadmap-slice-after-lifecycle-guardrails.md",
-      "selectedCount": 13,
+      "selectedCount": 15,
       "contexts": {
         "implement": 4,
         "task-aware": 5,
@@ -1959,7 +1969,7 @@
         "vault": 2,
         "restart": 2,
         "memory-vault-structure-analysis": 2,
-        "design": 2,
+        "design": 4,
         "improvements": 2,
         "to": 2,
         "memory": 2,
@@ -1968,9 +1978,14 @@
         "for": 2,
         "better": 2,
         "retrieval": 2,
-        "efficiency": 2
+        "efficiency": 2,
+        "auto-accept": 2,
+        "job": 2,
+        "scoring": 2,
+        "automation": 2,
+        "bidding-speed-optimization": 2
       },
-      "lastSelectedAt": "2026-06-03T16:42:55.477Z"
+      "lastSelectedAt": "2026-06-10T11:15:53.793Z"
     },
     "04_Architecture_Decisions/add-task-aware-context-pack-presets.md": {
       "path": "04_Architecture_Decisions/add-task-aware-context-pack-presets.md",
@@ -2152,7 +2167,7 @@
     },
     "04_Architecture_Decisions/add-read-only-follow-up-radar.md": {
       "path": "04_Architecture_Decisions/add-read-only-follow-up-radar.md",
-      "selectedCount": 23,
+      "selectedCount": 24,
       "contexts": {
         "bootstrap-laravel-project-memory": 2,
         "system_exploration": 2,
@@ -2169,13 +2184,18 @@
         "implementation": 1,
         "follow-ups": 1,
         "current": 1,
-        "worktree": 1
+        "worktree": 1,
+        "auto-accept": 2,
+        "job": 2,
+        "scoring": 2,
+        "automation": 2,
+        "design": 2
       },
-      "lastSelectedAt": "2026-06-05T05:20:23.722Z"
+      "lastSelectedAt": "2026-06-08T17:08:47.938Z"
     },
     "99_Templates/Template-ADR.md": {
       "path": "99_Templates/Template-ADR.md",
-      "selectedCount": 11,
+      "selectedCount": 12,
       "contexts": {
         "bootstrap-laravel-project-memory": 2,
         "line": 2,
@@ -2187,15 +2207,16 @@
         "table": 2,
         "claude": 6,
         "md": 2,
-        "docs": 2,
+        "docs": 4,
         "onboarding": 2,
         "for": 2,
         "code": 4,
         "answer": 2,
         "integration": 2,
-        "status": 2
+        "status": 2,
+        "claude-md": 2
       },
-      "lastSelectedAt": "2026-06-05T05:34:19.675Z"
+      "lastSelectedAt": "2026-06-11T07:48:42.175Z"
     },
     "99_Templates/Template-Insight.md": {
       "path": "99_Templates/Template-Insight.md",
@@ -2218,7 +2239,7 @@
     },
     "00_Index/Retrieval-Protocol.md": {
       "path": "00_Index/Retrieval-Protocol.md",
-      "selectedCount": 7,
+      "selectedCount": 8,
       "contexts": {
         "explain-memory-project-root": 2,
         "erp_logistics": 1,
@@ -2239,9 +2260,11 @@
         "claude": 2,
         "code": 2,
         "integration": 2,
-        "status": 2
+        "status": 2,
+        "docs": 2,
+        "claude-md": 2
       },
-      "lastSelectedAt": "2026-06-05T05:34:19.675Z"
+      "lastSelectedAt": "2026-06-11T07:48:42.175Z"
     },
     "00_Index/Open-Followups.md": {
       "path": "00_Index/Open-Followups.md",
@@ -2263,15 +2286,16 @@
     },
     "99_Templates/Template-Mistake.md": {
       "path": "99_Templates/Template-Mistake.md",
-      "selectedCount": 1,
+      "selectedCount": 2,
       "contexts": {
-        "system_exploration": 2
+        "system_exploration": 2,
+        "pr-review-merge-audit-fixes": 2
       },
-      "lastSelectedAt": "2026-05-18T12:59:53.697Z"
+      "lastSelectedAt": "2026-06-11T13:24:41.594Z"
     },
     "07_Insights/system-architecture-overview-erp-logistics.md": {
       "path": "07_Insights/system-architecture-overview-erp-logistics.md",
-      "selectedCount": 4,
+      "selectedCount": 5,
       "contexts": {
         "12": 2,
         "system_improvement": 2,
@@ -2288,9 +2312,14 @@
         "php": 2,
         "implement": 2,
         "erp": 2,
-        "optimizations": 2
+        "optimizations": 2,
+        "auto-accept": 2,
+        "job": 2,
+        "scoring": 2,
+        "automation": 2,
+        "design": 2
       },
-      "lastSelectedAt": "2026-05-20T06:25:35.978Z"
+      "lastSelectedAt": "2026-06-08T17:08:47.938Z"
     },
     "99_Templates/Template-Session-Log.md": {
       "path": "99_Templates/Template-Session-Log.md",
@@ -3905,7 +3934,7 @@
     },
     "05_Agent_Session_Logs/2026-05-21-verify-and-load-codex-device-code-auth-with-context7-validation.md": {
       "path": "05_Agent_Session_Logs/2026-05-21-verify-and-load-codex-device-code-auth-with-context7-validation.md",
-      "selectedCount": 6,
+      "selectedCount": 7,
       "contexts": {
         "403": 4,
         "404": 4,
@@ -3934,9 +3963,10 @@
         "frontmatter": 2,
         "validation": 2,
         "and": 2,
-        "standardization": 2
+        "standardization": 2,
+        "bidding-speed-b3-stream-list-page1": 2
       },
-      "lastSelectedAt": "2026-06-01T15:32:35.231Z"
+      "lastSelectedAt": "2026-06-10T11:32:44.798Z"
     },
     "04_Architecture_Decisions/adopt-oauth-device-code-grant-for-codex-auth.md": {
       "path": "04_Architecture_Decisions/adopt-oauth-device-code-grant-for-codex-auth.md",
@@ -4271,7 +4301,7 @@
     },
     "05_Agent_Session_Logs/2026-05-22-fix-codex-device-code-start-404-by-using-official-codex-deviceauth-endpoints.md": {
       "path": "05_Agent_Session_Logs/2026-05-22-fix-codex-device-code-start-404-by-using-official-codex-deviceauth-endpoints.md",
-      "selectedCount": 4,
+      "selectedCount": 5,
       "contexts": {
         "opencode-style": 3,
         "codex": 12,
@@ -4296,9 +4326,10 @@
         "codex-device": 1,
         "provider": 1,
         "ocr": 1,
-        "read": 1
+        "read": 1,
+        "bidding-speed-optimization-implementation": 2
       },
-      "lastSelectedAt": "2026-05-22T01:06:02.203Z"
+      "lastSelectedAt": "2026-06-10T11:24:22.326Z"
     },
     "05_Agent_Session_Logs/2026-05-21-migrated-deprecated-imagepart-to-unified-filepart-for-codex-image-reader-using-context7-verification.md": {
       "path": "05_Agent_Session_Logs/2026-05-21-migrated-deprecated-imagepart-to-unified-filepart-for-codex-image-reader-using-context7-verification.md",
@@ -4653,7 +4684,7 @@
     },
     "07_Insights/frontmatter-system-implementation-safe-parser-hybrid-schema-fix-migrate-report-cli.md": {
       "path": "07_Insights/frontmatter-system-implementation-safe-parser-hybrid-schema-fix-migrate-report-cli.md",
-      "selectedCount": 18,
+      "selectedCount": 21,
       "contexts": {
         "memory-vault-frontmatter-standardization": 3,
         "frontmatter": 8,
@@ -4768,13 +4799,16 @@
         "diagnostic": 1,
         "issue": 1,
         "fixes": 1,
-        "snippets": 1
+        "snippets": 1,
+        "bidding-speed-optimization-implementation": 2,
+        "bidding-speed-b3-stream-list-page1": 2,
+        "implement-audit-fixes-all-priorities": 2
       },
-      "lastSelectedAt": "2026-06-05T07:28:49.479Z"
+      "lastSelectedAt": "2026-06-11T11:54:43.314Z"
     },
     "05_Agent_Session_Logs/2026-06-01-implement-option-c-hybrid-frontmatter-system-for-project-memory-mcp-safe-parser-schema-fix-migrate-report-cli-mcp-tools-tests.md": {
       "path": "05_Agent_Session_Logs/2026-06-01-implement-option-c-hybrid-frontmatter-system-for-project-memory-mcp-safe-parser-schema-fix-migrate-report-cli-mcp-tools-tests.md",
-      "selectedCount": 18,
+      "selectedCount": 20,
       "contexts": {
         "memory-vault-frontmatter-standardization": 3,
         "frontmatter": 8,
@@ -4888,9 +4922,11 @@
         "memory_import": 1,
         "commits": 1,
         "pr": 1,
-        "runtime-review-commit": 1
+        "runtime-review-commit": 1,
+        "bidding-speed-optimization-implementation": 2,
+        "bidding-speed-b3-stream-list-page1": 2
       },
-      "lastSelectedAt": "2026-06-05T07:57:55.274Z"
+      "lastSelectedAt": "2026-06-10T11:32:44.798Z"
     },
     "05_Agent_Session_Logs/2026-06-01-re-verify-after-mcp-restart-99-templates-warnings-fix-confirmed-0-warnings.md": {
       "path": "05_Agent_Session_Logs/2026-06-01-re-verify-after-mcp-restart-99-templates-warnings-fix-confirmed-0-warnings.md",
@@ -5098,7 +5134,7 @@
     },
     "07_Insights/memory-index-retrieval-bottleneck-full-vault-re-scan-per-query-substring-only-search-roadmap-to-ranked-incremental-index.md": {
       "path": "07_Insights/memory-index-retrieval-bottleneck-full-vault-re-scan-per-query-substring-only-search-roadmap-to-ranked-incremental-index.md",
-      "selectedCount": 3,
+      "selectedCount": 4,
       "contexts": {
         "tier": 4,
         "index": 8,
@@ -5115,9 +5151,10 @@
         "memory": 4,
         "retrieval": 2,
         "continue": 2,
-        "roadmap": 2
+        "roadmap": 2,
+        "bidding-speed-optimization": 2
       },
-      "lastSelectedAt": "2026-06-05T02:49:39.340Z"
+      "lastSelectedAt": "2026-06-10T11:15:53.793Z"
     },
     "04_Architecture_Decisions/adopt-incremental-persistent-index-bm25-ranked-search-for-memory-retrieval.md": {
       "path": "04_Architecture_Decisions/adopt-incremental-persistent-index-bm25-ranked-search-for-memory-retrieval.md",
@@ -5184,7 +5221,7 @@
     },
     "05_Agent_Session_Logs/2026-06-03-audit-memory-vault-frontmatter-system-vs-15-section-thai-prompt-survey-gap-risk-no-code-edits.md": {
       "path": "05_Agent_Session_Logs/2026-06-03-audit-memory-vault-frontmatter-system-vs-15-section-thai-prompt-survey-gap-risk-no-code-edits.md",
-      "selectedCount": 4,
+      "selectedCount": 6,
       "contexts": {
         "continue": 4,
         "prior": 4,
@@ -5208,9 +5245,11 @@
         "memory_export": 1,
         "memory_import": 1,
         "commits": 1,
-        "pr": 1
+        "pr": 1,
+        "mcp-server-deep-audit-improvements": 2,
+        "pr-review-merge-audit-fixes": 2
       },
-      "lastSelectedAt": "2026-06-05T07:57:55.274Z"
+      "lastSelectedAt": "2026-06-11T13:24:41.594Z"
     },
     "05_Agent_Session_Logs/2026-05-23-strict-pr-review-8-category-feat-dynamic-ide-workspace-auto-detection.md": {
       "path": "05_Agent_Session_Logs/2026-05-23-strict-pr-review-8-category-feat-dynamic-ide-workspace-auto-detection.md",
@@ -5421,11 +5460,12 @@
     },
     "07_Insights/frontmatter-audit-confirmed-safety-gaps-adversarial-correction-duplicate-key-detection-is-not-dead.md": {
       "path": "07_Insights/frontmatter-audit-confirmed-safety-gaps-adversarial-correction-duplicate-key-detection-is-not-dead.md",
-      "selectedCount": 1,
+      "selectedCount": 2,
       "contexts": {
-        "runtime-review-commit": 2
+        "runtime-review-commit": 2,
+        "mcp-server-deep-audit-improvements": 2
       },
-      "lastSelectedAt": "2026-06-05T07:57:37.001Z"
+      "lastSelectedAt": "2026-06-11T08:19:30.850Z"
     },
     "05_Agent_Session_Logs/2026-06-05-add-mcp-doctor-remediation-suggestions.md": {
       "path": "05_Agent_Session_Logs/2026-06-05-add-mcp-doctor-remediation-suggestions.md",
@@ -5449,6 +5489,30 @@
         "runtime-review-commit": 1
       },
       "lastSelectedAt": "2026-06-05T07:57:55.274Z"
+    },
+    "04_Architecture_Decisions/adopt-opt-in-tier-3-hybrid-embedding-search-for-memory-retrieval.md": {
+      "path": "04_Architecture_Decisions/adopt-opt-in-tier-3-hybrid-embedding-search-for-memory-retrieval.md",
+      "selectedCount": 1,
+      "contexts": {
+        "bidding-speed-optimization": 2
+      },
+      "lastSelectedAt": "2026-06-10T11:15:53.793Z"
+    },
+    "05_Agent_Session_Logs/2026-06-05-runtime-verification-strict-review-and-commit-preparation-for-tier-3-embeddings-mcp-doctor.md": {
+      "path": "05_Agent_Session_Logs/2026-06-05-runtime-verification-strict-review-and-commit-preparation-for-tier-3-embeddings-mcp-doctor.md",
+      "selectedCount": 1,
+      "contexts": {
+        "mcp-server-deep-audit-improvements": 2
+      },
+      "lastSelectedAt": "2026-06-11T08:19:30.850Z"
+    },
+    "05_Agent_Session_Logs/2026-06-01-memory-vault-analysis-quality-gate-check.md": {
+      "path": "05_Agent_Session_Logs/2026-06-01-memory-vault-analysis-quality-gate-check.md",
+      "selectedCount": 1,
+      "contexts": {
+        "mcp-server-deep-audit-improvements": 2
+      },
+      "lastSelectedAt": "2026-06-11T08:19:30.850Z"
     }
   }
 }

@@ -1,8 +1,393 @@
 {
   "version": 1,
-  "updatedAt": "2026-06-05T09:44:06.582Z",
-  "activeSession": null,
+  "updatedAt": "2026-06-11T13:24:40.923Z",
+  "activeSession": {
+    "id": "memory-1781184280921",
+    "startedAt": "2026-06-11T13:24:40.921Z",
+    "updatedAt": "2026-06-11T13:24:40.923Z",
+    "taskArea": "pr-review-merge-audit-fixes",
+    "startedBy": "memory_sessionStart",
+    "counts": {
+      "sessionStart": 1,
+      "contextPack": 1,
+      "selfCheck": 0,
+      "sessionEnd": 0
+    },
+    "events": [
+      {
+        "tool": "memory_sessionStart",
+        "at": "2026-06-11T13:24:40.921Z",
+        "details": {
+          "taskArea": "pr-review-merge-audit-fixes"
+        }
+      },
+      {
+        "tool": "memory_contextPack",
+        "at": "2026-06-11T13:24:40.923Z",
+        "details": {
+          "query": "pr-review-merge-audit-fixes",
+          "taskArea": "pr-review-merge-audit-fixes"
+        }
+      }
+    ],
+    "missingSessionStart": false
+  },
   "recentSessions": [
+    {
+      "id": "memory-1781178881696",
+      "startedAt": "2026-06-11T11:54:41.696Z",
+      "updatedAt": "2026-06-11T13:22:36.146Z",
+      "taskArea": "src core services, config, schemas, controllers, utils",
+      "startedBy": "memory_sessionStart",
+      "counts": {
+        "sessionStart": 1,
+        "contextPack": 1,
+        "selfCheck": 1,
+        "sessionEnd": 1
+      },
+      "events": [
+        {
+          "tool": "memory_sessionStart",
+          "at": "2026-06-11T11:54:41.697Z",
+          "details": {
+            "taskArea": "implement-audit-fixes-all-priorities"
+          }
+        },
+        {
+          "tool": "memory_contextPack",
+          "at": "2026-06-11T11:54:41.705Z",
+          "details": {
+            "query": "implement-audit-fixes-all-priorities",
+            "taskArea": "implement-audit-fixes-all-priorities"
+          }
+        },
+        {
+          "tool": "memory_selfCheck",
+          "at": "2026-06-11T11:55:34.512Z",
+          "details": {
+            "task": "Implement all 86 audit fixes across ~20 source files: vault resolution safety, contextPack retrieval refactor, atomic state writes, Thai-language support, token-economy trims, API hardening",
+            "area": "src core services, config, schemas, controllers, utils",
+            "riskLevel": "high"
+          }
+        },
+        {
+          "tool": "memory_sessionEnd",
+          "at": "2026-06-11T13:22:36.146Z",
+          "details": {
+            "topic": "Implement all audit fixes: P0 vault-resolution safety, contextPack BM25 refactor, atomic state writes, Thai-language support, token-economy trims, API hardening",
+            "verify": true
+          }
+        }
+      ],
+      "missingSessionStart": false,
+      "topic": "Implement all audit fixes: P0 vault-resolution safety, contextPack BM25 refactor, atomic state writes, Thai-language support, token-economy trims, API hardening",
+      "endedAt": "2026-06-11T13:22:36.146Z",
+      "lastQualityGate": {
+        "ok": true,
+        "score": 100,
+        "grade": "A",
+        "warnings": []
+      }
+    },
+    {
+      "id": "memory-1781165970095",
+      "startedAt": "2026-06-11T08:19:30.095Z",
+      "updatedAt": "2026-06-11T11:14:47.293Z",
+      "taskArea": "mcp-server-deep-audit-improvements",
+      "startedBy": "memory_sessionStart",
+      "counts": {
+        "sessionStart": 1,
+        "contextPack": 1,
+        "selfCheck": 0,
+        "sessionEnd": 1
+      },
+      "events": [
+        {
+          "tool": "memory_sessionStart",
+          "at": "2026-06-11T08:19:30.095Z",
+          "details": {
+            "taskArea": "mcp-server-deep-audit-improvements"
+          }
+        },
+        {
+          "tool": "memory_contextPack",
+          "at": "2026-06-11T08:19:30.099Z",
+          "details": {
+            "query": "mcp-server-deep-audit-improvements",
+            "taskArea": "mcp-server-deep-audit-improvements"
+          }
+        },
+        {
+          "tool": "memory_sessionEnd",
+          "at": "2026-06-11T11:14:47.293Z",
+          "details": {
+            "topic": "Deep multi-agent audit of memory MCP server: 86 adversarially-verified improvement findings across 8 dimensions",
+            "verify": true
+          }
+        }
+      ],
+      "missingSessionStart": false,
+      "topic": "Deep multi-agent audit of memory MCP server: 86 adversarially-verified improvement findings across 8 dimensions",
+      "endedAt": "2026-06-11T11:14:47.293Z",
+      "lastQualityGate": {
+        "ok": false,
+        "score": 88,
+        "grade": "B",
+        "warnings": [
+          "selfCheck for risky work: Risky, deployment-like, decision-heavy, or multi-file work needs memory_selfCheck."
+        ]
+      }
+    },
+    {
+      "id": "memory-1781164121718",
+      "startedAt": "2026-06-11T07:48:41.718Z",
+      "updatedAt": "2026-06-11T08:10:28.578Z",
+      "taskArea": "docs/claude-md",
+      "startedBy": "memory_sessionStart",
+      "counts": {
+        "sessionStart": 1,
+        "contextPack": 1,
+        "selfCheck": 0,
+        "sessionEnd": 1
+      },
+      "events": [
+        {
+          "tool": "memory_sessionStart",
+          "at": "2026-06-11T07:48:41.718Z",
+          "details": {
+            "taskArea": "docs/claude-md"
+          }
+        },
+        {
+          "tool": "memory_contextPack",
+          "at": "2026-06-11T07:48:41.722Z",
+          "details": {
+            "query": "docs/claude-md",
+            "taskArea": "docs/claude-md"
+          }
+        },
+        {
+          "tool": "memory_sessionEnd",
+          "at": "2026-06-11T08:10:28.578Z",
+          "details": {
+            "topic": "Refresh CLAUDE.md via /init: verify all claims against current code and document Tier 1-3 search, embeddings env, MCP doctor, lifecycle mechanics",
+            "verify": true
+          }
+        }
+      ],
+      "missingSessionStart": false,
+      "topic": "Refresh CLAUDE.md via /init: verify all claims against current code and document Tier 1-3 search, embeddings env, MCP doctor, lifecycle mechanics",
+      "endedAt": "2026-06-11T08:10:28.578Z",
+      "lastQualityGate": {
+        "ok": true,
+        "score": 100,
+        "grade": "A",
+        "warnings": []
+      }
+    },
+    {
+      "id": "memory-1781091163939",
+      "startedAt": "2026-06-10T11:32:43.939Z",
+      "updatedAt": "2026-06-10T11:33:00.332Z",
+      "taskArea": "src/services + src/controllers",
+      "startedBy": "memory_sessionStart",
+      "counts": {
+        "sessionStart": 1,
+        "contextPack": 1,
+        "selfCheck": 1,
+        "sessionEnd": 0
+      },
+      "events": [
+        {
+          "tool": "memory_sessionStart",
+          "at": "2026-06-10T11:32:43.939Z",
+          "details": {
+            "taskArea": "bidding-speed-b3-stream-list-page1"
+          }
+        },
+        {
+          "tool": "memory_contextPack",
+          "at": "2026-06-10T11:32:43.942Z",
+          "details": {
+            "query": "bidding-speed-b3-stream-list-page1",
+            "taskArea": "bidding-speed-b3-stream-list-page1"
+          }
+        },
+        {
+          "tool": "memory_selfCheck",
+          "at": "2026-06-10T11:33:00.332Z",
+          "details": {
+            "task": "Implement B3: stream bidding-list pages to scheduleBookingDetails as they arrive (onListPage callback in api-client fetch + per-tick prep/dedup refactor in poller) — touches src/services/api-client.ts and src/controllers/poller.ts on the accept critical path",
+            "area": "src/services + src/controllers",
+            "riskLevel": "high"
+          }
+        }
+      ],
+      "missingSessionStart": false,
+      "endedAt": "2026-06-11T07:48:41.718Z",
+      "lastQualityGate": {
+        "ok": false,
+        "score": 0,
+        "grade": "F",
+        "warnings": [
+          "Lifecycle was replaced by a new memory_sessionStart before memory_sessionEnd."
+        ]
+      }
+    },
+    {
+      "id": "memory-1781090661565",
+      "startedAt": "2026-06-10T11:24:21.565Z",
+      "updatedAt": "2026-06-10T11:28:57.843Z",
+      "taskArea": "src/services",
+      "startedBy": "memory_sessionStart",
+      "counts": {
+        "sessionStart": 1,
+        "contextPack": 1,
+        "selfCheck": 1,
+        "sessionEnd": 1
+      },
+      "events": [
+        {
+          "tool": "memory_sessionStart",
+          "at": "2026-06-10T11:24:21.565Z",
+          "details": {
+            "taskArea": "bidding-speed-optimization-implementation"
+          }
+        },
+        {
+          "tool": "memory_contextPack",
+          "at": "2026-06-10T11:24:21.567Z",
+          "details": {
+            "query": "bidding-speed-optimization-implementation",
+            "taskArea": "bidding-speed-optimization-implementation"
+          }
+        },
+        {
+          "tool": "memory_selfCheck",
+          "at": "2026-06-10T11:24:31.806Z",
+          "details": {
+            "task": "Implement B1 (in-memory notify-rules cache with mutation invalidation) and B2 (adaptive fail-fast retry/timeout for bidding-list poll) in src/services/notify-rules.ts and src/services/api-client.ts — auto-accept critical path",
+            "area": "src/services",
+            "riskLevel": "high"
+          }
+        },
+        {
+          "tool": "memory_sessionEnd",
+          "at": "2026-06-10T11:28:57.843Z",
+          "details": {
+            "topic": "Implement B1 rules cache and B2 fail-fast list poll for accept-speed",
+            "verify": true
+          }
+        }
+      ],
+      "missingSessionStart": false,
+      "topic": "Implement B1 rules cache and B2 fail-fast list poll for accept-speed",
+      "endedAt": "2026-06-10T11:28:57.843Z",
+      "lastQualityGate": {
+        "ok": true,
+        "score": 100,
+        "grade": "A",
+        "warnings": []
+      }
+    },
+    {
+      "id": "memory-1781090152962",
+      "startedAt": "2026-06-10T11:15:52.962Z",
+      "updatedAt": "2026-06-10T11:19:57.191Z",
+      "taskArea": "bidding-speed-optimization",
+      "startedBy": "memory_sessionStart",
+      "counts": {
+        "sessionStart": 1,
+        "contextPack": 1,
+        "selfCheck": 0,
+        "sessionEnd": 1
+      },
+      "events": [
+        {
+          "tool": "memory_sessionStart",
+          "at": "2026-06-10T11:15:52.962Z",
+          "details": {
+            "taskArea": "bidding-speed-optimization"
+          }
+        },
+        {
+          "tool": "memory_contextPack",
+          "at": "2026-06-10T11:15:52.966Z",
+          "details": {
+            "query": "bidding-speed-optimization",
+            "taskArea": "bidding-speed-optimization"
+          }
+        },
+        {
+          "tool": "memory_sessionEnd",
+          "at": "2026-06-10T11:19:57.191Z",
+          "details": {
+            "topic": "Analyze SPX accept-speed critical path and propose improvements",
+            "verify": true
+          }
+        }
+      ],
+      "missingSessionStart": false,
+      "topic": "Analyze SPX accept-speed critical path and propose improvements",
+      "endedAt": "2026-06-10T11:19:57.191Z",
+      "lastQualityGate": {
+        "ok": false,
+        "score": 88,
+        "grade": "B",
+        "warnings": [
+          "selfCheck for risky work: Risky, deployment-like, decision-heavy, or multi-file work needs memory_selfCheck."
+        ]
+      }
+    },
+    {
+      "id": "memory-1780938526837",
+      "startedAt": "2026-06-08T17:08:46.837Z",
+      "updatedAt": "2026-06-08T17:20:14.082Z",
+      "taskArea": "src/controllers/poller.ts, src/services/api-client.ts, src/services/notifier.ts, src/services/notify-rules.ts",
+      "startedBy": "memory_sessionStart",
+      "counts": {
+        "sessionStart": 1,
+        "contextPack": 1,
+        "selfCheck": 1,
+        "sessionEnd": 0
+      },
+      "events": [
+        {
+          "tool": "memory_sessionStart",
+          "at": "2026-06-08T17:08:46.838Z",
+          "details": {
+            "taskArea": "auto-accept job scoring automation design"
+          }
+        },
+        {
+          "tool": "memory_contextPack",
+          "at": "2026-06-08T17:08:46.843Z",
+          "details": {
+            "query": "auto-accept job scoring automation design",
+            "taskArea": "auto-accept job scoring automation design"
+          }
+        },
+        {
+          "tool": "memory_selfCheck",
+          "at": "2026-06-08T17:20:14.082Z",
+          "details": {
+            "task": "Improve performance of SPX auto-accept hot path (poll -> match -> accept) without changing existing auto-accept matching conditions",
+            "area": "src/controllers/poller.ts, src/services/api-client.ts, src/services/notifier.ts, src/services/notify-rules.ts",
+            "riskLevel": "high"
+          }
+        }
+      ],
+      "missingSessionStart": false,
+      "endedAt": "2026-06-10T11:15:52.961Z",
+      "lastQualityGate": {
+        "ok": false,
+        "score": 0,
+        "grade": "F",
+        "warnings": [
+          "Lifecycle was replaced by a new memory_sessionStart before memory_sessionEnd."
+        ]
+      }
+    },
     {
       "id": "memory-1780646256472",
       "startedAt": "2026-06-05T07:57:36.472Z",
@@ -685,371 +1070,6 @@
         "warnings": [
           "vault warnings reviewed: Vault grade C with score 84."
         ]
-      }
-    },
-    {
-      "id": "memory-1780504974464",
-      "startedAt": "2026-06-03T16:42:54.464Z",
-      "updatedAt": "2026-06-03T16:44:59.849Z",
-      "taskArea": "Design improvements to memory index management for better AI retrieval efficiency",
-      "startedBy": "memory_sessionStart",
-      "counts": {
-        "sessionStart": 1,
-        "contextPack": 1,
-        "selfCheck": 0,
-        "sessionEnd": 1
-      },
-      "events": [
-        {
-          "tool": "memory_sessionStart",
-          "at": "2026-06-03T16:42:54.464Z",
-          "details": {
-            "taskArea": "Design improvements to memory index management for better AI retrieval efficiency"
-          }
-        },
-        {
-          "tool": "memory_contextPack",
-          "at": "2026-06-03T16:42:54.466Z",
-          "details": {
-            "query": "Design improvements to memory index management for better AI retrieval efficiency",
-            "taskArea": "Design improvements to memory index management for better AI retrieval efficiency"
-          }
-        },
-        {
-          "tool": "memory_sessionEnd",
-          "at": "2026-06-03T16:44:59.849Z",
-          "details": {
-            "topic": "Analyze memory index/retrieval and propose efficiency roadmap (Tier 1-3)",
-            "verify": true
-          }
-        }
-      ],
-      "missingSessionStart": false,
-      "topic": "Analyze memory index/retrieval and propose efficiency roadmap (Tier 1-3)",
-      "endedAt": "2026-06-03T16:44:59.849Z",
-      "lastQualityGate": {
-        "ok": true,
-        "score": 100,
-        "grade": "A",
-        "warnings": []
-      }
-    },
-    {
-      "id": "memory-1780504768066",
-      "startedAt": "2026-06-03T16:39:28.066Z",
-      "updatedAt": "2026-06-03T16:41:50.383Z",
-      "taskArea": "Post-merge cleanup: fix CLAUDE.md dist claim, delete merged remote branch, sync local main",
-      "startedBy": "memory_sessionStart",
-      "counts": {
-        "sessionStart": 1,
-        "contextPack": 1,
-        "selfCheck": 0,
-        "sessionEnd": 1
-      },
-      "events": [
-        {
-          "tool": "memory_sessionStart",
-          "at": "2026-06-03T16:39:28.066Z",
-          "details": {
-            "taskArea": "Post-merge cleanup: fix CLAUDE.md dist claim, delete merged remote branch, sync local main"
-          }
-        },
-        {
-          "tool": "memory_contextPack",
-          "at": "2026-06-03T16:39:28.068Z",
-          "details": {
-            "query": "Post-merge cleanup: fix CLAUDE.md dist claim, delete merged remote branch, sync local main",
-            "taskArea": "Post-merge cleanup: fix CLAUDE.md dist claim, delete merged remote branch, sync local main"
-          }
-        },
-        {
-          "tool": "memory_sessionEnd",
-          "at": "2026-06-03T16:41:50.383Z",
-          "details": {
-            "topic": "Post-merge cleanup: fix CLAUDE.md dist claim, delete merged branch, sync local main",
-            "verify": true
-          }
-        }
-      ],
-      "missingSessionStart": false,
-      "topic": "Post-merge cleanup: fix CLAUDE.md dist claim, delete merged branch, sync local main",
-      "endedAt": "2026-06-03T16:41:50.383Z",
-      "lastQualityGate": {
-        "ok": true,
-        "score": 100,
-        "grade": "A",
-        "warnings": []
-      }
-    },
-    {
-      "id": "memory-1780504338276",
-      "startedAt": "2026-06-03T16:32:18.276Z",
-      "updatedAt": "2026-06-03T16:34:43.243Z",
-      "taskArea": "src/services/frontmatter.service.ts, tests/frontmatter.service.test.ts",
-      "startedBy": "memory_sessionStart",
-      "counts": {
-        "sessionStart": 1,
-        "contextPack": 1,
-        "selfCheck": 1,
-        "sessionEnd": 1
-      },
-      "events": [
-        {
-          "tool": "memory_sessionStart",
-          "at": "2026-06-03T16:32:18.276Z",
-          "details": {
-            "taskArea": "rollback snapshot-before-restore + fix latestBackupDir to ignore non-fix backup dirs"
-          }
-        },
-        {
-          "tool": "memory_contextPack",
-          "at": "2026-06-03T16:32:18.277Z",
-          "details": {
-            "query": "rollback snapshot-before-restore + fix latestBackupDir to ignore non-fix backup dirs",
-            "taskArea": "rollback snapshot-before-restore + fix latestBackupDir to ignore non-fix backup dirs"
-          }
-        },
-        {
-          "tool": "memory_selfCheck",
-          "at": "2026-06-03T16:32:38.939Z",
-          "details": {
-            "task": "Add snapshot-before-restore to rollback() so a rollback is itself reversible; fix latestBackupDir to only select ISO-stamped fix/migrate backups (ignore note-overwrite-/pre-rollback- dirs). Write-path change.",
-            "area": "src/services/frontmatter.service.ts, tests/frontmatter.service.test.ts",
-            "riskLevel": "medium"
-          }
-        },
-        {
-          "tool": "memory_sessionEnd",
-          "at": "2026-06-03T16:34:43.243Z",
-          "details": {
-            "topic": "Make rollback reversible (snapshot-before-restore) + scope latestBackupDir to fix/migrate backups",
-            "verify": true
-          }
-        }
-      ],
-      "missingSessionStart": false,
-      "topic": "Make rollback reversible (snapshot-before-restore) + scope latestBackupDir to fix/migrate backups",
-      "endedAt": "2026-06-03T16:34:43.243Z",
-      "lastQualityGate": {
-        "ok": true,
-        "score": 100,
-        "grade": "A",
-        "warnings": []
-      }
-    },
-    {
-      "id": "memory-1780503513913",
-      "startedAt": "2026-06-03T16:18:33.913Z",
-      "updatedAt": "2026-06-03T16:29:15.753Z",
-      "taskArea": "src/utils/frontmatter-schema.ts, src/utils/frontmatter.ts, src/services/frontmatter.service.ts, src/config/memory.config.ts, tests",
-      "startedBy": "memory_sessionStart",
-      "counts": {
-        "sessionStart": 1,
-        "contextPack": 1,
-        "selfCheck": 1,
-        "sessionEnd": 1
-      },
-      "events": [
-        {
-          "tool": "memory_sessionStart",
-          "at": "2026-06-03T16:18:33.913Z",
-          "details": {
-            "taskArea": "Step 7 frontmatter enhancements: versioned migration registry, numeric schema-version, central code enum, schema-diagnostic line numbers, vaultRoot containment"
-          }
-        },
-        {
-          "tool": "memory_contextPack",
-          "at": "2026-06-03T16:18:33.917Z",
-          "details": {
-            "query": "Step 7 frontmatter enhancements: versioned migration registry, numeric schema-version, central code enum, schema-diagnostic line numbers, vaultRoot containment",
-            "taskArea": "Step 7 frontmatter enhancements: versioned migration registry, numeric schema-version, central code enum, schema-diagnostic line numbers, vaultRoot containment"
-          }
-        },
-        {
-          "tool": "memory_selfCheck",
-          "at": "2026-06-03T16:18:36.273Z",
-          "details": {
-            "task": "Step 7: versioned migration registry + numeric schema-version compare (frontmatter.service + frontmatter-schema); central frontmatter code registry; line numbers on schema-layer diagnostics; vaultRoot-within-projectRoot containment diagnostic. Multi-file, safety-critical, on top of PR #4.",
-            "area": "src/utils/frontmatter-schema.ts, src/utils/frontmatter.ts, src/services/frontmatter.service.ts, src/config/memory.config.ts, tests",
-            "riskLevel": "high"
-          }
-        },
-        {
-          "tool": "memory_sessionEnd",
-          "at": "2026-06-03T16:29:15.753Z",
-          "details": {
-            "topic": "Step 7 frontmatter enhancements (versioned migration, central codes, diagnostic line numbers, vault containment)",
-            "verify": true
-          }
-        }
-      ],
-      "missingSessionStart": false,
-      "topic": "Step 7 frontmatter enhancements (versioned migration, central codes, diagnostic line numbers, vault containment)",
-      "endedAt": "2026-06-03T16:29:15.753Z",
-      "lastQualityGate": {
-        "ok": true,
-        "score": 100,
-        "grade": "A",
-        "warnings": []
-      }
-    },
-    {
-      "id": "memory-1780501842252",
-      "startedAt": "2026-06-03T15:50:42.252Z",
-      "updatedAt": "2026-06-03T16:08:16.904Z",
-      "taskArea": "src/services/frontmatter.service.ts, src/utils/frontmatter.ts, src/services/note.service.ts, src/repositories/note.repository.ts, src/cli.ts, tests",
-      "startedBy": "memory_sessionStart",
-      "counts": {
-        "sessionStart": 1,
-        "contextPack": 1,
-        "selfCheck": 1,
-        "sessionEnd": 1
-      },
-      "events": [
-        {
-          "tool": "memory_sessionStart",
-          "at": "2026-06-03T15:50:42.253Z",
-          "details": {
-            "taskArea": "Implement Steps 1-6 frontmatter safety hardening (backup mandatory, migrate no-fabricate, body preservation, atomic verify, CLI exit codes, tests)"
-          }
-        },
-        {
-          "tool": "memory_contextPack",
-          "at": "2026-06-03T15:50:42.256Z",
-          "details": {
-            "query": "Implement Steps 1-6 frontmatter safety hardening (backup mandatory, migrate no-fabricate, body preservation, atomic verify, CLI exit codes, tests)",
-            "taskArea": "Implement Steps 1-6 frontmatter safety hardening (backup mandatory, migrate no-fabricate, body preservation, atomic verify, CLI exit codes, tests)"
-          }
-        },
-        {
-          "tool": "memory_selfCheck",
-          "at": "2026-06-03T15:50:44.601Z",
-          "details": {
-            "task": "Implement Steps 1-6: make backup mandatory on non-dry-run writes; migrate() must not fabricate frontmatter/created; preserve body bytes + line endings; verify+atomic backup; CLI exit codes + --format whitelist + per-file try/catch; tighten + add tests. Multi-file, safety-critical.",
-            "area": "src/services/frontmatter.service.ts, src/utils/frontmatter.ts, src/services/note.service.ts, src/repositories/note.repository.ts, src/cli.ts, tests",
-            "riskLevel": "high"
-          }
-        },
-        {
-          "tool": "memory_sessionEnd",
-          "at": "2026-06-03T16:08:16.904Z",
-          "details": {
-            "topic": "Implement Steps 1-6 frontmatter safety hardening + fix gray-matter cache non-idempotency",
-            "verify": true
-          }
-        }
-      ],
-      "missingSessionStart": false,
-      "topic": "Implement Steps 1-6 frontmatter safety hardening + fix gray-matter cache non-idempotency",
-      "endedAt": "2026-06-03T16:08:16.904Z",
-      "lastQualityGate": {
-        "ok": true,
-        "score": 100,
-        "grade": "A",
-        "warnings": []
-      }
-    },
-    {
-      "id": "memory-1780483415104",
-      "startedAt": "2026-06-03T10:43:35.104Z",
-      "updatedAt": "2026-06-03T15:46:46.032Z",
-      "taskArea": "frontmatter validation, vault config, CLI, tests",
-      "startedBy": "memory_sessionStart",
-      "counts": {
-        "sessionStart": 1,
-        "contextPack": 1,
-        "selfCheck": 1,
-        "sessionEnd": 1
-      },
-      "events": [
-        {
-          "tool": "memory_sessionStart",
-          "at": "2026-06-03T10:43:35.105Z",
-          "details": {
-            "taskArea": "Audit Memory Vault + frontmatter system against claude-code-memory-vault-prompt-th.md checklist"
-          }
-        },
-        {
-          "tool": "memory_contextPack",
-          "at": "2026-06-03T10:43:35.106Z",
-          "details": {
-            "query": "Audit Memory Vault + frontmatter system against claude-code-memory-vault-prompt-th.md checklist",
-            "taskArea": "Audit Memory Vault + frontmatter system against claude-code-memory-vault-prompt-th.md checklist"
-          }
-        },
-        {
-          "tool": "memory_selfCheck",
-          "at": "2026-06-03T10:43:53.718Z",
-          "details": {
-            "task": "Audit the existing Memory Vault + frontmatter system against the 15-section claude-code-memory-vault-prompt-th.md requirements and checklist; produce findings + incremental plan WITHOUT editing code this turn",
-            "area": "frontmatter validation, vault config, CLI, tests",
-            "riskLevel": "medium"
-          }
-        },
-        {
-          "tool": "memory_sessionEnd",
-          "at": "2026-06-03T15:46:46.032Z",
-          "details": {
-            "topic": "Audit Memory Vault + frontmatter system vs 15-section Thai prompt (survey + gap + risk, no code edits)",
-            "verify": true
-          }
-        }
-      ],
-      "missingSessionStart": false,
-      "topic": "Audit Memory Vault + frontmatter system vs 15-section Thai prompt (survey + gap + risk, no code edits)",
-      "endedAt": "2026-06-03T15:46:46.031Z",
-      "lastQualityGate": {
-        "ok": true,
-        "score": 100,
-        "grade": "A",
-        "warnings": []
-      }
-    },
-    {
-      "id": "memory-1780483247466",
-      "startedAt": "2026-06-03T10:40:47.466Z",
-      "updatedAt": "2026-06-03T10:41:29.035Z",
-      "taskArea": "CLAUDE.md add Full-Auto memory operating protocol directive",
-      "startedBy": "memory_sessionStart",
-      "counts": {
-        "sessionStart": 1,
-        "contextPack": 1,
-        "selfCheck": 0,
-        "sessionEnd": 1
-      },
-      "events": [
-        {
-          "tool": "memory_sessionStart",
-          "at": "2026-06-03T10:40:47.466Z",
-          "details": {
-            "taskArea": "CLAUDE.md add Full-Auto memory operating protocol directive"
-          }
-        },
-        {
-          "tool": "memory_contextPack",
-          "at": "2026-06-03T10:40:47.468Z",
-          "details": {
-            "query": "CLAUDE.md add Full-Auto memory operating protocol directive",
-            "taskArea": "CLAUDE.md add Full-Auto memory operating protocol directive"
-          }
-        },
-        {
-          "tool": "memory_sessionEnd",
-          "at": "2026-06-03T10:41:29.035Z",
-          "details": {
-            "topic": "Add Full-Auto project-memory operating protocol directive to CLAUDE.md",
-            "verify": true
-          }
-        }
-      ],
-      "missingSessionStart": false,
-      "topic": "Add Full-Auto project-memory operating protocol directive to CLAUDE.md",
-      "endedAt": "2026-06-03T10:41:29.035Z",
-      "lastQualityGate": {
-        "ok": true,
-        "score": 100,
-        "grade": "A",
-        "warnings": []
       }
     }
   ]

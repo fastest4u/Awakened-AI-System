@@ -2,6 +2,11 @@
 title: Auto Memory Digest
 type: insight
 derived-from:
+  - 05_Agent_Session_Logs/2026-06-11-refresh-claude-md-via-init-verify-all-claims-against-current-code-and-document-tier-1-3-search-embeddings-env-mcp-doctor-lifecycle-mechanics.md
+  - 05_Agent_Session_Logs/2026-06-11-deep-multi-agent-audit-of-memory-mcp-server-86-adversarially-verified-improvement-findings-across-8-dimensions.md
+  - 05_Agent_Session_Logs/2026-06-11-implement-all-audit-fixes-p0-vault-resolution-safety-contextpack-bm25-refactor-atomic-state-writes-thai-language-support-token-economy-trims-api-hardening.md
+  - 05_Agent_Session_Logs/2026-06-10-analyze-spx-accept-speed-critical-path-and-propose-improvements.md
+  - 05_Agent_Session_Logs/2026-06-10-implement-b1-rules-cache-and-b2-fail-fast-list-poll-for-accept-speed.md
   - 05_Agent_Session_Logs/2026-06-05-continue-memory-index-tier-3-hybrid-embedding-search.md
   - 05_Agent_Session_Logs/2026-06-05-answer-compact-memory-behavior-in-project-memory-mcp.md
   - 05_Agent_Session_Logs/2026-06-05-answer-claude-code-integration-status.md
@@ -27,15 +32,10 @@ derived-from:
   - 05_Agent_Session_Logs/2026-06-01-document-runtime-refresh-workflow-for-stale-project-memory-mcp-frontmatter-diagnostics.md
   - 05_Agent_Session_Logs/2026-06-01-harden-frontmatter-warning-system-and-safety-defaults.md
   - 05_Agent_Session_Logs/2026-06-01-implement-option-c-hybrid-frontmatter-system-for-project-memory-mcp-safe-parser-schema-fix-migrate-report-cli-mcp-tools-tests.md
-  - 05_Agent_Session_Logs/2026-06-01-memory-vault-analysis-quality-gate-check.md
-  - 05_Agent_Session_Logs/2026-06-01-memory-vault-frontmatter-system-analysis-and-standardization-design.md
-  - 05_Agent_Session_Logs/2026-06-01-memory-vault-system-structure-analysis.md
-  - 05_Agent_Session_Logs/2026-06-01-populate-empty-outcomes-in-2-stub-session-logs-to-clear-missing-required-field-errors.md
-  - 05_Agent_Session_Logs/2026-06-01-re-verify-after-mcp-restart-99-templates-warnings-fix-confirmed-0-warnings.md
 confidence: medium
 status: active
-created: "2026-06-05"
-updated: "2026-06-05"
+created: "2026-06-11"
+updated: "2026-06-11"
 tags:
   - digest
   - auto-compact
@@ -43,44 +43,56 @@ tags:
 ---
 # Auto Memory Digest
 
-Generated: 2026-06-05
+Generated: 2026-06-11
 
 > [!important]
 > This note is generated from recent session logs. Keep durable architectural choices in ADRs and keep repeated lessons here or in dedicated insight notes.
 
 ## High-Signal Outcomes
+- Rewrote CLAUDE.md after a 5-agent verification pass (claim audit + 4 subsystem explorers) cross-checked every existing claim against source
+- Corrected tool count from ~40 to exactly 32 registered memory_* tools plus 4 MCP prompts; flagged memory_export/memory_import as no-op stubs
+- Removed dead source-of-truth reference: memory/04_Architecture_Decisions/adr-full-auto-invocation-policy-for-project-memory-mcp-tools.md does not exist; tier policy lives only in root AGENTS.md
+- Fixed allowlist pointer from .claude/settings.json to .claude/settings.local.json
+- Documented the three-tier search/index subsystem (persistent index.json + BM25, backlink graph + section anchors, RRF hybrid embeddings), MEMORY_EMBEDDINGS* env family with silent lexical fallback, and the contextPack-does-not-use-BM25 split
+- Documented MCP doctor (lives in memory.config.ts, surfaced via memory_diagnoseWorkspace and memory-vault diagnose; no doctor subcommand), corrected build to three stages (cli.js minified not obfuscated), expanded vault resolution to the real 5-step order, added lifecycle/quality-gate mechanics and CLI footguns (--no-backup ignored, --unsafe needs --confirm, diagnose ignores --vault)
+- Ran a 95-agent workflow (8 dimension finders + 1 adversarial verifier per finding): 86 findings confirmed, 1 refuted, across index correctness, search accuracy, contextPack quality, lifecycle/usage/compaction, vault IO, config/doctor, performance, and API/token economy
+- CRITICAL confirmed: dynamic IDE-state vault resolution attaches to the wrong project's vault with cross-project contamination present in this live vault; bootstrap also generates client configs with a nonexistent entrypoint path and pins MEMORY_PROJECT_ROOT to the dynamic sentinel
+- Top accuracy cluster: contextPack (the mandated retrieval surface) bypasses BM25/hybrid, has a dead relevance filter, re-reads usage.json ~190x per call (~0.3-0.4s measured), and embeds 3KB usage telemetry per item billed against the maxChars budget; usage booster (+18) makes exact-title search fail 9x more often
+- Top robustness cluster: usage.json/lifecycle.json non-atomic writes with silent catch-reset can wipe all accumulated state; single global activeSession means concurrent agents force-grade each other F (4 of last 20 live sessions); memory_awaken silently destroys the active session
+- Thai-language cluster: slugify produces untitled filenames and digest dedupe drops distinct Thai lessons; risky-work regex and inferMode are English-only; Thai n-gram dedup destroys term frequency in BM25
+- Wrote prioritized P0-P3 roadmap to 07_Insights/deep-audit-2026-06-11-86-verified-findings-and-prioritized-improvement-roadmap-for-memory-mcp-server.md and delivered full Thai report to user
+- Implemented the full P0-P3 audit roadmap via 8 implementation agents in 3 phases (6 parallel disjoint-file packages + workflow refactor + failed-package recovery), then integrated: npm run typecheck clean, 364/364 tests pass, npm run build succeeds
+- P0 vault resolution: 5-pass precedence (vault-marker pass first, PWD/OLDPWD demoted to last env tier), home-dir/filesystem-root rejected as workspace, resolution provenance + PROJECT_ROOT_UNVERIFIED doctor warning, bootstrap entrypoint fixed via package.json walk-up (was one dir above dist/), generated configs and doctor snippets pin literal MEMORY_PROJECT_ROOT, doctor scans global ~/.claude.json, mojibake comments restored
+- Retrieval accuracy: contextPack now ranks via new MemoryQueryService.rankFor (BM25 full-text + usage boost capped at 0.75x BM25 applied only to matching docs, booster built once), relevance gate kills the dead typeWeight filter, usage telemetry stripped from wire, SEARCH_TEXT_LIMIT 4000->12000, cosine floor 0.15, Thai n-gram TF preserved, Unicode slugify, folder filters segment-aware case-insensitive, sortBy/scope/includeBody/similarityThreshold/verifyNote flags honored
+- Robustness: usage.json/lifecycle.json atomic tmp+rename writes with stderr warning on parse fallback, contexts capped top-40, supersede archives with null gate + endReason instead of forced grade-F, awaken now lifecycle-non-mutating, backup rotation keeps 20, yamlScalar quoting matrix, date inputs validated YYYY-MM-DD end-to-end, Zod .strict() on all 34 schemas, export/import return NOT_IMPLEMENTED
+- Token economy: compact JSON text envelope, sessionStart followUps/lifecycle/recommendedReads single-copy, sessionEnd lean candidateCount/candidatePaths, selfCheck compact projection, auto-compact minSessions 1->5, digest re-emits follow-ups as non-checkbox lines and preserves created date
+- Updated CLAUDE.md to match all new behaviors; rebuilt dist/ (MCP clients must reload to see new behavior)
+- Mapped end-to-end critical path: poll wait (avg POLL_INTERVAL_MS/2) -> bidding list page1 RTT (+extra pages) -> per-tick DB rules query -> request-list page1 RTT (page-level fast lane exists) -> accept POST RTT
+- Found stale comment in poller.ts:246 claiming rules are cached; readRulesDb() does a real DB SELECT every tick on the critical path before any detail fetch launches
+- Found bidding-list fetch waits for ALL extra pages before scheduling details (api-client.ts fetch -> fetchRemainingBiddingListPages)
+- Found list-poll retries (MAX_RETRIES=3, exponential backoff) stretch a failed tick ~7s+ even though the next tick supersedes it
+- Proposed ranked improvements: ops (lower POLL_INTERVAL_MS, cooldown 30-60s, raise detail concurrency when saturated, host near SPX), code (rules cache/parallel fetch, fail-fast list poll, page-1 streaming, adaptive interval, newness-aware sort), experiments (undici allowH2)
+- B1: added in-memory rules cache in src/services/notify-rules.ts — readRules() serves from cache (TTL 5s safety net), every writer (writeRulesFile, broadcastAllRules after all DB mutations, migrateJsonToDb) refreshes/invalidates synchronously, single-flight guard prevents concurrent SELECT stampede; per-tick DB SELECT removed from the accept critical path
+- B2: added listPollRetries() and listPollTimeoutMs() in src/services/api-client.ts — bidding-list poll retry budget and timeout now derive from live POLL_INTERVAL_MS (worst-case backoff capped at interval/2, timeout clamped [5s, 15s] at 2x interval); default 30s interval keeps exactly today's behavior (3 retries, 15s timeout), aggressive intervals fail fast so cadence recovers via next tick
+- npm run typecheck passed (backend + frontend); stopped at typecheck per Commit & Deploy Policy — no commit
 - Completed opt-in Tier 3 hybrid search plumbing with MEMORY_EMBEDDINGS config, hash/http providers, vector cache signatures, RRF fusion, and lexical-only fallback.
 - Added Thai/CJK character n-gram recall across index and section matching while preserving Latin/code token behavior.
 - Hardened embedding refresh with bounded document batches and cooldown on endpoint errors or malformed provider responses.
 - Documented embedding environment variables in README and recorded the Tier 3 retrieval ADR.
-- Checked project docs and source for memory compaction/token-economy behavior.
-- Confirmed project-memory MCP supports token-budgeted context packs, manual memory_compactVault, and sessionEnd autoCompact.
-- Checked CLAUDE.md and .claude/settings.local.json for Claude Code integration status.
-- Confirmed CLAUDE.md contains Full-Auto project-memory protocol and .claude/settings.local.json enables project-memory with core memory tool allowlist.
-- Reviewed roadmap and follow-up context for project-memory MCP improvements.
-- Prepared prioritized recommendation focused on runtime diagnostics, token economy, retrieval quality, multi-agent safety, and import/export completion.
-- Extended memory_diagnoseWorkspace with an additive doctor section for project/vault/build checks and AI client MCP config diagnostics.
-- Added read-only diagnostics for Claude Code, Codex, Cursor, Windsurf, Zed, OpenCode, and Antigravity local config files.
-- Added machine-readable issue codes including VAULT_AGENT_RULES_MISSING, CLIENT_CONFIG_MISSING_PROJECT_MEMORY, CLIENT_CONFIG_PARSE_ERROR, and CLAUDE_MCP_SERVER_DEFINITION_NOT_LOCAL.
-- Handled UTF-8 BOM-prefixed JSON client configs to avoid false parse-error warnings.
-- Updated the maintenance tool description and README documentation for MCP Doctor output.
-- Added optional doctor.issues[].remediation to MCP Doctor diagnostics with summary/path/snippet/command fields.
-- Added client-specific project-memory config snippets for Codex TOML, Zed context_servers JSON, OpenCode JSON, and mcpServers JSON clients.
-- Added remediation guidance for missing project root, missing vault, missing vault AGENTS.md, vault outside project, missing build info, client parse errors, missing project-memory client configs, missing Claude Code project-local .mcp.json, and no local client configs found.
-- Updated README documentation for the remediation field.
-- Verified built CLI diagnose now includes remediation for the Claude Code project-local .mcp.json info issue.
-- Reviewed current roadmap/follow-up context after MCP Doctor and remediation work.
-- Prepared recommendation to stabilize and verify the newly built MCP Doctor across real clients before starting another feature slice.
-- Confirmed active project-memory MCP runtime is using this repo's dist/index.js and current build info; runtime frontmatter validation for 99_Templates/Template-Daily-Note.md is warning-clean.
-- Strict-reviewed Tier 3 hybrid embedding search and MCP Doctor diagnostics/remediation before starting memory_export/import work.
-- Found and fixed two Tier 3 review defects: vector arm cap was applied before folder/type/tag eligibility, and stale vectors could remain persisted after disabling/changing the embedder signature.
-- Found and fixed one MCP Doctor review defect: inactive example configs could raise parse-error warnings or influence enabled-state inference.
-- Added regression coverage for filtered vector recall, vector cache scrubbing, and inactive example parse errors.
-- Committed implementation as a focused code/docs commit: a20cf48 feat: add hybrid embeddings and MCP doctor diagnostics.
-- Shipped Tier 2 (backlink graph + section-anchor search) to main via PR #6, squash-merged as ac8a8b4.
-- Ran a 6-dimension adversarial multi-agent review of the Tier 2 diff (25 agents); 17 findings confirmed (each independently verified), 2 rejected as correct-by-design.
 
 ## Decisions To Remember
+- Keep CLAUDE.md as the single onboarding doc but split operating protocol (what to do) from lifecycle mechanics (how the gate works in code)
+- Describe IDE product list at summary level so the doc does not rot as products are added
+- Prioritized vault-resolution correctness as P0 over all perf/token work because it breaks the product's core per-project isolation guarantee
+- Grouped 5 independently-confirmed contextPack findings into one P1 refactor (route scoring through rank()/rankHybrid, build booster once, strip usage telemetry from wire format)
+- Disjoint-file ownership across 6 parallel agents instead of worktrees; integration gates (typecheck/tests) run only after merge
+- contextPack relevance = rankFor(BM25)*10 + preset type weight + mistake/ADR bonuses with a zero-relevance gate; empty-terms packs keep type-weight fallback
+- Supersede semantics: null quality gate + endReason 'superseded' rather than per-agent session slots (schema-compatible, removes falsified grade-F telemetry)
+- search scope enum changed from never-honored vault|folder|index to implemented all|title|tags
+- memory_export/memory_import return NOT_IMPLEMENTED errors instead of fabricated ok:true
+- Cache invalidation via writer-refresh + 5s TTL safety net instead of TTL-only or invalidation-only (covers out-of-band SQL edits while keeping in-app reads exact)
+- Adaptive retry budget derived from POLL_INTERVAL_MS instead of hardcoded retries=0 (preserves long-interval recovery behavior unchanged)
+- Fail-fast applies only to bidding-list pages; request-list/overview/accept hops keep full retries since post-detection completion matters more than cadence
 - Embeddings remain off by default; lexical/BM25 behavior remains the default local-first path.
 - Hybrid ranking fuses BM25, vector cosine, and usage arms by Reciprocal Rank Fusion instead of comparing raw scores.
 - Document vectors are persisted only with an active embedder signature and stripped from public search/get/list results.
@@ -99,50 +111,38 @@ Generated: 2026-06-05
 - Snapshot the index once up front in resolveReference (all branches) rather than a second time in get().
 - Defer duplicate-basename folder-aware (Obsidian shortest-path) resolution to a follow-up — LOW severity, does not occur in the current vault; documented in the ensureLinkGraph docstring.
 - Kept broken-link warning dedup and full link-graph rebuild-on-mutation unchanged (both correct-by-design per the review).
-- Documentation-only single-file change; selfCheck intentionally skipped per low-risk criteria
-- Kept README's Thai-language note as the fullest tool-surface reference rather than duplicating it in CLAUDE.md
-- Placed the protocol as an imperative directive at the top of CLAUDE.md (read first) rather than a descriptive note at the bottom, because Claude Code loads CLAUDE.md preferentially and needs the instruction early
-- Kept AGENTS.md/.rules/ADR as the cited source of truth rather than restating every rule verbatim, to avoid drift
-- Advisory/planning task: did not edit code; presented a tiered roadmap and will ask the user which tier to implement
-- Keep everything local-first and feature-flag the embedding tier so the default stays zero-dependency (consistent with the vault's no-lock-in principle)
-- Did NOT edit code this turn, per the prompt's section 15 (survey -> report -> propose plan first)
-- Recovered workflow data from disk transcripts instead of re-running agents, to avoid re-hitting the session limit
-- Spot-verified the two HIGH findings and the duplicate-key hypothesis myself rather than trusting agent output, because the findings are decision-heavy and one agent claim was plausibly wrong
-- Implemented sequentially (not via parallel workflow) because the 6 steps mutate overlapping files (frontmatter.service.ts, frontmatter.ts) and must be verified in order
-- Made backup non-optional on writes rather than just warning, to fully satisfy the prompt's section-11 rule 'never overwrite memory without backup'
-- Kept created=today fabrication in `fix` (the prompt sanctions 'add missing frontmatter / fill created_at' as a SAFE fix) but removed it from `migrate` (which should only stamp versions)
 
 ## Open Follow-ups
+- [ ] Uncommitted src/config/memory.config.ts edit (adds 'devin' to IDE_PRODUCT_DIRS) also corrupted UTF-8 comment chars to U+FFFD at ~6 sites — clean the mojibake before committing
+- [ ] AGENTS.md:19 still cites the non-existent full-auto ADR — either write that ADR via memory_writeADR or drop the citation
+- [ ] memory_export and memory_import remain no-op stubs (also tracked in Auto-Memory-Digest)
+- [ ] README.md line 1 has a committed typo: 'co# Awakened AI Memory MCP Server' (broken H1)
+- [ ] memory_diagnoseWorkspace and the three frontmatter tools are unassigned in the AGENTS.md tier policy — assign tiers
+- [ ] P0: guard dynamic vault resolution (vault-marker requirement before writes; bootstrap should write literal project root, fix entrypoint path one dir above dist/)
+- [ ] P1: contextPack refactor — use BM25/hybrid index, fix dead typeWeight filter, build usage booster once per call, return only {selectedCount,lastSelectedAt} usage
+- [ ] P1: atomic tmp+rename writes for usage.json/lifecycle.json; make memory_awaken non-mutating
+- [ ] P2: trim sessionEnd candidateSessions to counts, dedupe sessionStart followUps/lifecycle blocks, compact JSON in envelope text copy, selfCheck through toPublicRecord
+- [ ] P2: Thai support — Unicode-preserving slugify, Thai keywords in risky-work regex and inferMode, fix n-gram term-frequency dedup
+- [ ] P2: auto-compact churn — raise minSessions, stop re-emitting open follow-ups as unchecked checkboxes, stop resetting digest created/updated
+- [ ] P3 quick wins: .strict() Zod schemas, YYYY-MM-DD date regex, NOT_IMPLEMENTED for export/import, raise SEARCH_TEXT_LIMIT, doctor global-config awareness, isPathWithin case-insensitive on Windows
+- [ ] Carried from before: implement memory_export/memory_import; clean U+FFFD mojibake in memory.config.ts before commit; fix README.md line-1 typo; write the missing full-auto ADR cited by AGENTS.md
+- [ ] Reload MCP clients to pick up the rebuilt dist/index.js; first verifyVault after reload may surface previously-skipped path-style broken wikilinks in the live vault (stricter link validation)
+- [ ] README.md (Thai) still documents the old search scope enum vault|folder|index and old export/import placeholders — update docs; also line-1 typo 'co#' remains
+- [ ] Auto-Memory-Digest heading renamed to 'Unresolved From Source Sessions' — anything grepping for the old 'Open Follow-ups' heading in the digest must adjust
+- [ ] awaken response shape changed (context.contextPack + top-level lifecycle status) — external consumers of the old shape must adapt
+- [ ] Cross-process index staleness (processes never reload index.json after startup) only partially addressed: vector wipes prevented, duplicate embedding work across processes remains
+- [ ] RANK_SCORE_SCALE=10 in contextPack is a heuristic — tune if pack ordering looks relevance-flat on the real vault
+- [ ] Write the missing full-auto ADR cited by AGENTS.md; consider committing this large working-tree change set on the feature branch
+- [ ] User decision: which improvements to implement (B1 rules cache, B2 fail-fast poll, B3 page-1 streaming, B4 adaptive interval)
+- [ ] Check dashboard metrics acceptRtt/detailToFirstMatch/pollLatency to size each fix before implementing
+- [ ] Check logs for booking-detail-concurrency-saturated and bidding-list-fetching-extra-pages to confirm B3/concurrency relevance
+- [ ] User to tune POLL_INTERVAL_MS themselves (1-3s during competition) via Settings UI
+- [ ] Optional next slices not implemented: B3 stream bidding-list page 1, B4 adaptive interval, C1 HTTP/2 experiment
+- [ ] Verify acceptRtt/detailToFirstMatch/pollLatency on dashboard after deploying with low interval
 - [ ] Review/commit the branch worktree separately; git status still contains broad pre-existing memory vault and AGENTS.md changes outside the Tier 3 implementation surface.
 - [ ] Consider a PR for feat/memory-index-tier3-embeddings once the user is ready to ship.
 - [ ] If user wants 100% Claude Code setup audit, inspect Claude Code global/project MCP server definition because this repo has .claude/settings.local.json but no root .mcp.json file visible in the workspace.
 - [ ] Consider adding optional remediation suggestions to doctor.issues, such as the exact config path and snippet to add when a client config is missing project-memory.
-- [ ] Implement memory_export and memory_import so README no longer lists them as placeholders.
-- [ ] Add safe Doctor Auto-Repair as dry-run plan/apply flow, not automatic file mutation.
-- [ ] Optionally add a project-local .mcp.json if this repo should be self-contained for Claude Code; current Doctor reports this as info-only because the server definition may live globally.
-- [ ] Tier 3: optional embedding hybrid search (next memory-index roadmap slice).
-- [ ] Backlink graph: duplicate-basename folder-aware resolution (Obsidian shortest-path) so a bare `dup` link in b/dup.md resolves to b's own folder rather than the lexicographically-first path — LOW, currently documented + deferred.
-- [ ] Optional: add ADR recording the decision to commit obfuscated dist/ output, if not already captured
-- [ ] Pre-existing: 99_Templates/Template-Daily-Note.md has 2 INVALID_DATE_FORMAT placeholder-date warnings (unrelated to this task)
-- [ ] AWAITING USER DECISION: which index roadmap tier to implement first (recommended Tier 1: persistent incremental index + BM25 ranked search fused with usage scoreBoost)
-- [ ] Consider writing an ADR for the index architecture direction once the tier is chosen
-- [ ] Tier 1.1 persistent index should reuse the safe parseFrontmatter + handle add/modify/delete via mtime; Tier 1.2 should fold in MemoryUsageService.scoreBoost so ranking is unified across memory_search and contextPack
-- [ ] Implement Step 1-2 (HIGH safety): make backup mandatory on non-dry-run writes (frontmatter.service.ts + note.service/repository); migrate() skip !hasFrontmatter notes and stop fabricating created=today
-- [ ] Step 3-6: preserve body bytes/line-endings in buildNoteContent; verify+atomic backup; CLI exit codes + --format whitelist; tighten tests (pin DUPLICATE_KEY, add BAD_INDENTATION/INVALID_YAML/tab-indent fixtures) + MigrateSummary renderer
-- [ ] Step 7 long-term: versioned migration registry, numeric schema-version compare, central code/severity enum, line numbers on schema-layer diagnostics, vaultRoot subset-of projectRoot check
-- [ ] Decide how to commit: the frontmatter subsystem (frontmatter.ts/.service.ts/cli.ts/config + tests) is untracked from a prior session and entangled with other uncommitted src changes (app.ts, vault.service.ts, vault-health.service.ts, memory.config.ts) — needs a strict-pr-review pass before committing per the existing follow-up
-- [ ] dist/ was rebuilt locally (obfuscated) to make the MCP runtime reflect the hardening; decide whether to commit the rebuilt bundle per the repo's commit-dist convention
-- [ ] Step 7 (long-term, not done): versioned migration registry (from->to transforms), numeric schema-version comparison, central code/severity enum, line numbers on schema-layer diagnostics, vaultRoot subset-of projectRoot containment check
-- [ ] Optional: snapshot-before-restore in rollback() (currently atomic+skip-on-error but still overwrites live edits without a pre-restore backup)
-- [ ] Decide whether to open a PR for feat/incremental-bm25-index (Tier 1) and/or continue to Tier 2 (backlink graph + section-level chunks) / Tier 3 (optional embedding hybrid search)
-- [ ] Recommend gitignoring .memory-mcp/index.json (derived cache, churns on edits) like dist/ — not done to avoid entangling with the already-dirty .gitignore
-- [ ] Tier 2: real incomingLinks via a link graph built during indexing (the wikilink data is already cheap to capture); section-level chunk index returning section + line anchor
-- [ ] AWAITING EXPLICIT USER CONFIRMATION to squash-merge PR #4 into main (auto-merge denied earlier; needs a clear go-ahead). PR now has 3 commits, 139 tests green, no P0-P3 blockers remaining
-- [ ] The PR #4 squash (frontmatter system + Steps 1-6 + Step 7 + rollback) is now on main; 158 unrelated files remain uncommitted in the working tree (memory/ vault notes, README/AGENTS/CLAUDE.md/.gitignore) — the user's call when/whether to commit those
-- [ ] Optional: commit CLAUDE.md (onboarding doc, currently untracked) if the project wants it in the repo
-- [ ] Optional: add ADR recording that dist/ is a gitignored artifact (not committed), to prevent the confusion that produced the wrong CLAUDE.md line
-- [ ] AWAITING EXPLICIT USER CONFIRMATION to squash-merge PR #4 into main (auto-merge was denied by the classifier; needs a clear go-ahead)
-- [ ] Remaining minor: rollback() still overwrites live edits without a snapshot-before-restore (atomic + skip-on-error mitigate; LOW)
 
 ## Confidence Lessons
 - Generated project configs now reference a real local JSON Schema artifact. -> A local schema artifact is better for project-agnostic reuse than a placeholder remote URL.
@@ -159,6 +159,11 @@ Generated: 2026-06-05
 - Changes preserve the existing 88/B vault health score -> Separating advisory info from the scoring gate avoids breaking backward-compatible health metrics
 
 ## Verification Evidence
+- All facts verified against source by parallel audit agents with file:line evidence (e.g. 32 tools counted via registerTool grep across 6 controllers; resolution order traced in memory.config.ts:730-778; embedder env in embedding.config.ts:8-90; stubs at maintenance.controller.ts:59-65). Single-file doc edit; typecheck/tests not applicable.
+- Read-only analysis; no source changes. Every finding was verified by an independent skeptic agent reading the cited code (several included runtime measurements, e.g. 190x usage.json reads = ~350ms reproduced, byte-exact file sizes). 1 finding rejected for fabricated evidence, demonstrating the verification layer filtered false positives. Full results: workflow wf_d0260d55-0d3 output file.
+- npm run typecheck: clean. npm test: 364/364 pass (one cross-package conflict found and fixed: schema-version now stamped as numeric CURRENT_SCHEMA_VERSION so the hardened yamlScalar does not quote it). npm run build: success. Bootstrap entrypoint fix diff-reviewed by hand. memory_selfCheck was run before implementation.
+- Read-only analysis; no code changes, no commands run. Claims grounded in cited source lines.
+- npm run typecheck exit 0 (tsc backend + frontend). No runtime test run — db/smoke/flow tests hit live SPX/MySQL per AGENTS.md.
 - Ran targeted Node tests for memory-query and retrieval helpers, then ran full `npm test` after the final README edit: 237 tests passed, 0 failed. Ran `npm run build` after the final README edit: build completed successfully for dist/index.js and dist/cli.js.
 - Read README.md, memory notes, src/services/memory-compaction.service.ts, src/services/memory-workflow.service.ts, and src/schemas/memory.ts via rg/Get-Content. No code changes or tests were needed for this explanatory answer.
 - Read CLAUDE.md, .claude/settings.local.json, AI Client setup notes, and related session logs using Get-Content/rg. No code changes or tests were needed for this explanatory answer.
@@ -174,13 +179,13 @@ Generated: 2026-06-05
 - Empirical: Node probe of installed gray-matter@4.0.3 confirmed throw/no-throw behavior for duplicate-key, unquoted-colon, bad-indent, tab-indent. Code reads confirmed migrate->computeRewrite fabrication path (frontmatter.service.ts:217-257,294-342) and body-strip (utils/frontmatter.ts:250-254). Live MCP validateFrontmatter + verifyVault rechecked (clean). No code changed.
 - npm test => 129 pass / 0 fail (35 suites). tsc --noEmit clean. npm run build green (esbuild + obfuscator, dist rebuilt). Live CLI smoke on ./memory: validate 151/151 valid 0 issues; migrate dry-run text renderer shows would-migrate 143 manual 0; validate --format xml -> 'Invalid --format' exit 2; fix --apply --no-backup -> mandatory-backup warning. No live vault note was mutated (all dry-run/read-only).
 - tsc --noEmit clean; npm test 158 pass / 0 fail (42 suites); npm run build green; perf smoke (dist-test, 200-file temp vault): cold 114ms (build index), warm ~28ms/query (no re-parse of unchanged files). Live vault not mutated (tests/smoke used temp dirs).
-- tsc --noEmit clean; npm test 139 pass / 0 fail (37 suites); npm run build green. New test asserts rollback writes the edited content to snapshotDir and restores the original. No live vault note mutated.
-- git diff --stat HEAD origin/main was empty before switching (trees identical). After: git branch --show-current=main, git log -1=88e1ea3, git rev-list --left-right --count origin/main...HEAD = 0 0, git status dirty count unchanged at 158. .gitignore confirmed dist/ is ignored.
-- tsc --noEmit clean; npm test 138 pass / 0 fail (37 suites); npm run build green; live CLI smoke: `diagnose` -> vaultWithinProject:true, `migrate --vault ./memory` dry-run -> 145 would-migrate, 0 manual. No live vault note mutated. Changes committed (8486881) + pushed to origin PR #4.
-- npm test passed (118 tests, 33 suites). npm run typecheck passed. npm run build passed and emitted dist/build-info.json. node dist\cli.js diagnose selected C:\Users\Server\Desktop\Awakened-AI-System from cwd and included build version metadata. node dist\cli.js validate --format json passed with 146/146 valid and zero diagnostics. memory_validateFrontmatter passed with 146/146 valid and zero info/warning/error/critical diagnostics. memory_verifyVault passed with score 88 grade B and 0 warnings/errors.
-- npm test passed 111/111; npm run typecheck passed; npm run build passed; node dist/cli.js init --vault <temp> created both .memory-mcp/frontmatter.config.json and .memory-mcp/frontmatter.config.schema.json with ConfigSchema=./frontmatter.config.schema.json and SchemaTitle='Memory Vault frontmatter config'; node dist/cli.js validate --format json on the real vault reports critical=0,error=0,warning=0,info=380,blockedFiles=0; node dist/cli.js validate --path 99_Templates/Template-Daily-Note.md reports 0 issues; memory_verifyVault reports score=88/B with 0 critical, 0 errors, 0 warnings.
 
 ## Source Sessions
+- [[05_Agent_Session_Logs/2026-06-11-refresh-claude-md-via-init-verify-all-claims-against-current-code-and-document-tier-1-3-search-embeddings-env-mcp-doctor-lifecycle-mechanics|2026-06-11-refresh-claude-md-via-init-verify-all-claims-against-current-code-and-document-tier-1-3-search-embeddings-env-mcp-doctor-lifecycle-mechanics.md]]
+- [[05_Agent_Session_Logs/2026-06-11-deep-multi-agent-audit-of-memory-mcp-server-86-adversarially-verified-improvement-findings-across-8-dimensions|2026-06-11-deep-multi-agent-audit-of-memory-mcp-server-86-adversarially-verified-improvement-findings-across-8-dimensions.md]]
+- [[05_Agent_Session_Logs/2026-06-11-implement-all-audit-fixes-p0-vault-resolution-safety-contextpack-bm25-refactor-atomic-state-writes-thai-language-support-token-economy-trims-api-hardening|2026-06-11-implement-all-audit-fixes-p0-vault-resolution-safety-contextpack-bm25-refactor-atomic-state-writes-thai-language-support-token-economy-trims-api-hardening.md]]
+- [[05_Agent_Session_Logs/2026-06-10-analyze-spx-accept-speed-critical-path-and-propose-improvements|2026-06-10-analyze-spx-accept-speed-critical-path-and-propose-improvements.md]]
+- [[05_Agent_Session_Logs/2026-06-10-implement-b1-rules-cache-and-b2-fail-fast-list-poll-for-accept-speed|2026-06-10-implement-b1-rules-cache-and-b2-fail-fast-list-poll-for-accept-speed.md]]
 - [[05_Agent_Session_Logs/2026-06-05-continue-memory-index-tier-3-hybrid-embedding-search|2026-06-05-continue-memory-index-tier-3-hybrid-embedding-search.md]]
 - [[05_Agent_Session_Logs/2026-06-05-answer-compact-memory-behavior-in-project-memory-mcp|2026-06-05-answer-compact-memory-behavior-in-project-memory-mcp.md]]
 - [[05_Agent_Session_Logs/2026-06-05-answer-claude-code-integration-status|2026-06-05-answer-claude-code-integration-status.md]]
@@ -206,8 +211,3 @@ Generated: 2026-06-05
 - [[05_Agent_Session_Logs/2026-06-01-document-runtime-refresh-workflow-for-stale-project-memory-mcp-frontmatter-diagnostics|2026-06-01-document-runtime-refresh-workflow-for-stale-project-memory-mcp-frontmatter-diagnostics.md]]
 - [[05_Agent_Session_Logs/2026-06-01-harden-frontmatter-warning-system-and-safety-defaults|2026-06-01-harden-frontmatter-warning-system-and-safety-defaults.md]]
 - [[05_Agent_Session_Logs/2026-06-01-implement-option-c-hybrid-frontmatter-system-for-project-memory-mcp-safe-parser-schema-fix-migrate-report-cli-mcp-tools-tests|2026-06-01-implement-option-c-hybrid-frontmatter-system-for-project-memory-mcp-safe-parser-schema-fix-migrate-report-cli-mcp-tools-tests.md]]
-- [[05_Agent_Session_Logs/2026-06-01-memory-vault-analysis-quality-gate-check|2026-06-01-memory-vault-analysis-quality-gate-check.md]]
-- [[05_Agent_Session_Logs/2026-06-01-memory-vault-frontmatter-system-analysis-and-standardization-design|2026-06-01-memory-vault-frontmatter-system-analysis-and-standardization-design.md]]
-- [[05_Agent_Session_Logs/2026-06-01-memory-vault-system-structure-analysis|2026-06-01-memory-vault-system-structure-analysis.md]]
-- [[05_Agent_Session_Logs/2026-06-01-populate-empty-outcomes-in-2-stub-session-logs-to-clear-missing-required-field-errors|2026-06-01-populate-empty-outcomes-in-2-stub-session-logs-to-clear-missing-required-field-errors.md]]
-- [[05_Agent_Session_Logs/2026-06-01-re-verify-after-mcp-restart-99-templates-warnings-fix-confirmed-0-warnings|2026-06-01-re-verify-after-mcp-restart-99-templates-warnings-fix-confirmed-0-warnings.md]]
