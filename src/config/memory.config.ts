@@ -300,6 +300,11 @@ const IDE_PRODUCT_DIRS = [
 const OPENCODE_PRODUCT_DIR = "ai.opencode.desktop";
 const OPENCODE_GLOBAL_FILE = "opencode.global.dat";
 
+// ZCode stores desktop workspace state under the user's home directory instead
+// of APPDATA. `lastWorkspaceSession[lastActiveTabIndex]` is the active tab,
+// while `recentProjects` is a weaker fallback when no active tab is available.
+const ZCODE_SETTING_FILE = join(".zcode", "v2", "setting.json");
+
 // Zed persists recent workspaces in a SQLite database. We probe each release
 // channel because users may run a stable, preview, or dev build of Zed. The
 // schema we care about: `workspaces.paths` (JSON-encoded list of folder
@@ -455,6 +460,11 @@ function ideStorageFiles(env: NodeJS.ProcessEnv, platform: NodeJS.Platform): str
 
 function opencodeGlobalFiles(env: NodeJS.ProcessEnv, platform: NodeJS.Platform): string[] {
   return ideAppDataRoots(env, platform).map((root) => join(root, OPENCODE_PRODUCT_DIR, OPENCODE_GLOBAL_FILE));
+}
+
+function zcodeSettingFiles(env: NodeJS.ProcessEnv): string[] {
+  const home = env.USERPROFILE || env.HOME;
+  return home ? [join(home, ZCODE_SETTING_FILE)] : [];
 }
 
 /**
@@ -670,6 +680,90 @@ function readOpencodeWorkspaceCandidates(
   return candidates;
 }
 
+function zcodeWorkspacePath(entry: unknown): string | undefined {
+  if (typeof entry === "string") {
+    return entry.startsWith("file://") ? decodeFileUri(entry) ?? entry : entry;
+  }
+  if (!entry || typeof entry !== "object") {
+    return undefined;
+  }
+  const data = entry as Record<string, unknown>;
+  if (typeof data.kind === "string" && data.kind !== "local") {
+    return undefined;
+  }
+  const raw = data.workspacePath ?? data.path;
+  if (typeof raw !== "string") {
+    return undefined;
+  }
+  return raw.startsWith("file://") ? decodeFileUri(raw) ?? raw : raw;
+}
+
+function readZcodeWorkspaceCandidates(
+  env: NodeJS.ProcessEnv,
+  fs: { existsSync: typeof existsSync; readFileSync: typeof readFileSync } = { existsSync, readFileSync },
+): IdeWorkspaceCandidate[] {
+  const candidates: IdeWorkspaceCandidate[] = [];
+  for (const file of zcodeSettingFiles(env)) {
+    if (!fs.existsSync(file)) continue;
+    let raw: string;
+    try {
+      raw = fs.readFileSync(file, "utf-8");
+    } catch {
+      continue;
+    }
+    let data: unknown;
+    try {
+      data = JSON.parse(raw);
+    } catch {
+      continue;
+    }
+    if (!data || typeof data !== "object") continue;
+    const root = data as Record<string, unknown>;
+    let mtimeMs = 0;
+    try {
+      mtimeMs = statSync(file).mtimeMs;
+    } catch {
+      mtimeMs = 0;
+    }
+
+    const sessions = Array.isArray(root.lastWorkspaceSession) ? root.lastWorkspaceSession : [];
+    const activeIndex = typeof root.lastActiveTabIndex === "number" && Number.isInteger(root.lastActiveTabIndex)
+      ? root.lastActiveTabIndex
+      : -1;
+    let activePathRecorded = false;
+    if (activeIndex >= 0 && activeIndex < sessions.length) {
+      const activePath = zcodeWorkspacePath(sessions[activeIndex]);
+      if (activePath) {
+        candidates.push({ path: activePath, lastActive: true, mtimeMs });
+        activePathRecorded = true;
+      }
+    }
+    sessions.forEach((entry, index) => {
+      if (index === activeIndex) return;
+      const path = zcodeWorkspacePath(entry);
+      if (path) {
+        candidates.push({ path, lastActive: false, mtimeMs });
+      }
+    });
+
+    const recentProjects = Array.isArray(root.recentProjects) ? root.recentProjects : [];
+    recentProjects.forEach((entry, index) => {
+      const path = zcodeWorkspacePath(entry);
+      if (path) {
+        candidates.push({ path, lastActive: !activePathRecorded && index === 0, mtimeMs });
+      }
+    });
+  }
+  return candidates;
+}
+
+function isZcodeRuntimeCwd(cwd: string | undefined, env: NodeJS.ProcessEnv, platform: NodeJS.Platform): boolean {
+  if (!cwd) return false;
+  const home = env.USERPROFILE || env.HOME;
+  if (!home) return false;
+  return isPathWithin(join(home, ".zcode"), cwd, platform);
+}
+
 interface IdeWorkspaceCandidate {
   /** Decoded absolute path. */
   path: string;
@@ -782,15 +876,21 @@ function pickIdeActiveWorkspace(candidates: IdeWorkspaceCandidate[]): string | u
 function findIdeActiveWorkspace(
   env: NodeJS.ProcessEnv,
   platform: NodeJS.Platform = nodePlatform(),
+  cwd?: string,
 ): string | undefined {
   const vscodeLike = readIdeWorkspaceCandidates(env, platform);
   const opencode = readOpencodeWorkspaceCandidates(env, platform);
   const zed = readZedWorkspaceCandidates(env, platform);
+  const zcode = readZcodeWorkspaceCandidates(env);
+  if (isZcodeRuntimeCwd(cwd, env, platform)) {
+    const zcodeWorkspace = pickIdeActiveWorkspace(zcode);
+    if (zcodeWorkspace) return zcodeWorkspace;
+  }
   // VS Code-derived state is generally fresher (the IDE writes it on every
-  // window focus); list it first so the dedup pass keeps that variant. Zed
-  // and OpenCode are appended afterwards so they only fill gaps for users
+  // window focus); list it first so the dedup pass keeps that variant. Other
+  // IDE-specific readers are appended afterwards so they fill gaps for users
   // who do not run any VS Code-derived IDE alongside.
-  return pickIdeActiveWorkspace([...vscodeLike, ...opencode, ...zed]);
+  return pickIdeActiveWorkspace([...vscodeLike, ...opencode, ...zed, ...zcode]);
 }
 
 interface DynamicRootResolution {
@@ -841,7 +941,7 @@ function resolveDynamicProjectRoot(
 
   // Pass 3 — IDE state fills the MCP-server case where cwd is usually the
   // client install directory rather than the user's project.
-  const ideWorkspace = findIdeActiveWorkspace(env);
+  const ideWorkspace = findIdeActiveWorkspace(env, nodePlatform(), cwd);
   if (ideWorkspace) {
     const workspaceRoot = findWorkspaceRoot(ideWorkspace, homeDir);
     if (workspaceRoot) {
@@ -956,7 +1056,7 @@ function workspaceDiagnosticCandidates(env: NodeJS.ProcessEnv, cwd: string, sele
     }
   }
 
-  const ideWorkspace = findIdeActiveWorkspace(env);
+  const ideWorkspace = findIdeActiveWorkspace(env, nodePlatform(), cwd);
   if (ideWorkspace) {
     candidates.push(candidateFromValue("IDE_STATE", ideWorkspace, selectedRoot));
   }
@@ -1658,12 +1758,15 @@ export const __internals = {
   unescapeJsonString,
   ideStorageFiles,
   opencodeGlobalFiles,
+  zcodeSettingFiles,
   extractOpencodeDirectories,
   zedDbFiles,
   decodeZedPathsColumn,
   readIdeWorkspaceCandidates,
   readOpencodeWorkspaceCandidates,
   readZedWorkspaceCandidates,
+  readZcodeWorkspaceCandidates,
+  isZcodeRuntimeCwd,
   pickIdeActiveWorkspace,
   findIdeActiveWorkspace,
   resolveDynamicProjectRoot,

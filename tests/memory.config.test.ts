@@ -1,8 +1,8 @@
 import { strict as assert } from "node:assert";
 import type { existsSync as ExistsSync, readFileSync as ReadFileSync } from "node:fs";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, parse, resolve } from "node:path";
+import { dirname, join, parse, resolve } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import { pathToFileURL } from "node:url";
 import { __internals, diagnoseMemoryConfig, loadMemoryConfig } from "../src/config/memory.config.js";
@@ -578,6 +578,75 @@ describe("findIdeActiveWorkspace (storage.json on disk)", () => {
     );
     assert.ok(detected, "expected a detected path");
     assert.equal(resolve(detected!).toLowerCase(), resolve(projectDir).toLowerCase());
+  });
+
+  it("locates the workspace from ZCode setting.json last active tab state", () => {
+    const zcodeHome = join(tmpRoot, "zcode-home");
+    const activeProject = join(tmpRoot, "zcode-active");
+    const otherProject = join(tmpRoot, "zcode-other");
+    mkdirSync(join(activeProject, "memory"), { recursive: true });
+    mkdirSync(join(otherProject, "memory"), { recursive: true });
+    mkdirSync(join(zcodeHome, ".zcode", "v2"), { recursive: true });
+    writeFileSync(join(activeProject, "memory", "AGENTS.md"), "# active vault\n");
+    writeFileSync(join(otherProject, "memory", "AGENTS.md"), "# other vault\n");
+    writeFileSync(
+      join(zcodeHome, ".zcode", "v2", "setting.json"),
+      JSON.stringify({
+        lastActiveTabIndex: 1,
+        lastWorkspaceSession: [
+          { kind: "local", workspacePath: otherProject },
+          { kind: "local", workspacePath: activeProject },
+        ],
+        recentProjects: [otherProject, activeProject],
+      }),
+    );
+
+    const detected = findIdeActiveWorkspace(
+      { APPDATA: join(tmpRoot, "missing-appdata"), USERPROFILE: zcodeHome } as NodeJS.ProcessEnv,
+      "win32",
+    );
+
+    assert.ok(detected, "expected a detected ZCode path");
+    assert.equal(resolve(detected!).toLowerCase(), resolve(activeProject).toLowerCase());
+  });
+
+  it("prefers ZCode state over other IDE state when launched from ZCode cwd", () => {
+    const zcodeHome = join(tmpRoot, "zcode-home");
+    const zcodeCli = join(zcodeHome, ".zcode", "cli");
+    const appData = join(tmpRoot, "appdata");
+    const zcodeProject = join(tmpRoot, "zcode-project");
+    const windsurfProject = join(tmpRoot, "windsurf-project");
+    const windsurfStorage = join(appData, "Windsurf", "User", "globalStorage", "storage.json");
+    const zcodeSetting = join(zcodeHome, ".zcode", "v2", "setting.json");
+    mkdirSync(join(zcodeProject, "memory"), { recursive: true });
+    mkdirSync(join(windsurfProject, "memory"), { recursive: true });
+    mkdirSync(dirname(windsurfStorage), { recursive: true });
+    mkdirSync(dirname(zcodeSetting), { recursive: true });
+    mkdirSync(zcodeCli, { recursive: true });
+    writeFileSync(join(zcodeProject, "memory", "AGENTS.md"), "# zcode vault\n");
+    writeFileSync(join(windsurfProject, "memory", "AGENTS.md"), "# windsurf vault\n");
+    writeFileSync(
+      windsurfStorage,
+      JSON.stringify({ windowsState: { lastActiveWindow: { folder: toFileUri(windsurfProject) } } }),
+    );
+    writeFileSync(
+      zcodeSetting,
+      JSON.stringify({
+        lastActiveTabIndex: 0,
+        lastWorkspaceSession: [{ kind: "local", workspacePath: zcodeProject }],
+        recentProjects: [zcodeProject],
+      }),
+    );
+    utimesSync(zcodeSetting, new Date("2026-01-01T00:00:00Z"), new Date("2026-01-01T00:00:00Z"));
+    utimesSync(windsurfStorage, new Date("2026-01-02T00:00:00Z"), new Date("2026-01-02T00:00:00Z"));
+
+    const result = loadMemoryConfig(
+      { MEMORY_PROJECT_ROOT: "dynamic", APPDATA: appData, USERPROFILE: zcodeHome } as NodeJS.ProcessEnv,
+      zcodeCli,
+    );
+
+    assert.equal(resolve(result.projectRoot).toLowerCase(), resolve(zcodeProject).toLowerCase());
+    assert.equal(result.resolution.source, "ide-state");
   });
 });
 
