@@ -30,6 +30,7 @@ function serialize(value: unknown, ancestors: Set<object>): string {
   try {
     const descriptors = Object.getOwnPropertyDescriptors(value);
     if (Array.isArray(value)) {
+      if (Object.getPrototypeOf(value) !== Array.prototype) invalid();
       const length = descriptors.length?.value;
       if (!Number.isSafeInteger(length) || length < 0) invalid();
 

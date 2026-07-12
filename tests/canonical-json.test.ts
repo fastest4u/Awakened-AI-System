@@ -47,4 +47,11 @@ describe("canonicalJson", () => {
     assert.equal(getterCalls, 0);
     assert.throws(() => canonicalJson(new Example()), /CANONICAL_JSON_INVALID/);
   });
+
+  it("rejects Array subclass instances", () => {
+    class ExampleArray extends Array {}
+    const value = new ExampleArray();
+    value.push(1, 2);
+    assert.throws(() => canonicalJson(value), /CANONICAL_JSON_INVALID/);
+  });
 });
