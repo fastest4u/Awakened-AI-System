@@ -21,8 +21,12 @@ const descriptor: ProjectDescriptorV1 = {
 
 const notRepositoryDiagnostic =
   "fatal: not a git repository (or any of the parent directories): .git\n";
-const unbornHeadDiagnostic =
-  "fatal: ambiguous argument 'HEAD': unknown revision or path not in the working tree.\n";
+const unbornHeadDiagnostic = [
+  "fatal: ambiguous argument 'HEAD': unknown revision or path not in the working tree.",
+  "Use '--' to separate paths from revisions, like this:",
+  "'git <command> [<revision>...] -- [<file>...]'",
+  "",
+].join("\n");
 
 describe("GitWorkspaceResolver", () => {
   let root: string | undefined;
@@ -246,6 +250,27 @@ describe("GitWorkspaceResolver", () => {
       "rev-parse HEAD",
       "symbolic-ref -q HEAD",
     ]);
+  });
+
+  it("classifies a real unborn repository through SpawnSync as not ready", () => {
+    root = mkdtempSync(join(tmpdir(), "memory-git-real-unborn-"));
+    const projectRoot = join(root, "unborn repository");
+    mkdirSync(projectRoot);
+    const runner = new SpawnSyncGitCommandRunner();
+    const initResult = runner.run(projectRoot, ["init", "--quiet"]);
+    assert.equal(initResult.exitCode, 0, initResult.stderr);
+
+    assert.deepEqual(runner.run(projectRoot, ["rev-parse", "HEAD"]), {
+      exitCode: 128,
+      stdout: "HEAD\n",
+      stderr: unbornHeadDiagnostic,
+    });
+    assert.throws(
+      () => new GitWorkspaceResolver(runner).inspect(projectRoot, descriptor),
+      (error: unknown) => error instanceof GitWorkspaceResolutionError
+        && error.code === "GIT_WORKSPACE_NOT_READY"
+        && error.reason === "UNBORN_HEAD",
+    );
   });
 
   for (const [caseName, headFailure] of [

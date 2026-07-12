@@ -62,8 +62,18 @@ export class GitWorkspaceResolutionError extends Error {
 
 const notRepositoryDiagnostic =
   /^fatal: not a git repository \(or any of the parent directories\): \.git(?:\r?\n)?$/;
-const unbornHeadDiagnostic =
-  /^fatal: ambiguous argument 'HEAD': unknown revision or path not in the working tree\.(?:\r?\n)?$/;
+const unbornHeadFatal =
+  "fatal: ambiguous argument 'HEAD': unknown revision or path not in the working tree.";
+const unbornHeadHint = [
+  "Use '--' to separate paths from revisions, like this:",
+  "'git <command> [<revision>...] -- [<file>...]'",
+];
+const knownUnbornHeadDiagnostics = new Set([
+  `${unbornHeadFatal}\n`,
+  `${unbornHeadFatal}\r\n`,
+  [unbornHeadFatal, ...unbornHeadHint, ""].join("\n"),
+  [unbornHeadFatal, ...unbornHeadHint, ""].join("\r\n"),
+]);
 
 function parseSingleLineOutput(stdout: string): string {
   const value = stdout.endsWith("\r\n")
@@ -202,7 +212,7 @@ export class GitWorkspaceResolver {
       headResult.exitCode === 128
       && branchRef !== null
       && /^(?:HEAD|HEAD\r?\n)$/.test(headResult.stdout)
-      && unbornHeadDiagnostic.test(headResult.stderr)
+      && knownUnbornHeadDiagnostics.has(headResult.stderr)
     ) {
       throw new GitWorkspaceResolutionError("GIT_WORKSPACE_NOT_READY", "UNBORN_HEAD");
     }
