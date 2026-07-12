@@ -2,9 +2,11 @@
 
 Status: Approved architecture design
 Date: 2026-07-11
-Runtime floor: Node.js 22.13.0
-Recommended runtime: Node.js 24 LTS line
-Decision record: memory/04_Architecture_Decisions/adopt-a-strictly-isolated-full-event-sourced-project-memory-orchestrator.md
+Runtime floor: Node.js 22.22.3 with runtime SQLite 3.51.3 or newer
+Recommended runtime: Node.js 24.16.0 or newer within the supported Node.js 24 LTS line
+Current decision record: memory/04_Architecture_Decisions/adopt-a-strictly-isolated-full-event-sourced-project-memory-orchestrator-2.md
+Historical decision record: memory/04_Architecture_Decisions/adopt-a-strictly-isolated-full-event-sourced-project-memory-orchestrator.md (its Node.js 22.13 runtime clause is superseded)
+Runtime safety decision: memory/04_Architecture_Decisions/require-a-wal-safe-sqlite-runtime-for-the-event-sourced-memory-store.md
 
 ## 1. Decision summary
 
@@ -80,8 +82,8 @@ The pre-change baseline is 406 passing tests plus a passing TypeScript typecheck
 
 ### 3.3 Operational goals
 
-- Run unflagged on Node.js 22.13.0 or newer.
-- Recommend Node.js 24 while insulating storage code from release-candidate API changes.
+- Run unflagged on Node.js 22.22.3 or newer and fail closed unless runtime SQLite is 3.51.3 or newer.
+- Recommend Node.js 24.16.0 or newer within the supported Node.js 24 LTS line while insulating storage code from release-candidate API changes.
 - Permit multiple MCP server processes to use the same project safely.
 - Keep legacy Markdown memory available throughout migration and rollback.
 - Detect identity mismatch, corruption, projection lag, broken lineage, and incomplete session closure.
@@ -253,15 +255,19 @@ Retrieval defaults to includeGlobal=false. When enabled, local project results a
 
 ## 7. Runtime and SQLite contract
 
-Node.js 22.13.0 is the minimum because node:sqlite is available without the experimental enable flag from that release line. Node.js 24 is recommended. The Node.js 24 documentation currently labels node:sqlite as a release candidate, so all direct API use sits behind a SqliteDriver interface and a startup capability probe.
+Node.js 22.22.3 is the minimum because it combines unflagged node:sqlite with bundled SQLite 3.51.3, the first upstream release that fixes the WAL-reset corruption bug affecting concurrent writers or checkpointers in separate threads or processes. Node.js 24.16.0 or newer within the supported Node.js 24 LTS line is recommended. All new authoritative-store API use sits behind a SqliteDriver interface and a startup capability probe; the pre-existing optional Zed workspace-diagnostic shim remains non-authorizing and is not reused by the event store.
+
+The runtime gate checks both process.versions.node and SELECT sqlite_version(). Production multi-process WAL mode fails closed unless Node.js is 22.22.3 or newer, node:sqlite can be loaded, and SQLite is 3.51.3 or newer. A semver declaration alone is insufficient because node:sqlite may be disabled and future runtime packaging can change the bundled SQLite engine.
 
 The driver must prove support for:
 
 - DatabaseSync;
+- SQLite 3.51.3 or newer at runtime;
 - prepared statements and bound parameters;
 - required PRAGMAs;
 - transactions with BEGIN IMMEDIATE, COMMIT, and ROLLBACK;
-- FTS5 for lexical projections, or a tested local fallback;
+- functional FTS5 create, insert, and query behavior for lexical projections, or a tested local fallback;
+- confirmed WAL activation rather than requested-WAL configuration alone;
 - consistent backup through either the runtime backup API or the quiesced snapshot path.
 
 Each writer connection applies and verifies:
@@ -314,7 +320,7 @@ Every event contains:
 - sessionId and optional parentSessionId;
 - trusted actorRole from the adapter binding plus attributed agentId and clientInstanceId;
 - correlationId and optional causationId;
-- commandId and idempotencyKey;
+- commandId, idempotencyKey, and zero-based commandEventIndex;
 - occurredAt supplied by the domain and recordedAt assigned by the store;
 - visibilityScope;
 - confidence and verificationStatus;
@@ -326,14 +332,15 @@ The database enforces:
 
 - UNIQUE eventId;
 - UNIQUE projectId plus streamId plus streamVersion;
-- UNIQUE projectId plus idempotencyKey;
+- UNIQUE projectId plus commandId plus commandEventIndex;
+- UNIQUE projectId plus idempotencyKey in command_dedup, not events;
 - foreign keys from evidence and outbox records;
 - project identity equality with project_meta;
 - non-empty event type, schema version, recorded time, and hashes.
 
 eventHash is SHA-256 over a versioned canonical serialization of the immutable envelope, payloadHash, evidence ciphertext hashes, keyed content fingerprints, and previousGlobalHash. An evidence fingerprint is HMAC-SHA-256 over redacted plaintext using a project fingerprint key; a raw plaintext hash is never stored because it can enable dictionary attacks against short content. The chain is tamper-evident, not tamper-proof against a local administrator who can rewrite the full database. Verified backup manifests can be signed by a project integrity key to make unauthorized historical replacement detectable across snapshots.
 
-Every mutating command requires commandId and a client-persisted, globally unique idempotencyKey minted before the first send. commandType is part of commandHash. Reusing a key for another command type or payload is always IDEMPOTENCY_CONFLICT. Strict primary mode never derives a key from a transient MCP request ID.
+Every mutating command requires commandId and a client-persisted, globally unique idempotencyKey minted before the first send. commandType is part of commandHash. Reusing a key for another command type or payload is always IDEMPOTENCY_CONFLICT. Strict primary mode never derives a key from a transient MCP request ID. Idempotency is enforced once per command in command_dedup so one atomic command may append multiple events; each event carries commandEventIndex and events enforces uniqueness of projectId plus commandId plus commandEventIndex. events.idempotencyKey remains indexed for audit and lineage but is not unique.
 
 ### 8.3 Immutability and correction
 
@@ -363,7 +370,7 @@ For a single-transaction mutating command:
 6. If the key exists with the same commandHash, reconstruct the canonical public response at its committed event range without another semantic append.
 7. If the key exists with a different commandHash, return IDEMPOTENCY_CONFLICT.
 8. Read and compare the expected stream version.
-9. Insert evidence, event rows, updated stream version, canonical public response, command_dedup, and outbox work.
+9. Insert evidence, all event rows with contiguous commandEventIndex values starting at zero, updated stream version, canonical public response, one command_dedup row, and outbox work.
 10. COMMIT.
 11. Notify projectors and wait for the command's required consistency level.
 
@@ -877,7 +884,7 @@ The server never repairs authoritative events by guessing. It can rebuild projec
 
 On runtimes with a proven node:sqlite online backup capability, the BackupProvider uses it and verifies the resulting SQLite file and manifest.
 
-The Node.js 22.13-compatible fallback:
+The Node.js 22.22.3-compatible fallback:
 
 1. uses compare-and-swap to acquire a maintenance epoch with owner, fencing token, and deadline;
 2. makes every new write transaction observe that epoch inside BEGIN IMMEDIATE and wait or fail before appending;
@@ -1002,7 +1009,7 @@ Operational logs never include session handles, encryption keys, unredacted evid
 
 - Event canonicalization and hash vectors.
 - Event schema validation and upcasting.
-- Idempotency replay and conflicting-key rejection.
+- Multi-event command idempotency replay, stable commandEventIndex ordering, and conflicting-key rejection.
 - Optimistic stream concurrency.
 - Rejection when a self-consistent heuristic candidate differs from the trusted ProjectBinding.
 - Project/workspace/branch eligibility, lineage, and freshness resolution.
@@ -1228,4 +1235,8 @@ The following are valid future programs but do not block this design:
 - Current configuration and workspace detection: src/config/memory.config.ts
 - Node.js SQLite API: https://nodejs.org/docs/latest-v24.x/api/sqlite.html
 - Node.js command-line SQLite availability: https://nodejs.org/docs/latest-v24.x/api/cli.html
+- SQLite WAL-reset bug and fixed-version guidance: https://www.sqlite.org/wal.html#the_wal_reset_bug
+- SQLite 3.51.3 release: https://sqlite.org/releaselog/3_51_3.html
+- Node.js 22.22.3 release: https://nodejs.org/uk/blog/release/v22.22.3
+- Node.js 24.16.0 release: https://nodejs.org/en/blog/release/v24.16.0
 - Audit insight: memory/07_Insights/single-active-lifecycle-causes-session-ownership-inversion-in-multi-agent-workfl.md
