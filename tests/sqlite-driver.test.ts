@@ -3,6 +3,7 @@ import { execFileSync } from "node:child_process";
 import {
   existsSync,
   mkdtempSync,
+  mkdirSync,
   rmSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -162,6 +163,32 @@ describe("runtime SQLite capabilities", () => {
     assert.equal(report.checks.nodeSqlite, true);
     assert.equal(report.checks.sqliteVersionAtLeastMinimum, false);
     assert.equal(existsSync(missingParent), false);
+  });
+
+  it("closes the disposable database after a post-open capability failure", async () => {
+    const directory = temporaryDirectory();
+    const probePath = join(directory, "capability.sqlite");
+    const prepared = new DatabaseSync(probePath);
+    try {
+      prepared.exec("CREATE TABLE capability_fts(content TEXT NOT NULL) STRICT");
+    } finally {
+      prepared.close();
+    }
+
+    const report = await probeRuntimeCapabilities(probePath);
+
+    assert.equal(report.ok, false);
+    if (report.ok) assert.fail("probe unexpectedly succeeded");
+    assert.equal(report.code, "SQLITE_CAPABILITY_MISSING");
+    assert.equal(report.checks.sqliteVersionAtLeastMinimum, true);
+    assert.equal(report.checks.wal, true);
+    assert.equal(report.checks.fts5, false);
+
+    rmSync(directory, { recursive: true });
+    assert.equal(existsSync(directory), false);
+    mkdirSync(directory);
+    const reopened = new DatabaseSync(probePath);
+    reopened.close();
   });
 });
 
