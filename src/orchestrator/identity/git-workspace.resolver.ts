@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
+import { isAbsolute } from "node:path";
 import { assertContainedPath, canonicalExistingDirectory } from "./canonical-path.js";
 import type {
   ProjectDescriptorV1,
@@ -59,6 +60,11 @@ export class GitWorkspaceResolutionError extends Error {
   }
 }
 
+const notRepositoryDiagnostic =
+  /^fatal: not a git repository \(or any of the parent directories\): \.git(?:\r?\n)?$/;
+const unbornHeadDiagnostic =
+  /^fatal: ambiguous argument 'HEAD': unknown revision or path not in the working tree\.(?:\r?\n)?$/;
+
 function parseSingleLineOutput(stdout: string): string {
   const value = stdout.endsWith("\r\n")
     ? stdout.slice(0, -2)
@@ -73,6 +79,9 @@ function parseSingleLineOutput(stdout: string): string {
 
 function canonicalGitDirectory(stdout: string): string {
   const path = parseSingleLineOutput(stdout);
+  if (!isAbsolute(path)) {
+    throw new GitWorkspaceResolutionError("GIT_PROBE_FAILED", "MALFORMED_OUTPUT");
+  }
   try {
     return canonicalExistingDirectory(path);
   } catch {
@@ -137,9 +146,9 @@ export class GitWorkspaceResolver {
   inspect(projectRoot: string, descriptor: ProjectDescriptorV1): WorkspaceSnapshot {
     const topLevelResult = this.runner.run(projectRoot, ["rev-parse", "--show-toplevel"]);
     if (
-      topLevelResult.exitCode !== 0
+      topLevelResult.exitCode === 128
       && topLevelResult.stdout.length === 0
-      && /fatal:\s+not a git repository\b/i.test(topLevelResult.stderr)
+      && notRepositoryDiagnostic.test(topLevelResult.stderr)
     ) {
       const workspaceRoot = canonicalExistingDirectory(projectRoot);
       return {
@@ -190,12 +199,10 @@ export class GitWorkspaceResolver {
       branchRef = parseBranchRef(branchResult.stdout);
     }
     if (
-      headResult.exitCode !== 0
+      headResult.exitCode === 128
       && branchRef !== null
       && /^(?:HEAD|HEAD\r?\n)$/.test(headResult.stdout)
-      && /ambiguous argument ['"]HEAD['"]: unknown revision or path not in the working tree/i.test(
-        headResult.stderr,
-      )
+      && unbornHeadDiagnostic.test(headResult.stderr)
     ) {
       throw new GitWorkspaceResolutionError("GIT_WORKSPACE_NOT_READY", "UNBORN_HEAD");
     }

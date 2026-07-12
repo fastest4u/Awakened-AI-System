@@ -50,6 +50,21 @@ describe("store manifest schema", () => {
     assert.deepEqual(parseStoreManifest(validManifest), validManifest);
   });
 
+  it("accepts valid leap-day timestamps with colonized numeric offsets", () => {
+    const manifest: StoreManifestV1 = {
+      ...validManifest,
+      createdAt: "2024-02-29T23:59:59.123456789+02:30",
+      lastIntegrity: {
+        status: "passed",
+        checkedAt: "2024-02-29T21:29:59.123456789-00:00",
+        schemaFingerprint: "schema-v1",
+        terminalEventHash: "event-hash",
+      },
+    };
+
+    assert.deepEqual(parseStoreManifest(manifest), manifest);
+  });
+
   it("rejects non-UUID store, project, and vault identities", () => {
     for (const field of ["storeId", "projectId", "vaultId"] as const) {
       assert.throws(() => parseStoreManifest({ ...validManifest, [field]: "not-a-uuid" }), field);
@@ -71,6 +86,30 @@ describe("store manifest schema", () => {
       },
     }));
   });
+
+  for (const [caseName, invalidTimestamp] of [
+    ["a colonless numeric offset", "2026-07-12T00:01:00+0200"],
+    ["an impossible calendar date", "2026-02-30T00:01:00Z"],
+    ["24:00 as a time", "2026-07-12T24:00:00Z"],
+  ] as const) {
+    it(`rejects ${caseName} in createdAt`, () => {
+      const createdAt = invalidTimestamp;
+      assert.throws(() => parseStoreManifest({ ...validManifest, createdAt }), createdAt);
+    });
+
+    it(`rejects ${caseName} in integrity checkedAt`, () => {
+      const checkedAt = invalidTimestamp;
+      assert.throws(() => parseStoreManifest({
+        ...validManifest,
+        lastIntegrity: {
+          status: "passed",
+          checkedAt,
+          schemaFingerprint: "schema-v1",
+          terminalEventHash: "event-hash",
+        },
+      }), checkedAt);
+    });
+  }
 
   it("rejects unknown root and integrity fields", () => {
     assert.throws(() => parseStoreManifest({ ...validManifest, extra: true }));

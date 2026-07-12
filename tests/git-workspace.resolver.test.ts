@@ -19,6 +19,11 @@ const descriptor: ProjectDescriptorV1 = {
   createdAt: "2026-07-11T00:00:00.000Z",
 };
 
+const notRepositoryDiagnostic =
+  "fatal: not a git repository (or any of the parent directories): .git\n";
+const unbornHeadDiagnostic =
+  "fatal: ambiguous argument 'HEAD': unknown revision or path not in the working tree.\n";
+
 describe("GitWorkspaceResolver", () => {
   let root: string | undefined;
 
@@ -110,7 +115,7 @@ describe("GitWorkspaceResolver", () => {
         return {
           exitCode: 128,
           stdout: "",
-          stderr: "fatal: not a git repository (or any of the parent directories): .git\n",
+          stderr: notRepositoryDiagnostic,
         };
       },
     };
@@ -127,6 +132,45 @@ describe("GitWorkspaceResolver", () => {
     assert.equal("gitDir" in snapshot, false);
     assert.equal("gitCommonDir" in snapshot, false);
   });
+
+  for (const [caseName, failure] of [
+    ["the not-a-repository diagnostic has the wrong exit status", {
+      exitCode: 1,
+      stdout: "",
+      stderr: notRepositoryDiagnostic,
+    }],
+    ["the not-a-repository diagnostic has an extra prefix", {
+      exitCode: 128,
+      stdout: "",
+      stderr: `unexpected prefix\n${notRepositoryDiagnostic}`,
+    }],
+    ["the not-a-repository diagnostic has an extra suffix", {
+      exitCode: 128,
+      stdout: "",
+      stderr: `${notRepositoryDiagnostic}unexpected suffix\n`,
+    }],
+    ["a permission diagnostic is mixed with not-a-repository text", {
+      exitCode: 128,
+      stdout: "",
+      stderr: `fatal: cannot open repository: Permission denied\n${notRepositoryDiagnostic}`,
+    }],
+    ["a dubious-ownership diagnostic is mixed with not-a-repository text", {
+      exitCode: 128,
+      stdout: "",
+      stderr: `fatal: detected dubious ownership in repository\n${notRepositoryDiagnostic}`,
+    }],
+  ] satisfies Array<[string, GitCommandResult]>) {
+    it(`fails closed when ${caseName}`, () => {
+      root = mkdtempSync(join(tmpdir(), "memory-git-non-repo-lookalike-"));
+      const runner: GitCommandRunner = { run: () => failure };
+
+      assert.throws(
+        () => new GitWorkspaceResolver(runner).inspect(root!, descriptor),
+        (error: unknown) => error instanceof GitWorkspaceResolutionError
+          && error.code === "GIT_PROBE_FAILED",
+      );
+    });
+  }
 
   it("fails closed with a typed probe error when Git cannot execute", () => {
     root = mkdtempSync(join(tmpdir(), "memory-git-missing-"));
@@ -174,7 +218,7 @@ describe("GitWorkspaceResolver", () => {
           "rev-parse HEAD": {
             exitCode: 128,
             stdout: "HEAD\n",
-            stderr: "fatal: ambiguous argument 'HEAD': unknown revision or path not in the working tree.\n",
+            stderr: unbornHeadDiagnostic,
           },
           "symbolic-ref -q HEAD": {
             exitCode: 0,
@@ -204,6 +248,75 @@ describe("GitWorkspaceResolver", () => {
     ]);
   });
 
+  for (const [caseName, headFailure] of [
+    ["the unborn-HEAD diagnostic has the wrong exit status", {
+      exitCode: 1,
+      stdout: "HEAD\n",
+      stderr: unbornHeadDiagnostic,
+    }],
+    ["the unborn-HEAD diagnostic has an extra prefix", {
+      exitCode: 128,
+      stdout: "HEAD\n",
+      stderr: `unexpected prefix\n${unbornHeadDiagnostic}`,
+    }],
+    ["the unborn-HEAD diagnostic has an extra suffix", {
+      exitCode: 128,
+      stdout: "HEAD\n",
+      stderr: `${unbornHeadDiagnostic}unexpected suffix\n`,
+    }],
+    ["a permission diagnostic is mixed with unborn-HEAD text", {
+      exitCode: 128,
+      stdout: "HEAD\n",
+      stderr: `fatal: cannot read HEAD: Permission denied\n${unbornHeadDiagnostic}`,
+    }],
+    ["a dubious-ownership diagnostic is mixed with unborn-HEAD text", {
+      exitCode: 128,
+      stdout: "HEAD\n",
+      stderr: `fatal: detected dubious ownership in repository\n${unbornHeadDiagnostic}`,
+    }],
+  ] satisfies Array<[string, GitCommandResult]>) {
+    it(`fails closed when ${caseName}`, () => {
+      root = mkdtempSync(join(tmpdir(), "memory-git-unborn-lookalike-"));
+      const projectRoot = join(root, "checkout");
+      const gitDir = join(projectRoot, ".git");
+      mkdirSync(gitDir, { recursive: true });
+      const results: Record<string, GitCommandResult> = {
+        "rev-parse --show-toplevel": {
+          exitCode: 0,
+          stdout: `${projectRoot}\n`,
+          stderr: "",
+        },
+        "rev-parse --path-format=absolute --absolute-git-dir": {
+          exitCode: 0,
+          stdout: `${gitDir}\n`,
+          stderr: "",
+        },
+        "rev-parse --path-format=absolute --git-common-dir": {
+          exitCode: 0,
+          stdout: `${gitDir}\n`,
+          stderr: "",
+        },
+        "rev-parse HEAD": headFailure,
+        "symbolic-ref -q HEAD": {
+          exitCode: 0,
+          stdout: "refs/heads/main\n",
+          stderr: "",
+        },
+      };
+      const runner: GitCommandRunner = {
+        run(_cwd: string, args: string[]) {
+          return results[args.join(" ")]!;
+        },
+      };
+
+      assert.throws(
+        () => new GitWorkspaceResolver(runner).inspect(projectRoot, descriptor),
+        (error: unknown) => error instanceof GitWorkspaceResolutionError
+          && error.code === "GIT_PROBE_FAILED",
+      );
+    });
+  }
+
   it("reports malformed Git path output as a typed probe failure", () => {
     root = mkdtempSync(join(tmpdir(), "memory-git-malformed-"));
     const runner: GitCommandRunner = {
@@ -220,6 +333,32 @@ describe("GitWorkspaceResolver", () => {
         assert.equal(error.reason, "MALFORMED_OUTPUT");
         return true;
       },
+    );
+  });
+
+  it("fails closed when a path probe emits an existing relative directory", () => {
+    root = mkdtempSync(join(tmpdir(), "memory-git-relative-path-"));
+    const projectRoot = join(root, "checkout");
+    const gitDir = join(projectRoot, ".git");
+    mkdirSync(gitDir, { recursive: true });
+    const outputs: Record<string, string> = {
+      "rev-parse --show-toplevel": ".\n",
+      "rev-parse --path-format=absolute --absolute-git-dir": `${gitDir}\n`,
+      "rev-parse --path-format=absolute --git-common-dir": `${gitDir}\n`,
+      "rev-parse HEAD": "0123456789abcdef0123456789abcdef01234567\n",
+      "symbolic-ref -q HEAD": "refs/heads/main\n",
+    };
+    const runner: GitCommandRunner = {
+      run(_cwd: string, args: string[]) {
+        return { exitCode: 0, stdout: outputs[args.join(" ")]!, stderr: "" };
+      },
+    };
+
+    assert.throws(
+      () => new GitWorkspaceResolver(runner).inspect(projectRoot, descriptor),
+      (error: unknown) => error instanceof GitWorkspaceResolutionError
+        && error.code === "GIT_PROBE_FAILED"
+        && error.reason === "MALFORMED_OUTPUT",
     );
   });
 
