@@ -37,3 +37,12 @@ export class SqliteCapabilityError extends Error {
     this.name = "SqliteCapabilityError";
   }
 }
+
+export class SqliteParamsError extends Error {
+  readonly code = "SQLITE_PARAMS_INVALID" as const;
+
+  constructor(message: string) {
+    super(message);
+    this.name = "SqliteParamsError";
+  }
+}

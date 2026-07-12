@@ -7,7 +7,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { DatabaseSync } from "node:sqlite";
+import { DatabaseSync, StatementSync } from "node:sqlite";
 import { afterEach, describe, it } from "node:test";
 import {
   DEFAULT_BUSY_TIMEOUT_MS,
@@ -18,7 +18,10 @@ import {
   probeRuntimeCapabilities,
 } from "../src/orchestrator/runtime/runtime-capabilities.js";
 import { NodeSqliteDriver } from "../src/orchestrator/storage/node-sqlite-driver.js";
-import type { SqliteParams } from "../src/orchestrator/storage/sqlite-driver.js";
+import type {
+  SqliteOpenOptions,
+  SqliteParams,
+} from "../src/orchestrator/storage/sqlite-driver.js";
 
 const temporaryDirectories: string[] = [];
 
@@ -37,6 +40,24 @@ function errorHasCode(expected: string): (error: unknown) => boolean {
     assert.equal(String((error as { code: unknown }).code), expected);
     return true;
   };
+}
+
+function ownDataPropertyValues(value: object): unknown[] {
+  return Reflect.ownKeys(value).flatMap((key) => {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    return descriptor !== undefined && "value" in descriptor
+      ? [descriptor.value]
+      : [];
+  });
+}
+
+function readJournalMode(path: string): string {
+  const database = new DatabaseSync(path, { readOnly: true });
+  try {
+    return String(database.prepare("PRAGMA journal_mode").get()?.journal_mode);
+  } finally {
+    database.close();
+  }
 }
 
 function createRawExistingDatabase(
@@ -160,6 +181,7 @@ describe("NodeSqliteDriver", () => {
       assert.equal(connection.prepare("PRAGMA synchronous").get()?.synchronous, 2n);
       assert.equal(connection.prepare("PRAGMA trusted_schema").get()?.trusted_schema, 0n);
       assert.equal(connection.prepare("PRAGMA busy_timeout").get()?.timeout, 5000n);
+      assert.equal(connection.prepare("PRAGMA application_id").get()?.application_id, 0n);
 
       connection.exec("CREATE TABLE sample(value INTEGER NOT NULL) STRICT");
       const inserted = connection
@@ -208,7 +230,110 @@ describe("NodeSqliteDriver", () => {
         () => connection
           .prepare("INSERT INTO sample VALUES ($value)")
           .run({ value: 8 } as unknown as SqliteParams),
-        /SQLITE_PARAMS_INVALID/,
+        errorHasCode("SQLITE_PARAMS_INVALID"),
+      );
+    } finally {
+      connection.close();
+    }
+  });
+
+  it("passes exactly zero native arguments to every statement method when params are absent", () => {
+    const calls: Array<{ sql: string; method: string; argumentsLength: number }> = [];
+    class InstrumentedDatabaseSync extends DatabaseSync {
+      override prepare(sql: string): StatementSync {
+        const statement = super.prepare(sql);
+        return new Proxy(statement, {
+          get(target, property): unknown {
+            const member = Reflect.get(target, property, target) as unknown;
+            if (typeof member !== "function") return member;
+            return (...args: unknown[]): unknown => {
+              if (
+                sql.includes("argument-probe")
+                && ["run", "get", "all", "iterate"].includes(String(property))
+              ) {
+                calls.push({
+                  sql,
+                  method: String(property),
+                  argumentsLength: args.length,
+                });
+              }
+              return Reflect.apply(member, target, args);
+            };
+          },
+        });
+      }
+    }
+    const instrumentedDriver = new NodeSqliteDriver({
+      DatabaseSync: InstrumentedDatabaseSync,
+    });
+    const databasePath = join(temporaryDirectory(), "arguments.sqlite");
+    const connection = instrumentedDriver.open(databasePath, {
+      mode: "create",
+      busyTimeoutMs: DEFAULT_BUSY_TIMEOUT_MS,
+    });
+    try {
+      connection.exec("CREATE TABLE argument_probe(value INTEGER NOT NULL) STRICT");
+      connection.prepare("INSERT INTO argument_probe VALUES (1) /* argument-probe-run */").run();
+      connection.prepare("SELECT value FROM argument_probe /* argument-probe-get */").get();
+      connection.prepare("SELECT value FROM argument_probe /* argument-probe-all */").all();
+      [...connection
+        .prepare("SELECT value FROM argument_probe /* argument-probe-iterate */")
+        .iterate()];
+      assert.deepEqual(
+        calls.map(({ method, argumentsLength }) => ({ method, argumentsLength })),
+        [
+          { method: "run", argumentsLength: 0 },
+          { method: "get", argumentsLength: 0 },
+          { method: "all", argumentsLength: 0 },
+          { method: "iterate", argumentsLength: 0 },
+        ],
+      );
+    } finally {
+      connection.close();
+    }
+  });
+
+  it("rejects every parameter value outside the narrow SqliteValue domain", () => {
+    const databasePath = join(temporaryDirectory(), "events.sqlite");
+    const connection = driver.open(databasePath, {
+      mode: "create",
+      busyTimeoutMs: DEFAULT_BUSY_TIMEOUT_MS,
+    });
+    try {
+      connection.exec("CREATE TABLE sample(value BLOB) STRICT");
+      const statement = connection.prepare("INSERT INTO sample VALUES ($value)");
+      for (const invalid of [
+        {},
+        undefined,
+        new DataView(new ArrayBuffer(4)),
+        new Uint16Array([1, 2]),
+      ]) {
+        assert.throws(
+          () => statement.run({ $value: invalid } as unknown as SqliteParams),
+          errorHasCode("SQLITE_PARAMS_INVALID"),
+        );
+      }
+      assert.equal(statement.run({ $value: new Uint8Array([1, 2]) }).changes, 1n);
+    } finally {
+      connection.close();
+    }
+  });
+
+  it("does not expose native connection or statement handles as own properties", () => {
+    const databasePath = join(temporaryDirectory(), "events.sqlite");
+    const connection = driver.open(databasePath, {
+      mode: "create",
+      busyTimeoutMs: DEFAULT_BUSY_TIMEOUT_MS,
+    });
+    try {
+      const statement = connection.prepare("SELECT 1 AS value");
+      assert.equal(
+        ownDataPropertyValues(connection).some((value) => value instanceof DatabaseSync),
+        false,
+      );
+      assert.equal(
+        ownDataPropertyValues(statement).some((value) => value instanceof StatementSync),
+        false,
       );
     } finally {
       connection.close();
@@ -257,6 +382,49 @@ describe("NodeSqliteDriver", () => {
       errorHasCode("SQLITE_CAPABILITY_MISSING"),
     );
     assert.equal(existsSync(databasePath), false);
+  });
+
+  it("rejects invalid modes before opening or mutating a database", () => {
+    const walPath = join(temporaryDirectory(), "wal.sqlite");
+    createRawExistingDatabase(walPath);
+    assert.throws(
+      () => {
+        const connection = driver.open(walPath, {
+          mode: "exsting",
+          busyTimeoutMs: DEFAULT_BUSY_TIMEOUT_MS,
+        } as unknown as SqliteOpenOptions);
+        connection.close();
+      },
+      errorHasCode("SQLITE_CAPABILITY_MISSING"),
+    );
+    assert.equal(readJournalMode(walPath), "wal");
+
+    const deletePath = join(temporaryDirectory(), "delete.sqlite");
+    createRawExistingDatabase(deletePath, { wal: false });
+    assert.throws(
+      () => driver.open(deletePath, {
+        mode: "exsting",
+        busyTimeoutMs: DEFAULT_BUSY_TIMEOUT_MS,
+      } as unknown as SqliteOpenOptions),
+      errorHasCode("SQLITE_CAPABILITY_MISSING"),
+    );
+    assert.equal(readJournalMode(deletePath), "delete");
+  });
+
+  it("transitions an identified DELETE-journal database to WAL only for writable existing mode", () => {
+    const databasePath = join(temporaryDirectory(), "events.sqlite");
+    createRawExistingDatabase(databasePath, { wal: false });
+
+    const connection = driver.open(databasePath, {
+      mode: "existing",
+      busyTimeoutMs: DEFAULT_BUSY_TIMEOUT_MS,
+    });
+    try {
+      assert.equal(connection.prepare("PRAGMA journal_mode").get()?.journal_mode, "wal");
+    } finally {
+      connection.close();
+    }
+    assert.equal(readJournalMode(databasePath), "wal");
   });
 
   it("opens an existing identified store in writable and read-only modes", () => {
@@ -340,11 +508,34 @@ describe("NodeSqliteDriver", () => {
       errorHasCode("SQLITE_CAPABILITY_MISSING"),
     );
 
-    const database = new DatabaseSync(databasePath, { readOnly: true });
-    try {
-      assert.equal(database.prepare("PRAGMA journal_mode").get()?.journal_mode, "delete");
-    } finally {
-      database.close();
+    assert.equal(readJournalMode(databasePath), "delete");
+  });
+
+  it("closes a database when a post-open hardening probe fails", () => {
+    class FailingProbeDatabaseSync extends DatabaseSync {
+      override prepare(sql: string): StatementSync {
+        if (sql === "PRAGMA journal_mode = WAL") {
+          throw new Error("INJECTED_POST_OPEN_PROBE_FAILURE");
+        }
+        return super.prepare(sql);
+      }
     }
+    const failingDriver = new NodeSqliteDriver({
+      DatabaseSync: FailingProbeDatabaseSync,
+    });
+    const databasePath = join(temporaryDirectory(), "failure.sqlite");
+
+    assert.throws(
+      () => failingDriver.open(databasePath, {
+        mode: "create",
+        busyTimeoutMs: DEFAULT_BUSY_TIMEOUT_MS,
+      }),
+      errorHasCode("SQLITE_CAPABILITY_MISSING"),
+    );
+    rmSync(databasePath);
+    assert.equal(existsSync(databasePath), false);
+
+    const reopened = new DatabaseSync(databasePath);
+    reopened.close();
   });
 });

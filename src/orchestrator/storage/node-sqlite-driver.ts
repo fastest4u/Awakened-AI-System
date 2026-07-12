@@ -3,6 +3,7 @@ import {
 } from "../runtime/runtime-capabilities.js";
 import {
   SqliteCapabilityError,
+  SqliteParamsError,
   type SqliteConnection,
   type SqliteDriver,
   type SqliteOpenOptions,
@@ -68,18 +69,10 @@ function verifyProjectIdentity(database: NativeDatabase): void {
   );
 }
 
-function verifyConnectionHardening(
+function verifyConnectionLocalControls(
   database: NativeDatabase,
   busyTimeoutMs: number,
 ): void {
-  requireCapability(
-    String(value(database, "PRAGMA journal_mode", "journal_mode")).toLowerCase() === "wal",
-    "SQLite WAL mode is unavailable",
-  );
-  requireCapability(
-    Number(value(database, "PRAGMA synchronous", "synchronous")) === 2,
-    "SQLite synchronous FULL mode is unavailable",
-  );
   requireCapability(
     Number(value(database, "PRAGMA foreign_keys", "foreign_keys")) === 1,
     "SQLite foreign key enforcement is unavailable",
@@ -92,6 +85,25 @@ function verifyConnectionHardening(
     Number(value(database, "PRAGMA trusted_schema", "trusted_schema")) === 0,
     "SQLite trusted schema hardening is unavailable",
   );
+}
+
+function verifyWal(database: NativeDatabase): void {
+  requireCapability(
+    String(value(database, "PRAGMA journal_mode", "journal_mode")).toLowerCase() === "wal",
+    "SQLite WAL mode is unavailable",
+  );
+}
+
+function verifyWritableConnectionHardening(
+  database: NativeDatabase,
+  busyTimeoutMs: number,
+): void {
+  verifyWal(database);
+  requireCapability(
+    Number(value(database, "PRAGMA synchronous", "synchronous")) === 2,
+    "SQLite synchronous FULL mode is unavailable",
+  );
+  verifyConnectionLocalControls(database, busyTimeoutMs);
 }
 
 function configureWritableConnection(
@@ -108,7 +120,7 @@ function configureWritableConnection(
     PRAGMA busy_timeout = ${busyTimeoutMs};
     PRAGMA trusted_schema = OFF;
   `);
-  verifyConnectionHardening(database, busyTimeoutMs);
+  verifyWritableConnectionHardening(database, busyTimeoutMs);
 }
 
 function configureReadOnlyConnection(
@@ -119,25 +131,42 @@ function configureReadOnlyConnection(
     PRAGMA foreign_keys = ON;
     PRAGMA trusted_schema = OFF;
   `);
-  verifyConnectionHardening(database, busyTimeoutMs);
+  verifyConnectionLocalControls(database, busyTimeoutMs);
+}
+
+function isSqliteValue(value: unknown): value is SqliteValue {
+  return value === null
+    || typeof value === "number"
+    || typeof value === "bigint"
+    || typeof value === "string"
+    || value instanceof Uint8Array;
+}
+
+function paramsError(message: string): SqliteParamsError {
+  return new SqliteParamsError(`SQLITE_PARAMS_INVALID: ${message}`);
 }
 
 function validateParams(params: SqliteParams): Record<string, SqliteValue> {
   const prototype = Object.getPrototypeOf(params) as unknown;
   if (prototype !== Object.prototype && prototype !== null) {
-    throw new Error("SQLITE_PARAMS_INVALID: parameters must be a plain record");
+    throw paramsError("parameters must be a plain record");
   }
 
   const bound: Record<string, SqliteValue> = {};
   for (const key of Reflect.ownKeys(params)) {
     if (typeof key !== "string" || !key.startsWith("$")) {
-      throw new Error("SQLITE_PARAMS_INVALID: every parameter name must start with $");
+      throw paramsError("every parameter name must start with $");
     }
     const descriptor = Object.getOwnPropertyDescriptor(params, key);
     if (descriptor === undefined || !("value" in descriptor) || !descriptor.enumerable) {
-      throw new Error("SQLITE_PARAMS_INVALID: parameters must be enumerable data properties");
+      throw paramsError("parameters must be enumerable data properties");
     }
-    bound[key] = descriptor.value as SqliteValue;
+    if (!isSqliteValue(descriptor.value)) {
+      throw paramsError(
+        "parameter values must be null, number, bigint, string, or Uint8Array",
+      );
+    }
+    bound[key] = descriptor.value;
   }
   return bound;
 }
@@ -152,14 +181,17 @@ function bigintResult(value: number | bigint, field: string): bigint {
 }
 
 class NodeSqliteStatement implements SqliteStatement {
-  constructor(private readonly statement: NativeStatement) {
+  readonly #statement: NativeStatement;
+
+  constructor(statement: NativeStatement) {
+    this.#statement = statement;
     statement.setReadBigInts(true);
   }
 
   run(params?: SqliteParams): SqliteRunResult {
     const result = params === undefined
-      ? this.statement.run()
-      : this.statement.run(validateParams(params));
+      ? this.#statement.run()
+      : this.#statement.run(validateParams(params));
     return {
       changes: bigintResult(result.changes, "changes"),
       lastInsertRowid: bigintResult(result.lastInsertRowid, "lastInsertRowid"),
@@ -168,46 +200,61 @@ class NodeSqliteStatement implements SqliteStatement {
 
   get(params?: SqliteParams): SqliteRow | undefined {
     const row = params === undefined
-      ? this.statement.get()
-      : this.statement.get(validateParams(params));
+      ? this.#statement.get()
+      : this.#statement.get(validateParams(params));
     return row as SqliteRow | undefined;
   }
 
   all(params?: SqliteParams): SqliteRow[] {
     const rows = params === undefined
-      ? this.statement.all()
-      : this.statement.all(validateParams(params));
+      ? this.#statement.all()
+      : this.#statement.all(validateParams(params));
     return rows as SqliteRow[];
   }
 
   iterate(params?: SqliteParams): IterableIterator<SqliteRow> {
     const rows = params === undefined
-      ? this.statement.iterate()
-      : this.statement.iterate(validateParams(params));
+      ? this.#statement.iterate()
+      : this.#statement.iterate(validateParams(params));
     return rows as IterableIterator<SqliteRow>;
   }
 }
 
 class NodeSqliteConnection implements SqliteConnection {
-  constructor(private readonly database: NativeDatabase) {}
+  readonly #database: NativeDatabase;
+
+  constructor(database: NativeDatabase) {
+    this.#database = database;
+  }
 
   exec(sql: string): void {
-    this.database.exec(sql);
+    this.#database.exec(sql);
   }
 
   prepare(sql: string): SqliteStatement {
-    return new NodeSqliteStatement(this.database.prepare(sql));
+    return new NodeSqliteStatement(this.#database.prepare(sql));
   }
 
   close(): void {
-    this.database.close();
+    this.#database.close();
   }
 }
 
 export class NodeSqliteDriver implements SqliteDriver {
-  constructor(private readonly sqlite: NodeSqliteModule) {}
+  readonly #sqlite: NodeSqliteModule;
+
+  constructor(sqlite: NodeSqliteModule) {
+    this.#sqlite = sqlite;
+  }
 
   open(path: string, options: SqliteOpenOptions): SqliteConnection {
+    if (
+      options.mode !== "create"
+      && options.mode !== "existing"
+      && options.mode !== "read-only-existing"
+    ) {
+      throw new SqliteCapabilityError("SQLite open mode is invalid");
+    }
     if (!Number.isSafeInteger(options.busyTimeoutMs) || options.busyTimeoutMs < 0) {
       throw new SqliteCapabilityError("SQLite busy timeout must be a non-negative safe integer");
     }
@@ -221,7 +268,7 @@ export class NodeSqliteDriver implements SqliteDriver {
   private openCreate(path: string, options: SqliteOpenOptions): SqliteConnection {
     let database: NativeDatabase | undefined;
     try {
-      database = new this.sqlite.DatabaseSync(path, nativeOptions(options));
+      database = new this.#sqlite.DatabaseSync(path, nativeOptions(options));
       configureWritableConnection(database, options.busyTimeoutMs);
       return new NodeSqliteConnection(database);
     } catch (error) {
@@ -237,10 +284,11 @@ export class NodeSqliteDriver implements SqliteDriver {
     };
     let preflight: NativeDatabase | undefined;
     try {
-      preflight = new this.sqlite.DatabaseSync(path, nativeOptions(readOnlyOptions));
+      preflight = new this.#sqlite.DatabaseSync(path, nativeOptions(readOnlyOptions));
       configureReadOnlyConnection(preflight, options.busyTimeoutMs);
       verifyProjectIdentity(preflight);
       if (options.mode === "read-only-existing") {
+        verifyWal(preflight);
         return new NodeSqliteConnection(preflight);
       }
       preflight.close();
@@ -252,7 +300,7 @@ export class NodeSqliteDriver implements SqliteDriver {
 
     let database: NativeDatabase | undefined;
     try {
-      database = new this.sqlite.DatabaseSync(path, nativeOptions(options));
+      database = new this.#sqlite.DatabaseSync(path, nativeOptions(options));
       verifyProjectIdentity(database);
       configureWritableConnection(database, options.busyTimeoutMs);
       return new NodeSqliteConnection(database);
