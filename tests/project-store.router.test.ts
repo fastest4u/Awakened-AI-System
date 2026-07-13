@@ -283,9 +283,10 @@ describe("StoreManifestRepository", () => {
     );
   });
 
-  it("syncs created ancestors, hard-link publication, and temporary cleanup in durability order", () => {
+  it("replays vault-local ancestors when a contender pre-created the complete store tree", () => {
     arrangeRoute();
     const publicationParent = resolve(vaultRoot, ".memory-mcp");
+    mkdirSync(route.storeRoot, { recursive: true });
     const barriers: Array<{
       path: string;
       published: boolean;
@@ -310,6 +311,44 @@ describe("StoreManifestRepository", () => {
       { path: publicationParent, published: false, temporaryCount: 0 },
       { path: route.storeRoot, published: true, temporaryCount: 1 },
       { path: route.storeRoot, published: true, temporaryCount: 0 },
+    ]);
+  });
+
+  it("derives and replays the Git-common durable base for direct manifest callers", () => {
+    root = mkdtempSync(join(tmpdir(), "memory-store-manifest-git-contender-"));
+    vaultRoot = join(root, "vault");
+    workspaceRoot = join(root, "workspace");
+    const gitCommonDir = join(root, "git-common");
+    const gitDir = join(gitCommonDir, "worktrees", "feature");
+    mkdirSync(vaultRoot);
+    mkdirSync(workspaceRoot);
+    mkdirSync(gitDir, { recursive: true });
+    route = new ProjectStoreRouter().route(descriptor, vaultRoot, {
+      kind: "git",
+      worktreeRoot: resolve(realpathSync.native(workspaceRoot)),
+      gitDir: resolve(realpathSync.native(gitDir)),
+      gitCommonDir: resolve(realpathSync.native(gitCommonDir)),
+      headCommit: "0123456789abcdef0123456789abcdef01234567",
+      branchRef: "refs/heads/feature",
+      detached: false,
+      workspaceId: "manifest-git-contender" as WorkspaceId,
+    });
+    mkdirSync(route.storeRoot, { recursive: true });
+    const barriers: string[] = [];
+
+    new StoreManifestRepository({
+      now: () => "2026-07-12T00:01:00.000Z",
+      syncDirectory(path) {
+        barriers.push(path);
+      },
+    }).createExplicit(route, identity);
+
+    assert.deepEqual(barriers, [
+      resolve(gitCommonDir),
+      resolve(gitCommonDir, "project-memory"),
+      resolve(gitCommonDir, "project-memory", descriptor.projectId),
+      route.storeRoot,
+      route.storeRoot,
     ]);
   });
 

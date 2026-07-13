@@ -1,11 +1,10 @@
 import {
   closeSync,
-  existsSync,
   fsyncSync,
   mkdirSync,
   openSync,
 } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
 
 export type DirectorySync = (path: string) => void;
 
@@ -61,17 +60,31 @@ export function fsyncDirectory(
 
 export function createDirectoryDurably(
   path: string,
+  durableBase: string,
   syncDirectory: DirectorySync,
 ): void {
-  const missingEntryParents: string[] = [];
-  let cursor = resolve(path);
-  while (!existsSync(cursor)) {
+  const target = resolve(path);
+  const base = resolve(durableBase);
+  const pathFromBase = relative(base, target);
+  if (
+    pathFromBase === ".."
+    || pathFromBase.startsWith(`..${sep}`)
+    || isAbsolute(pathFromBase)
+  ) {
+    throw new Error("DIRECTORY_OUTSIDE_DURABLE_BASE");
+  }
+
+  const entryParents: string[] = [];
+  let cursor = target;
+  while (process.platform === "win32"
+    ? cursor.toLowerCase() !== base.toLowerCase()
+    : cursor !== base) {
     const parent = dirname(cursor);
-    if (parent === cursor) break;
-    missingEntryParents.push(parent);
+    if (parent === cursor) throw new Error("DIRECTORY_OUTSIDE_DURABLE_BASE");
+    entryParents.push(parent);
     cursor = parent;
   }
 
-  mkdirSync(path, { recursive: true });
-  for (const parent of missingEntryParents.reverse()) syncDirectory(parent);
+  mkdirSync(target, { recursive: true });
+  for (const parent of entryParents.reverse()) syncDirectory(parent);
 }

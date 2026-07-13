@@ -121,6 +121,39 @@ function assertManifestRouteShape(route: ProjectStoreRoute): void {
   }
 }
 
+function manifestDurableBase(route: ProjectStoreRoute, projectId: ProjectId): string {
+  assertManifestRouteShape(route);
+  if (basename(route.storeRoot) !== "v2") throw routeInvalid();
+
+  let requestedBase: string;
+  if (route.kind === "vault-local") {
+    const authorityDirectory = dirname(route.storeRoot);
+    if (basename(authorityDirectory) !== ".memory-mcp") throw routeInvalid();
+    requestedBase = dirname(authorityDirectory);
+  } else if (route.kind === "git-common") {
+    const projectDirectory = dirname(route.storeRoot);
+    const projectMemoryDirectory = dirname(projectDirectory);
+    if (
+      basename(projectDirectory) !== projectId
+      || basename(projectMemoryDirectory) !== "project-memory"
+    ) {
+      throw routeInvalid();
+    }
+    requestedBase = dirname(projectMemoryDirectory);
+  } else {
+    throw routeInvalid();
+  }
+
+  let canonicalBase: string;
+  try {
+    canonicalBase = canonicalExistingDirectory(requestedBase);
+  } catch {
+    throw routeInvalid();
+  }
+  if (!samePath(canonicalBase, requestedBase)) throw routeInvalid();
+  return canonicalBase;
+}
+
 function assertCanonicalExistingAncestor(path: string): void {
   let cursor = resolve(path);
   while (true) {
@@ -142,8 +175,11 @@ function assertCanonicalExistingAncestor(path: string): void {
 
 type ManifestAuthorityStatus = "regular" | "missing";
 
-function manifestAuthorityStatus(route: ProjectStoreRoute): ManifestAuthorityStatus {
-  assertManifestRouteShape(route);
+function manifestAuthorityStatus(
+  route: ProjectStoreRoute,
+  projectId: ProjectId,
+): ManifestAuthorityStatus {
+  manifestDurableBase(route, projectId);
   assertCanonicalExistingAncestor(route.storeRoot);
 
   let root;
@@ -193,7 +229,7 @@ export class StoreManifestRepository {
   ): StoreManifestInspection {
     let authority: ManifestAuthorityStatus;
     try {
-      authority = manifestAuthorityStatus(route);
+      authority = manifestAuthorityStatus(route, expected.projectId);
     } catch {
       return {
         status: "invalid",
@@ -255,10 +291,10 @@ export class StoreManifestRepository {
       lastIntegrity: { status: "never" },
     });
 
-    assertManifestRouteShape(route);
+    const durableBase = manifestDurableBase(route, identity.projectId);
     assertCanonicalExistingAncestor(route.storeRoot);
-    createDirectoryDurably(route.storeRoot, this.dependencies.syncDirectory);
-    manifestAuthorityStatus(route);
+    createDirectoryDurably(route.storeRoot, durableBase, this.dependencies.syncDirectory);
+    manifestAuthorityStatus(route, identity.projectId);
     const publicationDirectory = canonicalExistingDirectory(dirname(route.storeManifestPath));
     if (!samePath(publicationDirectory, route.storeRoot)) throw routeInvalid();
     const publishedPath = join(publicationDirectory, "store-manifest.json");
@@ -300,7 +336,7 @@ export class StoreManifestRepository {
     expected: StoreManifestIdentity,
     result: StoreIntegrityResult,
   ): StoreManifestV1 {
-    if (manifestAuthorityStatus(route) !== "regular") throw routeInvalid();
+    if (manifestAuthorityStatus(route, expected.projectId) !== "regular") throw routeInvalid();
     const current = parseStoreManifest(
       JSON.parse(readFileSync(route.storeManifestPath, "utf8")) as unknown,
     );

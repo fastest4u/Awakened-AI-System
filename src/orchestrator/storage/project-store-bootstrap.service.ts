@@ -18,6 +18,7 @@ import {
   fsyncDirectory,
   type DirectorySync,
 } from "../identity/directory-durability.js";
+import { canonicalExistingDirectory } from "../identity/canonical-path.js";
 import {
   GitWorkspaceResolver,
   SpawnSyncGitCommandRunner,
@@ -458,6 +459,9 @@ export class DefaultProjectStoreBootstrapService implements ProjectStoreBootstra
       descriptor,
     );
     const route = this.#dependencies.router.route(descriptor, input.vaultRoot, workspace);
+    const durableStoreBase = workspace.kind === "git"
+      ? canonicalExistingDirectory(workspace.gitCommonDir)
+      : canonicalExistingDirectory(input.vaultRoot);
     const manifestInspection = this.#dependencies.manifestRepository.inspect(route, {
       projectId: descriptor.projectId,
       vaultId: descriptor.vaultId,
@@ -523,6 +527,7 @@ export class DefaultProjectStoreBootstrapService implements ProjectStoreBootstra
       DatabaseSync,
       descriptor,
       route,
+      durableStoreBase,
       createdDescriptor,
     );
     DefaultProjectStoreBootstrapService.#activeInitializations.set(
@@ -558,9 +563,14 @@ export class DefaultProjectStoreBootstrapService implements ProjectStoreBootstra
     DatabaseSync: DatabaseSyncConstructor,
     descriptor: ProjectDescriptorV1,
     route: ProjectStoreRoute,
+    durableStoreBase: string,
     createdDescriptor: boolean,
   ): Promise<ProjectStoreBootstrapResult> {
-    createDirectoryDurably(route.storeRoot, this.#dependencies.syncDirectory);
+    createDirectoryDurably(
+      route.storeRoot,
+      durableStoreBase,
+      this.#dependencies.syncDirectory,
+    );
     const capabilityReservation = reserveSqlitePath(
       route.storeRoot,
       (id) => `.events.sqlite.capability-${id}.tmp`,

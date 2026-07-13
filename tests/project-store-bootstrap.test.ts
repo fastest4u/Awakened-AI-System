@@ -11,7 +11,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, it } from "node:test";
 import { ProjectDescriptorRepository } from "../src/orchestrator/identity/project-descriptor.repository.js";
@@ -175,7 +175,7 @@ describe("DefaultProjectStoreBootstrapService", () => {
     assert.deepEqual(again.manifest, result.manifest);
   });
 
-  it("syncs every new Git-store ancestor before publishing the database", async () => {
+  it("replays every Git-store ancestor when a contender pre-created the complete tree", async () => {
     const { root, projectRoot, vaultRoot } = fixture();
     const gitCommonDir = join(root, "git-common");
     mkdirSync(gitCommonDir);
@@ -216,6 +216,7 @@ describe("DefaultProjectStoreBootstrapService", () => {
         assert.equal(actualVaultRoot, vaultRoot);
         assert.strictEqual(actualWorkspace, workspace);
         const observedRoute = super.route(descriptor, actualVaultRoot, actualWorkspace);
+        mkdirSync(observedRoute.storeRoot, { recursive: true });
         storeRoot = observedRoute.storeRoot;
         eventsPath = observedRoute.eventsPath;
         manifestPath = observedRoute.storeManifestPath;
@@ -275,6 +276,73 @@ describe("DefaultProjectStoreBootstrapService", () => {
         path: result.route.storeRoot,
         databasePublished: true,
         manifestPublished: false,
+        temporaryDatabaseCount: 0,
+      },
+    ]);
+  });
+
+  it("replays vault-local ancestors when a contender pre-created the complete tree", async () => {
+    const { projectRoot, vaultRoot } = fixture();
+    const barriers: Array<{
+      path: string;
+      databasePublished: boolean;
+      temporaryDatabaseCount: number;
+    }> = [];
+    let storeRoot = "";
+    let eventsPath = "";
+    class PrecreatedVaultStoreRouter extends ProjectStoreRouter {
+      override route(
+        descriptor: ProjectDescriptorV1,
+        actualVaultRoot: string,
+        workspace: WorkspaceSnapshot,
+      ): ProjectStoreRoute {
+        const observedRoute = super.route(descriptor, actualVaultRoot, workspace);
+        mkdirSync(observedRoute.storeRoot, { recursive: true });
+        storeRoot = observedRoute.storeRoot;
+        eventsPath = observedRoute.eventsPath;
+        return observedRoute;
+      }
+    }
+    const dependencies: Partial<ProjectStoreBootstrapDependencies> = {
+      router: new PrecreatedVaultStoreRouter(),
+      syncDirectory(path: string): void {
+        const entries = storeRoot.length > 0 && existsSync(storeRoot)
+          ? readdirSync(storeRoot)
+          : [];
+        barriers.push({
+          path,
+          databasePublished: eventsPath.length > 0 && existsSync(eventsPath),
+          temporaryDatabaseCount: entries.filter((name) =>
+            name.startsWith(".events.sqlite.bootstrap-") && name.endsWith(".tmp")
+          ).length,
+        });
+      },
+    };
+
+    const result = await new DefaultProjectStoreBootstrapService(dependencies).initialize({
+      projectRoot,
+      vaultRoot,
+    });
+
+    assert.deepEqual(barriers, [
+      {
+        path: resolve(vaultRoot),
+        databasePublished: false,
+        temporaryDatabaseCount: 0,
+      },
+      {
+        path: resolve(vaultRoot, ".memory-mcp"),
+        databasePublished: false,
+        temporaryDatabaseCount: 0,
+      },
+      {
+        path: result.route.storeRoot,
+        databasePublished: true,
+        temporaryDatabaseCount: 1,
+      },
+      {
+        path: result.route.storeRoot,
+        databasePublished: true,
         temporaryDatabaseCount: 0,
       },
     ]);

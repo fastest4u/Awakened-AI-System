@@ -164,7 +164,11 @@ export class ProjectDescriptorRepository {
     });
 
     const requestedDirectory = join(canonicalVaultRoot, DESCRIPTOR_DIRECTORY_NAME);
-    createDirectoryDurably(requestedDirectory, this.dependencies.syncDirectory);
+    createDirectoryDurably(
+      requestedDirectory,
+      canonicalVaultRoot,
+      this.dependencies.syncDirectory,
+    );
     const publicationDirectory = canonicalExistingDirectory(requestedDirectory);
     assertContainedPath(canonicalVaultRoot, publicationDirectory);
 

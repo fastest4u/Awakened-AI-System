@@ -1,15 +1,52 @@
 import { strict as assert } from "node:assert";
-import { describe, it } from "node:test";
+import { existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
+import { afterEach, describe, it } from "node:test";
 import {
+  createDirectoryDurably,
   fsyncDirectory,
   type DirectoryFsyncOperations,
 } from "../src/orchestrator/identity/directory-durability.js";
+
+const roots: string[] = [];
+
+afterEach(() => {
+  for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+});
 
 function codedError(code: string): Error & { code: string } {
   return Object.assign(new Error(`directory fsync ${code}`), { code });
 }
 
 describe("directory durability", () => {
+  it("replays the full parent chain from a known durable base for an existing tree", () => {
+    const root = mkdtempSync(join(tmpdir(), "directory-durability-contender-"));
+    roots.push(root);
+    const durableBase = join(root, "base");
+    const target = join(durableBase, "nested", "target");
+    mkdirSync(target, { recursive: true });
+    const barriers: string[] = [];
+
+    createDirectoryDurably(target, durableBase, (path) => barriers.push(path));
+
+    assert.deepEqual(barriers, [resolve(durableBase), resolve(durableBase, "nested")]);
+  });
+
+  it("rejects a target outside the known durable base before creating it", () => {
+    const root = mkdtempSync(join(tmpdir(), "directory-durability-escape-"));
+    roots.push(root);
+    const durableBase = join(root, "base");
+    const escapedTarget = join(root, "outside", "target");
+    mkdirSync(durableBase);
+
+    assert.throws(
+      () => createDirectoryDurably(escapedTarget, durableBase, () => undefined),
+      /DIRECTORY_OUTSIDE_DURABLE_BASE/,
+    );
+    assert.equal(existsSync(escapedTarget), false);
+  });
+
   it("tolerates portable unsupported fsync errors after closing the directory handle", () => {
     for (const code of ["EINVAL", "EISDIR", "ENOTSUP", "EOPNOTSUPP"]) {
       const calls: string[] = [];

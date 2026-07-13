@@ -126,10 +126,11 @@ describe("ProjectDescriptorRepository", () => {
     );
   });
 
-  it("syncs directory creation, publication, and temporary cleanup in durability order", () => {
+  it("replays the vault ancestor barrier when a contender pre-created the descriptor directory", () => {
     const canonicalVaultRoot = resolve(realpathSync.native(vaultRoot));
     const descriptorDirectory = join(canonicalVaultRoot, ".memory-mcp");
     const publishedPath = join(descriptorDirectory, "project-identity.json");
+    mkdirSync(descriptorDirectory, { recursive: true });
     const barriers: Array<{
       path: string;
       directoryExists: boolean;
