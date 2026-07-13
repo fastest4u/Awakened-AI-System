@@ -96,6 +96,28 @@ const RUNTIME_CHECK_NAMES = [
   "applicationId",
 ] as const;
 
+const RUNTIME_FIELD_NAMES = [
+  "ok",
+  "code",
+  "message",
+  "nodeVersion",
+  "sqliteVersion",
+  "nodeVersionAtLeastMinimum",
+  "sqliteVersionAtLeastMinimum",
+  "nodeSqlite",
+  "wal",
+  "fts5",
+  "foreignKeys",
+  "synchronousFull",
+  "busyTimeoutMs",
+  "trustedSchemaOff",
+  "transactionRollback",
+  "applicationId",
+  "checks",
+] as const;
+
+type RuntimeSnapshot = Record<(typeof RUNTIME_FIELD_NAMES)[number], unknown>;
+
 const STABLE_VERSION = /^\d+\.\d+\.\d+$/;
 
 function safeVersion(value: unknown): string {
@@ -107,9 +129,18 @@ function safeChecks(value: unknown): Record<string, boolean> {
   const record = value as Record<string, unknown>;
   const checks: Record<string, boolean> = {};
   for (const name of RUNTIME_CHECK_NAMES) {
-    if (typeof record[name] === "boolean") checks[name] = record[name];
+    const observed = Reflect.get(record, name) as unknown;
+    if (typeof observed === "boolean") checks[name] = observed;
   }
   return checks;
+}
+
+function snapshotRuntime(runtime: Record<string, unknown>): RuntimeSnapshot {
+  const snapshot = {} as RuntimeSnapshot;
+  for (const name of RUNTIME_FIELD_NAMES) {
+    snapshot[name] = Reflect.get(runtime, name) as unknown;
+  }
+  return snapshot;
 }
 
 function successfulRuntimeShape(
@@ -173,7 +204,7 @@ function unsafeRuntimeSummary(
       },
     };
   }
-  const record = runtime as unknown as Record<string, unknown>;
+  const record = snapshotRuntime(runtime as unknown as Record<string, unknown>);
   if (record.ok === true && successfulRuntimeShape(record)) {
     return {
       readiness: "ready",
@@ -221,6 +252,15 @@ function runtimeSummary(
         checks: {},
       },
     };
+  }
+}
+
+function safeFailureCode(failure: unknown): unknown {
+  try {
+    if (typeof failure !== "object" || failure === null) return undefined;
+    return Reflect.get(failure, "code") as unknown;
+  } catch {
+    return undefined;
   }
 }
 
@@ -280,12 +320,14 @@ export class ProjectStatusService {
   status(input: ProjectStatusInput): ProjectStatus {
     const binding = this.bindingProvider.current();
     const runtime = runtimeSummary(input.runtime);
-    const failureSummary = input.failure === undefined
+    const suppliedFailure = input.failure;
+    const hasFailure = suppliedFailure !== undefined;
+    const failureSummary = !hasFailure
       ? {}
-      : { failure: describeProjectBindingFailure(input.failure.code) };
+      : { failure: describeProjectBindingFailure(safeFailureCode(suppliedFailure)) };
     const state: ProjectStatusState = input.mode === "off"
       ? "disabled"
-      : input.failure !== undefined || runtime.readiness === "failed"
+      : hasFailure || runtime.readiness === "failed"
         ? "blocked"
         : runtime.readiness !== "ready" || binding === null
           ? "not-ready"

@@ -895,8 +895,7 @@ export class ProjectBindingService implements ProjectBindingProvider {
       };
     } catch (error) {
       this.invalidateIfOwned(revision);
-      if (error instanceof ProjectBindingError) throw error;
-      throw new ProjectBindingError("STORE_UNAVAILABLE");
+      throw new ProjectBindingError(safeCaughtFailureCode(error));
     }
   }
 

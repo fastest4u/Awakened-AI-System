@@ -711,6 +711,57 @@ describe("ProjectBindingService revalidation", () => {
     assert.deepEqual(item.calls, ["descriptor", "git", "route", "manifest", "identity-probe"]);
   });
 
+  it("reconstructs genuine late ProjectBindingError objects without touching hostile public getters", async () => {
+    const item = fixture();
+    const originalManifestRepository = item.dependencies.manifestRepository!;
+    const hostile = new ProjectBindingError("STORE_ROUTE_INVALID", {
+      secret: "HOSTILE_BINDING_DETAILS_SECRET",
+    });
+    Object.defineProperties(hostile, {
+      code: {
+        configurable: true,
+        enumerable: true,
+        get(): never {
+          throw new Error("HOSTILE_BINDING_CODE_GETTER_SECRET");
+        },
+      },
+      details: {
+        configurable: true,
+        enumerable: true,
+        get(): never {
+          throw new Error("HOSTILE_BINDING_DETAILS_GETTER_SECRET");
+        },
+      },
+    });
+    let rejectRevalidation = false;
+    const service = new ProjectBindingService({
+      ...item.dependencies,
+      manifestRepository: {
+        inspect(actualRoute, expected) {
+          if (rejectRevalidation) throw hostile;
+          return originalManifestRepository.inspect(actualRoute, expected);
+        },
+      },
+    });
+    const resolution = await service.establish(request(item.projectRoot, item.vaultRoot));
+    if (!resolution.ok) assert.fail(resolution.message);
+    rejectRevalidation = true;
+
+    let caught: unknown;
+    try {
+      await service.revalidate(resolution.binding);
+    } catch (error) {
+      caught = error;
+    }
+
+    assert.ok(caught instanceof ProjectBindingError);
+    assert.doesNotThrow(() => JSON.stringify(caught));
+    assert.notStrictEqual(caught, hostile);
+    assert.equal(caught.code, "STORE_ROUTE_INVALID");
+    assert.deepEqual(caught.details, {});
+    assert.equal(JSON.stringify(caught).includes("SECRET"), false);
+  });
+
   it("fails rather than following descriptor, manifest, branch, common-dir, or generation drift", async () => {
     const changes: Array<{
       name: string;
@@ -915,6 +966,66 @@ describe("ProjectStatusService privacy", () => {
     assert.equal(status.project, undefined);
   });
 
+  it("snapshots successful runtime fields once before validating and reporting them", async () => {
+    const item = fixture();
+    await established(item);
+    const service = new ProjectStatusService(item.service);
+    const runtimeValues: Record<string, unknown> = {
+      ok: true,
+      nodeVersion: "24.0.0",
+      sqliteVersion: "3.53.0",
+      nodeVersionAtLeastMinimum: true,
+      sqliteVersionAtLeastMinimum: true,
+      nodeSqlite: true,
+      wal: true,
+      fts5: true,
+      foreignKeys: true,
+      synchronousFull: true,
+      busyTimeoutMs: 5000,
+      trustedSchemaOff: true,
+      transactionRollback: true,
+      applicationId: 0x504d454d,
+    };
+    const reads: Record<string, number> = {};
+    const statefulRuntime: Record<string, unknown> = {};
+    for (const [name, safeValue] of Object.entries(runtimeValues)) {
+      const validationReads = name === "nodeVersion" || name === "sqliteVersion" ? 2 : 1;
+      Object.defineProperty(statefulRuntime, name, {
+        enumerable: true,
+        get(): unknown {
+          reads[name] = (reads[name] ?? 0) + 1;
+          return reads[name]! <= validationReads
+            ? safeValue
+            : `RUNTIME_${name}_GETTER_SECRET`;
+        },
+      });
+    }
+
+    const status = service.status({
+      mode: "primary",
+      runtime: statefulRuntime as never,
+    });
+
+    assert.equal(status.state, "bound");
+    assert.equal(status.contentAuthorized, true);
+    assert.deepEqual(reads, Object.fromEntries(Object.keys(runtimeValues).map((name) => [name, 1])));
+    assert.deepEqual(status.runtime, {
+      ok: true,
+      nodeVersion: "24.0.0",
+      sqliteVersion: "3.53.0",
+      nodeSqlite: true,
+      wal: true,
+      fts5: true,
+      foreignKeys: true,
+      synchronousFull: true,
+      busyTimeoutMs: 5000,
+      trustedSchemaOff: true,
+      transactionRollback: true,
+      applicationId: 0x504d454d,
+    });
+    assert.equal(JSON.stringify(status).includes("SECRET"), false);
+  });
+
   it("reconstructs failure text locally and allowlists only fixed runtime check names", () => {
     const item = fixture();
     const service = new ProjectStatusService(item.service);
@@ -976,6 +1087,37 @@ describe("ProjectStatusService privacy", () => {
       code: "SQLITE_CAPABILITY_MISSING",
       nodeVersion: "unknown",
       checks: {},
+    });
+    assert.equal(JSON.stringify(status).includes("SECRET"), false);
+  });
+
+  it("safely allowlists a binding failure whose code getter throws", () => {
+    const item = fixture();
+    const service = new ProjectStatusService(item.service);
+    const hostileFailure = Object.defineProperty({
+      ok: false,
+      message: "FAILURE_MESSAGE_SECRET",
+      details: { secret: "FAILURE_DETAILS_SECRET" },
+      remediation: ["FAILURE_REMEDIATION_SECRET"],
+    }, "code", {
+      enumerable: true,
+      get(): never {
+        throw new Error("FAILURE_CODE_GETTER_SECRET");
+      },
+    });
+
+    const status = service.status({
+      mode: "primary",
+      runtime: null,
+      failure: hostileFailure as never,
+    });
+
+    assert.equal(status.state, "blocked");
+    assert.equal(status.contentAuthorized, false);
+    assert.deepEqual(status.failure, {
+      code: "PROJECT_BINDING_REQUIRED",
+      message: "A trusted project binding is required",
+      remediation: ["establish a new trusted project binding"],
     });
     assert.equal(JSON.stringify(status).includes("SECRET"), false);
   });
