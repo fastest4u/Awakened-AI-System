@@ -76,7 +76,12 @@ interface Waiter {
   predicate(message: ChildMessage): boolean;
   resolve(message: ChildMessage): void;
   reject(error: Error): void;
-  timer: NodeJS.Timeout;
+  timer: NodeJS.Timeout | undefined;
+}
+
+interface FixtureExit {
+  code: number | null;
+  signal: NodeJS.Signals | null;
 }
 
 class FixtureClient {
@@ -84,30 +89,48 @@ class FixtureClient {
   readonly stderr: string[] = [];
   readonly #messages: ChildMessage[] = [];
   readonly #waiters: Waiter[] = [];
-  #exit: { code: number | null; signal: NodeJS.Signals | null } | undefined;
+  readonly #disconnectPromise: Promise<void>;
+  readonly #exitPromise: Promise<FixtureExit>;
+  readonly #shutdownEvents: string[] = [];
+  #resolveDisconnect!: () => void;
+  #resolveExit!: (exit: FixtureExit) => void;
+  #exit: FixtureExit | undefined;
   #disconnected = false;
+  #killRequested = false;
 
   constructor(path = NORMAL_FIXTURE_PATH, args: string[] = []) {
     this.child = fork(path, args, {
       serialization: "json",
       stdio: ["ignore", "ignore", "pipe", "ipc"],
     });
+    this.#disconnectPromise = new Promise<void>((resolve) => { this.#resolveDisconnect = resolve; });
+    this.#exitPromise = new Promise<FixtureExit>((resolve) => { this.#resolveExit = resolve; });
     activeClients.add(this);
     this.child.stderr?.on("data", (chunk: Buffer | string) => this.stderr.push(String(chunk)));
     this.child.on("message", (message: unknown) => this.push(message as ChildMessage));
-    this.child.on("disconnect", () => { this.#disconnected = true; });
+    this.child.on("disconnect", () => {
+      this.#disconnected = true;
+      this.#shutdownEvents.push("disconnect");
+      this.#resolveDisconnect();
+    });
     this.child.on("exit", (code, signal) => {
       activeClients.delete(this);
       this.#exit = { code, signal };
+      this.#shutdownEvents.push("exit");
+      this.#resolveExit(this.#exit);
       const error = new Error(`fixture exited before barrier: ${code ?? signal ?? "unknown"}\n${this.stderr.join("")}`);
       for (const waiter of this.#waiters.splice(0)) {
-        clearTimeout(waiter.timer);
+        if (waiter.timer !== undefined) clearTimeout(waiter.timer);
         waiter.reject(error);
       }
     });
   }
 
-  waitFor(predicate: (message: ChildMessage) => boolean, label: string): Promise<ChildMessage> {
+  waitFor(
+    predicate: (message: ChildMessage) => boolean,
+    label: string,
+    bounded = true,
+  ): Promise<ChildMessage> {
     const queuedIndex = this.#messages.findIndex(predicate);
     if (queuedIndex >= 0) return Promise.resolve(this.#messages.splice(queuedIndex, 1)[0]!);
     if (this.#exit !== undefined) return Promise.reject(new Error(`fixture exited before ${label}`));
@@ -116,12 +139,15 @@ class FixtureClient {
         predicate,
         resolve,
         reject,
-        timer: setTimeout(() => {
+        timer: undefined,
+      };
+      if (bounded) {
+        waiter.timer = setTimeout(() => {
           const index = this.#waiters.indexOf(waiter);
           if (index >= 0) this.#waiters.splice(index, 1);
           reject(new Error(`fixture ${label} barrier timed out\n${this.stderr.join("")}`));
-        }, FIXTURE_TIMEOUT_MS),
-      };
+        }, FIXTURE_TIMEOUT_MS);
+      }
       this.#waiters.push(waiter);
     });
   }
@@ -170,31 +196,57 @@ class FixtureClient {
   }
 
   async close(): Promise<void> {
-    if (this.#exit !== undefined) return;
-    const disconnected = this.#disconnected
-      ? Promise.resolve()
-      : new Promise<void>((resolve) => this.child.once("disconnect", resolve));
-    const exited = new Promise<void>((resolve) => this.child.once("exit", () => resolve()));
-    this.send({ type: "close" });
-    assert.equal((await this.waitFor((message) => message.type === "closed", "closed")).type, "closed");
-    await Promise.all([disconnected, exited]);
+    if (this.#exit !== undefined) {
+      throw new Error(`fixture exited before cooperative close: ${this.#exit.code ?? this.#exit.signal ?? "unknown"}\n${this.stderr.join("")}`);
+    }
+    let timedOut = false;
+    let watchdog!: NodeJS.Timeout;
+    const barrier = (async () => {
+      this.send({ type: "close" });
+      const message = await this.waitFor((candidate) => candidate.type === "closed", "closed", false);
+      assert.equal(message.type, "closed");
+      await this.#disconnectPromise;
+      const exit = await this.#exitPromise;
+      assert.deepEqual(exit, { code: 0, signal: null });
+      assert.deepEqual(this.#shutdownEvents.slice(-3), ["closed", "disconnect", "exit"]);
+    })();
+    const timeout = new Promise<never>((_resolve, reject) => {
+      watchdog = setTimeout(() => {
+        timedOut = true;
+        reject(new Error("fixture cooperative shutdown timed out"));
+      }, FIXTURE_TIMEOUT_MS);
+    });
+    try {
+      await Promise.race([barrier, timeout]);
+    } catch (error) {
+      if (this.#exit === undefined) await this.forceCleanup();
+      if (timedOut) {
+        throw new Error(`fixture cooperative shutdown timed out after forced exit\n${this.stderr.join("")}`, { cause: error });
+      }
+      throw error;
+    } finally {
+      clearTimeout(watchdog);
+    }
   }
 
-  async forceCleanup(): Promise<void> {
-    if (this.#exit !== undefined) return;
-    const exited = new Promise<void>((resolve) => this.child.once("exit", () => resolve()));
-    this.child.kill();
-    await exited;
+  async forceCleanup(): Promise<FixtureExit> {
+    if (this.#exit !== undefined) return this.#exit;
+    if (!this.#killRequested) {
+      this.#killRequested = true;
+      this.child.kill();
+    }
+    return this.#exitPromise;
   }
 
   private push(message: ChildMessage): void {
+    if (message.type === "closed") this.#shutdownEvents.push("closed");
     const index = this.#waiters.findIndex((waiter) => waiter.predicate(message));
     if (index < 0) {
       this.#messages.push(message);
       return;
     }
     const [waiter] = this.#waiters.splice(index, 1);
-    clearTimeout(waiter!.timer);
+    if (waiter!.timer !== undefined) clearTimeout(waiter!.timer);
     waiter!.resolve(message);
   }
 }
@@ -340,7 +392,31 @@ async function verifyIntegrity(context: ProjectContext): Promise<void> {
   }
 }
 
-function counts(path: string): { events: number; commands: number; outbox: number } {
+interface SemanticCounts {
+  events: number;
+  streams: number;
+  commands: number;
+  outbox: number;
+  branchScopes: number;
+}
+
+const EMPTY_SEMANTIC_COUNTS: SemanticCounts = {
+  events: 0,
+  streams: 0,
+  commands: 0,
+  outbox: 0,
+  branchScopes: 0,
+};
+
+const COMMITTED_SEMANTIC_COUNTS: SemanticCounts = {
+  events: 2,
+  streams: 1,
+  commands: 1,
+  outbox: 1,
+  branchScopes: 0,
+};
+
+function counts(path: string): SemanticCounts {
   const database = new DatabaseSync(path, { readOnly: true });
   try {
     assert.equal(database.prepare("PRAGMA quick_check").get()?.quick_check, "ok");
@@ -348,8 +424,89 @@ function counts(path: string): { events: number; commands: number; outbox: numbe
     assert.deepEqual(database.prepare("PRAGMA foreign_key_check").all(), []);
     return {
       events: Number(database.prepare("SELECT count(*) AS count FROM events").get()?.count),
+      streams: Number(database.prepare("SELECT count(*) AS count FROM streams").get()?.count),
       commands: Number(database.prepare("SELECT count(*) AS count FROM command_dedup").get()?.count),
       outbox: Number(database.prepare("SELECT count(*) AS count FROM outbox").get()?.count),
+      branchScopes: Number(database.prepare("SELECT count(*) AS count FROM branch_scopes").get()?.count),
+    };
+  } finally {
+    database.close();
+  }
+}
+
+function normalizeStoredValue(value: unknown): unknown {
+  if (typeof value === "bigint") return { bigint: value.toString() };
+  if (Array.isArray(value)) return value.map((item) => normalizeStoredValue(item));
+  if (typeof value === "object" && value !== null) {
+    return Object.fromEntries(Object.entries(value)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, item]) => [key, normalizeStoredValue(item)]));
+  }
+  return value;
+}
+
+function storedCommandEvidence(
+  path: string,
+  command: AppendCommandWire,
+  deduplicated: boolean,
+): { result: AppendResultWire; persistence: unknown } {
+  const database = new DatabaseSync(path, { readOnly: true });
+  try {
+    const row = database.prepare(`
+      SELECT response_json AS responseJson, response_hash AS responseHash,
+             event_ids_json AS eventIdsJson,
+             first_global_position AS firstGlobalPosition,
+             last_global_position AS lastGlobalPosition,
+             final_stream_version AS finalStreamVersion,
+             command_id AS commandId, idempotency_key AS idempotencyKey
+      FROM command_dedup
+      WHERE command_id = ? AND idempotency_key = ?
+    `).get(command.commandId, command.idempotencyKey) as Record<string, unknown> | undefined;
+    assert.ok(row);
+    assert.equal(typeof row.responseJson, "string");
+    assert.equal(typeof row.responseHash, "string");
+    assert.equal(typeof row.eventIdsJson, "string");
+    const stored = JSON.parse(row.responseJson as string) as {
+      eventIds: string[];
+      firstGlobalPosition: string;
+      lastGlobalPosition: string;
+      finalStreamVersion: string;
+      response: JsonValue;
+    };
+    assert.deepEqual(JSON.parse(row.eventIdsJson as string), stored.eventIds);
+    assert.equal(String(row.firstGlobalPosition), stored.firstGlobalPosition);
+    assert.equal(String(row.lastGlobalPosition), stored.lastGlobalPosition);
+    assert.equal(String(row.finalStreamVersion), stored.finalStreamVersion);
+    assert.deepEqual(stored.response, command.publicResponse);
+    assert.deepEqual({
+      firstGlobalPosition: stored.firstGlobalPosition,
+      lastGlobalPosition: stored.lastGlobalPosition,
+      finalStreamVersion: stored.finalStreamVersion,
+    }, {
+      firstGlobalPosition: "1",
+      lastGlobalPosition: "2",
+      finalStreamVersion: "2",
+    });
+    const events = database.prepare(`
+      SELECT event_id AS eventId, global_position AS globalPosition,
+             stream_version AS streamVersion, command_event_index AS commandEventIndex
+      FROM events WHERE command_id = ? ORDER BY command_event_index
+    `).all(command.commandId);
+    assert.deepEqual(events.map((event) => event.eventId), stored.eventIds);
+    assert.deepEqual(events.map((event) => String(event.globalPosition)), ["1", "2"]);
+    assert.deepEqual(events.map((event) => String(event.streamVersion)), ["1", "2"]);
+    assert.deepEqual(events.map((event) => Number(event.commandEventIndex)), [0, 1]);
+    return {
+      result: {
+        deduplicated,
+        firstGlobalPosition: stored.firstGlobalPosition,
+        lastGlobalPosition: stored.lastGlobalPosition,
+        finalStreamVersion: stored.finalStreamVersion,
+        eventIds: stored.eventIds,
+        response: stored.response,
+        responseHash: row.responseHash as string,
+      },
+      persistence: normalizeStoredValue({ row, events }),
     };
   } finally {
     database.close();
@@ -378,8 +535,21 @@ function transaction<T>(connection: ReturnType<NodeSqliteDriver["open"]>, operat
 }
 
 afterEach(async () => {
-  await Promise.allSettled([...activeClients].map(async (client) => client.forceCleanup()));
-  for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+  const leaked = [...activeClients];
+  const failures: unknown[] = [];
+  try {
+    if (leaked.length > 0) failures.push(new Error(`unexpected active fixture clients: ${leaked.length}`));
+  } finally {
+    const cleanup = await Promise.allSettled(leaked.map(async (client) => client.forceCleanup()));
+    for (const result of cleanup) {
+      if (result.status === "rejected") failures.push(result.reason);
+    }
+    if (activeClients.size > 0) failures.push(new Error(`fixture clients remained active: ${activeClients.size}`));
+    for (const root of roots.splice(0)) {
+      try { rmSync(root, { recursive: true, force: true }); } catch (error) { failures.push(error); }
+    }
+  }
+  if (failures.length > 0) throw new AggregateError(failures, "fixture cleanup invariant failed");
 });
 
 describe("event store crash recovery", () => {
@@ -401,8 +571,11 @@ describe("event store crash recovery", () => {
 
       const beforeRetry = counts(route.eventsPath);
       assert.deepEqual(beforeRetry, boundary === "after-commit-before-response"
-        ? { events: 2, commands: 1, outbox: 1 }
-        : { events: 0, commands: 0, outbox: 0 });
+        ? COMMITTED_SEMANTIC_COUNTS
+        : EMPTY_SEMANTIC_COUNTS);
+      const committedBeforeRetry = boundary === "after-commit-before-response"
+        ? storedCommandEvidence(route.eventsPath, command, true)
+        : undefined;
 
       const recovery = new FixtureClient();
       await recovery.ready();
@@ -412,11 +585,22 @@ describe("event store crash recovery", () => {
       });
       const result = await recovery.append(command);
       if (result.type === "error") assert.fail(`${result.code}: ${result.message}`);
-      assert.equal(result.result.deduplicated, boundary === "after-commit-before-response");
-      assert.equal(result.result.eventIds.length, 2);
+      const expectedResult = storedCommandEvidence(
+        route.eventsPath,
+        command,
+        boundary === "after-commit-before-response",
+      );
+      assert.deepEqual(result.result, expectedResult.result);
+      if (committedBeforeRetry !== undefined) {
+        assert.deepEqual(expectedResult.persistence, committedBeforeRetry.persistence);
+        assert.deepEqual(counts(route.eventsPath), beforeRetry);
+      } else {
+        assert.equal(result.result.deduplicated, false);
+        assert.deepEqual(counts(route.eventsPath), COMMITTED_SEMANTIC_COUNTS);
+      }
       await recovery.close();
 
-      assert.deepEqual(counts(route.eventsPath), { events: 2, commands: 1, outbox: 1 });
+      assert.deepEqual(counts(route.eventsPath), COMMITTED_SEMANTIC_COUNTS);
       await verifyIntegrity(await contextFor({
         ...project.request,
         clientInstanceId: `${boundary}-integrity`,
@@ -467,7 +651,7 @@ describe("event store crash recovery", () => {
     });
     await forcedExit;
     await uncertain.close();
-    assert.deepEqual(counts(route.eventsPath), { events: 2, commands: 1, outbox: 1 });
+    assert.deepEqual(counts(route.eventsPath), COMMITTED_SEMANTIC_COUNTS);
 
     const recovered = new ProjectStoreExecutor({
       workerUrl: WORKER_URL,
@@ -482,7 +666,7 @@ describe("event store crash recovery", () => {
     const replay = await recovered.append(decodedCommand);
     assert.equal(replay.deduplicated, true);
     await recovered.close();
-    assert.deepEqual(counts(route.eventsPath), { events: 2, commands: 1, outbox: 1 });
+    assert.deepEqual(counts(route.eventsPath), COMMITTED_SEMANTIC_COUNTS);
     await verifyIntegrity(context);
     proveHandleRelease(route.eventsPath);
   });
@@ -545,7 +729,7 @@ describe("event store crash recovery", () => {
     } finally {
       secondConnection.close();
     }
-    assert.deepEqual(counts(path), { events: 0, commands: 0, outbox: 0 });
+    assert.deepEqual(counts(path), EMPTY_SEMANTIC_COUNTS);
     await verifyIntegrity(await contextFor(project.request));
     proveHandleRelease(path);
   });

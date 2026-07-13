@@ -61,7 +61,12 @@ interface MessageWaiter {
   predicate(message: ChildMessage): boolean;
   resolve(message: ChildMessage): void;
   reject(error: Error): void;
-  timer: NodeJS.Timeout;
+  timer: NodeJS.Timeout | undefined;
+}
+
+interface FixtureExit {
+  code: number | null;
+  signal: NodeJS.Signals | null;
 }
 
 class FixtureClient {
@@ -69,24 +74,38 @@ class FixtureClient {
   readonly stderr: string[] = [];
   readonly #messages: ChildMessage[] = [];
   readonly #waiters: MessageWaiter[] = [];
+  readonly #disconnectPromise: Promise<void>;
+  readonly #exitPromise: Promise<FixtureExit>;
+  readonly #shutdownEvents: string[] = [];
+  #resolveDisconnect!: () => void;
+  #resolveExit!: (exit: FixtureExit) => void;
   #disconnected = false;
-  #exit: { code: number | null; signal: NodeJS.Signals | null } | undefined;
+  #exit: FixtureExit | undefined;
+  #killRequested = false;
 
   constructor(args: string[] = []) {
     this.child = fork(FIXTURE_PATH, args, {
       serialization: "json",
       stdio: ["ignore", "ignore", "pipe", "ipc"],
     });
+    this.#disconnectPromise = new Promise<void>((resolve) => { this.#resolveDisconnect = resolve; });
+    this.#exitPromise = new Promise<FixtureExit>((resolve) => { this.#resolveExit = resolve; });
     activeClients.add(this);
     this.child.stderr?.on("data", (chunk: Buffer | string) => this.stderr.push(String(chunk)));
     this.child.on("message", (message: unknown) => this.push(message as ChildMessage));
-    this.child.on("disconnect", () => { this.#disconnected = true; });
+    this.child.on("disconnect", () => {
+      this.#disconnected = true;
+      this.#shutdownEvents.push("disconnect");
+      this.#resolveDisconnect();
+    });
     this.child.on("exit", (code, signal) => {
       activeClients.delete(this);
       this.#exit = { code, signal };
+      this.#shutdownEvents.push("exit");
+      this.#resolveExit(this.#exit);
       const error = new Error(`fixture exited before barrier: ${code ?? signal ?? "unknown"}\n${this.stderr.join("")}`);
       for (const waiter of this.#waiters.splice(0)) {
-        clearTimeout(waiter.timer);
+        if (waiter.timer !== undefined) clearTimeout(waiter.timer);
         waiter.reject(error);
       }
     });
@@ -106,6 +125,7 @@ class FixtureClient {
   waitFor(
     predicate: (message: ChildMessage) => boolean,
     label: string,
+    bounded = true,
   ): Promise<ChildMessage> {
     const queuedIndex = this.#messages.findIndex(predicate);
     if (queuedIndex >= 0) return Promise.resolve(this.#messages.splice(queuedIndex, 1)[0]!);
@@ -117,12 +137,15 @@ class FixtureClient {
         predicate,
         resolve,
         reject,
-        timer: setTimeout(() => {
+        timer: undefined,
+      };
+      if (bounded) {
+        waiter.timer = setTimeout(() => {
           const index = this.#waiters.indexOf(waiter);
           if (index >= 0) this.#waiters.splice(index, 1);
           reject(new Error(`fixture ${label} barrier timed out\n${this.stderr.join("")}`));
-        }, FIXTURE_TIMEOUT_MS),
-      };
+        }, FIXTURE_TIMEOUT_MS);
+      }
       this.#waiters.push(waiter);
     });
   }
@@ -149,32 +172,57 @@ class FixtureClient {
   }
 
   async close(): Promise<void> {
-    if (this.#exit !== undefined) return;
-    const disconnected = this.#disconnected
-      ? Promise.resolve()
-      : new Promise<void>((resolve) => this.child.once("disconnect", resolve));
-    const exited = new Promise<void>((resolve) => this.child.once("exit", () => resolve()));
-    this.send({ type: "close" });
-    const message = await this.waitFor((candidate) => candidate.type === "closed", "closed");
-    assert.equal(message.type, "closed");
-    await Promise.all([disconnected, exited]);
+    if (this.#exit !== undefined) {
+      throw new Error(`fixture exited before cooperative close: ${this.#exit.code ?? this.#exit.signal ?? "unknown"}\n${this.stderr.join("")}`);
+    }
+    let timedOut = false;
+    let watchdog!: NodeJS.Timeout;
+    const barrier = (async () => {
+      this.send({ type: "close" });
+      const message = await this.waitFor((candidate) => candidate.type === "closed", "closed", false);
+      assert.equal(message.type, "closed");
+      await this.#disconnectPromise;
+      const exit = await this.#exitPromise;
+      assert.deepEqual(exit, { code: 0, signal: null });
+      assert.deepEqual(this.#shutdownEvents.slice(-3), ["closed", "disconnect", "exit"]);
+    })();
+    const timeout = new Promise<never>((_resolve, reject) => {
+      watchdog = setTimeout(() => {
+        timedOut = true;
+        reject(new Error("fixture cooperative shutdown timed out"));
+      }, FIXTURE_TIMEOUT_MS);
+    });
+    try {
+      await Promise.race([barrier, timeout]);
+    } catch (error) {
+      if (this.#exit === undefined) await this.forceCleanup();
+      if (timedOut) {
+        throw new Error(`fixture cooperative shutdown timed out after forced exit\n${this.stderr.join("")}`, { cause: error });
+      }
+      throw error;
+    } finally {
+      clearTimeout(watchdog);
+    }
   }
 
-  async forceCleanup(): Promise<void> {
-    if (this.#exit !== undefined) return;
-    const exited = new Promise<void>((resolve) => this.child.once("exit", () => resolve()));
-    this.child.kill();
-    await exited;
+  async forceCleanup(): Promise<FixtureExit> {
+    if (this.#exit !== undefined) return this.#exit;
+    if (!this.#killRequested) {
+      this.#killRequested = true;
+      this.child.kill();
+    }
+    return this.#exitPromise;
   }
 
   private push(message: ChildMessage): void {
+    if (message.type === "closed") this.#shutdownEvents.push("closed");
     const index = this.#waiters.findIndex((waiter) => waiter.predicate(message));
     if (index < 0) {
       this.#messages.push(message);
       return;
     }
     const [waiter] = this.#waiters.splice(index, 1);
-    clearTimeout(waiter!.timer);
+    if (waiter!.timer !== undefined) clearTimeout(waiter!.timer);
     waiter!.resolve(message);
   }
 }
@@ -349,10 +397,62 @@ function inspectStore(route: ProjectStoreRouteWire, expectedEvents: number, expe
   }
 }
 
-function eventCount(path: string): number {
-  const database = new DatabaseSync(path, { readOnly: true });
+function quoteIdentifier(value: string): string {
+  return `"${value.replaceAll('"', '""')}"`;
+}
+
+function normalizePersistentValue(value: unknown): unknown {
+  if (typeof value === "bigint") return { bigint: value.toString() };
+  if (value instanceof Uint8Array) return { bytes: Buffer.from(value).toString("base64") };
+  if (Array.isArray(value)) return value.map((item) => normalizePersistentValue(item));
+  if (typeof value === "object" && value !== null) {
+    return Object.fromEntries(Object.entries(value)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, item]) => [key, normalizePersistentValue(item)]));
+  }
+  return value;
+}
+
+function persistentSnapshot(vaultRoot: string, route: ProjectStoreRouteWire): unknown {
+  const database = new DatabaseSync(route.eventsPath, { readOnly: true });
   try {
-    return Number(database.prepare("SELECT count(*) AS count FROM events").get()?.count);
+    const tableNames = database.prepare(`
+      SELECT name FROM sqlite_schema
+      WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+      ORDER BY name
+    `).all().map((row) => String(row.name));
+    const tables: Record<string, unknown> = {};
+    for (const tableName of tableNames) {
+      const columns = database.prepare(`PRAGMA table_info(${quoteIdentifier(tableName)})`).all() as Array<{
+        name: string;
+        pk: number | bigint;
+      }>;
+      const primaryKey = columns.filter((column) => Number(column.pk) > 0)
+        .sort((left, right) => Number(left.pk) - Number(right.pk));
+      const order = (primaryKey.length > 0 ? primaryKey : columns)
+        .map((column) => quoteIdentifier(column.name)).join(", ");
+      tables[tableName] = normalizePersistentValue(database.prepare(
+        `SELECT * FROM ${quoteIdentifier(tableName)} ORDER BY ${order}`,
+      ).all());
+    }
+    return {
+      descriptorBytes: readFileSync(
+        join(vaultRoot, ".memory-mcp", "project-identity.json"),
+      ).toString("base64"),
+      manifestBytes: readFileSync(route.storeManifestPath).toString("base64"),
+      pragmas: normalizePersistentValue({
+        applicationId: database.prepare("PRAGMA application_id").get(),
+        userVersion: database.prepare("PRAGMA user_version").get(),
+        schemaVersion: database.prepare("PRAGMA schema_version").get(),
+      }),
+      schema: normalizePersistentValue(database.prepare(`
+        SELECT type, name, tbl_name AS tableName, sql
+        FROM sqlite_schema
+        WHERE name NOT LIKE 'sqlite_%'
+        ORDER BY type, name
+      `).all()),
+      tables,
+    };
   } finally {
     database.close();
   }
@@ -437,8 +537,21 @@ async function linkedWorktreeProof(): Promise<void> {
 }
 
 afterEach(async () => {
-  await Promise.allSettled([...activeClients].map(async (client) => client.forceCleanup()));
-  for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+  const leaked = [...activeClients];
+  const failures: unknown[] = [];
+  try {
+    if (leaked.length > 0) failures.push(new Error(`unexpected active fixture clients: ${leaked.length}`));
+  } finally {
+    const cleanup = await Promise.allSettled(leaked.map(async (client) => client.forceCleanup()));
+    for (const result of cleanup) {
+      if (result.status === "rejected") failures.push(result.reason);
+    }
+    if (activeClients.size > 0) failures.push(new Error(`fixture clients remained active: ${activeClients.size}`));
+    for (const root of roots.splice(0)) {
+      try { rmSync(root, { recursive: true, force: true }); } catch (error) { failures.push(error); }
+    }
+  }
+  if (failures.length > 0) throw new AggregateError(failures, "fixture cleanup invariant failed");
 });
 
 describe("event store process isolation", () => {
@@ -447,11 +560,25 @@ describe("event store process isolation", () => {
     const projectQ = projectFixture("project-q");
 
     const firstOpen = [new FixtureClient(), new FixtureClient()];
-    const firstStarted = await startAll(firstOpen, firstOpen.map(() => ({
+    await Promise.all(firstOpen.map((client) => client.ready()));
+    const virginStoreRoot = join(projectP.vaultRoot, ".memory-mcp", "v2");
+    for (const path of [
+      join(projectP.vaultRoot, ".memory-mcp", "project-identity.json"),
+      join(virginStoreRoot, "store-manifest.json"),
+      join(virginStoreRoot, "events.sqlite"),
+      join(virginStoreRoot, "events.sqlite-wal"),
+      join(virginStoreRoot, "events.sqlite-shm"),
+    ]) assert.equal(existsSync(path), false, path);
+    const virginAction = {
       kind: "initialize" as const,
       request: projectP.request,
       replicaDecision: "initialize-local" as const,
-    })));
+    };
+    const firstMessages = await Promise.all(firstOpen.map((client) => client.start(virginAction)));
+    for (const message of firstMessages) {
+      if (message.type === "error") assert.fail(`${message.code}: ${message.message}`);
+    }
+    const firstStarted = firstMessages as Extract<ChildMessage, { type: "started" }>[];
     const initialized = firstStarted.map((message) => {
       assert.equal(message.result.kind, "initialized");
       return message.result;
@@ -498,13 +625,14 @@ describe("event store process isolation", () => {
 
     const pBinding = await bindingFor(projectP.request);
     const qBinding = await bindingFor(projectQ.request);
-    const pBeforeAuthorityProbe = eventCount(routeP.eventsPath);
+    const beforeForeignRoute = persistentSnapshot(projectP.vaultRoot, routeP);
     const foreignRoute = new FixtureClient();
     await foreignRoute.ready();
     const foreignStarted = await foreignRoute.start({ kind: "open", route: routeP, binding: qBinding });
     assert.equal(foreignStarted.type, "error");
     if (foreignStarted.type === "error") assert.equal(foreignStarted.code, "PROJECT_ID_MISMATCH");
     await foreignRoute.close();
+    assert.deepEqual(persistentSnapshot(projectP.vaultRoot, routeP), beforeForeignRoute);
     const foreignStore = new FixtureClient();
     await foreignStore.ready();
     const pContext = decodeWorkerBinding(pBinding);
@@ -520,6 +648,7 @@ describe("event store process isolation", () => {
         contextFingerprint: computeProjectContextFingerprint(foreignBindingWithoutFingerprint),
       },
     });
+    const beforeForeignStore = persistentSnapshot(projectP.vaultRoot, routeP);
     const foreignStoreStarted = await foreignStore.start({
       kind: "open",
       route: routeP,
@@ -528,8 +657,7 @@ describe("event store process isolation", () => {
     assert.equal(foreignStoreStarted.type, "error");
     if (foreignStoreStarted.type === "error") assert.equal(foreignStoreStarted.code, "STORE_ID_MISMATCH");
     await foreignStore.close();
-    const pAfterAuthorityProbe = eventCount(routeP.eventsPath);
-    assert.equal(pAfterAuthorityProbe, pBeforeAuthorityProbe);
+    assert.deepEqual(persistentSnapshot(projectP.vaultRoot, routeP), beforeForeignStore);
 
     const pIdentity = inspectStore(routeP, 100, 4);
     const qIdentity = inspectStore(routeQ, 50, 2);
