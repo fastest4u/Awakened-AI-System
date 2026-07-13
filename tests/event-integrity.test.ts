@@ -39,6 +39,7 @@ import { canonicalJson } from "../src/orchestrator/serialization/canonical-json.
 import { BranchScopeRepository } from "../src/orchestrator/storage/branch-scope.repository.js";
 import {
   EventStore,
+  GENESIS_GLOBAL_HASH,
   SqliteEventStoreStatements,
 } from "../src/orchestrator/storage/event-store.js";
 import { MaintenanceFence } from "../src/orchestrator/storage/maintenance-fence.js";
@@ -352,6 +353,29 @@ function recomputedEventHash(
   });
 }
 
+function rehashCompleteEventChain(connection: SqliteConnection): void {
+  let previousGlobalHash = GENESIS_GLOBAL_HASH;
+  const rows = connection.prepare(`
+    SELECT * FROM events ORDER BY global_position
+  `).all();
+  for (const row of rows) {
+    const nextEventHash = recomputedEventHash(row, {
+      previous_global_hash: previousGlobalHash,
+    });
+    connection.prepare(`
+      UPDATE events
+      SET previous_global_hash = $previousGlobalHash,
+          event_hash = $eventHash
+      WHERE global_position = $globalPosition
+    `).run({
+      $previousGlobalHash: previousGlobalHash,
+      $eventHash: nextEventHash,
+      $globalPosition: bigintField(row, "global_position"),
+    });
+    previousGlobalHash = nextEventHash;
+  }
+}
+
 class ObservingConnection implements SqliteConnection {
   readonly executed: string[] = [];
 
@@ -414,12 +438,15 @@ describe("EventIntegrityService valid checks", () => {
       "SQLITE_INTEGRITY_CHECK_FAILED",
       "SQLITE_FOREIGN_KEY_CHECK_FAILED",
       "MIGRATION_CHECKSUM_MISMATCH",
+      "PROJECT_SCHEMA_VERSION_MISMATCH",
       "SCHEMA_FINGERPRINT_MISMATCH",
       "STREAM_HEAD_VERSION_MISMATCH",
       "STREAM_TYPE_MISMATCH",
       "COMMAND_RANGE_FOREIGN_EVENT",
       "COMMAND_RANGE_MISSING_EVENT",
       "COMMAND_EVENT_INDEX_MISMATCH",
+      "COMMAND_HASH_MISMATCH",
+      "COMMAND_METADATA_MISMATCH",
       "COMMAND_RESPONSE_HASH_MISMATCH",
       "GLOBAL_POSITION_NONCONTIGUOUS",
       "STREAM_VERSION_NONCONTIGUOUS",
@@ -636,6 +663,17 @@ describe("EventIntegrityService schema, stream, and command checks", () => {
     );
   });
 
+  it("rejects a changed project schema version even when migration history is intact", () => {
+    const fixture = createFixture();
+    mutateProtected(fixture, "project_meta_no_update", () => {
+      fixture.connection.exec("UPDATE project_meta SET schema_version = 2");
+    });
+
+    const report = fixture.integrity.fullCheck(fixture.context);
+    assert.equal(report.ok, false);
+    assert.ok(issueCodes(report).includes("PROJECT_SCHEMA_VERSION_MISMATCH"));
+  });
+
   it("detects stream-head and stream-type drift", () => {
     const headFixture = createFixture();
     headFixture.connection.exec(`
@@ -706,6 +744,81 @@ describe("EventIntegrityService schema, stream, and command checks", () => {
       indexFixture.integrity.quickCheck(indexFixture.context, 256),
       ["COMMAND_EVENT_INDEX_MISMATCH", "EVENT_HASH_MISMATCH"],
     );
+  });
+
+  it("rejects a substituted valid-format command hash", () => {
+    const fixture = createFixture();
+    mutateProtected(fixture, "command_dedup_no_update", () => {
+      fixture.connection.prepare(`
+        UPDATE command_dedup SET command_hash = $commandHash WHERE command_id = $commandId
+      `).run({ $commandHash: "f".repeat(64), $commandId: COMMAND_A });
+    });
+
+    const report = fixture.integrity.fullCheck(fixture.context);
+    assert.equal(report.ok, false);
+    assert.ok(issueCodes(report).includes("COMMAND_HASH_MISMATCH"));
+  });
+
+  it("binds command type into the recomputed command hash", () => {
+    const fixture = createFixture();
+    mutateProtected(fixture, "command_dedup_no_update", () => {
+      fixture.connection.prepare(`
+        UPDATE command_dedup SET command_type = 'SubstitutedType' WHERE command_id = $commandId
+      `).run({ $commandId: COMMAND_A });
+    });
+
+    const report = fixture.integrity.fullCheck(fixture.context);
+    assert.equal(report.ok, false);
+    assert.ok(issueCodes(report).includes("COMMAND_HASH_MISMATCH"));
+  });
+
+  it("requires every indexed event to retain its command idempotency key", () => {
+    const fixture = createFixture();
+    mutateProtected(fixture, "events_no_update", () => {
+      fixture.connection.prepare(`
+        UPDATE events
+        SET idempotency_key = 'integrity:substituted-key'
+        WHERE command_id = $commandId
+      `).run({ $commandId: COMMAND_A });
+      rehashCompleteEventChain(fixture.connection);
+    });
+
+    const report = fixture.integrity.fullCheck(fixture.context);
+    assert.equal(report.ok, false);
+    assert.ok(issueCodes(report).includes("COMMAND_METADATA_MISMATCH"));
+  });
+
+  it("requires command state to remain committed", () => {
+    const fixture = createFixture();
+    fixture.connection.exec("PRAGMA ignore_check_constraints = ON");
+    try {
+      mutateProtected(fixture, "command_dedup_no_update", () => {
+        fixture.connection.prepare(`
+          UPDATE command_dedup SET state = 'substituted' WHERE command_id = $commandId
+        `).run({ $commandId: COMMAND_A });
+      });
+    } finally {
+      fixture.connection.exec("PRAGMA ignore_check_constraints = OFF");
+    }
+
+    const report = fixture.integrity.fullCheck(fixture.context);
+    assert.equal(report.ok, false);
+    assert.ok(issueCodes(report).includes("COMMAND_METADATA_MISMATCH"));
+  });
+
+  it("binds committed time to the command events' recorded time", () => {
+    const fixture = createFixture();
+    mutateProtected(fixture, "command_dedup_no_update", () => {
+      fixture.connection.prepare(`
+        UPDATE command_dedup
+        SET committed_at = '2026-07-13T02:00:01.000Z'
+        WHERE command_id = $commandId
+      `).run({ $commandId: COMMAND_A });
+    });
+
+    const report = fixture.integrity.fullCheck(fixture.context);
+    assert.equal(report.ok, false);
+    assert.ok(issueCodes(report).includes("COMMAND_METADATA_MISMATCH"));
   });
 
   it("rejects semantically equivalent but noncanonical payload and response JSON", () => {
@@ -893,7 +1006,7 @@ describe("EventIntegrityService event-chain and orphan checks", () => {
     });
     assertIssueCodes(
       timestampFixture.integrity.fullCheck(timestampFixture.context),
-      ["EVENT_TIMESTAMP_INVALID"],
+      ["COMMAND_HASH_MISMATCH", "EVENT_TIMESTAMP_INVALID"],
     );
 
     const recordedFixture = createFixture();
@@ -911,7 +1024,7 @@ describe("EventIntegrityService event-chain and orphan checks", () => {
     });
     assertIssueCodes(
       recordedFixture.integrity.fullCheck(recordedFixture.context),
-      ["EVENT_TIMESTAMP_INVALID"],
+      ["COMMAND_METADATA_MISMATCH", "EVENT_TIMESTAMP_INVALID"],
     );
   });
 

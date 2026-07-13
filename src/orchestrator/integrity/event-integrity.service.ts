@@ -1,5 +1,10 @@
 import { readFileSync } from "node:fs";
-import { eventHash, payloadHash, responseHash } from "../crypto/event-hash.js";
+import {
+  commandHash,
+  eventHash,
+  payloadHash,
+  responseHash,
+} from "../crypto/event-hash.js";
 import type { ProjectContext } from "../identity/contracts.js";
 import { parseProjectDescriptor } from "../identity/project-descriptor.schema.js";
 import { parseStoreManifest } from "../identity/store-manifest.schema.js";
@@ -47,12 +52,15 @@ const ISSUE_MESSAGES: Record<IntegrityIssueCode, string> = {
   SQLITE_INTEGRITY_CHECK_FAILED: "SQLite integrity_check reported corruption",
   SQLITE_FOREIGN_KEY_CHECK_FAILED: "SQLite foreign-key verification reported corruption",
   MIGRATION_CHECKSUM_MISMATCH: "Recorded migration history does not match the required migrations",
+  PROJECT_SCHEMA_VERSION_MISMATCH: "Project schema version does not match the required migrations",
   SCHEMA_FINGERPRINT_MISMATCH: "Authoritative SQLite schema fingerprint does not match",
   STREAM_HEAD_VERSION_MISMATCH: "Stream head version does not match its maximum event version",
   STREAM_TYPE_MISMATCH: "Stream metadata type does not match its events",
   COMMAND_RANGE_FOREIGN_EVENT: "Command range contains an event owned by another command",
   COMMAND_RANGE_MISSING_EVENT: "Command range does not contain every event owned by the command",
   COMMAND_EVENT_INDEX_MISMATCH: "Command event indexes are not zero-based and contiguous",
+  COMMAND_HASH_MISMATCH: "Stored command hash does not match reconstructable command material",
+  COMMAND_METADATA_MISMATCH: "Committed command metadata does not match its indexed events",
   COMMAND_RESPONSE_HASH_MISMATCH: "Stored command response does not match its response hash",
   GLOBAL_POSITION_NONCONTIGUOUS: "Global event positions are not contiguous",
   STREAM_VERSION_NONCONTIGUOUS: "Per-stream event versions are not contiguous",
@@ -95,12 +103,16 @@ interface CommandRow {
   projectId: string;
   idempotencyKey: string;
   commandId: string;
+  commandType: string;
+  commandHash: string;
+  state: string;
   firstGlobalPosition: bigint;
   lastGlobalPosition: bigint;
   finalStreamVersion: bigint;
   eventIdsJson: string;
   responseJson: string;
   responseHash: string;
+  committedAt: string;
 }
 
 interface StructuralCheck {
@@ -240,12 +252,16 @@ function commandRow(row: SqliteRow): CommandRow {
     projectId: stringValue(row, "project_id"),
     idempotencyKey: stringValue(row, "idempotency_key"),
     commandId: stringValue(row, "command_id"),
+    commandType: stringValue(row, "command_type"),
+    commandHash: stringValue(row, "command_hash"),
+    state: stringValue(row, "state"),
     firstGlobalPosition: bigintValue(row, "first_global_position"),
     lastGlobalPosition: bigintValue(row, "last_global_position"),
     finalStreamVersion: bigintValue(row, "final_stream_version"),
     eventIdsJson: stringValue(row, "event_ids_json"),
     responseJson: stringValue(row, "response_json"),
     responseHash: stringValue(row, "response_hash"),
+    committedAt: stringValue(row, "committed_at"),
   };
 }
 
@@ -348,11 +364,12 @@ export class EventIntegrityService {
     this.checkPragma("integrity_check", "SQLITE_INTEGRITY_CHECK_FAILED", issues);
     this.checkForeignKeys(issues);
     const structural = this.checkStructural(context, issues);
+    this.checkProjectSchemaVersion(issues);
     this.checkStreams(structural.streams, structural.events, issues);
-    this.checkCommands(structural.commands, structural.events, issues);
     const rows = this.connection.prepare(`
       SELECT * FROM events ORDER BY global_position
     `).all();
+    this.checkCommands(structural.commands, structural.events, issues, rows);
     this.checkEventRows(context, rows, {
       expectedFirst: 1n,
       expectedPreviousHash: GENESIS_GLOBAL_HASH,
@@ -452,8 +469,9 @@ export class EventIntegrityService {
     const commands = includeStreamsAndCommands
       ? this.connection.prepare(`
           SELECT project_id, idempotency_key, command_id, first_global_position,
-                 last_global_position, final_stream_version, event_ids_json,
-                 response_json, response_hash
+                 command_type, command_hash, state, last_global_position,
+                 final_stream_version, event_ids_json, response_json, response_hash,
+                 committed_at
           FROM command_dedup
           ORDER BY project_id, first_global_position, command_id
         `).all().map(commandRow)
@@ -532,6 +550,22 @@ export class EventIntegrityService {
     }
   }
 
+  private checkProjectSchemaVersion(issues: IssueCollector): void {
+    const expectedVersion = this.migrations.at(-1)?.version;
+    const rows = this.connection.prepare(`
+      SELECT schema_version FROM project_meta WHERE singleton = 1
+    `).all();
+    if (
+      expectedVersion === undefined
+      || rows.length !== 1
+      || (typeof rows[0]?.schema_version !== "bigint"
+        && typeof rows[0]?.schema_version !== "number")
+      || Number(rows[0]!.schema_version) !== expectedVersion
+    ) {
+      issues.add("PROJECT_SCHEMA_VERSION_MISMATCH");
+    }
+  }
+
   private checkPragma(
     pragma: "quick_check" | "integrity_check",
     code: "SQLITE_QUICK_CHECK_FAILED" | "SQLITE_INTEGRITY_CHECK_FAILED",
@@ -597,8 +631,16 @@ export class EventIntegrityService {
     commands: readonly CommandRow[],
     events: readonly EventIndexRow[],
     issues: IssueCollector,
+    fullEventRows?: readonly SqliteRow[],
   ): void {
     const commandIds = new Set(commands.map((command) => command.commandId));
+    const fullRowsByCommand = new Map<string, SqliteRow[]>();
+    for (const row of fullEventRows ?? []) {
+      const commandId = stringValue(row, "command_id");
+      const rows = fullRowsByCommand.get(commandId) ?? [];
+      rows.push(row);
+      fullRowsByCommand.set(commandId, rows);
+    }
     for (const event of events) {
       if (!commandIds.has(event.commandId)) {
         issues.add("ORPHAN_EVENT", {
@@ -678,6 +720,169 @@ export class EventIntegrityService {
         issues.add("COMMAND_RESPONSE_HASH_MISMATCH", { commandId: command.commandId });
         issues.add("COMMAND_RANGE_MISSING_EVENT", { commandId: command.commandId });
       }
+      if (fullEventRows !== undefined && ownEvents.length !== 0) {
+        const commandEventRows = fullRowsByCommand.get(command.commandId) ?? [];
+        this.checkCommandMetadata(command, ownEvents, commandEventRows, issues);
+      }
+    }
+  }
+
+  private checkCommandMetadata(
+    command: CommandRow,
+    events: readonly EventIndexRow[],
+    rows: readonly SqliteRow[],
+    issues: IssueCollector,
+  ): void {
+    const location = { commandId: command.commandId };
+    const first = rows[0];
+    let metadataMatches = rows.length === events.length
+      && command.state === "committed"
+      && command.commandType.trim().length !== 0
+      && strictRfc3339(command.committedAt);
+    if (first !== undefined) {
+      const commonFields = [
+        "project_id",
+        "store_id",
+        "workspace_id",
+        "stream_id",
+        "stream_type",
+        "correlation_id",
+        "agent_id",
+        "branch_scope_id",
+        "branch_ref",
+      ] as const;
+      for (const row of rows) {
+        if (
+          stringValue(row, "command_id") !== command.commandId
+          || stringValue(row, "project_id") !== command.projectId
+          || stringValue(row, "idempotency_key") !== command.idempotencyKey
+          || stringValue(row, "recorded_at") !== command.committedAt
+          || commonFields.some((field) => row[field] !== first[field])
+        ) {
+          metadataMatches = false;
+        }
+      }
+    }
+    if (events.some((event) => event.idempotencyKey !== command.idempotencyKey)) {
+      metadataMatches = false;
+    }
+    if (!metadataMatches) issues.add("COMMAND_METADATA_MISMATCH", location);
+
+    const expectedHash = this.reconstructCommandHash(command, rows);
+    if (expectedHash !== undefined && expectedHash !== command.commandHash) {
+      issues.add("COMMAND_HASH_MISMATCH", location);
+    }
+  }
+
+  private reconstructCommandHash(
+    command: CommandRow,
+    sourceRows: readonly SqliteRow[],
+  ): string | undefined {
+    try {
+      const rows = [...sourceRows].sort((left, right) => {
+        const leftIndex = bigintValue(left, "command_event_index");
+        const rightIndex = bigintValue(right, "command_event_index");
+        return leftIndex === rightIndex ? 0 : leftIndex < rightIndex ? -1 : 1;
+      });
+      const first = rows[0];
+      if (first === undefined) return undefined;
+      for (let index = 0; index < rows.length; index += 1) {
+        const row = rows[index]!;
+        if (
+          bigintValue(row, "command_event_index") !== BigInt(index)
+          || !this.matchesEventHash(row)
+        ) {
+          return undefined;
+        }
+        const payload = canonicalJsonValue(stringValue(row, "payload_json"));
+        if (payloadHash(payload) !== stringValue(row, "payload_hash")) return undefined;
+      }
+
+      const branchScopeId = nullableStringValue(first, "branch_scope_id");
+      const branchRef = nullableStringValue(first, "branch_ref");
+      let git: { headCommit: string; branchRef: null; detached: true } | null;
+      if (branchScopeId === null && branchRef === null) {
+        git = null;
+      } else if (branchScopeId !== null && branchRef === null) {
+        const scopeRows = this.connection.prepare(`
+          SELECT created_head
+          FROM branch_scopes
+          WHERE project_id = $projectId AND branch_scope_id = $branchScopeId
+        `).all({
+          $projectId: stringValue(first, "project_id"),
+          $branchScopeId: branchScopeId,
+        });
+        if (scopeRows.length !== 1) return undefined;
+        git = {
+          headCommit: stringValue(scopeRows[0]!, "created_head"),
+          branchRef: null,
+          detached: true,
+        };
+      } else {
+        // Attached Git events do not yet persist the per-command HEAD witness.
+        return undefined;
+      }
+
+      const outboxRows = this.connection.prepare(`
+        SELECT outbox.target_key, outbox.kind, outbox.payload_json,
+               events.command_event_index
+        FROM outbox
+        JOIN events ON events.global_position = outbox.event_position
+        WHERE events.project_id = $projectId AND events.command_id = $commandId
+      `).all({
+        $projectId: command.projectId,
+        $commandId: command.commandId,
+      });
+      // The current schema does not persist original ordering for multiple outbox items.
+      if (outboxRows.length > 1) return undefined;
+      const outbox = outboxRows.map((row) => {
+        const eventIndex = safeNumber(bigintValue(row, "command_event_index"));
+        if (eventIndex === undefined) throw new Error("INTEGRITY_ROW_INVALID");
+        return {
+          targetKey: stringValue(row, "target_key"),
+          kind: stringValue(row, "kind"),
+          eventIndex,
+          payload: canonicalJsonValue(stringValue(row, "payload_json")),
+        };
+      });
+      const normalizedEvents = rows.map((row) => {
+        const eventSchemaVersion = safeNumber(bigintValue(row, "event_schema_version"));
+        if (eventSchemaVersion === undefined) throw new Error("INTEGRITY_ROW_INVALID");
+        return {
+          eventType: stringValue(row, "event_type"),
+          eventSchemaVersion,
+          occurredAt: stringValue(row, "occurred_at"),
+          visibilityScope: stringValue(row, "visibility_scope"),
+          sessionId: nullableStringValue(row, "session_id"),
+          parentSessionId: nullableStringValue(row, "parent_session_id"),
+          causationId: nullableStringValue(row, "causation_id"),
+          confidence: stringValue(row, "confidence"),
+          verificationStatus: stringValue(row, "verification_status"),
+          payload: canonicalJsonValue(stringValue(row, "payload_json")),
+          sourceRefs: canonicalJsonValue(stringValue(row, "source_refs_json")),
+          evidenceRefs: canonicalJsonValue(stringValue(row, "evidence_refs_json")),
+          evidenceDigests: canonicalJsonValue(stringValue(row, "evidence_digests_json")),
+        };
+      });
+      const firstStreamVersion = bigintValue(first, "stream_version");
+      if (firstStreamVersion < 1n) return undefined;
+      return commandHash({
+        commandId: command.commandId,
+        commandType: command.commandType,
+        projectId: command.projectId,
+        storeId: stringValue(first, "store_id"),
+        workspaceId: stringValue(first, "workspace_id"),
+        git,
+        streamId: stringValue(first, "stream_id"),
+        streamType: stringValue(first, "stream_type"),
+        expectedStreamVersion: (firstStreamVersion - 1n).toString(),
+        correlationId: stringValue(first, "correlation_id"),
+        agentId: stringValue(first, "agent_id"),
+        events: normalizedEvents,
+        outbox,
+      });
+    } catch {
+      return undefined;
     }
   }
 
