@@ -166,10 +166,12 @@ export function parseCliArgs(argv: string[]): CliOptions {
         if (argv[i + 1]) options.paths.push(argv[++i]);
         break;
       case "--project-root":
+        if (!V2_COMMANDS.has(options.command)) break;
         options.projectRoot = requiredOptionValue(argv, i, arg);
         i += 1;
         break;
       case "--replica": {
+        if (!V2_COMMANDS.has(options.command)) break;
         const value = requiredOptionValue(argv, i, arg);
         if (value !== "initialize-local") {
           throw new CliUsageError("REPLICA_DECISION_INVALID");
@@ -179,7 +181,7 @@ export function parseCliArgs(argv: string[]): CliOptions {
         break;
       }
       case "--full":
-        options.fullIntegrity = true;
+        if (V2_COMMANDS.has(options.command)) options.fullIntegrity = true;
         break;
       case "-h":
       case "--help":

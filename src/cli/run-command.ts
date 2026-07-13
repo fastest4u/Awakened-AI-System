@@ -1,5 +1,14 @@
-import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
+import {
+  copyFileSync,
+  createReadStream,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import {
@@ -51,11 +60,9 @@ import {
   type RuntimeCapabilityReport,
   type RuntimeCapabilityResult,
 } from "../orchestrator/runtime/runtime-capabilities.js";
-import {
-  DefaultProjectStoreBootstrapService,
-  ProjectStoreBootstrapError,
-  type ProjectStoreBootstrapResult,
-  type ProjectStoreBootstrapService,
+import type {
+  ProjectStoreBootstrapResult,
+  ProjectStoreBootstrapService,
 } from "../orchestrator/storage/project-store-bootstrap.service.js";
 import { FrontmatterService } from "../services/frontmatter.service.js";
 import { VaultService } from "../services/vault.service.js";
@@ -154,6 +161,10 @@ export interface OrchestratorAdminExecutor {
   close(): Promise<void>;
 }
 
+export interface OrchestratorIntegrityRecorder {
+  record(context: ProjectContext, report: IntegrityReport): Promise<void>;
+}
+
 export interface OrchestratorAdminDependencies {
   runtimeProbe(): Promise<RuntimeCapabilityResult>;
   inspectInitialization(
@@ -163,6 +174,7 @@ export interface OrchestratorAdminDependencies {
   bootstrap: ProjectStoreBootstrapService;
   bindingService: OrchestratorBindingService;
   executorFactory(context: ProjectContext): OrchestratorAdminExecutor;
+  integrityRecorder: OrchestratorIntegrityRecorder;
   clientInstanceId(): string;
 }
 
@@ -400,13 +412,89 @@ function bindingFailure(resolution: Exclude<ProjectBindingResolution, { ok: true
   return new SafeAdminError({ ok: false, ...description });
 }
 
-function typedFailure(error: unknown): SafeFailure {
-  if (error instanceof SafeAdminError) return error.failure;
-  if (error instanceof CliUsageError) return usageFailure(error.code);
-  if (error instanceof ProjectBindingError) {
-    return { ok: false, ...describeProjectBindingFailure(error.code) };
+type ClassifiedError =
+  | { kind: "safe"; failure: unknown }
+  | { kind: "usage" | "binding" | "bootstrap" | "worker"; code: unknown }
+  | { kind: "unknown" };
+
+const UNKNOWN_ADMIN_FAILURE: SafeFailure = {
+  ok: false,
+  code: "ORCHESTRATOR_ADMIN_FAILED",
+  message: "Orchestrator administration failed",
+};
+
+interface ClassifiedFailure {
+  failure: SafeFailure;
+  exitCode: 1 | 2;
+}
+
+function classifyError(error: unknown): ClassifiedError {
+  try {
+    if (error instanceof SafeAdminError) {
+      return { kind: "safe", failure: Reflect.get(error, "failure") };
+    }
+    if (error instanceof CliUsageError) {
+      return { kind: "usage", code: Reflect.get(error, "code") };
+    }
+    if (error instanceof ProjectBindingError) {
+      return { kind: "binding", code: Reflect.get(error, "code") };
+    }
+    if (error instanceof ProjectStoreWorkerError) {
+      return { kind: "worker", code: Reflect.get(error, "code") };
+    }
+    if (typeof error === "object" && error !== null) {
+      const name = Reflect.get(error, "name");
+      if (name === "ProjectStoreBootstrapError") {
+        return { kind: "bootstrap", code: Reflect.get(error, "code") };
+      }
+    }
+  } catch {
+    return { kind: "unknown" };
   }
-  if (error instanceof ProjectStoreBootstrapError) {
+  return { kind: "unknown" };
+}
+
+function safeAdminFailureSnapshot(value: unknown): SafeFailure {
+  if (typeof value !== "object" || value === null) return UNKNOWN_ADMIN_FAILURE;
+  const code = Reflect.get(value, "code");
+  const message = Reflect.get(value, "message");
+  if (typeof code !== "string" || typeof message !== "string") return UNKNOWN_ADMIN_FAILURE;
+  const remediation = Reflect.get(value, "remediation");
+  const summary = Reflect.get(value, "summary");
+  return {
+    ok: false,
+    code,
+    message,
+    ...(Array.isArray(remediation) && remediation.every((item) => typeof item === "string")
+      ? { remediation: [...remediation] }
+      : {}),
+    ...(summary === undefined
+      ? {}
+      : { summary: summarySnapshot(summary as ProjectInitializationSummary) }),
+  };
+}
+
+function typedFailure(error: unknown): ClassifiedFailure {
+  try {
+    const classified = classifyError(error);
+    if (classified.kind === "safe") {
+      return { failure: safeAdminFailureSnapshot(classified.failure), exitCode: 1 };
+    }
+    if (classified.kind === "usage") {
+      return {
+        failure: typeof classified.code === "string"
+          ? usageFailure(classified.code)
+          : UNKNOWN_ADMIN_FAILURE,
+        exitCode: 2,
+      };
+    }
+    if (classified.kind === "binding") {
+      return {
+        failure: { ok: false, ...describeProjectBindingFailure(classified.code) },
+        exitCode: 1,
+      };
+    }
+    if (classified.kind === "bootstrap") {
     const descriptions: Record<string, Omit<SafeFailure, "ok" | "code">> = {
       PROJECT_REPLICA_DECISION_REQUIRED: {
         message: "This project clone requires an explicit replica decision",
@@ -423,37 +511,44 @@ function typedFailure(error: unknown): SafeFailure {
         message: "The authoritative project store is unavailable or failed identity validation",
       },
     };
-    const safeCode = Object.hasOwn(descriptions, error.code)
-      ? error.code
+      const code = classified.code;
+      const safeCode = typeof code === "string" && Object.hasOwn(descriptions, code)
+      ? code
       : "STORE_UNAVAILABLE";
-    return {
-      ok: false,
-      code: safeCode,
-      ...(descriptions[safeCode] ?? { message: "Project-store initialization failed" }),
-    };
+      return {
+        failure: {
+          ok: false,
+          code: safeCode,
+          ...(descriptions[safeCode] ?? { message: "Project-store initialization failed" }),
+        },
+        exitCode: 1,
+      };
+    }
+    if (classified.kind === "worker") {
+      const allowedCodes = new Set([
+        "PROJECT_ID_MISMATCH",
+        "VAULT_ID_MISMATCH",
+        "STORE_ID_MISMATCH",
+        "STORE_UNAVAILABLE",
+        "WORKER_UNAVAILABLE",
+        "WORKER_TIMEOUT",
+        "WORKER_PROTOCOL_ERROR",
+        "SQLITE_INTEGRITY_FAILED",
+      ]);
+      const code = classified.code;
+      return {
+        failure: {
+          ok: false,
+          code: typeof code === "string" && allowedCodes.has(code) ? code : "STORE_UNAVAILABLE",
+          message: "The project-store worker could not complete the administration request",
+        },
+        exitCode: 1,
+      };
+    }
+  } catch {
+    return { failure: UNKNOWN_ADMIN_FAILURE, exitCode: 1 };
   }
-  if (error instanceof ProjectStoreWorkerError) {
-    const allowedCodes = new Set([
-      "PROJECT_ID_MISMATCH",
-      "VAULT_ID_MISMATCH",
-      "STORE_ID_MISMATCH",
-      "STORE_UNAVAILABLE",
-      "WORKER_UNAVAILABLE",
-      "WORKER_TIMEOUT",
-      "WORKER_PROTOCOL_ERROR",
-      "SQLITE_INTEGRITY_FAILED",
-    ]);
-    return {
-      ok: false,
-      code: allowedCodes.has(error.code) ? error.code : "STORE_UNAVAILABLE",
-      message: "The project-store worker could not complete the administration request",
-    };
-  }
-  return {
-    ok: false,
-    code: "ORCHESTRATOR_ADMIN_FAILED",
-    message: "Orchestrator administration failed",
-  };
+  return { failure: UNKNOWN_ADMIN_FAILURE, exitCode: 1 };
 }
 
 async function runLegacyCommand(options: CliOptions, io: CliIo): Promise<0 | 1 | 2> {
@@ -620,12 +715,26 @@ export async function runCliCommand(
     } finally {
       await executor.close();
     }
+    let recordingFailed = false;
+    try {
+      await dependencies.integrityRecorder.record(context, report);
+    } catch {
+      recordingFailed = true;
+    }
     writeJson(io.stdout, { action: "integrity", report: integritySnapshot(report) });
+    if (recordingFailed) {
+      writeJson(io.stderr, {
+        ok: false,
+        code: "INTEGRITY_RECORDING_FAILED",
+        message: "Integrity completed but its manifest record could not be persisted",
+      }, true);
+      return 1;
+    }
     return report.ok ? 0 : 1;
   } catch (error) {
-    const failure = typedFailure(error);
-    writeJson(io.stderr, failure, true);
-    return error instanceof CliUsageError ? 2 : 1;
+    const classified = typedFailure(error);
+    writeJson(io.stderr, classified.failure, true);
+    return classified.exitCode;
   }
 }
 
@@ -636,6 +745,118 @@ interface InitializationInspectorDependencies {
   manifestRepository: StoreManifestRepository;
   identityProbe: ProjectStoreIdentityProbe;
   pathExists(path: string): boolean;
+}
+
+interface StoreFileSignature {
+  exists: boolean;
+  stable: boolean;
+  size?: bigint;
+  modified?: bigint;
+  changed?: bigint;
+  fileId?: bigint;
+  digest?: string;
+}
+
+const MAXIMUM_STABLE_SNAPSHOT_ATTEMPTS = 3;
+
+async function storeFileSignature(path: string): Promise<StoreFileSignature> {
+  try {
+    const before = statSync(path, { bigint: true });
+    const hash = createHash("sha256");
+    for await (const chunk of createReadStream(path, { highWaterMark: 64 * 1024 })) {
+      hash.update(chunk);
+    }
+    const after = statSync(path, { bigint: true });
+    const stable = before.size === after.size
+      && before.mtimeNs === after.mtimeNs
+      && before.ctimeNs === after.ctimeNs
+      && before.ino === after.ino;
+    return {
+      exists: true,
+      stable,
+      size: after.size,
+      modified: after.mtimeNs,
+      changed: after.ctimeNs,
+      fileId: after.ino,
+      digest: hash.digest("hex"),
+    };
+  } catch {
+    return { exists: false, stable: true };
+  }
+}
+
+function sameStoreFileSignature(
+  left: StoreFileSignature,
+  right: StoreFileSignature,
+): boolean {
+  return left.exists === right.exists
+    && left.stable
+    && right.stable
+    && left.size === right.size
+    && left.modified === right.modified
+    && left.changed === right.changed
+    && left.fileId === right.fileId
+    && left.digest === right.digest;
+}
+
+function sameStoreFileContents(
+  source: StoreFileSignature,
+  snapshot: StoreFileSignature,
+): boolean {
+  return source.exists === snapshot.exists
+    && source.stable
+    && snapshot.stable
+    && source.size === snapshot.size
+    && source.digest === snapshot.digest;
+}
+
+function snapshotRoute(route: ProjectStoreRoute, storeRoot: string): ProjectStoreRoute {
+  return {
+    kind: route.kind,
+    storeRoot,
+    eventsPath: join(storeRoot, "events.sqlite"),
+    storeManifestPath: join(storeRoot, "store-manifest.json"),
+    projectionManifestPath: join(storeRoot, "current-projection.json"),
+  };
+}
+
+async function withStableStoreSnapshot<T>(
+  route: ProjectStoreRoute,
+  inspect: (snapshot: ProjectStoreRoute) => Promise<T>,
+): Promise<T> {
+  const sourceFiles = [route.eventsPath, `${route.eventsPath}-wal`] as const;
+  for (let attempt = 0; attempt < MAXIMUM_STABLE_SNAPSHOT_ATTEMPTS; attempt += 1) {
+    const directory = mkdtempSync(join(tmpdir(), "memory-vault-store-snapshot-"));
+    try {
+      const before = await Promise.all(sourceFiles.map(storeFileSignature));
+      if (!before[0].exists) throw new ProjectBindingError("STORE_UNAVAILABLE");
+      const snapshot = snapshotRoute(route, directory);
+      for (let index = 0; index < sourceFiles.length; index += 1) {
+        if (!before[index].exists) continue;
+        const destination = index === 0
+          ? snapshot.eventsPath
+          : `${snapshot.eventsPath}-wal`;
+        copyFileSync(sourceFiles[index], destination);
+      }
+      const after = await Promise.all(sourceFiles.map(storeFileSignature));
+      const snapshotFiles = [snapshot.eventsPath, `${snapshot.eventsPath}-wal`] as const;
+      const copied = await Promise.all(snapshotFiles.map(storeFileSignature));
+      if (
+        before.every((signature, index) => sameStoreFileSignature(signature, after[index]))
+        && after.every((signature, index) => sameStoreFileContents(signature, copied[index]))
+      ) {
+        return await inspect(snapshot);
+      }
+    } catch (error) {
+      if (error instanceof ProjectBindingError) throw error;
+      if (attempt + 1 === MAXIMUM_STABLE_SNAPSHOT_ATTEMPTS) {
+        throw new ProjectBindingError("STORE_UNAVAILABLE");
+      }
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  }
+  throw new ProjectBindingError("STORE_UNAVAILABLE");
 }
 
 function blockedInspection(
@@ -751,10 +972,12 @@ export function createProjectInitializationInspector(
         };
       }
       try {
-        const identity = await dependencies.identityProbe.inspectExisting(route, {
-          projectId: descriptor.projectId,
-          vaultId: descriptor.vaultId,
-        });
+        const identity = await withStableStoreSnapshot(route, (snapshot) => (
+          dependencies.identityProbe.inspectExisting(snapshot, {
+            projectId: descriptor.projectId,
+            vaultId: descriptor.vaultId,
+          })
+        ));
         return {
           state: "recoverable-manifest",
           summary: routedSummary(
@@ -784,11 +1007,13 @@ export function createProjectInitializationInspector(
     ) as InitializedProjectSummary;
     if (!databaseExists) return blockedInspection("STORE_UNAVAILABLE", initialized);
     try {
-      await dependencies.identityProbe.verify(route, {
-        projectId: descriptor.projectId,
-        vaultId: descriptor.vaultId,
-        storeId: manifestInspection.manifest.storeId,
-      });
+      await withStableStoreSnapshot(route, (snapshot) => (
+        dependencies.identityProbe.verify(snapshot, {
+          projectId: descriptor.projectId,
+          vaultId: descriptor.vaultId,
+          storeId: manifestInspection.manifest.storeId,
+        })
+      ));
       return { state: "initialized", summary: initialized, remediation: [] };
     } catch (error) {
       return error instanceof ProjectBindingError
@@ -807,6 +1032,7 @@ export function createOrchestratorAdminDependencies(
   });
   const bindingService = new ProjectBindingService({ identityProbe });
   const inspectInitialization = createProjectInitializationInspector(identityProbe);
+  const integrityManifestRepository = new StoreManifestRepository();
   return {
     async runtimeProbe() {
       const directory = mkdtempSync(join(tmpdir(), "memory-vault-runtime-"));
@@ -817,7 +1043,14 @@ export function createOrchestratorAdminDependencies(
       }
     },
     inspectInitialization,
-    bootstrap: new DefaultProjectStoreBootstrapService(),
+    bootstrap: {
+      async initialize(input) {
+        const { DefaultProjectStoreBootstrapService } = await import(
+          "../orchestrator/storage/project-store-bootstrap.service.js"
+        );
+        return new DefaultProjectStoreBootstrapService().initialize(input);
+      },
+    },
     bindingService,
     executorFactory(context) {
       return new ProjectStoreExecutor({
@@ -829,6 +1062,19 @@ export function createOrchestratorAdminDependencies(
         executorLeaseMs: 15_000,
         heartbeatIntervalMs: DEFAULT_HEARTBEAT_INTERVAL_MS,
       });
+    },
+    integrityRecorder: {
+      async record(context, report) {
+        integrityManifestRepository.recordIntegrity(context.binding.storeRoute, {
+          projectId: context.binding.projectId,
+          vaultId: context.binding.vaultId,
+          storeId: context.binding.storeId,
+        }, {
+          ok: report.ok,
+          schemaFingerprint: report.schemaFingerprint,
+          terminalEventHash: report.terminalEventHash,
+        });
+      },
     },
     clientInstanceId: randomUUID,
   };

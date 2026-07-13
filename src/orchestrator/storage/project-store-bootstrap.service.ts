@@ -9,7 +9,6 @@ import {
   unlinkSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
-import { DatabaseSync } from "node:sqlite";
 import type {
   ProjectDescriptorV1,
   ProjectStoreRoute,
@@ -44,6 +43,9 @@ import {
   type SchemaQueryConnection,
 } from "./schema-fingerprint.js";
 import type { SqliteConnection, SqliteDriver } from "./sqlite-driver.js";
+
+type DatabaseSyncConstructor = typeof import("node:sqlite").DatabaseSync;
+type NodeSqliteModule = Pick<typeof import("node:sqlite"), "DatabaseSync">;
 
 export interface ProjectStoreBootstrapInput {
   projectRoot: string;
@@ -98,7 +100,8 @@ export interface ProjectStoreBootstrapDependencies {
   workspaceResolver: GitWorkspaceResolver;
   router: ProjectStoreRouter;
   manifestRepository: StoreManifestRepository;
-  sqliteDriver: SqliteDriver;
+  sqliteDriver?: SqliteDriver;
+  loadNodeSqlite: () => Promise<NodeSqliteModule>;
   migrationRunner: MigrationRunner;
   probeCapabilities: (path: string) => Promise<RuntimeCapabilityResult>;
   now: () => string;
@@ -225,12 +228,13 @@ function nullableString(value: unknown): boolean {
 }
 
 function validateExistingStore(
+  DatabaseSync: DatabaseSyncConstructor,
   path: string,
   descriptor: ProjectDescriptorV1,
   expectedStoreId?: StoreId,
   mode: StoreValidationMode = "published",
 ): StoreIdentity {
-  let database: DatabaseSync | undefined;
+  let database: InstanceType<DatabaseSyncConstructor> | undefined;
   try {
     database = new DatabaseSync(path, {
       open: true,
@@ -277,7 +281,7 @@ function validateExistingStore(
 
     if (
       schemaFingerprint(database as unknown as SchemaQueryConnection)
-      !== expectedSchemaFingerprint([eventCoreMigration])
+      !== expectedSchemaFingerprint([eventCoreMigration], DatabaseSync)
     ) {
       throw bootstrapFailure("STORE_UNAVAILABLE");
     }
@@ -407,6 +411,7 @@ export class DefaultProjectStoreBootstrapService implements ProjectStoreBootstra
   >();
 
   readonly #dependencies: ProjectStoreBootstrapDependencies;
+  #nodeSqlite: Promise<NodeSqliteModule> | undefined;
 
   constructor(dependencies: Partial<ProjectStoreBootstrapDependencies> = {}) {
     this.#dependencies = {
@@ -417,8 +422,8 @@ export class DefaultProjectStoreBootstrapService implements ProjectStoreBootstra
       router: dependencies.router ?? new ProjectStoreRouter(),
       manifestRepository: dependencies.manifestRepository
         ?? new StoreManifestRepository(),
-      sqliteDriver: dependencies.sqliteDriver
-        ?? new NodeSqliteDriver({ DatabaseSync }),
+      sqliteDriver: dependencies.sqliteDriver,
+      loadNodeSqlite: dependencies.loadNodeSqlite ?? (() => import("node:sqlite")),
       migrationRunner: dependencies.migrationRunner ?? new MigrationRunner(),
       probeCapabilities: dependencies.probeCapabilities ?? probeRuntimeCapabilities,
       now: dependencies.now ?? (() => new Date().toISOString()),
@@ -431,6 +436,7 @@ export class DefaultProjectStoreBootstrapService implements ProjectStoreBootstra
   async initialize(
     input: ProjectStoreBootstrapInput,
   ): Promise<ProjectStoreBootstrapResult> {
+    const DatabaseSync = await this.databaseSync();
     const initial = this.#dependencies.descriptorRepository.inspect(input.vaultRoot);
     if (initial.status === "invalid") throw bootstrapFailure("STORE_UNAVAILABLE");
 
@@ -473,6 +479,7 @@ export class DefaultProjectStoreBootstrapService implements ProjectStoreBootstra
     if (manifestInspection.status === "valid") {
       if (!databaseExists) throw bootstrapFailure("STORE_UNAVAILABLE");
       validateExistingStore(
+        DatabaseSync,
         route.eventsPath,
         descriptor,
         manifestInspection.manifest.storeId,
@@ -488,7 +495,7 @@ export class DefaultProjectStoreBootstrapService implements ProjectStoreBootstra
     }
 
     if (databaseExists) {
-      const identity = validateExistingStore(route.eventsPath, descriptor);
+      const identity = validateExistingStore(DatabaseSync, route.eventsPath, descriptor);
       const manifest = this.publishOrAdoptManifest(route, descriptor, identity.storeId);
       return {
         descriptor,
@@ -521,7 +528,12 @@ export class DefaultProjectStoreBootstrapService implements ProjectStoreBootstra
       await active;
       return this.initialize(input);
     }
-    const initialization = this.createStore(descriptor, route, createdDescriptor);
+    const initialization = this.createStore(
+      DatabaseSync,
+      descriptor,
+      route,
+      createdDescriptor,
+    );
     DefaultProjectStoreBootstrapService.#activeInitializations.set(
       route.eventsPath,
       initialization,
@@ -538,7 +550,21 @@ export class DefaultProjectStoreBootstrapService implements ProjectStoreBootstra
     }
   }
 
+  private async databaseSync(): Promise<DatabaseSyncConstructor> {
+    try {
+      this.#nodeSqlite ??= this.#dependencies.loadNodeSqlite();
+      const sqlite = await this.#nodeSqlite;
+      if (typeof sqlite.DatabaseSync !== "function") {
+        throw new Error("node:sqlite DatabaseSync is unavailable");
+      }
+      return sqlite.DatabaseSync;
+    } catch (error) {
+      throw bootstrapFailure("SQLITE_CAPABILITY_MISSING", error);
+    }
+  }
+
   private async createStore(
+    DatabaseSync: DatabaseSyncConstructor,
     descriptor: ProjectDescriptorV1,
     route: ProjectStoreRoute,
     createdDescriptor: boolean,
@@ -575,7 +601,9 @@ export class DefaultProjectStoreBootstrapService implements ProjectStoreBootstra
     let connection: SqliteConnection | undefined;
     let publishedByThisContender = false;
     try {
-      connection = this.#dependencies.sqliteDriver.open(temporaryPath, {
+      const sqliteDriver = this.#dependencies.sqliteDriver
+        ?? new NodeSqliteDriver({ DatabaseSync });
+      connection = sqliteDriver.open(temporaryPath, {
         mode: "create",
         busyTimeoutMs: DEFAULT_BUSY_TIMEOUT_MS,
       });
@@ -608,6 +636,7 @@ export class DefaultProjectStoreBootstrapService implements ProjectStoreBootstra
       connection = undefined;
 
       validateExistingStore(
+        DatabaseSync,
         temporaryPath,
         descriptor,
         storeId,
@@ -622,7 +651,11 @@ export class DefaultProjectStoreBootstrapService implements ProjectStoreBootstra
       }
       unlinkIfPresent(temporaryPath);
 
-      const winningIdentity = validateExistingStore(route.eventsPath, descriptor);
+      const winningIdentity = validateExistingStore(
+        DatabaseSync,
+        route.eventsPath,
+        descriptor,
+      );
       fsyncFile(route.eventsPath);
       fsyncDirectory(dirname(route.eventsPath));
       this.#dependencies.faultInjector.hit("after-database-publish-before-manifest");

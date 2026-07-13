@@ -1,7 +1,18 @@
 import { createHash } from "node:crypto";
-import { DatabaseSync } from "node:sqlite";
+import { createRequire } from "node:module";
 import { DEFAULT_BUSY_TIMEOUT_MS } from "../runtime/runtime-capabilities.js";
 import type { Migration } from "./migration.js";
+
+type DatabaseSyncConstructor = typeof import("node:sqlite").DatabaseSync;
+const require = createRequire(import.meta.url);
+let cachedDatabaseSync: DatabaseSyncConstructor | undefined;
+
+function loadDatabaseSync(): DatabaseSyncConstructor {
+  if (cachedDatabaseSync !== undefined) return cachedDatabaseSync;
+  const sqlite = require("node:sqlite") as Pick<typeof import("node:sqlite"), "DatabaseSync">;
+  cachedDatabaseSync = sqlite.DatabaseSync;
+  return cachedDatabaseSync;
+}
 
 export interface SchemaEntry {
   type: string;
@@ -48,7 +59,10 @@ export function schemaFingerprint(connection: SchemaQueryConnection): string {
 
 const expectedFingerprints = new Map<string, string>();
 
-export function expectedSchemaFingerprint(migrations: readonly Migration[]): string {
+export function expectedSchemaFingerprint(
+  migrations: readonly Migration[],
+  DatabaseSync: DatabaseSyncConstructor = loadDatabaseSync(),
+): string {
   const key = createHash("sha256")
     .update(JSON.stringify(migrations.map(({ version, name, sql }) => [version, name, sql])), "utf8")
     .digest("hex");

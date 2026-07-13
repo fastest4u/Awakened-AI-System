@@ -24,6 +24,8 @@ import {
   type ProjectStoreBootstrapFaultBoundary,
 } from "../src/orchestrator/storage/project-store-bootstrap.service.js";
 import { NodeSqliteDriver } from "../src/orchestrator/storage/node-sqlite-driver.js";
+import { expectedSchemaFingerprint } from "../src/orchestrator/storage/schema-fingerprint.js";
+import { eventCoreMigration } from "../src/orchestrator/storage/migrations/0001-event-core.js";
 
 const roots: string[] = [];
 const driver = new NodeSqliteDriver({ DatabaseSync });
@@ -68,6 +70,46 @@ afterEach(() => {
 });
 
 describe("DefaultProjectStoreBootstrapService", () => {
+  it("does not load node:sqlite until initialize and caches the native module", async () => {
+    const { projectRoot, vaultRoot } = fixture();
+    const expected = paths(vaultRoot);
+    let loads = 0;
+    const service = new DefaultProjectStoreBootstrapService({
+      async loadNodeSqlite() {
+        loads += 1;
+        return { DatabaseSync };
+      },
+    });
+    assert.equal(loads, 0);
+    assert.equal(existsSync(expected.descriptor), false);
+    await service.initialize({ projectRoot, vaultRoot });
+    assert.equal(loads, 1);
+    await service.initialize({ projectRoot, vaultRoot });
+    assert.equal(loads, 1);
+  });
+
+  it("fails before identity mutation when lazy node:sqlite loading fails", async () => {
+    const { projectRoot, vaultRoot } = fixture();
+    const expected = paths(vaultRoot);
+    const service = new DefaultProjectStoreBootstrapService({
+      async loadNodeSqlite() { throw new Error("native sqlite unavailable"); },
+    });
+    assert.equal(existsSync(expected.descriptor), false);
+    await assert.rejects(
+      service.initialize({ projectRoot, vaultRoot }),
+      errorCode("SQLITE_CAPABILITY_MISSING"),
+    );
+    assert.equal(existsSync(expected.descriptor), false);
+    assert.equal(existsSync(expected.storeRoot), false);
+  });
+
+  it("preserves the event-core schema fingerprint after lazy native loading", () => {
+    assert.equal(
+      expectedSchemaFingerprint([eventCoreMigration], DatabaseSync),
+      "6b68aaaaab73b813f4a1f040a8adb0f519490fdfaa3d3f01a94e9ff067b6ab0b",
+    );
+  });
+
   it("creates the descriptor and one complete immutable store only on explicit initialize", async () => {
     const { projectRoot, vaultRoot } = fixture();
     const expected = paths(vaultRoot);

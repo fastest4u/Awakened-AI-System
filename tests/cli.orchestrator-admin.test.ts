@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -15,6 +17,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, it } from "node:test";
+import { fileURLToPath } from "node:url";
 import type {
   ProjectBinding,
   ProjectContext,
@@ -23,6 +26,7 @@ import type { TrustedProjectBindingRequest } from "../src/orchestrator/identity/
 import { ProjectDescriptorRepository } from "../src/orchestrator/identity/project-descriptor.repository.js";
 import type { IntegrityReport } from "../src/orchestrator/integrity/integrity.types.js";
 import type { RuntimeCapabilityReport } from "../src/orchestrator/runtime/runtime-capabilities.js";
+import { ProjectStoreWorkerError } from "../src/orchestrator/runtime/project-store-executor.js";
 import { DefaultProjectStoreBootstrapService } from "../src/orchestrator/storage/project-store-bootstrap.service.js";
 import { diagnoseMemoryConfig } from "../src/config/memory.config.js";
 import {
@@ -223,6 +227,9 @@ function dependencies(overrides: Partial<OrchestratorAdminDependencies> = {}): {
         async close() { calls.push("close"); },
       };
     },
+    integrityRecorder: {
+      async record() { calls.push("record"); },
+    },
     clientInstanceId() {
       calls.push("client-id");
       return "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
@@ -304,6 +311,28 @@ V2 options:
         return true;
       });
     }
+  });
+
+  it("keeps all new administration flags inert for legacy commands", () => {
+    assert.deepEqual(
+      parseCliArgs(["validate", "--project-root"]),
+      defaultOptions("validate"),
+    );
+    assert.deepEqual(
+      parseCliArgs(["validate", "--replica", "unknown", "--full"]),
+      defaultOptions("validate"),
+    );
+    assert.deepEqual(
+      parseCliArgs([
+        "migrate",
+        "--project-root",
+        "ignored-project",
+        "--replica",
+        "initialize-local",
+        "--full",
+      ]),
+      defaultOptions("migrate"),
+    );
   });
 });
 
@@ -397,6 +426,44 @@ describe("V2 administration lifecycle", () => {
       vaultRoot: roots.vaultRoot,
       routeState: "pending-project-identity",
     });
+  });
+
+  it("probes initialized and recoverable stores only through disposable stable snapshots", async () => {
+    const roots = temporaryProject();
+    const initialized = await new DefaultProjectStoreBootstrapService().initialize(roots);
+    const authoritativePath = initialized.route.eventsPath;
+    const observedProbePaths: string[] = [];
+    const assertDisposableSnapshot = (eventsPath: string): void => {
+      observedProbePaths.push(eventsPath);
+      assert.notEqual(eventsPath, authoritativePath);
+      assert.equal(existsSync(eventsPath), true);
+      assert.equal(readFileSync(eventsPath).length > 0, true);
+    };
+    const inspector = createProjectInitializationInspector({
+      async verify(route) {
+        assertDisposableSnapshot(route.eventsPath);
+      },
+      async inspectExisting(route, expected) {
+        assertDisposableSnapshot(route.eventsPath);
+        return { ...expected, storeId: initialized.manifest.storeId };
+      },
+    });
+
+    const beforeInitialized = treeDigest(roots.projectRoot);
+    const initializedInspection = await inspector(roots.projectRoot, roots.vaultRoot);
+    assert.equal(initializedInspection.state, "initialized");
+    assert.equal(treeDigest(roots.projectRoot), beforeInitialized);
+
+    rmSync(initialized.route.storeManifestPath);
+    const beforeRecovery = treeDigest(roots.projectRoot);
+    const recoveryInspection = await inspector(roots.projectRoot, roots.vaultRoot);
+    assert.equal(recoveryInspection.state, "recoverable-manifest");
+    if (recoveryInspection.state === "recoverable-manifest") {
+      assert.equal(recoveryInspection.summary.storeId, initialized.manifest.storeId);
+    }
+    assert.equal(treeDigest(roots.projectRoot), beforeRecovery);
+    assert.equal(observedProbePaths.length, 2);
+    assert.equal(observedProbePaths.every((path) => !existsSync(path)), true);
   });
 
   it("applies new initialization, recovers a missing manifest, and remains idempotent", async () => {
@@ -621,7 +688,7 @@ describe("V2 administration lifecycle", () => {
     assert.equal(code, 0);
     assert.deepEqual(fake.calls, [
       "client-id", "runtime", "establish:maintenance", "revalidate",
-      "executor", "open", "full", "close",
+      "executor", "open", "full", "close", "record",
     ]);
     assert.deepEqual(JSON.parse(capture.stdout()), {
       action: "integrity",
@@ -707,6 +774,83 @@ describe("V2 administration lifecycle", () => {
     assert.equal(capture.stderr().includes("close secret"), false);
   });
 
+  it("records failed integrity durably after close using the exact context and report", async () => {
+    const roots = temporaryProject();
+    const failedReport: IntegrityReport = {
+      ...QUICK_REPORT,
+      ok: false,
+      issues: [{
+        code: "SQLITE_QUICK_CHECK_FAILED",
+        message: "quick_check reported corruption",
+      }],
+    };
+    let recordedContext: ProjectContext | undefined;
+    let recordedReport: IntegrityReport | undefined;
+    const fake = dependencies({
+      executorFactory() {
+        fake.calls.push("executor");
+        return {
+          async open() { fake.calls.push("open"); return {}; },
+          async quickIntegrity() { fake.calls.push("quick"); return failedReport; },
+          async fullIntegrity() { throw new Error("unused"); },
+          async close() { fake.calls.push("close"); },
+        };
+      },
+    });
+    Object.assign(fake.value, {
+      integrityRecorder: {
+        async record(context: ProjectContext, report: IntegrityReport) {
+          fake.calls.push("record");
+          recordedContext = context;
+          recordedReport = report;
+        },
+      },
+    });
+    const capture = outputCapture();
+    assert.equal(await runCliCommand({
+      ...defaultOptions("orchestrator-integrity"),
+      projectRoot: roots.projectRoot,
+      vault: roots.vaultRoot,
+    }, capture.io, fake.value), 1);
+    assert.deepEqual(fake.calls.slice(-5), ["executor", "open", "quick", "close", "record"]);
+    assert.equal(recordedContext, CONTEXT);
+    assert.equal(recordedReport, failedReport);
+    assert.deepEqual(JSON.parse(capture.stdout()), {
+      action: "integrity",
+      report: failedReport,
+    });
+    assert.equal(capture.stderr(), "");
+  });
+
+  it("reports manifest recording failure separately without losing the integrity report", async () => {
+    const roots = temporaryProject();
+    const fake = dependencies();
+    Object.assign(fake.value, {
+      integrityRecorder: {
+        async record() {
+          fake.calls.push("record");
+          throw new Error("private manifest failure");
+        },
+      },
+    });
+    const capture = outputCapture();
+    assert.equal(await runCliCommand({
+      ...defaultOptions("orchestrator-integrity"),
+      projectRoot: roots.projectRoot,
+      vault: roots.vaultRoot,
+    }, capture.io, fake.value), 1);
+    assert.deepEqual(JSON.parse(capture.stdout()), {
+      action: "integrity",
+      report: QUICK_REPORT,
+    });
+    assert.deepEqual(JSON.parse(capture.stderr()), {
+      ok: false,
+      code: "INTEGRITY_RECORDING_FAILED",
+      message: "Integrity completed but its manifest record could not be persisted",
+    });
+    assert.equal(capture.stderr().includes("private manifest failure"), false);
+  });
+
   it("sanitizes blocked inspection messages and ignores hostile extra getters", async () => {
     const roots = temporaryProject();
     const summary = {
@@ -740,6 +884,64 @@ describe("V2 administration lifecycle", () => {
     assert.equal(output.includes("private remediation"), false);
     assert.equal(output.includes("worker secret"), false);
     assert.equal((JSON.parse(output) as { code: string }).code, "PROJECT_ID_MISMATCH");
+  });
+
+  it("classifies typed errors from one guarded discriminator snapshot", async () => {
+    const roots = temporaryProject();
+    const stateful = new ProjectStoreWorkerError("STORE_ID_MISMATCH", {
+      privateDetails: "must-not-leak",
+    });
+    let codeReads = 0;
+    Object.defineProperty(stateful, "code", {
+      configurable: true,
+      get() {
+        codeReads += 1;
+        if (codeReads === 1) return "STORE_ID_MISMATCH";
+        if (codeReads === 2) return "private-second-value";
+        throw new Error("private discriminator failure");
+      },
+    });
+    const statefulFake = dependencies({
+      executorFactory() {
+        return {
+          async open() { throw stateful; },
+          async quickIntegrity() { throw new Error("unused"); },
+          async fullIntegrity() { throw new Error("unused"); },
+          async close() {},
+        };
+      },
+    });
+    const statefulOutput = outputCapture();
+    assert.equal(await runCliCommand({
+      ...defaultOptions("orchestrator-integrity"),
+      projectRoot: roots.projectRoot,
+      vault: roots.vaultRoot,
+    }, statefulOutput.io, statefulFake.value), 1);
+    assert.equal(codeReads, 1);
+    assert.equal(
+      (JSON.parse(statefulOutput.stderr()) as { code: string }).code,
+      "STORE_ID_MISMATCH",
+    );
+    assert.equal(statefulOutput.stderr().includes("private"), false);
+
+    const hostile = new Proxy({}, {
+      getPrototypeOf() { throw new Error("private proxy prototype"); },
+      get() { throw new Error("private proxy getter"); },
+    });
+    const hostileFake = dependencies({
+      async runtimeProbe() { throw hostile; },
+    });
+    const hostileOutput = outputCapture();
+    assert.equal(await runCliCommand({
+      ...defaultOptions("orchestrator-status"),
+      projectRoot: roots.projectRoot,
+      vault: roots.vaultRoot,
+    }, hostileOutput.io, hostileFake.value), 1);
+    assert.equal(
+      (JSON.parse(hostileOutput.stderr()) as { code: string }).code,
+      "ORCHESTRATOR_ADMIN_FAILED",
+    );
+    assert.equal(hostileOutput.stderr().includes("private"), false);
   });
 
   it("uses the compiled one-shot identity worker and bound executor end to end", async () => {
@@ -827,11 +1029,35 @@ describe("V2 administration lifecycle", () => {
       vault: roots.vaultRoot,
     }, integrityOutput.io, real), 0);
     const integrity = JSON.parse(integrityOutput.stdout()) as {
-      report: { ok: boolean; mode: string; eventsVerified: number };
+      report: {
+        ok: boolean;
+        mode: string;
+        eventsVerified: number;
+        schemaFingerprint: string;
+        terminalEventHash: string;
+      };
     };
     assert.equal(integrity.report.ok, true);
     assert.equal(integrity.report.mode, "quick");
     assert.equal(integrity.report.eventsVerified, 0);
+    const recordedManifest = JSON.parse(
+      readFileSync(initialized.result.route.storeManifestPath, "utf8"),
+    ) as {
+      lastIntegrity: {
+        status: string;
+        schemaFingerprint: string;
+        terminalEventHash: string;
+      };
+    };
+    assert.equal(recordedManifest.lastIntegrity.status, "passed");
+    assert.equal(
+      recordedManifest.lastIntegrity.schemaFingerprint,
+      integrity.report.schemaFingerprint,
+    );
+    assert.equal(
+      recordedManifest.lastIntegrity.terminalEventHash,
+      integrity.report.terminalEventHash,
+    );
     const database = new DatabaseSync(initialized.result.route.eventsPath, { readOnly: true });
     assert.equal(database.prepare("SELECT count(*) AS count FROM events").get()?.count, 0);
     database.close();
@@ -1023,6 +1249,49 @@ Nothing to migrate; all notes are already current.
       true,
     );
     assert.deepEqual(fake.calls, []);
+  });
+});
+
+describe("lazy SQLite administration loading", () => {
+  it("keeps help available and maps V2 runtime failure without experimental SQLite", () => {
+    const cliPath = fileURLToPath(new URL("../src/cli.js", import.meta.url));
+    const help = spawnSync(process.execPath, [
+      "--no-experimental-sqlite",
+      cliPath,
+      "help",
+    ], {
+      cwd: process.cwd(),
+      encoding: "utf8",
+      windowsHide: true,
+    });
+    assert.equal(help.status, 0);
+    assert.equal(help.stdout, HELP);
+    assert.equal(help.stderr, "");
+
+    const roots = temporaryProject();
+    const status = spawnSync(process.execPath, [
+      "--no-experimental-sqlite",
+      cliPath,
+      "orchestrator-status",
+      "--project-root",
+      roots.projectRoot,
+      "--vault",
+      roots.vaultRoot,
+    ], {
+      cwd: process.cwd(),
+      encoding: "utf8",
+      windowsHide: true,
+    });
+    assert.equal(status.status, 1);
+    assert.equal(status.stdout, "");
+    assert.deepEqual(JSON.parse(status.stderr), {
+      ok: false,
+      code: "SQLITE_CAPABILITY_MISSING",
+      message: "Required SQLite runtime capabilities are unavailable",
+      remediation: [
+        "run memory-vault diagnose and restore the required Node.js/SQLite runtime",
+      ],
+    });
   });
 });
 
