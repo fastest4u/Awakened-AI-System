@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import {
   closeSync,
   existsSync,
@@ -38,6 +38,11 @@ import {
 import { MigrationRunner, migrationChecksum } from "./migration-runner.js";
 import { eventCoreMigration } from "./migrations/0001-event-core.js";
 import { NodeSqliteDriver } from "./node-sqlite-driver.js";
+import {
+  expectedSchemaFingerprint,
+  schemaFingerprint,
+  type SchemaQueryConnection,
+} from "./schema-fingerprint.js";
 import type { SqliteConnection, SqliteDriver } from "./sqlite-driver.js";
 
 export interface ProjectStoreBootstrapInput {
@@ -215,68 +220,6 @@ function numeric(value: unknown): number | undefined {
   return Number.isSafeInteger(converted) ? converted : undefined;
 }
 
-interface SchemaEntry {
-  type: string;
-  name: string;
-  tableName: string;
-  sql: string;
-}
-
-function userSchemaEntries(database: DatabaseSync): SchemaEntry[] {
-  return database.prepare(`
-    SELECT type, name, tbl_name, sql
-    FROM sqlite_schema
-    WHERE name NOT GLOB 'sqlite_*'
-    ORDER BY type, name, tbl_name, sql
-  `).all().map((row): SchemaEntry => {
-    if (
-      typeof row.type !== "string"
-      || typeof row.name !== "string"
-      || typeof row.tbl_name !== "string"
-      || typeof row.sql !== "string"
-    ) {
-      throw bootstrapFailure("STORE_UNAVAILABLE");
-    }
-    return {
-      type: row.type,
-      name: row.name,
-      tableName: row.tbl_name,
-      sql: row.sql,
-    };
-  });
-}
-
-function schemaFingerprint(database: DatabaseSync): string {
-  return createHash("sha256")
-    .update(JSON.stringify(userSchemaEntries(database)), "utf8")
-    .digest("hex");
-}
-
-let trustedEventCoreSchemaFingerprint: string | undefined;
-
-function eventCoreSchemaFingerprint(): string {
-  if (trustedEventCoreSchemaFingerprint !== undefined) {
-    return trustedEventCoreSchemaFingerprint;
-  }
-  const trusted = new DatabaseSync(":memory:", {
-    open: true,
-    readOnly: false,
-    enableForeignKeyConstraints: true,
-    enableDoubleQuotedStringLiterals: false,
-    allowExtension: false,
-    allowBareNamedParameters: false,
-    allowUnknownNamedParameters: false,
-    timeout: DEFAULT_BUSY_TIMEOUT_MS,
-  });
-  try {
-    trusted.exec(eventCoreMigration.sql);
-    trustedEventCoreSchemaFingerprint = schemaFingerprint(trusted);
-    return trustedEventCoreSchemaFingerprint;
-  } finally {
-    trusted.close();
-  }
-}
-
 function nullableString(value: unknown): boolean {
   return value === null || typeof value === "string";
 }
@@ -332,7 +275,10 @@ function validateExistingStore(
       throw bootstrapFailure("STORE_UNAVAILABLE");
     }
 
-    if (schemaFingerprint(database) !== eventCoreSchemaFingerprint()) {
+    if (
+      schemaFingerprint(database as unknown as SchemaQueryConnection)
+      !== expectedSchemaFingerprint([eventCoreMigration])
+    ) {
       throw bootstrapFailure("STORE_UNAVAILABLE");
     }
 

@@ -659,6 +659,51 @@ describe("ProjectBindingService revalidation", () => {
     );
   });
 
+  it("keeps revalidation valid when recordIntegrity changes only mutable manifest status", async () => {
+    const item = fixture();
+    const binding = await established(item);
+    item.state.manifestInspection = {
+      status: "valid",
+      path: binding.storeRoute.storeManifestPath,
+      manifest: manifest({
+        lastIntegrity: {
+          status: "passed",
+          checkedAt: "2026-07-13T02:01:00.000Z",
+          schemaFingerprint: "a".repeat(64),
+          terminalEventHash: "b".repeat(64),
+        },
+      }),
+    };
+
+    const context = await item.service.revalidate(binding);
+
+    assert.equal(context.binding, binding);
+    assert.equal(item.service.current(), binding);
+  });
+
+  it("still rejects immutable manifest metadata drift after an integrity update", async () => {
+    const item = fixture();
+    const binding = await established(item);
+    item.state.manifestInspection = {
+      status: "valid",
+      path: binding.storeRoute.storeManifestPath,
+      manifest: manifest({
+        createdAt: "2026-07-13T02:02:00.000Z",
+        lastIntegrity: {
+          status: "passed",
+          checkedAt: "2026-07-13T02:01:00.000Z",
+          schemaFingerprint: "a".repeat(64),
+          terminalEventHash: "b".repeat(64),
+        },
+      }),
+    };
+
+    await assert.rejects(
+      item.service.revalidate(binding),
+      (error) => assertBindingFailure(error, "STORE_UNAVAILABLE"),
+    );
+  });
+
   it("rejects a paused stale revalidation after rebind without clearing the newer generation", async () => {
     const item = fixture();
     const oldRevalidationProbe = deferred<void>();

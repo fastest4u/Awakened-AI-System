@@ -139,6 +139,16 @@ interface BindingBaseline {
   manifest: string;
 }
 
+function immutableManifestFingerprint(manifest: StoreManifestV1): string {
+  return canonicalJson({
+    schemaVersion: manifest.schemaVersion,
+    storeId: manifest.storeId,
+    projectId: manifest.projectId,
+    vaultId: manifest.vaultId,
+    createdAt: manifest.createdAt,
+  });
+}
+
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const IDENTITY_FAILURE_CODES = new Set<ProjectBindingFailureCode>([
   "PROJECT_ID_MISMATCH",
@@ -725,7 +735,7 @@ export class ProjectBindingService implements ProjectBindingProvider {
     });
     const baseline = {
       descriptor: canonicalJson(descriptor),
-      manifest: canonicalJson(storeManifest),
+      manifest: immutableManifestFingerprint(storeManifest),
     };
     this.assertEstablishmentOwned(revision);
     this.#binding = binding;
@@ -846,7 +856,7 @@ export class ProjectBindingService implements ProjectBindingProvider {
       if (storeManifest.storeId !== current.storeId) {
         throw new ProjectBindingError("STORE_ID_MISMATCH");
       }
-      if (canonicalJson(storeManifest) !== baseline.manifest) {
+      if (immutableManifestFingerprint(storeManifest) !== baseline.manifest) {
         throw new ProjectBindingError("STORE_UNAVAILABLE", { reason: "MANIFEST_CHANGED" });
       }
       if (!this.#dependencies.pathExists(storeRoute.eventsPath)) {
