@@ -4,13 +4,11 @@ import { EventEmitter } from "node:events";
 import {
   copyFileSync,
   mkdirSync,
-  mkdtempSync,
   readFileSync,
   renameSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { Worker } from "node:worker_threads";
@@ -77,6 +75,7 @@ import { MaintenanceFence } from "../src/orchestrator/storage/maintenance-fence.
 import { EventStore, EventStoreError } from "../src/orchestrator/storage/event-store.js";
 import { NodeSqliteDriver } from "../src/orchestrator/storage/node-sqlite-driver.js";
 import { DEFAULT_BUSY_TIMEOUT_MS } from "../src/orchestrator/runtime/runtime-capabilities.js";
+import { canonicalMkdtemp } from "./support/canonical-temp.js";
 
 const roots: string[] = [];
 const PROJECT_ID = "11111111-1111-4111-8111-111111111111" as ProjectId;
@@ -92,7 +91,7 @@ afterEach(() => {
 });
 
 function temporaryRoot(): string {
-  const root = mkdtempSync(join(tmpdir(), "project-store-executor-"));
+  const root = canonicalMkdtemp("project-store-executor-");
   roots.push(root);
   return root;
 }

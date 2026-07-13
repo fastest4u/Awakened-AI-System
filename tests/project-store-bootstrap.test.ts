@@ -2,7 +2,6 @@ import { strict as assert } from "node:assert";
 import {
   existsSync,
   linkSync,
-  mkdtempSync,
   mkdirSync,
   readFileSync,
   readdirSync,
@@ -10,7 +9,6 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, it } from "node:test";
@@ -40,12 +38,13 @@ import {
 import { NodeSqliteDriver } from "../src/orchestrator/storage/node-sqlite-driver.js";
 import { expectedSchemaFingerprint } from "../src/orchestrator/storage/schema-fingerprint.js";
 import { eventCoreMigration } from "../src/orchestrator/storage/migrations/0001-event-core.js";
+import { canonicalMkdtemp } from "./support/canonical-temp.js";
 
 const roots: string[] = [];
 const driver = new NodeSqliteDriver({ DatabaseSync });
 
 function fixture(): { root: string; projectRoot: string; vaultRoot: string } {
-  const root = mkdtempSync(join(tmpdir(), "memory-bootstrap-"));
+  const root = canonicalMkdtemp("memory-bootstrap-");
   roots.push(root);
   const projectRoot = join(root, "project");
   const vaultRoot = join(projectRoot, "memory");

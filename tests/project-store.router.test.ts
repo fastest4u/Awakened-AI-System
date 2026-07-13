@@ -2,7 +2,6 @@ import { strict as assert } from "node:assert";
 import {
   existsSync,
   mkdirSync,
-  mkdtempSync,
   readFileSync,
   readdirSync,
   realpathSync,
@@ -10,7 +9,6 @@ import {
   symlinkSync,
   writeFileSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
 import { join, resolve, sep } from "node:path";
 import { afterEach, describe, it } from "node:test";
 import type {
@@ -30,6 +28,7 @@ import {
 } from "../src/orchestrator/identity/store-manifest.schema.js";
 import { StoreManifestRepository } from "../src/orchestrator/identity/store-manifest.repository.js";
 import type { StoreManifestRepositoryDependencies } from "../src/orchestrator/identity/store-manifest.repository.js";
+import { canonicalMkdtemp } from "./support/canonical-temp.js";
 
 const descriptor: ProjectDescriptorV1 = {
   schemaVersion: 1,
@@ -131,7 +130,7 @@ describe("ProjectStoreRouter", () => {
   });
 
   it("routes a Git workspace beneath its common directory without creating state", () => {
-    root = mkdtempSync(join(tmpdir(), "memory-store-route-"));
+    root = canonicalMkdtemp("memory-store-route-");
     const vaultRoot = join(root, "vault");
     const gitCommonDir = join(root, "repo", ".git");
     const gitDir = join(gitCommonDir, "worktrees", "feature");
@@ -163,7 +162,7 @@ describe("ProjectStoreRouter", () => {
   });
 
   it("routes a non-Git workspace beneath the canonical vault without creating state", () => {
-    root = mkdtempSync(join(tmpdir(), "memory-store-route-non-git-"));
+    root = canonicalMkdtemp("memory-store-route-non-git-");
     const vaultRoot = join(root, "vault with spaces");
     const workspaceRoot = join(root, "โครงการ plain");
     mkdirSync(vaultRoot, { recursive: true });
@@ -189,7 +188,7 @@ describe("ProjectStoreRouter", () => {
   });
 
   it("routes distinct linked-worktree identities to the same Git-common store", () => {
-    root = mkdtempSync(join(tmpdir(), "memory-store-route-linked-"));
+    root = canonicalMkdtemp("memory-store-route-linked-");
     const vaultRoot = join(root, "vault");
     const gitCommonDir = join(root, "repo", ".git");
     const firstGitDir = join(gitCommonDir, "worktrees", "first");
@@ -241,7 +240,7 @@ describe("StoreManifestRepository", () => {
   });
 
   const arrangeRoute = (): void => {
-    root = mkdtempSync(join(tmpdir(), "memory-store-manifest-"));
+    root = canonicalMkdtemp("memory-store-manifest-");
     vaultRoot = join(root, "vault");
     workspaceRoot = join(root, "workspace");
     mkdirSync(vaultRoot);
@@ -315,7 +314,7 @@ describe("StoreManifestRepository", () => {
   });
 
   it("derives and replays the Git-common durable base for direct manifest callers", () => {
-    root = mkdtempSync(join(tmpdir(), "memory-store-manifest-git-contender-"));
+    root = canonicalMkdtemp("memory-store-manifest-git-contender-");
     vaultRoot = join(root, "vault");
     workspaceRoot = join(root, "workspace");
     const gitCommonDir = join(root, "git-common");

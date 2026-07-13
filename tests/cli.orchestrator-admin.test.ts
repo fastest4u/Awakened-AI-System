@@ -4,7 +4,6 @@ import { createHash } from "node:crypto";
 import {
   existsSync,
   mkdirSync,
-  mkdtempSync,
   readFileSync,
   readdirSync,
   renameSync,
@@ -13,7 +12,6 @@ import {
   symlinkSync,
   writeFileSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, it } from "node:test";
@@ -60,6 +58,7 @@ import {
   type OrchestratorAdminDependencies,
   type ProjectInitializationInspection,
 } from "../src/cli/run-command.js";
+import { canonicalMkdtemp } from "./support/canonical-temp.js";
 
 const temporaryRoots: string[] = [];
 
@@ -68,7 +67,7 @@ afterEach(() => {
 });
 
 function temporaryProject(): { projectRoot: string; vaultRoot: string } {
-  const root = mkdtempSync(join(tmpdir(), "memory-cli-admin-"));
+  const root = canonicalMkdtemp("memory-cli-admin-");
   temporaryRoots.push(root);
   const projectRoot = resolve(root, "project");
   const vaultRoot = resolve(projectRoot, "memory");
@@ -98,7 +97,7 @@ function temporaryGitRepository(): {
   headCommit: string;
   branchRef: string;
 } {
-  const root = mkdtempSync(join(tmpdir(), "memory-cli-admin-git-"));
+  const root = canonicalMkdtemp("memory-cli-admin-git-");
   temporaryRoots.push(root);
   const repositoryRoot = resolve(root, "repository");
   mkdirSync(repositoryRoot, { recursive: true });
@@ -2600,12 +2599,12 @@ describe("V1 MCP isolation", () => {
     const app = readFileSync(resolve("src/app.ts"), "utf8");
     const index = readFileSync(resolve("src/index.ts"), "utf8");
     assert.equal(
-      createHash("sha256").update(app).digest("hex"),
-      "1daf2c496807d73ddd35c4ff203581ca152cd445947afcd28e39fe888e08753f",
+      createHash("sha256").update(app.replace(/\r\n/g, "\n")).digest("hex"),
+      "aa8d8c4edceedc0fe147f38e489a547bd8fbc84c9b0dc3d242933c158116c920",
     );
     assert.equal(
-      createHash("sha256").update(index).digest("hex"),
-      "3cdd1f81d2a9eb5ab1be0c7af28ee2ef424e53555895c0fa716ed76d770aa4b0",
+      createHash("sha256").update(index.replace(/\r\n/g, "\n")).digest("hex"),
+      "55b3b498220f015044d89c4125c103df55f5bf23eae755637252698e63479fff",
     );
   });
 });

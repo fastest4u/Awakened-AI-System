@@ -5,6 +5,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  realpathSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -41,6 +42,7 @@ import {
   ProjectStatusService,
   type HeuristicProjectCandidate,
 } from "../src/orchestrator/diagnostics/project-status.service.js";
+import { canonicalMkdtemp } from "./support/canonical-temp.js";
 
 const PROJECT_ID = "11111111-1111-4111-8111-111111111111" as ProjectId;
 const OTHER_PROJECT_ID = "22222222-2222-4222-8222-222222222222" as ProjectId;
@@ -57,7 +59,7 @@ afterEach(() => {
 });
 
 function tempRoots(): { root: string; projectRoot: string; vaultRoot: string } {
-  const root = mkdtempSync(join(tmpdir(), "project-binding-"));
+  const root = canonicalMkdtemp("project-binding-");
   roots.push(root);
   const projectRoot = resolve(root, "project");
   const vaultRoot = resolve(projectRoot, "memory");
@@ -267,6 +269,35 @@ function assertBindingFailure(error: unknown, code: string): boolean {
 }
 
 describe("ProjectBindingService establishment", () => {
+  it("canonicalizes temporary roots before deriving identity-bearing paths", () => {
+    const targetRoot = mkdtempSync(join(tmpdir(), "project-binding-canonical-target-"));
+    const aliasRoot = `${targetRoot}-alias`;
+    roots.push(targetRoot, aliasRoot);
+    symlinkSync(targetRoot, aliasRoot, process.platform === "win32" ? "junction" : "dir");
+    const previousEnvironment = {
+      TMPDIR: process.env.TMPDIR,
+      TEMP: process.env.TEMP,
+      TMP: process.env.TMP,
+    };
+
+    try {
+      process.env.TMPDIR = aliasRoot;
+      process.env.TEMP = aliasRoot;
+      process.env.TMP = aliasRoot;
+      const temporary = tempRoots();
+      const canonicalRoot = resolve(realpathSync.native(temporary.root));
+
+      assert.equal(temporary.root, canonicalRoot);
+      assert.equal(temporary.projectRoot, resolve(canonicalRoot, "project"));
+      assert.equal(temporary.vaultRoot, resolve(canonicalRoot, "project", "memory"));
+    } finally {
+      for (const [name, value] of Object.entries(previousEnvironment)) {
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
+    }
+  });
+
   it("establishes only after the ordered descriptor/Git/route/manifest/worker identity gate", async () => {
     const item = fixture();
 
