@@ -22,12 +22,17 @@ import type {
   ProjectBinding,
   ProjectContext,
 } from "../src/orchestrator/identity/contracts.js";
+import { ProjectBindingError } from "../src/orchestrator/identity/project-binding.service.js";
 import type { TrustedProjectBindingRequest } from "../src/orchestrator/identity/project-binding.request.js";
 import { ProjectDescriptorRepository } from "../src/orchestrator/identity/project-descriptor.repository.js";
 import type { IntegrityReport } from "../src/orchestrator/integrity/integrity.types.js";
 import type { RuntimeCapabilityReport } from "../src/orchestrator/runtime/runtime-capabilities.js";
 import { ProjectStoreWorkerError } from "../src/orchestrator/runtime/project-store-executor.js";
-import { DefaultProjectStoreBootstrapService } from "../src/orchestrator/storage/project-store-bootstrap.service.js";
+import { WorkerProjectStoreIdentityProbe } from "../src/orchestrator/runtime/project-store-identity-probe.js";
+import {
+  DefaultProjectStoreBootstrapService,
+  type ProjectStoreBootstrapResult,
+} from "../src/orchestrator/storage/project-store-bootstrap.service.js";
 import { diagnoseMemoryConfig } from "../src/config/memory.config.js";
 import {
   projectConfigPath,
@@ -46,6 +51,7 @@ import {
   runCliCommand,
   type CliIo,
   type OrchestratorAdminDependencies,
+  type ProjectInitializationInspection,
 } from "../src/cli/run-command.js";
 
 const temporaryRoots: string[] = [];
@@ -152,6 +158,30 @@ const CONTEXT = {
   },
   checkedAt: "2026-07-13T00:00:01.000Z",
 } as ProjectContext;
+
+function statusBindingFor(roots: { projectRoot: string; vaultRoot: string }): ProjectBinding {
+  const storeRoot = join(roots.vaultRoot, ".memory-mcp", "v2");
+  return {
+    ...CONTEXT.binding,
+    actorRole: "untrusted",
+    clientInstanceId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    projectRoot: roots.projectRoot,
+    vaultRoot: roots.vaultRoot,
+    descriptorPath: join(roots.vaultRoot, ".memory-mcp", "project-identity.json"),
+    storeRoute: {
+      kind: "vault-local",
+      storeRoot,
+      eventsPath: join(storeRoot, "events.sqlite"),
+      storeManifestPath: join(storeRoot, "store-manifest.json"),
+      projectionManifestPath: join(storeRoot, "current-projection.json"),
+    },
+    workspace: {
+      kind: "non-git",
+      workspaceRoot: roots.projectRoot,
+      workspaceId: CONTEXT.binding.workspaceId,
+    },
+  };
+}
 
 const QUICK_REPORT: IntegrityReport = {
   ok: true,
@@ -428,6 +458,135 @@ describe("V2 administration lifecycle", () => {
     });
   });
 
+  for (const invalidInspection of [
+    {
+      name: "initialized state with a pending summary",
+      create(roots: { projectRoot: string; vaultRoot: string }) {
+        return {
+          state: "initialized",
+          summary: {
+            projectRoot: roots.projectRoot,
+            vaultRoot: roots.vaultRoot,
+            routeState: "pending-project-identity",
+          },
+          remediation: [],
+        } as unknown as ProjectInitializationInspection;
+      },
+    },
+    {
+      name: "initialized state without a store identity",
+      create(roots: { projectRoot: string; vaultRoot: string }) {
+        const storeRoot = resolve(roots.vaultRoot, ".memory-mcp", "v2");
+        return {
+          state: "initialized",
+          summary: {
+            projectRoot: roots.projectRoot,
+            vaultRoot: roots.vaultRoot,
+            routeState: "resolved",
+            storeRoot,
+            eventsPath: resolve(storeRoot, "events.sqlite"),
+            projectId: "11111111-1111-4111-8111-111111111111",
+            vaultId: "22222222-2222-4222-8222-222222222222",
+          },
+          remediation: [],
+        } as unknown as ProjectInitializationInspection;
+      },
+    },
+    {
+      name: "events path outside the store root",
+      create(roots: { projectRoot: string; vaultRoot: string }) {
+        const storeRoot = resolve(roots.vaultRoot, ".memory-mcp", "v2");
+        return {
+          state: "initialized",
+          summary: {
+            projectRoot: roots.projectRoot,
+            vaultRoot: roots.vaultRoot,
+            routeState: "resolved",
+            storeRoot,
+            eventsPath: resolve(roots.projectRoot, "outside.sqlite"),
+            projectId: "11111111-1111-4111-8111-111111111111",
+            vaultId: "22222222-2222-4222-8222-222222222222",
+            storeId: "33333333-3333-4333-8333-333333333333",
+          },
+          remediation: [],
+        } as unknown as ProjectInitializationInspection;
+      },
+    },
+    {
+      name: "noncanonical database name inside the store root",
+      create(roots: { projectRoot: string; vaultRoot: string }) {
+        const storeRoot = resolve(roots.vaultRoot, ".memory-mcp", "v2");
+        return {
+          state: "initialized",
+          summary: {
+            projectRoot: roots.projectRoot,
+            vaultRoot: roots.vaultRoot,
+            routeState: "resolved",
+            storeRoot,
+            eventsPath: resolve(storeRoot, "RUNTIME_PATH_SECRET.sqlite"),
+            projectId: "11111111-1111-4111-8111-111111111111",
+            vaultId: "22222222-2222-4222-8222-222222222222",
+            storeId: "33333333-3333-4333-8333-333333333333",
+          },
+          remediation: [],
+        } as unknown as ProjectInitializationInspection;
+      },
+    },
+    {
+      name: "new-project state with a resolved summary",
+      create(roots: { projectRoot: string; vaultRoot: string }) {
+        const storeRoot = resolve(roots.vaultRoot, ".memory-mcp", "v2");
+        return {
+          state: "new-project",
+          summary: {
+            projectRoot: roots.projectRoot,
+            vaultRoot: roots.vaultRoot,
+            routeState: "resolved",
+            storeRoot,
+            eventsPath: resolve(storeRoot, "events.sqlite"),
+            projectId: "11111111-1111-4111-8111-111111111111",
+            vaultId: "22222222-2222-4222-8222-222222222222",
+          },
+          remediation: ["rerun with --apply"],
+        } as unknown as ProjectInitializationInspection;
+      },
+    },
+    {
+      name: "summary roots outside the explicit request",
+      create(roots: { projectRoot: string; vaultRoot: string }) {
+        return {
+          state: "new-project",
+          summary: {
+            projectRoot: resolve(roots.projectRoot, "..", "other-project"),
+            vaultRoot: roots.vaultRoot,
+            routeState: "pending-project-identity",
+          },
+          remediation: ["rerun with --apply"],
+        } as unknown as ProjectInitializationInspection;
+      },
+    },
+  ]) {
+    it(`rejects an inconsistent initialization inspection: ${invalidInspection.name}`, async () => {
+      const roots = temporaryProject();
+      const fake = dependencies({
+        async inspectInitialization() { return invalidInspection.create(roots); },
+      });
+      const capture = outputCapture();
+
+      assert.equal(await runCliCommand({
+        ...defaultOptions("orchestrator-init"),
+        projectRoot: roots.projectRoot,
+        vault: roots.vaultRoot,
+      }, capture.io, fake.value), 1);
+      assert.equal(capture.stdout(), "");
+      assert.deepEqual(JSON.parse(capture.stderr()), {
+        ok: false,
+        code: "ORCHESTRATOR_ADMIN_FAILED",
+        message: "Orchestrator administration failed",
+      });
+    });
+  }
+
   it("probes initialized and recoverable stores only through disposable stable snapshots", async () => {
     const roots = temporaryProject();
     const initialized = await new DefaultProjectStoreBootstrapService().initialize(roots);
@@ -464,6 +623,93 @@ describe("V2 administration lifecycle", () => {
     assert.equal(treeDigest(roots.projectRoot), beforeRecovery);
     assert.equal(observedProbePaths.length, 2);
     assert.equal(observedProbePaths.every((path) => !existsSync(path)), true);
+  });
+
+  it("fails concrete inspection closed when the authoritative WAL path is non-regular", async () => {
+    const roots = temporaryProject();
+    const initialized = await new DefaultProjectStoreBootstrapService().initialize(roots);
+    const workerUrl = new URL("../src/workers/project-store.worker.js", import.meta.url);
+    const inspector = createOrchestratorAdminDependencies(workerUrl).inspectInitialization;
+    const walPath = `${initialized.route.eventsPath}-wal`;
+    const shmPath = `${initialized.route.eventsPath}-shm`;
+
+    const database = new DatabaseSync(initialized.route.eventsPath);
+    database.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+    database.close();
+    rmSync(walPath, { force: true });
+    rmSync(shmPath, { force: true });
+
+    assert.equal(existsSync(walPath), false);
+    const beforeNormalInspection = treeDigest(roots.projectRoot);
+    const normalInspection = await inspector(roots.projectRoot, roots.vaultRoot);
+    assert.equal(normalInspection.state, "initialized");
+    assert.equal(treeDigest(roots.projectRoot), beforeNormalInspection);
+
+    mkdirSync(walPath);
+    const beforeInvalidInspection = treeDigest(roots.projectRoot);
+    const invalidInspection = await inspector(roots.projectRoot, roots.vaultRoot);
+    assert.equal(invalidInspection.state, "blocked");
+    if (invalidInspection.state === "blocked") {
+      assert.equal(invalidInspection.code, "STORE_UNAVAILABLE");
+    }
+    assert.equal(treeDigest(roots.projectRoot), beforeInvalidInspection);
+    assert.equal(statSync(walPath).isDirectory(), true);
+  });
+
+  it("fails concrete inspection closed when the authoritative SHM path is non-regular", async () => {
+    const roots = temporaryProject();
+    const initialized = await new DefaultProjectStoreBootstrapService().initialize(roots);
+    const workerUrl = new URL("../src/workers/project-store.worker.js", import.meta.url);
+    const inspector = createOrchestratorAdminDependencies(workerUrl).inspectInitialization;
+    const walPath = `${initialized.route.eventsPath}-wal`;
+    const shmPath = `${initialized.route.eventsPath}-shm`;
+
+    const database = new DatabaseSync(initialized.route.eventsPath);
+    database.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+    database.close();
+    rmSync(walPath, { force: true });
+    rmSync(shmPath, { force: true });
+    mkdirSync(shmPath);
+
+    const beforeInspection = treeDigest(roots.projectRoot);
+    const inspection = await inspector(roots.projectRoot, roots.vaultRoot);
+    assert.equal(inspection.state, "blocked");
+    if (inspection.state === "blocked") {
+      assert.equal(inspection.code, "STORE_UNAVAILABLE");
+    }
+    assert.equal(treeDigest(roots.projectRoot), beforeInspection);
+    assert.equal(statSync(shmPath).isDirectory(), true);
+  });
+
+  it("does not launder a junctioned authoritative store through a temporary snapshot", {
+    skip: process.platform !== "win32",
+  }, async () => {
+    const roots = temporaryProject();
+    const initialized = await new DefaultProjectStoreBootstrapService().initialize(roots);
+    const workerUrl = new URL("../src/workers/project-store.worker.js", import.meta.url);
+    const relocatedStoreRoot = resolve(initialized.route.storeRoot, "..", "v2-relocated");
+    renameSync(initialized.route.storeRoot, relocatedStoreRoot);
+    symlinkSync(relocatedStoreRoot, initialized.route.storeRoot, "junction");
+
+    const directProbe = new WorkerProjectStoreIdentityProbe({ workerUrl });
+    await assert.rejects(directProbe.verify(initialized.route, {
+      projectId: initialized.descriptor.projectId,
+      vaultId: initialized.descriptor.vaultId,
+      storeId: initialized.manifest.storeId,
+    }), (error) => {
+      assert.ok(error instanceof ProjectBindingError);
+      assert.equal(error.code, "STORE_UNAVAILABLE");
+      return true;
+    });
+
+    const inspector = createOrchestratorAdminDependencies(workerUrl).inspectInitialization;
+    const beforeInspection = treeDigest(roots.projectRoot);
+    const inspection = await inspector(roots.projectRoot, roots.vaultRoot);
+    assert.equal(inspection.state, "blocked");
+    if (inspection.state === "blocked") {
+      assert.equal(inspection.code, "STORE_UNAVAILABLE");
+    }
+    assert.equal(treeDigest(roots.projectRoot), beforeInspection);
   });
 
   it("applies new initialization, recovers a missing manifest, and remains idempotent", async () => {
@@ -590,6 +836,62 @@ describe("V2 administration lifecycle", () => {
     assert.equal((JSON.parse(capture.stderr()) as { code: string }).code, "STORE_UNAVAILABLE");
   });
 
+  for (const hostileBootstrap of [
+    {
+      name: "descriptor timestamp",
+      mutate(result: ProjectStoreBootstrapResult): ProjectStoreBootstrapResult {
+        return {
+          ...result,
+          descriptor: {
+            ...result.descriptor,
+            createdAt: {
+              toJSON() { return "BOOTSTRAP_CREATED_AT_SECRET"; },
+            } as unknown as string,
+          },
+        };
+      },
+    },
+    {
+      name: "events route",
+      mutate(result: ProjectStoreBootstrapResult): ProjectStoreBootstrapResult {
+        return {
+          ...result,
+          route: {
+            ...result.route,
+            eventsPath: {
+              toJSON() { return "BOOTSTRAP_ROUTE_SECRET"; },
+            } as unknown as string,
+          },
+        };
+      },
+    },
+  ]) {
+    it(`rejects dependency-owned bootstrap output: ${hostileBootstrap.name}`, async () => {
+      const roots = temporaryProject();
+      const initialized = await new DefaultProjectStoreBootstrapService().initialize(roots);
+      const fake = dependencies({
+        bootstrap: {
+          async initialize() { return hostileBootstrap.mutate(initialized); },
+        },
+      });
+      const capture = outputCapture();
+
+      assert.equal(await runCliCommand({
+        ...defaultOptions("orchestrator-init"),
+        dryRun: false,
+        projectRoot: roots.projectRoot,
+        vault: roots.vaultRoot,
+      }, capture.io, fake.value), 1);
+      assert.equal(capture.stdout(), "");
+      assert.deepEqual(JSON.parse(capture.stderr()), {
+        ok: false,
+        code: "ORCHESTRATOR_ADMIN_FAILED",
+        message: "Orchestrator administration failed",
+      });
+      assert.equal(capture.stderr().includes("BOOTSTRAP_"), false);
+    });
+  }
+
   it("stops after a failed disposable runtime probe and never reaches a store dependency", async () => {
     const roots = temporaryProject();
     const fake = dependencies({
@@ -620,9 +922,74 @@ describe("V2 administration lifecycle", () => {
     );
   });
 
+  it("rejects a hostile successful runtime report before serializing dependency data", async () => {
+    const roots = temporaryProject();
+    const fake = dependencies({
+      async runtimeProbe() {
+        return {
+          ok: true,
+          ...RUNTIME,
+          nodeVersion: {
+            toJSON() { return "RUNTIME_REPORT_SECRET"; },
+          },
+        } as unknown as { ok: true } & RuntimeCapabilityReport;
+      },
+    });
+    const capture = outputCapture();
+
+    assert.equal(await runCliCommand({
+      ...defaultOptions("orchestrator-status"),
+      projectRoot: roots.projectRoot,
+      vault: roots.vaultRoot,
+    }, capture.io, fake.value), 1);
+    assert.equal(capture.stdout(), "");
+    assert.deepEqual(JSON.parse(capture.stderr()), {
+      ok: false,
+      code: "ORCHESTRATOR_ADMIN_FAILED",
+      message: "Orchestrator administration failed",
+    });
+    assert.equal(capture.stderr().includes("RUNTIME_REPORT_SECRET"), false);
+  });
+
+  it("rejects an unbounded runtime version string before status output", async () => {
+    const roots = temporaryProject();
+    const fake = dependencies({
+      async runtimeProbe() {
+        return {
+          ok: true,
+          ...RUNTIME,
+          nodeVersion: "RUNTIME_VERSION_SECRET",
+        };
+      },
+    });
+    const capture = outputCapture();
+
+    assert.equal(await runCliCommand({
+      ...defaultOptions("orchestrator-status"),
+      projectRoot: roots.projectRoot,
+      vault: roots.vaultRoot,
+    }, capture.io, fake.value), 1);
+    assert.equal(capture.stdout(), "");
+    assert.deepEqual(JSON.parse(capture.stderr()), {
+      ok: false,
+      code: "ORCHESTRATOR_ADMIN_FAILED",
+      message: "Orchestrator administration failed",
+    });
+    assert.equal(capture.stderr().includes("RUNTIME_VERSION_SECRET"), false);
+  });
+
   it("establishes status as untrusted and emits only the safe projection", async () => {
     const roots = temporaryProject();
-    const fake = dependencies();
+    const binding = statusBindingFor(roots);
+    const fake = dependencies({
+      bindingService: {
+        async establish() {
+          fake.calls.push("establish:untrusted");
+          return { ok: true, binding };
+        },
+        async revalidate() { return CONTEXT; },
+      },
+    });
     const capture = outputCapture();
     const code = await runCliCommand({
       ...defaultOptions("orchestrator-status"),
@@ -637,23 +1004,116 @@ describe("V2 administration lifecycle", () => {
     assert.equal(output.includes("private-client-id"), false);
     assert.deepEqual(JSON.parse(output), {
       action: "status",
-      projectId: CONTEXT.binding.projectId,
-      vaultId: CONTEXT.binding.vaultId,
-      storeId: CONTEXT.binding.storeId,
-      workspaceId: CONTEXT.binding.workspaceId,
-      eventsPath: CONTEXT.binding.storeRoute.eventsPath,
+      projectId: binding.projectId,
+      vaultId: binding.vaultId,
+      storeId: binding.storeId,
+      workspaceId: binding.workspaceId,
+      eventsPath: binding.storeRoute.eventsPath,
       runtime: RUNTIME,
     });
   });
 
+  for (const hostileStatus of [
+    {
+      name: "workspace identity",
+      mutate(binding: ProjectBinding): ProjectBinding {
+        return {
+          ...binding,
+          workspaceId: {
+            toJSON() { return "STATUS_WORKSPACE_SECRET"; },
+          } as unknown as ProjectBinding["workspaceId"],
+        };
+      },
+    },
+    {
+      name: "events route",
+      mutate(binding: ProjectBinding): ProjectBinding {
+        return {
+          ...binding,
+          storeRoute: {
+            ...binding.storeRoute,
+            eventsPath: {
+              toJSON() { return "STATUS_ROUTE_SECRET"; },
+            } as unknown as string,
+          },
+        };
+      },
+    },
+    {
+      name: "non-canonical events filename",
+      mutate(binding: ProjectBinding): ProjectBinding {
+        return {
+          ...binding,
+          storeRoute: {
+            ...binding.storeRoute,
+            eventsPath: join(binding.storeRoute.storeRoot, "renamed.sqlite"),
+          },
+        };
+      },
+    },
+    {
+      name: "inconsistent workspace identity",
+      mutate(binding: ProjectBinding): ProjectBinding {
+        return {
+          ...binding,
+          workspace: {
+            ...binding.workspace,
+            workspaceId: "workspace-other-id" as ProjectBinding["workspaceId"],
+          },
+        };
+      },
+    },
+    {
+      name: "foreign explicit roots",
+      mutate(binding: ProjectBinding): ProjectBinding {
+        return {
+          ...binding,
+          projectRoot: resolve(binding.projectRoot, "foreign-project"),
+        };
+      },
+    },
+    {
+      name: "foreign request identity",
+      mutate(binding: ProjectBinding): ProjectBinding {
+        return { ...binding, actorRole: "maintenance" };
+      },
+    },
+  ]) {
+    it(`rejects dependency-owned status output: ${hostileStatus.name}`, async () => {
+      const roots = temporaryProject();
+      const binding = hostileStatus.mutate(statusBindingFor(roots));
+      const fake = dependencies({
+        bindingService: {
+          async establish() { return { ok: true, binding }; },
+          async revalidate() { return CONTEXT; },
+        },
+      });
+      const capture = outputCapture();
+
+      assert.equal(await runCliCommand({
+        ...defaultOptions("orchestrator-status"),
+        projectRoot: roots.projectRoot,
+        vault: roots.vaultRoot,
+      }, capture.io, fake.value), 1);
+      assert.equal(capture.stdout(), "");
+      assert.deepEqual(JSON.parse(capture.stderr()), {
+        ok: false,
+        code: "ORCHESTRATOR_ADMIN_FAILED",
+        message: "Orchestrator administration failed",
+      });
+      assert.equal(capture.stderr().includes("STATUS_"), false);
+    });
+  }
+
   it("passes the canonical explicit binding request with no inferred roots", async () => {
     const roots = temporaryProject();
+    const binding = statusBindingFor(roots);
     let observed: TrustedProjectBindingRequest | undefined;
     const fake = dependencies({
       bindingService: {
         async establish(request) {
           observed = request;
-          return { ok: true, binding: CONTEXT.binding };
+          return { ok: true, binding };
         },
         async revalidate() { return CONTEXT; },
       },
@@ -774,7 +1234,119 @@ describe("V2 administration lifecycle", () => {
     assert.equal(capture.stderr().includes("close secret"), false);
   });
 
-  it("records failed integrity durably after close using the exact context and report", async () => {
+  for (const invalidReport of [
+    {
+      name: "foreign project identity",
+      fullIntegrity: false,
+      expectedCode: "PROJECT_ID_MISMATCH",
+      mutate: (report: IntegrityReport): IntegrityReport => ({
+        ...report,
+        projectId: "99999999-9999-4999-8999-999999999999",
+      }),
+    },
+    {
+      name: "foreign store identity",
+      fullIntegrity: false,
+      expectedCode: "STORE_ID_MISMATCH",
+      mutate: (report: IntegrityReport): IntegrityReport => ({
+        ...report,
+        storeId: "88888888-8888-4888-8888-888888888888",
+      }),
+    },
+    {
+      name: "quick report for a full request",
+      fullIntegrity: true,
+      expectedCode: "INTEGRITY_REPORT_INVALID",
+      mutate: (report: IntegrityReport): IntegrityReport => ({ ...report, mode: "quick" }),
+    },
+    {
+      name: "successful report with issues",
+      fullIntegrity: false,
+      expectedCode: "INTEGRITY_REPORT_INVALID",
+      mutate: (report: IntegrityReport): IntegrityReport => ({
+        ...report,
+        ok: true,
+        issues: [{
+          code: "SQLITE_QUICK_CHECK_FAILED",
+          message: "integrity issue",
+        }],
+      }),
+    },
+    {
+      name: "failed report without issues",
+      fullIntegrity: false,
+      expectedCode: "INTEGRITY_REPORT_INVALID",
+      mutate: (report: IntegrityReport): IntegrityReport => ({
+        ...report,
+        ok: false,
+        issues: [],
+      }),
+    },
+    {
+      name: "dependency-owned issue serialization",
+      fullIntegrity: false,
+      expectedCode: "INTEGRITY_REPORT_INVALID",
+      mutate: (report: IntegrityReport): IntegrityReport => ({
+        ...report,
+        ok: false,
+        issues: [{
+          code: "SQLITE_QUICK_CHECK_FAILED",
+          message: {
+            toJSON() { return "INTEGRITY_REPORT_SECRET"; },
+          } as unknown as string,
+        }],
+      }),
+    },
+  ]) {
+    it(`rejects an unbound integrity report: ${invalidReport.name}`, async () => {
+      const roots = temporaryProject();
+      const initialized = await new DefaultProjectStoreBootstrapService().initialize(roots);
+      const workerUrl = new URL("../src/workers/project-store.worker.js", import.meta.url);
+      const real = createOrchestratorAdminDependencies(workerUrl);
+      const calls: string[] = [];
+      const guardedDependencies: OrchestratorAdminDependencies = {
+        ...real,
+        executorFactory(context) {
+          calls.push("executor");
+          const expectedMode = invalidReport.fullIntegrity ? "full" : "quick";
+          const report = invalidReport.mutate({
+            ...QUICK_REPORT,
+            mode: expectedMode,
+            projectId: context.binding.projectId,
+            storeId: context.binding.storeId,
+          });
+          return {
+            async open() { calls.push("open"); return {}; },
+            async quickIntegrity() { calls.push("quick"); return report; },
+            async fullIntegrity() { calls.push("full"); return report; },
+            async close() { calls.push("close"); },
+          };
+        },
+      };
+      const beforeManifest = readFileSync(initialized.route.storeManifestPath, "utf8");
+      const capture = outputCapture();
+
+      assert.equal(await runCliCommand({
+        ...defaultOptions("orchestrator-integrity"),
+        fullIntegrity: invalidReport.fullIntegrity,
+        projectRoot: roots.projectRoot,
+        vault: roots.vaultRoot,
+      }, capture.io, guardedDependencies), 1);
+      assert.equal(capture.stdout(), "");
+      assert.equal(
+        (JSON.parse(capture.stderr()) as { code: string }).code,
+        invalidReport.expectedCode,
+      );
+      assert.equal(capture.stderr().includes("INTEGRITY_REPORT_SECRET"), false);
+      assert.equal(
+        readFileSync(initialized.route.storeManifestPath, "utf8"),
+        beforeManifest,
+      );
+      assert.equal(calls.at(-1), "close");
+    });
+  }
+
+  it("records failed integrity durably after close using the exact context and decoded report", async () => {
     const roots = temporaryProject();
     const failedReport: IntegrityReport = {
       ...QUICK_REPORT,
@@ -814,7 +1386,8 @@ describe("V2 administration lifecycle", () => {
     }, capture.io, fake.value), 1);
     assert.deepEqual(fake.calls.slice(-5), ["executor", "open", "quick", "close", "record"]);
     assert.equal(recordedContext, CONTEXT);
-    assert.equal(recordedReport, failedReport);
+    assert.notEqual(recordedReport, failedReport);
+    assert.deepEqual(recordedReport, failedReport);
     assert.deepEqual(JSON.parse(capture.stdout()), {
       action: "integrity",
       report: failedReport,
@@ -942,6 +1515,107 @@ describe("V2 administration lifecycle", () => {
       "ORCHESTRATOR_ADMIN_FAILED",
     );
     assert.equal(hostileOutput.stderr().includes("private"), false);
+  });
+
+  it("does not echo an unknown usage discriminator from a proxied usage error", async () => {
+    const roots = temporaryProject();
+    const proxiedUsageError = new Proxy(
+      new CliUsageError("PROJECT_ROOT_MISSING"),
+      {
+        get(target, property, receiver) {
+          if (property === "code") return "USAGE_PROXY_SECRET";
+          return Reflect.get(target, property, receiver);
+        },
+      },
+    );
+    const fake = dependencies({
+      async runtimeProbe() { throw proxiedUsageError; },
+    });
+    const capture = outputCapture();
+
+    assert.equal(await runCliCommand({
+      ...defaultOptions("orchestrator-status"),
+      projectRoot: roots.projectRoot,
+      vault: roots.vaultRoot,
+    }, capture.io, fake.value), 2);
+    assert.deepEqual(JSON.parse(capture.stderr()), {
+      ok: false,
+      code: "INVALID_COMMAND_LINE_INPUT",
+      message: "Invalid command-line input",
+    });
+    assert.equal(capture.stderr().includes("USAGE_PROXY_SECRET"), false);
+  });
+
+  it("does not retain a dependency-owned toJSON value in a blocked summary", async () => {
+    const roots = temporaryProject();
+    const fake = dependencies({
+      async inspectInitialization() {
+        return {
+          state: "blocked",
+          code: "PROJECT_ID_MISMATCH",
+          message: "ignored",
+          summary: {
+            projectRoot: {
+              toJSON() { return "SAFEADMIN_SUMMARY_SECRET"; },
+            } as unknown as string,
+            vaultRoot: roots.vaultRoot,
+            routeState: "pending-project-identity",
+          },
+          remediation: [],
+        };
+      },
+    });
+    const capture = outputCapture();
+
+    assert.equal(await runCliCommand({
+      ...defaultOptions("orchestrator-init"),
+      projectRoot: roots.projectRoot,
+      vault: roots.vaultRoot,
+    }, capture.io, fake.value), 1);
+    assert.deepEqual(JSON.parse(capture.stderr()), {
+      ok: false,
+      code: "ORCHESTRATOR_ADMIN_FAILED",
+      message: "Orchestrator administration failed",
+    });
+    assert.equal(capture.stderr().includes("SAFEADMIN_SUMMARY_SECRET"), false);
+  });
+
+  it("does not reject or disclose when a blocked summary toJSON throws", async () => {
+    const roots = temporaryProject();
+    const fake = dependencies({
+      async inspectInitialization() {
+        return {
+          state: "blocked",
+          code: "PROJECT_ID_MISMATCH",
+          message: "ignored",
+          summary: {
+            projectRoot: {
+              toJSON() { throw new Error("SAFEADMIN_TOJSON_SECRET"); },
+            } as unknown as string,
+            vaultRoot: roots.vaultRoot,
+            routeState: "pending-project-identity",
+          },
+          remediation: [],
+        };
+      },
+    });
+    const capture = outputCapture();
+    let exitCode: 0 | 1 | 2 | undefined;
+
+    await assert.doesNotReject(async () => {
+      exitCode = await runCliCommand({
+        ...defaultOptions("orchestrator-init"),
+        projectRoot: roots.projectRoot,
+        vault: roots.vaultRoot,
+      }, capture.io, fake.value);
+    });
+    assert.equal(exitCode, 1);
+    assert.deepEqual(JSON.parse(capture.stderr()), {
+      ok: false,
+      code: "ORCHESTRATOR_ADMIN_FAILED",
+      message: "Orchestrator administration failed",
+    });
+    assert.equal(capture.stderr().includes("SAFEADMIN_TOJSON_SECRET"), false);
   });
 
   it("uses the compiled one-shot identity worker and bound executor end to end", async () => {
