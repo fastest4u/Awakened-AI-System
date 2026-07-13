@@ -800,6 +800,75 @@ describe("EventStore", () => {
     assert.equal(fixture.connection.beginCount, 0);
   });
 
+  it("rejects incomplete Git and non-Git workspace snapshots even when both context copies omit the same field", () => {
+    const fixture = createFixture();
+    assert.equal(fixture.context.workspace.kind, "git");
+    const gitFields = [
+      "worktreeRoot",
+      "gitDir",
+      "gitCommonDir",
+      "headCommit",
+      "workspaceId",
+    ] as const;
+    for (const field of gitFields) {
+      const contextWorkspace = { ...fixture.context.workspace } as Record<string, unknown>;
+      const bindingWorkspace = { ...fixture.context.binding.workspace } as Record<string, unknown>;
+      delete contextWorkspace[field];
+      delete bindingWorkspace[field];
+      const incomplete: ProjectContext = {
+        ...fixture.context,
+        workspace: contextWorkspace as unknown as GitWorkspaceSnapshot,
+        binding: {
+          ...fixture.context.binding,
+          workspace: bindingWorkspace as unknown as GitWorkspaceSnapshot,
+        },
+      };
+      const before = fixture.connection.beginCount;
+      expectEventStoreError(
+        () => fixture.store.append(appendCommand(incomplete)),
+        "PROJECT_CONTEXT_MISMATCH",
+      );
+      assert.equal(fixture.connection.beginCount, before, field);
+      assert.deepEqual(counts(fixture.connection), {
+        streams: 0n,
+        branchScopes: 0n,
+        events: 0n,
+        outbox: 0n,
+        dedup: 0n,
+      });
+    }
+
+    const nonGitWorkspace: NonGitWorkspaceSnapshot = {
+      kind: "non-git",
+      workspaceRoot: "C:\\project",
+      workspaceId: "workspace-non-git" as WorkspaceId,
+    };
+    const validNonGit = contextFor(nonGitWorkspace);
+    const missingRoot = { ...nonGitWorkspace } as Record<string, unknown>;
+    delete missingRoot.workspaceRoot;
+    const incompleteNonGit: ProjectContext = {
+      ...validNonGit,
+      workspace: missingRoot as unknown as NonGitWorkspaceSnapshot,
+      binding: {
+        ...validNonGit.binding,
+        workspace: { ...missingRoot } as unknown as NonGitWorkspaceSnapshot,
+      },
+    };
+    const before = fixture.connection.beginCount;
+    expectEventStoreError(
+      () => fixture.store.append(appendCommand(incompleteNonGit)),
+      "PROJECT_CONTEXT_MISMATCH",
+    );
+    assert.equal(fixture.connection.beginCount, before);
+    assert.deepEqual(counts(fixture.connection), {
+      streams: 0n,
+      branchScopes: 0n,
+      events: 0n,
+      outbox: 0n,
+      dedup: 0n,
+    });
+  });
+
   it("rejects a new append during quiescing but permits read-only replay of committed dedup", () => {
     const fixture = createFixture();
     const original = appendCommand(fixture.context);
@@ -904,6 +973,37 @@ describe("EventStore", () => {
       fixture.store.append(command);
       fixture.connection.exec("DROP TRIGGER command_dedup_no_update");
       corrupt(fixture);
+      expectEventStoreError(() => fixture.store.append(command), "INTEGRITY_FAILURE");
+    }
+  });
+
+  it("rejects coherently rehashed replay rows with duplicate event IDs or an impossible final stream version", () => {
+    for (const malformed of [
+      {
+        eventIds: [uuid(1), uuid(1)],
+        firstGlobalPosition: "1",
+        lastGlobalPosition: "2",
+        finalStreamVersion: "2",
+        response: { accepted: true },
+      },
+      {
+        eventIds: [uuid(1), uuid(2)],
+        firstGlobalPosition: "1",
+        lastGlobalPosition: "2",
+        finalStreamVersion: "1",
+        response: { accepted: true },
+      },
+    ]) {
+      const fixture = createFixture();
+      const command = appendCommand(fixture.context);
+      fixture.store.append(command);
+      fixture.connection.exec("DROP TRIGGER command_dedup_no_update");
+      fixture.connection.prepare(`
+        UPDATE command_dedup SET response_json = $json, response_hash = $hash
+      `).run({
+        $json: canonicalJson(malformed),
+        $hash: responseHash(malformed),
+      });
       expectEventStoreError(() => fixture.store.append(command), "INTEGRITY_FAILURE");
     }
   });

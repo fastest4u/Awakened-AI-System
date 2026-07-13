@@ -213,6 +213,26 @@ function sameWorkspace(
   return false;
 }
 
+function isCompleteWorkspace(value: unknown): value is Record<string, unknown> {
+  if (!isPlainRecord(value)) return false;
+  if (value.kind === "git") {
+    return nonEmptyString(value.worktreeRoot)
+      && nonEmptyString(value.gitDir)
+      && nonEmptyString(value.gitCommonDir)
+      && nonEmptyString(value.headCommit)
+      && nonEmptyString(value.workspaceId)
+      && typeof value.detached === "boolean"
+      && (value.detached
+        ? value.branchRef === null
+        : nonEmptyString(value.branchRef));
+  }
+  if (value.kind === "non-git") {
+    return nonEmptyString(value.workspaceRoot)
+      && nonEmptyString(value.workspaceId);
+  }
+  return false;
+}
+
 function validateProjectContext(command: AppendCommand<JsonValue>): void {
   const context = command.context as unknown;
   if (!isPlainRecord(context) || !isPlainRecord(context.binding)) {
@@ -229,24 +249,12 @@ function validateProjectContext(command: AppendCommand<JsonValue>): void {
     || !ACTOR_ROLES.has(binding.actorRole as string)
     || !Number.isSafeInteger(binding.generation)
     || Number(binding.generation) <= 0
-    || !isPlainRecord(binding.workspace)
-    || !isPlainRecord(workspace)
+    || !isCompleteWorkspace(binding.workspace)
+    || !isCompleteWorkspace(workspace)
     || binding.workspaceId !== binding.workspace.workspaceId
     || binding.workspaceId !== workspace.workspaceId
     || !sameWorkspace(binding.workspace, workspace)
   ) {
-    throw new EventStoreError("PROJECT_CONTEXT_MISMATCH");
-  }
-  if (workspace.kind === "git") {
-    if (
-      !nonEmptyString(workspace.headCommit)
-      || typeof workspace.detached !== "boolean"
-      || (workspace.detached && workspace.branchRef !== null)
-      || (!workspace.detached && !nonEmptyString(workspace.branchRef))
-    ) {
-      throw new EventStoreError("PROJECT_CONTEXT_MISMATCH");
-    }
-  } else if (workspace.kind !== "non-git") {
     throw new EventStoreError("PROJECT_CONTEXT_MISMATCH");
   }
 }
@@ -469,6 +477,8 @@ function decodeStoredResponse<T extends JsonValue>(
     firstGlobalPosition < 1n
     || lastGlobalPosition < firstGlobalPosition
     || finalStreamVersion < 1n
+    || new Set(parsed.eventIds).size !== parsed.eventIds.length
+    || finalStreamVersion < BigInt(parsed.eventIds.length)
     || lastGlobalPosition - firstGlobalPosition + 1n !== BigInt(parsed.eventIds.length)
   ) {
     throw new EventStoreError("INTEGRITY_FAILURE");
