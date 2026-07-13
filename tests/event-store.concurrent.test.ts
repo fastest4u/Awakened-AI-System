@@ -27,7 +27,10 @@ const FIXTURE_PATH = fileURLToPath(new URL("./fixtures/project-store-child.js", 
 const WORKER_URL = new URL("../src/workers/project-store.worker.js", import.meta.url);
 const roots: string[] = [];
 const activeClients = new Set<FixtureClient>();
+const unreleasedClients = new Set<FixtureClient>();
 const FIXTURE_TIMEOUT_MS = 30_000;
+const CLEANUP_TIMEOUT_MS = 30_000;
+let fixtureClientSequence = 0;
 
 type FixtureStartAction =
   | { kind: "initialize"; request: TrustedProjectBindingRequest; replicaDecision?: "initialize-local" }
@@ -72,6 +75,7 @@ interface FixtureExit {
 class FixtureClient {
   readonly child: ChildProcess;
   readonly stderr: string[] = [];
+  readonly #label = `concurrent-fixture-${++fixtureClientSequence}`;
   readonly #messages: ChildMessage[] = [];
   readonly #waiters: MessageWaiter[] = [];
   readonly #disconnectPromise: Promise<void>;
@@ -91,6 +95,7 @@ class FixtureClient {
     this.#disconnectPromise = new Promise<void>((resolve) => { this.#resolveDisconnect = resolve; });
     this.#exitPromise = new Promise<FixtureExit>((resolve) => { this.#resolveExit = resolve; });
     activeClients.add(this);
+    unreleasedClients.add(this);
     this.child.stderr?.on("data", (chunk: Buffer | string) => this.stderr.push(String(chunk)));
     this.child.on("message", (message: unknown) => this.push(message as ChildMessage));
     this.child.on("disconnect", () => {
@@ -103,7 +108,7 @@ class FixtureClient {
       this.#exit = { code, signal };
       this.#shutdownEvents.push("exit");
       this.#resolveExit(this.#exit);
-      const error = new Error(`fixture exited before barrier: ${code ?? signal ?? "unknown"}\n${this.stderr.join("")}`);
+      const error = this.failure(`exited before barrier: ${code ?? signal ?? "unknown"}`);
       for (const waiter of this.#waiters.splice(0)) {
         if (waiter.timer !== undefined) clearTimeout(waiter.timer);
         waiter.reject(error);
@@ -118,7 +123,7 @@ class FixtureClient {
   }
 
   send(message: ParentMessage): void {
-    assert.equal(this.child.connected, true, "fixture IPC must remain connected");
+    assert.equal(this.child.connected, true, `${this.#label} IPC must remain connected`);
     this.child.send(message);
   }
 
@@ -130,7 +135,7 @@ class FixtureClient {
     const queuedIndex = this.#messages.findIndex(predicate);
     if (queuedIndex >= 0) return Promise.resolve(this.#messages.splice(queuedIndex, 1)[0]!);
     if (this.#exit !== undefined) {
-      return Promise.reject(new Error(`fixture already exited before ${label}: ${this.#exit.code ?? this.#exit.signal}`));
+      return Promise.reject(this.failure(`already exited before ${label}: ${this.#exit.code ?? this.#exit.signal}`));
     }
     return new Promise<ChildMessage>((resolve, reject) => {
       const waiter: MessageWaiter = {
@@ -143,7 +148,7 @@ class FixtureClient {
         waiter.timer = setTimeout(() => {
           const index = this.#waiters.indexOf(waiter);
           if (index >= 0) this.#waiters.splice(index, 1);
-          reject(new Error(`fixture ${label} barrier timed out\n${this.stderr.join("")}`));
+          reject(this.failure(`${label} barrier timed out`));
         }, FIXTURE_TIMEOUT_MS);
       }
       this.#waiters.push(waiter);
@@ -172,46 +177,95 @@ class FixtureClient {
   }
 
   async close(): Promise<void> {
+    const failures: unknown[] = [];
     if (this.#exit !== undefined) {
-      throw new Error(`fixture exited before cooperative close: ${this.#exit.code ?? this.#exit.signal ?? "unknown"}\n${this.stderr.join("")}`);
-    }
-    let timedOut = false;
-    let watchdog!: NodeJS.Timeout;
-    const barrier = (async () => {
-      this.send({ type: "close" });
-      const message = await this.waitFor((candidate) => candidate.type === "closed", "closed", false);
-      assert.equal(message.type, "closed");
-      await this.#disconnectPromise;
-      const exit = await this.#exitPromise;
-      assert.deepEqual(exit, { code: 0, signal: null });
-      assert.deepEqual(this.#shutdownEvents.slice(-3), ["closed", "disconnect", "exit"]);
-    })();
-    const timeout = new Promise<never>((_resolve, reject) => {
-      watchdog = setTimeout(() => {
-        timedOut = true;
-        reject(new Error("fixture cooperative shutdown timed out"));
-      }, FIXTURE_TIMEOUT_MS);
-    });
-    try {
-      await Promise.race([barrier, timeout]);
-    } catch (error) {
-      if (this.#exit === undefined) await this.forceCleanup();
-      if (timedOut) {
-        throw new Error(`fixture cooperative shutdown timed out after forced exit\n${this.stderr.join("")}`, { cause: error });
+      failures.push(this.failure("exited before cooperative close"));
+    } else {
+      let watchdog!: NodeJS.Timeout;
+      const barrier = (async () => {
+        this.send({ type: "close" });
+        const message = await this.waitFor((candidate) => candidate.type === "closed", "closed", false);
+        assert.equal(message.type, "closed");
+        await this.#disconnectPromise;
+        const exit = await this.#exitPromise;
+        assert.deepEqual(exit, { code: 0, signal: null }, this.#label);
+        assert.deepEqual(this.#shutdownEvents.slice(-3), ["closed", "disconnect", "exit"], this.#label);
+        assert.equal(this.#disconnected, true, this.#label);
+        assert.equal(this.child.connected, false, this.#label);
+        assert.equal(this.child.exitCode, 0, this.#label);
+        assert.equal(this.child.signalCode, null, this.#label);
+      })();
+      const timeout = new Promise<never>((_resolve, reject) => {
+        watchdog = setTimeout(
+          () => reject(this.failure("cooperative shutdown timed out")),
+          FIXTURE_TIMEOUT_MS,
+        );
+      });
+      try {
+        await Promise.race([barrier, timeout]);
+        unreleasedClients.delete(this);
+        return;
+      } catch (error) {
+        failures.push(error);
+      } finally {
+        clearTimeout(watchdog);
       }
-      throw error;
-    } finally {
-      clearTimeout(watchdog);
     }
+
+    try {
+      await this.forceCleanup();
+    } catch (error) {
+      failures.push(error);
+    }
+    throw new AggregateError(failures, `${this.#label} cooperative shutdown failed`);
   }
 
   async forceCleanup(): Promise<FixtureExit> {
-    if (this.#exit !== undefined) return this.#exit;
-    if (!this.#killRequested) {
+    const failures: unknown[] = [];
+    let killDelivered: boolean | undefined;
+    if (this.#exit === undefined && !this.#killRequested) {
       this.#killRequested = true;
-      this.child.kill();
+      try {
+        killDelivered = this.child.kill();
+      } catch (error) {
+        failures.push(new Error(`${this.#label} forced cleanup kill threw`, { cause: error }));
+      }
     }
-    return this.#exitPromise;
+
+    const [disconnectResult, exitResult] = await Promise.allSettled([
+      this.boundedCleanupBarrier(this.#disconnectPromise, "disconnect"),
+      this.boundedCleanupBarrier(this.#exitPromise, "exit"),
+    ]);
+    if (disconnectResult.status === "rejected") failures.push(disconnectResult.reason);
+    if (exitResult.status === "rejected") failures.push(exitResult.reason);
+    if (killDelivered === false && exitResult.status === "rejected") {
+      failures.push(this.failure("forced cleanup kill was not delivered"));
+    }
+    if (killDelivered === true && !this.child.killed) {
+      failures.push(this.failure("forced cleanup kill delivery was not recorded"));
+    }
+    if (disconnectResult.status === "fulfilled") {
+      if (!this.#disconnected) failures.push(this.failure("forced cleanup disconnect barrier was inconsistent"));
+      if (this.child.connected) failures.push(this.failure("forced cleanup left IPC connected"));
+    }
+    if (exitResult.status === "fulfilled") {
+      if (this.#exit === undefined) {
+        failures.push(this.failure("forced cleanup exit barrier was inconsistent"));
+      } else {
+        if (this.#exit !== exitResult.value) {
+          failures.push(this.failure("forced cleanup exit result did not match the observed exit"));
+        }
+        if (this.child.exitCode !== exitResult.value.code || this.child.signalCode !== exitResult.value.signal) {
+          failures.push(this.failure("forced cleanup child exit state was inconsistent"));
+        }
+      }
+    }
+    if (failures.length > 0) {
+      throw new AggregateError(failures, `${this.#label} forced cleanup failed`);
+    }
+    assert.equal(exitResult.status, "fulfilled");
+    unreleasedClients.delete(this);
+    return exitResult.value;
   }
 
   private push(message: ChildMessage): void {
@@ -224,6 +278,25 @@ class FixtureClient {
     const [waiter] = this.#waiters.splice(index, 1);
     if (waiter!.timer !== undefined) clearTimeout(waiter!.timer);
     waiter!.resolve(message);
+  }
+
+  private boundedCleanupBarrier<T>(promise: Promise<T>, label: "disconnect" | "exit"): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+      const watchdog = setTimeout(() => {
+        reject(this.failure(`forced cleanup ${label} barrier timed out`));
+      }, CLEANUP_TIMEOUT_MS);
+      promise.then((value) => {
+        clearTimeout(watchdog);
+        resolve(value);
+      }, (error: unknown) => {
+        clearTimeout(watchdog);
+        reject(error);
+      });
+    });
+  }
+
+  private failure(message: string): Error {
+    return new Error(`${this.#label} ${message}\n${this.stderr.join("")}`);
   }
 }
 
@@ -304,10 +377,9 @@ async function startAll(clients: FixtureClient[], actions: FixtureStartAction[])
 }
 
 async function closeAll(clients: FixtureClient[]): Promise<void> {
-  await Promise.all(clients.map((client) => client.close().catch(async (error: unknown) => {
-    await client.forceCleanup();
-    throw error;
-  })));
+  const results = await Promise.allSettled(clients.map(async (client) => client.close()));
+  const failures = results.flatMap((result) => result.status === "rejected" ? [result.reason] : []);
+  if (failures.length > 0) throw new AggregateError(failures, "fixture cooperative shutdowns failed");
 }
 
 async function bindingFor(request: TrustedProjectBindingRequest): Promise<WorkerBinding> {
@@ -537,18 +609,26 @@ async function linkedWorktreeProof(): Promise<void> {
 }
 
 afterEach(async () => {
-  const leaked = [...activeClients];
   const failures: unknown[] = [];
-  try {
-    if (leaked.length > 0) failures.push(new Error(`unexpected active fixture clients: ${leaked.length}`));
-  } finally {
-    const cleanup = await Promise.allSettled(leaked.map(async (client) => client.forceCleanup()));
-    for (const result of cleanup) {
-      if (result.status === "rejected") failures.push(result.reason);
-    }
-    if (activeClients.size > 0) failures.push(new Error(`fixture clients remained active: ${activeClients.size}`));
-    for (const root of roots.splice(0)) {
-      try { rmSync(root, { recursive: true, force: true }); } catch (error) { failures.push(error); }
+  const cleanupTargets = [...unreleasedClients];
+  if (cleanupTargets.length > 0) {
+    failures.push(new Error(`unexpected unreleased fixture clients: ${cleanupTargets.length}`));
+  }
+  const cleanup = await Promise.allSettled(cleanupTargets.map(async (client) => client.forceCleanup()));
+  for (const result of cleanup) {
+    if (result.status === "rejected") failures.push(result.reason);
+  }
+  if (activeClients.size > 0) {
+    failures.push(new Error(`fixture processes remained active: ${activeClients.size}`));
+  }
+  if (unreleasedClients.size > 0) {
+    failures.push(new Error(`fixture clients remained unreleased: ${unreleasedClients.size}`));
+  }
+  for (const root of roots.splice(0)) {
+    try {
+      rmSync(root, { recursive: true, force: true });
+    } catch (error) {
+      failures.push(new Error(`fixture root cleanup failed: ${root}`, { cause: error }));
     }
   }
   if (failures.length > 0) throw new AggregateError(failures, "fixture cleanup invariant failed");

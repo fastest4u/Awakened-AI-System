@@ -1,4 +1,5 @@
 import { strict as assert } from "node:assert";
+import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -27,6 +28,19 @@ const unbornHeadDiagnostic = [
   "'git <command> [<revision>...] -- [<file>...]'",
   "",
 ].join("\n");
+
+function runGitFixtureSetup(cwd: string, args: string[]): void {
+  const result = spawnSync("git", args, {
+    cwd,
+    encoding: "utf8",
+    shell: false,
+    windowsHide: true,
+    timeout: 30_000,
+    maxBuffer: 1024 * 1024,
+  });
+  const diagnostic = result.stderr || result.error?.message || "git exited without diagnostics";
+  assert.equal(result.status, 0, `${args.join(" ")}: ${diagnostic}`);
+}
 
 describe("GitWorkspaceResolver", () => {
   let root: string | undefined;
@@ -413,17 +427,13 @@ describe("GitWorkspaceResolver", () => {
     const linkedRoot = join(root, "สำเนา linked worktree");
     mkdirSync(projectRoot);
     const git = new SpawnSyncGitCommandRunner();
-    const run = (cwd: string, args: string[]): void => {
-      const result = git.run(cwd, args);
-      assert.equal(result.exitCode, 0, `${args.join(" ")}: ${result.stderr}`);
-    };
-    run(projectRoot, ["init", "--quiet"]);
-    run(projectRoot, ["config", "user.email", "resolver@example.invalid"]);
-    run(projectRoot, ["config", "user.name", "Resolver Test"]);
+    runGitFixtureSetup(projectRoot, ["init", "--quiet"]);
+    runGitFixtureSetup(projectRoot, ["config", "user.email", "resolver@example.invalid"]);
+    runGitFixtureSetup(projectRoot, ["config", "user.name", "Resolver Test"]);
     writeFileSync(join(projectRoot, "README.md"), "linked worktree fixture\n");
-    run(projectRoot, ["add", "README.md"]);
-    run(projectRoot, ["commit", "--quiet", "-m", "initial"]);
-    run(projectRoot, ["worktree", "add", "--quiet", "-b", "feature/linked", linkedRoot]);
+    runGitFixtureSetup(projectRoot, ["add", "README.md"]);
+    runGitFixtureSetup(projectRoot, ["commit", "--quiet", "-m", "initial"]);
+    runGitFixtureSetup(projectRoot, ["worktree", "add", "--quiet", "-b", "feature/linked", linkedRoot]);
 
     const main = new GitWorkspaceResolver(git).inspect(projectRoot, descriptor);
     const linked = new GitWorkspaceResolver(git).inspect(linkedRoot, descriptor);
