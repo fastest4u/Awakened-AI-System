@@ -22,7 +22,14 @@ import type {
   ProjectBinding,
   ProjectContext,
 } from "../src/orchestrator/identity/contracts.js";
-import { ProjectBindingError } from "../src/orchestrator/identity/project-binding.service.js";
+import {
+  deriveGitWorkspaceId,
+  deriveNonGitWorkspaceId,
+} from "../src/orchestrator/identity/git-workspace.resolver.js";
+import {
+  computeProjectContextFingerprint,
+  ProjectBindingError,
+} from "../src/orchestrator/identity/project-binding.service.js";
 import type { TrustedProjectBindingRequest } from "../src/orchestrator/identity/project-binding.request.js";
 import { ProjectDescriptorRepository } from "../src/orchestrator/identity/project-descriptor.repository.js";
 import type { IntegrityReport } from "../src/orchestrator/integrity/integrity.types.js";
@@ -121,53 +128,70 @@ const RUNTIME: RuntimeCapabilityReport = {
   applicationId: 0x504d454d,
 };
 
-const CONTEXT = {
-  binding: {
-    projectBindingId: "private-binding-id",
-    generation: 1,
-    contextFingerprint: "private-context-fingerprint",
-    source: "explicit-cli",
-    projectId: "11111111-1111-4111-8111-111111111111",
-    vaultId: "22222222-2222-4222-8222-222222222222",
-    storeId: "33333333-3333-4333-8333-333333333333",
-    workspaceId: "workspace-safe-id",
-    clientNamespace: "memory-vault-cli",
-    clientInstanceId: "private-client-id",
-    actorRole: "maintenance",
-    projectRoot: "C:\\explicit\\project",
-    vaultRoot: "C:\\explicit\\project\\memory",
-    descriptorPath: "C:\\explicit\\project\\memory\\.memory-mcp\\project-identity.json",
-    storeRoute: {
-      kind: "vault-local",
-      storeRoot: "C:\\explicit\\project\\memory\\.memory-mcp\\v2",
-      eventsPath: "C:\\explicit\\project\\memory\\.memory-mcp\\v2\\events.sqlite",
-      storeManifestPath: "C:\\explicit\\project\\memory\\.memory-mcp\\v2\\store-manifest.json",
-      projectionManifestPath: "C:\\explicit\\project\\memory\\.memory-mcp\\v2\\current-projection.json",
-    },
-    workspace: {
-      kind: "non-git",
-      workspaceRoot: "C:\\explicit\\project",
-      workspaceId: "workspace-safe-id",
-    },
-    establishedAt: "2026-07-13T00:00:00.000Z",
+function bindingWithFingerprint(
+  binding: Omit<ProjectBinding, "contextFingerprint">,
+): ProjectBinding {
+  const { projectBindingId, establishedAt, ...fingerprintMaterial } = binding;
+  return {
+    ...binding,
+    contextFingerprint: computeProjectContextFingerprint(fingerprintMaterial),
+  };
+}
+
+function refingerprintBinding(binding: ProjectBinding): ProjectBinding {
+  const { contextFingerprint: _contextFingerprint, ...withoutFingerprint } = binding;
+  return bindingWithFingerprint(withoutFingerprint);
+}
+
+const CONTEXT_PROJECT_ID = "11111111-1111-4111-8111-111111111111" as ProjectBinding["projectId"];
+const CONTEXT_VAULT_ID = "22222222-2222-4222-8222-222222222222" as ProjectBinding["vaultId"];
+const CONTEXT_WORKSPACE_ID = deriveNonGitWorkspaceId(CONTEXT_PROJECT_ID, CONTEXT_VAULT_ID);
+const CONTEXT_BINDING = bindingWithFingerprint({
+  projectBindingId: "44444444-4444-4444-8444-444444444444",
+  generation: 1,
+  source: "explicit-cli",
+  projectId: CONTEXT_PROJECT_ID,
+  vaultId: CONTEXT_VAULT_ID,
+  storeId: "33333333-3333-4333-8333-333333333333" as ProjectBinding["storeId"],
+  workspaceId: CONTEXT_WORKSPACE_ID,
+  clientNamespace: "memory-vault-cli",
+  clientInstanceId: "private-client-id",
+  actorRole: "maintenance",
+  projectRoot: "C:\\explicit\\project",
+  vaultRoot: "C:\\explicit\\project\\memory",
+  descriptorPath: "C:\\explicit\\project\\memory\\.memory-mcp\\project-identity.json",
+  storeRoute: {
+    kind: "vault-local",
+    storeRoot: "C:\\explicit\\project\\memory\\.memory-mcp\\v2",
+    eventsPath: "C:\\explicit\\project\\memory\\.memory-mcp\\v2\\events.sqlite",
+    storeManifestPath: "C:\\explicit\\project\\memory\\.memory-mcp\\v2\\store-manifest.json",
+    projectionManifestPath: "C:\\explicit\\project\\memory\\.memory-mcp\\v2\\current-projection.json",
   },
   workspace: {
     kind: "non-git",
     workspaceRoot: "C:\\explicit\\project",
-    workspaceId: "workspace-safe-id",
+    workspaceId: CONTEXT_WORKSPACE_ID,
   },
+  establishedAt: "2026-07-13T00:00:00.000Z",
+});
+const CONTEXT: ProjectContext = {
+  binding: CONTEXT_BINDING,
+  workspace: { ...CONTEXT_BINDING.workspace },
   checkedAt: "2026-07-13T00:00:01.000Z",
-} as ProjectContext;
+};
 
-function statusBindingFor(roots: { projectRoot: string; vaultRoot: string }): ProjectBinding {
-  const storeRoot = join(roots.vaultRoot, ".memory-mcp", "v2");
-  return {
+function bindingForRequest(request: TrustedProjectBindingRequest): ProjectBinding {
+  const storeRoot = join(request.vaultRoot, ".memory-mcp", "v2");
+  return refingerprintBinding({
     ...CONTEXT.binding,
-    actorRole: "untrusted",
-    clientInstanceId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
-    projectRoot: roots.projectRoot,
-    vaultRoot: roots.vaultRoot,
-    descriptorPath: join(roots.vaultRoot, ".memory-mcp", "project-identity.json"),
+    generation: request.generation,
+    source: request.source,
+    actorRole: request.actorRole,
+    clientNamespace: request.clientNamespace,
+    clientInstanceId: request.clientInstanceId,
+    projectRoot: request.projectRoot,
+    vaultRoot: request.vaultRoot,
+    descriptorPath: join(request.vaultRoot, ".memory-mcp", "project-identity.json"),
     storeRoute: {
       kind: "vault-local",
       storeRoot,
@@ -177,10 +201,70 @@ function statusBindingFor(roots: { projectRoot: string; vaultRoot: string }): Pr
     },
     workspace: {
       kind: "non-git",
-      workspaceRoot: roots.projectRoot,
+      workspaceRoot: request.projectRoot,
       workspaceId: CONTEXT.binding.workspaceId,
     },
+  });
+}
+
+function statusBindingFor(roots: { projectRoot: string; vaultRoot: string }): ProjectBinding {
+  return bindingForRequest({
+    source: "explicit-cli",
+    projectRoot: roots.projectRoot,
+    vaultRoot: roots.vaultRoot,
+    clientNamespace: "memory-vault-cli",
+    clientInstanceId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    actorRole: "untrusted",
+    generation: 1,
+  });
+}
+
+function maintenanceBindingFor(roots: { projectRoot: string; vaultRoot: string }): ProjectBinding {
+  return bindingForRequest({
+    source: "explicit-cli",
+    projectRoot: roots.projectRoot,
+    vaultRoot: roots.vaultRoot,
+    clientNamespace: "memory-vault-cli",
+    clientInstanceId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    actorRole: "maintenance",
+    generation: 1,
+  });
+}
+
+function contextForBinding(binding: ProjectBinding): ProjectContext {
+  return {
+    binding,
+    workspace: { ...binding.workspace },
+    checkedAt: "2026-07-13T00:00:01.000Z",
   };
+}
+
+function gitStatusBindingFor(binding: ProjectBinding): ProjectBinding {
+  const gitCommonDir = resolve(binding.projectRoot, ".git");
+  const gitDir = resolve(gitCommonDir, "worktrees", "fixture");
+  const workspaceId = deriveGitWorkspaceId(binding.projectId, gitCommonDir, gitDir);
+  const storeRoot = resolve(gitCommonDir, "project-memory", binding.projectId, "v2");
+  return refingerprintBinding({
+    ...binding,
+    workspaceId,
+    storeRoute: {
+      kind: "git-common",
+      storeRoot,
+      eventsPath: join(storeRoot, "events.sqlite"),
+      storeManifestPath: join(storeRoot, "store-manifest.json"),
+      projectionManifestPath: join(storeRoot, "current-projection.json"),
+    },
+    workspace: {
+      kind: "git",
+      worktreeRoot: binding.projectRoot,
+      gitDir,
+      gitCommonDir,
+      headCommit: "a".repeat(40),
+      branchRef: "refs/heads/main",
+      detached: false,
+      workspaceId,
+    },
+  });
 }
 
 const QUICK_REPORT: IntegrityReport = {
@@ -217,6 +301,7 @@ function dependencies(overrides: Partial<OrchestratorAdminDependencies> = {}): {
   calls: string[];
 } {
   const calls: string[] = [];
+  let establishedBinding: ProjectBinding | undefined;
   const value: OrchestratorAdminDependencies = {
     async runtimeProbe() {
       calls.push("runtime");
@@ -239,16 +324,19 @@ function dependencies(overrides: Partial<OrchestratorAdminDependencies> = {}): {
     bindingService: {
       async establish(request: TrustedProjectBindingRequest) {
         calls.push(`establish:${request.actorRole}`);
-        return { ok: true, binding: CONTEXT.binding };
+        establishedBinding = bindingForRequest(request);
+        return { ok: true, binding: establishedBinding };
       },
       async revalidate(binding: ProjectBinding) {
-        assert.equal(binding, CONTEXT.binding);
+        assert.ok(establishedBinding);
+        assert.deepEqual(binding, establishedBinding);
         calls.push("revalidate");
-        return CONTEXT;
+        return contextForBinding(establishedBinding);
       },
     },
     executorFactory(context: ProjectContext) {
-      assert.equal(context, CONTEXT);
+      assert.ok(establishedBinding);
+      assert.deepEqual(context, contextForBinding(establishedBinding));
       calls.push("executor");
       return {
         async open() { calls.push("open"); return {} as never; },
@@ -715,7 +803,9 @@ describe("V2 administration lifecycle", () => {
   it("applies new initialization, recovers a missing manifest, and remains idempotent", async () => {
     const roots = temporaryProject();
     const bootstrap = new DefaultProjectStoreBootstrapService();
-    const fake = dependencies({ bootstrap });
+    const workerUrl = new URL("../src/workers/project-store.worker.js", import.meta.url);
+    const real = createOrchestratorAdminDependencies(workerUrl);
+    const fake = dependencies({ bootstrap, bindingService: real.bindingService });
 
     const apply = async (): Promise<{
       code: 0 | 1 | 2;
@@ -762,8 +852,11 @@ describe("V2 administration lifecycle", () => {
   it("requires and forwards the explicit replica decision for descriptor-only clones", async () => {
     const roots = temporaryProject();
     new ProjectDescriptorRepository().createExplicit(roots.projectRoot, roots.vaultRoot);
+    const workerUrl = new URL("../src/workers/project-store.worker.js", import.meta.url);
+    const real = createOrchestratorAdminDependencies(workerUrl);
     const fake = dependencies({
       bootstrap: new DefaultProjectStoreBootstrapService(),
+      bindingService: real.bindingService,
       inspectInitialization: createProjectInitializationInspector({
         async verify() { throw new Error("database is absent"); },
         async inspectExisting() { throw new Error("database is absent"); },
@@ -892,6 +985,61 @@ describe("V2 administration lifecycle", () => {
     });
   }
 
+  it("rejects a valid-looking bootstrap result outside the explicit project authority", async () => {
+    const roots = temporaryProject();
+    const initialized = await new DefaultProjectStoreBootstrapService().initialize(roots);
+    const foreignStoreRoot = resolve(
+      roots.projectRoot,
+      "BOOTSTRAP_FOREIGN_SECRET",
+      ".memory-mcp",
+      "v2",
+    );
+    const foreignResult = {
+      ...initialized,
+      descriptor: {
+        ...initialized.descriptor,
+        projectId: "99999999-9999-4999-8999-999999999999",
+        vaultId: "88888888-8888-4888-8888-888888888888",
+      },
+      manifest: {
+        ...initialized.manifest,
+        projectId: "99999999-9999-4999-8999-999999999999",
+        vaultId: "88888888-8888-4888-8888-888888888888",
+        storeId: "77777777-7777-4777-8777-777777777777",
+      },
+      route: {
+        kind: "vault-local",
+        storeRoot: foreignStoreRoot,
+        eventsPath: join(foreignStoreRoot, "events.sqlite"),
+        storeManifestPath: join(foreignStoreRoot, "store-manifest.json"),
+        projectionManifestPath: join(foreignStoreRoot, "current-projection.json"),
+      },
+    } as ProjectStoreBootstrapResult;
+    const workerUrl = new URL("../src/workers/project-store.worker.js", import.meta.url);
+    const real = createOrchestratorAdminDependencies(workerUrl);
+    const guarded: OrchestratorAdminDependencies = {
+      ...real,
+      bootstrap: {
+        async initialize() { return foreignResult; },
+      },
+    };
+    const capture = outputCapture();
+
+    assert.equal(await runCliCommand({
+      ...defaultOptions("orchestrator-init"),
+      dryRun: false,
+      projectRoot: roots.projectRoot,
+      vault: roots.vaultRoot,
+    }, capture.io, guarded), 1);
+    assert.equal(capture.stdout(), "");
+    assert.deepEqual(JSON.parse(capture.stderr()), {
+      ok: false,
+      code: "ORCHESTRATOR_ADMIN_FAILED",
+      message: "Orchestrator administration failed",
+    });
+    assert.equal(capture.stderr().includes("BOOTSTRAP_FOREIGN_SECRET"), false);
+  });
+
   it("stops after a failed disposable runtime probe and never reaches a store dependency", async () => {
     const roots = temporaryProject();
     const fake = dependencies({
@@ -978,6 +1126,36 @@ describe("V2 administration lifecycle", () => {
     assert.equal(capture.stderr().includes("RUNTIME_VERSION_SECRET"), false);
   });
 
+  for (const belowMinimum of [
+    { name: "Node.js", runtime: { ...RUNTIME, nodeVersion: "0.0.0" } },
+    { name: "SQLite", runtime: { ...RUNTIME, sqliteVersion: "0.0.0" } },
+  ]) {
+    it(`rejects a successful runtime report below the minimum ${belowMinimum.name} version`, async () => {
+      const roots = temporaryProject();
+      const binding = statusBindingFor(roots);
+      const fake = dependencies({
+        async runtimeProbe() { return { ok: true, ...belowMinimum.runtime }; },
+        bindingService: {
+          async establish() { return { ok: true, binding }; },
+          async revalidate() { return CONTEXT; },
+        },
+      });
+      const capture = outputCapture();
+
+      assert.equal(await runCliCommand({
+        ...defaultOptions("orchestrator-status"),
+        projectRoot: roots.projectRoot,
+        vault: roots.vaultRoot,
+      }, capture.io, fake.value), 1);
+      assert.equal(capture.stdout(), "");
+      assert.deepEqual(JSON.parse(capture.stderr()), {
+        ok: false,
+        code: "ORCHESTRATOR_ADMIN_FAILED",
+        message: "Orchestrator administration failed",
+      });
+    });
+  }
+
   it("establishes status as untrusted and emits only the safe projection", async () => {
     const roots = temporaryProject();
     const binding = statusBindingFor(roots);
@@ -999,8 +1177,8 @@ describe("V2 administration lifecycle", () => {
     assert.equal(code, 0);
     assert.deepEqual(fake.calls, ["client-id", "runtime", "establish:untrusted"]);
     const output = capture.stdout();
-    assert.equal(output.includes("private-binding-id"), false);
-    assert.equal(output.includes("private-context-fingerprint"), false);
+    assert.equal(output.includes(binding.projectBindingId), false);
+    assert.equal(output.includes(binding.contextFingerprint), false);
     assert.equal(output.includes("private-client-id"), false);
     assert.deepEqual(JSON.parse(output), {
       action: "status",
@@ -1064,6 +1242,52 @@ describe("V2 administration lifecycle", () => {
       },
     },
     {
+      name: "self-consistent but non-derived non-Git workspace identity",
+      mutate(binding: ProjectBinding): ProjectBinding {
+        const workspaceId = "f".repeat(64) as ProjectBinding["workspaceId"];
+        return refingerprintBinding({
+          ...binding,
+          workspaceId,
+          workspace: {
+            kind: "non-git",
+            workspaceRoot: binding.projectRoot,
+            workspaceId,
+          },
+        });
+      },
+    },
+    {
+      name: "incoherent Git branch metadata",
+      mutate(binding: ProjectBinding): ProjectBinding {
+        const gitBinding = gitStatusBindingFor(binding);
+        if (gitBinding.workspace.kind !== "git") throw new Error("git fixture invalid");
+        return refingerprintBinding({
+          ...gitBinding,
+          workspace: {
+            ...gitBinding.workspace,
+            branchRef: null,
+            detached: false,
+          },
+        });
+      },
+    },
+    {
+      name: "hostile Git head commit",
+      mutate(binding: ProjectBinding): ProjectBinding {
+        const gitBinding = gitStatusBindingFor(binding);
+        if (gitBinding.workspace.kind !== "git") throw new Error("git fixture invalid");
+        return {
+          ...gitBinding,
+          workspace: {
+            ...gitBinding.workspace,
+            headCommit: {
+              toJSON() { return "STATUS_GIT_HEAD_SECRET"; },
+            } as unknown as string,
+          },
+        };
+      },
+    },
+    {
       name: "foreign explicit roots",
       mutate(binding: ProjectBinding): ProjectBinding {
         return {
@@ -1076,6 +1300,18 @@ describe("V2 administration lifecycle", () => {
       name: "foreign request identity",
       mutate(binding: ProjectBinding): ProjectBinding {
         return { ...binding, actorRole: "maintenance" };
+      },
+    },
+    {
+      name: "non-UUID private binding identity",
+      mutate(binding: ProjectBinding): ProjectBinding {
+        return { ...binding, projectBindingId: "STATUS_BINDING_ID_SECRET" };
+      },
+    },
+    {
+      name: "impossible established timestamp",
+      mutate(binding: ProjectBinding): ProjectBinding {
+        return { ...binding, establishedAt: "2026-02-30T00:00:00Z" };
       },
     },
   ]) {
@@ -1154,6 +1390,131 @@ describe("V2 administration lifecycle", () => {
       action: "integrity",
       report: { ...QUICK_REPORT, mode: "full" },
     });
+  });
+
+  it("rejects a revalidated integrity context that swaps established request authority", async () => {
+    const roots = temporaryProject();
+    const established = maintenanceBindingFor(roots);
+    const foreignProjectId = "99999999-9999-4999-8999-999999999999" as ProjectBinding["projectId"];
+    const foreignVaultId = "88888888-8888-4888-8888-888888888888" as ProjectBinding["vaultId"];
+    const gitCommonDir = resolve(roots.projectRoot, ".git");
+    const gitDir = resolve(gitCommonDir, "worktrees", "foreign");
+    const workspaceId = deriveGitWorkspaceId(foreignProjectId, gitCommonDir, gitDir);
+    const storeRoot = resolve(gitCommonDir, "project-memory", foreignProjectId, "v2");
+    const workspace = {
+      kind: "git" as const,
+      worktreeRoot: roots.projectRoot,
+      gitDir,
+      gitCommonDir,
+      headCommit: "b".repeat(40),
+      branchRef: "refs/heads/foreign",
+      detached: false,
+      workspaceId,
+    };
+    const foreignBindingId = "55555555-5555-4555-8555-555555555555";
+    const foreignBinding = refingerprintBinding({
+      ...established,
+      projectBindingId: foreignBindingId,
+      projectId: foreignProjectId,
+      vaultId: foreignVaultId,
+      storeId: "77777777-7777-4777-8777-777777777777" as ProjectBinding["storeId"],
+      workspaceId,
+      storeRoute: {
+        kind: "git-common",
+        storeRoot,
+        eventsPath: join(storeRoot, "events.sqlite"),
+        storeManifestPath: join(storeRoot, "store-manifest.json"),
+        projectionManifestPath: join(storeRoot, "current-projection.json"),
+      },
+      workspace,
+    });
+    const foreignContext: ProjectContext = {
+      binding: foreignBinding,
+      workspace: { ...workspace },
+      checkedAt: "2026-07-13T00:00:02.000Z",
+    };
+    let executorCalls = 0;
+    let recorderCalls = 0;
+    const fake = dependencies({
+      bindingService: {
+        async establish() { return { ok: true, binding: established }; },
+        async revalidate() { return foreignContext; },
+      },
+      executorFactory() {
+        executorCalls += 1;
+        const report = {
+          ...QUICK_REPORT,
+          projectId: foreignBinding.projectId,
+          storeId: foreignBinding.storeId,
+        };
+        return {
+          async open() { return {}; },
+          async quickIntegrity() { return report; },
+          async fullIntegrity() { return { ...report, mode: "full" }; },
+          async close() {},
+        };
+      },
+      integrityRecorder: {
+        async record() { recorderCalls += 1; },
+      },
+    });
+    const capture = outputCapture();
+
+    assert.equal(await runCliCommand({
+      ...defaultOptions("orchestrator-integrity"),
+      projectRoot: roots.projectRoot,
+      vault: roots.vaultRoot,
+    }, capture.io, fake.value), 1);
+    assert.equal(executorCalls, 0);
+    assert.equal(recorderCalls, 0);
+    assert.equal(capture.stdout(), "");
+    assert.deepEqual(JSON.parse(capture.stderr()), {
+      ok: false,
+      code: "ORCHESTRATOR_ADMIN_FAILED",
+      message: "Orchestrator administration failed",
+    });
+    assert.equal(capture.stderr().includes(foreignBindingId), false);
+  });
+
+  it("rejects a revalidated integrity context with a malformed checked timestamp", async () => {
+    const roots = temporaryProject();
+    const established = maintenanceBindingFor(roots);
+    let executorCalls = 0;
+    const fake = dependencies({
+      bindingService: {
+        async establish() { return { ok: true, binding: established }; },
+        async revalidate() {
+          return {
+            ...contextForBinding(established),
+            checkedAt: "INTEGRITY_CHECKED_AT_SECRET",
+          };
+        },
+      },
+      executorFactory() {
+        executorCalls += 1;
+        return {
+          async open() { return {}; },
+          async quickIntegrity() { return QUICK_REPORT; },
+          async fullIntegrity() { return { ...QUICK_REPORT, mode: "full" }; },
+          async close() {},
+        };
+      },
+    });
+    const capture = outputCapture();
+
+    assert.equal(await runCliCommand({
+      ...defaultOptions("orchestrator-integrity"),
+      projectRoot: roots.projectRoot,
+      vault: roots.vaultRoot,
+    }, capture.io, fake.value), 1);
+    assert.equal(executorCalls, 0);
+    assert.equal(capture.stdout(), "");
+    assert.deepEqual(JSON.parse(capture.stderr()), {
+      ok: false,
+      code: "ORCHESTRATOR_ADMIN_FAILED",
+      message: "Orchestrator administration failed",
+    });
+    assert.equal(capture.stderr().includes("INTEGRITY_CHECKED_AT_SECRET"), false);
   });
 
   it("always closes an opened integrity executor when verification fails", async () => {
@@ -1385,7 +1746,8 @@ describe("V2 administration lifecycle", () => {
       vault: roots.vaultRoot,
     }, capture.io, fake.value), 1);
     assert.deepEqual(fake.calls.slice(-5), ["executor", "open", "quick", "close", "record"]);
-    assert.equal(recordedContext, CONTEXT);
+    assert.notEqual(recordedContext, CONTEXT);
+    assert.deepEqual(recordedContext, contextForBinding(maintenanceBindingFor(roots)));
     assert.notEqual(recordedReport, failedReport);
     assert.deepEqual(recordedReport, failedReport);
     assert.deepEqual(JSON.parse(capture.stdout()), {

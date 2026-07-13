@@ -28,13 +28,17 @@ import type {
   ProjectBinding,
   ProjectContext,
   ProjectStoreRoute,
+  WorkspaceSnapshot,
 } from "../orchestrator/identity/contracts.js";
 import {
+  deriveGitWorkspaceId,
+  deriveNonGitWorkspaceId,
   GitWorkspaceResolutionError,
   GitWorkspaceResolver,
   SpawnSyncGitCommandRunner,
 } from "../orchestrator/identity/git-workspace.resolver.js";
 import {
+  computeProjectContextFingerprint,
   describeProjectBindingFailure,
   ProjectBindingError,
   ProjectBindingService,
@@ -60,10 +64,14 @@ import {
 import { WorkerProjectStoreIdentityProbe } from "../orchestrator/runtime/project-store-identity-probe.js";
 import { decodeIntegrityReport } from "../orchestrator/runtime/worker-protocol.js";
 import {
+  compareVersions,
+  MINIMUM_NODE_VERSION,
+  MINIMUM_SQLITE_VERSION,
   probeRuntimeCapabilities,
   type RuntimeCapabilityReport,
   type RuntimeCapabilityResult,
 } from "../orchestrator/runtime/runtime-capabilities.js";
+import { canonicalJson } from "../orchestrator/serialization/canonical-json.js";
 import type {
   ProjectStoreBootstrapResult,
   ProjectStoreBootstrapService,
@@ -285,11 +293,48 @@ function snapshotSafeInteger(value: unknown): number {
 }
 
 const VERSION_PATTERN = /^(0|[1-9]\d{0,5})\.(0|[1-9]\d{0,5})\.(0|[1-9]\d{0,5})$/;
+const RFC3339_PATTERN = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,9}))?(Z|([+-])(\d{2}):(\d{2}))$/;
 
 function snapshotVersion(value: unknown): string {
   const version = snapshotString(value);
   if (!VERSION_PATTERN.test(version)) throw new Error("ADMIN_SNAPSHOT_INVALID");
   return version;
+}
+
+function snapshotRfc3339(value: unknown): string {
+  const timestamp = snapshotString(value);
+  const match = RFC3339_PATTERN.exec(timestamp);
+  if (match === null) throw new Error("ADMIN_SNAPSHOT_INVALID");
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const hour = Number(match[4]);
+  const minute = Number(match[5]);
+  const second = Number(match[6]);
+  const offsetHour = match[8] === "Z" ? 0 : Number(match[10]);
+  const offsetMinute = match[8] === "Z" ? 0 : Number(match[11]);
+  const leapYear = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  const monthDays = [31, leapYear ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+  if (
+    year < 1
+    || month < 1
+    || month > 12
+    || day < 1
+    || day > (monthDays[month - 1] ?? 0)
+    || hour < 0
+    || hour > 23
+    || minute < 0
+    || minute > 59
+    || second < 0
+    || second > 59
+    || offsetHour < 0
+    || offsetHour > 23
+    || offsetMinute < 0
+    || offsetMinute > 59
+  ) {
+    throw new Error("ADMIN_SNAPSHOT_INVALID");
+  }
+  return timestamp;
 }
 
 function runtimeSnapshot(result: unknown): RuntimeCapabilityReport {
@@ -312,9 +357,17 @@ function runtimeSnapshot(result: unknown): RuntimeCapabilityReport {
   if (snapshotSafeInteger(Reflect.get(result, "applicationId")) !== 0x504d454d) {
     throw new Error("ADMIN_SNAPSHOT_INVALID");
   }
+  const nodeVersion = snapshotVersion(Reflect.get(result, "nodeVersion"));
+  const sqliteVersion = snapshotVersion(Reflect.get(result, "sqliteVersion"));
+  if (
+    compareVersions(nodeVersion, MINIMUM_NODE_VERSION) < 0
+    || compareVersions(sqliteVersion, MINIMUM_SQLITE_VERSION) < 0
+  ) {
+    throw new Error("ADMIN_SNAPSHOT_INVALID");
+  }
   return {
-    nodeVersion: snapshotVersion(Reflect.get(result, "nodeVersion")),
-    sqliteVersion: snapshotVersion(Reflect.get(result, "sqliteVersion")),
+    nodeVersion,
+    sqliteVersion,
     nodeVersionAtLeastMinimum: snapshotTrue(Reflect.get(result, "nodeVersionAtLeastMinimum")),
     sqliteVersionAtLeastMinimum: snapshotTrue(Reflect.get(result, "sqliteVersionAtLeastMinimum")),
     nodeSqlite: snapshotTrue(Reflect.get(result, "nodeSqlite")),
@@ -336,21 +389,56 @@ function snapshotRecord(value: unknown): Record<string, unknown> {
   return value as Record<string, unknown>;
 }
 
+function snapshotExactRecord(
+  value: unknown,
+  expectedKeys: readonly string[],
+): Record<string, unknown> {
+  const record = snapshotRecord(value);
+  const expected = new Set(expectedKeys);
+  const observed = Reflect.ownKeys(record);
+  if (
+    observed.length !== expected.size
+    || observed.some((key) => typeof key !== "string" || !expected.has(key))
+  ) {
+    throw new Error("ADMIN_SNAPSHOT_INVALID");
+  }
+  return record;
+}
+
 function snapshotBoolean(value: unknown): boolean {
   if (typeof value !== "boolean") throw new Error("ADMIN_SNAPSHOT_INVALID");
   return value;
 }
 
+function snapshotCanonicalAbsolutePath(value: unknown): string {
+  const path = snapshotString(value);
+  if (!isAbsolute(path)) throw new Error("ADMIN_SNAPSHOT_INVALID");
+  const normalized = resolve(path);
+  const sameShape = process.platform === "win32"
+    ? path.toLowerCase() === normalized.toLowerCase()
+    : path === normalized;
+  if (!sameShape) throw new Error("ADMIN_SNAPSHOT_INVALID");
+  return normalized;
+}
+
 function routeSnapshot(value: unknown): ProjectStoreRoute {
-  const route = snapshotRecord(value);
+  const route = snapshotExactRecord(value, [
+    "kind",
+    "storeRoot",
+    "eventsPath",
+    "storeManifestPath",
+    "projectionManifestPath",
+  ]);
   const kind = Reflect.get(route, "kind");
   if (kind !== "git-common" && kind !== "vault-local") {
     throw new Error("ADMIN_SNAPSHOT_INVALID");
   }
-  const storeRoot = snapshotAbsolutePath(Reflect.get(route, "storeRoot"));
-  const eventsPath = snapshotAbsolutePath(Reflect.get(route, "eventsPath"));
-  const storeManifestPath = snapshotAbsolutePath(Reflect.get(route, "storeManifestPath"));
-  const projectionManifestPath = snapshotAbsolutePath(
+  const storeRoot = snapshotCanonicalAbsolutePath(Reflect.get(route, "storeRoot"));
+  const eventsPath = snapshotCanonicalAbsolutePath(Reflect.get(route, "eventsPath"));
+  const storeManifestPath = snapshotCanonicalAbsolutePath(
+    Reflect.get(route, "storeManifestPath"),
+  );
+  const projectionManifestPath = snapshotCanonicalAbsolutePath(
     Reflect.get(route, "projectionManifestPath"),
   );
   if (
@@ -366,6 +454,229 @@ function routeSnapshot(value: unknown): ProjectStoreRoute {
     eventsPath,
     storeManifestPath,
     projectionManifestPath,
+  };
+}
+
+const HEAD_COMMIT_PATTERN = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
+
+function validBranchRef(value: string): boolean {
+  const components = value.split("/");
+  return value.startsWith("refs/")
+    && !value.endsWith(".")
+    && !value.endsWith("/")
+    && !value.includes("..")
+    && !value.includes("@{")
+    && !value.includes("//")
+    && !/[\u0000-\u0020\u007f~^:?*\[\\]/.test(value)
+    && components.every((component) => component.length > 0
+      && !component.startsWith(".")
+      && !component.endsWith(".lock"));
+}
+
+function workspaceSnapshot(
+  value: unknown,
+  projectId: ProjectBinding["projectId"],
+  vaultId: ProjectBinding["vaultId"],
+  projectRoot: string,
+  expectedWorkspaceId: ProjectBinding["workspaceId"],
+): WorkspaceSnapshot {
+  const observed = snapshotRecord(value);
+  const kind = Reflect.get(observed, "kind");
+  if (kind === "non-git") {
+    const workspace = snapshotExactRecord(value, ["kind", "workspaceRoot", "workspaceId"]);
+    const workspaceRoot = snapshotCanonicalAbsolutePath(Reflect.get(workspace, "workspaceRoot"));
+    const workspaceId = snapshotString(
+      Reflect.get(workspace, "workspaceId"),
+    ) as ProjectBinding["workspaceId"];
+    if (
+      !sameNativePath(workspaceRoot, projectRoot)
+      || workspaceId !== expectedWorkspaceId
+      || workspaceId !== deriveNonGitWorkspaceId(projectId, vaultId)
+    ) {
+      throw new Error("ADMIN_SNAPSHOT_INVALID");
+    }
+    return { kind: "non-git", workspaceRoot, workspaceId };
+  }
+  if (kind !== "git") throw new Error("ADMIN_SNAPSHOT_INVALID");
+
+  const workspace = snapshotExactRecord(value, [
+    "kind",
+    "worktreeRoot",
+    "gitDir",
+    "gitCommonDir",
+    "headCommit",
+    "branchRef",
+    "detached",
+    "workspaceId",
+  ]);
+  const worktreeRoot = snapshotCanonicalAbsolutePath(Reflect.get(workspace, "worktreeRoot"));
+  const gitDir = snapshotCanonicalAbsolutePath(Reflect.get(workspace, "gitDir"));
+  const gitCommonDir = snapshotCanonicalAbsolutePath(Reflect.get(workspace, "gitCommonDir"));
+  const headCommit = snapshotString(Reflect.get(workspace, "headCommit"));
+  const detached = snapshotBoolean(Reflect.get(workspace, "detached"));
+  const branchValue = Reflect.get(workspace, "branchRef");
+  const branchRef = branchValue === null ? null : snapshotString(branchValue);
+  const workspaceId = snapshotString(
+    Reflect.get(workspace, "workspaceId"),
+  ) as ProjectBinding["workspaceId"];
+  let derivedWorkspaceId: ProjectBinding["workspaceId"];
+  try {
+    derivedWorkspaceId = deriveGitWorkspaceId(projectId, gitCommonDir, gitDir);
+  } catch {
+    throw new Error("ADMIN_SNAPSHOT_INVALID");
+  }
+  if (
+    !sameNativePath(worktreeRoot, projectRoot)
+    || !HEAD_COMMIT_PATTERN.test(headCommit)
+    || (detached ? branchRef !== null : branchRef === null || !validBranchRef(branchRef))
+    || workspaceId !== expectedWorkspaceId
+    || workspaceId !== derivedWorkspaceId
+  ) {
+    throw new Error("ADMIN_SNAPSHOT_INVALID");
+  }
+  return {
+    kind: "git",
+    worktreeRoot,
+    gitDir,
+    gitCommonDir,
+    headCommit,
+    branchRef,
+    detached,
+    workspaceId,
+  };
+}
+
+function validatedBindingSnapshot(
+  value: unknown,
+  request: TrustedProjectBindingRequest,
+): ProjectBinding {
+  const binding = snapshotExactRecord(value, [
+    "projectBindingId",
+    "generation",
+    "contextFingerprint",
+    "source",
+    "projectId",
+    "vaultId",
+    "storeId",
+    "workspaceId",
+    "clientNamespace",
+    "clientInstanceId",
+    "actorRole",
+    "projectRoot",
+    "vaultRoot",
+    "descriptorPath",
+    "storeRoute",
+    "workspace",
+    "establishedAt",
+  ]);
+  const projectBindingId = snapshotUuid(Reflect.get(binding, "projectBindingId"));
+  const generation = snapshotSafeInteger(Reflect.get(binding, "generation"));
+  const contextFingerprint = snapshotHash(Reflect.get(binding, "contextFingerprint"));
+  const projectId = snapshotUuid(
+    Reflect.get(binding, "projectId"),
+  ) as ProjectBinding["projectId"];
+  const vaultId = snapshotUuid(
+    Reflect.get(binding, "vaultId"),
+  ) as ProjectBinding["vaultId"];
+  const storeId = snapshotUuid(
+    Reflect.get(binding, "storeId"),
+  ) as ProjectBinding["storeId"];
+  const workspaceId = snapshotString(
+    Reflect.get(binding, "workspaceId"),
+  ) as ProjectBinding["workspaceId"];
+  const projectRoot = snapshotCanonicalAbsolutePath(Reflect.get(binding, "projectRoot"));
+  const vaultRoot = snapshotCanonicalAbsolutePath(Reflect.get(binding, "vaultRoot"));
+  const descriptorPath = snapshotCanonicalAbsolutePath(Reflect.get(binding, "descriptorPath"));
+  if (
+    generation !== request.generation
+    || Reflect.get(binding, "source") !== request.source
+    || Reflect.get(binding, "actorRole") !== request.actorRole
+    || Reflect.get(binding, "clientNamespace") !== request.clientNamespace
+    || Reflect.get(binding, "clientInstanceId") !== request.clientInstanceId
+    || !sameNativePath(projectRoot, request.projectRoot)
+    || !sameNativePath(vaultRoot, request.vaultRoot)
+    || !sameNativePath(descriptorPath, join(vaultRoot, ".memory-mcp", "project-identity.json"))
+  ) {
+    throw new Error("ADMIN_SNAPSHOT_INVALID");
+  }
+
+  const workspace = workspaceSnapshot(
+    Reflect.get(binding, "workspace"),
+    projectId,
+    vaultId,
+    projectRoot,
+    workspaceId,
+  );
+  const storeRoute = routeSnapshot(Reflect.get(binding, "storeRoute"));
+  const expectedStoreRoot = workspace.kind === "git"
+    ? resolve(workspace.gitCommonDir, "project-memory", projectId, "v2")
+    : resolve(vaultRoot, ".memory-mcp", "v2");
+  if (
+    storeRoute.kind !== (workspace.kind === "git" ? "git-common" : "vault-local")
+    || !sameNativePath(storeRoute.storeRoot, expectedStoreRoot)
+  ) {
+    throw new Error("ADMIN_SNAPSHOT_INVALID");
+  }
+
+  const authority = {
+    generation,
+    source: request.source,
+    projectId,
+    vaultId,
+    storeId,
+    workspaceId,
+    clientNamespace: request.clientNamespace,
+    clientInstanceId: request.clientInstanceId,
+    actorRole: request.actorRole,
+    projectRoot,
+    vaultRoot,
+    descriptorPath,
+    storeRoute,
+    workspace,
+  };
+  if (computeProjectContextFingerprint(authority) !== contextFingerprint) {
+    throw new Error("ADMIN_SNAPSHOT_INVALID");
+  }
+  return {
+    ...authority,
+    projectBindingId,
+    contextFingerprint,
+    establishedAt: snapshotRfc3339(Reflect.get(binding, "establishedAt")),
+  };
+}
+
+function validatedContextSnapshot(
+  value: unknown,
+  established: ProjectBinding,
+  request: TrustedProjectBindingRequest,
+): ProjectContext {
+  const observed = snapshotRecord(value);
+  const hasBranchScope = Object.hasOwn(observed, "branchScopeId");
+  const context = snapshotExactRecord(value, hasBranchScope
+    ? ["binding", "workspace", "branchScopeId", "checkedAt"]
+    : ["binding", "workspace", "checkedAt"]);
+  const binding = validatedBindingSnapshot(Reflect.get(context, "binding"), request);
+  if (canonicalJson(binding) !== canonicalJson(established)) {
+    throw new Error("ADMIN_SNAPSHOT_INVALID");
+  }
+  const workspace = workspaceSnapshot(
+    Reflect.get(context, "workspace"),
+    binding.projectId,
+    binding.vaultId,
+    binding.projectRoot,
+    binding.workspaceId,
+  );
+  if (canonicalJson(workspace) !== canonicalJson(binding.workspace)) {
+    throw new Error("ADMIN_SNAPSHOT_INVALID");
+  }
+  const branchScopeId = hasBranchScope
+    ? snapshotUuid(Reflect.get(context, "branchScopeId")) as NonNullable<ProjectContext["branchScopeId"]>
+    : undefined;
+  return {
+    binding,
+    workspace,
+    ...(branchScopeId === undefined ? {} : { branchScopeId }),
+    checkedAt: snapshotRfc3339(Reflect.get(context, "checkedAt")),
   };
 }
 
@@ -416,70 +727,35 @@ function bootstrapSnapshot(value: unknown): ProjectStoreBootstrapResult {
   };
 }
 
+function assertBootstrapAuthority(
+  result: ProjectStoreBootstrapResult,
+  binding: ProjectBinding,
+): void {
+  if (
+    result.descriptor.projectId !== binding.projectId
+    || result.descriptor.vaultId !== binding.vaultId
+    || result.manifest.projectId !== binding.projectId
+    || result.manifest.vaultId !== binding.vaultId
+    || result.manifest.storeId !== binding.storeId
+    || canonicalJson(result.route) !== canonicalJson(binding.storeRoute)
+  ) {
+    throw new Error("ADMIN_SNAPSHOT_INVALID");
+  }
+}
+
 function statusSnapshot(
   bindingValue: unknown,
   runtime: RuntimeCapabilityReport,
   request: TrustedProjectBindingRequest,
 ): unknown {
-  const binding = snapshotRecord(bindingValue);
-  const projectId = snapshotUuid(Reflect.get(binding, "projectId"));
-  const projectRoot = snapshotAbsolutePath(Reflect.get(binding, "projectRoot"));
-  const vaultRoot = snapshotAbsolutePath(Reflect.get(binding, "vaultRoot"));
-  const descriptorPath = snapshotAbsolutePath(Reflect.get(binding, "descriptorPath"));
-  if (
-    !sameNativePath(projectRoot, request.projectRoot)
-    || !sameNativePath(vaultRoot, request.vaultRoot)
-    || !sameNativePath(descriptorPath, join(vaultRoot, ".memory-mcp", "project-identity.json"))
-    || Reflect.get(binding, "source") !== request.source
-    || Reflect.get(binding, "actorRole") !== request.actorRole
-    || Reflect.get(binding, "clientNamespace") !== request.clientNamespace
-    || Reflect.get(binding, "clientInstanceId") !== request.clientInstanceId
-    || Reflect.get(binding, "generation") !== request.generation
-  ) {
-    throw new Error("ADMIN_SNAPSHOT_INVALID");
-  }
-
-  const workspaceId = snapshotString(Reflect.get(binding, "workspaceId"));
-  const workspace = snapshotRecord(Reflect.get(binding, "workspace"));
-  if (snapshotString(Reflect.get(workspace, "workspaceId")) !== workspaceId) {
-    throw new Error("ADMIN_SNAPSHOT_INVALID");
-  }
-
-  const route = routeSnapshot(Reflect.get(binding, "storeRoute"));
-  const workspaceKind = Reflect.get(workspace, "kind");
-  if (workspaceKind === "non-git") {
-    const workspaceRoot = snapshotAbsolutePath(Reflect.get(workspace, "workspaceRoot"));
-    if (
-      route.kind !== "vault-local"
-      || !sameNativePath(workspaceRoot, projectRoot)
-      || !sameNativePath(route.storeRoot, join(vaultRoot, ".memory-mcp", "v2"))
-    ) {
-      throw new Error("ADMIN_SNAPSHOT_INVALID");
-    }
-  } else if (workspaceKind === "git") {
-    const worktreeRoot = snapshotAbsolutePath(Reflect.get(workspace, "worktreeRoot"));
-    const gitCommonDir = snapshotAbsolutePath(Reflect.get(workspace, "gitCommonDir"));
-    if (
-      route.kind !== "git-common"
-      || !sameNativePath(worktreeRoot, projectRoot)
-      || !sameNativePath(
-        route.storeRoot,
-        join(gitCommonDir, "project-memory", projectId, "v2"),
-      )
-    ) {
-      throw new Error("ADMIN_SNAPSHOT_INVALID");
-    }
-  } else {
-    throw new Error("ADMIN_SNAPSHOT_INVALID");
-  }
-
+  const binding = validatedBindingSnapshot(bindingValue, request);
   return {
     action: "status",
-    projectId,
-    vaultId: snapshotUuid(Reflect.get(binding, "vaultId")),
-    storeId: snapshotUuid(Reflect.get(binding, "storeId")),
-    workspaceId,
-    eventsPath: route.eventsPath,
+    projectId: binding.projectId,
+    vaultId: binding.vaultId,
+    storeId: binding.storeId,
+    workspaceId: binding.workspaceId,
+    eventsPath: binding.storeRoute.eventsPath,
     runtime,
   };
 }
@@ -963,19 +1239,33 @@ export async function runCliCommand(
           ? {}
           : { replicaDecision: options.replicaDecision }),
       }));
+      const bootstrapResolution = await dependencies.bindingService.establish(request);
+      if (!bootstrapResolution.ok) throw bindingFailure(bootstrapResolution);
+      const established = validatedBindingSnapshot(bootstrapResolution.binding, request);
+      const context = validatedContextSnapshot(
+        await dependencies.bindingService.revalidate(established),
+        established,
+        request,
+      );
+      assertBootstrapAuthority(result, context.binding);
       writeJson(io.stdout, { action: "initialized", result });
       return 0;
     }
 
     const resolution = await dependencies.bindingService.establish(request);
     if (!resolution.ok) throw bindingFailure(resolution);
+    const established = validatedBindingSnapshot(resolution.binding, request);
 
     if (options.command === "orchestrator-status") {
-      writeJson(io.stdout, statusSnapshot(resolution.binding, runtime, request));
+      writeJson(io.stdout, statusSnapshot(established, runtime, request));
       return 0;
     }
 
-    const context = await dependencies.bindingService.revalidate(resolution.binding);
+    const context = validatedContextSnapshot(
+      await dependencies.bindingService.revalidate(established),
+      established,
+      request,
+    );
     const executor = dependencies.executorFactory(context);
     let untrustedReport: unknown;
     try {
