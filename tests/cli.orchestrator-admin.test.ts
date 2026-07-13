@@ -770,6 +770,41 @@ describe("V2 administration lifecycle", () => {
     assert.equal(observedProbePaths.every((path) => !existsSync(path)), true);
   });
 
+  it("canonicalizes application-owned snapshot roots from an aliased temp directory", async () => {
+    const roots = temporaryProject();
+    await new DefaultProjectStoreBootstrapService().initialize(roots);
+    const workerUrl = new URL("../src/workers/project-store.worker.js", import.meta.url);
+    const inspector = createOrchestratorAdminDependencies(workerUrl).inspectInitialization;
+    const targetRoot = canonicalMkdtemp("memory-cli-admin-snapshot-target-");
+    const aliasRoot = `${targetRoot}-alias`;
+    try {
+      symlinkSync(targetRoot, aliasRoot, process.platform === "win32" ? "junction" : "dir");
+    } catch (error) {
+      rmSync(targetRoot, { recursive: true, force: true });
+      throw error;
+    }
+    temporaryRoots.push(aliasRoot, targetRoot);
+    const previousEnvironment = {
+      TMPDIR: process.env.TMPDIR,
+      TEMP: process.env.TEMP,
+      TMP: process.env.TMP,
+    };
+
+    try {
+      process.env.TMPDIR = aliasRoot;
+      process.env.TEMP = aliasRoot;
+      process.env.TMP = aliasRoot;
+      const inspection = await inspector(roots.projectRoot, roots.vaultRoot);
+
+      assert.equal(inspection.state, "initialized");
+    } finally {
+      for (const [name, value] of Object.entries(previousEnvironment)) {
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
+    }
+  });
+
   it("fails concrete inspection closed when the authoritative WAL path is non-regular", async () => {
     const roots = temporaryProject();
     const initialized = await new DefaultProjectStoreBootstrapService().initialize(roots);

@@ -1555,7 +1555,9 @@ async function withStableStoreSnapshot<T>(
   const sourceFiles = [route.eventsPath, `${route.eventsPath}-wal`] as const;
   const sourceShmPath = `${route.eventsPath}-shm`;
   for (let attempt = 0; attempt < MAXIMUM_STABLE_SNAPSHOT_ATTEMPTS; attempt += 1) {
-    const directory = mkdtempSync(join(tmpdir(), "memory-vault-store-snapshot-"));
+    const directory = resolve(realpathSync.native(
+      mkdtempSync(join(tmpdir(), "memory-vault-store-snapshot-")),
+    ));
     try {
       validateCanonicalStoreSource(route);
       await storeFileSignature(sourceShmPath);
