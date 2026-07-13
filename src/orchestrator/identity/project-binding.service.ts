@@ -212,6 +212,8 @@ export function describeProjectBindingFailure(
   };
 }
 
+const TRUSTED_PROJECT_BINDING_ERROR_CODES = new WeakMap<object, ProjectBindingFailureCode>();
+
 export class ProjectBindingError extends Error {
   readonly remediation: string[];
 
@@ -220,6 +222,7 @@ export class ProjectBindingError extends Error {
     readonly details: Record<string, unknown> = {},
   ) {
     super(describeProjectBindingFailure(code).message);
+    TRUSTED_PROJECT_BINDING_ERROR_CODES.set(this, code);
     this.name = "ProjectBindingError";
     this.remediation = describeProjectBindingFailure(code).remediation;
   }
@@ -240,14 +243,27 @@ function failure(
 }
 
 function exactErrorCode(error: unknown): string | undefined {
-  return typeof error === "object" && error !== null && "code" in error
-    && typeof error.code === "string"
-    ? error.code
-    : undefined;
+  try {
+    if (typeof error !== "object" || error === null || !("code" in error)) return undefined;
+    const code = Reflect.get(error, "code") as unknown;
+    return typeof code === "string" ? code : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function safeCaughtFailureCode(error: unknown): ProjectBindingFailureCode {
+  if ((typeof error !== "object" || error === null) && typeof error !== "function") {
+    return "STORE_UNAVAILABLE";
+  }
+  return TRUSTED_PROJECT_BINDING_ERROR_CODES.get(error as object) ?? "STORE_UNAVAILABLE";
 }
 
 function probeError(error: unknown): ProjectBindingError {
-  if (error instanceof ProjectBindingError) return error;
+  if ((typeof error === "object" && error !== null) || typeof error === "function") {
+    const trustedCode = TRUSTED_PROJECT_BINDING_ERROR_CODES.get(error as object);
+    if (trustedCode !== undefined) return new ProjectBindingError(trustedCode);
+  }
   const code = exactErrorCode(error);
   if (code !== undefined && IDENTITY_FAILURE_CODES.has(code as ProjectBindingFailureCode)) {
     return new ProjectBindingError(code as ProjectBindingFailureCode);
@@ -523,10 +539,7 @@ export class ProjectBindingService implements ProjectBindingProvider {
       return resolution;
     } catch (error) {
       this.invalidateIfOwned(revision);
-      const bindingError = error instanceof ProjectBindingError
-        ? error
-        : new ProjectBindingError("STORE_UNAVAILABLE");
-      return failure(bindingError.code, bindingError.details);
+      return failure(safeCaughtFailureCode(error));
     }
   }
 
@@ -888,11 +901,8 @@ export class ProjectBindingService implements ProjectBindingProvider {
   }
 
   private resolutionFromError(error: unknown, revision: bigint): ProjectBindingFailure {
-    const bindingError = error instanceof ProjectBindingError
-      ? error
-      : new ProjectBindingError("STORE_UNAVAILABLE");
     this.clearEstablishmentIfOwned(revision);
-    return failure(bindingError.code, bindingError.details);
+    return failure(safeCaughtFailureCode(error));
   }
 
   private beginEstablishment(): bigint {

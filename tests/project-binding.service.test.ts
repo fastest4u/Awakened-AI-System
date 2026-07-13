@@ -537,6 +537,31 @@ describe("ProjectBindingService establishment", () => {
     }
   });
 
+  it("never trusts throwing code or details getters on late dependency errors", async () => {
+    for (const hostileField of ["code", "details"] as const) {
+      const item = fixture();
+      const hostile = new ProjectBindingError("STORE_UNAVAILABLE");
+      Object.defineProperty(hostile, hostileField, {
+        configurable: true,
+        get(): never {
+          throw new Error(`HOSTILE_${hostileField.toUpperCase()}_GETTER_SECRET`);
+        },
+      });
+      const service = new ProjectBindingService({
+        ...item.dependencies,
+        randomId: () => { throw hostile; },
+      });
+
+      const resolution = await service.establish(request(item.projectRoot, item.vaultRoot));
+
+      assert.equal(resolution.ok, false, hostileField);
+      if (resolution.ok) assert.fail(`expected ${hostileField} failure`);
+      assert.equal(resolution.code, "STORE_UNAVAILABLE");
+      assert.equal(service.current(), null);
+      assert.equal(JSON.stringify(resolution).includes("SECRET"), false);
+    }
+  });
+
   it("prevents an older establishing generation from superseding a newer completed binding", async () => {
     const item = fixture();
     const firstProbe = deferred<void>();
@@ -866,6 +891,28 @@ describe("ProjectStatusService privacy", () => {
     assert.equal(malformed.state, "not-ready");
     assert.equal(malformed.contentAuthorized, false);
     assert.equal(JSON.stringify(malformed).includes("RUNTIME_SHAPE_SECRET"), false);
+  });
+
+  it("reports a confirmed runtime capability failure as blocked", async () => {
+    const item = fixture();
+    await established(item);
+    const service = new ProjectStatusService(item.service);
+
+    const status = service.status({
+      mode: "primary",
+      runtime: {
+        ok: false,
+        code: "SQLITE_CAPABILITY_MISSING",
+        message: "safe input must be reconstructed",
+        nodeVersion: "24.0.0",
+        sqliteVersion: "3.53.0",
+        checks: { wal: false },
+      },
+    });
+
+    assert.equal(status.state, "blocked");
+    assert.equal(status.contentAuthorized, false);
+    assert.equal(status.project, undefined);
   });
 
   it("reconstructs failure text locally and allowlists only fixed runtime check names", () => {

@@ -144,13 +144,27 @@ function successfulRuntimeShape(
     && runtime.applicationId === 0x504d454d;
 }
 
+function failedRuntimeShape(runtime: Record<string, unknown>): boolean {
+  return runtime.ok === false
+    && runtime.code === "SQLITE_CAPABILITY_MISSING"
+    && typeof runtime.message === "string"
+    && typeof runtime.nodeVersion === "string"
+    && STABLE_VERSION.test(runtime.nodeVersion)
+    && (runtime.sqliteVersion === undefined
+      || (typeof runtime.sqliteVersion === "string" && STABLE_VERSION.test(runtime.sqliteVersion)))
+    && typeof runtime.checks === "object"
+    && runtime.checks !== null;
+}
+
+type RuntimeReadiness = "absent" | "ready" | "failed";
+
 function unsafeRuntimeSummary(
   runtime: RuntimeCapabilityResult | null,
-): { summary: SafeRuntimeCapabilitySummary | null; ready: boolean } {
-  if (runtime === null) return { summary: null, ready: false };
+): { summary: SafeRuntimeCapabilitySummary | null; readiness: RuntimeReadiness } {
+  if (runtime === null) return { summary: null, readiness: "absent" };
   if (typeof runtime !== "object") {
     return {
-      ready: false,
+      readiness: "absent",
       summary: {
         ok: false,
         code: "SQLITE_CAPABILITY_MISSING",
@@ -162,7 +176,7 @@ function unsafeRuntimeSummary(
   const record = runtime as unknown as Record<string, unknown>;
   if (record.ok === true && successfulRuntimeShape(record)) {
     return {
-      ready: true,
+      readiness: "ready",
       summary: {
         ok: true,
         nodeVersion: record.nodeVersion,
@@ -181,7 +195,7 @@ function unsafeRuntimeSummary(
   }
   const sqliteVersion = safeVersion(record.sqliteVersion);
   return {
-    ready: false,
+    readiness: failedRuntimeShape(record) ? "failed" : "absent",
     summary: {
       ok: false,
       code: "SQLITE_CAPABILITY_MISSING",
@@ -194,12 +208,12 @@ function unsafeRuntimeSummary(
 
 function runtimeSummary(
   runtime: RuntimeCapabilityResult | null,
-): { summary: SafeRuntimeCapabilitySummary | null; ready: boolean } {
+): { summary: SafeRuntimeCapabilitySummary | null; readiness: RuntimeReadiness } {
   try {
     return unsafeRuntimeSummary(runtime);
   } catch {
     return {
-      ready: false,
+      readiness: "absent",
       summary: {
         ok: false,
         code: "SQLITE_CAPABILITY_MISSING",
@@ -271,9 +285,9 @@ export class ProjectStatusService {
       : { failure: describeProjectBindingFailure(input.failure.code) };
     const state: ProjectStatusState = input.mode === "off"
       ? "disabled"
-      : input.failure !== undefined
+      : input.failure !== undefined || runtime.readiness === "failed"
         ? "blocked"
-        : !runtime.ready || binding === null
+        : runtime.readiness !== "ready" || binding === null
           ? "not-ready"
           : "bound";
     const contentAuthorized = state === "bound";
