@@ -188,6 +188,30 @@ const REMEDIATION: Record<ProjectBindingFailureCode, string[]> = {
   STORE_UNAVAILABLE: ["verify the existing project store and retry"],
 };
 
+const PROJECT_BINDING_FAILURE_CODES = new Set<ProjectBindingFailureCode>(
+  Object.keys(FAILURE_MESSAGES) as ProjectBindingFailureCode[],
+);
+
+export interface SafeProjectBindingFailureDescription {
+  code: ProjectBindingFailureCode;
+  message: string;
+  remediation: string[];
+}
+
+export function describeProjectBindingFailure(
+  code: unknown,
+): SafeProjectBindingFailureDescription {
+  const safeCode = typeof code === "string"
+    && PROJECT_BINDING_FAILURE_CODES.has(code as ProjectBindingFailureCode)
+    ? code as ProjectBindingFailureCode
+    : "PROJECT_BINDING_REQUIRED";
+  return {
+    code: safeCode,
+    message: FAILURE_MESSAGES[safeCode],
+    remediation: [...REMEDIATION[safeCode]],
+  };
+}
+
 export class ProjectBindingError extends Error {
   readonly remediation: string[];
 
@@ -195,9 +219,9 @@ export class ProjectBindingError extends Error {
     readonly code: ProjectBindingFailureCode,
     readonly details: Record<string, unknown> = {},
   ) {
-    super(FAILURE_MESSAGES[code]);
+    super(describeProjectBindingFailure(code).message);
     this.name = "ProjectBindingError";
-    this.remediation = [...REMEDIATION[code]];
+    this.remediation = describeProjectBindingFailure(code).remediation;
   }
 }
 
@@ -205,12 +229,13 @@ function failure(
   code: ProjectBindingFailureCode,
   details: Record<string, unknown> = {},
 ): ProjectBindingFailure {
+  const description = describeProjectBindingFailure(code);
   return {
     ok: false,
-    code,
-    message: FAILURE_MESSAGES[code],
+    code: description.code,
+    message: description.message,
     details,
-    remediation: [...REMEDIATION[code]],
+    remediation: description.remediation,
   };
 }
 
@@ -302,10 +327,28 @@ function validateWorkspace(
 function validateRoute(
   route: ProjectStoreRoute,
   workspace: WorkspaceSnapshot,
+  descriptor: ProjectDescriptorV1,
+  vaultRoot: string,
   pathExists: (path: string) => boolean,
 ): void {
   const expectedKind = workspace.kind === "git" ? "git-common" : "vault-local";
   if (route.kind !== expectedKind) throw new ProjectBindingError("STORE_ROUTE_INVALID");
+  const routeBase = workspace.kind === "git" ? workspace.gitCommonDir : vaultRoot;
+  const expectedStoreRoot = workspace.kind === "git"
+    ? resolve(routeBase, "project-memory", descriptor.projectId, "v2")
+    : resolve(routeBase, ".memory-mcp", "v2");
+  try {
+    assertContainedPath(routeBase, expectedStoreRoot);
+  } catch {
+    throw new ProjectBindingError("STORE_ROUTE_INVALID");
+  }
+  const expectedRoute: ProjectStoreRoute = {
+    kind: expectedKind,
+    storeRoot: expectedStoreRoot,
+    eventsPath: join(expectedStoreRoot, "events.sqlite"),
+    storeManifestPath: join(expectedStoreRoot, "store-manifest.json"),
+    projectionManifestPath: join(expectedStoreRoot, "current-projection.json"),
+  };
   for (const path of [
     route.storeRoot,
     route.eventsPath,
@@ -315,7 +358,11 @@ function validateRoute(
     assertAbsoluteCanonicalShape(path);
   }
   if (
-    !samePath(dirname(route.eventsPath), route.storeRoot)
+    !samePath(route.storeRoot, expectedRoute.storeRoot)
+    || !samePath(route.eventsPath, expectedRoute.eventsPath)
+    || !samePath(route.storeManifestPath, expectedRoute.storeManifestPath)
+    || !samePath(route.projectionManifestPath, expectedRoute.projectionManifestPath)
+    || !samePath(dirname(route.eventsPath), route.storeRoot)
     || !samePath(dirname(route.storeManifestPath), route.storeRoot)
     || !samePath(dirname(route.projectionManifestPath), route.storeRoot)
     || basename(route.eventsPath) !== "events.sqlite"
@@ -443,6 +490,7 @@ export class ProjectBindingService implements ProjectBindingProvider {
   readonly #dependencies: ResolvedDependencies;
   #binding: ProjectBinding | null = null;
   #baseline: BindingBaseline | null = null;
+  #revision = 0n;
 
   constructor(dependencies: ProjectBindingServiceDependencies) {
     this.#dependencies = {
@@ -468,7 +516,24 @@ export class ProjectBindingService implements ProjectBindingProvider {
   }
 
   async establish(request: TrustedProjectBindingRequest): Promise<ProjectBindingResolution> {
-    this.clear();
+    const revision = this.beginEstablishment();
+    try {
+      const resolution = await this.establishOwned(request, revision);
+      this.assertEstablishmentOwned(revision);
+      return resolution;
+    } catch (error) {
+      this.invalidateIfOwned(revision);
+      const bindingError = error instanceof ProjectBindingError
+        ? error
+        : new ProjectBindingError("STORE_UNAVAILABLE");
+      return failure(bindingError.code, bindingError.details);
+    }
+  }
+
+  private async establishOwned(
+    request: TrustedProjectBindingRequest,
+    revision: bigint,
+  ): Promise<ProjectBindingResolution> {
     let trusted: TrustedProjectBindingRequest;
     try {
       trusted = parseTrustedProjectBindingRequest(
@@ -516,7 +581,7 @@ export class ProjectBindingService implements ProjectBindingProvider {
     try {
       validateDescriptorPath(vaultRoot, descriptorInspection.path);
     } catch (error) {
-      return this.resolutionFromError(error);
+      return this.resolutionFromError(error, revision);
     }
     const descriptor = descriptorInspection.descriptor;
 
@@ -531,17 +596,23 @@ export class ProjectBindingService implements ProjectBindingProvider {
           { reason: error.reason },
         );
       }
-      if (error instanceof ProjectBindingError) return this.resolutionFromError(error);
+      if (error instanceof ProjectBindingError) return this.resolutionFromError(error, revision);
       return failure("GIT_PROBE_FAILED");
     }
 
     let storeRoute: ProjectStoreRoute;
     try {
       storeRoute = this.#dependencies.router.route(descriptor, vaultRoot, workspace);
-      validateRoute(storeRoute, workspace, this.#dependencies.pathExists);
+      validateRoute(
+        storeRoute,
+        workspace,
+        descriptor,
+        vaultRoot,
+        this.#dependencies.pathExists,
+      );
     } catch (error) {
       return error instanceof ProjectBindingError
-        ? this.resolutionFromError(error)
+        ? this.resolutionFromError(error, revision)
         : failure("STORE_ROUTE_INVALID");
     }
 
@@ -572,9 +643,11 @@ export class ProjectBindingService implements ProjectBindingProvider {
           projectId: descriptor.projectId,
           vaultId: descriptor.vaultId,
         });
+        this.assertEstablishmentOwned(revision);
         validateInspectedIdentity(identity, descriptor);
       } catch (error) {
-        return this.resolutionFromError(probeError(error));
+        this.assertEstablishmentOwned(revision);
+        return this.resolutionFromError(probeError(error), revision);
       }
       return failure("STORE_MANIFEST_RECOVERY_REQUIRED", {
         manifestPath: manifestInspection.path,
@@ -585,7 +658,7 @@ export class ProjectBindingService implements ProjectBindingProvider {
     try {
       validateManifestIdentity(storeManifest, descriptor);
     } catch (error) {
-      return this.resolutionFromError(error);
+      return this.resolutionFromError(error, revision);
     }
     if (!samePath(manifestInspection.path, storeRoute.storeManifestPath)) {
       return failure("STORE_ROUTE_INVALID");
@@ -599,8 +672,10 @@ export class ProjectBindingService implements ProjectBindingProvider {
         vaultId: descriptor.vaultId,
         storeId: storeManifest.storeId,
       });
+      this.assertEstablishmentOwned(revision);
     } catch (error) {
-      return this.resolutionFromError(probeError(error));
+      this.assertEstablishmentOwned(revision);
+      return this.resolutionFromError(probeError(error), revision);
     }
 
     const bindingWithoutPrivateFields: Omit<
@@ -623,27 +698,37 @@ export class ProjectBindingService implements ProjectBindingProvider {
       workspace: { ...workspace },
     };
     const contextFingerprint = computeProjectContextFingerprint(bindingWithoutPrivateFields);
+    this.assertEstablishmentOwned(revision);
+    const projectBindingId = this.#dependencies.randomId();
+    const establishedAt = this.#dependencies.now();
+    if (!UUID.test(projectBindingId) || typeof establishedAt !== "string") {
+      throw new ProjectBindingError("STORE_UNAVAILABLE");
+    }
     const binding = freezeBinding({
       ...bindingWithoutPrivateFields,
-      projectBindingId: this.#dependencies.randomId(),
+      projectBindingId,
       contextFingerprint,
-      establishedAt: this.#dependencies.now(),
+      establishedAt,
     });
-    this.#binding = binding;
-    this.#baseline = {
+    const baseline = {
       descriptor: canonicalJson(descriptor),
       manifest: canonicalJson(storeManifest),
     };
+    this.assertEstablishmentOwned(revision);
+    this.#binding = binding;
+    this.#baseline = baseline;
     return { ok: true, binding };
   }
 
   async revalidate(binding: ProjectBinding): Promise<ProjectContext> {
+    const revision = this.#revision;
     try {
       const current = this.require();
       const baseline = this.#baseline;
       if (baseline === null || !samePrivateBinding(binding, current)) {
         throw new ProjectBindingError("PROJECT_BINDING_REQUIRED", { reason: "STALE_BINDING" });
       }
+      this.assertRevalidationCurrent(revision, current);
 
       let projectRoot: string;
       let vaultRoot: string;
@@ -702,7 +787,13 @@ export class ProjectBindingService implements ProjectBindingProvider {
       let storeRoute: ProjectStoreRoute;
       try {
         storeRoute = this.#dependencies.router.route(descriptor, vaultRoot, workspace);
-        validateRoute(storeRoute, workspace, this.#dependencies.pathExists);
+        validateRoute(
+          storeRoute,
+          workspace,
+          descriptor,
+          vaultRoot,
+          this.#dependencies.pathExists,
+        );
       } catch (error) {
         if (error instanceof ProjectBindingError) throw error;
         throw new ProjectBindingError("STORE_ROUTE_INVALID");
@@ -726,6 +817,7 @@ export class ProjectBindingService implements ProjectBindingProvider {
             vaultId: current.vaultId,
             storeId: current.storeId,
           });
+          this.assertRevalidationCurrent(revision, current);
         } catch (error) {
           throw probeError(error);
         }
@@ -754,6 +846,7 @@ export class ProjectBindingService implements ProjectBindingProvider {
           vaultId: descriptor.vaultId,
           storeId: storeManifest.storeId,
         });
+        this.assertRevalidationCurrent(revision, current);
       } catch (error) {
         throw probeError(error);
       }
@@ -780,27 +873,59 @@ export class ProjectBindingService implements ProjectBindingProvider {
       if (computeProjectContextFingerprint(observed) !== current.contextFingerprint) {
         throw new ProjectBindingError("PROJECT_BINDING_REQUIRED", { reason: "FINGERPRINT_MISMATCH" });
       }
+      const checkedAt = this.#dependencies.now();
+      this.assertRevalidationCurrent(revision, current);
       return {
         binding: current,
         workspace: current.workspace,
-        checkedAt: this.#dependencies.now(),
+        checkedAt,
       };
     } catch (error) {
-      this.clear();
+      this.invalidateIfOwned(revision);
       if (error instanceof ProjectBindingError) throw error;
       throw new ProjectBindingError("STORE_UNAVAILABLE");
     }
   }
 
-  private resolutionFromError(error: unknown): ProjectBindingFailure {
+  private resolutionFromError(error: unknown, revision: bigint): ProjectBindingFailure {
     const bindingError = error instanceof ProjectBindingError
       ? error
       : new ProjectBindingError("STORE_UNAVAILABLE");
-    this.clear();
+    this.clearEstablishmentIfOwned(revision);
     return failure(bindingError.code, bindingError.details);
   }
 
-  private clear(): void {
+  private beginEstablishment(): bigint {
+    this.#revision += 1n;
+    this.#binding = null;
+    this.#baseline = null;
+    return this.#revision;
+  }
+
+  private assertEstablishmentOwned(revision: bigint): void {
+    if (this.#revision !== revision) {
+      throw new ProjectBindingError("PROJECT_BINDING_REQUIRED", { reason: "SUPERSEDED" });
+    }
+  }
+
+  private assertRevalidationCurrent(
+    revision: bigint,
+    binding: ProjectBinding,
+  ): void {
+    if (this.#revision !== revision || this.#binding !== binding || this.#baseline === null) {
+      throw new ProjectBindingError("PROJECT_BINDING_REQUIRED", { reason: "SUPERSEDED" });
+    }
+  }
+
+  private clearEstablishmentIfOwned(revision: bigint): void {
+    if (this.#revision !== revision) return;
+    this.#binding = null;
+    this.#baseline = null;
+  }
+
+  private invalidateIfOwned(revision: bigint): void {
+    if (this.#revision !== revision) return;
+    this.#revision += 1n;
     this.#binding = null;
     this.#baseline = null;
   }

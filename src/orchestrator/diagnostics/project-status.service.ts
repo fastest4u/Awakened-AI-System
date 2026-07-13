@@ -3,6 +3,7 @@ import type {
   ProjectBindingFailure,
   ProjectBindingProvider,
 } from "../identity/project-binding.service.js";
+import { describeProjectBindingFailure } from "../identity/project-binding.service.js";
 import type { ProjectBinding } from "../identity/contracts.js";
 
 export type OrchestratorMode = "off" | "shadow" | "primary";
@@ -81,33 +82,132 @@ export interface ProjectStatus {
   heuristicCandidates: SafeHeuristicProjectCandidate[];
 }
 
-function runtimeSummary(
+const RUNTIME_CHECK_NAMES = [
+  "nodeVersionAtLeastMinimum",
+  "nodeSqlite",
+  "sqliteVersionAtLeastMinimum",
+  "wal",
+  "fts5",
+  "foreignKeys",
+  "synchronousFull",
+  "busyTimeout",
+  "trustedSchemaOff",
+  "transactionRollback",
+  "applicationId",
+] as const;
+
+const STABLE_VERSION = /^\d+\.\d+\.\d+$/;
+
+function safeVersion(value: unknown): string {
+  return typeof value === "string" && STABLE_VERSION.test(value) ? value : "unknown";
+}
+
+function safeChecks(value: unknown): Record<string, boolean> {
+  if (typeof value !== "object" || value === null) return {};
+  const record = value as Record<string, unknown>;
+  const checks: Record<string, boolean> = {};
+  for (const name of RUNTIME_CHECK_NAMES) {
+    if (typeof record[name] === "boolean") checks[name] = record[name];
+  }
+  return checks;
+}
+
+function successfulRuntimeShape(
+  runtime: Record<string, unknown>,
+): runtime is Record<string, unknown> & {
+  nodeVersion: string;
+  sqliteVersion: string;
+  nodeSqlite: true;
+  wal: true;
+  fts5: true;
+  foreignKeys: true;
+  synchronousFull: true;
+  busyTimeoutMs: 5000;
+  trustedSchemaOff: true;
+  transactionRollback: true;
+  applicationId: 0x504d454d;
+} {
+  return typeof runtime.nodeVersion === "string"
+    && STABLE_VERSION.test(runtime.nodeVersion)
+    && typeof runtime.sqliteVersion === "string"
+    && STABLE_VERSION.test(runtime.sqliteVersion)
+    && runtime.nodeVersionAtLeastMinimum === true
+    && runtime.sqliteVersionAtLeastMinimum === true
+    && runtime.nodeSqlite === true
+    && runtime.wal === true
+    && runtime.fts5 === true
+    && runtime.foreignKeys === true
+    && runtime.synchronousFull === true
+    && runtime.busyTimeoutMs === 5000
+    && runtime.trustedSchemaOff === true
+    && runtime.transactionRollback === true
+    && runtime.applicationId === 0x504d454d;
+}
+
+function unsafeRuntimeSummary(
   runtime: RuntimeCapabilityResult | null,
-): SafeRuntimeCapabilitySummary | null {
-  if (runtime === null) return null;
-  if (!runtime.ok) {
+): { summary: SafeRuntimeCapabilitySummary | null; ready: boolean } {
+  if (runtime === null) return { summary: null, ready: false };
+  if (typeof runtime !== "object") {
     return {
-      ok: false,
-      code: runtime.code,
-      nodeVersion: runtime.nodeVersion,
-      ...(runtime.sqliteVersion === undefined ? {} : { sqliteVersion: runtime.sqliteVersion }),
-      checks: { ...runtime.checks },
+      ready: false,
+      summary: {
+        ok: false,
+        code: "SQLITE_CAPABILITY_MISSING",
+        nodeVersion: "unknown",
+        checks: {},
+      },
     };
   }
+  const record = runtime as unknown as Record<string, unknown>;
+  if (record.ok === true && successfulRuntimeShape(record)) {
+    return {
+      ready: true,
+      summary: {
+        ok: true,
+        nodeVersion: record.nodeVersion,
+        sqliteVersion: record.sqliteVersion,
+        nodeSqlite: record.nodeSqlite,
+        wal: record.wal,
+        fts5: record.fts5,
+        foreignKeys: record.foreignKeys,
+        synchronousFull: record.synchronousFull,
+        busyTimeoutMs: record.busyTimeoutMs,
+        trustedSchemaOff: record.trustedSchemaOff,
+        transactionRollback: record.transactionRollback,
+        applicationId: record.applicationId,
+      },
+    };
+  }
+  const sqliteVersion = safeVersion(record.sqliteVersion);
   return {
-    ok: true,
-    nodeVersion: runtime.nodeVersion,
-    sqliteVersion: runtime.sqliteVersion,
-    nodeSqlite: runtime.nodeSqlite,
-    wal: runtime.wal,
-    fts5: runtime.fts5,
-    foreignKeys: runtime.foreignKeys,
-    synchronousFull: runtime.synchronousFull,
-    busyTimeoutMs: runtime.busyTimeoutMs,
-    trustedSchemaOff: runtime.trustedSchemaOff,
-    transactionRollback: runtime.transactionRollback,
-    applicationId: runtime.applicationId,
+    ready: false,
+    summary: {
+      ok: false,
+      code: "SQLITE_CAPABILITY_MISSING",
+      nodeVersion: safeVersion(record.nodeVersion),
+      ...(sqliteVersion === "unknown" ? {} : { sqliteVersion }),
+      checks: safeChecks(record.checks),
+    },
   };
+}
+
+function runtimeSummary(
+  runtime: RuntimeCapabilityResult | null,
+): { summary: SafeRuntimeCapabilitySummary | null; ready: boolean } {
+  try {
+    return unsafeRuntimeSummary(runtime);
+  } catch {
+    return {
+      ready: false,
+      summary: {
+        ok: false,
+        code: "SQLITE_CAPABILITY_MISSING",
+        nodeVersion: "unknown",
+        checks: {},
+      },
+    };
+  }
 }
 
 function bindingSummary(binding: ProjectBinding): Pick<
@@ -168,19 +268,12 @@ export class ProjectStatusService {
     const runtime = runtimeSummary(input.runtime);
     const failureSummary = input.failure === undefined
       ? {}
-      : {
-          failure: {
-            code: input.failure.code,
-            message: input.failure.message,
-            remediation: [...input.failure.remediation],
-          },
-        };
-    const unavailable = input.failure !== undefined || input.runtime?.ok === false;
+      : { failure: describeProjectBindingFailure(input.failure.code) };
     const state: ProjectStatusState = input.mode === "off"
       ? "disabled"
-      : unavailable
+      : input.failure !== undefined
         ? "blocked"
-        : binding === null
+        : !runtime.ready || binding === null
           ? "not-ready"
           : "bound";
     const contentAuthorized = state === "bound";
@@ -190,7 +283,7 @@ export class ProjectStatusService {
       state,
       contentAuthorized,
       ...(contentAuthorized && binding !== null ? bindingSummary(binding) : {}),
-      runtime,
+      runtime: runtime.summary,
       ...failureSummary,
       heuristicCandidates: safeCandidates(input.heuristicCandidates),
     };

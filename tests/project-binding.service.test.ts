@@ -78,10 +78,12 @@ function manifest(overrides: Partial<StoreManifestV1> = {}): StoreManifestV1 {
   };
 }
 
-function route(root: string): ProjectStoreRoute {
-  const storeRoot = resolve(root, "store");
+function route(vaultRoot: string, workspace: WorkspaceSnapshot): ProjectStoreRoute {
+  const storeRoot = workspace.kind === "git"
+    ? resolve(workspace.gitCommonDir, "project-memory", PROJECT_ID, "v2")
+    : resolve(vaultRoot, ".memory-mcp", "v2");
   return {
-    kind: "vault-local",
+    kind: workspace.kind === "git" ? "git-common" : "vault-local",
     storeRoot,
     eventsPath: join(storeRoot, "events.sqlite"),
     storeManifestPath: join(storeRoot, "store-manifest.json"),
@@ -99,6 +101,20 @@ function request(projectRoot: string, vaultRoot: string) {
     actorRole: "primary" as const,
     generation: 1,
   };
+}
+
+function deferred<T>(): {
+  promise: Promise<T>;
+  resolve(value: T): void;
+  reject(error: unknown): void;
+} {
+  let resolvePromise!: (value: T) => void;
+  let rejectPromise!: (error: unknown) => void;
+  const promise = new Promise<T>((resolveValue, rejectValue) => {
+    resolvePromise = resolveValue;
+    rejectPromise = rejectValue;
+  });
+  return { promise, resolve: resolvePromise, reject: rejectPromise };
 }
 
 interface Fixture {
@@ -127,15 +143,15 @@ interface Fixture {
 function fixture(options: { database?: boolean; workspace?: WorkspaceSnapshot } = {}): Fixture {
   const { root, projectRoot, vaultRoot } = tempRoots();
   const calls: string[] = [];
-  const storeRoute = route(root);
-  mkdirSync(storeRoute.storeRoot, { recursive: true });
-  if (options.database !== false) writeFileSync(storeRoute.eventsPath, "fixture", "utf8");
   const projectDescriptor = descriptor();
   const workspace = options.workspace ?? {
     kind: "non-git" as const,
     workspaceRoot: projectRoot,
     workspaceId: deriveNonGitWorkspaceId(PROJECT_ID, VAULT_ID),
   };
+  const storeRoute = route(vaultRoot, workspace);
+  mkdirSync(storeRoute.storeRoot, { recursive: true });
+  if (options.database !== false) writeFileSync(storeRoute.eventsPath, "fixture", "utf8");
   const state: Fixture["state"] = {
     descriptorInspection: {
       status: "valid",
@@ -450,6 +466,32 @@ describe("ProjectBindingService establishment", () => {
     assert.deepEqual(item.calls, ["descriptor", "git", "route"]);
   });
 
+  it("rejects a self-consistent absolute store route outside the identity-derived location", async () => {
+    const item = fixture();
+    const unrelatedStoreRoot = resolve(item.root, "self-consistent-unrelated-store");
+    item.state.route = {
+      kind: "vault-local",
+      storeRoot: unrelatedStoreRoot,
+      eventsPath: join(unrelatedStoreRoot, "events.sqlite"),
+      storeManifestPath: join(unrelatedStoreRoot, "store-manifest.json"),
+      projectionManifestPath: join(unrelatedStoreRoot, "current-projection.json"),
+    };
+    mkdirSync(unrelatedStoreRoot, { recursive: true });
+    writeFileSync(item.state.route.eventsPath, "fixture", "utf8");
+    item.state.manifestInspection = {
+      status: "valid",
+      path: item.state.route.storeManifestPath,
+      manifest: manifest(),
+    };
+
+    const result = await item.service.establish(request(item.projectRoot, item.vaultRoot));
+
+    assert.equal(result.ok, false);
+    if (result.ok) assert.fail("expected failure");
+    assert.equal(result.code, "STORE_ROUTE_INVALID");
+    assert.deepEqual(item.calls, ["descriptor", "git", "route"]);
+  });
+
   it("maps all Git probe failure reasons without silently treating them as non-Git", async () => {
     const reasons = [
       "COMMAND_FAILED",
@@ -475,6 +517,59 @@ describe("ProjectBindingService establishment", () => {
     }
   });
 
+  it("contains unknown late establishment failures as typed safe resolutions", async () => {
+    for (const [name, override] of [
+      ["randomId", { randomId: () => { throw new Error("RANDOM_ID_SECRET"); } }],
+      ["now", { now: () => { throw new Error("CLOCK_SECRET"); } }],
+      ["pathExists", { pathExists: () => { throw new Error("PATH_PROBE_SECRET"); } }],
+    ] as const) {
+      const item = fixture();
+      const service = new ProjectBindingService({ ...item.dependencies, ...override });
+
+      const resolution = await service.establish(request(item.projectRoot, item.vaultRoot));
+
+      assert.equal(resolution.ok, false, name);
+      if (resolution.ok) assert.fail(`expected ${name} failure`);
+      assert.equal(service.current(), null, name);
+      const encoded = JSON.stringify(resolution);
+      assert.equal(encoded.includes("SECRET"), false, name);
+      assert.match(resolution.code, /^(?:STORE_ROUTE_INVALID|STORE_UNAVAILABLE)$/);
+    }
+  });
+
+  it("prevents an older establishing generation from superseding a newer completed binding", async () => {
+    const item = fixture();
+    const firstProbe = deferred<void>();
+    let verifies = 0;
+    const identityProbe: ProjectStoreIdentityProbe = {
+      ...item.probe,
+      async verify(actualRoute, expected) {
+        verifies += 1;
+        if (verifies === 1) await firstProbe.promise;
+        return item.probe.verify(actualRoute, expected);
+      },
+    };
+    const service = new ProjectBindingService({ ...item.dependencies, identityProbe });
+
+    const olderPending = service.establish(request(item.projectRoot, item.vaultRoot));
+    assert.equal(verifies, 1);
+    const newer = await service.establish({
+      ...request(item.projectRoot, item.vaultRoot),
+      generation: 2,
+    });
+    if (!newer.ok) assert.fail(newer.message);
+    assert.equal(newer.ok, true);
+
+    firstProbe.resolve();
+    const older = await olderPending;
+
+    assert.equal(older.ok, false);
+    if (older.ok) assert.fail("older generation must be superseded");
+    assert.equal(older.code, "PROJECT_BINDING_REQUIRED");
+    assert.equal(service.current(), newer.binding);
+    assert.equal(service.current()?.generation, 2);
+  });
+
   it("keeps linked worktree store identity shared while preserving distinct stable workspace IDs", async () => {
     const item = fixture();
     const gitCommonDir = resolve(item.root, "repo", ".git");
@@ -497,18 +592,18 @@ describe("ProjectBindingService establishment", () => {
       branchRef: "refs/heads/second",
       workspaceId: deriveGitWorkspaceId(PROJECT_ID, gitCommonDir, secondGitDir),
     };
-    item.state.route = { ...item.state.route, kind: "git-common" };
     item.state.workspace = firstWorkspace;
+    item.state.route = route(item.vaultRoot, firstWorkspace);
+    mkdirSync(item.state.route.storeRoot, { recursive: true });
+    writeFileSync(item.state.route.eventsPath, "fixture", "utf8");
+    item.state.manifestInspection = {
+      status: "valid",
+      path: item.state.route.storeManifestPath,
+      manifest: manifest(),
+    };
     const first = await established(item);
 
     const secondFixture = fixture({ workspace: secondWorkspace });
-    secondFixture.state.route = { ...item.state.route };
-    secondFixture.state.manifestInspection = {
-      status: "valid",
-      path: secondFixture.state.route.storeManifestPath,
-      manifest: manifest(),
-    };
-    writeFileSync(secondFixture.state.route.eventsPath, "fixture", "utf8");
     const second = await established(secondFixture);
 
     assert.equal(first.storeId, second.storeId);
@@ -537,6 +632,41 @@ describe("ProjectBindingService revalidation", () => {
       item.service.revalidate(forged),
       (error) => assertBindingFailure(error, "PROJECT_BINDING_REQUIRED"),
     );
+  });
+
+  it("rejects a paused stale revalidation after rebind without clearing the newer generation", async () => {
+    const item = fixture();
+    const oldRevalidationProbe = deferred<void>();
+    let verifies = 0;
+    const identityProbe: ProjectStoreIdentityProbe = {
+      ...item.probe,
+      async verify(actualRoute, expected) {
+        verifies += 1;
+        if (verifies === 2) await oldRevalidationProbe.promise;
+        return item.probe.verify(actualRoute, expected);
+      },
+    };
+    const service = new ProjectBindingService({ ...item.dependencies, identityProbe });
+    const firstResolution = await service.establish(request(item.projectRoot, item.vaultRoot));
+    if (!firstResolution.ok) assert.fail(firstResolution.message);
+    assert.equal(firstResolution.ok, true);
+
+    const stalePending = service.revalidate(firstResolution.binding);
+    assert.equal(verifies, 2);
+    const newer = await service.establish({
+      ...request(item.projectRoot, item.vaultRoot),
+      generation: 2,
+    });
+    if (!newer.ok) assert.fail(newer.message);
+    assert.equal(newer.ok, true);
+
+    oldRevalidationProbe.resolve();
+    await assert.rejects(
+      stalePending,
+      (error) => assertBindingFailure(error, "PROJECT_BINDING_REQUIRED"),
+    );
+    assert.equal(service.current(), newer.binding);
+    assert.equal(service.current()?.generation, 2);
   });
 
   it("worker-verifies the known store identity before reporting a disappeared manifest as recoverable", async () => {
@@ -648,7 +778,14 @@ describe("ProjectBindingService revalidation", () => {
           detached: false,
           workspaceId: deriveGitWorkspaceId(PROJECT_ID, gitCommonDir, gitDir),
         };
-        item.state.route = { ...item.state.route, kind: "git-common" };
+        item.state.route = route(item.vaultRoot, item.state.workspace);
+        mkdirSync(item.state.route.storeRoot, { recursive: true });
+        writeFileSync(item.state.route.eventsPath, "fixture", "utf8");
+        item.state.manifestInspection = {
+          status: "valid",
+          path: item.state.route.storeManifestPath,
+          manifest: manifest(),
+        };
       }
       const binding = await established(item);
       const changedBinding = change.mutate(item, binding);
@@ -710,6 +847,90 @@ describe("ProjectStatusService privacy", () => {
     assert.equal(encoded.includes(binding.contextFingerprint), false);
     assert.equal(encoded.includes("must never appear"), false);
     assert.equal(encoded.includes("capabilityToken"), false);
+  });
+
+  it("keeps a bound identity not-ready until a complete successful runtime report exists", async () => {
+    const item = fixture();
+    await established(item);
+    const service = new ProjectStatusService(item.service);
+
+    const absent = service.status({ mode: "primary", runtime: null });
+    assert.equal(absent.state, "not-ready");
+    assert.equal(absent.contentAuthorized, false);
+    assert.equal(absent.project, undefined);
+
+    const malformed = service.status({
+      mode: "primary",
+      runtime: { ok: true, nodeVersion: "RUNTIME_SHAPE_SECRET" } as never,
+    });
+    assert.equal(malformed.state, "not-ready");
+    assert.equal(malformed.contentAuthorized, false);
+    assert.equal(JSON.stringify(malformed).includes("RUNTIME_SHAPE_SECRET"), false);
+  });
+
+  it("reconstructs failure text locally and allowlists only fixed runtime check names", () => {
+    const item = fixture();
+    const service = new ProjectStatusService(item.service);
+    const status = service.status({
+      mode: "primary",
+      runtime: {
+        ok: false,
+        code: "SQLITE_CAPABILITY_MISSING",
+        message: "RUNTIME_RAW_SECRET",
+        nodeVersion: "24.0.0",
+        sqliteVersion: "3.53.0",
+        checks: {
+          wal: false,
+          fts5: true,
+          unknownSecretCheck: true,
+        },
+      },
+      failure: {
+        ok: false,
+        code: "UNKNOWN_ATTACKER_CODE",
+        message: "FAILURE_MESSAGE_SECRET",
+        details: { secret: "FAILURE_DETAILS_SECRET" },
+        remediation: ["FAILURE_REMEDIATION_SECRET"],
+      } as never,
+    });
+
+    assert.equal(status.state, "blocked");
+    assert.equal(status.contentAuthorized, false);
+    assert.deepEqual(status.failure, {
+      code: "PROJECT_BINDING_REQUIRED",
+      message: "A trusted project binding is required",
+      remediation: ["establish a new trusted project binding"],
+    });
+    assert.deepEqual(status.runtime?.checks, { wal: false, fts5: true });
+    const encoded = JSON.stringify(status);
+    assert.equal(encoded.includes("UNKNOWN_ATTACKER_CODE"), false);
+    assert.equal(encoded.includes("SECRET"), false);
+  });
+
+  it("fails closed when a malformed runtime report throws while being inspected", () => {
+    const item = fixture();
+    const service = new ProjectStatusService(item.service);
+    const hostileRuntime = Object.defineProperty({ ok: false }, "nodeVersion", {
+      enumerable: true,
+      get(): never {
+        throw new Error("RUNTIME_GETTER_SECRET");
+      },
+    });
+
+    const status = service.status({
+      mode: "primary",
+      runtime: hostileRuntime as never,
+    });
+
+    assert.equal(status.state, "not-ready");
+    assert.equal(status.contentAuthorized, false);
+    assert.deepEqual(status.runtime, {
+      ok: false,
+      code: "SQLITE_CAPABILITY_MISSING",
+      nodeVersion: "unknown",
+      checks: {},
+    });
+    assert.equal(JSON.stringify(status).includes("SECRET"), false);
   });
 
   it("reports blocked diagnostic candidates without authorizing content", () => {
