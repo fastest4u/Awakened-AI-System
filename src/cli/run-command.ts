@@ -177,12 +177,26 @@ export interface OrchestratorIntegrityRecorder {
   record(context: ProjectContext, report: IntegrityReport): Promise<void>;
 }
 
+export interface OrchestratorWorkspaceAuthority {
+  descriptorPath: string;
+  projectId: ProjectBinding["projectId"];
+  vaultId: ProjectBinding["vaultId"];
+  storeId: ProjectBinding["storeId"];
+  workspaceId: ProjectBinding["workspaceId"];
+  storeRoute: ProjectStoreRoute;
+  workspace: WorkspaceSnapshot;
+}
+
 export interface OrchestratorAdminDependencies {
   runtimeProbe(): Promise<RuntimeCapabilityResult>;
   inspectInitialization(
     projectRoot: string,
     vaultRoot: string,
   ): Promise<ProjectInitializationInspection>;
+  inspectWorkspaceAuthority(
+    projectRoot: string,
+    vaultRoot: string,
+  ): Promise<OrchestratorWorkspaceAuthority>;
   bootstrap: ProjectStoreBootstrapService;
   bindingService: OrchestratorBindingService;
   executorFactory(context: ProjectContext): OrchestratorAdminExecutor;
@@ -521,13 +535,13 @@ function workspaceSnapshot(
   ) as ProjectBinding["workspaceId"];
   let derivedWorkspaceId: ProjectBinding["workspaceId"];
   try {
+    assertContainedPath(worktreeRoot, projectRoot);
     derivedWorkspaceId = deriveGitWorkspaceId(projectId, gitCommonDir, gitDir);
   } catch {
     throw new Error("ADMIN_SNAPSHOT_INVALID");
   }
   if (
-    !sameNativePath(worktreeRoot, projectRoot)
-    || !HEAD_COMMIT_PATTERN.test(headCommit)
+    !HEAD_COMMIT_PATTERN.test(headCommit)
     || (detached ? branchRef !== null : branchRef === null || !validBranchRef(branchRef))
     || workspaceId !== expectedWorkspaceId
     || workspaceId !== derivedWorkspaceId
@@ -643,6 +657,97 @@ function validatedBindingSnapshot(
     contextFingerprint,
     establishedAt: snapshotRfc3339(Reflect.get(binding, "establishedAt")),
   };
+}
+
+function workspaceAuthoritySnapshot(
+  value: unknown,
+  request: TrustedProjectBindingRequest,
+): OrchestratorWorkspaceAuthority {
+  const authority = snapshotExactRecord(value, [
+    "descriptorPath",
+    "projectId",
+    "vaultId",
+    "storeId",
+    "workspaceId",
+    "storeRoute",
+    "workspace",
+  ]);
+  const descriptorPath = snapshotCanonicalAbsolutePath(
+    Reflect.get(authority, "descriptorPath"),
+  );
+  const projectId = snapshotUuid(
+    Reflect.get(authority, "projectId"),
+  ) as ProjectBinding["projectId"];
+  const vaultId = snapshotUuid(
+    Reflect.get(authority, "vaultId"),
+  ) as ProjectBinding["vaultId"];
+  const storeId = snapshotUuid(
+    Reflect.get(authority, "storeId"),
+  ) as ProjectBinding["storeId"];
+  const workspaceId = snapshotString(
+    Reflect.get(authority, "workspaceId"),
+  ) as ProjectBinding["workspaceId"];
+  if (!sameNativePath(
+    descriptorPath,
+    join(request.vaultRoot, ".memory-mcp", "project-identity.json"),
+  )) {
+    throw new Error("ADMIN_SNAPSHOT_INVALID");
+  }
+  const workspace = workspaceSnapshot(
+    Reflect.get(authority, "workspace"),
+    projectId,
+    vaultId,
+    request.projectRoot,
+    workspaceId,
+  );
+  const storeRoute = routeSnapshot(Reflect.get(authority, "storeRoute"));
+  const expectedStoreRoot = workspace.kind === "git"
+    ? resolve(workspace.gitCommonDir, "project-memory", projectId, "v2")
+    : resolve(request.vaultRoot, ".memory-mcp", "v2");
+  if (
+    storeRoute.kind !== (workspace.kind === "git" ? "git-common" : "vault-local")
+    || !sameNativePath(storeRoute.storeRoot, expectedStoreRoot)
+  ) {
+    throw new Error("ADMIN_SNAPSHOT_INVALID");
+  }
+  return {
+    descriptorPath,
+    projectId,
+    vaultId,
+    storeId,
+    workspaceId,
+    storeRoute,
+    workspace,
+  };
+}
+
+function assertObservedWorkspaceAuthority(
+  binding: ProjectBinding,
+  observed: OrchestratorWorkspaceAuthority,
+): void {
+  if (
+    binding.projectId !== observed.projectId
+    || binding.vaultId !== observed.vaultId
+    || binding.storeId !== observed.storeId
+    || binding.workspaceId !== observed.workspaceId
+    || !sameNativePath(binding.descriptorPath, observed.descriptorPath)
+    || canonicalJson(binding.storeRoute) !== canonicalJson(observed.storeRoute)
+    || canonicalJson(binding.workspace) !== canonicalJson(observed.workspace)
+  ) {
+    throw new Error("ADMIN_SNAPSHOT_INVALID");
+  }
+}
+
+async function verifyObservedWorkspaceAuthority(
+  binding: ProjectBinding,
+  request: TrustedProjectBindingRequest,
+  dependencies: OrchestratorAdminDependencies,
+): Promise<void> {
+  const observed = workspaceAuthoritySnapshot(
+    await dependencies.inspectWorkspaceAuthority(request.projectRoot, request.vaultRoot),
+    request,
+  );
+  assertObservedWorkspaceAuthority(binding, observed);
 }
 
 function validatedContextSnapshot(
@@ -1242,6 +1347,7 @@ export async function runCliCommand(
       const bootstrapResolution = await dependencies.bindingService.establish(request);
       if (!bootstrapResolution.ok) throw bindingFailure(bootstrapResolution);
       const established = validatedBindingSnapshot(bootstrapResolution.binding, request);
+      await verifyObservedWorkspaceAuthority(established, request, dependencies);
       const context = validatedContextSnapshot(
         await dependencies.bindingService.revalidate(established),
         established,
@@ -1255,6 +1361,7 @@ export async function runCliCommand(
     const resolution = await dependencies.bindingService.establish(request);
     if (!resolution.ok) throw bindingFailure(resolution);
     const established = validatedBindingSnapshot(resolution.binding, request);
+    await verifyObservedWorkspaceAuthority(established, request, dependencies);
 
     if (options.command === "orchestrator-status") {
       writeJson(io.stdout, statusSnapshot(established, runtime, request));
@@ -1649,6 +1756,42 @@ export function createProjectInitializationInspector(
   };
 }
 
+function createWorkspaceAuthorityInspector(dependencies: {
+  descriptorRepository: ProjectDescriptorRepository;
+  workspaceResolver: GitWorkspaceResolver;
+  router: ProjectStoreRouter;
+  manifestRepository: StoreManifestRepository;
+}): (
+  projectRoot: string,
+  vaultRoot: string,
+) => Promise<OrchestratorWorkspaceAuthority> {
+  return async (projectRoot, vaultRoot) => {
+    const descriptorInspection = dependencies.descriptorRepository.inspect(vaultRoot);
+    if (descriptorInspection.status !== "valid") {
+      throw new Error("ADMIN_SNAPSHOT_INVALID");
+    }
+    const descriptor = descriptorInspection.descriptor;
+    const workspace = dependencies.workspaceResolver.inspect(projectRoot, descriptor);
+    const storeRoute = dependencies.router.route(descriptor, vaultRoot, workspace);
+    const manifestInspection = dependencies.manifestRepository.inspect(storeRoute, {
+      projectId: descriptor.projectId,
+      vaultId: descriptor.vaultId,
+    });
+    if (manifestInspection.status !== "valid") {
+      throw new Error("ADMIN_SNAPSHOT_INVALID");
+    }
+    return {
+      descriptorPath: descriptorInspection.path,
+      projectId: descriptor.projectId,
+      vaultId: descriptor.vaultId,
+      storeId: manifestInspection.manifest.storeId,
+      workspaceId: workspace.workspaceId,
+      storeRoute,
+      workspace,
+    };
+  };
+}
+
 export function createOrchestratorAdminDependencies(
   workerUrl: URL,
 ): OrchestratorAdminDependencies {
@@ -1656,9 +1799,29 @@ export function createOrchestratorAdminDependencies(
     workerUrl,
     requestTimeoutMs: 10_000,
   });
-  const bindingService = new ProjectBindingService({ identityProbe });
-  const inspectInitialization = createProjectInitializationInspector(identityProbe);
-  const integrityManifestRepository = new StoreManifestRepository();
+  const descriptorRepository = new ProjectDescriptorRepository();
+  const workspaceResolver = new GitWorkspaceResolver(new SpawnSyncGitCommandRunner());
+  const router = new ProjectStoreRouter();
+  const manifestRepository = new StoreManifestRepository();
+  const bindingService = new ProjectBindingService({
+    identityProbe,
+    descriptorRepository,
+    workspaceResolver,
+    router,
+    manifestRepository,
+  });
+  const inspectInitialization = createProjectInitializationInspector(identityProbe, {
+    descriptorRepository,
+    workspaceResolver,
+    router,
+    manifestRepository,
+  });
+  const inspectWorkspaceAuthority = createWorkspaceAuthorityInspector({
+    descriptorRepository,
+    workspaceResolver,
+    router,
+    manifestRepository,
+  });
   return {
     async runtimeProbe() {
       const directory = mkdtempSync(join(tmpdir(), "memory-vault-runtime-"));
@@ -1669,6 +1832,7 @@ export function createOrchestratorAdminDependencies(
       }
     },
     inspectInitialization,
+    inspectWorkspaceAuthority,
     bootstrap: {
       async initialize(input) {
         const { DefaultProjectStoreBootstrapService } = await import(
@@ -1691,7 +1855,7 @@ export function createOrchestratorAdminDependencies(
     },
     integrityRecorder: {
       async record(context, report) {
-        integrityManifestRepository.recordIntegrity(context.binding.storeRoute, {
+        manifestRepository.recordIntegrity(context.binding.storeRoute, {
           projectId: context.binding.projectId,
           vaultId: context.binding.vaultId,
           storeId: context.binding.storeId,
