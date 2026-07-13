@@ -27,6 +27,7 @@ import {
   type ProjectBindingServiceDependencies,
   type ProjectStoreIdentityProbe,
 } from "../src/orchestrator/identity/project-binding.service.js";
+import { canonicalJson } from "../src/orchestrator/serialization/canonical-json.js";
 import type { StoreManifestV1 } from "../src/orchestrator/identity/store-manifest.schema.js";
 import {
   ProjectStatusService,
@@ -1231,22 +1232,81 @@ describe("computeProjectContextFingerprint", () => {
     };
     const expectedMaterial = {
       generation: 1,
+      source: "explicit-cli",
       projectId: PROJECT_ID,
       vaultId: VAULT_ID,
       storeId: STORE_ID,
       workspaceId: workspace.workspaceId,
       projectRoot: item.projectRoot,
       vaultRoot: item.vaultRoot,
-      eventsPath: item.state.route.eventsPath,
+      descriptorPath: join(item.vaultRoot, ".memory-mcp", "project-identity.json"),
+      storeRoute: item.state.route,
+      workspace,
       clientNamespace: "codex",
       clientInstanceId: "client-1",
       actorRole: "primary",
     };
-    const canonical = JSON.stringify(expectedMaterial, Object.keys(expectedMaterial).sort());
+    const canonical = canonicalJson(expectedMaterial);
     const expected = createHash("sha256")
       .update(`project-memory/project-context/v1\n${canonical}`, "utf8")
       .digest("hex");
 
     assert.equal(computeProjectContextFingerprint(input), expected);
+  });
+
+  it("binds every authority-bearing route, workspace, source, and descriptor field", () => {
+    const item = fixture();
+    const gitCommonDir = resolve(item.root, "repo", ".git");
+    const gitDir = resolve(gitCommonDir, "worktrees", "bound");
+    const workspace: GitWorkspaceSnapshot = {
+      kind: "git",
+      worktreeRoot: item.projectRoot,
+      gitDir,
+      gitCommonDir,
+      headCommit: "a".repeat(40),
+      branchRef: "refs/heads/main",
+      detached: false,
+      workspaceId: deriveGitWorkspaceId(PROJECT_ID, gitCommonDir, gitDir),
+    };
+    const storeRoot = resolve(gitCommonDir, "project-memory", PROJECT_ID, "v2");
+    const input: Omit<ProjectBinding, "contextFingerprint" | "projectBindingId" | "establishedAt"> = {
+      generation: 1,
+      source: "explicit-cli",
+      projectId: PROJECT_ID,
+      vaultId: VAULT_ID,
+      storeId: STORE_ID,
+      workspaceId: workspace.workspaceId,
+      clientNamespace: "codex",
+      clientInstanceId: "client-1",
+      actorRole: "primary",
+      projectRoot: item.projectRoot,
+      vaultRoot: item.vaultRoot,
+      descriptorPath: join(item.vaultRoot, ".memory-mcp", "project-identity.json"),
+      storeRoute: {
+        kind: "git-common",
+        storeRoot,
+        eventsPath: join(storeRoot, "events.sqlite"),
+        storeManifestPath: join(storeRoot, "store-manifest.json"),
+        projectionManifestPath: join(storeRoot, "current-projection.json"),
+      },
+      workspace,
+    };
+    const fingerprint = computeProjectContextFingerprint(input);
+    const variants = [
+      { ...input, source: "mcp-roots" as const },
+      { ...input, descriptorPath: `${input.descriptorPath}.other` },
+      {
+        ...input,
+        storeRoute: {
+          ...input.storeRoute,
+          projectionManifestPath: `${input.storeRoute.projectionManifestPath}.other`,
+        },
+      },
+      { ...input, workspace: { ...workspace, headCommit: "b".repeat(40) } },
+      { ...input, workspace: { ...workspace, branchRef: "refs/heads/other" } },
+    ];
+    for (const variant of variants) {
+      assert.notEqual(computeProjectContextFingerprint(variant), fingerprint);
+    }
   });
 });

@@ -496,13 +496,16 @@ export function computeProjectContextFingerprint(
 ): string {
   const material = {
     generation: binding.generation,
+    source: binding.source,
     projectId: binding.projectId,
     vaultId: binding.vaultId,
     storeId: binding.storeId,
     workspaceId: binding.workspaceId,
     projectRoot: binding.projectRoot,
     vaultRoot: binding.vaultRoot,
-    eventsPath: binding.storeRoute.eventsPath,
+    descriptorPath: binding.descriptorPath,
+    storeRoute: binding.storeRoute,
+    workspace: binding.workspace,
     clientNamespace: binding.clientNamespace,
     clientInstanceId: binding.clientInstanceId,
     actorRole: binding.actorRole,

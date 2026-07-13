@@ -8,6 +8,10 @@ export interface MaintenanceLease {
   leaseExpiresAt: string;
 }
 
+export type ExecutorHeartbeatResult =
+  | { mode: "idle"; renewed: true }
+  | { mode: "quiescing"; lease: MaintenanceLease };
+
 export class MaintenanceFenceError extends Error {
   constructor(
     readonly code: string,
@@ -323,6 +327,59 @@ export class MaintenanceFence {
     if (changed !== 1n) fail("EXECUTOR_LEASE_NOT_ACTIVE");
   }
 
+  /**
+   * Performs the worker heartbeat decision in one short write transaction.
+   * An idle store renews the executor lease. A quiescing store is observed
+   * without renewal and returns the exact maintenance lease that the worker
+   * must acknowledge after draining its accepted FIFO.
+   */
+  heartbeatExecutor(
+    connection: SqliteConnection,
+    projectId: ProjectId,
+    executorId: string,
+    leaseExpiresAt: string,
+    now: string,
+  ): ExecutorHeartbeatResult {
+    connection.exec("BEGIN IMMEDIATE");
+    try {
+      const state = readState(connection);
+      let result: ExecutorHeartbeatResult;
+      if (state.mode === "idle") {
+        this.renewExecutor(
+          connection,
+          projectId,
+          executorId,
+          leaseExpiresAt,
+          now,
+        );
+        result = { mode: "idle", renewed: true };
+      } else {
+        if (
+          state.ownerId === null
+          || state.leaseExpiresAt === null
+          || state.epoch < 1n
+          || state.fencingToken < 1n
+        ) {
+          fail("MAINTENANCE_STATE_INVALID");
+        }
+        result = {
+          mode: "quiescing",
+          lease: {
+            epoch: state.epoch,
+            fencingToken: state.fencingToken,
+            ownerId: state.ownerId,
+            leaseExpiresAt: state.leaseExpiresAt,
+          },
+        };
+      }
+      connection.exec("COMMIT");
+      return result;
+    } catch (error) {
+      try { connection.exec("ROLLBACK"); } catch { /* preserve heartbeat failure */ }
+      throw error;
+    }
+  }
+
   closeExecutor(
     connection: SqliteConnection,
     projectId: ProjectId,
@@ -495,9 +552,15 @@ export class MaintenanceFence {
         ON acknowledged.epoch = required.epoch
        AND acknowledged.executor_id = required.executor_id
        AND acknowledged.fencing_token = required.fencing_token
+      LEFT JOIN executor_leases AS executor
+        ON executor.executor_id = required.executor_id
       WHERE required.epoch = $epoch
         AND required.fencing_token = $fencingToken
-        AND acknowledged.executor_id IS NULL
+        AND (
+          acknowledged.executor_id IS NULL
+          OR executor.executor_id IS NULL
+          OR executor.closed_at IS NULL
+        )
     `).get({
       $epoch: lease.epoch,
       $fencingToken: lease.fencingToken,

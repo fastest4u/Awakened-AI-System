@@ -23,6 +23,7 @@
     "typecheck": "tsc --noEmit",
     "lint": "tsc --noEmit",
     "test:build": "tsc -p tsconfig.test.json",
+    "test:build-artifacts": "npm run build && node scripts/smoke-worker.js",
     "test": "npm run test:build && node --test --test-reporter=spec \"dist-test/tests/**/*.test.js\""
   },
   "dependencies": {

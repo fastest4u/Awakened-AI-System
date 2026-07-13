@@ -258,7 +258,7 @@ describe("MaintenanceFence", () => {
     );
   });
 
-  it("accepts acknowledgements only from the immutable snapshot and exact fencing token", () => {
+  it("accepts acknowledgements only from the immutable snapshot and exact fencing token after executor close", () => {
     const connection = createConnection();
     const fence = new MaintenanceFence();
     transaction(connection, () => fence.registerExecutor(
@@ -307,6 +307,13 @@ describe("MaintenanceFence", () => {
       lease,
       "executor-a",
       "2026-07-13T01:06:00Z",
+    ));
+    assert.equal(fence.allRequiredExecutorsAcknowledged(connection, lease), false);
+    transaction(connection, () => fence.closeExecutor(
+      connection,
+      PROJECT_ID,
+      "executor-a",
+      "2026-07-13T01:07:00Z",
     ));
     assert.equal(fence.allRequiredExecutorsAcknowledged(connection, lease), true);
     transaction(connection, () => fence.release(
