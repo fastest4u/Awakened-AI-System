@@ -33,6 +33,25 @@ export const MAX_EVENTS_PER_COMMAND = 128;
 export const MAX_CANONICAL_COMMAND_BYTES = 4 * 1024 * 1024;
 export const GENESIS_GLOBAL_HASH = "0".repeat(64);
 
+export type EventStoreFaultBoundary =
+  | "before-begin"
+  | "after-first-insert-before-commit"
+  | "after-commit-before-response";
+
+export interface EventStoreFaultContext {
+  projectId: string;
+  commandId: string;
+  idempotencyKey: string;
+}
+
+export interface EventStoreFaultInjector {
+  hit(boundary: EventStoreFaultBoundary, context: EventStoreFaultContext): void;
+}
+
+export const NO_EVENT_STORE_FAULTS: EventStoreFaultInjector = {
+  hit: () => undefined,
+};
+
 const SQLITE_INT64_MAX = 9_223_372_036_854_775_807n;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const RFC3339 = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,9}))?(Z|([+-])(\d{2}):(\d{2}))$/;
@@ -870,6 +889,7 @@ export class EventStore {
     private readonly branchScopes: BranchScopeRepository,
     private readonly now: () => string = () => new Date().toISOString(),
     private readonly randomId: () => string = randomUUID,
+    private readonly faultInjector: EventStoreFaultInjector = NO_EVENT_STORE_FAULTS,
   ) {}
 
   append<TResponse extends JsonValue>(
@@ -890,8 +910,14 @@ export class EventStore {
       throw new EventStoreError("PROJECT_IDENTITY_MISMATCH");
     }
     const computedCommandHash = commandHash(validated.hashMaterial);
+    const faultContext: EventStoreFaultContext = {
+      projectId: command.context.binding.projectId,
+      commandId: command.commandId,
+      idempotencyKey: command.idempotencyKey,
+    };
     let transactionBegan = false;
     try {
+      this.faultInjector.hit("before-begin", faultContext);
       this.connection.exec("BEGIN IMMEDIATE");
       transactionBegan = true;
       const prior = this.statements.findDedup(
@@ -966,8 +992,11 @@ export class EventStore {
         tail,
         branchScopeId,
       );
-      for (const storedEvent of storedEvents) {
+      for (const [index, storedEvent] of storedEvents.entries()) {
         this.statements.insertEvent(storedEvent);
+        if (index === 0) {
+          this.faultInjector.hit("after-first-insert-before-commit", faultContext);
+        }
       }
       const nextVersion = currentVersion + BigInt(storedEvents.length);
       const changes = this.statements.compareAndSwapStream(
@@ -1001,6 +1030,7 @@ export class EventStore {
       );
       this.connection.exec("COMMIT");
       transactionBegan = false;
+      this.faultInjector.hit("after-commit-before-response", faultContext);
       return decodeStoredResponse<TResponse>(
         canonical(storedResponse),
         computedResponseHash,
