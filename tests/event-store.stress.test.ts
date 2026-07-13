@@ -29,8 +29,10 @@ const PROCESS_COUNT = 16;
 const COMMANDS_PER_PROCESS = 250;
 const EVENTS_PER_SEED = PROCESS_COUNT * COMMANDS_PER_PROCESS;
 const BARRIER_TIMEOUT_MS = 60_000;
+const CLEANUP_TIMEOUT_MS = 30_000;
 const roots = new Set<string>();
 const activeClients = new Set<FixtureClient>();
+const unreleasedClients = new Set<FixtureClient>();
 
 type FixtureStartAction =
   | { kind: "initialize"; request: TrustedProjectBindingRequest; replicaDecision?: "initialize-local" }
@@ -83,6 +85,7 @@ class FixtureClient {
   readonly #shutdownEvents: string[] = [];
   #resolveDisconnect!: () => void;
   #resolveExit!: (exit: FixtureExit) => void;
+  #disconnected = false;
   #exit: FixtureExit | undefined;
   #killRequested = false;
 
@@ -95,9 +98,11 @@ class FixtureClient {
     this.#disconnectPromise = new Promise<void>((resolve) => { this.#resolveDisconnect = resolve; });
     this.#exitPromise = new Promise<FixtureExit>((resolve) => { this.#resolveExit = resolve; });
     activeClients.add(this);
+    unreleasedClients.add(this);
     this.child.stderr?.on("data", (chunk: Buffer | string) => this.stderr.push(String(chunk)));
     this.child.on("message", (message: unknown) => this.push(message as ChildMessage));
     this.child.on("disconnect", () => {
+      this.#disconnected = true;
       this.#shutdownEvents.push("disconnect");
       this.#resolveDisconnect();
     });
@@ -112,6 +117,10 @@ class FixtureClient {
         waiter.reject(error);
       }
     });
+  }
+
+  get label(): string {
+    return this.#label;
   }
 
   async ready(): Promise<void> {
@@ -145,39 +154,85 @@ class FixtureClient {
   }
 
   async close(): Promise<void> {
-    if (this.#exit !== undefined) throw this.failure("exited before cooperative close");
-    let watchdog!: NodeJS.Timeout;
-    const barrier = (async () => {
-      this.send({ type: "close" });
-      const message = await this.waitFor((candidate) => candidate.type === "closed", "closed", false);
-      assert.equal(message.type, "closed");
-      await this.#disconnectPromise;
-      const exit = await this.#exitPromise;
-      assert.deepEqual(exit, { code: 0, signal: null }, this.#label);
-      assert.deepEqual(this.#shutdownEvents.slice(-3), ["closed", "disconnect", "exit"], this.#label);
-      assert.equal(this.child.connected, false, this.#label);
-      assert.equal(this.child.exitCode, 0, this.#label);
-    })();
-    const timeout = new Promise<never>((_resolve, reject) => {
-      watchdog = setTimeout(() => reject(this.failure("cooperative shutdown timed out")), BARRIER_TIMEOUT_MS);
-    });
-    try {
-      await Promise.race([barrier, timeout]);
-    } catch (error) {
-      if (this.#exit === undefined) await this.forceCleanup();
-      throw error;
-    } finally {
-      clearTimeout(watchdog);
+    const failures: unknown[] = [];
+    if (this.#exit !== undefined) {
+      failures.push(this.failure("exited before cooperative close"));
+    } else {
+      let watchdog!: NodeJS.Timeout;
+      const barrier = (async () => {
+        this.send({ type: "close" });
+        const message = await this.waitFor((candidate) => candidate.type === "closed", "closed", false);
+        assert.equal(message.type, "closed");
+        await this.#disconnectPromise;
+        const exit = await this.#exitPromise;
+        assert.deepEqual(exit, { code: 0, signal: null }, this.#label);
+        assert.deepEqual(this.#shutdownEvents.slice(-3), ["closed", "disconnect", "exit"], this.#label);
+        assert.equal(this.#disconnected, true, this.#label);
+        assert.equal(this.child.connected, false, this.#label);
+        assert.equal(this.child.exitCode, 0, this.#label);
+      })();
+      const timeout = new Promise<never>((_resolve, reject) => {
+        watchdog = setTimeout(() => reject(this.failure("cooperative shutdown timed out")), BARRIER_TIMEOUT_MS);
+      });
+      try {
+        await Promise.race([barrier, timeout]);
+        unreleasedClients.delete(this);
+        return;
+      } catch (error) {
+        failures.push(error);
+      } finally {
+        clearTimeout(watchdog);
+      }
     }
+
+    try {
+      await this.forceCleanup();
+    } catch (error) {
+      failures.push(error);
+    }
+    throw new AggregateError(failures, `${this.#label} cooperative shutdown failed`);
   }
 
   async forceCleanup(): Promise<FixtureExit> {
-    if (this.#exit !== undefined) return this.#exit;
-    if (!this.#killRequested) {
+    const failures: unknown[] = [];
+    let killDelivered: boolean | undefined;
+    if (this.#exit === undefined && !this.#killRequested) {
       this.#killRequested = true;
-      this.child.kill();
+      try {
+        killDelivered = this.child.kill();
+      } catch (error) {
+        failures.push(new Error(`${this.#label} forced cleanup kill threw`, { cause: error }));
+      }
     }
-    return this.#exitPromise;
+
+    const [disconnectResult, exitResult] = await Promise.allSettled([
+      this.boundedCleanupBarrier(this.#disconnectPromise, "disconnect"),
+      this.boundedCleanupBarrier(this.#exitPromise, "exit"),
+    ]);
+    if (disconnectResult.status === "rejected") failures.push(disconnectResult.reason);
+    if (exitResult.status === "rejected") failures.push(exitResult.reason);
+    if (killDelivered === false && exitResult.status === "rejected") {
+      failures.push(this.failure("forced cleanup kill was not delivered"));
+    }
+    if (killDelivered === true && !this.child.killed) {
+      failures.push(this.failure("forced cleanup kill delivery was not recorded"));
+    }
+    if (disconnectResult.status === "fulfilled") {
+      if (!this.#disconnected) failures.push(this.failure("forced cleanup disconnect barrier was inconsistent"));
+      if (this.child.connected) failures.push(this.failure("forced cleanup left IPC connected"));
+    }
+    if (exitResult.status === "fulfilled") {
+      if (this.#exit === undefined) failures.push(this.failure("forced cleanup exit barrier was inconsistent"));
+      else if (this.#exit !== exitResult.value) {
+        failures.push(this.failure("forced cleanup exit result did not match the observed exit"));
+      }
+    }
+    if (failures.length > 0) {
+      throw new AggregateError(failures, `${this.#label} forced cleanup failed`);
+    }
+    assert.equal(exitResult.status, "fulfilled");
+    unreleasedClients.delete(this);
+    return exitResult.value;
   }
 
   private send(message: ParentMessage): void {
@@ -218,6 +273,21 @@ class FixtureClient {
     waiter!.resolve(message);
   }
 
+  private boundedCleanupBarrier<T>(promise: Promise<T>, label: "disconnect" | "exit"): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+      const watchdog = setTimeout(() => {
+        reject(this.failure(`forced cleanup ${label} barrier timed out`));
+      }, CLEANUP_TIMEOUT_MS);
+      promise.then((value) => {
+        clearTimeout(watchdog);
+        resolve(value);
+      }, (error: unknown) => {
+        clearTimeout(watchdog);
+        reject(error);
+      });
+    });
+  }
+
   private failure(message: string): Error {
     return new Error(`${this.#label} ${message}\n${this.stderr.join("")}`);
   }
@@ -249,6 +319,18 @@ interface StressProject {
 interface Writer {
   worker: number;
   client: FixtureClient;
+}
+
+interface ExpectedEffect {
+  commandId: string;
+  idempotencyKey: string;
+  streamId: string;
+  streamVersion: number;
+  payload: unknown;
+  publicResponse: unknown;
+  clientInstanceId: string;
+  eventId?: string;
+  globalPosition?: number;
 }
 
 function shuffle<T>(values: readonly T[], prng: DeterministicPrng): T[] {
@@ -365,6 +447,11 @@ function count(database: DatabaseSync, sql: string): number {
   return Number(value);
 }
 
+function parseStoredJson(value: unknown, label: string): unknown {
+  if (typeof value !== "string") assert.fail(`${label} must be JSON text`);
+  return JSON.parse(value) as unknown;
+}
+
 function proveHandleRelease(path: string): string[] {
   const renamed: string[] = [];
   for (const candidate of [path, `${path}-wal`, `${path}-shm`]) {
@@ -383,8 +470,7 @@ function inspectStore(
   project: StressProject,
   route: ProjectStoreRouteWire,
   context: ProjectContext,
-  expectedCommandIds: ReadonlySet<string>,
-  expectedIdempotencyKeys: ReadonlySet<string>,
+  expectedEffects: ReadonlyMap<string, ExpectedEffect>,
   returnedEventIds: ReadonlySet<string>,
   returnedPositions: ReadonlySet<number>,
 ): string {
@@ -436,6 +522,94 @@ function inspectStore(
       WHERE commands.first_global_position = commands.last_global_position
     `), EVENTS_PER_SEED);
 
+    const joinedEffectRows = database.prepare(`
+      SELECT effects.command_id AS commandId,
+             effects.idempotency_key AS eventIdempotencyKey,
+             commands.idempotency_key AS commandIdempotencyKey,
+             effects.stream_id AS streamId,
+             effects.stream_version AS streamVersion,
+             effects.payload_json AS payloadJson,
+             effects.client_instance_id AS clientInstanceId,
+             effects.event_id AS eventId,
+             effects.global_position AS globalPosition,
+             commands.first_global_position AS commandFirstGlobalPosition,
+             commands.last_global_position AS commandLastGlobalPosition,
+             commands.final_stream_version AS commandFinalStreamVersion,
+             commands.event_ids_json AS commandEventIdsJson,
+             commands.response_json AS responseJson
+      FROM events AS effects
+      JOIN command_dedup AS commands
+        ON commands.project_id = effects.project_id
+       AND commands.command_id = effects.command_id
+      ORDER BY effects.command_id
+    `).all();
+    const storedEffects = new Map<string, Record<string, unknown>>();
+    for (const row of joinedEffectRows) {
+      const commandId = String(row.commandId);
+      assert.equal(storedEffects.has(commandId), false, `seed ${seed} duplicate joined effect ${commandId}`);
+      const payload = parseStoredJson(row.payloadJson, `seed ${seed} ${commandId} payload`);
+      const commandEventIds = parseStoredJson(
+        row.commandEventIdsJson,
+        `seed ${seed} ${commandId} command event IDs`,
+      );
+      const storedResponse = parseStoredJson(row.responseJson, `seed ${seed} ${commandId} response`);
+      assert.ok(
+        typeof storedResponse === "object" && storedResponse !== null && !Array.isArray(storedResponse),
+        `seed ${seed} ${commandId} stored response object`,
+      );
+      const response = storedResponse as Record<string, unknown>;
+      storedEffects.set(commandId, {
+        commandId,
+        eventIdempotencyKey: String(row.eventIdempotencyKey),
+        commandIdempotencyKey: String(row.commandIdempotencyKey),
+        streamId: String(row.streamId),
+        streamVersion: Number(row.streamVersion),
+        payload,
+        publicResponse: response.response,
+        clientInstanceId: String(row.clientInstanceId),
+        eventId: String(row.eventId),
+        globalPosition: Number(row.globalPosition),
+        commandFirstGlobalPosition: Number(row.commandFirstGlobalPosition),
+        commandLastGlobalPosition: Number(row.commandLastGlobalPosition),
+        commandFinalStreamVersion: Number(row.commandFinalStreamVersion),
+        commandEventIds,
+        responseEventIds: response.eventIds,
+        responseFirstGlobalPosition: response.firstGlobalPosition,
+        responseLastGlobalPosition: response.lastGlobalPosition,
+        responseFinalStreamVersion: response.finalStreamVersion,
+      });
+    }
+    const expectedEffectIds = [...expectedEffects.keys()].sort();
+    assert.deepEqual([...storedEffects.keys()].sort(), expectedEffectIds, `seed ${seed} exact effect keys`);
+    for (const commandId of expectedEffectIds) {
+      const expected = expectedEffects.get(commandId);
+      const stored = storedEffects.get(commandId);
+      assert.ok(expected, `seed ${seed} expected effect ${commandId}`);
+      assert.ok(stored, `seed ${seed} stored effect ${commandId}`);
+      assert.notEqual(expected.eventId, undefined, `seed ${seed} ${commandId} returned event association`);
+      assert.notEqual(expected.globalPosition, undefined, `seed ${seed} ${commandId} returned position association`);
+      assert.deepEqual(stored, {
+        commandId,
+        eventIdempotencyKey: expected.idempotencyKey,
+        commandIdempotencyKey: expected.idempotencyKey,
+        streamId: expected.streamId,
+        streamVersion: expected.streamVersion,
+        payload: expected.payload,
+        publicResponse: expected.publicResponse,
+        clientInstanceId: expected.clientInstanceId,
+        eventId: expected.eventId,
+        globalPosition: expected.globalPosition,
+        commandFirstGlobalPosition: expected.globalPosition,
+        commandLastGlobalPosition: expected.globalPosition,
+        commandFinalStreamVersion: expected.streamVersion,
+        commandEventIds: [expected.eventId],
+        responseEventIds: [expected.eventId],
+        responseFirstGlobalPosition: String(expected.globalPosition),
+        responseLastGlobalPosition: String(expected.globalPosition),
+        responseFinalStreamVersion: String(expected.streamVersion),
+      }, `seed ${seed} exact effect ${commandId}`);
+    }
+
     const positions = database.prepare(
       "SELECT global_position AS position FROM events ORDER BY global_position",
     ).all().map((row) => Number(row.position));
@@ -478,18 +652,9 @@ function inspectStore(
       );
     }
 
-    const storedCommandIds = database.prepare(
-      "SELECT command_id AS commandId FROM command_dedup ORDER BY command_id",
-    ).all().map((row) => String(row.commandId));
-    const storedIdempotencyKeys = database.prepare(
-      "SELECT idempotency_key AS idempotencyKey FROM command_dedup ORDER BY idempotency_key",
-    ).all().map((row) => String(row.idempotencyKey));
     const storedEventIds = database.prepare(
       "SELECT event_id AS eventId FROM events ORDER BY event_id",
     ).all().map((row) => String(row.eventId));
-    assert.deepEqual(storedCommandIds, [...expectedCommandIds].sort(), `seed ${seed} command effects`);
-    assert.deepEqual(storedIdempotencyKeys, [...expectedIdempotencyKeys].sort(),
-      `seed ${seed} idempotency effects`);
     assert.deepEqual(storedEventIds, [...returnedEventIds].sort(), `seed ${seed} event effects`);
 
     const eventIdentities = database.prepare(`
@@ -554,17 +719,27 @@ async function runSeed(seed: number): Promise<void> {
     }
 
     const commands = new Map<number, AppendCommandWire[]>();
-    const expectedCommandIds = new Set<string>();
+    const expectedEffects = new Map<string, ExpectedEffect>();
     const expectedIdempotencyKeys = new Set<string>();
     for (let worker = 0; worker < PROCESS_COUNT; worker += 1) {
       const workerCommands: AppendCommandWire[] = [];
       for (let sequence = 0; sequence < COMMANDS_PER_PROCESS; sequence += 1) {
         const command = appendCommand(seed, worker, sequence, prng.nextUint32());
         workerCommands.push(command);
-        assert.equal(expectedCommandIds.has(command.commandId), false, `seed ${seed} command ID collision`);
+        assert.equal(expectedEffects.has(command.commandId), false, `seed ${seed} command ID collision`);
         assert.equal(expectedIdempotencyKeys.has(command.idempotencyKey), false,
           `seed ${seed} idempotency collision`);
-        expectedCommandIds.add(command.commandId);
+        const event = command.events[0];
+        assert.ok(event, `seed ${seed} worker ${worker} sequence ${sequence} event`);
+        expectedEffects.set(command.commandId, {
+          commandId: command.commandId,
+          idempotencyKey: command.idempotencyKey,
+          streamId: command.streamId,
+          streamVersion: sequence + 1,
+          payload: event.payload,
+          publicResponse: command.publicResponse,
+          clientInstanceId: `stress-${seed}-${worker}`,
+        });
         expectedIdempotencyKeys.add(command.idempotencyKey);
       }
       commands.set(worker, workerCommands);
@@ -597,8 +772,14 @@ async function runSeed(seed: number): Promise<void> {
         assert.deepEqual(result.result.response, command.publicResponse, `seed ${seed} ${command.commandId} response`);
         const eventId = result.result.eventIds[0]!;
         const position = Number(result.result.firstGlobalPosition);
+        const expectedEffect = expectedEffects.get(command.commandId);
+        assert.ok(expectedEffect, `seed ${seed} ${command.commandId} expected effect`);
+        assert.equal(expectedEffect.eventId, undefined, `seed ${seed} duplicate result ${command.commandId}`);
+        assert.equal(expectedEffect.globalPosition, undefined, `seed ${seed} duplicate position result ${command.commandId}`);
         assert.equal(returnedEventIds.has(eventId), false, `seed ${seed} duplicate event ${eventId}`);
         assert.equal(returnedPositions.has(position), false, `seed ${seed} duplicate position ${position}`);
+        expectedEffect.eventId = eventId;
+        expectedEffect.globalPosition = position;
         returnedEventIds.add(eventId);
         returnedPositions.add(position);
       }
@@ -608,6 +789,7 @@ async function runSeed(seed: number): Promise<void> {
 
     await closeAll(writers.map(({ client }) => client));
     assert.equal(activeClients.size, 0, `seed ${seed} fixture processes must all exit`);
+    assert.equal(unreleasedClients.size, 0, `seed ${seed} fixture clients must all release`);
     const context = await contextFor(project.request);
     const report = await fullIntegrity(context);
     const terminalHash = inspectStore(
@@ -615,8 +797,7 @@ async function runSeed(seed: number): Promise<void> {
       project,
       route,
       context,
-      expectedCommandIds,
-      expectedIdempotencyKeys,
+      expectedEffects,
       returnedEventIds,
       returnedPositions,
     );
@@ -664,19 +845,35 @@ async function runSeed(seed: number): Promise<void> {
 
 afterEach(async () => {
   const failures: unknown[] = [];
-  const leaked = [...activeClients];
-  if (leaked.length > 0) failures.push(new Error(`unexpected active stress fixture clients: ${leaked.length}`));
-  const cleanup = await Promise.allSettled(leaked.map(async (client) => client.forceCleanup()));
-  for (const result of cleanup) {
-    if (result.status === "rejected") failures.push(result.reason);
+  const cleanupTargets = [...unreleasedClients].sort((left, right) => left.label.localeCompare(right.label));
+  if (cleanupTargets.length > 0) {
+    failures.push(new Error(`unexpected unreleased stress fixture clients: ${cleanupTargets.length}`));
   }
-  if (activeClients.size > 0) failures.push(new Error(`stress fixture clients remained active: ${activeClients.size}`));
-  for (const root of [...roots]) {
+  const cleanupFailures = await Promise.all(cleanupTargets.map(async (client) => {
+    try {
+      await client.forceCleanup();
+      return undefined;
+    } catch (error) {
+      return new Error(`${client.label} afterEach cleanup failed`, { cause: error });
+    }
+  }));
+  for (const failure of cleanupFailures) {
+    if (failure !== undefined) failures.push(failure);
+  }
+  const activeLeaks = [...activeClients].map((client) => client.label).sort();
+  if (activeLeaks.length > 0) {
+    failures.push(new Error(`stress fixture processes remained active: ${activeLeaks.join(", ")}`));
+  }
+  const unreleasedLeaks = [...unreleasedClients].map((client) => client.label).sort();
+  if (unreleasedLeaks.length > 0) {
+    failures.push(new Error(`stress fixture clients remained unreleased: ${unreleasedLeaks.join(", ")}`));
+  }
+  for (const root of [...roots].sort()) {
     try {
       rmSync(root, { recursive: true });
       roots.delete(root);
     } catch (error) {
-      failures.push(error);
+      failures.push(new Error(`stress root cleanup failed: ${root}`, { cause: error }));
     }
   }
   if (failures.length > 0) throw new AggregateError(failures, "stress cleanup invariant failed");
