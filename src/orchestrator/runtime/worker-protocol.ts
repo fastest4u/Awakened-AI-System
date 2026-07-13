@@ -294,6 +294,8 @@ export interface WorkerNotification {
   executorId: string;
   epoch: string;
   fencingToken: string;
+  ownerId: string;
+  leaseExpiresAt: string;
   connectionClosed: true;
 }
 
@@ -842,16 +844,23 @@ export function decodeWorkerResponseForRequest(
 
 export function decodeWorkerNotification(value: unknown): WorkerNotification {
   const notification = exact(value, [
-    "type", "executorId", "epoch", "fencingToken", "connectionClosed",
+    "type", "executorId", "epoch", "fencingToken", "ownerId", "leaseExpiresAt",
+    "connectionClosed",
   ]);
   if (notification.type !== "quiesced" || notification.connectionClosed !== true) invalid();
-  decimal(notification.epoch, 1n);
-  decimal(notification.fencingToken, 1n);
+  decodeMaintenanceLeaseWire({
+    epoch: notification.epoch,
+    fencingToken: notification.fencingToken,
+    ownerId: notification.ownerId,
+    leaseExpiresAt: notification.leaseExpiresAt,
+  });
   return {
     type: "quiesced",
     executorId: string(notification.executorId),
     epoch: notification.epoch as string,
     fencingToken: notification.fencingToken as string,
+    ownerId: notification.ownerId as string,
+    leaseExpiresAt: notification.leaseExpiresAt as string,
     connectionClosed: true,
   };
 }

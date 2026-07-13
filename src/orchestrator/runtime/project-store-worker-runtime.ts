@@ -154,6 +154,8 @@ export class ProjectStoreWorkerRuntime {
           executorId: closed.executorId,
           epoch: closed.epoch,
           fencingToken: closed.fencingToken,
+          ownerId: request.lease.ownerId,
+          leaseExpiresAt: request.lease.leaseExpiresAt,
           connectionClosed: true,
         });
       } catch (error) {
@@ -217,6 +219,8 @@ export class ProjectStoreWorkerRuntime {
           executorId: closed.executorId,
           epoch: closed.epoch,
           fencingToken: closed.fencingToken,
+          ownerId: lease.ownerId,
+          leaseExpiresAt: lease.leaseExpiresAt,
           connectionClosed: true,
         });
       } finally {

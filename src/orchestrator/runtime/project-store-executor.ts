@@ -7,12 +7,13 @@ import type {
   AppendResult,
   JsonValue,
 } from "../contracts/event.js";
-import type { ProjectContext } from "../identity/contracts.js";
+import type { ProjectContext, ProjectId } from "../identity/contracts.js";
 import type { IntegrityReport } from "../integrity/integrity.types.js";
 import type { MaintenanceLease } from "../storage/maintenance-fence.js";
 import {
   decodeAppendResultWire,
   decodeIntegrityReport,
+  decodeMaintenanceLeaseWire,
   decodeWorkerMessage,
   decodeWorkerResponseForRequest,
   encodeAppendCommandWire,
@@ -37,6 +38,18 @@ const ASSERTION_FAILURES = new Set([
   "VAULT_ID_MISMATCH",
   "STORE_ID_MISMATCH",
   "PROJECT_BINDING_REQUIRED",
+]);
+const MAINTENANCE_CONFIRMATION_CODES = new Set([
+  "MAINTENANCE_CONFIRMATION_REQUIRED",
+  "MAINTENANCE_CONFIRMATION_FAILED",
+  "MAINTENANCE_LEASE_INVALID",
+  "MAINTENANCE_LEASE_STALE",
+  "MAINTENANCE_STATE_INVALID",
+  "MAINTENANCE_TIMESTAMP_INVALID",
+  "MAINTENANCE_EXECUTOR_NOT_REQUIRED",
+  "MAINTENANCE_ACKNOWLEDGEMENT_REQUIRED",
+  "EXECUTOR_LEASE_INVALID",
+  "EXECUTOR_LEASE_NOT_ACTIVE",
 ]);
 
 export interface ProjectStoreExecutorOptions {
@@ -73,6 +86,21 @@ export interface ProjectStoreExecutorDependencies {
   workerFactory: WorkerFactory;
   scheduler: ExecutorScheduler;
   randomId: () => string;
+  /**
+   * Runs only after the store worker has exited. The implementation must use
+   * the maintenance owner's already-open connection; it must not create a
+   * short-lived publisher connection that would need to confirm its own close.
+   */
+  confirmMaintenanceClosure: (
+    confirmation: MaintenanceClosureConfirmation,
+  ) => void | Promise<void>;
+}
+
+export interface MaintenanceClosureConfirmation {
+  projectId: ProjectId;
+  executorId: string;
+  lease: MaintenanceLease;
+  connectionClosed: true;
 }
 
 const DEFAULT_SCHEDULER: ExecutorScheduler = {
@@ -222,6 +250,30 @@ function openAuthorityError(
   return null;
 }
 
+function sameMaintenanceLease(left: MaintenanceLease, right: MaintenanceLease): boolean {
+  return left.epoch === right.epoch
+    && left.fencingToken === right.fencingToken
+    && left.ownerId === right.ownerId
+    && left.leaseExpiresAt === right.leaseExpiresAt;
+}
+
+function confirmationError(error: unknown): ProjectStoreWorkerError {
+  try {
+    if (typeof error !== "object" || error === null) {
+      return new ProjectStoreWorkerError("MAINTENANCE_CONFIRMATION_FAILED");
+    }
+    Object.getPrototypeOf(error);
+    const code = Reflect.get(error, "code") as unknown;
+    return new ProjectStoreWorkerError(
+      typeof code === "string" && MAINTENANCE_CONFIRMATION_CODES.has(code)
+        ? code
+        : "MAINTENANCE_CONFIRMATION_FAILED",
+    );
+  } catch {
+    return new ProjectStoreWorkerError("MAINTENANCE_CONFIRMATION_FAILED");
+  }
+}
+
 export class ProjectStoreExecutor {
   readonly #options: ProjectStoreExecutorOptions;
   readonly #dependencies: ProjectStoreExecutorDependencies;
@@ -236,6 +288,12 @@ export class ProjectStoreExecutor {
   #openPromise: Promise<WorkerOpenResult> | null = null;
   #terminationPromise: Promise<void> | null = null;
   #expectedTermination = false;
+  #explicitMaintenanceLease: MaintenanceLease | null = null;
+  #quiescedNotification: WorkerNotification | null = null;
+  readonly #workerExit: Promise<number>;
+  #resolveWorkerExit!: (exitCode: number) => void;
+  readonly #poisonedSignal: Promise<ProjectStoreWorkerError>;
+  #resolvePoisonedSignal!: (error: ProjectStoreWorkerError) => void;
 
   constructor(
     options: ProjectStoreExecutorOptions,
@@ -247,7 +305,17 @@ export class ProjectStoreExecutor {
       workerFactory: dependencies.workerFactory ?? defaultWorkerFactory,
       scheduler: dependencies.scheduler ?? DEFAULT_SCHEDULER,
       randomId: dependencies.randomId ?? randomUUID,
+      confirmMaintenanceClosure: dependencies.confirmMaintenanceClosure
+        ?? (() => {
+          throw new ProjectStoreWorkerError("MAINTENANCE_CONFIRMATION_REQUIRED");
+        }),
     };
+    this.#workerExit = new Promise<number>((resolveExit) => {
+      this.#resolveWorkerExit = resolveExit;
+    });
+    this.#poisonedSignal = new Promise<ProjectStoreWorkerError>((resolvePoisoned) => {
+      this.#resolvePoisonedSignal = resolvePoisoned;
+    });
     const workerData: Record<string, JsonValue> = {
       role: "store",
       executorLeaseMs: options.executorLeaseMs,
@@ -313,7 +381,7 @@ export class ProjectStoreExecutor {
       type: "quickIntegrity",
       binding: encodeWorkerBindingAssertion(this.#options.context),
       tailLimit,
-    }, "read").then((value) => decodeIntegrityReport(value));
+    }, "read").then((value) => this.decodeBoundIntegrityReport(value, "quick"));
   }
 
   fullIntegrity(): Promise<IntegrityReport> {
@@ -322,17 +390,122 @@ export class ProjectStoreExecutor {
       id: "",
       type: "fullIntegrity",
       binding: encodeWorkerBindingAssertion(this.#options.context),
-    }, "read").then((value) => decodeIntegrityReport(value));
+    }, "read").then((value) => this.decodeBoundIntegrityReport(value, "full"));
+  }
+
+  private decodeBoundIntegrityReport(
+    value: unknown,
+    expectedMode: "quick" | "full",
+  ): IntegrityReport {
+    const report = decodeIntegrityReport(value);
+    if (
+      report.mode !== expectedMode
+      || report.ok !== (report.issues.length === 0)
+    ) {
+      const error = new ProjectStoreWorkerError("WORKER_PROTOCOL_ERROR");
+      void this.poison(error);
+      throw error;
+    }
+    const binding = this.#options.context.binding;
+    const authorityError = report.projectId !== binding.projectId
+      ? new ProjectStoreWorkerError("PROJECT_ID_MISMATCH")
+      : report.storeId !== binding.storeId
+        ? new ProjectStoreWorkerError("STORE_ID_MISMATCH")
+        : null;
+    if (authorityError !== null) {
+      void this.poison(authorityError);
+      throw authorityError;
+    }
+    return report;
   }
 
   async quiesce(lease: MaintenanceLease): Promise<void> {
     this.assertCallable(["open"]);
-    await this.request({
-      id: "",
-      type: "quiesce",
-      binding: encodeWorkerBindingAssertion(this.#options.context),
-      lease: encodeMaintenanceLeaseWire(lease),
-    }, "lifecycle");
+    if (this.#explicitMaintenanceLease !== null) {
+      throw new ProjectStoreWorkerError("MAINTENANCE_QUIESCING");
+    }
+    let encodedLease: ReturnType<typeof encodeMaintenanceLeaseWire>;
+    let expectedLease: MaintenanceLease;
+    try {
+      encodedLease = encodeMaintenanceLeaseWire(lease);
+      expectedLease = decodeMaintenanceLeaseWire(encodedLease);
+    } catch {
+      const failure = new ProjectStoreWorkerError("WORKER_PROTOCOL_ERROR");
+      await this.poison(failure);
+      throw failure;
+    }
+    this.#explicitMaintenanceLease = expectedLease;
+    this.#expectedTermination = true;
+    let requestError: ProjectStoreWorkerError | null = null;
+    try {
+      const response = await this.request({
+        id: "",
+        type: "quiesce",
+        binding: encodeWorkerBindingAssertion(this.#options.context),
+        lease: encodedLease,
+      }, "lifecycle") as { quiesced: true; epoch: string; connectionClosed: true };
+      if (response.epoch !== expectedLease.epoch.toString()) {
+        requestError = new ProjectStoreWorkerError("WORKER_PROTOCOL_ERROR");
+      }
+    } catch (error) {
+      requestError = error instanceof ProjectStoreWorkerError
+        ? error
+        : new ProjectStoreWorkerError("WORKER_UNAVAILABLE");
+    }
+
+    if (requestError !== null) {
+      await this.poison(requestError);
+      this.failMaintenanceClosure(requestError);
+    }
+    const termination = await Promise.race([
+      this.#workerExit.then(() => ({ kind: "exit" as const })),
+      this.#poisonedSignal.then((error) => ({ kind: "failure" as const, error })),
+    ]);
+    if (termination.kind === "failure") {
+      await (this.#terminationPromise ?? Promise.resolve());
+      this.failMaintenanceClosure(termination.error);
+    }
+    if (this.#state === "poisoned" || this.#terminalError !== null) {
+      this.failMaintenanceClosure(
+        this.#terminalError ?? new ProjectStoreWorkerError("WORKER_PROTOCOL_ERROR"),
+      );
+    }
+    const notification = this.#quiescedNotification;
+    if (notification === null) {
+      this.failMaintenanceClosure(new ProjectStoreWorkerError("WORKER_PROTOCOL_ERROR"));
+    }
+    const observedLease = decodeMaintenanceLeaseWire({
+      epoch: notification.epoch,
+      fencingToken: notification.fencingToken,
+      ownerId: notification.ownerId,
+      leaseExpiresAt: notification.leaseExpiresAt,
+    });
+    if (
+      !sameMaintenanceLease(observedLease, expectedLease)
+      || this.#state !== "closed"
+    ) {
+      this.failMaintenanceClosure(new ProjectStoreWorkerError("WORKER_PROTOCOL_ERROR"));
+    }
+
+    let ownerError: ProjectStoreWorkerError | null = null;
+    try {
+      await this.#dependencies.confirmMaintenanceClosure({
+        projectId: this.#options.context.binding.projectId,
+        executorId: this.#opened!.executorId,
+        lease: expectedLease,
+        connectionClosed: true,
+      });
+    } catch (error) {
+      ownerError = confirmationError(error);
+    }
+    if (ownerError !== null) {
+      this.#state = "poisoned";
+      this.#terminalError = ownerError;
+      this.rejectAll(ownerError);
+      throw ownerError;
+    }
+    this.#state = "quiesced";
+    this.#terminalError = new ProjectStoreWorkerError("WORKER_CLOSED");
   }
 
   close(): Promise<void> {
@@ -454,20 +627,81 @@ export class ProjectStoreExecutor {
       void this.poison(new ProjectStoreWorkerError("WORKER_PROTOCOL_ERROR"));
       return;
     }
-    this.#state = "quiesced";
+    if (this.#quiescedNotification !== null) {
+      void this.poison(new ProjectStoreWorkerError("WORKER_PROTOCOL_ERROR"));
+      return;
+    }
+    const observedLease = decodeMaintenanceLeaseWire({
+      epoch: notification.epoch,
+      fencingToken: notification.fencingToken,
+      ownerId: notification.ownerId,
+      leaseExpiresAt: notification.leaseExpiresAt,
+    });
+    if (
+      this.#explicitMaintenanceLease !== null
+      && !sameMaintenanceLease(observedLease, this.#explicitMaintenanceLease)
+    ) {
+      void this.poison(new ProjectStoreWorkerError("WORKER_PROTOCOL_ERROR"));
+      return;
+    }
+    this.#quiescedNotification = notification;
     this.#expectedTermination = true;
-    this.#terminalError = new ProjectStoreWorkerError("WORKER_CLOSED");
-    this.rejectAll(this.#terminalError);
   }
 
   private onExit(exitCode: number): void {
-    if (this.#expectedTermination && this.#pending.size === 0) {
-      this.#state = this.#state === "quiesced" ? "quiesced" : "closed";
+    this.#resolveWorkerExit(exitCode);
+    if (this.#expectedTermination) {
+      if (this.#pending.size > 0) {
+        const failure = new ProjectStoreWorkerError("WORKER_UNAVAILABLE", {
+          abnormalExit: exitCode !== 0,
+        });
+        this.#state = "poisoned";
+        this.#terminalError = failure;
+        this.rejectAll(failure);
+      }
+      if (this.#state === "poisoned" || this.#terminalError !== null) return;
+      this.#state = "closed";
+      if (this.#explicitMaintenanceLease === null && this.#quiescedNotification !== null) {
+        void this.confirmObservedMaintenanceClosure(this.#quiescedNotification);
+      }
       return;
     }
     void this.poison(new ProjectStoreWorkerError("WORKER_UNAVAILABLE", {
       abnormalExit: exitCode !== 0,
     }), false);
+  }
+
+  private failMaintenanceClosure(error: ProjectStoreWorkerError): never {
+    this.#state = "poisoned";
+    this.#terminalError = error;
+    this.rejectAll(error);
+    throw error;
+  }
+
+  private async confirmObservedMaintenanceClosure(
+    notification: WorkerNotification,
+  ): Promise<void> {
+    const lease = decodeMaintenanceLeaseWire({
+      epoch: notification.epoch,
+      fencingToken: notification.fencingToken,
+      ownerId: notification.ownerId,
+      leaseExpiresAt: notification.leaseExpiresAt,
+    });
+    try {
+      await this.#dependencies.confirmMaintenanceClosure({
+        projectId: this.#options.context.binding.projectId,
+        executorId: notification.executorId,
+        lease,
+        connectionClosed: true,
+      });
+      this.#state = "quiesced";
+      this.#terminalError = new ProjectStoreWorkerError("WORKER_CLOSED");
+    } catch (error) {
+      const failure = confirmationError(error);
+      this.#state = "poisoned";
+      this.#terminalError = failure;
+      this.rejectAll(failure);
+    }
   }
 
   private unknownOutcome(pending: PendingRequest): ProjectStoreWorkerError | null {
@@ -497,6 +731,7 @@ export class ProjectStoreExecutor {
     this.#state = "poisoned";
     this.#terminalError = error;
     this.rejectAll(error);
+    this.#resolvePoisonedSignal(error);
     if (terminate) {
       await this.terminateWorker();
     }
@@ -561,7 +796,9 @@ export class ProjectStoreExecutor {
     if (this.#terminationPromise !== null) return this.#terminationPromise;
     this.#expectedTermination = true;
     this.#terminationPromise = this.#worker.terminate()
-      .then(() => undefined)
+      .then((exitCode) => {
+        this.#resolveWorkerExit(exitCode);
+      })
       .catch(() => undefined);
     return this.#terminationPromise;
   }

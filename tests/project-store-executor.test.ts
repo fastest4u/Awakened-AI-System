@@ -52,6 +52,7 @@ import {
   ProjectStoreWorkerError,
   projectStoreExecutorKey,
   type ExecutorScheduler,
+  type ProjectStoreExecutorDependencies,
   type WorkerFactory,
   type WorkerLike,
 } from "../src/orchestrator/runtime/project-store-executor.js";
@@ -236,6 +237,14 @@ class DeferredTerminationWorker extends FakeWorker {
   }
 }
 
+class RejectingTerminationWorker extends FakeWorker {
+  override async terminate(): Promise<number> {
+    this.lifecycle.push("terminate");
+    this.terminateCalls += 1;
+    throw new Error("worker termination secret");
+  }
+}
+
 class DropCommittedAppendResponseWorker extends EventEmitter implements WorkerLike {
   readonly #worker: Worker;
   readonly #requestTypes = new Map<string, WorkerRequest["type"]>();
@@ -311,6 +320,7 @@ function deferred<T>(): {
 
 async function fakeExecutor(
   options: Partial<ConstructorParameters<typeof ProjectStoreExecutor>[0]> = {},
+  dependencies: Partial<ProjectStoreExecutorDependencies> = {},
 ): Promise<{
   executor: ProjectStoreExecutor;
   worker: FakeWorker;
@@ -335,6 +345,7 @@ async function fakeExecutor(
     workerFactory: factory,
     scheduler,
     randomId: () => "77777777-7777-4777-8777-777777777777",
+    ...dependencies,
   });
   const opening = executor.open();
   const request = worker.posted.at(-1);
@@ -350,6 +361,82 @@ function errorCode(expected: string): (error: unknown) => boolean {
     assert.equal(error.code, expected);
     return true;
   };
+}
+
+const CALLBACK_SECRET = "owner-callback-secret-must-not-escape";
+
+function hostileConfirmationFailure(
+  trap: "prototype" | "code" | "details",
+): object {
+  const target = {};
+  return new Proxy(target, {
+    getPrototypeOf(observed) {
+      if (trap === "prototype") throw new Error(CALLBACK_SECRET);
+      return Reflect.getPrototypeOf(observed);
+    },
+    get(observed, property, receiver) {
+      if (property === "code") {
+        if (trap === "code") throw new Error(CALLBACK_SECRET);
+        return "MAINTENANCE_LEASE_STALE";
+      }
+      if (property === "details") {
+        if (trap === "details") throw new Error(CALLBACK_SECRET);
+        return { secret: CALLBACK_SECRET };
+      }
+      return Reflect.get(observed, property, receiver);
+    },
+  });
+}
+
+function acquireAcknowledgedMaintenanceLease(
+  connection: ReturnType<NodeSqliteDriver["open"]>,
+  fence: MaintenanceFence,
+  context: ProjectContext,
+  executorId: string,
+): ReturnType<MaintenanceFence["acquire"]> {
+  const registeredAt = new Date().toISOString();
+  connection.exec("BEGIN IMMEDIATE");
+  fence.registerExecutor(
+    connection,
+    context.binding.projectId,
+    executorId,
+    context.binding.generation,
+    context.binding.contextFingerprint,
+    new Date(Date.now() + 60_000).toISOString(),
+    registeredAt,
+  );
+  connection.exec("COMMIT");
+  const acquiredAt = new Date().toISOString();
+  connection.exec("BEGIN IMMEDIATE");
+  const lease = fence.acquire(
+    connection,
+    "owner-confirmation",
+    new Date(Date.now() + 120_000).toISOString(),
+    acquiredAt,
+  );
+  connection.exec("COMMIT");
+  connection.exec("BEGIN IMMEDIATE");
+  fence.acknowledge(
+    connection,
+    lease,
+    executorId,
+    new Date().toISOString(),
+  );
+  connection.exec("COMMIT");
+  return lease;
+}
+
+function maintenanceReady(
+  connection: ReturnType<NodeSqliteDriver["open"]>,
+  fence: MaintenanceFence,
+  lease: ReturnType<MaintenanceFence["acquire"]>,
+): boolean {
+  connection.exec("BEGIN DEFERRED");
+  try {
+    return fence.allRequiredExecutorsAcknowledged(connection, lease);
+  } finally {
+    connection.exec("ROLLBACK");
+  }
 }
 
 describe("worker protocol", () => {
@@ -499,6 +586,648 @@ describe("ProjectStoreExecutor bounded lifecycle", () => {
     assert.equal(worker.posted.length, 1);
     worker.respond(worker.posted[0]!, openResult(context));
     assert.deepEqual(await first, await second);
+  });
+
+  it("waits for worker exit before the maintenance owner publishes readiness", async () => {
+    const context = await realContext();
+    const worker = new FakeWorker();
+    const fence = new MaintenanceFence();
+    const owner = new NodeSqliteDriver({ DatabaseSync }).open(
+      context.binding.storeRoute.eventsPath,
+      { mode: "existing", busyTimeoutMs: DEFAULT_BUSY_TIMEOUT_MS },
+    );
+    let ownerCalls = 0;
+    type OwnerConfirmation = {
+      projectId: ProjectId;
+      executorId: string;
+      lease: ReturnType<MaintenanceFence["acquire"]>;
+      connectionClosed: true;
+    };
+    const dependencies = {
+      workerFactory: () => worker,
+      confirmMaintenanceClosure: async (confirmation: OwnerConfirmation) => {
+        ownerCalls += 1;
+        assert.equal(confirmation.projectId, context.binding.projectId);
+        assert.equal(confirmation.connectionClosed, true);
+        owner.exec("BEGIN IMMEDIATE");
+        fence.confirmExecutorClosed(
+          owner,
+          confirmation.lease,
+          confirmation.projectId,
+          confirmation.executorId,
+          new Date().toISOString(),
+        );
+        owner.exec("COMMIT");
+      },
+    } as Partial<ProjectStoreExecutorDependencies> & {
+      confirmMaintenanceClosure(confirmation: OwnerConfirmation): Promise<void>;
+    };
+    const executor = new ProjectStoreExecutor({
+      workerUrl: WORKER_URL,
+      context,
+      maxPending: DEFAULT_MAX_PENDING,
+      requestTimeoutMs: 10_000,
+      closeTimeoutMs: 5_000,
+      executorLeaseMs: 15_000,
+      heartbeatIntervalMs: 5_000,
+    }, dependencies);
+    const opening = executor.open();
+    worker.respond(worker.posted[0]!, openResult(context));
+    const opened = await opening;
+    const lease = acquireAcknowledgedMaintenanceLease(
+      owner,
+      fence,
+      context,
+      opened.executorId,
+    );
+
+    let settled = false;
+    const quiescing = executor.quiesce(lease).finally(() => { settled = true; });
+    const request = worker.posted.at(-1)!;
+    assert.equal(request.type, "quiesce");
+    worker.respond(request, {
+      quiesced: true,
+      epoch: lease.epoch.toString(),
+      connectionClosed: true,
+    });
+    worker.emit("message", {
+      type: "quiesced",
+      executorId: opened.executorId,
+      epoch: lease.epoch.toString(),
+      fencingToken: lease.fencingToken.toString(),
+      ownerId: lease.ownerId,
+      leaseExpiresAt: lease.leaseExpiresAt,
+      connectionClosed: true,
+    });
+    await turn();
+    const settledBeforeExit = settled;
+    const ownerCallsBeforeExit = ownerCalls;
+    const readyBeforeExit = maintenanceReady(owner, fence, lease);
+
+    worker.emit("exit", 0);
+    const outcome = await quiescing.then(
+      () => "resolved",
+      (error: unknown) => error instanceof ProjectStoreWorkerError ? error.code : "unknown",
+    );
+    const readyAfterOwnerConfirmation = maintenanceReady(owner, fence, lease);
+    owner.close();
+
+    assert.equal(settledBeforeExit, false);
+    assert.equal(ownerCallsBeforeExit, 0);
+    assert.equal(readyBeforeExit, false);
+    assert.equal(ownerCalls, 1);
+    assert.equal(outcome, "resolved");
+    assert.equal(readyAfterOwnerConfirmation, true);
+  });
+
+  it("fails closed after worker exit when no maintenance owner callback exists", async () => {
+    const context = await realContext();
+    const worker = new FakeWorker();
+    const executor = new ProjectStoreExecutor({
+      workerUrl: WORKER_URL,
+      context,
+      maxPending: DEFAULT_MAX_PENDING,
+      requestTimeoutMs: 10_000,
+      closeTimeoutMs: 5_000,
+      executorLeaseMs: 15_000,
+      heartbeatIntervalMs: 5_000,
+    }, { workerFactory: () => worker });
+    const opening = executor.open();
+    worker.respond(worker.posted[0]!, openResult(context));
+    const opened = await opening;
+    const owner = new NodeSqliteDriver({ DatabaseSync }).open(
+      context.binding.storeRoute.eventsPath,
+      { mode: "existing", busyTimeoutMs: DEFAULT_BUSY_TIMEOUT_MS },
+    );
+    const fence = new MaintenanceFence();
+    const lease = acquireAcknowledgedMaintenanceLease(
+      owner,
+      fence,
+      context,
+      opened.executorId,
+    );
+
+    const quiescing = executor.quiesce(lease);
+    const request = worker.posted.at(-1)!;
+    worker.respond(request, {
+      quiesced: true,
+      epoch: lease.epoch.toString(),
+      connectionClosed: true,
+    });
+    worker.emit("message", {
+      type: "quiesced",
+      executorId: opened.executorId,
+      epoch: lease.epoch.toString(),
+      fencingToken: lease.fencingToken.toString(),
+      ownerId: lease.ownerId,
+      leaseExpiresAt: lease.leaseExpiresAt,
+      connectionClosed: true,
+    });
+    worker.emit("exit", 0);
+    const outcome = await quiescing.then(
+      () => "resolved",
+      (error: unknown) => error instanceof ProjectStoreWorkerError ? error.code : "unknown",
+    );
+    const ready = maintenanceReady(owner, fence, lease);
+    const closedAt = owner.prepare(`
+      SELECT closed_at
+      FROM executor_leases
+      WHERE project_id = $projectId AND executor_id = $executorId
+    `).get({
+      $projectId: context.binding.projectId,
+      $executorId: opened.executorId,
+    })?.closed_at;
+    owner.close();
+
+    assert.equal(outcome, "MAINTENANCE_CONFIRMATION_REQUIRED");
+    assert.equal(ready, false);
+    assert.equal(closedAt, null);
+  });
+
+  it("rejects maintenance response or notification evidence that mismatches the requested lease", async () => {
+    for (const mismatch of ["response", "notification"] as const) {
+      const context = contextFixture();
+      writeFileSync(context.binding.storeRoute.eventsPath, "fixture", "utf8");
+      const worker = new FakeWorker();
+      let ownerCalls = 0;
+      const dependencies = {
+        workerFactory: () => worker,
+        confirmMaintenanceClosure: async () => { ownerCalls += 1; },
+      } as Partial<ProjectStoreExecutorDependencies> & {
+        confirmMaintenanceClosure(confirmation: unknown): Promise<void>;
+      };
+      const executor = new ProjectStoreExecutor({
+        workerUrl: WORKER_URL,
+        context,
+        maxPending: DEFAULT_MAX_PENDING,
+        requestTimeoutMs: 10_000,
+        closeTimeoutMs: 5_000,
+        executorLeaseMs: 15_000,
+        heartbeatIntervalMs: 5_000,
+      }, dependencies);
+      const opening = executor.open();
+      worker.respond(worker.posted[0]!, openResult(context));
+      const opened = await opening;
+      const lease = {
+        epoch: 31n,
+        fencingToken: 31n,
+        ownerId: "exact-owner",
+        leaseExpiresAt: "2026-07-13T23:59:59.000Z",
+      };
+      const quiescing = executor.quiesce(lease);
+      const request = worker.posted.at(-1)!;
+      worker.respond(request, {
+        quiesced: true,
+        epoch: (mismatch === "response" ? 32n : lease.epoch).toString(),
+        connectionClosed: true,
+      });
+      worker.emit("message", {
+        type: "quiesced",
+        executorId: opened.executorId,
+        epoch: lease.epoch.toString(),
+        fencingToken: (
+          mismatch === "notification" ? 32n : lease.fencingToken
+        ).toString(),
+        ownerId: lease.ownerId,
+        leaseExpiresAt: lease.leaseExpiresAt,
+        connectionClosed: true,
+      });
+      worker.emit("exit", 0);
+      const outcome = await quiescing.then(
+        () => "resolved",
+        (error: unknown) => error instanceof ProjectStoreWorkerError ? error.code : "unknown",
+      );
+
+      assert.equal(outcome, "WORKER_PROTOCOL_ERROR", mismatch);
+      assert.equal(ownerCalls, 0, mismatch);
+    }
+  });
+
+  it("never confirms closure after a negative response or exit without notification", async () => {
+    const outcomes: Array<{
+      mode: "negative-response" | "exit-without-notification";
+      outcome: string;
+      ownerCalls: number;
+      ready: boolean;
+      closedAt: unknown;
+    }> = [];
+
+    for (const mode of ["negative-response", "exit-without-notification"] as const) {
+      const context = await realContext();
+      const worker = new FakeWorker();
+      const fence = new MaintenanceFence();
+      const owner = new NodeSqliteDriver({ DatabaseSync }).open(
+        context.binding.storeRoute.eventsPath,
+        { mode: "existing", busyTimeoutMs: DEFAULT_BUSY_TIMEOUT_MS },
+      );
+      let ownerCalls = 0;
+      const executor = new ProjectStoreExecutor({
+        workerUrl: WORKER_URL,
+        context,
+        maxPending: DEFAULT_MAX_PENDING,
+        requestTimeoutMs: 10_000,
+        closeTimeoutMs: 5_000,
+        executorLeaseMs: 15_000,
+        heartbeatIntervalMs: 5_000,
+      }, {
+        workerFactory: () => worker,
+        confirmMaintenanceClosure: async (confirmation) => {
+          ownerCalls += 1;
+          owner.exec("BEGIN IMMEDIATE");
+          fence.confirmExecutorClosed(
+            owner,
+            confirmation.lease,
+            confirmation.projectId,
+            confirmation.executorId,
+            new Date().toISOString(),
+          );
+          owner.exec("COMMIT");
+        },
+      });
+      const opening = executor.open();
+      worker.respond(worker.posted[0]!, openResult(context));
+      const opened = await opening;
+      const lease = acquireAcknowledgedMaintenanceLease(
+        owner,
+        fence,
+        context,
+        opened.executorId,
+      );
+
+      const quiescing = executor.quiesce(lease);
+      const request = worker.posted.at(-1)!;
+      if (mode === "negative-response") {
+        worker.fail(request, "STORE_UNAVAILABLE");
+      } else {
+        worker.respond(request, {
+          quiesced: true,
+          epoch: lease.epoch.toString(),
+          connectionClosed: true,
+        });
+      }
+      worker.emit("exit", 0);
+      const outcome = await quiescing.then(
+        () => "resolved",
+        (error: unknown) => error instanceof ProjectStoreWorkerError ? error.code : "unknown",
+      );
+      const ready = maintenanceReady(owner, fence, lease);
+      const closedAt = owner.prepare(`
+        SELECT closed_at
+        FROM executor_leases
+        WHERE project_id = $projectId AND executor_id = $executorId
+      `).get({
+        $projectId: context.binding.projectId,
+        $executorId: opened.executorId,
+      })?.closed_at;
+      outcomes.push({ mode, outcome, ownerCalls, ready, closedAt });
+      owner.close();
+    }
+
+    assert.deepEqual(outcomes, [{
+      mode: "negative-response",
+      outcome: "STORE_UNAVAILABLE",
+      ownerCalls: 0,
+      ready: false,
+      closedAt: null,
+    }, {
+      mode: "exit-without-notification",
+      outcome: "WORKER_PROTOCOL_ERROR",
+      ownerCalls: 0,
+      ready: false,
+      closedAt: null,
+    }]);
+  });
+
+  it("terminates and settles malformed or queue-full quiesce requests before confirmation", async () => {
+    let malformedOwnerCalls = 0;
+    const malformedExecutor = await fakeExecutor({}, {
+      confirmMaintenanceClosure: async () => { malformedOwnerCalls += 1; },
+    });
+    const malformedPosts = malformedExecutor.worker.posted.length;
+    let malformedOutcome = "pending";
+    const malformedQuiesce = malformedExecutor.executor.quiesce({
+      epoch: 41n,
+      fencingToken: 41n,
+      ownerId: { invalid: true } as unknown as string,
+      leaseExpiresAt: new Date(Date.now() + 60_000).toISOString(),
+    }).then(
+      () => { malformedOutcome = "resolved"; },
+      (error: unknown) => {
+        malformedOutcome = error instanceof ProjectStoreWorkerError ? error.code : "unknown";
+      },
+    );
+    await turn();
+    await turn();
+    const malformedBeforeExternalExit = malformedOutcome;
+    const malformedTerminateCalls = malformedExecutor.worker.terminateCalls;
+    if (malformedOutcome === "pending") malformedExecutor.worker.emit("exit", 0);
+    await malformedQuiesce;
+
+    let queueOwnerCalls = 0;
+    const queued = await fakeExecutor({}, {
+      confirmMaintenanceClosure: async () => { queueOwnerCalls += 1; },
+    });
+    const pendingReads = Array.from(
+      { length: DEFAULT_MAX_PENDING },
+      () => queued.executor.quickIntegrity(),
+    );
+    const readsSettled = Promise.allSettled(pendingReads);
+    const queuePosts = queued.worker.posted.length;
+    let queueOutcome = "pending";
+    const queueQuiesce = queued.executor.quiesce({
+      epoch: 42n,
+      fencingToken: 42n,
+      ownerId: "queue-owner",
+      leaseExpiresAt: new Date(Date.now() + 60_000).toISOString(),
+    }).then(
+      () => { queueOutcome = "resolved"; },
+      (error: unknown) => {
+        queueOutcome = error instanceof ProjectStoreWorkerError ? error.code : "unknown";
+      },
+    );
+    await turn();
+    await turn();
+    const queueBeforeExternalExit = queueOutcome;
+    const queueTerminateCalls = queued.worker.terminateCalls;
+    if (queueOutcome === "pending") queued.worker.emit("exit", 0);
+    await queueQuiesce;
+    await readsSettled;
+
+    assert.equal(malformedExecutor.worker.posted.length, malformedPosts);
+    assert.equal(malformedBeforeExternalExit, "WORKER_PROTOCOL_ERROR");
+    assert.equal(malformedTerminateCalls, 1);
+    assert.equal(malformedOwnerCalls, 0);
+    assert.equal(queued.worker.posted.length, queuePosts);
+    assert.equal(queueBeforeExternalExit, "STORE_QUEUE_FULL");
+    assert.equal(queueTerminateCalls, 1);
+    assert.equal(queueOwnerCalls, 0);
+  });
+
+  it("settles a typed quiesce failure when worker termination rejects without an exit event", async () => {
+    const context = contextFixture();
+    writeFileSync(context.binding.storeRoute.eventsPath, "fixture", "utf8");
+    const worker = new RejectingTerminationWorker();
+    let ownerCalls = 0;
+    const executor = new ProjectStoreExecutor({
+      workerUrl: WORKER_URL,
+      context,
+      maxPending: DEFAULT_MAX_PENDING,
+      requestTimeoutMs: 10_000,
+      closeTimeoutMs: 5_000,
+      executorLeaseMs: 15_000,
+      heartbeatIntervalMs: 5_000,
+    }, {
+      workerFactory: () => worker,
+      confirmMaintenanceClosure: async () => { ownerCalls += 1; },
+    });
+    const opening = executor.open();
+    worker.respond(worker.posted[0]!, openResult(context));
+    await opening;
+    let outcome = "pending";
+    const quiescing = executor.quiesce({
+      epoch: 43n,
+      fencingToken: 43n,
+      ownerId: { invalid: true } as unknown as string,
+      leaseExpiresAt: new Date(Date.now() + 60_000).toISOString(),
+    }).then(
+      () => { outcome = "resolved"; },
+      (error: unknown) => {
+        outcome = error instanceof ProjectStoreWorkerError ? error.code : "unknown";
+      },
+    );
+    await turn();
+    await turn();
+
+    assert.equal(outcome, "WORKER_PROTOCOL_ERROR");
+    assert.equal(worker.terminateCalls, 1);
+    assert.equal(ownerCalls, 0);
+    await quiescing;
+
+    const lateWorker = new RejectingTerminationWorker();
+    let lateOwnerCalls = 0;
+    const lateExecutor = new ProjectStoreExecutor({
+      workerUrl: WORKER_URL,
+      context,
+      maxPending: DEFAULT_MAX_PENDING,
+      requestTimeoutMs: 10_000,
+      closeTimeoutMs: 5_000,
+      executorLeaseMs: 15_000,
+      heartbeatIntervalMs: 5_000,
+    }, {
+      workerFactory: () => lateWorker,
+      confirmMaintenanceClosure: async () => { lateOwnerCalls += 1; },
+    });
+    const lateOpening = lateExecutor.open();
+    lateWorker.respond(lateWorker.posted[0]!, openResult(context));
+    const lateOpened = await lateOpening;
+    const lateLease = {
+      epoch: 44n,
+      fencingToken: 44n,
+      ownerId: "late-protocol-owner",
+      leaseExpiresAt: new Date(Date.now() + 60_000).toISOString(),
+    };
+    let lateOutcome = "pending";
+    const lateQuiescing = lateExecutor.quiesce(lateLease).then(
+      () => { lateOutcome = "resolved"; },
+      (error: unknown) => {
+        lateOutcome = error instanceof ProjectStoreWorkerError ? error.code : "unknown";
+      },
+    );
+    const lateRequest = lateWorker.posted.at(-1)!;
+    lateWorker.respond(lateRequest, {
+      quiesced: true,
+      epoch: lateLease.epoch.toString(),
+      connectionClosed: true,
+    });
+    await turn();
+    lateWorker.emit("message", {
+      type: "quiesced",
+      executorId: lateOpened.executorId,
+      epoch: lateLease.epoch.toString(),
+      fencingToken: (lateLease.fencingToken + 1n).toString(),
+      ownerId: lateLease.ownerId,
+      leaseExpiresAt: lateLease.leaseExpiresAt,
+      connectionClosed: true,
+    });
+    await turn();
+    await turn();
+
+    assert.equal(lateOutcome, "WORKER_PROTOCOL_ERROR");
+    assert.equal(lateWorker.terminateCalls, 1);
+    assert.equal(lateOwnerCalls, 0);
+    await lateQuiescing;
+  });
+
+  it("sanitizes hostile maintenance confirmation failures for explicit quiesce", async () => {
+    for (const trap of ["prototype", "code", "details"] as const) {
+      let ownerCalls = 0;
+      const { executor, worker, context } = await fakeExecutor({}, {
+        confirmMaintenanceClosure: async () => {
+          ownerCalls += 1;
+          throw hostileConfirmationFailure(trap);
+        },
+      });
+      const opened = openResult(context);
+      const lease = {
+        epoch: 51n,
+        fencingToken: 51n,
+        ownerId: "hostile-explicit-owner",
+        leaseExpiresAt: new Date(Date.now() + 60_000).toISOString(),
+      };
+      const quiescing = executor.quiesce(lease);
+      const request = worker.posted.at(-1)!;
+      worker.respond(request, {
+        quiesced: true,
+        epoch: lease.epoch.toString(),
+        connectionClosed: true,
+      });
+      worker.emit("message", {
+        type: "quiesced",
+        executorId: opened.executorId,
+        epoch: lease.epoch.toString(),
+        fencingToken: lease.fencingToken.toString(),
+        ownerId: lease.ownerId,
+        leaseExpiresAt: lease.leaseExpiresAt,
+        connectionClosed: true,
+      });
+      worker.emit("exit", 0);
+      const failure = await quiescing.then(
+        () => null,
+        (error: unknown) => error,
+      );
+
+      assert.ok(failure instanceof ProjectStoreWorkerError, trap);
+      assert.equal(
+        failure.code,
+        trap === "details" ? "MAINTENANCE_LEASE_STALE" : "MAINTENANCE_CONFIRMATION_FAILED",
+        trap,
+      );
+      assert.deepEqual(failure.details, {}, trap);
+      assert.equal(
+        `${failure.name}:${failure.message}:${JSON.stringify(failure.details)}`
+          .includes(CALLBACK_SECRET),
+        false,
+        trap,
+      );
+      assert.equal(ownerCalls, 1, trap);
+    }
+  });
+
+  it("contains hostile autonomous confirmation failures without an unhandled rejection", async () => {
+    let ownerCalls = 0;
+    const { executor, worker, context } = await fakeExecutor({}, {
+      confirmMaintenanceClosure: async () => {
+        ownerCalls += 1;
+        throw hostileConfirmationFailure("prototype");
+      },
+    });
+    const opened = openResult(context);
+    const lease = {
+      epoch: 52n,
+      fencingToken: 52n,
+      ownerId: "hostile-autonomous-owner",
+      leaseExpiresAt: new Date(Date.now() + 60_000).toISOString(),
+    };
+    const unhandled: unknown[] = [];
+    const captureUnhandled = (reason: unknown): void => { unhandled.push(reason); };
+    process.on("unhandledRejection", captureUnhandled);
+    try {
+      worker.emit("message", {
+        type: "quiesced",
+        executorId: opened.executorId,
+        epoch: lease.epoch.toString(),
+        fencingToken: lease.fencingToken.toString(),
+        ownerId: lease.ownerId,
+        leaseExpiresAt: lease.leaseExpiresAt,
+        connectionClosed: true,
+      });
+      worker.emit("exit", 0);
+      await turn();
+      await turn();
+    } finally {
+      process.off("unhandledRejection", captureUnhandled);
+    }
+
+    assert.equal(ownerCalls, 1);
+    assert.deepEqual(unhandled, []);
+    assert.throws(
+      () => executor.quickIntegrity(),
+      errorCode("MAINTENANCE_CONFIRMATION_FAILED"),
+    );
+  });
+
+  it("keeps autonomous closure fail-closed after a duplicate quiesced notification", async () => {
+    const context = await realContext();
+    const worker = new FakeWorker();
+    const fence = new MaintenanceFence();
+    const owner = new NodeSqliteDriver({ DatabaseSync }).open(
+      context.binding.storeRoute.eventsPath,
+      { mode: "existing", busyTimeoutMs: DEFAULT_BUSY_TIMEOUT_MS },
+    );
+    let ownerCalls = 0;
+    const executor = new ProjectStoreExecutor({
+      workerUrl: WORKER_URL,
+      context,
+      maxPending: DEFAULT_MAX_PENDING,
+      requestTimeoutMs: 10_000,
+      closeTimeoutMs: 5_000,
+      executorLeaseMs: 15_000,
+      heartbeatIntervalMs: 5_000,
+    }, {
+      workerFactory: () => worker,
+      confirmMaintenanceClosure: async (confirmation) => {
+        ownerCalls += 1;
+        owner.exec("BEGIN IMMEDIATE");
+        fence.confirmExecutorClosed(
+          owner,
+          confirmation.lease,
+          confirmation.projectId,
+          confirmation.executorId,
+          new Date().toISOString(),
+        );
+        owner.exec("COMMIT");
+      },
+    });
+    const opening = executor.open();
+    worker.respond(worker.posted[0]!, openResult(context));
+    const opened = await opening;
+    const lease = acquireAcknowledgedMaintenanceLease(
+      owner,
+      fence,
+      context,
+      opened.executorId,
+    );
+    const notification = {
+      type: "quiesced",
+      executorId: opened.executorId,
+      epoch: lease.epoch.toString(),
+      fencingToken: lease.fencingToken.toString(),
+      ownerId: lease.ownerId,
+      leaseExpiresAt: lease.leaseExpiresAt,
+      connectionClosed: true,
+    } as const;
+
+    worker.emit("message", notification);
+    worker.emit("message", notification);
+    await turn();
+    worker.emit("exit", 0);
+    await turn();
+
+    const ready = maintenanceReady(owner, fence, lease);
+    const closedAt = owner.prepare(`
+      SELECT closed_at
+      FROM executor_leases
+      WHERE project_id = $projectId AND executor_id = $executorId
+    `).get({
+      $projectId: context.binding.projectId,
+      $executorId: opened.executorId,
+    })?.closed_at;
+    owner.close();
+
+    assert.equal(ownerCalls, 0);
+    assert.equal(ready, false);
+    assert.equal(closedAt, null);
+    assert.throws(() => executor.quickIntegrity(), errorCode("WORKER_PROTOCOL_ERROR"));
   });
 
   it("rejects and poisons an authority-mismatched open success", async () => {
@@ -655,6 +1384,105 @@ describe("ProjectStoreExecutor bounded lifecycle", () => {
       await turn();
       assert.equal(worker.terminateCalls, 1, code);
       assert.throws(() => executor.quickIntegrity(), errorCode(code));
+    }
+  });
+
+  it("rejects and poisons quick and full integrity reports from a foreign project or store", async () => {
+    for (const mode of ["quick", "full"] as const) {
+      for (const mismatch of ["projectId", "storeId"] as const) {
+        const { executor, worker } = await fakeExecutor();
+        const pending = mode === "quick"
+          ? executor.quickIntegrity()
+          : executor.fullIntegrity();
+        const request = worker.posted.at(-1)!;
+        worker.respond(request, {
+          ok: true,
+          mode,
+          projectId: mismatch === "projectId"
+            ? "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+            : PROJECT_ID,
+          storeId: mismatch === "storeId"
+            ? "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+            : STORE_ID,
+          firstGlobalPosition: "0",
+          lastGlobalPosition: "0",
+          eventsVerified: 0,
+          streamsVerified: 0,
+          commandsVerified: 0,
+          schemaFingerprint: "a".repeat(64),
+          terminalEventHash: "0".repeat(64),
+          issues: [],
+        });
+        const expectedCode = mismatch === "projectId"
+          ? "PROJECT_ID_MISMATCH"
+          : "STORE_ID_MISMATCH";
+
+        await assert.rejects(pending, errorCode(expectedCode));
+        await turn();
+        assert.equal(worker.terminateCalls, 1, `${mode}:${mismatch}`);
+        assert.throws(
+          () => executor.quickIntegrity(),
+          errorCode(expectedCode),
+          `${mode}:${mismatch}`,
+        );
+      }
+    }
+  });
+
+  it("rejects and poisons integrity reports with a mismatched mode or inconsistent status", async () => {
+    const cases = [{
+      requestedMode: "quick",
+      reportMode: "full",
+      ok: true,
+      issues: [],
+    }, {
+      requestedMode: "full",
+      reportMode: "quick",
+      ok: true,
+      issues: [],
+    }, {
+      requestedMode: "quick",
+      reportMode: "quick",
+      ok: true,
+      issues: [{ code: "PROJECT_ID_MISMATCH", message: "foreign project" }],
+    }, {
+      requestedMode: "full",
+      reportMode: "full",
+      ok: false,
+      issues: [],
+    }] as const;
+
+    for (const testCase of cases) {
+      const { executor, worker } = await fakeExecutor();
+      const pending = testCase.requestedMode === "quick"
+        ? executor.quickIntegrity()
+        : executor.fullIntegrity();
+      worker.respond(worker.posted.at(-1)!, {
+        ok: testCase.ok,
+        mode: testCase.reportMode,
+        projectId: PROJECT_ID,
+        storeId: STORE_ID,
+        firstGlobalPosition: "0",
+        lastGlobalPosition: "0",
+        eventsVerified: 0,
+        streamsVerified: 0,
+        commandsVerified: 0,
+        schemaFingerprint: "a".repeat(64),
+        terminalEventHash: "0".repeat(64),
+        issues: testCase.issues,
+      });
+
+      await assert.rejects(pending, errorCode("WORKER_PROTOCOL_ERROR"));
+      await turn();
+      assert.equal(
+        worker.terminateCalls,
+        1,
+        `${testCase.requestedMode}:${testCase.reportMode}:${testCase.ok}`,
+      );
+      assert.throws(
+        () => executor.quickIntegrity(),
+        errorCode("WORKER_PROTOCOL_ERROR"),
+      );
     }
   });
 
@@ -1211,6 +2039,12 @@ describe("real project-store worker", () => {
 
   it("autonomously observes a foreign maintenance epoch, drains, acknowledges, and closes", async () => {
     const context = await realContext();
+    const connection = new NodeSqliteDriver({ DatabaseSync }).open(
+      context.binding.storeRoute.eventsPath,
+      { mode: "existing", busyTimeoutMs: DEFAULT_BUSY_TIMEOUT_MS },
+    );
+    const fence = new MaintenanceFence();
+    let ownerConfirmations = 0;
     const executor = new ProjectStoreExecutor({
       workerUrl: WORKER_URL,
       context,
@@ -1219,13 +2053,26 @@ describe("real project-store worker", () => {
       closeTimeoutMs: 5_000,
       executorLeaseMs: 15_000,
       heartbeatIntervalMs: 25,
+    }, {
+      confirmMaintenanceClosure: async (confirmation) => {
+        ownerConfirmations += 1;
+        connection.exec("BEGIN IMMEDIATE");
+        try {
+          fence.confirmExecutorClosed(
+            connection,
+            confirmation.lease,
+            confirmation.projectId,
+            confirmation.executorId,
+            new Date().toISOString(),
+          );
+          connection.exec("COMMIT");
+        } catch (error) {
+          connection.exec("ROLLBACK");
+          throw error;
+        }
+      },
     });
     await executor.open();
-    const connection = new NodeSqliteDriver({ DatabaseSync }).open(
-      context.binding.storeRoute.eventsPath,
-      { mode: "existing", busyTimeoutMs: DEFAULT_BUSY_TIMEOUT_MS },
-    );
-    const fence = new MaintenanceFence();
     const acquiredAt = new Date().toISOString();
     connection.exec("BEGIN IMMEDIATE");
     const lease = fence.acquire(
@@ -1249,6 +2096,7 @@ describe("real project-store worker", () => {
       }
     }
     assert.equal(closedAndAcknowledged, true);
+    assert.equal(ownerConfirmations, 1);
     assert.throws(() => executor.quickIntegrity(), errorCode("WORKER_CLOSED"));
 
     const releasedAt = new Date().toISOString();
@@ -1335,6 +2183,99 @@ describe("real project-store worker", () => {
 });
 
 describe("ProjectStoreWorkerBackend open identity", () => {
+  async function workerOwnedPublicationFault(
+    mode: "transient" | "persistent",
+  ): Promise<{
+    outcome: string;
+    readinessObservations: boolean[];
+    closeAttempts: number;
+    leakedBeforeCleanup: boolean;
+    readyAfterBackendClose: boolean;
+  }> {
+    const context = await realContext();
+    const observer = new NodeSqliteDriver({ DatabaseSync }).open(
+      context.binding.storeRoute.eventsPath,
+      { mode: "existing", busyTimeoutMs: DEFAULT_BUSY_TIMEOUT_MS },
+    );
+    const observerFence = new MaintenanceFence();
+    let lease: ReturnType<MaintenanceFence["acquire"]> | undefined;
+    class ObservedMarkerCloseFence extends MaintenanceFence {
+      readonly readinessObservations: boolean[] = [];
+      closeAttempts = 0;
+      markerOpen = false;
+      forceRelease: (() => void) | undefined;
+
+      override closeExecutor(
+        ...parameters: Parameters<MaintenanceFence["closeExecutor"]>
+      ): void {
+        super.closeExecutor(...parameters);
+        const [connection] = parameters;
+        const physicalClose = connection.close.bind(connection);
+        this.markerOpen = true;
+        this.forceRelease = () => {
+          this.markerOpen = false;
+          physicalClose();
+        };
+        connection.close = () => {
+          this.closeAttempts += 1;
+          assert.ok(lease);
+          this.readinessObservations.push(maintenanceReady(observer, observerFence, lease));
+          if (mode === "transient" && this.closeAttempts > 1) {
+            this.markerOpen = false;
+            physicalClose();
+            return;
+          }
+          throw new Error(`${mode} marker close failed`);
+        };
+      }
+    }
+    const workerFence = new ObservedMarkerCloseFence();
+    const backend = new ProjectStoreWorkerBackend({
+      selfUrl: WORKER_URL,
+      executorLeaseMs: 15_000,
+      appendRetryDeadlineMs: 10_000,
+      maintenanceFactory: () => workerFence,
+    });
+    const opened = await backend.dispatch({
+      id: `open-${mode}-publisher-close`,
+      type: "open",
+      binding: encodeWorkerBinding(context),
+    }) as WorkerOpenResult;
+    const acquiredAt = new Date().toISOString();
+    observer.exec("BEGIN IMMEDIATE");
+    lease = observerFence.acquire(
+      observer,
+      `${mode}-publisher-close`,
+      new Date(Date.now() + 60_000).toISOString(),
+      acquiredAt,
+    );
+    observer.exec("COMMIT");
+
+    const outcome = await backend.quiesceAndClose(
+      encodeMaintenanceLeaseWire(lease),
+      encodeWorkerBindingAssertion(context),
+    ).then(
+      () => "resolved",
+      (error: unknown) => error instanceof Error ? error.message : "unknown",
+    );
+    const readyAfterBackendClose = maintenanceReady(observer, observerFence, lease);
+    const leakedBeforeCleanup = workerFence.markerOpen;
+    try { workerFence.forceRelease?.(); } catch { /* transient close may already have released it */ }
+    observer.close();
+    const moved = `${context.binding.storeRoute.eventsPath}.${mode}-publisher-close`;
+    renameSync(context.binding.storeRoute.eventsPath, moved);
+    renameSync(moved, context.binding.storeRoute.eventsPath);
+
+    assert.equal(opened.executorId.length > 0, true);
+    return {
+      outcome,
+      readinessObservations: workerFence.readinessObservations,
+      closeAttempts: workerFence.closeAttempts,
+      leakedBeforeCleanup,
+      readyAfterBackendClose,
+    };
+  }
+
   it("revalidates identity on the actual writable handle after a file swap", async () => {
     const expected = await realContext();
     const foreign = await realContext();
@@ -1402,7 +2343,60 @@ describe("ProjectStoreWorkerBackend open identity", () => {
     renameSync(moved, context.binding.storeRoute.eventsPath);
   });
 
-  it("keeps maintenance readiness hidden until integrity children and the primary handle are closed", async () => {
+  it("does not publish normal-close readiness before the primary handle is released", async () => {
+    const context = await realContext();
+    const observer = new NodeSqliteDriver({ DatabaseSync }).open(
+      context.binding.storeRoute.eventsPath,
+      { mode: "existing", busyTimeoutMs: DEFAULT_BUSY_TIMEOUT_MS },
+    );
+    const observerFence = new MaintenanceFence();
+    const readinessObservations: boolean[] = [];
+    let closeExecutorCalls = 0;
+    class ConcurrentAcquireFence extends MaintenanceFence {
+      override closeExecutor(
+        ...parameters: Parameters<MaintenanceFence["closeExecutor"]>
+      ): void {
+        closeExecutorCalls += 1;
+        super.closeExecutor(...parameters);
+        const [connection] = parameters;
+        const physicalClose = connection.close.bind(connection);
+        connection.close = () => {
+          const acquiredAt = new Date().toISOString();
+          observer.exec("BEGIN IMMEDIATE");
+          const lease = observerFence.acquire(
+            observer,
+            "concurrent-normal-close",
+            new Date(Date.now() + 60_000).toISOString(),
+            acquiredAt,
+          );
+          observer.exec("COMMIT");
+          readinessObservations.push(maintenanceReady(observer, observerFence, lease));
+          physicalClose();
+        };
+      }
+    }
+    const backend = new ProjectStoreWorkerBackend({
+      selfUrl: WORKER_URL,
+      executorLeaseMs: 15_000,
+      appendRetryDeadlineMs: 10_000,
+      maintenanceFactory: () => new ConcurrentAcquireFence(),
+    });
+    await backend.dispatch({
+      id: "open-normal-close-ordering",
+      type: "open",
+      binding: encodeWorkerBinding(context),
+    });
+    await backend.close();
+    observer.close();
+    const moved = `${context.binding.storeRoute.eventsPath}.normal-close-ordering`;
+    renameSync(context.binding.storeRoute.eventsPath, moved);
+    renameSync(moved, context.binding.storeRoute.eventsPath);
+
+    assert.equal(closeExecutorCalls, 0);
+    assert.deepEqual(readinessObservations, []);
+  });
+
+  it("keeps worker-owned readiness hidden after integrity children and the primary handle close", async () => {
     const context = await realContext();
     const child = new DeferredTerminationWorker();
     const backend = new ProjectStoreWorkerBackend({
@@ -1487,87 +2481,35 @@ describe("ProjectStoreWorkerBackend open identity", () => {
     assert.equal(acknowledgementCountWhileClosing, 1n);
     assert.equal(closedAtWhileClosing, null);
     assert.equal(readyWhileClosing, false);
-    assert.equal(readyAfterClosing, true);
+    assert.equal(readyAfterClosing, false);
   });
 
-  it("retracts maintenance readiness and releases the marker handle when marker close fails", async () => {
-    const context = await realContext();
-    class OneShotMarkerCloseFailureFence extends MaintenanceFence {
-      closeAttempts = 0;
-      forceRelease: (() => void) | undefined;
-
-      override closeExecutor(
-        ...parameters: Parameters<MaintenanceFence["closeExecutor"]>
-      ): void {
-        super.closeExecutor(...parameters);
-        const [connection] = parameters;
-        const physicalClose = connection.close.bind(connection);
-        this.forceRelease = physicalClose;
-        connection.close = () => {
-          this.closeAttempts += 1;
-          if (this.closeAttempts === 1) throw new Error("marker close failed");
-          physicalClose();
-        };
-      }
-    }
-    const workerFence = new OneShotMarkerCloseFailureFence();
-    const backend = new ProjectStoreWorkerBackend({
-      selfUrl: WORKER_URL,
-      executorLeaseMs: 15_000,
-      appendRetryDeadlineMs: 10_000,
-      maintenanceFactory: () => workerFence,
+  it("never exposes worker readiness through a transient publisher close failure", async () => {
+    assert.deepEqual(await workerOwnedPublicationFault("transient"), {
+      outcome: "resolved",
+      readinessObservations: [],
+      closeAttempts: 0,
+      leakedBeforeCleanup: false,
+      readyAfterBackendClose: false,
     });
-    const opened = await backend.dispatch({
-      id: "open-marker-close-failure",
-      type: "open",
-      binding: encodeWorkerBinding(context),
-    }) as WorkerOpenResult;
-    const observer = new NodeSqliteDriver({ DatabaseSync }).open(
-      context.binding.storeRoute.eventsPath,
-      { mode: "existing", busyTimeoutMs: DEFAULT_BUSY_TIMEOUT_MS },
-    );
-    const fence = new MaintenanceFence();
-    const acquiredAt = new Date().toISOString();
-    observer.exec("BEGIN IMMEDIATE");
-    const lease = fence.acquire(
-      observer,
-      "marker-close-failure",
-      new Date(Date.now() + 60_000).toISOString(),
-      acquiredAt,
-    );
-    observer.exec("COMMIT");
-
-    await assert.rejects(backend.quiesceAndClose(
-      encodeMaintenanceLeaseWire(lease),
-      encodeWorkerBindingAssertion(context),
-    ), /marker close failed/);
-    const closedAtAfterFailure = observer.prepare(`
-      SELECT closed_at
-      FROM executor_leases
-      WHERE project_id = $projectId AND executor_id = $executorId
-    `).get({
-      $projectId: context.binding.projectId,
-      $executorId: opened.executorId,
-    })?.closed_at;
-    observer.exec("BEGIN DEFERRED");
-    const readyAfterFailure = fence.allRequiredExecutorsAcknowledged(observer, lease);
-    observer.exec("ROLLBACK");
-
-    try { workerFence.forceRelease?.(); } catch { /* production retry may already have closed it */ }
-    observer.close();
-    const moved = `${context.binding.storeRoute.eventsPath}.marker-close-failure`;
-    renameSync(context.binding.storeRoute.eventsPath, moved);
-    renameSync(moved, context.binding.storeRoute.eventsPath);
-
-    assert.equal(workerFence.closeAttempts, 2);
-    assert.equal(closedAtAfterFailure, null);
-    assert.equal(readyAfterFailure, false);
   });
 
-  it("physically closes SQLite even when executor close bookkeeping fails", async () => {
+  it("never creates a persistent publisher handle that requires post-hoc cleanup", async () => {
+    assert.deepEqual(await workerOwnedPublicationFault("persistent"), {
+      outcome: "resolved",
+      readinessObservations: [],
+      closeAttempts: 0,
+      leakedBeforeCleanup: false,
+      readyAfterBackendClose: false,
+    });
+  });
+
+  it("physically closes SQLite without publishing executor closure on normal close", async () => {
     const context = await realContext();
+    let closeExecutorCalls = 0;
     class FailingCloseFence extends MaintenanceFence {
       override closeExecutor(..._arguments: Parameters<MaintenanceFence["closeExecutor"]>): void {
+        closeExecutorCalls += 1;
         throw new Error("close bookkeeping failed");
       }
     }
@@ -1582,10 +2524,20 @@ describe("ProjectStoreWorkerBackend open identity", () => {
       type: "open",
       binding: encodeWorkerBinding(context),
     });
-    await assert.rejects(backend.close(), /close bookkeeping failed/);
+    await backend.close();
     const moved = `${context.binding.storeRoute.eventsPath}.bookkeeping-closed`;
     renameSync(context.binding.storeRoute.eventsPath, moved);
     renameSync(moved, context.binding.storeRoute.eventsPath);
+    const observer = new DatabaseSync(context.binding.storeRoute.eventsPath, { readOnly: true });
+    const closedAt = observer.prepare(`
+      SELECT closed_at
+      FROM executor_leases
+      WHERE project_id = ?
+    `).get(context.binding.projectId)?.closed_at;
+    observer.close();
+
+    assert.equal(closeExecutorCalls, 0);
+    assert.equal(closedAt, null);
   });
 
   it("does not commit an executor lease before fallible store service construction", async () => {

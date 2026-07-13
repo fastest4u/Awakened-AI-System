@@ -266,7 +266,6 @@ function assertBinding(context: ProjectContext, assertion: WorkerBindingAssertio
 
 interface ActiveStore {
   context: ProjectContext;
-  path: string;
   connection: SqliteConnection;
   maintenance: MaintenanceFence;
   eventStore: EventStore;
@@ -375,19 +374,9 @@ export class ProjectStoreWorkerBackend implements WorkerRuntimeBackend {
       failed = true;
     }
     try {
-      await this.closeHandles(active, false);
+      await this.closeHandles(active);
     } catch (error) {
       if (!failed) {
-        primaryError = error;
-        failed = true;
-      }
-    }
-    if (!failed) {
-      try {
-        // closed_at is the maintenance readiness marker. Publish it only
-        // after closeHandles has drained children and closed the primary DB.
-        await this.publishMaintenanceClosure(active, new Date().toISOString());
-      } catch (error) {
         primaryError = error;
         failed = true;
       }
@@ -400,117 +389,6 @@ export class ProjectStoreWorkerBackend implements WorkerRuntimeBackend {
     };
   }
 
-  private async publishMaintenanceClosure(active: ActiveStore, closedAt: string): Promise<void> {
-    const driver = await sqliteDriver();
-    const connection = driver.open(active.path, {
-      mode: "existing",
-      busyTimeoutMs: DEFAULT_BUSY_TIMEOUT_MS,
-    });
-    let primaryError: unknown;
-    let failed = false;
-    let transactionOpen = false;
-    try {
-      identityFromConnection(
-        connection,
-        {
-          projectId: active.context.binding.projectId,
-          vaultId: active.context.binding.vaultId,
-        },
-        active.context.binding.storeId,
-      );
-      connection.exec("BEGIN IMMEDIATE");
-      transactionOpen = true;
-      active.maintenance.closeExecutor(
-        connection,
-        active.context.binding.projectId,
-        active.executorId,
-        closedAt,
-      );
-      connection.exec("COMMIT");
-      transactionOpen = false;
-    } catch (error) {
-      if (transactionOpen) {
-        try { connection.exec("ROLLBACK"); } catch { /* preserve publication failure */ }
-      }
-      primaryError = error;
-      failed = true;
-    }
-    if (failed) {
-      try { connection.close(); } catch {
-        try { connection.close(); } catch { /* preserve publication failure */ }
-      }
-      throw primaryError;
-    }
-    try {
-      connection.close();
-    } catch (closeError) {
-      let retractionFailed = false;
-      try {
-        // A close exception leaves the marker handle's state unknown. Make
-        // readiness false again before retrying that physical close.
-        await this.retractMaintenanceClosure(active, closedAt);
-      } catch {
-        retractionFailed = true;
-      }
-      try { connection.close(); } catch { /* it may already have closed before throwing */ }
-      if (retractionFailed) failure("MAINTENANCE_READINESS_RETRACTION_FAILED");
-      throw closeError;
-    }
-  }
-
-  private async retractMaintenanceClosure(active: ActiveStore, closedAt: string): Promise<void> {
-    const driver = await sqliteDriver();
-    const connection = driver.open(active.path, {
-      mode: "existing",
-      busyTimeoutMs: DEFAULT_BUSY_TIMEOUT_MS,
-    });
-    let primaryError: unknown;
-    let failed = false;
-    let transactionOpen = false;
-    try {
-      identityFromConnection(
-        connection,
-        {
-          projectId: active.context.binding.projectId,
-          vaultId: active.context.binding.vaultId,
-        },
-        active.context.binding.storeId,
-      );
-      connection.exec("BEGIN IMMEDIATE");
-      transactionOpen = true;
-      const changed = connection.prepare(`
-        UPDATE executor_leases
-        SET closed_at = NULL
-        WHERE project_id = $projectId
-          AND executor_id = $executorId
-          AND closed_at = $closedAt
-      `).run({
-        $projectId: active.context.binding.projectId,
-        $executorId: active.executorId,
-        $closedAt: closedAt,
-      }).changes;
-      if (changed !== 1n) failure("MAINTENANCE_READINESS_RETRACTION_FAILED");
-      connection.exec("COMMIT");
-      transactionOpen = false;
-    } catch (error) {
-      if (transactionOpen) {
-        try { connection.exec("ROLLBACK"); } catch { /* preserve retraction failure */ }
-      }
-      primaryError = error;
-      failed = true;
-    }
-    try {
-      connection.close();
-    } catch (error) {
-      try { connection.close(); } catch { /* preserve the first cleanup failure */ }
-      if (!failed) {
-        primaryError = error;
-        failed = true;
-      }
-    }
-    if (failed) throw primaryError;
-  }
-
   async close(): Promise<void> {
     if (this.#closed) return;
     const active = this.#active;
@@ -519,7 +397,7 @@ export class ProjectStoreWorkerBackend implements WorkerRuntimeBackend {
       await this.terminateChildren();
       return;
     }
-    await this.closeHandles(active, true);
+    await this.closeHandles(active);
   }
 
   private ping(): WorkerSuccessData {
@@ -591,7 +469,6 @@ export class ProjectStoreWorkerBackend implements WorkerRuntimeBackend {
       connection.exec("COMMIT");
       this.#active = {
         context,
-        path,
         connection,
         maintenance,
         eventStore,
@@ -702,27 +579,10 @@ export class ProjectStoreWorkerBackend implements WorkerRuntimeBackend {
     await Promise.allSettled(children.map(async (child) => child.terminate()));
   }
 
-  private async closeHandles(active: ActiveStore, markLeaseClosed: boolean): Promise<void> {
+  private async closeHandles(active: ActiveStore): Promise<void> {
     await this.terminateChildren();
     let primaryError: unknown;
     let failed = false;
-    if (markLeaseClosed) {
-      const now = new Date().toISOString();
-      try {
-        active.connection.exec("BEGIN IMMEDIATE");
-        active.maintenance.closeExecutor(
-          active.connection,
-          active.context.binding.projectId,
-          active.executorId,
-          now,
-        );
-        active.connection.exec("COMMIT");
-      } catch (error) {
-        try { active.connection.exec("ROLLBACK"); } catch { /* preserve close failure */ }
-        primaryError = error;
-        failed = true;
-      }
-    }
     try {
       active.connection.close();
     } catch (error) {

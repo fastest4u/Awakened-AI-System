@@ -405,6 +405,36 @@ export class MaintenanceFence {
     if (changed !== 1n) fail("EXECUTOR_LEASE_NOT_ACTIVE");
   }
 
+  confirmExecutorClosed(
+    connection: SqliteConnection,
+    lease: MaintenanceLease,
+    projectId: ProjectId,
+    executorId: string,
+    now: string,
+  ): void {
+    assertCurrentLease(connection, lease, now);
+    const executor = nonEmpty(executorId, "MAINTENANCE_EXECUTOR_NOT_REQUIRED");
+    const confirmation = connection.prepare(`
+      SELECT required.fencing_token AS required_fencing_token,
+             acknowledged.fencing_token AS acknowledged_fencing_token
+      FROM maintenance_required_executors AS required
+      LEFT JOIN maintenance_acknowledgements AS acknowledged
+        ON acknowledged.epoch = required.epoch
+       AND acknowledged.executor_id = required.executor_id
+      WHERE required.epoch = $epoch AND required.executor_id = $executorId
+    `).get({
+      $epoch: lease.epoch,
+      $executorId: executor,
+    });
+    if (confirmation?.required_fencing_token !== lease.fencingToken) {
+      fail("MAINTENANCE_EXECUTOR_NOT_REQUIRED");
+    }
+    if (confirmation.acknowledged_fencing_token !== lease.fencingToken) {
+      fail("MAINTENANCE_ACKNOWLEDGEMENT_REQUIRED");
+    }
+    this.closeExecutor(connection, projectId, executor, now);
+  }
+
   acquire(
     connection: SqliteConnection,
     ownerId: string,

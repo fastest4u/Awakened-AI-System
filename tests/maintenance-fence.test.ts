@@ -332,6 +332,82 @@ describe("MaintenanceFence", () => {
     });
   });
 
+  it("lets only the maintenance owner confirm an acknowledged executor for the exact current lease", () => {
+    const connection = createConnection();
+    const fence = new MaintenanceFence();
+    transaction(connection, () => fence.registerExecutor(
+      connection,
+      PROJECT_ID,
+      "executor-owner-confirmed",
+      1,
+      "fingerprint-owner-confirmed",
+      "2026-07-13T10:00:00Z",
+      "2026-07-13T00:00:00Z",
+    ));
+    const stale = transaction(connection, () => fence.acquire(
+      connection,
+      "maintenance-a",
+      "2026-07-13T02:00:00Z",
+      "2026-07-13T01:00:00Z",
+    ));
+    transaction(connection, () => fence.acknowledge(
+      connection,
+      stale,
+      "executor-owner-confirmed",
+      "2026-07-13T01:10:00Z",
+    ));
+    const current = transaction(connection, () => fence.acquire(
+      connection,
+      "maintenance-b",
+      "2026-07-13T05:00:00Z",
+      "2026-07-13T03:00:00Z",
+    ));
+
+    expectCode(
+      () => transaction(connection, () => fence.confirmExecutorClosed(
+        connection,
+        stale,
+        PROJECT_ID,
+        "executor-owner-confirmed",
+        "2026-07-13T03:10:00Z",
+      )),
+      "MAINTENANCE_LEASE_STALE",
+    );
+    expectCode(
+      () => transaction(connection, () => fence.confirmExecutorClosed(
+        connection,
+        current,
+        PROJECT_ID,
+        "executor-owner-confirmed",
+        "2026-07-13T03:15:00Z",
+      )),
+      "MAINTENANCE_ACKNOWLEDGEMENT_REQUIRED",
+    );
+    assert.equal(connection.prepare(`
+      SELECT closed_at
+      FROM executor_leases
+      WHERE project_id = $projectId AND executor_id = $executorId
+    `).get({
+      $projectId: PROJECT_ID,
+      $executorId: "executor-owner-confirmed",
+    })?.closed_at, null);
+
+    transaction(connection, () => fence.acknowledge(
+      connection,
+      current,
+      "executor-owner-confirmed",
+      "2026-07-13T03:20:00Z",
+    ));
+    transaction(connection, () => fence.confirmExecutorClosed(
+      connection,
+      current,
+      PROJECT_ID,
+      "executor-owner-confirmed",
+      "2026-07-13T03:21:00Z",
+    ));
+    assert.equal(fence.allRequiredExecutorsAcknowledged(connection, current), true);
+  });
+
   it("does not turn later executor expiry or closure into an acknowledgement", () => {
     const connection = createConnection();
     const fence = new MaintenanceFence();
