@@ -538,6 +538,48 @@ describe("EventStore", () => {
     });
   });
 
+  it("persists compact command-time workspace and outbox-order witnesses", () => {
+    const gitFixture = createFixture();
+    const gitCommand = appendCommand(gitFixture.context, {
+      outbox: [
+        {
+          targetKey: "test/second",
+          kind: "second",
+          eventIndex: 0,
+          payload: { ordinal: 2 },
+        },
+        {
+          targetKey: "test/first",
+          kind: "first",
+          eventIndex: 0,
+          payload: { ordinal: 1 },
+        },
+      ],
+    });
+    gitFixture.store.append(gitCommand);
+    assert.deepEqual({ ...gitFixture.connection.prepare(`
+      SELECT workspace_head_commit, outbox_order_json FROM command_dedup
+    `).get() }, {
+      workspace_head_commit: gitWorkspace().headCommit,
+      outbox_order_json: canonicalJson(["test/second", "test/first"]),
+    });
+
+    const localWorkspace: NonGitWorkspaceSnapshot = {
+      kind: "non-git",
+      workspaceRoot: "C:\\project",
+      workspaceId: "workspace-local-witness" as WorkspaceId,
+    };
+    const localContext = contextFor(localWorkspace);
+    const localFixture = createFixture({ context: localContext });
+    localFixture.store.append(appendCommand(localContext, { outbox: [] }));
+    assert.deepEqual({ ...localFixture.connection.prepare(`
+      SELECT workspace_head_commit, outbox_order_json FROM command_dedup
+    `).get() }, {
+      workspace_head_commit: null,
+      outbox_order_json: "[]",
+    });
+  });
+
   it("locks the complete semantic command hash while excluding generated and transport-only fields", () => {
     const fixture = createFixture();
     const command = appendCommand(fixture.context);

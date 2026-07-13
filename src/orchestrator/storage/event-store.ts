@@ -699,12 +699,14 @@ export class SqliteEventStoreStatements implements EventStoreStatements {
     this.#insertDedup = connection.prepare(`
       INSERT INTO command_dedup(
         project_id, idempotency_key, command_id, command_type, command_hash,
-        state, first_global_position, last_global_position, final_stream_version,
-        event_ids_json, response_json, response_hash, committed_at
+        workspace_head_commit, outbox_order_json, state, first_global_position,
+        last_global_position, final_stream_version, event_ids_json, response_json,
+        response_hash, committed_at
       ) VALUES (
         $projectId, $idempotencyKey, $commandId, $commandType, $commandHash,
-        'committed', $firstGlobalPosition, $lastGlobalPosition, $finalStreamVersion,
-        $eventIdsJson, $responseJson, $responseHash, $committedAt
+        $workspaceHeadCommit, $outboxOrderJson, 'committed', $firstGlobalPosition,
+        $lastGlobalPosition, $finalStreamVersion, $eventIdsJson, $responseJson,
+        $responseHash, $committedAt
       )
     `);
   }
@@ -872,6 +874,10 @@ export class SqliteEventStoreStatements implements EventStoreStatements {
       $commandId: command.commandId,
       $commandType: command.commandType,
       $commandHash: commandHashValue,
+      $workspaceHeadCommit: command.context.workspace.kind === "git"
+        ? command.context.workspace.headCommit
+        : null,
+      $outboxOrderJson: canonical(command.outbox.map((item) => item.targetKey)),
       $firstGlobalPosition: BigInt(response.firstGlobalPosition),
       $lastGlobalPosition: BigInt(response.lastGlobalPosition),
       $finalStreamVersion: BigInt(response.finalStreamVersion),

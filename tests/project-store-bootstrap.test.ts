@@ -120,7 +120,7 @@ describe("DefaultProjectStoreBootstrapService", () => {
   it("preserves the event-core schema fingerprint after lazy native loading", () => {
     assert.equal(
       expectedSchemaFingerprint([eventCoreMigration], DatabaseSync),
-      "6b68aaaaab73b813f4a1f040a8adb0f519490fdfaa3d3f01a94e9ff067b6ab0b",
+      "cc5836d8494419704620cd406cce41a60c1cd387d5008242915a3a18094f3001",
     );
   });
 

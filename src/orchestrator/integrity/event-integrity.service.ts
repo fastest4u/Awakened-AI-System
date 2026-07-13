@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import {
   commandHash,
   eventHash,
+  outboxHash,
   payloadHash,
   responseHash,
 } from "../crypto/event-hash.js";
@@ -42,6 +43,11 @@ const STORED_RESPONSE_KEYS = [
   "lastGlobalPosition",
   "response",
 ].sort().join("\n");
+const COMMAND_WITNESS_DATA_ERRORS = new Set([
+  "CANONICAL_JSON_INVALID",
+  "INTEGRITY_JSON_NONCANONICAL",
+  "INTEGRITY_ROW_INVALID",
+]);
 
 const ISSUE_MESSAGES: Record<IntegrityIssueCode, string> = {
   PROJECT_ID_MISMATCH: "Project identity does not match the bound project",
@@ -105,6 +111,8 @@ interface CommandRow {
   commandId: string;
   commandType: string;
   commandHash: string;
+  workspaceHeadCommit: string | null;
+  outboxOrderJson: string;
   state: string;
   firstGlobalPosition: bigint;
   lastGlobalPosition: bigint;
@@ -120,6 +128,14 @@ interface StructuralCheck {
   events: EventIndexRow[];
   streams: StreamRow[];
   commands: CommandRow[];
+}
+
+class CommandWitnessInvalidError extends Error {}
+
+function isCommandWitnessInvalid(error: unknown): boolean {
+  return error instanceof CommandWitnessInvalidError
+    || error instanceof SyntaxError
+    || (error instanceof Error && COMMAND_WITNESS_DATA_ERRORS.has(error.message));
 }
 
 class IssueCollector {
@@ -254,6 +270,8 @@ function commandRow(row: SqliteRow): CommandRow {
     commandId: stringValue(row, "command_id"),
     commandType: stringValue(row, "command_type"),
     commandHash: stringValue(row, "command_hash"),
+    workspaceHeadCommit: nullableStringValue(row, "workspace_head_commit"),
+    outboxOrderJson: stringValue(row, "outbox_order_json"),
     state: stringValue(row, "state"),
     firstGlobalPosition: bigintValue(row, "first_global_position"),
     lastGlobalPosition: bigintValue(row, "last_global_position"),
@@ -469,9 +487,9 @@ export class EventIntegrityService {
     const commands = includeStreamsAndCommands
       ? this.connection.prepare(`
           SELECT project_id, idempotency_key, command_id, first_global_position,
-                 command_type, command_hash, state, last_global_position,
-                 final_stream_version, event_ids_json, response_json, response_hash,
-                 committed_at
+                 command_type, command_hash, workspace_head_commit,
+                 outbox_order_json, state, last_global_position, final_stream_version,
+                 event_ids_json, response_json, response_hash, committed_at
           FROM command_dedup
           ORDER BY project_id, first_global_position, command_id
         `).all().map(commandRow)
@@ -768,122 +786,182 @@ export class EventIntegrityService {
     }
     if (!metadataMatches) issues.add("COMMAND_METADATA_MISMATCH", location);
 
-    const expectedHash = this.reconstructCommandHash(command, rows);
-    if (expectedHash !== undefined && expectedHash !== command.commandHash) {
-      issues.add("COMMAND_HASH_MISMATCH", location);
+    try {
+      const expectedHash = this.reconstructCommandHash(command, rows);
+      if (expectedHash !== command.commandHash) {
+        issues.add("COMMAND_HASH_MISMATCH", location);
+      }
+    } catch (error) {
+      if (!isCommandWitnessInvalid(error)) throw error;
+      issues.add("COMMAND_METADATA_MISMATCH", location);
     }
   }
 
   private reconstructCommandHash(
     command: CommandRow,
     sourceRows: readonly SqliteRow[],
-  ): string | undefined {
-    try {
-      const rows = [...sourceRows].sort((left, right) => {
-        const leftIndex = bigintValue(left, "command_event_index");
-        const rightIndex = bigintValue(right, "command_event_index");
-        return leftIndex === rightIndex ? 0 : leftIndex < rightIndex ? -1 : 1;
-      });
-      const first = rows[0];
-      if (first === undefined) return undefined;
-      for (let index = 0; index < rows.length; index += 1) {
-        const row = rows[index]!;
-        if (
-          bigintValue(row, "command_event_index") !== BigInt(index)
-          || !this.matchesEventHash(row)
-        ) {
-          return undefined;
-        }
-        const payload = canonicalJsonValue(stringValue(row, "payload_json"));
-        if (payloadHash(payload) !== stringValue(row, "payload_hash")) return undefined;
+  ): string {
+    const invalid = (): never => {
+      throw new CommandWitnessInvalidError("COMMAND_WITNESS_INVALID");
+    };
+    const rows = [...sourceRows].sort((left, right) => {
+      const leftIndex = bigintValue(left, "command_event_index");
+      const rightIndex = bigintValue(right, "command_event_index");
+      return leftIndex === rightIndex ? 0 : leftIndex < rightIndex ? -1 : 1;
+    });
+    const first = rows[0];
+    if (first === undefined) return invalid();
+    const tupleFields = [
+      "project_id",
+      "store_id",
+      "workspace_id",
+      "stream_id",
+      "stream_type",
+      "correlation_id",
+      "agent_id",
+      "branch_scope_id",
+      "branch_ref",
+    ] as const;
+    for (let index = 0; index < rows.length; index += 1) {
+      const row = rows[index]!;
+      if (
+        bigintValue(row, "command_event_index") !== BigInt(index)
+        || tupleFields.some((field) => row[field] !== first[field])
+        || !this.matchesEventHash(row)
+      ) {
+        return invalid();
       }
-
-      const branchScopeId = nullableStringValue(first, "branch_scope_id");
-      const branchRef = nullableStringValue(first, "branch_ref");
-      let git: { headCommit: string; branchRef: null; detached: true } | null;
-      if (branchScopeId === null && branchRef === null) {
-        git = null;
-      } else if (branchScopeId !== null && branchRef === null) {
-        const scopeRows = this.connection.prepare(`
-          SELECT created_head
-          FROM branch_scopes
-          WHERE project_id = $projectId AND branch_scope_id = $branchScopeId
-        `).all({
-          $projectId: stringValue(first, "project_id"),
-          $branchScopeId: branchScopeId,
-        });
-        if (scopeRows.length !== 1) return undefined;
-        git = {
-          headCommit: stringValue(scopeRows[0]!, "created_head"),
-          branchRef: null,
-          detached: true,
-        };
-      } else {
-        // Attached Git events do not yet persist the per-command HEAD witness.
-        return undefined;
-      }
-
-      const outboxRows = this.connection.prepare(`
-        SELECT outbox.target_key, outbox.kind, outbox.payload_json,
-               events.command_event_index
-        FROM outbox
-        JOIN events ON events.global_position = outbox.event_position
-        WHERE events.project_id = $projectId AND events.command_id = $commandId
-      `).all({
-        $projectId: command.projectId,
-        $commandId: command.commandId,
-      });
-      // The current schema does not persist original ordering for multiple outbox items.
-      if (outboxRows.length > 1) return undefined;
-      const outbox = outboxRows.map((row) => {
-        const eventIndex = safeNumber(bigintValue(row, "command_event_index"));
-        if (eventIndex === undefined) throw new Error("INTEGRITY_ROW_INVALID");
-        return {
-          targetKey: stringValue(row, "target_key"),
-          kind: stringValue(row, "kind"),
-          eventIndex,
-          payload: canonicalJsonValue(stringValue(row, "payload_json")),
-        };
-      });
-      const normalizedEvents = rows.map((row) => {
-        const eventSchemaVersion = safeNumber(bigintValue(row, "event_schema_version"));
-        if (eventSchemaVersion === undefined) throw new Error("INTEGRITY_ROW_INVALID");
-        return {
-          eventType: stringValue(row, "event_type"),
-          eventSchemaVersion,
-          occurredAt: stringValue(row, "occurred_at"),
-          visibilityScope: stringValue(row, "visibility_scope"),
-          sessionId: nullableStringValue(row, "session_id"),
-          parentSessionId: nullableStringValue(row, "parent_session_id"),
-          causationId: nullableStringValue(row, "causation_id"),
-          confidence: stringValue(row, "confidence"),
-          verificationStatus: stringValue(row, "verification_status"),
-          payload: canonicalJsonValue(stringValue(row, "payload_json")),
-          sourceRefs: canonicalJsonValue(stringValue(row, "source_refs_json")),
-          evidenceRefs: canonicalJsonValue(stringValue(row, "evidence_refs_json")),
-          evidenceDigests: canonicalJsonValue(stringValue(row, "evidence_digests_json")),
-        };
-      });
-      const firstStreamVersion = bigintValue(first, "stream_version");
-      if (firstStreamVersion < 1n) return undefined;
-      return commandHash({
-        commandId: command.commandId,
-        commandType: command.commandType,
-        projectId: command.projectId,
-        storeId: stringValue(first, "store_id"),
-        workspaceId: stringValue(first, "workspace_id"),
-        git,
-        streamId: stringValue(first, "stream_id"),
-        streamType: stringValue(first, "stream_type"),
-        expectedStreamVersion: (firstStreamVersion - 1n).toString(),
-        correlationId: stringValue(first, "correlation_id"),
-        agentId: stringValue(first, "agent_id"),
-        events: normalizedEvents,
-        outbox,
-      });
-    } catch {
-      return undefined;
+      const payload = canonicalJsonValue(stringValue(row, "payload_json"));
+      if (payloadHash(payload) !== stringValue(row, "payload_hash")) return invalid();
     }
+
+    const branchScopeId = nullableStringValue(first, "branch_scope_id");
+    const branchRef = nullableStringValue(first, "branch_ref");
+    const workspaceHeadCommit = command.workspaceHeadCommit;
+    let git: {
+      headCommit: string;
+      branchRef: string | null;
+      detached: boolean;
+    } | null;
+    if (branchScopeId === null) {
+      if (branchRef !== null || workspaceHeadCommit !== null) return invalid();
+      git = null;
+    } else {
+      if (
+        branchScopeId.length === 0
+        || workspaceHeadCommit === null
+        || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(workspaceHeadCommit)
+        || (branchRef !== null && branchRef.length === 0)
+      ) {
+        return invalid();
+      }
+      const scopeRows = this.connection.prepare(`
+        SELECT created_head
+        FROM branch_scopes
+        WHERE project_id = $projectId AND branch_scope_id = $branchScopeId
+      `).all({
+        $projectId: stringValue(first, "project_id"),
+        $branchScopeId: branchScopeId,
+      });
+      if (
+        scopeRows.length !== 1
+        || (branchRef === null
+          && stringValue(scopeRows[0]!, "created_head") !== workspaceHeadCommit)
+      ) {
+        return invalid();
+      }
+      git = {
+        headCommit: workspaceHeadCommit,
+        branchRef,
+        detached: branchRef === null,
+      };
+    }
+
+    const parsedOrder = canonicalJsonValue(command.outboxOrderJson);
+    if (
+      !Array.isArray(parsedOrder)
+      || parsedOrder.some((target) => typeof target !== "string" || target.length === 0)
+      || new Set(parsedOrder).size !== parsedOrder.length
+    ) {
+      return invalid();
+    }
+    const outboxRows = this.connection.prepare(`
+      SELECT outbox.target_key, outbox.kind, outbox.payload_json,
+             outbox.content_hash, outbox.event_position, events.command_event_index
+      FROM outbox
+      JOIN events ON events.global_position = outbox.event_position
+      WHERE outbox.project_id = $projectId
+        AND events.project_id = $projectId
+        AND events.command_id = $commandId
+    `).all({
+      $projectId: command.projectId,
+      $commandId: command.commandId,
+    });
+    if (outboxRows.length !== parsedOrder.length) return invalid();
+    const outboxByTarget = new Map<string, SqliteRow>();
+    for (const row of outboxRows) {
+      const targetKey = stringValue(row, "target_key");
+      if (outboxByTarget.has(targetKey)) return invalid();
+      outboxByTarget.set(targetKey, row);
+    }
+    const outbox = parsedOrder.map((targetKey) => {
+      const row = outboxByTarget.get(targetKey as string);
+      if (row === undefined) return invalid();
+      const eventIndex = safeNumber(bigintValue(row, "command_event_index"));
+      const payload = canonicalJsonValue(stringValue(row, "payload_json"));
+      if (
+        eventIndex === undefined
+        || rows[eventIndex] === undefined
+        || bigintValue(row, "event_position") !== bigintValue(rows[eventIndex]!, "global_position")
+        || outboxHash(payload) !== stringValue(row, "content_hash")
+      ) {
+        return invalid();
+      }
+      const kind = stringValue(row, "kind");
+      if (kind.length === 0) return invalid();
+      return {
+        targetKey: targetKey as string,
+        kind,
+        eventIndex,
+        payload,
+      };
+    });
+    const normalizedEvents = rows.map((row) => {
+      const eventSchemaVersion = safeNumber(bigintValue(row, "event_schema_version"));
+      if (eventSchemaVersion === undefined) return invalid();
+      return {
+        eventType: stringValue(row, "event_type"),
+        eventSchemaVersion,
+        occurredAt: stringValue(row, "occurred_at"),
+        visibilityScope: stringValue(row, "visibility_scope"),
+        sessionId: nullableStringValue(row, "session_id"),
+        parentSessionId: nullableStringValue(row, "parent_session_id"),
+        causationId: nullableStringValue(row, "causation_id"),
+        confidence: stringValue(row, "confidence"),
+        verificationStatus: stringValue(row, "verification_status"),
+        payload: canonicalJsonValue(stringValue(row, "payload_json")),
+        sourceRefs: canonicalJsonValue(stringValue(row, "source_refs_json")),
+        evidenceRefs: canonicalJsonValue(stringValue(row, "evidence_refs_json")),
+        evidenceDigests: canonicalJsonValue(stringValue(row, "evidence_digests_json")),
+      };
+    });
+    const firstStreamVersion = bigintValue(first, "stream_version");
+    if (firstStreamVersion < 1n) return invalid();
+    return commandHash({
+      commandId: command.commandId,
+      commandType: command.commandType,
+      projectId: command.projectId,
+      storeId: stringValue(first, "store_id"),
+      workspaceId: stringValue(first, "workspace_id"),
+      git,
+      streamId: stringValue(first, "stream_id"),
+      streamType: stringValue(first, "stream_type"),
+      expectedStreamVersion: (firstStreamVersion - 1n).toString(),
+      correlationId: stringValue(first, "correlation_id"),
+      agentId: stringValue(first, "agent_id"),
+      events: normalizedEvents,
+      outbox,
+    });
   }
 
   private checkEventRows(

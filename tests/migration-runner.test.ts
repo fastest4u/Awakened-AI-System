@@ -165,6 +165,27 @@ describe("MigrationRunner", () => {
         const row = tableRows.find((candidate) => candidate.name === table);
         assert.equal(row?.strict, 1n, `${table} must be STRICT`);
       }
+      const commandColumns = connection.prepare("PRAGMA table_info(command_dedup)").all();
+      assert.deepEqual(
+        commandColumns.map((row) => row.name),
+        [
+          "project_id",
+          "idempotency_key",
+          "command_id",
+          "command_type",
+          "command_hash",
+          "workspace_head_commit",
+          "outbox_order_json",
+          "state",
+          "first_global_position",
+          "last_global_position",
+          "final_stream_version",
+          "event_ids_json",
+          "response_json",
+          "response_hash",
+          "committed_at",
+        ],
+      );
       for (const forbidden of [
         "evidence",
         "projection_state",
@@ -261,12 +282,13 @@ describe("MigrationRunner", () => {
 
       connection.exec(`
         INSERT INTO command_dedup(
-          project_id, idempotency_key, command_id, command_type, command_hash, state,
+          project_id, idempotency_key, command_id, command_type, command_hash,
+          workspace_head_commit, outbox_order_json, state,
           first_global_position, last_global_position, final_stream_version,
           event_ids_json, response_json, response_hash, committed_at
         ) VALUES (
           '11111111-1111-4111-8111-111111111111', 'idempotency-1', 'command-1',
-          'record', '${"c".repeat(64)}', 'committed', 1, 1, 1,
+          'record', '${"c".repeat(64)}', NULL, '[]', 'committed', 1, 1, 1,
           '["event-1"]', '{}', '${"d".repeat(64)}', '2026-07-11T00:00:00.000Z'
         );
       `);

@@ -10,8 +10,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, it } from "node:test";
-import type { AppendCommand, JsonValue, PendingEvent } from "../src/orchestrator/contracts/event.js";
 import type {
+  AppendCommand,
+  JsonValue,
+  PendingEvent,
+  PendingOutbox,
+} from "../src/orchestrator/contracts/event.js";
+import type {
+  GitWorkspaceSnapshot,
   NonGitWorkspaceSnapshot,
   ProjectBinding,
   ProjectContext,
@@ -23,7 +29,11 @@ import type {
 import { ProjectDescriptorRepository } from "../src/orchestrator/identity/project-descriptor.repository.js";
 import { ProjectStoreRouter } from "../src/orchestrator/identity/project-store.router.js";
 import { StoreManifestRepository } from "../src/orchestrator/identity/store-manifest.repository.js";
-import { eventHash, responseHash } from "../src/orchestrator/crypto/event-hash.js";
+import {
+  eventHash,
+  outboxHash,
+  responseHash,
+} from "../src/orchestrator/crypto/event-hash.js";
 import {
   EventIntegrityService,
   MAX_INTEGRITY_RANGE_EVENTS,
@@ -72,6 +82,7 @@ interface Fixture {
   context: ProjectContext;
   integrity: EventIntegrityService;
   manifestRepository: StoreManifestRepository;
+  store: EventStore;
 }
 
 function uuid(index: number): string {
@@ -226,7 +237,51 @@ function createFixture(options: { append?: boolean } = {}): Fixture {
     context,
     integrity: new EventIntegrityService(connection),
     manifestRepository,
+    store: eventStore,
   };
+}
+
+function gitContext(
+  fixture: Fixture,
+  overrides: Partial<GitWorkspaceSnapshot> = {},
+): ProjectContext {
+  const workspace: GitWorkspaceSnapshot = {
+    kind: "git",
+    worktreeRoot: join(fixture.root, "project"),
+    gitDir: join(fixture.root, "project", ".git", "worktrees", "integrity"),
+    gitCommonDir: join(fixture.root, "project", ".git"),
+    headCommit: "0123456789abcdef0123456789abcdef01234567",
+    branchRef: "refs/heads/main",
+    detached: false,
+    workspaceId: "workspace-integrity-git" as WorkspaceId,
+    ...overrides,
+  };
+  return {
+    binding: {
+      ...fixture.context.binding,
+      workspaceId: workspace.workspaceId,
+      workspace,
+    },
+    workspace,
+    checkedAt: NOW,
+  };
+}
+
+function twoOutboxItems(eventIndex = 0): PendingOutbox[] {
+  return [
+    {
+      targetKey: "integrity/outbox/second",
+      kind: "materialize-second",
+      eventIndex,
+      payload: { ordinal: 2 },
+    },
+    {
+      targetKey: "integrity/outbox/first",
+      kind: "materialize-first",
+      eventIndex,
+      payload: { ordinal: 1 },
+    },
+  ];
 }
 
 function issueCodes(report: { issues: readonly { code: string }[] }): string[] {
@@ -925,6 +980,364 @@ describe("EventIntegrityService schema, stream, and command checks", () => {
   });
 });
 
+describe("EventIntegrityService immutable command witnesses", () => {
+  const matrix = [
+    {
+      name: "local command with no outbox",
+      context: (fixture: Fixture): ProjectContext => fixture.context,
+      outbox: (): PendingOutbox[] => [],
+    },
+    {
+      name: "local command with one outbox item",
+      context: (fixture: Fixture): ProjectContext => fixture.context,
+      outbox: (): PendingOutbox[] => [twoOutboxItems()[0]!],
+    },
+    {
+      name: "detached Git command with one outbox item",
+      context: (fixture: Fixture): ProjectContext => gitContext(fixture, {
+        branchRef: null,
+        detached: true,
+      }),
+      outbox: (): PendingOutbox[] => [twoOutboxItems()[0]!],
+    },
+    {
+      name: "detached Git command with no outbox",
+      context: (fixture: Fixture): ProjectContext => gitContext(fixture, {
+        branchRef: null,
+        detached: true,
+      }),
+      outbox: (): PendingOutbox[] => [],
+    },
+    {
+      name: "detached Git command with two ordered outbox items for one event",
+      context: (fixture: Fixture): ProjectContext => gitContext(fixture, {
+        branchRef: null,
+        detached: true,
+      }),
+      outbox: (): PendingOutbox[] => twoOutboxItems(),
+    },
+    {
+      name: "attached Git command with one outbox item",
+      context: (fixture: Fixture): ProjectContext => gitContext(fixture),
+      outbox: (): PendingOutbox[] => [twoOutboxItems()[0]!],
+    },
+    {
+      name: "attached Git command with no outbox",
+      context: (fixture: Fixture): ProjectContext => gitContext(fixture),
+      outbox: (): PendingOutbox[] => [],
+    },
+    {
+      name: "attached Git command with two ordered outbox items for one event",
+      context: (fixture: Fixture): ProjectContext => gitContext(fixture),
+      outbox: (): PendingOutbox[] => twoOutboxItems(),
+    },
+    {
+      name: "local command with two ordered outbox items for one event",
+      context: (fixture: Fixture): ProjectContext => fixture.context,
+      outbox: (): PendingOutbox[] => twoOutboxItems(),
+    },
+  ] as const;
+
+  for (const entry of matrix) {
+    it(`recomputes the command hash for ${entry.name}`, () => {
+      const fixture = createFixture({ append: false });
+      const context = entry.context(fixture);
+      fixture.store.append({
+        ...appendCommand(context, COMMAND_A, "integrity:witness", "stream-witness", "witness", 1),
+        outbox: entry.outbox(),
+      });
+      assert.equal(fixture.integrity.fullCheck(context).ok, true, entry.name);
+
+      mutateProtected(fixture, "command_dedup_no_update", () => {
+        fixture.connection.prepare(`
+          UPDATE command_dedup SET command_hash = $commandHash WHERE command_id = $commandId
+        `).run({ $commandHash: "e".repeat(64), $commandId: COMMAND_A });
+      });
+
+      const report = fixture.integrity.fullCheck(context);
+      assert.equal(report.ok, false, entry.name);
+      assert.ok(issueCodes(report).includes("COMMAND_HASH_MISMATCH"), entry.name);
+    });
+  }
+
+  it("retains the exact command-time head when one attached branch scope advances", () => {
+    const fixture = createFixture({ append: false });
+    const firstHead = "0123456789abcdef0123456789abcdef01234567";
+    const secondHead = "89abcdef0123456789abcdef0123456789abcdef";
+    const firstContext = gitContext(fixture, { headCommit: firstHead });
+    const secondContext = gitContext(fixture, { headCommit: secondHead });
+    fixture.store.append(appendCommand(
+      firstContext,
+      COMMAND_A,
+      "integrity:head-a",
+      "stream-head-a",
+      "head-a",
+      1,
+    ));
+    fixture.store.append(appendCommand(
+      secondContext,
+      COMMAND_B,
+      "integrity:head-b",
+      "stream-head-b",
+      "head-b",
+      3,
+    ));
+
+    assert.equal(
+      fixture.connection.prepare("SELECT count(*) AS count FROM branch_scopes").get()?.count,
+      1n,
+    );
+    assert.deepEqual(
+      fixture.connection.prepare(`
+        SELECT workspace_head_commit FROM command_dedup ORDER BY first_global_position
+      `).all().map((row) => row.workspace_head_commit),
+      [firstHead, secondHead],
+    );
+    assert.equal(fixture.integrity.fullCheck(secondContext).ok, true);
+
+    mutateProtected(fixture, "command_dedup_no_update", () => {
+      fixture.connection.prepare(`
+        UPDATE command_dedup SET command_hash = $commandHash WHERE command_id = $commandId
+      `).run({ $commandHash: "e".repeat(64), $commandId: COMMAND_B });
+    });
+    const report = fixture.integrity.fullCheck(secondContext);
+    assert.equal(report.ok, false);
+    assert.ok(issueCodes(report).includes("COMMAND_HASH_MISMATCH"));
+  });
+
+  it("binds a detached command head to its branch scope creation head", () => {
+    const fixture = createFixture({ append: false });
+    const context = gitContext(fixture, { branchRef: null, detached: true });
+    fixture.store.append(appendCommand(
+      context,
+      COMMAND_A,
+      "integrity:detached-head",
+      "stream-detached-head",
+      "detached-head",
+      1,
+    ));
+    assert.equal(fixture.integrity.fullCheck(context).ok, true);
+
+    fixture.connection.prepare(`
+      UPDATE branch_scopes SET created_head = $head
+    `).run({ $head: "89abcdef0123456789abcdef0123456789abcdef" });
+
+    const report = fixture.integrity.fullCheck(context);
+    assert.equal(report.ok, false);
+    assert.ok(issueCodes(report).includes("COMMAND_METADATA_MISMATCH"));
+  });
+
+  const outboxCorruptions: ReadonlyArray<{
+    name: string;
+    expectedCode: "COMMAND_HASH_MISMATCH" | "COMMAND_METADATA_MISMATCH";
+    mutate: (fixture: Fixture) => void;
+  }> = [
+    {
+      name: "reordered witness",
+      expectedCode: "COMMAND_HASH_MISMATCH",
+      mutate: (fixture) => mutateProtected(fixture, "command_dedup_no_update", () => {
+        fixture.connection.prepare(`
+          UPDATE command_dedup SET outbox_order_json = $order WHERE command_id = $commandId
+        `).run({
+          $order: canonicalJson(["integrity/outbox/first", "integrity/outbox/second"]),
+          $commandId: COMMAND_A,
+        });
+      }),
+    },
+    ...[
+      ["duplicate witness target", ["integrity/outbox/second", "integrity/outbox/second"]],
+      ["missing witness target", ["integrity/outbox/second"]],
+      ["extra witness target", [
+        "integrity/outbox/second",
+        "integrity/outbox/first",
+        "integrity/outbox/extra",
+      ]],
+    ].map(([name, order]) => ({
+      name: name as string,
+      expectedCode: "COMMAND_METADATA_MISMATCH" as const,
+      mutate: (fixture: Fixture): void => mutateProtected(
+        fixture,
+        "command_dedup_no_update",
+        () => {
+          fixture.connection.prepare(`
+            UPDATE command_dedup SET outbox_order_json = $order WHERE command_id = $commandId
+          `).run({ $order: canonicalJson(order), $commandId: COMMAND_A });
+        },
+      ),
+    })),
+    {
+      name: "noncanonical witness JSON",
+      expectedCode: "COMMAND_METADATA_MISMATCH",
+      mutate: (fixture) => mutateProtected(fixture, "command_dedup_no_update", () => {
+        fixture.connection.prepare(`
+          UPDATE command_dedup SET outbox_order_json = $order WHERE command_id = $commandId
+        `).run({
+          $order: '[ "integrity/outbox/second", "integrity/outbox/first" ]',
+          $commandId: COMMAND_A,
+        });
+      }),
+    },
+    {
+      name: "deleted outbox row",
+      expectedCode: "COMMAND_METADATA_MISMATCH",
+      mutate: (fixture) => {
+        fixture.connection.prepare("DELETE FROM outbox WHERE target_key = $targetKey").run({
+          $targetKey: "integrity/outbox/first",
+        });
+      },
+    },
+    {
+      name: "extra command-owned outbox row",
+      expectedCode: "COMMAND_METADATA_MISMATCH",
+      mutate: (fixture) => {
+        const payload = { ordinal: 3 };
+        fixture.connection.prepare(`
+          INSERT INTO outbox(
+            project_id, target_key, event_position, kind, payload_json, content_hash,
+            status, attempt_count, claim_owner, claim_token, claim_expires_at,
+            created_at, updated_at
+          ) VALUES (
+            $projectId, 'integrity/outbox/extra', 1, 'materialize-extra',
+            $payloadJson, $contentHash, 'pending', 0, NULL, NULL, NULL, $now, $now
+          )
+        `).run({
+          $projectId: PROJECT_ID,
+          $payloadJson: canonicalJson(payload),
+          $contentHash: outboxHash(payload),
+          $now: NOW,
+        });
+      },
+    },
+    {
+      name: "moved outbox event position",
+      expectedCode: "COMMAND_HASH_MISMATCH",
+      mutate: (fixture) => {
+        fixture.connection.prepare(`
+          UPDATE outbox SET event_position = 2 WHERE target_key = $targetKey
+        `).run({ $targetKey: "integrity/outbox/first" });
+      },
+    },
+    {
+      name: "changed outbox kind",
+      expectedCode: "COMMAND_HASH_MISMATCH",
+      mutate: (fixture) => {
+        fixture.connection.prepare(`
+          UPDATE outbox SET kind = 'substituted-kind' WHERE target_key = $targetKey
+        `).run({ $targetKey: "integrity/outbox/first" });
+      },
+    },
+    {
+      name: "changed outbox payload",
+      expectedCode: "COMMAND_METADATA_MISMATCH",
+      mutate: (fixture) => {
+        fixture.connection.prepare(`
+          UPDATE outbox SET payload_json = '{"ordinal":999}' WHERE target_key = $targetKey
+        `).run({ $targetKey: "integrity/outbox/first" });
+      },
+    },
+    {
+      name: "coherently changed outbox payload and content hash",
+      expectedCode: "COMMAND_HASH_MISMATCH",
+      mutate: (fixture) => {
+        const payload = { ordinal: 999 };
+        fixture.connection.prepare(`
+          UPDATE outbox
+          SET payload_json = $payloadJson, content_hash = $contentHash
+          WHERE target_key = $targetKey
+        `).run({
+          $payloadJson: canonicalJson(payload),
+          $contentHash: outboxHash(payload),
+          $targetKey: "integrity/outbox/first",
+        });
+      },
+    },
+    {
+      name: "noncanonical outbox payload JSON",
+      expectedCode: "COMMAND_METADATA_MISMATCH",
+      mutate: (fixture) => {
+        fixture.connection.prepare(`
+          UPDATE outbox SET payload_json = '{ "ordinal": 1 }' WHERE target_key = $targetKey
+        `).run({ $targetKey: "integrity/outbox/first" });
+      },
+    },
+    {
+      name: "changed outbox content hash",
+      expectedCode: "COMMAND_METADATA_MISMATCH",
+      mutate: (fixture) => {
+        fixture.connection.prepare(`
+          UPDATE outbox SET content_hash = $hash WHERE target_key = $targetKey
+        `).run({ $hash: "f".repeat(64), $targetKey: "integrity/outbox/first" });
+      },
+    },
+  ];
+
+  for (const corruption of outboxCorruptions) {
+    it(`rejects ${corruption.name}`, () => {
+      const fixture = createFixture({ append: false });
+      fixture.store.append({
+        ...appendCommand(
+          fixture.context,
+          COMMAND_A,
+          "integrity:outbox-witness",
+          "stream-outbox-witness",
+          "outbox-witness",
+          1,
+        ),
+        outbox: twoOutboxItems(),
+      });
+      assert.equal(fixture.integrity.fullCheck(fixture.context).ok, true);
+
+      corruption.mutate(fixture);
+
+      const report = fixture.integrity.fullCheck(fixture.context);
+      assert.equal(report.ok, false, corruption.name);
+      assert.ok(issueCodes(report).includes(corruption.expectedCode), corruption.name);
+    });
+  }
+
+  it("rejects local and Git workspace-witness tuple contradictions", () => {
+    const localFixture = createFixture({ append: false });
+    localFixture.store.append(appendCommand(
+      localFixture.context,
+      COMMAND_A,
+      "integrity:local-tuple",
+      "stream-local-tuple",
+      "local-tuple",
+      1,
+    ));
+    mutateProtected(localFixture, "command_dedup_no_update", () => {
+      localFixture.connection.prepare(`
+        UPDATE command_dedup SET workspace_head_commit = $head WHERE command_id = $commandId
+      `).run({
+        $head: "0123456789abcdef0123456789abcdef01234567",
+        $commandId: COMMAND_A,
+      });
+    });
+    const localReport = localFixture.integrity.fullCheck(localFixture.context);
+    assert.equal(localReport.ok, false);
+    assert.ok(issueCodes(localReport).includes("COMMAND_METADATA_MISMATCH"));
+
+    const gitFixture = createFixture({ append: false });
+    const context = gitContext(gitFixture);
+    gitFixture.store.append(appendCommand(
+      context,
+      COMMAND_A,
+      "integrity:git-tuple",
+      "stream-git-tuple",
+      "git-tuple",
+      1,
+    ));
+    mutateProtected(gitFixture, "command_dedup_no_update", () => {
+      gitFixture.connection.prepare(`
+        UPDATE command_dedup SET workspace_head_commit = NULL WHERE command_id = $commandId
+      `).run({ $commandId: COMMAND_A });
+    });
+    const gitReport = gitFixture.integrity.fullCheck(context);
+    assert.equal(gitReport.ok, false);
+    assert.ok(issueCodes(gitReport).includes("COMMAND_METADATA_MISMATCH"));
+  });
+});
+
 describe("EventIntegrityService event-chain and orphan checks", () => {
   it("detects noncontiguous global and per-stream versions", () => {
     const globalFixture = createFixture();
@@ -936,6 +1349,7 @@ describe("EventIntegrityService event-chain and orphan checks", () => {
     assertIssueCodes(
       globalFixture.integrity.fullCheck(globalFixture.context),
       [
+        "COMMAND_METADATA_MISMATCH",
         "COMMAND_RANGE_MISSING_EVENT",
         "EVENT_HASH_MISMATCH",
         "GLOBAL_POSITION_NONCONTIGUOUS",
@@ -951,6 +1365,7 @@ describe("EventIntegrityService event-chain and orphan checks", () => {
     assertIssueCodes(
       streamFixture.integrity.fullCheck(streamFixture.context),
       [
+        "COMMAND_METADATA_MISMATCH",
         "COMMAND_RANGE_MISSING_EVENT",
         "EVENT_HASH_MISMATCH",
         "STREAM_HEAD_VERSION_MISMATCH",
@@ -968,7 +1383,7 @@ describe("EventIntegrityService event-chain and orphan checks", () => {
     });
     assertIssueCodes(
       payloadFixture.integrity.fullCheck(payloadFixture.context),
-      ["EVENT_PAYLOAD_HASH_MISMATCH"],
+      ["COMMAND_METADATA_MISMATCH", "EVENT_PAYLOAD_HASH_MISMATCH"],
     );
 
     const previousFixture = createFixture();
@@ -979,7 +1394,11 @@ describe("EventIntegrityService event-chain and orphan checks", () => {
     });
     assertIssueCodes(
       previousFixture.integrity.fullCheck(previousFixture.context),
-      ["EVENT_HASH_MISMATCH", "EVENT_PREVIOUS_HASH_MISMATCH"],
+      [
+        "COMMAND_METADATA_MISMATCH",
+        "EVENT_HASH_MISMATCH",
+        "EVENT_PREVIOUS_HASH_MISMATCH",
+      ],
     );
 
     const hashFixture = createFixture();
@@ -990,7 +1409,7 @@ describe("EventIntegrityService event-chain and orphan checks", () => {
     });
     assertIssueCodes(
       hashFixture.integrity.fullCheck(hashFixture.context),
-      ["EVENT_HASH_MISMATCH"],
+      ["COMMAND_METADATA_MISMATCH", "EVENT_HASH_MISMATCH"],
     );
 
     const timestampFixture = createFixture();
@@ -1051,11 +1470,12 @@ describe("EventIntegrityService event-chain and orphan checks", () => {
     commandFixture.connection.prepare(`
       INSERT INTO command_dedup(
         project_id, idempotency_key, command_id, command_type, command_hash,
-        state, first_global_position, last_global_position, final_stream_version,
-        event_ids_json, response_json, response_hash, committed_at
+        workspace_head_commit, outbox_order_json, state, first_global_position,
+        last_global_position, final_stream_version, event_ids_json, response_json,
+        response_hash, committed_at
       ) VALUES (
         $projectId, 'integrity:orphan-command', $commandId, 'Synthetic', $commandHash,
-        'committed', 99, 99, 1,
+        NULL, '[]', 'committed', 99, 99, 1,
         $eventIdsJson, $responseJson, $responseHash, $committedAt
       )
     `).run({
@@ -1109,7 +1529,7 @@ describe("EventIntegrityService bounds and transaction semantics", () => {
     );
     assertIssueCodes(
       fixture.integrity.fullCheck(fixture.context),
-      ["EVENT_PAYLOAD_HASH_MISMATCH"],
+      ["COMMAND_METADATA_MISMATCH", "EVENT_PAYLOAD_HASH_MISMATCH"],
     );
   });
 
@@ -1171,6 +1591,19 @@ describe("EventIntegrityService bounds and transaction semantics", () => {
       /INJECTED_READ_FAILURE/,
     );
     assert.deepEqual(throwing.executed, ["BEGIN DEFERRED", "ROLLBACK"]);
+
+    const witnessFixture = createFixture();
+    const witnessReadFailure = new ObservingConnection(
+      witnessFixture.connection,
+      undefined,
+      /FROM\s+outbox/i,
+    );
+    assert.throws(
+      () => new EventIntegrityService(witnessReadFailure).fullCheck(witnessFixture.context),
+      /INJECTED_READ_FAILURE/,
+    );
+    assert.equal(witnessReadFailure.executed[0], "BEGIN DEFERRED");
+    assert.equal(witnessReadFailure.executed.at(-1), "ROLLBACK");
   });
 
   it("keeps one WAL snapshot when another connection appends after the first read", () => {

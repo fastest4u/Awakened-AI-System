@@ -113,6 +113,17 @@ CREATE TABLE command_dedup (
   command_id TEXT NOT NULL,
   command_type TEXT NOT NULL,
   command_hash TEXT NOT NULL CHECK (length(command_hash) = 64),
+  workspace_head_commit TEXT CHECK (
+    workspace_head_commit IS NULL
+    OR (
+      length(workspace_head_commit) IN (40, 64)
+      AND workspace_head_commit NOT GLOB '*[^0-9a-f]*'
+    )
+  ),
+  outbox_order_json TEXT NOT NULL CHECK (
+    json_valid(outbox_order_json)
+    AND json_type(outbox_order_json) = 'array'
+  ),
   state TEXT NOT NULL CHECK (state = 'committed'),
   first_global_position INTEGER NOT NULL,
   last_global_position INTEGER NOT NULL CHECK (last_global_position >= first_global_position),
