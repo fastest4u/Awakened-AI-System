@@ -1,6 +1,7 @@
 import { strict as assert } from "node:assert";
 import {
   existsSync,
+  linkSync,
   mkdtempSync,
   mkdirSync,
   readFileSync,
@@ -15,6 +16,7 @@ import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, it } from "node:test";
 import { ProjectDescriptorRepository } from "../src/orchestrator/identity/project-descriptor.repository.js";
 import type { BranchScopeId, ProjectId } from "../src/orchestrator/identity/contracts.js";
+import { StoreManifestRepository } from "../src/orchestrator/identity/store-manifest.repository.js";
 import { DEFAULT_BUSY_TIMEOUT_MS, PROJECT_MEMORY_APPLICATION_ID } from "../src/orchestrator/runtime/runtime-capabilities.js";
 import { BranchScopeRepository } from "../src/orchestrator/storage/branch-scope.repository.js";
 import {
@@ -115,6 +117,33 @@ describe("DefaultProjectStoreBootstrapService", () => {
     assert.equal(again.recoveredManifest, false);
     assert.deepEqual(again.descriptor, result.descriptor);
     assert.deepEqual(again.manifest, result.manifest);
+  });
+
+  it("accepts a legitimately advanced published maintenance state without replacing identity", async () => {
+    const { projectRoot, vaultRoot } = fixture();
+    const expected = paths(vaultRoot);
+    const first = await new DefaultProjectStoreBootstrapService().initialize({ projectRoot, vaultRoot });
+    const database = new DatabaseSync(expected.events);
+    database.exec(`
+      UPDATE maintenance_state
+      SET epoch = 3,
+          mode = 'quiescing',
+          owner_id = 'maintenance-owner',
+          fencing_token = 7,
+          lease_expires_at = '2026-07-11T00:10:00.000Z',
+          requested_at = '2026-07-11T00:05:00.000Z'
+      WHERE singleton = 1;
+    `);
+    database.close();
+
+    const inspected = await new DefaultProjectStoreBootstrapService().initialize({
+      projectRoot,
+      vaultRoot,
+    });
+    assert.equal(inspected.createdStore, false);
+    assert.equal(inspected.recoveredManifest, false);
+    assert.deepEqual(inspected.descriptor, first.descriptor);
+    assert.equal(inspected.manifest.storeId, first.manifest.storeId);
   });
 
   it("requires an explicit replica decision only for an existing descriptor with no store evidence", async () => {
@@ -262,6 +291,105 @@ describe("DefaultProjectStoreBootstrapService", () => {
     }
   });
 
+  it("rejects same-name trigger drift and any extra user schema object", async () => {
+    {
+      const { projectRoot, vaultRoot } = fixture();
+      const expected = paths(vaultRoot);
+      await new DefaultProjectStoreBootstrapService().initialize({ projectRoot, vaultRoot });
+      const database = new DatabaseSync(expected.events);
+      database.exec(`
+        DROP TRIGGER events_identity_guard;
+        CREATE TRIGGER events_identity_guard
+        BEFORE INSERT ON events
+        BEGIN SELECT 1; END;
+      `);
+      database.close();
+
+      await assert.rejects(
+        new DefaultProjectStoreBootstrapService().initialize({ projectRoot, vaultRoot }),
+        errorCode("STORE_UNAVAILABLE"),
+      );
+    }
+
+    for (const table of ["evidence", "session_authority", "projection_state"]) {
+      const { projectRoot, vaultRoot } = fixture();
+      const expected = paths(vaultRoot);
+      await new DefaultProjectStoreBootstrapService().initialize({ projectRoot, vaultRoot });
+      const database = new DatabaseSync(expected.events);
+      database.exec(`CREATE TABLE ${table}(value TEXT NOT NULL) STRICT`);
+      database.close();
+
+      await assert.rejects(
+        new DefaultProjectStoreBootstrapService().initialize({ projectRoot, vaultRoot }),
+        errorCode("STORE_UNAVAILABLE"),
+      );
+    }
+  });
+
+  it("retries deterministic probe and bootstrap path collisions without deleting sentinels", async () => {
+    const { projectRoot, vaultRoot } = fixture();
+    const expected = paths(vaultRoot);
+    mkdirSync(expected.storeRoot, { recursive: true });
+    const probeCollision = join(
+      expected.storeRoot,
+      ".events.sqlite.capability-probe-collision.tmp",
+    );
+    const bootstrapCollision = join(
+      expected.storeRoot,
+      ".events.sqlite.bootstrap-bootstrap-collision.tmp",
+    );
+    writeFileSync(probeCollision, "probe-sentinel");
+    writeFileSync(bootstrapCollision, "bootstrap-sentinel");
+    const ids = [
+      "probe-collision",
+      "probe-fresh",
+      "44444444-4444-4444-8444-444444444444",
+      "bootstrap-collision",
+      "bootstrap-fresh",
+    ];
+
+    const initialized = await new DefaultProjectStoreBootstrapService({
+      randomId: () => ids.shift()!,
+    }).initialize({ projectRoot, vaultRoot });
+    assert.equal(initialized.createdStore, true);
+    assert.equal(initialized.manifest.storeId, "44444444-4444-4444-8444-444444444444");
+    assert.equal(readFileSync(probeCollision, "utf8"), "probe-sentinel");
+    assert.equal(readFileSync(bootstrapCollision, "utf8"), "bootstrap-sentinel");
+    assert.equal(ids.length, 0);
+  });
+
+  it("does not classify substring-only descriptor or manifest errors as publication races", async () => {
+    {
+      class MisleadingDescriptorRepository extends ProjectDescriptorRepository {
+        override createExplicit(): never {
+          throw new Error("NOT_A_RACE_PROJECT_DESCRIPTOR_EXISTS_SUFFIX");
+        }
+      }
+      const { projectRoot, vaultRoot } = fixture();
+      await assert.rejects(
+        new DefaultProjectStoreBootstrapService({
+          descriptorRepository: new MisleadingDescriptorRepository(),
+        }).initialize({ projectRoot, vaultRoot }),
+        /NOT_A_RACE_PROJECT_DESCRIPTOR_EXISTS_SUFFIX/,
+      );
+    }
+
+    {
+      class MisleadingManifestRepository extends StoreManifestRepository {
+        override createExplicit(): never {
+          throw new Error("NOT_A_RACE_STORE_MANIFEST_EXISTS_SUFFIX");
+        }
+      }
+      const { projectRoot, vaultRoot } = fixture();
+      await assert.rejects(
+        new DefaultProjectStoreBootstrapService({
+          manifestRepository: new MisleadingManifestRepository(),
+        }).initialize({ projectRoot, vaultRoot }),
+        /NOT_A_RACE_STORE_MANIFEST_EXISTS_SUFFIX/,
+      );
+    }
+  });
+
   it("converges concurrent first-open contenders on one descriptor and one checksummed schema", async () => {
     const { projectRoot, vaultRoot } = fixture();
     const [left, right] = await Promise.all([
@@ -282,6 +410,34 @@ describe("DefaultProjectStoreBootstrapService", () => {
     } finally {
       database.close();
     }
+  });
+
+  it("adopts a complete hard-link winner published at the pre-publication fault boundary", async () => {
+    const { projectRoot, vaultRoot } = fixture();
+    const expected = paths(vaultRoot);
+    const winner = await new DefaultProjectStoreBootstrapService().initialize({ projectRoot, vaultRoot });
+    const savedWinner = join(expected.storeRoot, ".deterministic-winner.sqlite");
+    linkSync(expected.events, savedWinner);
+    unlinkSync(expected.events);
+    unlinkSync(expected.manifest);
+
+    const contender = new DefaultProjectStoreBootstrapService({
+      faultInjector: {
+        hit(boundary): void {
+          if (boundary === "after-temp-complete-before-publish") {
+            linkSync(savedWinner, expected.events);
+          }
+        },
+      },
+    });
+    const adopted = await contender.initialize({
+      projectRoot,
+      vaultRoot,
+      replicaDecision: "initialize-local",
+    });
+    assert.equal(adopted.createdStore, false);
+    assert.equal(adopted.manifest.storeId, winner.manifest.storeId);
+    assert.equal(adopted.descriptor.projectId, winner.descriptor.projectId);
   });
 
   it("keeps unpublished crashes non-authoritative and recovers publication-before-manifest", async () => {

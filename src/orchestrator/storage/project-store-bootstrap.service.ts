@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   closeSync,
   existsSync,
@@ -106,6 +106,14 @@ interface StoreIdentity {
   schemaVersion: 1;
 }
 
+type StoreValidationMode = "pristine-unpublished" | "published";
+
+interface ReservedSqlitePath {
+  path: string;
+}
+
+const MAXIMUM_PATH_RESERVATION_ATTEMPTS = 8;
+
 function errorCode(error: unknown): string | undefined {
   return typeof error === "object" && error !== null && "code" in error
     ? String(error.code)
@@ -124,6 +132,31 @@ function cleanupSqliteFiles(path: string): void {
   unlinkIfPresent(path);
   unlinkIfPresent(`${path}-wal`);
   unlinkIfPresent(`${path}-shm`);
+}
+
+function reserveSqlitePath(
+  directory: string,
+  name: (id: string) => string,
+  randomId: () => string,
+): ReservedSqlitePath {
+  for (let attempt = 0; attempt < MAXIMUM_PATH_RESERVATION_ATTEMPTS; attempt += 1) {
+    const path = join(directory, name(randomId()));
+    let handle: number;
+    try {
+      handle = openSync(path, "wx", 0o600);
+    } catch (error) {
+      if (errorCode(error) === "EEXIST") continue;
+      throw bootstrapFailure("STORE_UNAVAILABLE", error);
+    }
+    try {
+      closeSync(handle);
+    } catch (error) {
+      cleanupSqliteFiles(path);
+      throw bootstrapFailure("STORE_UNAVAILABLE", error);
+    }
+    return { path };
+  }
+  throw bootstrapFailure("STORE_UNAVAILABLE");
 }
 
 function fsyncFile(path: string): void {
@@ -171,10 +204,77 @@ function numeric(value: unknown): number | undefined {
   return Number.isSafeInteger(converted) ? converted : undefined;
 }
 
+interface SchemaEntry {
+  type: string;
+  name: string;
+  tableName: string;
+  sql: string;
+}
+
+function userSchemaEntries(database: DatabaseSync): SchemaEntry[] {
+  return database.prepare(`
+    SELECT type, name, tbl_name, sql
+    FROM sqlite_schema
+    WHERE name NOT GLOB 'sqlite_*'
+    ORDER BY type, name, tbl_name, sql
+  `).all().map((row): SchemaEntry => {
+    if (
+      typeof row.type !== "string"
+      || typeof row.name !== "string"
+      || typeof row.tbl_name !== "string"
+      || typeof row.sql !== "string"
+    ) {
+      throw bootstrapFailure("STORE_UNAVAILABLE");
+    }
+    return {
+      type: row.type,
+      name: row.name,
+      tableName: row.tbl_name,
+      sql: row.sql,
+    };
+  });
+}
+
+function schemaFingerprint(database: DatabaseSync): string {
+  return createHash("sha256")
+    .update(JSON.stringify(userSchemaEntries(database)), "utf8")
+    .digest("hex");
+}
+
+let trustedEventCoreSchemaFingerprint: string | undefined;
+
+function eventCoreSchemaFingerprint(): string {
+  if (trustedEventCoreSchemaFingerprint !== undefined) {
+    return trustedEventCoreSchemaFingerprint;
+  }
+  const trusted = new DatabaseSync(":memory:", {
+    open: true,
+    readOnly: false,
+    enableForeignKeyConstraints: true,
+    enableDoubleQuotedStringLiterals: false,
+    allowExtension: false,
+    allowBareNamedParameters: false,
+    allowUnknownNamedParameters: false,
+    timeout: DEFAULT_BUSY_TIMEOUT_MS,
+  });
+  try {
+    trusted.exec(eventCoreMigration.sql);
+    trustedEventCoreSchemaFingerprint = schemaFingerprint(trusted);
+    return trustedEventCoreSchemaFingerprint;
+  } finally {
+    trusted.close();
+  }
+}
+
+function nullableString(value: unknown): boolean {
+  return value === null || typeof value === "string";
+}
+
 function validateExistingStore(
   path: string,
   descriptor: ProjectDescriptorV1,
   expectedStoreId?: StoreId,
+  mode: StoreValidationMode = "published",
 ): StoreIdentity {
   let database: DatabaseSync | undefined;
   try {
@@ -221,56 +321,7 @@ function validateExistingStore(
       throw bootstrapFailure("STORE_UNAVAILABLE");
     }
 
-    const requiredTables = [
-      "branch_scopes",
-      "command_dedup",
-      "events",
-      "executor_leases",
-      "maintenance_acknowledgements",
-      "maintenance_required_executors",
-      "maintenance_state",
-      "outbox",
-      "project_meta",
-      "schema_migrations",
-      "streams",
-      "workflow_instances",
-    ];
-    const requiredTriggers = [
-      "command_dedup_no_delete",
-      "command_dedup_no_update",
-      "events_identity_guard",
-      "events_no_delete",
-      "events_no_update",
-      "project_meta_no_delete",
-      "project_meta_no_update",
-      "schema_migrations_no_delete",
-      "schema_migrations_no_update",
-    ];
-    const requiredIndexes = [
-      "branch_scopes_active_ref",
-      "branch_scopes_detached_head",
-      "command_dedup_event_range",
-      "events_project_hash_chain",
-      "events_project_idempotency",
-      "events_project_position",
-      "events_stream_range",
-      "outbox_delivery_order",
-    ];
-    for (const [type, names] of [
-      ["table", requiredTables],
-      ["trigger", requiredTriggers],
-      ["index", requiredIndexes],
-    ] as const) {
-      const present = new Set(database.prepare(`
-        SELECT name FROM sqlite_schema WHERE type = $type
-      `).all({ $type: type }).map((row) => row.name));
-      if (names.some((name) => !present.has(name))) {
-        throw bootstrapFailure("STORE_UNAVAILABLE");
-      }
-    }
-    const strictTables = new Map(database.prepare("PRAGMA table_list").all()
-      .map((row) => [row.name, numeric(row.strict)]));
-    if (requiredTables.some((name) => strictTables.get(name) !== 1)) {
+    if (schemaFingerprint(database) !== eventCoreSchemaFingerprint()) {
       throw bootstrapFailure("STORE_UNAVAILABLE");
     }
 
@@ -304,14 +355,27 @@ function validateExistingStore(
       SELECT epoch, mode, owner_id, fencing_token, lease_expires_at, requested_at
       FROM maintenance_state WHERE singleton = 1
     `).all();
+    const maintenanceRow = maintenance[0];
+    const epoch = numeric(maintenanceRow?.epoch);
+    const fencingToken = numeric(maintenanceRow?.fencing_token);
+    const structurallyValidMaintenance = maintenance.length === 1
+      && epoch !== undefined
+      && epoch >= 0
+      && (maintenanceRow?.mode === "idle" || maintenanceRow?.mode === "quiescing")
+      && nullableString(maintenanceRow?.owner_id)
+      && fencingToken !== undefined
+      && fencingToken >= 0
+      && nullableString(maintenanceRow?.lease_expires_at)
+      && nullableString(maintenanceRow?.requested_at);
+    const pristineMaintenance = epoch === 0
+      && maintenanceRow?.mode === "idle"
+      && maintenanceRow.owner_id === null
+      && fencingToken === 0
+      && maintenanceRow.lease_expires_at === null
+      && maintenanceRow.requested_at === null;
     if (
-      maintenance.length !== 1
-      || numeric(maintenance[0]?.epoch) !== 0
-      || maintenance[0]?.mode !== "idle"
-      || maintenance[0]?.owner_id !== null
-      || numeric(maintenance[0]?.fencing_token) !== 0
-      || maintenance[0]?.lease_expires_at !== null
-      || maintenance[0]?.requested_at !== null
+      !structurallyValidMaintenance
+      || (mode === "pristine-unpublished" && !pristineMaintenance)
     ) {
       throw bootstrapFailure("STORE_UNAVAILABLE");
     }
@@ -426,7 +490,7 @@ export class DefaultProjectStoreBootstrapService implements ProjectStoreBootstra
         );
         createdDescriptor = true;
       } catch (error) {
-        if (!(error instanceof Error) || !error.message.includes("PROJECT_DESCRIPTOR_EXISTS")) {
+        if (!(error instanceof Error) || error.message !== "PROJECT_DESCRIPTOR_EXISTS") {
           throw error;
         }
         const winner = this.#dependencies.descriptorRepository.inspect(input.vaultRoot);
@@ -523,34 +587,37 @@ export class DefaultProjectStoreBootstrapService implements ProjectStoreBootstra
     createdDescriptor: boolean,
   ): Promise<ProjectStoreBootstrapResult> {
     mkdirSync(route.storeRoot, { recursive: true });
-    const capabilityPath = join(
+    const capabilityReservation = reserveSqlitePath(
       route.storeRoot,
-      `.events.sqlite.capability-${this.#dependencies.randomId()}.tmp`,
+      (id) => `.events.sqlite.capability-${id}.tmp`,
+      this.#dependencies.randomId,
     );
     let capability: RuntimeCapabilityResult;
     try {
       try {
-        capability = await this.#dependencies.probeCapabilities(capabilityPath);
+        capability = await this.#dependencies.probeCapabilities(
+          capabilityReservation.path,
+        );
       } catch (error) {
         throw bootstrapFailure("SQLITE_CAPABILITY_MISSING", error);
       }
     } finally {
-      cleanupSqliteFiles(capabilityPath);
+      cleanupSqliteFiles(capabilityReservation.path);
     }
     if (!capability.ok) {
       throw bootstrapFailure("SQLITE_CAPABILITY_MISSING");
     }
 
     const storeId = this.#dependencies.randomId() as StoreId;
-    const temporaryPath = join(
+    const temporaryReservation = reserveSqlitePath(
       route.storeRoot,
-      `.events.sqlite.bootstrap-${this.#dependencies.randomId()}.tmp`,
+      (id) => `.events.sqlite.bootstrap-${id}.tmp`,
+      this.#dependencies.randomId,
     );
+    const temporaryPath = temporaryReservation.path;
     let connection: SqliteConnection | undefined;
     let publishedByThisContender = false;
     try {
-      const reservation = openSync(temporaryPath, "wx", 0o600);
-      closeSync(reservation);
       connection = this.#dependencies.sqliteDriver.open(temporaryPath, {
         mode: "create",
         busyTimeoutMs: DEFAULT_BUSY_TIMEOUT_MS,
@@ -583,7 +650,12 @@ export class DefaultProjectStoreBootstrapService implements ProjectStoreBootstra
       connection.close();
       connection = undefined;
 
-      validateExistingStore(temporaryPath, descriptor, storeId);
+      validateExistingStore(
+        temporaryPath,
+        descriptor,
+        storeId,
+        "pristine-unpublished",
+      );
       fsyncFile(temporaryPath);
       try {
         linkSync(temporaryPath, route.eventsPath);
@@ -627,7 +699,7 @@ export class DefaultProjectStoreBootstrapService implements ProjectStoreBootstra
         manifestIdentity(descriptor, storeId),
       );
     } catch (error) {
-      if (!(error instanceof Error) || !error.message.includes("STORE_MANIFEST_EXISTS")) {
+      if (!(error instanceof Error) || error.message !== "STORE_MANIFEST_EXISTS") {
         throw error;
       }
       const winner = this.#dependencies.manifestRepository.inspect(route, {
