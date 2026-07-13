@@ -358,6 +358,66 @@ describe("DefaultProjectStoreBootstrapService", () => {
     assert.equal(ids.length, 0);
   });
 
+  it("preserves WAL-only and SHM-only sidecar collisions for probe and bootstrap reservations", async () => {
+    const { projectRoot, vaultRoot } = fixture();
+    const expected = paths(vaultRoot);
+    mkdirSync(expected.storeRoot, { recursive: true });
+    const probeWalBase = join(
+      expected.storeRoot,
+      ".events.sqlite.capability-probe-wal.tmp",
+    );
+    const probeShmBase = join(
+      expected.storeRoot,
+      ".events.sqlite.capability-probe-shm.tmp",
+    );
+    const bootstrapWalBase = join(
+      expected.storeRoot,
+      ".events.sqlite.bootstrap-bootstrap-wal.tmp",
+    );
+    const bootstrapShmBase = join(
+      expected.storeRoot,
+      ".events.sqlite.bootstrap-bootstrap-shm.tmp",
+    );
+    writeFileSync(`${probeWalBase}-wal`, "probe-wal-sentinel");
+    writeFileSync(`${probeShmBase}-shm`, "probe-shm-sentinel");
+    writeFileSync(`${bootstrapWalBase}-wal`, "bootstrap-wal-sentinel");
+    writeFileSync(`${bootstrapShmBase}-shm`, "bootstrap-shm-sentinel");
+    const ids = [
+      "probe-wal",
+      "probe-shm",
+      "probe-fresh-sidecars",
+      "55555555-5555-4555-8555-555555555555",
+      "bootstrap-wal",
+      "bootstrap-shm",
+      "bootstrap-fresh-sidecars",
+    ];
+
+    const initialized = await new DefaultProjectStoreBootstrapService({
+      randomId: () => ids.shift()!,
+    }).initialize({ projectRoot, vaultRoot });
+    assert.equal(initialized.createdStore, true);
+    assert.equal(initialized.manifest.storeId, "55555555-5555-4555-8555-555555555555");
+    assert.equal(readFileSync(`${probeWalBase}-wal`, "utf8"), "probe-wal-sentinel");
+    assert.equal(readFileSync(`${probeShmBase}-shm`, "utf8"), "probe-shm-sentinel");
+    assert.equal(
+      readFileSync(`${bootstrapWalBase}-wal`, "utf8"),
+      "bootstrap-wal-sentinel",
+    );
+    assert.equal(
+      readFileSync(`${bootstrapShmBase}-shm`, "utf8"),
+      "bootstrap-shm-sentinel",
+    );
+    for (const collidedBase of [
+      probeWalBase,
+      probeShmBase,
+      bootstrapWalBase,
+      bootstrapShmBase,
+    ]) {
+      assert.equal(existsSync(collidedBase), false);
+    }
+    assert.equal(ids.length, 0);
+  });
+
   it("does not classify substring-only descriptor or manifest errors as publication races", async () => {
     {
       class MisleadingDescriptorRepository extends ProjectDescriptorRepository {

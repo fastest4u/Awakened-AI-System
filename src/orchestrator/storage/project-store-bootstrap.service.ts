@@ -110,6 +110,7 @@ type StoreValidationMode = "pristine-unpublished" | "published";
 
 interface ReservedSqlitePath {
   path: string;
+  ownsInitiallyAbsentSidecars: true;
 }
 
 const MAXIMUM_PATH_RESERVATION_ATTEMPTS = 8;
@@ -128,10 +129,14 @@ function unlinkIfPresent(path: string): void {
   }
 }
 
-function cleanupSqliteFiles(path: string): void {
-  unlinkIfPresent(path);
-  unlinkIfPresent(`${path}-wal`);
-  unlinkIfPresent(`${path}-shm`);
+function cleanupReservedSqliteFiles(reservation: ReservedSqlitePath): void {
+  unlinkIfPresent(reservation.path);
+  unlinkIfPresent(`${reservation.path}-wal`);
+  unlinkIfPresent(`${reservation.path}-shm`);
+}
+
+function hasSqliteSidecar(path: string): boolean {
+  return existsSync(`${path}-wal`) || existsSync(`${path}-shm`);
 }
 
 function reserveSqlitePath(
@@ -141,6 +146,8 @@ function reserveSqlitePath(
 ): ReservedSqlitePath {
   for (let attempt = 0; attempt < MAXIMUM_PATH_RESERVATION_ATTEMPTS; attempt += 1) {
     const path = join(directory, name(randomId()));
+    if (hasSqliteSidecar(path)) continue;
+
     let handle: number;
     try {
       handle = openSync(path, "wx", 0o600);
@@ -151,10 +158,14 @@ function reserveSqlitePath(
     try {
       closeSync(handle);
     } catch (error) {
-      cleanupSqliteFiles(path);
+      unlinkIfPresent(path);
       throw bootstrapFailure("STORE_UNAVAILABLE", error);
     }
-    return { path };
+    if (hasSqliteSidecar(path)) {
+      unlinkIfPresent(path);
+      continue;
+    }
+    return { path, ownsInitiallyAbsentSidecars: true };
   }
   throw bootstrapFailure("STORE_UNAVAILABLE");
 }
@@ -602,7 +613,7 @@ export class DefaultProjectStoreBootstrapService implements ProjectStoreBootstra
         throw bootstrapFailure("SQLITE_CAPABILITY_MISSING", error);
       }
     } finally {
-      cleanupSqliteFiles(capabilityReservation.path);
+      cleanupReservedSqliteFiles(capabilityReservation);
     }
     if (!capability.ok) {
       throw bootstrapFailure("SQLITE_CAPABILITY_MISSING");
@@ -684,7 +695,7 @@ export class DefaultProjectStoreBootstrapService implements ProjectStoreBootstra
       };
     } finally {
       try { connection?.close(); } catch { /* cleanup continues */ }
-      cleanupSqliteFiles(temporaryPath);
+      cleanupReservedSqliteFiles(temporaryReservation);
     }
   }
 
