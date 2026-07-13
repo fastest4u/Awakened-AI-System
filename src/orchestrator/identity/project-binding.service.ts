@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { existsSync, realpathSync, statSync } from "node:fs";
+import { existsSync, lstatSync, realpathSync, statSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { canonicalJson } from "../serialization/canonical-json.js";
 import { assertContainedPath, canonicalExistingDirectory } from "./canonical-path.js";
@@ -308,6 +308,26 @@ function assertAbsoluteCanonicalShape(path: string): void {
   }
 }
 
+function assertRegularAuthorityFile(
+  path: string,
+  code: "PROJECT_DESCRIPTOR_INVALID" | "STORE_ROUTE_INVALID",
+): void {
+  try {
+    const authority = lstatSync(path);
+    const canonical = resolve(realpathSync.native(path));
+    if (
+      authority.isSymbolicLink()
+      || !authority.isFile()
+      || !samePath(canonical, path)
+    ) {
+      throw new ProjectBindingError(code);
+    }
+  } catch (error) {
+    if (error instanceof ProjectBindingError) throw error;
+    throw new ProjectBindingError(code);
+  }
+}
+
 function validateWorkspace(
   workspace: WorkspaceSnapshot,
   descriptor: ProjectDescriptorV1,
@@ -423,6 +443,9 @@ function validateRoute(
       throw new ProjectBindingError("STORE_ROUTE_INVALID");
     }
   }
+  if (pathExists(route.storeManifestPath)) {
+    assertRegularAuthorityFile(route.storeManifestPath, "STORE_ROUTE_INVALID");
+  }
 }
 
 function validateDescriptorPath(vaultRoot: string, path: string): void {
@@ -430,9 +453,11 @@ function validateDescriptorPath(vaultRoot: string, path: string): void {
   if (!isAbsolute(path) || !samePath(path, expected) || !isContained(vaultRoot, path)) {
     throw new ProjectBindingError("PROJECT_DESCRIPTOR_INVALID");
   }
+  assertRegularAuthorityFile(path, "PROJECT_DESCRIPTOR_INVALID");
 }
 
 function manifestIssueCode(issues: readonly string[]): ProjectBindingFailureCode | undefined {
+  if (issues.includes("STORE_ROUTE_INVALID")) return "STORE_ROUTE_INVALID";
   if (issues.includes("STORE_MANIFEST_PROJECT_ID_MISMATCH")) return "PROJECT_ID_MISMATCH";
   if (issues.includes("STORE_MANIFEST_VAULT_ID_MISMATCH")) return "VAULT_ID_MISMATCH";
   if (issues.includes("STORE_MANIFEST_STORE_ID_MISMATCH")) return "STORE_ID_MISMATCH";
@@ -680,14 +705,20 @@ export class ProjectBindingService implements ProjectBindingProvider {
       });
     }
 
+    if (!samePath(manifestInspection.path, storeRoute.storeManifestPath)) {
+      return failure("STORE_ROUTE_INVALID");
+    }
+    try {
+      assertRegularAuthorityFile(storeRoute.storeManifestPath, "STORE_ROUTE_INVALID");
+    } catch (error) {
+      return this.resolutionFromError(error, revision);
+    }
+
     const storeManifest = manifestInspection.manifest;
     try {
       validateManifestIdentity(storeManifest, descriptor);
     } catch (error) {
       return this.resolutionFromError(error, revision);
-    }
-    if (!samePath(manifestInspection.path, storeRoute.storeManifestPath)) {
-      return failure("STORE_ROUTE_INVALID");
     }
     if (!this.#dependencies.pathExists(storeRoute.eventsPath)) {
       return failure("STORE_UNAVAILABLE", { reason: "DATABASE_MISSING" });
@@ -854,6 +885,10 @@ export class ProjectBindingService implements ProjectBindingProvider {
           manifestIssueCode(manifestInspection.issues) ?? "STORE_UNAVAILABLE",
         );
       }
+      if (!samePath(manifestInspection.path, storeRoute.storeManifestPath)) {
+        throw new ProjectBindingError("STORE_ROUTE_INVALID");
+      }
+      assertRegularAuthorityFile(storeRoute.storeManifestPath, "STORE_ROUTE_INVALID");
       const storeManifest = manifestInspection.manifest;
       validateManifestIdentity(storeManifest, descriptor);
       if (storeManifest.storeId !== current.storeId) {

@@ -1,6 +1,14 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { join, resolve, sep } from "node:path";
 import { tmpdir } from "node:os";
 import { afterEach, describe, it } from "node:test";
@@ -151,12 +159,16 @@ function fixture(options: { database?: boolean; workspace?: WorkspaceSnapshot } 
     workspaceId: deriveNonGitWorkspaceId(PROJECT_ID, VAULT_ID),
   };
   const storeRoute = route(vaultRoot, workspace);
+  const descriptorPath = join(vaultRoot, ".memory-mcp", "project-identity.json");
+  mkdirSync(join(vaultRoot, ".memory-mcp"), { recursive: true });
   mkdirSync(storeRoute.storeRoot, { recursive: true });
+  writeFileSync(descriptorPath, "fixture", "utf8");
+  writeFileSync(storeRoute.storeManifestPath, "fixture", "utf8");
   if (options.database !== false) writeFileSync(storeRoute.eventsPath, "fixture", "utf8");
   const state: Fixture["state"] = {
     descriptorInspection: {
       status: "valid",
-      path: join(vaultRoot, ".memory-mcp", "project-identity.json"),
+      path: descriptorPath,
       descriptor: projectDescriptor,
     },
     workspace,
@@ -333,6 +345,7 @@ describe("ProjectBindingService establishment", () => {
       item.state.descriptorInspection = inspection.status === "missing"
         ? { status: "missing", path: descriptorPath }
         : { status: "invalid", path: descriptorPath, issues: inspection.issues };
+      rmSync(descriptorPath, { force: true });
       const before = existsSync(item.state.route.eventsPath);
 
       const resolution = await item.service.establish(request(item.projectRoot, item.vaultRoot));
@@ -349,9 +362,54 @@ describe("ProjectBindingService establishment", () => {
     }
   });
 
+  it("rejects a descriptor authority path redirected through an external reparse point", async () => {
+    const item = fixture();
+    const descriptorDirectory = join(item.vaultRoot, ".memory-mcp");
+    rmSync(descriptorDirectory, { recursive: true, force: true });
+    const externalDirectory = join(item.root, "external-descriptor-authority");
+    mkdirSync(externalDirectory);
+    writeFileSync(join(externalDirectory, "project-identity.json"), "fixture", "utf8");
+    symlinkSync(
+      externalDirectory,
+      descriptorDirectory,
+      process.platform === "win32" ? "junction" : "dir",
+    );
+
+    const result = await item.service.establish(request(item.projectRoot, item.vaultRoot));
+
+    assert.equal(result.ok, false);
+    if (result.ok) assert.fail("expected failure");
+    assert.equal(result.code, "PROJECT_DESCRIPTOR_INVALID");
+    assert.deepEqual(item.calls, ["descriptor"]);
+  });
+
+  it("rejects a descriptor authority removed after a valid inspection", async () => {
+    const item = fixture();
+    const descriptorPath = item.state.descriptorInspection.path;
+    const repository = item.dependencies.descriptorRepository!;
+    const service = new ProjectBindingService({
+      ...item.dependencies,
+      descriptorRepository: {
+        inspect(vaultRoot) {
+          const inspection = repository.inspect(vaultRoot);
+          rmSync(descriptorPath, { force: true });
+          return inspection;
+        },
+      },
+    });
+
+    const result = await service.establish(request(item.projectRoot, item.vaultRoot));
+
+    assert.equal(result.ok, false);
+    if (result.ok) assert.fail("expected failure");
+    assert.equal(result.code, "PROJECT_DESCRIPTOR_INVALID");
+    assert.deepEqual(item.calls, ["descriptor"]);
+  });
+
   it("requires an explicit replica decision when both manifest and database are absent", async () => {
     const item = fixture({ database: false });
     item.state.manifestInspection = { status: "missing", path: item.state.route.storeManifestPath };
+    rmSync(item.state.route.storeManifestPath, { force: true });
 
     const resolution = await item.service.establish(request(item.projectRoot, item.vaultRoot));
 
@@ -370,6 +428,7 @@ describe("ProjectBindingService establishment", () => {
   it("requires nonmutating CLI recovery when a database exists without its manifest", async () => {
     const item = fixture();
     item.state.manifestInspection = { status: "missing", path: item.state.route.storeManifestPath };
+    rmSync(item.state.route.storeManifestPath, { force: true });
     const before = readFileSync(item.state.route.eventsPath);
 
     const resolution = await item.service.establish(request(item.projectRoot, item.vaultRoot));
@@ -389,6 +448,7 @@ describe("ProjectBindingService establishment", () => {
         status: "missing",
         path: item.state.route.storeManifestPath,
       };
+      rmSync(item.state.route.storeManifestPath, { force: true });
       item.state.probeError = new ProjectBindingError(code);
 
       const resolution = await item.service.establish(request(item.projectRoot, item.vaultRoot));
@@ -491,6 +551,47 @@ describe("ProjectBindingService establishment", () => {
     if (result.ok) assert.fail("expected failure");
     assert.equal(result.code, "STORE_ROUTE_INVALID");
     assert.deepEqual(item.calls, ["descriptor", "git", "route"]);
+  });
+
+  it("rejects a manifest authority reparse point before manifest inspection", async () => {
+    const item = fixture();
+    const externalDirectory = join(item.root, "external-manifest-authority");
+    mkdirSync(externalDirectory);
+    rmSync(item.state.route.storeManifestPath, { force: true });
+    symlinkSync(
+      externalDirectory,
+      item.state.route.storeManifestPath,
+      process.platform === "win32" ? "junction" : "dir",
+    );
+
+    const result = await item.service.establish(request(item.projectRoot, item.vaultRoot));
+
+    assert.equal(result.ok, false);
+    if (result.ok) assert.fail("expected failure");
+    assert.equal(result.code, "STORE_ROUTE_INVALID");
+    assert.deepEqual(item.calls, ["descriptor", "git", "route"]);
+  });
+
+  it("rejects a manifest authority removed after a valid inspection", async () => {
+    const item = fixture();
+    const repository = item.dependencies.manifestRepository!;
+    const service = new ProjectBindingService({
+      ...item.dependencies,
+      manifestRepository: {
+        inspect(storeRoute, expected) {
+          const inspection = repository.inspect(storeRoute, expected);
+          rmSync(storeRoute.storeManifestPath, { force: true });
+          return inspection;
+        },
+      },
+    });
+
+    const result = await service.establish(request(item.projectRoot, item.vaultRoot));
+
+    assert.equal(result.ok, false);
+    if (result.ok) assert.fail("expected failure");
+    assert.equal(result.code, "STORE_ROUTE_INVALID");
+    assert.deepEqual(item.calls, ["descriptor", "git", "route", "manifest"]);
   });
 
   it("maps all Git probe failure reasons without silently treating them as non-Git", async () => {
@@ -622,6 +723,7 @@ describe("ProjectBindingService establishment", () => {
     item.state.route = route(item.vaultRoot, firstWorkspace);
     mkdirSync(item.state.route.storeRoot, { recursive: true });
     writeFileSync(item.state.route.eventsPath, "fixture", "utf8");
+    writeFileSync(item.state.route.storeManifestPath, "fixture", "utf8");
     item.state.manifestInspection = {
       status: "valid",
       path: item.state.route.storeManifestPath,
@@ -748,6 +850,7 @@ describe("ProjectBindingService revalidation", () => {
       status: "missing",
       path: binding.storeRoute.storeManifestPath,
     };
+    rmSync(binding.storeRoute.storeManifestPath, { force: true });
     item.state.probeError = new ProjectBindingError("PROJECT_ID_MISMATCH");
 
     await assert.rejects(
@@ -903,6 +1006,7 @@ describe("ProjectBindingService revalidation", () => {
         item.state.route = route(item.vaultRoot, item.state.workspace);
         mkdirSync(item.state.route.storeRoot, { recursive: true });
         writeFileSync(item.state.route.eventsPath, "fixture", "utf8");
+        writeFileSync(item.state.route.storeManifestPath, "fixture", "utf8");
         item.state.manifestInspection = {
           status: "valid",
           path: item.state.route.storeManifestPath,

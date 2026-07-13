@@ -7,10 +7,11 @@ import {
   readdirSync,
   realpathSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { join, resolve, sep } from "node:path";
 import { afterEach, describe, it } from "node:test";
 import type {
   GitWorkspaceSnapshot,
@@ -28,6 +29,7 @@ import {
   type StoreManifestV1,
 } from "../src/orchestrator/identity/store-manifest.schema.js";
 import { StoreManifestRepository } from "../src/orchestrator/identity/store-manifest.repository.js";
+import type { StoreManifestRepositoryDependencies } from "../src/orchestrator/identity/store-manifest.repository.js";
 
 const descriptor: ProjectDescriptorV1 = {
   schemaVersion: 1,
@@ -281,6 +283,55 @@ describe("StoreManifestRepository", () => {
     );
   });
 
+  it("syncs created ancestors, hard-link publication, and temporary cleanup in durability order", () => {
+    arrangeRoute();
+    const publicationParent = resolve(vaultRoot, ".memory-mcp");
+    const barriers: Array<{
+      path: string;
+      published: boolean;
+      temporaryCount: number;
+    }> = [];
+    const dependencies: StoreManifestRepositoryDependencies = {
+      now: () => "2026-07-12T00:01:00.000Z",
+      syncDirectory(path: string): void {
+        const entries = existsSync(route.storeRoot) ? readdirSync(route.storeRoot) : [];
+        barriers.push({
+          path,
+          published: existsSync(route.storeManifestPath),
+          temporaryCount: entries.filter((entry) => entry.endsWith(".tmp")).length,
+        });
+      },
+    };
+
+    new StoreManifestRepository(dependencies).createExplicit(route, identity);
+
+    assert.deepEqual(barriers, [
+      { path: resolve(vaultRoot), published: false, temporaryCount: 0 },
+      { path: publicationParent, published: false, temporaryCount: 0 },
+      { path: route.storeRoot, published: true, temporaryCount: 1 },
+      { path: route.storeRoot, published: true, temporaryCount: 0 },
+    ]);
+  });
+
+  it("fails closed when a manifest directory durability barrier fails", () => {
+    arrangeRoute();
+    const failure = Object.assign(new Error("manifest directory durability failed"), {
+      code: "EIO",
+    });
+    const dependencies: StoreManifestRepositoryDependencies = {
+      now: () => "2026-07-12T00:01:00.000Z",
+      syncDirectory(): never {
+        throw failure;
+      },
+    };
+
+    assert.throws(
+      () => new StoreManifestRepository(dependencies).createExplicit(route, identity),
+      (error: unknown) => error === failure,
+    );
+    assert.equal(existsSync(route.storeManifestPath), false);
+  });
+
   it("never overwrites an existing manifest and cleans its contender temporary file", () => {
     arrangeRoute();
     const repository = new StoreManifestRepository({
@@ -334,6 +385,113 @@ describe("StoreManifestRepository", () => {
     assert.equal(readFileSync(route.storeManifestPath, "utf8"), strictViolation);
   });
 
+  it("rejects a valid manifest reached through an external store-root reparse point", () => {
+    arrangeRoute();
+    const externalStoreRoot = join(root!, "external-store-authority");
+    mkdirSync(externalStoreRoot);
+    writeFileSync(
+      join(externalStoreRoot, "store-manifest.json"),
+      `${JSON.stringify(validManifest, null, 2)}\n`,
+    );
+    mkdirSync(resolve(vaultRoot, ".memory-mcp"));
+    symlinkSync(
+      externalStoreRoot,
+      route.storeRoot,
+      process.platform === "win32" ? "junction" : "dir",
+    );
+
+    const inspection = new StoreManifestRepository().inspect(route, identity);
+
+    assert.equal(inspection.status, "invalid");
+    if (inspection.status === "invalid") {
+      assert.deepEqual(inspection.issues, ["STORE_ROUTE_INVALID"]);
+    }
+  });
+
+  it("rejects a direct manifest file symlink or Windows authority reparse point", () => {
+    arrangeRoute();
+    mkdirSync(route.storeRoot, { recursive: true });
+    const externalPath = join(root!, "external-store-manifest.json");
+    writeFileSync(externalPath, `${JSON.stringify(validManifest, null, 2)}\n`);
+    try {
+      symlinkSync(externalPath, route.storeManifestPath, "file");
+    } catch (error) {
+      const code = typeof error === "object" && error !== null && "code" in error
+        ? String(error.code)
+        : "";
+      if (process.platform === "win32" && (code === "EPERM" || code === "EACCES")) {
+        const fallbackDirectory = join(root!, "external-manifest-reparse-directory");
+        mkdirSync(fallbackDirectory);
+        symlinkSync(fallbackDirectory, route.storeManifestPath, "junction");
+      } else {
+        throw error;
+      }
+    }
+
+    const inspection = new StoreManifestRepository().inspect(route, identity);
+
+    assert.equal(inspection.status, "invalid");
+    if (inspection.status === "invalid") {
+      assert.deepEqual(inspection.issues, ["STORE_ROUTE_INVALID"]);
+    }
+  });
+
+  it("rejects manifest authority input outside the declared store root for reads and writes", () => {
+    arrangeRoute();
+    mkdirSync(route.storeRoot, { recursive: true });
+    const externalRoot = join(root!, "external-manifest-authority");
+    mkdirSync(externalRoot);
+    const externalManifestPath = join(externalRoot, "store-manifest.json");
+    const originalBytes = `${JSON.stringify(validManifest, null, 2)}\n`;
+    writeFileSync(externalManifestPath, originalBytes);
+    const escapedRoute: ProjectStoreRoute = {
+      ...route,
+      storeManifestPath: externalManifestPath,
+    };
+    const repository = new StoreManifestRepository({
+      now: () => "2026-07-12T00:02:00.000Z",
+    });
+
+    const inspection = repository.inspect(escapedRoute, identity);
+    assert.equal(inspection.status, "invalid");
+    if (inspection.status === "invalid") {
+      assert.deepEqual(inspection.issues, ["STORE_ROUTE_INVALID"]);
+    }
+    assert.throws(
+      () => repository.createExplicit(escapedRoute, identity),
+      /STORE_ROUTE_INVALID/,
+    );
+    assert.throws(
+      () => repository.recordIntegrity(escapedRoute, identity, {
+        ok: true,
+        schemaFingerprint: "schema-v1",
+        terminalEventHash: "event-hash",
+      }),
+      /STORE_ROUTE_INVALID/,
+    );
+    assert.equal(readFileSync(externalManifestPath, "utf8"), originalBytes);
+  });
+
+  it("rejects a noncanonical lexical alias for the manifest authority file", () => {
+    arrangeRoute();
+    const repository = new StoreManifestRepository({
+      now: () => "2026-07-12T00:01:00.000Z",
+    });
+    repository.createExplicit(route, identity);
+    mkdirSync(join(route.storeRoot, "nested"));
+    const aliasedRoute: ProjectStoreRoute = {
+      ...route,
+      storeManifestPath: `${route.storeRoot}${sep}nested${sep}..${sep}store-manifest.json`,
+    };
+
+    const inspection = repository.inspect(aliasedRoute, identity);
+
+    assert.equal(inspection.status, "invalid");
+    if (inspection.status === "invalid") {
+      assert.deepEqual(inspection.issues, ["STORE_ROUTE_INVALID"]);
+    }
+  });
+
   it("atomically records integrity while preserving immutable manifest identity", () => {
     arrangeRoute();
     const times = [
@@ -364,6 +522,51 @@ describe("StoreManifestRepository", () => {
       manifest: updated,
     });
     assert.deepEqual(readdirSync(route.storeRoot), ["store-manifest.json"]);
+  });
+
+  it("syncs the replacement directory only after integrity bytes are renamed into place", () => {
+    arrangeRoute();
+    const observed: Array<{
+      path: string;
+      status: string;
+      temporaryCount: number;
+    }> = [];
+    const dependencies: StoreManifestRepositoryDependencies = {
+      now: (() => {
+        const times = [
+          "2026-07-12T00:01:00.000Z",
+          "2026-07-12T00:02:00.000Z",
+        ];
+        return () => times.shift()!;
+      })(),
+      syncDirectory(path: string): void {
+        if (!existsSync(route.storeManifestPath)) return;
+        const manifest = JSON.parse(readFileSync(route.storeManifestPath, "utf8")) as {
+          lastIntegrity: { status: string };
+        };
+        observed.push({
+          path,
+          status: manifest.lastIntegrity.status,
+          temporaryCount: readdirSync(route.storeRoot)
+            .filter((entry) => entry.endsWith(".tmp")).length,
+        });
+      },
+    };
+    const repository = new StoreManifestRepository(dependencies);
+    repository.createExplicit(route, identity);
+    observed.splice(0);
+
+    repository.recordIntegrity(route, identity, {
+      ok: true,
+      schemaFingerprint: "schema-v1",
+      terminalEventHash: "event-hash",
+    });
+
+    assert.deepEqual(observed, [{
+      path: route.storeRoot,
+      status: "passed",
+      temporaryCount: 0,
+    }]);
   });
 
   it("refuses integrity updates for a mismatched store identity without changing bytes", () => {

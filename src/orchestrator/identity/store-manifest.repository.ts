@@ -2,15 +2,16 @@ import { randomUUID } from "node:crypto";
 import {
   closeSync,
   fsyncSync,
+  lstatSync,
   linkSync,
-  mkdirSync,
   openSync,
   readFileSync,
+  realpathSync,
   renameSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { dirname, join } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { ZodError } from "zod";
 import { canonicalExistingDirectory } from "./canonical-path.js";
 import type {
@@ -19,6 +20,11 @@ import type {
   StoreId,
   VaultId,
 } from "./contracts.js";
+import {
+  createDirectoryDurably,
+  fsyncDirectory,
+  type DirectorySync,
+} from "./directory-durability.js";
 import {
   parseStoreManifest,
   type StoreManifestV1,
@@ -43,6 +49,12 @@ export type StoreManifestInspection =
 
 export interface StoreManifestRepositoryDependencies {
   now: () => string;
+  syncDirectory?: DirectorySync;
+}
+
+interface ResolvedStoreManifestRepositoryDependencies {
+  now: () => string;
+  syncDirectory: DirectorySync;
 }
 
 export interface StoreIntegrityResult {
@@ -67,23 +79,131 @@ function inspectionIssues(error: unknown): string[] {
   return [error instanceof Error ? error.message : String(error)];
 }
 
-function unlinkTemporary(path: string): void {
+function unlinkTemporary(path: string): boolean {
   try {
     unlinkSync(path);
+    return true;
   } catch (error) {
     if (errorCode(error) !== "ENOENT") throw error;
+    return false;
   }
 }
 
+function samePath(left: string, right: string): boolean {
+  const normalizedLeft = resolve(left);
+  const normalizedRight = resolve(right);
+  return process.platform === "win32"
+    ? normalizedLeft.toLowerCase() === normalizedRight.toLowerCase()
+    : normalizedLeft === normalizedRight;
+}
+
+function isLexicallyCanonical(path: string): boolean {
+  const normalized = resolve(path);
+  return process.platform === "win32"
+    ? path.toLowerCase() === normalized.toLowerCase()
+    : path === normalized;
+}
+
+function routeInvalid(): Error {
+  return new Error("STORE_ROUTE_INVALID");
+}
+
+function assertManifestRouteShape(route: ProjectStoreRoute): void {
+  if (
+    !isAbsolute(route.storeRoot)
+    || !isAbsolute(route.storeManifestPath)
+    || !isLexicallyCanonical(route.storeRoot)
+    || !isLexicallyCanonical(route.storeManifestPath)
+    || !samePath(dirname(route.storeManifestPath), route.storeRoot)
+    || basename(route.storeManifestPath) !== "store-manifest.json"
+  ) {
+    throw routeInvalid();
+  }
+}
+
+function assertCanonicalExistingAncestor(path: string): void {
+  let cursor = resolve(path);
+  while (true) {
+    try {
+      const authority = lstatSync(cursor);
+      if (authority.isSymbolicLink()) throw routeInvalid();
+      const canonical = resolve(realpathSync.native(cursor));
+      if (!samePath(canonical, cursor)) throw routeInvalid();
+      return;
+    } catch (error) {
+      if (error instanceof Error && error.message === "STORE_ROUTE_INVALID") throw error;
+      if (errorCode(error) !== "ENOENT") throw routeInvalid();
+      const parent = dirname(cursor);
+      if (parent === cursor) throw routeInvalid();
+      cursor = parent;
+    }
+  }
+}
+
+type ManifestAuthorityStatus = "regular" | "missing";
+
+function manifestAuthorityStatus(route: ProjectStoreRoute): ManifestAuthorityStatus {
+  assertManifestRouteShape(route);
+  assertCanonicalExistingAncestor(route.storeRoot);
+
+  let root;
+  try {
+    root = lstatSync(route.storeRoot);
+  } catch (error) {
+    if (errorCode(error) === "ENOENT") return "missing";
+    throw routeInvalid();
+  }
+  if (root.isSymbolicLink() || !root.isDirectory()) throw routeInvalid();
+  const canonicalRoot = resolve(realpathSync.native(route.storeRoot));
+  if (!samePath(canonicalRoot, route.storeRoot)) throw routeInvalid();
+
+  let authority;
+  try {
+    authority = lstatSync(route.storeManifestPath);
+  } catch (error) {
+    if (errorCode(error) === "ENOENT") return "missing";
+    throw routeInvalid();
+  }
+  if (authority.isSymbolicLink() || !authority.isFile()) throw routeInvalid();
+  const canonicalManifest = resolve(realpathSync.native(route.storeManifestPath));
+  if (
+    !samePath(canonicalManifest, route.storeManifestPath)
+    || !samePath(dirname(canonicalManifest), canonicalRoot)
+  ) {
+    throw routeInvalid();
+  }
+  return "regular";
+}
+
 export class StoreManifestRepository {
-  constructor(private readonly dependencies: StoreManifestRepositoryDependencies = {
+  private readonly dependencies: ResolvedStoreManifestRepositoryDependencies;
+
+  constructor(dependencies: StoreManifestRepositoryDependencies = {
     now: () => new Date().toISOString(),
-  }) {}
+  }) {
+    this.dependencies = {
+      now: dependencies.now,
+      syncDirectory: dependencies.syncDirectory ?? fsyncDirectory,
+    };
+  }
 
   inspect(
     route: ProjectStoreRoute,
     expected: ExpectedStoreManifestIdentity,
   ): StoreManifestInspection {
+    let authority: ManifestAuthorityStatus;
+    try {
+      authority = manifestAuthorityStatus(route);
+    } catch {
+      return {
+        status: "invalid",
+        path: route.storeManifestPath,
+        issues: ["STORE_ROUTE_INVALID"],
+      };
+    }
+    if (authority === "missing") {
+      return { status: "missing", path: route.storeManifestPath };
+    }
     let source: string;
     try {
       source = readFileSync(route.storeManifestPath, "utf8");
@@ -135,8 +255,12 @@ export class StoreManifestRepository {
       lastIntegrity: { status: "never" },
     });
 
-    mkdirSync(route.storeRoot, { recursive: true });
+    assertManifestRouteShape(route);
+    assertCanonicalExistingAncestor(route.storeRoot);
+    createDirectoryDurably(route.storeRoot, this.dependencies.syncDirectory);
+    manifestAuthorityStatus(route);
     const publicationDirectory = canonicalExistingDirectory(dirname(route.storeManifestPath));
+    if (!samePath(publicationDirectory, route.storeRoot)) throw routeInvalid();
     const publishedPath = join(publicationDirectory, "store-manifest.json");
     const temporaryPath = join(
       publicationDirectory,
@@ -162,9 +286,12 @@ export class StoreManifestRepository {
         }
         throw error;
       }
+      this.dependencies.syncDirectory(publicationDirectory);
       return manifest;
     } finally {
-      if (temporaryCreated) unlinkTemporary(temporaryPath);
+      if (temporaryCreated && unlinkTemporary(temporaryPath)) {
+        this.dependencies.syncDirectory(publicationDirectory);
+      }
     }
   }
 
@@ -173,6 +300,7 @@ export class StoreManifestRepository {
     expected: StoreManifestIdentity,
     result: StoreIntegrityResult,
   ): StoreManifestV1 {
+    if (manifestAuthorityStatus(route) !== "regular") throw routeInvalid();
     const current = parseStoreManifest(
       JSON.parse(readFileSync(route.storeManifestPath, "utf8")) as unknown,
     );
@@ -195,6 +323,7 @@ export class StoreManifestRepository {
       },
     });
     const publicationDirectory = canonicalExistingDirectory(dirname(route.storeManifestPath));
+    if (!samePath(publicationDirectory, route.storeRoot)) throw routeInvalid();
     const publishedPath = join(publicationDirectory, "store-manifest.json");
     const temporaryPath = join(
       publicationDirectory,
@@ -213,9 +342,12 @@ export class StoreManifestRepository {
       }
       renameSync(temporaryPath, publishedPath);
       temporaryCreated = false;
+      this.dependencies.syncDirectory(publicationDirectory);
       return updated;
     } finally {
-      if (temporaryCreated) unlinkTemporary(temporaryPath);
+      if (temporaryCreated && unlinkTemporary(temporaryPath)) {
+        this.dependencies.syncDirectory(publicationDirectory);
+      }
     }
   }
 }

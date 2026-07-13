@@ -4,7 +4,6 @@ import {
   existsSync,
   fsyncSync,
   linkSync,
-  mkdirSync,
   openSync,
   unlinkSync,
 } from "node:fs";
@@ -14,6 +13,11 @@ import type {
   ProjectStoreRoute,
   StoreId,
 } from "../identity/contracts.js";
+import {
+  createDirectoryDurably,
+  fsyncDirectory,
+  type DirectorySync,
+} from "../identity/directory-durability.js";
 import {
   GitWorkspaceResolver,
   SpawnSyncGitCommandRunner,
@@ -107,6 +111,12 @@ export interface ProjectStoreBootstrapDependencies {
   now: () => string;
   randomId: () => string;
   faultInjector: ProjectStoreBootstrapFaultInjector;
+  syncDirectory?: DirectorySync;
+}
+
+interface ResolvedProjectStoreBootstrapDependencies
+  extends Omit<ProjectStoreBootstrapDependencies, "syncDirectory"> {
+  syncDirectory: DirectorySync;
 }
 
 interface StoreIdentity {
@@ -184,26 +194,6 @@ function fsyncFile(path: string): void {
     fsyncSync(handle);
   } finally {
     closeSync(handle);
-  }
-}
-
-const directoryFsyncUnsupported = new Set([
-  "EINVAL",
-  "EISDIR",
-  "ENOTSUP",
-  "EOPNOTSUPP",
-  ...(process.platform === "win32" ? ["EACCES", "EBADF", "EPERM"] : []),
-]);
-
-function fsyncDirectory(path: string): void {
-  let handle: number | undefined;
-  try {
-    handle = openSync(path, "r");
-    fsyncSync(handle);
-  } catch (error) {
-    if (!directoryFsyncUnsupported.has(errorCode(error) ?? "")) throw error;
-  } finally {
-    if (handle !== undefined) closeSync(handle);
   }
 }
 
@@ -410,7 +400,7 @@ export class DefaultProjectStoreBootstrapService implements ProjectStoreBootstra
     Promise<ProjectStoreBootstrapResult>
   >();
 
-  readonly #dependencies: ProjectStoreBootstrapDependencies;
+  readonly #dependencies: ResolvedProjectStoreBootstrapDependencies;
   #nodeSqlite: Promise<NodeSqliteModule> | undefined;
 
   constructor(dependencies: Partial<ProjectStoreBootstrapDependencies> = {}) {
@@ -430,6 +420,7 @@ export class DefaultProjectStoreBootstrapService implements ProjectStoreBootstra
       randomId: dependencies.randomId ?? randomUUID,
       faultInjector: dependencies.faultInjector
         ?? NO_PROJECT_STORE_BOOTSTRAP_FAULTS,
+      syncDirectory: dependencies.syncDirectory ?? fsyncDirectory,
     };
   }
 
@@ -569,7 +560,7 @@ export class DefaultProjectStoreBootstrapService implements ProjectStoreBootstra
     route: ProjectStoreRoute,
     createdDescriptor: boolean,
   ): Promise<ProjectStoreBootstrapResult> {
-    mkdirSync(route.storeRoot, { recursive: true });
+    createDirectoryDurably(route.storeRoot, this.#dependencies.syncDirectory);
     const capabilityReservation = reserveSqlitePath(
       route.storeRoot,
       (id) => `.events.sqlite.capability-${id}.tmp`,
@@ -649,7 +640,6 @@ export class DefaultProjectStoreBootstrapService implements ProjectStoreBootstra
       } catch (error) {
         if (errorCode(error) !== "EEXIST") throw error;
       }
-      unlinkIfPresent(temporaryPath);
 
       const winningIdentity = validateExistingStore(
         DatabaseSync,
@@ -657,7 +647,9 @@ export class DefaultProjectStoreBootstrapService implements ProjectStoreBootstra
         descriptor,
       );
       fsyncFile(route.eventsPath);
-      fsyncDirectory(dirname(route.eventsPath));
+      this.#dependencies.syncDirectory(dirname(route.eventsPath));
+      unlinkIfPresent(temporaryPath);
+      this.#dependencies.syncDirectory(dirname(route.eventsPath));
       this.#dependencies.faultInjector.hit("after-database-publish-before-manifest");
       const manifest = this.publishOrAdoptManifest(
         route,

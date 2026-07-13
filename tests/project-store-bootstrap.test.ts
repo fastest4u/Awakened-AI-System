@@ -15,13 +15,27 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, it } from "node:test";
 import { ProjectDescriptorRepository } from "../src/orchestrator/identity/project-descriptor.repository.js";
-import type { BranchScopeId, ProjectId } from "../src/orchestrator/identity/contracts.js";
+import type {
+  BranchScopeId,
+  GitWorkspaceSnapshot,
+  ProjectDescriptorV1,
+  ProjectId,
+  ProjectStoreRoute,
+  WorkspaceSnapshot,
+  WorkspaceId,
+} from "../src/orchestrator/identity/contracts.js";
+import {
+  GitWorkspaceResolver,
+  SpawnSyncGitCommandRunner,
+} from "../src/orchestrator/identity/git-workspace.resolver.js";
+import { ProjectStoreRouter } from "../src/orchestrator/identity/project-store.router.js";
 import { StoreManifestRepository } from "../src/orchestrator/identity/store-manifest.repository.js";
 import { DEFAULT_BUSY_TIMEOUT_MS, PROJECT_MEMORY_APPLICATION_ID } from "../src/orchestrator/runtime/runtime-capabilities.js";
 import { BranchScopeRepository } from "../src/orchestrator/storage/branch-scope.repository.js";
 import {
   DefaultProjectStoreBootstrapService,
   type ProjectStoreBootstrapFaultBoundary,
+  type ProjectStoreBootstrapDependencies,
 } from "../src/orchestrator/storage/project-store-bootstrap.service.js";
 import { NodeSqliteDriver } from "../src/orchestrator/storage/node-sqlite-driver.js";
 import { expectedSchemaFingerprint } from "../src/orchestrator/storage/schema-fingerprint.js";
@@ -159,6 +173,111 @@ describe("DefaultProjectStoreBootstrapService", () => {
     assert.equal(again.recoveredManifest, false);
     assert.deepEqual(again.descriptor, result.descriptor);
     assert.deepEqual(again.manifest, result.manifest);
+  });
+
+  it("syncs every new Git-store ancestor before publishing the database", async () => {
+    const { root, projectRoot, vaultRoot } = fixture();
+    const gitCommonDir = join(root, "git-common");
+    mkdirSync(gitCommonDir);
+    const workspace: GitWorkspaceSnapshot = {
+      kind: "git",
+      worktreeRoot: projectRoot,
+      gitDir: join(projectRoot, ".git"),
+      gitCommonDir,
+      headCommit: "a".repeat(40),
+      branchRef: "refs/heads/main",
+      detached: false,
+      workspaceId: "bootstrap-git-workspace" as WorkspaceId,
+    };
+    class StaticGitWorkspaceResolver extends GitWorkspaceResolver {
+      constructor() {
+        super(new SpawnSyncGitCommandRunner());
+      }
+
+      override inspect(): GitWorkspaceSnapshot {
+        return workspace;
+      }
+    }
+    const barriers: Array<{
+      path: string;
+      databasePublished: boolean;
+      manifestPublished: boolean;
+      temporaryDatabaseCount: number;
+    }> = [];
+    let eventsPath = "";
+    let manifestPath = "";
+    let storeRoot = "";
+    class ObservingProjectStoreRouter extends ProjectStoreRouter {
+      override route(
+        descriptor: ProjectDescriptorV1,
+        actualVaultRoot: string,
+        actualWorkspace: WorkspaceSnapshot,
+      ): ProjectStoreRoute {
+        assert.equal(actualVaultRoot, vaultRoot);
+        assert.strictEqual(actualWorkspace, workspace);
+        const observedRoute = super.route(descriptor, actualVaultRoot, actualWorkspace);
+        storeRoot = observedRoute.storeRoot;
+        eventsPath = observedRoute.eventsPath;
+        manifestPath = observedRoute.storeManifestPath;
+        return observedRoute;
+      }
+    }
+    const dependencies: Partial<ProjectStoreBootstrapDependencies> = {
+      workspaceResolver: new StaticGitWorkspaceResolver(),
+      syncDirectory(path: string): void {
+        barriers.push({
+          path,
+          databasePublished: eventsPath.length > 0 && existsSync(eventsPath),
+          manifestPublished: manifestPath.length > 0 && existsSync(manifestPath),
+          temporaryDatabaseCount: storeRoot.length > 0 && existsSync(storeRoot)
+            ? readdirSync(storeRoot).filter((name) =>
+              name.startsWith(".events.sqlite.bootstrap-") && name.endsWith(".tmp")
+            ).length
+            : 0,
+        });
+      },
+      router: new ObservingProjectStoreRouter(),
+    };
+
+    const result = await new DefaultProjectStoreBootstrapService(dependencies).initialize({
+      projectRoot,
+      vaultRoot,
+    });
+    const projectMemoryRoot = join(gitCommonDir, "project-memory");
+    const projectStoreRoot = join(projectMemoryRoot, result.descriptor.projectId);
+
+    assert.deepEqual(barriers, [
+      {
+        path: gitCommonDir,
+        databasePublished: false,
+        manifestPublished: false,
+        temporaryDatabaseCount: 0,
+      },
+      {
+        path: projectMemoryRoot,
+        databasePublished: false,
+        manifestPublished: false,
+        temporaryDatabaseCount: 0,
+      },
+      {
+        path: projectStoreRoot,
+        databasePublished: false,
+        manifestPublished: false,
+        temporaryDatabaseCount: 0,
+      },
+      {
+        path: result.route.storeRoot,
+        databasePublished: true,
+        manifestPublished: false,
+        temporaryDatabaseCount: 1,
+      },
+      {
+        path: result.route.storeRoot,
+        databasePublished: true,
+        manifestPublished: false,
+        temporaryDatabaseCount: 0,
+      },
+    ]);
   });
 
   it("accepts a legitimately advanced published maintenance state without replacing identity", async () => {
