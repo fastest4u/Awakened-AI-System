@@ -33,6 +33,7 @@ import {
   decodeWorkerRequest,
   decodeWorkerResponse,
   encodeAppendCommandWire,
+  encodeMaintenanceLeaseWire,
   encodeWorkerBinding,
   encodeWorkerBindingAssertion,
   type WorkerBinding,
@@ -1399,6 +1400,168 @@ describe("ProjectStoreWorkerBackend open identity", () => {
     const moved = `${context.binding.storeRoute.eventsPath}.child-closed`;
     renameSync(context.binding.storeRoute.eventsPath, moved);
     renameSync(moved, context.binding.storeRoute.eventsPath);
+  });
+
+  it("keeps maintenance readiness hidden until integrity children and the primary handle are closed", async () => {
+    const context = await realContext();
+    const child = new DeferredTerminationWorker();
+    const backend = new ProjectStoreWorkerBackend({
+      selfUrl: WORKER_URL,
+      executorLeaseMs: 15_000,
+      appendRetryDeadlineMs: 10_000,
+      integrityWorkerFactory: () => child,
+    });
+    const opened = await backend.dispatch({
+      id: "open-maintenance-ordering",
+      type: "open",
+      binding: encodeWorkerBinding(context),
+    }) as WorkerOpenResult;
+    const integrity = backend.dispatch({
+      id: "full-maintenance-ordering",
+      type: "fullIntegrity",
+      binding: encodeWorkerBindingAssertion(context),
+    });
+    const integrityFailure = assert.rejects(integrity, (error) => (
+      error instanceof ProjectStoreWorkerBackendError
+      && error.code === "WORKER_UNAVAILABLE"
+    ));
+    const observer = new NodeSqliteDriver({ DatabaseSync }).open(
+      context.binding.storeRoute.eventsPath,
+      { mode: "existing", busyTimeoutMs: DEFAULT_BUSY_TIMEOUT_MS },
+    );
+    const fence = new MaintenanceFence();
+    const acquiredAt = new Date().toISOString();
+    observer.exec("BEGIN IMMEDIATE");
+    const lease = fence.acquire(
+      observer,
+      "maintenance-ordering",
+      new Date(Date.now() + 60_000).toISOString(),
+      acquiredAt,
+    );
+    observer.exec("COMMIT");
+
+    const closing = backend.quiesceAndClose(
+      encodeMaintenanceLeaseWire(lease),
+      encodeWorkerBindingAssertion(context),
+    );
+    await turn();
+    const terminateCallsWhileClosing = child.terminateCalls;
+    const acknowledgementCountWhileClosing = observer.prepare(`
+      SELECT count(*) AS count
+      FROM maintenance_acknowledgements
+      WHERE epoch = $epoch
+        AND executor_id = $executorId
+        AND fencing_token = $fencingToken
+    `).get({
+      $epoch: lease.epoch,
+      $executorId: opened.executorId,
+      $fencingToken: lease.fencingToken,
+    })?.count;
+    const closedAtWhileClosing = observer.prepare(`
+      SELECT closed_at
+      FROM executor_leases
+      WHERE project_id = $projectId AND executor_id = $executorId
+    `).get({
+      $projectId: context.binding.projectId,
+      $executorId: opened.executorId,
+    })?.closed_at;
+    observer.exec("BEGIN DEFERRED");
+    const readyWhileClosing = fence.allRequiredExecutorsAcknowledged(observer, lease);
+    observer.exec("ROLLBACK");
+
+    child.emit("exit", 1);
+    child.termination.resolve(1);
+    await integrityFailure;
+    await closing;
+
+    observer.exec("BEGIN DEFERRED");
+    const readyAfterClosing = fence.allRequiredExecutorsAcknowledged(observer, lease);
+    observer.exec("ROLLBACK");
+    observer.close();
+
+    const moved = `${context.binding.storeRoute.eventsPath}.maintenance-ready`;
+    renameSync(context.binding.storeRoute.eventsPath, moved);
+    renameSync(moved, context.binding.storeRoute.eventsPath);
+
+    assert.equal(terminateCallsWhileClosing, 1);
+    assert.equal(acknowledgementCountWhileClosing, 1n);
+    assert.equal(closedAtWhileClosing, null);
+    assert.equal(readyWhileClosing, false);
+    assert.equal(readyAfterClosing, true);
+  });
+
+  it("retracts maintenance readiness and releases the marker handle when marker close fails", async () => {
+    const context = await realContext();
+    class OneShotMarkerCloseFailureFence extends MaintenanceFence {
+      closeAttempts = 0;
+      forceRelease: (() => void) | undefined;
+
+      override closeExecutor(
+        ...parameters: Parameters<MaintenanceFence["closeExecutor"]>
+      ): void {
+        super.closeExecutor(...parameters);
+        const [connection] = parameters;
+        const physicalClose = connection.close.bind(connection);
+        this.forceRelease = physicalClose;
+        connection.close = () => {
+          this.closeAttempts += 1;
+          if (this.closeAttempts === 1) throw new Error("marker close failed");
+          physicalClose();
+        };
+      }
+    }
+    const workerFence = new OneShotMarkerCloseFailureFence();
+    const backend = new ProjectStoreWorkerBackend({
+      selfUrl: WORKER_URL,
+      executorLeaseMs: 15_000,
+      appendRetryDeadlineMs: 10_000,
+      maintenanceFactory: () => workerFence,
+    });
+    const opened = await backend.dispatch({
+      id: "open-marker-close-failure",
+      type: "open",
+      binding: encodeWorkerBinding(context),
+    }) as WorkerOpenResult;
+    const observer = new NodeSqliteDriver({ DatabaseSync }).open(
+      context.binding.storeRoute.eventsPath,
+      { mode: "existing", busyTimeoutMs: DEFAULT_BUSY_TIMEOUT_MS },
+    );
+    const fence = new MaintenanceFence();
+    const acquiredAt = new Date().toISOString();
+    observer.exec("BEGIN IMMEDIATE");
+    const lease = fence.acquire(
+      observer,
+      "marker-close-failure",
+      new Date(Date.now() + 60_000).toISOString(),
+      acquiredAt,
+    );
+    observer.exec("COMMIT");
+
+    await assert.rejects(backend.quiesceAndClose(
+      encodeMaintenanceLeaseWire(lease),
+      encodeWorkerBindingAssertion(context),
+    ), /marker close failed/);
+    const closedAtAfterFailure = observer.prepare(`
+      SELECT closed_at
+      FROM executor_leases
+      WHERE project_id = $projectId AND executor_id = $executorId
+    `).get({
+      $projectId: context.binding.projectId,
+      $executorId: opened.executorId,
+    })?.closed_at;
+    observer.exec("BEGIN DEFERRED");
+    const readyAfterFailure = fence.allRequiredExecutorsAcknowledged(observer, lease);
+    observer.exec("ROLLBACK");
+
+    try { workerFence.forceRelease?.(); } catch { /* production retry may already have closed it */ }
+    observer.close();
+    const moved = `${context.binding.storeRoute.eventsPath}.marker-close-failure`;
+    renameSync(context.binding.storeRoute.eventsPath, moved);
+    renameSync(moved, context.binding.storeRoute.eventsPath);
+
+    assert.equal(workerFence.closeAttempts, 2);
+    assert.equal(closedAtAfterFailure, null);
+    assert.equal(readyAfterFailure, false);
   });
 
   it("physically closes SQLite even when executor close bookkeeping fails", async () => {

@@ -357,17 +357,16 @@ export class ProjectStoreWorkerBackend implements WorkerRuntimeBackend {
     leaseWire: MaintenanceLeaseWire,
   ): Promise<{ executorId: string; epoch: string; fencingToken: string }> {
     const lease = decodeMaintenanceLeaseWire(leaseWire);
-    const now = new Date().toISOString();
+    const acknowledgedAt = new Date().toISOString();
     let primaryError: unknown;
     let failed = false;
     try {
       active.connection.exec("BEGIN IMMEDIATE");
-      active.maintenance.acknowledge(active.connection, lease, active.executorId, now);
-      active.maintenance.closeExecutor(
+      active.maintenance.acknowledge(
         active.connection,
-        active.context.binding.projectId,
+        lease,
         active.executorId,
-        now,
+        acknowledgedAt,
       );
       active.connection.exec("COMMIT");
     } catch (error) {
@@ -383,12 +382,133 @@ export class ProjectStoreWorkerBackend implements WorkerRuntimeBackend {
         failed = true;
       }
     }
+    if (!failed) {
+      try {
+        // closed_at is the maintenance readiness marker. Publish it only
+        // after closeHandles has drained children and closed the primary DB.
+        await this.publishMaintenanceClosure(active, new Date().toISOString());
+      } catch (error) {
+        primaryError = error;
+        failed = true;
+      }
+    }
     if (failed) throw primaryError;
     return {
       executorId: active.executorId,
       epoch: leaseWire.epoch,
       fencingToken: leaseWire.fencingToken,
     };
+  }
+
+  private async publishMaintenanceClosure(active: ActiveStore, closedAt: string): Promise<void> {
+    const driver = await sqliteDriver();
+    const connection = driver.open(active.path, {
+      mode: "existing",
+      busyTimeoutMs: DEFAULT_BUSY_TIMEOUT_MS,
+    });
+    let primaryError: unknown;
+    let failed = false;
+    let transactionOpen = false;
+    try {
+      identityFromConnection(
+        connection,
+        {
+          projectId: active.context.binding.projectId,
+          vaultId: active.context.binding.vaultId,
+        },
+        active.context.binding.storeId,
+      );
+      connection.exec("BEGIN IMMEDIATE");
+      transactionOpen = true;
+      active.maintenance.closeExecutor(
+        connection,
+        active.context.binding.projectId,
+        active.executorId,
+        closedAt,
+      );
+      connection.exec("COMMIT");
+      transactionOpen = false;
+    } catch (error) {
+      if (transactionOpen) {
+        try { connection.exec("ROLLBACK"); } catch { /* preserve publication failure */ }
+      }
+      primaryError = error;
+      failed = true;
+    }
+    if (failed) {
+      try { connection.close(); } catch {
+        try { connection.close(); } catch { /* preserve publication failure */ }
+      }
+      throw primaryError;
+    }
+    try {
+      connection.close();
+    } catch (closeError) {
+      let retractionFailed = false;
+      try {
+        // A close exception leaves the marker handle's state unknown. Make
+        // readiness false again before retrying that physical close.
+        await this.retractMaintenanceClosure(active, closedAt);
+      } catch {
+        retractionFailed = true;
+      }
+      try { connection.close(); } catch { /* it may already have closed before throwing */ }
+      if (retractionFailed) failure("MAINTENANCE_READINESS_RETRACTION_FAILED");
+      throw closeError;
+    }
+  }
+
+  private async retractMaintenanceClosure(active: ActiveStore, closedAt: string): Promise<void> {
+    const driver = await sqliteDriver();
+    const connection = driver.open(active.path, {
+      mode: "existing",
+      busyTimeoutMs: DEFAULT_BUSY_TIMEOUT_MS,
+    });
+    let primaryError: unknown;
+    let failed = false;
+    let transactionOpen = false;
+    try {
+      identityFromConnection(
+        connection,
+        {
+          projectId: active.context.binding.projectId,
+          vaultId: active.context.binding.vaultId,
+        },
+        active.context.binding.storeId,
+      );
+      connection.exec("BEGIN IMMEDIATE");
+      transactionOpen = true;
+      const changed = connection.prepare(`
+        UPDATE executor_leases
+        SET closed_at = NULL
+        WHERE project_id = $projectId
+          AND executor_id = $executorId
+          AND closed_at = $closedAt
+      `).run({
+        $projectId: active.context.binding.projectId,
+        $executorId: active.executorId,
+        $closedAt: closedAt,
+      }).changes;
+      if (changed !== 1n) failure("MAINTENANCE_READINESS_RETRACTION_FAILED");
+      connection.exec("COMMIT");
+      transactionOpen = false;
+    } catch (error) {
+      if (transactionOpen) {
+        try { connection.exec("ROLLBACK"); } catch { /* preserve retraction failure */ }
+      }
+      primaryError = error;
+      failed = true;
+    }
+    try {
+      connection.close();
+    } catch (error) {
+      try { connection.close(); } catch { /* preserve the first cleanup failure */ }
+      if (!failed) {
+        primaryError = error;
+        failed = true;
+      }
+    }
+    if (failed) throw primaryError;
   }
 
   async close(): Promise<void> {
