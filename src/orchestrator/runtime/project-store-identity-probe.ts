@@ -51,11 +51,15 @@ export interface WorkerProjectStoreIdentityProbeDependencies {
   randomId: () => string;
 }
 
-function probeFailure(code: string): ProjectBindingError {
+function probeFailure(
+  code: string,
+  details: Record<string, unknown> = {},
+): ProjectBindingError {
   return new ProjectBindingError(
     IDENTITY_CODES.has(code)
       ? code as "PROJECT_ID_MISMATCH" | "VAULT_ID_MISMATCH" | "STORE_ID_MISMATCH"
       : "STORE_UNAVAILABLE",
+    details,
   );
 }
 
@@ -150,22 +154,31 @@ export class WorkerProjectStoreIdentityProbe implements ProjectStoreIdentityProb
     return new Promise<WorkerResponse>((resolveResponse, rejectResponse) => {
       let response: WorkerResponse | undefined;
       let settled = false;
-      const timer = this.#dependencies.scheduler.setTimeout(() => {
+      let terminating = false;
+      let terminationCode = "WORKER_UNAVAILABLE";
+      const rejectOnce = (error: ProjectBindingError): void => {
         if (settled) return;
         settled = true;
         this.#dependencies.scheduler.clearTimeout(timer);
-        void worker.terminate().catch(() => undefined).then(() => {
-          rejectResponse(probeFailure("WORKER_TIMEOUT"));
-        });
-      }, this.#options.requestTimeoutMs);
-      const fail = (code: string): void => {
-        if (settled) return;
-        settled = true;
-        this.#dependencies.scheduler.clearTimeout(timer);
-        void worker.terminate().catch(() => undefined).then(() => {
-          rejectResponse(probeFailure(code));
-        });
+        rejectResponse(error);
       };
+      const fail = (code: string): void => {
+        if (settled || terminating) return;
+        terminating = true;
+        terminationCode = code;
+        this.#dependencies.scheduler.clearTimeout(timer);
+        void Promise.resolve()
+          .then(() => worker.terminate())
+          .then(
+            () => rejectOnce(probeFailure(code)),
+            () => rejectOnce(probeFailure("WORKER_UNAVAILABLE", {
+              terminationFailed: true,
+            })),
+          );
+      };
+      const timer = this.#dependencies.scheduler.setTimeout(() => {
+        fail("WORKER_TIMEOUT");
+      }, this.#options.requestTimeoutMs);
       worker.on("message", (value) => {
         if (settled) return;
         try {
@@ -187,8 +200,12 @@ export class WorkerProjectStoreIdentityProbe implements ProjectStoreIdentityProb
       worker.on("error", () => fail("WORKER_UNAVAILABLE"));
       worker.on("exit", (exitCode) => {
         if (settled) return;
+        if (terminating) {
+          rejectOnce(probeFailure(terminationCode));
+          return;
+        }
         if (exitCode !== 0 || response === undefined) {
-          fail("WORKER_UNAVAILABLE");
+          rejectOnce(probeFailure("WORKER_UNAVAILABLE"));
           return;
         }
         settled = true;

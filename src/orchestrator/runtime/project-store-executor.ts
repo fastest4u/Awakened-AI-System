@@ -274,6 +274,12 @@ function confirmationError(error: unknown): ProjectStoreWorkerError {
   }
 }
 
+function terminationFailure(): ProjectStoreWorkerError {
+  return new ProjectStoreWorkerError("WORKER_UNAVAILABLE", {
+    terminationFailed: true,
+  });
+}
+
 export class ProjectStoreExecutor {
   readonly #options: ProjectStoreExecutorOptions;
   readonly #dependencies: ProjectStoreExecutorDependencies;
@@ -325,10 +331,10 @@ export class ProjectStoreExecutor {
     this.#worker = this.#dependencies.workerFactory(options.workerUrl, { workerData });
     this.#worker.on("message", (value) => this.onMessage(value));
     this.#worker.on("messageerror", () => {
-      void this.poison(new ProjectStoreWorkerError("WORKER_PROTOCOL_ERROR"));
+      this.poisonInBackground(new ProjectStoreWorkerError("WORKER_PROTOCOL_ERROR"));
     });
     this.#worker.on("error", () => {
-      void this.poison(new ProjectStoreWorkerError("WORKER_UNAVAILABLE"));
+      this.poisonInBackground(new ProjectStoreWorkerError("WORKER_UNAVAILABLE"));
     });
     this.#worker.on("exit", (exitCode) => this.onExit(exitCode));
   }
@@ -403,7 +409,7 @@ export class ProjectStoreExecutor {
       || report.ok !== (report.issues.length === 0)
     ) {
       const error = new ProjectStoreWorkerError("WORKER_PROTOCOL_ERROR");
-      void this.poison(error);
+      this.poisonInBackground(error);
       throw error;
     }
     const binding = this.#options.context.binding;
@@ -413,7 +419,7 @@ export class ProjectStoreExecutor {
         ? new ProjectStoreWorkerError("STORE_ID_MISMATCH")
         : null;
     if (authorityError !== null) {
-      void this.poison(authorityError);
+      this.poisonInBackground(authorityError);
       throw authorityError;
     }
     return report;
@@ -553,7 +559,7 @@ export class ProjectStoreExecutor {
     const completeRequest = { ...request, id } as WorkerRequest;
     return new Promise<unknown>((resolveRequest, rejectRequest) => {
       const timer = this.#dependencies.scheduler.setTimeout(() => {
-        void this.poison(new ProjectStoreWorkerError("WORKER_TIMEOUT"));
+        this.poisonInBackground(new ProjectStoreWorkerError("WORKER_TIMEOUT"));
       }, this.#options.requestTimeoutMs);
       const pending: PendingRequest = {
         request: completeRequest,
@@ -571,7 +577,7 @@ export class ProjectStoreExecutor {
         this.#dependencies.scheduler.clearTimeout(timer);
         rejectRequest(new ProjectStoreWorkerError("WORKER_UNAVAILABLE"));
         this.notifyDrain();
-        void this.poison(new ProjectStoreWorkerError("WORKER_UNAVAILABLE"));
+        this.poisonInBackground(new ProjectStoreWorkerError("WORKER_UNAVAILABLE"));
       }
     });
   }
@@ -581,7 +587,7 @@ export class ProjectStoreExecutor {
     try {
       message = decodeWorkerMessage(value);
     } catch {
-      void this.poison(new ProjectStoreWorkerError("WORKER_PROTOCOL_ERROR"));
+      this.poisonInBackground(new ProjectStoreWorkerError("WORKER_PROTOCOL_ERROR"));
       return;
     }
     if (!("id" in message)) {
@@ -590,26 +596,36 @@ export class ProjectStoreExecutor {
     }
     const pending = this.#pending.get(message.id);
     if (pending === undefined) {
-      void this.poison(new ProjectStoreWorkerError("WORKER_PROTOCOL_ERROR"));
+      this.poisonInBackground(new ProjectStoreWorkerError("WORKER_PROTOCOL_ERROR"));
       return;
     }
     let response: WorkerResponse;
     try {
       response = decodeWorkerResponseForRequest(message, pending.request);
     } catch {
-      void this.poison(new ProjectStoreWorkerError("WORKER_PROTOCOL_ERROR"));
+      this.poisonInBackground(new ProjectStoreWorkerError("WORKER_PROTOCOL_ERROR"));
       return;
     }
     this.#pending.delete(message.id);
     this.#dependencies.scheduler.clearTimeout(pending.timer);
     if (!response.ok) {
-      const error = new ProjectStoreWorkerError(
+      const reported = new ProjectStoreWorkerError(
         response.error.code,
         safeDetails(response.error.details),
       );
+      const exactUnknown = reported.code === "COMMAND_OUTCOME_UNKNOWN"
+        ? this.unknownOutcome(pending)
+        : null;
+      const error = reported.code === "COMMAND_OUTCOME_UNKNOWN"
+        ? exactUnknown ?? new ProjectStoreWorkerError("WORKER_PROTOCOL_ERROR")
+        : reported;
       pending.reject(error);
-      if (pending.request.type === "open" || ASSERTION_FAILURES.has(error.code)) {
-        void this.poison(error);
+      if (
+        pending.request.type === "open"
+        || ASSERTION_FAILURES.has(error.code)
+        || reported.code === "COMMAND_OUTCOME_UNKNOWN"
+      ) {
+        this.poisonInBackground(error);
       }
     } else {
       pending.resolve(response.data);
@@ -624,11 +640,11 @@ export class ProjectStoreExecutor {
       || notification.executorId !== this.#opened.executorId
       || notification.connectionClosed !== true
     ) {
-      void this.poison(new ProjectStoreWorkerError("WORKER_PROTOCOL_ERROR"));
+      this.poisonInBackground(new ProjectStoreWorkerError("WORKER_PROTOCOL_ERROR"));
       return;
     }
     if (this.#quiescedNotification !== null) {
-      void this.poison(new ProjectStoreWorkerError("WORKER_PROTOCOL_ERROR"));
+      this.poisonInBackground(new ProjectStoreWorkerError("WORKER_PROTOCOL_ERROR"));
       return;
     }
     const observedLease = decodeMaintenanceLeaseWire({
@@ -641,7 +657,7 @@ export class ProjectStoreExecutor {
       this.#explicitMaintenanceLease !== null
       && !sameMaintenanceLease(observedLease, this.#explicitMaintenanceLease)
     ) {
-      void this.poison(new ProjectStoreWorkerError("WORKER_PROTOCOL_ERROR"));
+      this.poisonInBackground(new ProjectStoreWorkerError("WORKER_PROTOCOL_ERROR"));
       return;
     }
     this.#quiescedNotification = notification;
@@ -666,7 +682,7 @@ export class ProjectStoreExecutor {
       }
       return;
     }
-    void this.poison(new ProjectStoreWorkerError("WORKER_UNAVAILABLE", {
+    this.poisonInBackground(new ProjectStoreWorkerError("WORKER_UNAVAILABLE", {
       abnormalExit: exitCode !== 0,
     }), false);
   }
@@ -737,6 +753,12 @@ export class ProjectStoreExecutor {
     }
   }
 
+  private poisonInBackground(error: ProjectStoreWorkerError, terminate = true): void {
+    void this.poison(error, terminate).catch(() => {
+      // terminateWorker records a stable terminal failure for later close callers.
+    });
+  }
+
   private notifyDrain(): void {
     if (this.#pending.size !== 0) return;
     for (const waiter of this.#drainWaiters) waiter();
@@ -795,11 +817,19 @@ export class ProjectStoreExecutor {
   private terminateWorker(): Promise<void> {
     if (this.#terminationPromise !== null) return this.#terminationPromise;
     this.#expectedTermination = true;
-    this.#terminationPromise = this.#worker.terminate()
-      .then((exitCode) => {
+    this.#terminationPromise = (async () => {
+      try {
+        const exitCode = await this.#worker.terminate();
         this.#resolveWorkerExit(exitCode);
-      })
-      .catch(() => undefined);
+      } catch {
+        const failure = terminationFailure();
+        this.#state = "poisoned";
+        this.#terminalError = failure;
+        this.rejectAll(failure);
+        this.#resolvePoisonedSignal(failure);
+        throw failure;
+      }
+    })();
     return this.#terminationPromise;
   }
 }

@@ -99,6 +99,12 @@ function failure(code: string, details: Record<string, JsonValue> = {}): never {
   throw new ProjectStoreWorkerBackendError(code, details);
 }
 
+function terminationFailure(): ProjectStoreWorkerBackendError {
+  return new ProjectStoreWorkerBackendError("WORKER_UNAVAILABLE", {
+    terminationFailed: true,
+  });
+}
+
 function canonicalEventsPath(route: ProjectStoreRouteWire): string {
   try {
     const requested = resolve(route.eventsPath);
@@ -390,11 +396,10 @@ export class ProjectStoreWorkerBackend implements WorkerRuntimeBackend {
   }
 
   async close(): Promise<void> {
-    if (this.#closed) return;
     const active = this.#active;
     if (active === null) {
-      this.#closed = true;
       await this.terminateChildren();
+      this.#closed = true;
       return;
     }
     await this.closeHandles(active);
@@ -505,10 +510,24 @@ export class ProjectStoreWorkerBackend implements WorkerRuntimeBackend {
     commandWire: Extract<WorkerRequest, { type: "append" }>["command"],
   ): Promise<WorkerSuccessData> {
     const command = decodeAppendCommandWire(commandWire, active.context);
-    return retryPrimarySqliteBusy(
-      () => encodeAppendResultWire(active.eventStore.append(command)),
-      { deadlineMs: this.#options.appendRetryDeadlineMs },
-    );
+    try {
+      return await retryPrimarySqliteBusy(
+        () => encodeAppendResultWire(active.eventStore.append(command)),
+        { deadlineMs: this.#options.appendRetryDeadlineMs },
+      );
+    } catch (error) {
+      if (error instanceof EventStoreError && error.code === "COMMAND_OUTCOME_UNKNOWN") {
+        try {
+          active.connection.close();
+        } catch {
+          // The parent poisons and terminates this worker from the exact unknown-outcome response.
+        } finally {
+          this.#active = null;
+          this.#closed = true;
+        }
+      }
+      throw error;
+    }
   }
 
   private integrityInChild(
@@ -525,15 +544,27 @@ export class ProjectStoreWorkerBackend implements WorkerRuntimeBackend {
       let response: IntegrityReport | undefined;
       let settled = false;
       let terminating = false;
+      let terminationCause: ProjectStoreWorkerBackendError | undefined;
+      const rejectOnce = (error: ProjectStoreWorkerBackendError): void => {
+        if (settled) return;
+        settled = true;
+        rejectReport(error);
+      };
       const failChild = (error: ProjectStoreWorkerBackendError): void => {
         if (settled || terminating) return;
         terminating = true;
-        void child.terminate().catch(() => undefined).then(() => {
-          this.#children.delete(child);
-          if (settled) return;
-          settled = true;
-          rejectReport(error);
-        });
+        terminationCause = error;
+        void Promise.resolve()
+          .then(() => child.terminate())
+          .then(
+            () => {
+              this.#children.delete(child);
+              rejectOnce(error);
+            },
+            () => {
+              rejectOnce(this.#children.has(child) ? terminationFailure() : error);
+            },
+          );
       };
       child.on("message", (value) => {
         if (settled || terminating) return;
@@ -556,10 +587,13 @@ export class ProjectStoreWorkerBackend implements WorkerRuntimeBackend {
       child.on("error", () => failChild(new ProjectStoreWorkerBackendError("WORKER_UNAVAILABLE")));
       child.on("exit", (exitCode) => {
         this.#children.delete(child);
-        if (settled || terminating) return;
+        if (settled) return;
+        if (terminating) {
+          rejectOnce(terminationCause ?? new ProjectStoreWorkerBackendError("WORKER_UNAVAILABLE"));
+          return;
+        }
         if (exitCode !== 0 || response === undefined) {
-          settled = true;
-          rejectReport(new ProjectStoreWorkerBackendError("WORKER_UNAVAILABLE"));
+          rejectOnce(new ProjectStoreWorkerBackendError("WORKER_UNAVAILABLE"));
           return;
         }
         settled = true;
@@ -575,8 +609,16 @@ export class ProjectStoreWorkerBackend implements WorkerRuntimeBackend {
 
   private async terminateChildren(): Promise<void> {
     const children = [...this.#children];
-    this.#children.clear();
-    await Promise.allSettled(children.map(async (child) => child.terminate()));
+    const terminated = await Promise.all(children.map(async (child) => {
+      try {
+        await child.terminate();
+        this.#children.delete(child);
+        return true;
+      } catch {
+        return !this.#children.has(child);
+      }
+    }));
+    if (terminated.some((proved) => !proved)) throw terminationFailure();
   }
 
   private async closeHandles(active: ActiveStore): Promise<void> {

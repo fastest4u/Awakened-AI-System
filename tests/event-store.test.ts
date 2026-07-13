@@ -73,6 +73,40 @@ class RecordingConnection implements SqliteConnection {
   }
 }
 
+class CommitFailureConnection implements SqliteConnection {
+  commitAttempts = 0;
+  rollbackAttempts = 0;
+
+  constructor(
+    readonly inner: SqliteConnection,
+    readonly commitFailure: unknown,
+    readonly rollbackFailure?: unknown,
+    readonly commitBeforeThrow = false,
+  ) {}
+
+  exec(sql: string): void {
+    const normalized = sql.trim().replace(/\s+/g, " ").toUpperCase();
+    if (normalized === "COMMIT") {
+      this.commitAttempts += 1;
+      if (this.commitBeforeThrow) this.inner.exec(sql);
+      throw this.commitFailure;
+    }
+    if (normalized === "ROLLBACK") {
+      this.rollbackAttempts += 1;
+      if (this.rollbackFailure !== undefined) throw this.rollbackFailure;
+    }
+    this.inner.exec(sql);
+  }
+
+  prepare(sql: string): SqliteStatement {
+    return this.inner.prepare(sql);
+  }
+
+  close(): void {
+    // The fixture owns the underlying connection.
+  }
+}
+
 interface Fixture {
   path: string;
   connection: RecordingConnection;
@@ -302,6 +336,159 @@ afterEach(() => {
 });
 
 describe("EventStore", () => {
+  it("reports a non-BUSY COMMIT failure with the exact command recovery identity", () => {
+    const fixture = createFixture();
+    const connection = new CommitFailureConnection(
+      fixture.connection,
+      { errcode: 10, code: "ERR_SQLITE_ERROR" },
+    );
+    const store = new EventStore(
+      connection,
+      new SqliteEventStoreStatements(connection),
+      new MaintenanceFence(),
+      new BranchScopeRepository(),
+      () => NOW,
+      uuidGenerator(900),
+    );
+    const command = appendCommand(fixture.context);
+
+    const error = expectEventStoreError(
+      () => store.append(command),
+      "COMMAND_OUTCOME_UNKNOWN",
+    );
+
+    assert.deepEqual(error.details, {
+      commandId: command.commandId,
+      idempotencyKey: command.idempotencyKey,
+    });
+    assert.equal(connection.commitAttempts, 1);
+    assert.equal(connection.rollbackAttempts, 1);
+    assert.deepEqual(counts(fixture.connection), {
+      streams: 0n,
+      branchScopes: 0n,
+      events: 0n,
+      outbox: 0n,
+      dedup: 0n,
+    });
+  });
+
+  it("reports rollback failure after COMMIT as exact command outcome unknown", () => {
+    const fixture = createFixture();
+    const connection = new CommitFailureConnection(
+      fixture.connection,
+      { errcode: 5, code: "ERR_SQLITE_ERROR" },
+      new Error("rollback failed"),
+    );
+    const store = new EventStore(
+      connection,
+      new SqliteEventStoreStatements(connection),
+      new MaintenanceFence(),
+      new BranchScopeRepository(),
+      () => NOW,
+      uuidGenerator(1_000),
+    );
+    const command = appendCommand(fixture.context);
+
+    const error = expectEventStoreError(
+      () => store.append(command),
+      "COMMAND_OUTCOME_UNKNOWN",
+    );
+
+    assert.deepEqual(error.details, {
+      commandId: command.commandId,
+      idempotencyKey: command.idempotencyKey,
+    });
+    assert.equal(connection.rollbackAttempts, 1);
+    fixture.connection.exec("ROLLBACK");
+    assert.deepEqual(counts(fixture.connection), {
+      streams: 0n,
+      branchScopes: 0n,
+      events: 0n,
+      outbox: 0n,
+      dedup: 0n,
+    });
+  });
+
+  it("replays one deduplicated effect when COMMIT succeeds before reporting failure", () => {
+    const fixture = createFixture();
+    const connection = new CommitFailureConnection(
+      fixture.connection,
+      { errcode: 10, code: "ERR_SQLITE_ERROR" },
+      undefined,
+      true,
+    );
+    const store = new EventStore(
+      connection,
+      new SqliteEventStoreStatements(connection),
+      new MaintenanceFence(),
+      new BranchScopeRepository(),
+      () => NOW,
+      uuidGenerator(1_050),
+    );
+    const command = appendCommand(fixture.context);
+
+    const error = expectEventStoreError(
+      () => store.append(command),
+      "COMMAND_OUTCOME_UNKNOWN",
+    );
+    assert.deepEqual(error.details, {
+      commandId: command.commandId,
+      idempotencyKey: command.idempotencyKey,
+    });
+
+    const replay = fixture.store.append(command);
+    assert.equal(replay.deduplicated, true);
+    assert.deepEqual(counts(fixture.connection), {
+      streams: 1n,
+      branchScopes: 1n,
+      events: 2n,
+      outbox: 1n,
+      dedup: 1n,
+    });
+    assert.equal(
+      fixture.connection.prepare(`
+        SELECT count(*) AS count
+        FROM command_dedup
+        WHERE command_id = $commandId AND idempotency_key = $idempotencyKey
+      `).get({
+        $commandId: command.commandId,
+        $idempotencyKey: command.idempotencyKey,
+      })?.count,
+      1n,
+    );
+  });
+
+  it("preserves retryable SQLITE_BUSY when failed COMMIT is rolled back", () => {
+    const fixture = createFixture();
+    const connection = new CommitFailureConnection(
+      fixture.connection,
+      { errcode: 5, code: "ERR_SQLITE_ERROR" },
+    );
+    const store = new EventStore(
+      connection,
+      new SqliteEventStoreStatements(connection),
+      new MaintenanceFence(),
+      new BranchScopeRepository(),
+      () => NOW,
+      uuidGenerator(1_100),
+    );
+
+    const error = expectEventStoreError(
+      () => store.append(appendCommand(fixture.context)),
+      "SQLITE_BUSY",
+    );
+
+    assert.deepEqual(error.details, { retryable: true });
+    assert.equal(connection.rollbackAttempts, 1);
+    assert.deepEqual(counts(fixture.connection), {
+      streams: 0n,
+      branchScopes: 0n,
+      events: 0n,
+      outbox: 0n,
+      dedup: 0n,
+    });
+  });
+
   it("atomically appends an ordered pair, chains hashes, stores outbox, and exactly replays", () => {
     const fixture = createFixture({
       now: (() => {

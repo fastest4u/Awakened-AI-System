@@ -27,7 +27,10 @@ import type {
   VaultId,
 } from "../src/orchestrator/identity/contracts.js";
 import { deriveNonGitWorkspaceId } from "../src/orchestrator/identity/git-workspace.resolver.js";
-import { computeProjectContextFingerprint } from "../src/orchestrator/identity/project-binding.service.js";
+import {
+  computeProjectContextFingerprint,
+  ProjectBindingError,
+} from "../src/orchestrator/identity/project-binding.service.js";
 import {
   decodeAppendCommandWire,
   decodeWorkerRequest,
@@ -71,7 +74,7 @@ import {
   DefaultProjectStoreBootstrapService,
 } from "../src/orchestrator/storage/project-store-bootstrap.service.js";
 import { MaintenanceFence } from "../src/orchestrator/storage/maintenance-fence.js";
-import { EventStoreError } from "../src/orchestrator/storage/event-store.js";
+import { EventStore, EventStoreError } from "../src/orchestrator/storage/event-store.js";
 import { NodeSqliteDriver } from "../src/orchestrator/storage/node-sqlite-driver.js";
 import { DEFAULT_BUSY_TIMEOUT_MS } from "../src/orchestrator/runtime/runtime-capabilities.js";
 
@@ -998,7 +1001,7 @@ describe("ProjectStoreExecutor bounded lifecycle", () => {
     await turn();
     await turn();
 
-    assert.equal(outcome, "WORKER_PROTOCOL_ERROR");
+    assert.equal(outcome, "WORKER_UNAVAILABLE");
     assert.equal(worker.terminateCalls, 1);
     assert.equal(ownerCalls, 0);
     await quiescing;
@@ -1052,7 +1055,7 @@ describe("ProjectStoreExecutor bounded lifecycle", () => {
     await turn();
     await turn();
 
-    assert.equal(lateOutcome, "WORKER_PROTOCOL_ERROR");
+    assert.equal(lateOutcome, "WORKER_UNAVAILABLE");
     assert.equal(lateWorker.terminateCalls, 1);
     assert.equal(lateOwnerCalls, 0);
     await lateQuiescing;
@@ -1297,6 +1300,44 @@ describe("ProjectStoreExecutor bounded lifecycle", () => {
     });
   });
 
+  it("poisons an explicit unknown outcome and requires a newly revalidated executor", async () => {
+    const { executor, worker, context } = await fakeExecutor();
+    const command = appendCommand(context);
+    const mutation = executor.append(command);
+    const request = worker.posted.at(-1)!;
+    worker.emit("message", {
+      id: request.id,
+      ok: false,
+      error: {
+        code: "COMMAND_OUTCOME_UNKNOWN",
+        message: "COMMAND_OUTCOME_UNKNOWN",
+        details: {
+          commandId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+          idempotencyKey: "untrusted-worker-key",
+        },
+      },
+    });
+
+    await assert.rejects(mutation, (error) => {
+      assert.ok(error instanceof ProjectStoreWorkerError);
+      assert.equal(error.code, "COMMAND_OUTCOME_UNKNOWN");
+      assert.deepEqual(error.details, {
+        commandId: command.commandId,
+        idempotencyKey: command.idempotencyKey,
+      });
+      return true;
+    });
+    await turn();
+    assert.equal(worker.terminateCalls, 1);
+    const postsAfterPoison = worker.posted.length;
+    assert.throws(() => executor.quickIntegrity(), errorCode("COMMAND_OUTCOME_UNKNOWN"));
+    assert.equal(worker.posted.length, postsAfterPoison);
+
+    const recovered = await fakeExecutor();
+    assert.notEqual(recovered.worker, worker);
+    assert.equal(recovered.executor.canReuse(), true);
+  });
+
   it("classifies a read and a posted mutation differently on the same worker death", async () => {
     const { executor, worker, context } = await fakeExecutor();
     const read = executor.quickIntegrity();
@@ -1537,6 +1578,56 @@ describe("ProjectStoreExecutor bounded lifecycle", () => {
     await assert.rejects(closing, errorCode("STORE_UNAVAILABLE"));
     assert.equal(worker.terminateCalls, 1);
     await assert.rejects(executor.close(), errorCode("STORE_UNAVAILABLE"));
+  });
+
+  it("never reports normal, forced, or poisoned close after termination rejects without exit", async () => {
+    for (const mode of ["normal", "forced", "poisoned"] as const) {
+      const context = contextFixture();
+      writeFileSync(context.binding.storeRoute.eventsPath, "fixture", "utf8");
+      const worker = new RejectingTerminationWorker();
+      const scheduler = new ManualScheduler();
+      const executor = new ProjectStoreExecutor({
+        workerUrl: WORKER_URL,
+        context,
+        maxPending: DEFAULT_MAX_PENDING,
+        requestTimeoutMs: 10_000,
+        closeTimeoutMs: 5_000,
+        executorLeaseMs: 15_000,
+        heartbeatIntervalMs: 5_000,
+      }, {
+        workerFactory: () => worker,
+        scheduler,
+      });
+      const opening = executor.open();
+      worker.respond(worker.posted[0]!, openResult(context));
+      await opening;
+
+      let closing: Promise<void>;
+      if (mode === "poisoned") {
+        worker.emit("messageerror", new Error("malformed worker response"));
+        await turn();
+        closing = executor.close();
+      } else {
+        closing = executor.close();
+        await turn();
+        if (mode === "normal") {
+          const closeRequest = worker.posted.find((request) => request.type === "close")!;
+          worker.respond(closeRequest, { closed: true });
+        } else {
+          scheduler.runNext();
+        }
+      }
+
+      await assert.rejects(closing, (error) => {
+        assert.ok(error instanceof ProjectStoreWorkerError, mode);
+        assert.equal(error.code, "WORKER_UNAVAILABLE", mode);
+        assert.deepEqual(error.details, { terminationFailed: true }, mode);
+        assert.equal(error.message, "WORKER_UNAVAILABLE", mode);
+        return true;
+      });
+      assert.equal(worker.terminateCalls, 1, mode);
+      assert.equal(executor.canReuse(), false, mode);
+    }
   });
 
   it("keys reuse by canonical path, store, generation, and fingerprint and poisons rebinds", async () => {
@@ -2183,6 +2274,53 @@ describe("real project-store worker", () => {
 });
 
 describe("ProjectStoreWorkerBackend open identity", () => {
+  it("disposes an uncertain append connection before returning exact recovery IDs", async () => {
+    const context = await realContext();
+    const backend = new ProjectStoreWorkerBackend({
+      selfUrl: WORKER_URL,
+      executorLeaseMs: 15_000,
+      appendRetryDeadlineMs: 10_000,
+      eventStoreFactory: () => ({
+        append<T extends JsonValue>(command: AppendCommand<T>): never {
+          throw new EventStoreError("COMMAND_OUTCOME_UNKNOWN", {
+            commandId: command.commandId,
+            idempotencyKey: command.idempotencyKey,
+          });
+        },
+      }) as unknown as EventStore,
+    });
+    await backend.dispatch({
+      id: "open-uncertain-append",
+      type: "open",
+      binding: encodeWorkerBinding(context),
+    });
+    const command = appendCommand(context);
+
+    await assert.rejects(backend.dispatch({
+      id: "uncertain-append",
+      type: "append",
+      binding: encodeWorkerBindingAssertion(context),
+      command: encodeAppendCommandWire(command),
+    }), (error) => {
+      assert.ok(error instanceof EventStoreError);
+      assert.equal(error.code, "COMMAND_OUTCOME_UNKNOWN");
+      assert.deepEqual(error.details, {
+        commandId: command.commandId,
+        idempotencyKey: command.idempotencyKey,
+      });
+      return true;
+    });
+    await assert.rejects(backend.heartbeat(), (error) => (
+      error instanceof ProjectStoreWorkerBackendError
+      && error.code === "WORKER_CLOSED"
+    ));
+    await backend.close();
+
+    const moved = `${context.binding.storeRoute.eventsPath}.unknown-disposed`;
+    renameSync(context.binding.storeRoute.eventsPath, moved);
+    renameSync(moved, context.binding.storeRoute.eventsPath);
+  });
+
   async function workerOwnedPublicationFault(
     mode: "transient" | "persistent",
   ): Promise<{
@@ -2339,6 +2477,150 @@ describe("ProjectStoreWorkerBackend open identity", () => {
     ));
     await closing;
     const moved = `${context.binding.storeRoute.eventsPath}.child-closed`;
+    renameSync(context.binding.storeRoute.eventsPath, moved);
+    renameSync(moved, context.binding.storeRoute.eventsPath);
+  });
+
+  it("keeps a child tracked and rejects every close retry when termination has no exit proof", async () => {
+    const context = await realContext();
+    const child = new RejectingTerminationWorker();
+    const backend = new ProjectStoreWorkerBackend({
+      selfUrl: WORKER_URL,
+      executorLeaseMs: 15_000,
+      appendRetryDeadlineMs: 10_000,
+      integrityWorkerFactory: () => child,
+    });
+    await backend.dispatch({
+      id: "open-rejecting-child",
+      type: "open",
+      binding: encodeWorkerBinding(context),
+    });
+    const integrity = backend.dispatch({
+      id: "full-rejecting-child",
+      type: "fullIntegrity",
+      binding: encodeWorkerBindingAssertion(context),
+    });
+
+    try {
+      child.emit("messageerror", new Error("malformed child response"));
+      await assert.rejects(integrity, (error) => {
+        assert.ok(error instanceof ProjectStoreWorkerBackendError);
+        assert.equal(error.code, "WORKER_UNAVAILABLE");
+        assert.deepEqual(error.details, { terminationFailed: true });
+        return true;
+      });
+      assert.equal(child.terminateCalls, 1);
+
+      for (const expectedCalls of [2, 3]) {
+        await assert.rejects(backend.close(), (error) => {
+          assert.ok(error instanceof ProjectStoreWorkerBackendError);
+          assert.equal(error.code, "WORKER_UNAVAILABLE");
+          assert.deepEqual(error.details, { terminationFailed: true });
+          return true;
+        });
+        assert.equal(child.terminateCalls, expectedCalls);
+      }
+    } finally {
+      child.emit("exit", 1);
+      await backend.close();
+    }
+
+    const moved = `${context.binding.storeRoute.eventsPath}.rejecting-child-released`;
+    renameSync(context.binding.storeRoute.eventsPath, moved);
+    renameSync(moved, context.binding.storeRoute.eventsPath);
+  });
+
+  it("emits only failure when quiesce cannot prove integrity-child termination", async () => {
+    const context = await realContext();
+    const child = new RejectingTerminationWorker();
+    const backend = new ProjectStoreWorkerBackend({
+      selfUrl: WORKER_URL,
+      executorLeaseMs: 15_000,
+      appendRetryDeadlineMs: 10_000,
+      integrityWorkerFactory: () => child,
+    });
+    await backend.dispatch({
+      id: "open-quiesce-rejecting-child",
+      type: "open",
+      binding: encodeWorkerBinding(context),
+    });
+    const integrity = backend.dispatch({
+      id: "full-quiesce-rejecting-child",
+      type: "fullIntegrity",
+      binding: encodeWorkerBindingAssertion(context),
+    });
+    child.emit("messageerror", new Error("malformed child response"));
+    await assert.rejects(integrity, (error) => (
+      error instanceof ProjectStoreWorkerBackendError
+      && error.code === "WORKER_UNAVAILABLE"
+      && error.details.terminationFailed === true
+    ));
+
+    const observer = new NodeSqliteDriver({ DatabaseSync }).open(
+      context.binding.storeRoute.eventsPath,
+      { mode: "existing", busyTimeoutMs: DEFAULT_BUSY_TIMEOUT_MS },
+    );
+    const fence = new MaintenanceFence();
+    const acquiredAt = new Date().toISOString();
+    observer.exec("BEGIN IMMEDIATE");
+    const lease = fence.acquire(
+      observer,
+      "rejecting-child-maintenance",
+      new Date(Date.now() + 60_000).toISOString(),
+      acquiredAt,
+    );
+    observer.exec("COMMIT");
+
+    const posted: unknown[] = [];
+    const portClosed = deferred<void>();
+    const runtime = new ProjectStoreWorkerRuntime({
+      backend,
+      port: {
+        postMessage(value) { posted.push(value); },
+        close() { portClosed.resolve(); },
+      },
+      scheduler: {
+        setInterval() { return {}; },
+        clearInterval() {},
+      },
+      heartbeatIntervalMs: 5_000,
+    });
+
+    try {
+      runtime.receive({
+        id: "quiesce-rejecting-child",
+        type: "quiesce",
+        binding: encodeWorkerBindingAssertion(context),
+        lease: encodeMaintenanceLeaseWire(lease),
+      });
+      await portClosed.promise;
+
+      assert.deepEqual(posted, [{
+        id: "quiesce-rejecting-child",
+        ok: false,
+        error: {
+          code: "WORKER_UNAVAILABLE",
+          message: "WORKER_UNAVAILABLE",
+          details: { terminationFailed: true },
+        },
+      }]);
+      assert.equal(
+        posted.some((value) => (
+          typeof value === "object"
+          && value !== null
+          && "connectionClosed" in value
+          && value.connectionClosed === true
+        )),
+        false,
+      );
+      assert.equal(child.terminateCalls, 2);
+    } finally {
+      child.emit("exit", 1);
+      await backend.close();
+      observer.close();
+    }
+
+    const moved = `${context.binding.storeRoute.eventsPath}.quiesce-child-released`;
     renameSync(context.binding.storeRoute.eventsPath, moved);
     renameSync(moved, context.binding.storeRoute.eventsPath);
   });
@@ -2611,6 +2893,35 @@ describe("WorkerProjectStoreIdentityProbe forced settlement", () => {
     assert.equal(settled, false);
     worker.termination.resolve(1);
     await assert.rejects(result);
+    assert.equal(worker.terminateCalls, 1);
+  });
+
+  it("returns a typed cleanup failure when forced termination rejects without exit", async () => {
+    const context = contextFixture();
+    const worker = new RejectingTerminationWorker();
+    const probe = new WorkerProjectStoreIdentityProbe({
+      workerUrl: WORKER_URL,
+      requestTimeoutMs: 1_000,
+    }, {
+      workerFactory: () => worker,
+      scheduler: new ManualScheduler(),
+      randomId: () => "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+    });
+    const result = probe.verify(context.binding.storeRoute, {
+      projectId: context.binding.projectId,
+      vaultId: context.binding.vaultId,
+      storeId: context.binding.storeId,
+    });
+
+    worker.emit("messageerror", new Error("invalid response"));
+
+    await assert.rejects(result, (error) => {
+      assert.ok(error instanceof ProjectBindingError);
+      assert.equal(error.code, "STORE_UNAVAILABLE");
+      assert.deepEqual(error.details, { terminationFailed: true });
+      assert.equal(error.message.includes("worker termination secret"), false);
+      return true;
+    });
     assert.equal(worker.terminateCalls, 1);
   });
 });

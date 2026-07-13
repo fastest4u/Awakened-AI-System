@@ -577,6 +577,14 @@ function materializeEvents<T extends JsonValue>(
   });
 }
 
+function isPrimarySqliteBusy(error: unknown): boolean {
+  return typeof error === "object"
+    && error !== null
+    && "errcode" in error
+    && typeof error.errcode === "number"
+    && (error.errcode & 0xff) === 5;
+}
+
 function normalizeEventStoreError(error: unknown): EventStoreError {
   if (error instanceof EventStoreError) return error;
   if (error instanceof MaintenanceFenceError) {
@@ -585,13 +593,7 @@ function normalizeEventStoreError(error: unknown): EventStoreError {
     }
     return new EventStoreError("STORE_UNAVAILABLE", { retryable: false });
   }
-  if (
-    typeof error === "object"
-    && error !== null
-    && "errcode" in error
-    && typeof error.errcode === "number"
-    && (error.errcode & 0xff) === 5
-  ) {
+  if (isPrimarySqliteBusy(error)) {
     return new EventStoreError("SQLITE_BUSY", { retryable: true });
   }
   return new EventStoreError("STORE_UNAVAILABLE", { retryable: false });
@@ -916,6 +918,7 @@ export class EventStore {
       idempotencyKey: command.idempotencyKey,
     };
     let transactionBegan = false;
+    let commitAttempted = false;
     try {
       this.faultInjector.hit("before-begin", faultContext);
       this.connection.exec("BEGIN IMMEDIATE");
@@ -1028,6 +1031,7 @@ export class EventStore {
         computedResponseHash,
         validated.recordedAt,
       );
+      commitAttempted = true;
       this.connection.exec("COMMIT");
       transactionBegan = false;
       this.faultInjector.hit("after-commit-before-response", faultContext);
@@ -1037,8 +1041,20 @@ export class EventStore {
         false,
       );
     } catch (error) {
+      let rollbackFailed = false;
       if (transactionBegan) {
-        try { this.connection.exec("ROLLBACK"); } catch { /* preserve original */ }
+        try {
+          this.connection.exec("ROLLBACK");
+          transactionBegan = false;
+        } catch {
+          rollbackFailed = true;
+        }
+      }
+      if (rollbackFailed || (commitAttempted && !isPrimarySqliteBusy(error))) {
+        throw new EventStoreError("COMMAND_OUTCOME_UNKNOWN", {
+          commandId: command.commandId,
+          idempotencyKey: command.idempotencyKey,
+        });
       }
       throw normalizeEventStoreError(error);
     }
