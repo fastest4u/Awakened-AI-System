@@ -2,7 +2,7 @@
 
 Date: 2026-07-14
 
-Status: Draft for written-spec user review
+Status: Approved for implementation planning
 
 Parent design: docs/superpowers/specs/2026-07-11-full-event-sourced-memory-orchestrator-design.md
 
@@ -487,10 +487,13 @@ No caller-selected semantic field is omitted.
 AuthorityMaterialAdapter uses the shared pure canonicalizer to compute a
 candidate intentHash from decoded semantic input and its transport-private
 trusted binding, then creates the proof. The worker re-decodes the request,
-re-establishes ProjectContext and every server-derived binding assertion,
-recomputes the authoritative intentHash with the same canonicalizer, and rejects
-any mismatch before proof verification or dedup replay. Candidate construction
-is not authorization; only the worker's recomputation and transaction decide.
+re-establishes ProjectContext and the stable server-derived binding assertions,
+recomputes the authoritative intentHash from the original semantic assertions
+with the same canonicalizer, and rejects any mismatch before proof verification
+or dedup replay. Exact replay does not compare current binding generation,
+branch/HEAD/dirty state, or a whole-context fingerprint; those volatile checks
+run only for a fresh command after dedup misses. Candidate construction is not
+authorization; only the worker's recomputation and transaction decide.
 
 A bounded-operation proof instead binds canonical operationType, operationId,
 requestId, operationHash, authoritySessionId, targetSessionId,
@@ -531,6 +534,43 @@ persists the exact authorization input, whether proof or approval, with commandI
 and idempotencyKey in its trusted, crash-durable private credential store until
 it receives a terminal response. Thus an exact retry is allowed, but the input
 cannot authorize a different intent, command, session, binding, or generation.
+
+Internal event-appending workflow commands use the same dedup-first rule but
+separate a stable replay expectation from fresh authorization. The trusted
+runtime supplies workflow ID, workflow generation, planned-work ID, command
+identity, and server-derived audiences before store execution. If dedup exists,
+those stable fields must match and the stored record must contain a complete
+original claim fence; the original claim need not still be live. Only a dedup
+miss checks the current live coordinator owner/token and persists that claim in
+the internal-workflow authorization record. Therefore a committed response-loss
+retry succeeds after claim expiry or takeover, while a new stale-claim mutation
+still fails. External decoders accept neither the replay expectation nor the
+internal authorization record.
+
+The volatile current claim assertion is not part of internal semantic intent or
+the stable replay expectation. It is trusted runtime input used only by the fresh
+callback. The command_dedup authorization record retains the claim that actually
+authorized the committed mutation for audit and integrity verification.
+
+planned-work ID is a nonsecret lowercase SHA-256 digest of canonical stable work
+identity. Separate Version 1 domains bind validation
+(workflow/generation/result/command/idempotency) and workflow phase
+(workflow/generation/source phase/action/command/idempotency). Claim owner and
+token are never inputs to that digest.
+
+For workflow phases, the runtime first canonicalizes project, workflow,
+generation, source phase, and action. It derives commandId by UUIDv5 under one
+fixed lifecycle namespace and idempotencyKey from the canonical-action SHA-256,
+then hashes the action plus those identities into planned-work ID. This ordering
+is deterministic and has no circular derivation.
+
+The pending record's binding witness is deliberately stable: projectId,
+vaultId, storeId, workspaceId, clientNamespace, and the server-derived
+presenting/target audiences. It never stores or compares projectBindingId,
+binding generation, branch/HEAD/dirty state, or a whole-context fingerprint.
+Those volatile values may change after the original command commits; exact
+dedup retry still compares the original semantic assertions and stable witness,
+while a fresh command performs current branch/source checks.
 
 Capability claims assert an already-resolved ProjectBinding; they never select
 a project. They do not bind to projectBindingId, binding generation, Git HEAD,
@@ -710,6 +750,14 @@ Recovery:
 - appends SessionOwnershipRecovered and consumes the approval in the same
   transaction.
 
+The recovery transaction uses the same trigger-safe ownership order as resume:
+after privately materializing the planned event positions under BEGIN IMMEDIATE,
+it releases generation G's lease, compare-and-swaps authority to G+1, inserts
+the G+1 lease, then appends SessionOwnershipRecovered at the reserved position
+and consumes the approval. Deferred event-position foreign keys are checked at
+commit. Any failure rolls back the lease, authority, event, and approval
+together.
+
 Replacement authority binds only the target primary. A primary executor may be
 its own target. A maintenance executor routes the AuthorityMaterialDescriptor
 through the host broker directly to the attached target AuthorityMaterialAdapter;
@@ -813,6 +861,25 @@ A checkpoint contains:
 
 The worker derives identity, branch, child state, event position, and stream
 version. Caller-supplied values for those fields are assertions only.
+
+SourceStateFingerprint Version 1 includes sourceStateScopeVersion fixed to 1.
+The scope is resolved only from trusted ProjectBinding/store configuration and
+committed lifecycle rows; no caller supplies an exclusion. When those paths are
+inside projectRoot, the provider excludes the exact descriptor path, canonical
+storeRoot subtree (including SQLite sidecars and manifests), and canonical
+host-private pending-authorization root. It also excludes only exact
+compatibility-log targets derived from committed SessionStarted identities and
+exact same-directory temporary paths whose parsed session/revision/claim tuple
+matches a committed outbox row. It does not exclude the whole vault, the whole
+05_Agent_Session_Logs directory, arbitrary globs, or caller paths.
+
+The provider filters fixed Git status/inventory records through that scope
+before hashing canonical branch/HEAD/dirty data. Therefore store, pending,
+ending, failed, completed, cancelled, or abandoned materialization writes do not
+invalidate their own checkpoint/validation witnesses, while any ordinary
+tracked or untracked project edit remains visible. The scope version is part of
+every checkpoint and validation source-state witness; changing the rule requires
+a new version rather than reinterpreting an old fingerprint.
 
 ### 12.2 Validation and bounds
 
@@ -998,7 +1065,6 @@ memory_sessionEnd requires:
 - explicit child end policy;
 - final checkpoint fields;
 - allowlisted validationProfileIds;
-- durable validation-result references;
 - requested qualityThreshold as an integer from 0 through 10,000 basis points;
 - optional requireFullEvidence true; and
 - optional requireMaterialization true, which may tighten but never weaken
@@ -1007,15 +1073,22 @@ memory_sessionEnd requires:
 Before any mutation, the first transaction folds every nonterminal child. Under
 require-completed, any active, completion-proposed, or suspended child returns
 SESSION_CHILDREN_ACTIVE with zero effect. Only an eligible request verifies
-authority, creates one deterministic workflow instance, appends
-SessionEndRequested, moves the root to ending, and records the previous active
-or suspended state for cancellation.
+authority, creates the deterministic workflow instance when absent or reopens
+its cancelled row as specified below, appends SessionEndRequested, moves the
+root to ending, and records the previous active or suspended state for
+cancellation.
 
 The workflowId is session-end/{sessionId}. Amendment increments its generation;
 retrying the original command identity may wake only its existing generation and
 never creates another workflow. A different end command while state is ending
 returns SESSION_END_INCOMPLETE and directs the caller to amendment; it cannot
-append another SessionEndRequested.
+append another SessionEndRequested. A cancelled workflow row remains as durable
+history. A later end request from the restored active or suspended root
+atomically reopens that same row at generation G+1, replaces request/policy
+state, clears prior claims/retry/validation plans, appends a new
+SessionEndRequested, and starts again at requested. It never attempts a second
+workflow insert, and exact retries of earlier request/cancel commands still
+return their historical committed effects.
 
 SessionEndRequested persists requested and effective child policy,
 qualityThreshold, qualityPolicyVersion, requireFullEvidence, and
@@ -1056,6 +1129,17 @@ fences every prior-generation coordinator and outbox claim, and restarts the
 earliest affected downstream phase; no failed generation can reach
 SessionEnded.
 
+The final-checkpoint semantic transaction appends `SessionCheckpointRecorded`
+and uses that committed event as the trigger for the ending compatibility-log
+outbox row. Its event position is the ending materialization revision. The next
+`ending-materialization-queued` phase is an eventless compare-and-swap that first
+verifies that exact immutable row; there is no synthetic queue lifecycle event.
+
+Cancellation and abandonment leave the forward phase chain in durable terminal
+workflow phases cancelled and abandoned respectively. Recovery ignores both.
+Only cancelled may later reopen to requested, and only with a new generation
+and a fresh authorized SessionEndRequested as defined in Section 15.1.
+
 Every phase transition is compare-and-swap protected and idempotent. A process
 may crash before or after any event, workflow update, outbox claim, file replace,
 or acknowledgement. Restart resumes the same workflow from durable state.
@@ -1067,9 +1151,11 @@ configuration. It never accepts a shell command, executable path, environment,
 working directory, or script body from a lifecycle tool argument.
 
 A durable validation result is immutable, server-recorded, and produced only by
-ValidationProfileRunner. Caller references are accepted only when resultId binds
-the same project, workflow generation, profile configuration, and final-
-checkpoint fingerprint. A result contains:
+ValidationProfileRunner. Lifecycle request and amendment DTOs accept no result
+IDs or observations. The coordinator selects only result IDs from its own
+persisted attempt plan and accepts a result only when it binds the same project,
+workflow generation, profile configuration, and final-checkpoint fingerprint.
+A result contains:
 
 - profileId, profile version, and trusted configuration hash;
 - runId, workflow generation, and runner identity;
@@ -1082,6 +1168,18 @@ checkpoint fingerprint. A result contains:
   plus artifact references; a plain SHA-256 content hash is permitted only for
   an independently governed retained artifact; and
 - freshness policy result.
+
+Before external execution, the coordinator durably plans exactly one runId,
+resultId, result commandId, and result idempotencyKey for each workflow
+generation/profile. Crash retry reuses that plan; amendment creates a new
+generation and new plans. Validation-result persistence is an internal semantic
+command whose stable replay expectation is the persisted attempt-plan identity.
+On a dedup miss only, the fresh transaction requires the current live workflow
+generation and coordinator claim and stores that nonsecret fence in
+command_dedup. Exact committed replay compares the stable plan identity before
+current-claim inspection. The command cannot be selected by an external
+lifecycle request. Therefore one generation never has an ambiguous choice among
+multiple validation attempts.
 
 The vault gate is a named built-in profile. Immediately before
 SessionEndVerificationPassed and again in the SessionEnded transaction, the
@@ -1108,14 +1206,28 @@ the earliest phase affected by those changes and requires downstream validation
 and source-state checks to run again.
 
 memory_cancelSessionEnd appends SessionEndCancelled and restores the recorded
-active or suspended state if the session is not terminal.
+active or suspended state if the session is not terminal. It advances the
+workflow to a durable cancelled phase and fences all claims. A later authorized
+end request may reopen only that cancelled row as the next generation under the
+rules in Section 15.1.
 
-Amendment, cancellation, validation failure, and abandonment each queue a new
-fenced materialization generation. Cancellation replaces the ending artifact
-with an explicit cancelled-and-restored active or suspended state. Abandonment
-replaces it with abandoned state. The renderer emits an ending marker only while
-the folded semantic state is ending, so no cancellation or abandonment leaves a
-stale document that appears pending or completed.
+Every ending, amendment, validation-failure, verification-invalidation,
+completion, cancellation, and abandonment rewrite queues an immutable outbox
+row with a new materializationRevision equal to that row's triggering committed
+event position. Workflow generation remains the semantic-saga fence; the
+monotonic materialization revision is the artifact-rewrite fence. Cancellation
+replaces the ending artifact with an explicit cancelled-and-restored active or
+suspended state. Abandonment replaces it with abandoned state. The renderer
+emits an ending marker only while the folded semantic state is ending, so no
+cancellation or abandonment leaves a stale document that appears pending or
+completed.
+
+A workflow-origin row stores workflowId and workflowGeneration. Direct
+abandonment from active or suspended has no session-end workflow and instead
+uses a terminal-event origin with both workflow fields null; its committed
+SessionAbandoned position is still the materialization revision. In both cases,
+the latest committed revision for project, session, and artifact kind fences all
+earlier claims.
 
 Explicit abandonment requires trusted approval, appends SessionAbandoned,
 revokes capabilities, and never represents successful completion.
@@ -1148,9 +1260,15 @@ Markdown with:
 - sessionId, projectId, workspaceId, and branch assertions; and
 - a visible ending marker only while folded semantic state is ending.
 
-Outbox target identity includes sessionId, artifact kind, and workflow
-generation. Every generation still targets the same deterministic path. A stale
-generation is fenced from overwriting a newer generation.
+Outbox target identity includes sessionId, artifact kind, and
+materializationRevision. Every revision still targets the same deterministic
+path. The existing target_key primary-key component is encoded as
+lifecycle-log/{sessionId}/{materializationRevision}, so immutable lower-revision
+history can coexist. Workflow-origin rows additionally bind workflowId and workflowGeneration;
+terminal-event-origin rows are allowed only for a committed direct
+SessionAbandoned transition. A stale revision is fenced from overwriting a newer
+revision. Each immutable row retains its planned nextFingerprint, forming the
+history needed to recognize bytes replaced before a lost acknowledgement.
 
 The worker renders strictly through the event position recorded by the outbox
 row. It:
@@ -1159,20 +1277,38 @@ row. It:
 2. renders deterministic bytes through that triggering event position;
 3. writes a same-directory temporary file;
 4. computes the keyed materialization fingerprint and prepares the replacement;
-5. opens a short BEGIN IMMEDIATE transaction and rechecks the claim token,
-   current workflow generation, and fingerprint algorithm/schema/key ID;
-6. replaces the target only when absent, already equal to the new bytes, or
+5. opens a short BEGIN IMMEDIATE transaction and loads the exact retained
+   project/target/revision/owner/token row;
+6. if it is completed and still the latest revision, checks its retained
+   acknowledgement/fingerprint tuple and requires current target bytes to equal
+   committed nextFingerprint, then returns the stored completion without a live-
+   lease requirement; if a newer revision exists, returns bounded
+   superseded-after-completion without writing;
+7. otherwise requires noncompleted claimed status and rechecks the live claim
+   expiry, latest materialization revision, applicable current workflow
+   generation, and fingerprint algorithm/schema/key ID;
+8. replaces the target only when absent, already equal to the new bytes, or
    exactly equal to either the expected acknowledged prior fingerprint or the
-   committed nextFingerprint of any now-fenced lower-generation outbox row for
+   committed nextFingerprint of any now-fenced lower-revision outbox row for
    the same project, session, artifact kind, and path;
-7. syncs the file and containing directory when supported;
-8. acknowledges the new fingerprint and fencing token; and
-9. commits the SQLite transaction before reporting success.
+9. syncs the file and containing directory when supported;
+10. acknowledges the new fingerprint and fencing token; and
+11. commits the SQLite transaction before reporting success.
+
+Steps 5 through 11 are one LifecycleOperationalStore materialize operation.
+Repository acknowledgement is private to that operation; no executor or worker
+protocol variant can acknowledge without rechecking the current target bytes,
+fingerprint history, revision, generation, owner, and token.
 
 If the file write succeeds but acknowledgement is lost, retry computes the same
-bytes, accepts the matching target fingerprint, and records one completion. If a
-newer amendment or cancellation already fenced that row, its generation may
-still recognize the stale bytes from the committed lower-generation
+bytes and accepts the matching target fingerprint. If acknowledgement committed
+but its response was lost, exact materialize replay checks completed state before
+lease expiry and returns the one stored completion after verifying the retained
+tuple and current latest target bytes. An expired unacknowledged row cannot use
+that path; it requires takeover with a new fencing identity. If a newer
+amendment, verification result, completion, cancellation, or abandonment already
+fenced that row, the old completed retry returns superseded-after-completion and
+the newer revision may recognize stale bytes from committed lower-revision
 nextFingerprint and replace them safely. Any bytes not proven by one of those
 committed fingerprints fail permanently with MATERIALIZATION_CONFLICT.
 
@@ -1212,8 +1348,9 @@ read-only recovery and returns INTEGRITY_FAILURE with safe remediation.
 Subproject 2 replaces every hard-coded single-migration assumption with one
 ordered immutable registry containing:
 
-- 0001-event-core; and
-- 0002-session-lifecycle.
+- migration identifier 0001-event-core, whose already-published immutable
+  schema_migrations name remains event-core; and
+- migration identifier 0002-session-lifecycle, recorded as session-lifecycle.
 
 Registry versions are contiguous and equal array index plus one. Names are
 unique, nonblank, and immutable. Recorded migrations must be an exact
@@ -1303,26 +1440,71 @@ session_evidence_coverage:
   intervals exceed 200; and
 - no raw content or evidence reference columns.
 
+session_evidence_fingerprints is an immutable child table keyed by project,
+session, adapter session, and ordinal, with a unique frame ID. It stores source
+kind, observedAt, batch ID, fixed fingerprint algorithm/schema/key/domain/value,
+and recorded event position. This table is required to accept identical overlap
+and reject contradictory overlap; aggregate intervals alone are not evidence of
+ordinal consistency.
+
+child_transfer_tickets stores immutable source assignment/scope/checkpoint/
+follow-up/source-state/lineage plus creating event position and one nullable
+all-or-nothing claim group. Claim is a single compare-and-swap; source lineage is
+never rewritten.
+
+lifecycle_validation_results is immutable and stores project/session/result/
+workflow/generation/profile/version/configuration, persisted run and runner
+identity, final checkpoint identity/fingerprint, versioned validation-start and
+validation-completion source-state witnesses, project/workspace/branch/HEAD/
+dirty assertions, times, status/exit classification/redacted summary, output
+fingerprint algorithm/schema/key/domain/value, artifact references, freshness,
+and recorded event position.
+
+Migration 0002 extends workflow_instances with session and triggering-event
+binding, expected authority commitment, coordinator owner/claim token/lease,
+attempt/failure/safe-error/next-attempt fields, and a paired
+validationAttemptPlanGeneration plus canonical deterministic
+validationAttemptPlans JSON array. The array is written once for one workflow
+generation before external execution, contains one unique plan for every
+effective profile and at most 64 entries, and is immutable while that generation
+is unchanged. Amendment or cancelled-workflow reopening increments generation
+and atomically clears the pair before a new complete array may be written.
+Insert and update guards keep claim, generation, plan, retry, and failure groups
+coherent. A recovery index orders by triggering event position then workflow ID.
+
 Migration 0002 also adds the exact indexes required to recover session-end
 workflow instances and claim lifecycle outbox work in event-position order.
-Lifecycle outbox rows persist triggering event position, workflow generation,
-expected prior and next keyed materialization fingerprints with algorithm,
-schema version, key ID, and domain, claim fencing token, retryable or permanent
-failure classification, safe error code, bounded attempt count, and
-nextAttemptAt.
+Lifecycle outbox rows persist origin kind, triggering event position,
+materialization revision equal to that event position, nullable workflow ID and
+generation as an all-null/all-present group, expected prior and next keyed
+materialization fingerprints with algorithm, schema version, key ID, and domain,
+claim owner/lease/fencing token, retryable or permanent failure classification,
+safe error code, bounded attempt count, and nextAttemptAt. Immutable rows form
+the planned-fingerprint history; an ordered index finds the latest revision for
+one project, session, and artifact kind, and that target plus revision is unique.
+An UPDATE trigger makes origin, target identity/path, triggering position,
+revision, and planned fingerprint fields immutable; only the guarded
+claim/status/attempt/failure/backoff acknowledgement groups may change. A
+completed row retains the exact acknowledgement owner, token, revision, and
+fingerprint required for completed-state replay; completion never erases that
+tuple.
 
-Migration 0002 extends command_dedup with nullable
+Migration 0002 extends command_dedup with nullable lifecycle_authorization_kind;
 authorization_proof_version, authorization_proof_nonce, and
 authorization_proof_digest; authorization_approval_id and
 authorization_approval_digest; authorization_session_id and target_session_id;
-and server-derived presenting_actor_role, presenting_client_instance_id,
-target_actor_role, and target_client_instance_id. The three proof fields are null
-or all present, and the
-two approval fields are null or both present. command_hash stores intentHash.
-Existing Version 1 rows keep new columns null. Every Version 2 semantic command
-stores its binding assertions; commands that mint initial authority without a
-capability keep only proof fields null. No proof MAC, raw approval, or bearer
-secret is stored.
+server-derived presenting_actor_role, presenting_client_instance_id,
+target_actor_role, and target_client_instance_id; and internal workflow ID,
+generation, stable planned-work ID, claim owner, and claim token. The three proof
+fields are null or all present, and the two approval fields are null or both
+present. command_hash stores intentHash. Existing Version 1 rows keep every new
+column null. Every Version 2 semantic command stores authorization kind and its
+binding assertions. Initial authority has null proof/approval but retains both
+server-derived audiences and the generated target session. Protected authority
+requires proof or approval; abandonment may contain both. Internal workflow
+commands have no bearer or approval and instead require the complete workflow-
+generation/planned-work/live-claim authorization record. No proof MAC, raw
+approval, or bearer secret is stored.
 
 lifecycle_approval_consumptions stores one immutable row per approvalId and
 nonce digest, with projectId, sessionId, action, commandId, target primary,
@@ -1340,6 +1522,9 @@ An explicit maintenance operation:
 - requires an apply flag to mutate;
 - establishes the exact ProjectBinding and maintenance fence;
 - drains active executors and requires their maintenance-fence acknowledgement;
+- renews the same owner/epoch/token with a trusted host TTL before every mutable
+  or post-commit publication boundary and threads the returned later-expiring
+  lease into the next compare-and-swap;
 - runs upgrade-specific prefix integrity: application ID, exact recorded-prefix
   names and checksums, project_meta.schema_version equal to the prefix version,
   prefix schema fingerprint, foreign keys, and event hash chain;
@@ -1350,6 +1535,11 @@ An explicit maintenance operation:
 - records a new integrity result; and
 - closes every SQLite connection and filesystem handle opened by the upgrade;
   session capabilities are unchanged.
+
+Fence acquisition commits before waiting for executors. No long-lived
+maintenance or write transaction spans a wait, filesystem operation, integrity
+scan, or manifest write; integrity may still use its bounded BEGIN DEFERRED
+snapshot so one report observes one database state.
 
 Failure before SQLite commit leaves Version 1 unchanged. Failure after commit
 leaves Version 2 durably applied; retry detects the current schema and
@@ -1375,30 +1565,49 @@ The strict worker protocol adds exact request and response variants for:
 - authoritative session tree summary;
 - lease renewal;
 - session-end request, amendment, cancellation, and status;
-- recoverable workflow scan; and
-- lifecycle outbox claim and acknowledgement.
+- internal validation-result and event-appending workflow-phase mutations;
+- workflow claim, renewal, release, eventless phase advancement, and recoverable
+  scan; and
+- lifecycle outbox claim, renewal, materialization including acknowledgement,
+  and failure recording.
 
 Every decoder rejects unknown fields, unsafe numbers, noncanonical decimal
 positions, malformed identity, oversized payloads, and authority-bearing values
 that belong to trusted context.
 
-LifecycleCommandStore owns one BEGIN IMMEDIATE and shares internal event-append
-primitives with EventStore. Authority and lease checks, stream CAS, events,
-command dedup, workflow rows, and outbox rows commit together. It must not call
-EventStore.append from inside that transaction and must not expose arbitrary SQL
-or a caller-selected stream version.
+LifecycleCommandStore is the only semantic lifecycle transaction owner. It owns
+one BEGIN IMMEDIATE and shares internal event-append primitives with EventStore.
+Authority and lease checks, stream CAS, events, command dedup, workflow rows,
+and outbox rows commit together. It must not call EventStore.append from inside
+that transaction and must not expose arbitrary SQL or a caller-selected stream
+version.
+
+LifecycleOperationalStore is the only nonsemantic lifecycle transaction owner.
+It binds to the same ActiveStore connection and owns one short BEGIN IMMEDIATE
+for exact workflow claim/renew/release/eventless-phase work or outbox
+claim/renew/materialize/failure work. Its focused transaction facade exposes no
+event append, authority, validation, arbitrary SQL, or command_dedup. Row-state
+compare-and-swap and the exact workflow/revision/owner/token work identity provide
+idempotency. Uncertain commit reports that unchanged identity. Any workflow phase
+that appends a lifecycle event instead uses an internal semantic command through
+LifecycleCommandStore.
 
 Issued bearer secrets never cross the worker protocol. For issuance or reissue,
 the worker returns a private, strictly decoded AuthorityMaterialDescriptor
 Version 1 containing capability kind, complete persisted nonsecret canonical
 claims, stored verifier, verifier algorithm/version/key ID/domain, current
-authority commitment, and authority event position. ProjectStoreExecutor uses
-the same external CapabilityKeyProvider to reconstruct authority material,
-recomputes its verifier, constant-time compares it with the descriptor, and
-releases it only to the trusted adapter channel. Unknown or missing descriptor
-fields fail closed. For authorization, worker requests contain only the
-appropriate discriminated CapabilityProof or a signed lifecycle approval; no
-issued session handle or resume token crosses the boundary.
+authority commitment, and authority event position. ProjectStoreExecutor gives
+that descriptor to the trusted AuthorityMaterialAdapter. Only an adapter whose
+authenticated local identity equals the descriptor target may use its external
+CapabilityKeyProvider to reconstruct authority material, recompute the verifier,
+constant-time compare it, and release it locally. When presenter and target
+differ, the source adapter routes the nonsecret descriptor through the private
+host broker to the attached target adapter and performs zero reconstruction
+calls; this is mandatory for maintenance recovery and fork-to-child routing.
+Unknown or missing descriptor fields fail closed. For authorization, worker requests contain only the
+appropriate discriminated CapabilityProof, a signed lifecycle approval, or—for
+fork only—a signed transport-private ChildBindingGrant alongside the current
+root proof; no issued session handle or resume token crosses the boundary.
 
 The lifecycle intentHash contains semantic input and stable authorization
 assertions, never the CapabilityProof, proof nonce or digest, plaintext
@@ -1416,10 +1625,16 @@ Every externally initiated semantic lifecycle mutation requires commandId and
 idempotencyKey. Root mutations after start also require sessionId and a semantic-
 command proof derived from the current-generation root handle. Internal lease
 heartbeats use a bounded-operation proof plus generation compare-and-swap.
-Protected reads
-use a bounded-operation proof. Outbox claim or acknowledgement operations use
-workflow-generation fencing and their deterministic target identities. None uses
-semantic command_dedup.
+Protected reads use a bounded-operation proof. Workflow
+claim/renew/release/eventless-phase/recovery and outbox
+claim/renew/materialize/failure operations use workflow/revision/owner/token
+fencing and deterministic work identities through a separate internal
+operational executor path. None uses semantic command_dedup or appends a
+lifecycle event, and none is accepted from an external lifecycle DTO.
+Validation-result persistence and workflow phase actions that append events use
+the internal semantic path and dedup-first replay rules. Outbox acknowledgement
+has no standalone operation: it is private to materialize after current-target
+byte and fingerprint reconciliation.
 
 memory_sessionStart adds:
 
@@ -1514,6 +1729,8 @@ This phase must implement at least:
 - SQLITE_CAPABILITY_MISSING;
 - EVENT_CONFLICT;
 - IDEMPOTENCY_CONFLICT;
+- COMMAND_OUTCOME_UNKNOWN;
+- OPERATION_OUTCOME_UNKNOWN;
 - SESSION_NOT_FOUND;
 - SESSION_AMBIGUOUS;
 - SESSION_ALREADY_OWNED;
@@ -1560,9 +1777,10 @@ that aid guessing, raw evidence, environment values, or process command lines.
   throws in development and emits no value in production.
 - worker requests and responses, command_dedup, event payloads, outbox payloads,
   logs, test snapshots, and error envelopes contain no issued handle or token;
-  live requests may contain the appropriate CapabilityProof and live issuance
-  responses may contain a nonsecret AuthorityMaterialDescriptor. A recovery or
-  abandonment request may contain its signed private approval. No raw proof,
+  live requests may contain the appropriate CapabilityProof and a fork may
+  contain its transport-private ChildBindingGrant; live issuance responses may
+  contain a nonsecret AuthorityMaterialDescriptor. A recovery or abandonment
+  request may contain its signed private approval. No raw proof, grant,
   descriptor, or approval may be persisted in the project store, logs,
   snapshots, or fixtures. The only raw authorization persistence is the encrypted
   trusted-adapter pending-command record required for an exact semantic retry,
@@ -1572,7 +1790,7 @@ that aid guessing, raw evidence, environment values, or process command lines.
   materialization use.
 - Ordinary model-controlled inputs cannot select ProjectBinding, presenting or
   target actor role/clientInstanceId, Clock, KeyProvider, validation commands,
-  mode, or recovery approval.
+  mode, child-binding grant, or recovery/abandonment approval.
 
 ## 24. Testing strategy
 
@@ -1609,8 +1827,8 @@ Tests cover:
 - root-only current-generation lease triggers, clock clamping, renewal/takeover
   ordering, and bounded-operation heartbeat proofs;
 - session-end phases, failed-verification branch, source-state race detection,
-  amendment generation fencing, cancellation/abandonment rewrite, and terminal
-  protection;
+  self-write exclusion scope, amendment generation fencing, cancel/reopen/end,
+  cancellation/abandonment rewrite, and terminal protection;
 - deterministic Markdown bytes and path;
 - typed error privacy; and
 - disabled adapter byte compatibility with Version 1.
@@ -1673,23 +1891,33 @@ Tests prove:
   the persisted G proof tuple before current authority, returns the one stored
   effect, and reissues G+1 material only while G+1 remains current; after G+2 it
   returns the same public effect with stale status and no authority material;
-- lost responses for start, resume, suspension, ownership recovery, fork,
-  checkpoint, evidence batch, child report, disposition, completion, transfer
-  creation and claim, end request, validation-result persistence, amendment,
-  cancellation, abandonment rewrite, and materialization acknowledgement
-  produce one semantic effect;
-- stale workflow, capability, lease, and outbox generations produce zero new
-  effect for their attempted phase;
-- after a lower generation replaces the artifact and crashes before
-  acknowledgement, amendment or cancellation advances the generation and the
-  newer row safely replaces those committed stale deterministic bytes;
+- lost responses for semantic start, resume, suspension, ownership recovery,
+  fork, child-assignment amendment, checkpoint, evidence batch, child report,
+  disposition, completion, transfer creation and claim, end request,
+  internal event-appending workflow phases, validation-result persistence,
+  amendment, cancellation, and abandonment produce one semantic effect;
+- an internal committed command replays by stable planned-work identity after its
+  original claim expires or is taken over, without entering its fresh callback;
+- eventless workflow and outbox claim, renewal, and failure replay by
+  deterministic workflow/target/revision/owner/token work identity and never use
+  semantic command_dedup or event append;
+- a lost materialize response retries the complete byte-reconciling
+  replace-and-ack operation; after acknowledgement commit and lease expiry, exact
+  completed-state replay verifies the retained tuple/current latest bytes before
+  returning the stored result, while an expired unacknowledged row requires
+  takeover; no standalone acknowledgement path exists;
+- stale workflow, capability, or lease generations and stale outbox revisions
+  produce zero new effect for their attempted phase;
+- after a lower revision replaces the artifact and crashes before
+  acknowledgement, a newer rewrite safely replaces those committed stale
+  deterministic bytes using immutable planned-fingerprint history;
 - failed validation never reaches SessionEnded and coverage-only evidence never
   satisfies requireFullEvidence; and
 - retry uses the original command identity.
 
 ### 24.6 Fault injection
 
-Fault injection covers before and after every durable boundary:
+Fault injection covers every valid crash point at these durable boundaries:
 
 - authority insert or compare-and-swap;
 - event append;
@@ -1709,10 +1937,23 @@ Fault injection covers before and after every durable boundary:
 - SessionEnded append; and
 - response delivery.
 
-For each boundary, pre-commit death leaves zero new effect for that phase and a
-committed phase replays no duplicate effect. Earlier committed saga phases remain
-durable. Restart recovers the same workflow and never closes a different
-session.
+Atomic replacement and keyed acknowledgement are separate injectable boundaries
+inside one materialize operation; the latter is not a standalone protocol call.
+
+SQLite transaction boundaries expose before-write, after-write-before-commit,
+and after-commit-before-response points. External validation exposes before-run
+and after-run-before-result-commit. File staging exposes before-temp-write and
+after-temp-fsync-before-replace. Atomic replacement exposes
+after-replace-before-ack. Response delivery exposes only
+after-commit-before-response. Tests never manufacture an invalid Cartesian
+boundary/point pair.
+
+Pre-commit SQLite death leaves zero new effect for that phase; committed response
+loss replays no duplicate. A staged temporary file changes no authoritative
+database state. Replacement-before-ack retry recognizes the immutable planned
+fingerprint. Earlier committed saga phases remain durable. Restart recovers the
+same workflow, runs quick and full integrity plus handle/rename checks for every
+case, and never closes a different session.
 
 Tests use process barriers and injectable faults, not timing sleeps.
 
@@ -1722,9 +1963,10 @@ Automated scans assert that database text columns, event payloads, dedup
 responses, outbox payloads, Markdown artifacts, logs, errors, serialized worker
 messages, snapshots, and retained fixtures do not contain issued handles, resume
 tokens, project keys, raw fixture evidence, or secret environment values. Live
-worker requests may contain only the appropriate CapabilityProof, and live
-issuance responses only the nonsecret AuthorityMaterialDescriptor; tests discard
-both immediately. Credential-store tests prove pending semantic proofs and
+worker requests may contain only the appropriate CapabilityProof plus a
+fork-only transport-private ChildBindingGrant, and live issuance responses only
+the nonsecret AuthorityMaterialDescriptor; tests discard them immediately.
+Credential-store tests prove pending semantic proofs, grants, and
 signed approvals are encrypted at rest, survive a simulated adapter crash, and
 are deleted after a terminal response.
 
