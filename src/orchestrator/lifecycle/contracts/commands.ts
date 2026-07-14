@@ -1,0 +1,966 @@
+import type { JsonValue } from "../../contracts/event.js";
+import type {
+  ProjectContext,
+  ProjectId,
+  StoreId,
+  VaultId,
+  WorkspaceId,
+} from "../../identity/contracts.js";
+import type { TrustedActorRole } from "../../identity/project-binding.request.js";
+import { LifecycleError } from "../errors.js";
+import {
+  decodeCheckpointDraftV1,
+  type CheckpointDraftV1,
+  type CheckpointV1,
+} from "./checkpoint.js";
+import {
+  decodeChildDispositionV1,
+  decodeChildReportDraftV1,
+  type ChildDispositionV1,
+  type ChildReportDraftV1,
+} from "./child.js";
+import {
+  exactRecord,
+  parseBoolean,
+  parseBoundedString,
+  parseCanonicalTimestamp,
+  parseDecimalString,
+  parseEnum,
+  parseInteger,
+  parseLifecycleId,
+  parseNullableBoundedString,
+  parseNullableUuid,
+  strictArray,
+  strictRecord,
+  type AdapterSessionId,
+  type ApprovalId,
+  type CheckpointId,
+  type EvidenceBatchId,
+  type EvidenceFrameId,
+  type ReportId,
+  type ResumePolicy,
+  type SessionId,
+  type TransferTicketId,
+  type ValidationResultId,
+  type WorkflowId,
+} from "./identifiers.js";
+import {
+  assertValidationResultShape,
+  decodeSessionEndAmendmentV1,
+  decodeSessionEndRequestV1,
+  type SessionEndAmendmentV1,
+  type SessionEndRequestV1,
+  type ValidationResultV1,
+} from "./session-end.js";
+
+const LOWER_HASH = /^[0-9a-f]{64}$/;
+const RESUME_POLICIES = ["exact", "latest-safe"] as const;
+const EVIDENCE_SOURCE_KINDS = [
+  "model-turn",
+  "tool-request",
+  "tool-result",
+  "adapter-event",
+  "external-observation",
+] as const;
+const BASE_KEYS = [
+  "commandType",
+  "commandId",
+  "idempotencyKey",
+  "agentId",
+  "expectedProjectId",
+  "expectedVaultId",
+  "expectedWorkspaceId",
+  "expectedBranchRef",
+] as const;
+
+export interface LifecycleCommandBase {
+  commandId: string;
+  idempotencyKey: string;
+  agentId: string;
+  expectedProjectId: string;
+  expectedVaultId: string;
+  expectedWorkspaceId: string;
+  expectedBranchRef: string | null;
+}
+
+export interface LifecycleAudience {
+  presentingActorRole: "primary" | "maintenance" | "untrusted";
+  presentingClientInstanceId: string;
+  targetActorRole: "primary" | "maintenance" | "untrusted";
+  targetClientInstanceId: string;
+}
+
+export interface CapabilityProofV1 {
+  readonly proofVersion: 1;
+  readonly target: "semantic-command" | "bounded-operation";
+  readonly proofNonce: string;
+  readonly proofFingerprint: string;
+}
+
+export interface RedactedLifecycleApproval {
+  readonly approvalVersion: 1;
+  readonly approvalId: ApprovalId;
+  readonly action: "recover-root-authority" | "abandon-root";
+  readonly approvalFingerprint: string;
+}
+
+export interface RedactedChildBindingGrant {
+  readonly grantVersion: 1;
+  readonly grantId: string;
+  readonly targetClientInstanceId: string;
+  readonly grantFingerprint: string;
+}
+
+export type SemanticCommandAuthorization =
+  | {
+      kind: "initial-authority";
+      authoritySessionId: null;
+      targetSessionId: null;
+      proof: null;
+      approval: null;
+      childBindingGrant: null;
+    }
+  | {
+      kind: "protected";
+      authoritySessionId: SessionId;
+      targetSessionId: SessionId;
+      proof: CapabilityProofV1 | null;
+      approval: RedactedLifecycleApproval | null;
+      childBindingGrant: RedactedChildBindingGrant | null;
+    };
+
+export interface BoundedOperationAuthorization {
+  readonly kind: "bounded-operation";
+  readonly authoritySessionId: SessionId;
+  readonly targetSessionId: SessionId;
+  readonly proof: CapabilityProofV1;
+  readonly audience: LifecycleAudience;
+}
+
+export interface PreparedLifecycleWorkerCommand<C extends LifecycleSemanticCommandDraft> {
+  command: C;
+  candidateIntentHash: string;
+  authorization: SemanticCommandAuthorization;
+}
+
+export interface RootStartCommandV2 extends LifecycleCommandBase {
+  readonly commandType: "root-start";
+  readonly continuityKey: string;
+  readonly resumePolicy: "new";
+}
+
+export interface RootResumeCommandV2 extends LifecycleCommandBase {
+  readonly commandType: "root-resume";
+  readonly sessionId: SessionId | null;
+  readonly continuityKey: string;
+  readonly resumePolicy: Exclude<ResumePolicy, "new">;
+  readonly expectedOwnerGeneration: string;
+}
+
+export interface RootRecoveryCommandV2 extends LifecycleCommandBase {
+  readonly commandType: "root-recovery";
+  readonly sessionId: SessionId;
+  readonly expectedOwnerGeneration: string;
+  readonly preTransitionCheckpointId: CheckpointId;
+  readonly reasonCode: string;
+}
+
+export interface RootSuspendCommandV2 extends LifecycleCommandBase {
+  readonly commandType: "root-suspend";
+  readonly sessionId: SessionId;
+  readonly expectedStreamVersion: string;
+  readonly checkpoint: CheckpointDraftV1;
+}
+
+export interface ChildAssignmentV1 {
+  readonly assignmentId: string;
+  readonly summary: string;
+  readonly scope: string;
+}
+
+export interface ForkChildCommandV2 extends LifecycleCommandBase {
+  readonly commandType: "fork-child";
+  readonly parentSessionId: SessionId;
+  readonly expectedStreamVersion: string;
+  readonly assignment: ChildAssignmentV1;
+  readonly directAccessRequested: boolean;
+}
+
+export interface AmendChildAssignmentCommandV2 extends LifecycleCommandBase {
+  readonly commandType: "amend-child-assignment";
+  readonly parentSessionId: SessionId;
+  readonly childSessionId: SessionId;
+  readonly expectedStreamVersion: string;
+  readonly assignment: ChildAssignmentV1;
+}
+
+export interface RecordCheckpointCommandV2 extends LifecycleCommandBase {
+  readonly commandType: "record-checkpoint";
+  readonly sessionId: SessionId;
+  readonly expectedStreamVersion: string;
+  readonly expectedBaseEventPosition: string | null;
+  readonly draft: CheckpointDraftV1;
+}
+
+export interface EvidenceCoverageFrameV1 {
+  readonly frameId: EvidenceFrameId;
+  readonly ordinal: string;
+  readonly sourceKind: (typeof EVIDENCE_SOURCE_KINDS)[number];
+  readonly observedAt: string;
+  readonly contentFingerprint: string;
+}
+
+export interface RecordEvidenceBatchCommandV2 extends LifecycleCommandBase {
+  readonly commandType: "record-evidence-batch";
+  readonly adapterSessionId: AdapterSessionId;
+  readonly batchId: EvidenceBatchId;
+  readonly sessionId: SessionId;
+  readonly firstOrdinal: string;
+  readonly lastOrdinal: string;
+  readonly fingerprintSchemaVersion: 1;
+  readonly fingerprintKeyId: string;
+  readonly fingerprintDomain: "pm-evidence-frame-v1";
+  readonly redactionStatus: "content-not-retained";
+  readonly frames: readonly EvidenceCoverageFrameV1[];
+}
+
+export interface RecordChildReportCommandV2 extends LifecycleCommandBase {
+  readonly commandType: "record-child-report";
+  readonly childSessionId: SessionId;
+  readonly expectedStreamVersion: string;
+  readonly report: ChildReportDraftV1;
+}
+
+export interface DispositionChildReportCommandV2 extends LifecycleCommandBase {
+  readonly commandType: "disposition-child-report";
+  readonly parentSessionId: SessionId;
+  readonly childSessionId: SessionId;
+  readonly expectedStreamVersion: string;
+  readonly disposition: ChildDispositionV1;
+}
+
+export interface ProposeChildCompletionCommandV2 extends LifecycleCommandBase {
+  readonly commandType: "propose-child-completion";
+  readonly childSessionId: SessionId;
+  readonly expectedStreamVersion: string;
+  readonly reportId: ReportId;
+}
+
+export interface CompleteChildSessionCommandV2 extends LifecycleCommandBase {
+  readonly commandType: "complete-child-session";
+  readonly parentSessionId: SessionId;
+  readonly childSessionId: SessionId;
+  readonly expectedStreamVersion: string;
+  readonly reportId: ReportId;
+}
+
+export interface SuspendChildSessionCommandV2 extends LifecycleCommandBase {
+  readonly commandType: "suspend-child-session";
+  readonly parentSessionId: SessionId;
+  readonly childSessionId: SessionId;
+  readonly expectedStreamVersion: string;
+  readonly checkpointId: CheckpointId;
+  readonly blockers: readonly string[];
+  readonly followUps: readonly string[];
+}
+
+export interface CreateChildTransferCommandV2 extends LifecycleCommandBase {
+  readonly commandType: "create-child-transfer";
+  readonly parentSessionId: SessionId;
+  readonly childSessionId: SessionId;
+  readonly expectedStreamVersion: string;
+  readonly checkpointId: CheckpointId;
+}
+
+export interface ClaimChildTransferCommandV2 extends LifecycleCommandBase {
+  readonly commandType: "claim-child-transfer";
+  readonly rootSessionId: SessionId;
+  readonly transferTicketId: TransferTicketId;
+  readonly expectedStreamVersion: string;
+}
+
+export interface RequestSessionEndCommandV2 extends LifecycleCommandBase {
+  readonly commandType: "request-session-end";
+  readonly request: SessionEndRequestV1;
+}
+
+export interface AmendSessionEndCommandV2 extends LifecycleCommandBase {
+  readonly commandType: "amend-session-end";
+  readonly sessionId: SessionId;
+  readonly workflowId: WorkflowId;
+  readonly expectedStreamVersion: string;
+  readonly amendment: SessionEndAmendmentV1;
+}
+
+export interface CancelSessionEndCommandV2 extends LifecycleCommandBase {
+  readonly commandType: "cancel-session-end";
+  readonly sessionId: SessionId;
+  readonly workflowId: WorkflowId;
+  readonly expectedStreamVersion: string;
+  readonly preTransitionCheckpointId: CheckpointId;
+}
+
+export interface AbandonSessionCommandV2 extends LifecycleCommandBase {
+  readonly commandType: "abandon-session";
+  readonly sessionId: SessionId;
+  readonly expectedStreamVersion: string;
+  readonly preTransitionCheckpointId: CheckpointId;
+  readonly reasonCode: string;
+}
+
+export type LifecycleSemanticCommandDraft =
+  | RootStartCommandV2
+  | RootResumeCommandV2
+  | RootRecoveryCommandV2
+  | RootSuspendCommandV2
+  | ForkChildCommandV2
+  | AmendChildAssignmentCommandV2
+  | RecordCheckpointCommandV2
+  | RecordEvidenceBatchCommandV2
+  | RecordChildReportCommandV2
+  | DispositionChildReportCommandV2
+  | ProposeChildCompletionCommandV2
+  | CompleteChildSessionCommandV2
+  | SuspendChildSessionCommandV2
+  | CreateChildTransferCommandV2
+  | ClaimChildTransferCommandV2
+  | RequestSessionEndCommandV2
+  | AmendSessionEndCommandV2
+  | CancelSessionEndCommandV2
+  | AbandonSessionCommandV2;
+
+export interface WorkflowClaimAssertionV1 {
+  readonly workflowId: WorkflowId;
+  readonly workflowGeneration: number;
+  readonly claimOwnerId: string;
+  readonly claimToken: string;
+  readonly claimExpiresAt: string;
+}
+
+export type SemanticSessionEndAction =
+  | {
+      readonly action: "record-final-checkpoint-and-queue-ending";
+      readonly finalCheckpoint: CheckpointV1;
+      readonly materializationTarget: string;
+    }
+  | {
+      readonly action: "record-verification-failed";
+      readonly validationResultIds: readonly ValidationResultId[];
+      readonly safeFailureCode: string;
+    }
+  | {
+      readonly action: "record-verification-passed";
+      readonly validationResultIds: readonly ValidationResultId[];
+      readonly qualityScore: number;
+    }
+  | {
+      readonly action: "invalidate-verification";
+      readonly safeFailureCode: "SESSION_SOURCE_STATE_CONFLICT";
+    }
+  | {
+      readonly action: "append-terminal-completion";
+      readonly verificationEventPosition: string;
+      readonly materializationTarget: string;
+    };
+
+export interface ValidationAttemptPlanIdentityV1 {
+  readonly attemptPlanVersion: 1;
+  readonly projectId: ProjectId;
+  readonly vaultId: VaultId;
+  readonly storeId: StoreId;
+  readonly workspaceId: WorkspaceId;
+  readonly sessionId: SessionId;
+  readonly workflowId: WorkflowId;
+  readonly workflowGeneration: number;
+  readonly finalCheckpointId: CheckpointId;
+  readonly finalCheckpointFingerprint: string;
+  readonly profileId: string;
+  readonly profileVersion: number;
+  readonly profileConfigurationHash: string;
+  readonly runId: string;
+  readonly resultId: ValidationResultId;
+  readonly resultCommandId: string;
+  readonly resultIdempotencyKey: string;
+}
+
+export interface InternalValidationResultCommand extends LifecycleCommandBase {
+  readonly commandType: "internal-validation-result";
+  readonly workflowId: WorkflowId;
+  readonly workflowGeneration: number;
+  readonly plannedWorkId: string;
+  readonly attemptPlan: ValidationAttemptPlanIdentityV1;
+  readonly claim: WorkflowClaimAssertionV1;
+  readonly result: ValidationResultV1;
+}
+
+export interface InternalWorkflowPhaseCommand extends LifecycleCommandBase {
+  readonly commandType: "internal-workflow-phase";
+  readonly workflowId: WorkflowId;
+  readonly workflowGeneration: number;
+  readonly sourcePhase: string;
+  readonly plannedWorkId: string;
+  readonly claim: WorkflowClaimAssertionV1;
+  readonly action: SemanticSessionEndAction;
+}
+
+export type InternalWorkflowSemanticCommand =
+  | InternalValidationResultCommand
+  | InternalWorkflowPhaseCommand;
+
+const VALIDATION_ATTEMPT_PLAN_KEYS = [
+  "attemptPlanVersion",
+  "projectId",
+  "vaultId",
+  "storeId",
+  "workspaceId",
+  "sessionId",
+  "workflowId",
+  "workflowGeneration",
+  "finalCheckpointId",
+  "finalCheckpointFingerprint",
+  "profileId",
+  "profileVersion",
+  "profileConfigurationHash",
+  "runId",
+  "resultId",
+  "resultCommandId",
+  "resultIdempotencyKey",
+] as const;
+
+function invalidValidationResultBinding(): never {
+  throw new LifecycleError("SESSION_VALIDATION_RESULT_INVALID");
+}
+
+export function assertInternalValidationResultBinding(
+  command: InternalValidationResultCommand,
+): void {
+  try {
+    const planRecord = exactRecord(
+      command.attemptPlan,
+      VALIDATION_ATTEMPT_PLAN_KEYS,
+      "validationAttemptPlan",
+      "SESSION_VALIDATION_RESULT_INVALID",
+    );
+    if (planRecord.attemptPlanVersion !== 1) invalidValidationResultBinding();
+    parseLifecycleId<ProjectId>(planRecord.projectId, "attemptPlan.projectId");
+    parseLifecycleId<VaultId>(planRecord.vaultId, "attemptPlan.vaultId");
+    parseLifecycleId<StoreId>(planRecord.storeId, "attemptPlan.storeId");
+    if (typeof planRecord.workspaceId !== "string" || !LOWER_HASH.test(planRecord.workspaceId)) {
+      invalidValidationResultBinding();
+    }
+    parseLifecycleId<SessionId>(planRecord.sessionId, "attemptPlan.sessionId");
+    parseLifecycleId<WorkflowId>(planRecord.workflowId, "attemptPlan.workflowId");
+    parseInteger(
+      planRecord.workflowGeneration,
+      "attemptPlan.workflowGeneration",
+      1,
+      Number.MAX_SAFE_INTEGER,
+    );
+    parseLifecycleId<CheckpointId>(planRecord.finalCheckpointId, "attemptPlan.finalCheckpointId");
+    if (
+      typeof planRecord.finalCheckpointFingerprint !== "string"
+      || !LOWER_HASH.test(planRecord.finalCheckpointFingerprint)
+    ) invalidValidationResultBinding();
+    parseBoundedString(planRecord.profileId, "attemptPlan.profileId", 256);
+    parseInteger(planRecord.profileVersion, "attemptPlan.profileVersion", 1, Number.MAX_SAFE_INTEGER);
+    if (
+      typeof planRecord.profileConfigurationHash !== "string"
+      || !LOWER_HASH.test(planRecord.profileConfigurationHash)
+    ) invalidValidationResultBinding();
+    parseLifecycleId(planRecord.runId, "attemptPlan.runId");
+    parseLifecycleId<ValidationResultId>(planRecord.resultId, "attemptPlan.resultId");
+    parseLifecycleId(planRecord.resultCommandId, "attemptPlan.resultCommandId");
+    parseLifecycleId(planRecord.resultIdempotencyKey, "attemptPlan.resultIdempotencyKey");
+    assertValidationResultShape(command.result);
+
+    const plan = command.attemptPlan;
+    const result = command.result;
+    if (
+      command.commandType !== "internal-validation-result"
+      || command.commandId !== plan.resultCommandId
+      || command.idempotencyKey !== plan.resultIdempotencyKey
+      || command.expectedProjectId !== plan.projectId
+      || command.expectedVaultId !== plan.vaultId
+      || command.expectedWorkspaceId !== plan.workspaceId
+      || command.workflowId !== plan.workflowId
+      || command.workflowGeneration !== plan.workflowGeneration
+      || command.claim.workflowId !== plan.workflowId
+      || command.claim.workflowGeneration !== plan.workflowGeneration
+      || result.resultId !== plan.resultId
+      || result.projectId !== plan.projectId
+      || result.vaultId !== plan.vaultId
+      || result.storeId !== plan.storeId
+      || result.workspaceId !== plan.workspaceId
+      || result.sourceStateAtStart.workspaceId !== plan.workspaceId
+      || result.sourceStateAtCompletion.workspaceId !== plan.workspaceId
+      || result.sessionId !== plan.sessionId
+      || result.workflowId !== plan.workflowId
+      || result.workflowGeneration !== plan.workflowGeneration
+      || result.finalCheckpointId !== plan.finalCheckpointId
+      || result.finalCheckpointFingerprint !== plan.finalCheckpointFingerprint
+      || result.profileId !== plan.profileId
+      || result.profileVersion !== plan.profileVersion
+      || result.profileConfigurationHash !== plan.profileConfigurationHash
+      || result.runId !== plan.runId
+    ) invalidValidationResultBinding();
+  } catch {
+    invalidValidationResultBinding();
+  }
+}
+
+interface BoundedLifecycleOperationBase {
+  readonly context: ProjectContext;
+  readonly operationId: string;
+  readonly requestId: string;
+  readonly authorization: BoundedOperationAuthorization;
+}
+
+export type BoundedLifecycleOperation =
+  | (BoundedLifecycleOperationBase & {
+      readonly operation: "renew-root-lease";
+      readonly sessionId: SessionId;
+      readonly expectedOwnerGeneration: number;
+    })
+  | (BoundedLifecycleOperationBase & {
+      readonly operation: "read-session-tree" | "read-session-status" | "read-session-association";
+      readonly sessionId: SessionId;
+    });
+
+interface LifecycleFencedOperationBase {
+  readonly context: ProjectContext;
+  readonly workId: string;
+  readonly ownerId: string;
+  readonly fencingToken: string;
+}
+
+interface WorkflowFencedIdentity extends LifecycleFencedOperationBase {
+  readonly workflowId: WorkflowId;
+  readonly workflowGeneration: number;
+}
+
+interface OutboxFencedIdentity extends LifecycleFencedOperationBase {
+  readonly targetKey: string;
+  readonly materializationRevision: string;
+}
+
+export type LifecycleFencedOperation =
+  | (WorkflowFencedIdentity & { readonly operation: "workflow-claim"; readonly leaseUntil: string })
+  | (WorkflowFencedIdentity & { readonly operation: "workflow-renew"; readonly leaseUntil: string })
+  | (WorkflowFencedIdentity & { readonly operation: "workflow-release" })
+  | (WorkflowFencedIdentity & {
+      readonly operation: "workflow-eventless-phase";
+      readonly expectedPhase: string;
+      readonly nextPhase: string;
+    })
+  | (LifecycleFencedOperationBase & {
+      readonly operation: "workflow-recovery";
+      readonly dueBefore: string;
+      readonly limit: number;
+    })
+  | (OutboxFencedIdentity & { readonly operation: "outbox-claim"; readonly leaseUntil: string })
+  | (OutboxFencedIdentity & { readonly operation: "outbox-renew"; readonly leaseUntil: string })
+  | (OutboxFencedIdentity & {
+      readonly operation: "outbox-materialize";
+      readonly expectedCurrentFingerprint: string | null;
+      readonly nextFingerprint: string;
+      readonly materializedBytes: Uint8Array;
+      readonly acknowledgement: {
+        readonly ownerId: string;
+        readonly fencingToken: string;
+        readonly materializationRevision: string;
+        readonly nextFingerprint: string;
+      };
+    })
+  | (OutboxFencedIdentity & {
+      readonly operation: "outbox-failure";
+      readonly retryable: boolean;
+      readonly safeErrorCode: string;
+      readonly attempt: number;
+      readonly nextAttemptAt: string | null;
+    });
+
+function invalid(field: string): never {
+  throw new LifecycleError("LIFECYCLE_INPUT_INVALID", { field });
+}
+
+function exactCommand(value: unknown, extraKeys: readonly string[]): Record<string, unknown> {
+  return exactRecord(value, [...BASE_KEYS, ...extraKeys], "lifecycleCommand");
+}
+
+function base(command: Record<string, unknown>): LifecycleCommandBase {
+  return {
+    commandId: parseLifecycleId(command.commandId, "commandId"),
+    idempotencyKey: parseLifecycleId(command.idempotencyKey, "idempotencyKey"),
+    agentId: parseBoundedString(command.agentId, "agentId", 256),
+    expectedProjectId: parseBoundedString(command.expectedProjectId, "expectedProjectId", 256),
+    expectedVaultId: parseBoundedString(command.expectedVaultId, "expectedVaultId", 256),
+    expectedWorkspaceId: parseBoundedString(command.expectedWorkspaceId, "expectedWorkspaceId", 256),
+    expectedBranchRef: parseNullableBoundedString(command.expectedBranchRef, "expectedBranchRef", 1_024),
+  };
+}
+
+function assignment(value: unknown): ChildAssignmentV1 {
+  const input = exactRecord(value, ["assignmentId", "summary", "scope"], "assignment");
+  return Object.freeze({
+    assignmentId: parseLifecycleId(input.assignmentId, "assignment.assignmentId"),
+    summary: parseBoundedString(input.summary, "assignment.summary", 4_000),
+    scope: parseBoundedString(input.scope, "assignment.scope", 4_000),
+  });
+}
+
+function stringList(value: unknown, field: string, maximum = 100): readonly string[] {
+  const source = strictArray(value, field);
+  if (source.length > maximum) invalid(field);
+  return Object.freeze(source.map((item, index) =>
+    parseBoundedString(item, `${field}[${index}]`, 4_000)));
+}
+
+function evidenceFrame(value: unknown, field: string): EvidenceCoverageFrameV1 {
+  const frame = exactRecord(value, ["frameId", "ordinal", "sourceKind", "observedAt", "contentFingerprint"], field);
+  if (typeof frame.contentFingerprint !== "string" || !LOWER_HASH.test(frame.contentFingerprint)) {
+    invalid(`${field}.contentFingerprint`);
+  }
+  return Object.freeze({
+    frameId: parseLifecycleId<EvidenceFrameId>(frame.frameId, `${field}.frameId`),
+    ordinal: parseDecimalString(frame.ordinal, `${field}.ordinal`),
+    sourceKind: parseEnum(frame.sourceKind, EVIDENCE_SOURCE_KINDS, `${field}.sourceKind`),
+    observedAt: parseCanonicalTimestamp(frame.observedAt, `${field}.observedAt`),
+    contentFingerprint: frame.contentFingerprint,
+  });
+}
+
+function nullableDecimal(value: unknown, field: string): string | null {
+  return value === null ? null : parseDecimalString(value, field);
+}
+
+export function decodeLifecycleSemanticCommandDraft(value: unknown): LifecycleSemanticCommandDraft {
+  const candidate = strictRecord(value, "lifecycleCommand");
+  const commandType = parseBoundedString(candidate.commandType, "commandType", 64);
+  switch (commandType) {
+    case "root-start": {
+      const command = exactCommand(value, ["continuityKey", "resumePolicy"]);
+      if (command.resumePolicy !== "new") invalid("resumePolicy");
+      return Object.freeze({
+        ...base(command),
+        commandType,
+        continuityKey: parseBoundedString(command.continuityKey, "continuityKey", 1_024),
+        resumePolicy: "new",
+      });
+    }
+    case "root-resume": {
+      const command = exactCommand(value, ["sessionId", "continuityKey", "resumePolicy", "expectedOwnerGeneration"]);
+      const resumePolicy = parseEnum(command.resumePolicy, RESUME_POLICIES, "resumePolicy");
+      const sessionId = parseNullableUuid<SessionId>(command.sessionId, "sessionId");
+      if (resumePolicy === "exact" && sessionId === null) invalid("sessionId");
+      return Object.freeze({
+        ...base(command),
+        commandType,
+        sessionId,
+        continuityKey: parseBoundedString(command.continuityKey, "continuityKey", 1_024),
+        resumePolicy,
+        expectedOwnerGeneration: parseDecimalString(command.expectedOwnerGeneration, "expectedOwnerGeneration"),
+      });
+    }
+    case "root-recovery": {
+      const command = exactCommand(value, ["sessionId", "expectedOwnerGeneration", "preTransitionCheckpointId", "reasonCode"]);
+      return Object.freeze({
+        ...base(command),
+        commandType,
+        sessionId: parseLifecycleId<SessionId>(command.sessionId, "sessionId"),
+        expectedOwnerGeneration: parseDecimalString(command.expectedOwnerGeneration, "expectedOwnerGeneration"),
+        preTransitionCheckpointId: parseLifecycleId<CheckpointId>(command.preTransitionCheckpointId, "preTransitionCheckpointId"),
+        reasonCode: parseBoundedString(command.reasonCode, "reasonCode", 128),
+      });
+    }
+    case "root-suspend": {
+      const command = exactCommand(value, ["sessionId", "expectedStreamVersion", "checkpoint"]);
+      return Object.freeze({
+        ...base(command),
+        commandType,
+        sessionId: parseLifecycleId<SessionId>(command.sessionId, "sessionId"),
+        expectedStreamVersion: parseDecimalString(command.expectedStreamVersion, "expectedStreamVersion"),
+        checkpoint: decodeCheckpointDraftV1(command.checkpoint),
+      });
+    }
+    case "fork-child": {
+      const command = exactCommand(value, ["parentSessionId", "expectedStreamVersion", "assignment", "directAccessRequested"]);
+      return Object.freeze({
+        ...base(command),
+        commandType,
+        parentSessionId: parseLifecycleId<SessionId>(command.parentSessionId, "parentSessionId"),
+        expectedStreamVersion: parseDecimalString(command.expectedStreamVersion, "expectedStreamVersion"),
+        assignment: assignment(command.assignment),
+        directAccessRequested: parseBoolean(command.directAccessRequested, "directAccessRequested"),
+      });
+    }
+    case "amend-child-assignment": {
+      const command = exactCommand(value, ["parentSessionId", "childSessionId", "expectedStreamVersion", "assignment"]);
+      return Object.freeze({
+        ...base(command),
+        commandType,
+        parentSessionId: parseLifecycleId<SessionId>(command.parentSessionId, "parentSessionId"),
+        childSessionId: parseLifecycleId<SessionId>(command.childSessionId, "childSessionId"),
+        expectedStreamVersion: parseDecimalString(command.expectedStreamVersion, "expectedStreamVersion"),
+        assignment: assignment(command.assignment),
+      });
+    }
+    case "record-checkpoint": {
+      const command = exactCommand(value, ["sessionId", "expectedStreamVersion", "expectedBaseEventPosition", "draft"]);
+      return Object.freeze({
+        ...base(command),
+        commandType,
+        sessionId: parseLifecycleId<SessionId>(command.sessionId, "sessionId"),
+        expectedStreamVersion: parseDecimalString(command.expectedStreamVersion, "expectedStreamVersion"),
+        expectedBaseEventPosition: nullableDecimal(command.expectedBaseEventPosition, "expectedBaseEventPosition"),
+        draft: decodeCheckpointDraftV1(command.draft),
+      });
+    }
+    case "record-evidence-batch": {
+      const command = exactCommand(value, [
+        "adapterSessionId",
+        "batchId",
+        "sessionId",
+        "firstOrdinal",
+        "lastOrdinal",
+        "fingerprintSchemaVersion",
+        "fingerprintKeyId",
+        "fingerprintDomain",
+        "redactionStatus",
+        "frames",
+      ]);
+      if (
+        command.fingerprintSchemaVersion !== 1
+        || command.fingerprintDomain !== "pm-evidence-frame-v1"
+        || command.redactionStatus !== "content-not-retained"
+      ) invalid("recordEvidenceBatch");
+      const firstOrdinal = parseDecimalString(command.firstOrdinal, "firstOrdinal");
+      const lastOrdinal = parseDecimalString(command.lastOrdinal, "lastOrdinal");
+      if (BigInt(firstOrdinal) > BigInt(lastOrdinal)) invalid("recordEvidenceBatch.ordinals");
+      const source = strictArray(command.frames, "frames");
+      if (source.length === 0 || source.length > 2_000) invalid("frames");
+      const frames = source.map((item, index) => evidenceFrame(item, `frames[${index}]`));
+      if (frames[0]?.ordinal !== firstOrdinal || frames.at(-1)?.ordinal !== lastOrdinal) invalid("frames");
+      for (let index = 1; index < frames.length; index += 1) {
+        const previous = frames[index - 1];
+        const current = frames[index];
+        if (previous === undefined || current === undefined || BigInt(current.ordinal) !== BigInt(previous.ordinal) + 1n) {
+          invalid("frames");
+        }
+      }
+      if (new Set(frames.map((frame) => frame.frameId)).size !== frames.length) invalid("frames");
+      return Object.freeze({
+        ...base(command),
+        commandType,
+        adapterSessionId: parseLifecycleId<AdapterSessionId>(command.adapterSessionId, "adapterSessionId"),
+        batchId: parseLifecycleId<EvidenceBatchId>(command.batchId, "batchId"),
+        sessionId: parseLifecycleId<SessionId>(command.sessionId, "sessionId"),
+        firstOrdinal,
+        lastOrdinal,
+        fingerprintSchemaVersion: 1,
+        fingerprintKeyId: parseBoundedString(command.fingerprintKeyId, "fingerprintKeyId", 128),
+        fingerprintDomain: "pm-evidence-frame-v1",
+        redactionStatus: "content-not-retained",
+        frames: Object.freeze(frames),
+      });
+    }
+    case "record-child-report": {
+      const command = exactCommand(value, ["childSessionId", "expectedStreamVersion", "report"]);
+      const childSessionId = parseLifecycleId<SessionId>(command.childSessionId, "childSessionId");
+      const report = decodeChildReportDraftV1(command.report);
+      return Object.freeze({
+        ...base(command),
+        commandType,
+        childSessionId,
+        expectedStreamVersion: parseDecimalString(command.expectedStreamVersion, "expectedStreamVersion"),
+        report,
+      });
+    }
+    case "disposition-child-report": {
+      const command = exactCommand(value, ["parentSessionId", "childSessionId", "expectedStreamVersion", "disposition"]);
+      return Object.freeze({
+        ...base(command),
+        commandType,
+        parentSessionId: parseLifecycleId<SessionId>(command.parentSessionId, "parentSessionId"),
+        childSessionId: parseLifecycleId<SessionId>(command.childSessionId, "childSessionId"),
+        expectedStreamVersion: parseDecimalString(command.expectedStreamVersion, "expectedStreamVersion"),
+        disposition: decodeChildDispositionV1(command.disposition),
+      });
+    }
+    case "propose-child-completion":
+    case "complete-child-session": {
+      const complete = commandType === "complete-child-session";
+      const extraKeys = complete
+        ? ["parentSessionId", "childSessionId", "expectedStreamVersion", "reportId"]
+        : ["childSessionId", "expectedStreamVersion", "reportId"];
+      const command = exactCommand(value, extraKeys);
+      const common = {
+        ...base(command),
+        childSessionId: parseLifecycleId<SessionId>(command.childSessionId, "childSessionId"),
+        expectedStreamVersion: parseDecimalString(command.expectedStreamVersion, "expectedStreamVersion"),
+        reportId: parseLifecycleId<ReportId>(command.reportId, "reportId"),
+      };
+      return complete
+        ? Object.freeze({
+            ...common,
+            commandType: "complete-child-session" as const,
+            parentSessionId: parseLifecycleId<SessionId>(command.parentSessionId, "parentSessionId"),
+          })
+        : Object.freeze({ ...common, commandType: "propose-child-completion" as const });
+    }
+    case "suspend-child-session": {
+      const command = exactCommand(value, [
+        "parentSessionId",
+        "childSessionId",
+        "expectedStreamVersion",
+        "checkpointId",
+        "blockers",
+        "followUps",
+      ]);
+      return Object.freeze({
+        ...base(command),
+        commandType,
+        parentSessionId: parseLifecycleId<SessionId>(command.parentSessionId, "parentSessionId"),
+        childSessionId: parseLifecycleId<SessionId>(command.childSessionId, "childSessionId"),
+        expectedStreamVersion: parseDecimalString(command.expectedStreamVersion, "expectedStreamVersion"),
+        checkpointId: parseLifecycleId<CheckpointId>(command.checkpointId, "checkpointId"),
+        blockers: stringList(command.blockers, "blockers"),
+        followUps: stringList(command.followUps, "followUps"),
+      });
+    }
+    case "create-child-transfer": {
+      const command = exactCommand(value, ["parentSessionId", "childSessionId", "expectedStreamVersion", "checkpointId"]);
+      return Object.freeze({
+        ...base(command),
+        commandType,
+        parentSessionId: parseLifecycleId<SessionId>(command.parentSessionId, "parentSessionId"),
+        childSessionId: parseLifecycleId<SessionId>(command.childSessionId, "childSessionId"),
+        expectedStreamVersion: parseDecimalString(command.expectedStreamVersion, "expectedStreamVersion"),
+        checkpointId: parseLifecycleId<CheckpointId>(command.checkpointId, "checkpointId"),
+      });
+    }
+    case "claim-child-transfer": {
+      const command = exactCommand(value, ["rootSessionId", "transferTicketId", "expectedStreamVersion"]);
+      return Object.freeze({
+        ...base(command),
+        commandType,
+        rootSessionId: parseLifecycleId<SessionId>(command.rootSessionId, "rootSessionId"),
+        transferTicketId: parseLifecycleId<TransferTicketId>(command.transferTicketId, "transferTicketId"),
+        expectedStreamVersion: parseDecimalString(command.expectedStreamVersion, "expectedStreamVersion"),
+      });
+    }
+    case "request-session-end": {
+      const command = exactCommand(value, ["request"]);
+      return Object.freeze({ ...base(command), commandType, request: decodeSessionEndRequestV1(command.request) });
+    }
+    case "amend-session-end": {
+      const command = exactCommand(value, ["sessionId", "workflowId", "expectedStreamVersion", "amendment"]);
+      return Object.freeze({
+        ...base(command),
+        commandType,
+        sessionId: parseLifecycleId<SessionId>(command.sessionId, "sessionId"),
+        workflowId: parseLifecycleId<WorkflowId>(command.workflowId, "workflowId"),
+        expectedStreamVersion: parseDecimalString(command.expectedStreamVersion, "expectedStreamVersion"),
+        amendment: decodeSessionEndAmendmentV1(command.amendment),
+      });
+    }
+    case "cancel-session-end": {
+      const command = exactCommand(value, ["sessionId", "workflowId", "expectedStreamVersion", "preTransitionCheckpointId"]);
+      return Object.freeze({
+        ...base(command),
+        commandType,
+        sessionId: parseLifecycleId<SessionId>(command.sessionId, "sessionId"),
+        workflowId: parseLifecycleId<WorkflowId>(command.workflowId, "workflowId"),
+        expectedStreamVersion: parseDecimalString(command.expectedStreamVersion, "expectedStreamVersion"),
+        preTransitionCheckpointId: parseLifecycleId<CheckpointId>(command.preTransitionCheckpointId, "preTransitionCheckpointId"),
+      });
+    }
+    case "abandon-session": {
+      const command = exactCommand(value, ["sessionId", "expectedStreamVersion", "preTransitionCheckpointId", "reasonCode"]);
+      return Object.freeze({
+        ...base(command),
+        commandType,
+        sessionId: parseLifecycleId<SessionId>(command.sessionId, "sessionId"),
+        expectedStreamVersion: parseDecimalString(command.expectedStreamVersion, "expectedStreamVersion"),
+        preTransitionCheckpointId: parseLifecycleId<CheckpointId>(command.preTransitionCheckpointId, "preTransitionCheckpointId"),
+        reasonCode: parseBoundedString(command.reasonCode, "reasonCode", 128),
+      });
+    }
+    default:
+      invalid("commandType");
+  }
+}
+
+function invalidAuthorization(): never {
+  throw new LifecycleError("SESSION_CAPABILITY_INVALID");
+}
+
+export function assertSemanticCommandAuthorization(
+  command: LifecycleSemanticCommandDraft,
+  authorization: SemanticCommandAuthorization,
+): void {
+  if (authorization.kind === "initial-authority") {
+    if (
+      command.commandType !== "root-start"
+      || authorization.authoritySessionId !== null
+      || authorization.targetSessionId !== null
+      || authorization.proof !== null
+      || authorization.approval !== null
+      || authorization.childBindingGrant !== null
+    ) invalidAuthorization();
+    return;
+  }
+
+  if (command.commandType === "root-start") invalidAuthorization();
+  if (
+    authorization.proof === null
+    && authorization.approval === null
+    && authorization.childBindingGrant === null
+  ) invalidAuthorization();
+  if (authorization.proof !== null && authorization.proof.target !== "semantic-command") {
+    invalidAuthorization();
+  }
+
+  if (command.commandType === "root-recovery") {
+    if (
+      authorization.proof !== null
+      || authorization.approval === null
+      || authorization.approval.action !== "recover-root-authority"
+      || authorization.childBindingGrant !== null
+    ) {
+      invalidAuthorization();
+    }
+    return;
+  }
+  if (command.commandType === "abandon-session") {
+    if (
+      authorization.proof === null
+      || authorization.approval === null
+      || authorization.approval.action !== "abandon-root"
+      || authorization.childBindingGrant !== null
+    ) {
+      invalidAuthorization();
+    }
+    return;
+  }
+  if (command.commandType === "fork-child") {
+    if (
+      authorization.proof === null
+      || authorization.approval !== null
+      || (authorization.childBindingGrant !== null) !== command.directAccessRequested
+    ) invalidAuthorization();
+    return;
+  }
+  if (authorization.proof === null || authorization.approval !== null || authorization.childBindingGrant !== null) {
+    invalidAuthorization();
+  }
+}
+
+export type LifecycleContractContext = {
+  readonly context: ProjectContext;
+  readonly projectId: ProjectId;
+  readonly vaultId: VaultId;
+  readonly storeId: StoreId;
+  readonly workspaceId: WorkspaceId;
+  readonly actorRole: TrustedActorRole;
+  readonly metadata: Readonly<Record<string, JsonValue>>;
+};
