@@ -291,6 +291,7 @@ export class ProjectStoreExecutor {
   #opened: WorkerOpenResult | null = null;
   #sequence = 0;
   #closePromise: Promise<void> | null = null;
+  #quiescePromise: Promise<void> | null = null;
   #openPromise: Promise<WorkerOpenResult> | null = null;
   #terminationPromise: Promise<void> | null = null;
   #expectedTermination = false;
@@ -425,10 +426,14 @@ export class ProjectStoreExecutor {
     return report;
   }
 
-  async quiesce(lease: MaintenanceLease): Promise<void> {
-    this.assertCallable(["open"]);
-    if (this.#explicitMaintenanceLease !== null) {
-      throw new ProjectStoreWorkerError("MAINTENANCE_QUIESCING");
+  quiesce(lease: MaintenanceLease): Promise<void> {
+    try {
+      this.assertCallable(["open"]);
+      if (this.#explicitMaintenanceLease !== null) {
+        throw new ProjectStoreWorkerError("MAINTENANCE_QUIESCING");
+      }
+    } catch (error) {
+      return Promise.reject(error);
     }
     let encodedLease: ReturnType<typeof encodeMaintenanceLeaseWire>;
     let expectedLease: MaintenanceLease;
@@ -437,11 +442,22 @@ export class ProjectStoreExecutor {
       expectedLease = decodeMaintenanceLeaseWire(encodedLease);
     } catch {
       const failure = new ProjectStoreWorkerError("WORKER_PROTOCOL_ERROR");
-      await this.poison(failure);
-      throw failure;
+      this.#quiescePromise = (async () => {
+        await this.poison(failure);
+        throw failure;
+      })();
+      return this.#quiescePromise;
     }
     this.#explicitMaintenanceLease = expectedLease;
     this.#expectedTermination = true;
+    this.#quiescePromise = this.quiesceOwned(encodedLease, expectedLease);
+    return this.#quiescePromise;
+  }
+
+  private async quiesceOwned(
+    encodedLease: ReturnType<typeof encodeMaintenanceLeaseWire>,
+    expectedLease: MaintenanceLease,
+  ): Promise<void> {
     let requestError: ProjectStoreWorkerError | null = null;
     try {
       const response = await this.request({
@@ -459,14 +475,33 @@ export class ProjectStoreExecutor {
         : new ProjectStoreWorkerError("WORKER_UNAVAILABLE");
     }
 
-    if (requestError !== null) {
+    if (requestError !== null && requestError.code !== "MAINTENANCE_QUIESCING") {
       await this.poison(requestError);
       this.failMaintenanceClosure(requestError);
     }
+    let evidenceDeadline: object | null = null;
+    const boundedEvidence = requestError?.code === "MAINTENANCE_QUIESCING"
+      ? new Promise<{ kind: "timeout" }>((resolveTimeout) => {
+          evidenceDeadline = this.#dependencies.scheduler.setTimeout(
+            () => resolveTimeout({ kind: "timeout" }),
+            this.#options.closeTimeoutMs,
+          );
+        })
+      : new Promise<never>(() => undefined);
     const termination = await Promise.race([
       this.#workerExit.then(() => ({ kind: "exit" as const })),
       this.#poisonedSignal.then((error) => ({ kind: "failure" as const, error })),
-    ]);
+      boundedEvidence,
+    ]).finally(() => {
+      if (evidenceDeadline !== null) {
+        this.#dependencies.scheduler.clearTimeout(evidenceDeadline);
+      }
+    });
+    if (termination.kind === "timeout") {
+      const failure = new ProjectStoreWorkerError("WORKER_TIMEOUT");
+      await this.poison(failure);
+      this.failMaintenanceClosure(failure);
+    }
     if (termination.kind === "failure") {
       await (this.#terminationPromise ?? Promise.resolve());
       this.failMaintenanceClosure(termination.error);
@@ -516,6 +551,10 @@ export class ProjectStoreExecutor {
 
   close(): Promise<void> {
     if (this.#closePromise !== null) return this.#closePromise;
+    if (this.#quiescePromise !== null) {
+      this.#closePromise = this.#quiescePromise;
+      return this.#closePromise;
+    }
     if (this.#state === "closed" || this.#state === "quiesced") return Promise.resolve();
     if (this.#state === "poisoned") {
       this.#closePromise = this.#terminationPromise ?? Promise.resolve();
@@ -836,17 +875,30 @@ export class ProjectStoreExecutor {
 
 export class ProjectStoreExecutorRegistry {
   readonly #entries = new Map<string, { key: string; executor: ProjectStoreExecutor }>();
+  readonly #acquisitions = new Map<string, Promise<ProjectStoreExecutor>>();
 
   constructor(private readonly dependencies: Partial<ProjectStoreExecutorDependencies> = {}) {}
 
   async acquire(options: ProjectStoreExecutorOptions): Promise<ProjectStoreExecutor> {
     const reuseKey = storeReuseKey(options.context);
-    const exactKey = projectStoreExecutorKey(options.context);
-    const current = this.#entries.get(reuseKey);
-    if (current?.key === exactKey && current.executor.canReuse()) return current.executor;
-    if (current !== undefined) await current.executor.invalidateForRebind(options.context);
-    const executor = new ProjectStoreExecutor(options, this.dependencies);
-    this.#entries.set(reuseKey, { key: exactKey, executor });
-    return executor;
+    const predecessor = this.#acquisitions.get(reuseKey);
+    const acquisition = (async () => {
+      if (predecessor !== undefined) await predecessor.catch(() => undefined);
+      const exactKey = projectStoreExecutorKey(options.context);
+      const current = this.#entries.get(reuseKey);
+      if (current?.key === exactKey && current.executor.canReuse()) return current.executor;
+      if (current !== undefined) await current.executor.invalidateForRebind(options.context);
+      const executor = new ProjectStoreExecutor(options, this.dependencies);
+      this.#entries.set(reuseKey, { key: exactKey, executor });
+      return executor;
+    })();
+    this.#acquisitions.set(reuseKey, acquisition);
+    try {
+      return await acquisition;
+    } finally {
+      if (this.#acquisitions.get(reuseKey) === acquisition) {
+        this.#acquisitions.delete(reuseKey);
+      }
+    }
   }
 }

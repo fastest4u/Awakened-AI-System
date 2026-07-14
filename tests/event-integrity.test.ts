@@ -1513,6 +1513,70 @@ describe("EventIntegrityService event-chain and orphan checks", () => {
 });
 
 describe("EventIntegrityService bounds and transaction semantics", () => {
+  it("does not rescan the full event index for every command during a quick check", () => {
+    const fixture = createFixture({ append: false });
+    const commandCount = 64;
+    for (let index = 0; index < commandCount; index += 1) {
+      const streamId = `stream-linear-${index}`;
+      fixture.store.append({
+        ...appendCommand(
+          fixture.context,
+          uuid(1_000 + index),
+          `integrity:linear-${index}`,
+          streamId,
+          "linear",
+          index + 1,
+        ),
+        events: [pendingEvent("Linear.Recorded", index + 1)],
+      });
+    }
+
+    const originalFilter = Array.prototype.filter;
+    let fullEventIndexVisits = 0;
+    Object.defineProperty(Array.prototype, "filter", {
+      configurable: true,
+      writable: true,
+      value(
+        this: unknown[],
+        predicate: (value: unknown, index: number, array: unknown[]) => unknown,
+        thisArg?: unknown,
+      ): unknown[] {
+        const first = this[0];
+        if (
+          this.length === commandCount
+          && typeof first === "object"
+          && first !== null
+          && "globalPosition" in first
+          && "commandEventIndex" in first
+        ) {
+          fullEventIndexVisits += this.length;
+        }
+        return originalFilter.call(this, predicate, thisArg);
+      },
+    });
+    const report = (() => {
+      try {
+        return fixture.integrity.quickCheck(fixture.context, 1);
+      } finally {
+        Object.defineProperty(Array.prototype, "filter", {
+          configurable: true,
+          writable: true,
+          value: originalFilter,
+        });
+      }
+    })();
+
+    assert.equal(report.ok, true);
+    assert.deepEqual(
+      [report.eventsVerified, report.streamsVerified, report.commandsVerified],
+      [1, commandCount, commandCount],
+    );
+    assert.ok(
+      fullEventIndexVisits <= commandCount,
+      `quick check revisited ${fullEventIndexVisits} indexed events for ${commandCount} commands`,
+    );
+  });
+
   it("limits quick verification to the requested tail while full check still finds older damage", () => {
     const fixture = createFixture();
     mutateProtected(fixture, "events_no_update", () => {

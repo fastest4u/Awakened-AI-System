@@ -1548,6 +1548,37 @@ function snapshotRoute(route: ProjectStoreRoute, storeRoot: string): ProjectStor
   };
 }
 
+export interface CanonicalTemporaryDirectoryDependencies {
+  temporaryRoot(): string;
+  create(path: string): string;
+  canonicalize(path: string): string;
+  remove(path: string): void;
+}
+
+const DEFAULT_CANONICAL_TEMPORARY_DIRECTORY_DEPENDENCIES: CanonicalTemporaryDirectoryDependencies = {
+  temporaryRoot: tmpdir,
+  create: mkdtempSync,
+  canonicalize: realpathSync.native,
+  remove(path) { rmSync(path, { recursive: true, force: true }); },
+};
+
+export function createCanonicalTemporaryDirectory(
+  prefix: string,
+  dependencies: CanonicalTemporaryDirectoryDependencies
+    = DEFAULT_CANONICAL_TEMPORARY_DIRECTORY_DEPENDENCIES,
+): string {
+  const rawDirectory = dependencies.create(join(dependencies.temporaryRoot(), prefix));
+  try {
+    return resolve(dependencies.canonicalize(rawDirectory));
+  } catch (error) {
+    try {
+      dependencies.remove(rawDirectory);
+    } finally {
+      throw error;
+    }
+  }
+}
+
 async function withStableStoreSnapshot<T>(
   route: ProjectStoreRoute,
   inspect: (snapshot: ProjectStoreRoute) => Promise<T>,
@@ -1555,9 +1586,7 @@ async function withStableStoreSnapshot<T>(
   const sourceFiles = [route.eventsPath, `${route.eventsPath}-wal`] as const;
   const sourceShmPath = `${route.eventsPath}-shm`;
   for (let attempt = 0; attempt < MAXIMUM_STABLE_SNAPSHOT_ATTEMPTS; attempt += 1) {
-    const directory = resolve(realpathSync.native(
-      mkdtempSync(join(tmpdir(), "memory-vault-store-snapshot-")),
-    ));
+    const directory = createCanonicalTemporaryDirectory("memory-vault-store-snapshot-");
     try {
       validateCanonicalStoreSource(route);
       await storeFileSignature(sourceShmPath);

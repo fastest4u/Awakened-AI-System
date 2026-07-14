@@ -254,6 +254,43 @@ function eventIndex(row: SqliteRow): EventIndexRow {
   };
 }
 
+function lowerBoundGlobalPosition(
+  events: readonly EventIndexRow[],
+  target: bigint,
+): number {
+  let lower = 0;
+  let upper = events.length;
+  while (lower < upper) {
+    const middle = lower + Math.floor((upper - lower) / 2);
+    if (events[middle]!.globalPosition < target) lower = middle + 1;
+    else upper = middle;
+  }
+  return lower;
+}
+
+function upperBoundGlobalPosition(
+  events: readonly EventIndexRow[],
+  target: bigint,
+): number {
+  let lower = 0;
+  let upper = events.length;
+  while (lower < upper) {
+    const middle = lower + Math.floor((upper - lower) / 2);
+    if (events[middle]!.globalPosition <= target) lower = middle + 1;
+    else upper = middle;
+  }
+  return lower;
+}
+
+function eventCountInRange(
+  events: readonly EventIndexRow[],
+  first: bigint,
+  last: bigint,
+): number {
+  if (last < first) return 0;
+  return upperBoundGlobalPosition(events, last) - lowerBoundGlobalPosition(events, first);
+}
+
 function streamRow(row: SqliteRow): StreamRow {
   return {
     projectId: stringValue(row, "project_id"),
@@ -652,6 +689,7 @@ export class EventIntegrityService {
     fullEventRows?: readonly SqliteRow[],
   ): void {
     const commandIds = new Set(commands.map((command) => command.commandId));
+    const eventsByCommand = new Map<string, EventIndexRow[]>();
     const fullRowsByCommand = new Map<string, SqliteRow[]>();
     for (const row of fullEventRows ?? []) {
       const commandId = stringValue(row, "command_id");
@@ -660,6 +698,9 @@ export class EventIntegrityService {
       fullRowsByCommand.set(commandId, rows);
     }
     for (const event of events) {
+      const ownEvents = eventsByCommand.get(event.commandId) ?? [];
+      ownEvents.push(event);
+      eventsByCommand.set(event.commandId, ownEvents);
       if (!commandIds.has(event.commandId)) {
         issues.add("ORPHAN_EVENT", {
           globalPosition: event.globalPosition.toString(),
@@ -668,25 +709,30 @@ export class EventIntegrityService {
       }
     }
     for (const command of commands) {
-      const ownEvents = events.filter((event) => event.commandId === command.commandId);
+      const ownEvents = eventsByCommand.get(command.commandId) ?? [];
       const firstOwnEvent = ownEvents[0];
       const lastOwnEvent = ownEvents.at(-1);
-      const rangeEvents = events.filter((event) => event.globalPosition >= command.firstGlobalPosition
-        && event.globalPosition <= command.lastGlobalPosition);
+      const rangeEventCount = eventCountInRange(
+        events,
+        command.firstGlobalPosition,
+        command.lastGlobalPosition,
+      );
+      const ownRangeEventCount = eventCountInRange(
+        ownEvents,
+        command.firstGlobalPosition,
+        command.lastGlobalPosition,
+      );
       const span = command.lastGlobalPosition - command.firstGlobalPosition + 1n;
       if (ownEvents.length === 0) {
         issues.add("ORPHAN_COMMAND", { commandId: command.commandId });
       }
-      const hasForeignRangeEvent = rangeEvents.some(
-        (event) => event.commandId !== command.commandId,
-      );
+      const hasForeignRangeEvent = rangeEventCount > ownRangeEventCount;
       if (hasForeignRangeEvent) {
         issues.add("COMMAND_RANGE_FOREIGN_EVENT", { commandId: command.commandId });
       }
       if (
-        ownEvents.some((event) => event.globalPosition < command.firstGlobalPosition
-          || event.globalPosition > command.lastGlobalPosition)
-        || BigInt(rangeEvents.length) < span
+        ownEvents.length !== ownRangeEventCount
+        || BigInt(rangeEventCount) < span
         || (lastOwnEvent !== undefined
           && command.finalStreamVersion !== lastOwnEvent.streamVersion)
       ) {

@@ -58,6 +58,7 @@ import {
   type OrchestratorAdminDependencies,
   type ProjectInitializationInspection,
 } from "../src/cli/run-command.js";
+import * as runCommandModule from "../src/cli/run-command.js";
 import { canonicalMkdtemp } from "./support/canonical-temp.js";
 
 const temporaryRoots: string[] = [];
@@ -413,6 +414,37 @@ function dependencies(overrides: Partial<OrchestratorAdminDependencies> = {}): {
   };
   return { value, calls };
 }
+
+describe("canonical temporary directory cleanup", () => {
+  it("removes the raw directory when canonicalization fails", () => {
+    const createCanonicalTemporaryDirectory = (
+      runCommandModule as unknown as {
+        createCanonicalTemporaryDirectory?: (
+          prefix: string,
+          dependencies: {
+            temporaryRoot(): string;
+            create(path: string): string;
+            canonicalize(path: string): string;
+            remove(path: string): void;
+          },
+        ) => string;
+      }
+    ).createCanonicalTemporaryDirectory;
+    assert.equal(typeof createCanonicalTemporaryDirectory, "function");
+    const calls: string[] = [];
+    assert.throws(() => createCanonicalTemporaryDirectory!("snapshot-", {
+      temporaryRoot() { return "temp-root"; },
+      create(path) { calls.push(`create:${path}`); return "raw-directory"; },
+      canonicalize(path) { calls.push(`canonicalize:${path}`); throw new Error("canonical failure"); },
+      remove(path) { calls.push(`remove:${path}`); },
+    }), /canonical failure/);
+    assert.deepEqual(calls, [
+      `create:${join("temp-root", "snapshot-")}`,
+      "canonicalize:raw-directory",
+      "remove:raw-directory",
+    ]);
+  });
+});
 
 describe("CLI parser compatibility and V2 strictness", () => {
   it("preserves the complete legacy defaults and option behavior", () => {

@@ -405,9 +405,7 @@ function validateAppendCommand<T extends JsonValue>(
       payload: item.payload,
     };
   });
-  canonical(command.publicResponse);
-
-  const hashMaterial: JsonValue = {
+  const hashMaterial: Record<string, JsonValue> = {
     commandId: command.commandId,
     commandType: command.commandType,
     projectId: command.context.binding.projectId,
@@ -426,7 +424,12 @@ function validateAppendCommand<T extends JsonValue>(
     events: normalizedEvents,
     outbox: normalizedOutbox,
   };
-  const canonicalBytes = Buffer.byteLength(canonical(hashMaterial), "utf8");
+  const requestMaterial: JsonValue = {
+    ...hashMaterial,
+    idempotencyKey: command.idempotencyKey,
+    publicResponse: command.publicResponse,
+  };
+  const canonicalBytes = Buffer.byteLength(canonical(requestMaterial), "utf8");
   if (canonicalBytes > MAX_CANONICAL_COMMAND_BYTES) {
     throw new EventStoreError("COMMAND_TOO_LARGE");
   }

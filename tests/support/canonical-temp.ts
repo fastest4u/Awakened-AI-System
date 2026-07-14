@@ -1,7 +1,16 @@
-import { mkdtempSync, realpathSync } from "node:fs";
+import { mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
 export function canonicalMkdtemp(prefix: string): string {
-  return resolve(realpathSync.native(mkdtempSync(join(tmpdir(), prefix))));
+  const rawDirectory = mkdtempSync(join(tmpdir(), prefix));
+  try {
+    return resolve(realpathSync.native(rawDirectory));
+  } catch (error) {
+    try {
+      rmSync(rawDirectory, { recursive: true, force: true });
+    } finally {
+      throw error;
+    }
+  }
 }

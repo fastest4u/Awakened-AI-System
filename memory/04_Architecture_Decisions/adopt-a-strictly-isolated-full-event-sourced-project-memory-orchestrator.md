@@ -1,12 +1,12 @@
 ---
 title: Adopt a Strictly Isolated Full Event-Sourced Project Memory Orchestrator
 type: adr
-status: accepted
+status: superseded
 decision-date: "2026-07-11"
 confidence: high
 supersedes: []
 created: "2026-07-11"
-updated: "2026-07-11"
+updated: "2026-07-14"
 tags:
   - architecture
   - event-sourcing

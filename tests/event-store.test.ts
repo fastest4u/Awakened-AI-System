@@ -997,6 +997,27 @@ describe("EventStore", () => {
     }
   });
 
+  for (const field of ["publicResponse", "idempotencyKey"] as const) {
+    it(`rejects an oversized ${field} before opening a transaction`, () => {
+      const fixture = createFixture();
+      const base = appendCommand(fixture.context);
+      const oversized = "x".repeat(MAX_CANONICAL_COMMAND_BYTES + 1);
+      const command: AppendCommand<JsonValue> = field === "publicResponse"
+        ? { ...base, publicResponse: { text: oversized } }
+        : { ...base, idempotencyKey: oversized };
+
+      expectEventStoreError(() => fixture.store.append(command), "COMMAND_TOO_LARGE");
+      assert.equal(fixture.connection.beginCount, 0);
+      assert.deepEqual(counts(fixture.connection), {
+        streams: 0n,
+        branchScopes: 0n,
+        events: 0n,
+        outbox: 0n,
+        dedup: 0n,
+      });
+    });
+  }
+
   it("validates generated recorded times, generated event IDs, and exact bound workspace identity before BEGIN", () => {
     const invalidTime = createFixture({ now: () => "2026-02-30T00:00:00Z" });
     expectEventStoreError(

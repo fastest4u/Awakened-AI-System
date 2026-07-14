@@ -128,9 +128,9 @@ function json(value: unknown): JsonValue {
   }
   if (Array.isArray(value)) return array(value).map((item) => json(item));
   const source = record(value);
-  const result: Record<string, JsonValue> = {};
-  for (const [key, item] of Object.entries(source)) result[key] = json(item);
-  return result;
+  return Object.fromEntries(
+    Object.entries(source).map(([key, item]) => [key, json(item)]),
+  ) as Record<string, JsonValue>;
 }
 
 function stringArray(value: unknown): string[] {

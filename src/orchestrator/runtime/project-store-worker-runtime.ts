@@ -79,6 +79,44 @@ function safeError(error: unknown): SafeRuntimeError {
   return { code, details };
 }
 
+function sameMaintenanceLeaseWire(
+  left: MaintenanceLeaseWire,
+  right: MaintenanceLeaseWire,
+): boolean {
+  return left.epoch === right.epoch
+    && left.fencingToken === right.fencingToken
+    && left.ownerId === right.ownerId
+    && left.leaseExpiresAt === right.leaseExpiresAt;
+}
+
+function bindingAssertionFailure(
+  expected: WorkerBindingAssertion,
+  observed: WorkerBindingAssertion,
+): SafeRuntimeError | null {
+  if (observed.projectId !== expected.projectId) {
+    return { code: "PROJECT_ID_MISMATCH", details: {} };
+  }
+  if (observed.vaultId !== expected.vaultId) {
+    return { code: "VAULT_ID_MISMATCH", details: {} };
+  }
+  if (observed.storeId !== expected.storeId) {
+    return { code: "STORE_ID_MISMATCH", details: {} };
+  }
+  if (
+    observed.bindingGeneration !== expected.bindingGeneration
+    || observed.contextFingerprint !== expected.contextFingerprint
+  ) {
+    return {
+      code: "PROJECT_BINDING_REQUIRED",
+      details: {
+        staleGeneration: observed.bindingGeneration,
+        currentGeneration: expected.bindingGeneration,
+      },
+    };
+  }
+  return null;
+}
+
 export class ProjectStoreWorkerRuntime {
   readonly #backend: WorkerRuntimeBackend;
   readonly #port: WorkerRuntimePort;
@@ -89,6 +127,8 @@ export class ProjectStoreWorkerRuntime {
   #open = false;
   #closing = false;
   #quiescing = false;
+  #binding: WorkerBindingAssertion | null = null;
+  #observedQuiesce: { lease: MaintenanceLeaseWire; requestIds: string[] } | null = null;
   #heartbeatInFlight = false;
 
   constructor(options: ProjectStoreWorkerRuntimeOptions) {
@@ -113,7 +153,24 @@ export class ProjectStoreWorkerRuntime {
       this.stop();
       return;
     }
-    if (this.#closing || this.#quiescing) {
+    if (this.#closing) {
+      this.postFailure(request.id, { code: "MAINTENANCE_QUIESCING", details: {} });
+      return;
+    }
+    if (this.#quiescing) {
+      if (request.type === "quiesce" && this.#observedQuiesce !== null) {
+        const bindingFailure = this.#binding === null
+          ? { code: "PROJECT_BINDING_REQUIRED", details: {} }
+          : bindingAssertionFailure(this.#binding, request.binding);
+        if (bindingFailure !== null) {
+          this.postFailure(request.id, bindingFailure);
+        } else if (sameMaintenanceLeaseWire(request.lease, this.#observedQuiesce.lease)) {
+          this.#observedQuiesce.requestIds.push(request.id);
+        } else {
+          this.postFailure(request.id, { code: "MAINTENANCE_QUIESCING", details: {} });
+        }
+        return;
+      }
       this.postFailure(request.id, { code: "MAINTENANCE_QUIESCING", details: {} });
       return;
     }
@@ -170,6 +227,13 @@ export class ProjectStoreWorkerRuntime {
       const data = await this.#backend.dispatch(request);
       this.#port.postMessage({ id: request.id, ok: true, data });
       if (request.type === "open") {
+        this.#binding = {
+          projectId: request.binding.projectId,
+          vaultId: request.binding.vaultId,
+          storeId: request.binding.storeId,
+          bindingGeneration: request.binding.bindingGeneration,
+          contextFingerprint: request.binding.contextFingerprint,
+        };
         this.#open = true;
         this.startHeartbeat();
       }
@@ -209,11 +273,24 @@ export class ProjectStoreWorkerRuntime {
   private beginObservedQuiesce(lease: MaintenanceLeaseWire): void {
     if (this.#quiescing || this.#closing) return;
     this.#quiescing = true;
+    const observed = { lease, requestIds: [] as string[] };
+    this.#observedQuiesce = observed;
     this.clearHeartbeat();
     const accepted = this.#fifo;
     void accepted.then(async () => {
       try {
         const closed = await this.#backend.quiesceObservedAndClose(lease);
+        for (const id of observed.requestIds) {
+          this.#port.postMessage({
+            id,
+            ok: true,
+            data: {
+              quiesced: true,
+              epoch: closed.epoch,
+              connectionClosed: true,
+            },
+          });
+        }
         this.#port.postMessage({
           type: "quiesced",
           executorId: closed.executorId,
@@ -223,6 +300,9 @@ export class ProjectStoreWorkerRuntime {
           leaseExpiresAt: lease.leaseExpiresAt,
           connectionClosed: true,
         });
+      } catch (error) {
+        const failure = safeError(error);
+        for (const id of observed.requestIds) this.postFailure(id, failure);
       } finally {
         this.#closing = true;
         this.#port.close();

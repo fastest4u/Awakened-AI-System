@@ -476,6 +476,24 @@ describe("worker protocol", () => {
     );
   });
 
+  it("preserves own __proto__ keys in JSON payloads across the worker boundary", () => {
+    const context = contextFixture();
+    const payload = JSON.parse('{"__proto__":{"polluted":true},"kept":1}') as JsonValue;
+    const command = appendCommand(context) as AppendCommand<JsonValue>;
+    command.events[0] = { ...command.events[0]!, payload };
+
+    const encoded = encodeAppendCommandWire(command);
+    const encodedPayload = encoded.events[0]!.payload;
+    assert.equal(typeof encodedPayload, "object");
+    assert.notEqual(encodedPayload, null);
+    assert.equal(Object.hasOwn(encodedPayload as object, "__proto__"), true);
+    assert.deepEqual((encodedPayload as Record<string, JsonValue>).__proto__, { polluted: true });
+
+    const decoded = decodeAppendCommandWire(encoded, context);
+    assert.equal(Object.hasOwn(decoded.events[0]!.payload as object, "__proto__"), true);
+    assert.deepEqual(decoded.events[0]!.payload, payload);
+  });
+
   it("maps the complete revalidated ProjectContext losslessly", () => {
     const context = contextFixture();
     const encoded = workerBinding(context);
@@ -680,6 +698,111 @@ describe("ProjectStoreExecutor bounded lifecycle", () => {
     assert.equal(ownerCalls, 1);
     assert.equal(outcome, "resolved");
     assert.equal(readyAfterOwnerConfirmation, true);
+  });
+
+  it("joins close to an in-flight explicit quiesce without posting a second lifecycle request", async () => {
+    let ownerCalls = 0;
+    const { executor, worker } = await fakeExecutor({}, {
+      confirmMaintenanceClosure: async () => { ownerCalls += 1; },
+    });
+    const lease = {
+      epoch: 41n,
+      fencingToken: 41n,
+      ownerId: "maintenance-owner",
+      leaseExpiresAt: "2026-07-14T23:59:59.000Z",
+    };
+
+    const quiescing = executor.quiesce(lease);
+    const closing = executor.close();
+    assert.equal(closing, quiescing);
+    const request = worker.posted.at(-1)!;
+    assert.equal(request.type, "quiesce");
+    worker.respond(request, {
+      quiesced: true,
+      epoch: lease.epoch.toString(),
+      connectionClosed: true,
+    });
+    worker.emit("message", {
+      type: "quiesced",
+      executorId: openResult(contextFixture()).executorId,
+      epoch: lease.epoch.toString(),
+      fencingToken: lease.fencingToken.toString(),
+      ownerId: lease.ownerId,
+      leaseExpiresAt: lease.leaseExpiresAt,
+      connectionClosed: true,
+    });
+    await turn();
+    worker.emit("exit", 0);
+
+    const outcomes = await Promise.allSettled([quiescing, closing]);
+    assert.deepEqual(worker.posted.map((posted) => posted.type), ["open", "quiesce"]);
+    assert.deepEqual(outcomes.map((outcome) => outcome.status), ["fulfilled", "fulfilled"]);
+    assert.equal(ownerCalls, 1);
+  });
+
+  it("accepts matching autonomous quiesce evidence after a maintenance-quiescing response", async () => {
+    let ownerCalls = 0;
+    const { executor, worker, context } = await fakeExecutor({}, {
+      confirmMaintenanceClosure: async () => { ownerCalls += 1; },
+    });
+    const opened = openResult(context);
+    const lease = {
+      epoch: 42n,
+      fencingToken: 42n,
+      ownerId: "maintenance-owner",
+      leaseExpiresAt: "2026-07-14T23:59:59.000Z",
+    };
+
+    const quiescing = executor.quiesce(lease);
+    const request = worker.posted.at(-1)!;
+    worker.fail(request, "MAINTENANCE_QUIESCING");
+    worker.emit("message", {
+      type: "quiesced",
+      executorId: opened.executorId,
+      epoch: lease.epoch.toString(),
+      fencingToken: lease.fencingToken.toString(),
+      ownerId: lease.ownerId,
+      leaseExpiresAt: lease.leaseExpiresAt,
+      connectionClosed: true,
+    });
+    worker.emit("exit", 0);
+
+    await quiescing;
+    assert.equal(ownerCalls, 1);
+    assert.equal(worker.terminateCalls, 0);
+  });
+
+  it("bounds a maintenance-quiescing response when no closure evidence arrives", async () => {
+    const { executor, worker, scheduler } = await fakeExecutor();
+    const lease = {
+      epoch: 44n,
+      fencingToken: 44n,
+      ownerId: "maintenance-owner",
+      leaseExpiresAt: "2026-07-14T23:59:59.000Z",
+    };
+    const quiescing = executor.quiesce(lease);
+    const closing = executor.close();
+    const request = worker.posted.at(-1)!;
+    worker.fail(request, "MAINTENANCE_QUIESCING");
+    await turn();
+
+    let deadlineRan = false;
+    try {
+      scheduler.runNext();
+      deadlineRan = true;
+    } catch {
+      worker.emit("exit", 1);
+    }
+    const outcomes = await Promise.all([quiescing, closing].map(async (operation) => (
+      operation.then(
+        () => "resolved",
+        (error: unknown) => error instanceof ProjectStoreWorkerError ? error.code : "unknown",
+      )
+    )));
+
+    assert.equal(deadlineRan, true);
+    assert.deepEqual(outcomes, ["WORKER_TIMEOUT", "WORKER_TIMEOUT"]);
+    assert.equal(worker.terminateCalls, 1);
   });
 
   it("fails closed after worker exit when no maintenance owner callback exists", async () => {
@@ -1673,6 +1796,45 @@ describe("ProjectStoreExecutor bounded lifecycle", () => {
     await registry.acquire({ ...options, context: reboundStore });
     assert.equal(workers.length, 3);
   });
+
+  it("serializes concurrent rebind acquisition to one executor per canonical store", async () => {
+    const context = contextFixture();
+    writeFileSync(context.binding.storeRoute.eventsPath, "fixture", "utf8");
+    const rebound: ProjectContext = {
+      ...context,
+      binding: {
+        ...context.binding,
+        generation: context.binding.generation + 1,
+        contextFingerprint: "e".repeat(64),
+      },
+    };
+    const workers: FakeWorker[] = [];
+    const registry = new ProjectStoreExecutorRegistry({
+      workerFactory: () => {
+        const worker = new FakeWorker();
+        workers.push(worker);
+        return worker;
+      },
+    });
+    const options = {
+      workerUrl: WORKER_URL,
+      context,
+      maxPending: DEFAULT_MAX_PENDING,
+      requestTimeoutMs: 10_000,
+      closeTimeoutMs: 5_000,
+      executorLeaseMs: 15_000,
+      heartbeatIntervalMs: 5_000,
+    };
+    await registry.acquire(options);
+
+    const [first, second] = await Promise.all([
+      registry.acquire({ ...options, context: rebound }),
+      registry.acquire({ ...options, context: rebound }),
+    ]);
+
+    assert.equal(first, second);
+    assert.equal(workers.length, 2);
+  });
 });
 
 describe("primary SQLite busy retry", () => {
@@ -1793,6 +1955,116 @@ describe("primary SQLite busy retry", () => {
 });
 
 describe("ProjectStoreWorkerRuntime FIFO and heartbeat", () => {
+  it("coalesces a matching explicit quiesce after heartbeat observation", async () => {
+    const context = contextFixture();
+    const observedClose = deferred<{
+      executorId: string;
+      epoch: string;
+      fencingToken: string;
+    }>();
+    const posted: unknown[] = [];
+    let heartbeat: (() => void) | undefined;
+    let explicitCalls = 0;
+    const lease = {
+      epoch: "43",
+      fencingToken: "43",
+      ownerId: "maintenance-owner",
+      leaseExpiresAt: "2026-07-14T23:59:59.000Z",
+    };
+    const runtime = new ProjectStoreWorkerRuntime({
+      backend: {
+        async dispatch(request) {
+          if (request.type === "open") return openResult(context);
+          return { closed: true };
+        },
+        async heartbeat() { return { mode: "quiescing", lease }; },
+        async quiesceAndClose() {
+          explicitCalls += 1;
+          throw new Error("matching explicit quiesce must join observed closure");
+        },
+        async quiesceObservedAndClose() { return observedClose.promise; },
+        async close() {},
+      },
+      port: { postMessage(value) { posted.push(value); }, close() {} },
+      scheduler: {
+        setInterval(callback) { heartbeat = callback; return {}; },
+        clearInterval() {},
+      },
+      heartbeatIntervalMs: 5_000,
+    });
+    runtime.receive({ id: "open", type: "open", binding: workerBinding(context) });
+    await turn();
+    heartbeat?.();
+    await turn();
+
+    const binding = encodeWorkerBindingAssertion(context);
+    const mismatches = [
+      {
+        id: "foreign-project",
+        code: "PROJECT_ID_MISMATCH",
+        binding: { ...binding, projectId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" },
+      },
+      {
+        id: "foreign-vault",
+        code: "VAULT_ID_MISMATCH",
+        binding: { ...binding, vaultId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb" },
+      },
+      {
+        id: "foreign-store",
+        code: "STORE_ID_MISMATCH",
+        binding: { ...binding, storeId: "cccccccc-cccc-4ccc-8ccc-cccccccccccc" },
+      },
+      {
+        id: "stale-binding",
+        code: "PROJECT_BINDING_REQUIRED",
+        binding: {
+          ...binding,
+          bindingGeneration: binding.bindingGeneration + 1,
+          contextFingerprint: "e".repeat(64),
+        },
+      },
+    ];
+    for (const mismatch of mismatches) {
+      runtime.receive({
+        id: mismatch.id,
+        type: "quiesce",
+        binding: mismatch.binding,
+        lease,
+      });
+    }
+    for (const mismatch of mismatches) {
+      const response = posted.find(
+        (value) => (value as { id?: string }).id === mismatch.id,
+      ) as { ok?: boolean; error?: { code?: string } } | undefined;
+      assert.equal(response?.ok, false, mismatch.id);
+      assert.equal(response?.error?.code, mismatch.code, mismatch.id);
+    }
+
+    runtime.receive({
+      id: "explicit",
+      type: "quiesce",
+      binding: encodeWorkerBindingAssertion(context),
+      lease,
+    });
+    observedClose.resolve({
+      executorId: openResult(context).executorId,
+      epoch: lease.epoch,
+      fencingToken: lease.fencingToken,
+    });
+    await turn();
+    await turn();
+
+    const response = posted.find(
+      (value) => (value as { id?: string }).id === "explicit",
+    ) as { ok?: boolean; data?: { quiesced?: boolean } } | undefined;
+    assert.equal(response?.ok, true);
+    assert.equal(response?.data?.quiesced, true);
+    assert.equal(explicitCalls, 0);
+    assert.equal(posted.some(
+      (value) => (value as { type?: string }).type === "quiesced",
+    ), true);
+  });
+
   it("keeps heartbeat responsive during stalled full integrity and closes every handle before notification", async () => {
     const context = contextFixture();
     const full = deferred<WorkerSuccessData>();

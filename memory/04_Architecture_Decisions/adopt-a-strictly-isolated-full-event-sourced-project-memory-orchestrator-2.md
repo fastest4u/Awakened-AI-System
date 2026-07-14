@@ -1,12 +1,13 @@
 ---
-title: Adopt a Strictly Isolated Full Event-Sourced Project Memory Orchestrator
+title: Revise the Strictly Isolated Full Event-Sourced Project Memory Orchestrator for WAL-Safe Runtimes
 type: adr
 status: accepted
 decision-date: "2026-07-11"
 confidence: high
-supersedes: []
+supersedes:
+  - 04_Architecture_Decisions/adopt-a-strictly-isolated-full-event-sourced-project-memory-orchestrator.md
 created: "2026-07-11"
-updated: "2026-07-11"
+updated: "2026-07-14"
 tags:
   - architecture
   - event-sourcing
