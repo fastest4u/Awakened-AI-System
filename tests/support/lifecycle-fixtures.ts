@@ -47,6 +47,7 @@ export const WORKFLOW_ID = lifecycleUuid<WorkflowId>(20);
 export const CHECKPOINT_ID = lifecycleUuid<CheckpointId>(30);
 export const REPORT_ID = lifecycleUuid<ReportId>(40);
 export const REPORT_ITEM_ID = lifecycleUuid<ReportItemId>(41);
+export const SECOND_REPORT_ITEM_ID = lifecycleUuid<ReportItemId>(42);
 export const TRANSFER_TICKET_ID = lifecycleUuid<TransferTicketId>(50);
 export const APPROVAL_ID = lifecycleUuid<ApprovalId>(60);
 export const VALIDATION_RESULT_ID = lifecycleUuid<ValidationResultId>(70);
@@ -159,12 +160,20 @@ export interface ChildReportFixtureOptions {
   readonly childSessionId?: SessionId;
   readonly parentSessionId?: SessionId;
   readonly assignmentId?: string;
+  readonly itemIds?: readonly [ReportItemId, ReportItemId];
 }
 
 export function childReportFixture(options: ChildReportFixtureOptions = {}): ChildReportV1 {
-  const item = Object.freeze({
-    itemId: REPORT_ITEM_ID,
+  const itemIds = options.itemIds ?? [REPORT_ITEM_ID, SECOND_REPORT_ITEM_ID];
+  const finding = Object.freeze({
+    itemId: itemIds[0],
     summary: "Deterministic finding",
+    evidenceReferences: Object.freeze(["evidence:coverage-only"]),
+    confidence: "high" as const,
+  });
+  const proposedDecision = Object.freeze({
+    itemId: itemIds[1],
+    summary: "Deterministic proposed decision",
     evidenceReferences: Object.freeze(["evidence:coverage-only"]),
     confidence: "high" as const,
   });
@@ -176,14 +185,14 @@ export function childReportFixture(options: ChildReportFixtureOptions = {}): Chi
     assignmentId: options.assignmentId ?? DEFAULT_ASSIGNMENT.assignmentId,
     createdAt: lifecycleTimestamp(3),
     outcomeSummary: "Deterministic child result",
-    findings: Object.freeze([item]),
-    proposedDecisions: Object.freeze([]),
+    findings: Object.freeze([finding]),
+    proposedDecisions: Object.freeze([proposedDecision]),
     filesObservedOrChanged: Object.freeze([]),
     verificationPerformed: Object.freeze([]),
     openFollowUps: Object.freeze([]),
     blockers: Object.freeze([]),
     evidenceFingerprints: Object.freeze([]),
-    allReportItemIds: Object.freeze([REPORT_ITEM_ID]),
+    allReportItemIds: Object.freeze([...itemIds]),
   });
 }
 
@@ -191,11 +200,14 @@ export function childDispositionFixture(
   kind: ChildDispositionV1["kind"] = "accepted",
   reportId: ReportId = REPORT_ID,
 ): ChildDispositionV1 {
-  const accepted = kind === "accepted" || kind === "partially-accepted"
-    ? Object.freeze([REPORT_ITEM_ID])
+  const allReportItemIds = Object.freeze([REPORT_ITEM_ID, SECOND_REPORT_ITEM_ID]);
+  const accepted = kind === "accepted"
+    ? allReportItemIds
+    : kind === "partially-accepted"
+      ? Object.freeze([REPORT_ITEM_ID])
     : Object.freeze([] as ReportItemId[]);
   const rejected = kind === "rejected" || kind === "superseded"
-    ? Object.freeze([REPORT_ITEM_ID])
+    ? allReportItemIds
     : Object.freeze([] as ReportItemId[]);
   return Object.freeze({
     dispositionVersion: 1,
@@ -204,13 +216,11 @@ export function childDispositionFixture(
     acceptedItemIds: accepted,
     rejectedItemIds: rejected,
     deferredItemIds: kind === "partially-accepted"
-      ? Object.freeze([lifecycleUuid<ReportItemId>(42)])
+      ? Object.freeze([SECOND_REPORT_ITEM_ID])
       : Object.freeze([]),
     supersededByReportId: kind === "superseded" ? lifecycleUuid<ReportId>(43) : null,
     explanation: `Fixture disposition: ${kind}`,
-    allReportItemIds: kind === "partially-accepted"
-      ? Object.freeze([REPORT_ITEM_ID, lifecycleUuid<ReportItemId>(42)])
-      : Object.freeze([REPORT_ITEM_ID]),
+    allReportItemIds,
   });
 }
 

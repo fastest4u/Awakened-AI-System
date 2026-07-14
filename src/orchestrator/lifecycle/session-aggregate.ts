@@ -9,6 +9,7 @@ import type {
   CheckpointId,
   ChildSessionState,
   ReportId,
+  ReportItemId,
   RootSessionState,
   SessionId,
   TransferTicketId,
@@ -28,7 +29,12 @@ function childStates(...states: ChildSessionState[]): readonly ChildSessionState
   return Object.freeze(states);
 }
 
-const ROOT_TRANSITIONS: Readonly<Partial<Record<LifecycleEventType, readonly RootSessionState[]>>> = Object.freeze({
+type SessionTransitionTable<State extends string> = Readonly<
+  Record<LifecycleEventType, readonly State[]>
+>;
+
+const ROOT_TRANSITIONS = Object.freeze({
+  SessionStarted: rootStates(),
   SessionOwnerTransferred: rootStates("active", "suspended"),
   SessionOwnershipRecovered: rootStates("active", "suspended", "ending"),
   SessionSuspendRequested: rootStates("active"),
@@ -36,6 +42,15 @@ const ROOT_TRANSITIONS: Readonly<Partial<Record<LifecycleEventType, readonly Roo
   SessionResumed: rootStates("suspended"),
   SessionCheckpointRecorded: rootStates("active", "suspended", "ending"),
   EvidenceCoverageRecorded: rootStates("active", "suspended", "ending"),
+  SessionForked: rootStates(),
+  ChildAssignmentAmended: rootStates(),
+  ChildWorkReported: rootStates(),
+  ChildWorkDispositioned: rootStates(),
+  ChildCompletionProposed: rootStates(),
+  ChildSessionCompleted: rootStates(),
+  ChildSessionSuspended: rootStates(),
+  ChildWorkTransferCreated: rootStates(),
+  ChildWorkTransferClaimed: rootStates(),
   SessionEndRequested: rootStates("active", "suspended"),
   SessionEndAmended: rootStates("ending"),
   SessionValidationResultRecorded: rootStates("ending"),
@@ -45,11 +60,18 @@ const ROOT_TRANSITIONS: Readonly<Partial<Record<LifecycleEventType, readonly Roo
   SessionEndCancelled: rootStates("ending"),
   SessionAbandoned: rootStates("active", "suspended", "ending"),
   SessionEnded: rootStates("ending"),
-});
+}) satisfies SessionTransitionTable<RootSessionState>;
 
-const CHILD_TRANSITIONS: Readonly<Partial<Record<LifecycleEventType, readonly ChildSessionState[]>>> = Object.freeze({
+const CHILD_TRANSITIONS = Object.freeze({
+  SessionStarted: childStates(),
+  SessionOwnerTransferred: childStates(),
+  SessionOwnershipRecovered: childStates(),
+  SessionSuspendRequested: childStates(),
+  SessionSuspended: childStates(),
+  SessionResumed: childStates(),
   SessionCheckpointRecorded: childStates("active", "completion-proposed", "suspended"),
   EvidenceCoverageRecorded: childStates("active", "completion-proposed", "suspended"),
+  SessionForked: childStates(),
   ChildAssignmentAmended: childStates("active", "completion-proposed", "suspended"),
   ChildWorkReported: childStates("active", "completion-proposed", "suspended"),
   ChildWorkDispositioned: childStates("active", "completion-proposed"),
@@ -58,7 +80,16 @@ const CHILD_TRANSITIONS: Readonly<Partial<Record<LifecycleEventType, readonly Ch
   ChildSessionSuspended: childStates("active", "completion-proposed"),
   ChildWorkTransferCreated: childStates("suspended"),
   ChildWorkTransferClaimed: childStates("active"),
-});
+  SessionEndRequested: childStates(),
+  SessionEndAmended: childStates(),
+  SessionValidationResultRecorded: childStates(),
+  SessionEndVerificationPassed: childStates(),
+  SessionEndVerificationFailed: childStates(),
+  SessionEndVerificationInvalidated: childStates(),
+  SessionEndCancelled: childStates(),
+  SessionAbandoned: childStates(),
+  SessionEnded: childStates(),
+}) satisfies SessionTransitionTable<ChildSessionState>;
 
 const AUTHORITY_MUTATING_EVENTS = new Set<LifecycleEventType>([
   "SessionStarted",
@@ -78,6 +109,8 @@ export type TerminalLifecycleEventType =
   | "SessionEnded"
   | "ChildSessionCompleted"
   | "ChildWorkTransferCreated";
+
+export type EndVerificationState = "none" | "pending" | "passed" | "locked";
 
 interface AggregateBase {
   readonly projectId: ProjectId;
@@ -107,6 +140,7 @@ export interface RootAggregateState extends AggregateBase {
   readonly endWorkflowId: WorkflowId | null;
   readonly endWorkflowGeneration: number | null;
   readonly endPreviousState: "active" | "suspended" | null;
+  readonly endVerificationState: EndVerificationState;
   readonly verificationPassedEventPosition: bigint | null;
 }
 
@@ -122,8 +156,15 @@ export interface ChildAggregateState extends AggregateBase {
   readonly assignmentRevision: number;
   readonly sourceTransferTicketId: TransferTicketId | null;
   readonly claimedTransferTicketId: TransferTicketId | null;
+  readonly suspensionCheckpointId: CheckpointId | null;
   readonly latestReportId: ReportId | null;
+  readonly reportLineage: readonly ChildReportLineage[];
   readonly completionReportId: ReportId | null;
+}
+
+export interface ChildReportLineage {
+  readonly reportId: ReportId;
+  readonly allReportItemIds: readonly ReportItemId[];
 }
 
 export type SessionAggregateState = RootAggregateState | ChildAggregateState;
@@ -244,6 +285,7 @@ function initializeSession(event: LifecycleEventV1): SessionAggregateState {
       endWorkflowId: null,
       endWorkflowGeneration: null,
       endPreviousState: null,
+      endVerificationState: "none",
       verificationPassedEventPosition: null,
     });
   }
@@ -251,6 +293,7 @@ function initializeSession(event: LifecycleEventV1): SessionAggregateState {
   if (event.eventType === "SessionForked") {
     if (
       event.parentSessionId === null
+      || event.parentSessionId === event.sessionId
       || event.payload.parentSessionId !== event.parentSessionId
       || event.payload.rootOwnerGeneration < 1
     ) integrity();
@@ -267,7 +310,9 @@ function initializeSession(event: LifecycleEventV1): SessionAggregateState {
       assignmentRevision: 1,
       sourceTransferTicketId: event.payload.sourceTransferTicketId,
       claimedTransferTicketId: null,
+      suspensionCheckpointId: null,
       latestReportId: null,
+      reportLineage: Object.freeze([]),
       completionReportId: null,
     });
   }
@@ -295,12 +340,32 @@ function assertContinuationEnvelope(
   return positions;
 }
 
+export function isSessionTransitionAllowed(
+  kind: "root",
+  state: RootSessionState,
+  eventType: LifecycleEventType,
+): boolean;
+export function isSessionTransitionAllowed(
+  kind: "child",
+  state: ChildSessionState,
+  eventType: LifecycleEventType,
+): boolean;
+export function isSessionTransitionAllowed(
+  kind: "root" | "child",
+  state: RootSessionState | ChildSessionState,
+  eventType: LifecycleEventType,
+): boolean {
+  return kind === "root"
+    ? ROOT_TRANSITIONS[eventType].includes(state as RootSessionState)
+    : CHILD_TRANSITIONS[eventType].includes(state as ChildSessionState);
+}
+
 function isAllowedRootTransition(state: RootAggregateState, eventType: LifecycleEventType): boolean {
-  return ROOT_TRANSITIONS[eventType]?.includes(state.state) === true;
+  return isSessionTransitionAllowed("root", state.state, eventType);
 }
 
 function isAllowedChildTransition(state: ChildAggregateState, eventType: LifecycleEventType): boolean {
-  return CHILD_TRANSITIONS[eventType]?.includes(state.state) === true;
+  return isSessionTransitionAllowed("child", state.state, eventType);
 }
 
 function withRootEvent(
@@ -348,6 +413,7 @@ function checkpointChanges(
   const checkpoint = event.payload.checkpoint;
   if (
     checkpointEventPosition !== eventPosition
+    || baseEventPosition < state.eventPosition
     || baseEventPosition >= checkpointEventPosition
     || checkpoint.sessionId !== state.sessionId
     || checkpoint.parentSessionId !== state.parentSessionId
@@ -383,6 +449,25 @@ function assertWorkflow(
   ) integrity();
 }
 
+function reportLineage(
+  state: ChildAggregateState,
+  reportId: ReportId,
+): ChildReportLineage | null {
+  return state.reportLineage.find((report) => report.reportId === reportId) ?? null;
+}
+
+function sameReportItemSet(
+  left: readonly ReportItemId[],
+  right: readonly ReportItemId[],
+): boolean {
+  if (left.length !== right.length) return false;
+  const leftSet = new Set<ReportItemId>(left);
+  const rightSet = new Set<ReportItemId>(right);
+  return leftSet.size === left.length
+    && rightSet.size === right.length
+    && left.every((itemId) => rightSet.has(itemId));
+}
+
 function evolveRoot(
   state: RootAggregateState,
   event: LifecycleEventV1,
@@ -408,11 +493,19 @@ function evolveRoot(
         ownerGeneration: event.payload.ownerGeneration,
       });
     case "SessionSuspendRequested":
+      if (
+        state.latestCheckpointId === null
+        || event.payload.checkpointId !== state.latestCheckpointId
+        || state.suspendRequestedCheckpointId !== null
+      ) integrity();
       return withRootEvent(state, event, streamVersion, eventPosition, {
         suspendRequestedCheckpointId: event.payload.checkpointId,
       });
     case "SessionSuspended":
-      if (state.suspendRequestedCheckpointId === null) integrity();
+      if (
+        state.suspendRequestedCheckpointId === null
+        || state.suspendRequestedCheckpointId !== state.latestCheckpointId
+      ) integrity();
       return withRootEvent(state, event, streamVersion, eventPosition, {
         state: "suspended",
         suspendRequestedCheckpointId: null,
@@ -448,6 +541,7 @@ function evolveRoot(
         endWorkflowId: event.payload.workflowId,
         endWorkflowGeneration: event.payload.workflowGeneration,
         endPreviousState: event.payload.previousState,
+        endVerificationState: "pending",
         verificationPassedEventPosition: null,
       });
     }
@@ -456,6 +550,7 @@ function evolveRoot(
       if (event.payload.workflowGeneration !== event.payload.previousWorkflowGeneration + 1) integrity();
       return withRootEvent(state, event, streamVersion, eventPosition, {
         endWorkflowGeneration: event.payload.workflowGeneration,
+        endVerificationState: "pending",
         verificationPassedEventPosition: null,
       });
     case "SessionValidationResultRecorded":
@@ -472,12 +567,16 @@ function evolveRoot(
       return withRootEvent(state, event, streamVersion, eventPosition, {});
     case "SessionEndVerificationPassed":
       assertWorkflow(state, event.payload.workflowId, event.payload.workflowGeneration);
+      if (state.endVerificationState !== "pending") integrity();
       return withRootEvent(state, event, streamVersion, eventPosition, {
+        endVerificationState: "passed",
         verificationPassedEventPosition: eventPosition,
       });
     case "SessionEndVerificationFailed":
       assertWorkflow(state, event.payload.workflowId, event.payload.workflowGeneration);
+      if (state.endVerificationState !== "pending") integrity();
       return withRootEvent(state, event, streamVersion, eventPosition, {
+        endVerificationState: "locked",
         verificationPassedEventPosition: null,
       });
     case "SessionEndVerificationInvalidated": {
@@ -487,11 +586,13 @@ function evolveRoot(
         false,
       );
       if (
-        state.verificationPassedEventPosition === null
+        state.endVerificationState !== "passed"
+        || state.verificationPassedEventPosition === null
         || previousVerificationPosition !== state.verificationPassedEventPosition
         || previousVerificationPosition >= eventPosition
       ) integrity();
       return withRootEvent(state, event, streamVersion, eventPosition, {
+        endVerificationState: "locked",
         verificationPassedEventPosition: null,
       });
     }
@@ -501,6 +602,7 @@ function evolveRoot(
       return withRootEvent(state, event, streamVersion, eventPosition, {
         state: event.payload.restoredState,
         suspendRequestedCheckpointId: null,
+        endVerificationState: "none",
         verificationPassedEventPosition: null,
       });
     case "SessionAbandoned":
@@ -513,6 +615,7 @@ function evolveRoot(
       return withRootEvent(state, event, streamVersion, eventPosition, {
         state: "abandoned",
         suspendRequestedCheckpointId: null,
+        endVerificationState: "none",
         verificationPassedEventPosition: null,
         terminalEventPosition: eventPosition,
         terminalEventType: "SessionAbandoned",
@@ -521,7 +624,8 @@ function evolveRoot(
       assertWorkflow(state, event.payload.workflowId, event.payload.workflowGeneration);
       const verificationEventPosition = decimalPosition(event.payload.verificationEventPosition, false);
       if (
-        state.verificationPassedEventPosition === null
+        state.endVerificationState !== "passed"
+        || state.verificationPassedEventPosition === null
         || verificationEventPosition !== state.verificationPassedEventPosition
         || verificationEventPosition >= eventPosition
       ) integrity();
@@ -570,12 +674,29 @@ function evolveChild(
         event.payload.report.childSessionId !== state.sessionId
         || event.payload.report.parentSessionId !== state.parentSessionId
         || event.payload.report.assignmentId !== state.assignment.assignmentId
+        || reportLineage(state, event.payload.report.reportId) !== null
       ) integrity();
-      return withChildEvent(state, event, streamVersion, eventPosition, {
-        latestReportId: event.payload.report.reportId,
-      });
+      {
+        const itemIds = Object.freeze([...event.payload.report.allReportItemIds]);
+        if (new Set(itemIds).size !== itemIds.length) integrity();
+        const nextLineage = Object.freeze({
+          reportId: event.payload.report.reportId,
+          allReportItemIds: itemIds,
+        });
+        return withChildEvent(state, event, streamVersion, eventPosition, {
+          latestReportId: event.payload.report.reportId,
+          reportLineage: Object.freeze([...state.reportLineage, nextLineage]),
+        });
+      }
     case "ChildWorkDispositioned": {
-      if (state.latestReportId === null || event.payload.disposition.reportId !== state.latestReportId) integrity();
+      const referencedReport = reportLineage(state, event.payload.disposition.reportId);
+      if (
+        referencedReport === null
+        || !sameReportItemSet(
+          referencedReport.allReportItemIds,
+          event.payload.disposition.allReportItemIds,
+        )
+      ) integrity();
       const rejectedProposal = state.state === "completion-proposed"
         && event.payload.disposition.kind === "rejected"
         && state.completionReportId === event.payload.disposition.reportId;
@@ -584,15 +705,14 @@ function evolveChild(
         : {});
     }
     case "ChildCompletionProposed":
-      if (state.latestReportId === null || event.payload.reportId !== state.latestReportId) integrity();
+      if (reportLineage(state, event.payload.reportId) === null) integrity();
       return withChildEvent(state, event, streamVersion, eventPosition, {
         state: "completion-proposed",
         completionReportId: event.payload.reportId,
       });
     case "ChildSessionCompleted":
       if (
-        state.latestReportId === null
-        || event.payload.reportId !== state.latestReportId
+        reportLineage(state, event.payload.reportId) === null
         || (
           state.state === "completion-proposed"
           && state.completionReportId !== event.payload.reportId
@@ -605,11 +725,20 @@ function evolveChild(
         terminalEventType: "ChildSessionCompleted",
       });
     case "ChildSessionSuspended":
+      if (
+        state.latestCheckpointId === null
+        || event.payload.checkpointId !== state.latestCheckpointId
+      ) integrity();
       return withChildEvent(state, event, streamVersion, eventPosition, {
         state: "suspended",
         childCapabilityRevoked: true,
+        suspensionCheckpointId: event.payload.checkpointId,
       });
     case "ChildWorkTransferCreated":
+      if (
+        state.suspensionCheckpointId === null
+        || event.payload.checkpointId !== state.suspensionCheckpointId
+      ) integrity();
       return withChildEvent(state, event, streamVersion, eventPosition, {
         state: "transferred",
         childCapabilityRevoked: true,
@@ -625,7 +754,7 @@ function evolveChild(
         || event.payload.transferTicketId !== state.sourceTransferTicketId
         || event.payload.previousChildSessionId === state.sessionId
         || event.payload.previousChildSessionId === state.parentSessionId
-        || previousTransferPosition >= eventPosition
+        || previousTransferPosition >= state.eventPosition
       ) integrity();
       return withChildEvent(state, event, streamVersion, eventPosition, {
         claimedTransferTicketId: event.payload.transferTicketId,
