@@ -1,4 +1,5 @@
 import { isAbsolute, win32 } from "node:path";
+import type { WorkspaceId } from "../../identity/contracts.js";
 import {
   exactRecord,
   parseBoundedString,
@@ -104,7 +105,7 @@ export interface CheckpointMaterialClaimV1 {
 
 export interface SourceStateFingerprintV1 {
   readonly sourceStateScopeVersion: 1;
-  readonly workspaceId: string;
+  readonly workspaceId: WorkspaceId;
   readonly branchRef: string | null;
   readonly headCommit: string | null;
   readonly dirtyWorktreeFingerprint: string;
@@ -307,7 +308,7 @@ function sourceState(value: unknown): SourceStateFingerprintV1 {
   }
   return Object.freeze({
     sourceStateScopeVersion: 1,
-    workspaceId: parseBoundedString(state.workspaceId, "sourceState.workspaceId", 256),
+    workspaceId: hash(state.workspaceId, "sourceState.workspaceId") as WorkspaceId,
     branchRef: parseNullableBoundedString(state.branchRef, "sourceState.branchRef", 1_024),
     headCommit: headCommit as string | null,
     dirtyWorktreeFingerprint: hash(state.dirtyWorktreeFingerprint, "sourceState.dirtyWorktreeFingerprint") as string,
@@ -471,7 +472,11 @@ export function decodeCheckpointV1(value: unknown): CheckpointV1 {
     checkpointEventPosition,
     createdAt: parseCanonicalTimestamp(checkpoint.createdAt, "createdAt"),
     creatorAgentId: parseBoundedString(checkpoint.creatorAgentId, "creatorAgentId", 256),
-    creatorClientInstanceId: parseLifecycleId(checkpoint.creatorClientInstanceId, "creatorClientInstanceId"),
+    creatorClientInstanceId: parseBoundedString(
+      checkpoint.creatorClientInstanceId,
+      "creatorClientInstanceId",
+      256,
+    ),
     ...content,
     sourceState: sourceState(checkpoint.sourceState),
     childSummaries: boundedArray(checkpoint.childSummaries, "childSummaries", CHECKPOINT_MAX_MATERIAL_ENTRIES, childSummary),

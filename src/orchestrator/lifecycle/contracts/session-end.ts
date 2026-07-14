@@ -205,7 +205,7 @@ function decodeValidationSourceState(
   ) validationResultInvalid();
   return Object.freeze({
     sourceStateScopeVersion: 1,
-    workspaceId: state.workspaceId,
+    workspaceId: state.workspaceId as WorkspaceId,
     branchRef,
     headCommit: headCommit as string | null,
     dirtyWorktreeFingerprint: state.dirtyWorktreeFingerprint,

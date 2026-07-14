@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
+import type { ProjectId, VaultId, WorkspaceId } from "../src/orchestrator/identity/contracts.js";
 import {
   parseCanonicalTimestamp,
   parseCanonicalUuid,
@@ -121,6 +122,10 @@ const UUIDS = {
   workflow: "77777777-7777-4777-8777-777777777777",
 } as const;
 
+const DETERMINISTIC_IDEMPOTENCY_KEY = `lifecycle-phase-v1/${"5".repeat(64)}`;
+const OPAQUE_CLIENT_INSTANCE_ID = "codex-desktop/client-primary";
+const CANONICAL_CLAIM_TOKEN = "42";
+
 function indexedUuid(index: number): string {
   return `00000000-0000-4000-8000-${index.toString(16).padStart(12, "0")}`;
 }
@@ -148,7 +153,7 @@ function validCheckpoint(): Record<string, unknown> {
     checkpointEventPosition: "13",
     createdAt: "2026-07-14T10:11:12.123Z",
     creatorAgentId: "agent-primary",
-    creatorClientInstanceId: UUIDS.client,
+    creatorClientInstanceId: OPAQUE_CLIENT_INSTANCE_ID,
     taskSummary: "Bounded checkpoint",
     completedItems: [textItem()],
     inProgressItems: [],
@@ -171,7 +176,7 @@ function validCheckpoint(): Record<string, unknown> {
     materialClaims: [],
     sourceState: {
       sourceStateScopeVersion: 1,
-      workspaceId: "workspace-1",
+      workspaceId: "a".repeat(64),
       branchRef: "refs/heads/main",
       headCommit: "a".repeat(40),
       dirtyWorktreeFingerprint: "b".repeat(64),
@@ -289,11 +294,11 @@ function validEndRequest(): Record<string, unknown> {
 function validCommandBase(): Record<string, unknown> {
   return {
     commandId: UUIDS.command,
-    idempotencyKey: UUIDS.idempotency,
+    idempotencyKey: DETERMINISTIC_IDEMPOTENCY_KEY,
     agentId: "agent-primary",
-    expectedProjectId: "project-1",
-    expectedVaultId: "vault-1",
-    expectedWorkspaceId: "workspace-1",
+    expectedProjectId: UUIDS.item1,
+    expectedVaultId: UUIDS.item2,
+    expectedWorkspaceId: "a".repeat(64),
     expectedBranchRef: "refs/heads/main",
   };
 }
@@ -325,10 +330,10 @@ function validAmendment(): Record<string, unknown> {
 }
 
 function validInternalValidationResultCommand(): InternalValidationResultCommand {
-  const projectId = UUIDS.item1;
-  const vaultId = UUIDS.item2;
+  const projectId = UUIDS.item1 as ProjectId;
+  const vaultId = UUIDS.item2 as VaultId;
   const storeId = UUIDS.item3;
-  const workspaceId = "a".repeat(64);
+  const workspaceId = "a".repeat(64) as WorkspaceId;
   const finalCheckpointFingerprint = "b".repeat(64);
   const profileConfigurationHash = "c".repeat(64);
   const plannedWorkId = "0".repeat(64);
@@ -341,10 +346,10 @@ function validInternalValidationResultCommand(): InternalValidationResultCommand
   };
   const attemptPlan: ValidationAttemptPlanIdentityV1 = Object.freeze({
     attemptPlanVersion: 1,
-    projectId: projectId as never,
-    vaultId: vaultId as never,
+    projectId,
+    vaultId,
     storeId: storeId as never,
-    workspaceId: workspaceId as never,
+    workspaceId,
     sessionId: UUIDS.session as SessionId,
     workflowId: UUIDS.workflow as WorkflowId,
     workflowGeneration: 1,
@@ -357,7 +362,7 @@ function validInternalValidationResultCommand(): InternalValidationResultCommand
     runId: UUIDS.parent,
     resultId: UUIDS.report as ValidationResultId,
     resultCommandId: UUIDS.command,
-    resultIdempotencyKey: UUIDS.idempotency,
+    resultIdempotencyKey: DETERMINISTIC_IDEMPOTENCY_KEY,
   });
   const result: ValidationResultV1 = Object.freeze({
     validationResultVersion: 1,
@@ -409,7 +414,7 @@ function validInternalValidationResultCommand(): InternalValidationResultCommand
       workflowId: attemptPlan.workflowId,
       workflowGeneration: attemptPlan.workflowGeneration,
       claimOwnerId: UUIDS.client,
-      claimToken: UUIDS.item2,
+      claimToken: CANONICAL_CLAIM_TOKEN,
       claimExpiresAt: "2026-07-14T10:12:12.123Z",
     }),
     result,
@@ -436,7 +441,7 @@ function lifecycleEventPayloadCases(): Array<readonly [string, Record<string, un
       continuityKey: "thread:stable-key",
       clientNamespace: "codex-desktop",
       creatingAgentId: "agent-primary",
-      creatingClientInstanceId: UUIDS.client,
+      creatingClientInstanceId: OPAQUE_CLIENT_INSTANCE_ID,
       authorityCommitment,
     }],
     ["SessionOwnerTransferred", {
@@ -610,7 +615,7 @@ function validLifecycleEvent(
     correlationId: UUIDS.parent,
     causationId: null,
     commandId: UUIDS.command,
-    idempotencyKey: UUIDS.idempotency,
+    idempotencyKey: DETERMINISTIC_IDEMPOTENCY_KEY,
     occurredAt: "2026-07-14T10:11:12.123Z",
     authorityCommitment: "a".repeat(64),
     payload,
@@ -845,6 +850,7 @@ describe("lifecycle Version 1 contracts", () => {
   it("strictly decodes and freezes a checkpoint", () => {
     const decoded = decodeCheckpointV1(validCheckpoint());
     assert.equal(decoded.taskSummary, "Bounded checkpoint");
+    assert.equal(decoded.creatorClientInstanceId, OPAQUE_CLIENT_INSTANCE_ID);
     assert.ok(Object.isFrozen(decoded));
     assert.ok(Object.isFrozen(decoded.completedItems));
     assert.ok(Object.isFrozen(decoded.completedItems[0]));
@@ -853,6 +859,22 @@ describe("lifecycle Version 1 contracts", () => {
 
     const unknown = { ...validCheckpoint(), rawOutput: "private output" };
     expectCode("LIFECYCLE_INPUT_INVALID", () => decodeCheckpointV1(unknown));
+  });
+
+  it("keeps checkpoint creator client instance identity opaque and bounded", () => {
+    for (const creatorClientInstanceId of ["", "x".repeat(257), 42]) {
+      expectCode("LIFECYCLE_INPUT_INVALID", () => decodeCheckpointV1({
+        ...validCheckpoint(),
+        creatorClientInstanceId,
+      }));
+    }
+
+    const accessor = validCheckpoint();
+    Object.defineProperty(accessor, "creatorClientInstanceId", {
+      enumerable: true,
+      get: () => OPAQUE_CLIENT_INSTANCE_ID,
+    });
+    expectCode("LIFECYCLE_INPUT_INVALID", () => decodeCheckpointV1(accessor));
   });
 
   it("rejects symbol and non-enumerable array properties", () => {
@@ -1095,6 +1117,12 @@ describe("lifecycle Version 1 contracts", () => {
         candidate.sourceState = { ...(candidate.sourceState as object), dirtyWorktreeFingerprint: "not-a-hash" };
       },
       (candidate: Record<string, unknown>) => {
+        candidate.sourceState = { ...(candidate.sourceState as object), workspaceId: "not-a-workspace-id" };
+      },
+      (candidate: Record<string, unknown>) => {
+        candidate.sourceState = { ...(candidate.sourceState as object), workspaceId: "A".repeat(64) };
+      },
+      (candidate: Record<string, unknown>) => {
         candidate.childSummaries = [{
           childSessionId: UUIDS.parent.toUpperCase(),
           state: "active",
@@ -1117,6 +1145,15 @@ describe("lifecycle Version 1 contracts", () => {
       mutate(candidate);
       expectCode("LIFECYCLE_INPUT_INVALID", () => decodeCheckpointV1(candidate));
     }
+
+    const accessor = validCheckpoint();
+    const sourceState = { ...(accessor.sourceState as object) };
+    Object.defineProperty(sourceState, "workspaceId", {
+      enumerable: true,
+      get: () => "a".repeat(64),
+    });
+    accessor.sourceState = sourceState;
+    expectCode("LIFECYCLE_INPUT_INVALID", () => decodeCheckpointV1(accessor));
   });
 
   it("keeps Version 1 evidence capture honestly coverage-only", () => {
@@ -1502,10 +1539,50 @@ describe("lifecycle Version 1 contracts", () => {
     for (const [commandType, input] of semanticCommandCases()) {
       const decoded = decodeLifecycleSemanticCommandDraft(input);
       assert.equal(decoded.commandType, commandType);
+      assert.equal(decoded.idempotencyKey, DETERMINISTIC_IDEMPOTENCY_KEY);
       assert.ok(Object.isFrozen(decoded));
       expectCode("LIFECYCLE_INPUT_INVALID", () => decodeLifecycleSemanticCommandDraft({
         ...input,
         callerSelectedAudience: "primary",
+      }));
+    }
+  });
+
+  it("accepts exact bounded opaque semantic idempotency keys", () => {
+    const start = semanticCommandCases().find(([type]) => type === "root-start")![1];
+    for (const idempotencyKey of ["", "x".repeat(513), 42]) {
+      expectCode("LIFECYCLE_INPUT_INVALID", () => decodeLifecycleSemanticCommandDraft({
+        ...start,
+        idempotencyKey,
+      }));
+    }
+
+    const accessor = { ...start };
+    Object.defineProperty(accessor, "idempotencyKey", {
+      enumerable: true,
+      get: () => DETERMINISTIC_IDEMPOTENCY_KEY,
+    });
+    expectCode("LIFECYCLE_INPUT_INVALID", () => decodeLifecycleSemanticCommandDraft(accessor));
+  });
+
+  it("enforces canonical semantic project, vault, and workspace identities", () => {
+    const start = semanticCommandCases().find(([type]) => type === "root-start")![1];
+    const decoded = decodeLifecycleSemanticCommandDraft(start);
+    assert.equal(decoded.expectedProjectId, UUIDS.item1);
+    assert.equal(decoded.expectedVaultId, UUIDS.item2);
+    assert.equal(decoded.expectedWorkspaceId, "a".repeat(64));
+
+    for (const [field, value] of [
+      ["expectedProjectId", "not-a-project-id"],
+      ["expectedProjectId", UUIDS.session.toUpperCase()],
+      ["expectedVaultId", "not-a-vault-id"],
+      ["expectedVaultId", UUIDS.parent.toUpperCase()],
+      ["expectedWorkspaceId", "not-a-workspace-id"],
+      ["expectedWorkspaceId", "A".repeat(64)],
+    ] as const) {
+      expectCode("LIFECYCLE_INPUT_INVALID", () => decodeLifecycleSemanticCommandDraft({
+        ...start,
+        [field]: value,
       }));
     }
   });
@@ -1586,9 +1663,19 @@ describe("lifecycle Version 1 contracts", () => {
     const mismatches: Array<readonly [string, InternalValidationResultCommand]> = [
       ["commandId", { ...command, commandId: otherUuid }],
       ["idempotencyKey", { ...command, idempotencyKey: otherUuid }],
-      ["expectedProjectId", { ...command, expectedProjectId: otherUuid }],
-      ["expectedVaultId", { ...command, expectedVaultId: otherUuid }],
-      ["expectedWorkspaceId", { ...command, expectedWorkspaceId: "9".repeat(64) }],
+      ["idempotencyKey empty", {
+        ...command,
+        idempotencyKey: "",
+        attemptPlan: { ...command.attemptPlan, resultIdempotencyKey: "" },
+      }],
+      ["idempotencyKey bound", {
+        ...command,
+        idempotencyKey: "x".repeat(513),
+        attemptPlan: { ...command.attemptPlan, resultIdempotencyKey: "x".repeat(513) },
+      }],
+      ["expectedProjectId", { ...command, expectedProjectId: otherUuid as ProjectId }],
+      ["expectedVaultId", { ...command, expectedVaultId: otherUuid as VaultId }],
+      ["expectedWorkspaceId", { ...command, expectedWorkspaceId: "9".repeat(64) as WorkspaceId }],
       ["workflowId", { ...command, workflowId: otherWorkflowId }],
       ["workflowGeneration", { ...command, workflowGeneration: 2 }],
       ["command plannedWorkId format", { ...command, plannedWorkId: "not-a-hash" }],
@@ -1815,6 +1902,8 @@ describe("lifecycle Version 1 contracts", () => {
 
   it("exact-checks internal validation commands and volatile workflow claims", () => {
     const command = validInternalValidationResultCommand();
+    assert.equal(command.idempotencyKey, DETERMINISTIC_IDEMPOTENCY_KEY);
+    assert.equal(command.claim.claimToken, CANONICAL_CLAIM_TOKEN);
     for (const key of ["rawOutput", "environment", "proofMac", "approval"]) {
       const candidate = { ...command, [key]: "private" } as unknown as InternalValidationResultCommand;
       expectCode("SESSION_VALIDATION_RESULT_INVALID", () =>
@@ -1828,6 +1917,13 @@ describe("lifecycle Version 1 contracts", () => {
       expectCode("SESSION_VALIDATION_RESULT_INVALID", () =>
         assertInternalValidationResultBinding(candidate));
     }
+    for (const claimToken of ["", "-1", "01", "9223372036854775808", 1, 1n]) {
+      expectCode("SESSION_VALIDATION_RESULT_INVALID", () =>
+        assertInternalValidationResultBinding({
+          ...command,
+          claim: { ...command.claim, claimToken } as unknown as typeof command.claim,
+        }));
+    }
 
     const accessorCommand = { ...command };
     Object.defineProperty(accessorCommand, "plannedWorkId", {
@@ -1840,7 +1936,7 @@ describe("lifecycle Version 1 contracts", () => {
     const accessorClaim = { ...command.claim };
     Object.defineProperty(accessorClaim, "claimToken", {
       enumerable: true,
-      get: () => UUIDS.item2,
+      get: () => CANONICAL_CLAIM_TOKEN,
     });
     expectCode("SESSION_VALIDATION_RESULT_INVALID", () =>
       assertInternalValidationResultBinding({ ...command, claim: accessorClaim }));
@@ -2310,6 +2406,7 @@ describe("lifecycle Version 1 contracts", () => {
     for (const [eventType, payload] of cases) {
       const decoded = decodeLifecycleEventV1(validLifecycleEvent(eventType, payload));
       assert.equal(decoded.eventType, eventType);
+      assert.equal(decoded.idempotencyKey, DETERMINISTIC_IDEMPOTENCY_KEY);
       assert.equal(typeof decoded.streamVersion, "string");
       assert.equal(typeof decoded.globalPosition, "string");
       assert.ok(Object.isFrozen(decoded));
@@ -2330,6 +2427,9 @@ describe("lifecycle Version 1 contracts", () => {
       ["global position", (event: Record<string, unknown>) => { event.globalPosition = 1n; }],
       ["timestamp", (event: Record<string, unknown>) => { event.occurredAt = "2026-07-14T10:11:12Z"; }],
       ["authority commitment", (event: Record<string, unknown>) => { event.authorityCommitment = "not-a-hash"; }],
+      ["empty idempotency key", (event: Record<string, unknown>) => { event.idempotencyKey = ""; }],
+      ["oversized idempotency key", (event: Record<string, unknown>) => { event.idempotencyKey = "x".repeat(513); }],
+      ["non-string idempotency key", (event: Record<string, unknown>) => { event.idempotencyKey = 42; }],
       ["wrong discriminator payload", (event: Record<string, unknown>) => {
         event.eventType = "SessionResumed";
       }],
@@ -2365,9 +2465,9 @@ describe("lifecycle Version 1 contracts", () => {
     );
 
     const accessorEvent = validLifecycleEvent("SessionStarted", { ...startedPayload });
-    Object.defineProperty(accessorEvent, "streamVersion", {
+    Object.defineProperty(accessorEvent, "idempotencyKey", {
       enumerable: true,
-      get: () => "1",
+      get: () => DETERMINISTIC_IDEMPOTENCY_KEY,
     });
     assert.throws(() => decodeLifecycleEventV1(accessorEvent), { message: /LIFECYCLE_INPUT_INVALID/ });
 
@@ -2376,6 +2476,17 @@ describe("lifecycle Version 1 contracts", () => {
     assert.throws(() => decodeLifecycleEventV1(validLifecycleEvent("SessionCheckpointRecorded", {
       ...checkpointPayload,
       checkpointEventPosition: "14",
+    })), { message: /LIFECYCLE_INPUT_INVALID/ });
+    const checkpoint = checkpointPayload.checkpoint as Record<string, unknown>;
+    assert.throws(() => decodeLifecycleEventV1(validLifecycleEvent("SessionCheckpointRecorded", {
+      ...checkpointPayload,
+      checkpoint: {
+        ...checkpoint,
+        sourceState: {
+          ...(checkpoint.sourceState as object),
+          workspaceId: "9".repeat(64),
+        },
+      },
     })), { message: /LIFECYCLE_INPUT_INVALID/ });
 
     const coveragePayload = lifecycleEventPayloadCases()

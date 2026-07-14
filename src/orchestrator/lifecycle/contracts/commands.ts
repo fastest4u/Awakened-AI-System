@@ -78,9 +78,9 @@ export interface LifecycleCommandBase {
   commandId: string;
   idempotencyKey: string;
   agentId: string;
-  expectedProjectId: string;
-  expectedVaultId: string;
-  expectedWorkspaceId: string;
+  expectedProjectId: ProjectId;
+  expectedVaultId: VaultId;
+  expectedWorkspaceId: WorkspaceId;
   expectedBranchRef: string | null;
 }
 
@@ -466,7 +466,11 @@ export function assertInternalValidationResultBinding(
       invalidValidationResultBinding();
     }
     parseLifecycleId(commandRecord.commandId, "internalValidationResultCommand.commandId");
-    parseLifecycleId(commandRecord.idempotencyKey, "internalValidationResultCommand.idempotencyKey");
+    parseBoundedString(
+      commandRecord.idempotencyKey,
+      "internalValidationResultCommand.idempotencyKey",
+      512,
+    );
     parseBoundedString(commandRecord.agentId, "internalValidationResultCommand.agentId", 256);
     parseLifecycleId<ProjectId>(
       commandRecord.expectedProjectId,
@@ -509,7 +513,7 @@ export function assertInternalValidationResultBinding(
       Number.MAX_SAFE_INTEGER,
     );
     parseLifecycleId(claimRecord.claimOwnerId, "internalValidationResultCommand.claim.claimOwnerId");
-    parseLifecycleId(claimRecord.claimToken, "internalValidationResultCommand.claim.claimToken");
+    parseDecimalString(claimRecord.claimToken, "internalValidationResultCommand.claim.claimToken");
     parseCanonicalTimestamp(
       claimRecord.claimExpiresAt,
       "internalValidationResultCommand.claim.claimExpiresAt",
@@ -552,7 +556,7 @@ export function assertInternalValidationResultBinding(
     parseLifecycleId(planRecord.runId, "attemptPlan.runId");
     parseLifecycleId<ValidationResultId>(planRecord.resultId, "attemptPlan.resultId");
     parseLifecycleId(planRecord.resultCommandId, "attemptPlan.resultCommandId");
-    parseLifecycleId(planRecord.resultIdempotencyKey, "attemptPlan.resultIdempotencyKey");
+    parseBoundedString(planRecord.resultIdempotencyKey, "attemptPlan.resultIdempotencyKey", 512);
     const result = decodeValidationResultV1(commandRecord.result);
 
     const plan = commandRecord.attemptPlan as unknown as ValidationAttemptPlanIdentityV1;
@@ -669,13 +673,17 @@ function exactCommand(value: unknown, extraKeys: readonly string[]): Record<stri
 }
 
 function base(command: Record<string, unknown>): LifecycleCommandBase {
+  const expectedWorkspaceId = command.expectedWorkspaceId;
+  if (typeof expectedWorkspaceId !== "string" || !LOWER_HASH.test(expectedWorkspaceId)) {
+    invalid("expectedWorkspaceId");
+  }
   return {
     commandId: parseLifecycleId(command.commandId, "commandId"),
-    idempotencyKey: parseLifecycleId(command.idempotencyKey, "idempotencyKey"),
+    idempotencyKey: parseBoundedString(command.idempotencyKey, "idempotencyKey", 512),
     agentId: parseBoundedString(command.agentId, "agentId", 256),
-    expectedProjectId: parseBoundedString(command.expectedProjectId, "expectedProjectId", 256),
-    expectedVaultId: parseBoundedString(command.expectedVaultId, "expectedVaultId", 256),
-    expectedWorkspaceId: parseBoundedString(command.expectedWorkspaceId, "expectedWorkspaceId", 256),
+    expectedProjectId: parseLifecycleId<ProjectId>(command.expectedProjectId, "expectedProjectId"),
+    expectedVaultId: parseLifecycleId<VaultId>(command.expectedVaultId, "expectedVaultId"),
+    expectedWorkspaceId: expectedWorkspaceId as WorkspaceId,
     expectedBranchRef: parseNullableBoundedString(command.expectedBranchRef, "expectedBranchRef", 1_024),
   };
 }

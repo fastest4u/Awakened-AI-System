@@ -891,6 +891,7 @@ export function decodeLifecycleEventV1(value: unknown): LifecycleEventV1 {
         checkpointPayload.checkpointEventPosition !== globalPosition
         || checkpointPayload.checkpoint.sessionId !== event.sessionId
         || checkpointPayload.checkpoint.parentSessionId !== parentSessionId
+        || checkpointPayload.checkpoint.sourceState.workspaceId !== workspaceId
       ) invalid("event.payload.checkpoint");
     }
     if (eventType === "ChildWorkReported") {
@@ -926,7 +927,7 @@ export function decodeLifecycleEventV1(value: unknown): LifecycleEventV1 {
       correlationId: parseLifecycleId(event.correlationId, "correlationId"),
       causationId: parseNullableUuid(event.causationId, "causationId"),
       commandId: parseLifecycleId(event.commandId, "commandId"),
-      idempotencyKey: parseLifecycleId(event.idempotencyKey, "idempotencyKey"),
+      idempotencyKey: parseBoundedString(event.idempotencyKey, "idempotencyKey", 512),
       occurredAt: parseCanonicalTimestamp(event.occurredAt, "occurredAt"),
       authorityCommitment,
       payload,
