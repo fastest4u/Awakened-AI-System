@@ -53,12 +53,14 @@ import {
   type ValidationAttemptPlanIdentityV1,
 } from "../src/orchestrator/lifecycle/contracts/commands.js";
 import {
+  decodeLifecycleEventV1,
   LIFECYCLE_EVENT_TYPES,
   type LifecycleEventV1,
 } from "../src/orchestrator/lifecycle/contracts/events.js";
 import {
   decodeQualityPolicyV1,
   decodeSessionEndRequestV1,
+  decodeValidationResultV1,
   type QualityPolicyV1,
   type SessionEndRequestV1,
   type ValidationResultV1,
@@ -329,6 +331,7 @@ function validInternalValidationResultCommand(): InternalValidationResultCommand
   const workspaceId = "a".repeat(64);
   const finalCheckpointFingerprint = "b".repeat(64);
   const profileConfigurationHash = "c".repeat(64);
+  const plannedWorkId = "0".repeat(64);
   const sourceState = {
     sourceStateScopeVersion: 1 as const,
     workspaceId,
@@ -345,6 +348,7 @@ function validInternalValidationResultCommand(): InternalValidationResultCommand
     sessionId: UUIDS.session as SessionId,
     workflowId: UUIDS.workflow as WorkflowId,
     workflowGeneration: 1,
+    plannedWorkId,
     finalCheckpointId: UUIDS.checkpoint as CheckpointId,
     finalCheckpointFingerprint,
     profileId: "vault-gate",
@@ -371,7 +375,7 @@ function validInternalValidationResultCommand(): InternalValidationResultCommand
     profileVersion: attemptPlan.profileVersion,
     profileConfigurationHash: attemptPlan.profileConfigurationHash,
     runId: attemptPlan.runId,
-    runnerId: "trusted-vault-gate-runner",
+    runnerId: UUIDS.client,
     sourceStateAtStart: Object.freeze({ ...sourceState }),
     sourceStateAtCompletion: Object.freeze({ ...sourceState }),
     startedAt: "2026-07-14T10:11:12.123Z",
@@ -399,7 +403,7 @@ function validInternalValidationResultCommand(): InternalValidationResultCommand
     expectedBranchRef: "refs/heads/main",
     workflowId: attemptPlan.workflowId,
     workflowGeneration: attemptPlan.workflowGeneration,
-    plannedWorkId: "validation/vault-gate/generation-1",
+    plannedWorkId,
     attemptPlan,
     claim: Object.freeze({
       workflowId: attemptPlan.workflowId,
@@ -410,6 +414,207 @@ function validInternalValidationResultCommand(): InternalValidationResultCommand
     }),
     result,
   });
+}
+
+function validValidationResultInput(): Record<string, unknown> {
+  const result = validInternalValidationResultCommand().result;
+  return {
+    ...result,
+    sourceStateAtStart: { ...result.sourceStateAtStart },
+    sourceStateAtCompletion: { ...result.sourceStateAtCompletion },
+    outputFingerprint: { ...result.outputFingerprint },
+    artifactReferences: [...result.artifactReferences],
+  };
+}
+
+function lifecycleEventPayloadCases(): Array<readonly [string, Record<string, unknown>]> {
+  const authorityCommitment = "a".repeat(64);
+  return [
+    ["SessionStarted", {
+      sessionKind: "root",
+      ownerGeneration: 1,
+      continuityKey: "thread:stable-key",
+      clientNamespace: "codex-desktop",
+      creatingAgentId: "agent-primary",
+      creatingClientInstanceId: UUIDS.client,
+      authorityCommitment,
+    }],
+    ["SessionOwnerTransferred", {
+      previousOwnerGeneration: 1,
+      ownerGeneration: 2,
+      authorityCommitment,
+    }],
+    ["SessionOwnershipRecovered", {
+      previousOwnerGeneration: 1,
+      ownerGeneration: 2,
+      approvalId: UUIDS.item1,
+      authorityCommitment,
+    }],
+    ["SessionSuspendRequested", { checkpointId: UUIDS.checkpoint }],
+    ["SessionSuspended", { authorityCommitment }],
+    ["SessionResumed", { ownerGeneration: 2 }],
+    ["SessionCheckpointRecorded", {
+      checkpoint: validCheckpoint(),
+      baseEventPosition: "12",
+      checkpointEventPosition: "13",
+    }],
+    ["EvidenceCoverageRecorded", {
+      adapterSessionId: UUIDS.parent,
+      batchId: UUIDS.report,
+      firstOrdinal: "0",
+      lastOrdinal: "0",
+      highestContiguousOrdinal: "0",
+      missingIntervals: [],
+      fingerprintSchemaVersion: 1,
+      fingerprintKeyId: "evidence-key-1",
+      fingerprintDomain: "pm-evidence-frame-v1",
+      coverageFingerprint: "b".repeat(64),
+      captureMode: "coverage-only",
+      contentRetained: false,
+      frames: [{
+        frameId: UUIDS.item3,
+        ordinal: "0",
+        sourceKind: "tool-result",
+        observedAt: "2026-07-14T10:11:12.123Z",
+        contentFingerprint: "c".repeat(64),
+      }],
+    }],
+    ["SessionForked", {
+      parentSessionId: UUIDS.parent,
+      assignment: { assignmentId: UUIDS.item1, summary: "Investigate", scope: "src/orchestrator" },
+      rootOwnerGeneration: 1,
+      directAccessEnabled: false,
+      authorityCommitment,
+      sourceTransferTicketId: null,
+    }],
+    ["ChildAssignmentAmended", {
+      previousAssignmentRevision: 1,
+      assignmentRevision: 2,
+      assignment: { assignmentId: UUIDS.item1, summary: "Investigate more", scope: "src/orchestrator" },
+      reasonCode: "scope-clarified",
+    }],
+    ["ChildWorkReported", {
+      report: validReport(),
+      childAuthorAgentId: "agent-child",
+      primaryRecorderAgentId: "agent-primary",
+    }],
+    ["ChildWorkDispositioned", { disposition: validAcceptedDisposition() }],
+    ["ChildCompletionProposed", { reportId: UUIDS.report }],
+    ["ChildSessionCompleted", { reportId: UUIDS.report, authorityCommitment }],
+    ["ChildSessionSuspended", {
+      checkpointId: UUIDS.checkpoint,
+      blockers: ["Awaiting review"],
+      followUps: ["Resume later"],
+      authorityCommitment,
+    }],
+    ["ChildWorkTransferCreated", {
+      transferTicketId: UUIDS.item3,
+      checkpointId: UUIDS.checkpoint,
+      authorityCommitment,
+    }],
+    ["ChildWorkTransferClaimed", {
+      transferTicketId: UUIDS.item3,
+      previousChildSessionId: UUIDS.parent,
+      previousTransferEventPosition: "11",
+    }],
+    ["SessionEndRequested", {
+      workflowId: UUIDS.workflow,
+      workflowGeneration: 1,
+      previousState: "active",
+      childEndPolicy: "require-completed",
+      qualityThreshold: 8_000,
+      requireFullEvidence: false,
+      requireMaterialization: true,
+    }],
+    ["SessionEndAmended", {
+      workflowId: UUIDS.workflow,
+      previousWorkflowGeneration: 1,
+      workflowGeneration: 2,
+      preTransitionCheckpointId: UUIDS.checkpoint,
+    }],
+    ["SessionValidationResultRecorded", {
+      workflowId: UUIDS.workflow,
+      workflowGeneration: 1,
+      plannedWorkId: "0".repeat(64),
+      validationResult: validValidationResultInput(),
+    }],
+    ["SessionEndVerificationPassed", {
+      workflowId: UUIDS.workflow,
+      workflowGeneration: 1,
+      validationResultIds: [UUIDS.report],
+      qualityScore: 10_000,
+    }],
+    ["SessionEndVerificationFailed", {
+      workflowId: UUIDS.workflow,
+      workflowGeneration: 1,
+      validationResultIds: [UUIDS.report],
+      safeFailureCode: "SESSION_VALIDATION_RESULT_INVALID",
+    }],
+    ["SessionEndVerificationInvalidated", {
+      workflowId: UUIDS.workflow,
+      workflowGeneration: 1,
+      previousVerificationEventPosition: "18",
+      safeFailureCode: "SESSION_SOURCE_STATE_CONFLICT",
+    }],
+    ["SessionEndCancelled", {
+      workflowId: UUIDS.workflow,
+      workflowGeneration: 2,
+      restoredState: "active",
+      preTransitionCheckpointId: UUIDS.checkpoint,
+    }],
+    ["SessionAbandoned", {
+      workflowId: UUIDS.workflow,
+      workflowGeneration: 2,
+      approvalId: UUIDS.item1,
+      preTransitionCheckpointId: UUIDS.checkpoint,
+      reasonCode: "explicit-user-approval",
+      authorityCommitment,
+    }],
+    ["SessionEnded", {
+      workflowId: UUIDS.workflow,
+      workflowGeneration: 1,
+      verificationEventPosition: "20",
+      authorityCommitment,
+    }],
+  ];
+}
+
+function validLifecycleEvent(
+  eventType = "SessionStarted",
+  payload: Record<string, unknown> = lifecycleEventPayloadCases()[0]![1],
+): Record<string, unknown> {
+  const childEventTypes = new Set([
+    "SessionForked",
+    "ChildAssignmentAmended",
+    "ChildWorkReported",
+    "ChildWorkDispositioned",
+    "ChildCompletionProposed",
+    "ChildSessionCompleted",
+    "ChildSessionSuspended",
+    "ChildWorkTransferCreated",
+    "ChildWorkTransferClaimed",
+  ]);
+  return {
+    eventSchemaVersion: 1,
+    eventId: UUIDS.item3,
+    projectId: UUIDS.item1,
+    vaultId: UUIDS.item2,
+    storeId: UUIDS.item3,
+    workspaceId: "a".repeat(64),
+    streamId: `session/${UUIDS.session}`,
+    streamVersion: "1",
+    globalPosition: eventType === "SessionCheckpointRecorded" ? "13" : "1",
+    sessionId: UUIDS.session,
+    parentSessionId: childEventTypes.has(eventType) ? UUIDS.parent : null,
+    eventType,
+    correlationId: UUIDS.parent,
+    causationId: null,
+    commandId: UUIDS.command,
+    idempotencyKey: UUIDS.idempotency,
+    occurredAt: "2026-07-14T10:11:12.123Z",
+    authorityCommitment: "a".repeat(64),
+    payload,
+  };
 }
 
 function semanticCommandCases(): Array<readonly [string, Record<string, unknown>]> {
@@ -977,6 +1182,20 @@ describe("lifecycle Version 1 contracts", () => {
       };
       expectCode("LIFECYCLE_INPUT_INVALID", () => decodeCheckpointV1(input));
     }
+
+    for (const [highestContiguousOrdinal, missingIntervals] of [
+      ["10", [{ firstOrdinal: "4", lastOrdinal: "5" }]],
+      [null, [{ firstOrdinal: "1", lastOrdinal: "2" }]],
+      ["3", [{ firstOrdinal: "5", lastOrdinal: "6" }]],
+    ] as const) {
+      const input = validCheckpoint();
+      input.evidenceCoverage = {
+        captureMode: "coverage-only",
+        highestContiguousOrdinal,
+        missingIntervals,
+      };
+      expectCode("LIFECYCLE_INPUT_INVALID", () => decodeCheckpointV1(input));
+    }
   });
 
   it("strictly decodes reports and rejects duplicate report item identities", () => {
@@ -1372,6 +1591,15 @@ describe("lifecycle Version 1 contracts", () => {
       ["expectedWorkspaceId", { ...command, expectedWorkspaceId: "9".repeat(64) }],
       ["workflowId", { ...command, workflowId: otherWorkflowId }],
       ["workflowGeneration", { ...command, workflowGeneration: 2 }],
+      ["command plannedWorkId format", { ...command, plannedWorkId: "not-a-hash" }],
+      ["attempt plan plannedWorkId format", {
+        ...command,
+        attemptPlan: { ...command.attemptPlan, plannedWorkId: "not-a-hash" },
+      }],
+      ["plannedWorkId mismatch", {
+        ...command,
+        plannedWorkId: "1".repeat(64),
+      }],
       ["claim.workflowId", { ...command, claim: { ...command.claim, workflowId: otherWorkflowId } }],
       ["claim.workflowGeneration", {
         ...command,
@@ -1428,6 +1656,196 @@ describe("lifecycle Version 1 contracts", () => {
     }
   });
 
+  it("strictly decodes, freezes, and detaches trusted validation results", () => {
+    const input = validValidationResultInput();
+    input.artifactReferences = ["artifacts/validation-result.json"];
+    const decoded = decodeValidationResultV1(input);
+    assert.ok(Object.isFrozen(decoded));
+    assert.ok(Object.isFrozen(decoded.sourceStateAtStart));
+    assert.ok(Object.isFrozen(decoded.sourceStateAtCompletion));
+    assert.ok(Object.isFrozen(decoded.outputFingerprint));
+    assert.ok(Object.isFrozen(decoded.artifactReferences));
+    assert.notEqual(decoded.sourceStateAtStart, input.sourceStateAtStart);
+    assert.notEqual(decoded.outputFingerprint, input.outputFingerprint);
+    assert.notEqual(decoded.artifactReferences, input.artifactReferences);
+
+    input.summary = "mutated after decode";
+    (input.sourceStateAtStart as Record<string, unknown>).workspaceId = "9".repeat(64);
+    (input.outputFingerprint as Record<string, unknown>).fingerprint = "9".repeat(64);
+    (input.artifactReferences as string[])[0] = "mutated/private-output.txt";
+    assert.equal(decoded.summary, "Trusted validation passed");
+    assert.equal(decoded.sourceStateAtStart.workspaceId, "a".repeat(64));
+    assert.equal(decoded.outputFingerprint.fingerprint, "f".repeat(64));
+    assert.deepEqual(decoded.artifactReferences, ["artifacts/validation-result.json"]);
+  });
+
+  it("rejects malformed, nonexact, or secret-bearing validation result data", () => {
+    const invalid: Array<readonly [string, Record<string, unknown>]> = [];
+    for (const key of [
+      "rawOutput",
+      "stdout",
+      "stderr",
+      "environment",
+      "command",
+      "evidence",
+      "bearerToken",
+      "proofMac",
+      "approval",
+    ]) {
+      invalid.push([`result.${key}`, { ...validValidationResultInput(), [key]: "private" }]);
+    }
+    invalid.push(
+      ["resultId", { ...validValidationResultInput(), resultId: UUIDS.report.toUpperCase() }],
+      ["projectId", { ...validValidationResultInput(), projectId: UUIDS.session.toUpperCase() }],
+      ["vaultId", { ...validValidationResultInput(), vaultId: UUIDS.session.toUpperCase() }],
+      ["storeId", { ...validValidationResultInput(), storeId: UUIDS.session.toUpperCase() }],
+      ["workspaceId", { ...validValidationResultInput(), workspaceId: "not-a-workspace" }],
+      ["sessionId", { ...validValidationResultInput(), sessionId: UUIDS.session.toUpperCase() }],
+      ["workflowId", { ...validValidationResultInput(), workflowId: UUIDS.session.toUpperCase() }],
+      ["workflowGeneration", { ...validValidationResultInput(), workflowGeneration: 1.5 }],
+      ["finalCheckpointId", {
+        ...validValidationResultInput(),
+        finalCheckpointId: UUIDS.checkpoint.toUpperCase(),
+      }],
+      ["finalCheckpointFingerprint", {
+        ...validValidationResultInput(),
+        finalCheckpointFingerprint: "not-a-fingerprint",
+      }],
+      ["profileId", { ...validValidationResultInput(), profileId: "x".repeat(257) }],
+      ["profileVersion", { ...validValidationResultInput(), profileVersion: 1.5 }],
+      ["profileConfigurationHash", {
+        ...validValidationResultInput(),
+        profileConfigurationHash: "not-a-hash",
+      }],
+      ["runId", { ...validValidationResultInput(), runId: UUIDS.parent.toUpperCase() }],
+      ["startedAt", { ...validValidationResultInput(), startedAt: "2026-07-14T10:11:12Z" }],
+      ["completed before start", {
+        ...validValidationResultInput(),
+        completedAt: "2026-07-14T10:11:11.123Z",
+      }],
+      ["status", { ...validValidationResultInput(), status: "maybe" }],
+      ["exitClassification", { ...validValidationResultInput(), exitClassification: "unknown" }],
+      ["summary", { ...validValidationResultInput(), summary: "x".repeat(4_001) }],
+      ["fresh", { ...validValidationResultInput(), fresh: "true" }],
+      ["sourceState extra", {
+        ...validValidationResultInput(),
+        sourceStateAtStart: {
+          ...(validValidationResultInput().sourceStateAtStart as object),
+          environment: "private",
+        },
+      }],
+      ["sourceState workspace mismatch", {
+        ...validValidationResultInput(),
+        sourceStateAtCompletion: {
+          ...(validValidationResultInput().sourceStateAtCompletion as object),
+          workspaceId: "9".repeat(64),
+        },
+      }],
+      ["output fingerprint extra", {
+        ...validValidationResultInput(),
+        outputFingerprint: {
+          ...(validValidationResultInput().outputFingerprint as object),
+          stdout: "private",
+        },
+      }],
+      ["output fingerprint schema", {
+        ...validValidationResultInput(),
+        outputFingerprint: {
+          ...(validValidationResultInput().outputFingerprint as object),
+          fingerprintSchemaVersion: 2,
+        },
+      }],
+      ["output fingerprint domain", {
+        ...validValidationResultInput(),
+        outputFingerprint: {
+          ...(validValidationResultInput().outputFingerprint as object),
+          fingerprintDomain: "caller-selected",
+        },
+      }],
+      ["artifact reference length", {
+        ...validValidationResultInput(),
+        artifactReferences: ["x".repeat(513)],
+      }],
+      ["artifact reference type", {
+        ...validValidationResultInput(),
+        artifactReferences: [{ evidence: "private" }],
+      }],
+    );
+
+    const accessorResult = validValidationResultInput();
+    Object.defineProperty(accessorResult, "summary", {
+      enumerable: true,
+      get: () => "accessor summary",
+    });
+    invalid.push(["result accessor", accessorResult]);
+    const accessorSource = validValidationResultInput();
+    const sourceState = { ...(accessorSource.sourceStateAtStart as object) };
+    Object.defineProperty(sourceState, "workspaceId", {
+      enumerable: true,
+      get: () => "a".repeat(64),
+    });
+    accessorSource.sourceStateAtStart = sourceState;
+    invalid.push(["sourceState accessor", accessorSource]);
+    const accessorOutput = validValidationResultInput();
+    const output = { ...(accessorOutput.outputFingerprint as object) };
+    Object.defineProperty(output, "fingerprint", {
+      enumerable: true,
+      get: () => "f".repeat(64),
+    });
+    accessorOutput.outputFingerprint = output;
+    invalid.push(["output accessor", accessorOutput]);
+    const accessorArtifacts = validValidationResultInput();
+    const references = ["artifacts/result.json"];
+    Object.defineProperty(references, "0", {
+      enumerable: true,
+      get: () => "artifacts/result.json",
+    });
+    accessorArtifacts.artifactReferences = references;
+    invalid.push(["artifact array accessor", accessorArtifacts]);
+
+    for (const [field, candidate] of invalid) {
+      assert.throws(
+        () => decodeValidationResultV1(candidate),
+        (error: unknown) => error instanceof LifecycleError
+          && error.code === "SESSION_VALIDATION_RESULT_INVALID",
+        field,
+      );
+    }
+  });
+
+  it("exact-checks internal validation commands and volatile workflow claims", () => {
+    const command = validInternalValidationResultCommand();
+    for (const key of ["rawOutput", "environment", "proofMac", "approval"]) {
+      const candidate = { ...command, [key]: "private" } as unknown as InternalValidationResultCommand;
+      expectCode("SESSION_VALIDATION_RESULT_INVALID", () =>
+        assertInternalValidationResultBinding(candidate));
+    }
+    for (const key of ["stdout", "command", "bearerToken", "evidence"]) {
+      const candidate = {
+        ...command,
+        claim: { ...command.claim, [key]: "private" },
+      } as unknown as InternalValidationResultCommand;
+      expectCode("SESSION_VALIDATION_RESULT_INVALID", () =>
+        assertInternalValidationResultBinding(candidate));
+    }
+
+    const accessorCommand = { ...command };
+    Object.defineProperty(accessorCommand, "plannedWorkId", {
+      enumerable: true,
+      get: () => "0".repeat(64),
+    });
+    expectCode("SESSION_VALIDATION_RESULT_INVALID", () =>
+      assertInternalValidationResultBinding(accessorCommand));
+
+    const accessorClaim = { ...command.claim };
+    Object.defineProperty(accessorClaim, "claimToken", {
+      enumerable: true,
+      get: () => UUIDS.item2,
+    });
+    expectCode("SESSION_VALIDATION_RESULT_INVALID", () =>
+      assertInternalValidationResultBinding({ ...command, claim: accessorClaim }));
+  });
+
   it("enforces semantic authorization shapes and command-specific authority", () => {
     const start = decodeLifecycleSemanticCommandDraft({
       ...validCommandBase(),
@@ -1448,6 +1866,239 @@ describe("lifecycle Version 1 contracts", () => {
       authoritySessionId: UUIDS.session as SessionId,
       targetSessionId: UUIDS.session as SessionId,
       proof: null,
+      approval: null,
+      childBindingGrant: null,
+    }));
+  });
+
+  it("rejects nonexact or malformed semantic authorization records", () => {
+    const commands = new Map(semanticCommandCases().map(([type, input]) => [
+      type,
+      decodeLifecycleSemanticCommandDraft(input),
+    ]));
+    const start = commands.get("root-start")!;
+    const resume = commands.get("root-resume")!;
+    const recovery = commands.get("root-recovery")!;
+    const directFork = decodeLifecycleSemanticCommandDraft({
+      ...(semanticCommandCases().find(([type]) => type === "fork-child")?.[1] ?? {}),
+      directAccessRequested: true,
+    });
+    const proof: CapabilityProofV1 = {
+      proofVersion: 1,
+      target: "semantic-command",
+      proofNonce: UUIDS.item2,
+      proofFingerprint: "a".repeat(64),
+    };
+    const recoveryApproval: RedactedLifecycleApproval = {
+      approvalVersion: 1,
+      approvalId: UUIDS.item1 as ApprovalId,
+      action: "recover-root-authority",
+      approvalFingerprint: "b".repeat(64),
+    };
+    const grant: RedactedChildBindingGrant = {
+      grantVersion: 1,
+      grantId: UUIDS.item3,
+      targetClientInstanceId: UUIDS.client,
+      grantFingerprint: "c".repeat(64),
+    };
+    const initial = {
+      kind: "initial-authority" as const,
+      authoritySessionId: null,
+      targetSessionId: null,
+      proof: null,
+      approval: null,
+      childBindingGrant: null,
+    };
+    const protectedProof = {
+      kind: "protected" as const,
+      authoritySessionId: UUIDS.session as SessionId,
+      targetSessionId: UUIDS.session as SessionId,
+      proof,
+      approval: null,
+      childBindingGrant: null,
+    };
+    const protectedApproval = {
+      ...protectedProof,
+      proof: null,
+      approval: recoveryApproval,
+    };
+    const protectedGrant = {
+      ...protectedProof,
+      childBindingGrant: grant,
+    };
+
+    const accessorAuthorization = { ...protectedProof };
+    Object.defineProperty(accessorAuthorization, "targetSessionId", {
+      enumerable: true,
+      get: () => UUIDS.session,
+    });
+    const accessorProof = { ...proof };
+    Object.defineProperty(accessorProof, "proofNonce", {
+      enumerable: true,
+      get: () => UUIDS.item2,
+    });
+    const accessorApproval = { ...recoveryApproval };
+    Object.defineProperty(accessorApproval, "approvalId", {
+      enumerable: true,
+      get: () => UUIDS.item1,
+    });
+    const accessorGrant = { ...grant };
+    Object.defineProperty(accessorGrant, "grantId", {
+      enumerable: true,
+      get: () => UUIDS.item3,
+    });
+
+    const invalid: Array<readonly [string, LifecycleSemanticCommandDraft, SemanticCommandAuthorization]> = [
+      ["initial extra", start, { ...initial, rawOutput: "private" } as unknown as SemanticCommandAuthorization],
+      ["protected extra", resume, { ...protectedProof, proofMac: "private" } as unknown as SemanticCommandAuthorization],
+      ["authorization kind", resume, { ...protectedProof, kind: "bearer" } as unknown as SemanticCommandAuthorization],
+      ["authority id", resume, {
+        ...protectedProof,
+        authoritySessionId: UUIDS.session.toUpperCase() as SessionId,
+      }],
+      ["target id", resume, {
+        ...protectedProof,
+        targetSessionId: "not-a-session" as SessionId,
+      }],
+      ["authorization accessor", resume, accessorAuthorization],
+      ["proof extra", resume, {
+        ...protectedProof,
+        proof: { ...proof, bearerToken: "private" } as unknown as CapabilityProofV1,
+      }],
+      ["proof version", resume, {
+        ...protectedProof,
+        proof: { ...proof, proofVersion: 2 } as unknown as CapabilityProofV1,
+      }],
+      ["proof nonce", resume, { ...protectedProof, proof: { ...proof, proofNonce: "not-a-uuid" } }],
+      ["proof fingerprint", resume, { ...protectedProof, proof: { ...proof, proofFingerprint: "short" } }],
+      ["proof accessor", resume, { ...protectedProof, proof: accessorProof }],
+      ["approval extra", recovery, {
+        ...protectedApproval,
+        approval: { ...recoveryApproval, approvalToken: "private" } as unknown as RedactedLifecycleApproval,
+      }],
+      ["approval version", recovery, {
+        ...protectedApproval,
+        approval: { ...recoveryApproval, approvalVersion: 2 } as unknown as RedactedLifecycleApproval,
+      }],
+      ["approval id", recovery, {
+        ...protectedApproval,
+        approval: { ...recoveryApproval, approvalId: "not-a-uuid" as ApprovalId },
+      }],
+      ["approval fingerprint", recovery, {
+        ...protectedApproval,
+        approval: { ...recoveryApproval, approvalFingerprint: "short" },
+      }],
+      ["approval accessor", recovery, { ...protectedApproval, approval: accessorApproval }],
+      ["grant extra", directFork, {
+        ...protectedGrant,
+        childBindingGrant: { ...grant, childHandle: "private" } as unknown as RedactedChildBindingGrant,
+      }],
+      ["grant version", directFork, {
+        ...protectedGrant,
+        childBindingGrant: { ...grant, grantVersion: 2 } as unknown as RedactedChildBindingGrant,
+      }],
+      ["grant id", directFork, {
+        ...protectedGrant,
+        childBindingGrant: { ...grant, grantId: "not-a-uuid" },
+      }],
+      ["grant client", directFork, {
+        ...protectedGrant,
+        childBindingGrant: { ...grant, targetClientInstanceId: "x".repeat(257) },
+      }],
+      ["grant fingerprint", directFork, {
+        ...protectedGrant,
+        childBindingGrant: { ...grant, grantFingerprint: "short" },
+      }],
+      ["grant accessor", directFork, { ...protectedGrant, childBindingGrant: accessorGrant }],
+    ];
+    for (const [field, command, authorization] of invalid) {
+      expectCode("SESSION_CAPABILITY_INVALID", () =>
+        assertSemanticCommandAuthorization(command, authorization));
+    }
+  });
+
+  it("binds semantic authorization sessions to every command target", () => {
+    const commands = new Map(semanticCommandCases().map(([type, input]) => [
+      type,
+      decodeLifecycleSemanticCommandDraft(input),
+    ]));
+    const proof: CapabilityProofV1 = {
+      proofVersion: 1,
+      target: "semantic-command",
+      proofNonce: UUIDS.item2,
+      proofFingerprint: "a".repeat(64),
+    };
+    const recoveryApproval: RedactedLifecycleApproval = {
+      approvalVersion: 1,
+      approvalId: UUIDS.item1 as ApprovalId,
+      action: "recover-root-authority",
+      approvalFingerprint: "b".repeat(64),
+    };
+    const abandonmentApproval: RedactedLifecycleApproval = {
+      ...recoveryApproval,
+      action: "abandon-root",
+    };
+    const expected = new Map<string, readonly [SessionId | null, SessionId]>([
+      ["root-resume", [UUIDS.session as SessionId, UUIDS.session as SessionId]],
+      ["root-recovery", [UUIDS.session as SessionId, UUIDS.session as SessionId]],
+      ["root-suspend", [UUIDS.session as SessionId, UUIDS.session as SessionId]],
+      ["fork-child", [UUIDS.session as SessionId, UUIDS.session as SessionId]],
+      ["amend-child-assignment", [UUIDS.parent as SessionId, UUIDS.session as SessionId]],
+      ["record-checkpoint", [UUIDS.session as SessionId, UUIDS.session as SessionId]],
+      ["record-evidence-batch", [null, UUIDS.session as SessionId]],
+      ["record-child-report", [UUIDS.session as SessionId, UUIDS.session as SessionId]],
+      ["disposition-child-report", [UUIDS.parent as SessionId, UUIDS.session as SessionId]],
+      ["propose-child-completion", [UUIDS.session as SessionId, UUIDS.session as SessionId]],
+      ["complete-child-session", [UUIDS.parent as SessionId, UUIDS.session as SessionId]],
+      ["suspend-child-session", [UUIDS.parent as SessionId, UUIDS.session as SessionId]],
+      ["create-child-transfer", [UUIDS.parent as SessionId, UUIDS.session as SessionId]],
+      ["claim-child-transfer", [UUIDS.parent as SessionId, UUIDS.parent as SessionId]],
+      ["request-session-end", [UUIDS.session as SessionId, UUIDS.session as SessionId]],
+      ["amend-session-end", [UUIDS.session as SessionId, UUIDS.session as SessionId]],
+      ["cancel-session-end", [UUIDS.session as SessionId, UUIDS.session as SessionId]],
+      ["abandon-session", [UUIDS.session as SessionId, UUIDS.session as SessionId]],
+    ]);
+    assert.equal(expected.size, commands.size - 1);
+
+    for (const [commandType, [exactAuthority, targetSessionId]] of expected) {
+      const command = commands.get(commandType)!;
+      const authoritySessionId = exactAuthority ?? UUIDS.parent as SessionId;
+      const authorization: SemanticCommandAuthorization = {
+        kind: "protected",
+        authoritySessionId,
+        targetSessionId,
+        proof: commandType === "root-recovery" ? null : proof,
+        approval: commandType === "root-recovery"
+          ? recoveryApproval
+          : commandType === "abandon-session" ? abandonmentApproval : null,
+        childBindingGrant: null,
+      };
+      assert.doesNotThrow(
+        () => assertSemanticCommandAuthorization(command, authorization),
+        commandType,
+      );
+      expectCode("SESSION_CAPABILITY_INVALID", () => assertSemanticCommandAuthorization(command, {
+        ...authorization,
+        targetSessionId: UUIDS.report as SessionId,
+      }));
+      if (exactAuthority !== null) {
+        expectCode("SESSION_CAPABILITY_INVALID", () => assertSemanticCommandAuthorization(command, {
+          ...authorization,
+          authoritySessionId: UUIDS.report as SessionId,
+        }));
+      }
+    }
+
+    const latestSafe = decodeLifecycleSemanticCommandDraft({
+      ...(semanticCommandCases().find(([type]) => type === "root-resume")?.[1] ?? {}),
+      sessionId: null,
+      resumePolicy: "latest-safe",
+    });
+    expectCode("SESSION_CAPABILITY_INVALID", () => assertSemanticCommandAuthorization(latestSafe, {
+      kind: "protected",
+      authoritySessionId: UUIDS.parent as SessionId,
+      targetSessionId: UUIDS.session as SessionId,
+      proof,
       approval: null,
       childBindingGrant: null,
     }));
@@ -1651,6 +2302,89 @@ describe("lifecycle Version 1 contracts", () => {
     assert.deepEqual(LIFECYCLE_EVENT_TYPES, expected);
     assert.ok(Object.isFrozen(LIFECYCLE_EVENT_TYPES));
     assert.equal(null as LifecycleEventV1 | null, null);
+  });
+
+  it("strictly decodes every typed lifecycle event as JSON-safe data", () => {
+    const cases = lifecycleEventPayloadCases();
+    assert.equal(cases.length, LIFECYCLE_EVENT_TYPES.length);
+    for (const [eventType, payload] of cases) {
+      const decoded = decodeLifecycleEventV1(validLifecycleEvent(eventType, payload));
+      assert.equal(decoded.eventType, eventType);
+      assert.equal(typeof decoded.streamVersion, "string");
+      assert.equal(typeof decoded.globalPosition, "string");
+      assert.ok(Object.isFrozen(decoded));
+      assert.ok(Object.isFrozen(decoded.payload));
+      const serialized = JSON.stringify(decoded);
+      assert.equal(JSON.parse(serialized).eventType, eventType);
+      assert.doesNotMatch(serialized, /rawOutput|stdout|stderr|environment|bearer|proofMac|approvalToken/i);
+    }
+  });
+
+  it("rejects wrong, noncanonical, or secret-bearing lifecycle event data", () => {
+    const startedPayload = lifecycleEventPayloadCases()[0]![1];
+    for (const [field, mutate] of [
+      ["event identity", (event: Record<string, unknown>) => { event.eventId = UUIDS.session.toUpperCase(); }],
+      ["project identity", (event: Record<string, unknown>) => { event.projectId = UUIDS.session.toUpperCase(); }],
+      ["workspace identity", (event: Record<string, unknown>) => { event.workspaceId = "not-a-hash"; }],
+      ["stream version", (event: Record<string, unknown>) => { event.streamVersion = "01"; }],
+      ["global position", (event: Record<string, unknown>) => { event.globalPosition = 1n; }],
+      ["timestamp", (event: Record<string, unknown>) => { event.occurredAt = "2026-07-14T10:11:12Z"; }],
+      ["authority commitment", (event: Record<string, unknown>) => { event.authorityCommitment = "not-a-hash"; }],
+      ["wrong discriminator payload", (event: Record<string, unknown>) => {
+        event.eventType = "SessionResumed";
+      }],
+    ] as const) {
+      const event = validLifecycleEvent("SessionStarted", { ...startedPayload });
+      mutate(event);
+      assert.throws(() => decodeLifecycleEventV1(event), { message: /LIFECYCLE_INPUT_INVALID/ }, field);
+    }
+
+    for (const key of [
+      "rawOutput",
+      "stdout",
+      "stderr",
+      "environment",
+      "command",
+      "evidence",
+      "bearerToken",
+      "proofMac",
+      "approvalToken",
+    ]) {
+      const event = validLifecycleEvent("SessionStarted", { ...startedPayload, [key]: "private" });
+      assert.throws(() => decodeLifecycleEventV1(event), { message: /LIFECYCLE_INPUT_INVALID/ }, key);
+    }
+
+    const accessorPayload = { ...startedPayload };
+    Object.defineProperty(accessorPayload, "authorityCommitment", {
+      enumerable: true,
+      get: () => "a".repeat(64),
+    });
+    assert.throws(
+      () => decodeLifecycleEventV1(validLifecycleEvent("SessionStarted", accessorPayload)),
+      { message: /LIFECYCLE_INPUT_INVALID/ },
+    );
+
+    const accessorEvent = validLifecycleEvent("SessionStarted", { ...startedPayload });
+    Object.defineProperty(accessorEvent, "streamVersion", {
+      enumerable: true,
+      get: () => "1",
+    });
+    assert.throws(() => decodeLifecycleEventV1(accessorEvent), { message: /LIFECYCLE_INPUT_INVALID/ });
+
+    const checkpointPayload = lifecycleEventPayloadCases()
+      .find(([eventType]) => eventType === "SessionCheckpointRecorded")![1];
+    assert.throws(() => decodeLifecycleEventV1(validLifecycleEvent("SessionCheckpointRecorded", {
+      ...checkpointPayload,
+      checkpointEventPosition: "14",
+    })), { message: /LIFECYCLE_INPUT_INVALID/ });
+
+    const coveragePayload = lifecycleEventPayloadCases()
+      .find(([eventType]) => eventType === "EvidenceCoverageRecorded")![1];
+    assert.throws(() => decodeLifecycleEventV1(validLifecycleEvent("EvidenceCoverageRecorded", {
+      ...coveragePayload,
+      highestContiguousOrdinal: "3",
+      missingIntervals: [{ firstOrdinal: "5", lastOrdinal: "6" }],
+    })), { message: /LIFECYCLE_INPUT_INVALID/ });
   });
 
   it("publishes the complete frozen typed-error vocabulary", () => {

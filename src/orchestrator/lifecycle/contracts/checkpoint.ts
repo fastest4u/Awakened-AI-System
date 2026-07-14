@@ -347,6 +347,9 @@ function evidenceCoverage(value: unknown): CheckpointEvidenceCoverageV1 {
   }
   if (coverage.captureMode !== "coverage-only") invalid("evidenceCoverage.captureMode");
   const intervals = source.map((item, index) => interval(item, `evidenceCoverage.missingIntervals[${index}]`));
+  const highestContiguousOrdinal = coverage.highestContiguousOrdinal === null
+    ? null
+    : parseDecimalString(coverage.highestContiguousOrdinal, "evidenceCoverage.highestContiguousOrdinal");
   for (let index = 1; index < intervals.length; index += 1) {
     const previous = intervals[index - 1];
     const current = intervals[index];
@@ -355,11 +358,16 @@ function evidenceCoverage(value: unknown): CheckpointEvidenceCoverageV1 {
       invalid("evidenceCoverage.missingIntervals");
     }
   }
+  const firstMissingInterval = intervals[0];
+  if (
+    firstMissingInterval !== undefined
+    && BigInt(firstMissingInterval.firstOrdinal) !== (
+      highestContiguousOrdinal === null ? 0n : BigInt(highestContiguousOrdinal) + 1n
+    )
+  ) invalid("evidenceCoverage.missingIntervals");
   return Object.freeze({
     captureMode: "coverage-only",
-    highestContiguousOrdinal: coverage.highestContiguousOrdinal === null
-      ? null
-      : parseDecimalString(coverage.highestContiguousOrdinal, "evidenceCoverage.highestContiguousOrdinal"),
+    highestContiguousOrdinal,
     missingIntervals: Object.freeze(intervals),
   });
 }

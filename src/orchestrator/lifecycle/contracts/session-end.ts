@@ -29,6 +29,9 @@ const CHILD_END_POLICIES = ["require-completed", "suspend-and-carry-forward"] as
 const VALIDATION_STATUSES = ["pass", "fail", "unavailable"] as const;
 const VALIDATION_EXIT_CLASSIFICATIONS = ["passed", "failed", "unavailable", "not-run"] as const;
 const LOWER_HASH = /^[0-9a-f]{64}$/;
+const GIT_OBJECT_ID = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
+const VALIDATION_RESULT_MAX_ARTIFACT_REFERENCES = 100;
+const VALIDATION_RESULT_MAX_SUMMARY_SCALARS = 4_000;
 
 export interface QualityProfileV1 {
   readonly profileId: string;
@@ -87,7 +90,7 @@ export type SessionEndPhase = (typeof SESSION_END_PHASES)[number];
 export interface ValidationOutputFingerprintV1 {
   readonly fingerprintSchemaVersion: 1;
   readonly fingerprintKeyId: string;
-  readonly fingerprintDomain: string;
+  readonly fingerprintDomain: "pm-validation-output-v1";
   readonly fingerprint: string;
 }
 
@@ -122,6 +125,216 @@ export interface ValidationResultV1 {
 
 function invalid(field: string): never {
   throw new LifecycleError("LIFECYCLE_INPUT_INVALID", { field });
+}
+
+function validationResultInvalid(): never {
+  throw new LifecycleError("SESSION_VALIDATION_RESULT_INVALID");
+}
+
+const VALIDATION_RESULT_KEYS = [
+  "validationResultVersion",
+  "resultId",
+  "projectId",
+  "vaultId",
+  "storeId",
+  "workspaceId",
+  "sessionId",
+  "workflowId",
+  "workflowGeneration",
+  "finalCheckpointId",
+  "finalCheckpointFingerprint",
+  "profileId",
+  "profileVersion",
+  "profileConfigurationHash",
+  "runId",
+  "runnerId",
+  "sourceStateAtStart",
+  "sourceStateAtCompletion",
+  "startedAt",
+  "completedAt",
+  "status",
+  "exitClassification",
+  "summary",
+  "outputFingerprint",
+  "artifactReferences",
+  "fresh",
+] as const;
+
+const VALIDATION_SOURCE_STATE_KEYS = [
+  "sourceStateScopeVersion",
+  "workspaceId",
+  "branchRef",
+  "headCommit",
+  "dirtyWorktreeFingerprint",
+] as const;
+
+const VALIDATION_OUTPUT_FINGERPRINT_KEYS = [
+  "fingerprintSchemaVersion",
+  "fingerprintKeyId",
+  "fingerprintDomain",
+  "fingerprint",
+] as const;
+
+function decodeValidationSourceState(
+  value: unknown,
+  field: string,
+  expectedWorkspaceId: string,
+): SourceStateFingerprintV1 {
+  const state = exactRecord(
+    value,
+    VALIDATION_SOURCE_STATE_KEYS,
+    field,
+    "SESSION_VALIDATION_RESULT_INVALID",
+  );
+  if (
+    state.sourceStateScopeVersion !== 1
+    || typeof state.workspaceId !== "string"
+    || !LOWER_HASH.test(state.workspaceId)
+    || state.workspaceId !== expectedWorkspaceId
+  ) validationResultInvalid();
+  const branchRef = state.branchRef === null
+    ? null
+    : parseBoundedString(state.branchRef, `${field}.branchRef`, 1_024);
+  const headCommit = state.headCommit;
+  if (headCommit !== null && (typeof headCommit !== "string" || !GIT_OBJECT_ID.test(headCommit))) {
+    validationResultInvalid();
+  }
+  if (
+    typeof state.dirtyWorktreeFingerprint !== "string"
+    || !LOWER_HASH.test(state.dirtyWorktreeFingerprint)
+  ) validationResultInvalid();
+  return Object.freeze({
+    sourceStateScopeVersion: 1,
+    workspaceId: state.workspaceId,
+    branchRef,
+    headCommit: headCommit as string | null,
+    dirtyWorktreeFingerprint: state.dirtyWorktreeFingerprint,
+  });
+}
+
+function decodeValidationOutputFingerprint(value: unknown): ValidationOutputFingerprintV1 {
+  const fingerprint = exactRecord(
+    value,
+    VALIDATION_OUTPUT_FINGERPRINT_KEYS,
+    "validationResult.outputFingerprint",
+    "SESSION_VALIDATION_RESULT_INVALID",
+  );
+  if (
+    fingerprint.fingerprintSchemaVersion !== 1
+    || fingerprint.fingerprintDomain !== "pm-validation-output-v1"
+    || typeof fingerprint.fingerprint !== "string"
+    || !LOWER_HASH.test(fingerprint.fingerprint)
+  ) validationResultInvalid();
+  return Object.freeze({
+    fingerprintSchemaVersion: 1,
+    fingerprintKeyId: parseBoundedString(
+      fingerprint.fingerprintKeyId,
+      "validationResult.outputFingerprint.fingerprintKeyId",
+      128,
+    ),
+    fingerprintDomain: "pm-validation-output-v1",
+    fingerprint: fingerprint.fingerprint,
+  });
+}
+
+export function decodeValidationResultV1(value: unknown): ValidationResultV1 {
+  try {
+    const result = exactRecord(
+      value,
+      VALIDATION_RESULT_KEYS,
+      "validationResult",
+      "SESSION_VALIDATION_RESULT_INVALID",
+    );
+    if (result.validationResultVersion !== 1) validationResultInvalid();
+    const workspaceId = result.workspaceId;
+    if (typeof workspaceId !== "string" || !LOWER_HASH.test(workspaceId)) {
+      validationResultInvalid();
+    }
+    const finalCheckpointFingerprint = result.finalCheckpointFingerprint;
+    const profileConfigurationHash = result.profileConfigurationHash;
+    if (
+      typeof finalCheckpointFingerprint !== "string"
+      || !LOWER_HASH.test(finalCheckpointFingerprint)
+      || typeof profileConfigurationHash !== "string"
+      || !LOWER_HASH.test(profileConfigurationHash)
+    ) validationResultInvalid();
+    const startedAt = parseCanonicalTimestamp(result.startedAt, "validationResult.startedAt");
+    const completedAt = parseCanonicalTimestamp(result.completedAt, "validationResult.completedAt");
+    if (completedAt < startedAt) validationResultInvalid();
+    const artifactSource = strictArray(
+      result.artifactReferences,
+      "validationResult.artifactReferences",
+      "SESSION_VALIDATION_RESULT_INVALID",
+    );
+    if (artifactSource.length > VALIDATION_RESULT_MAX_ARTIFACT_REFERENCES) {
+      validationResultInvalid();
+    }
+    const artifactReferences = Object.freeze(artifactSource.map((reference, index) =>
+      parseBoundedString(
+        reference,
+        `validationResult.artifactReferences[${index}]`,
+        512,
+      )));
+    return Object.freeze({
+      validationResultVersion: 1,
+      resultId: parseLifecycleId<ValidationResultId>(result.resultId, "validationResult.resultId"),
+      projectId: parseLifecycleId<ProjectId>(result.projectId, "validationResult.projectId"),
+      vaultId: parseLifecycleId<VaultId>(result.vaultId, "validationResult.vaultId"),
+      storeId: parseLifecycleId<StoreId>(result.storeId, "validationResult.storeId"),
+      workspaceId: workspaceId as WorkspaceId,
+      sessionId: parseLifecycleId<SessionId>(result.sessionId, "validationResult.sessionId"),
+      workflowId: parseLifecycleId<WorkflowId>(result.workflowId, "validationResult.workflowId"),
+      workflowGeneration: parseInteger(
+        result.workflowGeneration,
+        "validationResult.workflowGeneration",
+        1,
+        Number.MAX_SAFE_INTEGER,
+      ),
+      finalCheckpointId: parseLifecycleId<CheckpointId>(
+        result.finalCheckpointId,
+        "validationResult.finalCheckpointId",
+      ),
+      finalCheckpointFingerprint,
+      profileId: parseBoundedString(result.profileId, "validationResult.profileId", 256),
+      profileVersion: parseInteger(
+        result.profileVersion,
+        "validationResult.profileVersion",
+        1,
+        Number.MAX_SAFE_INTEGER,
+      ),
+      profileConfigurationHash,
+      runId: parseLifecycleId(result.runId, "validationResult.runId"),
+      runnerId: parseLifecycleId(result.runnerId, "validationResult.runnerId"),
+      sourceStateAtStart: decodeValidationSourceState(
+        result.sourceStateAtStart,
+        "validationResult.sourceStateAtStart",
+        workspaceId,
+      ),
+      sourceStateAtCompletion: decodeValidationSourceState(
+        result.sourceStateAtCompletion,
+        "validationResult.sourceStateAtCompletion",
+        workspaceId,
+      ),
+      startedAt,
+      completedAt,
+      status: parseEnum(result.status, VALIDATION_STATUSES, "validationResult.status"),
+      exitClassification: parseEnum(
+        result.exitClassification,
+        VALIDATION_EXIT_CLASSIFICATIONS,
+        "validationResult.exitClassification",
+      ),
+      summary: parseBoundedString(
+        result.summary,
+        "validationResult.summary",
+        VALIDATION_RESULT_MAX_SUMMARY_SCALARS,
+      ),
+      outputFingerprint: decodeValidationOutputFingerprint(result.outputFingerprint),
+      artifactReferences,
+      fresh: parseBoolean(result.fresh, "validationResult.fresh"),
+    });
+  } catch {
+    validationResultInvalid();
+  }
 }
 
 function lexicalCompare(left: string, right: string): number {
@@ -275,14 +488,5 @@ export function decodeSessionEndAmendmentV1(value: unknown): SessionEndAmendment
 }
 
 export function assertValidationResultShape(result: ValidationResultV1): void {
-  if (
-    result.validationResultVersion !== 1
-    || !LOWER_HASH.test(result.profileConfigurationHash)
-    || !LOWER_HASH.test(result.finalCheckpointFingerprint)
-    || result.workflowGeneration < 1
-  ) invalid("validationResult");
-  parseCanonicalTimestamp(result.startedAt, "validationResult.startedAt");
-  parseCanonicalTimestamp(result.completedAt, "validationResult.completedAt");
-  parseEnum(result.status, VALIDATION_STATUSES, "validationResult.status");
-  parseEnum(result.exitClassification, VALIDATION_EXIT_CLASSIFICATIONS, "validationResult.exitClassification");
+  void decodeValidationResultV1(result);
 }

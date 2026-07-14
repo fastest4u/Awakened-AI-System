@@ -45,15 +45,16 @@ import {
   type WorkflowId,
 } from "./identifiers.js";
 import {
-  assertValidationResultShape,
   decodeSessionEndAmendmentV1,
   decodeSessionEndRequestV1,
+  decodeValidationResultV1,
   type SessionEndAmendmentV1,
   type SessionEndRequestV1,
   type ValidationResultV1,
 } from "./session-end.js";
 
 const LOWER_HASH = /^[0-9a-f]{64}$/;
+const LOWER_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const RESUME_POLICIES = ["exact", "latest-safe"] as const;
 const EVIDENCE_SOURCE_KINDS = [
   "model-turn",
@@ -372,6 +373,7 @@ export interface ValidationAttemptPlanIdentityV1 {
   readonly sessionId: SessionId;
   readonly workflowId: WorkflowId;
   readonly workflowGeneration: number;
+  readonly plannedWorkId: string;
   readonly finalCheckpointId: CheckpointId;
   readonly finalCheckpointFingerprint: string;
   readonly profileId: string;
@@ -416,6 +418,7 @@ const VALIDATION_ATTEMPT_PLAN_KEYS = [
   "sessionId",
   "workflowId",
   "workflowGeneration",
+  "plannedWorkId",
   "finalCheckpointId",
   "finalCheckpointFingerprint",
   "profileId",
@@ -427,6 +430,24 @@ const VALIDATION_ATTEMPT_PLAN_KEYS = [
   "resultIdempotencyKey",
 ] as const;
 
+const INTERNAL_VALIDATION_RESULT_COMMAND_KEYS = [
+  ...BASE_KEYS,
+  "workflowId",
+  "workflowGeneration",
+  "plannedWorkId",
+  "attemptPlan",
+  "claim",
+  "result",
+] as const;
+
+const WORKFLOW_CLAIM_KEYS = [
+  "workflowId",
+  "workflowGeneration",
+  "claimOwnerId",
+  "claimToken",
+  "claimExpiresAt",
+] as const;
+
 function invalidValidationResultBinding(): never {
   throw new LifecycleError("SESSION_VALIDATION_RESULT_INVALID");
 }
@@ -435,8 +456,66 @@ export function assertInternalValidationResultBinding(
   command: InternalValidationResultCommand,
 ): void {
   try {
+    const commandRecord = exactRecord(
+      command,
+      INTERNAL_VALIDATION_RESULT_COMMAND_KEYS,
+      "internalValidationResultCommand",
+      "SESSION_VALIDATION_RESULT_INVALID",
+    );
+    if (commandRecord.commandType !== "internal-validation-result") {
+      invalidValidationResultBinding();
+    }
+    parseLifecycleId(commandRecord.commandId, "internalValidationResultCommand.commandId");
+    parseLifecycleId(commandRecord.idempotencyKey, "internalValidationResultCommand.idempotencyKey");
+    parseBoundedString(commandRecord.agentId, "internalValidationResultCommand.agentId", 256);
+    parseLifecycleId<ProjectId>(
+      commandRecord.expectedProjectId,
+      "internalValidationResultCommand.expectedProjectId",
+    );
+    parseLifecycleId<VaultId>(
+      commandRecord.expectedVaultId,
+      "internalValidationResultCommand.expectedVaultId",
+    );
+    if (
+      typeof commandRecord.expectedWorkspaceId !== "string"
+      || !LOWER_HASH.test(commandRecord.expectedWorkspaceId)
+    ) invalidValidationResultBinding();
+    parseNullableBoundedString(
+      commandRecord.expectedBranchRef,
+      "internalValidationResultCommand.expectedBranchRef",
+      1_024,
+    );
+    parseLifecycleId<WorkflowId>(commandRecord.workflowId, "internalValidationResultCommand.workflowId");
+    parseInteger(
+      commandRecord.workflowGeneration,
+      "internalValidationResultCommand.workflowGeneration",
+      1,
+      Number.MAX_SAFE_INTEGER,
+    );
+    if (typeof commandRecord.plannedWorkId !== "string" || !LOWER_HASH.test(commandRecord.plannedWorkId)) {
+      invalidValidationResultBinding();
+    }
+    const claimRecord = exactRecord(
+      commandRecord.claim,
+      WORKFLOW_CLAIM_KEYS,
+      "internalValidationResultCommand.claim",
+      "SESSION_VALIDATION_RESULT_INVALID",
+    );
+    parseLifecycleId<WorkflowId>(claimRecord.workflowId, "internalValidationResultCommand.claim.workflowId");
+    parseInteger(
+      claimRecord.workflowGeneration,
+      "internalValidationResultCommand.claim.workflowGeneration",
+      1,
+      Number.MAX_SAFE_INTEGER,
+    );
+    parseLifecycleId(claimRecord.claimOwnerId, "internalValidationResultCommand.claim.claimOwnerId");
+    parseLifecycleId(claimRecord.claimToken, "internalValidationResultCommand.claim.claimToken");
+    parseCanonicalTimestamp(
+      claimRecord.claimExpiresAt,
+      "internalValidationResultCommand.claim.claimExpiresAt",
+    );
     const planRecord = exactRecord(
-      command.attemptPlan,
+      commandRecord.attemptPlan,
       VALIDATION_ATTEMPT_PLAN_KEYS,
       "validationAttemptPlan",
       "SESSION_VALIDATION_RESULT_INVALID",
@@ -456,6 +535,9 @@ export function assertInternalValidationResultBinding(
       1,
       Number.MAX_SAFE_INTEGER,
     );
+    if (typeof planRecord.plannedWorkId !== "string" || !LOWER_HASH.test(planRecord.plannedWorkId)) {
+      invalidValidationResultBinding();
+    }
     parseLifecycleId<CheckpointId>(planRecord.finalCheckpointId, "attemptPlan.finalCheckpointId");
     if (
       typeof planRecord.finalCheckpointFingerprint !== "string"
@@ -471,21 +553,20 @@ export function assertInternalValidationResultBinding(
     parseLifecycleId<ValidationResultId>(planRecord.resultId, "attemptPlan.resultId");
     parseLifecycleId(planRecord.resultCommandId, "attemptPlan.resultCommandId");
     parseLifecycleId(planRecord.resultIdempotencyKey, "attemptPlan.resultIdempotencyKey");
-    assertValidationResultShape(command.result);
+    const result = decodeValidationResultV1(commandRecord.result);
 
-    const plan = command.attemptPlan;
-    const result = command.result;
+    const plan = commandRecord.attemptPlan as unknown as ValidationAttemptPlanIdentityV1;
     if (
-      command.commandType !== "internal-validation-result"
-      || command.commandId !== plan.resultCommandId
-      || command.idempotencyKey !== plan.resultIdempotencyKey
-      || command.expectedProjectId !== plan.projectId
-      || command.expectedVaultId !== plan.vaultId
-      || command.expectedWorkspaceId !== plan.workspaceId
-      || command.workflowId !== plan.workflowId
-      || command.workflowGeneration !== plan.workflowGeneration
-      || command.claim.workflowId !== plan.workflowId
-      || command.claim.workflowGeneration !== plan.workflowGeneration
+      commandRecord.commandId !== plan.resultCommandId
+      || commandRecord.idempotencyKey !== plan.resultIdempotencyKey
+      || commandRecord.expectedProjectId !== plan.projectId
+      || commandRecord.expectedVaultId !== plan.vaultId
+      || commandRecord.expectedWorkspaceId !== plan.workspaceId
+      || commandRecord.workflowId !== plan.workflowId
+      || commandRecord.workflowGeneration !== plan.workflowGeneration
+      || commandRecord.plannedWorkId !== plan.plannedWorkId
+      || claimRecord.workflowId !== plan.workflowId
+      || claimRecord.workflowGeneration !== plan.workflowGeneration
       || result.resultId !== plan.resultId
       || result.projectId !== plan.projectId
       || result.vaultId !== plan.vaultId
@@ -894,38 +975,197 @@ function invalidAuthorization(): never {
   throw new LifecycleError("SESSION_CAPABILITY_INVALID");
 }
 
+const AUTHORIZATION_KEYS = [
+  "kind",
+  "authoritySessionId",
+  "targetSessionId",
+  "proof",
+  "approval",
+  "childBindingGrant",
+] as const;
+
+function canonicalAuthorizationId(value: unknown): value is string {
+  return typeof value === "string" && LOWER_UUID.test(value);
+}
+
+function decodeCapabilityProof(value: unknown): CapabilityProofV1 | null {
+  if (value === null) return null;
+  const proof = exactRecord(
+    value,
+    ["proofVersion", "target", "proofNonce", "proofFingerprint"],
+    "authorization.proof",
+    "SESSION_CAPABILITY_INVALID",
+  );
+  if (
+    proof.proofVersion !== 1
+    || proof.target !== "semantic-command"
+    || !canonicalAuthorizationId(proof.proofNonce)
+    || typeof proof.proofFingerprint !== "string"
+    || !LOWER_HASH.test(proof.proofFingerprint)
+  ) invalidAuthorization();
+  return proof as unknown as CapabilityProofV1;
+}
+
+function decodeLifecycleApproval(value: unknown): RedactedLifecycleApproval | null {
+  if (value === null) return null;
+  const approval = exactRecord(
+    value,
+    ["approvalVersion", "approvalId", "action", "approvalFingerprint"],
+    "authorization.approval",
+    "SESSION_CAPABILITY_INVALID",
+  );
+  if (
+    approval.approvalVersion !== 1
+    || !canonicalAuthorizationId(approval.approvalId)
+    || (approval.action !== "recover-root-authority" && approval.action !== "abandon-root")
+    || typeof approval.approvalFingerprint !== "string"
+    || !LOWER_HASH.test(approval.approvalFingerprint)
+  ) invalidAuthorization();
+  return approval as unknown as RedactedLifecycleApproval;
+}
+
+function decodeChildBindingGrant(value: unknown): RedactedChildBindingGrant | null {
+  if (value === null) return null;
+  const grant = exactRecord(
+    value,
+    ["grantVersion", "grantId", "targetClientInstanceId", "grantFingerprint"],
+    "authorization.childBindingGrant",
+    "SESSION_CAPABILITY_INVALID",
+  );
+  if (
+    grant.grantVersion !== 1
+    || !canonicalAuthorizationId(grant.grantId)
+    || typeof grant.grantFingerprint !== "string"
+    || !LOWER_HASH.test(grant.grantFingerprint)
+  ) invalidAuthorization();
+  parseBoundedString(
+    grant.targetClientInstanceId,
+    "authorization.childBindingGrant.targetClientInstanceId",
+    256,
+    { code: "SESSION_CAPABILITY_INVALID" },
+  );
+  return grant as unknown as RedactedChildBindingGrant;
+}
+
+function assertSemanticAuthorizationSessionBinding(
+  command: Exclude<LifecycleSemanticCommandDraft, RootStartCommandV2>,
+  authoritySessionId: string,
+  targetSessionId: string,
+): void {
+  switch (command.commandType) {
+    case "root-resume":
+      if (command.sessionId === null) {
+        if (authoritySessionId !== targetSessionId) invalidAuthorization();
+      } else if (
+        authoritySessionId !== command.sessionId
+        || targetSessionId !== command.sessionId
+      ) invalidAuthorization();
+      return;
+    case "root-recovery":
+    case "root-suspend":
+    case "amend-session-end":
+    case "cancel-session-end":
+    case "abandon-session":
+      if (
+        authoritySessionId !== command.sessionId
+        || targetSessionId !== command.sessionId
+      ) invalidAuthorization();
+      return;
+    case "fork-child":
+      if (
+        authoritySessionId !== command.parentSessionId
+        || targetSessionId !== command.parentSessionId
+      ) invalidAuthorization();
+      return;
+    case "amend-child-assignment":
+    case "disposition-child-report":
+    case "complete-child-session":
+    case "suspend-child-session":
+    case "create-child-transfer":
+      if (
+        authoritySessionId !== command.parentSessionId
+        || targetSessionId !== command.childSessionId
+      ) invalidAuthorization();
+      return;
+    case "record-checkpoint":
+      if (
+        authoritySessionId !== command.sessionId
+        || targetSessionId !== command.sessionId
+      ) invalidAuthorization();
+      return;
+    case "record-evidence-batch":
+      if (targetSessionId !== command.sessionId) invalidAuthorization();
+      return;
+    case "record-child-report":
+    case "propose-child-completion":
+      if (
+        authoritySessionId !== command.childSessionId
+        || targetSessionId !== command.childSessionId
+      ) invalidAuthorization();
+      return;
+    case "claim-child-transfer":
+      if (
+        authoritySessionId !== command.rootSessionId
+        || targetSessionId !== command.rootSessionId
+      ) invalidAuthorization();
+      return;
+    case "request-session-end":
+      if (
+        authoritySessionId !== command.request.sessionId
+        || targetSessionId !== command.request.sessionId
+      ) invalidAuthorization();
+      return;
+  }
+}
+
 export function assertSemanticCommandAuthorization(
   command: LifecycleSemanticCommandDraft,
   authorization: SemanticCommandAuthorization,
 ): void {
-  if (authorization.kind === "initial-authority") {
+  const authorizationRecord = exactRecord(
+    authorization,
+    AUTHORIZATION_KEYS,
+    "authorization",
+    "SESSION_CAPABILITY_INVALID",
+  );
+  if (authorizationRecord.kind === "initial-authority") {
     if (
       command.commandType !== "root-start"
-      || authorization.authoritySessionId !== null
-      || authorization.targetSessionId !== null
-      || authorization.proof !== null
-      || authorization.approval !== null
-      || authorization.childBindingGrant !== null
+      || authorizationRecord.authoritySessionId !== null
+      || authorizationRecord.targetSessionId !== null
+      || authorizationRecord.proof !== null
+      || authorizationRecord.approval !== null
+      || authorizationRecord.childBindingGrant !== null
     ) invalidAuthorization();
     return;
   }
 
-  if (command.commandType === "root-start") invalidAuthorization();
   if (
-    authorization.proof === null
-    && authorization.approval === null
-    && authorization.childBindingGrant === null
+    authorizationRecord.kind !== "protected"
+    || command.commandType === "root-start"
+    || !canonicalAuthorizationId(authorizationRecord.authoritySessionId)
+    || !canonicalAuthorizationId(authorizationRecord.targetSessionId)
   ) invalidAuthorization();
-  if (authorization.proof !== null && authorization.proof.target !== "semantic-command") {
-    invalidAuthorization();
-  }
+  const proof = decodeCapabilityProof(authorizationRecord.proof);
+  const approval = decodeLifecycleApproval(authorizationRecord.approval);
+  const childBindingGrant = decodeChildBindingGrant(authorizationRecord.childBindingGrant);
+  assertSemanticAuthorizationSessionBinding(
+    command,
+    authorizationRecord.authoritySessionId,
+    authorizationRecord.targetSessionId,
+  );
+  if (
+    proof === null
+    && approval === null
+    && childBindingGrant === null
+  ) invalidAuthorization();
 
   if (command.commandType === "root-recovery") {
     if (
-      authorization.proof !== null
-      || authorization.approval === null
-      || authorization.approval.action !== "recover-root-authority"
-      || authorization.childBindingGrant !== null
+      proof !== null
+      || approval === null
+      || approval.action !== "recover-root-authority"
+      || childBindingGrant !== null
     ) {
       invalidAuthorization();
     }
@@ -933,10 +1173,10 @@ export function assertSemanticCommandAuthorization(
   }
   if (command.commandType === "abandon-session") {
     if (
-      authorization.proof === null
-      || authorization.approval === null
-      || authorization.approval.action !== "abandon-root"
-      || authorization.childBindingGrant !== null
+      proof === null
+      || approval === null
+      || approval.action !== "abandon-root"
+      || childBindingGrant !== null
     ) {
       invalidAuthorization();
     }
@@ -944,13 +1184,13 @@ export function assertSemanticCommandAuthorization(
   }
   if (command.commandType === "fork-child") {
     if (
-      authorization.proof === null
-      || authorization.approval !== null
-      || (authorization.childBindingGrant !== null) !== command.directAccessRequested
+      proof === null
+      || approval !== null
+      || (childBindingGrant !== null) !== command.directAccessRequested
     ) invalidAuthorization();
     return;
   }
-  if (authorization.proof === null || authorization.approval !== null || authorization.childBindingGrant !== null) {
+  if (proof === null || approval !== null || childBindingGrant !== null) {
     invalidAuthorization();
   }
 }
