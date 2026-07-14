@@ -20,6 +20,8 @@ import { LifecycleError } from "./errors.js";
 const SQLITE_INT64_MAX = 9_223_372_036_854_775_807n;
 const UNSIGNED_DECIMAL = /^(0|[1-9][0-9]*)$/;
 const LOWER_HASH = /^[0-9a-f]{64}$/;
+const CANONICAL_REPORT_ITEM_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const CHILD_REPORT_LIMIT_V1 = 200;
 
 function rootStates(...states: RootSessionState[]): readonly RootSessionState[] {
   return Object.freeze(states);
@@ -158,13 +160,15 @@ export interface ChildAggregateState extends AggregateBase {
   readonly claimedTransferTicketId: TransferTicketId | null;
   readonly suspensionCheckpointId: CheckpointId | null;
   readonly latestReportId: ReportId | null;
-  readonly reportLineage: readonly ChildReportLineage[];
+  readonly reportCount: number;
+  readonly reportIndexHead: ChildReportIndexNode | null;
   readonly completionReportId: ReportId | null;
 }
 
-export interface ChildReportLineage {
+export interface ChildReportIndexNode {
   readonly reportId: ReportId;
-  readonly allReportItemIds: readonly ReportItemId[];
+  readonly itemSignature: string;
+  readonly previous: ChildReportIndexNode | null;
 }
 
 export type SessionAggregateState = RootAggregateState | ChildAggregateState;
@@ -312,7 +316,8 @@ function initializeSession(event: LifecycleEventV1): SessionAggregateState {
       claimedTransferTicketId: null,
       suspensionCheckpointId: null,
       latestReportId: null,
-      reportLineage: Object.freeze([]),
+      reportCount: 0,
+      reportIndexHead: null,
       completionReportId: null,
     });
   }
@@ -340,32 +345,12 @@ function assertContinuationEnvelope(
   return positions;
 }
 
-export function isSessionTransitionAllowed(
-  kind: "root",
-  state: RootSessionState,
-  eventType: LifecycleEventType,
-): boolean;
-export function isSessionTransitionAllowed(
-  kind: "child",
-  state: ChildSessionState,
-  eventType: LifecycleEventType,
-): boolean;
-export function isSessionTransitionAllowed(
-  kind: "root" | "child",
-  state: RootSessionState | ChildSessionState,
-  eventType: LifecycleEventType,
-): boolean {
-  return kind === "root"
-    ? ROOT_TRANSITIONS[eventType].includes(state as RootSessionState)
-    : CHILD_TRANSITIONS[eventType].includes(state as ChildSessionState);
-}
-
 function isAllowedRootTransition(state: RootAggregateState, eventType: LifecycleEventType): boolean {
-  return isSessionTransitionAllowed("root", state.state, eventType);
+  return ROOT_TRANSITIONS[eventType].includes(state.state);
 }
 
 function isAllowedChildTransition(state: ChildAggregateState, eventType: LifecycleEventType): boolean {
-  return isSessionTransitionAllowed("child", state.state, eventType);
+  return CHILD_TRANSITIONS[eventType].includes(state.state);
 }
 
 function withRootEvent(
@@ -449,23 +434,31 @@ function assertWorkflow(
   ) integrity();
 }
 
-function reportLineage(
-  state: ChildAggregateState,
-  reportId: ReportId,
-): ChildReportLineage | null {
-  return state.reportLineage.find((report) => report.reportId === reportId) ?? null;
+function reportItemSignature(
+  itemIds: readonly ReportItemId[],
+): string {
+  const sortedItemIds = [...itemIds].sort();
+  for (let index = 0; index < sortedItemIds.length; index += 1) {
+    const itemId = sortedItemIds[index];
+    if (
+      itemId === undefined
+      || !CANONICAL_REPORT_ITEM_ID.test(itemId)
+      || (index > 0 && itemId === sortedItemIds[index - 1])
+    ) integrity();
+  }
+  return sortedItemIds.join("");
 }
 
-function sameReportItemSet(
-  left: readonly ReportItemId[],
-  right: readonly ReportItemId[],
-): boolean {
-  if (left.length !== right.length) return false;
-  const leftSet = new Set<ReportItemId>(left);
-  const rightSet = new Set<ReportItemId>(right);
-  return leftSet.size === left.length
-    && rightSet.size === right.length
-    && left.every((itemId) => rightSet.has(itemId));
+function reportItemSignatureFor(
+  state: ChildAggregateState,
+  reportId: ReportId,
+): string | null {
+  let node = state.reportIndexHead;
+  while (node !== null) {
+    if (node.reportId === reportId) return node.itemSignature;
+    node = node.previous;
+  }
+  return null;
 }
 
 function evolveRoot(
@@ -522,7 +515,10 @@ function evolveRoot(
         event,
         streamVersion,
         eventPosition,
-        checkpointChanges(state, event, eventPosition),
+        {
+          ...checkpointChanges(state, event, eventPosition),
+          suspendRequestedCheckpointId: null,
+        },
       );
     case "EvidenceCoverageRecorded":
       return withRootEvent(state, event, streamVersion, eventPosition, {});
@@ -649,14 +645,15 @@ function evolveChild(
 ): ChildAggregateState {
   if (!isAllowedChildTransition(state, event.eventType)) stateConflict();
   switch (event.eventType) {
-    case "SessionCheckpointRecorded":
-      return withChildEvent(
-        state,
-        event,
-        streamVersion,
-        eventPosition,
-        checkpointChanges(state, event, eventPosition),
-      );
+    case "SessionCheckpointRecorded": {
+      const changes = checkpointChanges(state, event, eventPosition);
+      return withChildEvent(state, event, streamVersion, eventPosition, {
+        ...changes,
+        ...(state.state === "suspended"
+          ? { suspensionCheckpointId: changes.latestCheckpointId }
+          : {}),
+      });
+    }
     case "EvidenceCoverageRecorded":
       return withChildEvent(state, event, streamVersion, eventPosition, {});
     case "ChildAssignmentAmended":
@@ -674,28 +671,26 @@ function evolveChild(
         event.payload.report.childSessionId !== state.sessionId
         || event.payload.report.parentSessionId !== state.parentSessionId
         || event.payload.report.assignmentId !== state.assignment.assignmentId
-        || reportLineage(state, event.payload.report.reportId) !== null
+        || state.reportCount >= CHILD_REPORT_LIMIT_V1
+        || reportItemSignatureFor(state, event.payload.report.reportId) !== null
       ) integrity();
       {
-        const itemIds = Object.freeze([...event.payload.report.allReportItemIds]);
-        if (new Set(itemIds).size !== itemIds.length) integrity();
-        const nextLineage = Object.freeze({
+        const nextIndexHead: ChildReportIndexNode = Object.freeze({
           reportId: event.payload.report.reportId,
-          allReportItemIds: itemIds,
+          itemSignature: reportItemSignature(event.payload.report.allReportItemIds),
+          previous: state.reportIndexHead,
         });
         return withChildEvent(state, event, streamVersion, eventPosition, {
           latestReportId: event.payload.report.reportId,
-          reportLineage: Object.freeze([...state.reportLineage, nextLineage]),
+          reportCount: state.reportCount + 1,
+          reportIndexHead: nextIndexHead,
         });
       }
     case "ChildWorkDispositioned": {
-      const referencedReport = reportLineage(state, event.payload.disposition.reportId);
+      const referencedSignature = reportItemSignatureFor(state, event.payload.disposition.reportId);
       if (
-        referencedReport === null
-        || !sameReportItemSet(
-          referencedReport.allReportItemIds,
-          event.payload.disposition.allReportItemIds,
-        )
+        referencedSignature === null
+        || referencedSignature !== reportItemSignature(event.payload.disposition.allReportItemIds)
       ) integrity();
       const rejectedProposal = state.state === "completion-proposed"
         && event.payload.disposition.kind === "rejected"
@@ -705,14 +700,14 @@ function evolveChild(
         : {});
     }
     case "ChildCompletionProposed":
-      if (reportLineage(state, event.payload.reportId) === null) integrity();
+      if (reportItemSignatureFor(state, event.payload.reportId) === null) integrity();
       return withChildEvent(state, event, streamVersion, eventPosition, {
         state: "completion-proposed",
         completionReportId: event.payload.reportId,
       });
     case "ChildSessionCompleted":
       if (
-        reportLineage(state, event.payload.reportId) === null
+        reportItemSignatureFor(state, event.payload.reportId) === null
         || (
           state.state === "completion-proposed"
           && state.completionReportId !== event.payload.reportId

@@ -4,9 +4,9 @@ import {
   assertAuthorityMirror,
   evolveSession,
   foldSession,
-  isSessionTransitionAllowed,
   isTerminalSession,
   type ChildAggregateState,
+  type ChildReportIndexNode,
   type RootAggregateState,
   type SessionAggregateState,
   type SessionAuthorityMirror,
@@ -62,6 +62,12 @@ import {
   rootAggregate,
   validationResultFixture,
 } from "./support/lifecycle-fixtures.js";
+
+type SessionAggregateModule = typeof import("../src/orchestrator/lifecycle/session-aggregate.js");
+type TransitionPolicyIsPrivate = "isSessionTransitionAllowed" extends keyof SessionAggregateModule
+  ? false
+  : true;
+const TRANSITION_POLICY_IS_PRIVATE: TransitionPolicyIsPrivate = true;
 
 type LifecycleCode = "INTEGRITY_FAILURE" | "SESSION_STATE_CONFLICT";
 
@@ -327,9 +333,23 @@ describe("SessionAggregate", () => {
         baseEventPosition: requested.eventPosition.toString(),
         checkpointEventPosition: newerCheckpointPosition.toString(),
       }));
+      assert.equal(withNewerCheckpoint.suspendRequestedCheckpointId, null);
       expectIntegrity(() => evolveSession(withNewerCheckpoint, eventAfter(withNewerCheckpoint, "SessionSuspended", {
         authorityCommitment: AUTHORITY_B,
       })));
+      const replacementRequested = evolveSession(
+        withNewerCheckpoint,
+        eventAfter(withNewerCheckpoint, "SessionSuspendRequested", {
+          checkpointId: newerCheckpointId,
+        }),
+      );
+      const replacementSuspended = evolveSession(
+        replacementRequested,
+        eventAfter(replacementRequested, "SessionSuspended", {
+          authorityCommitment: AUTHORITY_B,
+        }),
+      );
+      assert.equal(replacementSuspended.state, "suspended");
 
       const suspended = evolveSession(requested, eventAfter(requested, "SessionSuspended", {
         authorityCommitment: AUTHORITY_B,
@@ -774,6 +794,33 @@ describe("SessionAggregate", () => {
       assert.equal(transferred.state, "transferred");
     });
 
+    it("makes a newer suspended-child checkpoint govern transfer", () => {
+      const suspended = suspendedChild();
+      const newerCheckpointId = lifecycleUuid<CheckpointId>(617);
+      const newerCheckpointPosition = suspended.eventPosition + 1n;
+      const recheckpointed = evolveSession(suspended, eventAfter(suspended, "SessionCheckpointRecorded", {
+        checkpoint: checkpointFixture({
+          sessionId: suspended.sessionId,
+          parentSessionId: suspended.parentSessionId,
+          checkpointId: newerCheckpointId,
+          baseEventPosition: suspended.eventPosition,
+          checkpointEventPosition: newerCheckpointPosition,
+        }),
+        baseEventPosition: suspended.eventPosition.toString(),
+        checkpointEventPosition: newerCheckpointPosition.toString(),
+      }));
+
+      expectIntegrity(() => evolveSession(recheckpointed, eventAfter(recheckpointed, "ChildWorkTransferCreated", {
+        checkpointId: CHECKPOINT_ID,
+        authorityCommitment: AUTHORITY_C,
+      })));
+      const transferred = evolveSession(recheckpointed, eventAfter(recheckpointed, "ChildWorkTransferCreated", {
+        checkpointId: newerCheckpointId,
+        authorityCommitment: AUTHORITY_C,
+      }));
+      assert.equal(transferred.state, "transferred");
+    });
+
     it("enforces assignment revisions and immutable assignment identity in every allowed nonterminal state", () => {
       for (const child of [childAggregate(), completionProposedChild(), suspendedChild()] as const) {
         const amended = evolveSession(child, eventAfter(child, "ChildAssignmentAmended", {
@@ -815,7 +862,7 @@ describe("SessionAggregate", () => {
       }
     });
 
-    it("preserves frozen report-item lineage and rejects duplicate report identities", () => {
+    it("stores report lineage as a canonical frozen structurally shared index", () => {
       const child = childAggregate();
       const mutableItemIds = [REPORT_ITEM_ID, SECOND_REPORT_ITEM_ID];
       const report = {
@@ -823,21 +870,90 @@ describe("SessionAggregate", () => {
         allReportItemIds: mutableItemIds,
       };
       const reported = evolveSession(child, eventAfter(child, "ChildWorkReported", { report }));
-      const lineage = (reported as unknown as {
-        readonly reportLineage?: readonly {
-          readonly reportId: ReportId;
-          readonly allReportItemIds: readonly ReportItemId[];
-        }[];
-      }).reportLineage;
-      assert.ok(Array.isArray(lineage));
-      assert.equal(Object.isFrozen(lineage), true);
-      assert.equal(Object.isFrozen(lineage[0]), true);
-      assert.equal(Object.isFrozen(lineage[0]?.allReportItemIds), true);
+      assert.equal(reported.reportCount, 1);
+      assert.equal("reportLineage" in reported, false);
+      const firstHead = reported.reportIndexHead;
+      assert.ok(firstHead);
+      assert.equal(Object.isFrozen(firstHead), true);
+      assert.equal(firstHead.reportId, REPORT_ID);
+      assert.equal(firstHead.previous, null);
+      assert.deepEqual(Object.keys(firstHead).sort(), ["itemSignature", "previous", "reportId"]);
+      assert.equal(Object.values(firstHead).some(Array.isArray), false);
+      const firstSignature = firstHead.itemSignature;
       mutableItemIds[0] = lifecycleUuid<ReportItemId>(610);
-      assert.deepEqual(lineage[0]?.allReportItemIds, [REPORT_ITEM_ID, SECOND_REPORT_ITEM_ID]);
+      assert.equal(firstHead.itemSignature, firstSignature);
+
+      const reversedChild = childAggregate();
+      const reversed = evolveSession(reversedChild, eventAfter(reversedChild, "ChildWorkReported", {
+        report: childReportFixture({
+          itemIds: [SECOND_REPORT_ITEM_ID, REPORT_ITEM_ID],
+        }),
+      }));
+      assert.equal(reversed.reportIndexHead?.itemSignature, firstSignature);
+
+      const secondReportId = lifecycleUuid<ReportId>(618);
+      const secondItemIds = [
+        lifecycleUuid<ReportItemId>(619),
+        lifecycleUuid<ReportItemId>(620),
+      ] as const;
+      const withSecond = evolveSession(reported, eventAfter(reported, "ChildWorkReported", {
+        report: childReportFixture({ reportId: secondReportId, itemIds: secondItemIds }),
+      }));
+      assert.equal(withSecond.reportCount, 2);
+      assert.equal(Object.isFrozen(withSecond.reportIndexHead), true);
+      assert.equal(withSecond.reportIndexHead?.reportId, secondReportId);
+      assert.equal(withSecond.reportIndexHead?.previous, firstHead);
 
       expectIntegrity(() => evolveSession(reported, eventAfter(reported, "ChildWorkReported", {
         report: childReportFixture({ reportId: REPORT_ID }),
+      })));
+      expectIntegrity(() => evolveSession(reported, eventAfter(reported, "ChildWorkReported", {
+        report: childReportFixture({
+          reportId: lifecycleUuid<ReportId>(621),
+          itemIds: [REPORT_ITEM_ID, REPORT_ITEM_ID],
+        }),
+      })));
+    });
+
+    it("accepts exactly 200 reports and rejects report 201 with bounded frozen state", () => {
+      let child = childAggregate();
+      let previousHead: ChildReportIndexNode | null = null;
+
+      for (let index = 0; index < 200; index += 1) {
+        const reportId = lifecycleUuid<ReportId>(10_000 + index);
+        const itemIds = [
+          lifecycleUuid<ReportItemId>(20_000 + index * 2),
+          lifecycleUuid<ReportItemId>(20_001 + index * 2),
+        ] as const;
+        child = evolveSession(child, eventAfter(child, "ChildWorkReported", {
+          report: childReportFixture({ reportId, itemIds }),
+        }));
+        assert.equal(child.reportIndexHead?.previous, previousHead);
+        previousHead = child.reportIndexHead;
+      }
+
+      assert.equal(child.reportCount, 200);
+      assert.equal(Object.isFrozen(child), true);
+      let node = child.reportIndexHead;
+      let depth = 0;
+      while (node !== null) {
+        assert.equal(Object.isFrozen(node), true);
+        assert.deepEqual(Object.keys(node).sort(), ["itemSignature", "previous", "reportId"]);
+        assert.equal(Object.values(node).some(Array.isArray), false);
+        node = node.previous;
+        depth += 1;
+      }
+      assert.equal(depth, 200);
+
+      const overflowReportId = lifecycleUuid<ReportId>(10_200);
+      expectIntegrity(() => evolveSession(child, eventAfter(child, "ChildWorkReported", {
+        report: childReportFixture({
+          reportId: overflowReportId,
+          itemIds: [
+            lifecycleUuid<ReportItemId>(20_400),
+            lifecycleUuid<ReportItemId>(20_401),
+          ],
+        }),
       })));
     });
 
@@ -997,6 +1113,7 @@ describe("SessionAggregate", () => {
 
   describe("complete transition matrix", () => {
     it("checks all 260 kind, state, and event-type combinations", () => {
+      assert.equal(TRANSITION_POLICY_IS_PRIVATE, true);
       const rootAllowed = {
         active: [
           "SessionOwnerTransferred",
@@ -1094,7 +1211,6 @@ describe("SessionAggregate", () => {
       for (const eventType of LIFECYCLE_EVENT_TYPES) {
         for (const [state, aggregate] of rootCases) {
           const expected = (rootAllowed[state] as readonly LifecycleEventType[]).includes(eventType);
-          assert.equal(isSessionTransitionAllowed("root", state, eventType), expected);
           const error = (() => {
             try {
               evolveSession(aggregate, eventAfter(aggregate, eventType) as LifecycleEventV1);
@@ -1103,12 +1219,18 @@ describe("SessionAggregate", () => {
               return candidate as LifecycleError;
             }
           })();
-          assert.equal(error?.code === "SESSION_STATE_CONFLICT", !expected);
+          if (expected) {
+            assert.ok(
+              error === null || error.code === "INTEGRITY_FAILURE",
+              `root ${state} + ${eventType} must route past the transition table`,
+            );
+          } else {
+            assert.equal(error?.code, "SESSION_STATE_CONFLICT", `root ${state} + ${eventType}`);
+          }
           combinations += 1;
         }
         for (const [state, aggregate] of childCases) {
           const expected = (childAllowed[state] as readonly LifecycleEventType[]).includes(eventType);
-          assert.equal(isSessionTransitionAllowed("child", state, eventType), expected);
           const error = (() => {
             try {
               evolveSession(aggregate, eventAfter(aggregate, eventType) as LifecycleEventV1);
@@ -1117,7 +1239,14 @@ describe("SessionAggregate", () => {
               return candidate as LifecycleError;
             }
           })();
-          assert.equal(error?.code === "SESSION_STATE_CONFLICT", !expected);
+          if (expected) {
+            assert.ok(
+              error === null || error.code === "INTEGRITY_FAILURE",
+              `child ${state} + ${eventType} must route past the transition table`,
+            );
+          } else {
+            assert.equal(error?.code, "SESSION_STATE_CONFLICT", `child ${state} + ${eventType}`);
+          }
           combinations += 1;
         }
       }
