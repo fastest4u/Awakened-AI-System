@@ -24,7 +24,7 @@ async function build() {
         platform: 'node',
         format: 'esm',
         outfile: outFile,
-        target: 'es2022',
+        target: 'node22',
         minify: true, // Minify the bundle first
         packages: 'external', // Do not bundle node_modules
     });
@@ -73,10 +73,22 @@ async function build() {
         platform: 'node',
         format: 'esm',
         outfile: path.join(outDir, 'cli.js'),
-        target: 'es2022',
+        target: 'node22',
         minify: true,
         packages: 'external',
         banner: { js: '#!/usr/bin/env node' },
+    });
+
+    console.log('🧵 Step 4: Bundling project-store worker (dist/workers/project-store.worker.js)...');
+    await esbuild.build({
+        entryPoints: ['src/workers/project-store.worker.ts'],
+        bundle: true,
+        platform: 'node',
+        format: 'esm',
+        outfile: path.join(outDir, 'workers', 'project-store.worker.js'),
+        target: 'node22',
+        minify: true,
+        packages: 'external',
     });
 
     writeFileSync(
@@ -88,7 +100,7 @@ async function build() {
         'utf8'
     );
 
-    console.log('✅ Build completed successfully! Output: dist/index.js (MCP server) + dist/cli.js (memory-vault CLI)');
+    console.log('✅ Build completed successfully! Output: dist/index.js (MCP server) + dist/cli.js (memory-vault CLI) + dist/workers/project-store.worker.js');
 }
 
 build().catch((error) => {

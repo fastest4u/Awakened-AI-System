@@ -1,0 +1,88 @@
+name: SQLite Stress
+
+on:
+  schedule:
+    - cron: "0 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sqlite-stress
+  cancel-in-progress: false
+
+jobs:
+  stress:
+    name: SQLite stress on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        os:
+          - ubuntu-latest
+          - windows-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24.16.0"
+
+      - name: Install dependencies
+        shell: pwsh
+        run: |
+          $logPath = "ci-logs/sqlite-stress-${{ matrix.os }}.log"
+          New-Item -ItemType Directory -Force -Path (Split-Path $logPath) | Out-Null
+          Write-Output "> npm ci" | Tee-Object -FilePath $logPath -Append
+          & npm ci 2>&1 | Tee-Object -FilePath $logPath -Append
+          $commandExitCode = $LASTEXITCODE
+          if ($commandExitCode -ne 0) {
+            exit $commandExitCode
+          }
+
+      - name: Build tests
+        shell: pwsh
+        run: |
+          $logPath = "ci-logs/sqlite-stress-${{ matrix.os }}.log"
+          Write-Output "> npm run test:build" | Tee-Object -FilePath $logPath -Append
+          & npm run test:build 2>&1 | Tee-Object -FilePath $logPath -Append
+          $commandExitCode = $LASTEXITCODE
+          if ($commandExitCode -ne 0) {
+            exit $commandExitCode
+          }
+
+      - name: Run default concurrent and crash tests
+        shell: pwsh
+        run: |
+          $logPath = "ci-logs/sqlite-stress-${{ matrix.os }}.log"
+          Write-Output "> node --test --test-concurrency=1 --test-reporter=spec dist-test/tests/event-store.concurrent.test.js dist-test/tests/event-store.crash.test.js" | Tee-Object -FilePath $logPath -Append
+          & node --test --test-concurrency=1 --test-reporter=spec dist-test/tests/event-store.concurrent.test.js dist-test/tests/event-store.crash.test.js 2>&1 | Tee-Object -FilePath $logPath -Append
+          $commandExitCode = $LASTEXITCODE
+          if ($commandExitCode -ne 0) {
+            exit $commandExitCode
+          }
+
+      - name: Run release stress test
+        shell: pwsh
+        run: |
+          $logPath = "ci-logs/sqlite-stress-${{ matrix.os }}.log"
+          Write-Output "> npm run test:stress" | Tee-Object -FilePath $logPath -Append
+          & npm run test:stress 2>&1 | Tee-Object -FilePath $logPath -Append
+          $commandExitCode = $LASTEXITCODE
+          if ($commandExitCode -ne 0) {
+            exit $commandExitCode
+          }
+
+      - name: Upload stress logs
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: sqlite-stress-logs-${{ matrix.os }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ci-logs/sqlite-stress-${{ matrix.os }}.log
+          if-no-files-found: error
+          retention-days: 14

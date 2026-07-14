@@ -6,3 +6,4 @@ memory/.memory-mcp/index.json*
 .env
 .env.*
 *.log
+.superpowers/

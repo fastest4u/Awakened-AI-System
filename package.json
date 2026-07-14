@@ -8,15 +8,24 @@
   "bin": {
     "memory-vault": "dist/cli.js"
   },
+  "engines": {
+    "node": ">=22.22.3"
+  },
   "scripts": {
     "dev": "npm run build && node dist/index.js",
     "start": "node dist/index.js",
+    "check:runtime": "node scripts/check-runtime.js",
+    "prestart": "npm run check:runtime",
+    "prebuild": "npm run check:runtime",
+    "pretest": "npm run check:runtime",
     "build": "node scripts/build.js",
     "memory-vault": "node dist/cli.js",
     "typecheck": "tsc --noEmit",
     "lint": "tsc --noEmit",
     "test:build": "tsc -p tsconfig.test.json",
-    "test": "npm run test:build && node --test --test-reporter=spec \"dist-test/tests/**/*.test.js\""
+    "test:stress": "node scripts/run-stress.js",
+    "test:build-artifacts": "npm run build && node scripts/smoke-worker.js",
+    "test": "npm run test:build && node --test --test-concurrency=1 --test-reporter=spec \"dist-test/tests/**/*.test.js\""
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0",
@@ -25,7 +34,7 @@
     "zod": "^3.25.76"
   },
   "devDependencies": {
-    "@types/node": "^20.17.32",
+    "@types/node": "^22.0.0",
     "esbuild": "^0.28.0",
     "javascript-obfuscator": "^5.4.2",
     "typescript": "^5.8.3"

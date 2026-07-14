@@ -27,7 +27,7 @@ MCP Server สำหรับระบบความจำแบบ project-loc
 3. **AI Client Integration Pack**
    `memory_bootstrapProject` สร้างไฟล์ config/rules ให้ client ต่าง ๆ ใช้ protocol เดียวกัน
 
-โค้ดหลักอยู่ใน `src/` และ build ออกเป็น `dist/index.js` สำหรับ MCP client เรียกผ่าน stdio
+โค้ดหลักอยู่ใน `src/` และ build ออกเป็น `dist/index.js` สำหรับ MCP stdio, `dist/cli.js` สำหรับคำสั่ง `memory-vault`, `dist/workers/project-store.worker.js` สำหรับ SQLite worker และ `dist/build-info.json` สำหรับ runtime diagnostics
 
 ## โครงสร้าง Vault
 
@@ -72,7 +72,7 @@ MCP Server สำหรับระบบความจำแบบ project-loc
 
 ## การติดตั้ง
 
-ต้องมี Node.js และ npm จากนั้นติดตั้ง dependency:
+ต้องมี Node.js `22.22.3` หรือใหม่กว่า พร้อม runtime SQLite `3.51.3` หรือใหม่กว่า โดยแนะนำ Node.js `24.16.0` หรือใหม่กว่าในสาย Node.js 24 LTS จากนั้นติดตั้ง dependency:
 
 ```bash
 npm install
@@ -101,11 +101,38 @@ npm run build
 
 | Command | รายละเอียด |
 | --- | --- |
-| `npm run start` | รัน `node dist/index.js` |
-| `npm run build` | bundle ด้วย esbuild แล้ว obfuscate output ไปที่ `dist/index.js` |
+| `npm run check:runtime` | ตรวจ Node.js, `node:sqlite`, SQLite, WAL, FTS5 และ capability ที่จำเป็นแบบ fail-closed |
+| `npm run start` | ตรวจ runtime แล้วรัน `node dist/index.js` |
+| `npm run build` | ตรวจ runtime แล้วสร้าง server, CLI, worker และ build metadata ใต้ `dist/` |
 | `npm run typecheck` | ตรวจ TypeScript โดยไม่ emit |
 | `npm run lint` | alias ของ typecheck |
+| `npm test` | compile test แล้วรัน default suite แบบ serial; stress 10 seeds ถูก skip โดยตั้งใจ |
+| `npm run test:build` | compile `src/` และ `tests/` ไปที่ `dist-test/` |
+| `npm run test:stress` | compile แล้วรัน event-store stress gate 10 seeds (`16 × 250` events ต่อ seed) |
+| `npm run test:build-artifacts` | build แล้ว smoke-test worker artifact จริง |
+| `npm run memory-vault -- <command>` | เรียก CLI ที่ build แล้วโดยไม่ต้อง `npm link` |
 | `npm run dev` | build แล้วรัน server |
+
+GitHub Actions ที่ `.github/workflows/ci.yml` รัน runtime probe, typecheck, default tests, build และ artifact smoke test บน Ubuntu/Windows ด้วย Node.js `22.22.3` และ `24.16.0` ส่วน `.github/workflows/sqlite-stress.yml` รัน stress suite แบบ serialized ทุกสัปดาห์หรือเมื่อสั่ง manual dispatch
+
+## V2 Administration CLI
+
+Subproject 1 เพิ่มคำสั่งดูแล event store แบบ explicit ผ่าน CLI โดยยัง **ไม่** เปลี่ยน MCP lifecycle เดิมไปใช้ V2 และยังไม่เปิด primary-mode cutover ทุกคำสั่งต้องระบุ project/vault แบบ literal:
+
+```bash
+# ตรวจสถานะก่อน initialize โดยไม่เขียนไฟล์
+npm run memory-vault -- orchestrator-init --project-root "C:/path/to/project" --vault "C:/path/to/project/memory"
+
+# initialize แบบ explicit; replica ที่มี descriptor แต่ยังไม่มี local store ต้องเพิ่ม --replica initialize-local
+npm run memory-vault -- orchestrator-init --project-root "C:/path/to/project" --vault "C:/path/to/project/memory" --apply
+npm run memory-vault -- orchestrator-init --project-root "C:/path/to/project" --vault "C:/path/to/project/memory" --replica initialize-local --apply
+
+# ตรวจ binding/runtime/store และตรวจ integrity
+npm run memory-vault -- orchestrator-status --project-root "C:/path/to/project" --vault "C:/path/to/project/memory"
+npm run memory-vault -- orchestrator-integrity --project-root "C:/path/to/project" --vault "C:/path/to/project/memory" --full
+```
+
+`orchestrator-init` เป็น inspection-only โดยค่าเริ่มต้นและจะเขียนเมื่อมี `--apply` เท่านั้น `orchestrator-status` แสดงเฉพาะ safe projection ของ identity/path/runtime และ `orchestrator-integrity` รัน quick check หรือ full chain check เมื่อเพิ่ม `--full`
 
 ## Environment Variables
 

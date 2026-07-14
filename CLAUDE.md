@@ -37,13 +37,18 @@ Notes:
 
 ## Commands
 
+The supported runtime floor is Node.js 22.22.3 with runtime SQLite 3.51.3 or newer. Node.js 24.16.0 or newer within the Node.js 24 LTS line is recommended. `npm run check:runtime` verifies the Node/SQLite versions plus the WAL, FTS5, foreign-key, synchronous, busy-timeout, trusted-schema, and rollback capabilities before authoritative-store work.
+
 ```bash
 npm install              # install deps
-npm run build            # bundle src -> dist/ (index.js obfuscated, cli.js plain), writes dist/build-info.json
+npm run check:runtime     # fail-closed Node/node:sqlite/WAL capability probe
+npm run build            # emit server, CLI, worker, and build-info artifacts under dist/
 npm run typecheck        # tsc --noEmit (npm run lint is an alias; there is no eslint/prettier)
 npm run start            # node dist/index.js  (runs the built MCP server over stdio)
 npm run dev              # build then start
 npm test                 # compile tests to dist-test/ then run node --test
+npm run test:stress      # compile and run the opt-in 10-seed event-store stress gate
+npm run test:build-artifacts  # rebuild and smoke-test the bundled worker
 npm run memory-vault -- validate   # run the built CLI without npm link (package is private; bin is link-only)
 ```
 
@@ -54,11 +59,11 @@ npm run test:build       # tsc -p tsconfig.test.json -> dist-test/
 node --test --test-reporter=spec "dist-test/tests/frontmatter.test.js"
 ```
 
-Tests are flat `tests/*.test.ts` files run with the Node built-in test runner (Node ≥ 21 for the `npm test` glob) — no Jest/Vitest. `tsconfig.test.json` compiles **both** `src/` and `tests/` with `rootDir: '.'` into `dist-test/`, which is why compiled tests live at `dist-test/tests/*.test.js` and import production code as `../src/<path>.js`. Two pitfalls: running `node --test` without re-running `test:build` executes stale output, and tsc never cleans `dist-test/` — deleted/renamed tests leave stale `.js` files that still execute (delete `dist-test/` when in doubt). There is no CI; `npm test` and `npm run typecheck` are entirely manual gates.
+Tests are flat `tests/*.test.ts` files run with the Node built-in test runner on the supported Node.js 22.22.3+ runtime — no Jest/Vitest. `tsconfig.test.json` compiles **both** `src/` and `tests/` with `rootDir: '.'` into `dist-test/`, which is why compiled tests live at `dist-test/tests/*.test.js` and import production code as `../src/<path>.js`. Two pitfalls: running `node --test` without re-running `test:build` executes stale output, and tsc never cleans `dist-test/` — deleted/renamed tests leave stale `.js` files that still execute (delete `dist-test/` when in doubt). Ordinary `npm test` intentionally skips the 10 release-stress seeds; run `npm run test:stress` explicitly for that gate. `.github/workflows/ci.yml` runs the runtime probe, typecheck, tests, build, and artifact smoke test on Ubuntu and Windows at the minimum and recommended runtimes. `.github/workflows/sqlite-stress.yml` runs the serialized stress suite weekly or by manual dispatch.
 
 ## Build is obfuscated
 
-`npm run build` (`scripts/build.js`) has three stages: (1) esbuild bundles `src/index.ts` → `dist/index.js` (ESM, minified, `packages: 'external'` — node_modules are *not* bundled, so `dist/` still needs `node_modules` at runtime); (2) `javascript-obfuscator` rewrites `dist/index.js` in place — only the server entry is obfuscated; (3) esbuild bundles `src/cli.ts` → `dist/cli.js` (minified, **not** obfuscated, shebang banner). It also writes `dist/build-info.json`, which is read at runtime by the doctor diagnostics (missing → `BUILD_INFO_MISSING` issue with an `npm run build` remediation). **`dist/` is gitignored — regenerate it, never hand-edit it.** MCP clients load `dist/index.js`, so after any source change you must `npm run build` and reload the client for it to see new behavior.
+`npm run build` (`scripts/build.js`) has four stages: (1) esbuild bundles `src/index.ts` → `dist/index.js` (ESM, minified, `packages: 'external'` — node_modules are *not* bundled, so `dist/` still needs `node_modules` at runtime); (2) `javascript-obfuscator` rewrites `dist/index.js` in place — only the server entry is obfuscated; (3) esbuild bundles `src/cli.ts` → `dist/cli.js` (minified, **not** obfuscated, shebang banner); (4) esbuild bundles the unobfuscated `src/workers/project-store.worker.ts` → `dist/workers/project-store.worker.js` so worker failures remain diagnosable. It also writes `dist/build-info.json`, which is read at runtime by the doctor diagnostics (missing → `BUILD_INFO_MISSING` issue with an `npm run build` remediation). All three JavaScript bundles target Node.js 22. **`dist/` is gitignored — regenerate it, never hand-edit it.** MCP clients load `dist/index.js`, so after any source change you must `npm run build` and reload the client for it to see new behavior.
 
 ## Architecture
 
@@ -112,7 +117,7 @@ Env overrides: `MEMORY_VAULT_DIR` (default `memory`), `MEMORY_VAULT_PATH` (absol
 
 ## memory-vault CLI
 
-`dist/cli.js` (`bin: memory-vault`, source `src/cli.ts`) is a standalone frontmatter validator/fixer for a vault: `validate`, `report` (= validate with markdown output), `fix`, `migrate` (`--rollback`), `init`, `diagnose`. Footguns: fix/migrate are dry-run by default (`--apply` to write); `--unsafe` without `--confirm` silently applies only safe fixes; `--no-backup` is accepted but deliberately **ignored** — a timestamped backup is always taken before writes; `diagnose` ignores `--vault` and uses `process.cwd()`. Exit codes are CI-oriented: validate/report exit 1 on error/critical findings, fix/migrate exit 1 when manual-attention items remain, 2 for bad usage.
+`dist/cli.js` (`bin: memory-vault`, source `src/cli.ts`) is a standalone frontmatter validator/fixer and explicit V2 administrator. Legacy commands are `validate`, `report` (= validate with markdown output), `fix`, `migrate` (`--rollback`), `init`, and `diagnose`. V2 administration commands are `orchestrator-init`, `orchestrator-status`, and `orchestrator-integrity`; all require literal `--project-root` and `--vault` paths. `orchestrator-init` is inspection-only unless `--apply` is supplied, copied descriptors without local store evidence additionally require `--replica initialize-local`, and integrity uses `--full` for the full chain check. These commands do not enable V2 MCP traffic or primary-mode cutover. Footguns: fix/migrate are dry-run by default (`--apply` to write); `--unsafe` without `--confirm` silently applies only safe fixes; `--no-backup` is accepted but deliberately **ignored** — a timestamped backup is always taken before writes; `diagnose` ignores `--vault` and uses `process.cwd()`. Exit codes are CI-oriented: validate/report exit 1 on error/critical findings, fix/migrate exit 1 when manual-attention items remain, 2 for bad usage.
 
 Frontmatter rules come from layered config — built-in defaults → `~/.memory-vault/frontmatter.config.json` → `<vault>/.memory-mcp/frontmatter.config.json` (the project layer lives *inside the vault*, not at project root). Array fields (`dateFields`, `validTypes`, `semanticExemptPaths`) are set-unioned across layers while `keyOrder`/`strictUnknownFields` are overridden; malformed layers are skipped non-fatally. Default `semanticExemptPaths` is `99_Templates/**` (`config/vault-policy.ts`). See `docs/frontmatter.config.schema.json` and `docs/frontmatter-system-th.md` (Thai design doc for the never-throw parser and severity taxonomy).
 

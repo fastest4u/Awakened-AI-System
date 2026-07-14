@@ -1,0 +1,83 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  release-gates:
+    name: Node ${{ matrix.node-version }} on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - windows-latest
+        node-version:
+          - "22.22.3"
+          - "24.16.0"
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: ${{ matrix.node-version }}
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Check runtime capabilities
+        run: npm run check:runtime
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Run tests
+        run: npm test
+
+      - name: Build
+        run: npm run build
+
+      - name: Test build artifacts
+        run: npm run test:build-artifacts
+
+  minimum-runtime-rejection:
+    name: Reject Node 22.13.0
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Node.js 22.13.0
+        uses: actions/setup-node@v6
+        with:
+          node-version: "22.13.0"
+
+      - name: Require the documented minimum-runtime rejection
+        shell: bash
+        run: |
+          set +e
+          output="$(node scripts/check-runtime.js --json 2>&1)"
+          status=$?
+          set -e
+
+          printf '%s\n' "$output"
+
+          expected='{"ok":false,"code":"SQLITE_CAPABILITY_MISSING","message":"Node 22.13.0 is below 22.22.3"}'
+          if [[ "$status" -ne 1 ]]; then
+            echo "Expected check-runtime to exit 1, received $status" >&2
+            exit 1
+          fi
+          if [[ "$output" != "$expected" ]]; then
+            echo "check-runtime did not emit the exact documented rejection" >&2
+            exit 1
+          fi
