@@ -7,7 +7,10 @@ import type {
   WorkspaceId,
 } from "../../identity/contracts.js";
 import type { TrustedActorRole } from "../../identity/project-binding.request.js";
-import { LifecycleError } from "../errors.js";
+import {
+  LIFECYCLE_IDEMPOTENCY_KEY_MAX_SCALARS,
+  LifecycleError,
+} from "../errors.js";
 import {
   decodeCheckpointDraftV1,
   type CheckpointDraftV1,
@@ -469,7 +472,7 @@ export function assertInternalValidationResultBinding(
     parseBoundedString(
       commandRecord.idempotencyKey,
       "internalValidationResultCommand.idempotencyKey",
-      512,
+      LIFECYCLE_IDEMPOTENCY_KEY_MAX_SCALARS,
     );
     parseBoundedString(commandRecord.agentId, "internalValidationResultCommand.agentId", 256);
     parseLifecycleId<ProjectId>(
@@ -556,7 +559,11 @@ export function assertInternalValidationResultBinding(
     parseLifecycleId(planRecord.runId, "attemptPlan.runId");
     parseLifecycleId<ValidationResultId>(planRecord.resultId, "attemptPlan.resultId");
     parseLifecycleId(planRecord.resultCommandId, "attemptPlan.resultCommandId");
-    parseBoundedString(planRecord.resultIdempotencyKey, "attemptPlan.resultIdempotencyKey", 512);
+    parseBoundedString(
+      planRecord.resultIdempotencyKey,
+      "attemptPlan.resultIdempotencyKey",
+      LIFECYCLE_IDEMPOTENCY_KEY_MAX_SCALARS,
+    );
     const result = decodeValidationResultV1(commandRecord.result);
 
     const plan = commandRecord.attemptPlan as unknown as ValidationAttemptPlanIdentityV1;
@@ -679,7 +686,11 @@ function base(command: Record<string, unknown>): LifecycleCommandBase {
   }
   return {
     commandId: parseLifecycleId(command.commandId, "commandId"),
-    idempotencyKey: parseBoundedString(command.idempotencyKey, "idempotencyKey", 512),
+    idempotencyKey: parseBoundedString(
+      command.idempotencyKey,
+      "idempotencyKey",
+      LIFECYCLE_IDEMPOTENCY_KEY_MAX_SCALARS,
+    ),
     agentId: parseBoundedString(command.agentId, "agentId", 256),
     expectedProjectId: parseLifecycleId<ProjectId>(command.expectedProjectId, "expectedProjectId"),
     expectedVaultId: parseLifecycleId<VaultId>(command.expectedVaultId, "expectedVaultId"),

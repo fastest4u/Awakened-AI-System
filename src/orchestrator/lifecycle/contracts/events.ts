@@ -5,6 +5,7 @@ import type {
   WorkspaceId,
 } from "../../identity/contracts.js";
 import {
+  LIFECYCLE_IDEMPOTENCY_KEY_MAX_SCALARS,
   LIFECYCLE_ERROR_CODES,
   LifecycleError,
   type LifecycleErrorCode,
@@ -927,7 +928,11 @@ export function decodeLifecycleEventV1(value: unknown): LifecycleEventV1 {
       correlationId: parseLifecycleId(event.correlationId, "correlationId"),
       causationId: parseNullableUuid(event.causationId, "causationId"),
       commandId: parseLifecycleId(event.commandId, "commandId"),
-      idempotencyKey: parseBoundedString(event.idempotencyKey, "idempotencyKey", 512),
+      idempotencyKey: parseBoundedString(
+        event.idempotencyKey,
+        "idempotencyKey",
+        LIFECYCLE_IDEMPOTENCY_KEY_MAX_SCALARS,
+      ),
       occurredAt: parseCanonicalTimestamp(event.occurredAt, "occurredAt"),
       authorityCommitment,
       payload,

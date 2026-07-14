@@ -2654,4 +2654,48 @@ describe("lifecycle Version 1 contracts", () => {
     }
     assert.throws(() => new LifecycleError("UNKNOWN_CODE" as LifecycleErrorCode));
   });
+
+  it("accepts bounded opaque idempotency error details without serializing them", () => {
+    const error = new LifecycleError("COMMAND_OUTCOME_UNKNOWN", {
+      commandId: UUIDS.command,
+      idempotencyKey: DETERMINISTIC_IDEMPOTENCY_KEY,
+    });
+    assert.deepEqual(error.toJSON(), {
+      code: "COMMAND_OUTCOME_UNKNOWN",
+      retryable: true,
+      safeMessage: "The lifecycle command outcome is unknown",
+      recoveryActions: ["retry-original-command"],
+    });
+    assert.doesNotMatch(JSON.stringify(error), /idempotency|lifecycle-phase-v1/i);
+    assert.doesNotThrow(() => new LifecycleError("COMMAND_OUTCOME_UNKNOWN", {
+      idempotencyKey: "😀".repeat(512),
+    }));
+
+    for (const idempotencyKey of [
+      "",
+      "x".repeat(513),
+      "😀".repeat(513),
+      42,
+      { secret: "not-safe" },
+    ]) {
+      assert.throws(
+        () => new LifecycleError("COMMAND_OUTCOME_UNKNOWN", { idempotencyKey }),
+        TypeError,
+      );
+    }
+
+    let getterCalled = false;
+    const accessorDetails = Object.defineProperty({}, "idempotencyKey", {
+      enumerable: true,
+      get: () => {
+        getterCalled = true;
+        return DETERMINISTIC_IDEMPOTENCY_KEY;
+      },
+    });
+    assert.throws(
+      () => new LifecycleError("COMMAND_OUTCOME_UNKNOWN", accessorDetails),
+      TypeError,
+    );
+    assert.equal(getterCalled, false);
+  });
 });

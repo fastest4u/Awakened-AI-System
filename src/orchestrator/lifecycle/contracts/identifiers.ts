@@ -1,4 +1,8 @@
-import { LifecycleError, type LifecycleErrorCode } from "../errors.js";
+import {
+  isBoundedLifecycleString,
+  LifecycleError,
+  type LifecycleErrorCode,
+} from "../errors.js";
 
 const LOWER_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const UNSIGNED_DECIMAL = /^(0|[1-9][0-9]*)$/;
@@ -138,9 +142,7 @@ export function parseBoundedString(
 ): string {
   const code = options.code ?? "LIFECYCLE_INPUT_INVALID";
   if (
-    typeof value !== "string"
-    || (!options.allowEmpty && value.length === 0)
-    || Array.from(value).length > maximumScalars
+    !isBoundedLifecycleString(value, maximumScalars, options.allowEmpty)
   ) {
     throw new LifecycleError(code, { field });
   }

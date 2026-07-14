@@ -152,7 +152,6 @@ const IDENTITY_DETAIL_KEYS = new Set([
   "projectId",
   "sessionId",
   "commandId",
-  "idempotencyKey",
   "operationId",
   "workflowId",
   "checkpointId",
@@ -177,6 +176,18 @@ const UNSIGNED_DECIMAL = /^(0|[1-9][0-9]*)$/;
 const SQLITE_INT64_MAX_DECIMAL = "9223372036854775807";
 const SAFE_FIELD = /^[A-Za-z][A-Za-z0-9_.\[\]-]{0,127}$/;
 const SAFE_PHASE = /^[a-z][a-z0-9-]{0,63}$/;
+
+export const LIFECYCLE_IDEMPOTENCY_KEY_MAX_SCALARS = 512;
+
+export function isBoundedLifecycleString(
+  value: unknown,
+  maximumScalars: number,
+  allowEmpty = false,
+): value is string {
+  return typeof value === "string"
+    && (allowEmpty || value.length > 0)
+    && Array.from(value).length <= maximumScalars;
+}
 
 export interface LifecycleErrorEnvelope {
   readonly code: LifecycleErrorCode;
@@ -210,6 +221,7 @@ function readSafeDetails(value: unknown): Readonly<Record<string, string | numbe
       || (
         !IDENTITY_DETAIL_KEYS.has(key)
         && !POSITION_DETAIL_KEYS.has(key)
+        && key !== "idempotencyKey"
         && key !== "field"
         && key !== "phase"
       )
@@ -221,6 +233,13 @@ function readSafeDetails(value: unknown): Readonly<Record<string, string | numbe
       throw new TypeError("Lifecycle error details must contain enumerable data properties only");
     }
     const detail = descriptor.value as unknown;
+    if (key === "idempotencyKey") {
+      if (!isBoundedLifecycleString(detail, LIFECYCLE_IDEMPOTENCY_KEY_MAX_SCALARS)) {
+        throw new TypeError("Lifecycle error idempotency details must be bounded opaque strings");
+      }
+      output[key] = detail;
+      continue;
+    }
     if (IDENTITY_DETAIL_KEYS.has(key)) {
       const validIdentity = key === "workspaceId"
         ? typeof detail === "string" && LOWER_HASH.test(detail)
