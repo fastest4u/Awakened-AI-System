@@ -23,6 +23,29 @@ const CHILD_ID = "55555555-5555-4555-8555-555555555555";
 const ADAPTER_ID = "66666666-6666-4666-8666-666666666666";
 const H64 = "a".repeat(64);
 const H64_B = "b".repeat(64);
+const RESERVED_LIFECYCLE_COMMAND_TYPES = [
+  "root-start",
+  "root-resume",
+  "root-recovery",
+  "root-suspend",
+  "fork-child",
+  "amend-child-assignment",
+  "record-checkpoint",
+  "record-evidence-batch",
+  "record-child-report",
+  "disposition-child-report",
+  "propose-child-completion",
+  "complete-child-session",
+  "suspend-child-session",
+  "create-child-transfer",
+  "claim-child-transfer",
+  "request-session-end",
+  "amend-session-end",
+  "cancel-session-end",
+  "abandon-session",
+  "internal-validation-result",
+  "internal-workflow-phase",
+] as const;
 const driver = new NodeSqliteDriver({ DatabaseSync });
 const connections: SqliteConnection[] = [];
 const roots: string[] = [];
@@ -413,6 +436,56 @@ function lifecycleOutbox(
   };
 }
 
+function validationResult(
+  overrides: Readonly<Record<string, SqliteValue>> = {},
+): Record<string, SqliteValue> {
+  return {
+    project_id: PROJECT_ID,
+    vault_id: VAULT_ID,
+    store_id: STORE_ID,
+    session_id: ROOT_ID,
+    result_id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+    validation_result_version: 1,
+    workflow_id: `session-end/${ROOT_ID}`,
+    workflow_generation: 1,
+    workspace_id: "workspace-1",
+    profile_id: "vault-gate",
+    profile_version: 1,
+    profile_configuration_hash: H64,
+    run_id: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+    runner_id: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+    final_checkpoint_id: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+    final_checkpoint_fingerprint: H64,
+    validation_start_scope_version: 1,
+    validation_start_project_id: PROJECT_ID,
+    validation_start_workspace_id: "workspace-1",
+    validation_start_branch_ref: null,
+    validation_start_head_commit: null,
+    validation_start_dirty_fingerprint: H64,
+    validation_completion_scope_version: 1,
+    validation_completion_project_id: PROJECT_ID,
+    validation_completion_workspace_id: "workspace-1",
+    validation_completion_branch_ref: null,
+    validation_completion_head_commit: null,
+    validation_completion_dirty_fingerprint: H64,
+    started_at: NOW,
+    completed_at: NOW,
+    status: "pass",
+    exit_classification: "passed",
+    redacted_summary: "ok",
+    output_fingerprint_algorithm: "hmac-sha256",
+    output_fingerprint_schema_version: 1,
+    output_fingerprint_key_id: "validation-key-1",
+    output_fingerprint_domain: "pm-validation-output-v1",
+    output_fingerprint_value: H64,
+    artifact_references_json: "[]",
+    fresh: 1,
+    recorded_event_position: 1,
+    created_at: NOW,
+    ...overrides,
+  };
+}
+
 function validationPlan(index: number, profileId = `profile-${index}`): Record<string, unknown> {
   const hex = index.toString(16).padStart(12, "0");
   return {
@@ -643,6 +716,7 @@ describe("0002-session-lifecycle structural contract", () => {
         "events_project_idempotency",
         "events_project_position",
         "events_stream_range",
+        "lifecycle_validation_results_event_position",
         "outbox_delivery_order",
         "outbox_lifecycle_claim_recovery",
         "outbox_lifecycle_latest_artifact",
@@ -663,6 +737,8 @@ describe("0002-session-lifecycle structural contract", () => {
         "CREATE INDEX session_authority_safe_resume ON session_authority(project_id, workspace_id, client_namespace, semantic_state, updated_at, session_id) WHERE session_kind = 'root' AND terminal_event_position IS NULL",
       session_leases_one_unreleased:
         "CREATE UNIQUE INDEX session_leases_one_unreleased ON session_leases(project_id, session_id) WHERE released_at IS NULL",
+      lifecycle_validation_results_event_position:
+        "CREATE INDEX lifecycle_validation_results_event_position ON lifecycle_validation_results(recorded_event_position)",
       workflow_instances_lifecycle_recovery:
         "CREATE INDEX workflow_instances_lifecycle_recovery ON workflow_instances(project_id, state, phase, triggering_event_position, workflow_id) WHERE session_id IS NOT NULL",
       outbox_lifecycle_target_revision:
@@ -690,8 +766,10 @@ describe("0002-session-lifecycle structural contract", () => {
         "command_dedup_no_delete",
         "command_dedup_no_update",
         "events_identity_guard",
+        "events_lifecycle_authorization_guard",
         "events_no_delete",
         "events_no_update",
+        "events_validation_result_link_guard",
         "lifecycle_approval_consumptions_no_delete",
         "lifecycle_approval_consumptions_no_update",
         "lifecycle_validation_results_insert_guard",
@@ -786,6 +864,51 @@ describe("0002-session-lifecycle structural contract", () => {
 });
 
 describe("0002-session-lifecycle authority, lease, and evidence guards", () => {
+  it("rejects SQL NULL in every required handle enum and actor role", () => {
+    const connection = currentConnection();
+    seedSessionEvent(connection, ROOT_ID, 1, "SessionStarted");
+    for (const column of [
+      "root_handle_expiry_kind",
+      "root_handle_actor_role",
+      "resume_token_expiry_kind",
+      "resume_token_actor_role",
+    ]) {
+      assert.throws(
+        () => insert(connection, "session_authority", rootAuthority({ [column]: null })),
+        /SESSION_AUTHORITY_SHAPE_INVALID/,
+        `root insert ${column}`,
+      );
+    }
+    insert(connection, "session_authority", rootAuthority());
+
+    seedSessionEvent(connection, CHILD_ID, 2, "ChildSessionStarted");
+    for (const column of ["child_handle_expiry_kind", "child_handle_actor_role"]) {
+      assert.throws(
+        () => insert(connection, "session_authority", childAuthority({ [column]: null })),
+        /SESSION_AUTHORITY_SHAPE_INVALID/,
+        `child insert ${column}`,
+      );
+    }
+    insert(connection, "session_authority", childAuthority());
+
+    for (const [sessionId, column] of [
+      [ROOT_ID, "root_handle_expiry_kind"],
+      [ROOT_ID, "root_handle_actor_role"],
+      [ROOT_ID, "resume_token_expiry_kind"],
+      [ROOT_ID, "resume_token_actor_role"],
+      [CHILD_ID, "child_handle_expiry_kind"],
+      [CHILD_ID, "child_handle_actor_role"],
+    ] as const) {
+      assert.throws(
+        () => connection.prepare(`
+          UPDATE session_authority SET ${column} = NULL WHERE session_id = $sessionId
+        `).run({ $sessionId: sessionId }),
+        /SESSION_AUTHORITY_SHAPE_INVALID/,
+        `update ${column}`,
+      );
+    }
+  });
+
   it("enforces complete root/child authority groups and immutable lineage", () => {
     const connection = currentConnection();
     seedSessionEvent(connection, ROOT_ID, 1, "SessionStarted");
@@ -966,6 +1089,148 @@ describe("0002-session-lifecycle authority, lease, and evidence guards", () => {
 });
 
 describe("0002-session-lifecycle authorization, validation, workflow, and outbox guards", () => {
+  it("reserves canonical lifecycle command types without blocking new generic Version 1 rows", () => {
+    const connection = currentConnection();
+    insert(connection, "command_dedup", legacyCommand({
+      command_type: "custom-generic-command",
+    }));
+
+    for (const commandType of RESERVED_LIFECYCLE_COMMAND_TYPES) {
+      assert.throws(
+        () => insert(connection, "command_dedup", legacyCommand({
+          idempotency_key: `reserved-${commandType}`,
+          command_id: `reserved-${commandType}`,
+          command_type: commandType,
+        })),
+        /COMMAND_AUTHORIZATION_INVALID/,
+        commandType,
+      );
+    }
+
+    const proofProtected = {
+      lifecycle_authorization_kind: "protected",
+      authorization_proof_version: 1,
+      authorization_proof_nonce: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+      authorization_proof_digest: H64,
+      authorization_session_id: ROOT_ID,
+      target_session_id: ROOT_ID,
+      presenting_actor_role: "primary",
+      presenting_client_instance_id: "client-root",
+      target_actor_role: "primary",
+      target_client_instance_id: "client-root",
+    } as const;
+    assert.throws(
+      () => insert(connection, "command_dedup", legacyCommand({
+        idempotency_key: "protected-root-start",
+        command_id: "protected-root-start",
+        command_type: "root-start",
+        ...proofProtected,
+      })),
+      /COMMAND_AUTHORIZATION_INVALID/,
+    );
+    assert.throws(
+      () => insert(connection, "command_dedup", legacyCommand({
+        idempotency_key: "initial-checkpoint",
+        command_id: "initial-checkpoint",
+        command_type: "record-checkpoint",
+        lifecycle_authorization_kind: "initial-authority",
+        target_session_id: ROOT_ID,
+        presenting_actor_role: "primary",
+        presenting_client_instance_id: "client-root",
+        target_actor_role: "primary",
+        target_client_instance_id: "client-root",
+      })),
+      /COMMAND_AUTHORIZATION_INVALID/,
+    );
+    assert.throws(
+      () => insert(connection, "command_dedup", legacyCommand({
+        idempotency_key: "internal-checkpoint",
+        command_id: "internal-checkpoint",
+        command_type: "record-checkpoint",
+        lifecycle_authorization_kind: "internal-workflow",
+        authorization_session_id: ROOT_ID,
+        target_session_id: ROOT_ID,
+        presenting_actor_role: "maintenance",
+        presenting_client_instance_id: "coordinator-1",
+        target_actor_role: "primary",
+        target_client_instance_id: "client-root",
+        internal_workflow_id: `session-end/${ROOT_ID}`,
+        internal_workflow_generation: 1,
+        internal_planned_work_id: H64,
+        internal_claim_owner_id: "coordinator-1",
+        internal_claim_token: 1,
+      })),
+      /COMMAND_AUTHORIZATION_INVALID/,
+    );
+    assert.throws(
+      () => insert(connection, "command_dedup", legacyCommand({
+        idempotency_key: "protected-internal",
+        command_id: "protected-internal",
+        command_type: "internal-validation-result",
+        ...proofProtected,
+      })),
+      /COMMAND_AUTHORIZATION_INVALID/,
+    );
+  });
+
+  it("rejects NULL lifecycle actor roles instead of accepting SQL unknown", () => {
+    const connection = currentConnection();
+    for (const column of ["presenting_actor_role", "target_actor_role"]) {
+      assert.throws(
+        () => insert(connection, "command_dedup", legacyCommand({
+          idempotency_key: `null-${column}`,
+          command_type: "record-checkpoint",
+          lifecycle_authorization_kind: "protected",
+          authorization_proof_version: 1,
+          authorization_proof_nonce: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+          authorization_proof_digest: H64,
+          authorization_session_id: ROOT_ID,
+          target_session_id: ROOT_ID,
+          presenting_actor_role: "primary",
+          presenting_client_instance_id: "client-root",
+          target_actor_role: "primary",
+          target_client_instance_id: "client-root",
+          [column]: null,
+        })),
+        /COMMAND_AUTHORIZATION_INVALID/,
+        column,
+      );
+    }
+  });
+
+  it("classifies session-domain lifecycle events even when command_type is generic", () => {
+    const connection = currentConnection();
+    seedSessionEvent(connection, ROOT_ID, 1, "SessionStarted");
+    assert.throws(
+      () => insert(connection, "command_dedup", legacyCommand({
+        idempotency_key: "generic-after-lifecycle-event",
+        command_id: "command-1",
+        command_type: "custom-generic-command",
+      })),
+      /COMMAND_AUTHORIZATION_INVALID/,
+    );
+  });
+
+  it("rejects a lifecycle event appended after an existing null-authorization command", () => {
+    const connection = currentConnection();
+    seedSessionEvent(connection, ROOT_ID, 1, "TaskRecorded");
+    insert(connection, "command_dedup", legacyCommand({
+      idempotency_key: "generic-before-lifecycle-event",
+      command_id: "command-3",
+      command_type: "custom-generic-command",
+    }));
+    assert.throws(
+      () => seedAdditionalSessionEvent(
+        connection,
+        ROOT_ID,
+        3,
+        2,
+        "SessionCheckpointRecorded",
+      ),
+      /COMMAND_AUTHORIZATION_INVALID/,
+    );
+  });
+
   it("keeps Version 1 authorization columns null and permits abandonment proof plus approval", () => {
     const connection = currentConnection();
     insert(connection, "command_dedup", legacyCommand());
@@ -1018,7 +1283,7 @@ describe("0002-session-lifecycle authorization, validation, workflow, and outbox
       () => insert(connection, "command_dedup", legacyCommand({
         idempotency_key: "invalid-protected",
         command_id: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
-        command_type: "checkpoint",
+        command_type: "record-checkpoint",
         lifecycle_authorization_kind: "protected",
         authorization_session_id: ROOT_ID,
         target_session_id: ROOT_ID,
@@ -1033,7 +1298,7 @@ describe("0002-session-lifecycle authorization, validation, workflow, and outbox
     insert(connection, "command_dedup", legacyCommand({
       idempotency_key: "initial-authority",
       command_id: "11111111-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
-      command_type: "start-session",
+      command_type: "root-start",
       lifecycle_authorization_kind: "initial-authority",
       target_session_id: ROOT_ID,
       presenting_actor_role: "primary",
@@ -1045,7 +1310,7 @@ describe("0002-session-lifecycle authorization, validation, workflow, and outbox
       () => insert(connection, "command_dedup", legacyCommand({
         idempotency_key: "partial-proof",
         command_id: "22222222-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
-        command_type: "checkpoint",
+        command_type: "record-checkpoint",
         lifecycle_authorization_kind: "protected",
         authorization_proof_version: 1,
         authorization_session_id: ROOT_ID,
@@ -1061,7 +1326,7 @@ describe("0002-session-lifecycle authorization, validation, workflow, and outbox
       () => insert(connection, "command_dedup", legacyCommand({
         idempotency_key: "both-witnesses-non-abandon",
         command_id: "33333333-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
-        command_type: "checkpoint",
+        command_type: "record-checkpoint",
         lifecycle_authorization_kind: "protected",
         authorization_proof_version: 1,
         authorization_proof_nonce: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
@@ -1080,7 +1345,7 @@ describe("0002-session-lifecycle authorization, validation, workflow, and outbox
     insert(connection, "command_dedup", legacyCommand({
       idempotency_key: "internal-workflow",
       command_id: "44444444-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
-      command_type: "record-validation-result",
+      command_type: "internal-validation-result",
       lifecycle_authorization_kind: "internal-workflow",
       authorization_session_id: ROOT_ID,
       target_session_id: ROOT_ID,
@@ -1098,7 +1363,7 @@ describe("0002-session-lifecycle authorization, validation, workflow, and outbox
       () => insert(connection, "command_dedup", legacyCommand({
         idempotency_key: "internal-missing-claim",
         command_id: "55555555-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
-        command_type: "record-validation-result",
+        command_type: "internal-validation-result",
         lifecycle_authorization_kind: "internal-workflow",
         authorization_session_id: ROOT_ID,
         target_session_id: ROOT_ID,
@@ -1156,50 +1421,7 @@ describe("0002-session-lifecycle authorization, validation, workflow, and outbox
       /UNIQUE constraint failed/,
     );
 
-    const validation = {
-      project_id: PROJECT_ID,
-      vault_id: VAULT_ID,
-      store_id: STORE_ID,
-      session_id: ROOT_ID,
-      result_id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
-      validation_result_version: 1,
-      workflow_id: `session-end/${ROOT_ID}`,
-      workflow_generation: 1,
-      workspace_id: "workspace-1",
-      profile_id: "vault-gate",
-      profile_version: 1,
-      profile_configuration_hash: H64,
-      run_id: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
-      runner_id: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
-      final_checkpoint_id: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
-      final_checkpoint_fingerprint: H64,
-      validation_start_scope_version: 1,
-      validation_start_project_id: PROJECT_ID,
-      validation_start_workspace_id: "workspace-1",
-      validation_start_branch_ref: null,
-      validation_start_head_commit: null,
-      validation_start_dirty_fingerprint: H64,
-      validation_completion_scope_version: 1,
-      validation_completion_project_id: PROJECT_ID,
-      validation_completion_workspace_id: "workspace-1",
-      validation_completion_branch_ref: null,
-      validation_completion_head_commit: null,
-      validation_completion_dirty_fingerprint: H64,
-      started_at: NOW,
-      completed_at: NOW,
-      status: "pass",
-      exit_classification: "passed",
-      redacted_summary: "ok",
-      output_fingerprint_algorithm: "hmac-sha256",
-      output_fingerprint_schema_version: 1,
-      output_fingerprint_key_id: "validation-key-1",
-      output_fingerprint_domain: "pm-validation-output-v1",
-      output_fingerprint_value: H64,
-      artifact_references_json: "[]",
-      fresh: 1,
-      recorded_event_position: 1,
-      created_at: NOW,
-    };
+    const validation = validationResult();
     assert.throws(
       () => insert(connection, "lifecycle_validation_results", validation),
       /LIFECYCLE_VALIDATION_EVENT_MISMATCH/,
@@ -1212,7 +1434,7 @@ describe("0002-session-lifecycle authorization, validation, workflow, and outbox
       2,
       "SessionValidationResultRecorded",
     );
-    for (const mismatchedBinding of [
+    const mismatchedBindings: readonly Readonly<Record<string, SqliteValue>>[] = [
       { vault_id: "99999999-9999-4999-8999-999999999999" },
       { store_id: "99999999-9999-4999-8999-999999999999" },
       {
@@ -1220,7 +1442,8 @@ describe("0002-session-lifecycle authorization, validation, workflow, and outbox
         validation_start_workspace_id: "other-workspace",
         validation_completion_workspace_id: "other-workspace",
       },
-    ]) {
+    ];
+    for (const mismatchedBinding of mismatchedBindings) {
       assert.throws(
         () => insert(connection, "lifecycle_validation_results", {
           ...validation,
@@ -1248,6 +1471,195 @@ describe("0002-session-lifecycle authorization, validation, workflow, and outbox
     );
   });
 
+  it("allows a validation result to forward-reference only its exact event", () => {
+    const matching = currentConnection();
+    seedAuthorities(matching);
+    matching.exec("BEGIN IMMEDIATE");
+    insert(matching, "lifecycle_validation_results", validationResult({
+      recorded_event_position: 3,
+    }));
+    seedAdditionalSessionEvent(
+      matching,
+      ROOT_ID,
+      3,
+      2,
+      "SessionValidationResultRecorded",
+    );
+    matching.exec("COMMIT");
+    assert.equal(
+      matching.prepare("SELECT count(*) AS count FROM lifecycle_validation_results").get()?.count,
+      1n,
+    );
+
+    const forwardMismatches: readonly {
+      result: Readonly<Record<string, SqliteValue>>;
+      eventType: string;
+    }[] = [
+      { result: { vault_id: "99999999-9999-4999-8999-999999999999" }, eventType: "SessionValidationResultRecorded" },
+      { result: { store_id: "99999999-9999-4999-8999-999999999999" }, eventType: "SessionValidationResultRecorded" },
+      {
+        result: {
+          workspace_id: "other-workspace",
+          validation_start_workspace_id: "other-workspace",
+          validation_completion_workspace_id: "other-workspace",
+        },
+        eventType: "SessionValidationResultRecorded",
+      },
+      { result: { session_id: CHILD_ID }, eventType: "SessionValidationResultRecorded" },
+      { result: {}, eventType: "SessionEndVerificationPassed" },
+    ];
+    for (const mismatch of forwardMismatches) {
+      const connection = currentConnection();
+      seedAuthorities(connection);
+      connection.exec("BEGIN IMMEDIATE");
+      insert(connection, "lifecycle_validation_results", validationResult({
+        ...mismatch.result,
+        recorded_event_position: 3,
+      }));
+      assert.throws(
+        () => seedAdditionalSessionEvent(
+          connection,
+          ROOT_ID,
+          3,
+          2,
+          mismatch.eventType,
+        ),
+        /LIFECYCLE_VALIDATION_EVENT_MISMATCH/,
+      );
+      connection.exec("ROLLBACK");
+      assert.equal(
+        connection.prepare("SELECT count(*) AS count FROM lifecycle_validation_results").get()?.count,
+        0n,
+      );
+    }
+
+    const missing = currentConnection();
+    seedAuthorities(missing);
+    missing.exec("BEGIN IMMEDIATE");
+    insert(missing, "lifecycle_validation_results", validationResult({
+      recorded_event_position: 3,
+    }));
+    assert.throws(() => missing.exec("COMMIT"), /FOREIGN KEY constraint failed/);
+    missing.exec("ROLLBACK");
+  });
+
+  it("binds workflow triggering identity to one generation and coherently reopens cancelled work", () => {
+    const connection = currentConnection();
+    seedAuthorities(connection);
+    insert(connection, "workflow_instances", lifecycleWorkflow());
+
+    assert.throws(
+      () => connection.exec("UPDATE workflow_instances SET triggering_event_position = 2"),
+      /WORKFLOW_LIFECYCLE_INVALID/,
+    );
+    assert.throws(
+      () => connection.prepare(`
+        UPDATE workflow_instances SET expected_authority_commitment = $commitment
+      `).run({ $commitment: H64_B }),
+      /WORKFLOW_LIFECYCLE_INVALID/,
+    );
+
+    connection.exec("UPDATE workflow_instances SET phase = 'cancelled'");
+    assert.throws(
+      () => connection.exec(`
+        UPDATE workflow_instances
+        SET generation = 2, phase = 'cancelled', coordinator_attempt_count = 0
+      `),
+      /WORKFLOW_LIFECYCLE_INVALID/,
+    );
+    assert.throws(
+      () => connection.exec(`
+        UPDATE workflow_instances
+        SET generation = 2, phase = 'requested', coordinator_attempt_count = 0,
+            result_json = NULL, error_code = NULL
+      `),
+      /WORKFLOW_LIFECYCLE_INVALID/,
+    );
+    connection.prepare(`
+      UPDATE workflow_instances
+      SET generation = 2, phase = 'requested', root_command_id = 'replacement-command',
+          triggering_event_position = 2, expected_authority_commitment = $commitment,
+          coordinator_owner_id = NULL, coordinator_claim_token = NULL,
+          coordinator_claim_expires_at = NULL, coordinator_attempt_count = 0,
+          coordinator_failure_class = NULL, coordinator_error_code = NULL,
+          coordinator_next_attempt_at = NULL,
+          validation_attempt_plan_generation = NULL, validation_attempt_plans_json = NULL,
+          result_json = NULL, error_code = NULL
+    `).run({ $commitment: H64_B });
+    assert.throws(
+      () => connection.exec("UPDATE workflow_instances SET triggering_event_position = 3"),
+      /WORKFLOW_LIFECYCLE_INVALID/,
+    );
+  });
+
+  it("persists workflow claim fencing across release and retry clear shapes", () => {
+    const connection = currentConnection();
+    seedAuthorities(connection);
+    insert(connection, "workflow_instances", lifecycleWorkflow());
+    connection.exec(`
+      UPDATE workflow_instances
+      SET coordinator_owner_id = 'worker-1', coordinator_claim_token = 2,
+          coordinator_claim_expires_at = '2026-07-14T00:02:00.000Z',
+          coordinator_attempt_count = 2
+    `);
+    connection.exec(`
+      UPDATE workflow_instances
+      SET coordinator_owner_id = NULL, coordinator_claim_token = NULL,
+          coordinator_claim_expires_at = NULL
+    `);
+    for (const token of [1, 2]) {
+      assert.throws(
+        () => connection.prepare(`
+          UPDATE workflow_instances
+          SET coordinator_owner_id = 'worker-stale', coordinator_claim_token = $token,
+              coordinator_claim_expires_at = '2026-07-14T00:03:00.000Z',
+              coordinator_attempt_count = 2
+        `).run({ $token: token }),
+        /WORKFLOW_LIFECYCLE_INVALID/,
+        `released token ${token}`,
+      );
+    }
+    connection.exec(`
+      UPDATE workflow_instances
+      SET coordinator_owner_id = 'worker-2', coordinator_claim_token = 3,
+          coordinator_claim_expires_at = '2026-07-14T00:03:00.000Z',
+          coordinator_attempt_count = 3
+    `);
+    assert.throws(
+      () => connection.exec(`
+        UPDATE workflow_instances
+        SET coordinator_owner_id = NULL, coordinator_claim_token = NULL,
+            coordinator_claim_expires_at = NULL, coordinator_attempt_count = 2
+      `),
+      /WORKFLOW_LIFECYCLE_INVALID/,
+    );
+    connection.exec(`
+      UPDATE workflow_instances
+      SET coordinator_owner_id = NULL, coordinator_claim_token = NULL,
+          coordinator_claim_expires_at = NULL,
+          coordinator_failure_class = 'retryable', coordinator_error_code = 'TEMPORARY',
+          coordinator_next_attempt_at = '2026-07-14T00:04:00.000Z'
+    `);
+    assert.throws(
+      () => connection.exec(`
+        UPDATE workflow_instances
+        SET coordinator_owner_id = 'worker-2', coordinator_claim_token = 3,
+            coordinator_claim_expires_at = '2026-07-14T00:05:00.000Z',
+            coordinator_failure_class = NULL, coordinator_error_code = NULL,
+            coordinator_next_attempt_at = NULL
+      `),
+      /WORKFLOW_LIFECYCLE_INVALID/,
+    );
+    connection.exec(`
+      UPDATE workflow_instances
+      SET coordinator_owner_id = 'worker-3', coordinator_claim_token = 4,
+          coordinator_claim_expires_at = '2026-07-14T00:05:00.000Z',
+          coordinator_attempt_count = 4,
+          coordinator_failure_class = NULL, coordinator_error_code = NULL,
+          coordinator_next_attempt_at = NULL
+    `);
+  });
+
   it("enforces workflow claim, retry, generation, and write-once plan invariants", () => {
     const connection = currentConnection();
     seedAuthorities(connection);
@@ -1267,7 +1679,8 @@ describe("0002-session-lifecycle authorization, validation, workflow, and outbox
     connection.exec(`
       UPDATE workflow_instances
       SET coordinator_owner_id = 'worker-1', coordinator_claim_token = 2,
-          coordinator_claim_expires_at = '2026-07-14T00:02:00.000Z'
+          coordinator_claim_expires_at = '2026-07-14T00:02:00.000Z',
+          coordinator_attempt_count = 2
     `);
     assert.throws(
       () => connection.exec(`
@@ -1280,7 +1693,8 @@ describe("0002-session-lifecycle authorization, validation, workflow, and outbox
     connection.exec(`
       UPDATE workflow_instances
       SET coordinator_owner_id = 'worker-2', coordinator_claim_token = 3,
-          coordinator_claim_expires_at = '2026-07-14T00:03:00.000Z'
+          coordinator_claim_expires_at = '2026-07-14T00:03:00.000Z',
+          coordinator_attempt_count = 3
     `);
     assert.throws(
       () => connection.exec(`
@@ -1364,6 +1778,8 @@ describe("0002-session-lifecycle authorization, validation, workflow, and outbox
       UPDATE workflow_instances
       SET generation = 2,
           phase = 'requested',
+          triggering_event_position = 2,
+          expected_authority_commitment = '${H64_B}',
           coordinator_owner_id = NULL,
           coordinator_claim_token = NULL,
           coordinator_claim_expires_at = NULL,
@@ -1385,6 +1801,9 @@ describe("0002-session-lifecycle authorization, validation, workflow, and outbox
     connection.exec(`
       UPDATE workflow_instances
       SET generation = 3, phase = 'requested',
+          root_command_id = 'replacement-command',
+          triggering_event_position = 3,
+          expected_authority_commitment = '${H64}',
           coordinator_owner_id = NULL, coordinator_claim_token = NULL,
           coordinator_claim_expires_at = NULL, coordinator_attempt_count = 0,
           coordinator_failure_class = NULL, coordinator_error_code = NULL,
@@ -1393,6 +1812,118 @@ describe("0002-session-lifecycle authorization, validation, workflow, and outbox
           validation_attempt_plans_json = NULL,
           result_json = NULL, error_code = NULL,
           updated_at = '${NOW}'
+    `);
+  });
+
+  it("rejects a NULL lifecycle outbox origin discriminator", () => {
+    const origin = currentConnection();
+    seedAuthorities(origin);
+    assert.throws(
+      () => insert(origin, "outbox", lifecycleOutbox({ origin_kind: null })),
+      /OUTBOX_LIFECYCLE_INVALID/,
+    );
+  });
+
+  it("rejects a NULL pending-outbox failure discriminator with retry metadata", () => {
+    const pendingFailure = currentConnection();
+    seedAuthorities(pendingFailure);
+    assert.throws(
+      () => insert(pendingFailure, "outbox", lifecycleOutbox({
+        failure_class: null,
+        safe_error_code: "TEMPORARY",
+        next_attempt_at: "2026-07-14T00:02:00.000Z",
+      })),
+      /OUTBOX_LIFECYCLE_INVALID/,
+    );
+  });
+
+  it("rejects a NULL failed-outbox failure discriminator", () => {
+    const failedFailure = currentConnection();
+    seedAuthorities(failedFailure);
+    assert.throws(
+      () => insert(failedFailure, "outbox", lifecycleOutbox({
+        status: "failed",
+        attempt_count: 1,
+        failure_class: null,
+        safe_error_code: "TEMPORARY",
+        next_attempt_at: "2026-07-14T00:02:00.000Z",
+      })),
+      /OUTBOX_LIFECYCLE_INVALID/,
+    );
+  });
+
+  it("persists outbox claim fencing across pending and failed clear shapes", () => {
+    const connection = currentConnection();
+    seedAuthorities(connection);
+    insert(connection, "outbox", lifecycleOutbox());
+    connection.exec(`
+      UPDATE outbox
+      SET status = 'claimed', attempt_count = 2,
+          claim_owner = 'worker-1', claim_token = 2,
+          claim_expires_at = '2026-07-14T00:02:00.000Z'
+      WHERE session_id = '${ROOT_ID}'
+    `);
+    connection.exec(`
+      UPDATE outbox
+      SET status = 'pending', claim_owner = NULL, claim_token = NULL,
+          claim_expires_at = NULL
+      WHERE session_id = '${ROOT_ID}'
+    `);
+    for (const token of [1, 2]) {
+      assert.throws(
+        () => connection.prepare(`
+          UPDATE outbox
+          SET status = 'claimed', attempt_count = 2,
+              claim_owner = 'worker-stale', claim_token = $token,
+              claim_expires_at = '2026-07-14T00:03:00.000Z'
+          WHERE session_id = $sessionId
+        `).run({ $token: token, $sessionId: ROOT_ID }),
+        /OUTBOX_LIFECYCLE_INVALID/,
+        `pending token ${token}`,
+      );
+    }
+    connection.exec(`
+      UPDATE outbox
+      SET status = 'claimed', attempt_count = 3,
+          claim_owner = 'worker-2', claim_token = 3,
+          claim_expires_at = '2026-07-14T00:03:00.000Z'
+      WHERE session_id = '${ROOT_ID}'
+    `);
+    assert.throws(
+      () => connection.exec(`
+        UPDATE outbox
+        SET status = 'pending', attempt_count = 2,
+            claim_owner = NULL, claim_token = NULL, claim_expires_at = NULL
+        WHERE session_id = '${ROOT_ID}'
+      `),
+      /OUTBOX_LIFECYCLE_INVALID/,
+    );
+    connection.exec(`
+      UPDATE outbox
+      SET status = 'failed', claim_owner = NULL, claim_token = NULL,
+          claim_expires_at = NULL, failure_class = 'retryable',
+          safe_error_code = 'TEMPORARY',
+          next_attempt_at = '2026-07-14T00:04:00.000Z'
+      WHERE session_id = '${ROOT_ID}'
+    `);
+    assert.throws(
+      () => connection.exec(`
+        UPDATE outbox
+        SET status = 'claimed', attempt_count = 3,
+            claim_owner = 'worker-2', claim_token = 3,
+            claim_expires_at = '2026-07-14T00:05:00.000Z',
+            failure_class = NULL, safe_error_code = NULL, next_attempt_at = NULL
+        WHERE session_id = '${ROOT_ID}'
+      `),
+      /OUTBOX_LIFECYCLE_INVALID/,
+    );
+    connection.exec(`
+      UPDATE outbox
+      SET status = 'claimed', attempt_count = 4,
+          claim_owner = 'worker-3', claim_token = 4,
+          claim_expires_at = '2026-07-14T00:05:00.000Z',
+          failure_class = NULL, safe_error_code = NULL, next_attempt_at = NULL
+      WHERE session_id = '${ROOT_ID}'
     `);
   });
 
@@ -1440,7 +1971,7 @@ describe("0002-session-lifecycle authorization, validation, workflow, and outbox
     );
     connection.exec(`
       UPDATE outbox
-      SET claim_owner = 'worker-2', claim_token = 2,
+      SET attempt_count = 2, claim_owner = 'worker-2', claim_token = 2,
           claim_expires_at = '2026-07-14T00:03:00.000Z', updated_at = '${NOW}'
       WHERE session_id = '${ROOT_ID}'
     `);

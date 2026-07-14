@@ -339,6 +339,9 @@ CREATE TABLE lifecycle_validation_results (
     DEFERRABLE INITIALLY DEFERRED
 ) STRICT;
 
+CREATE INDEX lifecycle_validation_results_event_position
+ON lifecycle_validation_results(recorded_event_position);
+
 ALTER TABLE command_dedup ADD COLUMN lifecycle_authorization_kind TEXT;
 ALTER TABLE command_dedup ADD COLUMN authorization_proof_version INTEGER;
 ALTER TABLE command_dedup ADD COLUMN authorization_proof_nonce TEXT;
@@ -441,8 +444,10 @@ WHEN
       OR NEW.root_handle_issue_nonce GLOB '*[^0-9a-f]*'
       OR NEW.root_handle_issued_at IS NULL
       OR NEW.root_handle_policy_code IS NULL
+      OR NEW.root_handle_expiry_kind IS NULL
       OR NEW.root_handle_expiry_kind NOT IN ('until-revoked', 'absolute')
       OR (NEW.root_handle_expiry_kind = 'absolute') <> (NEW.root_handle_expires_at IS NOT NULL)
+      OR NEW.root_handle_actor_role IS NULL
       OR NEW.root_handle_actor_role <> 'primary'
       OR NEW.root_handle_client_instance_id IS NULL
       OR NEW.root_handle_verifier IS NULL
@@ -456,8 +461,10 @@ WHEN
       OR NEW.resume_token_issue_nonce GLOB '*[^0-9a-f]*'
       OR NEW.resume_token_issued_at IS NULL
       OR NEW.resume_token_policy_code IS NULL
+      OR NEW.resume_token_expiry_kind IS NULL
       OR NEW.resume_token_expiry_kind NOT IN ('until-revoked', 'absolute')
       OR (NEW.resume_token_expiry_kind = 'absolute') <> (NEW.resume_token_expires_at IS NOT NULL)
+      OR NEW.resume_token_actor_role IS NULL
       OR NEW.resume_token_actor_role <> 'primary'
       OR NEW.resume_token_verifier IS NULL
       OR length(NEW.resume_token_verifier) <> 64
@@ -532,8 +539,10 @@ WHEN
           OR NEW.child_handle_issue_nonce GLOB '*[^0-9a-f]*'
           OR NEW.child_handle_issued_at IS NULL
           OR NEW.child_handle_policy_code IS NULL
+          OR NEW.child_handle_expiry_kind IS NULL
           OR NEW.child_handle_expiry_kind NOT IN ('until-revoked', 'absolute')
           OR (NEW.child_handle_expiry_kind = 'absolute') <> (NEW.child_handle_expires_at IS NOT NULL)
+          OR NEW.child_handle_actor_role IS NULL
           OR NEW.child_handle_actor_role <> 'untrusted'
           OR NEW.child_handle_client_instance_id IS NULL
           OR NEW.child_handle_verifier IS NULL
@@ -585,8 +594,10 @@ WHEN
     OR NEW.root_handle_issue_nonce GLOB '*[^0-9a-f]*'
     OR NEW.root_handle_issued_at IS NULL
     OR NEW.root_handle_policy_code IS NULL
+    OR NEW.root_handle_expiry_kind IS NULL
     OR NEW.root_handle_expiry_kind NOT IN ('until-revoked', 'absolute')
     OR (NEW.root_handle_expiry_kind = 'absolute') <> (NEW.root_handle_expires_at IS NOT NULL)
+    OR NEW.root_handle_actor_role IS NULL
     OR NEW.root_handle_actor_role <> 'primary'
     OR NEW.root_handle_client_instance_id IS NULL
     OR NEW.root_handle_verifier IS NULL
@@ -600,8 +611,10 @@ WHEN
     OR NEW.resume_token_issue_nonce GLOB '*[^0-9a-f]*'
     OR NEW.resume_token_issued_at IS NULL
     OR NEW.resume_token_policy_code IS NULL
+    OR NEW.resume_token_expiry_kind IS NULL
     OR NEW.resume_token_expiry_kind NOT IN ('until-revoked', 'absolute')
     OR (NEW.resume_token_expiry_kind = 'absolute') <> (NEW.resume_token_expires_at IS NOT NULL)
+    OR NEW.resume_token_actor_role IS NULL
     OR NEW.resume_token_actor_role <> 'primary'
     OR NEW.resume_token_verifier IS NULL
     OR length(NEW.resume_token_verifier) <> 64
@@ -671,8 +684,10 @@ WHEN
       OR NEW.child_handle_issue_nonce GLOB '*[^0-9a-f]*'
       OR NEW.child_handle_issued_at IS NULL
       OR NEW.child_handle_policy_code IS NULL
+      OR NEW.child_handle_expiry_kind IS NULL
       OR NEW.child_handle_expiry_kind NOT IN ('until-revoked', 'absolute')
       OR (NEW.child_handle_expiry_kind = 'absolute') <> (NEW.child_handle_expires_at IS NOT NULL)
+      OR NEW.child_handle_actor_role IS NULL
       OR NEW.child_handle_actor_role <> 'untrusted'
       OR NEW.child_handle_client_instance_id IS NULL
       OR NEW.child_handle_verifier IS NULL
@@ -875,6 +890,24 @@ BEGIN
   SELECT RAISE(ABORT, 'CHILD_TRANSFER_TICKET_IMMUTABLE');
 END;
 
+CREATE TRIGGER events_validation_result_link_guard
+BEFORE INSERT ON events
+WHEN EXISTS (
+  SELECT 1 FROM lifecycle_validation_results
+  WHERE recorded_event_position = NEW.global_position
+    AND (
+      project_id IS NOT NEW.project_id
+      OR vault_id IS NOT NEW.vault_id
+      OR store_id IS NOT NEW.store_id
+      OR workspace_id IS NOT NEW.workspace_id
+      OR session_id IS NOT NEW.session_id
+      OR NEW.event_type <> 'SessionValidationResultRecorded'
+    )
+)
+BEGIN
+  SELECT RAISE(ABORT, 'LIFECYCLE_VALIDATION_EVENT_MISMATCH');
+END;
+
 CREATE TRIGGER lifecycle_validation_results_insert_guard
 BEFORE INSERT ON lifecycle_validation_results
 WHEN NEW.project_id <> NEW.validation_start_project_id
@@ -887,15 +920,17 @@ WHEN NEW.project_id <> NEW.validation_start_project_id
     SELECT 1 FROM json_each(NEW.artifact_references_json)
     WHERE json_type(value) <> 'text' OR length(value) = 0
   )
-  OR NOT EXISTS (
+  OR EXISTS (
     SELECT 1 FROM events
     WHERE global_position = NEW.recorded_event_position
-      AND project_id = NEW.project_id
-      AND vault_id = NEW.vault_id
-      AND store_id = NEW.store_id
-      AND workspace_id = NEW.workspace_id
-      AND session_id = NEW.session_id
-      AND event_type = 'SessionValidationResultRecorded'
+      AND (
+        project_id IS NOT NEW.project_id
+        OR vault_id IS NOT NEW.vault_id
+        OR store_id IS NOT NEW.store_id
+        OR workspace_id IS NOT NEW.workspace_id
+        OR session_id IS NOT NEW.session_id
+        OR event_type <> 'SessionValidationResultRecorded'
+      )
   )
 BEGIN
   SELECT RAISE(ABORT, 'LIFECYCLE_VALIDATION_EVENT_MISMATCH');
@@ -913,11 +948,113 @@ BEGIN
   SELECT RAISE(ABORT, 'LIFECYCLE_VALIDATION_RESULT_IMMUTABLE');
 END;
 
+CREATE TRIGGER events_lifecycle_authorization_guard
+BEFORE INSERT ON events
+WHEN NEW.stream_type = 'session'
+  AND NEW.session_id IS NOT NULL
+  AND NEW.stream_id = 'session/' || NEW.session_id
+  AND NEW.event_type IN (
+    'SessionStarted',
+    'SessionOwnerTransferred',
+    'SessionOwnershipRecovered',
+    'SessionSuspendRequested',
+    'SessionSuspended',
+    'SessionResumed',
+    'SessionCheckpointRecorded',
+    'EvidenceCoverageRecorded',
+    'SessionForked',
+    'ChildAssignmentAmended',
+    'ChildWorkReported',
+    'ChildWorkDispositioned',
+    'ChildCompletionProposed',
+    'ChildSessionCompleted',
+    'ChildSessionSuspended',
+    'ChildWorkTransferCreated',
+    'ChildWorkTransferClaimed',
+    'SessionEndRequested',
+    'SessionEndAmended',
+    'SessionValidationResultRecorded',
+    'SessionEndVerificationPassed',
+    'SessionEndVerificationFailed',
+    'SessionEndVerificationInvalidated',
+    'SessionEndCancelled',
+    'SessionAbandoned',
+    'SessionEnded'
+  )
+  AND EXISTS (
+    SELECT 1 FROM command_dedup
+    WHERE project_id = NEW.project_id
+      AND command_id = NEW.command_id
+      AND lifecycle_authorization_kind IS NULL
+  )
+BEGIN
+  SELECT RAISE(ABORT, 'COMMAND_AUTHORIZATION_INVALID');
+END;
+
 CREATE TRIGGER command_dedup_lifecycle_insert_guard
 BEFORE INSERT ON command_dedup
 WHEN
   (NEW.lifecycle_authorization_kind IS NULL AND (
-    NEW.authorization_proof_version IS NOT NULL
+    NEW.command_type IN (
+      'root-start',
+      'root-resume',
+      'root-recovery',
+      'root-suspend',
+      'fork-child',
+      'amend-child-assignment',
+      'record-checkpoint',
+      'record-evidence-batch',
+      'record-child-report',
+      'disposition-child-report',
+      'propose-child-completion',
+      'complete-child-session',
+      'suspend-child-session',
+      'create-child-transfer',
+      'claim-child-transfer',
+      'request-session-end',
+      'amend-session-end',
+      'cancel-session-end',
+      'abandon-session',
+      'internal-validation-result',
+      'internal-workflow-phase'
+    )
+    OR EXISTS (
+      SELECT 1 FROM events
+      WHERE project_id = NEW.project_id
+        AND command_id = NEW.command_id
+        AND stream_type = 'session'
+        AND session_id IS NOT NULL
+        AND stream_id = 'session/' || session_id
+        AND event_type IN (
+          'SessionStarted',
+          'SessionOwnerTransferred',
+          'SessionOwnershipRecovered',
+          'SessionSuspendRequested',
+          'SessionSuspended',
+          'SessionResumed',
+          'SessionCheckpointRecorded',
+          'EvidenceCoverageRecorded',
+          'SessionForked',
+          'ChildAssignmentAmended',
+          'ChildWorkReported',
+          'ChildWorkDispositioned',
+          'ChildCompletionProposed',
+          'ChildSessionCompleted',
+          'ChildSessionSuspended',
+          'ChildWorkTransferCreated',
+          'ChildWorkTransferClaimed',
+          'SessionEndRequested',
+          'SessionEndAmended',
+          'SessionValidationResultRecorded',
+          'SessionEndVerificationPassed',
+          'SessionEndVerificationFailed',
+          'SessionEndVerificationInvalidated',
+          'SessionEndCancelled',
+          'SessionAbandoned',
+          'SessionEnded'
+        )
+    )
+    OR NEW.authorization_proof_version IS NOT NULL
     OR NEW.authorization_proof_nonce IS NOT NULL
     OR NEW.authorization_proof_digest IS NOT NULL
     OR NEW.authorization_approval_id IS NOT NULL
@@ -935,8 +1072,57 @@ WHEN
     OR NEW.internal_claim_token IS NOT NULL
   ))
   OR (NEW.lifecycle_authorization_kind IS NOT NULL AND (
-    NEW.lifecycle_authorization_kind NOT IN ('initial-authority', 'protected', 'internal-workflow')
+    NEW.command_type NOT IN (
+      'root-start',
+      'root-resume',
+      'root-recovery',
+      'root-suspend',
+      'fork-child',
+      'amend-child-assignment',
+      'record-checkpoint',
+      'record-evidence-batch',
+      'record-child-report',
+      'disposition-child-report',
+      'propose-child-completion',
+      'complete-child-session',
+      'suspend-child-session',
+      'create-child-transfer',
+      'claim-child-transfer',
+      'request-session-end',
+      'amend-session-end',
+      'cancel-session-end',
+      'abandon-session',
+      'internal-validation-result',
+      'internal-workflow-phase'
+    )
+    OR NEW.lifecycle_authorization_kind NOT IN ('initial-authority', 'protected', 'internal-workflow')
+    OR (NEW.lifecycle_authorization_kind = 'initial-authority'
+      AND NEW.command_type <> 'root-start')
+    OR (NEW.lifecycle_authorization_kind = 'protected' AND NEW.command_type NOT IN (
+      'root-resume',
+      'root-recovery',
+      'root-suspend',
+      'fork-child',
+      'amend-child-assignment',
+      'record-checkpoint',
+      'record-evidence-batch',
+      'record-child-report',
+      'disposition-child-report',
+      'propose-child-completion',
+      'complete-child-session',
+      'suspend-child-session',
+      'create-child-transfer',
+      'claim-child-transfer',
+      'request-session-end',
+      'amend-session-end',
+      'cancel-session-end',
+      'abandon-session'
+    ))
+    OR (NEW.lifecycle_authorization_kind = 'internal-workflow'
+      AND NEW.command_type NOT IN ('internal-validation-result', 'internal-workflow-phase'))
+    OR NEW.presenting_actor_role IS NULL
     OR NEW.presenting_actor_role NOT IN ('primary', 'maintenance', 'untrusted')
+    OR NEW.target_actor_role IS NULL
     OR NEW.target_actor_role NOT IN ('primary', 'maintenance', 'untrusted')
     OR NEW.presenting_client_instance_id IS NULL
     OR NEW.target_client_instance_id IS NULL
@@ -1028,7 +1214,10 @@ WHEN
     OR NEW.coordinator_attempt_count IS NULL OR NEW.coordinator_attempt_count < 0
     OR (NEW.coordinator_owner_id IS NULL) <> (NEW.coordinator_claim_token IS NULL)
     OR (NEW.coordinator_owner_id IS NULL) <> (NEW.coordinator_claim_expires_at IS NULL)
-    OR (NEW.coordinator_claim_token IS NOT NULL AND NEW.coordinator_claim_token <= 0)
+    OR (NEW.coordinator_claim_token IS NOT NULL AND (
+      NEW.coordinator_claim_token <= 0
+      OR NEW.coordinator_attempt_count < NEW.coordinator_claim_token
+    ))
     OR (NEW.coordinator_failure_class IS NULL) <> (NEW.coordinator_error_code IS NULL)
     OR (NEW.coordinator_failure_class IS NULL AND NEW.coordinator_next_attempt_at IS NOT NULL)
     OR (NEW.coordinator_failure_class = 'retryable' AND NEW.coordinator_next_attempt_at IS NULL)
@@ -1098,14 +1287,29 @@ WHEN
     OR NEW.expected_authority_commitment IS NULL
     OR length(NEW.expected_authority_commitment) <> 64
     OR NEW.expected_authority_commitment GLOB '*[^0-9a-f]*'
+    OR (NEW.generation = OLD.generation AND (
+      NEW.triggering_event_position IS NOT OLD.triggering_event_position
+      OR NEW.expected_authority_commitment IS NOT OLD.expected_authority_commitment
+    ))
     OR NEW.coordinator_attempt_count IS NULL OR NEW.coordinator_attempt_count < 0
     OR (NEW.coordinator_owner_id IS NULL) <> (NEW.coordinator_claim_token IS NULL)
     OR (NEW.coordinator_owner_id IS NULL) <> (NEW.coordinator_claim_expires_at IS NULL)
-    OR (NEW.coordinator_claim_token IS NOT NULL AND NEW.coordinator_claim_token <= 0)
-    OR (OLD.coordinator_claim_token IS NOT NULL AND NEW.coordinator_claim_token IS NOT NULL AND (
-      NEW.coordinator_claim_token < OLD.coordinator_claim_token
-      OR (NEW.coordinator_owner_id IS NOT OLD.coordinator_owner_id
-        AND NEW.coordinator_claim_token <= OLD.coordinator_claim_token)
+    OR (NEW.coordinator_claim_token IS NOT NULL AND (
+      NEW.coordinator_claim_token <= 0
+      OR NEW.coordinator_attempt_count < NEW.coordinator_claim_token
+    ))
+    OR (NEW.generation = OLD.generation AND (
+      NEW.coordinator_attempt_count < OLD.coordinator_attempt_count
+      OR (NEW.coordinator_claim_token IS NOT NULL AND (
+        (OLD.coordinator_claim_token IS NULL
+          AND NEW.coordinator_claim_token <= OLD.coordinator_attempt_count)
+        OR (OLD.coordinator_claim_token IS NOT NULL AND (
+          NEW.coordinator_claim_token < OLD.coordinator_claim_token
+          OR ((NEW.coordinator_owner_id IS NOT OLD.coordinator_owner_id
+            OR NEW.coordinator_claim_token IS NOT OLD.coordinator_claim_token)
+            AND NEW.coordinator_claim_token <= OLD.coordinator_attempt_count)
+        ))
+      ))
     ))
     OR (NEW.coordinator_failure_class IS NULL) <> (NEW.coordinator_error_code IS NULL)
     OR (NEW.coordinator_failure_class IS NULL AND NEW.coordinator_next_attempt_at IS NOT NULL)
@@ -1146,16 +1350,26 @@ WHEN
     OR (OLD.phase IN ('completed', 'abandoned') AND (
       NEW.phase IS NOT OLD.phase OR NEW.generation IS NOT OLD.generation
     ))
-    OR (OLD.phase = 'cancelled' AND NEW.phase IS NOT OLD.phase AND (
-      NEW.phase <> 'requested'
-      OR NEW.generation <> OLD.generation + 1
-      OR NEW.coordinator_owner_id IS NOT NULL
-      OR NEW.coordinator_attempt_count <> 0
-      OR NEW.coordinator_failure_class IS NOT NULL
-      OR NEW.validation_attempt_plan_generation IS NOT NULL
-      OR NEW.result_json IS NOT NULL
-      OR NEW.error_code IS NOT NULL
-    ))
+    OR (OLD.phase = 'cancelled'
+      AND (NEW.phase IS NOT OLD.phase OR NEW.generation IS NOT OLD.generation)
+      AND (
+        NEW.phase <> 'requested'
+        OR NEW.generation <> OLD.generation + 1
+        OR NEW.root_command_id IS OLD.root_command_id
+        OR NEW.triggering_event_position IS OLD.triggering_event_position
+        OR NEW.expected_authority_commitment IS OLD.expected_authority_commitment
+        OR NEW.coordinator_owner_id IS NOT NULL
+        OR NEW.coordinator_claim_token IS NOT NULL
+        OR NEW.coordinator_claim_expires_at IS NOT NULL
+        OR NEW.coordinator_attempt_count <> 0
+        OR NEW.coordinator_failure_class IS NOT NULL
+        OR NEW.coordinator_error_code IS NOT NULL
+        OR NEW.coordinator_next_attempt_at IS NOT NULL
+        OR NEW.validation_attempt_plan_generation IS NOT NULL
+        OR NEW.validation_attempt_plans_json IS NOT NULL
+        OR NEW.result_json IS NOT NULL
+        OR NEW.error_code IS NOT NULL
+      ))
   ))
 BEGIN
   SELECT RAISE(ABORT, 'WORKFLOW_LIFECYCLE_INVALID');
@@ -1216,7 +1430,8 @@ WHEN
     OR NEW.next_attempt_at IS NOT NULL
   ))
   OR (NEW.session_id IS NOT NULL AND (
-    NEW.origin_kind NOT IN ('workflow', 'terminal-event')
+    NEW.origin_kind IS NULL
+    OR NEW.origin_kind NOT IN ('workflow', 'terminal-event')
     OR (NEW.origin_kind = 'workflow' AND (
       NEW.workflow_id IS NULL OR NEW.workflow_generation IS NULL OR NEW.workflow_generation <= 0
     ))
@@ -1240,26 +1455,32 @@ WHEN
     OR NEW.fingerprint_domain IS NULL
     OR (NEW.status = 'pending' AND (
       NEW.claim_owner IS NOT NULL OR NEW.claim_token IS NOT NULL OR NEW.claim_expires_at IS NOT NULL
-      OR NOT (
-        (NEW.failure_class IS NULL AND NEW.safe_error_code IS NULL AND NEW.next_attempt_at IS NULL)
-        OR (NEW.failure_class = 'retryable' AND NEW.safe_error_code IS NOT NULL
-          AND NEW.next_attempt_at IS NOT NULL)
-      )
+      OR (NEW.failure_class IS NULL AND (
+        NEW.safe_error_code IS NOT NULL OR NEW.next_attempt_at IS NOT NULL
+      ))
+      OR (NEW.failure_class IS NOT NULL AND (
+        NEW.failure_class <> 'retryable'
+        OR NEW.safe_error_code IS NULL
+        OR NEW.next_attempt_at IS NULL
+      ))
     ))
     OR (NEW.status = 'claimed' AND (
       NEW.claim_owner IS NULL OR NEW.claim_token IS NULL OR NEW.claim_token <= 0
+      OR NEW.attempt_count < NEW.claim_token
       OR NEW.claim_expires_at IS NULL
       OR NEW.failure_class IS NOT NULL OR NEW.safe_error_code IS NOT NULL
       OR NEW.next_attempt_at IS NOT NULL
     ))
     OR (NEW.status = 'completed' AND (
       NEW.claim_owner IS NULL OR NEW.claim_token IS NULL OR NEW.claim_token <= 0
+      OR NEW.attempt_count < NEW.claim_token
       OR NEW.claim_expires_at IS NOT NULL
       OR NEW.failure_class IS NOT NULL OR NEW.safe_error_code IS NOT NULL
       OR NEW.next_attempt_at IS NOT NULL
     ))
     OR (NEW.status = 'failed' AND (
       NEW.claim_owner IS NOT NULL OR NEW.claim_token IS NOT NULL OR NEW.claim_expires_at IS NOT NULL
+      OR NEW.failure_class IS NULL
       OR NEW.failure_class NOT IN ('retryable', 'permanent')
       OR NEW.safe_error_code IS NULL
       OR (NEW.failure_class = 'retryable' AND NEW.next_attempt_at IS NULL)
@@ -1294,6 +1515,7 @@ WHEN
   ))
   OR (NEW.session_id IS NOT NULL AND (
     OLD.session_id IS NULL
+    OR NEW.origin_kind IS NULL
     OR NEW.origin_kind NOT IN ('workflow', 'terminal-event')
     OR (NEW.origin_kind = 'workflow' AND (
       NEW.workflow_id IS NULL OR NEW.workflow_generation IS NULL OR NEW.workflow_generation <= 0
@@ -1312,35 +1534,46 @@ WHEN
     OR NEW.fingerprint_schema_version IS NULL OR NEW.fingerprint_schema_version <= 0
     OR (NEW.status = 'pending' AND (
       NEW.claim_owner IS NOT NULL OR NEW.claim_token IS NOT NULL OR NEW.claim_expires_at IS NOT NULL
-      OR NOT (
-        (NEW.failure_class IS NULL AND NEW.safe_error_code IS NULL AND NEW.next_attempt_at IS NULL)
-        OR (NEW.failure_class = 'retryable' AND NEW.safe_error_code IS NOT NULL
-          AND NEW.next_attempt_at IS NOT NULL)
-      )
+      OR (NEW.failure_class IS NULL AND (
+        NEW.safe_error_code IS NOT NULL OR NEW.next_attempt_at IS NOT NULL
+      ))
+      OR (NEW.failure_class IS NOT NULL AND (
+        NEW.failure_class <> 'retryable'
+        OR NEW.safe_error_code IS NULL
+        OR NEW.next_attempt_at IS NULL
+      ))
     ))
     OR (NEW.status = 'claimed' AND (
       NEW.claim_owner IS NULL OR NEW.claim_token IS NULL OR NEW.claim_token <= 0
+      OR NEW.attempt_count < NEW.claim_token
       OR NEW.claim_expires_at IS NULL
       OR NEW.failure_class IS NOT NULL OR NEW.safe_error_code IS NOT NULL
       OR NEW.next_attempt_at IS NOT NULL
     ))
     OR (NEW.status = 'completed' AND (
       NEW.claim_owner IS NULL OR NEW.claim_token IS NULL OR NEW.claim_token <= 0
+      OR NEW.attempt_count < NEW.claim_token
       OR NEW.claim_expires_at IS NOT NULL
       OR NEW.failure_class IS NOT NULL OR NEW.safe_error_code IS NOT NULL
       OR NEW.next_attempt_at IS NOT NULL
     ))
     OR (NEW.status = 'failed' AND (
       NEW.claim_owner IS NOT NULL OR NEW.claim_token IS NOT NULL OR NEW.claim_expires_at IS NOT NULL
+      OR NEW.failure_class IS NULL
       OR NEW.failure_class NOT IN ('retryable', 'permanent')
       OR NEW.safe_error_code IS NULL
       OR (NEW.failure_class = 'retryable' AND NEW.next_attempt_at IS NULL)
       OR (NEW.failure_class = 'permanent' AND NEW.next_attempt_at IS NOT NULL)
     ))
     OR (NEW.status <> 'pending' AND NEW.attempt_count <= 0)
-    OR (OLD.claim_token IS NOT NULL AND NEW.claim_token IS NOT NULL AND (
-      NEW.claim_token < OLD.claim_token
-      OR (NEW.claim_owner IS NOT OLD.claim_owner AND NEW.claim_token <= OLD.claim_token)
+    OR NEW.attempt_count < OLD.attempt_count
+    OR (NEW.claim_token IS NOT NULL AND (
+      (OLD.claim_token IS NULL AND NEW.claim_token <= OLD.attempt_count)
+      OR (OLD.claim_token IS NOT NULL AND (
+        NEW.claim_token < OLD.claim_token
+        OR ((NEW.claim_owner IS NOT OLD.claim_owner OR NEW.claim_token IS NOT OLD.claim_token)
+          AND NEW.claim_token <= OLD.attempt_count)
+      ))
     ))
     OR (OLD.status = 'completed' AND (
       NEW.status <> 'completed'

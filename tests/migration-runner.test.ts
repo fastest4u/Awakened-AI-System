@@ -42,6 +42,18 @@ describe("MigrationRunner", () => {
         { kind: "bootstrap-empty" },
       );
       assert.deepEqual(applied, [1]);
+      connection.exec(`
+        INSERT INTO project_meta(
+          singleton, project_id, vault_id, store_id, schema_version, created_at
+        ) VALUES (
+          1,
+          '11111111-1111-4111-8111-111111111111',
+          '22222222-2222-4222-8222-222222222222',
+          '33333333-3333-4333-8333-333333333333',
+          1,
+          '2026-07-11T00:00:00.000Z'
+        )
+      `);
       assert.deepEqual(
         runner.apply(
           connection,
@@ -414,6 +426,46 @@ describe("MigrationRunner", () => {
       assert.equal(
         connection.prepare("SELECT schema_version FROM project_meta").get()?.schema_version,
         2n,
+      );
+    } finally {
+      connection.close();
+    }
+  });
+
+  it("rejects an identity-less explicit upgrade without applying pending schema", () => {
+    const connection = driver.open(databasePath(), {
+      mode: "create",
+      busyTimeoutMs: DEFAULT_BUSY_TIMEOUT_MS,
+    });
+    try {
+      const runner = new MigrationRunner();
+      runner.apply(
+        connection,
+        [eventCoreMigration],
+        "2026-07-11T00:00:00.000Z",
+        { kind: "bootstrap-empty" },
+      );
+
+      assert.throws(
+        () => runner.apply(
+          connection,
+          PROJECT_STORE_MIGRATIONS,
+          "2026-07-11T00:00:01.000Z",
+          { kind: "explicit-upgrade", expectedAppliedVersion: 1 },
+        ),
+        /PROJECT_SCHEMA_VERSION_MISMATCH/,
+      );
+      assert.deepEqual(
+        connection.prepare("SELECT version FROM schema_migrations ORDER BY version")
+          .all().map((row) => row.version),
+        [1n],
+      );
+      assert.equal(
+        connection.prepare(`
+          SELECT count(*) AS count FROM sqlite_schema
+          WHERE name = 'session_authority'
+        `).get()?.count,
+        0n,
       );
     } finally {
       connection.close();

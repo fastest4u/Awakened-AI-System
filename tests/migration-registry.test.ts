@@ -214,6 +214,21 @@ describe("project-store migration registry", () => {
     );
   });
 
+  it("rejects a published migration prefix without exactly one project identity", () => {
+    const connection = emptyConnection();
+    new MigrationRunner().apply(
+      connection,
+      [eventCoreMigration],
+      NOW,
+      { kind: "bootstrap-empty" },
+    );
+
+    assert.throws(
+      () => inspectStoreSchema(connection),
+      /PROJECT_SCHEMA_VERSION_MISMATCH/,
+    );
+  });
+
   it("validates the complete binary registry before touching SQLite", () => {
     const connection = emptyConnection();
     assert.throws(

@@ -128,11 +128,12 @@ function verifyProjectSchemaVersion(
   connection: SqliteConnection,
   appliedVersion: number,
 ): void {
-  if (!tableExists(connection, "project_meta")) return;
+  if (!tableExists(connection, "project_meta")) {
+    fail("PROJECT_SCHEMA_VERSION_MISMATCH");
+  }
   const rows = connection.prepare(`
-    SELECT schema_version FROM project_meta WHERE singleton = 1
+    SELECT schema_version FROM project_meta
   `).all();
-  if (rows.length === 0) return;
   if (
     rows.length !== 1
     || numeric(rows[0]?.schema_version) !== appliedVersion
