@@ -1288,7 +1288,8 @@ WHEN
     OR length(NEW.expected_authority_commitment) <> 64
     OR NEW.expected_authority_commitment GLOB '*[^0-9a-f]*'
     OR (NEW.generation = OLD.generation AND (
-      NEW.triggering_event_position IS NOT OLD.triggering_event_position
+      NEW.root_command_id IS NOT OLD.root_command_id
+      OR NEW.triggering_event_position IS NOT OLD.triggering_event_position
       OR NEW.expected_authority_commitment IS NOT OLD.expected_authority_commitment
     ))
     OR NEW.coordinator_attempt_count IS NULL OR NEW.coordinator_attempt_count < 0
@@ -1357,7 +1358,6 @@ WHEN
         OR NEW.generation <> OLD.generation + 1
         OR NEW.root_command_id IS OLD.root_command_id
         OR NEW.triggering_event_position IS OLD.triggering_event_position
-        OR NEW.expected_authority_commitment IS OLD.expected_authority_commitment
         OR NEW.coordinator_owner_id IS NOT NULL
         OR NEW.coordinator_claim_token IS NOT NULL
         OR NEW.coordinator_claim_expires_at IS NOT NULL

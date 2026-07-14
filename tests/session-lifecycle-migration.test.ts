@@ -1543,6 +1543,19 @@ describe("0002-session-lifecycle authorization, validation, workflow, and outbox
     missing.exec("ROLLBACK");
   });
 
+  it("keeps workflow root command identity immutable within one generation", () => {
+    const connection = currentConnection();
+    seedAuthorities(connection);
+    insert(connection, "workflow_instances", lifecycleWorkflow());
+
+    assert.throws(
+      () => connection.exec(`
+        UPDATE workflow_instances SET root_command_id = 'replacement-command'
+      `),
+      /WORKFLOW_LIFECYCLE_INVALID/,
+    );
+  });
+
   it("binds workflow triggering identity to one generation and coherently reopens cancelled work", () => {
     const connection = currentConnection();
     seedAuthorities(connection);
@@ -1575,6 +1588,22 @@ describe("0002-session-lifecycle authorization, validation, workflow, and outbox
       `),
       /WORKFLOW_LIFECYCLE_INVALID/,
     );
+    assert.throws(
+      () => connection.exec(`
+        UPDATE workflow_instances
+        SET generation = 2, phase = 'requested', root_command_id = 'replacement-command',
+            coordinator_attempt_count = 0, result_json = NULL, error_code = NULL
+      `),
+      /WORKFLOW_LIFECYCLE_INVALID/,
+    );
+    assert.throws(
+      () => connection.exec(`
+        UPDATE workflow_instances
+        SET generation = 2, phase = 'requested', triggering_event_position = 2,
+            coordinator_attempt_count = 0, result_json = NULL, error_code = NULL
+      `),
+      /WORKFLOW_LIFECYCLE_INVALID/,
+    );
     connection.prepare(`
       UPDATE workflow_instances
       SET generation = 2, phase = 'requested', root_command_id = 'replacement-command',
@@ -1585,7 +1614,7 @@ describe("0002-session-lifecycle authorization, validation, workflow, and outbox
           coordinator_next_attempt_at = NULL,
           validation_attempt_plan_generation = NULL, validation_attempt_plans_json = NULL,
           result_json = NULL, error_code = NULL
-    `).run({ $commitment: H64_B });
+    `).run({ $commitment: H64 });
     assert.throws(
       () => connection.exec("UPDATE workflow_instances SET triggering_event_position = 3"),
       /WORKFLOW_LIFECYCLE_INVALID/,
