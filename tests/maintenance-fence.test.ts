@@ -32,6 +32,7 @@ function createConnection(): SqliteConnection {
     connection,
     [eventCoreMigration],
     "2026-07-13T00:00:00.000Z",
+    { kind: "bootstrap-empty" },
   );
   connection.exec("BEGIN IMMEDIATE");
   connection.prepare(`

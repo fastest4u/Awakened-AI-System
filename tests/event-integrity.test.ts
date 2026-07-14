@@ -164,7 +164,12 @@ function createFixture(options: { append?: boolean } = {}): Fixture {
     busyTimeoutMs: DEFAULT_BUSY_TIMEOUT_MS,
   });
   connections.push(connection);
-  new MigrationRunner().apply(connection, [eventCoreMigration], NOW);
+  new MigrationRunner().apply(
+    connection,
+    [eventCoreMigration],
+    NOW,
+    { kind: "bootstrap-empty" },
+  );
   connection.exec("BEGIN IMMEDIATE");
   connection.prepare(`
     INSERT INTO project_meta(
@@ -235,7 +240,7 @@ function createFixture(options: { append?: boolean } = {}): Fixture {
     path: route.eventsPath,
     connection,
     context,
-    integrity: new EventIntegrityService(connection),
+    integrity: new EventIntegrityService(connection, [eventCoreMigration]),
     manifestRepository,
     store: eventStore,
   };
@@ -1638,7 +1643,8 @@ describe("EventIntegrityService bounds and transaction semantics", () => {
       `);
     });
     const observing = new ObservingConnection(findingFixture.connection);
-    const failedReport = new EventIntegrityService(observing).fullCheck(findingFixture.context);
+    const failedReport = new EventIntegrityService(observing, [eventCoreMigration])
+      .fullCheck(findingFixture.context);
     assert.equal(failedReport.ok, false);
     assert.equal(observing.executed[0], "BEGIN DEFERRED");
     assert.equal(observing.executed.at(-1), "COMMIT");
@@ -1651,7 +1657,8 @@ describe("EventIntegrityService bounds and transaction semantics", () => {
       /PRAGMA\s+quick_check/i,
     );
     assert.throws(
-      () => new EventIntegrityService(throwing).quickCheck(exceptionFixture.context, 256),
+      () => new EventIntegrityService(throwing, [eventCoreMigration])
+        .quickCheck(exceptionFixture.context, 256),
       /INJECTED_READ_FAILURE/,
     );
     assert.deepEqual(throwing.executed, ["BEGIN DEFERRED", "ROLLBACK"]);
@@ -1663,7 +1670,8 @@ describe("EventIntegrityService bounds and transaction semantics", () => {
       /FROM\s+outbox/i,
     );
     assert.throws(
-      () => new EventIntegrityService(witnessReadFailure).fullCheck(witnessFixture.context),
+      () => new EventIntegrityService(witnessReadFailure, [eventCoreMigration])
+        .fullCheck(witnessFixture.context),
       /INJECTED_READ_FAILURE/,
     );
     assert.equal(witnessReadFailure.executed[0], "BEGIN DEFERRED");
@@ -1700,7 +1708,8 @@ describe("EventIntegrityService bounds and transaction semantics", () => {
       ));
     });
 
-    const snapshot = new EventIntegrityService(observing).quickCheck(fixture.context, 256);
+    const snapshot = new EventIntegrityService(observing, [eventCoreMigration])
+      .quickCheck(fixture.context, 256);
     assert.equal(appended, true);
     assert.deepEqual(
       [snapshot.lastGlobalPosition, snapshot.eventsVerified, snapshot.streamsVerified],

@@ -38,6 +38,10 @@ import {
 import { NodeSqliteDriver } from "../src/orchestrator/storage/node-sqlite-driver.js";
 import { expectedSchemaFingerprint } from "../src/orchestrator/storage/schema-fingerprint.js";
 import { eventCoreMigration } from "../src/orchestrator/storage/migrations/0001-event-core.js";
+import {
+  CURRENT_PROJECT_STORE_SCHEMA_VERSION,
+  PROJECT_STORE_MIGRATIONS,
+} from "../src/orchestrator/storage/migrations/registry.js";
 import { canonicalMkdtemp } from "./support/canonical-temp.js";
 
 const roots: string[] = [];
@@ -153,8 +157,16 @@ describe("DefaultProjectStoreBootstrapService", () => {
       assert.equal(meta?.project_id, result.descriptor.projectId);
       assert.equal(meta?.vault_id, result.descriptor.vaultId);
       assert.equal(meta?.store_id, result.manifest.storeId);
-      assert.equal(meta?.schema_version, 1n);
-      assert.equal(database.prepare("SELECT count(*) AS count FROM schema_migrations").get()?.count, 1n);
+      assert.equal(meta?.schema_version, BigInt(CURRENT_PROJECT_STORE_SCHEMA_VERSION));
+      assert.equal(result.manifest.schemaVersion, 1);
+      assert.deepEqual(
+        database.prepare("SELECT version, name FROM schema_migrations ORDER BY version").all()
+          .map((row) => ({ version: row.version, name: row.name })),
+        PROJECT_STORE_MIGRATIONS.map((migration) => ({
+          version: BigInt(migration.version),
+          name: migration.name,
+        })),
+      );
       const maintenance = database
         .prepare("SELECT epoch, mode, owner_id, fencing_token FROM maintenance_state")
         .get();
@@ -483,7 +495,7 @@ describe("DefaultProjectStoreBootstrapService", () => {
       await new DefaultProjectStoreBootstrapService().initialize({ projectRoot, vaultRoot });
       unlinkSync(expected.manifest);
       const database = new DatabaseSync(expected.events);
-      database.exec("DROP TRIGGER project_meta_no_update");
+      database.exec("DROP TRIGGER project_meta_identity_immutable");
       database.prepare(`
         UPDATE project_meta SET project_id = $projectId WHERE singleton = 1
       `).run({ $projectId: "99999999-9999-4999-8999-999999999999" });
@@ -539,7 +551,7 @@ describe("DefaultProjectStoreBootstrapService", () => {
       );
     }
 
-    for (const table of ["evidence", "session_authority", "projection_state"]) {
+    for (const table of ["evidence", "rogue_lifecycle", "projection_state"]) {
       const { projectRoot, vaultRoot } = fixture();
       const expected = paths(vaultRoot);
       await new DefaultProjectStoreBootstrapService().initialize({ projectRoot, vaultRoot });
@@ -693,7 +705,10 @@ describe("DefaultProjectStoreBootstrapService", () => {
       busyTimeoutMs: DEFAULT_BUSY_TIMEOUT_MS,
     });
     try {
-      assert.equal(database.prepare("SELECT count(*) AS count FROM schema_migrations").get()?.count, 1n);
+      assert.equal(
+        database.prepare("SELECT count(*) AS count FROM schema_migrations").get()?.count,
+        BigInt(PROJECT_STORE_MIGRATIONS.length),
+      );
       assert.equal(database.prepare("PRAGMA integrity_check").get()?.integrity_check, "ok");
     } finally {
       database.close();
@@ -778,8 +793,8 @@ describe("DefaultProjectStoreBootstrapService", () => {
     database.exec("DROP TRIGGER schema_migrations_no_update");
     database.prepare(`
       UPDATE schema_migrations
-      SET version = 2, name = 'future', checksum = $checksum
-      WHERE version = 1
+      SET version = 3, name = 'future', checksum = $checksum
+      WHERE version = 2
     `).run({ $checksum: "f".repeat(64) });
     database.close();
 

@@ -19,14 +19,13 @@ import {
   SqliteEventStoreStatements,
 } from "../storage/event-store.js";
 import { MaintenanceFence } from "../storage/maintenance-fence.js";
-import { eventCoreMigration } from "../storage/migrations/0001-event-core.js";
-import { migrationChecksum } from "../storage/migration-runner.js";
+import { PROJECT_STORE_MIGRATIONS } from "../storage/migrations/registry.js";
 import { NodeSqliteDriver } from "../storage/node-sqlite-driver.js";
 import {
-  expectedSchemaFingerprint,
-  schemaFingerprint,
-  type SchemaQueryConnection,
-} from "../storage/schema-fingerprint.js";
+  inspectStoreSchema,
+  requireCurrentStoreSchema,
+  SchemaCompatibilityError,
+} from "../storage/schema-compatibility.js";
 import type { SqliteConnection, SqliteRow } from "../storage/sqlite-driver.js";
 import {
   compareVersions,
@@ -148,24 +147,11 @@ function identityFromConnection(
   const journal = connection.prepare("PRAGMA journal_mode").get()?.journal_mode;
   if (typeof journal !== "string" || journal.toLowerCase() !== "wal") failure("STORE_UNAVAILABLE");
 
-  const migrations = connection.prepare(`
-    SELECT version, name, checksum
-    FROM schema_migrations
-    ORDER BY version
-  `).all();
-  if (
-    migrations.length !== 1
-    || number(migrations[0]?.version) !== eventCoreMigration.version
-    || migrations[0]?.name !== eventCoreMigration.name
-    || migrations[0]?.checksum !== migrationChecksum(eventCoreMigration)
-  ) {
-    failure("MIGRATION_CHECKSUM_MISMATCH");
-  }
-  if (
-    schemaFingerprint(connection as unknown as SchemaQueryConnection)
-    !== expectedSchemaFingerprint([eventCoreMigration])
-  ) {
-    failure("SCHEMA_FINGERPRINT_MISMATCH");
+  try {
+    requireCurrentStoreSchema(inspectStoreSchema(connection, PROJECT_STORE_MIGRATIONS));
+  } catch (error) {
+    if (error instanceof SchemaCompatibilityError) failure(error.code);
+    throw error;
   }
 
   const rows = connection.prepare(`

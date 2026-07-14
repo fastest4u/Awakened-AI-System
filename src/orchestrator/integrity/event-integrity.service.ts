@@ -14,7 +14,7 @@ import { canonicalJson } from "../serialization/canonical-json.js";
 import { GENESIS_GLOBAL_HASH } from "../storage/event-store.js";
 import type { Migration } from "../storage/migration.js";
 import { migrationChecksum } from "../storage/migration-runner.js";
-import { eventCoreMigration } from "../storage/migrations/0001-event-core.js";
+import { PROJECT_STORE_MIGRATIONS } from "../storage/migrations/registry.js";
 import {
   expectedSchemaFingerprint,
   schemaFingerprint,
@@ -327,7 +327,7 @@ function transactionRollback(connection: SqliteConnection): void {
 export class EventIntegrityService {
   constructor(
     private readonly connection: SqliteConnection,
-    private readonly migrations: readonly Migration[] = [eventCoreMigration],
+    private readonly migrations: readonly Migration[] = PROJECT_STORE_MIGRATIONS,
   ) {}
 
   quickCheck(

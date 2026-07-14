@@ -39,14 +39,17 @@ import {
   probeRuntimeCapabilities,
   type RuntimeCapabilityResult,
 } from "../runtime/runtime-capabilities.js";
-import { MigrationRunner, migrationChecksum } from "./migration-runner.js";
-import { eventCoreMigration } from "./migrations/0001-event-core.js";
+import { MigrationRunner } from "./migration-runner.js";
+import {
+  CURRENT_PROJECT_STORE_SCHEMA_VERSION,
+  PROJECT_STORE_MIGRATIONS,
+} from "./migrations/registry.js";
 import { NodeSqliteDriver } from "./node-sqlite-driver.js";
 import {
-  expectedSchemaFingerprint,
-  schemaFingerprint,
-  type SchemaQueryConnection,
-} from "./schema-fingerprint.js";
+  inspectStoreSchema,
+  requireCurrentStoreSchema,
+  SchemaCompatibilityError,
+} from "./schema-compatibility.js";
 import type { SqliteConnection, SqliteDriver } from "./sqlite-driver.js";
 
 type DatabaseSyncConstructor = typeof import("node:sqlite").DatabaseSync;
@@ -86,6 +89,7 @@ export interface ProjectStoreBootstrapService {
 
 export type ProjectStoreBootstrapErrorCode =
   | "PROJECT_REPLICA_DECISION_REQUIRED"
+  | "SCHEMA_UPGRADE_REQUIRED"
   | "SCHEMA_TOO_NEW"
   | "SQLITE_CAPABILITY_MISSING"
   | "STORE_UNAVAILABLE";
@@ -249,33 +253,10 @@ function validateExistingStore(
       throw bootstrapFailure("STORE_UNAVAILABLE");
     }
 
-    const migrations = database.prepare(`
-      SELECT version, name, checksum
-      FROM schema_migrations
-      ORDER BY version
-    `).all();
-    const maximumVersion = migrations.reduce(
-      (maximum, row) => Math.max(maximum, numeric(row.version) ?? Number.MAX_SAFE_INTEGER),
-      0,
-    );
-    if (maximumVersion > eventCoreMigration.version) {
-      throw bootstrapFailure("SCHEMA_TOO_NEW");
-    }
-    if (
-      migrations.length !== 1
-      || numeric(migrations[0]?.version) !== eventCoreMigration.version
-      || migrations[0]?.name !== eventCoreMigration.name
-      || migrations[0]?.checksum !== migrationChecksum(eventCoreMigration)
-    ) {
-      throw bootstrapFailure("STORE_UNAVAILABLE");
-    }
-
-    if (
-      schemaFingerprint(database as unknown as SchemaQueryConnection)
-      !== expectedSchemaFingerprint([eventCoreMigration], DatabaseSync)
-    ) {
-      throw bootstrapFailure("STORE_UNAVAILABLE");
-    }
+    requireCurrentStoreSchema(inspectStoreSchema(
+      database as unknown as SqliteConnection,
+      PROJECT_STORE_MIGRATIONS,
+    ));
 
     const rows = database.prepare(`
       SELECT project_id, vault_id, store_id, schema_version, created_at
@@ -289,7 +270,7 @@ function validateExistingStore(
       || meta.vault_id !== descriptor.vaultId
       || typeof meta.store_id !== "string"
       || typeof meta.created_at !== "string"
-      || numeric(meta.schema_version) !== eventCoreMigration.version
+      || numeric(meta.schema_version) !== CURRENT_PROJECT_STORE_SCHEMA_VERSION
       || (expectedStoreId !== undefined && meta.store_id !== expectedStoreId)
     ) {
       throw bootstrapFailure("STORE_UNAVAILABLE");
@@ -348,6 +329,12 @@ function validateExistingStore(
     };
   } catch (error) {
     if (error instanceof ProjectStoreBootstrapError) throw error;
+    if (
+      error instanceof SchemaCompatibilityError
+      && (error.code === "SCHEMA_TOO_NEW" || error.code === "SCHEMA_UPGRADE_REQUIRED")
+    ) {
+      throw bootstrapFailure(error.code, error);
+    }
     throw bootstrapFailure("STORE_UNAVAILABLE", error);
   } finally {
     database?.close();
@@ -365,11 +352,12 @@ function insertBootstrapIdentity(
     connection.prepare(`
       INSERT INTO project_meta(
         singleton, project_id, vault_id, store_id, schema_version, created_at
-      ) VALUES (1, $projectId, $vaultId, $storeId, 1, $createdAt)
+      ) VALUES (1, $projectId, $vaultId, $storeId, $schemaVersion, $createdAt)
     `).run({
       $projectId: descriptor.projectId,
       $vaultId: descriptor.vaultId,
       $storeId: storeId,
+      $schemaVersion: CURRENT_PROJECT_STORE_SCHEMA_VERSION,
       $createdAt: createdAt,
     });
     connection.exec(`
@@ -610,8 +598,9 @@ export class DefaultProjectStoreBootstrapService implements ProjectStoreBootstra
       });
       this.#dependencies.migrationRunner.apply(
         connection,
-        [eventCoreMigration],
+        PROJECT_STORE_MIGRATIONS,
         this.#dependencies.now(),
+        { kind: "bootstrap-empty" },
       );
       this.#dependencies.faultInjector.hit("after-temp-schema-before-identity");
       insertBootstrapIdentity(

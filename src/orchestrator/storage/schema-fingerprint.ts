@@ -3,7 +3,7 @@ import { createRequire } from "node:module";
 import { DEFAULT_BUSY_TIMEOUT_MS } from "../runtime/runtime-capabilities.js";
 import type { Migration } from "./migration.js";
 
-type DatabaseSyncConstructor = typeof import("node:sqlite").DatabaseSync;
+export type DatabaseSyncConstructor = typeof import("node:sqlite").DatabaseSync;
 const require = createRequire(import.meta.url);
 let cachedDatabaseSync: DatabaseSyncConstructor | undefined;
 
@@ -87,4 +87,15 @@ export function expectedSchemaFingerprint(
   } finally {
     database.close();
   }
+}
+
+export function expectedSchemaFingerprintAtVersion(
+  registry: readonly Migration[],
+  version: number,
+  DatabaseSync: DatabaseSyncConstructor = loadDatabaseSync(),
+): string {
+  if (!Number.isSafeInteger(version) || version < 0 || version > registry.length) {
+    throw new Error("SCHEMA_VERSION_INVALID");
+  }
+  return expectedSchemaFingerprint(registry.slice(0, version), DatabaseSync);
 }
