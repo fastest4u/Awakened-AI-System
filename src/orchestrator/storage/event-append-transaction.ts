@@ -116,6 +116,11 @@ interface DedupRow {
   } | null;
 }
 
+interface LifecycleAuthorityBinding {
+  workspaceId: string;
+  clientNamespace: string;
+}
+
 interface GlobalTail {
   globalPosition: bigint;
   eventHash: string;
@@ -130,6 +135,10 @@ export interface EventAppendStatements {
   matchesProjectIdentity(projectId: string, vaultId: string, storeId: string): boolean;
   findDedup(projectId: string, idempotencyKey: string): DedupRow | undefined;
   findCommandId(projectId: string, commandId: string): { idempotencyKey: string } | undefined;
+  readLifecycleAuthorityBinding(
+    projectId: string,
+    sessionId: string,
+  ): LifecycleAuthorityBinding | undefined;
   readStream(projectId: string, streamId: string): StreamHead | undefined;
   insertStream(projectId: string, streamId: string, streamType: string, now: string): void;
   readGlobalTail(): GlobalTail;
@@ -827,23 +836,25 @@ function decodeLifecycleStableBindingRow(
 ): DedupRow["stableBinding"] {
   if (authorization === null) return null;
   const eventWorkspaceId = requiredString(row.lifecycle_event_workspace_id);
-  const authorityWorkspaceId = nullableString(row.lifecycle_authority_workspace_id);
-  const eventClientNamespace = nullableString(row.lifecycle_event_client_namespace);
-  const authorityClientNamespace = nullableString(row.lifecycle_authority_client_namespace);
+  const eventSessionId = requiredString(row.lifecycle_event_session_id);
+  const eventStreamId = requiredString(row.lifecycle_event_stream_id);
+  const eventStreamType = requiredString(row.lifecycle_event_stream_type);
+  const authoritySessionId = requiredString(row.lifecycle_authority_session_id);
+  const authorityWorkspaceId = requiredString(row.lifecycle_authority_workspace_id);
+  const authorityClientNamespace = requiredString(row.lifecycle_authority_client_namespace);
+  const targetSessionId = authorization.targetSessionId;
   if (eventWorkspaceId.length === 0
-    || (authorityWorkspaceId !== null && authorityWorkspaceId !== eventWorkspaceId)
-    || (authorityClientNamespace !== null
-      && eventClientNamespace !== null
-      && authorityClientNamespace !== eventClientNamespace)) {
-    throw new EventStoreError("INTEGRITY_FAILURE");
-  }
-  const clientNamespace = authorityClientNamespace ?? eventClientNamespace;
-  if (clientNamespace === null || clientNamespace.length === 0) {
+    || authorityClientNamespace.length === 0
+    || eventSessionId !== targetSessionId
+    || eventStreamId !== `session/${targetSessionId}`
+    || eventStreamType !== "session"
+    || authoritySessionId !== targetSessionId
+    || authorityWorkspaceId !== eventWorkspaceId) {
     throw new EventStoreError("INTEGRITY_FAILURE");
   }
   return {
-    workspaceId: authorityWorkspaceId ?? eventWorkspaceId,
-    clientNamespace,
+    workspaceId: authorityWorkspaceId,
+    clientNamespace: authorityClientNamespace,
   };
 }
 
@@ -919,6 +930,7 @@ export class SqliteEventAppendStatements implements EventAppendStatements {
   readonly #identity: SqliteStatement;
   readonly #findDedup: SqliteStatement;
   readonly #findCommandId: SqliteStatement;
+  readonly #readLifecycleAuthorityBinding: SqliteStatement | undefined;
   readonly #readStream: SqliteStatement;
   readonly #insertStream: SqliteStatement;
   readonly #readGlobalTail: SqliteStatement;
@@ -948,12 +960,14 @@ export class SqliteEventAppendStatements implements EventAppendStatements {
              dedup.internal_workflow_generation, dedup.internal_planned_work_id,
              dedup.internal_claim_owner_id, dedup.internal_claim_token,
              command_event.workspace_id AS lifecycle_event_workspace_id,
-             json_extract(command_event.payload_json, '$.clientNamespace')
-               AS lifecycle_event_client_namespace,
+             command_event.session_id AS lifecycle_event_session_id,
+             command_event.stream_id AS lifecycle_event_stream_id,
+             command_event.stream_type AS lifecycle_event_stream_type,
+             authority.session_id AS lifecycle_authority_session_id,
              authority.workspace_id AS lifecycle_authority_workspace_id,
              authority.client_namespace AS lifecycle_authority_client_namespace
       FROM command_dedup AS dedup
-      JOIN events AS command_event
+      LEFT JOIN events AS command_event
         ON command_event.project_id = dedup.project_id
        AND command_event.command_id = dedup.command_id
        AND command_event.command_event_index = 0
@@ -971,6 +985,13 @@ export class SqliteEventAppendStatements implements EventAppendStatements {
       FROM command_dedup
       WHERE project_id = $projectId AND command_id = $commandId
     `);
+    this.#readLifecycleAuthorityBinding = this.#lifecycleSchema
+      ? connection.prepare(`
+          SELECT workspace_id, client_namespace
+          FROM session_authority
+          WHERE project_id = $projectId AND session_id = $sessionId
+        `)
+      : undefined;
     this.#readStream = connection.prepare(`
       SELECT current_version, stream_type
       FROM streams
@@ -1132,6 +1153,26 @@ export class SqliteEventAppendStatements implements EventAppendStatements {
     const idempotencyKey = requiredString(row.idempotency_key);
     if (idempotencyKey.length === 0) throw new EventStoreError("INTEGRITY_FAILURE");
     return { idempotencyKey };
+  }
+
+  readLifecycleAuthorityBinding(
+    projectId: string,
+    sessionId: string,
+  ): LifecycleAuthorityBinding | undefined {
+    if (this.#readLifecycleAuthorityBinding === undefined) {
+      throw new EventStoreError("SCHEMA_UPGRADE_REQUIRED");
+    }
+    const row = this.#readLifecycleAuthorityBinding.get({
+      $projectId: projectId,
+      $sessionId: sessionId,
+    });
+    if (row === undefined) return undefined;
+    const workspaceId = requiredString(row.workspace_id);
+    const clientNamespace = requiredString(row.client_namespace);
+    if (workspaceId.length === 0 || clientNamespace.length === 0) {
+      throw new EventStoreError("INTEGRITY_FAILURE");
+    }
+    return { workspaceId, clientNamespace };
   }
 
   readStream(projectId: string, streamId: string): StreamHead | undefined {
@@ -1604,6 +1645,31 @@ export class EventAppendTransaction {
         throw new EventStoreError("COMMAND_INVALID", { field: "authorization" });
       }
     } else {
+      const targetSessionId = authorization.targetSessionId;
+      const expectedStreamId = `session/${targetSessionId}`;
+      const eventZero = batch.events[0];
+      if (eventZero === undefined
+        || eventZero.commandEventIndex !== 0
+        || eventZero.commandId !== prepared.command.commandId
+        || eventZero.projectId !== prepared.command.context.binding.projectId
+        || eventZero.sessionId !== targetSessionId
+        || eventZero.streamId !== expectedStreamId
+        || eventZero.streamType !== "session"
+        || prepared.command.streamId !== expectedStreamId
+        || eventZero.workspaceId !== prepared.command.context.binding.workspaceId) {
+        throw new EventStoreError("INTEGRITY_FAILURE");
+      }
+      const authorityBinding = this.statements.readLifecycleAuthorityBinding(
+        prepared.command.context.binding.projectId,
+        targetSessionId,
+      );
+      if (authorityBinding === undefined) {
+        throw new EventStoreError("INTEGRITY_FAILURE");
+      }
+      if (authorityBinding.workspaceId !== prepared.command.context.binding.workspaceId
+        || authorityBinding.clientNamespace !== prepared.command.context.binding.clientNamespace) {
+        throw new EventStoreError("IDEMPOTENCY_CONFLICT");
+      }
       if (validated.lifecycleIntent === null
         || !isPlainRecord(validated.lifecycleIntent)
         || !isPlainRecord(validated.lifecycleIntent.persistedAssertions)

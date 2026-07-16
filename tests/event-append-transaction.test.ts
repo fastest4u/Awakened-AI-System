@@ -27,6 +27,7 @@ import {
 import { BranchScopeRepository } from "../src/orchestrator/storage/branch-scope.repository.js";
 import {
   EventAppendTransaction,
+  EventStoreError,
   SqliteEventAppendStatements,
   matchesLifecycleReplayAuthorization,
 } from "../src/orchestrator/storage/event-append-transaction.js";
@@ -276,7 +277,11 @@ function fixture(): { connection: RecordingConnection; tx: EventAppendTransactio
   };
 }
 
-function lifecycleFixture(): { connection: RecordingConnection; tx: EventAppendTransaction } {
+function lifecycleFixture(): {
+  connection: RecordingConnection;
+  statements: SqliteEventAppendStatements;
+  tx: EventAppendTransaction;
+} {
   const root = mkdtempSync(join(tmpdir(), "event-append-lifecycle-"));
   roots.push(root);
   const connection = new RecordingConnection(driver.open(join(root, "events.sqlite"), {
@@ -302,16 +307,80 @@ function lifecycleFixture(): { connection: RecordingConnection; tx: EventAppendT
   `);
   connection.exec("COMMIT");
   connection.transactionStatements.length = 0;
+  const statements = new SqliteEventAppendStatements(connection);
   return {
     connection,
+    statements,
     tx: new EventAppendTransaction(
       connection,
-      new SqliteEventAppendStatements(connection),
+      statements,
       new MaintenanceFence(),
       new BranchScopeRepository(),
       () => "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
     ),
   };
+}
+
+function persistRootAuthority(
+  connection: SqliteConnection,
+  eventPosition: bigint,
+  overrides: {
+    workspaceId?: WorkspaceId;
+    clientNamespace?: string;
+  } = {},
+): void {
+  connection.prepare(`
+    INSERT INTO session_authority(
+      project_id, session_id, stream_id, session_kind, parent_session_id,
+      workspace_id, client_namespace, semantic_state, owner_generation,
+      child_capability_generation, direct_access_enabled,
+      continuity_fingerprint_algorithm, continuity_fingerprint_schema_version,
+      continuity_fingerprint_key_id, continuity_fingerprint_domain,
+      continuity_fingerprint, root_handle_capability_version, root_handle_key_id,
+      root_handle_issue_nonce, root_handle_issued_at, root_handle_policy_code,
+      root_handle_expiry_kind, root_handle_expires_at, root_handle_actor_role,
+      root_handle_client_instance_id, root_handle_verifier, root_handle_issuance_id,
+      resume_token_capability_version, resume_token_key_id, resume_token_issue_nonce,
+      resume_token_issued_at, resume_token_policy_code, resume_token_expiry_kind,
+      resume_token_expires_at, resume_token_actor_role, resume_token_verifier,
+      resume_token_issuance_id, child_handle_capability_version,
+      child_handle_key_id, child_handle_issue_nonce, child_handle_issued_at,
+      child_handle_policy_code, child_handle_expiry_kind, child_handle_expires_at,
+      child_handle_actor_role, child_handle_client_instance_id,
+      child_handle_verifier, child_handle_issuance_id, authority_commitment,
+      authority_event_position, latest_checkpoint_id,
+      latest_checkpoint_event_position, latest_checkpoint_fingerprint,
+      checkpoint_required_reason, checkpoint_required_event_position,
+      revocation_reason_code, revocation_event_position, revoked_at,
+      terminal_event_position, terminal_event_type, terminal_at, created_at, updated_at
+    ) VALUES (
+      $projectId, $sessionId, $streamId, 'root', NULL, $workspaceId,
+      $clientNamespace, 'active', 1, NULL, 0, 'hmac-sha256', 1,
+      'continuity-key-1', 'pm-continuity-v1', $authorityCommitment, 1,
+      'capability-key-1', $nonce, $now, 'root-default-v1', 'until-revoked',
+      NULL, 'primary', 'client-primary', $verifier, $handleIssuanceId,
+      1, 'capability-key-1', $resumeNonce, $now, 'resume-default-v1',
+      'until-revoked', NULL, 'primary', $resumeVerifier, $resumeIssuanceId,
+      NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+      $authorityCommitment, $eventPosition, NULL, NULL, NULL, NULL, NULL,
+      NULL, NULL, NULL, NULL, NULL, NULL, $now, $now
+    )
+  `).run({
+    $projectId: PROJECT_ID,
+    $sessionId: ROOT_SESSION_ID,
+    $streamId: `session/${ROOT_SESSION_ID}`,
+    $workspaceId: overrides.workspaceId ?? LIFECYCLE_WORKSPACE_ID,
+    $clientNamespace: overrides.clientNamespace ?? "lifecycle-tests",
+    $authorityCommitment: "a".repeat(64),
+    $nonce: "b".repeat(64),
+    $verifier: "c".repeat(64),
+    $handleIssuanceId: "77777777-7777-4777-8777-777777777777",
+    $resumeNonce: "d".repeat(64),
+    $resumeVerifier: "e".repeat(64),
+    $resumeIssuanceId: "88888888-8888-4888-8888-888888888888",
+    $eventPosition: eventPosition,
+    $now: NOW,
+  });
 }
 
 afterEach(() => {
@@ -348,6 +417,124 @@ it("never owns transaction statements while appending a prepared Version 1 batch
   assert.deepEqual(connection.transactionStatements, ["BEGIN IMMEDIATE", "COMMIT"]);
 });
 
+it("rejects lifecycle dedup when the persisted target authority is missing", () => {
+  const { connection, tx } = lifecycleFixture();
+  const command = lifecycleCommand();
+
+  connection.exec("BEGIN IMMEDIATE");
+  const prepared = tx.prepare(command.append, NOW, command.intentHash);
+  const planned = tx.planPrepared(prepared);
+  const committed = tx.appendPlanned(planned);
+  assert.throws(
+    () => tx.insertDedup(prepared, committed, initialAuthorization()),
+    (error: unknown) => error instanceof EventStoreError
+      && error.code === "INTEGRITY_FAILURE",
+  );
+  connection.exec("ROLLBACK");
+});
+
+it("rejects lifecycle dedup when event zero targets a different session", () => {
+  const { connection, tx } = lifecycleFixture();
+  const command = lifecycleCommand();
+  const otherSessionId = "99999999-9999-4999-8999-999999999999";
+  const malformed = {
+    ...command.append,
+    streamId: `session/${otherSessionId}`,
+    events: command.append.events.map((event) => ({
+      ...event,
+      sessionId: otherSessionId,
+    })),
+  };
+
+  connection.exec("BEGIN IMMEDIATE");
+  const prepared = tx.prepare(malformed, NOW, command.intentHash);
+  const planned = tx.planPrepared(prepared);
+  const committed = tx.appendPlanned(planned);
+  assert.throws(
+    () => tx.insertDedup(prepared, committed, initialAuthorization()),
+    (error: unknown) => error instanceof EventStoreError
+      && error.code === "INTEGRITY_FAILURE",
+  );
+  connection.exec("ROLLBACK");
+});
+
+for (const [name, authorityBinding] of [
+  ["workspace", { workspaceId: "2".repeat(64) as WorkspaceId }],
+  ["namespace", { clientNamespace: "wrong-lifecycle-client" }],
+] as const) {
+  it(`rejects lifecycle dedup when persisted authority ${name} differs from append context`, () => {
+    const { connection, tx } = lifecycleFixture();
+    const command = lifecycleCommand();
+
+    connection.exec("BEGIN IMMEDIATE");
+    const prepared = tx.prepare(command.append, NOW, command.intentHash);
+    const planned = tx.planPrepared(prepared);
+    const committed = tx.appendPlanned(planned);
+    persistRootAuthority(connection, committed.events[0]!.globalPosition, authorityBinding);
+    assert.throws(
+      () => tx.insertDedup(prepared, committed, initialAuthorization()),
+      (error: unknown) => error instanceof EventStoreError
+        && error.code === "IDEMPOTENCY_CONFLICT",
+    );
+    connection.exec("ROLLBACK");
+  });
+}
+
+it("treats historical lifecycle dedup without target authority as integrity failure before facades", () => {
+  const { connection, statements, tx } = lifecycleFixture();
+  const command = lifecycleCommand();
+  const authorization = initialAuthorization();
+
+  connection.exec("BEGIN IMMEDIATE");
+  const prepared = tx.prepare(command.append, NOW, command.intentHash);
+  const planned = tx.planPrepared(prepared);
+  const committed = tx.appendPlanned(planned);
+  statements.insertDedup(
+    prepared.command,
+    prepared.commandHash,
+    committed.storedResponse,
+    committed.responseHash,
+    NOW,
+    authorization,
+  );
+  connection.exec("COMMIT");
+
+  let facadeCalls = 0;
+  let newCalls = 0;
+  const store = new LifecycleCommandStore({
+    connection,
+    events: tx,
+    transaction: () => {
+      facadeCalls += 1;
+      return {
+        authority: {}, leases: {}, approvals: {}, transfers: {},
+        coverage: {}, workflows: {}, validation: {}, outbox: {},
+      };
+    },
+    now: () => NOW,
+  });
+  assert.throws(
+    () => store.execute({
+      context: command.append.context,
+      commandId: command.append.commandId,
+      idempotencyKey: command.append.idempotencyKey,
+      commandType: command.append.commandType,
+      candidateIntentHash: command.intentHash,
+      authoritativeIntentHash: command.intentHash,
+      replayExpectation: command.expectation,
+    }, () => {
+      newCalls += 1;
+      throw new Error("corrupt replay must not enter fresh path");
+    }),
+    (error: unknown) => error instanceof EventStoreError
+      && error.code === "INTEGRITY_FAILURE",
+  );
+  assert.equal(facadeCalls, 0);
+  assert.equal(newCalls, 0);
+  assert.deepEqual(connection.transactionStatements.at(-2), "BEGIN IMMEDIATE");
+  assert.deepEqual(connection.transactionStatements.at(-1), "ROLLBACK");
+});
+
 it("persists Version 2 authorization and replays an initial command with its generated target", () => {
   const { connection, tx } = lifecycleFixture();
   const command = lifecycleCommand();
@@ -364,6 +551,7 @@ it("persists Version 2 authorization and replays an initial command with its gen
   const prepared = tx.prepare(command.append, NOW, command.intentHash);
   const planned = tx.planPrepared(prepared);
   const committed = tx.appendPlanned(planned);
+  persistRootAuthority(connection, committed.events[0]!.globalPosition);
   tx.insertDedup(prepared, committed, record);
   connection.exec("COMMIT");
 
@@ -442,7 +630,11 @@ it("runs LifecycleCommandStore through the real primitive and replays before onN
   const command = lifecycleCommand();
   const authorization = initialAuthorization();
   const focused: LifecycleCommandTransaction = {
-    authority: {},
+    authority: {
+      persist(eventPosition: bigint) {
+        persistRootAuthority(connection, eventPosition);
+      },
+    },
     leases: {},
     approvals: {},
     transfers: {},
@@ -473,7 +665,10 @@ it("runs LifecycleCommandStore through the real primitive and replays before onN
     return {
       append: command.append,
       authorizationRecord: authorization,
-      afterAppend: () => undefined,
+      afterAppend: (committed, current) => {
+        (current.authority as { persist(eventPosition: bigint): void })
+          .persist(committed.events[0]!.globalPosition);
+      },
     };
   });
   const replay = store.execute({
