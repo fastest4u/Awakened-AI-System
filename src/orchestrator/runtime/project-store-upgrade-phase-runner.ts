@@ -18,6 +18,10 @@ export interface UpgradePhaseWorkerLike {
   on(event: "messageerror", listener: (error: unknown) => void): this;
   on(event: "error", listener: (error: Error) => void): this;
   on(event: "exit", listener: (exitCode: number) => void): this;
+  off(event: "message", listener: (value: unknown) => void): this;
+  off(event: "messageerror", listener: (error: unknown) => void): this;
+  off(event: "error", listener: (error: Error) => void): this;
+  off(event: "exit", listener: (exitCode: number) => void): this;
 }
 
 export interface ProjectStoreUpgradePhaseRunnerDependencies {
@@ -140,27 +144,12 @@ export class ProjectStoreUpgradePhaseRunner {
     return new Promise<T>((resolvePhase, rejectPhase) => {
       let decoded: T | undefined;
       let received = false;
-      let phaseError: ProjectStoreUpgradePhaseRunnerError | undefined;
       let settled = false;
       let terminating = false;
-      const finishReject = (error: ProjectStoreUpgradePhaseRunnerError): void => {
-        if (settled) return;
-        settled = true;
-        signal.removeEventListener("abort", onAbort);
-        rejectPhase(error);
-      };
-      const terminateWith = (error: ProjectStoreUpgradePhaseRunnerError): void => {
-        if (settled || terminating) return;
-        terminating = true;
-        phaseError = error;
-        void worker.terminate().catch(() => undefined);
-      };
-      const onAbort = (): void => {
-        terminateWith(new ProjectStoreUpgradePhaseRunnerError("WORKER_CLOSED"));
-      };
-      signal.addEventListener("abort", onAbort, { once: true });
-      worker.on("message", (value) => {
-        if (settled || terminating || received || phaseError !== undefined) {
+      let terminalError: ProjectStoreUpgradePhaseRunnerError | undefined;
+
+      const onMessage = (value: unknown): void => {
+        if (settled || terminating || received) {
           terminateWith(new ProjectStoreUpgradePhaseRunnerError("WORKER_PROTOCOL_ERROR"));
           return;
         }
@@ -173,7 +162,7 @@ export class ProjectStoreUpgradePhaseRunner {
             throw new ProjectStoreUpgradePhaseRunnerError("WORKER_PROTOCOL_ERROR");
           }
           if (Reflect.get(value, "ok") === false) {
-            phaseError = new ProjectStoreUpgradePhaseRunnerError(failureCode(value));
+            terminateWith(new ProjectStoreUpgradePhaseRunnerError(failureCode(value)));
             return;
           }
           if (Reflect.ownKeys(value).length !== 2 || !("data" in value)) {
@@ -186,27 +175,70 @@ export class ProjectStoreUpgradePhaseRunner {
             ? error
             : new ProjectStoreUpgradePhaseRunnerError("WORKER_PROTOCOL_ERROR"));
         }
-      });
-      worker.on("messageerror", () => {
+      };
+      const onMessageError = (): void => {
         terminateWith(new ProjectStoreUpgradePhaseRunnerError("WORKER_PROTOCOL_ERROR"));
-      });
-      worker.on("error", () => {
+      };
+      const onError = (): void => {
         terminateWith(new ProjectStoreUpgradePhaseRunnerError("WORKER_UNAVAILABLE"));
-      });
-      worker.on("exit", (exitCode) => {
+      };
+      const onExit = (exitCode: number): void => {
         if (settled) return;
-        if (terminating || phaseError !== undefined) {
-          finishReject(phaseError ?? new ProjectStoreUpgradePhaseRunnerError("WORKER_UNAVAILABLE"));
+        if (terminating) {
+          finishReject(terminalError ?? new ProjectStoreUpgradePhaseRunnerError("WORKER_UNAVAILABLE"));
           return;
         }
         if (exitCode !== 0 || !received) {
           finishReject(new ProjectStoreUpgradePhaseRunnerError("WORKER_UNAVAILABLE"));
           return;
         }
-        settled = true;
+        finishResolve(decoded as T);
+      };
+      const onAbort = (): void => {
+        terminateWith(new ProjectStoreUpgradePhaseRunnerError("WORKER_CLOSED"));
+      };
+      const removeListeners = (): void => {
         signal.removeEventListener("abort", onAbort);
-        resolvePhase(decoded as T);
-      });
+        worker.off("message", onMessage);
+        worker.off("messageerror", onMessageError);
+        worker.off("error", onError);
+        worker.off("exit", onExit);
+      };
+      const finishReject = (error: ProjectStoreUpgradePhaseRunnerError): void => {
+        if (settled) return;
+        settled = true;
+        removeListeners();
+        rejectPhase(error);
+      };
+      const finishResolve = (value: T): void => {
+        if (settled) return;
+        settled = true;
+        removeListeners();
+        resolvePhase(value);
+      };
+      const terminateWith = (error: ProjectStoreUpgradePhaseRunnerError): void => {
+        if (settled || terminating) return;
+        terminating = true;
+        terminalError = error;
+        let termination: Promise<number>;
+        try {
+          termination = worker.terminate();
+        } catch {
+          finishReject(error);
+          return;
+        }
+        void termination.then(
+          () => finishReject(error),
+          () => finishReject(error),
+        );
+      };
+
+      signal.addEventListener("abort", onAbort, { once: true });
+      worker.on("message", onMessage);
+      worker.on("messageerror", onMessageError);
+      worker.on("error", onError);
+      worker.on("exit", onExit);
+      if (signal.aborted) onAbort();
     });
   }
 }
