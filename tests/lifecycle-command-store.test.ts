@@ -22,6 +22,7 @@ import {
   type LifecycleCommandEnvelope,
   type LifecycleCommandTransaction,
   type LifecycleEventAppendPort,
+  type PreparedLifecycleCommit,
 } from "../src/orchestrator/lifecycle/lifecycle-command.store.js";
 import type {
   EventAppendReplay,
@@ -142,6 +143,7 @@ function replayResult(
 
 class FakeEvents implements LifecycleEventAppendPort {
   readonly calls: string[] = [];
+  readonly insertedAuthorizations: PersistedLifecycleAuthorizationRecord[] = [];
   replay: EventAppendReplay<JsonValue> | null = null;
 
   constructor(readonly connection: TransactionConnection) {}
@@ -189,9 +191,10 @@ class FakeEvents implements LifecycleEventAppendPort {
   insertDedup<T extends JsonValue>(
     _prepared: PreparedEventAppend<T>,
     _batch: EventAppendBatch<T>,
-    _record: PersistedLifecycleAuthorizationRecord,
+    record: PersistedLifecycleAuthorizationRecord,
   ): void {
     this.calls.push("dedup");
+    this.insertedAuthorizations.push(record);
     this.connection.stage("dedup");
   }
 
@@ -221,6 +224,12 @@ class DriftedCommitEvents extends FakeEvents {
         finalStreamVersion: "3",
       },
     };
+  }
+}
+
+class BusyResultEvents extends FakeEvents {
+  override result<T extends JsonValue>(_batch: EventAppendBatch<T>): never {
+    throw { errcode: 5 };
   }
 }
 
@@ -323,6 +332,19 @@ function stage(facade: object, effect: string): void {
   (facade as { stage(value: string): void }).stage(effect);
 }
 
+type StagingFacade = { stage(value: string): void };
+
+function assertDeeplyFrozen(value: unknown): void {
+  if (typeof value !== "object" || value === null) return;
+  assert.equal(Object.isFrozen(value), true);
+  for (const nested of Object.values(value)) assertDeeplyFrozen(nested);
+}
+
+function isLifecycleInputInvalid(error: unknown): boolean {
+  return error instanceof LifecycleCommandStoreError
+    && error.code === "LIFECYCLE_INPUT_INVALID";
+}
+
 describe("LifecycleCommandStore", () => {
   it("derives stable internal planned-work IDs from exact domain-separated identities", () => {
     const validation = {
@@ -402,7 +424,10 @@ describe("LifecycleCommandStore", () => {
         return transaction(connection);
       },
       now: () => NOW,
-      authorityMaterialStatus: () => "stale",
+      authorityMaterialStatus: () => {
+        assert.deepEqual(connection.statements, ["BEGIN IMMEDIATE"]);
+        return "stale";
+      },
     });
     let freshCalls = 0;
 
@@ -432,13 +457,16 @@ describe("LifecycleCommandStore", () => {
     });
 
     const result = store.execute(envelope(), (received) => {
-      assert.equal(received, tx);
+      assert.notEqual(received, tx);
       stage(received.authority, "authority");
       stage(received.leases, "lease");
       return {
         append: appendCommand(),
         authorizationRecord: authorization(),
-        beforeAppend: (_planned, current) => stage(current.approvals, "approval"),
+        beforeAppend: (_planned, current) => {
+          stage(current.approvals, "approval");
+          return undefined;
+        },
         afterAppend: (_committed, current) => {
           stage(current.workflows, "workflow");
           stage(current.outbox, "outbox");
@@ -455,6 +483,446 @@ describe("LifecycleCommandStore", () => {
     assert.deepEqual(events.calls, [
       "find-replay", "assert-command-id", "assert-maintenance", "prepare", "plan", "append", "dedup",
     ]);
+  });
+
+  it("projects only declared command facades from the transaction factory", () => {
+    const connection = new TransactionConnection();
+    const events = new FakeEvents(connection);
+    const raw = Object.assign(transaction(connection), { connection, arbitrarySql: () => undefined });
+    const store = new LifecycleCommandStore({
+      connection,
+      events,
+      transaction: () => raw,
+      now: () => NOW,
+    });
+
+    store.execute(envelope(), (received) => {
+      assert.equal("connection" in received, false);
+      assert.equal("arbitrarySql" in received, false);
+      assert.equal((received as unknown as { connection?: unknown }).connection, undefined);
+      return {
+        append: appendCommand(),
+        authorizationRecord: authorization(),
+        afterAppend: () => undefined,
+      };
+    });
+  });
+
+  it("rejects a beforeAppend PromiseLike before append or commit", () => {
+    const connection = new TransactionConnection();
+    const events = new FakeEvents(connection);
+    const store = new LifecycleCommandStore({
+      connection,
+      events,
+      transaction: () => transaction(connection),
+      now: () => NOW,
+    });
+
+    assert.throws(
+      () => store.execute(envelope(), () => ({
+        append: appendCommand(),
+        authorizationRecord: authorization(),
+        beforeAppend: (() => ({ then() { /* PromiseLike escape */ } })) as unknown as (
+          planned: PlannedEventAppend<JsonValue>,
+          transaction: LifecycleCommandTransaction,
+        ) => undefined,
+        afterAppend: () => undefined,
+      })),
+      (error: unknown) => error instanceof LifecycleCommandStoreError
+        && error.code === "LIFECYCLE_INPUT_INVALID",
+    );
+    assert.deepEqual(connection.statements, ["BEGIN IMMEDIATE", "ROLLBACK"]);
+    assert.doesNotMatch(events.calls.join(","), /append|dedup/);
+  });
+
+  it("rejects an onNew PromiseLike before preparing, appending, or committing", () => {
+    const connection = new TransactionConnection();
+    const events = new FakeEvents(connection);
+    const store = new LifecycleCommandStore({
+      connection,
+      events,
+      transaction: () => transaction(connection),
+      now: () => NOW,
+    });
+    const thenable = { then() { /* synchronous escape */ } };
+    const onNew = (() => thenable) as unknown as (
+      transaction: LifecycleCommandTransaction,
+    ) => PreparedLifecycleCommit<JsonValue>;
+
+    assert.throws(() => store.execute(envelope(), onNew), isLifecycleInputInvalid);
+    assert.deepEqual(connection.statements, ["BEGIN IMMEDIATE", "ROLLBACK"]);
+    assert.doesNotMatch(events.calls.join(","), /prepare|plan|append|dedup/);
+  });
+
+  it("rejects an afterAppend PromiseLike before dedup or commit", () => {
+    const connection = new TransactionConnection();
+    const events = new FakeEvents(connection);
+    const store = new LifecycleCommandStore({
+      connection,
+      events,
+      transaction: () => transaction(connection),
+      now: () => NOW,
+    });
+
+    assert.throws(
+      () => store.execute(envelope(), () => ({
+        append: appendCommand(),
+        authorizationRecord: authorization(),
+        afterAppend: (() => ({ then() { /* PromiseLike escape */ } })) as unknown as (
+          committed: EventAppendBatch<JsonValue>,
+          transaction: LifecycleCommandTransaction,
+        ) => undefined,
+      })),
+      isLifecycleInputInvalid,
+    );
+    assert.deepEqual(connection.statements, ["BEGIN IMMEDIATE", "ROLLBACK"]);
+    assert.match(events.calls.join(","), /append/);
+    assert.doesNotMatch(events.calls.join(","), /dedup/);
+    assert.deepEqual(connection.committed, []);
+  });
+
+  it("revokes facades and captured method references when onNew exits", () => {
+    const connection = new TransactionConnection();
+    const events = new FakeEvents(connection);
+    const store = new LifecycleCommandStore({
+      connection,
+      events,
+      transaction: () => transaction(connection),
+      now: () => NOW,
+    });
+    let capturedFacade: StagingFacade | undefined;
+    let capturedMethod: StagingFacade["stage"] | undefined;
+
+    store.execute(envelope(), (tx) => {
+      capturedFacade = tx.authority as StagingFacade;
+      capturedMethod = capturedFacade.stage;
+      return {
+        append: appendCommand(),
+        authorizationRecord: authorization(),
+        beforeAppend: () => {
+          assert.throws(() => capturedFacade!.stage("late-on-new-facade"), isLifecycleInputInvalid);
+          assert.throws(() => capturedMethod!("late-on-new-method"), isLifecycleInputInvalid);
+        },
+        afterAppend: () => undefined,
+      };
+    });
+
+    assert.deepEqual(connection.committed, ["event", "dedup"]);
+  });
+
+  it("revokes facades and captured method references when beforeAppend exits", () => {
+    const connection = new TransactionConnection();
+    const events = new FakeEvents(connection);
+    const store = new LifecycleCommandStore({
+      connection,
+      events,
+      transaction: () => transaction(connection),
+      now: () => NOW,
+    });
+    let capturedFacade: StagingFacade | undefined;
+    let capturedMethod: StagingFacade["stage"] | undefined;
+
+    store.execute(envelope(), () => ({
+      append: appendCommand(),
+      authorizationRecord: authorization(),
+      beforeAppend: (_planned, tx) => {
+        capturedFacade = tx.approvals as StagingFacade;
+        capturedMethod = capturedFacade.stage;
+      },
+      afterAppend: () => {
+        assert.throws(() => capturedFacade!.stage("late-before-facade"), isLifecycleInputInvalid);
+        assert.throws(() => capturedMethod!("late-before-method"), isLifecycleInputInvalid);
+      },
+    }));
+
+    assert.deepEqual(connection.committed, ["event", "dedup"]);
+  });
+
+  it("revokes facades and captured method references when afterAppend exits", () => {
+    const connection = new TransactionConnection();
+    const events = new FakeEvents(connection);
+    const store = new LifecycleCommandStore({
+      connection,
+      events,
+      transaction: () => transaction(connection),
+      now: () => NOW,
+    });
+    let capturedFacade: StagingFacade | undefined;
+    let capturedMethod: StagingFacade["stage"] | undefined;
+
+    store.execute(envelope(), () => ({
+      append: appendCommand(),
+      authorizationRecord: authorization(),
+      afterAppend: (_committed, tx) => {
+        capturedFacade = tx.workflows as StagingFacade;
+        capturedMethod = capturedFacade.stage;
+      },
+    }));
+
+    assert.throws(() => capturedFacade!.stage("post-commit-facade"), isLifecycleInputInvalid);
+    assert.throws(() => capturedMethod!("post-commit-method"), isLifecycleInputInvalid);
+    assert.deepEqual(connection.committed, ["event", "dedup"]);
+  });
+
+  it("guards object-valued method results so explicit self returns cannot expose a raw facade", () => {
+    const connection = new TransactionConnection();
+    const events = new FakeEvents(connection);
+    const tx = transaction(connection);
+    (tx.authority as StagingFacade & { returnSelf?: () => StagingFacade }).returnSelf =
+      function(this: StagingFacade) { return this; };
+    const store = new LifecycleCommandStore({
+      connection,
+      events,
+      transaction: () => tx,
+      now: () => NOW,
+    });
+    let escapedAuthority: StagingFacade | undefined;
+
+    store.execute(envelope(), (received) => {
+      escapedAuthority = (
+        received.authority as StagingFacade & { returnSelf(): StagingFacade }
+      ).returnSelf();
+      return {
+        append: appendCommand(),
+        authorizationRecord: authorization(),
+        afterAppend: () => undefined,
+      };
+    });
+
+    assert.throws(() => escapedAuthority!.stage("escaped-authority"), isLifecycleInputInvalid);
+  });
+
+  it("blocks inherited accessor mutators from leaking the raw command repository", () => {
+    const connection = new TransactionConnection();
+    const events = new FakeEvents(connection);
+    const store = new LifecycleCommandStore({
+      connection,
+      events,
+      transaction: () => transaction(connection),
+      now: () => NOW,
+    });
+    let leaked: StagingFacade | undefined;
+
+    assert.throws(
+      () => store.execute(envelope(), (tx) => {
+        const facade = tx.authority as unknown as {
+          __defineGetter__(property: string, getter: () => unknown): void;
+          readonly leak: unknown;
+        };
+        facade.__defineGetter__("leak", function(this: StagingFacade) {
+          leaked = this;
+          return 1;
+        });
+        void facade.leak;
+        return {
+          append: appendCommand(),
+          authorizationRecord: authorization(),
+          afterAppend: () => undefined,
+        };
+      }),
+      isLifecycleInputInvalid,
+    );
+    assert.equal(leaked, undefined);
+    assert.deepEqual(connection.statements, ["BEGIN IMMEDIATE", "ROLLBACK"]);
+  });
+
+  it("rejects a Promise returned by a connection-bound facade method", () => {
+    const connection = new TransactionConnection();
+    const events = new FakeEvents(connection);
+    const tx = transaction(connection);
+    (tx.authority as { readLater?: () => Promise<PersistedLifecycleAuthorizationRecord> }).readLater =
+      () => Promise.resolve(authorization());
+    const store = new LifecycleCommandStore({
+      connection,
+      events,
+      transaction: () => tx,
+      now: () => NOW,
+    });
+
+    assert.throws(
+      () => store.execute(envelope(), (received) => {
+        void (received.authority as { readLater(): Promise<unknown> }).readLater();
+        return {
+          append: appendCommand(),
+          authorizationRecord: authorization(),
+          afterAppend: () => undefined,
+        };
+      }),
+      isLifecycleInputInvalid,
+    );
+    assert.deepEqual(connection.statements, ["BEGIN IMMEDIATE", "ROLLBACK"]);
+  });
+
+  it("snapshots a plain authorization DTO returned by a guarded facade method", () => {
+    const connection = new TransactionConnection();
+    const events = new FakeEvents(connection);
+    const tx = transaction(connection);
+    const expected = authorization();
+    (tx.authority as { readCurrent?: () => PersistedLifecycleAuthorizationRecord }).readCurrent =
+      () => expected;
+    const store = new LifecycleCommandStore({
+      connection,
+      events,
+      transaction: () => tx,
+      now: () => NOW,
+    });
+
+    const result = store.execute(envelope(), (received) => ({
+      append: appendCommand(),
+      authorizationRecord: (
+        received.authority as { readCurrent(): PersistedLifecycleAuthorizationRecord }
+      ).readCurrent(),
+      afterAppend: () => undefined,
+    }));
+
+    assert.deepEqual(result.authorizationRecord, expected);
+    assertDeeplyFrozen(result.authorizationRecord);
+  });
+
+  it("evaluates authority material status synchronously inside the transaction", () => {
+    const connection = new TransactionConnection();
+    const events = new FakeEvents(connection);
+    const store = new LifecycleCommandStore({
+      connection,
+      events,
+      transaction: () => transaction(connection),
+      now: () => NOW,
+      authorityMaterialStatus: () => {
+        assert.deepEqual(connection.statements, ["BEGIN IMMEDIATE"]);
+        return "current";
+      },
+    });
+
+    const result = store.execute(envelope(), () => ({
+      append: appendCommand(),
+      authorizationRecord: authorization(),
+      afterAppend: () => undefined,
+    }));
+
+    assert.equal(result.authorityMaterialStatus, "current");
+    assert.deepEqual(connection.statements, ["BEGIN IMMEDIATE", "COMMIT"]);
+  });
+
+  it("rejects a PromiseLike authority material status before commit", () => {
+    const connection = new TransactionConnection();
+    const events = new FakeEvents(connection);
+    const store = new LifecycleCommandStore({
+      connection,
+      events,
+      transaction: () => transaction(connection),
+      now: () => NOW,
+      authorityMaterialStatus: (() => ({ then() { /* PromiseLike escape */ } })) as unknown as (
+        authorization: PersistedLifecycleAuthorizationRecord,
+      ) => "current",
+    });
+
+    assert.throws(
+      () => store.execute(envelope(), () => ({
+        append: appendCommand(),
+        authorizationRecord: authorization(),
+        afterAppend: () => undefined,
+      })),
+      isLifecycleInputInvalid,
+    );
+    assert.deepEqual(connection.statements, ["BEGIN IMMEDIATE", "ROLLBACK"]);
+    assert.deepEqual(connection.committed, []);
+  });
+
+  it("snapshots protected authorization before external aliases mutate proof and approval", () => {
+    const connection = new TransactionConnection();
+    const events = new FakeEvents(connection);
+    const store = new LifecycleCommandStore({
+      connection,
+      events,
+      transaction: () => transaction(connection),
+      now: () => NOW,
+    });
+    const original: Extract<PersistedLifecycleAuthorizationRecord, { kind: "protected" }> = {
+      kind: "protected",
+      proof: {
+        version: 1,
+        nonce: "00000000-0000-4000-8000-000000000001",
+        digest: "1".repeat(64),
+      },
+      approval: {
+        approvalId: "00000000-0000-4000-8000-000000000030",
+        digest: "2".repeat(64),
+      },
+      authorizationSessionId: "00000000-0000-4000-8000-000000000010",
+      targetSessionId: "00000000-0000-4000-8000-000000000010",
+      presenting: principal("primary-a"),
+      target: principal("primary-a"),
+    };
+    const expected = structuredClone(original);
+    const replayExpectation = structuredClone(original);
+
+    const result = store.execute(envelope({ replayExpectation }), () => ({
+      append: appendCommand(),
+      authorizationRecord: original,
+      beforeAppend: () => {
+        original.proof!.digest = "8".repeat(64);
+        original.approval!.digest = "9".repeat(64);
+        original.presenting.clientInstanceId = "mutated-presenter";
+      },
+      afterAppend: () => undefined,
+    }));
+
+    assert.notDeepEqual(original, expected);
+    assert.deepEqual(events.insertedAuthorizations, [expected]);
+    assert.deepEqual(result.authorizationRecord, expected);
+    assert.equal(result.authorizationRecord, events.insertedAuthorizations[0]);
+    assertDeeplyFrozen(result.authorizationRecord);
+  });
+
+  it("snapshots complete internal authorization before claim aliases mutate", () => {
+    const connection = new TransactionConnection();
+    const events = new FakeEvents(connection);
+    const store = new LifecycleCommandStore({
+      connection,
+      events,
+      transaction: () => transaction(connection),
+      now: () => NOW,
+    });
+    const original: Extract<PersistedLifecycleAuthorizationRecord, { kind: "internal-workflow" }> = {
+      kind: "internal-workflow",
+      workflowId: "00000000-0000-4000-8000-000000000020",
+      workflowGeneration: 3n,
+      plannedWorkId: "3".repeat(64),
+      claimOwnerId: "coordinator-a",
+      claimToken: 7n,
+      authorizationSessionId: "00000000-0000-4000-8000-000000000010",
+      targetSessionId: "00000000-0000-4000-8000-000000000010",
+      presenting: principal("primary-a"),
+      target: principal("primary-a"),
+    };
+    const expected = structuredClone(original);
+    const replayExpectation: LifecycleReplayExpectation = {
+      kind: "internal-workflow",
+      workflowId: original.workflowId,
+      workflowGeneration: original.workflowGeneration,
+      plannedWorkId: original.plannedWorkId,
+      authorizationSessionId: original.authorizationSessionId,
+      targetSessionId: original.targetSessionId,
+      presenting: structuredClone(original.presenting),
+      target: structuredClone(original.target),
+    };
+
+    const result = store.execute(envelope({ replayExpectation }), () => ({
+      append: appendCommand(),
+      authorizationRecord: original,
+      beforeAppend: () => {
+        original.claimOwnerId = "attacker";
+        original.claimToken = 999n;
+        original.target.clientInstanceId = "mutated-target";
+      },
+      afterAppend: () => undefined,
+    }));
+
+    assert.notDeepEqual(original, expected);
+    assert.deepEqual(events.insertedAuthorizations, [expected]);
+    assert.deepEqual(result.authorizationRecord, expected);
+    assert.equal(result.authorizationRecord, events.insertedAuthorizations[0]);
+    assertDeeplyFrozen(result.authorizationRecord);
   });
 
   it("rolls back all staged effects when the semantic callback fails", () => {
@@ -553,10 +1021,16 @@ describe("LifecycleCommandStore", () => {
           now: () => NOW,
         });
         const beforeAppend = hook === "beforeAppend"
-          ? (planned: PlannedEventAppend<JsonValue>) => mutate(planned)
+          ? (planned: PlannedEventAppend<JsonValue>) => {
+            mutate(planned);
+            return undefined;
+          }
           : undefined;
         const afterAppend = hook === "afterAppend"
-          ? (committed: EventAppendBatch<JsonValue>) => mutate(committed)
+          ? (committed: EventAppendBatch<JsonValue>) => {
+            mutate(committed);
+            return undefined;
+          }
           : () => undefined;
 
         assert.throws(() => store.execute(envelope(), () => ({
@@ -586,7 +1060,10 @@ describe("LifecycleCommandStore", () => {
       () => store.execute(envelope(), () => ({
         append: appendCommand(),
         authorizationRecord: authorization(),
-        afterAppend: () => events.corruptCommittedResponse(),
+        afterAppend: () => {
+          events.corruptCommittedResponse();
+          return undefined;
+        },
       })),
       (error: unknown) => error instanceof LifecycleCommandStoreError
         && error.code === "INTEGRITY_FAILURE",
@@ -619,6 +1096,28 @@ describe("LifecycleCommandStore", () => {
     );
     assert.deepEqual(connection.statements, ["BEGIN IMMEDIATE", "COMMIT", "ROLLBACK"]);
   });
+
+  it("maps a busy-shaped post-COMMIT result failure to command outcome unknown", () => {
+    const connection = new TransactionConnection();
+    const events = new BusyResultEvents(connection);
+    const store = new LifecycleCommandStore({
+      connection,
+      events,
+      transaction: () => transaction(connection),
+      now: () => NOW,
+    });
+
+    assert.throws(
+      () => store.execute(envelope(), () => ({
+        append: appendCommand(),
+        authorizationRecord: authorization(),
+        afterAppend: () => undefined,
+      })),
+      (error: unknown) => error instanceof LifecycleCommandStoreError
+        && error.code === "COMMAND_OUTCOME_UNKNOWN",
+    );
+    assert.deepEqual(connection.statements, ["BEGIN IMMEDIATE", "COMMIT"]);
+  });
 });
 
 function compileTimeTransactionBoundary(tx: LifecycleCommandTransaction): void {
@@ -633,6 +1132,48 @@ function compileTimeTransactionBoundary(tx: LifecycleCommandTransaction): void {
 }
 
 void compileTimeTransactionBoundary;
+
+function compileTimeSynchronousCommandCallbacks(store: LifecycleCommandStore): void {
+  // @ts-expect-error onNew must return a prepared commit synchronously
+  store.execute(envelope(), async () => ({
+    append: appendCommand(),
+    authorizationRecord: authorization(),
+    afterAppend: () => undefined,
+  }));
+  store.execute(envelope(), () => ({
+    append: appendCommand(),
+    authorizationRecord: authorization(),
+    // @ts-expect-error beforeAppend cannot return a Promise
+    beforeAppend: async () => undefined,
+    afterAppend: () => undefined,
+  }));
+  store.execute(envelope(), () => ({
+    append: appendCommand(),
+    authorizationRecord: authorization(),
+    // @ts-expect-error afterAppend cannot return a Promise
+    afterAppend: async () => undefined,
+  }));
+}
+
+void compileTimeSynchronousCommandCallbacks;
+
+function compileTimeAuthorityStatusHasNoTransaction(
+  connection: SqliteConnection,
+  events: LifecycleEventAppendPort,
+): void {
+  new LifecycleCommandStore({
+    connection,
+    events,
+    transaction: () => ({} as LifecycleCommandTransaction),
+    // @ts-expect-error material status cannot receive a transaction facade
+    authorityMaterialStatus: (_authorization, transactionFacade) => {
+      void transactionFacade;
+      return "current";
+    },
+  });
+}
+
+void compileTimeAuthorityStatusHasNoTransaction;
 
 type NestedLifecycleResponse = {
   nested: { eventPosition: string };

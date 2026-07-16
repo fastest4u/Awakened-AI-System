@@ -58,11 +58,11 @@ export interface PreparedLifecycleCommit<T extends JsonValue> {
   readonly beforeAppend?: (
     planned: PlannedEventAppend<T>,
     transaction: LifecycleCommandTransaction,
-  ) => void;
+  ) => undefined;
   readonly afterAppend: (
     committed: EventAppendBatch<T>,
     transaction: LifecycleCommandTransaction,
-  ) => void;
+  ) => undefined;
 }
 
 export type AuthorityMaterialStatus = "current" | "stale" | "unavailable" | "not-issued";
@@ -100,11 +100,11 @@ export interface LifecycleEventAppendPort {
 export interface LifecycleCommandStoreOptions {
   readonly connection: SqliteConnection;
   readonly events: LifecycleEventAppendPort;
+  /** Facade capabilities must be explicit own data properties; prototypes/accessors are excluded. */
   readonly transaction: (connection: SqliteConnection) => LifecycleCommandTransaction;
   readonly now?: () => string;
   readonly authorityMaterialStatus?: (
     authorization: PersistedLifecycleAuthorizationRecord,
-    transaction: LifecycleCommandTransaction,
   ) => AuthorityMaterialStatus;
 }
 
@@ -175,44 +175,273 @@ function isPlainRecord(value: unknown): value is Record<string, unknown> {
   return prototype === Object.prototype || prototype === null;
 }
 
+interface TransactionCallbackScope {
+  active: boolean;
+}
+
+function callbackBoundaryFailure(): never {
+  throw new LifecycleCommandStoreError("LIFECYCLE_INPUT_INVALID");
+}
+
+function assertCallbackActive(scope: TransactionCallbackScope): void {
+  if (!scope.active) callbackBoundaryFailure();
+}
+
+function guardedFacade<T extends object>(value: T, scope: TransactionCallbackScope): T {
+  const proxies = new WeakMap<object, object>();
+  const methodWrappers = new WeakMap<object, Map<PropertyKey, (...args: unknown[]) => unknown>>();
+  const callableWrappers = new WeakMap<Function, (...args: unknown[]) => unknown>();
+
+  function guardResult(result: unknown): unknown {
+    if (isThenable(result)) {
+      discardNativePromise(result);
+      callbackBoundaryFailure();
+    }
+    if (typeof result === "function") {
+      const prior = callableWrappers.get(result);
+      if (prior !== undefined) return prior;
+      const wrapper = function(this: unknown, ...args: unknown[]): unknown {
+        assertCallbackActive(scope);
+        return guardResult(Reflect.apply(result, this, args) as unknown);
+      };
+      callableWrappers.set(result, wrapper);
+      return wrapper;
+    }
+    if (Array.isArray(result)) return Object.freeze(result.map((item) => guardResult(item)));
+    if (typeof result === "object" && result !== null) return wrap(result);
+    return result;
+  }
+
+  function dataMember(
+    current: object,
+    property: PropertyKey,
+  ): { readonly found: true; readonly value: unknown } | { readonly found: false } {
+    const descriptor = Reflect.getOwnPropertyDescriptor(current, property);
+    if (descriptor === undefined) {
+      if (Reflect.getOwnPropertyDescriptor(Object.prototype, property) !== undefined
+        || Reflect.getOwnPropertyDescriptor(Function.prototype, property) !== undefined) {
+        callbackBoundaryFailure();
+      }
+      return { found: false };
+    }
+    if (!("value" in descriptor)) {
+      callbackBoundaryFailure();
+    }
+    return { found: true, value: descriptor.value };
+  }
+
+  function wrap(current: object): object {
+    const prior = proxies.get(current);
+    if (prior !== undefined) return prior;
+    const target = Object.create(null) as Record<PropertyKey, unknown>;
+    const proxy: Record<PropertyKey, unknown> = new Proxy(target, {
+      get: (_target, property) => {
+        assertCallbackActive(scope);
+        const resolved = dataMember(current, property);
+        if (!resolved.found) return undefined;
+        const member = resolved.value;
+        if (typeof member === "function") {
+          let wrappers = methodWrappers.get(current);
+          if (wrappers === undefined) {
+            wrappers = new Map();
+            methodWrappers.set(current, wrappers);
+          }
+          const priorWrapper = wrappers.get(property);
+          if (priorWrapper !== undefined) return priorWrapper;
+          const wrapper = (...args: unknown[]): unknown => {
+            assertCallbackActive(scope);
+            return guardResult(Reflect.apply(member, current, args) as unknown);
+          };
+          wrappers.set(property, wrapper);
+          return wrapper;
+        }
+        return guardResult(member);
+      },
+      has: (_target, property) => {
+        assertCallbackActive(scope);
+        return dataMember(current, property).found;
+      },
+      ownKeys: () => {
+        assertCallbackActive(scope);
+        return Reflect.ownKeys(current);
+      },
+      getOwnPropertyDescriptor: (_target, property): PropertyDescriptor | undefined => {
+        assertCallbackActive(scope);
+        const descriptor = Reflect.getOwnPropertyDescriptor(current, property);
+        if (descriptor === undefined) return undefined;
+        if (!("value" in descriptor)) callbackBoundaryFailure();
+        return {
+          configurable: true,
+          enumerable: descriptor.enumerable ?? false,
+          writable: false,
+          value: Reflect.get(proxy, property) as unknown,
+        };
+      },
+      getPrototypeOf: () => null,
+      set: () => callbackBoundaryFailure(),
+      defineProperty: () => callbackBoundaryFailure(),
+      deleteProperty: () => callbackBoundaryFailure(),
+      preventExtensions: () => callbackBoundaryFailure(),
+      setPrototypeOf: () => callbackBoundaryFailure(),
+    });
+    proxies.set(current, proxy);
+    return proxy;
+  }
+
+  return wrap(value) as T;
+}
+
+function isThenable(value: unknown): boolean {
+  if ((typeof value !== "object" || value === null) && typeof value !== "function") return false;
+  try {
+    return typeof Reflect.get(value, "then") === "function";
+  } catch {
+    return true;
+  }
+}
+
+function discardNativePromise(value: unknown): void {
+  try {
+    if (value instanceof Promise) void value.catch(() => undefined);
+  } catch {
+    // The callback result is rejected below; hostile Promise branding must not mask that result.
+  }
+}
+
+function synchronousCallbackResult<T>(result: T): T {
+  if (isThenable(result)) {
+    discardNativePromise(result);
+    callbackBoundaryFailure();
+  }
+  return result;
+}
+
+function undefinedCallbackResult(result: unknown): undefined {
+  if (result !== undefined) callbackBoundaryFailure();
+  return undefined;
+}
+
+function materialStatusResult(result: unknown): AuthorityMaterialStatus {
+  if (result !== "current"
+    && result !== "stale"
+    && result !== "unavailable"
+    && result !== "not-issued") {
+    callbackBoundaryFailure();
+  }
+  return result;
+}
+
+function invokeSynchronousTransactionCallback<T, TResult>(
+  transaction: LifecycleCommandTransaction,
+  callback: (guarded: LifecycleCommandTransaction) => T,
+  transform: (result: T) => TResult,
+): TResult {
+  const scope: TransactionCallbackScope = { active: true };
+  const guarded = guardedFacade(transaction, scope);
+  try {
+    return transform(synchronousCallbackResult(callback(guarded)));
+  } finally {
+    scope.active = false;
+  }
+}
+
+function projectCommandTransaction(
+  transaction: LifecycleCommandTransaction,
+): LifecycleCommandTransaction {
+  return {
+    authority: transaction.authority,
+    leases: transaction.leases,
+    approvals: transaction.approvals,
+    transfers: transaction.transfers,
+    coverage: transaction.coverage,
+    workflows: transaction.workflows,
+    validation: transaction.validation,
+    outbox: transaction.outbox,
+  };
+}
+
 function immutableSnapshot<T>(value: T): T {
   if (Array.isArray(value)) {
     return Object.freeze(value.map((item) => immutableSnapshot(item))) as T;
   }
   if (typeof value !== "object" || value === null) return value;
   if (!isPlainRecord(value)) throw new LifecycleCommandStoreError("INTEGRITY_FAILURE");
-  const snapshot: Record<string, unknown> = Object.getPrototypeOf(value) === null
-    ? Object.create(null) as Record<string, unknown>
-    : {};
+  const snapshot: Record<string, unknown> = {};
   for (const key of Object.keys(value)) snapshot[key] = immutableSnapshot(value[key]);
   return Object.freeze(snapshot) as T;
 }
 
+interface SnapshottedLifecycleCommit<T extends JsonValue> {
+  readonly append: AppendCommand<T>;
+  readonly authorizationRecord: PersistedLifecycleAuthorizationRecord;
+  readonly beforeAppend?: PreparedLifecycleCommit<T>["beforeAppend"];
+  readonly afterAppend: PreparedLifecycleCommit<T>["afterAppend"];
+}
+
+function dataProperty(record: Record<string, unknown>, property: string): unknown {
+  const descriptor = Reflect.getOwnPropertyDescriptor(record, property);
+  if (descriptor === undefined || !("value" in descriptor)) callbackBoundaryFailure();
+  return descriptor.value;
+}
+
+function snapshotPreparedCommit<T extends JsonValue>(
+  value: PreparedLifecycleCommit<T>,
+): SnapshottedLifecycleCommit<T> {
+  if (!isPlainRecord(value)) callbackBoundaryFailure();
+  const authorizationValue = dataProperty(value, "authorizationRecord");
+  const appendValue = dataProperty(value, "append");
+  if (!isPlainRecord(authorizationValue) || !isPlainRecord(appendValue)) callbackBoundaryFailure();
+  const authorizationRecord = immutableSnapshot(authorizationValue as PersistedLifecycleAuthorizationRecord);
+  const append = immutableSnapshot(appendValue as unknown as AppendCommand<T>);
+  const afterAppend = dataProperty(value, "afterAppend");
+  const beforeDescriptor = Reflect.getOwnPropertyDescriptor(value, "beforeAppend");
+  if (typeof afterAppend !== "function"
+    || (beforeDescriptor !== undefined
+      && (!("value" in beforeDescriptor)
+        || (beforeDescriptor.value !== undefined && typeof beforeDescriptor.value !== "function")))) {
+    callbackBoundaryFailure();
+  }
+  return Object.freeze({
+    append,
+    authorizationRecord,
+    ...(beforeDescriptor?.value === undefined
+      ? {}
+      : { beforeAppend: beforeDescriptor.value as PreparedLifecycleCommit<T>["beforeAppend"] }),
+    afterAppend: afterAppend as PreparedLifecycleCommit<T>["afterAppend"],
+  });
+}
+
 function integrityJson(value: unknown): JsonValue {
-  if (value === null
-    || typeof value === "string"
-    || typeof value === "boolean") return value;
+  if (value === null) return { type: "null" };
+  if (typeof value === "string") return { type: "string", value };
+  if (typeof value === "boolean") return { type: "boolean", value };
   if (typeof value === "number") {
     if (!Number.isFinite(value)) throw new LifecycleCommandStoreError("INTEGRITY_FAILURE");
-    return value;
+    return { type: "number", value: Object.is(value, -0) ? "-0" : value.toString() };
   }
-  if (typeof value === "bigint") return value.toString();
-  if (Array.isArray(value)) return value.map((item) => integrityJson(item));
+  if (typeof value === "bigint") return { type: "bigint", value: value.toString() };
+  if (value === undefined) return { type: "undefined" };
+  if (Array.isArray(value)) {
+    return { type: "array", value: value.map((item) => integrityJson(item)) };
+  }
   if (!isPlainRecord(value)) throw new LifecycleCommandStoreError("INTEGRITY_FAILURE");
   const normalized: Record<string, JsonValue> = {};
   for (const key of Object.keys(value)) {
-    const item = value[key];
-    if (item !== undefined) normalized[key] = integrityJson(item);
+    normalized[key] = integrityJson(value[key]);
   }
-  return normalized;
+  return { type: "object", value: normalized };
+}
+
+function integrityFingerprint(value: unknown): string {
+  return canonicalJson(integrityJson(value));
 }
 
 function batchFingerprint<T extends JsonValue>(batch: EventAppendBatch<T>): string {
-  return canonicalJson(integrityJson({
+  return integrityFingerprint({
     events: batch.events,
     storedResponse: batch.storedResponse,
     responseHash: batch.responseHash,
-  }));
+  });
 }
 
 function immutableBatchSnapshot<T extends JsonValue>(
@@ -273,58 +502,84 @@ export class LifecycleCommandStore {
     command: LifecycleCommandEnvelope,
     onNew: (transaction: LifecycleCommandTransaction) => PreparedLifecycleCommit<T>,
   ): LifecycleExecutionResult<T> {
-    assertEnvelope(command);
+    const envelope = immutableSnapshot(command);
+    assertEnvelope(envelope);
     let transactionBegan = false;
     let commitAttempted = false;
+    let commitFailed = false;
+    let commitCompleted = false;
     let focused: LifecycleCommandTransaction | undefined;
     try {
       this.#connection.exec("BEGIN IMMEDIATE");
       transactionBegan = true;
-      const replay = this.#events.findLifecycleReplay<T>(command);
+      const replay = this.#events.findLifecycleReplay<T>(envelope);
       if (replay !== null) {
-        this.#connection.exec("ROLLBACK");
-        transactionBegan = false;
-        if (replay.authorizationRecord === null
+        const replayAuthorization = replay.authorizationRecord === null
+          ? null
+          : immutableSnapshot(replay.authorizationRecord);
+        if (replayAuthorization === null
           || !authorizationMatchesExpectation(
-            replay.authorizationRecord,
-            command.replayExpectation,
+            replayAuthorization,
+            envelope.replayExpectation,
           )) {
           throw new LifecycleCommandStoreError("IDEMPOTENCY_CONFLICT");
         }
-        focused = this.#transaction(this.#connection);
+        const authorityMaterialStatus = materialStatusResult(synchronousCallbackResult(
+          this.#materialStatus(replayAuthorization),
+        ));
+        this.#connection.exec("ROLLBACK");
+        transactionBegan = false;
         return {
           deduplicated: true,
           publicResult: replay.response,
           appendResult: withoutAuthorization(replay),
-          authorizationRecord: replay.authorizationRecord,
-          authorityMaterialStatus: this.#materialStatus(replay.authorizationRecord, focused),
+          authorizationRecord: replayAuthorization,
+          authorityMaterialStatus,
         };
       }
 
-      this.#events.assertCommandIdentityAvailable(command);
+      this.#events.assertCommandIdentityAvailable(envelope);
       this.#events.assertAppendAllowed();
-      focused = this.#transaction(this.#connection);
-      const next = onNew(focused);
-      assertAppendIdentity(command, next);
+      focused = projectCommandTransaction(this.#transaction(this.#connection));
+      const next = invokeSynchronousTransactionCallback(focused, onNew, snapshotPreparedCommit);
+      const authorizationFingerprint = integrityFingerprint(next.authorizationRecord);
+      assertAppendIdentity(envelope, next);
       const prepared = this.#events.prepare(
         next.append,
         this.#now(),
-        command.authoritativeIntentHash,
+        envelope.authoritativeIntentHash,
       );
       const planned = this.#events.planPrepared(prepared);
       const plannedFingerprint = batchFingerprint(planned);
-      next.beforeAppend?.(immutablePlannedSnapshot(planned), focused);
+      if (next.beforeAppend !== undefined) {
+        invokeSynchronousTransactionCallback(focused, (transaction) =>
+          next.beforeAppend?.(immutablePlannedSnapshot(planned), transaction), undefinedCallbackResult);
+      }
       assertBatchUnchanged(planned, plannedFingerprint);
       const committed = this.#events.appendPlanned(planned);
       assertCommittedMatchesPlan(planned, committed);
       const committedFingerprint = batchFingerprint(committed);
-      next.afterAppend(immutableBatchSnapshot(committed), focused);
+      invokeSynchronousTransactionCallback(focused, (transaction) =>
+        next.afterAppend(immutableBatchSnapshot(committed), transaction), undefinedCallbackResult);
       assertBatchUnchanged(planned, plannedFingerprint);
       assertBatchUnchanged(committed, committedFingerprint);
       assertCommittedMatchesPlan(planned, committed);
+      if (integrityFingerprint(next.authorizationRecord) !== authorizationFingerprint) {
+        throw new LifecycleCommandStoreError("INTEGRITY_FAILURE");
+      }
+      assertAppendIdentity(envelope, next);
       this.#events.insertDedup(prepared, committed, next.authorizationRecord);
+      const authorityMaterialStatus = materialStatusResult(synchronousCallbackResult(
+        this.#materialStatus(next.authorizationRecord),
+      ));
       commitAttempted = true;
-      this.#connection.exec("COMMIT");
+      try {
+        this.#connection.exec("COMMIT");
+      } catch (error) {
+        commitFailed = true;
+        throw error;
+      }
+      commitCompleted = true;
       transactionBegan = false;
       const appendResult = this.#events.result(committed);
       return {
@@ -332,7 +587,7 @@ export class LifecycleCommandStore {
         publicResult: appendResult.response,
         appendResult,
         authorizationRecord: next.authorizationRecord,
-        authorityMaterialStatus: this.#materialStatus(next.authorizationRecord, focused),
+        authorityMaterialStatus,
       };
     } catch (error) {
       let rollbackFailed = false;
@@ -344,10 +599,13 @@ export class LifecycleCommandStore {
           rollbackFailed = true;
         }
       }
-      if (rollbackFailed || (commitAttempted && !isPrimarySqliteBusy(error))) {
+      const retryableBusyCommitFailure = commitFailed && isPrimarySqliteBusy(error);
+      if (rollbackFailed
+        || commitCompleted
+        || (commitAttempted && !retryableBusyCommitFailure)) {
         throw new LifecycleCommandStoreError("COMMAND_OUTCOME_UNKNOWN", {
-          commandId: command.commandId,
-          idempotencyKey: command.idempotencyKey,
+          commandId: envelope.commandId,
+          idempotencyKey: envelope.idempotencyKey,
         });
       }
       throw error;
