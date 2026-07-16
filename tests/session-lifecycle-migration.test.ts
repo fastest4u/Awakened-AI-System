@@ -4,6 +4,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, it } from "node:test";
+import type { RootStartCommandV2 } from "../src/orchestrator/lifecycle/contracts/commands.js";
+import {
+  buildLifecycleIntentWitness,
+  lifecycleIntentHashFromWitnessSource,
+} from "../src/orchestrator/lifecycle/lifecycle-intent-witness.js";
 import { canonicalJson } from "../src/orchestrator/serialization/canonical-json.js";
 import { MigrationRunner } from "../src/orchestrator/storage/migration-runner.js";
 import { PROJECT_STORE_MIGRATIONS } from "../src/orchestrator/storage/migrations/registry.js";
@@ -82,8 +87,31 @@ function seedLifecycleIntentWitness(
   `).get()?.position;
   assert.equal(typeof maxPosition, "bigint");
   const position = Number(maxPosition) + 1;
-  const sessionId = `intent-witness-${position}`;
+  const sessionId = `${position.toString(16).padStart(8, "0")}-0000-4000-8000-${position.toString(16).padStart(12, "0")}`;
   const streamId = `session/${sessionId}`;
+  const lifecycleIntentJson = buildLifecycleIntentWitness({
+    commandType: "root-start",
+    commandId: sessionId,
+    idempotencyKey: `migration-fixture-${position}`,
+    agentId: "agent-1",
+    expectedProjectId: PROJECT_ID,
+    expectedVaultId: VAULT_ID,
+    expectedWorkspaceId: "c".repeat(64),
+    expectedBranchRef: null,
+    continuityKey: `migration-fixture-${position}`,
+    resumePolicy: "new",
+  } as RootStartCommandV2, {
+    authorizationKind: "initial-authority",
+    authorizationSessionId: null,
+    targetSessionId: sessionId,
+    presentingActorRole: "primary",
+    presentingClientInstanceId: "client-1",
+    targetActorRole: "primary",
+    targetClientInstanceId: "client-1",
+    internalWorkflowId: null,
+    internalWorkflowGeneration: null,
+    internalPlannedWorkId: null,
+  }).source;
   rawInsert(connection, "streams", {
     project_id: PROJECT_ID,
     stream_id: streamId,
@@ -128,16 +156,7 @@ function seedLifecycleIntentWitness(
     payload_hash: H64,
     previous_global_hash: "0".repeat(64),
     event_hash: H64_B,
-    lifecycle_intent_json: canonicalJson({
-      intentMaterialVersion: 1,
-      material: {
-        commandId,
-        commandType: String(command.command_type),
-        targetSessionId: command.target_session_id === null
-          ? null
-          : String(command.target_session_id),
-      },
-    }),
+    lifecycle_intent_json: lifecycleIntentJson,
   });
 }
 
@@ -1201,14 +1220,36 @@ describe("0002-session-lifecycle authority, lease, and evidence guards", () => {
 
 describe("0002-session-lifecycle authorization, validation, workflow, and outbox guards", () => {
   it("requires one canonical nonsecret lifecycle intent witness at event index zero", () => {
-    const witness = canonicalJson({
-      intentMaterialVersion: 1,
-      material: { commandType: "root-start", continuityKey: "continuity-a" },
+    const commandId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const built = buildLifecycleIntentWitness({
+      commandType: "root-start",
+      commandId,
+      idempotencyKey: "intent-command",
+      agentId: "agent-1",
+      expectedProjectId: PROJECT_ID,
+      expectedVaultId: VAULT_ID,
+      expectedWorkspaceId: "c".repeat(64),
+      expectedBranchRef: null,
+      continuityKey: "continuity-a",
+      resumePolicy: "new",
+    } as RootStartCommandV2, {
+      authorizationKind: "initial-authority",
+      authorizationSessionId: null,
+      targetSessionId: ROOT_ID,
+      presentingActorRole: "primary",
+      presentingClientInstanceId: "client-root",
+      targetActorRole: "primary",
+      targetClientInstanceId: "client-root",
+      internalWorkflowId: null,
+      internalWorkflowGeneration: null,
+      internalPlannedWorkId: null,
     });
+    const witness = built.source;
     const validCommand = legacyCommand({
       idempotency_key: "intent-command",
-      command_id: "intent-command",
+      command_id: commandId,
       command_type: "root-start",
+      command_hash: built.intentHash,
       lifecycle_authorization_kind: "initial-authority",
       target_session_id: ROOT_ID,
       presenting_actor_role: "primary",
@@ -1225,25 +1266,36 @@ describe("0002-session-lifecycle authorization, validation, workflow, and outbox
 
     const valid = currentConnection();
     seedSessionEvent(valid, ROOT_ID, 1, "SessionStarted", {
-      commandId: "intent-command",
+      commandId,
       idempotencyKey: "intent-command",
       lifecycleIntentJson: witness,
     });
     rawInsert(valid, "command_dedup", validCommand);
     assert.equal(
       valid.prepare(`
-        SELECT lifecycle_intent_json FROM events WHERE command_id = 'intent-command'
-      `).get()?.lifecycle_intent_json,
+        SELECT lifecycle_intent_json FROM events WHERE command_id = $commandId
+      `).get({ $commandId: commandId })?.lifecycle_intent_json,
       witness,
     );
+    assert.equal(lifecycleIntentHashFromWitnessSource(witness), built.intentHash);
 
     for (const [name, source] of [
-      ["noncanonical", JSON.stringify({ material: {}, intentMaterialVersion: 1 }, null, 2)],
-      ["unknown-version", canonicalJson({ intentMaterialVersion: 2, material: {} })],
-      ["secret-bearing", canonicalJson({
+      ["obsolete-envelope", canonicalJson({
         intentMaterialVersion: 1,
-        material: { proof: "pmcap1.secret-canary" },
+        material: { commandType: "root-start", continuityKey: "continuity-a" },
       })],
+      ["noncanonical", JSON.stringify(JSON.parse(witness), null, 2)],
+      ["unknown-version", canonicalJson({
+        ...JSON.parse(witness) as Record<string, unknown>,
+        lifecycleIntentWitnessVersion: 2,
+      })],
+      ["secret-bearing", (() => {
+        const secret = JSON.parse(witness) as {
+          intent: { command: Record<string, unknown> };
+        };
+        secret.intent.command.proof = "pmcap1.secret-canary";
+        return canonicalJson(secret);
+      })()],
     ] as const) {
       const connection = currentConnection();
       assert.throws(

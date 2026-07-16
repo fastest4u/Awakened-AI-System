@@ -1033,20 +1033,56 @@ WHEN NEW.lifecycle_intent_json IS NOT NULL AND (
     ELSE
       json_type(NEW.lifecycle_intent_json) <> 'object'
       OR json(NEW.lifecycle_intent_json) <> NEW.lifecycle_intent_json
-      OR (SELECT count(*) FROM json_each(NEW.lifecycle_intent_json)) <> 2
+      OR (SELECT count(*) FROM json_each(NEW.lifecycle_intent_json)) <> 3
       OR EXISTS (
         SELECT 1 FROM json_each(NEW.lifecycle_intent_json)
-        WHERE key NOT IN ('intentMaterialVersion', 'material')
+        WHERE key NOT IN (
+          'lifecycleIntentWitnessVersion', 'intent', 'persistedAssertions'
+        )
       )
-      OR json_type(NEW.lifecycle_intent_json, '$.intentMaterialVersion') <> 'integer'
-      OR json_extract(NEW.lifecycle_intent_json, '$.intentMaterialVersion') <> 1
-      OR json_type(NEW.lifecycle_intent_json, '$.material') IS NULL
+      OR json_type(NEW.lifecycle_intent_json, '$.lifecycleIntentWitnessVersion') <> 'integer'
+      OR json_extract(NEW.lifecycle_intent_json, '$.lifecycleIntentWitnessVersion') <> 1
+      OR json_type(NEW.lifecycle_intent_json, '$.intent') <> 'object'
+      OR (SELECT count(*) FROM json_each(NEW.lifecycle_intent_json, '$.intent')) <> 3
+      OR EXISTS (
+        SELECT 1 FROM json_each(NEW.lifecycle_intent_json, '$.intent')
+        WHERE key NOT IN ('lifecycleIntentVersion', 'command', 'authorization')
+      )
+      OR json_type(NEW.lifecycle_intent_json, '$.intent.lifecycleIntentVersion') <> 'integer'
+      OR json_extract(NEW.lifecycle_intent_json, '$.intent.lifecycleIntentVersion') <> 1
+      OR json_type(NEW.lifecycle_intent_json, '$.intent.command') <> 'object'
+      OR json_type(NEW.lifecycle_intent_json, '$.intent.authorization') <> 'object'
+      OR json_type(NEW.lifecycle_intent_json, '$.persistedAssertions') <> 'object'
+      OR (SELECT count(*) FROM json_each(
+        NEW.lifecycle_intent_json, '$.persistedAssertions'
+      )) <> 10
+      OR EXISTS (
+        SELECT 1 FROM json_each(NEW.lifecycle_intent_json, '$.persistedAssertions')
+        WHERE key NOT IN (
+          'authorizationKind', 'authorizationSessionId', 'targetSessionId',
+          'presentingActorRole', 'presentingClientInstanceId', 'targetActorRole',
+          'targetClientInstanceId', 'internalWorkflowId',
+          'internalWorkflowGeneration', 'internalPlannedWorkId'
+        )
+      )
+      OR (SELECT count(*) FROM json_each(
+        NEW.lifecycle_intent_json, '$.intent.authorization'
+      )) <> 10
+      OR EXISTS (
+        SELECT 1 FROM json_each(NEW.lifecycle_intent_json, '$.intent.authorization')
+        WHERE key NOT IN (
+          'authorizationKind', 'authorizationSessionId', 'targetSessionId',
+          'presentingActorRole', 'presentingClientInstanceId', 'targetActorRole',
+          'targetClientInstanceId', 'internalWorkflowId',
+          'internalWorkflowGeneration', 'internalPlannedWorkId'
+        )
+      )
       OR instr(lower(NEW.lifecycle_intent_json), 'pmcap1.') > 0
       OR instr(lower(NEW.lifecycle_intent_json), 'pmrap1.') > 0
       OR EXISTS (
-        SELECT 1 FROM json_tree(NEW.lifecycle_intent_json, '$.material')
+        SELECT 1 FROM json_tree(NEW.lifecycle_intent_json, '$.intent.command')
         WHERE key IN (
-          'approval', 'authorization', 'bearer', 'bindingGeneration',
+          'approval', 'bearer', 'bindingGeneration',
           'candidateIntentHash', 'childBindingGrant', 'claimExpiresAt',
           'claimOwnerId', 'claimToken', 'contextFingerprint', 'environment',
           'path', 'projectBindingId', 'proof', 'proofDigest',
