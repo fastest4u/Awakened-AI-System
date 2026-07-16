@@ -55,6 +55,8 @@ export interface AppendCommand<TResponse extends JsonValue> {
   events: PendingEvent[];
   outbox: PendingOutbox[];
   publicResponse: TResponse;
+  /** Canonical nonsecret Version 2 witness stored on command event zero. */
+  lifecycleIntentWitness?: string;
 }
 
 export interface AppendResult<TResponse extends JsonValue> {
@@ -66,6 +68,69 @@ export interface AppendResult<TResponse extends JsonValue> {
   response: TResponse;
   responseHash: string;
 }
+
+export interface StoredCommandResponse<TResponse extends JsonValue> {
+  eventIds: string[];
+  firstGlobalPosition: string;
+  lastGlobalPosition: string;
+  finalStreamVersion: string;
+  response: TResponse;
+}
+
+export interface LifecyclePrincipal {
+  actorRole: TrustedActorRole;
+  clientInstanceId: string;
+}
+
+export type LifecycleCommandOrigin =
+  | {
+      kind: "initial-authority";
+      presenting: LifecyclePrincipal;
+      target: LifecyclePrincipal;
+    }
+  | {
+      kind: "protected";
+      proof: null | { version: 1; nonce: string; digest: string };
+      approval: null | { approvalId: string; digest: string };
+      authorizationSessionId: string;
+      targetSessionId: string;
+      presenting: LifecyclePrincipal;
+      target: LifecyclePrincipal;
+    }
+  | {
+      kind: "internal-workflow";
+      workflowId: string;
+      workflowGeneration: bigint;
+      plannedWorkId: string;
+      claimOwnerId: string;
+      claimToken: bigint;
+      authorizationSessionId: string;
+      targetSessionId: string;
+      presenting: LifecyclePrincipal;
+      target: LifecyclePrincipal;
+    };
+
+export type PersistedLifecycleAuthorizationRecord =
+  | (Extract<LifecycleCommandOrigin, { kind: "initial-authority" }> & {
+      authorizationSessionId: null;
+      targetSessionId: string;
+      proof: null;
+      approval: null;
+    })
+  | Extract<LifecycleCommandOrigin, { kind: "protected" | "internal-workflow" }>;
+
+export type LifecycleReplayExpectation =
+  | Extract<LifecycleCommandOrigin, { kind: "initial-authority" | "protected" }>
+  | {
+      kind: "internal-workflow";
+      workflowId: string;
+      workflowGeneration: bigint;
+      plannedWorkId: string;
+      authorizationSessionId: string;
+      targetSessionId: string;
+      presenting: LifecyclePrincipal;
+      target: LifecyclePrincipal;
+    };
 
 export interface StoredEvent {
   globalPosition: bigint;
@@ -104,4 +169,6 @@ export interface StoredEvent {
   payloadHash: string;
   previousGlobalHash: string;
   eventHash: string;
+  /** Canonical source is persisted only by Version 2 command event zero. */
+  lifecycleIntentJson?: string | null;
 }
