@@ -7,6 +7,7 @@ import {
   readFileSync,
   renameSync,
   rmSync,
+  writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -30,7 +31,10 @@ import type {
 import { ProjectDescriptorRepository } from "../src/orchestrator/identity/project-descriptor.repository.js";
 import { computeProjectContextFingerprint } from "../src/orchestrator/identity/project-binding.service.js";
 import { ProjectStoreRouter } from "../src/orchestrator/identity/project-store.router.js";
-import { StoreManifestRepository } from "../src/orchestrator/identity/store-manifest.repository.js";
+import {
+  StoreManifestRepository,
+  type PreparedStoreIntegrityManifest,
+} from "../src/orchestrator/identity/store-manifest.repository.js";
 import { EventIntegrityService } from "../src/orchestrator/integrity/event-integrity.service.js";
 import { LifecycleIntegrityService } from "../src/orchestrator/integrity/lifecycle-integrity.service.js";
 import type {
@@ -312,6 +316,17 @@ function currentFullIntegrity(fixture: Fixture): IntegrityReport {
   } finally {
     connection.close();
   }
+}
+
+function syntheticPreparedManifest(
+  preparationId = "55555555-5555-4555-8555-555555555555",
+): PreparedStoreIntegrityManifest {
+  return {
+    version: 1,
+    preparationId,
+    temporaryBasename: `.store-manifest.json.upgrade.${preparationId}.tmp`,
+    contentSha256: "a".repeat(64),
+  };
 }
 
 function lifecycleIssueCodes(
@@ -960,8 +975,14 @@ describe("explicit project-store upgrade", () => {
     const service = new ProjectStoreUpgradeService({
       sqliteDriver: recordingDriver,
       manifestRepository: fixture.manifestRepository,
-      manifestRecorder: {
-        record(): void {
+      manifestPreparer: {
+        async prepare(): Promise<PreparedStoreIntegrityManifest> {
+          return syntheticPreparedManifest();
+        },
+        discard(): void { /* synthetic artifact */ },
+      },
+      manifestPublisher: {
+        publish(): void {
           assert.equal(ownerClosed, false);
           assert.ok(owner !== null);
           assert.equal(
@@ -1053,7 +1074,10 @@ describe("explicit project-store upgrade", () => {
     const fence = new MaintenanceFence();
     const observations: string[] = [];
     const assertTakeoverExcluded = (boundary: string): void => {
-      const contender = openExisting(fixture);
+      const contender = boundary === "manifest-publication"
+        ? driver.open(fixture.path, { mode: "existing", busyTimeoutMs: 0 })
+        : openExisting(fixture);
+      if (boundary === "manifest-publication") connections.push(contender);
       assert.throws(
         () => transaction(contender, () => fence.acquire(
           contender,
@@ -1062,8 +1086,9 @@ describe("explicit project-store upgrade", () => {
           NOW,
         )),
         (error: unknown) => error instanceof Error
-          && "code" in error
-          && (error as Error & { code: unknown }).code === "MAINTENANCE_ALREADY_ACTIVE",
+          && (("code" in error
+            && (error as Error & { code: unknown }).code === "MAINTENANCE_ALREADY_ACTIVE")
+            || (boundary === "manifest-publication" && error.message === "database is locked")),
       );
       observations.push(boundary);
     };
@@ -1082,8 +1107,14 @@ describe("explicit project-store upgrade", () => {
           ) assertTakeoverExcluded(boundary);
         },
       },
-      manifestRecorder: {
-        record() {
+      manifestPreparer: {
+        async prepare(): Promise<PreparedStoreIntegrityManifest> {
+          return syntheticPreparedManifest();
+        },
+        discard(): void { /* synthetic artifact */ },
+      },
+      manifestPublisher: {
+        publish() {
           assertTakeoverExcluded("manifest-publication");
         },
       },
@@ -1129,7 +1160,13 @@ describe("explicit project-store upgrade", () => {
           return releaseIntegrity.promise.then(() => report);
         },
       },
-      manifestRecorder: { record() { /* publication is not held in this case */ } },
+      manifestPreparer: {
+        async prepare(): Promise<PreparedStoreIntegrityManifest> {
+          return syntheticPreparedManifest();
+        },
+        discard(): void { /* synthetic artifact */ },
+      },
+      manifestPublisher: { publish() { /* publication is not held in this case */ } },
     });
 
     const applying = service.apply(fixture.context);
@@ -1190,11 +1227,15 @@ describe("explicit project-store upgrade", () => {
           return currentFullIntegrity(fixture);
         },
       },
-      manifestRecorder: {
-        record(): Promise<void> {
+      manifestPreparer: {
+        prepare(): Promise<PreparedStoreIntegrityManifest> {
           manifestStarted.resolve(undefined);
-          return releaseManifest.promise.then(() => { publications += 1; });
+          return releaseManifest.promise.then(() => syntheticPreparedManifest());
         },
+        discard(): void { /* synthetic artifact */ },
+      },
+      manifestPublisher: {
+        publish(): void { publications += 1; },
       },
     });
 
@@ -1270,8 +1311,15 @@ describe("explicit project-store upgrade", () => {
           return releaseIntegrity.promise.then(() => currentFullIntegrity(fixture));
         },
       },
-      manifestRecorder: {
-        record(): void { manifestCalls += 1; },
+      manifestPreparer: {
+        async prepare(): Promise<PreparedStoreIntegrityManifest> {
+          manifestCalls += 1;
+          return syntheticPreparedManifest();
+        },
+        discard(): void { /* synthetic artifact */ },
+      },
+      manifestPublisher: {
+        publish(): void { manifestCalls += 1; },
       },
     });
 
@@ -1282,6 +1330,8 @@ describe("explicit project-store upgrade", () => {
     ]);
     loseRenewal = true;
     scheduler.runNext();
+    assert.equal(phaseSignal.aborted, true);
+    releaseIntegrity.resolve(undefined);
 
     await assert.rejects(
       applying,
@@ -1289,7 +1339,6 @@ describe("explicit project-store upgrade", () => {
         && "code" in error
         && (error as Error & { code: unknown }).code === "MAINTENANCE_LEASE_STALE",
     );
-    assert.equal(phaseSignal.aborted, true);
     assert.equal(manifestCalls, 0);
     assert.equal(
       openExisting(fixture).prepare(`
@@ -1298,15 +1347,237 @@ describe("explicit project-store upgrade", () => {
       "quiescing",
     );
 
-    releaseIntegrity.resolve(undefined);
-    await Promise.resolve();
-    await Promise.resolve();
     assert.equal(manifestCalls, 0);
     assert.equal(
       openExisting(fixture).prepare(`
         SELECT mode FROM maintenance_state WHERE singleton = 1
       `).get()?.mode,
       "quiescing",
+    );
+  });
+
+  it("never publishes a late prepared manifest after a contender takes the lease", async () => {
+    const fixture = createV1Store();
+    const fence = new MaintenanceFence();
+    const scheduler = new ManualLeaseScheduler();
+    const preparationStarted = deferred<void>();
+    const releasePreparation = deferred<void>();
+    const phaseFinished = deferred<void>();
+    const originalManifest = readFileSync(
+      fixture.context.binding.storeRoute.storeManifestPath,
+      "utf8",
+    );
+    const lateManifest = `${JSON.stringify({
+      ...JSON.parse(originalManifest) as Record<string, unknown>,
+      lastIntegrity: {
+        status: "passed",
+        checkedAt: NOW,
+        schemaFingerprint: "late-publication",
+        terminalEventHash: "late-publication",
+      },
+    }, null, 2)}\n`;
+    let clockMs = Date.parse(NOW);
+    let phaseSignal!: AbortSignal;
+    let publisherCalls = 0;
+    const prepared = syntheticPreparedManifest();
+    const service = construct<ProjectStoreUpgradeService>(ProjectStoreUpgradeService, {
+      sqliteDriver: driver,
+      maintenanceFence: fence,
+      now: () => new Date(clockMs).toISOString(),
+      randomId: () => "late-publication-owner",
+      trustedTtlMs: 1_000,
+      leaseHeartbeatMs: 250,
+      leaseScheduler: scheduler,
+      postCommitIntegrityRunner: {
+        async run(): Promise<IntegrityReport> {
+          return currentFullIntegrity(fixture);
+        },
+      },
+      manifestPreparer: {
+        prepare(
+          _context: ProjectContext,
+          _report: IntegrityReport,
+          signal: AbortSignal,
+        ): Promise<typeof prepared> {
+          phaseSignal = signal;
+          preparationStarted.resolve(undefined);
+          return releasePreparation.promise.then(() => {
+            phaseFinished.resolve(undefined);
+            return prepared;
+          });
+        },
+        discard(): void { /* the prepared artifact is synthetic */ },
+      },
+      manifestPublisher: {
+        publish(): void {
+          publisherCalls += 1;
+          writeFileSync(
+            fixture.context.binding.storeRoute.storeManifestPath,
+            lateManifest,
+            "utf8",
+          );
+        },
+      },
+    });
+
+    const applying = service.apply(fixture.context);
+    await Promise.race([
+      preparationStarted.promise,
+      applying.then(() => { throw new Error("MANIFEST_PREPARATION_NOT_USED"); }),
+    ]);
+    const ownerState = openExisting(fixture).prepare(`
+      SELECT lease_expires_at FROM maintenance_state WHERE singleton = 1
+    `).get();
+    clockMs = Date.parse(String(ownerState?.lease_expires_at)) + 1;
+    const contender = openExisting(fixture);
+    transaction(contender, () => fence.acquire(
+      contender,
+      "late-publication-contender",
+      new Date(clockMs + 1_000).toISOString(),
+      new Date(clockMs).toISOString(),
+    ));
+    scheduler.runNext();
+    releasePreparation.resolve(undefined);
+
+    await assert.rejects(
+      applying,
+      (error: unknown) => error instanceof Error
+        && "code" in error
+        && (error as Error & { code: unknown }).code === "MAINTENANCE_LEASE_STALE",
+    );
+    await phaseFinished.promise;
+    assert.equal(phaseSignal.aborted, true);
+    assert.equal(publisherCalls, 0);
+    assert.equal(
+      readFileSync(fixture.context.binding.storeRoute.storeManifestPath, "utf8"),
+      originalManifest,
+    );
+    assert.equal(
+      openExisting(fixture).prepare(`
+        SELECT mode, owner_id FROM maintenance_state WHERE singleton = 1
+      `).get()?.owner_id,
+      "late-publication-contender",
+    );
+  });
+
+  it("publishes a prepared manifest only inside the exact owner transaction", async () => {
+    const fixture = createV1Store();
+    const fence = new MaintenanceFence();
+    let ownerTransactionOpen = false;
+    let publisherCalls = 0;
+    let contenderBlocked = false;
+    const recordingDriver: SqliteDriver = {
+      open(path: string, options: SqliteOpenOptions): SqliteConnection {
+        const connection = driver.open(path, options);
+        if (options.mode !== "existing") return connection;
+        return {
+          exec(sql): void {
+            const statement = sql.trim().toUpperCase();
+            if (statement === "BEGIN IMMEDIATE") ownerTransactionOpen = true;
+            try {
+              connection.exec(sql);
+            } finally {
+              if (statement === "COMMIT" || statement === "ROLLBACK") {
+                ownerTransactionOpen = false;
+              }
+            }
+          },
+          prepare(sql) { return connection.prepare(sql); },
+          close() { connection.close(); },
+        };
+      },
+    };
+    const resultFor = (report: IntegrityReport) => ({
+      ok: report.ok,
+      schemaFingerprint: report.schemaFingerprint,
+      terminalEventHash: report.terminalEventHash,
+    });
+    const identity = {
+      projectId: fixture.context.binding.projectId,
+      vaultId: fixture.context.binding.vaultId,
+      storeId: fixture.context.binding.storeId,
+    };
+    const repository = fixture.manifestRepository as unknown as {
+      prepareIntegrity(
+        route: ProjectContext["binding"]["storeRoute"],
+        expected: typeof identity,
+        result: ReturnType<typeof resultFor>,
+        preparationId: string,
+      ): unknown;
+      publishPreparedIntegrity(
+        route: ProjectContext["binding"]["storeRoute"],
+        expected: typeof identity,
+        result: ReturnType<typeof resultFor>,
+        prepared: unknown,
+      ): unknown;
+      discardPreparedIntegrity(
+        route: ProjectContext["binding"]["storeRoute"],
+        prepared: unknown,
+      ): void;
+    };
+    const service = construct<ProjectStoreUpgradeService>(ProjectStoreUpgradeService, {
+      sqliteDriver: recordingDriver,
+      maintenanceFence: fence,
+      manifestRepository: fixture.manifestRepository,
+      now: () => NOW,
+      randomId: () => "transactional-manifest-owner",
+      trustedTtlMs: 60_000,
+      postCommitIntegrityRunner: {
+        async run(): Promise<IntegrityReport> {
+          return currentFullIntegrity(fixture);
+        },
+      },
+      manifestPreparer: {
+        async prepare(_context: ProjectContext, report: IntegrityReport): Promise<unknown> {
+          return repository.prepareIntegrity(
+            fixture.context.binding.storeRoute,
+            identity,
+            resultFor(report),
+            "77777777-7777-4777-8777-777777777777",
+          );
+        },
+        discard(_context: ProjectContext, prepared: unknown): void {
+          repository.discardPreparedIntegrity(
+            fixture.context.binding.storeRoute,
+            prepared,
+          );
+        },
+      },
+      manifestPublisher: {
+        publish(_context: ProjectContext, report: IntegrityReport, prepared: unknown): void {
+          publisherCalls += 1;
+          assert.equal(ownerTransactionOpen, true);
+          const contender = driver.open(fixture.path, {
+            mode: "existing",
+            busyTimeoutMs: 0,
+          });
+          connections.push(contender);
+          assert.throws(() => transaction(contender, () => fence.acquire(
+            contender,
+            "transactional-manifest-contender",
+            "2026-07-14T00:10:00.000Z",
+            NOW,
+          )));
+          contenderBlocked = true;
+          repository.publishPreparedIntegrity(
+            fixture.context.binding.storeRoute,
+            identity,
+            resultFor(report),
+            prepared,
+          );
+        },
+      },
+    });
+
+    const result = await service.apply(fixture.context);
+
+    assert.equal(result.integrity.ok, true);
+    assert.equal(publisherCalls, 1);
+    assert.equal(contenderBlocked, true);
+    assert.equal(ownerTransactionOpen, false);
+    assert.equal(
+      fixture.manifestRepository.inspect(fixture.context.binding.storeRoute, identity).status,
+      "valid",
     );
   });
 
@@ -1945,8 +2216,14 @@ describe("explicit project-store upgrade", () => {
       now: () => clock,
       randomId: () => "manifest-owner",
       trustedTtlMs: 60_000,
-      manifestRecorder: {
-        record() { throw publicationFailure; },
+      manifestPreparer: {
+        async prepare(): Promise<PreparedStoreIntegrityManifest> {
+          return syntheticPreparedManifest();
+        },
+        discard(): void { /* synthetic artifact */ },
+      },
+      manifestPublisher: {
+        publish() { throw publicationFailure; },
       },
     });
 

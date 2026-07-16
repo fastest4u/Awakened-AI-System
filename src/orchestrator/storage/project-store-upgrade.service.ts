@@ -2,7 +2,10 @@ import { randomUUID } from "node:crypto";
 import { realpathSync, statSync } from "node:fs";
 import { resolve } from "node:path";
 import type { ProjectContext } from "../identity/contracts.js";
-import { StoreManifestRepository } from "../identity/store-manifest.repository.js";
+import {
+  StoreManifestRepository,
+  type PreparedStoreIntegrityManifest,
+} from "../identity/store-manifest.repository.js";
 import { EventIntegrityService } from "../integrity/event-integrity.service.js";
 import type { IntegrityReport } from "../integrity/integrity.types.js";
 import type { MaintenanceClosureConfirmation } from "../runtime/project-store-executor.js";
@@ -52,12 +55,24 @@ export interface UpgradeExecutorRegistry {
   quiesceStore(context: ProjectContext, lease: MaintenanceLease): Promise<void>;
 }
 
-export interface UpgradeIntegrityManifestRecorder {
-  record(
+export interface UpgradeIntegrityManifestPreparer {
+  prepare(
     context: ProjectContext,
     report: IntegrityReport,
-    signal?: AbortSignal,
+    signal: AbortSignal,
+  ): Promise<PreparedStoreIntegrityManifest>;
+  discard(
+    context: ProjectContext,
+    prepared: PreparedStoreIntegrityManifest,
   ): void | Promise<void>;
+}
+
+export interface UpgradeIntegrityManifestPublisher {
+  publish(
+    context: ProjectContext,
+    report: IntegrityReport,
+    prepared: PreparedStoreIntegrityManifest,
+  ): void;
 }
 
 export interface UpgradePostCommitIntegrityRunner {
@@ -75,7 +90,8 @@ export interface ProjectStoreUpgradeServiceDependencies {
   migrationRunner?: MigrationRunner;
   executorRegistry?: UpgradeExecutorRegistry;
   manifestRepository?: StoreManifestRepository;
-  manifestRecorder?: UpgradeIntegrityManifestRecorder;
+  manifestPreparer?: UpgradeIntegrityManifestPreparer;
+  manifestPublisher?: UpgradeIntegrityManifestPublisher;
   postCommitIntegrityRunner?: UpgradePostCommitIntegrityRunner;
   upgradePhaseWorkerUrl?: URL;
   now?: () => string;
@@ -197,7 +213,8 @@ export class ProjectStoreUpgradeService {
   readonly #fence: MaintenanceFence;
   readonly #migrationRunner: MigrationRunner;
   readonly #registry: UpgradeExecutorRegistry;
-  readonly #manifestRecorder: UpgradeIntegrityManifestRecorder;
+  readonly #manifestPreparer: UpgradeIntegrityManifestPreparer;
+  readonly #manifestPublisher: UpgradeIntegrityManifestPublisher;
   readonly #postCommitIntegrityRunner: UpgradePostCommitIntegrityRunner;
   readonly #now: () => string;
   readonly #randomId: () => string;
@@ -222,29 +239,72 @@ export class ProjectStoreUpgradeService {
         ? {}
         : { workerUrl: dependencies.upgradePhaseWorkerUrl },
     );
-    const manifestRepository = dependencies.manifestRepository;
-    this.#manifestRecorder = dependencies.manifestRecorder
-      ?? (manifestRepository === undefined
-        ? {
-            record: (context, report, signal) => phaseRunner.recordManifest(
-              context,
-              report,
-              signal ?? new AbortController().signal,
-            ),
-          }
-        : {
-            record(context, report) {
-              manifestRepository.recordIntegrity(context.binding.storeRoute, {
-                projectId: context.binding.projectId,
-                vaultId: context.binding.vaultId,
-                storeId: context.binding.storeId,
-              }, {
-                ok: report.ok,
-                schemaFingerprint: report.schemaFingerprint,
-                terminalEventHash: report.terminalEventHash,
-              });
-            },
-          });
+    const customManifestPhases = dependencies.manifestPreparer !== undefined
+      || dependencies.manifestPublisher !== undefined;
+    if (
+      customManifestPhases
+      && (dependencies.manifestPreparer === undefined
+        || dependencies.manifestPublisher === undefined)
+    ) fail("WORKER_CONFIG_INVALID");
+    const manifestRepository = dependencies.manifestRepository ?? new StoreManifestRepository();
+    if (customManifestPhases) {
+      this.#manifestPreparer = dependencies.manifestPreparer!;
+      this.#manifestPublisher = dependencies.manifestPublisher!;
+    } else if (dependencies.manifestRepository !== undefined) {
+      this.#manifestPreparer = {
+        async prepare(context, report): Promise<PreparedStoreIntegrityManifest> {
+          return manifestRepository.prepareIntegrity(context.binding.storeRoute, {
+            projectId: context.binding.projectId,
+            vaultId: context.binding.vaultId,
+            storeId: context.binding.storeId,
+          }, {
+            ok: report.ok,
+            schemaFingerprint: report.schemaFingerprint,
+            terminalEventHash: report.terminalEventHash,
+          }, randomUUID());
+        },
+        discard(context, prepared): void {
+          manifestRepository.discardPreparedIntegrity(context.binding.storeRoute, prepared);
+        },
+      };
+      this.#manifestPublisher = {
+        publish(context, report, prepared): void {
+          manifestRepository.publishPreparedIntegrity(context.binding.storeRoute, {
+            projectId: context.binding.projectId,
+            vaultId: context.binding.vaultId,
+            storeId: context.binding.storeId,
+          }, {
+            ok: report.ok,
+            schemaFingerprint: report.schemaFingerprint,
+            terminalEventHash: report.terminalEventHash,
+          }, prepared);
+        },
+      };
+    } else {
+      this.#manifestPreparer = {
+        prepare: (context, report, signal) => phaseRunner.prepareManifest(
+          context,
+          report,
+          signal,
+        ),
+        discard(context, prepared): void {
+          manifestRepository.discardPreparedIntegrity(context.binding.storeRoute, prepared);
+        },
+      };
+      this.#manifestPublisher = {
+        publish(context, report, prepared): void {
+          manifestRepository.publishPreparedIntegrity(context.binding.storeRoute, {
+            projectId: context.binding.projectId,
+            vaultId: context.binding.vaultId,
+            storeId: context.binding.storeId,
+          }, {
+            ok: report.ok,
+            schemaFingerprint: report.schemaFingerprint,
+            terminalEventHash: report.terminalEventHash,
+          }, prepared);
+        },
+      };
+    }
     this.#postCommitIntegrityRunner = dependencies.postCommitIntegrityRunner ?? {
       run: (context, signal) => phaseRunner.fullIntegrity(context, signal),
     };
@@ -371,10 +431,39 @@ export class ProjectStoreUpgradeService {
       this.#faults.hit("after-full-integrity-before-manifest-record");
 
       active.lease = this.renewReady(active);
-      await this.guardedPhase(
-        active,
-        async (signal) => this.#manifestRecorder.record(context, integrity, signal),
-      );
+      let preparedManifest: PreparedStoreIntegrityManifest | undefined;
+      try {
+        preparedManifest = await this.guardedPhase(
+          active,
+          (signal) => this.#manifestPreparer.prepare(context, integrity, signal),
+          async (latePrepared) => {
+            try {
+              await this.#manifestPreparer.discard(context, latePrepared);
+            } catch {
+              // The maintenance lease failure remains authoritative.
+            }
+          },
+        );
+        transaction(connection, () => {
+          active!.lease = this.#fence.renewOwner(
+            connection,
+            active!.lease,
+            this.#now(),
+            this.#trustedTtlMs,
+          );
+          this.#fence.assertReady(connection, active!.lease, this.#now());
+          this.#manifestPublisher.publish(context, integrity, preparedManifest!);
+        });
+      } catch (error) {
+        if (preparedManifest !== undefined) {
+          try {
+            await this.#manifestPreparer.discard(context, preparedManifest);
+          } catch {
+            // The preparation/publication failure remains authoritative.
+          }
+        }
+        throw error;
+      }
       this.#faults.hit("after-manifest-record-before-fence-release");
 
       transaction(connection, () => {
@@ -470,10 +559,13 @@ export class ProjectStoreUpgradeService {
   private async guardedPhase<T>(
     active: ActiveOwner,
     operation: (signal: AbortSignal) => Promise<T>,
+    onAbortedResult?: (value: T) => void | Promise<void>,
   ): Promise<T> {
     const controller = new AbortController();
     let timer: object | undefined;
     let stopped = false;
+    let heartbeatLost = false;
+    let heartbeatError: unknown;
     let rejectHeartbeat!: (error: unknown) => void;
     const heartbeatFailure = new Promise<never>((_resolve, reject) => {
       rejectHeartbeat = reject;
@@ -493,6 +585,8 @@ export class ProjectStoreUpgradeService {
           schedule();
         } catch (error) {
           stop();
+          heartbeatLost = true;
+          heartbeatError = error;
           controller.abort(error);
           rejectHeartbeat(error);
         }
@@ -500,9 +594,18 @@ export class ProjectStoreUpgradeService {
     };
     schedule();
     const phase = Promise.resolve().then(() => operation(controller.signal));
-    void phase.catch(() => undefined);
     try {
       return await Promise.race([phase, heartbeatFailure]);
+    } catch (error) {
+      if (!heartbeatLost) throw error;
+      const outcome = await phase.then(
+        (value) => ({ ok: true as const, value }),
+        () => ({ ok: false as const }),
+      );
+      if (outcome.ok && onAbortedResult !== undefined) {
+        try { await onAbortedResult(outcome.value); } catch { /* preserve lease failure */ }
+      }
+      throw heartbeatError;
     } finally {
       stop();
     }

@@ -9,7 +9,12 @@ import {
 
 type PhaseConfig =
   | { phase: "full-integrity"; binding: unknown }
-  | { phase: "manifest-record"; binding: unknown; report: unknown };
+  | {
+      phase: "manifest-prepare";
+      binding: unknown;
+      report: unknown;
+      preparationId: string;
+    };
 
 function invalid(): never {
   throw new Error("WORKER_PROTOCOL_ERROR");
@@ -28,13 +33,20 @@ function config(value: unknown): PhaseConfig {
     return { phase: "full-integrity", binding: record.binding };
   }
   if (
-    record.phase === "manifest-record"
-    && keys.length === 3
+    record.phase === "manifest-prepare"
+    && keys.length === 4
     && keys[0] === "binding"
     && keys[1] === "phase"
-    && keys[2] === "report"
+    && keys[2] === "preparationId"
+    && keys[3] === "report"
+    && typeof record.preparationId === "string"
   ) {
-    return { phase: "manifest-record", binding: record.binding, report: record.report };
+    return {
+      phase: "manifest-prepare",
+      binding: record.binding,
+      report: record.report,
+      preparationId: record.preparationId,
+    };
   }
   invalid();
 }
@@ -69,7 +81,7 @@ void (async () => {
     });
   }
   const report = decodeIntegrityReport(phase.report);
-  new StoreManifestRepository().recordIntegrity(context.binding.storeRoute, {
+  return new StoreManifestRepository().prepareIntegrity(context.binding.storeRoute, {
     projectId: context.binding.projectId,
     vaultId: context.binding.vaultId,
     storeId: context.binding.storeId,
@@ -77,8 +89,7 @@ void (async () => {
     ok: report.ok,
     schemaFingerprint: report.schemaFingerprint,
     terminalEventHash: report.terminalEventHash,
-  });
-  return { recorded: true };
+  }, phase.preparationId);
 })().then((data) => {
   parent.postMessage({ ok: true, data });
 }).catch((error: unknown) => {

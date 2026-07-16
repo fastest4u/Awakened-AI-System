@@ -233,6 +233,32 @@ describe("StoreManifestRepository", () => {
     projectId: descriptor.projectId,
     vaultId: descriptor.vaultId,
   };
+  type IntegrityResult = {
+    ok: boolean;
+    schemaFingerprint: string;
+    terminalEventHash: string;
+  };
+  type PreparedManifest = {
+    version: number;
+    preparationId: string;
+    temporaryBasename: string;
+    contentSha256: string;
+  };
+  const preparedRepository = (repository: StoreManifestRepository) => repository as unknown as {
+    prepareIntegrity(
+      route: ProjectStoreRoute,
+      expected: typeof identity,
+      result: IntegrityResult,
+      preparationId: string,
+    ): PreparedManifest;
+    publishPreparedIntegrity(
+      route: ProjectStoreRoute,
+      expected: typeof identity,
+      result: IntegrityResult,
+      prepared: PreparedManifest,
+    ): StoreManifestV1;
+    discardPreparedIntegrity(route: ProjectStoreRoute, prepared: PreparedManifest): void;
+  };
 
   afterEach(() => {
     if (root !== undefined) rmSync(root, { recursive: true, force: true });
@@ -559,6 +585,91 @@ describe("StoreManifestRepository", () => {
       path: route.storeManifestPath,
       manifest: updated,
     });
+    assert.deepEqual(readdirSync(route.storeRoot), ["store-manifest.json"]);
+  });
+
+  it("prepares integrity bytes without publishing and commits only the exact artifact", () => {
+    arrangeRoute();
+    const times = [
+      "2026-07-12T00:01:00.000Z",
+      "2026-07-12T00:02:00.000Z",
+    ];
+    const repository = new StoreManifestRepository({ now: () => times.shift()! });
+    const twoPhase = preparedRepository(repository);
+    const created = repository.createExplicit(route, identity);
+    const originalBytes = readFileSync(route.storeManifestPath, "utf8");
+    const result = {
+      ok: true,
+      schemaFingerprint: "schema-v2",
+      terminalEventHash: "event-hash-v2",
+    };
+
+    const prepared = twoPhase.prepareIntegrity(
+      route,
+      identity,
+      result,
+      "88888888-8888-4888-8888-888888888888",
+    );
+
+    assert.equal(readFileSync(route.storeManifestPath, "utf8"), originalBytes);
+    assert.deepEqual(Object.keys(prepared).sort(), [
+      "contentSha256",
+      "preparationId",
+      "temporaryBasename",
+      "version",
+    ]);
+    assert.deepEqual(readdirSync(route.storeRoot).sort(), [
+      prepared.temporaryBasename,
+      "store-manifest.json",
+    ].sort());
+
+    const published = twoPhase.publishPreparedIntegrity(route, identity, result, prepared);
+
+    assert.deepEqual(published, {
+      ...created,
+      lastIntegrity: {
+        status: "passed",
+        checkedAt: "2026-07-12T00:02:00.000Z",
+        schemaFingerprint: "schema-v2",
+        terminalEventHash: "event-hash-v2",
+      },
+    });
+    assert.deepEqual(readdirSync(route.storeRoot), ["store-manifest.json"]);
+  });
+
+  it("rejects a forged prepared-manifest path without changing canonical bytes", () => {
+    arrangeRoute();
+    const times = [
+      "2026-07-12T00:01:00.000Z",
+      "2026-07-12T00:02:00.000Z",
+    ];
+    const repository = new StoreManifestRepository({ now: () => times.shift()! });
+    const twoPhase = preparedRepository(repository);
+    repository.createExplicit(route, identity);
+    const originalBytes = readFileSync(route.storeManifestPath, "utf8");
+    const result = {
+      ok: true,
+      schemaFingerprint: "schema-v2",
+      terminalEventHash: "event-hash-v2",
+    };
+    const prepared = twoPhase.prepareIntegrity(
+      route,
+      identity,
+      result,
+      "99999999-9999-4999-8999-999999999999",
+    );
+    const forged = {
+      ...prepared,
+      temporaryBasename: `..${sep}outside-store-root.tmp`,
+    };
+
+    assert.throws(
+      () => twoPhase.publishPreparedIntegrity(route, identity, result, forged),
+      /STORE_PREPARED_MANIFEST_INVALID/,
+    );
+    assert.equal(readFileSync(route.storeManifestPath, "utf8"), originalBytes);
+
+    twoPhase.discardPreparedIntegrity(route, prepared);
     assert.deepEqual(readdirSync(route.storeRoot), ["store-manifest.json"]);
   });
 

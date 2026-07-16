@@ -1,5 +1,11 @@
+import { randomUUID } from "node:crypto";
 import { Worker } from "node:worker_threads";
 import type { ProjectContext } from "../identity/contracts.js";
+import {
+  parsePreparedStoreIntegrityManifest,
+  StoreManifestRepository,
+  type PreparedStoreIntegrityManifest,
+} from "../identity/store-manifest.repository.js";
 import type { IntegrityReport } from "../integrity/integrity.types.js";
 import {
   decodeIntegrityReport,
@@ -83,29 +89,38 @@ export class ProjectStoreUpgradePhaseRunner {
     );
   }
 
-  recordManifest(
+  prepareManifest(
     context: ProjectContext,
     report: IntegrityReport,
     signal: AbortSignal,
-  ): Promise<void> {
+  ): Promise<PreparedStoreIntegrityManifest> {
+    const preparationId = randomUUID();
     return this.run(
       {
-        phase: "manifest-record",
+        phase: "manifest-prepare",
         binding: encodeWorkerBinding(context),
         report,
+        preparationId,
       },
       (value) => {
-        if (
-          typeof value !== "object"
-          || value === null
-          || Reflect.ownKeys(value).length !== 1
-          || Reflect.get(value, "recorded") !== true
-        ) {
+        const prepared = parsePreparedStoreIntegrityManifest(value);
+        if (prepared.preparationId !== preparationId) {
           throw new ProjectStoreUpgradePhaseRunnerError("WORKER_PROTOCOL_ERROR");
         }
+        return prepared;
       },
       signal,
-    );
+    ).catch((error: unknown) => {
+      try {
+        new StoreManifestRepository().discardIntegrityPreparation(
+          context.binding.storeRoute,
+          preparationId,
+        );
+      } catch {
+        // The phase failure remains authoritative; crash residue is never publishable by path.
+      }
+      throw error;
+    });
   }
 
   private run<T>(
