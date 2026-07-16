@@ -77,6 +77,7 @@ export interface ProjectStoreUpgradeServiceDependencies {
   manifestRepository?: StoreManifestRepository;
   manifestRecorder?: UpgradeIntegrityManifestRecorder;
   postCommitIntegrityRunner?: UpgradePostCommitIntegrityRunner;
+  upgradePhaseWorkerUrl?: URL;
   now?: () => string;
   randomId?: () => string;
   trustedTtlMs?: number;
@@ -216,7 +217,11 @@ export class ProjectStoreUpgradeService {
     this.#fence = dependencies.maintenanceFence ?? new MaintenanceFence();
     this.#migrationRunner = dependencies.migrationRunner ?? new MigrationRunner();
     this.#registry = dependencies.executorRegistry ?? NO_EXECUTORS;
-    const phaseRunner = new ProjectStoreUpgradePhaseRunner();
+    const phaseRunner = new ProjectStoreUpgradePhaseRunner(
+      dependencies.upgradePhaseWorkerUrl === undefined
+        ? {}
+        : { workerUrl: dependencies.upgradePhaseWorkerUrl },
+    );
     const manifestRepository = dependencies.manifestRepository;
     this.#manifestRecorder = dependencies.manifestRecorder
       ?? (manifestRepository === undefined

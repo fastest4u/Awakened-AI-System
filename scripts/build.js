@@ -91,6 +91,18 @@ async function build() {
         packages: 'external',
     });
 
+    console.log('🧵 Step 5: Bundling upgrade phase worker (dist/workers/project-store-upgrade-phase.worker.js)...');
+    await esbuild.build({
+        entryPoints: ['src/workers/project-store-upgrade-phase.worker.ts'],
+        bundle: true,
+        platform: 'node',
+        format: 'esm',
+        outfile: path.join(outDir, 'workers', 'project-store-upgrade-phase.worker.js'),
+        target: 'node22',
+        minify: true,
+        packages: 'external',
+    });
+
     writeFileSync(
         path.join(outDir, 'build-info.json'),
         `${JSON.stringify({
@@ -100,7 +112,7 @@ async function build() {
         'utf8'
     );
 
-    console.log('✅ Build completed successfully! Output: dist/index.js (MCP server) + dist/cli.js (memory-vault CLI) + dist/workers/project-store.worker.js');
+    console.log('✅ Build completed successfully! Output: dist/index.js (MCP server) + dist/cli.js (memory-vault CLI) + dist/workers/project-store.worker.js + dist/workers/project-store-upgrade-phase.worker.js');
 }
 
 build().catch((error) => {

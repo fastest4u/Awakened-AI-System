@@ -1,9 +1,28 @@
+import { createHash } from "node:crypto";
+import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { Worker } from "node:worker_threads";
 
 const MINIMUM_NODE_VERSION = "22.22.3";
 const MINIMUM_SQLITE_VERSION = "3.51.3";
 const REQUEST_TIMEOUT_MS = 10_000;
+const UPGRADE_TIMEOUT_MS = 30_000;
 const WORKER_URL = new URL("../dist/workers/project-store.worker.js", import.meta.url);
+const PROJECT_MEMORY_APPLICATION_ID = 0x504d454d;
+const NOW = "2026-07-16T00:00:00.000Z";
+const PROJECT_ID = "11111111-1111-4111-8111-111111111111";
+const VAULT_ID = "22222222-2222-4222-8222-222222222222";
+const STORE_ID = "33333333-3333-4333-8333-333333333333";
+const WORKSPACE_ID = "build-artifact-smoke-workspace";
 
 function parseStableVersion(value, label) {
   const match = /^(\d+)\.(\d+)\.(\d+)$/.exec(value);
@@ -68,7 +87,9 @@ function decodeResponse(value, expectedId, decodeData) {
     }
     const details = record(failure.details, "worker failure details");
     assertJson(details, "worker failure details");
-    throw new Error(`Worker request failed: ${failure.code}: ${failure.message}`);
+    throw new Error(
+      `Worker request failed: ${failure.code}: ${failure.message}: ${JSON.stringify(details)}`,
+    );
   }
   if (response.ok !== true) throw new Error("Worker response ok must be a boolean");
   return decodeData(response.data);
@@ -93,6 +114,218 @@ function decodeClose(value) {
   const closed = exact(value, ["closed"], "close response");
   if (closed.closed !== true) throw new Error("Worker did not acknowledge close");
   return closed;
+}
+
+function canonicalJson(value) {
+  if (value === null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  return `{${Object.keys(value).sort().map((key) => (
+    `${JSON.stringify(key)}:${canonicalJson(value[key])}`
+  )).join(",")}}`;
+}
+
+function eventCoreSql() {
+  const source = readFileSync(
+    new URL("../src/orchestrator/storage/migrations/0001-event-core.ts", import.meta.url),
+    "utf8",
+  ).replace(/\r\n?/g, "\n");
+  const match = /sql:\s*`([\s\S]*?)`,\s*};/.exec(source);
+  if (match === null) throw new Error("Unable to read the Version 1 migration fixture");
+  return match[1];
+}
+
+function createUpgradeFixture() {
+  const root = realpathSync.native(mkdtempSync(join(tmpdir(), "memory-build-upgrade-")));
+  const projectRoot = join(root, "project");
+  const vaultRoot = join(projectRoot, "memory");
+  const storeRoot = join(vaultRoot, ".memory-mcp", "v2");
+  const descriptorPath = join(vaultRoot, ".memory-mcp", "project-identity.json");
+  mkdirSync(storeRoot, { recursive: true });
+  const storeRoute = {
+    kind: "vault-local",
+    storeRoot,
+    eventsPath: join(storeRoot, "events.sqlite"),
+    storeManifestPath: join(storeRoot, "store-manifest.json"),
+    projectionManifestPath: join(storeRoot, "projection-manifest.json"),
+  };
+  writeFileSync(descriptorPath, `${JSON.stringify({
+    schemaVersion: 1,
+    projectId: PROJECT_ID,
+    vaultId: VAULT_ID,
+    createdAt: NOW,
+  }, null, 2)}\n`, "utf8");
+  writeFileSync(storeRoute.storeManifestPath, `${JSON.stringify({
+    schemaVersion: 1,
+    storeId: STORE_ID,
+    projectId: PROJECT_ID,
+    vaultId: VAULT_ID,
+    createdAt: NOW,
+    lastIntegrity: { status: "never" },
+  }, null, 2)}\n`, "utf8");
+
+  const sql = eventCoreSql();
+  const database = new DatabaseSync(storeRoute.eventsPath);
+  try {
+    database.exec(`
+      PRAGMA journal_mode = WAL;
+      PRAGMA synchronous = FULL;
+      PRAGMA application_id = ${PROJECT_MEMORY_APPLICATION_ID};
+    `);
+    database.exec(sql);
+    database.prepare(`
+      INSERT INTO schema_migrations(version, name, checksum, applied_at)
+      VALUES (1, 'event-core', ?, ?)
+    `).run(createHash("sha256").update(sql, "utf8").digest("hex"), NOW);
+    database.prepare(`
+      INSERT INTO project_meta(
+        singleton, project_id, vault_id, store_id, schema_version, created_at
+      ) VALUES (1, ?, ?, ?, 1, ?)
+    `).run(PROJECT_ID, VAULT_ID, STORE_ID, NOW);
+    database.exec(`
+      INSERT INTO maintenance_state(
+        singleton, epoch, mode, owner_id, fencing_token, lease_expires_at, requested_at
+      ) VALUES (1, 0, 'idle', NULL, 0, NULL, NULL)
+    `);
+  } finally {
+    database.close();
+  }
+
+  const workspace = {
+    kind: "non-git",
+    workspaceRoot: projectRoot,
+    workspaceId: WORKSPACE_ID,
+  };
+  const fingerprintMaterial = {
+    generation: 1,
+    source: "explicit-cli",
+    projectId: PROJECT_ID,
+    vaultId: VAULT_ID,
+    storeId: STORE_ID,
+    workspaceId: WORKSPACE_ID,
+    projectRoot,
+    vaultRoot,
+    descriptorPath,
+    storeRoute,
+    workspace,
+    clientNamespace: "build-artifact-smoke",
+    clientInstanceId: "build-artifact-smoke-client",
+    actorRole: "maintenance",
+  };
+  const contextFingerprint = createHash("sha256")
+    .update(`project-memory/project-context/v1\n${canonicalJson(fingerprintMaterial)}`, "utf8")
+    .digest("hex");
+  return {
+    root,
+    eventsPath: storeRoute.eventsPath,
+    manifestPath: storeRoute.storeManifestPath,
+    binding: {
+      projectId: PROJECT_ID,
+      vaultId: VAULT_ID,
+      storeId: STORE_ID,
+      bindingGeneration: 1,
+      contextFingerprint,
+      projectBindingId: "44444444-4444-4444-8444-444444444444",
+      source: "explicit-cli",
+      projectRoot,
+      vaultRoot,
+      descriptorPath: fingerprintMaterial.descriptorPath,
+      storeRoute,
+      workspaceId: WORKSPACE_ID,
+      workspace,
+      clientNamespace: fingerprintMaterial.clientNamespace,
+      clientInstanceId: fingerprintMaterial.clientInstanceId,
+      actorRole: "maintenance",
+      establishedAt: NOW,
+      checkedAt: NOW,
+      branchScopeId: null,
+    },
+  };
+}
+
+function decodeUpgrade(value) {
+  const result = exact(
+    value,
+    ["plan", "appliedVersions", "resumedPostCommit", "integrity"],
+    "upgrade result",
+  );
+  if (
+    !Array.isArray(result.appliedVersions)
+    || result.appliedVersions.length !== 1
+    || result.appliedVersions[0] !== 2
+  ) throw new Error("Bundled upgrade did not apply Version 2 exactly once");
+  const integrity = record(result.integrity, "upgrade integrity");
+  if (integrity.ok !== true) throw new Error("Bundled upgrade integrity did not pass");
+  return result;
+}
+
+async function smokeBundledUpgrade() {
+  const fixture = createUpgradeFixture();
+  const worker = new Worker(WORKER_URL, {
+    workerData: { role: "upgrade", binding: fixture.binding },
+  });
+  const operationId = "smoke-upgrade-apply";
+  let settled = false;
+  try {
+    await new Promise((resolve, reject) => {
+      const timer = setTimeout(
+        () => reject(new Error("Bundled upgrade request timed out")),
+        UPGRADE_TIMEOUT_MS,
+      );
+      const finish = (callback, value) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        callback(value);
+      };
+      worker.on("message", (value) => {
+        try {
+          const message = record(value, "upgrade worker message");
+          if (message.type === "upgrade-quiesce-required") {
+            if (message.operationId !== operationId) {
+              throw new Error("Bundled upgrade requested quiesce for the wrong operation");
+            }
+            worker.postMessage({
+              type: "upgrade-quiesce-complete",
+              operationId,
+            });
+            return;
+          }
+          decodeResponse(value, operationId, decodeUpgrade);
+          finish(resolve);
+        } catch (error) {
+          finish(reject, error);
+        }
+      });
+      worker.on("messageerror", () => finish(
+        reject,
+        new Error("Bundled upgrade worker emitted an unreadable message"),
+      ));
+      worker.on("error", (error) => finish(reject, error));
+      worker.on("exit", (code) => {
+        if (!settled) finish(reject, new Error(`Bundled upgrade worker exited with code ${code}`));
+      });
+      worker.postMessage({ id: operationId, type: "upgrade-apply" });
+    });
+
+    const database = new DatabaseSync(fixture.eventsPath, { readOnly: true });
+    try {
+      const versions = database.prepare(
+        "SELECT version FROM schema_migrations ORDER BY version",
+      ).all().map((row) => Number(row.version));
+      if (JSON.stringify(versions) !== "[1,2]") {
+        throw new Error(`Bundled upgrade recorded unexpected migrations ${JSON.stringify(versions)}`);
+      }
+    } finally {
+      database.close();
+    }
+    const manifest = JSON.parse(readFileSync(fixture.manifestPath, "utf8"));
+    if (manifest.lastIntegrity?.status !== "passed") {
+      throw new Error("Bundled upgrade did not publish the integrity manifest");
+    }
+  } finally {
+    await worker.terminate().catch(() => undefined);
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
 }
 
 async function main() {
@@ -187,7 +420,11 @@ async function main() {
     if (!exited) await worker.terminate();
   }
 
-  process.stdout.write(`Worker artifact OK: Node ${ping.nodeVersion}, SQLite ${ping.sqliteVersion}\n`);
+  await smokeBundledUpgrade();
+
+  process.stdout.write(
+    `Worker artifacts OK: Node ${ping.nodeVersion}, SQLite ${ping.sqliteVersion}, bundled upgrade phases passed\n`,
+  );
 }
 
 main().catch((error) => {

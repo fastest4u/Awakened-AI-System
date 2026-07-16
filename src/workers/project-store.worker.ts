@@ -123,6 +123,7 @@ const parent = parentPort;
 
 const role = config(workerData);
 const selfUrl = new URL(import.meta.url);
+const upgradePhaseWorkerUrl = new URL("./project-store-upgrade-phase.worker.js", import.meta.url);
 
 if (role.role === "upgrade") {
   const context = decodeWorkerBinding(role.binding);
@@ -210,6 +211,7 @@ if (role.role === "upgrade") {
     activeOperationId = command.id;
     activeService = new ProjectStoreUpgradeService({
       executorRegistry: registry,
+      upgradePhaseWorkerUrl,
       ...(role.trustedTtlMs === undefined ? {} : { trustedTtlMs: role.trustedTtlMs }),
     });
     void activeService.apply(context).then((result) => {
