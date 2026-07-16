@@ -33,7 +33,10 @@ import { ProjectStoreRouter } from "../src/orchestrator/identity/project-store.r
 import { StoreManifestRepository } from "../src/orchestrator/identity/store-manifest.repository.js";
 import { EventIntegrityService } from "../src/orchestrator/integrity/event-integrity.service.js";
 import { LifecycleIntegrityService } from "../src/orchestrator/integrity/lifecycle-integrity.service.js";
-import type { IntegrityIssueCode } from "../src/orchestrator/integrity/integrity.types.js";
+import type {
+  IntegrityIssueCode,
+  IntegrityReport,
+} from "../src/orchestrator/integrity/integrity.types.js";
 import { ProjectStoreUpgradeProbe } from "../src/orchestrator/runtime/project-store-upgrade-probe.js";
 import { ProjectStoreUpgradeExecutor } from "../src/orchestrator/runtime/project-store-upgrade-executor.js";
 import {
@@ -51,6 +54,7 @@ import {
 } from "../src/orchestrator/storage/project-store-upgrade.service.js";
 import {
   MaintenanceFence,
+  MaintenanceFenceError,
   type MaintenanceLease,
 } from "../src/orchestrator/storage/maintenance-fence.js";
 import { MigrationRunner } from "../src/orchestrator/storage/migration-runner.js";
@@ -65,6 +69,8 @@ import type {
   SqliteOpenOptions,
 } from "../src/orchestrator/storage/sqlite-driver.js";
 import { canonicalJson } from "../src/orchestrator/serialization/canonical-json.js";
+import type { RootStartCommandV2 } from "../src/orchestrator/lifecycle/contracts/commands.js";
+import { buildLifecycleIntentWitness } from "../src/orchestrator/lifecycle/lifecycle-intent-witness.js";
 import type { LifecycleEventV1 } from "../src/orchestrator/lifecycle/contracts/events.js";
 import type { SessionId } from "../src/orchestrator/lifecycle/contracts/identifiers.js";
 import {
@@ -174,10 +180,9 @@ function createV1Store(): Fixture {
     `);
   });
   connection.close();
-  const binding: ProjectBinding = {
+  const bindingMaterial: Omit<ProjectBinding, "contextFingerprint"> = {
     projectBindingId: "upgrade-binding",
     generation: 1,
-    contextFingerprint: "f".repeat(64),
     source: "explicit-cli",
     projectId: PROJECT_ID,
     vaultId: VAULT_ID,
@@ -192,6 +197,10 @@ function createV1Store(): Fixture {
     storeRoute: route,
     workspace,
     establishedAt: NOW,
+  };
+  const binding: ProjectBinding = {
+    ...bindingMaterial,
+    contextFingerprint: computeProjectContextFingerprint(bindingMaterial),
   };
   return {
     root,
@@ -250,6 +259,61 @@ function construct<T>(constructor: unknown, ...args: unknown[]): T {
   );
 }
 
+interface Deferred<T> {
+  readonly promise: Promise<T>;
+  resolve(value: T): void;
+  reject(error: unknown): void;
+}
+
+function deferred<T>(): Deferred<T> {
+  let resolve!: (value: T) => void;
+  let reject!: (error: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
+class ManualLeaseScheduler {
+  readonly #scheduled = new Map<object, () => void>();
+
+  setTimeout = (callback: () => void, _milliseconds: number): object => {
+    const handle = {};
+    this.#scheduled.set(handle, callback);
+    return handle;
+  };
+
+  clearTimeout = (handle: object): void => {
+    this.#scheduled.delete(handle);
+  };
+
+  runNext(): void {
+    const next = this.#scheduled.entries().next().value as
+      | readonly [object, () => void]
+      | undefined;
+    assert.notEqual(next, undefined, "expected one scheduled lease heartbeat");
+    this.#scheduled.delete(next![0]);
+    next![1]();
+  }
+}
+
+function currentFullIntegrity(fixture: Fixture): IntegrityReport {
+  const connection = driver.open(fixture.path, {
+    mode: "read-only-existing",
+    busyTimeoutMs: DEFAULT_BUSY_TIMEOUT_MS,
+  });
+  try {
+    return new EventIntegrityService(
+      connection,
+      PROJECT_STORE_MIGRATIONS,
+      [new LifecycleIntegrityService(connection)],
+    ).fullCheck(fixture.context);
+  } finally {
+    connection.close();
+  }
+}
+
 function lifecycleIssueCodes(
   connection: SqliteConnection,
   context: ProjectContext,
@@ -263,6 +327,38 @@ function lifecycleIssueCodes(
   return codes;
 }
 
+function rootStartIntent(values: {
+  commandId: string;
+  idempotencyKey: string;
+  targetSessionId: string;
+  workspaceId: string;
+  continuityKey: string;
+}): { source: string; intentHash: string } {
+  return buildLifecycleIntentWitness({
+    commandType: "root-start",
+    commandId: values.commandId,
+    idempotencyKey: values.idempotencyKey,
+    agentId: "fold-agent",
+    expectedProjectId: PROJECT_ID,
+    expectedVaultId: VAULT_ID,
+    expectedWorkspaceId: values.workspaceId,
+    expectedBranchRef: null,
+    continuityKey: values.continuityKey,
+    resumePolicy: "new",
+  } as RootStartCommandV2, {
+    authorizationKind: "initial-authority",
+    authorizationSessionId: null,
+    targetSessionId: values.targetSessionId,
+    presentingActorRole: "primary",
+    presentingClientInstanceId: "presenting-client",
+    targetActorRole: "primary",
+    targetClientInstanceId: "target-client",
+    internalWorkflowId: null,
+    internalWorkflowGeneration: null,
+    internalPlannedWorkId: null,
+  });
+}
+
 function insertLifecycleAuthorizationCommand(
   connection: SqliteConnection,
   values: {
@@ -271,6 +367,8 @@ function insertLifecycleAuthorizationCommand(
     commandType: "root-start" | "abandon-session" | "internal-workflow-phase";
     kind: "initial-authority" | "protected" | "internal-workflow";
     witnessAlreadyPresent?: boolean;
+    witnessJson?: string;
+    commandHash?: string;
   },
 ): void {
   const protectedCommand = values.kind === "protected";
@@ -279,8 +377,15 @@ function insertLifecycleAuthorizationCommand(
     const position = Number(connection.prepare(`
       SELECT coalesce(max(global_position), 0) + 1 AS position FROM events
     `).get()?.position);
-    const sessionId = `upgrade-intent-${position}`;
+    const sessionId = `${position.toString(16).padStart(8, "0")}-0000-4000-8000-${position.toString(16).padStart(12, "0")}`;
     const streamId = `session/${sessionId}`;
+    const witness = values.witnessJson ?? rootStartIntent({
+      commandId: sessionId,
+      idempotencyKey: `upgrade-fixture-${position}`,
+      targetSessionId: sessionId,
+      workspaceId: "e".repeat(64),
+      continuityKey: `upgrade-fixture-${position}`,
+    }).source;
     connection.prepare(`
       INSERT INTO streams(
         project_id, stream_id, stream_type, current_version, created_at, updated_at
@@ -319,10 +424,7 @@ function insertLifecycleAuthorizationCommand(
       $now: NOW,
       $hash: "a".repeat(64),
       $genesis: "0".repeat(64),
-      $lifecycleIntentJson: canonicalJson({
-        intentMaterialVersion: 1,
-        material: { commandId: values.commandId, commandType: values.commandType },
-      }),
+      $lifecycleIntentJson: witness,
     });
   }
   connection.prepare(`
@@ -351,7 +453,7 @@ function insertLifecycleAuthorizationCommand(
     $idempotencyKey: values.idempotencyKey,
     $commandId: values.commandId,
     $commandType: values.commandType,
-    $hash: "a".repeat(64),
+    $hash: values.commandHash ?? "a".repeat(64),
     $now: NOW,
     $kind: values.kind,
     $proofVersion: protectedCommand ? 1 : null,
@@ -379,6 +481,13 @@ function seedFoldableRootAuthority(
   const commandId = "99999999-9999-4999-8999-999999999999";
   const workspaceId = "e".repeat(64) as WorkspaceId;
   const authorityCommitment = "a".repeat(64);
+  const intent = rootStartIntent({
+    commandId,
+    idempotencyKey: "upgrade-test/root-start",
+    targetSessionId: sessionId,
+    workspaceId,
+    continuityKey: "fold-continuity",
+  });
   const foldContext: ProjectContext = {
     ...context,
     binding: { ...context.binding, workspaceId },
@@ -432,10 +541,7 @@ function seedFoldableRootAuthority(
     $correlationId: FOLD_CORRELATION_ID,
     $now: NOW,
     $payloadJson: canonicalJson(payload),
-    $lifecycleIntentJson: canonicalJson({
-      intentMaterialVersion: 1,
-      material: { commandId, commandType: "root-start", continuityKey: "fold-continuity" },
-    }),
+    $lifecycleIntentJson: intent.source,
     $hash: "b".repeat(64),
     $genesis: "0".repeat(64),
   });
@@ -445,6 +551,8 @@ function seedFoldableRootAuthority(
     commandType: "root-start",
     kind: "initial-authority",
     witnessAlreadyPresent: true,
+    witnessJson: intent.source,
+    commandHash: intent.intentHash,
   });
   connection.prepare(`
     INSERT INTO session_authority(
@@ -998,6 +1106,210 @@ describe("explicit project-store upgrade", () => {
     )));
   });
 
+  it("keeps the lease live while post-commit integrity spans its original TTL", async () => {
+    const fixture = createV1Store();
+    const fence = new MaintenanceFence();
+    const scheduler = new ManualLeaseScheduler();
+    const integrityStarted = deferred<void>();
+    const releaseIntegrity = deferred<void>();
+    let clockMs = Date.parse(NOW);
+    let report!: IntegrityReport;
+    const service = construct<ProjectStoreUpgradeService>(ProjectStoreUpgradeService, {
+      sqliteDriver: driver,
+      maintenanceFence: fence,
+      now: () => new Date(clockMs).toISOString(),
+      randomId: () => "heartbeat-integrity-owner",
+      trustedTtlMs: 1_000,
+      leaseHeartbeatMs: 250,
+      leaseScheduler: scheduler,
+      postCommitIntegrityRunner: {
+        run(): Promise<IntegrityReport> {
+          report = currentFullIntegrity(fixture);
+          integrityStarted.resolve(undefined);
+          return releaseIntegrity.promise.then(() => report);
+        },
+      },
+      manifestRecorder: { record() { /* publication is not held in this case */ } },
+    });
+
+    const applying = service.apply(fixture.context);
+    await Promise.race([
+      integrityStarted.promise,
+      applying.then(() => { throw new Error("POSTCOMMIT_INTEGRITY_RUNNER_NOT_USED"); }),
+    ]);
+    const phaseStartExpiry = Date.parse(String(openExisting(fixture).prepare(`
+      SELECT lease_expires_at FROM maintenance_state WHERE singleton = 1
+    `).get()?.lease_expires_at));
+    while (clockMs <= phaseStartExpiry + 250) {
+      clockMs += 250;
+      scheduler.runNext();
+    }
+
+    const contender = openExisting(fixture);
+    assert.throws(
+      () => transaction(contender, () => fence.acquire(
+        contender,
+        "heartbeat-integrity-contender",
+        new Date(clockMs + 1_000).toISOString(),
+        new Date(clockMs).toISOString(),
+      )),
+      (error: unknown) => error instanceof Error
+        && "code" in error
+        && (error as Error & { code: unknown }).code === "MAINTENANCE_ALREADY_ACTIVE",
+    );
+
+    releaseIntegrity.resolve(undefined);
+    const result = await applying;
+    assert.equal(result.integrity.ok, true);
+    assert.equal(
+      openExisting(fixture).prepare(`
+        SELECT mode FROM maintenance_state WHERE singleton = 1
+      `).get()?.mode,
+      "idle",
+    );
+  });
+
+  it("keeps the lease live while asynchronous manifest publication spans its original TTL", async () => {
+    const fixture = createV1Store();
+    const fence = new MaintenanceFence();
+    const scheduler = new ManualLeaseScheduler();
+    const manifestStarted = deferred<void>();
+    const releaseManifest = deferred<void>();
+    let clockMs = Date.parse(NOW);
+    let publications = 0;
+    const service = construct<ProjectStoreUpgradeService>(ProjectStoreUpgradeService, {
+      sqliteDriver: driver,
+      maintenanceFence: fence,
+      now: () => new Date(clockMs).toISOString(),
+      randomId: () => "heartbeat-manifest-owner",
+      trustedTtlMs: 1_000,
+      leaseHeartbeatMs: 250,
+      leaseScheduler: scheduler,
+      postCommitIntegrityRunner: {
+        async run(): Promise<IntegrityReport> {
+          return currentFullIntegrity(fixture);
+        },
+      },
+      manifestRecorder: {
+        record(): Promise<void> {
+          manifestStarted.resolve(undefined);
+          return releaseManifest.promise.then(() => { publications += 1; });
+        },
+      },
+    });
+
+    const applying = service.apply(fixture.context);
+    await Promise.race([
+      manifestStarted.promise,
+      applying.then(() => { throw new Error("ASYNC_MANIFEST_RECORDER_NOT_AWAITED"); }),
+    ]);
+    const phaseStartExpiry = Date.parse(String(openExisting(fixture).prepare(`
+      SELECT lease_expires_at FROM maintenance_state WHERE singleton = 1
+    `).get()?.lease_expires_at));
+    while (clockMs <= phaseStartExpiry + 250) {
+      clockMs += 250;
+      scheduler.runNext();
+    }
+
+    const contender = openExisting(fixture);
+    assert.throws(
+      () => transaction(contender, () => fence.acquire(
+        contender,
+        "heartbeat-manifest-contender",
+        new Date(clockMs + 1_000).toISOString(),
+        new Date(clockMs).toISOString(),
+      )),
+      (error: unknown) => error instanceof Error
+        && "code" in error
+        && (error as Error & { code: unknown }).code === "MAINTENANCE_ALREADY_ACTIVE",
+    );
+
+    releaseManifest.resolve(undefined);
+    const result = await applying;
+    assert.equal(result.integrity.ok, true);
+    assert.equal(publications, 1);
+    assert.equal(
+      openExisting(fixture).prepare(`
+        SELECT mode FROM maintenance_state WHERE singleton = 1
+      `).get()?.mode,
+      "idle",
+    );
+  });
+
+  it("aborts a guarded phase on renewal loss without publishing or releasing", async () => {
+    const fixture = createV1Store();
+    let loseRenewal = false;
+    const fence = new class extends MaintenanceFence {
+      override renewOwner(
+        connection: SqliteConnection,
+        lease: MaintenanceLease,
+        now: string,
+        trustedTtlMs: number,
+      ): MaintenanceLease {
+        if (loseRenewal) throw new MaintenanceFenceError("MAINTENANCE_LEASE_STALE");
+        return super.renewOwner(connection, lease, now, trustedTtlMs);
+      }
+    }();
+    const scheduler = new ManualLeaseScheduler();
+    const integrityStarted = deferred<void>();
+    const releaseIntegrity = deferred<void>();
+    let phaseSignal!: AbortSignal;
+    let manifestCalls = 0;
+    const service = construct<ProjectStoreUpgradeService>(ProjectStoreUpgradeService, {
+      sqliteDriver: driver,
+      maintenanceFence: fence,
+      now: () => NOW,
+      randomId: () => "lost-heartbeat-owner",
+      trustedTtlMs: 1_000,
+      leaseHeartbeatMs: 250,
+      leaseScheduler: scheduler,
+      postCommitIntegrityRunner: {
+        run(_context: ProjectContext, signal: AbortSignal): Promise<IntegrityReport> {
+          phaseSignal = signal;
+          integrityStarted.resolve(undefined);
+          return releaseIntegrity.promise.then(() => currentFullIntegrity(fixture));
+        },
+      },
+      manifestRecorder: {
+        record(): void { manifestCalls += 1; },
+      },
+    });
+
+    const applying = service.apply(fixture.context);
+    await Promise.race([
+      integrityStarted.promise,
+      applying.then(() => { throw new Error("POSTCOMMIT_INTEGRITY_RUNNER_NOT_USED"); }),
+    ]);
+    loseRenewal = true;
+    scheduler.runNext();
+
+    await assert.rejects(
+      applying,
+      (error: unknown) => error instanceof Error
+        && "code" in error
+        && (error as Error & { code: unknown }).code === "MAINTENANCE_LEASE_STALE",
+    );
+    assert.equal(phaseSignal.aborted, true);
+    assert.equal(manifestCalls, 0);
+    assert.equal(
+      openExisting(fixture).prepare(`
+        SELECT mode FROM maintenance_state WHERE singleton = 1
+      `).get()?.mode,
+      "quiescing",
+    );
+
+    releaseIntegrity.resolve(undefined);
+    await Promise.resolve();
+    await Promise.resolve();
+    assert.equal(manifestCalls, 0);
+    assert.equal(
+      openExisting(fixture).prepare(`
+        SELECT mode FROM maintenance_state WHERE singleton = 1
+      `).get()?.mode,
+      "quiescing",
+    );
+  });
+
   it("renews the same owner monotonically and requires physical closure readiness", () => {
     const fixture = createV1Store();
     const connection = openExisting(fixture);
@@ -1067,7 +1379,7 @@ describe("explicit project-store upgrade", () => {
     const result = await service.apply(fixture.context);
 
     assert.deepEqual(result.appliedVersions, [2]);
-    assert.equal(fence.renewals.length, 9);
+    assert.ok(fence.renewals.length >= 9);
     assert.equal(fence.readinessLeases.length, fence.renewals.length);
     for (let index = 0; index < fence.renewals.length; index += 1) {
       const renewal = fence.renewals[index]!;

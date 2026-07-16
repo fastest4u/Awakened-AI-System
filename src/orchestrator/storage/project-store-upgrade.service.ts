@@ -4,9 +4,9 @@ import { resolve } from "node:path";
 import type { ProjectContext } from "../identity/contracts.js";
 import { StoreManifestRepository } from "../identity/store-manifest.repository.js";
 import { EventIntegrityService } from "../integrity/event-integrity.service.js";
-import { LifecycleIntegrityService } from "../integrity/lifecycle-integrity.service.js";
 import type { IntegrityReport } from "../integrity/integrity.types.js";
 import type { MaintenanceClosureConfirmation } from "../runtime/project-store-executor.js";
+import { ProjectStoreUpgradePhaseRunner } from "../runtime/project-store-upgrade-phase-runner.js";
 import { DEFAULT_BUSY_TIMEOUT_MS } from "../runtime/runtime-capabilities.js";
 import { MaintenanceFence, type MaintenanceLease } from "./maintenance-fence.js";
 import { MigrationRunner } from "./migration-runner.js";
@@ -53,7 +53,20 @@ export interface UpgradeExecutorRegistry {
 }
 
 export interface UpgradeIntegrityManifestRecorder {
-  record(context: ProjectContext, report: IntegrityReport): void | Promise<void>;
+  record(
+    context: ProjectContext,
+    report: IntegrityReport,
+    signal?: AbortSignal,
+  ): void | Promise<void>;
+}
+
+export interface UpgradePostCommitIntegrityRunner {
+  run(context: ProjectContext, signal: AbortSignal): Promise<IntegrityReport>;
+}
+
+export interface UpgradeLeaseScheduler {
+  setTimeout(callback: () => void, milliseconds: number): object;
+  clearTimeout(handle: object): void;
 }
 
 export interface ProjectStoreUpgradeServiceDependencies {
@@ -63,9 +76,12 @@ export interface ProjectStoreUpgradeServiceDependencies {
   executorRegistry?: UpgradeExecutorRegistry;
   manifestRepository?: StoreManifestRepository;
   manifestRecorder?: UpgradeIntegrityManifestRecorder;
+  postCommitIntegrityRunner?: UpgradePostCommitIntegrityRunner;
   now?: () => string;
   randomId?: () => string;
   trustedTtlMs?: number;
+  leaseHeartbeatMs?: number;
+  leaseScheduler?: UpgradeLeaseScheduler;
   acquireRetryMs?: number;
   maximumAcquireAttempts?: number;
   sleep?: (milliseconds: number) => Promise<void>;
@@ -181,9 +197,12 @@ export class ProjectStoreUpgradeService {
   readonly #migrationRunner: MigrationRunner;
   readonly #registry: UpgradeExecutorRegistry;
   readonly #manifestRecorder: UpgradeIntegrityManifestRecorder;
+  readonly #postCommitIntegrityRunner: UpgradePostCommitIntegrityRunner;
   readonly #now: () => string;
   readonly #randomId: () => string;
   readonly #trustedTtlMs: number;
+  readonly #leaseHeartbeatMs: number;
+  readonly #leaseScheduler: UpgradeLeaseScheduler;
   readonly #acquireRetryMs: number;
   readonly #maximumAcquireAttempts: number;
   readonly #sleep: (milliseconds: number) => Promise<void>;
@@ -197,21 +216,32 @@ export class ProjectStoreUpgradeService {
     this.#fence = dependencies.maintenanceFence ?? new MaintenanceFence();
     this.#migrationRunner = dependencies.migrationRunner ?? new MigrationRunner();
     this.#registry = dependencies.executorRegistry ?? NO_EXECUTORS;
-    const manifestRepository = dependencies.manifestRepository ?? new StoreManifestRepository({
-      now: dependencies.now ?? (() => new Date().toISOString()),
-    });
-    this.#manifestRecorder = dependencies.manifestRecorder ?? {
-      record(context, report) {
-        manifestRepository.recordIntegrity(context.binding.storeRoute, {
-          projectId: context.binding.projectId,
-          vaultId: context.binding.vaultId,
-          storeId: context.binding.storeId,
-        }, {
-          ok: report.ok,
-          schemaFingerprint: report.schemaFingerprint,
-          terminalEventHash: report.terminalEventHash,
-        });
-      },
+    const phaseRunner = new ProjectStoreUpgradePhaseRunner();
+    const manifestRepository = dependencies.manifestRepository;
+    this.#manifestRecorder = dependencies.manifestRecorder
+      ?? (manifestRepository === undefined
+        ? {
+            record: (context, report, signal) => phaseRunner.recordManifest(
+              context,
+              report,
+              signal ?? new AbortController().signal,
+            ),
+          }
+        : {
+            record(context, report) {
+              manifestRepository.recordIntegrity(context.binding.storeRoute, {
+                projectId: context.binding.projectId,
+                vaultId: context.binding.vaultId,
+                storeId: context.binding.storeId,
+              }, {
+                ok: report.ok,
+                schemaFingerprint: report.schemaFingerprint,
+                terminalEventHash: report.terminalEventHash,
+              });
+            },
+          });
+    this.#postCommitIntegrityRunner = dependencies.postCommitIntegrityRunner ?? {
+      run: (context, signal) => phaseRunner.fullIntegrity(context, signal),
     };
     this.#now = dependencies.now ?? (() => new Date().toISOString());
     this.#randomId = dependencies.randomId ?? randomUUID;
@@ -219,12 +249,21 @@ export class ProjectStoreUpgradeService {
       dependencies.trustedTtlMs ?? 60_000,
       "MAINTENANCE_LEASE_INVALID",
     );
+    this.#leaseHeartbeatMs = positiveInteger(
+      dependencies.leaseHeartbeatMs ?? Math.max(1, Math.floor(this.#trustedTtlMs / 3)),
+      "MAINTENANCE_LEASE_INVALID",
+    );
+    if (this.#leaseHeartbeatMs >= this.#trustedTtlMs) fail("MAINTENANCE_LEASE_INVALID");
+    this.#leaseScheduler = dependencies.leaseScheduler ?? {
+      setTimeout: (callback, milliseconds) => setTimeout(callback, milliseconds),
+      clearTimeout: (handle) => clearTimeout(handle as NodeJS.Timeout),
+    };
     this.#acquireRetryMs = positiveInteger(
       dependencies.acquireRetryMs ?? 5,
       "MAINTENANCE_LEASE_INVALID",
     );
     this.#maximumAcquireAttempts = positiveInteger(
-      dependencies.maximumAcquireAttempts ?? 400,
+      dependencies.maximumAcquireAttempts ?? 2_000,
       "MAINTENANCE_LEASE_INVALID",
     );
     this.#sleep = dependencies.sleep ?? defaultSleep;
@@ -319,16 +358,18 @@ export class ProjectStoreUpgradeService {
       active.lease = this.renewReady(active);
       const currentPlan = this.inspectConnection(connection, context);
       if (currentPlan.status !== "current") fail("SCHEMA_UPGRADE_REQUIRED");
-      const integrity = new EventIntegrityService(
-        connection,
-        PROJECT_STORE_MIGRATIONS,
-        [new LifecycleIntegrityService(connection)],
-      ).fullCheck(context);
+      const integrity = await this.guardedPhase(
+        active,
+        (signal) => this.#postCommitIntegrityRunner.run(context, signal),
+      );
       if (!integrity.ok) fail("POST_UPGRADE_INTEGRITY_FAILED", { issues: integrity.issues });
       this.#faults.hit("after-full-integrity-before-manifest-record");
 
       active.lease = this.renewReady(active);
-      await this.#manifestRecorder.record(context, integrity);
+      await this.guardedPhase(
+        active,
+        async (signal) => this.#manifestRecorder.record(context, integrity, signal),
+      );
       this.#faults.hit("after-manifest-record-before-fence-release");
 
       transaction(connection, () => {
@@ -419,6 +460,47 @@ export class ProjectStoreUpgradeService {
       this.#fence.assertReady(active.connection, renewed, this.#now());
       return renewed;
     });
+  }
+
+  private async guardedPhase<T>(
+    active: ActiveOwner,
+    operation: (signal: AbortSignal) => Promise<T>,
+  ): Promise<T> {
+    const controller = new AbortController();
+    let timer: object | undefined;
+    let stopped = false;
+    let rejectHeartbeat!: (error: unknown) => void;
+    const heartbeatFailure = new Promise<never>((_resolve, reject) => {
+      rejectHeartbeat = reject;
+    });
+    const stop = (): void => {
+      if (stopped) return;
+      stopped = true;
+      if (timer !== undefined) this.#leaseScheduler.clearTimeout(timer);
+      timer = undefined;
+    };
+    const schedule = (): void => {
+      timer = this.#leaseScheduler.setTimeout(() => {
+        timer = undefined;
+        if (stopped) return;
+        try {
+          active.lease = this.renewReady(active);
+          schedule();
+        } catch (error) {
+          stop();
+          controller.abort(error);
+          rejectHeartbeat(error);
+        }
+      }, this.#leaseHeartbeatMs);
+    };
+    schedule();
+    const phase = Promise.resolve().then(() => operation(controller.signal));
+    void phase.catch(() => undefined);
+    try {
+      return await Promise.race([phase, heartbeatFailure]);
+    } finally {
+      stop();
+    }
   }
 
   private inspectConnection(
