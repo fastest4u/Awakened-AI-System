@@ -3,9 +3,12 @@ import { createHash } from "node:crypto";
 import { describe, it } from "node:test";
 import type {
   AppendCommand,
+  DeepReadonlyJson,
   JsonValue,
   LifecycleReplayExpectation,
   PersistedLifecycleAuthorizationRecord,
+  ReadonlyJsonValue,
+  StoredEvent,
 } from "../src/orchestrator/contracts/event.js";
 import type {
   EventAppendBatch,
@@ -171,7 +174,7 @@ class FakeEvents implements LifecycleEventAppendPort {
         firstGlobalPosition: "2",
         lastGlobalPosition: "2",
         finalStreamVersion: "2",
-        response: { eventPosition: "2" } as unknown as T,
+        response: { eventPosition: "2" } as unknown as DeepReadonlyJson<T>,
       },
       responseHash: "2".repeat(64),
     };
@@ -198,8 +201,8 @@ class FakeEvents implements LifecycleEventAppendPort {
       firstGlobalPosition: BigInt(batch.storedResponse.firstGlobalPosition),
       lastGlobalPosition: BigInt(batch.storedResponse.lastGlobalPosition),
       finalStreamVersion: BigInt(batch.storedResponse.finalStreamVersion),
-      eventIds: batch.storedResponse.eventIds,
-      response: batch.storedResponse.response,
+      eventIds: [...batch.storedResponse.eventIds],
+      response: batch.storedResponse.response as unknown as T,
       responseHash: batch.responseHash,
       authorizationRecord: authorization(),
     };
@@ -218,6 +221,87 @@ class DriftedCommitEvents extends FakeEvents {
         finalStreamVersion: "3",
       },
     };
+  }
+}
+
+function nestedStoredEvent(): StoredEvent {
+  return {
+    globalPosition: 2n,
+    eventId: "00000000-0000-4000-8000-000000000200",
+    projectId: CONTEXT.binding.projectId,
+    vaultId: CONTEXT.binding.vaultId,
+    storeId: CONTEXT.binding.storeId,
+    workspaceId: CONTEXT.binding.workspaceId,
+    branchScopeId: null,
+    branchRef: null,
+    streamId: "session/00000000-0000-4000-8000-000000000010",
+    streamType: "session",
+    streamVersion: 2n,
+    eventType: "NestedRecorded",
+    eventSchemaVersion: 1,
+    sessionId: "00000000-0000-4000-8000-000000000010",
+    parentSessionId: null,
+    actorRole: "primary",
+    agentId: "agent",
+    clientInstanceId: "primary-a",
+    correlationId: "correlation",
+    causationId: null,
+    commandId: "00000000-0000-4000-8000-000000000100",
+    idempotencyKey: "lifecycle:test:100",
+    commandEventIndex: 0,
+    occurredAt: NOW,
+    recordedAt: NOW,
+    visibilityScope: "session",
+    confidence: "high",
+    verificationStatus: "verified",
+    sourceRefs: ["source-a"],
+    evidenceRefs: [],
+    evidenceDigests: [],
+    payload: { nested: { accepted: true } },
+    payloadJson: '{"nested":{"accepted":true}}',
+    payloadHash: "3".repeat(64),
+    previousGlobalHash: "4".repeat(64),
+    eventHash: "5".repeat(64),
+    lifecycleIntentJson: null,
+  };
+}
+
+class MutableNestedBatchEvents extends FakeEvents {
+  override planPrepared<T extends JsonValue>(
+    _prepared: PreparedEventAppend<T>,
+  ): PlannedEventAppend<T> {
+    this.calls.push("plan");
+    return {
+      plannedOnly: true,
+      events: [nestedStoredEvent()],
+      storedResponse: {
+        eventIds: ["00000000-0000-4000-8000-000000000200"],
+        firstGlobalPosition: "2",
+        lastGlobalPosition: "2",
+        finalStreamVersion: "2",
+        response: { nested: { eventPosition: "2" } } as unknown as DeepReadonlyJson<T>,
+      },
+      responseHash: "2".repeat(64),
+    };
+  }
+}
+
+class ExternallyMutableCommitEvents extends MutableNestedBatchEvents {
+  committed: EventAppendBatch<JsonValue> | undefined;
+
+  override appendPlanned<T extends JsonValue>(
+    planned: PlannedEventAppend<T>,
+  ): EventAppendBatch<T> {
+    const committed = super.appendPlanned(planned);
+    this.committed = committed as EventAppendBatch<JsonValue>;
+    return committed;
+  }
+
+  corruptCommittedResponse(): void {
+    const response = this.committed?.storedResponse.response as {
+      nested: { eventPosition: string };
+    };
+    response.nested.eventPosition = "corrupt-after-hook-entry";
   }
 }
 
@@ -414,6 +498,103 @@ describe("LifecycleCommandStore", () => {
     assert.deepEqual(connection.committed, []);
   });
 
+  it("rejects a beforeAppend mutation of the planned nested response snapshot", () => {
+    const connection = new TransactionConnection();
+    const events = new FakeEvents(connection);
+    const store = new LifecycleCommandStore({
+      connection,
+      events,
+      transaction: () => transaction(connection),
+      now: () => NOW,
+    });
+
+    assert.throws(
+      () => store.execute(envelope(), () => ({
+        append: appendCommand(),
+        authorizationRecord: authorization(),
+        beforeAppend: (planned) => {
+          (planned.storedResponse.response as { eventPosition: string }).eventPosition = "999";
+        },
+        afterAppend: () => undefined,
+      })),
+    );
+    assert.deepEqual(connection.statements, ["BEGIN IMMEDIATE", "ROLLBACK"]);
+    assert.deepEqual(connection.committed, []);
+    assert.doesNotMatch(events.calls.join(","), /dedup/);
+  });
+
+  const hookMutations: ReadonlyArray<readonly [
+    name: string,
+    mutate: (batch: EventAppendBatch<JsonValue>) => void,
+  ]> = [
+    ["event identity", (batch) => {
+      (batch.events[0] as { globalPosition: bigint; eventHash: string }).globalPosition = 99n;
+      (batch.events[0] as { eventHash: string }).eventHash = "9".repeat(64);
+    }],
+    ["nested payload", (batch) => {
+      const payload = batch.events[0]!.payload as { nested: { accepted: boolean } };
+      payload.nested.accepted = false;
+    }],
+    ["nested response", (batch) => {
+      const response = batch.storedResponse.response as { nested: { eventPosition: string } };
+      response.nested.eventPosition = "999";
+    }],
+  ];
+
+  for (const [name, mutate] of hookMutations) {
+    for (const hook of ["beforeAppend", "afterAppend"] as const) {
+      it(`fails closed when ${hook} casts mutate ${name}`, () => {
+        const connection = new TransactionConnection();
+        const events = new MutableNestedBatchEvents(connection);
+        const store = new LifecycleCommandStore({
+          connection,
+          events,
+          transaction: () => transaction(connection),
+          now: () => NOW,
+        });
+        const beforeAppend = hook === "beforeAppend"
+          ? (planned: PlannedEventAppend<JsonValue>) => mutate(planned)
+          : undefined;
+        const afterAppend = hook === "afterAppend"
+          ? (committed: EventAppendBatch<JsonValue>) => mutate(committed)
+          : () => undefined;
+
+        assert.throws(() => store.execute(envelope(), () => ({
+          append: appendCommand(),
+          authorizationRecord: authorization(),
+          beforeAppend,
+          afterAppend,
+        })));
+        assert.deepEqual(connection.statements, ["BEGIN IMMEDIATE", "ROLLBACK"]);
+        assert.deepEqual(connection.committed, []);
+        assert.doesNotMatch(events.calls.join(","), /dedup/);
+      });
+    }
+  }
+
+  it("revalidates the trusted committed batch after afterAppend and before dedup", () => {
+    const connection = new TransactionConnection();
+    const events = new ExternallyMutableCommitEvents(connection);
+    const store = new LifecycleCommandStore({
+      connection,
+      events,
+      transaction: () => transaction(connection),
+      now: () => NOW,
+    });
+
+    assert.throws(
+      () => store.execute(envelope(), () => ({
+        append: appendCommand(),
+        authorizationRecord: authorization(),
+        afterAppend: () => events.corruptCommittedResponse(),
+      })),
+      (error: unknown) => error instanceof LifecycleCommandStoreError
+        && error.code === "INTEGRITY_FAILURE",
+    );
+    assert.deepEqual(connection.statements, ["BEGIN IMMEDIATE", "ROLLBACK"]);
+    assert.doesNotMatch(events.calls.join(","), /dedup/);
+  });
+
   it("maps an uncertain commit to the original command identity", () => {
     const connection = new TransactionConnection(true);
     const events = new FakeEvents(connection);
@@ -452,3 +633,45 @@ function compileTimeTransactionBoundary(tx: LifecycleCommandTransaction): void {
 }
 
 void compileTimeTransactionBoundary;
+
+type NestedLifecycleResponse = {
+  nested: { eventPosition: string };
+};
+
+function compileTimeImmutableBatchBoundary(
+  planned: PlannedEventAppend<NestedLifecycleResponse>,
+  committed: EventAppendBatch<NestedLifecycleResponse>,
+): void {
+  // @ts-expect-error planned event identity is immutable
+  planned.events[0]!.eventHash = "9".repeat(64);
+  // @ts-expect-error planned response is deeply immutable
+  planned.storedResponse.response.nested.eventPosition = "999";
+  // @ts-expect-error planned stored response arrays are immutable
+  planned.storedResponse.eventIds.push("00000000-0000-4000-8000-000000000999");
+  // @ts-expect-error committed event identity is immutable
+  committed.events[0]!.globalPosition = 99n;
+  // @ts-expect-error committed response is deeply immutable
+  committed.storedResponse.response.nested.eventPosition = "999";
+  // @ts-expect-error committed stored response arrays are immutable
+  committed.storedResponse.eventIds.push("00000000-0000-4000-8000-000000000999");
+}
+
+function isReadonlyJsonObject(
+  value: ReadonlyJsonValue,
+): value is { readonly [key: string]: ReadonlyJsonValue } {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function compileTimeImmutablePayloadBoundary(event: StoredEvent): void {
+  const payload = event.payload;
+  if (!isReadonlyJsonObject(payload)) return;
+  // @ts-expect-error stored event payload objects are immutable
+  payload.nested = { accepted: false };
+  const nested = payload.nested;
+  if (!isReadonlyJsonObject(nested)) return;
+  // @ts-expect-error stored event nested payload objects are immutable
+  nested.accepted = false;
+}
+
+void compileTimeImmutableBatchBoundary;
+void compileTimeImmutablePayloadBoundary;

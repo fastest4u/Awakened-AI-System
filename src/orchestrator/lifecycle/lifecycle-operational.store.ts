@@ -29,19 +29,40 @@ export type LifecycleOperationalWorkIdentity =
 export interface ConnectionBoundSessionEndWorkflowOperations {}
 export interface ConnectionBoundLifecycleOutboxOperations {}
 
-export interface LifecycleOperationalTransaction {
+export interface LifecycleOperationalRepositorySet {
   readonly workflows: ConnectionBoundSessionEndWorkflowOperations;
   readonly outbox: ConnectionBoundLifecycleOutboxOperations;
 }
 
-export interface LifecycleOperationalResult<T> {
-  readonly work: LifecycleOperationalWorkIdentity;
+export interface WorkflowOperationalTransaction {
+  readonly workflows: ConnectionBoundSessionEndWorkflowOperations;
+}
+
+export interface OutboxOperationalTransaction {
+  readonly outbox: ConnectionBoundLifecycleOutboxOperations;
+}
+
+export type LifecycleOperationalTransaction =
+  | WorkflowOperationalTransaction
+  | OutboxOperationalTransaction;
+
+export type LifecycleOperationalTransactionFor<
+  TWork extends LifecycleOperationalWorkIdentity,
+> = TWork extends WorkflowOperationalWorkIdentity
+  ? WorkflowOperationalTransaction
+  : OutboxOperationalTransaction;
+
+export interface LifecycleOperationalResult<
+  T,
+  TWork extends LifecycleOperationalWorkIdentity = LifecycleOperationalWorkIdentity,
+> {
+  readonly work: TWork;
   readonly publicResult: T;
 }
 
 export interface LifecycleOperationalStoreOptions {
   readonly connection: SqliteConnection;
-  readonly transaction: (connection: SqliteConnection) => LifecycleOperationalTransaction;
+  readonly transaction: (connection: SqliteConnection) => LifecycleOperationalRepositorySet;
   readonly afterCommit?: (work: LifecycleOperationalWorkIdentity) => void;
 }
 
@@ -72,7 +93,7 @@ function assertWork(work: LifecycleOperationalWorkIdentity): void {
 
 export class LifecycleOperationalStore {
   readonly #connection: SqliteConnection;
-  readonly #transaction: (connection: SqliteConnection) => LifecycleOperationalTransaction;
+  readonly #transaction: (connection: SqliteConnection) => LifecycleOperationalRepositorySet;
   readonly #afterCommit: (work: LifecycleOperationalWorkIdentity) => void;
 
   constructor(options: LifecycleOperationalStoreOptions) {
@@ -81,17 +102,21 @@ export class LifecycleOperationalStore {
     this.#afterCommit = options.afterCommit ?? (() => undefined);
   }
 
-  execute<T>(
-    work: LifecycleOperationalWorkIdentity,
-    onCurrent: (transaction: LifecycleOperationalTransaction) => T,
-  ): LifecycleOperationalResult<T> {
+  execute<TWork extends LifecycleOperationalWorkIdentity, T>(
+    work: TWork,
+    onCurrent: (transaction: LifecycleOperationalTransactionFor<TWork>) => T,
+  ): LifecycleOperationalResult<T, TWork> {
     assertWork(work);
     let transactionBegan = false;
     let commitAttempted = false;
     try {
       this.#connection.exec("BEGIN IMMEDIATE");
       transactionBegan = true;
-      const result = onCurrent(this.#transaction(this.#connection));
+      const repositories = this.#transaction(this.#connection);
+      const focused = work.kind === "workflow"
+        ? Object.freeze({ workflows: repositories.workflows })
+        : Object.freeze({ outbox: repositories.outbox });
+      const result = onCurrent(focused as LifecycleOperationalTransactionFor<TWork>);
       commitAttempted = true;
       this.#connection.exec("COMMIT");
       transactionBegan = false;

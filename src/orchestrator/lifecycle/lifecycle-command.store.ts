@@ -169,27 +169,87 @@ function withoutAuthorization<T extends JsonValue>(
   return appendResult;
 }
 
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const prototype = Object.getPrototypeOf(value) as unknown;
+  return prototype === Object.prototype || prototype === null;
+}
+
+function immutableSnapshot<T>(value: T): T {
+  if (Array.isArray(value)) {
+    return Object.freeze(value.map((item) => immutableSnapshot(item))) as T;
+  }
+  if (typeof value !== "object" || value === null) return value;
+  if (!isPlainRecord(value)) throw new LifecycleCommandStoreError("INTEGRITY_FAILURE");
+  const snapshot: Record<string, unknown> = Object.getPrototypeOf(value) === null
+    ? Object.create(null) as Record<string, unknown>
+    : {};
+  for (const key of Object.keys(value)) snapshot[key] = immutableSnapshot(value[key]);
+  return Object.freeze(snapshot) as T;
+}
+
+function integrityJson(value: unknown): JsonValue {
+  if (value === null
+    || typeof value === "string"
+    || typeof value === "boolean") return value;
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) throw new LifecycleCommandStoreError("INTEGRITY_FAILURE");
+    return value;
+  }
+  if (typeof value === "bigint") return value.toString();
+  if (Array.isArray(value)) return value.map((item) => integrityJson(item));
+  if (!isPlainRecord(value)) throw new LifecycleCommandStoreError("INTEGRITY_FAILURE");
+  const normalized: Record<string, JsonValue> = {};
+  for (const key of Object.keys(value)) {
+    const item = value[key];
+    if (item !== undefined) normalized[key] = integrityJson(item);
+  }
+  return normalized;
+}
+
+function batchFingerprint<T extends JsonValue>(batch: EventAppendBatch<T>): string {
+  return canonicalJson(integrityJson({
+    events: batch.events,
+    storedResponse: batch.storedResponse,
+    responseHash: batch.responseHash,
+  }));
+}
+
+function immutableBatchSnapshot<T extends JsonValue>(
+  batch: EventAppendBatch<T>,
+): EventAppendBatch<T> {
+  return immutableSnapshot({
+    events: batch.events,
+    storedResponse: batch.storedResponse,
+    responseHash: batch.responseHash,
+  });
+}
+
+function immutablePlannedSnapshot<T extends JsonValue>(
+  planned: PlannedEventAppend<T>,
+): PlannedEventAppend<T> {
+  return immutableSnapshot({
+    plannedOnly: true as const,
+    events: planned.events,
+    storedResponse: planned.storedResponse,
+    responseHash: planned.responseHash,
+  });
+}
+
+function assertBatchUnchanged<T extends JsonValue>(
+  batch: EventAppendBatch<T>,
+  expectedFingerprint: string,
+): void {
+  if (batchFingerprint(batch) !== expectedFingerprint) {
+    throw new LifecycleCommandStoreError("INTEGRITY_FAILURE");
+  }
+}
+
 function assertCommittedMatchesPlan<T extends JsonValue>(
   planned: PlannedEventAppend<T>,
   committed: EventAppendBatch<T>,
 ): void {
-  const responseMatches = planned.responseHash === committed.responseHash
-    && planned.storedResponse.firstGlobalPosition === committed.storedResponse.firstGlobalPosition
-    && planned.storedResponse.lastGlobalPosition === committed.storedResponse.lastGlobalPosition
-    && planned.storedResponse.finalStreamVersion === committed.storedResponse.finalStreamVersion
-    && canonicalJson(planned.storedResponse.eventIds) === canonicalJson(committed.storedResponse.eventIds)
-    && canonicalJson(planned.storedResponse.response) === canonicalJson(committed.storedResponse.response);
-  const eventsMatch = planned.events.length === committed.events.length
-    && planned.events.every((event, index) => {
-      const inserted = committed.events[index];
-      return inserted !== undefined
-        && event.eventId === inserted.eventId
-        && event.globalPosition === inserted.globalPosition
-        && event.streamVersion === inserted.streamVersion
-        && event.commandEventIndex === inserted.commandEventIndex
-        && event.eventHash === inserted.eventHash;
-    });
-  if (!responseMatches || !eventsMatch) {
+  if (batchFingerprint(planned) !== batchFingerprint(committed)) {
     throw new LifecycleCommandStoreError("INTEGRITY_FAILURE");
   }
 }
@@ -252,10 +312,16 @@ export class LifecycleCommandStore {
         command.authoritativeIntentHash,
       );
       const planned = this.#events.planPrepared(prepared);
-      next.beforeAppend?.(planned, focused);
+      const plannedFingerprint = batchFingerprint(planned);
+      next.beforeAppend?.(immutablePlannedSnapshot(planned), focused);
+      assertBatchUnchanged(planned, plannedFingerprint);
       const committed = this.#events.appendPlanned(planned);
       assertCommittedMatchesPlan(planned, committed);
-      next.afterAppend(committed, focused);
+      const committedFingerprint = batchFingerprint(committed);
+      next.afterAppend(immutableBatchSnapshot(committed), focused);
+      assertBatchUnchanged(planned, plannedFingerprint);
+      assertBatchUnchanged(committed, committedFingerprint);
+      assertCommittedMatchesPlan(planned, committed);
       this.#events.insertDedup(prepared, committed, next.authorizationRecord);
       commitAttempted = true;
       this.#connection.exec("COMMIT");

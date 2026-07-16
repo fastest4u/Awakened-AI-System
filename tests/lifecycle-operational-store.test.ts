@@ -3,7 +3,9 @@ import { describe, it } from "node:test";
 import {
   LifecycleOperationalStore,
   LifecycleOperationalStoreError,
+  type LifecycleOperationalRepositorySet,
   type LifecycleOperationalTransaction,
+  type OutboxOperationalWorkIdentity,
   type WorkflowOperationalWorkIdentity,
 } from "../src/orchestrator/lifecycle/lifecycle-operational.store.js";
 import type {
@@ -50,7 +52,19 @@ function work(): WorkflowOperationalWorkIdentity {
   };
 }
 
-function transaction(connection: OperationalConnection): LifecycleOperationalTransaction {
+function outboxWork(): OutboxOperationalWorkIdentity {
+  return {
+    kind: "outbox",
+    projectId: "00000000-0000-4000-8000-000000000001",
+    targetKey: "memory/session.md",
+    materializationRevision: 4n,
+    operation: "materialize",
+    ownerId: "materializer-a",
+    claimToken: 8n,
+  };
+}
+
+function transaction(connection: OperationalConnection): LifecycleOperationalRepositorySet {
   const stage = (value: string) => connection.stage(value);
   return {
     workflows: { stage },
@@ -63,7 +77,30 @@ function stage(facade: object, effect: string): void {
 }
 
 describe("LifecycleOperationalStore", () => {
-  it("commits focused workflow and outbox CAS work with exactly one boundary", () => {
+  it("projects only the workflow facade for workflow work", () => {
+    const connection = new OperationalConnection();
+    const repositories = new Proxy(transaction(connection), {
+      get(target, property, receiver) {
+        if (property === "outbox") throw new Error("workflow path read outbox repository");
+        return Reflect.get(target, property, receiver) as unknown;
+      },
+    });
+    const store = new LifecycleOperationalStore({
+      connection,
+      transaction: () => repositories,
+    });
+
+    store.execute(work(), (received) => {
+      assert.deepEqual(Object.keys(received), ["workflows"]);
+      assert.equal("outbox" in received, false);
+      stage(received.workflows, "workflow-only");
+      return null;
+    });
+
+    assert.deepEqual(connection.committed, ["workflow-only"]);
+  });
+
+  it("commits focused workflow CAS work with exactly one boundary", () => {
     const connection = new OperationalConnection();
     const tx = transaction(connection);
     const store = new LifecycleOperationalStore({
@@ -72,16 +109,40 @@ describe("LifecycleOperationalStore", () => {
     });
 
     const result = store.execute(work(), (received) => {
-      assert.equal(received, tx);
+      assert.notEqual(received, tx);
+      assert.deepEqual(Object.keys(received), ["workflows"]);
       stage(received.workflows, "workflow-renew");
-      stage(received.outbox, "outbox-cas");
       return { renewed: true };
     });
 
     assert.deepEqual(result.publicResult, { renewed: true });
     assert.deepEqual(result.work, work());
     assert.deepEqual(connection.statements, ["BEGIN IMMEDIATE", "COMMIT"]);
-    assert.deepEqual(connection.committed, ["workflow-renew", "outbox-cas"]);
+    assert.deepEqual(connection.committed, ["workflow-renew"]);
+  });
+
+  it("projects only the outbox facade for materialization work", () => {
+    const connection = new OperationalConnection();
+    const repositories = new Proxy(transaction(connection), {
+      get(target, property, receiver) {
+        if (property === "workflows") throw new Error("outbox path read workflow repository");
+        return Reflect.get(target, property, receiver) as unknown;
+      },
+    });
+    const store = new LifecycleOperationalStore({
+      connection,
+      transaction: () => repositories,
+    });
+
+    const result = store.execute(outboxWork(), (received) => {
+      assert.deepEqual(Object.keys(received), ["outbox"]);
+      assert.equal("workflows" in received, false);
+      stage(received.outbox, "materialize-and-ack");
+      return { materialized: true };
+    });
+
+    assert.deepEqual(result.publicResult, { materialized: true });
+    assert.deepEqual(connection.committed, ["materialize-and-ack"]);
   });
 
   it("rolls back a failed eventless operation without committing staged rows", () => {
@@ -152,3 +213,20 @@ function compileTimeOperationalBoundary(tx: LifecycleOperationalTransaction): vo
 }
 
 void compileTimeOperationalBoundary;
+
+function compileTimeKindSpecificOperationalBoundary(store: LifecycleOperationalStore): void {
+  store.execute(work(), (tx) => {
+    void tx.workflows;
+    // @ts-expect-error workflow work cannot access the outbox facade
+    void tx.outbox;
+    return null;
+  });
+  store.execute(outboxWork(), (tx) => {
+    void tx.outbox;
+    // @ts-expect-error outbox work cannot access the workflow facade
+    void tx.workflows;
+    return null;
+  });
+}
+
+void compileTimeKindSpecificOperationalBoundary;

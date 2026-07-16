@@ -223,7 +223,10 @@ function lifecycleCommand(): {
         sessionId: ROOT_SESSION_ID,
         confidence: "high",
         verificationStatus: "verified",
-        payload: { sessionId: ROOT_SESSION_ID },
+        payload: {
+          sessionId: ROOT_SESSION_ID,
+          clientNamespace: "lifecycle-tests",
+        },
         sourceRefs: [],
         evidenceRefs: [],
         evidenceDigests: [],
@@ -328,6 +331,16 @@ it("never owns transaction statements while appending a prepared Version 1 batch
   assert.equal(tx.findReplay(prepared, null), null);
   const planned = tx.planPrepared(prepared);
   const committed = tx.appendPlanned(planned);
+  assert.notEqual(committed.events, planned.events);
+  assert.notEqual(committed.events[0], planned.events[0]);
+  assert.notEqual(committed.storedResponse, planned.storedResponse);
+  assert.notEqual(committed.storedResponse.response, planned.storedResponse.response);
+  assert.equal(Object.isFrozen(planned.events[0]), true);
+  assert.equal(Object.isFrozen(planned.events[0]!.payload), true);
+  assert.equal(Object.isFrozen(planned.storedResponse.response), true);
+  assert.equal(Object.isFrozen(committed.events[0]), true);
+  assert.equal(Object.isFrozen(committed.events[0]!.payload), true);
+  assert.equal(Object.isFrozen(committed.storedResponse.response), true);
   tx.insertDedup(prepared, committed, null);
 
   assert.deepEqual(connection.transactionStatements, baseline);
@@ -479,12 +492,60 @@ it("runs LifecycleCommandStore through the real primitive and replays before onN
     throw new Error("replay must not enter fresh path");
   });
 
+  for (const changedBinding of [
+    {
+      ...envelope.context,
+      binding: {
+        ...envelope.context.binding,
+        workspaceId: "2".repeat(64) as WorkspaceId,
+      },
+      workspace: {
+        ...envelope.context.workspace,
+        workspaceId: "2".repeat(64) as WorkspaceId,
+      },
+    },
+    {
+      ...envelope.context,
+      binding: {
+        ...envelope.context.binding,
+        clientNamespace: "other-lifecycle-client",
+      },
+    },
+  ]) {
+    let facadeCalls = 0;
+    let changedNewCalls = 0;
+    const guardedStore = new LifecycleCommandStore({
+      connection,
+      events: tx,
+      transaction: () => {
+        facadeCalls += 1;
+        return focused;
+      },
+      now: () => NOW,
+    });
+    assert.throws(
+      () => guardedStore.execute({ ...envelope, context: changedBinding }, () => {
+        changedNewCalls += 1;
+        throw new Error("binding mismatch must not enter fresh path");
+      }),
+      (error: unknown) => typeof error === "object"
+        && error !== null
+        && "code" in error
+        && error.code === "IDEMPOTENCY_CONFLICT",
+    );
+    assert.equal(facadeCalls, 0);
+    assert.equal(changedNewCalls, 0);
+  }
+
   assert.equal(first.deduplicated, false);
   assert.equal(replay.deduplicated, true);
   assert.equal(replay.authorityMaterialStatus, "stale");
   assert.deepEqual(first.publicResult, replay.publicResult);
   assert.equal(newCalls, 1);
   assert.deepEqual(connection.transactionStatements, [
-    "BEGIN IMMEDIATE", "COMMIT", "BEGIN IMMEDIATE", "ROLLBACK",
+    "BEGIN IMMEDIATE", "COMMIT",
+    "BEGIN IMMEDIATE", "ROLLBACK",
+    "BEGIN IMMEDIATE", "ROLLBACK",
+    "BEGIN IMMEDIATE", "ROLLBACK",
   ]);
 });

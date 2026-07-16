@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import type {
   AppendCommand,
   AppendResult,
+  DeepReadonlyJson,
   JsonValue,
   LifecycleReplayExpectation,
   PendingOutbox,
@@ -109,6 +110,10 @@ interface DedupRow {
   responseJson: string;
   responseHash: string;
   authorizationRecord: PersistedLifecycleAuthorizationRecord | null;
+  stableBinding: {
+    workspaceId: string;
+    clientNamespace: string;
+  } | null;
 }
 
 interface GlobalTail {
@@ -204,6 +209,21 @@ function isPlainRecord(value: unknown): value is Record<string, unknown> {
 
 function isPlainArray(value: unknown): value is unknown[] {
   return Array.isArray(value) && Object.getPrototypeOf(value) === Array.prototype;
+}
+
+function immutableSnapshot<T>(value: T): T {
+  if (Array.isArray(value)) {
+    return Object.freeze(value.map((item) => immutableSnapshot(item))) as T;
+  }
+  if (typeof value !== "object" || value === null) return value;
+  if (!isPlainRecord(value)) throw new EventStoreError("COMMAND_INVALID");
+  const snapshot: Record<string, unknown> = Object.getPrototypeOf(value) === null
+    ? Object.create(null) as Record<string, unknown>
+    : {};
+  for (const key of Object.keys(value)) {
+    snapshot[key] = immutableSnapshot(value[key]);
+  }
+  return Object.freeze(snapshot) as T;
 }
 
 function nonEmptyString(value: unknown): value is string {
@@ -477,15 +497,15 @@ function validateAppendCommand<T extends JsonValue>(
 
 function buildStoredCommandResponse<T extends JsonValue>(
   publicResponse: T,
-  events: StoredEvent[],
+  events: readonly StoredEvent[],
 ): StoredCommandResponse<T> {
-  return {
-    eventIds: events.map((event) => event.eventId),
+  return Object.freeze({
+    eventIds: Object.freeze(events.map((event) => event.eventId)),
     firstGlobalPosition: events[0]!.globalPosition.toString(),
     lastGlobalPosition: events.at(-1)!.globalPosition.toString(),
     finalStreamVersion: events.at(-1)!.streamVersion.toString(),
-    response: publicResponse,
-  };
+    response: immutableSnapshot(publicResponse) as DeepReadonlyJson<T>,
+  });
 }
 
 function parseStoredDecimal(value: unknown): bigint {
@@ -591,10 +611,10 @@ function materializeEvents<T extends JsonValue>(
       visibilityScope: pending.visibilityScope as Exclude<VisibilityScope, "global">,
       confidence: pending.confidence,
       verificationStatus: pending.verificationStatus,
-      sourceRefs: pending.sourceRefs,
-      evidenceRefs: [] as [],
-      evidenceDigests: [] as [],
-      payload: pending.payload,
+      sourceRefs: Object.freeze([...pending.sourceRefs]),
+      evidenceRefs: Object.freeze([]) as readonly [],
+      evidenceDigests: Object.freeze([]) as readonly [],
+      payload: immutableSnapshot(pending.payload),
       payloadJson: validated.payloadJson[index]!,
       payloadHash: validated.payloadHashes[index]!,
       previousGlobalHash,
@@ -613,7 +633,7 @@ function materializeEvents<T extends JsonValue>(
     }
     const computedEventHash = eventHash(hashMaterial);
     previousGlobalHash = computedEventHash;
-    return { ...storedWithoutHash, eventHash: computedEventHash };
+    return Object.freeze({ ...storedWithoutHash, eventHash: computedEventHash });
   });
 }
 
@@ -801,6 +821,32 @@ function decodeLifecycleAuthorizationRow(
   };
 }
 
+function decodeLifecycleStableBindingRow(
+  row: SqliteRow,
+  authorization: PersistedLifecycleAuthorizationRecord | null,
+): DedupRow["stableBinding"] {
+  if (authorization === null) return null;
+  const eventWorkspaceId = requiredString(row.lifecycle_event_workspace_id);
+  const authorityWorkspaceId = nullableString(row.lifecycle_authority_workspace_id);
+  const eventClientNamespace = nullableString(row.lifecycle_event_client_namespace);
+  const authorityClientNamespace = nullableString(row.lifecycle_authority_client_namespace);
+  if (eventWorkspaceId.length === 0
+    || (authorityWorkspaceId !== null && authorityWorkspaceId !== eventWorkspaceId)
+    || (authorityClientNamespace !== null
+      && eventClientNamespace !== null
+      && authorityClientNamespace !== eventClientNamespace)) {
+    throw new EventStoreError("INTEGRITY_FAILURE");
+  }
+  const clientNamespace = authorityClientNamespace ?? eventClientNamespace;
+  if (clientNamespace === null || clientNamespace.length === 0) {
+    throw new EventStoreError("INTEGRITY_FAILURE");
+  }
+  return {
+    workspaceId: authorityWorkspaceId ?? eventWorkspaceId,
+    clientNamespace,
+  };
+}
+
 function samePrincipal(
   left: PersistedLifecycleAuthorizationRecord["presenting"],
   right: LifecycleReplayExpectation["presenting"],
@@ -891,18 +937,30 @@ export class SqliteEventAppendStatements implements EventAppendStatements {
       WHERE singleton = 1
     `);
     this.#findDedup = connection.prepare(this.#lifecycleSchema ? `
-      SELECT command_id, command_hash, response_json, response_hash,
-             lifecycle_authorization_kind,
-             authorization_proof_version, authorization_proof_nonce,
-             authorization_proof_digest, authorization_approval_id,
-             authorization_approval_digest, authorization_session_id,
-             target_session_id, presenting_actor_role,
-             presenting_client_instance_id, target_actor_role,
-             target_client_instance_id, internal_workflow_id,
-             internal_workflow_generation, internal_planned_work_id,
-             internal_claim_owner_id, internal_claim_token
-      FROM command_dedup
-      WHERE project_id = $projectId AND idempotency_key = $idempotencyKey
+      SELECT dedup.command_id, dedup.command_hash, dedup.response_json, dedup.response_hash,
+             dedup.lifecycle_authorization_kind,
+             dedup.authorization_proof_version, dedup.authorization_proof_nonce,
+             dedup.authorization_proof_digest, dedup.authorization_approval_id,
+             dedup.authorization_approval_digest, dedup.authorization_session_id,
+             dedup.target_session_id, dedup.presenting_actor_role,
+             dedup.presenting_client_instance_id, dedup.target_actor_role,
+             dedup.target_client_instance_id, dedup.internal_workflow_id,
+             dedup.internal_workflow_generation, dedup.internal_planned_work_id,
+             dedup.internal_claim_owner_id, dedup.internal_claim_token,
+             command_event.workspace_id AS lifecycle_event_workspace_id,
+             json_extract(command_event.payload_json, '$.clientNamespace')
+               AS lifecycle_event_client_namespace,
+             authority.workspace_id AS lifecycle_authority_workspace_id,
+             authority.client_namespace AS lifecycle_authority_client_namespace
+      FROM command_dedup AS dedup
+      JOIN events AS command_event
+        ON command_event.project_id = dedup.project_id
+       AND command_event.command_id = dedup.command_id
+       AND command_event.command_event_index = 0
+      LEFT JOIN session_authority AS authority
+        ON authority.project_id = dedup.project_id
+       AND authority.session_id = dedup.target_session_id
+      WHERE dedup.project_id = $projectId AND dedup.idempotency_key = $idempotencyKey
     ` : `
       SELECT command_id, command_hash, response_json, response_hash
       FROM command_dedup
@@ -1054,12 +1112,14 @@ export class SqliteEventAppendStatements implements EventAppendStatements {
     if (!UUID.test(commandId) || !HASH.test(commandHashValue) || !HASH.test(responseHashValue)) {
       throw new EventStoreError("INTEGRITY_FAILURE");
     }
+    const authorizationRecord = decodeLifecycleAuthorizationRow(row);
     return {
       commandId,
       commandHash: commandHashValue,
       responseJson,
       responseHash: responseHashValue,
-      authorizationRecord: decodeLifecycleAuthorizationRow(row),
+      authorizationRecord,
+      stableBinding: decodeLifecycleStableBindingRow(row, authorizationRecord),
     };
   }
 
@@ -1315,13 +1375,16 @@ export class EventAppendTransaction {
     recordedAt: string,
     commandHashOverride?: string,
   ): PreparedEventAppend<T> {
-    const validated = validateAppendCommand(command, recordedAt, this.randomId);
+    const commandSnapshot = immutableSnapshot(command);
+    const validated = immutableSnapshot(
+      validateAppendCommand(commandSnapshot, recordedAt, this.randomId),
+    );
     let matchesProjectIdentity: boolean;
     try {
       matchesProjectIdentity = this.statements.matchesProjectIdentity(
-        command.context.binding.projectId,
-        command.context.binding.vaultId,
-        command.context.binding.storeId,
+        commandSnapshot.context.binding.projectId,
+        commandSnapshot.context.binding.vaultId,
+        commandSnapshot.context.binding.storeId,
       );
     } catch (error) {
       throw normalizeEventStoreError(error);
@@ -1338,7 +1401,7 @@ export class EventAppendTransaction {
       throw new EventStoreError("COMMAND_INVALID", { field: "lifecycleIntentWitness" });
     }
     return Object.freeze({
-      command,
+      command: commandSnapshot,
       recordedAt,
       commandHash: hash,
       storedEventIds: Object.freeze([...validated.eventIds]),
@@ -1392,6 +1455,9 @@ export class EventAppendTransaction {
     if (prior.commandId !== probe.commandId
       || prior.commandHash !== probe.authoritativeIntentHash
       || prior.authorizationRecord === null
+      || prior.stableBinding === null
+      || prior.stableBinding.workspaceId !== probe.context.binding.workspaceId
+      || prior.stableBinding.clientNamespace !== probe.context.binding.clientNamespace
       || !matchesLifecycleReplayAuthorization(
         prior.authorizationRecord,
         probe.replayExpectation,
@@ -1477,7 +1543,7 @@ export class EventAppendTransaction {
     return Object.freeze({
       plannedOnly: true as const,
       events: Object.freeze(events),
-      storedResponse: Object.freeze(storedResponse),
+      storedResponse,
       responseHash: responseHash(storedResponse),
       [PLANNED]: prepared,
     }) as InternalPlanned<T>;
@@ -1515,11 +1581,15 @@ export class EventAppendTransaction {
         prepared.recordedAt,
       );
     }
-    return {
-      events: planned.events,
-      storedResponse: planned.storedResponse,
+    const committedEvents = Object.freeze(
+      planned.events.map((event) => immutableSnapshot(event)),
+    );
+    const committedResponse = immutableSnapshot(planned.storedResponse);
+    return Object.freeze({
+      events: committedEvents,
+      storedResponse: committedResponse,
       responseHash: planned.responseHash,
-    };
+    });
   }
 
   insertDedup<T extends JsonValue>(

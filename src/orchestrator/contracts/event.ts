@@ -10,6 +10,16 @@ import type { TrustedActorRole } from "../identity/project-binding.request.js";
 
 export type JsonPrimitive = null | boolean | number | string;
 export type JsonValue = JsonPrimitive | JsonValue[] | { [key: string]: JsonValue };
+export type DeepReadonlyJson<T extends JsonValue> =
+  T extends JsonPrimitive ? T
+    : T extends JsonValue[] ? readonly DeepReadonlyJson<T[number]>[]
+      : T extends { [key: string]: JsonValue }
+        ? { readonly [K in keyof T]: DeepReadonlyJson<T[K]> }
+        : never;
+export type ReadonlyJsonValue =
+  | JsonPrimitive
+  | readonly ReadonlyJsonValue[]
+  | { readonly [key: string]: ReadonlyJsonValue };
 export type VisibilityScope = "session" | "workspace" | "branch" | "project" | "global";
 export type Confidence = "high" | "medium" | "low" | "guess";
 export type VerificationStatus = "unverified" | "provisional" | "verified" | "conflicted";
@@ -70,11 +80,11 @@ export interface AppendResult<TResponse extends JsonValue> {
 }
 
 export interface StoredCommandResponse<TResponse extends JsonValue> {
-  eventIds: string[];
-  firstGlobalPosition: string;
-  lastGlobalPosition: string;
-  finalStreamVersion: string;
-  response: TResponse;
+  readonly eventIds: readonly string[];
+  readonly firstGlobalPosition: string;
+  readonly lastGlobalPosition: string;
+  readonly finalStreamVersion: string;
+  readonly response: DeepReadonlyJson<TResponse>;
 }
 
 export interface LifecyclePrincipal {
@@ -133,42 +143,42 @@ export type LifecycleReplayExpectation =
     };
 
 export interface StoredEvent {
-  globalPosition: bigint;
-  eventId: string;
-  projectId: ProjectId;
-  vaultId: VaultId;
-  storeId: StoreId;
-  workspaceId: WorkspaceId;
-  branchScopeId: BranchScopeId | null;
-  branchRef: string | null;
-  streamId: string;
-  streamType: string;
-  streamVersion: bigint;
-  eventType: string;
-  eventSchemaVersion: number;
-  sessionId: string | null;
-  parentSessionId: string | null;
-  actorRole: TrustedActorRole;
-  agentId: string;
-  clientInstanceId: string;
-  correlationId: string;
-  causationId: string | null;
-  commandId: string;
-  idempotencyKey: string;
-  commandEventIndex: number;
-  occurredAt: string;
-  recordedAt: string;
-  visibilityScope: Exclude<VisibilityScope, "global">;
-  confidence: Confidence;
-  verificationStatus: VerificationStatus;
-  sourceRefs: string[];
-  evidenceRefs: [];
-  evidenceDigests: [];
-  payload: JsonValue;
-  payloadJson: string;
-  payloadHash: string;
-  previousGlobalHash: string;
-  eventHash: string;
+  readonly globalPosition: bigint;
+  readonly eventId: string;
+  readonly projectId: ProjectId;
+  readonly vaultId: VaultId;
+  readonly storeId: StoreId;
+  readonly workspaceId: WorkspaceId;
+  readonly branchScopeId: BranchScopeId | null;
+  readonly branchRef: string | null;
+  readonly streamId: string;
+  readonly streamType: string;
+  readonly streamVersion: bigint;
+  readonly eventType: string;
+  readonly eventSchemaVersion: number;
+  readonly sessionId: string | null;
+  readonly parentSessionId: string | null;
+  readonly actorRole: TrustedActorRole;
+  readonly agentId: string;
+  readonly clientInstanceId: string;
+  readonly correlationId: string;
+  readonly causationId: string | null;
+  readonly commandId: string;
+  readonly idempotencyKey: string;
+  readonly commandEventIndex: number;
+  readonly occurredAt: string;
+  readonly recordedAt: string;
+  readonly visibilityScope: Exclude<VisibilityScope, "global">;
+  readonly confidence: Confidence;
+  readonly verificationStatus: VerificationStatus;
+  readonly sourceRefs: readonly string[];
+  readonly evidenceRefs: readonly [];
+  readonly evidenceDigests: readonly [];
+  readonly payload: ReadonlyJsonValue;
+  readonly payloadJson: string;
+  readonly payloadHash: string;
+  readonly previousGlobalHash: string;
+  readonly eventHash: string;
   /** Canonical source is persisted only by Version 2 command event zero. */
-  lifecycleIntentJson?: string | null;
+  readonly lifecycleIntentJson?: string | null;
 }
