@@ -24,6 +24,10 @@ import {
   type IntegrityReport,
 } from "../integrity/integrity.types.js";
 import type { MaintenanceLease } from "../storage/maintenance-fence.js";
+import type {
+  ProjectStoreUpgradePlan,
+  ProjectStoreUpgradeResult,
+} from "../storage/project-store-upgrade.service.js";
 
 const SQLITE_INT64_MAX = 9_223_372_036_854_775_807n;
 const UNSIGNED_DECIMAL = /^(0|[1-9]\d*)$/;
@@ -868,4 +872,116 @@ export function decodeWorkerNotification(value: unknown): WorkerNotification {
 export function decodeWorkerMessage(value: unknown): WorkerMessage {
   const message = record(value);
   return "id" in message ? decodeWorkerResponse(value) : decodeWorkerNotification(value);
+}
+
+export type UpgradeWorkerCommand =
+  | { id: string; type: "upgrade-inspect" }
+  | { id: string; type: "upgrade-apply" }
+  | {
+      id: string;
+      type: "upgrade-confirm-closure";
+      operationId: string;
+      confirmation: {
+        projectId: string;
+        executorId: string;
+        lease: MaintenanceLeaseWire;
+        connectionClosed: true;
+      };
+    }
+  | { type: "upgrade-quiesce-complete"; operationId: string };
+
+export interface UpgradeQuiesceRequiredNotification {
+  type: "upgrade-quiesce-required";
+  operationId: string;
+  lease: MaintenanceLeaseWire;
+}
+
+export function decodeUpgradeWorkerCommand(value: unknown): UpgradeWorkerCommand {
+  const command = record(value);
+  const type = string(command.type);
+  if (type === "upgrade-inspect" || type === "upgrade-apply") {
+    exact(value, ["id", "type"]);
+    return { id: string(command.id), type };
+  }
+  if (type === "upgrade-quiesce-complete") {
+    exact(value, ["type", "operationId"]);
+    return { type, operationId: string(command.operationId) };
+  }
+  if (type === "upgrade-confirm-closure") {
+    exact(value, ["id", "type", "operationId", "confirmation"]);
+    const confirmation = exact(command.confirmation, [
+      "projectId", "executorId", "lease", "connectionClosed",
+    ]);
+    if (confirmation.connectionClosed !== true) invalid();
+    const lease = decodeMaintenanceLeaseWire(confirmation.lease);
+    return {
+      id: string(command.id),
+      type,
+      operationId: string(command.operationId),
+      confirmation: {
+        projectId: string(confirmation.projectId),
+        executorId: string(confirmation.executorId),
+        lease: encodeMaintenanceLeaseWire(lease),
+        connectionClosed: true,
+      },
+    };
+  }
+  invalid();
+}
+
+export function decodeUpgradeQuiesceRequiredNotification(
+  value: unknown,
+): UpgradeQuiesceRequiredNotification {
+  const notification = exact(value, ["type", "operationId", "lease"]);
+  if (notification.type !== "upgrade-quiesce-required") invalid();
+  const lease = decodeMaintenanceLeaseWire(notification.lease);
+  return {
+    type: "upgrade-quiesce-required",
+    operationId: string(notification.operationId),
+    lease: encodeMaintenanceLeaseWire(lease),
+  };
+}
+
+export function decodeProjectStoreUpgradePlan(value: unknown): ProjectStoreUpgradePlan {
+  const plan = exact(value, [
+    "projectId", "storeId", "appliedVersion", "targetVersion", "pending", "status",
+  ]);
+  const status = string(plan.status);
+  if (status !== "current" && status !== "upgrade-required") invalid();
+  const pending = array(plan.pending).map((item) => {
+    const migration = exact(item, ["version", "name", "checksum"]);
+    const checksum = string(migration.checksum);
+    if (!HASH.test(checksum)) invalid();
+    return {
+      version: positiveInteger(migration.version),
+      name: string(migration.name),
+      checksum,
+    };
+  });
+  const appliedVersion = positiveInteger(plan.appliedVersion);
+  const targetVersion = positiveInteger(plan.targetVersion);
+  if (
+    appliedVersion > targetVersion
+    || pending.some((migration, index) => migration.version !== appliedVersion + index + 1)
+    || (status === "current") !== (pending.length === 0)
+  ) invalid();
+  return {
+    projectId: string(plan.projectId),
+    storeId: string(plan.storeId),
+    appliedVersion,
+    targetVersion,
+    pending,
+    status,
+  };
+}
+
+export function decodeProjectStoreUpgradeResult(value: unknown): ProjectStoreUpgradeResult {
+  const result = exact(value, ["plan", "appliedVersions", "resumedPostCommit", "integrity"]);
+  const appliedVersions = array(result.appliedVersions).map((version) => positiveInteger(version));
+  return {
+    plan: decodeProjectStoreUpgradePlan(result.plan),
+    appliedVersions,
+    resumedPostCommit: boolean(result.resumedPostCommit),
+    integrity: decodeIntegrityReport(result.integrity),
+  };
 }

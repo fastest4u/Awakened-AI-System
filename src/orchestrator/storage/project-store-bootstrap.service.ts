@@ -91,6 +91,8 @@ export type ProjectStoreBootstrapErrorCode =
   | "PROJECT_REPLICA_DECISION_REQUIRED"
   | "SCHEMA_UPGRADE_REQUIRED"
   | "SCHEMA_TOO_NEW"
+  | "MIGRATION_CHECKSUM_MISMATCH"
+  | "SCHEMA_FINGERPRINT_MISMATCH"
   | "SQLITE_CAPABILITY_MISSING"
   | "STORE_UNAVAILABLE";
 
@@ -331,7 +333,12 @@ function validateExistingStore(
     if (error instanceof ProjectStoreBootstrapError) throw error;
     if (
       error instanceof SchemaCompatibilityError
-      && (error.code === "SCHEMA_TOO_NEW" || error.code === "SCHEMA_UPGRADE_REQUIRED")
+      && (
+        error.code === "SCHEMA_TOO_NEW"
+        || error.code === "SCHEMA_UPGRADE_REQUIRED"
+        || error.code === "MIGRATION_CHECKSUM_MISMATCH"
+        || error.code === "SCHEMA_FINGERPRINT_MISMATCH"
+      )
     ) {
       throw bootstrapFailure(error.code, error);
     }

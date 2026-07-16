@@ -32,6 +32,7 @@ import { StoreManifestRepository } from "../src/orchestrator/identity/store-mani
 import {
   eventHash,
   outboxHash,
+  payloadHash,
   responseHash,
 } from "../src/orchestrator/crypto/event-hash.js";
 import {
@@ -45,6 +46,11 @@ import {
   type IntegrityIssueCode,
 } from "../src/orchestrator/integrity/integrity.types.js";
 import { DEFAULT_BUSY_TIMEOUT_MS } from "../src/orchestrator/runtime/runtime-capabilities.js";
+import {
+  buildLifecycleIntentWitness,
+  type TrustedLifecycleIntentAssertionsV1,
+} from "../src/orchestrator/lifecycle/lifecycle-intent-witness.js";
+import type { RootStartCommandV2 } from "../src/orchestrator/lifecycle/contracts/commands.js";
 import { canonicalJson } from "../src/orchestrator/serialization/canonical-json.js";
 import { BranchScopeRepository } from "../src/orchestrator/storage/branch-scope.repository.js";
 import {
@@ -55,6 +61,8 @@ import {
 import { MaintenanceFence } from "../src/orchestrator/storage/maintenance-fence.js";
 import { MigrationRunner } from "../src/orchestrator/storage/migration-runner.js";
 import { eventCoreMigration } from "../src/orchestrator/storage/migrations/0001-event-core.js";
+import { PROJECT_STORE_MIGRATIONS } from "../src/orchestrator/storage/migrations/registry.js";
+import type { Migration } from "../src/orchestrator/storage/migration.js";
 import { NodeSqliteDriver } from "../src/orchestrator/storage/node-sqlite-driver.js";
 import { expectedSchemaFingerprint } from "../src/orchestrator/storage/schema-fingerprint.js";
 import type {
@@ -67,7 +75,7 @@ const NOW = "2026-07-13T02:00:00.000Z";
 const PROJECT_ID = "11111111-1111-4111-8111-111111111111" as ProjectId;
 const VAULT_ID = "22222222-2222-4222-8222-222222222222" as VaultId;
 const STORE_ID = "33333333-3333-4333-8333-333333333333" as StoreId;
-const WORKSPACE_ID = "workspace-integrity" as WorkspaceId;
+const WORKSPACE_ID = "a".repeat(64) as WorkspaceId;
 const COMMAND_A = "44444444-4444-4444-8444-444444444444";
 const COMMAND_B = "55555555-5555-4555-8555-555555555555";
 const COMMAND_C = "66666666-6666-4666-8666-666666666666";
@@ -133,7 +141,10 @@ function appendCommand(
   };
 }
 
-function createFixture(options: { append?: boolean } = {}): Fixture {
+function createFixture(options: {
+  append?: boolean;
+  migrations?: readonly Migration[];
+} = {}): Fixture {
   const root = mkdtempSync(join(tmpdir(), "memory-event-integrity-"));
   roots.push(root);
   const projectRoot = join(root, "project");
@@ -164,9 +175,10 @@ function createFixture(options: { append?: boolean } = {}): Fixture {
     busyTimeoutMs: DEFAULT_BUSY_TIMEOUT_MS,
   });
   connections.push(connection);
+  const migrations = options.migrations ?? [eventCoreMigration];
   new MigrationRunner().apply(
     connection,
-    [eventCoreMigration],
+    migrations,
     NOW,
     { kind: "bootstrap-empty" },
   );
@@ -174,11 +186,12 @@ function createFixture(options: { append?: boolean } = {}): Fixture {
   connection.prepare(`
     INSERT INTO project_meta(
       singleton, project_id, vault_id, store_id, schema_version, created_at
-    ) VALUES (1, $projectId, $vaultId, $storeId, 1, $createdAt)
+    ) VALUES (1, $projectId, $vaultId, $storeId, $schemaVersion, $createdAt)
   `).run({
     $projectId: PROJECT_ID,
     $vaultId: VAULT_ID,
     $storeId: STORE_ID,
+    $schemaVersion: migrations.at(-1)?.version ?? 0,
     $createdAt: NOW,
   });
   connection.exec(`
@@ -240,7 +253,7 @@ function createFixture(options: { append?: boolean } = {}): Fixture {
     path: route.eventsPath,
     connection,
     context,
-    integrity: new EventIntegrityService(connection, [eventCoreMigration]),
+    integrity: new EventIntegrityService(connection, migrations),
     manifestRepository,
     store: eventStore,
   };
@@ -376,6 +389,16 @@ function recomputedEventHash(
   for (const [name, value] of Object.entries(overrides)) {
     if (value !== undefined) row[name] = value;
   }
+  const lifecycleIntentJson = row.lifecycle_intent_json;
+  assert.ok(
+    lifecycleIntentJson === undefined
+      || lifecycleIntentJson === null
+      || typeof lifecycleIntentJson === "string",
+    "lifecycle_intent_json",
+  );
+  const lifecycleIntent = typeof lifecycleIntentJson === "string"
+    ? JSON.parse(lifecycleIntentJson) as JsonValue
+    : undefined;
   return eventHash({
     globalPosition: bigintField(row, "global_position").toString(),
     eventId: stringField(row, "event_id"),
@@ -410,6 +433,7 @@ function recomputedEventHash(
     evidenceDigests: parsedField(row, "evidence_digests_json"),
     payloadHash: stringField(row, "payload_hash"),
     previousGlobalHash: stringField(row, "previous_global_hash"),
+    ...(lifecycleIntent === undefined ? {} : { lifecycleIntent }),
   });
 }
 
@@ -434,6 +458,143 @@ function rehashCompleteEventChain(connection: SqliteConnection): void {
     });
     previousGlobalHash = nextEventHash;
   }
+}
+
+const INTENT_SESSION_ID = "77777777-7777-4777-8777-777777777777";
+const INITIAL_INTENT_ASSERTIONS: TrustedLifecycleIntentAssertionsV1 = {
+  authorizationKind: "initial-authority",
+  authorizationSessionId: null,
+  targetSessionId: INTENT_SESSION_ID,
+  presentingActorRole: "primary",
+  presentingClientInstanceId: "client-integrity",
+  targetActorRole: "primary",
+  targetClientInstanceId: "client-integrity",
+  internalWorkflowId: null,
+  internalWorkflowGeneration: null,
+  internalPlannedWorkId: null,
+};
+
+function lifecycleIntent(command: RootStartCommandV2): {
+  commandHash: string;
+  witnessJson: string;
+} {
+  const built = buildLifecycleIntentWitness(command, INITIAL_INTENT_ASSERTIONS);
+  return { commandHash: built.intentHash, witnessJson: built.source };
+}
+
+function lifecycleIntentWitness(command: RootStartCommandV2): string {
+  return lifecycleIntent(command).witnessJson;
+}
+
+function lifecycleIntentHash(command: RootStartCommandV2): string {
+  return lifecycleIntent(command).commandHash;
+}
+
+function withMutableV2Witnesses(fixture: Fixture, mutate: () => void): void {
+  const eventsTrigger = triggerSql(fixture.connection, "events_no_update");
+  const commandsTrigger = triggerSql(fixture.connection, "command_dedup_no_update");
+  fixture.connection.exec("PRAGMA foreign_keys = OFF");
+  fixture.connection.exec("BEGIN IMMEDIATE");
+  try {
+    fixture.connection.exec("DROP TRIGGER events_no_update");
+    fixture.connection.exec("DROP TRIGGER command_dedup_no_update");
+    mutate();
+    fixture.connection.exec(eventsTrigger);
+    fixture.connection.exec(commandsTrigger);
+    fixture.connection.exec("COMMIT");
+  } catch (error) {
+    try { fixture.connection.exec("ROLLBACK"); } catch { /* preserve mutation failure */ }
+    throw error;
+  } finally {
+    fixture.connection.exec("PRAGMA foreign_keys = ON");
+  }
+}
+
+function installV2LifecycleIntent(
+  fixture: Fixture,
+  command: RootStartCommandV2,
+): { commandHash: string; witnessJson: string } {
+  const sessionId = INTENT_SESSION_ID;
+  const streamId = `session/${sessionId}`;
+  const { witnessJson, commandHash: nextCommandHash } = lifecycleIntent(command);
+  const startedPayload = {
+    sessionKind: "root",
+    ownerGeneration: 1,
+    continuityKey: command.continuityKey,
+    clientNamespace: fixture.context.binding.clientNamespace,
+    creatingAgentId: command.agentId,
+    creatingClientInstanceId: INITIAL_INTENT_ASSERTIONS.targetClientInstanceId,
+    authorityCommitment: "b".repeat(64),
+  };
+  const startedPayloadJson = canonicalJson(startedPayload);
+  const storedResponse = JSON.parse(stringField(fixture.connection.prepare(`
+    SELECT response_json FROM command_dedup WHERE command_id = $commandId
+  `).get({ $commandId: COMMAND_A })!, "response_json")) as Record<string, JsonValue>;
+  const nextResponse = {
+    ...storedResponse,
+    response: { accepted: true, sessionId },
+  };
+  const nextResponseJson = canonicalJson(nextResponse);
+  withMutableV2Witnesses(fixture, () => {
+    fixture.connection.prepare(`
+      UPDATE events
+      SET stream_id = $streamId,
+          stream_type = 'session',
+          event_type = CASE command_event_index
+            WHEN 0 THEN 'SessionStarted'
+            ELSE 'SessionCheckpointRecorded'
+          END,
+          session_id = $sessionId,
+          parent_session_id = NULL,
+          payload_json = CASE command_event_index
+            WHEN 0 THEN $startedPayloadJson
+            ELSE payload_json
+          END,
+          payload_hash = CASE command_event_index
+            WHEN 0 THEN $startedPayloadHash
+            ELSE payload_hash
+          END,
+          lifecycle_intent_json = CASE command_event_index
+            WHEN 0 THEN $witnessJson
+            ELSE NULL
+          END
+      WHERE command_id = $commandId
+    `).run({
+      $streamId: streamId,
+      $sessionId: sessionId,
+      $startedPayloadJson: startedPayloadJson,
+      $startedPayloadHash: payloadHash(startedPayload),
+      $witnessJson: witnessJson,
+      $commandId: COMMAND_A,
+    });
+    fixture.connection.prepare(`
+      UPDATE streams
+      SET stream_id = $streamId, stream_type = 'session'
+      WHERE stream_id = 'stream-a'
+    `).run({ $streamId: streamId });
+    fixture.connection.prepare(`
+      UPDATE command_dedup
+      SET command_type = 'root-start',
+          command_hash = $commandHash,
+          lifecycle_authorization_kind = 'initial-authority',
+          target_session_id = $sessionId,
+          presenting_actor_role = 'primary',
+          presenting_client_instance_id = 'client-integrity',
+          target_actor_role = 'primary',
+          target_client_instance_id = 'client-integrity',
+          response_json = $responseJson,
+          response_hash = $responseHash
+      WHERE command_id = $commandId
+    `).run({
+      $commandHash: nextCommandHash,
+      $sessionId: sessionId,
+      $responseJson: nextResponseJson,
+      $responseHash: responseHash(nextResponse),
+      $commandId: COMMAND_A,
+    });
+    rehashCompleteEventChain(fixture.connection);
+  });
+  return { commandHash: nextCommandHash, witnessJson };
 }
 
 class ObservingConnection implements SqliteConnection {
@@ -519,6 +680,14 @@ describe("EventIntegrityService valid checks", () => {
       "RANGE_INVALID",
       "RANGE_OUT_OF_BOUNDS",
       "TAIL_LIMIT_INVALID",
+      "COMMAND_AUTHORIZATION_METADATA_MISMATCH",
+      "SESSION_AUTHORITY_FOLD_MISMATCH",
+      "SESSION_LEASE_INVARIANT_MISMATCH",
+      "SESSION_EVIDENCE_COVERAGE_MISMATCH",
+      "LIFECYCLE_APPROVAL_CONSUMPTION_MISMATCH",
+      "LIFECYCLE_WORKFLOW_INVARIANT_MISMATCH",
+      "LIFECYCLE_VALIDATION_RESULT_MISMATCH",
+      "LIFECYCLE_OUTBOX_INVARIANT_MISMATCH",
     ];
     assert.deepEqual(INTEGRITY_ISSUE_CODES, expected);
   });
@@ -729,9 +898,12 @@ describe("EventIntegrityService schema, stream, and command checks", () => {
       fixture.connection.exec("UPDATE project_meta SET schema_version = 2");
     });
 
-    const report = fixture.integrity.fullCheck(fixture.context);
-    assert.equal(report.ok, false);
-    assert.ok(issueCodes(report).includes("PROJECT_SCHEMA_VERSION_MISMATCH"));
+    const quick = fixture.integrity.quickCheck(fixture.context);
+    const full = fixture.integrity.fullCheck(fixture.context);
+    assert.equal(quick.ok, false);
+    assert.equal(full.ok, false);
+    assert.ok(issueCodes(quick).includes("PROJECT_SCHEMA_VERSION_MISMATCH"));
+    assert.ok(issueCodes(full).includes("PROJECT_SCHEMA_VERSION_MISMATCH"));
   });
 
   it("detects stream-head and stream-type drift", () => {
@@ -1340,6 +1512,251 @@ describe("EventIntegrityService immutable command witnesses", () => {
     const gitReport = gitFixture.integrity.fullCheck(context);
     assert.equal(gitReport.ok, false);
     assert.ok(issueCodes(gitReport).includes("COMMAND_METADATA_MISMATCH"));
+  });
+});
+
+describe("EventIntegrityService Version 2 lifecycle intent witnesses", () => {
+  const materialA: RootStartCommandV2 = {
+    commandType: "root-start",
+    commandId: COMMAND_A,
+    idempotencyKey: "integrity:command-a",
+    agentId: "agent-primary",
+    continuityKey: "continuity-a",
+    expectedProjectId: PROJECT_ID,
+    expectedVaultId: VAULT_ID,
+    expectedWorkspaceId: WORKSPACE_ID,
+    expectedBranchRef: null,
+    resumePolicy: "new",
+  };
+  const materialB: RootStartCommandV2 = {
+    ...materialA,
+    continuityKey: "continuity-b",
+  };
+
+  it("keeps Version 1 event hashes byte-identical and never queries a Version 2 column", () => {
+    const fixture = createFixture();
+    assert.equal(
+      fixture.connection.prepare("PRAGMA table_info(events)").all()
+        .some((row) => row.name === "lifecycle_intent_json"),
+      false,
+    );
+    const observing = new ObservingConnection(
+      fixture.connection,
+      undefined,
+      /lifecycle_intent_json/i,
+    );
+    assert.equal(
+      new EventIntegrityService(observing, [eventCoreMigration]).fullCheck(fixture.context).ok,
+      true,
+    );
+    for (const row of fixture.connection.prepare("SELECT * FROM events ORDER BY global_position").all()) {
+      assert.equal(stringField(row, "event_hash"), recomputedEventHash(row));
+    }
+  });
+
+  it("accepts exactly one event-hash-bound canonical witness for a Version 2 command", () => {
+    const fixture = createFixture({ migrations: PROJECT_STORE_MIGRATIONS });
+    assert.ok(
+      fixture.connection.prepare("SELECT lifecycle_intent_json FROM events").all()
+        .every((row) => row.lifecycle_intent_json === null),
+    );
+    const installed = installV2LifecycleIntent(fixture, materialA);
+    assert.equal(
+      fixture.connection.prepare(`
+        SELECT lifecycle_intent_json FROM events
+        WHERE command_id = $commandId AND command_event_index = 0
+      `).get({ $commandId: COMMAND_A })?.lifecycle_intent_json,
+      installed.witnessJson,
+    );
+    assert.equal(fixture.integrity.fullCheck(fixture.context).ok, true);
+  });
+
+  it("hashes distinct caller intent differently when event outcomes are otherwise identical", () => {
+    const left = createFixture({ migrations: PROJECT_STORE_MIGRATIONS });
+    const right = createFixture({ migrations: PROJECT_STORE_MIGRATIONS });
+    const leftInstalled = installV2LifecycleIntent(left, materialA);
+    const rightInstalled = installV2LifecycleIntent(right, materialB);
+    assert.notEqual(leftInstalled.commandHash, rightInstalled.commandHash);
+    assert.equal(left.integrity.fullCheck(left.context).ok, true);
+    assert.equal(right.integrity.fullCheck(right.context).ok, true);
+  });
+
+  it("detects independent witness, command-hash, and event-hash tampering", () => {
+    const witnessFixture = createFixture({ migrations: PROJECT_STORE_MIGRATIONS });
+    installV2LifecycleIntent(witnessFixture, materialA);
+    withMutableV2Witnesses(witnessFixture, () => {
+      witnessFixture.connection.prepare(`
+        UPDATE events SET lifecycle_intent_json = $witness
+        WHERE command_id = $commandId AND command_event_index = 0
+      `).run({
+        $witness: lifecycleIntentWitness(materialB),
+        $commandId: COMMAND_A,
+      });
+    });
+    const witnessCodes = issueCodes(witnessFixture.integrity.fullCheck(witnessFixture.context));
+    assert.ok(witnessCodes.includes("EVENT_HASH_MISMATCH"));
+    assert.ok(witnessCodes.includes("COMMAND_HASH_MISMATCH"));
+
+    const commandFixture = createFixture({ migrations: PROJECT_STORE_MIGRATIONS });
+    installV2LifecycleIntent(commandFixture, materialA);
+    mutateProtected(commandFixture, "command_dedup_no_update", () => {
+      commandFixture.connection.prepare(`
+        UPDATE command_dedup SET command_hash = $hash WHERE command_id = $commandId
+      `).run({ $hash: "f".repeat(64), $commandId: COMMAND_A });
+    });
+    assert.ok(issueCodes(commandFixture.integrity.fullCheck(commandFixture.context))
+      .includes("COMMAND_HASH_MISMATCH"));
+
+    const eventFixture = createFixture({ migrations: PROJECT_STORE_MIGRATIONS });
+    installV2LifecycleIntent(eventFixture, materialA);
+    mutateProtected(eventFixture, "events_no_update", () => {
+      eventFixture.connection.prepare(`
+        UPDATE events SET event_hash = $hash
+        WHERE command_id = $commandId AND command_event_index = 0
+      `).run({ $hash: "e".repeat(64), $commandId: COMMAND_A });
+    });
+    assert.ok(issueCodes(eventFixture.integrity.fullCheck(eventFixture.context))
+      .includes("EVENT_HASH_MISMATCH"));
+  });
+
+  it("rejects duplicate, misplaced, noncanonical, and unknown-version witnesses", () => {
+    for (const [name, mutate] of [
+      ["duplicate", (fixture: Fixture): void => {
+        fixture.connection.prepare(`
+          UPDATE events SET lifecycle_intent_json = $witness
+          WHERE command_id = $commandId AND command_event_index = 1
+        `).run({
+          $witness: lifecycleIntentWitness(materialA),
+          $commandId: COMMAND_A,
+        });
+      }],
+      ["misplaced", (fixture: Fixture): void => {
+        fixture.connection.prepare(`
+          UPDATE events
+          SET lifecycle_intent_json = CASE command_event_index
+            WHEN 0 THEN NULL ELSE $witness END
+          WHERE command_id = $commandId
+        `).run({
+          $witness: lifecycleIntentWitness(materialA),
+          $commandId: COMMAND_A,
+        });
+      }],
+      ["noncanonical", (fixture: Fixture): void => {
+        fixture.connection.prepare(`
+          UPDATE events SET lifecycle_intent_json = $witness
+          WHERE command_id = $commandId AND command_event_index = 0
+        `).run({
+          $witness: JSON.stringify(JSON.parse(lifecycleIntentWitness(materialA)), null, 2),
+          $commandId: COMMAND_A,
+        });
+      }],
+      ["unknown-version", (fixture: Fixture): void => {
+        fixture.connection.prepare(`
+          UPDATE events SET lifecycle_intent_json = $witness
+          WHERE command_id = $commandId AND command_event_index = 0
+        `).run({
+          $witness: canonicalJson({
+            ...JSON.parse(lifecycleIntentWitness(materialA)) as Record<string, JsonValue>,
+            lifecycleIntentWitnessVersion: 2,
+          }),
+          $commandId: COMMAND_A,
+        });
+      }],
+    ] as const) {
+      const fixture = createFixture({ migrations: PROJECT_STORE_MIGRATIONS });
+      installV2LifecycleIntent(fixture, materialA);
+      withMutableV2Witnesses(fixture, () => mutate(fixture));
+      const report = fixture.integrity.fullCheck(fixture.context);
+      assert.equal(report.ok, false, name);
+      assert.ok(
+        issueCodes(report).includes("COMMAND_HASH_MISMATCH")
+          || issueCodes(report).includes("COMMAND_METADATA_MISMATCH"),
+        name,
+      );
+    }
+  });
+
+  it("rejects secret-bearing material without reflecting the canary", async () => {
+    const modulePath = "../src/orchestrator/lifecycle/lifecycle-intent-witness.js";
+    const witnessModule = await import(modulePath) as {
+      decodeLifecycleIntentWitness(source: string): unknown;
+    };
+    const canary = "pmcap1.secret-capability-canary";
+    let error: unknown;
+    try {
+      const witness = JSON.parse(lifecycleIntentWitness(materialA)) as {
+        intent: { command: Record<string, JsonValue> };
+      };
+      witness.intent.command.continuityKey = canary;
+      witnessModule.decodeLifecycleIntentWitness(canonicalJson(witness));
+    } catch (caught) {
+      error = caught;
+    }
+    assert.ok(error instanceof Error);
+    assert.doesNotMatch(String(error), new RegExp(canary));
+  });
+
+  it("does not expose a raw JSON writer escape hatch for unknown or secret fields", async () => {
+    const modulePath = "../src/orchestrator/lifecycle/lifecycle-intent-witness.js";
+    const witnessModule = await import(modulePath) as {
+      buildLifecycleIntentWitness(
+        command: unknown,
+        assertions: TrustedLifecycleIntentAssertionsV1,
+      ): unknown;
+    };
+    for (const material of [
+      { ...materialA, inventedSemanticInput: "caller-selected" },
+      { ...materialA, secret: "ordinary-secret-value" },
+    ] as const) {
+      assert.throws(
+        () => witnessModule.buildLifecycleIntentWitness(material, INITIAL_INTENT_ASSERTIONS),
+        /LIFECYCLE_INTENT_WITNESS_INVALID/,
+      );
+    }
+  });
+
+  it("rejects a coherent caller-selected replacement of witness and command hash", () => {
+    const fixture = createFixture({ migrations: PROJECT_STORE_MIGRATIONS });
+    installV2LifecycleIntent(fixture, materialA);
+    withMutableV2Witnesses(fixture, () => {
+      fixture.connection.prepare(`
+        UPDATE events SET lifecycle_intent_json = $witness
+        WHERE command_id = $commandId AND command_event_index = 0
+      `).run({
+        $witness: lifecycleIntentWitness(materialB),
+        $commandId: COMMAND_A,
+      });
+      fixture.connection.prepare(`
+        UPDATE command_dedup SET command_hash = $commandHash
+        WHERE command_id = $commandId
+      `).run({
+        $commandHash: lifecycleIntentHash(materialB),
+        $commandId: COMMAND_A,
+      });
+      rehashCompleteEventChain(fixture.connection);
+    });
+
+    const report = fixture.integrity.fullCheck(fixture.context);
+    assert.equal(report.ok, false);
+    assert.ok(issueCodes(report).includes("COMMAND_METADATA_MISMATCH"));
+  });
+
+  it("rejects drift between the event-bound witness and persisted generated target", () => {
+    const fixture = createFixture({ migrations: PROJECT_STORE_MIGRATIONS });
+    installV2LifecycleIntent(fixture, materialA);
+    mutateProtected(fixture, "command_dedup_no_update", () => {
+      fixture.connection.prepare(`
+        UPDATE command_dedup SET target_session_id = $targetSessionId
+        WHERE command_id = $commandId
+      `).run({
+        $targetSessionId: "88888888-8888-4888-8888-888888888888",
+        $commandId: COMMAND_A,
+      });
+    });
+
+    const report = fixture.integrity.fullCheck(fixture.context);
+    assert.equal(report.ok, false);
+    assert.ok(issueCodes(report).includes("COMMAND_METADATA_MISMATCH"));
   });
 });
 

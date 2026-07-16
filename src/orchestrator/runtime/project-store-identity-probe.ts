@@ -25,6 +25,10 @@ const IDENTITY_CODES = new Set([
   "PROJECT_ID_MISMATCH",
   "VAULT_ID_MISMATCH",
   "STORE_ID_MISMATCH",
+  "SCHEMA_UPGRADE_REQUIRED",
+  "SCHEMA_TOO_NEW",
+  "MIGRATION_CHECKSUM_MISMATCH",
+  "SCHEMA_FINGERPRINT_MISMATCH",
 ]);
 
 const scheduler: ExecutorScheduler = {
@@ -57,7 +61,7 @@ function probeFailure(
 ): ProjectBindingError {
   return new ProjectBindingError(
     IDENTITY_CODES.has(code)
-      ? code as "PROJECT_ID_MISMATCH" | "VAULT_ID_MISMATCH" | "STORE_ID_MISMATCH"
+      ? code as ProjectBindingError["code"]
       : "STORE_UNAVAILABLE",
     details,
   );

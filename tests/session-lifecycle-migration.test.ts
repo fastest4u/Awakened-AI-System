@@ -50,7 +50,7 @@ const driver = new NodeSqliteDriver({ DatabaseSync });
 const connections: SqliteConnection[] = [];
 const roots: string[] = [];
 
-function insert(
+function rawInsert(
   connection: SqliteConnection,
   table: string,
   values: Readonly<Record<string, SqliteValue>>,
@@ -63,6 +63,94 @@ function insert(
     INSERT INTO ${table}(${columns.join(", ")})
     VALUES (${columns.map((column) => `$${column}`).join(", ")})
   `).run(params);
+}
+
+function seedLifecycleIntentWitness(
+  connection: SqliteConnection,
+  command: Readonly<Record<string, SqliteValue>>,
+): void {
+  const commandId = String(command.command_id);
+  const existing = connection.prepare(`
+    SELECT count(*) AS count FROM events
+    WHERE project_id = $projectId
+      AND command_id = $commandId
+      AND lifecycle_intent_json IS NOT NULL
+  `).get({ $projectId: PROJECT_ID, $commandId: commandId })?.count;
+  if (existing === 1n) return;
+  const maxPosition = connection.prepare(`
+    SELECT coalesce(max(global_position), 0) AS position FROM events
+  `).get()?.position;
+  assert.equal(typeof maxPosition, "bigint");
+  const position = Number(maxPosition) + 1;
+  const sessionId = `intent-witness-${position}`;
+  const streamId = `session/${sessionId}`;
+  rawInsert(connection, "streams", {
+    project_id: PROJECT_ID,
+    stream_id: streamId,
+    stream_type: "session",
+    current_version: 1,
+    created_at: NOW,
+    updated_at: NOW,
+  });
+  rawInsert(connection, "events", {
+    global_position: position,
+    event_id: `${position.toString(16).padStart(8, "0")}-0000-4000-8000-${position.toString(16).padStart(12, "0")}`,
+    project_id: PROJECT_ID,
+    vault_id: VAULT_ID,
+    store_id: STORE_ID,
+    workspace_id: "workspace-1",
+    branch_scope_id: null,
+    branch_ref: null,
+    stream_id: streamId,
+    stream_type: "session",
+    stream_version: 1,
+    event_type: "SessionStarted",
+    event_schema_version: 1,
+    session_id: sessionId,
+    parent_session_id: null,
+    actor_role: "primary",
+    agent_id: "agent-1",
+    client_instance_id: "client-1",
+    correlation_id: `intent-correlation-${position}`,
+    causation_id: null,
+    command_id: commandId,
+    idempotency_key: String(command.idempotency_key),
+    command_event_index: 0,
+    occurred_at: NOW,
+    recorded_at: NOW,
+    visibility_scope: "session",
+    confidence: "high",
+    verification_status: "verified",
+    source_refs_json: "[]",
+    evidence_refs_json: "[]",
+    evidence_digests_json: "[]",
+    payload_json: "{}",
+    payload_hash: H64,
+    previous_global_hash: "0".repeat(64),
+    event_hash: H64_B,
+    lifecycle_intent_json: canonicalJson({
+      intentMaterialVersion: 1,
+      material: {
+        commandId,
+        commandType: String(command.command_type),
+        targetSessionId: command.target_session_id === null
+          ? null
+          : String(command.target_session_id),
+      },
+    }),
+  });
+}
+
+function insert(
+  connection: SqliteConnection,
+  table: string,
+  values: Readonly<Record<string, SqliteValue>>,
+): void {
+  if (table === "command_dedup" && values.lifecycle_authorization_kind !== null
+    && values.lifecycle_authorization_kind !== undefined) {
+    seedLifecycleIntentWitness(connection, values);
+  }
+  rawInsert(connection, table, values);
 }
 
 function currentConnection(): SqliteConnection {
@@ -104,6 +192,12 @@ function seedSessionEvent(
   sessionId: string,
   position: number,
   eventType: string,
+  options: {
+    commandId?: string;
+    idempotencyKey?: string;
+    commandEventIndex?: number;
+    lifecycleIntentJson?: string | null;
+  } = {},
 ): void {
   const streamId = `session/${sessionId}`;
   insert(connection, "streams", {
@@ -135,9 +229,9 @@ function seedSessionEvent(
     client_instance_id: "client-1",
     correlation_id: `correlation-${position}`,
     causation_id: null,
-    command_id: `command-${position}`,
-    idempotency_key: `idempotency-${position}`,
-    command_event_index: 0,
+    command_id: options.commandId ?? `command-${position}`,
+    idempotency_key: options.idempotencyKey ?? `idempotency-${position}`,
+    command_event_index: options.commandEventIndex ?? 0,
     occurred_at: NOW,
     recorded_at: NOW,
     visibility_scope: "session",
@@ -150,6 +244,9 @@ function seedSessionEvent(
     payload_hash: H64,
     previous_global_hash: "0".repeat(64),
     event_hash: H64_B,
+    ...(options.lifecycleIntentJson === undefined
+      ? {}
+      : { lifecycle_intent_json: options.lifecycleIntentJson }),
   });
 }
 
@@ -159,6 +256,12 @@ function seedAdditionalSessionEvent(
   position: number,
   streamVersion: number,
   eventType: string,
+  options: {
+    commandId?: string;
+    idempotencyKey?: string;
+    commandEventIndex?: number;
+    lifecycleIntentJson?: string | null;
+  } = {},
 ): void {
   const streamId = `session/${sessionId}`;
   connection.prepare(`
@@ -191,9 +294,9 @@ function seedAdditionalSessionEvent(
     client_instance_id: "client-1",
     correlation_id: `correlation-${position}`,
     causation_id: null,
-    command_id: `command-${position}`,
-    idempotency_key: `idempotency-${position}`,
-    command_event_index: 0,
+    command_id: options.commandId ?? `command-${position}`,
+    idempotency_key: options.idempotencyKey ?? `idempotency-${position}`,
+    command_event_index: options.commandEventIndex ?? 0,
     occurred_at: NOW,
     recorded_at: NOW,
     visibility_scope: "session",
@@ -206,6 +309,9 @@ function seedAdditionalSessionEvent(
     payload_hash: H64,
     previous_global_hash: H64_B,
     event_hash: H64,
+    ...(options.lifecycleIntentJson === undefined
+      ? {}
+      : { lifecycle_intent_json: options.lifecycleIntentJson }),
   });
 }
 
@@ -650,6 +756,9 @@ describe("0002-session-lifecycle structural contract", () => {
       connection.prepare(`PRAGMA table_info(${table})`).all()
         .slice(originalCount)
         .map((row) => String(row.name));
+    assert.deepEqual(alteredColumns("events", 35), [
+      "lifecycle_intent_json",
+    ]);
     assert.deepEqual(alteredColumns("command_dedup", 15), [
       "lifecycle_authorization_kind",
       "authorization_proof_version",
@@ -763,10 +872,12 @@ describe("0002-session-lifecycle structural contract", () => {
         "child_transfer_tickets_insert_guard",
         "child_transfer_tickets_update_guard",
         "command_dedup_lifecycle_insert_guard",
+        "command_dedup_lifecycle_intent_guard",
         "command_dedup_no_delete",
         "command_dedup_no_update",
         "events_identity_guard",
         "events_lifecycle_authorization_guard",
+        "events_lifecycle_intent_guard",
         "events_no_delete",
         "events_no_update",
         "events_validation_result_link_guard",
@@ -1089,6 +1200,101 @@ describe("0002-session-lifecycle authority, lease, and evidence guards", () => {
 });
 
 describe("0002-session-lifecycle authorization, validation, workflow, and outbox guards", () => {
+  it("requires one canonical nonsecret lifecycle intent witness at event index zero", () => {
+    const witness = canonicalJson({
+      intentMaterialVersion: 1,
+      material: { commandType: "root-start", continuityKey: "continuity-a" },
+    });
+    const validCommand = legacyCommand({
+      idempotency_key: "intent-command",
+      command_id: "intent-command",
+      command_type: "root-start",
+      lifecycle_authorization_kind: "initial-authority",
+      target_session_id: ROOT_ID,
+      presenting_actor_role: "primary",
+      presenting_client_instance_id: "client-root",
+      target_actor_role: "primary",
+      target_client_instance_id: "client-root",
+    });
+
+    const missing = currentConnection();
+    assert.throws(
+      () => rawInsert(missing, "command_dedup", validCommand),
+      /LIFECYCLE_INTENT_WITNESS_INVALID/,
+    );
+
+    const valid = currentConnection();
+    seedSessionEvent(valid, ROOT_ID, 1, "SessionStarted", {
+      commandId: "intent-command",
+      idempotencyKey: "intent-command",
+      lifecycleIntentJson: witness,
+    });
+    rawInsert(valid, "command_dedup", validCommand);
+    assert.equal(
+      valid.prepare(`
+        SELECT lifecycle_intent_json FROM events WHERE command_id = 'intent-command'
+      `).get()?.lifecycle_intent_json,
+      witness,
+    );
+
+    for (const [name, source] of [
+      ["noncanonical", JSON.stringify({ material: {}, intentMaterialVersion: 1 }, null, 2)],
+      ["unknown-version", canonicalJson({ intentMaterialVersion: 2, material: {} })],
+      ["secret-bearing", canonicalJson({
+        intentMaterialVersion: 1,
+        material: { proof: "pmcap1.secret-canary" },
+      })],
+    ] as const) {
+      const connection = currentConnection();
+      assert.throws(
+        () => seedSessionEvent(connection, `invalid-${name}`, 1, "SessionStarted", {
+          commandId: `invalid-${name}`,
+          idempotencyKey: `invalid-${name}`,
+          lifecycleIntentJson: source,
+        }),
+        /LIFECYCLE_INTENT_WITNESS_INVALID/,
+        name,
+      );
+    }
+
+    const nonLifecycle = currentConnection();
+    assert.throws(
+      () => seedSessionEvent(nonLifecycle, "non-lifecycle", 1, "TaskRecorded", {
+        commandId: "non-lifecycle",
+        idempotencyKey: "non-lifecycle",
+        lifecycleIntentJson: witness,
+      }),
+      /LIFECYCLE_INTENT_WITNESS_INVALID/,
+    );
+
+    const misplaced = currentConnection();
+    assert.throws(
+      () => seedSessionEvent(misplaced, "misplaced", 1, "SessionStarted", {
+        commandId: "misplaced",
+        idempotencyKey: "misplaced",
+        commandEventIndex: 1,
+        lifecycleIntentJson: witness,
+      }),
+      /LIFECYCLE_INTENT_WITNESS_INVALID/,
+    );
+  });
+
+  it("keeps Version 1 and non-lifecycle rows NULL", () => {
+    const connection = currentConnection();
+    seedSessionEvent(connection, ROOT_ID, 1, "TaskRecorded");
+    insert(connection, "command_dedup", legacyCommand({
+      idempotency_key: "command-1",
+      command_id: "command-1",
+      command_type: "custom-generic-command",
+    }));
+    assert.deepEqual(
+      connection.prepare(`
+        SELECT lifecycle_intent_json FROM events ORDER BY global_position
+      `).all().map((row) => row.lifecycle_intent_json),
+      [null],
+    );
+  });
+
   it("reserves canonical lifecycle command types without blocking new generic Version 1 rows", () => {
     const connection = currentConnection();
     insert(connection, "command_dedup", legacyCommand({

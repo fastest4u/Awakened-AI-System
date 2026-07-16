@@ -2460,6 +2460,9 @@ describe("real project-store worker", () => {
     assert.equal(closedAndAcknowledged, true);
     assert.equal(ownerConfirmations, 1);
     assert.throws(() => executor.quickIntegrity(), errorCode("WORKER_CLOSED"));
+    await executor.quiesce(lease);
+    await executor.quiesce(lease);
+    assert.equal(ownerConfirmations, 1);
 
     const releasedAt = new Date().toISOString();
     connection.exec("BEGIN IMMEDIATE");

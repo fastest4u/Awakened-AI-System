@@ -503,7 +503,7 @@ describe("DefaultProjectStoreBootstrapService", () => {
 
       await assert.rejects(
         new DefaultProjectStoreBootstrapService().initialize({ projectRoot, vaultRoot }),
-        errorCode("STORE_UNAVAILABLE"),
+        errorCode("SCHEMA_FINGERPRINT_MISMATCH"),
       );
       assert.equal(existsSync(expected.manifest), false);
     }
@@ -547,7 +547,7 @@ describe("DefaultProjectStoreBootstrapService", () => {
 
       await assert.rejects(
         new DefaultProjectStoreBootstrapService().initialize({ projectRoot, vaultRoot }),
-        errorCode("STORE_UNAVAILABLE"),
+        errorCode("SCHEMA_FINGERPRINT_MISMATCH"),
       );
     }
 
@@ -561,7 +561,7 @@ describe("DefaultProjectStoreBootstrapService", () => {
 
       await assert.rejects(
         new DefaultProjectStoreBootstrapService().initialize({ projectRoot, vaultRoot }),
-        errorCode("STORE_UNAVAILABLE"),
+        errorCode("SCHEMA_FINGERPRINT_MISMATCH"),
       );
     }
   });

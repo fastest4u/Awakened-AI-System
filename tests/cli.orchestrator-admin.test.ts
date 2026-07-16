@@ -485,6 +485,7 @@ V2 event-store administration:
   orchestrator-init       Inspect or explicitly initialize V2 identity/store (--apply writes)
   orchestrator-status     Verify and print one explicitly bound V2 project/store
   orchestrator-integrity  Run quick integrity, or full integrity with --full
+  orchestrator-upgrade    Inspect an older store, or explicitly upgrade it with --apply
 
 V2 options:
   --project-root <path>   Required literal project root.

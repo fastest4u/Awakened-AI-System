@@ -11,6 +11,10 @@ import { parseProjectDescriptor } from "../identity/project-descriptor.schema.js
 import { parseStoreManifest } from "../identity/store-manifest.schema.js";
 import { PROJECT_MEMORY_APPLICATION_ID } from "../runtime/runtime-capabilities.js";
 import { canonicalJson } from "../serialization/canonical-json.js";
+import {
+  decodeLifecycleIntentWitness,
+  lifecycleIntentHashFromWitnessSource,
+} from "../lifecycle/lifecycle-intent-witness.js";
 import { GENESIS_GLOBAL_HASH } from "../storage/event-store.js";
 import type { Migration } from "../storage/migration.js";
 import { migrationChecksum } from "../storage/migration-runner.js";
@@ -26,8 +30,10 @@ import type {
 } from "../storage/sqlite-driver.js";
 import {
   IntegrityInputError,
+  type IntegrityExtension,
   type IntegrityIssue,
   type IntegrityIssueCode,
+  type IntegrityIssueSink,
   type IntegrityMode,
   type IntegrityReport,
 } from "./integrity.types.js";
@@ -47,6 +53,34 @@ const COMMAND_WITNESS_DATA_ERRORS = new Set([
   "CANONICAL_JSON_INVALID",
   "INTEGRITY_JSON_NONCANONICAL",
   "INTEGRITY_ROW_INVALID",
+]);
+const LIFECYCLE_EVENT_TYPES = new Set([
+  "SessionStarted",
+  "SessionOwnerTransferred",
+  "SessionOwnershipRecovered",
+  "SessionSuspendRequested",
+  "SessionSuspended",
+  "SessionResumed",
+  "SessionCheckpointRecorded",
+  "EvidenceCoverageRecorded",
+  "SessionForked",
+  "ChildAssignmentAmended",
+  "ChildWorkReported",
+  "ChildWorkDispositioned",
+  "ChildCompletionProposed",
+  "ChildSessionCompleted",
+  "ChildSessionSuspended",
+  "ChildWorkTransferCreated",
+  "ChildWorkTransferClaimed",
+  "SessionEndRequested",
+  "SessionEndAmended",
+  "SessionValidationResultRecorded",
+  "SessionEndVerificationPassed",
+  "SessionEndVerificationFailed",
+  "SessionEndVerificationInvalidated",
+  "SessionEndCancelled",
+  "SessionAbandoned",
+  "SessionEnded",
 ]);
 
 const ISSUE_MESSAGES: Record<IntegrityIssueCode, string> = {
@@ -79,6 +113,14 @@ const ISSUE_MESSAGES: Record<IntegrityIssueCode, string> = {
   RANGE_INVALID: "Requested integrity range is invalid or exceeds the bounded maximum",
   RANGE_OUT_OF_BOUNDS: "Requested integrity range extends beyond the authoritative event tail",
   TAIL_LIMIT_INVALID: "Requested quick-check tail limit is invalid or exceeds the bounded maximum",
+  COMMAND_AUTHORIZATION_METADATA_MISMATCH: "Lifecycle command authorization metadata is incomplete or inconsistent",
+  SESSION_AUTHORITY_FOLD_MISMATCH: "Session authority does not match its immutable lifecycle event fold",
+  SESSION_LEASE_INVARIANT_MISMATCH: "Session lease generations or release state are inconsistent",
+  SESSION_EVIDENCE_COVERAGE_MISMATCH: "Session evidence coverage does not match immutable ordinal evidence",
+  LIFECYCLE_APPROVAL_CONSUMPTION_MISMATCH: "Lifecycle approval consumption metadata is incomplete or inconsistent",
+  LIFECYCLE_WORKFLOW_INVARIANT_MISMATCH: "Lifecycle workflow state or claims are inconsistent",
+  LIFECYCLE_VALIDATION_RESULT_MISMATCH: "Lifecycle validation results are not bound to their immutable event and scope",
+  LIFECYCLE_OUTBOX_INVARIANT_MISMATCH: "Lifecycle outbox materialization revisions or fingerprints are inconsistent",
 };
 
 const RFC3339 = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,9}))?(Z|([+-])(\d{2}):(\d{2}))$/;
@@ -111,6 +153,16 @@ interface CommandRow {
   commandId: string;
   commandType: string;
   commandHash: string;
+  lifecycleAuthorizationKind: string | null;
+  authorizationSessionId: string | null;
+  targetSessionId: string | null;
+  presentingActorRole: string | null;
+  presentingClientInstanceId: string | null;
+  targetActorRole: string | null;
+  targetClientInstanceId: string | null;
+  internalWorkflowId: string | null;
+  internalWorkflowGeneration: bigint | null;
+  internalPlannedWorkId: string | null;
   workspaceHeadCommit: string | null;
   outboxOrderJson: string;
   state: string;
@@ -138,7 +190,7 @@ function isCommandWitnessInvalid(error: unknown): boolean {
     || (error instanceof Error && COMMAND_WITNESS_DATA_ERRORS.has(error.message));
 }
 
-class IssueCollector {
+class IssueCollector implements IntegrityIssueSink {
   readonly #issues = new Map<string, IntegrityIssue>();
 
   add(
@@ -191,6 +243,14 @@ function nullableStringValue(row: SqliteRow, name: string): string | null {
 function bigintValue(row: SqliteRow, name: string): bigint {
   const value = row[name];
   if (typeof value !== "bigint") throw new Error("INTEGRITY_ROW_INVALID");
+  return value;
+}
+
+function nullableBigintValue(row: SqliteRow, name: string): bigint | null {
+  const value = row[name];
+  if (value !== null && typeof value !== "bigint") {
+    throw new Error("INTEGRITY_ROW_INVALID");
+  }
   return value;
 }
 
@@ -307,6 +367,16 @@ function commandRow(row: SqliteRow): CommandRow {
     commandId: stringValue(row, "command_id"),
     commandType: stringValue(row, "command_type"),
     commandHash: stringValue(row, "command_hash"),
+    lifecycleAuthorizationKind: nullableStringValue(row, "lifecycle_authorization_kind"),
+    authorizationSessionId: nullableStringValue(row, "authorization_session_id"),
+    targetSessionId: nullableStringValue(row, "target_session_id"),
+    presentingActorRole: nullableStringValue(row, "presenting_actor_role"),
+    presentingClientInstanceId: nullableStringValue(row, "presenting_client_instance_id"),
+    targetActorRole: nullableStringValue(row, "target_actor_role"),
+    targetClientInstanceId: nullableStringValue(row, "target_client_instance_id"),
+    internalWorkflowId: nullableStringValue(row, "internal_workflow_id"),
+    internalWorkflowGeneration: nullableBigintValue(row, "internal_workflow_generation"),
+    internalPlannedWorkId: nullableStringValue(row, "internal_planned_work_id"),
     workspaceHeadCommit: nullableStringValue(row, "workspace_head_commit"),
     outboxOrderJson: stringValue(row, "outbox_order_json"),
     state: stringValue(row, "state"),
@@ -328,6 +398,7 @@ export class EventIntegrityService {
   constructor(
     private readonly connection: SqliteConnection,
     private readonly migrations: readonly Migration[] = PROJECT_STORE_MIGRATIONS,
+    private readonly extensions: readonly IntegrityExtension[] = [],
   ) {}
 
   quickCheck(
@@ -382,6 +453,7 @@ export class EventIntegrityService {
     this.checkPragma("quick_check", "SQLITE_QUICK_CHECK_FAILED", issues);
     this.checkForeignKeys(issues);
     const structural = this.checkStructural(context, issues);
+    this.checkProjectSchemaVersion(issues);
     this.checkStreams(structural.streams, structural.events, issues);
     this.checkCommands(structural.commands, structural.events, issues);
     const rows = this.connection.prepare(`
@@ -402,6 +474,7 @@ export class EventIntegrityService {
       verifyStreamVersions: false,
       initialStreamVersions: new Map(),
     }, issues);
+    for (const extension of this.extensions) extension.quickCheck(context, issues);
     return this.report(
       "quick",
       context,
@@ -432,6 +505,7 @@ export class EventIntegrityService {
       verifyStreamVersions: true,
       initialStreamVersions: new Map(),
     }, issues);
+    for (const extension of this.extensions) extension.fullCheck(context, issues);
     return this.report(
       "full",
       context,
@@ -521,10 +595,21 @@ export class EventIntegrityService {
           FROM streams ORDER BY project_id, stream_id
         `).all().map(streamRow)
       : [];
+    const lifecycleAuthorizationColumns = (this.migrations.at(-1)?.version ?? 0) >= 2
+      ? `lifecycle_authorization_kind, authorization_session_id, target_session_id,
+         presenting_actor_role, presenting_client_instance_id,
+         target_actor_role, target_client_instance_id, internal_workflow_id,
+         internal_workflow_generation, internal_planned_work_id`
+      : `NULL AS lifecycle_authorization_kind, NULL AS authorization_session_id,
+         NULL AS target_session_id, NULL AS presenting_actor_role,
+         NULL AS presenting_client_instance_id, NULL AS target_actor_role,
+         NULL AS target_client_instance_id, NULL AS internal_workflow_id,
+         NULL AS internal_workflow_generation, NULL AS internal_planned_work_id`;
     const commands = includeStreamsAndCommands
       ? this.connection.prepare(`
           SELECT project_id, idempotency_key, command_id, first_global_position,
                  command_type, command_hash, workspace_head_commit,
+                 ${lifecycleAuthorizationColumns},
                  outbox_order_json, state, last_global_position, final_stream_version,
                  event_ids_json, response_json, response_hash, committed_at
           FROM command_dedup
@@ -833,13 +918,107 @@ export class EventIntegrityService {
     if (!metadataMatches) issues.add("COMMAND_METADATA_MISMATCH", location);
 
     try {
-      const expectedHash = this.reconstructCommandHash(command, rows);
+      const expectedHash = command.lifecycleAuthorizationKind === null
+        ? this.reconstructCommandHash(command, rows)
+        : this.reconstructLifecycleIntentHash(command, rows);
       if (expectedHash !== command.commandHash) {
         issues.add("COMMAND_HASH_MISMATCH", location);
       }
     } catch (error) {
       if (!isCommandWitnessInvalid(error)) throw error;
       issues.add("COMMAND_METADATA_MISMATCH", location);
+      if (command.lifecycleAuthorizationKind !== null) {
+        issues.add("COMMAND_HASH_MISMATCH", location);
+      }
+    }
+  }
+
+  private reconstructLifecycleIntentHash(
+    command: CommandRow,
+    sourceRows: readonly SqliteRow[],
+  ): string {
+    const invalid = (): never => {
+      throw new CommandWitnessInvalidError("COMMAND_WITNESS_INVALID");
+    };
+    const rows = [...sourceRows].sort((left, right) => {
+      const leftIndex = bigintValue(left, "command_event_index");
+      const rightIndex = bigintValue(right, "command_event_index");
+      return leftIndex === rightIndex ? 0 : leftIndex < rightIndex ? -1 : 1;
+    });
+    let witnessSource: string | undefined;
+    for (let index = 0; index < rows.length; index += 1) {
+      const row = rows[index]!;
+      const source = row.lifecycle_intent_json;
+      if (source !== null && source !== undefined && typeof source !== "string") return invalid();
+      if (typeof source !== "string") continue;
+      if (index !== 0 || bigintValue(row, "command_event_index") !== 0n) return invalid();
+      const sessionId = nullableStringValue(row, "session_id");
+      if (
+        stringValue(row, "stream_type") !== "session"
+        || sessionId === null
+        || stringValue(row, "stream_id") !== `session/${sessionId}`
+        || !LIFECYCLE_EVENT_TYPES.has(stringValue(row, "event_type"))
+      ) {
+        return invalid();
+      }
+      if (witnessSource !== undefined) return invalid();
+      witnessSource = source;
+    }
+    if (witnessSource === undefined) return invalid();
+    try {
+      const witness = decodeLifecycleIntentWitness(witnessSource);
+      const assertions = witness.persistedAssertions;
+      const generation = command.internalWorkflowGeneration === null
+        ? null
+        : safeNumber(command.internalWorkflowGeneration);
+      if (
+        assertions.authorizationKind !== command.lifecycleAuthorizationKind
+        || assertions.authorizationSessionId !== command.authorizationSessionId
+        || assertions.targetSessionId !== command.targetSessionId
+        || assertions.presentingActorRole !== command.presentingActorRole
+        || assertions.presentingClientInstanceId !== command.presentingClientInstanceId
+        || assertions.targetActorRole !== command.targetActorRole
+        || assertions.targetClientInstanceId !== command.targetClientInstanceId
+        || assertions.internalWorkflowId !== command.internalWorkflowId
+        || assertions.internalWorkflowGeneration !== generation
+        || assertions.internalPlannedWorkId !== command.internalPlannedWorkId
+      ) return invalid();
+
+      const first = rows[0]!;
+      const semanticCommand = witness.intent.command;
+      if (
+        semanticCommand.commandId !== command.commandId
+        || semanticCommand.idempotencyKey !== command.idempotencyKey
+        || semanticCommand.commandType !== command.commandType
+        || semanticCommand.agentId !== stringValue(first, "agent_id")
+        || semanticCommand.expectedProjectId !== stringValue(first, "project_id")
+        || semanticCommand.expectedVaultId !== stringValue(first, "vault_id")
+        || semanticCommand.expectedWorkspaceId !== stringValue(first, "workspace_id")
+        || semanticCommand.expectedBranchRef !== nullableStringValue(first, "branch_ref")
+        || assertions.targetSessionId !== nullableStringValue(first, "session_id")
+        || assertions.presentingActorRole !== stringValue(first, "actor_role")
+        || assertions.presentingClientInstanceId !== stringValue(first, "client_instance_id")
+      ) return invalid();
+
+      if (semanticCommand.commandType === "root-start") {
+        const payload = canonicalJsonValue(stringValue(first, "payload_json"));
+        const storedResponse = canonicalJsonValue(command.responseJson);
+        if (
+          stringValue(first, "event_type") !== "SessionStarted"
+          || !plainRecord(payload)
+          || payload.sessionKind !== "root"
+          || payload.ownerGeneration !== 1
+          || payload.continuityKey !== semanticCommand.continuityKey
+          || payload.creatingAgentId !== semanticCommand.agentId
+          || payload.creatingClientInstanceId !== assertions.targetClientInstanceId
+          || !plainRecord(storedResponse)
+          || !plainRecord(storedResponse.response)
+          || storedResponse.response.sessionId !== assertions.targetSessionId
+        ) return invalid();
+      }
+      return lifecycleIntentHashFromWitnessSource(witnessSource);
+    } catch {
+      return invalid();
     }
   }
 
@@ -1078,6 +1257,17 @@ export class EventIntegrityService {
       const eventSchemaVersion = safeNumber(bigintValue(row, "event_schema_version"));
       const commandEventIndex = safeNumber(bigintValue(row, "command_event_index"));
       if (eventSchemaVersion === undefined || commandEventIndex === undefined) return false;
+      const lifecycleIntentSource = row.lifecycle_intent_json;
+      if (
+        lifecycleIntentSource !== undefined
+        && lifecycleIntentSource !== null
+        && typeof lifecycleIntentSource !== "string"
+      ) {
+        return false;
+      }
+      const lifecycleIntent = typeof lifecycleIntentSource === "string"
+        ? decodeLifecycleIntentWitness(lifecycleIntentSource)
+        : undefined;
       const material = {
         globalPosition: bigintValue(row, "global_position").toString(),
         eventId: stringValue(row, "event_id"),
@@ -1112,6 +1302,7 @@ export class EventIntegrityService {
         evidenceDigests: canonicalJsonValue(stringValue(row, "evidence_digests_json")),
         payloadHash: stringValue(row, "payload_hash"),
         previousGlobalHash: stringValue(row, "previous_global_hash"),
+        ...(lifecycleIntent === undefined ? {} : { lifecycleIntent }),
       };
       return eventHash(material) === stringValue(row, "event_hash");
     } catch {

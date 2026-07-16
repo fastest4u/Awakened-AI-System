@@ -342,6 +342,8 @@ CREATE TABLE lifecycle_validation_results (
 CREATE INDEX lifecycle_validation_results_event_position
 ON lifecycle_validation_results(recorded_event_position);
 
+ALTER TABLE events ADD COLUMN lifecycle_intent_json TEXT;
+
 ALTER TABLE command_dedup ADD COLUMN lifecycle_authorization_kind TEXT;
 ALTER TABLE command_dedup ADD COLUMN authorization_proof_version INTEGER;
 ALTER TABLE command_dedup ADD COLUMN authorization_proof_nonce TEXT;
@@ -989,6 +991,102 @@ WHEN NEW.stream_type = 'session'
   )
 BEGIN
   SELECT RAISE(ABORT, 'COMMAND_AUTHORIZATION_INVALID');
+END;
+
+CREATE TRIGGER events_lifecycle_intent_guard
+BEFORE INSERT ON events
+WHEN NEW.lifecycle_intent_json IS NOT NULL AND (
+  NEW.command_event_index <> 0
+  OR NEW.stream_type <> 'session'
+  OR NEW.session_id IS NULL
+  OR NEW.stream_id <> 'session/' || NEW.session_id
+  OR NEW.event_type NOT IN (
+    'SessionStarted',
+    'SessionOwnerTransferred',
+    'SessionOwnershipRecovered',
+    'SessionSuspendRequested',
+    'SessionSuspended',
+    'SessionResumed',
+    'SessionCheckpointRecorded',
+    'EvidenceCoverageRecorded',
+    'SessionForked',
+    'ChildAssignmentAmended',
+    'ChildWorkReported',
+    'ChildWorkDispositioned',
+    'ChildCompletionProposed',
+    'ChildSessionCompleted',
+    'ChildSessionSuspended',
+    'ChildWorkTransferCreated',
+    'ChildWorkTransferClaimed',
+    'SessionEndRequested',
+    'SessionEndAmended',
+    'SessionValidationResultRecorded',
+    'SessionEndVerificationPassed',
+    'SessionEndVerificationFailed',
+    'SessionEndVerificationInvalidated',
+    'SessionEndCancelled',
+    'SessionAbandoned',
+    'SessionEnded'
+  )
+  OR CASE
+    WHEN json_valid(NEW.lifecycle_intent_json) = 0 THEN 1
+    ELSE
+      json_type(NEW.lifecycle_intent_json) <> 'object'
+      OR json(NEW.lifecycle_intent_json) <> NEW.lifecycle_intent_json
+      OR (SELECT count(*) FROM json_each(NEW.lifecycle_intent_json)) <> 2
+      OR EXISTS (
+        SELECT 1 FROM json_each(NEW.lifecycle_intent_json)
+        WHERE key NOT IN ('intentMaterialVersion', 'material')
+      )
+      OR json_type(NEW.lifecycle_intent_json, '$.intentMaterialVersion') <> 'integer'
+      OR json_extract(NEW.lifecycle_intent_json, '$.intentMaterialVersion') <> 1
+      OR json_type(NEW.lifecycle_intent_json, '$.material') IS NULL
+      OR instr(lower(NEW.lifecycle_intent_json), 'pmcap1.') > 0
+      OR instr(lower(NEW.lifecycle_intent_json), 'pmrap1.') > 0
+      OR EXISTS (
+        SELECT 1 FROM json_tree(NEW.lifecycle_intent_json, '$.material')
+        WHERE key IN (
+          'approval', 'authorization', 'bearer', 'bindingGeneration',
+          'candidateIntentHash', 'childBindingGrant', 'claimExpiresAt',
+          'claimOwnerId', 'claimToken', 'contextFingerprint', 'environment',
+          'path', 'projectBindingId', 'proof', 'proofDigest',
+          'proofFingerprint', 'proofNonce', 'proofVersion', 'rawEvidence',
+          'resumeToken'
+        )
+      )
+  END
+)
+BEGIN
+  SELECT RAISE(ABORT, 'LIFECYCLE_INTENT_WITNESS_INVALID');
+END;
+
+CREATE TRIGGER command_dedup_lifecycle_intent_guard
+BEFORE INSERT ON command_dedup
+WHEN
+  (NEW.lifecycle_authorization_kind IS NULL AND EXISTS (
+    SELECT 1 FROM events
+    WHERE project_id = NEW.project_id
+      AND command_id = NEW.command_id
+      AND lifecycle_intent_json IS NOT NULL
+  ))
+  OR (NEW.lifecycle_authorization_kind IS NOT NULL AND (
+    (SELECT count(*) FROM events
+      WHERE project_id = NEW.project_id
+        AND command_id = NEW.command_id
+        AND lifecycle_intent_json IS NOT NULL) <> 1
+    OR NOT EXISTS (
+      SELECT 1 FROM events
+      WHERE project_id = NEW.project_id
+        AND command_id = NEW.command_id
+        AND command_event_index = 0
+        AND stream_type = 'session'
+        AND session_id IS NOT NULL
+        AND stream_id = 'session/' || session_id
+        AND lifecycle_intent_json IS NOT NULL
+    )
+  ))
+BEGIN
+  SELECT RAISE(ABORT, 'LIFECYCLE_INTENT_WITNESS_INVALID');
 END;
 
 CREATE TRIGGER command_dedup_lifecycle_insert_guard

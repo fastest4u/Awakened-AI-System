@@ -297,6 +297,7 @@ export class ProjectStoreExecutor {
   #expectedTermination = false;
   #explicitMaintenanceLease: MaintenanceLease | null = null;
   #quiescedNotification: WorkerNotification | null = null;
+  #observedClosurePromise: Promise<void> | null = null;
   readonly #workerExit: Promise<number>;
   #resolveWorkerExit!: (exitCode: number) => void;
   readonly #poisonedSignal: Promise<ProjectStoreWorkerError>;
@@ -427,14 +428,6 @@ export class ProjectStoreExecutor {
   }
 
   quiesce(lease: MaintenanceLease): Promise<void> {
-    try {
-      this.assertCallable(["open"]);
-      if (this.#explicitMaintenanceLease !== null) {
-        throw new ProjectStoreWorkerError("MAINTENANCE_QUIESCING");
-      }
-    } catch (error) {
-      return Promise.reject(error);
-    }
     let encodedLease: ReturnType<typeof encodeMaintenanceLeaseWire>;
     let expectedLease: MaintenanceLease;
     try {
@@ -442,11 +435,45 @@ export class ProjectStoreExecutor {
       expectedLease = decodeMaintenanceLeaseWire(encodedLease);
     } catch {
       const failure = new ProjectStoreWorkerError("WORKER_PROTOCOL_ERROR");
-      this.#quiescePromise = (async () => {
+      this.#quiescePromise ??= (async () => {
         await this.poison(failure);
         throw failure;
       })();
       return this.#quiescePromise;
+    }
+    if (this.#quiescePromise !== null) {
+      if (
+        this.#explicitMaintenanceLease !== null
+        && sameMaintenanceLease(this.#explicitMaintenanceLease, expectedLease)
+      ) {
+        return this.#quiescePromise;
+      }
+      return Promise.reject(new ProjectStoreWorkerError("MAINTENANCE_QUIESCING"));
+    }
+    if (this.#quiescedNotification !== null) {
+      const observedLease = decodeMaintenanceLeaseWire({
+        epoch: this.#quiescedNotification.epoch,
+        fencingToken: this.#quiescedNotification.fencingToken,
+        ownerId: this.#quiescedNotification.ownerId,
+        leaseExpiresAt: this.#quiescedNotification.leaseExpiresAt,
+      });
+      if (!sameMaintenanceLease(observedLease, expectedLease)) {
+        return Promise.reject(new ProjectStoreWorkerError("MAINTENANCE_QUIESCING"));
+      }
+      const observed = this.#observedClosurePromise ?? Promise.resolve();
+      return observed.then(() => {
+        if (this.#state !== "quiesced") {
+          throw this.#terminalError ?? new ProjectStoreWorkerError("WORKER_CLOSED");
+        }
+      });
+    }
+    try {
+      this.assertCallable(["open"]);
+      if (this.#explicitMaintenanceLease !== null) {
+        throw new ProjectStoreWorkerError("MAINTENANCE_QUIESCING");
+      }
+    } catch (error) {
+      return Promise.reject(error);
     }
     this.#explicitMaintenanceLease = expectedLease;
     this.#expectedTermination = true;
@@ -717,7 +744,10 @@ export class ProjectStoreExecutor {
       if (this.#state === "poisoned" || this.#terminalError !== null) return;
       this.#state = "closed";
       if (this.#explicitMaintenanceLease === null && this.#quiescedNotification !== null) {
-        void this.confirmObservedMaintenanceClosure(this.#quiescedNotification);
+        this.#observedClosurePromise = this.confirmObservedMaintenanceClosure(
+          this.#quiescedNotification,
+        );
+        void this.#observedClosurePromise;
       }
       return;
     }
@@ -853,6 +883,10 @@ export class ProjectStoreExecutor {
     return this.#state === "new" || this.#state === "open";
   }
 
+  hasRegisteredExecutor(): boolean {
+    return this.#opened !== null;
+  }
+
   private terminateWorker(): Promise<void> {
     if (this.#terminationPromise !== null) return this.#terminationPromise;
     this.#expectedTermination = true;
@@ -876,14 +910,24 @@ export class ProjectStoreExecutor {
 export class ProjectStoreExecutorRegistry {
   readonly #entries = new Map<string, { key: string; executor: ProjectStoreExecutor }>();
   readonly #acquisitions = new Map<string, Promise<ProjectStoreExecutor>>();
+  readonly #quiescences = new Map<
+    string,
+    { lease: MaintenanceLease; promise: Promise<void> }
+  >();
 
   constructor(private readonly dependencies: Partial<ProjectStoreExecutorDependencies> = {}) {}
 
   async acquire(options: ProjectStoreExecutorOptions): Promise<ProjectStoreExecutor> {
     const reuseKey = storeReuseKey(options.context);
+    if (this.#quiescences.has(reuseKey)) {
+      throw new ProjectStoreWorkerError("MAINTENANCE_QUIESCING");
+    }
     const predecessor = this.#acquisitions.get(reuseKey);
     const acquisition = (async () => {
       if (predecessor !== undefined) await predecessor.catch(() => undefined);
+      if (this.#quiescences.has(reuseKey)) {
+        throw new ProjectStoreWorkerError("MAINTENANCE_QUIESCING");
+      }
       const exactKey = projectStoreExecutorKey(options.context);
       const current = this.#entries.get(reuseKey);
       if (current?.key === exactKey && current.executor.canReuse()) return current.executor;
@@ -899,6 +943,50 @@ export class ProjectStoreExecutorRegistry {
       if (this.#acquisitions.get(reuseKey) === acquisition) {
         this.#acquisitions.delete(reuseKey);
       }
+    }
+  }
+
+  async quiesceStore(
+    context: ProjectContext,
+    lease: MaintenanceLease,
+  ): Promise<void> {
+    const reuseKey = storeReuseKey(context);
+    const currentQuiescence = this.#quiescences.get(reuseKey);
+    if (currentQuiescence !== undefined) {
+      return sameMaintenanceLease(currentQuiescence.lease, lease)
+        ? currentQuiescence.promise
+        : Promise.reject(new ProjectStoreWorkerError("MAINTENANCE_QUIESCING"));
+    }
+    const quiescence = this.quiesceStoreOwned(reuseKey, lease);
+    const active = { lease, promise: quiescence };
+    this.#quiescences.set(reuseKey, active);
+    try {
+      await quiescence;
+    } finally {
+      if (this.#quiescences.get(reuseKey) === active) this.#quiescences.delete(reuseKey);
+    }
+  }
+
+  private async quiesceStoreOwned(
+    reuseKey: string,
+    lease: MaintenanceLease,
+  ): Promise<void> {
+    for (;;) {
+      const acquiring = this.#acquisitions.get(reuseKey);
+      if (acquiring !== undefined) await acquiring;
+      if (this.#acquisitions.get(reuseKey) !== undefined) continue;
+      const current = this.#entries.get(reuseKey);
+      if (current === undefined) return;
+      if (!current.executor.hasRegisteredExecutor()) {
+        if (this.#entries.get(reuseKey) === current) this.#entries.delete(reuseKey);
+        return;
+      }
+      try {
+        await current.executor.quiesce(lease);
+      } finally {
+        if (this.#entries.get(reuseKey) === current) this.#entries.delete(reuseKey);
+      }
+      if (this.#entries.get(reuseKey) === undefined) return;
     }
   }
 }

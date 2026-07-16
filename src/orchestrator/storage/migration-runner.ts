@@ -15,7 +15,20 @@ export type MigrationErrorCode = SchemaCompatibilityErrorCode;
 
 export type MigrationApplyMode =
   | { kind: "bootstrap-empty" }
-  | { kind: "explicit-upgrade"; expectedAppliedVersion: number };
+  | {
+      kind: "explicit-upgrade";
+      expectedAppliedVersion: number;
+      faultInjector?: {
+        hit(
+          boundary:
+            | "after-ddl-before-migration-row"
+            | "after-migration-row-before-project-version"
+            | "after-project-version-before-commit",
+          migration: Migration,
+        ): void;
+      };
+      renewMutableBoundary?: () => void;
+    };
 
 function fail(code: SchemaCompatibilityErrorCode): never {
   throw new SchemaCompatibilityError(code);
@@ -121,7 +134,12 @@ export class MigrationRunner {
 
       const applied: number[] = [];
       for (const migration of registry.slice(appliedVersion)) {
+        if (mode.kind === "explicit-upgrade") mode.renewMutableBoundary?.();
         connection.exec(migration.sql);
+        if (mode.kind === "explicit-upgrade") {
+          mode.faultInjector?.hit("after-ddl-before-migration-row", migration);
+          mode.renewMutableBoundary?.();
+        }
         connection.prepare(`
           INSERT INTO schema_migrations(version, name, checksum, applied_at)
           VALUES ($version, $name, $checksum, $appliedAt)
@@ -131,6 +149,11 @@ export class MigrationRunner {
           $checksum: migrationChecksum(migration),
           $appliedAt: appliedAt,
         });
+
+        if (mode.kind === "explicit-upgrade") {
+          mode.faultInjector?.hit("after-migration-row-before-project-version", migration);
+          mode.renewMutableBoundary?.();
+        }
 
         if (identityRowCount(connection) === 1) {
           const result = connection.prepare(`
@@ -143,8 +166,12 @@ export class MigrationRunner {
           });
           if (result.changes !== 1n) fail("PROJECT_SCHEMA_VERSION_MISMATCH");
         }
+        if (mode.kind === "explicit-upgrade") {
+          mode.faultInjector?.hit("after-project-version-before-commit", migration);
+        }
         applied.push(migration.version);
       }
+      if (mode.kind === "explicit-upgrade") mode.renewMutableBoundary?.();
       connection.exec("COMMIT");
       return applied;
     } catch (error) {

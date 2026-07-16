@@ -11,6 +11,7 @@ import { Worker } from "node:worker_threads";
 import type { JsonValue } from "../contracts/event.js";
 import type { ProjectContext } from "../identity/contracts.js";
 import { EventIntegrityService } from "../integrity/event-integrity.service.js";
+import { LifecycleIntegrityService } from "../integrity/lifecycle-integrity.service.js";
 import type { IntegrityReport } from "../integrity/integrity.types.js";
 import { BranchScopeRepository } from "../storage/branch-scope.repository.js";
 import {
@@ -643,7 +644,11 @@ export async function runIntegrityChild(
       { projectId: context.binding.projectId, vaultId: context.binding.vaultId },
       context.binding.storeId,
     );
-    const integrity = new EventIntegrityService(connection);
+    const integrity = new EventIntegrityService(
+      connection,
+      PROJECT_STORE_MIGRATIONS,
+      [new LifecycleIntegrityService(connection)],
+    );
     return request.type === "quickIntegrity"
       ? integrity.quickCheck(context, request.tailLimit)
       : integrity.fullCheck(context);

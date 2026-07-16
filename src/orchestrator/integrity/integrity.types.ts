@@ -1,4 +1,6 @@
-export const INTEGRITY_ISSUE_CODES = [
+import type { ProjectContext } from "../identity/contracts.js";
+
+export const CORE_INTEGRITY_ISSUE_CODES = [
   "PROJECT_ID_MISMATCH",
   "VAULT_ID_MISMATCH",
   "STORE_ID_MISMATCH",
@@ -30,6 +32,22 @@ export const INTEGRITY_ISSUE_CODES = [
   "TAIL_LIMIT_INVALID",
 ] as const;
 
+export const LIFECYCLE_INTEGRITY_ISSUE_CODES = [
+  "COMMAND_AUTHORIZATION_METADATA_MISMATCH",
+  "SESSION_AUTHORITY_FOLD_MISMATCH",
+  "SESSION_LEASE_INVARIANT_MISMATCH",
+  "SESSION_EVIDENCE_COVERAGE_MISMATCH",
+  "LIFECYCLE_APPROVAL_CONSUMPTION_MISMATCH",
+  "LIFECYCLE_WORKFLOW_INVARIANT_MISMATCH",
+  "LIFECYCLE_VALIDATION_RESULT_MISMATCH",
+  "LIFECYCLE_OUTBOX_INVARIANT_MISMATCH",
+] as const;
+
+export const INTEGRITY_ISSUE_CODES = [
+  ...CORE_INTEGRITY_ISSUE_CODES,
+  ...LIFECYCLE_INTEGRITY_ISSUE_CODES,
+] as const;
+
 export type IntegrityIssueCode = (typeof INTEGRITY_ISSUE_CODES)[number];
 export type IntegrityMode = "quick" | "full" | "range";
 
@@ -39,6 +57,18 @@ export interface IntegrityIssue {
   globalPosition?: string;
   streamId?: string;
   commandId?: string;
+}
+
+export interface IntegrityIssueSink {
+  add(
+    code: IntegrityIssueCode,
+    location?: Omit<IntegrityIssue, "code" | "message">,
+  ): void;
+}
+
+export interface IntegrityExtension {
+  quickCheck(context: ProjectContext, sink: IntegrityIssueSink): void;
+  fullCheck(context: ProjectContext, sink: IntegrityIssueSink): void;
 }
 
 export interface IntegrityReport {
