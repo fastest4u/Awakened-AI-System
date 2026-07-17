@@ -1,3 +1,5 @@
+import { canonicalJson } from "../serialization/canonical-json.js";
+
 export const LIFECYCLE_ERROR_CODES = Object.freeze([
   "PROJECT_BINDING_REQUIRED",
   "PROJECT_ID_MISMATCH",
@@ -177,6 +179,23 @@ const SQLITE_INT64_MAX_DECIMAL = "9223372036854775807";
 const SAFE_FIELD = /^[A-Za-z][A-Za-z0-9_.\[\]-]{0,127}$/;
 const SAFE_PHASE = /^[a-z][a-z0-9-]{0,63}$/;
 
+export const MAX_SESSION_AMBIGUITY_SUMMARIES = 16;
+export const MAX_SESSION_AMBIGUITY_JSON_BYTES = 16_384;
+
+export interface RedactedSessionAmbiguitySummaryV1 {
+  readonly sessionId: string;
+  readonly state: "active" | "suspended";
+  readonly ownerGeneration: string;
+  readonly latestCheckpointEventPosition: string | null;
+  readonly checkpointRequired: boolean;
+}
+
+export interface SessionAmbiguitySummariesV1 {
+  readonly schemaVersion: 1;
+  readonly candidates: readonly RedactedSessionAmbiguitySummaryV1[];
+  readonly truncated: boolean;
+}
+
 export const LIFECYCLE_IDEMPOTENCY_KEY_MAX_SCALARS = 512;
 
 export function isBoundedLifecycleString(
@@ -195,6 +214,7 @@ export interface LifecycleErrorEnvelope {
   readonly safeMessage: string;
   readonly projectId?: string;
   readonly sessionId?: string;
+  readonly candidateSummaries?: SessionAmbiguitySummariesV1;
   readonly recoveryActions: readonly LifecycleRecoveryAction[];
 }
 
@@ -206,7 +226,106 @@ function isSafeDecimalString(value: string): boolean {
     );
 }
 
-function readSafeDetails(value: unknown): Readonly<Record<string, string | number | bigint>> {
+function exactPlainRecord(value: unknown, keys: readonly string[]): Record<string, unknown> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new TypeError("Lifecycle ambiguity summaries must be plain records");
+  }
+  const prototype = Object.getPrototypeOf(value) as unknown;
+  if (prototype !== Object.prototype && prototype !== null) {
+    throw new TypeError("Lifecycle ambiguity summaries must be plain records");
+  }
+  const actual = Reflect.ownKeys(value);
+  if (actual.length !== keys.length
+    || actual.some((key) => typeof key !== "string" || !keys.includes(key))) {
+    throw new TypeError("Lifecycle ambiguity summaries contain unknown fields");
+  }
+  const output: Record<string, unknown> = {};
+  for (const key of keys) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (descriptor === undefined || !descriptor.enumerable || !("value" in descriptor)) {
+      throw new TypeError("Lifecycle ambiguity summaries require enumerable data properties");
+    }
+    output[key] = descriptor.value;
+  }
+  return output;
+}
+
+function decodeSessionAmbiguitySummariesJson(value: unknown): SessionAmbiguitySummariesV1 {
+  if (
+    typeof value !== "string"
+    || Buffer.byteLength(value, "utf8") > MAX_SESSION_AMBIGUITY_JSON_BYTES
+  ) throw new TypeError("Lifecycle ambiguity summaries must be bounded canonical JSON");
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value) as unknown;
+    if (canonicalJson(parsed) !== value) throw new TypeError("noncanonical");
+  } catch {
+    throw new TypeError("Lifecycle ambiguity summaries must be bounded canonical JSON");
+  }
+  const envelope = exactPlainRecord(parsed, ["schemaVersion", "candidates", "truncated"]);
+  if (
+    envelope.schemaVersion !== 1
+    || typeof envelope.truncated !== "boolean"
+    || !Array.isArray(envelope.candidates)
+    || envelope.candidates.length < 2
+    || envelope.candidates.length > MAX_SESSION_AMBIGUITY_SUMMARIES
+  ) throw new TypeError("Lifecycle ambiguity summaries have invalid bounds");
+  let previousSessionId: string | null = null;
+  const candidates = Object.freeze(envelope.candidates.map((candidate) => {
+    const item = exactPlainRecord(candidate, [
+      "sessionId",
+      "state",
+      "ownerGeneration",
+      "latestCheckpointEventPosition",
+      "checkpointRequired",
+    ]);
+    if (
+      typeof item.sessionId !== "string"
+      || !LOWER_UUID.test(item.sessionId)
+      || (previousSessionId !== null && item.sessionId <= previousSessionId)
+      || (item.state !== "active" && item.state !== "suspended")
+      || typeof item.ownerGeneration !== "string"
+      || !isSafeDecimalString(item.ownerGeneration)
+      || item.ownerGeneration === "0"
+      || (
+        item.latestCheckpointEventPosition !== null
+        && (
+          typeof item.latestCheckpointEventPosition !== "string"
+          || !isSafeDecimalString(item.latestCheckpointEventPosition)
+          || item.latestCheckpointEventPosition === "0"
+        )
+      )
+      || typeof item.checkpointRequired !== "boolean"
+    ) throw new TypeError("Lifecycle ambiguity summary contains invalid fields");
+    previousSessionId = item.sessionId;
+    return Object.freeze({
+      sessionId: item.sessionId,
+      state: item.state,
+      ownerGeneration: item.ownerGeneration,
+      latestCheckpointEventPosition: item.latestCheckpointEventPosition,
+      checkpointRequired: item.checkpointRequired,
+    }) as RedactedSessionAmbiguitySummaryV1;
+  }));
+  return Object.freeze({
+    schemaVersion: 1,
+    candidates,
+    truncated: envelope.truncated,
+  });
+}
+
+export function encodeSessionAmbiguitySummaries(
+  candidates: readonly RedactedSessionAmbiguitySummaryV1[],
+  truncated: boolean,
+): string {
+  const encoded = canonicalJson({ schemaVersion: 1, candidates, truncated });
+  decodeSessionAmbiguitySummariesJson(encoded);
+  return encoded;
+}
+
+function readSafeDetails(
+  code: LifecycleErrorCode,
+  value: unknown,
+): Readonly<Record<string, string | number | bigint>> {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
     throw new TypeError("Lifecycle error details must be a plain safe-scalar record");
   }
@@ -224,6 +343,7 @@ function readSafeDetails(value: unknown): Readonly<Record<string, string | numbe
         && key !== "idempotencyKey"
         && key !== "field"
         && key !== "phase"
+        && key !== "candidateSummariesJson"
       )
     ) {
       throw new TypeError("Lifecycle error details contain a non-allowlisted key");
@@ -233,6 +353,14 @@ function readSafeDetails(value: unknown): Readonly<Record<string, string | numbe
       throw new TypeError("Lifecycle error details must contain enumerable data properties only");
     }
     const detail = descriptor.value as unknown;
+    if (key === "candidateSummariesJson") {
+      if (code !== "SESSION_AMBIGUOUS") {
+        throw new TypeError("Lifecycle ambiguity summaries are valid only for SESSION_AMBIGUOUS");
+      }
+      decodeSessionAmbiguitySummariesJson(detail);
+      output[key] = detail as string;
+      continue;
+    }
     if (key === "idempotencyKey") {
       if (!isBoundedLifecycleString(detail, LIFECYCLE_IDEMPOTENCY_KEY_MAX_SCALARS)) {
         throw new TypeError("Lifecycle error idempotency details must be bounded opaque strings");
@@ -291,10 +419,12 @@ export class LifecycleError extends Error implements LifecycleErrorEnvelope {
   declare readonly projectId?: string;
   declare readonly sessionId?: string;
   readonly recoveryActions: readonly LifecycleRecoveryAction[];
+  readonly details!: Readonly<Record<string, string | number | bigint>>;
+  declare readonly candidateSummaries?: SessionAmbiguitySummariesV1;
 
   constructor(code: LifecycleErrorCode, details: unknown = {}) {
     if (!ERROR_CODE_SET.has(code)) throw new TypeError("Unknown lifecycle error code");
-    const safeDetails = readSafeDetails(details);
+    const safeDetails = readSafeDetails(code, details);
     const definition = FAILURE_DEFINITIONS[code];
     super(`${code}: ${definition.safeMessage}`);
     Object.defineProperty(this, "name", { value: "LifecycleError", enumerable: false });
@@ -302,8 +432,19 @@ export class LifecycleError extends Error implements LifecycleErrorEnvelope {
     this.retryable = definition.retryable;
     this.safeMessage = definition.safeMessage;
     this.recoveryActions = definition.recoveryActions;
+    Object.defineProperty(this, "details", {
+      value: safeDetails,
+      enumerable: false,
+      configurable: false,
+      writable: false,
+    });
     if (typeof safeDetails.projectId === "string") this.projectId = safeDetails.projectId;
     if (typeof safeDetails.sessionId === "string") this.sessionId = safeDetails.sessionId;
+    if (typeof safeDetails.candidateSummariesJson === "string") {
+      this.candidateSummaries = decodeSessionAmbiguitySummariesJson(
+        safeDetails.candidateSummariesJson,
+      );
+    }
   }
 
   toJSON(): LifecycleErrorEnvelope {
@@ -313,6 +454,9 @@ export class LifecycleError extends Error implements LifecycleErrorEnvelope {
       safeMessage: this.safeMessage,
       ...(this.projectId === undefined ? {} : { projectId: this.projectId }),
       ...(this.sessionId === undefined ? {} : { sessionId: this.sessionId }),
+      ...(this.candidateSummaries === undefined
+        ? {}
+        : { candidateSummaries: this.candidateSummaries }),
       recoveryActions: this.recoveryActions,
     });
   }

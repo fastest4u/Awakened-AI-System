@@ -19,6 +19,7 @@ import {
   type VerifiedCapabilityProofV1,
 } from "./authority/capability-codec.js";
 import { SecretString } from "./authority/redacted-secret.js";
+import { canonicalJson } from "../serialization/canonical-json.js";
 
 export type { AuthorityMaterialStatus } from "./lifecycle-command.store.js";
 
@@ -87,6 +88,21 @@ export interface AuthorityMaterialResolutionV1 {
   readonly recoveryCode?: "SESSION_HANDLE_STALE" | "SESSION_CAPABILITY_KEY_UNAVAILABLE";
 }
 
+export interface ContinuityFingerprintInputV1 {
+  readonly projectId: string;
+  readonly storeId: string;
+  readonly clientNamespace: string;
+  readonly continuityKey: string;
+}
+
+export interface ContinuityFingerprintV1 {
+  readonly algorithm: "hmac-sha256";
+  readonly schemaVersion: 1;
+  readonly keyId: string;
+  readonly domain: "pm-continuity-v1";
+  readonly fingerprint: string;
+}
+
 export type RootOrChildAuthorityMaterial =
   | {
       readonly kind: "root";
@@ -99,6 +115,7 @@ export type RootOrChildAuthorityMaterial =
     };
 
 const HASH = /^[0-9a-f]{64}$/;
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const DECIMAL = /^(0|[1-9][0-9]*)$/;
 
 function keyUnavailable(): never {
@@ -217,6 +234,68 @@ export class CapabilityService {
     this.#provider = options.keyProvider;
     this.#clock = options.clock;
     this.#nonces = options.nonceSource;
+  }
+
+  continuityFingerprint(input: ContinuityFingerprintInputV1): ContinuityFingerprintV1 {
+    if (
+      typeof input !== "object"
+      || input === null
+      || !UUID.test(input.projectId)
+      || !UUID.test(input.storeId)
+      || typeof input.clientNamespace !== "string"
+      || input.clientNamespace.length === 0
+      || Array.from(input.clientNamespace).length > 256
+      || typeof input.continuityKey !== "string"
+      || input.continuityKey.length === 0
+      || Array.from(input.continuityKey).length > 1_024
+    ) invalid();
+    let keyId: string;
+    try {
+      keyId = this.#provider.currentKey(
+        { projectId: input.projectId, storeId: input.storeId },
+        "continuity-index",
+      ).keyId;
+      if (
+        typeof keyId !== "string"
+        || keyId.length === 0
+        || Array.from(keyId).length > 256
+        || this.#provider.status(
+          { projectId: input.projectId, storeId: input.storeId },
+          "continuity-index",
+          keyId,
+        ) !== "available"
+      ) keyUnavailable();
+    } catch (error) {
+      if (error instanceof LifecycleError) throw error;
+      keyUnavailable();
+    }
+    const bytes = Buffer.from(canonicalJson({
+      clientNamespace: input.clientNamespace,
+      continuityKey: input.continuityKey,
+    }), "utf8");
+    try {
+      const fingerprint = this.#provider.fingerprint({
+        projectId: input.projectId,
+        storeId: input.storeId,
+        purpose: "continuity-index",
+        keyId,
+        domain: "pm-continuity-v1",
+        bytes,
+      });
+      if (!HASH.test(fingerprint)) invalid();
+      return Object.freeze({
+        algorithm: "hmac-sha256",
+        schemaVersion: 1,
+        keyId,
+        domain: "pm-continuity-v1",
+        fingerprint,
+      });
+    } catch (error) {
+      if (error instanceof LifecycleError) throw error;
+      keyUnavailable();
+    } finally {
+      bytes.fill(0);
+    }
   }
 
   prepareCapability(input: PrepareCapabilityInputV1): StoredCapabilityMaterialV1 {

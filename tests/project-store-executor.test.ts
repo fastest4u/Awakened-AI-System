@@ -76,6 +76,10 @@ import { EventStore, EventStoreError } from "../src/orchestrator/storage/event-s
 import { NodeSqliteDriver } from "../src/orchestrator/storage/node-sqlite-driver.js";
 import { DEFAULT_BUSY_TIMEOUT_MS } from "../src/orchestrator/runtime/runtime-capabilities.js";
 import { canonicalMkdtemp } from "./support/canonical-temp.js";
+import {
+  encodeSessionAmbiguitySummaries,
+  LifecycleError,
+} from "../src/orchestrator/lifecycle/errors.js";
 
 const roots: string[] = [];
 const PROJECT_ID = "11111111-1111-4111-8111-111111111111" as ProjectId;
@@ -1406,6 +1410,40 @@ describe("ProjectStoreExecutor bounded lifecycle", () => {
     }
   });
 
+  it("preserves the bounded ambiguity scalar through executor detail sanitization", async () => {
+    const { executor, worker } = await fakeExecutor();
+    const candidateSummariesJson = encodeSessionAmbiguitySummaries([{
+      sessionId: "00000000-0000-4000-8000-000000000010",
+      state: "active",
+      ownerGeneration: "1",
+      latestCheckpointEventPosition: null,
+      checkpointRequired: false,
+    }, {
+      sessionId: "00000000-0000-4000-8000-000000000011",
+      state: "suspended",
+      ownerGeneration: "2",
+      latestCheckpointEventPosition: "9",
+      checkpointRequired: true,
+    }], false);
+    const pending = executor.quickIntegrity();
+    const request = worker.posted.at(-1)!;
+    worker.emit("message", {
+      id: request.id,
+      ok: false,
+      error: {
+        code: "SESSION_AMBIGUOUS",
+        message: "SESSION_AMBIGUOUS",
+        details: { candidateSummariesJson },
+      },
+    });
+    await assert.rejects(pending, (error) => {
+      assert.ok(error instanceof ProjectStoreWorkerError);
+      assert.equal(error.code, "SESSION_AMBIGUOUS");
+      assert.deepEqual(error.details, { candidateSummariesJson });
+      return true;
+    });
+  });
+
   it("reports only the original command recovery identity after a posted mutation becomes ambiguous", async () => {
     const { executor, scheduler, context } = await fakeExecutor();
     const command = appendCommand(context);
@@ -1955,6 +1993,46 @@ describe("primary SQLite busy retry", () => {
 });
 
 describe("ProjectStoreWorkerRuntime FIFO and heartbeat", () => {
+  it("preserves the bounded ambiguity scalar through worker error sanitization and wire decoding", async () => {
+    const context = contextFixture();
+    const candidateSummariesJson = encodeSessionAmbiguitySummaries([{
+      sessionId: "00000000-0000-4000-8000-000000000010",
+      state: "active",
+      ownerGeneration: "1",
+      latestCheckpointEventPosition: null,
+      checkpointRequired: false,
+    }, {
+      sessionId: "00000000-0000-4000-8000-000000000011",
+      state: "suspended",
+      ownerGeneration: "2",
+      latestCheckpointEventPosition: "9",
+      checkpointRequired: true,
+    }], false);
+    const posted: unknown[] = [];
+    const runtime = new ProjectStoreWorkerRuntime({
+      backend: {
+        async dispatch() {
+          throw new LifecycleError("SESSION_AMBIGUOUS", { candidateSummariesJson });
+        },
+        async heartbeat() { return { mode: "idle" }; },
+        async quiesceAndClose() { throw new Error("unused"); },
+        async quiesceObservedAndClose() { throw new Error("unused"); },
+        async close() {},
+      },
+      port: { postMessage(value) { posted.push(value); }, close() {} },
+      scheduler: { setInterval() { return {}; }, clearInterval() {} },
+      heartbeatIntervalMs: 5_000,
+    });
+    runtime.receive({ id: "ambiguity-wire", type: "open", binding: workerBinding(context) });
+    await turn();
+
+    const decoded = decodeWorkerResponse(posted[0]);
+    assert.equal(decoded.ok, false);
+    if (decoded.ok) assert.fail("expected worker failure");
+    assert.equal(decoded.error.code, "SESSION_AMBIGUOUS");
+    assert.deepEqual(decoded.error.details, { candidateSummariesJson });
+  });
+
   it("coalesces a matching explicit quiesce after heartbeat observation", async () => {
     const context = contextFixture();
     const observedClose = deferred<{

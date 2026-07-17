@@ -67,8 +67,11 @@ import {
   type ValidationResultV1,
 } from "../src/orchestrator/lifecycle/contracts/session-end.js";
 import {
+  encodeSessionAmbiguitySummaries,
   LIFECYCLE_ERROR_CODES,
   LifecycleError,
+  MAX_SESSION_AMBIGUITY_JSON_BYTES,
+  MAX_SESSION_AMBIGUITY_SUMMARIES,
   type LifecycleErrorCode,
 } from "../src/orchestrator/lifecycle/errors.js";
 
@@ -2790,5 +2793,94 @@ describe("lifecycle Version 1 contracts", () => {
       TypeError,
     );
     assert.equal(getterCalled, false);
+  });
+
+  it("strictly bounds, canonicalizes, freezes, and redacts ambiguity summaries", () => {
+    const first = {
+      sessionId: "00000000-0000-4000-8000-000000000010",
+      state: "active" as const,
+      ownerGeneration: "1",
+      latestCheckpointEventPosition: null,
+      checkpointRequired: false,
+    };
+    const second = {
+      sessionId: "00000000-0000-4000-8000-000000000011",
+      state: "suspended" as const,
+      ownerGeneration: "9223372036854775807",
+      latestCheckpointEventPosition: "9223372036854775807",
+      checkpointRequired: true,
+    };
+    const encoded = encodeSessionAmbiguitySummaries([first, second], false);
+    assert.ok(Buffer.byteLength(encoded, "utf8") <= MAX_SESSION_AMBIGUITY_JSON_BYTES);
+    const error = new LifecycleError("SESSION_AMBIGUOUS", {
+      candidateSummariesJson: encoded,
+    });
+    assert.deepEqual(error.candidateSummaries, {
+      schemaVersion: 1,
+      candidates: [first, second],
+      truncated: false,
+    });
+    assert.equal(Object.isFrozen(error.details), true);
+    assert.equal(Object.prototype.propertyIsEnumerable.call(error, "details"), false);
+    assert.equal(Object.isFrozen(error.candidateSummaries), true);
+    assert.equal(Object.isFrozen(error.candidateSummaries?.candidates), true);
+    assert.equal(Object.isFrozen(error.candidateSummaries?.candidates[0]), true);
+    assert.equal(error.details.candidateSummariesJson, encoded);
+    assert.doesNotMatch(
+      JSON.stringify(error.candidateSummaries),
+      /continuity|fingerprint|proof|nonce|verifier|approval|workspace|branch|canary/iu,
+    );
+
+    const candidates = Array.from(
+      { length: MAX_SESSION_AMBIGUITY_SUMMARIES },
+      (_unused, index) => ({
+        ...first,
+        sessionId: `00000000-0000-4000-8000-${(index + 100).toString().padStart(12, "0")}`,
+      }),
+    );
+    assert.doesNotThrow(() => encodeSessionAmbiguitySummaries(candidates, true));
+
+    const invalidCandidates: readonly unknown[] = [
+      [first],
+      [...candidates, {
+        ...first,
+        sessionId: "00000000-0000-4000-8000-000000000999",
+      }],
+      [second, first],
+      [first, { ...second, state: "ended" }],
+      [first, { ...second, ownerGeneration: "0" }],
+      [first, { ...second, ownerGeneration: "01" }],
+      [first, { ...second, ownerGeneration: "9223372036854775808" }],
+      [first, { ...second, latestCheckpointEventPosition: "0" }],
+      [first, { ...second, hiddenCanary: "AMBIGUITY_CANARY" }],
+    ];
+    for (const invalid of invalidCandidates) {
+      assert.throws(
+        () => encodeSessionAmbiguitySummaries(invalid as never, false),
+        TypeError,
+      );
+    }
+    assert.throws(
+      () => new LifecycleError("SESSION_AMBIGUOUS", {
+        candidateSummariesJson: JSON.stringify({
+          schemaVersion: 1,
+          candidates: [first, second],
+          truncated: false,
+        }),
+      }),
+      TypeError,
+    );
+    assert.throws(
+      () => new LifecycleError("SESSION_AMBIGUOUS", {
+        candidateSummariesJson: "😀".repeat(MAX_SESSION_AMBIGUITY_JSON_BYTES),
+      }),
+      TypeError,
+    );
+    assert.throws(
+      () => new LifecycleError("INTEGRITY_FAILURE", {
+        candidateSummariesJson: encoded,
+      }),
+      TypeError,
+    );
   });
 });

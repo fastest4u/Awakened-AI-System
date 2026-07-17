@@ -188,7 +188,7 @@ export interface RootStartCommandV2 extends LifecycleCommandBase {
 export interface RootResumeCommandV2 extends LifecycleCommandBase {
   readonly commandType: "root-resume";
   readonly sessionId: SessionId | null;
-  readonly continuityKey: string;
+  readonly continuityKey: string | null;
   readonly resumePolicy: Exclude<ResumePolicy, "new">;
   readonly expectedOwnerGeneration: string;
 }
@@ -783,12 +783,13 @@ export function decodeLifecycleSemanticCommandDraft(value: unknown): LifecycleSe
       const command = exactCommand(value, ["sessionId", "continuityKey", "resumePolicy", "expectedOwnerGeneration"]);
       const resumePolicy = parseEnum(command.resumePolicy, RESUME_POLICIES, "resumePolicy");
       const sessionId = parseNullableUuid<SessionId>(command.sessionId, "sessionId");
-      if (resumePolicy === "exact" && sessionId === null) invalid("sessionId");
+      const continuityKey = parseNullableBoundedString(command.continuityKey, "continuityKey", 1_024);
+      if (resumePolicy === "exact" && sessionId === null && continuityKey === null) invalid("sessionId");
       return Object.freeze({
         ...base(command),
         commandType,
         sessionId,
-        continuityKey: parseBoundedString(command.continuityKey, "continuityKey", 1_024),
+        continuityKey,
         resumePolicy,
         expectedOwnerGeneration: parseDecimalString(command.expectedOwnerGeneration, "expectedOwnerGeneration"),
       });

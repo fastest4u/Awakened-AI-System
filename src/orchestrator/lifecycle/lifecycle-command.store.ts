@@ -30,6 +30,8 @@ import {
 import { LifecycleError } from "./errors.js";
 
 const LOWER_HASH = /^[0-9a-f]{64}$/;
+const POSITIVE_GENERATION = /^(?:[1-9][0-9]*)$/;
+const SQLITE_INT64_MAX = 9_223_372_036_854_775_807n;
 
 export interface LifecycleCommandEnvelope {
   readonly context: ProjectContext;
@@ -41,6 +43,8 @@ export interface LifecycleCommandEnvelope {
   readonly semanticCommand: LifecycleSemanticCommandDraft | InternalWorkflowSemanticCommand;
   readonly capabilityKind: CapabilityKind | null;
   readonly capabilityGeneration: string | null;
+  /** Resolve the protected generation from verified authority only after an exact replay miss. */
+  readonly capabilityGenerationResolution?: "fresh-commit";
   readonly replayExpectation: LifecycleReplayExpectation;
 }
 
@@ -69,6 +73,8 @@ export interface PreparedLifecycleCommit<T extends JsonValue> {
     readonly lifecycleIntentWitness?: never;
   };
   readonly authorizationRecord: PersistedLifecycleAuthorizationRecord;
+  /** Verified inside onNew; accepted only for a deferred protected envelope. */
+  readonly freshCapabilityGeneration?: string;
   readonly beforeAppend?: (
     planned: PlannedEventAppend<T>,
     transaction: LifecycleCommandTransaction,
@@ -123,14 +129,11 @@ export interface LifecycleCommandStoreOptions {
 }
 
 export class LifecycleCommandStoreError extends LifecycleError {
-  readonly details: Readonly<Record<string, string>>;
-
   constructor(
     code: "IDEMPOTENCY_CONFLICT" | "COMMAND_OUTCOME_UNKNOWN" | "LIFECYCLE_INPUT_INVALID" | "INTEGRITY_FAILURE",
     details: Readonly<Record<string, string>> = {},
   ) {
     super(code, details);
-    this.details = Object.freeze({ ...details });
   }
 }
 
@@ -142,6 +145,7 @@ function authorizationMatchesExpectation(
 }
 
 function assertEnvelope(command: LifecycleCommandEnvelope): void {
+  const deferredGeneration = command.capabilityGenerationResolution === "fresh-commit";
   if (!LOWER_HASH.test(command.candidateIntentHash)
     || !LOWER_HASH.test(command.authoritativeIntentHash)
     || command.commandId.length === 0
@@ -150,7 +154,10 @@ function assertEnvelope(command: LifecycleCommandEnvelope): void {
     || command.semanticCommand.commandId !== command.commandId
     || command.semanticCommand.idempotencyKey !== command.idempotencyKey
     || command.semanticCommand.commandType !== command.commandType
-    || ((command.capabilityKind === null) !== (command.capabilityGeneration === null))) {
+    || (command.capabilityGenerationResolution !== undefined && !deferredGeneration)
+    || (deferredGeneration
+      ? command.capabilityKind === null || command.capabilityGeneration !== null
+      : ((command.capabilityKind === null) !== (command.capabilityGeneration === null)))) {
     throw new LifecycleCommandStoreError("LIFECYCLE_INPUT_INVALID");
   }
   if (command.candidateIntentHash !== command.authoritativeIntentHash) {
@@ -392,6 +399,7 @@ function immutableSnapshot<T>(value: T): T {
 interface SnapshottedLifecycleCommit<T extends JsonValue> {
   readonly append: PreparedLifecycleCommit<T>["append"];
   readonly authorizationRecord: PersistedLifecycleAuthorizationRecord;
+  readonly freshCapabilityGeneration?: string;
   readonly beforeAppend?: PreparedLifecycleCommit<T>["beforeAppend"];
   readonly afterAppend: PreparedLifecycleCommit<T>["afterAppend"];
 }
@@ -416,19 +424,48 @@ function snapshotPreparedCommit<T extends JsonValue>(
   );
   const afterAppend = dataProperty(value, "afterAppend");
   const beforeDescriptor = Reflect.getOwnPropertyDescriptor(value, "beforeAppend");
+  const generationDescriptor = Reflect.getOwnPropertyDescriptor(value, "freshCapabilityGeneration");
   if (typeof afterAppend !== "function"
     || (beforeDescriptor !== undefined
       && (!("value" in beforeDescriptor)
-        || (beforeDescriptor.value !== undefined && typeof beforeDescriptor.value !== "function")))) {
+        || (beforeDescriptor.value !== undefined && typeof beforeDescriptor.value !== "function")))
+    || (generationDescriptor !== undefined
+      && (!("value" in generationDescriptor)
+        || (generationDescriptor.value !== undefined
+          && typeof generationDescriptor.value !== "string")))) {
     callbackBoundaryFailure();
   }
   return Object.freeze({
     append,
     authorizationRecord,
+    ...(generationDescriptor?.value === undefined
+      ? {}
+      : { freshCapabilityGeneration: generationDescriptor.value as string }),
     ...(beforeDescriptor?.value === undefined
       ? {}
       : { beforeAppend: beforeDescriptor.value as PreparedLifecycleCommit<T>["beforeAppend"] }),
     afterAppend: afterAppend as PreparedLifecycleCommit<T>["afterAppend"],
+  });
+}
+
+function positiveCapabilityGeneration(value: unknown): value is string {
+  if (typeof value !== "string" || !POSITIVE_GENERATION.test(value)) return false;
+  return BigInt(value) <= SQLITE_INT64_MAX;
+}
+
+function resolveFreshCapabilityGeneration<T extends JsonValue>(
+  envelope: LifecycleCommandEnvelope,
+  commit: SnapshottedLifecycleCommit<T>,
+): LifecycleCommandEnvelope {
+  if (envelope.capabilityGenerationResolution !== "fresh-commit") {
+    if (commit.freshCapabilityGeneration !== undefined) callbackBoundaryFailure();
+    return envelope;
+  }
+  if (!positiveCapabilityGeneration(commit.freshCapabilityGeneration)) callbackBoundaryFailure();
+  return Object.freeze({
+    ...envelope,
+    capabilityGeneration: commit.freshCapabilityGeneration,
+    capabilityGenerationResolution: undefined,
   });
 }
 
@@ -631,9 +668,10 @@ export class LifecycleCommandStore {
       this.#events.assertAppendAllowed();
       focused = projectCommandTransaction(this.#transaction(this.#connection));
       const next = invokeSynchronousTransactionCallback(focused, onNew, snapshotPreparedCommit);
+      const resolvedEnvelope = resolveFreshCapabilityGeneration(envelope, next);
       const authorizationFingerprint = integrityFingerprint(next.authorizationRecord);
-      assertAppendIdentity(envelope, next);
-      const trustedAppend = appendWithTrustedIntent(envelope, next);
+      assertAppendIdentity(resolvedEnvelope, next);
+      const trustedAppend = appendWithTrustedIntent(resolvedEnvelope, next);
       const prepared = this.#events.prepare(
         trustedAppend,
         this.#now(),
@@ -657,7 +695,7 @@ export class LifecycleCommandStore {
       if (integrityFingerprint(next.authorizationRecord) !== authorizationFingerprint) {
         throw new LifecycleCommandStoreError("INTEGRITY_FAILURE");
       }
-      assertAppendIdentity(envelope, next);
+      assertAppendIdentity(resolvedEnvelope, next);
       this.#events.insertDedup(prepared, committed, next.authorizationRecord);
       const authorityMaterialStatus = materialStatusResult(synchronousCallbackResult(
         this.#materialStatus(next.authorizationRecord),

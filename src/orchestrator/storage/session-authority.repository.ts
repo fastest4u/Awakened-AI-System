@@ -1,7 +1,12 @@
+import { createHash, timingSafeEqual } from "node:crypto";
 import { authorityCommitment, type CommittedAuthorityV1 } from "../lifecycle/authority/authority-commitment.js";
 import { decodeLifecycleEventV1, type LifecycleEventV1 } from "../lifecycle/contracts/events.js";
+import type { CheckpointV1 } from "../lifecycle/contracts/checkpoint.js";
 import type { ChildSessionState, RootSessionState } from "../lifecycle/contracts/identifiers.js";
-import { LifecycleError } from "../lifecycle/errors.js";
+import {
+  LifecycleError,
+  MAX_SESSION_AMBIGUITY_SUMMARIES,
+} from "../lifecycle/errors.js";
 import {
   assertAuthorityMirror,
   foldSession,
@@ -597,6 +602,34 @@ export class SessionAuthorityRepository {
     `).all({ $projectId: projectId, $rootSessionId: rootSessionId }).map(decodeAuthorityRow));
   }
 
+  listDirectChildrenBounded(
+    connection: SqliteConnection,
+    projectId: string,
+    rootSessionId: string,
+    limit: number,
+  ): readonly SessionAuthorityRecord[] {
+    if (
+      !LOWER_UUID.test(projectId)
+      || !LOWER_UUID.test(rootSessionId)
+      || !Number.isSafeInteger(limit)
+      || limit < 1
+      || limit > 1_000
+    ) invalid();
+    return Object.freeze(connection.prepare(`
+      SELECT ${SELECT_AUTHORITY}
+      FROM session_authority
+      WHERE project_id = $projectId
+        AND parent_session_id = $rootSessionId
+        AND session_kind = 'child'
+      ORDER BY session_id
+      LIMIT $limit
+    `).all({
+      $projectId: projectId,
+      $rootSessionId: rootSessionId,
+      $limit: BigInt(limit),
+    }).map(decodeAuthorityRow));
+  }
+
   listSafeResumeCandidates(
     connection: SqliteConnection,
     query: SafeResumeCandidateQuery,
@@ -607,6 +640,8 @@ export class SessionAuthorityRepository {
       || (query.sessionId !== undefined && query.sessionId !== null && !LOWER_UUID.test(query.sessionId))
       || (query.continuityFingerprint !== undefined && query.continuityFingerprint !== null
         && !LOWER_HASH.test(query.continuityFingerprint))
+      || (query.afterSessionId !== undefined && query.afterSessionId !== null
+        && !LOWER_UUID.test(query.afterSessionId))
       || states.length < 1 || states.length > 2 || new Set(states).size !== states.length
       || states.some((state) => state !== "active" && state !== "suspended")) invalid();
     const rows = connection.prepare(`
@@ -619,18 +654,117 @@ export class SessionAuthorityRepository {
         AND terminal_event_position IS NULL
         AND ($sessionId IS NULL OR session_id IS $sessionId)
         AND ($continuityFingerprint IS NULL OR continuity_fingerprint IS $continuityFingerprint)
+        AND ($afterSessionId IS NULL OR session_id > $afterSessionId)
         AND semantic_state IN ($state0, $state1)
       ORDER BY session_id
+      LIMIT $limit
     `).all({
       $projectId: query.projectId,
       $workspaceId: query.workspaceId,
       $clientNamespace: query.clientNamespace,
       $sessionId: query.sessionId ?? null,
       $continuityFingerprint: query.continuityFingerprint ?? null,
+      $afterSessionId: query.afterSessionId ?? null,
       $state0: states[0]!,
       $state1: states[1] ?? states[0]!,
+      $limit: BigInt(MAX_SESSION_AMBIGUITY_SUMMARIES + 1),
     });
     return Object.freeze(rows.map(decodeAuthorityRow));
+  }
+
+  listNonterminalRootContinuityOwners(
+    connection: SqliteConnection,
+    query: {
+      readonly projectId: string;
+      readonly workspaceId: string;
+      readonly clientNamespace: string;
+      readonly continuityFingerprint: string;
+    },
+  ): readonly SessionAuthorityRecord[] {
+    if (
+      !LOWER_UUID.test(query.projectId)
+      || !LOWER_HASH.test(query.workspaceId)
+      || query.clientNamespace.length === 0
+      || Array.from(query.clientNamespace).length > 256
+      || !LOWER_HASH.test(query.continuityFingerprint)
+    ) invalid();
+    return Object.freeze(connection.prepare(`
+      SELECT ${SELECT_AUTHORITY}
+      FROM session_authority
+      WHERE project_id = $projectId
+        AND workspace_id = $workspaceId
+        AND client_namespace = $clientNamespace
+        AND session_kind = 'root'
+        AND terminal_event_position IS NULL
+        AND continuity_fingerprint = $continuityFingerprint
+      ORDER BY session_id
+    `).all({
+      $projectId: query.projectId,
+      $workspaceId: query.workspaceId,
+      $clientNamespace: query.clientNamespace,
+      $continuityFingerprint: query.continuityFingerprint,
+    }).map(decodeAuthorityRow));
+  }
+
+  latestCheckpoint(
+    connection: SqliteConnection,
+    authority: SessionAuthorityRecord,
+  ): CheckpointV1 | null {
+    const events = eventRows(connection, authority);
+    const checkpoints = events.filter((event): event is Extract<
+      LifecycleEventV1,
+      { readonly eventType: "SessionCheckpointRecorded" }
+    > => event.eventType === "SessionCheckpointRecorded");
+    const latest = checkpoints.at(-1) ?? null;
+    if (authority.latestCheckpointId === null) {
+      if (
+        authority.latestCheckpointEventPosition !== null
+        || authority.latestCheckpointFingerprint !== null
+        || latest !== null
+      ) integrity();
+      return null;
+    }
+    if (
+      authority.latestCheckpointEventPosition === null
+      || authority.latestCheckpointFingerprint === null
+      || latest === null
+      || latest.payload.checkpoint.checkpointId !== authority.latestCheckpointId
+      || BigInt(latest.globalPosition) !== authority.latestCheckpointEventPosition
+      || latest.payload.checkpointEventPosition !== latest.globalPosition
+      || latest.payload.checkpoint.checkpointEventPosition !== latest.globalPosition
+      || latest.payload.checkpoint.sessionId !== authority.sessionId
+      || latest.payload.checkpoint.parentSessionId !== authority.parentSessionId
+    ) integrity();
+    const expectedFingerprint = createHash("sha256")
+      .update("project-memory/checkpoint/v1\n", "utf8")
+      .update(canonicalJson(latest.payload.checkpoint), "utf8")
+      .digest();
+    const observedFingerprint = Buffer.from(authority.latestCheckpointFingerprint, "hex");
+    let fingerprintMatches = false;
+    try {
+      fingerprintMatches = observedFingerprint.length === expectedFingerprint.length
+        && timingSafeEqual(observedFingerprint, expectedFingerprint);
+    } finally {
+      observedFingerprint.fill(0);
+      expectedFingerprint.fill(0);
+    }
+    if (!fingerprintMatches) integrity();
+    return latest.payload.checkpoint;
+  }
+
+  rootContinuityKey(
+    connection: SqliteConnection,
+    authority: SessionAuthorityRecord,
+  ): string {
+    if (authority.sessionKind !== "root" || authority.parentSessionId !== null) invalid();
+    const started = eventRows(connection, authority)[0];
+    if (
+      started === undefined
+      || started.eventType !== "SessionStarted"
+      || started.payload.sessionKind !== "root"
+      || started.sessionId !== authority.sessionId
+    ) integrity();
+    return started.payload.continuityKey;
   }
 
   requireFoldMatch(

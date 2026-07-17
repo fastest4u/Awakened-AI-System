@@ -121,6 +121,8 @@ export interface SafeResumeCandidateQuery {
   readonly clientNamespace: string;
   readonly sessionId?: string | null;
   readonly continuityFingerprint?: string | null;
+  /** Exclusive deterministic keyset cursor. */
+  readonly afterSessionId?: string | null;
   readonly semanticStates: readonly ("active" | "suspended")[];
 }
 

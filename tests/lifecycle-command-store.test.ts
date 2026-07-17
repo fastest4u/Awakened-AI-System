@@ -387,6 +387,20 @@ function isLifecycleInputInvalid(error: unknown): boolean {
 }
 
 describe("LifecycleCommandStore", () => {
+  it("constructs typed store errors without redefining the base sanitized details", () => {
+    const error = new LifecycleCommandStoreError("COMMAND_OUTCOME_UNKNOWN", {
+      commandId: SEMANTIC_COMMAND.commandId,
+      idempotencyKey: SEMANTIC_COMMAND.idempotencyKey,
+    });
+    assert.equal(error.code, "COMMAND_OUTCOME_UNKNOWN");
+    assert.deepEqual(error.details, {
+      commandId: SEMANTIC_COMMAND.commandId,
+      idempotencyKey: SEMANTIC_COMMAND.idempotencyKey,
+    });
+    assert.equal(Object.isFrozen(error.details), true);
+    assert.equal(Object.prototype.propertyIsEnumerable.call(error, "details"), false);
+  });
+
   it("derives stable internal planned-work IDs from exact domain-separated identities", () => {
     const validation = {
       workflowId: "00000000-0000-4000-8000-000000000020",
@@ -509,6 +523,62 @@ describe("LifecycleCommandStore", () => {
     assert.equal(freshCalls, 0);
     assert.deepEqual(events.calls, ["find-replay"]);
     assert.deepEqual(connection.statements, ["BEGIN IMMEDIATE", "ROLLBACK"]);
+  });
+
+  it("deduplicates before resolving a fresh protected capability generation", () => {
+    const replayConnection = new TransactionConnection();
+    const replayEvents = new FakeEvents(replayConnection);
+    replayEvents.replay = replayResult();
+    let replayTransactionFactoryCalls = 0;
+    const replayStore = new LifecycleCommandStore({
+      connection: replayConnection,
+      events: replayEvents,
+      transaction: () => {
+        replayTransactionFactoryCalls += 1;
+        return transaction(replayConnection);
+      },
+      now: () => NOW,
+    });
+    const deferredEnvelope = {
+      ...envelope(),
+      capabilityGeneration: null,
+      capabilityGenerationResolution: "fresh-commit",
+    } as unknown as LifecycleCommandEnvelope;
+    let replayFreshCalls = 0;
+
+    const replayed = replayStore.execute(deferredEnvelope, () => {
+      replayFreshCalls += 1;
+      throw new Error("replay must not resolve current authority generation");
+    });
+
+    assert.equal(replayed.deduplicated, true);
+    assert.equal(replayFreshCalls, 0);
+    assert.equal(replayTransactionFactoryCalls, 0);
+    assert.deepEqual(replayEvents.calls, ["find-replay"]);
+
+    const freshConnection = new TransactionConnection();
+    const freshEvents = new FakeEvents(freshConnection);
+    const freshStore = new LifecycleCommandStore({
+      connection: freshConnection,
+      events: freshEvents,
+      transaction: () => transaction(freshConnection),
+      now: () => NOW,
+    });
+    let generationResolvedInsideFreshCallback = false;
+
+    const fresh = freshStore.execute(deferredEnvelope, () => {
+      generationResolvedInsideFreshCallback = true;
+      return {
+        append: appendCommand(),
+        authorizationRecord: authorization(),
+        freshCapabilityGeneration: "1",
+        afterAppend: () => undefined,
+      } as unknown as PreparedLifecycleCommit<JsonValue>;
+    });
+
+    assert.equal(fresh.deduplicated, false);
+    assert.equal(generationResolvedInsideFreshCallback, true);
+    assert.deepEqual(freshConnection.committed, ["event", "dedup"]);
   });
 
   it("commits event and focused repository effects in one semantic transaction", () => {

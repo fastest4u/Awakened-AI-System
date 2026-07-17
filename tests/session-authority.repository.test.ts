@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import { describe, it } from "node:test";
 import {
@@ -31,6 +32,7 @@ import type { LifecycleEventV1 } from "../src/orchestrator/lifecycle/contracts/e
 import type { LifecycleError } from "../src/orchestrator/lifecycle/errors.js";
 import {
   CHILD_SESSION_ID,
+  CHECKPOINT_ID,
   PROJECT_ID,
   ROOT_SESSION_ID,
   STORE_ID,
@@ -656,6 +658,7 @@ describe("SessionAuthorityRepository inserts, CAS, and queries", () => {
       clientNamespace: "tests",
       sessionId: ROOT_SESSION_ID,
       continuityFingerprint: HASH_A,
+      afterSessionId: "00000000-0000-4000-8000-000000000001",
       semanticStates: ["active", "suspended"],
     });
     assert.equal(candidates.length, 1);
@@ -666,9 +669,39 @@ describe("SessionAuthorityRepository inserts, CAS, and queries", () => {
     assert.match(sql, /client_namespace\s*=\s*\$clientNamespace/iu);
     assert.match(sql, /session_id\s+IS\s+\$sessionId/iu);
     assert.match(sql, /continuity_fingerprint\s+IS\s+\$continuityFingerprint/iu);
+    assert.match(sql, /session_id\s*>\s*\$afterSessionId/iu);
     assert.match(sql, /ORDER BY session_id/iu);
+    assert.match(sql, /LIMIT\s+\$limit/iu);
+    assert.equal(connection.calls[0]?.params?.$limit, 17n);
+    assert.equal(
+      connection.calls[0]?.params?.$afterSessionId,
+      "00000000-0000-4000-8000-000000000001",
+    );
     assert.doesNotMatch(sql, /task|similarity|agent/iu);
     assert.doesNotMatch(sql, /ORDER BY[^]*(?:updated_at|created_at)/iu);
+  });
+
+  it("finds every nonterminal continuity owner including ending roots", () => {
+    const ending = rootAuthority({ semanticState: "ending" });
+    const connection = new RecordingConnection((_sql, kind) => {
+      if (kind === "all") return [authorityRow(ending)];
+      throw new Error("unexpected statement method");
+    });
+    const owners = new SessionAuthorityRepository().listNonterminalRootContinuityOwners(
+      connection,
+      {
+        projectId: PROJECT_ID,
+        workspaceId: WORKSPACE_ID,
+        clientNamespace: "tests",
+        continuityFingerprint: HASH_A,
+      },
+    );
+    assert.equal(owners[0]?.semanticState, "ending");
+    const sql = connection.prepared[0] ?? "";
+    assert.match(sql, /session_kind\s*=\s*'root'/iu);
+    assert.match(sql, /terminal_event_position\s+IS\s+NULL/iu);
+    assert.match(sql, /continuity_fingerprint\s*=\s*\$continuityFingerprint/iu);
+    assert.doesNotMatch(sql, /semantic_state\s+IN/iu);
   });
 
   it("lists only nonterminal direct children in deterministic session order", () => {
@@ -692,6 +725,63 @@ describe("SessionAuthorityRepository inserts, CAS, and queries", () => {
 });
 
 describe("SessionAuthorityRepository fold and checkpoint guards", () => {
+  it("loads only the indexed latest checkpoint and verifies its domain fingerprint", () => {
+    const base = rootAuthority();
+    const started = lifecycleEvent(1, "SessionStarted", {}, {
+      authorityCommitment: base.authorityCommitment,
+    }) as LifecycleEventV1;
+    const checkpoint = lifecycleEvent(2, "SessionCheckpointRecorded", {}, {
+      authorityCommitment: base.authorityCommitment,
+      sessionId: ROOT_SESSION_ID,
+      parentSessionId: null,
+    }) as Extract<LifecycleEventV1, { readonly eventType: "SessionCheckpointRecorded" }>;
+    const checkpointFingerprint = createHash("sha256")
+      .update("project-memory/checkpoint/v1\n", "utf8")
+      .update(canonicalJson(checkpoint.payload.checkpoint), "utf8")
+      .digest("hex");
+    const authority = rootAuthority({
+      latestCheckpointId: CHECKPOINT_ID,
+      latestCheckpointEventPosition: 2n,
+      latestCheckpointFingerprint: checkpointFingerprint,
+    });
+    const rows = [eventRow(started), eventRow(checkpoint)];
+    const healthy = new RecordingConnection((sql, kind) => {
+      if (kind === "all" && /FROM events/iu.test(sql)) return rows;
+      throw new Error("unexpected statement method");
+    });
+    assert.deepEqual(
+      new SessionAuthorityRepository().latestCheckpoint(healthy, authority),
+      checkpoint.payload.checkpoint,
+    );
+
+    const forgedMirror = { ...authority, latestCheckpointFingerprint: "f".repeat(64) };
+    expectCode(
+      "INTEGRITY_FAILURE",
+      () => new SessionAuthorityRepository().latestCheckpoint(healthy, forgedMirror),
+    );
+
+    const tamperedCheckpoint = {
+      ...checkpoint,
+      payload: {
+        ...checkpoint.payload,
+        checkpoint: {
+          ...checkpoint.payload.checkpoint,
+          taskSummary: "tampered checkpoint payload",
+        },
+      },
+    } as LifecycleEventV1;
+    const tampered = new RecordingConnection((sql, kind) => {
+      if (kind === "all" && /FROM events/iu.test(sql)) {
+        return [eventRow(started), eventRow(tamperedCheckpoint)];
+      }
+      throw new Error("unexpected statement method");
+    });
+    expectCode(
+      "INTEGRITY_FAILURE",
+      () => new SessionAuthorityRepository().latestCheckpoint(tampered, authority),
+    );
+  });
+
   it("loads the deterministic stream, folds it, and compares the bigint authority mirror", () => {
     const provisional = rootAuthority({ authorityEventPosition: 1n });
     const event = lifecycleEvent(1, "SessionStarted", {
