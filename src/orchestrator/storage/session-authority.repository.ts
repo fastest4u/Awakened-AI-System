@@ -138,15 +138,33 @@ function nullableHash(value: unknown): string | null {
   return value === null ? null : hash(value);
 }
 
-function timestamp(value: unknown): string {
-  if (typeof value !== "string" || !TIMESTAMP.test(value)) integrity();
+function timestamp(value: unknown, error: () => never = integrity): string {
+  if (typeof value !== "string" || !TIMESTAMP.test(value)) error();
   const milliseconds = Date.parse(value);
-  if (!Number.isFinite(milliseconds) || new Date(milliseconds).toISOString() !== value) integrity();
+  if (!Number.isFinite(milliseconds) || new Date(milliseconds).toISOString() !== value) error();
   return value;
 }
 
 function nullableTimestamp(value: unknown): string | null {
   return value === null ? null : timestamp(value);
+}
+
+function checkpointMutationTimestamp(
+  connection: SqliteConnection,
+  projectId: string,
+  sessionId: string,
+  value: unknown,
+): string {
+  const updatedAt = timestamp(value, invalid);
+  const row = connection.prepare(`
+    SELECT created_at
+    FROM session_authority
+    WHERE project_id = $projectId AND session_id = $sessionId
+  `).get({ $projectId: projectId, $sessionId: sessionId });
+  if (row === undefined) return updatedAt;
+  exactKeys(row, ["created_at"]);
+  if (Date.parse(updatedAt) < Date.parse(timestamp(ownData(row, "created_at")))) invalid();
+  return updatedAt;
 }
 
 function int64(value: unknown, allowZero = false): bigint {
@@ -647,8 +665,13 @@ export class SessionAuthorityRepository {
   markCheckpointRequired(connection: SqliteConnection, input: CheckpointRequirement): void {
     if (!LOWER_UUID.test(input.projectId) || !LOWER_UUID.test(input.sessionId)
       || input.eventPosition < 1n || input.eventPosition > SQLITE_INT64_MAX
-      || input.reason.length === 0 || Array.from(input.reason).length > 128
-      || !TIMESTAMP.test(input.updatedAt)) invalid();
+      || input.reason.length === 0 || Array.from(input.reason).length > 128) invalid();
+    const updatedAt = checkpointMutationTimestamp(
+      connection,
+      input.projectId,
+      input.sessionId,
+      input.updatedAt,
+    );
     const result = connection.prepare(`
       UPDATE session_authority
       SET checkpoint_required_reason = $reason,
@@ -665,15 +688,20 @@ export class SessionAuthorityRepository {
       $sessionId: input.sessionId,
       $reason: input.reason,
       $eventPosition: input.eventPosition,
-      $updatedAt: input.updatedAt,
+      $updatedAt: updatedAt,
     });
     if (result.changes > 1n) integrity();
   }
 
   clearCheckpointRequired(connection: SqliteConnection, input: CheckpointClear): boolean {
     if (!LOWER_UUID.test(input.projectId) || !LOWER_UUID.test(input.sessionId)
-      || input.checkpointBaseEventPosition < 0n || input.checkpointBaseEventPosition > SQLITE_INT64_MAX
-      || !TIMESTAMP.test(input.updatedAt)) invalid();
+      || input.checkpointBaseEventPosition < 0n || input.checkpointBaseEventPosition > SQLITE_INT64_MAX) invalid();
+    const updatedAt = checkpointMutationTimestamp(
+      connection,
+      input.projectId,
+      input.sessionId,
+      input.updatedAt,
+    );
     const result = connection.prepare(`
       UPDATE session_authority
       SET checkpoint_required_reason = NULL,
@@ -686,7 +714,7 @@ export class SessionAuthorityRepository {
       $projectId: input.projectId,
       $sessionId: input.sessionId,
       $checkpointBaseEventPosition: input.checkpointBaseEventPosition,
-      $updatedAt: input.updatedAt,
+      $updatedAt: updatedAt,
     });
     if (result.changes === 0n) return false;
     if (result.changes !== 1n) integrity();

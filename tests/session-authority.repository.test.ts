@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { DatabaseSync } from "node:sqlite";
 import { describe, it } from "node:test";
 import {
   assertAuthorityMirror,
@@ -10,6 +11,8 @@ import {
   type CommittedAuthorityV1,
 } from "../src/orchestrator/lifecycle/authority/authority-commitment.js";
 import { canonicalJson } from "../src/orchestrator/serialization/canonical-json.js";
+import { MigrationRunner } from "../src/orchestrator/storage/migration-runner.js";
+import { PROJECT_STORE_MIGRATIONS } from "../src/orchestrator/storage/migrations/registry.js";
 import { SessionAuthorityRepository } from "../src/orchestrator/storage/session-authority.repository.js";
 import type {
   ChildAuthorityInsert,
@@ -92,6 +95,67 @@ class RecordingConnection implements SqliteConnection {
   close(): void {
     this.closeCalls += 1;
   }
+}
+
+class NativeStatement implements SqliteStatement {
+  constructor(private readonly statement: import("node:sqlite").StatementSync) {
+    statement.setReadBigInts(true);
+  }
+
+  run(params?: SqliteParams): SqliteRunResult {
+    const result = params === undefined ? this.statement.run() : this.statement.run(params);
+    return {
+      changes: result.changes as bigint,
+      lastInsertRowid: result.lastInsertRowid as bigint,
+    };
+  }
+
+  get(params?: SqliteParams): SqliteRow | undefined {
+    return (params === undefined ? this.statement.get() : this.statement.get(params)) as
+      | SqliteRow
+      | undefined;
+  }
+
+  all(params?: SqliteParams): SqliteRow[] {
+    return (params === undefined ? this.statement.all() : this.statement.all(params)) as SqliteRow[];
+  }
+
+  iterate(params?: SqliteParams): IterableIterator<SqliteRow> {
+    return (params === undefined ? this.statement.iterate() : this.statement.iterate(params)) as
+      IterableIterator<SqliteRow>;
+  }
+}
+
+class NativeConnection implements SqliteConnection {
+  readonly database = new DatabaseSync(":memory:", {
+    allowBareNamedParameters: false,
+    allowUnknownNamedParameters: false,
+    enableForeignKeyConstraints: false,
+    enableDoubleQuotedStringLiterals: false,
+  });
+
+  exec(sql: string): void {
+    this.database.exec(sql);
+  }
+
+  prepare(sql: string): SqliteStatement {
+    return new NativeStatement(this.database.prepare(sql));
+  }
+
+  close(): void {
+    this.database.close();
+  }
+}
+
+function migratedNativeConnection(): NativeConnection {
+  const connection = new NativeConnection();
+  new MigrationRunner().apply(
+    connection,
+    PROJECT_STORE_MIGRATIONS,
+    NOW,
+    { kind: "bootstrap-empty" },
+  );
+  return connection;
 }
 
 function expectCode(code: string, action: () => unknown): void {
@@ -731,6 +795,7 @@ describe("SessionAuthorityRepository fold and checkpoint guards", () => {
   it("marks requirements monotonically and clears only from a covering checkpoint base", () => {
     const outcomes = [1n, 1n, 0n];
     const connection = new RecordingConnection((_sql, kind) => {
+      if (kind === "get") return { created_at: NOW } as SqliteRow;
       if (kind === "run") {
         return { changes: outcomes.shift() ?? 0n, lastInsertRowid: 0n };
       }
@@ -757,12 +822,73 @@ describe("SessionAuthorityRepository fold and checkpoint guards", () => {
       updatedAt: LATER,
     }), false);
 
-    const markSql = connection.prepared[0] ?? "";
+    const markSql = connection.prepared.find((sql) => (
+      /UPDATE session_authority/iu.test(sql)
+      && /checkpoint_required_reason\s*=\s*\$reason/iu.test(sql)
+    )) ?? "";
     assert.match(markSql, /checkpoint_required_event_position\s+IS\s+NULL/iu);
     assert.match(markSql, /checkpoint_required_event_position\s*</iu);
-    const clearSql = connection.prepared[1] ?? "";
+    const clearSql = connection.prepared.find((sql) => (
+      /UPDATE session_authority/iu.test(sql)
+      && /checkpoint_required_reason\s*=\s*NULL/iu.test(sql)
+    )) ?? "";
     assert.match(clearSql, /checkpoint_required_event_position\s*<=\s*\$checkpointBaseEventPosition/iu);
     assert.deepEqual(connection.execCalls, []);
     assert.equal(connection.closeCalls, 0);
+  });
+
+  it("rejects an impossible checkpoint-required timestamp without corrupting SQLite round-trip reads", () => {
+    const connection = migratedNativeConnection();
+    const repository = new SessionAuthorityRepository();
+    const authority = rootAuthority();
+    try {
+      repository.insertRoot(connection, authority);
+      let failure: unknown;
+      try {
+        repository.markCheckpointRequired(connection, {
+          projectId: PROJECT_ID,
+          sessionId: ROOT_SESSION_ID,
+          reason: "ownership-transfer",
+          eventPosition: 2n,
+          updatedAt: "2026-02-30T00:00:00.000Z",
+        });
+      } catch (error) {
+        failure = error;
+      }
+
+      assert.deepEqual(repository.get(connection, PROJECT_ID, ROOT_SESSION_ID), authority);
+      assert.equal((failure as LifecycleError | undefined)?.code, "LIFECYCLE_INPUT_INVALID");
+    } finally {
+      connection.close();
+    }
+  });
+
+  it("rejects a checkpoint clear timestamp earlier than createdAt without corrupting SQLite round-trip reads", () => {
+    const connection = migratedNativeConnection();
+    const repository = new SessionAuthorityRepository();
+    const authority = rootAuthority({
+      authorityEventPosition: 2n,
+      checkpointRequiredReason: "ownership-transfer",
+      checkpointRequiredEventPosition: 2n,
+    });
+    try {
+      repository.insertRoot(connection, authority);
+      let failure: unknown;
+      try {
+        repository.clearCheckpointRequired(connection, {
+          projectId: PROJECT_ID,
+          sessionId: ROOT_SESSION_ID,
+          checkpointBaseEventPosition: 2n,
+          updatedAt: "2026-07-16T23:59:59.999Z",
+        });
+      } catch (error) {
+        failure = error;
+      }
+
+      assert.deepEqual(repository.get(connection, PROJECT_ID, ROOT_SESSION_ID), authority);
+      assert.equal((failure as LifecycleError | undefined)?.code, "LIFECYCLE_INPUT_INVALID");
+    } finally {
+      connection.close();
+    }
   });
 });
