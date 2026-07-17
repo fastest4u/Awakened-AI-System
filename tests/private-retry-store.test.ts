@@ -294,7 +294,7 @@ function assertCode(code: string, error: unknown): boolean {
 }
 
 interface ConcurrentChildConfig {
-  readonly operation: "put" | "get" | "list";
+  readonly operation: "put" | "get" | "list" | "delete";
   readonly root: string;
   readonly providerKey: string;
   readonly semantic: string;
@@ -371,10 +371,13 @@ async function runConcurrentChild(): Promise<void> {
       const loaded = await pending.get(PROJECT_ID, COMMAND_ID, "fork/private-retry/1");
       outcome = { status: "fulfilled", code: null, recordCount: loaded === null ? 0 : 1 };
       destroyRecord(loaded);
-    } else {
+    } else if (config.operation === "list") {
       const records = await pending.list(PROJECT_ID);
       outcome = { status: "fulfilled", code: null, recordCount: records.length };
       for (const loaded of records) destroyRecord(loaded);
+    } else {
+      await pending.delete(PROJECT_ID, COMMAND_ID, "fork/private-retry/1");
+      outcome = { status: "fulfilled", code: null };
     }
   } catch (error) {
     outcome = {
@@ -800,6 +803,68 @@ if (!CHILD_PROCESS_MODE) describe("encrypted pending authorization store", () =>
       { operation: "get", status: "fulfilled", code: null, recordCount: 0 },
       { operation: "list", status: "fulfilled", code: null, recordCount: 0 },
     ]);
+  });
+
+  it("makes two separate-process deletes idempotent after both discover the final", async () => {
+    const root = privateRoot("pending-private-concurrent-delete-process-");
+    const barrierRoot = privateRoot("pending-private-concurrent-delete-barrier-");
+    const values = {
+      providerKey: randomBytes(32).toString("base64url"),
+      semantic: randomUUID(),
+      grant: randomBytes(32).toString("base64url"),
+      proofFingerprint: randomBytes(32).toString("hex"),
+      agentId: "agent-concurrent-delete",
+    };
+    const provider = new PrivateStateProvider(values.providerKey);
+    const seedConfig = childConfig(
+      root,
+      barrierRoot,
+      "seed",
+      "after-delete-final-observed",
+      values,
+    );
+    const record = childRecord(seedConfig);
+    try {
+      await store(root, provider).put(record);
+      const firstConfig: ConcurrentChildConfig = {
+        ...childConfig(
+          root,
+          barrierRoot,
+          "first-delete",
+          "after-delete-final-observed",
+          values,
+        ),
+        operation: "delete",
+      };
+      const secondConfig: ConcurrentChildConfig = {
+        ...childConfig(
+          root,
+          barrierRoot,
+          "second-delete",
+          "after-delete-final-observed",
+          values,
+        ),
+        operation: "delete",
+      };
+      const first = launchConcurrentChild(firstConfig);
+      await waitForBarrier(firstConfig.readyPath);
+      const second = launchConcurrentChild(secondConfig);
+      await waitForBarrier(secondConfig.readyPath);
+
+      writeFileSync(secondConfig.releasePath, "release", { encoding: "utf8", flag: "wx" });
+      const secondOutcome = await second.outcome;
+      writeFileSync(firstConfig.releasePath, "release", { encoding: "utf8", flag: "wx" });
+      const firstOutcome = await first.outcome;
+
+      assert.deepEqual([firstOutcome, secondOutcome], [
+        { status: "fulfilled", code: null },
+        { status: "fulfilled", code: null },
+      ]);
+      assert.equal(allFiles(root).length, 0);
+    } finally {
+      destroyRecord(record);
+      provider.destroy();
+    }
   });
 
   it("linearizes identical writers racing claim publication in separate processes", async () => {

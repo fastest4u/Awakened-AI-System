@@ -131,7 +131,10 @@ export type WorkerLifecycleResult<T extends JsonValue> =
     }
   | {
       readonly kind: "rejected";
-      readonly errorCode: Exclude<LifecycleErrorCode, "COMMAND_OUTCOME_UNKNOWN">;
+      readonly errorCode: Exclude<
+        LifecycleErrorCode,
+        "COMMAND_OUTCOME_UNKNOWN" | "OPERATION_OUTCOME_UNKNOWN"
+      >;
     }
   | {
       readonly kind: "unknown";
@@ -749,11 +752,15 @@ function decodeWorkerResult<T extends JsonValue>(value: WorkerLifecycleResult<T>
     source.kind !== "rejected"
     || typeof source.errorCode !== "string"
     || source.errorCode === "COMMAND_OUTCOME_UNKNOWN"
+    || source.errorCode === "OPERATION_OUTCOME_UNKNOWN"
     || !TERMINAL_CODES.has(source.errorCode as LifecycleErrorCode)
   ) invalid();
   return Object.freeze({
     kind: "rejected",
-    errorCode: source.errorCode as Exclude<LifecycleErrorCode, "COMMAND_OUTCOME_UNKNOWN">,
+    errorCode: source.errorCode as Exclude<
+      LifecycleErrorCode,
+      "COMMAND_OUTCOME_UNKNOWN" | "OPERATION_OUTCOME_UNKNOWN"
+    >,
   });
 }
 

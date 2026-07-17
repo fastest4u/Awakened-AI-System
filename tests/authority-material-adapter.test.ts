@@ -972,6 +972,27 @@ describe("authority material adapter", () => {
     assert.equal(await rejectedHarness.pending.get(PROJECT_ID, rejectedCommand.commandId, rejectedCommand.idempotencyKey), null);
   });
 
+  it("does not classify operation outcome unknown as a terminal rejection", async () => {
+    const current = harness();
+    const command = rootStart("00000000-0000-4000-8000-000000000026");
+    const context = trustedContext({
+      authoritySessionId: null,
+      targetSessionId: null,
+      capabilityKind: null,
+      capabilityGeneration: null,
+    });
+    await current.adapter.prepare(command, { kind: "initial-authority" }, context);
+
+    await assert.rejects(
+      current.adapter.complete(identity(command), {
+        kind: "rejected",
+        errorCode: "OPERATION_OUTCOME_UNKNOWN",
+      } as unknown as WorkerLifecycleResult<{ readonly sessionId: string }>),
+      (error) => expectCode("SESSION_CAPABILITY_INVALID", error),
+    );
+    assert.ok(await current.pending.get(PROJECT_ID, command.commandId, command.idempotencyKey));
+  });
+
   it("strict-decodes descriptor wrappers, rejects tampering, and retains retry state on delivery failure", async () => {
     const local = harness();
     local.channel.local = PRIMARY_A;

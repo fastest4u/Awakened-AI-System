@@ -48,7 +48,8 @@ export type PendingAuthorizationStoreFaultPoint =
   | "before-replace"
   | "after-replace"
   | "after-get-final-observed"
-  | "after-list-final-observed";
+  | "after-list-final-observed"
+  | "after-delete-final-observed";
 
 export interface EncryptedPendingAuthorizationStoreOptions {
   readonly privateStateRoot: string;
@@ -421,15 +422,26 @@ export class EncryptedPendingAuthorizationStore implements PendingAuthorizationS
     const directory = this.#existingScopeDirectory();
     if (directory === null) return;
     const paths = this.#paths(commandId, idempotencyKey);
-    this.#recoverClaim(paths.final, paths.claim, directory);
-    if (!existsSync(paths.final)) return;
-    const record = this.#openRecord(paths.final);
-    try {
-      if (!this.#identityMatches(record, commandId, idempotencyKey, paths.basename)) invalid();
-    } finally {
-      destroyPendingAuthorization(record.authorization);
+    for (let attempt = 0; attempt < MAX_RECONCILE_ATTEMPTS; attempt += 1) {
+      this.#recoverClaim(paths.final, paths.claim, directory);
+      if (!existsSync(paths.final)) return;
+      this.#faultInjector?.("after-delete-final-observed");
+      let record: PendingSemanticCommandRecordV1;
+      try {
+        record = this.#openRecord(paths.final, true);
+      } catch (error) {
+        if (error instanceof FinalDisappearedDuringRead) continue;
+        throw error;
+      }
+      try {
+        if (!this.#identityMatches(record, commandId, idempotencyKey, paths.basename)) invalid();
+      } finally {
+        destroyPendingAuthorization(record.authorization);
+      }
+      this.#unlink(paths.final, directory);
+      return;
     }
-    this.#unlink(paths.final, directory);
+    return invalid();
   }
 
   #assertLookup(projectId: string, commandId: string, idempotencyKey: string): void {

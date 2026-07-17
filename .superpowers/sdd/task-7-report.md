@@ -146,6 +146,42 @@ Minor: 0
 Reviewer verification: test build PASS; encrypted-store 14/14 PASS
 ```
 
+## Post-commit Fix Wave
+
+The original Task 7 implementation was committed as `9bb4ec46950eb82931fdcf361599a5f9c53c411b`. A post-commit review then confirmed two additional Important retry-safety findings, both resolved in a separate fix commit with message `fix: make pending authorization deletion idempotent`.
+
+### Concurrent delete idempotency
+
+`delete()` could observe the final and then map another process's intervening unlink to `SESSION_CAPABILITY_INVALID` during identity validation. A deterministic test launches two separate child deleters, pauses both after final discovery, lets one delete, and then releases the other.
+
+- RED: encrypted-store 14/15; one deleter fulfilled and the other rejected with `SESSION_CAPABILITY_INVALID` although the final was absent.
+- GREEN: both deleters fulfill, the final remains absent, and no raw or typed corruption error escapes.
+- Scope: `delete()` opts into the existing private ENOENT sentinel only while opening the observed final, then re-runs claim/final observation. Replacement/type/link/malformed/permission/authentication/key failures remain fail-closed; an unlink after successful open remains idempotent through ENOENT-tolerant unlink.
+- Read-only reviewer result: approved with no finding.
+
+### Retryable operation outcome classification
+
+The worker `rejected` variant originally excluded only `COMMAND_OUTCOME_UNKNOWN`; it could therefore accept retryable `OPERATION_OUTCOME_UNKNOWN` and delete pending state as if the result were terminal.
+
+- RED: authority adapter 12/13; completion surfaced `OPERATION_OUTCOME_UNKNOWN` through the terminal rejection branch instead of rejecting the invalid worker shape safely.
+- GREEN: both `COMMAND_OUTCOME_UNKNOWN` and `OPERATION_OUTCOME_UNKNOWN` are excluded from the terminal rejection type and strict decoder. A rejected operation-unknown result now fails with `SESSION_CAPABILITY_INVALID`, and the exact encrypted pending record remains available for retry.
+- The semantic `unknown` worker variant remains restricted to `COMMAND_OUTCOME_UNKNOWN`.
+
+Post-commit verification:
+
+```text
+npm run test:build
+  PASS
+
+node --test --test-reporter=spec \
+  dist-test/tests/private-retry-store.test.js \
+  dist-test/tests/authority-material-adapter.test.js
+  PASS — 28 passed, 0 failed
+
+npm run typecheck
+  PASS
+```
+
 ## Deliberate Trust-Boundary Notes and Follow-ups
 
 1. Descriptor commitment authenticity assumes the configured authenticated trusted-host channel. If routed transport later becomes adversarial, Tasks 13/18 should bind the expected commitment into authenticated transport metadata or a provider-verified descriptor without exposing bearer material.
