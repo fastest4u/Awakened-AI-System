@@ -569,6 +569,88 @@ describe("capability codec and service", () => {
     );
   });
 
+  it("rejects non-exact authority material targets without exposing runtime extras", () => {
+    const provider = new DeterministicCapabilityKeyProvider();
+    const service = new CapabilityService({
+      keyProvider: provider,
+      clock: { nowMs: () => NOW_MS },
+      nonceSource: new DeterministicNonceSource(),
+    });
+    const material = service.prepareCapability({
+      projectId: UUID.project,
+      vaultId: UUID.vault,
+      storeId: UUID.store,
+      workspaceId: WORKSPACE_ID,
+      clientNamespace: "desktop/tests",
+      sessionId: UUID.session,
+      kind: "root-session-handle",
+      capabilityGeneration: "7",
+      policyCode: "root-default-v1",
+      expiryKind: "until-revoked",
+      expiresAt: null,
+      actorRole: "primary",
+      clientInstanceId: "primary-a",
+    });
+    const capabilityCanary = "pmcap1.runtime-target-canary";
+    const approvalCanary = "pmrap1.runtime-approval-canary";
+    const symbolCanary = Symbol("runtime-provider-material");
+    let accessorReads = 0;
+    const accessorTarget = { actorRole: "primary" } as Record<string, unknown>;
+    Object.defineProperty(accessorTarget, "clientInstanceId", {
+      enumerable: true,
+      get() {
+        accessorReads += 1;
+        return "primary-a";
+      },
+    });
+    class RuntimeTarget {
+      readonly actorRole = "primary";
+      readonly clientInstanceId = "primary-a";
+    }
+    const symbolTarget: Record<PropertyKey, unknown> = {
+      actorRole: "primary",
+      clientInstanceId: "primary-a",
+    };
+    symbolTarget[symbolCanary] = capabilityCanary;
+    const invalidTargets: readonly unknown[] = [
+      {
+        actorRole: "primary",
+        clientInstanceId: "primary-a",
+        bearer: capabilityCanary,
+        approval: approvalCanary,
+      },
+      { actorRole: "primary", clientInstanceId: "primary-a", providerMaterial: "opaque" },
+      accessorTarget,
+      symbolTarget,
+      new RuntimeTarget(),
+      { actorRole: "maintenance", clientInstanceId: "primary-a" },
+      { actorRole: "primary", clientInstanceId: "" },
+      { actorRole: "primary", clientInstanceId: 42 },
+    ];
+
+    for (const target of invalidTargets) {
+      let result: unknown;
+      let caught: unknown;
+      try {
+        result = service.authorityMaterial({
+          authorityCommitment: "d".repeat(64),
+          expectedCapabilityGeneration: "7",
+          currentCapabilityGeneration: "7",
+          target: target as never,
+          materials: [material],
+        });
+      } catch (error) {
+        caught = error;
+      }
+      const observable = `${String(caught)}\n${JSON.stringify(caught)}\n${JSON.stringify(result)}`;
+      assert.doesNotMatch(observable, /pmcap1|pmrap1|runtime-provider-material/i);
+      assert.equal(result, undefined);
+      assert.ok(caught instanceof LifecycleError);
+      assert.equal(caught.code, "SESSION_CAPABILITY_INVALID");
+    }
+    assert.equal(accessorReads, 0, "target accessors must not execute");
+  });
+
   it("reconstructs only for the authenticated target and rejects verifier mismatch", () => {
     const provider = new DeterministicCapabilityKeyProvider();
     const service = new CapabilityService({

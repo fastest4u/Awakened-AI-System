@@ -119,6 +119,38 @@ function positiveGeneration(value: string): boolean {
   return generation > 0n && generation <= 9_223_372_036_854_775_807n;
 }
 
+function decodeAuthorityTarget(value: unknown): LifecycleAuthorityTarget {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) invalid();
+  const prototype = Object.getPrototypeOf(value) as unknown;
+  if (prototype !== Object.prototype && prototype !== null) invalid();
+  const keys = Reflect.ownKeys(value);
+  if (
+    keys.length !== 2
+    || keys.some((key) => typeof key !== "string")
+    || !keys.includes("actorRole")
+    || !keys.includes("clientInstanceId")
+  ) invalid();
+  const actorRoleDescriptor = Object.getOwnPropertyDescriptor(value, "actorRole");
+  const clientDescriptor = Object.getOwnPropertyDescriptor(value, "clientInstanceId");
+  if (
+    actorRoleDescriptor === undefined
+    || clientDescriptor === undefined
+    || !actorRoleDescriptor.enumerable
+    || !clientDescriptor.enumerable
+    || !("value" in actorRoleDescriptor)
+    || !("value" in clientDescriptor)
+  ) invalid();
+  const actorRole = actorRoleDescriptor.value as unknown;
+  const clientInstanceId = clientDescriptor.value as unknown;
+  if (
+    (actorRole !== "primary" && actorRole !== "untrusted")
+    || typeof clientInstanceId !== "string"
+    || clientInstanceId.length === 0
+    || Array.from(clientInstanceId).length > 256
+  ) invalid();
+  return Object.freeze({ actorRole, clientInstanceId });
+}
+
 function sameCapabilityScope(left: CapabilityClaimsV1, right: CapabilityClaimsV1): boolean {
   return left.projectId === right.projectId
     && left.vaultId === right.vaultId
@@ -238,13 +270,11 @@ export class CapabilityService {
   }
 
   authorityMaterial(input: AuthorityMaterialRequestV1): AuthorityMaterialResolutionV1 {
+    const target = decodeAuthorityTarget(input.target);
     if (
       !HASH.test(input.authorityCommitment)
       || !positiveGeneration(input.expectedCapabilityGeneration)
       || !positiveGeneration(input.currentCapabilityGeneration)
-      || input.target.clientInstanceId.length === 0
-      || Array.from(input.target.clientInstanceId).length > 256
-      || (input.target.actorRole !== "primary" && input.target.actorRole !== "untrusted")
       || !Array.isArray(input.materials)
       || input.materials.length > 2
     ) invalid();
@@ -260,7 +290,7 @@ export class CapabilityService {
       if (
         !HASH.test(material.verifier)
         || claims.capabilityGeneration !== input.currentCapabilityGeneration
-        || !targetAcceptsClaims(input.target, claims)
+        || !targetAcceptsClaims(target, claims)
         || kinds.has(claims.kind)
         || (scope !== undefined && !sameCapabilityScope(scope, claims))
       ) invalid();
@@ -269,9 +299,9 @@ export class CapabilityService {
       decodedMaterials.push(Object.freeze({ claims, verifier: material.verifier }));
     }
     if (
-      (input.target.actorRole === "untrusted"
+      (target.actorRole === "untrusted"
         && (decodedMaterials.length !== 1 || !kinds.has("child-session-handle")))
-      || (input.target.actorRole === "primary"
+      || (target.actorRole === "primary"
         && (!kinds.has("root-session-handle") || kinds.has("child-session-handle")))
     ) invalid();
     for (const material of decodedMaterials) {
@@ -297,7 +327,10 @@ export class CapabilityService {
       descriptorVersion: 1,
       authorityCommitment: input.authorityCommitment,
       capabilityGeneration: input.currentCapabilityGeneration,
-      target: Object.freeze({ ...input.target }),
+      target: Object.freeze({
+        actorRole: target.actorRole,
+        clientInstanceId: target.clientInstanceId,
+      }),
       materials: Object.freeze(decodedMaterials.map((material) => Object.freeze({
         claims: material.claims,
         verifier: material.verifier,
