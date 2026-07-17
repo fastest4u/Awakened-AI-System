@@ -529,8 +529,12 @@ export function authorityMirror(
     sessionKind: aggregate.kind,
     parentSessionId: aggregate.parentSessionId,
     semanticState: aggregate.state,
-    ownerGeneration: aggregate.kind === "root" ? aggregate.ownerGeneration : null,
-    childCapabilityGeneration: aggregate.kind === "child" ? aggregate.childCapabilityGeneration : null,
+    ownerGeneration: aggregate.kind === "root" ? BigInt(aggregate.ownerGeneration) : null,
+    childCapabilityGeneration: aggregate.kind === "child"
+      ? aggregate.childCapabilityGeneration === null
+        ? null
+        : BigInt(aggregate.childCapabilityGeneration)
+      : null,
     authorityCommitment: aggregate.authorityCommitment,
     latestCheckpointEventPosition: aggregate.latestCheckpointEventPosition,
     terminalEventPosition: aggregate.terminalEventPosition,

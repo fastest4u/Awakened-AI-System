@@ -177,8 +177,8 @@ export interface SessionAuthorityMirror {
   readonly sessionKind: "root" | "child";
   readonly parentSessionId: SessionId | null;
   readonly semanticState: RootSessionState | ChildSessionState;
-  readonly ownerGeneration: number | null;
-  readonly childCapabilityGeneration: number | null;
+  readonly ownerGeneration: bigint | null;
+  readonly childCapabilityGeneration: bigint | null;
   readonly authorityCommitment: string;
   readonly latestCheckpointEventPosition: bigint | null;
   readonly terminalEventPosition: bigint | null;
@@ -803,8 +803,14 @@ export function assertAuthorityMirror(
   aggregate: SessionAggregateState,
   authority: SessionAuthorityMirror,
 ): void {
-  const expectedOwnerGeneration = aggregate.kind === "root" ? aggregate.ownerGeneration : null;
-  const expectedChildGeneration = aggregate.kind === "child" ? aggregate.childCapabilityGeneration : null;
+  const expectedOwnerGeneration = aggregate.kind === "root"
+    ? BigInt(aggregate.ownerGeneration)
+    : null;
+  const expectedChildGeneration = aggregate.kind === "child"
+    ? aggregate.childCapabilityGeneration === null
+      ? null
+      : BigInt(aggregate.childCapabilityGeneration)
+    : null;
   if (
     authority.sessionKind !== aggregate.kind
     || authority.parentSessionId !== aggregate.parentSessionId

@@ -1278,8 +1278,8 @@ describe("SessionAggregate", () => {
         { sessionKind: "child" },
         { parentSessionId: OTHER_SESSION_ID },
         { semanticState: "suspended" },
-        { ownerGeneration: 2 },
-        { childCapabilityGeneration: 1 },
+        { ownerGeneration: 2n },
+        { childCapabilityGeneration: 1n },
         { authorityCommitment: AUTHORITY_B },
         { latestCheckpointEventPosition: root.latestCheckpointEventPosition! + 1n },
         { terminalEventPosition: 99n },
@@ -1294,7 +1294,7 @@ describe("SessionAggregate", () => {
 
       const child = childAggregate();
       assert.doesNotThrow(() => assertAuthorityMirror(child, authorityMirror(child)));
-      expectIntegrity(() => assertAuthorityMirror(child, authorityMirror(child, { childCapabilityGeneration: 2 })));
+      expectIntegrity(() => assertAuthorityMirror(child, authorityMirror(child, { childCapabilityGeneration: 2n })));
     });
 
     it("classifies only ended, abandoned, completed, and transferred states as terminal", () => {
