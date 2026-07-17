@@ -58,6 +58,13 @@ import {
 
 const LOWER_HASH = /^[0-9a-f]{64}$/;
 const LOWER_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const APPROVAL_MAX_LIFETIME_MS = 600_000;
+const APPROVAL_REASON_CODES = new Set([
+  "explicit-user-approval",
+  "credential-loss",
+  "suspected-compromise",
+  "irrecoverable-session",
+]);
 const RESUME_POLICIES = ["exact", "latest-safe"] as const;
 const EVIDENCE_SOURCE_KINDS = [
   "model-turn",
@@ -105,13 +112,38 @@ export interface RedactedLifecycleApproval {
   readonly approvalVersion: 1;
   readonly approvalId: ApprovalId;
   readonly action: "recover-root-authority" | "abandon-root";
+  readonly reasonCode: string;
   readonly approvalFingerprint: string;
+  readonly nonceDigest: string;
+  readonly projectId: ProjectId;
+  readonly vaultId: VaultId;
+  readonly storeId: StoreId;
+  readonly workspaceId: WorkspaceId;
+  readonly sessionId: SessionId;
+  readonly expectedOwnerGeneration: string;
+  readonly commandId: string;
+  readonly idempotencyKey: string;
+  readonly intentHash: string;
+  readonly executorActorRole: "primary" | "maintenance";
+  readonly executorClientInstanceId: string;
+  readonly targetActorRole: "primary";
+  readonly targetClientInstanceId: string;
+  readonly issuedAt: string;
+  readonly expiresAt: string;
+  readonly redactedApprovalReference: string;
 }
 
 export interface RedactedChildBindingGrant {
   readonly grantVersion: 1;
   readonly grantId: string;
+  readonly projectId: ProjectId;
+  readonly storeId: StoreId;
+  readonly parentSessionId: SessionId;
+  readonly targetActorRole: "untrusted";
   readonly targetClientInstanceId: string;
+  readonly issuedAt: string;
+  readonly expiresAt: string;
+  readonly bindingFingerprint: string;
   readonly grantFingerprint: string;
 }
 
@@ -1007,6 +1039,27 @@ function canonicalAuthorizationId(value: unknown): value is string {
   return typeof value === "string" && LOWER_UUID.test(value);
 }
 
+function positiveAuthorizationGeneration(value: unknown): value is string {
+  try {
+    return parseDecimalString(
+      value,
+      "authorization.approval.expectedOwnerGeneration",
+      "SESSION_CAPABILITY_INVALID",
+    ) !== "0";
+  } catch {
+    return false;
+  }
+}
+
+function canonicalAuthorizationTimestamp(value: unknown, field: string): value is string {
+  try {
+    parseCanonicalTimestamp(value, field);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function decodeCapabilityProof(value: unknown): CapabilityProofV1 | null {
   if (value === null) return null;
   const proof = exactRecord(
@@ -1029,7 +1082,30 @@ function decodeLifecycleApproval(value: unknown): RedactedLifecycleApproval | nu
   if (value === null) return null;
   const approval = exactRecord(
     value,
-    ["approvalVersion", "approvalId", "action", "approvalFingerprint"],
+    [
+      "approvalVersion",
+      "approvalId",
+      "action",
+      "reasonCode",
+      "approvalFingerprint",
+      "nonceDigest",
+      "projectId",
+      "vaultId",
+      "storeId",
+      "workspaceId",
+      "sessionId",
+      "expectedOwnerGeneration",
+      "commandId",
+      "idempotencyKey",
+      "intentHash",
+      "executorActorRole",
+      "executorClientInstanceId",
+      "targetActorRole",
+      "targetClientInstanceId",
+      "issuedAt",
+      "expiresAt",
+      "redactedApprovalReference",
+    ],
     "authorization.approval",
     "SESSION_CAPABILITY_INVALID",
   );
@@ -1037,9 +1113,60 @@ function decodeLifecycleApproval(value: unknown): RedactedLifecycleApproval | nu
     approval.approvalVersion !== 1
     || !canonicalAuthorizationId(approval.approvalId)
     || (approval.action !== "recover-root-authority" && approval.action !== "abandon-root")
+    || typeof approval.reasonCode !== "string"
+    || !APPROVAL_REASON_CODES.has(approval.reasonCode)
     || typeof approval.approvalFingerprint !== "string"
     || !LOWER_HASH.test(approval.approvalFingerprint)
+    || typeof approval.nonceDigest !== "string"
+    || !LOWER_HASH.test(approval.nonceDigest)
+    || !canonicalAuthorizationId(approval.projectId)
+    || !canonicalAuthorizationId(approval.vaultId)
+    || !canonicalAuthorizationId(approval.storeId)
+    || typeof approval.workspaceId !== "string"
+    || !LOWER_HASH.test(approval.workspaceId)
+    || !canonicalAuthorizationId(approval.sessionId)
+    || !positiveAuthorizationGeneration(approval.expectedOwnerGeneration)
+    || !canonicalAuthorizationId(approval.commandId)
+    || typeof approval.intentHash !== "string"
+    || !LOWER_HASH.test(approval.intentHash)
+    || (approval.executorActorRole !== "primary" && approval.executorActorRole !== "maintenance")
+    || approval.targetActorRole !== "primary"
+    || !canonicalAuthorizationTimestamp(approval.issuedAt, "authorization.approval.issuedAt")
+    || !canonicalAuthorizationTimestamp(approval.expiresAt, "authorization.approval.expiresAt")
+    || Date.parse(approval.expiresAt as string) - Date.parse(approval.issuedAt as string) <= 0
+    || Date.parse(approval.expiresAt as string) - Date.parse(approval.issuedAt as string) > APPROVAL_MAX_LIFETIME_MS
+    || (
+      approval.action === "abandon-root"
+      && (
+        approval.executorActorRole !== "primary"
+        || approval.executorClientInstanceId !== approval.targetClientInstanceId
+      )
+    )
   ) invalidAuthorization();
+  parseBoundedString(
+    approval.idempotencyKey,
+    "authorization.approval.idempotencyKey",
+    LIFECYCLE_IDEMPOTENCY_KEY_MAX_SCALARS,
+    { code: "SESSION_CAPABILITY_INVALID" },
+  );
+  parseBoundedString(
+    approval.executorClientInstanceId,
+    "authorization.approval.executorClientInstanceId",
+    256,
+    { code: "SESSION_CAPABILITY_INVALID" },
+  );
+  parseBoundedString(
+    approval.targetClientInstanceId,
+    "authorization.approval.targetClientInstanceId",
+    256,
+    { code: "SESSION_CAPABILITY_INVALID" },
+  );
+  parseBoundedString(
+    approval.redactedApprovalReference,
+    "authorization.approval.redactedApprovalReference",
+    512,
+    { code: "SESSION_CAPABILITY_INVALID" },
+  );
   return approval as unknown as RedactedLifecycleApproval;
 }
 
@@ -1047,13 +1174,34 @@ function decodeChildBindingGrant(value: unknown): RedactedChildBindingGrant | nu
   if (value === null) return null;
   const grant = exactRecord(
     value,
-    ["grantVersion", "grantId", "targetClientInstanceId", "grantFingerprint"],
+    [
+      "grantVersion",
+      "grantId",
+      "projectId",
+      "storeId",
+      "parentSessionId",
+      "targetActorRole",
+      "targetClientInstanceId",
+      "issuedAt",
+      "expiresAt",
+      "bindingFingerprint",
+      "grantFingerprint",
+    ],
     "authorization.childBindingGrant",
     "SESSION_CAPABILITY_INVALID",
   );
   if (
     grant.grantVersion !== 1
     || !canonicalAuthorizationId(grant.grantId)
+    || !canonicalAuthorizationId(grant.projectId)
+    || !canonicalAuthorizationId(grant.storeId)
+    || !canonicalAuthorizationId(grant.parentSessionId)
+    || grant.targetActorRole !== "untrusted"
+    || !canonicalAuthorizationTimestamp(grant.issuedAt, "authorization.childBindingGrant.issuedAt")
+    || !canonicalAuthorizationTimestamp(grant.expiresAt, "authorization.childBindingGrant.expiresAt")
+    || Date.parse(grant.expiresAt as string) <= Date.parse(grant.issuedAt as string)
+    || typeof grant.bindingFingerprint !== "string"
+    || !LOWER_HASH.test(grant.bindingFingerprint)
     || typeof grant.grantFingerprint !== "string"
     || !LOWER_HASH.test(grant.grantFingerprint)
   ) invalidAuthorization();

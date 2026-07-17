@@ -437,16 +437,35 @@ function verify<T extends LifecycleApprovalClaimsV1>(
       if (nowMs < BigInt(Date.parse(parsed.claims.issuedAt))) invalid();
       if (nowMs >= BigInt(Date.parse(parsed.claims.expiresAt))) expired();
       const approvalDigest = digest(profile.digestDomain, parsed.mac);
+      const safeNonceDigest = nonceDigest(parsed.claims.approvalNonce);
       return Object.freeze({
         claims: parsed.claims as T,
         redacted: Object.freeze({
           approvalVersion: 1,
           approvalId: parsed.claims.approvalId as RedactedLifecycleApproval["approvalId"],
           action: parsed.claims.action,
+          reasonCode: parsed.claims.reasonCode,
           approvalFingerprint: approvalDigest,
+          nonceDigest: safeNonceDigest,
+          projectId: parsed.claims.projectId as RedactedLifecycleApproval["projectId"],
+          vaultId: parsed.claims.vaultId as RedactedLifecycleApproval["vaultId"],
+          storeId: parsed.claims.storeId as RedactedLifecycleApproval["storeId"],
+          workspaceId: parsed.claims.workspaceId as RedactedLifecycleApproval["workspaceId"],
+          sessionId: parsed.claims.sessionId as RedactedLifecycleApproval["sessionId"],
+          expectedOwnerGeneration: parsed.claims.expectedOwnerGeneration,
+          commandId: parsed.claims.commandId,
+          idempotencyKey: parsed.claims.idempotencyKey,
+          intentHash: parsed.claims.intentHash,
+          executorActorRole: parsed.claims.executorActorRole,
+          executorClientInstanceId: parsed.claims.executorClientInstanceId,
+          targetActorRole: "primary",
+          targetClientInstanceId: parsed.claims.targetClientInstanceId,
+          issuedAt: parsed.claims.issuedAt,
+          expiresAt: parsed.claims.expiresAt,
+          redactedApprovalReference: parsed.claims.redactedApprovalReference,
         }),
         approvalDigest,
-        nonceDigest: nonceDigest(parsed.claims.approvalNonce),
+        nonceDigest: safeNonceDigest,
       });
     } finally {
       parsed.claimsBytes.fill(0);

@@ -3,6 +3,8 @@ export type CapabilityKind =
   | "root-resume-token"
   | "child-session-handle";
 
+export const PENDING_AUTHORIZATION_ENCRYPTION_PURPOSE = "pending-authorization-encryption";
+
 export type CapabilityKeyPurpose =
   | CapabilityKind
   | "child-binding-grant"
@@ -12,7 +14,7 @@ export type CapabilityKeyPurpose =
   | "materialization-fingerprint"
   | "recovery-approval"
   | "abandonment-approval"
-  | "pending-authorization-encryption";
+  | typeof PENDING_AUTHORIZATION_ENCRYPTION_PURPOSE;
 
 export interface KeyScope {
   readonly projectId: string;
@@ -64,6 +66,8 @@ export interface CapabilityKeyProvider {
   mac(input: KeyedMacInput): Uint8Array;
   verify(input: KeyedVerifyInput): boolean;
   fingerprint(input: KeyedFingerprintInput): string;
+  /** The provider must not retain `input.bytes`; the caller zeroizes them after return. */
   seal(input: KeyedSealInput): SealedValueV1;
+  /** Returns fresh, mutable, caller-owned plaintext bytes that will be zeroized after use. */
   open(input: KeyedOpenInput): Uint8Array;
 }
