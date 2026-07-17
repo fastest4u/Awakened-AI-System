@@ -18,6 +18,15 @@ import {
 } from "../storage/event-append-transaction.js";
 import type { SqliteConnection } from "../storage/sqlite-driver.js";
 import { canonicalJson } from "../serialization/canonical-json.js";
+import type {
+  InternalWorkflowSemanticCommand,
+  LifecycleSemanticCommandDraft,
+} from "./contracts/commands.js";
+import type { CapabilityKind } from "./authority/capability-key-provider.js";
+import {
+  buildLifecycleIntentWitness,
+  type TrustedLifecycleIntentAssertionsV1,
+} from "./lifecycle-intent-witness.js";
 import { LifecycleError } from "./errors.js";
 
 const LOWER_HASH = /^[0-9a-f]{64}$/;
@@ -29,6 +38,9 @@ export interface LifecycleCommandEnvelope {
   readonly commandType: string;
   readonly candidateIntentHash: string;
   readonly authoritativeIntentHash: string;
+  readonly semanticCommand: LifecycleSemanticCommandDraft | InternalWorkflowSemanticCommand;
+  readonly capabilityKind: CapabilityKind | null;
+  readonly capabilityGeneration: string | null;
   readonly replayExpectation: LifecycleReplayExpectation;
 }
 
@@ -53,7 +65,9 @@ export interface LifecycleCommandTransaction {
 }
 
 export interface PreparedLifecycleCommit<T extends JsonValue> {
-  readonly append: AppendCommand<T>;
+  readonly append: Omit<AppendCommand<T>, "lifecycleIntentWitness"> & {
+    readonly lifecycleIntentWitness?: never;
+  };
   readonly authorizationRecord: PersistedLifecycleAuthorizationRecord;
   readonly beforeAppend?: (
     planned: PlannedEventAppend<T>,
@@ -132,7 +146,11 @@ function assertEnvelope(command: LifecycleCommandEnvelope): void {
     || !LOWER_HASH.test(command.authoritativeIntentHash)
     || command.commandId.length === 0
     || command.idempotencyKey.length === 0
-    || command.commandType.length === 0) {
+    || command.commandType.length === 0
+    || command.semanticCommand.commandId !== command.commandId
+    || command.semanticCommand.idempotencyKey !== command.idempotencyKey
+    || command.semanticCommand.commandType !== command.commandType
+    || ((command.capabilityKind === null) !== (command.capabilityGeneration === null))) {
     throw new LifecycleCommandStoreError("LIFECYCLE_INPUT_INVALID");
   }
   if (command.candidateIntentHash !== command.authoritativeIntentHash) {
@@ -372,7 +390,7 @@ function immutableSnapshot<T>(value: T): T {
 }
 
 interface SnapshottedLifecycleCommit<T extends JsonValue> {
-  readonly append: AppendCommand<T>;
+  readonly append: PreparedLifecycleCommit<T>["append"];
   readonly authorizationRecord: PersistedLifecycleAuthorizationRecord;
   readonly beforeAppend?: PreparedLifecycleCommit<T>["beforeAppend"];
   readonly afterAppend: PreparedLifecycleCommit<T>["afterAppend"];
@@ -391,8 +409,11 @@ function snapshotPreparedCommit<T extends JsonValue>(
   const authorizationValue = dataProperty(value, "authorizationRecord");
   const appendValue = dataProperty(value, "append");
   if (!isPlainRecord(authorizationValue) || !isPlainRecord(appendValue)) callbackBoundaryFailure();
+  if (Object.hasOwn(appendValue, "lifecycleIntentWitness")) callbackBoundaryFailure();
   const authorizationRecord = immutableSnapshot(authorizationValue as PersistedLifecycleAuthorizationRecord);
-  const append = immutableSnapshot(appendValue as unknown as AppendCommand<T>);
+  const append = immutableSnapshot(
+    appendValue as unknown as PreparedLifecycleCommit<T>["append"],
+  );
   const afterAppend = dataProperty(value, "afterAppend");
   const beforeDescriptor = Reflect.getOwnPropertyDescriptor(value, "beforeAppend");
   if (typeof afterAppend !== "function"
@@ -409,6 +430,74 @@ function snapshotPreparedCommit<T extends JsonValue>(
       : { beforeAppend: beforeDescriptor.value as PreparedLifecycleCommit<T>["beforeAppend"] }),
     afterAppend: afterAppend as PreparedLifecycleCommit<T>["afterAppend"],
   });
+}
+
+function trustedIntentAssertions(
+  envelope: LifecycleCommandEnvelope,
+  authorization: PersistedLifecycleAuthorizationRecord,
+): TrustedLifecycleIntentAssertionsV1 {
+  const internal = authorization.kind === "internal-workflow" ? authorization : null;
+  if (internal !== null && (
+    internal.workflowGeneration < 1n
+    || internal.workflowGeneration > BigInt(Number.MAX_SAFE_INTEGER)
+  )) {
+    throw new LifecycleCommandStoreError("LIFECYCLE_INPUT_INVALID");
+  }
+  const proofPresent = authorization.kind === "protected" && authorization.proof !== null;
+  const capabilityPairPresent = envelope.capabilityKind !== null
+    && envelope.capabilityGeneration !== null;
+  const capabilityPairAbsent = envelope.capabilityKind === null
+    && envelope.capabilityGeneration === null;
+  if (
+    (!capabilityPairPresent && !capabilityPairAbsent)
+    || proofPresent !== capabilityPairPresent
+    || (authorization.kind !== "protected" && capabilityPairPresent)
+  ) {
+    throw new LifecycleCommandStoreError("IDEMPOTENCY_CONFLICT");
+  }
+  const binding = envelope.context.binding;
+  return {
+    authorizationKind: authorization.kind,
+    authorizationSessionId: authorization.authorizationSessionId,
+    targetSessionId: authorization.targetSessionId,
+    projectId: binding.projectId,
+    vaultId: binding.vaultId,
+    storeId: binding.storeId,
+    workspaceId: binding.workspaceId,
+    clientNamespace: binding.clientNamespace,
+    capabilityKind: envelope.capabilityKind,
+    capabilityGeneration: envelope.capabilityGeneration,
+    presentingActorRole: authorization.presenting.actorRole,
+    presentingClientInstanceId: authorization.presenting.clientInstanceId,
+    targetActorRole: authorization.target.actorRole,
+    targetClientInstanceId: authorization.target.clientInstanceId,
+    internalWorkflowId: internal?.workflowId ?? null,
+    internalWorkflowGeneration: internal === null ? null : Number(internal.workflowGeneration),
+    internalPlannedWorkId: internal?.plannedWorkId ?? null,
+  };
+}
+
+function appendWithTrustedIntent<T extends JsonValue>(
+  envelope: LifecycleCommandEnvelope,
+  commit: SnapshottedLifecycleCommit<T>,
+): AppendCommand<T> {
+  let built;
+  try {
+    built = buildLifecycleIntentWitness(
+      envelope.semanticCommand,
+      trustedIntentAssertions(envelope, commit.authorizationRecord),
+    );
+  } catch (error) {
+    if (error instanceof LifecycleCommandStoreError) throw error;
+    throw new LifecycleCommandStoreError("IDEMPOTENCY_CONFLICT");
+  }
+  if (built.intentHash !== envelope.authoritativeIntentHash) {
+    throw new LifecycleCommandStoreError("IDEMPOTENCY_CONFLICT");
+  }
+  return Object.freeze({
+    ...commit.append,
+    lifecycleIntentWitness: built.source,
+  }) as AppendCommand<T>;
 }
 
 function integrityJson(value: unknown): JsonValue {
@@ -544,8 +633,9 @@ export class LifecycleCommandStore {
       const next = invokeSynchronousTransactionCallback(focused, onNew, snapshotPreparedCommit);
       const authorizationFingerprint = integrityFingerprint(next.authorizationRecord);
       assertAppendIdentity(envelope, next);
+      const trustedAppend = appendWithTrustedIntent(envelope, next);
       const prepared = this.#events.prepare(
-        next.append,
+        trustedAppend,
         this.#now(),
         envelope.authoritativeIntentHash,
       );

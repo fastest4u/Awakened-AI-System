@@ -25,6 +25,7 @@ import type {
 import {
   decodeLifecycleIntentWitness,
   lifecycleIntentHashFromWitnessSource,
+  type TrustedLifecycleIntentAssertionsV1,
 } from "../lifecycle/lifecycle-intent-witness.js";
 import { canonicalJson } from "../serialization/canonical-json.js";
 import { BranchScopeRepository } from "./branch-scope.repository.js";
@@ -903,7 +904,11 @@ export function matchesLifecycleReplayAuthorization(
 
 function persistedAssertions(
   authorization: PersistedLifecycleAuthorizationRecord,
-): JsonValue {
+  binding: Pick<AppendCommand<JsonValue>["context"]["binding"],
+    "projectId" | "vaultId" | "storeId" | "workspaceId" | "clientNamespace">,
+  capability: Pick<TrustedLifecycleIntentAssertionsV1,
+    "capabilityKind" | "capabilityGeneration">,
+): TrustedLifecycleIntentAssertionsV1 {
   const internal = authorization.kind === "internal-workflow" ? authorization : null;
   if (internal !== null && (
     internal.workflowGeneration > BigInt(Number.MAX_SAFE_INTEGER)
@@ -915,6 +920,13 @@ function persistedAssertions(
     authorizationKind: authorization.kind,
     authorizationSessionId: authorization.authorizationSessionId,
     targetSessionId: authorization.targetSessionId,
+    projectId: binding.projectId,
+    vaultId: binding.vaultId,
+    storeId: binding.storeId,
+    workspaceId: binding.workspaceId,
+    clientNamespace: binding.clientNamespace,
+    capabilityKind: capability.capabilityKind,
+    capabilityGeneration: capability.capabilityGeneration,
     presentingActorRole: authorization.presenting.actorRole,
     presentingClientInstanceId: authorization.presenting.clientInstanceId,
     targetActorRole: authorization.target.actorRole,
@@ -1670,11 +1682,25 @@ export class EventAppendTransaction {
         || authorityBinding.clientNamespace !== prepared.command.context.binding.clientNamespace) {
         throw new EventStoreError("IDEMPOTENCY_CONFLICT");
       }
-      if (validated.lifecycleIntent === null
-        || !isPlainRecord(validated.lifecycleIntent)
-        || !isPlainRecord(validated.lifecycleIntent.persistedAssertions)
-        || canonical(validated.lifecycleIntent.persistedAssertions)
-          !== canonical(persistedAssertions(authorization))) {
+      const lifecycleIntentWitness = validated.lifecycleIntentJson === null
+        ? null
+        : decodeLifecycleIntentWitness(validated.lifecycleIntentJson);
+      const proofPresent = authorization.kind === "protected" && authorization.proof !== null;
+      const capabilityPairPresent = lifecycleIntentWitness !== null
+        && lifecycleIntentWitness.persistedAssertions.capabilityKind !== null
+        && lifecycleIntentWitness.persistedAssertions.capabilityGeneration !== null;
+      const capabilityPairAbsent = lifecycleIntentWitness !== null
+        && lifecycleIntentWitness.persistedAssertions.capabilityKind === null
+        && lifecycleIntentWitness.persistedAssertions.capabilityGeneration === null;
+      if (lifecycleIntentWitness === null
+        || (!capabilityPairPresent && !capabilityPairAbsent)
+        || proofPresent !== capabilityPairPresent
+        || canonical(lifecycleIntentWitness.persistedAssertions)
+          !== canonical(persistedAssertions(
+            authorization,
+            prepared.command.context.binding,
+            lifecycleIntentWitness.persistedAssertions,
+          ))) {
         throw new EventStoreError("IDEMPOTENCY_CONFLICT");
       }
       if (authorization.kind === "initial-authority") {

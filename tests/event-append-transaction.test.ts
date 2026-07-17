@@ -172,6 +172,7 @@ function initialAuthorization(): PersistedLifecycleAuthorizationRecord {
 function lifecycleCommand(): {
   append: AppendCommand<JsonValue>;
   intentHash: string;
+  semantic: RootStartCommandV2;
   expectation: LifecycleReplayExpectation;
 } {
   const semantic = {
@@ -190,6 +191,13 @@ function lifecycleCommand(): {
     authorizationKind: "initial-authority",
     authorizationSessionId: null,
     targetSessionId: ROOT_SESSION_ID,
+    projectId: PROJECT_ID,
+    vaultId: VAULT_ID,
+    storeId: STORE_ID,
+    workspaceId: LIFECYCLE_WORKSPACE_ID,
+    clientNamespace: "lifecycle-tests",
+    capabilityKind: null,
+    capabilityGeneration: null,
     presentingActorRole: "primary",
     presentingClientInstanceId: "client-primary",
     targetActorRole: "primary",
@@ -201,6 +209,7 @@ function lifecycleCommand(): {
   const record = initialAuthorization();
   return {
     intentHash: built.intentHash,
+    semantic,
     expectation: {
       kind: "initial-authority",
       presenting: record.presenting,
@@ -521,6 +530,9 @@ it("treats historical lifecycle dedup without target authority as integrity fail
       commandType: command.append.commandType,
       candidateIntentHash: command.intentHash,
       authoritativeIntentHash: command.intentHash,
+      semanticCommand: command.semantic,
+      capabilityKind: null,
+      capabilityGeneration: null,
       replayExpectation: command.expectation,
     }, () => {
       newCalls += 1;
@@ -657,13 +669,17 @@ it("runs LifecycleCommandStore through the real primitive and replays before onN
     commandType: command.append.commandType,
     candidateIntentHash: command.intentHash,
     authoritativeIntentHash: command.intentHash,
+    semanticCommand: command.semantic,
+    capabilityKind: null,
+    capabilityGeneration: null,
     replayExpectation: command.expectation,
   };
   let newCalls = 0;
   const first = store.execute(envelope, () => {
     newCalls += 1;
+    const { lifecycleIntentWitness: _privateWitness, ...append } = command.append;
     return {
-      append: command.append,
+      append,
       authorizationRecord: authorization,
       afterAppend: (committed, current) => {
         (current.authority as { persist(eventPosition: bigint): void })

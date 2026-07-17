@@ -1043,23 +1043,60 @@ WHEN NEW.lifecycle_intent_json IS NOT NULL AND (
       OR json_type(NEW.lifecycle_intent_json, '$.lifecycleIntentWitnessVersion') <> 'integer'
       OR json_extract(NEW.lifecycle_intent_json, '$.lifecycleIntentWitnessVersion') <> 1
       OR json_type(NEW.lifecycle_intent_json, '$.intent') <> 'object'
-      OR (SELECT count(*) FROM json_each(NEW.lifecycle_intent_json, '$.intent')) <> 3
+      OR (SELECT count(*) FROM json_each(NEW.lifecycle_intent_json, '$.intent')) <> 4
       OR EXISTS (
         SELECT 1 FROM json_each(NEW.lifecycle_intent_json, '$.intent')
-        WHERE key NOT IN ('lifecycleIntentVersion', 'command', 'authorization')
+        WHERE key NOT IN (
+          'lifecycleIntentVersion', 'command', 'binding', 'authorization'
+        )
       )
       OR json_type(NEW.lifecycle_intent_json, '$.intent.lifecycleIntentVersion') <> 'integer'
       OR json_extract(NEW.lifecycle_intent_json, '$.intent.lifecycleIntentVersion') <> 1
       OR json_type(NEW.lifecycle_intent_json, '$.intent.command') <> 'object'
+      OR json_type(NEW.lifecycle_intent_json, '$.intent.binding') <> 'object'
+      OR (SELECT count(*) FROM json_each(
+        NEW.lifecycle_intent_json, '$.intent.binding'
+      )) <> 5
+      OR EXISTS (
+        SELECT 1 FROM json_each(NEW.lifecycle_intent_json, '$.intent.binding')
+        WHERE key NOT IN (
+          'projectId', 'vaultId', 'storeId', 'workspaceId', 'clientNamespace'
+        )
+      )
+      OR json_type(NEW.lifecycle_intent_json, '$.intent.binding.projectId') <> 'text'
+      OR json_type(NEW.lifecycle_intent_json, '$.intent.binding.vaultId') <> 'text'
+      OR json_type(NEW.lifecycle_intent_json, '$.intent.binding.storeId') <> 'text'
+      OR json_type(NEW.lifecycle_intent_json, '$.intent.binding.workspaceId') <> 'text'
+      OR json_type(NEW.lifecycle_intent_json, '$.intent.binding.clientNamespace') <> 'text'
+      OR length(json_extract(
+        NEW.lifecycle_intent_json, '$.intent.binding.projectId'
+      )) <> 36
+      OR length(json_extract(
+        NEW.lifecycle_intent_json, '$.intent.binding.vaultId'
+      )) <> 36
+      OR length(json_extract(
+        NEW.lifecycle_intent_json, '$.intent.binding.storeId'
+      )) <> 36
+      OR length(json_extract(
+        NEW.lifecycle_intent_json, '$.intent.binding.workspaceId'
+      )) <> 64
+      OR json_extract(
+        NEW.lifecycle_intent_json, '$.intent.binding.workspaceId'
+      ) GLOB '*[^0-9a-f]*'
+      OR length(json_extract(
+        NEW.lifecycle_intent_json, '$.intent.binding.clientNamespace'
+      )) NOT BETWEEN 1 AND 256
       OR json_type(NEW.lifecycle_intent_json, '$.intent.authorization') <> 'object'
       OR json_type(NEW.lifecycle_intent_json, '$.persistedAssertions') <> 'object'
       OR (SELECT count(*) FROM json_each(
         NEW.lifecycle_intent_json, '$.persistedAssertions'
-      )) <> 10
+      )) <> 17
       OR EXISTS (
         SELECT 1 FROM json_each(NEW.lifecycle_intent_json, '$.persistedAssertions')
         WHERE key NOT IN (
           'authorizationKind', 'authorizationSessionId', 'targetSessionId',
+          'projectId', 'vaultId', 'storeId', 'workspaceId', 'clientNamespace',
+          'capabilityKind', 'capabilityGeneration',
           'presentingActorRole', 'presentingClientInstanceId', 'targetActorRole',
           'targetClientInstanceId', 'internalWorkflowId',
           'internalWorkflowGeneration', 'internalPlannedWorkId'
@@ -1067,14 +1104,310 @@ WHEN NEW.lifecycle_intent_json IS NOT NULL AND (
       )
       OR (SELECT count(*) FROM json_each(
         NEW.lifecycle_intent_json, '$.intent.authorization'
-      )) <> 10
+      )) <> 12
       OR EXISTS (
         SELECT 1 FROM json_each(NEW.lifecycle_intent_json, '$.intent.authorization')
         WHERE key NOT IN (
           'authorizationKind', 'authorizationSessionId', 'targetSessionId',
+          'capabilityKind', 'capabilityGeneration',
           'presentingActorRole', 'presentingClientInstanceId', 'targetActorRole',
           'targetClientInstanceId', 'internalWorkflowId',
           'internalWorkflowGeneration', 'internalPlannedWorkId'
+        )
+      )
+      OR json_type(
+        NEW.lifecycle_intent_json, '$.persistedAssertions.authorizationKind'
+      ) <> 'text'
+      OR json_extract(
+        NEW.lifecycle_intent_json, '$.persistedAssertions.authorizationKind'
+      ) NOT IN ('initial-authority', 'protected', 'internal-workflow')
+      OR json_type(
+        NEW.lifecycle_intent_json, '$.persistedAssertions.authorizationSessionId'
+      ) NOT IN ('null', 'text')
+      OR json_type(
+        NEW.lifecycle_intent_json, '$.persistedAssertions.targetSessionId'
+      ) <> 'text'
+      OR length(json_extract(
+        NEW.lifecycle_intent_json, '$.persistedAssertions.targetSessionId'
+      )) <> 36
+      OR json_type(
+        NEW.lifecycle_intent_json, '$.persistedAssertions.projectId'
+      ) <> 'text'
+      OR json_type(
+        NEW.lifecycle_intent_json, '$.persistedAssertions.vaultId'
+      ) <> 'text'
+      OR json_type(
+        NEW.lifecycle_intent_json, '$.persistedAssertions.storeId'
+      ) <> 'text'
+      OR json_type(
+        NEW.lifecycle_intent_json, '$.persistedAssertions.workspaceId'
+      ) <> 'text'
+      OR json_type(
+        NEW.lifecycle_intent_json, '$.persistedAssertions.clientNamespace'
+      ) <> 'text'
+      OR json_type(
+        NEW.lifecycle_intent_json, '$.persistedAssertions.capabilityKind'
+      ) NOT IN ('null', 'text')
+      OR (
+        json_type(
+          NEW.lifecycle_intent_json, '$.persistedAssertions.capabilityKind'
+        ) = 'text'
+        AND json_extract(
+          NEW.lifecycle_intent_json, '$.persistedAssertions.capabilityKind'
+        ) NOT IN (
+          'root-session-handle', 'root-resume-token', 'child-session-handle'
+        )
+      )
+      OR json_type(
+        NEW.lifecycle_intent_json, '$.persistedAssertions.capabilityGeneration'
+      ) NOT IN ('null', 'text')
+      OR (
+        json_type(
+          NEW.lifecycle_intent_json, '$.persistedAssertions.capabilityGeneration'
+        ) = 'text'
+        AND (
+          length(json_extract(
+            NEW.lifecycle_intent_json, '$.persistedAssertions.capabilityGeneration'
+          )) = 0
+          OR json_extract(
+            NEW.lifecycle_intent_json, '$.persistedAssertions.capabilityGeneration'
+          ) = '0'
+          OR json_extract(
+            NEW.lifecycle_intent_json, '$.persistedAssertions.capabilityGeneration'
+          ) GLOB '*[^0-9]*'
+          OR (
+            length(json_extract(
+              NEW.lifecycle_intent_json, '$.persistedAssertions.capabilityGeneration'
+            )) > 1
+            AND substr(json_extract(
+              NEW.lifecycle_intent_json, '$.persistedAssertions.capabilityGeneration'
+            ), 1, 1) = '0'
+          )
+          OR length(json_extract(
+            NEW.lifecycle_intent_json, '$.persistedAssertions.capabilityGeneration'
+          )) > 19
+          OR (
+            length(json_extract(
+              NEW.lifecycle_intent_json, '$.persistedAssertions.capabilityGeneration'
+            )) = 19
+            AND json_extract(
+              NEW.lifecycle_intent_json, '$.persistedAssertions.capabilityGeneration'
+            ) > '9223372036854775807'
+          )
+        )
+      )
+      OR json_extract(
+        NEW.lifecycle_intent_json, '$.persistedAssertions.presentingActorRole'
+      ) NOT IN ('primary', 'maintenance', 'untrusted')
+      OR json_extract(
+        NEW.lifecycle_intent_json, '$.persistedAssertions.targetActorRole'
+      ) NOT IN ('primary', 'maintenance', 'untrusted')
+      OR json_type(
+        NEW.lifecycle_intent_json, '$.persistedAssertions.presentingClientInstanceId'
+      ) <> 'text'
+      OR length(json_extract(
+        NEW.lifecycle_intent_json, '$.persistedAssertions.presentingClientInstanceId'
+      )) NOT BETWEEN 1 AND 256
+      OR json_type(
+        NEW.lifecycle_intent_json, '$.persistedAssertions.targetClientInstanceId'
+      ) <> 'text'
+      OR length(json_extract(
+        NEW.lifecycle_intent_json, '$.persistedAssertions.targetClientInstanceId'
+      )) NOT BETWEEN 1 AND 256
+      OR json_type(
+        NEW.lifecycle_intent_json, '$.persistedAssertions.internalWorkflowId'
+      ) NOT IN ('null', 'text')
+      OR json_type(
+        NEW.lifecycle_intent_json, '$.persistedAssertions.internalWorkflowGeneration'
+      ) NOT IN ('null', 'integer')
+      OR json_type(
+        NEW.lifecycle_intent_json, '$.persistedAssertions.internalPlannedWorkId'
+      ) NOT IN ('null', 'text')
+      OR (
+        json_type(
+          NEW.lifecycle_intent_json, '$.persistedAssertions.internalPlannedWorkId'
+        ) = 'text'
+        AND (
+          length(json_extract(
+            NEW.lifecycle_intent_json, '$.persistedAssertions.internalPlannedWorkId'
+          )) <> 64
+          OR json_extract(
+            NEW.lifecycle_intent_json, '$.persistedAssertions.internalPlannedWorkId'
+          ) GLOB '*[^0-9a-f]*'
+        )
+      )
+      OR json_extract(
+        NEW.lifecycle_intent_json, '$.intent.binding.projectId'
+      ) IS NOT json_extract(
+        NEW.lifecycle_intent_json, '$.persistedAssertions.projectId'
+      )
+      OR json_extract(
+        NEW.lifecycle_intent_json, '$.intent.binding.vaultId'
+      ) IS NOT json_extract(
+        NEW.lifecycle_intent_json, '$.persistedAssertions.vaultId'
+      )
+      OR json_extract(
+        NEW.lifecycle_intent_json, '$.intent.binding.storeId'
+      ) IS NOT json_extract(
+        NEW.lifecycle_intent_json, '$.persistedAssertions.storeId'
+      )
+      OR json_extract(
+        NEW.lifecycle_intent_json, '$.intent.binding.workspaceId'
+      ) IS NOT json_extract(
+        NEW.lifecycle_intent_json, '$.persistedAssertions.workspaceId'
+      )
+      OR json_extract(
+        NEW.lifecycle_intent_json, '$.intent.binding.clientNamespace'
+      ) IS NOT json_extract(
+        NEW.lifecycle_intent_json, '$.persistedAssertions.clientNamespace'
+      )
+      OR json_extract(
+        NEW.lifecycle_intent_json, '$.intent.authorization.authorizationKind'
+      ) IS NOT json_extract(
+        NEW.lifecycle_intent_json, '$.persistedAssertions.authorizationKind'
+      )
+      OR json_extract(
+        NEW.lifecycle_intent_json, '$.intent.authorization.authorizationSessionId'
+      ) IS NOT json_extract(
+        NEW.lifecycle_intent_json, '$.persistedAssertions.authorizationSessionId'
+      )
+      OR json_extract(
+        NEW.lifecycle_intent_json, '$.intent.authorization.capabilityKind'
+      ) IS NOT json_extract(
+        NEW.lifecycle_intent_json, '$.persistedAssertions.capabilityKind'
+      )
+      OR json_extract(
+        NEW.lifecycle_intent_json, '$.intent.authorization.capabilityGeneration'
+      ) IS NOT json_extract(
+        NEW.lifecycle_intent_json, '$.persistedAssertions.capabilityGeneration'
+      )
+      OR json_extract(
+        NEW.lifecycle_intent_json, '$.intent.authorization.presentingActorRole'
+      ) IS NOT json_extract(
+        NEW.lifecycle_intent_json, '$.persistedAssertions.presentingActorRole'
+      )
+      OR json_extract(
+        NEW.lifecycle_intent_json, '$.intent.authorization.presentingClientInstanceId'
+      ) IS NOT json_extract(
+        NEW.lifecycle_intent_json, '$.persistedAssertions.presentingClientInstanceId'
+      )
+      OR json_extract(
+        NEW.lifecycle_intent_json, '$.intent.authorization.targetActorRole'
+      ) IS NOT json_extract(
+        NEW.lifecycle_intent_json, '$.persistedAssertions.targetActorRole'
+      )
+      OR json_extract(
+        NEW.lifecycle_intent_json, '$.intent.authorization.targetClientInstanceId'
+      ) IS NOT json_extract(
+        NEW.lifecycle_intent_json, '$.persistedAssertions.targetClientInstanceId'
+      )
+      OR json_extract(
+        NEW.lifecycle_intent_json, '$.intent.authorization.internalWorkflowId'
+      ) IS NOT json_extract(
+        NEW.lifecycle_intent_json, '$.persistedAssertions.internalWorkflowId'
+      )
+      OR json_extract(
+        NEW.lifecycle_intent_json, '$.intent.authorization.internalWorkflowGeneration'
+      ) IS NOT json_extract(
+        NEW.lifecycle_intent_json, '$.persistedAssertions.internalWorkflowGeneration'
+      )
+      OR json_extract(
+        NEW.lifecycle_intent_json, '$.intent.authorization.internalPlannedWorkId'
+      ) IS NOT json_extract(
+        NEW.lifecycle_intent_json, '$.persistedAssertions.internalPlannedWorkId'
+      )
+      OR (
+        json_extract(
+          NEW.lifecycle_intent_json, '$.persistedAssertions.authorizationKind'
+        ) = 'initial-authority'
+        AND (
+          json_type(
+            NEW.lifecycle_intent_json, '$.persistedAssertions.authorizationSessionId'
+          ) <> 'null'
+          OR json_type(
+            NEW.lifecycle_intent_json, '$.intent.authorization.targetSessionId'
+          ) <> 'null'
+          OR json_type(
+            NEW.lifecycle_intent_json, '$.persistedAssertions.capabilityKind'
+          ) <> 'null'
+          OR json_type(
+            NEW.lifecycle_intent_json, '$.persistedAssertions.capabilityGeneration'
+          ) <> 'null'
+          OR json_type(
+            NEW.lifecycle_intent_json, '$.persistedAssertions.internalWorkflowId'
+          ) <> 'null'
+          OR json_type(
+            NEW.lifecycle_intent_json, '$.persistedAssertions.internalWorkflowGeneration'
+          ) <> 'null'
+          OR json_type(
+            NEW.lifecycle_intent_json, '$.persistedAssertions.internalPlannedWorkId'
+          ) <> 'null'
+        )
+      )
+      OR (
+        json_extract(
+          NEW.lifecycle_intent_json, '$.persistedAssertions.authorizationKind'
+        ) <> 'initial-authority'
+        AND json_extract(
+          NEW.lifecycle_intent_json, '$.intent.authorization.targetSessionId'
+        ) IS NOT json_extract(
+          NEW.lifecycle_intent_json, '$.persistedAssertions.targetSessionId'
+        )
+      )
+      OR (
+        json_extract(
+          NEW.lifecycle_intent_json, '$.persistedAssertions.authorizationKind'
+        ) = 'protected'
+        AND (
+          json_type(
+            NEW.lifecycle_intent_json, '$.persistedAssertions.authorizationSessionId'
+          ) <> 'text'
+          OR json_type(
+            NEW.lifecycle_intent_json, '$.persistedAssertions.internalWorkflowId'
+          ) <> 'null'
+          OR json_type(
+            NEW.lifecycle_intent_json, '$.persistedAssertions.internalWorkflowGeneration'
+          ) <> 'null'
+          OR json_type(
+            NEW.lifecycle_intent_json, '$.persistedAssertions.internalPlannedWorkId'
+          ) <> 'null'
+          OR (
+            json_type(
+              NEW.lifecycle_intent_json, '$.persistedAssertions.capabilityKind'
+            ) = 'null'
+          ) IS NOT (
+            json_type(
+              NEW.lifecycle_intent_json, '$.persistedAssertions.capabilityGeneration'
+            ) = 'null'
+          )
+        )
+      )
+      OR (
+        json_extract(
+          NEW.lifecycle_intent_json, '$.persistedAssertions.authorizationKind'
+        ) = 'internal-workflow'
+        AND (
+          json_type(
+            NEW.lifecycle_intent_json, '$.persistedAssertions.authorizationSessionId'
+          ) <> 'text'
+          OR json_type(
+            NEW.lifecycle_intent_json, '$.persistedAssertions.capabilityKind'
+          ) <> 'null'
+          OR json_type(
+            NEW.lifecycle_intent_json, '$.persistedAssertions.capabilityGeneration'
+          ) <> 'null'
+          OR json_type(
+            NEW.lifecycle_intent_json, '$.persistedAssertions.internalWorkflowId'
+          ) <> 'text'
+          OR json_type(
+            NEW.lifecycle_intent_json, '$.persistedAssertions.internalWorkflowGeneration'
+          ) <> 'integer'
+          OR json_extract(
+            NEW.lifecycle_intent_json, '$.persistedAssertions.internalWorkflowGeneration'
+          ) < 1
+          OR json_type(
+            NEW.lifecycle_intent_json, '$.persistedAssertions.internalPlannedWorkId'
+          ) <> 'text'
         )
       )
       OR instr(lower(NEW.lifecycle_intent_json), 'pmcap1.') > 0
@@ -1085,7 +1418,7 @@ WHEN NEW.lifecycle_intent_json IS NOT NULL AND (
           'approval', 'bearer', 'bindingGeneration',
           'candidateIntentHash', 'childBindingGrant', 'claimExpiresAt',
           'claimOwnerId', 'claimToken', 'contextFingerprint', 'environment',
-          'path', 'projectBindingId', 'proof', 'proofDigest',
+          'projectBindingId', 'proof', 'proofDigest',
           'proofFingerprint', 'proofNonce', 'proofVersion', 'rawEvidence',
           'resumeToken'
         )

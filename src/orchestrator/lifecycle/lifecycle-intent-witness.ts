@@ -1,4 +1,3 @@
-import { createHash } from "node:crypto";
 import { canonicalJson } from "../serialization/canonical-json.js";
 import {
   assertInternalValidationResultBinding,
@@ -20,13 +19,21 @@ import {
   strictArray,
   type ValidationResultId,
 } from "./contracts/identifiers.js";
+import type { CapabilityKind } from "./authority/capability-key-provider.js";
+import {
+  canonicalLifecycleIntentHash,
+  canonicalLifecycleIntentPreimage,
+  type LifecycleIntentActorRole,
+  type LifecycleIntentAuthorizationKind,
+  type LifecycleIntentAuthorizationV1,
+  type LifecycleIntentPreimageV1,
+} from "./lifecycle-intent.js";
 
-export type LifecycleIntentAuthorizationKind =
-  | "initial-authority"
-  | "protected"
-  | "internal-workflow";
-
-export type LifecycleIntentActorRole = "primary" | "maintenance" | "untrusted";
+export type {
+  LifecycleIntentActorRole,
+  LifecycleIntentAuthorizationKind,
+  LifecycleIntentPreimageV1,
+} from "./lifecycle-intent.js";
 
 /**
  * Trusted, already-derived assertions that the semantic writer will persist in
@@ -37,6 +44,13 @@ export interface TrustedLifecycleIntentAssertionsV1 {
   readonly authorizationKind: LifecycleIntentAuthorizationKind;
   readonly authorizationSessionId: string | null;
   readonly targetSessionId: string;
+  readonly projectId: string;
+  readonly vaultId: string;
+  readonly storeId: string;
+  readonly workspaceId: string;
+  readonly clientNamespace: string;
+  readonly capabilityKind: CapabilityKind | null;
+  readonly capabilityGeneration: string | null;
   readonly presentingActorRole: LifecycleIntentActorRole;
   readonly presentingClientInstanceId: string;
   readonly targetActorRole: LifecycleIntentActorRole;
@@ -53,16 +67,7 @@ type LifecycleIntentCommandV1 =
   | InternalValidationStableCommand
   | InternalWorkflowPhaseStableCommand;
 
-export type LifecycleIntentSemanticAssertionsV1 = Omit<
-  TrustedLifecycleIntentAssertionsV1,
-  "targetSessionId"
-> & { readonly targetSessionId: string | null };
-
-export interface LifecycleIntentPreimageV1 {
-  readonly lifecycleIntentVersion: 1;
-  readonly command: LifecycleIntentCommandV1;
-  readonly authorization: LifecycleIntentSemanticAssertionsV1;
-}
+export type LifecycleIntentSemanticAssertionsV1 = LifecycleIntentAuthorizationV1;
 
 export interface LifecycleIntentWitnessV1 {
   readonly lifecycleIntentWitnessVersion: 1;
@@ -83,6 +88,11 @@ const ACTOR_ROLES = new Set<LifecycleIntentActorRole>([
   "primary",
   "maintenance",
   "untrusted",
+]);
+const CAPABILITY_KINDS = new Set<CapabilityKind>([
+  "root-session-handle",
+  "root-resume-token",
+  "child-session-handle",
 ]);
 const FORBIDDEN_KEYS = new Set([
   "approval",
@@ -110,6 +120,13 @@ const ASSERTION_KEYS = [
   "authorizationKind",
   "authorizationSessionId",
   "targetSessionId",
+  "projectId",
+  "vaultId",
+  "storeId",
+  "workspaceId",
+  "clientNamespace",
+  "capabilityKind",
+  "capabilityGeneration",
   "presentingActorRole",
   "presentingClientInstanceId",
   "targetActorRole",
@@ -191,6 +208,28 @@ function decodeAssertions(value: unknown): TrustedLifecycleIntentAssertionsV1 {
       assertions.targetSessionId,
       "lifecycleIntent.targetSessionId",
     ),
+    projectId: parseLifecycleId(assertions.projectId, "lifecycleIntent.projectId"),
+    vaultId: parseLifecycleId(assertions.vaultId, "lifecycleIntent.vaultId"),
+    storeId: parseLifecycleId(assertions.storeId, "lifecycleIntent.storeId"),
+    workspaceId: typeof assertions.workspaceId === "string" && LOWER_HASH.test(assertions.workspaceId)
+      ? assertions.workspaceId
+      : invalid(),
+    clientNamespace: parseBoundedString(
+      assertions.clientNamespace,
+      "lifecycleIntent.clientNamespace",
+      256,
+    ),
+    capabilityKind: assertions.capabilityKind === null
+      ? null
+      : CAPABILITY_KINDS.has(assertions.capabilityKind as CapabilityKind)
+        ? assertions.capabilityKind as CapabilityKind
+        : invalid(),
+    capabilityGeneration: assertions.capabilityGeneration === null
+      ? null
+      : parseDecimalString(
+          assertions.capabilityGeneration,
+          "lifecycleIntent.capabilityGeneration",
+        ),
     presentingActorRole: presentingActorRole as LifecycleIntentActorRole,
     presentingClientInstanceId: parseBoundedString(
       assertions.presentingClientInstanceId,
@@ -224,12 +263,16 @@ function decodeAssertions(value: unknown): TrustedLifecycleIntentAssertionsV1 {
   const internalPresent = decoded.internalWorkflowId !== null
     || decoded.internalWorkflowGeneration !== null
     || decoded.internalPlannedWorkId !== null;
+  const capabilityPresent = decoded.capabilityKind !== null
+    || decoded.capabilityGeneration !== null;
+  if ((decoded.capabilityKind === null) !== (decoded.capabilityGeneration === null)) invalid();
   if (authorizationKind === "initial-authority") {
-    if (decoded.authorizationSessionId !== null || internalPresent) invalid();
+    if (decoded.authorizationSessionId !== null || internalPresent || capabilityPresent) invalid();
   } else if (authorizationKind === "protected") {
     if (decoded.authorizationSessionId === null || internalPresent) invalid();
   } else if (
     decoded.authorizationSessionId === null
+    || capabilityPresent
     || decoded.internalWorkflowId === null
     || decoded.internalWorkflowGeneration === null
     || decoded.internalPlannedWorkId === null
@@ -445,6 +488,11 @@ function assertExternalSessionBinding(
   command: LifecycleSemanticCommandDraft,
   assertions: TrustedLifecycleIntentAssertionsV1,
 ): void {
+  if (
+    command.expectedProjectId !== assertions.projectId
+    || command.expectedVaultId !== assertions.vaultId
+    || command.expectedWorkspaceId !== assertions.workspaceId
+  ) invalid();
   if (command.commandType === "root-start") {
     if (assertions.authorizationKind !== "initial-authority") invalid();
     return;
@@ -523,6 +571,11 @@ function normalizeStable(
   command: LifecycleIntentCommandV1,
   assertions: TrustedLifecycleIntentAssertionsV1,
 ): BuiltLifecycleIntentWitnessV1 {
+  if (
+    command.expectedProjectId !== assertions.projectId
+    || command.expectedVaultId !== assertions.vaultId
+    || command.expectedWorkspaceId !== assertions.workspaceId
+  ) invalid();
   const internal = command.commandType === "internal-validation-result"
     || command.commandType === "internal-workflow-phase";
   if (internal) {
@@ -536,16 +589,28 @@ function normalizeStable(
     assertExternalSessionBinding(command, assertions);
   }
   const authorization: LifecycleIntentSemanticAssertionsV1 = Object.freeze({
-    ...assertions,
+    authorizationKind: assertions.authorizationKind,
+    authorizationSessionId: assertions.authorizationSessionId,
     targetSessionId: assertions.authorizationKind === "initial-authority"
       ? null
       : assertions.targetSessionId,
+    capabilityKind: assertions.capabilityKind,
+    capabilityGeneration: assertions.capabilityGeneration,
+    presentingActorRole: assertions.presentingActorRole,
+    presentingClientInstanceId: assertions.presentingClientInstanceId,
+    targetActorRole: assertions.targetActorRole,
+    targetClientInstanceId: assertions.targetClientInstanceId,
+    internalWorkflowId: assertions.internalWorkflowId,
+    internalWorkflowGeneration: assertions.internalWorkflowGeneration,
+    internalPlannedWorkId: assertions.internalPlannedWorkId,
   });
-  const intent: LifecycleIntentPreimageV1 = Object.freeze({
-    lifecycleIntentVersion: 1,
-    command,
-    authorization,
-  });
+  const intent = canonicalLifecycleIntentPreimage(command, {
+    projectId: assertions.projectId,
+    vaultId: assertions.vaultId,
+    storeId: assertions.storeId,
+    workspaceId: assertions.workspaceId,
+    clientNamespace: assertions.clientNamespace,
+  }, authorization);
   const witness: LifecycleIntentWitnessV1 = Object.freeze({
     lifecycleIntentWitnessVersion: 1,
     intent,
@@ -554,7 +619,7 @@ function normalizeStable(
   noSecrets(witness);
   const source = canonicalJson(witness);
   return Object.freeze({
-    intentHash: createHash("sha256").update(canonicalJson(intent), "utf8").digest("hex"),
+    intentHash: canonicalLifecycleIntentHash(intent),
     source,
     witness,
   });
@@ -593,7 +658,7 @@ export function decodeLifecycleIntentWitness(source: string): LifecycleIntentWit
     const persistedAssertions = decodeAssertions(witness.persistedAssertions);
     const intent = exactRecord(
       witness.intent,
-      ["lifecycleIntentVersion", "command", "authorization"],
+      ["lifecycleIntentVersion", "command", "binding", "authorization"],
       "lifecycleIntent.intent",
     );
     if (intent.lifecycleIntentVersion !== 1) invalid();
@@ -609,7 +674,5 @@ export function decodeLifecycleIntentWitness(source: string): LifecycleIntentWit
 
 export function lifecycleIntentHashFromWitnessSource(source: string): string {
   const witness = decodeLifecycleIntentWitness(source);
-  return createHash("sha256")
-    .update(canonicalJson(witness.intent), "utf8")
-    .digest("hex");
+  return canonicalLifecycleIntentHash(witness.intent);
 }

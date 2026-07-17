@@ -4,7 +4,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, it } from "node:test";
-import type { RootStartCommandV2 } from "../src/orchestrator/lifecycle/contracts/commands.js";
+import type {
+  RecordCheckpointCommandV2,
+  RootResumeCommandV2,
+  RootStartCommandV2,
+} from "../src/orchestrator/lifecycle/contracts/commands.js";
 import {
   buildLifecycleIntentWitness,
   lifecycleIntentHashFromWitnessSource,
@@ -104,6 +108,13 @@ function seedLifecycleIntentWitness(
     authorizationKind: "initial-authority",
     authorizationSessionId: null,
     targetSessionId: sessionId,
+    projectId: PROJECT_ID,
+    vaultId: VAULT_ID,
+    storeId: STORE_ID,
+    workspaceId: "c".repeat(64),
+    clientNamespace: "tests",
+    capabilityKind: null,
+    capabilityGeneration: null,
     presentingActorRole: "primary",
     presentingClientInstanceId: "client-1",
     targetActorRole: "primary",
@@ -1236,6 +1247,13 @@ describe("0002-session-lifecycle authorization, validation, workflow, and outbox
       authorizationKind: "initial-authority",
       authorizationSessionId: null,
       targetSessionId: ROOT_ID,
+      projectId: PROJECT_ID,
+      vaultId: VAULT_ID,
+      storeId: STORE_ID,
+      workspaceId: "c".repeat(64),
+      clientNamespace: "tests",
+      capabilityKind: null,
+      capabilityGeneration: null,
       presentingActorRole: "primary",
       presentingClientInstanceId: "client-root",
       targetActorRole: "primary",
@@ -1329,6 +1347,142 @@ describe("0002-session-lifecycle authorization, validation, workflow, and outbox
       }),
       /LIFECYCLE_INTENT_WITNESS_INVALID/,
     );
+  });
+
+  it("allows canonical semantic checkpoint paths in lifecycle intent witnesses", () => {
+    const commandId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaab";
+    const built = buildLifecycleIntentWitness({
+      commandType: "record-checkpoint",
+      commandId,
+      idempotencyKey: "checkpoint/with-path",
+      agentId: "agent-1",
+      expectedProjectId: PROJECT_ID,
+      expectedVaultId: VAULT_ID,
+      expectedWorkspaceId: "c".repeat(64),
+      expectedBranchRef: null,
+      sessionId: CHILD_ID,
+      expectedStreamVersion: "0",
+      expectedBaseEventPosition: "0",
+      draft: {
+        checkpointVersion: 1,
+        taskSummary: "Checkpoint with a semantic project path",
+        completedItems: [],
+        inProgressItems: [],
+        blockers: [],
+        nextActions: [],
+        decisions: [],
+        assumptions: [],
+        unresolvedConflicts: [],
+        filesTouched: [{
+          path: "src/orchestrator/lifecycle/example.ts",
+          action: "modified",
+          contentHash: null,
+          branchRef: null,
+          confidence: "high",
+        }],
+        artifactReferences: [],
+        sourceReferences: [],
+        commandResults: [],
+        testResults: [],
+        materialClaims: [],
+      },
+    } as unknown as RecordCheckpointCommandV2, {
+      authorizationKind: "protected",
+      authorizationSessionId: CHILD_ID,
+      targetSessionId: CHILD_ID,
+      projectId: PROJECT_ID,
+      vaultId: VAULT_ID,
+      storeId: STORE_ID,
+      workspaceId: "c".repeat(64),
+      clientNamespace: "tests",
+      capabilityKind: "root-session-handle",
+      capabilityGeneration: "1",
+      presentingActorRole: "primary",
+      presentingClientInstanceId: "client-1",
+      targetActorRole: "primary",
+      targetClientInstanceId: "client-1",
+      internalWorkflowId: null,
+      internalWorkflowGeneration: null,
+      internalPlannedWorkId: null,
+    });
+    const connection = currentConnection();
+    assert.doesNotThrow(() => seedSessionEvent(
+      connection,
+      CHILD_ID,
+      1,
+      "SessionCheckpointRecorded",
+      {
+        commandId,
+        idempotencyKey: "checkpoint/with-path",
+        lifecycleIntentJson: built.source,
+      },
+    ));
+  });
+
+  it("rejects incomplete or nonpositive lifecycle capability pairs at the SQL boundary", () => {
+    const commandId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaac";
+    const built = buildLifecycleIntentWitness({
+      commandType: "root-resume",
+      commandId,
+      idempotencyKey: "resume/capability-pair",
+      agentId: "agent-1",
+      expectedProjectId: PROJECT_ID,
+      expectedVaultId: VAULT_ID,
+      expectedWorkspaceId: "c".repeat(64),
+      expectedBranchRef: null,
+      sessionId: ROOT_ID,
+      continuityKey: "continuity-a",
+      resumePolicy: "exact",
+      expectedOwnerGeneration: "1",
+    } as RootResumeCommandV2, {
+      authorizationKind: "protected",
+      authorizationSessionId: ROOT_ID,
+      targetSessionId: ROOT_ID,
+      projectId: PROJECT_ID,
+      vaultId: VAULT_ID,
+      storeId: STORE_ID,
+      workspaceId: "c".repeat(64),
+      clientNamespace: "tests",
+      capabilityKind: "root-resume-token",
+      capabilityGeneration: "1",
+      presentingActorRole: "primary",
+      presentingClientInstanceId: "client-1",
+      targetActorRole: "primary",
+      targetClientInstanceId: "client-1",
+      internalWorkflowId: null,
+      internalWorkflowGeneration: null,
+      internalPlannedWorkId: null,
+    });
+    for (const [name, capabilityKind, capabilityGeneration] of [
+      ["missing-kind", null, "1"],
+      ["missing-generation", "root-resume-token", null],
+      ["zero-generation", "root-resume-token", "0"],
+    ] as const) {
+      const witness = JSON.parse(built.source) as {
+        intent: { authorization: {
+          capabilityKind: "root-resume-token" | null;
+          capabilityGeneration: string | null;
+        } };
+        persistedAssertions: {
+          capabilityKind: "root-resume-token" | null;
+          capabilityGeneration: string | null;
+        };
+      };
+      witness.intent.authorization.capabilityKind = capabilityKind;
+      witness.intent.authorization.capabilityGeneration = capabilityGeneration;
+      witness.persistedAssertions.capabilityKind = capabilityKind;
+      witness.persistedAssertions.capabilityGeneration = capabilityGeneration;
+      const connection = currentConnection();
+      assert.throws(
+        () => seedSessionEvent(connection, ROOT_ID, 1, "SessionResumed", {
+          commandId,
+          idempotencyKey: `resume/capability-pair/${name}`,
+          lifecycleIntentJson: canonicalJson(witness),
+        }),
+        /LIFECYCLE_INTENT_WITNESS_INVALID/,
+        name,
+      );
+    }
   });
 
   it("keeps Version 1 and non-lifecycle rows NULL", () => {

@@ -48,9 +48,14 @@ import {
 import { DEFAULT_BUSY_TIMEOUT_MS } from "../src/orchestrator/runtime/runtime-capabilities.js";
 import {
   buildLifecycleIntentWitness,
+  lifecycleIntentHashFromWitnessSource,
   type TrustedLifecycleIntentAssertionsV1,
 } from "../src/orchestrator/lifecycle/lifecycle-intent-witness.js";
-import type { RootStartCommandV2 } from "../src/orchestrator/lifecycle/contracts/commands.js";
+import type {
+  InternalWorkflowPhaseCommand,
+  RootResumeCommandV2,
+  RootStartCommandV2,
+} from "../src/orchestrator/lifecycle/contracts/commands.js";
 import { canonicalJson } from "../src/orchestrator/serialization/canonical-json.js";
 import { BranchScopeRepository } from "../src/orchestrator/storage/branch-scope.repository.js";
 import {
@@ -465,6 +470,13 @@ const INITIAL_INTENT_ASSERTIONS: TrustedLifecycleIntentAssertionsV1 = {
   authorizationKind: "initial-authority",
   authorizationSessionId: null,
   targetSessionId: INTENT_SESSION_ID,
+  projectId: PROJECT_ID,
+  vaultId: VAULT_ID,
+  storeId: STORE_ID,
+  workspaceId: WORKSPACE_ID,
+  clientNamespace: "tests",
+  capabilityKind: null,
+  capabilityGeneration: null,
   presentingActorRole: "primary",
   presentingClientInstanceId: "client-integrity",
   targetActorRole: "primary",
@@ -595,6 +607,247 @@ function installV2LifecycleIntent(
     rehashCompleteEventChain(fixture.connection);
   });
   return { commandHash: nextCommandHash, witnessJson };
+}
+
+function installProtectedV2Resume(
+  fixture: Fixture,
+): { commandHash: string; witnessJson: string } {
+  const sessionId = INTENT_SESSION_ID;
+  const streamId = `session/${sessionId}`;
+  const command = {
+    commandType: "root-resume",
+    commandId: COMMAND_A,
+    idempotencyKey: "integrity:command-a",
+    agentId: "agent-primary",
+    expectedProjectId: PROJECT_ID,
+    expectedVaultId: VAULT_ID,
+    expectedWorkspaceId: WORKSPACE_ID,
+    expectedBranchRef: null,
+    sessionId,
+    continuityKey: "protected-resume-continuity",
+    resumePolicy: "exact",
+    expectedOwnerGeneration: "7",
+  } as RootResumeCommandV2;
+  const built = buildLifecycleIntentWitness(command, {
+    ...INITIAL_INTENT_ASSERTIONS,
+    authorizationKind: "protected",
+    authorizationSessionId: sessionId,
+    capabilityKind: "root-resume-token",
+    capabilityGeneration: "7",
+  });
+  withMutableV2Witnesses(fixture, () => {
+    fixture.connection.prepare(`
+      UPDATE events
+      SET stream_id = $streamId,
+          stream_type = 'session',
+          event_type = CASE command_event_index
+            WHEN 0 THEN 'SessionResumed'
+            ELSE 'SessionCheckpointRecorded'
+          END,
+          session_id = $sessionId,
+          parent_session_id = NULL,
+          lifecycle_intent_json = CASE command_event_index
+            WHEN 0 THEN $witnessJson
+            ELSE NULL
+          END
+      WHERE command_id = $commandId
+    `).run({
+      $streamId: streamId,
+      $sessionId: sessionId,
+      $witnessJson: built.source,
+      $commandId: COMMAND_A,
+    });
+    fixture.connection.prepare(`
+      UPDATE streams
+      SET stream_id = $streamId, stream_type = 'session'
+      WHERE stream_id = 'stream-a'
+    `).run({ $streamId: streamId });
+    fixture.connection.prepare(`
+      INSERT INTO session_authority(
+        project_id, session_id, stream_id, session_kind, parent_session_id,
+        workspace_id, client_namespace, semantic_state, owner_generation,
+        child_capability_generation, direct_access_enabled,
+        continuity_fingerprint_algorithm, continuity_fingerprint_schema_version,
+        continuity_fingerprint_key_id, continuity_fingerprint_domain,
+        continuity_fingerprint,
+        root_handle_capability_version, root_handle_key_id,
+        root_handle_issue_nonce, root_handle_issued_at, root_handle_policy_code,
+        root_handle_expiry_kind, root_handle_expires_at, root_handle_actor_role,
+        root_handle_client_instance_id, root_handle_verifier, root_handle_issuance_id,
+        resume_token_capability_version, resume_token_key_id,
+        resume_token_issue_nonce, resume_token_issued_at, resume_token_policy_code,
+        resume_token_expiry_kind, resume_token_expires_at, resume_token_actor_role,
+        resume_token_verifier, resume_token_issuance_id,
+        authority_commitment, authority_event_position, created_at, updated_at
+      )
+      SELECT project_id, $sessionId, $streamId, 'root', NULL,
+             workspace_id, $clientNamespace, 'active', 7, NULL, 0,
+             'hmac-sha256', 1, 'continuity-key', 'continuity-domain', $fingerprint,
+             1, 'root-key', $rootNonce, $now, 'root-policy',
+             'until-revoked', NULL, 'primary', 'client-integrity',
+             $rootVerifier, 'root-issuance',
+             1, 'resume-key', $resumeNonce, $now, 'resume-policy',
+             'until-revoked', NULL, 'primary', $resumeVerifier, 'resume-issuance',
+             $commitment, global_position, $now, $now
+      FROM events
+      WHERE command_id = $commandId AND command_event_index = 0
+    `).run({
+      $sessionId: sessionId,
+      $streamId: streamId,
+      $clientNamespace: fixture.context.binding.clientNamespace,
+      $fingerprint: "a".repeat(64),
+      $rootNonce: "b".repeat(64),
+      $rootVerifier: "c".repeat(64),
+      $resumeNonce: "d".repeat(64),
+      $resumeVerifier: "e".repeat(64),
+      $commitment: "f".repeat(64),
+      $now: NOW,
+      $commandId: COMMAND_A,
+    });
+    fixture.connection.prepare(`
+      UPDATE command_dedup
+      SET command_type = 'root-resume',
+          command_hash = $commandHash,
+          lifecycle_authorization_kind = 'protected',
+          authorization_proof_version = 1,
+          authorization_proof_nonce = '88888888-8888-4888-8888-888888888888',
+          authorization_proof_digest = $proofDigest,
+          authorization_session_id = $sessionId,
+          target_session_id = $sessionId,
+          presenting_actor_role = 'primary',
+          presenting_client_instance_id = 'client-integrity',
+          target_actor_role = 'primary',
+          target_client_instance_id = 'client-integrity'
+      WHERE command_id = $commandId
+    `).run({
+      $commandHash: built.intentHash,
+      $proofDigest: "d".repeat(64),
+      $sessionId: sessionId,
+      $commandId: COMMAND_A,
+    });
+    rehashCompleteEventChain(fixture.connection);
+  });
+  return { commandHash: built.intentHash, witnessJson: built.source };
+}
+
+function installInternalV2Phase(
+  fixture: Fixture,
+): { commandHash: string; witnessJson: string } {
+  installProtectedV2Resume(fixture);
+  const workflowId = "88888888-8888-4888-8888-888888888888";
+  const plannedWorkId = "9".repeat(64);
+  const command: InternalWorkflowPhaseCommand = {
+    commandType: "internal-workflow-phase",
+    commandId: COMMAND_A,
+    idempotencyKey: "integrity:command-a",
+    agentId: "agent-primary",
+    expectedProjectId: PROJECT_ID as InternalWorkflowPhaseCommand["expectedProjectId"],
+    expectedVaultId: VAULT_ID as InternalWorkflowPhaseCommand["expectedVaultId"],
+    expectedWorkspaceId: WORKSPACE_ID as InternalWorkflowPhaseCommand["expectedWorkspaceId"],
+    expectedBranchRef: null,
+    workflowId: workflowId as InternalWorkflowPhaseCommand["workflowId"],
+    workflowGeneration: 3,
+    plannedWorkId,
+    sourcePhase: "validate",
+    claim: {
+      workflowId: workflowId as InternalWorkflowPhaseCommand["workflowId"],
+      workflowGeneration: 3,
+      claimOwnerId: "99999999-9999-4999-8999-999999999999",
+      claimToken: "7",
+      claimExpiresAt: "2026-07-14T00:10:00.000Z",
+    },
+    action: {
+      action: "invalidate-verification",
+      safeFailureCode: "SESSION_SOURCE_STATE_CONFLICT",
+    },
+  };
+  const built = buildLifecycleIntentWitness(command, {
+    ...INITIAL_INTENT_ASSERTIONS,
+    authorizationKind: "internal-workflow",
+    authorizationSessionId: INTENT_SESSION_ID,
+    capabilityKind: null,
+    capabilityGeneration: null,
+    internalWorkflowId: workflowId,
+    internalWorkflowGeneration: 3,
+    internalPlannedWorkId: plannedWorkId,
+  });
+  withMutableV2Witnesses(fixture, () => {
+    fixture.connection.prepare(`
+      UPDATE events
+      SET lifecycle_intent_json = CASE command_event_index
+        WHEN 0 THEN $witnessJson ELSE NULL END
+      WHERE command_id = $commandId
+    `).run({ $witnessJson: built.source, $commandId: COMMAND_A });
+    fixture.connection.prepare(`
+      UPDATE command_dedup
+      SET command_type = 'internal-workflow-phase',
+          command_hash = $commandHash,
+          lifecycle_authorization_kind = 'internal-workflow',
+          authorization_proof_version = NULL,
+          authorization_proof_nonce = NULL,
+          authorization_proof_digest = NULL,
+          authorization_session_id = $sessionId,
+          target_session_id = $sessionId,
+          internal_workflow_id = $workflowId,
+          internal_workflow_generation = 3,
+          internal_planned_work_id = $plannedWorkId,
+          internal_claim_owner_id = $claimOwnerId,
+          internal_claim_token = 7
+      WHERE command_id = $commandId
+    `).run({
+      $commandHash: built.intentHash,
+      $sessionId: INTENT_SESSION_ID,
+      $workflowId: workflowId,
+      $plannedWorkId: plannedWorkId,
+      $claimOwnerId: command.claim.claimOwnerId,
+      $commandId: COMMAND_A,
+    });
+    rehashCompleteEventChain(fixture.connection);
+  });
+  return { commandHash: built.intentHash, witnessJson: built.source };
+}
+
+function replaceWitnessNamespace(source: string, clientNamespace: string): {
+  commandHash: string;
+  witnessJson: string;
+} {
+  const witness = JSON.parse(source) as {
+    intent: { binding: { clientNamespace: string } };
+    persistedAssertions: { clientNamespace: string };
+  };
+  witness.intent.binding.clientNamespace = clientNamespace;
+  witness.persistedAssertions.clientNamespace = clientNamespace;
+  const witnessJson = canonicalJson(witness as unknown as JsonValue);
+  return {
+    commandHash: lifecycleIntentHashFromWitnessSource(witnessJson),
+    witnessJson,
+  };
+}
+
+function replaceWitnessCapability(
+  source: string,
+  capabilityKind: "root-resume-token" | null,
+  capabilityGeneration: string | null,
+): { commandHash: string; witnessJson: string } {
+  const witness = JSON.parse(source) as {
+    intent: { authorization: {
+      capabilityKind: "root-resume-token" | null;
+      capabilityGeneration: string | null;
+    } };
+    persistedAssertions: {
+      capabilityKind: "root-resume-token" | null;
+      capabilityGeneration: string | null;
+    };
+  };
+  witness.intent.authorization.capabilityKind = capabilityKind;
+  witness.intent.authorization.capabilityGeneration = capabilityGeneration;
+  witness.persistedAssertions.capabilityKind = capabilityKind;
+  witness.persistedAssertions.capabilityGeneration = capabilityGeneration;
+  const witnessJson = canonicalJson(witness as unknown as JsonValue);
+  return {
+    commandHash: lifecycleIntentHashFromWitnessSource(witnessJson),
+    witnessJson,
+  };
 }
 
 class ObservingConnection implements SqliteConnection {
@@ -1568,7 +1821,139 @@ describe("EventIntegrityService Version 2 lifecycle intent witnesses", () => {
       `).get({ $commandId: COMMAND_A })?.lifecycle_intent_json,
       installed.witnessJson,
     );
+    const decoded = JSON.parse(installed.witnessJson) as {
+      intent: {
+        binding: {
+          projectId: string;
+          vaultId: string;
+          storeId: string;
+          workspaceId: string;
+          clientNamespace: string;
+        };
+        authorization: {
+          targetSessionId: string | null;
+          capabilityKind: string | null;
+          capabilityGeneration: string | null;
+        };
+      };
+      persistedAssertions: { targetSessionId: string };
+    };
+    assert.deepEqual(decoded.intent.binding, {
+      projectId: PROJECT_ID,
+      vaultId: VAULT_ID,
+      storeId: STORE_ID,
+      workspaceId: WORKSPACE_ID,
+      clientNamespace: "tests",
+    });
+    assert.deepEqual(decoded.intent.authorization, {
+      authorizationKind: "initial-authority",
+      authorizationSessionId: null,
+      targetSessionId: null,
+      capabilityKind: null,
+      capabilityGeneration: null,
+      presentingActorRole: "primary",
+      presentingClientInstanceId: "client-integrity",
+      targetActorRole: "primary",
+      targetClientInstanceId: "client-integrity",
+      internalWorkflowId: null,
+      internalWorkflowGeneration: null,
+      internalPlannedWorkId: null,
+    });
+    assert.equal(decoded.persistedAssertions.targetSessionId, INTENT_SESSION_ID);
     assert.equal(fixture.integrity.fullCheck(fixture.context).ok, true);
+  });
+
+  it("reconstructs a protected resume intent with capability kind and generation", () => {
+    const fixture = createFixture({ migrations: PROJECT_STORE_MIGRATIONS });
+    const installed = installProtectedV2Resume(fixture);
+    const decoded = JSON.parse(installed.witnessJson) as {
+      intent: {
+        authorization: {
+          capabilityKind: string | null;
+          capabilityGeneration: string | null;
+        };
+      };
+    };
+    assert.deepEqual(decoded.intent.authorization, {
+      authorizationKind: "protected",
+      authorizationSessionId: INTENT_SESSION_ID,
+      targetSessionId: INTENT_SESSION_ID,
+      capabilityKind: "root-resume-token",
+      capabilityGeneration: "7",
+      presentingActorRole: "primary",
+      presentingClientInstanceId: "client-integrity",
+      targetActorRole: "primary",
+      targetClientInstanceId: "client-integrity",
+      internalWorkflowId: null,
+      internalWorkflowGeneration: null,
+      internalPlannedWorkId: null,
+    });
+    assert.equal(fixture.integrity.fullCheck(fixture.context).ok, true);
+  });
+
+  it("independently binds protected and internal intent namespaces to session authority", () => {
+    for (const [name, install] of [
+      ["protected", installProtectedV2Resume],
+      ["internal", installInternalV2Phase],
+    ] as const) {
+      const fixture = createFixture({ migrations: PROJECT_STORE_MIGRATIONS });
+      const installed = install(fixture);
+      assert.equal(fixture.integrity.fullCheck(fixture.context).ok, true, `${name}: baseline`);
+      const replacement = replaceWitnessNamespace(
+        installed.witnessJson,
+        "coherently-rehashed-other-namespace",
+      );
+      withMutableV2Witnesses(fixture, () => {
+        fixture.connection.prepare(`
+          UPDATE events SET lifecycle_intent_json = $witness
+          WHERE command_id = $commandId AND command_event_index = 0
+        `).run({ $witness: replacement.witnessJson, $commandId: COMMAND_A });
+        fixture.connection.prepare(`
+          UPDATE command_dedup SET command_hash = $commandHash
+          WHERE command_id = $commandId
+        `).run({ $commandHash: replacement.commandHash, $commandId: COMMAND_A });
+        rehashCompleteEventChain(fixture.connection);
+      });
+
+      const report = fixture.integrity.fullCheck(fixture.context);
+      assert.equal(report.ok, false, name);
+      assert.ok(issueCodes(report).includes("COMMAND_METADATA_MISMATCH"), name);
+    }
+  });
+
+  it("requires persisted proof presence exactly when the intent has a capability pair", () => {
+    const proofWithoutCapability = createFixture({ migrations: PROJECT_STORE_MIGRATIONS });
+    const installed = installProtectedV2Resume(proofWithoutCapability);
+    const withoutCapability = replaceWitnessCapability(installed.witnessJson, null, null);
+    withMutableV2Witnesses(proofWithoutCapability, () => {
+      proofWithoutCapability.connection.prepare(`
+        UPDATE events SET lifecycle_intent_json = $witness
+        WHERE command_id = $commandId AND command_event_index = 0
+      `).run({ $witness: withoutCapability.witnessJson, $commandId: COMMAND_A });
+      proofWithoutCapability.connection.prepare(`
+        UPDATE command_dedup SET command_hash = $commandHash
+        WHERE command_id = $commandId
+      `).run({ $commandHash: withoutCapability.commandHash, $commandId: COMMAND_A });
+      rehashCompleteEventChain(proofWithoutCapability.connection);
+    });
+    assert.ok(issueCodes(proofWithoutCapability.integrity.fullCheck(
+      proofWithoutCapability.context,
+    )).includes("COMMAND_METADATA_MISMATCH"));
+
+    const capabilityWithoutProof = createFixture({ migrations: PROJECT_STORE_MIGRATIONS });
+    installProtectedV2Resume(capabilityWithoutProof);
+    withMutableV2Witnesses(capabilityWithoutProof, () => {
+      capabilityWithoutProof.connection.prepare(`
+        UPDATE command_dedup
+        SET authorization_proof_version = NULL,
+            authorization_proof_nonce = NULL,
+            authorization_proof_digest = NULL
+        WHERE command_id = $commandId
+      `).run({ $commandId: COMMAND_A });
+    });
+    assert.ok(issueCodes(capabilityWithoutProof.integrity.fullCheck(
+      capabilityWithoutProof.context,
+    )).includes("COMMAND_METADATA_MISMATCH"));
   });
 
   it("hashes distinct caller intent differently when event outcomes are otherwise identical", () => {
@@ -1739,6 +2124,44 @@ describe("EventIntegrityService Version 2 lifecycle intent witnesses", () => {
     const report = fixture.integrity.fullCheck(fixture.context);
     assert.equal(report.ok, false);
     assert.ok(issueCodes(report).includes("COMMAND_METADATA_MISMATCH"));
+  });
+
+  it("rejects coherently rehashed stable binding drift from the stored event", () => {
+    for (const [name, assertions] of [
+      ["store", {
+        ...INITIAL_INTENT_ASSERTIONS,
+        storeId: "99999999-9999-4999-8999-999999999999",
+      }],
+      ["client-namespace", {
+        ...INITIAL_INTENT_ASSERTIONS,
+        clientNamespace: "other-client-namespace",
+      }],
+    ] as const) {
+      const fixture = createFixture({ migrations: PROJECT_STORE_MIGRATIONS });
+      installV2LifecycleIntent(fixture, materialA);
+      const replacement = buildLifecycleIntentWitness(materialA, assertions);
+      withMutableV2Witnesses(fixture, () => {
+        fixture.connection.prepare(`
+          UPDATE events SET lifecycle_intent_json = $witness
+          WHERE command_id = $commandId AND command_event_index = 0
+        `).run({
+          $witness: replacement.source,
+          $commandId: COMMAND_A,
+        });
+        fixture.connection.prepare(`
+          UPDATE command_dedup SET command_hash = $commandHash
+          WHERE command_id = $commandId
+        `).run({
+          $commandHash: replacement.intentHash,
+          $commandId: COMMAND_A,
+        });
+        rehashCompleteEventChain(fixture.connection);
+      });
+
+      const report = fixture.integrity.fullCheck(fixture.context);
+      assert.equal(report.ok, false, name);
+      assert.ok(issueCodes(report).includes("COMMAND_METADATA_MISMATCH"), name);
+    }
   });
 
   it("rejects drift between the event-bound witness and persisted generated target", () => {

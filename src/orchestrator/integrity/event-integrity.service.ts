@@ -154,6 +154,9 @@ interface CommandRow {
   commandType: string;
   commandHash: string;
   lifecycleAuthorizationKind: string | null;
+  authorizationProofVersion: bigint | null;
+  authorizationProofNonce: string | null;
+  authorizationProofDigest: string | null;
   authorizationSessionId: string | null;
   targetSessionId: string | null;
   presentingActorRole: string | null;
@@ -368,6 +371,9 @@ function commandRow(row: SqliteRow): CommandRow {
     commandType: stringValue(row, "command_type"),
     commandHash: stringValue(row, "command_hash"),
     lifecycleAuthorizationKind: nullableStringValue(row, "lifecycle_authorization_kind"),
+    authorizationProofVersion: nullableBigintValue(row, "authorization_proof_version"),
+    authorizationProofNonce: nullableStringValue(row, "authorization_proof_nonce"),
+    authorizationProofDigest: nullableStringValue(row, "authorization_proof_digest"),
     authorizationSessionId: nullableStringValue(row, "authorization_session_id"),
     targetSessionId: nullableStringValue(row, "target_session_id"),
     presentingActorRole: nullableStringValue(row, "presenting_actor_role"),
@@ -596,11 +602,15 @@ export class EventIntegrityService {
         `).all().map(streamRow)
       : [];
     const lifecycleAuthorizationColumns = (this.migrations.at(-1)?.version ?? 0) >= 2
-      ? `lifecycle_authorization_kind, authorization_session_id, target_session_id,
+      ? `lifecycle_authorization_kind, authorization_proof_version,
+         authorization_proof_nonce, authorization_proof_digest,
+         authorization_session_id, target_session_id,
          presenting_actor_role, presenting_client_instance_id,
          target_actor_role, target_client_instance_id, internal_workflow_id,
          internal_workflow_generation, internal_planned_work_id`
-      : `NULL AS lifecycle_authorization_kind, NULL AS authorization_session_id,
+      : `NULL AS lifecycle_authorization_kind, NULL AS authorization_proof_version,
+         NULL AS authorization_proof_nonce, NULL AS authorization_proof_digest,
+         NULL AS authorization_session_id,
          NULL AS target_session_id, NULL AS presenting_actor_role,
          NULL AS presenting_client_instance_id, NULL AS target_actor_role,
          NULL AS target_client_instance_id, NULL AS internal_workflow_id,
@@ -971,8 +981,19 @@ export class EventIntegrityService {
       const generation = command.internalWorkflowGeneration === null
         ? null
         : safeNumber(command.internalWorkflowGeneration);
+      const proofFields = [
+        command.authorizationProofVersion,
+        command.authorizationProofNonce,
+        command.authorizationProofDigest,
+      ];
+      const proofPresent = proofFields.every((value) => value !== null);
+      const proofAbsent = proofFields.every((value) => value === null);
+      const capabilityPairPresent = assertions.capabilityKind !== null
+        && assertions.capabilityGeneration !== null;
       if (
-        assertions.authorizationKind !== command.lifecycleAuthorizationKind
+        (!proofPresent && !proofAbsent)
+        || proofPresent !== capabilityPairPresent
+        || assertions.authorizationKind !== command.lifecycleAuthorizationKind
         || assertions.authorizationSessionId !== command.authorizationSessionId
         || assertions.targetSessionId !== command.targetSessionId
         || assertions.presentingActorRole !== command.presentingActorRole
@@ -986,11 +1007,16 @@ export class EventIntegrityService {
 
       const first = rows[0]!;
       const semanticCommand = witness.intent.command;
+      const binding = witness.intent.binding;
       if (
         semanticCommand.commandId !== command.commandId
         || semanticCommand.idempotencyKey !== command.idempotencyKey
         || semanticCommand.commandType !== command.commandType
         || semanticCommand.agentId !== stringValue(first, "agent_id")
+        || binding.projectId !== stringValue(first, "project_id")
+        || binding.vaultId !== stringValue(first, "vault_id")
+        || binding.storeId !== stringValue(first, "store_id")
+        || binding.workspaceId !== stringValue(first, "workspace_id")
         || semanticCommand.expectedProjectId !== stringValue(first, "project_id")
         || semanticCommand.expectedVaultId !== stringValue(first, "vault_id")
         || semanticCommand.expectedWorkspaceId !== stringValue(first, "workspace_id")
@@ -999,6 +1025,23 @@ export class EventIntegrityService {
         || assertions.presentingActorRole !== stringValue(first, "actor_role")
         || assertions.presentingClientInstanceId !== stringValue(first, "client_instance_id")
       ) return invalid();
+
+      if (assertions.authorizationKind !== "initial-authority") {
+        if (assertions.authorizationSessionId === null) return invalid();
+        const authorityRows = this.connection.prepare(`
+          SELECT workspace_id, client_namespace
+          FROM session_authority
+          WHERE project_id = $projectId AND session_id = $sessionId
+        `).all({
+          $projectId: binding.projectId,
+          $sessionId: assertions.authorizationSessionId,
+        });
+        if (
+          authorityRows.length !== 1
+          || stringValue(authorityRows[0]!, "workspace_id") !== binding.workspaceId
+          || stringValue(authorityRows[0]!, "client_namespace") !== binding.clientNamespace
+        ) return invalid();
+      }
 
       if (semanticCommand.commandType === "root-start") {
         const payload = canonicalJsonValue(stringValue(first, "payload_json"));
@@ -1009,6 +1052,7 @@ export class EventIntegrityService {
           || payload.sessionKind !== "root"
           || payload.ownerGeneration !== 1
           || payload.continuityKey !== semanticCommand.continuityKey
+          || payload.clientNamespace !== binding.clientNamespace
           || payload.creatingAgentId !== semanticCommand.agentId
           || payload.creatingClientInstanceId !== assertions.targetClientInstanceId
           || !plainRecord(storedResponse)

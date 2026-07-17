@@ -25,6 +25,11 @@ import {
   type PreparedLifecycleCommit,
 } from "../src/orchestrator/lifecycle/lifecycle-command.store.js";
 import type {
+  InternalWorkflowPhaseCommand,
+  RootResumeCommandV2,
+} from "../src/orchestrator/lifecycle/contracts/commands.js";
+import { buildLifecycleIntentWitness } from "../src/orchestrator/lifecycle/lifecycle-intent-witness.js";
+import type {
   EventAppendReplay,
 } from "../src/orchestrator/storage/event-append-transaction.js";
 import type {
@@ -37,7 +42,6 @@ import {
 } from "../src/orchestrator/crypto/event-hash.js";
 import { canonicalJson } from "../src/orchestrator/serialization/canonical-json.js";
 
-const HASH_A = "a".repeat(64);
 const NOW = "2026-07-14T00:00:00.000Z";
 const CONTEXT = {
   binding: {
@@ -48,6 +52,40 @@ const CONTEXT = {
     clientNamespace: "tests",
   },
 } as unknown as ProjectContext;
+const SEMANTIC_COMMAND = {
+  commandType: "root-resume",
+  commandId: "00000000-0000-4000-8000-000000000100",
+  idempotencyKey: "lifecycle:test:100",
+  agentId: "agent",
+  expectedProjectId: CONTEXT.binding.projectId,
+  expectedVaultId: CONTEXT.binding.vaultId,
+  expectedWorkspaceId: CONTEXT.binding.workspaceId,
+  expectedBranchRef: null,
+  sessionId: "00000000-0000-4000-8000-000000000010",
+  continuityKey: "lifecycle:test",
+  resumePolicy: "exact",
+  expectedOwnerGeneration: "1",
+} as RootResumeCommandV2;
+const INTENT_WITNESS = buildLifecycleIntentWitness(SEMANTIC_COMMAND, {
+  authorizationKind: "protected",
+  authorizationSessionId: "00000000-0000-4000-8000-000000000010",
+  targetSessionId: "00000000-0000-4000-8000-000000000010",
+  projectId: CONTEXT.binding.projectId,
+  vaultId: CONTEXT.binding.vaultId,
+  storeId: CONTEXT.binding.storeId,
+  workspaceId: CONTEXT.binding.workspaceId,
+  clientNamespace: CONTEXT.binding.clientNamespace,
+  capabilityKind: "root-session-handle",
+  capabilityGeneration: "1",
+  presentingActorRole: "primary",
+  presentingClientInstanceId: "primary-a",
+  targetActorRole: "primary",
+  targetClientInstanceId: "primary-a",
+  internalWorkflowId: null,
+  internalWorkflowGeneration: null,
+  internalPlannedWorkId: null,
+});
+const HASH_A = INTENT_WITNESS.intentHash;
 
 class TransactionConnection implements SqliteConnection {
   readonly statements: string[] = [];
@@ -104,12 +142,15 @@ function envelope(overrides: Partial<LifecycleCommandEnvelope> = {}): LifecycleC
     commandType: "root-resume",
     candidateIntentHash: HASH_A,
     authoritativeIntentHash: HASH_A,
+    semanticCommand: SEMANTIC_COMMAND,
+    capabilityKind: "root-session-handle",
+    capabilityGeneration: "1",
     replayExpectation: expectation(),
     ...overrides,
   };
 }
 
-function appendCommand(): AppendCommand<JsonValue> {
+function appendCommand(): PreparedLifecycleCommit<JsonValue>["append"] {
   return {
     context: CONTEXT,
     commandId: "00000000-0000-4000-8000-000000000100",
@@ -410,6 +451,32 @@ describe("LifecycleCommandStore", () => {
     );
     assert.deepEqual(connection.statements, []);
     assert.deepEqual(events.calls, []);
+  });
+
+  it("rejects callback-owned lifecycle intent witnesses before event preparation", () => {
+    const connection = new TransactionConnection();
+    const events = new FakeEvents(connection);
+    const store = new LifecycleCommandStore({
+      connection,
+      events,
+      transaction: () => transaction(connection),
+      now: () => NOW,
+    });
+
+    assert.throws(
+      () => store.execute(envelope(), () => ({
+        append: {
+          ...appendCommand(),
+          lifecycleIntentWitness: INTENT_WITNESS.source,
+        } as unknown as PreparedLifecycleCommit<JsonValue>["append"],
+        authorizationRecord: authorization(),
+        afterAppend: () => undefined,
+      })),
+      (error: unknown) => error instanceof LifecycleCommandStoreError
+        && error.code === "LIFECYCLE_INPUT_INVALID",
+    );
+    assert.equal(events.calls.includes("prepare"), false);
+    assert.deepEqual(connection.statements.at(-1), "ROLLBACK");
   });
 
   it("returns exact replay before fresh authority work and reports advisory staleness", () => {
@@ -888,7 +955,7 @@ describe("LifecycleCommandStore", () => {
       workflowId: "00000000-0000-4000-8000-000000000020",
       workflowGeneration: 3n,
       plannedWorkId: "3".repeat(64),
-      claimOwnerId: "coordinator-a",
+      claimOwnerId: "00000000-0000-4000-8000-000000000030",
       claimToken: 7n,
       authorizationSessionId: "00000000-0000-4000-8000-000000000010",
       targetSessionId: "00000000-0000-4000-8000-000000000010",
@@ -898,7 +965,7 @@ describe("LifecycleCommandStore", () => {
     const expected = structuredClone(original);
     const replayExpectation: LifecycleReplayExpectation = {
       kind: "internal-workflow",
-      workflowId: original.workflowId,
+      workflowId: original.workflowId as InternalWorkflowPhaseCommand["workflowId"],
       workflowGeneration: original.workflowGeneration,
       plannedWorkId: original.plannedWorkId,
       authorizationSessionId: original.authorizationSessionId,
@@ -906,9 +973,61 @@ describe("LifecycleCommandStore", () => {
       presenting: structuredClone(original.presenting),
       target: structuredClone(original.target),
     };
+    const semanticCommand: InternalWorkflowPhaseCommand = {
+      commandType: "internal-workflow-phase",
+      commandId: "00000000-0000-4000-8000-000000000100",
+      idempotencyKey: "lifecycle:test:100",
+      agentId: "agent",
+      expectedProjectId: CONTEXT.binding.projectId,
+      expectedVaultId: CONTEXT.binding.vaultId,
+      expectedWorkspaceId: CONTEXT.binding.workspaceId,
+      expectedBranchRef: null,
+      workflowId: original.workflowId as InternalWorkflowPhaseCommand["workflowId"],
+      workflowGeneration: Number(original.workflowGeneration),
+      plannedWorkId: original.plannedWorkId,
+      sourcePhase: "validate",
+      claim: {
+        workflowId: original.workflowId as InternalWorkflowPhaseCommand["workflowId"],
+        workflowGeneration: Number(original.workflowGeneration),
+        claimOwnerId: original.claimOwnerId,
+        claimToken: original.claimToken.toString(),
+        claimExpiresAt: "2026-07-14T00:10:00.000Z",
+      },
+      action: {
+        action: "invalidate-verification",
+        safeFailureCode: "SESSION_SOURCE_STATE_CONFLICT",
+      },
+    };
+    const intent = buildLifecycleIntentWitness(semanticCommand, {
+      authorizationKind: "internal-workflow",
+      authorizationSessionId: original.authorizationSessionId,
+      targetSessionId: original.targetSessionId,
+      projectId: CONTEXT.binding.projectId,
+      vaultId: CONTEXT.binding.vaultId,
+      storeId: CONTEXT.binding.storeId,
+      workspaceId: CONTEXT.binding.workspaceId,
+      clientNamespace: CONTEXT.binding.clientNamespace,
+      capabilityKind: null,
+      capabilityGeneration: null,
+      presentingActorRole: original.presenting.actorRole,
+      presentingClientInstanceId: original.presenting.clientInstanceId,
+      targetActorRole: original.target.actorRole,
+      targetClientInstanceId: original.target.clientInstanceId,
+      internalWorkflowId: original.workflowId,
+      internalWorkflowGeneration: Number(original.workflowGeneration),
+      internalPlannedWorkId: original.plannedWorkId,
+    });
 
-    const result = store.execute(envelope({ replayExpectation }), () => ({
-      append: appendCommand(),
+    const result = store.execute(envelope({
+      commandType: "internal-workflow-phase",
+      candidateIntentHash: intent.intentHash,
+      authoritativeIntentHash: intent.intentHash,
+      semanticCommand,
+      capabilityKind: null,
+      capabilityGeneration: null,
+      replayExpectation,
+    }), () => ({
+      append: { ...appendCommand(), commandType: "internal-workflow-phase" },
       authorizationRecord: original,
       beforeAppend: () => {
         original.claimOwnerId = "attacker";
