@@ -42,6 +42,7 @@ import type {
 export const MAX_EVENTS_PER_COMMAND = 128;
 export const MAX_CANONICAL_COMMAND_BYTES = 4 * 1024 * 1024;
 export const GENESIS_GLOBAL_HASH = "0".repeat(64);
+export const PREVIOUS_PENDING_EVENT_CAUSATION = "project-memory/previous-pending-event/v1";
 
 export type EventStoreFaultBoundary =
   | "before-begin"
@@ -359,7 +360,7 @@ function validateAppendCommand<T extends JsonValue>(
   const payloadJson: string[] = [];
   const payloadHashes: string[] = [];
   const eventIds: string[] = [];
-  const normalizedEvents = command.events.map((event) => {
+  const normalizedEvents = command.events.map((event, index) => {
     if (!isPlainRecord(event)
       || !nonEmptyString(event.eventType)
       || !Number.isSafeInteger(event.eventSchemaVersion)
@@ -373,6 +374,9 @@ function validateAppendCommand<T extends JsonValue>(
       || !exactStringArray(event.sourceRefs)
       || !isPlainArray(event.evidenceRefs)
       || !isPlainArray(event.evidenceDigests)) {
+      throw new EventStoreError("EVENT_INVALID");
+    }
+    if (event.causationId === PREVIOUS_PENDING_EVENT_CAUSATION && index === 0) {
       throw new EventStoreError("EVENT_INVALID");
     }
     assertCanonicalRfc3339(event.occurredAt, "occurredAt");
@@ -612,7 +616,9 @@ function materializeEvents<T extends JsonValue>(
       agentId: command.agentId,
       clientInstanceId: command.context.binding.clientInstanceId,
       correlationId: command.correlationId,
-      causationId: pending.causationId ?? null,
+      causationId: pending.causationId === PREVIOUS_PENDING_EVENT_CAUSATION
+        ? validated.eventIds[index - 1] ?? null
+        : pending.causationId ?? null,
       commandId: command.commandId,
       idempotencyKey: command.idempotencyKey,
       commandEventIndex: index,
@@ -844,10 +850,22 @@ function decodeLifecycleStableBindingRow(
   const authorityWorkspaceId = requiredString(row.lifecycle_authority_workspace_id);
   const authorityClientNamespace = requiredString(row.lifecycle_authority_client_namespace);
   const targetSessionId = authorization.targetSessionId;
+  const ordinaryBinding = eventSessionId === targetSessionId
+    && eventStreamId === `session/${targetSessionId}`;
+  const commandType = row.lifecycle_command_type;
+  const eventType = row.lifecycle_event_type;
+  const eventParentSessionId = row.lifecycle_event_parent_session_id;
+  const childCreationBinding = authorization.kind === "protected"
+    && authorization.authorizationSessionId === targetSessionId
+    && (commandType === "fork-child" || commandType === "claim-child-transfer")
+    && eventType === "SessionForked"
+    && eventParentSessionId === targetSessionId
+    && LOWER_UUID.test(eventSessionId)
+    && eventSessionId !== targetSessionId
+    && eventStreamId === `session/${eventSessionId}`;
   if (eventWorkspaceId.length === 0
     || authorityClientNamespace.length === 0
-    || eventSessionId !== targetSessionId
-    || eventStreamId !== `session/${targetSessionId}`
+    || (!ordinaryBinding && !childCreationBinding)
     || eventStreamType !== "session"
     || authoritySessionId !== targetSessionId
     || authorityWorkspaceId !== eventWorkspaceId) {
@@ -962,6 +980,7 @@ export class SqliteEventAppendStatements implements EventAppendStatements {
     `);
     this.#findDedup = connection.prepare(this.#lifecycleSchema ? `
       SELECT dedup.command_id, dedup.command_hash, dedup.response_json, dedup.response_hash,
+             dedup.command_type AS lifecycle_command_type,
              dedup.lifecycle_authorization_kind,
              dedup.authorization_proof_version, dedup.authorization_proof_nonce,
              dedup.authorization_proof_digest, dedup.authorization_approval_id,
@@ -973,6 +992,8 @@ export class SqliteEventAppendStatements implements EventAppendStatements {
              dedup.internal_claim_owner_id, dedup.internal_claim_token,
              command_event.workspace_id AS lifecycle_event_workspace_id,
              command_event.session_id AS lifecycle_event_session_id,
+             command_event.event_type AS lifecycle_event_type,
+             command_event.parent_session_id AS lifecycle_event_parent_session_id,
              command_event.stream_id AS lifecycle_event_stream_id,
              command_event.stream_type AS lifecycle_event_stream_type,
              authority.session_id AS lifecycle_authority_session_id,
@@ -1660,15 +1681,44 @@ export class EventAppendTransaction {
       const targetSessionId = authorization.targetSessionId;
       const expectedStreamId = `session/${targetSessionId}`;
       const eventZero = batch.events[0];
+      const lifecycleIntentWitness = validated.lifecycleIntentJson === null
+        ? null
+        : decodeLifecycleIntentWitness(validated.lifecycleIntentJson);
       if (eventZero === undefined
         || eventZero.commandEventIndex !== 0
         || eventZero.commandId !== prepared.command.commandId
         || eventZero.projectId !== prepared.command.context.binding.projectId
-        || eventZero.sessionId !== targetSessionId
-        || eventZero.streamId !== expectedStreamId
         || eventZero.streamType !== "session"
-        || prepared.command.streamId !== expectedStreamId
         || eventZero.workspaceId !== prepared.command.context.binding.workspaceId) {
+        throw new EventStoreError("INTEGRITY_FAILURE");
+      }
+      const ordinaryBinding = eventZero.sessionId === targetSessionId
+        && eventZero.streamId === expectedStreamId
+        && prepared.command.streamId === expectedStreamId;
+      const semantic = lifecycleIntentWitness?.intent.command;
+      const childSessionId = eventZero.sessionId;
+      const forkCreation = semantic?.commandType === "fork-child"
+        && semantic.parentSessionId === targetSessionId
+        && batch.events.length === 1;
+      const claimCreation = semantic?.commandType === "claim-child-transfer"
+        && semantic.rootSessionId === targetSessionId
+        && batch.events.length === 2
+        && batch.events[1]?.eventType === "ChildWorkTransferClaimed";
+      const childCreation = authorization.kind === "protected"
+        && authorization.authorizationSessionId === targetSessionId
+        && (forkCreation || claimCreation)
+        && prepared.command.commandType === semantic?.commandType
+        && prepared.command.expectedStreamVersion === 0n
+        && typeof childSessionId === "string"
+        && LOWER_UUID.test(childSessionId)
+        && childSessionId !== targetSessionId
+        && prepared.command.streamId === `session/${childSessionId}`
+        && eventZero.streamId === prepared.command.streamId
+        && eventZero.eventType === "SessionForked"
+        && batch.events.every((event) => event.sessionId === childSessionId
+          && event.parentSessionId === targetSessionId
+          && event.streamId === prepared.command.streamId);
+      if (!ordinaryBinding && !childCreation) {
         throw new EventStoreError("INTEGRITY_FAILURE");
       }
       const authorityBinding = this.statements.readLifecycleAuthorityBinding(
@@ -1682,9 +1732,6 @@ export class EventAppendTransaction {
         || authorityBinding.clientNamespace !== prepared.command.context.binding.clientNamespace) {
         throw new EventStoreError("IDEMPOTENCY_CONFLICT");
       }
-      const lifecycleIntentWitness = validated.lifecycleIntentJson === null
-        ? null
-        : decodeLifecycleIntentWitness(validated.lifecycleIntentJson);
       const proofPresent = authorization.kind === "protected" && authorization.proof !== null;
       const capabilityPairPresent = lifecycleIntentWitness !== null
         && lifecycleIntentWitness.persistedAssertions.capabilityKind !== null

@@ -1008,6 +1008,26 @@ export class EventIntegrityService {
       const first = rows[0]!;
       const semanticCommand = witness.intent.command;
       const binding = witness.intent.binding;
+      const firstSessionId = nullableStringValue(first, "session_id");
+      const childCreationCommand = semanticCommand.commandType === "fork-child"
+        ? semanticCommand.parentSessionId === assertions.targetSessionId && rows.length === 1
+        : semanticCommand.commandType === "claim-child-transfer"
+          && semanticCommand.rootSessionId === assertions.targetSessionId
+          && rows.length === 2
+          && stringValue(rows[1]!, "event_type") === "ChildWorkTransferClaimed";
+      const ordinaryTargetBinding = assertions.targetSessionId === firstSessionId;
+      const childCreationBinding = assertions.authorizationKind === "protected"
+        && typeof assertions.targetSessionId === "string"
+        && assertions.authorizationSessionId === assertions.targetSessionId
+        && childCreationCommand
+        && firstSessionId !== null
+        && firstSessionId !== assertions.targetSessionId
+        && stringValue(first, "event_type") === "SessionForked"
+        && nullableStringValue(first, "parent_session_id") === assertions.targetSessionId
+        && rows.every((row) => nullableStringValue(row, "session_id") === firstSessionId
+          && nullableStringValue(row, "parent_session_id") === assertions.targetSessionId
+          && stringValue(row, "stream_type") === "session"
+          && stringValue(row, "stream_id") === `session/${firstSessionId}`);
       if (
         semanticCommand.commandId !== command.commandId
         || semanticCommand.idempotencyKey !== command.idempotencyKey
@@ -1021,7 +1041,7 @@ export class EventIntegrityService {
         || semanticCommand.expectedVaultId !== stringValue(first, "vault_id")
         || semanticCommand.expectedWorkspaceId !== stringValue(first, "workspace_id")
         || semanticCommand.expectedBranchRef !== nullableStringValue(first, "branch_ref")
-        || assertions.targetSessionId !== nullableStringValue(first, "session_id")
+        || (!ordinaryTargetBinding && !childCreationBinding)
         || assertions.presentingActorRole !== stringValue(first, "actor_role")
         || assertions.presentingClientInstanceId !== stringValue(first, "client_instance_id")
       ) return invalid();

@@ -121,6 +121,7 @@ function record(value: unknown): value is Record<string, unknown> {
 
 function canonicalHash(value: unknown): string {
   return createHash("sha256")
+    .update("project-memory/checkpoint/v1\n", "utf8")
     .update(canonicalJson(value as never), "utf8")
     .digest("hex");
 }
@@ -515,12 +516,21 @@ export class LifecycleIntegrityService implements IntegrityExtension {
           eventPosition: event.globalPosition,
           revokedAt: event.occurredAt,
         };
-      } else if (
-        event.eventType === "SessionSuspended"
-        || event.eventType === "ChildSessionSuspended"
-      ) {
+      } else if (event.eventType === "ChildSessionCompleted") {
         revocation = {
-          reason: "suspension",
+          reason: "child-completed",
+          eventPosition: event.globalPosition,
+          revokedAt: event.occurredAt,
+        };
+      } else if (event.eventType === "ChildSessionSuspended") {
+        revocation = {
+          reason: "child-suspended",
+          eventPosition: event.globalPosition,
+          revokedAt: event.occurredAt,
+        };
+      } else if (event.eventType === "ChildWorkTransferCreated") {
+        revocation = {
+          reason: "child-transferred",
           eventPosition: event.globalPosition,
           revokedAt: event.occurredAt,
         };
@@ -782,6 +792,7 @@ export class LifecycleIntegrityService implements IntegrityExtension {
         || row.created_event_parent_session_id !== row.source_parent_session_id
         || !record(createdPayload)
         || createdPayload.transferTicketId !== row.transfer_ticket_id
+        || createdPayload.checkpointId !== row.checkpoint_id
         || (claimed.every(present) && (
           row.claimed_event_type !== "ChildWorkTransferClaimed"
           || row.claimed_event_session_id !== row.claimed_child_session_id
@@ -789,12 +800,69 @@ export class LifecycleIntegrityService implements IntegrityExtension {
           || !record(claimedPayload)
           || claimedPayload.transferTicketId !== row.transfer_ticket_id
           || claimedPayload.previousChildSessionId !== row.source_child_session_id
+          || claimedPayload.previousTransferEventPosition !== decimal(row.created_event_position)
         ))
         || !canonicalJsonText(row.source_assignment_json)
         || !canonicalJsonText(row.source_scope_json)
         || !canonicalJsonText(row.follow_ups_json)
         || !canonicalJsonText(row.source_state_json)
         || !canonicalJsonText(row.lineage_json);
+    })) {
+      issue(sink, "LIFECYCLE_WORKFLOW_INVARIANT_MISMATCH");
+    }
+    const createdEvents = this.connection.prepare(`
+      SELECT created.global_position, created.session_id, created.parent_session_id,
+             created.payload_json,
+             ticket.transfer_ticket_id, ticket.source_child_session_id,
+             ticket.source_parent_session_id, ticket.checkpoint_id,
+             (SELECT COUNT(*) FROM child_transfer_tickets AS candidate
+              WHERE candidate.project_id = created.project_id
+                AND candidate.created_event_position = created.global_position) AS ticket_count
+      FROM events AS created
+      LEFT JOIN child_transfer_tickets AS ticket
+        ON ticket.project_id = created.project_id
+       AND ticket.created_event_position = created.global_position
+      WHERE created.project_id = $projectId
+        AND created.event_type = 'ChildWorkTransferCreated'
+    `).all({ $projectId: context.binding.projectId });
+    if (createdEvents.some((row) => {
+      let payload: unknown;
+      try { payload = parsedCanonicalJson(row.payload_json); } catch { payload = null; }
+      return !sameInteger(row.ticket_count, 1)
+        || !record(payload)
+        || payload.transferTicketId !== row.transfer_ticket_id
+        || payload.checkpointId !== row.checkpoint_id
+        || row.session_id !== row.source_child_session_id
+        || row.parent_session_id !== row.source_parent_session_id;
+    })) {
+      issue(sink, "LIFECYCLE_WORKFLOW_INVARIANT_MISMATCH");
+    }
+    const claimedEvents = this.connection.prepare(`
+      SELECT claimed.global_position, claimed.session_id, claimed.parent_session_id,
+             claimed.payload_json,
+             ticket.transfer_ticket_id, ticket.source_child_session_id,
+             ticket.claimed_child_session_id, ticket.claimed_by_root_session_id,
+             ticket.created_event_position,
+             (SELECT COUNT(*) FROM child_transfer_tickets AS candidate
+              WHERE candidate.project_id = claimed.project_id
+                AND candidate.claimed_event_position = claimed.global_position) AS ticket_count
+      FROM events AS claimed
+      LEFT JOIN child_transfer_tickets AS ticket
+        ON ticket.project_id = claimed.project_id
+       AND ticket.claimed_event_position = claimed.global_position
+      WHERE claimed.project_id = $projectId
+        AND claimed.event_type = 'ChildWorkTransferClaimed'
+    `).all({ $projectId: context.binding.projectId });
+    if (claimedEvents.some((row) => {
+      let payload: unknown;
+      try { payload = parsedCanonicalJson(row.payload_json); } catch { payload = null; }
+      return !sameInteger(row.ticket_count, 1)
+        || !record(payload)
+        || payload.transferTicketId !== row.transfer_ticket_id
+        || payload.previousChildSessionId !== row.source_child_session_id
+        || payload.previousTransferEventPosition !== decimal(row.created_event_position)
+        || row.session_id !== row.claimed_child_session_id
+        || row.parent_session_id !== row.claimed_by_root_session_id;
     })) {
       issue(sink, "LIFECYCLE_WORKFLOW_INVARIANT_MISMATCH");
     }

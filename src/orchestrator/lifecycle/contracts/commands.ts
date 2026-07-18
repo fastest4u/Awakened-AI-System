@@ -58,6 +58,7 @@ import {
 
 const LOWER_HASH = /^[0-9a-f]{64}$/;
 const LOWER_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const CANONICAL_32_BYTE_BASE64URL = /^[A-Za-z0-9_-]{43}$/;
 const APPROVAL_MAX_LIFETIME_MS = 600_000;
 const APPROVAL_REASON_CODES = new Set([
   "explicit-user-approval",
@@ -147,6 +148,21 @@ export interface RedactedChildBindingGrant {
   readonly grantFingerprint: string;
 }
 
+/** Transport-private fork authorization. This value must never be persisted. */
+export interface ChildBindingGrantV1 {
+  readonly grantVersion: 1;
+  readonly grantId: string;
+  readonly projectId: string;
+  readonly storeId: string;
+  readonly parentSessionId: string;
+  readonly targetActorRole: "untrusted";
+  readonly targetClientInstanceId: string;
+  readonly issuedAt: string;
+  readonly expiresAt: string;
+  readonly bindingFingerprint: string;
+  readonly mac: string;
+}
+
 export type SemanticCommandAuthorization =
   | {
       kind: "initial-authority";
@@ -162,7 +178,7 @@ export type SemanticCommandAuthorization =
       targetSessionId: SessionId;
       proof: CapabilityProofV1 | null;
       approval: RedactedLifecycleApproval | null;
-      childBindingGrant: RedactedChildBindingGrant | null;
+      childBindingGrant: ChildBindingGrantV1 | null;
     };
 
 export interface BoundedOperationAuthorization {
@@ -227,7 +243,9 @@ export interface AmendChildAssignmentCommandV2 extends LifecycleCommandBase {
   readonly parentSessionId: SessionId;
   readonly childSessionId: SessionId;
   readonly expectedStreamVersion: string;
+  readonly expectedAssignmentRevision: string;
   readonly assignment: ChildAssignmentV1;
+  readonly reasonCode: string;
 }
 
 export interface RecordCheckpointCommandV2 extends LifecycleCommandBase {
@@ -262,7 +280,9 @@ export interface RecordEvidenceBatchCommandV2 extends LifecycleCommandBase {
 
 export interface RecordChildReportCommandV2 extends LifecycleCommandBase {
   readonly commandType: "record-child-report";
+  readonly parentSessionId: SessionId;
   readonly childSessionId: SessionId;
+  readonly childAuthorAgentId: string;
   readonly expectedStreamVersion: string;
   readonly report: ChildReportDraftV1;
 }
@@ -827,14 +847,26 @@ export function decodeLifecycleSemanticCommandDraft(value: unknown): LifecycleSe
       });
     }
     case "amend-child-assignment": {
-      const command = exactCommand(value, ["parentSessionId", "childSessionId", "expectedStreamVersion", "assignment"]);
+      const command = exactCommand(value, [
+        "parentSessionId",
+        "childSessionId",
+        "expectedStreamVersion",
+        "expectedAssignmentRevision",
+        "assignment",
+        "reasonCode",
+      ]);
       return Object.freeze({
         ...base(command),
         commandType,
         parentSessionId: parseLifecycleId<SessionId>(command.parentSessionId, "parentSessionId"),
         childSessionId: parseLifecycleId<SessionId>(command.childSessionId, "childSessionId"),
         expectedStreamVersion: parseDecimalString(command.expectedStreamVersion, "expectedStreamVersion"),
+        expectedAssignmentRevision: parseDecimalString(
+          command.expectedAssignmentRevision,
+          "expectedAssignmentRevision",
+        ),
         assignment: assignment(command.assignment),
+        reasonCode: parseBoundedString(command.reasonCode, "reasonCode", 128),
       });
     }
     case "record-checkpoint": {
@@ -897,13 +929,23 @@ export function decodeLifecycleSemanticCommandDraft(value: unknown): LifecycleSe
       });
     }
     case "record-child-report": {
-      const command = exactCommand(value, ["childSessionId", "expectedStreamVersion", "report"]);
+      const command = exactCommand(value, [
+        "parentSessionId",
+        "childSessionId",
+        "childAuthorAgentId",
+        "expectedStreamVersion",
+        "report",
+      ]);
+      const parentSessionId = parseLifecycleId<SessionId>(command.parentSessionId, "parentSessionId");
       const childSessionId = parseLifecycleId<SessionId>(command.childSessionId, "childSessionId");
+      if (parentSessionId === childSessionId) invalid("parentSessionId");
       const report = decodeChildReportDraftV1(command.report);
       return Object.freeze({
         ...base(command),
         commandType,
+        parentSessionId,
         childSessionId,
+        childAuthorAgentId: parseBoundedString(command.childAuthorAgentId, "childAuthorAgentId", 256),
         expectedStreamVersion: parseDecimalString(command.expectedStreamVersion, "expectedStreamVersion"),
         report,
       });
@@ -1171,7 +1213,7 @@ function decodeLifecycleApproval(value: unknown): RedactedLifecycleApproval | nu
   return approval as unknown as RedactedLifecycleApproval;
 }
 
-function decodeChildBindingGrant(value: unknown): RedactedChildBindingGrant | null {
+function decodeChildBindingGrant(value: unknown): ChildBindingGrantV1 | null {
   if (value === null) return null;
   const grant = exactRecord(
     value,
@@ -1186,7 +1228,7 @@ function decodeChildBindingGrant(value: unknown): RedactedChildBindingGrant | nu
       "issuedAt",
       "expiresAt",
       "bindingFingerprint",
-      "grantFingerprint",
+      "mac",
     ],
     "authorization.childBindingGrant",
     "SESSION_CAPABILITY_INVALID",
@@ -1203,16 +1245,22 @@ function decodeChildBindingGrant(value: unknown): RedactedChildBindingGrant | nu
     || Date.parse(grant.expiresAt as string) <= Date.parse(grant.issuedAt as string)
     || typeof grant.bindingFingerprint !== "string"
     || !LOWER_HASH.test(grant.bindingFingerprint)
-    || typeof grant.grantFingerprint !== "string"
-    || !LOWER_HASH.test(grant.grantFingerprint)
+    || typeof grant.mac !== "string"
+    || !CANONICAL_32_BYTE_BASE64URL.test(grant.mac)
   ) invalidAuthorization();
+  const mac = Buffer.from(grant.mac as string, "base64url");
+  try {
+    if (mac.length !== 32 || mac.toString("base64url") !== grant.mac) invalidAuthorization();
+  } finally {
+    mac.fill(0);
+  }
   parseBoundedString(
     grant.targetClientInstanceId,
     "authorization.childBindingGrant.targetClientInstanceId",
     256,
     { code: "SESSION_CAPABILITY_INVALID" },
   );
-  return grant as unknown as RedactedChildBindingGrant;
+  return grant as unknown as ChildBindingGrantV1;
 }
 
 function assertSemanticAuthorizationSessionBinding(
@@ -1265,6 +1313,14 @@ function assertSemanticAuthorizationSessionBinding(
       if (targetSessionId !== command.sessionId) invalidAuthorization();
       return;
     case "record-child-report":
+      if (
+        targetSessionId !== command.childSessionId
+        || (
+          authoritySessionId !== command.childSessionId
+          && authoritySessionId !== command.parentSessionId
+        )
+      ) invalidAuthorization();
+      return;
     case "propose-child-completion":
       if (
         authoritySessionId !== command.childSessionId

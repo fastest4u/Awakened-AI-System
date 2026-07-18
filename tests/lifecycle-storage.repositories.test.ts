@@ -112,6 +112,7 @@ function transferInsert(): ChildTransferTicketInsert {
     }),
     sourceScope: Object.freeze({ paths: Object.freeze(["src/"]) }),
     checkpointId: CHECKPOINT_ID,
+    blockers: Object.freeze(["blocked on a future root"]),
     followUps: Object.freeze(["rerun focused verification"]),
     sourceState: Object.freeze({ fingerprint: HASH_A }),
     lineage: Object.freeze({ previousChildSessionId: CHILD_ID }),
@@ -141,7 +142,7 @@ function claimedTicketRow(): SqliteRow {
     source_assignment_json: '{"assignmentId":"cccccccc-cccc-4ccc-8ccc-cccccccccccc","summary":"carry the verified work"}',
     source_scope_json: '{"paths":["src/"]}',
     checkpoint_id: CHECKPOINT_ID,
-    follow_ups_json: '["rerun focused verification"]',
+    follow_ups_json: '[{"blockers":["blocked on a future root"],"childTransferAnnotationsVersion":1,"followUps":["rerun focused verification"]}]',
     source_state_json: `{"fingerprint":"${HASH_A}"}`,
     lineage_json: `{"previousChildSessionId":"${CHILD_ID}"}`,
     created_event_position: 41n,
@@ -281,6 +282,10 @@ describe("immutable child transfer tickets", () => {
     assert.equal(claimed.claimedChildSessionId, NEXT_CHILD_ID);
     assert.equal(claimed.claimedEventPosition, 44n);
     assert.deepEqual(claimed.sourceScope, { paths: ["src/"] });
+    assert.deepEqual(claimed.blockers, ["blocked on a future root"]);
+    assert.equal(runs[0]?.params?.$sourceScopeJson, '{"paths":["src/"]}');
+    assert.equal(runs[0]?.params?.$followUpsJson, '[{"blockers":["blocked on a future root"],"childTransferAnnotationsVersion":1,"followUps":["rerun focused verification"]}]');
+    assert.equal(Object.hasOwn(runs[0]?.params ?? {}, "$blockersJson"), false);
     const claimSql = runs[1]?.sql ?? "";
     assert.match(claimSql, /SET\s+claimed_by_root_session_id/iu);
     assert.doesNotMatch(claimSql, /SET[^]*source_(?:parent|child|assignment|scope|state)/iu);
@@ -291,6 +296,20 @@ describe("immutable child transfer tickets", () => {
     assert.match(claimSql, /claimed_at\s+IS\s+NULL/iu);
     assert.deepEqual(connection.execCalls, []);
     assert.equal(connection.closeCalls, 0);
+  });
+
+  it("decodes legacy follow-up arrays with no blockers while writers use only the versioned envelope", () => {
+    const legacyRow = claimedTicketRow();
+    legacyRow.follow_ups_json = '["legacy follow-up"]';
+    const connection = new RecordingConnection((sql, kind) => {
+      if (kind === "get" && /FROM child_transfer_tickets/iu.test(sql)) return legacyRow;
+      throw new Error(`unexpected SQL: ${sql}`);
+    });
+    const ticket = new ChildTransferRepository().get(connection, PROJECT_ID, TICKET_ID);
+    assert.ok(ticket !== null);
+    assert.deepEqual(ticket.blockers, []);
+    assert.deepEqual(ticket.followUps, ["legacy follow-up"]);
+    assert.deepEqual(ticket.sourceScope, { paths: ["src/"] });
   });
 
   it("returns EVENT_CONFLICT to every loser and preserves the source lineage", () => {

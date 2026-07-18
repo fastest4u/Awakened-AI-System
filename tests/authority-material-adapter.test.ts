@@ -357,7 +357,7 @@ function bearer(provider: DeterministicCapabilityKeyProvider): SecretString {
 function issueGrant(
   provider: DeterministicCapabilityKeyProvider,
   target: LifecycleAuthorityTarget = CHILD_A,
-): { secret: SecretString; redacted: RedactedChildBindingGrant } {
+): { secret: SecretString; signed: ChildBindingGrantV1; redacted: RedactedChildBindingGrant } {
   assert.equal(target.actorRole, "untrusted");
   const claims = {
     grantVersion: 1 as const,
@@ -392,6 +392,7 @@ function issueGrant(
       .digest("hex");
     return {
       secret: SecretString.from(canonicalJson(grant)),
+      signed: grant,
       redacted: {
         grantVersion: 1,
         grantId: claims.grantId,
@@ -737,24 +738,25 @@ describe("authority material adapter", () => {
       const restarted = harness({ root: primary.root, provider: primary.provider, channel: primary.channel, nonces: primary.nonces });
       const resumed = await restarted.adapter.resumePending(identity(command), context);
       assert.deepEqual(resumed, prepared);
-      assert.deepEqual(resumed.authorization.childBindingGrant, grant.redacted);
+      assert.deepEqual(resumed.authorization.childBindingGrant, grant.signed);
       const grantWitness = resumed.authorization.childBindingGrant as unknown as Record<string, unknown>;
       assert.deepEqual(Object.keys(grantWitness).sort(), [
         "bindingFingerprint",
         "expiresAt",
-        "grantFingerprint",
         "grantId",
         "grantVersion",
         "issuedAt",
+        "mac",
         "parentSessionId",
         "projectId",
         "storeId",
         "targetActorRole",
         "targetClientInstanceId",
       ]);
-      assert.equal("mac" in grantWitness, false);
+      assert.equal("mac" in grantWitness, true);
+      assert.equal("grantFingerprint" in grantWitness, false);
       const rawGrant = grant.secret.withValue((value) => JSON.parse(value) as { readonly mac: string });
-      assert.equal(canonicalJson(grantWitness).includes(rawGrant.mac), false);
+      assert.equal(canonicalJson(grantWitness).includes(rawGrant.mac), true);
       destroyPendingSecrets(stored);
     } finally {
       rootBearer.destroy();

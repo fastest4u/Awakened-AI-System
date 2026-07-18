@@ -280,12 +280,14 @@ function semanticFamilyCases(): readonly (readonly [
     }],
     ["amend-child-assignment", {
       ...base, commandType: "amend-child-assignment", parentSessionId: FAMILY_UUID.parent,
-      childSessionId: UUID.session, expectedStreamVersion: "2",
+      childSessionId: UUID.session, expectedStreamVersion: "2", expectedAssignmentRevision: "1",
       assignment: { assignmentId: FAMILY_UUID.item1, summary: "Investigate", scope: "src" },
+      reasonCode: "scope-refined",
     }, {
       ...base, commandType: "amend-child-assignment", parentSessionId: FAMILY_UUID.parent,
-      childSessionId: UUID.session, expectedStreamVersion: "2",
+      childSessionId: UUID.session, expectedStreamVersion: "2", expectedAssignmentRevision: "1",
       assignment: { assignmentId: FAMILY_UUID.item1, summary: "Investigate more", scope: "src" },
+      reasonCode: "scope-refined",
     }],
     ["record-checkpoint", {
       ...base, commandType: "record-checkpoint", sessionId: UUID.session,
@@ -311,10 +313,12 @@ function semanticFamilyCases(): readonly (readonly [
         observedAt: "2026-07-14T10:11:12.123Z", contentFingerprint: "b".repeat(64) }],
     }],
     ["record-child-report", {
-      ...base, commandType: "record-child-report", childSessionId: UUID.session,
+      ...base, commandType: "record-child-report", parentSessionId: FAMILY_UUID.parent,
+      childSessionId: UUID.session, childAuthorAgentId: "agent-child",
       expectedStreamVersion: "2", report: reportDraft(),
     }, {
-      ...base, commandType: "record-child-report", childSessionId: UUID.session,
+      ...base, commandType: "record-child-report", parentSessionId: FAMILY_UUID.parent,
+      childSessionId: UUID.session, childAuthorAgentId: "agent-child",
       expectedStreamVersion: "2", report: reportDraft("Changed outcome"),
     }],
     ["disposition-child-report", {

@@ -16,6 +16,7 @@ import {
   decodeLifecycleSemanticCommandDraft,
   type LifecycleAudience,
   type CapabilityProofV1,
+  type ChildBindingGrantV1,
   type LifecycleSemanticCommandDraft,
   type PreparedLifecycleWorkerCommand,
   type RedactedChildBindingGrant,
@@ -60,6 +61,7 @@ import { SecretString } from "./redacted-secret.js";
 
 export const CHILD_BINDING_GRANT_DOMAIN = "pm-lifecycle-child-binding-grant-v1";
 const CHILD_BINDING_GRANT_DIGEST_DOMAIN = "project-memory/child-binding-grant-digest/v1\n";
+export type { ChildBindingGrantV1 } from "../contracts/commands.js";
 
 export type PrivateLifecycleAuthorization =
   | { readonly kind: "initial-authority" }
@@ -78,20 +80,6 @@ export interface RevalidatedTrustedLifecycleContext {
   readonly capabilityGeneration: string | null;
   readonly authorityTarget: LifecycleAuthorityTarget;
   readonly targetBindingFingerprint: string | null;
-}
-
-export interface ChildBindingGrantV1 {
-  readonly grantVersion: 1;
-  readonly grantId: string;
-  readonly projectId: string;
-  readonly storeId: string;
-  readonly parentSessionId: string;
-  readonly targetActorRole: "untrusted";
-  readonly targetClientInstanceId: string;
-  readonly issuedAt: string;
-  readonly expiresAt: string;
-  readonly bindingFingerprint: string;
-  readonly mac: string;
 }
 
 export interface PrivateAuthorityChannel {
@@ -479,7 +467,7 @@ function verifyGrant(
   command: LifecycleSemanticCommandDraft,
   context: DerivedContext,
   nowMs: bigint,
-): RedactedChildBindingGrant {
+): { readonly signed: ChildBindingGrantV1; readonly redacted: RedactedChildBindingGrant } {
   if (command.commandType !== "fork-child" || context.targetBindingFingerprint === null) invalid();
   const grant = parseGrant(secret);
   if (
@@ -534,7 +522,7 @@ function verifyGrant(
       .update(CHILD_BINDING_GRANT_DIGEST_DOMAIN, "utf8")
       .update(mac)
       .digest("hex");
-    return Object.freeze({
+    const redacted = Object.freeze({
       grantVersion: 1,
       grantId: grant.grantId,
       projectId: grant.projectId as RedactedChildBindingGrant["projectId"],
@@ -547,6 +535,7 @@ function verifyGrant(
       bindingFingerprint: grant.bindingFingerprint,
       grantFingerprint: fingerprint,
     });
+    return Object.freeze({ signed: grant, redacted });
   } finally {
     bytes.fill(0);
     mac.fill(0);
@@ -599,7 +588,7 @@ function workerAuthorization(
   context: DerivedContext,
   proof: CapabilityProofV1 | null,
   approval: RedactedLifecycleApproval | null,
-  childBindingGrant: RedactedChildBindingGrant | null,
+  childBindingGrant: ChildBindingGrantV1 | null,
 ): SemanticCommandAuthorization {
   if (context.authoritySessionId === null || context.targetSessionId === null) {
     if (proof !== null || approval !== null || childBindingGrant !== null) invalid();
@@ -891,7 +880,7 @@ export class AuthorityMaterialAdapter {
     const approval = protectedAuthorization.approval === null
       ? null
       : verifyApproval(this.#provider, protectedAuthorization.approval, command, context, candidateIntentHash, nowMs);
-    const childBindingGrant = protectedAuthorization.childBindingGrant === null
+    const childBindingGrantVerification = protectedAuthorization.childBindingGrant === null
       ? null
       : verifyGrant(this.#provider, protectedAuthorization.childBindingGrant, command, context, nowMs);
     assertRecoveryTargetAttached(command, context, this.#channel);
@@ -937,7 +926,12 @@ export class AuthorityMaterialAdapter {
       };
       capabilityProof = createCapabilityProof(protectedAuthorization.bearer, target);
     }
-    const worker = workerAuthorization(context, capabilityProof, approval, childBindingGrant);
+    const worker = workerAuthorization(
+      context,
+      capabilityProof,
+      approval,
+      childBindingGrantVerification?.signed ?? null,
+    );
     assertSemanticCommandAuthorization(command, worker);
     const createdAt = validateClock(nowMs);
     const pendingAuthorization: PendingPrivateAuthorization = Object.freeze({
@@ -1003,7 +997,7 @@ export class AuthorityMaterialAdapter {
             replayTime,
           )
         : null;
-      const childBindingGrant = authorization.kind === "protected" && authorization.childBindingGrant !== null
+      const childBindingGrantVerification = authorization.kind === "protected" && authorization.childBindingGrant !== null
         ? verifyGrant(
             this.#provider,
             authorization.childBindingGrant,
@@ -1013,7 +1007,12 @@ export class AuthorityMaterialAdapter {
           )
         : null;
       assertRecoveryTargetAttached(record.command, context, this.#channel);
-      const worker = workerAuthorization(context, authorization.proof, approval, childBindingGrant);
+      const worker = workerAuthorization(
+        context,
+        authorization.proof,
+        approval,
+        childBindingGrantVerification?.signed ?? null,
+      );
       assertSemanticCommandAuthorization(record.command, worker);
       return Object.freeze({
         command: record.command,

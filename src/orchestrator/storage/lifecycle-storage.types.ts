@@ -196,6 +196,7 @@ export interface ChildTransferTicketInsert {
   readonly sourceAssignment: LifecycleJsonValue;
   readonly sourceScope: LifecycleJsonValue;
   readonly checkpointId: string;
+  readonly blockers: readonly string[];
   readonly followUps: readonly string[];
   readonly sourceState: LifecycleJsonValue;
   readonly lineage: LifecycleJsonValue;
@@ -221,6 +222,7 @@ export interface ChildTransferTicketRecord {
   readonly sourceAssignment: LifecycleJsonValue;
   readonly sourceScope: LifecycleJsonValue;
   readonly checkpointId: string;
+  readonly blockers: readonly string[];
   readonly followUps: readonly string[];
   readonly sourceState: LifecycleJsonValue;
   readonly lineage: LifecycleJsonValue;

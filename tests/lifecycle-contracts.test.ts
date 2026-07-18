@@ -40,6 +40,7 @@ import {
   type CapabilityProofV1,
   type BoundedLifecycleOperation,
   type BoundedOperationAuthorization,
+  type ChildBindingGrantV1,
   type InternalValidationResultCommand,
   type InternalWorkflowPhaseCommand,
   type InternalWorkflowSemanticCommand,
@@ -666,7 +667,9 @@ function semanticCommandCases(): Array<readonly [string, Record<string, unknown>
       parentSessionId: UUIDS.parent,
       childSessionId: UUIDS.session,
       expectedStreamVersion: "2",
+      expectedAssignmentRevision: "1",
       assignment: { assignmentId: UUIDS.item1, summary: "Investigate more", scope: "src/orchestrator" },
+      reasonCode: "scope-refined",
     }],
     ["record-checkpoint", {
       ...base,
@@ -699,7 +702,9 @@ function semanticCommandCases(): Array<readonly [string, Record<string, unknown>
     ["record-child-report", {
       ...base,
       commandType: "record-child-report",
+      parentSessionId: UUIDS.parent,
       childSessionId: UUIDS.session,
+      childAuthorAgentId: "agent-child",
       expectedStreamVersion: "2",
       report: validReportDraft(),
     }],
@@ -2012,7 +2017,7 @@ describe("lifecycle Version 1 contracts", () => {
       expiresAt: "2026-07-17T00:10:00.000Z",
       redactedApprovalReference: "approval/test",
     };
-    const grant: RedactedChildBindingGrant = {
+    const grant: ChildBindingGrantV1 = {
       grantVersion: 1,
       grantId: UUIDS.item3,
       projectId: UUIDS.item1 as ProjectId,
@@ -2023,6 +2028,19 @@ describe("lifecycle Version 1 contracts", () => {
       issuedAt: "2026-07-17T00:00:00.000Z",
       expiresAt: "2026-07-17T00:10:00.000Z",
       bindingFingerprint: "d".repeat(64),
+      mac: "A".repeat(43),
+    };
+    const redactedGrant: RedactedChildBindingGrant = {
+      grantVersion: grant.grantVersion,
+      grantId: grant.grantId,
+      projectId: grant.projectId as ProjectId,
+      storeId: grant.storeId as StoreId,
+      parentSessionId: grant.parentSessionId as SessionId,
+      targetActorRole: grant.targetActorRole,
+      targetClientInstanceId: grant.targetClientInstanceId,
+      issuedAt: grant.issuedAt,
+      expiresAt: grant.expiresAt,
+      bindingFingerprint: grant.bindingFingerprint,
       grantFingerprint: "c".repeat(64),
     };
     const initial = {
@@ -2115,11 +2133,11 @@ describe("lifecycle Version 1 contracts", () => {
       ["approval accessor", recovery, { ...protectedApproval, approval: accessorApproval }],
       ["grant extra", directFork, {
         ...protectedGrant,
-        childBindingGrant: { ...grant, childHandle: "private" } as unknown as RedactedChildBindingGrant,
+        childBindingGrant: { ...grant, childHandle: "private" } as unknown as ChildBindingGrantV1,
       }],
       ["grant version", directFork, {
         ...protectedGrant,
-        childBindingGrant: { ...grant, grantVersion: 2 } as unknown as RedactedChildBindingGrant,
+        childBindingGrant: { ...grant, grantVersion: 2 } as unknown as ChildBindingGrantV1,
       }],
       ["grant id", directFork, {
         ...protectedGrant,
@@ -2129,9 +2147,13 @@ describe("lifecycle Version 1 contracts", () => {
         ...protectedGrant,
         childBindingGrant: { ...grant, targetClientInstanceId: "x".repeat(257) },
       }],
-      ["grant fingerprint", directFork, {
+      ["grant mac", directFork, {
         ...protectedGrant,
-        childBindingGrant: { ...grant, grantFingerprint: "short" },
+        childBindingGrant: { ...grant, mac: "short" },
+      }],
+      ["redacted grant witness", directFork, {
+        ...protectedGrant,
+        childBindingGrant: redactedGrant as unknown as ChildBindingGrantV1,
       }],
       ["grant accessor", directFork, { ...protectedGrant, childBindingGrant: accessorGrant }],
     ];
@@ -2265,7 +2287,7 @@ describe("lifecycle Version 1 contracts", () => {
       proofNonce: UUIDS.item2,
       proofFingerprint: "a".repeat(64),
     };
-    const grant: RedactedChildBindingGrant = {
+    const grant: ChildBindingGrantV1 = {
       grantVersion: 1,
       grantId: UUIDS.item3,
       projectId: UUIDS.item1 as ProjectId,
@@ -2276,7 +2298,7 @@ describe("lifecycle Version 1 contracts", () => {
       issuedAt: "2026-07-17T00:00:00.000Z",
       expiresAt: "2026-07-17T00:10:00.000Z",
       bindingFingerprint: "d".repeat(64),
-      grantFingerprint: "b".repeat(64),
+      mac: "A".repeat(43),
     };
     expectCode("SESSION_CAPABILITY_INVALID", () => assertSemanticCommandAuthorization(fork, {
       kind: "protected",
@@ -2441,7 +2463,7 @@ describe("lifecycle Version 1 contracts", () => {
       ...(semanticCommandCases().find(([type]) => type === "fork-child")?.[1] ?? {}),
       directAccessRequested: true,
     });
-    const grant: RedactedChildBindingGrant = {
+    const grant: ChildBindingGrantV1 = {
       grantVersion: 1,
       grantId: UUIDS.item3,
       projectId: UUIDS.item1 as ProjectId,
@@ -2452,7 +2474,7 @@ describe("lifecycle Version 1 contracts", () => {
       issuedAt: "2026-07-17T00:00:00.000Z",
       expiresAt: "2026-07-17T00:10:00.000Z",
       bindingFingerprint: "d".repeat(64),
-      grantFingerprint: "c".repeat(64),
+      mac: "A".repeat(43),
     };
     assert.doesNotThrow(() => assertSemanticCommandAuthorization(directFork, {
       ...protectedBase,

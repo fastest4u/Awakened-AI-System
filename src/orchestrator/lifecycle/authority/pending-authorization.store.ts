@@ -2,7 +2,7 @@ import type { LifecycleAudience, LifecycleSemanticCommandDraft, CapabilityProofV
 import {
   assertSemanticCommandAuthorization,
   decodeLifecycleSemanticCommandDraft,
-  type RedactedChildBindingGrant,
+  type ChildBindingGrantV1,
   type RedactedLifecycleApproval,
   type SemanticCommandAuthorization,
 } from "../contracts/commands.js";
@@ -271,20 +271,20 @@ function dummyWorkerAuthorization(
         expiresAt: "2026-01-01T00:10:00.000Z",
         redactedApprovalReference: "pending-authorization-shape-check",
       };
-  const childBindingGrant: RedactedChildBindingGrant | null = authorization.childBindingGrant === null
+  const childBindingGrant: ChildBindingGrantV1 | null = authorization.childBindingGrant === null
     ? null
     : {
         grantVersion: 1,
         grantId: "00000000-0000-4000-8000-000000000002",
-        projectId: "00000000-0000-4000-8000-000000000003" as RedactedChildBindingGrant["projectId"],
-        storeId: "00000000-0000-4000-8000-000000000005" as RedactedChildBindingGrant["storeId"],
-        parentSessionId: authoritySessionId as RedactedChildBindingGrant["parentSessionId"],
+        projectId: "00000000-0000-4000-8000-000000000003",
+        storeId: "00000000-0000-4000-8000-000000000005",
+        parentSessionId: authoritySessionId,
         targetActorRole: "untrusted",
         targetClientInstanceId,
         issuedAt: "2026-01-01T00:00:00.000Z",
         expiresAt: "2026-01-01T00:10:00.000Z",
         bindingFingerprint: "0".repeat(64),
-        grantFingerprint: "0".repeat(64),
+        mac: "A".repeat(43),
       };
   return {
     kind: "protected",

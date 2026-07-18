@@ -29,6 +29,10 @@ export type ProtectedLifecycleReadOperation = Exclude<
   { readonly operation: "renew-root-lease" }
 >;
 
+export type ProtectedSessionTreeReadOperation = ProtectedLifecycleReadOperation & {
+  readonly operation: "read-session-tree";
+};
+
 export interface RedactedSessionSummaryV1 {
   readonly sessionId: string;
   readonly sessionKind: "root" | "child";
@@ -70,6 +74,21 @@ export interface SessionAssociationValidationV1 {
   readonly associated: true;
   readonly sessionId: string;
   readonly rootSessionId: string;
+}
+
+export interface ActiveChildDiagnosticV1 {
+  readonly resultVersion: 1;
+  readonly operation: "active-child-diagnostic";
+  readonly operationId: string;
+  readonly requestId: string;
+  readonly rootSessionId: string;
+  readonly activeChildCount: number | null;
+  readonly activeChildren: readonly {
+    readonly childSessionId: string;
+    readonly state: string;
+  }[];
+  readonly childrenTruncated: boolean;
+  readonly requiresResolution: boolean;
 }
 
 export type ProtectedLifecycleReadResultV1 =
@@ -485,5 +504,27 @@ export class LifecycleQueryService {
       }
       throw error;
     }
+  }
+
+  activeChildDiagnostic(
+    context: ProjectContext,
+    operation: ProtectedSessionTreeReadOperation,
+  ): ActiveChildDiagnosticV1 {
+    const tree = this.read(context, operation);
+    if (tree.operation !== "read-session-tree") invalid("INTEGRITY_FAILURE");
+    const activeChildren = Object.freeze(tree.children
+      .filter((child) => child.state !== "completed" && child.state !== "transferred")
+      .map((child) => Object.freeze({ childSessionId: child.sessionId, state: child.state })));
+    return Object.freeze({
+      resultVersion: 1,
+      operation: "active-child-diagnostic",
+      operationId: tree.operationId,
+      requestId: tree.requestId,
+      rootSessionId: tree.root.sessionId,
+      activeChildCount: tree.childrenTruncated ? null : activeChildren.length,
+      activeChildren,
+      childrenTruncated: tree.childrenTruncated,
+      requiresResolution: tree.childrenTruncated || activeChildren.length > 0,
+    });
   }
 }

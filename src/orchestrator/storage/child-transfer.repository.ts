@@ -20,7 +20,7 @@ const COLUMNS = [
 ] as const;
 const INSERT_KEYS = [
   "projectId", "transferTicketId", "sourceParentSessionId", "sourceChildSessionId",
-  "sourceAssignment", "sourceScope", "checkpointId", "followUps", "sourceState", "lineage",
+  "sourceAssignment", "sourceScope", "checkpointId", "blockers", "followUps", "sourceState", "lineage",
   "createdEventPosition", "createdAtMs",
 ] as const;
 const CLAIM_KEYS = [
@@ -109,6 +109,45 @@ function parseJson(value: unknown): LifecycleJsonValue {
   return frozenJson(parsed);
 }
 
+function stringListValue(
+  decoded: LifecycleJsonValue,
+  failure: () => never,
+): readonly string[] {
+  if (!Array.isArray(decoded)
+    || decoded.length > 200
+    || decoded.some((item) => typeof item !== "string"
+      || item.length === 0
+      || Array.from(item).length > 512)) failure();
+  return decoded as readonly string[];
+}
+
+function transferAnnotations(value: unknown): {
+  readonly blockers: readonly string[];
+  readonly followUps: readonly string[];
+} {
+  const decoded = parseJson(value);
+  if (!Array.isArray(decoded)) integrity();
+  if (decoded.every((item) => typeof item === "string")) {
+    return Object.freeze({
+      blockers: Object.freeze([]),
+      followUps: stringListValue(decoded, integrity),
+    });
+  }
+  if (decoded.length !== 1 || typeof decoded[0] !== "object" || decoded[0] === null
+    || Array.isArray(decoded[0])) integrity();
+  const record = decoded[0] as Readonly<Record<string, LifecycleJsonValue>>;
+  const keys = Object.keys(record);
+  if (keys.length !== 3
+    || !keys.includes("childTransferAnnotationsVersion")
+    || !keys.includes("blockers")
+    || !keys.includes("followUps")
+    || record.childTransferAnnotationsVersion !== 1) integrity();
+  return Object.freeze({
+    blockers: stringListValue(record.blockers as LifecycleJsonValue, integrity),
+    followUps: stringListValue(record.followUps as LifecycleJsonValue, integrity),
+  });
+}
+
 function decode(row: SqliteRow): ChildTransferTicketRecord {
   exact(row, COLUMNS, integrity);
   const claimedByRootSessionId = data(row, "claimed_by_root_session_id", integrity);
@@ -118,12 +157,7 @@ function decode(row: SqliteRow): ChildTransferTicketRecord {
   const claimed = claimedByRootSessionId !== null;
   if ([claimedByRootSessionId, claimedChildSessionId, claimedEventPosition, claimedAt]
     .some((value) => (value !== null) !== claimed)) integrity();
-  const followUps = parseJson(data(row, "follow_ups_json", integrity));
-  if (!Array.isArray(followUps)
-    || followUps.length > 200
-    || followUps.some((item) => typeof item !== "string" || item.length === 0 || Array.from(item).length > 512)) {
-    integrity();
-  }
+  const annotations = transferAnnotations(data(row, "follow_ups_json", integrity));
   const createdEventPosition = position(data(row, "created_event_position", integrity), integrity);
   const decodedClaimPosition = claimed
     ? position(claimedEventPosition, integrity)
@@ -137,7 +171,8 @@ function decode(row: SqliteRow): ChildTransferTicketRecord {
     sourceAssignment: parseJson(data(row, "source_assignment_json", integrity)),
     sourceScope: parseJson(data(row, "source_scope_json", integrity)),
     checkpointId: uuid(data(row, "checkpoint_id", integrity), integrity),
-    followUps: followUps as readonly string[],
+    blockers: annotations.blockers,
+    followUps: annotations.followUps,
     sourceState: parseJson(data(row, "source_state_json", integrity)),
     lineage: parseJson(data(row, "lineage_json", integrity)),
     createdEventPosition,
@@ -160,13 +195,15 @@ function insertValues(source: ChildTransferTicketInsert): ChildTransferTicketIns
   uuid(data(source, "checkpointId", invalid), invalid);
   position(data(source, "createdEventPosition", invalid), invalid);
   timestampFromMs(data(source, "createdAtMs", invalid));
-  const followUps = data(source, "followUps", invalid);
-  if (!Array.isArray(followUps)
-    || followUps.length > 200
-    || followUps.some((item) => typeof item !== "string" || item.length === 0 || Array.from(item).length > 512)) {
-    invalid();
+  for (const field of ["blockers", "followUps"] as const) {
+    const list = data(source, field, invalid);
+    if (!Array.isArray(list)
+      || list.length > 200
+      || list.some((item) => typeof item !== "string"
+        || item.length === 0
+        || Array.from(item).length > 512)) invalid();
   }
-  for (const field of ["sourceAssignment", "sourceScope", "followUps", "sourceState", "lineage"] as const) {
+  for (const field of ["sourceAssignment", "sourceScope", "blockers", "followUps", "sourceState", "lineage"] as const) {
     json(data(source, field, invalid), invalid);
   }
   return source;
@@ -201,6 +238,29 @@ export class ChildTransferRepository {
     return row === undefined ? null : decode(row);
   }
 
+  findCreatedEventPosition(
+    connection: SqliteConnection,
+    projectId: string,
+    transferTicketId: string,
+  ): bigint | null {
+    uuid(projectId, invalid);
+    uuid(transferTicketId, invalid);
+    const rows = connection.prepare(`
+      SELECT global_position
+      FROM events
+      WHERE project_id = $projectId
+        AND event_type = 'ChildWorkTransferCreated'
+        AND json_extract(payload_json, '$.transferTicketId') = $transferTicketId
+      ORDER BY global_position
+      LIMIT 2
+    `).all({ $projectId: projectId, $transferTicketId: transferTicketId });
+    if (rows.length > 1) integrity();
+    if (rows.length === 0) return null;
+    const row = rows[0]!;
+    exact(row, ["global_position"], integrity);
+    return position(data(row, "global_position", integrity), integrity);
+  }
+
   insert(connection: SqliteConnection, source: ChildTransferTicketInsert): void {
     const input = insertValues(source);
     const result = connection.prepare(`
@@ -223,7 +283,11 @@ export class ChildTransferRepository {
       $sourceAssignmentJson: json(input.sourceAssignment, invalid),
       $sourceScopeJson: json(input.sourceScope, invalid),
       $checkpointId: input.checkpointId,
-      $followUpsJson: json(input.followUps, invalid),
+      $followUpsJson: json([{
+        childTransferAnnotationsVersion: 1,
+        blockers: [...input.blockers],
+        followUps: [...input.followUps],
+      }], invalid),
       $sourceStateJson: json(input.sourceState, invalid),
       $lineageJson: json(input.lineage, invalid),
       $createdEventPosition: input.createdEventPosition,

@@ -1,5 +1,9 @@
-import { timingSafeEqual } from "node:crypto";
-import type { CapabilityProofV1 } from "./contracts/commands.js";
+import { createHash, timingSafeEqual } from "node:crypto";
+import type {
+  CapabilityProofV1,
+  ChildBindingGrantV1,
+  RedactedChildBindingGrant,
+} from "./contracts/commands.js";
 import { LifecycleError } from "./errors.js";
 import type { AuthorityMaterialStatus } from "./lifecycle-command.store.js";
 import type {
@@ -24,6 +28,8 @@ import { canonicalJson } from "../serialization/canonical-json.js";
 export type { AuthorityMaterialStatus } from "./lifecycle-command.store.js";
 
 export const MAX_BOUNDED_PROOF_HORIZON_MS = 120_000n;
+export const CHILD_BINDING_GRANT_DOMAIN = "pm-lifecycle-child-binding-grant-v1";
+const CHILD_BINDING_GRANT_DIGEST_DOMAIN = "project-memory/child-binding-grant-digest/v1\n";
 
 export interface CapabilityClock {
   nowMs(): bigint;
@@ -103,6 +109,14 @@ export interface ContinuityFingerprintV1 {
   readonly fingerprint: string;
 }
 
+export interface ChildBindingGrantExpectationV1 {
+  readonly projectId: string;
+  readonly storeId: string;
+  readonly parentSessionId: string;
+  readonly targetClientInstanceId: string;
+  readonly bindingFingerprint: string;
+}
+
 export type RootOrChildAuthorityMaterial =
   | {
       readonly kind: "root";
@@ -117,6 +131,8 @@ export type RootOrChildAuthorityMaterial =
 const HASH = /^[0-9a-f]{64}$/;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const DECIMAL = /^(0|[1-9][0-9]*)$/;
+const CANONICAL_TIMESTAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
+const BASE64URL_32 = /^[A-Za-z0-9_-]{43}$/;
 
 function keyUnavailable(): never {
   throw new LifecycleError("SESSION_CAPABILITY_KEY_UNAVAILABLE");
@@ -224,6 +240,26 @@ function sameHex(left: string, right: string): boolean {
   }
 }
 
+function exactDataRecord(value: unknown, expectedKeys: readonly string[]): Record<string, unknown> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) invalid();
+  const prototype = Object.getPrototypeOf(value) as unknown;
+  if (prototype !== Object.prototype && prototype !== null) invalid();
+  const keys = Reflect.ownKeys(value);
+  if (keys.length !== expectedKeys.length
+    || keys.some((key) => typeof key !== "string" || !expectedKeys.includes(key))) invalid();
+  for (const key of expectedKeys) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (descriptor === undefined || !descriptor.enumerable || !("value" in descriptor)) invalid();
+  }
+  return value as Record<string, unknown>;
+}
+
+function canonicalTimestamp(value: unknown): value is string {
+  if (typeof value !== "string" || !CANONICAL_TIMESTAMP.test(value)) return false;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) && new Date(parsed).toISOString() === value;
+}
+
 export class CapabilityService {
   readonly #provider: CapabilityKeyProvider;
   readonly #clock: CapabilityClock;
@@ -234,6 +270,113 @@ export class CapabilityService {
     this.#provider = options.keyProvider;
     this.#clock = options.clock;
     this.#nonces = options.nonceSource;
+  }
+
+  verifyChildBindingGrant(
+    grantInput: ChildBindingGrantV1,
+    expectationInput: ChildBindingGrantExpectationV1,
+  ): RedactedChildBindingGrant {
+    const grant = exactDataRecord(grantInput, [
+      "grantVersion",
+      "grantId",
+      "projectId",
+      "storeId",
+      "parentSessionId",
+      "targetActorRole",
+      "targetClientInstanceId",
+      "issuedAt",
+      "expiresAt",
+      "bindingFingerprint",
+      "mac",
+    ]);
+    const expectation = exactDataRecord(expectationInput, [
+      "projectId",
+      "storeId",
+      "parentSessionId",
+      "targetClientInstanceId",
+      "bindingFingerprint",
+    ]);
+    if (
+      grant.grantVersion !== 1
+      || typeof grant.grantId !== "string" || !UUID.test(grant.grantId)
+      || typeof grant.projectId !== "string" || !UUID.test(grant.projectId)
+      || typeof grant.storeId !== "string" || !UUID.test(grant.storeId)
+      || typeof grant.parentSessionId !== "string" || !UUID.test(grant.parentSessionId)
+      || grant.targetActorRole !== "untrusted"
+      || typeof grant.targetClientInstanceId !== "string"
+      || grant.targetClientInstanceId.length === 0
+      || Array.from(grant.targetClientInstanceId).length > 256
+      || !canonicalTimestamp(grant.issuedAt)
+      || !canonicalTimestamp(grant.expiresAt)
+      || Date.parse(grant.expiresAt) <= Date.parse(grant.issuedAt)
+      || typeof grant.bindingFingerprint !== "string" || !HASH.test(grant.bindingFingerprint)
+      || typeof grant.mac !== "string" || !BASE64URL_32.test(grant.mac)
+      || expectation.projectId !== grant.projectId
+      || expectation.storeId !== grant.storeId
+      || expectation.parentSessionId !== grant.parentSessionId
+      || expectation.targetClientInstanceId !== grant.targetClientInstanceId
+      || expectation.bindingFingerprint !== grant.bindingFingerprint
+    ) invalid();
+    const nowMs = this.#clock.nowMs();
+    if (typeof nowMs !== "bigint" || nowMs < BigInt(Date.parse(grant.issuedAt))
+      || nowMs >= BigInt(Date.parse(grant.expiresAt))) expired();
+    const claims = Object.freeze({
+      grantVersion: 1 as const,
+      grantId: grant.grantId,
+      projectId: grant.projectId,
+      storeId: grant.storeId,
+      parentSessionId: grant.parentSessionId,
+      targetActorRole: "untrusted" as const,
+      targetClientInstanceId: grant.targetClientInstanceId,
+      issuedAt: grant.issuedAt,
+      expiresAt: grant.expiresAt,
+      bindingFingerprint: grant.bindingFingerprint,
+    });
+    const bytes = Buffer.from(canonicalJson(claims), "utf8");
+    const mac = Buffer.from(grant.mac, "base64url");
+    try {
+      if (mac.length !== 32 || mac.toString("base64url") !== grant.mac) invalid();
+      let keyId: string;
+      try {
+        keyId = this.#provider.currentKey(
+          { projectId: grant.projectId, storeId: grant.storeId },
+          "child-binding-grant",
+        ).keyId;
+        if (this.#provider.status(
+          { projectId: grant.projectId, storeId: grant.storeId },
+          "child-binding-grant",
+          keyId,
+        ) !== "available") keyUnavailable();
+      } catch (error) {
+        if (error instanceof LifecycleError) throw error;
+        keyUnavailable();
+      }
+      let verified = false;
+      try {
+        verified = this.#provider.verify({
+          projectId: grant.projectId,
+          storeId: grant.storeId,
+          purpose: "child-binding-grant",
+          keyId,
+          domain: CHILD_BINDING_GRANT_DOMAIN,
+          bytes,
+          mac,
+        });
+      } catch {
+        invalid();
+      }
+      if (!verified) invalid();
+      return Object.freeze({
+        ...claims,
+        grantFingerprint: createHash("sha256")
+          .update(CHILD_BINDING_GRANT_DIGEST_DOMAIN, "utf8")
+          .update(mac)
+          .digest("hex"),
+      }) as RedactedChildBindingGrant;
+    } finally {
+      bytes.fill(0);
+      mac.fill(0);
+    }
   }
 
   continuityFingerprint(input: ContinuityFingerprintInputV1): ContinuityFingerprintV1 {

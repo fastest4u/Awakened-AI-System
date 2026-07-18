@@ -725,7 +725,10 @@ function seedCheckpointedRootAuthority(
     authorityCommitment: "a".repeat(64),
   }) as LifecycleEventV1;
   appendLifecycleEvent(connection, checkpointEvent);
-  const fingerprint = sha256Canonical(checkpoint);
+  const fingerprint = createHash("sha256")
+    .update("project-memory/checkpoint/v1\n", "utf8")
+    .update(canonicalJson(checkpoint), "utf8")
+    .digest("hex");
   connection.prepare(`
     UPDATE session_authority
     SET latest_checkpoint_id = $checkpointId,

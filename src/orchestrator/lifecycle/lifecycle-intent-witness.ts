@@ -530,6 +530,9 @@ function assertExternalSessionBinding(
       if (target !== command.sessionId) invalid();
       return;
     case "record-child-report":
+      if (target !== command.childSessionId
+        || (authority !== command.childSessionId && authority !== command.parentSessionId)) invalid();
+      return;
     case "propose-child-completion":
       if (authority !== command.childSessionId || target !== command.childSessionId) invalid();
       return;

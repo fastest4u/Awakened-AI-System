@@ -692,10 +692,10 @@ function evolveChild(
         referencedSignature === null
         || referencedSignature !== reportItemSignature(event.payload.disposition.allReportItemIds)
       ) integrity();
-      const rejectedProposal = state.state === "completion-proposed"
-        && event.payload.disposition.kind === "rejected"
+      const completionDispositionRequestsMoreWork = state.state === "completion-proposed"
+        && event.payload.disposition.kind !== "accepted"
         && state.completionReportId === event.payload.disposition.reportId;
-      return withChildEvent(state, event, streamVersion, eventPosition, rejectedProposal
+      return withChildEvent(state, event, streamVersion, eventPosition, completionDispositionRequestsMoreWork
         ? { state: "active", completionReportId: null }
         : {});
     }

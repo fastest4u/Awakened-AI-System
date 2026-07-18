@@ -30,6 +30,7 @@ import {
 import { LifecycleError } from "./errors.js";
 
 const LOWER_HASH = /^[0-9a-f]{64}$/;
+const LOWER_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const POSITIVE_GENERATION = /^(?:[1-9][0-9]*)$/;
 const SQLITE_INT64_MAX = 9_223_372_036_854_775_807n;
 
@@ -184,6 +185,34 @@ function assertAppendIdentity<T extends JsonValue>(
     || expected.workspaceId !== actual.workspaceId
     || expected.clientNamespace !== actual.clientNamespace) {
     throw new LifecycleCommandStoreError("IDEMPOTENCY_CONFLICT");
+  }
+  const expectedTargetStream = `session/${prepared.authorizationRecord.targetSessionId}`;
+  if (append.streamId !== expectedTargetStream) {
+    const authorization = prepared.authorizationRecord;
+    const semantic = envelope.semanticCommand;
+    const childSessionId = append.streamId.startsWith("session/")
+      ? append.streamId.slice("session/".length)
+      : "";
+    const rootSessionId = authorization.targetSessionId;
+    const fork = semantic.commandType === "fork-child"
+      && semantic.parentSessionId === rootSessionId
+      && append.events.length === 1;
+    const claim = semantic.commandType === "claim-child-transfer"
+      && semantic.rootSessionId === rootSessionId
+      && append.events.length === 2
+      && append.events[1]?.eventType === "ChildWorkTransferClaimed";
+    if (
+      authorization.kind !== "protected"
+      || authorization.authorizationSessionId !== rootSessionId
+      || (!fork && !claim)
+      || append.streamType !== "session"
+      || append.expectedStreamVersion !== 0n
+      || !LOWER_UUID.test(childSessionId)
+      || childSessionId === rootSessionId
+      || append.events[0]?.eventType !== "SessionForked"
+      || append.events.some((event) => event.sessionId !== childSessionId
+        || event.parentSessionId !== rootSessionId)
+    ) throw new LifecycleCommandStoreError("IDEMPOTENCY_CONFLICT");
   }
 }
 

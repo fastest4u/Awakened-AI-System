@@ -525,6 +525,25 @@ function eventRows(connection: SqliteConnection, authority: SessionAuthorityReco
 }
 
 export class SessionAuthorityRepository {
+  nextGlobalPosition(connection: SqliteConnection): bigint {
+    const row = connection.prepare(`
+      SELECT COALESCE(MAX(global_position), 0) AS maximum_position
+      FROM events
+    `).get();
+    if (row === undefined) integrity();
+    exactKeys(row, ["maximum_position"]);
+    const maximum = int64(ownData(row, "maximum_position"), true);
+    if (maximum >= SQLITE_INT64_MAX) integrity();
+    return maximum + 1n;
+  }
+
+  loadEvents(
+    connection: SqliteConnection,
+    authority: SessionAuthorityRecord,
+  ): readonly LifecycleEventV1[] {
+    return Object.freeze([...eventRows(connection, authority)]);
+  }
+
   get(connection: SqliteConnection, projectId: string, sessionId: string): SessionAuthorityRecord | null {
     if (!LOWER_UUID.test(projectId) || !LOWER_UUID.test(sessionId)) invalid();
     const row = connection.prepare(`
