@@ -228,6 +228,7 @@ function riskyTransitionChildren(
 ): readonly { readonly authority: SessionAuthorityRecord; readonly aggregate: SessionAggregateState }[] {
   return Object.freeze(authority.listNonterminalChildren(root.projectId, root.sessionId).map((observed) => {
     const child = Object.freeze({ ...observed }) as SessionAuthorityRecord;
+    authority.latestCheckpoint(child);
     const aggregate = authority.requireFoldMatch(child);
     if (child.sessionKind !== "child" || child.parentSessionId !== root.sessionId
       || aggregate.kind !== "child" || aggregate.parentSessionId !== root.sessionId) {

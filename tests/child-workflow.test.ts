@@ -31,6 +31,7 @@ import type {
   RecordChildReportCommandV2,
   RootResumeCommandV2,
   RootStartCommandV2,
+  RootSuspendCommandV2,
   SuspendChildSessionCommandV2,
 } from "../src/orchestrator/lifecycle/contracts/commands.js";
 import type { ChildDispositionV1, ChildReportDraftV1 } from "../src/orchestrator/lifecycle/contracts/child.js";
@@ -422,6 +423,7 @@ interface Fixture {
   readonly childAuthorities: RootOrChildAuthorityMaterial[];
   readonly additionalConnections: NativeConnection[];
   readonly cleanupDirectory: string | null;
+  readonly checkpointSourceCaptures: { count: number };
 }
 
 const fixtures: Fixture[] = [];
@@ -514,6 +516,7 @@ function fixture(databasePath = ":memory:", cleanupDirectory: string | null = nu
   const { events, store } = commandRuntime({ connection, authority, leases, approvals, transfers, ids, clock });
   const primary = context();
   const childContext = context("child-1", "untrusted");
+  const checkpointSourceCaptures = { count: 0 };
   const processor = new LifecycleCommandProcessor({
     connection,
     commandStore: store,
@@ -533,13 +536,16 @@ function fixture(databasePath = ":memory:", cleanupDirectory: string | null = nu
         headCommit: projectContext.workspace.kind === "git" ? projectContext.workspace.headCommit : null,
         dirtyWorktreeFingerprint: "d".repeat(64),
       }),
-      captureForCheckpoint: (projectContext: ProjectContext) => ({
-        sourceStateScopeVersion: 1,
-        workspaceId: projectContext.workspace.workspaceId,
-        branchRef: projectContext.workspace.kind === "git" ? projectContext.workspace.branchRef : null,
-        headCommit: projectContext.workspace.kind === "git" ? projectContext.workspace.headCommit : null,
-        dirtyWorktreeFingerprint: "d".repeat(64),
-      }),
+      captureForCheckpoint: (projectContext: ProjectContext) => {
+        checkpointSourceCaptures.count += 1;
+        return {
+          sourceStateScopeVersion: 1 as const,
+          workspaceId: projectContext.workspace.workspaceId,
+          branchRef: projectContext.workspace.kind === "git" ? projectContext.workspace.branchRef : null,
+          headCommit: projectContext.workspace.kind === "git" ? projectContext.workspace.headCommit : null,
+          dirtyWorktreeFingerprint: "d".repeat(64),
+        };
+      },
       captureForFinalization: (projectContext: ProjectContext) => ({
         sourceStateScopeVersion: 1,
         workspaceId: projectContext.workspace.workspaceId,
@@ -583,7 +589,7 @@ function fixture(databasePath = ":memory:", cleanupDirectory: string | null = nu
   const item = {
     connection, authority, leases, approvals, transfers, events, store, processor, capabilities, provider, clock, ids,
     workflow, query, primary, childContext, root: started, rootAuthority, childAuthorities: [],
-    additionalConnections: [], cleanupDirectory,
+    additionalConnections: [], cleanupDirectory, checkpointSourceCaptures,
   };
   fixtures.push(item);
   return item;
@@ -1045,6 +1051,48 @@ function seedChildCheckpoint(item: Fixture, childSessionId: string, ordinal: num
   return checkpoint;
 }
 
+function corruptLatestCheckpointFingerprint(item: Fixture, sessionId: string): SessionAuthorityRecord {
+  const current = item.authority.get(item.connection, PROJECT_ID, sessionId);
+  assert.ok(current !== null && current.latestCheckpointFingerprint !== null);
+  const corruptedFingerprint = current.latestCheckpointFingerprint === "0".repeat(64)
+    ? "1".repeat(64)
+    : "0".repeat(64);
+  const result = item.connection.prepare(`
+    UPDATE session_authority
+    SET latest_checkpoint_fingerprint = $fingerprint
+    WHERE project_id = $projectId AND session_id = $sessionId
+  `).run({
+    $projectId: PROJECT_ID,
+    $sessionId: sessionId,
+    $fingerprint: corruptedFingerprint,
+  });
+  assert.equal(result.changes, 1n);
+  const corrupted = item.authority.get(item.connection, PROJECT_ID, sessionId);
+  assert.ok(corrupted !== null);
+  assert.equal(corrupted.latestCheckpointFingerprint, corruptedFingerprint);
+  return corrupted;
+}
+
+function rootCheckpointDraft() {
+  return {
+    checkpointVersion: 1 as const,
+    taskSummary: "Durable root suspension checkpoint",
+    completedItems: [],
+    inProgressItems: [],
+    blockers: [],
+    nextActions: [],
+    decisions: [],
+    assumptions: [],
+    unresolvedConflicts: [],
+    filesTouched: [],
+    artifactReferences: [],
+    sourceReferences: [],
+    commandResults: [],
+    testResults: [],
+    materialClaims: [],
+  };
+}
+
 function claimScenario(item: Fixture, ordinal: number) {
   const child = directChild(item, ordinal);
   const oldChildId = child.result.publicResult.childSessionId;
@@ -1135,6 +1183,50 @@ describe("scoped child lifecycle", () => {
     ));
     assert.equal(replay.publicResult.childSessionId, direct.publicResult.childSessionId);
     assert.equal(item.connection.prepare("SELECT COUNT(*) AS count FROM events WHERE event_type = 'SessionForked'").get()?.count, 2n);
+  });
+
+  it("rejects root suspension before source capture when a nonterminal child checkpoint fingerprint is corrupt", () => {
+    const item = fixture();
+    const child = directChild(item, 1_020);
+    seedChildCheckpoint(item, child.result.publicResult.childSessionId, 1_120);
+    const corruptedChild = corruptLatestCheckpointFingerprint(item, child.result.publicResult.childSessionId);
+    const rootBefore = item.authority.get(item.connection, PROJECT_ID, item.root.publicResult.sessionId);
+    const leaseBefore = item.leases.current(item.connection, PROJECT_ID, item.root.publicResult.sessionId);
+    assert.ok(rootBefore !== null && leaseBefore !== null);
+    const rootAggregate = item.authority.requireFoldMatch(item.connection, rootBefore);
+    const command: RootSuspendCommandV2 = {
+      ...base(1_021),
+      commandType: "root-suspend",
+      sessionId: rootBefore.sessionId as RootSuspendCommandV2["sessionId"],
+      expectedStreamVersion: rootAggregate.streamVersion.toString(),
+      checkpoint: rootCheckpointDraft(),
+    };
+    const prepared = prepare(item, item.primary, command, {
+      authoritySessionId: rootBefore.sessionId,
+      targetSessionId: rootBefore.sessionId,
+      capabilityKind: "root-session-handle",
+      capabilityGeneration: item.root.publicResult.ownerGeneration,
+      material: item.rootAuthority,
+    });
+    const effectsBefore = {
+      events: item.connection.prepare("SELECT COUNT(*) AS count FROM events").get()?.count,
+      dedup: item.connection.prepare("SELECT COUNT(*) AS count FROM command_dedup").get()?.count,
+      authority: item.connection.prepare("SELECT COUNT(*) AS count FROM session_authority").get()?.count,
+    };
+
+    assert.throws(
+      () => item.processor.suspendRoot(item.primary, prepared),
+      (error: unknown) => errorCode(error) === "INTEGRITY_FAILURE",
+    );
+    assert.equal(item.checkpointSourceCaptures.count, 0);
+    assert.deepEqual(item.authority.get(item.connection, PROJECT_ID, rootBefore.sessionId), rootBefore);
+    assert.deepEqual(item.authority.get(item.connection, PROJECT_ID, corruptedChild.sessionId), corruptedChild);
+    assert.deepEqual(item.leases.current(item.connection, PROJECT_ID, rootBefore.sessionId), leaseBefore);
+    assert.deepEqual({
+      events: item.connection.prepare("SELECT COUNT(*) AS count FROM events").get()?.count,
+      dedup: item.connection.prepare("SELECT COUNT(*) AS count FROM command_dedup").get()?.count,
+      authority: item.connection.prepare("SELECT COUNT(*) AS count FROM session_authority").get()?.count,
+    }, effectsBefore);
   });
 
   it("keeps an exact direct-fork replay stale after the parent owner generation rotates", () => {
@@ -1741,6 +1833,78 @@ describe("scoped child lifecycle", () => {
       item.transfers.get(item.connection, PROJECT_ID, scenario.suspended.publicResult.transferTicketId!)?.claimedChildSessionId,
       retried.publicResult.childSessionId,
     );
+  });
+
+  it("rejects carry-forward claim when a destination child checkpoint fingerprint is corrupt", () => {
+    const item = fixture();
+    const scenario = claimScenario(item, 9_200);
+    const destinationRootId = scenario.futureStart.publicResult.sessionId;
+    const destinationRoot = item.authority.get(item.connection, PROJECT_ID, destinationRootId);
+    assert.ok(destinationRoot !== null);
+    const destinationAggregate = item.authority.requireFoldMatch(item.connection, destinationRoot);
+    const siblingCommand: ForkChildCommandV2 = {
+      ...base(9_450),
+      commandType: "fork-child",
+      parentSessionId: destinationRootId as ForkChildCommandV2["parentSessionId"],
+      expectedStreamVersion: destinationAggregate.streamVersion.toString(),
+      assignment: {
+        assignmentId: lifecycleUuid(9_451),
+        summary: "Destination sibling",
+        scope: "scope/destination-sibling",
+      },
+      directAccessRequested: false,
+    };
+    const sibling = success(item.workflow.execute(item.primary, prepare(item, item.primary, siblingCommand, {
+      authoritySessionId: destinationRootId,
+      targetSessionId: destinationRootId,
+      capabilityKind: "root-session-handle",
+      capabilityGeneration: scenario.futureStart.publicResult.ownerGeneration,
+      material: scenario.futureAuthority,
+    })));
+    seedChildCheckpoint(item, sibling.publicResult.childSessionId, 9_452);
+    seedSessionCheckpoint(item, destinationRootId, 9_454);
+    const corruptedSibling = corruptLatestCheckpointFingerprint(item, sibling.publicResult.childSessionId);
+    const currentDestination = item.authority.get(item.connection, PROJECT_ID, destinationRootId);
+    assert.ok(currentDestination !== null);
+    const currentDestinationAggregate = item.authority.requireFoldMatch(item.connection, currentDestination);
+    const claim: ClaimChildTransferCommandV2 = {
+      ...base(9_456),
+      commandType: "claim-child-transfer",
+      rootSessionId: destinationRootId as ClaimChildTransferCommandV2["rootSessionId"],
+      transferTicketId: scenario.suspended.publicResult.transferTicketId as ClaimChildTransferCommandV2["transferTicketId"],
+      expectedStreamVersion: currentDestinationAggregate.streamVersion.toString(),
+    };
+    const preparedClaim = prepare(item, item.primary, claim, {
+      authoritySessionId: destinationRootId,
+      targetSessionId: destinationRootId,
+      capabilityKind: "root-session-handle",
+      capabilityGeneration: scenario.futureStart.publicResult.ownerGeneration,
+      material: scenario.futureAuthority,
+    });
+    const ticketBefore = item.transfers.get(item.connection, PROJECT_ID, claim.transferTicketId);
+    assert.ok(ticketBefore !== null && ticketBefore.claimedEventPosition === null);
+    const effectsBefore = {
+      events: item.connection.prepare("SELECT COUNT(*) AS count FROM events").get()?.count,
+      dedup: item.connection.prepare("SELECT COUNT(*) AS count FROM command_dedup").get()?.count,
+      authority: item.connection.prepare("SELECT COUNT(*) AS count FROM session_authority").get()?.count,
+    };
+
+    assert.throws(
+      () => item.workflow.execute(item.primary, preparedClaim),
+      (error: unknown) => errorCode(error) === "INTEGRITY_FAILURE",
+    );
+    assert.equal(item.checkpointSourceCaptures.count, 0);
+    assert.deepEqual(item.authority.get(item.connection, PROJECT_ID, destinationRootId), currentDestination);
+    assert.deepEqual(
+      item.authority.get(item.connection, PROJECT_ID, corruptedSibling.sessionId),
+      corruptedSibling,
+    );
+    assert.deepEqual(item.transfers.get(item.connection, PROJECT_ID, claim.transferTicketId), ticketBefore);
+    assert.deepEqual({
+      events: item.connection.prepare("SELECT COUNT(*) AS count FROM events").get()?.count,
+      dedup: item.connection.prepare("SELECT COUNT(*) AS count FROM command_dedup").get()?.count,
+      authority: item.connection.prepare("SELECT COUNT(*) AS count FROM session_authority").get()?.count,
+    }, effectsBefore);
   });
 
   it("detects a raw-deleted transfer index from both full integrity and claim lookup", () => {

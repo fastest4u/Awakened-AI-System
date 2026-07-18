@@ -535,6 +535,7 @@ export class CheckpointService {
       ? [...authority.listNonterminalChildren(current.projectId, current.sessionId)]
           .map((childObserved) => {
             const child = Object.freeze({ ...childObserved }) as SessionAuthorityRecord;
+            authority.latestCheckpoint(child);
             const childAggregate = authority.requireFoldMatch(child);
             assertAuthorityAndAggregate(child, childAggregate);
             if (childAggregate.kind !== "child" || child.parentSessionId !== current.sessionId

@@ -19,6 +19,7 @@ import {
   type LifecycleEventAppendPort,
   type PreparedLifecycleCommit,
 } from "../src/orchestrator/lifecycle/lifecycle-command.store.js";
+import { LifecycleError } from "../src/orchestrator/lifecycle/errors.js";
 import { buildLifecycleIntentWitness } from "../src/orchestrator/lifecycle/lifecycle-intent-witness.js";
 import { canonicalJson } from "../src/orchestrator/serialization/canonical-json.js";
 import type { SqliteConnection, SqliteStatement } from "../src/orchestrator/storage/sqlite-driver.js";
@@ -205,6 +206,7 @@ function authorityHarness(options: {
   readonly markerPosition?: bigint | null;
   readonly faultPoint?: string;
   readonly corruptLatestCheckpointFingerprint?: boolean;
+  readonly corruptChildLatestCheckpointFingerprint?: boolean;
 } = {}): AuthorityHarness {
   const calls = {
     checkpointUpdates: [] as unknown[],
@@ -214,6 +216,9 @@ function authorityHarness(options: {
   };
   const priorCheckpointId = options.corruptLatestCheckpointFingerprint === true
     ? "77777777-7777-4777-8777-777777777777"
+    : null;
+  const childCheckpointId = options.corruptChildLatestCheckpointFingerprint === true
+    ? "88888888-8888-4888-8888-888888888888"
     : null;
   const root = Object.freeze({
     projectId: PROJECT_ID,
@@ -237,6 +242,9 @@ function authorityHarness(options: {
     parentSessionId: ROOT_ID,
     workspaceId: WORKSPACE_ID,
     semanticState: "active",
+    latestCheckpointId: childCheckpointId,
+    latestCheckpointEventPosition: childCheckpointId === null ? null : 39n,
+    latestCheckpointFingerprint: childCheckpointId === null ? null : "e".repeat(64),
   });
   const rootAggregate = Object.freeze({
     kind: "root",
@@ -265,15 +273,20 @@ function authorityHarness(options: {
     streamVersion: 2n,
     eventPosition: 40n,
     terminalEventPosition: null,
-    latestCheckpointId: null,
+    latestCheckpointId: childCheckpointId,
+    latestCheckpointEventPosition: childCheckpointId === null ? null : 39n,
+    latestCheckpointBaseEventPosition: childCheckpointId === null ? null : 38n,
   });
   const authority = Object.freeze({
     get: (projectId: string, sessionId: string) => projectId === PROJECT_ID && sessionId === ROOT_ID ? root : null,
     requireFoldMatch: (record: { readonly sessionId: string }) => record.sessionId === ROOT_ID ? rootAggregate : childAggregate,
     latestCheckpoint: (record: { readonly sessionId: string }) => {
       calls.latestCheckpointReads.push(record);
-      if (options.corruptLatestCheckpointFingerprint === true) {
-        throw new Error("INTEGRITY_FAILURE");
+      if (options.corruptLatestCheckpointFingerprint === true && record.sessionId === ROOT_ID) {
+        throw new LifecycleError("INTEGRITY_FAILURE");
+      }
+      if (options.corruptChildLatestCheckpointFingerprint === true && record.sessionId === CHILD_ID) {
+        throw new LifecycleError("INTEGRITY_FAILURE");
       }
       return null;
     },
@@ -301,6 +314,7 @@ async function checkpointServiceFixture(options: {
   readonly markerPosition?: bigint | null;
   readonly faultPoint?: string;
   readonly corruptLatestCheckpointFingerprint?: boolean;
+  readonly corruptChildLatestCheckpointFingerprint?: boolean;
 } = {}): Promise<{
   readonly service: CheckpointServiceLike;
   readonly harness: AuthorityHarness;
@@ -696,6 +710,22 @@ describe("CheckpointService transactional enrichment", () => {
         /INTEGRITY_FAILURE/u,
       );
       assert.equal(fixture.harness.calls.latestCheckpointReads.length, 1);
+      assert.equal(fixture.harness.calls.sourceCaptures.length, 0);
+      assert.equal(fixture.harness.calls.checkpointUpdates.length, 0);
+      assert.equal(fixture.harness.calls.clears.length, 0);
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it("rejects a corrupt nonterminal child checkpoint fingerprint before root enrichment", async () => {
+    const fixture = await checkpointServiceFixture({ corruptChildLatestCheckpointFingerprint: true });
+    try {
+      assert.throws(
+        () => fixture.service.record(fixture.harness.transaction, checkpointCommand()),
+        (error: unknown) => (error as { readonly code?: unknown }).code === "INTEGRITY_FAILURE",
+      );
+      assert.equal(fixture.harness.calls.latestCheckpointReads.length, 2);
       assert.equal(fixture.harness.calls.sourceCaptures.length, 0);
       assert.equal(fixture.harness.calls.checkpointUpdates.length, 0);
       assert.equal(fixture.harness.calls.clears.length, 0);

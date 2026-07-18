@@ -475,6 +475,7 @@ function riskyTransitionChildren(
   return Object.freeze(authority.listNonterminalChildren(root.projectId, root.sessionId)
     .map((observed) => {
       const child = Object.freeze({ ...observed }) as SessionAuthorityRecord;
+      authority.latestCheckpoint(child);
       const aggregate = authority.requireFoldMatch(child);
       if (child.sessionKind !== "child" || child.parentSessionId !== root.sessionId
         || aggregate.kind !== "child" || aggregate.parentSessionId !== root.sessionId) {
@@ -2167,6 +2168,7 @@ export class LifecycleCommandProcessor {
         current.sessionId,
       ).map((childView) => {
         const child = Object.freeze({ ...childView }) as SessionAuthorityRecord;
+        authority.latestCheckpoint(child);
         const childAggregate = authority.requireFoldMatch(child);
         if (childAggregate.kind !== "child" || child.parentSessionId !== current.sessionId) {
           invalid("INTEGRITY_FAILURE");

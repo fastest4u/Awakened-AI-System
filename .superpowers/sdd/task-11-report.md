@@ -88,6 +88,25 @@ The blocking review findings were resolved in a test-first follow-up:
 
 - RED: the directly affected focused run executed 59 tests with 54 passing and exactly 5 intended failures: corrupt prior checkpoint fingerprint, caller-selected file branch, pre-append suspension authority mutation, suspension junction escape, and the lstat/open junction substitution seam.
 - GREEN: directly affected focused gate — PASS, 59/59 tests, 0 failures.
-- Original five-file Task 11 gate with expanded coverage — PASS, 122/122 tests, 0 failures.
+- Prescribed five-file Task 11 gate after the first hardening wave — PASS, 110/110 tests, 0 failures. This corrects the prior 122 figure, which included suite headings instead of reporting only the prescribed gate's Node test count.
 - `npm run typecheck` — PASS, exit 0.
 - `npm test` — PASS, 1,250 tests; 1,240 passed; 10 skipped; 0 failed.
+
+## Child Checkpoint Integrity Follow-Up
+
+The final call-site audit found four places where a nonterminal child was folded and its latest checkpoint ID was trusted without verifying the indexed checkpoint event and fingerprint. Each path now calls the repository's full `latestCheckpoint(child)` verifier before folding or using the child aggregate:
+
+- root checkpoint and final-checkpoint child-summary enrichment;
+- root suspension child-summary enrichment;
+- root ownership-transfer/recovery risky-transition child collection; and
+- carry-forward claim risky-transition child collection.
+
+No mismatch is repaired implicitly. A corrupt child checkpoint index fails with `INTEGRITY_FAILURE` before source capture or any event, checkpoint index, marker, authority, lease, deduplication, or transfer-ticket mutation.
+
+### Follow-Up RED/GREEN and Verification
+
+- RED: direct affected run — 35 tests; 32 passed and exactly 3 intended corrupt-child-fingerprint regressions failed because no exception was raised.
+- GREEN: direct affected run — PASS, 35/35 tests, 0 failures.
+- Exact prescribed five-file Task 11 gate — PASS, 113/113 tests, 0 failures.
+- `npm run typecheck` — PASS, exit 0.
+- `npm test` — PASS, 1,253 tests; 1,243 passed; 10 skipped; 0 failed.
