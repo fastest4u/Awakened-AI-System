@@ -70,6 +70,7 @@ import {
 } from "./lifecycle-command.store.js";
 import { buildLifecycleIntentWitness } from "./lifecycle-intent-witness.js";
 import type { ChildAggregateState, SessionAggregateState } from "./session-aggregate.js";
+import { requireRiskyTransitionCheckpointV1 } from "./checkpoint.service.js";
 
 const LOWER_HASH = /^[0-9a-f]{64}$/;
 const SQLITE_INT64_MAX = 9_223_372_036_854_775_807n;
@@ -155,6 +156,7 @@ interface ChildAuthorityOperations {
   nextGlobalPosition(): bigint;
   loadEvents(input: SessionAuthorityRecord): readonly LifecycleEventV1[];
   requireFoldMatch(input: SessionAuthorityRecord): SessionAggregateState;
+  listNonterminalChildren(projectId: string, rootSessionId: string): readonly SessionAuthorityRecord[];
   markCheckpointRequired(input: {
     readonly projectId: string;
     readonly sessionId: string;
@@ -212,8 +214,27 @@ function authorityOperations(transaction: LifecycleCommandTransaction): ChildAut
     nextGlobalPosition: ownMethod<ChildAuthorityOperations["nextGlobalPosition"]>(value, "nextGlobalPosition"),
     loadEvents: ownMethod<ChildAuthorityOperations["loadEvents"]>(value, "loadEvents"),
     requireFoldMatch: ownMethod<ChildAuthorityOperations["requireFoldMatch"]>(value, "requireFoldMatch"),
+    listNonterminalChildren: ownMethod<ChildAuthorityOperations["listNonterminalChildren"]>(
+      value,
+      "listNonterminalChildren",
+    ),
     markCheckpointRequired: ownMethod<ChildAuthorityOperations["markCheckpointRequired"]>(value, "markCheckpointRequired"),
   });
+}
+
+function riskyTransitionChildren(
+  authority: ChildAuthorityOperations,
+  root: SessionAuthorityRecord,
+): readonly { readonly authority: SessionAuthorityRecord; readonly aggregate: SessionAggregateState }[] {
+  return Object.freeze(authority.listNonterminalChildren(root.projectId, root.sessionId).map((observed) => {
+    const child = Object.freeze({ ...observed }) as SessionAuthorityRecord;
+    const aggregate = authority.requireFoldMatch(child);
+    if (child.sessionKind !== "child" || child.parentSessionId !== root.sessionId
+      || aggregate.kind !== "child" || aggregate.parentSessionId !== root.sessionId) {
+      invalid("INTEGRITY_FAILURE");
+    }
+    return Object.freeze({ authority: child, aggregate });
+  }));
 }
 
 function transferOperations(transaction: LifecycleCommandTransaction): ChildTransferOperations {
@@ -1376,12 +1397,13 @@ export class ChildWorkflowService {
       throw new LifecycleError("SESSION_STATE_CONFLICT");
     }
     if (BigInt(command.expectedStreamVersion) !== aggregate.streamVersion) throw new LifecycleError("EVENT_CONFLICT");
-    const checkpoint = authority.latestCheckpoint(child);
-    if (checkpoint === null || checkpoint.checkpointId !== command.checkpointId
-      || aggregate.latestCheckpointId !== command.checkpointId
-      || aggregate.latestCheckpointEventPosition !== aggregate.eventPosition) {
-      throw new LifecycleError("CHECKPOINT_BASE_INVALID");
-    }
+    const checkpoint = requireRiskyTransitionCheckpointV1({
+      authority: child,
+      aggregate,
+      checkpoint: authority.latestCheckpoint(child),
+      explicitCheckpointId: command.checkpointId,
+      relevantChildren: [],
+    });
     const causationId = latestEventId(authority.loadEvents(child));
     const verified = this.#verify(transaction, command, parent);
     const now = exactNow(this.#clock);
@@ -1579,6 +1601,13 @@ export class ChildWorkflowService {
     if (typeof assignment.assignmentId !== "string" || typeof assignment.summary !== "string"
       || typeof assignment.scope !== "string") invalid("INTEGRITY_FAILURE");
     const verified = this.#verify(transaction, command, root);
+    requireRiskyTransitionCheckpointV1({
+      authority: root,
+      aggregate: rootAggregate,
+      checkpoint: authority.latestCheckpoint(root),
+      minimumBaseEventPosition: ticket.createdEventPosition,
+      relevantChildren: riskyTransitionChildren(authority, root),
+    });
     const now = exactNow(this.#clock);
     const forkPosition = authority.nextGlobalPosition();
     if (forkPosition > SQLITE_INT64_MAX - 1n) invalid("INTEGRITY_FAILURE");

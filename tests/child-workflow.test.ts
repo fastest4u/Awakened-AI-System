@@ -525,6 +525,39 @@ function fixture(databasePath = ":memory:", cleanupDirectory: string | null = nu
     identitySource: ids,
     integrity: { assertQuickHealthy: () => undefined },
     resumeSourceState: { captureCurrent: () => { throw new Error("unused"); } },
+    checkpointSourceStateProvider: {
+      capture: async (projectContext: ProjectContext) => ({
+        sourceStateScopeVersion: 1,
+        workspaceId: projectContext.workspace.workspaceId,
+        branchRef: projectContext.workspace.kind === "git" ? projectContext.workspace.branchRef : null,
+        headCommit: projectContext.workspace.kind === "git" ? projectContext.workspace.headCommit : null,
+        dirtyWorktreeFingerprint: "d".repeat(64),
+      }),
+      captureForCheckpoint: (projectContext: ProjectContext) => ({
+        sourceStateScopeVersion: 1,
+        workspaceId: projectContext.workspace.workspaceId,
+        branchRef: projectContext.workspace.kind === "git" ? projectContext.workspace.branchRef : null,
+        headCommit: projectContext.workspace.kind === "git" ? projectContext.workspace.headCommit : null,
+        dirtyWorktreeFingerprint: "d".repeat(64),
+      }),
+      captureForFinalization: (projectContext: ProjectContext) => ({
+        sourceStateScopeVersion: 1,
+        workspaceId: projectContext.workspace.workspaceId,
+        branchRef: projectContext.workspace.kind === "git" ? projectContext.workspace.branchRef : null,
+        headCommit: projectContext.workspace.kind === "git" ? projectContext.workspace.headCommit : null,
+        dirtyWorktreeFingerprint: "d".repeat(64),
+      }),
+    },
+    checkpointSourceStateScopeResolver: {
+      resolve: (_current: unknown, projectContext: ProjectContext) => ({
+        scopeVersion: 1,
+        descriptorPath: projectContext.binding.descriptorPath,
+        storeRoot: projectContext.binding.storeRoute.storeRoot,
+        privateStateRoot: projectContext.binding.projectRoot,
+        exactMaterializationTargets: [],
+        exactCommittedTempPaths: [],
+      }),
+    },
   });
   const started = processor.startRoot(primary, preparedStart(primary, startCommand(100))) as RootStartSuccess;
   assert.equal(started.kind, "success");
@@ -903,22 +936,39 @@ function disposition(
   };
 }
 
-function seedChildCheckpoint(item: Fixture, childSessionId: string, ordinal: number) {
-  const { authority, aggregate } = childAggregate(item, childSessionId);
-  assert.equal(aggregate.kind, "child");
+function seedSessionCheckpoint(item: Fixture, sessionId: string, ordinal: number) {
+  const authority = item.authority.get(item.connection, PROJECT_ID, sessionId);
+  assert.ok(authority !== null);
+  const aggregate = item.authority.requireFoldMatch(item.connection, authority);
   const nextPosition = (item.connection.prepare(
     "SELECT COALESCE(MAX(global_position), 0) + 1 AS position FROM events",
   ).get()?.position) as bigint;
   type CheckpointOptions = NonNullable<Parameters<typeof checkpointFixture>[0]>;
-  const checkpoint = checkpointFixture({
-    sessionId: childSessionId as CheckpointOptions["sessionId"],
+  const childSummaries = aggregate.kind === "root"
+    ? item.authority.listNonterminalChildren(item.connection, PROJECT_ID, sessionId).map((child) => {
+        const childState = item.authority.requireFoldMatch(item.connection, child);
+        assert.equal(childState.kind, "child");
+        return {
+          childSessionId: child.sessionId,
+          state: childState.state,
+          lastEventPosition: childState.eventPosition.toString(),
+          streamVersion: childState.streamVersion.toString(),
+          latestCheckpointId: childState.latestCheckpointId,
+        };
+      }).sort((left, right) => left.childSessionId.localeCompare(right.childSessionId))
+    : [];
+  const checkpoint = Object.freeze({
+    ...checkpointFixture({
+    sessionId: sessionId as CheckpointOptions["sessionId"],
     parentSessionId: authority.parentSessionId as CheckpointOptions["parentSessionId"],
     checkpointId: lifecycleUuid(ordinal) as CheckpointOptions["checkpointId"],
-    baseEventPosition: aggregate.eventPosition,
+    baseEventPosition: nextPosition - 1n,
     checkpointEventPosition: nextPosition,
+    }),
+    childSummaries: Object.freeze(childSummaries),
   });
   const append: AppendCommand<JsonValue> = {
-    context: item.childContext,
+    context: aggregate.kind === "root" ? item.primary : item.childContext,
     commandId: lifecycleUuid(ordinal + 1),
     idempotencyKey: `seed-checkpoint/${ordinal}`,
     commandType: "seed-child-checkpoint",
@@ -932,7 +982,7 @@ function seedChildCheckpoint(item: Fixture, childSessionId: string, ordinal: num
       eventSchemaVersion: 1,
       occurredAt: NOW,
       visibilityScope: "session",
-      sessionId: childSessionId,
+      sessionId,
       parentSessionId: authority.parentSessionId ?? undefined,
       confidence: "high",
       verificationStatus: "verified",
@@ -958,29 +1008,40 @@ function seedChildCheckpoint(item: Fixture, childSessionId: string, ordinal: num
     const planned = item.events.planPrepared(prepared);
     assert.equal(planned.events[0]?.globalPosition, nextPosition);
     const committed = item.events.appendPlanned(planned);
-    const updated = item.connection.prepare(`
-      UPDATE session_authority
-      SET latest_checkpoint_id = $checkpointId,
-          latest_checkpoint_event_position = $position,
-          latest_checkpoint_fingerprint = $fingerprint,
-          updated_at = $updatedAt
-      WHERE project_id = $projectId AND session_id = $sessionId
-        AND authority_commitment = $commitment
-    `).run({
-      $checkpointId: checkpoint.checkpointId,
-      $position: nextPosition,
-      $fingerprint: fingerprint,
-      $updatedAt: NOW,
-      $projectId: PROJECT_ID,
-      $sessionId: childSessionId,
-      $commitment: authority.authorityCommitment,
-    });
-    assert.equal(updated.changes, 1n);
+    assert.equal(item.authority.updateCheckpointIndex(item.connection, {
+      projectId: PROJECT_ID,
+      sessionId,
+      expectedLatestCheckpointId: authority.latestCheckpointId,
+      expectedLatestCheckpointEventPosition: authority.latestCheckpointEventPosition,
+      expectedLatestCheckpointFingerprint: authority.latestCheckpointFingerprint,
+      checkpointId: checkpoint.checkpointId,
+      checkpointEventPosition: nextPosition,
+      checkpointFingerprint: fingerprint,
+      updatedAt: NOW,
+    }), true);
+    if (authority.checkpointRequiredEventPosition !== null) {
+      assert.equal(item.authority.clearCheckpointRequired(item.connection, {
+        projectId: PROJECT_ID,
+        sessionId,
+        checkpointBaseEventPosition: nextPosition - 1n,
+        updatedAt: NOW,
+      }), true);
+    }
     item.connection.exec("COMMIT");
   } catch (error) {
     item.connection.exec("ROLLBACK");
     throw error;
   }
+  return checkpoint;
+}
+
+function seedChildCheckpoint(item: Fixture, childSessionId: string, ordinal: number) {
+  const checkpoint = seedSessionCheckpoint(item, childSessionId, ordinal);
+  const aggregate = item.authority.requireFoldMatch(
+    item.connection,
+    item.authority.get(item.connection, PROJECT_ID, childSessionId)!,
+  );
+  assert.equal(aggregate.kind, "child");
   return checkpoint;
 }
 
@@ -1011,6 +1072,7 @@ function claimScenario(item: Fixture, ordinal: number) {
     futureStart.authorityMaterial.target,
   );
   item.childAuthorities.push(futureAuthority);
+  seedSessionCheckpoint(item, futureStart.publicResult.sessionId, ordinal + 202);
   const futureRoot = item.authority.get(item.connection, PROJECT_ID, futureStart.publicResult.sessionId)!;
   const futureAggregate = item.authority.requireFoldMatch(item.connection, futureRoot);
   const claim: ClaimChildTransferCommandV2 = {
@@ -1094,6 +1156,7 @@ describe("scoped child lifecycle", () => {
       item.root.publicResult.sessionId,
     );
     assert.ok(generationOne !== null);
+    seedSessionCheckpoint(item, item.root.publicResult.sessionId, 1_102);
     item.clock.now = generationOne.expiresAtMs;
     const rotatedContext = context("primary-rotated");
     const rotated = item.processor.resumeRoot(
@@ -1501,7 +1564,10 @@ describe("scoped child lifecycle", () => {
     assert.deepEqual(ticket.sourceState, checkpoint.sourceState);
     assert.equal(ticket.sourceParentSessionId, item.root.publicResult.sessionId);
     assert.equal(ticket.sourceChildSessionId, oldChildId);
-    assert.equal(childAggregate(item, oldChildId).authority.revocationReasonCode, "child-transferred");
+    const transferredAuthority = childAggregate(item, oldChildId).authority;
+    assert.equal(transferredAuthority.revocationReasonCode, "child-transferred");
+    assert.equal(transferredAuthority.checkpointRequiredReason, null);
+    assert.equal(transferredAuthority.checkpointRequiredEventPosition, null);
     assert.deepEqual(
       reportPayloads(item, oldChildId, "ChildSessionSuspended").map((payload) => payload.blockers),
       [suspend.blockers],
@@ -1547,6 +1613,7 @@ describe("scoped child lifecycle", () => {
       futureStart.authorityMaterial.target,
     );
     item.childAuthorities.push(futureAuthority);
+    seedSessionCheckpoint(item, futureStart.publicResult.sessionId, 270_000);
     const futureRoot = item.authority.get(item.connection, PROJECT_ID, futureStart.publicResult.sessionId)!;
     const futureAggregate = item.authority.requireFoldMatch(item.connection, futureRoot);
     const claim: ClaimChildTransferCommandV2 = {
@@ -1573,6 +1640,12 @@ describe("scoped child lifecycle", () => {
     assert.equal(newChild.aggregate.correlationId, futureAggregate.correlationId);
     assert.equal(newChild.aggregate.sourceTransferTicketId, suspended.publicResult.transferTicketId);
     assert.equal(newChild.aggregate.streamVersion, 2n);
+    assert.equal(newChild.authority.checkpointRequiredReason, "carry-forward-claim");
+    assert.equal(typeof claimed.publicResult.eventPosition, "string");
+    assert.equal(
+      newChild.authority.checkpointRequiredEventPosition,
+      BigInt(claimed.publicResult.eventPosition!),
+    );
     assert.equal(childAggregate(item, oldChildId).aggregate.parentSessionId, item.root.publicResult.sessionId);
     const oldLineage = item.connection.prepare(`
       SELECT event_id, event_type, causation_id FROM events

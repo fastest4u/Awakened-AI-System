@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import { describe, it } from "node:test";
+import type { AppendCommand, JsonValue } from "../src/orchestrator/contracts/event.js";
 import type { ProjectContext } from "../src/orchestrator/identity/contracts.js";
 import type {
   PreparedLifecycleWorkerCommand,
@@ -57,6 +58,7 @@ import {
   STORE_ID,
   VAULT_ID,
   WORKSPACE_ID,
+  checkpointFixture,
   lifecycleUuid,
 } from "./support/lifecycle-fixtures.js";
 
@@ -1009,6 +1011,21 @@ function fixture(
         return options.resumeSourceState?.(projectContext) ?? checkpointSourceState(projectContext);
       },
     },
+    checkpointSourceStateProvider: {
+      capture: async (projectContext: ProjectContext) => checkpointSourceState(projectContext),
+      captureForCheckpoint: (projectContext: ProjectContext) => checkpointSourceState(projectContext),
+      captureForFinalization: (projectContext: ProjectContext) => checkpointSourceState(projectContext),
+    },
+    checkpointSourceStateScopeResolver: {
+      resolve: (_current: unknown, projectContext: ProjectContext) => ({
+        scopeVersion: 1,
+        descriptorPath: projectContext.binding.descriptorPath,
+        storeRoot: projectContext.binding.storeRoute.storeRoot,
+        privateStateRoot: projectContext.binding.projectRoot,
+        exactMaterializationTargets: [],
+        exactCommittedTempPaths: [],
+      }),
+    },
   });
   return {
     connection,
@@ -1022,6 +1039,109 @@ function fixture(
     selectionTrace,
     approvalEventCounts,
   };
+}
+
+function seedRootCheckpoint(item: Fixture, sessionId: string, ordinal: number) {
+  const authority = item.authority.get(item.connection, PROJECT_ID, sessionId);
+  assert.ok(authority !== null && authority.sessionKind === "root");
+  const aggregate = item.authority.requireFoldMatch(item.connection, authority);
+  assert.equal(aggregate.kind, "root");
+  if (aggregate.kind !== "root") assert.fail("root aggregate required");
+  const nextPosition = item.connection.prepare(
+    "SELECT COALESCE(MAX(global_position), 0) + 1 AS position FROM events",
+  ).get()?.position as bigint;
+  const projectContext = context(authority.rootHandleClientInstanceId ?? "checkpoint-seed");
+  const children = item.authority.listNonterminalChildren(item.connection, PROJECT_ID, sessionId)
+    .map((child) => {
+      const childAggregate = item.authority.requireFoldMatch(item.connection, child);
+      if (childAggregate.kind !== "child") assert.fail("child aggregate required");
+      return {
+        childSessionId: child.sessionId,
+        state: childAggregate.state,
+        lastEventPosition: childAggregate.eventPosition.toString(),
+        streamVersion: childAggregate.streamVersion.toString(),
+        latestCheckpointId: childAggregate.latestCheckpointId,
+      };
+    })
+    .sort((left, right) => left.childSessionId.localeCompare(right.childSessionId));
+  type CheckpointOptions = NonNullable<Parameters<typeof checkpointFixture>[0]>;
+  const checkpoint = Object.freeze({
+    ...checkpointFixture({
+      sessionId: sessionId as CheckpointOptions["sessionId"],
+      parentSessionId: null,
+      checkpointId: lifecycleUuid(ordinal) as CheckpointOptions["checkpointId"],
+      baseEventPosition: nextPosition - 1n,
+      checkpointEventPosition: nextPosition,
+    }),
+    sourceState: checkpointSourceState(projectContext),
+    childSummaries: Object.freeze(children),
+  });
+  const fingerprint = createHash("sha256")
+    .update("project-memory/checkpoint/v1\n", "utf8")
+    .update(canonicalJson(checkpoint as unknown as JsonValue), "utf8")
+    .digest("hex");
+  const occurredAt = new Date(Number(item.clock.nowMs())).toISOString();
+  const append: AppendCommand<JsonValue> = {
+    context: projectContext,
+    commandId: lifecycleUuid(ordinal + 1),
+    idempotencyKey: `seed-root-checkpoint/${ordinal}`,
+    commandType: "seed-root-checkpoint",
+    correlationId: aggregate.correlationId,
+    agentId: "agent-primary",
+    expectedStreamVersion: aggregate.streamVersion,
+    streamId: authority.streamId,
+    streamType: "session",
+    events: [{
+      eventType: "SessionCheckpointRecorded",
+      eventSchemaVersion: 1,
+      occurredAt,
+      visibilityScope: "session",
+      sessionId,
+      confidence: "high",
+      verificationStatus: "verified",
+      payload: {
+        checkpoint: checkpoint as unknown as JsonValue,
+        baseEventPosition: checkpoint.baseEventPosition,
+        checkpointEventPosition: checkpoint.checkpointEventPosition,
+      },
+      sourceRefs: [],
+      evidenceRefs: [],
+      evidenceDigests: [],
+    }],
+    outbox: [],
+    publicResponse: { checkpointId: checkpoint.checkpointId },
+  };
+  item.connection.exec("BEGIN IMMEDIATE");
+  try {
+    const prepared = item.events.prepare(append, occurredAt);
+    const planned = item.events.planPrepared(prepared);
+    assert.equal(planned.events[0]?.globalPosition, nextPosition);
+    item.events.appendPlanned(planned);
+    assert.equal(item.authority.updateCheckpointIndex(item.connection, {
+      projectId: PROJECT_ID,
+      sessionId,
+      expectedLatestCheckpointId: authority.latestCheckpointId,
+      expectedLatestCheckpointEventPosition: authority.latestCheckpointEventPosition,
+      expectedLatestCheckpointFingerprint: authority.latestCheckpointFingerprint,
+      checkpointId: checkpoint.checkpointId,
+      checkpointEventPosition: nextPosition,
+      checkpointFingerprint: fingerprint,
+      updatedAt: occurredAt,
+    }), true);
+    if (authority.checkpointRequiredEventPosition !== null) {
+      assert.equal(item.authority.clearCheckpointRequired(item.connection, {
+        projectId: PROJECT_ID,
+        sessionId,
+        checkpointBaseEventPosition: nextPosition - 1n,
+        updatedAt: occurredAt,
+      }), true);
+    }
+    item.connection.exec("COMMIT");
+  } catch (error) {
+    item.connection.exec("ROLLBACK");
+    throw error;
+  }
+  return checkpoint;
 }
 
 function transitionRootToEnding(
@@ -1523,6 +1643,7 @@ describe("LifecycleCommandProcessor root resume", () => {
         started.publicResult.sessionId,
       );
       assert.ok(generationOne !== null);
+      seedRootCheckpoint(item, started.publicResult.sessionId, 20_001);
       item.clock.now = generationOne.expiresAtMs;
       const transferred = success(item.processor.resumeRoot(targetContext, transferInput));
       assert.equal(transferred.publicResult.ownerGeneration, "2");
@@ -1536,7 +1657,7 @@ describe("LifecycleCommandProcessor root resume", () => {
       assert.ok(current !== null);
       assert.equal(current.ownerGeneration, 2n);
       assert.equal(current.rootHandleClientInstanceId, "primary-2");
-      assert.equal(item.connection.prepare("SELECT COUNT(*) AS count FROM events").get()?.count, 2n);
+      assert.equal(item.connection.prepare("SELECT COUNT(*) AS count FROM events").get()?.count, 3n);
       const leaseRows = item.connection.prepare(`
         SELECT owner_generation, released_at FROM session_leases ORDER BY owner_generation
       `).all();
@@ -1647,12 +1768,13 @@ describe("LifecycleCommandProcessor root resume", () => {
       );
       const lease = item.leases.current(item.connection, PROJECT_ID, started.publicResult.sessionId);
       assert.ok(lease !== null);
+      seedRootCheckpoint(item, started.publicResult.sessionId, 20_010);
       item.clock.now = lease.expiresAtMs;
       const resumed = success(item.processor.resumeRoot(secondContext, resumeInput));
       const replay = success(item.processor.resumeRoot(secondContext, resumeInput));
       assert.deepEqual(replay.publicResult, resumed.publicResult);
       assert.equal(replay.authorityMaterial.status, "current");
-      assert.equal(item.connection.prepare("SELECT COUNT(*) AS count FROM events").get()?.count, 2n);
+      assert.equal(item.connection.prepare("SELECT COUNT(*) AS count FROM events").get()?.count, 3n);
 
       const thirdContext = context("primary-3");
       const nextInput = preparedResume(
@@ -1663,6 +1785,7 @@ describe("LifecycleCommandProcessor root resume", () => {
       );
       const currentLease = item.leases.current(item.connection, PROJECT_ID, resumed.publicResult.sessionId);
       assert.ok(currentLease !== null);
+      seedRootCheckpoint(item, resumed.publicResult.sessionId, 20_012);
       item.clock.now = currentLease.expiresAtMs;
       const third = success(item.processor.resumeRoot(thirdContext, nextInput));
       assert.equal(third.publicResult.ownerGeneration, "3");
@@ -1672,7 +1795,7 @@ describe("LifecycleCommandProcessor root resume", () => {
       assert.equal(staleReplay.authorityMaterial.status, "stale");
       assert.equal(staleReplay.authorityMaterial.descriptor, null);
       assert.equal(staleReplay.authorityMaterial.recoveryCode, "SESSION_HANDLE_STALE");
-      assert.equal(item.connection.prepare("SELECT COUNT(*) AS count FROM events").get()?.count, 3n);
+      assert.equal(item.connection.prepare("SELECT COUNT(*) AS count FROM events").get()?.count, 5n);
     } finally {
       item.connection.close();
     }
@@ -1700,6 +1823,7 @@ describe("LifecycleCommandProcessor root resume", () => {
       const prepared = preparedResume(bySession, target, started, command);
       const lease = bySession.leases.current(bySession.connection, PROJECT_ID, started.publicResult.sessionId);
       assert.ok(lease !== null);
+      seedRootCheckpoint(bySession, started.publicResult.sessionId, 20_020);
       bySession.clock.now = lease.expiresAtMs;
       const resumed = success(bySession.processor.resumeRoot(target, prepared));
       assert.equal(resumed.publicResult.sessionId, started.publicResult.sessionId);
@@ -1724,6 +1848,7 @@ describe("LifecycleCommandProcessor root resume", () => {
         started.publicResult.sessionId,
       );
       assert.ok(lease !== null);
+      seedRootCheckpoint(byContinuity, started.publicResult.sessionId, 20_022);
       byContinuity.clock.now = lease.expiresAtMs;
       const resumed = success(byContinuity.processor.resumeRoot(target, prepared));
       assert.equal(resumed.publicResult.sessionId, started.publicResult.sessionId);
@@ -2134,6 +2259,7 @@ describe("LifecycleCommandProcessor root resume", () => {
           suspendCommand(341, started.publicResult.sessionId, "1"),
         ),
       ));
+      seedRootCheckpoint(item, started.publicResult.sessionId, 20_030);
       const target = context("primary-latest-target");
       const command = resumeCommand(342, null, "1", null, "latest-safe");
       const prepared = preparedResume(item, target, suspended, command);
@@ -2155,8 +2281,10 @@ describe("LifecycleCommandProcessor root resume", () => {
         "proof",
         "lease-current",
         "lease-expiry",
+        "checkpoint",
       ]);
       assert.deepEqual(item.operationTrace, [
+        "children-list",
         "lease-release/1",
         "authority-cas/2",
         "lease-insert/2",
@@ -2167,6 +2295,10 @@ describe("LifecycleCommandProcessor root resume", () => {
         "SessionOwnerTransferred",
         "SessionResumed",
       ]);
+      const current = item.authority.get(item.connection, PROJECT_ID, started.publicResult.sessionId);
+      assert.ok(current !== null);
+      assert.equal(current.checkpointRequiredReason, "ownership-transfer");
+      assert.equal(current.checkpointRequiredEventPosition, current.authorityEventPosition);
     } finally {
       item.connection.close();
     }
@@ -2201,6 +2333,11 @@ describe("LifecycleCommandProcessor root resume", () => {
               ),
             ))
           : started;
+        seedRootCheckpoint(
+          item,
+          issued.publicResult.sessionId,
+          priorState === "active" ? 20_040 : 20_042,
+        );
         const target = context(`primary-rollback-target-${priorState}`);
         const prepared = preparedResume(
           item,
@@ -2234,6 +2371,7 @@ describe("LifecycleCommandProcessor root resume", () => {
         );
 
         assert.deepEqual(item.operationTrace, [
+          "children-list",
           "lease-release/1",
           "authority-cas/2",
           "lease-insert/2",
@@ -2306,6 +2444,7 @@ describe("LifecycleCommandProcessor root resume", () => {
         "primary-compatible-0",
         "paging-compatible-canary-0",
       );
+      seedRootCheckpoint(item, firstCompatible.publicResult.sessionId, 20_050);
       const uniqueTarget = context("primary-paging-unique");
       const uniqueCommand = resumeCommand(502, null, "1", null, "latest-safe");
       const uniquePrepared = preparedResume(
@@ -2599,6 +2738,7 @@ describe("LifecycleCommandProcessor root lease renewal", () => {
         started.publicResult.sessionId,
       );
       assert.ok(firstLease !== null);
+      seedRootCheckpoint(item, started.publicResult.sessionId, 20_060);
       item.clock.now = firstLease.expiresAtMs;
       const transferred = success(item.processor.resumeRoot(secondContext, transfer));
       assert.equal(transferred.publicResult.ownerGeneration, "2");
@@ -2820,6 +2960,7 @@ describe("LifecycleQueryService protected root reads", () => {
         started,
         resumeCommand(147, started.publicResult.sessionId, "1", "query-proof-thread"),
       );
+      seedRootCheckpoint(item, started.publicResult.sessionId, 20_062);
       const transferred = success(item.processor.resumeRoot(secondContext, transfer));
       assert.equal(transferred.publicResult.ownerGeneration, "2");
       const postTransferCounts = counts();
@@ -2994,6 +3135,7 @@ describe("LifecycleCommandProcessor root suspension", () => {
       assert.ok(renewed !== null);
       assert.equal(renewed.renewedAtMs, item.clock.now);
       assert.equal(renewed.expiresAtMs, item.clock.now + OWNER_LEASE_MS);
+      seedRootCheckpoint(item, authority.sessionId, 20_064);
 
       const secondContext = context("primary-2");
       const resumeInput = preparedResume(
@@ -3148,6 +3290,7 @@ describe("LifecycleCommandProcessor root recovery", () => {
           suspendCommand(141, started.publicResult.sessionId, "1"),
         ),
       ));
+      seedRootCheckpoint(item, started.publicResult.sessionId, 20_100);
       const before = item.authority.get(item.connection, PROJECT_ID, started.publicResult.sessionId);
       assert.ok(before !== null && before.latestCheckpointId !== null);
       const maintenance = context("maintenance-1", "maintenance");
@@ -3165,19 +3308,20 @@ describe("LifecycleCommandProcessor root recovery", () => {
 
       assert.equal(recovered.publicResult.state, "suspended");
       assert.equal(recovered.publicResult.ownerGeneration, "2");
-      assert.equal(recovered.publicResult.eventPosition, "5");
+      assert.equal(recovered.publicResult.eventPosition, "6");
       assert.equal(recovered.authorityMaterial.status, "current");
       assert.deepEqual(recovered.authorityMaterial.target, {
         actorRole: "primary",
         clientInstanceId: "primary-2",
       });
       assert.deepEqual(item.operationTrace, [
+        "children-list",
         "lease-release/1",
         "authority-cas/2",
         "lease-insert/2",
         "approval-consume",
       ]);
-      assert.deepEqual(item.approvalEventCounts, [5n], "approval is consumed after the exact append");
+      assert.deepEqual(item.approvalEventCounts, [6n], "approval is consumed after the exact append");
       const eventTypes = item.connection.prepare(`
         SELECT event_type FROM events ORDER BY global_position
       `).all().map((row) => row.event_type);
@@ -3188,6 +3332,8 @@ describe("LifecycleCommandProcessor root recovery", () => {
       assert.equal(after.ownerGeneration, 2n);
       assert.equal(after.rootHandleClientInstanceId, "primary-2");
       assert.notEqual(after.authorityCommitment, before.authorityCommitment);
+      assert.equal(after.checkpointRequiredReason, "ownership-recovery");
+      assert.equal(after.checkpointRequiredEventPosition, BigInt(recovered.publicResult.eventPosition));
       item.authority.requireFoldMatch(item.connection, after);
       const leases = item.connection.prepare(`
         SELECT owner_generation, owner_client_instance_id, released_at
@@ -3216,17 +3362,19 @@ describe("LifecycleCommandProcessor root recovery", () => {
       assert.deepEqual(replayed.publicResult, recovered.publicResult);
       assert.deepEqual(item.operationTrace, []);
       assert.deepEqual(item.approvalEventCounts, []);
-      assert.equal(item.connection.prepare("SELECT COUNT(*) AS count FROM events").get()?.count, 5n);
+      assert.equal(item.connection.prepare("SELECT COUNT(*) AS count FROM events").get()?.count, 6n);
       assert.equal(item.connection.prepare(`
         SELECT COUNT(*) AS count FROM lifecycle_approval_consumptions
       `).get()?.count, 1n);
       assert.equal(suspended.publicResult.latestCheckpointEventPosition, "2");
 
+      const recoveryCheckpoint = seedRootCheckpoint(item, after.sessionId, 20_102);
+
       const reusedNonceCommand = recoveryCommand(
         143,
         after.sessionId,
         "2",
-        after.latestCheckpointId!,
+        recoveryCheckpoint.checkpointId,
       );
       const reusedNonce = preparedRecovery(
         item,
@@ -3241,17 +3389,18 @@ describe("LifecycleCommandProcessor root recovery", () => {
         (error: unknown) => (error as { code?: string }).code === "LIFECYCLE_APPROVAL_REPLAYED",
       );
       assert.deepEqual(item.operationTrace, [
+        "children-list",
         "lease-release/2",
         "authority-cas/3",
         "lease-insert/3",
         "approval-consume",
       ]);
-      assert.deepEqual(item.approvalEventCounts, [6n]);
+      assert.deepEqual(item.approvalEventCounts, [8n]);
       const rolledBack = item.authority.get(item.connection, PROJECT_ID, after.sessionId);
       assert.ok(rolledBack !== null);
       assert.equal(rolledBack.ownerGeneration, 2n);
       assert.equal(rolledBack.rootHandleClientInstanceId, "primary-2");
-      assert.equal(item.connection.prepare("SELECT COUNT(*) AS count FROM events").get()?.count, 5n);
+      assert.equal(item.connection.prepare("SELECT COUNT(*) AS count FROM events").get()?.count, 7n);
       assert.equal(item.connection.prepare(`
         SELECT COUNT(*) AS count FROM lifecycle_approval_consumptions
       `).get()?.count, 1n);
@@ -3408,6 +3557,7 @@ describe("LifecycleCommandProcessor root recovery", () => {
           suspendCommand(761, started.publicResult.sessionId, "1"),
         ),
       ));
+      seedRootCheckpoint(item, started.publicResult.sessionId, 20_110);
       const current = item.authority.get(item.connection, PROJECT_ID, started.publicResult.sessionId);
       assert.ok(current !== null && current.latestCheckpointId !== null);
       const maintenance = context("maintenance-recovery-lease", "maintenance");
@@ -3431,7 +3581,7 @@ describe("LifecycleCommandProcessor root recovery", () => {
         (error: unknown) => (error as { code?: string }).code === "INTEGRITY_FAILURE",
       );
 
-      assert.deepEqual(item.operationTrace, []);
+      assert.deepEqual(item.operationTrace, ["children-list"]);
       assert.deepEqual([
         item.connection.prepare("SELECT COUNT(*) AS count FROM events").get()?.count,
         item.connection.prepare("SELECT COUNT(*) AS count FROM command_dedup").get()?.count,
@@ -3478,8 +3628,10 @@ describe("LifecycleCommandProcessor root recovery", () => {
         suspended.publicResult.sessionId,
       );
       assert.ok(generationOneLease !== null);
+      seedRootCheckpoint(item, suspended.publicResult.sessionId, 20_120);
       item.clock.now = generationOneLease.expiresAtMs;
       const active = success(item.processor.resumeRoot(second, resumePrepared));
+      seedRootCheckpoint(item, active.publicResult.sessionId, 20_122);
       const before = item.authority.get(item.connection, PROJECT_ID, active.publicResult.sessionId);
       assert.ok(before !== null && before.latestCheckpointId !== null);
       const staleTarget = context("primary-recovery-active-stale");
@@ -3508,6 +3660,7 @@ describe("LifecycleCommandProcessor root recovery", () => {
         clientInstanceId: "primary-recovery-active-3",
       });
       assert.deepEqual(item.operationTrace, [
+        "children-list",
         "lease-release/2",
         "authority-cas/3",
         "lease-insert/3",
@@ -3538,7 +3691,7 @@ describe("LifecycleCommandProcessor root recovery", () => {
     }
   });
 
-  it("preserves ending state and leaves a seeded child authority row byte-for-byte unchanged", async () => {
+  it("rejects ending recovery when a nonterminal child cannot be folded", async () => {
     const Processor = await loadProcessorConstructor();
     assert.ok(Processor !== null);
     const item = fixture(Processor);
@@ -3564,30 +3717,26 @@ describe("LifecycleCommandProcessor root recovery", () => {
         742,
       );
       assert.ok(ending.latestCheckpointId !== null);
+      const checkpoint = seedRootCheckpoint(item, ending.sessionId, 20_130);
       const child = seedOpaqueChildSentinel(item, ending.sessionId);
       const maintenance = context("maintenance-recovery-ending", "maintenance");
       const prepared = preparedRecovery(
         item,
         maintenance,
-        recoveryCommand(744, ending.sessionId, "1", ending.latestCheckpointId),
+        recoveryCommand(744, ending.sessionId, "1", checkpoint.checkpointId),
         "primary-recovery-ending-target",
       );
       item.operationTrace.length = 0;
 
-      const recovered = success(item.processor.recoverRoot(maintenance, prepared));
-
-      assert.equal(recovered.publicResult.state, "ending");
-      assert.equal(recovered.publicResult.ownerGeneration, "2");
-      assert.deepEqual(item.operationTrace, [
-        "lease-release/1",
-        "authority-cas/2",
-        "lease-insert/2",
-        "approval-consume",
-      ]);
+      assert.throws(
+        () => item.processor.recoverRoot(maintenance, prepared),
+        (error: unknown) => (error as { code?: string }).code === "INTEGRITY_FAILURE",
+      );
+      assert.deepEqual(item.operationTrace, ["children-list"]);
       const after = item.authority.get(item.connection, PROJECT_ID, ending.sessionId);
       assert.ok(after !== null);
       assert.equal(after.semanticState, "ending");
-      assert.equal(after.ownerGeneration, 2n);
+      assert.equal(after.ownerGeneration, 1n);
       item.authority.requireFoldMatch(item.connection, after);
       const childAfter = item.connection.prepare(`
         SELECT * FROM session_authority WHERE project_id = $projectId AND session_id = $sessionId

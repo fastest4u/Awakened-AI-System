@@ -69,6 +69,11 @@ import type { SessionLeaseRepository } from "../storage/session-lease.repository
 import { canonicalJson } from "../serialization/canonical-json.js";
 import { isPrimarySqliteBusy } from "../storage/event-append-transaction.js";
 import { MAX_CANONICAL_TIMESTAMP_MS } from "../runtime/clock.js";
+import { requireRiskyTransitionCheckpointV1 } from "./checkpoint.service.js";
+import type {
+  SourceStateProvider,
+  SourceStateScopeResolver,
+} from "./source-state.provider.js";
 
 const OWNER_LEASE_DURATION_MS = 120_000n;
 const SQLITE_INT64_MAX = 9_223_372_036_854_775_807n;
@@ -134,6 +139,8 @@ export interface LifecycleCommandProcessorOptions {
   readonly identitySource: LifecycleProcessorIdentitySource;
   readonly integrity: LifecycleProcessorIntegrity;
   readonly resumeSourceState: LifecycleResumeSourceStatePort;
+  readonly checkpointSourceStateProvider: SourceStateProvider;
+  readonly checkpointSourceStateScopeResolver: SourceStateScopeResolver;
 }
 
 interface RootAuthorityOperations {
@@ -453,6 +460,25 @@ function rootOperations(transaction: LifecycleCommandTransaction): RootAuthority
       "compareAndSwap",
     ),
   });
+}
+
+function riskyTransitionChildren(
+  authority: RootAuthorityOperations,
+  root: SessionAuthorityRecord,
+): readonly {
+  readonly authority: SessionAuthorityRecord;
+  readonly aggregate: SessionAggregateState;
+}[] {
+  return Object.freeze(authority.listNonterminalChildren(root.projectId, root.sessionId)
+    .map((observed) => {
+      const child = Object.freeze({ ...observed }) as SessionAuthorityRecord;
+      const aggregate = authority.requireFoldMatch(child);
+      if (child.sessionKind !== "child" || child.parentSessionId !== root.sessionId
+        || aggregate.kind !== "child" || aggregate.parentSessionId !== root.sessionId) {
+        invalid("INTEGRITY_FAILURE");
+      }
+      return Object.freeze({ authority: child, aggregate });
+    }));
 }
 
 function leaseOperations(transaction: LifecycleCommandTransaction): RootLeaseOperations {
@@ -815,6 +841,8 @@ export class LifecycleCommandProcessor {
   readonly #ids: LifecycleProcessorIdentitySource;
   readonly #integrity: LifecycleProcessorIntegrity;
   readonly #resumeSourceState: LifecycleResumeSourceStatePort;
+  readonly #checkpointSourceState: SourceStateProvider;
+  readonly #checkpointSourceStateScopes: SourceStateScopeResolver;
 
   constructor(options: LifecycleCommandProcessorOptions) {
     this.#connection = options.connection;
@@ -826,6 +854,8 @@ export class LifecycleCommandProcessor {
     this.#ids = options.identitySource;
     this.#integrity = options.integrity;
     this.#resumeSourceState = options.resumeSourceState;
+    this.#checkpointSourceState = options.checkpointSourceStateProvider;
+    this.#checkpointSourceStateScopes = options.checkpointSourceStateScopeResolver;
   }
 
   renewRootLease(
@@ -1445,6 +1475,12 @@ export class LifecycleCommandProcessor {
       if (currentLease.ownerClientInstanceId === context.binding.clientInstanceId) {
         throw new LifecycleError("SESSION_ALREADY_OWNED");
       }
+      requireRiskyTransitionCheckpointV1({
+        authority: current,
+        aggregate,
+        checkpoint: authority.latestCheckpoint(current),
+        relevantChildren: riskyTransitionChildren(authority, current),
+      });
       const nextGeneration = current.ownerGeneration + 1n;
       if (nextGeneration > SQLITE_INT64_MAX || nextGeneration > BigInt(Number.MAX_SAFE_INTEGER)) {
         invalid("INTEGRITY_FAILURE");
@@ -1748,12 +1784,14 @@ export class LifecycleCommandProcessor {
       if (
         aggregateView.kind !== "root"
         || aggregateView.state !== current.semanticState
-        || aggregateView.latestCheckpointId !== decoded.preTransitionCheckpointId
-        || aggregateView.latestCheckpointBaseEventPosition === null
       ) throw new LifecycleError("CHECKPOINT_BASE_INVALID");
-      if (current.latestCheckpointId !== decoded.preTransitionCheckpointId) {
-        throw new LifecycleError("CHECKPOINT_BASE_INVALID");
-      }
+      requireRiskyTransitionCheckpointV1({
+        authority: current,
+        aggregate: aggregateView,
+        checkpoint: authority.latestCheckpoint(current),
+        explicitCheckpointId: decoded.preTransitionCheckpointId,
+        relevantChildren: riskyTransitionChildren(authority, current),
+      });
       const correlationId = aggregateView.correlationId;
       const streamVersion = aggregateView.streamVersion;
       const observedLease = leases.current(context.binding.projectId, current.sessionId);
@@ -2129,6 +2167,7 @@ export class LifecycleCommandProcessor {
         if (childAggregate.kind !== "child" || child.parentSessionId !== current.sessionId) {
           invalid("INTEGRITY_FAILURE");
         }
+        if (childAggregate.eventPosition > baseEventPosition) invalid("INTEGRITY_FAILURE");
         return Object.freeze({
           childSessionId: child.sessionId,
           state: childAggregate.state,
@@ -2136,28 +2175,15 @@ export class LifecycleCommandProcessor {
           streamVersion: childAggregate.streamVersion.toString(),
           latestCheckpointId: childAggregate.latestCheckpointId,
         });
-      });
-      const sourceState = context.workspace.kind === "git"
-        ? Object.freeze({
-            sourceStateScopeVersion: 1 as const,
-            workspaceId: context.workspace.workspaceId,
-            branchRef: context.workspace.branchRef,
-            headCommit: context.workspace.headCommit,
-            dirtyWorktreeFingerprint: createHash("sha256")
-              .update("project-memory/checkpoint-context/v1\n", "utf8")
-              .update(context.binding.contextFingerprint, "utf8")
-              .digest("hex"),
-          })
-        : Object.freeze({
-            sourceStateScopeVersion: 1 as const,
-            workspaceId: context.workspace.workspaceId,
-            branchRef: null,
-            headCommit: null,
-            dirtyWorktreeFingerprint: createHash("sha256")
-              .update("project-memory/checkpoint-context/v1\n", "utf8")
-              .update(context.binding.contextFingerprint, "utf8")
-              .digest("hex"),
-          });
+      }).sort((left, right) => compareBinaryText(left.childSessionId, right.childSessionId));
+      const sourceStateScope = this.#checkpointSourceStateScopes.resolve(this.#connection, context);
+      const sourceState = this.#checkpointSourceState.captureForCheckpoint(context, sourceStateScope);
+      if (typeof sourceState === "object" && sourceState !== null && "then" in sourceState) {
+        invalid("INTEGRITY_FAILURE");
+      }
+      const expectedCheckpointBranch = context.workspace.kind === "git" ? context.workspace.branchRef : null;
+      if (sourceState.workspaceId !== context.workspace.workspaceId
+        || sourceState.branchRef !== expectedCheckpointBranch) invalid("INTEGRITY_FAILURE");
       const checkpoint = decodeCheckpointV1({
         ...checkpointDraft,
         checkpointId: this.#ids.uuid(),
@@ -2172,6 +2198,7 @@ export class LifecycleCommandProcessor {
         childSummaries,
         evidenceCoverage: {
           captureMode: "coverage-only",
+          contentRetained: false,
           highestContiguousOrdinal: null,
           missingIntervals: [],
         },

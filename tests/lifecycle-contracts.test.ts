@@ -188,6 +188,7 @@ function validCheckpoint(): Record<string, unknown> {
     childSummaries: [],
     evidenceCoverage: {
       captureMode: "coverage-only",
+      contentRetained: false,
       highestContiguousOrdinal: "3",
       missingIntervals: [{ firstOrdinal: "4", lastOrdinal: "5" }],
     },
@@ -986,13 +987,42 @@ describe("lifecycle Version 1 contracts", () => {
     const intervals = validCheckpoint();
     intervals.evidenceCoverage = {
       captureMode: "coverage-only",
+      contentRetained: false,
       highestContiguousOrdinal: null,
-      missingIntervals: Array.from({ length: 201 }, (_, index) => ({
+      missingIntervals: Array.from({ length: 200 }, (_, index) => ({
         firstOrdinal: String(index * 2),
         lastOrdinal: String(index * 2),
       })),
     };
+    assert.equal(decodeCheckpointV1(intervals).evidenceCoverage.missingIntervals.length, 200);
+    const exactCoverage = intervals.evidenceCoverage as {
+      readonly captureMode: "coverage-only";
+      readonly contentRetained: false;
+      readonly highestContiguousOrdinal: null;
+      readonly missingIntervals: readonly unknown[];
+    };
+    intervals.evidenceCoverage = {
+      ...exactCoverage,
+      missingIntervals: [
+        ...exactCoverage.missingIntervals,
+        { firstOrdinal: "400", lastOrdinal: "400" },
+      ],
+    };
     expectCode("EVIDENCE_COVERAGE_TOO_FRAGMENTED", () => decodeCheckpointV1(intervals));
+
+    const resultBoundary = validCheckpoint();
+    resultBoundary.commandResults = [{
+      label: "build",
+      result: "x".repeat(4_000),
+      exitClassification: "passed",
+      outputFingerprint: null,
+      artifactReference: null,
+      confidence: "high",
+    }];
+    assert.equal(
+      decodeCheckpointV1(resultBoundary).commandResults[0]?.result.length,
+      4_000,
+    );
   });
 
   it("counts Unicode scalar values and rejects unsafe project paths", () => {
@@ -1024,6 +1054,8 @@ describe("lifecycle Version 1 contracts", () => {
       "\\\\server\\share\\file.ts",
       "C:\\absolute\\file.ts",
       "C:/absolute/file.ts",
+      "file:///external/file.ts",
+      "https://example.invalid/external.ts",
       `${scalar.repeat(509)}.txt`,
     ]) {
       const input = validCheckpoint();
@@ -1222,6 +1254,7 @@ describe("lifecycle Version 1 contracts", () => {
       const input = validCheckpoint();
       input.evidenceCoverage = {
         captureMode: "coverage-only",
+        contentRetained: false,
         highestContiguousOrdinal: "3",
         missingIntervals,
       };
@@ -1236,6 +1269,7 @@ describe("lifecycle Version 1 contracts", () => {
       const input = validCheckpoint();
       input.evidenceCoverage = {
         captureMode: "coverage-only",
+        contentRetained: false,
         highestContiguousOrdinal,
         missingIntervals,
       };

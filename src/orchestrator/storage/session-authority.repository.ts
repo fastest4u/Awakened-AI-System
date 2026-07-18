@@ -17,6 +17,7 @@ import { canonicalJson } from "../serialization/canonical-json.js";
 import type {
   AuthorityCompareAndSwap,
   CheckpointClear,
+  CheckpointIndexCompareAndSwap,
   CheckpointRequirement,
   ChildAuthorityInsert,
   RootAuthorityInsert,
@@ -867,6 +868,59 @@ export class SessionAuthorityRepository {
       $projectId: input.projectId,
       $sessionId: input.sessionId,
       $checkpointBaseEventPosition: input.checkpointBaseEventPosition,
+      $updatedAt: updatedAt,
+    });
+    if (result.changes === 0n) return false;
+    if (result.changes !== 1n) integrity();
+    return true;
+  }
+
+  updateCheckpointIndex(
+    connection: SqliteConnection,
+    input: CheckpointIndexCompareAndSwap,
+  ): boolean {
+    if (!LOWER_UUID.test(input.projectId) || !LOWER_UUID.test(input.sessionId)
+      || !LOWER_UUID.test(input.checkpointId)
+      || (input.expectedLatestCheckpointId !== null && !LOWER_UUID.test(input.expectedLatestCheckpointId))
+      || (input.expectedLatestCheckpointFingerprint !== null
+        && !LOWER_HASH.test(input.expectedLatestCheckpointFingerprint))
+      || !LOWER_HASH.test(input.checkpointFingerprint)
+      || input.checkpointEventPosition < 1n || input.checkpointEventPosition > SQLITE_INT64_MAX
+      || (input.expectedLatestCheckpointEventPosition !== null && (
+        input.expectedLatestCheckpointEventPosition < 1n
+        || input.expectedLatestCheckpointEventPosition >= input.checkpointEventPosition
+        || input.expectedLatestCheckpointEventPosition > SQLITE_INT64_MAX
+      ))
+      || ((input.expectedLatestCheckpointId === null)
+        !== (input.expectedLatestCheckpointEventPosition === null))
+      || ((input.expectedLatestCheckpointId === null)
+        !== (input.expectedLatestCheckpointFingerprint === null))) invalid();
+    const updatedAt = checkpointMutationTimestamp(
+      connection,
+      input.projectId,
+      input.sessionId,
+      input.updatedAt,
+    );
+    const result = connection.prepare(`
+      UPDATE session_authority
+      SET latest_checkpoint_id = $checkpointId,
+          latest_checkpoint_event_position = $checkpointEventPosition,
+          latest_checkpoint_fingerprint = $checkpointFingerprint,
+          updated_at = $updatedAt
+      WHERE project_id = $projectId AND session_id = $sessionId
+        AND terminal_event_position IS NULL
+        AND latest_checkpoint_id IS $expectedLatestCheckpointId
+        AND latest_checkpoint_event_position IS $expectedLatestCheckpointEventPosition
+        AND latest_checkpoint_fingerprint IS $expectedLatestCheckpointFingerprint
+    `).run({
+      $projectId: input.projectId,
+      $sessionId: input.sessionId,
+      $expectedLatestCheckpointId: input.expectedLatestCheckpointId,
+      $expectedLatestCheckpointEventPosition: input.expectedLatestCheckpointEventPosition,
+      $expectedLatestCheckpointFingerprint: input.expectedLatestCheckpointFingerprint,
+      $checkpointId: input.checkpointId,
+      $checkpointEventPosition: input.checkpointEventPosition,
+      $checkpointFingerprint: input.checkpointFingerprint,
       $updatedAt: updatedAt,
     });
     if (result.changes === 0n) return false;

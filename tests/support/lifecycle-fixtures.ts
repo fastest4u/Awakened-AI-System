@@ -149,6 +149,7 @@ export function checkpointFixture(options: CheckpointFixtureOptions = {}): Check
     childSummaries: Object.freeze([]),
     evidenceCoverage: Object.freeze({
       captureMode: "coverage-only",
+      contentRetained: false,
       highestContiguousOrdinal: null,
       missingIntervals: Object.freeze([]),
     }),

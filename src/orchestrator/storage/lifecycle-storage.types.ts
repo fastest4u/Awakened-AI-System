@@ -141,6 +141,18 @@ export interface CheckpointClear {
   readonly updatedAt: string;
 }
 
+export interface CheckpointIndexCompareAndSwap {
+  readonly projectId: string;
+  readonly sessionId: string;
+  readonly expectedLatestCheckpointId: string | null;
+  readonly expectedLatestCheckpointEventPosition: bigint | null;
+  readonly expectedLatestCheckpointFingerprint: string | null;
+  readonly checkpointId: string;
+  readonly checkpointEventPosition: bigint;
+  readonly checkpointFingerprint: string;
+  readonly updatedAt: string;
+}
+
 export interface RootLeaseRecord {
   readonly projectId: string;
   readonly sessionId: string;

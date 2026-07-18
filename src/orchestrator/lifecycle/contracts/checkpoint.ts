@@ -17,6 +17,7 @@ import {
   type SessionId,
 } from "./identifiers.js";
 import { LifecycleError } from "../errors.js";
+import { canonicalJson } from "../../serialization/canonical-json.js";
 
 export const CHECKPOINT_MAX_CANONICAL_BYTES = 256 * 1024;
 export const CHECKPOINT_MAX_TASK_SUMMARY_SCALARS = 2_000;
@@ -126,6 +127,7 @@ export interface MissingOrdinalIntervalV1 {
 
 export interface CheckpointEvidenceCoverageV1 {
   readonly captureMode: "coverage-only";
+  readonly contentRetained: false;
   readonly highestContiguousOrdinal: string | null;
   readonly missingIntervals: readonly MissingOrdinalIntervalV1[];
 }
@@ -341,12 +343,17 @@ function interval(value: unknown, field: string): MissingOrdinalIntervalV1 {
 }
 
 function evidenceCoverage(value: unknown): CheckpointEvidenceCoverageV1 {
-  const coverage = exactRecord(value, ["captureMode", "highestContiguousOrdinal", "missingIntervals"], "evidenceCoverage");
+  const coverage = exactRecord(
+    value,
+    ["captureMode", "contentRetained", "highestContiguousOrdinal", "missingIntervals"],
+    "evidenceCoverage",
+  );
   const source = strictArray(coverage.missingIntervals, "evidenceCoverage.missingIntervals");
   if (source.length > CHECKPOINT_MAX_MISSING_INTERVALS) {
     throw new LifecycleError("EVIDENCE_COVERAGE_TOO_FRAGMENTED");
   }
   if (coverage.captureMode !== "coverage-only") invalid("evidenceCoverage.captureMode");
+  if (coverage.contentRetained !== false) invalid("evidenceCoverage.contentRetained");
   const intervals = source.map((item, index) => interval(item, `evidenceCoverage.missingIntervals[${index}]`));
   const highestContiguousOrdinal = coverage.highestContiguousOrdinal === null
     ? null
@@ -368,6 +375,7 @@ function evidenceCoverage(value: unknown): CheckpointEvidenceCoverageV1 {
   ) invalid("evidenceCoverage.missingIntervals");
   return Object.freeze({
     captureMode: "coverage-only",
+    contentRetained: false,
     highestContiguousOrdinal,
     missingIntervals: Object.freeze(intervals),
   });
@@ -415,7 +423,7 @@ function decodeCheckpointContent(checkpoint: Record<string, unknown>): Checkpoin
 }
 
 function assertCheckpointBytes(value: CheckpointDraftV1 | CheckpointV1): void {
-  if (Buffer.byteLength(JSON.stringify(value), "utf8") > CHECKPOINT_MAX_CANONICAL_BYTES) {
+  if (Buffer.byteLength(canonicalJson(value), "utf8") > CHECKPOINT_MAX_CANONICAL_BYTES) {
     invalid("checkpoint.canonicalBytes");
   }
 }
@@ -479,7 +487,9 @@ export function decodeCheckpointV1(value: unknown): CheckpointV1 {
     ),
     ...content,
     sourceState: sourceState(checkpoint.sourceState),
-    childSummaries: boundedArray(checkpoint.childSummaries, "childSummaries", CHECKPOINT_MAX_MATERIAL_ENTRIES, childSummary),
+    childSummaries: Object.freeze(strictArray(checkpoint.childSummaries, "childSummaries").map(
+      (child, index) => childSummary(child, `childSummaries[${index}]`),
+    )),
     evidenceCoverage: evidenceCoverage(checkpoint.evidenceCoverage),
   });
 
