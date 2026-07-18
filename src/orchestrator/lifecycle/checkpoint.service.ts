@@ -151,6 +151,7 @@ export type CheckpointAgeDiagnosticV1 = JsonValue & {
 interface CheckpointAuthorityOperations {
   get(projectId: string, sessionId: string): SessionAuthorityRecord | null;
   requireFoldMatch(authority: SessionAuthorityRecord): SessionAggregateState;
+  latestCheckpoint(authority: SessionAuthorityRecord): CheckpointV1 | null;
   listNonterminalChildren(projectId: string, rootSessionId: string): readonly SessionAuthorityRecord[];
   nextGlobalPosition(): bigint;
   updateCheckpointIndex(input: CheckpointIndexCompareAndSwap): boolean;
@@ -180,6 +181,7 @@ function authorityOperations(transaction: LifecycleCommandTransaction): Checkpoi
   return Object.freeze({
     get: ownMethod<CheckpointAuthorityOperations["get"]>(value, "get"),
     requireFoldMatch: ownMethod<CheckpointAuthorityOperations["requireFoldMatch"]>(value, "requireFoldMatch"),
+    latestCheckpoint: ownMethod<CheckpointAuthorityOperations["latestCheckpoint"]>(value, "latestCheckpoint"),
     listNonterminalChildren: ownMethod<CheckpointAuthorityOperations["listNonterminalChildren"]>(value, "listNonterminalChildren"),
     nextGlobalPosition: ownMethod<CheckpointAuthorityOperations["nextGlobalPosition"]>(value, "nextGlobalPosition"),
     updateCheckpointIndex: ownMethod<CheckpointAuthorityOperations["updateCheckpointIndex"]>(value, "updateCheckpointIndex"),
@@ -228,6 +230,24 @@ function assertDraftPaths(context: ProjectContext, draft: CheckpointDraftV1): vo
   } catch {
     invalid();
   }
+}
+
+/**
+ * Validate checkpoint content against worker-owned project and source-state
+ * witnesses. Callers may describe work, but cannot select a different path
+ * authority or branch authority for persisted file assertions.
+ */
+export function requireTrustedCheckpointDraftV1(
+  context: ProjectContext,
+  draft: CheckpointDraftV1,
+  sourceState: SourceStateFingerprintV1,
+): void {
+  assertDraftPaths(context, draft);
+  const expectedBranchRef = context.workspace.kind === "git" ? context.workspace.branchRef : null;
+  if (sourceState.sourceStateScopeVersion !== 1
+    || sourceState.workspaceId !== context.workspace.workspaceId
+    || sourceState.branchRef !== expectedBranchRef) invalid("INTEGRITY_FAILURE");
+  if (draft.filesTouched.some((file) => file.branchRef !== sourceState.branchRef)) invalid();
 }
 
 function nonterminal(authority: SessionAuthorityRecord): boolean {
@@ -490,6 +510,7 @@ export class CheckpointService {
     const current = Object.freeze({ ...observed }) as SessionAuthorityRecord;
     const aggregate = authority.requireFoldMatch(current);
     assertAuthorityAndAggregate(current, aggregate);
+    authority.latestCheckpoint(current);
     if (BigInt(command.expectedStreamVersion) !== aggregate.streamVersion) {
       throw new LifecycleError("EVENT_CONFLICT");
     }
@@ -533,7 +554,7 @@ export class CheckpointService {
     const sourceState = syncValue(finalization
       ? this.#sourceState.captureForFinalization(invocation.context, invocation.sourceStateScope)
       : this.#sourceState.captureForCheckpoint(invocation.context, invocation.sourceStateScope));
-    this.#assertSourceState(invocation.context, sourceState);
+    requireTrustedCheckpointDraftV1(invocation.context, draft, sourceState);
     const coverage = syncValue(this.#coverage.capture(transaction, current, aggregate));
     const createdAt = canonicalNow(this.#clock);
     const checkpoint = decodeCheckpointV1({
@@ -614,10 +635,4 @@ export class CheckpointService {
     };
   }
 
-  #assertSourceState(context: ProjectContext, sourceState: SourceStateFingerprintV1): void {
-    const branchRef = context.workspace.kind === "git" ? context.workspace.branchRef : null;
-    if (sourceState.sourceStateScopeVersion !== 1
-      || sourceState.workspaceId !== context.workspace.workspaceId
-      || sourceState.branchRef !== branchRef) invalid("INTEGRITY_FAILURE");
-  }
 }

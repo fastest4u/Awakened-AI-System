@@ -2,6 +2,8 @@ import { execFile, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   closeSync,
+  constants,
+  fstatSync,
   lstatSync,
   openSync,
   readdirSync,
@@ -81,6 +83,10 @@ export interface SourceStateCommandRunner {
 export interface FilesystemSourceStateProviderOptions {
   readonly runner?: SourceStateCommandRunner;
   readonly trustedPrivateStateRoot?: string;
+  readonly faultInjector?: (
+    point: "after-lstat-before-open",
+    absolutePath: string,
+  ) => void;
 }
 
 export interface SqliteSourceStateScopeResolverOptions {
@@ -328,15 +334,20 @@ function relativeProjectPath(projectRoot: string, absolutePath: string): string 
 }
 
 function regularFileRecord(
+  projectRoot: string,
   projectPath: string,
   absolutePath: string,
   maximumBytes: number,
-  observedSize: number,
+  observedStat: NonNullable<ReturnType<typeof lstatSync>>,
+  faultInjector: FilesystemSourceStateProviderOptions["faultInjector"],
 ): InventoryRecord {
+  const observedSize = observedStat.size;
   if (!Number.isSafeInteger(observedSize) || observedSize < 0 || observedSize > maximumBytes) captureFailure();
+  faultInjector?.("after-lstat-before-open", absolutePath);
   let descriptor: number;
   try {
-    descriptor = openSync(absolutePath, "r");
+    const noFollow = typeof constants.O_NOFOLLOW === "number" ? constants.O_NOFOLLOW : 0;
+    descriptor = openSync(absolutePath, constants.O_RDONLY | noFollow);
   } catch {
     captureFailure();
   }
@@ -344,6 +355,20 @@ function regularFileRecord(
   const fingerprint = createHash("sha256").update("project-memory/source-file/v1\n");
   let size = 0;
   try {
+    const openedStat = fstatSync(descriptor);
+    if (!openedStat.isFile()
+      || openedStat.dev !== observedStat.dev
+      || openedStat.ino !== observedStat.ino
+      || openedStat.size !== observedSize) captureFailure();
+    try {
+      resolveContainedProjectPath(projectRoot, projectPath);
+    } catch {
+      captureFailure();
+    }
+    const currentPathStat = lstatSync(absolutePath);
+    if (!currentPathStat.isFile()
+      || currentPathStat.dev !== openedStat.dev
+      || currentPathStat.ino !== openedStat.ino) captureFailure();
     while (true) {
       const remaining = maximumBytes - size;
       const requested = Math.min(chunk.byteLength, remaining + 1);
@@ -353,6 +378,12 @@ function regularFileRecord(
       if (size > maximumBytes) captureFailure();
       fingerprint.update(chunk.subarray(0, read));
     }
+    const completedStat = fstatSync(descriptor);
+    if (!completedStat.isFile()
+      || completedStat.dev !== openedStat.dev
+      || completedStat.ino !== openedStat.ino
+      || completedStat.size !== openedStat.size
+      || size !== completedStat.size) captureFailure();
   } catch (error) {
     if (error instanceof LifecycleError) throw error;
     captureFailure();
@@ -367,8 +398,18 @@ function regularFileRecord(
   return Object.freeze({ path: projectPath, kind: "file", size, fingerprint: fingerprint.digest("hex") });
 }
 
-function fileRecord(projectRoot: string, absolutePath: string, maximumBytes: number): InventoryRecord {
+function fileRecord(
+  projectRoot: string,
+  absolutePath: string,
+  maximumBytes: number,
+  faultInjector: FilesystemSourceStateProviderOptions["faultInjector"],
+): InventoryRecord {
   const projectPath = relativeProjectPath(projectRoot, absolutePath);
+  try {
+    resolveContainedProjectPath(projectRoot, projectPath);
+  } catch {
+    captureFailure();
+  }
   let stat;
   try {
     stat = lstatSync(absolutePath);
@@ -393,10 +434,13 @@ function fileRecord(projectRoot: string, absolutePath: string, maximumBytes: num
     });
   }
   if (!stat.isFile()) captureFailure();
-  return regularFileRecord(projectPath, absolutePath, maximumBytes, stat.size);
+  return regularFileRecord(projectRoot, projectPath, absolutePath, maximumBytes, stat, faultInjector);
 }
 
-function nonGitInventory(capture: ValidatedCapture): readonly InventoryRecord[] {
+function nonGitInventory(
+  capture: ValidatedCapture,
+  faultInjector: FilesystemSourceStateProviderOptions["faultInjector"],
+): readonly InventoryRecord[] {
   const pendingDirectories = [capture.projectRoot];
   const files: string[] = [];
   let observedNodes = 0;
@@ -421,7 +465,7 @@ function nonGitInventory(capture: ValidatedCapture): readonly InventoryRecord[] 
   const records: InventoryRecord[] = [];
   let totalBytes = 0;
   for (const path of files) {
-    const record = fileRecord(capture.projectRoot, path, MAX_INVENTORY_BYTES - totalBytes);
+    const record = fileRecord(capture.projectRoot, path, MAX_INVENTORY_BYTES - totalBytes, faultInjector);
     records.push(record);
     totalBytes += record.size;
   }
@@ -481,7 +525,11 @@ function filteredStatus(value: string, capture: ValidatedCapture): readonly stri
   return Object.freeze(records.sort());
 }
 
-function gitInventory(value: string, capture: ValidatedCapture): readonly InventoryRecord[] {
+function gitInventory(
+  value: string,
+  capture: ValidatedCapture,
+  faultInjector: FilesystemSourceStateProviderOptions["faultInjector"],
+): readonly InventoryRecord[] {
   const paths = [...new Set(nulRecords(value))]
     .sort()
     .filter((path) => !isExcluded(capture.scope, resolve(capture.projectRoot, path)));
@@ -493,6 +541,7 @@ function gitInventory(value: string, capture: ValidatedCapture): readonly Invent
       capture.projectRoot,
       resolve(capture.projectRoot, path),
       MAX_INVENTORY_BYTES - totalBytes,
+      faultInjector,
     );
     records.push(record);
     totalBytes += record.size;
@@ -665,6 +714,7 @@ export class SqliteSourceStateScopeResolver implements SourceStateScopeResolver 
 export class FilesystemSourceStateProvider implements SourceStateProvider {
   readonly #runner: SourceStateCommandRunner;
   readonly #trustedPrivateStateRoot: string | undefined;
+  readonly #faultInjector: FilesystemSourceStateProviderOptions["faultInjector"];
 
   constructor(options: FilesystemSourceStateProviderOptions = {}) {
     if (typeof options !== "object" || options === null || Array.isArray(options)) invalid();
@@ -673,7 +723,7 @@ export class FilesystemSourceStateProvider implements SourceStateProvider {
     const descriptors = Object.getOwnPropertyDescriptors(options);
     const optionKeys = Reflect.ownKeys(descriptors);
     if (optionKeys.some((key) => typeof key !== "string"
-      || (key !== "runner" && key !== "trustedPrivateStateRoot"))) invalid();
+      || (key !== "runner" && key !== "trustedPrivateStateRoot" && key !== "faultInjector"))) invalid();
     for (const descriptor of Object.values(descriptors)) {
       if (!descriptor.enumerable || !("value" in descriptor)) invalid();
     }
@@ -683,8 +733,10 @@ export class FilesystemSourceStateProvider implements SourceStateProvider {
     if (options.trustedPrivateStateRoot !== undefined
       && (typeof options.trustedPrivateStateRoot !== "string"
         || !isAbsolute(options.trustedPrivateStateRoot))) invalid();
+    if (options.faultInjector !== undefined && typeof options.faultInjector !== "function") invalid();
     this.#runner = options.runner ?? new NodeSourceStateCommandRunner();
     this.#trustedPrivateStateRoot = options.trustedPrivateStateRoot;
+    this.#faultInjector = options.faultInjector;
   }
 
   captureForCheckpoint(context: ProjectContext, scope: SourceStateScopeV1): SourceStateFingerprintV1 {
@@ -703,7 +755,7 @@ export class FilesystemSourceStateProvider implements SourceStateProvider {
         branchRef: null,
         headCommit: null,
         status: Object.freeze([]),
-        inventory: nonGitInventory(validated),
+        inventory: nonGitInventory(validated, this.#faultInjector),
       });
     }
     const [branch, head, status, inventory] = await Promise.all([
@@ -722,7 +774,7 @@ export class FilesystemSourceStateProvider implements SourceStateProvider {
         branchRef: null,
         headCommit: null,
         status: Object.freeze([]),
-        inventory: nonGitInventory(validated),
+        inventory: nonGitInventory(validated, this.#faultInjector),
       });
     }
     return this.#gitFingerprint(
@@ -754,7 +806,7 @@ export class FilesystemSourceStateProvider implements SourceStateProvider {
       branchRef,
       headCommit,
       status: filteredStatus(status.stdout, validated),
-      inventory: gitInventory(inventory.stdout, validated),
+      inventory: gitInventory(inventory.stdout, validated, this.#faultInjector),
     });
   }
 }

@@ -196,6 +196,7 @@ interface AuthorityHarness {
     checkpointUpdates: unknown[];
     clears: unknown[];
     sourceCaptures: unknown[];
+    latestCheckpointReads: unknown[];
   };
 }
 
@@ -203,8 +204,17 @@ function authorityHarness(options: {
   readonly basePosition?: bigint;
   readonly markerPosition?: bigint | null;
   readonly faultPoint?: string;
+  readonly corruptLatestCheckpointFingerprint?: boolean;
 } = {}): AuthorityHarness {
-  const calls = { checkpointUpdates: [] as unknown[], clears: [] as unknown[], sourceCaptures: [] as unknown[] };
+  const calls = {
+    checkpointUpdates: [] as unknown[],
+    clears: [] as unknown[],
+    sourceCaptures: [] as unknown[],
+    latestCheckpointReads: [] as unknown[],
+  };
+  const priorCheckpointId = options.corruptLatestCheckpointFingerprint === true
+    ? "77777777-7777-4777-8777-777777777777"
+    : null;
   const root = Object.freeze({
     projectId: PROJECT_ID,
     sessionId: ROOT_ID,
@@ -213,9 +223,9 @@ function authorityHarness(options: {
     parentSessionId: null,
     workspaceId: WORKSPACE_ID,
     semanticState: "active",
-    latestCheckpointId: null,
-    latestCheckpointEventPosition: null,
-    latestCheckpointFingerprint: null,
+    latestCheckpointId: priorCheckpointId,
+    latestCheckpointEventPosition: priorCheckpointId === null ? null : 49n,
+    latestCheckpointFingerprint: priorCheckpointId === null ? null : "f".repeat(64),
     checkpointRequiredReason: options.markerPosition == null ? null : "accepted-child-report",
     checkpointRequiredEventPosition: options.markerPosition ?? null,
   });
@@ -240,9 +250,9 @@ function authorityHarness(options: {
     eventPosition: 30n,
     terminalEventPosition: null,
     correlationId: "77777777-7777-4777-8777-777777777777",
-    latestCheckpointId: null,
-    latestCheckpointEventPosition: null,
-    latestCheckpointBaseEventPosition: null,
+    latestCheckpointId: priorCheckpointId,
+    latestCheckpointEventPosition: priorCheckpointId === null ? null : 49n,
+    latestCheckpointBaseEventPosition: priorCheckpointId === null ? null : 48n,
   });
   const childAggregate = Object.freeze({
     kind: "child",
@@ -260,6 +270,13 @@ function authorityHarness(options: {
   const authority = Object.freeze({
     get: (projectId: string, sessionId: string) => projectId === PROJECT_ID && sessionId === ROOT_ID ? root : null,
     requireFoldMatch: (record: { readonly sessionId: string }) => record.sessionId === ROOT_ID ? rootAggregate : childAggregate,
+    latestCheckpoint: (record: { readonly sessionId: string }) => {
+      calls.latestCheckpointReads.push(record);
+      if (options.corruptLatestCheckpointFingerprint === true) {
+        throw new Error("INTEGRITY_FAILURE");
+      }
+      return null;
+    },
     listNonterminalChildren: (projectId: string, rootSessionId: string) =>
       projectId === PROJECT_ID && rootSessionId === ROOT_ID ? Object.freeze([child]) : Object.freeze([]),
     nextGlobalPosition: () => (options.basePosition ?? 50n) + 1n,
@@ -283,6 +300,7 @@ async function checkpointServiceFixture(options: {
   readonly basePosition?: bigint;
   readonly markerPosition?: bigint | null;
   readonly faultPoint?: string;
+  readonly corruptLatestCheckpointFingerprint?: boolean;
 } = {}): Promise<{
   readonly service: CheckpointServiceLike;
   readonly harness: AuthorityHarness;
@@ -664,6 +682,49 @@ describe("CheckpointService transactional enrichment", () => {
         /EVENT_CONFLICT/u,
       );
       assert.equal(fixture.harness.calls.sourceCaptures.length, 0);
+      assert.equal(fixture.harness.calls.checkpointUpdates.length, 0);
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it("rejects a corrupt existing checkpoint fingerprint before enrichment or mutation", async () => {
+    const fixture = await checkpointServiceFixture({ corruptLatestCheckpointFingerprint: true });
+    try {
+      assert.throws(
+        () => fixture.service.record(fixture.harness.transaction, checkpointCommand()),
+        /INTEGRITY_FAILURE/u,
+      );
+      assert.equal(fixture.harness.calls.latestCheckpointReads.length, 1);
+      assert.equal(fixture.harness.calls.sourceCaptures.length, 0);
+      assert.equal(fixture.harness.calls.checkpointUpdates.length, 0);
+      assert.equal(fixture.harness.calls.clears.length, 0);
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it("rejects a file assertion whose branch differs from the trusted source witness", async () => {
+    const fixture = await checkpointServiceFixture();
+    try {
+      const maliciousDraft = {
+        ...draft(),
+        filesTouched: [{
+          path: "src/observed.ts",
+          action: "observed",
+          contentHash: null,
+          branchRef: "refs/heads/caller-selected",
+          confidence: "high",
+        }],
+      };
+      assert.throws(
+        () => fixture.service.record(
+          fixture.harness.transaction,
+          checkpointCommand({ draft: maliciousDraft }),
+        ),
+        /LIFECYCLE_INPUT_INVALID/u,
+      );
+      assert.equal(fixture.harness.calls.sourceCaptures.length, 1);
       assert.equal(fixture.harness.calls.checkpointUpdates.length, 0);
     } finally {
       fixture.cleanup();

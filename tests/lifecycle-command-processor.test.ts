@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import { mkdtempSync, rmSync, symlinkSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { describe, it } from "node:test";
 import type { AppendCommand, JsonValue } from "../src/orchestrator/contracts/event.js";
@@ -3166,9 +3169,17 @@ describe("LifecycleCommandProcessor root suspension", () => {
     const Processor = await loadProcessorConstructor();
     assert.ok(Processor !== null);
     let failAppend = false;
-    const item = fixture(Processor, {
+    let observedSessionId: string | undefined;
+    let authorityDuringFirstInsert: SessionAuthorityRecord | null | undefined;
+    let item: Fixture;
+    item = fixture(Processor, {
       eventFault: (boundary) => {
         if (failAppend && boundary === "after-first-insert-before-commit") {
+          authorityDuringFirstInsert = item.authority.get(
+            item.connection,
+            PROJECT_ID,
+            observedSessionId!,
+          );
           throw new Error("injected-suspend-append-failure");
         }
       },
@@ -3179,6 +3190,7 @@ describe("LifecycleCommandProcessor root suspension", () => {
         primary,
         preparedStart(primary, startCommand(700, "suspend-negative")),
       ));
+      observedSessionId = started.publicResult.sessionId;
       const effectsBefore = () => [
         item.connection.prepare("SELECT COUNT(*) AS count FROM events").get()?.count,
         item.connection.prepare("SELECT COUNT(*) AS count FROM command_dedup").get()?.count,
@@ -3241,11 +3253,11 @@ describe("LifecycleCommandProcessor root suspension", () => {
         () => item.processor.suspendRoot(primary, validPrepared),
         /injected-suspend-append-failure/u,
       );
-      assert.deepEqual(item.operationTrace, [
-        "children-list",
-        "authority-cas/1",
-        "lease-renew/1",
-      ]);
+      assert.deepEqual(item.operationTrace, ["children-list"]);
+      assert.ok(authorityDuringFirstInsert !== null && authorityDuringFirstInsert !== undefined);
+      assert.equal(authorityDuringFirstInsert.semanticState, "active");
+      assert.equal(authorityDuringFirstInsert.latestCheckpointId, null);
+      assert.equal(authorityDuringFirstInsert.checkpointRequiredReason, null);
       assert.deepEqual(
         item.authority.get(item.connection, PROJECT_ID, started.publicResult.sessionId),
         authorityBefore,
@@ -3266,6 +3278,62 @@ describe("LifecycleCommandProcessor root suspension", () => {
       assert.equal(retried.publicResult.ownerGeneration, "1");
     } finally {
       item.connection.close();
+    }
+  });
+
+  it("rejects a suspension checkpoint path whose existing junction escapes the project", async () => {
+    const Processor = await loadProcessorConstructor();
+    assert.ok(Processor !== null);
+    const item = fixture(Processor);
+    const projectRoot = mkdtempSync(join(tmpdir(), "suspend-checkpoint-root-"));
+    const outside = mkdtempSync(join(tmpdir(), "suspend-checkpoint-outside-"));
+    try {
+      symlinkSync(outside, join(projectRoot, "linked-outside"), "junction");
+      const base = context("primary-suspend-path");
+      const workspace = Object.freeze({ ...base.workspace, workspaceRoot: projectRoot });
+      const primary: ProjectContext = Object.freeze({
+        ...base,
+        workspace,
+        binding: Object.freeze({
+          ...base.binding,
+          projectRoot,
+          workspace,
+        }),
+      });
+      const started = success(item.processor.startRoot(
+        primary,
+        preparedStart(primary, startCommand(710, "suspend-path")),
+      ));
+      const unsafeCommand: RootSuspendCommandV2 = {
+        ...suspendCommand(711, started.publicResult.sessionId, "1"),
+        checkpoint: {
+          ...checkpointDraft(),
+          filesTouched: [{
+            path: "linked-outside/secret.txt",
+            action: "observed",
+            contentHash: null,
+            branchRef: null,
+            confidence: "high",
+          }],
+        },
+      };
+
+      assert.throws(
+        () => item.processor.suspendRoot(
+          primary,
+          preparedSuspend(item, primary, started, unsafeCommand),
+        ),
+        /LIFECYCLE_INPUT_INVALID/u,
+      );
+      const authority = item.authority.get(item.connection, PROJECT_ID, started.publicResult.sessionId);
+      assert.ok(authority !== null);
+      assert.equal(authority.semanticState, "active");
+      assert.equal(authority.latestCheckpointId, null);
+      assert.equal(item.connection.prepare("SELECT COUNT(*) AS count FROM events").get()?.count, 1n);
+    } finally {
+      item.connection.close();
+      rmSync(projectRoot, { recursive: true, force: true });
+      rmSync(outside, { recursive: true, force: true });
     }
   });
 });

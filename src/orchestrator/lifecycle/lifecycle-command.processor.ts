@@ -69,7 +69,10 @@ import type { SessionLeaseRepository } from "../storage/session-lease.repository
 import { canonicalJson } from "../serialization/canonical-json.js";
 import { isPrimarySqliteBusy } from "../storage/event-append-transaction.js";
 import { MAX_CANONICAL_TIMESTAMP_MS } from "../runtime/clock.js";
-import { requireRiskyTransitionCheckpointV1 } from "./checkpoint.service.js";
+import {
+  requireRiskyTransitionCheckpointV1,
+  requireTrustedCheckpointDraftV1,
+} from "./checkpoint.service.js";
 import type {
   SourceStateProvider,
   SourceStateScopeResolver,
@@ -2084,6 +2087,7 @@ export class LifecycleCommandProcessor {
       if (aggregateView.kind !== "root" || aggregateView.state !== "active") {
         throw new LifecycleError("SESSION_STATE_CONFLICT");
       }
+      authority.latestCheckpoint(current);
       const streamVersion = aggregateView.streamVersion;
       const priorEventPosition = aggregateView.eventPosition;
       const correlationId = aggregateView.correlationId;
@@ -2184,6 +2188,7 @@ export class LifecycleCommandProcessor {
       const expectedCheckpointBranch = context.workspace.kind === "git" ? context.workspace.branchRef : null;
       if (sourceState.workspaceId !== context.workspace.workspaceId
         || sourceState.branchRef !== expectedCheckpointBranch) invalid("INTEGRITY_FAILURE");
+      requireTrustedCheckpointDraftV1(context, checkpointDraft, sourceState);
       const checkpoint = decodeCheckpointV1({
         ...checkpointDraft,
         checkpointId: this.#ids.uuid(),
@@ -2331,12 +2336,20 @@ export class LifecycleCommandProcessor {
         },
         authorizationRecord,
         freshCapabilityGeneration: generation,
-        beforeAppend: (planned, currentTransaction) => {
+        beforeAppend: (planned) => {
           if (
             planned.events.length !== 3
             || planned.events[0]?.globalPosition !== checkpointPosition
             || planned.events[1]?.globalPosition !== suspendRequestPosition
             || planned.events[2]?.globalPosition !== suspendedPosition
+          ) invalid("INTEGRITY_FAILURE");
+        },
+        afterAppend: (committed, currentTransaction) => {
+          if (
+            committed.events.length !== 3
+            || committed.events[0]?.globalPosition !== checkpointPosition
+            || committed.events[1]?.globalPosition !== suspendRequestPosition
+            || committed.events[2]?.globalPosition !== suspendedPosition
           ) invalid("INTEGRITY_FAILURE");
           const currentAuthority = rootOperations(currentTransaction);
           const currentLeases = leaseOperations(currentTransaction);
@@ -2357,14 +2370,6 @@ export class LifecycleCommandProcessor {
             observedNowMs: now.milliseconds,
             leaseDurationMs: OWNER_LEASE_DURATION_MS,
           });
-        },
-        afterAppend: (committed) => {
-          if (
-            committed.events.length !== 3
-            || committed.events[0]?.globalPosition !== checkpointPosition
-            || committed.events[1]?.globalPosition !== suspendRequestPosition
-            || committed.events[2]?.globalPosition !== suspendedPosition
-          ) invalid("INTEGRITY_FAILURE");
         },
       };
     });

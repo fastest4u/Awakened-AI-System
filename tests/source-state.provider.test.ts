@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, renameSync, rmSync, truncateSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, renameSync, rmSync, symlinkSync, truncateSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, it } from "node:test";
@@ -403,6 +403,36 @@ describe("SourceStateProvider trusted capture", () => {
       () => new Provider().captureForCheckpoint(fixture.context, fixture.scope),
       /INTEGRITY_FAILURE/u,
     );
+  });
+
+  it("fails closed when a path is replaced by an escaping junction between lstat and open", async () => {
+    const module = await optionalSourceStateModule();
+    const Provider = providerConstructor(module);
+    const fixture = projectFixture("non-git");
+    const outside = mkdtempSync(join(tmpdir(), "source-state-outside-"));
+    temporaryRoots.push(outside);
+    const insideDirectory = join(fixture.projectRoot, "inside");
+    const displacedDirectory = join(fixture.projectRoot, "inside-before-swap");
+    const target = join(insideDirectory, "target.txt");
+    mkdirSync(insideDirectory);
+    writeFileSync(target, "trusted\n", "utf8");
+    writeFileSync(join(outside, "target.txt"), "outside\n", "utf8");
+    let swapped = false;
+    const provider = new Provider({
+      faultInjector: (point: unknown, path: unknown) => {
+        if (point === "after-lstat-before-open" && path === target) {
+          renameSync(insideDirectory, displacedDirectory);
+          symlinkSync(outside, insideDirectory, "junction");
+          swapped = true;
+        }
+      },
+    });
+
+    assert.throws(
+      () => provider.captureForCheckpoint(fixture.context, fixture.scope),
+      /INTEGRITY_FAILURE/u,
+    );
+    assert.equal(swapped, true);
   });
 
   it("provides an injected deterministic fake for transactional tests", async () => {

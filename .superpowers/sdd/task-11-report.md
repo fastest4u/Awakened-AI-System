@@ -70,3 +70,24 @@ Tests:
 ## Concerns
 
 None blocking.
+
+## Post-Review Hardening Wave
+
+The blocking review findings were resolved in a test-first follow-up:
+
+- `CheckpointService.record` now calls the repository's full latest-checkpoint verifier before enrichment or any checkpoint-index overwrite. An indexed event/ID/position/fingerprint mismatch therefore fails with `INTEGRITY_FAILURE` and leaves the existing authority state untouched.
+- Root suspension uses the same exported trusted checkpoint-draft validator as standalone checkpoint recording. Project-relative file, artifact, and source paths are containment-checked through existing filesystem components, and every persisted `filesTouched[].branchRef` must exactly equal the worker-captured source witness.
+- Suspension now appends all three committed events before its authority/index/marker CAS and lease renewal. The post-append callback verifies the committed global positions and performs the final authority mutation in the same command transaction. A first-insert fault observes the original active authority with no checkpoint or marker, and the whole command still rolls back.
+- Source inventory file capture now uses `O_NOFOLLOW` where the platform exposes it, verifies the opened descriptor with `fstat`, compares pre-open/path/opened identities and file types, revalidates project containment after open, and confirms the descriptor identity/size again after the bounded read. A deterministic `after-lstat-before-open` fault seam proves that replacing an intermediate directory with an escaping junction fails closed.
+
+### Deferred Session-End Boundary
+
+`amend-session-end`, `cancel-session-end`, and `abandon-session` currently have strict command/event contracts, intent witnesses, aggregate fold rules, SQL/integrity representation, and fixed risky-transition names. There is no production session-end command coordinator or worker dispatch path that executes those commands or emits their events in this subproject. Consequently there is no callable transition on which to install the shared pre-transition checkpoint guard yet; doing so here would fabricate the coordinator owned by the later session-end work. That future coordinator must call `requireRiskyTransitionCheckpointV1` before each of those three transitions.
+
+### RED/GREEN and Final Verification
+
+- RED: the directly affected focused run executed 59 tests with 54 passing and exactly 5 intended failures: corrupt prior checkpoint fingerprint, caller-selected file branch, pre-append suspension authority mutation, suspension junction escape, and the lstat/open junction substitution seam.
+- GREEN: directly affected focused gate — PASS, 59/59 tests, 0 failures.
+- Original five-file Task 11 gate with expanded coverage — PASS, 122/122 tests, 0 failures.
+- `npm run typecheck` — PASS, exit 0.
+- `npm test` — PASS, 1,250 tests; 1,240 passed; 10 skipped; 0 failed.
