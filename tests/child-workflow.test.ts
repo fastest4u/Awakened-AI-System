@@ -424,6 +424,7 @@ interface Fixture {
   readonly additionalConnections: NativeConnection[];
   readonly cleanupDirectory: string | null;
   readonly checkpointSourceCaptures: { count: number };
+  readonly resumeSourceCaptures: { count: number };
 }
 
 const fixtures: Fixture[] = [];
@@ -517,6 +518,7 @@ function fixture(databasePath = ":memory:", cleanupDirectory: string | null = nu
   const primary = context();
   const childContext = context("child-1", "untrusted");
   const checkpointSourceCaptures = { count: 0 };
+  const resumeSourceCaptures = { count: 0 };
   const processor = new LifecycleCommandProcessor({
     connection,
     commandStore: store,
@@ -527,7 +529,12 @@ function fixture(databasePath = ":memory:", cleanupDirectory: string | null = nu
     clock,
     identitySource: ids,
     integrity: { assertQuickHealthy: () => undefined },
-    resumeSourceState: { captureCurrent: () => { throw new Error("unused"); } },
+    resumeSourceState: {
+      captureCurrent: () => {
+        resumeSourceCaptures.count += 1;
+        throw new Error("unused");
+      },
+    },
     checkpointSourceStateProvider: {
       capture: async (projectContext: ProjectContext) => ({
         sourceStateScopeVersion: 1,
@@ -589,7 +596,7 @@ function fixture(databasePath = ":memory:", cleanupDirectory: string | null = nu
   const item = {
     connection, authority, leases, approvals, transfers, events, store, processor, capabilities, provider, clock, ids,
     workflow, query, primary, childContext, root: started, rootAuthority, childAuthorities: [],
-    additionalConnections: [], cleanupDirectory, checkpointSourceCaptures,
+    additionalConnections: [], cleanupDirectory, checkpointSourceCaptures, resumeSourceCaptures,
   };
   fixtures.push(item);
   return item;
@@ -1226,6 +1233,59 @@ describe("scoped child lifecycle", () => {
       events: item.connection.prepare("SELECT COUNT(*) AS count FROM events").get()?.count,
       dedup: item.connection.prepare("SELECT COUNT(*) AS count FROM command_dedup").get()?.count,
       authority: item.connection.prepare("SELECT COUNT(*) AS count FROM session_authority").get()?.count,
+    }, effectsBefore);
+  });
+
+  it("rejects ownership transfer when a nonterminal child's latest checkpoint fingerprint is corrupt", () => {
+    const item = fixture();
+    const child = directChild(item, 1_030);
+    const childSessionId = child.result.publicResult.childSessionId;
+    const childCheckpoint = seedChildCheckpoint(item, childSessionId, 1_130);
+    const validChild = item.authority.get(item.connection, PROJECT_ID, childSessionId);
+    assert.ok(validChild !== null);
+    assert.equal(
+      item.authority.latestCheckpoint(item.connection, validChild)?.checkpointId,
+      childCheckpoint.checkpointId,
+    );
+    seedSessionCheckpoint(item, item.root.publicResult.sessionId, 1_131);
+    const corruptedChild = corruptLatestCheckpointFingerprint(item, childSessionId);
+    const childAggregateAfterCorruption = item.authority.requireFoldMatch(item.connection, corruptedChild);
+    assert.equal(childAggregateAfterCorruption.kind, "child");
+    assert.equal(childAggregateAfterCorruption.state, "active");
+
+    const rootBefore = item.authority.get(item.connection, PROJECT_ID, item.root.publicResult.sessionId);
+    const leaseBefore = item.leases.current(item.connection, PROJECT_ID, item.root.publicResult.sessionId);
+    assert.ok(rootBefore !== null && leaseBefore !== null);
+    const effectsBefore = {
+      events: item.connection.prepare("SELECT COUNT(*) AS count FROM events").get()?.count,
+      dedup: item.connection.prepare("SELECT COUNT(*) AS count FROM command_dedup").get()?.count,
+      authority: item.connection.prepare("SELECT COUNT(*) AS count FROM session_authority").get()?.count,
+      leases: item.connection.prepare("SELECT COUNT(*) AS count FROM session_leases").get()?.count,
+      approvalConsumptions: item.connection.prepare(
+        "SELECT COUNT(*) AS count FROM lifecycle_approval_consumptions",
+      ).get()?.count,
+    };
+    item.clock.now = leaseBefore.expiresAtMs;
+    const rotatedContext = context("primary-corrupt-child-transfer");
+    const prepared = preparedResume(item, rotatedContext, resumeCommand(item, 1_031));
+
+    assert.throws(
+      () => item.processor.resumeRoot(rotatedContext, prepared),
+      (error: unknown) => errorCode(error) === "INTEGRITY_FAILURE",
+    );
+    assert.equal(item.resumeSourceCaptures.count, 0);
+    assert.equal(item.checkpointSourceCaptures.count, 0);
+    assert.deepEqual(item.authority.get(item.connection, PROJECT_ID, rootBefore.sessionId), rootBefore);
+    assert.deepEqual(item.authority.get(item.connection, PROJECT_ID, corruptedChild.sessionId), corruptedChild);
+    assert.deepEqual(item.leases.current(item.connection, PROJECT_ID, rootBefore.sessionId), leaseBefore);
+    assert.deepEqual({
+      events: item.connection.prepare("SELECT COUNT(*) AS count FROM events").get()?.count,
+      dedup: item.connection.prepare("SELECT COUNT(*) AS count FROM command_dedup").get()?.count,
+      authority: item.connection.prepare("SELECT COUNT(*) AS count FROM session_authority").get()?.count,
+      leases: item.connection.prepare("SELECT COUNT(*) AS count FROM session_leases").get()?.count,
+      approvalConsumptions: item.connection.prepare(
+        "SELECT COUNT(*) AS count FROM lifecycle_approval_consumptions",
+      ).get()?.count,
     }, effectsBefore);
   });
 

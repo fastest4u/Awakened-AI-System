@@ -110,3 +110,27 @@ No mismatch is repaired implicitly. A corrupt child checkpoint index fails with 
 - Exact prescribed five-file Task 11 gate — PASS, 113/113 tests, 0 failures.
 - `npm run typecheck` — PASS, exit 0.
 - `npm test` — PASS, 1,253 tests; 1,243 passed; 10 skipped; 0 failed.
+
+## Final Risky-Transition Collector Mutation Proof
+
+A final test-only review wave added a real expired-lease ownership-transfer regression for the
+`lifecycle-command.processor.ts` `riskyTransitionChildren` collector. The test forks a fold-valid,
+active nonterminal child, records and verifies a real latest child checkpoint, records the covering
+root checkpoint, and then corrupts only the child's
+`session_authority.latest_checkpoint_fingerprint`. Exact resume ownership transfer must fail with
+`INTEGRITY_FAILURE` while preserving the complete root and child authority records, current root
+lease and lease-row count, events, command deduplication, authority-row count, lifecycle approval
+consumptions, and both resume/checkpoint source-capture counters.
+
+### Mutation and Final Verification
+
+- Current production guard — PASS, targeted direct run: 1 test, 1 suite, 1 passed, 0 failed, 0 skipped.
+- Mutation RED: temporarily removing only `authority.latestCheckpoint(child)` from
+  `riskyTransitionChildren` produced exactly 1 test, 1 suite, 0 passed, 1 failed, with
+  `AssertionError [ERR_ASSERTION]: Missing expected exception.` The call was restored immediately;
+  the production-file diff was empty before final verification and commit.
+- Restored GREEN: targeted direct run — PASS, 1 test, 1 suite, 1 passed, 0 failed, 0 skipped.
+- Exact prescribed five-file Task 11 gate — PASS, 114 tests, 19 suites, 114 passed, 0 failed,
+  0 skipped.
+- `npm run typecheck` — PASS, exit 0.
+- Full compiled suite — PASS, 1,254 tests, 171 suites; 1,244 passed; 10 skipped; 0 failed.
