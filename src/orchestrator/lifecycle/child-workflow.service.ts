@@ -606,6 +606,7 @@ export class ChildWorkflowService {
           && authority.revocationEventPosition === null && authority.revokedAt === null
           && authority.terminalEventPosition === null && authority.terminalAt === null
           && parent.semanticState === "active" && parent.ownerGeneration !== null
+          && BigInt(childAggregate.rootOwnerGeneration) === parent.ownerGeneration
           && parent.revocationEventPosition === null && parent.revokedAt === null
           && parent.terminalEventPosition === null && parent.terminalAt === null) {
           const resolved = this.#capabilities.authorityMaterial({

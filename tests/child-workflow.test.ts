@@ -29,6 +29,7 @@ import type {
   PreparedLifecycleWorkerCommand,
   ProposeChildCompletionCommandV2,
   RecordChildReportCommandV2,
+  RootResumeCommandV2,
   RootStartCommandV2,
   SuspendChildSessionCommandV2,
 } from "../src/orchestrator/lifecycle/contracts/commands.js";
@@ -206,6 +207,89 @@ function preparedStart(projectContext: ProjectContext, command: RootStartCommand
       authoritySessionId: null,
       targetSessionId: null,
       proof: null,
+      approval: null,
+      childBindingGrant: null,
+    },
+  };
+}
+
+function resumeCommand(
+  item: Fixture,
+  ordinal: number,
+): RootResumeCommandV2 {
+  return {
+    commandType: "root-resume",
+    commandId: lifecycleUuid(ordinal),
+    idempotencyKey: `root-resume/${ordinal}`,
+    agentId: "agent-primary",
+    expectedProjectId: PROJECT_ID,
+    expectedVaultId: VAULT_ID,
+    expectedWorkspaceId: WORKSPACE_ID,
+    expectedBranchRef: null,
+    sessionId: item.root.publicResult.sessionId as RootResumeCommandV2["sessionId"],
+    continuityKey: "thread-100",
+    resumePolicy: "exact",
+    expectedOwnerGeneration: item.root.publicResult.ownerGeneration,
+  };
+}
+
+function preparedResume(
+  item: Fixture,
+  projectContext: ProjectContext,
+  command: RootResumeCommandV2,
+): PreparedLifecycleWorkerCommand<RootResumeCommandV2> {
+  assert.equal(item.rootAuthority.kind, "root");
+  if (item.rootAuthority.kind !== "root" || item.rootAuthority.resumeToken === null) {
+    assert.fail("root resume token must be available");
+  }
+  const candidateIntentHash = buildLifecycleIntentWitness(command, {
+    authorizationKind: "protected",
+    authorizationSessionId: item.root.publicResult.sessionId,
+    targetSessionId: item.root.publicResult.sessionId,
+    projectId: projectContext.binding.projectId,
+    vaultId: projectContext.binding.vaultId,
+    storeId: projectContext.binding.storeId,
+    workspaceId: projectContext.binding.workspaceId,
+    clientNamespace: projectContext.binding.clientNamespace,
+    capabilityKind: "root-resume-token",
+    capabilityGeneration: command.expectedOwnerGeneration,
+    presentingActorRole: "primary",
+    presentingClientInstanceId: projectContext.binding.clientInstanceId,
+    targetActorRole: "primary",
+    targetClientInstanceId: projectContext.binding.clientInstanceId,
+    internalWorkflowId: null,
+    internalWorkflowGeneration: null,
+    internalPlannedWorkId: null,
+  }).intentHash;
+  const target: SemanticCommandProofTargetV1 = {
+    proofVersion: 1,
+    target: "semantic-command",
+    projectId: projectContext.binding.projectId,
+    vaultId: projectContext.binding.vaultId,
+    storeId: projectContext.binding.storeId,
+    workspaceId: projectContext.binding.workspaceId,
+    clientNamespace: projectContext.binding.clientNamespace,
+    authoritySessionId: item.root.publicResult.sessionId,
+    targetSessionId: item.root.publicResult.sessionId,
+    presentingActorRole: "primary",
+    presentingClientInstanceId: projectContext.binding.clientInstanceId,
+    targetActorRole: "primary",
+    targetClientInstanceId: projectContext.binding.clientInstanceId,
+    capabilityKind: "root-resume-token",
+    capabilityGeneration: command.expectedOwnerGeneration,
+    commandId: command.commandId,
+    idempotencyKey: command.idempotencyKey,
+    intentHash: candidateIntentHash,
+    proofNonce: lifecycleUuid(Number(command.commandId.slice(-12)) + 50_000),
+  };
+  return {
+    command,
+    candidateIntentHash,
+    authorization: {
+      kind: "protected",
+      authoritySessionId: item.root.publicResult.sessionId as NonNullable<RootResumeCommandV2["sessionId"]>,
+      targetSessionId: item.root.publicResult.sessionId as NonNullable<RootResumeCommandV2["sessionId"]>,
+      proof: createCapabilityProof(item.rootAuthority.resumeToken, target),
       approval: null,
       childBindingGrant: null,
     },
@@ -991,6 +1075,42 @@ describe("scoped child lifecycle", () => {
     assert.equal(item.connection.prepare("SELECT COUNT(*) AS count FROM events WHERE event_type = 'SessionForked'").get()?.count, 2n);
   });
 
+  it("keeps an exact direct-fork replay stale after the parent owner generation rotates", () => {
+    const item = fixture();
+    const command = forkCommand(item, 1_100, true);
+    const preparedFork = rootPrepared(
+      item,
+      command,
+      command.parentSessionId,
+      signedGrant(item, { grantId: lifecycleUuid(3_100) }),
+    );
+    const forked = success(item.workflow.execute(item.primary, preparedFork));
+    assert.equal(forked.authorityMaterial.status, "current");
+    assert.ok(forked.authorityMaterial.descriptor !== null);
+
+    const generationOne = item.leases.current(
+      item.connection,
+      PROJECT_ID,
+      item.root.publicResult.sessionId,
+    );
+    assert.ok(generationOne !== null);
+    item.clock.now = generationOne.expiresAtMs;
+    const rotatedContext = context("primary-rotated");
+    const rotated = item.processor.resumeRoot(
+      rotatedContext,
+      preparedResume(item, rotatedContext, resumeCommand(item, 1_101)),
+    );
+    assert.equal(rotated.kind, "success");
+    if (rotated.kind !== "success") assert.fail("expected owner generation rotation");
+    assert.equal(rotated.publicResult.ownerGeneration, "2");
+    assert.equal(childAggregate(item, forked.publicResult.childSessionId).aggregate.kind, "child");
+
+    const replay = success(item.workflow.execute(item.primary, preparedFork));
+    assert.deepEqual(replay.publicResult, forked.publicResult);
+    assert.equal(replay.authorityMaterial.status, "stale");
+    assert.equal(replay.authorityMaterial.descriptor, null);
+  });
+
   it("rejects expired, wrong-project, wrong-binding, and model-supplied grants", () => {
     const cases: readonly Partial<ChildBindingGrantV1>[] = [
       { expiresAt: NOW },
@@ -1135,6 +1255,11 @@ describe("scoped child lifecycle", () => {
     let root = item.authority.get(item.connection, PROJECT_ID, item.root.publicResult.sessionId)!;
     assert.equal(root.checkpointRequiredReason, "accepted-child-report");
     assert.ok(root.checkpointRequiredEventPosition !== null);
+    const acceptedIntegrity = new EventIntegrityService(
+      item.connection,
+      PROJECT_STORE_MIGRATIONS,
+      [new LifecycleIntegrityService(item.connection)],
+    ).fullCheck(item.primary);
     assert.throws(
       () => decide(5_011, disposition(accepted.reportId!, accepted.reportItemIds!, "accepted")),
       (error) => errorCode(error) === "CHILD_DISPOSITION_INVALID",
@@ -1144,6 +1269,19 @@ describe("scoped child lifecycle", () => {
     decide(5_004, disposition(partial.reportId!, partial.reportItemIds!, "partially-accepted"));
     root = item.authority.get(item.connection, PROJECT_ID, item.root.publicResult.sessionId)!;
     assert.equal(root.checkpointRequiredReason, "accepted-child-report");
+    const partialIntegrity = new EventIntegrityService(
+      item.connection,
+      PROJECT_STORE_MIGRATIONS,
+      [new LifecycleIntegrityService(item.connection)],
+    ).fullCheck(item.primary);
+    assert.deepEqual(
+      {
+        accepted: acceptedIntegrity.issues.some((issue) => issue.code === "SESSION_AUTHORITY_FOLD_MISMATCH"),
+        partial: partialIntegrity.issues.some((issue) => issue.code === "SESSION_AUTHORITY_FOLD_MISMATCH"),
+      },
+      { accepted: false, partial: false },
+      JSON.stringify({ accepted: acceptedIntegrity.issues, partial: partialIntegrity.issues }),
+    );
 
     const rejected = record(5_005);
     const proposal: ProposeChildCompletionCommandV2 = {
@@ -1594,6 +1732,97 @@ describe("scoped child lifecycle", () => {
     assert.throws(
       () => item.workflow.execute(item.primary, scenario.preparedClaim),
       (error) => errorCode(error) === "INTEGRITY_FAILURE",
+    );
+  });
+
+  it("detects every immutable transfer-ticket source field tampered behind canonical JSON", () => {
+    const item = fixture();
+    const scenario = claimScenario(item, 9_800);
+    const ticketId = scenario.suspended.publicResult.transferTicketId!;
+    const original = item.connection.prepare(`
+      SELECT *
+      FROM child_transfer_tickets
+      WHERE project_id = $projectId AND transfer_ticket_id = $transferTicketId
+    `).get({ $projectId: PROJECT_ID, $transferTicketId: ticketId });
+    assert.ok(original !== undefined);
+    const assignment = JSON.parse(original.source_assignment_json as string) as Record<string, JsonValue>;
+    const scope = JSON.parse(original.source_scope_json as string) as Record<string, JsonValue>;
+    const sourceState = JSON.parse(original.source_state_json as string) as Record<string, JsonValue>;
+    const lineage = JSON.parse(original.lineage_json as string) as Record<string, JsonValue>;
+    const annotations = JSON.parse(original.follow_ups_json as string) as [Record<string, JsonValue>];
+    const annotation = annotations[0]!;
+    const tampers = [
+      ["assignment", "source_assignment_json", canonicalJson({ ...assignment, summary: "tampered summary" })],
+      ["scope", "source_scope_json", canonicalJson({ ...scope, scope: "scope/tampered" })],
+      ["sourceState", "source_state_json", canonicalJson({ ...sourceState, dirtyWorktreeFingerprint: "f".repeat(64) })],
+      ["lineage", "lineage_json", canonicalJson({ ...lineage, correlationId: lifecycleUuid(9_899) })],
+      ["blockers", "follow_ups_json", canonicalJson([{ ...annotation, blockers: ["tampered blocker"] }])],
+      ["followUps", "follow_ups_json", canonicalJson([{ ...annotation, followUps: ["tampered follow-up"] }])],
+      ["createdAt", "created_at", "2026-07-18T00:00:01.000Z"],
+    ] as const;
+    const integrity = new EventIntegrityService(
+      item.connection,
+      PROJECT_STORE_MIGRATIONS,
+      [new LifecycleIntegrityService(item.connection)],
+    );
+    const baseline = integrity.fullCheck(item.primary);
+    assert.equal(
+      baseline.issues.some((issue) => issue.code === "LIFECYCLE_WORKFLOW_INVARIANT_MISMATCH"),
+      false,
+      JSON.stringify(baseline.issues),
+    );
+    const replaceTicket = (column: string, value: unknown) => {
+      const row = { ...original, [column]: value };
+      item.connection.prepare(`
+        DELETE FROM child_transfer_tickets
+        WHERE project_id = $projectId AND transfer_ticket_id = $transferTicketId
+      `).run({ $projectId: PROJECT_ID, $transferTicketId: ticketId });
+      item.connection.prepare(`
+        INSERT INTO child_transfer_tickets(
+          project_id, transfer_ticket_id, source_parent_session_id, source_child_session_id,
+          source_assignment_json, source_scope_json, checkpoint_id, follow_ups_json,
+          source_state_json, lineage_json, created_event_position, created_at,
+          claimed_by_root_session_id, claimed_child_session_id, claimed_event_position, claimed_at
+        ) VALUES (
+          $projectId, $transferTicketId, $sourceParentSessionId, $sourceChildSessionId,
+          $sourceAssignmentJson, $sourceScopeJson, $checkpointId, $followUpsJson,
+          $sourceStateJson, $lineageJson, $createdEventPosition, $createdAt,
+          $claimedByRootSessionId, $claimedChildSessionId, $claimedEventPosition, $claimedAt
+        )
+      `).run({
+        $projectId: row.project_id,
+        $transferTicketId: row.transfer_ticket_id,
+        $sourceParentSessionId: row.source_parent_session_id,
+        $sourceChildSessionId: row.source_child_session_id,
+        $sourceAssignmentJson: row.source_assignment_json,
+        $sourceScopeJson: row.source_scope_json,
+        $checkpointId: row.checkpoint_id,
+        $followUpsJson: row.follow_ups_json,
+        $sourceStateJson: row.source_state_json,
+        $lineageJson: row.lineage_json,
+        $createdEventPosition: row.created_event_position,
+        $createdAt: row.created_at,
+        $claimedByRootSessionId: row.claimed_by_root_session_id,
+        $claimedChildSessionId: row.claimed_child_session_id,
+        $claimedEventPosition: row.claimed_event_position,
+        $claimedAt: row.claimed_at,
+      } as SqliteParams);
+    };
+    const undetected: string[] = [];
+    for (const [label, column, value] of tampers) {
+      replaceTicket(column, value);
+      const report = integrity.fullCheck(item.primary);
+      if (!report.issues.some((issue) => issue.code === "LIFECYCLE_WORKFLOW_INVARIANT_MISMATCH")) {
+        undetected.push(label);
+      }
+      replaceTicket(column, original[column]);
+    }
+    assert.deepEqual(undetected, []);
+    const restored = integrity.fullCheck(item.primary);
+    assert.equal(
+      restored.issues.some((issue) => issue.code === "LIFECYCLE_WORKFLOW_INVARIANT_MISMATCH"),
+      false,
+      JSON.stringify(restored.issues),
     );
   });
 

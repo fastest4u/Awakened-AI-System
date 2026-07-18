@@ -131,6 +131,18 @@ interface CheckpointRequirementFold {
   readonly eventPosition: string;
 }
 
+type CheckpointRequirementTransition =
+  | {
+      readonly kind: "clear";
+      readonly eventPosition: string;
+      readonly baseEventPosition: string;
+    }
+  | {
+      readonly kind: "require";
+      readonly eventPosition: string;
+      readonly reason: string;
+    };
+
 interface RevocationFold {
   readonly reason: string;
   readonly eventPosition: string;
@@ -438,7 +450,7 @@ export class LifecycleIntegrityService implements IntegrityExtension {
       : latestCheckpointEvent === undefined
         ? null
         : canonicalHash(latestCheckpointEvent.payload.checkpoint);
-    const checkpointRequirement = this.checkpointRequirement(events);
+    const checkpointRequirement = this.checkpointRequirement(row, events);
     const revocation = this.revocation(events);
     const terminalEvent = aggregate.terminalEventPosition === null
       ? undefined
@@ -470,38 +482,81 @@ export class LifecycleIntegrityService implements IntegrityExtension {
   }
 
   private checkpointRequirement(
+    authority: SqliteRow,
     events: readonly LifecycleEventV1[],
   ): CheckpointRequirementFold | null {
-    let requirement: CheckpointRequirementFold | null = null;
+    const transitions: CheckpointRequirementTransition[] = [];
+    const requireCheckpoint = (reason: string, eventPosition: string): void => {
+      transitions.push({ kind: "require", reason, eventPosition });
+    };
     for (const event of events) {
       switch (event.eventType) {
         case "SessionCheckpointRecorded":
-          if (
-            requirement !== null
-            && BigInt(event.payload.baseEventPosition) >= BigInt(requirement.eventPosition)
-          ) requirement = null;
+          transitions.push({
+            kind: "clear",
+            eventPosition: event.globalPosition,
+            baseEventPosition: event.payload.baseEventPosition,
+          });
           break;
         case "SessionOwnerTransferred":
-          requirement = { reason: "ownership-transfer", eventPosition: event.globalPosition };
+          requireCheckpoint("ownership-transfer", event.globalPosition);
           break;
         case "SessionOwnershipRecovered":
-          requirement = { reason: "ownership-recovery", eventPosition: event.globalPosition };
+          requireCheckpoint("ownership-recovery", event.globalPosition);
           break;
         case "SessionSuspendRequested":
         case "SessionSuspended":
-          requirement = { reason: "suspension", eventPosition: event.globalPosition };
+          requireCheckpoint("suspension", event.globalPosition);
           break;
         case "ChildWorkTransferClaimed":
-          requirement = { reason: "carry-forward-claim", eventPosition: event.globalPosition };
+          requireCheckpoint("carry-forward-claim", event.globalPosition);
           break;
         case "SessionEndAmended":
-          requirement = { reason: "end-amendment", eventPosition: event.globalPosition };
+          requireCheckpoint("end-amendment", event.globalPosition);
           break;
         case "SessionEndCancelled":
-          requirement = { reason: "end-cancellation", eventPosition: event.globalPosition };
+          requireCheckpoint("end-cancellation", event.globalPosition);
           break;
         default:
           break;
+      }
+    }
+    if (authority.session_kind === "root") {
+      const children = this.connection.prepare(`
+        SELECT *
+        FROM session_authority
+        WHERE project_id = $projectId
+          AND session_kind = 'child'
+          AND parent_session_id = $parentSessionId
+        ORDER BY session_id
+      `).all({
+        $projectId: authority.project_id,
+        $parentSessionId: authority.session_id,
+      });
+      for (const child of children) {
+        for (const event of this.lifecycleEvents(child)) {
+          if (event.eventType === "ChildWorkDispositioned"
+            && (event.payload.disposition.kind === "accepted"
+              || event.payload.disposition.kind === "partially-accepted")) {
+            requireCheckpoint("accepted-child-report", event.globalPosition);
+          }
+        }
+      }
+    }
+    transitions.sort((left, right) => (
+      BigInt(left.eventPosition) < BigInt(right.eventPosition) ? -1
+        : BigInt(left.eventPosition) > BigInt(right.eventPosition) ? 1 : 0
+    ));
+    let requirement: CheckpointRequirementFold | null = null;
+    for (const transition of transitions) {
+      if (transition.kind === "require") {
+        requirement = {
+          reason: transition.reason,
+          eventPosition: transition.eventPosition,
+        };
+      } else if (requirement !== null
+        && BigInt(transition.baseEventPosition) >= BigInt(requirement.eventPosition)) {
+        requirement = null;
       }
     }
     return requirement;
@@ -758,13 +813,17 @@ export class LifecycleIntegrityService implements IntegrityExtension {
     }
     const transfers = this.connection.prepare(`
       SELECT ticket.*,
+             created.project_id AS created_event_project_id,
              created.event_type AS created_event_type,
              created.session_id AS created_event_session_id,
              created.parent_session_id AS created_event_parent_session_id,
+             created.occurred_at AS created_event_occurred_at,
              created.payload_json AS created_event_payload_json,
+             claimed.project_id AS claimed_event_project_id,
              claimed.event_type AS claimed_event_type,
              claimed.session_id AS claimed_event_session_id,
              claimed.parent_session_id AS claimed_event_parent_session_id,
+             claimed.occurred_at AS claimed_event_occurred_at,
              claimed.payload_json AS claimed_event_payload_json
       FROM child_transfer_tickets AS ticket
       LEFT JOIN events AS created ON created.global_position = ticket.created_event_position
@@ -787,16 +846,20 @@ export class LifecycleIntegrityService implements IntegrityExtension {
           : null;
       } catch { claimedPayload = null; }
       return (claimed.some(present) && !claimed.every(present))
+        || row.created_event_project_id !== row.project_id
         || row.created_event_type !== "ChildWorkTransferCreated"
         || row.created_event_session_id !== row.source_child_session_id
         || row.created_event_parent_session_id !== row.source_parent_session_id
+        || row.created_event_occurred_at !== row.created_at
         || !record(createdPayload)
         || createdPayload.transferTicketId !== row.transfer_ticket_id
         || createdPayload.checkpointId !== row.checkpoint_id
         || (claimed.every(present) && (
-          row.claimed_event_type !== "ChildWorkTransferClaimed"
+          row.claimed_event_project_id !== row.project_id
+          || row.claimed_event_type !== "ChildWorkTransferClaimed"
           || row.claimed_event_session_id !== row.claimed_child_session_id
           || row.claimed_event_parent_session_id !== row.claimed_by_root_session_id
+          || row.claimed_event_occurred_at !== row.claimed_at
           || !record(claimedPayload)
           || claimedPayload.transferTicketId !== row.transfer_ticket_id
           || claimedPayload.previousChildSessionId !== row.source_child_session_id
@@ -806,7 +869,8 @@ export class LifecycleIntegrityService implements IntegrityExtension {
         || !canonicalJsonText(row.source_scope_json)
         || !canonicalJsonText(row.follow_ups_json)
         || !canonicalJsonText(row.source_state_json)
-        || !canonicalJsonText(row.lineage_json);
+        || !canonicalJsonText(row.lineage_json)
+        || !this.transferMatchesSourceTruth(row);
     })) {
       issue(sink, "LIFECYCLE_WORKFLOW_INVARIANT_MISMATCH");
     }
@@ -865,6 +929,87 @@ export class LifecycleIntegrityService implements IntegrityExtension {
         || row.parent_session_id !== row.claimed_by_root_session_id;
     })) {
       issue(sink, "LIFECYCLE_WORKFLOW_INVARIANT_MISMATCH");
+    }
+  }
+
+  private transferMatchesSourceTruth(ticket: SqliteRow): boolean {
+    try {
+      if (!nonEmpty(ticket.project_id)
+        || !nonEmpty(ticket.source_child_session_id)
+        || !nonEmpty(ticket.source_parent_session_id)
+        || !nonEmpty(ticket.transfer_ticket_id)
+        || !nonEmpty(ticket.checkpoint_id)) return false;
+      const createdEventPosition = decimal(ticket.created_event_position);
+      if (createdEventPosition === null) return false;
+      const source = this.connection.prepare(`
+        SELECT *
+        FROM session_authority
+        WHERE project_id = $projectId AND session_id = $sessionId
+      `).get({
+        $projectId: ticket.project_id as string,
+        $sessionId: ticket.source_child_session_id as string,
+      });
+      if (source === undefined
+        || source.session_kind !== "child"
+        || source.parent_session_id !== ticket.source_parent_session_id
+        || source.semantic_state !== "transferred"
+        || decimal(source.terminal_event_position) !== createdEventPosition) return false;
+      const events = this.lifecycleEvents(source);
+      const aggregate = foldSession(events);
+      if (aggregate.kind !== "child"
+        || aggregate.state !== "transferred"
+        || aggregate.parentSessionId !== ticket.source_parent_session_id
+        || aggregate.sessionId !== ticket.source_child_session_id
+        || aggregate.terminalEventPosition?.toString() !== createdEventPosition
+        || aggregate.latestCheckpointId !== ticket.checkpoint_id
+        || aggregate.suspensionCheckpointId !== ticket.checkpoint_id) return false;
+      const transferIndex = events.findIndex((event) => (
+        event.eventType === "ChildWorkTransferCreated"
+        && event.globalPosition === createdEventPosition
+        && event.payload.transferTicketId === ticket.transfer_ticket_id
+      ));
+      const transferEvent = events[transferIndex];
+      const suspensionEvent = events[transferIndex - 1];
+      const checkpointEvent = [...events].reverse().find((event) => (
+        event.eventType === "SessionCheckpointRecorded"
+      ));
+      if (transferEvent === undefined || transferEvent.eventType !== "ChildWorkTransferCreated"
+        || suspensionEvent === undefined || suspensionEvent.eventType !== "ChildSessionSuspended"
+        || checkpointEvent === undefined || checkpointEvent.eventType !== "SessionCheckpointRecorded"
+        || transferEvent.payload.checkpointId !== ticket.checkpoint_id
+        || suspensionEvent.payload.checkpointId !== ticket.checkpoint_id
+        || checkpointEvent.payload.checkpoint.checkpointId !== ticket.checkpoint_id
+        || transferEvent.occurredAt !== ticket.created_at) return false;
+      const expectedAssignment = canonicalJson({
+        assignmentId: aggregate.assignment.assignmentId,
+        summary: aggregate.assignment.summary,
+        scope: aggregate.assignment.scope,
+        assignmentRevision: aggregate.assignmentRevision,
+      });
+      const expectedScope = canonicalJson({ scope: aggregate.assignment.scope });
+      const expectedSourceState = canonicalJson(checkpointEvent.payload.checkpoint.sourceState);
+      const expectedLineage = canonicalJson({
+        previousParentSessionId: source.parent_session_id,
+        previousChildSessionId: source.session_id,
+        correlationId: aggregate.correlationId,
+        transferEventPosition: createdEventPosition,
+      });
+      const expectedAnnotations = canonicalJson([{
+        childTransferAnnotationsVersion: 1,
+        blockers: [...suspensionEvent.payload.blockers],
+        followUps: [...suspensionEvent.payload.followUps],
+      }]);
+      const expectedLegacyFollowUps = suspensionEvent.payload.blockers.length === 0
+        ? canonicalJson([...suspensionEvent.payload.followUps])
+        : null;
+      return ticket.source_assignment_json === expectedAssignment
+        && ticket.source_scope_json === expectedScope
+        && ticket.source_state_json === expectedSourceState
+        && ticket.lineage_json === expectedLineage
+        && (ticket.follow_ups_json === expectedAnnotations
+          || ticket.follow_ups_json === expectedLegacyFollowUps);
+    } catch {
+      return false;
     }
   }
 
