@@ -75,6 +75,7 @@ import type {
   SqliteRow,
   SqliteStatement,
 } from "../src/orchestrator/storage/sqlite-driver.js";
+import { applyCurrentProjectStoreSchema } from "./support/current-project-store-schema.js";
 
 const NOW = "2026-07-13T02:00:00.000Z";
 const PROJECT_ID = "11111111-1111-4111-8111-111111111111" as ProjectId;
@@ -181,30 +182,38 @@ function createFixture(options: {
   });
   connections.push(connection);
   const migrations = options.migrations ?? [eventCoreMigration];
-  new MigrationRunner().apply(
-    connection,
-    migrations,
-    NOW,
-    { kind: "bootstrap-empty" },
-  );
-  connection.exec("BEGIN IMMEDIATE");
-  connection.prepare(`
-    INSERT INTO project_meta(
-      singleton, project_id, vault_id, store_id, schema_version, created_at
-    ) VALUES (1, $projectId, $vaultId, $storeId, $schemaVersion, $createdAt)
-  `).run({
-    $projectId: PROJECT_ID,
-    $vaultId: VAULT_ID,
-    $storeId: STORE_ID,
-    $schemaVersion: migrations.at(-1)?.version ?? 0,
-    $createdAt: NOW,
-  });
-  connection.exec(`
-    INSERT INTO maintenance_state(
-      singleton, epoch, mode, owner_id, fencing_token, lease_expires_at, requested_at
-    ) VALUES (1, 0, 'idle', NULL, 0, NULL, NULL)
-  `);
-  connection.exec("COMMIT");
+  if (migrations.length === PROJECT_STORE_MIGRATIONS.length) {
+    applyCurrentProjectStoreSchema(connection, {
+      projectId: PROJECT_ID,
+      vaultId: VAULT_ID,
+      storeId: STORE_ID,
+    }, NOW);
+  } else {
+    new MigrationRunner().apply(
+      connection,
+      migrations,
+      NOW,
+      { kind: "bootstrap-empty", beforeMigration: () => undefined },
+    );
+    connection.exec("BEGIN IMMEDIATE");
+    connection.prepare(`
+      INSERT INTO project_meta(
+        singleton, project_id, vault_id, store_id, schema_version, created_at
+      ) VALUES (1, $projectId, $vaultId, $storeId, $schemaVersion, $createdAt)
+    `).run({
+      $projectId: PROJECT_ID,
+      $vaultId: VAULT_ID,
+      $storeId: STORE_ID,
+      $schemaVersion: migrations.at(-1)?.version ?? 0,
+      $createdAt: NOW,
+    });
+    connection.exec(`
+      INSERT INTO maintenance_state(
+        singleton, epoch, mode, owner_id, fencing_token, lease_expires_at, requested_at
+      ) VALUES (1, 0, 'idle', NULL, 0, NULL, NULL)
+    `);
+    connection.exec("COMMIT");
+  }
 
   const binding: ProjectBinding = {
     projectBindingId: "binding-integrity",

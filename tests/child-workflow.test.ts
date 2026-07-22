@@ -75,6 +75,7 @@ import {
 import { canonicalJson } from "../src/orchestrator/serialization/canonical-json.js";
 
 const NOW = "2026-07-18T00:00:00.000Z";
+const LIFECYCLE_SCHEMA_MIGRATIONS = PROJECT_STORE_MIGRATIONS.slice(0, 2);
 const NOW_MS = BigInt(Date.parse(NOW));
 const TARGET_BINDING_FINGERPRINT = "d".repeat(64);
 
@@ -494,7 +495,9 @@ function commandRuntime(options: {
 function fixture(databasePath = ":memory:", cleanupDirectory: string | null = null): Fixture {
   assert.ok(ChildWorkflowServiceClass, "ChildWorkflowService must implement scoped child behavior");
   const connection = new NativeConnection(databasePath);
-  new MigrationRunner().apply(connection, PROJECT_STORE_MIGRATIONS, NOW, { kind: "bootstrap-empty" });
+  new MigrationRunner().apply(connection, LIFECYCLE_SCHEMA_MIGRATIONS, NOW, {
+    kind: "bootstrap-empty", beforeMigration: () => undefined,
+  });
   connection.exec("BEGIN IMMEDIATE");
   connection.prepare(`
     INSERT INTO project_meta(singleton, project_id, vault_id, store_id, schema_version, created_at)
@@ -1472,7 +1475,7 @@ describe("scoped child lifecycle", () => {
     assert.ok(root.checkpointRequiredEventPosition !== null);
     const acceptedIntegrity = new EventIntegrityService(
       item.connection,
-      PROJECT_STORE_MIGRATIONS,
+      LIFECYCLE_SCHEMA_MIGRATIONS,
       [new LifecycleIntegrityService(item.connection)],
     ).fullCheck(item.primary);
     assert.throws(
@@ -1486,7 +1489,7 @@ describe("scoped child lifecycle", () => {
     assert.equal(root.checkpointRequiredReason, "accepted-child-report");
     const partialIntegrity = new EventIntegrityService(
       item.connection,
-      PROJECT_STORE_MIGRATIONS,
+      LIFECYCLE_SCHEMA_MIGRATIONS,
       [new LifecycleIntegrityService(item.connection)],
     ).fullCheck(item.primary);
     assert.deepEqual(
@@ -1624,7 +1627,7 @@ describe("scoped child lifecycle", () => {
     assert.equal(completedAuthority.revocationReasonCode, "child-completed");
     const completionIntegrity = new EventIntegrityService(
       item.connection,
-      PROJECT_STORE_MIGRATIONS,
+      LIFECYCLE_SCHEMA_MIGRATIONS,
       [new LifecycleIntegrityService(item.connection)],
     );
     const completionReport = completionIntegrity.fullCheck(item.primary);
@@ -1727,7 +1730,7 @@ describe("scoped child lifecycle", () => {
     assert.equal(reportPayloads(item, oldChildId, "ChildWorkTransferCreated").length, 1);
     const suspensionIntegrity = new EventIntegrityService(
       item.connection,
-      PROJECT_STORE_MIGRATIONS,
+      LIFECYCLE_SCHEMA_MIGRATIONS,
       [new LifecycleIntegrityService(item.connection)],
     );
     const suspensionReport = suspensionIntegrity.fullCheck(item.primary);
@@ -1823,7 +1826,7 @@ describe("scoped child lifecycle", () => {
     assert.equal(claimedTicket?.claimedChildSessionId, claimed.publicResult.childSessionId);
     const claimIntegrity = new EventIntegrityService(
       item.connection,
-      PROJECT_STORE_MIGRATIONS,
+      LIFECYCLE_SCHEMA_MIGRATIONS,
       [new LifecycleIntegrityService(item.connection)],
     ).fullCheck(item.primary);
     assert.equal(
@@ -1972,7 +1975,7 @@ describe("scoped child lifecycle", () => {
     const scenario = claimScenario(item, 9_500);
     const integrity = new EventIntegrityService(
       item.connection,
-      PROJECT_STORE_MIGRATIONS,
+      LIFECYCLE_SCHEMA_MIGRATIONS,
       [new LifecycleIntegrityService(item.connection)],
     );
     const baselineReport = integrity.fullCheck(item.primary);
@@ -2059,7 +2062,7 @@ describe("scoped child lifecycle", () => {
     ] as const;
     const integrity = new EventIntegrityService(
       item.connection,
-      PROJECT_STORE_MIGRATIONS,
+      LIFECYCLE_SCHEMA_MIGRATIONS,
       [new LifecycleIntegrityService(item.connection)],
     );
     const baseline = integrity.fullCheck(item.primary);

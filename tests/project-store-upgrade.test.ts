@@ -67,6 +67,7 @@ import { eventCoreMigration } from "../src/orchestrator/storage/migrations/0001-
 import { PROJECT_STORE_MIGRATIONS } from "../src/orchestrator/storage/migrations/registry.js";
 import { NodeSqliteDriver } from "../src/orchestrator/storage/node-sqlite-driver.js";
 import { inspectStoreSchema } from "../src/orchestrator/storage/schema-compatibility.js";
+import { SqliteQualifiedCheckpointMigrationPreflight } from "../src/orchestrator/storage/qualified-checkpoint-migration-preflight.js";
 import type {
   SqliteConnection,
   SqliteDriver,
@@ -164,7 +165,7 @@ function createV1Store(): Fixture {
     connection,
     [eventCoreMigration],
     NOW,
-    { kind: "bootstrap-empty" },
+    { kind: "bootstrap-empty", beforeMigration: () => undefined },
   );
   transaction(connection, () => {
     connection.prepare(`
@@ -920,8 +921,8 @@ describe("explicit project-store upgrade", () => {
 
     assert.equal(plan.status, "upgrade-required");
     assert.equal(plan.appliedVersion, 1);
-    assert.equal(plan.targetVersion, 2);
-    assert.deepEqual(plan.pending.map(({ version }) => version), [2]);
+    assert.equal(plan.targetVersion, 3);
+    assert.deepEqual(plan.pending.map(({ version }) => version), [2, 3]);
     assert.deepEqual(readFileSync(fixture.path), before);
     const renamed = `${fixture.path}.renamed`;
     renameSync(fixture.path, renamed);
@@ -945,7 +946,7 @@ describe("explicit project-store upgrade", () => {
     const result = await service.apply(fixture.context);
 
     assert.equal(dryRun.status, "upgrade-required");
-    assert.deepEqual(result.appliedVersions, [2]);
+    assert.deepEqual(result.appliedVersions, [2, 3]);
     assert.equal(result.resumedPostCommit, false);
     assert.equal(result.integrity.ok, true);
     const connection = openExisting(fixture);
@@ -953,8 +954,38 @@ describe("explicit project-store upgrade", () => {
     assert.deepEqual(
       connection.prepare("SELECT version FROM schema_migrations ORDER BY version").all()
         .map((row) => Number(row.version)),
-      [1, 2],
+      [1, 2, 3],
     );
+  });
+
+  it("uses both concrete defaults and calls an explicit two-argument preflight override once", async () => {
+    const zeroArgumentFixture = createV1Store();
+    const zeroArgumentResult = await new ProjectStoreUpgradeService().apply(
+      zeroArgumentFixture.context,
+    );
+    assert.deepEqual(zeroArgumentResult.appliedVersions, [2, 3]);
+
+    const oneArgumentFixture = createV1Store();
+    const oneArgumentResult = await new ProjectStoreUpgradeService({
+      sqliteDriver: driver,
+      manifestRepository: oneArgumentFixture.manifestRepository,
+    }).apply(oneArgumentFixture.context);
+    assert.deepEqual(oneArgumentResult.appliedVersions, [2, 3]);
+
+    const overrideFixture = createV1Store();
+    const concrete = new SqliteQualifiedCheckpointMigrationPreflight();
+    let calls = 0;
+    const overrideResult = await new ProjectStoreUpgradeService({
+      sqliteDriver: driver,
+      manifestRepository: overrideFixture.manifestRepository,
+    }, {
+      assertEligibleAndStage(connection, projectContext): void {
+        calls += 1;
+        concrete.assertEligibleAndStage(connection, projectContext);
+      },
+    }).apply(overrideFixture.context);
+    assert.deepEqual(overrideResult.appliedVersions, [2, 3]);
+    assert.equal(calls, 1);
   });
 
   it("keeps the nonregistered owner open through manifest publication and fence release", async () => {
@@ -1006,7 +1037,7 @@ describe("explicit project-store upgrade", () => {
 
     const result = await service.apply(fixture.context);
 
-    assert.deepEqual(result.appliedVersions, [2]);
+    assert.deepEqual(result.appliedVersions, [2, 3]);
     assert.deepEqual(observations, ["manifest", "close:idle"]);
     const verification = openExisting(fixture);
     assert.equal(
@@ -1072,7 +1103,7 @@ describe("explicit project-store upgrade", () => {
     const result = await service.apply(fixture.context);
 
     assert.equal(observedCommittedFence, true);
-    assert.deepEqual(result.appliedVersions, [2]);
+    assert.deepEqual(result.appliedVersions, [2, 3]);
     assert.equal(setup.prepare(`
       SELECT closed_at FROM executor_leases
       WHERE project_id = $projectId AND executor_id = $executorId
@@ -1132,7 +1163,7 @@ describe("explicit project-store upgrade", () => {
 
     const result = await service.apply(fixture.context);
 
-    assert.deepEqual(result.appliedVersions, [2]);
+    assert.deepEqual(result.appliedVersions, [2, 3]);
     assert.deepEqual(observations, [
       "after-commit-before-full-integrity",
       "after-full-integrity-before-manifest-record",
@@ -1659,7 +1690,7 @@ describe("explicit project-store upgrade", () => {
 
     const result = await service.apply(fixture.context);
 
-    assert.deepEqual(result.appliedVersions, [2]);
+    assert.deepEqual(result.appliedVersions, [2, 3]);
     assert.ok(fence.renewals.length >= 9);
     assert.equal(fence.readinessLeases.length, fence.renewals.length);
     for (let index = 0; index < fence.renewals.length; index += 1) {
@@ -2098,19 +2129,19 @@ describe("explicit project-store upgrade", () => {
       [left.appliedVersions, right.appliedVersions]
         .map((versions) => [...versions])
         .sort((a, b) => b.length - a.length),
-      [[2], []],
+      [[2, 3], []],
     );
     const connection = openExisting(fixture);
     assert.deepEqual(
       connection.prepare("SELECT version FROM schema_migrations ORDER BY version").all()
         .map((row) => Number(row.version)),
-      [1, 2],
+      [1, 2, 3],
     );
   });
 
   for (const boundary of [
     "after-fence-before-prefix-integrity",
-    "after-0002-ddl-before-migration-row",
+    "after-target-ddl-before-migration-row",
     "after-migration-row-before-project-version",
     "after-project-version-before-commit",
     "after-commit-before-full-integrity",
@@ -2138,10 +2169,10 @@ describe("explicit project-store upgrade", () => {
       const afterFault = openExisting(fixture);
       const inspection = inspectStoreSchema(afterFault, PROJECT_STORE_MIGRATIONS);
       const preCommit = boundary === "after-fence-before-prefix-integrity"
-        || boundary === "after-0002-ddl-before-migration-row"
+        || boundary === "after-target-ddl-before-migration-row"
         || boundary === "after-migration-row-before-project-version"
         || boundary === "after-project-version-before-commit";
-      assert.equal(inspection.appliedVersion, preCommit ? 1 : 2);
+      assert.equal(inspection.appliedVersion, preCommit ? 1 : 3);
       afterFault.close();
       connections.splice(connections.indexOf(afterFault), 1);
 
@@ -2154,7 +2185,7 @@ describe("explicit project-store upgrade", () => {
         manifestRepository: fixture.manifestRepository,
       }).apply(fixture.context);
 
-      assert.deepEqual(recovered.appliedVersions, preCommit ? [2] : []);
+      assert.deepEqual(recovered.appliedVersions, preCommit ? [2, 3] : []);
       assert.equal(recovered.resumedPostCommit, !preCommit);
       assert.equal(recovered.integrity.ok, true);
       const renamed = `${fixture.path}.closed`;
@@ -2165,7 +2196,7 @@ describe("explicit project-store upgrade", () => {
 
   for (const boundary of [
     "after-fence-before-prefix-integrity",
-    "after-0002-ddl-before-migration-row",
+    "after-target-ddl-before-migration-row",
     "after-migration-row-before-project-version",
     "after-project-version-before-commit",
     "after-commit-before-full-integrity",
@@ -2183,7 +2214,7 @@ describe("explicit project-store upgrade", () => {
         manifestRepository: fixture.manifestRepository,
         faultInjector: {
           hit(observed) {
-            if (observed === boundary) clock = "2026-07-14T00:10:00.000Z";
+            if (observed === boundary) clock = "2026-07-15T00:00:00.000Z";
           },
         },
       });
@@ -2197,10 +2228,10 @@ describe("explicit project-store upgrade", () => {
       const afterExpiry = openExisting(fixture);
       const inspection = inspectStoreSchema(afterExpiry, PROJECT_STORE_MIGRATIONS);
       const preCommit = boundary === "after-fence-before-prefix-integrity"
-        || boundary === "after-0002-ddl-before-migration-row"
+        || boundary === "after-target-ddl-before-migration-row"
         || boundary === "after-migration-row-before-project-version"
         || boundary === "after-project-version-before-commit";
-      assert.equal(inspection.appliedVersion, preCommit ? 1 : 2);
+      assert.equal(inspection.appliedVersion, preCommit ? 1 : 3);
       afterExpiry.close();
       connections.splice(connections.indexOf(afterExpiry), 1);
 
@@ -2212,7 +2243,7 @@ describe("explicit project-store upgrade", () => {
         trustedTtlMs: 60_000,
         manifestRepository: fixture.manifestRepository,
       }).apply(fixture.context);
-      assert.deepEqual(recovered.appliedVersions, preCommit ? [2] : []);
+      assert.deepEqual(recovered.appliedVersions, preCommit ? [2, 3] : []);
       assert.equal(recovered.integrity.ok, true);
     });
   }
@@ -2345,7 +2376,7 @@ describe("explicit project-store upgrade", () => {
       const plan = await executor.inspect();
       const result = await executor.apply();
       assert.equal(plan.status, "upgrade-required");
-      assert.deepEqual(result.appliedVersions, [2]);
+      assert.deepEqual(result.appliedVersions, [2, 3]);
       assert.equal(result.integrity.ok, true);
     } finally {
       await executor.close();
@@ -2391,7 +2422,7 @@ describe("explicit project-store upgrade", () => {
     assert.equal(applied.code, 0, applied.stderr);
     const output = JSON.parse(applied.stdout) as { action: string; result: UpgradeResult };
     assert.equal(output.action, "upgraded");
-    assert.deepEqual(output.result.appliedVersions, [2]);
+    assert.deepEqual(output.result.appliedVersions, [2, 3]);
     const renamed = `${fixture.path}.cli-closed`;
     renameSync(fixture.path, renamed);
     renameSync(renamed, fixture.path);

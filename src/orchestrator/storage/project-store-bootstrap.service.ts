@@ -10,6 +10,7 @@ import {
 import { dirname, join } from "node:path";
 import type {
   ProjectDescriptorV1,
+  ProjectContext,
   ProjectStoreRoute,
   StoreId,
 } from "../identity/contracts.js";
@@ -51,6 +52,10 @@ import {
   SchemaCompatibilityError,
 } from "./schema-compatibility.js";
 import type { SqliteConnection, SqliteDriver } from "./sqlite-driver.js";
+import {
+  SqliteQualifiedCheckpointMigrationPreflight,
+  type QualifiedCheckpointMigrationPreflight,
+} from "./qualified-checkpoint-migration-preflight.js";
 
 type DatabaseSyncConstructor = typeof import("node:sqlite").DatabaseSync;
 type NodeSqliteModule = Pick<typeof import("node:sqlite"), "DatabaseSync">;
@@ -354,29 +359,21 @@ function insertBootstrapIdentity(
   storeId: StoreId,
   createdAt: string,
 ): void {
-  connection.exec("BEGIN IMMEDIATE");
-  try {
-    connection.prepare(`
-      INSERT INTO project_meta(
-        singleton, project_id, vault_id, store_id, schema_version, created_at
-      ) VALUES (1, $projectId, $vaultId, $storeId, $schemaVersion, $createdAt)
-    `).run({
-      $projectId: descriptor.projectId,
-      $vaultId: descriptor.vaultId,
-      $storeId: storeId,
-      $schemaVersion: CURRENT_PROJECT_STORE_SCHEMA_VERSION,
-      $createdAt: createdAt,
-    });
-    connection.exec(`
-      INSERT INTO maintenance_state(
-        singleton, epoch, mode, owner_id, fencing_token, lease_expires_at, requested_at
-      ) VALUES (1, 0, 'idle', NULL, 0, NULL, NULL)
-    `);
-    connection.exec("COMMIT");
-  } catch (error) {
-    try { connection.exec("ROLLBACK"); } catch { /* preserve original */ }
-    throw error;
-  }
+  connection.prepare(`
+    INSERT INTO project_meta(
+      singleton, project_id, vault_id, store_id, schema_version, created_at
+    ) VALUES (1, $projectId, $vaultId, $storeId, 2, $createdAt)
+  `).run({
+    $projectId: descriptor.projectId,
+    $vaultId: descriptor.vaultId,
+    $storeId: storeId,
+    $createdAt: createdAt,
+  });
+  connection.exec(`
+    INSERT INTO maintenance_state(
+      singleton, epoch, mode, owner_id, fencing_token, lease_expires_at, requested_at
+    ) VALUES (1, 0, 'idle', NULL, 0, NULL, NULL)
+  `);
 }
 
 function manifestIdentity(
@@ -397,9 +394,11 @@ export class DefaultProjectStoreBootstrapService implements ProjectStoreBootstra
   >();
 
   readonly #dependencies: ResolvedProjectStoreBootstrapDependencies;
+  readonly #preflight: QualifiedCheckpointMigrationPreflight;
   #nodeSqlite: Promise<NodeSqliteModule> | undefined;
 
   constructor(dependencies: Partial<ProjectStoreBootstrapDependencies> = {}) {
+    this.#preflight = new SqliteQualifiedCheckpointMigrationPreflight();
     this.#dependencies = {
       descriptorRepository: dependencies.descriptorRepository
         ?? new ProjectDescriptorRepository(),
@@ -607,14 +606,30 @@ export class DefaultProjectStoreBootstrapService implements ProjectStoreBootstra
         connection,
         PROJECT_STORE_MIGRATIONS,
         this.#dependencies.now(),
-        { kind: "bootstrap-empty" },
-      );
-      this.#dependencies.faultInjector.hit("after-temp-schema-before-identity");
-      insertBootstrapIdentity(
-        connection,
-        descriptor,
-        storeId,
-        this.#dependencies.now(),
+        {
+          kind: "bootstrap-empty",
+          beforeMigration: (migrationConnection, migration) => {
+            if (migration.version !== 3) return;
+            this.#dependencies.faultInjector.hit("after-temp-schema-before-identity");
+            const createdAt = this.#dependencies.now();
+            insertBootstrapIdentity(
+              migrationConnection,
+              descriptor,
+              storeId,
+              createdAt,
+            );
+            this.#preflight.assertEligibleAndStage(
+              migrationConnection,
+              {
+                binding: {
+                  projectId: descriptor.projectId,
+                  vaultId: descriptor.vaultId,
+                  storeId,
+                },
+              } as ProjectContext,
+            );
+          },
+        },
       );
       this.#dependencies.faultInjector.hit("after-temp-complete-before-publish");
       const checkpoint = connection.prepare("PRAGMA wal_checkpoint(TRUNCATE)").get();

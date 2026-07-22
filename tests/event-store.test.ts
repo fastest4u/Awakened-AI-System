@@ -252,7 +252,7 @@ function createFixture(options: {
     connection,
     [eventCoreMigration],
     NOW,
-    { kind: "bootstrap-empty" },
+    { kind: "bootstrap-empty", beforeMigration: () => undefined },
   );
   connection.exec("BEGIN IMMEDIATE");
   connection.prepare(`

@@ -11,6 +11,7 @@ import {
 } from "../src/orchestrator/storage/migration-runner.js";
 import { eventCoreMigration } from "../src/orchestrator/storage/migrations/0001-event-core.js";
 import { sessionLifecycleMigration } from "../src/orchestrator/storage/migrations/0002-session-lifecycle.js";
+import { qualifiedCheckpointCoverageMigration } from "../src/orchestrator/storage/migrations/0003-qualified-checkpoint-coverage.js";
 import {
   CURRENT_PROJECT_STORE_SCHEMA_VERSION,
   PROJECT_STORE_MIGRATIONS,
@@ -25,6 +26,7 @@ import {
 } from "../src/orchestrator/storage/schema-fingerprint.js";
 import { NodeSqliteDriver } from "../src/orchestrator/storage/node-sqlite-driver.js";
 import type { SqliteConnection } from "../src/orchestrator/storage/sqlite-driver.js";
+import { applyCurrentProjectStoreSchema } from "./support/current-project-store-schema.js";
 
 const NOW = "2026-07-14T00:00:00.000Z";
 const PROJECT_ID = "11111111-1111-4111-8111-111111111111";
@@ -70,7 +72,7 @@ function v1Connection(): SqliteConnection {
     connection,
     [eventCoreMigration],
     NOW,
-    { kind: "bootstrap-empty" },
+    { kind: "bootstrap-empty", beforeMigration: () => undefined },
   );
   addIdentity(connection, 1);
   return connection;
@@ -78,13 +80,11 @@ function v1Connection(): SqliteConnection {
 
 function currentConnection(): SqliteConnection {
   const connection = emptyConnection();
-  new MigrationRunner().apply(
-    connection,
-    PROJECT_STORE_MIGRATIONS,
-    NOW,
-    { kind: "bootstrap-empty" },
-  );
-  addIdentity(connection, CURRENT_PROJECT_STORE_SCHEMA_VERSION);
+  applyCurrentProjectStoreSchema(connection, {
+    projectId: PROJECT_ID,
+    vaultId: VAULT_ID,
+    storeId: STORE_ID,
+  }, NOW);
   return connection;
 }
 
@@ -106,15 +106,16 @@ describe("project-store migration registry", () => {
     assert.deepEqual(PROJECT_STORE_MIGRATIONS, [
       eventCoreMigration,
       sessionLifecycleMigration,
+      qualifiedCheckpointCoverageMigration,
     ]);
-    assert.equal(CURRENT_PROJECT_STORE_SCHEMA_VERSION, 2);
+    assert.equal(CURRENT_PROJECT_STORE_SCHEMA_VERSION, 3);
     assert.equal(
       migrationChecksum(sessionLifecycleMigration),
       "85666a0bdee4455068f03a81e9d3720df172d15fce6d8e6f0cb3f5f7d0a81293",
     );
     assert.deepEqual(
       PROJECT_STORE_MIGRATIONS.map((migration) => migration.version),
-      [1, 2],
+      [1, 2, 3],
     );
     assert.equal(
       new Set(PROJECT_STORE_MIGRATIONS.map((migration) => migration.name)).size,
@@ -132,13 +133,17 @@ describe("project-store migration registry", () => {
     const inspection = inspectStoreSchema(connection);
     assert.equal(inspection.status, "upgrade-required");
     assert.equal(inspection.appliedVersion, 1);
-    assert.equal(inspection.targetVersion, 2);
+    assert.equal(inspection.targetVersion, 3);
     assert.deepEqual(
       inspection.pending.map(({ version, name, checksum }) => ({ version, name, checksum })),
       [{
         version: 2,
         name: sessionLifecycleMigration.name,
         checksum: migrationChecksum(sessionLifecycleMigration),
+      }, {
+        version: 3,
+        name: qualifiedCheckpointCoverageMigration.name,
+        checksum: migrationChecksum(qualifiedCheckpointCoverageMigration),
       }],
     );
     assert.equal(
@@ -155,8 +160,8 @@ describe("project-store migration registry", () => {
   it("reports the complete registry as current", () => {
     const inspection = inspectStoreSchema(currentConnection());
     assert.equal(inspection.status, "current");
-    assert.equal(inspection.appliedVersion, 2);
-    assert.equal(inspection.targetVersion, 2);
+    assert.equal(inspection.appliedVersion, 3);
+    assert.equal(inspection.targetVersion, 3);
     assert.deepEqual(inspection.pending, []);
     assert.equal(requireCurrentStoreSchema(inspection), inspection);
     assert.equal(
@@ -170,7 +175,7 @@ describe("project-store migration registry", () => {
     dropHistoryGuards(connection);
     connection.prepare(`
       INSERT INTO schema_migrations(version, name, checksum, applied_at)
-      VALUES (3, 'future', $checksum, $appliedAt)
+      VALUES (4, 'future', $checksum, $appliedAt)
     `).run({ $checksum: "f".repeat(64), $appliedAt: NOW });
     assert.throws(() => inspectStoreSchema(connection), /SCHEMA_TOO_NEW/);
   });
@@ -224,7 +229,7 @@ describe("project-store migration registry", () => {
       connection,
       [eventCoreMigration],
       NOW,
-      { kind: "bootstrap-empty" },
+      { kind: "bootstrap-empty", beforeMigration: () => undefined },
     );
 
     assert.throws(
@@ -240,7 +245,7 @@ describe("project-store migration registry", () => {
         connection,
         [eventCoreMigration, { ...sessionLifecycleMigration, version: 3 }],
         NOW,
-        { kind: "bootstrap-empty" },
+        { kind: "bootstrap-empty", beforeMigration: () => undefined },
       ),
       /MIGRATION_SET_INVALID/,
     );

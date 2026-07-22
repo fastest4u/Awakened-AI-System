@@ -13,6 +13,8 @@ import { eventCoreMigration } from "../src/orchestrator/storage/migrations/0001-
 import { sessionLifecycleMigration } from "../src/orchestrator/storage/migrations/0002-session-lifecycle.js";
 import { PROJECT_STORE_MIGRATIONS } from "../src/orchestrator/storage/migrations/registry.js";
 import { NodeSqliteDriver } from "../src/orchestrator/storage/node-sqlite-driver.js";
+import { SqliteQualifiedCheckpointMigrationPreflight } from "../src/orchestrator/storage/qualified-checkpoint-migration-preflight.js";
+import type { ProjectContext } from "../src/orchestrator/identity/contracts.js";
 
 const roots: string[] = [];
 const driver = new NodeSqliteDriver({ DatabaseSync });
@@ -39,7 +41,7 @@ describe("MigrationRunner", () => {
         connection,
         [eventCoreMigration],
         "2026-07-11T00:00:00.000Z",
-        { kind: "bootstrap-empty" },
+        { kind: "bootstrap-empty", beforeMigration: () => undefined },
       );
       assert.deepEqual(applied, [1]);
       connection.exec(`
@@ -59,7 +61,7 @@ describe("MigrationRunner", () => {
           connection,
           [eventCoreMigration],
           "2026-07-11T00:00:01.000Z",
-          { kind: "explicit-upgrade", expectedAppliedVersion: 1 },
+          { kind: "explicit-upgrade", expectedAppliedVersion: 1, beforeMigration: () => undefined },
         ),
         [],
       );
@@ -68,7 +70,7 @@ describe("MigrationRunner", () => {
           connection,
           [eventCoreMigration],
           "2026-07-11T00:00:01.500Z",
-          { kind: "explicit-upgrade", expectedAppliedVersion: 0 },
+          { kind: "explicit-upgrade", expectedAppliedVersion: 0, beforeMigration: () => undefined },
         ),
         /MIGRATION_EXPECTED_VERSION_MISMATCH/,
       );
@@ -86,6 +88,7 @@ describe("MigrationRunner", () => {
           sql: `${eventCoreMigration.sql}\nSELECT 1;`,
         }], "2026-07-11T00:00:02.000Z", {
           kind: "explicit-upgrade",
+          beforeMigration: () => undefined,
           expectedAppliedVersion: 1,
         }),
         /MIGRATION_CHECKSUM_MISMATCH/,
@@ -114,7 +117,7 @@ describe("MigrationRunner", () => {
             connection,
             migrations,
             "2026-07-11T00:00:00.000Z",
-            { kind: "bootstrap-empty" },
+            { kind: "bootstrap-empty", beforeMigration: () => undefined },
           ),
           /MIGRATION_SET_INVALID/,
         );
@@ -144,7 +147,9 @@ describe("MigrationRunner", () => {
           version: 1,
           name: "broken",
           sql: "CREATE TABLE partial(value TEXT) STRICT; SELECT * FROM missing_table;",
-        }], "2026-07-11T00:00:00.000Z", { kind: "bootstrap-empty" }),
+        }], "2026-07-11T00:00:00.000Z", {
+          kind: "bootstrap-empty", beforeMigration: () => undefined,
+        }),
       );
       assert.equal(
         connection.prepare("SELECT count(*) AS count FROM sqlite_schema WHERE name = $name").get({
@@ -176,7 +181,7 @@ describe("MigrationRunner", () => {
           connection,
           [eventCoreMigration],
           "2026-07-11T00:00:01.000Z",
-          { kind: "explicit-upgrade", expectedAppliedVersion: 1 },
+          { kind: "explicit-upgrade", expectedAppliedVersion: 1, beforeMigration: () => undefined },
         ),
         /SCHEMA_TOO_NEW/,
       );
@@ -195,7 +200,7 @@ describe("MigrationRunner", () => {
         connection,
         [eventCoreMigration],
         "2026-07-11T00:00:00.000Z",
-        { kind: "bootstrap-empty" },
+        { kind: "bootstrap-empty", beforeMigration: () => undefined },
       );
       const requiredTables = [
         "branch_scopes",
@@ -363,7 +368,7 @@ describe("MigrationRunner", () => {
         connection,
         [eventCoreMigration],
         "2026-07-11T00:00:00.000Z",
-        { kind: "bootstrap-empty" },
+        { kind: "bootstrap-empty", beforeMigration: () => undefined },
       );
       connection.exec(`
         INSERT INTO project_meta(
@@ -391,7 +396,7 @@ describe("MigrationRunner", () => {
         connection,
         [eventCoreMigration, injectedFailure],
         "2026-07-11T00:00:01.000Z",
-        { kind: "explicit-upgrade", expectedAppliedVersion: 1 },
+        { kind: "explicit-upgrade", expectedAppliedVersion: 1, beforeMigration: () => undefined },
       ));
       assert.deepEqual(
         connection.prepare("SELECT version FROM schema_migrations ORDER BY version")
@@ -421,11 +426,27 @@ describe("MigrationRunner", () => {
         connection,
         PROJECT_STORE_MIGRATIONS,
         "2026-07-11T00:00:02.000Z",
-        { kind: "explicit-upgrade", expectedAppliedVersion: 1 },
-      ), [2]);
+        {
+          kind: "explicit-upgrade",
+          expectedAppliedVersion: 1,
+          beforeMigration: (migrationConnection, migration) => {
+            if (migration.version !== 3) return;
+            new SqliteQualifiedCheckpointMigrationPreflight().assertEligibleAndStage(
+              migrationConnection,
+              {
+                binding: {
+                  projectId: "11111111-1111-4111-8111-111111111111",
+                  vaultId: "22222222-2222-4222-8222-222222222222",
+                  storeId: "33333333-3333-4333-8333-333333333333",
+                },
+              } as ProjectContext,
+            );
+          },
+        },
+      ), [2, 3]);
       assert.equal(
         connection.prepare("SELECT schema_version FROM project_meta").get()?.schema_version,
-        2n,
+        3n,
       );
     } finally {
       connection.close();
@@ -443,7 +464,7 @@ describe("MigrationRunner", () => {
         connection,
         [eventCoreMigration],
         "2026-07-11T00:00:00.000Z",
-        { kind: "bootstrap-empty" },
+        { kind: "bootstrap-empty", beforeMigration: () => undefined },
       );
 
       assert.throws(
@@ -451,7 +472,7 @@ describe("MigrationRunner", () => {
           connection,
           PROJECT_STORE_MIGRATIONS,
           "2026-07-11T00:00:01.000Z",
-          { kind: "explicit-upgrade", expectedAppliedVersion: 1 },
+          { kind: "explicit-upgrade", expectedAppliedVersion: 1, beforeMigration: () => undefined },
         ),
         /PROJECT_SCHEMA_VERSION_MISMATCH/,
       );

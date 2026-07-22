@@ -17,6 +17,11 @@ import { PROJECT_STORE_MIGRATIONS } from "./migrations/registry.js";
 import { NodeSqliteDriver } from "./node-sqlite-driver.js";
 import { inspectStoreSchema } from "./schema-compatibility.js";
 import type { SqliteConnection, SqliteDriver, SqliteRow } from "./sqlite-driver.js";
+import {
+  qualifiedCheckpointMigrationFailure,
+  SqliteQualifiedCheckpointMigrationPreflight,
+  type QualifiedCheckpointMigrationPreflight,
+} from "./qualified-checkpoint-migration-preflight.js";
 
 export interface ProjectStoreUpgradePlan {
   projectId: string;
@@ -36,7 +41,7 @@ export interface ProjectStoreUpgradeResult {
 
 export type ProjectStoreUpgradeFaultBoundary =
   | "after-fence-before-prefix-integrity"
-  | "after-0002-ddl-before-migration-row"
+  | "after-target-ddl-before-migration-row"
   | "after-migration-row-before-project-version"
   | "after-project-version-before-commit"
   | "after-commit-before-full-integrity"
@@ -212,6 +217,7 @@ export class ProjectStoreUpgradeService {
   readonly #driver: Promise<SqliteDriver>;
   readonly #fence: MaintenanceFence;
   readonly #migrationRunner: MigrationRunner;
+  readonly #preflight: QualifiedCheckpointMigrationPreflight;
   readonly #registry: UpgradeExecutorRegistry;
   readonly #manifestPreparer: UpgradeIntegrityManifestPreparer;
   readonly #manifestPublisher: UpgradeIntegrityManifestPublisher;
@@ -227,12 +233,27 @@ export class ProjectStoreUpgradeService {
   readonly #faults: ProjectStoreUpgradeFaultInjector;
   readonly #owners = new Map<string, ActiveOwner>();
 
-  constructor(dependencies: ProjectStoreUpgradeServiceDependencies = {}) {
+  constructor();
+  constructor(dependencies: ProjectStoreUpgradeServiceDependencies);
+  constructor(
+    dependencies: ProjectStoreUpgradeServiceDependencies,
+    preflightOverride: QualifiedCheckpointMigrationPreflight,
+  );
+  constructor(
+    dependencies: ProjectStoreUpgradeServiceDependencies = {},
+    preflightOverride?: QualifiedCheckpointMigrationPreflight,
+  ) {
+    if (
+      arguments.length >= 2
+      && (preflightOverride === null
+        || typeof preflightOverride?.assertEligibleAndStage !== "function")
+    ) fail("MIGRATION_MODE_INVALID");
     this.#driver = dependencies.sqliteDriver === undefined
       ? import("node:sqlite").then((sqlite) => new NodeSqliteDriver(sqlite))
       : Promise.resolve(dependencies.sqliteDriver);
     this.#fence = dependencies.maintenanceFence ?? new MaintenanceFence();
     this.#migrationRunner = dependencies.migrationRunner ?? new MigrationRunner();
+    this.#preflight = preflightOverride ?? new SqliteQualifiedCheckpointMigrationPreflight();
     this.#registry = dependencies.executorRegistry ?? NO_EXECUTORS;
     const phaseRunner = new ProjectStoreUpgradePhaseRunner(
       dependencies.upgradePhaseWorkerUrl === undefined
@@ -383,7 +404,6 @@ export class ProjectStoreUpgradeService {
         active.lease = this.renewReady(active);
         lockedPlan = this.inspectConnection(connection, context);
         if (lockedPlan.status === "upgrade-required") {
-          const targetVersion = PROJECT_STORE_MIGRATIONS.at(-1)?.version;
           let liveLease = active.lease;
           appliedVersions = this.#migrationRunner.apply(
             connection,
@@ -392,6 +412,11 @@ export class ProjectStoreUpgradeService {
             {
               kind: "explicit-upgrade",
               expectedAppliedVersion: lockedPlan.appliedVersion,
+              beforeMigration: (migrationConnection, migration) => {
+                if (migration.version === 3) {
+                  this.#preflight.assertEligibleAndStage(migrationConnection, context);
+                }
+              },
               renewMutableBoundary: () => {
                 liveLease = this.#fence.renewOwner(
                   connection,
@@ -403,9 +428,9 @@ export class ProjectStoreUpgradeService {
               },
               faultInjector: {
                 hit: (boundary, migration) => {
-                  if (migration.version !== targetVersion) return;
+                  if (migration.version !== 3) return;
                   if (boundary === "after-ddl-before-migration-row") {
-                    this.#faults.hit("after-0002-ddl-before-migration-row");
+                    this.#faults.hit("after-target-ddl-before-migration-row");
                   } else if (boundary === "after-migration-row-before-project-version") {
                     this.#faults.hit("after-migration-row-before-project-version");
                   } else {
@@ -484,7 +509,7 @@ export class ProjectStoreUpgradeService {
       };
     } catch (error) {
       primaryError = error;
-      throw error;
+      throw qualifiedCheckpointMigrationFailure(error) ?? error;
     } finally {
       if (this.#owners.get(ownerKey) === active) this.#owners.delete(ownerKey);
       try {

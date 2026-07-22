@@ -8,17 +8,28 @@ import {
   validateMigrationRegistry,
 } from "./schema-compatibility.js";
 import type { SqliteConnection } from "./sqlite-driver.js";
+import {
+  QUALIFIED_CHECKPOINT_STAGE_MARKER_TABLE,
+  QUALIFIED_CHECKPOINT_STAGE_ROWS_TABLE,
+  qualifiedCheckpointMigrationFailure,
+} from "./qualified-checkpoint-migration-preflight.js";
 
 export { migrationChecksum } from "./schema-compatibility.js";
 export { SchemaCompatibilityError as MigrationError } from "./schema-compatibility.js";
 export type MigrationErrorCode = SchemaCompatibilityErrorCode;
 
+export type MigrationBeforeHook = (
+  connection: SqliteConnection,
+  migration: Migration,
+) => void;
+
 export type MigrationApplyMode =
-  | { kind: "bootstrap-empty" }
+  | { readonly kind: "bootstrap-empty"; readonly beforeMigration: MigrationBeforeHook }
   | {
-      kind: "explicit-upgrade";
-      expectedAppliedVersion: number;
-      faultInjector?: {
+      readonly kind: "explicit-upgrade";
+      readonly expectedAppliedVersion: number;
+      readonly beforeMigration: MigrationBeforeHook;
+      readonly faultInjector?: {
         hit(
           boundary:
             | "after-ddl-before-migration-row"
@@ -27,7 +38,7 @@ export type MigrationApplyMode =
           migration: Migration,
         ): void;
       };
-      renewMutableBoundary?: () => void;
+      readonly renewMutableBoundary?: () => void;
     };
 
 function fail(code: SchemaCompatibilityErrorCode): never {
@@ -67,12 +78,38 @@ function identityRowCount(connection: SqliteConnection): number {
 }
 
 function validateMode(mode: MigrationApplyMode): void {
+  if (typeof mode.beforeMigration !== "function") fail("MIGRATION_MODE_INVALID");
   if (mode.kind === "bootstrap-empty") return;
   if (
     mode.kind !== "explicit-upgrade"
     || !Number.isSafeInteger(mode.expectedAppliedVersion)
     || mode.expectedAppliedVersion < 0
   ) fail("MIGRATION_MODE_INVALID");
+}
+
+function assertQualifiedCheckpointStage(connection: SqliteConnection): void {
+  try {
+    const marker = connection.prepare(`
+      SELECT source_schema_version, target_schema_version, staged_row_count, sealed
+      FROM temp.${QUALIFIED_CHECKPOINT_STAGE_MARKER_TABLE}
+      WHERE singleton = 1
+    `).all();
+    const rowCount = numeric(connection.prepare(`
+      SELECT count(*) AS count FROM temp.${QUALIFIED_CHECKPOINT_STAGE_ROWS_TABLE}
+    `).get()?.count);
+    if (
+      marker.length !== 1
+      || numeric(marker[0]?.source_schema_version) !== 2
+      || numeric(marker[0]?.target_schema_version) !== 3
+      || numeric(marker[0]?.sealed) !== 1
+      || rowCount === undefined
+      || numeric(marker[0]?.staged_row_count) !== rowCount
+    ) fail("MIGRATION_EVIDENCE_V2_PRECONDITION_FAILED");
+  } catch (error) {
+    const normalized = qualifiedCheckpointMigrationFailure(error);
+    if (normalized !== undefined) throw normalized;
+    fail("MIGRATION_EVIDENCE_V2_PRECONDITION_FAILED");
+  }
 }
 
 function rollbackPreservingOriginal(connection: SqliteConnection): void {
@@ -135,6 +172,9 @@ export class MigrationRunner {
       const applied: number[] = [];
       for (const migration of registry.slice(appliedVersion)) {
         if (mode.kind === "explicit-upgrade") mode.renewMutableBoundary?.();
+        mode.beforeMigration(connection, migration);
+        if (migration.version === 3) assertQualifiedCheckpointStage(connection);
+        if (mode.kind === "explicit-upgrade") mode.renewMutableBoundary?.();
         connection.exec(migration.sql);
         if (mode.kind === "explicit-upgrade") {
           mode.faultInjector?.hit("after-ddl-before-migration-row", migration);
@@ -176,7 +216,7 @@ export class MigrationRunner {
       return applied;
     } catch (error) {
       rollbackPreservingOriginal(connection);
-      throw error;
+      throw qualifiedCheckpointMigrationFailure(error) ?? error;
     }
   }
 }

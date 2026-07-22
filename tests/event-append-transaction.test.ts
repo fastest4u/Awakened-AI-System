@@ -48,6 +48,7 @@ const WORKSPACE_ID = "workspace-primary" as WorkspaceId;
 const LIFECYCLE_WORKSPACE_ID = "1".repeat(64) as WorkspaceId;
 const ROOT_SESSION_ID = "44444444-4444-4444-8444-444444444444";
 const NOW = "2026-07-13T01:00:00.000Z";
+const LIFECYCLE_SCHEMA_MIGRATIONS = PROJECT_STORE_MIGRATIONS.slice(0, 2);
 const roots: string[] = [];
 const connections: SqliteConnection[] = [];
 const driver = new NodeSqliteDriver({ DatabaseSync });
@@ -256,7 +257,9 @@ function fixture(): { connection: RecordingConnection; tx: EventAppendTransactio
     busyTimeoutMs: DEFAULT_BUSY_TIMEOUT_MS,
   }));
   connections.push(connection);
-  new MigrationRunner().apply(connection, [eventCoreMigration], NOW, { kind: "bootstrap-empty" });
+  new MigrationRunner().apply(connection, [eventCoreMigration], NOW, {
+    kind: "bootstrap-empty", beforeMigration: () => undefined,
+  });
   connection.exec("BEGIN IMMEDIATE");
   connection.prepare(`
     INSERT INTO project_meta(singleton, project_id, vault_id, store_id, schema_version, created_at)
@@ -298,7 +301,9 @@ function lifecycleFixture(): {
     busyTimeoutMs: DEFAULT_BUSY_TIMEOUT_MS,
   }));
   connections.push(connection);
-  new MigrationRunner().apply(connection, PROJECT_STORE_MIGRATIONS, NOW, { kind: "bootstrap-empty" });
+  new MigrationRunner().apply(connection, LIFECYCLE_SCHEMA_MIGRATIONS, NOW, {
+    kind: "bootstrap-empty", beforeMigration: () => undefined,
+  });
   connection.exec("BEGIN IMMEDIATE");
   connection.prepare(`
     INSERT INTO project_meta(singleton, project_id, vault_id, store_id, schema_version, created_at)

@@ -42,6 +42,7 @@ import {
 } from "./support/lifecycle-fixtures.js";
 
 const NOW = "2026-07-17T00:00:00.000Z";
+const LIFECYCLE_SCHEMA_MIGRATIONS = PROJECT_STORE_MIGRATIONS.slice(0, 2);
 const LATER = "2026-07-17T00:00:01.000Z";
 const HASH_A = "a".repeat(64);
 const HASH_B = "b".repeat(64);
@@ -153,9 +154,9 @@ function migratedNativeConnection(): NativeConnection {
   const connection = new NativeConnection();
   new MigrationRunner().apply(
     connection,
-    PROJECT_STORE_MIGRATIONS,
+    LIFECYCLE_SCHEMA_MIGRATIONS,
     NOW,
-    { kind: "bootstrap-empty" },
+    { kind: "bootstrap-empty", beforeMigration: () => undefined },
   );
   return connection;
 }

@@ -193,9 +193,9 @@ function currentConnection(): SqliteConnection {
   connections.push(connection);
   new MigrationRunner().apply(
     connection,
-    PROJECT_STORE_MIGRATIONS,
+    PROJECT_STORE_MIGRATIONS.slice(0, 2),
     NOW,
-    { kind: "bootstrap-empty" },
+    { kind: "bootstrap-empty", beforeMigration: () => undefined },
   );
   insert(connection, "project_meta", {
     singleton: 1,

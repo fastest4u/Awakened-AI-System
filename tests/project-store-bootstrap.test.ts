@@ -793,8 +793,8 @@ describe("DefaultProjectStoreBootstrapService", () => {
     database.exec("DROP TRIGGER schema_migrations_no_update");
     database.prepare(`
       UPDATE schema_migrations
-      SET version = 3, name = 'future', checksum = $checksum
-      WHERE version = 2
+      SET version = 4, name = 'future', checksum = $checksum
+      WHERE version = 3
     `).run({ $checksum: "f".repeat(64) });
     database.close();
 

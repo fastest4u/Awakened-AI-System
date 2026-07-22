@@ -66,6 +66,7 @@ import {
 } from "./support/lifecycle-fixtures.js";
 
 const NOW = "2026-07-17T00:00:00.000Z";
+const LIFECYCLE_SCHEMA_MIGRATIONS = PROJECT_STORE_MIGRATIONS.slice(0, 2);
 const NOW_MS = BigInt(Date.parse(NOW));
 const OWNER_LEASE_MS = 120_000n;
 
@@ -866,7 +867,9 @@ function fixture(
   options: FixtureOptions = {},
 ): Fixture {
   const connection = new NativeConnection();
-  new MigrationRunner().apply(connection, PROJECT_STORE_MIGRATIONS, NOW, { kind: "bootstrap-empty" });
+  new MigrationRunner().apply(connection, LIFECYCLE_SCHEMA_MIGRATIONS, NOW, {
+    kind: "bootstrap-empty", beforeMigration: () => undefined,
+  });
   connection.exec("BEGIN IMMEDIATE");
   connection.prepare(`
     INSERT INTO project_meta(singleton, project_id, vault_id, store_id, schema_version, created_at)
