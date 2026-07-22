@@ -1,6 +1,113 @@
 import type { Migration } from "../migration.js";
 
 const PRECONDITION = "MIGRATION_EVIDENCE_V2_PRECONDITION_FAILED";
+const SQLITE_INT64_MAX_TEXT = "9223372036854775807";
+const UUID_GLOB = "[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[1-5][0-9a-f][0-9a-f][0-9a-f]-[89ab][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]";
+
+function strictUnsignedDecimal(expression: string): string {
+  return `(
+    typeof(${expression}) = 'text'
+    AND length(${expression}) BETWEEN 1 AND 19
+    AND ${expression} NOT GLOB '*[^0-9]*'
+    AND (${expression} = '0' OR ${expression} NOT GLOB '0*')
+    AND (length(${expression}) < 19 OR ${expression} <= '${SQLITE_INT64_MAX_TEXT}')
+  )`;
+}
+
+function canonicalUuid(expression: string): string {
+  return `(
+    typeof(${expression}) = 'text'
+    AND length(${expression}) = 36
+    AND lower(${expression}) = ${expression}
+    AND ${expression} GLOB '${UUID_GLOB}'
+  )`;
+}
+
+const LEGACY_V1_PAYLOAD_KEYS = Object.freeze({
+  SessionStarted: [
+    "sessionKind", "ownerGeneration", "continuityKey", "clientNamespace",
+    "creatingAgentId", "creatingClientInstanceId", "authorityCommitment",
+  ],
+  SessionOwnerTransferred: [
+    "previousOwnerGeneration", "ownerGeneration", "authorityCommitment",
+  ],
+  SessionOwnershipRecovered: [
+    "previousOwnerGeneration", "ownerGeneration", "approvalId", "authorityCommitment",
+  ],
+  SessionSuspendRequested: ["checkpointId"],
+  SessionSuspended: ["authorityCommitment"],
+  SessionResumed: ["ownerGeneration"],
+  SessionCheckpointRecorded: ["checkpoint", "baseEventPosition", "checkpointEventPosition"],
+  EvidenceCoverageRecorded: [
+    "adapterSessionId", "batchId", "firstOrdinal", "lastOrdinal",
+    "highestContiguousOrdinal", "missingIntervals", "fingerprintSchemaVersion",
+    "fingerprintKeyId", "fingerprintDomain", "coverageFingerprint", "captureMode",
+    "contentRetained", "frames",
+  ],
+  SessionForked: [
+    "parentSessionId", "assignment", "rootOwnerGeneration", "directAccessEnabled",
+    "authorityCommitment", "sourceTransferTicketId",
+  ],
+  ChildAssignmentAmended: [
+    "previousAssignmentRevision", "assignmentRevision", "assignment", "reasonCode",
+  ],
+  ChildWorkReported: ["report", "childAuthorAgentId", "primaryRecorderAgentId"],
+  ChildWorkDispositioned: ["disposition"],
+  ChildCompletionProposed: ["reportId"],
+  ChildSessionCompleted: ["reportId", "authorityCommitment"],
+  ChildSessionSuspended: ["checkpointId", "blockers", "followUps", "authorityCommitment"],
+  ChildWorkTransferCreated: ["transferTicketId", "checkpointId", "authorityCommitment"],
+  ChildWorkTransferClaimed: [
+    "transferTicketId", "previousChildSessionId", "previousTransferEventPosition",
+  ],
+  SessionEndRequested: [
+    "workflowId", "workflowGeneration", "previousState", "childEndPolicy",
+    "qualityThreshold", "requireFullEvidence", "requireMaterialization",
+  ],
+  SessionEndAmended: [
+    "workflowId", "previousWorkflowGeneration", "workflowGeneration",
+    "preTransitionCheckpointId",
+  ],
+  SessionValidationResultRecorded: [
+    "workflowId", "workflowGeneration", "plannedWorkId", "validationResult",
+  ],
+  SessionEndVerificationPassed: [
+    "workflowId", "workflowGeneration", "validationResultIds", "qualityScore",
+  ],
+  SessionEndVerificationFailed: [
+    "workflowId", "workflowGeneration", "validationResultIds", "safeFailureCode",
+  ],
+  SessionEndVerificationInvalidated: [
+    "workflowId", "workflowGeneration", "previousVerificationEventPosition",
+    "safeFailureCode",
+  ],
+  SessionEndCancelled: [
+    "workflowId", "workflowGeneration", "restoredState", "preTransitionCheckpointId",
+  ],
+  SessionAbandoned: [
+    "workflowId", "workflowGeneration", "approvalId", "preTransitionCheckpointId",
+    "reasonCode", "authorityCommitment",
+  ],
+  SessionEnded: [
+    "workflowId", "workflowGeneration", "verificationEventPosition", "authorityCommitment",
+  ],
+} as const);
+
+const LEGACY_V1_PAYLOAD_SHAPE_VALID = Object.entries(LEGACY_V1_PAYLOAD_KEYS)
+  .map(([eventType, keys]) => `(
+    legacy_event.event_type = '${eventType}'
+    AND (SELECT count(*) FROM json_each(legacy_event.payload_json)) = ${keys.length}
+    AND (SELECT count(DISTINCT field.key)
+         FROM json_each(legacy_event.payload_json) AS field) = ${keys.length}
+    AND NOT EXISTS (
+      SELECT 1 FROM json_each(legacy_event.payload_json) AS field
+      WHERE field.key NOT IN (${keys.map((key) => `'${key}'`).join(", ")})
+    )
+  )`)
+  .join("\nOR\n");
+const LEGACY_V1_EVENT_TYPES_SQL = Object.keys(LEGACY_V1_PAYLOAD_KEYS)
+  .map((eventType) => `'${eventType}'`)
+  .join(", ");
 
 const FINAL_BINDINGS_INVALID = `
   NEW.final_ending_scope_bindings_json IS NOT NULL AND (
@@ -9,11 +116,12 @@ const FINAL_BINDINGS_INVALID = `
     OR json(NEW.final_ending_scope_bindings_json)
       <> NEW.final_ending_scope_bindings_json
     OR length(CAST(NEW.final_ending_scope_bindings_json AS BLOB)) > 262144
-    OR json_array_length(NEW.final_ending_scope_bindings_json) > 100
     OR EXISTS (
       SELECT 1 FROM json_each(NEW.final_ending_scope_bindings_json) AS binding
       WHERE json_type(binding.value) <> 'object'
         OR (SELECT count(*) FROM json_each(binding.value)) <> 10
+        OR (SELECT count(DISTINCT field.key)
+            FROM json_each(binding.value) AS field) <> 10
         OR EXISTS (
           SELECT 1 FROM json_each(binding.value) AS field
           WHERE field.key NOT IN (
@@ -29,31 +137,22 @@ const FINAL_BINDINGS_INVALID = `
         OR json_extract(binding.value, '$.bindingKind') NOT IN (
           'current-child', 'carry-forward-ticket'
         )
-        OR json_type(binding.value, '$.childSessionId') <> 'text'
-        OR length(json_extract(binding.value, '$.childSessionId')) <> 36
-        OR lower(json_extract(binding.value, '$.childSessionId'))
-          <> json_extract(binding.value, '$.childSessionId')
-        OR json_extract(binding.value, '$.childSessionId') NOT GLOB
-          '[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]'
+        OR NOT ${canonicalUuid("json_extract(binding.value, '$.childSessionId')")}
         OR json_type(binding.value, '$.childState') <> 'text'
         OR json_extract(binding.value, '$.childState') NOT IN (
           'active', 'completion-proposed', 'completed', 'suspended', 'transferred'
         )
-        OR json_type(binding.value, '$.lastEventPosition') <> 'text'
+        OR NOT ${strictUnsignedDecimal("json_extract(binding.value, '$.lastEventPosition')")}
         OR json_extract(binding.value, '$.lastEventPosition') = '0'
-        OR json_extract(binding.value, '$.lastEventPosition') GLOB '*[^0-9]*'
-        OR json_extract(binding.value, '$.lastEventPosition') GLOB '0*'
-        OR json_type(binding.value, '$.streamVersion') <> 'text'
+        OR NOT ${strictUnsignedDecimal("json_extract(binding.value, '$.streamVersion')")}
         OR json_extract(binding.value, '$.streamVersion') = '0'
-        OR json_extract(binding.value, '$.streamVersion') GLOB '*[^0-9]*'
-        OR json_extract(binding.value, '$.streamVersion') GLOB '0*'
         OR (json_extract(binding.value, '$.checkpointId') IS NULL)
           <> (json_extract(binding.value, '$.checkpointEventPosition') IS NULL)
+        OR (json_extract(binding.value, '$.checkpointId') IS NOT NULL
+          AND NOT ${canonicalUuid("json_extract(binding.value, '$.checkpointId')")})
         OR (json_extract(binding.value, '$.checkpointEventPosition') IS NOT NULL AND (
-          json_type(binding.value, '$.checkpointEventPosition') <> 'text'
+          NOT ${strictUnsignedDecimal("json_extract(binding.value, '$.checkpointEventPosition')")}
           OR json_extract(binding.value, '$.checkpointEventPosition') = '0'
-          OR json_extract(binding.value, '$.checkpointEventPosition') GLOB '*[^0-9]*'
-          OR json_extract(binding.value, '$.checkpointEventPosition') GLOB '0*'
           OR CAST(json_extract(binding.value, '$.checkpointEventPosition') AS INTEGER)
             > CAST(json_extract(binding.value, '$.lastEventPosition') AS INTEGER)
           OR NOT EXISTS (
@@ -72,12 +171,40 @@ const FINAL_BINDINGS_INVALID = `
         OR (json_extract(binding.value, '$.bindingKind') = 'current-child' AND (
           json_extract(binding.value, '$.transferTicketId') IS NOT NULL
           OR json_extract(binding.value, '$.transferTicketEventPosition') IS NOT NULL
+          OR NOT EXISTS (
+            SELECT 1
+            FROM session_authority AS child
+            JOIN streams AS child_stream
+              ON child_stream.project_id = child.project_id
+              AND child_stream.stream_id = child.stream_id
+            JOIN events AS child_event
+              ON child_event.project_id = child.project_id
+              AND child_event.global_position = CAST(
+                json_extract(binding.value, '$.lastEventPosition') AS INTEGER
+              )
+              AND child_event.session_id = child.session_id
+              AND child_event.stream_version = child_stream.current_version
+            WHERE child.project_id = NEW.project_id
+              AND child.session_id = json_extract(binding.value, '$.childSessionId')
+              AND child.session_kind = 'child'
+              AND child.parent_session_id = NEW.session_id
+              AND child.semantic_state = json_extract(binding.value, '$.childState')
+              AND coalesce(child.terminal_event_position, child.authority_event_position)
+                = child_event.global_position
+              AND CAST(child_stream.current_version AS TEXT)
+                = json_extract(binding.value, '$.streamVersion')
+              AND child.latest_checkpoint_id
+                IS json_extract(binding.value, '$.checkpointId')
+          )
         ))
         OR (json_extract(binding.value, '$.bindingKind') = 'carry-forward-ticket' AND (
           json_extract(binding.value, '$.childState') <> 'transferred'
           OR json_extract(binding.value, '$.checkpointId') IS NULL
           OR json_extract(binding.value, '$.transferTicketId') IS NULL
+          OR NOT ${canonicalUuid("json_extract(binding.value, '$.transferTicketId')")}
           OR json_extract(binding.value, '$.transferTicketEventPosition') IS NULL
+          OR NOT ${strictUnsignedDecimal("json_extract(binding.value, '$.transferTicketEventPosition')")}
+          OR json_extract(binding.value, '$.transferTicketEventPosition') = '0'
           OR json_extract(binding.value, '$.lastEventPosition')
             <> json_extract(binding.value, '$.transferTicketEventPosition')
           OR NOT EXISTS (
@@ -87,13 +214,27 @@ const FINAL_BINDINGS_INVALID = `
               ON transfer_event.project_id = ticket.project_id
               AND transfer_event.global_position = ticket.created_event_position
               AND transfer_event.session_id = ticket.source_child_session_id
+              AND transfer_event.parent_session_id = ticket.source_parent_session_id
               AND transfer_event.event_type = 'ChildWorkTransferCreated'
               AND transfer_event.event_schema_version = 1
               AND json_extract(transfer_event.payload_json, '$.transferTicketId')
                 = ticket.transfer_ticket_id
               AND json_extract(transfer_event.payload_json, '$.checkpointId')
                 = ticket.checkpoint_id
+            JOIN session_authority AS source_child
+              ON source_child.project_id = ticket.project_id
+              AND source_child.session_id = ticket.source_child_session_id
+              AND source_child.session_kind = 'child'
+              AND source_child.parent_session_id = ticket.source_parent_session_id
+              AND source_child.semantic_state = 'transferred'
+              AND source_child.terminal_event_position = ticket.created_event_position
+              AND source_child.latest_checkpoint_id = ticket.checkpoint_id
+            JOIN streams AS source_stream
+              ON source_stream.project_id = source_child.project_id
+              AND source_stream.stream_id = source_child.stream_id
+              AND source_stream.current_version = transfer_event.stream_version
             WHERE ticket.project_id = NEW.project_id
+              AND ticket.source_parent_session_id = NEW.session_id
               AND ticket.transfer_ticket_id = json_extract(binding.value, '$.transferTicketId')
               AND ticket.source_child_session_id
                 = json_extract(binding.value, '$.childSessionId')
@@ -101,6 +242,8 @@ const FINAL_BINDINGS_INVALID = `
               AND ticket.created_event_position = CAST(
                 json_extract(binding.value, '$.transferTicketEventPosition') AS INTEGER
               )
+              AND CAST(source_stream.current_version AS TEXT)
+                = json_extract(binding.value, '$.streamVersion')
           )
         ))
         OR json(binding.value) <> json_object(
@@ -127,30 +270,183 @@ const FINAL_BINDINGS_INVALID = `
     )
   )`;
 
+function resultStatusValue(path: string): string {
+  return `(CASE
+    WHEN json_type(NEW.result_json, '$.status') = 'object'
+      THEN json_extract(NEW.result_json, '$.status${path}')
+    ELSE json_extract(NEW.result_json, '$${path}')
+  END)`;
+}
+
+function resultStatusType(path: string): string {
+  return `(CASE
+    WHEN json_type(NEW.result_json, '$.status') = 'object'
+      THEN json_type(NEW.result_json, '$.status${path}')
+    ELSE json_type(NEW.result_json, '$${path}')
+  END)`;
+}
+
+const STATUS_KEYS = `
+  'resultVersion', 'sessionId', 'workflowId', 'workflowGeneration', 'phase',
+  'priorRootState', 'triggeringEventPosition', 'finalCheckpointId',
+  'finalCheckpointEventPosition', 'evidenceWindow', 'validationPlansReady',
+  'qualityScore', 'safeFailureCode', 'materializationRequired'
+`;
+
+const RESULT_INVALID = `
+  NEW.result_json IS NOT NULL AND (
+    NOT json_valid(NEW.result_json)
+    OR json_type(NEW.result_json) IS NOT 'object'
+    OR json(NEW.result_json) <> NEW.result_json
+    OR NOT (
+      (
+        (SELECT count(*) FROM json_each(NEW.result_json)) = 14
+        AND (SELECT count(DISTINCT field.key)
+             FROM json_each(NEW.result_json) AS field) = 14
+        AND NOT EXISTS (
+          SELECT 1 FROM json_each(NEW.result_json) AS field
+          WHERE field.key NOT IN (${STATUS_KEYS})
+        )
+      )
+      OR
+      (
+        (SELECT count(*) FROM json_each(NEW.result_json)) = 5
+        AND (SELECT count(DISTINCT field.key)
+             FROM json_each(NEW.result_json) AS field) = 5
+        AND NOT EXISTS (
+          SELECT 1 FROM json_each(NEW.result_json) AS field
+          WHERE field.key NOT IN (
+            'resultVersion', 'action', 'progressed', 'previousPhase', 'status'
+          )
+        )
+        AND json_type(NEW.result_json, '$.resultVersion') = 'integer'
+        AND json_extract(NEW.result_json, '$.resultVersion') = 2
+        AND json_type(NEW.result_json, '$.action') = 'text'
+        AND json_extract(NEW.result_json, '$.action') IN (
+          'mark-children-resolved', 'record-final-checkpoint-and-queue-ending',
+          'confirm-ending-materialization', 'begin-validation',
+          'record-verification-failed', 'record-verification-passed',
+          'invalidate-verification', 'append-terminal-completion',
+          'confirm-completed-materialization', 'complete-without-materialization',
+          'complete-after-materialization'
+        )
+        AND json_type(NEW.result_json, '$.progressed') IN ('true', 'false')
+        AND json_type(NEW.result_json, '$.previousPhase') = 'text'
+        AND json_extract(NEW.result_json, '$.previousPhase') IN (
+          'requested', 'children-resolved', 'final-checkpoint-recorded',
+          'ending-materialization-queued', 'validating', 'verification-passed',
+          'verification-failed', 'completion-appended',
+          'completed-materialization-confirmed', 'completed', 'cancelled', 'abandoned'
+        )
+        AND json_type(NEW.result_json, '$.status') = 'object'
+        AND (SELECT count(*) FROM json_each(NEW.result_json, '$.status')) = 14
+        AND (SELECT count(DISTINCT field.key)
+             FROM json_each(NEW.result_json, '$.status') AS field) = 14
+        AND NOT EXISTS (
+          SELECT 1 FROM json_each(NEW.result_json, '$.status') AS field
+          WHERE field.key NOT IN (${STATUS_KEYS})
+        )
+      )
+    )
+    OR ${resultStatusType(".resultVersion")} IS NOT 'integer'
+    OR ${resultStatusValue(".resultVersion")} <> 2
+    OR ${resultStatusType(".sessionId")} IS NOT 'text'
+    OR NOT ${canonicalUuid(resultStatusValue(".sessionId"))}
+    OR ${resultStatusValue(".sessionId")} IS NOT NEW.session_id
+    OR ${resultStatusType(".workflowId")} IS NOT 'text'
+    OR ${resultStatusValue(".workflowId")} IS NOT NEW.workflow_id
+    OR ${resultStatusType(".workflowGeneration")} IS NOT 'integer'
+    OR ${resultStatusValue(".workflowGeneration")} <> NEW.generation
+    OR ${resultStatusValue(".workflowGeneration")} <= 0
+    OR ${resultStatusType(".phase")} IS NOT 'text'
+    OR ${resultStatusValue(".phase")} IS NOT NEW.phase
+    OR ${resultStatusValue(".phase")} NOT IN (
+      'requested', 'children-resolved', 'final-checkpoint-recorded',
+      'ending-materialization-queued', 'validating', 'verification-passed',
+      'verification-failed', 'completion-appended',
+      'completed-materialization-confirmed', 'completed', 'cancelled', 'abandoned'
+    )
+    OR ${resultStatusType(".priorRootState")} IS NOT 'text'
+    OR ${resultStatusValue(".priorRootState")} NOT IN ('active', 'suspended')
+    OR ${resultStatusType(".triggeringEventPosition")} IS NOT 'text'
+    OR NOT ${strictUnsignedDecimal(resultStatusValue(".triggeringEventPosition"))}
+    OR ${resultStatusValue(".triggeringEventPosition")} = '0'
+    OR ${resultStatusValue(".triggeringEventPosition")}
+      IS NOT CAST(NEW.triggering_event_position AS TEXT)
+    OR ${resultStatusType(".finalCheckpointId")} NOT IN ('null', 'text')
+    OR (${resultStatusType(".finalCheckpointId")} = 'text'
+      AND NOT ${canonicalUuid(resultStatusValue(".finalCheckpointId"))})
+    OR ${resultStatusType(".finalCheckpointEventPosition")} NOT IN ('null', 'text')
+    OR (${resultStatusType(".finalCheckpointEventPosition")} = 'text' AND (
+      NOT ${strictUnsignedDecimal(resultStatusValue(".finalCheckpointEventPosition"))}
+      OR ${resultStatusValue(".finalCheckpointEventPosition")} = '0'
+    ))
+    OR (${resultStatusType(".finalCheckpointId")} = 'null')
+      <> (${resultStatusType(".finalCheckpointEventPosition")} = 'null')
+    OR ${resultStatusType(".evidenceWindow")} IS NOT 'object'
+    OR (
+      CASE WHEN json_type(NEW.result_json, '$.status') = 'object'
+        THEN (SELECT count(*) FROM json_each(NEW.result_json, '$.status.evidenceWindow'))
+        ELSE (SELECT count(*) FROM json_each(NEW.result_json, '$.evidenceWindow'))
+      END
+    ) <> 3
+    OR (
+      CASE WHEN json_type(NEW.result_json, '$.status') = 'object'
+        THEN (SELECT count(DISTINCT field.key)
+              FROM json_each(NEW.result_json, '$.status.evidenceWindow') AS field)
+        ELSE (SELECT count(DISTINCT field.key)
+              FROM json_each(NEW.result_json, '$.evidenceWindow') AS field)
+      END
+    ) <> 3
+    OR EXISTS (
+      SELECT 1 FROM json_each(
+        NEW.result_json,
+        CASE WHEN json_type(NEW.result_json, '$.status') = 'object'
+          THEN '$.status.evidenceWindow' ELSE '$.evidenceWindow' END
+      ) AS field
+      WHERE field.key NOT IN (
+        'evidenceWindowState', 'evidenceFrozenCheckpointEventPosition',
+        'evidenceFrozenGeneration'
+      )
+    )
+    OR ${resultStatusType(".evidenceWindow.evidenceWindowState")} IS NOT 'text'
+    OR ${resultStatusValue(".evidenceWindow.evidenceWindowState")}
+      IS NOT NEW.evidence_window_state
+    OR ${resultStatusType(".evidenceWindow.evidenceFrozenCheckpointEventPosition")}
+      NOT IN ('null', 'text')
+    OR (${resultStatusType(".evidenceWindow.evidenceFrozenCheckpointEventPosition")} = 'text'
+      AND (
+        NOT ${strictUnsignedDecimal(
+          resultStatusValue(".evidenceWindow.evidenceFrozenCheckpointEventPosition"),
+        )}
+        OR ${resultStatusValue(".evidenceWindow.evidenceFrozenCheckpointEventPosition")} = '0'
+      ))
+    OR ${resultStatusValue(".evidenceWindow.evidenceFrozenCheckpointEventPosition")}
+      IS NOT CASE WHEN NEW.evidence_frozen_checkpoint_event_position IS NULL
+        THEN NULL ELSE CAST(NEW.evidence_frozen_checkpoint_event_position AS TEXT) END
+    OR ${resultStatusType(".evidenceWindow.evidenceFrozenGeneration")}
+      NOT IN ('null', 'integer')
+    OR (${resultStatusType(".evidenceWindow.evidenceFrozenGeneration")} = 'integer'
+      AND (${resultStatusValue(".evidenceWindow.evidenceFrozenGeneration")} <= 0
+        OR ${resultStatusValue(".evidenceWindow.evidenceFrozenGeneration")} > NEW.generation))
+    OR ${resultStatusValue(".evidenceWindow.evidenceFrozenGeneration")}
+      IS NOT NEW.evidence_frozen_generation
+    OR ${resultStatusType(".validationPlansReady")} NOT IN ('true', 'false')
+    OR ${resultStatusType(".qualityScore")} NOT IN ('null', 'integer')
+    OR (${resultStatusType(".qualityScore")} = 'integer'
+      AND ${resultStatusValue(".qualityScore")} NOT BETWEEN 0 AND 10000)
+    OR ${resultStatusType(".safeFailureCode")} NOT IN ('null', 'text')
+    OR ${resultStatusType(".materializationRequired")} NOT IN ('true', 'false')
+  )`;
+
 const FROZEN_GROUP_INVALID = `
-  NEW.evidence_frozen_checkpoint_event_position IS NOT NULL AND (
-    NEW.evidence_frozen_generation > NEW.generation
-    OR NOT json_valid(NEW.result_json)
-    OR coalesce(
-      json_extract(NEW.result_json, '$.status.sessionId'),
-      json_extract(NEW.result_json, '$.sessionId')
-    ) IS NOT NEW.session_id
-    OR coalesce(
-      json_extract(NEW.result_json, '$.status.workflowId'),
-      json_extract(NEW.result_json, '$.workflowId')
-    ) IS NOT NEW.workflow_id
-    OR coalesce(
-      json_extract(NEW.result_json, '$.status.workflowGeneration'),
-      json_extract(NEW.result_json, '$.workflowGeneration')
-    ) <> NEW.generation
-    OR coalesce(
-      json_extract(NEW.result_json, '$.status.phase'),
-      json_extract(NEW.result_json, '$.phase')
-    ) IS NOT NEW.phase
-    OR coalesce(
-      json_extract(NEW.result_json, '$.status.finalCheckpointEventPosition'),
-      json_extract(NEW.result_json, '$.finalCheckpointEventPosition')
-    ) IS NOT CAST(NEW.evidence_frozen_checkpoint_event_position AS TEXT)
+  (NEW.evidence_frozen_checkpoint_event_position IS NOT NULL AND (
+    NEW.evidence_frozen_generation IS NULL
+    OR NEW.evidence_frozen_generation <= 0
+    OR NEW.evidence_frozen_generation > NEW.generation
+    OR NEW.result_json IS NULL
+    OR ${resultStatusValue(".finalCheckpointEventPosition")}
+      IS NOT CAST(NEW.evidence_frozen_checkpoint_event_position AS TEXT)
     OR NOT EXISTS (
       SELECT 1 FROM events AS final_checkpoint_event
       WHERE final_checkpoint_event.project_id = NEW.project_id
@@ -160,13 +456,181 @@ const FROZEN_GROUP_INVALID = `
         AND final_checkpoint_event.event_type = 'SessionCheckpointRecorded'
         AND final_checkpoint_event.event_schema_version IN (1, 2)
         AND json_extract(final_checkpoint_event.payload_json,
-          '$.checkpoint.checkpointId') IS coalesce(
-            json_extract(NEW.result_json, '$.status.finalCheckpointId'),
-            json_extract(NEW.result_json, '$.finalCheckpointId')
-          )
+          '$.checkpoint.checkpointId') IS ${resultStatusValue(".finalCheckpointId")}
         AND json_extract(final_checkpoint_event.payload_json,
           '$.checkpoint.checkpointEventPosition')
           IS CAST(NEW.evidence_frozen_checkpoint_event_position AS TEXT)
+        AND json_type(final_checkpoint_event.payload_json,
+          '$.checkpoint.childSummaries') = 'array'
+        AND json_array_length(final_checkpoint_event.payload_json,
+          '$.checkpoint.childSummaries')
+          = json_array_length(NEW.final_ending_scope_bindings_json)
+        AND NOT EXISTS (
+          SELECT 1 FROM json_each(NEW.final_ending_scope_bindings_json) AS binding
+          WHERE json_extract(binding.value, '$.childSessionId') IS NOT json_extract(
+              final_checkpoint_event.payload_json,
+              '$.checkpoint.childSummaries[' || binding.key || '].childSessionId'
+            )
+            OR json_extract(binding.value, '$.childState') IS NOT json_extract(
+              final_checkpoint_event.payload_json,
+              '$.checkpoint.childSummaries[' || binding.key || '].state'
+            )
+            OR json_extract(binding.value, '$.lastEventPosition') IS NOT json_extract(
+              final_checkpoint_event.payload_json,
+              '$.checkpoint.childSummaries[' || binding.key || '].lastEventPosition'
+            )
+            OR json_extract(binding.value, '$.streamVersion') IS NOT json_extract(
+              final_checkpoint_event.payload_json,
+              '$.checkpoint.childSummaries[' || binding.key || '].streamVersion'
+            )
+            OR json_extract(binding.value, '$.checkpointId') IS NOT json_extract(
+              final_checkpoint_event.payload_json,
+              '$.checkpoint.childSummaries[' || binding.key || '].latestCheckpointId'
+            )
+        )
+    )
+  ))
+  OR (NEW.evidence_frozen_checkpoint_event_position IS NULL
+    AND NEW.result_json IS NOT NULL
+    AND (${resultStatusType(".finalCheckpointId")} <> 'null'
+      OR ${resultStatusType(".finalCheckpointEventPosition")} <> 'null'))`;
+
+const EVIDENCE_GROUP_PRESERVED = `
+  NEW.evidence_frozen_checkpoint_event_position
+    IS OLD.evidence_frozen_checkpoint_event_position
+  AND NEW.evidence_frozen_generation IS OLD.evidence_frozen_generation
+  AND NEW.evidence_window_state IS OLD.evidence_window_state
+  AND NEW.final_ending_scope_bindings_json IS OLD.final_ending_scope_bindings_json
+`;
+
+const NULL_SEALED_EVIDENCE_GROUP = `
+  NEW.evidence_window_state = 'sealed'
+  AND NEW.evidence_frozen_checkpoint_event_position IS NULL
+  AND NEW.evidence_frozen_generation IS NULL
+  AND NEW.final_ending_scope_bindings_json IS NULL
+`;
+
+const STRICT_WORKFLOW_UPDATE_INVALID = `
+  NOT (
+    (
+      NEW.generation = OLD.generation
+      AND NEW.phase IS OLD.phase
+      AND NEW.result_json IS OLD.result_json
+      AND ${EVIDENCE_GROUP_PRESERVED}
+    )
+    OR
+    (
+      NEW.generation = OLD.generation
+      AND NEW.phase IS NOT OLD.phase
+      AND json_type(NEW.result_json, '$.status') = 'object'
+      AND json_type(NEW.result_json, '$.progressed') = 'true'
+      AND json_extract(NEW.result_json, '$.previousPhase') IS OLD.phase
+      AND (
+        (OLD.phase = 'requested' AND NEW.phase = 'children-resolved'
+          AND json_extract(NEW.result_json, '$.action') = 'mark-children-resolved')
+        OR (OLD.phase = 'children-resolved' AND NEW.phase = 'final-checkpoint-recorded'
+          AND json_extract(NEW.result_json, '$.action')
+            = 'record-final-checkpoint-and-queue-ending')
+        OR (OLD.phase = 'final-checkpoint-recorded'
+          AND NEW.phase = 'ending-materialization-queued'
+          AND json_extract(NEW.result_json, '$.action') = 'confirm-ending-materialization')
+        OR (OLD.phase = 'ending-materialization-queued' AND NEW.phase = 'validating'
+          AND json_extract(NEW.result_json, '$.action') = 'begin-validation')
+        OR (OLD.phase = 'validating' AND NEW.phase = 'verification-failed'
+          AND json_extract(NEW.result_json, '$.action') = 'record-verification-failed')
+        OR (OLD.phase = 'validating' AND NEW.phase = 'verification-passed'
+          AND json_extract(NEW.result_json, '$.action') = 'record-verification-passed')
+        OR (OLD.phase = 'verification-passed' AND NEW.phase = 'verification-failed'
+          AND json_extract(NEW.result_json, '$.action') = 'invalidate-verification')
+        OR (OLD.phase = 'verification-passed' AND NEW.phase = 'completion-appended'
+          AND json_extract(NEW.result_json, '$.action') = 'append-terminal-completion')
+        OR (OLD.phase = 'completion-appended'
+          AND NEW.phase = 'completed-materialization-confirmed'
+          AND json_extract(NEW.result_json, '$.action')
+            = 'confirm-completed-materialization')
+        OR (OLD.phase = 'completion-appended' AND NEW.phase = 'completed'
+          AND json_extract(NEW.result_json, '$.action') = 'complete-without-materialization')
+        OR (OLD.phase = 'completed-materialization-confirmed' AND NEW.phase = 'completed'
+          AND json_extract(NEW.result_json, '$.action') = 'complete-after-materialization')
+      )
+      AND (
+        (OLD.phase = 'children-resolved' AND NEW.phase = 'final-checkpoint-recorded'
+          AND OLD.evidence_window_state = 'sealed'
+          AND OLD.evidence_frozen_checkpoint_event_position IS NULL
+          AND NEW.evidence_window_state = 'sealed'
+          AND NEW.evidence_frozen_checkpoint_event_position IS NOT NULL
+          AND NEW.evidence_frozen_generation = NEW.generation
+          AND NEW.final_ending_scope_bindings_json IS NOT NULL)
+        OR
+        (NOT (OLD.phase = 'children-resolved'
+          AND NEW.phase = 'final-checkpoint-recorded')
+          AND ${EVIDENCE_GROUP_PRESERVED})
+      )
+    )
+    OR
+    (
+      NEW.generation = OLD.generation + 1
+      AND OLD.evidence_window_state = 'sealed'
+      AND NEW.evidence_window_state = 'open'
+      AND NEW.phase IN ('requested', 'children-resolved')
+      AND NEW.evidence_frozen_checkpoint_event_position IS NULL
+      AND NEW.evidence_frozen_generation IS NULL
+      AND NEW.final_ending_scope_bindings_json IS NULL
+      AND NEW.result_json IS NOT NULL
+      AND json_type(NEW.result_json, '$.status') IS NULL
+    )
+    OR
+    (
+      NEW.generation = OLD.generation + 1
+      AND OLD.evidence_window_state = 'open'
+      AND NEW.evidence_window_state = 'sealed'
+      AND NEW.phase IN ('requested', 'children-resolved')
+      AND NEW.evidence_frozen_checkpoint_event_position IS NULL
+      AND NEW.evidence_frozen_generation IS NULL
+      AND NEW.final_ending_scope_bindings_json IS NULL
+      AND NEW.result_json IS NOT NULL
+      AND json_type(NEW.result_json, '$.status') IS NULL
+    )
+    OR
+    (
+      NEW.generation = OLD.generation + 1
+      AND NEW.phase IS OLD.phase
+      AND NEW.phase NOT IN ('cancelled', 'abandoned', 'completed')
+      AND ${EVIDENCE_GROUP_PRESERVED}
+      AND NEW.result_json IS NOT NULL
+      AND json_type(NEW.result_json, '$.status') IS NULL
+    )
+    OR
+    (
+      NEW.generation = OLD.generation + 1
+      AND OLD.phase NOT IN ('cancelled', 'abandoned', 'completed')
+      AND NEW.phase = 'cancelled'
+      AND ${NULL_SEALED_EVIDENCE_GROUP}
+      AND NEW.result_json IS NOT NULL
+      AND json_type(NEW.result_json, '$.status') IS NULL
+    )
+    OR
+    (
+      NEW.generation = OLD.generation + 1
+      AND OLD.phase = 'cancelled'
+      AND NEW.phase = 'requested'
+      AND ${NULL_SEALED_EVIDENCE_GROUP}
+      AND NEW.result_json IS NULL
+      AND NEW.root_command_id IS NOT OLD.root_command_id
+      AND NEW.triggering_event_position > OLD.triggering_event_position
+    )
+    OR
+    (
+      NEW.generation = OLD.generation + 1
+      AND OLD.phase NOT IN ('abandoned', 'completed')
+      AND NEW.phase = 'abandoned'
+      AND NEW.evidence_window_state = 'sealed'
+      AND NEW.evidence_frozen_checkpoint_event_position
+        IS OLD.evidence_frozen_checkpoint_event_position
+      AND NEW.evidence_frozen_generation IS OLD.evidence_frozen_generation
+      AND NEW.final_ending_scope_bindings_json IS OLD.final_ending_scope_bindings_json
+      AND NEW.result_json IS NOT NULL
+      AND json_type(NEW.result_json, '$.status') IS NULL
     )
   )`;
 
@@ -330,6 +794,19 @@ SELECT CASE WHEN
           AND json_type(payload_json, '$.amendmentVersion') IS NOT NULL)
       )
   )
+  AND NOT EXISTS (
+    SELECT 1 FROM events AS legacy_event
+    WHERE legacy_event.stream_type = 'session'
+      AND legacy_event.session_id IS NOT NULL
+      AND legacy_event.event_type IN (${LEGACY_V1_EVENT_TYPES_SQL})
+      AND (
+        legacy_event.event_schema_version <> 1
+        OR NOT json_valid(legacy_event.payload_json)
+        OR json_type(legacy_event.payload_json) <> 'object'
+        OR json(legacy_event.payload_json) <> legacy_event.payload_json
+        OR NOT (${LEGACY_V1_PAYLOAD_SHAPE_VALID})
+      )
+  )
 THEN 1 ELSE 0 END;
 
 ALTER TABLE session_evidence_coverage
@@ -413,6 +890,27 @@ CREATE INDEX session_evidence_coverage_transitions_snapshot
 ON session_evidence_coverage_transitions(
   project_id, session_id, adapter_session_id, batch_event_position DESC
 );
+
+CREATE UNIQUE INDEX session_evidence_coverage_latest_transition
+ON session_evidence_coverage(
+  project_id, session_id, adapter_session_id, latest_batch_event_position
+);
+
+CREATE TABLE session_evidence_coverage_transition_heads (
+  project_id TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  adapter_session_id TEXT NOT NULL,
+  batch_event_position INTEGER NOT NULL CHECK (batch_event_position > 0),
+  PRIMARY KEY (project_id, session_id, adapter_session_id),
+  FOREIGN KEY (project_id, session_id, adapter_session_id, batch_event_position)
+    REFERENCES session_evidence_coverage_transitions(
+      project_id, session_id, adapter_session_id, batch_event_position
+    ) DEFERRABLE INITIALLY DEFERRED,
+  FOREIGN KEY (project_id, session_id, adapter_session_id, batch_event_position)
+    REFERENCES session_evidence_coverage(
+      project_id, session_id, adapter_session_id, latest_batch_event_position
+    ) DEFERRABLE INITIALLY DEFERRED
+) STRICT;
 
 ALTER TABLE workflow_instances
   ADD COLUMN evidence_frozen_checkpoint_event_position INTEGER;
@@ -580,7 +1078,6 @@ CREATE TRIGGER session_evidence_coverage_transitions_insert_guard
 BEFORE INSERT ON session_evidence_coverage_transitions
 WHEN NEW.coverage_first_ordinal <> 0
   OR NEW.batch_last_ordinal > NEW.coverage_last_ordinal
-  OR NEW.new_frame_count <> NEW.batch_last_ordinal - NEW.batch_first_ordinal + 1
   OR NEW.frame_fingerprint_algorithm <> 'hmac-sha256'
   OR NEW.frame_fingerprint_schema_version <> 1
   OR NEW.frame_fingerprint_domain <> 'pm-evidence-frame-v1'
@@ -588,6 +1085,37 @@ WHEN NEW.coverage_first_ordinal <> 0
   OR NEW.coverage_fingerprint_schema_version <> 1
   OR NEW.coverage_fingerprint_key_id <> NEW.frame_fingerprint_key_id
   OR NEW.coverage_fingerprint_domain <> 'pm-evidence-coverage-v1'
+  OR EXISTS (
+    SELECT 1 FROM json_each(NEW.missing_intervals_json) AS interval
+    WHERE interval.type <> 'array'
+      OR json_array_length(interval.value) <> 2
+      OR json_type(interval.value, '$[0]') <> 'integer'
+      OR json_type(interval.value, '$[1]') <> 'integer'
+      OR json_extract(interval.value, '$[0]') < 0
+      OR json_extract(interval.value, '$[1]') < json_extract(interval.value, '$[0]')
+      OR json_extract(interval.value, '$[1]') > NEW.coverage_last_ordinal
+      OR (
+        json_extract(interval.value, '$[0]') <= NEW.batch_last_ordinal
+        AND json_extract(interval.value, '$[1]') >= NEW.batch_first_ordinal
+      )
+  )
+  OR EXISTS (
+    SELECT 1
+    FROM json_each(NEW.missing_intervals_json) AS prior
+    JOIN json_each(NEW.missing_intervals_json) AS following
+      ON CAST(following.key AS INTEGER) = CAST(prior.key AS INTEGER) + 1
+    WHERE json_extract(following.value, '$[0]')
+      <= json_extract(prior.value, '$[1]') + 1
+  )
+  OR (
+    json_array_length(NEW.missing_intervals_json) = 0
+    AND NEW.highest_contiguous_ordinal <> NEW.coverage_last_ordinal
+  )
+  OR (
+    json_array_length(NEW.missing_intervals_json) > 0
+    AND json_extract(NEW.missing_intervals_json, '$[0][0]')
+      <> NEW.highest_contiguous_ordinal + 1
+  )
   OR NOT EXISTS (
     SELECT 1 FROM events AS event
     WHERE event.global_position = NEW.batch_event_position
@@ -596,23 +1124,73 @@ WHEN NEW.coverage_first_ordinal <> 0
       AND event.stream_type = 'session'
       AND event.event_type = 'EvidenceCoverageRecorded'
       AND event.event_schema_version = 2
+      AND json_valid(event.payload_json)
+      AND json_type(event.payload_json) = 'object'
+      AND json(event.payload_json) = event.payload_json
+      AND (SELECT count(*) FROM json_each(event.payload_json)) = 20
+      AND (SELECT count(DISTINCT field.key)
+           FROM json_each(event.payload_json) AS field) = 20
+      AND NOT EXISTS (
+        SELECT 1 FROM json_each(event.payload_json) AS field
+        WHERE field.key NOT IN (
+          'adapterSessionId', 'batchId', 'batchFirstOrdinal', 'batchLastOrdinal',
+          'coverageFirstOrdinal', 'coverageLastOrdinal', 'highestContiguousOrdinal',
+          'missingIntervals', 'frameFingerprintAlgorithm',
+          'frameFingerprintSchemaVersion', 'frameFingerprintKeyId',
+          'frameFingerprintDomain', 'coverageFingerprintAlgorithm',
+          'coverageFingerprintSchemaVersion', 'coverageFingerprintKeyId',
+          'coverageFingerprintDomain', 'coverageFingerprint', 'captureMode',
+          'contentRetained', 'frames'
+        )
+      )
+      AND ${canonicalUuid("json_extract(event.payload_json, '$.adapterSessionId')")}
+      AND ${canonicalUuid("json_extract(event.payload_json, '$.batchId')")}
       AND json_extract(event.payload_json, '$.adapterSessionId') = NEW.adapter_session_id
       AND json_extract(event.payload_json, '$.batchId') = NEW.batch_id
-      AND CAST(json_extract(event.payload_json, '$.batchFirstOrdinal') AS INTEGER)
-        = NEW.batch_first_ordinal
-      AND CAST(json_extract(event.payload_json, '$.batchLastOrdinal') AS INTEGER)
-        = NEW.batch_last_ordinal
-      AND CAST(json_extract(event.payload_json, '$.coverageFirstOrdinal') AS INTEGER)
-        = NEW.coverage_first_ordinal
-      AND CAST(json_extract(event.payload_json, '$.coverageLastOrdinal') AS INTEGER)
-        = NEW.coverage_last_ordinal
-      AND coalesce(CAST(json_extract(event.payload_json,
-        '$.highestContiguousOrdinal') AS INTEGER), -1) = NEW.highest_contiguous_ordinal
-      AND json_array_length(json_extract(event.payload_json, '$.missingIntervals'))
+      AND json_type(event.payload_json, '$.batchFirstOrdinal') = 'text'
+      AND ${strictUnsignedDecimal("json_extract(event.payload_json, '$.batchFirstOrdinal')")}
+      AND CAST(NEW.batch_first_ordinal AS TEXT)
+        = json_extract(event.payload_json, '$.batchFirstOrdinal')
+      AND json_type(event.payload_json, '$.batchLastOrdinal') = 'text'
+      AND ${strictUnsignedDecimal("json_extract(event.payload_json, '$.batchLastOrdinal')")}
+      AND CAST(NEW.batch_last_ordinal AS TEXT)
+        = json_extract(event.payload_json, '$.batchLastOrdinal')
+      AND json_type(event.payload_json, '$.coverageFirstOrdinal') = 'text'
+      AND ${strictUnsignedDecimal("json_extract(event.payload_json, '$.coverageFirstOrdinal')")}
+      AND CAST(NEW.coverage_first_ordinal AS TEXT)
+        = json_extract(event.payload_json, '$.coverageFirstOrdinal')
+      AND json_type(event.payload_json, '$.coverageLastOrdinal') = 'text'
+      AND ${strictUnsignedDecimal("json_extract(event.payload_json, '$.coverageLastOrdinal')")}
+      AND CAST(NEW.coverage_last_ordinal AS TEXT)
+        = json_extract(event.payload_json, '$.coverageLastOrdinal')
+      AND (
+        (NEW.highest_contiguous_ordinal = -1
+          AND json_type(event.payload_json, '$.highestContiguousOrdinal') = 'null')
+        OR
+        (NEW.highest_contiguous_ordinal >= 0
+          AND json_type(event.payload_json, '$.highestContiguousOrdinal') = 'text'
+          AND ${strictUnsignedDecimal("json_extract(event.payload_json, '$.highestContiguousOrdinal')")}
+          AND CAST(NEW.highest_contiguous_ordinal AS TEXT)
+            = json_extract(event.payload_json, '$.highestContiguousOrdinal'))
+      )
+      AND json_type(event.payload_json, '$.missingIntervals') = 'array'
+      AND json_array_length(event.payload_json, '$.missingIntervals')
         = json_array_length(NEW.missing_intervals_json)
       AND NOT EXISTS (
         SELECT 1 FROM json_each(event.payload_json, '$.missingIntervals') AS interval
-        WHERE CAST(json_extract(interval.value, '$.firstOrdinal') AS INTEGER)
+        WHERE interval.type <> 'object'
+          OR (SELECT count(*) FROM json_each(interval.value)) <> 2
+          OR (SELECT count(DISTINCT field.key)
+              FROM json_each(interval.value) AS field) <> 2
+          OR EXISTS (
+            SELECT 1 FROM json_each(interval.value) AS field
+            WHERE field.key NOT IN ('firstOrdinal', 'lastOrdinal')
+          )
+          OR json_type(interval.value, '$.firstOrdinal') <> 'text'
+          OR NOT ${strictUnsignedDecimal("json_extract(interval.value, '$.firstOrdinal')")}
+          OR json_type(interval.value, '$.lastOrdinal') <> 'text'
+          OR NOT ${strictUnsignedDecimal("json_extract(interval.value, '$.lastOrdinal')")}
+          OR CAST(json_extract(interval.value, '$.firstOrdinal') AS INTEGER)
             <> json_extract(NEW.missing_intervals_json,
               '$[' || interval.key || '][0]')
           OR CAST(json_extract(interval.value, '$.lastOrdinal') AS INTEGER)
@@ -637,10 +1215,95 @@ WHEN NEW.coverage_first_ordinal <> 0
         IS NEW.coverage_fingerprint_domain
       AND json_extract(event.payload_json, '$.coverageFingerprint')
         IS NEW.coverage_fingerprint_value
-      AND json_array_length(json_extract(event.payload_json, '$.frames'))
-        = NEW.new_frame_count
+      AND json_type(event.payload_json, '$.frames') = 'array'
+      AND json_array_length(event.payload_json, '$.frames')
+        = NEW.batch_last_ordinal - NEW.batch_first_ordinal + 1
+      AND json_array_length(event.payload_json, '$.frames') BETWEEN 1 AND 2000
+      AND NOT EXISTS (
+        SELECT 1 FROM json_each(event.payload_json, '$.frames') AS frame
+        WHERE frame.type <> 'object'
+          OR (SELECT count(*) FROM json_each(frame.value)) <> 5
+          OR (SELECT count(DISTINCT field.key)
+              FROM json_each(frame.value) AS field) <> 5
+          OR EXISTS (
+            SELECT 1 FROM json_each(frame.value) AS field
+            WHERE field.key NOT IN (
+              'frameId', 'ordinal', 'sourceKind', 'observedAt', 'contentFingerprint'
+            )
+          )
+          OR NOT ${canonicalUuid("json_extract(frame.value, '$.frameId')")}
+          OR json_type(frame.value, '$.ordinal') <> 'text'
+          OR NOT ${strictUnsignedDecimal("json_extract(frame.value, '$.ordinal')")}
+          OR CAST(json_extract(frame.value, '$.ordinal') AS INTEGER)
+            <> NEW.batch_first_ordinal + CAST(frame.key AS INTEGER)
+          OR json_type(frame.value, '$.sourceKind') <> 'text'
+          OR json_extract(frame.value, '$.sourceKind') NOT IN (
+            'model-turn', 'tool-request', 'tool-result', 'adapter-event',
+            'external-observation'
+          )
+          OR json_type(frame.value, '$.observedAt') <> 'text'
+          OR strftime('%Y-%m-%dT%H:%M:%fZ',
+            json_extract(frame.value, '$.observedAt'))
+            IS NOT json_extract(frame.value, '$.observedAt')
+          OR json_type(frame.value, '$.contentFingerprint') <> 'text'
+          OR length(json_extract(frame.value, '$.contentFingerprint')) <> 64
+          OR json_extract(frame.value, '$.contentFingerprint') GLOB '*[^0-9a-f]*'
+      )
+      AND NOT EXISTS (
+        SELECT 1
+        FROM json_each(event.payload_json, '$.frames') AS left_frame
+        JOIN json_each(event.payload_json, '$.frames') AS right_frame
+          ON CAST(right_frame.key AS INTEGER) > CAST(left_frame.key AS INTEGER)
+        WHERE json_extract(right_frame.value, '$.frameId')
+          = json_extract(left_frame.value, '$.frameId')
+      )
+      AND NOT EXISTS (
+        SELECT 1
+        FROM json_each(event.payload_json, '$.frames') AS frame
+        JOIN session_evidence_fingerprints AS fingerprint
+          ON fingerprint.project_id = NEW.project_id
+          AND fingerprint.session_id = NEW.session_id
+          AND fingerprint.adapter_session_id = NEW.adapter_session_id
+          AND fingerprint.ordinal = CAST(
+            json_extract(frame.value, '$.ordinal') AS INTEGER
+          )
+        WHERE fingerprint.frame_id IS NOT json_extract(frame.value, '$.frameId')
+          OR fingerprint.source_kind IS NOT json_extract(frame.value, '$.sourceKind')
+          OR fingerprint.observed_at IS NOT json_extract(frame.value, '$.observedAt')
+          OR fingerprint.fingerprint_algorithm IS NOT NEW.frame_fingerprint_algorithm
+          OR fingerprint.fingerprint_schema_version <> NEW.frame_fingerprint_schema_version
+          OR fingerprint.fingerprint_key_id IS NOT NEW.frame_fingerprint_key_id
+          OR fingerprint.fingerprint_domain IS NOT NEW.frame_fingerprint_domain
+          OR fingerprint.fingerprint_value IS NOT json_extract(
+            frame.value, '$.contentFingerprint'
+          )
+      )
+      AND (
+        SELECT count(*)
+        FROM json_each(event.payload_json, '$.frames') AS frame
+        WHERE NOT EXISTS (
+          SELECT 1 FROM session_evidence_fingerprints AS fingerprint
+          WHERE fingerprint.project_id = NEW.project_id
+            AND fingerprint.session_id = NEW.session_id
+            AND fingerprint.adapter_session_id = NEW.adapter_session_id
+            AND fingerprint.ordinal = CAST(
+              json_extract(frame.value, '$.ordinal') AS INTEGER
+            )
+            AND fingerprint.frame_id IS json_extract(frame.value, '$.frameId')
+            AND fingerprint.source_kind IS json_extract(frame.value, '$.sourceKind')
+            AND fingerprint.observed_at IS json_extract(frame.value, '$.observedAt')
+            AND fingerprint.fingerprint_algorithm IS NEW.frame_fingerprint_algorithm
+            AND fingerprint.fingerprint_schema_version = NEW.frame_fingerprint_schema_version
+            AND fingerprint.fingerprint_key_id IS NEW.frame_fingerprint_key_id
+            AND fingerprint.fingerprint_domain IS NEW.frame_fingerprint_domain
+            AND fingerprint.fingerprint_value IS json_extract(
+              frame.value, '$.contentFingerprint'
+            )
+        )
+      ) = NEW.new_frame_count
       AND json_extract(event.payload_json, '$.captureMode') IS NEW.capture_mode
-      AND json_extract(event.payload_json, '$.contentRetained') = NEW.content_retained
+      AND json_type(event.payload_json, '$.contentRetained') = 'false'
+      AND NEW.content_retained = 0
   )
   OR (
     NEW.previous_coverage_fingerprint_value IS NULL
@@ -682,6 +1345,18 @@ WHEN NEW.coverage_first_ordinal <> 0
   )
 BEGIN
   SELECT RAISE(ABORT, 'SESSION_EVIDENCE_COVERAGE_TRANSITION_INVALID');
+END;
+
+CREATE TRIGGER session_evidence_coverage_transitions_advance_head
+AFTER INSERT ON session_evidence_coverage_transitions
+BEGIN
+  INSERT INTO session_evidence_coverage_transition_heads(
+    project_id, session_id, adapter_session_id, batch_event_position
+  ) VALUES (
+    NEW.project_id, NEW.session_id, NEW.adapter_session_id, NEW.batch_event_position
+  )
+  ON CONFLICT(project_id, session_id, adapter_session_id) DO UPDATE SET
+    batch_event_position = excluded.batch_event_position;
 END;
 
 CREATE TRIGGER session_evidence_coverage_transitions_no_update
@@ -752,6 +1427,7 @@ WHEN
       <> (NEW.evidence_frozen_generation IS NULL)
     OR (NEW.evidence_frozen_checkpoint_event_position IS NULL)
       <> (NEW.final_ending_scope_bindings_json IS NULL)
+    OR (${RESULT_INVALID})
     OR (${FINAL_BINDINGS_INVALID})
     OR (${FROZEN_GROUP_INVALID})
     OR (NEW.evidence_window_state = 'open' AND (
@@ -787,6 +1463,7 @@ WHEN
       <> (NEW.evidence_frozen_generation IS NULL)
     OR (NEW.evidence_frozen_checkpoint_event_position IS NULL)
       <> (NEW.final_ending_scope_bindings_json IS NULL)
+    OR (${RESULT_INVALID})
     OR (${FINAL_BINDINGS_INVALID})
     OR (${FROZEN_GROUP_INVALID})
     OR (NEW.evidence_window_state = 'open' AND (
@@ -802,33 +1479,7 @@ WHEN
       'verification-passed', 'verification-failed', 'completion-appended',
       'completed-materialization-confirmed', 'completed'
     ) AND NEW.evidence_frozen_checkpoint_event_position IS NULL)
-    OR (
-      (NEW.evidence_frozen_checkpoint_event_position IS NOT OLD.evidence_frozen_checkpoint_event_position
-        OR NEW.evidence_frozen_generation IS NOT OLD.evidence_frozen_generation
-        OR NEW.evidence_window_state IS NOT OLD.evidence_window_state
-        OR NEW.final_ending_scope_bindings_json IS NOT OLD.final_ending_scope_bindings_json)
-      AND NOT (
-        (OLD.evidence_window_state = 'sealed' AND NEW.evidence_window_state = 'open'
-          AND NEW.generation = OLD.generation + 1
-          AND NEW.evidence_frozen_checkpoint_event_position IS NULL)
-        OR (OLD.evidence_window_state = 'open' AND NEW.evidence_window_state = 'sealed'
-          AND NEW.generation = OLD.generation + 1
-          AND NEW.evidence_frozen_checkpoint_event_position IS NULL)
-        OR (OLD.evidence_window_state = 'sealed' AND NEW.evidence_window_state = 'sealed'
-          AND OLD.evidence_frozen_checkpoint_event_position IS NULL
-          AND NEW.evidence_frozen_checkpoint_event_position IS NOT NULL
-          AND NEW.generation = OLD.generation
-          AND NEW.evidence_frozen_generation = NEW.generation)
-        OR (OLD.phase <> 'cancelled' AND NEW.phase = 'cancelled'
-          AND NEW.generation = OLD.generation
-          AND NEW.evidence_window_state = 'sealed'
-          AND NEW.evidence_frozen_checkpoint_event_position IS NULL)
-        OR (OLD.phase = 'cancelled' AND NEW.phase = 'requested'
-          AND NEW.generation = OLD.generation + 1
-          AND NEW.evidence_window_state = 'sealed'
-          AND NEW.evidence_frozen_checkpoint_event_position IS NULL)
-      )
-    )
+    OR (${STRICT_WORKFLOW_UPDATE_INVALID})
   ))
 BEGIN
   SELECT RAISE(ABORT, 'WORKFLOW_EVIDENCE_STATE_INVALID');

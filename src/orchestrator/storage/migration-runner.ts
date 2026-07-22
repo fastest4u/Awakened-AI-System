@@ -9,8 +9,7 @@ import {
 } from "./schema-compatibility.js";
 import type { SqliteConnection } from "./sqlite-driver.js";
 import {
-  QUALIFIED_CHECKPOINT_STAGE_MARKER_TABLE,
-  QUALIFIED_CHECKPOINT_STAGE_ROWS_TABLE,
+  assertQualifiedCheckpointMigrationStage,
   qualifiedCheckpointMigrationFailure,
 } from "./qualified-checkpoint-migration-preflight.js";
 
@@ -87,31 +86,6 @@ function validateMode(mode: MigrationApplyMode): void {
   ) fail("MIGRATION_MODE_INVALID");
 }
 
-function assertQualifiedCheckpointStage(connection: SqliteConnection): void {
-  try {
-    const marker = connection.prepare(`
-      SELECT source_schema_version, target_schema_version, staged_row_count, sealed
-      FROM temp.${QUALIFIED_CHECKPOINT_STAGE_MARKER_TABLE}
-      WHERE singleton = 1
-    `).all();
-    const rowCount = numeric(connection.prepare(`
-      SELECT count(*) AS count FROM temp.${QUALIFIED_CHECKPOINT_STAGE_ROWS_TABLE}
-    `).get()?.count);
-    if (
-      marker.length !== 1
-      || numeric(marker[0]?.source_schema_version) !== 2
-      || numeric(marker[0]?.target_schema_version) !== 3
-      || numeric(marker[0]?.sealed) !== 1
-      || rowCount === undefined
-      || numeric(marker[0]?.staged_row_count) !== rowCount
-    ) fail("MIGRATION_EVIDENCE_V2_PRECONDITION_FAILED");
-  } catch (error) {
-    const normalized = qualifiedCheckpointMigrationFailure(error);
-    if (normalized !== undefined) throw normalized;
-    fail("MIGRATION_EVIDENCE_V2_PRECONDITION_FAILED");
-  }
-}
-
 function rollbackPreservingOriginal(connection: SqliteConnection): void {
   try {
     connection.exec("ROLLBACK");
@@ -173,7 +147,7 @@ export class MigrationRunner {
       for (const migration of registry.slice(appliedVersion)) {
         if (mode.kind === "explicit-upgrade") mode.renewMutableBoundary?.();
         mode.beforeMigration(connection, migration);
-        if (migration.version === 3) assertQualifiedCheckpointStage(connection);
+        if (migration.version === 3) assertQualifiedCheckpointMigrationStage(connection);
         if (mode.kind === "explicit-upgrade") mode.renewMutableBoundary?.();
         connection.exec(migration.sql);
         if (mode.kind === "explicit-upgrade") {

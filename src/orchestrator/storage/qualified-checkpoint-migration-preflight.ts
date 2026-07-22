@@ -20,6 +20,7 @@ import {
   minimumCheckpointUpperBound,
   minimumFinalEndingScopeBindingsUpperBound,
 } from "../lifecycle/checkpoint-capacity.js";
+import { foldSession, type SessionAggregateState } from "../lifecycle/session-aggregate.js";
 import { canonicalJson } from "../serialization/canonical-json.js";
 import { SchemaCompatibilityError } from "./schema-compatibility.js";
 import type { SqliteConnection, SqliteRow } from "./sqlite-driver.js";
@@ -30,6 +31,14 @@ export const QUALIFIED_CHECKPOINT_STAGE_ROWS_TABLE =
   "qualified_checkpoint_v3_stage_rows";
 
 const PRECONDITION = "MIGRATION_EVIDENCE_V2_PRECONDITION_FAILED" as const;
+const STAGE_TRIGGER_SPECS = Object.freeze([
+  ["qualified_checkpoint_v3_stage_marker_no_insert", QUALIFIED_CHECKPOINT_STAGE_MARKER_TABLE, "INSERT"],
+  ["qualified_checkpoint_v3_stage_marker_no_update", QUALIFIED_CHECKPOINT_STAGE_MARKER_TABLE, "UPDATE"],
+  ["qualified_checkpoint_v3_stage_marker_no_delete", QUALIFIED_CHECKPOINT_STAGE_MARKER_TABLE, "DELETE"],
+  ["qualified_checkpoint_v3_stage_rows_no_insert", QUALIFIED_CHECKPOINT_STAGE_ROWS_TABLE, "INSERT"],
+  ["qualified_checkpoint_v3_stage_rows_no_update", QUALIFIED_CHECKPOINT_STAGE_ROWS_TABLE, "UPDATE"],
+  ["qualified_checkpoint_v3_stage_rows_no_delete", QUALIFIED_CHECKPOINT_STAGE_ROWS_TABLE, "DELETE"],
+] as const);
 const POST_FINAL_PHASES = new Set([
   "final-checkpoint-recorded",
   "ending-materialization-queued",
@@ -78,6 +87,11 @@ const EMPTY_COVERAGE: CheckpointEvidenceCoverageV2 = Object.freeze({
 interface IndexedCheckpoint {
   readonly checkpoint: CheckpointV1;
   readonly eventPosition: string;
+}
+
+interface IndexedLifecycleHistory {
+  readonly checkpoints: ReadonlyMap<string, IndexedCheckpoint>;
+  readonly eventsBySession: ReadonlyMap<string, readonly LifecycleEventV1[]>;
 }
 
 interface StageRow {
@@ -174,6 +188,30 @@ function tableExists(connection: SqliteConnection, schema: "main" | "temp", name
   `).get({ $name: name }), "count") === 1;
 }
 
+function normalizedSql(source: string): string {
+  return source.replace(/\s+/g, " ").trim().replace(/^CREATE TEMP TRIGGER /, "CREATE TRIGGER ");
+}
+
+function assertStageTriggers(connection: SqliteConnection): void {
+  const rows = connection.prepare(`
+    SELECT name, tbl_name, sql
+    FROM temp.sqlite_schema
+    WHERE type = 'trigger' AND name GLOB 'qualified_checkpoint_v3_stage_*'
+    ORDER BY name
+  `).all();
+  if (rows.length !== STAGE_TRIGGER_SPECS.length) fail();
+  const byName = new Map(rows.map((row) => [requiredString(row, "name"), row]));
+  for (const [name, table, operation] of STAGE_TRIGGER_SPECS) {
+    const row = byName.get(name);
+    if (row === undefined || row.tbl_name !== table) fail();
+    const expected = normalizedSql(
+      `CREATE TRIGGER ${name} BEFORE ${operation} ON ${table}
+       BEGIN SELECT RAISE(ABORT, '${PRECONDITION}'); END`,
+    );
+    if (normalizedSql(requiredString(row, "sql")) !== expected) fail();
+  }
+}
+
 function assertStoreIdentity(
   connection: SqliteConnection,
   context: ProjectContext,
@@ -210,8 +248,9 @@ function assertCoverageEmpty(connection: SqliteConnection): void {
   ) fail();
 }
 
-function indexCheckpoints(connection: SqliteConnection): ReadonlyMap<string, IndexedCheckpoint> {
+function indexLifecycleHistory(connection: SqliteConnection): IndexedLifecycleHistory {
   const checkpoints = new Map<string, IndexedCheckpoint>();
+  const eventsBySession = new Map<string, LifecycleEventV1[]>();
   const lifecycleRows = connection.prepare(`
     SELECT global_position, event_id, project_id, vault_id, store_id,
            workspace_id, stream_id, stream_type, stream_version,
@@ -262,6 +301,10 @@ function indexCheckpoints(connection: SqliteConnection): ReadonlyMap<string, Ind
     } catch {
       fail();
     }
+    const sessionId = requiredString(row, "session_id");
+    const history = eventsBySession.get(sessionId) ?? [];
+    history.push(decoded);
+    eventsBySession.set(sessionId, history);
     if (eventType !== "SessionCheckpointRecorded") continue;
     const checkpointEvent = decoded as Extract<
       LifecycleEventV1,
@@ -279,7 +322,25 @@ function indexCheckpoints(connection: SqliteConnection): ReadonlyMap<string, Ind
     ) fail();
     checkpoints.set(checkpoint.checkpointId, { checkpoint, eventPosition });
   }
-  return checkpoints;
+  return { checkpoints, eventsBySession };
+}
+
+function foldAt(
+  history: IndexedLifecycleHistory,
+  sessionId: string,
+  eventPosition: string,
+): SessionAggregateState {
+  const events = history.eventsBySession.get(sessionId)?.filter(
+    (event) => BigInt(event.globalPosition) <= BigInt(eventPosition),
+  ) ?? [];
+  try {
+    const aggregate = foldSession(events);
+    if (aggregate.eventPosition !== BigInt(eventPosition)) fail();
+    return aggregate;
+  } catch (error) {
+    if (error instanceof SchemaCompatibilityError) throw error;
+    fail();
+  }
 }
 
 function eventAt(
@@ -316,7 +377,8 @@ function checkpointPosition(
 function bindingForSummary(
   connection: SqliteConnection,
   projectId: string,
-  checkpoints: ReadonlyMap<string, IndexedCheckpoint>,
+  rootSessionId: string,
+  history: IndexedLifecycleHistory,
   summaryValue: unknown,
 ): FinalEndingScopeBindingV1 {
   const summary = record(summaryValue);
@@ -329,17 +391,59 @@ function bindingForSummary(
     ? null
     : requiredString(summary as unknown as SqliteRow, "latestCheckpointId");
   const checkpointEventPosition = checkpointPosition(
-    checkpoints,
+    history.checkpoints,
     checkpointId,
     childSessionId,
     lastEventPosition,
   );
   const event = eventAt(connection, projectId, childSessionId, lastEventPosition);
   if (String(event.stream_version) !== streamVersion) fail();
+  const aggregate = foldAt(history, childSessionId, lastEventPosition);
+  if (
+    aggregate.kind !== "child"
+    || aggregate.parentSessionId !== rootSessionId
+    || aggregate.state !== childState
+    || aggregate.streamVersion !== BigInt(streamVersion)
+    || aggregate.latestCheckpointId !== checkpointId
+    || aggregate.latestCheckpointEventPosition
+      !== (checkpointEventPosition === null ? null : BigInt(checkpointEventPosition))
+  ) fail();
+  const authorityRows = connection.prepare(`
+    SELECT authority.session_kind, authority.parent_session_id,
+           authority.semantic_state, authority.authority_event_position,
+           authority.latest_checkpoint_id, authority.latest_checkpoint_event_position,
+           authority.terminal_event_position, stream.current_version
+    FROM session_authority AS authority
+    JOIN streams AS stream
+      ON stream.project_id = authority.project_id
+      AND stream.stream_id = authority.stream_id
+    WHERE authority.project_id = $projectId
+      AND authority.session_id = $childSessionId
+  `).all({ $projectId: projectId, $childSessionId: childSessionId });
+  if (authorityRows.length !== 1) fail();
+  const authority = authorityRows[0]!;
+  if (
+    authority.session_kind !== "child"
+    || authority.parent_session_id !== rootSessionId
+    || authority.semantic_state !== aggregate.state
+    || positiveInt64Decimal(authority, "authority_event_position")
+      !== aggregate.eventPosition.toString()
+    || nullableString(authority, "latest_checkpoint_id") !== aggregate.latestCheckpointId
+    || (authority.latest_checkpoint_event_position === null
+      ? null
+      : positiveInt64Decimal(authority, "latest_checkpoint_event_position"))
+      !== (aggregate.latestCheckpointEventPosition?.toString() ?? null)
+    || (authority.terminal_event_position === null
+      ? null
+      : positiveInt64Decimal(authority, "terminal_event_position"))
+      !== (aggregate.terminalEventPosition?.toString() ?? null)
+    || positiveInt64Decimal(authority, "current_version") !== aggregate.streamVersion.toString()
+  ) fail();
 
   const tickets = childState === "transferred" && checkpointId !== null
     ? connection.prepare(`
-        SELECT ticket.transfer_ticket_id, ticket.created_event_position
+        SELECT ticket.transfer_ticket_id, ticket.created_event_position,
+               event.parent_session_id
         FROM child_transfer_tickets AS ticket
         JOIN events AS event
           ON event.global_position = ticket.created_event_position
@@ -347,14 +451,17 @@ function bindingForSummary(
           AND event.session_id = ticket.source_child_session_id
           AND event.event_type = 'ChildWorkTransferCreated'
           AND event.event_schema_version = 1
+          AND event.parent_session_id = ticket.source_parent_session_id
           AND json_extract(event.payload_json, '$.transferTicketId') = ticket.transfer_ticket_id
           AND json_extract(event.payload_json, '$.checkpointId') = ticket.checkpoint_id
         WHERE ticket.project_id = $projectId
+          AND ticket.source_parent_session_id = $rootSessionId
           AND ticket.source_child_session_id = $childSessionId
           AND ticket.checkpoint_id = $checkpointId
           AND ticket.created_event_position = $lastEventPosition
       `).all({
         $projectId: projectId,
+        $rootSessionId: rootSessionId,
         $childSessionId: childSessionId,
         $checkpointId: checkpointId,
         $lastEventPosition: BigInt(lastEventPosition),
@@ -386,17 +493,47 @@ function bindingForSummary(
 function bindingsForCheckpoint(
   connection: SqliteConnection,
   projectId: string,
-  checkpoints: ReadonlyMap<string, IndexedCheckpoint>,
+  history: IndexedLifecycleHistory,
   checkpoint: CheckpointV1,
 ): readonly FinalEndingScopeBindingV1[] {
   const bindings = checkpoint.childSummaries
-    .map((summary) => bindingForSummary(connection, projectId, checkpoints, summary))
+    .map((summary) => bindingForSummary(
+      connection,
+      projectId,
+      checkpoint.sessionId,
+      history,
+      summary,
+    ))
     .sort((left, right) => Buffer.compare(
       Buffer.from(left.childSessionId, "utf8"),
       Buffer.from(right.childSessionId, "utf8"),
     ));
   try {
-    return decodeFinalEndingScopeBindingsV1(bindings);
+    const decoded = decodeFinalEndingScopeBindingsV1(bindings);
+    const retainedTickets = connection.prepare(`
+      SELECT transfer_ticket_id
+      FROM child_transfer_tickets
+      WHERE project_id = $projectId
+        AND source_parent_session_id = $rootSessionId
+        AND created_event_position <= $checkpointEventPosition
+        AND claimed_event_position IS NULL
+      ORDER BY transfer_ticket_id
+    `).all({
+      $projectId: projectId,
+      $rootSessionId: checkpoint.sessionId,
+      $checkpointEventPosition: BigInt(checkpoint.checkpointEventPosition),
+    });
+    const boundTicketIds = decoded
+      .filter((binding) => binding.bindingKind === "carry-forward-ticket")
+      .map((binding) => binding.transferTicketId)
+      .sort();
+    if (
+      retainedTickets.length !== boundTicketIds.length
+      || retainedTickets.some(
+        (ticket, index) => requiredString(ticket, "transfer_ticket_id") !== boundTicketIds[index],
+      )
+    ) fail();
+    return decoded;
   } catch {
     fail();
   }
@@ -470,7 +607,7 @@ function workflowResultStatus(source: string): Record<string, unknown> {
 function finalForWorkflow(
   connection: SqliteConnection,
   projectId: string,
-  checkpoints: ReadonlyMap<string, IndexedCheckpoint>,
+  history: IndexedLifecycleHistory,
   row: SqliteRow,
 ): { eventPosition: string; bindings: readonly FinalEndingScopeBindingV1[] } | null {
   const source = nullableString(row, "result_json");
@@ -497,7 +634,7 @@ function finalForWorkflow(
     return null;
   }
   if (typeof finalCheckpointId !== "string") fail();
-  const indexed = checkpoints.get(finalCheckpointId);
+  const indexed = history.checkpoints.get(finalCheckpointId);
   if (indexed === undefined || indexed.checkpoint.sessionId !== row.session_id) fail();
   if (
     status.finalCheckpointEventPosition !== indexed.eventPosition
@@ -509,7 +646,7 @@ function finalForWorkflow(
   eventAt(connection, projectId, requiredString(row, "session_id"), indexed.eventPosition);
   return {
     eventPosition: indexed.eventPosition,
-    bindings: bindingsForCheckpoint(connection, projectId, checkpoints, indexed.checkpoint),
+    bindings: bindingsForCheckpoint(connection, projectId, history, indexed.checkpoint),
   };
 }
 
@@ -527,7 +664,7 @@ function assertCapacity(bindings: readonly FinalEndingScopeBindingV1[]): void {
 function stageRows(
   connection: SqliteConnection,
   projectId: string,
-  checkpoints: ReadonlyMap<string, IndexedCheckpoint>,
+  history: IndexedLifecycleHistory,
 ): StageRow[] {
   const result: StageRow[] = [];
   const workflows = connection.prepare(`
@@ -550,7 +687,7 @@ function stageRows(
         && phase !== "cancelled"
         && phase !== "abandoned")
     ) fail();
-    const final = finalForWorkflow(connection, projectId, checkpoints, row);
+    const final = finalForWorkflow(connection, projectId, history, row);
     const requiresFinal = POST_FINAL_PHASES.has(phase);
     if (requiresFinal && final === null) fail();
     if (PREFINAL_PHASES.has(phase) && final !== null) fail();
@@ -577,7 +714,7 @@ function stageRows(
 function assertEveryLiveRootCapacity(
   connection: SqliteConnection,
   projectId: string,
-  checkpoints: ReadonlyMap<string, IndexedCheckpoint>,
+  history: IndexedLifecycleHistory,
 ): void {
   const roots = connection.prepare(`
     SELECT session_id FROM session_authority
@@ -603,7 +740,8 @@ function assertEveryLiveRootCapacity(
     const bindings = children.map((child) => bindingForSummary(
       connection,
       projectId,
-      checkpoints,
+      requiredString(root, "session_id"),
+      history,
       {
         childSessionId: child.child_session_id,
         state: child.semantic_state,
@@ -623,8 +761,21 @@ function assertEveryLiveRootCapacity(
         AND event.session_id = ticket.source_child_session_id
         AND event.event_type = 'ChildWorkTransferCreated'
         AND event.event_schema_version = 1
+        AND event.parent_session_id = ticket.source_parent_session_id
         AND json_extract(event.payload_json, '$.transferTicketId') = ticket.transfer_ticket_id
         AND json_extract(event.payload_json, '$.checkpointId') = ticket.checkpoint_id
+      JOIN session_authority AS child
+        ON child.project_id = ticket.project_id
+        AND child.session_id = ticket.source_child_session_id
+        AND child.session_kind = 'child'
+        AND child.parent_session_id = ticket.source_parent_session_id
+        AND child.semantic_state = 'transferred'
+        AND child.terminal_event_position = ticket.created_event_position
+        AND child.latest_checkpoint_id = ticket.checkpoint_id
+      JOIN streams AS stream
+        ON stream.project_id = child.project_id
+        AND stream.stream_id = child.stream_id
+        AND stream.current_version = event.stream_version
       WHERE ticket.project_id = $projectId
         AND ticket.source_parent_session_id = $rootSessionId
       ORDER BY ticket.source_child_session_id, ticket.created_event_position
@@ -637,7 +788,7 @@ function assertEveryLiveRootCapacity(
       const checkpointId = requiredString(ticket, "checkpoint_id");
       const eventPosition = positiveInt64Decimal(ticket, "created_event_position");
       const checkpointEventPosition = checkpointPosition(
-        checkpoints,
+        history.checkpoints,
         checkpointId,
         childSessionId,
         eventPosition,
@@ -799,6 +950,78 @@ export function qualifiedCheckpointMigrationFailure(
   return undefined;
 }
 
+export function assertQualifiedCheckpointMigrationStage(
+  connection: SqliteConnection,
+): void {
+  try {
+    if (
+      !tableExists(connection, "temp", QUALIFIED_CHECKPOINT_STAGE_MARKER_TABLE)
+      || !tableExists(connection, "temp", QUALIFIED_CHECKPOINT_STAGE_ROWS_TABLE)
+    ) fail();
+    const markers = connection.prepare(`
+      SELECT singleton, project_id, vault_id, store_id, source_schema_version,
+             target_schema_version, staged_row_count, sealed
+      FROM temp.${QUALIFIED_CHECKPOINT_STAGE_MARKER_TABLE}
+    `).all();
+    if (markers.length !== 1) fail();
+    const marker = markers[0]!;
+    const markerIdentity = {
+      projectId: requiredString(marker, "project_id"),
+      vaultId: requiredString(marker, "vault_id"),
+      storeId: requiredString(marker, "store_id"),
+    };
+    if (
+      scalarInteger(marker, "singleton") !== 1
+      || scalarInteger(marker, "source_schema_version") !== 2
+      || scalarInteger(marker, "target_schema_version") !== 3
+      || scalarInteger(marker, "sealed") !== 1
+    ) fail();
+    const identity = assertStoreIdentity(connection, {
+      binding: markerIdentity,
+    } as ProjectContext);
+    assertCoverageEmpty(connection);
+    const history = indexLifecycleHistory(connection);
+    assertEveryLiveRootCapacity(connection, identity.projectId, history);
+    const expected = stageRows(connection, identity.projectId, history);
+    const actual = connection.prepare(`
+      SELECT workflow_id, source_generation, source_phase,
+             evidence_frozen_checkpoint_event_position, evidence_frozen_generation,
+             evidence_window_state, final_ending_scope_bindings_json
+      FROM temp.${QUALIFIED_CHECKPOINT_STAGE_ROWS_TABLE}
+      ORDER BY workflow_id
+    `).all();
+    if (
+      scalarInteger(marker, "staged_row_count") !== expected.length
+      || actual.length !== expected.length
+    ) fail();
+    for (let index = 0; index < expected.length; index += 1) {
+      const wanted = expected[index]!;
+      const observed = actual[index]!;
+      const frozenPosition = observed.evidence_frozen_checkpoint_event_position === null
+        ? null
+        : positiveInt64Decimal(observed, "evidence_frozen_checkpoint_event_position");
+      const frozenGeneration = observed.evidence_frozen_generation === null
+        ? null
+        : scalarInteger(observed, "evidence_frozen_generation");
+      if (
+        requiredString(observed, "workflow_id") !== wanted.workflowId
+        || scalarInteger(observed, "source_generation") !== wanted.sourceGeneration
+        || requiredString(observed, "source_phase") !== wanted.sourcePhase
+        || frozenPosition !== wanted.frozenCheckpointEventPosition
+        || frozenGeneration !== wanted.frozenGeneration
+        || requiredString(observed, "evidence_window_state") !== wanted.evidenceWindowState
+        || nullableString(observed, "final_ending_scope_bindings_json")
+          !== wanted.finalEndingScopeBindingsJson
+      ) fail();
+    }
+    assertStageTriggers(connection);
+  } catch (error) {
+    const normalized = qualifiedCheckpointMigrationFailure(error);
+    if (normalized !== undefined) throw normalized;
+    throw new SchemaCompatibilityError(PRECONDITION);
+  }
+}
+
 export class SqliteQualifiedCheckpointMigrationPreflight
 implements QualifiedCheckpointMigrationPreflight {
   assertEligibleAndStage(
@@ -808,9 +1031,9 @@ implements QualifiedCheckpointMigrationPreflight {
     try {
       const identity = assertStoreIdentity(connection, context);
       assertCoverageEmpty(connection);
-      const checkpoints = indexCheckpoints(connection);
-      assertEveryLiveRootCapacity(connection, identity.projectId, checkpoints);
-      const rows = stageRows(connection, identity.projectId, checkpoints);
+      const history = indexLifecycleHistory(connection);
+      assertEveryLiveRootCapacity(connection, identity.projectId, history);
+      const rows = stageRows(connection, identity.projectId, history);
       createStage(connection, identity, rows);
     } catch (error) {
       const normalized = qualifiedCheckpointMigrationFailure(error);

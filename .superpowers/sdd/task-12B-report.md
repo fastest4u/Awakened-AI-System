@@ -52,3 +52,38 @@ Production routing remains disabled. This task does not activate or add a produc
 ## Concerns
 
 None blocking.
+
+---
+
+## Review Fix Wave 1
+
+Review base: `f7f67d4606274aae94f27f4dd1780876841da568`
+
+Required commit subject: `fix: harden qualified checkpoint migration invariants`
+
+Production routing remains disabled. Migration 0002 remains frozen and was not edited.
+
+### Review-Fix RED Evidence
+
+1. After stabilizing legacy fixtures so they represented valid source contracts, the focused qualified-checkpoint migration suite ran 43 tests: 27 passed and 16 failed for the intended missing invariants. The failures covered staged semantic revalidation and forged history (3), genuine-new coverage counting/strict JSON/deferred transition heads (4), workflow binding/result/matrix/generation/UTF-8 boundary rules (6), and child fold/transfer-ticket/retained-ticket-union rules (3).
+2. The first partial implementation reduced that same suite to 11 intended failures (32 passed), preserving the remaining workflow and child/ticket RED cases.
+3. A supplemental target-SQL-only test then proved that a forged empty handoff could smuggle malformed Version 1 lifecycle history: the isolated test failed 0/1 with `Missing expected exception` before the static SQL legacy-shape backstop was added.
+
+### Review-Fix Implementation
+
+- Replaced shallow migration-3 marker checking with a complete handoff assertion that recomputes source identity, coverage emptiness, lifecycle history/checkpoints, capacity, staged rows, and all six TEMP trigger definitions before target SQL runs.
+- Added a target-SQL exact-shape backstop for every known Version 1 lifecycle payload, so caller-authored or forged handoff state cannot bypass legacy-history validation.
+- Folded each child at the root's final checkpoint, cross-bound current-child summaries to event-time and live state, and required exact transfer-ticket/event/authority bindings. Capacity now includes every retained, unclaimed ticket at or before the final checkpoint.
+- Hardened coverage evidence JSON, decimal int64, interval, frame, and fingerprint validation. `new_frame_count` now counts only genuinely new fingerprints, and a deferred per-session head binds the latest transition to the aggregate at commit.
+- Hardened workflow result/binding shapes, direct-versus-wrapper result classification, phase/action mappings, progress semantics, generation fences, and exact frozen child-summary ordering. Removed the undocumented 100-binding cap while retaining the 262,144-byte UTF-8 limit.
+- Corrected test fixtures whose commitment chain/correlation identity or interval/frame contents were inconsistent with the source contract; these were fixture-validity repairs, not relaxed production rules.
+
+### Review-Fix GREEN Evidence
+
+- Focused qualified-checkpoint migration suite — PASS: 45/45 tests, 0 failures (50.26 s).
+- Exact seven-file Task 12B gate — PASS: 225/225 tests, 0 failures, 0 skipped (112.22 s).
+- `npm run typecheck` — PASS, exit 0.
+- Full repository suite, run once after all fixes — PASS: 1,318 tests total; 1,308 passed; 10 skipped; 0 failed (306.75 s test duration, 326.9 s command wall time).
+- `git diff --check` — PASS, exit 0 (line-ending conversion warnings only).
+- Frozen migration 0002 SHA-256 — PASS: `68B4039048A359C523B7842F6D17BAA5760E9760D2B4E9F80BB8A48DC339EB06`.
+- Production routing remains disabled.

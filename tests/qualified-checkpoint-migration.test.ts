@@ -42,8 +42,11 @@ const ROOT_ID = "44444444-4444-4444-8444-444444444444";
 const CHILD_ID = "55555555-5555-4555-8555-555555555555";
 const ADAPTER_ID = "66666666-6666-4666-8666-666666666666";
 const BATCH_ID = "77777777-7777-4777-8777-777777777777";
+const OTHER_ROOT_ID = "99999999-9999-4999-8999-999999999999";
 const H64 = "a".repeat(64);
 const H64_B = "b".repeat(64);
+const H64_C = "c".repeat(64);
+const MAX_INT64 = 9_223_372_036_854_775_807n;
 const registry = [
   eventCoreMigration,
   sessionLifecycleMigration,
@@ -138,22 +141,26 @@ function rawInsert(
 
 function rawEvent(
   connection: SqliteConnection,
-  position: number,
+  position: number | bigint,
   options: {
     readonly streamType?: string;
     readonly sessionId?: string | null;
     readonly eventType?: string;
     readonly eventSchemaVersion?: number;
     readonly payload?: unknown;
-    readonly streamVersion?: number;
+    readonly streamVersion?: number | bigint;
     readonly parentSessionId?: string | null;
+    readonly correlationId?: string;
   } = {},
 ): void {
+  const positionValue = BigInt(position);
+  const uuidTail = (offset: bigint): string => ((positionValue + offset) & 0xffff_ffff_ffffn)
+    .toString(16).padStart(12, "0");
   const sessionId = options.sessionId ?? null;
   const streamType = options.streamType ?? "generic";
   rawInsert(connection, "events", {
-    global_position: position,
-    event_id: `${position.toString(16).padStart(8, "0")}-0000-4000-8000-${position.toString(16).padStart(12, "0")}`,
+    global_position: positionValue,
+    event_id: `00000000-0000-4000-8000-${uuidTail(0n)}`,
     project_id: PROJECT_ID,
     vault_id: VAULT_ID,
     store_id: STORE_ID,
@@ -170,10 +177,11 @@ function rawEvent(
     actor_role: "primary",
     agent_id: "agent-1",
     client_instance_id: "client-1",
-    correlation_id: `${(position + 10_000).toString(16).padStart(8, "0")}-0000-4000-8000-${(position + 10_000).toString(16).padStart(12, "0")}`,
+    correlation_id: options.correlationId
+      ?? `00000000-0000-4000-8000-${uuidTail(10_000n)}`,
     causation_id: null,
-    command_id: `${(position + 20_000).toString(16).padStart(8, "0")}-0000-4000-8000-${(position + 20_000).toString(16).padStart(12, "0")}`,
-    idempotency_key: `idempotency-${position}`,
+    command_id: `00000000-0000-4000-8000-${uuidTail(20_000n)}`,
+    idempotency_key: `idempotency-${positionValue}`,
     command_event_index: 0,
     occurred_at: NOW,
     recorded_at: NOW,
@@ -348,6 +356,197 @@ function evidencePayload(
   };
 }
 
+function evidenceFingerprintRow(
+  overrides: Readonly<Record<string, SqliteValue>> = {},
+): Record<string, SqliteValue> {
+  return {
+    project_id: PROJECT_ID,
+    session_id: ROOT_ID,
+    adapter_session_id: ADAPTER_ID,
+    ordinal: 0,
+    frame_id: "88888888-8888-4888-8888-888888888888",
+    source_kind: "model-turn",
+    observed_at: NOW,
+    fingerprint_algorithm: "hmac-sha256",
+    fingerprint_schema_version: 1,
+    fingerprint_key_id: "key-1",
+    fingerprint_domain: "pm-evidence-frame-v1",
+    fingerprint_value: H64_B,
+    batch_id: BATCH_ID,
+    recorded_event_position: 1,
+    created_at: NOW,
+    ...overrides,
+  };
+}
+
+function seedRootAuthorityForCoverage(connection: SqliteConnection): void {
+  rawInsert(connection, "streams", {
+    project_id: PROJECT_ID,
+    stream_id: `session/${ROOT_ID}`,
+    stream_type: "session",
+    current_version: 2,
+    created_at: NOW,
+    updated_at: NOW,
+  });
+  rawInsert(connection, "session_authority", {
+    project_id: PROJECT_ID,
+    session_id: ROOT_ID,
+    stream_id: `session/${ROOT_ID}`,
+    session_kind: "root",
+    parent_session_id: null,
+    workspace_id: "1".repeat(64),
+    client_namespace: "tests",
+    semantic_state: "active",
+    owner_generation: 1,
+    child_capability_generation: null,
+    direct_access_enabled: 0,
+    continuity_fingerprint_algorithm: "hmac-sha256",
+    continuity_fingerprint_schema_version: 1,
+    continuity_fingerprint_key_id: "key-1",
+    continuity_fingerprint_domain: "pm-continuity-v1",
+    continuity_fingerprint: H64,
+    root_handle_capability_version: 1,
+    root_handle_key_id: "key-1",
+    root_handle_issue_nonce: H64,
+    root_handle_issued_at: NOW,
+    root_handle_policy_code: "root-handle",
+    root_handle_expiry_kind: "until-revoked",
+    root_handle_expires_at: null,
+    root_handle_actor_role: "primary",
+    root_handle_client_instance_id: "client-1",
+    root_handle_verifier: H64,
+    root_handle_issuance_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    resume_token_capability_version: 1,
+    resume_token_key_id: "key-1",
+    resume_token_issue_nonce: H64,
+    resume_token_issued_at: NOW,
+    resume_token_policy_code: "resume-token",
+    resume_token_expiry_kind: "until-revoked",
+    resume_token_expires_at: null,
+    resume_token_actor_role: "primary",
+    resume_token_verifier: H64,
+    resume_token_issuance_id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+    authority_commitment: H64,
+    authority_event_position: 1,
+    created_at: NOW,
+    updated_at: NOW,
+  });
+}
+
+function seedCoverageBaseline(connection: SqliteConnection): void {
+  connection.exec("BEGIN IMMEDIATE");
+  rawEvent(connection, 1, {
+    streamType: "session",
+    sessionId: ROOT_ID,
+    eventType: "EvidenceCoverageRecorded",
+    eventSchemaVersion: 2,
+    payload: evidencePayload(),
+  });
+  rawInsert(connection, "session_evidence_coverage_transitions", transitionRow());
+  rawInsert(connection, "session_evidence_coverage", coverageRow());
+  rawInsert(connection, "session_evidence_fingerprints", evidenceFingerprintRow());
+  connection.exec("COMMIT");
+}
+
+function seedSparseCoverageBaseline(connection: SqliteConnection): void {
+  const secondBatch = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  connection.exec("BEGIN IMMEDIATE");
+  rawEvent(connection, 1, {
+    streamType: "session",
+    sessionId: ROOT_ID,
+    eventType: "EvidenceCoverageRecorded",
+    eventSchemaVersion: 2,
+    payload: evidencePayload({
+      batchFirstOrdinal: "1",
+      batchLastOrdinal: "1",
+      coverageLastOrdinal: "1",
+      highestContiguousOrdinal: null,
+      missingIntervals: [{ firstOrdinal: "0", lastOrdinal: "0" }],
+      frames: [{
+        frameId: "aaaaaaaa-0000-4000-8000-000000000001",
+        ordinal: "1",
+        sourceKind: "tool-request",
+        observedAt: NOW,
+        contentFingerprint: H64,
+      }],
+    }),
+  });
+  rawInsert(connection, "session_evidence_coverage_transitions", transitionRow({
+    batch_first_ordinal: 1,
+    batch_last_ordinal: 1,
+    coverage_last_ordinal: 1,
+    highest_contiguous_ordinal: -1,
+    missing_intervals_json: "[[0,0]]",
+  }));
+  rawInsert(connection, "session_evidence_coverage", coverageRow(
+    ADAPTER_ID,
+    ROOT_ID,
+    {
+      last_ordinal: 1,
+      highest_contiguous_ordinal: -1,
+      missing_intervals_json: "[[0,0]]",
+    },
+  ));
+  rawInsert(connection, "session_evidence_fingerprints", evidenceFingerprintRow({
+    ordinal: 1,
+    frame_id: "aaaaaaaa-0000-4000-8000-000000000001",
+    source_kind: "tool-request",
+    fingerprint_value: H64,
+  }));
+  rawEvent(connection, 2, {
+    streamType: "session",
+    sessionId: ROOT_ID,
+    streamVersion: 2,
+    eventType: "EvidenceCoverageRecorded",
+    eventSchemaVersion: 2,
+    payload: evidencePayload({
+      batchId: secondBatch,
+      batchFirstOrdinal: "3",
+      batchLastOrdinal: "3",
+      coverageLastOrdinal: "3",
+      highestContiguousOrdinal: null,
+      missingIntervals: [
+        { firstOrdinal: "0", lastOrdinal: "0" },
+        { firstOrdinal: "2", lastOrdinal: "2" },
+      ],
+      coverageFingerprint: H64_B,
+      frames: [{
+        frameId: "aaaaaaaa-0000-4000-8000-000000000003",
+        ordinal: "3",
+        sourceKind: "tool-result",
+        observedAt: NOW,
+        contentFingerprint: H64_B,
+      }],
+    }),
+  });
+  rawInsert(connection, "session_evidence_coverage_transitions", transitionRow({
+    batch_id: secondBatch,
+    batch_event_position: 2,
+    batch_first_ordinal: 3,
+    batch_last_ordinal: 3,
+    coverage_last_ordinal: 3,
+    highest_contiguous_ordinal: -1,
+    missing_intervals_json: "[[0,0],[2,2]]",
+    previous_coverage_fingerprint_value: H64,
+    coverage_fingerprint_value: H64_B,
+  }));
+  connection.prepare(`
+    UPDATE session_evidence_coverage
+    SET last_ordinal = 3, highest_contiguous_ordinal = -1,
+        missing_intervals_json = '[[0,0],[2,2]]',
+        latest_batch_id = $batchId, latest_batch_event_position = 2,
+        coverage_fingerprint_value = $fingerprint, updated_at = $now
+  `).run({ $batchId: secondBatch, $fingerprint: H64_B, $now: NOW });
+  rawInsert(connection, "session_evidence_fingerprints", evidenceFingerprintRow({
+    ordinal: 3,
+    frame_id: "aaaaaaaa-0000-4000-8000-000000000003",
+    source_kind: "tool-result",
+    batch_id: secondBatch,
+    recorded_event_position: 2,
+  }));
+  connection.exec("COMMIT");
+}
+
 function seedRootStart(connection: SqliteConnection, position = 1): void {
   rawEvent(connection, position, {
     streamType: "session",
@@ -409,6 +608,373 @@ function sessionEndStatus(
     safeFailureCode: null,
     materializationRequired: false,
   };
+}
+
+function currentChildBinding(
+  index: number,
+  overrides: Readonly<Record<string, unknown>> = {},
+): Record<string, unknown> {
+  return {
+    bindingKind: "current-child",
+    bindingVersion: 1,
+    checkpointEventPosition: null,
+    checkpointId: null,
+    childSessionId: `00000000-0000-4000-8000-${(index + 1).toString(16).padStart(12, "0")}`,
+    childState: "active",
+    lastEventPosition: String(100_000 + index),
+    streamVersion: "1",
+    transferTicketEventPosition: null,
+    transferTicketId: null,
+    ...overrides,
+  };
+}
+
+function endingScopeBytes(value: unknown): number {
+  return Buffer.byteLength(canonicalJson(value as never), "utf8");
+}
+
+function exactEndingScopeBindingBytes(targetBytes: number): readonly Record<string, unknown>[] {
+  const bindings: Record<string, unknown>[] = [];
+  let currentBytes = 2;
+  while (true) {
+    const next = currentChildBinding(bindings.length);
+    const nextBytes = endingScopeBytes(next) + (bindings.length === 0 ? 0 : 1);
+    if (currentBytes + nextBytes > targetBytes) break;
+    bindings.push(next);
+    currentBytes += nextBytes;
+  }
+  let remaining = targetBytes - currentBytes;
+  for (let index = 0; index < bindings.length && remaining > 0; index += 1) {
+    const increment = Math.min(18, remaining);
+    bindings[index] = {
+      ...bindings[index],
+      streamVersion: `1${"0".repeat(increment)}`,
+    };
+    remaining -= increment;
+  }
+  if (remaining !== 0 || endingScopeBytes(bindings) !== targetBytes) {
+    throw new Error(`unable to synthesize exact ${targetBytes}-byte ending scope`);
+  }
+  return bindings;
+}
+
+function phaseResult(
+  action: string,
+  previousPhase: string,
+  status: Record<string, unknown>,
+): Record<string, unknown> {
+  return {
+    resultVersion: 2,
+    action,
+    progressed: true,
+    previousPhase,
+    status,
+  };
+}
+
+function seedRootFinalCheckpoint(
+  connection: SqliteConnection,
+  childSummaries: readonly Record<string, unknown>[] = [],
+): ReturnType<typeof checkpointFixture> {
+  const finalCheckpoint = {
+    ...checkpointFixture({
+      checkpointId: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee" as never,
+      sessionId: ROOT_ID as never,
+      baseEventPosition: 1,
+      checkpointEventPosition: MAX_INT64,
+    }),
+    childSummaries,
+  };
+  rawEvent(connection, MAX_INT64, {
+    streamType: "session",
+    sessionId: ROOT_ID,
+    streamVersion: 2,
+    eventType: "SessionCheckpointRecorded",
+    payload: {
+      checkpoint: finalCheckpoint,
+      baseEventPosition: "1",
+      checkpointEventPosition: MAX_INT64.toString(),
+    },
+  });
+  return finalCheckpoint as unknown as ReturnType<typeof checkpointFixture>;
+}
+
+function seedFinalWorkflowGuardFixture(
+  connection: SqliteConnection,
+  bindings: readonly Record<string, unknown>[],
+  write: "insert" | "update",
+  persistedBindings: readonly Record<string, unknown>[] = bindings,
+): void {
+  connection.exec("DROP TRIGGER session_authority_insert_guard");
+  for (const [index, binding] of bindings.entries()) {
+    const childSessionId = String(binding.childSessionId);
+    const lastEventPosition = BigInt(String(binding.lastEventPosition));
+    const streamVersion = BigInt(String(binding.streamVersion));
+    rawEvent(connection, lastEventPosition, {
+      streamType: "session",
+      sessionId: childSessionId,
+      parentSessionId: ROOT_ID,
+      streamVersion,
+      eventType: "GenericSessionNote",
+      payload: { fixtureIndex: index },
+    });
+    rawInsert(connection, "streams", {
+      project_id: PROJECT_ID,
+      stream_id: `session/${childSessionId}`,
+      stream_type: "session",
+      current_version: streamVersion,
+      created_at: NOW,
+      updated_at: NOW,
+    });
+    rawInsert(connection, "session_authority", {
+      project_id: PROJECT_ID,
+      session_id: childSessionId,
+      stream_id: `session/${childSessionId}`,
+      session_kind: "child",
+      parent_session_id: ROOT_ID,
+      workspace_id: "1".repeat(64),
+      client_namespace: "tests",
+      semantic_state: "active",
+      direct_access_enabled: 0,
+      authority_commitment: H64,
+      authority_event_position: lastEventPosition,
+      created_at: NOW,
+      updated_at: NOW,
+    });
+  }
+  const finalCheckpoint = seedRootFinalCheckpoint(
+    connection,
+    bindings.map((binding) => ({
+      childSessionId: binding.childSessionId,
+      state: binding.childState,
+      lastEventPosition: binding.lastEventPosition,
+      streamVersion: binding.streamVersion,
+      latestCheckpointId: binding.checkpointId,
+    })),
+  );
+  const status = sessionEndStatus(
+    "final-checkpoint-recorded",
+    String(finalCheckpoint.checkpointId),
+    MAX_INT64.toString(),
+  );
+  const bindingsJson = canonicalJson(persistedBindings as never);
+  if (write === "insert") {
+    rawInsert(connection, "workflow_instances", lifecycleWorkflow({
+      phase: "final-checkpoint-recorded",
+      result_json: canonicalJson(status),
+      evidence_frozen_checkpoint_event_position: MAX_INT64,
+      evidence_frozen_generation: 1,
+      final_ending_scope_bindings_json: bindingsJson,
+    }));
+    return;
+  }
+  rawInsert(connection, "workflow_instances", lifecycleWorkflow({ phase: "children-resolved" }));
+  connection.prepare(`
+    UPDATE workflow_instances
+    SET phase = 'final-checkpoint-recorded', result_json = $result,
+        evidence_frozen_checkpoint_event_position = $position,
+        evidence_frozen_generation = 1,
+        final_ending_scope_bindings_json = $bindings
+  `).run({
+    $result: canonicalJson(phaseResult(
+      "record-final-checkpoint-and-queue-ending",
+      "children-resolved",
+      status,
+    )),
+    $position: MAX_INT64,
+    $bindings: bindingsJson,
+  });
+}
+
+function seedTransferredFinalHistory(
+  connection: SqliteConnection,
+  options: {
+    readonly summaryState?: "active" | "transferred";
+    readonly ticketParentSessionId?: string;
+    readonly includeTicket?: boolean;
+    readonly includeSummary?: boolean;
+    readonly phase?: "final-checkpoint-recorded" | "cancelled" | "abandoned";
+  } = {},
+): void {
+  const childCorrelationId = "12121212-1212-4121-8121-121212121212";
+  connection.exec("PRAGMA foreign_keys = OFF");
+  connection.exec("DROP TRIGGER workflow_instances_lifecycle_insert_guard");
+  seedRootStart(connection, 1);
+  const childFork = lifecycleEvent(1, "SessionForked", {}, {
+    projectId: PROJECT_ID as never,
+    vaultId: VAULT_ID as never,
+    storeId: STORE_ID as never,
+    workspaceId: "1".repeat(64) as never,
+    sessionId: CHILD_ID as never,
+    parentSessionId: ROOT_ID as never,
+    globalPosition: 2,
+    streamVersion: 1,
+    authorityCommitment: H64,
+  });
+  rawEvent(connection, 2, {
+    streamType: "session",
+    sessionId: CHILD_ID,
+    parentSessionId: ROOT_ID,
+    streamVersion: 1,
+    eventType: "SessionForked",
+    payload: childFork.payload,
+    correlationId: childCorrelationId,
+  });
+  const childCheckpoint = checkpointFixture({
+    checkpointId: "cccccccc-cccc-4ccc-8ccc-cccccccccccc" as never,
+    sessionId: CHILD_ID as never,
+    parentSessionId: ROOT_ID as never,
+    baseEventPosition: 2,
+    checkpointEventPosition: 3,
+  });
+  rawEvent(connection, 3, {
+    streamType: "session",
+    sessionId: CHILD_ID,
+    parentSessionId: ROOT_ID,
+    streamVersion: 2,
+    eventType: "SessionCheckpointRecorded",
+    payload: {
+      checkpoint: childCheckpoint,
+      baseEventPosition: "2",
+      checkpointEventPosition: "3",
+    },
+    correlationId: childCorrelationId,
+  });
+  const suspended = lifecycleEvent(3, "ChildSessionSuspended", {
+    checkpointId: childCheckpoint.checkpointId,
+    authorityCommitment: H64_B,
+  }, {
+    projectId: PROJECT_ID as never,
+    vaultId: VAULT_ID as never,
+    storeId: STORE_ID as never,
+    workspaceId: "1".repeat(64) as never,
+    sessionId: CHILD_ID as never,
+    parentSessionId: ROOT_ID as never,
+    globalPosition: 4,
+    streamVersion: 3,
+    authorityCommitment: H64_B,
+  });
+  rawEvent(connection, 4, {
+    streamType: "session",
+    sessionId: CHILD_ID,
+    parentSessionId: ROOT_ID,
+    streamVersion: 3,
+    eventType: "ChildSessionSuspended",
+    payload: suspended.payload,
+    correlationId: childCorrelationId,
+  });
+  const transfer = lifecycleEvent(4, "ChildWorkTransferCreated", {
+    checkpointId: childCheckpoint.checkpointId,
+    authorityCommitment: H64_C,
+  }, {
+    projectId: PROJECT_ID as never,
+    vaultId: VAULT_ID as never,
+    storeId: STORE_ID as never,
+    workspaceId: "1".repeat(64) as never,
+    sessionId: CHILD_ID as never,
+    parentSessionId: ROOT_ID as never,
+    globalPosition: 5,
+    streamVersion: 4,
+    authorityCommitment: H64_C,
+  });
+  rawEvent(connection, 5, {
+    streamType: "session",
+    sessionId: CHILD_ID,
+    parentSessionId: ROOT_ID,
+    streamVersion: 4,
+    eventType: "ChildWorkTransferCreated",
+    payload: transfer.payload,
+    correlationId: childCorrelationId,
+  });
+  rawInsert(connection, "streams", {
+    project_id: PROJECT_ID,
+    stream_id: `session/${CHILD_ID}`,
+    stream_type: "session",
+    current_version: 4,
+    created_at: NOW,
+    updated_at: NOW,
+  });
+  rawInsert(connection, "session_authority", {
+    project_id: PROJECT_ID,
+    session_id: CHILD_ID,
+    stream_id: `session/${CHILD_ID}`,
+    session_kind: "child",
+    parent_session_id: ROOT_ID,
+    workspace_id: "1".repeat(64),
+    client_namespace: "tests",
+    semantic_state: "transferred",
+    owner_generation: null,
+    child_capability_generation: null,
+    direct_access_enabled: 0,
+    authority_commitment: H64_C,
+    authority_event_position: 5,
+    latest_checkpoint_id: childCheckpoint.checkpointId,
+    latest_checkpoint_event_position: 3,
+    latest_checkpoint_fingerprint: createHash("sha256")
+      .update("project-memory/checkpoint/v1\n", "utf8")
+      .update(canonicalJson(childCheckpoint), "utf8")
+      .digest("hex"),
+    terminal_event_position: 5,
+    terminal_event_type: "ChildWorkTransferCreated",
+    terminal_at: NOW,
+    created_at: NOW,
+    updated_at: NOW,
+  });
+  if (options.includeTicket !== false) {
+    rawInsert(connection, "child_transfer_tickets", {
+      project_id: PROJECT_ID,
+      transfer_ticket_id: transfer.payload.transferTicketId,
+      source_parent_session_id: options.ticketParentSessionId ?? ROOT_ID,
+      source_child_session_id: CHILD_ID,
+      source_assignment_json: "{}",
+      source_scope_json: "{}",
+      checkpoint_id: childCheckpoint.checkpointId,
+      follow_ups_json: "[]",
+      source_state_json: "{}",
+      lineage_json: "{}",
+      created_event_position: 5,
+      created_at: NOW,
+      claimed_by_root_session_id: null,
+      claimed_child_session_id: null,
+      claimed_event_position: null,
+      claimed_at: null,
+    });
+  }
+  const rootFinal = {
+    ...checkpointFixture({
+      checkpointId: "dddddddd-dddd-4ddd-8ddd-dddddddddddd" as never,
+      sessionId: ROOT_ID as never,
+      baseEventPosition: 1,
+      checkpointEventPosition: 6,
+    }),
+    childSummaries: options.includeSummary === false ? [] : [{
+        childSessionId: CHILD_ID,
+        state: options.summaryState ?? "transferred",
+        lastEventPosition: "5",
+        streamVersion: "4",
+        latestCheckpointId: childCheckpoint.checkpointId,
+      }],
+  };
+  rawEvent(connection, 6, {
+    streamType: "session",
+    sessionId: ROOT_ID,
+    streamVersion: 2,
+    eventType: "SessionCheckpointRecorded",
+    payload: {
+      checkpoint: rootFinal,
+      baseEventPosition: "1",
+      checkpointEventPosition: "6",
+    },
+  });
+  const phase = options.phase ?? "final-checkpoint-recorded";
+  rawInsert(connection, "workflow_instances", legacyLifecycleWorkflow({
+    phase,
+    result_json: canonicalJson(sessionEndStatus(
+      phase,
+      String(rootFinal.checkpointId),
+      "6",
+    )),
+  }));
 }
 
 function installForgedEmptyStage(connection: SqliteConnection): void {
@@ -609,13 +1175,20 @@ describe("qualified checkpoint migration", () => {
     `).get()?.sql);
     assert.match(transitionSql, /STRICT$/);
     assert.doesNotMatch(transitionSql, /observed_at|content_fingerprint|body|evidence_reference/i);
+    const headSql = String(connection.prepare(`
+      SELECT sql FROM sqlite_schema
+      WHERE type = 'table' AND name = 'session_evidence_coverage_transition_heads'
+    `).get()?.sql);
+    assert.match(headSql, /DEFERRABLE INITIALLY DEFERRED/);
+    assert.match(headSql, /STRICT$/);
     assert.equal(connection.prepare(`
       SELECT count(*) AS count FROM sqlite_schema
       WHERE type = 'index' AND name IN (
         'session_evidence_coverage_project_adapter',
-        'session_evidence_coverage_transitions_snapshot'
+        'session_evidence_coverage_transitions_snapshot',
+        'session_evidence_coverage_latest_transition'
       )
-    `).get()?.count, 2n);
+    `).get()?.count, 3n);
     assert.equal(connection.prepare(`
       SELECT count(*) AS count FROM sqlite_schema
       WHERE type = 'trigger' AND name IN (
@@ -623,13 +1196,14 @@ describe("qualified checkpoint migration", () => {
         'session_evidence_coverage_v3_update_guard',
         'session_evidence_coverage_no_delete',
         'session_evidence_coverage_transitions_insert_guard',
+        'session_evidence_coverage_transitions_advance_head',
         'session_evidence_coverage_transitions_no_update',
         'session_evidence_coverage_transitions_no_delete',
         'events_lifecycle_version_v3_guard',
         'workflow_instances_evidence_v3_insert_guard',
         'workflow_instances_evidence_v3_update_guard'
       )
-    `).get()?.count, 9n);
+    `).get()?.count, 10n);
     assert.match(
       qualifiedCheckpointCoverageMigration.sql,
       /length\(CAST\(NEW\.final_ending_scope_bindings_json AS BLOB\)\) > 262144/,
@@ -728,6 +1302,114 @@ describe("qualified checkpoint migration", () => {
         WHERE name GLOB 'qualified_checkpoint_v3_stage*'
       `).get()?.count, 0n);
     }
+  });
+
+  it("semantically revalidates staged frozen rows before any schema-3 copy", () => {
+    const connection = sourceConnection(2);
+    connection.exec("PRAGMA foreign_keys = OFF");
+    rawInsert(connection, "workflow_instances", legacyLifecycleWorkflow());
+    assert.throws(
+      () => new MigrationRunner().apply(connection, registry, NOW, mode({
+        kind: "explicit-upgrade",
+        expectedAppliedVersion: 2,
+        beforeMigration(candidate: SqliteConnection, migration: { version: number }): void {
+          if (migration.version !== 3) return;
+          new SqliteQualifiedCheckpointMigrationPreflight()
+            .assertEligibleAndStage(candidate, context);
+          candidate.exec(`
+            DROP TRIGGER qualified_checkpoint_v3_stage_rows_no_update;
+            UPDATE ${QUALIFIED_CHECKPOINT_STAGE_ROWS_TABLE}
+            SET evidence_frozen_checkpoint_event_position = 999,
+                evidence_frozen_generation = 1,
+                final_ending_scope_bindings_json = '[]';
+            CREATE TEMP TRIGGER qualified_checkpoint_v3_stage_rows_no_update
+            BEFORE UPDATE ON ${QUALIFIED_CHECKPOINT_STAGE_ROWS_TABLE}
+            BEGIN SELECT RAISE(ABORT, 'MIGRATION_EVIDENCE_V2_PRECONDITION_FAILED'); END;
+          `);
+        },
+      })),
+      /MIGRATION_EVIDENCE_V2_PRECONDITION_FAILED/,
+    );
+    assert.deepEqual(versions(connection), [1, 2]);
+    assert.equal(schemaVersion(connection), 2);
+  });
+
+  it("rejects recreated stage trigger names with the wrong target, operation, or body", () => {
+    const replacements = [
+      `CREATE TEMP TRIGGER qualified_checkpoint_v3_stage_marker_no_insert
+       BEFORE UPDATE ON ${QUALIFIED_CHECKPOINT_STAGE_ROWS_TABLE}
+       BEGIN SELECT RAISE(ABORT, 'MIGRATION_EVIDENCE_V2_PRECONDITION_FAILED'); END;`,
+      `CREATE TEMP TRIGGER qualified_checkpoint_v3_stage_marker_no_insert
+       BEFORE INSERT ON ${QUALIFIED_CHECKPOINT_STAGE_MARKER_TABLE}
+       BEGIN SELECT RAISE(ABORT, 'WRONG_BODY'); END;`,
+    ];
+    for (const replacement of replacements) {
+      const connection = sourceConnection(2);
+      assert.throws(
+        () => new MigrationRunner().apply(connection, registry, NOW, mode({
+          kind: "explicit-upgrade",
+          expectedAppliedVersion: 2,
+          beforeMigration(candidate: SqliteConnection, migration: { version: number }): void {
+            if (migration.version !== 3) return;
+            new SqliteQualifiedCheckpointMigrationPreflight()
+              .assertEligibleAndStage(candidate, context);
+            candidate.exec(`
+              DROP TRIGGER qualified_checkpoint_v3_stage_marker_no_insert;
+              ${replacement}
+            `);
+          },
+        })),
+        /MIGRATION_EVIDENCE_V2_PRECONDITION_FAILED/,
+      );
+      assert.deepEqual(versions(connection), [1, 2]);
+      assert.equal(schemaVersion(connection), 2);
+    }
+  });
+
+  it("does not let a forged override smuggle malformed legacy lifecycle history", () => {
+    const connection = sourceConnection(2);
+    connection.exec("PRAGMA foreign_keys = OFF");
+    seedRootStart(connection);
+    rawEvent(connection, 2, {
+      streamType: "session",
+      sessionId: ROOT_ID,
+      streamVersion: 2,
+      eventType: "SessionSuspended",
+      eventSchemaVersion: 1,
+      payload: { authorityCommitment: H64, unexpected: true },
+    });
+    assert.throws(
+      () => new MigrationRunner().apply(connection, registry, NOW, mode({
+        kind: "explicit-upgrade",
+        expectedAppliedVersion: 2,
+        beforeMigration(candidate: SqliteConnection, migration: { version: number }): void {
+          if (migration.version === 3) installForgedEmptyStage(candidate);
+        },
+      })),
+      /MIGRATION_EVIDENCE_V2_PRECONDITION_FAILED/,
+    );
+    assert.deepEqual(versions(connection), [1, 2]);
+    assert.equal(schemaVersion(connection), 2);
+  });
+
+  it("backstops malformed legacy lifecycle history inside target SQL", () => {
+    const connection = sourceConnection(2);
+    connection.exec("PRAGMA foreign_keys = OFF");
+    seedRootStart(connection);
+    rawEvent(connection, 2, {
+      streamType: "session",
+      sessionId: ROOT_ID,
+      streamVersion: 2,
+      eventType: "SessionSuspended",
+      eventSchemaVersion: 1,
+      payload: { authorityCommitment: H64, unexpected: true },
+    });
+    installForgedEmptyStage(connection);
+    assert.throws(
+      () => connection.exec(qualifiedCheckpointCoverageMigration.sql),
+      /MIGRATION_EVIDENCE_V2_PRECONDITION_FAILED/,
+    );
+    assert.equal(schemaVersion(connection), 2);
   });
 
   it("normalizes only the exact migration precondition failure tuple", () => {
@@ -854,6 +1536,296 @@ describe("qualified checkpoint migration", () => {
     );
   });
 
+  it("accepts an identical-overlap batch with zero genuinely new frames", () => {
+    const connection = currentConnection();
+    seedCoverageBaseline(connection);
+    const secondBatch = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    assert.doesNotThrow(() => {
+      connection.exec("BEGIN IMMEDIATE");
+      rawEvent(connection, 2, {
+        streamType: "session",
+        sessionId: ROOT_ID,
+        streamVersion: 2,
+        eventType: "EvidenceCoverageRecorded",
+        eventSchemaVersion: 2,
+        payload: evidencePayload({ batchId: secondBatch }),
+      });
+      rawInsert(connection, "session_evidence_coverage_transitions", transitionRow({
+        batch_id: secondBatch,
+        batch_event_position: 2,
+        previous_coverage_fingerprint_value: H64,
+        new_frame_count: 0,
+      }));
+      connection.prepare(`
+        UPDATE session_evidence_coverage
+        SET latest_batch_id = $batchId, latest_batch_event_position = 2,
+            updated_at = $now
+      `).run({ $batchId: secondBatch, $now: NOW });
+      connection.exec("COMMIT");
+    });
+  });
+
+  it("accepts a mixed-overlap batch whose genuinely-new subset is sparse", () => {
+    const connection = currentConnection();
+    seedSparseCoverageBaseline(connection);
+    const thirdBatch = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    const frames = [
+      {
+        frameId: "aaaaaaaa-0000-4000-8000-000000000000",
+        ordinal: "0",
+        sourceKind: "model-turn",
+        observedAt: NOW,
+        contentFingerprint: H64_C,
+      },
+      {
+        frameId: "aaaaaaaa-0000-4000-8000-000000000001",
+        ordinal: "1",
+        sourceKind: "tool-request",
+        observedAt: NOW,
+        contentFingerprint: H64,
+      },
+      {
+        frameId: "aaaaaaaa-0000-4000-8000-000000000002",
+        ordinal: "2",
+        sourceKind: "external-observation",
+        observedAt: NOW,
+        contentFingerprint: H64_C,
+      },
+      {
+        frameId: "aaaaaaaa-0000-4000-8000-000000000003",
+        ordinal: "3",
+        sourceKind: "tool-result",
+        observedAt: NOW,
+        contentFingerprint: H64_B,
+      },
+      {
+        frameId: "aaaaaaaa-0000-4000-8000-000000000004",
+        ordinal: "4",
+        sourceKind: "adapter-event",
+        observedAt: NOW,
+        contentFingerprint: H64_C,
+      },
+    ];
+    assert.doesNotThrow(() => {
+      connection.exec("BEGIN IMMEDIATE");
+      rawEvent(connection, 3, {
+        streamType: "session",
+        sessionId: ROOT_ID,
+        streamVersion: 3,
+        eventType: "EvidenceCoverageRecorded",
+        eventSchemaVersion: 2,
+        payload: evidencePayload({
+          batchId: thirdBatch,
+          batchLastOrdinal: "4",
+          coverageLastOrdinal: "4",
+          highestContiguousOrdinal: "4",
+          coverageFingerprint: H64_C,
+          frames,
+        }),
+      });
+      rawInsert(connection, "session_evidence_coverage_transitions", transitionRow({
+        batch_id: thirdBatch,
+        batch_event_position: 3,
+        batch_last_ordinal: 4,
+        coverage_last_ordinal: 4,
+        highest_contiguous_ordinal: 4,
+        previous_coverage_fingerprint_value: H64_B,
+        coverage_fingerprint_value: H64_C,
+        new_frame_count: 3,
+      }));
+      connection.prepare(`
+        UPDATE session_evidence_coverage
+        SET last_ordinal = 4, highest_contiguous_ordinal = 4,
+            missing_intervals_json = '[]',
+            latest_batch_id = $batchId, latest_batch_event_position = 3,
+            coverage_fingerprint_value = $fingerprint, updated_at = $now
+      `).run({
+        $batchId: thirdBatch,
+        $fingerprint: H64_C,
+        $now: NOW,
+      });
+      rawInsert(connection, "session_evidence_fingerprints", evidenceFingerprintRow({
+        ordinal: 0,
+        frame_id: "aaaaaaaa-0000-4000-8000-000000000000",
+        fingerprint_value: H64_C,
+        batch_id: thirdBatch,
+        recorded_event_position: 3,
+      }));
+      rawInsert(connection, "session_evidence_fingerprints", evidenceFingerprintRow({
+        ordinal: 2,
+        frame_id: "aaaaaaaa-0000-4000-8000-000000000002",
+        source_kind: "external-observation",
+        fingerprint_value: H64_C,
+        batch_id: thirdBatch,
+        recorded_event_position: 3,
+      }));
+      rawInsert(connection, "session_evidence_fingerprints", evidenceFingerprintRow({
+        ordinal: 4,
+        frame_id: "aaaaaaaa-0000-4000-8000-000000000004",
+        source_kind: "adapter-event",
+        fingerprint_value: H64_C,
+        batch_id: thirdBatch,
+        recorded_event_position: 3,
+      }));
+      connection.exec("COMMIT");
+    });
+  });
+
+  it("rejects a contradictory overlap before transition persistence", () => {
+    const connection = currentConnection();
+    seedCoverageBaseline(connection);
+    const secondBatch = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    rawEvent(connection, 2, {
+      streamType: "session",
+      sessionId: ROOT_ID,
+      streamVersion: 2,
+      eventType: "EvidenceCoverageRecorded",
+      eventSchemaVersion: 2,
+      payload: evidencePayload({
+        batchId: secondBatch,
+        frames: [{
+          frameId: "ffffffff-ffff-4fff-8fff-ffffffffffff",
+          ordinal: "0",
+          sourceKind: "model-turn",
+          observedAt: NOW,
+          contentFingerprint: H64_B,
+        }],
+      }),
+    });
+    assert.throws(
+      () => rawInsert(connection, "session_evidence_coverage_transitions", transitionRow({
+        batch_id: secondBatch,
+        batch_event_position: 2,
+        previous_coverage_fingerprint_value: H64,
+        new_frame_count: 0,
+      })),
+      /SESSION_EVIDENCE_COVERAGE_TRANSITION_INVALID/,
+    );
+  });
+
+  it("rejects coercive or incomplete evidence interval and decimal payloads", () => {
+    const cases = [
+      {
+        payload: evidencePayload({ unexpected: true }),
+        transition: transitionRow(),
+      },
+      {
+        payload: evidencePayload({
+          highestContiguousOrdinal: null,
+          missingIntervals: [{}],
+        }),
+        transition: transitionRow({
+          highest_contiguous_ordinal: -1,
+          missing_intervals_json: "[[0,0]]",
+        }),
+      },
+      {
+        payload: evidencePayload({
+          batchFirstOrdinal: "1x",
+          batchLastOrdinal: "1x",
+          coverageFirstOrdinal: "0",
+          coverageLastOrdinal: "1x",
+          highestContiguousOrdinal: "1x",
+          frames: [{
+            frameId: "88888888-8888-4888-8888-888888888888",
+            ordinal: "1x",
+            sourceKind: "model-turn",
+            observedAt: NOW,
+            contentFingerprint: H64_B,
+          }],
+        }),
+        transition: transitionRow({
+          batch_first_ordinal: 1,
+          batch_last_ordinal: 1,
+          coverage_last_ordinal: 1,
+          highest_contiguous_ordinal: 1,
+        }),
+      },
+      {
+        payload: evidencePayload({
+          batchFirstOrdinal: "9223372036854775808",
+          batchLastOrdinal: "9223372036854775808",
+          coverageLastOrdinal: "9223372036854775808",
+          highestContiguousOrdinal: "9223372036854775808",
+          frames: [{
+            frameId: "88888888-8888-4888-8888-888888888888",
+            ordinal: "9223372036854775808",
+            sourceKind: "model-turn",
+            observedAt: NOW,
+            contentFingerprint: H64_B,
+          }],
+        }),
+        transition: transitionRow({
+          batch_first_ordinal: 9_223_372_036_854_775_807n,
+          batch_last_ordinal: 9_223_372_036_854_775_807n,
+          coverage_last_ordinal: 9_223_372_036_854_775_807n,
+          highest_contiguous_ordinal: 9_223_372_036_854_775_807n,
+        }),
+      },
+    ];
+    for (const candidate of cases) {
+      const connection = currentConnection();
+      rawEvent(connection, 1, {
+        streamType: "session",
+        sessionId: ROOT_ID,
+        eventType: "EvidenceCoverageRecorded",
+        eventSchemaVersion: 2,
+        payload: candidate.payload,
+      });
+      assert.throws(
+        () => rawInsert(
+          connection,
+          "session_evidence_coverage_transitions",
+          candidate.transition,
+        ),
+        /SESSION_EVIDENCE_COVERAGE_TRANSITION_INVALID/,
+      );
+    }
+  });
+
+  it("cannot commit a newer transition without advancing its aggregate projection", () => {
+    const connection = currentConnection();
+    seedRootAuthorityForCoverage(connection);
+    connection.exec("PRAGMA foreign_keys = ON");
+    seedCoverageBaseline(connection);
+    const secondBatch = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    connection.exec("BEGIN IMMEDIATE");
+    rawEvent(connection, 2, {
+      streamType: "session",
+      sessionId: ROOT_ID,
+      streamVersion: 2,
+      eventType: "EvidenceCoverageRecorded",
+      eventSchemaVersion: 2,
+      payload: evidencePayload({
+        batchId: secondBatch,
+        batchFirstOrdinal: "1",
+        batchLastOrdinal: "1",
+        coverageLastOrdinal: "1",
+        highestContiguousOrdinal: "1",
+        coverageFingerprint: H64_B,
+        frames: [{
+          frameId: "aaaaaaaa-0000-4000-8000-000000000001",
+          ordinal: "1",
+          sourceKind: "tool-request",
+          observedAt: NOW,
+          contentFingerprint: H64,
+        }],
+      }),
+    });
+    rawInsert(connection, "session_evidence_coverage_transitions", transitionRow({
+      batch_id: secondBatch,
+      batch_event_position: 2,
+      batch_first_ordinal: 1,
+      batch_last_ordinal: 1,
+      coverage_last_ordinal: 1,
+      highest_contiguous_ordinal: 1,
+      previous_coverage_fingerprint_value: H64,
+      coverage_fingerprint_value: H64_B,
+    }));
+    assert.throws(() => connection.exec("COMMIT"), /constraint|aggregate/i);
+    connection.exec("ROLLBACK");
+  });
+
   it("rejects permissive workflow results before staging", () => {
     const invalidResults = [
       canonicalJson({ arbitrary: true }),
@@ -901,6 +1873,314 @@ describe("qualified checkpoint migration", () => {
     );
   });
 
+  it("byte-matches persistent final bindings to the root checkpoint summaries", () => {
+    const connection = currentConnection();
+    const checkpointBindings = [currentChildBinding(0)];
+    const forgedBindings = [{ ...checkpointBindings[0], childState: "suspended" }];
+    assert.throws(
+      () => seedFinalWorkflowGuardFixture(
+        connection,
+        checkpointBindings,
+        "insert",
+        forgedBindings,
+      ),
+      /WORKFLOW_EVIDENCE_STATE_INVALID/,
+    );
+  });
+
+  it("requires exact V2 or null results and binds the complete evidence window", () => {
+    const arbitrary = currentConnection();
+    assert.throws(
+      () => rawInsert(arbitrary, "workflow_instances", lifecycleWorkflow({
+        result_json: canonicalJson({ arbitrary: true }),
+      })),
+      /WORKFLOW_EVIDENCE_STATE_INVALID/,
+    );
+
+    const extraKey = currentConnection();
+    assert.throws(
+      () => rawInsert(extraKey, "workflow_instances", lifecycleWorkflow({
+        result_json: canonicalJson({
+          ...sessionEndStatus("requested", null, null),
+          unexpected: true,
+        }),
+      })),
+      /WORKFLOW_EVIDENCE_STATE_INVALID/,
+    );
+
+    const zeroGeneration = currentConnection();
+    const finalCheckpoint = seedRootFinalCheckpoint(zeroGeneration);
+    const zeroStatus = {
+      ...sessionEndStatus(
+        "final-checkpoint-recorded",
+        String(finalCheckpoint.checkpointId),
+        MAX_INT64.toString(),
+      ),
+      evidenceWindow: {
+        evidenceWindowState: "sealed",
+        evidenceFrozenCheckpointEventPosition: MAX_INT64.toString(),
+        evidenceFrozenGeneration: 0,
+      },
+    };
+    assert.throws(
+      () => rawInsert(zeroGeneration, "workflow_instances", lifecycleWorkflow({
+        phase: "final-checkpoint-recorded",
+        result_json: canonicalJson(zeroStatus),
+        evidence_frozen_checkpoint_event_position: MAX_INT64,
+        evidence_frozen_generation: 0,
+        final_ending_scope_bindings_json: "[]",
+      })),
+      /WORKFLOW_EVIDENCE_STATE_INVALID/,
+    );
+
+    const wrongTrigger = currentConnection();
+    const checkpoint = seedRootFinalCheckpoint(wrongTrigger);
+    const wrongTriggerStatus = {
+      ...sessionEndStatus(
+        "final-checkpoint-recorded",
+        String(checkpoint.checkpointId),
+        MAX_INT64.toString(),
+      ),
+      triggeringEventPosition: "9223372036854775808",
+    };
+    assert.throws(
+      () => rawInsert(wrongTrigger, "workflow_instances", lifecycleWorkflow({
+        phase: "final-checkpoint-recorded",
+        result_json: canonicalJson(wrongTriggerStatus),
+        evidence_frozen_checkpoint_event_position: MAX_INT64,
+        evidence_frozen_generation: 1,
+        final_ending_scope_bindings_json: "[]",
+      })),
+      /WORKFLOW_EVIDENCE_STATE_INVALID/,
+    );
+  });
+
+  it("allows only the exact ordinary phase/action transition matrix", () => {
+    const matrix = [
+      ["requested", "children-resolved", "mark-children-resolved"],
+      ["children-resolved", "final-checkpoint-recorded", "record-final-checkpoint-and-queue-ending"],
+      ["final-checkpoint-recorded", "ending-materialization-queued", "confirm-ending-materialization"],
+      ["ending-materialization-queued", "validating", "begin-validation"],
+      ["validating", "verification-failed", "record-verification-failed"],
+      ["validating", "verification-passed", "record-verification-passed"],
+      ["verification-passed", "verification-failed", "invalidate-verification"],
+      ["verification-passed", "completion-appended", "append-terminal-completion"],
+      ["completion-appended", "completed-materialization-confirmed", "confirm-completed-materialization"],
+      ["completion-appended", "completed", "complete-without-materialization"],
+      ["completed-materialization-confirmed", "completed", "complete-after-materialization"],
+    ] as const;
+    for (const [from, to, action] of matrix) {
+      const connection = currentConnection();
+      const needsFinal = from !== "requested" && from !== "children-resolved";
+      const freezesNow = to === "final-checkpoint-recorded";
+      const hasFinal = needsFinal || freezesNow;
+      const checkpoint = hasFinal ? seedRootFinalCheckpoint(connection) : null;
+      const startStatus = checkpoint === null || freezesNow
+        ? null
+        : sessionEndStatus(from, String(checkpoint.checkpointId), MAX_INT64.toString());
+      rawInsert(connection, "workflow_instances", lifecycleWorkflow({
+        phase: from,
+        result_json: startStatus === null ? null : canonicalJson(startStatus),
+        evidence_frozen_checkpoint_event_position: needsFinal ? MAX_INT64 : null,
+        evidence_frozen_generation: needsFinal ? 1 : null,
+        final_ending_scope_bindings_json: needsFinal ? "[]" : null,
+      }));
+      const nextStatus = sessionEndStatus(
+        to,
+        checkpoint === null ? null : String(checkpoint.checkpointId),
+        checkpoint === null ? null : MAX_INT64.toString(),
+      );
+      assert.doesNotThrow(() => connection.prepare(`
+        UPDATE workflow_instances
+        SET phase = $phase, result_json = $result,
+            evidence_frozen_checkpoint_event_position = $position,
+            evidence_frozen_generation = $frozenGeneration,
+            final_ending_scope_bindings_json = $bindings
+      `).run({
+        $phase: to,
+        $result: canonicalJson(phaseResult(action, from, nextStatus)),
+        $position: hasFinal ? MAX_INT64 : null,
+        $frozenGeneration: hasFinal ? 1 : null,
+        $bindings: hasFinal ? "[]" : null,
+      }), `${from} -> ${to}`);
+    }
+
+    const actionLie = currentConnection();
+    rawInsert(actionLie, "workflow_instances", lifecycleWorkflow());
+    assert.throws(() => actionLie.prepare(`
+      UPDATE workflow_instances SET phase = 'children-resolved', result_json = $result
+    `).run({
+      $result: canonicalJson(phaseResult(
+        "begin-validation",
+        "requested",
+        sessionEndStatus("children-resolved", null, null),
+      )),
+    }), /WORKFLOW_EVIDENCE_STATE_INVALID/);
+
+    const falseProgress = currentConnection();
+    rawInsert(falseProgress, "workflow_instances", lifecycleWorkflow());
+    assert.throws(() => falseProgress.prepare(`
+      UPDATE workflow_instances SET phase = 'children-resolved', result_json = $result
+    `).run({
+      $result: canonicalJson({
+        ...phaseResult(
+          "mark-children-resolved",
+          "requested",
+          sessionEndStatus("children-resolved", null, null),
+        ),
+        progressed: false,
+      }),
+    }), /WORKFLOW_EVIDENCE_STATE_INVALID/);
+  });
+
+  it("rejects same-generation cancellation and arbitrary preserved-group backtracking", () => {
+    const cancel = currentConnection();
+    rawInsert(cancel, "workflow_instances", lifecycleWorkflow({ phase: "children-resolved" }));
+    assert.throws(() => cancel.prepare(`
+      UPDATE workflow_instances SET phase = 'cancelled', result_json = $result
+    `).run({ $result: canonicalJson(sessionEndStatus("cancelled", null, null)) }),
+    /WORKFLOW_EVIDENCE_STATE_INVALID/);
+
+    const backtrack = currentConnection();
+    seedFinalWorkflowGuardFixture(backtrack, [], "insert");
+    assert.throws(() => backtrack.prepare(`
+      UPDATE workflow_instances SET phase = 'requested', result_json = $result
+    `).run({
+      $result: canonicalJson(sessionEndStatus(
+        "requested",
+        "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+        MAX_INT64.toString(),
+      )),
+    }), /WORKFLOW_EVIDENCE_STATE_INVALID/);
+  });
+
+  it("admits the generation-fenced open, seal, cancel, and reopen transitions", () => {
+    const connection = currentConnection();
+    rawInsert(connection, "workflow_instances", lifecycleWorkflow());
+    assert.doesNotThrow(() => connection.prepare(`
+      UPDATE workflow_instances
+      SET generation = 2, phase = 'children-resolved', result_json = $result,
+          evidence_window_state = 'open'
+    `).run({
+      $result: canonicalJson({
+        ...sessionEndStatus("children-resolved", null, null),
+        workflowGeneration: 2,
+        evidenceWindow: {
+          evidenceWindowState: "open",
+          evidenceFrozenCheckpointEventPosition: null,
+          evidenceFrozenGeneration: null,
+        },
+      }),
+    }));
+    assert.doesNotThrow(() => connection.prepare(`
+      UPDATE workflow_instances
+      SET generation = 3, result_json = $result, evidence_window_state = 'sealed'
+    `).run({
+      $result: canonicalJson({
+        ...sessionEndStatus("children-resolved", null, null),
+        workflowGeneration: 3,
+      }),
+    }));
+    assert.doesNotThrow(() => connection.prepare(`
+      UPDATE workflow_instances
+      SET generation = 4, phase = 'cancelled', result_json = $result
+    `).run({
+      $result: canonicalJson({
+        ...sessionEndStatus("cancelled", null, null),
+        workflowGeneration: 4,
+      }),
+    }));
+    assert.doesNotThrow(() => connection.prepare(`
+      UPDATE workflow_instances
+      SET generation = 5, phase = 'requested', root_command_id = 'root-command-5',
+          triggering_event_position = 5, result_json = NULL
+    `).run());
+  });
+
+  it("admits generation-fenced unchanged and abandoned transitions", () => {
+    const unchanged = currentConnection();
+    const unchangedCheckpoint = seedRootFinalCheckpoint(unchanged);
+    rawInsert(unchanged, "workflow_instances", lifecycleWorkflow({
+      phase: "final-checkpoint-recorded",
+      result_json: canonicalJson(sessionEndStatus(
+        "final-checkpoint-recorded",
+        String(unchangedCheckpoint.checkpointId),
+        MAX_INT64.toString(),
+      )),
+      evidence_frozen_checkpoint_event_position: MAX_INT64,
+      evidence_frozen_generation: 1,
+      final_ending_scope_bindings_json: "[]",
+    }));
+    assert.doesNotThrow(() => unchanged.prepare(`
+      UPDATE workflow_instances SET generation = 2, result_json = $result
+    `).run({
+      $result: canonicalJson({
+        ...sessionEndStatus(
+          "final-checkpoint-recorded",
+          String(unchangedCheckpoint.checkpointId),
+          MAX_INT64.toString(),
+        ),
+        workflowGeneration: 2,
+      }),
+    }));
+
+    for (const withFinal of [false, true]) {
+      const abandoned = currentConnection();
+      const checkpoint = withFinal ? seedRootFinalCheckpoint(abandoned) : null;
+      rawInsert(abandoned, "workflow_instances", lifecycleWorkflow({
+        phase: checkpoint === null ? "children-resolved" : "final-checkpoint-recorded",
+        result_json: checkpoint === null ? null : canonicalJson(sessionEndStatus(
+          "final-checkpoint-recorded",
+          String(checkpoint.checkpointId),
+          MAX_INT64.toString(),
+        )),
+        evidence_frozen_checkpoint_event_position: checkpoint === null ? null : MAX_INT64,
+        evidence_frozen_generation: checkpoint === null ? null : 1,
+        final_ending_scope_bindings_json: checkpoint === null ? null : "[]",
+      }));
+      assert.doesNotThrow(() => abandoned.prepare(`
+        UPDATE workflow_instances
+        SET generation = 2, phase = 'abandoned', result_json = $result
+      `).run({
+        $result: canonicalJson({
+          ...sessionEndStatus(
+            "abandoned",
+            checkpoint === null ? null : String(checkpoint.checkpointId),
+            checkpoint === null ? null : MAX_INT64.toString(),
+          ),
+          workflowGeneration: 2,
+        }),
+      }), withFinal ? "post-final abandonment" : "pre-final abandonment");
+    }
+  });
+
+  it("accepts 101 strict current-child bindings below the byte-derived limit", () => {
+    const connection = currentConnection();
+    const bindings = Array.from({ length: 101 }, (_, index) => currentChildBinding(index));
+    assert.ok(endingScopeBytes(bindings) < 262_144);
+    assert.doesNotThrow(() => seedFinalWorkflowGuardFixture(connection, bindings, "insert"));
+  });
+
+  it("enforces the exact final-binding byte boundary through INSERT and UPDATE", () => {
+    const exact = exactEndingScopeBindingBytes(262_144);
+    const over = exactEndingScopeBindingBytes(262_145);
+    assert.equal(endingScopeBytes(exact), 262_144);
+    assert.equal(endingScopeBytes(over), 262_145);
+    for (const write of ["insert", "update"] as const) {
+      const accepted = currentConnection();
+      assert.doesNotThrow(
+        () => seedFinalWorkflowGuardFixture(accepted, exact, write),
+        `${write} exact boundary`,
+      );
+      const rejected = currentConnection();
+      assert.throws(
+        () => seedFinalWorkflowGuardFixture(rejected, over, write),
+        /WORKFLOW_EVIDENCE_STATE_INVALID/,
+        `${write} limit plus one`,
+      );
+    }
+  });
+
   it("uses UTF-8 BLOB bytes at the exact final-binding boundary", () => {
     const connection = currentConnection();
     const asciiAtLimit = `["${"a".repeat(262_140)}"]`;
@@ -916,6 +2196,24 @@ describe("qualified checkpoint migration", () => {
     const multibyteMeasurement = measured.get({ $value: multibyteAtLimit });
     assert.equal(multibyteMeasurement?.bytes, 262_144n);
     assert.equal(multibyteMeasurement?.characters, 131_074n);
+
+    const finalCheckpoint = seedRootFinalCheckpoint(connection);
+    assert.throws(
+      () => rawInsert(connection, "workflow_instances", lifecycleWorkflow({
+        phase: "final-checkpoint-recorded",
+        result_json: canonicalJson(sessionEndStatus(
+          "final-checkpoint-recorded",
+          String(finalCheckpoint.checkpointId),
+          MAX_INT64.toString(),
+        )),
+        evidence_frozen_checkpoint_event_position: MAX_INT64,
+        evidence_frozen_generation: 1,
+        final_ending_scope_bindings_json: `[
+          "${"é".repeat(131_071)}"
+        ]`.replace(/\s/g, ""),
+      })),
+      /WORKFLOW_EVIDENCE_STATE_INVALID/,
+    );
   });
 
   it("rechecks Version 1 checkpoint coverage in target SQL even with a forged hook", () => {
@@ -1053,6 +2351,52 @@ describe("qualified checkpoint migration", () => {
     assert.throws(
       () => new SqliteQualifiedCheckpointMigrationPreflight()
         .assertEligibleAndStage(crossSession, context),
+      /MIGRATION_EVIDENCE_V2_PRECONDITION_FAILED/,
+    );
+  });
+
+  it("rejects a final child summary whose declared state disagrees with its fold and authority", () => {
+    const connection = sourceConnection(2);
+    seedTransferredFinalHistory(connection, {
+      summaryState: "active",
+      includeTicket: false,
+    });
+    assert.throws(
+      () => new SqliteQualifiedCheckpointMigrationPreflight()
+        .assertEligibleAndStage(connection, context),
+      /MIGRATION_EVIDENCE_V2_PRECONDITION_FAILED/,
+    );
+  });
+
+  it("stages a fold-valid transferred child with its exact retained ticket", () => {
+    const connection = sourceConnection(2);
+    seedTransferredFinalHistory(connection);
+    connection.exec("BEGIN IMMEDIATE");
+    assert.doesNotThrow(
+      () => new SqliteQualifiedCheckpointMigrationPreflight()
+        .assertEligibleAndStage(connection, context),
+    );
+    connection.exec("ROLLBACK");
+  });
+
+  it("binds a retained transfer ticket to the exact final root and transfer event parent", () => {
+    const connection = sourceConnection(2);
+    seedTransferredFinalHistory(connection, {
+      ticketParentSessionId: OTHER_ROOT_ID,
+    });
+    assert.throws(
+      () => new SqliteQualifiedCheckpointMigrationPreflight()
+        .assertEligibleAndStage(connection, context),
+      /MIGRATION_EVIDENCE_V2_PRECONDITION_FAILED/,
+    );
+  });
+
+  it("requires every retained transfer ticket in the final checkpoint and capacity union", () => {
+    const connection = sourceConnection(2);
+    seedTransferredFinalHistory(connection, { includeSummary: false });
+    assert.throws(
+      () => new SqliteQualifiedCheckpointMigrationPreflight()
+        .assertEligibleAndStage(connection, context),
       /MIGRATION_EVIDENCE_V2_PRECONDITION_FAILED/,
     );
   });
@@ -1200,6 +2544,93 @@ describe("qualified checkpoint migration", () => {
     assert.equal(backfilled?.final_ending_scope_bindings_json, null);
   });
 
+  it("successfully backfills every post-final, cancelled, and abandoned history shape", () => {
+    const postFinalPhases = [
+      "final-checkpoint-recorded",
+      "ending-materialization-queued",
+      "validating",
+      "verification-passed",
+      "verification-failed",
+      "completion-appended",
+      "completed-materialization-confirmed",
+      "completed",
+    ] as const;
+    const cases: Array<{
+      readonly phase: string;
+      readonly hasHistoricalFinal: boolean;
+      readonly keepsFinal: boolean;
+    }> = [
+      ...postFinalPhases.map((phase) => ({
+        phase,
+        hasHistoricalFinal: true,
+        keepsFinal: true,
+      })),
+      { phase: "cancelled", hasHistoricalFinal: false, keepsFinal: false },
+      { phase: "cancelled", hasHistoricalFinal: true, keepsFinal: false },
+      { phase: "abandoned", hasHistoricalFinal: false, keepsFinal: false },
+      { phase: "abandoned", hasHistoricalFinal: true, keepsFinal: true },
+    ];
+    for (const candidate of cases) {
+      const connection = sourceConnection(2);
+      connection.exec("PRAGMA foreign_keys = OFF");
+      seedRootStart(connection);
+      const finalCheckpoint = candidate.hasHistoricalFinal
+        ? checkpointFixture({
+            checkpointId: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee" as never,
+            sessionId: ROOT_ID as never,
+            baseEventPosition: 1,
+            checkpointEventPosition: 2,
+          })
+        : null;
+      if (finalCheckpoint !== null) {
+        rawEvent(connection, 2, {
+          streamType: "session",
+          sessionId: ROOT_ID,
+          streamVersion: 2,
+          eventType: "SessionCheckpointRecorded",
+          payload: {
+            checkpoint: finalCheckpoint,
+            baseEventPosition: "1",
+            checkpointEventPosition: "2",
+          },
+        });
+      }
+      rawInsert(connection, "workflow_instances", legacyLifecycleWorkflow({
+        phase: candidate.phase,
+        result_json: finalCheckpoint === null
+          ? null
+          : canonicalJson(sessionEndStatus(
+              candidate.phase,
+              String(finalCheckpoint.checkpointId),
+              "2",
+            )),
+      }));
+      const preflight = new SqliteQualifiedCheckpointMigrationPreflight();
+      new MigrationRunner().apply(connection, registry, NOW, mode({
+        kind: "explicit-upgrade",
+        expectedAppliedVersion: 2,
+        beforeMigration(candidateConnection: SqliteConnection, migration: { version: number }): void {
+          if (migration.version === 3) {
+            preflight.assertEligibleAndStage(candidateConnection, context);
+          }
+        },
+      }));
+      const row = connection.prepare(`
+        SELECT evidence_frozen_checkpoint_event_position, evidence_frozen_generation,
+               evidence_window_state, final_ending_scope_bindings_json
+        FROM workflow_instances
+      `).get();
+      assert.equal(row?.evidence_window_state, "sealed", candidate.phase);
+      assert.equal(
+        row?.evidence_frozen_checkpoint_event_position,
+        candidate.keepsFinal ? 2n : null,
+        candidate.phase,
+      );
+      assert.equal(row?.evidence_frozen_generation, candidate.keepsFinal ? 1n : null);
+      assert.equal(row?.final_ending_scope_bindings_json, candidate.keepsFinal ? "[]" : null);
+    }
+  });
+
   it("enforces workflow shapes and project-scoped adapter uniqueness through raw SQL", () => {
     const nonLifecycle = currentConnection();
     assert.throws(
@@ -1276,6 +2707,13 @@ describe("qualified checkpoint migration", () => {
         coverageLastOrdinal: "400",
         highestContiguousOrdinal: null,
         missingIntervals: intervals,
+        frames: [{
+          frameId: "88888888-8888-4888-8888-888888888888",
+          ordinal: "400",
+          sourceKind: "model-turn",
+          observedAt: NOW,
+          contentFingerprint: H64_B,
+        }],
       }),
     });
     rawInsert(connection, "session_evidence_coverage_transitions", transitionRow({
@@ -1305,14 +2743,27 @@ describe("qualified checkpoint migration", () => {
       payload: evidencePayload({
         adapterSessionId: secondAdapter,
         batchId: secondBatch,
+        batchFirstOrdinal: "1",
+        batchLastOrdinal: "1",
+        coverageLastOrdinal: "1",
         highestContiguousOrdinal: null,
         missingIntervals: oneInterval,
+        frames: [{
+          frameId: "aaaaaaaa-0000-4000-8000-000000000001",
+          ordinal: "1",
+          sourceKind: "tool-request",
+          observedAt: NOW,
+          contentFingerprint: H64,
+        }],
       }),
     });
     rawInsert(connection, "session_evidence_coverage_transitions", transitionRow({
       adapter_session_id: secondAdapter,
       batch_id: secondBatch,
       batch_event_position: 2,
+      batch_first_ordinal: 1,
+      batch_last_ordinal: 1,
+      coverage_last_ordinal: 1,
       highest_contiguous_ordinal: -1,
       missing_intervals_json: oneIntervalJson,
     }));
@@ -1323,6 +2774,7 @@ describe("qualified checkpoint migration", () => {
         {
           latest_batch_id: secondBatch,
           latest_batch_event_position: 2,
+          last_ordinal: 1,
           highest_contiguous_ordinal: -1,
           missing_intervals_json: oneIntervalJson,
         },
