@@ -4,6 +4,8 @@ import { describe, it } from "node:test";
 import type { ProjectContext } from "../src/orchestrator/identity/contracts.js";
 import {
   decodeLifecycleSemanticCommandDraft,
+  type InternalWorkflowExecutionPlan,
+  type InternalWorkflowSemanticCommand,
   type LifecycleAudience,
   type LifecycleSemanticCommandDraft,
 } from "../src/orchestrator/lifecycle/contracts/commands.js";
@@ -166,6 +168,82 @@ function checkpointDraft(taskSummary = "Bounded checkpoint"): Record<string, unk
     commandResults: [],
     testResults: [],
     materialClaims: [],
+  };
+}
+
+function persistedCheckpoint(checkpointVersion: 1 | 2): Record<string, unknown> {
+  return {
+    ...checkpointDraft(),
+    checkpointVersion,
+    checkpointId: FAMILY_UUID.checkpoint,
+    sessionId: UUID.session,
+    parentSessionId: null,
+    baseEventPosition: "10",
+    checkpointEventPosition: "11",
+    createdAt: "2026-07-14T10:11:12.123Z",
+    creatorAgentId: "agent-primary",
+    creatorClientInstanceId: "primary-a",
+    sourceState: {
+      sourceStateScopeVersion: 1,
+      workspaceId: WORKSPACE_ID,
+      branchRef: "refs/heads/expected",
+      headCommit: "a".repeat(40),
+      dirtyWorktreeFingerprint: "b".repeat(64),
+    },
+    childSummaries: [],
+    evidenceCoverage: checkpointVersion === 1
+      ? {
+          captureMode: "coverage-only",
+          contentRetained: false,
+          highestContiguousOrdinal: null,
+          missingIntervals: [],
+        }
+      : {
+          coverageVersion: 2,
+          captureMode: "coverage-only",
+          contentRetained: false,
+          adapterSessions: [],
+        },
+  };
+}
+
+function internalPhaseBase(): Record<string, unknown> {
+  return {
+    ...familyBase(),
+    commandType: "internal-workflow-phase",
+    workflowId: FAMILY_UUID.workflow,
+    workflowGeneration: 1,
+    sourcePhase: "children-resolved",
+    plannedWorkId: "3".repeat(64),
+    claim: {
+      workflowId: FAMILY_UUID.workflow,
+      workflowGeneration: 1,
+      claimOwnerId: FAMILY_UUID.parent,
+      claimToken: "1",
+      claimExpiresAt: "2026-07-14T10:16:12.123Z",
+    },
+  };
+}
+
+function internalAssertions(): TrustedLifecycleIntentAssertionsV1 {
+  return {
+    authorizationKind: "internal-workflow",
+    authorizationSessionId: UUID.session,
+    targetSessionId: UUID.session,
+    projectId: UUID.project,
+    vaultId: UUID.vault,
+    storeId: UUID.store,
+    workspaceId: WORKSPACE_ID,
+    clientNamespace: "desktop/tests",
+    capabilityKind: null,
+    capabilityGeneration: null,
+    presentingActorRole: "primary",
+    presentingClientInstanceId: "primary-a",
+    targetActorRole: "primary",
+    targetClientInstanceId: "primary-a",
+    internalWorkflowId: FAMILY_UUID.workflow,
+    internalWorkflowGeneration: 1,
+    internalPlannedWorkId: "3".repeat(64),
   };
 }
 
@@ -461,6 +539,66 @@ describe("lifecycle intent", () => {
       version2Hash,
     );
     assert.equal(lifecycleIntentHash(intent()), EXPECTED_INTENT_HASH);
+  });
+
+  it("strictly separates planned final-checkpoint drafts from persisted internal actions", () => {
+    const planned = ([1, 2] as const).map((checkpointVersion) => ({
+      ...internalPhaseBase(),
+      plannedAction: {
+        action: "prepare-final-checkpoint-and-queue-ending",
+        finalCheckpointDraft: { ...checkpointDraft(), checkpointVersion },
+        materializationTarget: "memory/session-end.md",
+      },
+    }));
+    const plannedWitnesses = planned.map((candidate) => buildLifecycleIntentWitness(
+      candidate as unknown as InternalWorkflowExecutionPlan,
+      internalAssertions(),
+    ));
+    assert.notEqual(plannedWitnesses[0]?.intentHash, plannedWitnesses[1]?.intentHash);
+    const plannedVersion = (index: number): unknown => {
+      const stable = plannedWitnesses[index]?.witness.intent.command as Readonly<Record<string, unknown>>;
+      assert.equal(stable.commandType, "internal-workflow-phase");
+      assert.equal(Object.hasOwn(stable, "action"), false);
+      const plannedAction = stable.plannedAction as Readonly<Record<string, unknown>>;
+      assert.equal(plannedAction.action, "prepare-final-checkpoint-and-queue-ending");
+      return (plannedAction.finalCheckpointDraft as Readonly<Record<string, unknown>>).checkpointVersion;
+    };
+    assert.equal(
+      plannedVersion(0),
+      1,
+    );
+    assert.equal(
+      plannedVersion(1),
+      2,
+    );
+
+    for (const checkpointVersion of [1, 2] as const) {
+      const persistedAsPlan = {
+        ...internalPhaseBase(),
+        plannedAction: {
+          action: "record-final-checkpoint-and-queue-ending",
+          finalCheckpoint: persistedCheckpoint(checkpointVersion),
+          materializationTarget: "memory/session-end.md",
+        },
+      };
+      assert.throws(() => buildLifecycleIntentWitness(
+        persistedAsPlan as unknown as InternalWorkflowExecutionPlan,
+        internalAssertions(),
+      ));
+
+      const plannedAsPersisted = {
+        ...internalPhaseBase(),
+        action: {
+          action: "prepare-final-checkpoint-and-queue-ending",
+          finalCheckpointDraft: { ...checkpointDraft(), checkpointVersion },
+          materializationTarget: "memory/session-end.md",
+        },
+      };
+      assert.throws(() => buildLifecycleIntentWitness(
+        plannedAsPersisted as unknown as InternalWorkflowSemanticCommand,
+        internalAssertions(),
+      ));
+    }
   });
 
   it("binds every decoded semantic field", () => {

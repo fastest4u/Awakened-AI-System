@@ -15,7 +15,6 @@ import {
 } from "../src/orchestrator/lifecycle/contracts/events.js";
 import {
   decodeLifecycleSemanticCommandDraft,
-  type InternalWorkflowExecutionPlan,
   type LifecycleSemanticCommandDraft,
 } from "../src/orchestrator/lifecycle/contracts/commands.js";
 import {
@@ -38,6 +37,8 @@ import {
   canonicalUtf8Bytes,
   compareCanonicalUtf8,
   referenceCheckpointFingerprint,
+  referenceMinimumCheckpointUpperBound,
+  referenceMinimumFinalEndingScopeBindingsUpperBound,
   unknownJsonStringUpperBound,
 } from "./support/qualified-checkpoint-reference.js";
 
@@ -519,6 +520,43 @@ describe("qualified checkpoint contracts", () => {
     }
   });
 
+  it("rejects every frame-batch intersection with a missing interval while allowing adjacency", () => {
+    const rangedPayload = {
+      ...evidencePayload(),
+      batchLastOrdinal: "4",
+      coverageLastOrdinal: "6",
+      frames: [2, 3, 4].map((ordinal) => ({
+        frameId: `00000000-0000-4000-8000-${(ordinal + 0x50).toString(16).padStart(12, "0")}`,
+        ordinal: String(ordinal),
+        sourceKind: "model-turn",
+        observedAt: "2026-07-22T00:00:00.000Z",
+        contentFingerprint: HASH,
+      })),
+    };
+    for (const [highestContiguousOrdinal, missingIntervals] of [
+      [null, [{ firstOrdinal: "0", lastOrdinal: "2" }]],
+      ["2", [{ firstOrdinal: "3", lastOrdinal: "3" }]],
+      ["3", [{ firstOrdinal: "4", lastOrdinal: "6" }]],
+      [null, [{ firstOrdinal: "0", lastOrdinal: "6" }]],
+    ] as const) {
+      expectCode("LIFECYCLE_INPUT_INVALID", () => decodeLifecycleEvent(event(
+        2,
+        "EvidenceCoverageRecorded",
+        { ...rangedPayload, highestContiguousOrdinal, missingIntervals },
+      )));
+    }
+    for (const [highestContiguousOrdinal, missingIntervals] of [
+      [null, [{ firstOrdinal: "0", lastOrdinal: "1" }]],
+      ["4", [{ firstOrdinal: "5", lastOrdinal: "6" }]],
+    ] as const) {
+      assert.doesNotThrow(() => decodeLifecycleEvent(event(
+        2,
+        "EvidenceCoverageRecorded",
+        { ...rangedPayload, highestContiguousOrdinal, missingIntervals },
+      )));
+    }
+  });
+
   it("rejects every mixed outer and nested lifecycle event version", () => {
     for (const candidate of [
       event(2, "SessionStarted", {}),
@@ -549,8 +587,6 @@ describe("qualified checkpoint contracts", () => {
       const decoded: LifecycleSemanticCommandDraft = decodeLifecycleSemanticCommandDraft(candidate);
       assert.equal(decoded.commandType, (candidate as Record<string, unknown>).commandType);
     }
-    const compileSurface = null as unknown as InternalWorkflowExecutionPlan;
-    assert.equal(compileSurface, null);
   });
 
   it("strictly decodes deeply frozen canonical final ending-scope bindings", () => {
@@ -582,6 +618,26 @@ describe("qualified checkpoint contracts", () => {
       [current, current],
     ]) expectCode("LIFECYCLE_INPUT_INVALID", () => decodeFinalEndingScopeBindingsV1(candidate));
     assert.ok(canonicalUtf8Bytes(decoded) <= FINAL_ENDING_SCOPE_BINDINGS_MAX_CANONICAL_BYTES);
+  });
+
+  it("rejects impossible ending-scope cardinality before proportional or indexed work", () => {
+    const sparse: unknown[] = [];
+    sparse.length = 1_000_000_000;
+    let ownKeysCalls = 0;
+    let indexedReads = 0;
+    const hostile = new Proxy(sparse, {
+      ownKeys(): never {
+        ownKeysCalls += 1;
+        throw new Error("proportional exact-array validation reached");
+      },
+      get(target, property, receiver) {
+        if (typeof property === "string" && /^(?:0|[1-9][0-9]*)$/u.test(property)) indexedReads += 1;
+        return Reflect.get(target, property, receiver);
+      },
+    });
+    expectCode("LIFECYCLE_INPUT_INVALID", () => decodeFinalEndingScopeBindingsV1(hostile));
+    assert.equal(ownKeysCalls, 0);
+    assert.equal(indexedReads, 0);
   });
 
   it("reserves maximum-width unknown strings and nullable future checkpoint pairs", () => {
@@ -624,10 +680,10 @@ describe("qualified checkpoint contracts", () => {
       ...checkpoint(2),
       evidenceCoverage: coverage([]),
     }).evidenceCoverage as CheckpointEvidenceCoverageV2;
-    const estimatorOverhead = minimumCheckpointUpperBound({
-      evidenceCoverage: emptyCoverage,
-      endingScopeBindings: estimatorBindings,
-    }) - canonicalUtf8Bytes(emptyCoverage);
+    const estimatorOverhead = referenceMinimumCheckpointUpperBound(
+      emptyCoverage,
+      estimatorBindings,
+    ) - canonicalUtf8Bytes(emptyCoverage);
     const exactEstimatorCoverage = decodeCheckpoint({
       ...checkpoint(2),
       baseEventPosition: "9223372036854775807",
@@ -640,17 +696,32 @@ describe("qualified checkpoint contracts", () => {
       checkpointEventPosition: "9223372036854775807",
       evidenceCoverage: exactCoverageBytes(CHECKPOINT_MAX_CANONICAL_BYTES + 1 - estimatorOverhead),
     }).evidenceCoverage as CheckpointEvidenceCoverageV2;
+    const exactReferenceBytes = referenceMinimumCheckpointUpperBound(
+      exactEstimatorCoverage,
+      estimatorBindings,
+    );
+    const plusOneReferenceBytes = referenceMinimumCheckpointUpperBound(
+      plusOneEstimatorCoverage,
+      estimatorBindings,
+    );
+    assert.equal(exactReferenceBytes, CHECKPOINT_MAX_CANONICAL_BYTES);
+    assert.equal(plusOneReferenceBytes, CHECKPOINT_MAX_CANONICAL_BYTES + 1);
     assert.equal(minimumCheckpointUpperBound({
       evidenceCoverage: exactEstimatorCoverage,
       endingScopeBindings: estimatorBindings,
-    }), CHECKPOINT_MAX_CANONICAL_BYTES);
+    }), exactReferenceBytes);
     assert.equal(minimumCheckpointUpperBound({
       evidenceCoverage: plusOneEstimatorCoverage,
       endingScopeBindings: estimatorBindings,
-    }), CHECKPOINT_MAX_CANONICAL_BYTES + 1);
-    assert.ok(minimumFinalEndingScopeBindingsUpperBound({
-      endingScopeBindings: decodeFinalEndingScopeBindingsV1(exactBindings),
-    }) > FINAL_ENDING_SCOPE_BINDINGS_MAX_CANONICAL_BYTES);
+    }), plusOneReferenceBytes);
+    const decodedExactBindings = decodeFinalEndingScopeBindingsV1(exactBindings);
+    const finalBindingReferenceBytes = referenceMinimumFinalEndingScopeBindingsUpperBound(
+      decodedExactBindings,
+    );
+    assert.equal(minimumFinalEndingScopeBindingsUpperBound({
+      endingScopeBindings: decodedExactBindings,
+    }), finalBindingReferenceBytes);
+    assert.ok(finalBindingReferenceBytes > FINAL_ENDING_SCOPE_BINDINGS_MAX_CANONICAL_BYTES);
   });
 
   it("exposes all qualified-coverage failures as stable nonretryable actions", () => {

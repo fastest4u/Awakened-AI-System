@@ -1061,7 +1061,13 @@ function decodeEvidenceCoverageRecordedV2(value: unknown): EvidenceCoverageRecor
   ) invalid("event.payload.highestContiguousOrdinal");
   const missingIntervals = intervals(payload.missingIntervals, "event.payload.missingIntervals");
   for (const missing of missingIntervals) {
-    if (BigInt(missing.lastOrdinal) > BigInt(coverageLastOrdinal)) invalid("event.payload.missingIntervals");
+    if (
+      BigInt(missing.lastOrdinal) > BigInt(coverageLastOrdinal)
+      || (
+        BigInt(missing.firstOrdinal) <= BigInt(batchLastOrdinal)
+        && BigInt(missing.lastOrdinal) >= BigInt(batchFirstOrdinal)
+      )
+    ) invalid("event.payload.missingIntervals");
   }
   const firstMissing = missingIntervals[0];
   if (

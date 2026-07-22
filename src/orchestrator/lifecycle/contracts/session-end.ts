@@ -31,6 +31,14 @@ import {
 } from "./identifiers.js";
 
 export const FINAL_ENDING_SCOPE_BINDINGS_MAX_CANONICAL_BYTES = 256 * 1024;
+// The smallest valid binding is a current active child with one-digit positions,
+// a fixed-width UUID, and both nullable ID/position groups null: 282 canonical bytes.
+// A nonempty JSON array is therefore at least 1 + (282 + 1) * length bytes.
+const MINIMUM_FINAL_ENDING_SCOPE_BINDING_CANONICAL_BYTES = 282;
+const FINAL_ENDING_SCOPE_BINDINGS_MAX_WORK_ITEMS = Math.floor(
+  (FINAL_ENDING_SCOPE_BINDINGS_MAX_CANONICAL_BYTES - 1)
+    / (MINIMUM_FINAL_ENDING_SCOPE_BINDING_CANONICAL_BYTES + 1),
+);
 
 export const QUALITY_POLICY_MAX_PROFILES = 64;
 export const QUALITY_THRESHOLD_MAX = 10_000;
@@ -671,6 +679,11 @@ export function decodeSessionEndAmendment(value: unknown): SessionEndAmendment {
 export function decodeFinalEndingScopeBindingsV1(
   value: unknown,
 ): readonly FinalEndingScopeBindingV1[] {
+  if (
+    !Array.isArray(value)
+    || Object.getPrototypeOf(value) !== Array.prototype
+    || value.length > FINAL_ENDING_SCOPE_BINDINGS_MAX_WORK_ITEMS
+  ) invalid("finalEndingScopeBindings");
   const source = strictArray(value, "finalEndingScopeBindings");
   let previousChildSessionId: string | null = null;
   const decoded = source.map((entry, index): FinalEndingScopeBindingV1 => {
