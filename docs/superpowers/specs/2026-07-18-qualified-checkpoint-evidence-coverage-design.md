@@ -2,7 +2,7 @@
 
 Date: 2026-07-18
 
-Status: Ready for user review
+Status: Approved for implementation
 
 Amends:
 `docs/superpowers/specs/2026-07-14-root-child-lifecycle-and-checkpoints-design.md`
