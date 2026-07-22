@@ -26,6 +26,8 @@ import {
 } from "../src/orchestrator/lifecycle/lifecycle-command.store.js";
 import type {
   InternalWorkflowPhaseCommand,
+  RecordCheckpointCommandV2,
+  RecordCheckpointCommandV3,
   RootResumeCommandV2,
 } from "../src/orchestrator/lifecycle/contracts/commands.js";
 import { buildLifecycleIntentWitness } from "../src/orchestrator/lifecycle/lifecycle-intent-witness.js";
@@ -86,6 +88,61 @@ const INTENT_WITNESS = buildLifecycleIntentWitness(SEMANTIC_COMMAND, {
   internalPlannedWorkId: null,
 });
 const HASH_A = INTENT_WITNESS.intentHash;
+
+function recordCheckpointCommand(checkpointVersion: 1 | 2): RecordCheckpointCommandV2 | RecordCheckpointCommandV3 {
+  return {
+    commandType: "record-checkpoint",
+    commandId: SEMANTIC_COMMAND.commandId,
+    idempotencyKey: SEMANTIC_COMMAND.idempotencyKey,
+    agentId: SEMANTIC_COMMAND.agentId,
+    expectedProjectId: CONTEXT.binding.projectId,
+    expectedVaultId: CONTEXT.binding.vaultId,
+    expectedWorkspaceId: CONTEXT.binding.workspaceId,
+    expectedBranchRef: null,
+    sessionId: SEMANTIC_COMMAND.sessionId,
+    expectedStreamVersion: "1",
+    expectedBaseEventPosition: null,
+    draft: {
+      checkpointVersion,
+      taskSummary: "same command identity, different nested version",
+      completedItems: [],
+      inProgressItems: [],
+      blockers: [],
+      nextActions: [],
+      decisions: [],
+      assumptions: [],
+      unresolvedConflicts: [],
+      filesTouched: [],
+      artifactReferences: [],
+      sourceReferences: [],
+      commandResults: [],
+      testResults: [],
+      materialClaims: [],
+    },
+  } as RecordCheckpointCommandV2 | RecordCheckpointCommandV3;
+}
+
+function checkpointIntent(command: RecordCheckpointCommandV2 | RecordCheckpointCommandV3) {
+  return buildLifecycleIntentWitness(command, {
+    authorizationKind: "protected",
+    authorizationSessionId: command.sessionId,
+    targetSessionId: command.sessionId,
+    projectId: CONTEXT.binding.projectId,
+    vaultId: CONTEXT.binding.vaultId,
+    storeId: CONTEXT.binding.storeId,
+    workspaceId: CONTEXT.binding.workspaceId,
+    clientNamespace: CONTEXT.binding.clientNamespace,
+    capabilityKind: "root-session-handle",
+    capabilityGeneration: "1",
+    presentingActorRole: "primary",
+    presentingClientInstanceId: "primary-a",
+    targetActorRole: "primary",
+    targetClientInstanceId: "primary-a",
+    internalWorkflowId: null,
+    internalWorkflowGeneration: null,
+    internalPlannedWorkId: null,
+  });
+}
 
 class TransactionConnection implements SqliteConnection {
   readonly statements: string[] = [];
@@ -523,6 +580,59 @@ describe("LifecycleCommandStore", () => {
     assert.equal(freshCalls, 0);
     assert.deepEqual(events.calls, ["find-replay"]);
     assert.deepEqual(connection.statements, ["BEGIN IMMEDIATE", "ROLLBACK"]);
+  });
+
+  it("replays an exact Version 1 command but rejects same-identity nested Version 2 reuse", () => {
+    const version1 = recordCheckpointCommand(1);
+    const version2 = recordCheckpointCommand(2);
+    const version1Intent = checkpointIntent(version1);
+    const version2Intent = checkpointIntent(version2);
+    assert.notEqual(version1Intent.intentHash, version2Intent.intentHash);
+
+    const connection = new TransactionConnection();
+    const events = new FakeEvents(connection);
+    const store = new LifecycleCommandStore({
+      connection,
+      events,
+      transaction: () => transaction(connection),
+      now: () => NOW,
+    });
+    const version1Envelope = envelope({
+      commandType: version1.commandType,
+      candidateIntentHash: version1Intent.intentHash,
+      authoritativeIntentHash: version1Intent.intentHash,
+      semanticCommand: version1,
+    });
+    const committed = store.execute(version1Envelope, () => ({
+      append: { ...appendCommand(), commandType: version1.commandType },
+      authorizationRecord: authorization(),
+      afterAppend: () => undefined,
+    }));
+    assert.equal(committed.deduplicated, false);
+
+    events.replay = replayResult();
+    let replayFreshCalls = 0;
+    const replayed = store.execute(version1Envelope, () => {
+      replayFreshCalls += 1;
+      throw new Error("exact Version 1 replay must not enter the fresh path");
+    });
+    assert.equal(replayed.deduplicated, true);
+    assert.equal(replayFreshCalls, 0);
+
+    const callsBeforeConflict = [...events.calls];
+    assert.throws(
+      () => store.execute(envelope({
+        commandType: version2.commandType,
+        candidateIntentHash: version2Intent.intentHash,
+        authoritativeIntentHash: version1Intent.intentHash,
+        semanticCommand: version2,
+      }), () => {
+        throw new Error("cross-version reuse must fail before replay or fresh work");
+      }),
+      (error: unknown) => error instanceof LifecycleCommandStoreError
+        && error.code === "IDEMPOTENCY_CONFLICT",
+    );
+    assert.deepEqual(events.calls, callsBeforeConflict);
   });
 
   it("deduplicates before resolving a fresh protected capability generation", () => {

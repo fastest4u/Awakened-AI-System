@@ -271,6 +271,129 @@ function binding(overrides: Record<string, unknown> = {}): Record<string, unknow
   };
 }
 
+function jsonStringWithContentBytes(contentBytes: number, maximumScalars: number): string {
+  for (let escapedScalars = 0; escapedScalars <= maximumScalars; escapedScalars += 1) {
+    const scalarCount = contentBytes - (5 * escapedScalars);
+    if (
+      scalarCount >= escapedScalars
+      && scalarCount >= 1
+      && scalarCount <= maximumScalars
+    ) {
+      return `${"\0".repeat(escapedScalars)}${"x".repeat(scalarCount - escapedScalars)}`;
+    }
+  }
+  throw new Error(`cannot encode ${contentBytes} JSON string-content bytes`);
+}
+
+function exactCoverageBytes(targetBytes: number): Record<string, unknown> {
+  const adapterSessions = Array.from({ length: 200 }, (_, index) => ({
+    ...coverageEntry(`00000000-0000-4000-8000-${(index + 1).toString(16).padStart(12, "0")}`),
+    frameFingerprintKeyId: "k",
+    coverageFingerprintKeyId: "k",
+    latestBatchEventPosition: "1",
+  }));
+  const candidate = coverage(adapterSessions);
+  let remaining = targetBytes - canonicalUtf8Bytes(candidate);
+  if (remaining < 0) throw new Error("coverage target is below the canonical base");
+  if (remaining % 2 === 1) {
+    adapterSessions[0] = { ...adapterSessions[0], latestBatchEventPosition: "10" };
+    remaining -= 1;
+  }
+  for (let index = 0; index < adapterSessions.length && remaining > 0; index += 1) {
+    let selected = "k";
+    let selectedIncrement = 0;
+    for (let contentBytes = 1; contentBytes <= 768; contentBytes += 1) {
+      let value: string;
+      try {
+        value = jsonStringWithContentBytes(contentBytes, 128);
+      } catch {
+        continue;
+      }
+      const increment = 2 * (contentBytes - 1);
+      if (increment <= remaining && increment >= selectedIncrement) {
+        selected = value;
+        selectedIncrement = increment;
+      }
+    }
+    adapterSessions[index] = {
+      ...adapterSessions[index],
+      frameFingerprintKeyId: selected,
+      coverageFingerprintKeyId: selected,
+    };
+    remaining -= selectedIncrement;
+  }
+  if (remaining !== 0 || canonicalUtf8Bytes(candidate) !== targetBytes) {
+    throw new Error(`unable to synthesize exact ${targetBytes}-byte coverage`);
+  }
+  return candidate;
+}
+
+function exactCheckpointBytes(targetBytes: number): Record<string, unknown> {
+  const completedItems: Record<string, unknown>[] = [];
+  const candidate = {
+    ...checkpoint(2),
+    baseEventPosition: "9223372036854775807",
+    checkpointEventPosition: "9223372036854775807",
+    completedItems,
+    evidenceCoverage: coverage([]),
+  };
+  while (canonicalUtf8Bytes(candidate) < targetBytes) {
+    const withEmpty = {
+      ...candidate,
+      completedItems: [...completedItems, { summary: "", confidence: "high" }],
+    };
+    const requiredContentBytes = targetBytes - canonicalUtf8Bytes(withEmpty);
+    if (requiredContentBytes <= 24_000) {
+      completedItems.push({
+        summary: jsonStringWithContentBytes(requiredContentBytes, 4_000),
+        confidence: "high",
+      });
+      break;
+    }
+    completedItems.push({ summary: "\0".repeat(4_000), confidence: "high" });
+  }
+  if (canonicalUtf8Bytes(candidate) !== targetBytes) {
+    throw new Error(`unable to synthesize exact ${targetBytes}-byte checkpoint`);
+  }
+  return candidate;
+}
+
+function decimalWithLength(length: number): string {
+  return `1${"0".repeat(length - 1)}`;
+}
+
+function exactEndingScopeBindingBytes(targetBytes: number): readonly Record<string, unknown>[] {
+  const bindings: Record<string, unknown>[] = [];
+  let currentBytes = 2;
+  while (true) {
+    const next = binding({
+      childSessionId: `00000000-0000-4000-8000-${(bindings.length + 1).toString(16).padStart(12, "0")}`,
+      lastEventPosition: "1",
+      streamVersion: "1",
+    });
+    const nextBytes = canonicalUtf8Bytes(next) + (bindings.length === 0 ? 0 : 1);
+    if (currentBytes + nextBytes > targetBytes) break;
+    bindings.push(next);
+    currentBytes += nextBytes;
+  }
+  let remaining = targetBytes - currentBytes;
+  for (let index = 0; index < bindings.length && remaining > 0; index += 1) {
+    for (const field of ["lastEventPosition", "streamVersion"] as const) {
+      const increment = Math.min(18, remaining);
+      bindings[index] = {
+        ...bindings[index],
+        [field]: decimalWithLength(1 + increment),
+      };
+      remaining -= increment;
+      if (remaining === 0) break;
+    }
+  }
+  if (remaining !== 0 || canonicalUtf8Bytes(bindings) !== targetBytes) {
+    throw new Error(`unable to synthesize exact ${targetBytes}-byte ending scope`);
+  }
+  return bindings;
+}
+
 function baseCommand(commandType: string): Record<string, unknown> {
   return {
     commandType,
@@ -361,18 +484,23 @@ describe("qualified checkpoint contracts", () => {
     }));
   });
 
-  it("enforces complete Version 2 coverage and checkpoint byte caps", () => {
+  it("enforces the exact qualified-coverage canonical byte boundary", () => {
     assert.ok(CHECKPOINT_EVIDENCE_COVERAGE_MAX_CANONICAL_BYTES < CHECKPOINT_MAX_CANONICAL_BYTES);
-    const unicodeKey = "😀".repeat(128);
-    const adapterSessions = Array.from({ length: 200 }, (_, index) => ({
-      ...coverageEntry(`00000000-0000-4000-8000-${(index + 1).toString(16).padStart(12, "0")}`),
-      frameFingerprintKeyId: unicodeKey,
-      coverageFingerprintKeyId: unicodeKey,
-    }));
-    assert.ok(canonicalUtf8Bytes(coverage(adapterSessions)) > CHECKPOINT_EVIDENCE_COVERAGE_MAX_CANONICAL_BYTES);
+    const exact = exactCoverageBytes(CHECKPOINT_EVIDENCE_COVERAGE_MAX_CANONICAL_BYTES);
+    const limitPlusOne = exactCoverageBytes(CHECKPOINT_EVIDENCE_COVERAGE_MAX_CANONICAL_BYTES + 1);
+    assert.equal(canonicalUtf8Bytes(exact), 196_608);
+    assert.equal(canonicalUtf8Bytes(limitPlusOne), 196_609);
+    assert.equal(decodeCheckpoint({
+      ...checkpoint(2),
+      baseEventPosition: "9223372036854775807",
+      checkpointEventPosition: "9223372036854775807",
+      evidenceCoverage: exact,
+    }).checkpointVersion, 2);
     expectCode("EVIDENCE_COVERAGE_SNAPSHOT_TOO_LARGE", () => decodeCheckpoint({
       ...checkpoint(2),
-      evidenceCoverage: coverage(adapterSessions),
+      baseEventPosition: "9223372036854775807",
+      checkpointEventPosition: "9223372036854775807",
+      evidenceCoverage: limitPlusOne,
     }));
   });
 
@@ -470,32 +598,59 @@ describe("qualified checkpoint contracts", () => {
   });
 
   it("rejects limit-plus-one checkpoint and ending-scope capacity", () => {
-    const evidenceCoverage = decodeCheckpoint(checkpoint(2)).evidenceCoverage as CheckpointEvidenceCoverageV2;
-    const endingScopeBindings = decodeFinalEndingScopeBindingsV1(Array.from(
-      { length: 200 },
+    const exactCheckpoint = exactCheckpointBytes(CHECKPOINT_MAX_CANONICAL_BYTES);
+    const checkpointLimitPlusOne = exactCheckpointBytes(CHECKPOINT_MAX_CANONICAL_BYTES + 1);
+    assert.equal(canonicalUtf8Bytes(exactCheckpoint), 262_144);
+    assert.equal(canonicalUtf8Bytes(checkpointLimitPlusOne), 262_145);
+    assert.equal(decodeCheckpoint(exactCheckpoint).checkpointVersion, 2);
+    expectCode("CHECKPOINT_CAPACITY_EXCEEDED", () => decodeCheckpoint(checkpointLimitPlusOne));
+
+    const exactBindings = exactEndingScopeBindingBytes(FINAL_ENDING_SCOPE_BINDINGS_MAX_CANONICAL_BYTES);
+    const bindingLimitPlusOne = exactEndingScopeBindingBytes(
+      FINAL_ENDING_SCOPE_BINDINGS_MAX_CANONICAL_BYTES + 1,
+    );
+    assert.equal(canonicalUtf8Bytes(exactBindings), 262_144);
+    assert.equal(canonicalUtf8Bytes(bindingLimitPlusOne), 262_145);
+    assert.equal(decodeFinalEndingScopeBindingsV1(exactBindings).length, exactBindings.length);
+    expectCode("LIFECYCLE_INPUT_INVALID", () => decodeFinalEndingScopeBindingsV1(bindingLimitPlusOne));
+
+    const estimatorBindings = decodeFinalEndingScopeBindingsV1(Array.from(
+      { length: 220 },
       (_, index) => binding({
         childSessionId: `00000000-0000-4000-8000-${(index + 1).toString(16).padStart(12, "0")}`,
       }),
     ));
-    const checkpointBytes = minimumCheckpointUpperBound({ evidenceCoverage, endingScopeBindings });
-    const bindingBytes = minimumFinalEndingScopeBindingsUpperBound({ endingScopeBindings });
-    assert.ok(checkpointBytes > canonicalUtf8Bytes(evidenceCoverage));
-    assert.ok(bindingBytes >= canonicalUtf8Bytes(endingScopeBindings));
-    assert.ok(checkpointBytes <= CHECKPOINT_MAX_CANONICAL_BYTES);
-    assert.ok(bindingBytes <= FINAL_ENDING_SCOPE_BINDINGS_MAX_CANONICAL_BYTES);
-
-    const oversizedCoverage = decodeCheckpoint({
+    const emptyCoverage = decodeCheckpoint({
       ...checkpoint(2),
-      evidenceCoverage: coverage(Array.from({ length: 200 }, (_, index) => ({
-        ...coverageEntry(`00000000-0000-4000-8000-${(index + 1).toString(16).padStart(12, "0")}`),
-        frameFingerprintKeyId: "😀".repeat(35),
-        coverageFingerprintKeyId: "😀".repeat(35),
-      }))),
+      evidenceCoverage: coverage([]),
     }).evidenceCoverage as CheckpointEvidenceCoverageV2;
-    assert.ok(minimumCheckpointUpperBound({
-      evidenceCoverage: oversizedCoverage,
-      endingScopeBindings,
-    }) > CHECKPOINT_MAX_CANONICAL_BYTES);
+    const estimatorOverhead = minimumCheckpointUpperBound({
+      evidenceCoverage: emptyCoverage,
+      endingScopeBindings: estimatorBindings,
+    }) - canonicalUtf8Bytes(emptyCoverage);
+    const exactEstimatorCoverage = decodeCheckpoint({
+      ...checkpoint(2),
+      baseEventPosition: "9223372036854775807",
+      checkpointEventPosition: "9223372036854775807",
+      evidenceCoverage: exactCoverageBytes(CHECKPOINT_MAX_CANONICAL_BYTES - estimatorOverhead),
+    }).evidenceCoverage as CheckpointEvidenceCoverageV2;
+    const plusOneEstimatorCoverage = decodeCheckpoint({
+      ...checkpoint(2),
+      baseEventPosition: "9223372036854775807",
+      checkpointEventPosition: "9223372036854775807",
+      evidenceCoverage: exactCoverageBytes(CHECKPOINT_MAX_CANONICAL_BYTES + 1 - estimatorOverhead),
+    }).evidenceCoverage as CheckpointEvidenceCoverageV2;
+    assert.equal(minimumCheckpointUpperBound({
+      evidenceCoverage: exactEstimatorCoverage,
+      endingScopeBindings: estimatorBindings,
+    }), CHECKPOINT_MAX_CANONICAL_BYTES);
+    assert.equal(minimumCheckpointUpperBound({
+      evidenceCoverage: plusOneEstimatorCoverage,
+      endingScopeBindings: estimatorBindings,
+    }), CHECKPOINT_MAX_CANONICAL_BYTES + 1);
+    assert.ok(minimumFinalEndingScopeBindingsUpperBound({
+      endingScopeBindings: decodeFinalEndingScopeBindingsV1(exactBindings),
+    }) > FINAL_ENDING_SCOPE_BINDINGS_MAX_CANONICAL_BYTES);
   });
 
   it("exposes all qualified-coverage failures as stable nonretryable actions", () => {
