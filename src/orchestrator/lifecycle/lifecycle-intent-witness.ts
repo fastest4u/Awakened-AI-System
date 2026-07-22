@@ -3,11 +3,13 @@ import {
   assertInternalValidationResultBinding,
   decodeLifecycleSemanticCommandDraft,
   type InternalValidationResultCommand,
+  type InternalWorkflowExecutionPlan,
+  type InternalWorkflowPhasePlan,
   type InternalWorkflowPhaseCommand,
   type InternalWorkflowSemanticCommand,
   type LifecycleSemanticCommandDraft,
 } from "./contracts/commands.js";
-import { decodeCheckpointV1 } from "./contracts/checkpoint.js";
+import { decodeCheckpoint, decodeCheckpointDraft } from "./contracts/checkpoint.js";
 import {
   exactRecord,
   parseBoundedString,
@@ -62,10 +64,12 @@ export interface TrustedLifecycleIntentAssertionsV1 {
 
 type InternalValidationStableCommand = Omit<InternalValidationResultCommand, "claim">;
 type InternalWorkflowPhaseStableCommand = Omit<InternalWorkflowPhaseCommand, "claim">;
+type InternalWorkflowPhasePlanStableCommand = Omit<InternalWorkflowPhasePlan, "claim">;
 type LifecycleIntentCommandV1 =
   | LifecycleSemanticCommandDraft
   | InternalValidationStableCommand
-  | InternalWorkflowPhaseStableCommand;
+  | InternalWorkflowPhaseStableCommand
+  | InternalWorkflowPhasePlanStableCommand;
 
 export type LifecycleIntentSemanticAssertionsV1 = LifecycleIntentAuthorizationV1;
 
@@ -343,13 +347,13 @@ function decodePhaseAction(value: unknown): InternalWorkflowPhaseCommand["action
       );
       return Object.freeze({
         action: source.action,
-        finalCheckpoint: decodeCheckpointV1(action.finalCheckpoint),
+        finalCheckpoint: decodeCheckpoint(action.finalCheckpoint),
         materializationTarget: parseBoundedString(
           action.materializationTarget,
           "lifecycleIntent.action.materializationTarget",
           1_024,
         ),
-      });
+      }) as InternalWorkflowPhaseCommand["action"];
     }
     case "record-verification-failed": {
       const action = exactRecord(
@@ -426,6 +430,29 @@ function decodePhaseAction(value: unknown): InternalWorkflowPhaseCommand["action
   }
 }
 
+function decodePlannedPhaseAction(value: unknown): InternalWorkflowPhasePlan["plannedAction"] {
+  const source = exactRecord(value, Object.keys(value as object), "lifecycleIntent.plannedAction");
+  if (source.action === "prepare-final-checkpoint-and-queue-ending") {
+    const action = exactRecord(
+      value,
+      ["action", "finalCheckpointDraft", "materializationTarget"],
+      "lifecycleIntent.plannedAction",
+    );
+    const finalCheckpointDraft = decodeCheckpointDraft(action.finalCheckpointDraft);
+    return Object.freeze({
+      action: "prepare-final-checkpoint-and-queue-ending",
+      finalCheckpointDraft,
+      materializationTarget: parseBoundedString(
+        action.materializationTarget,
+        "lifecycleIntent.plannedAction.materializationTarget",
+        1_024,
+      ),
+    }) as InternalWorkflowPhasePlan["plannedAction"];
+  }
+  if (source.action === "record-final-checkpoint-and-queue-ending") invalid();
+  return decodePhaseAction(value) as InternalWorkflowPhasePlan["plannedAction"];
+}
+
 function decodePhaseStableCommand(value: unknown): InternalWorkflowPhaseStableCommand {
   const stable = exactRecord(
     value,
@@ -446,24 +473,47 @@ function decodePhaseStableCommand(value: unknown): InternalWorkflowPhaseStableCo
   }) as unknown as InternalWorkflowPhaseStableCommand;
 }
 
+function decodePhasePlanStableCommand(value: unknown): InternalWorkflowPhasePlanStableCommand {
+  const stable = exactRecord(
+    value,
+    [...INTERNAL_STABLE_BASE_KEYS, "sourcePhase", "plannedAction"],
+    "lifecycleIntent.internalPhasePlan",
+  );
+  if (stable.commandType !== "internal-workflow-phase") invalid();
+  validateStableBase(stable);
+  return Object.freeze({
+    ...stable,
+    commandType: "internal-workflow-phase",
+    sourcePhase: parseBoundedString(
+      stable.sourcePhase,
+      "lifecycleIntent.sourcePhase",
+      128,
+    ),
+    plannedAction: decodePlannedPhaseAction(stable.plannedAction),
+  }) as unknown as InternalWorkflowPhasePlanStableCommand;
+}
+
 function decodeStableCommand(value: unknown): LifecycleIntentCommandV1 {
   const record = exactRecord(value, Object.keys(value as object), "lifecycleIntent.command");
   if (record.commandType === "internal-validation-result") {
     return decodeValidationStableCommand(value);
   }
   if (record.commandType === "internal-workflow-phase") {
-    return decodePhaseStableCommand(value);
+    return Object.hasOwn(record, "plannedAction")
+      ? decodePhasePlanStableCommand(value)
+      : decodePhaseStableCommand(value);
   }
   return decodeLifecycleSemanticCommandDraft(value);
 }
 
-function stableInternalCommand(command: InternalWorkflowSemanticCommand):
-  InternalValidationStableCommand | InternalWorkflowPhaseStableCommand {
+function stableInternalCommand(command: InternalWorkflowSemanticCommand | InternalWorkflowExecutionPlan):
+  InternalValidationStableCommand | InternalWorkflowPhaseStableCommand | InternalWorkflowPhasePlanStableCommand {
+  const phasePlan = command.commandType === "internal-workflow-phase" && "plannedAction" in command;
   const input = exactRecord(
     command,
     command.commandType === "internal-validation-result"
       ? [...INTERNAL_STABLE_BASE_KEYS, "attemptPlan", "claim", "result"]
-      : [...INTERNAL_STABLE_BASE_KEYS, "sourcePhase", "claim", "action"],
+      : [...INTERNAL_STABLE_BASE_KEYS, "sourcePhase", "claim", phasePlan ? "plannedAction" : "action"],
     "lifecycleIntent.internalCommand",
   );
   const claim = exactRecord(
@@ -481,7 +531,9 @@ function stableInternalCommand(command: InternalWorkflowSemanticCommand):
   const { claim: _volatileClaim, ...stable } = input;
   return input.commandType === "internal-validation-result"
     ? decodeValidationStableCommand(stable)
-    : decodePhaseStableCommand(stable);
+    : phasePlan
+      ? decodePhasePlanStableCommand(stable)
+      : decodePhaseStableCommand(stable);
 }
 
 function assertExternalSessionBinding(
@@ -546,7 +598,7 @@ function assertExternalSessionBinding(
 }
 
 function normalize(
-  command: LifecycleSemanticCommandDraft | InternalWorkflowSemanticCommand,
+  command: LifecycleSemanticCommandDraft | InternalWorkflowSemanticCommand | InternalWorkflowExecutionPlan,
   assertionsInput: TrustedLifecycleIntentAssertionsV1,
 ): BuiltLifecycleIntentWitnessV1 {
   const assertions = decodeAssertions(assertionsInput);
@@ -633,7 +685,7 @@ function normalizeStable(
  * decoded at runtime; callers cannot provide arbitrary hash material.
  */
 export function buildLifecycleIntentWitness(
-  command: LifecycleSemanticCommandDraft | InternalWorkflowSemanticCommand,
+  command: LifecycleSemanticCommandDraft | InternalWorkflowSemanticCommand | InternalWorkflowExecutionPlan,
   persistedAssertions: TrustedLifecycleIntentAssertionsV1,
 ): BuiltLifecycleIntentWitnessV1 {
   try {

@@ -12,8 +12,10 @@ import {
   LifecycleError,
 } from "../errors.js";
 import {
-  decodeCheckpointDraftV1,
+  decodeCheckpointDraft,
+  type CheckpointDraftV2,
   type CheckpointDraftV1,
+  type CheckpointV2,
   type CheckpointV1,
 } from "./checkpoint.js";
 import {
@@ -48,11 +50,13 @@ import {
   type WorkflowId,
 } from "./identifiers.js";
 import {
-  decodeSessionEndAmendmentV1,
-  decodeSessionEndRequestV1,
+  decodeSessionEndAmendment,
+  decodeSessionEndRequest,
   decodeValidationResultV1,
   type SessionEndAmendmentV1,
+  type SessionEndAmendmentV2,
   type SessionEndRequestV1,
+  type SessionEndRequestV2,
   type ValidationResultV1,
 } from "./session-end.js";
 
@@ -224,6 +228,10 @@ export interface RootSuspendCommandV2 extends LifecycleCommandBase {
   readonly checkpoint: CheckpointDraftV1;
 }
 
+export interface RootSuspendCommandV3 extends Omit<RootSuspendCommandV2, "checkpoint"> {
+  readonly checkpoint: CheckpointDraftV2;
+}
+
 export interface ChildAssignmentV1 {
   readonly assignmentId: string;
   readonly summary: string;
@@ -254,6 +262,10 @@ export interface RecordCheckpointCommandV2 extends LifecycleCommandBase {
   readonly expectedStreamVersion: string;
   readonly expectedBaseEventPosition: string | null;
   readonly draft: CheckpointDraftV1;
+}
+
+export interface RecordCheckpointCommandV3 extends Omit<RecordCheckpointCommandV2, "draft"> {
+  readonly draft: CheckpointDraftV2;
 }
 
 export interface EvidenceCoverageFrameV1 {
@@ -340,12 +352,20 @@ export interface RequestSessionEndCommandV2 extends LifecycleCommandBase {
   readonly request: SessionEndRequestV1;
 }
 
+export interface RequestSessionEndCommandV3 extends Omit<RequestSessionEndCommandV2, "request"> {
+  readonly request: SessionEndRequestV2;
+}
+
 export interface AmendSessionEndCommandV2 extends LifecycleCommandBase {
   readonly commandType: "amend-session-end";
   readonly sessionId: SessionId;
   readonly workflowId: WorkflowId;
   readonly expectedStreamVersion: string;
   readonly amendment: SessionEndAmendmentV1;
+}
+
+export interface AmendSessionEndCommandV3 extends Omit<AmendSessionEndCommandV2, "amendment"> {
+  readonly amendment: SessionEndAmendmentV2;
 }
 
 export interface CancelSessionEndCommandV2 extends LifecycleCommandBase {
@@ -369,9 +389,11 @@ export type LifecycleSemanticCommandDraft =
   | RootResumeCommandV2
   | RootRecoveryCommandV2
   | RootSuspendCommandV2
+  | RootSuspendCommandV3
   | ForkChildCommandV2
   | AmendChildAssignmentCommandV2
   | RecordCheckpointCommandV2
+  | RecordCheckpointCommandV3
   | RecordEvidenceBatchCommandV2
   | RecordChildReportCommandV2
   | DispositionChildReportCommandV2
@@ -381,7 +403,9 @@ export type LifecycleSemanticCommandDraft =
   | CreateChildTransferCommandV2
   | ClaimChildTransferCommandV2
   | RequestSessionEndCommandV2
+  | RequestSessionEndCommandV3
   | AmendSessionEndCommandV2
+  | AmendSessionEndCommandV3
   | CancelSessionEndCommandV2
   | AbandonSessionCommandV2;
 
@@ -393,12 +417,19 @@ export interface WorkflowClaimAssertionV1 {
   readonly claimExpiresAt: string;
 }
 
-export type SemanticSessionEndAction =
-  | {
-      readonly action: "record-final-checkpoint-and-queue-ending";
-      readonly finalCheckpoint: CheckpointV1;
-      readonly materializationTarget: string;
-    }
+export interface RecordFinalCheckpointAndQueueEndingActionV1 {
+  readonly action: "record-final-checkpoint-and-queue-ending";
+  readonly finalCheckpoint: CheckpointV1;
+  readonly materializationTarget: string;
+}
+
+export interface RecordFinalCheckpointAndQueueEndingActionV2 {
+  readonly action: "record-final-checkpoint-and-queue-ending";
+  readonly finalCheckpoint: CheckpointV2;
+  readonly materializationTarget: string;
+}
+
+export type NonCheckpointSemanticSessionEndAction =
   | {
       readonly action: "record-verification-failed";
       readonly validationResultIds: readonly ValidationResultId[];
@@ -418,6 +449,35 @@ export type SemanticSessionEndAction =
       readonly verificationEventPosition: string;
       readonly materializationTarget: string;
     };
+
+export type SemanticSessionEndActionV1 =
+  | RecordFinalCheckpointAndQueueEndingActionV1
+  | NonCheckpointSemanticSessionEndAction;
+
+export type SemanticSessionEndActionV2 =
+  | RecordFinalCheckpointAndQueueEndingActionV2
+  | NonCheckpointSemanticSessionEndAction;
+
+export type SemanticSessionEndAction =
+  | SemanticSessionEndActionV1
+  | SemanticSessionEndActionV2;
+
+export interface PlanFinalCheckpointAndQueueEndingActionV1 {
+  readonly action: "prepare-final-checkpoint-and-queue-ending";
+  readonly finalCheckpointDraft: CheckpointDraftV1;
+  readonly materializationTarget: string;
+}
+
+export interface PlanFinalCheckpointAndQueueEndingActionV2 {
+  readonly action: "prepare-final-checkpoint-and-queue-ending";
+  readonly finalCheckpointDraft: CheckpointDraftV2;
+  readonly materializationTarget: string;
+}
+
+export type PlannedSemanticSessionEndAction =
+  | PlanFinalCheckpointAndQueueEndingActionV1
+  | PlanFinalCheckpointAndQueueEndingActionV2
+  | NonCheckpointSemanticSessionEndAction;
 
 export interface ValidationAttemptPlanIdentityV1 {
   readonly attemptPlanVersion: 1;
@@ -463,6 +523,15 @@ export interface InternalWorkflowPhaseCommand extends LifecycleCommandBase {
 export type InternalWorkflowSemanticCommand =
   | InternalValidationResultCommand
   | InternalWorkflowPhaseCommand;
+
+export interface InternalWorkflowPhasePlan
+  extends Omit<InternalWorkflowPhaseCommand, "action"> {
+  readonly plannedAction: PlannedSemanticSessionEndAction;
+}
+
+export type InternalWorkflowExecutionPlan =
+  | InternalValidationResultCommand
+  | InternalWorkflowPhasePlan;
 
 const VALIDATION_ATTEMPT_PLAN_KEYS = [
   "attemptPlanVersion",
@@ -832,8 +901,8 @@ export function decodeLifecycleSemanticCommandDraft(value: unknown): LifecycleSe
         commandType,
         sessionId: parseLifecycleId<SessionId>(command.sessionId, "sessionId"),
         expectedStreamVersion: parseDecimalString(command.expectedStreamVersion, "expectedStreamVersion"),
-        checkpoint: decodeCheckpointDraftV1(command.checkpoint),
-      });
+        checkpoint: decodeCheckpointDraft(command.checkpoint),
+      }) as RootSuspendCommandV2 | RootSuspendCommandV3;
     }
     case "fork-child": {
       const command = exactCommand(value, ["parentSessionId", "expectedStreamVersion", "assignment", "directAccessRequested"]);
@@ -877,8 +946,8 @@ export function decodeLifecycleSemanticCommandDraft(value: unknown): LifecycleSe
         sessionId: parseLifecycleId<SessionId>(command.sessionId, "sessionId"),
         expectedStreamVersion: parseDecimalString(command.expectedStreamVersion, "expectedStreamVersion"),
         expectedBaseEventPosition: nullableDecimal(command.expectedBaseEventPosition, "expectedBaseEventPosition"),
-        draft: decodeCheckpointDraftV1(command.draft),
-      });
+        draft: decodeCheckpointDraft(command.draft),
+      }) as RecordCheckpointCommandV2 | RecordCheckpointCommandV3;
     }
     case "record-evidence-batch": {
       const command = exactCommand(value, [
@@ -1025,7 +1094,11 @@ export function decodeLifecycleSemanticCommandDraft(value: unknown): LifecycleSe
     }
     case "request-session-end": {
       const command = exactCommand(value, ["request"]);
-      return Object.freeze({ ...base(command), commandType, request: decodeSessionEndRequestV1(command.request) });
+      return Object.freeze({
+        ...base(command),
+        commandType,
+        request: decodeSessionEndRequest(command.request),
+      }) as RequestSessionEndCommandV2 | RequestSessionEndCommandV3;
     }
     case "amend-session-end": {
       const command = exactCommand(value, ["sessionId", "workflowId", "expectedStreamVersion", "amendment"]);
@@ -1035,8 +1108,8 @@ export function decodeLifecycleSemanticCommandDraft(value: unknown): LifecycleSe
         sessionId: parseLifecycleId<SessionId>(command.sessionId, "sessionId"),
         workflowId: parseLifecycleId<WorkflowId>(command.workflowId, "workflowId"),
         expectedStreamVersion: parseDecimalString(command.expectedStreamVersion, "expectedStreamVersion"),
-        amendment: decodeSessionEndAmendmentV1(command.amendment),
-      });
+        amendment: decodeSessionEndAmendment(command.amendment),
+      }) as AmendSessionEndCommandV2 | AmendSessionEndCommandV3;
     }
     case "cancel-session-end": {
       const command = exactCommand(value, ["sessionId", "workflowId", "expectedStreamVersion", "preTransitionCheckpointId"]);

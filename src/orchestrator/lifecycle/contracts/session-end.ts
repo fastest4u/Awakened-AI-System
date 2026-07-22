@@ -1,6 +1,10 @@
 import { LifecycleError } from "../errors.js";
 import type { ProjectId, StoreId, VaultId, WorkspaceId } from "../../identity/contracts.js";
+import type { JsonValue } from "../../contracts/event.js";
+import { canonicalJson } from "../../serialization/canonical-json.js";
 import {
+  type CheckpointDraftV2,
+  decodeCheckpointDraftV2,
   decodeCheckpointDraftV1,
   type CheckpointDraftV1,
   type SourceStateFingerprintV1,
@@ -10,16 +14,23 @@ import {
   parseBoolean,
   parseBoundedString,
   parseCanonicalTimestamp,
+  parseDecimalString,
   parseEnum,
   parseInteger,
   parseLifecycleId,
+  parseNullableUuid,
   strictArray,
+  strictRecord,
   type CheckpointId,
   type ChildEndPolicy,
   type SessionId,
   type ValidationResultId,
   type WorkflowId,
+  type TransferTicketId,
+  type ChildSessionState,
 } from "./identifiers.js";
+
+export const FINAL_ENDING_SCOPE_BINDINGS_MAX_CANONICAL_BYTES = 256 * 1024;
 
 export const QUALITY_POLICY_MAX_PROFILES = 64;
 export const QUALITY_THRESHOLD_MAX = 10_000;
@@ -32,6 +43,8 @@ const LOWER_HASH = /^[0-9a-f]{64}$/;
 const GIT_OBJECT_ID = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 const VALIDATION_RESULT_MAX_ARTIFACT_REFERENCES = 100;
 const VALIDATION_RESULT_MAX_SUMMARY_SCALARS = 4_000;
+const CHILD_STATES = ["active", "completion-proposed", "completed", "suspended", "transferred"] as const;
+const EVIDENCE_WINDOW_ACTIONS = ["unchanged", "open", "seal"] as const;
 
 export interface QualityProfileV1 {
   readonly profileId: string;
@@ -68,6 +81,88 @@ export interface SessionEndAmendmentV1 {
   readonly requestedQualityThreshold: number | null;
   readonly requireFullEvidence: boolean | null;
   readonly requireMaterialization: boolean | null;
+}
+
+export interface SessionEndRequestV2
+  extends Omit<SessionEndRequestV1, "requestVersion" | "finalCheckpoint"> {
+  readonly requestVersion: 2;
+  readonly finalCheckpoint: CheckpointDraftV2;
+}
+
+export interface SessionEndAmendmentV2
+  extends Omit<SessionEndAmendmentV1, "amendmentVersion" | "finalCheckpoint"> {
+  readonly amendmentVersion: 2;
+  readonly finalCheckpoint: CheckpointDraftV2 | null;
+  readonly evidenceWindowAction: "unchanged" | "open" | "seal";
+}
+
+export type SessionEndRequest = SessionEndRequestV1 | SessionEndRequestV2;
+export type SessionEndAmendment = SessionEndAmendmentV1 | SessionEndAmendmentV2;
+
+export interface SessionEndEvidenceWindowStatusV2 {
+  readonly evidenceWindowState: "open" | "sealed";
+  readonly evidenceFrozenCheckpointEventPosition: string | null;
+  readonly evidenceFrozenGeneration: number | null;
+}
+
+export type SessionEndPhaseActionV2 =
+  | "mark-children-resolved"
+  | "record-final-checkpoint-and-queue-ending"
+  | "confirm-ending-materialization"
+  | "begin-validation"
+  | "record-verification-failed"
+  | "record-verification-passed"
+  | "invalidate-verification"
+  | "append-terminal-completion"
+  | "confirm-completed-materialization"
+  | "complete-without-materialization"
+  | "complete-after-materialization";
+
+export type SessionEndStatusV2 = JsonValue & {
+  readonly resultVersion: 2;
+  readonly sessionId: SessionId;
+  readonly workflowId: WorkflowId;
+  readonly workflowGeneration: number;
+  readonly phase: SessionEndPhase;
+  readonly priorRootState: "active" | "suspended";
+  readonly triggeringEventPosition: string;
+  readonly finalCheckpointId: CheckpointId | null;
+  readonly finalCheckpointEventPosition: string | null;
+  readonly evidenceWindow: SessionEndEvidenceWindowStatusV2;
+  readonly validationPlansReady: boolean;
+  readonly qualityScore: number | null;
+  readonly safeFailureCode: string | null;
+  readonly materializationRequired: boolean;
+};
+
+export type SessionEndPhaseResultV2 = JsonValue & {
+  readonly resultVersion: 2;
+  readonly action: SessionEndPhaseActionV2;
+  readonly progressed: boolean;
+  readonly previousPhase: SessionEndPhase;
+  readonly status: SessionEndStatusV2;
+};
+
+export type ValidationResultRecordedResultV1 = JsonValue & {
+  readonly resultVersion: 1;
+  readonly resultId: ValidationResultId;
+  readonly workflowId: WorkflowId;
+  readonly workflowGeneration: number;
+  readonly eventPosition: string;
+  readonly finalStreamVersion: string;
+};
+
+export interface FinalEndingScopeBindingV1 {
+  readonly bindingVersion: 1;
+  readonly bindingKind: "current-child" | "carry-forward-ticket";
+  readonly childSessionId: SessionId;
+  readonly childState: ChildSessionState;
+  readonly lastEventPosition: string;
+  readonly streamVersion: string;
+  readonly checkpointId: CheckpointId | null;
+  readonly checkpointEventPosition: string | null;
+  readonly transferTicketId: TransferTicketId | null;
+  readonly transferTicketEventPosition: string | null;
 }
 
 export const SESSION_END_PHASES = Object.freeze([
@@ -489,4 +584,174 @@ export function decodeSessionEndAmendmentV1(value: unknown): SessionEndAmendment
 
 export function assertValidationResultShape(result: ValidationResultV1): void {
   void decodeValidationResultV1(result);
+}
+
+export function decodeSessionEndRequestV2(value: unknown): SessionEndRequestV2 {
+  const request = exactRecord(value, [
+    "requestVersion",
+    "sessionId",
+    "childEndPolicy",
+    "finalCheckpoint",
+    "validationProfileIds",
+    "requestedQualityThreshold",
+    "requireFullEvidence",
+    "requireMaterialization",
+  ], "sessionEndRequest");
+  if (request.requestVersion !== 2) invalid("requestVersion");
+  return Object.freeze({
+    requestVersion: 2,
+    sessionId: parseLifecycleId<SessionId>(request.sessionId, "sessionId"),
+    childEndPolicy: parseEnum(request.childEndPolicy, CHILD_END_POLICIES, "childEndPolicy"),
+    finalCheckpoint: decodeCheckpointDraftV2(request.finalCheckpoint),
+    validationProfileIds: decodeProfileIds(request.validationProfileIds),
+    requestedQualityThreshold: parseInteger(
+      request.requestedQualityThreshold,
+      "requestedQualityThreshold",
+      0,
+      QUALITY_THRESHOLD_MAX,
+    ),
+    requireFullEvidence: parseBoolean(request.requireFullEvidence, "requireFullEvidence"),
+    requireMaterialization: parseBoolean(request.requireMaterialization, "requireMaterialization"),
+  });
+}
+
+export function decodeSessionEndAmendmentV2(value: unknown): SessionEndAmendmentV2 {
+  const amendment = exactRecord(value, [
+    "amendmentVersion",
+    "childEndPolicy",
+    "finalCheckpoint",
+    "validationProfileIds",
+    "requestedQualityThreshold",
+    "requireFullEvidence",
+    "requireMaterialization",
+    "evidenceWindowAction",
+  ], "sessionEndAmendment");
+  if (amendment.amendmentVersion !== 2) invalid("amendmentVersion");
+  const evidenceWindowAction = parseEnum(
+    amendment.evidenceWindowAction,
+    EVIDENCE_WINDOW_ACTIONS,
+    "evidenceWindowAction",
+  );
+  const childEndPolicy = amendment.childEndPolicy === null
+    ? null
+    : parseEnum(amendment.childEndPolicy, CHILD_END_POLICIES, "childEndPolicy");
+  const finalCheckpoint = amendment.finalCheckpoint === null
+    ? null
+    : decodeCheckpointDraftV2(amendment.finalCheckpoint);
+  if (evidenceWindowAction === "open" && finalCheckpoint === null) invalid("finalCheckpoint");
+  const validationProfileIds = amendment.validationProfileIds === null
+    ? null
+    : decodeProfileIds(amendment.validationProfileIds);
+  return Object.freeze({
+    amendmentVersion: 2,
+    childEndPolicy,
+    finalCheckpoint,
+    validationProfileIds,
+    requestedQualityThreshold: nullableThreshold(amendment.requestedQualityThreshold),
+    requireFullEvidence: nullableBoolean(amendment.requireFullEvidence, "requireFullEvidence"),
+    requireMaterialization: nullableBoolean(amendment.requireMaterialization, "requireMaterialization"),
+    evidenceWindowAction,
+  });
+}
+
+export function decodeSessionEndRequest(value: unknown): SessionEndRequest {
+  const version = strictRecord(value, "sessionEndRequest").requestVersion;
+  if (version === 1) return decodeSessionEndRequestV1(value);
+  if (version === 2) return decodeSessionEndRequestV2(value);
+  return invalid("requestVersion");
+}
+
+export function decodeSessionEndAmendment(value: unknown): SessionEndAmendment {
+  const version = strictRecord(value, "sessionEndAmendment").amendmentVersion;
+  if (version === 1) return decodeSessionEndAmendmentV1(value);
+  if (version === 2) return decodeSessionEndAmendmentV2(value);
+  return invalid("amendmentVersion");
+}
+
+export function decodeFinalEndingScopeBindingsV1(
+  value: unknown,
+): readonly FinalEndingScopeBindingV1[] {
+  const source = strictArray(value, "finalEndingScopeBindings");
+  let previousChildSessionId: string | null = null;
+  const decoded = source.map((entry, index): FinalEndingScopeBindingV1 => {
+    const field = `finalEndingScopeBindings[${index}]`;
+    const binding = exactRecord(entry, [
+      "bindingVersion",
+      "bindingKind",
+      "childSessionId",
+      "childState",
+      "lastEventPosition",
+      "streamVersion",
+      "checkpointId",
+      "checkpointEventPosition",
+      "transferTicketId",
+      "transferTicketEventPosition",
+    ], field);
+    if (binding.bindingVersion !== 1) invalid(`${field}.bindingVersion`);
+    const bindingKind = parseEnum(
+      binding.bindingKind,
+      ["current-child", "carry-forward-ticket"] as const,
+      `${field}.bindingKind`,
+    );
+    const childSessionId = parseLifecycleId<SessionId>(binding.childSessionId, `${field}.childSessionId`);
+    if (
+      previousChildSessionId !== null
+      && Buffer.compare(Buffer.from(previousChildSessionId, "utf8"), Buffer.from(childSessionId, "utf8")) >= 0
+    ) invalid("finalEndingScopeBindings");
+    previousChildSessionId = childSessionId;
+    const childState = parseEnum(binding.childState, CHILD_STATES, `${field}.childState`);
+    const lastEventPosition = parseDecimalString(binding.lastEventPosition, `${field}.lastEventPosition`);
+    const streamVersion = parseDecimalString(binding.streamVersion, `${field}.streamVersion`);
+    if (lastEventPosition === "0" || streamVersion === "0") invalid(field);
+    const checkpointId = parseNullableUuid<CheckpointId>(binding.checkpointId, `${field}.checkpointId`);
+    const checkpointEventPosition = binding.checkpointEventPosition === null
+      ? null
+      : parseDecimalString(binding.checkpointEventPosition, `${field}.checkpointEventPosition`);
+    if (
+      (checkpointId === null) !== (checkpointEventPosition === null)
+      || checkpointEventPosition === "0"
+      || (
+        checkpointEventPosition !== null
+        && BigInt(checkpointEventPosition) > BigInt(lastEventPosition)
+      )
+    ) invalid(field);
+    const transferTicketId = parseNullableUuid<TransferTicketId>(
+      binding.transferTicketId,
+      `${field}.transferTicketId`,
+    );
+    const transferTicketEventPosition = binding.transferTicketEventPosition === null
+      ? null
+      : parseDecimalString(
+          binding.transferTicketEventPosition,
+          `${field}.transferTicketEventPosition`,
+        );
+    if (bindingKind === "current-child") {
+      if (transferTicketId !== null || transferTicketEventPosition !== null) invalid(field);
+    } else if (
+      childState !== "transferred"
+      || checkpointId === null
+      || checkpointEventPosition === null
+      || transferTicketId === null
+      || transferTicketEventPosition === null
+      || transferTicketEventPosition === "0"
+      || lastEventPosition !== transferTicketEventPosition
+    ) invalid(field);
+    return Object.freeze({
+      bindingVersion: 1,
+      bindingKind,
+      childSessionId,
+      childState,
+      lastEventPosition,
+      streamVersion,
+      checkpointId,
+      checkpointEventPosition,
+      transferTicketId,
+      transferTicketEventPosition,
+    });
+  });
+  const frozen = Object.freeze(decoded);
+  if (Buffer.byteLength(canonicalJson(frozen), "utf8") > FINAL_ENDING_SCOPE_BINDINGS_MAX_CANONICAL_BYTES) {
+    invalid("finalEndingScopeBindings.canonicalBytes");
+  }
+  return frozen;
 }

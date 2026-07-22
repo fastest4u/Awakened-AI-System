@@ -4,7 +4,7 @@ import type {
   VaultId,
   WorkspaceId,
 } from "../identity/contracts.js";
-import type { LifecycleAssignmentV1, LifecycleEventType, LifecycleEventV1 } from "./contracts/events.js";
+import type { LifecycleAssignmentV1, LifecycleEvent, LifecycleEventType } from "./contracts/events.js";
 import type {
   CheckpointId,
   ChildSessionState,
@@ -22,6 +22,12 @@ const UNSIGNED_DECIMAL = /^(0|[1-9][0-9]*)$/;
 const LOWER_HASH = /^[0-9a-f]{64}$/;
 const CANONICAL_REPORT_ITEM_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const CHILD_REPORT_LIMIT_V1 = 200;
+const VERSION_2_EVENT_TYPES = new Set<LifecycleEventType>([
+  "EvidenceCoverageRecorded",
+  "SessionCheckpointRecorded",
+  "SessionEndRequested",
+  "SessionEndAmended",
+]);
 
 function rootStates(...states: RootSessionState[]): readonly RootSessionState[] {
   return Object.freeze(states);
@@ -209,13 +215,14 @@ function deterministicStreamId(sessionId: SessionId): string {
   return `session/${sessionId}`;
 }
 
-function payloadCommitment(event: LifecycleEventV1): string | null {
+function payloadCommitment(event: LifecycleEvent): string | null {
   if (!("authorityCommitment" in event.payload)) return null;
   return commitment(event.payload.authorityCommitment);
 }
 
-function assertEnvelope(event: LifecycleEventV1): { readonly streamVersion: bigint; readonly eventPosition: bigint } {
-  if (event.eventSchemaVersion !== 1) integrity();
+function assertEnvelope(event: LifecycleEvent): { readonly streamVersion: bigint; readonly eventPosition: bigint } {
+  if (event.eventSchemaVersion !== 1 && event.eventSchemaVersion !== 2) integrity();
+  if (event.eventSchemaVersion === 2 && !VERSION_2_EVENT_TYPES.has(event.eventType)) integrity();
   const streamVersion = decimalPosition(event.streamVersion, false);
   const eventPosition = decimalPosition(event.globalPosition, false);
   if (event.streamId !== deterministicStreamId(event.sessionId)) integrity();
@@ -223,12 +230,12 @@ function assertEnvelope(event: LifecycleEventV1): { readonly streamVersion: bigi
   return Object.freeze({ streamVersion, eventPosition });
 }
 
-function assertInitialCommitment(event: LifecycleEventV1): void {
+function assertInitialCommitment(event: LifecycleEvent): void {
   const embedded = payloadCommitment(event);
   if (embedded === null || embedded !== event.authorityCommitment) integrity();
 }
 
-function assertContinuationCommitment(state: SessionAggregateState, event: LifecycleEventV1): void {
+function assertContinuationCommitment(state: SessionAggregateState, event: LifecycleEvent): void {
   const embedded = payloadCommitment(event);
   if (AUTHORITY_MUTATING_EVENTS.has(event.eventType)) {
     if (
@@ -249,7 +256,7 @@ function freezeAssignment(assignment: LifecycleAssignmentV1): LifecycleAssignmen
   });
 }
 
-function initializeSession(event: LifecycleEventV1): SessionAggregateState {
+function initializeSession(event: LifecycleEvent): SessionAggregateState {
   const { streamVersion, eventPosition } = assertEnvelope(event);
   if (streamVersion !== 1n) integrity();
   assertInitialCommitment(event);
@@ -327,7 +334,7 @@ function initializeSession(event: LifecycleEventV1): SessionAggregateState {
 
 function assertContinuationEnvelope(
   state: SessionAggregateState,
-  event: LifecycleEventV1,
+  event: LifecycleEvent,
 ): { readonly streamVersion: bigint; readonly eventPosition: bigint } {
   const positions = assertEnvelope(event);
   if (
@@ -355,7 +362,7 @@ function isAllowedChildTransition(state: ChildAggregateState, eventType: Lifecyc
 
 function withRootEvent(
   state: RootAggregateState,
-  event: LifecycleEventV1,
+  event: LifecycleEvent,
   streamVersion: bigint,
   eventPosition: bigint,
   changes: Partial<RootAggregateState>,
@@ -371,7 +378,7 @@ function withRootEvent(
 
 function withChildEvent(
   state: ChildAggregateState,
-  event: LifecycleEventV1,
+  event: LifecycleEvent,
   streamVersion: bigint,
   eventPosition: bigint,
   changes: Partial<ChildAggregateState>,
@@ -387,7 +394,7 @@ function withChildEvent(
 
 function checkpointChanges(
   state: SessionAggregateState,
-  event: Extract<LifecycleEventV1, { readonly eventType: "SessionCheckpointRecorded" }>,
+  event: Extract<LifecycleEvent, { readonly eventType: "SessionCheckpointRecorded" }>,
   eventPosition: bigint,
 ): Pick<
   SessionAggregateState,
@@ -463,7 +470,7 @@ function reportItemSignatureFor(
 
 function evolveRoot(
   state: RootAggregateState,
-  event: LifecycleEventV1,
+  event: LifecycleEvent,
   streamVersion: bigint,
   eventPosition: bigint,
 ): RootAggregateState {
@@ -639,7 +646,7 @@ function evolveRoot(
 
 function evolveChild(
   state: ChildAggregateState,
-  event: LifecycleEventV1,
+  event: LifecycleEvent,
   streamVersion: bigint,
   eventPosition: bigint,
 ): ChildAggregateState {
@@ -760,12 +767,12 @@ function evolveChild(
   }
 }
 
-export function evolveSession(state: RootAggregateState, event: LifecycleEventV1): RootAggregateState;
-export function evolveSession(state: ChildAggregateState, event: LifecycleEventV1): ChildAggregateState;
-export function evolveSession(state: SessionAggregateState, event: LifecycleEventV1): SessionAggregateState;
+export function evolveSession(state: RootAggregateState, event: LifecycleEvent): RootAggregateState;
+export function evolveSession(state: ChildAggregateState, event: LifecycleEvent): ChildAggregateState;
+export function evolveSession(state: SessionAggregateState, event: LifecycleEvent): SessionAggregateState;
 export function evolveSession(
   state: SessionAggregateState,
-  event: LifecycleEventV1,
+  event: LifecycleEvent,
 ): SessionAggregateState {
   const { streamVersion, eventPosition } = assertContinuationEnvelope(state, event);
   if (isTerminalSession(state)) stateConflict();
@@ -781,7 +788,7 @@ export function evolveSession(
     : evolveChild(state, event, streamVersion, eventPosition);
 }
 
-export function foldSession(events: readonly LifecycleEventV1[]): SessionAggregateState {
+export function foldSession(events: readonly LifecycleEvent[]): SessionAggregateState {
   const first = events[0];
   if (first === undefined) integrity();
   let aggregate = initializeSession(first);

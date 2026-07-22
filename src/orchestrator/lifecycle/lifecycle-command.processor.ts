@@ -30,6 +30,7 @@ import type {
   RootResumeCommandV2,
   RootStartCommandV2,
   RootSuspendCommandV2,
+  RootSuspendCommandV3,
 } from "./contracts/commands.js";
 import {
   assertSemanticCommandAuthorization,
@@ -2016,21 +2017,23 @@ export class LifecycleCommandProcessor {
 
   suspendRoot(
     context: ProjectContext,
-    input: PreparedLifecycleWorkerCommand<RootSuspendCommandV2>,
+    input: PreparedLifecycleWorkerCommand<RootSuspendCommandV2 | RootSuspendCommandV3>,
   ): WorkerLifecycleResult<RootSessionPublicResultV2> {
     const decoded = decodeLifecycleSemanticCommandDraft(input.command);
     if (decoded.commandType !== "root-suspend") invalid();
-    assertSemanticCommandAuthorization(decoded, input.authorization);
-    validateContext(context, decoded);
+    if (decoded.checkpoint.checkpointVersion !== 1) throw new LifecycleError("LIFECYCLE_V2_DISABLED");
+    const command = decoded as RootSuspendCommandV2;
+    assertSemanticCommandAuthorization(command, input.authorization);
+    validateContext(context, command);
     if (
       input.authorization.kind !== "protected"
       || input.authorization.proof === null
       || input.authorization.approval !== null
       || input.authorization.childBindingGrant !== null
-      || input.authorization.authoritySessionId !== decoded.sessionId
-      || input.authorization.targetSessionId !== decoded.sessionId
+      || input.authorization.authoritySessionId !== command.sessionId
+      || input.authorization.targetSessionId !== command.sessionId
     ) throw new LifecycleError("SESSION_CAPABILITY_INVALID");
-    const checkpointDraft = decodeCheckpointDraftV1(decoded.checkpoint);
+    const checkpointDraft = decodeCheckpointDraftV1(command.checkpoint);
     const proof = input.authorization.proof;
     const proofBytes = Buffer.from(proof.proofFingerprint, "hex");
     let proofDigest: string;

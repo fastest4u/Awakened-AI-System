@@ -16,6 +16,7 @@ import {
   type LifecycleEventBaseV1,
   type LifecycleEventPayloadMapV1,
   type LifecycleEventType,
+  type LifecycleEvent,
   type LifecycleEventV1,
 } from "../src/orchestrator/lifecycle/contracts/events.js";
 import type {
@@ -185,6 +186,37 @@ function transferDerivedChild(): ChildAggregateState {
 }
 
 describe("SessionAggregate", () => {
+  it("folds the exact Version 2 event subset through the shared event union", () => {
+    const invalidV2Start = Object.freeze({
+      ...lifecycleEvent(1, "SessionStarted"),
+      eventSchemaVersion: 2 as const,
+    }) as unknown as LifecycleEvent;
+    expectIntegrity(() => foldSession([invalidV2Start]));
+
+    const root = rootAggregate();
+    const evidenceV1 = eventAfter(root, "EvidenceCoverageRecorded");
+    const evidenceV2 = Object.freeze({
+      ...evidenceV1,
+      eventSchemaVersion: 2 as const,
+    }) as unknown as LifecycleEvent;
+    const afterEvidence = evolveSession(root, evidenceV2);
+    assert.equal(afterEvidence.streamVersion, root.streamVersion + 1n);
+
+    const requestedV1 = eventAfter(afterEvidence, "SessionEndRequested", {
+      workflowId: WORKFLOW_ID,
+      workflowGeneration: 1,
+      previousState: "active",
+    });
+    const requestedV2 = Object.freeze({
+      ...requestedV1,
+      eventSchemaVersion: 2 as const,
+      payload: Object.freeze({ ...requestedV1.payload, requestVersion: 2 as const }),
+    }) as unknown as LifecycleEvent;
+    const ending = evolveSession(afterEvidence, requestedV2);
+    assert.equal(ending.kind, "root");
+    assert.equal(ending.state, "ending");
+  });
+
   describe("first-event and stream identity rules", () => {
     it("folds only SessionStarted or SessionForked as stream version one", () => {
       const root = foldSession([lifecycleEvent(1, "SessionStarted")]);

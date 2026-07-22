@@ -24,6 +24,7 @@ import {
 import {
   decodeLifecycleSemanticCommandDraft,
   type RecordCheckpointCommandV2,
+  type RecordCheckpointCommandV3,
 } from "./contracts/commands.js";
 import type { CheckpointId, SessionId } from "./contracts/identifiers.js";
 import { LifecycleError } from "./errors.js";
@@ -477,7 +478,7 @@ export class CheckpointService {
 
   record(
     transaction: LifecycleCommandTransaction,
-    commandInput: RecordCheckpointCommandV2,
+    commandInput: RecordCheckpointCommandV2 | RecordCheckpointCommandV3,
   ): FreshLifecycleEffect<CheckpointRecordedResultV1> {
     return this.#record(transaction, commandInput, false);
   }
@@ -493,12 +494,13 @@ export class CheckpointService {
 
   #record(
     transaction: LifecycleCommandTransaction,
-    commandInput: RecordCheckpointCommandV2,
+    commandInput: RecordCheckpointCommandV2 | RecordCheckpointCommandV3,
     finalization: boolean,
   ): FreshLifecycleEffect<CheckpointRecordedResultV1> {
     const decoded = decodeLifecycleSemanticCommandDraft(commandInput);
     if (decoded.commandType !== "record-checkpoint") invalid();
-    const command = decoded;
+    if (decoded.draft.checkpointVersion !== 1) throw new LifecycleError("LIFECYCLE_V2_DISABLED");
+    const command = decoded as RecordCheckpointCommandV2;
     const invocation = this.#invocations.current(transaction, command);
     assertContext(invocation.context, command);
     const draft = decodeCheckpointDraftV1(command.draft);

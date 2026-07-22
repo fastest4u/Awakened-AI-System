@@ -418,6 +418,51 @@ describe("lifecycle intent", () => {
     );
   });
 
+  it("separates nested checkpoint versions while preserving the Version 1 intent vector", () => {
+    const version1 = decodeLifecycleSemanticCommandDraft({
+      ...familyBase(),
+      commandType: "record-checkpoint",
+      sessionId: UUID.session,
+      expectedStreamVersion: "3",
+      expectedBaseEventPosition: null,
+      draft: checkpointDraft(),
+    });
+    const version2 = decodeLifecycleSemanticCommandDraft({
+      ...familyBase(),
+      commandType: "record-checkpoint",
+      sessionId: UUID.session,
+      expectedStreamVersion: "3",
+      expectedBaseEventPosition: null,
+      draft: { ...checkpointDraft(), checkpointVersion: 2 },
+    });
+    const version1Hash = lifecycleIntentHash(intent({ command: version1 }));
+    const version2Hash = lifecycleIntentHash(intent({ command: version2 }));
+    assert.notEqual(version1Hash, version2Hash);
+    assert.equal(
+      buildLifecycleIntentWitness(version2, {
+        authorizationKind: "protected",
+        authorizationSessionId: UUID.session,
+        targetSessionId: UUID.session,
+        projectId: UUID.project,
+        vaultId: UUID.vault,
+        storeId: UUID.store,
+        workspaceId: WORKSPACE_ID,
+        clientNamespace: "desktop/tests",
+        capabilityKind: "root-resume-token",
+        capabilityGeneration: "7",
+        presentingActorRole: "primary",
+        presentingClientInstanceId: "primary-a",
+        targetActorRole: "primary",
+        targetClientInstanceId: "primary-a",
+        internalWorkflowId: null,
+        internalWorkflowGeneration: null,
+        internalPlannedWorkId: null,
+      }).intentHash,
+      version2Hash,
+    );
+    assert.equal(lifecycleIntentHash(intent()), EXPECTED_INTENT_HASH);
+  });
+
   it("binds every decoded semantic field", () => {
     const base = intent();
     const variants: readonly Record<string, unknown>[] = [

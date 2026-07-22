@@ -11,8 +11,11 @@ import {
   parseNullableBoundedString,
   parseNullableUuid,
   strictArray,
+  strictRecord,
   type CheckpointId,
+  type AdapterSessionId,
   type ChildSessionState,
+  type EvidenceBatchId,
   type MaterialConfidence,
   type SessionId,
 } from "./identifiers.js";
@@ -20,6 +23,7 @@ import { LifecycleError } from "../errors.js";
 import { canonicalJson } from "../../serialization/canonical-json.js";
 
 export const CHECKPOINT_MAX_CANONICAL_BYTES = 256 * 1024;
+export const CHECKPOINT_EVIDENCE_COVERAGE_MAX_CANONICAL_BYTES = 192 * 1024;
 export const CHECKPOINT_MAX_TASK_SUMMARY_SCALARS = 2_000;
 export const CHECKPOINT_MAX_LIST_ENTRIES = 100;
 export const CHECKPOINT_MAX_MATERIAL_ENTRIES = 200;
@@ -163,6 +167,45 @@ export interface CheckpointV1 extends CheckpointDraftV1 {
   readonly childSummaries: readonly CheckpointChildSummaryV1[];
   readonly evidenceCoverage: CheckpointEvidenceCoverageV1;
 }
+
+export interface CheckpointAdapterCoverageV2 {
+  readonly adapterSessionId: AdapterSessionId;
+  readonly coverageFirstOrdinal: "0";
+  readonly coverageLastOrdinal: string;
+  readonly highestContiguousOrdinal: string | null;
+  readonly missingIntervals: readonly MissingOrdinalIntervalV1[];
+  readonly frameFingerprintAlgorithm: "hmac-sha256";
+  readonly frameFingerprintSchemaVersion: 1;
+  readonly frameFingerprintKeyId: string;
+  readonly frameFingerprintDomain: "pm-evidence-frame-v1";
+  readonly coverageFingerprintAlgorithm: "hmac-sha256";
+  readonly coverageFingerprintSchemaVersion: 1;
+  readonly coverageFingerprintKeyId: string;
+  readonly coverageFingerprintDomain: "pm-evidence-coverage-v1";
+  readonly coverageFingerprint: string;
+  readonly latestBatchId: EvidenceBatchId;
+  readonly latestBatchEventPosition: string;
+}
+
+export interface CheckpointEvidenceCoverageV2 {
+  readonly coverageVersion: 2;
+  readonly captureMode: "coverage-only";
+  readonly contentRetained: false;
+  readonly adapterSessions: readonly CheckpointAdapterCoverageV2[];
+}
+
+export interface CheckpointDraftV2 extends Omit<CheckpointDraftV1, "checkpointVersion"> {
+  readonly checkpointVersion: 2;
+}
+
+export interface CheckpointV2
+  extends Omit<CheckpointV1, "checkpointVersion" | "evidenceCoverage"> {
+  readonly checkpointVersion: 2;
+  readonly evidenceCoverage: CheckpointEvidenceCoverageV2;
+}
+
+export type CheckpointDraft = CheckpointDraftV1 | CheckpointDraftV2;
+export type Checkpoint = CheckpointV1 | CheckpointV2;
 
 function invalid(field: string): never {
   throw new LifecycleError("LIFECYCLE_INPUT_INVALID", { field });
@@ -422,10 +465,152 @@ function decodeCheckpointContent(checkpoint: Record<string, unknown>): Checkpoin
   });
 }
 
-function assertCheckpointBytes(value: CheckpointDraftV1 | CheckpointV1): void {
+function assertCheckpointBytes(value: CheckpointDraft | Checkpoint): void {
   if (Buffer.byteLength(canonicalJson(value), "utf8") > CHECKPOINT_MAX_CANONICAL_BYTES) {
     invalid("checkpoint.canonicalBytes");
   }
+}
+
+function evidenceCoverageV2(value: unknown): CheckpointEvidenceCoverageV2 {
+  const coverage = exactRecord(
+    value,
+    ["coverageVersion", "captureMode", "contentRetained", "adapterSessions"],
+    "evidenceCoverage",
+  );
+  if (
+    coverage.coverageVersion !== 2
+    || coverage.captureMode !== "coverage-only"
+    || coverage.contentRetained !== false
+  ) invalid("evidenceCoverage");
+  const source = strictArray(coverage.adapterSessions, "evidenceCoverage.adapterSessions");
+  if (source.length > 200) throw new LifecycleError("EVIDENCE_ADAPTER_SESSION_LIMIT");
+  let previousAdapterSessionId: string | null = null;
+  let totalIntervals = 0;
+  const adapterSessions = source.map((item, index): CheckpointAdapterCoverageV2 => {
+    const field = `evidenceCoverage.adapterSessions[${index}]`;
+    const adapter = exactRecord(item, [
+      "adapterSessionId",
+      "coverageFirstOrdinal",
+      "coverageLastOrdinal",
+      "highestContiguousOrdinal",
+      "missingIntervals",
+      "frameFingerprintAlgorithm",
+      "frameFingerprintSchemaVersion",
+      "frameFingerprintKeyId",
+      "frameFingerprintDomain",
+      "coverageFingerprintAlgorithm",
+      "coverageFingerprintSchemaVersion",
+      "coverageFingerprintKeyId",
+      "coverageFingerprintDomain",
+      "coverageFingerprint",
+      "latestBatchId",
+      "latestBatchEventPosition",
+    ], field);
+    if (
+      adapter.coverageFirstOrdinal !== "0"
+      || adapter.frameFingerprintAlgorithm !== "hmac-sha256"
+      || adapter.frameFingerprintSchemaVersion !== 1
+      || adapter.frameFingerprintDomain !== "pm-evidence-frame-v1"
+      || adapter.coverageFingerprintAlgorithm !== "hmac-sha256"
+      || adapter.coverageFingerprintSchemaVersion !== 1
+      || adapter.coverageFingerprintDomain !== "pm-evidence-coverage-v1"
+    ) invalid(field);
+    const adapterSessionId = parseLifecycleId<AdapterSessionId>(
+      adapter.adapterSessionId,
+      `${field}.adapterSessionId`,
+    );
+    if (
+      previousAdapterSessionId !== null
+      && Buffer.compare(Buffer.from(previousAdapterSessionId, "utf8"), Buffer.from(adapterSessionId, "utf8")) >= 0
+    ) invalid("evidenceCoverage.adapterSessions");
+    previousAdapterSessionId = adapterSessionId;
+    const coverageLastOrdinal = parseDecimalString(
+      adapter.coverageLastOrdinal,
+      `${field}.coverageLastOrdinal`,
+    );
+    const highestContiguousOrdinal = adapter.highestContiguousOrdinal === null
+      ? null
+      : parseDecimalString(
+          adapter.highestContiguousOrdinal,
+          `${field}.highestContiguousOrdinal`,
+        );
+    if (
+      highestContiguousOrdinal !== null
+      && BigInt(highestContiguousOrdinal) > BigInt(coverageLastOrdinal)
+    ) invalid(`${field}.highestContiguousOrdinal`);
+    const intervalSource = strictArray(adapter.missingIntervals, `${field}.missingIntervals`);
+    if (intervalSource.length > CHECKPOINT_MAX_MISSING_INTERVALS) {
+      throw new LifecycleError("EVIDENCE_COVERAGE_TOO_FRAGMENTED");
+    }
+    totalIntervals += intervalSource.length;
+    if (totalIntervals > CHECKPOINT_MAX_MISSING_INTERVALS) {
+      throw new LifecycleError("EVIDENCE_COVERAGE_TOO_FRAGMENTED");
+    }
+    const missingIntervals = intervalSource.map((entry, intervalIndex) =>
+      interval(entry, `${field}.missingIntervals[${intervalIndex}]`));
+    for (let intervalIndex = 0; intervalIndex < missingIntervals.length; intervalIndex += 1) {
+      const current = missingIntervals[intervalIndex];
+      const previous = missingIntervals[intervalIndex - 1];
+      if (
+        current === undefined
+        || BigInt(current.lastOrdinal) > BigInt(coverageLastOrdinal)
+        || (
+          previous !== undefined
+          && BigInt(current.firstOrdinal) <= BigInt(previous.lastOrdinal) + 1n
+        )
+      ) invalid(`${field}.missingIntervals`);
+    }
+    const firstMissing = missingIntervals[0];
+    if (
+      firstMissing === undefined
+        ? highestContiguousOrdinal !== coverageLastOrdinal
+        : BigInt(firstMissing.firstOrdinal) !== (
+            highestContiguousOrdinal === null ? 0n : BigInt(highestContiguousOrdinal) + 1n
+          )
+    ) invalid(`${field}.missingIntervals`);
+    const frameFingerprintKeyId = parseBoundedString(
+      adapter.frameFingerprintKeyId,
+      `${field}.frameFingerprintKeyId`,
+      128,
+    );
+    const coverageFingerprintKeyId = parseBoundedString(
+      adapter.coverageFingerprintKeyId,
+      `${field}.coverageFingerprintKeyId`,
+      128,
+    );
+    if (coverageFingerprintKeyId !== frameFingerprintKeyId) invalid(`${field}.coverageFingerprintKeyId`);
+    return Object.freeze({
+      adapterSessionId,
+      coverageFirstOrdinal: "0",
+      coverageLastOrdinal,
+      highestContiguousOrdinal,
+      missingIntervals: Object.freeze(missingIntervals),
+      frameFingerprintAlgorithm: "hmac-sha256",
+      frameFingerprintSchemaVersion: 1,
+      frameFingerprintKeyId,
+      frameFingerprintDomain: "pm-evidence-frame-v1",
+      coverageFingerprintAlgorithm: "hmac-sha256",
+      coverageFingerprintSchemaVersion: 1,
+      coverageFingerprintKeyId,
+      coverageFingerprintDomain: "pm-evidence-coverage-v1",
+      coverageFingerprint: hash(adapter.coverageFingerprint, `${field}.coverageFingerprint`) as string,
+      latestBatchId: parseLifecycleId<EvidenceBatchId>(adapter.latestBatchId, `${field}.latestBatchId`),
+      latestBatchEventPosition: parseDecimalString(
+        adapter.latestBatchEventPosition,
+        `${field}.latestBatchEventPosition`,
+      ),
+    });
+  });
+  const decoded = Object.freeze({
+    coverageVersion: 2 as const,
+    captureMode: "coverage-only" as const,
+    contentRetained: false as const,
+    adapterSessions: Object.freeze(adapterSessions),
+  });
+  if (Buffer.byteLength(canonicalJson(decoded), "utf8") > CHECKPOINT_EVIDENCE_COVERAGE_MAX_CANONICAL_BYTES) {
+    throw new LifecycleError("EVIDENCE_COVERAGE_SNAPSHOT_TOO_LARGE");
+  }
+  return decoded;
 }
 
 export function decodeCheckpointDraftV1(value: unknown): CheckpointDraftV1 {
@@ -495,4 +680,105 @@ export function decodeCheckpointV1(value: unknown): CheckpointV1 {
 
   assertCheckpointBytes(decoded);
   return decoded;
+}
+
+export function decodeCheckpointDraftV2(value: unknown): CheckpointDraftV2 {
+  const checkpoint = exactRecord(
+    value,
+    ["checkpointVersion", ...CHECKPOINT_CONTENT_KEYS],
+    "checkpointDraft",
+  );
+  if (checkpoint.checkpointVersion !== 2) invalid("checkpointVersion");
+  const decoded = Object.freeze({
+    checkpointVersion: 2 as const,
+    ...decodeCheckpointContent(checkpoint),
+  });
+  assertCheckpointBytes(decoded);
+  return decoded;
+}
+
+export function decodeCheckpointV2(value: unknown): CheckpointV2 {
+  const checkpoint = exactRecord(value, [
+    "checkpointVersion",
+    "checkpointId",
+    "sessionId",
+    "parentSessionId",
+    "baseEventPosition",
+    "checkpointEventPosition",
+    "createdAt",
+    "creatorAgentId",
+    "creatorClientInstanceId",
+    ...CHECKPOINT_CONTENT_KEYS,
+    "sourceState",
+    "childSummaries",
+    "evidenceCoverage",
+  ], "checkpoint");
+  if (checkpoint.checkpointVersion !== 2) invalid("checkpointVersion");
+  const baseEventPosition = parseDecimalString(checkpoint.baseEventPosition, "baseEventPosition");
+  const checkpointEventPosition = parseDecimalString(
+    checkpoint.checkpointEventPosition,
+    "checkpointEventPosition",
+  );
+  if (BigInt(baseEventPosition) > BigInt(checkpointEventPosition)) {
+    throw new LifecycleError("CHECKPOINT_BASE_INVALID");
+  }
+  const decodedCoverage = evidenceCoverageV2(checkpoint.evidenceCoverage);
+  if (decodedCoverage.adapterSessions.some(
+    (adapter) => BigInt(adapter.latestBatchEventPosition) > BigInt(baseEventPosition),
+  )) invalid("evidenceCoverage.adapterSessions.latestBatchEventPosition");
+  const childSummaries = strictArray(checkpoint.childSummaries, "childSummaries").map(
+    (child, index) => childSummary(child, `childSummaries[${index}]`),
+  );
+  for (let index = 1; index < childSummaries.length; index += 1) {
+    const previous = childSummaries[index - 1];
+    const current = childSummaries[index];
+    if (
+      previous === undefined
+      || current === undefined
+      || Buffer.compare(
+        Buffer.from(previous.childSessionId, "utf8"),
+        Buffer.from(current.childSessionId, "utf8"),
+      ) >= 0
+    ) invalid("childSummaries");
+  }
+  if (decodedCoverage.adapterSessions.some((adapter) => adapter.latestBatchEventPosition === "0")) {
+    invalid("evidenceCoverage.adapterSessions.latestBatchEventPosition");
+  }
+  const decoded: CheckpointV2 = Object.freeze({
+    checkpointVersion: 2,
+    checkpointId: parseLifecycleId<CheckpointId>(checkpoint.checkpointId, "checkpointId"),
+    sessionId: parseLifecycleId<SessionId>(checkpoint.sessionId, "sessionId"),
+    parentSessionId: parseNullableUuid<SessionId>(checkpoint.parentSessionId, "parentSessionId"),
+    baseEventPosition,
+    checkpointEventPosition,
+    createdAt: parseCanonicalTimestamp(checkpoint.createdAt, "createdAt"),
+    creatorAgentId: parseBoundedString(checkpoint.creatorAgentId, "creatorAgentId", 256),
+    creatorClientInstanceId: parseBoundedString(
+      checkpoint.creatorClientInstanceId,
+      "creatorClientInstanceId",
+      256,
+    ),
+    ...decodeCheckpointContent(checkpoint),
+    sourceState: sourceState(checkpoint.sourceState),
+    childSummaries: Object.freeze(childSummaries),
+    evidenceCoverage: decodedCoverage,
+  });
+  if (Buffer.byteLength(canonicalJson(decoded), "utf8") > CHECKPOINT_MAX_CANONICAL_BYTES) {
+    throw new LifecycleError("CHECKPOINT_CAPACITY_EXCEEDED");
+  }
+  return decoded;
+}
+
+export function decodeCheckpointDraft(value: unknown): CheckpointDraft {
+  const version = strictRecord(value, "checkpointDraft").checkpointVersion;
+  if (version === 1) return decodeCheckpointDraftV1(value);
+  if (version === 2) return decodeCheckpointDraftV2(value);
+  return invalid("checkpointVersion");
+}
+
+export function decodeCheckpoint(value: unknown): Checkpoint {
+  const version = strictRecord(value, "checkpoint").checkpointVersion;
+  if (version === 1) return decodeCheckpointV1(value);
+  if (version === 2) return decodeCheckpointV2(value);
+  return invalid("checkpointVersion");
 }

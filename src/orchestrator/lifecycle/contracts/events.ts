@@ -10,7 +10,12 @@ import {
   LifecycleError,
   type LifecycleErrorCode,
 } from "../errors.js";
-import { decodeCheckpointV1, type CheckpointV1 } from "./checkpoint.js";
+import {
+  decodeCheckpointV2,
+  decodeCheckpointV1,
+  type CheckpointV1,
+  type CheckpointV2,
+} from "./checkpoint.js";
 import {
   decodeChildDispositionV1,
   decodeChildReportV1,
@@ -29,6 +34,7 @@ import {
   parseNullableBoundedString,
   parseNullableUuid,
   strictArray,
+  strictRecord,
   type AdapterSessionId,
   type ApprovalId,
   type CheckpointId,
@@ -303,6 +309,60 @@ export interface LifecycleEventBaseV1<T extends LifecycleEventType = LifecycleEv
 export type LifecycleEventV1 = {
   readonly [T in LifecycleEventType]: LifecycleEventBaseV1<T>;
 }[LifecycleEventType];
+
+export interface EvidenceCoverageRecordedV2 {
+  readonly adapterSessionId: AdapterSessionId;
+  readonly batchId: EvidenceBatchId;
+  readonly batchFirstOrdinal: string;
+  readonly batchLastOrdinal: string;
+  readonly coverageFirstOrdinal: "0";
+  readonly coverageLastOrdinal: string;
+  readonly highestContiguousOrdinal: string | null;
+  readonly missingIntervals: readonly LifecycleMissingOrdinalIntervalV1[];
+  readonly frameFingerprintAlgorithm: "hmac-sha256";
+  readonly frameFingerprintSchemaVersion: 1;
+  readonly frameFingerprintKeyId: string;
+  readonly frameFingerprintDomain: "pm-evidence-frame-v1";
+  readonly coverageFingerprintAlgorithm: "hmac-sha256";
+  readonly coverageFingerprintSchemaVersion: 1;
+  readonly coverageFingerprintKeyId: string;
+  readonly coverageFingerprintDomain: "pm-evidence-coverage-v1";
+  readonly coverageFingerprint: string;
+  readonly captureMode: "coverage-only";
+  readonly contentRetained: false;
+  readonly frames: readonly LifecycleEvidenceFrameRecordedV1[];
+}
+
+export interface SessionCheckpointRecordedPayloadV2
+  extends Omit<LifecycleEventPayloadMapV1["SessionCheckpointRecorded"], "checkpoint"> {
+  readonly checkpoint: CheckpointV2;
+}
+
+export type SessionEndRequestedPayloadV2 = LifecycleEventPayloadMapV1["SessionEndRequested"] & {
+  readonly requestVersion: 2;
+};
+
+export type SessionEndAmendedPayloadV2 = LifecycleEventPayloadMapV1["SessionEndAmended"] & {
+  readonly amendmentVersion: 2;
+  readonly finalCheckpointVersion: 2 | null;
+  readonly evidenceWindowAction: "unchanged" | "open" | "seal";
+};
+
+type LifecycleEventBaseV2<
+  T extends "EvidenceCoverageRecorded" | "SessionCheckpointRecorded" | "SessionEndRequested" | "SessionEndAmended",
+  P,
+> = Omit<LifecycleEventBaseV1<T>, "eventSchemaVersion" | "payload"> & {
+  readonly eventSchemaVersion: 2;
+  readonly payload: P;
+};
+
+export type LifecycleEventV2 =
+  | LifecycleEventBaseV2<"EvidenceCoverageRecorded", EvidenceCoverageRecordedV2>
+  | LifecycleEventBaseV2<"SessionCheckpointRecorded", SessionCheckpointRecordedPayloadV2>
+  | LifecycleEventBaseV2<"SessionEndRequested", SessionEndRequestedPayloadV2>
+  | LifecycleEventBaseV2<"SessionEndAmended", SessionEndAmendedPayloadV2>;
+
+export type LifecycleEvent = LifecycleEventV1 | LifecycleEventV2;
 
 function invalid(field: string): never {
   throw new LifecycleError("LIFECYCLE_INPUT_INVALID", { field });
@@ -940,4 +1000,263 @@ export function decodeLifecycleEventV1(value: unknown): LifecycleEventV1 {
   } catch {
     invalid("lifecycleEvent");
   }
+}
+
+const LIFECYCLE_EVENT_TYPES_V2 = [
+  "EvidenceCoverageRecorded",
+  "SessionCheckpointRecorded",
+  "SessionEndRequested",
+  "SessionEndAmended",
+] as const;
+
+function decodeEvidenceCoverageRecordedV2(value: unknown): EvidenceCoverageRecordedV2 {
+  const payload = exactRecord(value, [
+    "adapterSessionId",
+    "batchId",
+    "batchFirstOrdinal",
+    "batchLastOrdinal",
+    "coverageFirstOrdinal",
+    "coverageLastOrdinal",
+    "highestContiguousOrdinal",
+    "missingIntervals",
+    "frameFingerprintAlgorithm",
+    "frameFingerprintSchemaVersion",
+    "frameFingerprintKeyId",
+    "frameFingerprintDomain",
+    "coverageFingerprintAlgorithm",
+    "coverageFingerprintSchemaVersion",
+    "coverageFingerprintKeyId",
+    "coverageFingerprintDomain",
+    "coverageFingerprint",
+    "captureMode",
+    "contentRetained",
+    "frames",
+  ], "event.payload");
+  if (
+    payload.coverageFirstOrdinal !== "0"
+    || payload.frameFingerprintAlgorithm !== "hmac-sha256"
+    || payload.frameFingerprintSchemaVersion !== 1
+    || payload.frameFingerprintDomain !== "pm-evidence-frame-v1"
+    || payload.coverageFingerprintAlgorithm !== "hmac-sha256"
+    || payload.coverageFingerprintSchemaVersion !== 1
+    || payload.coverageFingerprintDomain !== "pm-evidence-coverage-v1"
+    || payload.captureMode !== "coverage-only"
+    || payload.contentRetained !== false
+  ) invalid("event.payload");
+  const batchFirstOrdinal = parseDecimalString(payload.batchFirstOrdinal, "event.payload.batchFirstOrdinal");
+  const batchLastOrdinal = parseDecimalString(payload.batchLastOrdinal, "event.payload.batchLastOrdinal");
+  const coverageLastOrdinal = parseDecimalString(payload.coverageLastOrdinal, "event.payload.coverageLastOrdinal");
+  const frames = evidenceFrames(payload.frames);
+  if (
+    frames[0]?.ordinal !== batchFirstOrdinal
+    || frames.at(-1)?.ordinal !== batchLastOrdinal
+    || BigInt(batchLastOrdinal) > BigInt(coverageLastOrdinal)
+  ) invalid("event.payload.frames");
+  const highestContiguousOrdinal = payload.highestContiguousOrdinal === null
+    ? null
+    : parseDecimalString(payload.highestContiguousOrdinal, "event.payload.highestContiguousOrdinal");
+  if (
+    highestContiguousOrdinal !== null
+    && BigInt(highestContiguousOrdinal) > BigInt(coverageLastOrdinal)
+  ) invalid("event.payload.highestContiguousOrdinal");
+  const missingIntervals = intervals(payload.missingIntervals, "event.payload.missingIntervals");
+  for (const missing of missingIntervals) {
+    if (BigInt(missing.lastOrdinal) > BigInt(coverageLastOrdinal)) invalid("event.payload.missingIntervals");
+  }
+  const firstMissing = missingIntervals[0];
+  if (
+    firstMissing === undefined
+      ? highestContiguousOrdinal !== coverageLastOrdinal
+      : BigInt(firstMissing.firstOrdinal) !== (
+          highestContiguousOrdinal === null ? 0n : BigInt(highestContiguousOrdinal) + 1n
+        )
+  ) invalid("event.payload.missingIntervals");
+  const frameFingerprintKeyId = parseBoundedString(
+    payload.frameFingerprintKeyId,
+    "event.payload.frameFingerprintKeyId",
+    128,
+  );
+  const coverageFingerprintKeyId = parseBoundedString(
+    payload.coverageFingerprintKeyId,
+    "event.payload.coverageFingerprintKeyId",
+    128,
+  );
+  if (frameFingerprintKeyId !== coverageFingerprintKeyId) invalid("event.payload.coverageFingerprintKeyId");
+  return Object.freeze({
+    adapterSessionId: parseLifecycleId<AdapterSessionId>(
+      payload.adapterSessionId,
+      "event.payload.adapterSessionId",
+    ),
+    batchId: parseLifecycleId<EvidenceBatchId>(payload.batchId, "event.payload.batchId"),
+    batchFirstOrdinal,
+    batchLastOrdinal,
+    coverageFirstOrdinal: "0",
+    coverageLastOrdinal,
+    highestContiguousOrdinal,
+    missingIntervals,
+    frameFingerprintAlgorithm: "hmac-sha256",
+    frameFingerprintSchemaVersion: 1,
+    frameFingerprintKeyId,
+    frameFingerprintDomain: "pm-evidence-frame-v1",
+    coverageFingerprintAlgorithm: "hmac-sha256",
+    coverageFingerprintSchemaVersion: 1,
+    coverageFingerprintKeyId,
+    coverageFingerprintDomain: "pm-evidence-coverage-v1",
+    coverageFingerprint: hash(payload.coverageFingerprint, "event.payload.coverageFingerprint"),
+    captureMode: "coverage-only",
+    contentRetained: false,
+    frames,
+  });
+}
+
+function decodePayloadV2(
+  eventType: LifecycleEventV2["eventType"],
+  value: unknown,
+): LifecycleEventV2["payload"] {
+  switch (eventType) {
+    case "EvidenceCoverageRecorded":
+      return decodeEvidenceCoverageRecordedV2(value);
+    case "SessionCheckpointRecorded": {
+      const payload = exactRecord(
+        value,
+        ["checkpoint", "baseEventPosition", "checkpointEventPosition"],
+        "event.payload",
+      );
+      const checkpoint = decodeCheckpointV2(payload.checkpoint);
+      const baseEventPosition = parseDecimalString(payload.baseEventPosition, "event.payload.baseEventPosition");
+      const checkpointEventPosition = parseDecimalString(
+        payload.checkpointEventPosition,
+        "event.payload.checkpointEventPosition",
+      );
+      if (
+        checkpoint.baseEventPosition !== baseEventPosition
+        || checkpoint.checkpointEventPosition !== checkpointEventPosition
+      ) invalid("event.payload.checkpoint");
+      return Object.freeze({ checkpoint, baseEventPosition, checkpointEventPosition });
+    }
+    case "SessionEndRequested": {
+      const payload = exactRecord(value, [
+        "workflowId",
+        "workflowGeneration",
+        "previousState",
+        "childEndPolicy",
+        "qualityThreshold",
+        "requireFullEvidence",
+        "requireMaterialization",
+        "requestVersion",
+      ], "event.payload");
+      if (payload.requestVersion !== 2) invalid("event.payload.requestVersion");
+      return Object.freeze({
+        workflowId: workflowId(payload.workflowId),
+        workflowGeneration: generation(payload.workflowGeneration, "event.payload.workflowGeneration"),
+        previousState: parseEnum(payload.previousState, ROOT_PREVIOUS_STATES, "event.payload.previousState"),
+        childEndPolicy: parseEnum(payload.childEndPolicy, CHILD_END_POLICIES, "event.payload.childEndPolicy"),
+        qualityThreshold: parseInteger(payload.qualityThreshold, "event.payload.qualityThreshold", 0, 10_000),
+        requireFullEvidence: parseBoolean(payload.requireFullEvidence, "event.payload.requireFullEvidence"),
+        requireMaterialization: parseBoolean(payload.requireMaterialization, "event.payload.requireMaterialization"),
+        requestVersion: 2,
+      });
+    }
+    case "SessionEndAmended": {
+      const payload = exactRecord(value, [
+        "workflowId",
+        "previousWorkflowGeneration",
+        "workflowGeneration",
+        "preTransitionCheckpointId",
+        "amendmentVersion",
+        "finalCheckpointVersion",
+        "evidenceWindowAction",
+      ], "event.payload");
+      if (
+        payload.amendmentVersion !== 2
+        || (payload.finalCheckpointVersion !== 2 && payload.finalCheckpointVersion !== null)
+        || (
+          payload.evidenceWindowAction !== "unchanged"
+          && payload.evidenceWindowAction !== "open"
+          && payload.evidenceWindowAction !== "seal"
+        )
+        || (payload.evidenceWindowAction === "open" && payload.finalCheckpointVersion !== 2)
+      ) invalid("event.payload");
+      const previousWorkflowGeneration = generation(
+        payload.previousWorkflowGeneration,
+        "event.payload.previousWorkflowGeneration",
+      );
+      const workflowGeneration = generation(payload.workflowGeneration, "event.payload.workflowGeneration");
+      if (workflowGeneration !== previousWorkflowGeneration + 1) invalid("event.payload.workflowGeneration");
+      return Object.freeze({
+        workflowId: workflowId(payload.workflowId),
+        previousWorkflowGeneration,
+        workflowGeneration,
+        preTransitionCheckpointId: checkpointId(
+          payload.preTransitionCheckpointId,
+          "event.payload.preTransitionCheckpointId",
+        ),
+        amendmentVersion: 2,
+        finalCheckpointVersion: payload.finalCheckpointVersion,
+        evidenceWindowAction: payload.evidenceWindowAction,
+      });
+    }
+  }
+}
+
+export function decodeLifecycleEventV2(value: unknown): LifecycleEventV2 {
+  try {
+    const event = exactRecord(value, EVENT_BASE_KEYS, "lifecycleEvent");
+    if (event.eventSchemaVersion !== 2) invalid("eventSchemaVersion");
+    const eventType = parseEnum(event.eventType, LIFECYCLE_EVENT_TYPES_V2, "eventType");
+    const workspaceId = event.workspaceId;
+    if (typeof workspaceId !== "string" || !LOWER_HASH.test(workspaceId)) invalid("workspaceId");
+    const streamVersion = parseDecimalString(event.streamVersion, "streamVersion");
+    const globalPosition = parseDecimalString(event.globalPosition, "globalPosition");
+    if (streamVersion === "0" || globalPosition === "0") invalid("event.position");
+    const parentSessionId = parseNullableUuid<SessionId>(event.parentSessionId, "parentSessionId");
+    if (
+      (eventType === "SessionEndRequested" || eventType === "SessionEndAmended")
+      && parentSessionId !== null
+    ) invalid("parentSessionId");
+    const payload = decodePayloadV2(eventType, event.payload);
+    if (eventType === "SessionCheckpointRecorded") {
+      const checkpointPayload = payload as SessionCheckpointRecordedPayloadV2;
+      if (
+        checkpointPayload.checkpointEventPosition !== globalPosition
+        || checkpointPayload.checkpoint.sessionId !== event.sessionId
+        || checkpointPayload.checkpoint.parentSessionId !== parentSessionId
+        || checkpointPayload.checkpoint.sourceState.workspaceId !== workspaceId
+      ) invalid("event.payload.checkpoint");
+    }
+    return Object.freeze({
+      eventSchemaVersion: 2,
+      eventId: parseLifecycleId(event.eventId, "eventId"),
+      projectId: parseLifecycleId<ProjectId>(event.projectId, "projectId"),
+      vaultId: parseLifecycleId<VaultId>(event.vaultId, "vaultId"),
+      storeId: parseLifecycleId<StoreId>(event.storeId, "storeId"),
+      workspaceId: workspaceId as WorkspaceId,
+      streamId: parseBoundedString(event.streamId, "streamId", 512),
+      streamVersion,
+      globalPosition,
+      sessionId: parseLifecycleId<SessionId>(event.sessionId, "sessionId"),
+      parentSessionId,
+      eventType,
+      correlationId: parseLifecycleId(event.correlationId, "correlationId"),
+      causationId: parseNullableUuid(event.causationId, "causationId"),
+      commandId: parseLifecycleId(event.commandId, "commandId"),
+      idempotencyKey: parseBoundedString(
+        event.idempotencyKey,
+        "idempotencyKey",
+        LIFECYCLE_IDEMPOTENCY_KEY_MAX_SCALARS,
+      ),
+      occurredAt: parseCanonicalTimestamp(event.occurredAt, "occurredAt"),
+      authorityCommitment: hash(event.authorityCommitment, "authorityCommitment"),
+      payload,
+    }) as LifecycleEventV2;
+  } catch {
+    invalid("lifecycleEvent");
+  }
+}
+
+export function decodeLifecycleEvent(value: unknown): LifecycleEvent {
+  const version = strictRecord(value, "lifecycleEvent").eventSchemaVersion;
+  if (version === 1) return decodeLifecycleEventV1(value);
+  if (version === 2) return decodeLifecycleEventV2(value);
+  return invalid("eventSchemaVersion");
 }
