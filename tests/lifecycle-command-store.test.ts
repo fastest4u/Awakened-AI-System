@@ -259,7 +259,11 @@ class FakeEvents implements LifecycleEventAppendPort {
 
   assertAppendAllowed(): void { this.calls.push("assert-maintenance"); }
 
-  prepare<T extends JsonValue>(command: AppendCommand<T>): PreparedEventAppend<T> {
+  prepare<T extends JsonValue>(
+    command: AppendCommand<T>,
+    _recordedAt: string,
+    _commandHashOverride: string,
+  ): PreparedEventAppend<T> {
     this.calls.push("prepare");
     return { command, recordedAt: NOW, commandHash: HASH_A, storedEventIds: [] };
   }
@@ -307,6 +311,54 @@ class FakeEvents implements LifecycleEventAppendPort {
       responseHash: batch.responseHash,
       authorizationRecord: authorization(),
     };
+  }
+}
+
+class PersistedIntentReplayEvents extends FakeEvents {
+  #storedIntentHash: string | null = null;
+  #pendingIntentHash: string | null = null;
+  #pendingAuthorization: PersistedLifecycleAuthorizationRecord | null = null;
+
+  override findLifecycleReplay<T extends JsonValue>(
+    command: LifecycleCommandEnvelope,
+  ): EventAppendReplay<T> | null {
+    this.calls.push("find-replay");
+    if (this.replay === null) return null;
+    if (this.#storedIntentHash !== command.authoritativeIntentHash) {
+      throw new LifecycleCommandStoreError("IDEMPOTENCY_CONFLICT");
+    }
+    return this.replay as EventAppendReplay<T>;
+  }
+
+  override prepare<T extends JsonValue>(
+    command: AppendCommand<T>,
+    recordedAt: string,
+    commandHashOverride: string,
+  ): PreparedEventAppend<T> {
+    const prepared = super.prepare(command, recordedAt, commandHashOverride);
+    return { ...prepared, recordedAt, commandHash: commandHashOverride };
+  }
+
+  override insertDedup<T extends JsonValue>(
+    prepared: PreparedEventAppend<T>,
+    batch: EventAppendBatch<T>,
+    record: PersistedLifecycleAuthorizationRecord,
+  ): void {
+    super.insertDedup(prepared, batch, record);
+    this.#pendingIntentHash = prepared.commandHash;
+    this.#pendingAuthorization = record;
+  }
+
+  override result<T extends JsonValue>(batch: EventAppendBatch<T>): EventAppendReplay<T> {
+    const result = super.result(batch);
+    if (this.#pendingIntentHash === null || this.#pendingAuthorization === null) {
+      throw new Error("committed dedup identity was not staged");
+    }
+    this.#storedIntentHash = this.#pendingIntentHash;
+    this.replay = replayResult(this.#pendingAuthorization);
+    this.#pendingIntentHash = null;
+    this.#pendingAuthorization = null;
+    return result;
   }
 }
 
@@ -590,7 +642,7 @@ describe("LifecycleCommandStore", () => {
     assert.notEqual(version1Intent.intentHash, version2Intent.intentHash);
 
     const connection = new TransactionConnection();
-    const events = new FakeEvents(connection);
+    const events = new PersistedIntentReplayEvents(connection);
     const store = new LifecycleCommandStore({
       connection,
       events,
@@ -610,7 +662,6 @@ describe("LifecycleCommandStore", () => {
     }));
     assert.equal(committed.deduplicated, false);
 
-    events.replay = replayResult();
     let replayFreshCalls = 0;
     const replayed = store.execute(version1Envelope, () => {
       replayFreshCalls += 1;
@@ -620,19 +671,28 @@ describe("LifecycleCommandStore", () => {
     assert.equal(replayFreshCalls, 0);
 
     const callsBeforeConflict = [...events.calls];
+    const statementsBeforeConflict = [...connection.statements];
+    let conflictFreshCalls = 0;
     assert.throws(
       () => store.execute(envelope({
         commandType: version2.commandType,
         candidateIntentHash: version2Intent.intentHash,
-        authoritativeIntentHash: version1Intent.intentHash,
+        authoritativeIntentHash: version2Intent.intentHash,
         semanticCommand: version2,
       }), () => {
-        throw new Error("cross-version reuse must fail before replay or fresh work");
+        conflictFreshCalls += 1;
+        throw new Error("cross-version reuse must fail before fresh work");
       }),
       (error: unknown) => error instanceof LifecycleCommandStoreError
         && error.code === "IDEMPOTENCY_CONFLICT",
     );
-    assert.deepEqual(events.calls, callsBeforeConflict);
+    assert.equal(conflictFreshCalls, 0);
+    assert.deepEqual(events.calls, [...callsBeforeConflict, "find-replay"]);
+    assert.deepEqual(connection.statements, [
+      ...statementsBeforeConflict,
+      "BEGIN IMMEDIATE",
+      "ROLLBACK",
+    ]);
   });
 
   it("deduplicates before resolving a fresh protected capability generation", () => {
