@@ -109,7 +109,7 @@ const LEGACY_V1_EVENT_TYPES_SQL = Object.keys(LEGACY_V1_PAYLOAD_KEYS)
   .map((eventType) => `'${eventType}'`)
   .join(", ");
 
-const FINAL_BINDINGS_INVALID = `
+const FINAL_BINDINGS_BASELINE_INVALID = `
   NEW.final_ending_scope_bindings_json IS NOT NULL AND (
     NOT json_valid(NEW.final_ending_scope_bindings_json)
     OR json_type(NEW.final_ending_scope_bindings_json) <> 'array'
@@ -171,31 +171,6 @@ const FINAL_BINDINGS_INVALID = `
         OR (json_extract(binding.value, '$.bindingKind') = 'current-child' AND (
           json_extract(binding.value, '$.transferTicketId') IS NOT NULL
           OR json_extract(binding.value, '$.transferTicketEventPosition') IS NOT NULL
-          OR NOT EXISTS (
-            SELECT 1
-            FROM session_authority AS child
-            JOIN streams AS child_stream
-              ON child_stream.project_id = child.project_id
-              AND child_stream.stream_id = child.stream_id
-            JOIN events AS child_event
-              ON child_event.project_id = child.project_id
-              AND child_event.global_position = CAST(
-                json_extract(binding.value, '$.lastEventPosition') AS INTEGER
-              )
-              AND child_event.session_id = child.session_id
-              AND child_event.stream_version = child_stream.current_version
-            WHERE child.project_id = NEW.project_id
-              AND child.session_id = json_extract(binding.value, '$.childSessionId')
-              AND child.session_kind = 'child'
-              AND child.parent_session_id = NEW.session_id
-              AND child.semantic_state = json_extract(binding.value, '$.childState')
-              AND coalesce(child.terminal_event_position, child.authority_event_position)
-                = child_event.global_position
-              AND CAST(child_stream.current_version AS TEXT)
-                = json_extract(binding.value, '$.streamVersion')
-              AND child.latest_checkpoint_id
-                IS json_extract(binding.value, '$.checkpointId')
-          )
         ))
         OR (json_extract(binding.value, '$.bindingKind') = 'carry-forward-ticket' AND (
           json_extract(binding.value, '$.childState') <> 'transferred'
@@ -207,44 +182,6 @@ const FINAL_BINDINGS_INVALID = `
           OR json_extract(binding.value, '$.transferTicketEventPosition') = '0'
           OR json_extract(binding.value, '$.lastEventPosition')
             <> json_extract(binding.value, '$.transferTicketEventPosition')
-          OR NOT EXISTS (
-            SELECT 1
-            FROM child_transfer_tickets AS ticket
-            JOIN events AS transfer_event
-              ON transfer_event.project_id = ticket.project_id
-              AND transfer_event.global_position = ticket.created_event_position
-              AND transfer_event.session_id = ticket.source_child_session_id
-              AND transfer_event.parent_session_id = ticket.source_parent_session_id
-              AND transfer_event.event_type = 'ChildWorkTransferCreated'
-              AND transfer_event.event_schema_version = 1
-              AND json_extract(transfer_event.payload_json, '$.transferTicketId')
-                = ticket.transfer_ticket_id
-              AND json_extract(transfer_event.payload_json, '$.checkpointId')
-                = ticket.checkpoint_id
-            JOIN session_authority AS source_child
-              ON source_child.project_id = ticket.project_id
-              AND source_child.session_id = ticket.source_child_session_id
-              AND source_child.session_kind = 'child'
-              AND source_child.parent_session_id = ticket.source_parent_session_id
-              AND source_child.semantic_state = 'transferred'
-              AND source_child.terminal_event_position = ticket.created_event_position
-              AND source_child.latest_checkpoint_id = ticket.checkpoint_id
-            JOIN streams AS source_stream
-              ON source_stream.project_id = source_child.project_id
-              AND source_stream.stream_id = source_child.stream_id
-              AND source_stream.current_version = transfer_event.stream_version
-            WHERE ticket.project_id = NEW.project_id
-              AND ticket.source_parent_session_id = NEW.session_id
-              AND ticket.transfer_ticket_id = json_extract(binding.value, '$.transferTicketId')
-              AND ticket.source_child_session_id
-                = json_extract(binding.value, '$.childSessionId')
-              AND ticket.checkpoint_id = json_extract(binding.value, '$.checkpointId')
-              AND ticket.created_event_position = CAST(
-                json_extract(binding.value, '$.transferTicketEventPosition') AS INTEGER
-              )
-              AND CAST(source_stream.current_version AS TEXT)
-                = json_extract(binding.value, '$.streamVersion')
-          )
         ))
         OR json(binding.value) <> json_object(
           'bindingKind', json_extract(binding.value, '$.bindingKind'),
@@ -269,6 +206,84 @@ const FINAL_BINDINGS_INVALID = `
         >= json_extract(right_binding.value, '$.childSessionId')
     )
   )`;
+
+const FINAL_BINDINGS_CURRENT_STATE_INVALID = `
+  NEW.final_ending_scope_bindings_json IS NOT NULL AND EXISTS (
+    SELECT 1 FROM json_each(NEW.final_ending_scope_bindings_json) AS binding
+    WHERE (
+      json_extract(binding.value, '$.bindingKind') = 'current-child'
+      AND NOT EXISTS (
+        SELECT 1
+        FROM session_authority AS child
+        JOIN streams AS child_stream
+          ON child_stream.project_id = child.project_id
+          AND child_stream.stream_id = child.stream_id
+        JOIN events AS child_event
+          ON child_event.project_id = child.project_id
+          AND child_event.global_position = CAST(
+            json_extract(binding.value, '$.lastEventPosition') AS INTEGER
+          )
+          AND child_event.session_id = child.session_id
+          AND child_event.stream_version = child_stream.current_version
+        WHERE child.project_id = NEW.project_id
+          AND child.session_id = json_extract(binding.value, '$.childSessionId')
+          AND child.session_kind = 'child'
+          AND child.parent_session_id = NEW.session_id
+          AND child.semantic_state = json_extract(binding.value, '$.childState')
+          AND coalesce(child.terminal_event_position, child.authority_event_position)
+            = child_event.global_position
+          AND CAST(child_stream.current_version AS TEXT)
+            = json_extract(binding.value, '$.streamVersion')
+          AND child.latest_checkpoint_id
+            IS json_extract(binding.value, '$.checkpointId')
+      )
+    )
+    OR (
+      json_extract(binding.value, '$.bindingKind') = 'carry-forward-ticket'
+      AND NOT EXISTS (
+        SELECT 1
+        FROM child_transfer_tickets AS ticket
+        JOIN events AS transfer_event
+          ON transfer_event.project_id = ticket.project_id
+          AND transfer_event.global_position = ticket.created_event_position
+          AND transfer_event.session_id = ticket.source_child_session_id
+          AND transfer_event.parent_session_id = ticket.source_parent_session_id
+          AND transfer_event.event_type = 'ChildWorkTransferCreated'
+          AND transfer_event.event_schema_version = 1
+          AND json_extract(transfer_event.payload_json, '$.transferTicketId')
+            = ticket.transfer_ticket_id
+          AND json_extract(transfer_event.payload_json, '$.checkpointId')
+            = ticket.checkpoint_id
+        JOIN session_authority AS source_child
+          ON source_child.project_id = ticket.project_id
+          AND source_child.session_id = ticket.source_child_session_id
+          AND source_child.session_kind = 'child'
+          AND source_child.parent_session_id = ticket.source_parent_session_id
+          AND source_child.semantic_state = 'transferred'
+          AND source_child.terminal_event_position = ticket.created_event_position
+          AND source_child.latest_checkpoint_id = ticket.checkpoint_id
+        JOIN streams AS source_stream
+          ON source_stream.project_id = source_child.project_id
+          AND source_stream.stream_id = source_child.stream_id
+          AND source_stream.current_version = transfer_event.stream_version
+        WHERE ticket.project_id = NEW.project_id
+          AND ticket.source_parent_session_id = NEW.session_id
+          AND ticket.transfer_ticket_id = json_extract(binding.value, '$.transferTicketId')
+          AND ticket.source_child_session_id
+            = json_extract(binding.value, '$.childSessionId')
+          AND ticket.checkpoint_id = json_extract(binding.value, '$.checkpointId')
+          AND ticket.created_event_position = CAST(
+            json_extract(binding.value, '$.transferTicketEventPosition') AS INTEGER
+          )
+          AND CAST(source_stream.current_version AS TEXT)
+            = json_extract(binding.value, '$.streamVersion')
+      )
+    )
+  )`;
+
+const FINAL_BINDINGS_INVALID = `
+  (${FINAL_BINDINGS_BASELINE_INVALID})
+  OR (${FINAL_BINDINGS_CURRENT_STATE_INVALID})`;
 
 function resultStatusValue(path: string): string {
   return `(CASE
@@ -502,6 +517,13 @@ const EVIDENCE_GROUP_PRESERVED = `
   AND NEW.evidence_window_state IS OLD.evidence_window_state
   AND NEW.final_ending_scope_bindings_json IS OLD.final_ending_scope_bindings_json
 `;
+
+const FINAL_BINDINGS_UPDATE_INVALID = `
+  (${FINAL_BINDINGS_BASELINE_INVALID})
+  OR (
+    NOT (${EVIDENCE_GROUP_PRESERVED})
+    AND (${FINAL_BINDINGS_CURRENT_STATE_INVALID})
+  )`;
 
 const NULL_SEALED_EVIDENCE_GROUP = `
   NEW.evidence_window_state = 'sealed'
@@ -1464,7 +1486,7 @@ WHEN
     OR (NEW.evidence_frozen_checkpoint_event_position IS NULL)
       <> (NEW.final_ending_scope_bindings_json IS NULL)
     OR (${RESULT_INVALID})
-    OR (${FINAL_BINDINGS_INVALID})
+    OR (${FINAL_BINDINGS_UPDATE_INVALID})
     OR (${FROZEN_GROUP_INVALID})
     OR (NEW.evidence_window_state = 'open' AND (
       NEW.evidence_frozen_checkpoint_event_position IS NOT NULL

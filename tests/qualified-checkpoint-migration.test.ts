@@ -704,6 +704,7 @@ function seedFinalWorkflowGuardFixture(
   bindings: readonly Record<string, unknown>[],
   write: "insert" | "update",
   persistedBindings: readonly Record<string, unknown>[] = bindings,
+  beforeWrite: () => void = () => undefined,
 ): void {
   connection.exec("DROP TRIGGER session_authority_insert_guard");
   for (const [index, binding] of bindings.entries()) {
@@ -758,6 +759,7 @@ function seedFinalWorkflowGuardFixture(
     MAX_INT64.toString(),
   );
   const bindingsJson = canonicalJson(persistedBindings as never);
+  beforeWrite();
   if (write === "insert") {
     rawInsert(connection, "workflow_instances", lifecycleWorkflow({
       phase: "final-checkpoint-recorded",
@@ -1433,6 +1435,73 @@ describe("qualified checkpoint migration", () => {
     ]) assert.equal(qualifiedCheckpointMigrationFailure(candidate), undefined);
   });
 
+  it("preserves unrelated preflight error identity while normalizing recognized failures", () => {
+    const connection = sourceConnection(2);
+    const sentinel = Object.assign(new Error("unrelated sentinel"), {
+      code: "UNRELATED_DRIVER_FAILURE",
+    });
+    const throwingConnection: SqliteConnection = {
+      exec: (sql) => connection.exec(sql),
+      prepare(sql) {
+        if (sql.includes("FROM project_meta")) throw sentinel;
+        return connection.prepare(sql);
+      },
+      close: () => undefined,
+    };
+    let observed: unknown;
+    try {
+      new SqliteQualifiedCheckpointMigrationPreflight()
+        .assertEligibleAndStage(throwingConnection, context);
+    } catch (error) {
+      observed = error;
+    }
+    assert.equal(observed, sentinel);
+
+    const semanticConnection = sourceConnection(2);
+    assert.throws(
+      () => new SqliteQualifiedCheckpointMigrationPreflight().assertEligibleAndStage(
+        semanticConnection,
+        {
+          binding: {
+            ...context.binding,
+            projectId: OTHER_ROOT_ID,
+          },
+        } as ProjectContext,
+      ),
+      (error) => (
+        typeof error === "object"
+        && error !== null
+        && "code" in error
+        && error.code === "MIGRATION_EVIDENCE_V2_PRECONDITION_FAILED"
+      ),
+    );
+
+    const sqliteGuardConnection = sourceConnection(2);
+    const sqliteGuard = Object.assign(
+      new Error("MIGRATION_EVIDENCE_V2_PRECONDITION_FAILED"),
+      { code: "ERR_SQLITE_ERROR", errcode: 1811 },
+    );
+    const guardedConnection: SqliteConnection = {
+      exec: (sql) => sqliteGuardConnection.exec(sql),
+      prepare(sql) {
+        if (sql.includes("FROM project_meta")) throw sqliteGuard;
+        return sqliteGuardConnection.prepare(sql);
+      },
+      close: () => undefined,
+    };
+    assert.throws(
+      () => new SqliteQualifiedCheckpointMigrationPreflight()
+        .assertEligibleAndStage(guardedConnection, context),
+      (error) => (
+        error !== sqliteGuard
+        && typeof error === "object"
+        && error !== null
+        && "code" in error
+        && error.code === "MIGRATION_EVIDENCE_V2_PRECONDITION_FAILED"
+      ),
+    );
+  });
+
   it("ignores unrelated generic outer Version 2 rows but rejects unsupported lifecycle history", () => {
     const accepted = sourceConnection(2);
     accepted.exec("PRAGMA foreign_keys = OFF");
@@ -1883,6 +1952,116 @@ describe("qualified checkpoint migration", () => {
         checkpointBindings,
         "insert",
         forgedBindings,
+      ),
+      /WORKFLOW_EVIDENCE_STATE_INVALID/,
+    );
+  });
+
+  it("preserves a frozen event-time baseline after mutable child state evolves", () => {
+    const connection = currentConnection();
+    const binding = currentChildBinding(0);
+    seedFinalWorkflowGuardFixture(connection, [binding], "insert");
+    const childSessionId = String(binding.childSessionId);
+    const nextPosition = BigInt(String(binding.lastEventPosition)) + 1n;
+    const nextStreamVersion = BigInt(String(binding.streamVersion)) + 1n;
+
+    assert.doesNotThrow(() => {
+      rawEvent(connection, nextPosition, {
+        streamType: "session",
+        sessionId: childSessionId,
+        parentSessionId: ROOT_ID,
+        streamVersion: nextStreamVersion,
+        eventType: "GenericSessionNote",
+        payload: { evolvedAfterFreeze: true },
+      });
+      connection.prepare(`
+        UPDATE streams
+        SET current_version = $streamVersion, updated_at = $now
+        WHERE project_id = $projectId AND stream_id = $streamId
+      `).run({
+        $streamVersion: nextStreamVersion,
+        $now: NOW,
+        $projectId: PROJECT_ID,
+        $streamId: `session/${childSessionId}`,
+      });
+      connection.prepare(`
+        UPDATE session_authority
+        SET semantic_state = 'suspended',
+            authority_event_position = $eventPosition,
+            updated_at = $now
+        WHERE project_id = $projectId AND session_id = $sessionId
+      `).run({
+        $eventPosition: nextPosition,
+        $now: NOW,
+        $projectId: PROJECT_ID,
+        $sessionId: childSessionId,
+      });
+    });
+
+    assert.doesNotThrow(() => connection.prepare(`
+      UPDATE workflow_instances
+      SET phase = 'ending-materialization-queued', result_json = $result
+      WHERE project_id = $projectId AND workflow_id = $workflowId
+    `).run({
+      $result: canonicalJson(phaseResult(
+        "confirm-ending-materialization",
+        "final-checkpoint-recorded",
+        sessionEndStatus(
+          "ending-materialization-queued",
+          "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+          MAX_INT64.toString(),
+        ),
+      )),
+      $projectId: PROJECT_ID,
+      $workflowId: `session-end/${ROOT_ID}`,
+    }));
+  });
+
+  it("still rejects a final freeze whose bindings are stale at freeze time", () => {
+    const connection = currentConnection();
+    const binding = currentChildBinding(0);
+    const childSessionId = String(binding.childSessionId);
+    const nextPosition = BigInt(String(binding.lastEventPosition)) + 1n;
+    const nextStreamVersion = BigInt(String(binding.streamVersion)) + 1n;
+
+    assert.throws(
+      () => seedFinalWorkflowGuardFixture(
+        connection,
+        [binding],
+        "update",
+        [binding],
+        () => {
+          rawEvent(connection, nextPosition, {
+            streamType: "session",
+            sessionId: childSessionId,
+            parentSessionId: ROOT_ID,
+            streamVersion: nextStreamVersion,
+            eventType: "GenericSessionNote",
+            payload: { evolvedBeforeFreeze: true },
+          });
+          connection.prepare(`
+            UPDATE streams
+            SET current_version = $streamVersion, updated_at = $now
+            WHERE project_id = $projectId AND stream_id = $streamId
+          `).run({
+            $streamVersion: nextStreamVersion,
+            $now: NOW,
+            $projectId: PROJECT_ID,
+            $streamId: `session/${childSessionId}`,
+          });
+          connection.prepare(`
+            UPDATE session_authority
+            SET semantic_state = 'suspended',
+                authority_event_position = $eventPosition,
+                updated_at = $now
+            WHERE project_id = $projectId AND session_id = $sessionId
+          `).run({
+            $eventPosition: nextPosition,
+            $now: NOW,
+            $projectId: PROJECT_ID,
+            $sessionId: childSessionId,
+          });
+        },
       ),
       /WORKFLOW_EVIDENCE_STATE_INVALID/,
     );

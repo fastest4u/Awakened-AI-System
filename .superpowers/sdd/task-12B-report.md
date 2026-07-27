@@ -87,3 +87,77 @@ Production routing remains disabled. Migration 0002 remains frozen and was not e
 - `git diff --check` — PASS, exit 0 (line-ending conversion warnings only).
 - Frozen migration 0002 SHA-256 — PASS: `68B4039048A359C523B7842F6D17BAA5760E9760D2B4E9F80BB8A48DC339EB06`.
 - Production routing remains disabled.
+
+---
+
+## Review Fix Wave 2
+
+Review base: `9dcf42c2b697397001875fa1f3c306cb38b3d9f3`
+
+Required commit subject: `fix: preserve frozen baselines and migration errors`
+
+Status: DONE. Production Lifecycle V2 routing remains disabled. Migration 0002
+remains frozen and was not edited.
+
+### Review-Fix Round-2 RED Evidence
+
+Command:
+
+```powershell
+node --test --test-concurrency=1 --test-reporter=spec --test-name-pattern="^(preserves unrelated preflight error identity while normalizing recognized failures|preserves a frozen event-time baseline after mutable child state evolves|still rejects a final freeze whose bindings are stale at freeze time)$" dist-test/tests/qualified-checkpoint-migration.test.js
+```
+
+Result against unchanged production code: FAIL, exit 1; 3 tests total, 1 passed,
+2 failed. The unrelated sentinel emerged as a replacement
+`SchemaCompatibilityError("MIGRATION_EVIDENCE_V2_PRECONDITION_FAILED")` instead
+of the exact sentinel object, and a phase update preserving an already valid
+frozen group failed with `WORKFLOW_EVIDENCE_STATE_INVALID` after the child
+authority/stream legally advanced. The stale-at-freeze control passed, proving
+initial/final-freeze freshness was already enforced and must not be weakened.
+
+### Review-Fix Round-2 Implementation
+
+- Split final-binding validation into immutable baseline checks and mutable
+  current-state freshness checks. Inserts and updates that establish or replace
+  a frozen group still run both; updates preserving the exact frozen group run
+  only immutable JSON, checkpoint-event, and root-checkpoint baseline checks.
+- Changed both preflight outer fault boundaries to normalize only an existing
+  semantic precondition error or the exact recognized SQLite abort tuple.
+  Unrelated driver, I/O, corruption, and programming exceptions now retain
+  their original object, code, and identity.
+- Added behavioral regressions for post-freeze child evolution, stale bindings
+  at freeze time, exact unrelated error identity, semantic normalization, and
+  exact SQLite guard normalization. No source-text assertions were added.
+
+### Review-Fix Round-2 GREEN Evidence
+
+- Focused three-test RED/GREEN command — PASS: 3/3 tests, 0 failures.
+- Focused qualified-checkpoint migration suite — PASS: 48/48 tests, 0 failures.
+- Exact seven-file Task 12B gate — PASS: 228/228 tests, 0 failures, 0 skipped.
+- `npm run typecheck` — PASS, exit 0.
+- Full repository suite (`npm test`) — PASS: 1,321 tests total; 1,311 passed;
+  10 skipped; 0 failed.
+- `git diff --check` — PASS, exit 0 (line-ending conversion warnings only).
+- Frozen migration 0002 SHA-256 — PASS:
+  `68B4039048A359C523B7842F6D17BAA5760E9760D2B4E9F80BB8A48DC339EB06`.
+
+### Review-Fix Round-2 Files
+
+- `src/orchestrator/storage/migrations/0003-qualified-checkpoint-coverage.ts`
+- `src/orchestrator/storage/qualified-checkpoint-migration-preflight.ts`
+- `tests/qualified-checkpoint-migration.test.ts`
+- `.superpowers/sdd/task-12B-report.md`
+
+### Review-Fix Round-2 Self-Review
+
+- Preserved updates cannot change any frozen-group byte and still pass the
+  strict phase/action matrix plus root checkpoint/result cross-binding.
+- Immutable binding shape, canonical JSON, byte cap, child checkpoint-event
+  linkage, sorted identity, and root checkpoint summary checks remain active on
+  every update.
+- Current child/stream/ticket freshness remains mandatory on insert and the
+  final-freeze transition; the stale-before-freeze regression passes.
+- Semantic validation still originates from the explicit precondition error,
+  and only the exact SQLite `(message, code, errcode)` tuple is translated.
+- Production routing remains disabled; no route or runtime activation file was
+  changed. Concerns: none blocking.

@@ -1018,7 +1018,7 @@ export function assertQualifiedCheckpointMigrationStage(
   } catch (error) {
     const normalized = qualifiedCheckpointMigrationFailure(error);
     if (normalized !== undefined) throw normalized;
-    throw new SchemaCompatibilityError(PRECONDITION);
+    throw error;
   }
 }
 
@@ -1038,7 +1038,7 @@ implements QualifiedCheckpointMigrationPreflight {
     } catch (error) {
       const normalized = qualifiedCheckpointMigrationFailure(error);
       if (normalized !== undefined) throw normalized;
-      throw new SchemaCompatibilityError(PRECONDITION);
+      throw error;
     }
   }
 }
