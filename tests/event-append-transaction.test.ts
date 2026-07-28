@@ -53,6 +53,20 @@ const roots: string[] = [];
 const connections: SqliteConnection[] = [];
 const driver = new NodeSqliteDriver({ DatabaseSync });
 
+function healthyCoverageFacade() {
+  return {
+    assertEvidenceWindowWritable: () => undefined,
+    assertQuickHealthy: () => undefined,
+    registerAffectedExistingSessions: () => undefined,
+    assertVersion1Eligible: () => undefined,
+    prepareBatch: () => { throw new Error("evidence coverage not used"); },
+    persistPrepared: () => undefined,
+    snapshotV2: () => { throw new Error("evidence coverage not used"); },
+    minimumCheckpointUpperBound: () => 0,
+    minimumFinalEndingScopeBindingsUpperBound: () => 0,
+  };
+}
+
 class RecordingConnection implements SqliteConnection {
   readonly transactionStatements: string[] = [];
 
@@ -522,7 +536,7 @@ it("treats historical lifecycle dedup without target authority as integrity fail
       facadeCalls += 1;
       return {
         authority: {}, leases: {}, approvals: {}, transfers: {},
-        coverage: {}, workflows: {}, validation: {}, outbox: {},
+        coverage: healthyCoverageFacade(), workflows: {}, validation: {}, outbox: {},
       };
     },
     now: () => NOW,
@@ -655,7 +669,7 @@ it("runs LifecycleCommandStore through the real primitive and replays before onN
     leases: {},
     approvals: {},
     transfers: {},
-    coverage: {},
+    coverage: healthyCoverageFacade(),
     workflows: {},
     validation: {},
     outbox: {},

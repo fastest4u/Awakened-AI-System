@@ -32,6 +32,7 @@ import { LifecycleError } from "./errors.js";
 import type { FreshLifecycleEffect } from "./checkpoint.service.js";
 import type { LifecycleCommandTransaction } from "./lifecycle-command.store.js";
 import type { SessionAggregateState } from "./session-aggregate.js";
+import { canonicalJson } from "../serialization/canonical-json.js";
 
 const LOWER_HASH = /^[0-9a-f]{64}$/u;
 
@@ -345,6 +346,30 @@ function evidenceEvent(
   };
 }
 
+function assertPreparedPayloadMatchesCommand(
+  command: RecordEvidenceBatchCommandV2,
+  payload: ReturnType<typeof decodeEvidenceCoverageRecordedV2>,
+): void {
+  let framesMatch = false;
+  try {
+    framesMatch = canonicalJson(payload.frames) === canonicalJson(command.frames);
+  } catch {
+    invalid("INTEGRITY_FAILURE");
+  }
+  if (
+    payload.adapterSessionId !== command.adapterSessionId
+    || payload.batchId !== command.batchId
+    || payload.batchFirstOrdinal !== command.firstOrdinal
+    || payload.batchLastOrdinal !== command.lastOrdinal
+    || payload.frameFingerprintSchemaVersion !== command.fingerprintSchemaVersion
+    || payload.frameFingerprintKeyId !== command.fingerprintKeyId
+    || payload.frameFingerprintDomain !== command.fingerprintDomain
+    || payload.coverageFingerprintKeyId !== command.fingerprintKeyId
+    || command.redactionStatus !== "content-not-retained"
+    || !framesMatch
+  ) invalid("INTEGRITY_FAILURE");
+}
+
 export class EvidenceCoverageService {
   readonly #invocations: EvidenceCoverageInvocationScope;
 
@@ -384,12 +409,14 @@ export class EvidenceCoverageService {
       prospectiveEndingScopeBindings,
       plannedEventPosition: eventPosition,
     });
+    const preparedHandle = prepared.handle;
     let eventPayload;
     try {
       eventPayload = decodeEvidenceCoverageRecordedV2(prepared.eventPayload);
     } catch {
       return invalid("INTEGRITY_FAILURE");
     }
+    assertPreparedPayloadMatchesCommand(command, eventPayload);
     if (
       prepared.sessionId !== command.sessionId
       || prepared.adapterSessionId !== command.adapterSessionId
@@ -455,7 +482,7 @@ export class EvidenceCoverageService {
           || event.eventSchemaVersion !== 2
         ) invalid("INTEGRITY_FAILURE");
         coverageOperations(currentTransaction).persistPrepared(
-          prepared,
+          preparedHandle,
           event as StoredEvent,
         );
       },

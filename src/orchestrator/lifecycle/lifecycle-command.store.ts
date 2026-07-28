@@ -28,9 +28,12 @@ import type {
   MinimumCheckpointCapacityInput,
   MinimumEndingScopeCapacityInput,
 } from "./checkpoint-capacity.js";
-import type { CheckpointEvidenceCoverageV2 } from "./contracts/checkpoint.js";
+import {
+  decodeCheckpointV2,
+  type CheckpointEvidenceCoverageV2,
+} from "./contracts/checkpoint.js";
+import type { EvidenceCoverageRecordedV2 } from "./contracts/events.js";
 import type { SessionId } from "./contracts/identifiers.js";
-import { decodeFinalEndingScopeBindingsV1 } from "./contracts/session-end.js";
 import type {
   InternalWorkflowSemanticCommand,
   LifecycleSemanticCommandDraft,
@@ -46,6 +49,27 @@ const LOWER_HASH = /^[0-9a-f]{64}$/;
 const LOWER_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const POSITIVE_GENERATION = /^(?:[1-9][0-9]*)$/;
 const SQLITE_INT64_MAX = 9_223_372_036_854_775_807n;
+const SQLITE_INT64_MAX_TEXT = "9223372036854775807";
+const SQLITE_UUID_GLOB = "[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[1-5][0-9a-f][0-9a-f][0-9a-f]-[89ab][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]";
+
+function sqliteStrictUnsignedDecimal(expression: string): string {
+  return `(
+    typeof(${expression}) = 'text'
+    AND length(${expression}) BETWEEN 1 AND 19
+    AND ${expression} NOT GLOB '*[^0-9]*'
+    AND (${expression} = '0' OR ${expression} NOT GLOB '0*')
+    AND (length(${expression}) < 19 OR ${expression} <= '${SQLITE_INT64_MAX_TEXT}')
+  )`;
+}
+
+function sqliteCanonicalUuid(expression: string): string {
+  return `(
+    typeof(${expression}) = 'text'
+    AND length(${expression}) = 36
+    AND lower(${expression}) = ${expression}
+    AND ${expression} GLOB '${SQLITE_UUID_GLOB}'
+  )`;
+}
 
 export interface LifecycleCommandEnvelope {
   readonly context: ProjectContext;
@@ -66,21 +90,34 @@ export interface ConnectionBoundSessionAuthority {}
 export interface ConnectionBoundSessionLeases {}
 export interface ConnectionBoundLifecycleApprovals {}
 export interface ConnectionBoundChildTransfers {}
+declare const PREPARED_EVIDENCE_COVERAGE_HANDLE: unique symbol;
+export type PreparedEvidenceCoverageHandle = symbol & {
+  readonly [PREPARED_EVIDENCE_COVERAGE_HANDLE]: true;
+};
+export interface ConnectionBoundPreparedEvidenceCoverageBatch {
+  readonly handle: PreparedEvidenceCoverageHandle;
+  readonly sessionId: SessionId;
+  readonly adapterSessionId: EvidenceCoverageBatchInput["command"]["adapterSessionId"];
+  readonly eventPayload: EvidenceCoverageRecordedV2;
+}
 export interface ConnectionBoundEvidenceCoverage {
-  assertEvidenceWindowWritable?(sessionId: SessionId): void;
-  assertQuickHealthy?(sessionIds: readonly SessionId[]): void;
-  assertVersion1Eligible?(sessionIds: readonly SessionId[]): void;
-  prepareBatch?(input: EvidenceCoverageBatchInput): PreparedEvidenceCoverageBatch;
-  persistPrepared?(
-    prepared: PreparedEvidenceCoverageBatch,
+  assertEvidenceWindowWritable(sessionId: SessionId): void;
+  assertQuickHealthy(sessionIds: readonly SessionId[]): void;
+  registerAffectedExistingSessions(sessionIds: readonly SessionId[]): void;
+  assertVersion1Eligible(sessionIds: readonly SessionId[]): void;
+  prepareBatch(
+    input: EvidenceCoverageBatchInput,
+  ): ConnectionBoundPreparedEvidenceCoverageBatch;
+  persistPrepared(
+    handle: PreparedEvidenceCoverageHandle,
     committedEvent: StoredEvent,
   ): void;
-  snapshotV2?(
+  snapshotV2(
     sessionId: SessionId,
     baseEventPosition: bigint,
   ): CheckpointEvidenceCoverageV2;
-  minimumCheckpointUpperBound?(input: MinimumCheckpointCapacityInput): number;
-  minimumFinalEndingScopeBindingsUpperBound?(
+  minimumCheckpointUpperBound(input: MinimumCheckpointCapacityInput): number;
+  minimumFinalEndingScopeBindingsUpperBound(
     input: MinimumEndingScopeCapacityInput,
   ): number;
 }
@@ -197,6 +234,557 @@ function nullableRowString(
   return row[field] === null ? null : rowString(row, field);
 }
 
+const SESSION_END_STATUS_KEYS = `
+  'resultVersion', 'sessionId', 'workflowId', 'workflowGeneration', 'phase',
+  'priorRootState', 'triggeringEventPosition', 'finalCheckpointId',
+  'finalCheckpointEventPosition', 'evidenceWindow', 'validationPlansReady',
+  'qualityScore', 'safeFailureCode', 'materializationRequired'
+`;
+
+const CHECKPOINT_KEYS = `
+  'checkpointVersion', 'checkpointId', 'sessionId', 'parentSessionId',
+  'baseEventPosition', 'checkpointEventPosition', 'createdAt',
+  'creatorAgentId', 'creatorClientInstanceId', 'taskSummary',
+  'completedItems', 'inProgressItems', 'blockers', 'nextActions', 'decisions',
+  'assumptions', 'unresolvedConflicts', 'filesTouched', 'artifactReferences',
+  'sourceReferences', 'commandResults', 'testResults', 'materialClaims',
+  'sourceState', 'childSummaries', 'evidenceCoverage'
+`;
+
+const SESSION_END_PHASES = new Set([
+  "requested",
+  "children-resolved",
+  "final-checkpoint-recorded",
+  "ending-materialization-queued",
+  "validating",
+  "verification-passed",
+  "verification-failed",
+  "completion-appended",
+  "completed-materialization-confirmed",
+  "completed",
+  "cancelled",
+  "abandoned",
+]);
+
+const SESSION_END_PHASE_ACTIONS = new Set([
+  "mark-children-resolved",
+  "record-final-checkpoint-and-queue-ending",
+  "confirm-ending-materialization",
+  "begin-validation",
+  "record-verification-failed",
+  "record-verification-passed",
+  "invalidate-verification",
+  "append-terminal-completion",
+  "confirm-completed-materialization",
+  "complete-without-materialization",
+  "complete-after-materialization",
+]);
+
+const SESSION_END_STATUS_FIELDS = [
+  "resultVersion",
+  "sessionId",
+  "workflowId",
+  "workflowGeneration",
+  "phase",
+  "priorRootState",
+  "triggeringEventPosition",
+  "finalCheckpointId",
+  "finalCheckpointEventPosition",
+  "evidenceWindow",
+  "validationPlansReady",
+  "qualityScore",
+  "safeFailureCode",
+  "materializationRequired",
+] as const;
+
+function hasExactJsonFields(
+  value: Readonly<Record<string, unknown>>,
+  expected: readonly string[],
+): boolean {
+  const actual = Object.keys(value);
+  return actual.length === expected.length
+    && actual.every((field) => expected.includes(field));
+}
+
+function assertFrozenWorkflowResult(
+  resultJson: string,
+  expected: {
+    readonly sessionId: SessionId;
+    readonly workflowId: string;
+    readonly workflowGeneration: bigint;
+    readonly phase: string;
+    readonly triggeringEventPosition: bigint;
+    readonly frozenPosition: bigint;
+    readonly frozenGeneration: bigint;
+  },
+): void {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(resultJson) as unknown;
+    if (!isPlainRecord(parsed) || canonicalJson(parsed) !== resultJson) {
+      return storageIntegrity();
+    }
+  } catch {
+    return storageIntegrity();
+  }
+  if (!isPlainRecord(parsed)) return storageIntegrity();
+  let status: Readonly<Record<string, unknown>>;
+  if (Object.hasOwn(parsed, "status")) {
+    if (
+      !hasExactJsonFields(parsed, [
+        "resultVersion",
+        "action",
+        "progressed",
+        "previousPhase",
+        "status",
+      ])
+      || parsed.resultVersion !== 2
+      || typeof parsed.action !== "string"
+      || !SESSION_END_PHASE_ACTIONS.has(parsed.action)
+      || typeof parsed.progressed !== "boolean"
+      || typeof parsed.previousPhase !== "string"
+      || !SESSION_END_PHASES.has(parsed.previousPhase)
+      || !isPlainRecord(parsed.status)
+    ) return storageIntegrity();
+    status = parsed.status;
+  } else {
+    status = parsed;
+  }
+  const window = status.evidenceWindow;
+  if (
+    !hasExactJsonFields(status, SESSION_END_STATUS_FIELDS)
+    || status.resultVersion !== 2
+    || status.sessionId !== expected.sessionId
+    || status.workflowId !== expected.workflowId
+    || !Number.isSafeInteger(status.workflowGeneration)
+    || BigInt(status.workflowGeneration as number) !== expected.workflowGeneration
+    || (status.workflowGeneration as number) < 1
+    || status.phase !== expected.phase
+    || typeof status.phase !== "string"
+    || !SESSION_END_PHASES.has(status.phase)
+    || (status.priorRootState !== "active" && status.priorRootState !== "suspended")
+    || status.triggeringEventPosition !== expected.triggeringEventPosition.toString()
+    || typeof status.finalCheckpointId !== "string"
+    || !LOWER_UUID.test(status.finalCheckpointId)
+    || status.finalCheckpointEventPosition !== expected.frozenPosition.toString()
+    || !isPlainRecord(window)
+    || !hasExactJsonFields(window, [
+      "evidenceWindowState",
+      "evidenceFrozenCheckpointEventPosition",
+      "evidenceFrozenGeneration",
+    ])
+    || window.evidenceWindowState !== "sealed"
+    || window.evidenceFrozenCheckpointEventPosition !== expected.frozenPosition.toString()
+    || !Number.isSafeInteger(window.evidenceFrozenGeneration)
+    || BigInt(window.evidenceFrozenGeneration as number) !== expected.frozenGeneration
+    || typeof status.validationPlansReady !== "boolean"
+    || (status.qualityScore !== null
+      && (!Number.isSafeInteger(status.qualityScore)
+        || (status.qualityScore as number) < 0
+        || (status.qualityScore as number) > 10_000))
+    || (status.safeFailureCode !== null && typeof status.safeFailureCode !== "string")
+    || typeof status.materializationRequired !== "boolean"
+  ) return storageIntegrity();
+}
+
+function assertFrozenWorkflowIntegrity(
+  connection: SqliteConnection,
+  projectId: string,
+  workflowId: string,
+  rootSessionId: SessionId,
+  frozenPosition: bigint,
+): void {
+  let row: Readonly<Record<string, unknown>> | undefined;
+  try {
+    row = connection.prepare(`
+      SELECT CASE WHEN
+        json_valid(workflow.result_json)
+        AND json(workflow.result_json) = workflow.result_json
+        AND (
+          (
+            json_type(workflow.result_json, '$.status') IS NULL
+            AND (SELECT count(*) FROM json_each(workflow.result_json)) = 14
+            AND NOT EXISTS (
+              SELECT 1 FROM json_each(workflow.result_json) AS field
+              WHERE field.key NOT IN (${SESSION_END_STATUS_KEYS})
+            )
+          )
+          OR (
+            json_type(workflow.result_json, '$.status') = 'object'
+            AND (SELECT count(*) FROM json_each(workflow.result_json)) = 5
+            AND NOT EXISTS (
+              SELECT 1 FROM json_each(workflow.result_json) AS field
+              WHERE field.key NOT IN (
+                'resultVersion', 'action', 'progressed', 'previousPhase', 'status'
+              )
+            )
+            AND (SELECT count(*) FROM json_each(workflow.result_json, '$.status')) = 14
+            AND NOT EXISTS (
+              SELECT 1 FROM json_each(workflow.result_json, '$.status') AS field
+              WHERE field.key NOT IN (${SESSION_END_STATUS_KEYS})
+            )
+          )
+        )
+        AND (
+          CASE WHEN json_type(workflow.result_json, '$.status') = 'object'
+            THEN json_extract(workflow.result_json, '$.status.resultVersion')
+            ELSE json_extract(workflow.result_json, '$.resultVersion')
+          END
+        ) = 2
+        AND (
+          CASE WHEN json_type(workflow.result_json, '$.status') = 'object'
+            THEN json_extract(workflow.result_json, '$.status.sessionId')
+            ELSE json_extract(workflow.result_json, '$.sessionId')
+          END
+        ) = workflow.session_id
+        AND (
+          CASE WHEN json_type(workflow.result_json, '$.status') = 'object'
+            THEN json_extract(workflow.result_json, '$.status.workflowId')
+            ELSE json_extract(workflow.result_json, '$.workflowId')
+          END
+        ) = workflow.workflow_id
+        AND (
+          CASE WHEN json_type(workflow.result_json, '$.status') = 'object'
+            THEN json_extract(workflow.result_json, '$.status.workflowGeneration')
+            ELSE json_extract(workflow.result_json, '$.workflowGeneration')
+          END
+        ) = workflow.generation
+        AND (
+          CASE WHEN json_type(workflow.result_json, '$.status') = 'object'
+            THEN json_extract(workflow.result_json, '$.status.phase')
+            ELSE json_extract(workflow.result_json, '$.phase')
+          END
+        ) = workflow.phase
+        AND (
+          CASE WHEN json_type(workflow.result_json, '$.status') = 'object'
+            THEN json_extract(
+              workflow.result_json,
+              '$.status.evidenceWindow.evidenceWindowState'
+            )
+            ELSE json_extract(
+              workflow.result_json,
+              '$.evidenceWindow.evidenceWindowState'
+            )
+          END
+        ) = workflow.evidence_window_state
+        AND (
+          CASE WHEN json_type(workflow.result_json, '$.status') = 'object'
+            THEN json_extract(
+              workflow.result_json,
+              '$.status.evidenceWindow.evidenceFrozenCheckpointEventPosition'
+            )
+            ELSE json_extract(
+              workflow.result_json,
+              '$.evidenceWindow.evidenceFrozenCheckpointEventPosition'
+            )
+          END
+        ) = CAST(workflow.evidence_frozen_checkpoint_event_position AS TEXT)
+        AND (
+          CASE WHEN json_type(workflow.result_json, '$.status') = 'object'
+            THEN json_extract(
+              workflow.result_json,
+              '$.status.evidenceWindow.evidenceFrozenGeneration'
+            )
+            ELSE json_extract(
+              workflow.result_json,
+              '$.evidenceWindow.evidenceFrozenGeneration'
+            )
+          END
+        ) = workflow.evidence_frozen_generation
+        AND (
+          CASE WHEN json_type(workflow.result_json, '$.status') = 'object'
+            THEN json_extract(workflow.result_json, '$.status.finalCheckpointEventPosition')
+            ELSE json_extract(workflow.result_json, '$.finalCheckpointEventPosition')
+          END
+        ) = CAST(workflow.evidence_frozen_checkpoint_event_position AS TEXT)
+        AND json_valid(event.payload_json)
+        AND json(event.payload_json) = event.payload_json
+        AND json_type(event.payload_json) = 'object'
+        AND (SELECT count(*) FROM json_each(event.payload_json)) = 3
+        AND NOT EXISTS (
+          SELECT 1 FROM json_each(event.payload_json) AS field
+          WHERE field.key NOT IN ('checkpoint', 'baseEventPosition', 'checkpointEventPosition')
+        )
+        AND json_type(event.payload_json, '$.checkpoint') = 'object'
+        AND (
+          SELECT count(*) FROM json_each(event.payload_json, '$.checkpoint')
+        ) = 26
+        AND NOT EXISTS (
+          SELECT 1 FROM json_each(event.payload_json, '$.checkpoint') AS field
+          WHERE field.key NOT IN (${CHECKPOINT_KEYS})
+        )
+        AND json_extract(event.payload_json, '$.checkpoint.checkpointVersion') = 2
+        AND json_extract(event.payload_json, '$.checkpoint.sessionId') = workflow.session_id
+        AND json_type(event.payload_json, '$.checkpoint.parentSessionId') = 'null'
+        AND json_extract(event.payload_json, '$.checkpoint.checkpointEventPosition')
+          = CAST(event.global_position AS TEXT)
+        AND json_extract(event.payload_json, '$.checkpointEventPosition')
+          = CAST(event.global_position AS TEXT)
+        AND json_extract(event.payload_json, '$.checkpoint.baseEventPosition')
+          = json_extract(event.payload_json, '$.baseEventPosition')
+        AND CAST(json_extract(event.payload_json, '$.checkpoint.baseEventPosition') AS INTEGER)
+          <= event.global_position
+        AND json_extract(event.payload_json, '$.checkpoint.checkpointId') = (
+          CASE WHEN json_type(workflow.result_json, '$.status') = 'object'
+            THEN json_extract(workflow.result_json, '$.status.finalCheckpointId')
+            ELSE json_extract(workflow.result_json, '$.finalCheckpointId')
+          END
+        )
+        AND json_type(event.payload_json, '$.checkpoint.childSummaries') = 'array'
+        AND json_type(event.payload_json, '$.checkpoint.evidenceCoverage') = 'object'
+        AND json_extract(
+          event.payload_json,
+          '$.checkpoint.evidenceCoverage.coverageVersion'
+        ) = 2
+        AND json_extract(
+          event.payload_json,
+          '$.checkpoint.evidenceCoverage.captureMode'
+        ) = 'coverage-only'
+        AND json_type(
+          event.payload_json,
+          '$.checkpoint.evidenceCoverage.contentRetained'
+        ) = 'false'
+        AND json_type(
+          event.payload_json,
+          '$.checkpoint.evidenceCoverage.adapterSessions'
+        ) = 'array'
+        AND json_valid(workflow.final_ending_scope_bindings_json)
+        AND json(workflow.final_ending_scope_bindings_json)
+          = workflow.final_ending_scope_bindings_json
+        AND json_type(workflow.final_ending_scope_bindings_json) = 'array'
+        AND length(CAST(workflow.final_ending_scope_bindings_json AS BLOB)) <= 262144
+        AND json_array_length(workflow.final_ending_scope_bindings_json) <= 605
+        AND json_array_length(
+          event.payload_json,
+          '$.checkpoint.childSummaries'
+        ) = json_array_length(workflow.final_ending_scope_bindings_json)
+        AND NOT EXISTS (
+          SELECT 1
+          FROM json_each(workflow.final_ending_scope_bindings_json) AS binding
+          WHERE json_type(binding.value) <> 'object'
+            OR (SELECT count(*) FROM json_each(binding.value)) <> 10
+            OR (
+              SELECT count(DISTINCT field.key)
+              FROM json_each(binding.value) AS field
+            ) <> 10
+            OR EXISTS (
+              SELECT 1 FROM json_each(binding.value) AS field
+              WHERE field.key NOT IN (
+                'bindingVersion', 'bindingKind', 'childSessionId', 'childState',
+                'lastEventPosition', 'streamVersion', 'checkpointId',
+                'checkpointEventPosition', 'transferTicketId',
+                'transferTicketEventPosition'
+              )
+            )
+            OR json_type(binding.value, '$.bindingVersion') <> 'integer'
+            OR json_extract(binding.value, '$.bindingVersion') <> 1
+            OR json_type(binding.value, '$.bindingKind') <> 'text'
+            OR json_extract(binding.value, '$.bindingKind') NOT IN (
+              'current-child', 'carry-forward-ticket'
+            )
+            OR NOT ${sqliteCanonicalUuid(
+              "json_extract(binding.value, '$.childSessionId')",
+            )}
+            OR json_type(binding.value, '$.childState') <> 'text'
+            OR json_extract(binding.value, '$.childState') NOT IN (
+              'active', 'completion-proposed', 'completed', 'suspended', 'transferred'
+            )
+            OR NOT ${sqliteStrictUnsignedDecimal(
+              "json_extract(binding.value, '$.lastEventPosition')",
+            )}
+            OR json_extract(binding.value, '$.lastEventPosition') = '0'
+            OR NOT ${sqliteStrictUnsignedDecimal(
+              "json_extract(binding.value, '$.streamVersion')",
+            )}
+            OR json_extract(binding.value, '$.streamVersion') = '0'
+            OR (json_extract(binding.value, '$.checkpointId') IS NULL)
+              <> (json_extract(binding.value, '$.checkpointEventPosition') IS NULL)
+            OR (
+              json_extract(binding.value, '$.checkpointId') IS NOT NULL
+              AND NOT ${sqliteCanonicalUuid(
+                "json_extract(binding.value, '$.checkpointId')",
+              )}
+            )
+            OR (
+              json_extract(binding.value, '$.checkpointEventPosition') IS NOT NULL
+              AND (
+                NOT ${sqliteStrictUnsignedDecimal(
+                  "json_extract(binding.value, '$.checkpointEventPosition')",
+                )}
+                OR json_extract(binding.value, '$.checkpointEventPosition') = '0'
+                OR CAST(
+                  json_extract(binding.value, '$.checkpointEventPosition') AS INTEGER
+                ) > CAST(
+                  json_extract(binding.value, '$.lastEventPosition') AS INTEGER
+                )
+                OR NOT EXISTS (
+                  SELECT 1
+                  FROM events AS child_checkpoint
+                  WHERE child_checkpoint.project_id = workflow.project_id
+                    AND child_checkpoint.global_position = CAST(
+                      json_extract(
+                        binding.value,
+                        '$.checkpointEventPosition'
+                      ) AS INTEGER
+                    )
+                    AND child_checkpoint.session_id = json_extract(
+                      binding.value,
+                      '$.childSessionId'
+                    )
+                    AND child_checkpoint.event_type = 'SessionCheckpointRecorded'
+                    AND child_checkpoint.event_schema_version IN (1, 2)
+                    AND json_extract(
+                      child_checkpoint.payload_json,
+                      '$.checkpoint.checkpointId'
+                    ) = json_extract(binding.value, '$.checkpointId')
+                )
+              )
+            )
+            OR (
+              json_extract(binding.value, '$.bindingKind') = 'current-child'
+              AND (
+                json_extract(binding.value, '$.transferTicketId') IS NOT NULL
+                OR json_extract(
+                  binding.value,
+                  '$.transferTicketEventPosition'
+                ) IS NOT NULL
+              )
+            )
+            OR (
+              json_extract(binding.value, '$.bindingKind') = 'carry-forward-ticket'
+              AND (
+                json_extract(binding.value, '$.childState') <> 'transferred'
+                OR json_extract(binding.value, '$.checkpointId') IS NULL
+                OR json_extract(binding.value, '$.transferTicketId') IS NULL
+                OR NOT ${sqliteCanonicalUuid(
+                  "json_extract(binding.value, '$.transferTicketId')",
+                )}
+                OR json_extract(
+                  binding.value,
+                  '$.transferTicketEventPosition'
+                ) IS NULL
+                OR NOT ${sqliteStrictUnsignedDecimal(
+                  "json_extract(binding.value, '$.transferTicketEventPosition')",
+                )}
+                OR json_extract(
+                  binding.value,
+                  '$.transferTicketEventPosition'
+                ) = '0'
+                OR json_extract(binding.value, '$.lastEventPosition')
+                  <> json_extract(
+                    binding.value,
+                    '$.transferTicketEventPosition'
+                  )
+              )
+            )
+            OR json(binding.value) <> json_object(
+              'bindingKind', json_extract(binding.value, '$.bindingKind'),
+              'bindingVersion', json_extract(binding.value, '$.bindingVersion'),
+              'checkpointEventPosition',
+                json_extract(binding.value, '$.checkpointEventPosition'),
+              'checkpointId', json_extract(binding.value, '$.checkpointId'),
+              'childSessionId', json_extract(binding.value, '$.childSessionId'),
+              'childState', json_extract(binding.value, '$.childState'),
+              'lastEventPosition',
+                json_extract(binding.value, '$.lastEventPosition'),
+              'streamVersion', json_extract(binding.value, '$.streamVersion'),
+              'transferTicketEventPosition',
+                json_extract(binding.value, '$.transferTicketEventPosition'),
+              'transferTicketId',
+                json_extract(binding.value, '$.transferTicketId')
+            )
+            OR json_extract(binding.value, '$.childSessionId') IS NOT json_extract(
+              event.payload_json,
+              '$.checkpoint.childSummaries[' || binding.key || '].childSessionId'
+            )
+            OR json_extract(binding.value, '$.childState') IS NOT json_extract(
+              event.payload_json,
+              '$.checkpoint.childSummaries[' || binding.key || '].state'
+            )
+            OR json_extract(binding.value, '$.lastEventPosition') IS NOT json_extract(
+              event.payload_json,
+              '$.checkpoint.childSummaries[' || binding.key || '].lastEventPosition'
+            )
+            OR json_extract(binding.value, '$.streamVersion') IS NOT json_extract(
+              event.payload_json,
+              '$.checkpoint.childSummaries[' || binding.key || '].streamVersion'
+            )
+            OR json_extract(binding.value, '$.checkpointId') IS NOT json_extract(
+              event.payload_json,
+              '$.checkpoint.childSummaries[' || binding.key || '].latestCheckpointId'
+            )
+        )
+        AND NOT EXISTS (
+          SELECT 1
+          FROM json_each(
+            workflow.final_ending_scope_bindings_json
+          ) AS left_binding
+          JOIN json_each(
+            workflow.final_ending_scope_bindings_json
+          ) AS right_binding
+            ON CAST(right_binding.key AS INTEGER)
+              = CAST(left_binding.key AS INTEGER) + 1
+          WHERE json_extract(left_binding.value, '$.childSessionId')
+            >= json_extract(right_binding.value, '$.childSessionId')
+        )
+      THEN 1 ELSE 0 END AS frozen_valid,
+      event.payload_json AS checkpoint_payload_json,
+      workflow.result_json AS workflow_result_json,
+      workflow.generation AS workflow_generation,
+      workflow.phase AS workflow_phase,
+      workflow.triggering_event_position AS triggering_event_position,
+      workflow.evidence_frozen_generation AS frozen_generation
+      FROM workflow_instances AS workflow
+      JOIN events AS event
+        ON event.global_position = workflow.evidence_frozen_checkpoint_event_position
+       AND event.project_id = workflow.project_id
+       AND event.session_id = workflow.session_id
+       AND event.stream_id = 'session/' || workflow.session_id
+       AND event.stream_type = 'session'
+       AND event.parent_session_id IS NULL
+       AND event.event_type = 'SessionCheckpointRecorded'
+       AND event.event_schema_version = 2
+      WHERE workflow.project_id = $projectId
+        AND workflow.workflow_id = $workflowId
+        AND workflow.session_id = $rootSessionId
+        AND workflow.evidence_frozen_checkpoint_event_position = $frozenPosition
+    `).get({
+      $projectId: projectId,
+      $workflowId: workflowId,
+      $rootSessionId: rootSessionId,
+      $frozenPosition: frozenPosition,
+    });
+  } catch {
+    return storageIntegrity();
+  }
+  if (row === undefined || rowBigint(row, "frozen_valid") !== 1n) {
+    return storageIntegrity();
+  }
+  try {
+    assertFrozenWorkflowResult(
+      rowString(row, "workflow_result_json"),
+      {
+        sessionId: rootSessionId,
+        workflowId,
+        workflowGeneration: rowBigint(row, "workflow_generation"),
+        phase: rowString(row, "workflow_phase"),
+        triggeringEventPosition: rowBigint(row, "triggering_event_position"),
+        frozenPosition,
+        frozenGeneration: rowBigint(row, "frozen_generation"),
+      },
+    );
+    const payloadJson = rowString(row, "checkpoint_payload_json");
+    const payload = JSON.parse(payloadJson) as unknown;
+    if (!isPlainRecord(payload)) return storageIntegrity();
+    const checkpoint = decodeCheckpointV2(payload.checkpoint);
+    if (canonicalJson(checkpoint) !== canonicalJson(payload.checkpoint)) {
+      return storageIntegrity();
+    }
+  } catch {
+    return storageIntegrity();
+  }
+}
+
 function assertEvidenceWindowWritable(
   connection: SqliteConnection,
   sessionId: SessionId,
@@ -209,7 +797,8 @@ function assertEvidenceWindowWritable(
   if (identity === undefined) return storageIntegrity();
   const projectId = rowString(identity, "project_id");
   const authority = connection.prepare(`
-    SELECT session_kind, parent_session_id
+    SELECT stream_id, session_kind, parent_session_id, workspace_id, client_namespace,
+      owner_generation, child_capability_generation
     FROM session_authority
     WHERE project_id = $projectId
       AND session_id = $sessionId
@@ -218,19 +807,69 @@ function assertEvidenceWindowWritable(
     $sessionId: sessionId,
   });
   if (authority === undefined) throw new LifecycleError("SESSION_NOT_FOUND");
+  const streamId = rowString(authority, "stream_id");
   const kind = rowString(authority, "session_kind");
   const parentSessionId = nullableRowString(authority, "parent_session_id");
-  const rootSessionId = kind === "root" && parentSessionId === null
-    ? sessionId
-    : kind === "child" && parentSessionId !== null
-      ? parentSessionId
-      : storageIntegrity();
+  const workspaceId = rowString(authority, "workspace_id");
+  const clientNamespace = rowString(authority, "client_namespace");
+  const ownerGeneration = nullableRowBigint(authority, "owner_generation");
+  const childCapabilityGeneration = nullableRowBigint(
+    authority,
+    "child_capability_generation",
+  );
+  if (streamId !== `session/${sessionId}`) return storageIntegrity();
+  let rootSessionId: SessionId;
+  if (kind === "root") {
+    if (
+      parentSessionId !== null
+      || ownerGeneration === null
+      || ownerGeneration < 1n
+      || childCapabilityGeneration !== null
+    ) return storageIntegrity();
+    rootSessionId = sessionId;
+  } else if (kind === "child") {
+    if (
+      parentSessionId === null
+      || !LOWER_UUID.test(parentSessionId)
+      || ownerGeneration !== null
+      || childCapabilityGeneration === null
+      || childCapabilityGeneration < 1n
+    ) return storageIntegrity();
+    const parent = connection.prepare(`
+      SELECT stream_id, session_kind, parent_session_id, workspace_id, client_namespace,
+        owner_generation, child_capability_generation
+      FROM session_authority
+      WHERE project_id = $projectId
+        AND session_id = $parentSessionId
+    `).get({
+      $projectId: projectId,
+      $parentSessionId: parentSessionId,
+    });
+    const parentOwnerGeneration = parent === undefined
+      ? null
+      : nullableRowBigint(parent, "owner_generation");
+    if (
+      parent === undefined
+      || rowString(parent, "stream_id") !== `session/${parentSessionId}`
+      || rowString(parent, "session_kind") !== "root"
+      || nullableRowString(parent, "parent_session_id") !== null
+      || rowString(parent, "workspace_id") !== workspaceId
+      || rowString(parent, "client_namespace") !== clientNamespace
+      || parentOwnerGeneration === null
+      || parentOwnerGeneration < 1n
+      || nullableRowBigint(parent, "child_capability_generation") !== null
+    ) return storageIntegrity();
+    rootSessionId = parentSessionId as SessionId;
+  } else {
+    return storageIntegrity();
+  }
   const workflow = connection.prepare(`
     SELECT workflow_type, generation, phase, session_id,
       evidence_frozen_checkpoint_event_position,
       evidence_frozen_generation,
       evidence_window_state,
-      final_ending_scope_bindings_json
+      CASE WHEN final_ending_scope_bindings_json IS NULL
+        THEN 1 ELSE 0 END AS bindings_is_null
     FROM workflow_instances
     WHERE project_id = $projectId
       AND workflow_id = $workflowId
@@ -249,7 +888,8 @@ function assertEvidenceWindowWritable(
     "evidence_frozen_checkpoint_event_position",
   );
   const frozenGeneration = nullableRowBigint(workflow, "evidence_frozen_generation");
-  const bindingsJson = nullableRowString(workflow, "final_ending_scope_bindings_json");
+  const bindingsIsNull = rowBigint(workflow, "bindings_is_null");
+  if (bindingsIsNull !== 0n && bindingsIsNull !== 1n) return storageIntegrity();
   if (
     workflowType !== "session-end"
     || generation < 1n
@@ -258,41 +898,24 @@ function assertEvidenceWindowWritable(
   ) return storageIntegrity();
   const nullGroup = frozenPosition === null
     && frozenGeneration === null
-    && bindingsJson === null;
+    && bindingsIsNull === 1n;
   const completeGroup = frozenPosition !== null
     && frozenGeneration !== null
-    && bindingsJson !== null;
+    && bindingsIsNull === 0n;
   if (!nullGroup && !completeGroup) return storageIntegrity();
-  if (bindingsJson !== null) {
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(bindingsJson) as unknown;
-    } catch {
-      return storageIntegrity();
-    }
-    let bindings;
-    try {
-      bindings = decodeFinalEndingScopeBindingsV1(parsed);
-    } catch {
-      return storageIntegrity();
-    }
+  if (completeGroup) {
     if (
-      canonicalJson(bindings) !== bindingsJson
-      || frozenPosition === null
-      || frozenPosition < 1n
+      frozenPosition < 1n
       || frozenGeneration !== generation
+      || windowState !== "sealed"
     ) return storageIntegrity();
-    const checkpoint = connection.prepare(`
-      SELECT event_type, event_schema_version, session_id
-      FROM events
-      WHERE global_position = $globalPosition
-    `).get({ $globalPosition: frozenPosition });
-    if (
-      checkpoint === undefined
-      || checkpoint.event_type !== "SessionCheckpointRecorded"
-      || rowBigint(checkpoint, "event_schema_version") !== 2n
-      || checkpoint.session_id !== rootSessionId
-    ) return storageIntegrity();
+    assertFrozenWorkflowIntegrity(
+      connection,
+      projectId,
+      `session-end/${rootSessionId}`,
+      rootSessionId,
+      frozenPosition,
+    );
   }
   if (phase === "cancelled") {
     if (windowState !== "sealed" || !nullGroup) return storageIntegrity();
@@ -306,24 +929,47 @@ function assertEvidenceWindowWritable(
 export function connectionBoundEvidenceCoverage(
   connection: SqliteConnection,
   repository: EvidenceCoverageRepository,
-): Required<ConnectionBoundEvidenceCoverage> {
-  return Object.freeze({
+): ConnectionBoundEvidenceCoverage {
+  const preparedByHandle = new Map<
+    PreparedEvidenceCoverageHandle,
+    PreparedEvidenceCoverageBatch
+  >();
+  const facade: ConnectionBoundEvidenceCoverage = {
     assertEvidenceWindowWritable: (sessionId) =>
       assertEvidenceWindowWritable(connection, sessionId),
     assertQuickHealthy: (sessionIds) =>
       repository.assertQuickHealthy(connection, sessionIds),
+    registerAffectedExistingSessions: (sessionIds) =>
+      repository.assertQuickHealthy(connection, sessionIds),
     assertVersion1Eligible: (sessionIds) =>
       repository.assertVersion1Eligible(connection, sessionIds),
-    prepareBatch: (input) => repository.prepareBatch(connection, input),
-    persistPrepared: (prepared, event) =>
-      repository.persistPrepared(connection, prepared, event),
+    prepareBatch: (input) => {
+      const prepared = repository.prepareBatch(connection, input);
+      const handle = Symbol("prepared-evidence-coverage") as PreparedEvidenceCoverageHandle;
+      preparedByHandle.set(handle, prepared);
+      return Object.freeze({
+        handle,
+        sessionId: prepared.sessionId,
+        adapterSessionId: prepared.adapterSessionId,
+        eventPayload: prepared.eventPayload,
+      });
+    },
+    persistPrepared: (handle, event) => {
+      if (typeof handle !== "symbol") return storageIntegrity();
+      const preparedHandle = handle as PreparedEvidenceCoverageHandle;
+      const prepared = preparedByHandle.get(preparedHandle);
+      if (prepared === undefined) return storageIntegrity();
+      preparedByHandle.delete(preparedHandle);
+      repository.persistPrepared(connection, prepared, event);
+    },
     snapshotV2: (sessionId, baseEventPosition) =>
       repository.snapshotV2(connection, sessionId, baseEventPosition),
     minimumCheckpointUpperBound: (input) =>
       repository.minimumCheckpointUpperBound(connection, input),
     minimumFinalEndingScopeBindingsUpperBound: (input) =>
       repository.minimumFinalEndingScopeBindingsUpperBound(connection, input),
-  });
+  };
+  return Object.freeze(facade);
 }
 
 export class LifecycleCommandStoreError extends LifecycleError {
@@ -836,8 +1482,9 @@ function assertCommittedMatchesPlan<T extends JsonValue>(
 }
 
 function affectedExistingSessionIds(
-  command: LifecycleSemanticCommandDraft | InternalWorkflowSemanticCommand,
+  envelope: LifecycleCommandEnvelope,
 ): readonly SessionId[] {
+  const command = envelope.semanticCommand;
   switch (command.commandType) {
     case "root-start":
       return Object.freeze([]);
@@ -868,31 +1515,124 @@ function affectedExistingSessionIds(
       return Object.freeze([command.request.sessionId]);
     case "internal-validation-result":
     case "internal-workflow-phase":
-      return Object.freeze([]);
+      if (envelope.replayExpectation.kind !== "internal-workflow") {
+        return storageIntegrity();
+      }
+      return Object.freeze([
+        envelope.replayExpectation.targetSessionId as SessionId,
+      ]);
   }
+}
+
+const COVERAGE_FACADE_METHODS = [
+  "assertEvidenceWindowWritable",
+  "assertQuickHealthy",
+  "registerAffectedExistingSessions",
+  "assertVersion1Eligible",
+  "prepareBatch",
+  "persistPrepared",
+  "snapshotV2",
+  "minimumCheckpointUpperBound",
+  "minimumFinalEndingScopeBindingsUpperBound",
+] as const;
+
+function assertCompleteCoverageFacade(
+  coverage: ConnectionBoundEvidenceCoverage,
+): ConnectionBoundEvidenceCoverage {
+  if (typeof coverage !== "object" || coverage === null) return storageIntegrity();
+  for (const method of COVERAGE_FACADE_METHODS) {
+    const descriptor = Reflect.getOwnPropertyDescriptor(coverage, method);
+    if (
+      descriptor === undefined
+      || !descriptor.enumerable
+      || !("value" in descriptor)
+      || typeof descriptor.value !== "function"
+    ) return storageIntegrity();
+  }
+  return coverage;
+}
+
+interface FreshIntegrityCoordinator {
+  readonly coverage: ConnectionBoundEvidenceCoverage;
+  register(sessionIds: readonly SessionId[]): void;
+  seal(): void;
+  assertRegistered(sessionIds: readonly SessionId[]): void;
+}
+
+function createFreshIntegrityCoordinator(
+  coverageValue: ConnectionBoundEvidenceCoverage,
+): FreshIntegrityCoordinator {
+  const coverage = assertCompleteCoverageFacade(coverageValue);
+  const checked = new Set<SessionId>();
+  let acceptingRegistrations = true;
+  const register = (sessionIds: readonly SessionId[]): void => {
+    if (
+      !acceptingRegistrations
+      || !Array.isArray(sessionIds)
+      || Object.getPrototypeOf(sessionIds) !== Array.prototype
+      || sessionIds.length > 200
+    ) return storageIntegrity();
+    const pending: SessionId[] = [];
+    for (const sessionId of sessionIds) {
+      if (typeof sessionId !== "string" || !LOWER_UUID.test(sessionId)) {
+        return storageIntegrity();
+      }
+      const trustedSessionId = sessionId as SessionId;
+      if (!checked.has(trustedSessionId)) pending.push(trustedSessionId);
+    }
+    if (pending.length === 0) return;
+    coverage.assertQuickHealthy(Object.freeze(pending));
+    for (const sessionId of pending) checked.add(sessionId);
+  };
+  return {
+    coverage: Object.freeze({
+      ...coverage,
+      registerAffectedExistingSessions: register,
+    }),
+    register,
+    seal: () => {
+      acceptingRegistrations = false;
+    },
+    assertRegistered: (sessionIds) => {
+      for (const sessionId of sessionIds) {
+        if (!checked.has(sessionId)) return storageIntegrity();
+      }
+    },
+  };
 }
 
 function invokeFreshIntegrityGate(
   envelope: LifecycleCommandEnvelope,
-  transaction: LifecycleCommandTransaction,
+  coordinator: FreshIntegrityCoordinator,
 ): void {
-  const coverage = transaction.coverage;
-  const affected = affectedExistingSessionIds(envelope.semanticCommand);
+  const coverage = coordinator.coverage;
+  const affected = affectedExistingSessionIds(envelope);
   if (envelope.semanticCommand.commandType === "record-evidence-batch") {
-    if (
-      typeof coverage.assertEvidenceWindowWritable !== "function"
-      || typeof coverage.assertQuickHealthy !== "function"
-    ) {
-      throw new LifecycleCommandStoreError("INTEGRITY_FAILURE");
-    }
     coverage.assertEvidenceWindowWritable(envelope.semanticCommand.sessionId);
-    coverage.assertQuickHealthy(affected);
+    coordinator.register(affected);
     return;
   }
-  // Legacy test/runtime assemblies remain production-disabled for Version 2;
-  // when the expanded facade is present, every trusted affected session is
-  // checked centrally before semantic work.
-  if (affected.length > 0) coverage.assertQuickHealthy?.(affected);
+  coordinator.register(affected);
+}
+
+function callbackRequiredAffectedSessionIds<T extends JsonValue>(
+  envelope: LifecycleCommandEnvelope,
+  commit: SnapshottedLifecycleCommit<T>,
+): readonly SessionId[] {
+  if (envelope.semanticCommand.commandType !== "claim-child-transfer") {
+    return Object.freeze([]);
+  }
+  const claimed = commit.append.events[1];
+  if (
+    claimed?.eventType !== "ChildWorkTransferClaimed"
+    || !isPlainRecord(claimed.payload)
+  ) return storageIntegrity();
+  const previousChildSessionId = claimed.payload.previousChildSessionId;
+  if (
+    typeof previousChildSessionId !== "string"
+    || !LOWER_UUID.test(previousChildSessionId)
+  ) return storageIntegrity();
+  return Object.freeze([previousChildSessionId as SessionId]);
 }
 
 export class LifecycleCommandStore {
@@ -923,6 +1663,7 @@ export class LifecycleCommandStore {
     let commitFailed = false;
     let commitCompleted = false;
     let focused: LifecycleCommandTransaction | undefined;
+    let freshIntegrity: FreshIntegrityCoordinator | undefined;
     try {
       this.#connection.exec("BEGIN IMMEDIATE");
       transactionBegan = true;
@@ -955,7 +1696,7 @@ export class LifecycleCommandStore {
       this.#events.assertCommandIdentityAvailable(envelope);
       this.#events.assertAppendAllowed();
       const rawTransaction = this.#transaction(this.#connection);
-      focused = projectCommandTransaction(this.#coverageRepository === undefined
+      const projected = projectCommandTransaction(this.#coverageRepository === undefined
         ? rawTransaction
         : {
             ...rawTransaction,
@@ -964,15 +1705,24 @@ export class LifecycleCommandStore {
               this.#coverageRepository,
             ),
           });
+      freshIntegrity = createFreshIntegrityCoordinator(projected.coverage);
+      focused = {
+        ...projected,
+        coverage: freshIntegrity.coverage,
+      };
       invokeSynchronousTransactionCallback(
         focused,
-        (transaction) => invokeFreshIntegrityGate(envelope, transaction),
+        () => invokeFreshIntegrityGate(envelope, freshIntegrity!),
         undefinedCallbackResult,
       );
       const next = invokeSynchronousTransactionCallback(focused, onNew, snapshotPreparedCommit);
+      freshIntegrity.seal();
       const resolvedEnvelope = resolveFreshCapabilityGeneration(envelope, next);
       const authorizationFingerprint = integrityFingerprint(next.authorizationRecord);
       assertAppendIdentity(resolvedEnvelope, next);
+      freshIntegrity.assertRegistered(
+        callbackRequiredAffectedSessionIds(resolvedEnvelope, next),
+      );
       const trustedAppend = appendWithTrustedIntent(resolvedEnvelope, next);
       const prepared = this.#events.prepare(
         trustedAppend,

@@ -25,6 +25,7 @@ import {
   type PreparedLifecycleCommit,
 } from "../src/orchestrator/lifecycle/lifecycle-command.store.js";
 import type {
+  ClaimChildTransferCommandV2,
   InternalWorkflowPhaseCommand,
   RecordEvidenceBatchCommandV2,
   RecordCheckpointCommandV2,
@@ -475,6 +476,7 @@ function transaction(connection: TransactionConnection): LifecycleCommandTransac
     coverage: {
       assertEvidenceWindowWritable: () => undefined,
       assertQuickHealthy: () => undefined,
+      registerAffectedExistingSessions: () => undefined,
       assertVersion1Eligible: () => undefined,
       prepareBatch: () => { throw new Error("not used"); },
       persistPrepared: () => undefined,
@@ -580,6 +582,222 @@ describe("LifecycleCommandStore", () => {
     });
     assert.deepEqual(order, []);
   });
+
+  it("fails closed before a fresh non-evidence callback when quick health is absent", () => {
+    const connection = new TransactionConnection();
+    const events = new FakeEvents(connection);
+    let callbackCalls = 0;
+    const store = new LifecycleCommandStore({
+      connection,
+      events,
+      transaction: () => ({
+        ...transaction(connection),
+        coverage: {} as never,
+      }),
+      now: () => NOW,
+    });
+
+    assert.throws(
+      () => store.execute(envelope(), () => {
+        callbackCalls += 1;
+        return {
+          append: appendCommand(),
+          authorizationRecord: authorization(),
+          afterAppend: () => undefined,
+        };
+      }),
+      (error: unknown) => error instanceof LifecycleCommandStoreError
+        && error.code === "INTEGRITY_FAILURE",
+    );
+    assert.equal(callbackCalls, 0);
+    assert.deepEqual(connection.committed, []);
+  });
+
+  it("skips quick health for a root start with no existing session", () => {
+    const connection = new TransactionConnection();
+    const events = new FakeEvents(connection);
+    let healthCalls = 0;
+    let callbackCalls = 0;
+    const store = new LifecycleCommandStore({
+      connection,
+      events,
+      transaction: () => {
+        const tx = transaction(connection);
+        return {
+          ...tx,
+          coverage: {
+            ...tx.coverage,
+            assertQuickHealthy: () => { healthCalls += 1; },
+          },
+        };
+      },
+      now: () => NOW,
+    });
+    const rootStartEnvelope = envelope({
+      commandType: "root-start",
+      semanticCommand: {
+        commandType: "root-start",
+        commandId: SEMANTIC_COMMAND.commandId,
+        idempotencyKey: SEMANTIC_COMMAND.idempotencyKey,
+        agentId: SEMANTIC_COMMAND.agentId,
+        expectedProjectId: CONTEXT.binding.projectId,
+        expectedVaultId: CONTEXT.binding.vaultId,
+        expectedWorkspaceId: CONTEXT.binding.workspaceId,
+        expectedBranchRef: null,
+        continuityKey: "new-root",
+        resumePolicy: "new",
+      } as never,
+    });
+
+    assert.throws(
+      () => store.execute(rootStartEnvelope, () => {
+        callbackCalls += 1;
+        throw new Error("stop-after-fresh-gate");
+      }),
+      /stop-after-fresh-gate/,
+    );
+    assert.equal(healthCalls, 0);
+    assert.equal(callbackCalls, 1);
+  });
+
+  it("quick-checks a callback-registered existing descendant before semantic writes", () => {
+    const descendantSessionId = "00000000-0000-4000-8000-000000000099";
+    const connection = new TransactionConnection();
+    const events = new FakeEvents(connection);
+    const healthCalls: readonly string[][] = [];
+    let semanticWrites = 0;
+    const store = new LifecycleCommandStore({
+      connection,
+      events,
+      transaction: () => {
+        const tx = transaction(connection);
+        return {
+          ...tx,
+          coverage: {
+            ...tx.coverage,
+            assertQuickHealthy: (sessionIds: readonly string[]) => {
+              (healthCalls as string[][]).push([...sessionIds]);
+              if (sessionIds.includes(descendantSessionId)) {
+                throw new LifecycleCommandStoreError("INTEGRITY_FAILURE");
+              }
+            },
+          },
+        };
+      },
+      now: () => NOW,
+    });
+
+    assert.throws(
+      () => store.execute(envelope(), (current) => {
+        (
+          current.coverage as unknown as {
+            registerAffectedExistingSessions(sessionIds: readonly string[]): void;
+          }
+        ).registerAffectedExistingSessions([descendantSessionId]);
+        semanticWrites += 1;
+        return {
+          append: appendCommand(),
+          authorizationRecord: authorization(),
+          afterAppend: () => undefined,
+        };
+      }),
+      (error: unknown) => error instanceof LifecycleCommandStoreError
+        && error.code === "INTEGRITY_FAILURE",
+    );
+    assert.deepEqual(healthCalls, [
+      [SEMANTIC_COMMAND.sessionId],
+      [descendantSessionId],
+    ]);
+    assert.equal(semanticWrites, 0);
+    assert.deepEqual(connection.committed, []);
+  });
+
+  it("requires claim-transfer callbacks to register the discovered source child", () => {
+    const sourceChildSessionId = "00000000-0000-4000-8000-000000000098";
+    const claimedChildSessionId = "00000000-0000-4000-8000-000000000099";
+    const semantic: ClaimChildTransferCommandV2 = {
+      commandType: "claim-child-transfer",
+      commandId: SEMANTIC_COMMAND.commandId,
+      idempotencyKey: SEMANTIC_COMMAND.idempotencyKey,
+      agentId: SEMANTIC_COMMAND.agentId,
+      expectedProjectId: CONTEXT.binding.projectId,
+      expectedVaultId: CONTEXT.binding.vaultId,
+      expectedWorkspaceId: CONTEXT.binding.workspaceId,
+      expectedBranchRef: null,
+      rootSessionId: SEMANTIC_COMMAND.sessionId,
+      transferTicketId: "00000000-0000-4000-8000-000000000097",
+      expectedStreamVersion: "1",
+    } as ClaimChildTransferCommandV2;
+    const witness = buildLifecycleIntentWitness(semantic, {
+      ...INTENT_WITNESS.witness.persistedAssertions,
+      targetSessionId: semantic.rootSessionId,
+    });
+    const claimEnvelope = envelope({
+      commandType: semantic.commandType,
+      semanticCommand: semantic,
+      candidateIntentHash: witness.intentHash,
+      authoritativeIntentHash: witness.intentHash,
+    });
+    const pending = (
+      eventType: "SessionForked" | "ChildWorkTransferClaimed",
+      payload: JsonValue,
+    ) => ({
+      eventType,
+      eventSchemaVersion: 1,
+      occurredAt: NOW,
+      visibilityScope: "session" as const,
+      sessionId: claimedChildSessionId,
+      parentSessionId: semantic.rootSessionId,
+      confidence: "high" as const,
+      verificationStatus: "verified" as const,
+      payload,
+      sourceRefs: [],
+      evidenceRefs: [],
+      evidenceDigests: [],
+    });
+    const append = {
+      ...appendCommand(),
+      commandType: semantic.commandType,
+      expectedStreamVersion: 0n,
+      streamId: `session/${claimedChildSessionId}`,
+      events: [
+        pending("SessionForked", { parentSessionId: semantic.rootSessionId }),
+        pending("ChildWorkTransferClaimed", { previousChildSessionId: sourceChildSessionId }),
+      ],
+    };
+
+    const connection = new TransactionConnection();
+    const events = new FakeEvents(connection);
+    const store = new LifecycleCommandStore({
+      connection,
+      events,
+      transaction: () => transaction(connection),
+      now: () => NOW,
+    });
+    assert.throws(
+      () => store.execute(claimEnvelope, () => ({
+        append,
+        authorizationRecord: authorization(),
+        afterAppend: () => undefined,
+      })),
+      (error: unknown) => error instanceof LifecycleCommandStoreError
+        && error.code === "INTEGRITY_FAILURE",
+    );
+    assert.equal(events.calls.includes("prepare"), false);
+
+    const registered = store.execute(claimEnvelope, (current) => {
+      current.coverage.registerAffectedExistingSessions([
+        sourceChildSessionId as never,
+      ]);
+      return {
+        append,
+        authorizationRecord: authorization(),
+        afterAppend: () => undefined,
+      };
+    });
+    assert.equal(registered.deduplicated, false);
+  });
+
   it("constructs typed store errors without redefining the base sanitized details", () => {
     const error = new LifecycleCommandStoreError("COMMAND_OUTCOME_UNKNOWN", {
       commandId: SEMANTIC_COMMAND.commandId,

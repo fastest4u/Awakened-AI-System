@@ -248,6 +248,18 @@ function transferOperations(transaction: LifecycleCommandTransaction): ChildTran
   });
 }
 
+function registerAffectedExistingSession(
+  transaction: LifecycleCommandTransaction,
+  sessionId: SessionId,
+): void {
+  ownMethod<
+    LifecycleCommandTransaction["coverage"]["registerAffectedExistingSessions"]
+  >(
+    transaction.coverage as object,
+    "registerAffectedExistingSessions",
+  )([sessionId]);
+}
+
 function validateContext(context: ProjectContext, command: ChildCommand): void {
   const binding = context?.binding;
   if (binding === undefined
@@ -1564,6 +1576,7 @@ export class ChildWorkflowService {
       || sourceAggregate.kind !== "child" || sourceAggregate.state !== "transferred") {
       invalid("INTEGRITY_FAILURE");
     }
+    registerAffectedExistingSession(transaction, source.sessionId as SessionId);
     const sourceEvents = authority.loadEvents(source);
     const transferEventIndex = sourceEvents.findIndex((event) =>
       event.eventType === "ChildWorkTransferCreated"

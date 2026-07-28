@@ -70,6 +70,20 @@ const LIFECYCLE_SCHEMA_MIGRATIONS = PROJECT_STORE_MIGRATIONS.slice(0, 2);
 const NOW_MS = BigInt(Date.parse(NOW));
 const OWNER_LEASE_MS = 120_000n;
 
+function healthyCoverageFacade() {
+  return {
+    assertEvidenceWindowWritable: () => undefined,
+    assertQuickHealthy: () => undefined,
+    registerAffectedExistingSessions: () => undefined,
+    assertVersion1Eligible: () => undefined,
+    prepareBatch: () => { throw new Error("evidence coverage not used"); },
+    persistPrepared: () => undefined,
+    snapshotV2: () => { throw new Error("evidence coverage not used"); },
+    minimumCheckpointUpperBound: () => 0,
+    minimumFinalEndingScopeBindingsUpperBound: () => 0,
+  };
+}
+
 type RootSessionPublicResultV2 = {
   readonly project: {
     readonly projectId: string;
@@ -982,7 +996,7 @@ function fixture(
           approvals.consume(current, input)),
       },
       transfers: {},
-      coverage: {},
+      coverage: healthyCoverageFacade(),
       workflows: {},
       validation: {},
       outbox: {},

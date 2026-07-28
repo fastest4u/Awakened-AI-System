@@ -79,6 +79,20 @@ const LIFECYCLE_SCHEMA_MIGRATIONS = PROJECT_STORE_MIGRATIONS.slice(0, 2);
 const NOW_MS = BigInt(Date.parse(NOW));
 const TARGET_BINDING_FINGERPRINT = "d".repeat(64);
 
+function healthyCoverageFacade() {
+  return {
+    assertEvidenceWindowWritable: () => undefined,
+    assertQuickHealthy: () => undefined,
+    registerAffectedExistingSessions: () => undefined,
+    assertVersion1Eligible: () => undefined,
+    prepareBatch: () => { throw new Error("evidence coverage not used"); },
+    persistPrepared: () => undefined,
+    snapshotV2: () => { throw new Error("evidence coverage not used"); },
+    minimumCheckpointUpperBound: () => 0,
+    minimumFinalEndingScopeBindingsUpperBound: () => 0,
+  };
+}
+
 class NativeStatement implements SqliteStatement {
   constructor(private readonly statement: import("node:sqlite").StatementSync) {
     statement.setReadBigInts(true);
@@ -485,7 +499,7 @@ function commandRuntime(options: {
         insert: (input: Parameters<ChildTransferRepository["insert"]>[1]) => transfers.insert(current, input),
         claim: (input: Parameters<ChildTransferRepository["claim"]>[1]) => transfers.claim(current, input),
       },
-      coverage: {}, workflows: {}, validation: {}, outbox: {},
+      coverage: healthyCoverageFacade(), workflows: {}, validation: {}, outbox: {},
     }),
     now: () => new Date(Number(clock.nowMs())).toISOString(),
   });

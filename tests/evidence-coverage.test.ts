@@ -13,16 +13,31 @@ import type { CheckpointEvidenceCoverageV2 } from "../src/orchestrator/lifecycle
 import type { RecordEvidenceBatchCommandV2 } from "../src/orchestrator/lifecycle/contracts/commands.js";
 import type { FinalEndingScopeBindingV1 } from "../src/orchestrator/lifecycle/contracts/session-end.js";
 import type { ProjectContext } from "../src/orchestrator/identity/contracts.js";
-import type { StoredEvent } from "../src/orchestrator/contracts/event.js";
+import type {
+  LifecycleReplayExpectation,
+  PersistedLifecycleAuthorizationRecord,
+  StoredEvent,
+} from "../src/orchestrator/contracts/event.js";
 import { canonicalJson } from "../src/orchestrator/serialization/canonical-json.js";
 import { EvidenceCoverageRepository } from "../src/orchestrator/storage/evidence-coverage.repository.js";
 import {
   EvidenceCoverageService,
 } from "../src/orchestrator/lifecycle/evidence-coverage.service.js";
-import type { LifecycleCommandTransaction } from "../src/orchestrator/lifecycle/lifecycle-command.store.js";
 import {
   connectionBoundEvidenceCoverage,
+  LifecycleCommandStore,
+  type LifecycleCommandEnvelope,
+  type LifecycleCommandTransaction,
 } from "../src/orchestrator/lifecycle/lifecycle-command.store.js";
+import { buildLifecycleIntentWitness } from "../src/orchestrator/lifecycle/lifecycle-intent-witness.js";
+import { BranchScopeRepository } from "../src/orchestrator/storage/branch-scope.repository.js";
+import {
+  EventAppendTransaction,
+  SqliteEventAppendStatements,
+} from "../src/orchestrator/storage/event-append-transaction.js";
+import { MaintenanceFence } from "../src/orchestrator/storage/maintenance-fence.js";
+import type { SessionAuthorityRecord } from "../src/orchestrator/storage/lifecycle-storage.types.js";
+import type { SessionAggregateState } from "../src/orchestrator/lifecycle/session-aggregate.js";
 import { NodeSqliteDriver } from "../src/orchestrator/storage/node-sqlite-driver.js";
 import type {
   SqliteConnection,
@@ -31,6 +46,7 @@ import type {
   SqliteValue,
 } from "../src/orchestrator/storage/sqlite-driver.js";
 import { applyCurrentProjectStoreSchema } from "./support/current-project-store-schema.js";
+import { checkpointFixture } from "./support/lifecycle-fixtures.js";
 
 const NOW = "2026-07-27T00:00:00.000Z";
 const PROJECT_ID = "11111111-1111-4111-8111-111111111111";
@@ -89,6 +105,27 @@ function repositoryTableCounts(
     table,
     connection.prepare(`SELECT count(*) AS count FROM ${table}`).get()!.count as bigint,
   ])));
+}
+
+function atomicStoreState(
+  connection: SqliteConnection,
+): Readonly<Record<string, bigint>> {
+  const counts = repositoryTableCounts(connection);
+  const stream = connection.prepare(`
+    SELECT current_version
+    FROM streams
+    WHERE project_id = $projectId
+      AND stream_id = $streamId
+  `).get({
+    $projectId: PROJECT_ID,
+    $streamId: `session/${SESSION_ID}`,
+  });
+  return Object.freeze({
+    ...counts,
+    command_dedup:
+      connection.prepare("SELECT count(*) AS count FROM command_dedup").get()!.count as bigint,
+    session_stream_version: stream?.current_version as bigint,
+  });
 }
 
 function indexedUuid(index: number): string {
@@ -196,7 +233,7 @@ function seedAuthorityForForeignKeys(
     client_namespace: "client-1",
     semantic_state: "active",
     owner_generation: 1n,
-    child_capability_generation: 1n,
+    child_capability_generation: null,
     direct_access_enabled: 0n,
     authority_commitment: "f".repeat(64),
     authority_event_position: eventPosition,
@@ -211,11 +248,46 @@ function seedAuthorityForForeignKeys(
   rawInsert(connection, "session_authority", authority);
 }
 
+function seedChildAuthorityForForeignKeys(
+  connection: SqliteConnection,
+  childSessionId: string,
+  rootSessionId = SESSION_ID,
+): void {
+  rawInsert(connection, "streams", {
+    project_id: PROJECT_ID,
+    stream_id: `session/${childSessionId}`,
+    stream_type: "session",
+    current_version: 1n,
+    created_at: NOW,
+    updated_at: NOW,
+  });
+  rawInsert(connection, "session_authority", {
+    project_id: PROJECT_ID,
+    session_id: childSessionId,
+    stream_id: `session/${childSessionId}`,
+    session_kind: "child",
+    parent_session_id: rootSessionId,
+    workspace_id: "c".repeat(64),
+    client_namespace: "client-1",
+    semantic_state: "active",
+    owner_generation: null,
+    child_capability_generation: 1n,
+    direct_access_enabled: 1n,
+    authority_commitment: "f".repeat(64),
+    authority_event_position: 1n,
+    created_at: NOW,
+    updated_at: NOW,
+  });
+}
+
 function faultingConnection(
   connection: SqliteConnection,
   sqlMarker: string,
+  when: "before" | "after" = "before",
+  occurrence = 1,
 ): SqliteConnection {
   let injected = false;
+  let matches = 0;
   return {
     exec(sql) {
       connection.exec(sql);
@@ -224,11 +296,18 @@ function faultingConnection(
       const statement = connection.prepare(sql);
       const wrapped: SqliteStatement = {
         run(params) {
-          if (!injected && sql.includes(sqlMarker)) {
+          const matchesBoundary = sql.includes(sqlMarker);
+          if (matchesBoundary) matches += 1;
+          if (!injected && matchesBoundary && matches === occurrence && when === "before") {
             injected = true;
             throw new Error(`injected:${sqlMarker}`);
           }
-          return statement.run(params);
+          const result = statement.run(params);
+          if (!injected && matchesBoundary && matches === occurrence && when === "after") {
+            injected = true;
+            throw new Error(`injected:${sqlMarker}`);
+          }
+          return result;
         },
         get(params) {
           return statement.get(params);
@@ -248,14 +327,62 @@ function faultingConnection(
   };
 }
 
-function context(): ProjectContext {
+function recordingConnection(
+  connection: SqliteConnection,
+  statements: string[],
+): SqliteConnection {
+  return {
+    exec(sql) {
+      connection.exec(sql);
+    },
+    prepare(sql) {
+      statements.push(sql.trim().replace(/\s+/g, " "));
+      return connection.prepare(sql);
+    },
+    close() {
+      connection.close();
+    },
+  };
+}
+
+function context(
+  actorRole: "primary" | "untrusted" = "primary",
+  clientInstanceId = "client-1",
+): ProjectContext {
+  const workspace = {
+    kind: "non-git" as const,
+    workspaceRoot: "C:\\evidence-coverage",
+    workspaceId: "c".repeat(64) as never,
+  };
   return {
     binding: {
+      projectBindingId: "evidence-coverage-binding",
+      generation: 1,
+      contextFingerprint: H64,
+      source: "explicit-cli",
       projectId: PROJECT_ID,
       vaultId: VAULT_ID,
       storeId: STORE_ID,
+      workspaceId: workspace.workspaceId,
+      clientNamespace: "client-1",
+      clientInstanceId,
+      actorRole,
+      projectRoot: "C:\\evidence-coverage",
+      vaultRoot: "C:\\evidence-coverage\\memory",
+      descriptorPath: "C:\\evidence-coverage\\memory\\.project-memory.json",
+      storeRoute: {
+        kind: "local",
+        storeRoot: "C:\\evidence-coverage\\.project-memory",
+        eventsPath: "C:\\evidence-coverage\\.project-memory\\events.sqlite",
+        storeManifestPath: "C:\\evidence-coverage\\.project-memory\\store.json",
+        projectionManifestPath: "C:\\evidence-coverage\\.project-memory\\projection.json",
+      },
+      workspace,
+      establishedAt: NOW,
     },
-  } as ProjectContext;
+    workspace,
+    checkedAt: NOW,
+  } as unknown as ProjectContext;
 }
 
 function command(
@@ -287,6 +414,375 @@ function command(
       contentFingerprint: FRAME_H64,
     }],
     ...overrides,
+  };
+}
+
+function evidenceAuthorization(
+  input: {
+    readonly authorizationSessionId?: string;
+    readonly targetSessionId?: string;
+    readonly actorRole?: "primary" | "untrusted";
+    readonly clientInstanceId?: string;
+    readonly proofDigest?: string;
+  } = {},
+): PersistedLifecycleAuthorizationRecord {
+  const actorRole = input.actorRole ?? "primary";
+  const clientInstanceId = input.clientInstanceId ?? "client-1";
+  return {
+    kind: "protected",
+    proof: {
+      version: 1,
+      nonce: indexedUuid(900_001),
+      digest: input.proofDigest ?? H64,
+    },
+    approval: null,
+    authorizationSessionId: input.authorizationSessionId ?? SESSION_ID,
+    targetSessionId: input.targetSessionId ?? SESSION_ID,
+    presenting: { actorRole, clientInstanceId },
+    target: { actorRole, clientInstanceId },
+  };
+}
+
+function evidenceEnvelope(
+  semantic: RecordEvidenceBatchCommandV2,
+  authorization = evidenceAuthorization(),
+  capabilityKind: "root-session-handle" | "child-session-handle" = "root-session-handle",
+  capabilityGeneration = "1",
+  projectContext = context(),
+): LifecycleCommandEnvelope {
+  const assertions = {
+    authorizationKind: "protected" as const,
+    authorizationSessionId: authorization.authorizationSessionId,
+    targetSessionId: authorization.targetSessionId,
+    projectId: PROJECT_ID,
+    vaultId: VAULT_ID,
+    storeId: STORE_ID,
+    workspaceId: "c".repeat(64),
+    clientNamespace: projectContext.binding.clientNamespace,
+    capabilityKind,
+    capabilityGeneration,
+    presentingActorRole: authorization.presenting.actorRole,
+    presentingClientInstanceId: authorization.presenting.clientInstanceId,
+    targetActorRole: authorization.target.actorRole,
+    targetClientInstanceId: authorization.target.clientInstanceId,
+    internalWorkflowId: null,
+    internalWorkflowGeneration: null,
+    internalPlannedWorkId: null,
+  };
+  const witness = buildLifecycleIntentWitness(semantic, assertions);
+  return {
+    context: projectContext,
+    commandId: semantic.commandId,
+    idempotencyKey: semantic.idempotencyKey,
+    commandType: semantic.commandType,
+    candidateIntentHash: witness.intentHash,
+    authoritativeIntentHash: witness.intentHash,
+    semanticCommand: semantic,
+    capabilityKind,
+    capabilityGeneration: null,
+    capabilityGenerationResolution: "fresh-commit",
+    replayExpectation: authorization as LifecycleReplayExpectation,
+  };
+}
+
+function targetAuthority(
+  input: {
+    readonly sessionId?: string;
+    readonly sessionKind?: "root" | "child";
+    readonly parentSessionId?: string | null;
+    readonly ownerGeneration?: bigint | null;
+    readonly childCapabilityGeneration?: bigint | null;
+  } = {},
+): SessionAuthorityRecord {
+  const sessionId = input.sessionId ?? SESSION_ID;
+  const sessionKind = input.sessionKind ?? "root";
+  return {
+    projectId: PROJECT_ID,
+    sessionId,
+    streamId: `session/${sessionId}`,
+    sessionKind,
+    parentSessionId: input.parentSessionId ?? null,
+    workspaceId: "c".repeat(64),
+    clientNamespace: "client-1",
+    ownerGeneration: input.ownerGeneration ?? (sessionKind === "root" ? 1n : null),
+    childCapabilityGeneration:
+      input.childCapabilityGeneration ?? (sessionKind === "child" ? 1n : null),
+    authorityCommitment: "f".repeat(64),
+    revocationEventPosition: null,
+    revokedAt: null,
+    terminalEventPosition: null,
+    terminalEventType: null,
+    terminalAt: null,
+  } as SessionAuthorityRecord;
+}
+
+function targetAggregate(
+  authority = targetAuthority(),
+  streamVersion = 1n,
+  eventPosition = 1n,
+): SessionAggregateState {
+  const record = authority as unknown as {
+    sessionId: string;
+    streamId: string;
+    sessionKind: "root" | "child";
+    parentSessionId: string | null;
+    ownerGeneration: bigint | null;
+    childCapabilityGeneration: bigint | null;
+  };
+  return {
+    kind: record.sessionKind,
+    projectId: PROJECT_ID,
+    vaultId: VAULT_ID,
+    storeId: STORE_ID,
+    workspaceId: "c".repeat(64),
+    sessionId: record.sessionId,
+    streamId: record.streamId,
+    parentSessionId: record.parentSessionId,
+    streamVersion,
+    eventPosition,
+    terminalEventPosition: null,
+    correlationId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    ...(record.sessionKind === "root"
+      ? { ownerGeneration: Number(record.ownerGeneration) }
+      : { childCapabilityGeneration: record.childCapabilityGeneration?.toString() ?? null }),
+  } as SessionAggregateState;
+}
+
+function frozenCheckpointPayload(
+  checkpointId = indexedUuid(710_005),
+  childSummaries: readonly unknown[] = [],
+): Readonly<Record<string, unknown>> {
+  const checkpoint = {
+    ...checkpointFixture({
+      sessionId: SESSION_ID as never,
+      checkpointId: checkpointId as never,
+      baseEventPosition: "1",
+      checkpointEventPosition: "2",
+    }),
+    checkpointVersion: 2,
+    childSummaries,
+    evidenceCoverage: {
+      coverageVersion: 2,
+      captureMode: "coverage-only",
+      contentRetained: false,
+      adapterSessions: [],
+    },
+  };
+  return {
+    checkpoint,
+    baseEventPosition: "1",
+    checkpointEventPosition: "2",
+  };
+}
+
+function frozenWorkflowResult(
+  checkpointId = indexedUuid(710_005),
+): Readonly<Record<string, unknown>> {
+  return {
+    resultVersion: 2,
+    sessionId: SESSION_ID,
+    workflowId: `session-end/${SESSION_ID}`,
+    workflowGeneration: 1,
+    phase: "final-checkpoint-recorded",
+    priorRootState: "active",
+    triggeringEventPosition: "1",
+    finalCheckpointId: checkpointId,
+    finalCheckpointEventPosition: "2",
+    evidenceWindow: {
+      evidenceWindowState: "sealed",
+      evidenceFrozenCheckpointEventPosition: "2",
+      evidenceFrozenGeneration: 1,
+    },
+    validationPlansReady: false,
+    qualityScore: null,
+    safeFailureCode: null,
+    materializationRequired: false,
+  };
+}
+
+function realEvidenceStoreFixture(
+  input: {
+    readonly semantic?: RecordEvidenceBatchCommandV2;
+    readonly repositoryConnection?: SqliteConnection;
+    readonly seed?: boolean;
+    readonly streamVersion?: bigint;
+    readonly eventPosition?: bigint;
+    readonly eventIdStart?: number;
+    readonly projectContext?: ProjectContext;
+    readonly authorization?: PersistedLifecycleAuthorizationRecord;
+    readonly envelopeAuthorization?: PersistedLifecycleAuthorizationRecord;
+    readonly authorizationAuthority?: ReturnType<typeof targetAuthority>;
+    readonly targetAuthority?: ReturnType<typeof targetAuthority>;
+    readonly targetAggregate?: ReturnType<typeof targetAggregate>;
+    readonly capabilityKind?: "root-session-handle" | "child-session-handle";
+    readonly freshCapabilityGeneration?: string;
+    readonly envelopeCapabilityGeneration?: string;
+    readonly prospectiveEndingScopeBindings?: readonly FinalEndingScopeBindingV1[];
+    readonly seedChildSessionId?: string;
+  } = {},
+) {
+  const connection = input.repositoryConnection ?? database();
+  if (input.seed !== false) {
+    rawGenericSessionEvent(connection, 1n);
+    seedAuthorityForForeignKeys(connection, 1n);
+    if (input.seedChildSessionId !== undefined) {
+      seedChildAuthorityForForeignKeys(connection, input.seedChildSessionId);
+    }
+  }
+  const semantic = input.semantic ?? command();
+  const projectContext = input.projectContext ?? context();
+  const authorization = input.authorization ?? evidenceAuthorization();
+  const target = input.targetAuthority ?? targetAuthority({
+    sessionId: semantic.sessionId,
+  });
+  const authorizationAuthority = input.authorizationAuthority ?? target;
+  const aggregate = input.targetAggregate ?? targetAggregate(
+    target,
+    input.streamVersion ?? 1n,
+    input.eventPosition ?? 1n,
+  );
+  const recorder = providerRecorder();
+  const repository = new EvidenceCoverageRepository(recorder.provider);
+  let eventId = input.eventIdStart ?? 950_000;
+  const events = new EventAppendTransaction(
+    connection,
+    new SqliteEventAppendStatements(connection),
+    new MaintenanceFence(),
+    new BranchScopeRepository(),
+    () => indexedUuid(eventId++),
+  );
+  const service = new EvidenceCoverageService({
+    invocationScope: {
+      current: () => ({
+        context: projectContext,
+        authorizationRecord: authorization,
+        freshCapabilityGeneration: input.freshCapabilityGeneration ?? "1",
+        authorizationAuthority,
+        targetAuthority: target,
+        targetAggregate: aggregate,
+        prospectiveEndingScopeBindings:
+          input.prospectiveEndingScopeBindings ?? [],
+        occurredAt: NOW,
+      }),
+    },
+  });
+  const store = new LifecycleCommandStore({
+    connection,
+    events,
+    transaction: () => ({
+      authority: {
+        nextGlobalPosition: () => (
+          connection.prepare(
+            "SELECT COALESCE(max(global_position), 0) + 1 AS position FROM events",
+          ).get()!.position as bigint
+        ),
+      },
+      leases: {},
+      approvals: {},
+      transfers: {},
+      coverage: connectionBoundEvidenceCoverage(connection, repository),
+      workflows: {},
+      validation: {},
+      outbox: {},
+    }),
+    now: () => NOW,
+  });
+  return {
+    connection,
+    semantic,
+    recorder,
+    repository,
+    service,
+    store,
+    envelope: evidenceEnvelope(
+      semantic,
+      input.envelopeAuthorization ?? authorization,
+      input.capabilityKind ?? "root-session-handle",
+      input.envelopeCapabilityGeneration
+        ?? input.freshCapabilityGeneration
+        ?? "1",
+      projectContext,
+    ),
+  };
+}
+
+function validPreparedEventPayload(
+  semantic: RecordEvidenceBatchCommandV2 = command(),
+): Readonly<Record<string, unknown>> {
+  return {
+    adapterSessionId: semantic.adapterSessionId,
+    batchId: semantic.batchId,
+    batchFirstOrdinal: semantic.firstOrdinal,
+    batchLastOrdinal: semantic.lastOrdinal,
+    coverageFirstOrdinal: "0",
+    coverageLastOrdinal: semantic.lastOrdinal,
+    highestContiguousOrdinal: null,
+    missingIntervals: [{ firstOrdinal: "0", lastOrdinal: "4" }],
+    frameFingerprintAlgorithm: "hmac-sha256",
+    frameFingerprintSchemaVersion: 1,
+    frameFingerprintKeyId: semantic.fingerprintKeyId,
+    frameFingerprintDomain: "pm-evidence-frame-v1",
+    coverageFingerprintAlgorithm: "hmac-sha256",
+    coverageFingerprintSchemaVersion: 1,
+    coverageFingerprintKeyId: semantic.fingerprintKeyId,
+    coverageFingerprintDomain: "pm-evidence-coverage-v1",
+    coverageFingerprint: H64,
+    captureMode: "coverage-only",
+    contentRetained: false,
+    frames: semantic.frames.map((frame) => ({ ...frame })),
+  };
+}
+
+function directEvidenceServiceFixture(
+  payload: Readonly<Record<string, unknown>>,
+  semantic: RecordEvidenceBatchCommandV2 = command(),
+) {
+  const authority = targetAuthority();
+  const aggregate = targetAggregate(authority);
+  const handle = Symbol("direct-prepared-evidence");
+  let persistCalls = 0;
+  const transaction = {
+    authority: { nextGlobalPosition: () => 2n },
+    leases: {},
+    approvals: {},
+    transfers: {},
+    coverage: {
+      assertEvidenceWindowWritable: () => undefined,
+      assertQuickHealthy: () => undefined,
+      registerAffectedExistingSessions: () => undefined,
+      assertVersion1Eligible: () => undefined,
+      prepareBatch: () => ({
+        handle,
+        sessionId: semantic.sessionId,
+        adapterSessionId: semantic.adapterSessionId,
+        eventPayload: payload,
+      }),
+      persistPrepared: () => { persistCalls += 1; },
+      snapshotV2: () => { throw new Error("not used"); },
+      minimumCheckpointUpperBound: () => 0,
+      minimumFinalEndingScopeBindingsUpperBound: () => 0,
+    },
+    workflows: {},
+    validation: {},
+    outbox: {},
+  } as unknown as LifecycleCommandTransaction;
+  const service = new EvidenceCoverageService({
+    invocationScope: {
+      current: () => ({
+        context: context(),
+        authorizationRecord: evidenceAuthorization(),
+        freshCapabilityGeneration: "1",
+        authorizationAuthority: authority,
+        targetAuthority: authority,
+        targetAggregate: aggregate,
+        prospectiveEndingScopeBindings: [],
+        occurredAt: NOW,
+      }),
+    },
+  });
+  return {
+    record: () => service.record(transaction, semantic),
+    persistCalls: () => persistCalls,
   };
 }
 
@@ -705,8 +1201,8 @@ describe("evidence coverage repository", () => {
       workspace_id: "c".repeat(64),
       branch_scope_id: null,
       branch_ref: null,
-      stream_id: `generic/${SESSION_ID}`,
-      stream_type: "generic",
+      stream_id: `session/${SESSION_ID}`,
+      stream_type: "session",
       stream_version: 2n,
       event_type: "SessionCheckpointRecorded",
       event_schema_version: 2n,
@@ -728,7 +1224,7 @@ describe("evidence coverage repository", () => {
       source_refs_json: "[]",
       evidence_refs_json: "[]",
       evidence_digests_json: "[]",
-      payload_json: canonicalJson({ checkpoint: { checkpointVersion: 2 } }),
+      payload_json: canonicalJson(frozenCheckpointPayload()),
       payload_hash: H64,
       previous_global_hash: "0".repeat(64),
       event_hash: H64,
@@ -745,12 +1241,725 @@ describe("evidence coverage repository", () => {
       assert.throws(
         () => facade.assertEvidenceWindowWritable(target as never),
         (error: unknown) => (error as { code?: string }).code
+          === "INTEGRITY_FAILURE",
+      );
+    }
+
+    connection.prepare(`
+      UPDATE workflow_instances
+      SET result_json = $resultJson
+    `).run({
+      $resultJson: canonicalJson({
+        resultVersion: 2,
+        action: "malformed-action",
+        progressed: true,
+        previousPhase: "requested",
+        status: frozenWorkflowResult(),
+      }),
+    });
+    assert.throws(
+      () => facade.assertEvidenceWindowWritable(SESSION_ID as never),
+      (error: unknown) => (error as { code?: string }).code === "INTEGRITY_FAILURE",
+    );
+
+    connection.prepare(`
+      UPDATE workflow_instances
+      SET result_json = $resultJson
+    `).run({ $resultJson: canonicalJson(frozenWorkflowResult()) });
+    for (const target of [SESSION_ID, childSessionId]) {
+      assert.throws(
+        () => facade.assertEvidenceWindowWritable(target as never),
+        (error: unknown) => (error as { code?: string }).code
           === "SESSION_END_EVIDENCE_FROZEN",
+      );
+    }
+
+    connection.prepare(`
+      UPDATE workflow_instances
+      SET final_ending_scope_bindings_json = $bindings
+    `).run({ $bindings: canonicalJson([endingBinding(0)]) });
+    assert.throws(
+      () => facade.assertEvidenceWindowWritable(SESSION_ID as never),
+      (error: unknown) => (error as { code?: string }).code === "INTEGRITY_FAILURE",
+    );
+    connection.prepare(`
+      UPDATE workflow_instances
+      SET final_ending_scope_bindings_json = '[]'
+    `).run();
+
+    connection.exec("DROP TRIGGER events_no_update");
+    const strictBinding = endingBinding(0);
+    connection.prepare(`
+      UPDATE workflow_instances
+      SET final_ending_scope_bindings_json = $bindings
+    `).run({
+      $bindings: canonicalJson([{
+        ...strictBinding,
+        bindingKind: "bogus",
+        transferTicketId: "garbage",
+        transferTicketEventPosition: "1",
+      }]),
+    });
+    connection.prepare(`
+      UPDATE events
+      SET payload_json = $payload
+      WHERE global_position = 2
+    `).run({
+      $payload: canonicalJson(frozenCheckpointPayload(
+        indexedUuid(710_005),
+        [{
+          childSessionId: strictBinding.childSessionId,
+          state: strictBinding.childState,
+          lastEventPosition: strictBinding.lastEventPosition,
+          streamVersion: strictBinding.streamVersion,
+          latestCheckpointId: strictBinding.checkpointId,
+        }],
+      )),
+    });
+    assert.throws(
+      () => facade.assertEvidenceWindowWritable(SESSION_ID as never),
+      (error: unknown) => (error as { code?: string }).code === "INTEGRITY_FAILURE",
+    );
+    connection.prepare(`
+      UPDATE workflow_instances
+      SET final_ending_scope_bindings_json = '[]'
+    `).run();
+    connection.prepare(`
+      UPDATE events
+      SET payload_json = $payload
+      WHERE global_position = 2
+    `).run({ $payload: canonicalJson(frozenCheckpointPayload()) });
+
+    connection.prepare(`
+      UPDATE events
+      SET stream_id = $streamId,
+          stream_type = 'generic'
+      WHERE global_position = 2
+    `).run({ $streamId: `generic/${SESSION_ID}` });
+    assert.throws(
+      () => facade.assertEvidenceWindowWritable(SESSION_ID as never),
+      (error: unknown) => (error as { code?: string }).code === "INTEGRITY_FAILURE",
+    );
+    const malformedStrictCheckpoint = frozenCheckpointPayload() as {
+      readonly checkpoint: Readonly<Record<string, unknown>>;
+      readonly baseEventPosition: string;
+      readonly checkpointEventPosition: string;
+    };
+    connection.prepare(`
+      UPDATE events
+      SET stream_id = $streamId,
+          stream_type = 'session',
+          payload_json = $payload
+      WHERE global_position = 2
+    `).run({
+      $streamId: `session/${SESSION_ID}`,
+      $payload: canonicalJson({
+        ...malformedStrictCheckpoint,
+        checkpoint: {
+          ...malformedStrictCheckpoint.checkpoint,
+          taskSummary: null,
+        },
+      }),
+    });
+    assert.throws(
+      () => facade.assertEvidenceWindowWritable(SESSION_ID as never),
+      (error: unknown) => (error as { code?: string }).code === "INTEGRITY_FAILURE",
+    );
+    connection.prepare(`
+      UPDATE events
+      SET stream_id = $streamId,
+          stream_type = 'session',
+          payload_json = $payload
+      WHERE global_position = 2
+    `).run({
+      $streamId: `session/${SESSION_ID}`,
+      $payload: canonicalJson({
+        checkpoint: { checkpointVersion: 2 },
+        baseEventPosition: "1",
+        checkpointEventPosition: "2",
+      }),
+    });
+    assert.throws(
+      () => facade.assertEvidenceWindowWritable(SESSION_ID as never),
+      (error: unknown) => (error as { code?: string }).code === "INTEGRITY_FAILURE",
+    );
+  });
+
+  it("rejects missing child roots and child-to-child ancestry before workflow lookup", () => {
+    const connection = database();
+    rawGenericSessionEvent(connection, 1n);
+    seedAuthorityForForeignKeys(connection, 1n);
+    const facade = connectionBoundEvidenceCoverage(
+      connection,
+      new EvidenceCoverageRepository(providerRecorder().provider),
+    );
+    const malformedParentId = indexedUuid(711_001);
+    const targetChildId = indexedUuid(711_002);
+    rawInsert(connection, "session_authority", {
+      project_id: PROJECT_ID,
+      session_id: malformedParentId,
+      stream_id: `session/${malformedParentId}`,
+      session_kind: "child",
+      parent_session_id: SESSION_ID,
+      workspace_id: "c".repeat(64),
+      client_namespace: "client-1",
+      semantic_state: "active",
+      owner_generation: null,
+      child_capability_generation: 1n,
+      direct_access_enabled: 1n,
+      authority_commitment: "f".repeat(64),
+      authority_event_position: 1n,
+      created_at: NOW,
+      updated_at: NOW,
+    });
+    rawInsert(connection, "session_authority", {
+      project_id: PROJECT_ID,
+      session_id: targetChildId,
+      stream_id: `session/${targetChildId}`,
+      session_kind: "child",
+      parent_session_id: malformedParentId,
+      workspace_id: "c".repeat(64),
+      client_namespace: "client-1",
+      semantic_state: "active",
+      owner_generation: null,
+      child_capability_generation: 1n,
+      direct_access_enabled: 1n,
+      authority_commitment: "f".repeat(64),
+      authority_event_position: 1n,
+      created_at: NOW,
+      updated_at: NOW,
+    });
+    assert.throws(
+      () => facade.assertEvidenceWindowWritable(targetChildId as never),
+      (error: unknown) => (error as { code?: string }).code === "INTEGRITY_FAILURE",
+    );
+
+    const missingRootChildId = indexedUuid(711_004);
+    rawInsert(connection, "session_authority", {
+      project_id: PROJECT_ID,
+      session_id: missingRootChildId,
+      stream_id: `session/${missingRootChildId}`,
+      session_kind: "child",
+      parent_session_id: indexedUuid(711_003),
+      workspace_id: "c".repeat(64),
+      client_namespace: "client-1",
+      semantic_state: "active",
+      owner_generation: null,
+      child_capability_generation: 1n,
+      direct_access_enabled: 1n,
+      authority_commitment: "f".repeat(64),
+      authority_event_position: 1n,
+      created_at: NOW,
+      updated_at: NOW,
+    });
+    assert.throws(
+      () => facade.assertEvidenceWindowWritable(missingRootChildId as never),
+      (error: unknown) => (error as { code?: string }).code === "INTEGRITY_FAILURE",
+    );
+
+    const malformedIdChild = indexedUuid(711_005);
+    rawInsert(connection, "session_authority", {
+      project_id: PROJECT_ID,
+      session_id: "x",
+      stream_id: "session/x",
+      session_kind: "root",
+      parent_session_id: null,
+      workspace_id: "c".repeat(64),
+      client_namespace: "client-1",
+      semantic_state: "active",
+      owner_generation: 1n,
+      child_capability_generation: null,
+      direct_access_enabled: 0n,
+      authority_commitment: "f".repeat(64),
+      authority_event_position: 1n,
+      created_at: NOW,
+      updated_at: NOW,
+    });
+    rawInsert(connection, "session_authority", {
+      project_id: PROJECT_ID,
+      session_id: malformedIdChild,
+      stream_id: `session/${malformedIdChild}`,
+      session_kind: "child",
+      parent_session_id: "x",
+      workspace_id: "c".repeat(64),
+      client_namespace: "client-1",
+      semantic_state: "active",
+      owner_generation: null,
+      child_capability_generation: 1n,
+      direct_access_enabled: 1n,
+      authority_commitment: "f".repeat(64),
+      authority_event_position: 1n,
+      created_at: NOW,
+      updated_at: NOW,
+    });
+    assert.throws(
+      () => facade.assertEvidenceWindowWritable(malformedIdChild as never),
+      (error: unknown) => (error as { code?: string }).code === "INTEGRITY_FAILURE",
+    );
+
+    const malformedGenerationRoot = indexedUuid(711_006);
+    const malformedGenerationChild = indexedUuid(711_007);
+    rawInsert(connection, "session_authority", {
+      project_id: PROJECT_ID,
+      session_id: malformedGenerationRoot,
+      stream_id: `session/${malformedGenerationRoot}`,
+      session_kind: "root",
+      parent_session_id: null,
+      workspace_id: "c".repeat(64),
+      client_namespace: "client-1",
+      semantic_state: "active",
+      owner_generation: null,
+      child_capability_generation: null,
+      direct_access_enabled: 0n,
+      authority_commitment: "f".repeat(64),
+      authority_event_position: 1n,
+      created_at: NOW,
+      updated_at: NOW,
+    });
+    rawInsert(connection, "session_authority", {
+      project_id: PROJECT_ID,
+      session_id: malformedGenerationChild,
+      stream_id: `session/${malformedGenerationChild}`,
+      session_kind: "child",
+      parent_session_id: malformedGenerationRoot,
+      workspace_id: "c".repeat(64),
+      client_namespace: "client-1",
+      semantic_state: "active",
+      owner_generation: null,
+      child_capability_generation: 1n,
+      direct_access_enabled: 1n,
+      authority_commitment: "f".repeat(64),
+      authority_event_position: 1n,
+      created_at: NOW,
+      updated_at: NOW,
+    });
+    assert.throws(
+      () => facade.assertEvidenceWindowWritable(malformedGenerationChild as never),
+      (error: unknown) => (error as { code?: string }).code === "INTEGRITY_FAILURE",
+    );
+  });
+
+  it("uses the same indexed query shape for empty and large frozen projections", () => {
+    const observedShapes: string[][] = [];
+    for (const bindingCount of [0, 605]) {
+      const connection = database();
+      rawGenericSessionEvent(connection, 1n);
+      seedAuthorityForForeignKeys(connection, 1n);
+      const bindings = Array.from(
+        { length: bindingCount },
+        (_, index) => endingBinding(index),
+      );
+      const summaries = bindings.map((binding) => ({
+        childSessionId: binding.childSessionId,
+        state: binding.childState,
+        lastEventPosition: binding.lastEventPosition,
+        streamVersion: binding.streamVersion,
+        latestCheckpointId: binding.checkpointId,
+      }));
+      connection.exec("DROP TRIGGER workflow_instances_lifecycle_insert_guard");
+      connection.exec("DROP TRIGGER workflow_instances_evidence_v3_insert_guard");
+      rawInsert(connection, "workflow_instances", {
+        project_id: PROJECT_ID,
+        workflow_id: `session-end/${SESSION_ID}`,
+        workflow_type: "session-end",
+        generation: 1n,
+        state: "active",
+        phase: "final-checkpoint-recorded",
+        root_command_id: "root-command",
+        result_json: canonicalJson(frozenWorkflowResult()),
+        error_code: null,
+        created_at: NOW,
+        updated_at: NOW,
+        session_id: SESSION_ID,
+        triggering_event_position: 1n,
+        expected_authority_commitment: H64,
+        coordinator_owner_id: null,
+        coordinator_claim_token: null,
+        coordinator_claim_expires_at: null,
+        coordinator_attempt_count: 0n,
+        coordinator_failure_class: null,
+        coordinator_error_code: null,
+        coordinator_next_attempt_at: null,
+        validation_attempt_plan_generation: null,
+        validation_attempt_plans_json: null,
+        evidence_frozen_checkpoint_event_position: 2n,
+        evidence_frozen_generation: 1n,
+        evidence_window_state: "sealed",
+        final_ending_scope_bindings_json: canonicalJson(bindings),
+      });
+      const payload = frozenCheckpointPayload(indexedUuid(710_005), summaries);
+      rawInsert(connection, "events", {
+        global_position: 2n,
+        event_id: indexedUuid(712_001 + bindingCount),
+        project_id: PROJECT_ID,
+        vault_id: VAULT_ID,
+        store_id: STORE_ID,
+        workspace_id: "c".repeat(64),
+        branch_scope_id: null,
+        branch_ref: null,
+        stream_id: `session/${SESSION_ID}`,
+        stream_type: "session",
+        stream_version: 2n,
+        event_type: "SessionCheckpointRecorded",
+        event_schema_version: 2n,
+        session_id: SESSION_ID,
+        parent_session_id: null,
+        actor_role: "primary",
+        agent_id: "agent-1",
+        client_instance_id: "client-1",
+        correlation_id: indexedUuid(712_301 + bindingCount),
+        causation_id: null,
+        command_id: indexedUuid(712_401 + bindingCount),
+        idempotency_key: `frozen-${bindingCount}`,
+        command_event_index: 0n,
+        occurred_at: NOW,
+        recorded_at: NOW,
+        visibility_scope: "session",
+        confidence: "high",
+        verification_status: "verified",
+        source_refs_json: "[]",
+        evidence_refs_json: "[]",
+        evidence_digests_json: "[]",
+        payload_json: canonicalJson(payload),
+        payload_hash: H64,
+        previous_global_hash: H64,
+        event_hash: H64,
+        lifecycle_intent_json: null,
+      });
+      const sql: string[] = [];
+      const inspected = recordingConnection(connection, sql);
+      const facade = connectionBoundEvidenceCoverage(
+        inspected,
+        new EvidenceCoverageRepository(providerRecorder().provider),
+      );
+      assert.throws(
+        () => facade.assertEvidenceWindowWritable(SESSION_ID as never),
+        (error: unknown) => (error as { code?: string }).code
+          === "SESSION_END_EVIDENCE_FROZEN",
+      );
+      assert.equal(sql.length, 4);
+      assert.match(sql[1]!, /session_authority.*project_id.*session_id/i);
+      assert.match(sql[2]!, /workflow_instances.*project_id.*workflow_id/i);
+      assert.match(sql[3]!, /JOIN events AS event.*global_position/i);
+      assert.doesNotMatch(
+        sql[2]!,
+        /SELECT\s+final_ending_scope_bindings_json/i,
+      );
+      observedShapes.push(sql);
+    }
+    assert.deepEqual(observedShapes[0], observedShapes[1]);
+  });
+
+  it("commits evidence event transition aggregate and ordinals atomically", () => {
+    const fixture = realEvidenceStoreFixture();
+
+    const result = fixture.store.execute(
+      fixture.envelope,
+      (transaction) => fixture.service.record(transaction, fixture.semantic),
+    );
+
+    assert.equal(result.deduplicated, false);
+    assert.deepEqual(repositoryTableCounts(fixture.connection), {
+      events: 2n,
+      session_evidence_coverage_transitions: 1n,
+      session_evidence_coverage_transition_heads: 1n,
+      session_evidence_coverage: 1n,
+      session_evidence_fingerprints: 1n,
+    });
+    assert.equal(
+      fixture.connection.prepare("SELECT count(*) AS count FROM command_dedup").get()!.count,
+      1n,
+    );
+  });
+
+  it("rolls back real first-batch store faults before and after every repository write", () => {
+    const markers = [
+      "INSERT INTO session_evidence_coverage_transitions",
+      "INSERT INTO session_evidence_coverage(",
+      "INSERT INTO session_evidence_fingerprints",
+    ] as const;
+    for (const marker of markers) {
+      for (const when of ["before", "after"] as const) {
+        const connection = database();
+        const faulting = faultingConnection(connection, marker, when);
+        const fixture = realEvidenceStoreFixture({
+          repositoryConnection: faulting,
+        });
+        const before = atomicStoreState(connection);
+        assert.throws(
+          () => fixture.store.execute(
+            fixture.envelope,
+            (transaction) => fixture.service.record(transaction, fixture.semantic),
+          ),
+          new RegExp(`injected:${marker.replace(/[()]/g, "\\$&")}`),
+          `${when}:${marker}`,
+        );
+        assert.deepEqual(
+          atomicStoreState(connection),
+          before,
+          `${when}:${marker}`,
+        );
+      }
+    }
+  });
+
+  it("rolls back real later-batch store faults before and after every repository write", () => {
+    const boundaries = [
+      {
+        marker: "INSERT INTO session_evidence_coverage_transitions",
+        occurrence: 2,
+      },
+      {
+        marker: "UPDATE session_evidence_coverage SET",
+        occurrence: 1,
+      },
+      {
+        marker: "INSERT INTO session_evidence_fingerprints",
+        occurrence: 2,
+      },
+    ] as const;
+    for (const { marker, occurrence } of boundaries) {
+      for (const when of ["before", "after"] as const) {
+        const connection = database();
+        const faulting = faultingConnection(
+          connection,
+          marker,
+          when,
+          occurrence,
+        );
+        const first = realEvidenceStoreFixture({
+          repositoryConnection: faulting,
+        });
+        first.store.execute(
+          first.envelope,
+          (transaction) => first.service.record(transaction, first.semantic),
+        );
+        const before = atomicStoreState(connection);
+        const laterSemantic = command({
+          commandId: indexedUuid(940_001),
+          idempotencyKey: "evidence-batch-later",
+          batchId: indexedUuid(940_002) as never,
+          firstOrdinal: "6",
+          lastOrdinal: "6",
+          frames: [{
+            frameId: indexedUuid(940_003) as never,
+            ordinal: "6",
+            sourceKind: "tool-result",
+            observedAt: NOW,
+            contentFingerprint: "e".repeat(64),
+          }],
+        });
+        const later = realEvidenceStoreFixture({
+          semantic: laterSemantic,
+          repositoryConnection: faulting,
+          seed: false,
+          streamVersion: 2n,
+          eventPosition: 2n,
+          eventIdStart: 960_000,
+        });
+        assert.throws(
+          () => later.store.execute(
+            later.envelope,
+            (transaction) => later.service.record(transaction, later.semantic),
+          ),
+          new RegExp(`injected:${marker.replace(/[()]/g, "\\$&")}`),
+          `${when}:${marker}`,
+        );
+        assert.deepEqual(
+          atomicStoreState(connection),
+          before,
+          `${when}:${marker}`,
+        );
+      }
+    }
+  });
+
+  it("records through the real store for root-to-descendant and child-self scopes", () => {
+    const childSessionId = indexedUuid(920_001);
+    const child = targetAuthority({
+      sessionId: childSessionId,
+      sessionKind: "child",
+      parentSessionId: SESSION_ID,
+      ownerGeneration: null,
+      childCapabilityGeneration: 1n,
+    });
+    const semantic = command({ sessionId: childSessionId as never });
+    const cases = [
+      {
+        name: "root-to-descendant",
+        projectContext: context("primary", "client-1"),
+        authorization: evidenceAuthorization({
+          authorizationSessionId: SESSION_ID,
+          targetSessionId: childSessionId,
+          actorRole: "primary",
+          clientInstanceId: "client-1",
+        }),
+        authorizationAuthority: targetAuthority(),
+        capabilityKind: "root-session-handle" as const,
+      },
+      {
+        name: "child-self",
+        projectContext: context("untrusted", "child-client"),
+        authorization: evidenceAuthorization({
+          authorizationSessionId: childSessionId,
+          targetSessionId: childSessionId,
+          actorRole: "untrusted",
+          clientInstanceId: "child-client",
+        }),
+        authorizationAuthority: child,
+        capabilityKind: "child-session-handle" as const,
+      },
+    ];
+    for (const scope of cases) {
+      const fixture = realEvidenceStoreFixture({
+        semantic,
+        seedChildSessionId: childSessionId,
+        projectContext: scope.projectContext,
+        authorization: scope.authorization,
+        authorizationAuthority: scope.authorizationAuthority,
+        targetAuthority: child,
+        targetAggregate: targetAggregate(child),
+        capabilityKind: scope.capabilityKind,
+        prospectiveEndingScopeBindings: [endingBinding(0)],
+      });
+      const result = fixture.store.execute(
+        fixture.envelope,
+        (transaction) => fixture.service.record(transaction, fixture.semantic),
+      );
+      assert.equal(result.deduplicated, false, scope.name);
+      assert.equal(
+        fixture.connection.prepare(`
+          SELECT count(*) AS count
+          FROM session_evidence_coverage
+          WHERE session_id = $sessionId
+        `).get({ $sessionId: childSessionId })!.count,
+        1n,
+        scope.name,
       );
     }
   });
 
-  it("commits evidence event transition aggregate and ordinals atomically", () => {
+  it("rejects wrong ancestry role and stale generation before provider work or effects", () => {
+    const childSessionId = indexedUuid(921_001);
+    const semantic = command({ sessionId: childSessionId as never });
+    const validEnvelopeAuthorization = evidenceAuthorization({
+      authorizationSessionId: SESSION_ID,
+      targetSessionId: childSessionId,
+    });
+    const cases = [
+      {
+        name: "wrong-parent",
+        semantic,
+        seedChildSessionId: childSessionId,
+        authorization: validEnvelopeAuthorization,
+        envelopeAuthorization: validEnvelopeAuthorization,
+        authorizationAuthority: targetAuthority(),
+        targetAuthority: targetAuthority({
+          sessionId: childSessionId,
+          sessionKind: "child",
+          parentSessionId: indexedUuid(921_002),
+          ownerGeneration: null,
+          childCapabilityGeneration: 1n,
+        }),
+        expectedCode: "INTEGRITY_FAILURE",
+      },
+      {
+        name: "wrong-role",
+        semantic: command(),
+        authorization: evidenceAuthorization({
+          actorRole: "untrusted",
+          clientInstanceId: "wrong-role-client",
+        }),
+        envelopeAuthorization: evidenceAuthorization(),
+        authorizationAuthority: targetAuthority(),
+        targetAuthority: targetAuthority(),
+        expectedCode: "SESSION_CAPABILITY_INVALID",
+      },
+      {
+        name: "stale-generation",
+        semantic: command(),
+        authorization: evidenceAuthorization(),
+        envelopeAuthorization: evidenceAuthorization(),
+        authorizationAuthority: targetAuthority(),
+        targetAuthority: targetAuthority(),
+        freshCapabilityGeneration: "2",
+        envelopeCapabilityGeneration: "1",
+        expectedCode: "SESSION_CAPABILITY_INVALID",
+      },
+    ];
+    for (const testCase of cases) {
+      const fixture = realEvidenceStoreFixture({
+        semantic: testCase.semantic,
+        seedChildSessionId: testCase.seedChildSessionId,
+        authorization: testCase.authorization,
+        envelopeAuthorization: testCase.envelopeAuthorization,
+        authorizationAuthority: testCase.authorizationAuthority,
+        targetAuthority: testCase.targetAuthority,
+        targetAggregate: targetAggregate(testCase.targetAuthority),
+        freshCapabilityGeneration: testCase.freshCapabilityGeneration,
+        envelopeCapabilityGeneration: testCase.envelopeCapabilityGeneration,
+      });
+      const before = atomicStoreState(fixture.connection);
+      assert.throws(
+        () => fixture.store.execute(
+          fixture.envelope,
+          (transaction) => fixture.service.record(transaction, fixture.semantic),
+        ),
+        (error: unknown) => (error as { code?: string }).code === testCase.expectedCode,
+        testCase.name,
+      );
+      assert.deepEqual(fixture.recorder.calls, {
+        currentKey: 0,
+        status: 0,
+        fingerprint: 0,
+      }, testCase.name);
+      assert.deepEqual(atomicStoreState(fixture.connection), before, testCase.name);
+    }
+  });
+
+  it("rolls back conflicting proof intent and replays exactly without provider work", () => {
+    const first = realEvidenceStoreFixture();
+    first.store.execute(
+      first.envelope,
+      (transaction) => first.service.record(transaction, first.semantic),
+    );
+    const committed = atomicStoreState(first.connection);
+    const providerAfterCommit = { ...first.recorder.calls };
+    const replay = first.store.execute(first.envelope, () => {
+      throw new Error("exact replay must not enter the semantic callback");
+    });
+    assert.equal(replay.deduplicated, true);
+    assert.deepEqual(first.recorder.calls, providerAfterCommit);
+    assert.deepEqual(atomicStoreState(first.connection), committed);
+
+    const conflictingAuthorization = evidenceAuthorization({
+      proofDigest: "e".repeat(64),
+    });
+    const conflicting = realEvidenceStoreFixture({
+      repositoryConnection: first.connection,
+      seed: false,
+      authorization: conflictingAuthorization,
+      envelopeAuthorization: conflictingAuthorization,
+      streamVersion: 2n,
+      eventPosition: 2n,
+      eventIdStart: 970_000,
+    });
+    assert.throws(
+      () => conflicting.store.execute(
+        conflicting.envelope,
+        (transaction) => conflicting.service.record(transaction, conflicting.semantic),
+      ),
+      (error: unknown) => (error as { code?: string }).code === "IDEMPOTENCY_CONFLICT",
+    );
+    assert.deepEqual(conflicting.recorder.calls, {
+      currentKey: 0,
+      status: 0,
+      fingerprint: 0,
+    });
+    assert.deepEqual(atomicStoreState(first.connection), committed);
+  });
+
+  it("constructs one coverage-only service effect from a detached prepared payload", () => {
     const serviceContext = {
       binding: {
         projectId: PROJECT_ID,
@@ -791,7 +2000,9 @@ describe("evidence coverage repository", () => {
       correlationId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
       ownerGeneration: 1,
     } as never;
+    const preparedHandle = Symbol("test-prepared-evidence-coverage");
     const prepared = {
+      handle: preparedHandle,
       sessionId: SESSION_ID,
       adapterSessionId: ADAPTER_ID,
       eventPayload: {
@@ -826,11 +2037,18 @@ describe("evidence coverage repository", () => {
       coverage: {
         prepareBatch: () => prepared,
         persistPrepared: (...input: unknown[]) => { persisted.push(input); },
+        assertEvidenceWindowWritable: () => undefined,
+        assertQuickHealthy: () => undefined,
+        registerAffectedExistingSessions: () => undefined,
+        assertVersion1Eligible: () => undefined,
+        snapshotV2: () => { throw new Error("not used"); },
+        minimumCheckpointUpperBound: () => 0,
+        minimumFinalEndingScopeBindingsUpperBound: () => 0,
       },
       workflows: {},
       validation: {},
       outbox: {},
-    } as LifecycleCommandTransaction;
+    } as unknown as LifecycleCommandTransaction;
     const service = new EvidenceCoverageService({
       invocationScope: {
         current: () => ({
@@ -885,8 +2103,54 @@ describe("evidence coverage repository", () => {
       storedResponse: {} as never,
       responseHash: H64,
     }, transaction);
-    assert.deepEqual(persisted, [[prepared, committed]]);
+    assert.deepEqual(persisted, [[preparedHandle, committed]]);
   });
+
+  it("rejects every command-authored prepared payload drift before append or result", () => {
+    const cases: readonly [
+      string,
+      (payload: Record<string, unknown>) => void,
+    ][] = [
+      ["adapter", (payload) => {
+        payload.adapterSessionId = indexedUuid(930_001);
+      }],
+      ["batch ordinals", (payload) => {
+        payload.batchFirstOrdinal = "6";
+        payload.batchLastOrdinal = "6";
+        payload.coverageLastOrdinal = "6";
+        payload.missingIntervals = [{ firstOrdinal: "0", lastOrdinal: "5" }];
+        payload.frames = [{
+          ...command().frames[0]!,
+          ordinal: "6",
+        }];
+      }],
+      ["frames", (payload) => {
+        payload.frames = [{
+          ...command().frames[0]!,
+          contentFingerprint: "e".repeat(64),
+        }];
+      }],
+      ["key profile", (payload) => {
+        payload.frameFingerprintKeyId = "other-key";
+        payload.coverageFingerprintKeyId = "other-key";
+      }],
+    ];
+
+    for (const [name, mutate] of cases) {
+      const payload = JSON.parse(
+        JSON.stringify(validPreparedEventPayload()),
+      ) as Record<string, unknown>;
+      mutate(payload);
+      const fixture = directEvidenceServiceFixture(payload);
+      assert.throws(
+        fixture.record,
+        (error: unknown) => (error as { code?: string }).code === "INTEGRITY_FAILURE",
+        name,
+      );
+      assert.equal(fixture.persistCalls(), 0, name);
+    }
+  });
+
   it("prepares a deeply frozen authenticated first batch with exact provider framing", () => {
     const connection = database();
     const recorder = providerRecorder();
@@ -1256,6 +2520,36 @@ describe("evidence coverage repository", () => {
     assert.equal(recorder.calls.fingerprint, callsBeforeZeroNew.fingerprint);
     assert.equal(zeroNew.eventPayload.coverageFingerprint, second.eventPayload.coverageFingerprint);
     assert.deepEqual(zeroNew.newFrames, []);
+    repository.persistPrepared(
+      connection,
+      zeroNew,
+      storedEvent(
+        connection,
+        zeroNew.eventPayload as unknown as Readonly<Record<string, unknown>>,
+        {
+          globalPosition: 3n,
+          eventId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb3",
+          commandId: zeroNewCommand.commandId,
+          idempotencyKey: zeroNewCommand.idempotencyKey,
+          streamVersion: 3n,
+        },
+      ),
+    );
+    const latest = connection.prepare(`
+      SELECT latest_batch_id, latest_batch_event_position
+      FROM session_evidence_coverage
+      WHERE project_id = $projectId
+        AND session_id = $sessionId
+        AND adapter_session_id = $adapterSessionId
+    `).get({
+      $projectId: PROJECT_ID,
+      $sessionId: SESSION_ID,
+      $adapterSessionId: ADAPTER_ID,
+    });
+    assert.deepEqual({ ...latest }, {
+      latest_batch_id: zeroNewCommand.batchId,
+      latest_batch_event_position: 3n,
+    });
 
     const callsBeforeContradiction = { ...recorder.calls };
     assert.throws(
