@@ -2678,6 +2678,88 @@ describe("evidence coverage repository", () => {
     }
   });
 
+  it("projects a live child checkpoint recorded after its authority event into evidence ending scope", () => {
+    const childSessionId = indexedUuid(920_002);
+    const checkpointId = indexedUuid(920_003);
+    const fixture = realEvidenceStoreFixture({ seedChildSessionId: childSessionId });
+    const checkpoint = checkpointFixture({
+      checkpointId: checkpointId as never,
+      sessionId: childSessionId as never,
+      parentSessionId: SESSION_ID as never,
+      baseEventPosition: "2",
+      checkpointEventPosition: "3",
+    });
+    const checkpointFingerprint = createHash("sha256")
+      .update("project-memory/checkpoint/v1\n", "utf8")
+      .update(canonicalJson(checkpoint), "utf8")
+      .digest("hex");
+    rawLifecycleSessionEvent(fixture.connection, lifecycleEvent(
+      2,
+      "SessionCheckpointRecorded",
+      {
+        checkpoint,
+        baseEventPosition: "2",
+        checkpointEventPosition: "3",
+      },
+      {
+        projectId: PROJECT_ID as never,
+        vaultId: VAULT_ID as never,
+        storeId: STORE_ID as never,
+        workspaceId: "c".repeat(64) as never,
+        sessionId: childSessionId as never,
+        parentSessionId: SESSION_ID as never,
+        streamId: `session/${childSessionId}`,
+        streamVersion: 2,
+        globalPosition: 3,
+      },
+    ));
+    fixture.connection.prepare(`
+      UPDATE streams
+      SET current_version = 2,
+          updated_at = $updatedAt
+      WHERE project_id = $projectId
+        AND stream_id = $streamId
+    `).run({
+      $updatedAt: NOW,
+      $projectId: PROJECT_ID,
+      $streamId: `session/${childSessionId}`,
+    });
+    fixture.connection.prepare(`
+      UPDATE session_authority
+      SET latest_checkpoint_id = $checkpointId,
+          latest_checkpoint_event_position = 3,
+          latest_checkpoint_fingerprint = $checkpointFingerprint,
+          updated_at = $updatedAt
+      WHERE project_id = $projectId
+        AND session_id = $sessionId
+    `).run({
+      $checkpointId: checkpointId,
+      $checkpointFingerprint: checkpointFingerprint,
+      $updatedAt: NOW,
+      $projectId: PROJECT_ID,
+      $sessionId: childSessionId,
+    });
+
+    const result = fixture.store.execute(
+      fixture.envelope,
+      (transaction) => fixture.service.record(transaction, fixture.semantic),
+    );
+
+    assert.equal(result.deduplicated, false);
+    assert.deepEqual(fixture.preparedEndingScopeBindings, [[{
+      bindingVersion: 1,
+      bindingKind: "current-child",
+      childSessionId,
+      childState: "active",
+      lastEventPosition: "3",
+      streamVersion: "2",
+      checkpointId,
+      checkpointEventPosition: "3",
+      transferTicketId: null,
+      transferTicketEventPosition: null,
+    }]]);
+  });
+
   it("derives retained tickets, excludes claimed tickets, and rejects provenance tampering without effects", () => {
     const retained = realEvidenceStoreFixture();
     const retainedFacts = seedTransferredChildTicket(retained.connection);

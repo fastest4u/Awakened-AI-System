@@ -731,7 +731,7 @@ export class SessionAuthorityRepository {
             child.latest_checkpoint_id IS NOT NULL
             AND child.latest_checkpoint_event_position IS NOT NULL
             AND child.latest_checkpoint_fingerprint IS NOT NULL
-            AND child.latest_checkpoint_event_position <= child.authority_event_position
+            AND child.latest_checkpoint_event_position <= head_event.global_position
             AND checkpoint_event.project_id = child.project_id
             AND checkpoint_event.global_position = child.latest_checkpoint_event_position
             AND checkpoint_event.stream_id = child.stream_id
