@@ -245,3 +245,84 @@ export interface ChildTransferTicketRecord {
   readonly claimedEventPosition: bigint | null;
   readonly claimedAtMs: bigint | null;
 }
+
+export interface EvidenceCoverageStorageInterval {
+  readonly firstOrdinal: bigint;
+  readonly lastOrdinal: bigint;
+}
+
+export interface EvidenceCoverageAggregateRecord {
+  readonly projectId: string;
+  readonly sessionId: string;
+  readonly adapterSessionId: string;
+  readonly captureMode: "coverage-only";
+  readonly firstOrdinal: 0n;
+  readonly lastOrdinal: bigint;
+  /** SQLite stores the public `null` sentinel as `-1`. */
+  readonly highestContiguousOrdinal: bigint;
+  readonly missingIntervals: readonly EvidenceCoverageStorageInterval[];
+  readonly frameFingerprintAlgorithm: "hmac-sha256";
+  readonly frameFingerprintSchemaVersion: 1;
+  readonly frameFingerprintKeyId: string;
+  readonly frameFingerprintDomain: "pm-evidence-frame-v1";
+  readonly coverageFingerprintAlgorithm: "hmac-sha256";
+  readonly coverageFingerprintSchemaVersion: 1;
+  readonly coverageFingerprintKeyId: string;
+  readonly coverageFingerprintDomain: "pm-evidence-coverage-v1";
+  readonly coverageFingerprint: string;
+  readonly latestBatchId: string;
+  readonly latestBatchEventPosition: bigint;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+}
+
+export interface EvidenceCoverageTransitionRecord {
+  readonly projectId: string;
+  readonly sessionId: string;
+  readonly adapterSessionId: string;
+  readonly batchId: string;
+  readonly batchEventPosition: bigint;
+  readonly batchFirstOrdinal: bigint;
+  readonly batchLastOrdinal: bigint;
+  readonly coverageFirstOrdinal: 0n;
+  readonly coverageLastOrdinal: bigint;
+  readonly highestContiguousOrdinal: bigint;
+  readonly missingIntervals: readonly EvidenceCoverageStorageInterval[];
+  readonly frameFingerprintAlgorithm: "hmac-sha256";
+  readonly frameFingerprintSchemaVersion: 1;
+  readonly frameFingerprintKeyId: string;
+  readonly frameFingerprintDomain: "pm-evidence-frame-v1";
+  readonly previousCoverageFingerprint: string | null;
+  readonly coverageFingerprintAlgorithm: "hmac-sha256";
+  readonly coverageFingerprintSchemaVersion: 1;
+  readonly coverageFingerprintKeyId: string;
+  readonly coverageFingerprintDomain: "pm-evidence-coverage-v1";
+  readonly coverageFingerprint: string;
+  readonly newFrameCount: number;
+  readonly captureMode: "coverage-only";
+  readonly contentRetained: false;
+  readonly createdAt: string;
+}
+
+export interface EvidenceFingerprintRecord {
+  readonly projectId: string;
+  readonly sessionId: string;
+  readonly adapterSessionId: string;
+  readonly ordinal: bigint;
+  readonly frameId: string;
+  readonly sourceKind:
+    | "model-turn"
+    | "tool-request"
+    | "tool-result"
+    | "adapter-event"
+    | "external-observation";
+  readonly observedAt: string;
+  readonly fingerprintAlgorithm: "hmac-sha256";
+  readonly fingerprintSchemaVersion: 1;
+  readonly fingerprintKeyId: string;
+  readonly fingerprintDomain: "pm-evidence-frame-v1";
+  readonly fingerprintValue: string;
+  readonly batchId: string;
+  readonly recordedEventPosition: bigint;
+  readonly createdAt: string;
+}
