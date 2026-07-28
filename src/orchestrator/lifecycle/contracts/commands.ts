@@ -276,6 +276,10 @@ export interface EvidenceCoverageFrameV1 {
   readonly contentFingerprint: string;
 }
 
+const EVIDENCE_FRAME_FINGERPRINT_SCHEMA_VERSION = 1 as const;
+const EVIDENCE_FRAME_FINGERPRINT_DOMAIN = "pm-evidence-frame-v1" as const;
+const EVIDENCE_REDACTION_STATUS = "content-not-retained" as const;
+
 export interface RecordEvidenceBatchCommandV2 extends LifecycleCommandBase {
   readonly commandType: "record-evidence-batch";
   readonly adapterSessionId: AdapterSessionId;
@@ -963,9 +967,9 @@ export function decodeLifecycleSemanticCommandDraft(value: unknown): LifecycleSe
         "frames",
       ]);
       if (
-        command.fingerprintSchemaVersion !== 1
-        || command.fingerprintDomain !== "pm-evidence-frame-v1"
-        || command.redactionStatus !== "content-not-retained"
+        command.fingerprintSchemaVersion !== EVIDENCE_FRAME_FINGERPRINT_SCHEMA_VERSION
+        || command.fingerprintDomain !== EVIDENCE_FRAME_FINGERPRINT_DOMAIN
+        || command.redactionStatus !== EVIDENCE_REDACTION_STATUS
       ) invalid("recordEvidenceBatch");
       const firstOrdinal = parseDecimalString(command.firstOrdinal, "firstOrdinal");
       const lastOrdinal = parseDecimalString(command.lastOrdinal, "lastOrdinal");
@@ -990,10 +994,10 @@ export function decodeLifecycleSemanticCommandDraft(value: unknown): LifecycleSe
         sessionId: parseLifecycleId<SessionId>(command.sessionId, "sessionId"),
         firstOrdinal,
         lastOrdinal,
-        fingerprintSchemaVersion: 1,
+        fingerprintSchemaVersion: EVIDENCE_FRAME_FINGERPRINT_SCHEMA_VERSION,
         fingerprintKeyId: parseBoundedString(command.fingerprintKeyId, "fingerprintKeyId", 128),
-        fingerprintDomain: "pm-evidence-frame-v1",
-        redactionStatus: "content-not-retained",
+        fingerprintDomain: EVIDENCE_FRAME_FINGERPRINT_DOMAIN,
+        redactionStatus: EVIDENCE_REDACTION_STATUS,
         frames: Object.freeze(frames),
       });
     }

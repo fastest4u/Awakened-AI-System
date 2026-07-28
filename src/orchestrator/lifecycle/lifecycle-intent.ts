@@ -60,6 +60,31 @@ export interface LifecycleIntentInputV1 {
   readonly internalPlannedWorkId: string | null;
 }
 
+export function assertEvidenceLifecycleIntentAuthorizationV1(
+  authorization: LifecycleIntentAuthorizationV1,
+  targetSessionId: string,
+): void {
+  const self = authorization.authorizationSessionId === targetSessionId;
+  if (
+    authorization.authorizationKind !== "protected"
+    || authorization.targetSessionId !== targetSessionId
+    || authorization.authorizationSessionId === null
+    || authorization.capabilityGeneration === null
+    || authorization.internalWorkflowId !== null
+    || authorization.internalWorkflowGeneration !== null
+    || authorization.internalPlannedWorkId !== null
+    || authorization.targetActorRole !== authorization.presentingActorRole
+    || authorization.targetClientInstanceId !== authorization.presentingClientInstanceId
+    || (
+      authorization.presentingActorRole === "primary"
+        ? authorization.capabilityKind !== "root-session-handle"
+        : authorization.presentingActorRole === "untrusted"
+          ? !self || authorization.capabilityKind !== "child-session-handle"
+          : true
+    )
+  ) invalid();
+}
+
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const HASH = /^[0-9a-f]{64}$/;
 const DECIMAL = /^(0|[1-9][0-9]*)$/;

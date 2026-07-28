@@ -26,6 +26,7 @@ import {
 } from "../src/orchestrator/lifecycle/lifecycle-command.store.js";
 import type {
   InternalWorkflowPhaseCommand,
+  RecordEvidenceBatchCommandV2,
   RecordCheckpointCommandV2,
   RecordCheckpointCommandV3,
   RootResumeCommandV2,
@@ -471,7 +472,16 @@ function transaction(connection: TransactionConnection): LifecycleCommandTransac
     leases: { stage },
     approvals: { stage },
     transfers: { stage },
-    coverage: { stage },
+    coverage: {
+      assertEvidenceWindowWritable: () => undefined,
+      assertQuickHealthy: () => undefined,
+      assertVersion1Eligible: () => undefined,
+      prepareBatch: () => { throw new Error("not used"); },
+      persistPrepared: () => undefined,
+      snapshotV2: () => { throw new Error("not used"); },
+      minimumCheckpointUpperBound: () => 0,
+      minimumFinalEndingScopeBindingsUpperBound: () => 0,
+    },
     workflows: { stage },
     validation: { stage },
     outbox: { stage },
@@ -496,6 +506,80 @@ function isLifecycleInputInvalid(error: unknown): boolean {
 }
 
 describe("LifecycleCommandStore", () => {
+  it("returns replay before window health provider or repository access", () => {
+    const evidenceCommand: RecordEvidenceBatchCommandV2 = {
+      commandType: "record-evidence-batch",
+      commandId: SEMANTIC_COMMAND.commandId,
+      idempotencyKey: SEMANTIC_COMMAND.idempotencyKey,
+      agentId: SEMANTIC_COMMAND.agentId,
+      expectedProjectId: CONTEXT.binding.projectId,
+      expectedVaultId: CONTEXT.binding.vaultId,
+      expectedWorkspaceId: CONTEXT.binding.workspaceId,
+      expectedBranchRef: null,
+      adapterSessionId: "00000000-0000-4000-8000-000000000030" as never,
+      batchId: "00000000-0000-4000-8000-000000000031" as never,
+      sessionId: SEMANTIC_COMMAND.sessionId as never,
+      firstOrdinal: "0",
+      lastOrdinal: "0",
+      fingerprintSchemaVersion: 1,
+      fingerprintKeyId: "evidence-key-1",
+      fingerprintDomain: "pm-evidence-frame-v1",
+      redactionStatus: "content-not-retained",
+      frames: [{
+        frameId: "00000000-0000-4000-8000-000000000032" as never,
+        ordinal: "0",
+        sourceKind: "tool-result",
+        observedAt: NOW,
+        contentFingerprint: "a".repeat(64),
+      }],
+    };
+    const built = buildLifecycleIntentWitness(evidenceCommand, {
+      ...INTENT_WITNESS.witness.persistedAssertions,
+      targetSessionId: evidenceCommand.sessionId,
+    });
+    const evidenceEnvelope = envelope({
+      commandType: evidenceCommand.commandType,
+      semanticCommand: evidenceCommand,
+      candidateIntentHash: built.intentHash,
+      authoritativeIntentHash: built.intentHash,
+    });
+    const order: string[] = [];
+    const connection = new TransactionConnection();
+    const events = new FakeEvents(connection);
+    const store = new LifecycleCommandStore({
+      connection,
+      events,
+      transaction: () => {
+        const tx = transaction(connection);
+        return {
+          ...tx,
+          coverage: {
+            ...tx.coverage,
+            assertEvidenceWindowWritable: () => { order.push("window"); },
+            assertQuickHealthy: () => { order.push("health"); },
+          },
+        };
+      },
+      now: () => NOW,
+    });
+
+    store.execute(evidenceEnvelope, () => {
+      order.push("callback");
+      return {
+        append: { ...appendCommand(), commandType: evidenceCommand.commandType },
+        authorizationRecord: authorization(),
+        afterAppend: () => undefined,
+      };
+    });
+    assert.deepEqual(order, ["window", "health", "callback"]);
+
+    events.replay = replayResult();
+    order.length = 0;
+    store.execute(evidenceEnvelope, () => {
+      throw new Error("replay must not enter fresh work");
+    });
+    assert.deepEqual(order, []);
+  });
   it("constructs typed store errors without redefining the base sanitized details", () => {
     const error = new LifecycleCommandStoreError("COMMAND_OUTCOME_UNKNOWN", {
       commandId: SEMANTIC_COMMAND.commandId,

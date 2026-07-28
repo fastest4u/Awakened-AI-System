@@ -1009,7 +1009,7 @@ const LIFECYCLE_EVENT_TYPES_V2 = [
   "SessionEndAmended",
 ] as const;
 
-function decodeEvidenceCoverageRecordedV2(value: unknown): EvidenceCoverageRecordedV2 {
+export function decodeEvidenceCoverageRecordedV2(value: unknown): EvidenceCoverageRecordedV2 {
   const payload = exactRecord(value, [
     "adapterSessionId",
     "batchId",

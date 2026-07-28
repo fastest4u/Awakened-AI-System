@@ -17,7 +17,20 @@ import {
   matchesLifecycleReplayAuthorization,
 } from "../storage/event-append-transaction.js";
 import type { SqliteConnection } from "../storage/sqlite-driver.js";
+import type {
+  EvidenceCoverageBatchInput,
+  PreparedEvidenceCoverageBatch,
+} from "../storage/evidence-coverage.repository.js";
+import { EvidenceCoverageRepository } from "../storage/evidence-coverage.repository.js";
 import { canonicalJson } from "../serialization/canonical-json.js";
+import type { StoredEvent } from "../contracts/event.js";
+import type {
+  MinimumCheckpointCapacityInput,
+  MinimumEndingScopeCapacityInput,
+} from "./checkpoint-capacity.js";
+import type { CheckpointEvidenceCoverageV2 } from "./contracts/checkpoint.js";
+import type { SessionId } from "./contracts/identifiers.js";
+import { decodeFinalEndingScopeBindingsV1 } from "./contracts/session-end.js";
 import type {
   InternalWorkflowSemanticCommand,
   LifecycleSemanticCommandDraft,
@@ -53,7 +66,24 @@ export interface ConnectionBoundSessionAuthority {}
 export interface ConnectionBoundSessionLeases {}
 export interface ConnectionBoundLifecycleApprovals {}
 export interface ConnectionBoundChildTransfers {}
-export interface ConnectionBoundEvidenceCoverage {}
+export interface ConnectionBoundEvidenceCoverage {
+  assertEvidenceWindowWritable?(sessionId: SessionId): void;
+  assertQuickHealthy?(sessionIds: readonly SessionId[]): void;
+  assertVersion1Eligible?(sessionIds: readonly SessionId[]): void;
+  prepareBatch?(input: EvidenceCoverageBatchInput): PreparedEvidenceCoverageBatch;
+  persistPrepared?(
+    prepared: PreparedEvidenceCoverageBatch,
+    committedEvent: StoredEvent,
+  ): void;
+  snapshotV2?(
+    sessionId: SessionId,
+    baseEventPosition: bigint,
+  ): CheckpointEvidenceCoverageV2;
+  minimumCheckpointUpperBound?(input: MinimumCheckpointCapacityInput): number;
+  minimumFinalEndingScopeBindingsUpperBound?(
+    input: MinimumEndingScopeCapacityInput,
+  ): number;
+}
 export interface ConnectionBoundSessionEndWorkflows {}
 export interface ConnectionBoundValidationResults {}
 export interface ConnectionBoundLifecycleOutbox {}
@@ -123,10 +153,177 @@ export interface LifecycleCommandStoreOptions {
   readonly events: LifecycleEventAppendPort;
   /** Facade capabilities must be explicit own data properties; prototypes/accessors are excluded. */
   readonly transaction: (connection: SqliteConnection) => LifecycleCommandTransaction;
+  /** Optional schema-3 coverage repository; kept production-unwired until lifecycle V2 routing lands. */
+  readonly evidenceCoverageRepository?: EvidenceCoverageRepository;
   readonly now?: () => string;
   readonly authorityMaterialStatus?: (
     authorization: PersistedLifecycleAuthorizationRecord,
   ) => AuthorityMaterialStatus;
+}
+
+const PREFINAL_SESSION_END_PHASES = new Set([
+  "requested",
+  "children-resolved",
+]);
+
+function storageIntegrity(): never {
+  throw new LifecycleCommandStoreError("INTEGRITY_FAILURE");
+}
+
+function rowString(row: Readonly<Record<string, unknown>>, field: string): string {
+  const value = row[field];
+  if (typeof value !== "string") return storageIntegrity();
+  return value;
+}
+
+function rowBigint(row: Readonly<Record<string, unknown>>, field: string): bigint {
+  const value = row[field];
+  if (typeof value === "bigint") return value;
+  if (typeof value === "number" && Number.isSafeInteger(value)) return BigInt(value);
+  return storageIntegrity();
+}
+
+function nullableRowBigint(
+  row: Readonly<Record<string, unknown>>,
+  field: string,
+): bigint | null {
+  return row[field] === null ? null : rowBigint(row, field);
+}
+
+function nullableRowString(
+  row: Readonly<Record<string, unknown>>,
+  field: string,
+): string | null {
+  return row[field] === null ? null : rowString(row, field);
+}
+
+function assertEvidenceWindowWritable(
+  connection: SqliteConnection,
+  sessionId: SessionId,
+): void {
+  const identity = connection.prepare(`
+    SELECT project_id
+    FROM project_meta
+    WHERE singleton = 1
+  `).get();
+  if (identity === undefined) return storageIntegrity();
+  const projectId = rowString(identity, "project_id");
+  const authority = connection.prepare(`
+    SELECT session_kind, parent_session_id
+    FROM session_authority
+    WHERE project_id = $projectId
+      AND session_id = $sessionId
+  `).get({
+    $projectId: projectId,
+    $sessionId: sessionId,
+  });
+  if (authority === undefined) throw new LifecycleError("SESSION_NOT_FOUND");
+  const kind = rowString(authority, "session_kind");
+  const parentSessionId = nullableRowString(authority, "parent_session_id");
+  const rootSessionId = kind === "root" && parentSessionId === null
+    ? sessionId
+    : kind === "child" && parentSessionId !== null
+      ? parentSessionId
+      : storageIntegrity();
+  const workflow = connection.prepare(`
+    SELECT workflow_type, generation, phase, session_id,
+      evidence_frozen_checkpoint_event_position,
+      evidence_frozen_generation,
+      evidence_window_state,
+      final_ending_scope_bindings_json
+    FROM workflow_instances
+    WHERE project_id = $projectId
+      AND workflow_id = $workflowId
+  `).get({
+    $projectId: projectId,
+    $workflowId: `session-end/${rootSessionId}`,
+  });
+  if (workflow === undefined) return;
+  const workflowType = rowString(workflow, "workflow_type");
+  const generation = rowBigint(workflow, "generation");
+  const phase = rowString(workflow, "phase");
+  const workflowSessionId = nullableRowString(workflow, "session_id");
+  const windowState = nullableRowString(workflow, "evidence_window_state");
+  const frozenPosition = nullableRowBigint(
+    workflow,
+    "evidence_frozen_checkpoint_event_position",
+  );
+  const frozenGeneration = nullableRowBigint(workflow, "evidence_frozen_generation");
+  const bindingsJson = nullableRowString(workflow, "final_ending_scope_bindings_json");
+  if (
+    workflowType !== "session-end"
+    || generation < 1n
+    || workflowSessionId !== rootSessionId
+    || (windowState !== "open" && windowState !== "sealed")
+  ) return storageIntegrity();
+  const nullGroup = frozenPosition === null
+    && frozenGeneration === null
+    && bindingsJson === null;
+  const completeGroup = frozenPosition !== null
+    && frozenGeneration !== null
+    && bindingsJson !== null;
+  if (!nullGroup && !completeGroup) return storageIntegrity();
+  if (bindingsJson !== null) {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(bindingsJson) as unknown;
+    } catch {
+      return storageIntegrity();
+    }
+    let bindings;
+    try {
+      bindings = decodeFinalEndingScopeBindingsV1(parsed);
+    } catch {
+      return storageIntegrity();
+    }
+    if (
+      canonicalJson(bindings) !== bindingsJson
+      || frozenPosition === null
+      || frozenPosition < 1n
+      || frozenGeneration !== generation
+    ) return storageIntegrity();
+    const checkpoint = connection.prepare(`
+      SELECT event_type, event_schema_version, session_id
+      FROM events
+      WHERE global_position = $globalPosition
+    `).get({ $globalPosition: frozenPosition });
+    if (
+      checkpoint === undefined
+      || checkpoint.event_type !== "SessionCheckpointRecorded"
+      || rowBigint(checkpoint, "event_schema_version") !== 2n
+      || checkpoint.session_id !== rootSessionId
+    ) return storageIntegrity();
+  }
+  if (phase === "cancelled") {
+    if (windowState !== "sealed" || !nullGroup) return storageIntegrity();
+    return;
+  }
+  if (completeGroup) throw new LifecycleError("SESSION_END_EVIDENCE_FROZEN");
+  if (PREFINAL_SESSION_END_PHASES.has(phase)) return;
+  return storageIntegrity();
+}
+
+export function connectionBoundEvidenceCoverage(
+  connection: SqliteConnection,
+  repository: EvidenceCoverageRepository,
+): Required<ConnectionBoundEvidenceCoverage> {
+  return Object.freeze({
+    assertEvidenceWindowWritable: (sessionId) =>
+      assertEvidenceWindowWritable(connection, sessionId),
+    assertQuickHealthy: (sessionIds) =>
+      repository.assertQuickHealthy(connection, sessionIds),
+    assertVersion1Eligible: (sessionIds) =>
+      repository.assertVersion1Eligible(connection, sessionIds),
+    prepareBatch: (input) => repository.prepareBatch(connection, input),
+    persistPrepared: (prepared, event) =>
+      repository.persistPrepared(connection, prepared, event),
+    snapshotV2: (sessionId, baseEventPosition) =>
+      repository.snapshotV2(connection, sessionId, baseEventPosition),
+    minimumCheckpointUpperBound: (input) =>
+      repository.minimumCheckpointUpperBound(connection, input),
+    minimumFinalEndingScopeBindingsUpperBound: (input) =>
+      repository.minimumFinalEndingScopeBindingsUpperBound(connection, input),
+  });
 }
 
 export class LifecycleCommandStoreError extends LifecycleError {
@@ -638,10 +835,71 @@ function assertCommittedMatchesPlan<T extends JsonValue>(
   }
 }
 
+function affectedExistingSessionIds(
+  command: LifecycleSemanticCommandDraft | InternalWorkflowSemanticCommand,
+): readonly SessionId[] {
+  switch (command.commandType) {
+    case "root-start":
+      return Object.freeze([]);
+    case "root-resume":
+      return Object.freeze(command.sessionId === null ? [] : [command.sessionId]);
+    case "root-recovery":
+    case "root-suspend":
+    case "record-checkpoint":
+    case "record-evidence-batch":
+    case "amend-session-end":
+    case "cancel-session-end":
+    case "abandon-session":
+      return Object.freeze([command.sessionId]);
+    case "fork-child":
+      return Object.freeze([command.parentSessionId]);
+    case "amend-child-assignment":
+    case "record-child-report":
+    case "disposition-child-report":
+    case "complete-child-session":
+    case "suspend-child-session":
+    case "create-child-transfer":
+      return Object.freeze([command.parentSessionId, command.childSessionId]);
+    case "propose-child-completion":
+      return Object.freeze([command.childSessionId]);
+    case "claim-child-transfer":
+      return Object.freeze([command.rootSessionId]);
+    case "request-session-end":
+      return Object.freeze([command.request.sessionId]);
+    case "internal-validation-result":
+    case "internal-workflow-phase":
+      return Object.freeze([]);
+  }
+}
+
+function invokeFreshIntegrityGate(
+  envelope: LifecycleCommandEnvelope,
+  transaction: LifecycleCommandTransaction,
+): void {
+  const coverage = transaction.coverage;
+  const affected = affectedExistingSessionIds(envelope.semanticCommand);
+  if (envelope.semanticCommand.commandType === "record-evidence-batch") {
+    if (
+      typeof coverage.assertEvidenceWindowWritable !== "function"
+      || typeof coverage.assertQuickHealthy !== "function"
+    ) {
+      throw new LifecycleCommandStoreError("INTEGRITY_FAILURE");
+    }
+    coverage.assertEvidenceWindowWritable(envelope.semanticCommand.sessionId);
+    coverage.assertQuickHealthy(affected);
+    return;
+  }
+  // Legacy test/runtime assemblies remain production-disabled for Version 2;
+  // when the expanded facade is present, every trusted affected session is
+  // checked centrally before semantic work.
+  if (affected.length > 0) coverage.assertQuickHealthy?.(affected);
+}
+
 export class LifecycleCommandStore {
   readonly #connection: SqliteConnection;
   readonly #events: LifecycleEventAppendPort;
   readonly #transaction: (connection: SqliteConnection) => LifecycleCommandTransaction;
+  readonly #coverageRepository: EvidenceCoverageRepository | undefined;
   readonly #now: () => string;
   readonly #materialStatus: NonNullable<LifecycleCommandStoreOptions["authorityMaterialStatus"]>;
 
@@ -649,6 +907,7 @@ export class LifecycleCommandStore {
     this.#connection = options.connection;
     this.#events = options.events;
     this.#transaction = options.transaction;
+    this.#coverageRepository = options.evidenceCoverageRepository;
     this.#now = options.now ?? (() => new Date().toISOString());
     this.#materialStatus = options.authorityMaterialStatus ?? (() => "unavailable");
   }
@@ -695,7 +954,21 @@ export class LifecycleCommandStore {
 
       this.#events.assertCommandIdentityAvailable(envelope);
       this.#events.assertAppendAllowed();
-      focused = projectCommandTransaction(this.#transaction(this.#connection));
+      const rawTransaction = this.#transaction(this.#connection);
+      focused = projectCommandTransaction(this.#coverageRepository === undefined
+        ? rawTransaction
+        : {
+            ...rawTransaction,
+            coverage: connectionBoundEvidenceCoverage(
+              this.#connection,
+              this.#coverageRepository,
+            ),
+          });
+      invokeSynchronousTransactionCallback(
+        focused,
+        (transaction) => invokeFreshIntegrityGate(envelope, transaction),
+        undefinedCallbackResult,
+      );
       const next = invokeSynchronousTransactionCallback(focused, onNew, snapshotPreparedCommit);
       const resolvedEnvelope = resolveFreshCapabilityGeneration(envelope, next);
       const authorizationFingerprint = integrityFingerprint(next.authorizationRecord);

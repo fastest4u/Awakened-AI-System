@@ -75,6 +75,9 @@ import {
   MAX_SESSION_AMBIGUITY_SUMMARIES,
   type LifecycleErrorCode,
 } from "../src/orchestrator/lifecycle/errors.js";
+import {
+  decodeEvidenceCoverageRecordedResultV2,
+} from "../src/orchestrator/lifecycle/evidence-coverage.service.js";
 
 type RequiredContractSurface = readonly [
   SessionId,
@@ -786,6 +789,50 @@ function semanticCommandCases(): Array<readonly [string, Record<string, unknown>
 }
 
 describe("lifecycle Version 1 contracts", () => {
+  it("strictly decodes only the redacted coverage-only evidence result", () => {
+    const value = {
+      resultVersion: 2,
+      operation: "record-evidence-batch",
+      sessionId: UUIDS.session,
+      adapterSessionId: UUIDS.parent,
+      batchId: UUIDS.report,
+      batchFirstOrdinal: "5",
+      batchLastOrdinal: "5",
+      coverageFirstOrdinal: "0",
+      coverageLastOrdinal: "5",
+      highestContiguousOrdinal: null,
+      missingIntervals: [{ firstOrdinal: "0", lastOrdinal: "4" }],
+      captureMode: "coverage-only",
+      contentRetained: false,
+      eventPosition: "12",
+      finalStreamVersion: "3",
+    };
+    const decoded = decodeEvidenceCoverageRecordedResultV2(value);
+    assert.deepEqual(decoded, value);
+    assert.ok(Object.isFrozen(decoded));
+    assert.ok(Object.isFrozen(decoded.missingIntervals));
+    assert.ok(Object.isFrozen(decoded.missingIntervals[0]));
+    for (const extra of [
+      { coverageFingerprint: "a".repeat(64) },
+      { frameFingerprintKeyId: "key-1" },
+      { frames: [] },
+      { observedAt: "2026-07-14T10:11:12.123Z" },
+      { rawEvidence: "private" },
+    ]) {
+      expectCode("LIFECYCLE_INPUT_INVALID", () =>
+        decodeEvidenceCoverageRecordedResultV2({ ...value, ...extra }));
+    }
+    for (const malformed of [
+      { ...value, resultVersion: 1 },
+      { ...value, highestContiguousOrdinal: "0" },
+      { ...value, batchFirstOrdinal: "6" },
+      { ...value, finalStreamVersion: "0" },
+      { ...value, missingIntervals: [{ firstOrdinal: "0", lastOrdinal: "5" }] },
+    ]) {
+      expectCode("LIFECYCLE_INPUT_INVALID", () =>
+        decodeEvidenceCoverageRecordedResultV2(malformed));
+    }
+  });
   it("exports the complete lifecycle contract type surface", () => {
     const surface = null as unknown as RequiredContractSurface;
     assert.equal(surface, null);

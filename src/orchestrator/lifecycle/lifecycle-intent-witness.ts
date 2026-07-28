@@ -25,6 +25,7 @@ import type { CapabilityKind } from "./authority/capability-key-provider.js";
 import {
   canonicalLifecycleIntentHash,
   canonicalLifecycleIntentPreimage,
+  assertEvidenceLifecycleIntentAuthorizationV1,
   type LifecycleIntentActorRole,
   type LifecycleIntentAuthorizationKind,
   type LifecycleIntentAuthorizationV1,
@@ -580,6 +581,7 @@ function assertExternalSessionBinding(
       return;
     case "record-evidence-batch":
       if (target !== command.sessionId) invalid();
+      assertEvidenceLifecycleIntentAuthorizationV1(assertions, command.sessionId);
       return;
     case "record-child-report":
       if (target !== command.childSessionId
