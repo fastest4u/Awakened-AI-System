@@ -770,6 +770,150 @@ describe("SessionAuthorityRepository fold and checkpoint guards", () => {
     assert.equal(connection.calls[0]?.kind, "get");
   });
 
+  it("resolves an older real SQLite checkpoint after the mutable latest index advances", () => {
+    const connection = new NativeConnection();
+    const repository = new SessionAuthorityRepository();
+    const oldCheckpointId = "22222222-2222-4222-8222-222222222222";
+    const newCheckpointId = "33333333-3333-4333-8333-333333333333";
+    const oldCheckpoint = checkpointFixture({
+      checkpointId: oldCheckpointId as typeof CHECKPOINT_ID,
+      baseEventPosition: 1,
+      checkpointEventPosition: 2,
+    });
+    const newCheckpoint = checkpointFixture({
+      checkpointId: newCheckpointId as typeof CHECKPOINT_ID,
+      baseEventPosition: 2,
+      checkpointEventPosition: 3,
+    });
+    const oldEvent = lifecycleEvent(2, "SessionCheckpointRecorded", {
+      checkpoint: oldCheckpoint,
+      baseEventPosition: "1",
+      checkpointEventPosition: "2",
+    }, {
+      globalPosition: 2,
+      streamVersion: 2,
+      sessionId: ROOT_SESSION_ID,
+      parentSessionId: null,
+    }) as Extract<LifecycleEventV1, { readonly eventType: "SessionCheckpointRecorded" }>;
+    const newEvent = lifecycleEvent(3, "SessionCheckpointRecorded", {
+      checkpoint: newCheckpoint,
+      baseEventPosition: "2",
+      checkpointEventPosition: "3",
+    }, {
+      globalPosition: 3,
+      streamVersion: 3,
+      sessionId: ROOT_SESSION_ID,
+      parentSessionId: null,
+    }) as Extract<LifecycleEventV1, { readonly eventType: "SessionCheckpointRecorded" }>;
+    try {
+      connection.exec(`
+        CREATE TABLE events (
+          global_position INTEGER PRIMARY KEY,
+          event_id TEXT NOT NULL,
+          project_id TEXT NOT NULL,
+          vault_id TEXT NOT NULL,
+          store_id TEXT NOT NULL,
+          workspace_id TEXT NOT NULL,
+          stream_id TEXT NOT NULL,
+          stream_type TEXT NOT NULL,
+          stream_version INTEGER NOT NULL,
+          event_type TEXT NOT NULL,
+          event_schema_version INTEGER NOT NULL,
+          session_id TEXT,
+          parent_session_id TEXT,
+          correlation_id TEXT NOT NULL,
+          causation_id TEXT,
+          command_id TEXT NOT NULL,
+          idempotency_key TEXT NOT NULL,
+          occurred_at TEXT NOT NULL,
+          payload_json TEXT NOT NULL
+        ) STRICT;
+        CREATE TABLE session_authority (
+          project_id TEXT NOT NULL,
+          session_id TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          terminal_event_position INTEGER,
+          latest_checkpoint_id TEXT,
+          latest_checkpoint_event_position INTEGER,
+          latest_checkpoint_fingerprint TEXT,
+          updated_at TEXT NOT NULL,
+          PRIMARY KEY (project_id, session_id)
+        ) STRICT;
+      `);
+      const insertEvent = connection.prepare(`
+        INSERT INTO events (
+          global_position, event_id, project_id, vault_id, store_id, workspace_id,
+          stream_id, stream_type, stream_version, event_type, event_schema_version,
+          session_id, parent_session_id, correlation_id, causation_id, command_id,
+          idempotency_key, occurred_at, payload_json
+        ) VALUES (
+          $global_position, $event_id, $project_id, $vault_id, $store_id, $workspace_id,
+          $stream_id, $stream_type, $stream_version, $event_type, $event_schema_version,
+          $session_id, $parent_session_id, $correlation_id, $causation_id, $command_id,
+          $idempotency_key, $occurred_at, $payload_json
+        )
+      `);
+      insertEvent.run(Object.fromEntries(
+        Object.entries(eventRow(oldEvent)).map(([key, value]) => [`$${key}`, value]),
+      ));
+      insertEvent.run(Object.fromEntries(
+        Object.entries(eventRow(newEvent)).map(([key, value]) => [`$${key}`, value]),
+      ));
+      connection.prepare(`
+        INSERT INTO session_authority (
+          project_id, session_id, created_at, terminal_event_position,
+          latest_checkpoint_id, latest_checkpoint_event_position,
+          latest_checkpoint_fingerprint, updated_at
+        ) VALUES (
+          $projectId, $sessionId, $createdAt, NULL, NULL, NULL, NULL, $updatedAt
+        )
+      `).run({
+        $projectId: PROJECT_ID,
+        $sessionId: ROOT_SESSION_ID,
+        $createdAt: NOW,
+        $updatedAt: NOW,
+      });
+      assert.equal(repository.updateCheckpointIndex(connection, {
+        projectId: PROJECT_ID,
+        sessionId: ROOT_SESSION_ID,
+        expectedLatestCheckpointId: null,
+        expectedLatestCheckpointEventPosition: null,
+        expectedLatestCheckpointFingerprint: null,
+        checkpointId: oldCheckpointId,
+        checkpointEventPosition: 2n,
+        checkpointFingerprint: "a".repeat(64),
+        updatedAt: LATER,
+      }), true);
+      assert.equal(repository.updateCheckpointIndex(connection, {
+        projectId: PROJECT_ID,
+        sessionId: ROOT_SESSION_ID,
+        expectedLatestCheckpointId: oldCheckpointId,
+        expectedLatestCheckpointEventPosition: 2n,
+        expectedLatestCheckpointFingerprint: "a".repeat(64),
+        checkpointId: newCheckpointId,
+        checkpointEventPosition: 3n,
+        checkpointFingerprint: "b".repeat(64),
+        updatedAt: LATER,
+      }), true);
+      const mutableLatest = connection.prepare(`
+        SELECT latest_checkpoint_id, latest_checkpoint_event_position
+        FROM session_authority
+        WHERE project_id = $projectId AND session_id = $sessionId
+      `).get({ $projectId: PROJECT_ID, $sessionId: ROOT_SESSION_ID });
+      assert.equal(mutableLatest?.latest_checkpoint_id, newCheckpointId);
+      assert.equal(mutableLatest?.latest_checkpoint_event_position, 3n);
+
+      assert.deepEqual(repository.requireCheckpointAtEventPosition(connection, {
+        projectId: PROJECT_ID,
+        sessionId: ROOT_SESSION_ID,
+        checkpointId: oldCheckpointId as typeof CHECKPOINT_ID,
+        checkpointEventPosition: 2n,
+      }), oldCheckpoint);
+    } finally {
+      connection.close();
+    }
+  });
+
   it("loads only the indexed latest checkpoint and verifies its domain fingerprint", () => {
     const base = rootAuthority();
     const started = lifecycleEvent(1, "SessionStarted", {}, {

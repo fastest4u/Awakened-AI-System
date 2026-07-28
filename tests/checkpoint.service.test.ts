@@ -5,8 +5,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 
-import type { JsonValue } from "../src/orchestrator/contracts/event.js";
-import type { PersistedLifecycleAuthorizationRecord } from "../src/orchestrator/contracts/event.js";
+import type {
+  AppendCommand,
+  JsonValue,
+  PersistedLifecycleAuthorizationRecord,
+} from "../src/orchestrator/contracts/event.js";
+import { internalPhasePlannedWorkId } from "../src/orchestrator/crypto/event-hash.js";
 import type { ProjectContext } from "../src/orchestrator/identity/contracts.js";
 import {
   decodeCheckpointDraftV1,
@@ -14,18 +18,31 @@ import {
   decodeCheckpointV1,
 } from "../src/orchestrator/lifecycle/contracts/checkpoint.js";
 import type {
+  InternalWorkflowExecutionPlan,
+  InternalWorkflowPhaseCommand,
+  InternalWorkflowPhasePlan,
   RecordCheckpointCommandV2,
   RecordCheckpointCommandV3,
 } from "../src/orchestrator/lifecycle/contracts/commands.js";
 import {
   LifecycleCommandStore,
   type LifecycleCommandEnvelope,
+  type LifecycleCommandTransaction,
   type LifecycleEventAppendPort,
   type PreparedLifecycleCommit,
 } from "../src/orchestrator/lifecycle/lifecycle-command.store.js";
 import { LifecycleError } from "../src/orchestrator/lifecycle/errors.js";
-import { buildLifecycleIntentWitness } from "../src/orchestrator/lifecycle/lifecycle-intent-witness.js";
+import {
+  buildLifecycleIntentWitness,
+  type TrustedLifecycleIntentAssertionsV1,
+} from "../src/orchestrator/lifecycle/lifecycle-intent-witness.js";
 import { canonicalJson } from "../src/orchestrator/serialization/canonical-json.js";
+import type {
+  EventAppendBatch,
+  EventAppendReplay,
+  PlannedEventAppend,
+  PreparedEventAppend,
+} from "../src/orchestrator/storage/event-append-transaction.js";
 import type { SqliteConnection, SqliteStatement } from "../src/orchestrator/storage/sqlite-driver.js";
 import {
   checkpointFixture,
@@ -51,7 +68,7 @@ interface CheckpointServiceLike {
     readonly afterAppend: (committed: unknown, transaction: unknown) => void;
   };
   prepareFinalPhase(transaction: unknown, input: unknown): {
-    readonly action: Readonly<Record<string, unknown>>;
+    readonly action: InternalWorkflowPhaseCommand["action"];
     readonly effect: ReturnType<CheckpointServiceLike["record"]>;
   };
   recordPreparedFinal(
@@ -111,6 +128,8 @@ const CHILD_ID = "44444444-4444-4444-8444-444444444444";
 const COMMAND_ID = "55555555-5555-4555-8555-555555555555";
 const IDEMPOTENCY_KEY = "checkpoint-test/v1";
 const CHECKPOINT_ID = "66666666-6666-4666-8666-666666666666";
+const WORKFLOW_ID = "77777777-7777-4777-8777-777777777777";
+const CLAIM_OWNER_ID = "88888888-8888-4888-8888-888888888888";
 const CREATED_AT = "2026-07-18T01:02:03.004Z";
 
 function draft(): Readonly<Record<string, unknown>> {
@@ -167,6 +186,145 @@ function checkpointCommand(overrides: Readonly<Record<string, unknown>> = {}): R
     draft: draft(),
     ...overrides,
   });
+}
+
+function childCheckpointCommand(
+  overrides: Readonly<Record<string, unknown>> = {},
+): Readonly<Record<string, unknown>> {
+  return checkpointCommand({
+    commandId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    idempotencyKey: "checkpoint-test/child",
+    sessionId: CHILD_ID,
+    expectedStreamVersion: "2",
+    ...overrides,
+  });
+}
+
+function internalFinalCheckpointPlan(
+  checkpointVersion: 1 | 2,
+): InternalWorkflowPhasePlan {
+  const commandId = checkpointVersion === 1
+    ? "99999999-9999-4999-8999-999999999999"
+    : "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  const idempotencyKey = `checkpoint-test/internal-final/v${checkpointVersion}`;
+  const workflowId = WORKFLOW_ID as InternalWorkflowPhasePlan["workflowId"];
+  const plannedWorkId = internalPhasePlannedWorkId({
+    workflowId,
+    workflowGeneration: 1n,
+    sourcePhase: "children-resolved",
+    action: "prepare-final-checkpoint-and-queue-ending",
+    commandId,
+    idempotencyKey,
+  });
+  const plannedAction: InternalWorkflowPhasePlan["plannedAction"] = checkpointVersion === 1
+    ? Object.freeze({
+        action: "prepare-final-checkpoint-and-queue-ending" as const,
+        finalCheckpointDraft: decodeCheckpointDraftV1(draft()),
+        materializationTarget: "memory/final.md",
+      })
+    : Object.freeze({
+        action: "prepare-final-checkpoint-and-queue-ending" as const,
+        finalCheckpointDraft: decodeCheckpointDraftV2(qualifiedDraft()),
+        materializationTarget: "memory/final.md",
+      });
+  return Object.freeze({
+    commandType: "internal-workflow-phase",
+    commandId,
+    idempotencyKey,
+    agentId: "agent-checkpoint",
+    expectedProjectId: PROJECT_ID as InternalWorkflowPhasePlan["expectedProjectId"],
+    expectedVaultId: VAULT_ID as InternalWorkflowPhasePlan["expectedVaultId"],
+    expectedWorkspaceId: WORKSPACE_ID as InternalWorkflowPhasePlan["expectedWorkspaceId"],
+    expectedBranchRef: "refs/heads/current",
+    workflowId,
+    workflowGeneration: 1,
+    sourcePhase: "children-resolved",
+    plannedWorkId,
+    claim: Object.freeze({
+      workflowId,
+      workflowGeneration: 1,
+      claimOwnerId: CLAIM_OWNER_ID,
+      claimToken: "1",
+      claimExpiresAt: "2026-07-18T01:12:03.004Z",
+    }),
+    plannedAction,
+  });
+}
+
+function internalPlanAuthorization(
+  plan: InternalWorkflowPhasePlan,
+): Extract<PersistedLifecycleAuthorizationRecord, { readonly kind: "internal-workflow" }> {
+  const principal = Object.freeze({
+    actorRole: "primary" as const,
+    clientInstanceId: "primary-client",
+  });
+  return {
+    kind: "internal-workflow",
+    workflowId: plan.workflowId,
+    workflowGeneration: BigInt(plan.workflowGeneration),
+    plannedWorkId: plan.plannedWorkId,
+    claimOwnerId: plan.claim.claimOwnerId,
+    claimToken: BigInt(plan.claim.claimToken),
+    authorizationSessionId: ROOT_ID,
+    targetSessionId: ROOT_ID,
+    presenting: principal,
+    target: principal,
+  };
+}
+
+function internalPlanEnvelope(
+  context: ProjectContext,
+  plan: InternalWorkflowPhasePlan,
+): LifecycleCommandEnvelope {
+  const authorization = internalPlanAuthorization(plan);
+  const replayExpectation = {
+    kind: "internal-workflow" as const,
+    workflowId: plan.workflowId,
+    workflowGeneration: BigInt(plan.workflowGeneration),
+    plannedWorkId: plan.plannedWorkId,
+    authorizationSessionId: ROOT_ID,
+    targetSessionId: ROOT_ID,
+    presenting: authorization.presenting,
+    target: authorization.target,
+  };
+  const executionPlan: InternalWorkflowExecutionPlan = plan;
+  const witness = buildLifecycleIntentWitness(executionPlan, internalPlanAssertions(plan));
+  return {
+    context,
+    commandId: plan.commandId,
+    idempotencyKey: plan.idempotencyKey,
+    commandType: plan.commandType,
+    candidateIntentHash: witness.intentHash,
+    authoritativeIntentHash: witness.intentHash,
+    semanticCommand: plan,
+    capabilityKind: null,
+    capabilityGeneration: null,
+    replayExpectation,
+  };
+}
+
+function internalPlanAssertions(
+  plan: InternalWorkflowPhasePlan,
+): TrustedLifecycleIntentAssertionsV1 {
+  return {
+    authorizationKind: "internal-workflow",
+    authorizationSessionId: ROOT_ID,
+    targetSessionId: ROOT_ID,
+    projectId: PROJECT_ID,
+    vaultId: VAULT_ID,
+    storeId: STORE_ID,
+    workspaceId: WORKSPACE_ID,
+    clientNamespace: "tests",
+    capabilityKind: null,
+    capabilityGeneration: null,
+    presentingActorRole: "primary",
+    presentingClientInstanceId: "primary-client",
+    targetActorRole: "primary",
+    targetClientInstanceId: "primary-client",
+    internalWorkflowId: plan.workflowId,
+    internalWorkflowGeneration: plan.workflowGeneration,
+    internalPlannedWorkId: plan.plannedWorkId,
+  };
 }
 
 function contextAndScope(projectRoot: string): {
@@ -243,6 +401,8 @@ interface AuthorityHarness {
     version2Snapshots: unknown[];
     identities: unknown[];
     clocks: unknown[];
+    foldReads: unknown[];
+    childLists: unknown[];
   };
 }
 
@@ -255,6 +415,7 @@ function authorityHarness(options: {
   readonly eligibilityError?: Error;
   readonly snapshotError?: Error;
   readonly snapshot?: Readonly<Record<string, unknown>>;
+  readonly target?: "root" | "child";
 } = {}): AuthorityHarness {
   const calls = {
     checkpointUpdates: [] as unknown[],
@@ -265,6 +426,8 @@ function authorityHarness(options: {
     version2Snapshots: [] as unknown[],
     identities: [] as unknown[],
     clocks: [] as unknown[],
+    foldReads: [] as unknown[],
+    childLists: [] as unknown[],
   };
   const priorCheckpointId = options.corruptLatestCheckpointFingerprint === true
     ? "77777777-7777-4777-8777-777777777777"
@@ -297,6 +460,12 @@ function authorityHarness(options: {
     latestCheckpointId: childCheckpointId,
     latestCheckpointEventPosition: childCheckpointId === null ? null : 39n,
     latestCheckpointFingerprint: childCheckpointId === null ? null : "e".repeat(64),
+    checkpointRequiredReason: options.target === "child" && options.markerPosition != null
+      ? "child-checkpoint-required"
+      : null,
+    checkpointRequiredEventPosition: options.target === "child"
+      ? options.markerPosition ?? null
+      : null,
   });
   const rootAggregate = Object.freeze({
     kind: "root",
@@ -325,13 +494,23 @@ function authorityHarness(options: {
     streamVersion: 2n,
     eventPosition: 40n,
     terminalEventPosition: null,
+    correlationId: "77777777-7777-4777-8777-777777777777",
     latestCheckpointId: childCheckpointId,
     latestCheckpointEventPosition: childCheckpointId === null ? null : 39n,
     latestCheckpointBaseEventPosition: childCheckpointId === null ? null : 38n,
   });
   const authority = Object.freeze({
-    get: (projectId: string, sessionId: string) => projectId === PROJECT_ID && sessionId === ROOT_ID ? root : null,
-    requireFoldMatch: (record: { readonly sessionId: string }) => record.sessionId === ROOT_ID ? rootAggregate : childAggregate,
+    get: (projectId: string, sessionId: string) => projectId !== PROJECT_ID
+      ? null
+      : sessionId === ROOT_ID
+        ? root
+        : sessionId === CHILD_ID
+          ? child
+          : null,
+    requireFoldMatch: (record: { readonly sessionId: string }) => {
+      calls.foldReads.push(record.sessionId);
+      return record.sessionId === ROOT_ID ? rootAggregate : childAggregate;
+    },
     latestCheckpoint: (record: { readonly sessionId: string }) => {
       calls.latestCheckpointReads.push(record);
       if (options.corruptLatestCheckpointFingerprint === true && record.sessionId === ROOT_ID) {
@@ -342,8 +521,12 @@ function authorityHarness(options: {
       }
       return null;
     },
-    listNonterminalChildren: (projectId: string, rootSessionId: string) =>
-      projectId === PROJECT_ID && rootSessionId === ROOT_ID ? Object.freeze([child]) : Object.freeze([]),
+    listNonterminalChildren: (projectId: string, rootSessionId: string) => {
+      calls.childLists.push({ projectId, rootSessionId });
+      return projectId === PROJECT_ID && rootSessionId === ROOT_ID
+        ? Object.freeze([child])
+        : Object.freeze([]);
+    },
     nextGlobalPosition: () => (options.basePosition ?? 50n) + 1n,
     updateCheckpointIndex: (input: unknown) => {
       if (options.faultPoint === "before-checkpoint-index-cas") throw new Error("INJECTED_CHECKPOINT_CRASH");
@@ -380,14 +563,17 @@ function authorityHarness(options: {
 }
 
 async function checkpointServiceFixture(options: {
+  readonly authorizationRecord?: PersistedLifecycleAuthorizationRecord;
   readonly basePosition?: bigint;
   readonly markerPosition?: bigint | null;
   readonly faultPoint?: string;
+  readonly freshCapabilityGeneration?: string | null;
   readonly corruptLatestCheckpointFingerprint?: boolean;
   readonly corruptChildLatestCheckpointFingerprint?: boolean;
   readonly eligibilityError?: Error;
   readonly snapshotError?: Error;
   readonly snapshot?: Readonly<Record<string, unknown>>;
+  readonly target?: "root" | "child";
 } = {}): Promise<{
   readonly service: CheckpointServiceLike;
   readonly harness: AuthorityHarness;
@@ -402,8 +588,11 @@ async function checkpointServiceFixture(options: {
   const invocation = Object.freeze({
     context,
     sourceStateScope: scope,
-    authorizationRecord: Object.freeze({ kind: "protected" }),
-    freshCapabilityGeneration: "1",
+    authorizationRecord: options.authorizationRecord
+      ?? Object.freeze({ kind: "protected" }),
+    ...(options.freshCapabilityGeneration === null
+      ? {}
+      : { freshCapabilityGeneration: options.freshCapabilityGeneration ?? "1" }),
   });
   const sourceStateProvider = Object.freeze({
     captureForCheckpoint: (observedContext: ProjectContext, observedScope: unknown) => {
@@ -462,16 +651,233 @@ async function checkpointServiceFixture(options: {
   };
 }
 
-function committedCheckpointBatch(position = 51n): Readonly<Record<string, unknown>> {
+function committedCheckpointBatch(
+  position = 51n,
+  streamVersion = 4n,
+): Readonly<Record<string, unknown>> {
   return Object.freeze({
     events: Object.freeze([Object.freeze({
       globalPosition: position,
-      streamVersion: 4n,
+      streamVersion,
       eventType: "SessionCheckpointRecorded",
     })]),
     storedResponse: Object.freeze({}) as JsonValue,
     responseHash: "e".repeat(64),
   });
+}
+
+class InternalPlanStoreConnection implements SqliteConnection {
+  readonly statements: string[] = [];
+
+  exec(sql: string): void {
+    this.statements.push(sql.trim().replace(/\s+/gu, " ").toUpperCase());
+  }
+
+  prepare(_sql: string): SqliteStatement {
+    throw new Error("internal plan harness does not issue raw SQL");
+  }
+
+  close(): void {}
+}
+
+class InternalPlanEvents implements LifecycleEventAppendPort {
+  readonly calls: string[] = [];
+  readonly insertedAuthorizations: PersistedLifecycleAuthorizationRecord[] = [];
+
+  constructor(readonly replay: EventAppendReplay<JsonValue> | null) {}
+
+  findLifecycleReplay<T extends JsonValue>(
+    _command: LifecycleCommandEnvelope,
+  ): EventAppendReplay<T> | null {
+    this.calls.push("find-replay");
+    return this.replay as EventAppendReplay<T> | null;
+  }
+
+  assertCommandIdentityAvailable(_command: LifecycleCommandEnvelope): void {
+    this.calls.push("assert-command-id");
+  }
+
+  assertAppendAllowed(): void {
+    this.calls.push("assert-append");
+  }
+
+  prepare<T extends JsonValue>(
+    command: AppendCommand<T>,
+    recordedAt: string,
+    commandHashOverride: string,
+  ): PreparedEventAppend<T> {
+    this.calls.push("prepare");
+    return {
+      command,
+      recordedAt,
+      commandHash: commandHashOverride,
+      storedEventIds: ["bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"],
+    };
+  }
+
+  planPrepared<T extends JsonValue>(
+    prepared: PreparedEventAppend<T>,
+  ): PlannedEventAppend<T> {
+    this.calls.push("plan");
+    const events = prepared.command.events.map((pending, index) => ({
+      globalPosition: 51n + BigInt(index),
+      streamVersion: prepared.command.expectedStreamVersion + BigInt(index) + 1n,
+      eventType: pending.eventType,
+      payload: pending.payload,
+    })) as unknown as EventAppendBatch<T>["events"];
+    return {
+      plannedOnly: true,
+      events,
+      storedResponse: {
+        eventIds: ["bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"],
+        firstGlobalPosition: "51",
+        lastGlobalPosition: "51",
+        finalStreamVersion: (
+          prepared.command.expectedStreamVersion + BigInt(events.length)
+        ).toString(),
+        response: prepared.command.publicResponse as PlannedEventAppend<T>[
+          "storedResponse"
+        ]["response"],
+      },
+      responseHash: "c".repeat(64),
+    };
+  }
+
+  appendPlanned<T extends JsonValue>(
+    planned: PlannedEventAppend<T>,
+  ): EventAppendBatch<T> {
+    this.calls.push("append");
+    return planned;
+  }
+
+  insertDedup<T extends JsonValue>(
+    _prepared: PreparedEventAppend<T>,
+    _batch: EventAppendBatch<T>,
+    authorization: PersistedLifecycleAuthorizationRecord,
+  ): void {
+    this.calls.push("dedup");
+    this.insertedAuthorizations.push(authorization);
+  }
+
+  result<T extends JsonValue>(batch: EventAppendBatch<T>) {
+    this.calls.push("result");
+    return {
+      deduplicated: false,
+      firstGlobalPosition: BigInt(batch.storedResponse.firstGlobalPosition),
+      lastGlobalPosition: BigInt(batch.storedResponse.lastGlobalPosition),
+      finalStreamVersion: BigInt(batch.storedResponse.finalStreamVersion),
+      eventIds: [...batch.storedResponse.eventIds],
+      response: batch.storedResponse.response as T,
+      responseHash: batch.responseHash,
+    };
+  }
+}
+
+function completeCheckpointTransaction(
+  harness: AuthorityHarness,
+): LifecycleCommandTransaction {
+  const partial = harness.transaction as {
+    readonly authority: LifecycleCommandTransaction["authority"];
+    readonly coverage: {
+      assertVersion1Eligible(
+        sessionIds: readonly string[],
+      ): void;
+      snapshotV2(
+        sessionId: string,
+        baseEventPosition: bigint,
+      ): ReturnType<LifecycleCommandTransaction["coverage"]["snapshotV2"]>;
+    };
+  };
+  return Object.freeze({
+    authority: partial.authority,
+    leases: Object.freeze({}),
+    approvals: Object.freeze({}),
+    transfers: Object.freeze({}),
+    coverage: Object.freeze({
+      assertEvidenceWindowWritable: () => undefined,
+      assertQuickHealthy: () => undefined,
+      registerAffectedExistingSessions: () => undefined,
+      assertVersion1Eligible: (sessionIds: readonly string[]) =>
+        partial.coverage.assertVersion1Eligible(sessionIds),
+      prepareBatch: () => {
+        throw new Error("unused evidence coverage preparation");
+      },
+      persistPrepared: () => {
+        throw new Error("unused evidence coverage persistence");
+      },
+      snapshotV2: (sessionId: string, baseEventPosition: bigint) =>
+        partial.coverage.snapshotV2(sessionId, baseEventPosition),
+      minimumCheckpointUpperBound: () => 0,
+      minimumFinalEndingScopeBindingsUpperBound: () => 0,
+    }),
+    workflows: Object.freeze({}),
+    validation: Object.freeze({}),
+    outbox: Object.freeze({}),
+  });
+}
+
+function checkpointCommandFromPlan(
+  plan: InternalWorkflowPhasePlan,
+): RecordCheckpointCommandV2 | RecordCheckpointCommandV3 {
+  if (plan.plannedAction.action !== "prepare-final-checkpoint-and-queue-ending") {
+    throw new Error("expected final checkpoint phase plan");
+  }
+  const command = {
+    commandType: "record-checkpoint" as const,
+    commandId: plan.commandId,
+    idempotencyKey: plan.idempotencyKey,
+    agentId: plan.agentId,
+    expectedProjectId: plan.expectedProjectId,
+    expectedVaultId: plan.expectedVaultId,
+    expectedWorkspaceId: plan.expectedWorkspaceId,
+    expectedBranchRef: plan.expectedBranchRef,
+    sessionId: ROOT_ID as RecordCheckpointCommandV2["sessionId"],
+    expectedStreamVersion: "3",
+    expectedBaseEventPosition: "50",
+  };
+  return plan.plannedAction.finalCheckpointDraft.checkpointVersion === 1
+    ? { ...command, draft: plan.plannedAction.finalCheckpointDraft }
+    : { ...command, draft: plan.plannedAction.finalCheckpointDraft };
+}
+
+function internalPlanReplay(
+  plan: InternalWorkflowPhasePlan,
+): EventAppendReplay<JsonValue> {
+  const checkpointVersion = plan.plannedAction.action
+      === "prepare-final-checkpoint-and-queue-ending"
+    ? plan.plannedAction.finalCheckpointDraft.checkpointVersion
+    : 1;
+  return {
+    deduplicated: true,
+    firstGlobalPosition: 51n,
+    lastGlobalPosition: 51n,
+    finalStreamVersion: 4n,
+    eventIds: ["bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"],
+    response: {
+      checkpointVersion,
+      checkpointId: CHECKPOINT_ID,
+      sessionId: ROOT_ID,
+      baseEventPosition: "50",
+      checkpointEventPosition: "51",
+      finalStreamVersion: "4",
+      checkpointRequiredCleared: false,
+    },
+    responseHash: "c".repeat(64),
+    authorizationRecord: internalPlanAuthorization(plan),
+  };
+}
+
+function adaptPreparedInternalCommit(
+  effect: ReturnType<CheckpointServiceLike["record"]>,
+): PreparedLifecycleCommit<JsonValue> {
+  const commit = effect as unknown as PreparedLifecycleCommit<JsonValue>;
+  return {
+    ...commit,
+    append: {
+      ...commit.append,
+      commandType: "internal-workflow-phase",
+    },
+  };
 }
 
 describe("Checkpoint Version 1 contract corrections", () => {
@@ -851,6 +1257,43 @@ describe("CheckpointService transactional enrichment", () => {
     }
   });
 
+  it("prepares a manual child checkpoint through the shared version-aware path", async () => {
+    const version1 = await checkpointServiceFixture({ target: "child" });
+    const version2 = await checkpointServiceFixture({ target: "child" });
+    try {
+      const v1 = version1.service.record(
+        version1.harness.transaction,
+        childCheckpointCommand(),
+      );
+      const v2 = version2.service.record(
+        version2.harness.transaction,
+        childCheckpointCommand({
+          commandId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+          idempotencyKey: "checkpoint-test/child-v2",
+          draft: qualifiedDraft(),
+        }),
+      );
+      for (const effect of [v1, v2]) {
+        const checkpoint = (effect.append.events[0] as {
+          readonly payload: { readonly checkpoint: Readonly<Record<string, unknown>> };
+        }).payload.checkpoint;
+        assert.equal(checkpoint.sessionId, CHILD_ID);
+        assert.equal(checkpoint.parentSessionId, ROOT_ID);
+        assert.deepEqual(checkpoint.childSummaries, []);
+      }
+      assert.deepEqual(version1.harness.calls.version1Eligibility, [[CHILD_ID]]);
+      assert.deepEqual(version2.harness.calls.version2Snapshots, [{
+        sessionId: CHILD_ID,
+        baseEventPosition: 50n,
+      }]);
+      assert.equal(version1.harness.calls.childLists.length, 0);
+      assert.equal(version2.harness.calls.childLists.length, 0);
+    } finally {
+      version1.cleanup();
+      version2.cleanup();
+    }
+  });
+
   it("rejects unavailable checkpoint evidence keys before source, clock, or UUID work", async () => {
     const unavailable = new Error("EVIDENCE_FINGERPRINT_KEY_UNAVAILABLE");
     const version1 = await checkpointServiceFixture({ eligibilityError: unavailable });
@@ -875,6 +1318,9 @@ describe("CheckpointService transactional enrichment", () => {
         assert.equal(fixture.harness.calls.sourceCaptures.length, 0);
         assert.equal(fixture.harness.calls.clocks.length, 0);
         assert.equal(fixture.harness.calls.identities.length, 0);
+        assert.deepEqual(fixture.harness.calls.foldReads, [ROOT_ID]);
+        assert.equal(fixture.harness.calls.latestCheckpointReads.length, 1);
+        assert.equal(fixture.harness.calls.childLists.length, 0);
       }
     } finally {
       version1.cleanup();
@@ -891,8 +1337,11 @@ describe("CheckpointService transactional enrichment", () => {
         materializationTarget: "memory/final.md",
       });
       assert.equal(prepared.action.action, "record-final-checkpoint-and-queue-ending");
+      if (prepared.action.action !== "record-final-checkpoint-and-queue-ending") {
+        throw new Error("unexpected final checkpoint action");
+      }
       assert.equal(
-        (prepared.action.finalCheckpoint as Readonly<Record<string, unknown>>).checkpointVersion,
+        prepared.action.finalCheckpoint.checkpointVersion,
         1,
       );
       assert.equal(prepared.action.materializationTarget, "memory/final.md");
@@ -934,6 +1383,126 @@ describe("CheckpointService transactional enrichment", () => {
     }
   });
 
+  it("accepts only snapshotted own-data final inputs at the phase target bound", async () => {
+    const fixture = await checkpointServiceFixture();
+    let getterReads = 0;
+    try {
+      const accessorInput = {};
+      Object.defineProperties(accessorInput, {
+        command: {
+          enumerable: true,
+          get: () => {
+            getterReads += 1;
+            return checkpointCommand();
+          },
+        },
+        materializationTarget: {
+          enumerable: true,
+          value: "memory/final.md",
+        },
+      });
+      assert.throws(
+        () => fixture.service.prepareFinalPhase(
+          fixture.harness.transaction,
+          accessorInput,
+        ),
+        /LIFECYCLE_INPUT_INVALID/u,
+      );
+      assert.equal(getterReads, 0);
+      assert.throws(
+        () => fixture.service.prepareFinalPhase(fixture.harness.transaction, {
+          command: checkpointCommand(),
+          materializationTarget: "x".repeat(1_025),
+        }),
+        /LIFECYCLE_INPUT_INVALID/u,
+      );
+      assert.equal(fixture.harness.calls.sourceCaptures.length, 0);
+
+      const prepared = fixture.service.prepareFinalPhase(fixture.harness.transaction, {
+        command: checkpointCommand(),
+        materializationTarget: "x".repeat(1_024),
+      });
+      if (prepared.action.action !== "record-final-checkpoint-and-queue-ending") {
+        throw new Error("unexpected final checkpoint action");
+      }
+      assert.equal(prepared.action.materializationTarget.length, 1_024);
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it("rejects a prepared final capability after its guarded callback closes", async () => {
+    const fixture = await checkpointServiceFixture();
+    let active = true;
+    const guardedTransaction = new Proxy(fixture.harness.transaction, {
+      get(target, property, receiver) {
+        if (!active) throw new Error("STALE_TRANSACTION_CALLBACK");
+        return Reflect.get(target, property, receiver) as unknown;
+      },
+      ownKeys(target) {
+        if (!active) throw new Error("STALE_TRANSACTION_CALLBACK");
+        return Reflect.ownKeys(target);
+      },
+    });
+    try {
+      const prepared = fixture.service.prepareFinalPhase(guardedTransaction, {
+        command: checkpointCommand(),
+        materializationTarget: "memory/final.md",
+      });
+      active = false;
+      assert.throws(
+        () => fixture.service.recordPreparedFinal(guardedTransaction, prepared),
+        /STALE_TRANSACTION_CALLBACK/u,
+      );
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it("deep-freezes the prepared final effect against cast mutation", async () => {
+    const fixture = await checkpointServiceFixture();
+    try {
+      const prepared = fixture.service.prepareFinalPhase(fixture.harness.transaction, {
+        command: checkpointCommand(),
+        materializationTarget: "memory/final.md",
+      });
+      assert.equal(Object.isFrozen(prepared.effect), true);
+      assert.equal(Object.isFrozen(prepared.effect.append), true);
+      assert.equal(Object.isFrozen(prepared.effect.append.events), true);
+      const pendingEvent = prepared.effect.append.events[0] as unknown as {
+        readonly payload: {
+          readonly checkpoint: {
+            readonly taskSummary: string;
+          };
+        };
+      };
+      assert.equal(Object.isFrozen(pendingEvent), true);
+      assert.equal(Object.isFrozen(pendingEvent.payload), true);
+      assert.equal(Object.isFrozen(pendingEvent.payload.checkpoint), true);
+      assert.throws(() => {
+        (prepared.effect as unknown as {
+          afterAppend: () => void;
+        }).afterAppend = () => undefined;
+      }, TypeError);
+      assert.throws(() => {
+        (prepared.effect.append as unknown as {
+          events: readonly unknown[];
+        }).events = [];
+      }, TypeError);
+      assert.throws(() => {
+        (pendingEvent.payload.checkpoint as {
+          taskSummary: string;
+        }).taskSummary = "cast mutation";
+      }, TypeError);
+      assert.equal(
+        fixture.service.recordPreparedFinal(fixture.harness.transaction, prepared),
+        prepared.effect,
+      );
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
   it("prepares a full qualified final action from only the stable draft and target", async () => {
     const fixture = await checkpointServiceFixture();
     try {
@@ -946,7 +1515,10 @@ describe("CheckpointService transactional enrichment", () => {
         command,
         materializationTarget: "memory/qualified-final.md",
       });
-      const checkpoint = prepared.action.finalCheckpoint as Readonly<Record<string, unknown>>;
+      if (prepared.action.action !== "record-final-checkpoint-and-queue-ending") {
+        throw new Error("unexpected final checkpoint action");
+      }
+      const checkpoint = prepared.action.finalCheckpoint;
       assert.equal(checkpoint.checkpointVersion, 2);
       assert.deepEqual(checkpoint.evidenceCoverage, {
         coverageVersion: 2,
@@ -1085,6 +1657,8 @@ describe("CheckpointService transactional enrichment", () => {
   it("updates the specialized checkpoint index and clears only a covered marker after append", async () => {
     const fixture = await checkpointServiceFixture({ markerPosition: 41n });
     try {
+      const expectedFingerprint =
+        "a24657fd1bedcb0af8f229c62e472e603085f159768dfa4c04d355dc11d8cf2e";
       const effect = fixture.service.record(fixture.harness.transaction, checkpointCommand());
       assert.equal(effect.append.publicResponse.checkpointRequiredCleared, true);
       assert.equal(fixture.harness.calls.checkpointUpdates.length, 0);
@@ -1100,15 +1674,44 @@ describe("CheckpointService transactional enrichment", () => {
         expectedLatestCheckpointFingerprint: null,
         checkpointId: CHECKPOINT_ID,
         checkpointEventPosition: 51n,
-        checkpointFingerprint: fixture.harness.calls.checkpointUpdates.length === 0
-          ? undefined
-          : (fixture.harness.calls.checkpointUpdates[0] as Record<string, unknown>).checkpointFingerprint,
+        checkpointFingerprint: expectedFingerprint,
         updatedAt: CREATED_AT,
       }]);
-      assert.match(
-        (fixture.harness.calls.checkpointUpdates[0] as { readonly checkpointFingerprint: string }).checkpointFingerprint,
-        /^[0-9a-f]{64}$/u,
-      );
+      assert.deepEqual(fixture.harness.calls.clears, [{
+        projectId: PROJECT_ID,
+        sessionId: ROOT_ID,
+        checkpointBaseEventPosition: 50n,
+        updatedAt: CREATED_AT,
+      }]);
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it("uses the same checkpoint-index CAS and marker clear for Version 2", async () => {
+    const fixture = await checkpointServiceFixture({ markerPosition: 41n });
+    try {
+      const effect = fixture.service.record(fixture.harness.transaction, checkpointCommand({
+        commandId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+        idempotencyKey: "checkpoint-test/v2-marker",
+        draft: qualifiedDraft(),
+      }));
+      const expectedFingerprint =
+        "e6ecf25b9fe21a423a9a55570656d8a1f1f61e6242f1524cb38d0edde0309fe5";
+      assert.equal(effect.append.publicResponse.checkpointVersion, 2);
+      assert.equal(effect.append.publicResponse.checkpointRequiredCleared, true);
+      effect.afterAppend(committedCheckpointBatch(), fixture.harness.transaction);
+      assert.deepEqual(fixture.harness.calls.checkpointUpdates, [{
+        projectId: PROJECT_ID,
+        sessionId: ROOT_ID,
+        expectedLatestCheckpointId: null,
+        expectedLatestCheckpointEventPosition: null,
+        expectedLatestCheckpointFingerprint: null,
+        checkpointId: CHECKPOINT_ID,
+        checkpointEventPosition: 51n,
+        checkpointFingerprint: expectedFingerprint,
+        updatedAt: CREATED_AT,
+      }]);
       assert.deepEqual(fixture.harness.calls.clears, [{
         projectId: PROJECT_ID,
         sessionId: ROOT_ID,
@@ -1166,6 +1769,171 @@ describe("CheckpointService transactional enrichment", () => {
       );
       assert.equal(fixture.harness.calls.checkpointUpdates.length, 1);
       assert.equal(fixture.harness.calls.clears.length, 0);
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it("executes stable internal final-checkpoint plans only on fresh V1/V2 callbacks", async () => {
+    for (const checkpointVersion of [1, 2] as const) {
+      const plan = internalFinalCheckpointPlan(checkpointVersion);
+      const envelopeFor = (context: ProjectContext) => internalPlanEnvelope(context, plan);
+      const replayFixture = await checkpointServiceFixture({
+        authorizationRecord: internalPlanAuthorization(plan),
+        freshCapabilityGeneration: null,
+      });
+      try {
+        const connection = new InternalPlanStoreConnection();
+        const events = new InternalPlanEvents(internalPlanReplay(plan));
+        let transactionConstructions = 0;
+        let preparations = 0;
+        let consumptions = 0;
+        const store = new LifecycleCommandStore({
+          connection,
+          events,
+          transaction: () => {
+            transactionConstructions += 1;
+            throw new Error("replay must not construct a transaction facade");
+          },
+          now: () => CREATED_AT,
+        });
+        const replayed = store.execute(envelopeFor(replayFixture.context), (transaction) => {
+          preparations += 1;
+          const prepared = replayFixture.service.prepareFinalPhase(transaction, {
+            command: checkpointCommandFromPlan(plan),
+            materializationTarget: plan.plannedAction.action
+                === "prepare-final-checkpoint-and-queue-ending"
+              ? plan.plannedAction.materializationTarget
+              : "unreachable",
+          });
+          consumptions += 1;
+          return adaptPreparedInternalCommit(
+            replayFixture.service.recordPreparedFinal(transaction, prepared),
+          );
+        });
+
+        assert.equal(replayed.deduplicated, true);
+        assert.equal(transactionConstructions, 0);
+        assert.equal(preparations, 0);
+        assert.equal(consumptions, 0);
+        assert.equal(replayFixture.harness.calls.sourceCaptures.length, 0);
+        assert.deepEqual(events.calls, ["find-replay"]);
+        assert.deepEqual(connection.statements, ["BEGIN IMMEDIATE", "ROLLBACK"]);
+      } finally {
+        replayFixture.cleanup();
+      }
+
+      const freshFixture = await checkpointServiceFixture({
+        authorizationRecord: internalPlanAuthorization(plan),
+        freshCapabilityGeneration: null,
+      });
+      try {
+        const connection = new InternalPlanStoreConnection();
+        const events = new InternalPlanEvents(null);
+        const sequence: string[] = [];
+        let preparations = 0;
+        let consumptions = 0;
+        const store = new LifecycleCommandStore({
+          connection,
+          events,
+          transaction: () => completeCheckpointTransaction(freshFixture.harness),
+          now: () => CREATED_AT,
+        });
+        const committed = store.execute(envelopeFor(freshFixture.context), (transaction) => {
+          const checkpointCommand = checkpointCommandFromPlan(plan);
+          const prepared = freshFixture.service.prepareFinalPhase(transaction, {
+            command: checkpointCommand,
+            materializationTarget: plan.plannedAction.action
+                === "prepare-final-checkpoint-and-queue-ending"
+              ? plan.plannedAction.materializationTarget
+              : "unreachable",
+          });
+          preparations += 1;
+          sequence.push("prepared");
+
+          const { plannedAction: _plannedAction, ...stablePlan } = plan;
+          const authoritativeCommand: InternalWorkflowPhaseCommand = {
+            ...stablePlan,
+            action: prepared.action,
+          };
+          assert.equal(authoritativeCommand.action.action, "record-final-checkpoint-and-queue-ending");
+          if (authoritativeCommand.action.action !== "record-final-checkpoint-and-queue-ending"
+            || plan.plannedAction.action !== "prepare-final-checkpoint-and-queue-ending") {
+            throw new Error("unexpected internal final-checkpoint action");
+          }
+          assert.equal(
+            authoritativeCommand.action.finalCheckpoint.checkpointVersion,
+            plan.plannedAction.finalCheckpointDraft.checkpointVersion,
+          );
+          assert.doesNotThrow(() => buildLifecycleIntentWitness(
+            authoritativeCommand,
+            internalPlanAssertions(plan),
+          ));
+          sequence.push(`authoritative-v${checkpointVersion}`);
+
+          const effect = freshFixture.service.recordPreparedFinal(transaction, prepared);
+          consumptions += 1;
+          sequence.push("consumed");
+          return adaptPreparedInternalCommit(effect);
+        });
+
+        assert.equal(committed.deduplicated, false);
+        assert.equal(preparations, 1);
+        assert.equal(consumptions, 1);
+        assert.deepEqual(sequence, [
+          "prepared",
+          `authoritative-v${checkpointVersion}`,
+          "consumed",
+        ]);
+        assert.equal(
+          (committed.publicResult as Readonly<Record<string, unknown>>).checkpointVersion,
+          checkpointVersion,
+        );
+        assert.deepEqual(freshFixture.harness.calls.version1Eligibility,
+          checkpointVersion === 1 ? [[ROOT_ID]] : []);
+        assert.deepEqual(freshFixture.harness.calls.version2Snapshots,
+          checkpointVersion === 2
+            ? [{ sessionId: ROOT_ID, baseEventPosition: 50n }]
+            : []);
+        assert.deepEqual(events.insertedAuthorizations, [internalPlanAuthorization(plan)]);
+        assert.deepEqual(connection.statements, ["BEGIN IMMEDIATE", "COMMIT"]);
+      } finally {
+        freshFixture.cleanup();
+      }
+    }
+  });
+
+  it("rejects an unconsumed prepared final capability after a real store callback closes", async () => {
+    const plan = internalFinalCheckpointPlan(1);
+    const fixture = await checkpointServiceFixture({
+      authorizationRecord: internalPlanAuthorization(plan),
+      freshCapabilityGeneration: null,
+    });
+    let guardedTransaction: LifecycleCommandTransaction | undefined;
+    let unconsumed: ReturnType<CheckpointServiceLike["prepareFinalPhase"]> | undefined;
+    try {
+      const connection = new InternalPlanStoreConnection();
+      const events = new InternalPlanEvents(null);
+      const store = new LifecycleCommandStore({
+        connection,
+        events,
+        transaction: () => completeCheckpointTransaction(fixture.harness),
+        now: () => CREATED_AT,
+      });
+      store.execute(internalPlanEnvelope(fixture.context, plan), (transaction) => {
+        guardedTransaction = transaction;
+        unconsumed = fixture.service.prepareFinalPhase(transaction, {
+          command: checkpointCommandFromPlan(plan),
+          materializationTarget: "memory/final.md",
+        });
+        return adaptPreparedInternalCommit(unconsumed.effect);
+      });
+      assert.notEqual(guardedTransaction, undefined);
+      assert.notEqual(unconsumed, undefined);
+      assert.throws(
+        () => fixture.service.recordPreparedFinal(guardedTransaction!, unconsumed!),
+        /LIFECYCLE_INPUT_INVALID/u,
+      );
     } finally {
       fixture.cleanup();
     }

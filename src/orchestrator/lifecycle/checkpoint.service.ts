@@ -318,6 +318,59 @@ function syncValue<T>(value: T): T {
   return value;
 }
 
+function finalCheckpointPreparationInput(
+  value: unknown,
+): FinalCheckpointPhasePreparationInput {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) invalid();
+  const keys = Reflect.ownKeys(value);
+  if (keys.length !== 2 || !keys.includes("command") || !keys.includes("materializationTarget")) {
+    invalid();
+  }
+  const command = Object.getOwnPropertyDescriptor(value, "command");
+  const target = Object.getOwnPropertyDescriptor(value, "materializationTarget");
+  if (command === undefined || !command.enumerable || !("value" in command)
+    || target === undefined || !target.enumerable || !("value" in target)
+    || typeof target.value !== "string" || target.value.length === 0
+    || Array.from(target.value).length > 1_024) invalid();
+  return Object.freeze({
+    command: command.value as RecordCheckpointCommandV2 | RecordCheckpointCommandV3,
+    materializationTarget: target.value,
+  });
+}
+
+function immutablePreparedEffect<T extends JsonValue>(
+  effect: FreshLifecycleEffect<T>,
+): FreshLifecycleEffect<T> {
+  const snapshots = new WeakMap<object, object>();
+  const snapshot = (value: unknown): unknown => {
+    if (Array.isArray(value)) {
+      const prior = snapshots.get(value);
+      if (prior !== undefined) return prior;
+      const next: unknown[] = [];
+      snapshots.set(value, next);
+      for (const item of value) next.push(snapshot(item));
+      return Object.freeze(next);
+    }
+    if (typeof value !== "object" || value === null || typeof value === "function") return value;
+    const prototype = Object.getPrototypeOf(value) as unknown;
+    if (prototype !== Object.prototype && prototype !== null) invalid("INTEGRITY_FAILURE");
+    const prior = snapshots.get(value);
+    if (prior !== undefined) return prior;
+    const next: Record<string, unknown> = {};
+    snapshots.set(value, next);
+    for (const key of Reflect.ownKeys(value)) {
+      if (typeof key !== "string") invalid("INTEGRITY_FAILURE");
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      if (descriptor === undefined || !descriptor.enumerable || !("value" in descriptor)) {
+        invalid("INTEGRITY_FAILURE");
+      }
+      next[key] = snapshot(descriptor.value);
+    }
+    return Object.freeze(next);
+  };
+  return snapshot(effect) as FreshLifecycleEffect<T>;
+}
+
 const CHECKPOINT_RESULT_KEYS = [
   "checkpointVersion",
   "checkpointId",
@@ -596,26 +649,22 @@ export class CheckpointService {
     transaction: LifecycleCommandTransaction,
     input: FinalCheckpointPhasePreparationInput,
   ): PreparedFinalCheckpointPhase {
-    if (typeof input !== "object" || input === null || Reflect.ownKeys(input).length !== 2
-      || !Object.hasOwn(input, "command") || !Object.hasOwn(input, "materializationTarget")
-      || typeof input.materializationTarget !== "string"
-      || input.materializationTarget.length === 0
-      || Array.from(input.materializationTarget).length > 4_000) invalid();
-    const effect = this.#record(transaction, input.command, true);
+    const preparedInput = finalCheckpointPreparationInput(input);
+    const effect = immutablePreparedEffect(this.#record(transaction, preparedInput.command, true));
     const pending = effect.append.events[0];
     if (pending?.eventType !== "SessionCheckpointRecorded"
       || typeof pending.payload !== "object" || pending.payload === null
       || Array.isArray(pending.payload)) invalid("INTEGRITY_FAILURE");
     const checkpointInput = (pending.payload as Readonly<Record<string, JsonValue>>).checkpoint;
-    const checkpoint = input.command.draft.checkpointVersion === 1
+    const checkpoint = preparedInput.command.draft.checkpointVersion === 1
       ? decodeCheckpointV1(checkpointInput)
-      : input.command.draft.checkpointVersion === 2
+      : preparedInput.command.draft.checkpointVersion === 2
         ? decodeCheckpointV2(checkpointInput)
         : invalid("INTEGRITY_FAILURE");
     const action = Object.freeze({
       action: "record-final-checkpoint-and-queue-ending" as const,
       finalCheckpoint: checkpoint,
-      materializationTarget: input.materializationTarget,
+      materializationTarget: preparedInput.materializationTarget,
     });
     const prepared = Object.freeze({
       [PREPARED_FINAL_CHECKPOINT_PHASE]: true as const,
@@ -633,6 +682,7 @@ export class CheckpointService {
     if (typeof prepared !== "object" || prepared === null) invalid("INTEGRITY_FAILURE");
     const owned = this.#preparedFinals.get(prepared);
     if (owned === undefined || owned.transaction !== transaction) invalid("INTEGRITY_FAILURE");
+    void transaction.authority;
     this.#preparedFinals.delete(prepared);
     return owned.effect;
   }
@@ -657,7 +707,9 @@ export class CheckpointService {
     const observed = authority.get(invocation.context.binding.projectId, command.sessionId);
     if (observed === null) throw new LifecycleError("SESSION_NOT_FOUND");
     const current = Object.freeze({ ...observed }) as SessionAuthorityRecord;
-    const aggregate = authority.requireFoldMatch(current);
+    const aggregate = Object.freeze({
+      ...authority.requireFoldMatch(current),
+    }) as SessionAggregateState;
     assertAuthorityAndAggregate(current, aggregate);
     authority.latestCheckpoint(current);
     if (BigInt(command.expectedStreamVersion) !== aggregate.streamVersion) {
@@ -680,12 +732,24 @@ export class CheckpointService {
       throw new LifecycleError("CHECKPOINT_BASE_INVALID");
     }
 
+    const coverage: CheckpointEvidenceCoverageV1 | CheckpointEvidenceCoverageV2 =
+      draft.checkpointVersion === 1
+        ? (transaction.coverage.assertVersion1Eligible(
+            Object.freeze([current.sessionId as SessionId]),
+          ), EMPTY_COVERAGE)
+        : syncValue(transaction.coverage.snapshotV2(
+            current.sessionId as SessionId,
+            baseEventPosition,
+          ));
+
     const childSummaries = aggregate.kind === "root"
       ? [...authority.listNonterminalChildren(current.projectId, current.sessionId)]
           .map((childObserved) => {
             const child = Object.freeze({ ...childObserved }) as SessionAuthorityRecord;
             authority.latestCheckpoint(child);
-            const childAggregate = authority.requireFoldMatch(child);
+            const childAggregate = Object.freeze({
+              ...authority.requireFoldMatch(child),
+            }) as SessionAggregateState;
             assertAuthorityAndAggregate(child, childAggregate);
             if (childAggregate.kind !== "child" || child.parentSessionId !== current.sessionId
               || childAggregate.eventPosition > baseEventPosition) invalid("INTEGRITY_FAILURE");
@@ -701,15 +765,6 @@ export class CheckpointService {
             : left.childSessionId > right.childSessionId ? 1 : 0)
       : [];
 
-    const coverage: CheckpointEvidenceCoverageV1 | CheckpointEvidenceCoverageV2 =
-      draft.checkpointVersion === 1
-        ? (transaction.coverage.assertVersion1Eligible(
-            Object.freeze([current.sessionId as SessionId]),
-          ), EMPTY_COVERAGE)
-        : syncValue(transaction.coverage.snapshotV2(
-            current.sessionId as SessionId,
-            baseEventPosition,
-          ));
     const sourceState = syncValue(finalization
       ? this.#sourceState.captureForFinalization(invocation.context, invocation.sourceStateScope)
       : this.#sourceState.captureForCheckpoint(invocation.context, invocation.sourceStateScope));

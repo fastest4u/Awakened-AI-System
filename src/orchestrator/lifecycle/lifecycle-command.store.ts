@@ -36,6 +36,7 @@ import type { EvidenceCoverageRecordedV2 } from "./contracts/events.js";
 import { decodeFinalEndingScopeBindingsV1 } from "./contracts/session-end.js";
 import type { SessionId } from "./contracts/identifiers.js";
 import type {
+  InternalWorkflowPhasePlan,
   InternalWorkflowSemanticCommand,
   LifecycleSemanticCommandDraft,
 } from "./contracts/commands.js";
@@ -79,7 +80,10 @@ export interface LifecycleCommandEnvelope {
   readonly commandType: string;
   readonly candidateIntentHash: string;
   readonly authoritativeIntentHash: string;
-  readonly semanticCommand: LifecycleSemanticCommandDraft | InternalWorkflowSemanticCommand;
+  readonly semanticCommand:
+    | LifecycleSemanticCommandDraft
+    | InternalWorkflowSemanticCommand
+    | InternalWorkflowPhasePlan;
   readonly capabilityKind: CapabilityKind | null;
   readonly capabilityGeneration: string | null;
   /** Resolve the protected generation from verified authority only after an exact replay miss. */
