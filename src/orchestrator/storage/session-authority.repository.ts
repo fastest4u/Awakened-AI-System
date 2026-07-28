@@ -1,8 +1,21 @@
 import { createHash, timingSafeEqual } from "node:crypto";
+import type { ProjectId } from "../identity/contracts.js";
 import { authorityCommitment, type CommittedAuthorityV1 } from "../lifecycle/authority/authority-commitment.js";
-import { decodeLifecycleEventV1, type LifecycleEventV1 } from "../lifecycle/contracts/events.js";
-import type { CheckpointV1 } from "../lifecycle/contracts/checkpoint.js";
-import type { ChildSessionState, RootSessionState } from "../lifecycle/contracts/identifiers.js";
+import {
+  decodeLifecycleEvent,
+  type LifecycleEvent,
+} from "../lifecycle/contracts/events.js";
+import {
+  decodeCheckpointV1,
+  decodeCheckpointV2,
+  type Checkpoint,
+} from "../lifecycle/contracts/checkpoint.js";
+import type {
+  CheckpointId,
+  ChildSessionState,
+  RootSessionState,
+  SessionId,
+} from "../lifecycle/contracts/identifiers.js";
 import {
   LifecycleError,
   MAX_SESSION_AMBIGUITY_SUMMARIES,
@@ -40,6 +53,13 @@ const TERMINAL_TYPES = new Set<TerminalLifecycleEventType>([
   "ChildSessionCompleted",
   "ChildWorkTransferCreated",
 ]);
+
+export interface CheckpointAtEventPositionInput {
+  readonly projectId: ProjectId;
+  readonly sessionId: SessionId;
+  readonly checkpointId: CheckpointId;
+  readonly checkpointEventPosition: bigint;
+}
 
 const FIELD_MAP = [
   ["projectId", "project_id"], ["sessionId", "session_id"], ["streamId", "stream_id"],
@@ -470,7 +490,7 @@ function mutationParams(input: SessionAuthorityMutation): SqliteParams {
   return params;
 }
 
-function eventRows(connection: SqliteConnection, authority: SessionAuthorityRecord): readonly LifecycleEventV1[] {
+function eventRows(connection: SqliteConnection, authority: SessionAuthorityRecord): readonly LifecycleEvent[] {
   const columns = [
     "global_position", "event_id", "project_id", "vault_id", "store_id", "workspace_id",
     "stream_id", "stream_type", "stream_version", "event_type", "event_schema_version",
@@ -499,7 +519,7 @@ function eventRows(connection: SqliteConnection, authority: SessionAuthorityReco
     const streamVersion = int64(ownData(row, "stream_version"));
     const position = int64(ownData(row, "global_position"));
     try {
-      return decodeLifecycleEventV1({
+      return decodeLifecycleEvent({
         eventSchemaVersion: schemaVersion,
         eventId: ownData(row, "event_id"),
         projectId: ownData(row, "project_id"),
@@ -582,6 +602,84 @@ function decodeCurrentChildProjection(
 }
 
 export class SessionAuthorityRepository {
+  requireCheckpointAtEventPosition(
+    connection: SqliteConnection,
+    input: CheckpointAtEventPositionInput,
+  ): Checkpoint {
+    exactKeys(input, [
+      "projectId",
+      "sessionId",
+      "checkpointId",
+      "checkpointEventPosition",
+    ], invalid);
+    if (!LOWER_UUID.test(input.projectId)
+      || !LOWER_UUID.test(input.sessionId)
+      || !LOWER_UUID.test(input.checkpointId)
+      || typeof input.checkpointEventPosition !== "bigint"
+      || input.checkpointEventPosition < 1n
+      || input.checkpointEventPosition > SQLITE_INT64_MAX) invalid();
+    const projectId = input.projectId as ProjectId;
+    const sessionId = input.sessionId as SessionId;
+    const checkpointId = input.checkpointId as CheckpointId;
+    const columns = [
+      "global_position", "event_id", "project_id", "vault_id", "store_id", "workspace_id",
+      "stream_id", "stream_type", "stream_version", "event_type", "event_schema_version",
+      "session_id", "parent_session_id", "correlation_id", "causation_id", "command_id",
+      "idempotency_key", "occurred_at", "payload_json",
+    ] as const;
+    const row = connection.prepare(`
+      SELECT ${columns.join(", ")}
+      FROM events
+      WHERE global_position = $checkpointEventPosition
+    `).get({ $checkpointEventPosition: input.checkpointEventPosition });
+    if (row === undefined) integrity();
+    exactKeys(row, columns);
+    const globalPosition = int64(ownData(row, "global_position"));
+    const schemaVersion = version(ownData(row, "event_schema_version"));
+    const rowProjectId = uuid(ownData(row, "project_id"));
+    uuid(ownData(row, "event_id"));
+    uuid(ownData(row, "vault_id"));
+    uuid(ownData(row, "store_id"));
+    const workspaceId = hash(ownData(row, "workspace_id"));
+    const streamId = text(ownData(row, "stream_id"));
+    int64(ownData(row, "stream_version"));
+    const rowSessionId = uuid(ownData(row, "session_id"));
+    const parentSessionId = nullableUuid(ownData(row, "parent_session_id"));
+    uuid(ownData(row, "correlation_id"));
+    nullableUuid(ownData(row, "causation_id"));
+    uuid(ownData(row, "command_id"));
+    text(ownData(row, "idempotency_key"), 512);
+    timestamp(ownData(row, "occurred_at"));
+    if (globalPosition !== input.checkpointEventPosition
+      || rowProjectId !== projectId
+      || rowSessionId !== sessionId
+      || streamId !== `session/${sessionId}`
+      || ownData(row, "stream_type") !== "session"
+      || ownData(row, "event_type") !== "SessionCheckpointRecorded"
+      || (schemaVersion !== 1 && schemaVersion !== 2)) integrity();
+    const payload = parseCanonical(text(ownData(row, "payload_json"), 1_000_000));
+    if (typeof payload !== "object" || payload === null || Array.isArray(payload)) integrity();
+    exactKeys(payload, ["checkpoint", "baseEventPosition", "checkpointEventPosition"]);
+    const payloadRecord = payload as Readonly<Record<string, unknown>>;
+    let checkpoint: Checkpoint;
+    try {
+      checkpoint = schemaVersion === 1
+        ? decodeCheckpointV1(payloadRecord.checkpoint)
+        : decodeCheckpointV2(payloadRecord.checkpoint);
+    } catch {
+      integrity();
+    }
+    if (checkpoint.checkpointVersion !== schemaVersion
+      || checkpoint.checkpointId !== checkpointId
+      || checkpoint.sessionId !== sessionId
+      || checkpoint.parentSessionId !== parentSessionId
+      || checkpoint.sourceState.workspaceId !== workspaceId
+      || payloadRecord.baseEventPosition !== checkpoint.baseEventPosition
+      || payloadRecord.checkpointEventPosition !== globalPosition.toString()
+      || checkpoint.checkpointEventPosition !== globalPosition.toString()) integrity();
+    return checkpoint;
+  }
+
   nextGlobalPosition(connection: SqliteConnection): bigint {
     const row = connection.prepare(`
       SELECT COALESCE(MAX(global_position), 0) AS maximum_position
@@ -597,7 +695,7 @@ export class SessionAuthorityRepository {
   loadEvents(
     connection: SqliteConnection,
     authority: SessionAuthorityRecord,
-  ): readonly LifecycleEventV1[] {
+  ): readonly LifecycleEvent[] {
     return Object.freeze([...eventRows(connection, authority)]);
   }
 
@@ -899,10 +997,10 @@ export class SessionAuthorityRepository {
   latestCheckpoint(
     connection: SqliteConnection,
     authority: SessionAuthorityRecord,
-  ): CheckpointV1 | null {
+  ): Checkpoint | null {
     const events = eventRows(connection, authority);
     const checkpoints = events.filter((event): event is Extract<
-      LifecycleEventV1,
+      LifecycleEvent,
       { readonly eventType: "SessionCheckpointRecorded" }
     > => event.eventType === "SessionCheckpointRecorded");
     const latest = checkpoints.at(-1) ?? null;
@@ -926,7 +1024,10 @@ export class SessionAuthorityRepository {
       || latest.payload.checkpoint.parentSessionId !== authority.parentSessionId
     ) integrity();
     const expectedFingerprint = createHash("sha256")
-      .update("project-memory/checkpoint/v1\n", "utf8")
+      .update(
+        `project-memory/checkpoint/v${latest.payload.checkpoint.checkpointVersion}\n`,
+        "utf8",
+      )
       .update(canonicalJson(latest.payload.checkpoint), "utf8")
       .digest();
     const observedFingerprint = Buffer.from(authority.latestCheckpointFingerprint, "hex");

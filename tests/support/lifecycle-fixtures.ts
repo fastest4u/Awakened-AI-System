@@ -11,7 +11,10 @@ import {
   type SessionAggregateState,
   type SessionAuthorityMirror,
 } from "../../src/orchestrator/lifecycle/session-aggregate.js";
-import type { CheckpointV1 } from "../../src/orchestrator/lifecycle/contracts/checkpoint.js";
+import type {
+  CheckpointV1,
+  CheckpointV2,
+} from "../../src/orchestrator/lifecycle/contracts/checkpoint.js";
 import type {
   ChildDispositionV1,
   ChildReportV1,
@@ -152,6 +155,21 @@ export function checkpointFixture(options: CheckpointFixtureOptions = {}): Check
       contentRetained: false,
       highestContiguousOrdinal: null,
       missingIntervals: Object.freeze([]),
+    }),
+  });
+}
+
+export function qualifiedCheckpointFixture(
+  options: CheckpointFixtureOptions = {},
+): CheckpointV2 {
+  return Object.freeze({
+    ...checkpointFixture(options),
+    checkpointVersion: 2,
+    evidenceCoverage: Object.freeze({
+      coverageVersion: 2,
+      captureMode: "coverage-only",
+      contentRetained: false,
+      adapterSessions: Object.freeze([]),
     }),
   });
 }

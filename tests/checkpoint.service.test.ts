@@ -10,9 +10,13 @@ import type { PersistedLifecycleAuthorizationRecord } from "../src/orchestrator/
 import type { ProjectContext } from "../src/orchestrator/identity/contracts.js";
 import {
   decodeCheckpointDraftV1,
+  decodeCheckpointDraftV2,
   decodeCheckpointV1,
 } from "../src/orchestrator/lifecycle/contracts/checkpoint.js";
-import type { RecordCheckpointCommandV2 } from "../src/orchestrator/lifecycle/contracts/commands.js";
+import type {
+  RecordCheckpointCommandV2,
+  RecordCheckpointCommandV3,
+} from "../src/orchestrator/lifecycle/contracts/commands.js";
 import {
   LifecycleCommandStore,
   type LifecycleCommandEnvelope,
@@ -23,7 +27,10 @@ import { LifecycleError } from "../src/orchestrator/lifecycle/errors.js";
 import { buildLifecycleIntentWitness } from "../src/orchestrator/lifecycle/lifecycle-intent-witness.js";
 import { canonicalJson } from "../src/orchestrator/serialization/canonical-json.js";
 import type { SqliteConnection, SqliteStatement } from "../src/orchestrator/storage/sqlite-driver.js";
-import { checkpointFixture } from "./support/lifecycle-fixtures.js";
+import {
+  checkpointFixture,
+  qualifiedCheckpointFixture,
+} from "./support/lifecycle-fixtures.js";
 
 const EXPECTED_RISKY_TRANSITIONS = Object.freeze([
   "ownership-transfer",
@@ -43,12 +50,21 @@ interface CheckpointServiceLike {
     };
     readonly afterAppend: (committed: unknown, transaction: unknown) => void;
   };
+  prepareFinalPhase(transaction: unknown, input: unknown): {
+    readonly action: Readonly<Record<string, unknown>>;
+    readonly effect: ReturnType<CheckpointServiceLike["record"]>;
+  };
+  recordPreparedFinal(
+    transaction: unknown,
+    prepared: unknown,
+  ): ReturnType<CheckpointServiceLike["record"]>;
 }
 
 type CheckpointServiceModule = Readonly<Record<string, unknown>> & {
   readonly CheckpointService?: new (options: unknown) => CheckpointServiceLike;
   readonly checkpointAgeDiagnosticV1?: (input: unknown) => Readonly<Record<string, unknown>>;
   readonly requireRiskyTransitionCheckpointV1?: (input: unknown) => unknown;
+  readonly decodeCheckpointRecordedResult?: (input: unknown) => Readonly<Record<string, unknown>>;
 };
 
 async function optionalCheckpointServiceModule(): Promise<CheckpointServiceModule> {
@@ -68,6 +84,12 @@ async function optionalCheckpointServiceModule(): Promise<CheckpointServiceModul
             append: { events: Object.freeze([]), publicResponse: Object.freeze({}) },
             afterAppend: () => undefined,
           };
+        }
+        prepareFinalPhase(): ReturnType<CheckpointServiceLike["prepareFinalPhase"]> {
+          throw new Error("MISSING_CHECKPOINT_SERVICE");
+        }
+        recordPreparedFinal(): ReturnType<CheckpointServiceLike["record"]> {
+          throw new Error("MISSING_CHECKPOINT_SERVICE");
         }
       }
       return Object.freeze({ CheckpointService: MissingCheckpointService });
@@ -93,6 +115,25 @@ const CREATED_AT = "2026-07-18T01:02:03.004Z";
 
 function draft(): Readonly<Record<string, unknown>> {
   const fixture = checkpointFixture();
+  const {
+    checkpointId: _checkpointId,
+    sessionId: _sessionId,
+    parentSessionId: _parentSessionId,
+    baseEventPosition: _baseEventPosition,
+    checkpointEventPosition: _checkpointEventPosition,
+    createdAt: _createdAt,
+    creatorAgentId: _creatorAgentId,
+    creatorClientInstanceId: _creatorClientInstanceId,
+    sourceState: _sourceState,
+    childSummaries: _childSummaries,
+    evidenceCoverage: _evidenceCoverage,
+    ...content
+  } = fixture;
+  return content;
+}
+
+function qualifiedDraft(): Readonly<Record<string, unknown>> {
+  const fixture = qualifiedCheckpointFixture();
   const {
     checkpointId: _checkpointId,
     sessionId: _sessionId,
@@ -198,6 +239,10 @@ interface AuthorityHarness {
     clears: unknown[];
     sourceCaptures: unknown[];
     latestCheckpointReads: unknown[];
+    version1Eligibility: unknown[];
+    version2Snapshots: unknown[];
+    identities: unknown[];
+    clocks: unknown[];
   };
 }
 
@@ -207,12 +252,19 @@ function authorityHarness(options: {
   readonly faultPoint?: string;
   readonly corruptLatestCheckpointFingerprint?: boolean;
   readonly corruptChildLatestCheckpointFingerprint?: boolean;
+  readonly eligibilityError?: Error;
+  readonly snapshotError?: Error;
+  readonly snapshot?: Readonly<Record<string, unknown>>;
 } = {}): AuthorityHarness {
   const calls = {
     checkpointUpdates: [] as unknown[],
     clears: [] as unknown[],
     sourceCaptures: [] as unknown[],
     latestCheckpointReads: [] as unknown[],
+    version1Eligibility: [] as unknown[],
+    version2Snapshots: [] as unknown[],
+    identities: [] as unknown[],
+    clocks: [] as unknown[],
   };
   const priorCheckpointId = options.corruptLatestCheckpointFingerprint === true
     ? "77777777-7777-4777-8777-777777777777"
@@ -305,7 +357,25 @@ function authorityHarness(options: {
   });
   return {
     calls,
-    transaction: Object.freeze({ authority }),
+    transaction: Object.freeze({
+      authority,
+      coverage: Object.freeze({
+        assertVersion1Eligible: (sessionIds: readonly string[]) => {
+          calls.version1Eligibility.push([...sessionIds]);
+          if (options.eligibilityError !== undefined) throw options.eligibilityError;
+        },
+        snapshotV2: (sessionId: string, baseEventPosition: bigint) => {
+          calls.version2Snapshots.push({ sessionId, baseEventPosition });
+          if (options.snapshotError !== undefined) throw options.snapshotError;
+          return options.snapshot ?? Object.freeze({
+            coverageVersion: 2,
+            captureMode: "coverage-only",
+            contentRetained: false,
+            adapterSessions: Object.freeze([]),
+          });
+        },
+      }),
+    }),
   };
 }
 
@@ -315,6 +385,9 @@ async function checkpointServiceFixture(options: {
   readonly faultPoint?: string;
   readonly corruptLatestCheckpointFingerprint?: boolean;
   readonly corruptChildLatestCheckpointFingerprint?: boolean;
+  readonly eligibilityError?: Error;
+  readonly snapshotError?: Error;
+  readonly snapshot?: Readonly<Record<string, unknown>>;
 } = {}): Promise<{
   readonly service: CheckpointServiceLike;
   readonly harness: AuthorityHarness;
@@ -359,8 +432,18 @@ async function checkpointServiceFixture(options: {
     service: new Service({
       invocationScope: { current: () => invocation },
       sourceStateProvider,
-      identitySource: { uuid: () => CHECKPOINT_ID },
-      clock: { now: () => CREATED_AT },
+      identitySource: {
+        uuid: () => {
+          harness.calls.identities.push(true);
+          return CHECKPOINT_ID;
+        },
+      },
+      clock: {
+        now: () => {
+          harness.calls.clocks.push(true);
+          return CREATED_AT;
+        },
+      },
       coverageSnapshot: {
         capture: () => Object.freeze({
           captureMode: "coverage-only",
@@ -392,6 +475,36 @@ function committedCheckpointBatch(position = 51n): Readonly<Record<string, unkno
 }
 
 describe("Checkpoint Version 1 contract corrections", () => {
+  it("strictly decodes versioned checkpoint results without mixed fields", async () => {
+    const module = await optionalCheckpointServiceModule();
+    assert.equal(typeof module.decodeCheckpointRecordedResult, "function");
+    for (const checkpointVersion of [1, 2] as const) {
+      const result = {
+        checkpointVersion,
+        checkpointId: CHECKPOINT_ID,
+        sessionId: ROOT_ID,
+        baseEventPosition: "50",
+        checkpointEventPosition: "51",
+        finalStreamVersion: "4",
+        checkpointRequiredCleared: false,
+      };
+      assert.deepEqual(module.decodeCheckpointRecordedResult!(result), result);
+      assert.throws(
+        () => module.decodeCheckpointRecordedResult!({ ...result, checkpointBody: {} }),
+        /LIFECYCLE_INPUT_INVALID/u,
+      );
+    }
+    assert.throws(() => module.decodeCheckpointRecordedResult!({
+      checkpointVersion: 2,
+      checkpointId: CHECKPOINT_ID,
+      sessionId: ROOT_ID,
+      baseEventPosition: "51",
+      checkpointEventPosition: "51",
+      finalStreamVersion: "4",
+      checkpointRequiredCleared: false,
+    }), /LIFECYCLE_INPUT_INVALID/u);
+  });
+
   it("records explicit non-retention in coverage-only checkpoint evidence", () => {
     const checkpoint = decodeCheckpointV1(checkpointFixture());
     assert.equal(
@@ -642,6 +755,214 @@ describe("RiskyTransitionPolicy Version 1", () => {
 });
 
 describe("CheckpointService transactional enrichment", () => {
+  it("dispatches checkpoint preparation once on checkpointVersion", async () => {
+    const version1 = await checkpointServiceFixture();
+    const version2 = await checkpointServiceFixture();
+    try {
+      const v1Effect = version1.service.record(
+        version1.harness.transaction,
+        checkpointCommand({ draft: decodeCheckpointDraftV1(draft()) }),
+      );
+      const v2Effect = version2.service.record(
+        version2.harness.transaction,
+        checkpointCommand({
+          commandId: "77777777-7777-4777-8777-777777777777",
+          idempotencyKey: "checkpoint-test/v2",
+          draft: decodeCheckpointDraftV2(qualifiedDraft()),
+        }) as unknown as RecordCheckpointCommandV3,
+      );
+
+      assert.equal(v1Effect.append.publicResponse.checkpointVersion, 1);
+      assert.equal(v2Effect.append.publicResponse.checkpointVersion, 2);
+      assert.equal(v1Effect.append.events[0]?.eventSchemaVersion, 1);
+      assert.equal(v2Effect.append.events[0]?.eventSchemaVersion, 2);
+      assert.deepEqual(version1.harness.calls.version1Eligibility, [[ROOT_ID]]);
+      assert.deepEqual(version1.harness.calls.version2Snapshots, []);
+      assert.deepEqual(version2.harness.calls.version1Eligibility, []);
+      assert.deepEqual(version2.harness.calls.version2Snapshots, [{
+        sessionId: ROOT_ID,
+        baseEventPosition: 50n,
+      }]);
+    } finally {
+      version1.cleanup();
+      version2.cleanup();
+    }
+  });
+
+  it("retains deterministic overlapping adapter coverage and latest batch linkage", async () => {
+    const adapter = (
+      adapterSessionId: string,
+      highestContiguousOrdinal: string,
+      missingIntervals: readonly Readonly<Record<string, string>>[],
+      latestBatchId: string,
+      latestBatchEventPosition: string,
+    ) => Object.freeze({
+      adapterSessionId,
+      coverageFirstOrdinal: "0",
+      coverageLastOrdinal: "2",
+      highestContiguousOrdinal,
+      missingIntervals: Object.freeze(missingIntervals),
+      frameFingerprintAlgorithm: "hmac-sha256",
+      frameFingerprintSchemaVersion: 1,
+      frameFingerprintKeyId: "coverage-key-1",
+      frameFingerprintDomain: "pm-evidence-frame-v1",
+      coverageFingerprintAlgorithm: "hmac-sha256",
+      coverageFingerprintSchemaVersion: 1,
+      coverageFingerprintKeyId: "coverage-key-1",
+      coverageFingerprintDomain: "pm-evidence-coverage-v1",
+      coverageFingerprint: "a".repeat(64),
+      latestBatchId,
+      latestBatchEventPosition,
+    });
+    const snapshot = Object.freeze({
+      coverageVersion: 2,
+      captureMode: "coverage-only",
+      contentRetained: false,
+      adapterSessions: Object.freeze([
+        adapter(
+          "11111111-1111-4111-8111-111111111111",
+          "0",
+          [{ firstOrdinal: "1", lastOrdinal: "2" }],
+          "88888888-8888-4888-8888-888888888888",
+          "42",
+        ),
+        adapter(
+          "22222222-2222-4222-8222-222222222222",
+          "2",
+          [],
+          "99999999-9999-4999-8999-999999999999",
+          "49",
+        ),
+      ]),
+    });
+    const fixture = await checkpointServiceFixture({ snapshot });
+    try {
+      const effect = fixture.service.record(fixture.harness.transaction, checkpointCommand({
+        commandId: "77777777-7777-4777-8777-777777777777",
+        idempotencyKey: "checkpoint-test/v2-overlap",
+        draft: qualifiedDraft(),
+      }));
+      const event = effect.append.events[0] as {
+        readonly payload: { readonly checkpoint: Readonly<Record<string, unknown>> };
+      };
+      assert.deepEqual(event.payload.checkpoint.evidenceCoverage, snapshot);
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it("rejects unavailable checkpoint evidence keys before source, clock, or UUID work", async () => {
+    const unavailable = new Error("EVIDENCE_FINGERPRINT_KEY_UNAVAILABLE");
+    const version1 = await checkpointServiceFixture({ eligibilityError: unavailable });
+    const version2 = await checkpointServiceFixture({ snapshotError: unavailable });
+    try {
+      assert.throws(
+        () => version1.service.record(version1.harness.transaction, checkpointCommand()),
+        /EVIDENCE_FINGERPRINT_KEY_UNAVAILABLE/u,
+      );
+      assert.throws(
+        () => version2.service.record(
+          version2.harness.transaction,
+          checkpointCommand({
+            commandId: "77777777-7777-4777-8777-777777777777",
+            idempotencyKey: "checkpoint-test/v2-unavailable",
+            draft: qualifiedDraft(),
+          }),
+        ),
+        /EVIDENCE_FINGERPRINT_KEY_UNAVAILABLE/u,
+      );
+      for (const fixture of [version1, version2]) {
+        assert.equal(fixture.harness.calls.sourceCaptures.length, 0);
+        assert.equal(fixture.harness.calls.clocks.length, 0);
+        assert.equal(fixture.harness.calls.identities.length, 0);
+      }
+    } finally {
+      version1.cleanup();
+      version2.cleanup();
+    }
+  });
+
+  it("owns each final checkpoint preparation in one transaction and consumes it once", async () => {
+    const fixture = await checkpointServiceFixture();
+    try {
+      const command = checkpointCommand() as unknown as RecordCheckpointCommandV2;
+      const prepared = fixture.service.prepareFinalPhase(fixture.harness.transaction, {
+        command,
+        materializationTarget: "memory/final.md",
+      });
+      assert.equal(prepared.action.action, "record-final-checkpoint-and-queue-ending");
+      assert.equal(
+        (prepared.action.finalCheckpoint as Readonly<Record<string, unknown>>).checkpointVersion,
+        1,
+      );
+      assert.equal(prepared.action.materializationTarget, "memory/final.md");
+      assert.equal(
+        (fixture.harness.calls.sourceCaptures[0] as Readonly<Record<string, unknown>>).final,
+        true,
+      );
+
+      const foreignTransaction = Object.freeze({ ...fixture.harness.transaction });
+      assert.throws(
+        () => fixture.service.recordPreparedFinal(foreignTransaction, prepared),
+        /INTEGRITY_FAILURE/u,
+      );
+      assert.throws(
+        () => fixture.service.recordPreparedFinal(
+          fixture.harness.transaction,
+          { ...prepared },
+        ),
+        /INTEGRITY_FAILURE/u,
+      );
+      assert.equal(
+        fixture.service.recordPreparedFinal(fixture.harness.transaction, prepared),
+        prepared.effect,
+      );
+      assert.throws(
+        () => fixture.service.recordPreparedFinal(fixture.harness.transaction, prepared),
+        /INTEGRITY_FAILURE/u,
+      );
+      assert.throws(
+        () => fixture.service.prepareFinalPhase(fixture.harness.transaction, {
+          command,
+          materializationTarget: "memory/final.md",
+          finalCheckpointId: CHECKPOINT_ID,
+        }),
+        /LIFECYCLE_INPUT_INVALID/u,
+      );
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it("prepares a full qualified final action from only the stable draft and target", async () => {
+    const fixture = await checkpointServiceFixture();
+    try {
+      const command = checkpointCommand({
+        commandId: "77777777-7777-4777-8777-777777777777",
+        idempotencyKey: "checkpoint-test/v2-final",
+        draft: qualifiedDraft(),
+      }) as unknown as RecordCheckpointCommandV3;
+      const prepared = fixture.service.prepareFinalPhase(fixture.harness.transaction, {
+        command,
+        materializationTarget: "memory/qualified-final.md",
+      });
+      const checkpoint = prepared.action.finalCheckpoint as Readonly<Record<string, unknown>>;
+      assert.equal(checkpoint.checkpointVersion, 2);
+      assert.deepEqual(checkpoint.evidenceCoverage, {
+        coverageVersion: 2,
+        captureMode: "coverage-only",
+        contentRetained: false,
+        adapterSessions: [],
+      });
+      assert.equal(
+        fixture.service.recordPreparedFinal(fixture.harness.transaction, prepared),
+        prepared.effect,
+      );
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
   it("derives the base, event position, source witness, coverage, and root child summaries", async () => {
     const fixture = await checkpointServiceFixture();
     try {
@@ -672,8 +993,8 @@ describe("CheckpointService transactional enrichment", () => {
       assert.deepEqual(event.payload.checkpoint.evidenceCoverage, {
         captureMode: "coverage-only",
         contentRetained: false,
-        highestContiguousOrdinal: "4",
-        missingIntervals: [{ firstOrdinal: "5", lastOrdinal: "6" }],
+        highestContiguousOrdinal: null,
+        missingIntervals: [],
       });
       assert.equal(fixture.harness.calls.sourceCaptures.length, 1);
       assert.equal(effect.append.publicResponse.baseEventPosition, "50");
@@ -932,7 +1253,14 @@ describe("CheckpointService transactional enrichment", () => {
 
       const replay = store.execute(envelope, (transaction) => {
         freshCallbacks += 1;
-        return fixture.service.record(transaction, command) as unknown as PreparedLifecycleCommit<JsonValue>;
+        const prepared = fixture.service.prepareFinalPhase(transaction, {
+          command,
+          materializationTarget: "memory/final.md",
+        });
+        return fixture.service.recordPreparedFinal(
+          transaction,
+          prepared,
+        ) as unknown as PreparedLifecycleCommit<JsonValue>;
       });
 
       assert.equal(replay.deduplicated, true);

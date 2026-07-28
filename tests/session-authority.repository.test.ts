@@ -28,7 +28,11 @@ import type {
   SqliteRunResult,
   SqliteStatement,
 } from "../src/orchestrator/storage/sqlite-driver.js";
-import type { LifecycleEventV1 } from "../src/orchestrator/lifecycle/contracts/events.js";
+import {
+  decodeLifecycleEvent,
+  type LifecycleEvent,
+  type LifecycleEventV1,
+} from "../src/orchestrator/lifecycle/contracts/events.js";
 import type { LifecycleError } from "../src/orchestrator/lifecycle/errors.js";
 import {
   CHILD_SESSION_ID,
@@ -38,6 +42,8 @@ import {
   STORE_ID,
   VAULT_ID,
   WORKSPACE_ID,
+  checkpointFixture,
+  qualifiedCheckpointFixture,
   lifecycleEvent,
 } from "./support/lifecycle-fixtures.js";
 
@@ -463,7 +469,7 @@ function mutation(record: SessionAuthorityRecord): SessionAuthorityMutation {
   return next;
 }
 
-function eventRow(event: LifecycleEventV1): SqliteRow {
+function eventRow(event: LifecycleEvent): SqliteRow {
   return {
     global_position: BigInt(event.globalPosition),
     event_id: event.eventId,
@@ -726,6 +732,44 @@ describe("SessionAuthorityRepository inserts, CAS, and queries", () => {
 });
 
 describe("SessionAuthorityRepository fold and checkpoint guards", () => {
+  it("resolves a historical checkpoint only by its stored global position", () => {
+    const historicalCheckpointId = "22222222-2222-4222-8222-222222222222";
+    const historicalCheckpoint = checkpointFixture({
+      checkpointId: historicalCheckpointId as typeof CHECKPOINT_ID,
+      baseEventPosition: 1,
+      checkpointEventPosition: 2,
+    });
+    const historicalEvent = lifecycleEvent(2, "SessionCheckpointRecorded", {
+      checkpoint: historicalCheckpoint,
+      baseEventPosition: "1",
+      checkpointEventPosition: "2",
+    }, {
+      globalPosition: 2,
+      sessionId: ROOT_SESSION_ID,
+      parentSessionId: null,
+    }) as Extract<LifecycleEventV1, { readonly eventType: "SessionCheckpointRecorded" }>;
+    const connection = new RecordingConnection((sql, kind, params) => {
+      assert.equal(kind, "get");
+      assert.match(sql, /WHERE\s+global_position\s*=\s*\$checkpointEventPosition/iu);
+      assert.deepEqual(params, { $checkpointEventPosition: 2n });
+      return eventRow(historicalEvent);
+    });
+
+    const resolved = new SessionAuthorityRepository().requireCheckpointAtEventPosition(
+      connection,
+      {
+        projectId: PROJECT_ID,
+        sessionId: ROOT_SESSION_ID,
+        checkpointId: historicalCheckpointId as typeof CHECKPOINT_ID,
+        checkpointEventPosition: 2n,
+      },
+    );
+
+    assert.deepEqual(resolved, historicalCheckpoint);
+    assert.equal(connection.calls.length, 1);
+    assert.equal(connection.calls[0]?.kind, "get");
+  });
+
   it("loads only the indexed latest checkpoint and verifies its domain fingerprint", () => {
     const base = rootAuthority();
     const started = lifecycleEvent(1, "SessionStarted", {}, {
@@ -736,10 +780,15 @@ describe("SessionAuthorityRepository fold and checkpoint guards", () => {
       sessionId: ROOT_SESSION_ID,
       parentSessionId: null,
     }) as Extract<LifecycleEventV1, { readonly eventType: "SessionCheckpointRecorded" }>;
-    const checkpointFingerprint = createHash("sha256")
-      .update("project-memory/checkpoint/v1\n", "utf8")
-      .update(canonicalJson(checkpoint.payload.checkpoint), "utf8")
-      .digest("hex");
+    const checkpointFingerprint =
+      "339bf93de777eee55732671bbb0b6b3bca3202a521771ea4eee115a4531e2b1d";
+    assert.equal(
+      createHash("sha256")
+        .update("project-memory/checkpoint/v1\n", "utf8")
+        .update(canonicalJson(checkpoint.payload.checkpoint), "utf8")
+        .digest("hex"),
+      checkpointFingerprint,
+    );
     const authority = rootAuthority({
       latestCheckpointId: CHECKPOINT_ID,
       latestCheckpointEventPosition: 2n,
@@ -780,6 +829,111 @@ describe("SessionAuthorityRepository fold and checkpoint guards", () => {
     expectCode(
       "INTEGRITY_FAILURE",
       () => new SessionAuthorityRepository().latestCheckpoint(tampered, authority),
+    );
+  });
+
+  it("loads a qualified latest checkpoint with only the Version 2 hash domain", () => {
+    const base = rootAuthority();
+    const started = lifecycleEvent(1, "SessionStarted", {}, {
+      authorityCommitment: base.authorityCommitment,
+    }) as LifecycleEventV1;
+    const checkpoint = qualifiedCheckpointFixture({
+      baseEventPosition: 1,
+      checkpointEventPosition: 2,
+    });
+    const checkpointEvent = decodeLifecycleEvent({
+      ...lifecycleEvent(2, "SessionCheckpointRecorded", {}, {
+        authorityCommitment: base.authorityCommitment,
+        sessionId: ROOT_SESSION_ID,
+        parentSessionId: null,
+      }),
+      eventSchemaVersion: 2,
+      payload: {
+        checkpoint,
+        baseEventPosition: "1",
+        checkpointEventPosition: "2",
+      },
+    });
+    const version2Fingerprint =
+      "3280a70a2dea35aec587065902134933a46233081bc35b060c3c6963036c4dba";
+    assert.equal(
+      createHash("sha256")
+        .update("project-memory/checkpoint/v2\n", "utf8")
+        .update(canonicalJson(checkpoint), "utf8")
+        .digest("hex"),
+      version2Fingerprint,
+    );
+    const authority = rootAuthority({
+      latestCheckpointId: CHECKPOINT_ID,
+      latestCheckpointEventPosition: 2n,
+      latestCheckpointFingerprint: version2Fingerprint,
+    });
+    const connection = new RecordingConnection((sql, kind) => {
+      if (kind === "all" && /FROM events/iu.test(sql)) {
+        return [eventRow(started), eventRow(checkpointEvent)];
+      }
+      throw new Error("unexpected statement method");
+    });
+    assert.deepEqual(
+      new SessionAuthorityRepository().latestCheckpoint(connection, authority),
+      checkpoint,
+    );
+
+    const version1Fingerprint = createHash("sha256")
+      .update("project-memory/checkpoint/v1\n", "utf8")
+      .update(canonicalJson(checkpoint), "utf8")
+      .digest("hex");
+    expectCode(
+      "INTEGRITY_FAILURE",
+      () => new SessionAuthorityRepository().latestCheckpoint(connection, {
+        ...authority,
+        latestCheckpointFingerprint: version1Fingerprint,
+      }),
+    );
+  });
+
+  it("rejects direct checkpoint lookup when any supplied or nested binding differs", () => {
+    const checkpoint = checkpointFixture({ baseEventPosition: 1, checkpointEventPosition: 2 });
+    const event = lifecycleEvent(2, "SessionCheckpointRecorded", {
+      checkpoint,
+      baseEventPosition: "1",
+      checkpointEventPosition: "2",
+    }, {
+      globalPosition: 2,
+      sessionId: ROOT_SESSION_ID,
+      parentSessionId: null,
+    }) as Extract<LifecycleEventV1, { readonly eventType: "SessionCheckpointRecorded" }>;
+    let row = eventRow(event);
+    const connection = new RecordingConnection((_sql, kind) => {
+      if (kind === "get") return row;
+      throw new Error("unexpected statement method");
+    });
+    const repository = new SessionAuthorityRepository();
+    const exact = {
+      projectId: PROJECT_ID,
+      sessionId: ROOT_SESSION_ID,
+      checkpointId: CHECKPOINT_ID,
+      checkpointEventPosition: 2n,
+    };
+    for (const mismatch of [
+      { ...exact, projectId: VAULT_ID },
+      { ...exact, sessionId: CHILD_SESSION_ID },
+      { ...exact, checkpointId: "22222222-2222-4222-8222-222222222222" },
+    ]) {
+      expectCode(
+        "INTEGRITY_FAILURE",
+        () => repository.requireCheckpointAtEventPosition(
+          connection,
+          mismatch as unknown as Parameters<
+            SessionAuthorityRepository["requireCheckpointAtEventPosition"]
+          >[1],
+        ),
+      );
+    }
+    row = { ...eventRow(event), event_schema_version: 2n };
+    expectCode(
+      "INTEGRITY_FAILURE",
+      () => repository.requireCheckpointAtEventPosition(connection, exact),
     );
   });
 

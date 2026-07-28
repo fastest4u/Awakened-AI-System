@@ -14,15 +14,21 @@ import type {
   SessionAuthorityRecord,
 } from "../storage/lifecycle-storage.types.js";
 import {
+  decodeCheckpointDraftV2,
   decodeCheckpointDraftV1,
+  decodeCheckpointV2,
   decodeCheckpointV1,
-  type CheckpointDraftV1,
+  type Checkpoint,
+  type CheckpointDraft,
   type CheckpointEvidenceCoverageV1,
+  type CheckpointEvidenceCoverageV2,
   type CheckpointV1,
   type SourceStateFingerprintV1,
 } from "./contracts/checkpoint.js";
 import {
   decodeLifecycleSemanticCommandDraft,
+  type RecordFinalCheckpointAndQueueEndingActionV1,
+  type RecordFinalCheckpointAndQueueEndingActionV2,
   type RecordCheckpointCommandV2,
   type RecordCheckpointCommandV3,
 } from "./contracts/commands.js";
@@ -64,6 +70,20 @@ export type CheckpointRecordedResultV1 = JsonValue & {
   readonly checkpointRequiredCleared: boolean;
 };
 
+export type CheckpointRecordedResultV2 = JsonValue & {
+  readonly checkpointVersion: 2;
+  readonly checkpointId: string;
+  readonly sessionId: string;
+  readonly baseEventPosition: string;
+  readonly checkpointEventPosition: string;
+  readonly finalStreamVersion: string;
+  readonly checkpointRequiredCleared: boolean;
+};
+
+export type CheckpointRecordedResult =
+  | CheckpointRecordedResultV1
+  | CheckpointRecordedResultV2;
+
 export type FreshLifecycleEffect<T extends JsonValue> = PreparedLifecycleCommit<T>;
 
 export interface TrustedCheckpointInvocationV1 {
@@ -76,7 +96,7 @@ export interface TrustedCheckpointInvocationV1 {
 export interface CheckpointInvocationScope {
   current(
     transaction: LifecycleCommandTransaction,
-    command: RecordCheckpointCommandV2,
+    command: RecordCheckpointCommandV2 | RecordCheckpointCommandV3,
   ): TrustedCheckpointInvocationV1;
 }
 
@@ -91,8 +111,19 @@ export interface CheckpointCoverageSnapshotPort {
   ): CheckpointEvidenceCoverageV1;
 }
 
-export interface FinalCheckpointPhaseInput {
-  readonly command: RecordCheckpointCommandV2;
+export interface FinalCheckpointPhasePreparationInput {
+  readonly command: RecordCheckpointCommandV2 | RecordCheckpointCommandV3;
+  readonly materializationTarget: string;
+}
+
+const PREPARED_FINAL_CHECKPOINT_PHASE = Symbol("prepared-final-checkpoint-phase");
+
+export interface PreparedFinalCheckpointPhase {
+  readonly [PREPARED_FINAL_CHECKPOINT_PHASE]: true;
+  readonly action:
+    | RecordFinalCheckpointAndQueueEndingActionV1
+    | RecordFinalCheckpointAndQueueEndingActionV2;
+  readonly effect: FreshLifecycleEffect<CheckpointRecordedResult>;
 }
 
 export interface CheckpointServiceOptions {
@@ -114,7 +145,7 @@ export interface RiskyTransitionRelevantChildV1 {
 export interface RiskyTransitionCheckpointInputV1 {
   readonly authority: SessionAuthorityRecord;
   readonly aggregate: SessionAggregateState;
-  readonly checkpoint: CheckpointV1 | null;
+  readonly checkpoint: Checkpoint | null;
   readonly explicitCheckpointId?: string;
   readonly minimumBaseEventPosition?: bigint;
   readonly relevantChildren: readonly RiskyTransitionRelevantChildV1[];
@@ -131,7 +162,7 @@ export interface CheckpointAgeDiagnosticInputV1 {
     | "checkpointRequiredReason"
     | "checkpointRequiredEventPosition"
   >;
-  readonly checkpoint: CheckpointV1 | null;
+  readonly checkpoint: Checkpoint | null;
   readonly observedAt: string;
 }
 
@@ -152,7 +183,7 @@ export type CheckpointAgeDiagnosticV1 = JsonValue & {
 interface CheckpointAuthorityOperations {
   get(projectId: string, sessionId: string): SessionAuthorityRecord | null;
   requireFoldMatch(authority: SessionAuthorityRecord): SessionAggregateState;
-  latestCheckpoint(authority: SessionAuthorityRecord): CheckpointV1 | null;
+  latestCheckpoint(authority: SessionAuthorityRecord): Checkpoint | null;
   listNonterminalChildren(projectId: string, rootSessionId: string): readonly SessionAuthorityRecord[];
   nextGlobalPosition(): bigint;
   updateCheckpointIndex(input: CheckpointIndexCompareAndSwap): boolean;
@@ -202,7 +233,10 @@ function canonicalNow(clock: CheckpointClock): string {
   return canonicalTimestamp(clock.now());
 }
 
-function assertContext(context: ProjectContext, command: RecordCheckpointCommandV2): void {
+function assertContext(
+  context: ProjectContext,
+  command: RecordCheckpointCommandV2 | RecordCheckpointCommandV3,
+): void {
   const binding = context?.binding;
   if (binding === undefined
     || context.workspace !== binding.workspace
@@ -217,7 +251,7 @@ function assertContext(context: ProjectContext, command: RecordCheckpointCommand
   if (branchRef !== command.expectedBranchRef) throw new LifecycleError("WORKSPACE_AMBIGUOUS");
 }
 
-function assertDraftPaths(context: ProjectContext, draft: CheckpointDraftV1): void {
+function assertDraftPaths(context: ProjectContext, draft: CheckpointDraft): void {
   try {
     for (const file of draft.filesTouched) {
       resolveContainedProjectPath(context.binding.projectRoot, file.path);
@@ -240,7 +274,7 @@ function assertDraftPaths(context: ProjectContext, draft: CheckpointDraftV1): vo
  */
 export function requireTrustedCheckpointDraftV1(
   context: ProjectContext,
-  draft: CheckpointDraftV1,
+  draft: CheckpointDraft,
   sourceState: SourceStateFingerprintV1,
 ): void {
   assertDraftPaths(context, draft);
@@ -284,9 +318,68 @@ function syncValue<T>(value: T): T {
   return value;
 }
 
-function checkpointFingerprint(checkpoint: CheckpointV1): string {
+const CHECKPOINT_RESULT_KEYS = [
+  "checkpointVersion",
+  "checkpointId",
+  "sessionId",
+  "baseEventPosition",
+  "checkpointEventPosition",
+  "finalStreamVersion",
+  "checkpointRequiredCleared",
+] as const;
+const LOWER_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
+const UNSIGNED_DECIMAL = /^(?:0|[1-9][0-9]*)$/u;
+
+export function decodeCheckpointRecordedResult(
+  value: unknown,
+): CheckpointRecordedResult {
+  if (typeof value !== "object" || value === null || Array.isArray(value)
+    || (Object.getPrototypeOf(value) !== Object.prototype && Object.getPrototypeOf(value) !== null)) {
+    invalid();
+  }
+  const record = value as Readonly<Record<string, unknown>>;
+  const keys = Reflect.ownKeys(record);
+  if (keys.length !== CHECKPOINT_RESULT_KEYS.length
+    || keys.some((key) => typeof key !== "string" || !CHECKPOINT_RESULT_KEYS.includes(
+      key as (typeof CHECKPOINT_RESULT_KEYS)[number],
+    ))) invalid();
+  for (const key of CHECKPOINT_RESULT_KEYS) {
+    const descriptor = Object.getOwnPropertyDescriptor(record, key);
+    if (descriptor === undefined || !descriptor.enumerable || !("value" in descriptor)) invalid();
+  }
+  if (record.checkpointVersion !== 1 && record.checkpointVersion !== 2) invalid();
+  if (typeof record.checkpointId !== "string" || !LOWER_UUID.test(record.checkpointId)
+    || typeof record.sessionId !== "string" || !LOWER_UUID.test(record.sessionId)
+    || typeof record.baseEventPosition !== "string" || !UNSIGNED_DECIMAL.test(record.baseEventPosition)
+    || typeof record.checkpointEventPosition !== "string"
+    || !UNSIGNED_DECIMAL.test(record.checkpointEventPosition)
+    || typeof record.finalStreamVersion !== "string" || !UNSIGNED_DECIMAL.test(record.finalStreamVersion)
+    || record.baseEventPosition.length > 19
+    || record.checkpointEventPosition.length > 19
+    || record.finalStreamVersion.length > 19
+    || record.checkpointRequiredCleared !== true && record.checkpointRequiredCleared !== false) invalid();
+  const baseEventPosition = BigInt(record.baseEventPosition);
+  const checkpointEventPosition = BigInt(record.checkpointEventPosition);
+  const finalStreamVersion = BigInt(record.finalStreamVersion);
+  if (baseEventPosition < 1n
+    || checkpointEventPosition !== baseEventPosition + 1n
+    || checkpointEventPosition > SQLITE_INT64_MAX
+    || finalStreamVersion < 1n
+    || finalStreamVersion > SQLITE_INT64_MAX) invalid();
+  return Object.freeze({
+    checkpointVersion: record.checkpointVersion,
+    checkpointId: record.checkpointId,
+    sessionId: record.sessionId,
+    baseEventPosition: record.baseEventPosition,
+    checkpointEventPosition: record.checkpointEventPosition,
+    finalStreamVersion: record.finalStreamVersion,
+    checkpointRequiredCleared: record.checkpointRequiredCleared,
+  }) as CheckpointRecordedResult;
+}
+
+function checkpointFingerprint(checkpoint: Checkpoint): string {
   return createHash("sha256")
-    .update("project-memory/checkpoint/v1\n", "utf8")
+    .update(`project-memory/checkpoint/v${checkpoint.checkpointVersion}\n`, "utf8")
     .update(canonicalJson(checkpoint), "utf8")
     .digest("hex");
 }
@@ -312,7 +405,11 @@ export function checkpointAgeDiagnosticV1(
       || authority.latestCheckpointEventPosition !== null
       || authority.latestCheckpointFingerprint !== null) invalid("INTEGRITY_FAILURE");
   } else {
-    const checkpoint = decodeCheckpointV1(input.checkpoint);
+    const checkpoint = input.checkpoint.checkpointVersion === 1
+      ? decodeCheckpointV1(input.checkpoint)
+      : input.checkpoint.checkpointVersion === 2
+        ? decodeCheckpointV2(input.checkpoint)
+        : invalid("INTEGRITY_FAILURE");
     latestCheckpointCreatedAt = checkpoint.createdAt;
     baseline = latestCheckpointCreatedAt;
     if (checkpoint.sessionId !== authority.sessionId
@@ -351,8 +448,15 @@ export function checkpointAgeDiagnosticV1(
  */
 export function requireRiskyTransitionCheckpointV1(
   input: RiskyTransitionCheckpointInputV1,
-): CheckpointV1 {
-  const { authority, aggregate, checkpoint } = input;
+): Checkpoint {
+  const { authority, aggregate } = input;
+  const checkpoint = input.checkpoint === null
+    ? null
+    : input.checkpoint.checkpointVersion === 1
+      ? decodeCheckpointV1(input.checkpoint)
+      : input.checkpoint.checkpointVersion === 2
+        ? decodeCheckpointV2(input.checkpoint)
+        : invalid("INTEGRITY_FAILURE");
   if ((authority.checkpointRequiredReason === null)
       !== (authority.checkpointRequiredEventPosition === null)) invalid("INTEGRITY_FAILURE");
   if (authority.checkpointRequiredEventPosition !== null) {
@@ -427,13 +531,13 @@ export function requireRiskyTransitionCheckpointV1(
 }
 
 function pendingCheckpointEvent(
-  checkpoint: CheckpointV1,
+  checkpoint: Checkpoint,
   parentSessionId: string | null,
   occurredAt: string,
 ): PendingEvent {
   return {
     eventType: "SessionCheckpointRecorded",
-    eventSchemaVersion: 1,
+    eventSchemaVersion: checkpoint.checkpointVersion,
     occurredAt,
     visibilityScope: "session",
     sessionId: checkpoint.sessionId,
@@ -456,8 +560,14 @@ export class CheckpointService {
   readonly #sourceState: SourceStateProvider;
   readonly #ids: CheckpointIdentitySource;
   readonly #clock: CheckpointClock;
-  readonly #coverage: CheckpointCoverageSnapshotPort;
   readonly #faultInjector: CheckpointServiceOptions["faultInjector"];
+  readonly #preparedFinals = new WeakMap<
+    PreparedFinalCheckpointPhase,
+    {
+      readonly transaction: LifecycleCommandTransaction;
+      readonly effect: FreshLifecycleEffect<CheckpointRecordedResult>;
+    }
+  >();
 
   constructor(options: CheckpointServiceOptions) {
     if (options === undefined || typeof options !== "object"
@@ -472,38 +582,75 @@ export class CheckpointService {
     this.#sourceState = options.sourceStateProvider;
     this.#ids = options.identitySource;
     this.#clock = options.clock;
-    this.#coverage = options.coverageSnapshot ?? { capture: () => EMPTY_COVERAGE };
     this.#faultInjector = options.faultInjector;
   }
 
   record(
     transaction: LifecycleCommandTransaction,
     commandInput: RecordCheckpointCommandV2 | RecordCheckpointCommandV3,
-  ): FreshLifecycleEffect<CheckpointRecordedResultV1> {
+  ): FreshLifecycleEffect<CheckpointRecordedResult> {
     return this.#record(transaction, commandInput, false);
   }
 
-  recordFinal(
+  prepareFinalPhase(
     transaction: LifecycleCommandTransaction,
-    input: FinalCheckpointPhaseInput,
-  ): FreshLifecycleEffect<CheckpointRecordedResultV1> {
-    if (typeof input !== "object" || input === null || Reflect.ownKeys(input).length !== 1
-      || !Object.hasOwn(input, "command")) invalid();
-    return this.#record(transaction, input.command, true);
+    input: FinalCheckpointPhasePreparationInput,
+  ): PreparedFinalCheckpointPhase {
+    if (typeof input !== "object" || input === null || Reflect.ownKeys(input).length !== 2
+      || !Object.hasOwn(input, "command") || !Object.hasOwn(input, "materializationTarget")
+      || typeof input.materializationTarget !== "string"
+      || input.materializationTarget.length === 0
+      || Array.from(input.materializationTarget).length > 4_000) invalid();
+    const effect = this.#record(transaction, input.command, true);
+    const pending = effect.append.events[0];
+    if (pending?.eventType !== "SessionCheckpointRecorded"
+      || typeof pending.payload !== "object" || pending.payload === null
+      || Array.isArray(pending.payload)) invalid("INTEGRITY_FAILURE");
+    const checkpointInput = (pending.payload as Readonly<Record<string, JsonValue>>).checkpoint;
+    const checkpoint = input.command.draft.checkpointVersion === 1
+      ? decodeCheckpointV1(checkpointInput)
+      : input.command.draft.checkpointVersion === 2
+        ? decodeCheckpointV2(checkpointInput)
+        : invalid("INTEGRITY_FAILURE");
+    const action = Object.freeze({
+      action: "record-final-checkpoint-and-queue-ending" as const,
+      finalCheckpoint: checkpoint,
+      materializationTarget: input.materializationTarget,
+    });
+    const prepared = Object.freeze({
+      [PREPARED_FINAL_CHECKPOINT_PHASE]: true as const,
+      action,
+      effect,
+    }) as PreparedFinalCheckpointPhase;
+    this.#preparedFinals.set(prepared, Object.freeze({ transaction, effect }));
+    return prepared;
+  }
+
+  recordPreparedFinal(
+    transaction: LifecycleCommandTransaction,
+    prepared: PreparedFinalCheckpointPhase,
+  ): FreshLifecycleEffect<CheckpointRecordedResult> {
+    if (typeof prepared !== "object" || prepared === null) invalid("INTEGRITY_FAILURE");
+    const owned = this.#preparedFinals.get(prepared);
+    if (owned === undefined || owned.transaction !== transaction) invalid("INTEGRITY_FAILURE");
+    this.#preparedFinals.delete(prepared);
+    return owned.effect;
   }
 
   #record(
     transaction: LifecycleCommandTransaction,
     commandInput: RecordCheckpointCommandV2 | RecordCheckpointCommandV3,
     finalization: boolean,
-  ): FreshLifecycleEffect<CheckpointRecordedResultV1> {
+  ): FreshLifecycleEffect<CheckpointRecordedResult> {
     const decoded = decodeLifecycleSemanticCommandDraft(commandInput);
     if (decoded.commandType !== "record-checkpoint") invalid();
-    if (decoded.draft.checkpointVersion !== 1) throw new LifecycleError("LIFECYCLE_V2_DISABLED");
-    const command = decoded as RecordCheckpointCommandV2;
+    if (decoded.draft.checkpointVersion !== 1 && decoded.draft.checkpointVersion !== 2) invalid();
+    const command = decoded;
     const invocation = this.#invocations.current(transaction, command);
     assertContext(invocation.context, command);
-    const draft = decodeCheckpointDraftV1(command.draft);
+    const draft = command.draft.checkpointVersion === 1
+      ? decodeCheckpointDraftV1(command.draft)
+      : decodeCheckpointDraftV2(command.draft);
     assertDraftPaths(invocation.context, draft);
 
     const authority = authorityOperations(transaction);
@@ -554,13 +701,21 @@ export class CheckpointService {
             : left.childSessionId > right.childSessionId ? 1 : 0)
       : [];
 
+    const coverage: CheckpointEvidenceCoverageV1 | CheckpointEvidenceCoverageV2 =
+      draft.checkpointVersion === 1
+        ? (transaction.coverage.assertVersion1Eligible(
+            Object.freeze([current.sessionId as SessionId]),
+          ), EMPTY_COVERAGE)
+        : syncValue(transaction.coverage.snapshotV2(
+            current.sessionId as SessionId,
+            baseEventPosition,
+          ));
     const sourceState = syncValue(finalization
       ? this.#sourceState.captureForFinalization(invocation.context, invocation.sourceStateScope)
       : this.#sourceState.captureForCheckpoint(invocation.context, invocation.sourceStateScope));
     requireTrustedCheckpointDraftV1(invocation.context, draft, sourceState);
-    const coverage = syncValue(this.#coverage.capture(transaction, current, aggregate));
     const createdAt = canonicalNow(this.#clock);
-    const checkpoint = decodeCheckpointV1({
+    const checkpointInput = {
       ...draft,
       checkpointId: this.#ids.uuid(),
       sessionId: current.sessionId,
@@ -573,11 +728,14 @@ export class CheckpointService {
       sourceState,
       childSummaries,
       evidenceCoverage: coverage,
-    });
+    };
+    const checkpoint = draft.checkpointVersion === 1
+      ? decodeCheckpointV1(checkpointInput)
+      : decodeCheckpointV2(checkpointInput);
     const fingerprint = checkpointFingerprint(checkpoint);
     const checkpointRequiredCleared = markerPosition !== null;
-    const result: CheckpointRecordedResultV1 = Object.freeze({
-      checkpointVersion: 1,
+    const result = decodeCheckpointRecordedResult({
+      checkpointVersion: checkpoint.checkpointVersion,
       checkpointId: checkpoint.checkpointId,
       sessionId: checkpoint.sessionId,
       baseEventPosition: checkpoint.baseEventPosition,
