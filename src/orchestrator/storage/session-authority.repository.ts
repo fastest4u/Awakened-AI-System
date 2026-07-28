@@ -20,6 +20,7 @@ import type {
   CheckpointIndexCompareAndSwap,
   CheckpointRequirement,
   ChildAuthorityInsert,
+  CurrentChildEndingScopeProjectionRecord,
   RootAuthorityInsert,
   SafeResumeCandidateQuery,
   SessionAuthorityMutation,
@@ -525,6 +526,61 @@ function eventRows(connection: SqliteConnection, authority: SessionAuthorityReco
   });
 }
 
+const CURRENT_CHILD_PROJECTION_COLUMNS = [
+  ...AUTHORITY_COLUMNS,
+  "root_session_id",
+  "last_event_position",
+  "stream_version",
+  "head_valid",
+  "checkpoint_valid",
+] as const;
+
+function decodeCurrentChildProjection(
+  row: SqliteRow,
+): CurrentChildEndingScopeProjectionRecord {
+  exactKeys(row, CURRENT_CHILD_PROJECTION_COLUMNS);
+  const authorityRow: SqliteRow = {};
+  for (const column of AUTHORITY_COLUMNS) {
+    authorityRow[column] = ownData(row, column) as SqliteValue;
+  }
+  const authority = decodeAuthorityRow(authorityRow);
+  const projectId = authority.projectId;
+  const rootSessionId = uuid(ownData(row, "root_session_id"));
+  const childSessionId = authority.sessionId;
+  const childState = authority.semanticState;
+  if (
+    authority.sessionKind !== "child"
+    || authority.parentSessionId !== rootSessionId
+    || authority.terminalEventPosition !== null
+    || (
+      childState !== "active"
+    && childState !== "completion-proposed"
+    && childState !== "suspended"
+    )
+  ) integrity();
+  const checkpointId = authority.latestCheckpointId;
+  const checkpointEventPosition = authority.latestCheckpointEventPosition;
+  const lastEventPosition = int64(
+    ownData(row, "last_event_position"),
+  );
+  if (
+    int64(ownData(row, "head_valid"), true) !== 1n
+    || int64(ownData(row, "checkpoint_valid"), true) !== 1n
+    || (checkpointId === null) !== (checkpointEventPosition === null)
+    || lastEventPosition < authority.authorityEventPosition
+  ) integrity();
+  return Object.freeze({
+    projectId,
+    rootSessionId,
+    childSessionId,
+    childState,
+    lastEventPosition,
+    streamVersion: int64(ownData(row, "stream_version")),
+    checkpointId,
+    checkpointEventPosition,
+  });
+}
+
 export class SessionAuthorityRepository {
   nextGlobalPosition(connection: SqliteConnection): bigint {
     const row = connection.prepare(`
@@ -620,6 +676,120 @@ export class SessionAuthorityRepository {
         AND terminal_event_position IS NULL
       ORDER BY session_id
     `).all({ $projectId: projectId, $rootSessionId: rootSessionId }).map(decodeAuthorityRow));
+  }
+
+  listNonterminalChildEndingScopeProjectionsBounded(
+    connection: SqliteConnection,
+    projectId: string,
+    rootSessionId: string,
+    limit: number,
+  ): readonly CurrentChildEndingScopeProjectionRecord[] {
+    if (
+      !LOWER_UUID.test(projectId)
+      || !LOWER_UUID.test(rootSessionId)
+      || !Number.isSafeInteger(limit)
+      || limit < 1
+      || limit > 1_000
+    ) invalid();
+    return Object.freeze(connection.prepare(`
+      SELECT
+        ${AUTHORITY_COLUMNS.map((column) =>
+          `child.${column} AS ${column}`).join(",\n        ")},
+        child.parent_session_id AS root_session_id,
+        head_event.global_position AS last_event_position,
+        child_stream.current_version AS stream_version,
+        CASE WHEN
+          child_stream.stream_type = 'session'
+          AND head_event.project_id = child.project_id
+          AND head_event.stream_id = child.stream_id
+          AND head_event.stream_type = 'session'
+          AND head_event.stream_version = child_stream.current_version
+          AND head_event.session_id = child.session_id
+          AND head_event.parent_session_id = child.parent_session_id
+          AND head_event.global_position >= child.authority_event_position
+          AND authority_event.project_id = child.project_id
+          AND authority_event.global_position = child.authority_event_position
+          AND authority_event.stream_id = child.stream_id
+          AND authority_event.stream_type = 'session'
+          AND authority_event.stream_version <= child_stream.current_version
+          AND authority_event.session_id = child.session_id
+          AND authority_event.parent_session_id = child.parent_session_id
+          AND json_valid(authority_event.payload_json)
+          AND json(authority_event.payload_json) = authority_event.payload_json
+          AND json_extract(
+            authority_event.payload_json,
+            '$.authorityCommitment'
+          ) = child.authority_commitment
+        THEN 1 ELSE 0 END AS head_valid,
+        CASE WHEN
+          (
+            child.latest_checkpoint_id IS NULL
+            AND child.latest_checkpoint_event_position IS NULL
+            AND child.latest_checkpoint_fingerprint IS NULL
+          )
+          OR (
+            child.latest_checkpoint_id IS NOT NULL
+            AND child.latest_checkpoint_event_position IS NOT NULL
+            AND child.latest_checkpoint_fingerprint IS NOT NULL
+            AND child.latest_checkpoint_event_position <= child.authority_event_position
+            AND checkpoint_event.project_id = child.project_id
+            AND checkpoint_event.global_position = child.latest_checkpoint_event_position
+            AND checkpoint_event.stream_id = child.stream_id
+            AND checkpoint_event.stream_type = 'session'
+            AND checkpoint_event.session_id = child.session_id
+            AND checkpoint_event.parent_session_id = child.parent_session_id
+            AND checkpoint_event.event_type = 'SessionCheckpointRecorded'
+            AND checkpoint_event.event_schema_version IN (1, 2)
+            AND json_valid(checkpoint_event.payload_json)
+            AND json(checkpoint_event.payload_json) = checkpoint_event.payload_json
+            AND json_extract(
+              checkpoint_event.payload_json,
+              '$.checkpoint.checkpointId'
+            ) = child.latest_checkpoint_id
+            AND json_extract(
+              checkpoint_event.payload_json,
+              '$.checkpoint.sessionId'
+            ) = child.session_id
+            AND json_extract(
+              checkpoint_event.payload_json,
+              '$.checkpoint.parentSessionId'
+            ) IS child.parent_session_id
+            AND json_extract(
+              checkpoint_event.payload_json,
+              '$.checkpoint.checkpointEventPosition'
+            ) = CAST(child.latest_checkpoint_event_position AS TEXT)
+            AND json_extract(
+              checkpoint_event.payload_json,
+              '$.checkpointEventPosition'
+            ) = CAST(child.latest_checkpoint_event_position AS TEXT)
+          )
+        THEN 1 ELSE 0 END AS checkpoint_valid
+      FROM session_authority AS child
+        INDEXED BY session_authority_parent_terminal
+      LEFT JOIN streams AS child_stream
+        ON child_stream.project_id = child.project_id
+        AND child_stream.stream_id = child.stream_id
+      LEFT JOIN events AS head_event
+        ON head_event.project_id = child_stream.project_id
+        AND head_event.stream_id = child_stream.stream_id
+        AND head_event.stream_version = child_stream.current_version
+      LEFT JOIN events AS authority_event
+        ON authority_event.project_id = child.project_id
+        AND authority_event.global_position = child.authority_event_position
+      LEFT JOIN events AS checkpoint_event
+        ON checkpoint_event.project_id = child.project_id
+        AND checkpoint_event.global_position = child.latest_checkpoint_event_position
+      WHERE child.project_id = $projectId
+        AND child.parent_session_id = $rootSessionId
+        AND child.session_kind = 'child'
+        AND child.terminal_event_position IS NULL
+      ORDER BY child.session_id
+      LIMIT $limit
+    `).all({
+      $projectId: projectId,
+      $rootSessionId: rootSessionId,
+      $limit: BigInt(limit),
+    }).map(decodeCurrentChildProjection));
   }
 
   listDirectChildrenBounded(

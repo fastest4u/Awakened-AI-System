@@ -2,6 +2,7 @@ import { LifecycleError } from "../lifecycle/errors.js";
 import { MAX_CANONICAL_TIMESTAMP_MS } from "../runtime/clock.js";
 import { canonicalJson } from "../serialization/canonical-json.js";
 import type {
+  CarryForwardEndingScopeProjectionRecord,
   ChildTransferClaim,
   ChildTransferTicketInsert,
   ChildTransferTicketRecord,
@@ -222,6 +223,46 @@ function claimValues(source: ChildTransferClaim): ChildTransferClaim {
   return source;
 }
 
+const CARRY_PROJECTION_COLUMNS = [
+  "project_id",
+  "root_session_id",
+  "child_session_id",
+  "child_state",
+  "last_event_position",
+  "stream_version",
+  "checkpoint_id",
+  "checkpoint_event_position",
+  "transfer_ticket_id",
+  "transfer_ticket_event_position",
+  "projection_valid",
+] as const;
+
+function decodeCarryProjection(
+  row: SqliteRow,
+): CarryForwardEndingScopeProjectionRecord {
+  exact(row, CARRY_PROJECTION_COLUMNS, integrity);
+  if (data(row, "child_state", integrity) !== "transferred") integrity();
+  if (data(row, "projection_valid", integrity) !== 1n) integrity();
+  return Object.freeze({
+    projectId: uuid(data(row, "project_id", integrity), integrity),
+    rootSessionId: uuid(data(row, "root_session_id", integrity), integrity),
+    childSessionId: uuid(data(row, "child_session_id", integrity), integrity),
+    childState: "transferred",
+    lastEventPosition: position(data(row, "last_event_position", integrity), integrity),
+    streamVersion: position(data(row, "stream_version", integrity), integrity),
+    checkpointId: uuid(data(row, "checkpoint_id", integrity), integrity),
+    checkpointEventPosition: position(
+      data(row, "checkpoint_event_position", integrity),
+      integrity,
+    ),
+    transferTicketId: uuid(data(row, "transfer_ticket_id", integrity), integrity),
+    transferTicketEventPosition: position(
+      data(row, "transfer_ticket_event_position", integrity),
+      integrity,
+    ),
+  });
+}
+
 export class ChildTransferRepository {
   get(
     connection: SqliteConnection,
@@ -236,6 +277,154 @@ export class ChildTransferRepository {
       WHERE project_id = $projectId AND transfer_ticket_id = $transferTicketId
     `).get({ $projectId: projectId, $transferTicketId: transferTicketId });
     return row === undefined ? null : decode(row);
+  }
+
+  listUnclaimedBySourceRoot(
+    connection: SqliteConnection,
+    projectId: string,
+    sourceParentSessionId: string,
+    limit: number,
+  ): readonly ChildTransferTicketRecord[] {
+    uuid(projectId, invalid);
+    uuid(sourceParentSessionId, invalid);
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1_000) invalid();
+    return Object.freeze(connection.prepare(`
+      SELECT ${COLUMNS.join(", ")}
+      FROM child_transfer_tickets
+      WHERE project_id = $projectId
+        AND source_parent_session_id = $sourceParentSessionId
+        AND claimed_by_root_session_id IS NULL
+        AND claimed_child_session_id IS NULL
+        AND claimed_event_position IS NULL
+        AND claimed_at IS NULL
+      ORDER BY source_child_session_id, transfer_ticket_id
+      LIMIT $limit
+    `).all({
+      $projectId: projectId,
+      $sourceParentSessionId: sourceParentSessionId,
+      $limit: BigInt(limit),
+    }).map(decode));
+  }
+
+  listUnclaimedEndingScopeProjectionsBySourceRoot(
+    connection: SqliteConnection,
+    projectId: string,
+    sourceParentSessionId: string,
+    limit: number,
+  ): readonly CarryForwardEndingScopeProjectionRecord[] {
+    uuid(projectId, invalid);
+    uuid(sourceParentSessionId, invalid);
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1_000) invalid();
+    return Object.freeze(connection.prepare(`
+      SELECT
+        ticket.project_id AS project_id,
+        ticket.source_parent_session_id AS root_session_id,
+        ticket.source_child_session_id AS child_session_id,
+        source_child.semantic_state AS child_state,
+        ticket.created_event_position AS last_event_position,
+        source_stream.current_version AS stream_version,
+        ticket.checkpoint_id AS checkpoint_id,
+        source_child.latest_checkpoint_event_position AS checkpoint_event_position,
+        ticket.transfer_ticket_id AS transfer_ticket_id,
+        ticket.created_event_position AS transfer_ticket_event_position,
+        CASE WHEN
+          source_child.project_id = ticket.project_id
+          AND source_child.session_id = ticket.source_child_session_id
+          AND source_child.session_kind = 'child'
+          AND source_child.parent_session_id = ticket.source_parent_session_id
+          AND source_child.semantic_state = 'transferred'
+          AND source_child.terminal_event_position = ticket.created_event_position
+          AND source_child.authority_event_position = ticket.created_event_position
+          AND source_child.latest_checkpoint_id = ticket.checkpoint_id
+          AND source_child.latest_checkpoint_event_position IS NOT NULL
+          AND source_child.latest_checkpoint_event_position <= ticket.created_event_position
+          AND source_child.latest_checkpoint_fingerprint IS NOT NULL
+          AND source_stream.project_id = source_child.project_id
+          AND source_stream.stream_id = source_child.stream_id
+          AND source_stream.stream_type = 'session'
+          AND transfer_event.project_id = ticket.project_id
+          AND transfer_event.global_position = ticket.created_event_position
+          AND transfer_event.stream_id = source_child.stream_id
+          AND transfer_event.stream_type = 'session'
+          AND transfer_event.stream_version = source_stream.current_version
+          AND transfer_event.session_id = ticket.source_child_session_id
+          AND transfer_event.parent_session_id = ticket.source_parent_session_id
+          AND transfer_event.event_type = 'ChildWorkTransferCreated'
+          AND transfer_event.event_schema_version = 1
+          AND json_valid(transfer_event.payload_json)
+          AND json(transfer_event.payload_json) = transfer_event.payload_json
+          AND json_extract(
+            transfer_event.payload_json,
+            '$.transferTicketId'
+          ) = ticket.transfer_ticket_id
+          AND json_extract(
+            transfer_event.payload_json,
+            '$.checkpointId'
+          ) = ticket.checkpoint_id
+          AND json_extract(
+            transfer_event.payload_json,
+            '$.authorityCommitment'
+          ) = source_child.authority_commitment
+          AND checkpoint_event.project_id = ticket.project_id
+          AND checkpoint_event.global_position
+            = source_child.latest_checkpoint_event_position
+          AND checkpoint_event.stream_id = source_child.stream_id
+          AND checkpoint_event.stream_type = 'session'
+          AND checkpoint_event.session_id = ticket.source_child_session_id
+          AND checkpoint_event.parent_session_id = ticket.source_parent_session_id
+          AND checkpoint_event.event_type = 'SessionCheckpointRecorded'
+          AND checkpoint_event.event_schema_version IN (1, 2)
+          AND json_valid(checkpoint_event.payload_json)
+          AND json(checkpoint_event.payload_json) = checkpoint_event.payload_json
+          AND json_extract(
+            checkpoint_event.payload_json,
+            '$.checkpoint.checkpointId'
+          ) = ticket.checkpoint_id
+          AND json_extract(
+            checkpoint_event.payload_json,
+            '$.checkpoint.sessionId'
+          ) = ticket.source_child_session_id
+          AND json_extract(
+            checkpoint_event.payload_json,
+            '$.checkpoint.parentSessionId'
+          ) = ticket.source_parent_session_id
+          AND json_extract(
+            checkpoint_event.payload_json,
+            '$.checkpoint.checkpointEventPosition'
+          ) = CAST(source_child.latest_checkpoint_event_position AS TEXT)
+          AND json_extract(
+            checkpoint_event.payload_json,
+            '$.checkpointEventPosition'
+          ) = CAST(source_child.latest_checkpoint_event_position AS TEXT)
+        THEN 1 ELSE 0 END AS projection_valid
+      FROM child_transfer_tickets AS ticket
+        INDEXED BY child_transfer_tickets_unclaimed_source_root
+      LEFT JOIN session_authority AS source_child
+        ON source_child.project_id = ticket.project_id
+        AND source_child.session_id = ticket.source_child_session_id
+      LEFT JOIN streams AS source_stream
+        ON source_stream.project_id = source_child.project_id
+        AND source_stream.stream_id = source_child.stream_id
+      LEFT JOIN events AS transfer_event
+        ON transfer_event.project_id = ticket.project_id
+        AND transfer_event.global_position = ticket.created_event_position
+      LEFT JOIN events AS checkpoint_event
+        ON checkpoint_event.project_id = ticket.project_id
+        AND checkpoint_event.global_position
+          = source_child.latest_checkpoint_event_position
+      WHERE ticket.project_id = $projectId
+        AND ticket.source_parent_session_id = $sourceParentSessionId
+        AND ticket.claimed_by_root_session_id IS NULL
+        AND ticket.claimed_child_session_id IS NULL
+        AND ticket.claimed_event_position IS NULL
+        AND ticket.claimed_at IS NULL
+      ORDER BY ticket.source_child_session_id, ticket.transfer_ticket_id
+      LIMIT $limit
+    `).all({
+      $projectId: projectId,
+      $sourceParentSessionId: sourceParentSessionId,
+      $limit: BigInt(limit),
+    }).map(decodeCarryProjection));
   }
 
   findCreatedEventPosition(

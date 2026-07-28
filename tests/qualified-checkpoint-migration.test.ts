@@ -1188,9 +1188,23 @@ describe("qualified checkpoint migration", () => {
       WHERE type = 'index' AND name IN (
         'session_evidence_coverage_project_adapter',
         'session_evidence_coverage_transitions_snapshot',
-        'session_evidence_coverage_latest_transition'
+        'session_evidence_coverage_latest_transition',
+        'child_transfer_tickets_unclaimed_source_root'
       )
-    `).get()?.count, 3n);
+    `).get()?.count, 4n);
+    const transferProjectionIndexSql = String(connection.prepare(`
+      SELECT sql FROM sqlite_schema
+      WHERE type = 'index'
+        AND name = 'child_transfer_tickets_unclaimed_source_root'
+    `).get()?.sql);
+    assert.match(
+      transferProjectionIndexSql,
+      /ON child_transfer_tickets\(\s*project_id,\s*source_parent_session_id,\s*source_child_session_id,\s*transfer_ticket_id\s*\)/,
+    );
+    assert.match(
+      transferProjectionIndexSql,
+      /WHERE claimed_by_root_session_id IS NULL[\s\S]*claimed_child_session_id IS NULL[\s\S]*claimed_event_position IS NULL[\s\S]*claimed_at IS NULL/,
+    );
     assert.equal(connection.prepare(`
       SELECT count(*) AS count FROM sqlite_schema
       WHERE type = 'trigger' AND name IN (

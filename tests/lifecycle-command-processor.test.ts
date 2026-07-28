@@ -857,6 +857,7 @@ interface FixtureOptions {
     actual: readonly SessionAuthorityRecord[],
   ) => readonly SessionAuthorityRecord[];
   readonly assertQuickHealthy?: (context: ProjectContext) => void;
+  readonly coverageQuickHealth?: (sessionIds: readonly string[]) => void;
   readonly currentLease?: (actual: RootLeaseRecord | null) => RootLeaseRecord | null;
   readonly eventFault?: (
     boundary: "before-begin" | "after-first-insert-before-commit" | "after-commit-before-response",
@@ -996,7 +997,11 @@ function fixture(
           approvals.consume(current, input)),
       },
       transfers: {},
-      coverage: healthyCoverageFacade(),
+      coverage: {
+        ...healthyCoverageFacade(),
+        assertQuickHealthy: (sessionIds: readonly string[]) =>
+          options.coverageQuickHealth?.(sessionIds),
+      },
       workflows: {},
       validation: {},
       outbox: {},
@@ -1878,6 +1883,60 @@ describe("LifecycleCommandProcessor root resume", () => {
     }
   });
 
+  it("quick-checks a uniquely selected null-session resume root before semantic mutation", async () => {
+    const Processor = await loadProcessorConstructor();
+    assert.ok(Processor !== null);
+    const healthCalls: string[][] = [];
+    const item = fixture(Processor, {
+      coverageQuickHealth: (sessionIds) => {
+        healthCalls.push([...sessionIds]);
+        throw new Error("selected-root-health-stop");
+      },
+    });
+    try {
+      const source = context("primary-null-resume-source");
+      const started = success(item.processor.startRoot(
+        source,
+        preparedStart(source, startCommand(149, "null-session-health-thread")),
+      ));
+      const target = context("primary-null-resume-target");
+      const resume = preparedResume(
+        item,
+        target,
+        started,
+        resumeCommand(150, null, "1", "null-session-health-thread", "exact"),
+      );
+      const lease = item.leases.current(
+        item.connection,
+        PROJECT_ID,
+        started.publicResult.sessionId,
+      );
+      assert.ok(lease !== null);
+      seedRootCheckpoint(item, started.publicResult.sessionId, 20_021);
+      item.clock.now = lease.expiresAtMs;
+      const countsBefore = {
+        events: item.connection.prepare("SELECT COUNT(*) AS count FROM events").get()?.count,
+        dedup: item.connection.prepare("SELECT COUNT(*) AS count FROM command_dedup").get()?.count,
+      };
+      item.operationTrace.length = 0;
+      item.selectionTrace.length = 0;
+
+      assert.throws(
+        () => item.processor.resumeRoot(target, resume),
+        /selected-root-health-stop/,
+      );
+      assert.deepEqual(healthCalls, [[started.publicResult.sessionId]]);
+      assert.deepEqual(item.selectionTrace, ["candidate-query", "fold"]);
+      assert.deepEqual(item.operationTrace, []);
+      assert.deepEqual({
+        events: item.connection.prepare("SELECT COUNT(*) AS count FROM events").get()?.count,
+        dedup: item.connection.prepare("SELECT COUNT(*) AS count FROM command_dedup").get()?.count,
+      }, countsBefore);
+    } finally {
+      item.connection.close();
+    }
+  });
+
   it("replays current-generation authority and rejects a fresh same-owner command without a synthetic event", async () => {
     const Processor = await loadProcessorConstructor();
     assert.ok(Processor !== null);
@@ -1922,8 +1981,10 @@ describe("LifecycleCommandProcessor root resume", () => {
     const Processor = await loadProcessorConstructor();
     assert.ok(Processor !== null);
     let forcedCandidates: readonly SessionAuthorityRecord[] | null = null;
+    const coverageHealthCalls: string[][] = [];
     const item = fixture(Processor, {
       resumeCandidates: (_input, actual) => forcedCandidates ?? actual,
+      coverageQuickHealth: (sessionIds) => coverageHealthCalls.push([...sessionIds]),
     });
     try {
       const firstContext = context("primary-1");
@@ -1958,6 +2019,7 @@ describe("LifecycleCommandProcessor root resume", () => {
 
       const target = context("primary-3");
       item.selectionTrace.length = 0;
+      coverageHealthCalls.length = 0;
       const zero = preparedResume(
         item,
         target,
@@ -1969,6 +2031,7 @@ describe("LifecycleCommandProcessor root resume", () => {
         (error: unknown) => (error as { code?: string }).code === "SESSION_NOT_FOUND",
       );
       assert.deepEqual(item.selectionTrace, ["candidate-query"]);
+      assert.deepEqual(coverageHealthCalls, []);
 
       const firstAuthority = item.authority.get(item.connection, PROJECT_ID, first.publicResult.sessionId);
       const secondAuthority = item.authority.get(item.connection, PROJECT_ID, second.publicResult.sessionId);
@@ -2029,6 +2092,7 @@ describe("LifecycleCommandProcessor root resume", () => {
         "fold",
         "source-capture",
       ]);
+      assert.deepEqual(coverageHealthCalls, []);
       assert.ok(secondSuspended.publicResult.latestCheckpointEventPosition !== null);
       assert.deepEqual([
         item.connection.prepare("SELECT COUNT(*) AS count FROM events").get()?.count,

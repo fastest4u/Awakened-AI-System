@@ -860,6 +860,18 @@ WHERE stream_type = 'session'
     )
   );
 
+CREATE INDEX child_transfer_tickets_unclaimed_source_root
+ON child_transfer_tickets(
+  project_id,
+  source_parent_session_id,
+  source_child_session_id,
+  transfer_ticket_id
+)
+WHERE claimed_by_root_session_id IS NULL
+  AND claimed_child_session_id IS NULL
+  AND claimed_event_position IS NULL
+  AND claimed_at IS NULL;
+
 ALTER TABLE session_evidence_coverage
   ADD COLUMN coverage_fingerprint_schema_version INTEGER NOT NULL DEFAULT 1
   CHECK (coverage_fingerprint_schema_version = 1);

@@ -6,6 +6,7 @@ import type {
   ApprovalConsumptionInput,
   ChildTransferClaim,
   ChildTransferTicketInsert,
+  ChildTransferTicketRecord,
 } from "../src/orchestrator/storage/lifecycle-storage.types.js";
 import type {
   SqliteConnection,
@@ -154,6 +155,16 @@ function claimedTicketRow(): SqliteRow {
   };
 }
 
+function unclaimedTicketRow(): SqliteRow {
+  return {
+    ...claimedTicketRow(),
+    claimed_by_root_session_id: null,
+    claimed_child_session_id: null,
+    claimed_event_position: null,
+    claimed_at: null,
+  };
+}
+
 describe("connection-bound lifecycle approval consumption", () => {
   it("persists the complete verified nonsecret tuple but never the redacted reference or raw approval", () => {
     let inserted: SqliteParams | undefined;
@@ -261,6 +272,44 @@ describe("connection-bound lifecycle approval consumption", () => {
 });
 
 describe("immutable child transfer tickets", () => {
+  it("lists unclaimed source-root tickets with a deterministic limit-plus-one read", () => {
+    const connection = new RecordingConnection((sql, kind, params) => {
+      if (kind === "all" && /FROM child_transfer_tickets/iu.test(sql)) {
+        assert.match(sql, /source_parent_session_id\s*=\s*\$sourceParentSessionId/iu);
+        assert.match(sql, /claimed_by_root_session_id\s+IS\s+NULL/iu);
+        assert.match(sql, /claimed_child_session_id\s+IS\s+NULL/iu);
+        assert.match(sql, /claimed_event_position\s+IS\s+NULL/iu);
+        assert.match(sql, /claimed_at\s+IS\s+NULL/iu);
+        assert.match(sql, /ORDER BY\s+source_child_session_id,\s*transfer_ticket_id/iu);
+        assert.match(sql, /LIMIT\s+\$limit/iu);
+        assert.equal(params?.$projectId, PROJECT_ID);
+        assert.equal(params?.$sourceParentSessionId, ROOT_ID);
+        assert.equal(params?.$limit, 606n);
+        return [unclaimedTicketRow()];
+      }
+      throw new Error(`unexpected SQL: ${sql}`);
+    });
+    const repository = new ChildTransferRepository() as ChildTransferRepository & {
+      listUnclaimedBySourceRoot(
+        connection: SqliteConnection,
+        projectId: string,
+        sourceParentSessionId: string,
+        limit: number,
+      ): readonly ChildTransferTicketRecord[];
+    };
+
+    const tickets = repository.listUnclaimedBySourceRoot(
+      connection,
+      PROJECT_ID,
+      ROOT_ID,
+      606,
+    );
+
+    assert.equal(tickets.length, 1);
+    assert.equal(tickets[0]?.transferTicketId, TICKET_ID);
+    assert.equal(tickets[0]?.claimedEventPosition, null);
+  });
+
   it("inserts canonical ticket evidence and claims only the nullable claim group", () => {
     const runs: Array<{ readonly sql: string; readonly params: SqliteParams | undefined }> = [];
     const connection = new RecordingConnection((sql, kind, params) => {

@@ -36,7 +36,7 @@ import {
   assertSemanticCommandAuthorization,
   decodeLifecycleSemanticCommandDraft,
 } from "./contracts/commands.js";
-import type { RootSessionState } from "./contracts/identifiers.js";
+import type { RootSessionState, SessionId } from "./contracts/identifiers.js";
 import {
   decodeCheckpointDraftV1,
   decodeCheckpointV1,
@@ -464,6 +464,18 @@ function rootOperations(transaction: LifecycleCommandTransaction): RootAuthority
       "compareAndSwap",
     ),
   });
+}
+
+function registerAffectedExistingSession(
+  transaction: LifecycleCommandTransaction,
+  sessionId: SessionId,
+): void {
+  ownMethod<
+    LifecycleCommandTransaction["coverage"]["registerAffectedExistingSessions"]
+  >(
+    transaction.coverage as object,
+    "registerAffectedExistingSessions",
+  )([sessionId]);
 }
 
 function riskyTransitionChildren(
@@ -1420,6 +1432,7 @@ export class LifecycleCommandProcessor {
       if (current.sessionId !== targetSessionId || current.ownerGeneration === null) {
         throw new LifecycleError("SESSION_OWNERSHIP_MISMATCH");
       }
+      registerAffectedExistingSession(transaction, current.sessionId as SessionId);
       const aggregate = aggregates.get(current.sessionId) ?? authority.requireFoldMatch(current);
       if (aggregate.kind !== "root" || (aggregate.state !== "active" && aggregate.state !== "suspended")) {
         throw new LifecycleError("SESSION_STATE_CONFLICT");

@@ -246,6 +246,30 @@ export interface ChildTransferTicketRecord {
   readonly claimedAtMs: bigint | null;
 }
 
+export interface CurrentChildEndingScopeProjectionRecord {
+  readonly projectId: string;
+  readonly rootSessionId: string;
+  readonly childSessionId: string;
+  readonly childState: Exclude<ChildSessionState, "completed" | "transferred">;
+  readonly lastEventPosition: bigint;
+  readonly streamVersion: bigint;
+  readonly checkpointId: string | null;
+  readonly checkpointEventPosition: bigint | null;
+}
+
+export interface CarryForwardEndingScopeProjectionRecord {
+  readonly projectId: string;
+  readonly rootSessionId: string;
+  readonly childSessionId: string;
+  readonly childState: "transferred";
+  readonly lastEventPosition: bigint;
+  readonly streamVersion: bigint;
+  readonly checkpointId: string;
+  readonly checkpointEventPosition: bigint;
+  readonly transferTicketId: string;
+  readonly transferTicketEventPosition: bigint;
+}
+
 export interface EvidenceCoverageStorageInterval {
   readonly firstOrdinal: bigint;
   readonly lastOrdinal: bigint;

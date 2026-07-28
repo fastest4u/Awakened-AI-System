@@ -1,5 +1,5 @@
 import { strict as assert } from "node:assert";
-import { createHmac } from "node:crypto";
+import { createHash, createHmac } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -19,7 +19,13 @@ import type {
   StoredEvent,
 } from "../src/orchestrator/contracts/event.js";
 import { canonicalJson } from "../src/orchestrator/serialization/canonical-json.js";
+import {
+  authorityCommitment,
+  type CommittedAuthorityV1,
+} from "../src/orchestrator/lifecycle/authority/authority-commitment.js";
 import { EvidenceCoverageRepository } from "../src/orchestrator/storage/evidence-coverage.repository.js";
+import { ChildTransferRepository } from "../src/orchestrator/storage/child-transfer.repository.js";
+import { SessionAuthorityRepository } from "../src/orchestrator/storage/session-authority.repository.js";
 import {
   EvidenceCoverageService,
 } from "../src/orchestrator/lifecycle/evidence-coverage.service.js";
@@ -36,8 +42,13 @@ import {
   SqliteEventAppendStatements,
 } from "../src/orchestrator/storage/event-append-transaction.js";
 import { MaintenanceFence } from "../src/orchestrator/storage/maintenance-fence.js";
-import type { SessionAuthorityRecord } from "../src/orchestrator/storage/lifecycle-storage.types.js";
+import type {
+  ChildAuthorityInsert,
+  RootAuthorityInsert,
+  SessionAuthorityRecord,
+} from "../src/orchestrator/storage/lifecycle-storage.types.js";
 import type { SessionAggregateState } from "../src/orchestrator/lifecycle/session-aggregate.js";
+import type { LifecycleEventV1 } from "../src/orchestrator/lifecycle/contracts/events.js";
 import { NodeSqliteDriver } from "../src/orchestrator/storage/node-sqlite-driver.js";
 import type {
   SqliteConnection,
@@ -46,7 +57,10 @@ import type {
   SqliteValue,
 } from "../src/orchestrator/storage/sqlite-driver.js";
 import { applyCurrentProjectStoreSchema } from "./support/current-project-store-schema.js";
-import { checkpointFixture } from "./support/lifecycle-fixtures.js";
+import {
+  checkpointFixture,
+  lifecycleEvent,
+} from "./support/lifecycle-fixtures.js";
 
 const NOW = "2026-07-27T00:00:00.000Z";
 const PROJECT_ID = "11111111-1111-4111-8111-111111111111";
@@ -134,6 +148,213 @@ function indexedUuid(index: number): string {
     .padStart(12, "0")}`;
 }
 
+function committedAuthority(record: SessionAuthorityRecord): CommittedAuthorityV1 {
+  return {
+    authorityVersion: 1,
+    projectId: record.projectId,
+    sessionId: record.sessionId,
+    sessionKind: record.sessionKind,
+    parentSessionId: record.parentSessionId,
+    workspaceId: record.workspaceId,
+    clientNamespace: record.clientNamespace,
+    ownerGeneration: record.ownerGeneration?.toString() ?? null,
+    childCapabilityGeneration: record.childCapabilityGeneration?.toString() ?? null,
+    directAccessEnabled: record.directAccessEnabled,
+    continuityFingerprintAlgorithm: record.continuityFingerprintAlgorithm,
+    continuityFingerprintSchemaVersion: record.continuityFingerprintSchemaVersion,
+    continuityFingerprintKeyId: record.continuityFingerprintKeyId,
+    continuityFingerprintDomain: record.continuityFingerprintDomain,
+    continuityFingerprint: record.continuityFingerprint,
+    rootHandleCapabilityVersion: record.rootHandleCapabilityVersion,
+    rootHandleKeyId: record.rootHandleKeyId,
+    rootHandleIssueNonce: record.rootHandleIssueNonce,
+    rootHandleIssuedAt: record.rootHandleIssuedAt,
+    rootHandlePolicyCode: record.rootHandlePolicyCode,
+    rootHandleExpiryKind: record.rootHandleExpiryKind,
+    rootHandleExpiresAt: record.rootHandleExpiresAt,
+    rootHandleActorRole: record.rootHandleActorRole,
+    rootHandleClientInstanceId: record.rootHandleClientInstanceId,
+    rootHandleVerifier: record.rootHandleVerifier,
+    resumeTokenCapabilityVersion: record.resumeTokenCapabilityVersion,
+    resumeTokenKeyId: record.resumeTokenKeyId,
+    resumeTokenIssueNonce: record.resumeTokenIssueNonce,
+    resumeTokenIssuedAt: record.resumeTokenIssuedAt,
+    resumeTokenPolicyCode: record.resumeTokenPolicyCode,
+    resumeTokenExpiryKind: record.resumeTokenExpiryKind,
+    resumeTokenExpiresAt: record.resumeTokenExpiresAt,
+    resumeTokenActorRole: record.resumeTokenActorRole,
+    resumeTokenVerifier: record.resumeTokenVerifier,
+    childHandleCapabilityVersion: record.childHandleCapabilityVersion,
+    childHandleKeyId: record.childHandleKeyId,
+    childHandleIssueNonce: record.childHandleIssueNonce,
+    childHandleIssuedAt: record.childHandleIssuedAt,
+    childHandlePolicyCode: record.childHandlePolicyCode,
+    childHandleExpiryKind: record.childHandleExpiryKind,
+    childHandleExpiresAt: record.childHandleExpiresAt,
+    childHandleActorRole: record.childHandleActorRole,
+    childHandleClientInstanceId: record.childHandleClientInstanceId,
+    childHandleVerifier: record.childHandleVerifier,
+    revocationReasonCode: record.revocationReasonCode,
+    revocationEventPosition: record.revocationEventPosition?.toString() ?? null,
+    revokedAt: record.revokedAt,
+    terminalEventPosition: record.terminalEventPosition?.toString() ?? null,
+    terminalEventType: record.terminalEventType,
+    terminalAt: record.terminalAt,
+  };
+}
+
+function withAuthorityCommitment<T extends SessionAuthorityRecord>(record: T): T {
+  const next = { ...record } as T;
+  return Object.freeze({
+    ...next,
+    authorityCommitment: authorityCommitment(committedAuthority(next)),
+  }) as T;
+}
+
+function rootAuthorityFixture(
+  overrides: Partial<RootAuthorityInsert> = {},
+): RootAuthorityInsert {
+  return withAuthorityCommitment({
+    projectId: PROJECT_ID,
+    sessionId: SESSION_ID,
+    streamId: `session/${SESSION_ID}`,
+    sessionKind: "root",
+    parentSessionId: null,
+    workspaceId: "c".repeat(64),
+    clientNamespace: "client-1",
+    semanticState: "active",
+    ownerGeneration: 1n,
+    childCapabilityGeneration: null,
+    directAccessEnabled: false,
+    continuityFingerprintAlgorithm: "hmac-sha256",
+    continuityFingerprintSchemaVersion: 1,
+    continuityFingerprintKeyId: "continuity-key-1",
+    continuityFingerprintDomain: "pm-continuity-v1",
+    continuityFingerprint: H64,
+    rootHandleCapabilityVersion: 1,
+    rootHandleKeyId: "capability-key-1",
+    rootHandleIssueNonce: H64,
+    rootHandleIssuedAt: NOW,
+    rootHandlePolicyCode: "root-default-v1",
+    rootHandleExpiryKind: "until-revoked",
+    rootHandleExpiresAt: null,
+    rootHandleActorRole: "primary",
+    rootHandleClientInstanceId: "client-1",
+    rootHandleVerifier: H64,
+    rootHandleIssuanceId: indexedUuid(810_001),
+    resumeTokenCapabilityVersion: 1,
+    resumeTokenKeyId: "capability-key-1",
+    resumeTokenIssueNonce: FRAME_H64,
+    resumeTokenIssuedAt: NOW,
+    resumeTokenPolicyCode: "resume-default-v1",
+    resumeTokenExpiryKind: "until-revoked",
+    resumeTokenExpiresAt: null,
+    resumeTokenActorRole: "primary",
+    resumeTokenVerifier: FRAME_H64,
+    resumeTokenIssuanceId: indexedUuid(810_002),
+    childHandleCapabilityVersion: null,
+    childHandleKeyId: null,
+    childHandleIssueNonce: null,
+    childHandleIssuedAt: null,
+    childHandlePolicyCode: null,
+    childHandleExpiryKind: null,
+    childHandleExpiresAt: null,
+    childHandleActorRole: null,
+    childHandleClientInstanceId: null,
+    childHandleVerifier: null,
+    childHandleIssuanceId: null,
+    authorityCommitment: H64,
+    authorityEventPosition: 1n,
+    latestCheckpointId: null,
+    latestCheckpointEventPosition: null,
+    latestCheckpointFingerprint: null,
+    checkpointRequiredReason: null,
+    checkpointRequiredEventPosition: null,
+    revocationReasonCode: null,
+    revocationEventPosition: null,
+    revokedAt: null,
+    terminalEventPosition: null,
+    terminalEventType: null,
+    terminalAt: null,
+    createdAt: NOW,
+    updatedAt: NOW,
+    ...overrides,
+  });
+}
+
+function childAuthorityFixture(
+  childSessionId: string,
+  rootSessionId = SESSION_ID,
+  overrides: Partial<ChildAuthorityInsert> = {},
+): ChildAuthorityInsert {
+  return withAuthorityCommitment({
+    projectId: PROJECT_ID,
+    sessionId: childSessionId,
+    streamId: `session/${childSessionId}`,
+    sessionKind: "child",
+    parentSessionId: rootSessionId,
+    workspaceId: "c".repeat(64),
+    clientNamespace: "client-1",
+    semanticState: "active",
+    ownerGeneration: null,
+    childCapabilityGeneration: 1n,
+    directAccessEnabled: true,
+    continuityFingerprintAlgorithm: null,
+    continuityFingerprintSchemaVersion: null,
+    continuityFingerprintKeyId: null,
+    continuityFingerprintDomain: null,
+    continuityFingerprint: null,
+    rootHandleCapabilityVersion: null,
+    rootHandleKeyId: null,
+    rootHandleIssueNonce: null,
+    rootHandleIssuedAt: null,
+    rootHandlePolicyCode: null,
+    rootHandleExpiryKind: null,
+    rootHandleExpiresAt: null,
+    rootHandleActorRole: null,
+    rootHandleClientInstanceId: null,
+    rootHandleVerifier: null,
+    rootHandleIssuanceId: null,
+    resumeTokenCapabilityVersion: null,
+    resumeTokenKeyId: null,
+    resumeTokenIssueNonce: null,
+    resumeTokenIssuedAt: null,
+    resumeTokenPolicyCode: null,
+    resumeTokenExpiryKind: null,
+    resumeTokenExpiresAt: null,
+    resumeTokenActorRole: null,
+    resumeTokenVerifier: null,
+    resumeTokenIssuanceId: null,
+    childHandleCapabilityVersion: 1,
+    childHandleKeyId: "capability-key-1",
+    childHandleIssueNonce: H64,
+    childHandleIssuedAt: NOW,
+    childHandlePolicyCode: "child-default-v1",
+    childHandleExpiryKind: "absolute",
+    childHandleExpiresAt: "2026-07-28T01:00:00.000Z",
+    childHandleActorRole: "untrusted",
+    childHandleClientInstanceId: "child-client",
+    childHandleVerifier: H64,
+    childHandleIssuanceId: indexedUuid(810_003),
+    authorityCommitment: H64,
+    authorityEventPosition: 2n,
+    latestCheckpointId: null,
+    latestCheckpointEventPosition: null,
+    latestCheckpointFingerprint: null,
+    checkpointRequiredReason: null,
+    checkpointRequiredEventPosition: null,
+    revocationReasonCode: null,
+    revocationEventPosition: null,
+    revokedAt: null,
+    terminalEventPosition: null,
+    terminalEventType: null,
+    terminalAt: null,
+    createdAt: NOW,
+    updatedAt: NOW,
+    ...overrides,
+  });
+}
+
 function endingBinding(index: number): FinalEndingScopeBindingV1 {
   return {
     bindingVersion: 1,
@@ -209,6 +430,50 @@ function rawGenericSessionEvent(
   });
 }
 
+function rawLifecycleSessionEvent(
+  connection: SqliteConnection,
+  event: LifecycleEventV1,
+): void {
+  rawInsert(connection, "events", {
+    global_position: BigInt(event.globalPosition),
+    event_id: event.eventId,
+    project_id: event.projectId,
+    vault_id: event.vaultId,
+    store_id: event.storeId,
+    workspace_id: event.workspaceId,
+    branch_scope_id: null,
+    branch_ref: null,
+    stream_id: event.streamId,
+    stream_type: "session",
+    stream_version: BigInt(event.streamVersion),
+    event_type: event.eventType,
+    event_schema_version: 1n,
+    session_id: event.sessionId,
+    parent_session_id: event.parentSessionId,
+    actor_role: "primary",
+    agent_id: "agent-1",
+    client_instance_id: "client-1",
+    correlation_id: event.correlationId,
+    causation_id: event.causationId,
+    command_id: event.commandId,
+    idempotency_key: event.idempotencyKey,
+    command_event_index: 0n,
+    occurred_at: event.occurredAt,
+    recorded_at: NOW,
+    visibility_scope: "session",
+    confidence: "high",
+    verification_status: "verified",
+    source_refs_json: "[]",
+    evidence_refs_json: "[]",
+    evidence_digests_json: "[]",
+    payload_json: canonicalJson(event.payload),
+    payload_hash: H64,
+    previous_global_hash: H64,
+    event_hash: H64,
+    lifecycle_intent_json: null,
+  });
+}
+
 function seedAuthorityForForeignKeys(
   connection: SqliteConnection,
   eventPosition: bigint,
@@ -223,29 +488,19 @@ function seedAuthorityForForeignKeys(
     updated_at: NOW,
   });
   connection.exec("DROP TRIGGER session_authority_insert_guard");
-  const authority: Record<string, SqliteValue> = {
-    project_id: PROJECT_ID,
-    session_id: SESSION_ID,
-    stream_id: `session/${SESSION_ID}`,
-    session_kind: "root",
-    parent_session_id: null,
-    workspace_id: "c".repeat(64),
-    client_namespace: "client-1",
-    semantic_state: "active",
-    owner_generation: 1n,
-    child_capability_generation: null,
-    direct_access_enabled: 0n,
-    authority_commitment: "f".repeat(64),
-    authority_event_position: eventPosition,
-    created_at: NOW,
-    updated_at: NOW,
-  };
-  if (latestCheckpoint) {
-    authority.latest_checkpoint_id = indexedUuid(400_001);
-    authority.latest_checkpoint_event_position = eventPosition;
-    authority.latest_checkpoint_fingerprint = "e".repeat(64);
-  }
-  rawInsert(connection, "session_authority", authority);
+  new SessionAuthorityRepository().insertRoot(
+    connection,
+    rootAuthorityFixture({
+      authorityEventPosition: eventPosition,
+      ...(latestCheckpoint
+        ? {
+            latestCheckpointId: indexedUuid(400_001),
+            latestCheckpointEventPosition: eventPosition,
+            latestCheckpointFingerprint: "e".repeat(64),
+          }
+        : {}),
+    }),
+  );
 }
 
 function seedChildAuthorityForForeignKeys(
@@ -253,6 +508,19 @@ function seedChildAuthorityForForeignKeys(
   childSessionId: string,
   rootSessionId = SESSION_ID,
 ): void {
+  const childAuthority = childAuthorityFixture(childSessionId, rootSessionId);
+  const fork = lifecycleEvent(1, "SessionForked", {}, {
+    projectId: PROJECT_ID as never,
+    vaultId: VAULT_ID as never,
+    storeId: STORE_ID as never,
+    workspaceId: "c".repeat(64) as never,
+    sessionId: childSessionId as never,
+    parentSessionId: rootSessionId as never,
+    streamId: `session/${childSessionId}`,
+    streamVersion: 1,
+    globalPosition: 2,
+    authorityCommitment: childAuthority.authorityCommitment,
+  });
   rawInsert(connection, "streams", {
     project_id: PROJECT_ID,
     stream_id: `session/${childSessionId}`,
@@ -261,23 +529,171 @@ function seedChildAuthorityForForeignKeys(
     created_at: NOW,
     updated_at: NOW,
   });
-  rawInsert(connection, "session_authority", {
+  rawInsert(connection, "events", {
+    global_position: 2n,
+    event_id: fork.eventId,
     project_id: PROJECT_ID,
-    session_id: childSessionId,
-    stream_id: `session/${childSessionId}`,
-    session_kind: "child",
-    parent_session_id: rootSessionId,
+    vault_id: VAULT_ID,
+    store_id: STORE_ID,
     workspace_id: "c".repeat(64),
-    client_namespace: "client-1",
-    semantic_state: "active",
-    owner_generation: null,
-    child_capability_generation: 1n,
-    direct_access_enabled: 1n,
-    authority_commitment: "f".repeat(64),
-    authority_event_position: 1n,
+    branch_scope_id: null,
+    branch_ref: null,
+    stream_id: fork.streamId,
+    stream_type: "session",
+    stream_version: 1n,
+    event_type: fork.eventType,
+    event_schema_version: 1n,
+    session_id: childSessionId,
+    parent_session_id: rootSessionId,
+    actor_role: "primary",
+    agent_id: "agent-1",
+    client_instance_id: "client-1",
+    correlation_id: fork.correlationId,
+    causation_id: null,
+    command_id: fork.commandId,
+    idempotency_key: fork.idempotencyKey,
+    command_event_index: 0n,
+    occurred_at: fork.occurredAt,
+    recorded_at: NOW,
+    visibility_scope: "session",
+    confidence: "high",
+    verification_status: "verified",
+    source_refs_json: "[]",
+    evidence_refs_json: "[]",
+    evidence_digests_json: "[]",
+    payload_json: canonicalJson(fork.payload),
+    payload_hash: H64,
+    previous_global_hash: H64,
+    event_hash: H64,
+    lifecycle_intent_json: null,
+  });
+  new SessionAuthorityRepository().insertChild(
+    connection,
+    childAuthority,
+  );
+}
+
+function seedTransferredChildTicket(
+  connection: SqliteConnection,
+  claimed = false,
+): {
+  readonly childSessionId: string;
+  readonly checkpointId: string;
+  readonly transferTicketId: string;
+} {
+  const childSessionId = indexedUuid(926_001);
+  const checkpointId = indexedUuid(926_002);
+  const transferTicketId = indexedUuid(926_003);
+  const checkpoint = checkpointFixture({
+    checkpointId: checkpointId as never,
+    sessionId: childSessionId as never,
+    parentSessionId: SESSION_ID as never,
+    baseEventPosition: "2",
+    checkpointEventPosition: "3",
+  });
+  const checkpointFingerprint = createHash("sha256")
+    .update("project-memory/checkpoint/v1\n", "utf8")
+    .update(canonicalJson(checkpoint), "utf8")
+    .digest("hex");
+  const transferred = childAuthorityFixture(childSessionId, SESSION_ID, {
+    semanticState: "transferred",
+    childCapabilityGeneration: null,
+    directAccessEnabled: false,
+    childHandleCapabilityVersion: null,
+    childHandleKeyId: null,
+    childHandleIssueNonce: null,
+    childHandleIssuedAt: null,
+    childHandlePolicyCode: null,
+    childHandleExpiryKind: null,
+    childHandleExpiresAt: null,
+    childHandleActorRole: null,
+    childHandleClientInstanceId: null,
+    childHandleVerifier: null,
+    childHandleIssuanceId: null,
+    authorityEventPosition: 5n,
+    latestCheckpointId: checkpointId,
+    latestCheckpointEventPosition: 3n,
+    latestCheckpointFingerprint: checkpointFingerprint,
+    terminalEventPosition: 5n,
+    terminalEventType: "ChildWorkTransferCreated",
+    terminalAt: NOW,
+  });
+  const eventOptions = {
+    projectId: PROJECT_ID as never,
+    vaultId: VAULT_ID as never,
+    storeId: STORE_ID as never,
+    workspaceId: "c".repeat(64) as never,
+    sessionId: childSessionId as never,
+    parentSessionId: SESSION_ID as never,
+    streamId: `session/${childSessionId}`,
+    correlationId: indexedUuid(926_004),
+  };
+  const fork = lifecycleEvent(1, "SessionForked", {}, {
+    ...eventOptions,
+    globalPosition: 2,
+    streamVersion: 1,
+  });
+  const checkpointEvent = lifecycleEvent(2, "SessionCheckpointRecorded", {
+    checkpoint,
+    baseEventPosition: "2",
+    checkpointEventPosition: "3",
+  }, {
+    ...eventOptions,
+    globalPosition: 3,
+    streamVersion: 2,
+  });
+  const suspended = lifecycleEvent(3, "ChildSessionSuspended", {
+    checkpointId: checkpointId as never,
+    blockers: [],
+    followUps: [],
+    authorityCommitment: H64,
+  }, {
+    ...eventOptions,
+    globalPosition: 4,
+    streamVersion: 3,
+    authorityCommitment: H64,
+  });
+  const transfer = lifecycleEvent(4, "ChildWorkTransferCreated", {
+    transferTicketId: transferTicketId as never,
+    checkpointId: checkpointId as never,
+    authorityCommitment: transferred.authorityCommitment,
+  }, {
+    ...eventOptions,
+    globalPosition: 5,
+    streamVersion: 4,
+    authorityCommitment: transferred.authorityCommitment,
+  });
+  rawInsert(connection, "streams", {
+    project_id: PROJECT_ID,
+    stream_id: `session/${childSessionId}`,
+    stream_type: "session",
+    current_version: 4n,
     created_at: NOW,
     updated_at: NOW,
   });
+  for (const event of [fork, checkpointEvent, suspended, transfer]) {
+    rawLifecycleSessionEvent(connection, event);
+  }
+  new SessionAuthorityRepository().insertChild(connection, transferred);
+  rawInsert(connection, "child_transfer_tickets", {
+    project_id: PROJECT_ID,
+    transfer_ticket_id: transferTicketId,
+    source_parent_session_id: SESSION_ID,
+    source_child_session_id: childSessionId,
+    source_assignment_json: "{}",
+    source_scope_json: "{}",
+    checkpoint_id: checkpointId,
+    follow_ups_json: "[]",
+    source_state_json: "{}",
+    lineage_json: "{}",
+    created_event_position: 5n,
+    created_at: NOW,
+    claimed_by_root_session_id: claimed ? SESSION_ID : null,
+    claimed_child_session_id: claimed ? indexedUuid(926_005) : null,
+    claimed_event_position: claimed ? 6n : null,
+    claimed_at: claimed ? NOW : null,
+  });
+  return { childSessionId, checkpointId, transferTicketId };
 }
 
 function faultingConnection(
@@ -496,24 +912,27 @@ function targetAuthority(
 ): SessionAuthorityRecord {
   const sessionId = input.sessionId ?? SESSION_ID;
   const sessionKind = input.sessionKind ?? "root";
-  return {
-    projectId: PROJECT_ID,
-    sessionId,
-    streamId: `session/${sessionId}`,
-    sessionKind,
-    parentSessionId: input.parentSessionId ?? null,
-    workspaceId: "c".repeat(64),
-    clientNamespace: "client-1",
-    ownerGeneration: input.ownerGeneration ?? (sessionKind === "root" ? 1n : null),
-    childCapabilityGeneration:
-      input.childCapabilityGeneration ?? (sessionKind === "child" ? 1n : null),
-    authorityCommitment: "f".repeat(64),
-    revocationEventPosition: null,
-    revokedAt: null,
-    terminalEventPosition: null,
-    terminalEventType: null,
-    terminalAt: null,
-  } as SessionAuthorityRecord;
+  const base: SessionAuthorityRecord = sessionKind === "root"
+    ? rootAuthorityFixture({
+        sessionId,
+        streamId: `session/${sessionId}`,
+      })
+    : childAuthorityFixture(
+        sessionId,
+        input.parentSessionId ?? SESSION_ID,
+      );
+  return Object.freeze({
+    ...base,
+    ...(Object.hasOwn(input, "parentSessionId")
+      ? { parentSessionId: input.parentSessionId ?? null }
+      : {}),
+    ...(Object.hasOwn(input, "ownerGeneration")
+      ? { ownerGeneration: input.ownerGeneration ?? null }
+      : {}),
+    ...(Object.hasOwn(input, "childCapabilityGeneration")
+      ? { childCapabilityGeneration: input.childCapabilityGeneration ?? null }
+      : {}),
+  }) as SessionAuthorityRecord;
 }
 
 function targetAggregate(
@@ -551,13 +970,14 @@ function targetAggregate(
 function frozenCheckpointPayload(
   checkpointId = indexedUuid(710_005),
   childSummaries: readonly unknown[] = [],
+  checkpointEventPosition = "2",
 ): Readonly<Record<string, unknown>> {
   const checkpoint = {
     ...checkpointFixture({
       sessionId: SESSION_ID as never,
       checkpointId: checkpointId as never,
       baseEventPosition: "1",
-      checkpointEventPosition: "2",
+      checkpointEventPosition,
     }),
     checkpointVersion: 2,
     childSummaries,
@@ -571,12 +991,13 @@ function frozenCheckpointPayload(
   return {
     checkpoint,
     baseEventPosition: "1",
-    checkpointEventPosition: "2",
+    checkpointEventPosition,
   };
 }
 
 function frozenWorkflowResult(
   checkpointId = indexedUuid(710_005),
+  checkpointEventPosition = "2",
 ): Readonly<Record<string, unknown>> {
   return {
     resultVersion: 2,
@@ -587,10 +1008,10 @@ function frozenWorkflowResult(
     priorRootState: "active",
     triggeringEventPosition: "1",
     finalCheckpointId: checkpointId,
-    finalCheckpointEventPosition: "2",
+    finalCheckpointEventPosition: checkpointEventPosition,
     evidenceWindow: {
       evidenceWindowState: "sealed",
-      evidenceFrozenCheckpointEventPosition: "2",
+      evidenceFrozenCheckpointEventPosition: checkpointEventPosition,
       evidenceFrozenGeneration: 1,
     },
     validationPlansReady: false,
@@ -617,7 +1038,6 @@ function realEvidenceStoreFixture(
     readonly capabilityKind?: "root-session-handle" | "child-session-handle";
     readonly freshCapabilityGeneration?: string;
     readonly envelopeCapabilityGeneration?: string;
-    readonly prospectiveEndingScopeBindings?: readonly FinalEndingScopeBindingV1[];
     readonly seedChildSessionId?: string;
   } = {},
 ) {
@@ -643,6 +1063,9 @@ function realEvidenceStoreFixture(
   );
   const recorder = providerRecorder();
   const repository = new EvidenceCoverageRepository(recorder.provider);
+  const authorityRepository = new SessionAuthorityRepository();
+  const transferRepository = new ChildTransferRepository();
+  const preparedEndingScopeBindings: FinalEndingScopeBindingV1[][] = [];
   let eventId = input.eventIdStart ?? 950_000;
   const events = new EventAppendTransaction(
     connection,
@@ -660,12 +1083,11 @@ function realEvidenceStoreFixture(
         authorizationAuthority,
         targetAuthority: target,
         targetAggregate: aggregate,
-        prospectiveEndingScopeBindings:
-          input.prospectiveEndingScopeBindings ?? [],
         occurredAt: NOW,
       }),
     },
   });
+  const boundCoverage = connectionBoundEvidenceCoverage(connection, repository);
   const store = new LifecycleCommandStore({
     connection,
     events,
@@ -676,11 +1098,46 @@ function realEvidenceStoreFixture(
             "SELECT COALESCE(max(global_position), 0) + 1 AS position FROM events",
           ).get()!.position as bigint
         ),
+        get: (projectId: string, sessionId: string) =>
+          authorityRepository.get(connection, projectId, sessionId),
+        listNonterminalChildEndingScopeProjectionsBounded: (
+          projectId: string,
+          rootSessionId: string,
+          limit: number,
+        ) => authorityRepository.listNonterminalChildEndingScopeProjectionsBounded(
+          connection,
+          projectId,
+          rootSessionId,
+          limit,
+        ),
       },
       leases: {},
       approvals: {},
-      transfers: {},
-      coverage: connectionBoundEvidenceCoverage(connection, repository),
+      transfers: {
+        listUnclaimedEndingScopeProjectionsBySourceRoot: (
+          projectId: string,
+          sourceParentSessionId: string,
+          limit: number,
+        ) => transferRepository.listUnclaimedEndingScopeProjectionsBySourceRoot(
+          connection,
+          projectId,
+          sourceParentSessionId,
+          limit,
+        ),
+      },
+      coverage: {
+        ...boundCoverage,
+        prepareBatch: (
+          preparedInput: Parameters<typeof boundCoverage.prepareBatch>[0],
+        ) => {
+          preparedEndingScopeBindings.push(
+            preparedInput.prospectiveEndingScopeBindings.map((binding) => ({
+              ...binding,
+            })),
+          );
+          return boundCoverage.prepareBatch(preparedInput);
+        },
+      },
       workflows: {},
       validation: {},
       outbox: {},
@@ -692,6 +1149,7 @@ function realEvidenceStoreFixture(
     semantic,
     recorder,
     repository,
+    preparedEndingScopeBindings,
     service,
     store,
     envelope: evidenceEnvelope(
@@ -742,10 +1200,14 @@ function directEvidenceServiceFixture(
   const handle = Symbol("direct-prepared-evidence");
   let persistCalls = 0;
   const transaction = {
-    authority: { nextGlobalPosition: () => 2n },
+    authority: {
+      nextGlobalPosition: () => 2n,
+      get: () => authority,
+      listNonterminalChildEndingScopeProjectionsBounded: () => [],
+    },
     leases: {},
     approvals: {},
-    transfers: {},
+    transfers: { listUnclaimedEndingScopeProjectionsBySourceRoot: () => [] },
     coverage: {
       assertEvidenceWindowWritable: () => undefined,
       assertQuickHealthy: () => undefined,
@@ -775,7 +1237,6 @@ function directEvidenceServiceFixture(
         authorizationAuthority: authority,
         targetAuthority: authority,
         targetAggregate: aggregate,
-        prospectiveEndingScopeBindings: [],
         occurredAt: NOW,
       }),
     },
@@ -1276,6 +1737,59 @@ describe("evidence coverage repository", () => {
 
     connection.prepare(`
       UPDATE workflow_instances
+      SET phase = 'requested',
+          result_json = $resultJson
+    `).run({
+      $resultJson: canonicalJson({
+        ...frozenWorkflowResult(),
+        phase: "requested",
+      }),
+    });
+    assert.throws(
+      () => facade.assertEvidenceWindowWritable(SESSION_ID as never),
+      (error: unknown) => (error as { code?: string }).code === "INTEGRITY_FAILURE",
+    );
+
+    connection.prepare(`
+      UPDATE workflow_instances
+      SET phase = 'final-checkpoint-recorded',
+          result_json = $resultJson
+    `).run({
+      $resultJson: canonicalJson({
+        resultVersion: 2,
+        action: "record-final-checkpoint-and-queue-ending",
+        progressed: true,
+        previousPhase: "requested",
+        status: frozenWorkflowResult(),
+      }),
+    });
+    assert.throws(
+      () => facade.assertEvidenceWindowWritable(SESSION_ID as never),
+      (error: unknown) => (error as { code?: string }).code === "INTEGRITY_FAILURE",
+    );
+
+    connection.prepare(`
+      UPDATE workflow_instances
+      SET triggering_event_position = -1,
+          result_json = $resultJson
+    `).run({
+      $resultJson: canonicalJson({
+        ...frozenWorkflowResult(),
+        triggeringEventPosition: "-1",
+      }),
+    });
+    assert.throws(
+      () => facade.assertEvidenceWindowWritable(SESSION_ID as never),
+      (error: unknown) => (error as { code?: string }).code === "INTEGRITY_FAILURE",
+    );
+    connection.prepare(`
+      UPDATE workflow_instances
+      SET triggering_event_position = 1,
+          result_json = $resultJson
+    `).run({ $resultJson: canonicalJson(frozenWorkflowResult()) });
+
+    connection.prepare(`
+      UPDATE workflow_instances
       SET final_ending_scope_bindings_json = $bindings
     `).run({ $bindings: canonicalJson([endingBinding(0)]) });
     assert.throws(
@@ -1539,15 +2053,154 @@ describe("evidence coverage repository", () => {
     );
   });
 
+  it("keeps a frozen carry-forward baseline frozen after mutable ticket claim drift", () => {
+    const connection = database();
+    rawGenericSessionEvent(connection, 1n);
+    seedAuthorityForForeignKeys(connection, 1n);
+    const transfer = seedTransferredChildTicket(connection);
+    const finalCheckpointId = indexedUuid(713_000);
+    const frozenPosition = 6n;
+    const binding: FinalEndingScopeBindingV1 = {
+      bindingVersion: 1,
+      bindingKind: "carry-forward-ticket",
+      childSessionId: transfer.childSessionId as never,
+      childState: "transferred",
+      lastEventPosition: "5",
+      streamVersion: "4",
+      checkpointId: transfer.checkpointId as never,
+      checkpointEventPosition: "3",
+      transferTicketId: transfer.transferTicketId as never,
+      transferTicketEventPosition: "5",
+    };
+    const summaries = [{
+      childSessionId: binding.childSessionId,
+      state: binding.childState,
+      lastEventPosition: binding.lastEventPosition,
+      streamVersion: binding.streamVersion,
+      latestCheckpointId: binding.checkpointId,
+    }];
+    connection.exec("DROP TRIGGER workflow_instances_lifecycle_insert_guard");
+    connection.exec("DROP TRIGGER workflow_instances_evidence_v3_insert_guard");
+    rawInsert(connection, "workflow_instances", {
+      project_id: PROJECT_ID,
+      workflow_id: `session-end/${SESSION_ID}`,
+      workflow_type: "session-end",
+      generation: 1n,
+      state: "active",
+      phase: "final-checkpoint-recorded",
+      root_command_id: "root-command",
+      result_json: canonicalJson(frozenWorkflowResult(
+        finalCheckpointId,
+        frozenPosition.toString(),
+      )),
+      error_code: null,
+      created_at: NOW,
+      updated_at: NOW,
+      session_id: SESSION_ID,
+      triggering_event_position: 1n,
+      expected_authority_commitment: H64,
+      coordinator_owner_id: null,
+      coordinator_claim_token: null,
+      coordinator_claim_expires_at: null,
+      coordinator_attempt_count: 0n,
+      coordinator_failure_class: null,
+      coordinator_error_code: null,
+      coordinator_next_attempt_at: null,
+      validation_attempt_plan_generation: null,
+      validation_attempt_plans_json: null,
+      evidence_frozen_checkpoint_event_position: frozenPosition,
+      evidence_frozen_generation: 1n,
+      evidence_window_state: "sealed",
+      final_ending_scope_bindings_json: canonicalJson([binding]),
+    });
+    rawInsert(connection, "events", {
+      global_position: frozenPosition,
+      event_id: indexedUuid(713_001),
+      project_id: PROJECT_ID,
+      vault_id: VAULT_ID,
+      store_id: STORE_ID,
+      workspace_id: "c".repeat(64),
+      branch_scope_id: null,
+      branch_ref: null,
+      stream_id: `session/${SESSION_ID}`,
+      stream_type: "session",
+      stream_version: 2n,
+      event_type: "SessionCheckpointRecorded",
+      event_schema_version: 2n,
+      session_id: SESSION_ID,
+      parent_session_id: null,
+      actor_role: "primary",
+      agent_id: "agent-1",
+      client_instance_id: "client-1",
+      correlation_id: indexedUuid(713_002),
+      causation_id: null,
+      command_id: indexedUuid(713_003),
+      idempotency_key: "frozen-carry-forward",
+      command_event_index: 0n,
+      occurred_at: NOW,
+      recorded_at: NOW,
+      visibility_scope: "session",
+      confidence: "high",
+      verification_status: "verified",
+      source_refs_json: "[]",
+      evidence_refs_json: "[]",
+      evidence_digests_json: "[]",
+      payload_json: canonicalJson(frozenCheckpointPayload(
+        finalCheckpointId,
+        summaries,
+        frozenPosition.toString(),
+      )),
+      payload_hash: H64,
+      previous_global_hash: H64,
+      event_hash: H64,
+      lifecycle_intent_json: null,
+    });
+    const facade = connectionBoundEvidenceCoverage(
+      connection,
+      new EvidenceCoverageRepository(providerRecorder().provider),
+    );
+    const frozen = (error: unknown) => (error as { code?: string }).code
+      === "SESSION_END_EVIDENCE_FROZEN";
+    assert.throws(
+      () => facade.assertEvidenceWindowWritable(SESSION_ID as never),
+      frozen,
+    );
+
+    connection.prepare(`
+      UPDATE child_transfer_tickets
+      SET claimed_by_root_session_id = $rootSessionId,
+          claimed_child_session_id = $claimedChildSessionId,
+          claimed_event_position = 7,
+          claimed_at = $claimedAt
+      WHERE project_id = $projectId
+        AND transfer_ticket_id = $transferTicketId
+    `).run({
+      $rootSessionId: SESSION_ID,
+      $claimedChildSessionId: indexedUuid(713_004),
+      $claimedAt: NOW,
+      $projectId: PROJECT_ID,
+      $transferTicketId: transfer.transferTicketId,
+    });
+
+    assert.throws(
+      () => facade.assertEvidenceWindowWritable(SESSION_ID as never),
+      frozen,
+    );
+  });
+
   it("uses the same indexed query shape for empty and large frozen projections", () => {
     const observedShapes: string[][] = [];
     for (const bindingCount of [0, 605]) {
       const connection = database();
       rawGenericSessionEvent(connection, 1n);
       seedAuthorityForForeignKeys(connection, 1n);
+      const frozenPosition = 2n + BigInt(bindingCount);
       const bindings = Array.from(
         { length: bindingCount },
-        (_, index) => endingBinding(index),
+        (_, index) => ({
+          ...endingBinding(index),
+          lastEventPosition: (index + 2).toString(),
+        }),
       );
       const summaries = bindings.map((binding) => ({
         childSessionId: binding.childSessionId,
@@ -1556,6 +2209,46 @@ describe("evidence coverage repository", () => {
         streamVersion: binding.streamVersion,
         latestCheckpointId: binding.checkpointId,
       }));
+      if (bindingCount > 0) {
+        const authorities = new SessionAuthorityRepository();
+        connection.exec("BEGIN IMMEDIATE");
+        try {
+          for (const [index, binding] of bindings.entries()) {
+            const authorityEventPosition = BigInt(index + 2);
+            const authority = childAuthorityFixture(
+              binding.childSessionId,
+              SESSION_ID,
+              { authorityEventPosition },
+            );
+            const fork = lifecycleEvent(index + 1, "SessionForked", {}, {
+              projectId: PROJECT_ID as never,
+              vaultId: VAULT_ID as never,
+              storeId: STORE_ID as never,
+              workspaceId: "c".repeat(64) as never,
+              sessionId: binding.childSessionId,
+              parentSessionId: SESSION_ID as never,
+              streamId: `session/${binding.childSessionId}`,
+              streamVersion: 1,
+              globalPosition: authorityEventPosition,
+              authorityCommitment: authority.authorityCommitment,
+            });
+            rawInsert(connection, "streams", {
+              project_id: PROJECT_ID,
+              stream_id: authority.streamId,
+              stream_type: "session",
+              current_version: 1n,
+              created_at: NOW,
+              updated_at: NOW,
+            });
+            rawLifecycleSessionEvent(connection, fork);
+            authorities.insertChild(connection, authority);
+          }
+          connection.exec("COMMIT");
+        } catch (error) {
+          connection.exec("ROLLBACK");
+          throw error;
+        }
+      }
       connection.exec("DROP TRIGGER workflow_instances_lifecycle_insert_guard");
       connection.exec("DROP TRIGGER workflow_instances_evidence_v3_insert_guard");
       rawInsert(connection, "workflow_instances", {
@@ -1566,7 +2259,10 @@ describe("evidence coverage repository", () => {
         state: "active",
         phase: "final-checkpoint-recorded",
         root_command_id: "root-command",
-        result_json: canonicalJson(frozenWorkflowResult()),
+        result_json: canonicalJson(frozenWorkflowResult(
+          indexedUuid(710_005),
+          frozenPosition.toString(),
+        )),
         error_code: null,
         created_at: NOW,
         updated_at: NOW,
@@ -1582,14 +2278,18 @@ describe("evidence coverage repository", () => {
         coordinator_next_attempt_at: null,
         validation_attempt_plan_generation: null,
         validation_attempt_plans_json: null,
-        evidence_frozen_checkpoint_event_position: 2n,
+        evidence_frozen_checkpoint_event_position: frozenPosition,
         evidence_frozen_generation: 1n,
         evidence_window_state: "sealed",
         final_ending_scope_bindings_json: canonicalJson(bindings),
       });
-      const payload = frozenCheckpointPayload(indexedUuid(710_005), summaries);
+      const payload = frozenCheckpointPayload(
+        indexedUuid(710_005),
+        summaries,
+        frozenPosition.toString(),
+      );
       rawInsert(connection, "events", {
-        global_position: 2n,
+        global_position: frozenPosition,
         event_id: indexedUuid(712_001 + bindingCount),
         project_id: PROJECT_ID,
         vault_id: VAULT_ID,
@@ -1626,6 +2326,17 @@ describe("evidence coverage repository", () => {
         event_hash: H64,
         lifecycle_intent_json: null,
       });
+      connection.prepare(`
+        UPDATE streams
+        SET current_version = 2,
+            updated_at = $updatedAt
+        WHERE project_id = $projectId
+          AND stream_id = $streamId
+      `).run({
+        $updatedAt: NOW,
+        $projectId: PROJECT_ID,
+        $streamId: `session/${SESSION_ID}`,
+      });
       const sql: string[] = [];
       const inspected = recordingConnection(connection, sql);
       const facade = connectionBoundEvidenceCoverage(
@@ -1648,6 +2359,119 @@ describe("evidence coverage repository", () => {
       observedShapes.push(sql);
     }
     assert.deepEqual(observedShapes[0], observedShapes[1]);
+  });
+
+  it("uses bounded projection indexes before limits and excludes terminal children", () => {
+    const connection = database();
+    rawGenericSessionEvent(connection, 1n);
+    seedAuthorityForForeignKeys(connection, 1n);
+    const liveChildSessionId = indexedUuid(714_000);
+    seedChildAuthorityForForeignKeys(connection, liveChildSessionId);
+    rawLifecycleSessionEvent(connection, lifecycleEvent(2, "ChildWorkReported", {}, {
+      projectId: PROJECT_ID as never,
+      vaultId: VAULT_ID as never,
+      storeId: STORE_ID as never,
+      workspaceId: "c".repeat(64) as never,
+      sessionId: liveChildSessionId as never,
+      parentSessionId: SESSION_ID as never,
+      streamId: `session/${liveChildSessionId}`,
+      streamVersion: 2,
+      globalPosition: 3,
+    }));
+    connection.prepare(`
+      UPDATE streams
+      SET current_version = 2,
+          updated_at = $updatedAt
+      WHERE project_id = $projectId
+        AND stream_id = $streamId
+    `).run({
+      $updatedAt: NOW,
+      $projectId: PROJECT_ID,
+      $streamId: `session/${liveChildSessionId}`,
+    });
+    connection.exec("BEGIN IMMEDIATE");
+    try {
+      for (let index = 0; index < 606; index += 1) {
+        const terminalChildSessionId = indexedUuid(715_000 + index);
+        rawInsert(connection, "session_authority", {
+          project_id: PROJECT_ID,
+          session_id: terminalChildSessionId,
+          stream_id: `session/${terminalChildSessionId}`,
+          session_kind: "child",
+          parent_session_id: SESSION_ID,
+          workspace_id: "c".repeat(64),
+          client_namespace: "client-1",
+          semantic_state: "completed",
+          owner_generation: null,
+          child_capability_generation: null,
+          direct_access_enabled: 0n,
+          authority_commitment: "f".repeat(64),
+          authority_event_position: 1n,
+          terminal_event_position: 1n,
+          terminal_event_type: "ChildSessionCompleted",
+          terminal_at: NOW,
+          created_at: NOW,
+          updated_at: NOW,
+        });
+      }
+      connection.exec("COMMIT");
+    } catch (error) {
+      connection.exec("ROLLBACK");
+      throw error;
+    }
+    const sql: string[] = [];
+    const inspected = recordingConnection(connection, sql);
+    const current = new SessionAuthorityRepository()
+      .listNonterminalChildEndingScopeProjectionsBounded(
+        inspected,
+        PROJECT_ID,
+        SESSION_ID,
+        606,
+      );
+    const carry = new ChildTransferRepository()
+      .listUnclaimedEndingScopeProjectionsBySourceRoot(
+        inspected,
+        PROJECT_ID,
+        SESSION_ID,
+        606,
+      );
+    assert.deepEqual(
+      current.map((projection) => projection.childSessionId),
+      [liveChildSessionId],
+    );
+    assert.equal(current[0]?.lastEventPosition, 3n);
+    assert.equal(current[0]?.streamVersion, 2n);
+    assert.deepEqual(carry, []);
+    assert.equal(sql.length, 2);
+
+    const childPlan = connection.prepare(
+      `EXPLAIN QUERY PLAN ${sql[0]!}`,
+    ).all({
+      $projectId: PROJECT_ID,
+      $rootSessionId: SESSION_ID,
+      $limit: 606n,
+    }).map((row) => String(row.detail));
+    assert.ok(childPlan.some((detail) =>
+      /SEARCH child USING INDEX session_authority_parent_terminal/.test(detail)));
+    assert.equal(
+      childPlan.some((detail) => /SCAN child|USE TEMP B-TREE/.test(detail)),
+      false,
+    );
+
+    const ticketPlan = connection.prepare(
+      `EXPLAIN QUERY PLAN ${sql[1]!}`,
+    ).all({
+      $projectId: PROJECT_ID,
+      $sourceParentSessionId: SESSION_ID,
+      $limit: 606n,
+    }).map((row) => String(row.detail));
+    assert.ok(ticketPlan.some((detail) =>
+      /SEARCH ticket USING INDEX child_transfer_tickets_unclaimed_source_root/
+        .test(detail)));
+    assert.equal(
+      ticketPlan.some((detail) => /SCAN ticket|USE TEMP B-TREE/.test(detail)),
+      false,
+    );
   });
 
   it("commits evidence event transition aggregate and ordinals atomically", () => {
@@ -1818,9 +2642,8 @@ describe("evidence coverage repository", () => {
         authorization: scope.authorization,
         authorizationAuthority: scope.authorizationAuthority,
         targetAuthority: child,
-        targetAggregate: targetAggregate(child),
+        targetAggregate: targetAggregate(child, 1n, 2n),
         capabilityKind: scope.capabilityKind,
-        prospectiveEndingScopeBindings: [endingBinding(0)],
       });
       const result = fixture.store.execute(
         fixture.envelope,
@@ -1836,7 +2659,82 @@ describe("evidence coverage repository", () => {
         1n,
         scope.name,
       );
+      assert.deepEqual(
+        fixture.preparedEndingScopeBindings,
+        [[{
+          bindingVersion: 1,
+          bindingKind: "current-child",
+          childSessionId,
+          childState: "active",
+          lastEventPosition: "2",
+          streamVersion: "1",
+          checkpointId: null,
+          checkpointEventPosition: null,
+          transferTicketId: null,
+          transferTicketEventPosition: null,
+        }]],
+        scope.name,
+      );
     }
+  });
+
+  it("derives retained tickets, excludes claimed tickets, and rejects provenance tampering without effects", () => {
+    const retained = realEvidenceStoreFixture();
+    const retainedFacts = seedTransferredChildTicket(retained.connection);
+    retained.store.execute(
+      retained.envelope,
+      (transaction) => retained.service.record(transaction, retained.semantic),
+    );
+    assert.deepEqual(retained.preparedEndingScopeBindings, [[{
+      bindingVersion: 1,
+      bindingKind: "carry-forward-ticket",
+      childSessionId: retainedFacts.childSessionId,
+      childState: "transferred",
+      lastEventPosition: "5",
+      streamVersion: "4",
+      checkpointId: retainedFacts.checkpointId,
+      checkpointEventPosition: "3",
+      transferTicketId: retainedFacts.transferTicketId,
+      transferTicketEventPosition: "5",
+    }]]);
+
+    const claimed = realEvidenceStoreFixture();
+    seedTransferredChildTicket(claimed.connection, true);
+    claimed.store.execute(
+      claimed.envelope,
+      (transaction) => claimed.service.record(transaction, claimed.semantic),
+    );
+    assert.deepEqual(claimed.preparedEndingScopeBindings, [[]]);
+
+    const tampered = realEvidenceStoreFixture();
+    const tamperedFacts = seedTransferredChildTicket(tampered.connection);
+    tampered.connection.exec("DROP TRIGGER events_no_update");
+    tampered.connection.prepare(`
+      UPDATE events
+      SET payload_json = $payload
+      WHERE global_position = 5
+    `).run({
+      $payload: canonicalJson({
+        transferTicketId: indexedUuid(926_099),
+        checkpointId: tamperedFacts.checkpointId,
+        authorityCommitment: H64,
+      }),
+    });
+    const before = atomicStoreState(tampered.connection);
+    assert.throws(
+      () => tampered.store.execute(
+        tampered.envelope,
+        (transaction) => tampered.service.record(transaction, tampered.semantic),
+      ),
+      (error: unknown) => (error as { code?: string }).code === "INTEGRITY_FAILURE",
+    );
+    assert.deepEqual(tampered.recorder.calls, {
+      currentKey: 0,
+      status: 0,
+      fingerprint: 0,
+    });
+    assert.deepEqual(atomicStoreState(tampered.connection), before);
+    assert.deepEqual(tampered.preparedEndingScopeBindings, []);
   });
 
   it("rejects wrong ancestry role and stale generation before provider work or effects", () => {
@@ -2030,10 +2928,14 @@ describe("evidence coverage repository", () => {
     } as never;
     const persisted: unknown[] = [];
     const transaction = {
-      authority: { nextGlobalPosition: () => 2n },
+      authority: {
+        nextGlobalPosition: () => 2n,
+        get: () => targetAuthority,
+        listNonterminalChildEndingScopeProjectionsBounded: () => [],
+      },
       leases: {},
       approvals: {},
-      transfers: {},
+      transfers: { listUnclaimedEndingScopeProjectionsBySourceRoot: () => [] },
       coverage: {
         prepareBatch: () => prepared,
         persistPrepared: (...input: unknown[]) => { persisted.push(input); },
@@ -2066,7 +2968,6 @@ describe("evidence coverage repository", () => {
           authorizationAuthority: targetAuthority,
           targetAuthority,
           targetAggregate,
-          prospectiveEndingScopeBindings: [],
           occurredAt: NOW,
         }),
       },
@@ -2104,6 +3005,188 @@ describe("evidence coverage repository", () => {
       responseHash: H64,
     }, transaction);
     assert.deepEqual(persisted, [[preparedHandle, committed]]);
+  });
+
+  it("derives current-child capacity from connection facts and rejects command influence", () => {
+    const childSessionId = indexedUuid(925_001);
+    const root = {
+      ...targetAuthority(),
+      semanticState: "active",
+      authorityEventPosition: 1n,
+      latestCheckpointId: null,
+      latestCheckpointEventPosition: null,
+      latestCheckpointFingerprint: null,
+    } as SessionAuthorityRecord;
+    const child = {
+      ...targetAuthority({
+        sessionId: childSessionId,
+        sessionKind: "child",
+        parentSessionId: SESSION_ID,
+        ownerGeneration: null,
+        childCapabilityGeneration: 1n,
+      }),
+      semanticState: "active",
+      authorityEventPosition: 7n,
+      latestCheckpointId: null,
+      latestCheckpointEventPosition: null,
+      latestCheckpointFingerprint: null,
+    } as SessionAuthorityRecord;
+    let preparedInput: {
+      readonly prospectiveEndingScopeBindings: readonly FinalEndingScopeBindingV1[];
+    } | undefined;
+    const preparedHandle = Symbol("derived-projection");
+    const transaction = {
+      authority: {
+        nextGlobalPosition: () => 8n,
+        get: (_projectId: string, sessionId: string) =>
+          sessionId === SESSION_ID ? root : sessionId === childSessionId ? child : null,
+        listNonterminalChildEndingScopeProjectionsBounded: () => [{
+          projectId: PROJECT_ID,
+          rootSessionId: SESSION_ID,
+          childSessionId,
+          childState: "active",
+          lastEventPosition: 7n,
+          streamVersion: 2n,
+          checkpointId: null,
+          checkpointEventPosition: null,
+        }],
+      },
+      leases: {},
+      approvals: {},
+      transfers: {
+        listUnclaimedEndingScopeProjectionsBySourceRoot: () => [],
+      },
+      coverage: {
+        assertEvidenceWindowWritable: () => undefined,
+        assertQuickHealthy: () => undefined,
+        registerAffectedExistingSessions: () => undefined,
+        assertVersion1Eligible: () => undefined,
+        prepareBatch: (input: {
+          readonly prospectiveEndingScopeBindings: readonly FinalEndingScopeBindingV1[];
+        }) => {
+          preparedInput = input;
+          return {
+            handle: preparedHandle,
+            sessionId: SESSION_ID,
+            adapterSessionId: ADAPTER_ID,
+            eventPayload: validPreparedEventPayload(),
+          };
+        },
+        persistPrepared: () => undefined,
+        snapshotV2: () => { throw new Error("not used"); },
+        minimumCheckpointUpperBound: () => 0,
+        minimumFinalEndingScopeBindingsUpperBound: () => 0,
+      },
+      workflows: {},
+      validation: {},
+      outbox: {},
+    } as unknown as LifecycleCommandTransaction;
+    const service = new EvidenceCoverageService({
+      invocationScope: {
+        current: () => ({
+          context: context(),
+          authorizationRecord: evidenceAuthorization(),
+          freshCapabilityGeneration: "1",
+          authorizationAuthority: root,
+          targetAuthority: root,
+          targetAggregate: targetAggregate(root),
+          occurredAt: NOW,
+        }),
+      },
+    });
+
+    service.record(transaction, command());
+
+    assert.deepEqual(preparedInput?.prospectiveEndingScopeBindings, [{
+      bindingVersion: 1,
+      bindingKind: "current-child",
+      childSessionId,
+      childState: "active",
+      lastEventPosition: "7",
+      streamVersion: "2",
+      checkpointId: null,
+      checkpointEventPosition: null,
+      transferTicketId: null,
+      transferTicketEventPosition: null,
+    }]);
+    assert.throws(
+      () => service.record(transaction, {
+        ...command(),
+        prospectiveEndingScopeBindings: [endingBinding(1)],
+      } as never),
+      (error: unknown) => (error as { code?: string }).code
+        === "LIFECYCLE_INPUT_INVALID",
+    );
+    assert.equal(
+      preparedInput?.prospectiveEndingScopeBindings[0]?.childSessionId,
+      childSessionId,
+    );
+  });
+
+  it("rejects a combined 606 ending-scope projection before provider work", () => {
+    const root = targetAuthority();
+    const current = Array.from({ length: 303 }, (_, index) => ({
+      projectId: PROJECT_ID,
+      rootSessionId: SESSION_ID,
+      childSessionId: indexedUuid(930_000 + index),
+      childState: "active" as const,
+      lastEventPosition: 1n,
+      streamVersion: 1n,
+      checkpointId: null,
+      checkpointEventPosition: null,
+    }));
+    const carry = Array.from({ length: 303 }, (_, index) => ({
+      projectId: PROJECT_ID,
+      rootSessionId: SESSION_ID,
+      childSessionId: indexedUuid(931_000 + index),
+      childState: "transferred" as const,
+      lastEventPosition: 1n,
+      streamVersion: 1n,
+      checkpointId: indexedUuid(932_000 + index),
+      checkpointEventPosition: 1n,
+      transferTicketId: indexedUuid(933_000 + index),
+      transferTicketEventPosition: 1n,
+    }));
+    const recorder = providerRecorder();
+    const coverage = connectionBoundEvidenceCoverage(
+      database(),
+      new EvidenceCoverageRepository(recorder.provider),
+    );
+    const transaction = {
+      authority: {
+        nextGlobalPosition: () => 2n,
+        get: () => root,
+        listNonterminalChildEndingScopeProjectionsBounded: () => current,
+      },
+      transfers: {
+        listUnclaimedEndingScopeProjectionsBySourceRoot: () => carry,
+      },
+      coverage,
+    } as unknown as LifecycleCommandTransaction;
+    const service = new EvidenceCoverageService({
+      invocationScope: {
+        current: () => ({
+          context: context(),
+          authorizationRecord: evidenceAuthorization(),
+          freshCapabilityGeneration: "1",
+          authorizationAuthority: root,
+          targetAuthority: root,
+          targetAggregate: targetAggregate(root),
+          occurredAt: NOW,
+        }),
+      },
+    });
+
+    assert.throws(
+      () => service.record(transaction, command()),
+      (error: unknown) => (error as { code?: string }).code
+        === "CHECKPOINT_CAPACITY_EXCEEDED",
+    );
+    assert.deepEqual(recorder.calls, {
+      currentKey: 0,
+      status: 0,
+      fingerprint: 0,
+    });
   });
 
   it("rejects every command-authored prepared payload drift before append or result", () => {

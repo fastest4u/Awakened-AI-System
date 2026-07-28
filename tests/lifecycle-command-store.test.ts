@@ -660,6 +660,62 @@ describe("LifecycleCommandStore", () => {
     assert.equal(callbackCalls, 1);
   });
 
+  it("quick-checks a callback-selected null-session resume root synchronously", () => {
+    const selectedRootSessionId = "00000000-0000-4000-8000-000000000010";
+    const semantic = {
+      ...SEMANTIC_COMMAND,
+      sessionId: null,
+    } as RootResumeCommandV2;
+    const witness = buildLifecycleIntentWitness(semantic, {
+      ...INTENT_WITNESS.witness.persistedAssertions,
+      targetSessionId: selectedRootSessionId,
+    });
+    const resumeEnvelope = envelope({
+      semanticCommand: semantic,
+      candidateIntentHash: witness.intentHash,
+      authoritativeIntentHash: witness.intentHash,
+    });
+    const connection = new TransactionConnection();
+    const events = new FakeEvents(connection);
+    const order: string[] = [];
+    const store = new LifecycleCommandStore({
+      connection,
+      events,
+      transaction: () => {
+        const tx = transaction(connection);
+        return {
+          ...tx,
+          coverage: {
+            ...tx.coverage,
+            assertQuickHealthy: (sessionIds: readonly string[]) => {
+              order.push(`health/${sessionIds.join(",")}`);
+            },
+          },
+        };
+      },
+      now: () => NOW,
+    });
+
+    store.execute(resumeEnvelope, (current) => {
+      order.push("selected");
+      current.coverage.registerAffectedExistingSessions([
+        selectedRootSessionId as never,
+      ]);
+      order.push("semantic-mutation");
+      return {
+        append: appendCommand(),
+        authorizationRecord: authorization(),
+        afterAppend: () => undefined,
+      };
+    });
+
+    assert.deepEqual(order, [
+      "selected",
+      `health/${selectedRootSessionId}`,
+      "semantic-mutation",
+    ]);
+  });
+
   it("quick-checks a callback-registered existing descendant before semantic writes", () => {
     const descendantSessionId = "00000000-0000-4000-8000-000000000099";
     const connection = new TransactionConnection();

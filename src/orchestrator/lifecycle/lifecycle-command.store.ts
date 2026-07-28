@@ -33,6 +33,7 @@ import {
   type CheckpointEvidenceCoverageV2,
 } from "./contracts/checkpoint.js";
 import type { EvidenceCoverageRecordedV2 } from "./contracts/events.js";
+import { decodeFinalEndingScopeBindingsV1 } from "./contracts/session-end.js";
 import type { SessionId } from "./contracts/identifiers.js";
 import type {
   InternalWorkflowSemanticCommand,
@@ -280,6 +281,20 @@ const SESSION_END_PHASE_ACTIONS = new Set([
   "complete-after-materialization",
 ]);
 
+const SESSION_END_WORKFLOW_TRANSITIONS = new Set([
+  "requested\u0000children-resolved\u0000mark-children-resolved",
+  "children-resolved\u0000final-checkpoint-recorded\u0000record-final-checkpoint-and-queue-ending",
+  "final-checkpoint-recorded\u0000ending-materialization-queued\u0000confirm-ending-materialization",
+  "ending-materialization-queued\u0000validating\u0000begin-validation",
+  "validating\u0000verification-failed\u0000record-verification-failed",
+  "validating\u0000verification-passed\u0000record-verification-passed",
+  "verification-passed\u0000verification-failed\u0000invalidate-verification",
+  "verification-passed\u0000completion-appended\u0000append-terminal-completion",
+  "completion-appended\u0000completed-materialization-confirmed\u0000confirm-completed-materialization",
+  "completion-appended\u0000completed\u0000complete-without-materialization",
+  "completed-materialization-confirmed\u0000completed\u0000complete-after-materialization",
+]);
+
 const SESSION_END_STATUS_FIELDS = [
   "resultVersion",
   "sessionId",
@@ -341,12 +356,18 @@ function assertFrozenWorkflowResult(
       || parsed.resultVersion !== 2
       || typeof parsed.action !== "string"
       || !SESSION_END_PHASE_ACTIONS.has(parsed.action)
-      || typeof parsed.progressed !== "boolean"
+      || parsed.progressed !== true
       || typeof parsed.previousPhase !== "string"
       || !SESSION_END_PHASES.has(parsed.previousPhase)
       || !isPlainRecord(parsed.status)
     ) return storageIntegrity();
     status = parsed.status;
+    if (
+      typeof status.phase !== "string"
+      || !SESSION_END_WORKFLOW_TRANSITIONS.has(
+        `${parsed.previousPhase}\u0000${status.phase}\u0000${parsed.action}`,
+      )
+    ) return storageIntegrity();
   } else {
     status = parsed;
   }
@@ -363,9 +384,11 @@ function assertFrozenWorkflowResult(
     || typeof status.phase !== "string"
     || !SESSION_END_PHASES.has(status.phase)
     || (status.priorRootState !== "active" && status.priorRootState !== "suspended")
+    || !positiveCapabilityGeneration(status.triggeringEventPosition)
     || status.triggeringEventPosition !== expected.triggeringEventPosition.toString()
     || typeof status.finalCheckpointId !== "string"
     || !LOWER_UUID.test(status.finalCheckpointId)
+    || !positiveCapabilityGeneration(status.finalCheckpointEventPosition)
     || status.finalCheckpointEventPosition !== expected.frozenPosition.toString()
     || !isPlainRecord(window)
     || !hasExactJsonFields(window, [
@@ -374,6 +397,7 @@ function assertFrozenWorkflowResult(
       "evidenceFrozenGeneration",
     ])
     || window.evidenceWindowState !== "sealed"
+    || !positiveCapabilityGeneration(window.evidenceFrozenCheckpointEventPosition)
     || window.evidenceFrozenCheckpointEventPosition !== expected.frozenPosition.toString()
     || !Number.isSafeInteger(window.evidenceFrozenGeneration)
     || BigInt(window.evidenceFrozenGeneration as number) !== expected.frozenGeneration
@@ -675,6 +699,51 @@ function assertFrozenWorkflowIntegrity(
                     binding.value,
                     '$.transferTicketEventPosition'
                   )
+                OR NOT EXISTS (
+                  SELECT 1
+                  FROM child_transfer_tickets AS immutable_ticket
+                  JOIN events AS immutable_transfer_event
+                    ON immutable_transfer_event.project_id
+                      = immutable_ticket.project_id
+                    AND immutable_transfer_event.global_position
+                      = immutable_ticket.created_event_position
+                    AND immutable_transfer_event.session_id
+                      = immutable_ticket.source_child_session_id
+                    AND immutable_transfer_event.parent_session_id
+                      = immutable_ticket.source_parent_session_id
+                    AND immutable_transfer_event.event_type
+                      = 'ChildWorkTransferCreated'
+                    AND immutable_transfer_event.event_schema_version = 1
+                    AND json_valid(immutable_transfer_event.payload_json)
+                    AND json(immutable_transfer_event.payload_json)
+                      = immutable_transfer_event.payload_json
+                    AND json_extract(
+                      immutable_transfer_event.payload_json,
+                      '$.transferTicketId'
+                    ) = immutable_ticket.transfer_ticket_id
+                    AND json_extract(
+                      immutable_transfer_event.payload_json,
+                      '$.checkpointId'
+                    ) = immutable_ticket.checkpoint_id
+                  WHERE immutable_ticket.project_id = workflow.project_id
+                    AND immutable_ticket.source_parent_session_id
+                      = workflow.session_id
+                    AND immutable_ticket.source_child_session_id
+                      = json_extract(binding.value, '$.childSessionId')
+                    AND immutable_ticket.transfer_ticket_id
+                      = json_extract(binding.value, '$.transferTicketId')
+                    AND immutable_ticket.checkpoint_id
+                      = json_extract(binding.value, '$.checkpointId')
+                    AND immutable_ticket.created_event_position = CAST(
+                      json_extract(
+                        binding.value,
+                        '$.transferTicketEventPosition'
+                      ) AS INTEGER
+                    )
+                    AND immutable_transfer_event.stream_version = CAST(
+                      json_extract(binding.value, '$.streamVersion') AS INTEGER
+                    )
+                )
               )
             )
             OR json(binding.value) <> json_object(
@@ -714,21 +783,9 @@ function assertFrozenWorkflowIntegrity(
               '$.checkpoint.childSummaries[' || binding.key || '].latestCheckpointId'
             )
         )
-        AND NOT EXISTS (
-          SELECT 1
-          FROM json_each(
-            workflow.final_ending_scope_bindings_json
-          ) AS left_binding
-          JOIN json_each(
-            workflow.final_ending_scope_bindings_json
-          ) AS right_binding
-            ON CAST(right_binding.key AS INTEGER)
-              = CAST(left_binding.key AS INTEGER) + 1
-          WHERE json_extract(left_binding.value, '$.childSessionId')
-            >= json_extract(right_binding.value, '$.childSessionId')
-        )
       THEN 1 ELSE 0 END AS frozen_valid,
       event.payload_json AS checkpoint_payload_json,
+      workflow.final_ending_scope_bindings_json AS ending_scope_bindings_json,
       workflow.result_json AS workflow_result_json,
       workflow.generation AS workflow_generation,
       workflow.phase AS workflow_phase,
@@ -778,6 +835,12 @@ function assertFrozenWorkflowIntegrity(
     if (!isPlainRecord(payload)) return storageIntegrity();
     const checkpoint = decodeCheckpointV2(payload.checkpoint);
     if (canonicalJson(checkpoint) !== canonicalJson(payload.checkpoint)) {
+      return storageIntegrity();
+    }
+    const bindingsJson = rowString(row, "ending_scope_bindings_json");
+    const bindings = JSON.parse(bindingsJson) as unknown;
+    const decodedBindings = decodeFinalEndingScopeBindingsV1(bindings);
+    if (canonicalJson(decodedBindings) !== bindingsJson) {
       return storageIntegrity();
     }
   } catch {
@@ -920,6 +983,9 @@ function assertEvidenceWindowWritable(
   if (phase === "cancelled") {
     if (windowState !== "sealed" || !nullGroup) return storageIntegrity();
     return;
+  }
+  if (completeGroup && PREFINAL_SESSION_END_PHASES.has(phase)) {
+    return storageIntegrity();
   }
   if (completeGroup) throw new LifecycleError("SESSION_END_EVIDENCE_FROZEN");
   if (PREFINAL_SESSION_END_PHASES.has(phase)) return;
