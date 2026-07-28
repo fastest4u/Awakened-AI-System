@@ -75,6 +75,8 @@ interface CurrentAdapter {
 
 interface PreparedMetadata {
   readonly plannedEventPosition: bigint | null;
+  readonly eventFramesJson: string;
+  readonly newFramesJson: string;
 }
 
 const AUTHENTIC_PREPARED = new WeakSet<object>();
@@ -399,6 +401,8 @@ function genuinelyNewFrames(
   adapterSessionId: AdapterSessionId,
   command: RecordEvidenceBatchCommandV2,
   frameKeyId: string,
+  priorCoverageLastOrdinal: bigint | null,
+  priorMissingIntervals: readonly EvidenceCoverageOrdinalInterval[],
 ): readonly LifecycleEvidenceFrameRecordedV1[] {
   const parameters: Record<`$${string}`, string | bigint> = {
     $projectId: projectId,
@@ -432,7 +436,12 @@ function genuinelyNewFrames(
   const byOrdinal = new Map<bigint, SqliteRow>();
   const byFrame = new Map<string, SqliteRow>();
   for (const row of rows) {
-    byOrdinal.set(bigint(row, "ordinal"), row);
+    if (
+      string(row, "session_id") === sessionId
+      && string(row, "adapter_session_id") === adapterSessionId
+    ) {
+      byOrdinal.set(bigint(row, "ordinal"), row);
+    }
     byFrame.set(string(row, "frame_id"), row);
   }
   const result: LifecycleEvidenceFrameRecordedV1[] = [];
@@ -440,6 +449,11 @@ function genuinelyNewFrames(
     const ordinal = BigInt(frame.ordinal);
     const ordinalRow = byOrdinal.get(ordinal);
     const frameRow = byFrame.get(frame.frameId);
+    const expectedPresent = priorCoverageLastOrdinal !== null
+      && ordinal <= priorCoverageLastOrdinal
+      && !priorMissingIntervals.some((interval) =>
+        ordinal >= interval.firstOrdinal && ordinal <= interval.lastOrdinal);
+    if ((ordinalRow !== undefined) !== expectedPresent) return integrity();
     if (ordinalRow === undefined) {
       if (frameRow !== undefined) return input("frames.frameId");
       result.push(Object.freeze({ ...frame }));
@@ -480,6 +494,10 @@ export class EvidenceCoverageRepository {
     connection: SqliteConnection,
     inputValue: EvidenceCoverageBatchInput,
   ): PreparedEvidenceCoverageBatch {
+    const command: RecordEvidenceBatchCommandV2 = deepFreeze({
+      ...inputValue.command,
+      frames: inputValue.command.frames.map((frame) => ({ ...frame })),
+    });
     const identity = storeIdentity(connection);
     const projectId = inputValue.context.binding.projectId;
     const storeId = inputValue.context.binding.storeId;
@@ -497,9 +515,9 @@ export class EvidenceCoverageRepository {
       )
     ) input("plannedEventPosition");
 
-    const commandBounds = validateCommand(inputValue.command);
-    const sessionId = inputValue.command.sessionId;
-    const adapterSessionId = inputValue.command.adapterSessionId;
+    const commandBounds = validateCommand(command);
+    const sessionId = command.sessionId;
+    const adapterSessionId = command.adapterSessionId;
     const existingAdapterNamespace = connection.prepare(`
       SELECT session_id
       FROM session_evidence_coverage
@@ -518,9 +536,9 @@ export class EvidenceCoverageRepository {
       (adapter) => adapter.entry.adapterSessionId === adapterSessionId,
     );
     const frameKeyId = current?.entry.frameFingerprintKeyId
-      ?? inputValue.command.fingerprintKeyId;
+      ?? command.fingerprintKeyId;
     if (
-      inputValue.command.fingerprintKeyId !== frameKeyId
+      command.fingerprintKeyId !== frameKeyId
       || (
         current !== undefined
         && current.entry.coverageFingerprintKeyId !== frameKeyId
@@ -531,8 +549,10 @@ export class EvidenceCoverageRepository {
       projectId,
       sessionId,
       adapterSessionId,
-      inputValue.command,
+      command,
       frameKeyId,
+      current === undefined ? null : BigInt(current.entry.coverageLastOrdinal),
+      current?.intervals ?? [],
     );
     const advanced = advanceEvidenceCoverageIntervals({
       priorCoverageLastOrdinal: current === undefined
@@ -559,7 +579,7 @@ export class EvidenceCoverageRepository {
       coverageFingerprintKeyId: frameKeyId,
       coverageFingerprintDomain: "pm-evidence-coverage-v1",
       coverageFingerprint: provisionalDigest,
-      latestBatchId: inputValue.command.batchId,
+      latestBatchId: command.batchId,
       latestBatchEventPosition: position,
     });
     const prospectiveEntries = adapters
@@ -655,7 +675,7 @@ export class EvidenceCoverageRepository {
 
     const eventPayload: EvidenceCoverageRecordedV2 = deepFreeze({
       adapterSessionId,
-      batchId: inputValue.command.batchId,
+      batchId: command.batchId,
       batchFirstOrdinal: commandBounds.firstOrdinal.toString(),
       batchLastOrdinal: commandBounds.lastOrdinal.toString(),
       coverageFirstOrdinal: "0",
@@ -673,7 +693,7 @@ export class EvidenceCoverageRepository {
       coverageFingerprint,
       captureMode: "coverage-only",
       contentRetained: false,
-      frames: inputValue.command.frames.map((frame) => ({ ...frame })),
+      frames: command.frames.map((frame) => ({ ...frame })),
     });
     const prepared = deepFreeze({
       [PREPARED_EVIDENCE_COVERAGE_BATCH]: true as const,
@@ -690,6 +710,8 @@ export class EvidenceCoverageRepository {
     AUTHENTIC_PREPARED.add(prepared);
     PREPARED_METADATA.set(prepared, {
       plannedEventPosition: inputValue.plannedEventPosition,
+      eventFramesJson: canonicalJson(eventPayload.frames),
+      newFramesJson: canonicalJson(newFrames),
     });
     return prepared;
   }
@@ -702,6 +724,20 @@ export class EvidenceCoverageRepository {
     if (!AUTHENTIC_PREPARED.has(prepared)) return integrity();
     const metadata = PREPARED_METADATA.get(prepared);
     if (metadata === undefined) return integrity();
+    if (
+      canonicalJson(prepared.eventPayload.frames) !== metadata.eventFramesJson
+      || canonicalJson(prepared.newFrames) !== metadata.newFramesJson
+    ) return integrity();
+    const payloadFrames = new Map(
+      prepared.eventPayload.frames.map((frame) => [frame.ordinal, frame]),
+    );
+    for (const frame of prepared.newFrames) {
+      const payloadFrame = payloadFrames.get(frame.ordinal);
+      if (
+        payloadFrame === undefined
+        || canonicalJson(payloadFrame) !== canonicalJson(frame)
+      ) return integrity();
+    }
     const payloadJson = canonicalJson(prepared.eventPayload);
     if (
       committedEvent.globalPosition < 1n
@@ -956,36 +992,61 @@ export class EvidenceCoverageRepository {
           OR EXISTS(
             SELECT 1 FROM session_evidence_fingerprints
             WHERE project_id = $projectId AND session_id = $sessionId
-          )
-          OR EXISTS(
-            SELECT 1 FROM events
-            WHERE project_id = $projectId AND session_id = $sessionId
-              AND (
-                event_type = 'EvidenceCoverageRecorded'
-                OR (
-                  event_type = 'SessionCheckpointRecorded'
-                  AND (
-                    json_type(
-                      payload_json,
-                      '$.checkpoint.evidenceCoverage.highestContiguousOrdinal'
-                    ) <> 'null'
-                    OR json_array_length(
-                      payload_json,
-                      '$.checkpoint.evidenceCoverage.missingIntervals'
-                    ) > 0
-                    OR json_array_length(
-                      payload_json,
-                      '$.checkpoint.evidenceCoverage.adapterSessions'
-                    ) > 0
-                  )
-                )
-              )
           ) AS has_coverage
       `).get({
         $projectId: identity.projectId,
         $sessionId: sessionId,
       });
       if (row === undefined || bigint(row, "has_coverage") !== 0n) {
+        throw new LifecycleError("CHECKPOINT_EVIDENCE_VERSION_REQUIRED");
+      }
+      const indexedEvents = connection.prepare(`
+        SELECT
+          latest.event_type AS latest_event_type,
+          checkpoint.event_type AS checkpoint_event_type,
+          json_type(
+            checkpoint.payload_json,
+            '$.checkpoint.evidenceCoverage.highestContiguousOrdinal'
+          ) AS checkpoint_highest_type,
+          coalesce(json_array_length(
+            checkpoint.payload_json,
+            '$.checkpoint.evidenceCoverage.missingIntervals'
+          ), 0) AS checkpoint_missing_count,
+          coalesce(json_array_length(
+            checkpoint.payload_json,
+            '$.checkpoint.evidenceCoverage.adapterSessions'
+          ), 0) AS checkpoint_adapter_count
+        FROM session_authority AS authority
+        JOIN streams AS stream
+          ON stream.project_id = authority.project_id
+          AND stream.stream_id = authority.stream_id
+        LEFT JOIN events AS latest
+          ON latest.project_id = stream.project_id
+          AND latest.stream_id = stream.stream_id
+          AND latest.stream_version = stream.current_version
+        LEFT JOIN events AS checkpoint
+          ON checkpoint.global_position = authority.latest_checkpoint_event_position
+        WHERE authority.project_id = $projectId
+          AND authority.session_id = $sessionId
+      `).get({
+        $projectId: identity.projectId,
+        $sessionId: sessionId,
+      });
+      if (
+        indexedEvents !== undefined
+        && (
+          indexedEvents.latest_event_type === "EvidenceCoverageRecorded"
+          || (
+            indexedEvents.checkpoint_event_type === "SessionCheckpointRecorded"
+            && (
+              indexedEvents.checkpoint_highest_type !== null
+              && indexedEvents.checkpoint_highest_type !== "null"
+              || bigint(indexedEvents, "checkpoint_missing_count") > 0n
+              || bigint(indexedEvents, "checkpoint_adapter_count") > 0n
+            )
+          )
+        )
+      ) {
         throw new LifecycleError("CHECKPOINT_EVIDENCE_VERSION_REQUIRED");
       }
     }
@@ -1029,20 +1090,21 @@ export class EvidenceCoverageRepository {
     baseEventPosition: bigint,
   ): CheckpointEvidenceCoverageV2 {
     const identity = storeIdentity(connection);
-    const adapterCount = connection.prepare(`
-      SELECT count(DISTINCT adapter_session_id) AS adapter_count
-      FROM session_evidence_coverage_transitions
+    const adapterRows = connection.prepare(`
+      SELECT adapter_session_id
+      FROM session_evidence_coverage_transition_heads
       WHERE project_id = $projectId
         AND session_id = $sessionId
-    `).get({
+      ORDER BY CAST(adapter_session_id AS BLOB)
+      LIMIT 201
+    `).all({
       $projectId: identity.projectId,
       $sessionId: sessionId,
     });
-    if (adapterCount === undefined) return integrity();
-    if (bigint(adapterCount, "adapter_count") > 200n) {
+    if (adapterRows.length > 200) {
       throw new LifecycleError("EVIDENCE_ADAPTER_SESSION_LIMIT");
     }
-    const rows = connection.prepare(`
+    const selectTransition = connection.prepare(`
       SELECT transition.*,
         event.project_id AS event_project_id,
         event.session_id AS event_session_id,
@@ -1053,21 +1115,19 @@ export class EvidenceCoverageRepository {
         ON event.global_position = transition.batch_event_position
       WHERE transition.project_id = $projectId
         AND transition.session_id = $sessionId
+        AND transition.adapter_session_id = $adapterSessionId
         AND transition.batch_event_position <= $baseEventPosition
-        AND transition.batch_event_position = (
-          SELECT max(candidate.batch_event_position)
-          FROM session_evidence_coverage_transitions AS candidate
-          WHERE candidate.project_id = transition.project_id
-            AND candidate.session_id = transition.session_id
-            AND candidate.adapter_session_id = transition.adapter_session_id
-            AND candidate.batch_event_position <= $baseEventPosition
-        )
-      ORDER BY CAST(transition.adapter_session_id AS BLOB)
-      LIMIT 200
-    `).all({
-      $projectId: identity.projectId,
-      $sessionId: sessionId,
-      $baseEventPosition: baseEventPosition,
+      ORDER BY batch_event_position DESC
+      LIMIT 1
+    `);
+    const rows = adapterRows.flatMap((adapterRow) => {
+      const row = selectTransition.get({
+        $projectId: identity.projectId,
+        $sessionId: sessionId,
+        $adapterSessionId: string(adapterRow, "adapter_session_id"),
+        $baseEventPosition: baseEventPosition,
+      });
+      return row === undefined ? [] : [row];
     });
     let totalIntervals = 0;
     const entries = rows.map((row): CheckpointAdapterCoverageV2 => {
