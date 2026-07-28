@@ -1000,53 +1000,39 @@ export class EvidenceCoverageRepository {
       if (row === undefined || bigint(row, "has_coverage") !== 0n) {
         throw new LifecycleError("CHECKPOINT_EVIDENCE_VERSION_REQUIRED");
       }
-      const indexedEvents = connection.prepare(`
-        SELECT
-          latest.event_type AS latest_event_type,
-          checkpoint.event_type AS checkpoint_event_type,
-          json_type(
-            checkpoint.payload_json,
-            '$.checkpoint.evidenceCoverage.highestContiguousOrdinal'
-          ) AS checkpoint_highest_type,
-          coalesce(json_array_length(
-            checkpoint.payload_json,
-            '$.checkpoint.evidenceCoverage.missingIntervals'
-          ), 0) AS checkpoint_missing_count,
-          coalesce(json_array_length(
-            checkpoint.payload_json,
-            '$.checkpoint.evidenceCoverage.adapterSessions'
-          ), 0) AS checkpoint_adapter_count
-        FROM session_authority AS authority
-        JOIN streams AS stream
-          ON stream.project_id = authority.project_id
-          AND stream.stream_id = authority.stream_id
-        LEFT JOIN events AS latest
-          ON latest.project_id = stream.project_id
-          AND latest.stream_id = stream.stream_id
-          AND latest.stream_version = stream.current_version
-        LEFT JOIN events AS checkpoint
-          ON checkpoint.global_position = authority.latest_checkpoint_event_position
-        WHERE authority.project_id = $projectId
-          AND authority.session_id = $sessionId
+      const artifact = connection.prepare(`
+        SELECT 1
+        FROM events
+        WHERE project_id = $projectId
+          AND session_id = $sessionId
+          AND stream_type = 'session'
+          AND session_id IS NOT NULL
+          AND (
+            event_type = 'EvidenceCoverageRecorded'
+            OR (
+              event_type = 'SessionCheckpointRecorded'
+              AND (
+                json_extract(
+                  payload_json,
+                  '$.checkpoint.evidenceCoverage.highestContiguousOrdinal'
+                ) IS NOT NULL
+                OR coalesce(json_array_length(
+                  payload_json,
+                  '$.checkpoint.evidenceCoverage.missingIntervals'
+                ), 0) > 0
+                OR coalesce(json_array_length(
+                  payload_json,
+                  '$.checkpoint.evidenceCoverage.adapterSessions'
+                ), 0) > 0
+              )
+            )
+          )
+        LIMIT 1
       `).get({
         $projectId: identity.projectId,
         $sessionId: sessionId,
       });
-      if (
-        indexedEvents !== undefined
-        && (
-          indexedEvents.latest_event_type === "EvidenceCoverageRecorded"
-          || (
-            indexedEvents.checkpoint_event_type === "SessionCheckpointRecorded"
-            && (
-              indexedEvents.checkpoint_highest_type !== null
-              && indexedEvents.checkpoint_highest_type !== "null"
-              || bigint(indexedEvents, "checkpoint_missing_count") > 0n
-              || bigint(indexedEvents, "checkpoint_adapter_count") > 0n
-            )
-          )
-        )
-      ) {
+      if (artifact !== undefined) {
         throw new LifecycleError("CHECKPOINT_EVIDENCE_VERSION_REQUIRED");
       }
     }
@@ -1090,18 +1076,19 @@ export class EvidenceCoverageRepository {
     baseEventPosition: bigint,
   ): CheckpointEvidenceCoverageV2 {
     const identity = storeIdentity(connection);
-    const adapterRows = connection.prepare(`
+    const adapterSessionIds = connection.prepare(`
       SELECT adapter_session_id
       FROM session_evidence_coverage_transition_heads
       WHERE project_id = $projectId
         AND session_id = $sessionId
-      ORDER BY CAST(adapter_session_id AS BLOB)
       LIMIT 201
     `).all({
       $projectId: identity.projectId,
       $sessionId: sessionId,
-    });
-    if (adapterRows.length > 200) {
+    }).map((row) => string(row, "adapter_session_id"))
+      .sort((left, right) =>
+        Buffer.compare(Buffer.from(left, "utf8"), Buffer.from(right, "utf8")));
+    if (adapterSessionIds.length > 200) {
       throw new LifecycleError("EVIDENCE_ADAPTER_SESSION_LIMIT");
     }
     const selectTransition = connection.prepare(`
@@ -1120,11 +1107,11 @@ export class EvidenceCoverageRepository {
       ORDER BY batch_event_position DESC
       LIMIT 1
     `);
-    const rows = adapterRows.flatMap((adapterRow) => {
+    const rows = adapterSessionIds.flatMap((adapterSessionId) => {
       const row = selectTransition.get({
         $projectId: identity.projectId,
         $sessionId: sessionId,
-        $adapterSessionId: string(adapterRow, "adapter_session_id"),
+        $adapterSessionId: adapterSessionId,
         $baseEventPosition: baseEventPosition,
       });
       return row === undefined ? [] : [row];

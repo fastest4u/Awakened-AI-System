@@ -69,6 +69,21 @@ function rawInsert(
   ) as SqliteParams);
 }
 
+function repositoryTableCounts(
+  connection: SqliteConnection,
+): Readonly<Record<string, bigint>> {
+  return Object.freeze(Object.fromEntries([
+    "events",
+    "session_evidence_coverage_transitions",
+    "session_evidence_coverage_transition_heads",
+    "session_evidence_coverage",
+    "session_evidence_fingerprints",
+  ].map((table) => [
+    table,
+    connection.prepare(`SELECT count(*) AS count FROM ${table}`).get()!.count as bigint,
+  ])));
+}
+
 function indexedUuid(index: number): string {
   return `${index.toString(16).padStart(8, "0")}-0000-4000-8000-${index
     .toString(16)
@@ -87,6 +102,21 @@ function endingBinding(index: number): FinalEndingScopeBindingV1 {
     checkpointEventPosition: null,
     transferTicketId: null,
     transferTicketEventPosition: null,
+  };
+}
+
+function carryEndingBinding(index: number): FinalEndingScopeBindingV1 {
+  return {
+    bindingVersion: 1,
+    bindingKind: "carry-forward-ticket",
+    childSessionId: indexedUuid(400_000 + index) as never,
+    childState: "transferred",
+    lastEventPosition: "1",
+    streamVersion: "1",
+    checkpointId: indexedUuid(500_000 + index) as never,
+    checkpointEventPosition: "1",
+    transferTicketId: indexedUuid(600_000 + index) as never,
+    transferTicketEventPosition: "1",
   };
 }
 
@@ -1246,7 +1276,7 @@ describe("evidence coverage repository", () => {
       `).run();
       expectIntegrity(() => repository.persistPrepared(connection, prepared, committed));
     }
-    {
+    for (const drift of ["digest", "position"] as const) {
       const connection = database();
       const repository = new EvidenceCoverageRepository(providerRecorder().provider);
       const first = repository.prepareBatch(connection, {
@@ -1295,16 +1325,22 @@ describe("evidence coverage repository", () => {
         },
       );
       connection.exec("DROP TRIGGER session_evidence_coverage_v3_update_guard");
-      connection.prepare(`
-        UPDATE session_evidence_coverage
-        SET coverage_fingerprint_value = $digest
-      `).run({ $digest: "c".repeat(64) });
+      if (drift === "digest") {
+        connection.prepare(`
+          UPDATE session_evidence_coverage
+          SET coverage_fingerprint_value = $digest
+        `).run({ $digest: "c".repeat(64) });
+      } else {
+        connection.prepare(`
+          UPDATE session_evidence_coverage
+          SET latest_batch_event_position = 99
+        `).run();
+      }
+      const stateBeforeRejectedPersist = repositoryTableCounts(connection);
       expectIntegrity(() => repository.persistPrepared(connection, later, committed));
-      assert.equal(
-        connection.prepare(
-          "SELECT count(*) AS count FROM session_evidence_coverage_transitions",
-        ).get()!.count,
-        1n,
+      assert.deepEqual(
+        repositoryTableCounts(connection),
+        stateBeforeRejectedPersist,
       );
     }
   });
@@ -1754,6 +1790,219 @@ describe("evidence coverage repository", () => {
       ),
     );
 
+    const coverageConnection = database();
+    coverageConnection.exec(`
+      DROP TRIGGER IF EXISTS events_no_update;
+      DROP TRIGGER IF EXISTS session_evidence_coverage_insert_guard;
+      DROP TRIGGER IF EXISTS session_evidence_coverage_v3_insert_guard;
+      DROP TRIGGER IF EXISTS session_evidence_coverage_transitions_insert_guard;
+      DROP TRIGGER IF EXISTS session_evidence_coverage_transitions_advance_head;
+    `);
+    const targetAdapterIndex = 199;
+    const targetAdapterSessionId = indexedUuid(
+      300_000 + targetAdapterIndex,
+    );
+    const targetBatchId = indexedUuid(301_000 + targetAdapterIndex);
+    const maximumOrdinal = "9223372036854775807";
+    const maximumMissingOrdinal = "9223372036854775806";
+    let exactCoveragePosition = 200n;
+    const projections = (keyIds: readonly string[]) => Array.from(
+      { length: 200 },
+      (_, index) => ({
+        ...adapterEntry(index, keyIds[index]!),
+        coverageLastOrdinal: maximumOrdinal,
+        highestContiguousOrdinal: null,
+        missingIntervals: [{
+          firstOrdinal: "0",
+          lastOrdinal: maximumMissingOrdinal,
+        }],
+        coverageFingerprint: index === targetAdapterIndex
+          ? "0".repeat(64)
+          : H64,
+        latestBatchEventPosition: index === targetAdapterIndex
+          ? exactCoveragePosition.toString()
+          : BigInt(index + 1).toString(),
+      }),
+    );
+    const coverageBytes = (keyIds: readonly string[]): number =>
+      Buffer.byteLength(canonicalJson({
+        coverageVersion: 2,
+        captureMode: "coverage-only",
+        contentRetained: false,
+        adapterSessions: projections(keyIds),
+      }), "utf8");
+    let keyIds = Array.from({ length: 200 }, () => "k");
+    if ((196_608 - coverageBytes(keyIds)) % 2 !== 0) {
+      exactCoveragePosition = 1_000n;
+    }
+    let remainingKeyBytes = (196_608 - coverageBytes(keyIds)) / 2;
+    assert.equal(Number.isInteger(remainingKeyBytes), true);
+    assert.equal(remainingKeyBytes >= 0, true);
+    keyIds = keyIds.map(() => {
+      const added = Math.min(127, remainingKeyBytes);
+      remainingKeyBytes -= added;
+      return "k".repeat(added + 1);
+    });
+    assert.equal(remainingKeyBytes, 0);
+    assert.equal(coverageBytes(keyIds), 196_608);
+
+    for (let index = 0; index < targetAdapterIndex; index += 1) {
+      const position = BigInt(index + 1);
+      rawGenericSessionEvent(coverageConnection, position);
+    }
+    coverageConnection.prepare(`
+      UPDATE events
+      SET stream_id = $streamId,
+          stream_type = 'session',
+          event_type = 'EvidenceCoverageRecorded',
+          event_schema_version = 2
+    `).run({ $streamId: `session/${SESSION_ID}` });
+    for (let index = 0; index < targetAdapterIndex; index += 1) {
+      const entry = projections(keyIds)[index]!;
+      const position = BigInt(entry.latestBatchEventPosition);
+      rawInsert(coverageConnection, "session_evidence_coverage_transitions", {
+        project_id: PROJECT_ID,
+        session_id: SESSION_ID,
+        adapter_session_id: entry.adapterSessionId,
+        batch_id: entry.latestBatchId,
+        batch_event_position: position,
+        batch_first_ordinal: BigInt(maximumOrdinal),
+        batch_last_ordinal: BigInt(maximumOrdinal),
+        coverage_first_ordinal: 0n,
+        coverage_last_ordinal: BigInt(maximumOrdinal),
+        highest_contiguous_ordinal: -1n,
+        missing_intervals_json: `[[0,${maximumMissingOrdinal}]]`,
+        frame_fingerprint_algorithm: "hmac-sha256",
+        frame_fingerprint_schema_version: 1n,
+        frame_fingerprint_key_id: entry.frameFingerprintKeyId,
+        frame_fingerprint_domain: "pm-evidence-frame-v1",
+        previous_coverage_fingerprint_value: null,
+        coverage_fingerprint_algorithm: "hmac-sha256",
+        coverage_fingerprint_schema_version: 1n,
+        coverage_fingerprint_key_id: entry.coverageFingerprintKeyId,
+        coverage_fingerprint_domain: "pm-evidence-coverage-v1",
+        coverage_fingerprint_value: H64,
+        new_frame_count: 1n,
+        capture_mode: "coverage-only",
+        content_retained: 0n,
+        created_at: NOW,
+      });
+      rawInsert(coverageConnection, "session_evidence_coverage", {
+        project_id: PROJECT_ID,
+        session_id: SESSION_ID,
+        adapter_session_id: entry.adapterSessionId,
+        capture_mode: "coverage-only",
+        first_ordinal: 0n,
+        last_ordinal: BigInt(maximumOrdinal),
+        highest_contiguous_ordinal: -1n,
+        missing_intervals_json: `[[0,${maximumMissingOrdinal}]]`,
+        fingerprint_algorithm: "hmac-sha256",
+        fingerprint_schema_version: 1n,
+        fingerprint_key_id: entry.frameFingerprintKeyId,
+        fingerprint_domain: "pm-evidence-frame-v1",
+        latest_batch_id: entry.latestBatchId,
+        latest_batch_event_position: position,
+        created_at: NOW,
+        updated_at: NOW,
+        coverage_fingerprint_algorithm: "hmac-sha256",
+        coverage_fingerprint_schema_version: 1n,
+        coverage_fingerprint_key_id: entry.coverageFingerprintKeyId,
+        coverage_fingerprint_domain: "pm-evidence-coverage-v1",
+        coverage_fingerprint_value: H64,
+      });
+      rawInsert(
+        coverageConnection,
+        "session_evidence_coverage_transition_heads",
+        {
+          project_id: PROJECT_ID,
+          session_id: SESSION_ID,
+          adapter_session_id: entry.adapterSessionId,
+          batch_event_position: position,
+        },
+      );
+    }
+    const coverageCommand = command({
+      commandId: indexedUuid(303_000),
+      idempotencyKey: "exact-coverage-repository-bound",
+      sessionId: SESSION_ID as never,
+      adapterSessionId: targetAdapterSessionId as never,
+      batchId: targetBatchId as never,
+      fingerprintKeyId: keyIds[targetAdapterIndex],
+      firstOrdinal: maximumOrdinal,
+      lastOrdinal: maximumOrdinal,
+      frames: [{
+        frameId: indexedUuid(303_001) as never,
+        ordinal: maximumOrdinal,
+        sourceKind: "external-observation",
+        observedAt: NOW,
+        contentFingerprint: "f".repeat(64),
+      }],
+    });
+    const exactCoverageRecorder = providerRecorder(
+      undefined,
+      "available",
+      keyIds[targetAdapterIndex],
+    );
+    const exactCoveragePrepared = new EvidenceCoverageRepository(
+      exactCoverageRecorder.provider,
+    ).prepareBatch(coverageConnection, {
+      context: context(),
+      command: coverageCommand,
+      prospectiveEndingScopeBindings: [],
+      plannedEventPosition: exactCoveragePosition,
+    });
+    const exactCoverageSnapshot: CheckpointEvidenceCoverageV2 = {
+      coverageVersion: 2,
+      captureMode: "coverage-only",
+      contentRetained: false,
+      adapterSessions: projections(keyIds).map((entry, index) =>
+        index === targetAdapterIndex
+          ? {
+            ...entry,
+            coverageFingerprint:
+              exactCoveragePrepared.eventPayload.coverageFingerprint,
+          }
+          : entry),
+    };
+    assert.equal(
+      Buffer.byteLength(canonicalJson(exactCoverageSnapshot), "utf8"),
+      196_608,
+    );
+    assert.equal(exactCoverageRecorder.calls.currentKey, 1);
+    const coverageState = repositoryTableCounts(coverageConnection);
+    const overCoverageRecorder = providerRecorder(
+      undefined,
+      "available",
+      keyIds[targetAdapterIndex],
+    );
+    const overCoveragePosition = exactCoveragePosition * 10n;
+    assert.equal(
+      coverageBytes(keyIds) + (
+        overCoveragePosition.toString().length
+        - exactCoveragePosition.toString().length
+      ),
+      196_609,
+    );
+    assert.throws(
+      () => new EvidenceCoverageRepository(overCoverageRecorder.provider)
+        .prepareBatch(coverageConnection, {
+          context: context(),
+          command: coverageCommand,
+          prospectiveEndingScopeBindings: [],
+          plannedEventPosition: overCoveragePosition,
+        }),
+      (error: unknown) => (
+        error instanceof Error
+        && "code" in error
+        && error.code === "EVIDENCE_COVERAGE_SNAPSHOT_TOO_LARGE"
+      ),
+    );
+    assert.deepEqual(
+      overCoverageRecorder.calls,
+      { currentKey: 0, status: 0, fingerprint: 0 },
+    );
+    assert.deepEqual(repositoryTableCounts(coverageConnection), coverageState);
+
     const exactBindings = Array.from({ length: 580 }, (_, index) =>
       endingBinding(index));
     const exactCommand = command({
@@ -1810,6 +2059,51 @@ describe("evidence coverage repository", () => {
     );
     assert.equal(exactRecorder.calls.currentKey, 1);
 
+    const plusOneConnection = database();
+    const plusOneRecorder = providerRecorder(undefined, "available", "k");
+    assert.throws(
+      () => new EvidenceCoverageRepository(plusOneRecorder.provider)
+        .prepareBatch(plusOneConnection, {
+          context: context(),
+          command: exactCommand,
+          prospectiveEndingScopeBindings: exactBindings,
+          plannedEventPosition: 10n,
+        }),
+      (error: unknown) => (
+        error instanceof Error
+        && "code" in error
+        && error.code === "CHECKPOINT_CAPACITY_EXCEEDED"
+      ),
+    );
+    assert.deepEqual(
+      plusOneRecorder.calls,
+      { currentKey: 0, status: 0, fingerprint: 0 },
+    );
+    assert.deepEqual(
+      repositoryTableCounts(plusOneConnection),
+      {
+        events: 0n,
+        session_evidence_coverage_transitions: 0n,
+        session_evidence_coverage_transition_heads: 0n,
+        session_evidence_coverage: 0n,
+        session_evidence_fingerprints: 0n,
+      },
+    );
+    const plusOneCoverage: CheckpointEvidenceCoverageV2 = {
+      ...prospectiveCoverage,
+      adapterSessions: prospectiveCoverage.adapterSessions.map((entry) => ({
+        ...entry,
+        latestBatchEventPosition: "10",
+      })),
+    };
+    assert.equal(
+      exactRepository.minimumCheckpointUpperBound(plusOneConnection, {
+        evidenceCoverage: plusOneCoverage,
+        endingScopeBindings: exactBindings,
+      }),
+      262_145,
+    );
+
     const placeholderConnection = database();
     const placeholderRecorder = providerRecorder(undefined, "available", "k");
     assert.throws(
@@ -1830,20 +2124,86 @@ describe("evidence coverage repository", () => {
       placeholderRecorder.calls,
       { currentKey: 0, status: 0, fingerprint: 0 },
     );
-    for (const [count, relation] of [
-      [605, "below"],
-      [606, "above"],
-    ] as const) {
-      const bound = exactRepository.minimumFinalEndingScopeBindingsUpperBound(
+    assert.deepEqual(
+      repositoryTableCounts(placeholderConnection),
+      {
+        events: 0n,
+        session_evidence_coverage_transitions: 0n,
+        session_evidence_coverage_transition_heads: 0n,
+        session_evidence_coverage: 0n,
+        session_evidence_fingerprints: 0n,
+      },
+    );
+    const finalExactBindings = Array.from({ length: 605 }, (_, index) =>
+      carryEndingBinding(index));
+    assert.equal(
+      exactRepository.minimumFinalEndingScopeBindingsUpperBound(
         exactConnection,
-        {
-          endingScopeBindings: Array.from({ length: count }, (_, index) =>
-            endingBinding(index)),
-        },
-      );
-      if (relation === "below") assert.equal(bound <= 262_144, true);
-      else assert.equal(bound > 262_144, true);
-    }
+        { endingScopeBindings: finalExactBindings },
+      ),
+      261_966,
+    );
+    const finalExactConnection = database();
+    const finalExactRecorder = providerRecorder(undefined, "available", "k");
+    assert.doesNotThrow(() =>
+      new EvidenceCoverageRepository(finalExactRecorder.provider)
+        .prepareBatch(finalExactConnection, {
+          context: context(),
+          command: exactCommand,
+          prospectiveEndingScopeBindings: finalExactBindings,
+          plannedEventPosition: 1n,
+        }));
+    assert.equal(finalExactRecorder.calls.currentKey, 1);
+    assert.deepEqual(
+      repositoryTableCounts(finalExactConnection),
+      {
+        events: 0n,
+        session_evidence_coverage_transitions: 0n,
+        session_evidence_coverage_transition_heads: 0n,
+        session_evidence_coverage: 0n,
+        session_evidence_fingerprints: 0n,
+      },
+    );
+
+    const finalOverBindings = Array.from({ length: 606 }, (_, index) =>
+      carryEndingBinding(index));
+    assert.equal(
+      exactRepository.minimumFinalEndingScopeBindingsUpperBound(
+        exactConnection,
+        { endingScopeBindings: finalOverBindings },
+      ),
+      262_399,
+    );
+    const finalOverConnection = database();
+    const finalOverRecorder = providerRecorder(undefined, "available", "k");
+    assert.throws(
+      () => new EvidenceCoverageRepository(finalOverRecorder.provider)
+        .prepareBatch(finalOverConnection, {
+          context: context(),
+          command: exactCommand,
+          prospectiveEndingScopeBindings: finalOverBindings,
+          plannedEventPosition: 1n,
+        }),
+      (error: unknown) => (
+        error instanceof Error
+        && "code" in error
+        && error.code === "CHECKPOINT_CAPACITY_EXCEEDED"
+      ),
+    );
+    assert.deepEqual(
+      finalOverRecorder.calls,
+      { currentKey: 0, status: 0, fingerprint: 0 },
+    );
+    assert.deepEqual(
+      repositoryTableCounts(finalOverConnection),
+      {
+        events: 0n,
+        session_evidence_coverage_transitions: 0n,
+        session_evidence_coverage_transition_heads: 0n,
+        session_evidence_coverage: 0n,
+        session_evidence_fingerprints: 0n,
+      },
+    );
   });
 
   it("persists transition aggregate and ordinal order with real foreign keys", () => {
@@ -2324,6 +2684,217 @@ describe("evidence coverage repository", () => {
     }
   });
 
+  it("rejects non-current evidence events and superseded coverage checkpoints", () => {
+    const assertHistoricalRejected = (
+      eventType: string,
+      eventSchemaVersion: bigint,
+      payload: Readonly<Record<string, unknown>>,
+    ): string => {
+      const connection = database();
+      rawGenericSessionEvent(connection, 1n);
+      rawGenericSessionEvent(connection, 2n);
+      connection.exec("DROP TRIGGER events_no_update");
+      const laterIsCheckpoint = eventType === "SessionCheckpointRecorded";
+      const laterPayload = laterIsCheckpoint
+        ? {
+          checkpoint: {
+            checkpointVersion: Number(eventSchemaVersion),
+            evidenceCoverage: {
+              highestContiguousOrdinal: null,
+              missingIntervals: [],
+              adapterSessions: [],
+            },
+          },
+        }
+        : {};
+      connection.prepare(`
+        UPDATE events
+        SET stream_id = $streamId,
+            stream_type = 'session',
+            stream_version = global_position,
+            event_type = CASE global_position
+              WHEN 1 THEN $eventType
+              ELSE $laterEventType
+            END,
+            event_schema_version = CASE global_position
+              WHEN 1 THEN $eventSchemaVersion
+              ELSE $laterEventSchemaVersion
+            END,
+            payload_json = CASE global_position
+              WHEN 1 THEN $payloadJson
+              ELSE $laterPayloadJson
+            END
+      `).run({
+        $streamId: `session/${SESSION_ID}`,
+        $eventType: eventType,
+        $eventSchemaVersion: eventSchemaVersion,
+        $payloadJson: canonicalJson(payload),
+        $laterEventType: laterIsCheckpoint
+          ? "SessionCheckpointRecorded"
+          : "GenericEvent",
+        $laterEventSchemaVersion: laterIsCheckpoint
+          ? eventSchemaVersion
+          : 1n,
+        $laterPayloadJson: canonicalJson(laterPayload),
+      });
+      let artifactSql = "";
+      const inspected: SqliteConnection = {
+        exec(sql) {
+          connection.exec(sql);
+        },
+        prepare(sql) {
+          if (
+            sql.includes("FROM events")
+            && sql.includes("EvidenceCoverageRecorded")
+            && sql.includes("LIMIT 1")
+          ) {
+            artifactSql = sql;
+          }
+          return connection.prepare(sql);
+        },
+        close() {
+          connection.close();
+        },
+      };
+      assert.throws(
+        () => new EvidenceCoverageRepository(providerRecorder().provider)
+          .assertVersion1Eligible(inspected, [SESSION_ID as never]),
+        (error: unknown) => (
+          error instanceof Error
+          && "code" in error
+          && error.code === "CHECKPOINT_EVIDENCE_VERSION_REQUIRED"
+        ),
+      );
+      return artifactSql;
+    };
+
+    const evidenceSql = assertHistoricalRejected(
+      "EvidenceCoverageRecorded",
+      99n,
+      {},
+    );
+    const checkpointV1Sql = assertHistoricalRejected(
+      "SessionCheckpointRecorded",
+      1n,
+      {
+        checkpoint: {
+          checkpointVersion: 1,
+          evidenceCoverage: {
+            highestContiguousOrdinal: "0",
+            missingIntervals: [],
+            adapterSessions: [],
+          },
+        },
+      },
+    );
+    const checkpointV2Sql = assertHistoricalRejected(
+      "SessionCheckpointRecorded",
+      2n,
+      {
+        checkpoint: {
+          checkpointVersion: 2,
+          evidenceCoverage: {
+            highestContiguousOrdinal: null,
+            missingIntervals: [],
+            adapterSessions: [{ adapterSessionId: ADAPTER_ID }],
+          },
+        },
+      },
+    );
+    assert.equal(evidenceSql, checkpointV1Sql);
+    assert.equal(evidenceSql, checkpointV2Sql);
+  });
+
+  it("keeps clean missing null and empty historical checkpoint coverage eligible", () => {
+    const connection = database();
+    for (let position = 1n; position <= 3n; position += 1n) {
+      rawGenericSessionEvent(connection, position);
+    }
+    connection.exec("DROP TRIGGER events_no_update");
+    const cleanPayloads = [
+      { checkpoint: { checkpointVersion: 1 } },
+      {
+        checkpoint: {
+          checkpointVersion: 1,
+          evidenceCoverage: {
+            highestContiguousOrdinal: null,
+            missingIntervals: [],
+            adapterSessions: [],
+          },
+        },
+      },
+      {
+        checkpoint: {
+          checkpointVersion: 2,
+          evidenceCoverage: {
+            highestContiguousOrdinal: null,
+            missingIntervals: [],
+            adapterSessions: [],
+          },
+        },
+      },
+    ];
+    for (let index = 0; index < cleanPayloads.length; index += 1) {
+      connection.prepare(`
+        UPDATE events
+        SET stream_id = $streamId,
+            stream_type = 'session',
+            stream_version = global_position,
+            event_type = 'SessionCheckpointRecorded',
+            event_schema_version = $eventSchemaVersion,
+            payload_json = $payloadJson
+        WHERE global_position = $globalPosition
+      `).run({
+        $streamId: `session/${SESSION_ID}`,
+        $eventSchemaVersion: index === 2 ? 2n : 1n,
+        $payloadJson: canonicalJson(cleanPayloads[index]),
+        $globalPosition: BigInt(index + 1),
+      });
+    }
+    let artifactSql = "";
+    const inspected: SqliteConnection = {
+      exec(sql) {
+        connection.exec(sql);
+      },
+      prepare(sql) {
+        if (
+          sql.includes("FROM events")
+          && sql.includes("EvidenceCoverageRecorded")
+          && sql.includes("LIMIT 1")
+        ) {
+          artifactSql = sql;
+        }
+        return connection.prepare(sql);
+      },
+      close() {
+        connection.close();
+      },
+    };
+    assert.doesNotThrow(() =>
+      new EvidenceCoverageRepository(providerRecorder().provider)
+        .assertVersion1Eligible(inspected, [SESSION_ID as never]));
+    assert.notEqual(artifactSql, "");
+    const plan = connection.prepare(
+      `EXPLAIN QUERY PLAN ${artifactSql}`,
+    ).all({
+      $projectId: PROJECT_ID,
+      $sessionId: SESSION_ID,
+    }).map((row) => String(row.detail));
+    assert.equal(
+      plan.some((detail) =>
+        detail.includes(
+          "SEARCH events USING INDEX events_session_evidence_artifacts "
+          + "(project_id=? AND session_id=?)",
+        )),
+      true,
+    );
+    assert.equal(
+      plan.some((detail) =>
+        /SCAN events|USE TEMP B-TREE/i.test(detail)),
+      false,
+    );
+  });
+
   it("bounds event-time snapshot work by adapter identities rather than transition history", () => {
     const connection = database();
     const repository = new EvidenceCoverageRepository(providerRecorder().provider);
@@ -2373,6 +2944,7 @@ describe("evidence coverage repository", () => {
     let headEnumerations = 0;
     let indexedTransitionSeeks = 0;
     let unboundedTransitionQueries = 0;
+    let headEnumerationSql = "";
     const inspected: SqliteConnection = {
       exec(sql) {
         connection.exec(sql);
@@ -2380,6 +2952,7 @@ describe("evidence coverage repository", () => {
       prepare(sql) {
         if (sql.includes("FROM session_evidence_coverage_transition_heads")) {
           headEnumerations += 1;
+          headEnumerationSql = sql;
         }
         if (
           sql.includes("FROM session_evidence_coverage_transitions")
@@ -2410,6 +2983,28 @@ describe("evidence coverage repository", () => {
     assert.equal(headEnumerations, 1);
     assert.equal(indexedTransitionSeeks, 1);
     assert.equal(unboundedTransitionQueries, 0);
+    assert.doesNotMatch(headEnumerationSql, /ORDER BY|CAST\s*\(/i);
+    const headPlan = connection.prepare(
+      `EXPLAIN QUERY PLAN ${headEnumerationSql}`,
+    ).all({
+      $projectId: PROJECT_ID,
+      $sessionId: SESSION_ID,
+    }).map((row) => String(row.detail));
+    assert.equal(
+      headPlan.some((detail) =>
+        detail.includes(
+          "SEARCH session_evidence_coverage_transition_heads "
+          + "USING COVERING INDEX sqlite_autoindex_"
+          + "session_evidence_coverage_transition_heads_1 "
+          + "(project_id=? AND session_id=?)",
+        )),
+      true,
+    );
+    assert.equal(
+      headPlan.some((detail) =>
+        /SCAN|USE TEMP B-TREE/i.test(detail)),
+      false,
+    );
   });
 
   it("keeps Version 1 eligibility independent of deep event history", () => {

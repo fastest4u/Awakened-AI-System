@@ -1212,6 +1212,81 @@ describe("qualified checkpoint migration", () => {
     );
   });
 
+  it("installs an index-backed exact historical evidence-artifact predicate", () => {
+    const connection = currentConnection();
+    const indexSql = String(connection.prepare(`
+      SELECT sql FROM sqlite_schema
+      WHERE type = 'index' AND name = 'events_session_evidence_artifacts'
+    `).get()?.sql);
+    assert.match(
+      indexSql,
+      /ON events\(project_id, session_id\)/,
+    );
+    assert.match(
+      indexSql,
+      /stream_type = 'session'[\s\S]*session_id IS NOT NULL/,
+    );
+    assert.match(
+      indexSql,
+      /event_type = 'EvidenceCoverageRecorded'/,
+    );
+    assert.doesNotMatch(
+      indexSql,
+      /EvidenceCoverageRecorded'[\s\S]{0,120}event_schema_version/,
+    );
+    assert.match(
+      indexSql,
+      /highestContiguousOrdinal[\s\S]*missingIntervals[\s\S]*adapterSessions/,
+    );
+
+    const plan = connection.prepare(`
+      EXPLAIN QUERY PLAN
+      SELECT 1
+      FROM events
+      WHERE project_id = $projectId
+        AND session_id = $sessionId
+        AND stream_type = 'session'
+        AND session_id IS NOT NULL
+        AND (
+          event_type = 'EvidenceCoverageRecorded'
+          OR (
+            event_type = 'SessionCheckpointRecorded'
+            AND (
+              json_extract(
+                payload_json,
+                '$.checkpoint.evidenceCoverage.highestContiguousOrdinal'
+              ) IS NOT NULL
+              OR coalesce(json_array_length(
+                payload_json,
+                '$.checkpoint.evidenceCoverage.missingIntervals'
+              ), 0) > 0
+              OR coalesce(json_array_length(
+                payload_json,
+                '$.checkpoint.evidenceCoverage.adapterSessions'
+              ), 0) > 0
+            )
+          )
+        )
+      LIMIT 1
+    `).all({
+      $projectId: PROJECT_ID,
+      $sessionId: ROOT_ID,
+    }).map((row) => String(row.detail));
+    assert.equal(
+      plan.some((detail) =>
+        detail.includes(
+          "SEARCH events USING INDEX events_session_evidence_artifacts "
+          + "(project_id=? AND session_id=?)",
+        )),
+      true,
+    );
+    assert.equal(
+      plan.some((detail) =>
+        /SCAN events|USE TEMP B-TREE/i.test(detail)),
+      false,
+    );
+  });
+
   it("runs the migration-3 hook after complete uncommitted schema 2 on every source path", () => {
     const sourceVersions = [0, 1, 2] as const;
     for (const sourceVersion of sourceVersions) {

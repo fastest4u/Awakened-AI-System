@@ -834,6 +834,32 @@ THEN 1 ELSE 0 END;
 ALTER TABLE session_evidence_coverage
   ADD COLUMN coverage_fingerprint_algorithm TEXT NOT NULL DEFAULT 'hmac-sha256'
   CHECK (coverage_fingerprint_algorithm = 'hmac-sha256');
+
+CREATE INDEX events_session_evidence_artifacts
+ON events(project_id, session_id)
+WHERE stream_type = 'session'
+  AND session_id IS NOT NULL
+  AND (
+    event_type = 'EvidenceCoverageRecorded'
+    OR (
+      event_type = 'SessionCheckpointRecorded'
+      AND (
+        json_extract(
+          payload_json,
+          '$.checkpoint.evidenceCoverage.highestContiguousOrdinal'
+        ) IS NOT NULL
+        OR coalesce(json_array_length(
+          payload_json,
+          '$.checkpoint.evidenceCoverage.missingIntervals'
+        ), 0) > 0
+        OR coalesce(json_array_length(
+          payload_json,
+          '$.checkpoint.evidenceCoverage.adapterSessions'
+        ), 0) > 0
+      )
+    )
+  );
+
 ALTER TABLE session_evidence_coverage
   ADD COLUMN coverage_fingerprint_schema_version INTEGER NOT NULL DEFAULT 1
   CHECK (coverage_fingerprint_schema_version = 1);
