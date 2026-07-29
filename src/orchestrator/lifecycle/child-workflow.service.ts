@@ -8,6 +8,8 @@ import type { ProjectContext } from "../identity/contracts.js";
 import type {
   ChildAuthorityInsert,
   ChildTransferTicketInsert,
+  CarryForwardEndingScopeProjectionRecord,
+  CurrentChildEndingScopeProjectionRecord,
   SessionAuthorityMutation,
   SessionAuthorityRecord,
 } from "../storage/lifecycle-storage.types.js";
@@ -55,6 +57,7 @@ import {
   type SuspendChildSessionCommandV2,
 } from "./contracts/commands.js";
 import type { LifecycleEventV1 } from "./contracts/events.js";
+import { CHECKPOINT_MAX_CANONICAL_BYTES } from "./contracts/checkpoint.js";
 import type {
   ChildSessionState,
   ReportId,
@@ -62,6 +65,15 @@ import type {
   SessionId,
   TransferTicketId,
 } from "./contracts/identifiers.js";
+import {
+  decodeFinalEndingScopeBindingsV1,
+  FINAL_ENDING_SCOPE_BINDINGS_MAX_CANONICAL_BYTES,
+  type FinalEndingScopeBindingV1,
+} from "./contracts/session-end.js";
+import type {
+  MinimumCheckpointCapacityInput,
+  MinimumEndingScopeCapacityInput,
+} from "./checkpoint-capacity.js";
 import { LifecycleError } from "./errors.js";
 import {
   LifecycleCommandStore,
@@ -74,6 +86,8 @@ import { requireRiskyTransitionCheckpointV1 } from "./checkpoint.service.js";
 
 const LOWER_HASH = /^[0-9a-f]{64}$/;
 const SQLITE_INT64_MAX = 9_223_372_036_854_775_807n;
+const ENDING_SCOPE_PROJECTION_LIMIT = 606;
+const ESTIMATOR_ONLY_POSITION = "9223372036854775807";
 const REPORT_FIELDS = [
   "findings",
   "proposedDecisions",
@@ -157,6 +171,11 @@ interface ChildAuthorityOperations {
   loadEvents(input: SessionAuthorityRecord): readonly LifecycleEventV1[];
   requireFoldMatch(input: SessionAuthorityRecord): SessionAggregateState;
   listNonterminalChildren(projectId: string, rootSessionId: string): readonly SessionAuthorityRecord[];
+  listNonterminalChildEndingScopeProjectionsBounded(
+    projectId: string,
+    rootSessionId: string,
+    limit: number,
+  ): readonly CurrentChildEndingScopeProjectionRecord[];
   markCheckpointRequired(input: {
     readonly projectId: string;
     readonly sessionId: string;
@@ -169,6 +188,11 @@ interface ChildAuthorityOperations {
 interface ChildTransferOperations {
   get(projectId: string, transferTicketId: string): import("../storage/lifecycle-storage.types.js").ChildTransferTicketRecord | null;
   findCreatedEventPosition(projectId: string, transferTicketId: string): bigint | null;
+  listUnclaimedEndingScopeProjectionsBySourceRoot(
+    projectId: string,
+    sourceRootSessionId: string,
+    limit: number,
+  ): readonly CarryForwardEndingScopeProjectionRecord[];
   insert(input: ChildTransferTicketInsert): void;
   claim(input: import("../storage/lifecycle-storage.types.js").ChildTransferClaim): unknown;
 }
@@ -218,6 +242,9 @@ function authorityOperations(transaction: LifecycleCommandTransaction): ChildAut
       value,
       "listNonterminalChildren",
     ),
+    listNonterminalChildEndingScopeProjectionsBounded: ownMethod<
+      ChildAuthorityOperations["listNonterminalChildEndingScopeProjectionsBounded"]
+    >(value, "listNonterminalChildEndingScopeProjectionsBounded"),
     markCheckpointRequired: ownMethod<ChildAuthorityOperations["markCheckpointRequired"]>(value, "markCheckpointRequired"),
   });
 }
@@ -243,6 +270,9 @@ function transferOperations(transaction: LifecycleCommandTransaction): ChildTran
   return Object.freeze({
     get: ownMethod<ChildTransferOperations["get"]>(value, "get"),
     findCreatedEventPosition: ownMethod<ChildTransferOperations["findCreatedEventPosition"]>(value, "findCreatedEventPosition"),
+    listUnclaimedEndingScopeProjectionsBySourceRoot: ownMethod<
+      ChildTransferOperations["listUnclaimedEndingScopeProjectionsBySourceRoot"]
+    >(value, "listUnclaimedEndingScopeProjectionsBySourceRoot"),
     insert: ownMethod<ChildTransferOperations["insert"]>(value, "insert"),
     claim: ownMethod<ChildTransferOperations["claim"]>(value, "claim"),
   });
@@ -258,6 +288,181 @@ function registerAffectedExistingSession(
     transaction.coverage as object,
     "registerAffectedExistingSessions",
   )([sessionId]);
+}
+
+declare const ESTIMATOR_ONLY_SESSION_ID: unique symbol;
+type EstimatorOnlySessionId = SessionId & {
+  readonly [ESTIMATOR_ONLY_SESSION_ID]: true;
+};
+
+function estimatorOnlySessionId(
+  bindings: readonly FinalEndingScopeBindingV1[],
+): EstimatorOnlySessionId {
+  const occupied = new Set(bindings.map((binding) => binding.childSessionId));
+  for (let ordinal = 0; ordinal <= occupied.size; ordinal += 1) {
+    const candidate = `00000000-0000-4000-8000-${ordinal.toString(16).padStart(12, "0")}`;
+    if (!occupied.has(candidate as SessionId)) {
+      return candidate as EstimatorOnlySessionId;
+    }
+  }
+  return invalid("INTEGRITY_FAILURE");
+}
+
+function estimatorBinding(value: Readonly<Record<string, unknown>>): FinalEndingScopeBindingV1 {
+  try {
+    const decoded = decodeFinalEndingScopeBindingsV1([value]);
+    const binding = decoded[0];
+    if (binding === undefined) invalid("INTEGRITY_FAILURE");
+    return binding;
+  } catch {
+    return invalid("INTEGRITY_FAILURE");
+  }
+}
+
+function currentChildEndingScopeBinding(
+  root: SessionAuthorityRecord,
+  projection: CurrentChildEndingScopeProjectionRecord,
+): FinalEndingScopeBindingV1 {
+  if (projection.projectId !== root.projectId
+    || projection.rootSessionId !== root.sessionId
+    || ((projection.checkpointId === null)
+      !== (projection.checkpointEventPosition === null))) invalid("INTEGRITY_FAILURE");
+  return estimatorBinding({
+    bindingVersion: 1,
+    bindingKind: "current-child",
+    childSessionId: projection.childSessionId,
+    childState: projection.childState,
+    lastEventPosition: projection.lastEventPosition.toString(),
+    streamVersion: projection.streamVersion.toString(),
+    checkpointId: projection.checkpointId,
+    checkpointEventPosition: projection.checkpointEventPosition?.toString() ?? null,
+    transferTicketId: null,
+    transferTicketEventPosition: null,
+  });
+}
+
+function carryForwardEndingScopeBinding(
+  root: SessionAuthorityRecord,
+  projection: CarryForwardEndingScopeProjectionRecord,
+): FinalEndingScopeBindingV1 {
+  if (projection.projectId !== root.projectId
+    || projection.rootSessionId !== root.sessionId) invalid("INTEGRITY_FAILURE");
+  return estimatorBinding({
+    bindingVersion: 1,
+    bindingKind: "carry-forward-ticket",
+    childSessionId: projection.childSessionId,
+    childState: projection.childState,
+    lastEventPosition: projection.lastEventPosition.toString(),
+    streamVersion: projection.streamVersion.toString(),
+    checkpointId: projection.checkpointId,
+    checkpointEventPosition: projection.checkpointEventPosition.toString(),
+    transferTicketId: projection.transferTicketId,
+    transferTicketEventPosition: projection.transferTicketEventPosition.toString(),
+  });
+}
+
+function claimedCarryForwardEndingScopeBinding(
+  ticket: Readonly<import("../storage/lifecycle-storage.types.js").ChildTransferTicketRecord>,
+  source: SessionAuthorityRecord,
+  aggregate: Extract<SessionAggregateState, { readonly kind: "child" }>,
+): FinalEndingScopeBindingV1 {
+  if (source.latestCheckpointEventPosition === null
+    || source.sessionId !== ticket.sourceChildSessionId
+    || source.parentSessionId !== ticket.sourceParentSessionId) invalid("INTEGRITY_FAILURE");
+  return estimatorBinding({
+    bindingVersion: 1,
+    bindingKind: "carry-forward-ticket",
+    childSessionId: source.sessionId,
+    childState: "transferred",
+    lastEventPosition: ticket.createdEventPosition.toString(),
+    streamVersion: aggregate.streamVersion.toString(),
+    checkpointId: ticket.checkpointId,
+    checkpointEventPosition: source.latestCheckpointEventPosition.toString(),
+    transferTicketId: ticket.transferTicketId,
+    transferTicketEventPosition: ticket.createdEventPosition.toString(),
+  });
+}
+
+function prospectiveEndingScopeBindings(
+  authority: ChildAuthorityOperations,
+  transfers: ChildTransferOperations,
+  root: SessionAuthorityRecord,
+  replacedCarryForward: FinalEndingScopeBindingV1 | null,
+): readonly FinalEndingScopeBindingV1[] {
+  const children = authority.listNonterminalChildEndingScopeProjectionsBounded(
+    root.projectId,
+    root.sessionId,
+    ENDING_SCOPE_PROJECTION_LIMIT,
+  );
+  const tickets = transfers.listUnclaimedEndingScopeProjectionsBySourceRoot(
+    root.projectId,
+    root.sessionId,
+    ENDING_SCOPE_PROJECTION_LIMIT,
+  );
+  if (!Array.isArray(children)
+    || !Array.isArray(tickets)
+    || children.length > ENDING_SCOPE_PROJECTION_LIMIT
+    || tickets.length > ENDING_SCOPE_PROJECTION_LIMIT) invalid("INTEGRITY_FAILURE");
+  const current = [
+    ...children.map((projection) => currentChildEndingScopeBinding(root, projection)),
+    ...tickets.map((projection) => carryForwardEndingScopeBinding(root, projection)),
+    ...(replacedCarryForward === null ? [] : [replacedCarryForward]),
+  ];
+  const folded = replacedCarryForward === null
+    ? current
+    : current.filter(
+        (binding) => binding.childSessionId !== replacedCarryForward.childSessionId,
+      );
+  const prospective = estimatorBinding({
+    bindingVersion: 1,
+    bindingKind: "current-child",
+    childSessionId: estimatorOnlySessionId(folded),
+    childState: "active",
+    lastEventPosition: ESTIMATOR_ONLY_POSITION,
+    streamVersion: ESTIMATOR_ONLY_POSITION,
+    checkpointId: null,
+    checkpointEventPosition: null,
+    transferTicketId: null,
+    transferTicketEventPosition: null,
+  });
+  const bindings = [...folded, prospective].sort((left, right) => Buffer.compare(
+    Buffer.from(left.childSessionId, "utf8"),
+    Buffer.from(right.childSessionId, "utf8"),
+  ));
+  for (let index = 1; index < bindings.length; index += 1) {
+    if (bindings[index - 1]?.childSessionId === bindings[index]?.childSessionId) {
+      invalid("INTEGRITY_FAILURE");
+    }
+  }
+  return Object.freeze(bindings);
+}
+
+function assertProspectiveCapacity(
+  transaction: LifecycleCommandTransaction,
+  root: SessionAuthorityRecord,
+  aggregate: Extract<SessionAggregateState, { readonly kind: "root" }>,
+  endingScopeBindings: readonly FinalEndingScopeBindingV1[],
+): void {
+  const evidenceCoverage = transaction.coverage.snapshotV2(
+    root.sessionId as SessionId,
+    aggregate.eventPosition,
+  );
+  const minimumCheckpointBytes: number = transaction.coverage.minimumCheckpointUpperBound({
+    evidenceCoverage,
+    endingScopeBindings,
+  } satisfies MinimumCheckpointCapacityInput);
+  const minimumEndingScopeBytes: number =
+    transaction.coverage.minimumFinalEndingScopeBindingsUpperBound({
+      endingScopeBindings,
+    } satisfies MinimumEndingScopeCapacityInput);
+  if (!Number.isSafeInteger(minimumCheckpointBytes)
+    || minimumCheckpointBytes < 0
+    || !Number.isSafeInteger(minimumEndingScopeBytes)
+    || minimumEndingScopeBytes < 0) invalid("INTEGRITY_FAILURE");
+  if (minimumCheckpointBytes > CHECKPOINT_MAX_CANONICAL_BYTES
+    || minimumEndingScopeBytes > FINAL_ENDING_SCOPE_BINDINGS_MAX_CANONICAL_BYTES) {
+    throw new LifecycleError("CHECKPOINT_CAPACITY_EXCEEDED");
+  }
 }
 
 function validateContext(context: ProjectContext, command: ChildCommand): void {
@@ -808,6 +1013,7 @@ export class ChildWorkflowService {
   ): FreshLifecycleEffect<ForkChildResultV2> {
     const scope = this.#scope(transaction, command);
     const authority = authorityOperations(transaction);
+    const transfers = transferOperations(transaction);
     const { record: parent, aggregate } = this.#requireCurrentRoot(
       authority,
       scope.context.binding.projectId,
@@ -840,6 +1046,18 @@ export class ChildWorkflowService {
       targetClientInstanceId = signed.targetClientInstanceId;
     } else if (scope.input.authorization.kind !== "protected"
       || scope.input.authorization.childBindingGrant !== null) throw new LifecycleError("SESSION_CAPABILITY_INVALID");
+    const endingScopeBindings = prospectiveEndingScopeBindings(
+      authority,
+      transfers,
+      parent,
+      null,
+    );
+    assertProspectiveCapacity(
+      transaction,
+      parent,
+      aggregate,
+      endingScopeBindings,
+    );
     const childSessionId = this.#ids.uuid();
     const targetMaterial = targetClientInstanceId === null
       ? null
@@ -1622,6 +1840,23 @@ export class ChildWorkflowService {
       minimumBaseEventPosition: ticket.createdEventPosition,
       relevantChildren: riskyTransitionChildren(authority, root),
     });
+    const replacedCarryForward = claimedCarryForwardEndingScopeBinding(
+      ticket,
+      source,
+      sourceAggregate,
+    );
+    const endingScopeBindings = prospectiveEndingScopeBindings(
+      authority,
+      transfers,
+      root,
+      replacedCarryForward,
+    );
+    assertProspectiveCapacity(
+      transaction,
+      root,
+      rootAggregate,
+      endingScopeBindings,
+    );
     const now = exactNow(this.#clock);
     const forkPosition = authority.nextGlobalPosition();
     if (forkPosition > SQLITE_INT64_MAX - 1n) invalid("INTEGRITY_FAILURE");

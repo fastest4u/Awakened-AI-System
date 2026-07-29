@@ -38,7 +38,6 @@ import {
 } from "./contracts/commands.js";
 import type { RootSessionState, SessionId } from "./contracts/identifiers.js";
 import {
-  decodeCheckpointDraftV1,
   decodeCheckpointV1,
   type CheckpointV1,
   type SourceStateFingerprintV1,
@@ -71,8 +70,8 @@ import { canonicalJson } from "../serialization/canonical-json.js";
 import { isPrimarySqliteBusy } from "../storage/event-append-transaction.js";
 import { MAX_CANONICAL_TIMESTAMP_MS } from "../runtime/clock.js";
 import {
+  CheckpointService,
   requireRiskyTransitionCheckpointV1,
-  requireTrustedCheckpointDraftV1,
 } from "./checkpoint.service.js";
 import type {
   SourceStateProvider,
@@ -518,7 +517,11 @@ function approvalOperations(transaction: LifecycleCommandTransaction): RecoveryA
 
 function validateContext(
   context: ProjectContext,
-  command: RootStartCommandV2 | RootResumeCommandV2 | RootSuspendCommandV2,
+  command:
+    | RootStartCommandV2
+    | RootResumeCommandV2
+    | RootSuspendCommandV2
+    | RootSuspendCommandV3,
 ): void {
   const binding = context?.binding;
   if (
@@ -860,6 +863,7 @@ export class LifecycleCommandProcessor {
   readonly #resumeSourceState: LifecycleResumeSourceStatePort;
   readonly #checkpointSourceState: SourceStateProvider;
   readonly #checkpointSourceStateScopes: SourceStateScopeResolver;
+  readonly #checkpoints: CheckpointService;
 
   constructor(options: LifecycleCommandProcessorOptions) {
     this.#connection = options.connection;
@@ -873,6 +877,16 @@ export class LifecycleCommandProcessor {
     this.#resumeSourceState = options.resumeSourceState;
     this.#checkpointSourceState = options.checkpointSourceStateProvider;
     this.#checkpointSourceStateScopes = options.checkpointSourceStateScopeResolver;
+    this.#checkpoints = new CheckpointService({
+      invocationScope: {
+        current: () => invalid("INTEGRITY_FAILURE"),
+      },
+      sourceStateProvider: this.#checkpointSourceState,
+      identitySource: this.#ids,
+      clock: {
+        now: () => exactNow(this.#clock).timestamp,
+      },
+    });
   }
 
   renewRootLease(
@@ -2034,8 +2048,7 @@ export class LifecycleCommandProcessor {
   ): WorkerLifecycleResult<RootSessionPublicResultV2> {
     const decoded = decodeLifecycleSemanticCommandDraft(input.command);
     if (decoded.commandType !== "root-suspend") invalid();
-    if (decoded.checkpoint.checkpointVersion !== 1) throw new LifecycleError("LIFECYCLE_V2_DISABLED");
-    const command = decoded as RootSuspendCommandV2;
+    const command = decoded;
     assertSemanticCommandAuthorization(command, input.authorization);
     validateContext(context, command);
     if (
@@ -2046,7 +2059,6 @@ export class LifecycleCommandProcessor {
       || input.authorization.authoritySessionId !== command.sessionId
       || input.authorization.targetSessionId !== command.sessionId
     ) throw new LifecycleError("SESSION_CAPABILITY_INVALID");
-    const checkpointDraft = decodeCheckpointDraftV1(command.checkpoint);
     const proof = input.authorization.proof;
     const proofBytes = Buffer.from(proof.proofFingerprint, "hex");
     let proofDigest: string;
@@ -2179,57 +2191,19 @@ export class LifecycleCommandProcessor {
       if (baseEventPosition < priorEventPosition) invalid("INTEGRITY_FAILURE");
       const suspendRequestPosition = checkpointPosition + 1n;
       const suspendedPosition = checkpointPosition + 2n;
-      const childSummaries = authority.listNonterminalChildren(
-        context.binding.projectId,
-        current.sessionId,
-      ).map((childView) => {
-        const child = Object.freeze({ ...childView }) as SessionAuthorityRecord;
-        authority.latestCheckpoint(child);
-        const childAggregate = authority.requireFoldMatch(child);
-        if (childAggregate.kind !== "child" || child.parentSessionId !== current.sessionId) {
-          invalid("INTEGRITY_FAILURE");
-        }
-        if (childAggregate.eventPosition > baseEventPosition) invalid("INTEGRITY_FAILURE");
-        return Object.freeze({
-          childSessionId: child.sessionId,
-          state: childAggregate.state,
-          lastEventPosition: childAggregate.eventPosition.toString(),
-          streamVersion: childAggregate.streamVersion.toString(),
-          latestCheckpointId: childAggregate.latestCheckpointId,
-        });
-      }).sort((left, right) => compareBinaryText(left.childSessionId, right.childSessionId));
       const sourceStateScope = this.#checkpointSourceStateScopes.resolve(this.#connection, context);
-      const sourceState = this.#checkpointSourceState.captureForCheckpoint(context, sourceStateScope);
-      if (typeof sourceState === "object" && sourceState !== null && "then" in sourceState) {
-        invalid("INTEGRITY_FAILURE");
-      }
-      const expectedCheckpointBranch = context.workspace.kind === "git" ? context.workspace.branchRef : null;
-      if (sourceState.workspaceId !== context.workspace.workspaceId
-        || sourceState.branchRef !== expectedCheckpointBranch) invalid("INTEGRITY_FAILURE");
-      requireTrustedCheckpointDraftV1(context, checkpointDraft, sourceState);
-      const checkpoint = decodeCheckpointV1({
-        ...checkpointDraft,
-        checkpointId: this.#ids.uuid(),
-        sessionId: current.sessionId,
-        parentSessionId: null,
-        baseEventPosition: baseEventPosition.toString(),
-        checkpointEventPosition: checkpointPosition.toString(),
+      const preparedCheckpoint = this.#checkpoints.prepareRootSuspension(transaction, {
+        context,
+        command,
+        sourceStateScope,
+        authority: current,
+        aggregate: aggregateView,
+        baseEventPosition,
+        checkpointEventPosition: checkpointPosition,
         createdAt: now.timestamp,
-        creatorAgentId: decoded.agentId,
-        creatorClientInstanceId: context.binding.clientInstanceId,
-        sourceState,
-        childSummaries,
-        evidenceCoverage: {
-          captureMode: "coverage-only",
-          contentRetained: false,
-          highestContiguousOrdinal: null,
-          missingIntervals: [],
-        },
-      }) as CheckpointV1;
-      const checkpointFingerprint = createHash("sha256")
-        .update("project-memory/checkpoint/v1\n", "utf8")
-        .update(canonicalJson(checkpoint as unknown as JsonValue), "utf8")
-        .digest("hex");
+      });
+      const checkpoint = preparedCheckpoint.checkpoint;
+      const checkpointFingerprint = preparedCheckpoint.checkpointFingerprint;
       const continuityKey = authority.rootContinuityKey(current);
       const rotatedHandle = this.#capabilities.prepareCapability({
         projectId: context.binding.projectId,
@@ -2308,23 +2282,7 @@ export class LifecycleCommandProcessor {
           expectedStreamVersion: streamVersion,
           streamId: current.streamId,
           streamType: "session",
-          events: [{
-            eventType: "SessionCheckpointRecorded",
-            eventSchemaVersion: 1,
-            occurredAt: now.timestamp,
-            visibilityScope: "session",
-            sessionId: current.sessionId,
-            confidence: "high",
-            verificationStatus: "verified",
-            payload: {
-              checkpoint: checkpoint as unknown as JsonValue,
-              baseEventPosition: baseEventPosition.toString(),
-              checkpointEventPosition: checkpointPosition.toString(),
-            } as JsonValue,
-            sourceRefs: [],
-            evidenceRefs: [],
-            evidenceDigests: [],
-          }, {
+          events: [preparedCheckpoint.event, {
             eventType: "SessionSuspendRequested",
             eventSchemaVersion: 1,
             occurredAt: now.timestamp,

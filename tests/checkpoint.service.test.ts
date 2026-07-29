@@ -75,6 +75,11 @@ interface CheckpointServiceLike {
     transaction: unknown,
     prepared: unknown,
   ): ReturnType<CheckpointServiceLike["record"]>;
+  prepareRootSuspension(transaction: unknown, input: unknown): {
+    readonly checkpoint: Readonly<Record<string, unknown>>;
+    readonly checkpointFingerprint: string;
+    readonly event: Readonly<Record<string, unknown>>;
+  };
 }
 
 type CheckpointServiceModule = Readonly<Record<string, unknown>> & {
@@ -106,6 +111,9 @@ async function optionalCheckpointServiceModule(): Promise<CheckpointServiceModul
           throw new Error("MISSING_CHECKPOINT_SERVICE");
         }
         recordPreparedFinal(): ReturnType<CheckpointServiceLike["record"]> {
+          throw new Error("MISSING_CHECKPOINT_SERVICE");
+        }
+        prepareRootSuspension(): ReturnType<CheckpointServiceLike["prepareRootSuspension"]> {
           throw new Error("MISSING_CHECKPOINT_SERVICE");
         }
       }
@@ -392,6 +400,8 @@ function contextAndScope(projectRoot: string): {
 
 interface AuthorityHarness {
   readonly transaction: Readonly<Record<string, unknown>>;
+  readonly root: Readonly<Record<string, unknown>>;
+  readonly rootAggregate: Readonly<Record<string, unknown>>;
   readonly calls: {
     checkpointUpdates: unknown[];
     clears: unknown[];
@@ -540,8 +550,17 @@ function authorityHarness(options: {
   });
   return {
     calls,
+    root,
+    rootAggregate,
     transaction: Object.freeze({
       authority,
+      transfers: Object.freeze({
+        listUnclaimedEndingScopeProjectionsBySourceRoot: () => Object.freeze([{
+          projectId: PROJECT_ID,
+          rootSessionId: ROOT_ID,
+          childSessionId: "99999999-9999-4999-8999-999999999999",
+        }]),
+      }),
       coverage: Object.freeze({
         assertVersion1Eligible: (sessionIds: readonly string[]) => {
           calls.version1Eligibility.push([...sessionIds]);
@@ -578,6 +597,7 @@ async function checkpointServiceFixture(options: {
   readonly service: CheckpointServiceLike;
   readonly harness: AuthorityHarness;
   readonly context: ProjectContext;
+  readonly scope: Readonly<Record<string, unknown>>;
   readonly cleanup: () => void;
 }> {
   const module = await optionalCheckpointServiceModule();
@@ -647,6 +667,7 @@ async function checkpointServiceFixture(options: {
     }),
     harness,
     context,
+    scope,
     cleanup: () => rmSync(projectRoot, { recursive: true, force: true }),
   };
 }
@@ -1192,6 +1213,59 @@ describe("CheckpointService transactional enrichment", () => {
     } finally {
       version1.cleanup();
       version2.cleanup();
+    }
+  });
+
+  it("prepares root suspension with complete Version 1 ending-scope eligibility", async () => {
+    const fixture = await checkpointServiceFixture();
+    try {
+      const command = Object.freeze({
+        commandType: "root-suspend",
+        commandId: COMMAND_ID,
+        idempotencyKey: "checkpoint-test/root-suspension",
+        agentId: "agent-checkpoint",
+        expectedProjectId: PROJECT_ID,
+        expectedVaultId: VAULT_ID,
+        expectedWorkspaceId: WORKSPACE_ID,
+        expectedBranchRef: "refs/heads/current",
+        sessionId: ROOT_ID,
+        expectedStreamVersion: "3",
+        checkpoint: decodeCheckpointDraftV1(draft()),
+      });
+
+      const prepared = fixture.service.prepareRootSuspension(
+        fixture.harness.transaction,
+        {
+          context: fixture.context,
+          command,
+          sourceStateScope: fixture.scope,
+          authority: fixture.harness.root,
+          aggregate: fixture.harness.rootAggregate,
+          baseEventPosition: 50n,
+          checkpointEventPosition: 51n,
+          createdAt: CREATED_AT,
+        },
+      );
+
+      assert.equal(prepared.checkpoint.checkpointVersion, 1);
+      assert.equal(prepared.event.eventSchemaVersion, 1);
+      assert.deepEqual(fixture.harness.calls.version1Eligibility, [[
+        ROOT_ID,
+        CHILD_ID,
+        "99999999-9999-4999-8999-999999999999",
+      ]]);
+      assert.deepEqual(fixture.harness.calls.version2Snapshots, []);
+      assert.equal(fixture.harness.calls.sourceCaptures.length, 1);
+      assert.equal(fixture.harness.calls.identities.length, 1);
+      assert.equal(
+        prepared.checkpointFingerprint,
+        createHash("sha256")
+          .update("project-memory/checkpoint/v1\n", "utf8")
+          .update(canonicalJson(prepared.checkpoint), "utf8")
+          .digest("hex"),
+      );
+    } finally {
+      fixture.cleanup();
     }
   });
 

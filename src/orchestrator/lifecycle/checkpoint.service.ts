@@ -31,6 +31,8 @@ import {
   type RecordFinalCheckpointAndQueueEndingActionV2,
   type RecordCheckpointCommandV2,
   type RecordCheckpointCommandV3,
+  type RootSuspendCommandV2,
+  type RootSuspendCommandV3,
 } from "./contracts/commands.js";
 import type { CheckpointId, SessionId } from "./contracts/identifiers.js";
 import { LifecycleError } from "./errors.js";
@@ -137,6 +139,23 @@ export interface CheckpointServiceOptions {
   ) => void;
 }
 
+export interface RootSuspensionCheckpointPreparationInput {
+  readonly context: ProjectContext;
+  readonly command: RootSuspendCommandV2 | RootSuspendCommandV3;
+  readonly sourceStateScope: SourceStateScopeV1;
+  readonly authority: SessionAuthorityRecord;
+  readonly aggregate: SessionAggregateState;
+  readonly baseEventPosition: bigint;
+  readonly checkpointEventPosition: bigint;
+  readonly createdAt: string;
+}
+
+export interface PreparedRootSuspensionCheckpoint {
+  readonly checkpoint: Checkpoint;
+  readonly checkpointFingerprint: string;
+  readonly event: PendingEvent;
+}
+
 export interface RiskyTransitionRelevantChildV1 {
   readonly authority: SessionAuthorityRecord;
   readonly aggregate: SessionAggregateState;
@@ -190,6 +209,20 @@ interface CheckpointAuthorityOperations {
   clearCheckpointRequired(input: CheckpointClear): boolean;
 }
 
+interface CheckpointPreparationAuthorityOperations {
+  latestCheckpoint(authority: SessionAuthorityRecord): Checkpoint | null;
+  listNonterminalChildren(projectId: string, rootSessionId: string): readonly SessionAuthorityRecord[];
+  requireFoldMatch(authority: SessionAuthorityRecord): SessionAggregateState;
+}
+
+interface RootSuspensionTransferOperations {
+  listUnclaimedEndingScopeProjectionsBySourceRoot(
+    projectId: string,
+    sourceRootSessionId: string,
+    limit: number,
+  ): readonly import("../storage/lifecycle-storage.types.js").CarryForwardEndingScopeProjectionRecord[];
+}
+
 const EMPTY_COVERAGE: CheckpointEvidenceCoverageV1 = Object.freeze({
   captureMode: "coverage-only",
   contentRetained: false,
@@ -221,6 +254,36 @@ function authorityOperations(transaction: LifecycleCommandTransaction): Checkpoi
   });
 }
 
+function preparationAuthorityOperations(
+  transaction: LifecycleCommandTransaction,
+): CheckpointPreparationAuthorityOperations {
+  const value = transaction.authority as object;
+  return Object.freeze({
+    latestCheckpoint: ownMethod<CheckpointPreparationAuthorityOperations["latestCheckpoint"]>(
+      value,
+      "latestCheckpoint",
+    ),
+    listNonterminalChildren: ownMethod<
+      CheckpointPreparationAuthorityOperations["listNonterminalChildren"]
+    >(value, "listNonterminalChildren"),
+    requireFoldMatch: ownMethod<CheckpointPreparationAuthorityOperations["requireFoldMatch"]>(
+      value,
+      "requireFoldMatch",
+    ),
+  });
+}
+
+function rootSuspensionTransferOperations(
+  transaction: LifecycleCommandTransaction,
+): RootSuspensionTransferOperations {
+  const value = transaction.transfers as object;
+  return Object.freeze({
+    listUnclaimedEndingScopeProjectionsBySourceRoot: ownMethod<
+      RootSuspensionTransferOperations["listUnclaimedEndingScopeProjectionsBySourceRoot"]
+    >(value, "listUnclaimedEndingScopeProjectionsBySourceRoot"),
+  });
+}
+
 function canonicalTimestamp(value: unknown): string {
   const timestamp = value;
   if (typeof timestamp !== "string" || !CANONICAL_TIMESTAMP.test(timestamp)) invalid();
@@ -235,7 +298,11 @@ function canonicalNow(clock: CheckpointClock): string {
 
 function assertContext(
   context: ProjectContext,
-  command: RecordCheckpointCommandV2 | RecordCheckpointCommandV3,
+  command:
+    | RecordCheckpointCommandV2
+    | RecordCheckpointCommandV3
+    | RootSuspendCommandV2
+    | RootSuspendCommandV3,
 ): void {
   const binding = context?.binding;
   if (binding === undefined
@@ -608,6 +675,28 @@ function pendingCheckpointEvent(
   };
 }
 
+interface CheckpointPreparationInput {
+  readonly transaction: LifecycleCommandTransaction;
+  readonly context: ProjectContext;
+  readonly sourceStateScope: SourceStateScopeV1;
+  readonly draft: CheckpointDraft;
+  readonly current: SessionAuthorityRecord;
+  readonly aggregate: SessionAggregateState;
+  readonly baseEventPosition: bigint;
+  readonly checkpointEventPosition: bigint;
+  readonly createdAt: string | null;
+  readonly creatorAgentId: string;
+  readonly childSummaries: () => CheckpointV1["childSummaries"];
+  readonly version1EligibilitySessionIds: readonly SessionId[];
+  readonly finalization: boolean;
+}
+
+interface PreparedCheckpoint {
+  readonly checkpoint: Checkpoint;
+  readonly checkpointFingerprint: string;
+  readonly event: PendingEvent;
+}
+
 export class CheckpointService {
   readonly #invocations: CheckpointInvocationScope;
   readonly #sourceState: SourceStateProvider;
@@ -643,6 +732,87 @@ export class CheckpointService {
     commandInput: RecordCheckpointCommandV2 | RecordCheckpointCommandV3,
   ): FreshLifecycleEffect<CheckpointRecordedResult> {
     return this.#record(transaction, commandInput, false);
+  }
+
+  prepareRootSuspension(
+    transaction: LifecycleCommandTransaction,
+    input: RootSuspensionCheckpointPreparationInput,
+  ): PreparedRootSuspensionCheckpoint {
+    const decoded = decodeLifecycleSemanticCommandDraft(input.command);
+    if (decoded.commandType !== "root-suspend"
+      || (decoded.checkpoint.checkpointVersion !== 1
+        && decoded.checkpoint.checkpointVersion !== 2)) invalid();
+    assertContext(input.context, decoded);
+    const draft = decoded.checkpoint.checkpointVersion === 1
+      ? decodeCheckpointDraftV1(decoded.checkpoint)
+      : decodeCheckpointDraftV2(decoded.checkpoint);
+    assertDraftPaths(input.context, draft);
+    const current = Object.freeze({ ...input.authority }) as SessionAuthorityRecord;
+    const aggregate = Object.freeze({ ...input.aggregate }) as SessionAggregateState;
+    assertAuthorityAndAggregate(current, aggregate);
+    if (current.sessionKind !== "root"
+      || current.parentSessionId !== null
+      || aggregate.kind !== "root"
+      || aggregate.sessionId !== decoded.sessionId
+      || current.sessionId !== decoded.sessionId
+      || current.projectId !== input.context.binding.projectId
+      || current.workspaceId !== input.context.binding.workspaceId
+      || BigInt(decoded.expectedStreamVersion) !== aggregate.streamVersion
+      || input.checkpointEventPosition !== input.baseEventPosition + 1n
+      || input.checkpointEventPosition < 2n
+      || input.checkpointEventPosition > SQLITE_INT64_MAX
+      || input.baseEventPosition < aggregate.eventPosition) invalid("INTEGRITY_FAILURE");
+    const authority = preparationAuthorityOperations(transaction);
+    const childSummaries = this.#childSummaries(
+      authority,
+      current,
+      aggregate,
+      input.baseEventPosition,
+    );
+    const ticketProjections = rootSuspensionTransferOperations(transaction)
+      .listUnclaimedEndingScopeProjectionsBySourceRoot(
+        current.projectId,
+        current.sessionId,
+        606,
+      );
+    if (!Array.isArray(ticketProjections) || ticketProjections.length >= 606) {
+      throw new LifecycleError("CHECKPOINT_CAPACITY_EXCEEDED");
+    }
+    const endingScopeIds = [
+      ...childSummaries.map((summary) => summary.childSessionId),
+      ...ticketProjections.map((projection) => {
+        if (projection.projectId !== current.projectId
+          || projection.rootSessionId !== current.sessionId) invalid("INTEGRITY_FAILURE");
+        return projection.childSessionId as SessionId;
+      }),
+    ].sort((left, right) => Buffer.compare(
+      Buffer.from(left, "utf8"),
+      Buffer.from(right, "utf8"),
+    ));
+    for (let index = 1; index < endingScopeIds.length; index += 1) {
+      if (endingScopeIds[index - 1] === endingScopeIds[index]) {
+        invalid("INTEGRITY_FAILURE");
+      }
+    }
+    const prepared = this.#prepareCheckpoint({
+      transaction,
+      context: input.context,
+      sourceStateScope: input.sourceStateScope,
+      draft,
+      current,
+      aggregate,
+      baseEventPosition: input.baseEventPosition,
+      checkpointEventPosition: input.checkpointEventPosition,
+      createdAt: canonicalTimestamp(input.createdAt),
+      creatorAgentId: decoded.agentId,
+      childSummaries: () => childSummaries,
+      version1EligibilitySessionIds: Object.freeze([
+        current.sessionId as SessionId,
+        ...endingScopeIds,
+      ]),
+      finalization: false,
+    });
+    return Object.freeze(prepared);
   }
 
   prepareFinalPhase(
@@ -685,6 +855,92 @@ export class CheckpointService {
     void transaction.authority;
     this.#preparedFinals.delete(prepared);
     return owned.effect;
+  }
+
+  #childSummaries(
+    authority: CheckpointPreparationAuthorityOperations,
+    current: SessionAuthorityRecord,
+    aggregate: SessionAggregateState,
+    baseEventPosition: bigint,
+  ): CheckpointV1["childSummaries"] {
+    if (aggregate.kind !== "root") return Object.freeze([]);
+    return Object.freeze(
+      [...authority.listNonterminalChildren(current.projectId, current.sessionId)]
+        .map((childObserved) => {
+          const child = Object.freeze({ ...childObserved }) as SessionAuthorityRecord;
+          authority.latestCheckpoint(child);
+          const childAggregate = Object.freeze({
+            ...authority.requireFoldMatch(child),
+          }) as SessionAggregateState;
+          assertAuthorityAndAggregate(child, childAggregate);
+          if (childAggregate.kind !== "child"
+            || child.parentSessionId !== current.sessionId
+            || childAggregate.eventPosition > baseEventPosition) invalid("INTEGRITY_FAILURE");
+          return Object.freeze({
+            childSessionId: child.sessionId as SessionId,
+            state: childAggregate.state,
+            lastEventPosition: childAggregate.eventPosition.toString(),
+            streamVersion: childAggregate.streamVersion.toString(),
+            latestCheckpointId: childAggregate.latestCheckpointId,
+          });
+        })
+        .sort((left, right) => Buffer.compare(
+          Buffer.from(left.childSessionId, "utf8"),
+          Buffer.from(right.childSessionId, "utf8"),
+        )),
+    );
+  }
+
+  #prepareCheckpoint(input: CheckpointPreparationInput): PreparedCheckpoint {
+    if (!Array.isArray(input.version1EligibilitySessionIds)
+      || input.version1EligibilitySessionIds.length === 0
+      || input.version1EligibilitySessionIds[0] !== input.current.sessionId) {
+      invalid("INTEGRITY_FAILURE");
+    }
+    const coverage: CheckpointEvidenceCoverageV1 | CheckpointEvidenceCoverageV2 =
+      input.draft.checkpointVersion === 1
+        ? (input.transaction.coverage.assertVersion1Eligible(
+            input.version1EligibilitySessionIds,
+          ), EMPTY_COVERAGE)
+        : syncValue(input.transaction.coverage.snapshotV2(
+            input.current.sessionId as SessionId,
+            input.baseEventPosition,
+          ));
+    const childSummaries = syncValue(input.childSummaries());
+    if (!Array.isArray(childSummaries)) invalid("INTEGRITY_FAILURE");
+    const sourceState = syncValue(input.finalization
+      ? this.#sourceState.captureForFinalization(input.context, input.sourceStateScope)
+      : this.#sourceState.captureForCheckpoint(input.context, input.sourceStateScope));
+    requireTrustedCheckpointDraftV1(input.context, input.draft, sourceState);
+    const createdAt = input.createdAt === null
+      ? canonicalNow(this.#clock)
+      : canonicalTimestamp(input.createdAt);
+    const checkpointInput = {
+      ...input.draft,
+      checkpointId: this.#ids.uuid(),
+      sessionId: input.current.sessionId,
+      parentSessionId: input.current.parentSessionId,
+      baseEventPosition: input.baseEventPosition.toString(),
+      checkpointEventPosition: input.checkpointEventPosition.toString(),
+      createdAt,
+      creatorAgentId: input.creatorAgentId,
+      creatorClientInstanceId: input.context.binding.clientInstanceId,
+      sourceState,
+      childSummaries,
+      evidenceCoverage: coverage,
+    };
+    const checkpoint = input.draft.checkpointVersion === 1
+      ? decodeCheckpointV1(checkpointInput)
+      : decodeCheckpointV2(checkpointInput);
+    return Object.freeze({
+      checkpoint,
+      checkpointFingerprint: checkpointFingerprint(checkpoint),
+      event: pendingCheckpointEvent(
+        checkpoint,
+        input.current.parentSessionId,
+        createdAt,
+      ),
+    });
   }
 
   #record(
@@ -732,62 +988,29 @@ export class CheckpointService {
       throw new LifecycleError("CHECKPOINT_BASE_INVALID");
     }
 
-    const coverage: CheckpointEvidenceCoverageV1 | CheckpointEvidenceCoverageV2 =
-      draft.checkpointVersion === 1
-        ? (transaction.coverage.assertVersion1Eligible(
-            Object.freeze([current.sessionId as SessionId]),
-          ), EMPTY_COVERAGE)
-        : syncValue(transaction.coverage.snapshotV2(
-            current.sessionId as SessionId,
-            baseEventPosition,
-          ));
-
-    const childSummaries = aggregate.kind === "root"
-      ? [...authority.listNonterminalChildren(current.projectId, current.sessionId)]
-          .map((childObserved) => {
-            const child = Object.freeze({ ...childObserved }) as SessionAuthorityRecord;
-            authority.latestCheckpoint(child);
-            const childAggregate = Object.freeze({
-              ...authority.requireFoldMatch(child),
-            }) as SessionAggregateState;
-            assertAuthorityAndAggregate(child, childAggregate);
-            if (childAggregate.kind !== "child" || child.parentSessionId !== current.sessionId
-              || childAggregate.eventPosition > baseEventPosition) invalid("INTEGRITY_FAILURE");
-            return Object.freeze({
-              childSessionId: child.sessionId as SessionId,
-              state: childAggregate.state,
-              lastEventPosition: childAggregate.eventPosition.toString(),
-              streamVersion: childAggregate.streamVersion.toString(),
-              latestCheckpointId: childAggregate.latestCheckpointId,
-            });
-          })
-          .sort((left, right) => left.childSessionId < right.childSessionId ? -1
-            : left.childSessionId > right.childSessionId ? 1 : 0)
-      : [];
-
-    const sourceState = syncValue(finalization
-      ? this.#sourceState.captureForFinalization(invocation.context, invocation.sourceStateScope)
-      : this.#sourceState.captureForCheckpoint(invocation.context, invocation.sourceStateScope));
-    requireTrustedCheckpointDraftV1(invocation.context, draft, sourceState);
-    const createdAt = canonicalNow(this.#clock);
-    const checkpointInput = {
-      ...draft,
-      checkpointId: this.#ids.uuid(),
-      sessionId: current.sessionId,
-      parentSessionId: current.parentSessionId,
-      baseEventPosition: baseEventPosition.toString(),
-      checkpointEventPosition: checkpointPosition.toString(),
-      createdAt,
+    const prepared = this.#prepareCheckpoint({
+      transaction,
+      context: invocation.context,
+      sourceStateScope: invocation.sourceStateScope,
+      draft,
+      current,
+      aggregate,
+      baseEventPosition,
+      checkpointEventPosition: checkpointPosition,
+      createdAt: null,
       creatorAgentId: command.agentId,
-      creatorClientInstanceId: invocation.context.binding.clientInstanceId,
-      sourceState,
-      childSummaries,
-      evidenceCoverage: coverage,
-    };
-    const checkpoint = draft.checkpointVersion === 1
-      ? decodeCheckpointV1(checkpointInput)
-      : decodeCheckpointV2(checkpointInput);
-    const fingerprint = checkpointFingerprint(checkpoint);
+      childSummaries: () => this.#childSummaries(
+          authority,
+          current,
+          aggregate,
+          baseEventPosition,
+        ),
+      version1EligibilitySessionIds: Object.freeze([current.sessionId as SessionId]),
+      finalization,
+    });
+    const { checkpoint } = prepared;
+    const createdAt = checkpoint.createdAt;
+    const fingerprint = prepared.checkpointFingerprint;
     const checkpointRequiredCleared = markerPosition !== null;
     const result = decodeCheckpointRecordedResult({
       checkpointVersion: checkpoint.checkpointVersion,
@@ -798,7 +1021,7 @@ export class CheckpointService {
       finalStreamVersion: (aggregate.streamVersion + 1n).toString(),
       checkpointRequiredCleared,
     });
-    const event = pendingCheckpointEvent(checkpoint, current.parentSessionId, createdAt);
+    const event = prepared.event;
     return {
       append: {
         context: invocation.context,

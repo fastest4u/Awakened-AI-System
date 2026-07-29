@@ -15,9 +15,12 @@ import type {
   RootResumeCommandV2,
   RootStartCommandV2,
   RootSuspendCommandV2,
+  RootSuspendCommandV3,
 } from "../src/orchestrator/lifecycle/contracts/commands.js";
 import type {
+  CheckpointEvidenceCoverageV2,
   CheckpointDraftV1,
+  CheckpointDraftV2,
   SourceStateFingerprintV1,
 } from "../src/orchestrator/lifecycle/contracts/checkpoint.js";
 import {
@@ -115,7 +118,7 @@ interface LifecycleCommandProcessorLike {
   ): WorkerLifecycleResult<RootSessionPublicResultV2>;
   suspendRoot(
     projectContext: ProjectContext,
-    command: PreparedLifecycleWorkerCommand<RootSuspendCommandV2>,
+    command: PreparedLifecycleWorkerCommand<RootSuspendCommandV2 | RootSuspendCommandV3>,
   ): WorkerLifecycleResult<RootSessionPublicResultV2>;
   recoverRoot(
     projectContext: ProjectContext,
@@ -476,6 +479,13 @@ function checkpointDraft(): CheckpointDraftV1 {
   };
 }
 
+function qualifiedCheckpointDraft(): CheckpointDraftV2 {
+  return {
+    ...checkpointDraft(),
+    checkpointVersion: 2,
+  };
+}
+
 function suspendCommand(
   ordinal: number,
   sessionId: string,
@@ -496,12 +506,23 @@ function suspendCommand(
   };
 }
 
-function preparedSuspend(
+function qualifiedSuspendCommand(
+  ordinal: number,
+  sessionId: string,
+  expectedStreamVersion: string,
+): RootSuspendCommandV3 {
+  return {
+    ...suspendCommand(ordinal, sessionId, expectedStreamVersion),
+    checkpoint: qualifiedCheckpointDraft(),
+  };
+}
+
+function preparedSuspend<C extends RootSuspendCommandV2 | RootSuspendCommandV3>(
   item: Fixture,
   projectContext: ProjectContext,
   issued: Extract<WorkerLifecycleResult<RootSessionPublicResultV2>, { kind: "success" }>,
-  command: RootSuspendCommandV2,
-): PreparedLifecycleWorkerCommand<RootSuspendCommandV2> {
+  command: C,
+): PreparedLifecycleWorkerCommand<C> {
   const descriptor = issued.authorityMaterial.descriptor;
   const descriptorTarget = issued.authorityMaterial.target;
   assert.ok(descriptor !== null && descriptorTarget !== null);
@@ -845,6 +866,12 @@ interface Fixture {
   readonly operationTrace: string[];
   readonly selectionTrace: string[];
   readonly approvalEventCounts: bigint[];
+  readonly checkpointPreparationTrace: string[];
+  readonly version1Eligibility: readonly (readonly string[])[];
+  readonly version2Snapshots: readonly {
+    readonly sessionId: string;
+    readonly baseEventPosition: bigint;
+  }[];
 }
 
 interface FixtureOptions {
@@ -858,6 +885,7 @@ interface FixtureOptions {
   ) => readonly SessionAuthorityRecord[];
   readonly assertQuickHealthy?: (context: ProjectContext) => void;
   readonly coverageQuickHealth?: (sessionIds: readonly string[]) => void;
+  readonly checkpointCoverageSnapshot?: CheckpointEvidenceCoverageV2;
   readonly currentLease?: (actual: RootLeaseRecord | null) => RootLeaseRecord | null;
   readonly eventFault?: (
     boundary: "before-begin" | "after-first-insert-before-commit" | "after-commit-before-response",
@@ -916,6 +944,12 @@ function fixture(
   const operationTrace: string[] = [];
   const selectionTrace: string[] = [];
   const approvalEventCounts: bigint[] = [];
+  const checkpointPreparationTrace: string[] = [];
+  const version1Eligibility: string[][] = [];
+  const version2Snapshots: {
+    sessionId: string;
+    baseEventPosition: bigint;
+  }[] = [];
   const events = new EventAppendTransaction(
     connection,
     new SqliteEventAppendStatements(connection),
@@ -996,11 +1030,27 @@ function fixture(
           approvalEventCounts.push(current.prepare("SELECT COUNT(*) AS count FROM events").get()?.count as bigint),
           approvals.consume(current, input)),
       },
-      transfers: {},
+      transfers: {
+        listUnclaimedEndingScopeProjectionsBySourceRoot: () => Object.freeze([]),
+      },
       coverage: {
         ...healthyCoverageFacade(),
         assertQuickHealthy: (sessionIds: readonly string[]) =>
           options.coverageQuickHealth?.(sessionIds),
+        assertVersion1Eligible: (sessionIds: readonly string[]) => {
+          checkpointPreparationTrace.push("eligibility");
+          version1Eligibility.push([...sessionIds]);
+        },
+        snapshotV2: (sessionId: string, baseEventPosition: bigint) => {
+          checkpointPreparationTrace.push("snapshot");
+          version2Snapshots.push({ sessionId, baseEventPosition });
+          return options.checkpointCoverageSnapshot ?? Object.freeze({
+            coverageVersion: 2,
+            captureMode: "coverage-only",
+            contentRetained: false,
+            adapterSessions: Object.freeze([]),
+          });
+        },
       },
       workflows: {},
       validation: {},
@@ -1028,7 +1078,12 @@ function fixture(
     approvalRepository: approvals,
     capabilityService: processorCapabilities,
     clock,
-    identitySource: ids,
+    identitySource: {
+      uuid: () => {
+        checkpointPreparationTrace.push("uuid");
+        return ids.uuid();
+      },
+    },
     integrity: { assertQuickHealthy: (projectContext: ProjectContext) => options.assertQuickHealthy?.(projectContext) },
     resumeSourceState: {
       captureCurrent: (projectContext: ProjectContext) => {
@@ -1038,7 +1093,10 @@ function fixture(
     },
     checkpointSourceStateProvider: {
       capture: async (projectContext: ProjectContext) => checkpointSourceState(projectContext),
-      captureForCheckpoint: (projectContext: ProjectContext) => checkpointSourceState(projectContext),
+      captureForCheckpoint: (projectContext: ProjectContext) => {
+        checkpointPreparationTrace.push("source");
+        return checkpointSourceState(projectContext);
+      },
       captureForFinalization: (projectContext: ProjectContext) => checkpointSourceState(projectContext),
     },
     checkpointSourceStateScopeResolver: {
@@ -1063,6 +1121,9 @@ function fixture(
     operationTrace,
     selectionTrace,
     approvalEventCounts,
+    checkpointPreparationTrace,
+    version1Eligibility,
+    version2Snapshots,
   };
 }
 
@@ -3172,6 +3233,94 @@ describe("LifecycleQueryService protected root reads", () => {
 });
 
 describe("LifecycleCommandProcessor root suspension", () => {
+  it("uses shared checkpoint preparation for root suspension", async () => {
+    const Processor = await loadProcessorConstructor();
+    assert.ok(Processor !== null);
+    const v2Coverage = Object.freeze({
+      coverageVersion: 2 as const,
+      captureMode: "coverage-only" as const,
+      contentRetained: false as const,
+      adapterSessions: Object.freeze([]),
+    });
+    for (const checkpointVersion of [1, 2] as const) {
+      const item = fixture(Processor, { checkpointCoverageSnapshot: v2Coverage });
+      try {
+        const primary = context(`primary-shared-checkpoint-v${checkpointVersion}`);
+        const started = success(item.processor.startRoot(
+          primary,
+          preparedStart(
+            primary,
+            startCommand(20_000 + checkpointVersion, `shared-checkpoint-v${checkpointVersion}`),
+          ),
+        ));
+        const command = checkpointVersion === 1
+          ? suspendCommand(20_010 + checkpointVersion, started.publicResult.sessionId, "1")
+          : qualifiedSuspendCommand(20_010 + checkpointVersion, started.publicResult.sessionId, "1");
+        const prepared = preparedSuspend(item, primary, started, command);
+        item.checkpointPreparationTrace.length = 0;
+
+        const suspended = success(item.processor.suspendRoot(primary, prepared));
+
+        const checkpointRow = item.connection.prepare(`
+          SELECT event_schema_version, payload_json
+          FROM events
+          WHERE project_id = $projectId
+            AND session_id = $sessionId
+            AND event_type = 'SessionCheckpointRecorded'
+        `).get({
+          $projectId: PROJECT_ID,
+          $sessionId: started.publicResult.sessionId,
+        });
+        assert.ok(checkpointRow !== undefined);
+        const payload = JSON.parse(String(checkpointRow.payload_json)) as {
+          readonly checkpoint: {
+            readonly checkpointVersion: 1 | 2;
+            readonly checkpointId: string;
+          };
+        };
+        assert.equal(checkpointRow.event_schema_version, BigInt(checkpointVersion));
+        assert.equal(payload.checkpoint.checkpointVersion, checkpointVersion);
+        assert.deepEqual(
+          item.checkpointPreparationTrace.slice(0, 3),
+          [checkpointVersion === 1 ? "eligibility" : "snapshot", "source", "uuid"],
+        );
+        if (checkpointVersion === 1) {
+          assert.deepEqual(item.version1Eligibility, [[started.publicResult.sessionId]]);
+          assert.deepEqual(item.version2Snapshots, []);
+        } else {
+          assert.deepEqual(item.version1Eligibility, []);
+          assert.deepEqual(item.version2Snapshots, [{
+            sessionId: started.publicResult.sessionId,
+            baseEventPosition: 1n,
+          }]);
+        }
+        const authority = item.authority.get(
+          item.connection,
+          PROJECT_ID,
+          started.publicResult.sessionId,
+        );
+        assert.ok(authority !== null);
+        assert.equal(authority.latestCheckpointId, payload.checkpoint.checkpointId);
+        assert.equal(authority.latestCheckpointEventPosition, 2n);
+        assert.equal(
+          authority.latestCheckpointFingerprint,
+          createHash("sha256")
+            .update(`project-memory/checkpoint/v${checkpointVersion}\n`, "utf8")
+            .update(canonicalJson(payload.checkpoint), "utf8")
+            .digest("hex"),
+        );
+        assert.equal(authority.checkpointRequiredReason, "suspension");
+        assert.equal(authority.checkpointRequiredEventPosition, 4n);
+        const preparationCalls = item.checkpointPreparationTrace.length;
+        const replayed = success(item.processor.suspendRoot(primary, prepared));
+        assert.deepEqual(replayed.publicResult, suspended.publicResult);
+        assert.equal(item.checkpointPreparationTrace.length, preparationCalls);
+      } finally {
+        item.connection.close();
+      }
+    }
+  });
+
   it("checkpoints before suspension, renews the lease, and resumes suspended state exactly once", async () => {
     const Processor = await loadProcessorConstructor();
     assert.ok(Processor !== null);

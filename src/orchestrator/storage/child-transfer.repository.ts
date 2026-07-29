@@ -398,7 +398,6 @@ export class ChildTransferRepository {
           ) = CAST(source_child.latest_checkpoint_event_position AS TEXT)
         THEN 1 ELSE 0 END AS projection_valid
       FROM child_transfer_tickets AS ticket
-        INDEXED BY child_transfer_tickets_unclaimed_source_root
       LEFT JOIN session_authority AS source_child
         ON source_child.project_id = ticket.project_id
         AND source_child.session_id = ticket.source_child_session_id
