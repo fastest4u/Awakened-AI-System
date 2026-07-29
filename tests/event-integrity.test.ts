@@ -40,9 +40,12 @@ import {
   MAX_INTEGRITY_RANGE_EVENTS,
   MAX_QUICK_TAIL_EVENTS,
 } from "../src/orchestrator/integrity/event-integrity.service.js";
+import { LifecycleIntegrityService } from "../src/orchestrator/integrity/lifecycle-integrity.service.js";
 import {
   INTEGRITY_ISSUE_CODES,
   IntegrityInputError,
+  type AsyncIntegrityExtension,
+  type IntegrityExtension,
   type IntegrityIssueCode,
 } from "../src/orchestrator/integrity/integrity.types.js";
 import { DEFAULT_BUSY_TIMEOUT_MS } from "../src/orchestrator/runtime/runtime-capabilities.js";
@@ -866,10 +869,13 @@ class ObservingConnection implements SqliteConnection {
     private readonly inner: SqliteConnection,
     private readonly afterFirstRead?: () => void,
     private readonly throwOnPrepare?: RegExp,
+    private readonly throwOnExec?: RegExp,
   ) {}
 
   exec(sql: string): void {
-    this.executed.push(sql.trim().replace(/\s+/g, " ").toUpperCase());
+    const normalized = sql.trim().replace(/\s+/g, " ").toUpperCase();
+    this.executed.push(normalized);
+    if (this.throwOnExec?.test(normalized)) throw new Error("INJECTED_EXEC_FAILURE");
     this.inner.exec(sql);
   }
 
@@ -2525,6 +2531,187 @@ describe("EventIntegrityService bounds and transaction semantics", () => {
     );
     assert.equal(witnessReadFailure.executed[0], "BEGIN DEFERRED");
     assert.equal(witnessReadFailure.executed.at(-1), "ROLLBACK");
+  });
+
+  it("async integrity holds one deferred transaction and invokes each extension once", async () => {
+    const fixture = createFixture();
+    const observing = new ObservingConnection(fixture.connection);
+    const calls = {
+      legacyQuick: 0,
+      legacyFull: 0,
+      asyncSyncQuick: 0,
+      asyncSyncFull: 0,
+      asyncQuick: 0,
+      asyncFull: 0,
+    };
+    const assertTransactionRemainsOpen = async (): Promise<void> => {
+      assert.equal(observing.executed.at(-1), "BEGIN DEFERRED");
+      await Promise.resolve();
+      assert.equal(observing.executed.at(-1), "BEGIN DEFERRED");
+    };
+    const legacyExtension: IntegrityExtension = {
+      quickCheck(): void {
+        calls.legacyQuick += 1;
+        assert.equal(observing.executed.at(-1), "BEGIN DEFERRED");
+      },
+      fullCheck(): void {
+        calls.legacyFull += 1;
+        assert.equal(observing.executed.at(-1), "BEGIN DEFERRED");
+      },
+    };
+    const asyncExtension: AsyncIntegrityExtension = {
+      quickCheck(): void {
+        calls.asyncSyncQuick += 1;
+      },
+      fullCheck(): void {
+        calls.asyncSyncFull += 1;
+      },
+      async quickCheckAsync(): Promise<void> {
+        calls.asyncQuick += 1;
+        await assertTransactionRemainsOpen();
+      },
+      async fullCheckAsync(): Promise<void> {
+        calls.asyncFull += 1;
+        await assertTransactionRemainsOpen();
+      },
+    };
+    const integrity = new EventIntegrityService(
+      observing,
+      [eventCoreMigration],
+      [legacyExtension, asyncExtension],
+    );
+
+    assert.equal((await integrity.quickCheckAsync(fixture.context, 256)).ok, true);
+    assert.equal((await integrity.fullCheckAsync(fixture.context)).ok, true);
+    assert.deepEqual(observing.executed, [
+      "BEGIN DEFERRED",
+      "COMMIT",
+      "BEGIN DEFERRED",
+      "COMMIT",
+    ]);
+    assert.deepEqual(calls, {
+      legacyQuick: 1,
+      legacyFull: 1,
+      asyncSyncQuick: 0,
+      asyncSyncFull: 0,
+      asyncQuick: 1,
+      asyncFull: 1,
+    });
+
+    const rejectionFixture = createFixture();
+    const rollbackFailure = new ObservingConnection(
+      rejectionFixture.connection,
+      undefined,
+      undefined,
+      /^ROLLBACK$/,
+    );
+    const sentinel = Object.freeze({ reason: "async-extension-rejected" });
+    const rejectingExtension: AsyncIntegrityExtension = {
+      quickCheck(): void {
+        assert.fail("sync quick extension must not run when async is available");
+      },
+      fullCheck(): void {},
+      async quickCheckAsync(): Promise<void> {
+        await Promise.resolve();
+        throw sentinel;
+      },
+      async fullCheckAsync(): Promise<void> {},
+    };
+
+    await assert.rejects(
+      () => new EventIntegrityService(
+        rollbackFailure,
+        [eventCoreMigration],
+        [rejectingExtension],
+      ).quickCheckAsync(rejectionFixture.context, 256),
+      (error: unknown) => {
+        assert.equal(error, sentinel);
+        return true;
+      },
+    );
+    assert.deepEqual(rollbackFailure.executed, ["BEGIN DEFERRED", "ROLLBACK"]);
+  });
+
+  it("synchronous integrity fails closed when qualified coverage requires authentication", () => {
+    const versionOne = createFixture();
+    const versionOneIntegrity = new EventIntegrityService(
+      versionOne.connection,
+      [eventCoreMigration],
+      [new LifecycleIntegrityService(versionOne.connection)],
+    );
+    assert.equal(versionOneIntegrity.quickCheck(versionOne.context, 256).ok, true);
+    assert.equal(versionOneIntegrity.fullCheck(versionOne.context).ok, true);
+
+    const versionTwo = createFixture({
+      migrations: PROJECT_STORE_MIGRATIONS.slice(0, 2),
+    });
+    const versionTwoIntegrity = new EventIntegrityService(
+      versionTwo.connection,
+      PROJECT_STORE_MIGRATIONS.slice(0, 2),
+      [new LifecycleIntegrityService(versionTwo.connection)],
+    );
+    assert.equal(versionTwoIntegrity.quickCheck(versionTwo.context, 256).ok, true);
+    assert.equal(versionTwoIntegrity.fullCheck(versionTwo.context).ok, true);
+
+    const qualified = createFixture({ migrations: PROJECT_STORE_MIGRATIONS });
+    const qualifiedIntegrity = new EventIntegrityService(
+      qualified.connection,
+      PROJECT_STORE_MIGRATIONS,
+      [new LifecycleIntegrityService(qualified.connection)],
+    );
+    assert.equal(qualifiedIntegrity.quickCheck(qualified.context, 256).ok, true);
+    assert.equal(qualifiedIntegrity.fullCheck(qualified.context).ok, true);
+
+    qualified.connection.exec("PRAGMA foreign_keys = OFF");
+    qualified.connection.exec(
+      "DROP TRIGGER session_evidence_coverage_transitions_insert_guard",
+    );
+    qualified.connection.prepare(`
+      INSERT INTO session_evidence_coverage_transitions(
+        project_id, session_id, adapter_session_id, batch_id,
+        batch_event_position, batch_first_ordinal, batch_last_ordinal,
+        coverage_first_ordinal, coverage_last_ordinal,
+        highest_contiguous_ordinal, missing_intervals_json,
+        frame_fingerprint_algorithm, frame_fingerprint_schema_version,
+        frame_fingerprint_key_id, frame_fingerprint_domain,
+        previous_coverage_fingerprint_value,
+        coverage_fingerprint_algorithm, coverage_fingerprint_schema_version,
+        coverage_fingerprint_key_id, coverage_fingerprint_domain,
+        coverage_fingerprint_value, new_frame_count, capture_mode,
+        content_retained, created_at
+      ) VALUES (
+        $projectId, $sessionId, $adapterSessionId, $batchId,
+        1, 0, 0, 0, 0, 0, '[]',
+        'hmac-sha256', 1, 'historical-key', 'pm-evidence-frame-v1',
+        NULL, 'hmac-sha256', 1, 'historical-key',
+        'pm-evidence-coverage-v1', $fingerprint, 1,
+        'coverage-only', 0, $createdAt
+      )
+    `).run({
+      $projectId: qualified.context.binding.projectId,
+      $sessionId: "77777777-7777-4777-8777-777777777777",
+      $adapterSessionId: "88888888-8888-4888-8888-888888888888",
+      $batchId: "99999999-9999-4999-8999-999999999999",
+      $fingerprint: "a".repeat(64),
+      $createdAt: NOW,
+    });
+    qualified.connection.exec("PRAGMA foreign_keys = ON");
+
+    const isHistoricalKeyFailure = (error: unknown): boolean => {
+      assert.equal(
+        (error as { readonly code?: unknown }).code,
+        "EVIDENCE_HISTORICAL_KEY_UNAVAILABLE",
+      );
+      return true;
+    };
+    assert.throws(
+      () => qualifiedIntegrity.quickCheck(qualified.context, 256),
+      isHistoricalKeyFailure,
+    );
+    assert.throws(
+      () => qualifiedIntegrity.fullCheck(qualified.context),
+      isHistoricalKeyFailure,
+    );
   });
 
   it("keeps one WAL snapshot when another connection appends after the first read", () => {

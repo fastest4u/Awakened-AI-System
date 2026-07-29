@@ -30,6 +30,7 @@ import type {
 } from "../storage/sqlite-driver.js";
 import {
   IntegrityInputError,
+  type AsyncIntegrityExtension,
   type IntegrityExtension,
   type IntegrityIssue,
   type IntegrityIssueCode,
@@ -229,6 +230,17 @@ class IssueCollector implements IntegrityIssueSink {
   }
 }
 
+interface QuickReportState {
+  readonly issues: IssueCollector;
+  readonly structural: StructuralCheck;
+  readonly indexedRows: EventIndexRow[];
+}
+
+interface FullReportState {
+  readonly issues: IssueCollector;
+  readonly structural: StructuralCheck;
+}
+
 function stringValue(row: SqliteRow, name: string): string {
   const value = row[name];
   if (typeof value !== "string") throw new Error("INTEGRITY_ROW_INVALID");
@@ -400,6 +412,18 @@ function transactionRollback(connection: SqliteConnection): void {
   try { connection.exec("ROLLBACK"); } catch { /* preserve the original failure */ }
 }
 
+function hasQuickCheckAsync(
+  extension: IntegrityExtension,
+): extension is IntegrityExtension & Pick<AsyncIntegrityExtension, "quickCheckAsync"> {
+  return typeof (extension as Partial<AsyncIntegrityExtension>).quickCheckAsync === "function";
+}
+
+function hasFullCheckAsync(
+  extension: IntegrityExtension,
+): extension is IntegrityExtension & Pick<AsyncIntegrityExtension, "fullCheckAsync"> {
+  return typeof (extension as Partial<AsyncIntegrityExtension>).fullCheckAsync === "function";
+}
+
 export class EventIntegrityService {
   constructor(
     private readonly connection: SqliteConnection,
@@ -423,6 +447,24 @@ export class EventIntegrityService {
 
   fullCheck(context: ProjectContext): IntegrityReport {
     return this.inTransaction(() => this.fullReport(context));
+  }
+
+  quickCheckAsync(
+    context: ProjectContext,
+    tailLimit = DEFAULT_QUICK_TAIL_EVENTS,
+  ): Promise<IntegrityReport> {
+    if (
+      !Number.isSafeInteger(tailLimit)
+      || tailLimit < 1
+      || tailLimit > MAX_QUICK_TAIL_EVENTS
+    ) {
+      throw new IntegrityInputError("TAIL_LIMIT_INVALID");
+    }
+    return this.inTransactionAsync(() => this.quickReportAsync(context, tailLimit));
+  }
+
+  fullCheckAsync(context: ProjectContext): Promise<IntegrityReport> {
+    return this.inTransactionAsync(() => this.fullReportAsync(context));
   }
 
   verifyRange(
@@ -454,7 +496,61 @@ export class EventIntegrityService {
     }
   }
 
+  private async inTransactionAsync<T>(operation: () => Promise<T>): Promise<T> {
+    this.connection.exec("BEGIN DEFERRED");
+    try {
+      const result = await operation();
+      this.connection.exec("COMMIT");
+      return result;
+    } catch (error) {
+      transactionRollback(this.connection);
+      throw error;
+    }
+  }
+
   private quickReport(context: ProjectContext, tailLimit: number): IntegrityReport {
+    const state = this.buildQuickReport(context, tailLimit);
+    for (const extension of this.extensions) {
+      extension.quickCheck(context, state.issues);
+    }
+    return this.report(
+      "quick",
+      context,
+      state.structural.schemaFingerprint,
+      state.indexedRows,
+      state.structural.streams.length,
+      state.structural.commands.length,
+      state.issues,
+    );
+  }
+
+  private async quickReportAsync(
+    context: ProjectContext,
+    tailLimit: number,
+  ): Promise<IntegrityReport> {
+    const state = this.buildQuickReport(context, tailLimit);
+    for (const extension of this.extensions) {
+      if (hasQuickCheckAsync(extension)) {
+        await extension.quickCheckAsync(context, state.issues);
+      } else {
+        extension.quickCheck(context, state.issues);
+      }
+    }
+    return this.report(
+      "quick",
+      context,
+      state.structural.schemaFingerprint,
+      state.indexedRows,
+      state.structural.streams.length,
+      state.structural.commands.length,
+      state.issues,
+    );
+  }
+
+  private buildQuickReport(
+    context: ProjectContext,
+    tailLimit: number,
+  ): QuickReportState {
     const issues = new IssueCollector();
     this.checkPragma("quick_check", "SQLITE_QUICK_CHECK_FAILED", issues);
     this.checkForeignKeys(issues);
@@ -480,19 +576,46 @@ export class EventIntegrityService {
       verifyStreamVersions: false,
       initialStreamVersions: new Map(),
     }, issues);
-    for (const extension of this.extensions) extension.quickCheck(context, issues);
-    return this.report(
-      "quick",
-      context,
-      structural.schemaFingerprint,
-      indexedRows,
-      structural.streams.length,
-      structural.commands.length,
-      issues,
-    );
+    return { issues, structural, indexedRows };
   }
 
   private fullReport(context: ProjectContext): IntegrityReport {
+    const state = this.buildFullReport(context);
+    for (const extension of this.extensions) {
+      extension.fullCheck(context, state.issues);
+    }
+    return this.report(
+      "full",
+      context,
+      state.structural.schemaFingerprint,
+      state.structural.events,
+      state.structural.streams.length,
+      state.structural.commands.length,
+      state.issues,
+    );
+  }
+
+  private async fullReportAsync(context: ProjectContext): Promise<IntegrityReport> {
+    const state = this.buildFullReport(context);
+    for (const extension of this.extensions) {
+      if (hasFullCheckAsync(extension)) {
+        await extension.fullCheckAsync(context, state.issues);
+      } else {
+        extension.fullCheck(context, state.issues);
+      }
+    }
+    return this.report(
+      "full",
+      context,
+      state.structural.schemaFingerprint,
+      state.structural.events,
+      state.structural.streams.length,
+      state.structural.commands.length,
+      state.issues,
+    );
+  }
+
+  private buildFullReport(context: ProjectContext): FullReportState {
     const issues = new IssueCollector();
     this.checkPragma("quick_check", "SQLITE_QUICK_CHECK_FAILED", issues);
     this.checkPragma("integrity_check", "SQLITE_INTEGRITY_CHECK_FAILED", issues);
@@ -511,16 +634,7 @@ export class EventIntegrityService {
       verifyStreamVersions: true,
       initialStreamVersions: new Map(),
     }, issues);
-    for (const extension of this.extensions) extension.fullCheck(context, issues);
-    return this.report(
-      "full",
-      context,
-      structural.schemaFingerprint,
-      structural.events,
-      structural.streams.length,
-      structural.commands.length,
-      issues,
-    );
+    return { issues, structural };
   }
 
   private rangeReport(

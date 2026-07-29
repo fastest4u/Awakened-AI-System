@@ -71,6 +71,16 @@ export interface IntegrityExtension {
   fullCheck(context: ProjectContext, sink: IntegrityIssueSink): void;
 }
 
+export interface HistoricalEvidenceIntegrityProviderPort {
+  status(keyId: string): Promise<"available" | "revoked" | "unavailable">;
+  fingerprint(keyId: string, bytes: Uint8Array): Promise<string>;
+}
+
+export interface AsyncIntegrityExtension extends IntegrityExtension {
+  quickCheckAsync(context: ProjectContext, sink: IntegrityIssueSink): Promise<void>;
+  fullCheckAsync(context: ProjectContext, sink: IntegrityIssueSink): Promise<void>;
+}
+
 export interface IntegrityReport {
   ok: boolean;
   mode: IntegrityMode;

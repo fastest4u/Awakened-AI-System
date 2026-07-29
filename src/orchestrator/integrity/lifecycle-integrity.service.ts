@@ -1,10 +1,16 @@
 import { createHash } from "node:crypto";
 import { canonicalJson } from "../serialization/canonical-json.js";
 import { decodeLifecycleEventV1, type LifecycleEventV1 } from "../lifecycle/contracts/events.js";
+import { LifecycleError } from "../lifecycle/errors.js";
 import { foldSession, type SessionAggregateState } from "../lifecycle/session-aggregate.js";
 import type { ProjectContext } from "../identity/contracts.js";
 import type { SqliteConnection, SqliteRow } from "../storage/sqlite-driver.js";
-import type { IntegrityExtension, IntegrityIssueCode, IntegrityIssueSink } from "./integrity.types.js";
+import type {
+  AsyncIntegrityExtension,
+  HistoricalEvidenceIntegrityProviderPort,
+  IntegrityIssueCode,
+  IntegrityIssueSink,
+} from "./integrity.types.js";
 
 const AUTHORIZATION_COLUMNS = [
   "authorization_proof_version",
@@ -149,10 +155,43 @@ interface RevocationFold {
   readonly revokedAt: string;
 }
 
-export class LifecycleIntegrityService implements IntegrityExtension {
-  constructor(private readonly connection: SqliteConnection) {}
+export class LifecycleIntegrityService implements AsyncIntegrityExtension {
+  constructor(
+    private readonly connection: SqliteConnection,
+    private readonly provider?: HistoricalEvidenceIntegrityProviderPort,
+  ) {}
 
   quickCheck(context: ProjectContext, sink: IntegrityIssueSink): void {
+    if (!this.hasLifecycleSchema()) return;
+    this.assertSynchronousEvidenceAuthenticationAvailable(context);
+    this.runQuickCheck(context, sink);
+  }
+
+  fullCheck(context: ProjectContext, sink: IntegrityIssueSink): void {
+    if (!this.hasLifecycleSchema()) return;
+    this.assertSynchronousEvidenceAuthenticationAvailable(context);
+    this.runFullCheck(context, sink);
+  }
+
+  quickCheckAsync(
+    context: ProjectContext,
+    sink: IntegrityIssueSink,
+  ): Promise<void> {
+    void this.provider;
+    if (this.hasLifecycleSchema()) this.runQuickCheck(context, sink);
+    return Promise.resolve();
+  }
+
+  fullCheckAsync(
+    context: ProjectContext,
+    sink: IntegrityIssueSink,
+  ): Promise<void> {
+    void this.provider;
+    if (this.hasLifecycleSchema()) this.runFullCheck(context, sink);
+    return Promise.resolve();
+  }
+
+  private runQuickCheck(context: ProjectContext, sink: IntegrityIssueSink): void {
     this.checkAuthorization(context, sink);
     this.checkAuthorityLinkage(context, sink, false);
     this.checkLeases(context, sink);
@@ -160,14 +199,45 @@ export class LifecycleIntegrityService implements IntegrityExtension {
     this.checkOutboxShape(context, sink, false);
   }
 
-  fullCheck(context: ProjectContext, sink: IntegrityIssueSink): void {
-    this.quickCheck(context, sink);
+  private runFullCheck(context: ProjectContext, sink: IntegrityIssueSink): void {
+    this.runQuickCheck(context, sink);
     this.checkAuthorityLinkage(context, sink, true);
     this.checkEvidence(context, sink);
     this.checkApprovalsAndTransfers(context, sink);
     this.checkValidation(context, sink);
     this.checkWorkflowClaims(context, sink);
     this.checkOutboxShape(context, sink, true);
+  }
+
+  private hasLifecycleSchema(): boolean {
+    return this.connection.prepare(`
+      SELECT 1 AS present
+      FROM sqlite_schema
+      WHERE type = 'table' AND name = 'session_authority'
+      LIMIT 1
+    `).get() !== undefined;
+  }
+
+  private assertSynchronousEvidenceAuthenticationAvailable(
+    context: ProjectContext,
+  ): void {
+    const hasQualifiedCoverageTable = this.connection.prepare(`
+      SELECT 1 AS present
+      FROM sqlite_schema
+      WHERE type = 'table' AND name = 'session_evidence_coverage_transitions'
+      LIMIT 1
+    `).get() !== undefined;
+    if (!hasQualifiedCoverageTable) return;
+
+    const hasQualifiedCoverage = this.connection.prepare(`
+      SELECT 1 AS present
+      FROM session_evidence_coverage_transitions
+      WHERE project_id = $projectId
+      LIMIT 1
+    `).get({ $projectId: context.binding.projectId }) !== undefined;
+    if (hasQualifiedCoverage) {
+      throw new LifecycleError("EVIDENCE_HISTORICAL_KEY_UNAVAILABLE");
+    }
   }
 
   private checkAuthorization(context: ProjectContext, sink: IntegrityIssueSink): void {
