@@ -46,13 +46,15 @@ import {
   type CheckpointEvidenceCoverageV2,
 } from "../src/orchestrator/lifecycle/contracts/checkpoint.js";
 import {
+  minimumCheckpointUpperBound,
+  minimumFinalEndingScopeBindingsUpperBound,
+  type MinimumCheckpointCapacityInput,
+  type MinimumEndingScopeCapacityInput,
+} from "../src/orchestrator/lifecycle/checkpoint-capacity.js";
+import {
   FINAL_ENDING_SCOPE_BINDINGS_MAX_CANONICAL_BYTES,
   type FinalEndingScopeBindingV1,
 } from "../src/orchestrator/lifecycle/contracts/session-end.js";
-import type {
-  MinimumCheckpointCapacityInput,
-  MinimumEndingScopeCapacityInput,
-} from "../src/orchestrator/lifecycle/checkpoint-capacity.js";
 import {
   LifecycleQueryService,
   type ProtectedSessionTreeReadOperation,
@@ -65,7 +67,11 @@ import {
   SqliteEventAppendStatements,
 } from "../src/orchestrator/storage/event-append-transaction.js";
 import { LifecycleApprovalRepository } from "../src/orchestrator/storage/lifecycle-approval.repository.js";
-import type { SessionAuthorityRecord } from "../src/orchestrator/storage/lifecycle-storage.types.js";
+import type {
+  CarryForwardEndingScopeProjectionRecord,
+  CurrentChildEndingScopeProjectionRecord,
+  SessionAuthorityRecord,
+} from "../src/orchestrator/storage/lifecycle-storage.types.js";
 import { MaintenanceFence } from "../src/orchestrator/storage/maintenance-fence.js";
 import { MigrationRunner } from "../src/orchestrator/storage/migration-runner.js";
 import { PROJECT_STORE_MIGRATIONS } from "../src/orchestrator/storage/migrations/registry.js";
@@ -87,6 +93,11 @@ import {
   checkpointFixture,
   lifecycleUuid,
 } from "./support/lifecycle-fixtures.js";
+import {
+  compareCanonicalUtf8,
+  referenceMinimumCheckpointUpperBound,
+  referenceMinimumFinalEndingScopeBindingsUpperBound,
+} from "./support/qualified-checkpoint-reference.js";
 import { canonicalJson } from "../src/orchestrator/serialization/canonical-json.js";
 
 const NOW = "2026-07-18T00:00:00.000Z";
@@ -475,6 +486,19 @@ interface Fixture {
 
 const fixtures: Fixture[] = [];
 
+interface EndingScopeProjectionOverrides {
+  readonly children?: (
+    projectId: string,
+    rootSessionId: string,
+    limit: number,
+  ) => readonly CurrentChildEndingScopeProjectionRecord[];
+  readonly tickets?: (
+    projectId: string,
+    rootSessionId: string,
+    limit: number,
+  ) => readonly CarryForwardEndingScopeProjectionRecord[];
+}
+
 function commandRuntime(options: {
   readonly connection: NativeConnection;
   readonly authority: SessionAuthorityRepository;
@@ -484,8 +508,19 @@ function commandRuntime(options: {
   readonly ids: DeterministicIds;
   readonly clock: TestClock;
   readonly coverage?: ConnectionBoundEvidenceCoverage;
+  readonly endingScopeProjections?: EndingScopeProjectionOverrides;
 }): { readonly events: EventAppendTransaction; readonly store: LifecycleCommandStore } {
-  const { connection, authority, leases, approvals, transfers, ids, clock, coverage } = options;
+  const {
+    connection,
+    authority,
+    leases,
+    approvals,
+    transfers,
+    ids,
+    clock,
+    coverage,
+    endingScopeProjections,
+  } = options;
   const childAuthority = authority as SessionAuthorityRepository & {
     nextGlobalPosition(current: SqliteConnection): bigint;
     loadEvents(current: SqliteConnection, input: SessionAuthorityRecord): readonly unknown[];
@@ -513,12 +548,16 @@ function commandRuntime(options: {
           projectId: string,
           rootSessionId: string,
           limit: number,
-        ) => authority.listNonterminalChildEndingScopeProjectionsBounded(
-          current,
+        ) => endingScopeProjections?.children?.(
           projectId,
           rootSessionId,
           limit,
-        ),
+        ) ?? authority.listNonterminalChildEndingScopeProjectionsBounded(
+            current,
+            projectId,
+            rootSessionId,
+            limit,
+          ),
         latestCheckpoint: (input: SessionAuthorityRecord) => authority.latestCheckpoint(current, input),
         rootContinuityKey: (input: SessionAuthorityRecord) => authority.rootContinuityKey(current, input),
         nextGlobalPosition: () => childAuthority.nextGlobalPosition(current),
@@ -542,12 +581,16 @@ function commandRuntime(options: {
           projectId: string,
           sourceRootSessionId: string,
           limit: number,
-        ) => transfers.listUnclaimedEndingScopeProjectionsBySourceRoot(
-          current,
+        ) => endingScopeProjections?.tickets?.(
           projectId,
           sourceRootSessionId,
           limit,
-        ),
+        ) ?? transfers.listUnclaimedEndingScopeProjectionsBySourceRoot(
+            current,
+            projectId,
+            sourceRootSessionId,
+            limit,
+          ),
         insert: (input: Parameters<ChildTransferRepository["insert"]>[1]) => transfers.insert(current, input),
         claim: (input: Parameters<ChildTransferRepository["claim"]>[1]) => transfers.claim(current, input),
       },
@@ -562,6 +605,7 @@ function fixture(
   databasePath = ":memory:",
   cleanupDirectory: string | null = null,
   coverage?: ConnectionBoundEvidenceCoverage,
+  endingScopeProjections?: EndingScopeProjectionOverrides,
 ): Fixture {
   assert.ok(ChildWorkflowServiceClass, "ChildWorkflowService must implement scoped child behavior");
   const connection = new NativeConnection(databasePath);
@@ -596,6 +640,7 @@ function fixture(
     ids,
     clock,
     coverage,
+    endingScopeProjections,
   });
   const primary = context();
   const childContext = context("child-1", "untrusted");
@@ -1229,9 +1274,84 @@ function claimScenario(item: Fixture, ordinal: number) {
   return { child, oldChildId, suspended, futureStart, futureAuthority, claim, preparedClaim };
 }
 
-function capacityHarness() {
+function forkUnderRoot(
+  item: Fixture,
+  root: RootStartSuccess,
+  rootAuthority: RootOrChildAuthorityMaterial,
+  ordinal: number,
+) {
+  const rootRecord = item.authority.get(
+    item.connection,
+    PROJECT_ID,
+    root.publicResult.sessionId,
+  );
+  assert.ok(rootRecord !== null);
+  const aggregate = item.authority.requireFoldMatch(item.connection, rootRecord);
+  assert.equal(aggregate.kind, "root");
+  const command: ForkChildCommandV2 = {
+    ...base(ordinal),
+    commandType: "fork-child",
+    parentSessionId: root.publicResult.sessionId as ForkChildCommandV2["parentSessionId"],
+    expectedStreamVersion: aggregate.streamVersion.toString(),
+    assignment: {
+      assignmentId: lifecycleUuid(ordinal + 1_000),
+      summary: `Destination assignment ${ordinal}`,
+      scope: `scope/destination/${ordinal}`,
+    },
+    directAccessRequested: false,
+  };
+  return success(item.workflow.execute(item.primary, prepare(item, item.primary, command, {
+    authoritySessionId: root.publicResult.sessionId,
+    targetSessionId: root.publicResult.sessionId,
+    capabilityKind: "root-session-handle",
+    capabilityGeneration: root.publicResult.ownerGeneration,
+    material: rootAuthority,
+  })));
+}
+
+function suspendUnderRoot(
+  item: Fixture,
+  root: RootStartSuccess,
+  rootAuthority: RootOrChildAuthorityMaterial,
+  childSessionId: string,
+  ordinal: number,
+) {
+  const checkpoint = seedChildCheckpoint(item, childSessionId, ordinal + 100);
+  const aggregate = childAggregate(item, childSessionId).aggregate;
+  assert.equal(aggregate.kind, "child");
+  const command: SuspendChildSessionCommandV2 = {
+    ...base(ordinal),
+    commandType: "suspend-child-session",
+    parentSessionId: root.publicResult.sessionId as SuspendChildSessionCommandV2["parentSessionId"],
+    childSessionId: childSessionId as SuspendChildSessionCommandV2["childSessionId"],
+    expectedStreamVersion: aggregate.streamVersion.toString(),
+    checkpointId: checkpoint.checkpointId,
+    blockers: ["retain this destination carry-forward ticket"],
+    followUps: ["preserve it while another ticket is claimed"],
+  };
+  const suspended = success(item.workflow.execute(
+    item.primary,
+    prepare(item, item.primary, command, {
+      authoritySessionId: root.publicResult.sessionId,
+      targetSessionId: childSessionId,
+      capabilityKind: "root-session-handle",
+      capabilityGeneration: root.publicResult.ownerGeneration,
+      material: rootAuthority,
+    }),
+  ));
+  return { checkpoint, suspended };
+}
+
+function capacityHarness(
+  options: {
+    readonly evidenceCoverage?: CheckpointEvidenceCoverageV2;
+    readonly realEstimators?: boolean;
+  } = {},
+) {
   const checkpointInputs: MinimumCheckpointCapacityInput[] = [];
   const endingInputs: MinimumEndingScopeCapacityInput[] = [];
+  const checkpointEstimates: number[] = [];
+  const endingEstimates: number[] = [];
   const checkpointCoverageJson: string[] = [];
   const snapshots: {
     readonly sessionId: string;
@@ -1239,7 +1359,8 @@ function capacityHarness() {
   }[] = [];
   let checkpointBytes = CHECKPOINT_MAX_CANONICAL_BYTES;
   let endingBytes = FINAL_ENDING_SCOPE_BINDINGS_MAX_CANONICAL_BYTES;
-  const evidenceCoverage: CheckpointEvidenceCoverageV2 = Object.freeze({
+  const evidenceCoverage: CheckpointEvidenceCoverageV2 =
+    options.evidenceCoverage ?? Object.freeze({
     coverageVersion: 2,
     captureMode: "coverage-only",
     contentRetained: false,
@@ -1273,11 +1394,19 @@ function capacityHarness() {
     minimumCheckpointUpperBound: (input) => {
       checkpointCoverageJson.push(canonicalJson(input.evidenceCoverage));
       checkpointInputs.push(input);
-      return checkpointBytes;
+      const estimate = options.realEstimators
+        ? minimumCheckpointUpperBound(input)
+        : checkpointBytes;
+      checkpointEstimates.push(estimate);
+      return estimate;
     },
     minimumFinalEndingScopeBindingsUpperBound: (input) => {
       endingInputs.push(input);
-      return endingBytes;
+      const estimate = options.realEstimators
+        ? minimumFinalEndingScopeBindingsUpperBound(input)
+        : endingBytes;
+      endingEstimates.push(estimate);
+      return estimate;
     },
   });
   return {
@@ -1285,11 +1414,15 @@ function capacityHarness() {
     evidenceCoverage,
     checkpointInputs,
     endingInputs,
+    checkpointEstimates,
+    endingEstimates,
     checkpointCoverageJson,
     snapshots,
     resetCalls: () => {
       checkpointInputs.length = 0;
       endingInputs.length = 0;
+      checkpointEstimates.length = 0;
+      endingEstimates.length = 0;
       checkpointCoverageJson.length = 0;
       snapshots.length = 0;
     },
@@ -1298,6 +1431,70 @@ function capacityHarness() {
       endingBytes = nextEndingBytes;
     },
   };
+}
+
+function boundaryEvidenceCoverage(
+  latestBatchEventPosition: "1" | "10",
+): CheckpointEvidenceCoverageV2 {
+  return Object.freeze({
+    coverageVersion: 2,
+    captureMode: "coverage-only",
+    contentRetained: false,
+    adapterSessions: Object.freeze([{
+      adapterSessionId: lifecycleUuid(92_000) as CheckpointEvidenceCoverageV2["adapterSessions"][number]["adapterSessionId"],
+      coverageFirstOrdinal: "0" as const,
+      coverageLastOrdinal: "0",
+      highestContiguousOrdinal: "0",
+      missingIntervals: Object.freeze([]),
+      frameFingerprintAlgorithm: "hmac-sha256" as const,
+      frameFingerprintSchemaVersion: 1 as const,
+      frameFingerprintKeyId: "k".repeat(45),
+      frameFingerprintDomain: "pm-evidence-frame-v1" as const,
+      coverageFingerprintAlgorithm: "hmac-sha256" as const,
+      coverageFingerprintSchemaVersion: 1 as const,
+      coverageFingerprintKeyId: "k",
+      coverageFingerprintDomain: "pm-evidence-coverage-v1" as const,
+      coverageFingerprint: "a".repeat(64),
+      latestBatchId: lifecycleUuid(92_001) as CheckpointEvidenceCoverageV2["adapterSessions"][number]["latestBatchId"],
+      latestBatchEventPosition,
+    }]),
+  });
+}
+
+function projectedCurrentChildren(
+  projectId: string,
+  rootSessionId: string,
+  count: number,
+): readonly CurrentChildEndingScopeProjectionRecord[] {
+  return Object.freeze(Array.from({ length: count }, (_, index) => Object.freeze({
+    projectId,
+    rootSessionId,
+    childSessionId: lifecycleUuid(200_000 + index),
+    childState: "active" as const,
+    lastEventPosition: 1n,
+    streamVersion: 1n,
+    checkpointId: null,
+    checkpointEventPosition: null,
+  })));
+}
+
+function projectedCarryTickets(
+  projectId: string,
+  rootSessionId: string,
+  count: number,
+): readonly CarryForwardEndingScopeProjectionRecord[] {
+  return Object.freeze(Array.from({ length: count }, (_, index) => Object.freeze({
+    projectId,
+    rootSessionId,
+    childSessionId: lifecycleUuid(400_000 + index),
+    childState: "transferred" as const,
+    lastEventPosition: 1n,
+    streamVersion: 1n,
+    checkpointId: lifecycleUuid(500_000 + index),
+    checkpointEventPosition: 1n,
+    transferTicketId: lifecycleUuid(600_000 + index),
+    transferTicketEventPosition: 1n,
+  })));
 }
 
 function persistentChildWorkflowCounts(item: Fixture) {
@@ -1338,6 +1535,353 @@ function errorCode(error: unknown): string | undefined {
 }
 
 describe("scoped child lifecycle", () => {
+  it("rejects an exactly-full bounded ending-scope page before estimation or state growth", () => {
+    for (const projectionKind of ["current-child", "carry-forward-ticket"] as const) {
+      const capacity = capacityHarness();
+      const requests: { readonly source: "children" | "tickets"; readonly limit: number }[] = [];
+      const item = fixture(":memory:", null, capacity.coverage, {
+        children: (projectId, rootSessionId, limit) => {
+          requests.push({ source: "children", limit });
+          return projectionKind === "current-child"
+            ? projectedCurrentChildren(projectId, rootSessionId, 606).slice(0, limit)
+            : [];
+        },
+        tickets: (projectId, rootSessionId, limit) => {
+          requests.push({ source: "tickets", limit });
+          return projectionKind === "carry-forward-ticket"
+            ? projectedCarryTickets(projectId, rootSessionId, 606).slice(0, limit)
+            : [];
+        },
+      });
+      const beforeCounts = persistentChildWorkflowCounts(item);
+      const beforeUuids = item.ids.uuidCalls;
+      const beforeBytes = item.ids.bytesCalls;
+
+      assert.throws(
+        () => fork(item, 89_000 + (projectionKind === "current-child" ? 0 : 10), false),
+        (error: unknown) => errorCode(error) === "CHECKPOINT_CAPACITY_EXCEEDED",
+      );
+
+      assert.deepEqual(requests, [
+        { source: "children", limit: 606 },
+        { source: "tickets", limit: 606 },
+      ]);
+      assert.equal(capacity.snapshots.length, 0);
+      assert.equal(capacity.checkpointInputs.length, 0);
+      assert.equal(capacity.endingInputs.length, 0);
+      assert.equal(item.ids.uuidCalls, beforeUuids);
+      assert.equal(item.ids.bytesCalls, beforeBytes);
+      assert.deepEqual(persistentChildWorkflowCounts(item), beforeCounts);
+    }
+  });
+
+  it("classifies malformed bounded ending-scope results as integrity failures", () => {
+    for (const malformedSource of ["children", "tickets"] as const) {
+      const capacity = capacityHarness();
+      const item = fixture(":memory:", null, capacity.coverage, {
+        children: () => malformedSource === "children"
+          ? Object.freeze({}) as unknown as readonly CurrentChildEndingScopeProjectionRecord[]
+          : [],
+        tickets: () => malformedSource === "tickets"
+          ? Object.freeze({}) as unknown as readonly CarryForwardEndingScopeProjectionRecord[]
+          : [],
+      });
+      const beforeCounts = persistentChildWorkflowCounts(item);
+      const beforeUuids = item.ids.uuidCalls;
+      const beforeBytes = item.ids.bytesCalls;
+
+      assert.throws(
+        () => fork(item, 89_050 + (malformedSource === "children" ? 0 : 10), false),
+        (error: unknown) => errorCode(error) === "INTEGRITY_FAILURE",
+      );
+
+      assert.equal(capacity.snapshots.length, 0);
+      assert.equal(capacity.checkpointInputs.length, 0);
+      assert.equal(capacity.endingInputs.length, 0);
+      assert.equal(item.ids.uuidCalls, beforeUuids);
+      assert.equal(item.ids.bytesCalls, beforeBytes);
+      assert.deepEqual(persistentChildWorkflowCounts(item), beforeCounts);
+    }
+  });
+
+  it("uses real estimators at independently serialized exact and plus-one checkpoint boundaries", () => {
+    for (const boundary of [
+      {
+        latestBatchEventPosition: "1" as const,
+        expectedCheckpointBytes: 262_144,
+        ordinal: 89_100,
+        rejected: false,
+      },
+      {
+        latestBatchEventPosition: "10" as const,
+        expectedCheckpointBytes: 262_145,
+        ordinal: 89_200,
+        rejected: true,
+      },
+    ]) {
+      const evidenceCoverage = boundaryEvidenceCoverage(
+        boundary.latestBatchEventPosition,
+      );
+      const capacity = capacityHarness({
+        evidenceCoverage,
+        realEstimators: true,
+      });
+      const requestedLimits: number[] = [];
+      const item = fixture(":memory:", null, capacity.coverage, {
+        children: (projectId, rootSessionId, limit) => {
+          requestedLimits.push(limit);
+          return projectedCurrentChildren(
+            projectId,
+            rootSessionId,
+            579,
+          ).slice(0, limit);
+        },
+        tickets: () => [],
+      });
+      const beforeCounts = persistentChildWorkflowCounts(item);
+      const beforeUuids = item.ids.uuidCalls;
+      const beforeBytes = item.ids.bytesCalls;
+
+      if (boundary.rejected) {
+        assert.throws(
+          () => fork(item, boundary.ordinal, false),
+          (error: unknown) => errorCode(error) === "CHECKPOINT_CAPACITY_EXCEEDED",
+        );
+      } else {
+        assert.equal(
+          success(fork(item, boundary.ordinal, false)).publicResult.operation,
+          "fork-child",
+        );
+      }
+
+      assert.deepEqual(requestedLimits, [606]);
+      assert.equal(capacity.checkpointInputs.length, 1);
+      assert.equal(capacity.endingInputs.length, 1);
+      assert.strictEqual(
+        capacity.checkpointInputs[0]?.endingScopeBindings,
+        capacity.endingInputs[0]?.endingScopeBindings,
+      );
+      const bindings = capacity.checkpointInputs[0]!.endingScopeBindings;
+      assert.equal(bindings.length, 580);
+      assert.equal(
+        referenceMinimumCheckpointUpperBound(evidenceCoverage, bindings),
+        boundary.expectedCheckpointBytes,
+      );
+      assert.deepEqual(
+        capacity.checkpointEstimates,
+        [boundary.expectedCheckpointBytes],
+      );
+      assert.equal(
+        referenceMinimumFinalEndingScopeBindingsUpperBound(bindings),
+        251_141,
+      );
+      assert.deepEqual(capacity.endingEstimates, [251_141]);
+      if (boundary.rejected) {
+        assert.equal(item.ids.uuidCalls, beforeUuids);
+        assert.equal(item.ids.bytesCalls, beforeBytes);
+        assert.deepEqual(persistentChildWorkflowCounts(item), beforeCounts);
+      }
+    }
+  });
+
+  it("preserves a mixed nonempty destination in one canonical claim projection", () => {
+    const capacity = capacityHarness({ realEstimators: true });
+    const item = fixture(":memory:", null, capacity.coverage);
+    const scenario = claimScenario(item, 93_000);
+    const existingCurrent = forkUnderRoot(
+      item,
+      scenario.futureStart,
+      scenario.futureAuthority,
+      96_000,
+    );
+    const existingCarryChild = forkUnderRoot(
+      item,
+      scenario.futureStart,
+      scenario.futureAuthority,
+      96_100,
+    );
+    const existingCarry = suspendUnderRoot(
+      item,
+      scenario.futureStart,
+      scenario.futureAuthority,
+      existingCarryChild.publicResult.childSessionId,
+      96_200,
+    );
+    seedSessionCheckpoint(
+      item,
+      scenario.futureStart.publicResult.sessionId,
+      96_400,
+    );
+
+    const destinationRoot = item.authority.get(
+      item.connection,
+      PROJECT_ID,
+      scenario.futureStart.publicResult.sessionId,
+    );
+    assert.ok(destinationRoot !== null);
+    const destinationAggregate = item.authority.requireFoldMatch(
+      item.connection,
+      destinationRoot,
+    );
+    assert.equal(destinationAggregate.kind, "root");
+    const claim: ClaimChildTransferCommandV2 = {
+      ...base(96_500),
+      commandType: "claim-child-transfer",
+      rootSessionId: scenario.futureStart.publicResult.sessionId as ClaimChildTransferCommandV2["rootSessionId"],
+      transferTicketId: scenario.suspended.publicResult.transferTicketId as ClaimChildTransferCommandV2["transferTicketId"],
+      expectedStreamVersion: destinationAggregate.streamVersion.toString(),
+    };
+    const preparedClaim = prepare(item, item.primary, claim, {
+      authoritySessionId: scenario.futureStart.publicResult.sessionId,
+      targetSessionId: scenario.futureStart.publicResult.sessionId,
+      capabilityKind: "root-session-handle",
+      capabilityGeneration: scenario.futureStart.publicResult.ownerGeneration,
+      material: scenario.futureAuthority,
+    });
+
+    const currentAuthority = item.authority.get(
+      item.connection,
+      PROJECT_ID,
+      existingCurrent.publicResult.childSessionId,
+    );
+    assert.ok(currentAuthority !== null);
+    const currentAggregate = item.authority.requireFoldMatch(
+      item.connection,
+      currentAuthority,
+    );
+    assert.equal(currentAggregate.kind, "child");
+    const carryAuthority = item.authority.get(
+      item.connection,
+      PROJECT_ID,
+      existingCarryChild.publicResult.childSessionId,
+    );
+    assert.ok(carryAuthority !== null);
+    const carryAggregate = item.authority.requireFoldMatch(
+      item.connection,
+      carryAuthority,
+    );
+    assert.equal(carryAggregate.kind, "child");
+    const carryTicket = item.transfers.get(
+      item.connection,
+      PROJECT_ID,
+      existingCarry.suspended.publicResult.transferTicketId!,
+    );
+    assert.ok(carryTicket !== null);
+    assert.ok(carryAuthority.latestCheckpointId !== null);
+    assert.ok(carryAuthority.latestCheckpointEventPosition !== null);
+    const expectedBindings = Object.freeze(([
+      {
+        bindingVersion: 1,
+        bindingKind: "current-child",
+        childSessionId: "00000000-0000-4000-8000-000000000000" as FinalEndingScopeBindingV1["childSessionId"],
+        childState: "active",
+        lastEventPosition: "9223372036854775807",
+        streamVersion: "9223372036854775807",
+        checkpointId: null,
+        checkpointEventPosition: null,
+        transferTicketId: null,
+        transferTicketEventPosition: null,
+      },
+      {
+        bindingVersion: 1,
+        bindingKind: "current-child",
+        childSessionId: existingCurrent.publicResult.childSessionId as FinalEndingScopeBindingV1["childSessionId"],
+        childState: "active",
+        lastEventPosition: currentAggregate.eventPosition.toString(),
+        streamVersion: currentAggregate.streamVersion.toString(),
+        checkpointId: null,
+        checkpointEventPosition: null,
+        transferTicketId: null,
+        transferTicketEventPosition: null,
+      },
+      {
+        bindingVersion: 1,
+        bindingKind: "carry-forward-ticket",
+        childSessionId: existingCarryChild.publicResult.childSessionId as FinalEndingScopeBindingV1["childSessionId"],
+        childState: "transferred",
+        lastEventPosition: carryTicket.createdEventPosition.toString(),
+        streamVersion: carryAggregate.streamVersion.toString(),
+        checkpointId: carryAuthority.latestCheckpointId as FinalEndingScopeBindingV1["checkpointId"],
+        checkpointEventPosition:
+          carryAuthority.latestCheckpointEventPosition.toString(),
+        transferTicketId: carryTicket.transferTicketId as FinalEndingScopeBindingV1["transferTicketId"],
+        transferTicketEventPosition:
+          carryTicket.createdEventPosition.toString(),
+      },
+    ] satisfies FinalEndingScopeBindingV1[]).sort((left, right) =>
+      compareCanonicalUtf8(left.childSessionId, right.childSessionId)));
+    const incomingTicketBefore = item.transfers.get(
+      item.connection,
+      PROJECT_ID,
+      claim.transferTicketId,
+    );
+    assert.ok(incomingTicketBefore !== null);
+    capacity.resetCalls();
+
+    const claimed = success(item.workflow.execute(item.primary, preparedClaim));
+
+    assert.equal(claimed.publicResult.operation, "claim-child-transfer");
+    assert.equal(claimed.publicResult.previousChildSessionId, scenario.oldChildId);
+    assert.equal(capacity.checkpointInputs.length, 1);
+    assert.equal(capacity.endingInputs.length, 1);
+    assert.strictEqual(
+      capacity.checkpointInputs[0]?.endingScopeBindings,
+      capacity.endingInputs[0]?.endingScopeBindings,
+    );
+    const actualBindings =
+      capacity.checkpointInputs[0]!.endingScopeBindings;
+    assert.deepEqual(actualBindings, expectedBindings);
+    assert.equal(
+      actualBindings.filter(
+        (binding) => binding.childSessionId === scenario.oldChildId,
+      ).length,
+      0,
+    );
+    for (let index = 1; index < actualBindings.length; index += 1) {
+      assert.equal(
+        compareCanonicalUtf8(
+          actualBindings[index - 1]!.childSessionId,
+          actualBindings[index]!.childSessionId,
+        ) < 0,
+        true,
+      );
+    }
+    const referenceCheckpointBytes = referenceMinimumCheckpointUpperBound(
+      capacity.evidenceCoverage,
+      expectedBindings,
+    );
+    const referenceEndingBytes =
+      referenceMinimumFinalEndingScopeBindingsUpperBound(expectedBindings);
+    assert.deepEqual(capacity.checkpointEstimates, [referenceCheckpointBytes]);
+    assert.deepEqual(capacity.endingEstimates, [referenceEndingBytes]);
+    assert.equal(
+      referenceCheckpointBytes > referenceMinimumCheckpointUpperBound(
+        capacity.evidenceCoverage,
+        expectedBindings.map((binding) => ({
+          bindingKind: "carry-forward-ticket" as const,
+          childSessionId: binding.childSessionId,
+        })),
+      ),
+      true,
+    );
+    assert.equal(
+      item.transfers.get(
+        item.connection,
+        PROJECT_ID,
+        existingCarry.suspended.publicResult.transferTicketId!,
+      )?.claimedEventPosition,
+      null,
+    );
+    assert.equal(
+      item.transfers.get(
+        item.connection,
+        PROJECT_ID,
+        claim.transferTicketId,
+      )?.claimedChildSessionId,
+      claimed.publicResult.childSessionId,
+    );
+  });
+
   it("rejects every state-growing path before capacity is exceeded", () => {
     const exactForkCapacity = capacityHarness();
     const exactForkItem = fixture(":memory:", null, exactForkCapacity.coverage);

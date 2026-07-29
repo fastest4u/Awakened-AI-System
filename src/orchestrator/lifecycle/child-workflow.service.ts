@@ -86,7 +86,7 @@ import { requireRiskyTransitionCheckpointV1 } from "./checkpoint.service.js";
 
 const LOWER_HASH = /^[0-9a-f]{64}$/;
 const SQLITE_INT64_MAX = 9_223_372_036_854_775_807n;
-const ENDING_SCOPE_PROJECTION_LIMIT = 606;
+const ENDING_SCOPE_LIMIT_PLUS_ONE = 606;
 const ESTIMATOR_ONLY_POSITION = "9223372036854775807";
 const REPORT_FIELDS = [
   "findings",
@@ -392,17 +392,20 @@ function prospectiveEndingScopeBindings(
   const children = authority.listNonterminalChildEndingScopeProjectionsBounded(
     root.projectId,
     root.sessionId,
-    ENDING_SCOPE_PROJECTION_LIMIT,
+    ENDING_SCOPE_LIMIT_PLUS_ONE,
   );
   const tickets = transfers.listUnclaimedEndingScopeProjectionsBySourceRoot(
     root.projectId,
     root.sessionId,
-    ENDING_SCOPE_PROJECTION_LIMIT,
+    ENDING_SCOPE_LIMIT_PLUS_ONE,
   );
-  if (!Array.isArray(children)
-    || !Array.isArray(tickets)
-    || children.length > ENDING_SCOPE_PROJECTION_LIMIT
-    || tickets.length > ENDING_SCOPE_PROJECTION_LIMIT) invalid("INTEGRITY_FAILURE");
+  if (!Array.isArray(children) || !Array.isArray(tickets)) {
+    invalid("INTEGRITY_FAILURE");
+  }
+  if (children.length >= ENDING_SCOPE_LIMIT_PLUS_ONE
+    || tickets.length >= ENDING_SCOPE_LIMIT_PLUS_ONE) {
+    throw new LifecycleError("CHECKPOINT_CAPACITY_EXCEEDED");
+  }
   const current = [
     ...children.map((projection) => currentChildEndingScopeBinding(root, projection)),
     ...tickets.map((projection) => carryForwardEndingScopeBinding(root, projection)),
