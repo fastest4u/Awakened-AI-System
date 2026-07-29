@@ -402,8 +402,10 @@ function prospectiveEndingScopeBindings(
   if (!Array.isArray(children) || !Array.isArray(tickets)) {
     invalid("INTEGRITY_FAILURE");
   }
-  if (children.length >= ENDING_SCOPE_LIMIT_PLUS_ONE
-    || tickets.length >= ENDING_SCOPE_LIMIT_PLUS_ONE) {
+  if (children.length > ENDING_SCOPE_LIMIT_PLUS_ONE
+    || tickets.length > ENDING_SCOPE_LIMIT_PLUS_ONE) invalid("INTEGRITY_FAILURE");
+  if (children.length === ENDING_SCOPE_LIMIT_PLUS_ONE
+    || tickets.length === ENDING_SCOPE_LIMIT_PLUS_ONE) {
     throw new LifecycleError("CHECKPOINT_CAPACITY_EXCEEDED");
   }
   const current = [

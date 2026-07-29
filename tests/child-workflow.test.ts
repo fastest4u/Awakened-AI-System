@@ -1604,6 +1604,46 @@ describe("scoped child lifecycle", () => {
     }
   });
 
+  it("classifies overlong bounded ending-scope results as integrity failures", () => {
+    for (const overlongSource of ["children", "tickets"] as const) {
+      const capacity = capacityHarness();
+      const requests: { readonly source: "children" | "tickets"; readonly limit: number }[] = [];
+      const item = fixture(":memory:", null, capacity.coverage, {
+        children: (projectId, rootSessionId, limit) => {
+          requests.push({ source: "children", limit });
+          return overlongSource === "children"
+            ? projectedCurrentChildren(projectId, rootSessionId, 607)
+            : [];
+        },
+        tickets: (projectId, rootSessionId, limit) => {
+          requests.push({ source: "tickets", limit });
+          return overlongSource === "tickets"
+            ? projectedCarryTickets(projectId, rootSessionId, 607)
+            : [];
+        },
+      });
+      const beforeCounts = persistentChildWorkflowCounts(item);
+      const beforeUuids = item.ids.uuidCalls;
+      const beforeBytes = item.ids.bytesCalls;
+
+      assert.throws(
+        () => fork(item, 89_075 + (overlongSource === "children" ? 0 : 10), false),
+        (error: unknown) => errorCode(error) === "INTEGRITY_FAILURE",
+      );
+
+      assert.deepEqual(requests, [
+        { source: "children", limit: 606 },
+        { source: "tickets", limit: 606 },
+      ]);
+      assert.equal(capacity.snapshots.length, 0);
+      assert.equal(capacity.checkpointInputs.length, 0);
+      assert.equal(capacity.endingInputs.length, 0);
+      assert.equal(item.ids.uuidCalls, beforeUuids);
+      assert.equal(item.ids.bytesCalls, beforeBytes);
+      assert.deepEqual(persistentChildWorkflowCounts(item), beforeCounts);
+    }
+  });
+
   it("uses real estimators at independently serialized exact and plus-one checkpoint boundaries", () => {
     for (const boundary of [
       {
@@ -1680,6 +1720,129 @@ describe("scoped child lifecycle", () => {
         assert.equal(item.ids.uuidCalls, beforeUuids);
         assert.equal(item.ids.bytesCalls, beforeBytes);
         assert.deepEqual(persistentChildWorkflowCounts(item), beforeCounts);
+      }
+    }
+  });
+
+  it("enforces nearest reachable real ending-scope bounds for fork and transfer claim", () => {
+    for (const operation of ["fork-child", "claim-child-transfer"] as const) {
+      for (const boundary of [
+        {
+          retainedCarryTickets: 604,
+          prospectiveBindingCount: 605,
+          expectedEndingBytes: 261_966,
+          rejected: false,
+        },
+        {
+          retainedCarryTickets: 605,
+          prospectiveBindingCount: 606,
+          expectedEndingBytes: 262_399,
+          rejected: true,
+        },
+      ]) {
+        const capacity = capacityHarness({ realEstimators: true });
+        let capacityRootSessionId: string | null = null;
+        const item = fixture(":memory:", null, capacity.coverage, {
+          children: () => [],
+          tickets: (projectId, rootSessionId, limit) =>
+            rootSessionId === capacityRootSessionId
+              ? projectedCarryTickets(
+                  projectId,
+                  rootSessionId,
+                  boundary.retainedCarryTickets,
+                ).slice(0, limit)
+              : [],
+        });
+        let executeStateGrowth: () => WorkerLifecycleResult<ChildWorkflowResultV2>;
+        let claimedTicketId: string | null = null;
+        let claimedTicketBefore:
+          ReturnType<ChildTransferRepository["get"]> | null = null;
+        if (operation === "fork-child") {
+          capacityRootSessionId = item.root.publicResult.sessionId;
+          executeStateGrowth = () => fork(
+            item,
+            89_300 + boundary.retainedCarryTickets,
+            false,
+          );
+        } else {
+          const scenario = claimScenario(
+            item,
+            89_500 + boundary.retainedCarryTickets,
+          );
+          capacityRootSessionId = scenario.futureStart.publicResult.sessionId;
+          claimedTicketId = scenario.suspended.publicResult.transferTicketId!;
+          claimedTicketBefore = item.transfers.get(
+            item.connection,
+            PROJECT_ID,
+            claimedTicketId,
+          );
+          assert.ok(claimedTicketBefore !== null);
+          executeStateGrowth = () => item.workflow.execute(
+            item.primary,
+            scenario.preparedClaim,
+          );
+        }
+        capacity.resetCalls();
+        const beforeCounts = persistentChildWorkflowCounts(item);
+        const beforeUuids = item.ids.uuidCalls;
+        const beforeBytes = item.ids.bytesCalls;
+
+        if (boundary.rejected) {
+          assert.throws(
+            executeStateGrowth,
+            (error: unknown) =>
+              errorCode(error) === "CHECKPOINT_CAPACITY_EXCEEDED",
+          );
+        } else {
+          assert.equal(
+            success(executeStateGrowth()).publicResult.operation,
+            operation,
+          );
+        }
+
+        assert.equal(capacity.checkpointInputs.length, 1);
+        assert.equal(capacity.endingInputs.length, 1);
+        assert.strictEqual(
+          capacity.checkpointInputs[0]?.endingScopeBindings,
+          capacity.endingInputs[0]?.endingScopeBindings,
+        );
+        const bindings = capacity.endingInputs[0]!.endingScopeBindings;
+        assert.equal(bindings.length, boundary.prospectiveBindingCount);
+        assert.equal(
+          referenceMinimumFinalEndingScopeBindingsUpperBound(bindings),
+          boundary.expectedEndingBytes,
+        );
+        assert.deepEqual(
+          capacity.endingEstimates,
+          [boundary.expectedEndingBytes],
+        );
+        const referenceCheckpointBytes = referenceMinimumCheckpointUpperBound(
+          capacity.evidenceCoverage,
+          bindings,
+        );
+        assert.deepEqual(
+          capacity.checkpointEstimates,
+          [referenceCheckpointBytes],
+        );
+        assert.equal(
+          referenceCheckpointBytes <= CHECKPOINT_MAX_CANONICAL_BYTES,
+          true,
+        );
+        if (boundary.rejected) {
+          assert.equal(item.ids.uuidCalls, beforeUuids);
+          assert.equal(item.ids.bytesCalls, beforeBytes);
+          assert.deepEqual(persistentChildWorkflowCounts(item), beforeCounts);
+          if (claimedTicketId !== null) {
+            assert.deepEqual(
+              item.transfers.get(
+                item.connection,
+                PROJECT_ID,
+                claimedTicketId,
+              ),
+              claimedTicketBefore,
+            );
+          }
+        }
       }
     }
   });
