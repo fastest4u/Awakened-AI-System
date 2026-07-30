@@ -113,6 +113,55 @@ function terminationFailure(): ProjectStoreWorkerBackendError {
   });
 }
 
+const INTRINSIC_UINT8_ARRAY_FILL = Uint8Array.prototype.fill;
+const TYPED_ARRAY_PROTOTYPE = Object.getPrototypeOf(Uint8Array.prototype) as object;
+const INTRINSIC_TYPED_ARRAY_BUFFER = Object.getOwnPropertyDescriptor(
+  TYPED_ARRAY_PROTOTYPE,
+  "buffer",
+)!.get!;
+const INTRINSIC_TYPED_ARRAY_BYTE_LENGTH = Object.getOwnPropertyDescriptor(
+  TYPED_ARRAY_PROTOTYPE,
+  "byteLength",
+)!.get!;
+const INTRINSIC_TYPED_ARRAY_BYTE_OFFSET = Object.getOwnPropertyDescriptor(
+  TYPED_ARRAY_PROTOTYPE,
+  "byteOffset",
+)!.get!;
+const INTRINSIC_ARRAY_BUFFER_BYTE_LENGTH = Object.getOwnPropertyDescriptor(
+  ArrayBuffer.prototype,
+  "byteLength",
+)!.get!;
+
+function ownsWholeBytes(bytes: Uint8Array, expectedByteLength: number): boolean {
+  try {
+    const buffer = INTRINSIC_TYPED_ARRAY_BUFFER.call(bytes) as ArrayBuffer;
+    return buffer instanceof ArrayBuffer
+      && INTRINSIC_TYPED_ARRAY_BYTE_LENGTH.call(bytes) === expectedByteLength
+      && INTRINSIC_TYPED_ARRAY_BYTE_OFFSET.call(bytes) === 0
+      && INTRINSIC_ARRAY_BUFFER_BYTE_LENGTH.call(buffer) === expectedByteLength;
+  } catch {
+    return false;
+  }
+}
+
+function intrinsicByteLength(bytes: Uint8Array): number {
+  try {
+    return INTRINSIC_TYPED_ARRAY_BYTE_LENGTH.call(bytes) as number;
+  } catch {
+    return 0;
+  }
+}
+
+function scrubProviderBytes(bytes: Uint8Array, expectedByteLength: number): boolean {
+  const ownershipValid = ownsWholeBytes(bytes, expectedByteLength);
+  try {
+    INTRINSIC_UINT8_ARRAY_FILL.call(bytes, 0);
+  } catch {
+    return false;
+  }
+  return ownershipValid && ownsWholeBytes(bytes, expectedByteLength);
+}
+
 function zeroMalformedProviderFingerprint(value: unknown): void {
   if (typeof value !== "object" || value === null) return;
   const candidate = value as { operation?: unknown; bytes?: unknown };
@@ -122,11 +171,9 @@ function zeroMalformedProviderFingerprint(value: unknown): void {
     && bytes instanceof Uint8Array
     && Object.getPrototypeOf(bytes) === Uint8Array.prototype
     && bytes.buffer instanceof ArrayBuffer
-    && bytes.byteLength >= 1
-    && bytes.byteLength <= MAX_INTEGRITY_PROVIDER_INPUT_BYTES
-    && bytes.byteOffset === 0
-    && bytes.byteLength === bytes.buffer.byteLength
-  ) bytes.fill(0);
+    && intrinsicByteLength(bytes) >= 1
+    && intrinsicByteLength(bytes) <= MAX_INTEGRITY_PROVIDER_INPUT_BYTES
+  ) scrubProviderBytes(bytes, intrinsicByteLength(bytes));
 }
 
 function canonicalEventsPath(route: ProjectStoreRouteWire): string {
@@ -556,6 +603,7 @@ export class ProjectStoreWorkerBackend implements WorkerRuntimeBackend {
       let settled = false;
       let terminating = false;
       let providerOperationActive = false;
+      const providerRequestIds = new Set<string>();
       let terminationCause: ProjectStoreWorkerBackendError | undefined;
       const rejectOnce = (error: ProjectStoreWorkerBackendError): void => {
         if (settled) return;
@@ -584,15 +632,25 @@ export class ProjectStoreWorkerBackend implements WorkerRuntimeBackend {
         if (
           response !== undefined
           || providerOperationActive
+          || providerRequestIds.has(providerRequest.providerRequestId)
           || providerRequest.integrityRequestId !== request.id
           || (providerRequest.operation === "fingerprint" && request.type !== "fullIntegrity")
         ) {
-          if (providerRequest.operation === "fingerprint") providerRequest.bytes.fill(0);
+          if (providerRequest.operation === "fingerprint") {
+            scrubProviderBytes(
+              providerRequest.bytes,
+              intrinsicByteLength(providerRequest.bytes),
+            );
+          }
           failChild(new ProjectStoreWorkerBackendError("WORKER_PROTOCOL_ERROR"));
           return;
         }
+        providerRequestIds.add(providerRequest.providerRequestId);
         providerOperationActive = true;
-        void (async () => {
+        const expectedByteLength = providerRequest.operation === "fingerprint"
+          ? intrinsicByteLength(providerRequest.bytes)
+          : 0;
+        const operationPromise = (async () => {
           let providerResponse: IntegrityProviderResponseWire;
           try {
             const scope = {
@@ -650,6 +708,7 @@ export class ProjectStoreWorkerBackend implements WorkerRuntimeBackend {
               }
             } else {
               let fingerprint: unknown;
+              let ownershipValid = false;
               try {
                 fingerprint = await provider.fingerprint({
                   ...scope,
@@ -660,9 +719,15 @@ export class ProjectStoreWorkerBackend implements WorkerRuntimeBackend {
                 });
               } catch {
                 fingerprint = undefined;
+              } finally {
+                ownershipValid = scrubProviderBytes(
+                  providerRequest.bytes,
+                  expectedByteLength,
+                );
               }
               providerResponse = typeof fingerprint === "string"
                 && /^[0-9a-f]{64}$/.test(fingerprint)
+                && ownershipValid
                 ? {
                     type: "integrity-provider-response",
                     integrityRequestId: providerRequest.integrityRequestId,
@@ -686,10 +751,21 @@ export class ProjectStoreWorkerBackend implements WorkerRuntimeBackend {
               failChild(new ProjectStoreWorkerBackendError("WORKER_UNAVAILABLE"));
             }
           } finally {
-            if (providerRequest.operation === "fingerprint") providerRequest.bytes.fill(0);
+            if (providerRequest.operation === "fingerprint") {
+              scrubProviderBytes(providerRequest.bytes, expectedByteLength);
+            }
             providerOperationActive = false;
           }
         })();
+        void operationPromise.catch(() => {
+          if (providerRequest.operation === "fingerprint") {
+            scrubProviderBytes(providerRequest.bytes, expectedByteLength);
+          }
+          providerOperationActive = false;
+          if (!settled && !terminating) {
+            failChild(new ProjectStoreWorkerBackendError("WORKER_PROTOCOL_ERROR"));
+          }
+        });
       };
       child.on("message", (value) => {
         if (settled || terminating) return;

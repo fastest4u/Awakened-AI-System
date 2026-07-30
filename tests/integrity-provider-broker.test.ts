@@ -124,6 +124,55 @@ class MalformedFingerprintProvider extends DeterministicCapabilityKeyProvider {
   }
 }
 
+class DetachingFingerprintProvider extends DeterministicCapabilityKeyProvider {
+  override fingerprint(
+    ...parameters: Parameters<DeterministicCapabilityKeyProvider["fingerprint"]>
+  ): string {
+    const fingerprint = super.fingerprint(...parameters);
+    const [input] = parameters;
+    structuredClone(input.bytes, { transfer: [input.bytes.buffer as ArrayBuffer] });
+    return fingerprint;
+  }
+}
+
+class FillTamperingFingerprintProvider extends DeterministicCapabilityKeyProvider {
+  override fingerprint(
+    ...parameters: Parameters<DeterministicCapabilityKeyProvider["fingerprint"]>
+  ): string {
+    const fingerprint = super.fingerprint(...parameters);
+    const [input] = parameters;
+    input.bytes.fill = (() => {
+      throw new Error("provider-fill-secret-canary");
+    }) as typeof input.bytes.fill;
+    return fingerprint;
+  }
+}
+
+function captureOwnedUint8Arrays<T>(operation: () => T): {
+  readonly result: T;
+  readonly allocations: Uint8Array[];
+} {
+  const descriptor = Object.getOwnPropertyDescriptor(globalThis, "Uint8Array")!;
+  const OriginalUint8Array = Uint8Array;
+  const allocations: Uint8Array[] = [];
+  const CapturingUint8Array = new Proxy(OriginalUint8Array, {
+    construct(target, argumentsList, newTarget) {
+      const value = Reflect.construct(target, argumentsList, newTarget) as Uint8Array;
+      if (typeof argumentsList[0] === "number") allocations.push(value);
+      return value;
+    },
+  });
+  Object.defineProperty(globalThis, "Uint8Array", {
+    ...descriptor,
+    value: CapturingUint8Array,
+  });
+  try {
+    return { result: operation(), allocations };
+  } finally {
+    Object.defineProperty(globalThis, "Uint8Array", descriptor);
+  }
+}
+
 function emptyReport(mode: "quick" | "full"): Record<string, unknown> {
   return {
     ok: true,
@@ -282,6 +331,70 @@ test("integrity provider broker preserves backend ownership and strict request c
     (error: unknown) => (error as { code?: unknown }).code
       === "EVIDENCE_HISTORICAL_KEY_UNAVAILABLE",
   );
+
+  const invalidKeyClient = new WorkerIntegrityProviderClient({
+    postMessage(): void {
+      assert.fail("invalid key must fail before posting");
+    },
+  } as Pick<typeof channel.port1, "postMessage">, "invalid-key-copy", "full");
+  const invalidKeyCopy = captureOwnedUint8Arrays(() => invalidKeyClient.fingerprint(
+    "x".repeat(129),
+    new Uint8Array([6, 5, 4]),
+  ));
+  await assert.rejects(
+    invalidKeyCopy.result,
+    (error: unknown) => (error as { code?: unknown }).code === "WORKER_PROTOCOL_ERROR",
+  );
+  assert.deepEqual([...invalidKeyCopy.allocations.at(-1)!], [0, 0, 0]);
+
+  const concurrentPosts: unknown[] = [];
+  const concurrentClient = new WorkerIntegrityProviderClient({
+    postMessage(value: unknown): void { concurrentPosts.push(value); },
+  } as Pick<typeof channel.port1, "postMessage">, "concurrent-copy", "full");
+  const concurrentPending = concurrentClient.status("historical-key");
+  const concurrentCopy = captureOwnedUint8Arrays(() => concurrentClient.fingerprint(
+    "historical-key",
+    new Uint8Array([3, 2, 1]),
+  ));
+  await assert.rejects(
+    concurrentCopy.result,
+    (error: unknown) => (error as { code?: unknown }).code === "WORKER_PROTOCOL_ERROR",
+  );
+  assert.equal(concurrentPosts.length, 1);
+  assert.deepEqual([...concurrentCopy.allocations.at(-1)!], [0, 0, 0]);
+  concurrentClient.dispose(new Error("test complete"));
+  await assert.rejects(concurrentPending, /test complete/);
+
+  let throwingPortBytes: Uint8Array | undefined;
+  const throwingPortClient = new WorkerIntegrityProviderClient({
+    postMessage(value: unknown): void {
+      throwingPortBytes = (value as { bytes?: Uint8Array }).bytes;
+      throw new Error("port-secret-canary");
+    },
+  } as Pick<typeof channel.port1, "postMessage">, "throwing-port-copy", "full");
+  await assert.rejects(
+    throwingPortClient.fingerprint("historical-key", new Uint8Array([8, 6, 4, 2])),
+    (error: unknown) => (
+      (error as { code?: unknown }).code === "WORKER_PROTOCOL_ERROR"
+      && !String((error as Error).message).includes("port-secret-canary")
+    ),
+  );
+  assert.deepEqual([...(throwingPortBytes ?? [])], [0, 0, 0, 0]);
+
+  let attachedPortBytes: Uint8Array | undefined;
+  const attachedPortClient = new WorkerIntegrityProviderClient({
+    postMessage(value: unknown): void {
+      attachedPortBytes = (value as { bytes?: Uint8Array }).bytes;
+    },
+  } as Pick<typeof channel.port1, "postMessage">, "attached-port-copy", "full");
+  const attachedPending = attachedPortClient.fingerprint(
+    "historical-key",
+    new Uint8Array([1, 3, 5, 7]),
+  );
+  assert.deepEqual([...(attachedPortBytes ?? [])], [0, 0, 0, 0]);
+  attachedPortClient.dispose(new Error("test complete"));
+  await assert.rejects(attachedPending, /test complete/);
+
   channel.port1.close();
   channel.port2.close();
 
@@ -644,6 +757,238 @@ test("integrity provider broker terminates malformed concurrent or out-of-order 
   );
   await outOfOrderBackend.close();
 
+  const replayObservations: Array<{
+    readonly operation: "status" | "fingerprint";
+    readonly terminationBeforeCleanup: number;
+    readonly providerCallCount: number;
+    readonly firstReplayBytes: Uint8Array;
+    readonly secondReplayBytes: Uint8Array;
+  }> = [];
+  for (const operation of ["status", "fingerprint"] as const) {
+    const replayContext = await projectContext();
+    const replayChild = new BrokerChild();
+    const replayProvider = new DeterministicCapabilityKeyProvider();
+    const replayBackend = new ProjectStoreWorkerBackend({
+      selfUrl: WORKER_URL,
+      executorLeaseMs: 15_000,
+      appendRetryDeadlineMs: 10_000,
+      keyProvider: replayProvider,
+      integrityWorkerFactory: () => replayChild,
+    });
+    await replayBackend.dispatch({
+      id: `open-${operation}-replay`,
+      type: "open",
+      binding: encodeWorkerBinding(replayContext),
+    });
+    const replayIntegrity = replayBackend.dispatch({
+      id: `full-${operation}-replay`,
+      type: "fullIntegrity",
+      binding: encodeWorkerBindingAssertion(replayContext),
+    });
+    const firstReplayBytes = new Uint8Array([1, 2, 3]);
+    const secondReplayBytes = new Uint8Array([4, 5, 6]);
+    const providerMessage = (bytes: Uint8Array) => operation === "status"
+      ? {
+          type: "integrity-provider-request",
+          integrityRequestId: `full-${operation}-replay`,
+          providerRequestId: "sequential-replay-id",
+          operation,
+          keyId: "test-evidence-fingerprint-key-v1",
+        }
+      : {
+          type: "integrity-provider-request",
+          integrityRequestId: `full-${operation}-replay`,
+          providerRequestId: "sequential-replay-id",
+          operation,
+          keyId: "historical-key",
+          bytes,
+        };
+    replayChild.emit("message", providerMessage(firstReplayBytes));
+    await turn();
+    replayChild.emit("message", providerMessage(secondReplayBytes));
+    await turn();
+    const terminationBeforeCleanup = replayChild.terminateCalls;
+    const providerCallCount = replayProvider.calls.filter(
+      (call) => call.operation === operation,
+    ).length;
+    if (terminationBeforeCleanup === 0) {
+      replayChild.emit("messageerror", new Error("test cleanup"));
+      await turn();
+    }
+    replayChild.termination.resolve(1);
+    await assert.rejects(
+      replayIntegrity,
+      (error: unknown) => error instanceof ProjectStoreWorkerBackendError
+        && error.code === "WORKER_PROTOCOL_ERROR"
+        && Object.keys(error.details).length === 0,
+    );
+    await replayBackend.close();
+
+    replayObservations.push({
+      operation,
+      terminationBeforeCleanup,
+      providerCallCount,
+      firstReplayBytes,
+      secondReplayBytes,
+    });
+  }
+
+  for (const hostileCase of [
+    {
+      name: "detach",
+      provider: new DetachingFingerprintProvider(),
+      expectedFingerprintOk: false,
+    },
+    {
+      name: "fill-tamper",
+      provider: new FillTamperingFingerprintProvider(),
+      expectedFingerprintOk: true,
+    },
+  ]) {
+    const hostileContext = await projectContext();
+    const hostileChild = new BrokerChild();
+    const hostileBackend = new ProjectStoreWorkerBackend({
+      selfUrl: WORKER_URL,
+      executorLeaseMs: 15_000,
+      appendRetryDeadlineMs: 10_000,
+      keyProvider: hostileCase.provider,
+      integrityWorkerFactory: () => hostileChild,
+    });
+    await hostileBackend.dispatch({
+      id: `open-hostile-${hostileCase.name}`,
+      type: "open",
+      binding: encodeWorkerBinding(hostileContext),
+    });
+    const hostileIntegrity = hostileBackend.dispatch({
+      id: `full-hostile-${hostileCase.name}`,
+      type: "fullIntegrity",
+      binding: encodeWorkerBindingAssertion(hostileContext),
+    });
+    const unhandled: unknown[] = [];
+    const captureUnhandled = (error: unknown): void => { unhandled.push(error); };
+    process.on("unhandledRejection", captureUnhandled);
+    let outcome = "pending";
+    try {
+      hostileChild.emit("message", {
+        type: "integrity-provider-request",
+        integrityRequestId: `full-hostile-${hostileCase.name}`,
+        providerRequestId: `fingerprint-${hostileCase.name}`,
+        operation: "fingerprint",
+        keyId: "historical-key",
+        bytes: new Uint8Array([9, 8, 7, 6]),
+      });
+      await turn();
+      await turn();
+      const fingerprintResponse = hostileChild.posted.at(-1);
+
+      hostileChild.emit("message", {
+        type: "integrity-provider-request",
+        integrityRequestId: `full-hostile-${hostileCase.name}`,
+        providerRequestId: `status-after-${hostileCase.name}`,
+        operation: "status",
+        keyId: "test-evidence-fingerprint-key-v1",
+      });
+      await turn();
+      await turn();
+      const statusResponse = hostileChild.posted.at(-1);
+      const terminationBeforeCleanup = hostileChild.terminateCalls;
+
+      if (terminationBeforeCleanup === 0) {
+        hostileChild.emit("message", {
+          id: `full-hostile-${hostileCase.name}`,
+          ok: true,
+          data: {
+            ...emptyReport("full"),
+            projectId: hostileContext.binding.projectId,
+            storeId: hostileContext.binding.storeId,
+          },
+        });
+        hostileChild.emit("exit", 0);
+        await hostileIntegrity;
+        outcome = "resolved";
+      } else {
+        hostileChild.termination.resolve(1);
+        outcome = await hostileIntegrity.then(
+          () => "resolved",
+          (error: unknown) => error instanceof ProjectStoreWorkerBackendError
+            ? error.code
+            : "unknown",
+        );
+      }
+      await hostileBackend.close();
+      await turn();
+
+      assert.equal(terminationBeforeCleanup, 0, hostileCase.name);
+      assert.equal(outcome, "resolved", hostileCase.name);
+      assert.deepEqual(
+        fingerprintResponse,
+        hostileCase.expectedFingerprintOk
+          ? {
+              type: "integrity-provider-response",
+              integrityRequestId: `full-hostile-${hostileCase.name}`,
+              providerRequestId: `fingerprint-${hostileCase.name}`,
+              operation: "fingerprint",
+              ok: true,
+              fingerprint: (fingerprintResponse as { fingerprint?: string }).fingerprint,
+            }
+          : {
+              type: "integrity-provider-response",
+              integrityRequestId: `full-hostile-${hostileCase.name}`,
+              providerRequestId: `fingerprint-${hostileCase.name}`,
+              operation: "fingerprint",
+              ok: false,
+              code: "INTEGRITY_FAILURE",
+            },
+      );
+      if (hostileCase.expectedFingerprintOk) {
+        assert.match(
+          (fingerprintResponse as { fingerprint: string }).fingerprint,
+          /^[0-9a-f]{64}$/,
+        );
+        assert.deepEqual(
+          [...hostileCase.provider.fingerprintInputs.at(-1)!],
+          [0, 0, 0, 0],
+        );
+      }
+      assert.deepEqual(statusResponse, {
+        type: "integrity-provider-response",
+        integrityRequestId: `full-hostile-${hostileCase.name}`,
+        providerRequestId: `status-after-${hostileCase.name}`,
+        operation: "status",
+        ok: true,
+        status: "available",
+      });
+      assert.equal(
+        JSON.stringify([fingerprintResponse, statusResponse]).includes("secret-canary"),
+        false,
+      );
+      assert.deepEqual(unhandled, []);
+    } finally {
+      process.off("unhandledRejection", captureUnhandled);
+      if (outcome === "pending") {
+        if (hostileChild.terminateCalls === 0) {
+          hostileChild.emit("messageerror", new Error("test cleanup"));
+          await turn();
+        }
+        hostileChild.termination.resolve(1);
+        await Promise.allSettled([hostileIntegrity, hostileBackend.close()]);
+      }
+    }
+  }
+
+  for (const observation of replayObservations) {
+    assert.equal(
+      observation.terminationBeforeCleanup,
+      1,
+      observation.operation,
+    );
+    assert.equal(observation.providerCallCount, 1, observation.operation);
+    if (observation.operation === "fingerprint") {
+      assert.deepEqual([...observation.firstReplayBytes], [0, 0, 0]);
+      assert.deepEqual([...observation.secondReplayBytes], [0, 0, 0]);
+    }
+  }
+
   const prematureTerminalContext = await projectContext();
   const prematureTerminalChild = new BrokerChild();
   const prematureTerminalBackend = new ProjectStoreWorkerBackend({
@@ -688,4 +1033,53 @@ test("integrity provider broker terminates malformed concurrent or out-of-order 
       && error.code === "WORKER_PROTOCOL_ERROR",
   );
   await prematureTerminalBackend.close();
+
+  const postTerminalContext = await projectContext();
+  const postTerminalChild = new BrokerChild();
+  const postTerminalProvider = new DeterministicCapabilityKeyProvider();
+  const postTerminalBackend = new ProjectStoreWorkerBackend({
+    selfUrl: WORKER_URL,
+    executorLeaseMs: 15_000,
+    appendRetryDeadlineMs: 10_000,
+    keyProvider: postTerminalProvider,
+    integrityWorkerFactory: () => postTerminalChild,
+  });
+  await postTerminalBackend.dispatch({
+    id: "open-post-terminal-provider",
+    type: "open",
+    binding: encodeWorkerBinding(postTerminalContext),
+  });
+  const postTerminalIntegrity = postTerminalBackend.dispatch({
+    id: "full-post-terminal-provider",
+    type: "fullIntegrity",
+    binding: encodeWorkerBindingAssertion(postTerminalContext),
+  });
+  postTerminalChild.emit("message", {
+    id: "full-post-terminal-provider",
+    ok: true,
+    data: {
+      ...emptyReport("full"),
+      projectId: postTerminalContext.binding.projectId,
+      storeId: postTerminalContext.binding.storeId,
+    },
+  });
+  postTerminalChild.emit("message", {
+    type: "integrity-provider-request",
+    integrityRequestId: "full-post-terminal-provider",
+    providerRequestId: "after-terminal",
+    operation: "status",
+    keyId: "test-evidence-fingerprint-key-v1",
+  });
+  await turn();
+  const postTerminalCalls = postTerminalProvider.calls.length;
+  assert.equal(postTerminalChild.terminateCalls, 1);
+  postTerminalChild.termination.resolve(1);
+  await assert.rejects(
+    postTerminalIntegrity,
+    (error: unknown) => error instanceof ProjectStoreWorkerBackendError
+      && error.code === "WORKER_PROTOCOL_ERROR"
+      && Object.keys(error.details).length === 0,
+  );
+  assert.equal(postTerminalCalls, 0);
+  await postTerminalBackend.close();
 });

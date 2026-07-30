@@ -29,6 +29,17 @@ function protocolError(): IntegrityProviderClientError {
   return new IntegrityProviderClientError("WORKER_PROTOCOL_ERROR");
 }
 
+const INTRINSIC_UINT8_ARRAY_FILL = Uint8Array.prototype.fill;
+
+function scrubOwnedBytes(bytes: Uint8Array | undefined): void {
+  if (bytes === undefined) return;
+  try {
+    INTRINSIC_UINT8_ARRAY_FILL.call(bytes, 0);
+  } catch {
+    // A successful transfer detaches the canonical copy.
+  }
+}
+
 export class WorkerIntegrityProviderClient implements HistoricalEvidenceIntegrityProviderPort {
   readonly #port: Pick<MessagePort, "postMessage">;
   readonly #integrityRequestId: string;
@@ -111,8 +122,14 @@ export class WorkerIntegrityProviderClient implements HistoricalEvidenceIntegrit
     keyId: string,
     bytes?: Uint8Array,
   ): Promise<string> {
-    if (this.#disposed !== undefined) return Promise.reject(this.#disposed);
-    if (this.#pending !== undefined) return Promise.reject(protocolError());
+    if (this.#disposed !== undefined) {
+      scrubOwnedBytes(bytes);
+      return Promise.reject(this.#disposed);
+    }
+    if (this.#pending !== undefined) {
+      scrubOwnedBytes(bytes);
+      return Promise.reject(protocolError());
+    }
     const providerRequestId = randomUUID();
     let request: IntegrityProviderRequestWire;
     try {
@@ -133,6 +150,7 @@ export class WorkerIntegrityProviderClient implements HistoricalEvidenceIntegrit
             bytes,
           });
     } catch {
+      scrubOwnedBytes(bytes);
       return Promise.reject(protocolError());
     }
     return new Promise<string>((resolve, reject) => {
@@ -142,10 +160,12 @@ export class WorkerIntegrityProviderClient implements HistoricalEvidenceIntegrit
           const transferable = request.bytes.buffer;
           if (!(transferable instanceof ArrayBuffer)) throw protocolError();
           this.#port.postMessage(request, [transferable]);
+          scrubOwnedBytes(request.bytes);
         } else {
           this.#port.postMessage(request);
         }
       } catch {
+        if (request.operation === "fingerprint") scrubOwnedBytes(request.bytes);
         this.poison(protocolError());
       }
     });
