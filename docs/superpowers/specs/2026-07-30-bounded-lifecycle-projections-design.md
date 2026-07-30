@@ -201,11 +201,15 @@ identity does not justify the row.
 Quick verification reads exactly: target row by the primary key; predecessor by
 the unique stream-version key when non-genesis; target event by global position;
 and, only when the target transition refers to a report, the partial-unique
-report-witness row and its source event. Checkpoint/terminal source events are
-also direct global-position reads. These are constant-count, protocol-bounded
-lookups. Quick integrity proves the target binding and one link; full replay
-alone proves every historical report-index/projection link and every historical
-transition.
+report-witness row and its raw source event. The witness event position and
+stream version must both precede the consuming target. Quick recomputes the
+standalone report-item-set and report-witness hashes from that raw event, but it
+does not read the witness row's predecessor or prove that witness's historical
+report-index advance/link. The target row still gets its own predecessor check.
+Checkpoint/terminal source events are also direct global-position reads. These
+are constant-count, protocol-bounded lookups. Quick integrity proves the target
+binding and its direct reachable dependencies; Task 12J full replay alone
+proves every historical report-index/projection link and transition.
 
 ## Workflow-generation effective-checkpoint slice
 
@@ -240,8 +244,14 @@ CREATE TABLE lifecycle_workflow_generation_folds (
   UNIQUE (project_id, workflow_id, trigger_event_position),
   CHECK (
     evidence_window_state <> 'open'
-    OR (replacement_checkpoint_version = 2
-      AND effective_checkpoint_version = 2)
+    OR effective_checkpoint_version = 2
+  ),
+  CHECK (
+    replacement_checkpoint_version IS NULL
+    OR (
+      effective_checkpoint_version = replacement_checkpoint_version
+      AND effective_draft_source_event_position = trigger_event_position
+    )
   ),
   CHECK (effective_draft_source_event_position <= trigger_event_position),
   FOREIGN KEY (trigger_event_position) REFERENCES events(global_position)
@@ -266,36 +276,55 @@ The workflow hash is lowercase SHA-256 of:
 
 ```text
 domain = "project-memory/lifecycle/workflow-generation/v1\n"
-tuple = [projectId, workflowId, workflowGeneration, sessionId,
+tuple = [projectId, workflowId, workflowGenerationDecimal, sessionId,
          triggerEventPositionDecimal, rootCommandId, evidenceWindowState,
          replacementCheckpointVersionOrNull, effectiveCheckpointVersion,
          effectiveDraftSourceEventPositionDecimal, previousFingerprintOrNull]
 ```
+
+`workflowGenerationDecimal` is the canonical unsigned base-10 string with no
+leading zero.
 
 Generation 1 has a null predecessor; every later row uses the immediately prior
 generation's fingerprint. Initial request, cancelled-row reopen, and an
 amendment with a non-null replacement set replacement/effective version from
 the strict request/amendment and set source to the trigger event. A null
 amendment carries prior effective version/source and records null replacement.
-`open` requires a supplied V2 replacement, effective V2, source equal to the
-trigger, and window `open`. `seal` records window `sealed`; a non-null
-replacement uses it, while a null replacement carries effective/source.
-`unchanged` has the same replace-or-carry rule and preserves window state.
+The `open` action specifically requires a supplied V2 replacement, effective
+V2, source equal to the trigger, and window `open`. A later `unchanged` action
+while that window remains open may use a null amendment and carry the prior V2
+effective version/source. `seal` records window `sealed`; a non-null replacement
+uses it, while a null replacement carries effective/source. `unchanged` has the
+same replace-or-carry rule and preserves window state. Every non-null
+replacement equals the effective version and makes the trigger its source.
 Schema-3 cancel and ending-abandon generation rows have null replacement and
 carry effective version/source; cancel clears the frozen evidence group, not
 draft provenance, and records window `sealed`; ending-abandon records the
 schema-3 guarded sealed window. Same-generation phase progress creates no row.
 
-Thus the schema-3 generation cases are: initial request; `open`; `seal`;
-same-phase amendment/`unchanged`; cancellation; cancelled-to-request reopen;
-and ending-abandon. Task 14 must keep the request/amend/reopen event generation
-and `workflow_instances.generation` aligned for these cases; that downstream
-contract is not changed in Task 12.
+For live schema 3, the row trigger and root command are exact: generation 1 is
+the `SessionEndRequested` event/command; every amend, including `open`, `seal`,
+and `unchanged`, is the corresponding `SessionEndAmended` event/command at
+generation + 1; cancel is `SessionEndCancelled` at generation + 1; a
+cancelled-to-request reopen is its new `SessionEndRequested` event/command at
+generation + 1; and ending-abandon is `SessionAbandoned` at generation + 1.
+Same-generation phase updates emit no row. Task 14 must align the event payload,
+root aggregate generation, and `workflow_instances.generation` for every one of
+these generation-causing events, including cancel and abandon. Task 12 records
+that downstream contract but does not change it.
 
-Schema-2 legacy cancel/abandon history may not have a distinct generation
-event. Preflight emits one row per distinct observed generation, carrying the
-last effective version/source until a request, amendment, or reopen supplies a
-replacement; it does not invent a duplicate row.
+Schema-2 compatibility history may place cancel or ending-abandon at the same
+generation as its preceding request/amend/reopen. Preflight still emits exactly
+one row for each distinct generation. It deterministically collapses that
+generation's staged row to the last generation-semantic event by global
+position: cancel or abandon becomes `trigger_event_position` and supplies
+`root_command_id`/window state, replacement becomes null, and effective
+version/source carry from that generation's strict request/amend/reopen.
+Preflight then recomputes the collapsed row hash and every downstream
+`previous_fingerprint`/fingerprint. It invents neither an event nor a
+generation. A history without a strict request/amend/reopen draft source or a
+contiguous generation chain fails preflight. The current lifecycle workflow
+generation must equal the maximum staged generation.
 
 `lifecycle_intent_json` exists only on the command's
 `command_event_index = 0`. The application writer and preflight therefore
@@ -344,13 +373,19 @@ stages.
 Under the upgrade transaction, preflight takes one ascending global-position
 pass, strict-decodes lifecycle events and each indexed command-event-0 intent,
 and builds the existing freeze rows plus both projection stages with the same
-pure folds/hash domains as the live writer. Migration 0003 verifies identity,
-three separate counts, strict cardinality (one child row per eligible child
-event and one workflow row per distinct generation), predecessor adjacency,
-source/target linkage and every hash; copies the sealed rows exactly once;
-installs indexes/guards; and drops all stage tables/triggers/marker. Any
+pure folds/hash domains as the live writer. Before sealing, the application
+preflight computes every staged hash. After sealing and immediately before
+executing migration SQL, the application
+`assertQualifiedCheckpointMigrationStage` verifier independently recomputes
+every staged hash and rejects any tamper. Migration 0003 SQL has no SHA
+function/UDF: it verifies marker identity, three separate counts, row shape,
+strict cardinality (one child row per eligible child event and one workflow row
+per distinct generation), predecessor/source/target linkage, and exact-copy
+equality only. It copies the already verified sealed rows exactly once,
+installs indexes/guards, and drops all stage tables/triggers/marker. Any
 mismatch aborts and rolls the source database back exactly to schema 2 with no
-partial persistent object.
+partial persistent object. The live writer computes new hashes; quick/full
+integrity independently recompute persisted hashes.
 
 ## Quick and full integrity
 
@@ -360,9 +395,12 @@ ID/created-position lookup. It never scans lifecycle/ticket history, walks a
 projection chain, reads ordinal/frame rows, decodes frames, recomputes coverage
 HMAC, repairs state, or compares a frozen baseline with current authority.
 
-Any missing, extra, malformed, cross-project/session/stream, non-adjacent,
-bad-hash, bad-carry, bad-event/source/intent, or otherwise mismatched projection
-is `INTEGRITY_FAILURE`. Authenticated coverage accumulator/content mismatch is
+For the target and only its directly reachable dependencies, any missing,
+malformed, cross-project/session/stream, non-adjacent, bad-hash, bad-carry, or
+bad-event/source/intent projection is `INTEGRITY_FAILURE`. Quick cannot discover
+an arbitrary orphan/extra projection row. Task 12J's full ordered merge cursor
+detects every such orphan/extra row and maps it to `INTEGRITY_FAILURE`.
+Authenticated coverage accumulator/content mismatch is
 `SESSION_EVIDENCE_COVERAGE_MISMATCH`. Missing historical key material remains
 `EVIDENCE_HISTORICAL_KEY_UNAVAILABLE`; only a fresh-final gate maps legal later
 state to `SESSION_END_COVERAGE_CHANGED`.
@@ -372,21 +410,27 @@ projection cursor, and generation-causing event/intent cursor plus workflow
 projection cursor. Each expected event/generation consumes exactly one row;
 position/key ordering detects a missing row before advancing and a leftover
 cursor row detects an extra row. It recomputes every report set/witness/index
-and both projection chains, while coverage replay keeps its existing advancing
-ordinal/transition cursors. Work is linear in events plus projection rows; no
-prefix is rescanned and no repair is attempted.
+and both projection chains, including the exact schema-2 cancel/abandon
+same-generation compatibility collapse and downstream re-fingerprinting.
+Coverage replay keeps its existing advancing ordinal/transition cursors. Work
+is linear in events plus projection rows; no prefix is rescanned and no repair
+is attempted.
 
 ## Required tests and rollout boundary
 
 Migration/raw-SQL tests cover every CHECK/FK/index, target/source identity,
 genesis/predecessor, report partial uniqueness, insert adjacency, and immutable
 update/delete guards; staged schema-1/2 backfill covers all three counts,
-tampered hashes/cardinality, exact rollback, and the frozen migration-0002
-SHA-256. Writer tests cover multi-event ascending order, service-afterAppend
-ordering, dedup ordering, replay no-op, and atomic rollback. Quick tests
-instrument zero history scans while tampering every field/hash/source and after
-legal later child/workflow evolution. Full tests prove exact visit counts and
-missing/extra detection for both cursor pairs.
+cardinality, legacy same-generation cancel/abandon collapse, missing strict
+draft-source rejection, application verification failure for a tampered sealed
+stage hash, exact rollback, and the frozen migration-0002 SHA-256. Writer tests
+cover multi-event ascending order, service-afterAppend ordering, dedup ordering,
+replay no-op, and atomic rollback. Quick tests instrument zero history scans
+while tampering every field/hash/source, after legal later child/workflow
+evolution, and for legal open-window `unchanged` null carry. They also prove a
+report consumer checks witness ordering and raw report hashes without reading
+the witness predecessor. Full tests prove exact visit counts, schema-2 collapse,
+and full-only orphan/extra detection for both cursor pairs.
 
 The schema-3 projection writer supports existing V1 writes. Task 13 may expose
 strict V2/V3 worker command/result codecs but must not enable lifecycle V2
