@@ -268,6 +268,17 @@ export interface WorkerOpenResult extends WorkerBindingAssertion {
   executorId: string;
 }
 
+export const MAX_INTEGRITY_PROVIDER_INPUT_BYTES = 4 * 1024 * 1024;
+
+export type IntegrityProviderRequestWire =
+  | { readonly type: "integrity-provider-request"; readonly integrityRequestId: string; readonly providerRequestId: string; readonly operation: "status"; readonly keyId: string }
+  | { readonly type: "integrity-provider-request"; readonly integrityRequestId: string; readonly providerRequestId: string; readonly operation: "fingerprint"; readonly keyId: string; readonly bytes: Uint8Array };
+
+export type IntegrityProviderResponseWire =
+  | { readonly type: "integrity-provider-response"; readonly integrityRequestId: string; readonly providerRequestId: string; readonly operation: "status"; readonly ok: true; readonly status: "available" | "revoked" | "unavailable" }
+  | { readonly type: "integrity-provider-response"; readonly integrityRequestId: string; readonly providerRequestId: string; readonly operation: "fingerprint"; readonly ok: true; readonly fingerprint: string }
+  | { readonly type: "integrity-provider-response"; readonly integrityRequestId: string; readonly providerRequestId: string; readonly operation: "status" | "fingerprint"; readonly ok: false; readonly code: "EVIDENCE_HISTORICAL_KEY_UNAVAILABLE" | "INTEGRITY_FAILURE" };
+
 export type WorkerRequest =
   | { id: string; type: "ping" }
   | { id: string; type: "verifyIdentity"; route: ProjectStoreRouteWire; expected: StoreIdentityWire }
@@ -712,6 +723,128 @@ export function decodeWorkerRequest(value: unknown): WorkerRequest {
     default:
       invalid();
   }
+}
+
+function integrityProviderId(value: unknown): string {
+  return string(value);
+}
+
+function integrityProviderKeyId(value: unknown): string {
+  const keyId = string(value);
+  const scalars = Array.from(keyId);
+  if (
+    scalars.length > 128
+    || scalars.some((scalar) => {
+      const codePoint = scalar.codePointAt(0)!;
+      return codePoint >= 0xd800 && codePoint <= 0xdfff;
+    })
+  ) invalid();
+  return keyId;
+}
+
+function integrityProviderBytes(value: unknown): Uint8Array {
+  if (
+    !(value instanceof Uint8Array)
+    || Object.getPrototypeOf(value) !== Uint8Array.prototype
+    || !(value.buffer instanceof ArrayBuffer)
+    || value.byteLength < 1
+    || value.byteLength > MAX_INTEGRITY_PROVIDER_INPUT_BYTES
+    || value.byteOffset !== 0
+    || value.byteLength !== value.buffer.byteLength
+  ) invalid();
+  return value;
+}
+
+export function decodeIntegrityProviderRequestWire(
+  value: unknown,
+): IntegrityProviderRequestWire {
+  const request = record(value);
+  if (request.type !== "integrity-provider-request") invalid();
+  const operation = request.operation;
+  if (operation === "status") {
+    const decoded = exact(value, [
+      "type", "integrityRequestId", "providerRequestId", "operation", "keyId",
+    ]);
+    return {
+      type: "integrity-provider-request",
+      integrityRequestId: integrityProviderId(decoded.integrityRequestId),
+      providerRequestId: integrityProviderId(decoded.providerRequestId),
+      operation,
+      keyId: integrityProviderKeyId(decoded.keyId),
+    };
+  }
+  if (operation === "fingerprint") {
+    const decoded = exact(value, [
+      "type", "integrityRequestId", "providerRequestId", "operation", "keyId", "bytes",
+    ]);
+    return {
+      type: "integrity-provider-request",
+      integrityRequestId: integrityProviderId(decoded.integrityRequestId),
+      providerRequestId: integrityProviderId(decoded.providerRequestId),
+      operation,
+      keyId: integrityProviderKeyId(decoded.keyId),
+      bytes: integrityProviderBytes(decoded.bytes),
+    };
+  }
+  invalid();
+}
+
+export function decodeIntegrityProviderResponseWire(
+  value: unknown,
+): IntegrityProviderResponseWire {
+  const response = record(value);
+  if (response.type !== "integrity-provider-response") invalid();
+  const operation = response.operation;
+  if (operation !== "status" && operation !== "fingerprint") invalid();
+  if (response.ok === false) {
+    const decoded = exact(value, [
+      "type", "integrityRequestId", "providerRequestId", "operation", "ok", "code",
+    ]);
+    if (
+      decoded.code !== "EVIDENCE_HISTORICAL_KEY_UNAVAILABLE"
+      && decoded.code !== "INTEGRITY_FAILURE"
+    ) invalid();
+    return {
+      type: "integrity-provider-response",
+      integrityRequestId: integrityProviderId(decoded.integrityRequestId),
+      providerRequestId: integrityProviderId(decoded.providerRequestId),
+      operation,
+      ok: false,
+      code: decoded.code,
+    };
+  }
+  if (response.ok !== true) invalid();
+  if (operation === "status") {
+    const decoded = exact(value, [
+      "type", "integrityRequestId", "providerRequestId", "operation", "ok", "status",
+    ]);
+    if (
+      decoded.status !== "available"
+      && decoded.status !== "revoked"
+      && decoded.status !== "unavailable"
+    ) invalid();
+    return {
+      type: "integrity-provider-response",
+      integrityRequestId: integrityProviderId(decoded.integrityRequestId),
+      providerRequestId: integrityProviderId(decoded.providerRequestId),
+      operation,
+      ok: true,
+      status: decoded.status,
+    };
+  }
+  const decoded = exact(value, [
+    "type", "integrityRequestId", "providerRequestId", "operation", "ok", "fingerprint",
+  ]);
+  const fingerprint = string(decoded.fingerprint);
+  if (!HASH.test(fingerprint)) invalid();
+  return {
+    type: "integrity-provider-response",
+    integrityRequestId: integrityProviderId(decoded.integrityRequestId),
+    providerRequestId: integrityProviderId(decoded.providerRequestId),
+    operation,
+    ok: true,
+    fingerprint,
+  };
 }
 
 function decodeAppendCommandWireShape(value: unknown): AppendCommandWire {

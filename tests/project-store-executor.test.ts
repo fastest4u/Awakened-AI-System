@@ -2833,6 +2833,46 @@ describe("ProjectStoreWorkerBackend open identity", () => {
     renameSync(moved, context.binding.storeRoute.eventsPath);
   });
 
+  it("keeps a broker protocol-failing integrity child tracked until termination proof", async () => {
+    const context = await realContext();
+    const child = new DeferredTerminationWorker();
+    const backend = new ProjectStoreWorkerBackend({
+      selfUrl: WORKER_URL,
+      executorLeaseMs: 15_000,
+      appendRetryDeadlineMs: 10_000,
+      integrityWorkerFactory: () => child,
+    });
+    await backend.dispatch({
+      id: "open-broker-protocol-failure",
+      type: "open",
+      binding: encodeWorkerBinding(context),
+    });
+    const integrity = backend.dispatch({
+      id: "full-broker-protocol-failure",
+      type: "fullIntegrity",
+      binding: encodeWorkerBindingAssertion(context),
+    });
+    child.emit("message", {
+      type: "integrity-provider-request",
+      integrityRequestId: "wrong-integrity-request",
+      providerRequestId: "provider-operation",
+      operation: "status",
+      keyId: "historical-key",
+    });
+    let closeSettled = false;
+    const closing = backend.close().finally(() => { closeSettled = true; });
+    await turn();
+    assert.equal(closeSettled, false);
+    assert.equal(child.terminateCalls, 2);
+    child.termination.resolve(1);
+    await assert.rejects(integrity, (error) => (
+      error instanceof ProjectStoreWorkerBackendError
+      && error.code === "WORKER_PROTOCOL_ERROR"
+      && Object.keys(error.details).length === 0
+    ));
+    await closing;
+  });
+
   it("keeps a child tracked and rejects every close retry when termination has no exit proof", async () => {
     const context = await realContext();
     const child = new RejectingTerminationWorker();

@@ -12,7 +12,11 @@ import type { JsonValue } from "../contracts/event.js";
 import type { ProjectContext } from "../identity/contracts.js";
 import { EventIntegrityService } from "../integrity/event-integrity.service.js";
 import { LifecycleIntegrityService } from "../integrity/lifecycle-integrity.service.js";
-import type { IntegrityReport } from "../integrity/integrity.types.js";
+import type {
+  HistoricalEvidenceIntegrityProviderPort,
+  IntegrityReport,
+} from "../integrity/integrity.types.js";
+import type { CapabilityKeyProvider } from "../lifecycle/authority/capability-key-provider.js";
 import { BranchScopeRepository } from "../storage/branch-scope.repository.js";
 import {
   EventStore,
@@ -41,6 +45,7 @@ import type {
 } from "./project-store-worker-runtime.js";
 import {
   decodeAppendCommandWire,
+  decodeIntegrityProviderRequestWire,
   decodeIntegrityReport,
   decodeMaintenanceLeaseWire,
   decodeWorkerBinding,
@@ -49,7 +54,9 @@ import {
   encodeAppendResultWire,
   encodeMaintenanceLeaseWire,
   encodeWorkerBinding,
+  MAX_INTEGRITY_PROVIDER_INPUT_BYTES,
   type MaintenanceLeaseWire,
+  type IntegrityProviderResponseWire,
   type ProjectStoreRouteWire,
   type StoreIdentityExpectationWire,
   type StoreIdentityWire,
@@ -74,6 +81,7 @@ export interface ProjectStoreWorkerBackendOptions {
   selfUrl: URL;
   executorLeaseMs: number;
   appendRetryDeadlineMs: number;
+  readonly keyProvider?: CapabilityKeyProvider;
   afterReadOnlyIdentityVerified?: () => void;
   integrityWorkerFactory?: (
     url: URL,
@@ -103,6 +111,22 @@ function terminationFailure(): ProjectStoreWorkerBackendError {
   return new ProjectStoreWorkerBackendError("WORKER_UNAVAILABLE", {
     terminationFailed: true,
   });
+}
+
+function zeroMalformedProviderFingerprint(value: unknown): void {
+  if (typeof value !== "object" || value === null) return;
+  const candidate = value as { operation?: unknown; bytes?: unknown };
+  const bytes = candidate.bytes;
+  if (
+    candidate.operation === "fingerprint"
+    && bytes instanceof Uint8Array
+    && Object.getPrototypeOf(bytes) === Uint8Array.prototype
+    && bytes.buffer instanceof ArrayBuffer
+    && bytes.byteLength >= 1
+    && bytes.byteLength <= MAX_INTEGRITY_PROVIDER_INPUT_BYTES
+    && bytes.byteOffset === 0
+    && bytes.byteLength === bytes.buffer.byteLength
+  ) bytes.fill(0);
 }
 
 function canonicalEventsPath(route: ProjectStoreRouteWire): string {
@@ -531,6 +555,7 @@ export class ProjectStoreWorkerBackend implements WorkerRuntimeBackend {
       let response: IntegrityReport | undefined;
       let settled = false;
       let terminating = false;
+      let providerOperationActive = false;
       let terminationCause: ProjectStoreWorkerBackendError | undefined;
       const rejectOnce = (error: ProjectStoreWorkerBackendError): void => {
         if (settled) return;
@@ -553,9 +578,140 @@ export class ProjectStoreWorkerBackend implements WorkerRuntimeBackend {
             },
           );
       };
+      const handleProviderRequest = (
+        providerRequest: ReturnType<typeof decodeIntegrityProviderRequestWire>,
+      ): void => {
+        if (
+          response !== undefined
+          || providerOperationActive
+          || providerRequest.integrityRequestId !== request.id
+          || (providerRequest.operation === "fingerprint" && request.type !== "fullIntegrity")
+        ) {
+          if (providerRequest.operation === "fingerprint") providerRequest.bytes.fill(0);
+          failChild(new ProjectStoreWorkerBackendError("WORKER_PROTOCOL_ERROR"));
+          return;
+        }
+        providerOperationActive = true;
+        void (async () => {
+          let providerResponse: IntegrityProviderResponseWire;
+          try {
+            const scope = {
+              projectId: active.context.binding.projectId,
+              storeId: active.context.binding.storeId,
+            };
+            const provider = this.#options.keyProvider;
+            if (provider === undefined) {
+              providerResponse = {
+                type: "integrity-provider-response",
+                integrityRequestId: providerRequest.integrityRequestId,
+                providerRequestId: providerRequest.providerRequestId,
+                operation: providerRequest.operation,
+                ok: false,
+                code: "EVIDENCE_HISTORICAL_KEY_UNAVAILABLE",
+              };
+            } else if (providerRequest.operation === "status") {
+              let status: unknown;
+              try {
+                status = await provider.status(
+                  scope,
+                  "evidence-fingerprint",
+                  providerRequest.keyId,
+                );
+              } catch {
+                status = undefined;
+              }
+              if (status === "available") {
+                providerResponse = {
+                  type: "integrity-provider-response",
+                  integrityRequestId: providerRequest.integrityRequestId,
+                  providerRequestId: providerRequest.providerRequestId,
+                  operation: "status",
+                  ok: true,
+                  status,
+                };
+              } else if (status === "revoked" || status === "unavailable") {
+                providerResponse = {
+                  type: "integrity-provider-response",
+                  integrityRequestId: providerRequest.integrityRequestId,
+                  providerRequestId: providerRequest.providerRequestId,
+                  operation: "status",
+                  ok: false,
+                  code: "EVIDENCE_HISTORICAL_KEY_UNAVAILABLE",
+                };
+              } else {
+                providerResponse = {
+                  type: "integrity-provider-response",
+                  integrityRequestId: providerRequest.integrityRequestId,
+                  providerRequestId: providerRequest.providerRequestId,
+                  operation: "status",
+                  ok: false,
+                  code: "INTEGRITY_FAILURE",
+                };
+              }
+            } else {
+              let fingerprint: unknown;
+              try {
+                fingerprint = await provider.fingerprint({
+                  ...scope,
+                  purpose: "evidence-fingerprint",
+                  keyId: providerRequest.keyId,
+                  domain: "pm-evidence-coverage-v1",
+                  bytes: providerRequest.bytes,
+                });
+              } catch {
+                fingerprint = undefined;
+              }
+              providerResponse = typeof fingerprint === "string"
+                && /^[0-9a-f]{64}$/.test(fingerprint)
+                ? {
+                    type: "integrity-provider-response",
+                    integrityRequestId: providerRequest.integrityRequestId,
+                    providerRequestId: providerRequest.providerRequestId,
+                    operation: "fingerprint",
+                    ok: true,
+                    fingerprint,
+                  }
+                : {
+                    type: "integrity-provider-response",
+                    integrityRequestId: providerRequest.integrityRequestId,
+                    providerRequestId: providerRequest.providerRequestId,
+                    operation: "fingerprint",
+                    ok: false,
+                    code: "INTEGRITY_FAILURE",
+                  };
+            }
+            if (!settled && !terminating) child.postMessage(providerResponse);
+          } catch {
+            if (!settled && !terminating) {
+              failChild(new ProjectStoreWorkerBackendError("WORKER_UNAVAILABLE"));
+            }
+          } finally {
+            if (providerRequest.operation === "fingerprint") providerRequest.bytes.fill(0);
+            providerOperationActive = false;
+          }
+        })();
+      };
       child.on("message", (value) => {
         if (settled || terminating) return;
         try {
+          if (
+            typeof value === "object"
+            && value !== null
+            && "type" in value
+            && value.type === "integrity-provider-request"
+          ) {
+            try {
+              handleProviderRequest(decodeIntegrityProviderRequestWire(value));
+            } catch {
+              zeroMalformedProviderFingerprint(value);
+              throw new ProjectStoreWorkerBackendError("WORKER_PROTOCOL_ERROR");
+            }
+            return;
+          }
+          if (providerOperationActive) {
+            failChild(new ProjectStoreWorkerBackendError("WORKER_PROTOCOL_ERROR"));
+            return;
+          }
           const message = decodeWorkerMessage(value);
           if (!("id" in message) || response !== undefined) {
             return failChild(new ProjectStoreWorkerBackendError("WORKER_PROTOCOL_ERROR"));
@@ -630,6 +786,7 @@ export class ProjectStoreWorkerBackend implements WorkerRuntimeBackend {
 export async function runIntegrityChild(
   context: ProjectContext,
   request: Extract<WorkerRequest, { type: "quickIntegrity" | "fullIntegrity" }>,
+  provider?: HistoricalEvidenceIntegrityProviderPort,
 ): Promise<IntegrityReport> {
   const path = canonicalEventsPath(context.binding.storeRoute);
   // The child is intentionally read-only and never registers an executor lease.
@@ -647,11 +804,11 @@ export async function runIntegrityChild(
     const integrity = new EventIntegrityService(
       connection,
       PROJECT_STORE_MIGRATIONS,
-      [new LifecycleIntegrityService(connection)],
+      [new LifecycleIntegrityService(connection, provider)],
     );
     return request.type === "quickIntegrity"
-      ? integrity.quickCheck(context, request.tailLimit)
-      : integrity.fullCheck(context);
+      ? await integrity.quickCheckAsync(context, request.tailLimit)
+      : await integrity.fullCheckAsync(context);
   } finally {
     connection.close();
   }

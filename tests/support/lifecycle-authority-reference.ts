@@ -75,6 +75,7 @@ function providerMac(
 
 export class DeterministicCapabilityKeyProvider implements CapabilityKeyProvider {
   readonly calls: ProviderCall[] = [];
+  readonly fingerprintInputs: Uint8Array[] = [];
   readonly #statuses = new Map<string, "available" | "revoked" | "unavailable">();
 
   currentKey(scope: KeyScope, purpose: CapabilityKeyPurpose): CapabilityKeyRef {
@@ -134,6 +135,7 @@ export class DeterministicCapabilityKeyProvider implements CapabilityKeyProvider
   }
 
   fingerprint(input: KeyedFingerprintInput): string {
+    this.fingerprintInputs.push(input.bytes);
     this.#record("fingerprint", input);
     const digest = providerMac(input, input.purpose, input.keyId, input.domain, input.bytes);
     try {
