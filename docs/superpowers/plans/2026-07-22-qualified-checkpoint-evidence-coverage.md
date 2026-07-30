@@ -80,9 +80,11 @@ The required anchor test titles and initial behavioral failures are:
 | 12I | `bounded quick integrity rejects one-byte prospective capacity overflow` | Capacity recomputation is absent. |
 | 12I | `bounded quick integrity checks status once per distinct current profile` | Distinct-profile status calls are absent. |
 | 12I | `migration 3 seals and verifies both authenticated lifecycle projection stages` | Child-event/workflow-generation TEMP stages and independent hash verification are absent. |
+| 12I | `migration 3 projection guard aborts when any sealed stage predicate is false` | The executable TEMP guard does not cover all stage/count/linkage/exact-copy predicates. |
 | 12I | `lifecycle command store writes projections after service postwrites and before dedup` | The store-owned projection-writer hook and atomic ordering are absent. |
 | 12I | `bounded quick integrity reads only target projection dependencies` | Child/event/workflow binding checks still reconstruct data-sized history. |
 | 12I | `bounded quick integrity accepts legal open-window unchanged null carry` | Workflow generation provenance incorrectly requires every generation to replace its draft. |
+| 12I | `bounded quick integrity verifies a consumer bound to a non-latest report witness` | Report resolution incorrectly substitutes the latest report or scans child history. |
 | 12J | `full integrity advances each qualified coverage row exactly once` | Advancing replay is absent. |
 | 12J | `full integrity fingerprints each non-zero transition exactly once` | Provider call count is wrong. |
 | 12J | `full integrity reconstructs version 2 checkpoints and frozen snapshots at their historical bases` | Historical reconstruction is absent. |
@@ -1511,7 +1513,7 @@ git commit -m "feat: broker lifecycle integrity provider operations"
 
 **Interfaces:**
 - Consumes: Task 12G async orchestration, Task 12H brokered status port, `EventAppendBatch<T>`, `LifecycleCommandTransaction`, `decodeLifecycleEventV1`/the strict V1/V2 dispatcher, `decodeLifecycleIntentWitness`, direct historical checkpoint/coverage-transition/ticket reads, and the approved projection amendment.
-- Produces: `ChildEventFoldProjection`, `WorkflowGenerationFoldProjection`, five pure canonical hash functions, two strict pure fold functions, and a store-owned `LifecycleProjectionWriter.append<T extends JsonValue>(committed: EventAppendBatch<T>, transaction: LifecycleCommandTransaction): void`.
+- Produces: `ChildEventFoldProjection`, `WorkflowGenerationFoldProjection`, five canonical hash domains exposed by six pure hash functions, two strict pure fold functions, and a store-owned `LifecycleProjectionWriter.append<T extends JsonValue>(committed: EventAppendBatch<T>, transaction: LifecycleCommandTransaction): void`. `reportIndexGenesisFingerprint` and `advanceReportIndexFingerprint` are separate functions over the single `project-memory/lifecycle/report-index/v1\n` domain.
 - Produces: `SqliteLifecycleProjectionRepository` direct methods `findChildAtEvent`, `findChildByStreamVersion`, `findReportWitness`, `findWorkflowGeneration`, and `findWorkflowPredecessor`; every method returns zero/one strict row and uses the table primary/unique indexes.
 - Produces: bounded quick health usable before fresh commands; no lifecycle/ticket history scan, projection-chain walk, ordinal/frame read, HMAC replay, repair, or comparison of frozen baselines with current mutable authority.
 
@@ -1529,6 +1531,8 @@ production hash/fold helpers. Encode lowercase SHA-256 as
 `UTF8(domain-with-final-LF) || UTF8(canonicalJson(tuple))`, UTF-8-byte-sort
 `allReportItemIds`, and expose independent helpers for report item set,
 report witness, report index genesis/advance, child row, and workflow row.
+The six functions intentionally expose five domains because report-index
+genesis and advance use different tuples under the same report-index domain.
 Use exact domains and tuples from the approved amendment.
 
 In `tests/lifecycle-projection-folds.test.ts` and
@@ -1538,7 +1542,9 @@ In `tests/lifecycle-projection-folds.test.ts` and
 - `migration 3 enforces immutable child-event projection identity and adjacency`;
 - `migration 3 enforces immutable workflow-generation provenance and adjacency`;
 - `migration 3 collapses schema 2 cancel and abandon at the same generation`;
-- `projection folds match independent canonical vectors and null-carry semantics`.
+- `projection folds match independent canonical vectors and null-carry semantics`;
+- `child projection fold resolves a consumer bound to a non-latest report witness`;
+- `migration 3 projection guard aborts when any sealed stage predicate is false`.
 
 Raw-SQL cases must exercise every CHECK/FK/index, project/session/stream/type
 source guard, child genesis/non-genesis predecessor, stream-version adjacency,
@@ -1546,6 +1552,12 @@ report partial uniqueness, report/checkpoint/terminal source linkage,
 workflow trigger/source plus command-event-0 intent linkage, immutable
 update/delete triggers, three stage counts, missing strict draft source,
 tampered sealed-stage fingerprint, and exact schema-2 rollback.
+Build at least three reports, then make completion proposal, disposition, and
+completion consumers reference the first report after a different latest
+report exists. Prove the exact first report witness is used and the later
+report is not substituted. Execute migration SQL with each guard predicate
+false in turn and assert the TEMP guard trigger aborts with
+`MIGRATION_EVIDENCE_V2_PRECONDITION_FAILED`.
 
 - [ ] **Step 2: Compile the scaffold and record the migration RED**
 
@@ -1555,7 +1567,7 @@ exports whose bodies throw `NOT_IMPLEMENTED`, then run:
 ```powershell
 npm run test:build
 if ($LASTEXITCODE -ne 0) { throw "Task 12I projection tests must compile before behavioral RED" }
-node --test --test-concurrency=1 --test-reporter=spec --test-name-pattern="^(migration 3 seals and verifies both authenticated lifecycle projection stages|migration 3 enforces immutable child-event projection identity and adjacency|migration 3 enforces immutable workflow-generation provenance and adjacency|migration 3 collapses schema 2 cancel and abandon at the same generation|projection folds match independent canonical vectors and null-carry semantics)$" dist-test/tests/lifecycle-projection-folds.test.js dist-test/tests/qualified-checkpoint-migration.test.js
+node --test --test-concurrency=1 --test-reporter=spec --test-name-pattern="^(migration 3 seals and verifies both authenticated lifecycle projection stages|migration 3 projection guard aborts when any sealed stage predicate is false|migration 3 enforces immutable child-event projection identity and adjacency|migration 3 enforces immutable workflow-generation provenance and adjacency|migration 3 collapses schema 2 cancel and abandon at the same generation|projection folds match independent canonical vectors and null-carry semantics|child projection fold resolves a consumer bound to a non-latest report witness)$" dist-test/tests/lifecycle-projection-folds.test.js dist-test/tests/qualified-checkpoint-migration.test.js
 ```
 
 Expected: the two tables, sealed stages, pure hashes/folds, compatibility
@@ -1594,6 +1606,7 @@ export function workflowGenerationFingerprint(
 export function foldChildEventProjection(
   previous: ChildEventFoldProjection | null,
   event: StoredEvent,
+  reportWitness: ChildEventFoldProjection | null,
 ): ChildEventFoldProjection;
 export function foldWorkflowGenerationProjection(
   previous: WorkflowGenerationFoldProjection | null,
@@ -1610,9 +1623,17 @@ hash member. `foldChildEventProjection` implements the exact
 `ChildWorkTransferCreated`, `SessionCheckpointRecorded`,
 `EvidenceCoverageRecorded`, `ChildAssignmentAmended`, and
 `ChildWorkTransferClaimed` rules from the amendment. A report consumer requires
-the exact witnessed report/item-set; a rejected/requests-more-work disposition
-of the proposed completion report returns to `active`. Non-report events carry
-the report triple as null while preserving the report-index state.
+the exact witnessed report/item-set. `reportWitness` must be null for
+`SessionForked`, `ChildWorkReported`, and every event that does not consume a
+report. For `ChildCompletionProposed`, `ChildWorkDispositioned`, and
+`ChildSessionCompleted`, it must be the immutable `ChildWorkReported`
+projection row whose `reportedReportId` equals the event's referenced report,
+whose project/child identity matches, and whose event position and stream
+version both precede the consumer. It may be an arbitrary older report and
+must not be replaced by `latestReportId`. A rejected/requests-more-work
+disposition of the proposed completion report returns to `active`. Non-report
+events carry the event-local report triple as null while preserving the
+report-index state.
 
 `foldWorkflowGenerationProjection` implements replace-or-carry for request,
 reopen, amendment `open`/`seal`/`unchanged`, cancel, and abandon. A null
@@ -1643,6 +1664,15 @@ functions, collapse only schema-2 same-generation cancel/abandon, compute all
 hashes before sealing, then install INSERT/UPDATE/DELETE denial triggers on
 the marker and all three TEMP tables.
 
+During that pass, maintain a bounded per-child
+`Map<reportId, ChildEventFoldProjection>` populated only after a
+`ChildWorkReported` row is successfully folded. Resolve the report ID of every
+proposal/disposition/completion from that map and pass the exact row as
+`reportWitness`; pass null for all other events. Missing, duplicate,
+cross-child, or non-preceding witnesses fail preflight. This supports a
+consumer of any prior report, not only the latest report, without a second
+history pass.
+
 `assertQualifiedCheckpointMigrationStage` must re-read the sealed rows,
 independently invoke the pure hash/fold functions, compare every field/hash and
 all three counts, and reject mutation before migration SQL executes. It must
@@ -1650,26 +1680,105 @@ not trust the stage creator's in-memory arrays.
 
 Extend migration 0003 with the two persistent STRICT tables, indexes, and
 immutable triggers exactly as the approved DDL. The migration SQL performs no
-SHA/UDF work. Its stage handoff has this shape:
+SHA/UDF work. Retain the existing executable TEMP guard-table pattern and
+extend its single boolean expression:
 
 ```sql
+CREATE TEMP TABLE qualified_checkpoint_v3_guard (
+  value INTEGER NOT NULL
+) STRICT;
+CREATE TEMP TRIGGER qualified_checkpoint_v3_guard_abort
+BEFORE INSERT ON qualified_checkpoint_v3_guard
+WHEN NEW.value <> 1
+BEGIN
+  SELECT RAISE(ABORT, 'MIGRATION_EVIDENCE_V2_PRECONDITION_FAILED');
+END;
+
+INSERT INTO qualified_checkpoint_v3_guard(value)
 SELECT CASE WHEN
-  marker.source_schema_version = 2
-  AND marker.target_schema_version = 3
-  AND marker.freeze_row_count =
-      (SELECT count(*) FROM qualified_checkpoint_v3_stage_rows)
-  AND marker.child_fold_row_count =
-      (SELECT count(*) FROM qualified_checkpoint_v3_stage_child_event_folds)
-  AND marker.workflow_generation_row_count =
-      (SELECT count(*) FROM qualified_checkpoint_v3_stage_workflow_generation_folds)
-  AND marker.sealed = 1
-THEN 1 ELSE RAISE(ABORT, 'MIGRATION_EVIDENCE_V2_PRECONDITION_FAILED') END
-FROM qualified_checkpoint_v3_stage_marker AS marker;
+  (SELECT count(*) FROM qualified_checkpoint_v3_stage_marker) = 1
+  AND (SELECT source_schema_version
+       FROM qualified_checkpoint_v3_stage_marker) = 2
+  AND (SELECT target_schema_version
+       FROM qualified_checkpoint_v3_stage_marker) = 3
+  AND (SELECT sealed FROM qualified_checkpoint_v3_stage_marker) = 1
+  AND (SELECT freeze_row_count FROM qualified_checkpoint_v3_stage_marker)
+      = (SELECT count(*) FROM qualified_checkpoint_v3_stage_rows)
+  AND (SELECT child_fold_row_count FROM qualified_checkpoint_v3_stage_marker)
+      = (SELECT count(*)
+         FROM qualified_checkpoint_v3_stage_child_event_folds)
+  AND (SELECT workflow_generation_row_count
+       FROM qualified_checkpoint_v3_stage_marker)
+      = (SELECT count(*)
+         FROM qualified_checkpoint_v3_stage_workflow_generation_folds)
+  AND (SELECT count(*) FROM temp.sqlite_schema
+       WHERE type = 'trigger'
+         AND name GLOB 'qualified_checkpoint_v3_stage_*_no_*') = 12
+  AND NOT EXISTS (
+    SELECT 1
+    FROM qualified_checkpoint_v3_stage_child_event_folds AS child
+    LEFT JOIN events AS target
+      ON target.global_position = child.event_position
+     AND target.project_id = child.project_id
+     AND target.session_id = child.child_session_id
+     AND target.stream_version = child.stream_version
+    LEFT JOIN qualified_checkpoint_v3_stage_child_event_folds AS predecessor
+      ON predecessor.project_id = child.project_id
+     AND predecessor.child_session_id = child.child_session_id
+     AND predecessor.stream_version = child.stream_version - 1
+    WHERE target.global_position IS NULL
+       OR (child.stream_version = 1
+           AND predecessor.event_position IS NOT NULL)
+       OR (child.stream_version > 1
+           AND (predecessor.event_position IS NULL
+                OR child.previous_fingerprint <> predecessor.fingerprint))
+  )
+  AND NOT EXISTS (
+    SELECT 1
+    FROM qualified_checkpoint_v3_stage_workflow_generation_folds AS workflow
+    LEFT JOIN events AS trigger_event
+      ON trigger_event.global_position = workflow.trigger_event_position
+     AND trigger_event.project_id = workflow.project_id
+     AND trigger_event.session_id = workflow.session_id
+     AND trigger_event.command_id = workflow.root_command_id
+     AND trigger_event.command_event_index = 0
+    LEFT JOIN events AS source_event
+      ON source_event.global_position =
+         workflow.effective_draft_source_event_position
+     AND source_event.project_id = workflow.project_id
+     AND source_event.session_id = workflow.session_id
+    WHERE trigger_event.global_position IS NULL
+       OR trigger_event.lifecycle_intent_json IS NULL
+       OR source_event.global_position IS NULL
+  )
+  AND NOT EXISTS (
+    SELECT * FROM qualified_checkpoint_v3_stage_child_event_folds
+    EXCEPT SELECT * FROM lifecycle_child_event_folds
+  )
+  AND NOT EXISTS (
+    SELECT * FROM lifecycle_child_event_folds
+    EXCEPT SELECT * FROM qualified_checkpoint_v3_stage_child_event_folds
+  )
+  AND NOT EXISTS (
+    SELECT * FROM qualified_checkpoint_v3_stage_workflow_generation_folds
+    EXCEPT SELECT * FROM lifecycle_workflow_generation_folds
+  )
+  AND NOT EXISTS (
+    SELECT * FROM lifecycle_workflow_generation_folds
+    EXCEPT SELECT * FROM qualified_checkpoint_v3_stage_workflow_generation_folds
+  )
+THEN 1 ELSE 0 END;
 ```
 
-Verify strict cardinality/linkage and exact-copy equality, insert both stages
-once, then drop all stage triggers/tables/marker. Preserve migration 0002
-byte-for-byte.
+The complete expression also retains the existing freeze-row/project identity
+predicates and expands child checkpoint/terminal/report plus workflow
+generation/predecessor/event-type/payload/intent linkage exactly as the
+approved DDL requires. Run the guard once before persistent mutation for stage
+shape/linkage and again after copying for exact-copy equality. SQLite
+`RAISE()` appears only inside the trigger body—never directly in a top-level
+`SELECT CASE`. A false predicate inserts `0`, so the trigger aborts. Then drop
+the guard trigger/table and every stage trigger/table/marker. Preserve
+migration 0002 byte-for-byte.
 
 - [ ] **Step 5: Run projection migration GREEN and commit the schema/fold unit**
 
@@ -1688,6 +1797,7 @@ Add exact anchors:
 
 - `lifecycle command store writes projections after service postwrites and before dedup`;
 - `lifecycle projection writer processes a multi-event batch in ascending position`;
+- `lifecycle projection writer resolves a non-latest report witness by its partial-unique key`;
 - `lifecycle command replay performs no projection write`;
 - `lifecycle projection failure rolls back events service state and dedup atomically`;
 - `schema 3 projects existing version 1 lifecycle writes while version 2 routing stays disabled`.
@@ -1695,7 +1805,9 @@ Add exact anchors:
 Recording collaborators must prove the order
 `beforeAppend → append → service afterAppend → projection append → dedup →
 commit`. SQL integration cases must cover every eligible child event and every
-generation-causing event, including legal `unchanged` null carry. A replay
+generation-causing event, including legal `unchanged` null carry. Create three
+reports and consume the first after the third is latest; assert the writer
+passes that first row—not the predecessor/latest row—to the pure fold. A replay
 must record zero projection/repository calls. The disabled-routing case uses
 the production worker/backend composition and asserts `LIFECYCLE_V2_DISABLED`
 with zero event/dedup/workflow effect.
@@ -1705,7 +1817,7 @@ with zero event/dedup/workflow effect.
 ```powershell
 npm run test:build
 if ($LASTEXITCODE -ne 0) { throw "Task 12I writer tests must compile before behavioral RED" }
-node --test --test-concurrency=1 --test-reporter=spec --test-name-pattern="^(lifecycle command store writes projections after service postwrites and before dedup|lifecycle projection writer processes a multi-event batch in ascending position|lifecycle command replay performs no projection write|lifecycle projection failure rolls back events service state and dedup atomically|schema 3 projects existing version 1 lifecycle writes while version 2 routing stays disabled)$" dist-test/tests/lifecycle-command-store.test.js dist-test/tests/event-append-transaction.test.js dist-test/tests/project-store-executor.test.js
+node --test --test-concurrency=1 --test-reporter=spec --test-name-pattern="^(lifecycle command store writes projections after service postwrites and before dedup|lifecycle projection writer processes a multi-event batch in ascending position|lifecycle projection writer resolves a non-latest report witness by its partial-unique key|lifecycle command replay performs no projection write|lifecycle projection failure rolls back events service state and dedup atomically|schema 3 projects existing version 1 lifecycle writes while version 2 routing stays disabled)$" dist-test/tests/lifecycle-command-store.test.js dist-test/tests/event-append-transaction.test.js dist-test/tests/project-store-executor.test.js
 ```
 
 Expected: `LifecycleProjectionWriter`/repository or the post-service/pre-dedup
@@ -1723,6 +1835,14 @@ the pure fold, and inserts the exact new row. It strict-decodes
 `event.lifecycleIntentJson` only on command event zero and rejects any trigger,
 source, identity, adjacency, or committed-batch mismatch as
 `INTEGRITY_FAILURE`.
+
+For each proposal/disposition/completion event, resolve its referenced report
+through the partial-unique
+`(project_id, child_session_id, reported_report_id)` lookup, require the
+witness position/version to precede the consumer, and pass that exact immutable
+row to `foldChildEventProjection`. Pass null for report producers and
+non-consumers. Never substitute `latest_report_id`, walk predecessors, or
+reject a valid non-latest report.
 
 Add a required `projectionWriter: LifecycleProjectionWriter` own data property
 to `LifecycleCommandStoreOptions`. Pass the focused transaction to it exactly
@@ -1764,7 +1884,9 @@ git commit -m "feat: persist immutable lifecycle projections"
 Preserve the four original exact anchors and their existing canonical evidence,
 ticket-row, and claimed-event provenance coverage. Add exact anchors
 `bounded quick integrity reads only target projection dependencies` and
-`bounded quick integrity accepts legal open-window unchanged null carry`.
+`bounded quick integrity accepts legal open-window unchanged null carry` plus
+`bounded quick integrity verifies a consumer bound to a non-latest report
+witness`.
 
 After valid writes, tamper every child/workflow field, previous/current hash,
 project/session/stream/generation, trigger/source event, command-event-0
@@ -1776,13 +1898,16 @@ with null replacement carrying the earlier V2 source. Instrument query classes
 and fail on any lifecycle/ticket history scan, predecessor walk beyond the
 target's one predecessor, ordinal/frame read, frame decode, HMAC call, repair,
 or current-vs-frozen comparison.
+Make report C latest while a proposal/disposition/completion consumes report A;
+tampering A must fail, and C must never be substituted as that consumer's
+witness.
 
 - [ ] **Step 11: Compile and record the bounded projection RED**
 
 ```powershell
 npm run test:build
 if ($LASTEXITCODE -ne 0) { throw "Task 12I quick tests must compile before behavioral RED" }
-node --test --test-concurrency=1 --test-reporter=spec --test-name-pattern="^(bounded quick integrity rejects aggregate transition and checkpoint tampering without ordinal reads|bounded quick integrity resolves frozen version 2 checkpoints at the recorded event-time baseline|bounded quick integrity rejects one-byte prospective capacity overflow|bounded quick integrity checks status once per distinct current profile|bounded quick integrity reads only target projection dependencies|bounded quick integrity accepts legal open-window unchanged null carry)$" dist-test/tests/qualified-checkpoint-quick-integrity.test.js
+node --test --test-concurrency=1 --test-reporter=spec --test-name-pattern="^(bounded quick integrity rejects aggregate transition and checkpoint tampering without ordinal reads|bounded quick integrity resolves frozen version 2 checkpoints at the recorded event-time baseline|bounded quick integrity rejects one-byte prospective capacity overflow|bounded quick integrity checks status once per distinct current profile|bounded quick integrity reads only target projection dependencies|bounded quick integrity accepts legal open-window unchanged null carry|bounded quick integrity verifies a consumer bound to a non-latest report witness)$" dist-test/tests/qualified-checkpoint-quick-integrity.test.js
 ```
 
 Expected: direct child/workflow projections are not yet consumed, a tampered
@@ -1798,8 +1923,10 @@ event_position)`, its one predecessor by stream version when non-genesis, and
 the target/checkpoint/terminal raw events directly. Only a report-consuming
 target may additionally read its partial-unique report-witness row and raw
 report event; require witness event position and stream version before the
-consumer and independently recompute report item-set/witness hashes without
-reading the witness predecessor.
+consumer, pass that exact row to `foldChildEventProjection`, and independently
+recompute report item-set/witness hashes without reading the witness
+predecessor. Resolve by referenced report ID, never by latest report, so an
+arbitrary older report remains valid.
 
 For an open/effective workflow binding read the target row and one predecessor
 by `(project_id, workflow_id, workflow_generation)`, trigger/source events by
@@ -1952,7 +2079,11 @@ project/session/stream version; fold from that child's bounded in-memory prior
 row, compare every field/hash, validate report raw item set/witness/index, then
 advance exactly once. If the peek key precedes the expected key, report an
 orphan/out-of-order row; if it follows or is null, report a missing row. After
-the event cursor ends, any remaining child row is an orphan.
+the event cursor ends, any remaining child row is an orphan. Maintain the same
+bounded per-child report-ID map as preflight: insert each verified report row,
+resolve proposal/disposition/completion to its exact possibly non-latest
+witness, pass it to `foldChildEventProjection`, and pass null for every other
+event.
 
 For every distinct generation-causing workflow event, strict-decode the event
 plus its command-event-0 `lifecycle_intent_json`, build the expected row from
