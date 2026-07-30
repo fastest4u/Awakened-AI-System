@@ -4,17 +4,18 @@
 
 **Goal:** Complete Task 12 by adding schema-fenced, adapter-qualified Version 2 checkpoints and authenticated coverage without changing historical Version 1 bytes or enabling production lifecycle routing.
 
-**Architecture:** Keep Version 1 contracts immutable and introduce strict discriminator-based Version 2 unions. Migration 0003 adds compact authenticated coverage transitions plus bounded session-end freeze metadata; semantic writes remain in one `BEGIN IMMEDIATE` transaction, while checkpoints read only bounded aggregates and full integrity alone replays history. Execute Tasks 12A through 12J in order, with a fresh specification review and code-quality review after each commit.
+**Architecture:** Keep Version 1 contracts immutable and introduce strict discriminator-based Version 2 unions. Migration 0003 adds compact authenticated coverage transitions, bounded session-end freeze metadata, and the two append-only binding-fold slices specified by the approved bounded-projection amendment; semantic writes remain in one `BEGIN IMMEDIATE` transaction, quick integrity performs only fixed-count indexed reads, and full integrity alone replays history with advancing merge cursors. Execute Tasks 12A through 12J in order, with a fresh specification review and code-quality review after each commit.
 
 **Tech Stack:** TypeScript 5.8 strict NodeNext, Node.js 22.22.3 minimum / 24.16.0 recommended, `node:sqlite`, SQLite 3.51.3+, Node core crypto, existing canonical JSON and provider abstractions, native `node:test`, PowerShell-compatible npm scripts.
 
 ## Global Constraints
 
-- This is the normative companion for Task 12 in `docs/superpowers/plans/2026-07-14-root-child-lifecycle-and-checkpoints.md` and implements `docs/superpowers/specs/2026-07-18-qualified-checkpoint-evidence-coverage-design.md`.
+- This is the normative companion for Task 12 in `docs/superpowers/plans/2026-07-14-root-child-lifecycle-and-checkpoints.md` and implements both `docs/superpowers/specs/2026-07-18-qualified-checkpoint-evidence-coverage-design.md` and the approved architecture amendment `docs/superpowers/specs/2026-07-30-bounded-lifecycle-projections-design.md`.
 - Tasks 1 through 11 are complete. Do not redo, squash, or rewrite their commits; extend their public seams compatibly.
 - `LifecycleEventV1`, `decodeLifecycleEventV1`, `CheckpointV1`, `CheckpointDraftV1`, `decodeCheckpointV1`, `decodeCheckpointDraftV1`, and the Version 1 checkpoint fingerprint domain remain byte-compatible.
 - `src/orchestrator/storage/migrations/0002-session-lifecycle.ts` remains byte-for-byte unchanged at SHA-256 `68B4039048A359C523B7842F6D17BAA5760E9760D2B4E9F80BB8A48DC339EB06`.
-- Schema 3 is introduced only by `0003-qualified-checkpoint-coverage`; a schema-2 binary reports `SCHEMA_TOO_NEW` before reading Version 2 lifecycle events.
+- Schema 3 is current and is introduced only by the still-unreleased `0003-qualified-checkpoint-coverage`; edit migration 0003 in place, never add migration 0004 for Task 12, and keep schema-1/bootstrap upgrades passing through schema 2 before the 2-to-3 preflight. A schema-2 binary reports `SCHEMA_TOO_NEW` before reading Version 2 lifecycle events.
+- Schema 3 owns immutable `lifecycle_child_event_folds` and `lifecycle_workflow_generation_folds`. The former has one authenticated row per eligible child-stream event; the latter has one authenticated row per distinct lifecycle workflow generation, including the specified schema-2 same-generation cancel/abandon collapse.
 - The only outer Version 2 lifecycle events are `EvidenceCoverageRecorded`, `SessionCheckpointRecorded`, `SessionEndRequested`, and `SessionEndAmended`, each with its matching strict Version 2 payload. Every other lifecycle event stays outer Version 1.
 - Every adapter session owns an independent ordinal namespace. Never union ordinals across adapters and never pick a representative adapter.
 - Evidence remains coverage-only: `captureMode: "coverage-only"`, `contentRetained: false`, no frame body/reference retention, and no path that satisfies `requireFullEvidence`.
@@ -23,9 +24,9 @@
 - Bounds are lifetime 200 adapters per lifecycle session, 200 missing intervals per adapter, 200 missing intervals across all current adapters, 196,608 canonical UTF-8 bytes for qualified coverage, 262,144 bytes for the enriched checkpoint, and 262,144 bytes for final ending-scope bindings.
 - Capacity checks run before append, provider work where specified, and UUID/ticket/authority mutation. Exact-limit inputs pass; limit-plus-one leaves zero persistent effect.
 - Fresh command ordering is exact replay, identity/append validation, evidence-window gate for evidence commands, bounded quick health, semantic callback, append/postwrites, dedup, commit.
-- Quick integrity is bounded and compares aggregate/transition/event/index sentinels. Full integrity performs one advancing historical replay; no checkpoint path scans immutable ordinal history.
+- Quick integrity is bounded and compares aggregate/transition/event/index sentinels plus direct immutable child-event/workflow-generation rows. It never scans lifecycle/ticket history, walks a projection chain, reads ordinal/frame rows, decodes frames, recomputes coverage HMAC, repairs state, or compares a frozen baseline with current authority. Full integrity performs one advancing historical replay with synchronized event/projection merge cursors.
 - Frozen session-end bindings are checked at their recorded event-time baseline by integrity. Only the three Task 15 freshness gates compare that baseline with current mutable state.
-- All production registration roots remain untouched and lifecycle Version 2 remains disabled after schema 3, codecs, worker seams, and tests exist.
+- The schema-3 writer persists the two projections for existing Version 1 lifecycle writes, but every production registration root remains untouched and lifecycle Version 2 routing/composition remains disabled after schema 3, codecs, worker seams, and tests exist.
 
 ### Per-Task Review Protocol
 
@@ -78,10 +79,17 @@ The required anchor test titles and initial behavioral failures are:
 | 12I | `bounded quick integrity resolves frozen version 2 checkpoints at the recorded event-time baseline` | Recorded-base lookup is absent. |
 | 12I | `bounded quick integrity rejects one-byte prospective capacity overflow` | Capacity recomputation is absent. |
 | 12I | `bounded quick integrity checks status once per distinct current profile` | Distinct-profile status calls are absent. |
+| 12I | `migration 3 seals and verifies both authenticated lifecycle projection stages` | Child-event/workflow-generation TEMP stages and independent hash verification are absent. |
+| 12I | `lifecycle command store writes projections after service postwrites and before dedup` | The store-owned projection-writer hook and atomic ordering are absent. |
+| 12I | `bounded quick integrity reads only target projection dependencies` | Child/event/workflow binding checks still reconstruct data-sized history. |
+| 12I | `bounded quick integrity accepts legal open-window unchanged null carry` | Workflow generation provenance incorrectly requires every generation to replace its draft. |
 | 12J | `full integrity advances each qualified coverage row exactly once` | Advancing replay is absent. |
 | 12J | `full integrity fingerprints each non-zero transition exactly once` | Provider call count is wrong. |
 | 12J | `full integrity reconstructs version 2 checkpoints and frozen snapshots at their historical bases` | Historical reconstruction is absent. |
 | 12J | `full integrity reports unavailable historical keys and never repairs state` | Failure/no-repair behavior is absent. |
+| 12J | `full integrity merge cursors reject missing and orphan child projection rows` | No synchronized event/child-projection merge cursor exists. |
+| 12J | `full integrity merge cursors reject missing and orphan workflow projection rows` | No synchronized generation-event/workflow-projection merge cursor exists. |
+| 12J | `full integrity collapses schema 2 same-generation cancel and abandon once` | Compatibility replay does not perform the exact last-semantic-event collapse and downstream re-fingerprinting. |
 
 ---
 
@@ -94,8 +102,11 @@ The required anchor test titles and initial behavioral failures are:
 | `src/orchestrator/lifecycle/contracts/commands.ts` | V3 command variants for nested V2 checkpoint/end DTOs and versioned internal actions. |
 | `src/orchestrator/lifecycle/contracts/session-end.ts` | V2 request/amendment/window status and strict bounded `FinalEndingScopeBindingV1` codec. |
 | `src/orchestrator/lifecycle/checkpoint-capacity.ts` | Exact capacity-input contracts plus pure conservative checkpoint and ending-scope byte estimators shared by migration and writers. |
-| `src/orchestrator/storage/migrations/0003-qualified-checkpoint-coverage.ts` | Schema-3 aggregate profiles/digest, immutable transitions, workflow freeze fields, guards, and backfill SQL. |
-| `src/orchestrator/storage/qualified-checkpoint-migration-preflight.ts` | Mandatory quiesced schema-2 eligibility plus sealed immutable TEMP staging for one-pass canonical backfill. |
+| `src/orchestrator/storage/migrations/0003-qualified-checkpoint-coverage.ts` | Schema-3 aggregate profiles/digest, immutable transitions, workflow freeze fields, both persistent lifecycle projection slices, SQL guards, and exact-copy backfill SQL. |
+| `src/orchestrator/storage/qualified-checkpoint-migration-preflight.ts` | Mandatory quiesced schema-2 eligibility plus one ascending history pass that builds and independently verifies the sealed freeze/child-event/workflow-generation TEMP stages. |
+| `src/orchestrator/lifecycle/lifecycle-projection-folds.ts` | Pure strict child-event and workflow-generation fold transitions plus the five canonical SHA-256 domains shared by preflight, live writer, quick integrity, and full replay. |
+| `src/orchestrator/storage/lifecycle-projection.repository.ts` | `LifecycleProjectionWriter` implementation, immutable inserts, target/predecessor/source direct reads, and ordered full-integrity cursors for both projection tables. |
+| `src/orchestrator/lifecycle/lifecycle-command.store.ts` | Store-owned projection hook ordered after service `afterAppend` and before dedup inside the existing semantic transaction; replay never invokes it. |
 | `src/orchestrator/storage/evidence-coverage.repository.ts` | Bounded aggregate/transition/ordinal comparison, prepare/persist, snapshots, and capacity reads. |
 | `src/orchestrator/lifecycle/evidence-coverage-accumulator.ts` | Pure canonical rolling-accumulator input and incremental interval logic. |
 | `src/orchestrator/lifecycle/evidence-coverage.service.ts` | Authorized Version 2 evidence recording through the semantic transaction facade. |
@@ -106,8 +117,11 @@ The required anchor test titles and initial behavioral failures are:
 | `src/orchestrator/runtime/worker-integrity-provider-client.ts` | One-in-flight integrity-child status/fingerprint client with exact correlation and transferred-buffer ownership. |
 | `src/orchestrator/runtime/project-store-worker-backend.ts` / `src/workers/project-store.worker.ts` | Provider-owning broker endpoint and child routing; no provider object or raw key crosses `workerData` or messages. |
 | `tests/support/qualified-checkpoint-reference.ts` | Independent V2 checkpoint SHA-256, rolling HMAC, UTF-8 ordering, and byte-budget reference helpers. |
+| `tests/support/lifecycle-projection-reference.ts` | Independent canonical report-set/witness/index, child-fold, and workflow-generation fingerprint reference helpers. |
+| `tests/lifecycle-projection-folds.test.ts` | Pure fold/hash vectors, child transition semantics, and workflow replace/null-carry/schema-2 collapse semantics. |
 | `tests/qualified-checkpoint-contracts.test.ts` | V1 compatibility, V2 strict codecs, fixed vectors, bounds, and intent versioning. |
-| `tests/qualified-checkpoint-migration.test.ts` | Migration 0003 DDL, preflight, backfill, trigger, compatibility, and rollback corpus. |
+| `tests/qualified-checkpoint-migration.test.ts` | Migration 0003 DDL, all three staged counts, authenticated backfill, projection guards/cardinality, schema-2 collapse, compatibility, and rollback corpus. |
+| `tests/lifecycle-command-store.test.ts` | Projection-writer placement, committed-batch equality/order, replay no-op, dedup ordering, and atomic rollback. |
 | `tests/evidence-coverage.test.ts` | Accumulator, provider, interval, overlap, transaction-order, snapshot, and capacity behavior. |
 | `tests/event-integrity.test.ts` | One deferred async integrity transaction, exactly-once extension dispatch, rollback, and synchronous qualified-coverage fail-closed behavior. |
 | `tests/integrity-provider-broker.test.ts` | Strict provider IPC correlation, backend ownership, transfer limits, failure mapping, and zeroization. |
@@ -1476,73 +1490,362 @@ git commit -m "feat: broker lifecycle integrity provider operations"
 ### Task 12I: Prove Bounded Quick Integrity
 
 **Files:**
-- Create: `tests/qualified-checkpoint-quick-integrity.test.ts`
+- Create: `src/orchestrator/lifecycle/lifecycle-projection-folds.ts`
+- Create: `src/orchestrator/storage/lifecycle-projection.repository.ts`
+- Create: `tests/support/lifecycle-projection-reference.ts`
+- Create: `tests/lifecycle-projection-folds.test.ts`
+- Modify: `src/orchestrator/storage/migrations/0003-qualified-checkpoint-coverage.ts`
+- Modify: `src/orchestrator/storage/qualified-checkpoint-migration-preflight.ts`
+- Modify: `src/orchestrator/lifecycle/lifecycle-command.store.ts`
 - Modify: `src/orchestrator/integrity/lifecycle-integrity.service.ts`
+- Modify: `tests/qualified-checkpoint-quick-integrity.test.ts`
+- Modify: `tests/lifecycle-command-store.test.ts`
+- Modify: `tests/lifecycle-command-processor.test.ts`
+- Modify: `tests/child-workflow.test.ts`
+- Modify: `tests/event-append-transaction.test.ts`
 - Modify: `tests/event-integrity.test.ts`
 - Modify: `tests/evidence-coverage.test.ts`
 - Modify: `tests/checkpoint.service.test.ts`
 - Modify: `tests/qualified-checkpoint-migration.test.ts`
+- Modify: `tests/project-store-executor.test.ts`
 
 **Interfaces:**
-- Consumes: Task 12G async orchestration, Task 12H brokered status port, strict event/checkpoint/binding codecs, aggregate/latest-transition/event/index rows, direct historical checkpoint lookup, and event-time transition snapshots.
-- Produces: Bounded quick health usable before fresh commands; no ordinal scan, frame decode, HMAC replay, repair, or comparison of frozen baselines with current mutable authority.
+- Consumes: Task 12G async orchestration, Task 12H brokered status port, `EventAppendBatch<T>`, `LifecycleCommandTransaction`, `decodeLifecycleEventV1`/the strict V1/V2 dispatcher, `decodeLifecycleIntentWitness`, direct historical checkpoint/coverage-transition/ticket reads, and the approved projection amendment.
+- Produces: `ChildEventFoldProjection`, `WorkflowGenerationFoldProjection`, five pure canonical hash functions, two strict pure fold functions, and a store-owned `LifecycleProjectionWriter.append<T extends JsonValue>(committed: EventAppendBatch<T>, transaction: LifecycleCommandTransaction): void`.
+- Produces: `SqliteLifecycleProjectionRepository` direct methods `findChildAtEvent`, `findChildByStreamVersion`, `findReportWitness`, `findWorkflowGeneration`, and `findWorkflowPredecessor`; every method returns zero/one strict row and uses the table primary/unique indexes.
+- Produces: bounded quick health usable before fresh commands; no lifecycle/ticket history scan, projection-chain walk, ordinal/frame read, HMAC replay, repair, or comparison of frozen baselines with current mutable authority.
 
-- [ ] **Step 1: Write failing bounded quick-integrity tests**
+Task 12I already contains reviewed committed quick-integrity work plus the
+in-progress canonical top-level evidence and transfer-ticket provenance fixes
+in `lifecycle-integrity.service.ts` and
+`qualified-checkpoint-quick-integrity.test.ts`. Preserve those implementations
+and tests. Extend them in place; do not recreate, replace wholesale, or discard
+either file while adding the projection-backed path.
 
-Use the exact anchor titles `bounded quick integrity rejects aggregate
-transition and checkpoint tampering without ordinal reads`, `bounded quick
-integrity resolves frozen version 2 checkpoints at the recorded event-time
-baseline`, `bounded quick integrity rejects one-byte prospective capacity
-overflow`, and `bounded quick integrity checks status once per distinct current
-profile`. After valid commits, tamper each aggregate/profile/digest/interval,
-latest transition/event, checkpoint body/index/hash/version, frozen group,
-ticket/direct-position binding, and open-window shape independently. Instrument
-zero ordinal/frame reads. Advance a child's coverage legally after freezing,
-then tamper only its transition at the frozen base.
+- [ ] **Step 1: Add independent projection references and migration RED tests**
 
-- [ ] **Step 2: Run the deterministic RED quick-integrity gate**
+Create `tests/support/lifecycle-projection-reference.ts` without importing
+production hash/fold helpers. Encode lowercase SHA-256 as
+`UTF8(domain-with-final-LF) || UTF8(canonicalJson(tuple))`, UTF-8-byte-sort
+`allReportItemIds`, and expose independent helpers for report item set,
+report witness, report index genesis/advance, child row, and workflow row.
+Use exact domains and tuples from the approved amendment.
 
-Follow the global compile/scaffold protocol, then run:
+In `tests/lifecycle-projection-folds.test.ts` and
+`tests/qualified-checkpoint-migration.test.ts`, add exact anchors:
+
+- `migration 3 seals and verifies both authenticated lifecycle projection stages`;
+- `migration 3 enforces immutable child-event projection identity and adjacency`;
+- `migration 3 enforces immutable workflow-generation provenance and adjacency`;
+- `migration 3 collapses schema 2 cancel and abandon at the same generation`;
+- `projection folds match independent canonical vectors and null-carry semantics`.
+
+Raw-SQL cases must exercise every CHECK/FK/index, project/session/stream/type
+source guard, child genesis/non-genesis predecessor, stream-version adjacency,
+report partial uniqueness, report/checkpoint/terminal source linkage,
+workflow trigger/source plus command-event-0 intent linkage, immutable
+update/delete triggers, three stage counts, missing strict draft source,
+tampered sealed-stage fingerprint, and exact schema-2 rollback.
+
+- [ ] **Step 2: Compile the scaffold and record the migration RED**
+
+Follow the global compile/scaffold rule. If imports are absent, add only typed
+exports whose bodies throw `NOT_IMPLEMENTED`, then run:
 
 ```powershell
 npm run test:build
-if ($LASTEXITCODE -ne 0) { throw "Task 12I consumes established seams and must compile before behavioral RED" }
-node --test --test-concurrency=1 --test-reporter=spec --test-name-pattern="^(bounded quick integrity rejects aggregate transition and checkpoint tampering without ordinal reads|bounded quick integrity resolves frozen version 2 checkpoints at the recorded event-time baseline|bounded quick integrity rejects one-byte prospective capacity overflow|bounded quick integrity checks status once per distinct current profile)$" dist-test/tests/qualified-checkpoint-quick-integrity.test.js
+if ($LASTEXITCODE -ne 0) { throw "Task 12I projection tests must compile before behavioral RED" }
+node --test --test-concurrency=1 --test-reporter=spec --test-name-pattern="^(migration 3 seals and verifies both authenticated lifecycle projection stages|migration 3 enforces immutable child-event projection identity and adjacency|migration 3 enforces immutable workflow-generation provenance and adjacency|migration 3 collapses schema 2 cancel and abandon at the same generation|projection folds match independent canonical vectors and null-carry semantics)$" dist-test/tests/lifecycle-projection-folds.test.js dist-test/tests/qualified-checkpoint-migration.test.js
 ```
 
-Expected: aggregate/transition linkage, recorded-base resolution, capacity
-recomputation, or distinct-profile status checks are absent.
+Expected: the two tables, sealed stages, pure hashes/folds, compatibility
+collapse, or insert/immutability guards are absent; each named test executes
+against the newly built artifacts and fails for that exact behavior.
 
-- [ ] **Step 3: Implement bounded structural and event-time checks**
+- [ ] **Step 3: Implement exact pure hashes and fold transitions**
 
-Validate adapter/interval/byte counts, the storage `-1` sentinel, fixed
-profiles, aggregate equality with indexed latest transition/event metadata,
-checkpoint body/index/domain, and frozen bindings resolved by stored global
-positions. Recompute both pure capacity estimates from current quick-healthy
-coverage plus policy-derived prospective ending scope. For each frozen V2
-child/ticket checkpoint use
-`SessionAuthorityRepository.requireCheckpointAtEventPosition` and
-`EvidenceCoverageRepository.snapshotFromTransitionsV2(connection,
-childSessionId, checkpointBaseEventPosition)`; compare with the immutable
-transition projection at that base, never current aggregate. A referenced V1
-checkpoint requires an event-time clean scope. Async quick calls status once
-per distinct current profile. Do not recompute HMAC, scan ordinals, decode
-frames, or compare frozen groups with current mutable folds/latest indexes.
+Create `lifecycle-projection-folds.ts` with immutable record types and these
+exact exports:
 
-- [ ] **Step 4: Run the GREEN quick-integrity gate**
+```ts
+export function reportItemSetFingerprint(input: {
+  projectId: string; childSessionId: string; reportId: string;
+  allReportItemIds: readonly string[];
+}): string;
+export function reportWitnessFingerprint(row: Pick<
+  ChildEventFoldProjection,
+  "projectId" | "childSessionId" | "eventPosition" | "streamVersion"
+  | "reportedReportId" | "reportedItemCount" | "reportedItemSetFingerprint"
+>): string;
+export function reportIndexGenesisFingerprint(
+  projectId: string, childSessionId: string,
+): string;
+export function advanceReportIndexFingerprint(input: {
+  projectId: string; childSessionId: string; reportCount: number;
+  latestReportId: string; previousReportIndexFingerprint: string;
+  reportWitnessFingerprint: string;
+}): string;
+export function childEventFoldFingerprint(
+  row: Omit<ChildEventFoldProjection, "fingerprint">,
+): string;
+export function workflowGenerationFingerprint(
+  row: Omit<WorkflowGenerationFoldProjection, "fingerprint">,
+): string;
+export function foldChildEventProjection(
+  previous: ChildEventFoldProjection | null,
+  event: StoredEvent,
+): ChildEventFoldProjection;
+export function foldWorkflowGenerationProjection(
+  previous: WorkflowGenerationFoldProjection | null,
+  trigger: StoredEvent,
+  intent: LifecycleIntentWitnessV1,
+  compatibilityMode: "live-schema-3" | "schema-2-preflight",
+): WorkflowGenerationFoldProjection;
+```
+
+Use canonical unsigned decimal strings for every position/generation/version
+hash member. `foldChildEventProjection` implements the exact
+`SessionForked`, `ChildWorkReported`, `ChildCompletionProposed`,
+`ChildWorkDispositioned`, `ChildSessionCompleted`, `ChildSessionSuspended`,
+`ChildWorkTransferCreated`, `SessionCheckpointRecorded`,
+`EvidenceCoverageRecorded`, `ChildAssignmentAmended`, and
+`ChildWorkTransferClaimed` rules from the amendment. A report consumer requires
+the exact witnessed report/item-set; a rejected/requests-more-work disposition
+of the proposed completion report returns to `active`. Non-report events carry
+the report triple as null while preserving the report-index state.
+
+`foldWorkflowGenerationProjection` implements replace-or-carry for request,
+reopen, amendment `open`/`seal`/`unchanged`, cancel, and abandon. A null
+amendment carries `effectiveCheckpointVersion` and
+`effectiveDraftSourceEventPosition`; `open` requires a V2 replacement and
+source equal to trigger. Live cancel/abandon advances generation. Only
+schema-2 preflight may collapse a same-generation cancel/abandon to the last
+generation-semantic event before re-fingerprinting the downstream chain.
+
+- [ ] **Step 4: Extend migration 0003 and the single-pass preflight**
+
+In `qualified-checkpoint-migration-preflight.ts`, retain the existing freeze
+table as `qualified_checkpoint_v3_stage_rows` and add constants for:
+
+```ts
+export const QUALIFIED_CHECKPOINT_STAGE_CHILD_EVENT_FOLDS_TABLE =
+  "qualified_checkpoint_v3_stage_child_event_folds";
+export const QUALIFIED_CHECKPOINT_STAGE_WORKFLOW_GENERATION_FOLDS_TABLE =
+  "qualified_checkpoint_v3_stage_workflow_generation_folds";
+```
+
+Replace the TEMP marker's `staged_row_count` with
+`freeze_row_count`, `child_fold_row_count`, and
+`workflow_generation_row_count`. One ascending `global_position` pass must
+strict-decode each lifecycle event and its indexed command-event-0 intent,
+build all existing freeze rows plus both projection arrays with the pure
+functions, collapse only schema-2 same-generation cancel/abandon, compute all
+hashes before sealing, then install INSERT/UPDATE/DELETE denial triggers on
+the marker and all three TEMP tables.
+
+`assertQualifiedCheckpointMigrationStage` must re-read the sealed rows,
+independently invoke the pure hash/fold functions, compare every field/hash and
+all three counts, and reject mutation before migration SQL executes. It must
+not trust the stage creator's in-memory arrays.
+
+Extend migration 0003 with the two persistent STRICT tables, indexes, and
+immutable triggers exactly as the approved DDL. The migration SQL performs no
+SHA/UDF work. Its stage handoff has this shape:
+
+```sql
+SELECT CASE WHEN
+  marker.source_schema_version = 2
+  AND marker.target_schema_version = 3
+  AND marker.freeze_row_count =
+      (SELECT count(*) FROM qualified_checkpoint_v3_stage_rows)
+  AND marker.child_fold_row_count =
+      (SELECT count(*) FROM qualified_checkpoint_v3_stage_child_event_folds)
+  AND marker.workflow_generation_row_count =
+      (SELECT count(*) FROM qualified_checkpoint_v3_stage_workflow_generation_folds)
+  AND marker.sealed = 1
+THEN 1 ELSE RAISE(ABORT, 'MIGRATION_EVIDENCE_V2_PRECONDITION_FAILED') END
+FROM qualified_checkpoint_v3_stage_marker AS marker;
+```
+
+Verify strict cardinality/linkage and exact-copy equality, insert both stages
+once, then drop all stage triggers/tables/marker. Preserve migration 0002
+byte-for-byte.
+
+- [ ] **Step 5: Run projection migration GREEN and commit the schema/fold unit**
 
 ```powershell
 npm run test:build
-node --test --test-concurrency=1 --test-reporter=spec dist-test/tests/qualified-checkpoint-quick-integrity.test.js dist-test/tests/event-integrity.test.js dist-test/tests/evidence-coverage.test.js dist-test/tests/checkpoint.service.test.js dist-test/tests/qualified-checkpoint-migration.test.js
+node --test --test-concurrency=1 --test-reporter=spec dist-test/tests/lifecycle-projection-folds.test.js dist-test/tests/qualified-checkpoint-migration.test.js dist-test/tests/project-store-upgrade.test.js dist-test/tests/project-store-bootstrap.test.js
 npm run typecheck
+git diff --check
+git add src/orchestrator/lifecycle/lifecycle-projection-folds.ts src/orchestrator/storage/migrations/0003-qualified-checkpoint-coverage.ts src/orchestrator/storage/qualified-checkpoint-migration-preflight.ts tests/support/lifecycle-projection-reference.ts tests/lifecycle-projection-folds.test.ts tests/qualified-checkpoint-migration.test.ts
+git commit -m "feat: stage immutable lifecycle projections"
 ```
 
-- [ ] **Step 5: Commit Task 12I and run both per-task reviews**
+- [ ] **Step 6: Write store-owned writer and atomic-order RED tests**
+
+Add exact anchors:
+
+- `lifecycle command store writes projections after service postwrites and before dedup`;
+- `lifecycle projection writer processes a multi-event batch in ascending position`;
+- `lifecycle command replay performs no projection write`;
+- `lifecycle projection failure rolls back events service state and dedup atomically`;
+- `schema 3 projects existing version 1 lifecycle writes while version 2 routing stays disabled`.
+
+Recording collaborators must prove the order
+`beforeAppend → append → service afterAppend → projection append → dedup →
+commit`. SQL integration cases must cover every eligible child event and every
+generation-causing event, including legal `unchanged` null carry. A replay
+must record zero projection/repository calls. The disabled-routing case uses
+the production worker/backend composition and asserts `LIFECYCLE_V2_DISABLED`
+with zero event/dedup/workflow effect.
+
+- [ ] **Step 7: Compile and record the writer RED**
 
 ```powershell
-git add src/orchestrator/integrity/lifecycle-integrity.service.ts tests/qualified-checkpoint-quick-integrity.test.ts tests/event-integrity.test.ts tests/evidence-coverage.test.ts tests/checkpoint.service.test.ts tests/qualified-checkpoint-migration.test.ts
+npm run test:build
+if ($LASTEXITCODE -ne 0) { throw "Task 12I writer tests must compile before behavioral RED" }
+node --test --test-concurrency=1 --test-reporter=spec --test-name-pattern="^(lifecycle command store writes projections after service postwrites and before dedup|lifecycle projection writer processes a multi-event batch in ascending position|lifecycle command replay performs no projection write|lifecycle projection failure rolls back events service state and dedup atomically|schema 3 projects existing version 1 lifecycle writes while version 2 routing stays disabled)$" dist-test/tests/lifecycle-command-store.test.js dist-test/tests/event-append-transaction.test.js dist-test/tests/project-store-executor.test.js
+```
+
+Expected: `LifecycleProjectionWriter`/repository or the post-service/pre-dedup
+hook is absent, replay invokes an incorrectly placed hook, failure is not
+atomic, or schema 3 changes disabled production routing.
+
+- [ ] **Step 8: Implement immutable persistence and central hook**
+
+Create `lifecycle-projection.repository.ts`. Its
+`SqliteLifecycleProjectionRepository` implements
+`LifecycleProjectionWriter`; it owns the same connection as the command store,
+sorts/validates the immutable committed batch by `globalPosition`, loads only
+the immediately preceding child stream-version/workflow generation row, calls
+the pure fold, and inserts the exact new row. It strict-decodes
+`event.lifecycleIntentJson` only on command event zero and rejects any trigger,
+source, identity, adjacency, or committed-batch mismatch as
+`INTEGRITY_FAILURE`.
+
+Add a required `projectionWriter: LifecycleProjectionWriter` own data property
+to `LifecycleCommandStoreOptions`. Pass the focused transaction to it exactly
+once:
+
+```ts
+invokeSynchronousTransactionCallback(focused, (transaction) =>
+  next.afterAppend(immutableBatchSnapshot(committed), transaction),
+  undefinedCallbackResult);
+assertBatchUnchanged(committed, committedFingerprint);
+invokeSynchronousTransactionCallback(focused, (transaction) =>
+  this.#projectionWriter.append(immutableBatchSnapshot(committed), transaction),
+  undefinedCallbackResult);
+assertBatchUnchanged(committed, committedFingerprint);
+this.#events.insertDedup(prepared, committed, next.authorizationRecord);
+```
+
+Update every Task-12 store fixture in
+`lifecycle-command-store.test.ts`, `lifecycle-command-processor.test.ts`,
+`child-workflow.test.ts`, `checkpoint.service.test.ts`,
+`evidence-coverage.test.ts`, and `event-append-transaction.test.ts`: migrated
+SQLite fixtures receive a real `SqliteLifecycleProjectionRepository`; isolated
+ordering fixtures receive an explicit recording writer. No hidden no-op
+default is allowed in a production-capable store.
+
+- [ ] **Step 9: Run writer GREEN and commit the persistence unit**
+
+```powershell
+npm run test:build
+node --test --test-concurrency=1 --test-reporter=spec dist-test/tests/lifecycle-command-store.test.js dist-test/tests/lifecycle-command-processor.test.js dist-test/tests/child-workflow.test.js dist-test/tests/checkpoint.service.test.js dist-test/tests/evidence-coverage.test.js dist-test/tests/event-append-transaction.test.js dist-test/tests/project-store-executor.test.js
+npm run typecheck
+git diff --check
+git add src/orchestrator/storage/lifecycle-projection.repository.ts src/orchestrator/lifecycle/lifecycle-command.store.ts tests/lifecycle-command-store.test.ts tests/lifecycle-command-processor.test.ts tests/child-workflow.test.ts tests/checkpoint.service.test.ts tests/evidence-coverage.test.ts tests/event-append-transaction.test.ts tests/project-store-executor.test.ts
+git commit -m "feat: persist immutable lifecycle projections"
+```
+
+- [ ] **Step 10: Extend the existing quick-integrity tests with bounded projection RED cases**
+
+Preserve the four original exact anchors and their existing canonical evidence,
+ticket-row, and claimed-event provenance coverage. Add exact anchors
+`bounded quick integrity reads only target projection dependencies` and
+`bounded quick integrity accepts legal open-window unchanged null carry`.
+
+After valid writes, tamper every child/workflow field, previous/current hash,
+project/session/stream/generation, trigger/source event, command-event-0
+intent, checkpoint/terminal/report source, report item-set/witness, and carry
+field independently. Cover legal later child/workflow evolution after a frozen
+binding, report consumer witness ordering, raw report hash recomputation
+without reading that witness row's predecessor, and open-window `unchanged`
+with null replacement carrying the earlier V2 source. Instrument query classes
+and fail on any lifecycle/ticket history scan, predecessor walk beyond the
+target's one predecessor, ordinal/frame read, frame decode, HMAC call, repair,
+or current-vs-frozen comparison.
+
+- [ ] **Step 11: Compile and record the bounded projection RED**
+
+```powershell
+npm run test:build
+if ($LASTEXITCODE -ne 0) { throw "Task 12I quick tests must compile before behavioral RED" }
+node --test --test-concurrency=1 --test-reporter=spec --test-name-pattern="^(bounded quick integrity rejects aggregate transition and checkpoint tampering without ordinal reads|bounded quick integrity resolves frozen version 2 checkpoints at the recorded event-time baseline|bounded quick integrity rejects one-byte prospective capacity overflow|bounded quick integrity checks status once per distinct current profile|bounded quick integrity reads only target projection dependencies|bounded quick integrity accepts legal open-window unchanged null carry)$" dist-test/tests/qualified-checkpoint-quick-integrity.test.js
+```
+
+Expected: direct child/workflow projections are not yet consumed, a tampered
+projection/source is accepted, legal later evolution/null carry is rejected,
+or instrumentation observes a data-sized reconstruction.
+
+- [ ] **Step 12: Replace historical reconstruction with fixed-count direct reads**
+
+Keep the already implemented aggregate/coverage/checkpoint/capacity/status and
+canonical top-level evidence/ticket checks. For each frozen child binding read
+the target child projection by `(project_id, child_session_id,
+event_position)`, its one predecessor by stream version when non-genesis, and
+the target/checkpoint/terminal raw events directly. Only a report-consuming
+target may additionally read its partial-unique report-witness row and raw
+report event; require witness event position and stream version before the
+consumer and independently recompute report item-set/witness hashes without
+reading the witness predecessor.
+
+For an open/effective workflow binding read the target row and one predecessor
+by `(project_id, workflow_id, workflow_generation)`, trigger/source events by
+global position, and trigger command event zero by the existing
+`(project_id, command_id, command_event_index)` index. Strict-decode event plus
+intent and recompute target/predecessor hash, replace-or-carry, window, root
+command, source, generation, and session/workflow identity.
+
+Use direct checkpoint and coverage-transition-by-base queries and direct
+immutable transfer-ticket ID/created-position lookup. Map missing, malformed,
+cross-identity, non-adjacent, bad-hash, bad-carry, or bad-event/source/intent
+projection to `INTEGRITY_FAILURE`; coverage accumulator/content mismatch stays
+`SESSION_EVIDENCE_COVERAGE_MISMATCH`; historical key absence stays
+`EVIDENCE_HISTORICAL_KEY_UNAVAILABLE`. Quick cannot and must not search for an
+arbitrary orphan projection row.
+
+- [ ] **Step 13: Run Task 12I GREEN, protected assertions, and exact-file commit**
+
+```powershell
+npm run test:build
+node --test --test-concurrency=1 --test-reporter=spec dist-test/tests/qualified-checkpoint-contracts.test.js dist-test/tests/qualified-checkpoint-migration.test.js dist-test/tests/lifecycle-projection-folds.test.js dist-test/tests/evidence-coverage.test.js dist-test/tests/checkpoint.service.test.js dist-test/tests/lifecycle-command-store.test.js dist-test/tests/lifecycle-command-processor.test.js dist-test/tests/child-workflow.test.js dist-test/tests/qualified-checkpoint-quick-integrity.test.js dist-test/tests/event-integrity.test.js dist-test/tests/event-append-transaction.test.js dist-test/tests/project-store-executor.test.js
+npm run typecheck
+$hash = (Get-FileHash -Algorithm SHA256 src/orchestrator/storage/migrations/0002-session-lifecycle.ts).Hash
+if ($hash -ne "68B4039048A359C523B7842F6D17BAA5760E9760D2B4E9F80BB8A48DC339EB06") { throw "migration 0002 changed" }
+$enabledRoute = rg -n 'type:\s*"lifecycle"|lifecycleRuntimeFactory' src/orchestrator/runtime src/workers
+if ($LASTEXITCODE -eq 0) { throw "Task 12 must not register a lifecycle worker route" }
+if ($LASTEXITCODE -ne 1) { throw "production-disabled assertion failed to run" }
+git diff --check
+git add src/orchestrator/integrity/lifecycle-integrity.service.ts tests/qualified-checkpoint-quick-integrity.test.ts tests/event-integrity.test.ts
 git commit -m "feat: verify bounded qualified checkpoint integrity"
 ```
+
+The final `git add` deliberately includes the two preserved Task12I WIP files
+only after their extended GREEN gate. Before committing, inspect
+`git diff --cached --name-only`; it must contain exactly the files named by the
+current coherent commit and never `.superpowers`.
+
+- [ ] **Step 14: Run both Task 12I reviews and the fix loop**
+
+Record the Task12I BASE before the first projection commit and HEAD after the
+quick-integrity commit. Invoke `superpowers:requesting-code-review` twice on
+that complete BASE..HEAD range: first for both approved specs, then with a fresh
+reviewer for implementation quality/security. For every Critical/Important
+finding, add a focused failing test, run its named RED, fix through the same
+files/owners above, rerun Step 13, commit the fix, and repeat both reviews
+against the corrected HEAD.
 
 ---
 
@@ -1550,8 +1853,11 @@ git commit -m "feat: verify bounded qualified checkpoint integrity"
 
 **Files:**
 - Create: `tests/qualified-checkpoint-full-integrity.test.ts`
+- Modify: `src/orchestrator/lifecycle/lifecycle-projection-folds.ts`
+- Modify: `src/orchestrator/storage/lifecycle-projection.repository.ts`
 - Modify: `src/orchestrator/integrity/lifecycle-integrity.service.ts`
 - Modify: `src/orchestrator/integrity/event-integrity.service.ts`
+- Modify: `tests/support/lifecycle-projection-reference.ts`
 - Modify: `tests/support/lifecycle-authority-reference.ts`
 - Modify: `tests/event-integrity.test.ts`
 - Modify: `tests/evidence-coverage.test.ts`
@@ -1559,8 +1865,9 @@ git commit -m "feat: verify bounded qualified checkpoint integrity"
 - Modify: `tests/qualified-checkpoint-migration.test.ts`
 
 **Interfaces:**
-- Consumes: Task 12G async orchestration, Task 12H brokered status/fingerprint port, and Task 12I structural checks.
-- Produces: One advancing authenticated full replay, exact typed provider/mismatch failures, complexity evidence, and no repair behavior.
+- Consumes: Task 12G async orchestration, Task 12H brokered status/fingerprint port, Task 12I pure projection folds/direct repository, strict lifecycle event/intent codecs, and the existing advancing coverage transition/ordinal cursors.
+- Produces: one ascending global event replay plus synchronized child-projection and workflow-generation-projection merge cursors; every event, projection, report witness/index advance, coverage transition/ordinal, checkpoint, and ending witness is consumed at most once.
+- Produces: exact typed provider/mismatch failures, measured visit counts linear in source rows, full-only orphan/extra detection, schema-2 compatibility collapse, and no repair behavior.
 
 - [ ] **Step 1: Write failing replay, complexity, and failure-mapping tests**
 
@@ -1568,18 +1875,32 @@ Use the exact anchor titles `full integrity advances each qualified coverage row
 exactly once`, `full integrity fingerprints each non-zero transition exactly
 once`, `full integrity reconstructs version 2 checkpoints and frozen snapshots
 at their historical bases`, and `full integrity reports unavailable historical
-keys and never repairs state`. Cover first/mixed/gap-fill/zero-new histories,
-overlap, all global bounds, accumulator/transition/ordinal/event tampering, V1
-after prior coverage, migration-backfill equivalence, and later legal evolution.
-Also replay Version 2 request/amendment window actions, generation increments,
-final-freeze, unchanged-preserve, cancel-clear, cancelled-row reopen, frozen
-groups, and validation/pass/completion freshness witnesses. Reconstruct every
-historical ending baseline from checkpoint summaries, event-time child folds,
-transfer events/tickets, and directly bound child checkpoint positions; prove
-later legal work/coverage does not corrupt that baseline.
-Instrument visits and provider calls: status once per distinct recorded profile,
-fingerprint once per non-zero-new transition, none for zero-new, no prefix
-rescan/quadratic work.
+keys and never repairs state`. Add exact anchors `full integrity merge cursors
+reject missing and orphan child projection rows`, `full integrity merge cursors
+reject missing and orphan workflow projection rows`, and `full integrity
+collapses schema 2 same-generation cancel and abandon once`.
+
+Cover first/mixed/gap-fill/zero-new histories, overlap, all global bounds,
+accumulator/transition/ordinal/event tampering, V1 after prior coverage,
+migration-backfill equivalence, and later legal evolution. For child
+projections, cover every eligible event, report item-set/witness/index link,
+completion/disposition reset, checkpoint/terminal carry, missing expected row,
+out-of-order row, and trailing orphan. For workflow projections, cover request,
+replacement/null amendment, open → unchanged-null-carry → seal, cancel,
+cancelled-row reopen, abandon, wrong trigger/source/intent, missing expected
+row, out-of-order row, and trailing orphan.
+
+Build a schema-2 history where cancel and ending-abandon share a generation
+with the preceding strict request/amend/reopen. Assert exactly one expected
+workflow row for that generation, trigger/root command/window from the last
+semantic event, null replacement, effective version/source carried from the
+strict draft event, and downstream fingerprints recomputed once.
+
+Instrument every cursor/repository/provider class. Assert one global event
+visit per row, one child/workflow projection visit per row, one coverage
+transition/ordinal visit per row, status once per distinct recorded profile,
+fingerprint once per non-zero-new transition, zero for zero-new, and no prefix
+rescan.
 
 - [ ] **Step 2: Run the deterministic RED full-integrity gate**
 
@@ -1588,32 +1909,130 @@ Follow the global compile/scaffold protocol, then run:
 ```powershell
 npm run test:build
 if ($LASTEXITCODE -ne 0) { throw "Task 12J consumes established seams and must compile before behavioral RED" }
-node --test --test-concurrency=1 --test-reporter=spec --test-name-pattern="^(full integrity advances each qualified coverage row exactly once|full integrity fingerprints each non-zero transition exactly once|full integrity reconstructs version 2 checkpoints and frozen snapshots at their historical bases|full integrity reports unavailable historical keys and never repairs state)$" dist-test/tests/qualified-checkpoint-full-integrity.test.js
+node --test --test-concurrency=1 --test-reporter=spec --test-name-pattern="^(full integrity advances each qualified coverage row exactly once|full integrity fingerprints each non-zero transition exactly once|full integrity reconstructs version 2 checkpoints and frozen snapshots at their historical bases|full integrity reports unavailable historical keys and never repairs state|full integrity merge cursors reject missing and orphan child projection rows|full integrity merge cursors reject missing and orphan workflow projection rows|full integrity collapses schema 2 same-generation cancel and abandon once)$" dist-test/tests/qualified-checkpoint-full-integrity.test.js
 ```
 
 Expected: no advancing authenticated replay exists, visit/provider counts are
-not linear, snapshots use mutable state, or failures/repair behavior are wrong.
+not linear, a missing/orphan projection escapes detection, compatibility
+collapse is wrong, snapshots use mutable state, or failures/repair behavior
+are wrong.
 
-- [ ] **Step 3: Implement one advancing replay and exact failures**
+- [ ] **Step 3: Add strict ordered projection cursors**
 
-Walk ordered lifecycle/evidence events, compact transitions, ordinal rows,
-checkpoints, workflow generations/window/freeze transitions, validation and
-completion witnesses, ending bindings, child folds, and tickets once. Maintain bounded maps/cursors, determine
-genuinely new frames per event, reproduce each accumulator after historical key
-status, advance intervals with bigint adjacency, reconstruct each V2 snapshot
-at its base, and compare the complete immutable tuple using writer domains
-exactly. Reproduce every `open`/`seal`/`unchanged`, final-freeze,
-cancel-clear, and cancelled-row reopen state transition, and prove each
-validation/pass/completion witness against its historical frozen group without
-comparing it to later mutable state. Reconstruct canonical ending-scope binding
-JSON from the same historical child/ticket/checkpoint sources used by migration
-preflight. The measured complexity is
-`O(lifecycleEvents + eventFrameEntries + immutableOrdinalRows + transitions + checkpoints + endingScopeBindings + transferTickets)`.
+Extend `SqliteLifecycleProjectionRepository` with:
+
+```ts
+export interface ChildEventFoldCursor {
+  peek(): ChildEventFoldProjection | null;
+  advance(): ChildEventFoldProjection;
+}
+export interface WorkflowGenerationFoldCursor {
+  peek(): WorkflowGenerationFoldProjection | null;
+  advance(): WorkflowGenerationFoldProjection;
+}
+export function openChildEventFoldCursor(
+  connection: SqliteConnection, projectId: string,
+): ChildEventFoldCursor;
+export function openWorkflowGenerationFoldCursor(
+  connection: SqliteConnection, projectId: string,
+): WorkflowGenerationFoldCursor;
+```
+
+The child query order is `(event_position, child_session_id, stream_version)`;
+the workflow query order is
+`(trigger_event_position, workflow_id, workflow_generation)`. Each cursor
+prepares/executes one ordered statement and only advances; it provides no
+rewind, per-event query, prefix query, or repair method.
+
+- [ ] **Step 4: Implement one global event replay with synchronized merges**
+
+Advance one existing global-position event cursor. When an eligible child event
+is decoded, require `childCursor.peek()` to have the exact event position,
+project/session/stream version; fold from that child's bounded in-memory prior
+row, compare every field/hash, validate report raw item set/witness/index, then
+advance exactly once. If the peek key precedes the expected key, report an
+orphan/out-of-order row; if it follows or is null, report a missing row. After
+the event cursor ends, any remaining child row is an orphan.
+
+For every distinct generation-causing workflow event, strict-decode the event
+plus its command-event-0 `lifecycle_intent_json`, build the expected row from
+the workflow's bounded prior row, compare the workflow cursor key/tuple/hash,
+and advance exactly once. In schema-2 compatibility mode, buffer only the
+current generation's strict draft candidate and replace it with a same-
+generation cancel/abandon when encountered; emit/compare that generation once
+when the next generation/workflow/end-of-stream proves the group closed, then
+recompute all successor fingerprints from the collapsed row. Live schema 3
+never accepts same-generation cancel/abandon. A leftover workflow row is an
+orphan.
+
+In the same event pass, advance compact coverage transition and ordinal
+cursors, checkpoints, workflow freeze/window state, validation/completion
+witnesses, ending bindings, and tickets once. Maintain only per-stream/per-
+workflow current folds plus bounded protocol maps, determine genuinely new
+frames per event, reproduce each accumulator after historical key status,
+advance intervals with bigint adjacency, reconstruct each V2 snapshot at its
+base, and compare complete immutable tuples using the writer's exact domains.
+Reproduce `open`/`seal`/`unchanged`, final-freeze, cancel-clear, cancelled-row
+reopen, and each validation/pass/completion witness against its historical
+frozen group without comparing later mutable state.
+
+Reconstruct canonical ending-scope binding JSON from the same historical
+child/ticket/checkpoint sources as preflight. The measured complexity is:
+
+```text
+O(lifecycleEvents
+  + childProjectionRows
+  + workflowProjectionRows
+  + eventFrameEntries
+  + immutableOrdinalRows
+  + coverageTransitions
+  + checkpoints
+  + endingScopeBindings
+  + transferTickets)
+```
+
+No prefix is rescanned, and report-index/projection chains are advanced rather
+than queried from genesis for each consumer.
+
+- [ ] **Step 5: Preserve exact error mapping and prohibit repair**
+
 Return `EVIDENCE_HISTORICAL_KEY_UNAVAILABLE` for unavailable key
 material, `SESSION_EVIDENCE_COVERAGE_MISMATCH` for authenticated mismatch, and
-`INTEGRITY_FAILURE` at the existing corruption boundary. Never rewrite state.
+`INTEGRITY_FAILURE` for every event/projection/source/intent/cursor mismatch,
+including missing and orphan rows. Do not collapse a coverage mismatch into
+generic integrity failure. Do not map legal later evolution to
+`SESSION_END_COVERAGE_CHANGED`; that code belongs only to the Task 15 fresh
+final gates. Full replay opens no write transaction and never inserts, updates,
+deletes, rebuilds, or repairs any row.
 
-- [ ] **Step 4: Run the GREEN full-integrity and Task-12 exit gates**
+- [ ] **Step 6: Run focused Task 12J GREEN**
+
+```powershell
+npm run test:build
+node --test --test-concurrency=1 --test-reporter=spec dist-test/tests/qualified-checkpoint-full-integrity.test.js dist-test/tests/qualified-checkpoint-quick-integrity.test.js dist-test/tests/event-integrity.test.js dist-test/tests/evidence-coverage.test.js dist-test/tests/checkpoint.service.test.js dist-test/tests/qualified-checkpoint-migration.test.js dist-test/tests/lifecycle-projection-folds.test.js
+npm run typecheck
+```
+
+- [ ] **Step 7: Commit Task 12J**
+
+```powershell
+git add src/orchestrator/lifecycle/lifecycle-projection-folds.ts src/orchestrator/storage/lifecycle-projection.repository.ts src/orchestrator/integrity/lifecycle-integrity.service.ts src/orchestrator/integrity/event-integrity.service.ts tests/support/lifecycle-projection-reference.ts tests/support/lifecycle-authority-reference.ts tests/qualified-checkpoint-full-integrity.test.ts tests/event-integrity.test.ts tests/evidence-coverage.test.ts tests/checkpoint.service.test.ts tests/qualified-checkpoint-migration.test.ts
+git diff --cached --name-only
+git commit -m "feat: replay qualified checkpoint integrity"
+```
+
+The staged-name inspection must match the files actually changed by Task 12J
+and must never include `.superpowers` or unrelated user work.
+
+- [ ] **Step 8: Run both Task 12J per-task reviews**
+
+Invoke `superpowers:requesting-code-review` on Task12J BASE..HEAD first for both
+approved specs, then with a fresh reviewer for implementation
+quality/security. Resolve each Critical/Important finding with a focused named
+RED, rerun Steps 6-7, commit the fix, and repeat both reviews against the
+corrected HEAD.
+
+- [ ] **Step 9: Run the complete Task-12 exit gates**
 
 ```powershell
 npm run test:build
@@ -1621,21 +2040,23 @@ node --test --test-concurrency=1 --test-reporter=spec dist-test/tests/qualified-
 npm run typecheck
 npm test
 git diff --check
+$hash = (Get-FileHash -Algorithm SHA256 src/orchestrator/storage/migrations/0002-session-lifecycle.ts).Hash
+if ($hash -ne "68B4039048A359C523B7842F6D17BAA5760E9760D2B4E9F80BB8A48DC339EB06") { throw "migration 0002 changed" }
+node --input-type=module -e "const { PROJECT_STORE_MIGRATIONS, CURRENT_PROJECT_STORE_SCHEMA_VERSION } = await import('./dist-test/src/orchestrator/storage/migrations/registry.js'); if (CURRENT_PROJECT_STORE_SCHEMA_VERSION !== 3 || PROJECT_STORE_MIGRATIONS.map(m => m.version).join(',') !== '1,2,3') process.exit(1)"
+if ($LASTEXITCODE -ne 0) { throw "schema 3 registry assertion failed" }
+$enabledRoute = rg -n 'type:\s*"lifecycle"|lifecycleRuntimeFactory' src/orchestrator/runtime src/workers
+if ($LASTEXITCODE -eq 0) { throw "Task 12 must not register a lifecycle worker route" }
+if ($LASTEXITCODE -ne 1) { throw "production-disabled assertion failed to run" }
+git status --short
 ```
 
 Expected: focused/full gates pass; quick work is bounded, full work is linear,
 provider operations cross only the strict broker, sync coverage checks fail
-closed, provider/key material never crosses, and production registration stays
-disabled.
+closed, provider/key material never crosses, migration history is exactly
+`[1, 2, 3]`, migration 0002 has the frozen hash, production lifecycle V2
+routing remains disabled, and `git status --short` is empty.
 
-- [ ] **Step 5: Commit Task 12J and run both per-task reviews**
-
-```powershell
-git add src/orchestrator/integrity/lifecycle-integrity.service.ts src/orchestrator/integrity/event-integrity.service.ts tests/support/lifecycle-authority-reference.ts tests/qualified-checkpoint-full-integrity.test.ts tests/event-integrity.test.ts tests/evidence-coverage.test.ts tests/checkpoint.service.test.ts tests/qualified-checkpoint-migration.test.ts
-git commit -m "feat: replay qualified checkpoint integrity"
-```
-
-- [ ] **Step 6: Run Task 12 specification and quality reviews**
+- [ ] **Step 10: Run whole-Task-12 specification and quality reviews**
 
 Invoke `superpowers:requesting-code-review` twice on the complete Task 12 range:
 first for approved-spec compliance, then for implementation quality/security.
@@ -1651,10 +2072,12 @@ The following requirements augment and override the named tasks in the parent pl
 
 ### Task 13 Worker and Executor
 
-- [ ] Round-trip `RootSuspendCommandV2 | V3`, `RecordCheckpointCommandV2 | V3`, `RequestSessionEndCommandV2 | V3`, and `AmendSessionEndCommandV2 | V3` under the same operation names by nested discriminator.
+- [ ] Round-trip `RootSuspendCommandV2 | V3`, `RecordCheckpointCommandV2 | V3`, `RequestSessionEndCommandV2 | V3`, and `AmendSessionEndCommandV2 | V3` under the same operation names by nested discriminator; Task 13 consumes these already-strict Task12 contracts and does not redefine their DTOs.
 - [ ] Decode `CheckpointRecordedResultV1 | V2`, versioned end results, and `SessionEndEvidenceWindowStatusV2`; reject mixed tags and unsupported outer/nested versions.
 - [ ] Bind nested versions into candidate/authoritative intent, worker result tags, and deterministic internal work identity; old exact replay precedes current gates and cross-version identity reuse conflicts.
-- [ ] Prove schema 3/codecs alone never inject a runtime or enable production routing.
+- [ ] Keep `src/workers/project-store.worker.ts` production construction uninjected and prove schema 3/codecs alone never inject a lifecycle runtime or enable production routing; missing factory/provider returns `LIFECYCLE_V2_DISABLED` with zero SQLite effect.
+- [ ] Task 13 must not edit or own `src/orchestrator/storage/migrations/0003-qualified-checkpoint-coverage.ts`, `src/orchestrator/storage/qualified-checkpoint-migration-preflight.ts`, `src/orchestrator/lifecycle/lifecycle-projection-folds.ts`, `src/orchestrator/storage/lifecycle-projection.repository.ts`, `src/orchestrator/lifecycle/lifecycle-command.store.ts`, or `src/orchestrator/integrity/lifecycle-integrity.service.ts`. It must not add another projection writer, write either projection from a worker/runtime callback, introduce mutable snapshot rows, or change the Task12 store-owned after-service/before-dedup hook.
+- [ ] The Task13 runtime may construct the already-defined Task12 `LifecycleProjectionWriter` only as part of the single connection-bound semantic-store composition; it must pass the exact active SQLite connection and must not open a second handle. Worker dispatch does not call the writer directly.
 
 ### Task 14 Session-End Freeze and Evidence Window
 
