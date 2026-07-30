@@ -80,7 +80,8 @@ The required anchor test titles and initial behavioral failures are:
 | 12I | `bounded quick integrity rejects one-byte prospective capacity overflow` | Capacity recomputation is absent. |
 | 12I | `bounded quick integrity checks status once per distinct current profile` | Distinct-profile status calls are absent. |
 | 12I | `migration 3 seals and verifies both authenticated lifecycle projection stages` | Child-event/workflow-generation TEMP stages and independent hash verification are absent. |
-| 12I | `migration 3 projection guard aborts when any sealed stage predicate is false` | The executable TEMP guard does not cover all stage/count/linkage/exact-copy predicates. |
+| 12I | `migration 3 pre-copy guard rejects any invalid sealed projection stage` | The executable TEMP guard does not reject a bad marker/count/trigger/cardinality/source/linkage predicate before persistent copy. |
+| 12I | `migration 3 post-copy guard rejects missing extra or changed projection rows` | Bidirectional exact-copy verification is absent or runs before the persistent copy exists. |
 | 12I | `lifecycle command store writes projections after service postwrites and before dedup` | The store-owned projection-writer hook and atomic ordering are absent. |
 | 12I | `bounded quick integrity reads only target projection dependencies` | Child/event/workflow binding checks still reconstruct data-sized history. |
 | 12I | `bounded quick integrity accepts legal open-window unchanged null carry` | Workflow generation provenance incorrectly requires every generation to replace its draft. |
@@ -1544,7 +1545,8 @@ In `tests/lifecycle-projection-folds.test.ts` and
 - `migration 3 collapses schema 2 cancel and abandon at the same generation`;
 - `projection folds match independent canonical vectors and null-carry semantics`;
 - `child projection fold resolves a consumer bound to a non-latest report witness`;
-- `migration 3 projection guard aborts when any sealed stage predicate is false`.
+- `migration 3 pre-copy guard rejects any invalid sealed projection stage`;
+- `migration 3 post-copy guard rejects missing extra or changed projection rows`.
 
 Raw-SQL cases must exercise every CHECK/FK/index, project/session/stream/type
 source guard, child genesis/non-genesis predecessor, stream-version adjacency,
@@ -1555,9 +1557,11 @@ tampered sealed-stage fingerprint, and exact schema-2 rollback.
 Build at least three reports, then make completion proposal, disposition, and
 completion consumers reference the first report after a different latest
 report exists. Prove the exact first report witness is used and the later
-report is not substituted. Execute migration SQL with each guard predicate
-false in turn and assert the TEMP guard trigger aborts with
-`MIGRATION_EVIDENCE_V2_PRECONDITION_FAILED`.
+report is not substituted. Execute migration SQL with each pre-copy predicate
+false in turn and assert no persistent projection row is inserted. Then let
+pre-copy pass, tamper each persistent copy with a missing, extra, and changed
+row before the post-copy insert, and assert rollback. Both guards abort through
+the TEMP trigger with `MIGRATION_EVIDENCE_V2_PRECONDITION_FAILED`.
 
 - [ ] **Step 2: Compile the scaffold and record the migration RED**
 
@@ -1567,7 +1571,7 @@ exports whose bodies throw `NOT_IMPLEMENTED`, then run:
 ```powershell
 npm run test:build
 if ($LASTEXITCODE -ne 0) { throw "Task 12I projection tests must compile before behavioral RED" }
-node --test --test-concurrency=1 --test-reporter=spec --test-name-pattern="^(migration 3 seals and verifies both authenticated lifecycle projection stages|migration 3 projection guard aborts when any sealed stage predicate is false|migration 3 enforces immutable child-event projection identity and adjacency|migration 3 enforces immutable workflow-generation provenance and adjacency|migration 3 collapses schema 2 cancel and abandon at the same generation|projection folds match independent canonical vectors and null-carry semantics|child projection fold resolves a consumer bound to a non-latest report witness)$" dist-test/tests/lifecycle-projection-folds.test.js dist-test/tests/qualified-checkpoint-migration.test.js
+node --test --test-concurrency=1 --test-reporter=spec --test-name-pattern="^(migration 3 seals and verifies both authenticated lifecycle projection stages|migration 3 pre-copy guard rejects any invalid sealed projection stage|migration 3 post-copy guard rejects missing extra or changed projection rows|migration 3 enforces immutable child-event projection identity and adjacency|migration 3 enforces immutable workflow-generation provenance and adjacency|migration 3 collapses schema 2 cancel and abandon at the same generation|projection folds match independent canonical vectors and null-carry semantics|child projection fold resolves a consumer bound to a non-latest report witness)$" dist-test/tests/lifecycle-projection-folds.test.js dist-test/tests/qualified-checkpoint-migration.test.js
 ```
 
 Expected: the two tables, sealed stages, pure hashes/folds, compatibility
@@ -1680,8 +1684,8 @@ not trust the stage creator's in-memory arrays.
 
 Extend migration 0003 with the two persistent STRICT tables, indexes, and
 immutable triggers exactly as the approved DDL. The migration SQL performs no
-SHA/UDF work. Retain the existing executable TEMP guard-table pattern and
-extend its single boolean expression:
+SHA/UDF work. Retain the existing executable TEMP guard-table pattern, but use
+two ordered guard inserts with disjoint responsibilities:
 
 ```sql
 CREATE TEMP TABLE qualified_checkpoint_v3_guard (
@@ -1694,6 +1698,7 @@ BEGIN
   SELECT RAISE(ABORT, 'MIGRATION_EVIDENCE_V2_PRECONDITION_FAILED');
 END;
 
+-- Guard insert 1: run before any persistent projection insert/update.
 INSERT INTO qualified_checkpoint_v3_guard(value)
 SELECT CASE WHEN
   (SELECT count(*) FROM qualified_checkpoint_v3_stage_marker) = 1
@@ -1714,6 +1719,19 @@ SELECT CASE WHEN
   AND (SELECT count(*) FROM temp.sqlite_schema
        WHERE type = 'trigger'
          AND name GLOB 'qualified_checkpoint_v3_stage_*_no_*') = 12
+  AND EXISTS (
+    SELECT 1
+    FROM project_meta AS meta
+    JOIN qualified_checkpoint_v3_stage_marker AS marker ON marker.singleton = 1
+    WHERE meta.singleton = 1
+      AND meta.schema_version = 2
+      AND marker.project_id = meta.project_id
+      AND marker.vault_id = meta.vault_id
+      AND marker.store_id = meta.store_id
+  )
+  AND (SELECT count(*) FROM qualified_checkpoint_v3_stage_rows)
+      = (SELECT count(*) FROM workflow_instances
+         WHERE session_id IS NOT NULL)
   AND NOT EXISTS (
     SELECT 1
     FROM qualified_checkpoint_v3_stage_child_event_folds AS child
@@ -1751,7 +1769,19 @@ SELECT CASE WHEN
        OR trigger_event.lifecycle_intent_json IS NULL
        OR source_event.global_position IS NULL
   )
-  AND NOT EXISTS (
+THEN 1 ELSE 0 END;
+
+-- Only after guard insert 1 succeeds: execute the existing exact freeze-row
+-- UPDATE, then copy both authenticated projection stages exactly once.
+INSERT INTO lifecycle_child_event_folds
+SELECT * FROM qualified_checkpoint_v3_stage_child_event_folds;
+INSERT INTO lifecycle_workflow_generation_folds
+SELECT * FROM qualified_checkpoint_v3_stage_workflow_generation_folds;
+
+-- Guard insert 2: run only after every persistent copy/update completes.
+INSERT INTO qualified_checkpoint_v3_guard(value)
+SELECT CASE WHEN
+  NOT EXISTS (
     SELECT * FROM qualified_checkpoint_v3_stage_child_event_folds
     EXCEPT SELECT * FROM lifecycle_child_event_folds
   )
@@ -1767,18 +1797,60 @@ SELECT CASE WHEN
     SELECT * FROM lifecycle_workflow_generation_folds
     EXCEPT SELECT * FROM qualified_checkpoint_v3_stage_workflow_generation_folds
   )
+  AND NOT EXISTS (
+    SELECT 1
+    FROM qualified_checkpoint_v3_stage_rows AS stage
+    LEFT JOIN workflow_instances AS workflow
+      ON workflow.workflow_id = stage.workflow_id
+     AND workflow.session_id IS NOT NULL
+    WHERE workflow.workflow_id IS NULL
+       OR workflow.generation <> stage.source_generation
+       OR workflow.phase <> stage.source_phase
+       OR workflow.evidence_frozen_checkpoint_event_position
+          IS NOT stage.evidence_frozen_checkpoint_event_position
+       OR workflow.evidence_frozen_generation
+          IS NOT stage.evidence_frozen_generation
+       OR workflow.evidence_window_state IS NOT stage.evidence_window_state
+       OR workflow.final_ending_scope_bindings_json
+          IS NOT stage.final_ending_scope_bindings_json
+  )
+  AND NOT EXISTS (
+    SELECT 1
+    FROM workflow_instances AS workflow
+    WHERE workflow.session_id IS NOT NULL
+      AND NOT EXISTS (
+        SELECT 1
+        FROM qualified_checkpoint_v3_stage_rows AS stage
+        WHERE stage.workflow_id = workflow.workflow_id
+      )
+  )
 THEN 1 ELSE 0 END;
 ```
 
-The complete expression also retains the existing freeze-row/project identity
-predicates and expands child checkpoint/terminal/report plus workflow
+The order is mandatory:
+
+1. create the TEMP guard table/trigger;
+2. run guard insert 1 using only marker/source/TEMP-stage predicates—the
+   pre-copy expression contains no read of `lifecycle_child_event_folds` or
+   `lifecycle_workflow_generation_folds`;
+3. only after guard insert 1 succeeds, execute the existing exact freeze-row
+   update and copy both authenticated projection stages;
+4. run guard insert 2 against the completed persistent state, using both
+   `stage EXCEPT persistent` and `persistent EXCEPT stage` for each projection
+   plus the bidirectional freeze-row comparison;
+5. only after guard insert 2 succeeds, drop the guard trigger/table and every
+   stage trigger/table/marker.
+
+Guard insert 1 also retains the existing freeze-row/project identity predicates
+and covers all three source-to-stage and stage-to-source cardinalities, all 12
+denial triggers, child checkpoint/terminal/report sources, and workflow
 generation/predecessor/event-type/payload/intent linkage exactly as the
-approved DDL requires. Run the guard once before persistent mutation for stage
-shape/linkage and again after copying for exact-copy equality. SQLite
-`RAISE()` appears only inside the trigger body—never directly in a top-level
-`SELECT CASE`. A false predicate inserts `0`, so the trigger aborts. Then drop
-the guard trigger/table and every stage trigger/table/marker. Preserve
-migration 0002 byte-for-byte.
+approved DDL requires. It contains no persistent exact-copy predicate. Guard
+insert 2 may reassert those retained predicates
+but must not replace its bidirectional exact-copy checks. SQLite `RAISE()`
+appears only inside the trigger body—never directly in a top-level
+`SELECT CASE`. A false predicate inserts `0`, so the trigger aborts and the
+transaction restores exact schema 2. Preserve migration 0002 byte-for-byte.
 
 - [ ] **Step 5: Run projection migration GREEN and commit the schema/fold unit**
 
