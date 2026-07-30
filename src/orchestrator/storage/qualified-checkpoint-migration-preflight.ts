@@ -1,16 +1,17 @@
 import type { ProjectContext } from "../identity/contracts.js";
 import {
   CHECKPOINT_MAX_CANONICAL_BYTES,
-  decodeCheckpointV1,
+  decodeCheckpoint,
   type CheckpointEvidenceCoverageV2,
-  type CheckpointV1,
+  type Checkpoint,
 } from "../lifecycle/contracts/checkpoint.js";
 import type { ChildSessionState } from "../lifecycle/contracts/identifiers.js";
 import {
   LIFECYCLE_EVENT_TYPES,
-  decodeLifecycleEventV1,
-  type LifecycleEventV1,
+  decodeLifecycleEvent,
+  type LifecycleEvent,
 } from "../lifecycle/contracts/events.js";
+import type { StoredEvent } from "../contracts/event.js";
 import {
   decodeFinalEndingScopeBindingsV1,
   FINAL_ENDING_SCOPE_BINDINGS_MAX_CANONICAL_BYTES,
@@ -21,6 +22,16 @@ import {
   minimumFinalEndingScopeBindingsUpperBound,
 } from "../lifecycle/checkpoint-capacity.js";
 import { foldSession, type SessionAggregateState } from "../lifecycle/session-aggregate.js";
+import {
+  foldChildEventProjection,
+  foldWorkflowGenerationProjection,
+  type ChildEventFoldProjection,
+  type WorkflowGenerationFoldProjection,
+} from "../lifecycle/lifecycle-projection-folds.js";
+import {
+  decodeLifecycleIntentWitness,
+  type LifecycleIntentWitnessV1,
+} from "../lifecycle/lifecycle-intent-witness.js";
 import { canonicalJson } from "../serialization/canonical-json.js";
 import { SchemaCompatibilityError } from "./schema-compatibility.js";
 import type { SqliteConnection, SqliteRow } from "./sqlite-driver.js";
@@ -29,6 +40,10 @@ export const QUALIFIED_CHECKPOINT_STAGE_MARKER_TABLE =
   "qualified_checkpoint_v3_stage_marker";
 export const QUALIFIED_CHECKPOINT_STAGE_ROWS_TABLE =
   "qualified_checkpoint_v3_stage_rows";
+export const QUALIFIED_CHECKPOINT_STAGE_CHILD_EVENT_FOLDS_TABLE =
+  "qualified_checkpoint_v3_stage_child_event_folds";
+export const QUALIFIED_CHECKPOINT_STAGE_WORKFLOW_GENERATION_FOLDS_TABLE =
+  "qualified_checkpoint_v3_stage_workflow_generation_folds";
 
 const PRECONDITION = "MIGRATION_EVIDENCE_V2_PRECONDITION_FAILED" as const;
 const STAGE_TRIGGER_SPECS = Object.freeze([
@@ -38,6 +53,36 @@ const STAGE_TRIGGER_SPECS = Object.freeze([
   ["qualified_checkpoint_v3_stage_rows_no_insert", QUALIFIED_CHECKPOINT_STAGE_ROWS_TABLE, "INSERT"],
   ["qualified_checkpoint_v3_stage_rows_no_update", QUALIFIED_CHECKPOINT_STAGE_ROWS_TABLE, "UPDATE"],
   ["qualified_checkpoint_v3_stage_rows_no_delete", QUALIFIED_CHECKPOINT_STAGE_ROWS_TABLE, "DELETE"],
+  [
+    "qualified_checkpoint_v3_stage_child_event_folds_no_insert",
+    QUALIFIED_CHECKPOINT_STAGE_CHILD_EVENT_FOLDS_TABLE,
+    "INSERT",
+  ],
+  [
+    "qualified_checkpoint_v3_stage_child_event_folds_no_update",
+    QUALIFIED_CHECKPOINT_STAGE_CHILD_EVENT_FOLDS_TABLE,
+    "UPDATE",
+  ],
+  [
+    "qualified_checkpoint_v3_stage_child_event_folds_no_delete",
+    QUALIFIED_CHECKPOINT_STAGE_CHILD_EVENT_FOLDS_TABLE,
+    "DELETE",
+  ],
+  [
+    "qualified_checkpoint_v3_stage_workflow_generation_folds_no_insert",
+    QUALIFIED_CHECKPOINT_STAGE_WORKFLOW_GENERATION_FOLDS_TABLE,
+    "INSERT",
+  ],
+  [
+    "qualified_checkpoint_v3_stage_workflow_generation_folds_no_update",
+    QUALIFIED_CHECKPOINT_STAGE_WORKFLOW_GENERATION_FOLDS_TABLE,
+    "UPDATE",
+  ],
+  [
+    "qualified_checkpoint_v3_stage_workflow_generation_folds_no_delete",
+    QUALIFIED_CHECKPOINT_STAGE_WORKFLOW_GENERATION_FOLDS_TABLE,
+    "DELETE",
+  ],
 ] as const);
 const POST_FINAL_PHASES = new Set([
   "final-checkpoint-recorded",
@@ -58,6 +103,19 @@ const CHILD_STATES = new Set<ChildSessionState>([
   "transferred",
 ]);
 const LIFECYCLE_EVENT_TYPE_SET = new Set<string>(LIFECYCLE_EVENT_TYPES);
+const CHILD_PROJECTION_EVENT_TYPES = new Set<string>([
+  "SessionForked",
+  "SessionCheckpointRecorded",
+  "EvidenceCoverageRecorded",
+  "ChildAssignmentAmended",
+  "ChildWorkReported",
+  "ChildWorkDispositioned",
+  "ChildCompletionProposed",
+  "ChildSessionCompleted",
+  "ChildSessionSuspended",
+  "ChildWorkTransferCreated",
+  "ChildWorkTransferClaimed",
+]);
 const SESSION_END_PHASES = new Set([
   ...PREFINAL_PHASES,
   ...POST_FINAL_PHASES,
@@ -85,13 +143,15 @@ const EMPTY_COVERAGE: CheckpointEvidenceCoverageV2 = Object.freeze({
 });
 
 interface IndexedCheckpoint {
-  readonly checkpoint: CheckpointV1;
+  readonly checkpoint: Checkpoint;
   readonly eventPosition: string;
 }
 
 interface IndexedLifecycleHistory {
   readonly checkpoints: ReadonlyMap<string, IndexedCheckpoint>;
-  readonly eventsBySession: ReadonlyMap<string, readonly LifecycleEventV1[]>;
+  readonly eventsBySession: ReadonlyMap<string, readonly LifecycleEvent[]>;
+  readonly childEventFolds: readonly ChildEventFoldProjection[];
+  readonly workflowGenerationFolds: readonly WorkflowGenerationFoldProjection[];
 }
 
 interface StageRow {
@@ -250,24 +310,54 @@ function assertCoverageEmpty(connection: SqliteConnection): void {
 
 function indexLifecycleHistory(connection: SqliteConnection): IndexedLifecycleHistory {
   const checkpoints = new Map<string, IndexedCheckpoint>();
-  const eventsBySession = new Map<string, LifecycleEventV1[]>();
+  const eventsBySession = new Map<string, LifecycleEvent[]>();
+  const childEventFolds: ChildEventFoldProjection[] = [];
+  const workflowGenerationFolds: WorkflowGenerationFoldProjection[] = [];
+  const childHeads = new Map<string, ChildEventFoldProjection>();
+  const reportWitnesses = new Map<
+    string,
+    Map<string, ChildEventFoldProjection>
+  >();
+  const commandIntents = new Map<string, {
+    readonly witness: LifecycleIntentWitnessV1;
+    readonly sessionId: string;
+    readonly streamId: string;
+  }>();
+  const workflowHeads = new Map<string, WorkflowGenerationFoldProjection>();
+  const workflowIndexes = new Map<string, number>();
   const lifecycleRows = connection.prepare(`
     SELECT global_position, event_id, project_id, vault_id, store_id,
            workspace_id, stream_id, stream_type, stream_version,
            event_type, event_schema_version, session_id, parent_session_id,
            correlation_id, causation_id, command_id, idempotency_key,
-           occurred_at, payload_json
+           command_event_index, occurred_at, recorded_at, payload_json,
+           lifecycle_intent_json
     FROM events
     WHERE stream_type = 'session' AND session_id IS NOT NULL
-    ORDER BY stream_id, stream_version
+    ORDER BY global_position
   `).all();
   const authorityCommitments = new Map<string, string>();
   for (const row of lifecycleRows) {
     const eventType = requiredString(row, "event_type");
+    const commandEventIndex = scalarInteger(row, "command_event_index");
+    const commandKey = `${
+      requiredString(row, "project_id")
+    }\u0000${requiredString(row, "command_id")}`;
+    const indexedIntentSource = nullableString(row, "lifecycle_intent_json");
+    if (commandEventIndex === 0 && indexedIntentSource !== null) {
+      if (commandIntents.has(commandKey)) fail();
+      try {
+        commandIntents.set(commandKey, {
+          witness: decodeLifecycleIntentWitness(indexedIntentSource),
+          sessionId: requiredString(row, "session_id"),
+          streamId: requiredString(row, "stream_id"),
+        });
+      } catch {
+        fail();
+      }
+    }
     if (!LIFECYCLE_EVENT_TYPE_SET.has(eventType)) continue;
     const schemaVersion = scalarInteger(row, "event_schema_version");
-    if (schemaVersion !== 1) fail();
-    if (eventType === "EvidenceCoverageRecorded") fail();
     const payload = record(parseCanonicalJson(requiredString(row, "payload_json")));
     const streamId = requiredString(row, "stream_id");
     if (typeof payload.authorityCommitment === "string") {
@@ -275,9 +365,9 @@ function indexLifecycleHistory(connection: SqliteConnection): IndexedLifecycleHi
     }
     const authorityCommitment = authorityCommitments.get(streamId);
     if (authorityCommitment === undefined) fail();
-    let decoded;
+    let decoded: LifecycleEvent;
     try {
-      decoded = decodeLifecycleEventV1({
+      decoded = decodeLifecycleEvent({
         eventSchemaVersion: schemaVersion,
         eventId: row.event_id,
         projectId: row.project_id,
@@ -305,24 +395,166 @@ function indexLifecycleHistory(connection: SqliteConnection): IndexedLifecycleHi
     const history = eventsBySession.get(sessionId) ?? [];
     history.push(decoded);
     eventsBySession.set(sessionId, history);
-    if (eventType !== "SessionCheckpointRecorded") continue;
-    const checkpointEvent = decoded as Extract<
-      LifecycleEventV1,
-      { readonly eventType: "SessionCheckpointRecorded" }
-    >;
-    const checkpoint = decodeCheckpointV1(checkpointEvent.payload.checkpoint);
-    const eventPosition = checkpointEvent.globalPosition;
+
+    const globalPosition = BigInt(positiveInt64Decimal(row, "global_position"));
+    const streamVersion = BigInt(positiveInt64Decimal(row, "stream_version"));
+    const stored = {
+      globalPosition,
+      eventId: decoded.eventId,
+      projectId: decoded.projectId,
+      vaultId: decoded.vaultId,
+      storeId: decoded.storeId,
+      workspaceId: decoded.workspaceId,
+      branchScopeId: null,
+      branchRef: null,
+      streamId: decoded.streamId,
+      streamType: "session",
+      streamVersion,
+      eventType: decoded.eventType,
+      eventSchemaVersion: decoded.eventSchemaVersion,
+      sessionId: decoded.sessionId,
+      parentSessionId: decoded.parentSessionId,
+      actorRole: "primary",
+      agentId: "migration-preflight",
+      clientInstanceId: "migration-preflight",
+      correlationId: decoded.correlationId,
+      causationId: decoded.causationId,
+      commandId: decoded.commandId,
+      idempotencyKey: decoded.idempotencyKey,
+      commandEventIndex,
+      occurredAt: decoded.occurredAt,
+      recordedAt: requiredString(row, "recorded_at"),
+      visibilityScope: "session",
+      confidence: "high",
+      verificationStatus: "verified",
+      sourceRefs: [],
+      evidenceRefs: [],
+      evidenceDigests: [],
+      payload,
+      payloadJson: requiredString(row, "payload_json"),
+      payloadHash: "0".repeat(64),
+      previousGlobalHash: "0".repeat(64),
+      eventHash: "0".repeat(64),
+      lifecycleIntentJson: nullableString(row, "lifecycle_intent_json"),
+    } as unknown as StoredEvent;
+
     if (
-      checkpointEvent.payload.baseEventPosition !== checkpoint.baseEventPosition
-      || checkpointEvent.payload.checkpointEventPosition !== eventPosition
-      || checkpoint.checkpointEventPosition !== eventPosition
-      || checkpoint.evidenceCoverage.highestContiguousOrdinal !== null
-      || checkpoint.evidenceCoverage.missingIntervals.length !== 0
-      || checkpoints.has(checkpoint.checkpointId)
-    ) fail();
-    checkpoints.set(checkpoint.checkpointId, { checkpoint, eventPosition });
+      decoded.parentSessionId !== null
+      && CHILD_PROJECTION_EVENT_TYPES.has(decoded.eventType)
+    ) {
+      const previous = childHeads.get(decoded.sessionId) ?? null;
+      const childReports = reportWitnesses.get(decoded.sessionId)
+        ?? new Map<string, ChildEventFoldProjection>();
+      let reportId: string | null = null;
+      if (decoded.eventType === "ChildCompletionProposed") {
+        reportId = decoded.payload.reportId;
+      } else if (decoded.eventType === "ChildWorkDispositioned") {
+        reportId = decoded.payload.disposition.reportId;
+      } else if (decoded.eventType === "ChildSessionCompleted") {
+        reportId = decoded.payload.reportId;
+      }
+      const reportWitness = reportId === null
+        ? null
+        : childReports.get(reportId) ?? null;
+      if (
+        decoded.eventType === "ChildWorkReported"
+        && childReports.has(decoded.payload.report.reportId)
+      ) fail();
+      let projection: ChildEventFoldProjection;
+      try {
+        projection = foldChildEventProjection(previous, stored, reportWitness);
+      } catch {
+        fail();
+      }
+      childHeads.set(decoded.sessionId, projection);
+      childEventFolds.push(projection);
+      if (projection.reportedReportId !== null) {
+        childReports.set(projection.reportedReportId, projection);
+        reportWitnesses.set(decoded.sessionId, childReports);
+      }
+    }
+
+    let projectionWorkflowId: string | null = null;
+    switch (decoded.eventType) {
+      case "SessionEndRequested":
+      case "SessionEndAmended":
+      case "SessionEndCancelled":
+        projectionWorkflowId = decoded.payload.workflowId;
+        break;
+      case "SessionAbandoned":
+        projectionWorkflowId = decoded.payload.workflowId;
+        break;
+      default:
+        break;
+    }
+    if (projectionWorkflowId !== null) {
+      const workflowId = projectionWorkflowId;
+      const indexedIntent = commandIntents.get(commandKey);
+      if (
+        indexedIntent === undefined
+        || indexedIntent.sessionId !== decoded.sessionId
+        || indexedIntent.streamId !== decoded.streamId
+      ) fail();
+      let projection: WorkflowGenerationFoldProjection;
+      try {
+        projection = foldWorkflowGenerationProjection(
+          workflowHeads.get(workflowId) ?? null,
+          stored,
+          indexedIntent.witness,
+          "schema-2-preflight",
+        );
+      } catch {
+        fail();
+      }
+      const existingIndex = workflowIndexes.get(workflowId);
+      const existing = workflowHeads.get(workflowId);
+      if (
+        existing !== undefined
+        && projection.workflowGeneration === existing.workflowGeneration
+      ) {
+        if (existingIndex === undefined) fail();
+        workflowGenerationFolds[existingIndex] = projection;
+      } else {
+        workflowIndexes.set(workflowId, workflowGenerationFolds.length);
+        workflowGenerationFolds.push(projection);
+      }
+      workflowHeads.set(workflowId, projection);
+    }
+
+    if (eventType === "SessionCheckpointRecorded") {
+      const checkpointEvent = decoded as Extract<
+        LifecycleEvent,
+        { readonly eventType: "SessionCheckpointRecorded" }
+      >;
+      const checkpoint = decodeCheckpoint(checkpointEvent.payload.checkpoint);
+      const eventPosition = checkpointEvent.globalPosition;
+      const emptyCoverage = checkpoint.checkpointVersion === 1
+        ? (
+            checkpoint.evidenceCoverage.highestContiguousOrdinal === null
+            && checkpoint.evidenceCoverage.missingIntervals.length === 0
+          )
+        : checkpoint.evidenceCoverage.adapterSessions.length === 0;
+      if (
+        checkpointEvent.payload.baseEventPosition !== checkpoint.baseEventPosition
+        || checkpointEvent.payload.checkpointEventPosition !== eventPosition
+        || checkpoint.checkpointEventPosition !== eventPosition
+        || !emptyCoverage
+        || checkpoints.has(checkpoint.checkpointId)
+      ) fail();
+      checkpoints.set(checkpoint.checkpointId, { checkpoint, eventPosition });
+    }
   }
-  return { checkpoints, eventsBySession };
+  return {
+    checkpoints,
+    eventsBySession,
+    childEventFolds,
+    workflowGenerationFolds: workflowGenerationFolds.sort((left, right) =>
+      left.triggerEventPosition < right.triggerEventPosition
+        ? -1
+        : left.triggerEventPosition > right.triggerEventPosition
+          ? 1
+          : 0),
+  };
 }
 
 function foldAt(
@@ -494,7 +726,7 @@ function bindingsForCheckpoint(
   connection: SqliteConnection,
   projectId: string,
   history: IndexedLifecycleHistory,
-  checkpoint: CheckpointV1,
+  checkpoint: Checkpoint,
 ): readonly FinalEndingScopeBindingV1[] {
   const bindings = checkpoint.childSummaries
     .map((summary) => bindingForSummary(
@@ -711,6 +943,42 @@ function stageRows(
   return result;
 }
 
+function assertWorkflowProjectionCoverage(
+  connection: SqliteConnection,
+  history: IndexedLifecycleHistory,
+): void {
+  const workflows = connection.prepare(`
+    SELECT workflow_id, generation, session_id, root_command_id,
+           triggering_event_position
+    FROM workflow_instances
+    WHERE session_id IS NOT NULL
+    ORDER BY workflow_id
+  `).all();
+  const heads = new Map<string, WorkflowGenerationFoldProjection>();
+  for (const projection of history.workflowGenerationFolds) {
+    const current = heads.get(projection.workflowId);
+    if (
+      current === undefined
+        ? projection.workflowGeneration !== 1
+        : projection.workflowGeneration !== current.workflowGeneration + 1
+    ) fail();
+    heads.set(projection.workflowId, projection);
+  }
+  if (heads.size !== workflows.length) fail();
+  for (const workflow of workflows) {
+    const workflowId = requiredString(workflow, "workflow_id");
+    const head = heads.get(workflowId);
+    if (
+      head === undefined
+      || head.sessionId !== requiredString(workflow, "session_id")
+      || head.workflowGeneration !== scalarInteger(workflow, "generation")
+      || head.rootCommandId !== requiredString(workflow, "root_command_id")
+      || head.triggerEventPosition.toString()
+        !== positiveInt64Decimal(workflow, "triggering_event_position")
+    ) fail();
+  }
+}
+
 function assertEveryLiveRootCapacity(
   connection: SqliteConnection,
   projectId: string,
@@ -815,15 +1083,14 @@ function assertEveryLiveRootCapacity(
 }
 
 function dropStage(connection: SqliteConnection): void {
+  for (const [name] of STAGE_TRIGGER_SPECS) {
+    connection.exec(`DROP TRIGGER IF EXISTS temp.${name}`);
+  }
   connection.exec(`
-    DROP TRIGGER IF EXISTS temp.qualified_checkpoint_v3_stage_marker_no_insert;
-    DROP TRIGGER IF EXISTS temp.qualified_checkpoint_v3_stage_marker_no_update;
-    DROP TRIGGER IF EXISTS temp.qualified_checkpoint_v3_stage_marker_no_delete;
-    DROP TRIGGER IF EXISTS temp.qualified_checkpoint_v3_stage_rows_no_insert;
-    DROP TRIGGER IF EXISTS temp.qualified_checkpoint_v3_stage_rows_no_update;
-    DROP TRIGGER IF EXISTS temp.qualified_checkpoint_v3_stage_rows_no_delete;
     DROP TABLE IF EXISTS temp.${QUALIFIED_CHECKPOINT_STAGE_MARKER_TABLE};
     DROP TABLE IF EXISTS temp.${QUALIFIED_CHECKPOINT_STAGE_ROWS_TABLE};
+    DROP TABLE IF EXISTS temp.${QUALIFIED_CHECKPOINT_STAGE_CHILD_EVENT_FOLDS_TABLE};
+    DROP TABLE IF EXISTS temp.${QUALIFIED_CHECKPOINT_STAGE_WORKFLOW_GENERATION_FOLDS_TABLE};
   `);
 }
 
@@ -831,10 +1098,22 @@ function createStage(
   connection: SqliteConnection,
   identity: { projectId: string; vaultId: string; storeId: string },
   rows: readonly StageRow[],
+  childEventFolds: readonly ChildEventFoldProjection[],
+  workflowGenerationFolds: readonly WorkflowGenerationFoldProjection[],
 ): void {
   if (
     tableExists(connection, "temp", QUALIFIED_CHECKPOINT_STAGE_MARKER_TABLE)
     || tableExists(connection, "temp", QUALIFIED_CHECKPOINT_STAGE_ROWS_TABLE)
+    || tableExists(
+      connection,
+      "temp",
+      QUALIFIED_CHECKPOINT_STAGE_CHILD_EVENT_FOLDS_TABLE,
+    )
+    || tableExists(
+      connection,
+      "temp",
+      QUALIFIED_CHECKPOINT_STAGE_WORKFLOW_GENERATION_FOLDS_TABLE,
+    )
   ) fail();
   try {
     connection.exec(`
@@ -858,6 +1137,145 @@ function createStage(
             AND final_ending_scope_bindings_json IS NOT NULL)
         )
       ) STRICT;
+      CREATE TEMP TABLE ${QUALIFIED_CHECKPOINT_STAGE_CHILD_EVENT_FOLDS_TABLE} (
+        project_id TEXT NOT NULL,
+        child_session_id TEXT NOT NULL,
+        event_position INTEGER NOT NULL CHECK (event_position > 0),
+        stream_version INTEGER NOT NULL CHECK (stream_version > 0),
+        root_session_id TEXT NOT NULL,
+        child_state TEXT NOT NULL CHECK (child_state IN (
+          'active', 'completion-proposed', 'completed', 'suspended', 'transferred'
+        )),
+        latest_checkpoint_id TEXT,
+        latest_checkpoint_event_position INTEGER CHECK (
+          latest_checkpoint_event_position IS NULL
+          OR latest_checkpoint_event_position > 0
+        ),
+        authority_commitment TEXT NOT NULL CHECK (
+          length(authority_commitment) = 64
+          AND authority_commitment NOT GLOB '*[^0-9a-f]*'
+        ),
+        terminal_event_type TEXT CHECK (
+          terminal_event_type IS NULL
+          OR terminal_event_type IN (
+            'ChildSessionCompleted', 'ChildWorkTransferCreated'
+          )
+        ),
+        terminal_event_position INTEGER CHECK (
+          terminal_event_position IS NULL OR terminal_event_position > 0
+        ),
+        report_count INTEGER NOT NULL CHECK (report_count BETWEEN 0 AND 200),
+        latest_report_id TEXT,
+        report_index_fingerprint TEXT NOT NULL CHECK (
+          length(report_index_fingerprint) = 64
+          AND report_index_fingerprint NOT GLOB '*[^0-9a-f]*'
+        ),
+        completion_report_id TEXT,
+        reported_report_id TEXT,
+        reported_item_count INTEGER CHECK (
+          reported_item_count IS NULL OR reported_item_count BETWEEN 0 AND 200
+        ),
+        reported_item_set_fingerprint TEXT CHECK (
+          reported_item_set_fingerprint IS NULL
+          OR (
+            length(reported_item_set_fingerprint) = 64
+            AND reported_item_set_fingerprint NOT GLOB '*[^0-9a-f]*'
+          )
+        ),
+        previous_fingerprint TEXT CHECK (
+          previous_fingerprint IS NULL
+          OR (
+            length(previous_fingerprint) = 64
+            AND previous_fingerprint NOT GLOB '*[^0-9a-f]*'
+          )
+        ),
+        fingerprint TEXT NOT NULL CHECK (
+          length(fingerprint) = 64
+          AND fingerprint NOT GLOB '*[^0-9a-f]*'
+        ),
+        PRIMARY KEY (project_id, child_session_id, event_position),
+        UNIQUE (project_id, child_session_id, stream_version),
+        CHECK (
+          (latest_checkpoint_id IS NULL)
+            = (latest_checkpoint_event_position IS NULL)
+        ),
+        CHECK ((terminal_event_type IS NULL) = (terminal_event_position IS NULL)),
+        CHECK ((report_count = 0) = (latest_report_id IS NULL)),
+        CHECK (
+          (reported_report_id IS NULL) = (reported_item_count IS NULL)
+          AND (reported_report_id IS NULL)
+            = (reported_item_set_fingerprint IS NULL)
+        ),
+        CHECK (completion_report_id IS NULL OR report_count > 0),
+        CHECK (
+          (child_state = 'completed'
+            AND terminal_event_type = 'ChildSessionCompleted')
+          OR (child_state = 'transferred'
+            AND terminal_event_type = 'ChildWorkTransferCreated')
+          OR (child_state IN ('active', 'completion-proposed', 'suspended')
+            AND terminal_event_type IS NULL)
+        ),
+        CHECK (
+          terminal_event_position IS NULL
+          OR terminal_event_position <= event_position
+        ),
+        CHECK (
+          latest_checkpoint_event_position IS NULL
+          OR latest_checkpoint_event_position <= event_position
+        )
+      ) STRICT;
+      CREATE TEMP TABLE ${QUALIFIED_CHECKPOINT_STAGE_WORKFLOW_GENERATION_FOLDS_TABLE} (
+        project_id TEXT NOT NULL,
+        workflow_id TEXT NOT NULL,
+        workflow_generation INTEGER NOT NULL CHECK (workflow_generation > 0),
+        session_id TEXT NOT NULL,
+        trigger_event_position INTEGER NOT NULL CHECK (trigger_event_position > 0),
+        root_command_id TEXT NOT NULL,
+        evidence_window_state TEXT NOT NULL CHECK (
+          evidence_window_state IN ('open', 'sealed')
+        ),
+        replacement_checkpoint_version INTEGER CHECK (
+          replacement_checkpoint_version IS NULL
+          OR replacement_checkpoint_version IN (1, 2)
+        ),
+        effective_checkpoint_version INTEGER NOT NULL CHECK (
+          effective_checkpoint_version IN (1, 2)
+        ),
+        effective_draft_source_event_position INTEGER NOT NULL CHECK (
+          effective_draft_source_event_position > 0
+        ),
+        previous_fingerprint TEXT CHECK (
+          previous_fingerprint IS NULL
+          OR (
+            length(previous_fingerprint) = 64
+            AND previous_fingerprint NOT GLOB '*[^0-9a-f]*'
+          )
+        ),
+        fingerprint TEXT NOT NULL CHECK (
+          length(fingerprint) = 64
+          AND fingerprint NOT GLOB '*[^0-9a-f]*'
+        ),
+        PRIMARY KEY (project_id, workflow_id, workflow_generation),
+        UNIQUE (project_id, workflow_id, trigger_event_position),
+        CHECK (
+          evidence_window_state <> 'open'
+          OR effective_checkpoint_version = 2
+        ),
+        CHECK (
+          replacement_checkpoint_version IS NULL
+          OR (
+            effective_checkpoint_version = replacement_checkpoint_version
+            AND effective_draft_source_event_position = trigger_event_position
+          )
+        ),
+        CHECK (
+          effective_draft_source_event_position <= trigger_event_position
+        )
+      ) STRICT;
+      CREATE UNIQUE INDEX qualified_checkpoint_v3_stage_child_event_folds_report_witness
+      ON ${QUALIFIED_CHECKPOINT_STAGE_CHILD_EVENT_FOLDS_TABLE}(
+        project_id, child_session_id, reported_report_id
+      ) WHERE reported_report_id IS NOT NULL;
       CREATE TEMP TABLE ${QUALIFIED_CHECKPOINT_STAGE_MARKER_TABLE} (
         singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
         project_id TEXT NOT NULL,
@@ -865,7 +1283,11 @@ function createStage(
         store_id TEXT NOT NULL,
         source_schema_version INTEGER NOT NULL CHECK (source_schema_version = 2),
         target_schema_version INTEGER NOT NULL CHECK (target_schema_version = 3),
-        staged_row_count INTEGER NOT NULL CHECK (staged_row_count >= 0),
+        freeze_row_count INTEGER NOT NULL CHECK (freeze_row_count >= 0),
+        child_fold_row_count INTEGER NOT NULL CHECK (child_fold_row_count >= 0),
+        workflow_generation_row_count INTEGER NOT NULL CHECK (
+          workflow_generation_row_count >= 0
+        ),
         sealed INTEGER NOT NULL CHECK (sealed = 1)
       ) STRICT;
     `);
@@ -891,37 +1313,103 @@ function createStage(
         $bindingsJson: row.finalEndingScopeBindingsJson,
       });
     }
+    const insertChildFold = connection.prepare(`
+      INSERT INTO temp.${QUALIFIED_CHECKPOINT_STAGE_CHILD_EVENT_FOLDS_TABLE}(
+        project_id, child_session_id, event_position, stream_version,
+        root_session_id, child_state, latest_checkpoint_id,
+        latest_checkpoint_event_position, authority_commitment,
+        terminal_event_type, terminal_event_position, report_count,
+        latest_report_id, report_index_fingerprint, completion_report_id,
+        reported_report_id, reported_item_count,
+        reported_item_set_fingerprint, previous_fingerprint, fingerprint
+      ) VALUES (
+        $projectId, $childSessionId, $eventPosition, $streamVersion,
+        $rootSessionId, $childState, $latestCheckpointId,
+        $latestCheckpointEventPosition, $authorityCommitment,
+        $terminalEventType, $terminalEventPosition, $reportCount,
+        $latestReportId, $reportIndexFingerprint, $completionReportId,
+        $reportedReportId, $reportedItemCount,
+        $reportedItemSetFingerprint, $previousFingerprint, $fingerprint
+      )
+    `);
+    for (const row of childEventFolds) {
+      insertChildFold.run({
+        $projectId: row.projectId,
+        $childSessionId: row.childSessionId,
+        $eventPosition: row.eventPosition,
+        $streamVersion: row.streamVersion,
+        $rootSessionId: row.rootSessionId,
+        $childState: row.childState,
+        $latestCheckpointId: row.latestCheckpointId,
+        $latestCheckpointEventPosition: row.latestCheckpointEventPosition,
+        $authorityCommitment: row.authorityCommitment,
+        $terminalEventType: row.terminalEventType,
+        $terminalEventPosition: row.terminalEventPosition,
+        $reportCount: row.reportCount,
+        $latestReportId: row.latestReportId,
+        $reportIndexFingerprint: row.reportIndexFingerprint,
+        $completionReportId: row.completionReportId,
+        $reportedReportId: row.reportedReportId,
+        $reportedItemCount: row.reportedItemCount,
+        $reportedItemSetFingerprint: row.reportedItemSetFingerprint,
+        $previousFingerprint: row.previousFingerprint,
+        $fingerprint: row.fingerprint,
+      });
+    }
+    const insertWorkflowFold = connection.prepare(`
+      INSERT INTO temp.${QUALIFIED_CHECKPOINT_STAGE_WORKFLOW_GENERATION_FOLDS_TABLE}(
+        project_id, workflow_id, workflow_generation, session_id,
+        trigger_event_position, root_command_id, evidence_window_state,
+        replacement_checkpoint_version, effective_checkpoint_version,
+        effective_draft_source_event_position, previous_fingerprint, fingerprint
+      ) VALUES (
+        $projectId, $workflowId, $workflowGeneration, $sessionId,
+        $triggerEventPosition, $rootCommandId, $evidenceWindowState,
+        $replacementCheckpointVersion, $effectiveCheckpointVersion,
+        $effectiveDraftSourceEventPosition, $previousFingerprint, $fingerprint
+      )
+    `);
+    for (const row of workflowGenerationFolds) {
+      insertWorkflowFold.run({
+        $projectId: row.projectId,
+        $workflowId: row.workflowId,
+        $workflowGeneration: row.workflowGeneration,
+        $sessionId: row.sessionId,
+        $triggerEventPosition: row.triggerEventPosition,
+        $rootCommandId: row.rootCommandId,
+        $evidenceWindowState: row.evidenceWindowState,
+        $replacementCheckpointVersion: row.replacementCheckpointVersion,
+        $effectiveCheckpointVersion: row.effectiveCheckpointVersion,
+        $effectiveDraftSourceEventPosition:
+          row.effectiveDraftSourceEventPosition,
+        $previousFingerprint: row.previousFingerprint,
+        $fingerprint: row.fingerprint,
+      });
+    }
     connection.prepare(`
       INSERT INTO temp.${QUALIFIED_CHECKPOINT_STAGE_MARKER_TABLE}(
         singleton, project_id, vault_id, store_id, source_schema_version,
-        target_schema_version, staged_row_count, sealed
-      ) VALUES (1, $projectId, $vaultId, $storeId, 2, 3, $rowCount, 1)
+        target_schema_version, freeze_row_count, child_fold_row_count,
+        workflow_generation_row_count, sealed
+      ) VALUES (
+        1, $projectId, $vaultId, $storeId, 2, 3, $freezeRowCount,
+        $childFoldRowCount, $workflowGenerationRowCount, 1
+      )
     `).run({
       $projectId: identity.projectId,
       $vaultId: identity.vaultId,
       $storeId: identity.storeId,
-      $rowCount: rows.length,
+      $freezeRowCount: rows.length,
+      $childFoldRowCount: childEventFolds.length,
+      $workflowGenerationRowCount: workflowGenerationFolds.length,
     });
-    connection.exec(`
-      CREATE TEMP TRIGGER qualified_checkpoint_v3_stage_marker_no_insert
-      BEFORE INSERT ON ${QUALIFIED_CHECKPOINT_STAGE_MARKER_TABLE}
-      BEGIN SELECT RAISE(ABORT, '${PRECONDITION}'); END;
-      CREATE TEMP TRIGGER qualified_checkpoint_v3_stage_marker_no_update
-      BEFORE UPDATE ON ${QUALIFIED_CHECKPOINT_STAGE_MARKER_TABLE}
-      BEGIN SELECT RAISE(ABORT, '${PRECONDITION}'); END;
-      CREATE TEMP TRIGGER qualified_checkpoint_v3_stage_marker_no_delete
-      BEFORE DELETE ON ${QUALIFIED_CHECKPOINT_STAGE_MARKER_TABLE}
-      BEGIN SELECT RAISE(ABORT, '${PRECONDITION}'); END;
-      CREATE TEMP TRIGGER qualified_checkpoint_v3_stage_rows_no_insert
-      BEFORE INSERT ON ${QUALIFIED_CHECKPOINT_STAGE_ROWS_TABLE}
-      BEGIN SELECT RAISE(ABORT, '${PRECONDITION}'); END;
-      CREATE TEMP TRIGGER qualified_checkpoint_v3_stage_rows_no_update
-      BEFORE UPDATE ON ${QUALIFIED_CHECKPOINT_STAGE_ROWS_TABLE}
-      BEGIN SELECT RAISE(ABORT, '${PRECONDITION}'); END;
-      CREATE TEMP TRIGGER qualified_checkpoint_v3_stage_rows_no_delete
-      BEFORE DELETE ON ${QUALIFIED_CHECKPOINT_STAGE_ROWS_TABLE}
-      BEGIN SELECT RAISE(ABORT, '${PRECONDITION}'); END;
-    `);
+    for (const [name, table, operation] of STAGE_TRIGGER_SPECS) {
+      connection.exec(`
+        CREATE TEMP TRIGGER ${name}
+        BEFORE ${operation} ON ${table}
+        BEGIN SELECT RAISE(ABORT, '${PRECONDITION}'); END
+      `);
+    }
   } catch (error) {
     try { dropStage(connection); } catch { /* rollback remains authoritative */ }
     const normalized = qualifiedCheckpointMigrationFailure(error);
@@ -950,6 +1438,115 @@ export function qualifiedCheckpointMigrationFailure(
   return undefined;
 }
 
+function nullablePositiveInt64(row: SqliteRow, key: string): bigint | null {
+  return row[key] === null ? null : BigInt(positiveInt64Decimal(row, key));
+}
+
+function assertChildFoldStageRows(
+  connection: SqliteConnection,
+  expected: readonly ChildEventFoldProjection[],
+): void {
+  const actual = connection.prepare(`
+    SELECT project_id, child_session_id, event_position, stream_version,
+           root_session_id, child_state, latest_checkpoint_id,
+           latest_checkpoint_event_position, authority_commitment,
+           terminal_event_type, terminal_event_position, report_count,
+           latest_report_id, report_index_fingerprint, completion_report_id,
+           reported_report_id, reported_item_count,
+           reported_item_set_fingerprint, previous_fingerprint, fingerprint
+    FROM temp.${QUALIFIED_CHECKPOINT_STAGE_CHILD_EVENT_FOLDS_TABLE}
+    ORDER BY event_position
+  `).all();
+  if (actual.length !== expected.length) fail();
+  for (let index = 0; index < expected.length; index += 1) {
+    const wanted = expected[index]!;
+    const observed = actual[index]!;
+    if (
+      requiredString(observed, "project_id") !== wanted.projectId
+      || requiredString(observed, "child_session_id") !== wanted.childSessionId
+      || BigInt(positiveInt64Decimal(observed, "event_position"))
+        !== wanted.eventPosition
+      || BigInt(positiveInt64Decimal(observed, "stream_version"))
+        !== wanted.streamVersion
+      || requiredString(observed, "root_session_id") !== wanted.rootSessionId
+      || requiredString(observed, "child_state") !== wanted.childState
+      || nullableString(observed, "latest_checkpoint_id")
+        !== wanted.latestCheckpointId
+      || nullablePositiveInt64(observed, "latest_checkpoint_event_position")
+        !== wanted.latestCheckpointEventPosition
+      || requiredString(observed, "authority_commitment")
+        !== wanted.authorityCommitment
+      || nullableString(observed, "terminal_event_type")
+        !== wanted.terminalEventType
+      || nullablePositiveInt64(observed, "terminal_event_position")
+        !== wanted.terminalEventPosition
+      || scalarInteger(observed, "report_count") !== wanted.reportCount
+      || nullableString(observed, "latest_report_id") !== wanted.latestReportId
+      || requiredString(observed, "report_index_fingerprint")
+        !== wanted.reportIndexFingerprint
+      || nullableString(observed, "completion_report_id")
+        !== wanted.completionReportId
+      || nullableString(observed, "reported_report_id")
+        !== wanted.reportedReportId
+      || (
+        observed.reported_item_count === null
+          ? null
+          : scalarInteger(observed, "reported_item_count")
+      ) !== wanted.reportedItemCount
+      || nullableString(observed, "reported_item_set_fingerprint")
+        !== wanted.reportedItemSetFingerprint
+      || nullableString(observed, "previous_fingerprint")
+        !== wanted.previousFingerprint
+      || requiredString(observed, "fingerprint") !== wanted.fingerprint
+    ) fail();
+  }
+}
+
+function assertWorkflowFoldStageRows(
+  connection: SqliteConnection,
+  expected: readonly WorkflowGenerationFoldProjection[],
+): void {
+  const actual = connection.prepare(`
+    SELECT project_id, workflow_id, workflow_generation, session_id,
+           trigger_event_position, root_command_id, evidence_window_state,
+           replacement_checkpoint_version, effective_checkpoint_version,
+           effective_draft_source_event_position, previous_fingerprint, fingerprint
+    FROM temp.${QUALIFIED_CHECKPOINT_STAGE_WORKFLOW_GENERATION_FOLDS_TABLE}
+    ORDER BY trigger_event_position
+  `).all();
+  if (actual.length !== expected.length) fail();
+  for (let index = 0; index < expected.length; index += 1) {
+    const wanted = expected[index]!;
+    const observed = actual[index]!;
+    if (
+      requiredString(observed, "project_id") !== wanted.projectId
+      || requiredString(observed, "workflow_id") !== wanted.workflowId
+      || scalarInteger(observed, "workflow_generation")
+        !== wanted.workflowGeneration
+      || requiredString(observed, "session_id") !== wanted.sessionId
+      || BigInt(positiveInt64Decimal(observed, "trigger_event_position"))
+        !== wanted.triggerEventPosition
+      || requiredString(observed, "root_command_id") !== wanted.rootCommandId
+      || requiredString(observed, "evidence_window_state")
+        !== wanted.evidenceWindowState
+      || (
+        observed.replacement_checkpoint_version === null
+          ? null
+          : scalarInteger(observed, "replacement_checkpoint_version")
+      ) !== wanted.replacementCheckpointVersion
+      || scalarInteger(observed, "effective_checkpoint_version")
+        !== wanted.effectiveCheckpointVersion
+      || BigInt(positiveInt64Decimal(
+        observed,
+        "effective_draft_source_event_position",
+      )) !== wanted.effectiveDraftSourceEventPosition
+      || nullableString(observed, "previous_fingerprint")
+        !== wanted.previousFingerprint
+      || requiredString(observed, "fingerprint") !== wanted.fingerprint
+    ) fail();
+  }
+}
+
 export function assertQualifiedCheckpointMigrationStage(
   connection: SqliteConnection,
 ): void {
@@ -957,10 +1554,21 @@ export function assertQualifiedCheckpointMigrationStage(
     if (
       !tableExists(connection, "temp", QUALIFIED_CHECKPOINT_STAGE_MARKER_TABLE)
       || !tableExists(connection, "temp", QUALIFIED_CHECKPOINT_STAGE_ROWS_TABLE)
+      || !tableExists(
+        connection,
+        "temp",
+        QUALIFIED_CHECKPOINT_STAGE_CHILD_EVENT_FOLDS_TABLE,
+      )
+      || !tableExists(
+        connection,
+        "temp",
+        QUALIFIED_CHECKPOINT_STAGE_WORKFLOW_GENERATION_FOLDS_TABLE,
+      )
     ) fail();
     const markers = connection.prepare(`
       SELECT singleton, project_id, vault_id, store_id, source_schema_version,
-             target_schema_version, staged_row_count, sealed
+             target_schema_version, freeze_row_count, child_fold_row_count,
+             workflow_generation_row_count, sealed
       FROM temp.${QUALIFIED_CHECKPOINT_STAGE_MARKER_TABLE}
     `).all();
     if (markers.length !== 1) fail();
@@ -981,6 +1589,7 @@ export function assertQualifiedCheckpointMigrationStage(
     } as ProjectContext);
     assertCoverageEmpty(connection);
     const history = indexLifecycleHistory(connection);
+    assertWorkflowProjectionCoverage(connection, history);
     assertEveryLiveRootCapacity(connection, identity.projectId, history);
     const expected = stageRows(connection, identity.projectId, history);
     const actual = connection.prepare(`
@@ -991,8 +1600,12 @@ export function assertQualifiedCheckpointMigrationStage(
       ORDER BY workflow_id
     `).all();
     if (
-      scalarInteger(marker, "staged_row_count") !== expected.length
+      scalarInteger(marker, "freeze_row_count") !== expected.length
       || actual.length !== expected.length
+      || scalarInteger(marker, "child_fold_row_count")
+        !== history.childEventFolds.length
+      || scalarInteger(marker, "workflow_generation_row_count")
+        !== history.workflowGenerationFolds.length
     ) fail();
     for (let index = 0; index < expected.length; index += 1) {
       const wanted = expected[index]!;
@@ -1014,6 +1627,8 @@ export function assertQualifiedCheckpointMigrationStage(
           !== wanted.finalEndingScopeBindingsJson
       ) fail();
     }
+    assertChildFoldStageRows(connection, history.childEventFolds);
+    assertWorkflowFoldStageRows(connection, history.workflowGenerationFolds);
     assertStageTriggers(connection);
   } catch (error) {
     const normalized = qualifiedCheckpointMigrationFailure(error);
@@ -1032,9 +1647,16 @@ implements QualifiedCheckpointMigrationPreflight {
       const identity = assertStoreIdentity(connection, context);
       assertCoverageEmpty(connection);
       const history = indexLifecycleHistory(connection);
+      assertWorkflowProjectionCoverage(connection, history);
       assertEveryLiveRootCapacity(connection, identity.projectId, history);
       const rows = stageRows(connection, identity.projectId, history);
-      createStage(connection, identity, rows);
+      createStage(
+        connection,
+        identity,
+        rows,
+        history.childEventFolds,
+        history.workflowGenerationFolds,
+      );
     } catch (error) {
       const normalized = qualifiedCheckpointMigrationFailure(error);
       if (normalized !== undefined) throw normalized;

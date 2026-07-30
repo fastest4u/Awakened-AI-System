@@ -681,6 +681,127 @@ CREATE TEMP TABLE IF NOT EXISTS qualified_checkpoint_v3_stage_rows (
   )
 ) STRICT;
 
+CREATE TEMP TABLE IF NOT EXISTS qualified_checkpoint_v3_stage_child_event_folds (
+  project_id TEXT NOT NULL,
+  child_session_id TEXT NOT NULL,
+  event_position INTEGER NOT NULL CHECK (event_position > 0),
+  stream_version INTEGER NOT NULL CHECK (stream_version > 0),
+  root_session_id TEXT NOT NULL,
+  child_state TEXT NOT NULL CHECK (child_state IN (
+    'active', 'completion-proposed', 'completed', 'suspended', 'transferred'
+  )),
+  latest_checkpoint_id TEXT,
+  latest_checkpoint_event_position INTEGER
+    CHECK (latest_checkpoint_event_position IS NULL OR latest_checkpoint_event_position > 0),
+  authority_commitment TEXT NOT NULL CHECK (
+    length(authority_commitment) = 64
+    AND authority_commitment NOT GLOB '*[^0-9a-f]*'
+  ),
+  terminal_event_type TEXT CHECK (
+    terminal_event_type IS NULL
+    OR terminal_event_type IN ('ChildSessionCompleted', 'ChildWorkTransferCreated')
+  ),
+  terminal_event_position INTEGER
+    CHECK (terminal_event_position IS NULL OR terminal_event_position > 0),
+  report_count INTEGER NOT NULL CHECK (report_count BETWEEN 0 AND 200),
+  latest_report_id TEXT,
+  report_index_fingerprint TEXT NOT NULL CHECK (
+    length(report_index_fingerprint) = 64
+    AND report_index_fingerprint NOT GLOB '*[^0-9a-f]*'
+  ),
+  completion_report_id TEXT,
+  reported_report_id TEXT,
+  reported_item_count INTEGER
+    CHECK (reported_item_count IS NULL OR reported_item_count BETWEEN 0 AND 200),
+  reported_item_set_fingerprint TEXT CHECK (
+    reported_item_set_fingerprint IS NULL
+    OR (
+      length(reported_item_set_fingerprint) = 64
+      AND reported_item_set_fingerprint NOT GLOB '*[^0-9a-f]*'
+    )
+  ),
+  previous_fingerprint TEXT CHECK (
+    previous_fingerprint IS NULL
+    OR (
+      length(previous_fingerprint) = 64
+      AND previous_fingerprint NOT GLOB '*[^0-9a-f]*'
+    )
+  ),
+  fingerprint TEXT NOT NULL CHECK (
+    length(fingerprint) = 64 AND fingerprint NOT GLOB '*[^0-9a-f]*'
+  ),
+  PRIMARY KEY (project_id, child_session_id, event_position),
+  UNIQUE (project_id, child_session_id, stream_version),
+  CHECK ((latest_checkpoint_id IS NULL) = (latest_checkpoint_event_position IS NULL)),
+  CHECK ((terminal_event_type IS NULL) = (terminal_event_position IS NULL)),
+  CHECK ((report_count = 0) = (latest_report_id IS NULL)),
+  CHECK (
+    (reported_report_id IS NULL) = (reported_item_count IS NULL)
+    AND (reported_report_id IS NULL) = (reported_item_set_fingerprint IS NULL)
+  ),
+  CHECK (completion_report_id IS NULL OR report_count > 0),
+  CHECK (
+    (child_state = 'completed'
+      AND terminal_event_type = 'ChildSessionCompleted')
+    OR (child_state = 'transferred'
+      AND terminal_event_type = 'ChildWorkTransferCreated')
+    OR (child_state IN ('active', 'completion-proposed', 'suspended')
+      AND terminal_event_type IS NULL)
+  ),
+  CHECK (terminal_event_position IS NULL OR terminal_event_position <= event_position),
+  CHECK (
+    latest_checkpoint_event_position IS NULL
+    OR latest_checkpoint_event_position <= event_position
+  )
+) STRICT;
+
+CREATE UNIQUE INDEX IF NOT EXISTS
+qualified_checkpoint_v3_stage_child_event_folds_report_witness
+ON qualified_checkpoint_v3_stage_child_event_folds(
+  project_id, child_session_id, reported_report_id
+)
+WHERE reported_report_id IS NOT NULL;
+
+CREATE TEMP TABLE IF NOT EXISTS qualified_checkpoint_v3_stage_workflow_generation_folds (
+  project_id TEXT NOT NULL,
+  workflow_id TEXT NOT NULL,
+  workflow_generation INTEGER NOT NULL CHECK (workflow_generation > 0),
+  session_id TEXT NOT NULL,
+  trigger_event_position INTEGER NOT NULL CHECK (trigger_event_position > 0),
+  root_command_id TEXT NOT NULL,
+  evidence_window_state TEXT NOT NULL
+    CHECK (evidence_window_state IN ('open', 'sealed')),
+  replacement_checkpoint_version INTEGER
+    CHECK (replacement_checkpoint_version IS NULL
+      OR replacement_checkpoint_version IN (1, 2)),
+  effective_checkpoint_version INTEGER NOT NULL
+    CHECK (effective_checkpoint_version IN (1, 2)),
+  effective_draft_source_event_position INTEGER NOT NULL
+    CHECK (effective_draft_source_event_position > 0),
+  previous_fingerprint TEXT CHECK (
+    previous_fingerprint IS NULL
+    OR (length(previous_fingerprint) = 64
+      AND previous_fingerprint NOT GLOB '*[^0-9a-f]*')
+  ),
+  fingerprint TEXT NOT NULL CHECK (
+    length(fingerprint) = 64 AND fingerprint NOT GLOB '*[^0-9a-f]*'
+  ),
+  PRIMARY KEY (project_id, workflow_id, workflow_generation),
+  UNIQUE (project_id, workflow_id, trigger_event_position),
+  CHECK (
+    evidence_window_state <> 'open'
+    OR effective_checkpoint_version = 2
+  ),
+  CHECK (
+    replacement_checkpoint_version IS NULL
+    OR (
+      effective_checkpoint_version = replacement_checkpoint_version
+      AND effective_draft_source_event_position = trigger_event_position
+    )
+  ),
+  CHECK (effective_draft_source_event_position <= trigger_event_position)
+) STRICT;
+
 CREATE TEMP TABLE IF NOT EXISTS qualified_checkpoint_v3_stage_marker (
   singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
   project_id TEXT NOT NULL,
@@ -688,7 +809,10 @@ CREATE TEMP TABLE IF NOT EXISTS qualified_checkpoint_v3_stage_marker (
   store_id TEXT NOT NULL,
   source_schema_version INTEGER NOT NULL CHECK (source_schema_version = 2),
   target_schema_version INTEGER NOT NULL CHECK (target_schema_version = 3),
-  staged_row_count INTEGER NOT NULL CHECK (staged_row_count >= 0),
+  freeze_row_count INTEGER NOT NULL CHECK (freeze_row_count >= 0),
+  child_fold_row_count INTEGER NOT NULL CHECK (child_fold_row_count >= 0),
+  workflow_generation_row_count INTEGER NOT NULL
+    CHECK (workflow_generation_row_count >= 0),
   sealed INTEGER NOT NULL CHECK (sealed = 1)
 ) STRICT;
 
@@ -707,8 +831,14 @@ SELECT CASE WHEN
   AND (SELECT source_schema_version FROM qualified_checkpoint_v3_stage_marker) = 2
   AND (SELECT target_schema_version FROM qualified_checkpoint_v3_stage_marker) = 3
   AND (SELECT sealed FROM qualified_checkpoint_v3_stage_marker) = 1
-  AND (SELECT staged_row_count FROM qualified_checkpoint_v3_stage_marker)
+  AND (SELECT freeze_row_count FROM qualified_checkpoint_v3_stage_marker)
     = (SELECT count(*) FROM qualified_checkpoint_v3_stage_rows)
+  AND (SELECT child_fold_row_count FROM qualified_checkpoint_v3_stage_marker)
+    = (SELECT count(*) FROM qualified_checkpoint_v3_stage_child_event_folds)
+  AND (SELECT workflow_generation_row_count
+       FROM qualified_checkpoint_v3_stage_marker)
+    = (SELECT count(*)
+       FROM qualified_checkpoint_v3_stage_workflow_generation_folds)
   AND (SELECT count(*) FROM temp.sqlite_schema
        WHERE type = 'trigger' AND name IN (
          'qualified_checkpoint_v3_stage_marker_no_insert',
@@ -716,8 +846,14 @@ SELECT CASE WHEN
          'qualified_checkpoint_v3_stage_marker_no_delete',
          'qualified_checkpoint_v3_stage_rows_no_insert',
          'qualified_checkpoint_v3_stage_rows_no_update',
-         'qualified_checkpoint_v3_stage_rows_no_delete'
-       )) = 6
+         'qualified_checkpoint_v3_stage_rows_no_delete',
+         'qualified_checkpoint_v3_stage_child_event_folds_no_insert',
+         'qualified_checkpoint_v3_stage_child_event_folds_no_update',
+         'qualified_checkpoint_v3_stage_child_event_folds_no_delete',
+         'qualified_checkpoint_v3_stage_workflow_generation_folds_no_insert',
+         'qualified_checkpoint_v3_stage_workflow_generation_folds_no_update',
+         'qualified_checkpoint_v3_stage_workflow_generation_folds_no_delete'
+       )) = 12
   AND (SELECT count(*) FROM qualified_checkpoint_v3_stage_rows)
     = (SELECT count(*) FROM workflow_instances WHERE session_id IS NOT NULL)
   AND (SELECT count(*) FROM project_meta) = 1
@@ -829,7 +965,1707 @@ SELECT CASE WHEN
         OR NOT (${LEGACY_V1_PAYLOAD_SHAPE_VALID})
       )
   )
+  AND (SELECT count(*) FROM qualified_checkpoint_v3_stage_child_event_folds)
+    = (
+      SELECT count(*) FROM events
+      WHERE stream_type = 'session'
+        AND session_id IS NOT NULL
+        AND parent_session_id IS NOT NULL
+        AND event_type IN (
+          'SessionForked', 'SessionCheckpointRecorded',
+          'EvidenceCoverageRecorded', 'ChildAssignmentAmended',
+          'ChildWorkReported', 'ChildWorkDispositioned',
+          'ChildCompletionProposed', 'ChildSessionCompleted',
+          'ChildSessionSuspended', 'ChildWorkTransferCreated',
+          'ChildWorkTransferClaimed'
+        )
+    )
+  AND NOT EXISTS (
+    SELECT 1
+    FROM qualified_checkpoint_v3_stage_child_event_folds AS child
+    LEFT JOIN events AS target
+      ON target.global_position = child.event_position
+      AND target.project_id = child.project_id
+      AND target.session_id = child.child_session_id
+      AND target.parent_session_id = child.root_session_id
+      AND target.stream_id = 'session/' || child.child_session_id
+      AND target.stream_type = 'session'
+      AND target.stream_version = child.stream_version
+      AND target.event_type IN (
+        'SessionForked', 'SessionCheckpointRecorded',
+        'EvidenceCoverageRecorded', 'ChildAssignmentAmended',
+        'ChildWorkReported', 'ChildWorkDispositioned',
+        'ChildCompletionProposed', 'ChildSessionCompleted',
+        'ChildSessionSuspended', 'ChildWorkTransferCreated',
+        'ChildWorkTransferClaimed'
+      )
+    LEFT JOIN qualified_checkpoint_v3_stage_child_event_folds AS predecessor
+      ON predecessor.project_id = child.project_id
+      AND predecessor.child_session_id = child.child_session_id
+      AND predecessor.root_session_id = child.root_session_id
+      AND predecessor.stream_version = child.stream_version - 1
+    WHERE target.global_position IS NULL
+      OR (child.stream_version = 1 AND (
+        target.event_type <> 'SessionForked'
+        OR child.previous_fingerprint IS NOT NULL
+        OR predecessor.event_position IS NOT NULL
+      ))
+      OR (child.stream_version > 1 AND (
+        target.event_type = 'SessionForked'
+        OR predecessor.event_position IS NULL
+        OR child.event_position <= predecessor.event_position
+        OR child.previous_fingerprint IS NOT predecessor.fingerprint
+      ))
+      OR (
+        target.event_type = 'ChildWorkReported'
+        AND (
+          child.reported_report_id IS NOT json_extract(
+            target.payload_json, '$.report.reportId'
+          )
+          OR child.reported_item_count <> (
+            coalesce(json_array_length(
+              target.payload_json, '$.report.findings'
+            ), -1000)
+            + coalesce(json_array_length(
+              target.payload_json, '$.report.proposedDecisions'
+            ), -1000)
+            + coalesce(json_array_length(
+              target.payload_json, '$.report.filesObservedOrChanged'
+            ), -1000)
+            + coalesce(json_array_length(
+              target.payload_json, '$.report.verificationPerformed'
+            ), -1000)
+            + coalesce(json_array_length(
+              target.payload_json, '$.report.openFollowUps'
+            ), -1000)
+            + coalesce(json_array_length(
+              target.payload_json, '$.report.blockers'
+            ), -1000)
+          )
+        )
+      )
+      OR (
+        target.event_type <> 'ChildWorkReported'
+        AND (
+          child.reported_report_id IS NOT NULL
+          OR child.reported_item_count IS NOT NULL
+          OR child.reported_item_set_fingerprint IS NOT NULL
+        )
+      )
+      OR (
+        child.latest_checkpoint_event_position IS NOT NULL
+        AND NOT EXISTS (
+          SELECT 1 FROM events AS checkpoint_event
+          WHERE checkpoint_event.global_position
+              = child.latest_checkpoint_event_position
+            AND checkpoint_event.project_id = child.project_id
+            AND checkpoint_event.session_id = child.child_session_id
+            AND checkpoint_event.parent_session_id = child.root_session_id
+            AND checkpoint_event.stream_id
+              = 'session/' || child.child_session_id
+            AND checkpoint_event.event_type = 'SessionCheckpointRecorded'
+            AND checkpoint_event.global_position <= child.event_position
+            AND json_extract(
+              checkpoint_event.payload_json, '$.checkpoint.checkpointId'
+            ) = child.latest_checkpoint_id
+        )
+      )
+      OR (
+        child.terminal_event_position IS NOT NULL
+        AND NOT EXISTS (
+          SELECT 1 FROM events AS terminal_event
+          WHERE terminal_event.global_position = child.terminal_event_position
+            AND terminal_event.project_id = child.project_id
+            AND terminal_event.session_id = child.child_session_id
+            AND terminal_event.parent_session_id = child.root_session_id
+            AND terminal_event.stream_id = 'session/' || child.child_session_id
+            AND terminal_event.event_type = child.terminal_event_type
+            AND terminal_event.global_position <= child.event_position
+        )
+      )
+      OR (
+        child.latest_report_id IS NOT NULL
+        AND NOT EXISTS (
+          SELECT 1
+          FROM qualified_checkpoint_v3_stage_child_event_folds AS report
+          WHERE report.project_id = child.project_id
+            AND report.child_session_id = child.child_session_id
+            AND report.reported_report_id = child.latest_report_id
+            AND report.event_position <= child.event_position
+        )
+      )
+      OR (
+        child.completion_report_id IS NOT NULL
+        AND NOT EXISTS (
+          SELECT 1
+          FROM qualified_checkpoint_v3_stage_child_event_folds AS report
+          WHERE report.project_id = child.project_id
+            AND report.child_session_id = child.child_session_id
+            AND report.reported_report_id = child.completion_report_id
+            AND report.event_position < child.event_position
+            AND report.stream_version < child.stream_version
+        )
+      )
+      OR (
+        target.event_type IN (
+          'ChildCompletionProposed', 'ChildSessionCompleted',
+          'ChildWorkDispositioned'
+        )
+        AND NOT EXISTS (
+          SELECT 1
+          FROM qualified_checkpoint_v3_stage_child_event_folds AS report
+          JOIN events AS report_event
+            ON report_event.global_position = report.event_position
+            AND report_event.project_id = report.project_id
+            AND report_event.session_id = report.child_session_id
+            AND report_event.event_type = 'ChildWorkReported'
+          WHERE report.project_id = child.project_id
+            AND report.child_session_id = child.child_session_id
+            AND report.event_position < child.event_position
+            AND report.stream_version < child.stream_version
+            AND report.reported_report_id = coalesce(
+              json_extract(target.payload_json, '$.reportId'),
+              json_extract(target.payload_json, '$.disposition.reportId')
+            )
+            AND (
+              target.event_type <> 'ChildWorkDispositioned'
+              OR (
+                json_type(
+                  target.payload_json,
+                  '$.disposition.allReportItemIds'
+                ) = 'array'
+                AND json_array_length(
+                  target.payload_json,
+                  '$.disposition.allReportItemIds'
+                ) = report.reported_item_count
+                AND NOT EXISTS (
+                  SELECT disposition_item.value
+                  FROM json_each(
+                    target.payload_json,
+                    '$.disposition.allReportItemIds'
+                  ) AS disposition_item
+                  EXCEPT
+                  SELECT report_item.item_id
+                  FROM (
+                    SELECT json_extract(item.value, '$.itemId') AS item_id
+                    FROM json_each(
+                      report_event.payload_json,
+                      '$.report.findings'
+                    ) AS item
+                    UNION ALL
+                    SELECT json_extract(item.value, '$.itemId')
+                    FROM json_each(
+                      report_event.payload_json,
+                      '$.report.proposedDecisions'
+                    ) AS item
+                    UNION ALL
+                    SELECT json_extract(item.value, '$.itemId')
+                    FROM json_each(
+                      report_event.payload_json,
+                      '$.report.filesObservedOrChanged'
+                    ) AS item
+                    UNION ALL
+                    SELECT json_extract(item.value, '$.itemId')
+                    FROM json_each(
+                      report_event.payload_json,
+                      '$.report.verificationPerformed'
+                    ) AS item
+                    UNION ALL
+                    SELECT json_extract(item.value, '$.itemId')
+                    FROM json_each(
+                      report_event.payload_json,
+                      '$.report.openFollowUps'
+                    ) AS item
+                    UNION ALL
+                    SELECT json_extract(item.value, '$.itemId')
+                    FROM json_each(
+                      report_event.payload_json,
+                      '$.report.blockers'
+                    ) AS item
+                  ) AS report_item
+                )
+                AND NOT EXISTS (
+                  SELECT report_item.item_id
+                  FROM (
+                    SELECT json_extract(item.value, '$.itemId') AS item_id
+                    FROM json_each(
+                      report_event.payload_json,
+                      '$.report.findings'
+                    ) AS item
+                    UNION ALL
+                    SELECT json_extract(item.value, '$.itemId')
+                    FROM json_each(
+                      report_event.payload_json,
+                      '$.report.proposedDecisions'
+                    ) AS item
+                    UNION ALL
+                    SELECT json_extract(item.value, '$.itemId')
+                    FROM json_each(
+                      report_event.payload_json,
+                      '$.report.filesObservedOrChanged'
+                    ) AS item
+                    UNION ALL
+                    SELECT json_extract(item.value, '$.itemId')
+                    FROM json_each(
+                      report_event.payload_json,
+                      '$.report.verificationPerformed'
+                    ) AS item
+                    UNION ALL
+                    SELECT json_extract(item.value, '$.itemId')
+                    FROM json_each(
+                      report_event.payload_json,
+                      '$.report.openFollowUps'
+                    ) AS item
+                    UNION ALL
+                    SELECT json_extract(item.value, '$.itemId')
+                    FROM json_each(
+                      report_event.payload_json,
+                      '$.report.blockers'
+                    ) AS item
+                  ) AS report_item
+                  EXCEPT
+                  SELECT disposition_item.value
+                  FROM json_each(
+                    target.payload_json,
+                    '$.disposition.allReportItemIds'
+                  ) AS disposition_item
+                )
+              )
+            )
+        )
+      )
+      OR (
+        child.stream_version = 1
+        AND (
+          child.child_state <> 'active'
+          OR child.latest_checkpoint_id IS NOT NULL
+          OR child.latest_checkpoint_event_position IS NOT NULL
+          OR child.terminal_event_type IS NOT NULL
+          OR child.terminal_event_position IS NOT NULL
+          OR child.report_count <> 0
+          OR child.latest_report_id IS NOT NULL
+          OR child.completion_report_id IS NOT NULL
+          OR child.reported_report_id IS NOT NULL
+          OR child.reported_item_count IS NOT NULL
+          OR child.reported_item_set_fingerprint IS NOT NULL
+          OR child.authority_commitment IS NOT json_extract(
+            target.payload_json, '$.authorityCommitment'
+          )
+        )
+      )
+      OR (
+        child.stream_version > 1
+        AND (
+          child.authority_commitment IS NOT coalesce(
+            json_extract(target.payload_json, '$.authorityCommitment'),
+            predecessor.authority_commitment
+          )
+          OR (
+            target.event_type = 'ChildWorkReported'
+            AND (
+              child.report_count <> predecessor.report_count + 1
+              OR child.latest_report_id IS NOT child.reported_report_id
+              OR child.report_index_fingerprint
+                IS predecessor.report_index_fingerprint
+            )
+          )
+          OR (
+            target.event_type <> 'ChildWorkReported'
+            AND (
+              child.report_count <> predecessor.report_count
+              OR child.latest_report_id IS NOT predecessor.latest_report_id
+              OR child.report_index_fingerprint
+                IS NOT predecessor.report_index_fingerprint
+            )
+          )
+          OR coalesce(CASE target.event_type
+            WHEN 'ChildWorkReported' THEN
+              child.child_state = predecessor.child_state
+              AND child.latest_checkpoint_id IS predecessor.latest_checkpoint_id
+              AND child.latest_checkpoint_event_position
+                IS predecessor.latest_checkpoint_event_position
+              AND child.terminal_event_type IS predecessor.terminal_event_type
+              AND child.terminal_event_position
+                IS predecessor.terminal_event_position
+              AND child.completion_report_id
+                IS predecessor.completion_report_id
+              AND predecessor.child_state IN (
+                'active', 'completion-proposed', 'suspended'
+              )
+            WHEN 'SessionCheckpointRecorded' THEN
+              child.child_state = predecessor.child_state
+              AND child.latest_checkpoint_event_position = child.event_position
+              AND child.latest_checkpoint_id IS json_extract(
+                target.payload_json, '$.checkpoint.checkpointId'
+              )
+              AND child.terminal_event_type IS predecessor.terminal_event_type
+              AND child.terminal_event_position
+                IS predecessor.terminal_event_position
+              AND child.completion_report_id
+                IS predecessor.completion_report_id
+              AND predecessor.child_state IN (
+                'active', 'completion-proposed', 'suspended'
+              )
+            WHEN 'EvidenceCoverageRecorded' THEN
+              child.child_state = predecessor.child_state
+              AND child.latest_checkpoint_id IS predecessor.latest_checkpoint_id
+              AND child.latest_checkpoint_event_position
+                IS predecessor.latest_checkpoint_event_position
+              AND child.terminal_event_type IS predecessor.terminal_event_type
+              AND child.terminal_event_position
+                IS predecessor.terminal_event_position
+              AND child.completion_report_id
+                IS predecessor.completion_report_id
+              AND predecessor.child_state IN (
+                'active', 'completion-proposed', 'suspended'
+              )
+            WHEN 'ChildAssignmentAmended' THEN
+              child.child_state = predecessor.child_state
+              AND child.latest_checkpoint_id IS predecessor.latest_checkpoint_id
+              AND child.latest_checkpoint_event_position
+                IS predecessor.latest_checkpoint_event_position
+              AND child.terminal_event_type IS predecessor.terminal_event_type
+              AND child.terminal_event_position
+                IS predecessor.terminal_event_position
+              AND child.completion_report_id
+                IS predecessor.completion_report_id
+              AND predecessor.child_state IN (
+                'active', 'completion-proposed', 'suspended'
+              )
+            WHEN 'ChildWorkTransferClaimed' THEN
+              child.child_state = predecessor.child_state
+              AND child.latest_checkpoint_id IS predecessor.latest_checkpoint_id
+              AND child.latest_checkpoint_event_position
+                IS predecessor.latest_checkpoint_event_position
+              AND child.terminal_event_type IS predecessor.terminal_event_type
+              AND child.terminal_event_position
+                IS predecessor.terminal_event_position
+              AND child.completion_report_id
+                IS predecessor.completion_report_id
+              AND predecessor.child_state = 'active'
+            WHEN 'ChildCompletionProposed' THEN
+              predecessor.child_state = 'active'
+              AND child.child_state = 'completion-proposed'
+              AND child.completion_report_id IS json_extract(
+                target.payload_json, '$.reportId'
+              )
+              AND child.latest_checkpoint_id IS predecessor.latest_checkpoint_id
+              AND child.latest_checkpoint_event_position
+                IS predecessor.latest_checkpoint_event_position
+              AND child.terminal_event_type IS NULL
+              AND child.terminal_event_position IS NULL
+            WHEN 'ChildWorkDispositioned' THEN
+              predecessor.child_state IN ('active', 'completion-proposed')
+              AND child.latest_checkpoint_id IS predecessor.latest_checkpoint_id
+              AND child.latest_checkpoint_event_position
+                IS predecessor.latest_checkpoint_event_position
+              AND child.terminal_event_type IS NULL
+              AND child.terminal_event_position IS NULL
+              AND (
+                (
+                  predecessor.child_state = 'completion-proposed'
+                  AND json_extract(
+                    target.payload_json, '$.disposition.kind'
+                  ) <> 'accepted'
+                  AND json_extract(
+                    target.payload_json, '$.disposition.reportId'
+                  ) IS predecessor.completion_report_id
+                  AND child.child_state = 'active'
+                  AND child.completion_report_id IS NULL
+                )
+                OR (
+                  NOT (
+                    predecessor.child_state = 'completion-proposed'
+                    AND json_extract(
+                      target.payload_json, '$.disposition.kind'
+                    ) <> 'accepted'
+                    AND json_extract(
+                      target.payload_json, '$.disposition.reportId'
+                    ) IS predecessor.completion_report_id
+                  )
+                  AND child.child_state = predecessor.child_state
+                  AND child.completion_report_id
+                    IS predecessor.completion_report_id
+                )
+              )
+            WHEN 'ChildSessionCompleted' THEN
+              predecessor.child_state IN ('active', 'completion-proposed')
+              AND (
+                predecessor.child_state <> 'completion-proposed'
+                OR predecessor.completion_report_id IS json_extract(
+                  target.payload_json, '$.reportId'
+                )
+              )
+              AND child.child_state = 'completed'
+              AND child.terminal_event_type = 'ChildSessionCompleted'
+              AND child.terminal_event_position = child.event_position
+              AND child.latest_checkpoint_id IS predecessor.latest_checkpoint_id
+              AND child.latest_checkpoint_event_position
+                IS predecessor.latest_checkpoint_event_position
+              AND child.completion_report_id
+                IS predecessor.completion_report_id
+            WHEN 'ChildSessionSuspended' THEN
+              predecessor.child_state IN ('active', 'completion-proposed')
+              AND predecessor.latest_checkpoint_id IS NOT NULL
+              AND json_extract(target.payload_json, '$.checkpointId')
+                IS predecessor.latest_checkpoint_id
+              AND child.child_state = 'suspended'
+              AND child.latest_checkpoint_id IS predecessor.latest_checkpoint_id
+              AND child.latest_checkpoint_event_position
+                IS predecessor.latest_checkpoint_event_position
+              AND child.terminal_event_type IS NULL
+              AND child.terminal_event_position IS NULL
+              AND child.completion_report_id
+                IS predecessor.completion_report_id
+            WHEN 'ChildWorkTransferCreated' THEN
+              predecessor.child_state = 'suspended'
+              AND predecessor.latest_checkpoint_id IS NOT NULL
+              AND json_extract(target.payload_json, '$.checkpointId')
+                IS predecessor.latest_checkpoint_id
+              AND child.child_state = 'transferred'
+              AND child.latest_checkpoint_id IS predecessor.latest_checkpoint_id
+              AND child.latest_checkpoint_event_position
+                IS predecessor.latest_checkpoint_event_position
+              AND child.terminal_event_type = 'ChildWorkTransferCreated'
+              AND child.terminal_event_position = child.event_position
+              AND child.completion_report_id
+                IS predecessor.completion_report_id
+            ELSE 0
+          END, 0) = 0
+        )
+      )
+  )
+  AND NOT EXISTS (
+    SELECT 1 FROM events AS source
+    WHERE source.stream_type = 'session'
+      AND source.session_id IS NOT NULL
+      AND source.parent_session_id IS NOT NULL
+      AND source.event_type IN (
+        'SessionForked', 'SessionCheckpointRecorded',
+        'EvidenceCoverageRecorded', 'ChildAssignmentAmended',
+        'ChildWorkReported', 'ChildWorkDispositioned',
+        'ChildCompletionProposed', 'ChildSessionCompleted',
+        'ChildSessionSuspended', 'ChildWorkTransferCreated',
+        'ChildWorkTransferClaimed'
+      )
+      AND NOT EXISTS (
+        SELECT 1
+        FROM qualified_checkpoint_v3_stage_child_event_folds AS child
+        WHERE child.project_id = source.project_id
+          AND child.child_session_id = source.session_id
+          AND child.event_position = source.global_position
+          AND child.stream_version = source.stream_version
+      )
+  )
+  AND (SELECT count(*)
+       FROM qualified_checkpoint_v3_stage_workflow_generation_folds)
+    = (
+      SELECT count(*) FROM (
+        SELECT event.project_id,
+               json_extract(event.payload_json, '$.workflowId') AS workflow_id,
+               json_extract(event.payload_json, '$.workflowGeneration') AS generation
+        FROM events AS event
+        WHERE event.stream_type = 'session'
+          AND event.session_id IS NOT NULL
+          AND event.parent_session_id IS NULL
+          AND event.event_type IN (
+            'SessionEndRequested', 'SessionEndAmended',
+            'SessionEndCancelled', 'SessionAbandoned'
+          )
+          AND json_type(event.payload_json, '$.workflowId') = 'text'
+          AND json_type(event.payload_json, '$.workflowGeneration') = 'integer'
+        GROUP BY event.project_id, workflow_id, generation
+      )
+    )
+  AND NOT EXISTS (
+    SELECT 1
+    FROM qualified_checkpoint_v3_stage_workflow_generation_folds AS workflow
+    LEFT JOIN events AS trigger_event
+      ON trigger_event.global_position = workflow.trigger_event_position
+      AND trigger_event.project_id = workflow.project_id
+      AND trigger_event.session_id = workflow.session_id
+      AND trigger_event.parent_session_id IS NULL
+      AND trigger_event.stream_type = 'session'
+      AND trigger_event.stream_id = 'session/' || workflow.session_id
+      AND trigger_event.command_id = workflow.root_command_id
+      AND trigger_event.event_type IN (
+        'SessionEndRequested', 'SessionEndAmended',
+        'SessionEndCancelled', 'SessionAbandoned'
+      )
+      AND json_extract(trigger_event.payload_json, '$.workflowId')
+        = workflow.workflow_id
+      AND json_extract(trigger_event.payload_json, '$.workflowGeneration')
+        = workflow.workflow_generation
+    LEFT JOIN events AS trigger_intent_event
+      ON trigger_intent_event.project_id = trigger_event.project_id
+      AND trigger_intent_event.command_id = trigger_event.command_id
+      AND trigger_intent_event.command_event_index = 0
+      AND trigger_intent_event.session_id = trigger_event.session_id
+      AND trigger_intent_event.stream_id = trigger_event.stream_id
+      AND trigger_intent_event.lifecycle_intent_json IS NOT NULL
+    LEFT JOIN events AS source_event
+      ON source_event.global_position
+        = workflow.effective_draft_source_event_position
+      AND source_event.project_id = workflow.project_id
+      AND source_event.session_id = workflow.session_id
+      AND source_event.parent_session_id IS NULL
+      AND source_event.stream_type = 'session'
+      AND source_event.stream_id = 'session/' || workflow.session_id
+      AND source_event.event_type IN (
+        'SessionEndRequested', 'SessionEndAmended'
+      )
+      AND json_extract(source_event.payload_json, '$.workflowId')
+        = workflow.workflow_id
+    LEFT JOIN events AS source_intent_event
+      ON source_intent_event.project_id = source_event.project_id
+      AND source_intent_event.command_id = source_event.command_id
+      AND source_intent_event.command_event_index = 0
+      AND source_intent_event.session_id = source_event.session_id
+      AND source_intent_event.stream_id = source_event.stream_id
+      AND source_intent_event.lifecycle_intent_json IS NOT NULL
+    LEFT JOIN qualified_checkpoint_v3_stage_workflow_generation_folds AS predecessor
+      ON predecessor.project_id = workflow.project_id
+      AND predecessor.workflow_id = workflow.workflow_id
+      AND predecessor.session_id = workflow.session_id
+      AND predecessor.workflow_generation = workflow.workflow_generation - 1
+    WHERE trigger_event.global_position IS NULL
+      OR trigger_intent_event.global_position IS NULL
+      OR source_event.global_position IS NULL
+      OR source_intent_event.global_position IS NULL
+      OR json_extract(
+        trigger_intent_event.lifecycle_intent_json,
+        '$.intent.command.commandId'
+      ) IS NOT workflow.root_command_id
+      OR coalesce(CASE trigger_event.event_type
+        WHEN 'SessionEndRequested' THEN
+          json_extract(
+            trigger_intent_event.lifecycle_intent_json,
+            '$.intent.command.commandType'
+          ) = 'request-session-end'
+          AND json_extract(
+            trigger_intent_event.lifecycle_intent_json,
+            '$.intent.command.request.sessionId'
+          ) = workflow.session_id
+        WHEN 'SessionEndAmended' THEN
+          json_extract(
+            trigger_intent_event.lifecycle_intent_json,
+            '$.intent.command.commandType'
+          ) = 'amend-session-end'
+          AND json_extract(
+            trigger_intent_event.lifecycle_intent_json,
+            '$.intent.command.sessionId'
+          ) = workflow.session_id
+          AND json_extract(
+            trigger_intent_event.lifecycle_intent_json,
+            '$.intent.command.workflowId'
+          ) = workflow.workflow_id
+        WHEN 'SessionEndCancelled' THEN
+          json_extract(
+            trigger_intent_event.lifecycle_intent_json,
+            '$.intent.command.commandType'
+          ) = 'cancel-session-end'
+          AND json_extract(
+            trigger_intent_event.lifecycle_intent_json,
+            '$.intent.command.sessionId'
+          ) = workflow.session_id
+          AND json_extract(
+            trigger_intent_event.lifecycle_intent_json,
+            '$.intent.command.workflowId'
+          ) = workflow.workflow_id
+        WHEN 'SessionAbandoned' THEN
+          json_extract(
+            trigger_intent_event.lifecycle_intent_json,
+            '$.intent.command.commandType'
+          ) = 'abandon-session'
+          AND json_extract(
+            trigger_intent_event.lifecycle_intent_json,
+            '$.intent.command.sessionId'
+          ) = workflow.session_id
+        ELSE 0
+      END, 0) = 0
+      OR json_extract(
+        source_intent_event.lifecycle_intent_json,
+        '$.intent.command.commandId'
+      ) IS NOT source_event.command_id
+      OR coalesce(CASE source_event.event_type
+        WHEN 'SessionEndRequested' THEN
+          json_extract(
+            source_intent_event.lifecycle_intent_json,
+            '$.intent.command.commandType'
+          ) = 'request-session-end'
+          AND json_extract(
+            source_intent_event.lifecycle_intent_json,
+            '$.intent.command.request.sessionId'
+          ) = workflow.session_id
+        WHEN 'SessionEndAmended' THEN
+          json_extract(
+            source_intent_event.lifecycle_intent_json,
+            '$.intent.command.commandType'
+          ) = 'amend-session-end'
+          AND json_extract(
+            source_intent_event.lifecycle_intent_json,
+            '$.intent.command.sessionId'
+          ) = workflow.session_id
+          AND json_extract(
+            source_intent_event.lifecycle_intent_json,
+            '$.intent.command.workflowId'
+          ) = workflow.workflow_id
+        ELSE 0
+      END, 0) = 0
+      OR (
+        workflow.workflow_generation = 1
+        AND (
+          workflow.previous_fingerprint IS NOT NULL
+          OR predecessor.workflow_generation IS NOT NULL
+        )
+      )
+      OR (
+        workflow.workflow_generation > 1
+        AND (
+          predecessor.workflow_generation IS NULL
+          OR workflow.previous_fingerprint IS NOT predecessor.fingerprint
+          OR workflow.trigger_event_position
+            <= predecessor.trigger_event_position
+        )
+      )
+      OR EXISTS (
+        SELECT 1 FROM events AS later
+        WHERE later.project_id = workflow.project_id
+          AND later.session_id = workflow.session_id
+          AND later.global_position > workflow.trigger_event_position
+          AND later.event_type IN (
+            'SessionEndRequested', 'SessionEndAmended',
+            'SessionEndCancelled', 'SessionAbandoned'
+          )
+          AND json_extract(later.payload_json, '$.workflowId')
+            = workflow.workflow_id
+          AND json_extract(later.payload_json, '$.workflowGeneration')
+            = workflow.workflow_generation
+      )
+      OR workflow.effective_checkpoint_version IS NOT coalesce(
+        json_extract(
+          source_intent_event.lifecycle_intent_json,
+          '$.intent.command.request.finalCheckpoint.checkpointVersion'
+        ),
+        json_extract(
+          source_intent_event.lifecycle_intent_json,
+          '$.intent.command.amendment.finalCheckpoint.checkpointVersion'
+        )
+      )
+      OR (
+        workflow.replacement_checkpoint_version IS NOT NULL
+        AND (
+          workflow.effective_draft_source_event_position
+            <> workflow.trigger_event_position
+          OR workflow.replacement_checkpoint_version IS NOT coalesce(
+            json_extract(
+              trigger_intent_event.lifecycle_intent_json,
+              '$.intent.command.request.finalCheckpoint.checkpointVersion'
+            ),
+            json_extract(
+              trigger_intent_event.lifecycle_intent_json,
+              '$.intent.command.amendment.finalCheckpoint.checkpointVersion'
+            )
+          )
+        )
+      )
+      OR (
+        trigger_event.event_type IN (
+          'SessionEndCancelled', 'SessionAbandoned'
+        )
+        AND workflow.replacement_checkpoint_version IS NOT NULL
+      )
+      OR coalesce(CASE trigger_event.event_type
+        WHEN 'SessionEndRequested' THEN
+          workflow.replacement_checkpoint_version IS NOT NULL
+          AND workflow.replacement_checkpoint_version
+            = workflow.effective_checkpoint_version
+          AND workflow.effective_draft_source_event_position
+            = workflow.trigger_event_position
+          AND workflow.replacement_checkpoint_version IS coalesce(
+            json_extract(
+              trigger_intent_event.lifecycle_intent_json,
+              '$.intent.command.request.finalCheckpoint.checkpointVersion'
+            ),
+            json_extract(
+              trigger_intent_event.lifecycle_intent_json,
+              '$.intent.command.amendment.finalCheckpoint.checkpointVersion'
+            )
+          )
+          AND workflow.evidence_window_state = CASE
+            WHEN workflow.replacement_checkpoint_version = 2 THEN 'open'
+            ELSE 'sealed'
+          END
+        WHEN 'SessionEndAmended' THEN
+          workflow.workflow_generation > 1
+          AND json_extract(
+            trigger_event.payload_json, '$.previousWorkflowGeneration'
+          ) = predecessor.workflow_generation
+          AND workflow.replacement_checkpoint_version IS coalesce(
+            json_extract(
+              trigger_intent_event.lifecycle_intent_json,
+              '$.intent.command.request.finalCheckpoint.checkpointVersion'
+            ),
+            json_extract(
+              trigger_intent_event.lifecycle_intent_json,
+              '$.intent.command.amendment.finalCheckpoint.checkpointVersion'
+            )
+          )
+          AND (
+            (
+              workflow.replacement_checkpoint_version IS NULL
+              AND workflow.effective_checkpoint_version
+                = predecessor.effective_checkpoint_version
+              AND workflow.effective_draft_source_event_position
+                = predecessor.effective_draft_source_event_position
+            )
+            OR (
+              workflow.replacement_checkpoint_version IS NOT NULL
+              AND workflow.effective_checkpoint_version
+                = workflow.replacement_checkpoint_version
+              AND workflow.effective_draft_source_event_position
+                = workflow.trigger_event_position
+            )
+          )
+          AND (
+            (
+              trigger_event.event_schema_version = 1
+              AND workflow.evidence_window_state
+                = predecessor.evidence_window_state
+            )
+            OR (
+              trigger_event.event_schema_version = 2
+              AND (
+                (
+                  json_extract(
+                    trigger_event.payload_json, '$.evidenceWindowAction'
+                  ) = 'unchanged'
+                  AND workflow.evidence_window_state
+                    = predecessor.evidence_window_state
+                )
+                OR (
+                  json_extract(
+                    trigger_event.payload_json, '$.evidenceWindowAction'
+                  ) = 'open'
+                  AND predecessor.evidence_window_state = 'sealed'
+                  AND workflow.replacement_checkpoint_version = 2
+                  AND workflow.evidence_window_state = 'open'
+                )
+                OR (
+                  json_extract(
+                    trigger_event.payload_json, '$.evidenceWindowAction'
+                  ) = 'seal'
+                  AND predecessor.evidence_window_state = 'open'
+                  AND workflow.evidence_window_state = 'sealed'
+                )
+              )
+            )
+          )
+        WHEN 'SessionEndCancelled' THEN
+          workflow.replacement_checkpoint_version IS NULL
+          AND workflow.evidence_window_state = 'sealed'
+          AND (
+            (
+              workflow.workflow_generation > 1
+              AND workflow.effective_checkpoint_version
+                = predecessor.effective_checkpoint_version
+              AND workflow.effective_draft_source_event_position
+                = predecessor.effective_draft_source_event_position
+            )
+            OR (
+              source_event.global_position < trigger_event.global_position
+              AND json_extract(
+                source_event.payload_json, '$.workflowGeneration'
+              ) = workflow.workflow_generation
+            )
+          )
+        WHEN 'SessionAbandoned' THEN
+          workflow.replacement_checkpoint_version IS NULL
+          AND workflow.evidence_window_state = 'sealed'
+          AND (
+            (
+              workflow.workflow_generation > 1
+              AND workflow.effective_checkpoint_version
+                = predecessor.effective_checkpoint_version
+              AND workflow.effective_draft_source_event_position
+                = predecessor.effective_draft_source_event_position
+            )
+            OR (
+              source_event.global_position < trigger_event.global_position
+              AND json_extract(
+                source_event.payload_json, '$.workflowGeneration'
+              ) = workflow.workflow_generation
+            )
+          )
+        ELSE 0
+      END, 0) = 0
+  )
+  AND NOT EXISTS (
+    SELECT 1 FROM workflow_instances AS instance
+    WHERE instance.session_id IS NOT NULL
+      AND NOT EXISTS (
+        SELECT 1
+        FROM qualified_checkpoint_v3_stage_workflow_generation_folds AS fold
+        WHERE fold.workflow_id = instance.workflow_id
+          AND fold.session_id = instance.session_id
+          AND fold.workflow_generation = instance.generation
+          AND fold.trigger_event_position = instance.triggering_event_position
+          AND fold.root_command_id = instance.root_command_id
+      )
+  )
+  AND NOT EXISTS (
+    SELECT 1
+    FROM qualified_checkpoint_v3_stage_workflow_generation_folds AS fold
+    WHERE fold.workflow_generation = (
+      SELECT max(candidate.workflow_generation)
+      FROM qualified_checkpoint_v3_stage_workflow_generation_folds AS candidate
+      WHERE candidate.project_id = fold.project_id
+        AND candidate.workflow_id = fold.workflow_id
+    )
+      AND NOT EXISTS (
+        SELECT 1 FROM workflow_instances AS instance
+        WHERE instance.workflow_id = fold.workflow_id
+          AND instance.session_id = fold.session_id
+          AND instance.generation = fold.workflow_generation
+          AND instance.triggering_event_position = fold.trigger_event_position
+          AND instance.root_command_id = fold.root_command_id
+      )
+  )
 THEN 1 ELSE 0 END;
+
+CREATE TABLE lifecycle_child_event_folds (
+  project_id TEXT NOT NULL,
+  child_session_id TEXT NOT NULL,
+  event_position INTEGER NOT NULL CHECK (event_position > 0),
+  stream_version INTEGER NOT NULL CHECK (stream_version > 0),
+  root_session_id TEXT NOT NULL,
+  child_state TEXT NOT NULL CHECK (child_state IN (
+    'active', 'completion-proposed', 'completed', 'suspended', 'transferred'
+  )),
+  latest_checkpoint_id TEXT,
+  latest_checkpoint_event_position INTEGER
+    CHECK (
+      latest_checkpoint_event_position IS NULL
+      OR latest_checkpoint_event_position > 0
+    ),
+  authority_commitment TEXT NOT NULL CHECK (
+    length(authority_commitment) = 64
+    AND authority_commitment NOT GLOB '*[^0-9a-f]*'
+  ),
+  terminal_event_type TEXT CHECK (
+    terminal_event_type IS NULL
+    OR terminal_event_type IN (
+      'ChildSessionCompleted', 'ChildWorkTransferCreated'
+    )
+  ),
+  terminal_event_position INTEGER
+    CHECK (terminal_event_position IS NULL OR terminal_event_position > 0),
+  report_count INTEGER NOT NULL CHECK (report_count BETWEEN 0 AND 200),
+  latest_report_id TEXT,
+  report_index_fingerprint TEXT NOT NULL CHECK (
+    length(report_index_fingerprint) = 64
+    AND report_index_fingerprint NOT GLOB '*[^0-9a-f]*'
+  ),
+  completion_report_id TEXT,
+  reported_report_id TEXT,
+  reported_item_count INTEGER
+    CHECK (reported_item_count IS NULL OR reported_item_count BETWEEN 0 AND 200),
+  reported_item_set_fingerprint TEXT CHECK (
+    reported_item_set_fingerprint IS NULL
+    OR (
+      length(reported_item_set_fingerprint) = 64
+      AND reported_item_set_fingerprint NOT GLOB '*[^0-9a-f]*'
+    )
+  ),
+  previous_fingerprint TEXT CHECK (
+    previous_fingerprint IS NULL
+    OR (
+      length(previous_fingerprint) = 64
+      AND previous_fingerprint NOT GLOB '*[^0-9a-f]*'
+    )
+  ),
+  fingerprint TEXT NOT NULL CHECK (
+    length(fingerprint) = 64 AND fingerprint NOT GLOB '*[^0-9a-f]*'
+  ),
+  PRIMARY KEY (project_id, child_session_id, event_position),
+  UNIQUE (project_id, child_session_id, stream_version),
+  CHECK (
+    (latest_checkpoint_id IS NULL)
+      = (latest_checkpoint_event_position IS NULL)
+  ),
+  CHECK ((terminal_event_type IS NULL) = (terminal_event_position IS NULL)),
+  CHECK ((report_count = 0) = (latest_report_id IS NULL)),
+  CHECK (
+    (reported_report_id IS NULL) = (reported_item_count IS NULL)
+    AND (reported_report_id IS NULL)
+      = (reported_item_set_fingerprint IS NULL)
+  ),
+  CHECK (completion_report_id IS NULL OR report_count > 0),
+  CHECK (
+    (child_state = 'completed'
+      AND terminal_event_type = 'ChildSessionCompleted')
+    OR (child_state = 'transferred'
+      AND terminal_event_type = 'ChildWorkTransferCreated')
+    OR (child_state IN ('active', 'completion-proposed', 'suspended')
+      AND terminal_event_type IS NULL)
+  ),
+  CHECK (
+    terminal_event_position IS NULL
+    OR terminal_event_position <= event_position
+  ),
+  CHECK (
+    latest_checkpoint_event_position IS NULL
+    OR latest_checkpoint_event_position <= event_position
+  ),
+  FOREIGN KEY (event_position) REFERENCES events(global_position)
+    DEFERRABLE INITIALLY DEFERRED,
+  FOREIGN KEY (latest_checkpoint_event_position) REFERENCES events(global_position)
+    DEFERRABLE INITIALLY DEFERRED,
+  FOREIGN KEY (terminal_event_position) REFERENCES events(global_position)
+    DEFERRABLE INITIALLY DEFERRED
+) STRICT;
+
+CREATE INDEX lifecycle_child_event_folds_at_event
+ON lifecycle_child_event_folds(
+  project_id, child_session_id, event_position
+);
+CREATE INDEX lifecycle_child_event_folds_root_at_event
+ON lifecycle_child_event_folds(
+  project_id, root_session_id, event_position
+);
+CREATE UNIQUE INDEX lifecycle_child_event_folds_report_witness
+ON lifecycle_child_event_folds(
+  project_id, child_session_id, reported_report_id
+)
+WHERE reported_report_id IS NOT NULL;
+
+CREATE TRIGGER lifecycle_child_event_folds_insert_guard
+BEFORE INSERT ON lifecycle_child_event_folds
+WHEN
+  NOT EXISTS (
+    SELECT 1 FROM events AS target
+    WHERE target.global_position = NEW.event_position
+      AND target.project_id = NEW.project_id
+      AND target.stream_type = 'session'
+      AND target.stream_id = 'session/' || NEW.child_session_id
+      AND target.session_id = NEW.child_session_id
+      AND target.parent_session_id = NEW.root_session_id
+      AND target.stream_version = NEW.stream_version
+      AND target.event_type IN (
+        'SessionForked', 'SessionCheckpointRecorded',
+        'EvidenceCoverageRecorded', 'ChildAssignmentAmended',
+        'ChildWorkReported', 'ChildWorkDispositioned',
+        'ChildCompletionProposed', 'ChildSessionCompleted',
+        'ChildSessionSuspended', 'ChildWorkTransferCreated',
+        'ChildWorkTransferClaimed'
+      )
+  )
+  OR (
+    NEW.stream_version = 1
+    AND (
+      NEW.previous_fingerprint IS NOT NULL
+      OR NOT EXISTS (
+        SELECT 1 FROM events AS target
+        WHERE target.global_position = NEW.event_position
+          AND target.event_type = 'SessionForked'
+      )
+      OR EXISTS (
+        SELECT 1 FROM lifecycle_child_event_folds AS predecessor
+        WHERE predecessor.project_id = NEW.project_id
+          AND predecessor.child_session_id = NEW.child_session_id
+      )
+    )
+  )
+  OR (
+    NEW.stream_version > 1
+    AND NOT EXISTS (
+      SELECT 1 FROM lifecycle_child_event_folds AS predecessor
+      WHERE predecessor.project_id = NEW.project_id
+        AND predecessor.child_session_id = NEW.child_session_id
+        AND predecessor.stream_version = NEW.stream_version - 1
+        AND predecessor.root_session_id = NEW.root_session_id
+        AND predecessor.event_position < NEW.event_position
+        AND predecessor.fingerprint = NEW.previous_fingerprint
+    )
+  )
+  OR (
+    NEW.stream_version > 1
+    AND EXISTS (
+      SELECT 1 FROM events AS target
+      WHERE target.global_position = NEW.event_position
+        AND target.event_type = 'SessionForked'
+    )
+  )
+  OR (
+    (SELECT event_type FROM events
+      WHERE global_position = NEW.event_position) = 'ChildWorkReported'
+    AND (
+      NEW.reported_report_id IS NOT (
+        SELECT json_extract(payload_json, '$.report.reportId')
+        FROM events WHERE global_position = NEW.event_position
+      )
+      OR NEW.reported_item_count IS NOT (
+        SELECT
+          coalesce(json_array_length(payload_json, '$.report.findings'), -1000)
+          + coalesce(json_array_length(
+            payload_json, '$.report.proposedDecisions'
+          ), -1000)
+          + coalesce(json_array_length(
+            payload_json, '$.report.filesObservedOrChanged'
+          ), -1000)
+          + coalesce(json_array_length(
+            payload_json, '$.report.verificationPerformed'
+          ), -1000)
+          + coalesce(json_array_length(
+            payload_json, '$.report.openFollowUps'
+          ), -1000)
+          + coalesce(json_array_length(payload_json, '$.report.blockers'), -1000)
+        FROM events WHERE global_position = NEW.event_position
+      )
+    )
+  )
+  OR (
+    (SELECT event_type FROM events
+      WHERE global_position = NEW.event_position) <> 'ChildWorkReported'
+    AND (
+      NEW.reported_report_id IS NOT NULL
+      OR NEW.reported_item_count IS NOT NULL
+      OR NEW.reported_item_set_fingerprint IS NOT NULL
+    )
+  )
+  OR (
+    NEW.latest_checkpoint_event_position IS NOT NULL
+    AND NOT EXISTS (
+      SELECT 1 FROM events AS checkpoint_event
+      WHERE checkpoint_event.global_position
+          = NEW.latest_checkpoint_event_position
+        AND checkpoint_event.project_id = NEW.project_id
+        AND checkpoint_event.session_id = NEW.child_session_id
+        AND checkpoint_event.parent_session_id = NEW.root_session_id
+        AND checkpoint_event.stream_type = 'session'
+        AND checkpoint_event.event_type = 'SessionCheckpointRecorded'
+        AND checkpoint_event.global_position <= NEW.event_position
+        AND json_extract(
+          checkpoint_event.payload_json, '$.checkpoint.checkpointId'
+        ) = NEW.latest_checkpoint_id
+    )
+  )
+  OR (
+    NEW.terminal_event_position IS NOT NULL
+    AND NOT EXISTS (
+      SELECT 1 FROM events AS terminal_event
+      WHERE terminal_event.global_position = NEW.terminal_event_position
+        AND terminal_event.project_id = NEW.project_id
+        AND terminal_event.session_id = NEW.child_session_id
+        AND terminal_event.parent_session_id = NEW.root_session_id
+        AND terminal_event.stream_type = 'session'
+        AND terminal_event.event_type = NEW.terminal_event_type
+        AND terminal_event.global_position <= NEW.event_position
+    )
+  )
+  OR (
+    NEW.latest_report_id IS NOT NULL
+    AND NOT EXISTS (
+      SELECT 1 FROM lifecycle_child_event_folds AS report
+      WHERE report.project_id = NEW.project_id
+        AND report.child_session_id = NEW.child_session_id
+        AND report.reported_report_id = NEW.latest_report_id
+        AND report.event_position <= NEW.event_position
+    )
+    AND NEW.reported_report_id IS NOT NEW.latest_report_id
+  )
+  OR (
+    NEW.completion_report_id IS NOT NULL
+    AND NOT EXISTS (
+      SELECT 1 FROM lifecycle_child_event_folds AS report
+      WHERE report.project_id = NEW.project_id
+        AND report.child_session_id = NEW.child_session_id
+        AND report.reported_report_id = NEW.completion_report_id
+        AND report.event_position < NEW.event_position
+        AND report.stream_version < NEW.stream_version
+    )
+  )
+  OR (
+    (SELECT event_type FROM events
+      WHERE global_position = NEW.event_position)
+      IN (
+        'ChildCompletionProposed', 'ChildSessionCompleted',
+        'ChildWorkDispositioned'
+      )
+    AND NOT EXISTS (
+      SELECT 1
+      FROM lifecycle_child_event_folds AS report
+      JOIN events AS target ON target.global_position = NEW.event_position
+      WHERE report.project_id = NEW.project_id
+        AND report.child_session_id = NEW.child_session_id
+        AND report.event_position < NEW.event_position
+        AND report.stream_version < NEW.stream_version
+        AND report.reported_report_id = coalesce(
+          json_extract(target.payload_json, '$.reportId'),
+          json_extract(target.payload_json, '$.disposition.reportId')
+        )
+    )
+  )
+  OR (
+    NEW.stream_version = 1
+    AND (
+      NEW.child_state <> 'active'
+      OR NEW.latest_checkpoint_id IS NOT NULL
+      OR NEW.latest_checkpoint_event_position IS NOT NULL
+      OR NEW.terminal_event_type IS NOT NULL
+      OR NEW.terminal_event_position IS NOT NULL
+      OR NEW.report_count <> 0
+      OR NEW.latest_report_id IS NOT NULL
+      OR NEW.completion_report_id IS NOT NULL
+      OR NEW.reported_report_id IS NOT NULL
+      OR NEW.reported_item_count IS NOT NULL
+      OR NEW.reported_item_set_fingerprint IS NOT NULL
+      OR NEW.authority_commitment IS NOT (
+        SELECT json_extract(target.payload_json, '$.authorityCommitment')
+        FROM events AS target
+        WHERE target.global_position = NEW.event_position
+      )
+    )
+  )
+  OR (
+    NEW.stream_version > 1
+    AND NOT EXISTS (
+      SELECT 1
+      FROM lifecycle_child_event_folds AS predecessor
+      JOIN events AS target
+        ON target.global_position = NEW.event_position
+      WHERE predecessor.project_id = NEW.project_id
+        AND predecessor.child_session_id = NEW.child_session_id
+        AND predecessor.stream_version = NEW.stream_version - 1
+        AND predecessor.event_position < NEW.event_position
+        AND predecessor.fingerprint = NEW.previous_fingerprint
+        AND NEW.authority_commitment IS coalesce(
+          json_extract(target.payload_json, '$.authorityCommitment'),
+          predecessor.authority_commitment
+        )
+        AND (
+          (
+            target.event_type = 'ChildWorkReported'
+            AND NEW.report_count = predecessor.report_count + 1
+            AND NEW.latest_report_id IS NEW.reported_report_id
+            AND NEW.report_index_fingerprint
+              IS NOT predecessor.report_index_fingerprint
+          )
+          OR (
+            target.event_type <> 'ChildWorkReported'
+            AND NEW.report_count = predecessor.report_count
+            AND NEW.latest_report_id IS predecessor.latest_report_id
+            AND NEW.report_index_fingerprint
+              IS predecessor.report_index_fingerprint
+          )
+        )
+        AND CASE target.event_type
+          WHEN 'ChildWorkReported' THEN
+            NEW.child_state = predecessor.child_state
+            AND NEW.latest_checkpoint_id IS predecessor.latest_checkpoint_id
+            AND NEW.latest_checkpoint_event_position
+              IS predecessor.latest_checkpoint_event_position
+            AND NEW.terminal_event_type IS predecessor.terminal_event_type
+            AND NEW.terminal_event_position IS predecessor.terminal_event_position
+            AND NEW.completion_report_id IS predecessor.completion_report_id
+            AND predecessor.child_state IN (
+              'active', 'completion-proposed', 'suspended'
+            )
+          WHEN 'SessionCheckpointRecorded' THEN
+            NEW.child_state = predecessor.child_state
+            AND NEW.latest_checkpoint_event_position = NEW.event_position
+            AND NEW.latest_checkpoint_id IS json_extract(
+              target.payload_json, '$.checkpoint.checkpointId'
+            )
+            AND NEW.terminal_event_type IS predecessor.terminal_event_type
+            AND NEW.terminal_event_position IS predecessor.terminal_event_position
+            AND NEW.completion_report_id IS predecessor.completion_report_id
+            AND predecessor.child_state IN (
+              'active', 'completion-proposed', 'suspended'
+            )
+          WHEN 'EvidenceCoverageRecorded' THEN
+            NEW.child_state = predecessor.child_state
+            AND NEW.latest_checkpoint_id IS predecessor.latest_checkpoint_id
+            AND NEW.latest_checkpoint_event_position
+              IS predecessor.latest_checkpoint_event_position
+            AND NEW.terminal_event_type IS predecessor.terminal_event_type
+            AND NEW.terminal_event_position IS predecessor.terminal_event_position
+            AND NEW.completion_report_id IS predecessor.completion_report_id
+            AND predecessor.child_state IN (
+              'active', 'completion-proposed', 'suspended'
+            )
+          WHEN 'ChildAssignmentAmended' THEN
+            NEW.child_state = predecessor.child_state
+            AND NEW.latest_checkpoint_id IS predecessor.latest_checkpoint_id
+            AND NEW.latest_checkpoint_event_position
+              IS predecessor.latest_checkpoint_event_position
+            AND NEW.terminal_event_type IS predecessor.terminal_event_type
+            AND NEW.terminal_event_position IS predecessor.terminal_event_position
+            AND NEW.completion_report_id IS predecessor.completion_report_id
+            AND predecessor.child_state IN (
+              'active', 'completion-proposed', 'suspended'
+            )
+          WHEN 'ChildWorkTransferClaimed' THEN
+            NEW.child_state = predecessor.child_state
+            AND NEW.latest_checkpoint_id IS predecessor.latest_checkpoint_id
+            AND NEW.latest_checkpoint_event_position
+              IS predecessor.latest_checkpoint_event_position
+            AND NEW.terminal_event_type IS predecessor.terminal_event_type
+            AND NEW.terminal_event_position IS predecessor.terminal_event_position
+            AND NEW.completion_report_id IS predecessor.completion_report_id
+            AND predecessor.child_state = 'active'
+          WHEN 'ChildCompletionProposed' THEN
+            predecessor.child_state = 'active'
+            AND NEW.child_state = 'completion-proposed'
+            AND NEW.completion_report_id IS json_extract(
+              target.payload_json, '$.reportId'
+            )
+            AND NEW.latest_checkpoint_id IS predecessor.latest_checkpoint_id
+            AND NEW.latest_checkpoint_event_position
+              IS predecessor.latest_checkpoint_event_position
+            AND NEW.terminal_event_type IS NULL
+            AND NEW.terminal_event_position IS NULL
+          WHEN 'ChildWorkDispositioned' THEN
+            predecessor.child_state IN ('active', 'completion-proposed')
+            AND NEW.latest_checkpoint_id IS predecessor.latest_checkpoint_id
+            AND NEW.latest_checkpoint_event_position
+              IS predecessor.latest_checkpoint_event_position
+            AND NEW.terminal_event_type IS NULL
+            AND NEW.terminal_event_position IS NULL
+            AND (
+              (
+                predecessor.child_state = 'completion-proposed'
+                AND json_extract(
+                  target.payload_json, '$.disposition.kind'
+                ) <> 'accepted'
+                AND json_extract(
+                  target.payload_json, '$.disposition.reportId'
+                ) IS predecessor.completion_report_id
+                AND NEW.child_state = 'active'
+                AND NEW.completion_report_id IS NULL
+              )
+              OR (
+                NOT (
+                  predecessor.child_state = 'completion-proposed'
+                  AND json_extract(
+                    target.payload_json, '$.disposition.kind'
+                  ) <> 'accepted'
+                  AND json_extract(
+                    target.payload_json, '$.disposition.reportId'
+                  ) IS predecessor.completion_report_id
+                )
+                AND NEW.child_state = predecessor.child_state
+                AND NEW.completion_report_id
+                  IS predecessor.completion_report_id
+              )
+            )
+          WHEN 'ChildSessionCompleted' THEN
+            predecessor.child_state IN ('active', 'completion-proposed')
+            AND (
+              predecessor.child_state <> 'completion-proposed'
+              OR predecessor.completion_report_id IS json_extract(
+                target.payload_json, '$.reportId'
+              )
+            )
+            AND NEW.child_state = 'completed'
+            AND NEW.terminal_event_type = 'ChildSessionCompleted'
+            AND NEW.terminal_event_position = NEW.event_position
+            AND NEW.latest_checkpoint_id IS predecessor.latest_checkpoint_id
+            AND NEW.latest_checkpoint_event_position
+              IS predecessor.latest_checkpoint_event_position
+            AND NEW.completion_report_id IS predecessor.completion_report_id
+          WHEN 'ChildSessionSuspended' THEN
+            predecessor.child_state IN ('active', 'completion-proposed')
+            AND predecessor.latest_checkpoint_id IS NOT NULL
+            AND json_extract(target.payload_json, '$.checkpointId')
+              IS predecessor.latest_checkpoint_id
+            AND NEW.child_state = 'suspended'
+            AND NEW.latest_checkpoint_id IS predecessor.latest_checkpoint_id
+            AND NEW.latest_checkpoint_event_position
+              IS predecessor.latest_checkpoint_event_position
+            AND NEW.terminal_event_type IS NULL
+            AND NEW.terminal_event_position IS NULL
+            AND NEW.completion_report_id IS predecessor.completion_report_id
+          WHEN 'ChildWorkTransferCreated' THEN
+            predecessor.child_state = 'suspended'
+            AND predecessor.latest_checkpoint_id IS NOT NULL
+            AND json_extract(target.payload_json, '$.checkpointId')
+              IS predecessor.latest_checkpoint_id
+            AND NEW.child_state = 'transferred'
+            AND NEW.latest_checkpoint_id IS predecessor.latest_checkpoint_id
+            AND NEW.latest_checkpoint_event_position
+              IS predecessor.latest_checkpoint_event_position
+            AND NEW.terminal_event_type = 'ChildWorkTransferCreated'
+            AND NEW.terminal_event_position = NEW.event_position
+            AND NEW.completion_report_id IS predecessor.completion_report_id
+          ELSE 0
+        END
+    )
+  )
+BEGIN
+  SELECT RAISE(ABORT, 'LIFECYCLE_CHILD_EVENT_FOLD_INVALID');
+END;
+
+CREATE TRIGGER lifecycle_child_event_folds_no_update
+BEFORE UPDATE ON lifecycle_child_event_folds
+BEGIN
+  SELECT RAISE(ABORT, 'LIFECYCLE_CHILD_EVENT_FOLD_IMMUTABLE');
+END;
+CREATE TRIGGER lifecycle_child_event_folds_no_delete
+BEFORE DELETE ON lifecycle_child_event_folds
+BEGIN
+  SELECT RAISE(ABORT, 'LIFECYCLE_CHILD_EVENT_FOLD_IMMUTABLE');
+END;
+
+CREATE TABLE lifecycle_workflow_generation_folds (
+  project_id TEXT NOT NULL,
+  workflow_id TEXT NOT NULL,
+  workflow_generation INTEGER NOT NULL CHECK (workflow_generation > 0),
+  session_id TEXT NOT NULL,
+  trigger_event_position INTEGER NOT NULL CHECK (trigger_event_position > 0),
+  root_command_id TEXT NOT NULL,
+  evidence_window_state TEXT NOT NULL
+    CHECK (evidence_window_state IN ('open', 'sealed')),
+  replacement_checkpoint_version INTEGER
+    CHECK (
+      replacement_checkpoint_version IS NULL
+      OR replacement_checkpoint_version IN (1, 2)
+    ),
+  effective_checkpoint_version INTEGER NOT NULL
+    CHECK (effective_checkpoint_version IN (1, 2)),
+  effective_draft_source_event_position INTEGER NOT NULL
+    CHECK (effective_draft_source_event_position > 0),
+  previous_fingerprint TEXT CHECK (
+    previous_fingerprint IS NULL
+    OR (
+      length(previous_fingerprint) = 64
+      AND previous_fingerprint NOT GLOB '*[^0-9a-f]*'
+    )
+  ),
+  fingerprint TEXT NOT NULL CHECK (
+    length(fingerprint) = 64 AND fingerprint NOT GLOB '*[^0-9a-f]*'
+  ),
+  PRIMARY KEY (project_id, workflow_id, workflow_generation),
+  UNIQUE (project_id, workflow_id, trigger_event_position),
+  CHECK (
+    evidence_window_state <> 'open'
+    OR effective_checkpoint_version = 2
+  ),
+  CHECK (
+    replacement_checkpoint_version IS NULL
+    OR (
+      effective_checkpoint_version = replacement_checkpoint_version
+      AND effective_draft_source_event_position = trigger_event_position
+    )
+  ),
+  CHECK (effective_draft_source_event_position <= trigger_event_position),
+  FOREIGN KEY (trigger_event_position) REFERENCES events(global_position)
+    DEFERRABLE INITIALLY DEFERRED,
+  FOREIGN KEY (effective_draft_source_event_position)
+    REFERENCES events(global_position)
+    DEFERRABLE INITIALLY DEFERRED
+) STRICT;
+
+CREATE INDEX lifecycle_workflow_generation_folds_session
+ON lifecycle_workflow_generation_folds(
+  project_id, session_id, workflow_id, workflow_generation
+);
+
+CREATE TRIGGER lifecycle_workflow_generation_folds_insert_guard
+BEFORE INSERT ON lifecycle_workflow_generation_folds
+WHEN
+  NOT EXISTS (
+    SELECT 1
+    FROM events AS trigger_event
+    JOIN events AS trigger_intent_event
+      ON trigger_intent_event.project_id = trigger_event.project_id
+      AND trigger_intent_event.command_id = trigger_event.command_id
+      AND trigger_intent_event.command_event_index = 0
+      AND trigger_intent_event.session_id = trigger_event.session_id
+      AND trigger_intent_event.stream_id = trigger_event.stream_id
+      AND trigger_intent_event.lifecycle_intent_json IS NOT NULL
+    JOIN events AS source_event
+      ON source_event.global_position
+        = NEW.effective_draft_source_event_position
+      AND source_event.project_id = NEW.project_id
+      AND source_event.session_id = NEW.session_id
+      AND source_event.parent_session_id IS NULL
+      AND source_event.stream_type = 'session'
+      AND source_event.stream_id = 'session/' || NEW.session_id
+      AND source_event.event_type IN (
+        'SessionEndRequested', 'SessionEndAmended'
+      )
+      AND json_extract(source_event.payload_json, '$.workflowId')
+        = NEW.workflow_id
+    JOIN events AS source_intent_event
+      ON source_intent_event.project_id = source_event.project_id
+      AND source_intent_event.command_id = source_event.command_id
+      AND source_intent_event.command_event_index = 0
+      AND source_intent_event.session_id = source_event.session_id
+      AND source_intent_event.stream_id = source_event.stream_id
+      AND source_intent_event.lifecycle_intent_json IS NOT NULL
+    LEFT JOIN lifecycle_workflow_generation_folds AS predecessor
+      ON predecessor.project_id = NEW.project_id
+      AND predecessor.workflow_id = NEW.workflow_id
+      AND predecessor.session_id = NEW.session_id
+      AND predecessor.workflow_generation = NEW.workflow_generation - 1
+    WHERE trigger_event.global_position = NEW.trigger_event_position
+      AND trigger_event.project_id = NEW.project_id
+      AND trigger_event.session_id = NEW.session_id
+      AND trigger_event.parent_session_id IS NULL
+      AND trigger_event.stream_type = 'session'
+      AND trigger_event.stream_id = 'session/' || NEW.session_id
+      AND trigger_event.command_id = NEW.root_command_id
+      AND trigger_event.event_type IN (
+        'SessionEndRequested', 'SessionEndAmended',
+        'SessionEndCancelled', 'SessionAbandoned'
+      )
+      AND json_extract(trigger_event.payload_json, '$.workflowId')
+        = NEW.workflow_id
+      AND json_extract(trigger_event.payload_json, '$.workflowGeneration')
+        = NEW.workflow_generation
+      AND (
+        (
+          NEW.workflow_generation = 1
+          AND NEW.previous_fingerprint IS NULL
+          AND predecessor.workflow_generation IS NULL
+        )
+        OR (
+          NEW.workflow_generation > 1
+          AND predecessor.workflow_generation = NEW.workflow_generation - 1
+          AND predecessor.trigger_event_position < NEW.trigger_event_position
+          AND predecessor.fingerprint = NEW.previous_fingerprint
+        )
+      )
+      AND json_extract(
+        trigger_intent_event.lifecycle_intent_json,
+        '$.intent.command.commandId'
+      ) = NEW.root_command_id
+      AND CASE trigger_event.event_type
+        WHEN 'SessionEndRequested' THEN
+          json_extract(
+            trigger_intent_event.lifecycle_intent_json,
+            '$.intent.command.commandType'
+          ) = 'request-session-end'
+          AND json_extract(
+            trigger_intent_event.lifecycle_intent_json,
+            '$.intent.command.request.sessionId'
+          ) = NEW.session_id
+        WHEN 'SessionEndAmended' THEN
+          json_extract(
+            trigger_intent_event.lifecycle_intent_json,
+            '$.intent.command.commandType'
+          ) = 'amend-session-end'
+          AND json_extract(
+            trigger_intent_event.lifecycle_intent_json,
+            '$.intent.command.sessionId'
+          ) = NEW.session_id
+          AND json_extract(
+            trigger_intent_event.lifecycle_intent_json,
+            '$.intent.command.workflowId'
+          ) = NEW.workflow_id
+        WHEN 'SessionEndCancelled' THEN
+          json_extract(
+            trigger_intent_event.lifecycle_intent_json,
+            '$.intent.command.commandType'
+          ) = 'cancel-session-end'
+          AND json_extract(
+            trigger_intent_event.lifecycle_intent_json,
+            '$.intent.command.sessionId'
+          ) = NEW.session_id
+          AND json_extract(
+            trigger_intent_event.lifecycle_intent_json,
+            '$.intent.command.workflowId'
+          ) = NEW.workflow_id
+        WHEN 'SessionAbandoned' THEN
+          json_extract(
+            trigger_intent_event.lifecycle_intent_json,
+            '$.intent.command.commandType'
+          ) = 'abandon-session'
+          AND json_extract(
+            trigger_intent_event.lifecycle_intent_json,
+            '$.intent.command.sessionId'
+          ) = NEW.session_id
+        ELSE 0
+      END
+      AND json_extract(
+        source_intent_event.lifecycle_intent_json,
+        '$.intent.command.commandId'
+      ) = source_event.command_id
+      AND CASE source_event.event_type
+        WHEN 'SessionEndRequested' THEN
+          json_extract(
+            source_intent_event.lifecycle_intent_json,
+            '$.intent.command.commandType'
+          ) = 'request-session-end'
+          AND json_extract(
+            source_intent_event.lifecycle_intent_json,
+            '$.intent.command.request.sessionId'
+          ) = NEW.session_id
+        WHEN 'SessionEndAmended' THEN
+          json_extract(
+            source_intent_event.lifecycle_intent_json,
+            '$.intent.command.commandType'
+          ) = 'amend-session-end'
+          AND json_extract(
+            source_intent_event.lifecycle_intent_json,
+            '$.intent.command.sessionId'
+          ) = NEW.session_id
+          AND json_extract(
+            source_intent_event.lifecycle_intent_json,
+            '$.intent.command.workflowId'
+          ) = NEW.workflow_id
+        ELSE 0
+      END
+      AND NEW.effective_checkpoint_version IS coalesce(
+        json_extract(
+          source_intent_event.lifecycle_intent_json,
+          '$.intent.command.request.finalCheckpoint.checkpointVersion'
+        ),
+        json_extract(
+          source_intent_event.lifecycle_intent_json,
+          '$.intent.command.amendment.finalCheckpoint.checkpointVersion'
+        )
+      )
+      AND CASE trigger_event.event_type
+        WHEN 'SessionEndRequested' THEN
+          NEW.replacement_checkpoint_version IS coalesce(
+            json_extract(
+              trigger_intent_event.lifecycle_intent_json,
+              '$.intent.command.request.finalCheckpoint.checkpointVersion'
+            ),
+            json_extract(
+              trigger_intent_event.lifecycle_intent_json,
+              '$.intent.command.amendment.finalCheckpoint.checkpointVersion'
+            )
+          )
+          AND NEW.replacement_checkpoint_version IS NOT NULL
+          AND NEW.effective_checkpoint_version
+            = NEW.replacement_checkpoint_version
+          AND NEW.effective_draft_source_event_position
+            = NEW.trigger_event_position
+          AND NEW.evidence_window_state = CASE
+            WHEN NEW.replacement_checkpoint_version = 2 THEN 'open'
+            ELSE 'sealed'
+          END
+        WHEN 'SessionEndAmended' THEN
+          NEW.workflow_generation > 1
+          AND json_extract(
+            trigger_event.payload_json, '$.previousWorkflowGeneration'
+          ) = predecessor.workflow_generation
+          AND NEW.replacement_checkpoint_version IS coalesce(
+            json_extract(
+              trigger_intent_event.lifecycle_intent_json,
+              '$.intent.command.request.finalCheckpoint.checkpointVersion'
+            ),
+            json_extract(
+              trigger_intent_event.lifecycle_intent_json,
+              '$.intent.command.amendment.finalCheckpoint.checkpointVersion'
+            )
+          )
+          AND (
+            (
+              NEW.replacement_checkpoint_version IS NULL
+              AND NEW.effective_checkpoint_version
+                = predecessor.effective_checkpoint_version
+              AND NEW.effective_draft_source_event_position
+                = predecessor.effective_draft_source_event_position
+            )
+            OR (
+              NEW.replacement_checkpoint_version IS NOT NULL
+              AND NEW.effective_checkpoint_version
+                = NEW.replacement_checkpoint_version
+              AND NEW.effective_draft_source_event_position
+                = NEW.trigger_event_position
+            )
+          )
+          AND (
+            (
+              trigger_event.event_schema_version = 1
+              AND NEW.evidence_window_state
+                = predecessor.evidence_window_state
+            )
+            OR (
+              trigger_event.event_schema_version = 2
+              AND (
+                (
+                  json_extract(
+                    trigger_event.payload_json, '$.evidenceWindowAction'
+                  ) = 'unchanged'
+                  AND NEW.evidence_window_state
+                    = predecessor.evidence_window_state
+                )
+                OR (
+                  json_extract(
+                    trigger_event.payload_json, '$.evidenceWindowAction'
+                  ) = 'open'
+                  AND predecessor.evidence_window_state = 'sealed'
+                  AND NEW.replacement_checkpoint_version = 2
+                  AND NEW.evidence_window_state = 'open'
+                )
+                OR (
+                  json_extract(
+                    trigger_event.payload_json, '$.evidenceWindowAction'
+                  ) = 'seal'
+                  AND predecessor.evidence_window_state = 'open'
+                  AND NEW.evidence_window_state = 'sealed'
+                )
+              )
+            )
+          )
+        WHEN 'SessionEndCancelled' THEN
+          NEW.replacement_checkpoint_version IS NULL
+          AND NEW.evidence_window_state = 'sealed'
+          AND (
+            (
+              NEW.workflow_generation > 1
+              AND NEW.effective_checkpoint_version
+                = predecessor.effective_checkpoint_version
+              AND NEW.effective_draft_source_event_position
+                = predecessor.effective_draft_source_event_position
+            )
+            OR (
+              source_event.global_position < trigger_event.global_position
+              AND json_extract(
+                source_event.payload_json, '$.workflowGeneration'
+              ) = NEW.workflow_generation
+            )
+          )
+        WHEN 'SessionAbandoned' THEN
+          NEW.replacement_checkpoint_version IS NULL
+          AND NEW.evidence_window_state = 'sealed'
+          AND (
+            (
+              NEW.workflow_generation > 1
+              AND NEW.effective_checkpoint_version
+                = predecessor.effective_checkpoint_version
+              AND NEW.effective_draft_source_event_position
+                = predecessor.effective_draft_source_event_position
+            )
+            OR (
+              source_event.global_position < trigger_event.global_position
+              AND json_extract(
+                source_event.payload_json, '$.workflowGeneration'
+              ) = NEW.workflow_generation
+            )
+          )
+        ELSE 0
+      END
+  )
+BEGIN
+  SELECT RAISE(ABORT, 'LIFECYCLE_WORKFLOW_GENERATION_FOLD_INVALID');
+END;
+
+CREATE TRIGGER lifecycle_workflow_generation_folds_no_update
+BEFORE UPDATE ON lifecycle_workflow_generation_folds
+BEGIN
+  SELECT RAISE(ABORT, 'LIFECYCLE_WORKFLOW_GENERATION_FOLD_IMMUTABLE');
+END;
+CREATE TRIGGER lifecycle_workflow_generation_folds_no_delete
+BEFORE DELETE ON lifecycle_workflow_generation_folds
+BEGIN
+  SELECT RAISE(ABORT, 'LIFECYCLE_WORKFLOW_GENERATION_FOLD_IMMUTABLE');
+END;
 
 ALTER TABLE session_evidence_coverage
   ADD COLUMN coverage_fingerprint_algorithm TEXT NOT NULL DEFAULT 'hmac-sha256'
@@ -1004,15 +2840,47 @@ SET evidence_frozen_checkpoint_event_position = (
     )
 WHERE session_id IS NOT NULL;
 
+INSERT INTO lifecycle_child_event_folds
+SELECT * FROM qualified_checkpoint_v3_stage_child_event_folds;
+
+INSERT INTO lifecycle_workflow_generation_folds
+SELECT * FROM qualified_checkpoint_v3_stage_workflow_generation_folds;
+
 DELETE FROM qualified_checkpoint_v3_guard;
 INSERT INTO qualified_checkpoint_v3_guard(value)
 SELECT CASE WHEN
   NOT EXISTS (
+    SELECT *
+    FROM qualified_checkpoint_v3_stage_child_event_folds
+    EXCEPT
+    SELECT * FROM lifecycle_child_event_folds
+  )
+  AND NOT EXISTS (
+    SELECT *
+    FROM lifecycle_child_event_folds
+    EXCEPT
+    SELECT * FROM qualified_checkpoint_v3_stage_child_event_folds
+  )
+  AND NOT EXISTS (
+    SELECT *
+    FROM qualified_checkpoint_v3_stage_workflow_generation_folds
+    EXCEPT
+    SELECT * FROM lifecycle_workflow_generation_folds
+  )
+  AND NOT EXISTS (
+    SELECT *
+    FROM lifecycle_workflow_generation_folds
+    EXCEPT
+    SELECT * FROM qualified_checkpoint_v3_stage_workflow_generation_folds
+  )
+  AND NOT EXISTS (
     SELECT 1
-    FROM workflow_instances AS workflow
-    JOIN qualified_checkpoint_v3_stage_rows AS stage
-      ON stage.workflow_id = workflow.workflow_id
-    WHERE workflow.generation <> stage.source_generation
+    FROM qualified_checkpoint_v3_stage_rows AS stage
+    LEFT JOIN workflow_instances AS workflow
+      ON workflow.workflow_id = stage.workflow_id
+      AND workflow.session_id IS NOT NULL
+    WHERE workflow.workflow_id IS NULL
+      OR workflow.generation <> stage.source_generation
       OR workflow.phase <> stage.source_phase
       OR workflow.evidence_frozen_checkpoint_event_position
         IS NOT stage.evidence_frozen_checkpoint_event_position
@@ -1022,13 +2890,24 @@ SELECT CASE WHEN
         IS NOT stage.final_ending_scope_bindings_json
   )
   AND NOT EXISTS (
-    SELECT 1 FROM workflow_instances
-    WHERE session_id IS NULL AND (
-      evidence_frozen_checkpoint_event_position IS NOT NULL
-      OR evidence_frozen_generation IS NOT NULL
-      OR evidence_window_state IS NOT NULL
-      OR final_ending_scope_bindings_json IS NOT NULL
-    )
+    SELECT 1
+    FROM workflow_instances AS workflow
+    WHERE workflow.session_id IS NOT NULL
+      AND NOT EXISTS (
+        SELECT 1
+        FROM qualified_checkpoint_v3_stage_rows AS stage
+        WHERE stage.workflow_id = workflow.workflow_id
+      )
+  )
+  AND NOT EXISTS (
+    SELECT 1 FROM workflow_instances AS workflow
+    WHERE workflow.session_id IS NULL
+      AND (
+        workflow.evidence_frozen_checkpoint_event_position IS NOT NULL
+        OR workflow.evidence_frozen_generation IS NOT NULL
+        OR workflow.evidence_window_state IS NOT NULL
+        OR workflow.final_ending_scope_bindings_json IS NOT NULL
+      )
   )
 THEN 1 ELSE 0 END;
 
@@ -1551,8 +3430,16 @@ DROP TRIGGER qualified_checkpoint_v3_stage_marker_no_delete;
 DROP TRIGGER qualified_checkpoint_v3_stage_rows_no_insert;
 DROP TRIGGER qualified_checkpoint_v3_stage_rows_no_update;
 DROP TRIGGER qualified_checkpoint_v3_stage_rows_no_delete;
+DROP TRIGGER qualified_checkpoint_v3_stage_child_event_folds_no_insert;
+DROP TRIGGER qualified_checkpoint_v3_stage_child_event_folds_no_update;
+DROP TRIGGER qualified_checkpoint_v3_stage_child_event_folds_no_delete;
+DROP TRIGGER qualified_checkpoint_v3_stage_workflow_generation_folds_no_insert;
+DROP TRIGGER qualified_checkpoint_v3_stage_workflow_generation_folds_no_update;
+DROP TRIGGER qualified_checkpoint_v3_stage_workflow_generation_folds_no_delete;
 DROP TRIGGER qualified_checkpoint_v3_guard_abort;
 DROP TABLE qualified_checkpoint_v3_guard;
+DROP TABLE qualified_checkpoint_v3_stage_workflow_generation_folds;
+DROP TABLE qualified_checkpoint_v3_stage_child_event_folds;
 DROP TABLE qualified_checkpoint_v3_stage_marker;
 DROP TABLE qualified_checkpoint_v3_stage_rows;
 `,
