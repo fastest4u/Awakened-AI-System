@@ -768,6 +768,176 @@ function addWorkflow(
   });
 }
 
+function frozenTicketFixture(): {
+  readonly fixture: Fixture;
+  readonly binding: Record<string, unknown>;
+  readonly rootCheckpoint: Record<string, unknown>;
+} {
+  const fixture = createFixture();
+  const checkpointId = uuid(88_010);
+  const ticketId = uuid(88_011);
+  const childCheckpoint = {
+    ...qualifiedCheckpointFixture({
+      checkpointId: checkpointId as never,
+      sessionId: CHILD_ID as never,
+      parentSessionId: ROOT_ID as never,
+      baseEventPosition: 2,
+      checkpointEventPosition: 3,
+    }),
+  };
+  const childFingerprint = checkpointFingerprint(childCheckpoint, 2);
+  const transferred = childAuthority(CHILD_ID, 4n, {
+    semantic_state: "transferred",
+    child_capability_generation: null,
+    direct_access_enabled: 0,
+    child_handle_capability_version: null,
+    child_handle_key_id: null,
+    child_handle_issue_nonce: null,
+    child_handle_issued_at: null,
+    child_handle_policy_code: null,
+    child_handle_expiry_kind: null,
+    child_handle_expires_at: null,
+    child_handle_actor_role: null,
+    child_handle_client_instance_id: null,
+    child_handle_verifier: null,
+    child_handle_issuance_id: null,
+    latest_checkpoint_id: checkpointId,
+    latest_checkpoint_event_position: 3,
+    latest_checkpoint_fingerprint: childFingerprint,
+    terminal_event_position: 4,
+    terminal_event_type: "ChildWorkTransferCreated",
+    terminal_at: NOW,
+  });
+  rawInsert(fixture.connection, "streams", {
+    project_id: PROJECT_ID,
+    stream_id: `session/${CHILD_ID}`,
+    stream_type: "session",
+    current_version: 3,
+    created_at: NOW,
+    updated_at: NOW,
+  });
+  rawEvent(fixture.connection, {
+    globalPosition: 2n,
+    streamId: `session/${CHILD_ID}`,
+    streamVersion: 1n,
+    eventType: "SessionForked",
+    eventSchemaVersion: 1,
+    sessionId: CHILD_ID,
+    parentSessionId: ROOT_ID,
+    payload: { authorityCommitment: H64 },
+  });
+  rawEvent(fixture.connection, {
+    globalPosition: 3n,
+    streamId: `session/${CHILD_ID}`,
+    streamVersion: 2n,
+    eventType: "SessionCheckpointRecorded",
+    eventSchemaVersion: 2,
+    sessionId: CHILD_ID,
+    parentSessionId: ROOT_ID,
+    payload: {
+      checkpoint: childCheckpoint,
+      baseEventPosition: "2",
+      checkpointEventPosition: "3",
+    },
+  });
+  rawEvent(fixture.connection, {
+    globalPosition: 4n,
+    streamId: `session/${CHILD_ID}`,
+    streamVersion: 3n,
+    eventType: "ChildWorkTransferCreated",
+    eventSchemaVersion: 1,
+    sessionId: CHILD_ID,
+    parentSessionId: ROOT_ID,
+    payload: {
+      transferTicketId: ticketId,
+      checkpointId,
+      authorityCommitment: transferred.authority_commitment,
+    },
+  });
+  rawInsert(fixture.connection, "session_authority", transferred);
+  rawInsert(fixture.connection, "child_transfer_tickets", {
+    project_id: PROJECT_ID,
+    transfer_ticket_id: ticketId,
+    source_parent_session_id: ROOT_ID,
+    source_child_session_id: CHILD_ID,
+    source_assignment_json: "{}",
+    source_scope_json: "{}",
+    checkpoint_id: checkpointId,
+    follow_ups_json: "[]",
+    source_state_json: "{}",
+    lineage_json: "{}",
+    created_event_position: 4,
+    created_at: NOW,
+    claimed_by_root_session_id: null,
+    claimed_child_session_id: null,
+    claimed_event_position: null,
+    claimed_at: null,
+  });
+  const binding = {
+    bindingVersion: 1,
+    bindingKind: "carry-forward-ticket",
+    childSessionId: CHILD_ID,
+    childState: "transferred",
+    lastEventPosition: "4",
+    streamVersion: "3",
+    checkpointId,
+    checkpointEventPosition: "3",
+    transferTicketId: ticketId,
+    transferTicketEventPosition: "4",
+  };
+  const rootCheckpointId = uuid(88_012);
+  const rootCheckpoint = {
+    ...qualifiedCheckpointFixture({
+      checkpointId: rootCheckpointId as never,
+      sessionId: ROOT_ID as never,
+      baseEventPosition: 1,
+      checkpointEventPosition: 5,
+    }),
+    childSummaries: [{
+      childSessionId: CHILD_ID,
+      state: "transferred",
+      lastEventPosition: "4",
+      streamVersion: "3",
+      latestCheckpointId: checkpointId,
+    }],
+  };
+  rawEvent(fixture.connection, {
+    globalPosition: 5n,
+    streamId: `session/${ROOT_ID}`,
+    streamVersion: 2n,
+    eventType: "SessionCheckpointRecorded",
+    eventSchemaVersion: 2,
+    sessionId: ROOT_ID,
+    payload: {
+      checkpoint: rootCheckpoint,
+      baseEventPosition: "1",
+      checkpointEventPosition: "5",
+    },
+  });
+  fixture.connection.prepare(`
+    UPDATE streams SET current_version = 2
+    WHERE project_id = $projectId AND stream_id = $streamId
+  `).run({ $projectId: PROJECT_ID, $streamId: `session/${ROOT_ID}` });
+  dropTrigger(fixture.connection, "workflow_instances_evidence_v3_insert_guard");
+  addWorkflow(fixture, {
+    phase: "final-checkpoint-recorded",
+    result_json: canonicalJson(workflowStatus(
+      "final-checkpoint-recorded",
+      rootCheckpointId,
+      "5",
+    )),
+    evidence_frozen_checkpoint_event_position: 5,
+    evidence_frozen_generation: 1,
+    evidence_window_state: "sealed",
+    final_ending_scope_bindings_json: canonicalJson([binding]),
+  });
+  return {
+    fixture,
+    binding,
+    rootCheckpoint: rootCheckpoint as Record<string, unknown>,
+  };
+}
+
 function addCapacityChildren(fixture: Fixture, count: number): readonly {
   bindingKind: "current-child";
   childSessionId: string;
@@ -1127,6 +1297,63 @@ it("bounded quick integrity resolves frozen version 2 checkpoints at the recorde
   assert.ok(
     result.issues.includes("LIFECYCLE_WORKFLOW_INVARIANT_MISMATCH"),
     JSON.stringify(result.issues),
+  );
+
+  const direct = frozenTicketFixture();
+  assert.deepEqual((await quickIssues(direct.fixture)).issues, []);
+  dropTrigger(direct.fixture.connection, "workflow_instances_evidence_v3_update_guard");
+  dropTrigger(direct.fixture.connection, "workflow_instances_lifecycle_update_guard");
+  dropTrigger(direct.fixture.connection, "events_no_update");
+  const forgedBinding = {
+    ...direct.binding,
+    lastEventPosition: "7",
+    transferTicketEventPosition: "7",
+  };
+  const forgedRootCheckpoint = {
+    ...direct.rootCheckpoint,
+    childSummaries: [{
+      childSessionId: CHILD_ID,
+      state: "transferred",
+      lastEventPosition: "7",
+      streamVersion: "3",
+      latestCheckpointId: direct.binding.checkpointId,
+    }],
+  };
+  direct.fixture.connection.prepare(`
+    UPDATE workflow_instances
+    SET final_ending_scope_bindings_json = $bindings
+    WHERE project_id = $projectId
+  `).run({
+    $bindings: canonicalJson([forgedBinding]),
+    $projectId: PROJECT_ID,
+  });
+  direct.fixture.connection.prepare(`
+    UPDATE events SET payload_json = $payload WHERE global_position = 5
+  `).run({
+    $payload: canonicalJson({
+      checkpoint: forgedRootCheckpoint,
+      baseEventPosition: "1",
+      checkpointEventPosition: "5",
+    }),
+  });
+  assert.ok(
+    (await quickIssues(direct.fixture)).issues
+      .includes("LIFECYCLE_WORKFLOW_INVARIANT_MISMATCH"),
+  );
+
+  const ticket = frozenTicketFixture();
+  assert.deepEqual((await quickIssues(ticket.fixture)).issues, []);
+  dropTrigger(ticket.fixture.connection, "child_transfer_tickets_update_guard");
+  ticket.fixture.connection.prepare(`
+    UPDATE child_transfer_tickets SET checkpoint_id = $checkpointId
+    WHERE project_id = $projectId
+  `).run({
+    $checkpointId: uuid(88_099),
+    $projectId: PROJECT_ID,
+  });
+  assert.ok(
+    (await quickIssues(ticket.fixture)).issues
+      .includes("LIFECYCLE_WORKFLOW_INVARIANT_MISMATCH"),
   );
 });
 
