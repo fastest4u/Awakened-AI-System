@@ -1,9 +1,31 @@
 import { createHash } from "node:crypto";
 import { canonicalJson } from "../serialization/canonical-json.js";
-import { decodeLifecycleEventV1, type LifecycleEventV1 } from "../lifecycle/contracts/events.js";
+import {
+  decodeLifecycleEvent,
+  type LifecycleEvent,
+} from "../lifecycle/contracts/events.js";
+import {
+  CHECKPOINT_MAX_CANONICAL_BYTES,
+  type Checkpoint,
+  type CheckpointEvidenceCoverageV2,
+} from "../lifecycle/contracts/checkpoint.js";
+import {
+  decodeFinalEndingScopeBindingsV1,
+  FINAL_ENDING_SCOPE_BINDINGS_MAX_CANONICAL_BYTES,
+  type FinalEndingScopeBindingV1,
+} from "../lifecycle/contracts/session-end.js";
 import { LifecycleError } from "../lifecycle/errors.js";
 import { foldSession, type SessionAggregateState } from "../lifecycle/session-aggregate.js";
 import type { ProjectContext } from "../identity/contracts.js";
+import type { CapabilityKeyProvider } from "../lifecycle/authority/capability-key-provider.js";
+import { ChildTransferRepository } from "../storage/child-transfer.repository.js";
+import { EvidenceCoverageRepository } from "../storage/evidence-coverage.repository.js";
+import { SessionAuthorityRepository } from "../storage/session-authority.repository.js";
+import type {
+  CarryForwardEndingScopeProjectionRecord,
+  CurrentChildEndingScopeProjectionRecord,
+  SessionAuthorityRecord,
+} from "../storage/lifecycle-storage.types.js";
 import type { SqliteConnection, SqliteRow } from "../storage/sqlite-driver.js";
 import type {
   AsyncIntegrityExtension,
@@ -58,6 +80,7 @@ const INTERNAL_COMMAND_TYPES = new Set([
 const ACTOR_ROLES = new Set(["primary", "maintenance", "untrusted"]);
 const LOWER_HASH = /^[0-9a-f]{64}$/;
 const LOWER_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const UNSIGNED_DECIMAL = /^(?:0|[1-9][0-9]{0,18})$/;
 
 function issue(sink: IntegrityIssueSink, code: IntegrityIssueCode): void {
   sink.add(code);
@@ -95,6 +118,13 @@ function sameInteger(left: unknown, right: unknown): boolean {
   return integer(left) !== null && integer(left) === integer(right);
 }
 
+function positiveDecimalString(value: unknown): boolean {
+  return typeof value === "string"
+    && UNSIGNED_DECIMAL.test(value)
+    && BigInt(value) > 0n
+    && BigInt(value) <= SQLITE_INT64_MAX;
+}
+
 function allNull(row: SqliteRow, columns: readonly string[]): boolean {
   return columns.every((column) => row[column] === null);
 }
@@ -125,11 +155,90 @@ function record(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function canonicalHash(value: unknown): string {
+function canonicalHash(checkpoint: Checkpoint): string {
   return createHash("sha256")
-    .update("project-memory/checkpoint/v1\n", "utf8")
-    .update(canonicalJson(value as never), "utf8")
+    .update(`project-memory/checkpoint/v${checkpoint.checkpointVersion}\n`, "utf8")
+    .update(canonicalJson(checkpoint), "utf8")
     .digest("hex");
+}
+
+const SQLITE_INT64_MAX = 9_223_372_036_854_775_807n;
+const ENDING_SCOPE_LIMIT_PLUS_ONE = 606;
+const EMPTY_QUALIFIED_COVERAGE: CheckpointEvidenceCoverageV2 = Object.freeze({
+  coverageVersion: 2,
+  captureMode: "coverage-only",
+  contentRetained: false,
+  adapterSessions: Object.freeze([]),
+});
+
+function binaryCompare(left: string, right: string): number {
+  return Buffer.compare(Buffer.from(left, "utf8"), Buffer.from(right, "utf8"));
+}
+
+function currentBinding(
+  root: SessionAuthorityRecord,
+  projection: CurrentChildEndingScopeProjectionRecord,
+): FinalEndingScopeBindingV1 {
+  if (
+    projection.projectId !== root.projectId
+    || projection.rootSessionId !== root.sessionId
+    || projection.lastEventPosition < 1n
+    || projection.lastEventPosition > SQLITE_INT64_MAX
+    || projection.streamVersion < 1n
+    || projection.streamVersion > SQLITE_INT64_MAX
+    || (projection.checkpointId === null)
+      !== (projection.checkpointEventPosition === null)
+    || (
+      projection.checkpointEventPosition !== null
+      && (
+        projection.checkpointEventPosition < 1n
+        || projection.checkpointEventPosition > projection.lastEventPosition
+      )
+    )
+  ) throw new LifecycleError("INTEGRITY_FAILURE");
+  return Object.freeze({
+    bindingVersion: 1,
+    bindingKind: "current-child",
+    childSessionId: projection.childSessionId as FinalEndingScopeBindingV1["childSessionId"],
+    childState: projection.childState,
+    lastEventPosition: projection.lastEventPosition.toString(),
+    streamVersion: projection.streamVersion.toString(),
+    checkpointId: projection.checkpointId as FinalEndingScopeBindingV1["checkpointId"],
+    checkpointEventPosition: projection.checkpointEventPosition?.toString() ?? null,
+    transferTicketId: null,
+    transferTicketEventPosition: null,
+  });
+}
+
+function carryBinding(
+  root: SessionAuthorityRecord,
+  projection: CarryForwardEndingScopeProjectionRecord,
+): FinalEndingScopeBindingV1 {
+  if (
+    projection.projectId !== root.projectId
+    || projection.rootSessionId !== root.sessionId
+    || projection.childState !== "transferred"
+    || projection.lastEventPosition !== projection.transferTicketEventPosition
+    || projection.lastEventPosition < 1n
+    || projection.lastEventPosition > SQLITE_INT64_MAX
+    || projection.streamVersion < 1n
+    || projection.streamVersion > SQLITE_INT64_MAX
+    || projection.checkpointEventPosition < 1n
+    || projection.checkpointEventPosition > projection.lastEventPosition
+  ) throw new LifecycleError("INTEGRITY_FAILURE");
+  return Object.freeze({
+    bindingVersion: 1,
+    bindingKind: "carry-forward-ticket",
+    childSessionId: projection.childSessionId as FinalEndingScopeBindingV1["childSessionId"],
+    childState: "transferred",
+    lastEventPosition: projection.lastEventPosition.toString(),
+    streamVersion: projection.streamVersion.toString(),
+    checkpointId: projection.checkpointId as FinalEndingScopeBindingV1["checkpointId"],
+    checkpointEventPosition: projection.checkpointEventPosition.toString(),
+    transferTicketId:
+      projection.transferTicketId as FinalEndingScopeBindingV1["transferTicketId"],
+    transferTicketEventPosition: projection.transferTicketEventPosition.toString(),
+  });
 }
 
 interface CheckpointRequirementFold {
@@ -173,22 +282,23 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
     this.runFullCheck(context, sink);
   }
 
-  quickCheckAsync(
+  async quickCheckAsync(
     context: ProjectContext,
     sink: IntegrityIssueSink,
   ): Promise<void> {
-    void this.provider;
-    if (this.hasLifecycleSchema()) this.runQuickCheck(context, sink);
-    return Promise.resolve();
+    if (!this.hasLifecycleSchema()) return;
+    this.runQuickCheck(context, sink);
+    await this.checkQualifiedQuick(context, sink);
   }
 
-  fullCheckAsync(
+  async fullCheckAsync(
     context: ProjectContext,
     sink: IntegrityIssueSink,
   ): Promise<void> {
-    void this.provider;
-    if (this.hasLifecycleSchema()) this.runFullCheck(context, sink);
-    return Promise.resolve();
+    if (!this.hasLifecycleSchema()) return;
+    this.runQuickCheck(context, sink);
+    await this.checkQualifiedQuick(context, sink);
+    this.runFullOnly(context, sink);
   }
 
   private runQuickCheck(context: ProjectContext, sink: IntegrityIssueSink): void {
@@ -201,12 +311,559 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
 
   private runFullCheck(context: ProjectContext, sink: IntegrityIssueSink): void {
     this.runQuickCheck(context, sink);
+    this.runFullOnly(context, sink);
+  }
+
+  private runFullOnly(context: ProjectContext, sink: IntegrityIssueSink): void {
     this.checkAuthorityLinkage(context, sink, true);
     this.checkEvidence(context, sink);
     this.checkApprovalsAndTransfers(context, sink);
     this.checkValidation(context, sink);
     this.checkWorkflowClaims(context, sink);
     this.checkOutboxShape(context, sink, true);
+  }
+
+  private async checkQualifiedQuick(
+    context: ProjectContext,
+    sink: IntegrityIssueSink,
+  ): Promise<void> {
+    const qualifiedSchema = this.connection.prepare(`
+      SELECT 1 AS present
+      FROM sqlite_schema
+      WHERE type = 'table'
+        AND name = 'session_evidence_coverage_transitions'
+      LIMIT 1
+    `).get() !== undefined;
+    if (!qualifiedSchema) return;
+
+    const projectId = context.binding.projectId;
+    const currentRows = this.connection.prepare(`
+      SELECT DISTINCT session_id
+      FROM session_evidence_coverage
+      WHERE project_id = $projectId
+      ORDER BY CAST(session_id AS BLOB)
+    `).all({ $projectId: projectId });
+    const sessionIds = currentRows.map((row) => {
+      if (typeof row.session_id !== "string") {
+        throw new LifecycleError("INTEGRITY_FAILURE");
+      }
+      return row.session_id;
+    });
+    const counts = this.connection.prepare(`
+      SELECT
+        (SELECT count(*) FROM session_evidence_coverage
+         WHERE project_id = $projectId) AS aggregate_count,
+        (SELECT count(*) FROM session_evidence_coverage_transition_heads
+         WHERE project_id = $projectId) AS head_count
+    `).get({ $projectId: projectId });
+    if (
+      counts === undefined
+      || decimal(counts.aggregate_count) === null
+      || decimal(counts.aggregate_count) !== decimal(counts.head_count)
+    ) {
+      issue(sink, "SESSION_EVIDENCE_COVERAGE_MISMATCH");
+      return;
+    }
+
+    const profileIds = new Set<string>();
+    const collector: Pick<
+      CapabilityKeyProvider,
+      "currentKey" | "status" | "fingerprint"
+    > = {
+      currentKey(): never {
+        throw new LifecycleError("INTEGRITY_FAILURE");
+      },
+      status(_scope, _purpose, keyId) {
+        profileIds.add(keyId);
+        return "available";
+      },
+      fingerprint(): never {
+        throw new LifecycleError("INTEGRITY_FAILURE");
+      },
+    };
+    try {
+      new EvidenceCoverageRepository(collector).assertQuickHealthy(
+        this.connection,
+        sessionIds as never,
+      );
+      this.checkLatestEvidenceEventProjection(context);
+    } catch {
+      issue(sink, "SESSION_EVIDENCE_COVERAGE_MISMATCH");
+      return;
+    }
+
+    const statuses = new Map<string, "available">();
+    for (const keyId of [...profileIds].sort(binaryCompare)) {
+      if (this.provider === undefined) {
+        throw new LifecycleError("EVIDENCE_HISTORICAL_KEY_UNAVAILABLE");
+      }
+      const status = await this.provider.status(keyId);
+      if (status !== "available") {
+        throw new LifecycleError("EVIDENCE_HISTORICAL_KEY_UNAVAILABLE");
+      }
+      statuses.set(keyId, "available");
+    }
+    const cached: Pick<
+      CapabilityKeyProvider,
+      "currentKey" | "status" | "fingerprint"
+    > = {
+      currentKey(): never {
+        throw new LifecycleError("INTEGRITY_FAILURE");
+      },
+      status(_scope, _purpose, keyId) {
+        const status = statuses.get(keyId);
+        if (status === undefined) throw new LifecycleError("INTEGRITY_FAILURE");
+        return status;
+      },
+      fingerprint(): never {
+        throw new LifecycleError("INTEGRITY_FAILURE");
+      },
+    };
+    const coverage = new EvidenceCoverageRepository(cached);
+
+    try {
+      this.checkCurrentCheckpointIndexes(context);
+    } catch {
+      issue(sink, "SESSION_AUTHORITY_FOLD_MISMATCH");
+      return;
+    }
+    try {
+      this.checkFrozenWorkflowIntegrity(context, coverage);
+    } catch {
+      issue(sink, "LIFECYCLE_WORKFLOW_INVARIANT_MISMATCH");
+      return;
+    }
+    try {
+      this.checkProspectiveCapacity(context, coverage, sessionIds);
+    } catch {
+      issue(sink, "SESSION_EVIDENCE_COVERAGE_MISMATCH");
+    }
+  }
+
+  private checkLatestEvidenceEventProjection(context: ProjectContext): void {
+    const rows = this.connection.prepare(`
+      SELECT transition.*,
+        event.global_position AS event_global_position,
+        event.project_id AS event_project_id,
+        event.stream_id AS event_stream_id,
+        event.stream_type AS event_stream_type,
+        event.session_id AS event_session_id,
+        event.parent_session_id AS event_parent_session_id,
+        event.event_type AS event_type,
+        event.event_schema_version AS event_schema_version,
+        authority.parent_session_id AS authority_parent_session_id,
+        json_valid(event.payload_json) AS payload_valid,
+        json(event.payload_json) = event.payload_json AS payload_canonical,
+        (SELECT count(*) FROM json_each(event.payload_json)) AS payload_key_count,
+        json_extract(event.payload_json, '$.adapterSessionId') AS payload_adapter_session_id,
+        json_extract(event.payload_json, '$.batchId') AS payload_batch_id,
+        json_extract(event.payload_json, '$.batchFirstOrdinal') AS payload_batch_first_ordinal,
+        json_extract(event.payload_json, '$.batchLastOrdinal') AS payload_batch_last_ordinal,
+        json_extract(event.payload_json, '$.coverageFirstOrdinal') AS payload_coverage_first_ordinal,
+        json_extract(event.payload_json, '$.coverageLastOrdinal') AS payload_coverage_last_ordinal,
+        json_extract(event.payload_json, '$.highestContiguousOrdinal') AS payload_highest_contiguous_ordinal,
+        json_extract(event.payload_json, '$.missingIntervals') AS payload_missing_intervals,
+        json_extract(event.payload_json, '$.frameFingerprintAlgorithm') AS payload_frame_algorithm,
+        json_extract(event.payload_json, '$.frameFingerprintSchemaVersion') AS payload_frame_version,
+        json_extract(event.payload_json, '$.frameFingerprintKeyId') AS payload_frame_key,
+        json_extract(event.payload_json, '$.frameFingerprintDomain') AS payload_frame_domain,
+        json_extract(event.payload_json, '$.coverageFingerprintAlgorithm') AS payload_coverage_algorithm,
+        json_extract(event.payload_json, '$.coverageFingerprintSchemaVersion') AS payload_coverage_version,
+        json_extract(event.payload_json, '$.coverageFingerprintKeyId') AS payload_coverage_key,
+        json_extract(event.payload_json, '$.coverageFingerprintDomain') AS payload_coverage_domain,
+        json_extract(event.payload_json, '$.coverageFingerprint') AS payload_coverage_fingerprint,
+        json_extract(event.payload_json, '$.captureMode') AS payload_capture_mode,
+        json_extract(event.payload_json, '$.contentRetained') AS payload_content_retained,
+        json_array_length(event.payload_json, '$.frames') AS payload_frame_count
+      FROM session_evidence_coverage_transition_heads AS head
+      JOIN session_evidence_coverage_transitions AS transition
+        ON transition.project_id = head.project_id
+        AND transition.session_id = head.session_id
+        AND transition.adapter_session_id = head.adapter_session_id
+        AND transition.batch_event_position = head.batch_event_position
+      LEFT JOIN events AS event
+        ON event.global_position = transition.batch_event_position
+      LEFT JOIN session_authority AS authority
+        ON authority.project_id = transition.project_id
+        AND authority.session_id = transition.session_id
+      WHERE head.project_id = $projectId
+      ORDER BY CAST(head.session_id AS BLOB), CAST(head.adapter_session_id AS BLOB)
+    `).all({ $projectId: context.binding.projectId });
+    for (const row of rows) {
+      const last = decimal(row.coverage_last_ordinal);
+      const highest = decimal(row.highest_contiguous_ordinal);
+      if (last === null || highest === null) throw new LifecycleError("INTEGRITY_FAILURE");
+      let intervals: unknown;
+      try {
+        intervals = JSON.parse(String(row.missing_intervals_json));
+      } catch {
+        throw new LifecycleError("INTEGRITY_FAILURE");
+      }
+      if (!Array.isArray(intervals)) throw new LifecycleError("INTEGRITY_FAILURE");
+      const publicIntervals = intervals.map((interval) => {
+        if (
+          !Array.isArray(interval)
+          || interval.length !== 2
+          || integer(interval[0]) === null
+          || integer(interval[1]) === null
+        ) throw new LifecycleError("INTEGRITY_FAILURE");
+        return {
+          firstOrdinal: String(interval[0]),
+          lastOrdinal: String(interval[1]),
+        };
+      });
+      const expectedHighest = highest === "-1" ? null : highest;
+      if (
+        !LOWER_UUID.test(String(row.adapter_session_id))
+        || !LOWER_UUID.test(String(row.batch_id))
+        || decimal(row.event_global_position) !== decimal(row.batch_event_position)
+        || row.event_project_id !== row.project_id
+        || row.event_stream_id !== `session/${String(row.session_id)}`
+        || row.event_stream_type !== "session"
+        || row.event_session_id !== row.session_id
+        || row.event_parent_session_id !== row.authority_parent_session_id
+        || row.event_type !== "EvidenceCoverageRecorded"
+        || integer(row.event_schema_version) !== 2
+        || integer(row.payload_valid) !== 1
+        || integer(row.payload_canonical) !== 1
+        || integer(row.payload_key_count) !== 20
+        || row.payload_adapter_session_id !== row.adapter_session_id
+        || row.payload_batch_id !== row.batch_id
+        || row.payload_batch_first_ordinal !== decimal(row.batch_first_ordinal)
+        || row.payload_batch_last_ordinal !== decimal(row.batch_last_ordinal)
+        || row.payload_coverage_first_ordinal !== decimal(row.coverage_first_ordinal)
+        || row.payload_coverage_last_ordinal !== last
+        || row.payload_highest_contiguous_ordinal !== expectedHighest
+        || row.payload_missing_intervals !== canonicalJson(publicIntervals)
+        || row.payload_frame_algorithm !== row.frame_fingerprint_algorithm
+        || !sameInteger(row.payload_frame_version, row.frame_fingerprint_schema_version)
+        || row.payload_frame_key !== row.frame_fingerprint_key_id
+        || row.payload_frame_domain !== row.frame_fingerprint_domain
+        || row.payload_coverage_algorithm !== row.coverage_fingerprint_algorithm
+        || !sameInteger(row.payload_coverage_version, row.coverage_fingerprint_schema_version)
+        || row.payload_coverage_key !== row.coverage_fingerprint_key_id
+        || row.payload_coverage_domain !== row.coverage_fingerprint_domain
+        || row.payload_coverage_fingerprint !== row.coverage_fingerprint_value
+        || row.payload_capture_mode !== row.capture_mode
+        || integer(row.payload_content_retained) !== 0
+        || !sameInteger(row.payload_frame_count, row.new_frame_count)
+      ) throw new LifecycleError("INTEGRITY_FAILURE");
+    }
+  }
+
+  private checkCurrentCheckpointIndexes(
+    context: ProjectContext,
+  ): void {
+    const rows = this.connection.prepare(`
+      SELECT session_id, latest_checkpoint_id,
+             latest_checkpoint_event_position, latest_checkpoint_fingerprint
+      FROM session_authority
+      WHERE project_id = $projectId
+        AND latest_checkpoint_id IS NOT NULL
+      ORDER BY CAST(session_id AS BLOB)
+    `).all({ $projectId: context.binding.projectId });
+    const authority = new SessionAuthorityRepository();
+    for (const row of rows) {
+      if (
+        typeof row.session_id !== "string"
+        || typeof row.latest_checkpoint_id !== "string"
+        || typeof row.latest_checkpoint_fingerprint !== "string"
+      ) throw new LifecycleError("INTEGRITY_FAILURE");
+      const position = integer(row.latest_checkpoint_event_position);
+      if (position === null || position < 1) throw new LifecycleError("INTEGRITY_FAILURE");
+      const checkpoint = authority.requireCheckpointAtEventPosition(this.connection, {
+        projectId: context.binding.projectId,
+        sessionId: row.session_id as never,
+        checkpointId: row.latest_checkpoint_id as never,
+        checkpointEventPosition: BigInt(position),
+      });
+      if (canonicalHash(checkpoint) !== row.latest_checkpoint_fingerprint) {
+        throw new LifecycleError("INTEGRITY_FAILURE");
+      }
+    }
+  }
+
+  private checkFrozenWorkflowIntegrity(
+    context: ProjectContext,
+    coverage: EvidenceCoverageRepository,
+  ): void {
+    const rows = this.connection.prepare(`
+      SELECT session_id, generation, phase, result_json,
+             evidence_frozen_checkpoint_event_position,
+             evidence_frozen_generation, evidence_window_state,
+             final_ending_scope_bindings_json
+      FROM workflow_instances
+      WHERE project_id = $projectId
+        AND session_id IS NOT NULL
+        AND evidence_frozen_checkpoint_event_position IS NOT NULL
+      ORDER BY CAST(session_id AS BLOB), generation
+    `).all({ $projectId: context.binding.projectId });
+    const authority = new SessionAuthorityRepository();
+    for (const row of rows) {
+      if (
+        typeof row.session_id !== "string"
+        || typeof row.result_json !== "string"
+        || typeof row.final_ending_scope_bindings_json !== "string"
+      ) throw new LifecycleError("INTEGRITY_FAILURE");
+      const frozenPosition = integer(row.evidence_frozen_checkpoint_event_position);
+      const generation = integer(row.generation);
+      const frozenGeneration = integer(row.evidence_frozen_generation);
+      if (
+        frozenPosition === null
+        || frozenPosition < 1
+        || generation === null
+        || frozenGeneration === null
+        || frozenGeneration < 1
+        || frozenGeneration > generation
+        || row.evidence_window_state !== "sealed"
+      ) throw new LifecycleError("INTEGRITY_FAILURE");
+      const result = parsedCanonicalJson(row.result_json);
+      if (!record(result)) throw new LifecycleError("INTEGRITY_FAILURE");
+      const status = record(result.status) ? result.status : result;
+      if (
+        status.phase !== row.phase
+        || status.sessionId !== row.session_id
+        || status.finalCheckpointEventPosition !== String(frozenPosition)
+        || typeof status.finalCheckpointId !== "string"
+      ) throw new LifecycleError("INTEGRITY_FAILURE");
+      const parsedBindings = parsedCanonicalJson(row.final_ending_scope_bindings_json);
+      const bindings = decodeFinalEndingScopeBindingsV1(parsedBindings);
+      if (canonicalJson(bindings) !== row.final_ending_scope_bindings_json) {
+        throw new LifecycleError("INTEGRITY_FAILURE");
+      }
+      const rootCheckpoint = authority.requireCheckpointAtEventPosition(this.connection, {
+        projectId: context.binding.projectId,
+        sessionId: row.session_id as never,
+        checkpointId: status.finalCheckpointId as never,
+        checkpointEventPosition: BigInt(frozenPosition),
+      });
+      if (
+        rootCheckpoint.checkpointVersion !== 2
+        || rootCheckpoint.parentSessionId !== null
+      ) throw new LifecycleError("INTEGRITY_FAILURE");
+      const expectedSummaries = bindings.map((binding) => ({
+        childSessionId: binding.childSessionId,
+        state: binding.childState,
+        lastEventPosition: binding.lastEventPosition,
+        streamVersion: binding.streamVersion,
+        latestCheckpointId: binding.checkpointId,
+      }));
+      if (canonicalJson(expectedSummaries) !== canonicalJson(rootCheckpoint.childSummaries)) {
+        throw new LifecycleError("INTEGRITY_FAILURE");
+      }
+      const rootHistorical = coverage.snapshotFromTransitionsV2(
+        this.connection,
+        rootCheckpoint.sessionId,
+        BigInt(rootCheckpoint.baseEventPosition),
+      );
+      if (canonicalJson(rootHistorical) !== canonicalJson(rootCheckpoint.evidenceCoverage)) {
+        throw new LifecycleError("INTEGRITY_FAILURE");
+      }
+      for (const binding of bindings) {
+        this.checkFrozenBinding(
+          context,
+          row.session_id,
+          binding,
+          authority,
+          coverage,
+        );
+      }
+    }
+  }
+
+  private checkFrozenBinding(
+    context: ProjectContext,
+    rootSessionId: string,
+    binding: FinalEndingScopeBindingV1,
+    authority: SessionAuthorityRepository,
+    coverage: EvidenceCoverageRepository,
+  ): void {
+    const lastEvent = this.connection.prepare(`
+      SELECT project_id, stream_id, stream_type, stream_version,
+             session_id, parent_session_id
+      FROM events
+      WHERE global_position = $position
+    `).get({ $position: BigInt(binding.lastEventPosition) });
+    if (
+      lastEvent === undefined
+      || lastEvent.project_id !== context.binding.projectId
+      || lastEvent.stream_id !== `session/${binding.childSessionId}`
+      || lastEvent.stream_type !== "session"
+      || decimal(lastEvent.stream_version) !== binding.streamVersion
+      || lastEvent.session_id !== binding.childSessionId
+      || lastEvent.parent_session_id !== rootSessionId
+    ) throw new LifecycleError("INTEGRITY_FAILURE");
+
+    if (binding.bindingKind === "carry-forward-ticket") {
+      const ticket = this.connection.prepare(`
+        SELECT ticket.project_id, ticket.transfer_ticket_id,
+               ticket.source_parent_session_id, ticket.source_child_session_id,
+               ticket.checkpoint_id, ticket.created_event_position,
+               event.project_id AS event_project_id,
+               event.stream_id AS event_stream_id,
+               event.stream_type AS event_stream_type,
+               event.stream_version AS event_stream_version,
+               event.session_id AS event_session_id,
+               event.parent_session_id AS event_parent_session_id,
+               event.event_type AS event_type,
+               event.event_schema_version AS event_schema_version,
+               json_extract(event.payload_json, '$.transferTicketId') AS payload_ticket_id,
+               json_extract(event.payload_json, '$.checkpointId') AS payload_checkpoint_id
+        FROM child_transfer_tickets AS ticket
+        LEFT JOIN events AS event
+          ON event.global_position = $eventPosition
+        WHERE ticket.project_id = $projectId
+          AND ticket.transfer_ticket_id = $ticketId
+      `).get({
+        $eventPosition: BigInt(binding.transferTicketEventPosition!),
+        $projectId: context.binding.projectId,
+        $ticketId: binding.transferTicketId,
+      });
+      if (
+        ticket === undefined
+        || ticket.project_id !== context.binding.projectId
+        || ticket.source_parent_session_id !== rootSessionId
+        || ticket.source_child_session_id !== binding.childSessionId
+        || ticket.checkpoint_id !== binding.checkpointId
+        || decimal(ticket.created_event_position) !== binding.transferTicketEventPosition
+        || ticket.event_project_id !== context.binding.projectId
+        || ticket.event_stream_id !== `session/${binding.childSessionId}`
+        || ticket.event_stream_type !== "session"
+        || ticket.event_session_id !== binding.childSessionId
+        || ticket.event_parent_session_id !== ticket.source_parent_session_id
+        || ticket.event_type !== "ChildWorkTransferCreated"
+        || integer(ticket.event_schema_version) !== 1
+        || ticket.payload_ticket_id !== binding.transferTicketId
+        || ticket.payload_checkpoint_id !== binding.checkpointId
+      ) throw new LifecycleError("INTEGRITY_FAILURE");
+    }
+
+    if (binding.checkpointId === null || binding.checkpointEventPosition === null) return;
+    const checkpoint = authority.requireCheckpointAtEventPosition(this.connection, {
+      projectId: context.binding.projectId,
+      sessionId: binding.childSessionId,
+      checkpointId: binding.checkpointId,
+      checkpointEventPosition: BigInt(binding.checkpointEventPosition),
+    });
+    if (checkpoint.checkpointVersion === 2) {
+      const historical = coverage.snapshotFromTransitionsV2(
+        this.connection,
+        checkpoint.sessionId,
+        BigInt(checkpoint.baseEventPosition),
+      );
+      if (canonicalJson(historical) !== canonicalJson(checkpoint.evidenceCoverage)) {
+        throw new LifecycleError("INTEGRITY_FAILURE");
+      }
+      return;
+    }
+    const nonClean = this.connection.prepare(`
+      SELECT 1 AS present
+      FROM session_evidence_coverage_transitions
+      WHERE project_id = $projectId
+        AND session_id = $sessionId
+        AND batch_event_position <= $basePosition
+      UNION ALL
+      SELECT 1 AS present
+      FROM events
+      WHERE project_id = $projectId
+        AND session_id = $sessionId
+        AND global_position <= $basePosition
+        AND event_type = 'EvidenceCoverageRecorded'
+      LIMIT 1
+    `).get({
+      $projectId: context.binding.projectId,
+      $sessionId: checkpoint.sessionId,
+      $basePosition: BigInt(checkpoint.baseEventPosition),
+    });
+    if (nonClean !== undefined) throw new LifecycleError("INTEGRITY_FAILURE");
+  }
+
+  private checkProspectiveCapacity(
+    context: ProjectContext,
+    coverage: EvidenceCoverageRepository,
+    currentEvidenceSessionIds: readonly string[],
+  ): void {
+    const authority = new SessionAuthorityRepository();
+    const transfers = new ChildTransferRepository();
+    const roots = this.connection.prepare(`
+      SELECT session_id
+      FROM session_authority
+      WHERE project_id = $projectId
+        AND session_kind = 'root'
+        AND terminal_event_position IS NULL
+      ORDER BY CAST(session_id AS BLOB)
+    `).all({ $projectId: context.binding.projectId });
+    const evidenceSessions = new Set(currentEvidenceSessionIds);
+    for (const row of roots) {
+      if (typeof row.session_id !== "string") throw new LifecycleError("INTEGRITY_FAILURE");
+      const root = authority.get(
+        this.connection,
+        context.binding.projectId,
+        row.session_id,
+      );
+      if (root === null || root.sessionKind !== "root") {
+        throw new LifecycleError("INTEGRITY_FAILURE");
+      }
+      const children = authority.listNonterminalChildEndingScopeProjectionsBounded(
+        this.connection,
+        root.projectId,
+        root.sessionId,
+        ENDING_SCOPE_LIMIT_PLUS_ONE,
+      );
+      const tickets = transfers.listUnclaimedEndingScopeProjectionsBySourceRoot(
+        this.connection,
+        root.projectId,
+        root.sessionId,
+        ENDING_SCOPE_LIMIT_PLUS_ONE,
+      );
+      if (
+        children.length >= ENDING_SCOPE_LIMIT_PLUS_ONE
+        || tickets.length >= ENDING_SCOPE_LIMIT_PLUS_ONE
+      ) throw new LifecycleError("CHECKPOINT_CAPACITY_EXCEEDED");
+      const rawBindings = [
+        ...children.map((projection) => currentBinding(root, projection)),
+        ...tickets.map((projection) => carryBinding(root, projection)),
+      ].sort((left, right) => binaryCompare(left.childSessionId, right.childSessionId));
+      const bindings = decodeFinalEndingScopeBindingsV1(rawBindings);
+      const relevantSessionIds = new Set<string>([root.sessionId]);
+      for (const sessionId of currentEvidenceSessionIds) {
+        const facts = authority.get(
+          this.connection,
+          context.binding.projectId,
+          sessionId,
+        );
+        if (facts === null) throw new LifecycleError("INTEGRITY_FAILURE");
+        const rootSessionId = facts.sessionKind === "root"
+          ? facts.sessionId
+          : facts.parentSessionId;
+        if (rootSessionId === root.sessionId) relevantSessionIds.add(sessionId);
+      }
+      for (const sessionId of relevantSessionIds) {
+        const snapshot = evidenceSessions.has(sessionId)
+          ? coverage.snapshotV2(
+              this.connection,
+              sessionId as never,
+              SQLITE_INT64_MAX,
+            )
+          : EMPTY_QUALIFIED_COVERAGE;
+        const checkpointBytes = coverage.minimumCheckpointUpperBound(
+          this.connection,
+          { evidenceCoverage: snapshot, endingScopeBindings: bindings },
+        );
+        const endingScopeBytes = coverage.minimumFinalEndingScopeBindingsUpperBound(
+          this.connection,
+          { endingScopeBindings: bindings },
+        );
+        if (
+          !Number.isSafeInteger(checkpointBytes)
+          || checkpointBytes < 0
+          || !Number.isSafeInteger(endingScopeBytes)
+          || endingScopeBytes < 0
+          || checkpointBytes > CHECKPOINT_MAX_CANONICAL_BYTES
+          || endingScopeBytes > FINAL_ENDING_SCOPE_BINDINGS_MAX_CANONICAL_BYTES
+        ) throw new LifecycleError("CHECKPOINT_CAPACITY_EXCEEDED");
+      }
+    }
   }
 
   private hasLifecycleSchema(): boolean {
@@ -439,7 +1096,7 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
     }
   }
 
-  private lifecycleEvents(authority: SqliteRow): readonly LifecycleEventV1[] {
+  private lifecycleEvents(authority: SqliteRow): readonly LifecycleEvent[] {
     const rows = this.connection.prepare(`
       SELECT global_position, event_id, project_id, vault_id, store_id,
              workspace_id, stream_id, stream_type, stream_version,
@@ -453,7 +1110,7 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
       $projectId: authority.project_id,
       $streamId: authority.stream_id,
     });
-    const events: LifecycleEventV1[] = [];
+    const events: LifecycleEvent[] = [];
     let authorityCommitment: string | null = null;
     for (const row of rows) {
       const payload = parsedCanonicalJson(row.payload_json);
@@ -471,7 +1128,7 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
         || authorityCommitment === null
         || row.stream_type !== "session"
       ) throw new Error("INVALID_LIFECYCLE_EVENT_ENVELOPE");
-      events.push(decodeLifecycleEventV1({
+      events.push(decodeLifecycleEvent({
         eventSchemaVersion,
         eventId: row.event_id,
         projectId: row.project_id,
@@ -499,7 +1156,7 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
   private authorityMatchesFold(
     row: SqliteRow,
     aggregate: SessionAggregateState,
-    events: readonly LifecycleEventV1[],
+    events: readonly LifecycleEvent[],
   ): boolean {
     const latestAuthorityEvent = [...events].reverse().find((event) => (
       "authorityCommitment" in event.payload
@@ -553,7 +1210,7 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
 
   private checkpointRequirement(
     authority: SqliteRow,
-    events: readonly LifecycleEventV1[],
+    events: readonly LifecycleEvent[],
   ): CheckpointRequirementFold | null {
     const transitions: CheckpointRequirementTransition[] = [];
     const requireCheckpoint = (reason: string, eventPosition: string): void => {
@@ -632,7 +1289,7 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
     return requirement;
   }
 
-  private revocation(events: readonly LifecycleEventV1[]): RevocationFold | null {
+  private revocation(events: readonly LifecycleEvent[]): RevocationFold | null {
     let revocation: RevocationFold | null = null;
     for (const event of events) {
       if (event.eventType === "SessionAbandoned") {
@@ -705,14 +1362,118 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
   private checkWorkflowShape(context: ProjectContext, sink: IntegrityIssueSink): void {
     const rows = this.connection.prepare(`
       SELECT * FROM workflow_instances
-      WHERE project_id = $projectId AND session_id IS NOT NULL
+      WHERE project_id = $projectId
     `).all({ $projectId: context.binding.projectId });
     for (const row of rows) {
+      const evidenceColumns = [
+        "evidence_frozen_checkpoint_event_position",
+        "evidence_frozen_generation",
+        "evidence_window_state",
+        "final_ending_scope_bindings_json",
+      ] as const;
+      if (row.session_id === null) {
+        if (!allNull(row, evidenceColumns)) {
+          issue(sink, "LIFECYCLE_WORKFLOW_INVARIANT_MISMATCH");
+          return;
+        }
+        continue;
+      }
       const claim = [row.coordinator_owner_id, row.coordinator_claim_token, row.coordinator_claim_expires_at];
       const plan = [row.validation_attempt_plan_generation, row.validation_attempt_plans_json];
       const failure = [row.coordinator_failure_class, row.coordinator_error_code];
+      const frozen = [
+        row.evidence_frozen_checkpoint_event_position,
+        row.evidence_frozen_generation,
+        row.final_ending_scope_bindings_json,
+      ];
       const attemptCount = integer(row.coordinator_attempt_count);
       const claimToken = integer(row.coordinator_claim_token);
+      const generation = integer(row.generation);
+      const frozenGeneration = integer(row.evidence_frozen_generation);
+      const finalPhases = new Set([
+        "final-checkpoint-recorded",
+        "ending-materialization-queued",
+        "validating",
+        "verification-passed",
+        "verification-failed",
+        "completion-appended",
+        "completed-materialization-confirmed",
+        "completed",
+      ]);
+      let resultStatus: Record<string, unknown> | null = null;
+      try {
+        if (row.result_json !== null) {
+          const result = parsedCanonicalJson(row.result_json);
+          if (!record(result)) throw new Error("INVALID_WORKFLOW_RESULT");
+          resultStatus = record(result.status) ? result.status : result;
+        }
+      } catch {
+        resultStatus = null;
+      }
+      const frozenPresent = frozen.every(present);
+      const frozenAbsent = frozen.every((value) => !present(value));
+      const statusKeys = resultStatus === null
+        ? []
+        : Object.keys(resultStatus).sort();
+      const expectedStatusKeys = [
+        "evidenceWindow",
+        "finalCheckpointEventPosition",
+        "finalCheckpointId",
+        "materializationRequired",
+        "phase",
+        "priorRootState",
+        "qualityScore",
+        "resultVersion",
+        "safeFailureCode",
+        "sessionId",
+        "triggeringEventPosition",
+        "validationPlansReady",
+        "workflowGeneration",
+        "workflowId",
+      ];
+      const resultMatches = row.result_json === null
+        ? true
+        : resultStatus !== null
+          && canonicalJson(statusKeys) === canonicalJson(expectedStatusKeys)
+          && resultStatus.resultVersion === 2
+          && resultStatus.sessionId === row.session_id
+          && resultStatus.workflowId === row.workflow_id
+          && sameInteger(resultStatus.workflowGeneration, row.generation)
+          && resultStatus.phase === row.phase
+          && (
+            resultStatus.priorRootState === "active"
+            || resultStatus.priorRootState === "suspended"
+          )
+          && resultStatus.triggeringEventPosition === decimal(row.triggering_event_position)
+          && (
+            (resultStatus.finalCheckpointId === null
+              && resultStatus.finalCheckpointEventPosition === null)
+            || (
+              typeof resultStatus.finalCheckpointId === "string"
+              && LOWER_UUID.test(resultStatus.finalCheckpointId)
+              && positiveDecimalString(resultStatus.finalCheckpointEventPosition)
+            )
+          )
+          && (
+            frozenPresent
+              ? resultStatus.finalCheckpointEventPosition
+                === decimal(row.evidence_frozen_checkpoint_event_position)
+              : resultStatus.finalCheckpointId === null
+                && resultStatus.finalCheckpointEventPosition === null
+          )
+          && record(resultStatus.evidenceWindow)
+          && Object.keys(resultStatus.evidenceWindow).length === 3
+          && resultStatus.evidenceWindow.evidenceWindowState === row.evidence_window_state
+          && resultStatus.evidenceWindow.evidenceFrozenCheckpointEventPosition
+            === decimal(row.evidence_frozen_checkpoint_event_position)
+          && (
+            resultStatus.evidenceWindow.evidenceFrozenGeneration === null
+              ? row.evidence_frozen_generation === null
+              : sameInteger(
+                  resultStatus.evidenceWindow.evidenceFrozenGeneration,
+                  row.evidence_frozen_generation,
+                )
+          );
       if (
         row.workflow_type !== "session-end"
         || !positive(row.triggering_event_position)
@@ -738,6 +1499,33 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
         || (present(row.validation_attempt_plans_json) && !canonicalJsonText(row.validation_attempt_plans_json))
         || (present(row.validation_attempt_plan_generation)
           && !sameInteger(row.validation_attempt_plan_generation, row.generation))
+        || (row.evidence_window_state !== "open" && row.evidence_window_state !== "sealed")
+        || (!frozenPresent && !frozenAbsent)
+        || (
+          frozenPresent
+          && (
+            frozenGeneration === null
+            || generation === null
+            || frozenGeneration < 1
+            || frozenGeneration > generation
+            || row.evidence_window_state !== "sealed"
+            || !canonicalJsonText(row.final_ending_scope_bindings_json)
+          )
+        )
+        || (
+          row.evidence_window_state === "open"
+          && (!frozenAbsent || (row.phase !== "requested" && row.phase !== "children-resolved"))
+        )
+        || (
+          frozenPresent
+          && !finalPhases.has(String(row.phase))
+          && row.phase !== "abandoned"
+        )
+        || (finalPhases.has(String(row.phase)) && !frozenPresent)
+        || (row.phase === "cancelled" && (
+          row.evidence_window_state !== "sealed" || !frozenAbsent
+        ))
+        || !resultMatches
       ) {
         issue(sink, "LIFECYCLE_WORKFLOW_INVARIANT_MISMATCH");
         return;
