@@ -1841,6 +1841,317 @@ function replaceFreezeStageRowsUnchecked(
   for (const sql of triggerSql) connection.exec(sql);
 }
 
+function replaceProjectionStageRowUnchecked(
+  connection: SqliteConnection,
+  table: typeof QUALIFIED_CHECKPOINT_STAGE_CHILD_EVENT_FOLDS_TABLE
+    | typeof QUALIFIED_CHECKPOINT_STAGE_WORKFLOW_GENERATION_FOLDS_TABLE,
+  keyColumn: "event_position" | "workflow_generation",
+  keyValue: number,
+  overrides: Readonly<Record<string, SqliteValue>>,
+): void {
+  const suffix = table === QUALIFIED_CHECKPOINT_STAGE_CHILD_EVENT_FOLDS_TABLE
+    ? "child_event_folds"
+    : "workflow_generation_folds";
+  const triggerNames = ["insert", "update", "delete"].map(
+    (operation) => `qualified_checkpoint_v3_stage_${suffix}_no_${operation}`,
+  );
+  const triggerSql = triggerNames.map((name) => {
+    const sql = connection.prepare(`
+      SELECT sql FROM temp.sqlite_schema
+      WHERE type = 'trigger' AND name = $name
+    `).get({ $name: name })?.sql;
+    assert.equal(typeof sql, "string", name);
+    return String(sql).replace(/^CREATE TRIGGER/i, "CREATE TEMP TRIGGER");
+  });
+  const rows = connection.prepare(`SELECT * FROM ${table}`).all().map(
+    (row) => {
+      const record = row as Readonly<Record<string, SqliteValue>>;
+      return diagnosticBigInt(record[keyColumn]) === BigInt(keyValue)
+        ? { ...record, ...overrides }
+        : record;
+    },
+  );
+  const checkedTable = `${table}_checked`;
+  for (const name of triggerNames) connection.exec(`DROP TRIGGER temp.${name}`);
+  connection.exec(`ALTER TABLE ${table} RENAME TO ${checkedTable}`);
+  if (table === QUALIFIED_CHECKPOINT_STAGE_CHILD_EVENT_FOLDS_TABLE) {
+    connection.exec(`
+      CREATE TEMP TABLE ${table} (
+        project_id TEXT NOT NULL,
+        child_session_id TEXT NOT NULL,
+        event_position INTEGER NOT NULL,
+        stream_version INTEGER NOT NULL,
+        root_session_id TEXT NOT NULL,
+        child_state TEXT NOT NULL,
+        latest_checkpoint_id TEXT,
+        latest_checkpoint_event_position INTEGER,
+        authority_commitment TEXT NOT NULL,
+        terminal_event_type TEXT,
+        terminal_event_position INTEGER,
+        report_count INTEGER NOT NULL,
+        latest_report_id TEXT,
+        report_index_fingerprint TEXT NOT NULL,
+        completion_report_id TEXT,
+        reported_report_id TEXT,
+        reported_item_count INTEGER,
+        reported_item_set_fingerprint TEXT,
+        previous_fingerprint TEXT,
+        fingerprint TEXT NOT NULL
+      ) STRICT
+    `);
+  } else {
+    connection.exec(`
+      CREATE TEMP TABLE ${table} (
+        project_id TEXT NOT NULL,
+        workflow_id TEXT NOT NULL,
+        workflow_generation INTEGER NOT NULL,
+        session_id TEXT NOT NULL,
+        trigger_event_position INTEGER NOT NULL,
+        root_command_id TEXT NOT NULL,
+        evidence_window_state TEXT NOT NULL,
+        replacement_checkpoint_version INTEGER,
+        effective_checkpoint_version INTEGER NOT NULL,
+        effective_draft_source_event_position INTEGER NOT NULL,
+        previous_fingerprint TEXT,
+        fingerprint TEXT NOT NULL
+      ) STRICT
+    `);
+  }
+  for (const row of rows) rawInsert(connection, table, row);
+  connection.exec(`DROP TABLE ${checkedTable}`);
+  for (const sql of triggerSql) connection.exec(sql);
+}
+
+type FirstGuardFamily =
+  | "marker"
+  | "seal"
+  | "freeze"
+  | "project-identity"
+  | "legacy-source"
+  | "child-projection"
+  | "workflow-projection";
+
+const FIRST_GUARD_FAMILY_CLAUSES: Readonly<Record<
+  FirstGuardFamily,
+  readonly number[]
+>> = Object.freeze({
+  marker: Object.freeze([0, 1, 2, 3, 4, 5, 6, 7]),
+  seal: Object.freeze([8]),
+  freeze: Object.freeze([9, 12, 13]),
+  "project-identity": Object.freeze([10, 11]),
+  "legacy-source": Object.freeze([14, 15, 16, 17, 18, 19, 20]),
+  "child-projection": Object.freeze([21, 22, 23]),
+  "workflow-projection": Object.freeze([24, 25, 26, 27]),
+});
+
+function splitTopLevelSqlConjunction(expression: string): readonly string[] {
+  const clauses: string[] = [];
+  let start = 0;
+  let depth = 0;
+  let quoted = false;
+  for (let index = 0; index < expression.length; index += 1) {
+    const character = expression[index]!;
+    if (character === "'") {
+      if (quoted && expression[index + 1] === "'") {
+        index += 1;
+      } else {
+        quoted = !quoted;
+      }
+      continue;
+    }
+    if (quoted) continue;
+    if (character === "(") {
+      depth += 1;
+      continue;
+    }
+    if (character === ")") {
+      depth -= 1;
+      continue;
+    }
+    if (
+      depth === 0
+      && expression.slice(index, index + 3) === "AND"
+      && /\s/.test(expression[index - 1] ?? " ")
+      && /\s/.test(expression[index + 3] ?? " ")
+    ) {
+      clauses.push(expression.slice(start, index).trim());
+      start = index + 3;
+      index += 2;
+    }
+  }
+  clauses.push(expression.slice(start).trim());
+  return clauses;
+}
+
+function firstGuardClauses(): readonly string[] {
+  const sql = qualifiedCheckpointCoverageMigration.sql;
+  const prefix = "INSERT INTO qualified_checkpoint_v3_guard(value)\n"
+    + "SELECT CASE WHEN\n";
+  const start = sql.indexOf(prefix);
+  assert.ok(start >= 0, "first pre-copy guard start");
+  const expressionStart = start + prefix.length;
+  const end = sql.indexOf("THEN 1 ELSE 0 END;", expressionStart);
+  assert.ok(end > expressionStart, "first pre-copy guard end");
+  const clauses = splitTopLevelSqlConjunction(
+    sql.slice(expressionStart, end).trim(),
+  );
+  assert.equal(clauses.length, 28, "first pre-copy guard clause inventory");
+  return clauses;
+}
+
+function evaluateFirstGuardFamilies(
+  connection: SqliteConnection,
+): Readonly<Record<FirstGuardFamily, boolean>> {
+  const clauses = firstGuardClauses();
+  return Object.fromEntries(
+    Object.entries(FIRST_GUARD_FAMILY_CLAUSES).map(([family, indexes]) => {
+      const expression = indexes.map((index) => `(${clauses[index]})`)
+        .join(" AND ");
+      const row = connection.prepare(`
+        SELECT CASE WHEN ${expression} THEN 1 ELSE 0 END AS valid
+      `).get();
+      return [family, row?.valid === 1n];
+    }),
+  ) as Readonly<Record<FirstGuardFamily, boolean>>;
+}
+
+function assertFirstGuardFamilyIsolation(
+  connection: SqliteConnection,
+  intendedFalse: readonly FirstGuardFamily[],
+  caseName: string,
+): void {
+  const actual = evaluateFirstGuardFamilies(connection);
+  const intended = new Set(intendedFalse);
+  for (const family of Object.keys(
+    FIRST_GUARD_FAMILY_CLAUSES,
+  ) as FirstGuardFamily[]) {
+    assert.equal(
+      actual[family],
+      !intended.has(family),
+      `${caseName}: ${family}`,
+    );
+  }
+}
+
+function rowsInsideNotExistsClause(
+  connection: SqliteConnection,
+  clauseIndex: number,
+  select: string,
+): readonly Readonly<Record<string, SqliteValue>>[] {
+  const clause = firstGuardClauses()[clauseIndex]!;
+  const prefix = "NOT EXISTS (";
+  assert.ok(clause.startsWith(prefix), `clause ${clauseIndex} NOT EXISTS`);
+  assert.ok(clause.endsWith(")"), `clause ${clauseIndex} closes`);
+  const inner = clause.slice(prefix.length, -1).trim();
+  assert.match(inner, /^SELECT 1\b/);
+  return connection.prepare(
+    inner.replace(/^SELECT 1\b/, `SELECT ${select}`),
+  ).all() as readonly Readonly<Record<string, SqliteValue>>[];
+}
+
+interface ChildFirstGuardDiagnostic {
+  readonly countMatches: boolean;
+  readonly invalidStagePositions: readonly bigint[];
+  readonly unlinkedSourcePositions: readonly bigint[];
+}
+
+function diagnosticBigInt(value: SqliteValue | undefined): bigint {
+  assert.ok(
+    typeof value === "bigint"
+    || typeof value === "number"
+    || typeof value === "string",
+  );
+  return BigInt(value);
+}
+
+function diagnoseChildFirstGuard(
+  connection: SqliteConnection,
+): ChildFirstGuardDiagnostic {
+  const clauses = firstGuardClauses();
+  const count = connection.prepare(`
+    SELECT CASE WHEN ${clauses[21]} THEN 1 ELSE 0 END AS valid
+  `).get()?.valid === 1n;
+  const invalidStagePositions = rowsInsideNotExistsClause(
+    connection,
+    22,
+    "child.event_position AS event_position",
+  ).map((row) => diagnosticBigInt(row.event_position)).sort((left, right) =>
+    left < right ? -1 : left > right ? 1 : 0);
+  const unlinkedSourcePositions = rowsInsideNotExistsClause(
+    connection,
+    23,
+    "source.global_position AS event_position",
+  ).map((row) => diagnosticBigInt(row.event_position)).sort((left, right) =>
+    left < right ? -1 : left > right ? 1 : 0);
+  return {
+    countMatches: count,
+    invalidStagePositions,
+    unlinkedSourcePositions,
+  };
+}
+
+interface WorkflowFirstGuardDiagnostic {
+  readonly groupingCountMatches: boolean;
+  readonly invalidStageGenerations: readonly bigint[];
+  readonly uncoveredInstanceGenerations: readonly bigint[];
+  readonly uncoveredLatestGenerations: readonly bigint[];
+}
+
+function diagnoseWorkflowFirstGuard(
+  connection: SqliteConnection,
+): WorkflowFirstGuardDiagnostic {
+  const clauses = firstGuardClauses();
+  const count = connection.prepare(`
+    SELECT CASE WHEN ${clauses[24]} THEN 1 ELSE 0 END AS valid
+  `).get()?.valid === 1n;
+  const generations = (
+    clauseIndex: number,
+    select: string,
+  ): readonly bigint[] => rowsInsideNotExistsClause(
+    connection,
+    clauseIndex,
+    select,
+  ).map((row) => diagnosticBigInt(row.generation)).sort((left, right) =>
+    left < right ? -1 : left > right ? 1 : 0);
+  return {
+    groupingCountMatches: count,
+    invalidStageGenerations: generations(
+      25,
+      "workflow.workflow_generation AS generation",
+    ),
+    uncoveredInstanceGenerations: generations(
+      26,
+      "instance.generation AS generation",
+    ),
+    uncoveredLatestGenerations: generations(
+      27,
+      "fold.workflow_generation AS generation",
+    ),
+  };
+}
+
+function expectChildFirstGuardDiagnostic(
+  expected: ChildFirstGuardDiagnostic,
+  caseName?: string,
+): (connection: SqliteConnection) => void {
+  return (connection) => assert.deepEqual(
+    diagnoseChildFirstGuard(connection),
+    expected,
+    caseName,
+  );
+}
+
+function expectWorkflowFirstGuardDiagnostic(
+  expected: WorkflowFirstGuardDiagnostic,
+  caseName?: string,
+): (connection: SqliteConnection) => void {
+  return (connection) => assert.deepEqual(
+    diagnoseWorkflowFirstGuard(connection),
+    expected,
+    caseName,
+  );
+}
+
 function assertNoPersistentProjectionTable(
   connection: SqliteConnection,
   caseName: string,
@@ -1863,6 +2174,9 @@ function assertPreCopyMutationRejected(
   seed: (connection: SqliteConnection) => void,
   mutate: (connection: SqliteConnection) => void,
   stage: "preflight" | "forged-empty" = "preflight",
+  intendedFalseFamilies: readonly FirstGuardFamily[] = [],
+  assertLeafDiagnostic: (connection: SqliteConnection) => void =
+    () => undefined,
 ): void {
   const connection = sourceConnection(2);
   connection.exec("PRAGMA foreign_keys = OFF");
@@ -1875,6 +2189,12 @@ function assertPreCopyMutationRejected(
     installForgedEmptyStage(connection);
   }
   mutate(connection);
+  assertFirstGuardFamilyIsolation(
+    connection,
+    intendedFalseFamilies,
+    caseName,
+  );
+  assertLeafDiagnostic(connection);
   assert.throws(
     () => connection.exec(qualifiedCheckpointCoverageMigration.sql),
     /MIGRATION_EVIDENCE_V2_PRECONDITION_FAILED/,
@@ -4061,37 +4381,47 @@ describe("qualified checkpoint migration", () => {
         }),
       ),
       "forged-empty",
+      ["marker"],
     );
     const markerMutations = [
-      ["marker singleton", "singleton", 2],
-      ["marker source schema", "source_schema_version", 1],
-      ["marker target schema", "target_schema_version", 2],
-      ["marker sealed state", "sealed", 0],
+      [
+        "marker singleton",
+        "singleton",
+        2,
+        "marker-and-project-identity",
+      ],
+      ["marker source schema", "source_schema_version", 1, "marker"],
+      ["marker target schema", "target_schema_version", 2, "marker"],
+      ["marker sealed state", "sealed", 0, "marker"],
       [
         "marker project identity",
         "project_id",
         "99999999-9999-4999-8999-999999999998",
+        "project-identity",
       ],
       [
         "marker vault identity",
         "vault_id",
         "99999999-9999-4999-8999-999999999997",
+        "project-identity",
       ],
       [
         "marker store identity",
         "store_id",
         "99999999-9999-4999-8999-999999999996",
+        "project-identity",
       ],
-      ["marker freeze row count", "freeze_row_count", 1],
-      ["marker child fold row count", "child_fold_row_count", 1],
+      ["marker freeze row count", "freeze_row_count", 1, "marker"],
+      ["marker child fold row count", "child_fold_row_count", 1, "marker"],
       [
         "marker workflow generation row count",
         "workflow_generation_row_count",
         1,
+        "marker",
       ],
     ] as const;
     for (const candidate of markerMutations) {
-      const [name, column, value] = candidate;
+      const [name, column, value, family] = candidate;
       assertPreCopyMutationRejected(
         name,
         () => undefined,
@@ -4104,6 +4434,9 @@ describe("qualified checkpoint migration", () => {
           `).run({ $value: value }),
         ),
         "forged-empty",
+        family === "marker-and-project-identity"
+          ? ["marker", "project-identity"]
+          : [family],
       );
     }
 
@@ -4134,6 +4467,7 @@ describe("qualified checkpoint migration", () => {
         );
       },
       "forged-empty",
+      ["freeze"],
     );
 
     const denialTriggers = [
@@ -4156,7 +4490,78 @@ describe("qualified checkpoint migration", () => {
         () => undefined,
         (connection) => connection.exec(`DROP TRIGGER temp.${triggerName}`),
         "forged-empty",
+        ["seal"],
       );
+    }
+  });
+
+  it("migration 3 unmutated shared projection fixtures pass every first-guard family", () => {
+    for (const fixture of [
+      {
+        name: "empty legacy",
+        seed(): void {
+          // Empty schema-2 source is the minimal legacy baseline.
+        },
+      },
+      {
+        name: "freeze stage",
+        seed: seedTransferredFinalHistory,
+      },
+      {
+        name: "child projection",
+        seed: seedAllChildProjectionEventClasses,
+      },
+      {
+        name: "workflow projection",
+        seed: seedAllWorkflowProjectionTriggerClasses,
+      },
+      {
+        name: "amended workflow projection",
+        seed: seedAmendedWorkflowProjection,
+      },
+    ]) {
+      const connection = sourceConnection(2);
+      connection.exec("PRAGMA foreign_keys = OFF");
+      fixture.seed(connection);
+      const preflight = new SqliteQualifiedCheckpointMigrationPreflight();
+      const applied = new MigrationRunner().apply(
+        connection,
+        registry,
+        NOW,
+        mode({
+          kind: "explicit-upgrade",
+          expectedAppliedVersion: 2,
+          beforeMigration(
+            candidate: SqliteConnection,
+            migration: { version: number },
+          ): void {
+            if (migration.version !== 3) return;
+            preflight.assertEligibleAndStage(candidate, context);
+            assertFirstGuardFamilyIsolation(candidate, [], fixture.name);
+            assert.deepEqual(
+              diagnoseChildFirstGuard(candidate),
+              {
+                countMatches: true,
+                invalidStagePositions: [],
+                unlinkedSourcePositions: [],
+              },
+              fixture.name,
+            );
+            assert.deepEqual(
+              diagnoseWorkflowFirstGuard(candidate),
+              {
+                groupingCountMatches: true,
+                invalidStageGenerations: [],
+                uncoveredInstanceGenerations: [],
+                uncoveredLatestGenerations: [],
+              },
+              fixture.name,
+            );
+          },
+        }),
+      );
+      assert.deepEqual(applied, [3], fixture.name);
+      assert.equal(schemaVersion(connection), 3, fixture.name);
     }
   });
 
@@ -4183,6 +4588,8 @@ describe("qualified checkpoint migration", () => {
             SET ${column} = $value
           `).run({ $value: value }),
         ),
+        "preflight",
+        ["freeze"],
       );
     }
     for (const [name, overrides] of [
@@ -4206,6 +4613,8 @@ describe("qualified checkpoint migration", () => {
           connection,
           overrides,
         ),
+        "preflight",
+        ["freeze"],
       );
     }
     assertPreCopyMutationRejected(
@@ -4219,6 +4628,8 @@ describe("qualified checkpoint migration", () => {
           SET final_ending_scope_bindings_json = $value
         `).run({ $value: `["${"x".repeat(262_145)}"]` }),
       ),
+      "preflight",
+      ["freeze"],
     );
     assertPreCopyMutationRejected(
       "workflow source without freeze stage",
@@ -4240,6 +4651,8 @@ describe("qualified checkpoint migration", () => {
           `),
         );
       },
+      "preflight",
+      ["freeze"],
     );
   });
 
@@ -4365,6 +4778,10 @@ describe("qualified checkpoint migration", () => {
         candidate.name,
         candidate.seed,
         candidate.mutate,
+        "preflight",
+        candidate.name === "project metadata cardinality"
+          ? ["project-identity"]
+          : ["legacy-source"],
       );
     }
   });
@@ -4393,6 +4810,15 @@ describe("qualified checkpoint migration", () => {
       ["target supported type", "event_type", "GenericRecorded"],
     ] as const;
     for (const [name, column, value] of sourceLinkageMutations) {
+      const sourceStillQualifies =
+        column !== "stream_type" && column !== "event_type";
+      const stagedCoverageKeyChanged = [
+        "global_position",
+        "project_id",
+        "session_id",
+        "stream_version",
+      ].includes(column);
+      const sourcePosition = column === "global_position" ? 101n : 1n;
       assertPreCopyMutationRejected(
         `child ${name}`,
         (connection) => {
@@ -4405,6 +4831,16 @@ describe("qualified checkpoint migration", () => {
             WHERE global_position = 1
           `).run({ $value: value });
         },
+        "preflight",
+        ["child-projection"],
+        expectChildFirstGuardDiagnostic({
+          countMatches: sourceStillQualifies,
+          invalidStagePositions: [1n],
+          unlinkedSourcePositions: sourceStillQualifies
+              && stagedCoverageKeyChanged
+            ? [sourcePosition]
+            : [],
+        }, name),
       );
     }
 
@@ -4455,6 +4891,30 @@ describe("qualified checkpoint migration", () => {
             WHERE event_position = $position
           `).run({ $value: value, $position: position }),
         ),
+        "preflight",
+        ["child-projection"],
+        expectChildFirstGuardDiagnostic({
+          countMatches: true,
+          invalidStagePositions: position === 12
+            && (
+              column === "latest_checkpoint_id"
+              || column === "latest_checkpoint_event_position"
+            )
+              ? [12n, 13n]
+              : position === 21 && column === "reported_report_id"
+                ? [21n, 22n, 23n, 24n, 25n]
+                : position === 21 && column === "reported_item_count"
+                  ? [21n, 23n]
+                  : position === 22 && column === "latest_report_id"
+                    ? [22n, 23n]
+                    : position === 22 && column === "completion_report_id"
+                      ? [22n, 23n]
+                      : position === 2 && column === "stream_version"
+                        ? [2n, 3n]
+                      : [BigInt(position)],
+          unlinkedSourcePositions:
+            position === 2 && column === "stream_version" ? [2n] : [],
+        }),
       );
     }
     assertPreCopyMutationRejected(
@@ -4472,21 +4932,93 @@ describe("qualified checkpoint migration", () => {
           WHERE event_position = 25
         `),
       ),
+      "preflight",
+      ["child-projection"],
+      expectChildFirstGuardDiagnostic({
+        countMatches: true,
+        invalidStagePositions: [25n],
+        unlinkedSourcePositions: [],
+      }),
     );
 
     const payloadClasses = [
-      { name: "SessionForked", position: 1 },
-      { name: "ChildAssignmentAmended", position: 2 },
-      { name: "ChildWorkTransferClaimed", position: 3 },
-      { name: "SessionForked second chain", position: 10 },
-      { name: "SessionCheckpointRecorded", position: 11 },
-      { name: "ChildSessionSuspended", position: 12 },
-      { name: "ChildWorkTransferCreated", position: 13 },
-      { name: "SessionForked report chain", position: 20 },
-      { name: "ChildWorkReported", position: 21 },
-      { name: "ChildCompletionProposed", position: 22 },
-      { name: "ChildWorkDispositioned", position: 23 },
-      { name: "ChildSessionCompleted", position: 25 },
+      {
+        name: "SessionForked authority commitment",
+        position: 1,
+        mutate(payload: Record<string, unknown>): void {
+          payload.authorityCommitment = H64_B;
+        },
+      },
+      {
+        name: "SessionForked second-chain authority commitment",
+        position: 10,
+        mutate(payload: Record<string, unknown>): void {
+          payload.authorityCommitment = H64_B;
+        },
+      },
+      {
+        name: "SessionCheckpointRecorded checkpoint identity",
+        position: 11,
+        mutate(payload: Record<string, unknown>): void {
+          (payload.checkpoint as Record<string, unknown>).checkpointId =
+            "99999999-9999-4999-8999-999999999991";
+        },
+      },
+      {
+        name: "ChildSessionSuspended checkpoint identity",
+        position: 12,
+        mutate(payload: Record<string, unknown>): void {
+          payload.checkpointId =
+            "99999999-9999-4999-8999-999999999991";
+        },
+      },
+      {
+        name: "ChildWorkTransferCreated checkpoint identity",
+        position: 13,
+        mutate(payload: Record<string, unknown>): void {
+          payload.checkpointId =
+            "99999999-9999-4999-8999-999999999991";
+        },
+      },
+      {
+        name: "SessionForked report-chain authority commitment",
+        position: 20,
+        mutate(payload: Record<string, unknown>): void {
+          payload.authorityCommitment = H64_B;
+        },
+      },
+      {
+        name: "ChildWorkReported report identity",
+        position: 21,
+        mutate(payload: Record<string, unknown>): void {
+          (payload.report as Record<string, unknown>).reportId =
+            "99999999-9999-4999-8999-999999999990";
+        },
+      },
+      {
+        name: "ChildCompletionProposed report identity",
+        position: 22,
+        mutate(payload: Record<string, unknown>): void {
+          payload.reportId =
+            "99999999-9999-4999-8999-999999999990";
+        },
+      },
+      {
+        name: "ChildWorkDispositioned report identity",
+        position: 23,
+        mutate(payload: Record<string, unknown>): void {
+          (payload.disposition as Record<string, unknown>).reportId =
+            "99999999-9999-4999-8999-999999999990";
+        },
+      },
+      {
+        name: "ChildSessionCompleted report identity",
+        position: 25,
+        mutate(payload: Record<string, unknown>): void {
+          payload.reportId =
+            "99999999-9999-4999-8999-999999999990";
+        },
+      },
     ] as const;
     for (const candidate of payloadClasses) {
       assertPreCopyMutationRejected(
@@ -4495,12 +5027,31 @@ describe("qualified checkpoint migration", () => {
           seedAllChildProjectionEventClasses(connection);
         },
         (connection) => {
+          const source = connection.prepare(`
+            SELECT payload_json FROM events
+            WHERE global_position = $position
+          `).get({ $position: candidate.position });
+          const payload = JSON.parse(String(source?.payload_json)) as
+            Record<string, unknown>;
+          candidate.mutate(payload);
           connection.exec("DROP TRIGGER events_no_update");
           connection.prepare(`
-            UPDATE events SET payload_json = '{}'
+            UPDATE events SET payload_json = $payload
             WHERE global_position = $position
-          `).run({ $position: candidate.position });
+          `).run({
+            $payload: canonicalJson(payload as never),
+            $position: candidate.position,
+          });
         },
+        "preflight",
+        ["child-projection"],
+        expectChildFirstGuardDiagnostic({
+          countMatches: true,
+          invalidStagePositions: candidate.position === 11
+            ? [11n, 12n, 13n]
+            : [BigInt(candidate.position)],
+          unlinkedSourcePositions: [],
+        }),
       );
     }
 
@@ -4530,11 +5081,23 @@ describe("qualified checkpoint migration", () => {
           payload: coverage.payload,
         });
       },
+      "preflight",
+      ["legacy-source", "child-projection"],
+      expectChildFirstGuardDiagnostic({
+        countMatches: false,
+        invalidStagePositions: [],
+        unlinkedSourcePositions: [14n],
+      }),
     );
 
     for (const candidate of [
       {
         name: "missing staged source row",
+        diagnostic: {
+          countMatches: false,
+          invalidStagePositions: [2n],
+          unlinkedSourcePositions: [],
+        },
         mutate(connection: SqliteConnection): void {
           connection.exec("DROP TRIGGER events_no_delete");
           connection.exec("DELETE FROM events WHERE global_position = 2");
@@ -4542,6 +5105,11 @@ describe("qualified checkpoint migration", () => {
       },
       {
         name: "extra supported source row",
+        diagnostic: {
+          countMatches: false,
+          invalidStagePositions: [],
+          unlinkedSourcePositions: [14n],
+        },
         mutate(connection: SqliteConnection): void {
           const amended = lifecycleEvent(14, "ChildAssignmentAmended", {}, {
             projectId: PROJECT_ID as never,
@@ -4566,6 +5134,11 @@ describe("qualified checkpoint migration", () => {
       },
       {
         name: "disposition item-set linkage",
+        diagnostic: {
+          countMatches: true,
+          invalidStagePositions: [23n],
+          unlinkedSourcePositions: [],
+        },
         mutate(connection: SqliteConnection): void {
           const source = connection.prepare(`
             SELECT payload_json FROM events WHERE global_position = 23
@@ -4591,34 +5164,202 @@ describe("qualified checkpoint migration", () => {
           seedAllChildProjectionEventClasses(connection);
         },
         candidate.mutate,
+        "preflight",
+        ["child-projection"],
+        expectChildFirstGuardDiagnostic(candidate.diagnostic),
       );
+    }
+  });
+
+  it("migration 3 child guard isolates every supported carry and transition leaf", () => {
+    const branches = [
+      { name: "assignment", position: 2, nextState: "suspended" },
+      { name: "claim", position: 3, nextState: "suspended" },
+      { name: "checkpoint", position: 11, nextState: "suspended" },
+      { name: "suspension", position: 12, nextState: "active" },
+      { name: "transfer", position: 13, nextState: "suspended" },
+      { name: "report", position: 21, nextState: "suspended" },
+      { name: "proposal", position: 22, nextState: "active" },
+      { name: "disposition", position: 23, nextState: "completion-proposed" },
+      { name: "completion", position: 25, nextState: "active" },
+    ] as const;
+    const branchChild = (position: number): string =>
+      position < 10 ? CHILD_ID : position < 20 ? CHILD_B_ID : CHILD_C_ID;
+    const seedThrough = (
+      connection: SqliteConnection,
+      position: number,
+    ): void => {
+      seedAllChildProjectionEventClasses(connection);
+      connection.exec("DROP TRIGGER events_no_delete");
+      connection.prepare(`
+        DELETE FROM events
+        WHERE session_id = $session_id
+          AND global_position > $position
+      `).run({
+        $session_id: branchChild(position),
+        $position: position,
+      });
+    };
+    const commonLeafMutations = [
+      {
+        name: "state transition",
+        overrides(branch: typeof branches[number]) {
+          return { child_state: branch.nextState };
+        },
+      },
+      {
+        name: "checkpoint id carry",
+        overrides() {
+          return {
+            latest_checkpoint_id:
+              "99999999-9999-4999-8999-999999999966",
+          };
+        },
+      },
+      {
+        name: "checkpoint event-position carry",
+        overrides() {
+          return { latest_checkpoint_event_position: 999 };
+        },
+      },
+      {
+        name: "terminal type carry",
+        overrides(branch: typeof branches[number]) {
+          return {
+            terminal_event_type: branch.position === 25
+              ? "ChildWorkTransferCreated"
+              : "ChildSessionCompleted",
+          };
+        },
+      },
+      {
+        name: "terminal event-position carry",
+        overrides(branch: typeof branches[number]) {
+          return {
+            terminal_event_position: branch.position - 1,
+          };
+        },
+      },
+      {
+        name: "completion report carry",
+        overrides() {
+          return {
+            completion_report_id:
+              "99999999-9999-4999-8999-999999999965",
+          };
+        },
+      },
+      {
+        name: "authority carry or override",
+        overrides() {
+          return { authority_commitment: H64_B };
+        },
+      },
+      {
+        name: "report-count carry or advance",
+        overrides(
+          branch: typeof branches[number],
+          row: Readonly<Record<string, SqliteValue>>,
+        ) {
+          return { report_count: diagnosticBigInt(row.report_count) + 1n };
+        },
+      },
+      {
+        name: "latest-report carry or advance",
+        overrides() {
+          return {
+            latest_report_id:
+              "99999999-9999-4999-8999-999999999964",
+          };
+        },
+      },
+      {
+        name: "report-index carry or advance",
+        overrides(
+          branch: typeof branches[number],
+          row: Readonly<Record<string, SqliteValue>>,
+          connection: SqliteConnection,
+        ) {
+          if (branch.position !== 21) {
+            return {
+              report_index_fingerprint: row.report_index_fingerprint === H64_B
+                ? H64_C
+                : H64_B,
+            };
+          }
+          const predecessor = connection.prepare(`
+            SELECT report_index_fingerprint
+            FROM ${QUALIFIED_CHECKPOINT_STAGE_CHILD_EVENT_FOLDS_TABLE}
+            WHERE event_position = 20
+          `).get();
+          return {
+            report_index_fingerprint:
+              String(predecessor?.report_index_fingerprint),
+          };
+        },
+      },
+    ] as const;
+
+    for (const branch of branches) {
+      for (const leaf of commonLeafMutations) {
+        const caseName = `child ${branch.name} ${leaf.name}`;
+        assertPreCopyMutationRejected(
+          caseName,
+          (connection) => seedThrough(connection, branch.position),
+          (connection) => {
+            const row = connection.prepare(`
+              SELECT *
+              FROM ${QUALIFIED_CHECKPOINT_STAGE_CHILD_EVENT_FOLDS_TABLE}
+              WHERE event_position = $position
+            `).get({ $position: branch.position }) as
+              Readonly<Record<string, SqliteValue>>;
+            replaceProjectionStageRowUnchecked(
+              connection,
+              QUALIFIED_CHECKPOINT_STAGE_CHILD_EVENT_FOLDS_TABLE,
+              "event_position",
+              branch.position,
+              leaf.overrides(branch, row, connection),
+            );
+          },
+          "preflight",
+          ["child-projection"],
+          expectChildFirstGuardDiagnostic({
+            countMatches: true,
+            invalidStagePositions: [BigInt(branch.position)],
+            unlinkedSourcePositions: [],
+          }, caseName),
+        );
+      }
     }
   });
 
   it("migration 3 pre-copy guard covers every workflow source intent lineage and trigger predicate class", () => {
     const triggerSourceMutations = [
-      ["trigger event position", "global_position", 101],
+      ["trigger event position", 6, "global_position", 101],
       [
         "trigger project identity",
+        2,
         "project_id",
         "99999999-9999-4999-8999-999999999986",
       ],
       [
         "trigger session identity",
+        6,
         "session_id",
         "99999999-9999-4999-8999-999999999985",
       ],
-      ["trigger parent identity", "parent_session_id", CHILD_ID],
-      ["trigger stream id", "stream_id", "session/wrong-root"],
-      ["trigger stream type", "stream_type", "generic"],
+      ["trigger parent identity", 6, "parent_session_id", CHILD_ID],
+      ["trigger stream id", 6, "stream_id", "session/wrong-root"],
+      ["trigger stream type", 6, "stream_type", "generic"],
       [
         "trigger command identity",
+        6,
         "command_id",
         "99999999-9999-4999-8999-999999999984",
       ],
-      ["trigger supported type", "event_type", "GenericRecorded"],
+      ["trigger supported type", 6, "event_type", "GenericRecorded"],
     ] as const;
-    for (const [name, column, value] of triggerSourceMutations) {
+    for (const [name, position, column, value] of triggerSourceMutations) {
       assertPreCopyMutationRejected(
         `workflow ${name}`,
         (connection) => {
@@ -4628,36 +5369,47 @@ describe("qualified checkpoint migration", () => {
           connection.exec("DROP TRIGGER events_no_update");
           connection.prepare(`
             UPDATE events SET ${column} = $value
-            WHERE global_position = 6
-          `).run({ $value: value });
+            WHERE global_position = $position
+          `).run({ $value: value, $position: position });
         },
+        "preflight",
+        ["workflow-projection"],
+        expectWorkflowFirstGuardDiagnostic({
+          groupingCountMatches: true,
+          invalidStageGenerations: position === 2 ? [1n, 2n] : [3n],
+          uncoveredInstanceGenerations: [],
+          uncoveredLatestGenerations: [],
+        }),
       );
     }
     const effectiveSourceMutations = [
-      ["source event position", "global_position", 105],
+      ["source event position", 5, "global_position", 105],
       [
         "source project identity",
+        2,
         "project_id",
         "99999999-9999-4999-8999-999999999973",
       ],
       [
         "source session identity",
+        5,
         "session_id",
         "99999999-9999-4999-8999-999999999972",
       ],
-      ["source parent identity", "parent_session_id", CHILD_ID],
-      ["source stream id", "stream_id", "session/wrong-source-root"],
-      ["source stream type", "stream_type", "generic"],
+      ["source parent identity", 5, "parent_session_id", CHILD_ID],
+      ["source stream id", 5, "stream_id", "session/wrong-source-root"],
+      ["source stream type", 5, "stream_type", "generic"],
       [
         "source command identity",
+        5,
         "command_id",
         "99999999-9999-4999-8999-999999999971",
       ],
-      ["source command-event-0 linkage", "command_event_index", 1],
-      ["source supported type", "event_type", "GenericRecorded"],
-      ["source intent presence", "lifecycle_intent_json", null],
+      ["source command-event-0 linkage", 5, "command_event_index", 1],
+      ["source supported type", 5, "event_type", "GenericRecorded"],
+      ["source intent presence", 5, "lifecycle_intent_json", null],
     ] as const;
-    for (const [name, column, value] of effectiveSourceMutations) {
+    for (const [name, position, column, value] of effectiveSourceMutations) {
       assertPreCopyMutationRejected(
         `workflow ${name}`,
         (connection) => {
@@ -4667,9 +5419,17 @@ describe("qualified checkpoint migration", () => {
           connection.exec("DROP TRIGGER events_no_update");
           connection.prepare(`
             UPDATE events SET ${column} = $value
-            WHERE global_position = 5
-          `).run({ $value: value });
+            WHERE global_position = $position
+          `).run({ $value: value, $position: position });
         },
+        "preflight",
+        ["workflow-projection"],
+        expectWorkflowFirstGuardDiagnostic({
+          groupingCountMatches: true,
+          invalidStageGenerations: position === 2 ? [1n, 2n] : [3n],
+          uncoveredInstanceGenerations: [],
+          uncoveredLatestGenerations: [],
+        }),
       );
     }
 
@@ -4710,6 +5470,15 @@ describe("qualified checkpoint migration", () => {
       ],
     ] as const;
     for (const [name, generation, column, value] of stageLineageMutations) {
+      const changedGeneration = column === "workflow_generation"
+        ? BigInt(value)
+        : BigInt(generation);
+      const identityBreaksInstance = [
+        "workflow_id",
+        "session_id",
+        "root_command_id",
+        "workflow_generation",
+      ].includes(column);
       assertPreCopyMutationRejected(
         `workflow ${name}`,
         (connection) => {
@@ -4724,6 +5493,20 @@ describe("qualified checkpoint migration", () => {
             WHERE workflow_generation = $generation
           `).run({ $value: value, $generation: generation }),
         ),
+        "preflight",
+        ["workflow-projection"],
+        expectWorkflowFirstGuardDiagnostic({
+          groupingCountMatches: true,
+          invalidStageGenerations: [changedGeneration],
+          uncoveredInstanceGenerations: identityBreaksInstance ? [3n] : [],
+          uncoveredLatestGenerations: column === "project_id"
+            ? [2n]
+            : column === "workflow_id"
+              ? [2n, 3n]
+            : identityBreaksInstance
+              ? [changedGeneration]
+              : [],
+        }),
       );
     }
     assertPreCopyMutationRejected(
@@ -4741,6 +5524,14 @@ describe("qualified checkpoint migration", () => {
           WHERE workflow_generation = 3
         `),
       ),
+      "preflight",
+      ["workflow-projection"],
+      expectWorkflowFirstGuardDiagnostic({
+        groupingCountMatches: true,
+        invalidStageGenerations: [3n],
+        uncoveredInstanceGenerations: [3n],
+        uncoveredLatestGenerations: [3n],
+      }),
     );
 
     const intentMutations = [
@@ -4834,56 +5625,111 @@ describe("qualified checkpoint migration", () => {
             WHERE global_position = 6
           `).run({ $value: value });
         },
+        "preflight",
+        ["workflow-projection"],
+        expectWorkflowFirstGuardDiagnostic({
+          groupingCountMatches: true,
+          invalidStageGenerations: [3n],
+          uncoveredInstanceGenerations: [],
+          uncoveredLatestGenerations: [],
+        }),
       );
     }
 
     const payloadClasses = [
-      { name: "SessionEndRequested generation one", position: 2 },
-      { name: "SessionEndAmended", position: 3 },
-      { name: "SessionEndCancelled", position: 4 },
-      { name: "SessionEndRequested reopen", position: 5 },
-      { name: "SessionAbandoned", position: 6 },
+      {
+        name: "SessionEndRequested generation-one workflow identity",
+        position: 2,
+        invalidGenerations: [1, 2],
+        groupingCountMatches: true,
+        mutate(payload: Record<string, unknown>): void {
+          payload.workflowId =
+            "99999999-9999-4999-8999-999999999976";
+        },
+      },
+      {
+        name: "SessionEndAmended predecessor generation",
+        position: 3,
+        invalidGenerations: [2],
+        groupingCountMatches: true,
+        seed: seedAmendedWorkflowProjection,
+        mutate(payload: Record<string, unknown>): void {
+          payload.previousWorkflowGeneration = 99;
+        },
+      },
+      {
+        name: "SessionEndCancelled checkpoint parity",
+        position: 4,
+        invalidGenerations: [2],
+        groupingCountMatches: true,
+        mutate(payload: Record<string, unknown>): void {
+          payload.preTransitionCheckpointId =
+            "99999999-9999-4999-8999-999999999975";
+        },
+      },
+      {
+        name: "SessionAbandoned checkpoint parity",
+        position: 6,
+        invalidGenerations: [3],
+        groupingCountMatches: true,
+        mutate(payload: Record<string, unknown>): void {
+          payload.preTransitionCheckpointId =
+            "99999999-9999-4999-8999-999999999973";
+        },
+      },
     ] as const;
     for (const candidate of payloadClasses) {
       assertPreCopyMutationRejected(
         `workflow payload class ${candidate.name}`,
         (connection) => {
-          seedAllWorkflowProjectionTriggerClasses(connection);
+          if ("seed" in candidate) {
+            candidate.seed(connection);
+          } else {
+            seedAllWorkflowProjectionTriggerClasses(connection);
+          }
         },
         (connection) => {
+          const source = connection.prepare(`
+            SELECT payload_json FROM events
+            WHERE global_position = $position
+          `).get({ $position: candidate.position });
+          const payload = JSON.parse(String(source?.payload_json)) as
+            Record<string, unknown>;
+          candidate.mutate(payload);
           connection.exec("DROP TRIGGER events_no_update");
           connection.prepare(`
-            UPDATE events SET payload_json = '{}'
+            UPDATE events SET payload_json = $payload
             WHERE global_position = $position
-          `).run({ $position: candidate.position });
+          `).run({
+            $payload: canonicalJson(payload as never),
+            $position: candidate.position,
+          });
         },
+        "preflight",
+        ["workflow-projection"],
+        expectWorkflowFirstGuardDiagnostic({
+          groupingCountMatches: candidate.groupingCountMatches,
+          invalidStageGenerations: candidate.invalidGenerations.map(BigInt),
+          uncoveredInstanceGenerations: [],
+          uncoveredLatestGenerations: [],
+        }),
       );
     }
 
     for (const candidate of [
       {
-        name: "trigger workflow payload identity",
-        position: 6,
+        name: "request trigger and source workflow payload identity",
+        position: 2,
         field: "workflowId",
         value: "99999999-9999-4999-8999-999999999976",
+        invalidGenerations: [1n, 2n],
       },
       {
-        name: "trigger workflow generation payload",
-        position: 6,
+        name: "request trigger and source workflow generation payload",
+        position: 2,
         field: "workflowGeneration",
         value: 99,
-      },
-      {
-        name: "source workflow payload identity",
-        position: 5,
-        field: "workflowId",
-        value: "99999999-9999-4999-8999-999999999975",
-      },
-      {
-        name: "exact cancelled predecessor provenance",
-        position: 4,
-        field: "workflowGeneration",
-        value: 99,
+        invalidGenerations: [1n],
       },
     ] as const) {
       assertPreCopyMutationRejected(
@@ -4908,6 +5754,14 @@ describe("qualified checkpoint migration", () => {
             $position: candidate.position,
           });
         },
+        "preflight",
+        ["workflow-projection"],
+        expectWorkflowFirstGuardDiagnostic({
+          groupingCountMatches: true,
+          invalidStageGenerations: candidate.invalidGenerations,
+          uncoveredInstanceGenerations: [],
+          uncoveredLatestGenerations: [],
+        }),
       );
     }
 
@@ -4938,6 +5792,14 @@ describe("qualified checkpoint migration", () => {
             WHERE global_position = 5
           `).run({ $intent: canonicalJson(intent as never) });
         },
+        "preflight",
+        ["workflow-projection"],
+        expectWorkflowFirstGuardDiagnostic({
+          groupingCountMatches: true,
+          invalidStageGenerations: [3n],
+          uncoveredInstanceGenerations: [],
+          uncoveredLatestGenerations: [],
+        }),
       );
     }
     for (const candidate of [
@@ -5015,6 +5877,16 @@ describe("qualified checkpoint migration", () => {
             $position: candidate.position,
           });
         },
+        "preflight",
+        ["workflow-projection"],
+        expectWorkflowFirstGuardDiagnostic({
+          groupingCountMatches: true,
+          invalidStageGenerations: candidate.position === 2
+            ? [1n, 2n]
+            : [BigInt(candidate.position === 3 ? 2 : 3)],
+          uncoveredInstanceGenerations: [],
+          uncoveredLatestGenerations: [],
+        }),
       );
     }
     assertPreCopyMutationRejected(
@@ -5039,6 +5911,252 @@ describe("qualified checkpoint migration", () => {
           requireMaterialization: false,
         },
       }),
+      "preflight",
+      ["workflow-projection"],
+      expectWorkflowFirstGuardDiagnostic({
+        groupingCountMatches: false,
+        invalidStageGenerations: [],
+        uncoveredInstanceGenerations: [],
+        uncoveredLatestGenerations: [],
+      }),
+    );
+  });
+
+  it("migration 3 workflow guard isolates every transition carry and intent leaf", () => {
+    const branches = [
+      {
+        name: "initial request",
+        position: 2,
+        generation: 1,
+        phase: "requested",
+        state: "active",
+      },
+      {
+        name: "amendment",
+        position: 3,
+        generation: 2,
+        phase: "requested",
+        state: "active",
+      },
+      {
+        name: "cancellation",
+        position: 4,
+        generation: 2,
+        phase: "cancelled",
+        state: "completed",
+      },
+      {
+        name: "reopen request",
+        position: 5,
+        generation: 3,
+        phase: "requested",
+        state: "active",
+      },
+      {
+        name: "abandonment",
+        position: 6,
+        generation: 3,
+        phase: "abandoned",
+        state: "completed",
+      },
+    ] as const;
+    const seedBranch = (
+      connection: SqliteConnection,
+      branch: typeof branches[number],
+    ): void => {
+      if (branch.name === "amendment") {
+        seedAmendedWorkflowProjection(connection);
+      } else {
+        seedAllWorkflowProjectionTriggerClasses(connection);
+        if (branch.position < 6) {
+          connection.exec("DROP TRIGGER events_no_delete");
+          connection.prepare(`
+            DELETE FROM events WHERE global_position > $position
+          `).run({ $position: branch.position });
+        }
+        connection.exec("DELETE FROM workflow_instances");
+        rawInsert(connection, "workflow_instances", legacyLifecycleWorkflow({
+          workflow_id: PROJECTION_WORKFLOW_ID,
+          generation: branch.generation,
+          state: branch.state,
+          phase: branch.phase,
+          root_command_id: eventCommandId(branch.position),
+          session_id: ROOT_ID,
+          triggering_event_position: branch.position,
+        }));
+      }
+    };
+    const stageLeaves = [
+      {
+        name: "replacement checkpoint version",
+        overrides(row: Readonly<Record<string, SqliteValue>>) {
+          return {
+            replacement_checkpoint_version:
+              row.replacement_checkpoint_version === null ? 2 : null,
+          };
+        },
+      },
+      {
+        name: "effective checkpoint version",
+        overrides(row: Readonly<Record<string, SqliteValue>>) {
+          return {
+            effective_checkpoint_version:
+              diagnosticBigInt(row.effective_checkpoint_version) === 1n
+                ? 2
+                : 1,
+          };
+        },
+      },
+      {
+        name: "evidence-window state",
+        overrides(row: Readonly<Record<string, SqliteValue>>) {
+          return {
+            evidence_window_state:
+              row.evidence_window_state === "sealed" ? "open" : "sealed",
+          };
+        },
+      },
+      {
+        name: "effective source or carry",
+        overrides() {
+          return { effective_draft_source_event_position: 1 };
+        },
+      },
+    ] as const;
+    for (const branch of branches) {
+      for (const leaf of stageLeaves) {
+        const caseName = `workflow ${branch.name} ${leaf.name}`;
+        assertPreCopyMutationRejected(
+          caseName,
+          (connection) => seedBranch(connection, branch),
+          (connection) => {
+            const row = connection.prepare(`
+              SELECT *
+              FROM ${QUALIFIED_CHECKPOINT_STAGE_WORKFLOW_GENERATION_FOLDS_TABLE}
+              WHERE workflow_generation = $generation
+            `).get({ $generation: branch.generation }) as
+              Readonly<Record<string, SqliteValue>>;
+            replaceProjectionStageRowUnchecked(
+              connection,
+              QUALIFIED_CHECKPOINT_STAGE_WORKFLOW_GENERATION_FOLDS_TABLE,
+              "workflow_generation",
+              branch.generation,
+              leaf.overrides(row),
+            );
+          },
+          "preflight",
+          ["workflow-projection"],
+          expectWorkflowFirstGuardDiagnostic({
+            groupingCountMatches: true,
+            invalidStageGenerations: [BigInt(branch.generation)],
+            uncoveredInstanceGenerations: [],
+            uncoveredLatestGenerations: [],
+          }, caseName),
+        );
+      }
+    }
+
+    for (const [name, field, value] of [
+      ["command type", "commandType", "abandon-session"],
+      [
+        "session identity",
+        "sessionId",
+        "99999999-9999-4999-8999-999999999963",
+      ],
+      [
+        "workflow identity",
+        "workflowId",
+        "99999999-9999-4999-8999-999999999962",
+      ],
+      [
+        "checkpoint identity",
+        "preTransitionCheckpointId",
+        "99999999-9999-4999-8999-999999999961",
+      ],
+    ] as const) {
+      const caseName = `workflow isolated cancel intent ${name}`;
+      assertPreCopyMutationRejected(
+        caseName,
+        (connection) => seedBranch(connection, branches[2]),
+        (connection) => {
+          const source = connection.prepare(`
+            SELECT lifecycle_intent_json FROM events
+            WHERE global_position = 4
+          `).get();
+          const intent = JSON.parse(String(source?.lifecycle_intent_json)) as {
+            intent: { command: Record<string, unknown> };
+          };
+          intent.intent.command[field] = value;
+          connection.exec("DROP TRIGGER events_no_update");
+          connection.prepare(`
+            UPDATE events SET lifecycle_intent_json = $intent
+            WHERE global_position = 4
+          `).run({ $intent: canonicalJson(intent as never) });
+        },
+        "preflight",
+        ["workflow-projection"],
+        expectWorkflowFirstGuardDiagnostic({
+          groupingCountMatches: true,
+          invalidStageGenerations: [2n],
+          uncoveredInstanceGenerations: [],
+          uncoveredLatestGenerations: [],
+        }, caseName),
+      );
+    }
+
+    assertPreCopyMutationRejected(
+      "workflow later same-generation last-semantic-event",
+      (connection) => seedAllWorkflowProjectionTriggerClasses(connection),
+      (connection) => rawEvent(connection, 7, {
+        streamType: "session",
+        sessionId: ROOT_ID,
+        streamVersion: 7,
+        eventType: "SessionAbandoned",
+        commandId: eventCommandId(7),
+        lifecycleIntent: abandonIntentWitness(
+          eventCommandId(7),
+          "6",
+          "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+          "explicit-user-approval",
+        ),
+        payload: {
+          workflowId: PROJECTION_WORKFLOW_ID,
+          workflowGeneration: 3,
+          approvalId: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+          preTransitionCheckpointId:
+            "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+          reasonCode: "explicit-user-approval",
+          authorityCommitment: H64,
+        },
+      }),
+      "preflight",
+      ["workflow-projection"],
+      expectWorkflowFirstGuardDiagnostic({
+        groupingCountMatches: true,
+        invalidStageGenerations: [3n],
+        uncoveredInstanceGenerations: [],
+        uncoveredLatestGenerations: [],
+      }, "workflow later same-generation last-semantic-event"),
+    );
+
+    assertPreCopyMutationRejected(
+      "workflow exact cancelled-predecessor provenance",
+      (connection) => seedBranch(connection, branches[3]),
+      (connection) => replaceProjectionStageRowUnchecked(
+        connection,
+        QUALIFIED_CHECKPOINT_STAGE_WORKFLOW_GENERATION_FOLDS_TABLE,
+        "workflow_generation",
+        2,
+        { trigger_event_position: 3 },
+      ),
+      "preflight",
+      ["workflow-projection"],
+      expectWorkflowFirstGuardDiagnostic({
+        groupingCountMatches: true,
+        invalidStageGenerations: [2n, 3n],
+        uncoveredInstanceGenerations: [],
+        uncoveredLatestGenerations: [],
+      }, "workflow exact cancelled-predecessor provenance"),
     );
   });
 
@@ -6964,6 +8082,52 @@ describe("qualified checkpoint migration", () => {
     assert.equal(rows[6]?.completion_report_id, first.reportId);
     assert.equal(rows[7]?.completion_report_id, first.reportId);
     assert.equal(rows[7]?.child_state, "completed");
+  });
+
+  it("migration 3 collapses schema 2 cancel and abandon at the same generation", () => {
+    const connection = sourceConnection(2);
+    connection.exec("PRAGMA foreign_keys = OFF");
+    seedAllWorkflowProjectionTriggerClasses(connection);
+
+    new MigrationRunner().apply(connection, registry, NOW, mode({
+      kind: "explicit-upgrade",
+      expectedAppliedVersion: 2,
+      beforeMigration(
+        candidate: SqliteConnection,
+        migration: { version: number },
+      ): void {
+        if (migration.version === 3) {
+          new SqliteQualifiedCheckpointMigrationPreflight()
+            .assertEligibleAndStage(candidate, context);
+        }
+      },
+    }));
+
+    assert.deepEqual(
+      connection.prepare(`
+        SELECT workflow_generation, trigger_event_position,
+               effective_draft_source_event_position
+        FROM lifecycle_workflow_generation_folds
+        ORDER BY workflow_generation
+      `).all().map((row) => ({ ...row })),
+      [
+        {
+          workflow_generation: 1n,
+          trigger_event_position: 2n,
+          effective_draft_source_event_position: 2n,
+        },
+        {
+          workflow_generation: 2n,
+          trigger_event_position: 4n,
+          effective_draft_source_event_position: 2n,
+        },
+        {
+          workflow_generation: 3n,
+          trigger_event_position: 6n,
+          effective_draft_source_event_position: 5n,
+        },
+      ],
+    );
   });
 
   it("migration 3 copies child and workflow predecessor chains deterministically", () => {
