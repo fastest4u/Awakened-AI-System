@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import type { StoredEvent } from "../contracts/event.js";
 import { canonicalJson } from "../serialization/canonical-json.js";
 import {
   decodeLifecycleEvent,
@@ -17,6 +18,13 @@ import {
 import { LifecycleError } from "../lifecycle/errors.js";
 import { decodeLifecycleIntentWitness } from "../lifecycle/lifecycle-intent-witness.js";
 import {
+  foldChildEventProjection,
+  foldWorkflowGenerationProjection,
+  reportItemSetFingerprint,
+  type ChildEventFoldProjection,
+  type WorkflowGenerationFoldProjection,
+} from "../lifecycle/lifecycle-projection-folds.js";
+import {
   evolveSession,
   foldSession,
   type SessionAggregateState,
@@ -25,9 +33,11 @@ import type { ProjectContext } from "../identity/contracts.js";
 import type { CapabilityKeyProvider } from "../lifecycle/authority/capability-key-provider.js";
 import { ChildTransferRepository } from "../storage/child-transfer.repository.js";
 import { EvidenceCoverageRepository } from "../storage/evidence-coverage.repository.js";
+import { SqliteLifecycleProjectionRepository } from "../storage/lifecycle-projection.repository.js";
 import { SessionAuthorityRepository } from "../storage/session-authority.repository.js";
 import type {
   CarryForwardEndingScopeProjectionRecord,
+  ChildTransferTicketRecord,
   CurrentChildEndingScopeProjectionRecord,
   SessionAuthorityRecord,
 } from "../storage/lifecycle-storage.types.js";
@@ -494,6 +504,7 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
         event.event_type AS event_type,
         event.event_schema_version AS event_schema_version,
         authority.parent_session_id AS authority_parent_session_id,
+        event.payload_json AS payload_json,
         json_valid(event.payload_json) AS payload_valid,
         json(event.payload_json) = event.payload_json AS payload_canonical,
         (SELECT count(*) FROM json_each(event.payload_json)) AS payload_key_count,
@@ -538,7 +549,8 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
         json_extract(event.payload_json, '$.coverageFingerprint') AS payload_coverage_fingerprint,
         json_extract(event.payload_json, '$.captureMode') AS payload_capture_mode,
         json_extract(event.payload_json, '$.contentRetained') AS payload_content_retained,
-        json_array_length(event.payload_json, '$.frames') AS payload_frame_count
+        json_array_length(event.payload_json, '$.frames') AS payload_frame_count,
+        event.payload_json -> '$.frames' AS payload_frames_json
       FROM session_evidence_coverage_transition_heads AS head
       JOIN session_evidence_coverage_transitions AS transition
         ON transition.project_id = head.project_id
@@ -595,6 +607,36 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
       });
       const expectedHighest = highest === "-1" ? null : highest;
       const expectedHighestType = expectedHighest === null ? "null" : "text";
+      const topLevelValues: Readonly<Record<string, unknown>> = {
+        adapterSessionId: row.payload_adapter_session_id,
+        batchFirstOrdinal: row.payload_batch_first_ordinal,
+        batchId: row.payload_batch_id,
+        batchLastOrdinal: row.payload_batch_last_ordinal,
+        captureMode: row.payload_capture_mode,
+        contentRetained: false,
+        coverageFingerprint: row.payload_coverage_fingerprint,
+        coverageFingerprintAlgorithm: row.payload_coverage_algorithm,
+        coverageFingerprintDomain: row.payload_coverage_domain,
+        coverageFingerprintKeyId: row.payload_coverage_key,
+        coverageFingerprintSchemaVersion: integer(row.payload_coverage_version),
+        coverageFirstOrdinal: row.payload_coverage_first_ordinal,
+        coverageLastOrdinal: row.payload_coverage_last_ordinal,
+        frameFingerprintAlgorithm: row.payload_frame_algorithm,
+        frameFingerprintDomain: row.payload_frame_domain,
+        frameFingerprintKeyId: row.payload_frame_key,
+        frameFingerprintSchemaVersion: integer(row.payload_frame_version),
+        highestContiguousOrdinal: expectedHighest,
+        missingIntervals: publicIntervals,
+      };
+      const framesJson = row.payload_frames_json;
+      if (typeof framesJson !== "string") throw new LifecycleError("INTEGRITY_FAILURE");
+      const reconstructedPayload = `{${LATEST_EVIDENCE_PAYLOAD_KEYS.map((key) => (
+        `${canonicalJson(key)}:${
+          key === "frames"
+            ? framesJson
+            : canonicalJson(topLevelValues[key] as never)
+        }`
+      )).join(",")}}`;
       if (
         !LOWER_UUID.test(String(row.adapter_session_id))
         || !LOWER_UUID.test(String(row.batch_id))
@@ -608,6 +650,7 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
         || integer(row.event_schema_version) !== 2
         || integer(row.payload_valid) !== 1
         || integer(row.payload_canonical) !== 1
+        || reconstructedPayload !== row.payload_json
         || integer(row.payload_key_count) !== 20
         || row.payload_key_sequence !== LATEST_EVIDENCE_PAYLOAD_KEY_SEQUENCE
         || row.payload_adapter_session_id_type !== "text"
@@ -772,21 +815,11 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
           BigInt(rootCheckpoint.baseEventPosition),
         );
       }
-      const childProjections = this.frozenChildProjections(
-        context,
-        row.session_id,
-        bindings,
-      );
       for (const binding of bindings) {
-        const projection = childProjections.get(
-          `${binding.childSessionId}\u0000${binding.lastEventPosition}`,
-        );
-        if (projection === undefined) throw new LifecycleError("INTEGRITY_FAILURE");
         this.checkFrozenBinding(
           context,
           row.session_id,
           binding,
-          projection,
           authority,
           coverage,
         );
@@ -798,16 +831,52 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
     context: ProjectContext,
     rootSessionId: string,
     binding: FinalEndingScopeBindingV1,
-    projection: SessionAggregateState,
     authority: SessionAuthorityRepository,
     coverage: EvidenceCoverageRepository,
   ): void {
+    const repository = new SqliteLifecycleProjectionRepository(this.connection);
+    const eventPosition = BigInt(binding.lastEventPosition);
+    const target = repository.findChildAtEvent(
+      context.binding.projectId,
+      binding.childSessionId,
+      eventPosition,
+    );
+    if (target === null) throw new LifecycleError("INTEGRITY_FAILURE");
+    const predecessor = target.streamVersion === 1n
+      ? null
+      : repository.findChildByStreamVersion(
+          context.binding.projectId,
+          binding.childSessionId,
+          target.streamVersion - 1n,
+        );
     if (
-      projection.kind !== "child"
-      || projection.sessionId !== binding.childSessionId
-      || projection.parentSessionId !== rootSessionId
-      || projection.state !== binding.childState
-      || projection.eventPosition !== BigInt(binding.lastEventPosition)
+      (target.streamVersion === 1n) !== (predecessor === null)
+      || (predecessor !== null && (
+        predecessor.fingerprint !== target.previousFingerprint
+        || predecessor.eventPosition >= target.eventPosition
+      ))
+    ) throw new LifecycleError("INTEGRITY_FAILURE");
+    const targetEvent = this.storedEventAt(eventPosition);
+    const reportWitness = this.reportWitnessForTarget(
+      context,
+      repository,
+      target,
+      targetEvent,
+    );
+    const expected = foldChildEventProjection(
+      predecessor,
+      targetEvent,
+      reportWitness,
+    );
+    if (!this.sameChildProjection(target, expected)) {
+      throw new LifecycleError("INTEGRITY_FAILURE");
+    }
+    const projection = target;
+    if (
+      projection.childSessionId !== binding.childSessionId
+      || projection.rootSessionId !== rootSessionId
+      || projection.childState !== binding.childState
+      || projection.eventPosition !== eventPosition
       || projection.streamVersion !== BigInt(binding.streamVersion)
       || projection.latestCheckpointId !== binding.checkpointId
       || projection.latestCheckpointEventPosition
@@ -819,37 +888,29 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
       || (
         binding.bindingKind === "carry-forward-ticket"
         && (
-          projection.state !== "transferred"
+          projection.childState !== "transferred"
           || projection.terminalEventPosition !== projection.eventPosition
           || projection.terminalEventType !== "ChildWorkTransferCreated"
         )
       )
     ) throw new LifecycleError("INTEGRITY_FAILURE");
-    const lastEvent = this.connection.prepare(`
-      SELECT project_id, stream_id, stream_type, stream_version,
-             session_id, parent_session_id
-      FROM events
-      WHERE global_position = $position
-    `).get({ $position: BigInt(binding.lastEventPosition) });
     if (
-      lastEvent === undefined
-      || lastEvent.project_id !== context.binding.projectId
-      || lastEvent.stream_id !== `session/${binding.childSessionId}`
-      || lastEvent.stream_type !== "session"
-      || decimal(lastEvent.stream_version) !== binding.streamVersion
-      || lastEvent.session_id !== binding.childSessionId
-      || lastEvent.parent_session_id !== rootSessionId
+      !this.eventMatchesContext(context, targetEvent)
+      || targetEvent.streamId !== `session/${binding.childSessionId}`
+      || targetEvent.streamType !== "session"
+      || targetEvent.streamVersion.toString() !== binding.streamVersion
+      || targetEvent.sessionId !== binding.childSessionId
+      || targetEvent.parentSessionId !== rootSessionId
     ) throw new LifecycleError("INTEGRITY_FAILURE");
 
     if (binding.bindingKind === "carry-forward-ticket") {
-      const ticket = this.connection.prepare(`
-        SELECT ticket.project_id, ticket.transfer_ticket_id,
-               ticket.source_parent_session_id, ticket.source_child_session_id,
-               ticket.checkpoint_id, ticket.created_event_position,
-               ticket.created_at,
-               ticket.claimed_by_root_session_id, ticket.claimed_child_session_id,
-               ticket.claimed_event_position, ticket.claimed_at,
-               event.global_position AS event_global_position,
+      const ticket = new ChildTransferRepository().get(
+        this.connection,
+        context.binding.projectId,
+        binding.transferTicketId!,
+      );
+      const created = this.connection.prepare(`
+        SELECT event.global_position AS event_global_position,
                event.project_id AS event_project_id,
                event.stream_id AS event_stream_id,
                event.stream_type AS event_stream_type,
@@ -863,64 +924,37 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
                json_extract(event.payload_json, '$.checkpointId') AS payload_checkpoint_id,
                json_extract(event.payload_json, '$.authorityCommitment')
                  AS payload_authority_commitment
-        FROM child_transfer_tickets AS ticket
-        LEFT JOIN events AS event
-          ON event.global_position = $eventPosition
-        WHERE ticket.project_id = $projectId
-          AND ticket.transfer_ticket_id = $ticketId
+        FROM events AS event
+        WHERE event.global_position = $eventPosition
       `).get({
         $eventPosition: BigInt(binding.transferTicketEventPosition!),
-        $projectId: context.binding.projectId,
-        $ticketId: binding.transferTicketId,
       });
       if (
-        ticket === undefined
-        || ticket.project_id !== context.binding.projectId
-        || ticket.transfer_ticket_id !== binding.transferTicketId
-        || ticket.source_parent_session_id !== rootSessionId
-        || ticket.source_child_session_id !== binding.childSessionId
-        || ticket.checkpoint_id !== binding.checkpointId
-        || decimal(ticket.created_event_position) !== binding.transferTicketEventPosition
-        || ticket.created_at !== ticket.event_occurred_at
-        || (
-          [
-            ticket.claimed_by_root_session_id,
-            ticket.claimed_child_session_id,
-            ticket.claimed_event_position,
-            ticket.claimed_at,
-          ].some(present)
-          && ![
-            ticket.claimed_by_root_session_id,
-            ticket.claimed_child_session_id,
-            ticket.claimed_event_position,
-            ticket.claimed_at,
-          ].every(present)
-        )
-        || (
-          ticket.claimed_event_position !== null
-          && (
-            typeof ticket.claimed_by_root_session_id !== "string"
-            || !LOWER_UUID.test(ticket.claimed_by_root_session_id)
-            || typeof ticket.claimed_child_session_id !== "string"
-            || !LOWER_UUID.test(ticket.claimed_child_session_id)
-            || !nonEmpty(ticket.claimed_at)
-            || int64(ticket.claimed_event_position) === null
-            || int64(ticket.claimed_event_position)! <= BigInt(binding.transferTicketEventPosition!)
-          )
-        )
-        || decimal(ticket.event_global_position) !== binding.transferTicketEventPosition
-        || ticket.event_project_id !== context.binding.projectId
-        || ticket.event_stream_id !== `session/${binding.childSessionId}`
-        || ticket.event_stream_type !== "session"
-        || ticket.event_session_id !== binding.childSessionId
-        || ticket.event_parent_session_id !== ticket.source_parent_session_id
-        || decimal(ticket.event_stream_version) !== binding.streamVersion
-        || ticket.event_type !== "ChildWorkTransferCreated"
-        || integer(ticket.event_schema_version) !== 1
-        || ticket.payload_ticket_id !== binding.transferTicketId
-        || ticket.payload_checkpoint_id !== binding.checkpointId
-        || ticket.payload_authority_commitment !== projection.authorityCommitment
+        ticket === null
+        || created === undefined
+        || ticket.projectId !== context.binding.projectId
+        || ticket.transferTicketId !== binding.transferTicketId
+        || ticket.sourceParentSessionId !== rootSessionId
+        || ticket.sourceChildSessionId !== binding.childSessionId
+        || ticket.checkpointId !== binding.checkpointId
+        || ticket.createdEventPosition.toString() !== binding.transferTicketEventPosition
+        || new Date(Number(ticket.createdAtMs)).toISOString() !== created.event_occurred_at
+        || decimal(created.event_global_position) !== binding.transferTicketEventPosition
+        || created.event_project_id !== context.binding.projectId
+        || created.event_stream_id !== `session/${binding.childSessionId}`
+        || created.event_stream_type !== "session"
+        || created.event_session_id !== binding.childSessionId
+        || created.event_parent_session_id !== ticket.sourceParentSessionId
+        || decimal(created.event_stream_version) !== binding.streamVersion
+        || created.event_type !== "ChildWorkTransferCreated"
+        || integer(created.event_schema_version) !== 1
+        || created.payload_ticket_id !== binding.transferTicketId
+        || created.payload_checkpoint_id !== binding.checkpointId
+        || created.payload_authority_commitment !== projection.authorityCommitment
       ) throw new LifecycleError("INTEGRITY_FAILURE");
+      if (ticket.claimedEventPosition !== null) {
+        this.assertTransferClaimProvenance(context, ticket);
+      }
     }
 
     if (binding.checkpointId === null || binding.checkpointEventPosition === null) {
@@ -959,113 +993,385 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
     );
   }
 
-  private frozenChildProjections(
-    context: ProjectContext,
-    rootSessionId: string,
-    bindings: readonly FinalEndingScopeBindingV1[],
-  ): ReadonlyMap<string, SessionAggregateState> {
-    const byChild = new Map<string, FinalEndingScopeBindingV1[]>();
-    for (const binding of bindings) {
-      const existing = byChild.get(binding.childSessionId);
-      if (existing === undefined) byChild.set(binding.childSessionId, [binding]);
-      else existing.push(binding);
-    }
-    const result = new Map<string, SessionAggregateState>();
-    for (const [childSessionId, childBindings] of [...byChild].sort(
-      ([left], [right]) => binaryCompare(left, right),
-    )) {
-      const targets = new Map<string, FinalEndingScopeBindingV1>();
-      let maximumStreamVersion = 0n;
-      let maximumEventPosition = 0n;
-      for (const binding of childBindings) {
-        const targetKey = binding.lastEventPosition;
-        const existing = targets.get(targetKey);
-        if (
-          existing !== undefined
-          && canonicalJson(existing) !== canonicalJson(binding)
-        ) throw new LifecycleError("INTEGRITY_FAILURE");
-        targets.set(targetKey, binding);
-        const streamVersion = BigInt(binding.streamVersion);
-        const eventPosition = BigInt(binding.lastEventPosition);
-        if (streamVersion > maximumStreamVersion) maximumStreamVersion = streamVersion;
-        if (eventPosition > maximumEventPosition) maximumEventPosition = eventPosition;
-      }
-      const rows = this.connection.prepare(`
-        SELECT global_position, event_id, project_id, vault_id, store_id,
-               workspace_id, stream_id, stream_type, stream_version,
-               event_type, event_schema_version, session_id, parent_session_id,
-               correlation_id, causation_id, command_id, idempotency_key,
-               occurred_at, payload_json
-        FROM events
-        WHERE project_id = $projectId
-          AND stream_id = $streamId
-          AND stream_version <= $maxStreamVersion
-          AND global_position <= $maxEventPosition
-        ORDER BY stream_version
-        LIMIT $maxStreamVersion
-      `).all({
-        $projectId: context.binding.projectId,
-        $streamId: `session/${childSessionId}`,
-        $maxStreamVersion: maximumStreamVersion,
-        $maxEventPosition: maximumEventPosition,
+  private storedEventAt(globalPosition: bigint): StoredEvent {
+    const rows = this.connection.prepare(`
+      SELECT global_position, event_id, project_id, vault_id, store_id,
+             workspace_id, branch_scope_id, branch_ref,
+             stream_id, stream_type, stream_version,
+             event_type, event_schema_version, session_id, parent_session_id,
+             actor_role, agent_id, client_instance_id, correlation_id,
+             causation_id, command_id, idempotency_key, command_event_index,
+             occurred_at, recorded_at, visibility_scope, confidence,
+             verification_status, source_refs_json, evidence_refs_json,
+             evidence_digests_json, payload_json, payload_hash,
+             previous_global_hash, event_hash, lifecycle_intent_json
+      FROM events
+      WHERE global_position = $globalPosition
+      LIMIT 2
+    `).all({ $globalPosition: globalPosition });
+    if (rows.length !== 1) throw new LifecycleError("INTEGRITY_FAILURE");
+    const row = rows[0]!;
+    const position = int64(row.global_position);
+    const streamVersion = int64(row.stream_version);
+    const eventSchemaVersion = integer(row.event_schema_version);
+    const commandEventIndex = integer(row.command_event_index);
+    const payload = parsedCanonicalJson(row.payload_json);
+    const sourceRefs = parsedCanonicalJson(row.source_refs_json);
+    const evidenceRefs = parsedCanonicalJson(row.evidence_refs_json);
+    const evidenceDigests = parsedCanonicalJson(row.evidence_digests_json);
+    if (
+      position === null
+      || position !== globalPosition
+      || streamVersion === null
+      || eventSchemaVersion === null
+      || commandEventIndex === null
+      || commandEventIndex < 0
+      || !record(payload)
+      || !nonEmpty(row.event_id)
+      || !nonEmpty(row.project_id)
+      || !nonEmpty(row.vault_id)
+      || !nonEmpty(row.store_id)
+      || !nonEmpty(row.workspace_id)
+      || !nonEmpty(row.stream_id)
+      || !nonEmpty(row.stream_type)
+      || !nonEmpty(row.event_type)
+      || !ACTOR_ROLES.has(String(row.actor_role))
+      || !nonEmpty(row.agent_id)
+      || !nonEmpty(row.client_instance_id)
+      || !nonEmpty(row.correlation_id)
+      || !nonEmpty(row.command_id)
+      || !nonEmpty(row.idempotency_key)
+      || !nonEmpty(row.occurred_at)
+      || !nonEmpty(row.recorded_at)
+      || (
+        row.visibility_scope !== "project"
+        && row.visibility_scope !== "session"
+        && row.visibility_scope !== "private"
+      )
+      || (
+        row.confidence !== "low"
+        && row.confidence !== "medium"
+        && row.confidence !== "high"
+      )
+      || (
+        row.verification_status !== "unverified"
+        && row.verification_status !== "partially-verified"
+        && row.verification_status !== "verified"
+      )
+      || !Array.isArray(sourceRefs)
+      || sourceRefs.some((value) => typeof value !== "string")
+      || !Array.isArray(evidenceRefs)
+      || !Array.isArray(evidenceDigests)
+      || typeof row.payload_json !== "string"
+      || typeof row.payload_hash !== "string"
+      || !LOWER_HASH.test(row.payload_hash)
+      || typeof row.previous_global_hash !== "string"
+      || !LOWER_HASH.test(row.previous_global_hash)
+      || typeof row.event_hash !== "string"
+      || !LOWER_HASH.test(row.event_hash)
+    ) throw new LifecycleError("INTEGRITY_FAILURE");
+    return Object.freeze({
+      globalPosition: position,
+      eventId: row.event_id,
+      projectId: row.project_id,
+      vaultId: row.vault_id,
+      storeId: row.store_id,
+      workspaceId: row.workspace_id,
+      branchScopeId: typeof row.branch_scope_id === "string"
+        ? row.branch_scope_id
+        : null,
+      branchRef: typeof row.branch_ref === "string" ? row.branch_ref : null,
+      streamId: row.stream_id,
+      streamType: row.stream_type,
+      streamVersion,
+      eventType: row.event_type,
+      eventSchemaVersion,
+      sessionId: typeof row.session_id === "string" ? row.session_id : null,
+      parentSessionId: typeof row.parent_session_id === "string"
+        ? row.parent_session_id
+        : null,
+      actorRole: row.actor_role,
+      agentId: row.agent_id,
+      clientInstanceId: row.client_instance_id,
+      correlationId: row.correlation_id,
+      causationId: typeof row.causation_id === "string" ? row.causation_id : null,
+      commandId: row.command_id,
+      idempotencyKey: row.idempotency_key,
+      commandEventIndex,
+      occurredAt: row.occurred_at,
+      recordedAt: row.recorded_at,
+      visibilityScope: row.visibility_scope,
+      confidence: row.confidence,
+      verificationStatus: row.verification_status,
+      sourceRefs: Object.freeze(sourceRefs),
+      evidenceRefs: Object.freeze(evidenceRefs),
+      evidenceDigests: Object.freeze(evidenceDigests),
+      payload,
+      payloadJson: row.payload_json,
+      payloadHash: row.payload_hash,
+      previousGlobalHash: row.previous_global_hash,
+      eventHash: row.event_hash,
+      lifecycleIntentJson: typeof row.lifecycle_intent_json === "string"
+        ? row.lifecycle_intent_json
+        : null,
+    } as unknown as StoredEvent);
+  }
+
+  private decodeStoredLifecycleEvent(
+    event: StoredEvent,
+    authorityCommitment: string,
+  ): LifecycleEvent {
+    try {
+      return decodeLifecycleEvent({
+        eventSchemaVersion: event.eventSchemaVersion,
+        eventId: event.eventId,
+        projectId: event.projectId,
+        vaultId: event.vaultId,
+        storeId: event.storeId,
+        workspaceId: event.workspaceId,
+        streamId: event.streamId,
+        streamVersion: event.streamVersion.toString(),
+        globalPosition: event.globalPosition.toString(),
+        sessionId: event.sessionId,
+        parentSessionId: event.parentSessionId,
+        eventType: event.eventType,
+        correlationId: event.correlationId,
+        causationId: event.causationId,
+        commandId: event.commandId,
+        idempotencyKey: event.idempotencyKey,
+        occurredAt: event.occurredAt,
+        authorityCommitment,
+        payload: event.payload,
       });
-      let aggregate: SessionAggregateState | null = null;
-      let authorityCommitment: string | null = null;
-      for (const row of rows) {
-        const payload = parsedCanonicalJson(row.payload_json);
-        if (!record(payload)) throw new LifecycleError("INTEGRITY_FAILURE");
-        if (typeof payload.authorityCommitment === "string") {
-          authorityCommitment = payload.authorityCommitment;
-        }
-        const eventSchemaVersion = integer(row.event_schema_version);
-        const streamVersion = decimal(row.stream_version);
-        const globalPosition = decimal(row.global_position);
-        if (
-          eventSchemaVersion === null
-          || streamVersion === null
-          || globalPosition === null
-          || authorityCommitment === null
-          || row.stream_type !== "session"
-          || row.session_id !== childSessionId
-          || row.parent_session_id !== rootSessionId
-        ) throw new LifecycleError("INTEGRITY_FAILURE");
-        const event = decodeLifecycleEvent({
-          eventSchemaVersion,
-          eventId: row.event_id,
-          projectId: row.project_id,
-          vaultId: row.vault_id,
-          storeId: row.store_id,
-          workspaceId: row.workspace_id,
-          streamId: row.stream_id,
-          streamVersion,
-          globalPosition,
-          sessionId: row.session_id,
-          parentSessionId: row.parent_session_id,
-          eventType: row.event_type,
-          correlationId: row.correlation_id,
-          causationId: row.causation_id,
-          commandId: row.command_id,
-          idempotencyKey: row.idempotency_key,
-          occurredAt: row.occurred_at,
-          authorityCommitment,
-          payload,
-        });
-        aggregate = aggregate === null
-          ? foldSession([event])
-          : evolveSession(aggregate as never, event);
-        if (targets.has(globalPosition)) {
-          result.set(`${childSessionId}\u0000${globalPosition}`, aggregate);
-        }
-      }
-      if (
-        aggregate === null
-        || aggregate.streamVersion !== maximumStreamVersion
-        || aggregate.eventPosition !== maximumEventPosition
-        || [...targets].some(([position]) =>
-          !result.has(`${childSessionId}\u0000${position}`))
-      ) throw new LifecycleError("INTEGRITY_FAILURE");
+    } catch {
+      throw new LifecycleError("INTEGRITY_FAILURE");
     }
-    return result;
+  }
+
+  private eventMatchesContext(
+    context: ProjectContext,
+    event: StoredEvent,
+  ): boolean {
+    const workspace = context.workspace ?? context.binding.workspace;
+    const branchRef = workspace?.kind === "git"
+      ? workspace.branchRef
+      : null;
+    return event.projectId === context.binding.projectId
+      && event.vaultId === context.binding.vaultId
+      && event.storeId === context.binding.storeId
+      && event.workspaceId === context.binding.workspaceId
+      && event.branchScopeId === (context.branchScopeId ?? null)
+      && event.branchRef === branchRef;
+  }
+
+  private reportWitnessForTarget(
+    context: ProjectContext,
+    repository: SqliteLifecycleProjectionRepository,
+    target: ChildEventFoldProjection,
+    targetEvent: StoredEvent,
+  ): ChildEventFoldProjection | null {
+    const payload = targetEvent.payload;
+    if (!record(payload)) throw new LifecycleError("INTEGRITY_FAILURE");
+    const reportId = targetEvent.eventType === "ChildWorkDispositioned"
+      ? record(payload.disposition) && typeof payload.disposition.reportId === "string"
+        ? payload.disposition.reportId
+        : null
+      : targetEvent.eventType === "ChildCompletionProposed"
+        || targetEvent.eventType === "ChildSessionCompleted"
+        ? typeof payload.reportId === "string" ? payload.reportId : null
+        : null;
+    if (reportId === null) return null;
+    const witness = repository.findReportWitness(
+      context.binding.projectId,
+      target.childSessionId,
+      reportId,
+    );
+    if (
+      witness === null
+      || witness.eventPosition >= target.eventPosition
+      || witness.streamVersion >= target.streamVersion
+      || witness.reportedReportId !== reportId
+      || witness.reportedItemCount === null
+      || witness.reportedItemSetFingerprint === null
+    ) throw new LifecycleError("INTEGRITY_FAILURE");
+    const source = this.storedEventAt(witness.eventPosition);
+    const event = this.decodeStoredLifecycleEvent(source, witness.authorityCommitment);
+    if (
+      event.eventType !== "ChildWorkReported"
+      || !this.eventMatchesContext(context, source)
+      || source.streamId !== `session/${target.childSessionId}`
+      || source.streamType !== "session"
+      || event.sessionId !== target.childSessionId
+      || event.parentSessionId !== target.rootSessionId
+      || event.globalPosition !== witness.eventPosition.toString()
+      || event.streamVersion !== witness.streamVersion.toString()
+      || event.payload.report.reportId !== reportId
+      || event.payload.report.allReportItemIds.length !== witness.reportedItemCount
+      || reportItemSetFingerprint({
+        projectId: context.binding.projectId,
+        childSessionId: target.childSessionId,
+        reportId,
+        allReportItemIds: event.payload.report.allReportItemIds,
+      }) !== witness.reportedItemSetFingerprint
+    ) throw new LifecycleError("INTEGRITY_FAILURE");
+    return witness;
+  }
+
+  private sameChildProjection(
+    left: ChildEventFoldProjection,
+    right: ChildEventFoldProjection,
+  ): boolean {
+    return left.projectId === right.projectId
+      && left.childSessionId === right.childSessionId
+      && left.eventPosition === right.eventPosition
+      && left.streamVersion === right.streamVersion
+      && left.rootSessionId === right.rootSessionId
+      && left.childState === right.childState
+      && left.latestCheckpointId === right.latestCheckpointId
+      && left.latestCheckpointEventPosition === right.latestCheckpointEventPosition
+      && left.authorityCommitment === right.authorityCommitment
+      && left.terminalEventType === right.terminalEventType
+      && left.terminalEventPosition === right.terminalEventPosition
+      && left.reportCount === right.reportCount
+      && left.latestReportId === right.latestReportId
+      && left.reportIndexFingerprint === right.reportIndexFingerprint
+      && left.completionReportId === right.completionReportId
+      && left.reportedReportId === right.reportedReportId
+      && left.reportedItemCount === right.reportedItemCount
+      && left.reportedItemSetFingerprint === right.reportedItemSetFingerprint
+      && left.previousFingerprint === right.previousFingerprint
+      && left.fingerprint === right.fingerprint;
+  }
+
+  private assertTransferClaimProvenance(
+    context: ProjectContext,
+    ticket: ChildTransferTicketRecord,
+  ): void {
+    if (
+      ticket.claimedByRootSessionId === null
+      || ticket.claimedChildSessionId === null
+      || ticket.claimedEventPosition === null
+      || ticket.claimedAtMs === null
+    ) throw new LifecycleError("INTEGRITY_FAILURE");
+    const row = this.connection.prepare(`
+      SELECT
+        fork.global_position AS fork_global_position,
+        fork.event_id AS fork_event_id,
+        fork.project_id AS fork_project_id,
+        fork.vault_id AS fork_vault_id,
+        fork.store_id AS fork_store_id,
+        fork.workspace_id AS fork_workspace_id,
+        fork.stream_id AS fork_stream_id,
+        fork.stream_type AS fork_stream_type,
+        fork.stream_version AS fork_stream_version,
+        fork.event_type AS fork_event_type,
+        fork.event_schema_version AS fork_event_schema_version,
+        fork.session_id AS fork_session_id,
+        fork.parent_session_id AS fork_parent_session_id,
+        fork.correlation_id AS fork_correlation_id,
+        fork.causation_id AS fork_causation_id,
+        fork.command_id AS fork_command_id,
+        fork.idempotency_key AS fork_idempotency_key,
+        fork.occurred_at AS fork_occurred_at,
+        fork.payload_json AS fork_payload_json,
+        claimed.global_position AS claimed_global_position,
+        claimed.event_id AS claimed_event_id,
+        claimed.project_id AS claimed_project_id,
+        claimed.vault_id AS claimed_vault_id,
+        claimed.store_id AS claimed_store_id,
+        claimed.workspace_id AS claimed_workspace_id,
+        claimed.stream_id AS claimed_stream_id,
+        claimed.stream_type AS claimed_stream_type,
+        claimed.stream_version AS claimed_stream_version,
+        claimed.event_type AS claimed_event_type,
+        claimed.event_schema_version AS claimed_event_schema_version,
+        claimed.session_id AS claimed_session_id,
+        claimed.parent_session_id AS claimed_parent_session_id,
+        claimed.correlation_id AS claimed_correlation_id,
+        claimed.causation_id AS claimed_causation_id,
+        claimed.command_id AS claimed_command_id,
+        claimed.idempotency_key AS claimed_idempotency_key,
+        claimed.occurred_at AS claimed_occurred_at,
+        claimed.payload_json AS claimed_payload_json
+      FROM events AS claimed
+      LEFT JOIN events AS fork INDEXED BY events_stream_range
+        ON fork.project_id = claimed.project_id
+        AND fork.stream_id = claimed.stream_id
+        AND fork.stream_version = 1
+      WHERE claimed.global_position = $claimedEventPosition
+      LIMIT 1
+    `).get({ $claimedEventPosition: ticket.claimedEventPosition });
+    if (row === undefined) throw new LifecycleError("INTEGRITY_FAILURE");
+    const decode = (
+      prefix: "fork" | "claimed",
+      authorityCommitment: string,
+    ): LifecycleEvent => {
+      const payload = parsedCanonicalJson(row[`${prefix}_payload_json`]);
+      const eventSchemaVersion = integer(row[`${prefix}_event_schema_version`]);
+      const streamVersion = decimal(row[`${prefix}_stream_version`]);
+      const globalPosition = decimal(row[`${prefix}_global_position`]);
+      if (
+        !record(payload)
+        || eventSchemaVersion === null
+        || streamVersion === null
+        || globalPosition === null
+        || row[`${prefix}_stream_type`] !== "session"
+      ) throw new LifecycleError("INTEGRITY_FAILURE");
+      return decodeLifecycleEvent({
+        eventSchemaVersion,
+        eventId: row[`${prefix}_event_id`],
+        projectId: row[`${prefix}_project_id`],
+        vaultId: row[`${prefix}_vault_id`],
+        storeId: row[`${prefix}_store_id`],
+        workspaceId: row[`${prefix}_workspace_id`],
+        streamId: row[`${prefix}_stream_id`],
+        streamVersion,
+        globalPosition,
+        sessionId: row[`${prefix}_session_id`],
+        parentSessionId: row[`${prefix}_parent_session_id`],
+        eventType: row[`${prefix}_event_type`],
+        correlationId: row[`${prefix}_correlation_id`],
+        causationId: row[`${prefix}_causation_id`],
+        commandId: row[`${prefix}_command_id`],
+        idempotencyKey: row[`${prefix}_idempotency_key`],
+        occurredAt: row[`${prefix}_occurred_at`],
+        authorityCommitment,
+        payload,
+      });
+    };
+    const forkPayload = parsedCanonicalJson(row.fork_payload_json);
+    if (!record(forkPayload) || typeof forkPayload.authorityCommitment !== "string") {
+      throw new LifecycleError("INTEGRITY_FAILURE");
+    }
+    const fork = decode("fork", forkPayload.authorityCommitment);
+    const claimed = decode("claimed", fork.authorityCommitment);
+    const projection = evolveSession(foldSession([fork]), claimed);
+    if (
+      fork.eventType !== "SessionForked"
+      || fork.eventSchemaVersion !== 1
+      || fork.projectId !== context.binding.projectId
+      || fork.vaultId !== context.binding.vaultId
+      || fork.storeId !== context.binding.storeId
+      || fork.workspaceId !== context.binding.workspaceId
+      || fork.sessionId !== ticket.claimedChildSessionId
+      || fork.parentSessionId !== ticket.claimedByRootSessionId
+      || fork.streamVersion !== "1"
+      || fork.payload.sourceTransferTicketId !== ticket.transferTicketId
+      || claimed.eventType !== "ChildWorkTransferClaimed"
+      || claimed.eventSchemaVersion !== 1
+      || claimed.projectId !== context.binding.projectId
+      || claimed.sessionId !== ticket.claimedChildSessionId
+      || claimed.parentSessionId !== ticket.claimedByRootSessionId
+      || claimed.streamVersion !== "2"
+      || claimed.globalPosition !== ticket.claimedEventPosition.toString()
+      || claimed.occurredAt !== new Date(Number(ticket.claimedAtMs)).toISOString()
+      || claimed.payload.transferTicketId !== ticket.transferTicketId
+      || claimed.payload.previousChildSessionId !== ticket.sourceChildSessionId
+      || claimed.payload.previousTransferEventPosition
+        !== ticket.createdEventPosition.toString()
+      || projection.kind !== "child"
+      || projection.claimedTransferTicketId !== ticket.transferTicketId
+    ) throw new LifecycleError("INTEGRITY_FAILURE");
   }
 
   private assertEventTimeCleanScope(
@@ -1842,7 +2148,7 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
       let openHistoryValid = true;
       if (row.evidence_window_state === "open") {
         try {
-          this.assertOpenWorkflowHistory(context, row);
+          this.assertOpenWorkflowProjection(context, row);
         } catch {
           openHistoryValid = false;
         }
@@ -1910,182 +2216,210 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
     }
   }
 
-  private assertOpenWorkflowHistory(
+  private assertOpenWorkflowProjection(
     context: ProjectContext,
     workflow: SqliteRow,
   ): void {
     const generation = integer(workflow.generation);
-    const triggeringPosition = int64(workflow.triggering_event_position);
     if (
       generation === null
       || generation < 1
-      || triggeringPosition === null
-      || typeof workflow.session_id !== "string"
       || typeof workflow.workflow_id !== "string"
+      || typeof workflow.session_id !== "string"
       || typeof workflow.root_command_id !== "string"
-      || typeof workflow.expected_authority_commitment !== "string"
-      || !LOWER_HASH.test(workflow.expected_authority_commitment)
     ) throw new LifecycleError("INTEGRITY_FAILURE");
-    const triggering = this.connection.prepare(`
-      SELECT stream_version
-      FROM events
-      WHERE global_position = $triggeringPosition
-        AND project_id = $projectId
-        AND session_id = $sessionId
-        AND stream_id = $streamId
-        AND stream_type = 'session'
-      LIMIT 1
-    `).get({
-      $triggeringPosition: triggeringPosition,
-      $projectId: context.binding.projectId,
-      $sessionId: workflow.session_id,
-      $streamId: `session/${String(workflow.session_id)}`,
-    });
-    const triggeringStreamVersion = int64(triggering?.stream_version);
-    if (triggeringStreamVersion === null) throw new LifecycleError("INTEGRITY_FAILURE");
+    const repository = new SqliteLifecycleProjectionRepository(this.connection);
+    const target = repository.findWorkflowGeneration(
+      context.binding.projectId,
+      workflow.workflow_id,
+      generation,
+    );
+    if (target === null) throw new LifecycleError("INTEGRITY_FAILURE");
+    const predecessor = repository.findWorkflowPredecessor(
+      context.binding.projectId,
+      workflow.workflow_id,
+      generation,
+    );
+    if (
+      (generation === 1) !== (predecessor === null)
+      || (predecessor !== null && (
+        predecessor.workflowGeneration !== generation - 1
+        || predecessor.fingerprint !== target.previousFingerprint
+        || predecessor.triggerEventPosition >= target.triggerEventPosition
+      ))
+    ) throw new LifecycleError("INTEGRITY_FAILURE");
+    const trigger = this.storedEventAt(target.triggerEventPosition);
+    if (
+      !this.eventMatchesContext(context, trigger)
+      || trigger.streamId !== `session/${target.sessionId}`
+      || trigger.streamType !== "session"
+      || trigger.sessionId !== target.sessionId
+      || trigger.parentSessionId !== null
+      || trigger.commandEventIndex !== 0
+    ) throw new LifecycleError("INTEGRITY_FAILURE");
+    const intent = this.commandIntentEventZero(context, trigger);
+    const expected = foldWorkflowGenerationProjection(
+      predecessor,
+      trigger,
+      intent,
+      "live-schema-3",
+    );
+    if (
+      !this.sameWorkflowProjection(target, expected)
+      || target.projectId !== context.binding.projectId
+      || target.workflowId !== workflow.workflow_id
+      || target.workflowGeneration !== generation
+      || target.sessionId !== workflow.session_id
+      || target.triggerEventPosition !== int64(workflow.triggering_event_position)
+      || target.rootCommandId !== workflow.root_command_id
+      || target.evidenceWindowState !== "open"
+    ) throw new LifecycleError("INTEGRITY_FAILURE");
+    this.assertEffectiveWorkflowSource(context, target);
+  }
+
+  private commandIntentEventZero(
+    context: ProjectContext,
+    event: StoredEvent,
+  ): ReturnType<typeof decodeLifecycleIntentWitness> {
     const rows = this.connection.prepare(`
-      SELECT global_position, event_id, project_id, vault_id, store_id,
-             workspace_id, stream_id, stream_type, stream_version,
-             event_type, event_schema_version, session_id, parent_session_id,
-             correlation_id, causation_id, command_id, idempotency_key,
-             occurred_at, payload_json, lifecycle_intent_json
+      SELECT global_position, lifecycle_intent_json
       FROM events
       WHERE project_id = $projectId
-        AND stream_id = $streamId
-        AND stream_version <= $triggeringStreamVersion
-        AND event_type IN ('SessionEndRequested', 'SessionEndAmended')
-        AND json_extract(payload_json, '$.workflowId') = $workflowId
-      ORDER BY stream_version
-      LIMIT $generation
+        AND command_id = $commandId
+        AND command_event_index = 0
+      LIMIT 2
     `).all({
       $projectId: context.binding.projectId,
-      $streamId: `session/${String(workflow.session_id)}`,
-      $triggeringStreamVersion: triggeringStreamVersion,
-      $workflowId: workflow.workflow_id,
-      $generation: BigInt(generation),
+      $commandId: event.commandId,
     });
-    if (rows.length !== generation) throw new LifecycleError("INTEGRITY_FAILURE");
-    let effectiveVersion: 1 | 2 | null = null;
-    for (let index = 0; index < rows.length; index += 1) {
-      const row = rows[index]!;
-      const payload = parsedCanonicalJson(row.payload_json);
-      if (!record(payload) || typeof row.lifecycle_intent_json !== "string") {
-        throw new LifecycleError("INTEGRITY_FAILURE");
-      }
-      const eventSchemaVersion = integer(row.event_schema_version);
-      const streamVersion = decimal(row.stream_version);
-      const globalPosition = decimal(row.global_position);
-      if (
-        eventSchemaVersion === null
-        || streamVersion === null
-        || globalPosition === null
-        || row.project_id !== context.binding.projectId
-        || row.vault_id !== context.binding.vaultId
-        || row.store_id !== context.binding.storeId
-        || row.workspace_id !== context.binding.workspaceId
-        || row.session_id !== workflow.session_id
-        || row.parent_session_id !== null
-      ) throw new LifecycleError("INTEGRITY_FAILURE");
-      const event = decodeLifecycleEvent({
-        eventSchemaVersion,
-        eventId: row.event_id,
-        projectId: row.project_id,
-        vaultId: row.vault_id,
-        storeId: row.store_id,
-        workspaceId: row.workspace_id,
-        streamId: row.stream_id,
-        streamVersion,
-        globalPosition,
-        sessionId: row.session_id,
-        parentSessionId: row.parent_session_id,
-        eventType: row.event_type,
-        correlationId: row.correlation_id,
-        causationId: row.causation_id,
-        commandId: row.command_id,
-        idempotencyKey: row.idempotency_key,
-        occurredAt: row.occurred_at,
-        authorityCommitment: workflow.expected_authority_commitment,
-        payload,
-      });
-      const witness = decodeLifecycleIntentWitness(row.lifecycle_intent_json);
-      const command = witness.intent.command;
-      if (
-        !record(command)
-        || command.commandId !== event.commandId
-        || witness.intent.binding.projectId !== context.binding.projectId
-        || witness.intent.binding.vaultId !== context.binding.vaultId
-        || witness.intent.binding.storeId !== context.binding.storeId
-        || witness.intent.binding.workspaceId !== context.binding.workspaceId
-        || witness.intent.binding.clientNamespace !== context.binding.clientNamespace
-        || witness.intent.authorization.authorizationSessionId !== workflow.session_id
-        || witness.intent.authorization.targetSessionId !== workflow.session_id
-      ) throw new LifecycleError("INTEGRITY_FAILURE");
-      const expectedGeneration = index + 1;
-      if (event.eventType === "SessionEndRequested") {
-        if (
-          command.commandType !== "request-session-end"
-          || !record(command.request)
-          || command.request.sessionId !== workflow.session_id
-          || event.payload.workflowId !== workflow.workflow_id
-          || event.payload.workflowGeneration !== expectedGeneration
-          || command.request.childEndPolicy !== event.payload.childEndPolicy
-          || command.request.requestedQualityThreshold !== event.payload.qualityThreshold
-          || command.request.requireFullEvidence !== event.payload.requireFullEvidence
-          || command.request.requireMaterialization !== event.payload.requireMaterialization
-          || (
-            event.eventSchemaVersion === 1
-              ? command.request.requestVersion !== 1
-              : command.request.requestVersion !== 2
-          )
-          || !record(command.request.finalCheckpoint)
-          || (
-            command.request.finalCheckpoint.checkpointVersion !== 1
-            && command.request.finalCheckpoint.checkpointVersion !== 2
-          )
-        ) throw new LifecycleError("INTEGRITY_FAILURE");
-        effectiveVersion = command.request.finalCheckpoint.checkpointVersion;
-      } else if (event.eventType === "SessionEndAmended") {
-        if (
-          command.commandType !== "amend-session-end"
-          || command.sessionId !== workflow.session_id
-          || command.workflowId !== workflow.workflow_id
-          || !record(command.amendment)
-          || event.payload.workflowId !== workflow.workflow_id
-          || event.payload.workflowGeneration !== expectedGeneration
-          || event.payload.previousWorkflowGeneration !== expectedGeneration - 1
-          || (
-            event.eventSchemaVersion === 1
-              ? command.amendment.amendmentVersion !== 1
-              : (
-                command.amendment.amendmentVersion !== 2
-                || payload.evidenceWindowAction !== command.amendment.evidenceWindowAction
-                || payload.finalCheckpointVersion
-                  !== (
-                    record(command.amendment.finalCheckpoint)
-                      ? command.amendment.finalCheckpoint.checkpointVersion
-                      : null
-                  )
-              )
-          )
-        ) throw new LifecycleError("INTEGRITY_FAILURE");
-        const draft = command.amendment.finalCheckpoint;
-        if (draft !== null) {
-          if (
-            !record(draft)
-            || (draft.checkpointVersion !== 1 && draft.checkpointVersion !== 2)
-          ) throw new LifecycleError("INTEGRITY_FAILURE");
-          effectiveVersion = draft.checkpointVersion;
-        }
-      } else {
-        throw new LifecycleError("INTEGRITY_FAILURE");
-      }
-    }
-    const current = rows.at(-1)!;
     if (
-      int64(current.global_position) !== triggeringPosition
-      || current.command_id !== workflow.root_command_id
-      || effectiveVersion !== 2
+      rows.length !== 1
+      || int64(rows[0]!.global_position) !== event.globalPosition
+      || typeof rows[0]!.lifecycle_intent_json !== "string"
+    ) {
+      throw new LifecycleError("INTEGRITY_FAILURE");
+    }
+    try {
+      return decodeLifecycleIntentWitness(rows[0]!.lifecycle_intent_json);
+    } catch {
+      throw new LifecycleError("INTEGRITY_FAILURE");
+    }
+  }
+
+  private assertEffectiveWorkflowSource(
+    context: ProjectContext,
+    target: WorkflowGenerationFoldProjection,
+  ): void {
+    if (target.effectiveDraftSourceEventPosition > target.triggerEventPosition) {
+      throw new LifecycleError("INTEGRITY_FAILURE");
+    }
+    const source = this.storedEventAt(target.effectiveDraftSourceEventPosition);
+    const event = this.decodeStoredLifecycleEvent(source, "0".repeat(64));
+    if (
+      !this.eventMatchesContext(context, source)
+      || source.streamId !== `session/${target.sessionId}`
+      || source.streamType !== "session"
+      || source.sessionId !== target.sessionId
+      || source.parentSessionId !== null
+      || source.commandEventIndex !== 0
     ) throw new LifecycleError("INTEGRITY_FAILURE");
+    const witness = this.commandIntentEventZero(context, source);
+    const command = witness.intent.command;
+    if (
+      !record(command)
+      || source.projectId !== context.binding.projectId
+      || source.vaultId !== context.binding.vaultId
+      || source.storeId !== context.binding.storeId
+      || source.workspaceId !== context.binding.workspaceId
+      || event.sessionId !== target.sessionId
+      || event.parentSessionId !== null
+      || command.commandId !== source.commandId
+      || command.expectedBranchRef !== source.branchRef
+      || witness.intent.binding.projectId !== context.binding.projectId
+      || witness.intent.binding.vaultId !== context.binding.vaultId
+      || witness.intent.binding.storeId !== context.binding.storeId
+      || witness.intent.binding.workspaceId !== context.binding.workspaceId
+      || witness.intent.binding.clientNamespace !== context.binding.clientNamespace
+      || witness.intent.authorization.authorizationSessionId !== target.sessionId
+      || witness.intent.authorization.targetSessionId !== target.sessionId
+    ) throw new LifecycleError("INTEGRITY_FAILURE");
+    let sourceVersion: 1 | 2;
+    if (event.eventType === "SessionEndRequested") {
+      const request = record(command.request) ? command.request : null;
+      const draft = request !== null && record(request.finalCheckpoint)
+        ? request.finalCheckpoint
+        : null;
+      if (
+        command.commandType !== "request-session-end"
+        || request === null
+        || draft === null
+        || request.sessionId !== target.sessionId
+        || event.payload.workflowId !== target.workflowId
+        || event.payload.workflowGeneration > target.workflowGeneration
+        || request.childEndPolicy !== event.payload.childEndPolicy
+        || request.requestedQualityThreshold !== event.payload.qualityThreshold
+        || request.requireFullEvidence !== event.payload.requireFullEvidence
+        || request.requireMaterialization !== event.payload.requireMaterialization
+        || (
+          event.eventSchemaVersion === 1
+            ? request.requestVersion !== 1
+            : request.requestVersion !== 2
+        )
+        || (draft.checkpointVersion !== 1 && draft.checkpointVersion !== 2)
+      ) throw new LifecycleError("INTEGRITY_FAILURE");
+      sourceVersion = draft.checkpointVersion;
+    } else if (event.eventType === "SessionEndAmended") {
+      const amendment = record(command.amendment) ? command.amendment : null;
+      const draft = amendment !== null && record(amendment.finalCheckpoint)
+        ? amendment.finalCheckpoint
+        : null;
+      if (
+        command.commandType !== "amend-session-end"
+        || amendment === null
+        || draft === null
+        || command.sessionId !== target.sessionId
+        || command.workflowId !== target.workflowId
+        || event.payload.workflowId !== target.workflowId
+        || event.payload.workflowGeneration > target.workflowGeneration
+        || event.payload.previousWorkflowGeneration
+          !== event.payload.workflowGeneration - 1
+        || (
+          event.eventSchemaVersion === 1
+            ? amendment.amendmentVersion !== 1
+            : (
+              amendment.amendmentVersion !== 2
+              || amendment.evidenceWindowAction !== event.payload.evidenceWindowAction
+              || event.payload.finalCheckpointVersion !== draft.checkpointVersion
+            )
+        )
+        || (draft.checkpointVersion !== 1 && draft.checkpointVersion !== 2)
+      ) throw new LifecycleError("INTEGRITY_FAILURE");
+      sourceVersion = draft.checkpointVersion;
+    } else {
+      throw new LifecycleError("INTEGRITY_FAILURE");
+    }
+    if (sourceVersion !== target.effectiveCheckpointVersion) {
+      throw new LifecycleError("INTEGRITY_FAILURE");
+    }
+  }
+
+  private sameWorkflowProjection(
+    left: WorkflowGenerationFoldProjection,
+    right: WorkflowGenerationFoldProjection,
+  ): boolean {
+    return left.projectId === right.projectId
+      && left.workflowId === right.workflowId
+      && left.workflowGeneration === right.workflowGeneration
+      && left.sessionId === right.sessionId
+      && left.triggerEventPosition === right.triggerEventPosition
+      && left.rootCommandId === right.rootCommandId
+      && left.evidenceWindowState === right.evidenceWindowState
+      && left.replacementCheckpointVersion === right.replacementCheckpointVersion
+      && left.effectiveCheckpointVersion === right.effectiveCheckpointVersion
+      && left.effectiveDraftSourceEventPosition
+        === right.effectiveDraftSourceEventPosition
+      && left.previousFingerprint === right.previousFingerprint
+      && left.fingerprint === right.fingerprint;
   }
 
   private checkEvidence(context: ProjectContext, sink: IntegrityIssueSink): void {
