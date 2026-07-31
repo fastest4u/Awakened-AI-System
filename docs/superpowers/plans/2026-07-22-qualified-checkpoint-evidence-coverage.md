@@ -1872,7 +1872,7 @@ Add exact anchors:
 - `lifecycle projection writer resolves a non-latest report witness by its partial-unique key`;
 - `lifecycle command replay performs no projection write`;
 - `lifecycle projection failure rolls back events service state and dedup atomically`;
-- `schema 3 projects existing version 1 lifecycle writes while version 2 routing stays disabled`.
+- `schema 3 projects existing version 1 lifecycle writes`.
 
 Recording collaborators must prove the order
 `beforeAppend → append → service afterAppend → projection append → dedup →
@@ -1880,21 +1880,24 @@ commit`. SQL integration cases must cover every eligible child event and every
 generation-causing event, including legal `unchanged` null carry. Create three
 reports and consume the first after the third is latest; assert the writer
 passes that first row—not the predecessor/latest row—to the pure fold. A replay
-must record zero projection/repository calls. The disabled-routing case uses
-the production worker/backend composition and asserts `LIFECYCLE_V2_DISABLED`
-with zero event/dedup/workflow effect.
+must record zero projection/repository calls. Task 12's production-disabled
+gate remains structural: schema 3 and these writers must not register a
+lifecycle worker route. The exact decoded production request,
+`LIFECYCLE_V2_DISABLED`, and zero-SQLite-effect behavioral proof is deferred to
+Task 13, which introduces the lifecycle wire variant and backend dispatch seam;
+Task 12I must not add either seam early.
 
 - [ ] **Step 7: Compile and record the writer RED**
 
 ```powershell
 npm run test:build
 if ($LASTEXITCODE -ne 0) { throw "Task 12I writer tests must compile before behavioral RED" }
-node --test --test-concurrency=1 --test-reporter=spec --test-name-pattern="^(lifecycle command store writes projections after service postwrites and before dedup|lifecycle projection writer processes a multi-event batch in ascending position|lifecycle projection writer resolves a non-latest report witness by its partial-unique key|lifecycle command replay performs no projection write|lifecycle projection failure rolls back events service state and dedup atomically|schema 3 projects existing version 1 lifecycle writes while version 2 routing stays disabled)$" dist-test/tests/lifecycle-command-store.test.js dist-test/tests/event-append-transaction.test.js dist-test/tests/project-store-executor.test.js
+node --test --test-concurrency=1 --test-reporter=spec --test-name-pattern="^(lifecycle command store writes projections after service postwrites and before dedup|lifecycle projection writer processes a multi-event batch in ascending position|lifecycle projection writer resolves a non-latest report witness by its partial-unique key|lifecycle command replay performs no projection write|lifecycle projection failure rolls back events service state and dedup atomically|schema 3 projects existing version 1 lifecycle writes)$" dist-test/tests/lifecycle-command-store.test.js dist-test/tests/event-append-transaction.test.js
 ```
 
 Expected: `LifecycleProjectionWriter`/repository or the post-service/pre-dedup
 hook is absent, replay invokes an incorrectly placed hook, failure is not
-atomic, or schema 3 changes disabled production routing.
+atomic, or schema-3 Version 1 writes are not projected.
 
 - [ ] **Step 8: Implement immutable persistence and central hook**
 
@@ -1947,7 +1950,7 @@ npm run test:build
 node --test --test-concurrency=1 --test-reporter=spec dist-test/tests/lifecycle-command-store.test.js dist-test/tests/lifecycle-command-processor.test.js dist-test/tests/child-workflow.test.js dist-test/tests/checkpoint.service.test.js dist-test/tests/evidence-coverage.test.js dist-test/tests/event-append-transaction.test.js dist-test/tests/project-store-executor.test.js
 npm run typecheck
 git diff --check
-git add src/orchestrator/storage/lifecycle-projection.repository.ts src/orchestrator/lifecycle/lifecycle-command.store.ts tests/lifecycle-command-store.test.ts tests/lifecycle-command-processor.test.ts tests/child-workflow.test.ts tests/checkpoint.service.test.ts tests/evidence-coverage.test.ts tests/event-append-transaction.test.ts tests/project-store-executor.test.ts
+git add src/orchestrator/storage/lifecycle-projection.repository.ts src/orchestrator/lifecycle/lifecycle-command.store.ts tests/lifecycle-command-store.test.ts tests/lifecycle-command-processor.test.ts tests/child-workflow.test.ts tests/checkpoint.service.test.ts tests/evidence-coverage.test.ts tests/event-append-transaction.test.ts
 git commit -m "feat: persist immutable lifecycle projections"
 ```
 
