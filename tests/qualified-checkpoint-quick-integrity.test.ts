@@ -35,6 +35,7 @@ import {
 } from "./support/lifecycle-fixtures.js";
 import {
   buildLifecycleIntentWitness,
+  decodeLifecycleIntentWitness,
 } from "../src/orchestrator/lifecycle/lifecycle-intent-witness.js";
 import {
   referenceCheckpointFingerprint,
@@ -315,6 +316,7 @@ function rawEvent(
     readonly parentSessionId?: string | null;
     readonly payload: unknown;
     readonly lifecycleIntent?: string | null;
+    readonly idempotencyKey?: string;
   },
 ): void {
   const offset = Number(input.globalPosition % 100_000n);
@@ -340,7 +342,7 @@ function rawEvent(
     correlation_id: input.sessionId,
     causation_id: null,
     command_id: uuid(30_000 + offset),
-    idempotency_key: `quick-integrity/${input.globalPosition}`,
+    idempotency_key: input.idempotencyKey ?? `quick-integrity/${input.globalPosition}`,
     command_event_index: 0,
     occurred_at: NOW,
     recorded_at: NOW,
@@ -611,6 +613,8 @@ function createFixture(): Fixture {
       storeId: STORE_ID,
       workspaceId: WORKSPACE_ID,
       clientNamespace: "tests",
+      actorRole: "primary",
+      clientInstanceId: "client-quick-integrity",
     },
   } as ProjectContext;
   return { connection, context };
@@ -1198,6 +1202,10 @@ function amendmentWitness(
 function amendmentWitnessV2(
   workflowId: string,
   commandId: string,
+  overrides: {
+    readonly command?: Readonly<Record<string, unknown>>;
+    readonly origin?: Readonly<Record<string, unknown>>;
+  } = {},
 ): string {
   const command = {
     commandType: "amend-session-end",
@@ -1221,8 +1229,9 @@ function amendmentWitnessV2(
       requireMaterialization: true,
       evidenceWindowAction: "unchanged",
     },
+    ...overrides.command,
   };
-  return buildLifecycleIntentWitness(command as never, {
+  const origin = {
     authorizationKind: "protected",
     authorizationSessionId: ROOT_ID,
     targetSessionId: ROOT_ID,
@@ -1240,7 +1249,9 @@ function amendmentWitnessV2(
     internalWorkflowId: null,
     internalWorkflowGeneration: null,
     internalPlannedWorkId: null,
-  }).source;
+    ...overrides.origin,
+  };
+  return buildLifecycleIntentWitness(command as never, origin as never).source;
 }
 
 function openWorkflowFixture(version: 1 | 2): Fixture {
@@ -1265,6 +1276,7 @@ function openWorkflowFixture(version: 1 | 2): Fixture {
       ...(version === 2 ? { requestVersion: 2 } : {}),
     },
     lifecycleIntent: requestWitness(version, commandId),
+    idempotencyKey: `quick-integrity/end-request/${version}`,
   });
   fixture.connection.prepare(`
     UPDATE streams SET current_version = 2
@@ -1318,6 +1330,7 @@ function openAmendmentFixture(finalCheckpointVersion: 1 | null): Fixture {
       requestVersion: 2,
     },
     lifecycleIntent: requestWitness(2, requestCommandId),
+    idempotencyKey: "quick-integrity/end-request/2",
   });
   rawEvent(fixture.connection, {
     globalPosition: 3n,
@@ -1342,6 +1355,9 @@ function openAmendmentFixture(finalCheckpointVersion: 1 | null): Fixture {
     lifecycleIntent: finalCheckpointVersion === null
       ? amendmentWitnessV2(workflowId, amendmentCommandId)
       : amendmentWitness(workflowId, amendmentCommandId, finalCheckpointVersion),
+    idempotencyKey: `quick-integrity/end-amendment/${
+      finalCheckpointVersion === null ? "v2-unchanged" : finalCheckpointVersion
+    }`,
   });
   fixture.connection.prepare(`
     UPDATE streams SET current_version = 3
@@ -1977,6 +1993,7 @@ function claimFrozenTicket(
   frozen: ReturnType<typeof frozenTicketFixture>,
 ): {
   readonly claimedChildSessionId: string;
+  readonly forkEventPosition: bigint;
   readonly claimEventPosition: bigint;
 } {
   const claimedChildSessionId = uuid(88_020);
@@ -2053,7 +2070,7 @@ function claimFrozenTicket(
     $projectId: PROJECT_ID,
     $transferTicketId: ticketId,
   });
-  return { claimedChildSessionId, claimEventPosition };
+  return { claimedChildSessionId, forkEventPosition, claimEventPosition };
 }
 
 function addCapacityChildren(fixture: Fixture, count: number): readonly {
@@ -2985,6 +3002,55 @@ it("bounded quick integrity binds a legal later ticket claim to its strict direc
   claimFrozenTicket(legal);
   assert.deepEqual((await quickIssues(legal.fixture)).issues, []);
 
+  const acceptedBranchMutations: string[] = [];
+  for (const target of ["fork", "claim"] as const) {
+    const changed = frozenTicketFixture();
+    const positions = claimFrozenTicket(changed);
+    const branchScopeId = uuid(97_001);
+    const branchRef = "refs/heads/foreign-claim";
+    rawInsert(changed.fixture.connection, "branch_scopes", {
+      project_id: PROJECT_ID,
+      branch_scope_id: branchScopeId,
+      current_ref: branchRef,
+      created_head: H64,
+      detached: 0,
+      created_at: NOW,
+      updated_at: NOW,
+      retired_at: null,
+    });
+    dropTrigger(changed.fixture.connection, "events_no_update");
+    changed.fixture.connection.prepare(`
+      UPDATE events
+      SET branch_scope_id = $branchScopeId, branch_ref = $branchRef
+      WHERE global_position = $position
+    `).run({
+      $branchScopeId: branchScopeId,
+      $branchRef: branchRef,
+      $position: target === "fork"
+        ? positions.forkEventPosition
+        : positions.claimEventPosition,
+    });
+    const issues = (await quickIssues(changed.fixture)).issues;
+    if (!issues.includes("LIFECYCLE_WORKFLOW_INVARIANT_MISMATCH")) {
+      acceptedBranchMutations.push(target);
+    }
+  }
+
+  const stableIdentity = frozenTicketFixture();
+  const stableClaim = claimFrozenTicket(stableIdentity);
+  dropTrigger(stableIdentity.fixture.connection, "events_no_update");
+  stableIdentity.fixture.connection.prepare(`
+    UPDATE events SET vault_id = $vaultId WHERE global_position = $position
+  `).run({
+    $vaultId: uuid(97_002),
+    $position: stableClaim.claimEventPosition,
+  });
+  assert.ok(
+    (await quickIssues(stableIdentity.fixture)).issues
+      .includes("LIFECYCLE_WORKFLOW_INVARIANT_MISMATCH"),
+    "stable lifecycle identity",
+  );
+
   const tampered = frozenTicketFixture();
   const claim = claimFrozenTicket(tampered);
   dropTrigger(tampered.fixture.connection, "events_no_update");
@@ -3003,6 +3069,11 @@ it("bounded quick integrity binds a legal later ticket claim to its strict direc
   assert.ok(
     (await quickIssues(tampered.fixture)).issues
       .includes("LIFECYCLE_WORKFLOW_INVARIANT_MISMATCH"),
+  );
+  assert.deepEqual(
+    acceptedBranchMutations,
+    [],
+    `accepted foreign branch provenance: ${acceptedBranchMutations.join(", ")}`,
   );
 });
 
@@ -3102,6 +3173,24 @@ it("bounded quick integrity accepts legal open-window unchanged null carry", asy
   assert.deepEqual(result.issues, []);
   assert.equal(result.reads.workflowProjectionReads(), 2);
 
+  const maintenanceInspection = openAmendmentFixture(null);
+  const maintenanceContext = {
+    ...maintenanceInspection.context,
+    binding: {
+      ...maintenanceInspection.context.binding,
+      actorRole: "maintenance",
+      clientInstanceId: "client-integrity-inspector",
+    },
+  } as ProjectContext;
+  assert.deepEqual(
+    (await quickIssues({
+      connection: maintenanceInspection.connection,
+      context: maintenanceContext,
+    })).issues,
+    [],
+    "historical presenting identity is bound to its event, not the inspector",
+  );
+
   const workflowMutations = [
     { label: "project", set: `project_id = '${uuid(95_001)}'` },
     { label: "workflow", set: `workflow_id = '${uuid(95_002)}'` },
@@ -3184,6 +3273,64 @@ it("bounded quick integrity accepts legal open-window unchanged null carry", asy
     "effective source context",
   );
 
+  const acceptedIntentMutations: string[] = [];
+  const intentMutations: readonly {
+    readonly label: string;
+    readonly command?: Readonly<Record<string, unknown>>;
+    readonly origin?: Readonly<Record<string, unknown>>;
+  }[] = [
+    {
+      label: "expected branch",
+      command: { expectedBranchRef: "refs/heads/foreign-intent" },
+    },
+    {
+      label: "idempotency key",
+      command: { idempotencyKey: "quick-integrity/end-amendment/foreign" },
+    },
+    { label: "agent", command: { agentId: "agent-foreign" } },
+    {
+      label: "expected project",
+      command: { expectedProjectId: uuid(98_001) },
+      origin: { projectId: uuid(98_001) },
+    },
+    {
+      label: "expected vault",
+      command: { expectedVaultId: uuid(98_002) },
+      origin: { vaultId: uuid(98_002) },
+    },
+    {
+      label: "expected workspace",
+      command: { expectedWorkspaceId: H64_B },
+      origin: { workspaceId: H64_B },
+    },
+    { label: "client namespace", origin: { clientNamespace: "foreign-tests" } },
+    { label: "presenting actor", origin: { presentingActorRole: "maintenance" } },
+    {
+      label: "presenting client",
+      origin: { presentingClientInstanceId: "client-foreign" },
+    },
+  ];
+  for (const mutation of intentMutations) {
+    const changed = openAmendmentFixture(null);
+    const rebuilt = amendmentWitnessV2(uuid(89_005), uuid(30_003), {
+      command: mutation.command,
+      origin: mutation.origin,
+    });
+    assert.doesNotThrow(
+      () => decodeLifecycleIntentWitness(rebuilt),
+      `${mutation.label} fixture must remain strict-valid`,
+    );
+    dropTrigger(changed.connection, "events_no_update");
+    changed.connection.prepare(`
+      UPDATE events SET lifecycle_intent_json = $intent
+      WHERE global_position = 3 AND command_event_index = 0
+    `).run({ $intent: rebuilt });
+    const issues = (await quickIssues(changed)).issues;
+    if (!issues.includes("LIFECYCLE_WORKFLOW_INVARIANT_MISMATCH")) {
+      acceptedIntentMutations.push(mutation.label);
+    }
+  }
+
   const intentTampered = openAmendmentFixture(null);
   dropTrigger(intentTampered.connection, "events_no_update");
   intentTampered.connection.prepare(`
@@ -3229,6 +3376,11 @@ it("bounded quick integrity accepts legal open-window unchanged null carry", asy
   assert.ok(
     (await quickIssues(tampered)).issues
       .includes("LIFECYCLE_WORKFLOW_INVARIANT_MISMATCH"),
+  );
+  assert.deepEqual(
+    acceptedIntentMutations,
+    [],
+    `accepted command-event-0 identity: ${acceptedIntentMutations.join(", ")}`,
   );
 });
 

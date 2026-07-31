@@ -1152,16 +1152,30 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
     context: ProjectContext,
     event: StoredEvent,
   ): boolean {
+    return this.eventIdentityMatchesContext(context, event);
+  }
+
+  private eventIdentityMatchesContext(
+    context: ProjectContext,
+    identity: {
+      readonly projectId: unknown;
+      readonly vaultId: unknown;
+      readonly storeId: unknown;
+      readonly workspaceId: unknown;
+      readonly branchScopeId: unknown;
+      readonly branchRef: unknown;
+    },
+  ): boolean {
     const workspace = context.workspace ?? context.binding.workspace;
     const branchRef = workspace?.kind === "git"
       ? workspace.branchRef
       : null;
-    return event.projectId === context.binding.projectId
-      && event.vaultId === context.binding.vaultId
-      && event.storeId === context.binding.storeId
-      && event.workspaceId === context.binding.workspaceId
-      && event.branchScopeId === (context.branchScopeId ?? null)
-      && event.branchRef === branchRef;
+    return identity.projectId === context.binding.projectId
+      && identity.vaultId === context.binding.vaultId
+      && identity.storeId === context.binding.storeId
+      && identity.workspaceId === context.binding.workspaceId
+      && identity.branchScopeId === (context.branchScopeId ?? null)
+      && identity.branchRef === branchRef;
   }
 
   private reportWitnessForTarget(
@@ -1261,6 +1275,8 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
         fork.vault_id AS fork_vault_id,
         fork.store_id AS fork_store_id,
         fork.workspace_id AS fork_workspace_id,
+        fork.branch_scope_id AS fork_branch_scope_id,
+        fork.branch_ref AS fork_branch_ref,
         fork.stream_id AS fork_stream_id,
         fork.stream_type AS fork_stream_type,
         fork.stream_version AS fork_stream_version,
@@ -1280,6 +1296,8 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
         claimed.vault_id AS claimed_vault_id,
         claimed.store_id AS claimed_store_id,
         claimed.workspace_id AS claimed_workspace_id,
+        claimed.branch_scope_id AS claimed_branch_scope_id,
+        claimed.branch_ref AS claimed_branch_ref,
         claimed.stream_id AS claimed_stream_id,
         claimed.stream_type AS claimed_stream_type,
         claimed.stream_version AS claimed_stream_version,
@@ -1349,17 +1367,28 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
     if (
       fork.eventType !== "SessionForked"
       || fork.eventSchemaVersion !== 1
-      || fork.projectId !== context.binding.projectId
-      || fork.vaultId !== context.binding.vaultId
-      || fork.storeId !== context.binding.storeId
-      || fork.workspaceId !== context.binding.workspaceId
+      || !this.eventIdentityMatchesContext(context, {
+        projectId: row.fork_project_id,
+        vaultId: row.fork_vault_id,
+        storeId: row.fork_store_id,
+        workspaceId: row.fork_workspace_id,
+        branchScopeId: row.fork_branch_scope_id,
+        branchRef: row.fork_branch_ref,
+      })
       || fork.sessionId !== ticket.claimedChildSessionId
       || fork.parentSessionId !== ticket.claimedByRootSessionId
       || fork.streamVersion !== "1"
       || fork.payload.sourceTransferTicketId !== ticket.transferTicketId
       || claimed.eventType !== "ChildWorkTransferClaimed"
       || claimed.eventSchemaVersion !== 1
-      || claimed.projectId !== context.binding.projectId
+      || !this.eventIdentityMatchesContext(context, {
+        projectId: row.claimed_project_id,
+        vaultId: row.claimed_vault_id,
+        storeId: row.claimed_store_id,
+        workspaceId: row.claimed_workspace_id,
+        branchScopeId: row.claimed_branch_scope_id,
+        branchRef: row.claimed_branch_ref,
+      })
       || claimed.sessionId !== ticket.claimedChildSessionId
       || claimed.parentSessionId !== ticket.claimedByRootSessionId
       || claimed.streamVersion !== "2"
@@ -2250,8 +2279,7 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
     ) throw new LifecycleError("INTEGRITY_FAILURE");
     const trigger = this.storedEventAt(target.triggerEventPosition);
     if (
-      !this.eventMatchesContext(context, trigger)
-      || trigger.streamId !== `session/${target.sessionId}`
+      trigger.streamId !== `session/${target.sessionId}`
       || trigger.streamType !== "session"
       || trigger.sessionId !== target.sessionId
       || trigger.parentSessionId !== null
@@ -2300,10 +2328,40 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
       throw new LifecycleError("INTEGRITY_FAILURE");
     }
     try {
-      return decodeLifecycleIntentWitness(rows[0]!.lifecycle_intent_json);
+      const witness = decodeLifecycleIntentWitness(rows[0]!.lifecycle_intent_json);
+      this.assertWorkflowIntentEventContext(context, event, witness);
+      return witness;
     } catch {
       throw new LifecycleError("INTEGRITY_FAILURE");
     }
+  }
+
+  private assertWorkflowIntentEventContext(
+    context: ProjectContext,
+    event: StoredEvent,
+    witness: ReturnType<typeof decodeLifecycleIntentWitness>,
+  ): void {
+    const command = witness.intent.command;
+    const binding = witness.intent.binding;
+    const authorization = witness.intent.authorization;
+    if (
+      !record(command)
+      || !this.eventMatchesContext(context, event)
+      || command.commandId !== event.commandId
+      || command.idempotencyKey !== event.idempotencyKey
+      || command.agentId !== event.agentId
+      || command.expectedProjectId !== event.projectId
+      || command.expectedVaultId !== event.vaultId
+      || command.expectedWorkspaceId !== event.workspaceId
+      || command.expectedBranchRef !== event.branchRef
+      || binding.projectId !== context.binding.projectId
+      || binding.vaultId !== context.binding.vaultId
+      || binding.storeId !== context.binding.storeId
+      || binding.workspaceId !== context.binding.workspaceId
+      || binding.clientNamespace !== context.binding.clientNamespace
+      || authorization.presentingActorRole !== event.actorRole
+      || authorization.presentingClientInstanceId !== event.clientInstanceId
+    ) throw new LifecycleError("INTEGRITY_FAILURE");
   }
 
   private assertEffectiveWorkflowSource(
@@ -2316,8 +2374,7 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
     const source = this.storedEventAt(target.effectiveDraftSourceEventPosition);
     const event = this.decodeStoredLifecycleEvent(source, "0".repeat(64));
     if (
-      !this.eventMatchesContext(context, source)
-      || source.streamId !== `session/${target.sessionId}`
+      source.streamId !== `session/${target.sessionId}`
       || source.streamType !== "session"
       || source.sessionId !== target.sessionId
       || source.parentSessionId !== null
@@ -2327,19 +2384,8 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
     const command = witness.intent.command;
     if (
       !record(command)
-      || source.projectId !== context.binding.projectId
-      || source.vaultId !== context.binding.vaultId
-      || source.storeId !== context.binding.storeId
-      || source.workspaceId !== context.binding.workspaceId
       || event.sessionId !== target.sessionId
       || event.parentSessionId !== null
-      || command.commandId !== source.commandId
-      || command.expectedBranchRef !== source.branchRef
-      || witness.intent.binding.projectId !== context.binding.projectId
-      || witness.intent.binding.vaultId !== context.binding.vaultId
-      || witness.intent.binding.storeId !== context.binding.storeId
-      || witness.intent.binding.workspaceId !== context.binding.workspaceId
-      || witness.intent.binding.clientNamespace !== context.binding.clientNamespace
       || witness.intent.authorization.authorizationSessionId !== target.sessionId
       || witness.intent.authorization.targetSessionId !== target.sessionId
     ) throw new LifecycleError("INTEGRITY_FAILURE");
