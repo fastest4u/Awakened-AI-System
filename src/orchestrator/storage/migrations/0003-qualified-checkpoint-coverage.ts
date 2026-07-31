@@ -3029,10 +3029,12 @@ SET evidence_frozen_checkpoint_event_position = (
 WHERE session_id IS NOT NULL;
 
 INSERT INTO lifecycle_child_event_folds
-SELECT * FROM qualified_checkpoint_v3_stage_child_event_folds;
+SELECT * FROM qualified_checkpoint_v3_stage_child_event_folds
+ORDER BY project_id, child_session_id, stream_version;
 
 INSERT INTO lifecycle_workflow_generation_folds
-SELECT * FROM qualified_checkpoint_v3_stage_workflow_generation_folds;
+SELECT * FROM qualified_checkpoint_v3_stage_workflow_generation_folds
+ORDER BY project_id, workflow_id, workflow_generation;
 
 DELETE FROM qualified_checkpoint_v3_guard;
 INSERT INTO qualified_checkpoint_v3_guard(value)
