@@ -20,6 +20,7 @@ import type {
 } from "../src/orchestrator/identity/contracts.js";
 import { DEFAULT_BUSY_TIMEOUT_MS } from "../src/orchestrator/runtime/runtime-capabilities.js";
 import type { RootStartCommandV2 } from "../src/orchestrator/lifecycle/contracts/commands.js";
+import { decodeLifecycleEvent } from "../src/orchestrator/lifecycle/contracts/events.js";
 import { buildLifecycleIntentWitness } from "../src/orchestrator/lifecycle/lifecycle-intent-witness.js";
 import {
   LifecycleCommandStore,
@@ -61,6 +62,7 @@ import {
   childReportFixture,
   lifecycleEvent,
   lifecycleUuid,
+  qualifiedCheckpointFixture,
 } from "./support/lifecycle-fixtures.js";
 
 const PROJECT_ID = "11111111-1111-4111-8111-111111111111" as ProjectId;
@@ -951,6 +953,205 @@ it("lifecycle projection writer rejects committed drift from the persisted event
     ).get()?.count,
     0n,
   );
+});
+
+function executeRootShapedLifecycleEvent(
+  eventType:
+    | "SessionForked"
+    | "ChildAssignmentAmended"
+    | "ChildWorkReported"
+    | "ChildWorkDispositioned"
+    | "ChildCompletionProposed"
+    | "ChildSessionCompleted"
+    | "ChildSessionSuspended"
+    | "ChildWorkTransferCreated"
+    | "ChildWorkTransferClaimed"
+    | "SessionCheckpointRecorded"
+    | "EvidenceCoverageRecorded",
+): {
+  readonly connection: RecordingConnection;
+  readonly execute: () => ReturnType<LifecycleCommandStore["execute"]>;
+} {
+  const { connection, tx } = lifecycleFixture();
+  const command = lifecycleCommand();
+  const authorization = initialAuthorization();
+  const source = lifecycleEvent(1, eventType, {}, {
+    sessionId: ROOT_SESSION_ID as never,
+    parentSessionId: null,
+    workspaceId: LIFECYCLE_WORKSPACE_ID,
+  });
+  const sourcePayload = source.payload as unknown as Readonly<
+    Record<string, JsonValue>
+  >;
+  const payload = eventType === "SessionCheckpointRecorded"
+    ? Object.freeze({
+        checkpoint: qualifiedCheckpointFixture({
+          sessionId: ROOT_SESSION_ID as never,
+          parentSessionId: null,
+          baseEventPosition: 0,
+          checkpointEventPosition: 1,
+        }),
+        baseEventPosition: "0",
+        checkpointEventPosition: "1",
+      })
+    : eventType === "EvidenceCoverageRecorded"
+      ? Object.freeze({
+          adapterSessionId: sourcePayload.adapterSessionId,
+          batchId: sourcePayload.batchId,
+          batchFirstOrdinal: "0",
+          batchLastOrdinal: "0",
+          coverageFirstOrdinal: "0",
+          coverageLastOrdinal: "0",
+          highestContiguousOrdinal: "0",
+          missingIntervals: Object.freeze([]),
+          frameFingerprintAlgorithm: "hmac-sha256",
+          frameFingerprintSchemaVersion: 1,
+          frameFingerprintKeyId: "evidence-key-v1",
+          frameFingerprintDomain: "pm-evidence-frame-v1",
+          coverageFingerprintAlgorithm: "hmac-sha256",
+          coverageFingerprintSchemaVersion: 1,
+          coverageFingerprintKeyId: "evidence-key-v1",
+          coverageFingerprintDomain: "pm-evidence-coverage-v1",
+          coverageFingerprint: sourcePayload.coverageFingerprint,
+          captureMode: "coverage-only",
+          contentRetained: false,
+          frames: sourcePayload.frames,
+        })
+      : source.payload;
+  const eventSchemaVersion = eventType === "SessionCheckpointRecorded"
+      || eventType === "EvidenceCoverageRecorded"
+    ? 2
+    : source.eventSchemaVersion;
+  if (
+    eventType === "SessionCheckpointRecorded"
+    || eventType === "EvidenceCoverageRecorded"
+  ) {
+    decodeLifecycleEvent({ ...source, eventSchemaVersion, payload });
+  }
+  const { lifecycleIntentWitness: _privateWitness, ...baseAppend } = command.append;
+  const append = {
+    ...baseAppend,
+    events: [{
+      eventType,
+      eventSchemaVersion,
+      occurredAt: source.occurredAt,
+      visibilityScope: "session",
+      sessionId: ROOT_SESSION_ID,
+      confidence: "high",
+      verificationStatus: "verified",
+      payload: payload as JsonValue,
+      sourceRefs: [],
+      evidenceRefs: [],
+      evidenceDigests: [],
+    }],
+  } satisfies Omit<AppendCommand<JsonValue>, "lifecycleIntentWitness">;
+  const focused: LifecycleCommandTransaction = {
+    authority: {
+      persist(eventPosition: bigint) {
+        persistRootAuthority(connection, eventPosition);
+      },
+    },
+    leases: {},
+    approvals: {},
+    transfers: {},
+    coverage: healthyCoverageFacade(),
+    workflows: {},
+    validation: {},
+    outbox: {},
+  };
+  const store = new LifecycleCommandStore({
+    connection,
+    events: tx,
+    projectionWriter: new SqliteLifecycleProjectionRepository(connection),
+    transaction: () => focused,
+    now: () => NOW,
+  });
+  return {
+    connection,
+    execute: () => store.execute({
+      context: command.append.context,
+      commandId: command.append.commandId,
+      idempotencyKey: command.append.idempotencyKey,
+      commandType: command.append.commandType,
+      candidateIntentHash: command.intentHash,
+      authoritativeIntentHash: command.intentHash,
+      semanticCommand: command.semantic,
+      capabilityKind: null,
+      capabilityGeneration: null,
+      replayExpectation: command.expectation,
+    }, () => ({
+      append,
+      authorizationRecord: authorization,
+      afterAppend: (committed, current) => {
+        (current.authority as { persist(eventPosition: bigint): void })
+          .persist(committed.events[0]!.globalPosition);
+      },
+    })),
+  };
+}
+
+it("lifecycle projection writer rejects every null-parent child-only event atomically", () => {
+  const childOnlyTypes = [
+    "SessionForked",
+    "ChildAssignmentAmended",
+    "ChildWorkReported",
+    "ChildWorkDispositioned",
+    "ChildCompletionProposed",
+    "ChildSessionCompleted",
+    "ChildSessionSuspended",
+    "ChildWorkTransferCreated",
+    "ChildWorkTransferClaimed",
+  ] as const;
+
+  for (const eventType of childOnlyTypes) {
+    const { connection, execute } = executeRootShapedLifecycleEvent(eventType);
+    assert.throws(
+      execute,
+      (error: unknown) => typeof error === "object"
+        && error !== null
+        && "code" in error
+        && error.code === "INTEGRITY_FAILURE",
+      eventType,
+    );
+    assert.deepEqual({
+      events: connection.prepare("SELECT count(*) AS count FROM events").get()?.count,
+      dedup: connection.prepare(
+        "SELECT count(*) AS count FROM command_dedup",
+      ).get()?.count,
+      projections: connection.prepare(
+        "SELECT count(*) AS count FROM lifecycle_child_event_folds",
+      ).get()?.count,
+    }, { events: 0n, dedup: 0n, projections: 0n }, eventType);
+    assert.deepEqual(
+      connection.transactionStatements.slice(-2),
+      ["BEGIN IMMEDIATE", "ROLLBACK"],
+      eventType,
+    );
+  }
+});
+
+it("lifecycle projection writer leaves valid root checkpoint and evidence events unprojected", () => {
+  for (const eventType of [
+    "SessionCheckpointRecorded",
+    "EvidenceCoverageRecorded",
+  ] as const) {
+    const { connection, execute } = executeRootShapedLifecycleEvent(eventType);
+    assert.equal(execute().deduplicated, false, eventType);
+    assert.deepEqual({
+      events: connection.prepare("SELECT count(*) AS count FROM events").get()?.count,
+      dedup: connection.prepare(
+        "SELECT count(*) AS count FROM command_dedup",
+      ).get()?.count,
+      projections: connection.prepare(
+        "SELECT count(*) AS count FROM lifecycle_child_event_folds",
+      ).get()?.count,
+    }, { events: 1n, dedup: 1n, projections: 0n }, eventType);
+    assert.deepEqual(
+      connection.transactionStatements.slice(-2),
+      ["BEGIN IMMEDIATE", "COMMIT"],
+      eventType,
+    );
+  }
 });
 
 it("never owns transaction statements while appending a prepared Version 1 batch", () => {

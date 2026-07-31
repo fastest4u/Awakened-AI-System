@@ -37,10 +37,8 @@ const CHILD_STATES = new Set([
   "suspended",
   "transferred",
 ]);
-const CHILD_EVENT_TYPES = new Set([
+const CHILD_ONLY_EVENT_TYPES = new Set([
   "SessionForked",
-  "SessionCheckpointRecorded",
-  "EvidenceCoverageRecorded",
   "ChildAssignmentAmended",
   "ChildWorkReported",
   "ChildWorkDispositioned",
@@ -49,6 +47,10 @@ const CHILD_EVENT_TYPES = new Set([
   "ChildSessionSuspended",
   "ChildWorkTransferCreated",
   "ChildWorkTransferClaimed",
+]);
+const DUAL_SCOPE_CHILD_EVENT_TYPES = new Set([
+  "SessionCheckpointRecorded",
+  "EvidenceCoverageRecorded",
 ]);
 const REPORT_CONSUMER_TYPES = new Set([
   "ChildCompletionProposed",
@@ -604,7 +606,13 @@ implements LifecycleProjectionWriter {
       if (typeof transaction !== "object" || transaction === null) integrity();
       for (const event of assertCommittedBatch(committed)) {
         assertPersistedEventMatches(event, this.#eventAt(event.globalPosition));
-        if (event.parentSessionId !== null && CHILD_EVENT_TYPES.has(event.eventType)) {
+        if (
+          CHILD_ONLY_EVENT_TYPES.has(event.eventType)
+          || (
+            event.parentSessionId !== null
+            && DUAL_SCOPE_CHILD_EVENT_TYPES.has(event.eventType)
+          )
+        ) {
           this.#appendChild(event);
         }
         const workflow = workflowIdentity(event);
