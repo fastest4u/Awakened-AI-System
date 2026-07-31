@@ -742,9 +742,9 @@ CREATE TEMP TABLE IF NOT EXISTS qualified_checkpoint_v3_stage_child_event_folds 
   CHECK (completion_report_id IS NULL OR report_count > 0),
   CHECK (
     (child_state = 'completed'
-      AND terminal_event_type = 'ChildSessionCompleted')
+      AND terminal_event_type IS 'ChildSessionCompleted')
     OR (child_state = 'transferred'
-      AND terminal_event_type = 'ChildWorkTransferCreated')
+      AND terminal_event_type IS 'ChildWorkTransferCreated')
     OR (child_state IN ('active', 'completion-proposed', 'suspended')
       AND terminal_event_type IS NULL)
   ),
@@ -1528,6 +1528,23 @@ SELECT CASE WHEN
       AND predecessor.workflow_id = workflow.workflow_id
       AND predecessor.session_id = workflow.session_id
       AND predecessor.workflow_generation = workflow.workflow_generation - 1
+    LEFT JOIN events AS predecessor_trigger_event
+      ON predecessor_trigger_event.global_position
+        = predecessor.trigger_event_position
+      AND predecessor_trigger_event.project_id = workflow.project_id
+      AND predecessor_trigger_event.session_id = workflow.session_id
+      AND predecessor_trigger_event.parent_session_id IS NULL
+      AND predecessor_trigger_event.stream_type = 'session'
+      AND predecessor_trigger_event.stream_id = 'session/' || workflow.session_id
+      AND predecessor_trigger_event.event_type = 'SessionEndCancelled'
+      AND json_extract(
+        predecessor_trigger_event.payload_json,
+        '$.workflowId'
+      ) = workflow.workflow_id
+      AND json_extract(
+        predecessor_trigger_event.payload_json,
+        '$.workflowGeneration'
+      ) = predecessor.workflow_generation
     WHERE trigger_event.global_position IS NULL
       OR trigger_intent_event.global_position IS NULL
       OR source_event.global_position IS NULL
@@ -1572,6 +1589,13 @@ SELECT CASE WHEN
             trigger_intent_event.lifecycle_intent_json,
             '$.intent.command.workflowId'
           ) = workflow.workflow_id
+          AND json_extract(
+            trigger_intent_event.lifecycle_intent_json,
+            '$.intent.command.preTransitionCheckpointId'
+          ) = json_extract(
+            trigger_event.payload_json,
+            '$.preTransitionCheckpointId'
+          )
         WHEN 'SessionAbandoned' THEN
           json_extract(
             trigger_intent_event.lifecycle_intent_json,
@@ -1581,6 +1605,17 @@ SELECT CASE WHEN
             trigger_intent_event.lifecycle_intent_json,
             '$.intent.command.sessionId'
           ) = workflow.session_id
+          AND json_extract(
+            trigger_intent_event.lifecycle_intent_json,
+            '$.intent.command.preTransitionCheckpointId'
+          ) = json_extract(
+            trigger_event.payload_json,
+            '$.preTransitionCheckpointId'
+          )
+          AND json_extract(
+            trigger_intent_event.lifecycle_intent_json,
+            '$.intent.command.reasonCode'
+          ) = json_extract(trigger_event.payload_json, '$.reasonCode')
         ELSE 0
       END, 0) = 0
       OR json_extract(
@@ -1678,6 +1713,10 @@ SELECT CASE WHEN
       OR coalesce(CASE trigger_event.event_type
         WHEN 'SessionEndRequested' THEN
           workflow.replacement_checkpoint_version IS NOT NULL
+          AND (
+            workflow.workflow_generation = 1
+            OR predecessor_trigger_event.global_position IS NOT NULL
+          )
           AND workflow.replacement_checkpoint_version
             = workflow.effective_checkpoint_version
           AND workflow.effective_draft_source_event_position
@@ -1903,9 +1942,9 @@ CREATE TABLE lifecycle_child_event_folds (
   CHECK (completion_report_id IS NULL OR report_count > 0),
   CHECK (
     (child_state = 'completed'
-      AND terminal_event_type = 'ChildSessionCompleted')
+      AND terminal_event_type IS 'ChildSessionCompleted')
     OR (child_state = 'transferred'
-      AND terminal_event_type = 'ChildWorkTransferCreated')
+      AND terminal_event_type IS 'ChildWorkTransferCreated')
     OR (child_state IN ('active', 'completion-proposed', 'suspended')
       AND terminal_event_type IS NULL)
   ),
@@ -2095,6 +2134,11 @@ WHEN
     AND NOT EXISTS (
       SELECT 1
       FROM lifecycle_child_event_folds AS report
+      JOIN events AS report_event
+        ON report_event.global_position = report.event_position
+        AND report_event.project_id = report.project_id
+        AND report_event.session_id = report.child_session_id
+        AND report_event.event_type = 'ChildWorkReported'
       JOIN events AS target ON target.global_position = NEW.event_position
       WHERE report.project_id = NEW.project_id
         AND report.child_session_id = NEW.child_session_id
@@ -2103,6 +2147,111 @@ WHEN
         AND report.reported_report_id = coalesce(
           json_extract(target.payload_json, '$.reportId'),
           json_extract(target.payload_json, '$.disposition.reportId')
+        )
+        AND (
+          target.event_type <> 'ChildWorkDispositioned'
+          OR (
+            json_type(
+              target.payload_json,
+              '$.disposition.allReportItemIds'
+            ) = 'array'
+            AND json_array_length(
+              target.payload_json,
+              '$.disposition.allReportItemIds'
+            ) = report.reported_item_count
+            AND NOT EXISTS (
+              SELECT disposition_item.value
+              FROM json_each(
+                target.payload_json,
+                '$.disposition.allReportItemIds'
+              ) AS disposition_item
+              EXCEPT
+              SELECT report_item.item_id
+              FROM (
+                SELECT json_extract(item.value, '$.itemId') AS item_id
+                FROM json_each(
+                  report_event.payload_json,
+                  '$.report.findings'
+                ) AS item
+                UNION ALL
+                SELECT json_extract(item.value, '$.itemId')
+                FROM json_each(
+                  report_event.payload_json,
+                  '$.report.proposedDecisions'
+                ) AS item
+                UNION ALL
+                SELECT json_extract(item.value, '$.itemId')
+                FROM json_each(
+                  report_event.payload_json,
+                  '$.report.filesObservedOrChanged'
+                ) AS item
+                UNION ALL
+                SELECT json_extract(item.value, '$.itemId')
+                FROM json_each(
+                  report_event.payload_json,
+                  '$.report.verificationPerformed'
+                ) AS item
+                UNION ALL
+                SELECT json_extract(item.value, '$.itemId')
+                FROM json_each(
+                  report_event.payload_json,
+                  '$.report.openFollowUps'
+                ) AS item
+                UNION ALL
+                SELECT json_extract(item.value, '$.itemId')
+                FROM json_each(
+                  report_event.payload_json,
+                  '$.report.blockers'
+                ) AS item
+              ) AS report_item
+            )
+            AND NOT EXISTS (
+              SELECT report_item.item_id
+              FROM (
+                SELECT json_extract(item.value, '$.itemId') AS item_id
+                FROM json_each(
+                  report_event.payload_json,
+                  '$.report.findings'
+                ) AS item
+                UNION ALL
+                SELECT json_extract(item.value, '$.itemId')
+                FROM json_each(
+                  report_event.payload_json,
+                  '$.report.proposedDecisions'
+                ) AS item
+                UNION ALL
+                SELECT json_extract(item.value, '$.itemId')
+                FROM json_each(
+                  report_event.payload_json,
+                  '$.report.filesObservedOrChanged'
+                ) AS item
+                UNION ALL
+                SELECT json_extract(item.value, '$.itemId')
+                FROM json_each(
+                  report_event.payload_json,
+                  '$.report.verificationPerformed'
+                ) AS item
+                UNION ALL
+                SELECT json_extract(item.value, '$.itemId')
+                FROM json_each(
+                  report_event.payload_json,
+                  '$.report.openFollowUps'
+                ) AS item
+                UNION ALL
+                SELECT json_extract(item.value, '$.itemId')
+                FROM json_each(
+                  report_event.payload_json,
+                  '$.report.blockers'
+                ) AS item
+              ) AS report_item
+              EXCEPT
+              SELECT disposition_item.value
+              FROM json_each(
+                target.payload_json,
+                '$.disposition.allReportItemIds'
+              ) AS disposition_item
+            )
+          )
         )
     )
   )
@@ -2409,6 +2558,23 @@ WHEN
       AND predecessor.workflow_id = NEW.workflow_id
       AND predecessor.session_id = NEW.session_id
       AND predecessor.workflow_generation = NEW.workflow_generation - 1
+    LEFT JOIN events AS predecessor_trigger_event
+      ON predecessor_trigger_event.global_position
+        = predecessor.trigger_event_position
+      AND predecessor_trigger_event.project_id = NEW.project_id
+      AND predecessor_trigger_event.session_id = NEW.session_id
+      AND predecessor_trigger_event.parent_session_id IS NULL
+      AND predecessor_trigger_event.stream_type = 'session'
+      AND predecessor_trigger_event.stream_id = 'session/' || NEW.session_id
+      AND predecessor_trigger_event.event_type = 'SessionEndCancelled'
+      AND json_extract(
+        predecessor_trigger_event.payload_json,
+        '$.workflowId'
+      ) = NEW.workflow_id
+      AND json_extract(
+        predecessor_trigger_event.payload_json,
+        '$.workflowGeneration'
+      ) = predecessor.workflow_generation
     WHERE trigger_event.global_position = NEW.trigger_event_position
       AND trigger_event.project_id = NEW.project_id
       AND trigger_event.session_id = NEW.session_id
@@ -2477,6 +2643,13 @@ WHEN
             trigger_intent_event.lifecycle_intent_json,
             '$.intent.command.workflowId'
           ) = NEW.workflow_id
+          AND json_extract(
+            trigger_intent_event.lifecycle_intent_json,
+            '$.intent.command.preTransitionCheckpointId'
+          ) = json_extract(
+            trigger_event.payload_json,
+            '$.preTransitionCheckpointId'
+          )
         WHEN 'SessionAbandoned' THEN
           json_extract(
             trigger_intent_event.lifecycle_intent_json,
@@ -2486,6 +2659,17 @@ WHEN
             trigger_intent_event.lifecycle_intent_json,
             '$.intent.command.sessionId'
           ) = NEW.session_id
+          AND json_extract(
+            trigger_intent_event.lifecycle_intent_json,
+            '$.intent.command.preTransitionCheckpointId'
+          ) = json_extract(
+            trigger_event.payload_json,
+            '$.preTransitionCheckpointId'
+          )
+          AND json_extract(
+            trigger_intent_event.lifecycle_intent_json,
+            '$.intent.command.reasonCode'
+          ) = json_extract(trigger_event.payload_json, '$.reasonCode')
         ELSE 0
       END
       AND json_extract(
@@ -2540,6 +2724,10 @@ WHEN
             )
           )
           AND NEW.replacement_checkpoint_version IS NOT NULL
+          AND (
+            NEW.workflow_generation = 1
+            OR predecessor_trigger_event.global_position IS NOT NULL
+          )
           AND NEW.effective_checkpoint_version
             = NEW.replacement_checkpoint_version
           AND NEW.effective_draft_source_event_position

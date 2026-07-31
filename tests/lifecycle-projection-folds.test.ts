@@ -456,6 +456,127 @@ describe("authenticated lifecycle projection folds", () => {
     );
   });
 
+  it("workflow projection fold rejects cancel and abandon event-intent parity mismatches", () => {
+    const requestCommandId = lifecycleUuid(54_001);
+    const request = rootStored({
+      position: 20n,
+      streamVersion: 2n,
+      eventType: "SessionEndRequested",
+      eventSchemaVersion: 1,
+      commandId: requestCommandId,
+      payload: {
+        workflowId: WORKFLOW_ID,
+        workflowGeneration: 1,
+        previousState: "active",
+        childEndPolicy: "require-completed",
+        qualityThreshold: 0,
+        requireFullEvidence: false,
+        requireMaterialization: false,
+      },
+    });
+    const previous = foldWorkflowGenerationProjection(
+      null,
+      request,
+      intent({
+        commandType: "request-session-end",
+        commandId: requestCommandId,
+        idempotencyKey: "projection/parity/request",
+        agentId: "agent-primary",
+        expectedProjectId: PROJECT_ID,
+        expectedVaultId: VAULT_ID,
+        expectedWorkspaceId: WORKSPACE_ID,
+        expectedBranchRef: null,
+        request: {
+          requestVersion: 1,
+          sessionId: ROOT_SESSION_ID,
+          childEndPolicy: "require-completed",
+          finalCheckpoint: checkpointDraft(1),
+          validationProfileIds: [],
+          requestedQualityThreshold: 0,
+          requireFullEvidence: false,
+          requireMaterialization: false,
+        },
+      }),
+      "live-schema-3",
+    );
+
+    const eventCheckpointId = lifecycleUuid(54_002);
+    const otherCheckpointId = lifecycleUuid(54_003);
+    const cancelCommandId = lifecycleUuid(54_004);
+    const cancel = rootStored({
+      position: 21n,
+      streamVersion: 3n,
+      eventType: "SessionEndCancelled",
+      eventSchemaVersion: 1,
+      commandId: cancelCommandId,
+      payload: {
+        workflowId: WORKFLOW_ID,
+        workflowGeneration: 2,
+        restoredState: "active",
+        preTransitionCheckpointId: eventCheckpointId,
+      },
+    });
+    assert.throws(() => foldWorkflowGenerationProjection(
+      previous,
+      cancel,
+      intent({
+        commandType: "cancel-session-end",
+        commandId: cancelCommandId,
+        idempotencyKey: "projection/parity/cancel",
+        agentId: "agent-primary",
+        expectedProjectId: PROJECT_ID,
+        expectedVaultId: VAULT_ID,
+        expectedWorkspaceId: WORKSPACE_ID,
+        expectedBranchRef: null,
+        sessionId: ROOT_SESSION_ID,
+        workflowId: WORKFLOW_ID,
+        expectedStreamVersion: "2",
+        preTransitionCheckpointId: otherCheckpointId,
+      }),
+      "live-schema-3",
+    ));
+
+    const abandonCommandId = lifecycleUuid(54_005);
+    const abandon = rootStored({
+      position: 22n,
+      streamVersion: 3n,
+      eventType: "SessionAbandoned",
+      eventSchemaVersion: 1,
+      commandId: abandonCommandId,
+      payload: {
+        workflowId: WORKFLOW_ID,
+        workflowGeneration: 2,
+        approvalId: lifecycleUuid(54_006),
+        preTransitionCheckpointId: eventCheckpointId,
+        reasonCode: "explicit-user-approval",
+        authorityCommitment: "a".repeat(64),
+      },
+    });
+    for (const mismatch of [
+      { preTransitionCheckpointId: otherCheckpointId, reasonCode: "explicit-user-approval" },
+      { preTransitionCheckpointId: eventCheckpointId, reasonCode: "operator-emergency" },
+    ]) {
+      assert.throws(() => foldWorkflowGenerationProjection(
+        previous,
+        abandon,
+        intent({
+          commandType: "abandon-session",
+          commandId: abandonCommandId,
+          idempotencyKey: "projection/parity/abandon",
+          agentId: "agent-primary",
+          expectedProjectId: PROJECT_ID,
+          expectedVaultId: VAULT_ID,
+          expectedWorkspaceId: WORKSPACE_ID,
+          expectedBranchRef: null,
+          sessionId: ROOT_SESSION_ID,
+          expectedStreamVersion: "2",
+          ...mismatch,
+        }),
+        "live-schema-3",
+      ));
+    }
+  });
+
   it("child projection fold resolves a consumer bound to a non-latest report witness", () => {
     let current = foldChildEventProjection(
       null,

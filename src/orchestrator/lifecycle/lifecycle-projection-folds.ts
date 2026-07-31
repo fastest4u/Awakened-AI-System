@@ -730,6 +730,8 @@ export function foldWorkflowGenerationProjection(
         || command.commandType !== "cancel-session-end"
         || command.sessionId !== event.sessionId
         || command.workflowId !== event.payload.workflowId
+        || command.preTransitionCheckpointId
+          !== event.payload.preTransitionCheckpointId
         || event.payload.workflowId !== previous.workflowId
         || event.sessionId !== previous.sessionId
       ) invalid();
@@ -757,6 +759,9 @@ export function foldWorkflowGenerationProjection(
         previous === null
         || command.commandType !== "abandon-session"
         || command.sessionId !== event.sessionId
+        || command.preTransitionCheckpointId
+          !== event.payload.preTransitionCheckpointId
+        || command.reasonCode !== event.payload.reasonCode
         || event.payload.workflowId === null
         || event.payload.workflowGeneration === null
         || event.payload.workflowId !== previous.workflowId

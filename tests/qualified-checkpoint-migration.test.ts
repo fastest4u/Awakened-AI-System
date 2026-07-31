@@ -38,6 +38,7 @@ import type {
 import {
   checkpointFixture,
   childDispositionFixture,
+  childReportFixture,
   lifecycleEvent,
   qualifiedCheckpointFixture,
 } from "./support/lifecycle-fixtures.js";
@@ -705,6 +706,52 @@ function unchangedAmendmentIntentWitness(
     },
   };
   return buildLifecycleIntentWitness(command as never, {
+    authorizationKind: "protected",
+    authorizationSessionId: ROOT_ID,
+    targetSessionId: ROOT_ID,
+    projectId: PROJECT_ID,
+    vaultId: VAULT_ID,
+    storeId: STORE_ID,
+    workspaceId: WORKSPACE_ID,
+    clientNamespace: "tests",
+    capabilityKind: "root-session-handle",
+    capabilityGeneration: "1",
+    presentingActorRole: "primary",
+    presentingClientInstanceId: "client-1",
+    targetActorRole: "primary",
+    targetClientInstanceId: "client-1",
+    internalWorkflowId: null,
+    internalWorkflowGeneration: null,
+    internalPlannedWorkId: null,
+  }).source;
+}
+
+function legacyAmendmentIntentWitness(
+  commandId: string,
+  expectedStreamVersion: string,
+): string {
+  return buildLifecycleIntentWitness({
+    commandType: "amend-session-end",
+    commandId,
+    idempotencyKey: `migration/legacy-amend/${commandId}`,
+    agentId: "agent-1",
+    expectedProjectId: PROJECT_ID,
+    expectedVaultId: VAULT_ID,
+    expectedWorkspaceId: WORKSPACE_ID,
+    expectedBranchRef: null,
+    sessionId: ROOT_ID,
+    workflowId: PROJECTION_WORKFLOW_ID,
+    expectedStreamVersion,
+    amendment: {
+      amendmentVersion: 1,
+      childEndPolicy: null,
+      finalCheckpoint: null,
+      validationProfileIds: null,
+      requestedQualityThreshold: null,
+      requireFullEvidence: null,
+      requireMaterialization: true,
+    },
+  } as never, {
     authorizationKind: "protected",
     authorizationSessionId: ROOT_ID,
     targetSessionId: ROOT_ID,
@@ -4275,6 +4322,1020 @@ describe("qualified checkpoint migration", () => {
       ),
       /LIFECYCLE_WORKFLOW_GENERATION_FOLD_INVALID/,
     );
+  });
+
+  it("migration 3 preflight requires an exact cancelled predecessor before reopen", () => {
+    for (const predecessorType of [
+      "SessionEndRequested",
+      "SessionEndAmended",
+      "SessionAbandoned",
+      "SessionEndCancelled",
+    ] as const) {
+      const connection = sourceConnection(2);
+      connection.exec("PRAGMA foreign_keys = OFF");
+      seedRootStart(connection);
+      rawEvent(connection, 2, {
+        streamType: "session",
+        sessionId: ROOT_ID,
+        streamVersion: 2,
+        eventType: "SessionEndRequested",
+        commandId: eventCommandId(2),
+        lifecycleIntent: requestIntentWitness(eventCommandId(2)),
+        payload: {
+          workflowId: PROJECTION_WORKFLOW_ID,
+          workflowGeneration: 1,
+          previousState: "active",
+          childEndPolicy: "require-completed",
+          qualityThreshold: 0,
+          requireFullEvidence: false,
+          requireMaterialization: false,
+        },
+      });
+
+      let reopenPosition = 3;
+      let reopenGeneration = 2;
+      if (predecessorType === "SessionEndAmended") {
+        rawEvent(connection, 3, {
+          streamType: "session",
+          sessionId: ROOT_ID,
+          streamVersion: 3,
+          eventType: predecessorType,
+          commandId: eventCommandId(3),
+          lifecycleIntent: legacyAmendmentIntentWitness(eventCommandId(3), "2"),
+          payload: {
+            workflowId: PROJECTION_WORKFLOW_ID,
+            previousWorkflowGeneration: 1,
+            workflowGeneration: 2,
+            preTransitionCheckpointId:
+              "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+          },
+        });
+        reopenPosition = 4;
+        reopenGeneration = 3;
+      } else if (predecessorType === "SessionAbandoned") {
+        rawEvent(connection, 3, {
+          streamType: "session",
+          sessionId: ROOT_ID,
+          streamVersion: 3,
+          eventType: predecessorType,
+          commandId: eventCommandId(3),
+          lifecycleIntent: abandonIntentWitness(
+            eventCommandId(3),
+            "2",
+            "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+            "explicit-user-approval",
+          ),
+          payload: {
+            workflowId: PROJECTION_WORKFLOW_ID,
+            workflowGeneration: 1,
+            approvalId: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+            preTransitionCheckpointId:
+              "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+            reasonCode: "explicit-user-approval",
+            authorityCommitment: H64,
+          },
+        });
+        reopenPosition = 4;
+      } else if (predecessorType === "SessionEndCancelled") {
+        rawEvent(connection, 3, {
+          streamType: "session",
+          sessionId: ROOT_ID,
+          streamVersion: 3,
+          eventType: predecessorType,
+          commandId: eventCommandId(3),
+          lifecycleIntent: cancelIntentWitness(
+            eventCommandId(3),
+            PROJECTION_WORKFLOW_ID,
+            "2",
+            "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+          ),
+          payload: {
+            workflowId: PROJECTION_WORKFLOW_ID,
+            workflowGeneration: 1,
+            restoredState: "active",
+            preTransitionCheckpointId:
+              "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+          },
+        });
+        reopenPosition = 4;
+      }
+
+      rawEvent(connection, reopenPosition, {
+        streamType: "session",
+        sessionId: ROOT_ID,
+        streamVersion: reopenPosition,
+        eventType: "SessionEndRequested",
+        commandId: eventCommandId(reopenPosition),
+        lifecycleIntent: requestIntentWitness(eventCommandId(reopenPosition)),
+        payload: {
+          workflowId: PROJECTION_WORKFLOW_ID,
+          workflowGeneration: reopenGeneration,
+          previousState: "active",
+          childEndPolicy: "require-completed",
+          qualityThreshold: 0,
+          requireFullEvidence: false,
+          requireMaterialization: false,
+        },
+      });
+      rawInsert(connection, "workflow_instances", legacyLifecycleWorkflow({
+        workflow_id: PROJECTION_WORKFLOW_ID,
+        generation: reopenGeneration,
+        state: "active",
+        phase: "requested",
+        root_command_id: eventCommandId(reopenPosition),
+        session_id: ROOT_ID,
+        triggering_event_position: reopenPosition,
+      }));
+
+      connection.exec("BEGIN IMMEDIATE");
+      const stage = () => new SqliteQualifiedCheckpointMigrationPreflight()
+        .assertEligibleAndStage(connection, context);
+      if (predecessorType === "SessionEndCancelled") {
+        assert.doesNotThrow(stage);
+      } else {
+        assert.throws(
+          stage,
+          /MIGRATION_EVIDENCE_V2_PRECONDITION_FAILED/,
+          predecessorType,
+        );
+      }
+      connection.exec("ROLLBACK");
+    }
+  });
+
+  it("migration 3 preflight advances each child lifecycle stream exactly once", () => {
+    const connection = sourceConnection(2);
+    seedTransferredFinalHistory(connection);
+    const preparedSql: string[] = [];
+    const observed: SqliteConnection = {
+      exec(sql): void {
+        connection.exec(sql);
+      },
+      prepare(sql) {
+        preparedSql.push(sql.replace(/\s+/g, " ").trim());
+        return connection.prepare(sql);
+      },
+      close(): void {
+        connection.close();
+      },
+    };
+    connection.exec("BEGIN IMMEDIATE");
+    new SqliteQualifiedCheckpointMigrationPreflight()
+      .assertEligibleAndStage(observed, context);
+    assert.equal(
+      preparedSql.filter((sql) =>
+        sql.includes("ORDER BY global_position")
+        && sql.includes("FROM events")).length,
+      1,
+    );
+    assert.equal(
+      preparedSql.filter((sql) =>
+        sql.includes("WHERE project_id = $projectId AND global_position = $position"))
+        .length,
+      0,
+    );
+    connection.exec("ROLLBACK");
+  });
+
+  it("migration 3 persistent workflow guard requires an exact cancelled predecessor before reopen", () => {
+    for (const predecessorType of [
+      "SessionEndRequested",
+      "SessionEndAmended",
+      "SessionAbandoned",
+      "SessionEndCancelled",
+    ] as const) {
+      const connection = currentConnection();
+      seedRootStart(connection);
+      seedLegacyEndRequest(connection, 2, 2);
+      rawInsert(
+        connection,
+        "lifecycle_workflow_generation_folds",
+        workflowProjectionRow(),
+      );
+
+      let reopenPosition = 3;
+      let reopenGeneration = 2;
+      let previousFingerprint = H64;
+      if (predecessorType === "SessionEndAmended") {
+        rawEvent(connection, 3, {
+          streamType: "session",
+          sessionId: ROOT_ID,
+          streamVersion: 3,
+          eventType: predecessorType,
+          commandId: eventCommandId(3),
+          lifecycleIntent: legacyAmendmentIntentWitness(eventCommandId(3), "2"),
+          payload: {
+            workflowId: PROJECTION_WORKFLOW_ID,
+            previousWorkflowGeneration: 1,
+            workflowGeneration: 2,
+            preTransitionCheckpointId:
+              "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+          },
+        });
+        rawInsert(
+          connection,
+          "lifecycle_workflow_generation_folds",
+          workflowProjectionRow(3, {
+            workflow_generation: 2,
+            root_command_id: eventCommandId(3),
+            replacement_checkpoint_version: null,
+            effective_draft_source_event_position: 2,
+            previous_fingerprint: H64,
+            fingerprint: H64_B,
+          }),
+        );
+        reopenPosition = 4;
+        reopenGeneration = 3;
+        previousFingerprint = H64_B;
+      } else if (
+        predecessorType === "SessionAbandoned"
+        || predecessorType === "SessionEndCancelled"
+      ) {
+        const checkpointId = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+        rawEvent(connection, 3, {
+          streamType: "session",
+          sessionId: ROOT_ID,
+          streamVersion: 3,
+          eventType: predecessorType,
+          commandId: eventCommandId(3),
+          lifecycleIntent: predecessorType === "SessionAbandoned"
+            ? abandonIntentWitness(
+                eventCommandId(3),
+                "2",
+                checkpointId,
+                "explicit-user-approval",
+              )
+            : cancelIntentWitness(
+                eventCommandId(3),
+                PROJECTION_WORKFLOW_ID,
+                "2",
+                checkpointId,
+              ),
+          payload: predecessorType === "SessionAbandoned"
+            ? {
+                workflowId: PROJECTION_WORKFLOW_ID,
+                workflowGeneration: 2,
+                approvalId: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+                preTransitionCheckpointId: checkpointId,
+                reasonCode: "explicit-user-approval",
+                authorityCommitment: H64,
+              }
+            : {
+                workflowId: PROJECTION_WORKFLOW_ID,
+                workflowGeneration: 2,
+                restoredState: "active",
+                preTransitionCheckpointId: checkpointId,
+              },
+        });
+        rawInsert(
+          connection,
+          "lifecycle_workflow_generation_folds",
+          workflowProjectionRow(3, {
+            workflow_generation: 2,
+            root_command_id: eventCommandId(3),
+            replacement_checkpoint_version: null,
+            effective_draft_source_event_position: 2,
+            previous_fingerprint: H64,
+            fingerprint: H64_B,
+          }),
+        );
+        reopenPosition = 4;
+        reopenGeneration = 3;
+        previousFingerprint = H64_B;
+      }
+
+      rawEvent(connection, reopenPosition, {
+        streamType: "session",
+        sessionId: ROOT_ID,
+        streamVersion: reopenPosition,
+        eventType: "SessionEndRequested",
+        commandId: eventCommandId(reopenPosition),
+        lifecycleIntent: requestIntentWitness(eventCommandId(reopenPosition)),
+        payload: {
+          workflowId: PROJECTION_WORKFLOW_ID,
+          workflowGeneration: reopenGeneration,
+          previousState: "active",
+          childEndPolicy: "require-completed",
+          qualityThreshold: 0,
+          requireFullEvidence: false,
+          requireMaterialization: false,
+        },
+      });
+      const insertReopen = () => rawInsert(
+        connection,
+        "lifecycle_workflow_generation_folds",
+        workflowProjectionRow(reopenPosition, {
+          workflow_generation: reopenGeneration,
+          root_command_id: eventCommandId(reopenPosition),
+          replacement_checkpoint_version: 1,
+          effective_checkpoint_version: 1,
+          effective_draft_source_event_position: reopenPosition,
+          previous_fingerprint: previousFingerprint,
+          fingerprint: H64_C,
+        }),
+      );
+      if (predecessorType === "SessionEndCancelled") {
+        assert.doesNotThrow(insertReopen);
+      } else {
+        assert.throws(
+          insertReopen,
+          /LIFECYCLE_WORKFLOW_GENERATION_FOLD_INVALID/,
+          predecessorType,
+        );
+      }
+    }
+  });
+
+  it("migration 3 persistent workflow guard rejects cancel checkpoint intent mismatch", () => {
+    const connection = currentConnection();
+    seedRootStart(connection);
+    seedLegacyEndRequest(connection, 2, 2);
+    rawInsert(
+      connection,
+      "lifecycle_workflow_generation_folds",
+      workflowProjectionRow(),
+    );
+    const eventCheckpointId = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+    const intentCheckpointId = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+    const commandId = eventCommandId(3);
+    rawEvent(connection, 3, {
+      streamType: "session",
+      sessionId: ROOT_ID,
+      streamVersion: 3,
+      eventType: "SessionEndCancelled",
+      commandId,
+      lifecycleIntent: cancelIntentWitness(
+        commandId,
+        PROJECTION_WORKFLOW_ID,
+        "2",
+        intentCheckpointId,
+      ),
+      payload: {
+        workflowId: PROJECTION_WORKFLOW_ID,
+        workflowGeneration: 2,
+        restoredState: "active",
+        preTransitionCheckpointId: eventCheckpointId,
+      },
+    });
+    assert.throws(
+      () => rawInsert(
+        connection,
+        "lifecycle_workflow_generation_folds",
+        workflowProjectionRow(3, {
+          workflow_generation: 2,
+          root_command_id: commandId,
+          replacement_checkpoint_version: null,
+          effective_draft_source_event_position: 2,
+          previous_fingerprint: H64,
+          fingerprint: H64_B,
+        }),
+      ),
+      /LIFECYCLE_WORKFLOW_GENERATION_FOLD_INVALID/,
+    );
+  });
+
+  it("migration 3 pre-copy guard rejects cancel and abandon event-intent parity mismatch", () => {
+    for (const candidate of [
+      {
+        name: "cancel checkpoint",
+        eventType: "SessionEndCancelled",
+        phase: "cancelled",
+        mismatchCheckpoint: true,
+        mismatchReason: false,
+      },
+      {
+        name: "abandon checkpoint",
+        eventType: "SessionAbandoned",
+        phase: "abandoned",
+        mismatchCheckpoint: true,
+        mismatchReason: false,
+      },
+      {
+        name: "abandon reason",
+        eventType: "SessionAbandoned",
+        phase: "abandoned",
+        mismatchCheckpoint: false,
+        mismatchReason: true,
+      },
+    ] as const) {
+      const connection = sourceConnection(2);
+      connection.exec("PRAGMA foreign_keys = OFF");
+      seedRootStart(connection);
+      seedLegacyEndRequest(connection, 2, 2);
+      const checkpointId = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+      const commandId = eventCommandId(3);
+      rawEvent(connection, 3, {
+        streamType: "session",
+        sessionId: ROOT_ID,
+        streamVersion: 3,
+        eventType: candidate.eventType,
+        commandId,
+        lifecycleIntent: candidate.eventType === "SessionEndCancelled"
+          ? cancelIntentWitness(
+              commandId,
+              PROJECTION_WORKFLOW_ID,
+              "2",
+              checkpointId,
+            )
+          : abandonIntentWitness(
+              commandId,
+              "2",
+              checkpointId,
+              "explicit-user-approval",
+            ),
+        payload: candidate.eventType === "SessionEndCancelled"
+          ? {
+              workflowId: PROJECTION_WORKFLOW_ID,
+              workflowGeneration: 1,
+              restoredState: "active",
+              preTransitionCheckpointId: checkpointId,
+            }
+          : {
+              workflowId: PROJECTION_WORKFLOW_ID,
+              workflowGeneration: 1,
+              approvalId: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+              preTransitionCheckpointId: checkpointId,
+              reasonCode: "explicit-user-approval",
+              authorityCommitment: H64,
+            },
+      });
+      rawInsert(connection, "workflow_instances", legacyLifecycleWorkflow({
+        workflow_id: PROJECTION_WORKFLOW_ID,
+        generation: 1,
+        state: "completed",
+        phase: candidate.phase,
+        root_command_id: commandId,
+        session_id: ROOT_ID,
+        triggering_event_position: 3,
+      }));
+
+      connection.exec("BEGIN IMMEDIATE");
+      new SqliteQualifiedCheckpointMigrationPreflight()
+        .assertEligibleAndStage(connection, context);
+      const mismatchedIntent = candidate.eventType === "SessionEndCancelled"
+        ? cancelIntentWitness(
+            commandId,
+            PROJECTION_WORKFLOW_ID,
+            "2",
+            "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+          )
+        : abandonIntentWitness(
+            commandId,
+            "2",
+            candidate.mismatchCheckpoint
+              ? "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"
+              : checkpointId,
+            candidate.mismatchReason
+              ? "operator-emergency"
+              : "explicit-user-approval",
+          );
+      connection.exec("DROP TRIGGER events_no_update");
+      connection.prepare(`
+        UPDATE events SET lifecycle_intent_json = $intent
+        WHERE global_position = 3
+      `).run({ $intent: mismatchedIntent });
+      assert.throws(
+        () => connection.exec(qualifiedCheckpointCoverageMigration.sql),
+        /MIGRATION_EVIDENCE_V2_PRECONDITION_FAILED/,
+        candidate.name,
+      );
+      connection.exec("ROLLBACK");
+      assert.equal(schemaVersion(connection), 2, candidate.name);
+    }
+  });
+
+  it("migration 3 persistent workflow guard rejects abandon event-intent parity mismatch", () => {
+    for (const mismatch of [
+      {
+        name: "checkpoint",
+        intentCheckpointId: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+        intentReasonCode: "explicit-user-approval",
+      },
+      {
+        name: "reason",
+        intentCheckpointId: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+        intentReasonCode: "operator-emergency",
+      },
+    ]) {
+      const connection = currentConnection();
+      seedRootStart(connection);
+      seedLegacyEndRequest(connection, 2, 2);
+      rawInsert(
+        connection,
+        "lifecycle_workflow_generation_folds",
+        workflowProjectionRow(),
+      );
+      const commandId = eventCommandId(3);
+      rawEvent(connection, 3, {
+        streamType: "session",
+        sessionId: ROOT_ID,
+        streamVersion: 3,
+        eventType: "SessionAbandoned",
+        commandId,
+        lifecycleIntent: abandonIntentWitness(
+          commandId,
+          "2",
+          mismatch.intentCheckpointId,
+          mismatch.intentReasonCode,
+        ),
+        payload: {
+          workflowId: PROJECTION_WORKFLOW_ID,
+          workflowGeneration: 2,
+          approvalId: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+          preTransitionCheckpointId:
+            "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+          reasonCode: "explicit-user-approval",
+          authorityCommitment: H64,
+        },
+      });
+      assert.throws(
+        () => rawInsert(
+          connection,
+          "lifecycle_workflow_generation_folds",
+          workflowProjectionRow(3, {
+            workflow_generation: 2,
+            root_command_id: commandId,
+            replacement_checkpoint_version: null,
+            effective_draft_source_event_position: 2,
+            previous_fingerprint: H64,
+            fingerprint: H64_B,
+          }),
+        ),
+        /LIFECYCLE_WORKFLOW_GENERATION_FOLD_INVALID/,
+        mismatch.name,
+      );
+    }
+  });
+
+  it("migration 3 persistent child guard rejects disposition report item-set mismatch", () => {
+    const connection = currentConnection();
+    seedChildForkProjectionEvent(connection);
+    rawInsert(
+      connection,
+      "lifecycle_child_event_folds",
+      childProjectionRow(),
+    );
+    const reported = lifecycleEvent(2, "ChildWorkReported", {}, {
+      projectId: PROJECT_ID as never,
+      vaultId: VAULT_ID as never,
+      storeId: STORE_ID as never,
+      workspaceId: WORKSPACE_ID as never,
+      sessionId: CHILD_ID as never,
+      parentSessionId: ROOT_ID as never,
+      globalPosition: 2,
+      streamVersion: 2,
+      authorityCommitment: H64,
+    });
+    const {
+      allReportItemIds,
+      ...storedReport
+    } = reported.payload.report;
+    rawEvent(connection, 2, {
+      streamType: "session",
+      sessionId: CHILD_ID,
+      parentSessionId: ROOT_ID,
+      streamVersion: 2,
+      eventType: "ChildWorkReported",
+      payload: {
+        ...reported.payload,
+        report: storedReport,
+      },
+    });
+    rawInsert(
+      connection,
+      "lifecycle_child_event_folds",
+      childProjectionRow({
+        event_position: 2,
+        stream_version: 2,
+        report_count: 1,
+        latest_report_id: reported.payload.report.reportId,
+        report_index_fingerprint: H64_B,
+        reported_report_id: reported.payload.report.reportId,
+        reported_item_count: allReportItemIds.length,
+        reported_item_set_fingerprint: H64_C,
+        previous_fingerprint: H64_B,
+        fingerprint: H64_C,
+      }),
+    );
+    const wrongItemIds = allReportItemIds.map((_, index) =>
+      `ffffffff-ffff-4fff-8fff-${(index + 1).toString(16).padStart(12, "0")}`);
+    const disposition = {
+      ...childDispositionFixture("accepted", reported.payload.report.reportId),
+      acceptedItemIds: wrongItemIds,
+      allReportItemIds: wrongItemIds,
+    };
+    rawEvent(connection, 3, {
+      streamType: "session",
+      sessionId: CHILD_ID,
+      parentSessionId: ROOT_ID,
+      streamVersion: 3,
+      eventType: "ChildWorkDispositioned",
+      payload: { disposition },
+    });
+    assert.throws(
+      () => rawInsert(
+        connection,
+        "lifecycle_child_event_folds",
+        childProjectionRow({
+          event_position: 3,
+          stream_version: 3,
+          report_count: 1,
+          latest_report_id: reported.payload.report.reportId,
+          report_index_fingerprint: H64_B,
+          previous_fingerprint: H64_C,
+          fingerprint: H64,
+        }),
+      ),
+      /LIFECYCLE_CHILD_EVENT_FOLD_INVALID/,
+    );
+  });
+
+  it("migration 3 projection tables enforce every row constraint index and immutable guard", () => {
+    const childConstraintCases = [
+      ["event position", { event_position: 0 }],
+      ["stream version", { stream_version: 0 }],
+      ["child state", { child_state: "unknown" }],
+      ["checkpoint position", {
+        latest_checkpoint_id: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+        latest_checkpoint_event_position: 0,
+      }],
+      ["authority hash", { authority_commitment: "not-a-hash" }],
+      ["terminal type", {
+        child_state: "completed",
+        terminal_event_type: "SessionEnded",
+        terminal_event_position: 1,
+      }],
+      ["terminal position", {
+        child_state: "completed",
+        terminal_event_type: "ChildSessionCompleted",
+        terminal_event_position: 0,
+      }],
+      ["negative report count", { report_count: -1 }],
+      ["oversized report count", {
+        report_count: 201,
+        latest_report_id: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+      }],
+      ["report-index hash", { report_index_fingerprint: "not-a-hash" }],
+      ["reported count", {
+        report_count: 1,
+        latest_report_id: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+        reported_report_id: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+        reported_item_count: 201,
+        reported_item_set_fingerprint: H64,
+      }],
+      ["reported set hash", {
+        report_count: 1,
+        latest_report_id: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+        reported_report_id: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+        reported_item_count: 1,
+        reported_item_set_fingerprint: "not-a-hash",
+      }],
+      ["previous hash", { previous_fingerprint: "not-a-hash" }],
+      ["fingerprint", { fingerprint: "not-a-hash" }],
+      ["checkpoint pair", {
+        latest_checkpoint_id: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+      }],
+      ["terminal pair", { terminal_event_position: 1 }],
+      ["report pair", {
+        report_count: 1,
+        latest_report_id: null,
+      }],
+      ["reported triple", {
+        reported_report_id: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+      }],
+      ["completion witness", {
+        completion_report_id: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+      }],
+      ["state terminal shape", {
+        child_state: "completed",
+        terminal_event_type: null,
+        terminal_event_position: null,
+      }],
+      ["terminal ordering", {
+        child_state: "completed",
+        terminal_event_type: "ChildSessionCompleted",
+        terminal_event_position: 2,
+      }],
+      ["checkpoint ordering", {
+        latest_checkpoint_id: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+        latest_checkpoint_event_position: 2,
+      }],
+    ] as const;
+    for (const [name, overrides] of childConstraintCases) {
+      const connection = currentConnection();
+      connection.exec("DROP TRIGGER lifecycle_child_event_folds_insert_guard");
+      assert.throws(
+        () => rawInsert(
+          connection,
+          "lifecycle_child_event_folds",
+          childProjectionRow(overrides),
+        ),
+        /constraint failed|CHECK constraint failed/,
+        name,
+      );
+    }
+
+    const childPrimary = currentConnection();
+    childPrimary.exec("DROP TRIGGER lifecycle_child_event_folds_insert_guard");
+    rawInsert(childPrimary, "lifecycle_child_event_folds", childProjectionRow());
+    assert.throws(
+      () => rawInsert(childPrimary, "lifecycle_child_event_folds", childProjectionRow()),
+      /UNIQUE constraint failed/,
+    );
+
+    const childStreamUnique = currentConnection();
+    childStreamUnique.exec("DROP TRIGGER lifecycle_child_event_folds_insert_guard");
+    rawInsert(childStreamUnique, "lifecycle_child_event_folds", childProjectionRow());
+    assert.throws(
+      () => rawInsert(
+        childStreamUnique,
+        "lifecycle_child_event_folds",
+        childProjectionRow({ event_position: 2, fingerprint: H64_C }),
+      ),
+      /UNIQUE constraint failed/,
+    );
+
+    const childReportUnique = currentConnection();
+    childReportUnique.exec("DROP TRIGGER lifecycle_child_event_folds_insert_guard");
+    const reportId = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+    const reportRow = childProjectionRow({
+      report_count: 1,
+      latest_report_id: reportId,
+      reported_report_id: reportId,
+      reported_item_count: 1,
+      reported_item_set_fingerprint: H64,
+    });
+    rawInsert(childReportUnique, "lifecycle_child_event_folds", reportRow);
+    assert.throws(
+      () => rawInsert(
+        childReportUnique,
+        "lifecycle_child_event_folds",
+        {
+          ...reportRow,
+          event_position: 2,
+          stream_version: 2,
+          previous_fingerprint: H64_B,
+          fingerprint: H64_C,
+        },
+      ),
+      /UNIQUE constraint failed/,
+    );
+
+    const immutableChild = currentConnection();
+    seedChildForkProjectionEvent(immutableChild);
+    rawInsert(
+      immutableChild,
+      "lifecycle_child_event_folds",
+      childProjectionRow(),
+    );
+    assert.throws(
+      () => immutableChild.exec(`
+        UPDATE lifecycle_child_event_folds SET fingerprint = '${H64_C}'
+      `),
+      /LIFECYCLE_CHILD_EVENT_FOLD_IMMUTABLE/,
+    );
+    assert.throws(
+      () => immutableChild.exec("DELETE FROM lifecycle_child_event_folds"),
+      /LIFECYCLE_CHILD_EVENT_FOLD_IMMUTABLE/,
+    );
+
+    const workflowConstraintCases = [
+      ["generation", { workflow_generation: 0 }],
+      ["trigger position", { trigger_event_position: 0 }],
+      ["window", { evidence_window_state: "unknown" }],
+      ["replacement version", { replacement_checkpoint_version: 3 }],
+      ["effective version", { effective_checkpoint_version: 3 }],
+      ["source position", { effective_draft_source_event_position: 0 }],
+      ["previous hash", { previous_fingerprint: "not-a-hash" }],
+      ["fingerprint", { fingerprint: "not-a-hash" }],
+      ["open version", {
+        evidence_window_state: "open",
+        effective_checkpoint_version: 1,
+      }],
+      ["replacement parity", {
+        replacement_checkpoint_version: 2,
+        effective_checkpoint_version: 1,
+      }],
+      ["replacement source", {
+        replacement_checkpoint_version: 1,
+        effective_draft_source_event_position: 1,
+      }],
+      ["source ordering", {
+        replacement_checkpoint_version: null,
+        effective_draft_source_event_position: 3,
+      }],
+    ] as const;
+    for (const [name, overrides] of workflowConstraintCases) {
+      const connection = currentConnection();
+      connection.exec(
+        "DROP TRIGGER lifecycle_workflow_generation_folds_insert_guard",
+      );
+      assert.throws(
+        () => rawInsert(
+          connection,
+          "lifecycle_workflow_generation_folds",
+          workflowProjectionRow(2, overrides),
+        ),
+        /constraint failed|CHECK constraint failed/,
+        name,
+      );
+    }
+
+    const workflowPrimary = currentConnection();
+    workflowPrimary.exec(
+      "DROP TRIGGER lifecycle_workflow_generation_folds_insert_guard",
+    );
+    rawInsert(
+      workflowPrimary,
+      "lifecycle_workflow_generation_folds",
+      workflowProjectionRow(),
+    );
+    assert.throws(
+      () => rawInsert(
+        workflowPrimary,
+        "lifecycle_workflow_generation_folds",
+        workflowProjectionRow(),
+      ),
+      /UNIQUE constraint failed/,
+    );
+
+    const workflowTriggerUnique = currentConnection();
+    workflowTriggerUnique.exec(
+      "DROP TRIGGER lifecycle_workflow_generation_folds_insert_guard",
+    );
+    rawInsert(
+      workflowTriggerUnique,
+      "lifecycle_workflow_generation_folds",
+      workflowProjectionRow(),
+    );
+    assert.throws(
+      () => rawInsert(
+        workflowTriggerUnique,
+        "lifecycle_workflow_generation_folds",
+        workflowProjectionRow(2, {
+          workflow_generation: 2,
+          previous_fingerprint: H64,
+          fingerprint: H64_B,
+        }),
+      ),
+      /UNIQUE constraint failed/,
+    );
+
+    for (const missing of ["trigger", "source"] as const) {
+      const connection = currentConnection();
+      connection.exec(
+        "DROP TRIGGER lifecycle_workflow_generation_folds_insert_guard",
+      );
+      rawEvent(connection, missing === "trigger" ? 1 : 2);
+      connection.exec("PRAGMA foreign_keys = ON");
+      connection.exec("BEGIN IMMEDIATE");
+      rawInsert(
+        connection,
+        "lifecycle_workflow_generation_folds",
+        workflowProjectionRow(2, {
+          replacement_checkpoint_version: null,
+          effective_draft_source_event_position: 1,
+        }),
+      );
+      assert.throws(
+        () => connection.exec("COMMIT"),
+        /FOREIGN KEY constraint failed/,
+        missing,
+      );
+      connection.exec("ROLLBACK");
+    }
+
+    const immutableWorkflow = currentConnection();
+    seedRootStart(immutableWorkflow);
+    seedLegacyEndRequest(immutableWorkflow, 2, 2);
+    rawInsert(
+      immutableWorkflow,
+      "lifecycle_workflow_generation_folds",
+      workflowProjectionRow(),
+    );
+    assert.throws(
+      () => immutableWorkflow.exec(`
+        UPDATE lifecycle_workflow_generation_folds
+        SET fingerprint = '${H64_C}'
+      `),
+      /LIFECYCLE_WORKFLOW_GENERATION_FOLD_IMMUTABLE/,
+    );
+    assert.throws(
+      () => immutableWorkflow.exec(
+        "DELETE FROM lifecycle_workflow_generation_folds",
+      ),
+      /LIFECYCLE_WORKFLOW_GENERATION_FOLD_IMMUTABLE/,
+    );
+  });
+
+  it("migration 3 backfills three reports while consumers bind the first non-latest witness", () => {
+    const connection = sourceConnection(2);
+    connection.exec("PRAGMA foreign_keys = OFF");
+    seedChildForkProjectionEvent(connection);
+    const reports = [0, 1, 2].map((offset) => childReportFixture({
+      childSessionId: CHILD_ID as never,
+      parentSessionId: ROOT_ID as never,
+      reportId: `aaaaaaaa-aaaa-4aaa-8aaa-${(offset + 1)
+        .toString(16).padStart(12, "0")}` as never,
+      itemIds: [
+        `bbbbbbbb-bbbb-4bbb-8bbb-${(offset + 1)
+          .toString(16).padStart(12, "0")}` as never,
+        `cccccccc-cccc-4ccc-8ccc-${(offset + 1)
+          .toString(16).padStart(12, "0")}` as never,
+      ],
+    }));
+    for (let index = 0; index < reports.length; index += 1) {
+      const report = reports[index]!;
+      const { allReportItemIds: _allReportItemIds, ...storedReport } = report;
+      rawEvent(connection, index + 2, {
+        streamType: "session",
+        sessionId: CHILD_ID,
+        parentSessionId: ROOT_ID,
+        streamVersion: index + 2,
+        eventType: "ChildWorkReported",
+        payload: {
+          report: storedReport,
+          childAuthorAgentId: "agent-child",
+          primaryRecorderAgentId: "agent-primary",
+        },
+      });
+    }
+    const first = reports[0]!;
+    rawEvent(connection, 5, {
+      streamType: "session",
+      sessionId: CHILD_ID,
+      parentSessionId: ROOT_ID,
+      streamVersion: 5,
+      eventType: "ChildCompletionProposed",
+      payload: { reportId: first.reportId },
+    });
+    rawEvent(connection, 6, {
+      streamType: "session",
+      sessionId: CHILD_ID,
+      parentSessionId: ROOT_ID,
+      streamVersion: 6,
+      eventType: "ChildWorkDispositioned",
+      payload: {
+        disposition: {
+          ...childDispositionFixture("rejected", first.reportId),
+          rejectedItemIds: first.allReportItemIds,
+          allReportItemIds: first.allReportItemIds,
+        },
+      },
+    });
+    rawEvent(connection, 7, {
+      streamType: "session",
+      sessionId: CHILD_ID,
+      parentSessionId: ROOT_ID,
+      streamVersion: 7,
+      eventType: "ChildCompletionProposed",
+      payload: { reportId: first.reportId },
+    });
+    rawEvent(connection, 8, {
+      streamType: "session",
+      sessionId: CHILD_ID,
+      parentSessionId: ROOT_ID,
+      streamVersion: 8,
+      eventType: "ChildSessionCompleted",
+      payload: {
+        reportId: first.reportId,
+        authorityCommitment: H64,
+      },
+    });
+
+    new MigrationRunner().apply(connection, registry, NOW, mode({
+      kind: "explicit-upgrade",
+      expectedAppliedVersion: 2,
+      beforeMigration(candidate: SqliteConnection, migration: { version: number }): void {
+        if (migration.version === 3) {
+          new SqliteQualifiedCheckpointMigrationPreflight()
+            .assertEligibleAndStage(candidate, context);
+        }
+      },
+    }));
+
+    const rows = connection.prepare(`
+      SELECT event_position, child_state, latest_report_id,
+             completion_report_id, reported_report_id
+      FROM lifecycle_child_event_folds
+      ORDER BY event_position
+    `).all();
+    assert.equal(rows.length, 8);
+    assert.deepEqual(
+      rows.filter((row) => row.reported_report_id !== null)
+        .map((row) => row.reported_report_id),
+      reports.map((report) => report.reportId),
+    );
+    for (const eventPosition of [5n, 6n, 7n, 8n]) {
+      const row = rows.find((candidate) =>
+        candidate.event_position === eventPosition);
+      assert.equal(row?.latest_report_id, reports[2]!.reportId);
+    }
+    assert.equal(rows[4]?.completion_report_id, first.reportId);
+    assert.equal(rows[5]?.completion_report_id, null);
+    assert.equal(rows[6]?.completion_report_id, first.reportId);
+    assert.equal(rows[7]?.completion_report_id, first.reportId);
+    assert.equal(rows[7]?.child_state, "completed");
   });
 
   it("migration 3 collapses schema 2 cancel and abandon at the same generation", () => {

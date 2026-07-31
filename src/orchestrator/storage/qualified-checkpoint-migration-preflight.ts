@@ -21,7 +21,6 @@ import {
   minimumCheckpointUpperBound,
   minimumFinalEndingScopeBindingsUpperBound,
 } from "../lifecycle/checkpoint-capacity.js";
-import { foldSession, type SessionAggregateState } from "../lifecycle/session-aggregate.js";
 import {
   foldChildEventProjection,
   foldWorkflowGenerationProjection,
@@ -149,7 +148,8 @@ interface IndexedCheckpoint {
 
 interface IndexedLifecycleHistory {
   readonly checkpoints: ReadonlyMap<string, IndexedCheckpoint>;
-  readonly eventsBySession: ReadonlyMap<string, readonly LifecycleEvent[]>;
+  readonly eventsByPosition: ReadonlyMap<string, LifecycleEvent>;
+  readonly childFoldsByEvent: ReadonlyMap<string, ChildEventFoldProjection>;
   readonly childEventFolds: readonly ChildEventFoldProjection[];
   readonly workflowGenerationFolds: readonly WorkflowGenerationFoldProjection[];
 }
@@ -310,7 +310,8 @@ function assertCoverageEmpty(connection: SqliteConnection): void {
 
 function indexLifecycleHistory(connection: SqliteConnection): IndexedLifecycleHistory {
   const checkpoints = new Map<string, IndexedCheckpoint>();
-  const eventsBySession = new Map<string, LifecycleEvent[]>();
+  const eventsByPosition = new Map<string, LifecycleEvent>();
+  const childFoldsByEvent = new Map<string, ChildEventFoldProjection>();
   const childEventFolds: ChildEventFoldProjection[] = [];
   const workflowGenerationFolds: WorkflowGenerationFoldProjection[] = [];
   const childHeads = new Map<string, ChildEventFoldProjection>();
@@ -324,6 +325,9 @@ function indexLifecycleHistory(connection: SqliteConnection): IndexedLifecycleHi
     readonly streamId: string;
   }>();
   const workflowHeads = new Map<string, WorkflowGenerationFoldProjection>();
+  // Trigger type is contextual provenance, not part of the approved row/hash.
+  // Preflight must retain it while folding so only a cancelled row can reopen.
+  const workflowHeadTriggerTypes = new Map<string, LifecycleEvent["eventType"]>();
   const workflowIndexes = new Map<string, number>();
   const lifecycleRows = connection.prepare(`
     SELECT global_position, event_id, project_id, vault_id, store_id,
@@ -392,9 +396,8 @@ function indexLifecycleHistory(connection: SqliteConnection): IndexedLifecycleHi
       fail();
     }
     const sessionId = requiredString(row, "session_id");
-    const history = eventsBySession.get(sessionId) ?? [];
-    history.push(decoded);
-    eventsBySession.set(sessionId, history);
+    if (eventsByPosition.has(decoded.globalPosition)) fail();
+    eventsByPosition.set(decoded.globalPosition, decoded);
 
     const globalPosition = BigInt(positiveInt64Decimal(row, "global_position"));
     const streamVersion = BigInt(positiveInt64Decimal(row, "stream_version"));
@@ -468,6 +471,10 @@ function indexLifecycleHistory(connection: SqliteConnection): IndexedLifecycleHi
       }
       childHeads.set(decoded.sessionId, projection);
       childEventFolds.push(projection);
+      childFoldsByEvent.set(
+        `${projection.childSessionId}\u0000${projection.eventPosition}`,
+        projection,
+      );
       if (projection.reportedReportId !== null) {
         childReports.set(projection.reportedReportId, projection);
         reportWitnesses.set(decoded.sessionId, childReports);
@@ -489,6 +496,12 @@ function indexLifecycleHistory(connection: SqliteConnection): IndexedLifecycleHi
     }
     if (projectionWorkflowId !== null) {
       const workflowId = projectionWorkflowId;
+      const previous = workflowHeads.get(workflowId) ?? null;
+      if (
+        decoded.eventType === "SessionEndRequested"
+        && previous !== null
+        && workflowHeadTriggerTypes.get(workflowId) !== "SessionEndCancelled"
+      ) fail();
       const indexedIntent = commandIntents.get(commandKey);
       if (
         indexedIntent === undefined
@@ -498,7 +511,7 @@ function indexLifecycleHistory(connection: SqliteConnection): IndexedLifecycleHi
       let projection: WorkflowGenerationFoldProjection;
       try {
         projection = foldWorkflowGenerationProjection(
-          workflowHeads.get(workflowId) ?? null,
+          previous,
           stored,
           indexedIntent.witness,
           "schema-2-preflight",
@@ -519,6 +532,7 @@ function indexLifecycleHistory(connection: SqliteConnection): IndexedLifecycleHi
         workflowGenerationFolds.push(projection);
       }
       workflowHeads.set(workflowId, projection);
+      workflowHeadTriggerTypes.set(workflowId, decoded.eventType);
     }
 
     if (eventType === "SessionCheckpointRecorded") {
@@ -546,7 +560,8 @@ function indexLifecycleHistory(connection: SqliteConnection): IndexedLifecycleHi
   }
   return {
     checkpoints,
-    eventsBySession,
+    eventsByPosition,
+    childFoldsByEvent,
     childEventFolds,
     workflowGenerationFolds: workflowGenerationFolds.sort((left, right) =>
       left.triggerEventPosition < right.triggerEventPosition
@@ -557,37 +572,19 @@ function indexLifecycleHistory(connection: SqliteConnection): IndexedLifecycleHi
   };
 }
 
-function foldAt(
-  history: IndexedLifecycleHistory,
-  sessionId: string,
-  eventPosition: string,
-): SessionAggregateState {
-  const events = history.eventsBySession.get(sessionId)?.filter(
-    (event) => BigInt(event.globalPosition) <= BigInt(eventPosition),
-  ) ?? [];
-  try {
-    const aggregate = foldSession(events);
-    if (aggregate.eventPosition !== BigInt(eventPosition)) fail();
-    return aggregate;
-  } catch (error) {
-    if (error instanceof SchemaCompatibilityError) throw error;
-    fail();
-  }
-}
-
 function eventAt(
-  connection: SqliteConnection,
+  history: IndexedLifecycleHistory,
   projectId: string,
   sessionId: string,
   eventPosition: string,
-): SqliteRow {
-  const rows = connection.prepare(`
-    SELECT global_position, stream_version, event_type, session_id
-    FROM events
-    WHERE project_id = $projectId AND global_position = $position
-  `).all({ $projectId: projectId, $position: BigInt(eventPosition) });
-  if (rows.length !== 1 || rows[0]!.session_id !== sessionId) fail();
-  return rows[0]!;
+): LifecycleEvent {
+  const event = history.eventsByPosition.get(eventPosition);
+  if (
+    event === undefined
+    || event.projectId !== projectId
+    || event.sessionId !== sessionId
+  ) fail();
+  return event;
 }
 
 function checkpointPosition(
@@ -628,13 +625,15 @@ function bindingForSummary(
     childSessionId,
     lastEventPosition,
   );
-  const event = eventAt(connection, projectId, childSessionId, lastEventPosition);
-  if (String(event.stream_version) !== streamVersion) fail();
-  const aggregate = foldAt(history, childSessionId, lastEventPosition);
+  const event = eventAt(history, projectId, childSessionId, lastEventPosition);
+  if (event.streamVersion !== streamVersion) fail();
+  const aggregate = history.childFoldsByEvent.get(
+    `${childSessionId}\u0000${lastEventPosition}`,
+  );
   if (
-    aggregate.kind !== "child"
-    || aggregate.parentSessionId !== rootSessionId
-    || aggregate.state !== childState
+    aggregate === undefined
+    || aggregate.rootSessionId !== rootSessionId
+    || aggregate.childState !== childState
     || aggregate.streamVersion !== BigInt(streamVersion)
     || aggregate.latestCheckpointId !== checkpointId
     || aggregate.latestCheckpointEventPosition
@@ -657,7 +656,7 @@ function bindingForSummary(
   if (
     authority.session_kind !== "child"
     || authority.parent_session_id !== rootSessionId
-    || authority.semantic_state !== aggregate.state
+    || authority.semantic_state !== aggregate.childState
     || positiveInt64Decimal(authority, "authority_event_position")
       !== aggregate.eventPosition.toString()
     || nullableString(authority, "latest_checkpoint_id") !== aggregate.latestCheckpointId
@@ -875,7 +874,7 @@ function finalForWorkflow(
     window.evidenceFrozenCheckpointEventPosition !== indexed.eventPosition
     || window.evidenceFrozenGeneration !== generation
   ) fail();
-  eventAt(connection, projectId, requiredString(row, "session_id"), indexed.eventPosition);
+  eventAt(history, projectId, requiredString(row, "session_id"), indexed.eventPosition);
   return {
     eventPosition: indexed.eventPosition,
     bindings: bindingsForCheckpoint(connection, projectId, history, indexed.checkpoint),
@@ -1209,9 +1208,9 @@ function createStage(
         CHECK (completion_report_id IS NULL OR report_count > 0),
         CHECK (
           (child_state = 'completed'
-            AND terminal_event_type = 'ChildSessionCompleted')
+            AND terminal_event_type IS 'ChildSessionCompleted')
           OR (child_state = 'transferred'
-            AND terminal_event_type = 'ChildWorkTransferCreated')
+            AND terminal_event_type IS 'ChildWorkTransferCreated')
           OR (child_state IN ('active', 'completion-proposed', 'suspended')
             AND terminal_event_type IS NULL)
         ),
