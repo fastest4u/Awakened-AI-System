@@ -40,6 +40,7 @@ import { LifecycleCommandProcessor } from "../src/orchestrator/lifecycle/lifecyc
 import {
   LifecycleCommandStore,
   type ConnectionBoundEvidenceCoverage,
+  type LifecycleCommandTransaction,
 } from "../src/orchestrator/lifecycle/lifecycle-command.store.js";
 import {
   CHECKPOINT_MAX_CANONICAL_BYTES,
@@ -73,8 +74,11 @@ import type {
   SessionAuthorityRecord,
 } from "../src/orchestrator/storage/lifecycle-storage.types.js";
 import { MaintenanceFence } from "../src/orchestrator/storage/maintenance-fence.js";
-import { MigrationRunner } from "../src/orchestrator/storage/migration-runner.js";
 import { PROJECT_STORE_MIGRATIONS } from "../src/orchestrator/storage/migrations/registry.js";
+import {
+  SqliteLifecycleProjectionRepository,
+} from "../src/orchestrator/storage/lifecycle-projection.repository.js";
+import { applyCurrentProjectStoreSchema } from "./support/current-project-store-schema.js";
 import { SessionAuthorityRepository } from "../src/orchestrator/storage/session-authority.repository.js";
 import { SessionLeaseRepository } from "../src/orchestrator/storage/session-lease.repository.js";
 import type {
@@ -101,7 +105,7 @@ import {
 import { canonicalJson } from "../src/orchestrator/serialization/canonical-json.js";
 
 const NOW = "2026-07-18T00:00:00.000Z";
-const LIFECYCLE_SCHEMA_MIGRATIONS = PROJECT_STORE_MIGRATIONS.slice(0, 2);
+const LIFECYCLE_SCHEMA_MIGRATIONS = PROJECT_STORE_MIGRATIONS;
 const NOW_MS = BigInt(Date.parse(NOW));
 const TARGET_BINDING_FINGERPRINT = "d".repeat(64);
 
@@ -124,6 +128,19 @@ function healthyCoverageFacade(
     minimumCheckpointUpperBound: () => 0,
     minimumFinalEndingScopeBindingsUpperBound: () => 0,
     ...overrides,
+  };
+}
+
+function projectionSeedTransaction(): LifecycleCommandTransaction {
+  return {
+    authority: {},
+    leases: {},
+    approvals: {},
+    transfers: {},
+    coverage: healthyCoverageFacade(),
+    workflows: {},
+    validation: {},
+    outbox: {},
   };
 }
 
@@ -535,6 +552,7 @@ function commandRuntime(options: {
   const store = new LifecycleCommandStore({
     connection,
     events,
+    projectionWriter: new SqliteLifecycleProjectionRepository(connection),
     transaction: (current) => ({
       authority: {
         get: (projectId: string, sessionId: string) => authority.get(current, projectId, sessionId),
@@ -609,19 +627,11 @@ function fixture(
 ): Fixture {
   assert.ok(ChildWorkflowServiceClass, "ChildWorkflowService must implement scoped child behavior");
   const connection = new NativeConnection(databasePath);
-  new MigrationRunner().apply(connection, LIFECYCLE_SCHEMA_MIGRATIONS, NOW, {
-    kind: "bootstrap-empty", beforeMigration: () => undefined,
-  });
-  connection.exec("BEGIN IMMEDIATE");
-  connection.prepare(`
-    INSERT INTO project_meta(singleton, project_id, vault_id, store_id, schema_version, created_at)
-    VALUES (1, $projectId, $vaultId, $storeId, 2, $createdAt)
-  `).run({ $projectId: PROJECT_ID, $vaultId: VAULT_ID, $storeId: STORE_ID, $createdAt: NOW });
-  connection.exec(`
-    INSERT INTO maintenance_state(singleton, epoch, mode, owner_id, fencing_token, lease_expires_at, requested_at)
-    VALUES (1, 0, 'idle', NULL, 0, NULL, NULL)
-  `);
-  connection.exec("COMMIT");
+  applyCurrentProjectStoreSchema(connection, {
+    projectId: PROJECT_ID,
+    vaultId: VAULT_ID,
+    storeId: STORE_ID,
+  }, NOW);
 
   const ids = new DeterministicIds();
   const clock = new TestClock();
@@ -1167,6 +1177,10 @@ function seedSessionCheckpoint(item: Fixture, sessionId: string, ordinal: number
         updatedAt: NOW,
       }), true);
     }
+    new SqliteLifecycleProjectionRepository(item.connection).append(
+      committed,
+      projectionSeedTransaction(),
+    );
     item.connection.exec("COMMIT");
   } catch (error) {
     item.connection.exec("ROLLBACK");

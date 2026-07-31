@@ -41,8 +41,11 @@ import {
 } from "../src/orchestrator/storage/event-append-transaction.js";
 import { LifecycleApprovalRepository } from "../src/orchestrator/storage/lifecycle-approval.repository.js";
 import { MaintenanceFence } from "../src/orchestrator/storage/maintenance-fence.js";
-import { MigrationRunner } from "../src/orchestrator/storage/migration-runner.js";
 import { PROJECT_STORE_MIGRATIONS } from "../src/orchestrator/storage/migrations/registry.js";
+import {
+  SqliteLifecycleProjectionRepository,
+} from "../src/orchestrator/storage/lifecycle-projection.repository.js";
+import { applyCurrentProjectStoreSchema } from "./support/current-project-store-schema.js";
 import { SessionAuthorityRepository } from "../src/orchestrator/storage/session-authority.repository.js";
 import { SessionLeaseRepository } from "../src/orchestrator/storage/session-lease.repository.js";
 import type {
@@ -69,7 +72,7 @@ import {
 } from "./support/lifecycle-fixtures.js";
 
 const NOW = "2026-07-17T00:00:00.000Z";
-const LIFECYCLE_SCHEMA_MIGRATIONS = PROJECT_STORE_MIGRATIONS.slice(0, 2);
+const LIFECYCLE_SCHEMA_MIGRATIONS = PROJECT_STORE_MIGRATIONS;
 const NOW_MS = BigInt(Date.parse(NOW));
 const OWNER_LEASE_MS = 120_000n;
 
@@ -910,25 +913,11 @@ function fixture(
   options: FixtureOptions = {},
 ): Fixture {
   const connection = new NativeConnection();
-  new MigrationRunner().apply(connection, LIFECYCLE_SCHEMA_MIGRATIONS, NOW, {
-    kind: "bootstrap-empty", beforeMigration: () => undefined,
-  });
-  connection.exec("BEGIN IMMEDIATE");
-  connection.prepare(`
-    INSERT INTO project_meta(singleton, project_id, vault_id, store_id, schema_version, created_at)
-    VALUES (1, $projectId, $vaultId, $storeId, 2, $createdAt)
-  `).run({
-    $projectId: PROJECT_ID,
-    $vaultId: VAULT_ID,
-    $storeId: STORE_ID,
-    $createdAt: NOW,
-  });
-  connection.exec(`
-    INSERT INTO maintenance_state(
-      singleton, epoch, mode, owner_id, fencing_token, lease_expires_at, requested_at
-    ) VALUES (1, 0, 'idle', NULL, 0, NULL, NULL)
-  `);
-  connection.exec("COMMIT");
+  applyCurrentProjectStoreSchema(connection, {
+    projectId: PROJECT_ID,
+    vaultId: VAULT_ID,
+    storeId: STORE_ID,
+  }, NOW);
 
   const ids = new DeterministicIds();
   const clock = new TestClock();
@@ -961,6 +950,7 @@ function fixture(
   const store = new LifecycleCommandStore({
     connection,
     events,
+    projectionWriter: new SqliteLifecycleProjectionRepository(connection),
     transaction: (current) => ({
       authority: {
         get: (projectId: string, sessionId: string) => authority.get(current, projectId, sessionId),

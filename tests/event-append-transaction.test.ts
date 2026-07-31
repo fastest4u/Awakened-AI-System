@@ -9,6 +9,7 @@ import type {
   JsonValue,
   LifecycleReplayExpectation,
   PersistedLifecycleAuthorizationRecord,
+  StoredEvent,
 } from "../src/orchestrator/contracts/event.js";
 import type {
   ProjectContext,
@@ -26,6 +27,7 @@ import {
 } from "../src/orchestrator/lifecycle/lifecycle-command.store.js";
 import { BranchScopeRepository } from "../src/orchestrator/storage/branch-scope.repository.js";
 import {
+  type EventAppendBatch,
   EventAppendTransaction,
   EventStoreError,
   SqliteEventAppendStatements,
@@ -34,12 +36,32 @@ import {
 import { MaintenanceFence } from "../src/orchestrator/storage/maintenance-fence.js";
 import { MigrationRunner } from "../src/orchestrator/storage/migration-runner.js";
 import { eventCoreMigration } from "../src/orchestrator/storage/migrations/0001-event-core.js";
-import { PROJECT_STORE_MIGRATIONS } from "../src/orchestrator/storage/migrations/registry.js";
 import { NodeSqliteDriver } from "../src/orchestrator/storage/node-sqlite-driver.js";
 import type {
   SqliteConnection,
+  SqliteParams,
   SqliteStatement,
+  SqliteValue,
 } from "../src/orchestrator/storage/sqlite-driver.js";
+import {
+  SqliteLifecycleProjectionRepository,
+} from "../src/orchestrator/storage/lifecycle-projection.repository.js";
+import { canonicalJson } from "../src/orchestrator/serialization/canonical-json.js";
+import { applyCurrentProjectStoreSchema } from "./support/current-project-store-schema.js";
+import {
+  CHILD_SESSION_ID as PROJECTION_CHILD_ID,
+  APPROVAL_ID as PROJECTION_APPROVAL_ID,
+  CHECKPOINT_ID as PROJECTION_CHECKPOINT_ID,
+  PROJECT_ID as PROJECTION_PROJECT_ID,
+  ROOT_SESSION_ID as PROJECTION_ROOT_ID,
+  STORE_ID as PROJECTION_STORE_ID,
+  VAULT_ID as PROJECTION_VAULT_ID,
+  WORKFLOW_ID as PROJECTION_WORKFLOW_ID,
+  WORKSPACE_ID as PROJECTION_WORKSPACE_ID,
+  childReportFixture,
+  lifecycleEvent,
+  lifecycleUuid,
+} from "./support/lifecycle-fixtures.js";
 
 const PROJECT_ID = "11111111-1111-4111-8111-111111111111" as ProjectId;
 const VAULT_ID = "22222222-2222-4222-8222-222222222222" as VaultId;
@@ -48,7 +70,6 @@ const WORKSPACE_ID = "workspace-primary" as WorkspaceId;
 const LIFECYCLE_WORKSPACE_ID = "1".repeat(64) as WorkspaceId;
 const ROOT_SESSION_ID = "44444444-4444-4444-8444-444444444444";
 const NOW = "2026-07-13T01:00:00.000Z";
-const LIFECYCLE_SCHEMA_MIGRATIONS = PROJECT_STORE_MIGRATIONS.slice(0, 2);
 const roots: string[] = [];
 const connections: SqliteConnection[] = [];
 const driver = new NodeSqliteDriver({ DatabaseSync });
@@ -315,25 +336,11 @@ function lifecycleFixture(): {
     busyTimeoutMs: DEFAULT_BUSY_TIMEOUT_MS,
   }));
   connections.push(connection);
-  new MigrationRunner().apply(connection, LIFECYCLE_SCHEMA_MIGRATIONS, NOW, {
-    kind: "bootstrap-empty", beforeMigration: () => undefined,
-  });
-  connection.exec("BEGIN IMMEDIATE");
-  connection.prepare(`
-    INSERT INTO project_meta(singleton, project_id, vault_id, store_id, schema_version, created_at)
-    VALUES (1, $projectId, $vaultId, $storeId, 2, $createdAt)
-  `).run({
-    $projectId: PROJECT_ID,
-    $vaultId: VAULT_ID,
-    $storeId: STORE_ID,
-    $createdAt: NOW,
-  });
-  connection.exec(`
-    INSERT INTO maintenance_state(
-      singleton, epoch, mode, owner_id, fencing_token, lease_expires_at, requested_at
-    ) VALUES (1, 0, 'idle', NULL, 0, NULL, NULL)
-  `);
-  connection.exec("COMMIT");
+  applyCurrentProjectStoreSchema(connection, {
+    projectId: PROJECT_ID,
+    vaultId: VAULT_ID,
+    storeId: STORE_ID,
+  }, NOW);
   connection.transactionStatements.length = 0;
   const statements = new SqliteEventAppendStatements(connection);
   return {
@@ -346,6 +353,258 @@ function lifecycleFixture(): {
       new BranchScopeRepository(),
       () => "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
     ),
+  };
+}
+
+function projectionFixture(): SqliteConnection {
+  const root = mkdtempSync(join(tmpdir(), "lifecycle-projection-writer-"));
+  roots.push(root);
+  const connection = new RecordingConnection(driver.open(join(root, "events.sqlite"), {
+    mode: "create",
+    busyTimeoutMs: DEFAULT_BUSY_TIMEOUT_MS,
+  }));
+  connections.push(connection);
+  applyCurrentProjectStoreSchema(connection, {
+    projectId: PROJECTION_PROJECT_ID,
+    vaultId: PROJECTION_VAULT_ID,
+    storeId: PROJECTION_STORE_ID,
+  }, NOW);
+  connection.exec("PRAGMA foreign_keys = OFF");
+  connection.transactionStatements.length = 0;
+  return connection;
+}
+
+function projectionStored(
+  event: ReturnType<typeof lifecycleEvent>,
+  overrides: Partial<StoredEvent> = {},
+): StoredEvent {
+  return Object.freeze({
+    globalPosition: BigInt(event.globalPosition),
+    eventId: event.eventId,
+    projectId: event.projectId,
+    vaultId: event.vaultId,
+    storeId: event.storeId,
+    workspaceId: event.workspaceId,
+    branchScopeId: null,
+    branchRef: null,
+    streamId: event.streamId,
+    streamType: "session",
+    streamVersion: BigInt(event.streamVersion),
+    eventType: event.eventType,
+    eventSchemaVersion: event.eventSchemaVersion,
+    sessionId: event.sessionId,
+    parentSessionId: event.parentSessionId,
+    actorRole: "primary",
+    agentId: "agent-primary",
+    clientInstanceId: "client-primary",
+    correlationId: event.correlationId,
+    causationId: event.causationId,
+    commandId: event.commandId,
+    idempotencyKey: event.idempotencyKey,
+    commandEventIndex: 0,
+    occurredAt: event.occurredAt,
+    recordedAt: event.occurredAt,
+    visibilityScope: "session",
+    confidence: "high",
+    verificationStatus: "verified",
+    sourceRefs: Object.freeze([]),
+    evidenceRefs: Object.freeze([]),
+    evidenceDigests: Object.freeze([]),
+    payload: event.payload,
+    payloadJson: canonicalJson(event.payload),
+    payloadHash: "a".repeat(64),
+    previousGlobalHash: "b".repeat(64),
+    eventHash: "c".repeat(64),
+    lifecycleIntentJson: null,
+    ...overrides,
+  } as StoredEvent);
+}
+
+function insertProjectionEvent(
+  connection: SqliteConnection,
+  event: StoredEvent,
+): void {
+  const values: Readonly<Record<string, SqliteValue>> = {
+    global_position: event.globalPosition,
+    event_id: event.eventId,
+    project_id: event.projectId,
+    vault_id: event.vaultId,
+    store_id: event.storeId,
+    workspace_id: event.workspaceId,
+    branch_scope_id: null,
+    branch_ref: null,
+    stream_id: event.streamId,
+    stream_type: event.streamType,
+    stream_version: event.streamVersion,
+    event_type: event.eventType,
+    event_schema_version: event.eventSchemaVersion,
+    session_id: event.sessionId,
+    parent_session_id: event.parentSessionId,
+    actor_role: event.actorRole,
+    agent_id: event.agentId,
+    client_instance_id: event.clientInstanceId,
+    correlation_id: event.correlationId,
+    causation_id: event.causationId,
+    command_id: event.commandId,
+    idempotency_key: event.idempotencyKey,
+    command_event_index: event.commandEventIndex,
+    occurred_at: event.occurredAt,
+    recorded_at: event.recordedAt,
+    visibility_scope: event.visibilityScope,
+    confidence: event.confidence,
+    verification_status: event.verificationStatus,
+    source_refs_json: canonicalJson(event.sourceRefs),
+    evidence_refs_json: canonicalJson(event.evidenceRefs),
+    evidence_digests_json: canonicalJson(event.evidenceDigests),
+    payload_json: event.payloadJson,
+    payload_hash: event.payloadHash,
+    previous_global_hash: event.previousGlobalHash,
+    event_hash: event.eventHash,
+    lifecycle_intent_json: event.lifecycleIntentJson ?? null,
+  };
+  const columns = Object.keys(values);
+  connection.prepare(`
+    INSERT INTO events(${columns.join(", ")})
+    VALUES (${columns.map((column) => `$${column}`).join(", ")})
+  `).run(Object.fromEntries(
+    columns.map((column) => [`$${column}`, values[column]!]),
+  ) as SqliteParams);
+}
+
+function immutableProjectionBatch(
+  events: readonly StoredEvent[],
+): EventAppendBatch<JsonValue> {
+  const ordered = [...events].sort((left, right) =>
+    left.globalPosition < right.globalPosition ? -1 : 1);
+  return Object.freeze({
+    events: Object.freeze([...events]),
+    storedResponse: Object.freeze({
+      eventIds: Object.freeze(ordered.map((event) => event.eventId)),
+      firstGlobalPosition: ordered[0]!.globalPosition.toString(),
+      lastGlobalPosition: ordered.at(-1)!.globalPosition.toString(),
+      finalStreamVersion: ordered.at(-1)!.streamVersion.toString(),
+      response: Object.freeze({ projected: true }),
+    }),
+    responseHash: "d".repeat(64),
+  }) as EventAppendBatch<JsonValue>;
+}
+
+function projectionTransaction(): LifecycleCommandTransaction {
+  return {
+    authority: {},
+    leases: {},
+    approvals: {},
+    transfers: {},
+    coverage: healthyCoverageFacade(),
+    workflows: {},
+    validation: {},
+    outbox: {},
+  };
+}
+
+function workflowCheckpointDraft(): Readonly<Record<string, unknown>> {
+  return Object.freeze({
+    checkpointVersion: 2,
+    taskSummary: "projection writer",
+    completedItems: Object.freeze([]),
+    inProgressItems: Object.freeze([]),
+    blockers: Object.freeze([]),
+    nextActions: Object.freeze([]),
+    decisions: Object.freeze([]),
+    assumptions: Object.freeze([]),
+    unresolvedConflicts: Object.freeze([]),
+    filesTouched: Object.freeze([]),
+    artifactReferences: Object.freeze([]),
+    sourceReferences: Object.freeze([]),
+    commandResults: Object.freeze([]),
+    testResults: Object.freeze([]),
+    materialClaims: Object.freeze([]),
+  });
+}
+
+function workflowIntentSource(
+  command: Parameters<typeof buildLifecycleIntentWitness>[0],
+): string {
+  return buildLifecycleIntentWitness(command, {
+    authorizationKind: "protected",
+    authorizationSessionId: PROJECTION_ROOT_ID,
+    targetSessionId: PROJECTION_ROOT_ID,
+    projectId: PROJECTION_PROJECT_ID,
+    vaultId: PROJECTION_VAULT_ID,
+    storeId: PROJECTION_STORE_ID,
+    workspaceId: PROJECTION_WORKSPACE_ID,
+    clientNamespace: "tests",
+    capabilityKind: "root-session-handle",
+    capabilityGeneration: "1",
+    presentingActorRole: "primary",
+    presentingClientInstanceId: "client-primary",
+    targetActorRole: "primary",
+    targetClientInstanceId: "client-primary",
+    internalWorkflowId: null,
+    internalWorkflowGeneration: null,
+    internalPlannedWorkId: null,
+  }).source;
+}
+
+function workflowProjectionEvent(
+  position: number,
+  streamVersion: number,
+  eventType:
+    | "SessionEndRequested"
+    | "SessionEndAmended"
+    | "SessionEndCancelled"
+    | "SessionAbandoned",
+  eventSchemaVersion: 1 | 2,
+  payload: Readonly<Record<string, JsonValue>>,
+  command: Parameters<typeof buildLifecycleIntentWitness>[0],
+): StoredEvent {
+  const immutablePayload = Object.freeze({ ...payload });
+  const source = lifecycleEvent(position, eventType, immutablePayload as never, {
+    globalPosition: position,
+    streamVersion,
+    sessionId: PROJECTION_ROOT_ID,
+    parentSessionId: null,
+    workspaceId: PROJECTION_WORKSPACE_ID,
+  });
+  return projectionStored(source, {
+    eventType,
+    eventSchemaVersion,
+    streamId: `session/${PROJECTION_ROOT_ID}`,
+    streamVersion: BigInt(streamVersion),
+    sessionId: PROJECTION_ROOT_ID,
+    parentSessionId: null,
+    commandId: command.commandId,
+    idempotencyKey: command.idempotencyKey,
+    payload: immutablePayload as never,
+    payloadJson: canonicalJson(immutablePayload),
+    lifecycleIntentJson: workflowIntentSource(command),
+  });
+}
+
+function reportEvent(position: number, reportOrdinal: number): {
+  readonly event: StoredEvent;
+  readonly reportId: ReturnType<typeof childReportFixture>["reportId"];
+} {
+  const report = childReportFixture({
+    reportId: lifecycleUuid<ReturnType<typeof childReportFixture>["reportId"]>(
+      reportOrdinal,
+    ),
+    childSessionId: PROJECTION_CHILD_ID,
+    parentSessionId: PROJECTION_ROOT_ID,
+  });
+  const { allReportItemIds: _derived, ...unfrozenPersistedReport } = report;
+  const persistedReport = Object.freeze(unfrozenPersistedReport);
+  return {
+    event: projectionStored(lifecycleEvent(position, "ChildWorkReported", {
+      report: persistedReport as never,
+    }, {
+      streamVersion: position,
+      globalPosition: position,
+      sessionId: PROJECTION_CHILD_ID,
+      parentSessionId: PROJECTION_ROOT_ID,
+      workspaceId: PROJECTION_WORKSPACE_ID,
+    })),
+    reportId: report.reportId,
   };
 }
 
@@ -416,6 +675,282 @@ afterEach(() => {
     try { connection.close(); } catch { /* cleanup continues */ }
   }
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+});
+
+it("lifecycle projection writer processes a multi-event batch in ascending position", () => {
+  const connection = projectionFixture();
+  const commandId = lifecycleUuid(91_000);
+  const idempotencyKey = "projection/multi-event";
+  const fork = projectionStored(lifecycleEvent(1, "SessionForked"), {
+    commandId,
+    idempotencyKey,
+    commandEventIndex: 0,
+  });
+  const amended = projectionStored(lifecycleEvent(2, "ChildAssignmentAmended"), {
+    commandId,
+    idempotencyKey,
+    commandEventIndex: 1,
+  });
+  insertProjectionEvent(connection, fork);
+  insertProjectionEvent(connection, amended);
+  const repository = new SqliteLifecycleProjectionRepository(connection);
+
+  connection.exec("BEGIN IMMEDIATE");
+  repository.append(
+    immutableProjectionBatch([amended, fork]),
+    projectionTransaction(),
+  );
+  connection.exec("COMMIT");
+
+  assert.deepEqual(
+    connection.prepare(`
+      SELECT event_position, stream_version
+      FROM lifecycle_child_event_folds
+      ORDER BY event_position
+    `).all().map((row) => ({
+      event_position: row.event_position,
+      stream_version: row.stream_version,
+    })),
+    [
+      { event_position: 1n, stream_version: 1n },
+      { event_position: 2n, stream_version: 2n },
+    ],
+  );
+  assert.equal(
+    repository.findChildByStreamVersion(
+      PROJECTION_PROJECT_ID,
+      PROJECTION_CHILD_ID,
+      2n,
+    )?.eventPosition,
+    2n,
+  );
+});
+
+it("lifecycle projection writer resolves a non-latest report witness by its partial-unique key", () => {
+  const connection = projectionFixture();
+  const fork = projectionStored(lifecycleEvent(1, "SessionForked"));
+  const reportA = reportEvent(2, 90_001);
+  const reportB = reportEvent(3, 90_002);
+  const reportC = reportEvent(4, 90_003);
+  const proposal = projectionStored(lifecycleEvent(5, "ChildCompletionProposed", {
+    reportId: reportA.reportId as never,
+  }));
+  const events = [fork, reportA.event, reportB.event, reportC.event, proposal];
+  for (const event of events) insertProjectionEvent(connection, event);
+  const repository = new SqliteLifecycleProjectionRepository(connection);
+
+  for (const event of events) {
+    connection.exec("BEGIN IMMEDIATE");
+    repository.append(immutableProjectionBatch([event]), projectionTransaction());
+    connection.exec("COMMIT");
+  }
+
+  const projected = repository.findChildAtEvent(
+    PROJECTION_PROJECT_ID,
+    PROJECTION_CHILD_ID,
+    5n,
+  );
+  assert.equal(projected?.completionReportId, reportA.reportId);
+  assert.equal(projected?.latestReportId, reportC.reportId);
+  assert.equal(
+    repository.findReportWitness(
+      PROJECTION_PROJECT_ID,
+      PROJECTION_CHILD_ID,
+      reportA.reportId,
+    )?.eventPosition,
+    2n,
+  );
+});
+
+it("lifecycle projection writer persists every workflow generation and unchanged null carry", () => {
+  const base = (commandId: string, idempotencyKey: string) => ({
+    commandId,
+    idempotencyKey,
+    agentId: "agent-primary",
+    expectedProjectId: PROJECTION_PROJECT_ID,
+    expectedVaultId: PROJECTION_VAULT_ID,
+    expectedWorkspaceId: PROJECTION_WORKSPACE_ID,
+    expectedBranchRef: null,
+  });
+  const requestOne = {
+    ...base(lifecycleUuid(92_001), "projection/workflow/request-1"),
+    commandType: "request-session-end" as const,
+    request: {
+      requestVersion: 2 as const,
+      sessionId: PROJECTION_ROOT_ID,
+      childEndPolicy: "require-completed" as const,
+      finalCheckpoint: workflowCheckpointDraft() as never,
+      validationProfileIds: Object.freeze([]),
+      requestedQualityThreshold: 0,
+      requireFullEvidence: false,
+      requireMaterialization: false,
+    },
+  };
+  const amendment = {
+    ...base(lifecycleUuid(92_002), "projection/workflow/amend"),
+    commandType: "amend-session-end" as const,
+    sessionId: PROJECTION_ROOT_ID,
+    workflowId: PROJECTION_WORKFLOW_ID,
+    expectedStreamVersion: "2",
+    amendment: {
+      amendmentVersion: 2 as const,
+      childEndPolicy: null,
+      finalCheckpoint: null,
+      validationProfileIds: null,
+      requestedQualityThreshold: null,
+      requireFullEvidence: null,
+      requireMaterialization: true,
+      evidenceWindowAction: "unchanged" as const,
+    },
+  };
+  const cancel = {
+    ...base(lifecycleUuid(92_003), "projection/workflow/cancel"),
+    commandType: "cancel-session-end" as const,
+    sessionId: PROJECTION_ROOT_ID,
+    workflowId: PROJECTION_WORKFLOW_ID,
+    expectedStreamVersion: "3",
+    preTransitionCheckpointId: PROJECTION_CHECKPOINT_ID,
+  };
+  const requestTwo = {
+    ...base(lifecycleUuid(92_004), "projection/workflow/request-2"),
+    commandType: "request-session-end" as const,
+    request: {
+      ...requestOne.request,
+      finalCheckpoint: workflowCheckpointDraft() as never,
+    },
+  };
+  const abandon = {
+    ...base(lifecycleUuid(92_005), "projection/workflow/abandon"),
+    commandType: "abandon-session" as const,
+    sessionId: PROJECTION_ROOT_ID,
+    expectedStreamVersion: "5",
+    preTransitionCheckpointId: PROJECTION_CHECKPOINT_ID,
+    reasonCode: "explicit-user-approval",
+  };
+  const events = [
+    workflowProjectionEvent(10, 2, "SessionEndRequested", 2, {
+      workflowId: PROJECTION_WORKFLOW_ID,
+      workflowGeneration: 1,
+      previousState: "active",
+      childEndPolicy: "require-completed",
+      qualityThreshold: 0,
+      requireFullEvidence: false,
+      requireMaterialization: false,
+      requestVersion: 2,
+    }, requestOne),
+    workflowProjectionEvent(11, 3, "SessionEndAmended", 2, {
+      workflowId: PROJECTION_WORKFLOW_ID,
+      previousWorkflowGeneration: 1,
+      workflowGeneration: 2,
+      preTransitionCheckpointId: PROJECTION_CHECKPOINT_ID,
+      amendmentVersion: 2,
+      finalCheckpointVersion: null,
+      evidenceWindowAction: "unchanged",
+    }, amendment),
+    workflowProjectionEvent(12, 4, "SessionEndCancelled", 1, {
+      workflowId: PROJECTION_WORKFLOW_ID,
+      workflowGeneration: 3,
+      restoredState: "active",
+      preTransitionCheckpointId: PROJECTION_CHECKPOINT_ID,
+    }, cancel),
+    workflowProjectionEvent(13, 5, "SessionEndRequested", 2, {
+      workflowId: PROJECTION_WORKFLOW_ID,
+      workflowGeneration: 4,
+      previousState: "active",
+      childEndPolicy: "require-completed",
+      qualityThreshold: 0,
+      requireFullEvidence: false,
+      requireMaterialization: false,
+      requestVersion: 2,
+    }, requestTwo),
+    workflowProjectionEvent(14, 6, "SessionAbandoned", 1, {
+      workflowId: PROJECTION_WORKFLOW_ID,
+      workflowGeneration: 5,
+      approvalId: PROJECTION_APPROVAL_ID,
+      preTransitionCheckpointId: PROJECTION_CHECKPOINT_ID,
+      reasonCode: "explicit-user-approval",
+      authorityCommitment: "a".repeat(64),
+    }, abandon),
+  ];
+  const connection = projectionFixture();
+  const repository = new SqliteLifecycleProjectionRepository(connection);
+  for (const event of events) insertProjectionEvent(connection, event);
+
+  for (const event of events) {
+    connection.exec("BEGIN IMMEDIATE");
+    repository.append(immutableProjectionBatch([event]), projectionTransaction());
+    connection.exec("COMMIT");
+  }
+
+  assert.deepEqual(connection.prepare(`
+    SELECT workflow_generation, evidence_window_state,
+           replacement_checkpoint_version, effective_checkpoint_version,
+           effective_draft_source_event_position
+    FROM lifecycle_workflow_generation_folds
+    ORDER BY workflow_generation
+  `).all().map((row) => ({
+    generation: Number(row.workflow_generation),
+    state: row.evidence_window_state,
+    replacement: row.replacement_checkpoint_version === null
+      ? null
+      : Number(row.replacement_checkpoint_version),
+    effective: Number(row.effective_checkpoint_version),
+    source: row.effective_draft_source_event_position,
+  })), [
+    { generation: 1, state: "open", replacement: 2, effective: 2, source: 10n },
+    { generation: 2, state: "open", replacement: null, effective: 2, source: 10n },
+    { generation: 3, state: "sealed", replacement: null, effective: 2, source: 10n },
+    { generation: 4, state: "open", replacement: 2, effective: 2, source: 13n },
+    { generation: 5, state: "sealed", replacement: null, effective: 2, source: 13n },
+  ]);
+});
+
+it("schema 3 projects existing version 1 lifecycle writes", () => {
+  const connection = projectionFixture();
+  const fork = projectionStored(lifecycleEvent(1, "SessionForked"));
+  insertProjectionEvent(connection, fork);
+  const repository = new SqliteLifecycleProjectionRepository(connection);
+  connection.exec("BEGIN IMMEDIATE");
+  repository.append(immutableProjectionBatch([fork]), projectionTransaction());
+  connection.exec("COMMIT");
+  assert.equal(
+    connection.prepare("SELECT schema_version FROM project_meta").get()?.schema_version,
+    3n,
+  );
+  assert.equal(
+    connection.prepare("SELECT count(*) AS count FROM lifecycle_child_event_folds").get()?.count,
+    1n,
+  );
+});
+
+it("lifecycle projection writer rejects committed drift from the persisted event", () => {
+  const connection = projectionFixture();
+  const persisted = projectionStored(lifecycleEvent(1, "SessionForked"));
+  const drifted = Object.freeze({
+    ...persisted,
+    eventHash: "d".repeat(64),
+  });
+  insertProjectionEvent(connection, persisted);
+  const repository = new SqliteLifecycleProjectionRepository(connection);
+
+  connection.exec("BEGIN IMMEDIATE");
+  assert.throws(
+    () => repository.append(
+      immutableProjectionBatch([drifted]),
+      projectionTransaction(),
+    ),
+    (error: unknown) => typeof error === "object"
+      && error !== null
+      && "code" in error
+      && error.code === "INTEGRITY_FAILURE",
+  );
+  connection.exec("ROLLBACK");
+  assert.equal(
+    connection.prepare(
+      "SELECT count(*) AS count FROM lifecycle_child_event_folds",
+    ).get()?.count,
+    0n,
+  );
 });
 
 it("never owns transaction statements while appending a prepared Version 1 batch", () => {
@@ -532,6 +1067,7 @@ it("treats historical lifecycle dedup without target authority as integrity fail
   const store = new LifecycleCommandStore({
     connection,
     events: tx,
+    projectionWriter: new SqliteLifecycleProjectionRepository(connection),
     transaction: () => {
       facadeCalls += 1;
       return {
@@ -677,6 +1213,7 @@ it("runs LifecycleCommandStore through the real primitive and replays before onN
   const store = new LifecycleCommandStore({
     connection,
     events: tx,
+    projectionWriter: new SqliteLifecycleProjectionRepository(connection),
     transaction: () => focused,
     now: () => NOW,
     authorityMaterialStatus: () => "stale",
@@ -747,6 +1284,7 @@ it("runs LifecycleCommandStore through the real primitive and replays before onN
     const guardedStore = new LifecycleCommandStore({
       connection,
       events: tx,
+      projectionWriter: new SqliteLifecycleProjectionRepository(connection),
       transaction: () => {
         facadeCalls += 1;
         return focused;

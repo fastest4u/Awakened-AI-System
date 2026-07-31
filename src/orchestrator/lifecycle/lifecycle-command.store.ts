@@ -22,6 +22,9 @@ import type {
   PreparedEvidenceCoverageBatch,
 } from "../storage/evidence-coverage.repository.js";
 import { EvidenceCoverageRepository } from "../storage/evidence-coverage.repository.js";
+import type {
+  LifecycleProjectionWriter,
+} from "../storage/lifecycle-projection.repository.js";
 import { canonicalJson } from "../serialization/canonical-json.js";
 import type { StoredEvent } from "../contracts/event.js";
 import type {
@@ -193,6 +196,8 @@ export interface LifecycleEventAppendPort {
 export interface LifecycleCommandStoreOptions {
   readonly connection: SqliteConnection;
   readonly events: LifecycleEventAppendPort;
+  /** Store-owned projection persistence; must be an explicit own data property. */
+  readonly projectionWriter: LifecycleProjectionWriter;
   /** Facade capabilities must be explicit own data properties; prototypes/accessors are excluded. */
   readonly transaction: (connection: SqliteConnection) => LifecycleCommandTransaction;
   /** Optional schema-3 coverage repository; kept production-unwired until lifecycle V2 routing lands. */
@@ -1708,14 +1713,31 @@ function callbackRequiredAffectedSessionIds<T extends JsonValue>(
 export class LifecycleCommandStore {
   readonly #connection: SqliteConnection;
   readonly #events: LifecycleEventAppendPort;
+  readonly #projectionWriter: LifecycleProjectionWriter;
   readonly #transaction: (connection: SqliteConnection) => LifecycleCommandTransaction;
   readonly #coverageRepository: EvidenceCoverageRepository | undefined;
   readonly #now: () => string;
   readonly #materialStatus: NonNullable<LifecycleCommandStoreOptions["authorityMaterialStatus"]>;
 
   constructor(options: LifecycleCommandStoreOptions) {
+    const projectionWriterDescriptor = Reflect.getOwnPropertyDescriptor(
+      options,
+      "projectionWriter",
+    );
+    if (
+      projectionWriterDescriptor === undefined
+      || !("value" in projectionWriterDescriptor)
+      || typeof projectionWriterDescriptor.value !== "object"
+      || projectionWriterDescriptor.value === null
+      || typeof (projectionWriterDescriptor.value as LifecycleProjectionWriter).append
+        !== "function"
+    ) {
+      throw new LifecycleCommandStoreError("INTEGRITY_FAILURE");
+    }
     this.#connection = options.connection;
     this.#events = options.events;
+    this.#projectionWriter =
+      projectionWriterDescriptor.value as LifecycleProjectionWriter;
     this.#transaction = options.transaction;
     this.#coverageRepository = options.evidenceCoverageRepository;
     this.#now = options.now ?? (() => new Date().toISOString());
@@ -1818,6 +1840,12 @@ export class LifecycleCommandStore {
         throw new LifecycleCommandStoreError("INTEGRITY_FAILURE");
       }
       assertAppendIdentity(resolvedEnvelope, next);
+      invokeSynchronousTransactionCallback(focused, (transaction) =>
+        this.#projectionWriter.append(
+          immutableBatchSnapshot(committed),
+          transaction,
+        ), undefinedCallbackResult);
+      assertBatchUnchanged(committed, committedFingerprint);
       this.#events.insertDedup(prepared, committed, next.authorizationRecord);
       const authorityMaterialStatus = materialStatusResult(synchronousCallbackResult(
         this.#materialStatus(next.authorizationRecord),

@@ -44,6 +44,9 @@ import type {
   PreparedEventAppend,
 } from "../src/orchestrator/storage/event-append-transaction.js";
 import type { SqliteConnection, SqliteStatement } from "../src/orchestrator/storage/sqlite-driver.js";
+import type {
+  LifecycleProjectionWriter,
+} from "../src/orchestrator/storage/lifecycle-projection.repository.js";
 import {
   checkpointFixture,
   qualifiedCheckpointFixture,
@@ -58,6 +61,10 @@ const EXPECTED_RISKY_TRANSITIONS = Object.freeze([
   "end-cancellation",
   "abandonment",
 ] as const);
+
+function recordingProjectionWriter(): LifecycleProjectionWriter {
+  return Object.freeze({ append: () => undefined });
+}
 
 interface CheckpointServiceLike {
   record(transaction: unknown, command: unknown): {
@@ -1865,6 +1872,7 @@ describe("CheckpointService transactional enrichment", () => {
         const store = new LifecycleCommandStore({
           connection,
           events,
+          projectionWriter: recordingProjectionWriter(),
           transaction: () => {
             transactionConstructions += 1;
             throw new Error("replay must not construct a transaction facade");
@@ -1910,6 +1918,7 @@ describe("CheckpointService transactional enrichment", () => {
         const store = new LifecycleCommandStore({
           connection,
           events,
+          projectionWriter: recordingProjectionWriter(),
           transaction: () => completeCheckpointTransaction(freshFixture.harness),
           now: () => CREATED_AT,
         });
@@ -1991,6 +2000,7 @@ describe("CheckpointService transactional enrichment", () => {
       const store = new LifecycleCommandStore({
         connection,
         events,
+        projectionWriter: recordingProjectionWriter(),
         transaction: () => completeCheckpointTransaction(fixture.harness),
         now: () => CREATED_AT,
       });
@@ -2077,6 +2087,7 @@ describe("CheckpointService transactional enrichment", () => {
       const store = new LifecycleCommandStore({
         connection,
         events,
+        projectionWriter: recordingProjectionWriter(),
         transaction: () => { throw new Error("exact replay must not construct transaction facades"); },
       });
       const envelope: LifecycleCommandEnvelope = {

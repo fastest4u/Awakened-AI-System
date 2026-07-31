@@ -58,6 +58,9 @@ import type {
 } from "../src/orchestrator/storage/sqlite-driver.js";
 import { applyCurrentProjectStoreSchema } from "./support/current-project-store-schema.js";
 import {
+  SqliteLifecycleProjectionRepository,
+} from "../src/orchestrator/storage/lifecycle-projection.repository.js";
+import {
   checkpointFixture,
   lifecycleEvent,
 } from "./support/lifecycle-fixtures.js";
@@ -74,6 +77,19 @@ const H64 = "a".repeat(64);
 const FRAME_H64 = "b".repeat(64);
 const roots: string[] = [];
 const connections: SqliteConnection[] = [];
+
+function projectionSeedTransaction(): LifecycleCommandTransaction {
+  return {
+    authority: {},
+    leases: {},
+    approvals: {},
+    transfers: {},
+    coverage: {} as LifecycleCommandTransaction["coverage"],
+    workflows: {},
+    validation: {},
+    outbox: {},
+  };
+}
 
 function database(): SqliteConnection {
   const root = mkdtempSync(join(tmpdir(), "evidence-coverage-"));
@@ -571,6 +587,56 @@ function seedChildAuthorityForForeignKeys(
     connection,
     childAuthority,
   );
+  const storedFork = Object.freeze({
+    globalPosition: 2n,
+    eventId: fork.eventId,
+    projectId: PROJECT_ID,
+    vaultId: VAULT_ID,
+    storeId: STORE_ID,
+    workspaceId: "c".repeat(64),
+    branchScopeId: null,
+    branchRef: null,
+    streamId: fork.streamId,
+    streamType: "session",
+    streamVersion: 1n,
+    eventType: fork.eventType,
+    eventSchemaVersion: 1,
+    sessionId: childSessionId,
+    parentSessionId: rootSessionId,
+    actorRole: "primary",
+    agentId: "agent-1",
+    clientInstanceId: "client-1",
+    correlationId: fork.correlationId,
+    causationId: null,
+    commandId: fork.commandId,
+    idempotencyKey: fork.idempotencyKey,
+    commandEventIndex: 0,
+    occurredAt: fork.occurredAt,
+    recordedAt: NOW,
+    visibilityScope: "session",
+    confidence: "high",
+    verificationStatus: "verified",
+    sourceRefs: Object.freeze([]),
+    evidenceRefs: Object.freeze([]),
+    evidenceDigests: Object.freeze([]),
+    payload: fork.payload,
+    payloadJson: canonicalJson(fork.payload),
+    payloadHash: H64,
+    previousGlobalHash: H64,
+    eventHash: H64,
+    lifecycleIntentJson: null,
+  }) as unknown as StoredEvent;
+  new SqliteLifecycleProjectionRepository(connection).append(Object.freeze({
+    events: Object.freeze([storedFork]),
+    storedResponse: Object.freeze({
+      eventIds: Object.freeze([storedFork.eventId]),
+      firstGlobalPosition: "2",
+      lastGlobalPosition: "2",
+      finalStreamVersion: "1",
+      response: Object.freeze({ seeded: true }),
+    }),
+    responseHash: H64,
+  }), projectionSeedTransaction());
 }
 
 function seedTransferredChildTicket(
@@ -1091,6 +1157,7 @@ function realEvidenceStoreFixture(
   const store = new LifecycleCommandStore({
     connection,
     events,
+    projectionWriter: new SqliteLifecycleProjectionRepository(connection),
     transaction: () => ({
       authority: {
         nextGlobalPosition: () => (

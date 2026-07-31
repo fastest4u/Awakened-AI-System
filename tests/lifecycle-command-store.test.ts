@@ -45,6 +45,9 @@ import {
   internalValidationPlannedWorkId,
 } from "../src/orchestrator/crypto/event-hash.js";
 import { canonicalJson } from "../src/orchestrator/serialization/canonical-json.js";
+import type {
+  LifecycleProjectionWriter,
+} from "../src/orchestrator/storage/lifecycle-projection.repository.js";
 
 const NOW = "2026-07-14T00:00:00.000Z";
 const CONTEXT = {
@@ -151,7 +154,10 @@ class TransactionConnection implements SqliteConnection {
   readonly committed: string[] = [];
   #pending: string[] = [];
 
-  constructor(readonly failCommit = false) {}
+  constructor(
+    readonly failCommit = false,
+    readonly order?: string[],
+  ) {}
 
   stage(effect: string): void { this.#pending.push(effect); }
 
@@ -164,6 +170,7 @@ class TransactionConnection implements SqliteConnection {
       if (this.failCommit) throw { errcode: 10 };
       this.committed.push(...this.#pending);
       this.#pending = [];
+      this.order?.push("commit");
     } else if (normalized === "ROLLBACK") {
       this.#pending = [];
     }
@@ -246,7 +253,10 @@ class FakeEvents implements LifecycleEventAppendPort {
   readonly insertedAuthorizations: PersistedLifecycleAuthorizationRecord[] = [];
   replay: EventAppendReplay<JsonValue> | null = null;
 
-  constructor(readonly connection: TransactionConnection) {}
+  constructor(
+    readonly connection: TransactionConnection,
+    readonly order?: string[],
+  ) {}
 
   findLifecycleReplay<T extends JsonValue>(
     _command: LifecycleCommandEnvelope,
@@ -288,6 +298,7 @@ class FakeEvents implements LifecycleEventAppendPort {
 
   appendPlanned<T extends JsonValue>(planned: PlannedEventAppend<T>): EventAppendBatch<T> {
     this.calls.push("append");
+    this.order?.push("append");
     this.connection.stage("event");
     return planned;
   }
@@ -298,6 +309,7 @@ class FakeEvents implements LifecycleEventAppendPort {
     record: PersistedLifecycleAuthorizationRecord,
   ): void {
     this.calls.push("dedup");
+    this.order?.push("dedup");
     this.insertedAuthorizations.push(record);
     this.connection.stage("dedup");
   }
@@ -490,6 +502,12 @@ function transaction(connection: TransactionConnection): LifecycleCommandTransac
   };
 }
 
+function recordingProjectionWriter(
+  append: LifecycleProjectionWriter["append"] = () => undefined,
+): LifecycleProjectionWriter {
+  return Object.freeze({ append });
+}
+
 function stage(facade: object, effect: string): void {
   (facade as { stage(value: string): void }).stage(effect);
 }
@@ -508,6 +526,104 @@ function isLifecycleInputInvalid(error: unknown): boolean {
 }
 
 describe("LifecycleCommandStore", () => {
+  it("lifecycle command store writes projections after service postwrites and before dedup", () => {
+    const order: string[] = [];
+    const connection = new TransactionConnection(false, order);
+    const events = new FakeEvents(connection, order);
+    const projectionWriter = recordingProjectionWriter((committed, current) => {
+      order.push("projection append");
+      assertDeeplyFrozen(committed);
+      stage(current.authority, "projection");
+    });
+    const store = new LifecycleCommandStore({
+      connection,
+      events,
+      projectionWriter,
+      transaction: () => transaction(connection),
+      now: () => NOW,
+    });
+
+    store.execute(envelope(), () => ({
+      append: appendCommand(),
+      authorizationRecord: authorization(),
+      beforeAppend: () => {
+        order.push("beforeAppend");
+        return undefined;
+      },
+      afterAppend: (_committed, current) => {
+        order.push("service afterAppend");
+        stage(current.authority, "service");
+      },
+    }));
+
+    assert.deepEqual(order, [
+      "beforeAppend",
+      "append",
+      "service afterAppend",
+      "projection append",
+      "dedup",
+      "commit",
+    ]);
+    assert.deepEqual(connection.committed, ["event", "service", "projection", "dedup"]);
+  });
+
+  it("lifecycle command replay performs no projection write", () => {
+    const connection = new TransactionConnection();
+    const events = new FakeEvents(connection);
+    let projectionCalls = 0;
+    const store = new LifecycleCommandStore({
+      connection,
+      events,
+      projectionWriter: recordingProjectionWriter(() => {
+        projectionCalls += 1;
+      }),
+      transaction: () => transaction(connection),
+      now: () => NOW,
+    });
+    store.execute(envelope(), () => ({
+      append: appendCommand(),
+      authorizationRecord: authorization(),
+      afterAppend: () => undefined,
+    }));
+    assert.equal(projectionCalls, 1);
+
+    events.replay = replayResult();
+    store.execute(envelope(), () => {
+      throw new Error("replay must not enter fresh work");
+    });
+    assert.equal(projectionCalls, 1);
+  });
+
+  it("lifecycle projection failure rolls back events service state and dedup atomically", () => {
+    const connection = new TransactionConnection();
+    const events = new FakeEvents(connection);
+    const store = new LifecycleCommandStore({
+      connection,
+      events,
+      projectionWriter: recordingProjectionWriter((_committed, current) => {
+        stage(current.authority, "projection");
+        throw new LifecycleCommandStoreError("INTEGRITY_FAILURE");
+      }),
+      transaction: () => transaction(connection),
+      now: () => NOW,
+    });
+
+    assert.throws(
+      () => store.execute(envelope(), () => ({
+        append: appendCommand(),
+        authorizationRecord: authorization(),
+        afterAppend: (_committed, current) => {
+          stage(current.authority, "service");
+        },
+      })),
+      (error: unknown) => error instanceof LifecycleCommandStoreError
+        && error.code === "INTEGRITY_FAILURE",
+    );
+    assert.deepEqual(connection.committed, []);
+    assert.equal(events.calls.includes("dedup"), false);
+    assert.deepEqual(connection.statements.slice(-2), ["BEGIN IMMEDIATE", "ROLLBACK"]);
+  });
+
   it("returns replay before window health provider or repository access", () => {
     const evidenceCommand: RecordEvidenceBatchCommandV2 = {
       commandType: "record-evidence-batch",
@@ -551,6 +667,7 @@ describe("LifecycleCommandStore", () => {
     const store = new LifecycleCommandStore({
       connection,
       events,
+      projectionWriter: recordingProjectionWriter(),
       transaction: () => {
         const tx = transaction(connection);
         return {
@@ -590,6 +707,7 @@ describe("LifecycleCommandStore", () => {
     const store = new LifecycleCommandStore({
       connection,
       events,
+      projectionWriter: recordingProjectionWriter(),
       transaction: () => ({
         ...transaction(connection),
         coverage: {} as never,
@@ -621,6 +739,7 @@ describe("LifecycleCommandStore", () => {
     const store = new LifecycleCommandStore({
       connection,
       events,
+      projectionWriter: recordingProjectionWriter(),
       transaction: () => {
         const tx = transaction(connection);
         return {
@@ -681,6 +800,7 @@ describe("LifecycleCommandStore", () => {
     const store = new LifecycleCommandStore({
       connection,
       events,
+      projectionWriter: recordingProjectionWriter(),
       transaction: () => {
         const tx = transaction(connection);
         return {
@@ -725,6 +845,7 @@ describe("LifecycleCommandStore", () => {
     const store = new LifecycleCommandStore({
       connection,
       events,
+      projectionWriter: recordingProjectionWriter(),
       transaction: () => {
         const tx = transaction(connection);
         return {
@@ -827,6 +948,7 @@ describe("LifecycleCommandStore", () => {
     const store = new LifecycleCommandStore({
       connection,
       events,
+      projectionWriter: recordingProjectionWriter(),
       transaction: () => transaction(connection),
       now: () => NOW,
     });
@@ -919,6 +1041,7 @@ describe("LifecycleCommandStore", () => {
     const store = new LifecycleCommandStore({
       connection,
       events,
+      projectionWriter: recordingProjectionWriter(),
       transaction: () => transaction(connection),
       now: () => NOW,
     });
@@ -940,6 +1063,7 @@ describe("LifecycleCommandStore", () => {
     const store = new LifecycleCommandStore({
       connection,
       events,
+      projectionWriter: recordingProjectionWriter(),
       transaction: () => transaction(connection),
       now: () => NOW,
     });
@@ -967,6 +1091,7 @@ describe("LifecycleCommandStore", () => {
     const store = new LifecycleCommandStore({
       connection,
       events,
+      projectionWriter: recordingProjectionWriter(),
       transaction: () => {
         assert.deepEqual(events.calls, ["find-replay"]);
         return transaction(connection);
@@ -1004,6 +1129,7 @@ describe("LifecycleCommandStore", () => {
     const store = new LifecycleCommandStore({
       connection,
       events,
+      projectionWriter: recordingProjectionWriter(),
       transaction: () => transaction(connection),
       now: () => NOW,
     });
@@ -1061,6 +1187,7 @@ describe("LifecycleCommandStore", () => {
     const replayStore = new LifecycleCommandStore({
       connection: replayConnection,
       events: replayEvents,
+      projectionWriter: recordingProjectionWriter(),
       transaction: () => {
         replayTransactionFactoryCalls += 1;
         return transaction(replayConnection);
@@ -1089,6 +1216,7 @@ describe("LifecycleCommandStore", () => {
     const freshStore = new LifecycleCommandStore({
       connection: freshConnection,
       events: freshEvents,
+      projectionWriter: recordingProjectionWriter(),
       transaction: () => transaction(freshConnection),
       now: () => NOW,
     });
@@ -1116,6 +1244,7 @@ describe("LifecycleCommandStore", () => {
     const store = new LifecycleCommandStore({
       connection,
       events,
+      projectionWriter: recordingProjectionWriter(),
       transaction: () => tx,
       now: () => NOW,
       authorityMaterialStatus: () => "current",
@@ -1157,6 +1286,7 @@ describe("LifecycleCommandStore", () => {
     const store = new LifecycleCommandStore({
       connection,
       events,
+      projectionWriter: recordingProjectionWriter(),
       transaction: () => raw,
       now: () => NOW,
     });
@@ -1179,6 +1309,7 @@ describe("LifecycleCommandStore", () => {
     const store = new LifecycleCommandStore({
       connection,
       events,
+      projectionWriter: recordingProjectionWriter(),
       transaction: () => transaction(connection),
       now: () => NOW,
     });
@@ -1206,6 +1337,7 @@ describe("LifecycleCommandStore", () => {
     const store = new LifecycleCommandStore({
       connection,
       events,
+      projectionWriter: recordingProjectionWriter(),
       transaction: () => transaction(connection),
       now: () => NOW,
     });
@@ -1225,6 +1357,7 @@ describe("LifecycleCommandStore", () => {
     const store = new LifecycleCommandStore({
       connection,
       events,
+      projectionWriter: recordingProjectionWriter(),
       transaction: () => transaction(connection),
       now: () => NOW,
     });
@@ -1252,6 +1385,7 @@ describe("LifecycleCommandStore", () => {
     const store = new LifecycleCommandStore({
       connection,
       events,
+      projectionWriter: recordingProjectionWriter(),
       transaction: () => transaction(connection),
       now: () => NOW,
     });
@@ -1281,6 +1415,7 @@ describe("LifecycleCommandStore", () => {
     const store = new LifecycleCommandStore({
       connection,
       events,
+      projectionWriter: recordingProjectionWriter(),
       transaction: () => transaction(connection),
       now: () => NOW,
     });
@@ -1309,6 +1444,7 @@ describe("LifecycleCommandStore", () => {
     const store = new LifecycleCommandStore({
       connection,
       events,
+      projectionWriter: recordingProjectionWriter(),
       transaction: () => transaction(connection),
       now: () => NOW,
     });
@@ -1338,6 +1474,7 @@ describe("LifecycleCommandStore", () => {
     const store = new LifecycleCommandStore({
       connection,
       events,
+      projectionWriter: recordingProjectionWriter(),
       transaction: () => tx,
       now: () => NOW,
     });
@@ -1363,6 +1500,7 @@ describe("LifecycleCommandStore", () => {
     const store = new LifecycleCommandStore({
       connection,
       events,
+      projectionWriter: recordingProjectionWriter(),
       transaction: () => transaction(connection),
       now: () => NOW,
     });
@@ -1400,6 +1538,7 @@ describe("LifecycleCommandStore", () => {
     const store = new LifecycleCommandStore({
       connection,
       events,
+      projectionWriter: recordingProjectionWriter(),
       transaction: () => tx,
       now: () => NOW,
     });
@@ -1428,6 +1567,7 @@ describe("LifecycleCommandStore", () => {
     const store = new LifecycleCommandStore({
       connection,
       events,
+      projectionWriter: recordingProjectionWriter(),
       transaction: () => tx,
       now: () => NOW,
     });
@@ -1450,6 +1590,7 @@ describe("LifecycleCommandStore", () => {
     const store = new LifecycleCommandStore({
       connection,
       events,
+      projectionWriter: recordingProjectionWriter(),
       transaction: () => transaction(connection),
       now: () => NOW,
       authorityMaterialStatus: () => {
@@ -1474,6 +1615,7 @@ describe("LifecycleCommandStore", () => {
     const store = new LifecycleCommandStore({
       connection,
       events,
+      projectionWriter: recordingProjectionWriter(),
       transaction: () => transaction(connection),
       now: () => NOW,
       authorityMaterialStatus: (() => ({ then() { /* PromiseLike escape */ } })) as unknown as (
@@ -1499,6 +1641,7 @@ describe("LifecycleCommandStore", () => {
     const store = new LifecycleCommandStore({
       connection,
       events,
+      projectionWriter: recordingProjectionWriter(),
       transaction: () => transaction(connection),
       now: () => NOW,
     });
@@ -1545,6 +1688,7 @@ describe("LifecycleCommandStore", () => {
     const store = new LifecycleCommandStore({
       connection,
       events,
+      projectionWriter: recordingProjectionWriter(),
       transaction: () => transaction(connection),
       now: () => NOW,
     });
@@ -1648,6 +1792,7 @@ describe("LifecycleCommandStore", () => {
     const store = new LifecycleCommandStore({
       connection,
       events,
+      projectionWriter: recordingProjectionWriter(),
       transaction: () => transaction(connection),
       now: () => NOW,
     });
@@ -1666,6 +1811,7 @@ describe("LifecycleCommandStore", () => {
     const store = new LifecycleCommandStore({
       connection,
       events,
+      projectionWriter: recordingProjectionWriter(),
       transaction: () => transaction(connection),
       now: () => NOW,
     });
@@ -1689,6 +1835,7 @@ describe("LifecycleCommandStore", () => {
     const store = new LifecycleCommandStore({
       connection,
       events,
+      projectionWriter: recordingProjectionWriter(),
       transaction: () => transaction(connection),
       now: () => NOW,
     });
@@ -1734,6 +1881,7 @@ describe("LifecycleCommandStore", () => {
         const store = new LifecycleCommandStore({
           connection,
           events,
+          projectionWriter: recordingProjectionWriter(),
           transaction: () => transaction(connection),
           now: () => NOW,
         });
@@ -1769,6 +1917,7 @@ describe("LifecycleCommandStore", () => {
     const store = new LifecycleCommandStore({
       connection,
       events,
+      projectionWriter: recordingProjectionWriter(),
       transaction: () => transaction(connection),
       now: () => NOW,
     });
@@ -1795,6 +1944,7 @@ describe("LifecycleCommandStore", () => {
     const store = new LifecycleCommandStore({
       connection,
       events,
+      projectionWriter: recordingProjectionWriter(),
       transaction: () => transaction(connection),
       now: () => NOW,
     });
@@ -1820,6 +1970,7 @@ describe("LifecycleCommandStore", () => {
     const store = new LifecycleCommandStore({
       connection,
       events,
+      projectionWriter: recordingProjectionWriter(),
       transaction: () => transaction(connection),
       now: () => NOW,
     });
@@ -1881,6 +2032,7 @@ function compileTimeAuthorityStatusHasNoTransaction(
   new LifecycleCommandStore({
     connection,
     events,
+    projectionWriter: recordingProjectionWriter(),
     transaction: () => ({} as LifecycleCommandTransaction),
     // @ts-expect-error material status cannot receive a transaction facade
     authorityMaterialStatus: (_authorization, transactionFacade) => {
