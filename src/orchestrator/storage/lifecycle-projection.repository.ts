@@ -5,6 +5,8 @@ import type {
 } from "../lifecycle/lifecycle-command.store.js";
 import {
   childEventFoldFingerprint,
+  classifyChildProjectionEvent,
+  classifyWorkflowProjectionEvent,
   foldChildEventProjection,
   foldWorkflowGenerationProjection,
   reportItemSetFingerprint,
@@ -30,6 +32,60 @@ import type {
 
 const SQLITE_INT64_MAX = 9_223_372_036_854_775_807n;
 const LOWER_HASH = /^[0-9a-f]{64}$/;
+
+export const CHILD_EVENT_FOLD_CURSOR_SQL = `
+  SELECT /* lifecycle-full:child-fold */ *
+  FROM lifecycle_child_event_folds
+    INDEXED BY lifecycle_child_event_folds_full_replay
+  WHERE project_id = $projectId
+  ORDER BY event_position, child_session_id, stream_version
+`;
+
+export const WORKFLOW_GENERATION_FOLD_CURSOR_SQL = `
+  SELECT /* lifecycle-full:workflow-fold */ *
+  FROM lifecycle_workflow_generation_folds
+    INDEXED BY lifecycle_workflow_generation_folds_full_replay
+  WHERE project_id = $projectId
+  ORDER BY trigger_event_position, workflow_id, workflow_generation
+`;
+
+export interface ChildEventFoldCursor {
+  readonly visits: number;
+  peek(): ChildEventFoldProjection | null;
+  advance(): ChildEventFoldProjection;
+  close(): void;
+}
+
+export interface WorkflowGenerationFoldCursor {
+  readonly visits: number;
+  peek(): WorkflowGenerationFoldProjection | null;
+  advance(): WorkflowGenerationFoldProjection;
+  close(): void;
+}
+
+export function openChildEventFoldCursor(
+  connection: SqliteConnection,
+  projectId: string,
+): ChildEventFoldCursor {
+  return openDetachedProjectionCursor(
+    connection,
+    projectId,
+    CHILD_EVENT_FOLD_CURSOR_SQL,
+    hydrateChild,
+  );
+}
+
+export function openWorkflowGenerationFoldCursor(
+  connection: SqliteConnection,
+  projectId: string,
+): WorkflowGenerationFoldCursor {
+  return openDetachedProjectionCursor(
+    connection,
+    projectId,
+    WORKFLOW_GENERATION_FOLD_CURSOR_SQL,
+    hydrateWorkflow,
+  );
+}
 const CHILD_STATES = new Set([
   "active",
   "completion-proposed",
@@ -37,31 +93,10 @@ const CHILD_STATES = new Set([
   "suspended",
   "transferred",
 ]);
-const CHILD_ONLY_EVENT_TYPES = new Set([
-  "SessionForked",
-  "ChildAssignmentAmended",
-  "ChildWorkReported",
-  "ChildWorkDispositioned",
-  "ChildCompletionProposed",
-  "ChildSessionCompleted",
-  "ChildSessionSuspended",
-  "ChildWorkTransferCreated",
-  "ChildWorkTransferClaimed",
-]);
-const DUAL_SCOPE_CHILD_EVENT_TYPES = new Set([
-  "SessionCheckpointRecorded",
-  "EvidenceCoverageRecorded",
-]);
 const REPORT_CONSUMER_TYPES = new Set([
   "ChildCompletionProposed",
   "ChildWorkDispositioned",
   "ChildSessionCompleted",
-]);
-const WORKFLOW_EVENT_TYPES = new Set([
-  "SessionEndRequested",
-  "SessionEndAmended",
-  "SessionEndCancelled",
-  "SessionAbandoned",
 ]);
 
 export interface LifecycleProjectionWriter {
@@ -314,6 +349,92 @@ function hydrateWorkflow(row: SqliteRow): WorkflowGenerationFoldProjection {
   return projection;
 }
 
+interface DetachedProjectionCursor<T> {
+  readonly visits: number;
+  peek(): T | null;
+  advance(): T;
+  close(): void;
+}
+
+function openDetachedProjectionCursor<T>(
+  connection: SqliteConnection,
+  projectId: string,
+  sql: string,
+  hydrate: (row: SqliteRow) => T,
+): DetachedProjectionCursor<T> {
+  if (projectId.length === 0) return integrity();
+  let iterator: IterableIterator<SqliteRow>;
+  try {
+    iterator = connection.prepare(sql).iterate({ $projectId: projectId });
+  } catch {
+    return integrity();
+  }
+
+  let lookahead: T | null = null;
+  let visits = 0;
+  let closed = false;
+  const closeIterator = (): void => {
+    const close = iterator.return;
+    if (typeof close === "function") close.call(iterator);
+  };
+  const prime = (): void => {
+    let next: IteratorResult<SqliteRow>;
+    try {
+      next = iterator.next();
+    } catch {
+      return integrity();
+    }
+    if (next.done === true) {
+      lookahead = null;
+      return;
+    }
+    try {
+      lookahead = hydrate({ ...next.value });
+    } catch (error) {
+      if (error instanceof LifecycleError && error.code === "INTEGRITY_FAILURE") {
+        throw error;
+      }
+      return integrity();
+    }
+  };
+
+  try {
+    prime();
+  } catch (error) {
+    try {
+      closeIterator();
+    } catch {
+      // The hydration/iterator failure has precedence over close failure.
+    }
+    if (error instanceof LifecycleError && error.code === "INTEGRITY_FAILURE") {
+      throw error;
+    }
+    return integrity();
+  }
+
+  return {
+    get visits() { return visits; },
+    peek() { return lookahead; },
+    advance() {
+      if (lookahead === null || closed) return integrity();
+      const current = lookahead;
+      prime();
+      visits += 1;
+      return current;
+    },
+    close() {
+      if (closed) return;
+      closed = true;
+      lookahead = null;
+      try {
+        closeIterator();
+      } catch {
+        return integrity();
+      }
+    },
+  };
+}
+
 const CHILD_COLUMNS = `
   project_id, child_session_id, event_position, stream_version,
   root_session_id, child_state, latest_checkpoint_id,
@@ -517,34 +638,6 @@ function reportIdFor(event: StoredEvent): string | null {
   return candidate;
 }
 
-function workflowIdentity(event: StoredEvent): {
-  readonly workflowId: string;
-  readonly workflowGeneration: number;
-} | null {
-  if (!WORKFLOW_EVENT_TYPES.has(event.eventType)) return null;
-  const payload = record(event.payload);
-  if (
-    event.eventType === "SessionAbandoned"
-    && payload.workflowId === null
-    && payload.workflowGeneration === null
-  ) {
-    return null;
-  }
-  if (
-    typeof payload.workflowId !== "string"
-    || payload.workflowId.length === 0
-    || typeof payload.workflowGeneration !== "number"
-    || !Number.isSafeInteger(payload.workflowGeneration)
-    || payload.workflowGeneration <= 0
-  ) {
-    return integrity();
-  }
-  return {
-    workflowId: payload.workflowId,
-    workflowGeneration: payload.workflowGeneration,
-  };
-}
-
 function assertCommittedBatch<T extends JsonValue>(
   committed: EventAppendBatch<T>,
 ): readonly StoredEvent[] {
@@ -606,17 +699,12 @@ implements LifecycleProjectionWriter {
       if (typeof transaction !== "object" || transaction === null) integrity();
       for (const event of assertCommittedBatch(committed)) {
         assertPersistedEventMatches(event, this.#eventAt(event.globalPosition));
-        if (
-          CHILD_ONLY_EVENT_TYPES.has(event.eventType)
-          || (
-            event.parentSessionId !== null
-            && DUAL_SCOPE_CHILD_EVENT_TYPES.has(event.eventType)
-          )
-        ) {
+        const child = classifyChildProjectionEvent(event);
+        if (child === "child-only" || child === "dual-scope-child") {
           this.#appendChild(event);
         }
-        const workflow = workflowIdentity(event);
-        if (workflow !== null) this.#appendWorkflow(event, workflow);
+        const workflow = classifyWorkflowProjectionEvent(event);
+        if (workflow.kind === "identified") this.#appendWorkflow(event, workflow);
       }
     } catch (error) {
       if (error instanceof LifecycleError && error.code === "INTEGRITY_FAILURE") {

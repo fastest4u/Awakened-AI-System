@@ -30,6 +30,15 @@ import {
   qualifiedCheckpointMigrationFailure,
 } from "../src/orchestrator/storage/qualified-checkpoint-migration-preflight.js";
 import { inspectStoreSchema } from "../src/orchestrator/storage/schema-compatibility.js";
+import {
+  CHILD_EVENT_FOLD_CURSOR_SQL,
+  WORKFLOW_GENERATION_FOLD_CURSOR_SQL,
+} from "../src/orchestrator/storage/lifecycle-projection.repository.js";
+import {
+  LIFECYCLE_EVENT_CURSOR_SQL,
+  QUALIFIED_ORDINAL_CURSOR_SQL,
+  QUALIFIED_TRANSITION_CURSOR_SQL,
+} from "../src/orchestrator/integrity/lifecycle-integrity.service.js";
 import type {
   SqliteConnection,
   SqliteParams,
@@ -2211,6 +2220,64 @@ afterEach(() => {
 });
 
 describe("qualified checkpoint migration", () => {
+  it("migration 3 full replay cursors use global order indexes without temp sorting", () => {
+    const connection = currentConnection();
+    const indexes = [
+      {
+        table: "lifecycle_child_event_folds",
+        name: "lifecycle_child_event_folds_full_replay",
+        columns: ["project_id", "event_position", "child_session_id", "stream_version"],
+        sql: CHILD_EVENT_FOLD_CURSOR_SQL,
+      },
+      {
+        table: "lifecycle_workflow_generation_folds",
+        name: "lifecycle_workflow_generation_folds_full_replay",
+        columns: ["project_id", "trigger_event_position", "workflow_id", "workflow_generation"],
+        sql: WORKFLOW_GENERATION_FOLD_CURSOR_SQL,
+      },
+      {
+        table: "session_evidence_coverage_transitions",
+        name: "session_evidence_coverage_transitions_full_replay",
+        columns: ["project_id", "batch_event_position", "session_id", "adapter_session_id"],
+        sql: QUALIFIED_TRANSITION_CURSOR_SQL,
+      },
+      {
+        table: "session_evidence_fingerprints",
+        name: "session_evidence_fingerprints_full_replay",
+        columns: ["project_id", "recorded_event_position", "session_id", "adapter_session_id", "ordinal"],
+        sql: QUALIFIED_ORDINAL_CURSOR_SQL,
+      },
+    ] as const;
+
+    for (const candidate of indexes) {
+      const metadata = connection.prepare(
+        `PRAGMA index_list('${candidate.table}')`,
+      ).all().find((row) => row.name === candidate.name);
+      assert.equal(metadata?.unique, 0n, candidate.name);
+      assert.equal(metadata?.partial, 0n, candidate.name);
+      assert.deepEqual(
+        connection.prepare(`PRAGMA index_info('${candidate.name}')`).all()
+          .map((row) => row.name),
+        candidate.columns,
+        candidate.name,
+      );
+    }
+
+    const cursorPlans = [
+      [LIFECYCLE_EVENT_CURSOR_SQL, "events_project_position"],
+      ...indexes.map((candidate) => [candidate.sql, candidate.name] as const),
+    ] as const;
+    for (const [sql, expectedIndex] of cursorPlans) {
+      const plan = connection.prepare(`EXPLAIN QUERY PLAN ${sql}`)
+        .all({ $projectId: PROJECT_ID })
+        .map((row) => String(row.detail))
+        .join("\n");
+      assert.match(plan, new RegExp(expectedIndex), expectedIndex);
+      assert.doesNotMatch(plan, /USE TEMP B-TREE/i, expectedIndex);
+      assert.doesNotMatch(plan, /^SCAN (?:events|lifecycle_|session_evidence_)/im, expectedIndex);
+    }
+  });
+
   it("requires migration-3 preflight for every explicit upgrade", () => {
     for (const beforeMigration of [undefined, () => undefined]) {
       const connection = sourceConnection(2);

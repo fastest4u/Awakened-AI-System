@@ -62,8 +62,74 @@ export interface WorkflowGenerationFoldProjection {
   readonly fingerprint: string;
 }
 
+export type ChildProjectionEventClassification =
+  | "child-only"
+  | "dual-scope-child"
+  | "none";
+
+export type WorkflowProjectionEventClassification =
+  | { readonly kind: "none" }
+  | { readonly kind: "null-identity-abandon" }
+  | {
+      readonly kind: "identified";
+      readonly workflowId: string;
+      readonly workflowGeneration: number;
+    };
+
 function invalid(): never {
   throw new TypeError("LIFECYCLE_PROJECTION_INVALID");
+}
+
+export function classifyChildProjectionEvent(
+  event: Pick<StoredEvent, "eventType" | "parentSessionId">,
+): ChildProjectionEventClassification {
+  switch (event.eventType) {
+    case "SessionForked":
+    case "ChildAssignmentAmended":
+    case "ChildWorkReported":
+    case "ChildWorkDispositioned":
+    case "ChildCompletionProposed":
+    case "ChildSessionCompleted":
+    case "ChildSessionSuspended":
+    case "ChildWorkTransferCreated":
+    case "ChildWorkTransferClaimed":
+      return "child-only";
+    case "SessionCheckpointRecorded":
+    case "EvidenceCoverageRecorded":
+      return event.parentSessionId === null ? "none" : "dual-scope-child";
+    default:
+      return "none";
+  }
+}
+
+export function classifyWorkflowProjectionEvent(
+  event: Pick<StoredEvent, "eventType" | "payload">,
+): WorkflowProjectionEventClassification {
+  if (
+    event.eventType !== "SessionEndRequested"
+    && event.eventType !== "SessionEndAmended"
+    && event.eventType !== "SessionEndCancelled"
+    && event.eventType !== "SessionAbandoned"
+  ) return Object.freeze({ kind: "none" });
+
+  const payload = record(event.payload);
+  if (
+    event.eventType === "SessionAbandoned"
+    && payload.workflowId === null
+    && payload.workflowGeneration === null
+  ) return Object.freeze({ kind: "null-identity-abandon" });
+  if (
+    typeof payload.workflowId !== "string"
+    || payload.workflowId.trim().length === 0
+    || typeof payload.workflowGeneration !== "number"
+    || !Number.isSafeInteger(payload.workflowGeneration)
+    || payload.workflowGeneration <= 0
+  ) return invalid();
+  return Object.freeze({
+    kind: "identified",
+    workflowId: payload.workflowId,
+    workflowGeneration: payload.workflowGeneration,
+  });
 }
 
 function record(value: unknown): Readonly<Record<string, unknown>> {

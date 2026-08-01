@@ -1,6 +1,17 @@
 import { strict as assert } from "node:assert";
 import { describe, it } from "node:test";
 import type { StoredEvent } from "../src/orchestrator/contracts/event.js";
+import type {
+  SqliteConnection,
+  SqliteRow,
+  SqliteStatement,
+} from "../src/orchestrator/storage/sqlite-driver.js";
+import {
+  CHILD_EVENT_FOLD_CURSOR_SQL,
+  WORKFLOW_GENERATION_FOLD_CURSOR_SQL,
+  openChildEventFoldCursor,
+  openWorkflowGenerationFoldCursor,
+} from "../src/orchestrator/storage/lifecycle-projection.repository.js";
 import type { LifecycleIntentWitnessV1 } from "../src/orchestrator/lifecycle/lifecycle-intent-witness.js";
 import type {
   ReportId,
@@ -10,6 +21,8 @@ import {
   type ChildEventFoldProjection,
   advanceReportIndexFingerprint,
   childEventFoldFingerprint,
+  classifyChildProjectionEvent,
+  classifyWorkflowProjectionEvent,
   foldChildEventProjection,
   foldWorkflowGenerationProjection,
   reportIndexGenesisFingerprint,
@@ -189,7 +202,327 @@ function checkpointDraft(version: 1 | 2): Readonly<Record<string, unknown>> {
   };
 }
 
+function singleReusableRowConnection(initial: SqliteRow | readonly SqliteRow[]): {
+  readonly connection: SqliteConnection;
+  readonly raw: SqliteRow;
+  readonly prepared: string[];
+  readonly iterated: () => number;
+  readonly returned: () => number;
+} {
+  const rows = Array.isArray(initial) ? initial : [initial];
+  const raw = { ...rows[0]! };
+  const prepared: string[] = [];
+  let iterated = 0;
+  let returned = 0;
+  let nextIndex = 0;
+  const iterator: IterableIterator<SqliteRow> = {
+    next() {
+      const source = rows[nextIndex];
+      if (source === undefined) return { done: true, value: undefined };
+      nextIndex += 1;
+      for (const key of Object.keys(raw)) delete raw[key];
+      Object.assign(raw, source);
+      return { done: false, value: raw };
+    },
+    return() {
+      returned += 1;
+      return { done: true, value: undefined };
+    },
+    [Symbol.iterator]() { return this; },
+  };
+  const connection: SqliteConnection = {
+    exec(): never { throw new Error("unexpected exec"); },
+    prepare(sql): SqliteStatement {
+      prepared.push(sql);
+      return {
+        run(): never { throw new Error("unexpected run"); },
+        get(): never { throw new Error("unexpected get"); },
+        all(): never { throw new Error("unexpected all"); },
+        iterate(params) {
+          assert.deepEqual(params, { $projectId: PROJECT_ID });
+          iterated += 1;
+          return iterator;
+        },
+      };
+    },
+    close(): void {},
+  };
+  return {
+    connection,
+    raw,
+    prepared,
+    iterated: () => iterated,
+    returned: () => returned,
+  };
+}
+
 describe("authenticated lifecycle projection folds", () => {
+  it("ordered projection cursors detach lookahead count visits and close exactly once", () => {
+    const childWithoutFingerprint = {
+      projectId: PROJECT_ID,
+      childSessionId: CHILD_SESSION_ID,
+      eventPosition: 1n,
+      streamVersion: 1n,
+      rootSessionId: ROOT_SESSION_ID,
+      childState: "active" as const,
+      latestCheckpointId: null,
+      latestCheckpointEventPosition: null,
+      authorityCommitment: "a".repeat(64),
+      terminalEventType: null,
+      terminalEventPosition: null,
+      reportCount: 0,
+      latestReportId: null,
+      reportIndexFingerprint: referenceReportIndexGenesisFingerprint(
+        PROJECT_ID,
+        CHILD_SESSION_ID,
+      ),
+      completionReportId: null,
+      reportedReportId: null,
+      reportedItemCount: null,
+      reportedItemSetFingerprint: null,
+      previousFingerprint: null,
+    };
+    const child = singleReusableRowConnection({
+      project_id: PROJECT_ID,
+      child_session_id: CHILD_SESSION_ID,
+      event_position: 1n,
+      stream_version: 1n,
+      root_session_id: ROOT_SESSION_ID,
+      child_state: "active",
+      latest_checkpoint_id: null,
+      latest_checkpoint_event_position: null,
+      authority_commitment: childWithoutFingerprint.authorityCommitment,
+      terminal_event_type: null,
+      terminal_event_position: null,
+      report_count: 0n,
+      latest_report_id: null,
+      report_index_fingerprint: childWithoutFingerprint.reportIndexFingerprint,
+      completion_report_id: null,
+      reported_report_id: null,
+      reported_item_count: null,
+      reported_item_set_fingerprint: null,
+      previous_fingerprint: null,
+      fingerprint: referenceChildEventFoldFingerprint(childWithoutFingerprint),
+    });
+    const childCursor = openChildEventFoldCursor(child.connection, PROJECT_ID);
+    child.raw.child_session_id = "mutated-after-next";
+    assert.equal(childCursor.visits, 0);
+    assert.equal(childCursor.peek()?.childSessionId, CHILD_SESSION_ID);
+    assert.equal(childCursor.peek()?.childSessionId, CHILD_SESSION_ID);
+    assert.equal(childCursor.visits, 0);
+    assert.equal(childCursor.advance().childSessionId, CHILD_SESSION_ID);
+    assert.equal(childCursor.visits, 1);
+    assert.equal(childCursor.peek(), null);
+    assert.throws(() => childCursor.advance(), /INTEGRITY_FAILURE/);
+    childCursor.close();
+    childCursor.close();
+    assert.deepEqual(child.prepared, [CHILD_EVENT_FOLD_CURSOR_SQL]);
+    assert.equal(child.iterated(), 1);
+    assert.equal(child.returned(), 1);
+
+    const workflowWithoutFingerprint = {
+      projectId: PROJECT_ID,
+      workflowId: WORKFLOW_ID,
+      workflowGeneration: 1,
+      sessionId: ROOT_SESSION_ID,
+      triggerEventPosition: 2n,
+      rootCommandId: lifecycleUuid(82_001),
+      evidenceWindowState: "open" as const,
+      replacementCheckpointVersion: 2 as const,
+      effectiveCheckpointVersion: 2 as const,
+      effectiveDraftSourceEventPosition: 2n,
+      previousFingerprint: null,
+    };
+    const workflow = singleReusableRowConnection({
+      project_id: PROJECT_ID,
+      workflow_id: WORKFLOW_ID,
+      workflow_generation: 1n,
+      session_id: ROOT_SESSION_ID,
+      trigger_event_position: 2n,
+      root_command_id: workflowWithoutFingerprint.rootCommandId,
+      evidence_window_state: "open",
+      replacement_checkpoint_version: 2n,
+      effective_checkpoint_version: 2n,
+      effective_draft_source_event_position: 2n,
+      previous_fingerprint: null,
+      fingerprint: referenceWorkflowGenerationFingerprint(workflowWithoutFingerprint),
+    });
+    const workflowCursor = openWorkflowGenerationFoldCursor(
+      workflow.connection,
+      PROJECT_ID,
+    );
+    workflow.raw.workflow_id = "mutated-after-next";
+    assert.equal(workflowCursor.peek()?.workflowId, WORKFLOW_ID);
+    assert.equal(workflowCursor.advance().workflowId, WORKFLOW_ID);
+    assert.equal(workflowCursor.visits, 1);
+    assert.equal(workflowCursor.peek(), null);
+    workflowCursor.close();
+    workflowCursor.close();
+    assert.deepEqual(workflow.prepared, [WORKFLOW_GENERATION_FOLD_CURSOR_SQL]);
+    assert.equal(workflow.iterated(), 1);
+    assert.equal(workflow.returned(), 1);
+
+    const malformed = singleReusableRowConnection({
+      ...child.raw,
+      child_session_id: CHILD_SESSION_ID,
+      fingerprint: "not-a-hash",
+    });
+    assert.throws(
+      () => openChildEventFoldCursor(malformed.connection, PROJECT_ID),
+      /INTEGRITY_FAILURE/,
+    );
+    assert.equal(malformed.returned(), 1);
+  });
+
+  it("projection cursor counts only advances that return after priming valid lookahead", () => {
+    const withoutFingerprint = {
+      projectId: PROJECT_ID,
+      childSessionId: CHILD_SESSION_ID,
+      eventPosition: 1n,
+      streamVersion: 1n,
+      rootSessionId: ROOT_SESSION_ID,
+      childState: "active" as const,
+      latestCheckpointId: null,
+      latestCheckpointEventPosition: null,
+      authorityCommitment: "a".repeat(64),
+      terminalEventType: null,
+      terminalEventPosition: null,
+      reportCount: 0,
+      latestReportId: null,
+      reportIndexFingerprint: referenceReportIndexGenesisFingerprint(
+        PROJECT_ID,
+        CHILD_SESSION_ID,
+      ),
+      completionReportId: null,
+      reportedReportId: null,
+      reportedItemCount: null,
+      reportedItemSetFingerprint: null,
+      previousFingerprint: null,
+    };
+    const fingerprint = referenceChildEventFoldFingerprint(withoutFingerprint);
+    const valid: SqliteRow = {
+      project_id: PROJECT_ID,
+      child_session_id: CHILD_SESSION_ID,
+      event_position: 1n,
+      stream_version: 1n,
+      root_session_id: ROOT_SESSION_ID,
+      child_state: "active",
+      latest_checkpoint_id: null,
+      latest_checkpoint_event_position: null,
+      authority_commitment: withoutFingerprint.authorityCommitment,
+      terminal_event_type: null,
+      terminal_event_position: null,
+      report_count: 0n,
+      latest_report_id: null,
+      report_index_fingerprint: withoutFingerprint.reportIndexFingerprint,
+      completion_report_id: null,
+      reported_report_id: null,
+      reported_item_count: null,
+      reported_item_set_fingerprint: null,
+      previous_fingerprint: null,
+      fingerprint,
+    };
+    const rows = singleReusableRowConnection([
+      valid,
+      {
+        ...valid,
+        event_position: 2n,
+        stream_version: 2n,
+        previous_fingerprint: fingerprint,
+        fingerprint: "malformed-next-row",
+      },
+    ]);
+    const cursor = openChildEventFoldCursor(rows.connection, PROJECT_ID);
+    assert.throws(() => cursor.advance(), /INTEGRITY_FAILURE/);
+    assert.equal(cursor.visits, 0);
+    cursor.close();
+    assert.equal(rows.returned(), 1);
+  });
+
+  it("shares the asymmetric child projection classifier with the writer and replay", () => {
+    const childOnly = [
+      "SessionForked",
+      "ChildAssignmentAmended",
+      "ChildWorkReported",
+      "ChildWorkDispositioned",
+      "ChildCompletionProposed",
+      "ChildSessionCompleted",
+      "ChildSessionSuspended",
+      "ChildWorkTransferCreated",
+      "ChildWorkTransferClaimed",
+    ] as const;
+    for (const eventType of childOnly) {
+      assert.equal(
+        classifyChildProjectionEvent({ eventType, parentSessionId: null }),
+        "child-only",
+        eventType,
+      );
+      assert.equal(
+        classifyChildProjectionEvent({ eventType, parentSessionId: ROOT_SESSION_ID }),
+        "child-only",
+        eventType,
+      );
+    }
+    for (const eventType of ["SessionCheckpointRecorded", "EvidenceCoverageRecorded"] as const) {
+      assert.equal(
+        classifyChildProjectionEvent({ eventType, parentSessionId: ROOT_SESSION_ID }),
+        "dual-scope-child",
+        eventType,
+      );
+      assert.equal(
+        classifyChildProjectionEvent({ eventType, parentSessionId: null }),
+        "none",
+        eventType,
+      );
+    }
+    assert.equal(
+      classifyChildProjectionEvent({ eventType: "SessionStarted", parentSessionId: null }),
+      "none",
+    );
+  });
+
+  it("shares strict per-event workflow projection identity classification", () => {
+    for (const eventType of [
+      "SessionEndRequested",
+      "SessionEndAmended",
+      "SessionEndCancelled",
+      "SessionAbandoned",
+    ] as const) {
+      assert.deepEqual(classifyWorkflowProjectionEvent({
+        eventType,
+        payload: { workflowId: WORKFLOW_ID, workflowGeneration: 3 },
+      }), {
+        kind: "identified",
+        workflowId: WORKFLOW_ID,
+        workflowGeneration: 3,
+      }, eventType);
+    }
+    assert.deepEqual(classifyWorkflowProjectionEvent({
+      eventType: "SessionAbandoned",
+      payload: { workflowId: null, workflowGeneration: null },
+    }), { kind: "null-identity-abandon" });
+    assert.deepEqual(classifyWorkflowProjectionEvent({
+      eventType: "SessionStarted",
+      payload: {},
+    }), { kind: "none" });
+    for (const payload of [
+      { workflowId: null, workflowGeneration: 1 },
+      { workflowId: WORKFLOW_ID, workflowGeneration: null },
+      { workflowId: "", workflowGeneration: 1 },
+      { workflowId: "   ", workflowGeneration: 1 },
+      { workflowId: WORKFLOW_ID, workflowGeneration: 0 },
+      { workflowId: WORKFLOW_ID, workflowGeneration: Number.MAX_SAFE_INTEGER + 1 },
+    ]) {
+      assert.throws(
+        () => classifyWorkflowProjectionEvent({
+          eventType: "SessionAbandoned",
+          payload,
+        }),
+        /LIFECYCLE_PROJECTION_INVALID/,
+      );
+    }
+  });
+
   it("projection folds match independent canonical vectors and null-carry semantics", () => {
     const fork = foldChildEventProjection(
       null,

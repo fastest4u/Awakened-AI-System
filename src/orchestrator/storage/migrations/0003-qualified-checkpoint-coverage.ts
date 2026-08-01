@@ -1972,6 +1972,10 @@ CREATE INDEX lifecycle_child_event_folds_root_at_event
 ON lifecycle_child_event_folds(
   project_id, root_session_id, event_position
 );
+CREATE INDEX lifecycle_child_event_folds_full_replay
+ON lifecycle_child_event_folds(
+  project_id, event_position, child_session_id, stream_version
+);
 CREATE UNIQUE INDEX lifecycle_child_event_folds_report_witness
 ON lifecycle_child_event_folds(
   project_id, child_session_id, reported_report_id
@@ -2519,6 +2523,10 @@ CREATE INDEX lifecycle_workflow_generation_folds_session
 ON lifecycle_workflow_generation_folds(
   project_id, session_id, workflow_id, workflow_generation
 );
+CREATE INDEX lifecycle_workflow_generation_folds_full_replay
+ON lifecycle_workflow_generation_folds(
+  project_id, trigger_event_position, workflow_id, workflow_generation
+);
 
 CREATE TRIGGER lifecycle_workflow_generation_folds_insert_guard
 BEFORE INSERT ON lifecycle_workflow_generation_folds
@@ -2973,6 +2981,15 @@ CREATE TABLE session_evidence_coverage_transitions (
 CREATE INDEX session_evidence_coverage_transitions_snapshot
 ON session_evidence_coverage_transitions(
   project_id, session_id, adapter_session_id, batch_event_position DESC
+);
+CREATE INDEX session_evidence_coverage_transitions_full_replay
+ON session_evidence_coverage_transitions(
+  project_id, batch_event_position, session_id, adapter_session_id
+);
+
+CREATE INDEX session_evidence_fingerprints_full_replay
+ON session_evidence_fingerprints(
+  project_id, recorded_event_position, session_id, adapter_session_id, ordinal
 );
 
 CREATE UNIQUE INDEX session_evidence_coverage_latest_transition
