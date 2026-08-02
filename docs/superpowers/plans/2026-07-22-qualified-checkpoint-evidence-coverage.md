@@ -2063,6 +2063,10 @@ against the corrected HEAD.
 - Modify: `src/orchestrator/lifecycle/lifecycle-projection-folds.ts`
 - Modify: `src/orchestrator/storage/lifecycle-projection.repository.ts`
 - Modify: `src/orchestrator/integrity/lifecycle-integrity.service.ts`
+- Modify only for exact identified-terminal generation compatibility:
+  `src/orchestrator/lifecycle/session-aggregate.ts`
+- Modify only for that shared-fold regression proof:
+  `tests/session-aggregate.test.ts`
 - Modify only if the existing async extension seam proves insufficient:
   `src/orchestrator/integrity/event-integrity.service.ts`
 - Modify: `tests/support/lifecycle-projection-reference.ts`
@@ -2126,6 +2130,29 @@ disagreement rather than expect the legacy `SESSION_AUTHORITY_FOLD_MISMATCH`
 sink issue. Do not change the authority payload's creating client, `event_hash`,
 `hydrateReplayEvent`, migration behavior, production failure handling, or any
 other upgrade-test scope.
+
+**Task 12J fix-round-4 exact-terminal-fold scope amendment:** Qualified replay
+must pass every detached strict lifecycle event unchanged to `foldSession` or
+`evolveSession`; it must not clone, normalize, or rewrite a workflow generation
+before folding. The approved schema-3 workflow projection advances an
+identified `SessionEndCancelled` or ending-state `SessionAbandoned` to the next
+generation, while persisted schema-2 compatibility may retain the current
+generation and carries no source-schema marker. Reconcile only this shared
+aggregate seam: add a terminal-specific workflow assertion that requires the
+same workflow ID and a safe integer generation equal to the aggregate's current
+generation or exactly current plus one. Do not broaden the ordinary
+`assertWorkflow` rule used by amendment, validation, verification, or ending.
+For either identified terminal, store the event's accepted generation in the
+aggregate; preserve null-identity abandonment from active/suspended state and
+reject stale, skipped, cross-workflow, null, or partial identity. Remove the
+qualified-replay copied-event/post-fold generation patch and fold the exact
+decoded event. Prove same-generation compatibility, next-generation live
+cancel and identified abandon, cancel-then-reopen generation fencing, invalid
+generation/identity rejection, and unchanged null-identity abandon. This
+amendment authorizes only `src/orchestrator/lifecycle/session-aggregate.ts` and
+`tests/session-aggregate.test.ts` beyond the existing Task 12J file scope; it
+does not change codecs, event schema versions, migrations, routing, or public
+failure taxonomy.
 
 The honest complexity contract is:
 
@@ -2655,7 +2682,7 @@ persistent tables prove zero repair on each failure path.
 ```powershell
 npm run test:build
 node --test --test-concurrency=1 --test-reporter=spec --test-name-pattern="^(full integrity advances each qualified coverage row exactly once|full integrity fingerprints each non-zero transition exactly once|full integrity reconstructs version 2 checkpoints and frozen snapshots at their historical bases|full integrity reports unavailable historical keys and never repairs state|full integrity merge cursors reject missing and orphan child projection rows|full integrity merge cursors reject missing and orphan workflow projection rows|full integrity collapses schema 2 same-generation cancel and abandon once)$" dist-test/tests/qualified-checkpoint-full-integrity.test.js
-node --test --test-concurrency=1 --test-reporter=spec dist-test/tests/qualified-checkpoint-full-integrity.test.js dist-test/tests/qualified-checkpoint-quick-integrity.test.js dist-test/tests/event-integrity.test.js dist-test/tests/event-append-transaction.test.js dist-test/tests/evidence-coverage.test.js dist-test/tests/checkpoint.service.test.js dist-test/tests/qualified-checkpoint-migration.test.js dist-test/tests/lifecycle-projection-folds.test.js
+node --test --test-concurrency=1 --test-reporter=spec dist-test/tests/qualified-checkpoint-full-integrity.test.js dist-test/tests/qualified-checkpoint-quick-integrity.test.js dist-test/tests/event-integrity.test.js dist-test/tests/event-append-transaction.test.js dist-test/tests/evidence-coverage.test.js dist-test/tests/checkpoint.service.test.js dist-test/tests/qualified-checkpoint-migration.test.js dist-test/tests/lifecycle-projection-folds.test.js dist-test/tests/session-aggregate.test.js
 node --test --test-concurrency=1 --test-reporter=spec --test-name-pattern="^runs lifecycle invariants through the ordinary integrity worker$" dist-test/tests/project-store-upgrade.test.js
 npm run typecheck
 git diff --check
@@ -2677,11 +2704,12 @@ as named by the amendment.
 - [ ] **Step 10: Stage exactly the permitted Task 12J scope and commit**
 
 ```powershell
-git add -- src/orchestrator/storage/migrations/0003-qualified-checkpoint-coverage.ts src/orchestrator/lifecycle/lifecycle-projection-folds.ts src/orchestrator/storage/lifecycle-projection.repository.ts src/orchestrator/integrity/lifecycle-integrity.service.ts src/orchestrator/integrity/event-integrity.service.ts tests/support/lifecycle-projection-reference.ts tests/support/lifecycle-authority-reference.ts tests/qualified-checkpoint-full-integrity.test.ts tests/qualified-checkpoint-quick-integrity.test.ts tests/project-store-upgrade.test.ts tests/qualified-checkpoint-migration.test.ts tests/lifecycle-projection-folds.test.ts tests/event-integrity.test.ts tests/evidence-coverage.test.ts tests/checkpoint.service.test.ts
+git add -- src/orchestrator/storage/migrations/0003-qualified-checkpoint-coverage.ts src/orchestrator/lifecycle/lifecycle-projection-folds.ts src/orchestrator/lifecycle/session-aggregate.ts src/orchestrator/storage/lifecycle-projection.repository.ts src/orchestrator/integrity/lifecycle-integrity.service.ts src/orchestrator/integrity/event-integrity.service.ts tests/support/lifecycle-projection-reference.ts tests/support/lifecycle-authority-reference.ts tests/qualified-checkpoint-full-integrity.test.ts tests/qualified-checkpoint-quick-integrity.test.ts tests/project-store-upgrade.test.ts tests/qualified-checkpoint-migration.test.ts tests/lifecycle-projection-folds.test.ts tests/session-aggregate.test.ts tests/event-integrity.test.ts tests/evidence-coverage.test.ts tests/checkpoint.service.test.ts
 $staged = @(git diff --cached --name-only)
 $allowed = @(
   'src/orchestrator/storage/migrations/0003-qualified-checkpoint-coverage.ts',
   'src/orchestrator/lifecycle/lifecycle-projection-folds.ts',
+  'src/orchestrator/lifecycle/session-aggregate.ts',
   'src/orchestrator/storage/lifecycle-projection.repository.ts',
   'src/orchestrator/integrity/lifecycle-integrity.service.ts',
   'src/orchestrator/integrity/event-integrity.service.ts',
@@ -2692,6 +2720,7 @@ $allowed = @(
   'tests/project-store-upgrade.test.ts',
   'tests/qualified-checkpoint-migration.test.ts',
   'tests/lifecycle-projection-folds.test.ts',
+  'tests/session-aggregate.test.ts',
   'tests/event-integrity.test.ts',
   'tests/evidence-coverage.test.ts',
   'tests/checkpoint.service.test.ts'
@@ -2722,7 +2751,7 @@ finding.
 
 ```powershell
 npm run test:build
-node --test --test-concurrency=1 --test-reporter=spec dist-test/tests/qualified-checkpoint-contracts.test.js dist-test/tests/qualified-checkpoint-migration.test.js dist-test/tests/evidence-coverage.test.js dist-test/tests/checkpoint.service.test.js dist-test/tests/lifecycle-command-store.test.js dist-test/tests/lifecycle-command-processor.test.js dist-test/tests/child-workflow.test.js dist-test/tests/integrity-provider-broker.test.js dist-test/tests/qualified-checkpoint-quick-integrity.test.js dist-test/tests/qualified-checkpoint-full-integrity.test.js dist-test/tests/event-integrity.test.js dist-test/tests/project-store-executor.test.js
+node --test --test-concurrency=1 --test-reporter=spec dist-test/tests/qualified-checkpoint-contracts.test.js dist-test/tests/qualified-checkpoint-migration.test.js dist-test/tests/evidence-coverage.test.js dist-test/tests/checkpoint.service.test.js dist-test/tests/lifecycle-command-store.test.js dist-test/tests/lifecycle-command-processor.test.js dist-test/tests/child-workflow.test.js dist-test/tests/integrity-provider-broker.test.js dist-test/tests/qualified-checkpoint-quick-integrity.test.js dist-test/tests/qualified-checkpoint-full-integrity.test.js dist-test/tests/session-aggregate.test.js dist-test/tests/event-integrity.test.js dist-test/tests/project-store-executor.test.js
 npm run typecheck
 npm test
 git diff --check
