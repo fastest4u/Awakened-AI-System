@@ -9,7 +9,10 @@ import {
   type LifecycleEvent,
   type LifecycleEvidenceFrameRecordedV1,
 } from "../lifecycle/contracts/events.js";
-import { advanceEvidenceCoverageIntervals } from "../lifecycle/evidence-coverage-accumulator.js";
+import {
+  advanceEvidenceCoverageIntervals,
+  assertEvidenceCoverageProjectionBounds,
+} from "../lifecycle/evidence-coverage-accumulator.js";
 import {
   CHECKPOINT_MAX_CANONICAL_BYTES,
   type Checkpoint,
@@ -35,8 +38,13 @@ import {
 import {
   evolveSession,
   foldSession,
+  assertAuthorityMirror,
   type SessionAggregateState,
 } from "../lifecycle/session-aggregate.js";
+import {
+  authorityCommitment,
+  type CommittedAuthorityV1,
+} from "../lifecycle/authority/authority-commitment.js";
 import type { ProjectContext } from "../identity/contracts.js";
 import type { CapabilityKeyProvider } from "../lifecycle/authority/capability-key-provider.js";
 import { ChildTransferRepository } from "../storage/child-transfer.repository.js";
@@ -198,7 +206,10 @@ interface ImmutableOrdinalIdentity {
 
 interface EvidenceReplayState {
   readonly sessionId: string;
+  readonly createdAt: string;
+  readonly updatedAt: string;
   readonly coverageLastOrdinal: bigint;
+  readonly missingIntervalsJson: string;
   readonly missingIntervals: readonly {
     readonly firstOrdinal: bigint;
     readonly lastOrdinal: bigint;
@@ -219,14 +230,73 @@ interface HistoricalCheckpointCapture {
   readonly evidenceCoverage: CheckpointEvidenceCoverageV2;
 }
 
+interface HistoricalCheckpointRequest {
+  readonly checkpointId: string;
+  readonly sessionId: string;
+  readonly baseEventPosition: bigint;
+  readonly checkpointEventPosition: bigint;
+  readonly childSummaries: Checkpoint["childSummaries"];
+}
+
+interface HistoricalCheckpointPlan {
+  readonly byBase: ReadonlyMap<bigint, readonly HistoricalCheckpointRequest[]>;
+  readonly childIdsByPosition: ReadonlyMap<bigint, ReadonlySet<string>>;
+}
+
 interface ReplayPreIndexes {
   readonly transferTickets: readonly Readonly<SqliteRow>[];
+  readonly transferTicketById: ReadonlyMap<string, Readonly<SqliteRow>>;
+  readonly transferTicketByBinding: ReadonlyMap<string, Readonly<SqliteRow>>;
+  readonly ticketsByCreatePosition: ReadonlyMap<bigint, readonly Readonly<SqliteRow>[]>;
+  readonly ticketsByClaimPosition: ReadonlyMap<bigint, readonly Readonly<SqliteRow>[]>;
+  readonly validations: readonly Readonly<SqliteRow>[];
+  readonly validationById: ReadonlyMap<string, Readonly<SqliteRow>>;
+  readonly validationsByEventPosition: ReadonlyMap<bigint, readonly Readonly<SqliteRow>[]>;
 }
 
 interface ReplayEndpointIndexes {
   readonly workflows: readonly Readonly<SqliteRow>[];
-  readonly validations: readonly Readonly<SqliteRow>[];
+  readonly evidence: readonly Readonly<SqliteRow>[];
   readonly authorities: ReadonlyMap<string, Readonly<SqliteRow>>;
+}
+
+type ReplayWorkflowPhase =
+  | "requested"
+  | "cancelled"
+  | "abandoned"
+  | "final-checkpoint-recorded"
+  | "validating"
+  | "verification-passed"
+  | "verification-failed"
+  | "completion-appended";
+
+interface WorkflowReplayState {
+  readonly workflowId: string;
+  readonly sessionId: string;
+  readonly generation: number;
+  readonly triggerEventPosition: bigint;
+  readonly rootCommandId: string;
+  readonly expectedAuthorityCommitment: string;
+  readonly priorRootState: "active" | "suspended";
+  readonly materializationRequired: boolean;
+  readonly evidenceWindowState: "open" | "sealed";
+  readonly phase: ReplayWorkflowPhase;
+  readonly frozenCheckpointId: string | null;
+  readonly frozenCheckpointEventPosition: bigint | null;
+  readonly frozenGeneration: number | null;
+  readonly endingBindingsJson: string | null;
+  readonly validationResultIds: ReadonlySet<string>;
+  readonly qualityScore: number | null;
+  readonly safeFailureCode: string | null;
+  readonly verificationEventPosition: bigint | null;
+  readonly completionEventPosition: bigint | null;
+}
+
+interface TransferSuspensionWitness {
+  readonly checkpointId: string;
+  readonly streamVersion: bigint;
+  readonly blockers: readonly string[];
+  readonly followUps: readonly string[];
 }
 const LATEST_EVIDENCE_PAYLOAD_KEYS = [
   "adapterSessionId",
@@ -289,6 +359,41 @@ function int64(value: unknown, allowZero = false): bigint | null {
     || converted > SQLITE_INT64_MAX
   ) return null;
   return converted;
+}
+
+function signedCoverageInt64(value: unknown): bigint | null {
+  const converted = typeof value === "bigint"
+    ? value
+    : typeof value === "number" && Number.isSafeInteger(value)
+      ? BigInt(value)
+      : null;
+  if (converted === null || converted < -1n || converted > SQLITE_INT64_MAX) {
+    return null;
+  }
+  return converted;
+}
+
+function canonicalCoverageIntervals(
+  value: unknown,
+): readonly { readonly firstOrdinal: bigint; readonly lastOrdinal: bigint }[] | null {
+  if (typeof value !== "string") return null;
+  if (value === "[]") return [];
+  if (!value.startsWith("[[") || !value.endsWith("]]")) return null;
+  const entries = value.slice(2, -2).split("],[");
+  const intervals: Array<{ firstOrdinal: bigint; lastOrdinal: bigint }> = [];
+  for (const entry of entries) {
+    const fields = entry.split(",");
+    if (
+      fields.length !== 2
+      || !UNSIGNED_DECIMAL.test(fields[0]!)
+      || !UNSIGNED_DECIMAL.test(fields[1]!)
+    ) return null;
+    intervals.push({
+      firstOrdinal: BigInt(fields[0]!),
+      lastOrdinal: BigInt(fields[1]!),
+    });
+  }
+  return intervals;
 }
 
 function decimal(value: unknown): string | null {
@@ -557,8 +662,9 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
     sink: IntegrityIssueSink,
   ): Promise<void> {
     if (!this.hasLifecycleSchema()) return;
-    this.runQuickCheck(context, sink);
-    await this.checkQualifiedQuick(context, sink);
+    const qualifiedSchema = this.hasQualifiedLifecycleSchema();
+    this.runQuickCheck(context, sink, qualifiedSchema);
+    await this.checkQualifiedQuick(context, sink, !qualifiedSchema, qualifiedSchema);
   }
 
   async fullCheckAsync(
@@ -566,8 +672,14 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
     sink: IntegrityIssueSink,
   ): Promise<void> {
     if (!this.hasLifecycleSchema()) return;
-    this.runQuickCheck(context, sink);
-    const qualified = await this.checkQualifiedQuick(context, sink);
+    const qualifiedSchema = this.hasQualifiedLifecycleSchema();
+    this.runQuickCheck(context, sink, qualifiedSchema);
+    const qualified = await this.checkQualifiedQuick(
+      context,
+      sink,
+      false,
+      qualifiedSchema,
+    );
     if (qualified.qualifiedSchema) {
       await this.checkQualifiedFullReplay(context, sink, qualified.statuses);
       this.runFullOnly(context, sink, false);
@@ -576,11 +688,15 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
     }
   }
 
-  private runQuickCheck(context: ProjectContext, sink: IntegrityIssueSink): void {
+  private runQuickCheck(
+    context: ProjectContext,
+    sink: IntegrityIssueSink,
+    qualifiedEndpointOnly = false,
+  ): void {
     this.checkAuthorization(context, sink);
     this.checkAuthorityLinkage(context, sink, false);
     this.checkLeases(context, sink);
-    this.checkWorkflowShape(context, sink);
+    this.checkWorkflowShape(context, sink, qualifiedEndpointOnly);
     this.checkOutboxShape(context, sink, false);
   }
 
@@ -594,25 +710,21 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
     sink: IntegrityIssueSink,
     includeLegacyEvidence: boolean,
   ): void {
-    this.checkAuthorityLinkage(context, sink, true);
+    const historyAlreadyReplayed = !includeLegacyEvidence;
+    this.checkAuthorityLinkage(context, sink, true, historyAlreadyReplayed);
     if (includeLegacyEvidence) this.checkEvidence(context, sink);
-    this.checkApprovalsAndTransfers(context, sink);
+    this.checkApprovalsAndTransfers(context, sink, historyAlreadyReplayed);
     this.checkValidation(context, sink);
-    this.checkWorkflowClaims(context, sink);
+    this.checkWorkflowClaims(context, sink, historyAlreadyReplayed);
     this.checkOutboxShape(context, sink, true);
   }
 
   private async checkQualifiedQuick(
     context: ProjectContext,
     sink: IntegrityIssueSink,
+    includeBoundedHistory = true,
+    qualifiedSchema = this.hasQualifiedLifecycleSchema(),
   ): Promise<QualifiedQuickResult> {
-    const qualifiedSchema = this.connection.prepare(`
-      SELECT 1 AS present
-      FROM sqlite_schema
-      WHERE type = 'table'
-        AND name = 'session_evidence_coverage_transitions'
-      LIMIT 1
-    `).get() !== undefined;
     const statuses = new Map<string, "available">();
     const readonlyAvailableStatuses: ReadonlyMap<string, "available"> = statuses;
     if (!qualifiedSchema) {
@@ -708,18 +820,19 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
       },
     };
     const coverage = new EvidenceCoverageRepository(cached);
-
-    try {
-      this.checkCurrentCheckpointIndexes(context);
-    } catch {
-      issue(sink, "SESSION_AUTHORITY_FOLD_MISMATCH");
-      return { qualifiedSchema: true, statuses: readonlyAvailableStatuses };
-    }
-    try {
-      this.checkFrozenWorkflowIntegrity(context);
-    } catch {
-      issue(sink, "LIFECYCLE_WORKFLOW_INVARIANT_MISMATCH");
-      return { qualifiedSchema: true, statuses: readonlyAvailableStatuses };
+    if (includeBoundedHistory) {
+      try {
+        this.checkCurrentCheckpointIndexes(context);
+      } catch {
+        issue(sink, "SESSION_AUTHORITY_FOLD_MISMATCH");
+        return { qualifiedSchema: true, statuses: readonlyAvailableStatuses };
+      }
+      try {
+        this.checkFrozenWorkflowIntegrity(context);
+      } catch {
+        issue(sink, "LIFECYCLE_WORKFLOW_INVARIANT_MISMATCH");
+        return { qualifiedSchema: true, statuses: readonlyAvailableStatuses };
+      }
     }
     try {
       this.checkProspectiveCapacity(context, coverage, sessionIds);
@@ -759,7 +872,7 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
       );
       opened.push(ordinals);
       const intents = this.indexWorkflowIntents(context);
-      const checkpointBases = this.indexHistoricalCheckpointBases(context);
+      const checkpointPlan = this.indexHistoricalCheckpointBases(context);
       const preIndexes = this.indexReplayPreIndexes(context);
       const endpoints = this.indexReplayEndpoints(context);
       await this.replayProjectionCorrespondence(
@@ -770,7 +883,7 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
         transitions,
         ordinals,
         intents,
-        checkpointBases,
+        checkpointPlan,
         preIndexes,
         endpoints,
         replayStatuses,
@@ -833,13 +946,17 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
     transitions: DetachedReplayCursor<QualifiedTransitionReplayRow>,
     ordinals: DetachedReplayCursor<ImmutableOrdinalIdentity>,
     intents: ReadonlyMap<string, IndexedReplayIntent>,
-    checkpointBases: ReadonlyMap<bigint, ReadonlySet<string>>,
+    checkpointPlan: HistoricalCheckpointPlan,
     preIndexes: ReplayPreIndexes,
     endpoints: ReplayEndpointIndexes,
     replayStatuses: Map<string, "available">,
     sink: IntegrityIssueSink,
   ): Promise<void> {
     const aggregates = new Map<string, SessionAggregateState>();
+    const authorityPositions = new Map<string, bigint>();
+    const checkpointRequirements = new Map<string, CheckpointRequirementFold>();
+    const revocations = new Map<string, RevocationFold>();
+    const terminalAts = new Map<string, string>();
     const childHeads = new Map<string, ChildEventFoldProjection>();
     const reportWitnesses = new Map<
       string,
@@ -851,6 +968,14 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
     const evidenceStates = new Map<string, Map<string, EvidenceReplayState>>();
     const historicalSnapshots = new Map<string, HistoricalCheckpointCapture>();
     const reconstructedCheckpoints = new Map<string, Checkpoint>();
+    const capturedChildren = new Map<string, ChildEventFoldProjection>();
+    const liveChildrenByRoot = new Map<string, Set<string>>();
+    const activeTicketsByRoot = new Map<string, Set<string>>();
+    const consumedTicketCreates = new Set<string>();
+    const consumedTicketClaims = new Set<string>();
+    const transferSuspensions = new Map<string, TransferSuspensionWitness>();
+    const workflowStates = new Map<string, WorkflowReplayState>();
+    const consumedValidations = new Set<string>();
 
     while (events.peek() !== null) {
       const event = events.advance();
@@ -864,7 +989,10 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
         transition !== null
         && transition.batchEventPosition < event.globalPosition
       ) throw new LifecycleError("INTEGRITY_FAILURE");
-      if (!LIFECYCLE_EVENT_TYPE_SET.has(event.eventType)) {
+      const lifecycleScoped = event.streamType === "session"
+        && event.sessionId !== null
+        && LIFECYCLE_EVENT_TYPE_SET.has(event.eventType);
+      if (!lifecycleScoped) {
         if (
           currentOrdinals.length !== 0
           || transition?.batchEventPosition === event.globalPosition
@@ -873,10 +1001,15 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
         this.assertNoWorkflowProjectionAtOrBefore(workflows, event.globalPosition);
         this.captureHistoricalEvidenceBases(
           event.globalPosition,
-          checkpointBases,
+          checkpointPlan.byBase,
           aggregates,
           evidenceStates,
           historicalSnapshots,
+          capturedChildren,
+          liveChildrenByRoot,
+          activeTicketsByRoot,
+          preIndexes,
+          childHeads,
         );
         continue;
       }
@@ -884,6 +1017,20 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
         throw new LifecycleError("INTEGRITY_FAILURE");
       }
       const decoded = this.foldReplayAuthority(event, aggregates);
+      if (
+        event.sessionId !== null
+        && Object.prototype.hasOwnProperty.call(decoded.payload, "authorityCommitment")
+      ) authorityPositions.set(event.sessionId, event.globalPosition);
+      this.evolveReplayCheckpointRequirement(
+        event,
+        decoded,
+        checkpointRequirements,
+      );
+      const aggregateAtEvent = aggregates.get(event.sessionId!);
+      if (
+        aggregateAtEvent?.terminalEventPosition === event.globalPosition
+      ) terminalAts.set(event.sessionId!, event.occurredAt);
+      this.evolveReplayRevocation(event, decoded, revocations);
       if (
         decoded.eventType === "EvidenceCoverageRecorded"
         && decoded.eventSchemaVersion === 2
@@ -905,6 +1052,11 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
         );
         transitions.advance();
       } else if (
+        decoded.eventType === "EvidenceCoverageRecorded"
+        && decoded.eventSchemaVersion === 1
+      ) {
+        throw new LifecycleError("INTEGRITY_FAILURE");
+      } else if (
         currentOrdinals.length !== 0
         || transition?.batchEventPosition === event.globalPosition
       ) {
@@ -917,14 +1069,22 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
           decoded,
           intents,
           historicalSnapshots,
-          childHeads,
-          preIndexes.transferTickets,
           endpoints,
         );
         if (reconstructedCheckpoints.has(reconstructed.checkpointId)) {
           throw new LifecycleError("INTEGRITY_FAILURE");
         }
         reconstructedCheckpoints.set(reconstructed.checkpointId, reconstructed);
+        this.applyFinalCheckpointWorkflowState(
+          event,
+          decoded,
+          intents.get(event.commandId),
+          reconstructed,
+          reconstructedCheckpoints,
+          preIndexes,
+          evidenceStates,
+          workflowStates,
+        );
       }
       const classification = classifyChildProjectionEvent(event);
       if (classification === "child-only" || classification === "dual-scope-child") {
@@ -950,6 +1110,30 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
         ) throw new LifecycleError("INTEGRITY_FAILURE");
         children.advance();
         childHeads.set(event.sessionId, expected);
+        let liveChildren = liveChildrenByRoot.get(expected.rootSessionId);
+        if (liveChildren === undefined) {
+          liveChildren = new Set<string>();
+          liveChildrenByRoot.set(expected.rootSessionId, liveChildren);
+        }
+        if (
+          expected.childState === "completed"
+          || expected.childState === "suspended"
+          || expected.childState === "transferred"
+        ) liveChildren.delete(expected.childSessionId);
+        else liveChildren.add(expected.childSessionId);
+        if (
+          checkpointPlan.childIdsByPosition.get(event.globalPosition)
+            ?.has(expected.childSessionId) === true
+        ) {
+          const captureKey = this.childCaptureKey(
+            expected.childSessionId,
+            event.globalPosition,
+          );
+          if (capturedChildren.has(captureKey)) {
+            throw new LifecycleError("INTEGRITY_FAILURE");
+          }
+          capturedChildren.set(captureKey, deeplyFreeze({ ...expected }));
+        }
         if (decoded.eventType === "ChildWorkReported") {
           const reportId = expected.reportedReportId;
           if (reportId === null) throw new LifecycleError("INTEGRITY_FAILURE");
@@ -963,6 +1147,18 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
         }
       }
       this.assertNoChildProjectionAtOrBefore(children, event.globalPosition);
+
+      this.consumeTransferTicketGroups(
+        event,
+        decoded,
+        preIndexes,
+        aggregates,
+        reconstructedCheckpoints,
+        transferSuspensions,
+        activeTicketsByRoot,
+        consumedTicketCreates,
+        consumedTicketClaims,
+      );
 
       const workflow = classifyWorkflowProjectionEvent(event);
       if (workflow.kind === "identified") {
@@ -1016,14 +1212,35 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
         } else {
           throw new LifecycleError("INTEGRITY_FAILURE");
         }
+        workflowStates.set(workflow.workflowId, this.evolveWorkflowGenerationState(
+          event,
+          decoded,
+          indexedIntent,
+          expected,
+          aggregates.get(event.sessionId!),
+          workflowStates.get(workflow.workflowId),
+        ));
       }
       this.assertNoWorkflowProjectionAtOrBefore(workflows, event.globalPosition);
+      this.evolveWorkflowSemanticState(
+        event,
+        decoded,
+        intents.get(event.commandId),
+        preIndexes,
+        workflowStates,
+        consumedValidations,
+      );
       this.captureHistoricalEvidenceBases(
         event.globalPosition,
-        checkpointBases,
+        checkpointPlan.byBase,
         aggregates,
         evidenceStates,
         historicalSnapshots,
+        capturedChildren,
+        liveChildrenByRoot,
+        activeTicketsByRoot,
+        preIndexes,
+        childHeads,
       );
     }
     if (children.peek() !== null) throw new LifecycleError("INTEGRITY_FAILURE");
@@ -1031,14 +1248,30 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
     if (workflows.peek() !== null) throw new LifecycleError("INTEGRITY_FAILURE");
     if (transitions.peek() !== null) throw new LifecycleError("INTEGRITY_FAILURE");
     if (ordinals.peek() !== null) throw new LifecycleError("INTEGRITY_FAILURE");
+    if (
+      consumedTicketCreates.size !== preIndexes.transferTickets.length
+      || preIndexes.transferTickets.some((ticket) => (
+        ticket.claimed_event_position !== null
+        && !consumedTicketClaims.has(String(ticket.transfer_ticket_id))
+      ))
+    ) throw new LifecycleError("INTEGRITY_FAILURE");
+    if (consumedValidations.size !== preIndexes.validations.length) {
+      throw new LifecycleError("INTEGRITY_FAILURE");
+    }
     this.assertReplayEndpointCorrespondence(
       context,
       preIndexes,
       endpoints,
       aggregates,
+      authorityPositions,
+      checkpointRequirements,
+      revocations,
+      terminalAts,
       childHeads,
       workflowHeads,
+      workflowStates,
       reconstructedCheckpoints,
+      evidenceStates,
     );
   }
 
@@ -1050,15 +1283,10 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
     const batchLastOrdinal = int64(row.batch_last_ordinal, true);
     const coverageFirstOrdinal = int64(row.coverage_first_ordinal, true);
     const coverageLastOrdinal = int64(row.coverage_last_ordinal, true);
-    const highestRaw = integer(row.highest_contiguous_ordinal);
+    const highestRaw = signedCoverageInt64(row.highest_contiguous_ordinal);
     const newFrameCount = integer(row.new_frame_count);
     const contentRetained = integer(row.content_retained);
-    let decodedIntervals: unknown;
-    try {
-      decodedIntervals = parsedCanonicalJson(row.missing_intervals_json);
-    } catch {
-      throw new LifecycleError("INTEGRITY_FAILURE");
-    }
+    const decodedIntervals = canonicalCoverageIntervals(row.missing_intervals_json);
     if (
       batchEventPosition === null
       || batchFirstOrdinal === null
@@ -1067,8 +1295,8 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
       || coverageFirstOrdinal !== 0n
       || coverageLastOrdinal === null
       || highestRaw === null
-      || highestRaw < -1
-      || BigInt(highestRaw) > coverageLastOrdinal
+      || highestRaw < -1n
+      || highestRaw > coverageLastOrdinal
       || newFrameCount === null
       || newFrameCount < 0
       || contentRetained !== 0
@@ -1096,20 +1324,17 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
       || row.capture_mode !== "coverage-only"
       || !nonEmpty(row.created_at)
       || typeof row.missing_intervals_json !== "string"
-      || !Array.isArray(decodedIntervals)
+      || decodedIntervals === null
       || decodedIntervals.length > 200
     ) throw new LifecycleError("INTEGRITY_FAILURE");
     const intervals: Array<{ firstOrdinal: bigint; lastOrdinal: bigint }> = [];
     let priorLast = -2n;
     for (const value of decodedIntervals) {
-      if (!Array.isArray(value) || value.length !== 2) {
-        throw new LifecycleError("INTEGRITY_FAILURE");
-      }
-      const firstOrdinal = int64(value[0], true);
-      const lastOrdinal = int64(value[1], true);
+      const firstOrdinal = value.firstOrdinal;
+      const lastOrdinal = value.lastOrdinal;
       if (
-        firstOrdinal === null
-        || lastOrdinal === null
+        firstOrdinal > SQLITE_INT64_MAX
+        || lastOrdinal > SQLITE_INT64_MAX
         || lastOrdinal < firstOrdinal
         || lastOrdinal > coverageLastOrdinal
         || firstOrdinal <= priorLast + 1n
@@ -1127,7 +1352,7 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
       batchLastOrdinal,
       coverageFirstOrdinal,
       coverageLastOrdinal,
-      highestContiguousOrdinal: highestRaw === -1 ? null : BigInt(highestRaw),
+      highestContiguousOrdinal: highestRaw === -1n ? null : highestRaw,
       missingIntervals: intervals,
       missingIntervalsJson: row.missing_intervals_json,
       frameFingerprintAlgorithm: "hmac-sha256" as const,
@@ -1278,7 +1503,7 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
       || transition.adapterSessionId !== payload.adapterSessionId
       || transition.batchId !== payload.batchId
       || transition.batchEventPosition !== event.globalPosition
-      || transition.createdAt !== event.recordedAt
+      || transition.createdAt !== event.occurredAt
       || transition.frameFingerprintAlgorithm !== payload.frameFingerprintAlgorithm
       || transition.frameFingerprintSchemaVersion !== payload.frameFingerprintSchemaVersion
       || transition.frameFingerprintKeyId !== payload.frameFingerprintKeyId
@@ -1308,6 +1533,24 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
     if (
       transition.previousCoverageFingerprintValue
         !== (previous?.coverageFingerprint ?? null)
+      || (previous !== undefined && (
+        previous.checkpointEntry.frameFingerprintAlgorithm
+          !== payload.frameFingerprintAlgorithm
+        || previous.checkpointEntry.frameFingerprintSchemaVersion
+          !== payload.frameFingerprintSchemaVersion
+        || previous.checkpointEntry.frameFingerprintKeyId
+          !== payload.frameFingerprintKeyId
+        || previous.checkpointEntry.frameFingerprintDomain
+          !== payload.frameFingerprintDomain
+        || previous.checkpointEntry.coverageFingerprintAlgorithm
+          !== payload.coverageFingerprintAlgorithm
+        || previous.checkpointEntry.coverageFingerprintSchemaVersion
+          !== payload.coverageFingerprintSchemaVersion
+        || previous.checkpointEntry.coverageFingerprintKeyId
+          !== payload.coverageFingerprintKeyId
+        || previous.checkpointEntry.coverageFingerprintDomain
+          !== payload.coverageFingerprintDomain
+      ))
     ) throw new LifecycleError("INTEGRITY_FAILURE");
 
     const frameOrdinals: bigint[] = [];
@@ -1349,7 +1592,7 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
           identity.sessionId !== event.sessionId
           || identity.adapterSessionId !== payload.adapterSessionId
           || identity.batchId !== payload.batchId
-          || identity.createdAt !== event.recordedAt
+          || identity.createdAt !== event.occurredAt
         ) throw new LifecycleError("INTEGRITY_FAILURE");
         expectedCurrentKeys.add(key);
         newFrames.push(deeplyFreeze({ ...frame }));
@@ -1381,6 +1624,64 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
       || canonicalJson(payload.missingIntervals)
         !== canonicalJson(advanced.missingIntervals)
     ) throw new LifecycleError("INTEGRITY_FAILURE");
+
+    const checkpointEntry = deeplyFreeze({
+      adapterSessionId: payload.adapterSessionId,
+      coverageFirstOrdinal: payload.coverageFirstOrdinal,
+      coverageLastOrdinal: payload.coverageLastOrdinal,
+      highestContiguousOrdinal: payload.highestContiguousOrdinal,
+      missingIntervals: payload.missingIntervals,
+      frameFingerprintAlgorithm: payload.frameFingerprintAlgorithm,
+      frameFingerprintSchemaVersion: payload.frameFingerprintSchemaVersion,
+      frameFingerprintKeyId: payload.frameFingerprintKeyId,
+      frameFingerprintDomain: payload.frameFingerprintDomain,
+      coverageFingerprintAlgorithm: payload.coverageFingerprintAlgorithm,
+      coverageFingerprintSchemaVersion: payload.coverageFingerprintSchemaVersion,
+      coverageFingerprintKeyId: payload.coverageFingerprintKeyId,
+      coverageFingerprintDomain: payload.coverageFingerprintDomain,
+      coverageFingerprint: payload.coverageFingerprint,
+      latestBatchId: payload.batchId,
+      latestBatchEventPosition: event.globalPosition.toString(),
+    });
+    const candidateState: EvidenceReplayState = deeplyFreeze({
+      sessionId: event.sessionId,
+      createdAt: previous?.createdAt ?? event.occurredAt,
+      updatedAt: event.occurredAt,
+      coverageLastOrdinal: BigInt(advanced.coverageLastOrdinal),
+      missingIntervalsJson: transition.missingIntervalsJson,
+      missingIntervals: transition.missingIntervals,
+      coverageFingerprint: payload.coverageFingerprint,
+      checkpointEntry,
+    });
+    const candidateEntries = [...sessionStates.values()]
+      .filter((state) => (
+        state.checkpointEntry.adapterSessionId !== payload.adapterSessionId
+      ))
+      .map((state) => state.checkpointEntry)
+      .concat(checkpointEntry)
+      .sort((left, right) => binaryCompare(
+        left.adapterSessionId,
+        right.adapterSessionId,
+      ));
+    const candidateCoverage: CheckpointEvidenceCoverageV2 = deeplyFreeze({
+      coverageVersion: 2,
+      captureMode: "coverage-only",
+      contentRetained: false,
+      adapterSessions: candidateEntries,
+    });
+    try {
+      assertEvidenceCoverageProjectionBounds({
+        prospectiveAdapterCount: candidateEntries.length,
+        prospectiveTotalIntervalCount: candidateEntries.reduce(
+          (total, entry) => total + entry.missingIntervals.length,
+          0,
+        ),
+        targetIntervalCount: checkpointEntry.missingIntervals.length,
+        evidenceCoverage: candidateCoverage,
+      });
+    } catch {
+      throw new LifecycleError("INTEGRITY_FAILURE");
+    }
 
     await this.requireReplayStatus(payload.coverageFingerprintKeyId, statuses);
     if (newFrames.length === 0) {
@@ -1440,82 +1741,230 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
         issue(sink, "SESSION_EVIDENCE_COVERAGE_MISMATCH");
       }
     }
-    sessionStates.set(payload.adapterSessionId, deeplyFreeze({
-      sessionId: event.sessionId,
-      coverageLastOrdinal: BigInt(advanced.coverageLastOrdinal),
-      missingIntervals: transition.missingIntervals,
-      coverageFingerprint: payload.coverageFingerprint,
-      checkpointEntry: deeplyFreeze({
-        adapterSessionId: payload.adapterSessionId,
-        coverageFirstOrdinal: payload.coverageFirstOrdinal,
-        coverageLastOrdinal: payload.coverageLastOrdinal,
-        highestContiguousOrdinal: payload.highestContiguousOrdinal,
-        missingIntervals: payload.missingIntervals,
-        frameFingerprintAlgorithm: payload.frameFingerprintAlgorithm,
-        frameFingerprintSchemaVersion: payload.frameFingerprintSchemaVersion,
-        frameFingerprintKeyId: payload.frameFingerprintKeyId,
-        frameFingerprintDomain: payload.frameFingerprintDomain,
-        coverageFingerprintAlgorithm: payload.coverageFingerprintAlgorithm,
-        coverageFingerprintSchemaVersion: payload.coverageFingerprintSchemaVersion,
-        coverageFingerprintKeyId: payload.coverageFingerprintKeyId,
-        coverageFingerprintDomain: payload.coverageFingerprintDomain,
-        coverageFingerprint: payload.coverageFingerprint,
-        latestBatchId: payload.batchId,
-        latestBatchEventPosition: event.globalPosition.toString(),
-      }),
-    }));
+    sessionStates.set(payload.adapterSessionId, candidateState);
   }
 
   private indexHistoricalCheckpointBases(
     context: ProjectContext,
-  ): ReadonlyMap<bigint, ReadonlySet<string>> {
+  ): HistoricalCheckpointPlan {
     const rows = this.connection.prepare(`
-      SELECT /* lifecycle-full:pre-index */ global_position, session_id,
-             payload_json
-      FROM events INDEXED BY events_project_position
-      WHERE project_id = $projectId
-        AND event_type = 'SessionCheckpointRecorded'
-      ORDER BY global_position
+      SELECT /* lifecycle-full:pre-index */ event.*
+      FROM events AS event INDEXED BY events_project_position
+      WHERE event.project_id = $projectId
+        AND event.stream_type = 'session'
+        AND event.session_id IS NOT NULL
+        AND event.event_type = 'SessionCheckpointRecorded'
+      ORDER BY event.global_position
     `).all({ $projectId: context.binding.projectId });
-    const mutable = new Map<bigint, Set<string>>();
+    const byBase = new Map<bigint, HistoricalCheckpointRequest[]>();
+    const childIdsByPosition = new Map<bigint, Set<string>>();
     for (const row of rows) {
+      const stored = this.hydrateReplayEvent({ ...row });
       let payload: unknown;
       try {
-        payload = parsedCanonicalJson(row.payload_json);
+        payload = parsedCanonicalJson(stored.payloadJson);
       } catch {
         throw new LifecycleError("INTEGRITY_FAILURE");
       }
+      const payloadRecord = record(payload) ? payload : null;
+      const checkpoint = payloadRecord !== null && record(payloadRecord.checkpoint)
+        ? payloadRecord.checkpoint
+        : null;
       if (
-        int64(row.global_position) === null
-        || !nonEmpty(row.session_id)
-        || !record(payload)
-        || !positiveDecimalString(payload.baseEventPosition)
+        checkpoint === null
+        || stored.sessionId === null
+        || payloadRecord === null
+        || !positiveDecimalString(payloadRecord.baseEventPosition)
+        || !positiveDecimalString(payloadRecord.checkpointEventPosition)
+        || !nonEmpty(checkpoint.checkpointId)
+        || checkpoint.sessionId !== stored.sessionId
+        || checkpoint.parentSessionId !== stored.parentSessionId
+        || checkpoint.baseEventPosition !== payloadRecord.baseEventPosition
+        || checkpoint.checkpointEventPosition !== payloadRecord.checkpointEventPosition
+        || BigInt(payloadRecord.checkpointEventPosition as string) !== stored.globalPosition
+        || stored.globalPosition !== BigInt(payloadRecord.baseEventPosition as string) + 1n
+        || !Array.isArray(checkpoint.childSummaries)
       ) throw new LifecycleError("INTEGRITY_FAILURE");
-      const base = BigInt(String(payload.baseEventPosition));
-      let sessions = mutable.get(base);
-      if (sessions === undefined) {
-        sessions = new Set<string>();
-        mutable.set(base, sessions);
+      const base = BigInt(String(payloadRecord.baseEventPosition));
+      const seenChildren = new Set<string>();
+      for (const candidate of checkpoint.childSummaries) {
+        if (
+          !record(candidate)
+          || !nonEmpty(candidate.childSessionId)
+          || seenChildren.has(candidate.childSessionId as string)
+          || !positiveDecimalString(candidate.lastEventPosition)
+          || !positiveDecimalString(candidate.streamVersion)
+          || typeof candidate.state !== "string"
+          || (
+            candidate.latestCheckpointId !== null
+            && !nonEmpty(candidate.latestCheckpointId)
+          )
+        ) throw new LifecycleError("INTEGRITY_FAILURE");
+        seenChildren.add(candidate.childSessionId as string);
+        const position = BigInt(candidate.lastEventPosition as string);
+        let childIds = childIdsByPosition.get(position);
+        if (childIds === undefined) {
+          childIds = new Set<string>();
+          childIdsByPosition.set(position, childIds);
+        }
+        childIds.add(candidate.childSessionId as string);
       }
-      sessions.add(row.session_id as string);
+      let requests = byBase.get(base);
+      if (requests === undefined) {
+        requests = [];
+        byBase.set(base, requests);
+      }
+      requests.push(deeplyFreeze({
+        checkpointId: checkpoint.checkpointId as string,
+        sessionId: stored.sessionId,
+        baseEventPosition: base,
+        checkpointEventPosition: stored.globalPosition,
+        childSummaries: deeplyFreeze(checkpoint.childSummaries) as unknown as Checkpoint["childSummaries"],
+      }));
     }
-    return mutable;
+    return deeplyFreeze({ byBase, childIdsByPosition });
   }
 
   private historicalSnapshotKey(sessionId: string, base: bigint): string {
     return canonicalJson([sessionId, base.toString()]);
   }
 
+  private childCaptureKey(childSessionId: string, position: bigint): string {
+    return canonicalJson([childSessionId, position.toString()]);
+  }
+
+  private consumeTransferTicketGroups(
+    stored: StoredEvent,
+    event: LifecycleEvent,
+    indexes: ReplayPreIndexes,
+    aggregates: ReadonlyMap<string, SessionAggregateState>,
+    checkpoints: ReadonlyMap<string, Checkpoint>,
+    suspensions: Map<string, TransferSuspensionWitness>,
+    activeByRoot: Map<string, Set<string>>,
+    consumedCreates: Set<string>,
+    consumedClaims: Set<string>,
+  ): void {
+    if (event.eventType === "ChildSessionSuspended") {
+      if (stored.sessionId === null || suspensions.has(stored.sessionId)) {
+        throw new LifecycleError("INTEGRITY_FAILURE");
+      }
+      suspensions.set(stored.sessionId, deeplyFreeze({
+        checkpointId: event.payload.checkpointId,
+        streamVersion: stored.streamVersion,
+        blockers: deeplyFreeze([...event.payload.blockers]),
+        followUps: deeplyFreeze([...event.payload.followUps]),
+      }));
+    }
+    const creates = indexes.ticketsByCreatePosition.get(stored.globalPosition) ?? [];
+    const claims = indexes.ticketsByClaimPosition.get(stored.globalPosition) ?? [];
+    if (event.eventType === "ChildWorkTransferCreated") {
+      if (creates.length !== 1 || stored.sessionId === null) {
+        throw new LifecycleError("INTEGRITY_FAILURE");
+      }
+      const ticket = creates[0]!;
+      const ticketId = event.payload.transferTicketId;
+      const aggregate = aggregates.get(stored.sessionId);
+      const suspension = suspensions.get(stored.sessionId);
+      const checkpoint = checkpoints.get(event.payload.checkpointId);
+      if (
+        aggregate === undefined
+        || aggregate.kind !== "child"
+        || suspension === undefined
+        || checkpoint === undefined
+      ) throw new LifecycleError("INTEGRITY_FAILURE");
+      const expectedAssignment = canonicalJson({
+        assignmentId: aggregate.assignment.assignmentId,
+        summary: aggregate.assignment.summary,
+        scope: aggregate.assignment.scope,
+        assignmentRevision: aggregate.assignmentRevision,
+      });
+      const expectedAnnotations = canonicalJson([{
+        childTransferAnnotationsVersion: 1,
+        blockers: [...suspension.blockers],
+        followUps: [...suspension.followUps],
+      }]);
+      const expectedLegacyFollowUps = suspension.blockers.length === 0
+        ? canonicalJson([...suspension.followUps])
+        : null;
+      if (
+        ticket.transfer_ticket_id !== ticketId
+        || ticket.source_child_session_id !== stored.sessionId
+        || ticket.source_parent_session_id !== stored.parentSessionId
+        || ticket.checkpoint_id !== event.payload.checkpointId
+        || ticket.created_at !== stored.occurredAt
+        || aggregate.state !== "transferred"
+        || aggregate.suspensionCheckpointId !== event.payload.checkpointId
+        || aggregate.terminalEventPosition !== stored.globalPosition
+        || suspension.checkpointId !== event.payload.checkpointId
+        || suspension.streamVersion + 1n !== stored.streamVersion
+        || ticket.source_assignment_json !== expectedAssignment
+        || ticket.source_scope_json !== canonicalJson({
+          scope: aggregate.assignment.scope,
+        })
+        || (
+          ticket.follow_ups_json !== expectedAnnotations
+          && ticket.follow_ups_json !== expectedLegacyFollowUps
+        )
+        || ticket.source_state_json !== canonicalJson(checkpoint.sourceState)
+        || ticket.lineage_json !== canonicalJson({
+          previousParentSessionId: stored.parentSessionId,
+          previousChildSessionId: stored.sessionId,
+          correlationId: aggregate.correlationId,
+          transferEventPosition: stored.globalPosition.toString(),
+        })
+        || consumedCreates.has(ticketId)
+      ) throw new LifecycleError("INTEGRITY_FAILURE");
+      let active = activeByRoot.get(ticket.source_parent_session_id as string);
+      if (active === undefined) {
+        active = new Set<string>();
+        activeByRoot.set(ticket.source_parent_session_id as string, active);
+      }
+      active.add(ticketId);
+      consumedCreates.add(ticketId);
+      suspensions.delete(stored.sessionId);
+    } else if (creates.length !== 0) {
+      throw new LifecycleError("INTEGRITY_FAILURE");
+    }
+    if (event.eventType === "ChildWorkTransferClaimed") {
+      if (claims.length !== 1 || stored.sessionId === null) {
+        throw new LifecycleError("INTEGRITY_FAILURE");
+      }
+      const ticket = claims[0]!;
+      const ticketId = event.payload.transferTicketId;
+      const active = activeByRoot.get(ticket.source_parent_session_id as string);
+      if (
+        ticket.transfer_ticket_id !== ticketId
+        || ticket.source_child_session_id !== event.payload.previousChildSessionId
+        || decimal(ticket.created_event_position)
+          !== event.payload.previousTransferEventPosition
+        || ticket.claimed_by_root_session_id !== stored.parentSessionId
+        || ticket.claimed_child_session_id !== stored.sessionId
+        || ticket.claimed_at !== stored.occurredAt
+        || active?.delete(ticketId) !== true
+        || consumedClaims.has(ticketId)
+      ) throw new LifecycleError("INTEGRITY_FAILURE");
+      consumedClaims.add(ticketId);
+    } else if (claims.length !== 0) {
+      throw new LifecycleError("INTEGRITY_FAILURE");
+    }
+  }
+
   private captureHistoricalEvidenceBases(
     position: bigint,
-    requested: ReadonlyMap<bigint, ReadonlySet<string>>,
+    requested: ReadonlyMap<bigint, readonly HistoricalCheckpointRequest[]>,
     aggregates: ReadonlyMap<string, SessionAggregateState>,
     states: ReadonlyMap<string, ReadonlyMap<string, EvidenceReplayState>>,
     snapshots: Map<string, HistoricalCheckpointCapture>,
+    capturedChildren: ReadonlyMap<string, ChildEventFoldProjection>,
+    liveChildrenByRoot: ReadonlyMap<string, ReadonlySet<string>>,
+    activeTicketsByRoot: ReadonlyMap<string, ReadonlySet<string>>,
+    preIndexes: ReplayPreIndexes,
+    childHeads: ReadonlyMap<string, ChildEventFoldProjection>,
   ): void {
-    const sessions = requested.get(position);
-    if (sessions === undefined) return;
-    for (const sessionId of sessions) {
+    const requests = requested.get(position);
+    if (requests === undefined) return;
+    for (const request of requests) {
+      const sessionId = request.sessionId;
       const aggregate = aggregates.get(sessionId);
       if (aggregate === undefined) throw new LifecycleError("INTEGRITY_FAILURE");
       const adapterSessions = [...(states.get(sessionId)?.values() ?? [])]
@@ -1526,9 +1975,17 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
         ));
       const key = this.historicalSnapshotKey(sessionId, position);
       if (snapshots.has(key)) throw new LifecycleError("INTEGRITY_FAILURE");
+      const childSummaries = this.captureCheckpointChildSummaries(
+        request,
+        capturedChildren,
+        liveChildrenByRoot,
+        activeTicketsByRoot,
+        preIndexes,
+        childHeads,
+      );
       snapshots.set(key, deeplyFreeze({
         aggregate: deeplyFreeze({ ...aggregate }) as SessionAggregateState,
-        childSummaries: deeplyFreeze([]) as unknown as Checkpoint["childSummaries"],
+        childSummaries,
         evidenceCoverage: deeplyFreeze({
           coverageVersion: 2,
           captureMode: "coverage-only",
@@ -1539,14 +1996,79 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
     }
   }
 
+  private captureCheckpointChildSummaries(
+    request: HistoricalCheckpointRequest,
+    capturedChildren: ReadonlyMap<string, ChildEventFoldProjection>,
+    liveChildrenByRoot: ReadonlyMap<string, ReadonlySet<string>>,
+    activeTicketsByRoot: ReadonlyMap<string, ReadonlySet<string>>,
+    preIndexes: ReplayPreIndexes,
+    childHeads: ReadonlyMap<string, ChildEventFoldProjection>,
+  ): Checkpoint["childSummaries"] {
+    const liveCount = liveChildrenByRoot.get(request.sessionId)?.size ?? 0;
+    const activeTicketCount = activeTicketsByRoot.get(request.sessionId)?.size ?? 0;
+    if (request.childSummaries.length !== liveCount + activeTicketCount) {
+      throw new LifecycleError("INTEGRITY_FAILURE");
+    }
+    const summaries = request.childSummaries.map((summary) => {
+      const lastEventPosition = BigInt(summary.lastEventPosition);
+      const captured = capturedChildren.get(this.childCaptureKey(
+        summary.childSessionId,
+        lastEventPosition,
+      ));
+      const headAtBase = childHeads.get(summary.childSessionId);
+      if (
+        captured === undefined
+        || headAtBase === undefined
+        || captured.rootSessionId !== request.sessionId
+        || headAtBase.eventPosition !== captured.eventPosition
+        || captured.childState !== summary.state
+        || captured.streamVersion.toString() !== summary.streamVersion
+        || captured.latestCheckpointId !== summary.latestCheckpointId
+      ) throw new LifecycleError("INTEGRITY_FAILURE");
+      if (summary.state === "transferred") {
+        if (summary.latestCheckpointId === null) {
+          throw new LifecycleError("INTEGRITY_FAILURE");
+        }
+        const bindingKey = canonicalJson([
+          request.sessionId,
+          summary.childSessionId,
+          summary.latestCheckpointId,
+          summary.lastEventPosition,
+        ]);
+        const ticket = preIndexes.transferTicketByBinding.get(bindingKey);
+        const ticketId = ticket?.transfer_ticket_id;
+        const created = ticket === undefined ? null : int64(ticket.created_event_position);
+        const claimed = ticket === undefined ? null : int64(ticket.claimed_event_position);
+        if (
+          ticket === undefined
+          || !nonEmpty(ticketId)
+          || created === null
+          || created > request.baseEventPosition
+          || (claimed !== null && claimed <= request.baseEventPosition)
+          || activeTicketsByRoot.get(request.sessionId)?.has(ticketId as string) !== true
+        ) throw new LifecycleError("INTEGRITY_FAILURE");
+      } else if (
+        liveChildrenByRoot.get(request.sessionId)?.has(summary.childSessionId) !== true
+      ) {
+        throw new LifecycleError("INTEGRITY_FAILURE");
+      }
+      return deeplyFreeze({
+        childSessionId: captured.childSessionId,
+        state: captured.childState,
+        lastEventPosition: captured.eventPosition.toString(),
+        streamVersion: captured.streamVersion.toString(),
+        latestCheckpointId: captured.latestCheckpointId,
+      });
+    }).sort((left, right) => binaryCompare(left.childSessionId, right.childSessionId));
+    return deeplyFreeze(summaries) as unknown as Checkpoint["childSummaries"];
+  }
+
   private assertHistoricalCheckpoint(
     context: ProjectContext,
     stored: StoredEvent,
     event: Extract<LifecycleEvent, { readonly eventType: "SessionCheckpointRecorded" }>,
     intents: ReadonlyMap<string, IndexedReplayIntent>,
     snapshots: ReadonlyMap<string, HistoricalCheckpointCapture>,
-    childHeads: ReadonlyMap<string, ChildEventFoldProjection>,
-    transferTickets: readonly Readonly<SqliteRow>[],
     endpoints: ReplayEndpointIndexes,
   ): Checkpoint {
     const checkpoint = event.payload.checkpoint;
@@ -1556,33 +2078,51 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
       || checkpoint.baseEventPosition !== event.payload.baseEventPosition
       || checkpoint.checkpointEventPosition !== event.payload.checkpointEventPosition
       || checkpoint.checkpointEventPosition !== event.globalPosition
+      || stored.globalPosition !== BigInt(checkpoint.baseEventPosition) + 1n
     ) throw new LifecycleError("INTEGRITY_FAILURE");
     const base = BigInt(checkpoint.baseEventPosition);
     const baseSnapshot = snapshots.get(this.historicalSnapshotKey(event.sessionId, base));
-    const snapshot = baseSnapshot === undefined
-      ? undefined
-      : deeplyFreeze({
-          ...baseSnapshot,
-          childSummaries: this.reconstructCheckpointChildSummaries(
-            event.sessionId,
-            stored.globalPosition,
-            childHeads,
-            transferTickets,
-          ),
-        });
+    const snapshot = baseSnapshot;
     const indexedIntent = intents.get(stored.commandId);
     const command = indexedIntent?.witness.intent.command;
+    const authorization = indexedIntent?.witness.intent.authorization;
+    const manual = record(command) && command.commandType === "record-checkpoint";
+    const internalAction = record(command)
+      && command.commandType === "internal-workflow-phase"
+      && record(command.action)
+      && command.action.action === "record-final-checkpoint-and-queue-ending"
+      ? command.action
+      : null;
+    const draftSource = manual && record(command.draft)
+      ? command.draft
+      : internalAction !== null && record(internalAction.finalCheckpoint)
+        ? internalAction.finalCheckpoint
+        : null;
     if (
       snapshot === undefined
       || indexedIntent === undefined
       || indexedIntent.commandHash === null
       || !record(command)
-      || command.commandType !== "record-checkpoint"
-      || command.sessionId !== event.sessionId
-      || command.expectedStreamVersion !== snapshot.aggregate.streamVersion.toString()
+      || draftSource === null
       || (
-        command.expectedBaseEventPosition !== null
-        && command.expectedBaseEventPosition !== checkpoint.baseEventPosition
+        manual
+          ? command.sessionId !== event.sessionId
+            || command.expectedStreamVersion !== snapshot.aggregate.streamVersion.toString()
+            || (
+              command.expectedBaseEventPosition !== null
+              && command.expectedBaseEventPosition !== checkpoint.baseEventPosition
+            )
+          : internalAction === null
+            || authorization?.authorizationKind !== "internal-workflow"
+            || authorization.authorizationSessionId !== event.sessionId
+            || authorization.targetSessionId !== event.sessionId
+            || authorization.internalWorkflowId !== command.workflowId
+            || authorization.internalWorkflowGeneration !== command.workflowGeneration
+            || authorization.internalPlannedWorkId !== command.plannedWorkId
+            || command.sourcePhase !== "children-resolved"
+            || !nonEmpty(internalAction.materializationTarget)
+            || canonicalJson(internalAction.finalCheckpoint)
+              !== canonicalJson(checkpoint)
       )
       || stored.streamVersion !== snapshot.aggregate.streamVersion + 1n
       || snapshot.aggregate.parentSessionId !== event.parentSessionId
@@ -1598,10 +2138,15 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
     const evidenceCoverage = checkpoint.checkpointVersion === 2
       ? snapshot.evidenceCoverage
       : snapshot.evidenceCoverage.adapterSessions.length === 0
-        ? checkpoint.evidenceCoverage
+        ? deeplyFreeze({
+            captureMode: "coverage-only" as const,
+            contentRetained: false as const,
+            highestContiguousOrdinal: null,
+            missingIntervals: deeplyFreeze([]),
+          })
         : (() => { throw new LifecycleError("INTEGRITY_FAILURE"); })();
     const expected = deeplyFreeze({
-      ...(command.draft as Record<string, unknown>),
+      ...draftSource,
       checkpointId: checkpoint.checkpointId,
       sessionId: event.sessionId,
       parentSessionId: event.parentSessionId,
@@ -1627,49 +2172,6 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
       )
     ) throw new LifecycleError("INTEGRITY_FAILURE");
     return expected;
-  }
-
-  private reconstructCheckpointChildSummaries(
-    rootSessionId: string,
-    checkpointEventPosition: bigint,
-    childHeads: ReadonlyMap<string, ChildEventFoldProjection>,
-    transferTickets: readonly Readonly<SqliteRow>[],
-  ): Checkpoint["childSummaries"] {
-    const activeTransferredChildren = new Set<string>();
-    for (const ticket of transferTickets) {
-      const created = int64(ticket.created_event_position);
-      const claimed = int64(ticket.claimed_event_position);
-      if (
-        ticket.source_parent_session_id === rootSessionId
-        && typeof ticket.source_child_session_id === "string"
-        && created !== null
-        && created < checkpointEventPosition
-        && (claimed === null || claimed >= checkpointEventPosition)
-      ) activeTransferredChildren.add(ticket.source_child_session_id);
-    }
-    return deeplyFreeze([...childHeads.values()]
-      .filter((child) => (
-        child.rootSessionId === rootSessionId
-        && (
-          child.terminalEventPosition === null
-          || (
-            child.childState === "transferred"
-            && child.terminalEventType === "ChildWorkTransferCreated"
-            && activeTransferredChildren.has(child.childSessionId)
-          )
-        )
-      ))
-      .map((child) => deeplyFreeze({
-        childSessionId: child.childSessionId,
-        state: child.childState,
-        lastEventPosition: child.eventPosition.toString(),
-        streamVersion: child.streamVersion.toString(),
-        latestCheckpointId: child.latestCheckpointId,
-      }))
-      .sort((left, right) => binaryCompare(
-        left.childSessionId,
-        right.childSessionId,
-      ))) as unknown as Checkpoint["childSummaries"];
   }
 
   private indexWorkflowIntents(
@@ -1737,7 +2239,92 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
       ORDER BY created_event_position, transfer_ticket_id
     `).all({ $projectId: context.binding.projectId })
       .map((row) => deeplyFreeze({ ...row }));
-    return deeplyFreeze({ transferTickets });
+    const transferTicketById = new Map<string, Readonly<SqliteRow>>();
+    const transferTicketByBinding = new Map<string, Readonly<SqliteRow>>();
+    const ticketsByCreatePosition = new Map<bigint, Readonly<SqliteRow>[]>();
+    const ticketsByClaimPosition = new Map<bigint, Readonly<SqliteRow>[]>();
+    const appendAt = (
+      target: Map<bigint, Readonly<SqliteRow>[]>,
+      position: bigint,
+      row: Readonly<SqliteRow>,
+    ): void => {
+      const rows = target.get(position) ?? [];
+      rows.push(row);
+      target.set(position, rows);
+    };
+    for (const ticket of transferTickets) {
+      const ticketId = ticket.transfer_ticket_id;
+      const created = int64(ticket.created_event_position);
+      const claimed = int64(ticket.claimed_event_position);
+      const claimTuple = [
+        ticket.claimed_by_root_session_id,
+        ticket.claimed_child_session_id,
+        ticket.claimed_event_position,
+        ticket.claimed_at,
+      ];
+      const claimAbsent = claimTuple.every((value) => value === null);
+      const claimPresent = claimTuple.every(present);
+      if (
+        !nonEmpty(ticketId)
+        || transferTicketById.has(ticketId as string)
+        || !nonEmpty(ticket.source_parent_session_id)
+        || !nonEmpty(ticket.source_child_session_id)
+        || !nonEmpty(ticket.checkpoint_id)
+        || created === null
+        || (!claimAbsent && !claimPresent)
+        || (claimPresent && (
+          claimed === null
+          || !nonEmpty(ticket.claimed_by_root_session_id)
+          || !nonEmpty(ticket.claimed_child_session_id)
+          || !nonEmpty(ticket.claimed_at)
+        ))
+      ) throw new LifecycleError("INTEGRITY_FAILURE");
+      const bindingKey = canonicalJson([
+        ticket.source_parent_session_id,
+        ticket.source_child_session_id,
+        ticket.checkpoint_id,
+        created.toString(),
+      ]);
+      if (transferTicketByBinding.has(bindingKey)) {
+        throw new LifecycleError("INTEGRITY_FAILURE");
+      }
+      transferTicketById.set(ticketId as string, ticket);
+      transferTicketByBinding.set(bindingKey, ticket);
+      appendAt(ticketsByCreatePosition, created, ticket);
+      if (claimed !== null) appendAt(ticketsByClaimPosition, claimed, ticket);
+    }
+    const validations = this.connection.prepare(`
+      SELECT /* lifecycle-full:pre-index */ *
+      FROM lifecycle_validation_results
+      WHERE project_id = $projectId
+      ORDER BY recorded_event_position, result_id
+    `).all({ $projectId: context.binding.projectId })
+      .map((row) => deeplyFreeze({ ...row }));
+    const validationById = new Map<string, Readonly<SqliteRow>>();
+    const validationsByEventPosition = new Map<bigint, Readonly<SqliteRow>[]>();
+    for (const validation of validations) {
+      const resultId = validation.result_id;
+      const position = int64(validation.recorded_event_position);
+      if (
+        !nonEmpty(resultId)
+        || position === null
+        || validationById.has(resultId as string)
+      ) throw new LifecycleError("INTEGRITY_FAILURE");
+      validationById.set(resultId as string, validation);
+      const atPosition = validationsByEventPosition.get(position) ?? [];
+      atPosition.push(validation);
+      validationsByEventPosition.set(position, atPosition);
+    }
+    return deeplyFreeze({
+      transferTickets,
+      transferTicketById,
+      transferTicketByBinding,
+      ticketsByCreatePosition,
+      ticketsByClaimPosition,
+      validations,
+      validationById,
+      validationsByEventPosition,
+    });
   }
 
   private indexReplayEndpoints(context: ProjectContext): ReplayEndpointIndexes {
@@ -1745,14 +2332,8 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
       SELECT /* lifecycle-full:endpoint */ *
       FROM workflow_instances
       WHERE project_id = $projectId
-      ORDER BY workflow_id
-    `).all({ $projectId: context.binding.projectId })
-      .map((row) => deeplyFreeze({ ...row }));
-    const validations = this.connection.prepare(`
-      SELECT /* lifecycle-full:endpoint */ *
-      FROM lifecycle_validation_results
-      WHERE project_id = $projectId
-      ORDER BY recorded_event_position, result_id
+        AND session_id IS NOT NULL
+      ORDER BY CAST(workflow_id AS BLOB)
     `).all({ $projectId: context.binding.projectId })
       .map((row) => deeplyFreeze({ ...row }));
     const authorityRows = this.connection.prepare(`
@@ -1772,7 +2353,761 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
       }
       authorities.set(row.session_id as string, deeplyFreeze({ ...row }));
     }
-    return deeplyFreeze({ workflows, validations, authorities });
+    const evidence = this.connection.prepare(`
+      SELECT /* lifecycle-full:endpoint */ aggregate.*,
+             head.batch_event_position AS head_batch_event_position,
+             transition.batch_id AS endpoint_batch_id,
+             transition.batch_event_position AS endpoint_batch_event_position,
+             transition.coverage_fingerprint_value AS endpoint_coverage_fingerprint
+      FROM session_evidence_coverage AS aggregate
+      LEFT JOIN session_evidence_coverage_transition_heads AS head
+        ON head.project_id = aggregate.project_id
+        AND head.session_id = aggregate.session_id
+        AND head.adapter_session_id = aggregate.adapter_session_id
+      LEFT JOIN session_evidence_coverage_transitions AS transition
+        ON transition.project_id = head.project_id
+        AND transition.session_id = head.session_id
+        AND transition.adapter_session_id = head.adapter_session_id
+        AND transition.batch_event_position = head.batch_event_position
+      WHERE aggregate.project_id = $projectId
+      ORDER BY CAST(aggregate.session_id AS BLOB),
+               CAST(aggregate.adapter_session_id AS BLOB)
+    `).all({ $projectId: context.binding.projectId })
+      .map((row) => deeplyFreeze({ ...row }));
+    return deeplyFreeze({ workflows, evidence, authorities });
+  }
+
+  private evolveWorkflowGenerationState(
+    stored: StoredEvent,
+    event: LifecycleEvent,
+    indexedIntent: IndexedReplayIntent,
+    head: WorkflowGenerationFoldProjection,
+    aggregate: SessionAggregateState | undefined,
+    previous: WorkflowReplayState | undefined,
+  ): WorkflowReplayState {
+    const command = indexedIntent.witness.intent.command;
+    if (
+      !record(command)
+      || stored.sessionId === null
+      || aggregate === undefined
+      || aggregate.sessionId !== stored.sessionId
+    ) {
+      throw new LifecycleError("INTEGRITY_FAILURE");
+    }
+    if (event.eventType === "SessionEndRequested") {
+      const request = record(command.request) ? command.request : null;
+      if (
+        command.commandType !== "request-session-end"
+        || request === null
+        || request.sessionId !== stored.sessionId
+        || request.requireMaterialization !== event.payload.requireMaterialization
+        || (
+          previous !== undefined
+          && (
+            previous.phase !== "cancelled"
+            || event.payload.workflowGeneration !== previous.generation + 1
+          )
+        )
+      ) throw new LifecycleError("INTEGRITY_FAILURE");
+      return deeplyFreeze({
+        workflowId: head.workflowId,
+        sessionId: head.sessionId,
+        generation: head.workflowGeneration,
+        triggerEventPosition: head.triggerEventPosition,
+        rootCommandId: head.rootCommandId,
+        expectedAuthorityCommitment: aggregate.authorityCommitment,
+        priorRootState: event.payload.previousState,
+        materializationRequired: event.payload.requireMaterialization,
+        evidenceWindowState: head.evidenceWindowState,
+        phase: "requested" as const,
+        frozenCheckpointId: null,
+        frozenCheckpointEventPosition: null,
+        frozenGeneration: null,
+        endingBindingsJson: null,
+        validationResultIds: new Set<string>(),
+        qualityScore: null,
+        safeFailureCode: null,
+        verificationEventPosition: null,
+        completionEventPosition: null,
+      });
+    }
+    if (previous === undefined || previous.workflowId !== head.workflowId) {
+      throw new LifecycleError("INTEGRITY_FAILURE");
+    }
+    if (event.eventType === "SessionEndAmended") {
+      const amendment = record(command.amendment) ? command.amendment : null;
+      if (
+        command.commandType !== "amend-session-end"
+        || amendment === null
+        || command.workflowId !== previous.workflowId
+        || event.payload.previousWorkflowGeneration !== previous.generation
+        || event.payload.workflowGeneration !== head.workflowGeneration
+        || (
+          amendment.requireMaterialization !== null
+          && typeof amendment.requireMaterialization !== "boolean"
+        )
+      ) throw new LifecycleError("INTEGRITY_FAILURE");
+      const unchanged = event.eventSchemaVersion === 2
+        && event.payload.evidenceWindowAction === "unchanged";
+      const materializationRequired = amendment.requireMaterialization === null
+        ? previous.materializationRequired
+        : amendment.requireMaterialization as boolean;
+      return deeplyFreeze({
+        ...previous,
+        generation: head.workflowGeneration,
+        triggerEventPosition: head.triggerEventPosition,
+        rootCommandId: head.rootCommandId,
+        expectedAuthorityCommitment: aggregate.authorityCommitment,
+        materializationRequired,
+        evidenceWindowState: head.evidenceWindowState,
+        phase: unchanged ? previous.phase : "requested" as const,
+        frozenCheckpointId: unchanged ? previous.frozenCheckpointId : null,
+        frozenCheckpointEventPosition: unchanged
+          ? previous.frozenCheckpointEventPosition
+          : null,
+        frozenGeneration: unchanged ? previous.frozenGeneration : null,
+        endingBindingsJson: unchanged ? previous.endingBindingsJson : null,
+        validationResultIds: unchanged
+          ? previous.validationResultIds
+          : new Set<string>(),
+        qualityScore: unchanged ? previous.qualityScore : null,
+        safeFailureCode: unchanged ? previous.safeFailureCode : null,
+        verificationEventPosition: unchanged
+          ? previous.verificationEventPosition
+          : null,
+        completionEventPosition: unchanged ? previous.completionEventPosition : null,
+      });
+    }
+    if (event.eventType === "SessionEndCancelled") {
+      if (
+        command.commandType !== "cancel-session-end"
+        || command.workflowId !== previous.workflowId
+        || command.preTransitionCheckpointId !== event.payload.preTransitionCheckpointId
+      ) throw new LifecycleError("INTEGRITY_FAILURE");
+      return deeplyFreeze({
+        ...previous,
+        generation: head.workflowGeneration,
+        triggerEventPosition: head.triggerEventPosition,
+        rootCommandId: head.rootCommandId,
+        expectedAuthorityCommitment: aggregate.authorityCommitment,
+        evidenceWindowState: "sealed" as const,
+        phase: "cancelled" as const,
+        frozenCheckpointId: null,
+        frozenCheckpointEventPosition: null,
+        frozenGeneration: null,
+        endingBindingsJson: null,
+        validationResultIds: new Set<string>(),
+        qualityScore: null,
+        safeFailureCode: null,
+        verificationEventPosition: null,
+        completionEventPosition: null,
+      });
+    }
+    if (event.eventType === "SessionAbandoned") {
+      if (
+        command.commandType !== "abandon-session"
+        || command.preTransitionCheckpointId !== event.payload.preTransitionCheckpointId
+      ) throw new LifecycleError("INTEGRITY_FAILURE");
+      return deeplyFreeze({
+        ...previous,
+        generation: head.workflowGeneration,
+        triggerEventPosition: head.triggerEventPosition,
+        rootCommandId: head.rootCommandId,
+        expectedAuthorityCommitment: aggregate.authorityCommitment,
+        evidenceWindowState: "sealed" as const,
+        phase: "abandoned" as const,
+      });
+    }
+    throw new LifecycleError("INTEGRITY_FAILURE");
+  }
+
+  private applyFinalCheckpointWorkflowState(
+    stored: StoredEvent,
+    event: Extract<LifecycleEvent, { readonly eventType: "SessionCheckpointRecorded" }>,
+    indexedIntent: IndexedReplayIntent | undefined,
+    checkpoint: Checkpoint,
+    checkpoints: ReadonlyMap<string, Checkpoint>,
+    preIndexes: ReplayPreIndexes,
+    evidenceStates: ReadonlyMap<string, ReadonlyMap<string, EvidenceReplayState>>,
+    states: Map<string, WorkflowReplayState>,
+  ): void {
+    const command = indexedIntent?.witness.intent.command;
+    if (!record(command) || command.commandType === "record-checkpoint") return;
+    const action = record(command.action) ? command.action : null;
+    if (
+      command.commandType !== "internal-workflow-phase"
+      || action === null
+      || action.action !== "record-final-checkpoint-and-queue-ending"
+      || command.sourcePhase !== "children-resolved"
+      || canonicalJson(action.finalCheckpoint) !== canonicalJson(event.payload.checkpoint)
+    ) throw new LifecycleError("INTEGRITY_FAILURE");
+    const previous = states.get(command.workflowId as string);
+    if (
+      previous === undefined
+      || previous.sessionId !== stored.sessionId
+      || previous.generation !== command.workflowGeneration
+      || previous.phase !== "requested"
+    ) throw new LifecycleError("INTEGRITY_FAILURE");
+    const bindings = this.replayEndingBindings(
+      checkpoint,
+      checkpoints,
+      preIndexes,
+      evidenceStates,
+    );
+    states.set(previous.workflowId, deeplyFreeze({
+      ...previous,
+      evidenceWindowState: "sealed" as const,
+      phase: "final-checkpoint-recorded" as const,
+      frozenCheckpointId: checkpoint.checkpointId,
+      frozenCheckpointEventPosition: stored.globalPosition,
+      frozenGeneration: previous.generation,
+      endingBindingsJson: canonicalJson(bindings),
+      validationResultIds: new Set<string>(),
+      qualityScore: null,
+      safeFailureCode: null,
+      verificationEventPosition: null,
+      completionEventPosition: null,
+    }));
+  }
+
+  private replayEndingBindings(
+    checkpoint: Checkpoint,
+    checkpoints: ReadonlyMap<string, Checkpoint>,
+    preIndexes: ReplayPreIndexes,
+    evidenceStates: ReadonlyMap<string, ReadonlyMap<string, EvidenceReplayState>>,
+  ): readonly FinalEndingScopeBindingV1[] {
+    const base = BigInt(checkpoint.baseEventPosition);
+    const bindings = checkpoint.childSummaries.map((summary) => {
+      const checkpointEventPosition = summary.latestCheckpointId === null
+        ? null
+        : checkpoints.get(summary.latestCheckpointId)?.checkpointEventPosition ?? null;
+      const childCheckpoint = summary.latestCheckpointId === null
+        ? null
+        : checkpoints.get(summary.latestCheckpointId) ?? null;
+      const adapterSessions = [...(evidenceStates.get(summary.childSessionId)?.values() ?? [])]
+        .map((state) => state.checkpointEntry)
+        .sort((left, right) => binaryCompare(
+          left.adapterSessionId,
+          right.adapterSessionId,
+        ));
+      if (
+        childCheckpoint === null
+          ? adapterSessions.length !== 0
+          : childCheckpoint.checkpointVersion === 1
+            ? adapterSessions.length !== 0
+            : canonicalJson(childCheckpoint.evidenceCoverage) !== canonicalJson({
+                coverageVersion: 2,
+                captureMode: "coverage-only",
+                contentRetained: false,
+                adapterSessions,
+              })
+      ) throw new LifecycleError("INTEGRITY_FAILURE");
+      if (summary.state === "transferred") {
+        if (summary.latestCheckpointId === null || checkpointEventPosition === null) {
+          throw new LifecycleError("INTEGRITY_FAILURE");
+        }
+        const ticket = preIndexes.transferTicketByBinding.get(canonicalJson([
+          checkpoint.sessionId,
+          summary.childSessionId,
+          summary.latestCheckpointId,
+          summary.lastEventPosition,
+        ]));
+        const created = ticket === undefined ? null : int64(ticket.created_event_position);
+        const claimed = ticket === undefined ? null : int64(ticket.claimed_event_position);
+        if (
+          ticket === undefined
+          || !nonEmpty(ticket.transfer_ticket_id)
+          || created === null
+          || created > base
+          || (claimed !== null && claimed <= base)
+        ) throw new LifecycleError("INTEGRITY_FAILURE");
+        return {
+          bindingVersion: 1,
+          bindingKind: "carry-forward-ticket" as const,
+          childSessionId: summary.childSessionId,
+          childState: summary.state,
+          lastEventPosition: summary.lastEventPosition,
+          streamVersion: summary.streamVersion,
+          checkpointId: summary.latestCheckpointId,
+          checkpointEventPosition,
+          transferTicketId: ticket.transfer_ticket_id,
+          transferTicketEventPosition: created.toString(),
+        };
+      }
+      return {
+        bindingVersion: 1,
+        bindingKind: "current-child" as const,
+        childSessionId: summary.childSessionId,
+        childState: summary.state,
+        lastEventPosition: summary.lastEventPosition,
+        streamVersion: summary.streamVersion,
+        checkpointId: summary.latestCheckpointId,
+        checkpointEventPosition,
+        transferTicketId: null,
+        transferTicketEventPosition: null,
+      };
+    }).sort((left, right) => binaryCompare(left.childSessionId, right.childSessionId));
+    return decodeFinalEndingScopeBindingsV1(bindings);
+  }
+
+  private evolveWorkflowSemanticState(
+    stored: StoredEvent,
+    event: LifecycleEvent,
+    indexedIntent: IndexedReplayIntent | undefined,
+    preIndexes: ReplayPreIndexes,
+    states: Map<string, WorkflowReplayState>,
+    consumedValidations: Set<string>,
+  ): void {
+    if (event.eventType === "SessionValidationResultRecorded") {
+      const command = indexedIntent?.witness.intent.command;
+      const result = event.payload.validationResult;
+      const rows = preIndexes.validationsByEventPosition.get(stored.globalPosition) ?? [];
+      const state = states.get(event.payload.workflowId);
+      if (
+        !record(command)
+        || command.commandType !== "internal-validation-result"
+        || command.workflowId !== event.payload.workflowId
+        || command.workflowGeneration !== event.payload.workflowGeneration
+        || command.plannedWorkId !== event.payload.plannedWorkId
+        || canonicalJson(command.result) !== canonicalJson(result)
+        || state === undefined
+        || state.sessionId !== stored.sessionId
+        || state.generation !== event.payload.workflowGeneration
+        || state.frozenCheckpointId === null
+        || state.phase !== "final-checkpoint-recorded"
+        && state.phase !== "validating"
+        || rows.length !== 1
+        || rows[0]!.result_id !== result.resultId
+        || consumedValidations.has(result.resultId)
+        || !this.validationRowMatchesEvent(rows[0]!, stored, event)
+        || rows[0]!.final_checkpoint_id !== state.frozenCheckpointId
+      ) throw new LifecycleError("INTEGRITY_FAILURE");
+      const validationResultIds = new Set(state.validationResultIds);
+      validationResultIds.add(result.resultId);
+      consumedValidations.add(result.resultId);
+      states.set(state.workflowId, deeplyFreeze({
+        ...state,
+        phase: "validating" as const,
+        validationResultIds,
+      }));
+      return;
+    }
+    if (
+      event.eventType !== "SessionEndVerificationPassed"
+      && event.eventType !== "SessionEndVerificationFailed"
+      && event.eventType !== "SessionEndVerificationInvalidated"
+      && event.eventType !== "SessionEnded"
+    ) return;
+    const command = indexedIntent?.witness.intent.command;
+    const action = record(command) && record(command.action) ? command.action : null;
+    const workflowId = event.payload.workflowId;
+    const generation = event.payload.workflowGeneration;
+    const state = states.get(workflowId);
+    if (
+      !record(command)
+      || command.commandType !== "internal-workflow-phase"
+      || action === null
+      || command.workflowId !== workflowId
+      || command.workflowGeneration !== generation
+      || state === undefined
+      || state.sessionId !== stored.sessionId
+      || state.generation !== generation
+    ) throw new LifecycleError("INTEGRITY_FAILURE");
+    if (event.eventType === "SessionEndVerificationPassed") {
+      if (
+        command.sourcePhase !== "validating"
+        || action.action !== "record-verification-passed"
+        || canonicalJson(action.validationResultIds)
+          !== canonicalJson(event.payload.validationResultIds)
+        || action.qualityScore !== event.payload.qualityScore
+        || state.phase !== "validating"
+        || event.payload.validationResultIds.length !== state.validationResultIds.size
+        || event.payload.validationResultIds.some((id) => !state.validationResultIds.has(id))
+      ) throw new LifecycleError("INTEGRITY_FAILURE");
+      states.set(workflowId, deeplyFreeze({
+        ...state,
+        phase: "verification-passed" as const,
+        qualityScore: event.payload.qualityScore,
+        safeFailureCode: null,
+        verificationEventPosition: stored.globalPosition,
+      }));
+      return;
+    }
+    if (event.eventType === "SessionEndVerificationFailed") {
+      if (
+        command.sourcePhase !== "validating"
+        || action.action !== "record-verification-failed"
+        || canonicalJson(action.validationResultIds)
+          !== canonicalJson(event.payload.validationResultIds)
+        || action.safeFailureCode !== event.payload.safeFailureCode
+        || state.phase !== "validating"
+        || event.payload.validationResultIds.length !== state.validationResultIds.size
+        || event.payload.validationResultIds.some((id) => !state.validationResultIds.has(id))
+      ) throw new LifecycleError("INTEGRITY_FAILURE");
+      states.set(workflowId, deeplyFreeze({
+        ...state,
+        phase: "verification-failed" as const,
+        qualityScore: null,
+        safeFailureCode: event.payload.safeFailureCode,
+        verificationEventPosition: null,
+      }));
+      return;
+    }
+    if (event.eventType === "SessionEndVerificationInvalidated") {
+      if (
+        command.sourcePhase !== "verification-passed"
+        || action.action !== "invalidate-verification"
+        || action.safeFailureCode !== event.payload.safeFailureCode
+        || state.phase !== "verification-passed"
+        || state.verificationEventPosition?.toString()
+          !== event.payload.previousVerificationEventPosition
+      ) throw new LifecycleError("INTEGRITY_FAILURE");
+      states.set(workflowId, deeplyFreeze({
+        ...state,
+        phase: "verification-failed" as const,
+        qualityScore: null,
+        safeFailureCode: event.payload.safeFailureCode,
+        verificationEventPosition: null,
+      }));
+      return;
+    }
+    if (
+      command.sourcePhase !== "verification-passed"
+      || action.action !== "append-terminal-completion"
+      || action.verificationEventPosition !== event.payload.verificationEventPosition
+      || state.phase !== "verification-passed"
+      || state.verificationEventPosition?.toString()
+        !== event.payload.verificationEventPosition
+    ) throw new LifecycleError("INTEGRITY_FAILURE");
+    states.set(workflowId, deeplyFreeze({
+      ...state,
+      phase: "completion-appended" as const,
+      completionEventPosition: stored.globalPosition,
+    }));
+  }
+
+  private validationRowMatchesEvent(
+    row: Readonly<SqliteRow>,
+    stored: StoredEvent,
+    event: Extract<LifecycleEvent, { readonly eventType: "SessionValidationResultRecorded" }>,
+  ): boolean {
+    const result = event.payload.validationResult;
+    const start = result.sourceStateAtStart;
+    const completion = result.sourceStateAtCompletion;
+    const output = result.outputFingerprint;
+    return row.project_id === stored.projectId
+      && row.vault_id === stored.vaultId
+      && row.store_id === stored.storeId
+      && row.workspace_id === stored.workspaceId
+      && row.session_id === stored.sessionId
+      && row.result_id === result.resultId
+      && sameInteger(row.validation_result_version, result.validationResultVersion)
+      && row.workflow_id === event.payload.workflowId
+      && sameInteger(row.workflow_generation, event.payload.workflowGeneration)
+      && row.profile_id === result.profileId
+      && sameInteger(row.profile_version, result.profileVersion)
+      && row.profile_configuration_hash === result.profileConfigurationHash
+      && row.run_id === result.runId
+      && row.runner_id === result.runnerId
+      && row.final_checkpoint_id === result.finalCheckpointId
+      && row.final_checkpoint_fingerprint === result.finalCheckpointFingerprint
+      && sameInteger(row.validation_start_scope_version, start.sourceStateScopeVersion)
+      && row.validation_start_project_id === result.projectId
+      && row.validation_start_workspace_id === start.workspaceId
+      && row.validation_start_branch_ref === start.branchRef
+      && row.validation_start_head_commit === start.headCommit
+      && row.validation_start_dirty_fingerprint === start.dirtyWorktreeFingerprint
+      && sameInteger(
+        row.validation_completion_scope_version,
+        completion.sourceStateScopeVersion,
+      )
+      && row.validation_completion_project_id === result.projectId
+      && row.validation_completion_workspace_id === completion.workspaceId
+      && row.validation_completion_branch_ref === completion.branchRef
+      && row.validation_completion_head_commit === completion.headCommit
+      && row.validation_completion_dirty_fingerprint
+        === completion.dirtyWorktreeFingerprint
+      && row.started_at === result.startedAt
+      && row.completed_at === result.completedAt
+      && row.status === result.status
+      && row.exit_classification === result.exitClassification
+      && row.redacted_summary === result.summary
+      && row.output_fingerprint_algorithm === "hmac-sha256"
+      && sameInteger(
+        row.output_fingerprint_schema_version,
+        output.fingerprintSchemaVersion,
+      )
+      && row.output_fingerprint_key_id === output.fingerprintKeyId
+      && row.output_fingerprint_domain === output.fingerprintDomain
+      && row.output_fingerprint_value === output.fingerprint
+      && row.artifact_references_json === canonicalJson(result.artifactReferences)
+      && integer(row.fresh) === (result.fresh ? 1 : 0)
+      && int64(row.recorded_event_position) === stored.globalPosition
+      && row.created_at === stored.recordedAt;
+  }
+
+  private authorityRowCommitment(row: Readonly<SqliteRow>): string {
+    const text = (key: string): string => {
+      const value = row[key];
+      if (typeof value !== "string") throw new LifecycleError("INTEGRITY_FAILURE");
+      return value;
+    };
+    const nullableText = (key: string): string | null => {
+      const value = row[key];
+      if (value === null) return null;
+      if (typeof value !== "string") throw new LifecycleError("INTEGRITY_FAILURE");
+      return value;
+    };
+    const nullableVersion = (key: string): number | null => {
+      const value = row[key];
+      if (value === null) return null;
+      const decoded = integer(value);
+      if (decoded === null || decoded < 1) {
+        throw new LifecycleError("INTEGRITY_FAILURE");
+      }
+      return decoded;
+    };
+    const nullablePosition = (key: string): string | null => {
+      const value = row[key];
+      if (value === null) return null;
+      const decoded = int64(value);
+      if (decoded === null) throw new LifecycleError("INTEGRITY_FAILURE");
+      return decoded.toString();
+    };
+    const kind = row.session_kind;
+    const direct = integer(row.direct_access_enabled);
+    if ((kind !== "root" && kind !== "child") || (direct !== 0 && direct !== 1)) {
+      throw new LifecycleError("INTEGRITY_FAILURE");
+    }
+    const committed: CommittedAuthorityV1 = {
+      authorityVersion: 1,
+      projectId: text("project_id"),
+      sessionId: text("session_id"),
+      sessionKind: kind,
+      parentSessionId: nullableText("parent_session_id"),
+      workspaceId: text("workspace_id"),
+      clientNamespace: text("client_namespace"),
+      ownerGeneration: nullablePosition("owner_generation"),
+      childCapabilityGeneration: nullablePosition("child_capability_generation"),
+      directAccessEnabled: direct === 1,
+      continuityFingerprintAlgorithm: nullableText("continuity_fingerprint_algorithm"),
+      continuityFingerprintSchemaVersion: nullableVersion("continuity_fingerprint_schema_version"),
+      continuityFingerprintKeyId: nullableText("continuity_fingerprint_key_id"),
+      continuityFingerprintDomain: nullableText("continuity_fingerprint_domain"),
+      continuityFingerprint: nullableText("continuity_fingerprint"),
+      rootHandleCapabilityVersion: nullableVersion("root_handle_capability_version"),
+      rootHandleKeyId: nullableText("root_handle_key_id"),
+      rootHandleIssueNonce: nullableText("root_handle_issue_nonce"),
+      rootHandleIssuedAt: nullableText("root_handle_issued_at"),
+      rootHandlePolicyCode: nullableText("root_handle_policy_code"),
+      rootHandleExpiryKind: nullableText("root_handle_expiry_kind") as CommittedAuthorityV1["rootHandleExpiryKind"],
+      rootHandleExpiresAt: nullableText("root_handle_expires_at"),
+      rootHandleActorRole: nullableText("root_handle_actor_role") as CommittedAuthorityV1["rootHandleActorRole"],
+      rootHandleClientInstanceId: nullableText("root_handle_client_instance_id"),
+      rootHandleVerifier: nullableText("root_handle_verifier"),
+      resumeTokenCapabilityVersion: nullableVersion("resume_token_capability_version"),
+      resumeTokenKeyId: nullableText("resume_token_key_id"),
+      resumeTokenIssueNonce: nullableText("resume_token_issue_nonce"),
+      resumeTokenIssuedAt: nullableText("resume_token_issued_at"),
+      resumeTokenPolicyCode: nullableText("resume_token_policy_code"),
+      resumeTokenExpiryKind: nullableText("resume_token_expiry_kind") as CommittedAuthorityV1["resumeTokenExpiryKind"],
+      resumeTokenExpiresAt: nullableText("resume_token_expires_at"),
+      resumeTokenActorRole: nullableText("resume_token_actor_role") as CommittedAuthorityV1["resumeTokenActorRole"],
+      resumeTokenVerifier: nullableText("resume_token_verifier"),
+      childHandleCapabilityVersion: nullableVersion("child_handle_capability_version"),
+      childHandleKeyId: nullableText("child_handle_key_id"),
+      childHandleIssueNonce: nullableText("child_handle_issue_nonce"),
+      childHandleIssuedAt: nullableText("child_handle_issued_at"),
+      childHandlePolicyCode: nullableText("child_handle_policy_code"),
+      childHandleExpiryKind: nullableText("child_handle_expiry_kind") as CommittedAuthorityV1["childHandleExpiryKind"],
+      childHandleExpiresAt: nullableText("child_handle_expires_at"),
+      childHandleActorRole: nullableText("child_handle_actor_role") as CommittedAuthorityV1["childHandleActorRole"],
+      childHandleClientInstanceId: nullableText("child_handle_client_instance_id"),
+      childHandleVerifier: nullableText("child_handle_verifier"),
+      revocationReasonCode: nullableText("revocation_reason_code"),
+      revocationEventPosition: nullablePosition("revocation_event_position"),
+      revokedAt: nullableText("revoked_at"),
+      terminalEventPosition: nullablePosition("terminal_event_position"),
+      terminalEventType: nullableText("terminal_event_type"),
+      terminalAt: nullableText("terminal_at"),
+    };
+    return authorityCommitment(committed);
+  }
+
+  private workflowEndpointPhaseAllowed(
+    state: WorkflowReplayState,
+    endpointPhase: unknown,
+  ): boolean {
+    if (typeof endpointPhase !== "string") return false;
+    switch (state.phase) {
+      case "requested":
+        return endpointPhase === "requested" || endpointPhase === "children-resolved";
+      case "final-checkpoint-recorded":
+        return endpointPhase === "final-checkpoint-recorded"
+          || endpointPhase === "ending-materialization-queued"
+          || endpointPhase === "validating";
+      case "completion-appended":
+        return endpointPhase === "completion-appended"
+          || endpointPhase === "completed"
+          || (
+            state.materializationRequired
+            && endpointPhase === "completed-materialization-confirmed"
+          );
+      default:
+        return endpointPhase === state.phase;
+    }
+  }
+
+  private workflowEndpointStatus(
+    row: Readonly<SqliteRow>,
+  ): Readonly<Record<string, unknown>> | null {
+    if (row.result_json === null) return null;
+    let result: unknown;
+    try {
+      result = parsedCanonicalJson(row.result_json);
+    } catch {
+      throw new LifecycleError("INTEGRITY_FAILURE");
+    }
+    if (!record(result)) throw new LifecycleError("INTEGRITY_FAILURE");
+    const statusFields = [
+      "evidenceWindow",
+      "finalCheckpointEventPosition",
+      "finalCheckpointId",
+      "materializationRequired",
+      "phase",
+      "priorRootState",
+      "qualityScore",
+      "resultVersion",
+      "safeFailureCode",
+      "sessionId",
+      "triggeringEventPosition",
+      "validationPlansReady",
+      "workflowGeneration",
+      "workflowId",
+    ];
+    let status: Readonly<Record<string, unknown>> = result;
+    if (Object.prototype.hasOwnProperty.call(result, "status")) {
+      const outerFields = [
+        "action",
+        "previousPhase",
+        "progressed",
+        "resultVersion",
+        "status",
+      ];
+      const phaseActions = new Set([
+        "mark-children-resolved",
+        "record-final-checkpoint-and-queue-ending",
+        "confirm-ending-materialization",
+        "begin-validation",
+        "record-verification-failed",
+        "record-verification-passed",
+        "invalidate-verification",
+        "append-terminal-completion",
+        "confirm-completed-materialization",
+        "complete-without-materialization",
+        "complete-after-materialization",
+      ]);
+      const transitions = new Set([
+        "requested\u0000children-resolved\u0000mark-children-resolved",
+        "children-resolved\u0000final-checkpoint-recorded\u0000record-final-checkpoint-and-queue-ending",
+        "final-checkpoint-recorded\u0000ending-materialization-queued\u0000confirm-ending-materialization",
+        "ending-materialization-queued\u0000validating\u0000begin-validation",
+        "validating\u0000verification-failed\u0000record-verification-failed",
+        "validating\u0000verification-passed\u0000record-verification-passed",
+        "verification-passed\u0000verification-failed\u0000invalidate-verification",
+        "verification-passed\u0000completion-appended\u0000append-terminal-completion",
+        "completion-appended\u0000completed-materialization-confirmed\u0000confirm-completed-materialization",
+        "completion-appended\u0000completed\u0000complete-without-materialization",
+        "completed-materialization-confirmed\u0000completed\u0000complete-after-materialization",
+      ]);
+      const idempotentDestinations = new Map<string, string>([
+        ["mark-children-resolved", "children-resolved"],
+        ["record-final-checkpoint-and-queue-ending", "final-checkpoint-recorded"],
+        ["confirm-ending-materialization", "ending-materialization-queued"],
+        ["begin-validation", "validating"],
+        ["record-verification-failed", "verification-failed"],
+        ["record-verification-passed", "verification-passed"],
+        ["invalidate-verification", "verification-failed"],
+        ["append-terminal-completion", "completion-appended"],
+        ["confirm-completed-materialization", "completed-materialization-confirmed"],
+        ["complete-without-materialization", "completed"],
+        ["complete-after-materialization", "completed"],
+      ]);
+      if (
+        canonicalJson(Object.keys(result).sort()) !== canonicalJson(outerFields)
+        || result.resultVersion !== 2
+        || typeof result.action !== "string"
+        || !phaseActions.has(result.action)
+        || typeof result.previousPhase !== "string"
+        || typeof result.progressed !== "boolean"
+        || !record(result.status)
+      ) throw new LifecycleError("INTEGRITY_FAILURE");
+      status = result.status;
+      const transition = `${result.previousPhase}\u0000${String(status.phase)}\u0000${result.action}`;
+      if (
+        result.progressed
+          ? !transitions.has(transition)
+          : result.previousPhase !== status.phase
+            || idempotentDestinations.get(result.action) !== status.phase
+      ) throw new LifecycleError("INTEGRITY_FAILURE");
+    }
+    if (canonicalJson(Object.keys(status).sort()) !== canonicalJson(statusFields)) {
+      throw new LifecycleError("INTEGRITY_FAILURE");
+    }
+    return status;
+  }
+
+  private workflowEndpointMatchesReplay(
+    row: Readonly<SqliteRow>,
+    state: WorkflowReplayState,
+  ): boolean {
+    if (
+      row.project_id === undefined
+      || row.workflow_type !== "session-end"
+      || row.workflow_id !== state.workflowId
+      || row.session_id !== state.sessionId
+      || integer(row.generation) !== state.generation
+      || row.root_command_id !== state.rootCommandId
+      || int64(row.triggering_event_position) !== state.triggerEventPosition
+      || row.expected_authority_commitment !== state.expectedAuthorityCommitment
+      || !this.workflowEndpointPhaseAllowed(state, row.phase)
+      || row.evidence_window_state !== state.evidenceWindowState
+      || int64(row.evidence_frozen_checkpoint_event_position)
+        !== state.frozenCheckpointEventPosition
+      || integer(row.evidence_frozen_generation) !== state.frozenGeneration
+      || row.final_ending_scope_bindings_json !== state.endingBindingsJson
+    ) return false;
+    const status = this.workflowEndpointStatus(row);
+    if (status === null) {
+      return state.frozenCheckpointId === null
+        && (row.phase === "requested" || row.phase === "cancelled" || row.phase === "abandoned");
+    }
+    const window = record(status.evidenceWindow) ? status.evidenceWindow : null;
+    if (window === null) return false;
+    const plansReady = row.validation_attempt_plan_generation !== null
+      && row.validation_attempt_plans_json !== null;
+    return status.resultVersion === 2
+      && status.sessionId === state.sessionId
+      && status.workflowId === state.workflowId
+      && integer(status.workflowGeneration) === state.generation
+      && status.phase === row.phase
+      && status.priorRootState === state.priorRootState
+      && status.triggeringEventPosition === state.triggerEventPosition.toString()
+      && status.finalCheckpointId === state.frozenCheckpointId
+      && status.finalCheckpointEventPosition
+        === (state.frozenCheckpointEventPosition?.toString() ?? null)
+      && window.evidenceWindowState === state.evidenceWindowState
+      && window.evidenceFrozenCheckpointEventPosition
+        === (state.frozenCheckpointEventPosition?.toString() ?? null)
+      && (
+        window.evidenceFrozenGeneration === null
+          ? state.frozenGeneration === null
+          : integer(window.evidenceFrozenGeneration) === state.frozenGeneration
+      )
+      && status.validationPlansReady === plansReady
+      && status.qualityScore === state.qualityScore
+      && status.safeFailureCode === state.safeFailureCode
+      && status.materializationRequired === state.materializationRequired;
   }
 
   private assertReplayEndpointCorrespondence(
@@ -1780,19 +3115,60 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
     preIndexes: ReplayPreIndexes,
     endpoints: ReplayEndpointIndexes,
     aggregates: ReadonlyMap<string, SessionAggregateState>,
+    authorityPositions: ReadonlyMap<string, bigint>,
+    checkpointRequirements: ReadonlyMap<string, CheckpointRequirementFold>,
+    revocations: ReadonlyMap<string, RevocationFold>,
+    terminalAts: ReadonlyMap<string, string>,
     childHeads: ReadonlyMap<string, ChildEventFoldProjection>,
     workflowHeads: ReadonlyMap<string, WorkflowGenerationFoldProjection>,
+    workflowStates: ReadonlyMap<string, WorkflowReplayState>,
     checkpoints: ReadonlyMap<string, Checkpoint>,
+    evidenceStates: ReadonlyMap<string, ReadonlyMap<string, EvidenceReplayState>>,
   ): void {
     if (endpoints.authorities.size !== aggregates.size) {
       throw new LifecycleError("INTEGRITY_FAILURE");
     }
     for (const [sessionId, aggregate] of aggregates) {
       const row = endpoints.authorities.get(sessionId);
+      const authorityPosition = authorityPositions.get(sessionId);
+      const checkpointRequirement = checkpointRequirements.get(sessionId);
+      const revocation = revocations.get(sessionId);
       if (
         row === undefined
         || row.project_id !== context.binding.projectId
+        || row.workspace_id !== aggregate.workspaceId
+        || row.stream_id !== `session/${sessionId}`
+        || int64(row.endpoint_stream_version) !== aggregate.streamVersion
+        || authorityPosition === undefined
+        || int64(row.authority_event_position) !== authorityPosition
+        || row.terminal_event_type !== aggregate.terminalEventType
+        || row.checkpoint_required_reason !== (checkpointRequirement?.reason ?? null)
+        || decimal(row.checkpoint_required_event_position)
+          !== (checkpointRequirement?.eventPosition ?? null)
+        || row.revocation_reason_code !== (revocation?.reason ?? null)
+        || decimal(row.revocation_event_position)
+          !== (revocation?.eventPosition ?? null)
+        || row.revoked_at !== (revocation?.revokedAt ?? null)
+        || row.terminal_at !== (terminalAts.get(sessionId) ?? null)
+        || integer(row.direct_access_enabled) !== (
+          aggregate.kind === "child" && aggregate.directAccessEnabled ? 1 : 0
+        )
+        || row.authority_commitment !== this.authorityRowCommitment(row)
       ) throw new LifecycleError("INTEGRITY_FAILURE");
+      try {
+        assertAuthorityMirror(aggregate, {
+          sessionKind: row.session_kind as "root" | "child",
+          parentSessionId: row.parent_session_id as SessionAggregateState["parentSessionId"],
+          semanticState: row.semantic_state as SessionAggregateState["state"],
+          ownerGeneration: int64(row.owner_generation),
+          childCapabilityGeneration: int64(row.child_capability_generation),
+          authorityCommitment: String(row.authority_commitment),
+          latestCheckpointEventPosition: int64(row.latest_checkpoint_event_position),
+          terminalEventPosition: int64(row.terminal_event_position),
+        });
+      } catch {
+        throw new LifecycleError("INTEGRITY_FAILURE");
+      }
       if (aggregate.latestCheckpointId !== null) {
         const checkpoint = checkpoints.get(aggregate.latestCheckpointId);
         if (
@@ -1802,105 +3178,88 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
             !== aggregate.latestCheckpointEventPosition
           || row.latest_checkpoint_fingerprint !== canonicalHash(checkpoint)
         ) throw new LifecycleError("INTEGRITY_FAILURE");
-      } else if (row.latest_checkpoint_fingerprint !== null) {
+      } else if (
+        row.latest_checkpoint_id !== null
+        || row.latest_checkpoint_event_position !== null
+        || row.latest_checkpoint_fingerprint !== null
+      ) {
         throw new LifecycleError("INTEGRITY_FAILURE");
       }
     }
 
-    if (endpoints.workflows.length !== workflowHeads.size) {
+    if (
+      endpoints.workflows.length !== workflowHeads.size
+      || workflowStates.size !== workflowHeads.size
+    ) {
       throw new LifecycleError("INTEGRITY_FAILURE");
     }
     for (const row of endpoints.workflows) {
       if (!nonEmpty(row.workflow_id)) throw new LifecycleError("INTEGRITY_FAILURE");
       const head = workflowHeads.get(row.workflow_id as string);
-      const frozenEndpoint = int64(row.evidence_frozen_checkpoint_event_position) !== null
-        && integer(row.evidence_frozen_generation) !== null
-        && row.evidence_window_state === "sealed";
+      const state = workflowStates.get(row.workflow_id as string);
       if (
         head === undefined
+        || state === undefined
         || integer(row.generation) !== head.workflowGeneration
         || row.session_id !== head.sessionId
         || row.root_command_id !== head.rootCommandId
         || int64(row.triggering_event_position) !== head.triggerEventPosition
-        || (!frozenEndpoint && row.evidence_window_state !== head.evidenceWindowState)
+        || !this.workflowEndpointMatchesReplay(row, state)
       ) throw new LifecycleError("INTEGRITY_FAILURE");
-      if (row.final_ending_scope_bindings_json !== null) {
-        if (
-          typeof row.final_ending_scope_bindings_json !== "string"
-          || typeof row.result_json !== "string"
-        ) throw new LifecycleError("INTEGRITY_FAILURE");
-        const bindings = decodeFinalEndingScopeBindingsV1(
-          parsedCanonicalJson(row.final_ending_scope_bindings_json),
-        );
-        const result = parsedCanonicalJson(row.result_json);
-        const status = record(result) && record(result.status) ? result.status : result;
-        if (!record(status) || !nonEmpty(status.finalCheckpointId)) {
-          throw new LifecycleError("INTEGRITY_FAILURE");
-        }
-        const checkpoint = checkpoints.get(status.finalCheckpointId as string);
-        if (
-          checkpoint === undefined
-          || status.finalCheckpointEventPosition !== checkpoint.checkpointEventPosition
-          || int64(row.evidence_frozen_checkpoint_event_position)
-            !== BigInt(checkpoint.checkpointEventPosition)
-        ) throw new LifecycleError("INTEGRITY_FAILURE");
-        const frozenPosition = BigInt(checkpoint.checkpointEventPosition);
-        const expected = checkpoint.childSummaries.map((summary) => {
-          const checkpointEventPosition = summary.latestCheckpointId === null
-            ? null
-            : checkpoints.get(summary.latestCheckpointId)?.checkpointEventPosition ?? null;
-          const activeTicket = preIndexes.transferTickets.find((ticket) => (
-            ticket.source_parent_session_id === checkpoint.sessionId
-            && ticket.source_child_session_id === summary.childSessionId
-            && int64(ticket.created_event_position) === BigInt(summary.lastEventPosition)
-            && ticket.checkpoint_id === summary.latestCheckpointId
-            && (
-              int64(ticket.claimed_event_position) === null
-              || int64(ticket.claimed_event_position)! >= frozenPosition
-            )
-          ));
-          if (summary.state === "transferred") {
-            if (
-              activeTicket === undefined
-              || !nonEmpty(activeTicket.transfer_ticket_id)
-              || checkpointEventPosition === null
-            ) throw new LifecycleError("INTEGRITY_FAILURE");
-            return {
-              bindingVersion: 1,
-              bindingKind: "carry-forward-ticket" as const,
-              childSessionId: summary.childSessionId,
-              childState: summary.state,
-              lastEventPosition: summary.lastEventPosition,
-              streamVersion: summary.streamVersion,
-              checkpointId: summary.latestCheckpointId,
-              checkpointEventPosition,
-              transferTicketId: activeTicket.transfer_ticket_id,
-              transferTicketEventPosition: String(activeTicket.created_event_position),
-            };
-          }
-          return {
-            bindingVersion: 1,
-            bindingKind: "current-child" as const,
-            childSessionId: summary.childSessionId,
-            childState: summary.state,
-            lastEventPosition: summary.lastEventPosition,
-            streamVersion: summary.streamVersion,
-            checkpointId: summary.latestCheckpointId,
-            checkpointEventPosition,
-            transferTicketId: null,
-            transferTicketEventPosition: null,
-          };
-        }).sort((left, right) => binaryCompare(
-          left.childSessionId,
-          right.childSessionId,
-        ));
-        if (canonicalJson(bindings) !== canonicalJson(expected)) {
-          throw new LifecycleError("INTEGRITY_FAILURE");
-        }
-      }
     }
 
-    for (const row of endpoints.validations) {
+    let replayEvidenceCount = 0;
+    for (const sessionStates of evidenceStates.values()) {
+      replayEvidenceCount += sessionStates.size;
+    }
+    if (endpoints.evidence.length !== replayEvidenceCount) {
+      throw new LifecycleError("INTEGRITY_FAILURE");
+    }
+    for (const row of endpoints.evidence) {
+      if (!nonEmpty(row.session_id) || !nonEmpty(row.adapter_session_id)) {
+        throw new LifecycleError("INTEGRITY_FAILURE");
+      }
+      const state = evidenceStates.get(row.session_id as string)
+        ?.get(row.adapter_session_id as string);
+      const entry = state?.checkpointEntry;
+      if (
+        state === undefined
+        || entry === undefined
+        || row.project_id !== context.binding.projectId
+        || row.session_id !== state.sessionId
+        || row.capture_mode !== "coverage-only"
+        || int64(row.first_ordinal, true) !== 0n
+        || int64(row.last_ordinal, true) !== state.coverageLastOrdinal
+        || decimal(row.highest_contiguous_ordinal)
+          !== (entry.highestContiguousOrdinal ?? "-1")
+        || row.missing_intervals_json !== state.missingIntervalsJson
+        || row.fingerprint_algorithm !== entry.frameFingerprintAlgorithm
+        || integer(row.fingerprint_schema_version)
+          !== entry.frameFingerprintSchemaVersion
+        || row.fingerprint_key_id !== entry.frameFingerprintKeyId
+        || row.fingerprint_domain !== entry.frameFingerprintDomain
+        || row.coverage_fingerprint_algorithm
+          !== entry.coverageFingerprintAlgorithm
+        || integer(row.coverage_fingerprint_schema_version)
+          !== entry.coverageFingerprintSchemaVersion
+        || row.coverage_fingerprint_key_id !== entry.coverageFingerprintKeyId
+        || row.coverage_fingerprint_domain !== entry.coverageFingerprintDomain
+        || row.coverage_fingerprint_value !== entry.coverageFingerprint
+        || row.latest_batch_id !== entry.latestBatchId
+        || decimal(row.latest_batch_event_position)
+          !== entry.latestBatchEventPosition
+        || row.created_at !== state.createdAt
+        || row.updated_at !== state.updatedAt
+        || decimal(row.head_batch_event_position)
+          !== entry.latestBatchEventPosition
+        || row.endpoint_batch_id !== entry.latestBatchId
+        || decimal(row.endpoint_batch_event_position)
+          !== entry.latestBatchEventPosition
+        || row.endpoint_coverage_fingerprint !== entry.coverageFingerprint
+      ) throw new LifecycleError("INTEGRITY_FAILURE");
+    }
+
+    for (const row of preIndexes.validations) {
       if (!nonEmpty(row.final_checkpoint_id) || !nonEmpty(row.final_checkpoint_fingerprint)) {
         throw new LifecycleError("INTEGRITY_FAILURE");
       }
@@ -1946,6 +3305,90 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
     const lookahead = cursor.peek();
     if (lookahead !== null && lookahead.triggerEventPosition <= eventPosition) {
       throw new LifecycleError("INTEGRITY_FAILURE");
+    }
+  }
+
+  private evolveReplayCheckpointRequirement(
+    stored: StoredEvent,
+    event: LifecycleEvent,
+    requirements: Map<string, CheckpointRequirementFold>,
+  ): void {
+    if (stored.sessionId === null) throw new LifecycleError("INTEGRITY_FAILURE");
+    if (event.eventType === "SessionCheckpointRecorded") {
+      const current = requirements.get(stored.sessionId);
+      if (
+        current !== undefined
+        && BigInt(event.payload.baseEventPosition) >= BigInt(current.eventPosition)
+      ) requirements.delete(stored.sessionId);
+      return;
+    }
+    let targetSessionId = stored.sessionId;
+    let reason: string | null = null;
+    switch (event.eventType) {
+      case "SessionOwnerTransferred":
+        reason = "ownership-transfer";
+        break;
+      case "SessionOwnershipRecovered":
+        reason = "ownership-recovery";
+        break;
+      case "SessionSuspendRequested":
+      case "SessionSuspended":
+        reason = "suspension";
+        break;
+      case "ChildWorkTransferClaimed":
+        reason = "carry-forward-claim";
+        break;
+      case "SessionEndAmended":
+        reason = "end-amendment";
+        break;
+      case "SessionEndCancelled":
+        reason = "end-cancellation";
+        break;
+      case "ChildWorkDispositioned":
+        if (
+          event.payload.disposition.kind === "accepted"
+          || event.payload.disposition.kind === "partially-accepted"
+        ) {
+          if (stored.parentSessionId === null) {
+            throw new LifecycleError("INTEGRITY_FAILURE");
+          }
+          targetSessionId = stored.parentSessionId;
+          reason = "accepted-child-report";
+        }
+        break;
+      default:
+        break;
+    }
+    if (reason !== null) {
+      requirements.set(targetSessionId, deeplyFreeze({
+        reason,
+        eventPosition: stored.globalPosition.toString(),
+      }));
+    }
+  }
+
+  private evolveReplayRevocation(
+    stored: StoredEvent,
+    event: LifecycleEvent,
+    revocations: Map<string, RevocationFold>,
+  ): void {
+    if (stored.sessionId === null) throw new LifecycleError("INTEGRITY_FAILURE");
+    let reason: string | null = null;
+    if (event.eventType === "SessionAbandoned") {
+      reason = event.payload.reasonCode;
+    } else if (event.eventType === "ChildSessionCompleted") {
+      reason = "child-completed";
+    } else if (event.eventType === "ChildSessionSuspended") {
+      reason = "child-suspended";
+    } else if (event.eventType === "ChildWorkTransferCreated") {
+      reason = "child-transferred";
+    }
+    if (reason !== null) {
+      revocations.set(stored.sessionId, deeplyFreeze({
+        reason,
+        eventPosition: stored.globalPosition.toString(),
+        revokedAt: stored.occurredAt,
+      }));
     }
   }
 
@@ -3214,6 +4657,16 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
     `).get() !== undefined;
   }
 
+  private hasQualifiedLifecycleSchema(): boolean {
+    return this.connection.prepare(`
+      SELECT 1 AS present
+      FROM sqlite_schema
+      WHERE type = 'table'
+        AND name = 'session_evidence_coverage_transitions'
+      LIMIT 1
+    `).get() !== undefined;
+  }
+
   private assertSynchronousEvidenceAuthenticationAvailable(
     context: ProjectContext,
   ): void {
@@ -3351,6 +4804,7 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
     context: ProjectContext,
     sink: IntegrityIssueSink,
     full: boolean,
+    historyAlreadyReplayed = false,
   ): void {
     const rows = this.connection.prepare(`
       SELECT authority.*, event.project_id AS event_project_id,
@@ -3419,7 +4873,7 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
         issue(sink, "SESSION_AUTHORITY_FOLD_MISMATCH");
         return;
       }
-      if (full) {
+      if (full && !historyAlreadyReplayed) {
         try {
           const events = this.lifecycleEvents(row);
           const aggregate = foldSession(events);
@@ -3698,7 +5152,11 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
     }
   }
 
-  private checkWorkflowShape(context: ProjectContext, sink: IntegrityIssueSink): void {
+  private checkWorkflowShape(
+    context: ProjectContext,
+    sink: IntegrityIssueSink,
+    qualifiedEndpointOnly = false,
+  ): void {
     const rows = this.connection.prepare(`
       SELECT * FROM workflow_instances
       WHERE project_id = $projectId
@@ -3814,7 +5272,7 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
                 )
           );
       let openHistoryValid = true;
-      if (row.evidence_window_state === "open") {
+      if (row.evidence_window_state === "open" && !qualifiedEndpointOnly) {
         try {
           this.assertOpenWorkflowProjection(context, row);
         } catch {
@@ -4206,7 +5664,11 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
     }
   }
 
-  private checkApprovalsAndTransfers(context: ProjectContext, sink: IntegrityIssueSink): void {
+  private checkApprovalsAndTransfers(
+    context: ProjectContext,
+    sink: IntegrityIssueSink,
+    historyAlreadyReplayed = false,
+  ): void {
     const approvals = this.connection.prepare(`
       SELECT approval.*, command.authorization_approval_id,
              command.authorization_approval_digest,
@@ -4302,10 +5764,11 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
         || !canonicalJsonText(row.follow_ups_json)
         || !canonicalJsonText(row.source_state_json)
         || !canonicalJsonText(row.lineage_json)
-        || !this.transferMatchesSourceTruth(row);
+        || (!historyAlreadyReplayed && !this.transferMatchesSourceTruth(row));
     })) {
       issue(sink, "LIFECYCLE_WORKFLOW_INVARIANT_MISMATCH");
     }
+    if (historyAlreadyReplayed) return;
     const createdEvents = this.connection.prepare(`
       SELECT created.global_position, created.session_id, created.parent_session_id,
              created.payload_json,
@@ -4529,50 +5992,56 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
     }
   }
 
-  private checkWorkflowClaims(context: ProjectContext, sink: IntegrityIssueSink): void {
+  private checkWorkflowClaims(
+    context: ProjectContext,
+    sink: IntegrityIssueSink,
+    historyAlreadyReplayed = false,
+  ): void {
     const rows = this.connection.prepare(`
-      SELECT workflow.*, authority.authority_commitment,
-             authority.session_kind, authority.stream_id AS authority_stream_id,
-             event.session_id AS event_session_id,
-             event.stream_id AS event_stream_id, event.command_id AS event_command_id,
-             event.event_type AS event_type, event.payload_json AS event_payload_json
-      FROM workflow_instances AS workflow
-      LEFT JOIN session_authority AS authority
-        ON authority.project_id = workflow.project_id
-       AND authority.session_id = workflow.session_id
-      LEFT JOIN events AS event
-        ON event.global_position = workflow.triggering_event_position
-      WHERE workflow.project_id = $projectId AND workflow.session_id IS NOT NULL
+        SELECT workflow.*, authority.authority_commitment,
+               authority.session_kind, authority.stream_id AS authority_stream_id,
+               event.session_id AS event_session_id,
+               event.stream_id AS event_stream_id, event.command_id AS event_command_id,
+               event.event_type AS event_type, event.payload_json AS event_payload_json
+        FROM workflow_instances AS workflow
+        LEFT JOIN session_authority AS authority
+          ON authority.project_id = workflow.project_id
+         AND authority.session_id = workflow.session_id
+        LEFT JOIN events AS event
+          ON event.global_position = workflow.triggering_event_position
+        WHERE workflow.project_id = $projectId AND workflow.session_id IS NOT NULL
     `).all({ $projectId: context.binding.projectId });
     if (rows.some((row) => {
-      let payload: unknown;
-      let classification: ReturnType<typeof classifyWorkflowProjectionEvent> | null;
-      try {
-        payload = parsedCanonicalJson(row.event_payload_json);
-        classification = classifyWorkflowProjectionEvent({
-          eventType: row.event_type as StoredEvent["eventType"],
-          payload: payload as StoredEvent["payload"],
-        });
-      } catch {
-        payload = null;
-        classification = null;
-      }
-      const commitment = this.authorityCommitmentAt(
-        row.project_id,
-        row.event_stream_id,
-        row.triggering_event_position,
-      );
-      return row.session_kind !== "root"
-        || row.event_session_id !== row.session_id
-        || row.event_stream_id !== row.authority_stream_id
-        || row.event_command_id !== row.root_command_id
-        || !record(payload)
-        || classification?.kind !== "identified"
-        || classification.workflowId !== row.workflow_id
-        || !sameInteger(classification.workflowGeneration, row.generation)
-        || commitment !== row.expected_authority_commitment
-        || (present(row.validation_attempt_plan_generation)
-          && !sameInteger(row.validation_attempt_plan_generation, row.generation));
+        let payload: unknown;
+        let classification: ReturnType<typeof classifyWorkflowProjectionEvent> | null;
+        try {
+          payload = parsedCanonicalJson(row.event_payload_json);
+          classification = classifyWorkflowProjectionEvent({
+            eventType: row.event_type as StoredEvent["eventType"],
+            payload: payload as StoredEvent["payload"],
+          });
+        } catch {
+          payload = null;
+          classification = null;
+        }
+        const commitment = historyAlreadyReplayed
+          ? row.expected_authority_commitment
+          : this.authorityCommitmentAt(
+              row.project_id,
+              row.event_stream_id,
+              row.triggering_event_position,
+            );
+        return row.session_kind !== "root"
+          || row.event_session_id !== row.session_id
+          || row.event_stream_id !== row.authority_stream_id
+          || row.event_command_id !== row.root_command_id
+          || !record(payload)
+          || classification?.kind !== "identified"
+          || classification.workflowId !== row.workflow_id
+          || !sameInteger(classification.workflowGeneration, row.generation)
+          || commitment !== row.expected_authority_commitment
+          || (present(row.validation_attempt_plan_generation)
+            && !sameInteger(row.validation_attempt_plan_generation, row.generation));
     })) {
       issue(sink, "LIFECYCLE_WORKFLOW_INVARIANT_MISMATCH");
       return;

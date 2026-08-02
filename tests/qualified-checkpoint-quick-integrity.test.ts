@@ -21,6 +21,8 @@ import {
 } from "../src/orchestrator/lifecycle/authority/authority-commitment.js";
 import { canonicalJson } from "../src/orchestrator/serialization/canonical-json.js";
 import { NodeSqliteDriver } from "../src/orchestrator/storage/node-sqlite-driver.js";
+import { MigrationRunner } from "../src/orchestrator/storage/migration-runner.js";
+import { PROJECT_STORE_MIGRATIONS } from "../src/orchestrator/storage/migrations/registry.js";
 import type {
   SqliteConnection,
   SqliteParams,
@@ -620,6 +622,74 @@ function createFixture(): Fixture {
   return { connection, context };
 }
 
+function createSchema2Fixture(): Fixture {
+  const root = mkdtempSync(join(tmpdir(), "qualified-quick-integrity-v2-"));
+  roots.push(root);
+  const connection = driver.open(join(root, "events.sqlite"), {
+    mode: "create",
+    busyTimeoutMs: 1_000,
+  });
+  connections.push(connection);
+  const runner = new MigrationRunner();
+  runner.apply(connection, [PROJECT_STORE_MIGRATIONS[0]!], NOW, {
+    kind: "bootstrap-empty",
+    beforeMigration() {},
+  });
+  connection.prepare(`
+    INSERT INTO project_meta(
+      singleton, project_id, vault_id, store_id, schema_version, created_at
+    ) VALUES (1, $projectId, $vaultId, $storeId, 1, $createdAt)
+  `).run({
+    $projectId: PROJECT_ID,
+    $vaultId: VAULT_ID,
+    $storeId: STORE_ID,
+    $createdAt: NOW,
+  });
+  connection.exec(`
+    INSERT INTO maintenance_state(
+      singleton, epoch, mode, owner_id, fencing_token, lease_expires_at, requested_at
+    ) VALUES (1, 0, 'idle', NULL, 0, NULL, NULL)
+  `);
+  runner.apply(connection, PROJECT_STORE_MIGRATIONS.slice(0, 2), NOW, {
+    kind: "explicit-upgrade",
+    expectedAppliedVersion: 1,
+    beforeMigration() {},
+  });
+  rawInsert(connection, "streams", {
+    project_id: PROJECT_ID,
+    stream_id: `session/${ROOT_ID}`,
+    stream_type: "session",
+    current_version: 1,
+    created_at: NOW,
+    updated_at: NOW,
+  });
+  const rootRow = rootAuthority();
+  rawEvent(connection, {
+    globalPosition: 1n,
+    streamId: `session/${ROOT_ID}`,
+    streamVersion: 1n,
+    eventType: "SessionStarted",
+    eventSchemaVersion: 1,
+    sessionId: ROOT_ID,
+    payload: { authorityCommitment: rootRow.authority_commitment },
+  });
+  rawInsert(connection, "session_authority", rootRow);
+  return {
+    connection,
+    context: {
+      binding: {
+        projectId: PROJECT_ID,
+        vaultId: VAULT_ID,
+        storeId: STORE_ID,
+        workspaceId: WORKSPACE_ID,
+        clientNamespace: "tests",
+        actorRole: "primary",
+        clientInstanceId: "client-quick-integrity",
+      },
+    } as ProjectContext,
+  };
+}
+
 function evidencePayload(
   adapterSessionId: string,
   batchId: string,
@@ -952,72 +1022,6 @@ function checkpointFingerprint(checkpoint: unknown, version: 1 | 2): string {
     .update(canonicalJson(checkpoint), "utf8")
     .digest("hex");
 }
-
-function addCurrentCheckpoint(fixture: Fixture): Record<string, unknown> {
-  const evidenceCoverage = {
-    coverageVersion: 2,
-    captureMode: "coverage-only",
-    contentRetained: false,
-    adapterSessions: [{
-      adapterSessionId: ADAPTER_ID,
-      coverageFirstOrdinal: "0",
-      coverageLastOrdinal: "0",
-      highestContiguousOrdinal: "0",
-      missingIntervals: [],
-      frameFingerprintAlgorithm: "hmac-sha256",
-      frameFingerprintSchemaVersion: 1,
-      frameFingerprintKeyId: "key-a",
-      frameFingerprintDomain: "pm-evidence-frame-v1",
-      coverageFingerprintAlgorithm: "hmac-sha256",
-      coverageFingerprintSchemaVersion: 1,
-      coverageFingerprintKeyId: "key-a",
-      coverageFingerprintDomain: "pm-evidence-coverage-v1",
-      coverageFingerprint: H64,
-      latestBatchId: BATCH_ID,
-      latestBatchEventPosition: "2",
-    }],
-  };
-  const checkpoint = {
-    ...qualifiedCheckpointFixture({
-      checkpointId: CHECKPOINT_ID as never,
-      sessionId: ROOT_ID as never,
-      baseEventPosition: 2,
-      checkpointEventPosition: 3,
-    }),
-    evidenceCoverage,
-  };
-  rawEvent(fixture.connection, {
-    globalPosition: 3n,
-    streamId: `session/${ROOT_ID}`,
-    streamVersion: 3n,
-    eventType: "SessionCheckpointRecorded",
-    eventSchemaVersion: 2,
-    sessionId: ROOT_ID,
-    payload: {
-      checkpoint,
-      baseEventPosition: "2",
-      checkpointEventPosition: "3",
-    },
-  });
-  fixture.connection.prepare(`
-    UPDATE streams SET current_version = 3
-    WHERE project_id = $projectId AND stream_id = $streamId
-  `).run({ $projectId: PROJECT_ID, $streamId: `session/${ROOT_ID}` });
-  fixture.connection.prepare(`
-    UPDATE session_authority
-    SET latest_checkpoint_id = $checkpointId,
-        latest_checkpoint_event_position = 3,
-        latest_checkpoint_fingerprint = $fingerprint
-    WHERE project_id = $projectId AND session_id = $sessionId
-  `).run({
-    $checkpointId: CHECKPOINT_ID,
-    $fingerprint: checkpointFingerprint(checkpoint, 2),
-    $projectId: PROJECT_ID,
-    $sessionId: ROOT_ID,
-  });
-  return checkpoint as Record<string, unknown>;
-}
-
 function workflowStatus(
   phase: string,
   finalCheckpointId: string | null,
@@ -1253,60 +1257,6 @@ function amendmentWitnessV2(
   };
   return buildLifecycleIntentWitness(command as never, origin as never).source;
 }
-
-function openWorkflowFixture(version: 1 | 2): Fixture {
-  const fixture = createFixture();
-  const workflowId = uuid(89_001 + version);
-  const commandId = uuid(30_002);
-  rawEvent(fixture.connection, {
-    globalPosition: 2n,
-    streamId: `session/${ROOT_ID}`,
-    streamVersion: 2n,
-    eventType: "SessionEndRequested",
-    eventSchemaVersion: version,
-    sessionId: ROOT_ID,
-    payload: {
-      workflowId,
-      workflowGeneration: 1,
-      previousState: "active",
-      childEndPolicy: "require-completed",
-      qualityThreshold: 0,
-      requireFullEvidence: false,
-      requireMaterialization: false,
-      ...(version === 2 ? { requestVersion: 2 } : {}),
-    },
-    lifecycleIntent: requestWitness(version, commandId),
-    idempotencyKey: `quick-integrity/end-request/${version}`,
-  });
-  fixture.connection.prepare(`
-    UPDATE streams SET current_version = 2
-    WHERE project_id = $projectId AND stream_id = $streamId
-  `).run({ $projectId: PROJECT_ID, $streamId: `session/${ROOT_ID}` });
-  addWorkflow(fixture, {
-    workflow_id: workflowId,
-    generation: 1,
-    phase: "requested",
-    root_command_id: commandId,
-    triggering_event_position: 2,
-    expected_authority_commitment: H64,
-    evidence_window_state: "open",
-  });
-  insertWorkflowProjection(fixture.connection, workflowProjection({
-    projectId: PROJECT_ID,
-    workflowId,
-    workflowGeneration: 1,
-    sessionId: ROOT_ID,
-    triggerEventPosition: 2n,
-    rootCommandId: commandId,
-    evidenceWindowState: version === 2 ? "open" : "sealed",
-    replacementCheckpointVersion: version,
-    effectiveCheckpointVersion: version,
-    effectiveDraftSourceEventPosition: 2n,
-    previousFingerprint: null,
-  }));
-  return fixture;
-}
-
 function openAmendmentFixture(finalCheckpointVersion: 1 | null): Fixture {
   const fixture = createFixture();
   const workflowId = uuid(89_005);
@@ -1403,57 +1353,6 @@ function openAmendmentFixture(finalCheckpointVersion: 1 | null): Fixture {
   }
   return fixture;
 }
-
-function frozenRootV1Fixture(dirty: boolean): Fixture {
-  const fixture = createFixture();
-  if (dirty) {
-    seedCoverage(fixture, { position: 2n, streamVersion: 2n });
-  }
-  const checkpointPosition = dirty ? 3n : 2n;
-  const basePosition = dirty ? 2n : 1n;
-  const checkpoint = checkpointFixture({
-    checkpointId: uuid(dirty ? 89_011 : 89_010) as never,
-    sessionId: ROOT_ID as never,
-    baseEventPosition: basePosition,
-    checkpointEventPosition: checkpointPosition,
-  });
-  rawEvent(fixture.connection, {
-    globalPosition: checkpointPosition,
-    streamId: `session/${ROOT_ID}`,
-    streamVersion: dirty ? 3n : 2n,
-    eventType: "SessionCheckpointRecorded",
-    eventSchemaVersion: 1,
-    sessionId: ROOT_ID,
-    payload: {
-      checkpoint,
-      baseEventPosition: basePosition.toString(),
-      checkpointEventPosition: checkpointPosition.toString(),
-    },
-  });
-  fixture.connection.prepare(`
-    UPDATE streams SET current_version = $version
-    WHERE project_id = $projectId AND stream_id = $streamId
-  `).run({
-    $version: dirty ? 3n : 2n,
-    $projectId: PROJECT_ID,
-    $streamId: `session/${ROOT_ID}`,
-  });
-  dropTrigger(fixture.connection, "workflow_instances_evidence_v3_insert_guard");
-  addWorkflow(fixture, {
-    phase: "final-checkpoint-recorded",
-    result_json: canonicalJson(workflowStatus(
-      "final-checkpoint-recorded",
-      checkpoint.checkpointId,
-      checkpointPosition.toString(),
-    )),
-    evidence_frozen_checkpoint_event_position: checkpointPosition,
-    evidence_frozen_generation: 1,
-    evidence_window_state: "sealed",
-    final_ending_scope_bindings_json: "[]",
-  });
-  return fixture;
-}
-
 function frozenInt64RootFixture(): Fixture {
   const fixture = createFixture();
   const frozenPosition = 9_223_372_036_854_775_807n;
@@ -1776,303 +1675,6 @@ function frozenCurrentChildFixture(
     rootCheckpointPosition,
   };
 }
-
-function frozenTicketFixture(): {
-  readonly fixture: Fixture;
-  readonly binding: Record<string, unknown>;
-  readonly rootCheckpoint: Record<string, unknown>;
-} {
-  const fixture = createFixture();
-  const checkpointId = uuid(88_010);
-  const ticketId = uuid(88_011);
-  const childCheckpoint = {
-    ...qualifiedCheckpointFixture({
-      checkpointId: checkpointId as never,
-      sessionId: CHILD_ID as never,
-      parentSessionId: ROOT_ID as never,
-      baseEventPosition: 2,
-      checkpointEventPosition: 3,
-    }),
-  };
-  const childFingerprint = checkpointFingerprint(childCheckpoint, 2);
-  const transferred = childAuthority(CHILD_ID, 5n, {
-    semantic_state: "transferred",
-    child_capability_generation: null,
-    direct_access_enabled: 0,
-    child_handle_capability_version: null,
-    child_handle_key_id: null,
-    child_handle_issue_nonce: null,
-    child_handle_issued_at: null,
-    child_handle_policy_code: null,
-    child_handle_expiry_kind: null,
-    child_handle_expires_at: null,
-    child_handle_actor_role: null,
-    child_handle_client_instance_id: null,
-    child_handle_verifier: null,
-    child_handle_issuance_id: null,
-    latest_checkpoint_id: checkpointId,
-    latest_checkpoint_event_position: 3,
-    latest_checkpoint_fingerprint: childFingerprint,
-    terminal_event_position: 5,
-    terminal_event_type: "ChildWorkTransferCreated",
-    terminal_at: NOW,
-  });
-  rawInsert(fixture.connection, "streams", {
-    project_id: PROJECT_ID,
-    stream_id: `session/${CHILD_ID}`,
-    stream_type: "session",
-    current_version: 4,
-    created_at: NOW,
-    updated_at: NOW,
-  });
-  rawEvent(fixture.connection, {
-    globalPosition: 2n,
-    streamId: `session/${CHILD_ID}`,
-    streamVersion: 1n,
-    eventType: "SessionForked",
-    eventSchemaVersion: 1,
-    sessionId: CHILD_ID,
-    parentSessionId: ROOT_ID,
-    payload: forkPayload(H64),
-  });
-  rawEvent(fixture.connection, {
-    globalPosition: 3n,
-    streamId: `session/${CHILD_ID}`,
-    streamVersion: 2n,
-    eventType: "SessionCheckpointRecorded",
-    eventSchemaVersion: 2,
-    sessionId: CHILD_ID,
-    parentSessionId: ROOT_ID,
-    payload: {
-      checkpoint: childCheckpoint,
-      baseEventPosition: "2",
-      checkpointEventPosition: "3",
-    },
-  });
-  rawEvent(fixture.connection, {
-    globalPosition: 4n,
-    streamId: `session/${CHILD_ID}`,
-    streamVersion: 3n,
-    eventType: "ChildSessionSuspended",
-    eventSchemaVersion: 1,
-    sessionId: CHILD_ID,
-    parentSessionId: ROOT_ID,
-    payload: {
-      checkpointId,
-      blockers: [],
-      followUps: [],
-      authorityCommitment: H64_B,
-    },
-  });
-  rawEvent(fixture.connection, {
-    globalPosition: 5n,
-    streamId: `session/${CHILD_ID}`,
-    streamVersion: 4n,
-    eventType: "ChildWorkTransferCreated",
-    eventSchemaVersion: 1,
-    sessionId: CHILD_ID,
-    parentSessionId: ROOT_ID,
-    payload: {
-      transferTicketId: ticketId,
-      checkpointId,
-      authorityCommitment: transferred.authority_commitment,
-    },
-  });
-  rawInsert(fixture.connection, "session_authority", transferred);
-  rawInsert(fixture.connection, "child_transfer_tickets", {
-    project_id: PROJECT_ID,
-    transfer_ticket_id: ticketId,
-    source_parent_session_id: ROOT_ID,
-    source_child_session_id: CHILD_ID,
-    source_assignment_json: "{}",
-    source_scope_json: "{}",
-    checkpoint_id: checkpointId,
-    follow_ups_json: "[]",
-    source_state_json: "{}",
-    lineage_json: "{}",
-    created_event_position: 5,
-    created_at: NOW,
-    claimed_by_root_session_id: null,
-    claimed_child_session_id: null,
-    claimed_event_position: null,
-    claimed_at: null,
-  });
-  const binding = {
-    bindingVersion: 1,
-    bindingKind: "carry-forward-ticket",
-    childSessionId: CHILD_ID,
-    childState: "transferred",
-    lastEventPosition: "5",
-    streamVersion: "4",
-    checkpointId,
-    checkpointEventPosition: "3",
-    transferTicketId: ticketId,
-    transferTicketEventPosition: "5",
-  };
-  const rootCheckpointId = uuid(88_012);
-  const rootCheckpoint = {
-    ...qualifiedCheckpointFixture({
-      checkpointId: rootCheckpointId as never,
-      sessionId: ROOT_ID as never,
-      baseEventPosition: 1,
-      checkpointEventPosition: 6,
-    }),
-    childSummaries: [{
-      childSessionId: CHILD_ID,
-      state: "transferred",
-      lastEventPosition: "5",
-      streamVersion: "4",
-      latestCheckpointId: checkpointId,
-    }],
-  };
-  rawEvent(fixture.connection, {
-    globalPosition: 6n,
-    streamId: `session/${ROOT_ID}`,
-    streamVersion: 2n,
-    eventType: "SessionCheckpointRecorded",
-    eventSchemaVersion: 2,
-    sessionId: ROOT_ID,
-    payload: {
-      checkpoint: rootCheckpoint,
-      baseEventPosition: "1",
-      checkpointEventPosition: "6",
-    },
-  });
-  fixture.connection.prepare(`
-    UPDATE streams SET current_version = 2
-    WHERE project_id = $projectId AND stream_id = $streamId
-  `).run({ $projectId: PROJECT_ID, $streamId: `session/${ROOT_ID}` });
-  dropTrigger(fixture.connection, "workflow_instances_evidence_v3_insert_guard");
-  addWorkflow(fixture, {
-    phase: "final-checkpoint-recorded",
-    result_json: canonicalJson(workflowStatus(
-      "final-checkpoint-recorded",
-      rootCheckpointId,
-      "6",
-    )),
-    evidence_frozen_checkpoint_event_position: 6,
-    evidence_frozen_generation: 1,
-    evidence_window_state: "sealed",
-    final_ending_scope_bindings_json: canonicalJson([binding]),
-  });
-  const forkProjection = genesisChildProjection(CHILD_ID, 2n, H64);
-  const checkpointProjection = carriedChildProjection(forkProjection, {
-    eventPosition: 3n,
-    streamVersion: 2n,
-    latestCheckpointId: checkpointId,
-    latestCheckpointEventPosition: 3n,
-  });
-  const suspendedProjection = carriedChildProjection(checkpointProjection, {
-    eventPosition: 4n,
-    streamVersion: 3n,
-    childState: "suspended",
-    authorityCommitment: H64_B,
-  });
-  const transferProjection = carriedChildProjection(suspendedProjection, {
-    eventPosition: 5n,
-    streamVersion: 4n,
-    childState: "transferred",
-    authorityCommitment: String(transferred.authority_commitment),
-    terminalEventType: "ChildWorkTransferCreated",
-    terminalEventPosition: 5n,
-  });
-  for (const projection of [
-    forkProjection,
-    checkpointProjection,
-    suspendedProjection,
-    transferProjection,
-  ]) insertChildProjection(fixture.connection, projection);
-  return {
-    fixture,
-    binding,
-    rootCheckpoint: rootCheckpoint as Record<string, unknown>,
-  };
-}
-
-function claimFrozenTicket(
-  frozen: ReturnType<typeof frozenTicketFixture>,
-): {
-  readonly claimedChildSessionId: string;
-  readonly forkEventPosition: bigint;
-  readonly claimEventPosition: bigint;
-} {
-  const claimedChildSessionId = uuid(88_020);
-  const forkEventPosition = 7n;
-  const claimEventPosition = 8n;
-  const ticketId = String(frozen.binding.transferTicketId);
-  const claimed = childAuthority(claimedChildSessionId, forkEventPosition, {
-    child_capability_generation: null,
-    direct_access_enabled: 0,
-    child_handle_capability_version: null,
-    child_handle_key_id: null,
-    child_handle_issue_nonce: null,
-    child_handle_issued_at: null,
-    child_handle_policy_code: null,
-    child_handle_expiry_kind: null,
-    child_handle_expires_at: null,
-    child_handle_actor_role: null,
-    child_handle_client_instance_id: null,
-    child_handle_verifier: null,
-    child_handle_issuance_id: null,
-    checkpoint_required_reason: "carry-forward-claim",
-    checkpoint_required_event_position: claimEventPosition,
-  });
-  rawInsert(frozen.fixture.connection, "streams", {
-    project_id: PROJECT_ID,
-    stream_id: `session/${claimedChildSessionId}`,
-    stream_type: "session",
-    current_version: 2,
-    created_at: NOW,
-    updated_at: NOW,
-  });
-  rawEvent(frozen.fixture.connection, {
-    globalPosition: forkEventPosition,
-    streamId: `session/${claimedChildSessionId}`,
-    streamVersion: 1n,
-    eventType: "SessionForked",
-    eventSchemaVersion: 1,
-    sessionId: claimedChildSessionId,
-    parentSessionId: ROOT_ID,
-    payload: {
-      ...forkPayload(String(claimed.authority_commitment)),
-      directAccessEnabled: false,
-      sourceTransferTicketId: ticketId,
-    },
-  });
-  rawEvent(frozen.fixture.connection, {
-    globalPosition: claimEventPosition,
-    streamId: `session/${claimedChildSessionId}`,
-    streamVersion: 2n,
-    eventType: "ChildWorkTransferClaimed",
-    eventSchemaVersion: 1,
-    sessionId: claimedChildSessionId,
-    parentSessionId: ROOT_ID,
-    payload: {
-      transferTicketId: ticketId,
-      previousChildSessionId: CHILD_ID,
-      previousTransferEventPosition: frozen.binding.transferTicketEventPosition,
-    },
-  });
-  rawInsert(frozen.fixture.connection, "session_authority", claimed);
-  frozen.fixture.connection.prepare(`
-    UPDATE child_transfer_tickets
-    SET claimed_by_root_session_id = $claimedByRootSessionId,
-        claimed_child_session_id = $claimedChildSessionId,
-        claimed_event_position = $claimedEventPosition,
-        claimed_at = $claimedAt
-    WHERE project_id = $projectId
-      AND transfer_ticket_id = $transferTicketId
-  `).run({
-    $claimedByRootSessionId: ROOT_ID,
-    $claimedChildSessionId: claimedChildSessionId,
-    $claimedEventPosition: claimEventPosition,
-    $claimedAt: NOW,
-    $projectId: PROJECT_ID,
-    $transferTicketId: ticketId,
-  });
-  return { claimedChildSessionId, forkEventPosition, claimEventPosition };
-}
-
 function addCapacityChildren(fixture: Fixture, count: number): readonly {
   bindingKind: "current-child";
   childSessionId: string;
@@ -2261,7 +1863,7 @@ afterEach(() => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 
-it("bounded quick integrity rejects aggregate transition and checkpoint tampering without ordinal reads", async () => {
+it("bounded quick integrity rejects current aggregate and transition tampering without historical reads", async () => {
   const cases: readonly {
     readonly expected: IntegrityIssueCode;
     readonly mutate: (fixture: Fixture) => void;
@@ -2328,56 +1930,6 @@ it("bounded quick integrity rejects aggregate transition and checkpoint tamperin
       },
     },
     {
-      expected: "SESSION_AUTHORITY_FOLD_MISMATCH",
-      mutate(fixture) {
-        seedCoverage(fixture);
-        addCurrentCheckpoint(fixture);
-        dropTrigger(fixture.connection, "session_authority_update_guard");
-        fixture.connection.exec(
-          `UPDATE session_authority SET latest_checkpoint_fingerprint = '${H64_B}'`,
-        );
-      },
-    },
-    {
-      expected: "SESSION_AUTHORITY_FOLD_MISMATCH",
-      mutate(fixture) {
-        seedCoverage(fixture);
-        addCurrentCheckpoint(fixture);
-        dropTrigger(fixture.connection, "session_authority_update_guard");
-        fixture.connection.prepare(`
-          UPDATE session_authority SET latest_checkpoint_id = $checkpointId
-        `).run({ $checkpointId: uuid(88_099) });
-      },
-    },
-    {
-      expected: "SESSION_AUTHORITY_FOLD_MISMATCH",
-      mutate(fixture) {
-        seedCoverage(fixture);
-        addCurrentCheckpoint(fixture);
-        dropTrigger(fixture.connection, "events_no_update");
-        const row = fixture.connection.prepare(
-          "SELECT payload_json FROM events WHERE global_position = 3",
-        ).get()!;
-        const payload = JSON.parse(String(row.payload_json)) as Record<string, unknown>;
-        const checkpoint = payload.checkpoint as Record<string, unknown>;
-        checkpoint.taskSummary = "tampered";
-        fixture.connection.prepare(
-          "UPDATE events SET payload_json = $payload WHERE global_position = 3",
-        ).run({ $payload: canonicalJson(payload) });
-      },
-    },
-    {
-      expected: "SESSION_AUTHORITY_FOLD_MISMATCH",
-      mutate(fixture) {
-        seedCoverage(fixture);
-        addCurrentCheckpoint(fixture);
-        dropTrigger(fixture.connection, "events_no_update");
-        fixture.connection.exec(
-          "UPDATE events SET event_schema_version = 1 WHERE global_position = 3",
-        );
-      },
-    },
-    {
       expected: "LIFECYCLE_WORKFLOW_INVARIANT_MISMATCH",
       mutate(fixture) {
         dropTrigger(fixture.connection, "workflow_instances_evidence_v3_insert_guard");
@@ -2394,270 +1946,6 @@ it("bounded quick integrity rejects aggregate transition and checkpoint tamperin
     const result = await quickIssues(fixture);
     assert.ok(result.issues.includes(item.expected), item.expected);
   }
-});
-
-it("bounded quick integrity resolves frozen version 2 checkpoints at the recorded event-time baseline", async () => {
-  const fixture = createFixture();
-  const childStream = `session/${CHILD_ID}`;
-  rawInsert(fixture.connection, "streams", {
-    project_id: PROJECT_ID,
-    stream_id: childStream,
-    stream_type: "session",
-    current_version: 1,
-    created_at: NOW,
-    updated_at: NOW,
-  });
-  const childRow = childAuthority(CHILD_ID, 2n);
-  rawEvent(fixture.connection, {
-    globalPosition: 2n,
-    streamId: childStream,
-    streamVersion: 1n,
-    eventType: "SessionForked",
-    eventSchemaVersion: 1,
-    sessionId: CHILD_ID,
-    parentSessionId: ROOT_ID,
-    payload: forkPayload(String(childRow.authority_commitment)),
-  });
-  rawInsert(fixture.connection, "session_authority", childRow);
-  seedCoverage(fixture, {
-    sessionId: CHILD_ID,
-    position: 3n,
-    streamVersion: 2n,
-  });
-  const childCheckpoint = {
-    ...qualifiedCheckpointFixture({
-      checkpointId: CHECKPOINT_ID as never,
-      sessionId: CHILD_ID as never,
-      parentSessionId: ROOT_ID as never,
-      baseEventPosition: 3,
-      checkpointEventPosition: 4,
-    }),
-    evidenceCoverage: {
-      coverageVersion: 2,
-      captureMode: "coverage-only",
-      contentRetained: false,
-      adapterSessions: [{
-        adapterSessionId: ADAPTER_ID,
-        coverageFirstOrdinal: "0",
-        coverageLastOrdinal: "0",
-        highestContiguousOrdinal: "0",
-        missingIntervals: [],
-        frameFingerprintAlgorithm: "hmac-sha256",
-        frameFingerprintSchemaVersion: 1,
-        frameFingerprintKeyId: "key-a",
-        frameFingerprintDomain: "pm-evidence-frame-v1",
-        coverageFingerprintAlgorithm: "hmac-sha256",
-        coverageFingerprintSchemaVersion: 1,
-        coverageFingerprintKeyId: "key-a",
-        coverageFingerprintDomain: "pm-evidence-coverage-v1",
-        coverageFingerprint: H64,
-        latestBatchId: BATCH_ID,
-        latestBatchEventPosition: "3",
-      }],
-    },
-  };
-  rawEvent(fixture.connection, {
-    globalPosition: 4n,
-    streamId: childStream,
-    streamVersion: 3n,
-    eventType: "SessionCheckpointRecorded",
-    eventSchemaVersion: 2,
-    sessionId: CHILD_ID,
-    parentSessionId: ROOT_ID,
-    payload: {
-      checkpoint: childCheckpoint,
-      baseEventPosition: "3",
-      checkpointEventPosition: "4",
-    },
-  });
-  fixture.connection.prepare(`
-    UPDATE session_authority
-    SET latest_checkpoint_id = $checkpointId,
-        latest_checkpoint_event_position = 4,
-        latest_checkpoint_fingerprint = $fingerprint
-    WHERE project_id = $projectId AND session_id = $sessionId
-  `).run({
-    $checkpointId: CHECKPOINT_ID,
-    $fingerprint: checkpointFingerprint(childCheckpoint, 2),
-    $projectId: PROJECT_ID,
-    $sessionId: CHILD_ID,
-  });
-  fixture.connection.prepare(`
-    UPDATE streams SET current_version = 3
-    WHERE project_id = $projectId AND stream_id = $streamId
-  `).run({ $projectId: PROJECT_ID, $streamId: childStream });
-  const childGenesisProjection = genesisChildProjection(
-    CHILD_ID,
-    2n,
-    String(childRow.authority_commitment),
-  );
-  const childCoverageProjection = carriedChildProjection(childGenesisProjection, {
-    eventPosition: 3n,
-    streamVersion: 2n,
-  });
-  const childCheckpointProjection = carriedChildProjection(childCoverageProjection, {
-    eventPosition: 4n,
-    streamVersion: 3n,
-    latestCheckpointId: CHECKPOINT_ID,
-    latestCheckpointEventPosition: 4n,
-  });
-  for (const projection of [
-    childGenesisProjection,
-    childCoverageProjection,
-    childCheckpointProjection,
-  ]) insertChildProjection(fixture.connection, projection);
-  const binding = {
-    bindingVersion: 1,
-    bindingKind: "current-child",
-    childSessionId: CHILD_ID,
-    childState: "active",
-    lastEventPosition: "4",
-    streamVersion: "3",
-    checkpointId: CHECKPOINT_ID,
-    checkpointEventPosition: "4",
-    transferTicketId: null,
-    transferTicketEventPosition: null,
-  };
-  const rootCheckpointId = uuid(88_002);
-  const rootCheckpoint = {
-    ...qualifiedCheckpointFixture({
-      checkpointId: rootCheckpointId as never,
-      sessionId: ROOT_ID as never,
-      baseEventPosition: 1,
-      checkpointEventPosition: 5,
-    }),
-    childSummaries: [{
-      childSessionId: CHILD_ID,
-      state: "active",
-      lastEventPosition: "4",
-      streamVersion: "3",
-      latestCheckpointId: CHECKPOINT_ID,
-    }],
-  };
-  rawEvent(fixture.connection, {
-    globalPosition: 5n,
-    streamId: `session/${ROOT_ID}`,
-    streamVersion: 2n,
-    eventType: "SessionCheckpointRecorded",
-    eventSchemaVersion: 2,
-    sessionId: ROOT_ID,
-    payload: {
-      checkpoint: rootCheckpoint,
-      baseEventPosition: "1",
-      checkpointEventPosition: "5",
-    },
-  });
-  fixture.connection.prepare(`
-    UPDATE streams SET current_version = 2
-    WHERE project_id = $projectId AND stream_id = $streamId
-  `).run({ $projectId: PROJECT_ID, $streamId: `session/${ROOT_ID}` });
-  dropTrigger(fixture.connection, "workflow_instances_evidence_v3_insert_guard");
-  addWorkflow(fixture, {
-    phase: "final-checkpoint-recorded",
-    result_json: canonicalJson(workflowStatus(
-      "final-checkpoint-recorded",
-      rootCheckpointId,
-      "5",
-    )),
-    evidence_frozen_checkpoint_event_position: 5,
-    evidence_frozen_generation: 1,
-    evidence_window_state: "sealed",
-    final_ending_scope_bindings_json: canonicalJson([binding]),
-  });
-
-  dropTrigger(fixture.connection, "session_evidence_coverage_no_delete");
-  dropTrigger(fixture.connection, "session_evidence_fingerprints_no_delete");
-  dropTrigger(fixture.connection, "session_evidence_coverage_transitions_no_update");
-  fixture.connection.exec("PRAGMA foreign_keys = OFF");
-  fixture.connection.prepare(
-    "DELETE FROM session_evidence_fingerprints WHERE project_id = $projectId AND session_id = $sessionId",
-  ).run({ $projectId: PROJECT_ID, $sessionId: CHILD_ID });
-  fixture.connection.prepare(
-    "DELETE FROM session_evidence_coverage WHERE project_id = $projectId AND session_id = $sessionId",
-  ).run({ $projectId: PROJECT_ID, $sessionId: CHILD_ID });
-  seedCoverage(fixture, {
-    sessionId: CHILD_ID,
-    adapterSessionId: ADAPTER_ID,
-    batchId: uuid(77_002),
-    position: 6n,
-    streamVersion: 4n,
-    fingerprint: H64_B,
-    previousFingerprint: H64,
-  });
-  assert.deepEqual((await quickIssues(fixture)).issues, []);
-  fixture.connection.prepare(`
-    UPDATE session_evidence_coverage_transitions
-    SET coverage_fingerprint_value = $tampered
-    WHERE project_id = $projectId AND session_id = $sessionId
-      AND batch_event_position = 3
-  `).run({
-    $tampered: "c".repeat(64),
-    $projectId: PROJECT_ID,
-    $sessionId: CHILD_ID,
-  });
-
-  const result = await quickIssues(fixture);
-  assert.ok(
-    result.issues.includes("LIFECYCLE_WORKFLOW_INVARIANT_MISMATCH"),
-    JSON.stringify(result.issues),
-  );
-
-  const direct = frozenTicketFixture();
-  assert.deepEqual((await quickIssues(direct.fixture)).issues, []);
-  dropTrigger(direct.fixture.connection, "workflow_instances_evidence_v3_update_guard");
-  dropTrigger(direct.fixture.connection, "workflow_instances_lifecycle_update_guard");
-  dropTrigger(direct.fixture.connection, "events_no_update");
-  const forgedBinding = {
-    ...direct.binding,
-    lastEventPosition: "7",
-    transferTicketEventPosition: "7",
-  };
-  const forgedRootCheckpoint = {
-    ...direct.rootCheckpoint,
-    childSummaries: [{
-      childSessionId: CHILD_ID,
-      state: "transferred",
-      lastEventPosition: "7",
-      streamVersion: "3",
-      latestCheckpointId: direct.binding.checkpointId,
-    }],
-  };
-  direct.fixture.connection.prepare(`
-    UPDATE workflow_instances
-    SET final_ending_scope_bindings_json = $bindings
-    WHERE project_id = $projectId
-  `).run({
-    $bindings: canonicalJson([forgedBinding]),
-    $projectId: PROJECT_ID,
-  });
-  direct.fixture.connection.prepare(`
-    UPDATE events SET payload_json = $payload WHERE global_position = 6
-  `).run({
-    $payload: canonicalJson({
-      checkpoint: forgedRootCheckpoint,
-      baseEventPosition: "1",
-      checkpointEventPosition: "5",
-    }),
-  });
-  assert.ok(
-    (await quickIssues(direct.fixture)).issues
-      .includes("LIFECYCLE_WORKFLOW_INVARIANT_MISMATCH"),
-  );
-
-  const ticket = frozenTicketFixture();
-  assert.deepEqual((await quickIssues(ticket.fixture)).issues, []);
-  dropTrigger(ticket.fixture.connection, "child_transfer_tickets_update_guard");
-  ticket.fixture.connection.prepare(`
-    UPDATE child_transfer_tickets SET checkpoint_id = $checkpointId
-    WHERE project_id = $projectId
-  `).run({
-    $checkpointId: uuid(88_099),
-    $projectId: PROJECT_ID,
-  });
-  assert.ok(
-    (await quickIssues(ticket.fixture)).issues
-      .includes("LIFECYCLE_WORKFLOW_INVARIANT_MISMATCH"),
-  );
 });
 
 it("bounded quick integrity rejects one-byte prospective capacity overflow", async () => {
@@ -2783,15 +2071,6 @@ it("bounded quick integrity checks status once per distinct current profile", as
     64,
   );
 });
-
-it("bounded quick integrity accepts clean frozen version 1 checkpoints and rejects dirty event-time scope", async () => {
-  assert.deepEqual((await quickIssues(frozenRootV1Fixture(false))).issues, []);
-  assert.ok(
-    (await quickIssues(frozenRootV1Fixture(true))).issues
-      .includes("LIFECYCLE_WORKFLOW_INVARIANT_MISMATCH"),
-  );
-});
-
 it("bounded quick integrity preserves signed-int64 positions and interval endpoints", async () => {
   assert.deepEqual((await quickIssues(frozenInt64RootFixture())).issues, []);
 
@@ -2836,92 +2115,6 @@ it("bounded quick integrity requires exact canonical latest coverage payload key
       .includes("SESSION_EVIDENCE_COVERAGE_MISMATCH"),
   );
 });
-
-it("bounded quick integrity folds frozen current-child state at the recorded position", async () => {
-  const frozen = frozenCurrentChildFixture("checkpoint");
-  assert.deepEqual((await quickIssues(frozen.fixture)).issues, []);
-  dropTrigger(frozen.fixture.connection, "workflow_instances_evidence_v3_update_guard");
-  dropTrigger(frozen.fixture.connection, "workflow_instances_lifecycle_update_guard");
-  dropTrigger(frozen.fixture.connection, "events_no_update");
-  const forgedBinding = {
-    ...frozen.binding,
-    childState: "suspended",
-  };
-  const forgedRoot = {
-    ...frozen.rootCheckpoint,
-    childSummaries: [{
-      childSessionId: CHILD_ID,
-      state: "suspended",
-      lastEventPosition: frozen.binding.lastEventPosition,
-      streamVersion: frozen.binding.streamVersion,
-      latestCheckpointId: frozen.binding.checkpointId,
-    }],
-  };
-  frozen.fixture.connection.prepare(`
-    UPDATE workflow_instances SET final_ending_scope_bindings_json = $bindings
-    WHERE project_id = $projectId
-  `).run({
-    $bindings: canonicalJson([forgedBinding]),
-    $projectId: PROJECT_ID,
-  });
-  frozen.fixture.connection.prepare(`
-    UPDATE events SET payload_json = $payload WHERE global_position = $position
-  `).run({
-    $payload: canonicalJson({
-      checkpoint: forgedRoot,
-      baseEventPosition: "1",
-      checkpointEventPosition: frozen.rootCheckpointPosition.toString(),
-    }),
-    $position: frozen.rootCheckpointPosition,
-  });
-  assert.ok(
-    (await quickIssues(frozen.fixture)).issues
-      .includes("LIFECYCLE_WORKFLOW_INVARIANT_MISMATCH"),
-  );
-});
-
-it("bounded quick integrity requires clean event-time scope for null child checkpoints", async () => {
-  assert.deepEqual(
-    (await quickIssues(frozenCurrentChildFixture("clean-null").fixture)).issues,
-    [],
-  );
-  assert.ok(
-    (await quickIssues(frozenCurrentChildFixture("covered-null").fixture)).issues
-      .includes("LIFECYCLE_WORKFLOW_INVARIANT_MISMATCH"),
-  );
-});
-
-it("bounded quick integrity requires an effective version 2 draft while evidence is open", async () => {
-  assert.deepEqual((await quickIssues(openWorkflowFixture(2))).issues, []);
-  assert.ok(
-    (await quickIssues(openWorkflowFixture(1))).issues
-      .includes("LIFECYCLE_WORKFLOW_INVARIANT_MISMATCH"),
-  );
-  assert.deepEqual((await quickIssues(openAmendmentFixture(null))).issues, []);
-  assert.ok(
-    (await quickIssues(openAmendmentFixture(1))).issues
-      .includes("LIFECYCLE_WORKFLOW_INVARIANT_MISMATCH"),
-  );
-});
-
-it("bounded quick integrity strict-decodes frozen transfer provenance", async () => {
-  const frozen = frozenTicketFixture();
-  assert.deepEqual((await quickIssues(frozen.fixture)).issues, []);
-  dropTrigger(frozen.fixture.connection, "events_no_update");
-  const row = frozen.fixture.connection.prepare(
-    "SELECT payload_json FROM events WHERE global_position = 5",
-  ).get()!;
-  const payload = JSON.parse(String(row.payload_json)) as Record<string, unknown>;
-  payload.unexpectedTicketAlias = frozen.binding.transferTicketId;
-  frozen.fixture.connection.prepare(
-    "UPDATE events SET payload_json = $payload WHERE global_position = 5",
-  ).run({ $payload: canonicalJson(payload) });
-  assert.ok(
-    (await quickIssues(frozen.fixture)).issues
-      .includes("LIFECYCLE_WORKFLOW_INVARIANT_MISMATCH"),
-  );
-});
-
 it("bounded quick integrity rejects noncanonical top-level scalar escapes while keeping frames opaque", async () => {
   const adapterSessionId = uuid(60_606);
   const escapedTopLevel = createFixture();
@@ -2969,115 +2162,7 @@ it("bounded quick integrity rejects noncanonical top-level scalar escapes while 
   ).run({ $payload: opaqueFramePayload });
   assert.deepEqual((await quickIssues(escapedFrame)).issues, []);
 });
-
-it("bounded quick integrity strict-decodes every frozen transfer ticket JSON field", async () => {
-  const corruptions = [
-    ["source_assignment_json", "{\"value\":\"\\u0030\"}"],
-    ["source_scope_json", "{\"value\":\"\\u0030\"}"],
-    ["follow_ups_json", "[\"\\u0030\"]"],
-    ["source_state_json", "{\"value\":\"\\u0030\"}"],
-    ["lineage_json", "{\"value\":\"\\u0030\"}"],
-  ] as const;
-  for (const [column, value] of corruptions) {
-    const frozen = frozenTicketFixture();
-    dropTrigger(frozen.fixture.connection, "child_transfer_tickets_update_guard");
-    frozen.fixture.connection.prepare(`
-      UPDATE child_transfer_tickets SET ${column} = $value
-      WHERE project_id = $projectId AND transfer_ticket_id = $transferTicketId
-    `).run({
-      $value: value,
-      $projectId: PROJECT_ID,
-      $transferTicketId: frozen.binding.transferTicketId as string,
-    });
-    assert.ok(
-      (await quickIssues(frozen.fixture)).issues
-        .includes("LIFECYCLE_WORKFLOW_INVARIANT_MISMATCH"),
-      column,
-    );
-  }
-});
-
-it("bounded quick integrity binds a legal later ticket claim to its strict direct event", async () => {
-  const legal = frozenTicketFixture();
-  claimFrozenTicket(legal);
-  assert.deepEqual((await quickIssues(legal.fixture)).issues, []);
-
-  const acceptedBranchMutations: string[] = [];
-  for (const target of ["fork", "claim"] as const) {
-    const changed = frozenTicketFixture();
-    const positions = claimFrozenTicket(changed);
-    const branchScopeId = uuid(97_001);
-    const branchRef = "refs/heads/foreign-claim";
-    rawInsert(changed.fixture.connection, "branch_scopes", {
-      project_id: PROJECT_ID,
-      branch_scope_id: branchScopeId,
-      current_ref: branchRef,
-      created_head: H64,
-      detached: 0,
-      created_at: NOW,
-      updated_at: NOW,
-      retired_at: null,
-    });
-    dropTrigger(changed.fixture.connection, "events_no_update");
-    changed.fixture.connection.prepare(`
-      UPDATE events
-      SET branch_scope_id = $branchScopeId, branch_ref = $branchRef
-      WHERE global_position = $position
-    `).run({
-      $branchScopeId: branchScopeId,
-      $branchRef: branchRef,
-      $position: target === "fork"
-        ? positions.forkEventPosition
-        : positions.claimEventPosition,
-    });
-    const issues = (await quickIssues(changed.fixture)).issues;
-    if (!issues.includes("LIFECYCLE_WORKFLOW_INVARIANT_MISMATCH")) {
-      acceptedBranchMutations.push(target);
-    }
-  }
-
-  const stableIdentity = frozenTicketFixture();
-  const stableClaim = claimFrozenTicket(stableIdentity);
-  dropTrigger(stableIdentity.fixture.connection, "events_no_update");
-  stableIdentity.fixture.connection.prepare(`
-    UPDATE events SET vault_id = $vaultId WHERE global_position = $position
-  `).run({
-    $vaultId: uuid(97_002),
-    $position: stableClaim.claimEventPosition,
-  });
-  assert.ok(
-    (await quickIssues(stableIdentity.fixture)).issues
-      .includes("LIFECYCLE_WORKFLOW_INVARIANT_MISMATCH"),
-    "stable lifecycle identity",
-  );
-
-  const tampered = frozenTicketFixture();
-  const claim = claimFrozenTicket(tampered);
-  dropTrigger(tampered.fixture.connection, "events_no_update");
-  const claimRow = tampered.fixture.connection.prepare(
-    "SELECT payload_json FROM events WHERE global_position = $position",
-  ).get({ $position: claim.claimEventPosition })!;
-  const claimPayload = JSON.parse(String(claimRow.payload_json)) as Record<string, unknown>;
-  claimPayload.previousChildSessionId = uuid(88_021);
-  tampered.fixture.connection.prepare(`
-    UPDATE events SET payload_json = $payload
-    WHERE global_position = $position
-  `).run({
-    $payload: canonicalJson(claimPayload),
-    $position: claim.claimEventPosition,
-  });
-  assert.ok(
-    (await quickIssues(tampered.fixture)).issues
-      .includes("LIFECYCLE_WORKFLOW_INVARIANT_MISMATCH"),
-  );
-  assert.deepEqual(
-    acceptedBranchMutations,
-    [],
-    `accepted foreign branch provenance: ${acceptedBranchMutations.join(", ")}`,
-  );
-});
-
-it("bounded quick integrity reads only target projection dependencies", async () => {
+it("bounded quick integrity performs no historical projection dependency reads", async () => {
   const frozen = frozenCurrentChildFixture("checkpoint");
   seedCoverage(frozen.fixture, {
     sessionId: CHILD_ID,
@@ -3088,90 +2173,20 @@ it("bounded quick integrity reads only target projection dependencies", async ()
   });
   const result = await quickIssues(frozen.fixture);
   assert.deepEqual(result.issues, []);
-  assert.equal(result.reads.childProjectionTargetReads(), 1);
-  assert.equal(result.reads.childProjectionPredecessorReads(), 1);
+  assert.equal(result.reads.childProjectionTargetReads(), 0);
+  assert.equal(result.reads.childProjectionPredecessorReads(), 0);
   assert.equal(result.reads.reportWitnessReads(), 0);
-
-  const mutations: readonly {
-    readonly label: string;
-    readonly set: string;
-  }[] = [
-    { label: "project", set: `project_id = '${uuid(94_001)}'` },
-    { label: "child", set: `child_session_id = '${uuid(94_002)}'` },
-    { label: "event position", set: "event_position = 4" },
-    { label: "stream version", set: "stream_version = 3" },
-    { label: "root", set: `root_session_id = '${uuid(94_003)}'` },
-    { label: "state", set: "child_state = 'completion-proposed'" },
-    { label: "checkpoint id", set: `latest_checkpoint_id = '${uuid(94_004)}'` },
-    { label: "checkpoint source", set: "latest_checkpoint_event_position = 2" },
-    { label: "authority", set: `authority_commitment = '${H64_B}'` },
-    { label: "previous hash", set: `previous_fingerprint = '${H64_B}'` },
-    { label: "current hash", set: `fingerprint = '${H64_B}'` },
-  ];
-  for (const mutation of mutations) {
-    const tampered = frozenCurrentChildFixture("checkpoint");
-    dropTrigger(tampered.fixture.connection, "lifecycle_child_event_folds_no_update");
-    tampered.fixture.connection.exec(`
-      UPDATE lifecycle_child_event_folds
-      SET ${mutation.set}
-      WHERE project_id = '${PROJECT_ID}'
-        AND child_session_id = '${CHILD_ID}'
-        AND event_position = 3
-    `);
-    assert.ok(
-      (await quickIssues(tampered.fixture)).issues
-        .includes("LIFECYCLE_WORKFLOW_INVARIANT_MISMATCH"),
-      mutation.label,
-    );
-  }
-
-  for (const mutation of [
-    {
-      label: "terminal type and state linkage",
-      set: "child_state = 'completed', terminal_event_type = 'ChildSessionCompleted'",
-    },
-    { label: "terminal source", set: "terminal_event_position = 4" },
-  ] as const) {
-    const tampered = frozenTicketFixture();
-    dropTrigger(tampered.fixture.connection, "lifecycle_child_event_folds_no_update");
-    tampered.fixture.connection.exec(`
-      UPDATE lifecycle_child_event_folds
-      SET ${mutation.set}
-      WHERE project_id = '${PROJECT_ID}'
-        AND child_session_id = '${CHILD_ID}'
-        AND event_position = 5
-    `);
-    assert.ok(
-      (await quickIssues(tampered.fixture)).issues
-        .includes("LIFECYCLE_WORKFLOW_INVARIANT_MISMATCH"),
-      mutation.label,
-    );
-  }
-
-  for (const mutation of [
-    { label: "target vault", column: "vault_id", value: uuid(94_010) },
-    { label: "target store", column: "store_id", value: uuid(94_011) },
-    { label: "target workspace", column: "workspace_id", value: uuid(94_012) },
-    { label: "target branch", column: "branch_ref", value: "refs/heads/tampered" },
-  ] as const) {
-    const tampered = frozenCurrentChildFixture("clean-null");
-    dropTrigger(tampered.fixture.connection, "events_no_update");
-    tampered.fixture.connection.prepare(`
-      UPDATE events SET ${mutation.column} = $value WHERE global_position = 2
-    `).run({ $value: mutation.value });
-    assert.ok(
-      (await quickIssues(tampered.fixture)).issues
-        .includes("LIFECYCLE_WORKFLOW_INVARIANT_MISMATCH"),
-      mutation.label,
-    );
-  }
+  assert.equal(result.reads.workflowProjectionReads(), 0);
 });
 
-it("bounded quick integrity accepts legal open-window unchanged null carry", async () => {
+it("bounded quick integrity accepts clean open-window endpoints without historical reads", async () => {
   const legal = openAmendmentFixture(null);
   const result = await quickIssues(legal);
   assert.deepEqual(result.issues, []);
-  assert.equal(result.reads.workflowProjectionReads(), 2);
+  assert.equal(result.reads.childProjectionTargetReads(), 0);
+  assert.equal(result.reads.childProjectionPredecessorReads(), 0);
+  assert.equal(result.reads.reportWitnessReads(), 0);
+  assert.equal(result.reads.workflowProjectionReads(), 0);
 
   const maintenanceInspection = openAmendmentFixture(null);
   const maintenanceContext = {
@@ -3182,287 +2197,51 @@ it("bounded quick integrity accepts legal open-window unchanged null carry", asy
       clientInstanceId: "client-integrity-inspector",
     },
   } as ProjectContext;
-  assert.deepEqual(
-    (await quickIssues({
-      connection: maintenanceInspection.connection,
-      context: maintenanceContext,
-    })).issues,
-    [],
-    "historical presenting identity is bound to its event, not the inspector",
-  );
-
-  const workflowMutations = [
-    { label: "project", set: `project_id = '${uuid(95_001)}'` },
-    { label: "workflow", set: `workflow_id = '${uuid(95_002)}'` },
-    { label: "generation", set: "workflow_generation = 3" },
-    { label: "session", set: `session_id = '${uuid(95_003)}'` },
-    {
-      label: "trigger",
-      set: "trigger_event_position = 1, effective_draft_source_event_position = 1",
-    },
-    { label: "root command", set: `root_command_id = '${uuid(95_004)}'` },
-    { label: "window", set: "evidence_window_state = 'sealed'" },
-    {
-      label: "replacement",
-      set: "evidence_window_state = 'sealed', replacement_checkpoint_version = 1, effective_checkpoint_version = 1, effective_draft_source_event_position = 3",
-    },
-    {
-      label: "effective version",
-      set: "evidence_window_state = 'sealed', effective_checkpoint_version = 1",
-    },
-    { label: "effective source", set: "effective_draft_source_event_position = 3" },
-    { label: "previous hash", set: `previous_fingerprint = '${H64_B}'` },
-    { label: "current hash", set: `fingerprint = '${H64_B}'` },
-  ] as const;
-  for (const mutation of workflowMutations) {
-    const tampered = openAmendmentFixture(null);
-    dropTrigger(tampered.connection, "lifecycle_workflow_generation_folds_no_update");
-    tampered.connection.exec(`
-      UPDATE lifecycle_workflow_generation_folds
-      SET ${mutation.set}
-      WHERE project_id = '${PROJECT_ID}' AND workflow_generation = 2
-    `);
-    assert.ok(
-      (await quickIssues(tampered)).issues
-        .includes("LIFECYCLE_WORKFLOW_INVARIANT_MISMATCH"),
-      mutation.label,
-    );
-  }
-
-  const triggerTampered = openAmendmentFixture(null);
-  dropTrigger(triggerTampered.connection, "events_no_update");
-  const triggerRow = triggerTampered.connection.prepare(
-    "SELECT payload_json FROM events WHERE global_position = 3",
-  ).get()!;
-  const triggerPayload = JSON.parse(String(triggerRow.payload_json)) as Record<string, unknown>;
-  triggerPayload.previousWorkflowGeneration = 2;
-  triggerPayload.workflowGeneration = 3;
-  triggerTampered.connection.prepare(
-    "UPDATE events SET payload_json = $payload WHERE global_position = 3",
-  ).run({ $payload: canonicalJson(triggerPayload) });
-  assert.ok(
-    (await quickIssues(triggerTampered)).issues
-      .includes("LIFECYCLE_WORKFLOW_INVARIANT_MISMATCH"),
-    "trigger event",
-  );
-
-  const sourceTampered = openAmendmentFixture(null);
-  dropTrigger(sourceTampered.connection, "events_no_update");
-  const sourceRow = sourceTampered.connection.prepare(
-    "SELECT payload_json FROM events WHERE global_position = 2",
-  ).get()!;
-  const sourcePayload = JSON.parse(String(sourceRow.payload_json)) as Record<string, unknown>;
-  sourcePayload.requireMaterialization = true;
-  sourceTampered.connection.prepare(
-    "UPDATE events SET payload_json = $payload WHERE global_position = 2",
-  ).run({ $payload: canonicalJson(sourcePayload) });
-  assert.ok(
-    (await quickIssues(sourceTampered)).issues
-      .includes("LIFECYCLE_WORKFLOW_INVARIANT_MISMATCH"),
-    "effective source event",
-  );
-
-  const sourceContextTampered = openAmendmentFixture(null);
-  dropTrigger(sourceContextTampered.connection, "events_no_update");
-  sourceContextTampered.connection.prepare(`
-    UPDATE events SET workspace_id = $workspaceId WHERE global_position = 2
-  `).run({ $workspaceId: uuid(95_010) });
-  assert.ok(
-    (await quickIssues(sourceContextTampered)).issues
-      .includes("LIFECYCLE_WORKFLOW_INVARIANT_MISMATCH"),
-    "effective source context",
-  );
-
-  const acceptedIntentMutations: string[] = [];
-  const intentMutations: readonly {
-    readonly label: string;
-    readonly command?: Readonly<Record<string, unknown>>;
-    readonly origin?: Readonly<Record<string, unknown>>;
-  }[] = [
-    {
-      label: "expected branch",
-      command: { expectedBranchRef: "refs/heads/foreign-intent" },
-    },
-    {
-      label: "idempotency key",
-      command: { idempotencyKey: "quick-integrity/end-amendment/foreign" },
-    },
-    { label: "agent", command: { agentId: "agent-foreign" } },
-    {
-      label: "expected project",
-      command: { expectedProjectId: uuid(98_001) },
-      origin: { projectId: uuid(98_001) },
-    },
-    {
-      label: "expected vault",
-      command: { expectedVaultId: uuid(98_002) },
-      origin: { vaultId: uuid(98_002) },
-    },
-    {
-      label: "expected workspace",
-      command: { expectedWorkspaceId: H64_B },
-      origin: { workspaceId: H64_B },
-    },
-    { label: "client namespace", origin: { clientNamespace: "foreign-tests" } },
-    { label: "presenting actor", origin: { presentingActorRole: "maintenance" } },
-    {
-      label: "presenting client",
-      origin: { presentingClientInstanceId: "client-foreign" },
-    },
-  ];
-  for (const mutation of intentMutations) {
-    const changed = openAmendmentFixture(null);
-    const rebuilt = amendmentWitnessV2(uuid(89_005), uuid(30_003), {
-      command: mutation.command,
-      origin: mutation.origin,
-    });
-    assert.doesNotThrow(
-      () => decodeLifecycleIntentWitness(rebuilt),
-      `${mutation.label} fixture must remain strict-valid`,
-    );
-    dropTrigger(changed.connection, "events_no_update");
-    changed.connection.prepare(`
-      UPDATE events SET lifecycle_intent_json = $intent
-      WHERE global_position = 3 AND command_event_index = 0
-    `).run({ $intent: rebuilt });
-    const issues = (await quickIssues(changed)).issues;
-    if (!issues.includes("LIFECYCLE_WORKFLOW_INVARIANT_MISMATCH")) {
-      acceptedIntentMutations.push(mutation.label);
-    }
-  }
-
-  const intentTampered = openAmendmentFixture(null);
-  dropTrigger(intentTampered.connection, "events_no_update");
-  intentTampered.connection.prepare(`
-    UPDATE events SET lifecycle_intent_json = $intent
-    WHERE global_position = 3 AND command_event_index = 0
-  `).run({ $intent: requestWitness(2, uuid(30_003)) });
-  assert.ok(
-    (await quickIssues(intentTampered)).issues
-      .includes("LIFECYCLE_WORKFLOW_INVARIANT_MISMATCH"),
-    "command event zero intent",
-  );
-
-  const tampered = openAmendmentFixture(null);
-  const generationOneFingerprint = String(tampered.connection.prepare(`
-    SELECT fingerprint
-    FROM lifecycle_workflow_generation_folds
-    WHERE project_id = $projectId AND workflow_generation = 1
-  `).get({ $projectId: PROJECT_ID })!.fingerprint);
-  const bad = workflowProjection({
-    projectId: PROJECT_ID,
-    workflowId: uuid(89_005),
-    workflowGeneration: 2,
-    sessionId: ROOT_ID,
-    triggerEventPosition: 3n,
-    rootCommandId: uuid(30_003),
-    evidenceWindowState: "open",
-    replacementCheckpointVersion: null,
-    effectiveCheckpointVersion: 2,
-    effectiveDraftSourceEventPosition: 3n,
-    previousFingerprint: generationOneFingerprint,
+  const maintenance = await quickIssues({
+    connection: maintenanceInspection.connection,
+    context: maintenanceContext,
   });
-  dropTrigger(tampered.connection, "lifecycle_workflow_generation_folds_no_update");
-  tampered.connection.prepare(`
-    UPDATE lifecycle_workflow_generation_folds
-    SET effective_draft_source_event_position = $source,
-        fingerprint = $fingerprint
-    WHERE project_id = $projectId AND workflow_generation = 2
-  `).run({
-    $source: 3n,
-    $fingerprint: bad.fingerprint,
-    $projectId: PROJECT_ID,
-  });
-  assert.ok(
-    (await quickIssues(tampered)).issues
-      .includes("LIFECYCLE_WORKFLOW_INVARIANT_MISMATCH"),
-  );
-  assert.deepEqual(
-    acceptedIntentMutations,
-    [],
-    `accepted command-event-0 identity: ${acceptedIntentMutations.join(", ")}`,
-  );
+  assert.deepEqual(maintenance.issues, []);
+  assert.equal(maintenance.reads.childProjectionTargetReads(), 0);
+  assert.equal(maintenance.reads.childProjectionPredecessorReads(), 0);
+  assert.equal(maintenance.reads.reportWitnessReads(), 0);
+  assert.equal(maintenance.reads.workflowProjectionReads(), 0);
 });
 
-it("bounded quick integrity verifies a consumer bound to a non-latest report witness", async () => {
+it("bounded quick integrity does not read historical report witnesses for clean endpoints", async () => {
   const legal = nonLatestReportFixture();
   const result = await quickIssues(legal.fixture);
   assert.deepEqual(result.issues, []);
-  assert.equal(result.reads.childProjectionTargetReads(), 1);
-  assert.equal(result.reads.childProjectionPredecessorReads(), 1);
-  assert.equal(result.reads.reportWitnessReads(), 1);
-  const consumer = legal.fixture.connection.prepare(`
-    SELECT latest_report_id, completion_report_id
-    FROM lifecycle_child_event_folds
-    WHERE project_id = $projectId AND child_session_id = $childSessionId
-      AND event_position = 6
-  `).get({ $projectId: PROJECT_ID, $childSessionId: CHILD_ID })!;
-  assert.notEqual(consumer.latest_report_id, consumer.completion_report_id);
+  assert.equal(result.reads.childProjectionTargetReads(), 0);
+  assert.equal(result.reads.childProjectionPredecessorReads(), 0);
+  assert.equal(result.reads.reportWitnessReads(), 0);
+  assert.equal(result.reads.workflowProjectionReads(), 0);
+});
 
-  for (const mutation of [
-    { label: "report count carry", set: "report_count = 2" },
-    { label: "latest report carry", set: `latest_report_id = '${uuid(91_000)}'` },
-    { label: "report index carry", set: `report_index_fingerprint = '${H64_B}'` },
-    { label: "completion report", set: `completion_report_id = '${uuid(91_001)}'` },
-  ] as const) {
-    const changed = nonLatestReportFixture();
-    dropTrigger(changed.fixture.connection, "lifecycle_child_event_folds_no_update");
-    changed.fixture.connection.exec(`
-      UPDATE lifecycle_child_event_folds
-      SET ${mutation.set}
-      WHERE project_id = '${PROJECT_ID}'
-        AND child_session_id = '${CHILD_ID}'
-        AND event_position = 6
-    `);
-    assert.ok(
-      (await quickIssues(changed.fixture)).issues
-        .includes("LIFECYCLE_WORKFLOW_INVARIANT_MISMATCH"),
-      mutation.label,
-    );
-  }
-
-  for (const mutation of [
-    { label: "witness report id", set: `reported_report_id = '${uuid(91_099)}'` },
-    { label: "witness item count", set: "reported_item_count = 3" },
-    { label: "witness item set", set: `reported_item_set_fingerprint = '${H64_B}'` },
-    { label: "witness event ordering", set: "event_position = 7" },
-    { label: "witness stream ordering", set: "stream_version = 6" },
-    { label: "witness fingerprint", set: `fingerprint = '${H64_B}'` },
-  ] as const) {
-    const changed = nonLatestReportFixture();
-    dropTrigger(changed.fixture.connection, "lifecycle_child_event_folds_no_update");
-    changed.fixture.connection.exec(`
-      UPDATE lifecycle_child_event_folds
-      SET ${mutation.set}
-      WHERE project_id = '${PROJECT_ID}'
-        AND child_session_id = '${CHILD_ID}'
-        AND reported_report_id = '${uuid(91_000)}'
-    `);
-    assert.ok(
-      (await quickIssues(changed.fixture)).issues
-        .includes("LIFECYCLE_WORKFLOW_INVARIANT_MISMATCH"),
-      mutation.label,
-    );
-  }
-
-  const tampered = nonLatestReportFixture();
-  dropTrigger(tampered.fixture.connection, "events_no_update");
-  const row = tampered.fixture.connection.prepare(
-    "SELECT payload_json FROM events WHERE global_position = $position",
-  ).get({ $position: tampered.reportAEventPosition })!;
-  const payload = JSON.parse(String(row.payload_json)) as {
-    report: { findings: { itemId: string }[] };
+it("schema 2 quick integrity retains the legacy historical workflow mode", async () => {
+  const fixture = createSchema2Fixture();
+  const reads = observedConnection(fixture.connection);
+  const service = new LifecycleIntegrityService(reads.connection);
+  const probe = service as unknown as {
+    checkWorkflowShape(
+      context: ProjectContext,
+      sink: { add(code: IntegrityIssueCode): void },
+      qualifiedEndpointOnly?: boolean,
+    ): void;
   };
-  payload.report.findings[0]!.itemId = uuid(92_099);
-  tampered.fixture.connection.prepare(`
-    UPDATE events SET payload_json = $payload
-    WHERE global_position = $position
-  `).run({
-    $payload: canonicalJson(payload),
-    $position: tampered.reportAEventPosition,
+  const original = probe.checkWorkflowShape.bind(service);
+  const modes: boolean[] = [];
+  probe.checkWorkflowShape = (context, sink, qualifiedEndpointOnly = false): void => {
+    modes.push(qualifiedEndpointOnly);
+    original(context, sink, qualifiedEndpointOnly);
+  };
+  const issues: IntegrityIssueCode[] = [];
+
+  await service.quickCheckAsync(fixture.context, {
+    add(code) { issues.push(code); },
   });
-  assert.ok(
-    (await quickIssues(tampered.fixture)).issues
-      .includes("LIFECYCLE_WORKFLOW_INVARIANT_MISMATCH"),
-  );
+
+  assert.deepEqual(issues, []);
+  assert.deepEqual(modes, [false]);
+  assert.equal(reads.writes(), 0);
 });
