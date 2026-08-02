@@ -2154,6 +2154,24 @@ amendment authorizes only `src/orchestrator/lifecycle/session-aggregate.ts` and
 does not change codecs, event schema versions, migrations, routing, or public
 failure taxonomy.
 
+**Task 12J fix-round-5 proof-hardening amendment:** The zero adapter-inspection
+claim for ending bindings must be enforced structurally, not represented by a
+counter that is merely initialized to zero. Remove the passive
+`endingBindingEvidenceAdapterInspections` counter. Define a summary-only
+evidence-revision type containing exactly `revisionEventPosition` and
+`adapterCount`, and make `replayEndingBindings` accept only a read-only map of
+that type. The full replay state may remain at the caller, but the binding body
+must not be able to name or enumerate adapter entries. Retain the strict-valid
+two-child/twelve-adapters-per-child fixture and its positive transition,
+canonicalization, checkpoint-materialization, and exactly-B revision-lookup
+counters; build/typecheck is the enforcement gate for zero binding-time
+adapter entry access. Add explicit positive stale-generation regressions from
+an ending aggregate at generation 2 for both identified cancel and identified
+abandon. Finally, record the exact Task 12J marked-query inventory as five
+cursor statements, four pre-index statements, and three endpoint statements.
+This proof correction changes no runtime schema, migration, routing, codec, or
+failure taxonomy.
+
 The honest complexity contract is:
 
 ```text
