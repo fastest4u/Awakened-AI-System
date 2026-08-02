@@ -2056,6 +2056,9 @@ against the corrected HEAD.
 **Files:**
 - Create: `tests/qualified-checkpoint-full-integrity.test.ts`
 - Modify: `tests/qualified-checkpoint-quick-integrity.test.ts`
+- Modify only to correct the strict-invalid hand-built post-upgrade event hash
+  fixture exposed by qualified full replay:
+  `tests/project-store-upgrade.test.ts`
 - Modify: `src/orchestrator/storage/migrations/0003-qualified-checkpoint-coverage.ts`
 - Modify: `src/orchestrator/lifecycle/lifecycle-projection-folds.ts`
 - Modify: `src/orchestrator/storage/lifecycle-projection.repository.ts`
@@ -2104,6 +2107,14 @@ coverage for endpoint shape, current-key status, prospective capacity,
 no-write behavior, and bounded/no-historical-query execution. Retain or add a
 schema-2 legacy regression proving that this narrow schema-3 boundary does not
 change legacy/pre-qualified behavior.
+
+**Task 12J fix-round-3 upgrade-fixture scope amendment:** Qualified full replay
+now hydrates the synthetic `SessionStarted` row used by the ordinary integrity
+worker regression in `tests/project-store-upgrade.test.ts`. That hand-built
+post-upgrade fixture used a placeholder `payload_hash` instead of the SHA-256
+of its canonical payload, while the adjacent lifecycle append helper already
+uses the correct hash. Correct only that fixture at its source; do not weaken
+`hydrateReplayEvent`, alter migration behavior, or broaden the upgrade test.
 
 The honest complexity contract is:
 
@@ -2634,6 +2645,7 @@ persistent tables prove zero repair on each failure path.
 npm run test:build
 node --test --test-concurrency=1 --test-reporter=spec --test-name-pattern="^(full integrity advances each qualified coverage row exactly once|full integrity fingerprints each non-zero transition exactly once|full integrity reconstructs version 2 checkpoints and frozen snapshots at their historical bases|full integrity reports unavailable historical keys and never repairs state|full integrity merge cursors reject missing and orphan child projection rows|full integrity merge cursors reject missing and orphan workflow projection rows|full integrity collapses schema 2 same-generation cancel and abandon once)$" dist-test/tests/qualified-checkpoint-full-integrity.test.js
 node --test --test-concurrency=1 --test-reporter=spec dist-test/tests/qualified-checkpoint-full-integrity.test.js dist-test/tests/qualified-checkpoint-quick-integrity.test.js dist-test/tests/event-integrity.test.js dist-test/tests/event-append-transaction.test.js dist-test/tests/evidence-coverage.test.js dist-test/tests/checkpoint.service.test.js dist-test/tests/qualified-checkpoint-migration.test.js dist-test/tests/lifecycle-projection-folds.test.js
+node --test --test-concurrency=1 --test-reporter=spec --test-name-pattern="^runs lifecycle invariants through the ordinary integrity worker$" dist-test/tests/project-store-upgrade.test.js
 npm run typecheck
 git diff --check
 ```
@@ -2644,10 +2656,15 @@ child-only routing, root dual-scope exclusion, projection order, report
 witnesses, and workflow generations after the classifier move. Do not edit or
 stage it for Task 12J; run the existing suite unchanged in Step 9.
 
+`tests/project-store-upgrade.test.ts` is otherwise a regression consumer. Its
+only permitted Task 12J edit is replacing the strict-invalid placeholder
+payload hash in the named post-upgrade fixture with the independently computed
+canonical payload hash proven by the adjacent working helper.
+
 - [ ] **Step 10: Stage exactly the permitted Task 12J scope and commit**
 
 ```powershell
-git add -- src/orchestrator/storage/migrations/0003-qualified-checkpoint-coverage.ts src/orchestrator/lifecycle/lifecycle-projection-folds.ts src/orchestrator/storage/lifecycle-projection.repository.ts src/orchestrator/integrity/lifecycle-integrity.service.ts src/orchestrator/integrity/event-integrity.service.ts tests/support/lifecycle-projection-reference.ts tests/support/lifecycle-authority-reference.ts tests/qualified-checkpoint-full-integrity.test.ts tests/qualified-checkpoint-quick-integrity.test.ts tests/qualified-checkpoint-migration.test.ts tests/lifecycle-projection-folds.test.ts tests/event-integrity.test.ts tests/evidence-coverage.test.ts tests/checkpoint.service.test.ts
+git add -- src/orchestrator/storage/migrations/0003-qualified-checkpoint-coverage.ts src/orchestrator/lifecycle/lifecycle-projection-folds.ts src/orchestrator/storage/lifecycle-projection.repository.ts src/orchestrator/integrity/lifecycle-integrity.service.ts src/orchestrator/integrity/event-integrity.service.ts tests/support/lifecycle-projection-reference.ts tests/support/lifecycle-authority-reference.ts tests/qualified-checkpoint-full-integrity.test.ts tests/qualified-checkpoint-quick-integrity.test.ts tests/project-store-upgrade.test.ts tests/qualified-checkpoint-migration.test.ts tests/lifecycle-projection-folds.test.ts tests/event-integrity.test.ts tests/evidence-coverage.test.ts tests/checkpoint.service.test.ts
 $staged = @(git diff --cached --name-only)
 $allowed = @(
   'src/orchestrator/storage/migrations/0003-qualified-checkpoint-coverage.ts',
@@ -2659,6 +2676,7 @@ $allowed = @(
   'tests/support/lifecycle-authority-reference.ts',
   'tests/qualified-checkpoint-full-integrity.test.ts',
   'tests/qualified-checkpoint-quick-integrity.test.ts',
+  'tests/project-store-upgrade.test.ts',
   'tests/qualified-checkpoint-migration.test.ts',
   'tests/lifecycle-projection-folds.test.ts',
   'tests/event-integrity.test.ts',
