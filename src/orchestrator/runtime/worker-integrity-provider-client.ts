@@ -1,6 +1,9 @@
 import { randomUUID } from "node:crypto";
 import type { MessagePort } from "node:worker_threads";
-import type { HistoricalEvidenceIntegrityProviderPort } from "../integrity/integrity.types.js";
+import {
+  HistoricalEvidenceKeyUnavailableError,
+  type HistoricalEvidenceIntegrityProviderPort,
+} from "../integrity/integrity.types.js";
 import {
   MAX_INTEGRITY_PROVIDER_INPUT_BYTES,
   decodeIntegrityProviderRequestWire,
@@ -19,7 +22,7 @@ interface PendingProviderOperation {
 }
 
 class IntegrityProviderClientError extends Error {
-  constructor(readonly code: "EVIDENCE_HISTORICAL_KEY_UNAVAILABLE" | "INTEGRITY_FAILURE" | "WORKER_PROTOCOL_ERROR") {
+  constructor(readonly code: "INTEGRITY_FAILURE" | "WORKER_PROTOCOL_ERROR") {
     super(code);
     this.name = "IntegrityProviderClientError";
   }
@@ -76,7 +79,9 @@ export class WorkerIntegrityProviderClient implements HistoricalEvidenceIntegrit
     }
     this.#pending = undefined;
     if (!response.ok) {
-      pending.reject(new IntegrityProviderClientError(response.code));
+      pending.reject(response.code === "EVIDENCE_HISTORICAL_KEY_UNAVAILABLE"
+        ? new HistoricalEvidenceKeyUnavailableError()
+        : new IntegrityProviderClientError(response.code));
       return;
     }
     pending.resolve(response.operation === "status" ? response.status : response.fingerprint);

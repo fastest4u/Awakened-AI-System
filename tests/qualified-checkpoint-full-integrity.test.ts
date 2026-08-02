@@ -22,6 +22,8 @@ import {
   LifecycleIntegrityService,
   type LifecycleFullReplayWorkCounters,
 } from "../src/orchestrator/integrity/lifecycle-integrity.service.js";
+import { WorkerIntegrityProviderClient } from "../src/orchestrator/runtime/worker-integrity-provider-client.js";
+import { decodeIntegrityProviderRequestWire } from "../src/orchestrator/runtime/worker-protocol.js";
 import {
   authorityCommitment,
   type CommittedAuthorityV1,
@@ -6141,6 +6143,29 @@ const provider: HistoricalEvidenceIntegrityProviderPort = {
   },
 };
 
+function unavailableWorkerProvider(
+  mode: "quick" | "full",
+  calls: { operation: "status" | "fingerprint"; keyId: string }[],
+): WorkerIntegrityProviderClient {
+  let client!: WorkerIntegrityProviderClient;
+  const port = {
+    postMessage(value: unknown): void {
+      const request = decodeIntegrityProviderRequestWire(value);
+      calls.push({ operation: request.operation, keyId: request.keyId });
+      queueMicrotask(() => client.accept({
+        type: "integrity-provider-response",
+        integrityRequestId: request.integrityRequestId,
+        providerRequestId: request.providerRequestId,
+        operation: request.operation,
+        ok: false,
+        code: "EVIDENCE_HISTORICAL_KEY_UNAVAILABLE",
+      }));
+    },
+  } as ConstructorParameters<typeof WorkerIntegrityProviderClient>[0];
+  client = new WorkerIntegrityProviderClient(port, `unavailable-${mode}`, mode);
+  return client;
+}
+
 async function fullIssues(fixture: Fixture): Promise<readonly IntegrityIssueCode[]> {
   const issues: IntegrityIssueCode[] = [];
   await new LifecycleIntegrityService(fixture.connection, provider)
@@ -8739,6 +8764,14 @@ it("full integrity reports unavailable historical keys and never repairs state",
       code: "EVIDENCE_HISTORICAL_KEY_UNAVAILABLE",
     },
     {
+      label: "structural unavailable rejection is untrusted",
+      provider: {
+        async status() { throw { code: "EVIDENCE_HISTORICAL_KEY_UNAVAILABLE" }; },
+        async fingerprint(keyId, bytes) { return testProviderFingerprint(keyId, bytes); },
+      },
+      code: "INTEGRITY_FAILURE",
+    },
+    {
       label: "invalid current status",
       provider: {
         async status() { return "unknown" as never; },
@@ -9179,6 +9212,62 @@ it("full integrity reports unavailable historical keys and never repairs state",
       advances: failure.expected,
     });
   }
+});
+
+it("production worker provider preserves unavailable current-key precedence in quick integrity", async () => {
+  const fixture = createFixture();
+  addCoverage(fixture);
+  const before = persistentSnapshot(fixture.connection);
+  const observed = observedReplayConnection(fixture.connection, { trapDml: true });
+  const calls: { operation: "status" | "fingerprint"; keyId: string }[] = [];
+  const workerProvider = unavailableWorkerProvider("quick", calls);
+
+  await assert.rejects(
+    () => new LifecycleIntegrityService(observed.connection, workerProvider)
+      .quickCheckAsync(fixture.context, { add() {} }),
+    (error: unknown) => (
+      typeof error === "object"
+      && error !== null
+      && "code" in error
+      && error.code === "EVIDENCE_HISTORICAL_KEY_UNAVAILABLE"
+    ),
+  );
+
+  assert.deepEqual(calls, [{ operation: "status", keyId: "key-a" }]);
+  assert.deepEqual([...observed.counts.keys()], []);
+  assert.equal(persistentSnapshot(fixture.connection), before);
+});
+
+it("production worker provider preserves unavailable historical-only key precedence in full integrity", async () => {
+  const fixture = createFixture();
+  addCoverage(fixture);
+  removeCurrentCoverageEndpoint(fixture);
+  const before = persistentSnapshot(fixture.connection);
+  const observed = observedReplayConnection(fixture.connection, { trapDml: true });
+  const calls: { operation: "status" | "fingerprint"; keyId: string }[] = [];
+  const workerProvider = unavailableWorkerProvider("full", calls);
+  const service = new LifecycleIntegrityService(observed.connection, workerProvider);
+  const cursors = captureReplayVisitCursors(service);
+
+  await assert.rejects(
+    () => service.fullCheckAsync(fixture.context, { add() {} }),
+    (error: unknown) => (
+      typeof error === "object"
+      && error !== null
+      && "code" in error
+      && error.code === "EVIDENCE_HISTORICAL_KEY_UNAVAILABLE"
+    ),
+  );
+
+  assert.deepEqual(calls, [{ operation: "status", keyId: "key-a" }]);
+  assertOpenedReplayContract({
+    label: "production worker unavailable replay key",
+    fixture,
+    before,
+    observed,
+    cursors,
+    advances: { event: 2, "coverage-transition": 0, "immutable-ordinal": 1 },
+  });
 });
 
 it("full integrity merge cursors reject missing and orphan child projection rows", async () => {

@@ -66,6 +66,15 @@ export interface IntegrityIssueSink {
   ): void;
 }
 
+export class HistoricalEvidenceKeyUnavailableError extends Error {
+  readonly code = "EVIDENCE_HISTORICAL_KEY_UNAVAILABLE" as const;
+
+  constructor() {
+    super("EVIDENCE_HISTORICAL_KEY_UNAVAILABLE");
+    this.name = "HistoricalEvidenceKeyUnavailableError";
+  }
+}
+
 export interface IntegrityExtension {
   quickCheck(context: ProjectContext, sink: IntegrityIssueSink): void;
   fullCheck(context: ProjectContext, sink: IntegrityIssueSink): void;

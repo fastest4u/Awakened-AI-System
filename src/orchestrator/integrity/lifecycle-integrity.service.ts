@@ -65,11 +65,12 @@ import type {
   SessionAuthorityRecord,
 } from "../storage/lifecycle-storage.types.js";
 import type { SqliteConnection, SqliteRow } from "../storage/sqlite-driver.js";
-import type {
-  AsyncIntegrityExtension,
-  HistoricalEvidenceIntegrityProviderPort,
-  IntegrityIssueCode,
-  IntegrityIssueSink,
+import {
+  HistoricalEvidenceKeyUnavailableError,
+  type AsyncIntegrityExtension,
+  type HistoricalEvidenceIntegrityProviderPort,
+  type IntegrityIssueCode,
+  type IntegrityIssueSink,
 } from "./integrity.types.js";
 
 const AUTHORIZATION_COLUMNS = [
@@ -841,7 +842,10 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
       let status: "available" | "revoked" | "unavailable";
       try {
         status = await this.provider.status(keyId);
-      } catch {
+      } catch (error) {
+        if (error instanceof HistoricalEvidenceKeyUnavailableError) {
+          throw new LifecycleError("EVIDENCE_HISTORICAL_KEY_UNAVAILABLE");
+        }
         throw new LifecycleError("INTEGRITY_FAILURE");
       }
       if (status === "revoked" || status === "unavailable") {
@@ -1535,7 +1539,10 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
     let status: "available" | "revoked" | "unavailable";
     try {
       status = await this.provider.status(keyId);
-    } catch {
+    } catch (error) {
+      if (error instanceof HistoricalEvidenceKeyUnavailableError) {
+        throw new LifecycleError("EVIDENCE_HISTORICAL_KEY_UNAVAILABLE");
+      }
       throw new LifecycleError("INTEGRITY_FAILURE");
     }
     if (status === "revoked" || status === "unavailable") {
