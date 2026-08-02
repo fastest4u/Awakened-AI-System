@@ -92,6 +92,41 @@ function isLifecycleInputInvalid(error: unknown): boolean {
 }
 
 describe("LifecycleOperationalStore", () => {
+  it("preserves claim-next identities before a target row exists", () => {
+    const connection = new OperationalConnection();
+    const store = new LifecycleOperationalStore({
+      connection,
+      transaction: () => transaction(connection),
+    });
+    const selections = [
+      {
+        kind: "workflow-selection",
+        projectId: "00000000-0000-4000-8000-000000000001",
+        workId: "workflow-scan-1",
+        operation: "claim-next",
+        ownerId: "coordinator-a",
+      },
+      {
+        kind: "outbox-selection",
+        projectId: "00000000-0000-4000-8000-000000000001",
+        workId: "outbox-scan-1",
+        operation: "claim-next",
+        ownerId: "materializer-a",
+      },
+    ] as const;
+    for (const selection of selections) {
+      const result = store.execute(
+        selection as unknown as LifecycleOperationalWorkIdentity,
+        () => ({ selected: false }),
+      );
+      assert.deepEqual(result.work, selection);
+      assert.equal(Object.isFrozen(result.work), true);
+      assert.equal("workflowId" in result.work, false);
+      assert.equal("targetKey" in result.work, false);
+      assert.equal("claimToken" in result.work, false);
+    }
+  });
+
   const malformedWork: ReadonlyArray<readonly [name: string, value: unknown]> = [
     ["unknown kind", { ...work(), kind: "timer" }],
     ["unknown workflow operation", { ...work(), operation: "delete" }],

@@ -2748,6 +2748,7 @@ describe("lifecycle Version 1 contracts", () => {
       "CHILD_DISPOSITION_INVALID",
       "LIFECYCLE_INPUT_INVALID",
       "LIFECYCLE_V2_DISABLED",
+      "LIFECYCLE_OPERATION_UNAVAILABLE",
       "STORE_ID_MISMATCH",
       "WORKER_PROTOCOL_ERROR",
     ];
@@ -2804,6 +2805,7 @@ describe("lifecycle Version 1 contracts", () => {
       CHILD_DISPOSITION_INVALID: ["The child report disposition is invalid", false, ["correct-lifecycle-input"]],
       LIFECYCLE_INPUT_INVALID: ["Lifecycle input is invalid", false, ["correct-lifecycle-input"]],
       LIFECYCLE_V2_DISABLED: ["Lifecycle Version 2 is disabled", false, ["enable-lifecycle-v2"]],
+      LIFECYCLE_OPERATION_UNAVAILABLE: ["The lifecycle operation is not available in this runtime", false, ["upgrade-runtime"]],
       STORE_ID_MISMATCH: ["Store identity does not match the manifest", false, ["attach-intended-store"]],
       WORKER_PROTOCOL_ERROR: ["The lifecycle worker protocol rejected the message", false, ["restart-trusted-worker"]],
     };

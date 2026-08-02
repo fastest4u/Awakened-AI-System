@@ -10,10 +10,47 @@ import type {
 import type { ProjectContext, ProjectId } from "../identity/contracts.js";
 import type { IntegrityReport } from "../integrity/integrity.types.js";
 import type { MaintenanceLease } from "../storage/maintenance-fence.js";
+import type {
+  AuthorityMaterialAdapter,
+  LifecycleExecutionResult,
+  WorkerLifecycleResult,
+} from "../lifecycle/authority/authority-material-adapter.js";
+import type {
+  InternalWorkflowExecutionPlan,
+  LifecycleSemanticCommandDraft,
+  PreparedLifecycleWorkerCommand,
+} from "../lifecycle/contracts/commands.js";
+import type { PendingCommandIdentity } from "../lifecycle/authority/pending-authorization.store.js";
+import {
+  LIFECYCLE_ERROR_CODES,
+  LifecycleError,
+  type LifecycleErrorCode,
+} from "../lifecycle/errors.js";
+import type {
+  LifecycleBoundedMutationForInput,
+  LifecycleBoundedMutationInput,
+  LifecycleBoundedResultFor,
+  LifecycleFencedInput,
+  LifecycleFencedOperationForInput,
+  LifecycleFencedOperationWire,
+  LifecycleFencedResultFor,
+  LifecycleInternalResultFor,
+  LifecycleQueryForInput,
+  LifecycleQueryInput,
+  LifecycleQueryResultFor,
+  LifecycleResultFor,
+  LifecycleSemanticOperationWire,
+} from "./lifecycle-worker-protocol.js";
+import {
+  decodeLifecycleWorkerOperationWire,
+  type LifecycleWorkerOperationWire,
+  type LifecycleWorkerSuccessWire,
+} from "./lifecycle-worker-protocol.js";
 import {
   decodeAppendResultWire,
   decodeIntegrityReport,
   decodeMaintenanceLeaseWire,
+  decodeWorkerRequest,
   decodeWorkerMessage,
   decodeWorkerResponseForRequest,
   encodeAppendCommandWire,
@@ -51,6 +88,13 @@ const MAINTENANCE_CONFIRMATION_CODES = new Set([
   "EXECUTOR_LEASE_INVALID",
   "EXECUTOR_LEASE_NOT_ACTIVE",
 ]);
+const DEFINITIVE_LIFECYCLE_ERROR_CODES = new Set<string>(
+  LIFECYCLE_ERROR_CODES.filter((code) => (
+    code !== "COMMAND_OUTCOME_UNKNOWN"
+    && code !== "OPERATION_OUTCOME_UNKNOWN"
+    && code !== "WORKER_PROTOCOL_ERROR"
+  )),
+);
 
 export interface ProjectStoreExecutorOptions {
   workerUrl: URL;
@@ -83,17 +127,18 @@ export interface ExecutorScheduler {
 }
 
 export interface ProjectStoreExecutorDependencies {
-  workerFactory: WorkerFactory;
-  scheduler: ExecutorScheduler;
-  randomId: () => string;
+  readonly workerFactory: WorkerFactory;
+  readonly scheduler: ExecutorScheduler;
+  readonly randomId: () => string;
   /**
    * Runs only after the store worker has exited. The implementation must use
    * the maintenance owner's already-open connection; it must not create a
    * short-lived publisher connection that would need to confirm its own close.
    */
-  confirmMaintenanceClosure: (
+  readonly confirmMaintenanceClosure: (
     confirmation: MaintenanceClosureConfirmation,
   ) => void | Promise<void>;
+  readonly authorityMaterialAdapter?: AuthorityMaterialAdapter;
 }
 
 export interface MaintenanceClosureConfirmation {
@@ -146,13 +191,173 @@ export class ProjectStoreWorkerError extends Error {
   }
 }
 
-type RequestKind = "read" | "mutation" | "lifecycle";
+type RequestKind = "read" | "mutation" | "bounded" | "operational" | "control";
+
+type PendingLifecycleIdentity =
+  | {
+      readonly kind: "semantic";
+      readonly projectId: ProjectId;
+      readonly commandId: string;
+      readonly idempotencyKey: string;
+    }
+  | {
+      readonly kind: "bounded";
+      readonly operationId: string;
+      readonly requestId: string;
+    }
+  | {
+      readonly kind: "operational";
+      readonly work: JsonValue;
+    };
+type SemanticPendingIdentity = Extract<PendingLifecycleIdentity, { readonly kind: "semantic" }>;
+
+type ExactInput<I, Shape> = I & Record<Exclude<keyof I, keyof Shape>, never>;
+type ExactBoundedInput<I extends LifecycleBoundedMutationInput> = ExactInput<
+  I,
+  Extract<LifecycleBoundedMutationInput, { readonly operation: I["operation"] }>
+>;
+type ExactQueryInput<I extends LifecycleQueryInput> = ExactInput<
+  I,
+  Extract<LifecycleQueryInput, { readonly operation: I["operation"] }>
+>;
+type ExactFencedInput<I extends LifecycleFencedInput> = ExactInput<
+  I,
+  Extract<LifecycleFencedInput, { readonly operation: I["operation"] }>
+>;
+
+function semanticIdentity(
+  projectId: ProjectId,
+  commandId: string,
+  idempotencyKey: string,
+): SemanticPendingIdentity {
+  return Object.freeze({
+    kind: "semantic" as const,
+    projectId,
+    commandId,
+    idempotencyKey,
+  });
+}
+
+function pendingCommandIdentity(identity: SemanticPendingIdentity): PendingCommandIdentity {
+  return Object.freeze({
+    projectId: identity.projectId,
+    commandId: identity.commandId,
+    idempotencyKey: identity.idempotencyKey,
+  });
+}
+
+function boundedIdentity(
+  operationId: string,
+  requestId: string,
+): PendingLifecycleIdentity {
+  return Object.freeze({ kind: "bounded" as const, operationId, requestId });
+}
+
+function operationalIdentity(
+  projectId: ProjectId,
+  wire: LifecycleFencedOperationWire,
+): PendingLifecycleIdentity {
+  const input = wire.input as unknown as Readonly<Record<string, JsonValue>>;
+  let work: JsonValue;
+  switch (wire.operation) {
+    case "workflow-claim-next":
+      work = Object.freeze({
+        kind: "workflow-selection",
+        projectId,
+        workId: input.workId,
+        operation: "claim-next",
+        ownerId: input.ownerId,
+      });
+      break;
+    case "outbox-claim-next":
+      work = Object.freeze({
+        kind: "outbox-selection",
+        projectId,
+        workId: input.workId,
+        operation: "claim-next",
+        ownerId: input.ownerId,
+      });
+      break;
+    case "workflow-recovery":
+      work = Object.freeze({
+        projectId,
+        workId: input.workId,
+        operation: "workflow-recovery",
+        ownerId: input.ownerId,
+        fencingToken: input.fencingToken,
+      });
+      break;
+    case "workflow-claim":
+    case "workflow-renew":
+    case "workflow-release":
+    case "workflow-eventless-phase": {
+      const operation = {
+        "workflow-claim": "claim",
+        "workflow-renew": "renew",
+        "workflow-release": "release",
+        "workflow-eventless-phase": "advance-eventless",
+      }[wire.operation];
+      work = Object.freeze({
+        kind: "workflow",
+        projectId,
+        workflowId: input.workflowId,
+        workflowGeneration: String(input.workflowGeneration),
+        operation,
+        ownerId: input.ownerId,
+        claimToken: input.fencingToken,
+      });
+      break;
+    }
+    case "outbox-claim":
+    case "outbox-renew":
+    case "outbox-materialize":
+    case "outbox-failure": {
+      const operation = {
+        "outbox-claim": "claim",
+        "outbox-renew": "renew",
+        "outbox-materialize": "materialize",
+        "outbox-failure": "record-failure",
+      }[wire.operation];
+      work = Object.freeze({
+        kind: "outbox",
+        projectId,
+        targetKey: input.targetKey,
+        materializationRevision: input.materializationRevision,
+        operation,
+        ownerId: input.ownerId,
+        claimToken: input.fencingToken,
+      });
+      break;
+    }
+  }
+  return Object.freeze({ kind: "operational" as const, work });
+}
+
+function identityOutcomeUnknown(identity: PendingLifecycleIdentity): ProjectStoreWorkerError {
+  switch (identity.kind) {
+    case "semantic":
+      return new ProjectStoreWorkerError("COMMAND_OUTCOME_UNKNOWN", Object.freeze({
+        commandId: identity.commandId,
+        idempotencyKey: identity.idempotencyKey,
+      }));
+    case "bounded":
+      return new ProjectStoreWorkerError("OPERATION_OUTCOME_UNKNOWN", Object.freeze({
+        operationId: identity.operationId,
+        requestId: identity.requestId,
+      }));
+    case "operational":
+      return new ProjectStoreWorkerError("OPERATION_OUTCOME_UNKNOWN", Object.freeze({
+        work: identity.work,
+      }));
+  }
+}
 
 interface PendingRequest {
-  request: WorkerRequest;
-  kind: RequestKind;
-  timer: object;
-  mutationIdentity?: { commandId: string; idempotencyKey: string };
+  readonly request: WorkerRequest;
+  readonly kind: RequestKind;
+  readonly identity: PendingLifecycleIdentity | null;
+  readonly timer: object;
+  posted: boolean;
   resolve(value: unknown): void;
   reject(error: ProjectStoreWorkerError): void;
 }
@@ -317,6 +522,9 @@ export class ProjectStoreExecutor {
         ?? (() => {
           throw new ProjectStoreWorkerError("MAINTENANCE_CONFIRMATION_REQUIRED");
         }),
+      ...(dependencies.authorityMaterialAdapter === undefined
+        ? {}
+        : { authorityMaterialAdapter: dependencies.authorityMaterialAdapter }),
     };
     this.#workerExit = new Promise<number>((resolveExit) => {
       this.#resolveWorkerExit = resolveExit;
@@ -354,7 +562,7 @@ export class ProjectStoreExecutor {
         id: "",
         type: "open",
         binding: encodeWorkerBinding(this.#options.context),
-      }, "lifecycle") as WorkerOpenResult;
+      }, "control") as WorkerOpenResult;
       const authorityError = openAuthorityError(this.#options.context, result);
       if (authorityError !== null) {
         await this.poison(authorityError);
@@ -376,10 +584,160 @@ export class ProjectStoreExecutor {
       type: "append",
       binding,
       command: encodeAppendCommandWire(command),
-    }, "mutation", {
-      commandId: command.commandId,
-      idempotencyKey: command.idempotencyKey,
-    }).then((value) => decodeAppendResultWire(value) as AppendResult<T>);
+    }, "mutation", semanticIdentity(
+      this.#options.context.binding.projectId,
+      command.commandId,
+      command.idempotencyKey,
+    )).then((value) => decodeAppendResultWire(value) as AppendResult<T>);
+  }
+
+  executeLifecycleMutation<C extends LifecycleSemanticCommandDraft>(
+    command: PreparedLifecycleWorkerCommand<C>,
+  ): Promise<LifecycleExecutionResult<LifecycleResultFor<C>>> {
+    this.assertCallable(["open"]);
+    const adapter = this.#dependencies.authorityMaterialAdapter;
+    if (adapter === undefined) throw new ProjectStoreWorkerError("LIFECYCLE_V2_DISABLED");
+    const wire = decodeLifecycleWorkerOperationWire({
+      kind: "semantic",
+      operation: command.command.commandType,
+      prepared: command,
+    });
+    if (wire.kind !== "semantic") throw new ProjectStoreWorkerError("WORKER_PROTOCOL_ERROR");
+    const identity = semanticIdentity(
+      this.#options.context.binding.projectId,
+      wire.prepared.command.commandId,
+      wire.prepared.command.idempotencyKey,
+    );
+    return this.executeExternalLifecycle<C>(
+      wire as LifecycleSemanticOperationWire<C>,
+      identity,
+      adapter,
+    );
+  }
+
+  executeLifecycleInternalMutation<I extends InternalWorkflowExecutionPlan>(
+    plan: I,
+  ): Promise<LifecycleInternalResultFor<I>> {
+    this.assertCallable(["open"]);
+    const wire = decodeLifecycleWorkerOperationWire({
+      kind: "internal-semantic",
+      operation: plan.commandType,
+      command: plan,
+    });
+    if (wire.kind !== "internal-semantic") {
+      throw new ProjectStoreWorkerError("WORKER_PROTOCOL_ERROR");
+    }
+    const identity = semanticIdentity(
+      this.#options.context.binding.projectId,
+      wire.command.commandId,
+      wire.command.idempotencyKey,
+    );
+    return this.requestLifecycleResult(wire, "mutation", identity) as Promise<
+      LifecycleInternalResultFor<I>
+    >;
+  }
+
+  executeLifecycleBounded<I extends LifecycleBoundedMutationInput>(
+    operation: ExactBoundedInput<I>,
+  ): Promise<LifecycleBoundedResultFor<LifecycleBoundedMutationForInput<I>>> {
+    this.assertCallable(["open"]);
+    const wire = decodeLifecycleWorkerOperationWire({
+      kind: "bounded",
+      operation: operation.operation,
+      input: operation,
+    });
+    if (wire.kind !== "bounded") throw new ProjectStoreWorkerError("WORKER_PROTOCOL_ERROR");
+    const identity = boundedIdentity(wire.input.operationId, wire.input.requestId);
+    return this.requestLifecycleResult(wire, "bounded", identity) as unknown as Promise<
+      LifecycleBoundedResultFor<LifecycleBoundedMutationForInput<I>>
+    >;
+  }
+
+  queryLifecycle<I extends LifecycleQueryInput>(
+    query: ExactQueryInput<I>,
+  ): Promise<LifecycleQueryResultFor<LifecycleQueryForInput<I>>> {
+    this.assertCallable(["open"]);
+    const wire = decodeLifecycleWorkerOperationWire({
+      kind: "query",
+      operation: query.operation,
+      input: query,
+    });
+    if (wire.kind !== "query") throw new ProjectStoreWorkerError("WORKER_PROTOCOL_ERROR");
+    return this.requestLifecycleResult(wire, "read", null) as unknown as Promise<
+      LifecycleQueryResultFor<LifecycleQueryForInput<I>>
+    >;
+  }
+
+  executeLifecycleFenced<I extends LifecycleFencedInput>(
+    operation: ExactFencedInput<I>,
+  ): Promise<LifecycleFencedResultFor<LifecycleFencedOperationForInput<I>>> {
+    this.assertCallable(["open"]);
+    const wire = decodeLifecycleWorkerOperationWire({
+      kind: "fenced",
+      operation: operation.operation,
+      input: operation,
+    });
+    if (wire.kind !== "fenced") throw new ProjectStoreWorkerError("WORKER_PROTOCOL_ERROR");
+    const identity = operationalIdentity(this.#options.context.binding.projectId, wire);
+    return this.requestLifecycleResult(wire, "operational", identity) as Promise<
+      LifecycleFencedResultFor<LifecycleFencedOperationForInput<I>>
+    >;
+  }
+
+  private requestLifecycleResult(
+    operation: LifecycleWorkerOperationWire,
+    kind: RequestKind,
+    identity: PendingLifecycleIdentity | null,
+  ): Promise<JsonValue> {
+    return this.request({
+      id: "",
+      type: "lifecycle",
+      binding: encodeWorkerBindingAssertion(this.#options.context),
+      operation,
+    }, kind, identity).then((value) => (value as LifecycleWorkerSuccessWire).result);
+  }
+
+  private async executeExternalLifecycle<C extends LifecycleSemanticCommandDraft>(
+    operation: LifecycleSemanticOperationWire<C>,
+    identity: SemanticPendingIdentity,
+    adapter: AuthorityMaterialAdapter,
+  ): Promise<LifecycleExecutionResult<LifecycleResultFor<C>>> {
+    const completionIdentity = pendingCommandIdentity(identity);
+    let result: WorkerLifecycleResult<LifecycleResultFor<C>>;
+    try {
+      result = await this.requestLifecycleResult(
+        operation,
+        "mutation",
+        identity,
+      ) as WorkerLifecycleResult<LifecycleResultFor<C>>;
+    } catch (error) {
+      if (
+        error instanceof ProjectStoreWorkerError
+        && DEFINITIVE_LIFECYCLE_ERROR_CODES.has(error.code)
+      ) {
+        return adapter.complete(completionIdentity, Object.freeze({
+          kind: "rejected" as const,
+          errorCode: error.code as Exclude<
+            LifecycleErrorCode,
+            "COMMAND_OUTCOME_UNKNOWN" | "OPERATION_OUTCOME_UNKNOWN"
+          >,
+        }));
+      }
+      throw error;
+    }
+    try {
+      return await adapter.complete(completionIdentity, result);
+    } catch (error) {
+      if (
+        error instanceof LifecycleError
+        && (error.code === "COMMAND_OUTCOME_UNKNOWN" || error.code === "OPERATION_OUTCOME_UNKNOWN")
+      ) {
+        const exactUnknown = identityOutcomeUnknown(identity);
+        await this.poison(exactUnknown);
+        throw exactUnknown;
+      }
+      throw error;
+    }
   }
 
   quickIntegrity(tailLimit = 256): Promise<IntegrityReport> {
@@ -492,7 +850,7 @@ export class ProjectStoreExecutor {
         type: "quiesce",
         binding: encodeWorkerBindingAssertion(this.#options.context),
         lease: encodedLease,
-      }, "lifecycle") as { quiesced: true; epoch: string; connectionClosed: true };
+      }, "control") as { quiesced: true; epoch: string; connectionClosed: true };
       if (response.epoch !== expectedLease.epoch.toString()) {
         requestError = new ProjectStoreWorkerError("WORKER_PROTOCOL_ERROR");
       }
@@ -616,13 +974,16 @@ export class ProjectStoreExecutor {
   private request(
     request: WorkerRequest,
     kind: RequestKind,
-    mutationIdentity?: { commandId: string; idempotencyKey: string },
+    identity: PendingLifecycleIdentity | null = null,
   ): Promise<unknown> {
     if (this.#pending.size >= this.#options.maxPending) {
       return Promise.reject(new ProjectStoreWorkerError("STORE_QUEUE_FULL"));
     }
     const id = `${this.#dependencies.randomId()}:${++this.#sequence}`;
-    const completeRequest = { ...request, id } as WorkerRequest;
+    const candidate = { ...request, id } as WorkerRequest;
+    const completeRequest = candidate.type === "lifecycle"
+      ? decodeWorkerRequest(candidate)
+      : candidate;
     return new Promise<unknown>((resolveRequest, rejectRequest) => {
       const timer = this.#dependencies.scheduler.setTimeout(() => {
         this.poisonInBackground(new ProjectStoreWorkerError("WORKER_TIMEOUT"));
@@ -630,14 +991,16 @@ export class ProjectStoreExecutor {
       const pending: PendingRequest = {
         request: completeRequest,
         kind,
+        identity,
         timer,
-        mutationIdentity,
+        posted: false,
         resolve: resolveRequest,
         reject: rejectRequest,
       };
       this.#pending.set(id, pending);
       try {
         this.#worker.postMessage(completeRequest);
+        pending.posted = true;
       } catch {
         this.#pending.delete(id);
         this.#dependencies.scheduler.clearTimeout(timer);
@@ -679,17 +1042,20 @@ export class ProjectStoreExecutor {
         response.error.code,
         safeDetails(response.error.details),
       );
-      const exactUnknown = reported.code === "COMMAND_OUTCOME_UNKNOWN"
+      const uncertain = reported.code === "COMMAND_OUTCOME_UNKNOWN"
+        || reported.code === "OPERATION_OUTCOME_UNKNOWN"
+        || reported.code === "WORKER_PROTOCOL_ERROR";
+      const exactUnknown = uncertain
         ? this.unknownOutcome(pending)
         : null;
-      const error = reported.code === "COMMAND_OUTCOME_UNKNOWN"
+      const error = uncertain
         ? exactUnknown ?? new ProjectStoreWorkerError("WORKER_PROTOCOL_ERROR")
         : reported;
       pending.reject(error);
       if (
         pending.request.type === "open"
         || ASSERTION_FAILURES.has(error.code)
-        || reported.code === "COMMAND_OUTCOME_UNKNOWN"
+        || uncertain
       ) {
         this.poisonInBackground(error);
       }
@@ -790,11 +1156,8 @@ export class ProjectStoreExecutor {
   }
 
   private unknownOutcome(pending: PendingRequest): ProjectStoreWorkerError | null {
-    if (pending.kind !== "mutation" || pending.mutationIdentity === undefined) return null;
-    return new ProjectStoreWorkerError("COMMAND_OUTCOME_UNKNOWN", {
-      commandId: pending.mutationIdentity.commandId,
-      idempotencyKey: pending.mutationIdentity.idempotencyKey,
-    });
+    if (!pending.posted || pending.identity === null) return null;
+    return identityOutcomeUnknown(pending.identity);
   }
 
   private rejectAll(readError: ProjectStoreWorkerError): void {
@@ -850,7 +1213,7 @@ export class ProjectStoreExecutor {
     const graceful = (async () => {
       await this.waitForDrain();
       if (this.#state === "poisoned" || this.#state === "quiesced") return;
-      await this.request({ id: "", type: "close" }, "lifecycle");
+      await this.request({ id: "", type: "close" }, "control");
       await this.terminateWorker();
       this.#state = "closed";
     })();

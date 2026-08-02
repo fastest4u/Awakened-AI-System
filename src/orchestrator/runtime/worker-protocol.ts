@@ -28,10 +28,18 @@ import type {
   ProjectStoreUpgradePlan,
   ProjectStoreUpgradeResult,
 } from "../storage/project-store-upgrade.service.js";
+import {
+  assertLifecycleWireCanonicalSize,
+  decodeLifecycleWorkerOperationWire,
+  decodeLifecycleWorkerSuccessForOperation,
+  type LifecycleWorkerOperationWire,
+  type LifecycleWorkerSuccessWire,
+} from "./lifecycle-worker-protocol.js";
 
 const SQLITE_INT64_MAX = 9_223_372_036_854_775_807n;
 const UNSIGNED_DECIMAL = /^(0|[1-9]\d*)$/;
 const HASH = /^[0-9a-f]{64}$/;
+const LIFECYCLE_BINDING_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const SOURCES = new Set<ProjectBindingSource>([
   "stdio-explicit-root",
   "mcp-roots",
@@ -285,6 +293,7 @@ export type WorkerRequest =
   | { id: string; type: "inspectExisting"; route: ProjectStoreRouteWire; expected: StoreIdentityExpectationWire }
   | { id: string; type: "open"; binding: WorkerBinding }
   | { id: string; type: "append"; binding: WorkerBindingAssertion; command: AppendCommandWire }
+  | { id: string; type: "lifecycle"; binding: WorkerBindingAssertion; operation: LifecycleWorkerOperationWire }
   | { id: string; type: "quickIntegrity"; binding: WorkerBindingAssertion; tailLimit: number }
   | { id: string; type: "fullIntegrity"; binding: WorkerBindingAssertion }
   | { id: string; type: "quiesce"; binding: WorkerBindingAssertion; lease: MaintenanceLeaseWire }
@@ -295,6 +304,7 @@ export type WorkerSuccessData =
   | WorkerOpenResult
   | StoreIdentityWire
   | AppendResultWire
+  | LifecycleWorkerSuccessWire
   | IntegrityReport
   | { verified: true }
   | { quiesced: true; epoch: string; connectionClosed: true }
@@ -710,6 +720,22 @@ export function decodeWorkerRequest(value: unknown): WorkerRequest {
     case "append":
       exact(value, ["id", "type", "binding", "command"]);
       return { id, type, binding: decodeAssertion(request.binding), command: decodeAppendCommandWireShape(request.command) };
+    case "lifecycle":
+      exact(value, ["id", "type", "binding", "operation"]);
+      const binding = decodeAssertion(request.binding);
+      if (
+        !LIFECYCLE_BINDING_UUID.test(binding.projectId)
+        || !LIFECYCLE_BINDING_UUID.test(binding.vaultId)
+        || !LIFECYCLE_BINDING_UUID.test(binding.storeId)
+      ) invalid();
+      const lifecycleRequest = Object.freeze({
+        id,
+        type,
+        binding: Object.freeze(binding),
+        operation: decodeLifecycleWorkerOperationWire(request.operation),
+      });
+      assertLifecycleWireCanonicalSize(lifecycleRequest);
+      return lifecycleRequest;
     case "quickIntegrity":
       exact(value, ["id", "type", "binding", "tailLimit"]);
       return { id, type, binding: decodeAssertion(request.binding), tailLimit: positiveInteger(request.tailLimit) };
@@ -896,7 +922,11 @@ function decodeOpen(value: unknown): WorkerOpenResult {
   }), executorId: string(result.executorId) };
 }
 
-function decodeSuccessForType(type: WorkerRequest["type"], value: unknown): WorkerSuccessData {
+function decodeSuccessForType(
+  type: WorkerRequest["type"],
+  value: unknown,
+  request?: WorkerRequest,
+): WorkerSuccessData {
   switch (type) {
     case "ping": return decodePing(value);
     case "verifyIdentity": {
@@ -907,6 +937,14 @@ function decodeSuccessForType(type: WorkerRequest["type"], value: unknown): Work
     case "inspectExisting": return decodeIdentity(value);
     case "open": return decodeOpen(value);
     case "append": return encodeAppendResultWire(decodeAppendResultWire(value));
+    case "lifecycle": {
+      if (request?.type !== "lifecycle") invalid();
+      return decodeLifecycleWorkerSuccessForOperation(
+        value,
+        request.operation,
+        request.binding.projectId as ProjectId,
+      );
+    }
     case "quickIntegrity":
     case "fullIntegrity": return decodeIntegrityReport(value);
     case "quiesce": {
@@ -946,6 +984,22 @@ function decodeUnknownSuccess(value: unknown): WorkerSuccessData {
       if (result.closed !== true) invalid();
       return { closed: true };
     },
+    (input) => {
+      const result = exact(input, ["operation", "nestedContractVersion", "result"]);
+      const nestedContractVersion = result.nestedContractVersion;
+      if (
+        nestedContractVersion !== null
+        && nestedContractVersion !== 1
+        && nestedContractVersion !== 2
+      ) invalid();
+      const lifecycle = {
+        operation: string(result.operation),
+        nestedContractVersion,
+        result: json(result.result),
+      } as LifecycleWorkerSuccessWire;
+      assertLifecycleWireCanonicalSize(lifecycle);
+      return lifecycle;
+    },
   ];
   for (const decode of decoders) {
     try { return decode(value); } catch (error) {
@@ -975,7 +1029,7 @@ export function decodeWorkerResponseForRequest(
   return {
     id: string(response.id),
     ok: true,
-    data: decodeSuccessForType(request.type, response.data),
+    data: decodeSuccessForType(request.type, response.data, request),
   };
 }
 

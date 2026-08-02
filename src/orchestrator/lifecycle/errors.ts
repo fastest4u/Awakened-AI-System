@@ -50,6 +50,7 @@ export const LIFECYCLE_ERROR_CODES = Object.freeze([
   "CHILD_DISPOSITION_INVALID",
   "LIFECYCLE_INPUT_INVALID",
   "LIFECYCLE_V2_DISABLED",
+  "LIFECYCLE_OPERATION_UNAVAILABLE",
   "STORE_ID_MISMATCH",
   "WORKER_PROTOCOL_ERROR",
 ] as const);
@@ -202,6 +203,11 @@ const FAILURE_DEFINITIONS: Readonly<Record<LifecycleErrorCode, LifecycleFailureD
   CHILD_DISPOSITION_INVALID: failure("The child report disposition is invalid", false, "correct-lifecycle-input"),
   LIFECYCLE_INPUT_INVALID: failure("Lifecycle input is invalid", false, "correct-lifecycle-input"),
   LIFECYCLE_V2_DISABLED: failure("Lifecycle Version 2 is disabled", false, "enable-lifecycle-v2"),
+  LIFECYCLE_OPERATION_UNAVAILABLE: failure(
+    "The lifecycle operation is not available in this runtime",
+    false,
+    "upgrade-runtime",
+  ),
   STORE_ID_MISMATCH: failure("Store identity does not match the manifest", false, "attach-intended-store"),
   WORKER_PROTOCOL_ERROR: failure("The lifecycle worker protocol rejected the message", false, "restart-trusted-worker"),
 });

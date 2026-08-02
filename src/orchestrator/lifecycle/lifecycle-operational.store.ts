@@ -12,6 +12,22 @@ const OUTBOX_OPERATIONS = new Set<OutboxOperationalWorkIdentity["operation"]>([
   "claim", "renew", "materialize", "record-failure",
 ]);
 
+export interface WorkflowSelectionOperationalWorkIdentity {
+  readonly kind: "workflow-selection";
+  readonly projectId: string;
+  readonly workId: string;
+  readonly operation: "claim-next";
+  readonly ownerId: string;
+}
+
+export interface OutboxSelectionOperationalWorkIdentity {
+  readonly kind: "outbox-selection";
+  readonly projectId: string;
+  readonly workId: string;
+  readonly operation: "claim-next";
+  readonly ownerId: string;
+}
+
 export interface WorkflowOperationalWorkIdentity {
   readonly kind: "workflow";
   readonly projectId: string;
@@ -33,6 +49,8 @@ export interface OutboxOperationalWorkIdentity {
 }
 
 export type LifecycleOperationalWorkIdentity =
+  | WorkflowSelectionOperationalWorkIdentity
+  | OutboxSelectionOperationalWorkIdentity
   | WorkflowOperationalWorkIdentity
   | OutboxOperationalWorkIdentity;
 
@@ -60,7 +78,9 @@ export type LifecycleOperationalTransactionFor<
   TWork extends LifecycleOperationalWorkIdentity,
 > = TWork extends WorkflowOperationalWorkIdentity
   ? WorkflowOperationalTransaction
-  : OutboxOperationalTransaction;
+  : TWork extends WorkflowSelectionOperationalWorkIdentity
+    ? WorkflowOperationalTransaction
+    : OutboxOperationalTransaction;
 
 export interface LifecycleOperationalResult<
   T,
@@ -131,6 +151,20 @@ function decodeWork(value: unknown): LifecycleOperationalWorkIdentity {
   if (typeof value !== "object" || value === null || Array.isArray(value)) invalidWork();
   const kindDescriptor = Reflect.getOwnPropertyDescriptor(value, "kind");
   if (kindDescriptor === undefined || !("value" in kindDescriptor)) invalidWork();
+  if (kindDescriptor.value === "workflow-selection" || kindDescriptor.value === "outbox-selection") {
+    const work = strictDataRecord(value, [
+      "kind", "projectId", "workId", "operation", "ownerId",
+    ]);
+    if (work.operation !== "claim-next") invalidWork();
+    const snapshot = Object.freeze({
+      kind: kindDescriptor.value,
+      projectId: canonicalUuid(work.projectId),
+      workId: nonEmptyString(work.workId),
+      operation: "claim-next" as const,
+      ownerId: nonEmptyString(work.ownerId),
+    });
+    return snapshot as WorkflowSelectionOperationalWorkIdentity | OutboxSelectionOperationalWorkIdentity;
+  }
   if (kindDescriptor.value === "workflow") {
     const work = strictDataRecord(value, [
       "kind", "projectId", "workflowId", "workflowGeneration", "operation", "ownerId", "claimToken",
@@ -363,7 +397,7 @@ export class LifecycleOperationalStore {
       this.#connection.exec("BEGIN IMMEDIATE");
       transactionBegan = true;
       const repositories = this.#transaction(this.#connection);
-      const focused = workSnapshot.kind === "workflow"
+      const focused = workSnapshot.kind === "workflow" || workSnapshot.kind === "workflow-selection"
         ? { workflows: repositories.workflows }
         : { outbox: repositories.outbox };
       const result = invokeSynchronousTransactionCallback(

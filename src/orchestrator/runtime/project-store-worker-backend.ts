@@ -17,6 +17,7 @@ import type {
   IntegrityReport,
 } from "../integrity/integrity.types.js";
 import type { CapabilityKeyProvider } from "../lifecycle/authority/capability-key-provider.js";
+import { LifecycleError } from "../lifecycle/errors.js";
 import { BranchScopeRepository } from "../storage/branch-scope.repository.js";
 import {
   EventStore,
@@ -43,6 +44,8 @@ import type {
   WorkerHeartbeatObservation,
   WorkerRuntimeBackend,
 } from "./project-store-worker-runtime.js";
+import type { LifecycleWorkerRuntimeFactoryPort } from "./lifecycle-worker-runtime.factory.js";
+import type { LifecycleWorkerRuntime } from "./lifecycle-worker-runtime.js";
 import {
   decodeAppendCommandWire,
   decodeIntegrityProviderRequestWire,
@@ -82,6 +85,7 @@ export interface ProjectStoreWorkerBackendOptions {
   executorLeaseMs: number;
   appendRetryDeadlineMs: number;
   readonly keyProvider?: CapabilityKeyProvider;
+  readonly lifecycleRuntimeFactory?: LifecycleWorkerRuntimeFactoryPort;
   afterReadOnlyIdentityVerified?: () => void;
   integrityWorkerFactory?: (
     url: URL,
@@ -333,6 +337,7 @@ interface ActiveStore {
   connection: SqliteConnection;
   maintenance: MaintenanceFence;
   eventStore: EventStore;
+  lifecycleRuntime: LifecycleWorkerRuntime | null;
   executorId: string;
 }
 
@@ -371,6 +376,10 @@ export class ProjectStoreWorkerBackend implements WorkerRuntimeBackend {
         const active = this.requireActive(request.binding);
         return this.append(active, request.command);
       }
+      case "lifecycle":
+        const active = this.requireActive(request.binding);
+        if (active.lifecycleRuntime === null) failure("LIFECYCLE_V2_DISABLED");
+        return this.lifecycle(active, request);
       case "quickIntegrity": {
         const active = this.requireActive(request.binding);
         return this.integrityInChild(active, request);
@@ -456,8 +465,11 @@ export class ProjectStoreWorkerBackend implements WorkerRuntimeBackend {
   async close(): Promise<void> {
     const active = this.#active;
     if (active === null) {
-      await this.terminateChildren();
-      this.#closed = true;
+      try {
+        await this.terminateChildren();
+      } finally {
+        this.#closed = true;
+      }
       return;
     }
     await this.closeHandles(active);
@@ -506,6 +518,8 @@ export class ProjectStoreWorkerBackend implements WorkerRuntimeBackend {
     const maintenance = this.#options.maintenanceFactory?.() ?? new MaintenanceFence();
     const executorId = randomUUID();
     const now = new Date().toISOString();
+    let lifecycleRuntime: LifecycleWorkerRuntime | null = null;
+    let registrationBegan = false;
     try {
       identityFromConnection(
         connection,
@@ -519,7 +533,18 @@ export class ProjectStoreWorkerBackend implements WorkerRuntimeBackend {
           maintenance,
           new BranchScopeRepository(),
         );
+      if (
+        this.#options.lifecycleRuntimeFactory !== undefined
+        && this.#options.keyProvider !== undefined
+      ) {
+        lifecycleRuntime = this.#options.lifecycleRuntimeFactory.create({
+          connection,
+          maintenanceFence: maintenance,
+          keyProvider: this.#options.keyProvider,
+        });
+      }
       connection.exec("BEGIN IMMEDIATE");
+      registrationBegan = true;
       maintenance.registerExecutor(
         connection,
         context.binding.projectId,
@@ -530,16 +555,23 @@ export class ProjectStoreWorkerBackend implements WorkerRuntimeBackend {
         now,
       );
       connection.exec("COMMIT");
+      registrationBegan = false;
       this.#active = {
         context,
         connection,
         maintenance,
         eventStore,
+        lifecycleRuntime,
         executorId,
       };
     } catch (error) {
-      try { connection.exec("ROLLBACK"); } catch { /* transaction may not have begun */ }
-      connection.close();
+      if (registrationBegan) {
+        try { connection.exec("ROLLBACK"); } catch { /* preserve the first open failure */ }
+      }
+      if (lifecycleRuntime !== null) {
+        try { lifecycleRuntime.dispose(); } catch { /* preserve the first open failure */ }
+      }
+      try { connection.close(); } catch { /* preserve the first open failure */ }
       throw error;
     }
     return {
@@ -576,13 +608,37 @@ export class ProjectStoreWorkerBackend implements WorkerRuntimeBackend {
     } catch (error) {
       if (error instanceof EventStoreError && error.code === "COMMAND_OUTCOME_UNKNOWN") {
         try {
-          active.connection.close();
+          await this.closeHandles(active);
         } catch {
           // The parent poisons and terminates this worker from the exact unknown-outcome response.
-        } finally {
-          this.#active = null;
-          this.#closed = true;
         }
+      }
+      throw error;
+    }
+  }
+
+  private async lifecycle(
+    active: ActiveStore,
+    request: Extract<WorkerRequest, { type: "lifecycle" }>,
+  ): Promise<WorkerSuccessData> {
+    try {
+      const result = await active.lifecycleRuntime!.execute(request.operation, active.context);
+      const semanticUnknown = request.operation.kind === "semantic"
+        && typeof result.result === "object"
+        && result.result !== null
+        && !Array.isArray(result.result)
+        && result.result.kind === "unknown"
+        && result.result.errorCode === "COMMAND_OUTCOME_UNKNOWN";
+      if (semanticUnknown) {
+        try { await this.closeHandles(active); } catch { /* preserve the exact unknown result */ }
+      }
+      return result;
+    } catch (error) {
+      if (
+        error instanceof LifecycleError
+        && (error.code === "COMMAND_OUTCOME_UNKNOWN" || error.code === "OPERATION_OUTCOME_UNKNOWN")
+      ) {
+        try { await this.closeHandles(active); } catch { /* preserve the exact unknown error */ }
       }
       throw error;
     }
@@ -841,9 +897,22 @@ export class ProjectStoreWorkerBackend implements WorkerRuntimeBackend {
   }
 
   private async closeHandles(active: ActiveStore): Promise<void> {
-    await this.terminateChildren();
     let primaryError: unknown;
     let failed = false;
+    try {
+      await this.terminateChildren();
+    } catch (error) {
+      primaryError = error;
+      failed = true;
+    }
+    try {
+      active.lifecycleRuntime?.dispose();
+    } catch (error) {
+      if (!failed) {
+        primaryError = error;
+        failed = true;
+      }
+    }
     try {
       active.connection.close();
     } catch (error) {

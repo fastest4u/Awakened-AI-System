@@ -760,7 +760,27 @@ interface OutboxFencedIdentity extends LifecycleFencedOperationBase {
   readonly materializationRevision: string;
 }
 
+export interface WorkflowClaimNextOperation {
+  readonly operation: "workflow-claim-next";
+  readonly context: ProjectContext;
+  readonly workId: string;
+  readonly ownerId: string;
+  readonly observedNowMs: string;
+  readonly ttlMs: string;
+}
+
+export interface OutboxClaimNextOperation {
+  readonly operation: "outbox-claim-next";
+  readonly context: ProjectContext;
+  readonly workId: string;
+  readonly ownerId: string;
+  readonly observedNowMs: string;
+  readonly ttlMs: string;
+}
+
 export type LifecycleFencedOperation =
+  | WorkflowClaimNextOperation
+  | OutboxClaimNextOperation
   | (WorkflowFencedIdentity & { readonly operation: "workflow-claim"; readonly leaseUntil: string })
   | (WorkflowFencedIdentity & { readonly operation: "workflow-renew"; readonly leaseUntil: string })
   | (WorkflowFencedIdentity & { readonly operation: "workflow-release" })
@@ -776,18 +796,7 @@ export type LifecycleFencedOperation =
     })
   | (OutboxFencedIdentity & { readonly operation: "outbox-claim"; readonly leaseUntil: string })
   | (OutboxFencedIdentity & { readonly operation: "outbox-renew"; readonly leaseUntil: string })
-  | (OutboxFencedIdentity & {
-      readonly operation: "outbox-materialize";
-      readonly expectedCurrentFingerprint: string | null;
-      readonly nextFingerprint: string;
-      readonly materializedBytes: Uint8Array;
-      readonly acknowledgement: {
-        readonly ownerId: string;
-        readonly fencingToken: string;
-        readonly materializationRevision: string;
-        readonly nextFingerprint: string;
-      };
-    })
+  | (OutboxFencedIdentity & { readonly operation: "outbox-materialize" })
   | (OutboxFencedIdentity & {
       readonly operation: "outbox-failure";
       readonly retryable: boolean;
