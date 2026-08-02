@@ -690,6 +690,65 @@ function createSchema2Fixture(): Fixture {
   };
 }
 
+function seedSchema2OpenWorkflow(fixture: Fixture): string {
+  const workflowId = uuid(89_090);
+  const commandId = uuid(30_002);
+  rawEvent(fixture.connection, {
+    globalPosition: 2n,
+    streamId: `session/${ROOT_ID}`,
+    streamVersion: 2n,
+    eventType: "SessionEndRequested",
+    eventSchemaVersion: 2,
+    sessionId: ROOT_ID,
+    payload: {
+      workflowId,
+      workflowGeneration: 1,
+      previousState: "active",
+      childEndPolicy: "require-completed",
+      qualityThreshold: 0,
+      requireFullEvidence: false,
+      requireMaterialization: false,
+      requestVersion: 2,
+    },
+    lifecycleIntent: requestWitness(2, commandId),
+    idempotencyKey: "quick-integrity/end-request/2",
+  });
+  fixture.connection.prepare(`
+    UPDATE streams SET current_version = 2, updated_at = $now
+    WHERE project_id = $projectId AND stream_id = $streamId
+  `).run({
+    $now: NOW,
+    $projectId: PROJECT_ID,
+    $streamId: `session/${ROOT_ID}`,
+  });
+  rawInsert(fixture.connection, "workflow_instances", {
+    project_id: PROJECT_ID,
+    workflow_id: workflowId,
+    workflow_type: "session-end",
+    generation: 1,
+    state: "active",
+    phase: "requested",
+    root_command_id: commandId,
+    result_json: null,
+    error_code: null,
+    created_at: NOW,
+    updated_at: NOW,
+    session_id: ROOT_ID,
+    triggering_event_position: 2,
+    expected_authority_commitment: rootAuthority().authority_commitment,
+    coordinator_owner_id: null,
+    coordinator_claim_token: null,
+    coordinator_claim_expires_at: null,
+    coordinator_attempt_count: 0,
+    coordinator_failure_class: null,
+    coordinator_error_code: null,
+    coordinator_next_attempt_at: null,
+    validation_attempt_plan_generation: null,
+    validation_attempt_plans_json: null,
+  });
+  return workflowId;
+}
+
 function evidencePayload(
   adapterSessionId: string,
   batchId: string,
@@ -929,7 +988,10 @@ function observedConnection(connection: SqliteConnection): {
         lifecycleHistoryScans += 1;
       }
     }
-    if (/FROM\s+lifecycle_workflow_generation_folds/i.test(sql)) {
+    if (
+      /FROM\s+lifecycle_workflow_generation_folds/i.test(sql)
+      || /legacy-workflow-projection/i.test(sql)
+    ) {
       workflowProjectionReads += 1;
       if (/ORDER\s+BY|OFFSET|WITH\s+RECURSIVE/i.test(sql)) {
         lifecycleHistoryScans += 1;
@@ -2220,21 +2282,9 @@ it("bounded quick integrity does not read historical report witnesses for clean 
 
 it("schema 2 quick integrity retains the legacy historical workflow mode", async () => {
   const fixture = createSchema2Fixture();
+  seedSchema2OpenWorkflow(fixture);
   const reads = observedConnection(fixture.connection);
   const service = new LifecycleIntegrityService(reads.connection);
-  const probe = service as unknown as {
-    checkWorkflowShape(
-      context: ProjectContext,
-      sink: { add(code: IntegrityIssueCode): void },
-      qualifiedEndpointOnly?: boolean,
-    ): void;
-  };
-  const original = probe.checkWorkflowShape.bind(service);
-  const modes: boolean[] = [];
-  probe.checkWorkflowShape = (context, sink, qualifiedEndpointOnly = false): void => {
-    modes.push(qualifiedEndpointOnly);
-    original(context, sink, qualifiedEndpointOnly);
-  };
   const issues: IntegrityIssueCode[] = [];
 
   await service.quickCheckAsync(fixture.context, {
@@ -2242,6 +2292,26 @@ it("schema 2 quick integrity retains the legacy historical workflow mode", async
   });
 
   assert.deepEqual(issues, []);
-  assert.deepEqual(modes, [false]);
+  assert.ok(reads.workflowProjectionReads() > 0);
+  assert.ok(reads.lifecycleHistoryScans() > 0);
   assert.equal(reads.writes(), 0);
+
+  const corrupted = createSchema2Fixture();
+  seedSchema2OpenWorkflow(corrupted);
+  corrupted.connection.exec("DROP TRIGGER events_no_update");
+  corrupted.connection.prepare(`
+    UPDATE events
+    SET lifecycle_intent_json = $intent
+    WHERE global_position = 2
+  `).run({ $intent: requestWitness(2, uuid(30_003)) });
+  const corruptedReads = observedConnection(corrupted.connection);
+  const corruptedIssues: IntegrityIssueCode[] = [];
+  await new LifecycleIntegrityService(corruptedReads.connection)
+    .quickCheckAsync(corrupted.context, {
+      add(code) { corruptedIssues.push(code); },
+    });
+  assert.deepEqual(corruptedIssues, ["LIFECYCLE_WORKFLOW_INVARIANT_MISMATCH"]);
+  assert.ok(corruptedReads.workflowProjectionReads() > 0);
+  assert.ok(corruptedReads.lifecycleHistoryScans() > 0);
+  assert.equal(corruptedReads.writes(), 0);
 });

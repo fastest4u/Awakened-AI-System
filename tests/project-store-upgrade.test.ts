@@ -31,6 +31,7 @@ import type {
 import { ProjectDescriptorRepository } from "../src/orchestrator/identity/project-descriptor.repository.js";
 import { computeProjectContextFingerprint } from "../src/orchestrator/identity/project-binding.service.js";
 import { ProjectStoreRouter } from "../src/orchestrator/identity/project-store.router.js";
+import { commandHash, payloadHash } from "../src/orchestrator/crypto/event-hash.js";
 import {
   StoreManifestRepository,
   type PreparedStoreIntegrityManifest,
@@ -349,7 +350,7 @@ function rootStartIntent(values: {
   targetSessionId: string;
   workspaceId: string;
   continuityKey: string;
-}): { source: string; intentHash: string } {
+}): ReturnType<typeof buildLifecycleIntentWitness> {
   return buildLifecycleIntentWitness({
     commandType: "root-start",
     commandId: values.commandId,
@@ -548,9 +549,9 @@ function seedFoldableRootAuthority(
       1, 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', $projectId, $vaultId,
       $storeId, $workspaceId, NULL, NULL, $streamId, 'session', 1,
       'SessionStarted', 1, $sessionId, NULL, 'primary', 'fold-agent',
-      'fold-client', $correlationId, NULL,
+      'presenting-client', $correlationId, NULL,
       $commandId, 'upgrade-test/root-start', 0, $now, $now, 'session', 'high',
-      'verified', '[]', '[]', '[]', $payloadJson, $hash, $genesis, $hash,
+      'verified', '[]', '[]', '[]', $payloadJson, $payloadHash, $genesis, $hash,
       $lifecycleIntentJson
     )
   `).run({
@@ -564,6 +565,7 @@ function seedFoldableRootAuthority(
     $correlationId: FOLD_CORRELATION_ID,
     $now: NOW,
     $payloadJson: canonicalJson(payload),
+    $payloadHash: payloadHash(payload),
     $lifecycleIntentJson: intent.source,
     $hash: "b".repeat(64),
     $genesis: "0".repeat(64),
@@ -575,7 +577,7 @@ function seedFoldableRootAuthority(
     kind: "initial-authority",
     witnessAlreadyPresent: true,
     witnessJson: intent.source,
-    commandHash: intent.intentHash,
+    commandHash: commandHash(intent.witness.intent.command),
   });
   connection.prepare(`
     INSERT INTO session_authority(
@@ -673,7 +675,7 @@ function appendLifecycleEvent(
     $idempotencyKey: event.idempotencyKey,
     $occurredAt: event.occurredAt,
     $payloadJson: canonicalJson(event.payload),
-    $payloadHash: sha256Canonical(event.payload),
+    $payloadHash: payloadHash(event.payload),
     $previousGlobalHash: "0".repeat(64),
     $eventHash: event.globalPosition.padStart(64, "0"),
   });
@@ -1973,21 +1975,21 @@ describe("explicit project-store upgrade", () => {
       WHERE project_id = $projectId
     `).run({ $projectId: PROJECT_ID });
 
-    const report = await runIntegrityChild(foldContext, {
-      id: "ordinary-current-lifecycle-integrity",
-      type: "fullIntegrity",
-      binding: {
-        projectId: foldContext.binding.projectId,
-        vaultId: foldContext.binding.vaultId,
-        storeId: foldContext.binding.storeId,
-        bindingGeneration: foldContext.binding.generation,
-        contextFingerprint: foldContext.binding.contextFingerprint,
-      },
-    });
-
-    assert.equal(
-      report.issues.some(({ code }) => code === "SESSION_AUTHORITY_FOLD_MISMATCH"),
-      true,
+    await assert.rejects(
+      runIntegrityChild(foldContext, {
+        id: "ordinary-current-lifecycle-integrity",
+        type: "fullIntegrity",
+        binding: {
+          projectId: foldContext.binding.projectId,
+          vaultId: foldContext.binding.vaultId,
+          storeId: foldContext.binding.storeId,
+          bindingGeneration: foldContext.binding.generation,
+          contextFingerprint: foldContext.binding.contextFingerprint,
+        },
+      }),
+      (error: unknown) => error instanceof Error
+        && "code" in error
+        && (error as Error & { code: unknown }).code === "INTEGRITY_FAILURE",
     );
   });
 

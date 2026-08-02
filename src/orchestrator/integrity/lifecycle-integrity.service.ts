@@ -11,9 +11,10 @@ import {
 } from "../lifecycle/contracts/events.js";
 import {
   advanceEvidenceCoverageIntervals,
-  assertEvidenceCoverageProjectionBounds,
 } from "../lifecycle/evidence-coverage-accumulator.js";
 import {
+  CHECKPOINT_EVIDENCE_COVERAGE_MAX_CANONICAL_BYTES,
+  CHECKPOINT_MAX_MISSING_INTERVALS,
   CHECKPOINT_MAX_CANONICAL_BYTES,
   type Checkpoint,
   type CheckpointEvidenceCoverageV2,
@@ -155,6 +156,14 @@ interface DetachedReplayCursor<T> {
   close(): void;
 }
 
+export interface LifecycleFullReplayWorkCounters {
+  evidenceTransitionAdapterLookups: number;
+  evidenceEntryCanonicalizations: number;
+  checkpointEvidenceCaptures: number;
+  checkpointEvidenceEntryMaterializations: number;
+  endingBindingEvidenceRevisionLookups: number;
+}
+
 interface QualifiedTransitionReplayRow {
   readonly projectId: string;
   readonly sessionId: string;
@@ -216,6 +225,16 @@ interface EvidenceReplayState {
   }[];
   readonly coverageFingerprint: string;
   readonly checkpointEntry: CheckpointEvidenceCoverageV2["adapterSessions"][number];
+  readonly canonicalEntryBytes: number;
+}
+
+interface EvidenceReplaySessionState {
+  readonly adapters: Map<string, EvidenceReplayState>;
+  adapterCount: number;
+  totalIntervalCount: number;
+  canonicalEntryBytesTotal: number;
+  canonicalCoverageBytes: number;
+  revisionEventPosition: bigint | null;
 }
 
 interface IndexedReplayIntent {
@@ -228,6 +247,15 @@ interface HistoricalCheckpointCapture {
   readonly aggregate: SessionAggregateState;
   readonly childSummaries: Checkpoint["childSummaries"];
   readonly evidenceCoverage: CheckpointEvidenceCoverageV2;
+  readonly evidenceRevisionEventPosition: bigint | null;
+  readonly evidenceAdapterCount: number;
+}
+
+interface CheckpointEvidenceRevision {
+  readonly sessionId: string;
+  readonly checkpointVersion: 1 | 2;
+  readonly revisionEventPosition: bigint | null;
+  readonly adapterCount: number;
 }
 
 interface HistoricalCheckpointRequest {
@@ -545,6 +573,10 @@ const EMPTY_QUALIFIED_COVERAGE: CheckpointEvidenceCoverageV2 = Object.freeze({
   contentRetained: false,
   adapterSessions: Object.freeze([]),
 });
+const EMPTY_QUALIFIED_COVERAGE_CANONICAL_BYTES = Buffer.byteLength(
+  canonicalJson(EMPTY_QUALIFIED_COVERAGE),
+  "utf8",
+);
 
 function binaryCompare(left: string, right: string): number {
   return Buffer.compare(Buffer.from(left, "utf8"), Buffer.from(right, "utf8"));
@@ -643,7 +675,17 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
   constructor(
     private readonly connection: SqliteConnection,
     private readonly provider?: HistoricalEvidenceIntegrityProviderPort,
+    private readonly replayWorkCounters?: LifecycleFullReplayWorkCounters,
   ) {}
+
+  private incrementReplayWork(
+    counter: keyof LifecycleFullReplayWorkCounters,
+    amount = 1,
+  ): void {
+    if (this.replayWorkCounters !== undefined) {
+      this.replayWorkCounters[counter] += amount;
+    }
+  }
 
   quickCheck(context: ProjectContext, sink: IntegrityIssueSink): void {
     if (!this.hasLifecycleSchema()) return;
@@ -965,9 +1007,10 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
     const workflowHeads = new Map<string, WorkflowGenerationFoldProjection>();
     const pendingWorkflows = new Map<string, WorkflowGenerationFoldProjection>();
     const immutableOrdinals = new Map<string, ImmutableOrdinalIdentity>();
-    const evidenceStates = new Map<string, Map<string, EvidenceReplayState>>();
+    const evidenceStates = new Map<string, EvidenceReplaySessionState>();
     const historicalSnapshots = new Map<string, HistoricalCheckpointCapture>();
     const reconstructedCheckpoints = new Map<string, Checkpoint>();
+    const checkpointEvidenceRevisions = new Map<string, CheckpointEvidenceRevision>();
     const capturedChildren = new Map<string, ChildEventFoldProjection>();
     const liveChildrenByRoot = new Map<string, Set<string>>();
     const activeTicketsByRoot = new Map<string, Set<string>>();
@@ -1075,12 +1118,26 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
           throw new LifecycleError("INTEGRITY_FAILURE");
         }
         reconstructedCheckpoints.set(reconstructed.checkpointId, reconstructed);
+        const capture = historicalSnapshots.get(this.historicalSnapshotKey(
+          reconstructed.sessionId,
+          BigInt(reconstructed.baseEventPosition),
+        ));
+        if (capture === undefined || checkpointEvidenceRevisions.has(reconstructed.checkpointId)) {
+          throw new LifecycleError("INTEGRITY_FAILURE");
+        }
+        checkpointEvidenceRevisions.set(reconstructed.checkpointId, deeplyFreeze({
+          sessionId: reconstructed.sessionId,
+          checkpointVersion: reconstructed.checkpointVersion,
+          revisionEventPosition: capture.evidenceRevisionEventPosition,
+          adapterCount: capture.evidenceAdapterCount,
+        }));
         this.applyFinalCheckpointWorkflowState(
           event,
           decoded,
           intents.get(event.commandId),
           reconstructed,
           reconstructedCheckpoints,
+          checkpointEvidenceRevisions,
           preIndexes,
           evidenceStates,
           workflowStates,
@@ -1117,7 +1174,6 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
         }
         if (
           expected.childState === "completed"
-          || expected.childState === "suspended"
           || expected.childState === "transferred"
         ) liveChildren.delete(expected.childSessionId);
         else liveChildren.add(expected.childSessionId);
@@ -1491,7 +1547,7 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
     transition: QualifiedTransitionReplayRow,
     currentOrdinals: readonly ImmutableOrdinalIdentity[],
     identities: ReadonlyMap<string, ImmutableOrdinalIdentity>,
-    states: Map<string, Map<string, EvidenceReplayState>>,
+    states: Map<string, EvidenceReplaySessionState>,
     statuses: Map<string, "available">,
     sink: IntegrityIssueSink,
   ): Promise<void> {
@@ -1524,12 +1580,20 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
       || !this.sameReplayIntervals(transition.missingIntervals, payload.missingIntervals)
     ) throw new LifecycleError("INTEGRITY_FAILURE");
 
-    let sessionStates = states.get(event.sessionId);
-    if (sessionStates === undefined) {
-      sessionStates = new Map<string, EvidenceReplayState>();
-      states.set(event.sessionId, sessionStates);
+    let sessionState = states.get(event.sessionId);
+    if (sessionState === undefined) {
+      sessionState = {
+        adapters: new Map<string, EvidenceReplayState>(),
+        adapterCount: 0,
+        totalIntervalCount: 0,
+        canonicalEntryBytesTotal: 0,
+        canonicalCoverageBytes: EMPTY_QUALIFIED_COVERAGE_CANONICAL_BYTES,
+        revisionEventPosition: null,
+      };
+      states.set(event.sessionId, sessionState);
     }
-    const previous = sessionStates.get(payload.adapterSessionId);
+    this.incrementReplayWork("evidenceTransitionAdapterLookups");
+    const previous = sessionState.adapters.get(payload.adapterSessionId);
     if (
       transition.previousCoverageFingerprintValue
         !== (previous?.coverageFingerprint ?? null)
@@ -1643,6 +1707,8 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
       latestBatchId: payload.batchId,
       latestBatchEventPosition: event.globalPosition.toString(),
     });
+    this.incrementReplayWork("evidenceEntryCanonicalizations");
+    const canonicalEntryBytes = Buffer.byteLength(canonicalJson(checkpointEntry), "utf8");
     const candidateState: EvidenceReplayState = deeplyFreeze({
       sessionId: event.sessionId,
       createdAt: previous?.createdAt ?? event.occurredAt,
@@ -1652,34 +1718,24 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
       missingIntervals: transition.missingIntervals,
       coverageFingerprint: payload.coverageFingerprint,
       checkpointEntry,
+      canonicalEntryBytes,
     });
-    const candidateEntries = [...sessionStates.values()]
-      .filter((state) => (
-        state.checkpointEntry.adapterSessionId !== payload.adapterSessionId
-      ))
-      .map((state) => state.checkpointEntry)
-      .concat(checkpointEntry)
-      .sort((left, right) => binaryCompare(
-        left.adapterSessionId,
-        right.adapterSessionId,
-      ));
-    const candidateCoverage: CheckpointEvidenceCoverageV2 = deeplyFreeze({
-      coverageVersion: 2,
-      captureMode: "coverage-only",
-      contentRetained: false,
-      adapterSessions: candidateEntries,
-    });
-    try {
-      assertEvidenceCoverageProjectionBounds({
-        prospectiveAdapterCount: candidateEntries.length,
-        prospectiveTotalIntervalCount: candidateEntries.reduce(
-          (total, entry) => total + entry.missingIntervals.length,
-          0,
-        ),
-        targetIntervalCount: checkpointEntry.missingIntervals.length,
-        evidenceCoverage: candidateCoverage,
-      });
-    } catch {
+    const candidateAdapterCount = sessionState.adapterCount + (previous === undefined ? 1 : 0);
+    const candidateTotalIntervalCount = sessionState.totalIntervalCount
+      - (previous?.missingIntervals.length ?? 0)
+      + checkpointEntry.missingIntervals.length;
+    const candidateEntryBytesTotal = sessionState.canonicalEntryBytesTotal
+      - (previous?.canonicalEntryBytes ?? 0)
+      + canonicalEntryBytes;
+    const candidateCoverageBytes = EMPTY_QUALIFIED_COVERAGE_CANONICAL_BYTES
+      + candidateEntryBytesTotal
+      + Math.max(0, candidateAdapterCount - 1);
+    if (
+      candidateAdapterCount > 200
+      || checkpointEntry.missingIntervals.length > CHECKPOINT_MAX_MISSING_INTERVALS
+      || candidateTotalIntervalCount > CHECKPOINT_MAX_MISSING_INTERVALS
+      || candidateCoverageBytes > CHECKPOINT_EVIDENCE_COVERAGE_MAX_CANONICAL_BYTES
+    ) {
       throw new LifecycleError("INTEGRITY_FAILURE");
     }
 
@@ -1741,7 +1797,12 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
         issue(sink, "SESSION_EVIDENCE_COVERAGE_MISMATCH");
       }
     }
-    sessionStates.set(payload.adapterSessionId, candidateState);
+    sessionState.adapters.set(payload.adapterSessionId, candidateState);
+    sessionState.adapterCount = candidateAdapterCount;
+    sessionState.totalIntervalCount = candidateTotalIntervalCount;
+    sessionState.canonicalEntryBytesTotal = candidateEntryBytesTotal;
+    sessionState.canonicalCoverageBytes = candidateCoverageBytes;
+    sessionState.revisionEventPosition = event.globalPosition;
   }
 
   private indexHistoricalCheckpointBases(
@@ -1953,7 +2014,7 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
     position: bigint,
     requested: ReadonlyMap<bigint, readonly HistoricalCheckpointRequest[]>,
     aggregates: ReadonlyMap<string, SessionAggregateState>,
-    states: ReadonlyMap<string, ReadonlyMap<string, EvidenceReplayState>>,
+    states: ReadonlyMap<string, EvidenceReplaySessionState>,
     snapshots: Map<string, HistoricalCheckpointCapture>,
     capturedChildren: ReadonlyMap<string, ChildEventFoldProjection>,
     liveChildrenByRoot: ReadonlyMap<string, ReadonlySet<string>>,
@@ -1964,15 +2025,41 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
     const requests = requested.get(position);
     if (requests === undefined) return;
     for (const request of requests) {
+      this.incrementReplayWork("checkpointEvidenceCaptures");
       const sessionId = request.sessionId;
       const aggregate = aggregates.get(sessionId);
       if (aggregate === undefined) throw new LifecycleError("INTEGRITY_FAILURE");
-      const adapterSessions = [...(states.get(sessionId)?.values() ?? [])]
+      const evidenceState = states.get(sessionId);
+      const adapterSessions = [...(evidenceState?.adapters.values() ?? [])]
         .map((state) => state.checkpointEntry)
         .sort((left, right) => binaryCompare(
           left.adapterSessionId,
           right.adapterSessionId,
         ));
+      this.incrementReplayWork(
+        "checkpointEvidenceEntryMaterializations",
+        adapterSessions.length,
+      );
+      const evidenceCoverage: CheckpointEvidenceCoverageV2 = deeplyFreeze({
+        coverageVersion: 2,
+        captureMode: "coverage-only",
+        contentRetained: false,
+        adapterSessions: deeplyFreeze(adapterSessions),
+      });
+      const materializedCoverageBytes = Buffer.byteLength(
+        canonicalJson(evidenceCoverage),
+        "utf8",
+      );
+      if (
+        adapterSessions.length !== (evidenceState?.adapterCount ?? 0)
+        || adapterSessions.reduce(
+          (total, entry) => total + entry.missingIntervals.length,
+          0,
+        ) !== (evidenceState?.totalIntervalCount ?? 0)
+        || materializedCoverageBytes
+          !== (evidenceState?.canonicalCoverageBytes
+            ?? EMPTY_QUALIFIED_COVERAGE_CANONICAL_BYTES)
+      ) throw new LifecycleError("INTEGRITY_FAILURE");
       const key = this.historicalSnapshotKey(sessionId, position);
       if (snapshots.has(key)) throw new LifecycleError("INTEGRITY_FAILURE");
       const childSummaries = this.captureCheckpointChildSummaries(
@@ -1986,12 +2073,9 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
       snapshots.set(key, deeplyFreeze({
         aggregate: deeplyFreeze({ ...aggregate }) as SessionAggregateState,
         childSummaries,
-        evidenceCoverage: deeplyFreeze({
-          coverageVersion: 2,
-          captureMode: "coverage-only",
-          contentRetained: false,
-          adapterSessions: deeplyFreeze(adapterSessions),
-        }),
+        evidenceCoverage,
+        evidenceRevisionEventPosition: evidenceState?.revisionEventPosition ?? null,
+        evidenceAdapterCount: evidenceState?.adapterCount ?? 0,
       }));
     }
   }
@@ -2527,8 +2611,9 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
     indexedIntent: IndexedReplayIntent | undefined,
     checkpoint: Checkpoint,
     checkpoints: ReadonlyMap<string, Checkpoint>,
+    checkpointEvidenceRevisions: ReadonlyMap<string, CheckpointEvidenceRevision>,
     preIndexes: ReplayPreIndexes,
-    evidenceStates: ReadonlyMap<string, ReadonlyMap<string, EvidenceReplayState>>,
+    evidenceStates: ReadonlyMap<string, EvidenceReplaySessionState>,
     states: Map<string, WorkflowReplayState>,
   ): void {
     const command = indexedIntent?.witness.intent.command;
@@ -2551,6 +2636,7 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
     const bindings = this.replayEndingBindings(
       checkpoint,
       checkpoints,
+      checkpointEvidenceRevisions,
       preIndexes,
       evidenceStates,
     );
@@ -2573,8 +2659,9 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
   private replayEndingBindings(
     checkpoint: Checkpoint,
     checkpoints: ReadonlyMap<string, Checkpoint>,
+    checkpointEvidenceRevisions: ReadonlyMap<string, CheckpointEvidenceRevision>,
     preIndexes: ReplayPreIndexes,
-    evidenceStates: ReadonlyMap<string, ReadonlyMap<string, EvidenceReplayState>>,
+    evidenceStates: ReadonlyMap<string, EvidenceReplaySessionState>,
   ): readonly FinalEndingScopeBindingV1[] {
     const base = BigInt(checkpoint.baseEventPosition);
     const bindings = checkpoint.childSummaries.map((summary) => {
@@ -2584,23 +2671,28 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
       const childCheckpoint = summary.latestCheckpointId === null
         ? null
         : checkpoints.get(summary.latestCheckpointId) ?? null;
-      const adapterSessions = [...(evidenceStates.get(summary.childSessionId)?.values() ?? [])]
-        .map((state) => state.checkpointEntry)
-        .sort((left, right) => binaryCompare(
-          left.adapterSessionId,
-          right.adapterSessionId,
-        ));
+      const checkpointEvidenceRevision = summary.latestCheckpointId === null
+        ? null
+        : checkpointEvidenceRevisions.get(summary.latestCheckpointId) ?? null;
+      const currentEvidenceState = evidenceStates.get(summary.childSessionId);
+      const currentEvidenceRevision = currentEvidenceState?.revisionEventPosition ?? null;
+      const currentEvidenceAdapterCount = currentEvidenceState?.adapterCount ?? 0;
+      this.incrementReplayWork("endingBindingEvidenceRevisionLookups");
       if (
         childCheckpoint === null
-          ? adapterSessions.length !== 0
-          : childCheckpoint.checkpointVersion === 1
-            ? adapterSessions.length !== 0
-            : canonicalJson(childCheckpoint.evidenceCoverage) !== canonicalJson({
-                coverageVersion: 2,
-                captureMode: "coverage-only",
-                contentRetained: false,
-                adapterSessions,
-              })
+          ? checkpointEvidenceRevision !== null
+            || currentEvidenceRevision !== null
+            || currentEvidenceAdapterCount !== 0
+          : checkpointEvidenceRevision === null
+            || checkpointEvidenceRevision.sessionId !== summary.childSessionId
+            || checkpointEvidenceRevision.checkpointVersion !== childCheckpoint.checkpointVersion
+            || (childCheckpoint.checkpointVersion === 1
+              ? checkpointEvidenceRevision.revisionEventPosition !== null
+                || checkpointEvidenceRevision.adapterCount !== 0
+                || currentEvidenceRevision !== null
+                || currentEvidenceAdapterCount !== 0
+              : checkpointEvidenceRevision.revisionEventPosition !== currentEvidenceRevision
+                || checkpointEvidenceRevision.adapterCount !== currentEvidenceAdapterCount)
       ) throw new LifecycleError("INTEGRITY_FAILURE");
       if (summary.state === "transferred") {
         if (summary.latestCheckpointId === null || checkpointEventPosition === null) {
@@ -3123,7 +3215,7 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
     workflowHeads: ReadonlyMap<string, WorkflowGenerationFoldProjection>,
     workflowStates: ReadonlyMap<string, WorkflowReplayState>,
     checkpoints: ReadonlyMap<string, Checkpoint>,
-    evidenceStates: ReadonlyMap<string, ReadonlyMap<string, EvidenceReplayState>>,
+    evidenceStates: ReadonlyMap<string, EvidenceReplaySessionState>,
   ): void {
     if (endpoints.authorities.size !== aggregates.size) {
       throw new LifecycleError("INTEGRITY_FAILURE");
@@ -3210,7 +3302,7 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
 
     let replayEvidenceCount = 0;
     for (const sessionStates of evidenceStates.values()) {
-      replayEvidenceCount += sessionStates.size;
+      replayEvidenceCount += sessionStates.adapterCount;
     }
     if (endpoints.evidence.length !== replayEvidenceCount) {
       throw new LifecycleError("INTEGRITY_FAILURE");
@@ -3220,7 +3312,7 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
         throw new LifecycleError("INTEGRITY_FAILURE");
       }
       const state = evidenceStates.get(row.session_id as string)
-        ?.get(row.adapter_session_id as string);
+        ?.adapters.get(row.adapter_session_id as string);
       const entry = state?.checkpointEntry;
       if (
         state === undefined
@@ -3411,13 +3503,48 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
       throw new LifecycleError("INTEGRITY_FAILURE");
     }
     const decoded = this.decodeStoredLifecycleEvent(event, commitment);
+    let foldEvent = decoded;
+    let liveTerminalGeneration: number | null = null;
+    const identifiedTerminalGeneration = decoded.eventType === "SessionEndCancelled"
+      ? decoded.payload.workflowGeneration
+      : decoded.eventType === "SessionAbandoned"
+        ? decoded.payload.workflowGeneration
+        : null;
+    // The shared aggregate retains schema-2 terminal-at-current-generation
+    // semantics. Qualified projections fence identified terminals at the next
+    // generation, so replay folds the compatible event and retains that fence.
+    if (
+      (decoded.eventType === "SessionEndCancelled"
+        || decoded.eventType === "SessionAbandoned")
+      && previous?.kind === "root"
+      && previous.endWorkflowGeneration !== null
+      && identifiedTerminalGeneration === previous.endWorkflowGeneration + 1
+    ) {
+      liveTerminalGeneration = identifiedTerminalGeneration;
+      foldEvent = deeplyFreeze({
+        ...decoded,
+        payload: {
+          ...decoded.payload,
+          workflowGeneration: previous.endWorkflowGeneration,
+        },
+      }) as LifecycleEvent;
+    }
     let aggregate: SessionAggregateState;
     try {
       aggregate = previous === undefined
-        ? foldSession([decoded])
-        : evolveSession(previous, decoded);
+        ? foldSession([foldEvent])
+        : evolveSession(previous, foldEvent);
     } catch {
       throw new LifecycleError("INTEGRITY_FAILURE");
+    }
+    if (liveTerminalGeneration !== null) {
+      if (aggregate.kind !== "root") {
+        throw new LifecycleError("INTEGRITY_FAILURE");
+      }
+      aggregate = deeplyFreeze({
+        ...aggregate,
+        endWorkflowGeneration: liveTerminalGeneration,
+      });
     }
     if (
       aggregate.authorityCommitment !== commitment
@@ -5162,6 +5289,15 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
       WHERE project_id = $projectId
     `).all({ $projectId: context.binding.projectId });
     for (const row of rows) {
+      if (!Object.prototype.hasOwnProperty.call(row, "evidence_window_state")) {
+        try {
+          this.assertLegacyWorkflowShape(context, row);
+        } catch {
+          issue(sink, "LIFECYCLE_WORKFLOW_INVARIANT_MISMATCH");
+          return;
+        }
+        continue;
+      }
       const evidenceColumns = [
         "evidence_frozen_checkpoint_event_position",
         "evidence_frozen_generation",
@@ -5340,6 +5476,117 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
         return;
       }
     }
+  }
+
+  private assertLegacyWorkflowShape(
+    context: ProjectContext,
+    row: Readonly<SqliteRow>,
+  ): void {
+    if (row.session_id === null) return;
+    const generation = integer(row.generation);
+    const triggerPosition = int64(row.triggering_event_position);
+    const attemptCount = integer(row.coordinator_attempt_count);
+    const claimToken = integer(row.coordinator_claim_token);
+    const claim = [
+      row.coordinator_owner_id,
+      row.coordinator_claim_token,
+      row.coordinator_claim_expires_at,
+    ];
+    const failure = [row.coordinator_failure_class, row.coordinator_error_code];
+    const plan = [
+      row.validation_attempt_plan_generation,
+      row.validation_attempt_plans_json,
+    ];
+    if (
+      row.workflow_type !== "session-end"
+      || !nonEmpty(row.workflow_id)
+      || !nonEmpty(row.session_id)
+      || generation === null
+      || generation < 1
+      || triggerPosition === null
+      || !nonEmpty(row.root_command_id)
+      || !nonEmpty(row.expected_authority_commitment)
+      || attemptCount === null
+      || attemptCount < 0
+      || (claim.some(present) && !claim.every(present))
+      || (claim.every(present) && (
+        !nonEmpty(row.coordinator_owner_id)
+        || claimToken === null
+        || claimToken < 1
+        || claimToken > attemptCount
+        || !nonEmpty(row.coordinator_claim_expires_at)
+      ))
+      || (failure.some(present) && !failure.every(present))
+      || (row.coordinator_failure_class === null
+        && row.coordinator_next_attempt_at !== null)
+      || (row.coordinator_failure_class === "retryable"
+        && !nonEmpty(row.coordinator_next_attempt_at))
+      || (row.coordinator_failure_class === "permanent"
+        && row.coordinator_next_attempt_at !== null)
+      || (row.coordinator_failure_class !== null
+        && row.coordinator_failure_class !== "retryable"
+        && row.coordinator_failure_class !== "permanent")
+      || (plan.some(present) && !plan.every(present))
+      || (present(row.validation_attempt_plans_json)
+        && !canonicalJsonText(row.validation_attempt_plans_json))
+      || (present(row.validation_attempt_plan_generation)
+        && !sameInteger(row.validation_attempt_plan_generation, row.generation))
+      || (row.result_json !== null && !canonicalJsonText(row.result_json))
+    ) throw new LifecycleError("INTEGRITY_FAILURE");
+
+    const trigger = this.storedEventAt(triggerPosition);
+    if (
+      trigger.projectId !== context.binding.projectId
+      || trigger.streamId !== `session/${String(row.session_id)}`
+      || trigger.streamType !== "session"
+      || trigger.sessionId !== row.session_id
+      || trigger.parentSessionId !== null
+    ) throw new LifecycleError("INTEGRITY_FAILURE");
+    const positions = this.connection.prepare(`
+      SELECT global_position /* legacy-workflow-projection */
+      FROM events
+      WHERE project_id = $projectId
+        AND stream_id = $streamId
+        AND stream_version <= $maxStreamVersion
+      ORDER BY stream_version
+    `).all({
+      $projectId: context.binding.projectId,
+      $streamId: trigger.streamId,
+      $maxStreamVersion: trigger.streamVersion,
+    });
+    let projection: WorkflowGenerationFoldProjection | null = null;
+    for (const positionRow of positions) {
+      const position = int64(positionRow.global_position);
+      if (position === null) throw new LifecycleError("INTEGRITY_FAILURE");
+      const event = this.storedEventAt(position);
+      const classified = classifyWorkflowProjectionEvent(event);
+      if (
+        classified.kind !== "identified"
+        || classified.workflowId !== row.workflow_id
+      ) continue;
+      const witness = this.commandIntentEventZero(context, event);
+      projection = foldWorkflowGenerationProjection(
+        projection,
+        event,
+        witness,
+        "schema-2-preflight",
+      );
+    }
+    if (
+      projection === null
+      || projection.projectId !== context.binding.projectId
+      || projection.workflowId !== row.workflow_id
+      || projection.workflowGeneration !== generation
+      || projection.sessionId !== row.session_id
+      || projection.triggerEventPosition !== triggerPosition
+      || projection.rootCommandId !== row.root_command_id
+      || this.authorityCommitmentAt(
+        context.binding.projectId,
+        trigger.streamId,
+        triggerPosition,
+      ) !== row.expected_authority_commitment
+    ) throw new LifecycleError("INTEGRITY_FAILURE");
+    this.assertEffectiveWorkflowSource(context, projection);
   }
 
   private assertOpenWorkflowProjection(
