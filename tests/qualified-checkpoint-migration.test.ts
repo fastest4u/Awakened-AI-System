@@ -2876,6 +2876,48 @@ describe("qualified checkpoint migration", () => {
         /MIGRATION_EVIDENCE_V2_PRECONDITION_FAILED/,
       );
     }
+
+    const strictValidCheckpoint = sourceConnection(2);
+    strictValidCheckpoint.exec("PRAGMA foreign_keys = OFF");
+    seedRootStart(strictValidCheckpoint, 1);
+    const rootCorrelationId = strictValidCheckpoint.prepare(`
+      SELECT correlation_id
+      FROM events
+      WHERE global_position = 1
+    `).get()?.correlation_id;
+    if (typeof rootCorrelationId !== "string") {
+      assert.fail("expected the valid V1 root start correlation ID");
+    }
+    const checkpoint = qualifiedCheckpointFixture({
+      sessionId: ROOT_ID as never,
+      parentSessionId: null,
+      baseEventPosition: 1,
+      checkpointEventPosition: 2,
+    });
+    rawEvent(strictValidCheckpoint, 2, {
+      streamType: "session",
+      sessionId: ROOT_ID,
+      parentSessionId: null,
+      streamVersion: 2,
+      eventType: "SessionCheckpointRecorded",
+      eventSchemaVersion: 2,
+      correlationId: rootCorrelationId,
+      payload: {
+        checkpoint,
+        baseEventPosition: "1",
+        checkpointEventPosition: "2",
+      },
+    });
+    assert.throws(
+      () => new SqliteQualifiedCheckpointMigrationPreflight()
+        .assertEligibleAndStage(strictValidCheckpoint, context),
+      (error) => (
+        typeof error === "object"
+        && error !== null
+        && "code" in error
+        && error.code === "MIGRATION_EVIDENCE_V2_PRECONDITION_FAILED"
+      ),
+    );
   });
 
   it("rejects missing nested lifecycle version tags while preserving generic positive versions", () => {

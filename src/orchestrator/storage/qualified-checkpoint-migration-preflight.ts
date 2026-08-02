@@ -1,15 +1,15 @@
 import type { ProjectContext } from "../identity/contracts.js";
 import {
   CHECKPOINT_MAX_CANONICAL_BYTES,
-  decodeCheckpoint,
+  decodeCheckpointV1,
   type CheckpointEvidenceCoverageV2,
-  type Checkpoint,
+  type CheckpointV1,
 } from "../lifecycle/contracts/checkpoint.js";
 import type { ChildSessionState } from "../lifecycle/contracts/identifiers.js";
 import {
   LIFECYCLE_EVENT_TYPES,
-  decodeLifecycleEvent,
-  type LifecycleEvent,
+  decodeLifecycleEventV1,
+  type LifecycleEventV1,
 } from "../lifecycle/contracts/events.js";
 import type { StoredEvent } from "../contracts/event.js";
 import {
@@ -142,13 +142,13 @@ const EMPTY_COVERAGE: CheckpointEvidenceCoverageV2 = Object.freeze({
 });
 
 interface IndexedCheckpoint {
-  readonly checkpoint: Checkpoint;
+  readonly checkpoint: CheckpointV1;
   readonly eventPosition: string;
 }
 
 interface IndexedLifecycleHistory {
   readonly checkpoints: ReadonlyMap<string, IndexedCheckpoint>;
-  readonly eventsByPosition: ReadonlyMap<string, LifecycleEvent>;
+  readonly eventsByPosition: ReadonlyMap<string, LifecycleEventV1>;
   readonly childFoldsByEvent: ReadonlyMap<string, ChildEventFoldProjection>;
   readonly childEventFolds: readonly ChildEventFoldProjection[];
   readonly workflowGenerationFolds: readonly WorkflowGenerationFoldProjection[];
@@ -310,7 +310,7 @@ function assertCoverageEmpty(connection: SqliteConnection): void {
 
 function indexLifecycleHistory(connection: SqliteConnection): IndexedLifecycleHistory {
   const checkpoints = new Map<string, IndexedCheckpoint>();
-  const eventsByPosition = new Map<string, LifecycleEvent>();
+  const eventsByPosition = new Map<string, LifecycleEventV1>();
   const childFoldsByEvent = new Map<string, ChildEventFoldProjection>();
   const childEventFolds: ChildEventFoldProjection[] = [];
   const workflowGenerationFolds: WorkflowGenerationFoldProjection[] = [];
@@ -327,7 +327,7 @@ function indexLifecycleHistory(connection: SqliteConnection): IndexedLifecycleHi
   const workflowHeads = new Map<string, WorkflowGenerationFoldProjection>();
   // Trigger type is contextual provenance, not part of the approved row/hash.
   // Preflight must retain it while folding so only a cancelled row can reopen.
-  const workflowHeadTriggerTypes = new Map<string, LifecycleEvent["eventType"]>();
+  const workflowHeadTriggerTypes = new Map<string, LifecycleEventV1["eventType"]>();
   const workflowIndexes = new Map<string, number>();
   const lifecycleRows = connection.prepare(`
     SELECT global_position, event_id, project_id, vault_id, store_id,
@@ -362,6 +362,7 @@ function indexLifecycleHistory(connection: SqliteConnection): IndexedLifecycleHi
     }
     if (!LIFECYCLE_EVENT_TYPE_SET.has(eventType)) continue;
     const schemaVersion = scalarInteger(row, "event_schema_version");
+    if (schemaVersion !== 1 || eventType === "EvidenceCoverageRecorded") fail();
     const payload = record(parseCanonicalJson(requiredString(row, "payload_json")));
     const streamId = requiredString(row, "stream_id");
     if (typeof payload.authorityCommitment === "string") {
@@ -369,9 +370,9 @@ function indexLifecycleHistory(connection: SqliteConnection): IndexedLifecycleHi
     }
     const authorityCommitment = authorityCommitments.get(streamId);
     if (authorityCommitment === undefined) fail();
-    let decoded: LifecycleEvent;
+    let decoded: LifecycleEventV1;
     try {
-      decoded = decodeLifecycleEvent({
+      decoded = decodeLifecycleEventV1({
         eventSchemaVersion: schemaVersion,
         eventId: row.event_id,
         projectId: row.project_id,
@@ -537,17 +538,15 @@ function indexLifecycleHistory(connection: SqliteConnection): IndexedLifecycleHi
 
     if (eventType === "SessionCheckpointRecorded") {
       const checkpointEvent = decoded as Extract<
-        LifecycleEvent,
+        LifecycleEventV1,
         { readonly eventType: "SessionCheckpointRecorded" }
       >;
-      const checkpoint = decodeCheckpoint(checkpointEvent.payload.checkpoint);
+      const checkpoint = decodeCheckpointV1(checkpointEvent.payload.checkpoint);
       const eventPosition = checkpointEvent.globalPosition;
-      const emptyCoverage = checkpoint.checkpointVersion === 1
-        ? (
-            checkpoint.evidenceCoverage.highestContiguousOrdinal === null
-            && checkpoint.evidenceCoverage.missingIntervals.length === 0
-          )
-        : checkpoint.evidenceCoverage.adapterSessions.length === 0;
+      const emptyCoverage = (
+        checkpoint.evidenceCoverage.highestContiguousOrdinal === null
+        && checkpoint.evidenceCoverage.missingIntervals.length === 0
+      );
       if (
         checkpointEvent.payload.baseEventPosition !== checkpoint.baseEventPosition
         || checkpointEvent.payload.checkpointEventPosition !== eventPosition
@@ -577,7 +576,7 @@ function eventAt(
   projectId: string,
   sessionId: string,
   eventPosition: string,
-): LifecycleEvent {
+): LifecycleEventV1 {
   const event = history.eventsByPosition.get(eventPosition);
   if (
     event === undefined
@@ -725,7 +724,7 @@ function bindingsForCheckpoint(
   connection: SqliteConnection,
   projectId: string,
   history: IndexedLifecycleHistory,
-  checkpoint: Checkpoint,
+  checkpoint: CheckpointV1,
 ): readonly FinalEndingScopeBindingV1[] {
   const bindings = checkpoint.childSummaries
     .map((summary) => bindingForSummary(
