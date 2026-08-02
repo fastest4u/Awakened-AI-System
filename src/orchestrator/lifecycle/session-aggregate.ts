@@ -441,6 +441,30 @@ function assertWorkflow(
   ) integrity();
 }
 
+function assertTerminalWorkflow(
+  state: RootAggregateState,
+  workflowId: WorkflowId,
+  workflowGeneration: number,
+): void {
+  const currentGeneration = state.endWorkflowGeneration;
+  if (
+    state.endWorkflowId === null
+    || currentGeneration === null
+    || workflowId !== state.endWorkflowId
+    || !Number.isSafeInteger(currentGeneration)
+    || currentGeneration < 1
+    || !Number.isSafeInteger(workflowGeneration)
+    || workflowGeneration < 1
+    || (
+      workflowGeneration !== currentGeneration
+      && (
+        currentGeneration === Number.MAX_SAFE_INTEGER
+        || workflowGeneration !== currentGeneration + 1
+      )
+    )
+  ) integrity();
+}
+
 function reportItemSignature(
   itemIds: readonly ReportItemId[],
 ): string {
@@ -600,24 +624,28 @@ function evolveRoot(
       });
     }
     case "SessionEndCancelled":
-      assertWorkflow(state, event.payload.workflowId, event.payload.workflowGeneration);
+      assertTerminalWorkflow(state, event.payload.workflowId, event.payload.workflowGeneration);
       if (state.endPreviousState === null || event.payload.restoredState !== state.endPreviousState) integrity();
       return withRootEvent(state, event, streamVersion, eventPosition, {
         state: event.payload.restoredState,
         suspendRequestedCheckpointId: null,
+        endWorkflowGeneration: event.payload.workflowGeneration,
         endVerificationState: "none",
         verificationPassedEventPosition: null,
       });
     case "SessionAbandoned":
       if (state.state === "ending") {
         if (event.payload.workflowId === null || event.payload.workflowGeneration === null) integrity();
-        assertWorkflow(state, event.payload.workflowId, event.payload.workflowGeneration);
+        assertTerminalWorkflow(state, event.payload.workflowId, event.payload.workflowGeneration);
       } else if (event.payload.workflowId !== null || event.payload.workflowGeneration !== null) {
         integrity();
       }
       return withRootEvent(state, event, streamVersion, eventPosition, {
         state: "abandoned",
         suspendRequestedCheckpointId: null,
+        ...(state.state === "ending"
+          ? { endWorkflowGeneration: event.payload.workflowGeneration }
+          : {}),
         endVerificationState: "none",
         verificationPassedEventPosition: null,
         terminalEventPosition: eventPosition,

@@ -78,6 +78,7 @@ import { canonicalJson } from "../src/orchestrator/serialization/canonical-json.
 import type { RootStartCommandV2 } from "../src/orchestrator/lifecycle/contracts/commands.js";
 import { buildLifecycleIntentWitness } from "../src/orchestrator/lifecycle/lifecycle-intent-witness.js";
 import type { LifecycleEventV1 } from "../src/orchestrator/lifecycle/contracts/events.js";
+import { LifecycleError } from "../src/orchestrator/lifecycle/errors.js";
 import type { SessionId } from "../src/orchestrator/lifecycle/contracts/identifiers.js";
 import {
   checkpointFixture,
@@ -1987,9 +1988,8 @@ describe("explicit project-store upgrade", () => {
           contextFingerprint: foldContext.binding.contextFingerprint,
         },
       }),
-      (error: unknown) => error instanceof Error
-        && "code" in error
-        && (error as Error & { code: unknown }).code === "INTEGRITY_FAILURE",
+      (error: unknown) => error instanceof LifecycleError
+        && error.code === "INTEGRITY_FAILURE",
     );
   });
 

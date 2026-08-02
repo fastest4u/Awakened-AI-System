@@ -162,6 +162,7 @@ export interface LifecycleFullReplayWorkCounters {
   checkpointEvidenceCaptures: number;
   checkpointEvidenceEntryMaterializations: number;
   endingBindingEvidenceRevisionLookups: number;
+  endingBindingEvidenceAdapterInspections: number;
 }
 
 interface QualifiedTransitionReplayRow {
@@ -2678,6 +2679,8 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
       const currentEvidenceRevision = currentEvidenceState?.revisionEventPosition ?? null;
       const currentEvidenceAdapterCount = currentEvidenceState?.adapterCount ?? 0;
       this.incrementReplayWork("endingBindingEvidenceRevisionLookups");
+      // Binding equivalence compares captured revision summaries only, so adapter-entry
+      // inspections remain zero instead of deepening with each bound checkpoint.
       if (
         childCheckpoint === null
           ? checkpointEvidenceRevision !== null
@@ -3503,48 +3506,13 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
       throw new LifecycleError("INTEGRITY_FAILURE");
     }
     const decoded = this.decodeStoredLifecycleEvent(event, commitment);
-    let foldEvent = decoded;
-    let liveTerminalGeneration: number | null = null;
-    const identifiedTerminalGeneration = decoded.eventType === "SessionEndCancelled"
-      ? decoded.payload.workflowGeneration
-      : decoded.eventType === "SessionAbandoned"
-        ? decoded.payload.workflowGeneration
-        : null;
-    // The shared aggregate retains schema-2 terminal-at-current-generation
-    // semantics. Qualified projections fence identified terminals at the next
-    // generation, so replay folds the compatible event and retains that fence.
-    if (
-      (decoded.eventType === "SessionEndCancelled"
-        || decoded.eventType === "SessionAbandoned")
-      && previous?.kind === "root"
-      && previous.endWorkflowGeneration !== null
-      && identifiedTerminalGeneration === previous.endWorkflowGeneration + 1
-    ) {
-      liveTerminalGeneration = identifiedTerminalGeneration;
-      foldEvent = deeplyFreeze({
-        ...decoded,
-        payload: {
-          ...decoded.payload,
-          workflowGeneration: previous.endWorkflowGeneration,
-        },
-      }) as LifecycleEvent;
-    }
     let aggregate: SessionAggregateState;
     try {
       aggregate = previous === undefined
-        ? foldSession([foldEvent])
-        : evolveSession(previous, foldEvent);
+        ? foldSession([decoded])
+        : evolveSession(previous, decoded);
     } catch {
       throw new LifecycleError("INTEGRITY_FAILURE");
-    }
-    if (liveTerminalGeneration !== null) {
-      if (aggregate.kind !== "root") {
-        throw new LifecycleError("INTEGRITY_FAILURE");
-      }
-      aggregate = deeplyFreeze({
-        ...aggregate,
-        endWorkflowGeneration: liveTerminalGeneration,
-      });
     }
     if (
       aggregate.authorityCommitment !== commitment

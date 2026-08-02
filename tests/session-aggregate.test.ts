@@ -511,6 +511,95 @@ describe("SessionAggregate", () => {
       })));
     });
 
+    it("accepts current or exactly-next identified terminal generations", () => {
+      const ending = endingRoot();
+      const currentCancel = evolveSession(ending, eventAfter(ending, "SessionEndCancelled", {
+        workflowGeneration: 1,
+        restoredState: "active",
+      }));
+      assert.equal(currentCancel.endWorkflowGeneration, 1);
+
+      const nextCancel = evolveSession(ending, eventAfter(ending, "SessionEndCancelled", {
+        workflowGeneration: 2,
+        restoredState: "active",
+      }));
+      assert.equal(nextCancel.endWorkflowGeneration, 2);
+
+      const currentAbandon = evolveSession(ending, eventAfter(ending, "SessionAbandoned", {
+        workflowId: WORKFLOW_ID,
+        workflowGeneration: 1,
+        authorityCommitment: AUTHORITY_B,
+      }));
+      assert.equal(currentAbandon.endWorkflowGeneration, 1);
+
+      const nextAbandon = evolveSession(ending, eventAfter(ending, "SessionAbandoned", {
+        workflowId: WORKFLOW_ID,
+        workflowGeneration: 2,
+        authorityCommitment: AUTHORITY_B,
+      }));
+      assert.equal(nextAbandon.endWorkflowGeneration, 2);
+    });
+
+    it("uses an accepted next terminal generation as the reopen fence", () => {
+      const ending = endingRoot();
+      const cancelled = evolveSession(ending, eventAfter(ending, "SessionEndCancelled", {
+        workflowGeneration: 2,
+        restoredState: "active",
+      }));
+      expectIntegrity(() => evolveSession(cancelled, eventAfter(cancelled, "SessionEndRequested", {
+        workflowGeneration: 2,
+        previousState: "active",
+      })));
+      const reopened = evolveSession(cancelled, eventAfter(cancelled, "SessionEndRequested", {
+        workflowGeneration: 3,
+        previousState: "active",
+      }));
+      assert.equal(reopened.state, "ending");
+      assert.equal(reopened.endWorkflowGeneration, 3);
+    });
+
+    it("rejects invalid identified terminal identities without changing null abandonment", () => {
+      const ending = endingRoot();
+      const otherWorkflowId = lifecycleUuid<WorkflowId>(499);
+      for (const payload of [
+        { workflowGeneration: 0 },
+        { workflowGeneration: 3 },
+        { workflowGeneration: Number.MAX_SAFE_INTEGER + 1 },
+        { workflowId: otherWorkflowId },
+        { workflowId: null },
+      ] as const) {
+        expectIntegrity(() => evolveSession(ending, tamperPayload(
+          eventAfter(ending, "SessionEndCancelled", { restoredState: "active" }),
+          payload,
+        )));
+      }
+      for (const payload of [
+        { workflowGeneration: 0 },
+        { workflowGeneration: 3 },
+        { workflowGeneration: Number.MAX_SAFE_INTEGER + 1 },
+        { workflowId: otherWorkflowId },
+        { workflowId: null, workflowGeneration: 1 },
+        { workflowId: WORKFLOW_ID, workflowGeneration: null },
+      ] as const) {
+        expectIntegrity(() => evolveSession(ending, tamperPayload(
+          eventAfter(ending, "SessionAbandoned", { authorityCommitment: AUTHORITY_B }),
+          payload,
+        )));
+      }
+
+      for (const state of [rootAggregate(), suspendedRoot()] as const) {
+        const abandoned = evolveSession(state, eventAfter(state, "SessionAbandoned", {
+          workflowId: null,
+          workflowGeneration: null,
+          authorityCommitment: state.authorityCommitment === AUTHORITY_A
+            ? AUTHORITY_B
+            : AUTHORITY_C,
+        }));
+        assert.equal(abandoned.state, "abandoned");
+        assert.equal(abandoned.endWorkflowGeneration, null);
+      }
+    });
+
     it("binds validation, verification, invalidation, and terminal end to one workflow generation", () => {
       const ending = endingRoot();
       const recorded = evolveSession(ending, eventAfter(ending, "SessionValidationResultRecorded", {

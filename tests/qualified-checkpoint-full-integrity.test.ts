@@ -92,6 +92,7 @@ interface FullReplayWorkCounters {
   checkpointEvidenceCaptures: number;
   checkpointEvidenceEntryMaterializations: number;
   endingBindingEvidenceRevisionLookups: number;
+  endingBindingEvidenceAdapterInspections: number;
 }
 
 function replayWorkCounters(): FullReplayWorkCounters {
@@ -101,6 +102,7 @@ function replayWorkCounters(): FullReplayWorkCounters {
     checkpointEvidenceCaptures: 0,
     checkpointEvidenceEntryMaterializations: 0,
     endingBindingEvidenceRevisionLookups: 0,
+    endingBindingEvidenceAdapterInspections: 0,
   };
 }
 
@@ -1577,6 +1579,8 @@ function storedMissingIntervalsJson(
 function addQualifiedCoverageBatch(
   fixture: Fixture,
   input: {
+    readonly sessionId?: string;
+    readonly parentSessionId?: string | null;
     readonly position: bigint;
     readonly streamVersion: bigint;
     readonly batchId: string;
@@ -1602,6 +1606,7 @@ function addQualifiedCoverageBatch(
     readonly lastOrdinal: string;
   }[];
   readonly newFrameCount: number;
+  readonly checkpointEntry: Readonly<Record<string, unknown>>;
 } {
   assert.ok(input.frames.length > 0);
   const frames = [...input.frames].sort((left, right) => (
@@ -1612,6 +1617,9 @@ function addQualifiedCoverageBatch(
     frames.length,
   );
   const occurredAt = input.occurredAt ?? NOW;
+  const sessionId = input.sessionId ?? ROOT_ID;
+  const parentSessionId = input.parentSessionId
+    ?? (sessionId === ROOT_ID ? null : ROOT_ID);
   const adapterSessionId = input.adapterSessionId ?? ADAPTER_ID;
   const previous = fixture.connection.prepare(`
     SELECT * FROM session_evidence_coverage
@@ -1620,7 +1628,7 @@ function addQualifiedCoverageBatch(
       AND adapter_session_id = $adapterSessionId
   `).get({
     $projectId: PROJECT_ID,
-    $sessionId: ROOT_ID,
+    $sessionId: sessionId,
     $adapterSessionId: adapterSessionId,
   });
   const priorIdentities = new Map(fixture.connection.prepare(`
@@ -1630,7 +1638,7 @@ function addQualifiedCoverageBatch(
       AND adapter_session_id = $adapterSessionId
   `).all({
     $projectId: PROJECT_ID,
-    $sessionId: ROOT_ID,
+    $sessionId: sessionId,
     $adapterSessionId: adapterSessionId,
   }).map((row) => [BigInt(String(row.ordinal)).toString(), row] as const));
   const newFrames = frames.filter((frame) => {
@@ -1663,6 +1671,7 @@ function addQualifiedCoverageBatch(
     ? previousCoverageFingerprint
     : testProviderFingerprint(keyId, Buffer.from(canonicalJson(
         expectedCoverageAccumulator({
+          sessionId,
           adapterSessionId,
           keyId,
           previousCoverageFingerprint,
@@ -1707,17 +1716,17 @@ function addQualifiedCoverageBatch(
   `).run({
     $now: occurredAt,
     $projectId: PROJECT_ID,
-    $streamId: `session/${ROOT_ID}`,
+    $streamId: `session/${sessionId}`,
     $streamVersion: input.streamVersion,
   });
   rawEvent(fixture.connection, {
     globalPosition: input.position,
-    streamId: `session/${ROOT_ID}`,
+    streamId: `session/${sessionId}`,
     streamVersion: input.streamVersion,
     eventType: "EvidenceCoverageRecorded",
     eventSchemaVersion: 2,
-    sessionId: ROOT_ID,
-    parentSessionId: null,
+    sessionId,
+    parentSessionId,
     payload,
   });
   const missingIntervalsJson = storedMissingIntervalsJson(input.expected.missingIntervals);
@@ -1725,7 +1734,7 @@ function addQualifiedCoverageBatch(
   try {
     rawInsert(fixture.connection, "session_evidence_coverage_transitions", {
       project_id: PROJECT_ID,
-      session_id: ROOT_ID,
+      session_id: sessionId,
       adapter_session_id: adapterSessionId,
       batch_id: input.batchId,
       batch_event_position: input.position,
@@ -1755,7 +1764,7 @@ function addQualifiedCoverageBatch(
     if (previous === undefined) {
       rawInsert(fixture.connection, "session_evidence_coverage", {
         project_id: PROJECT_ID,
-        session_id: ROOT_ID,
+        session_id: sessionId,
         adapter_session_id: adapterSessionId,
         capture_mode: "coverage-only",
         first_ordinal: 0,
@@ -1802,14 +1811,14 @@ function addQualifiedCoverageBatch(
         $now: occurredAt,
         $coverageFingerprint: coverageFingerprint!,
         $projectId: PROJECT_ID,
-        $sessionId: ROOT_ID,
+        $sessionId: sessionId,
         $adapterSessionId: adapterSessionId,
       });
     }
     for (const frame of newFrames) {
       rawInsert(fixture.connection, "session_evidence_fingerprints", {
         project_id: PROJECT_ID,
-        session_id: ROOT_ID,
+        session_id: sessionId,
         adapter_session_id: adapterSessionId,
         ordinal: frame.ordinal,
         frame_id: frame.frameId,
@@ -1835,6 +1844,24 @@ function addQualifiedCoverageBatch(
     highestContiguousOrdinal: input.expected.highestContiguousOrdinal,
     missingIntervals: input.expected.missingIntervals,
     newFrameCount: newFrames.length,
+    checkpointEntry: {
+      adapterSessionId,
+      coverageFirstOrdinal: "0",
+      coverageLastOrdinal: input.expected.coverageLastOrdinal,
+      highestContiguousOrdinal: input.expected.highestContiguousOrdinal,
+      missingIntervals: input.expected.missingIntervals,
+      frameFingerprintAlgorithm: "hmac-sha256",
+      frameFingerprintSchemaVersion: 1,
+      frameFingerprintKeyId: keyId,
+      frameFingerprintDomain: "pm-evidence-frame-v1",
+      coverageFingerprintAlgorithm: "hmac-sha256",
+      coverageFingerprintSchemaVersion: 1,
+      coverageFingerprintKeyId: keyId,
+      coverageFingerprintDomain: "pm-evidence-coverage-v1",
+      coverageFingerprint,
+      latestBatchId: input.batchId,
+      latestBatchEventPosition: input.position.toString(),
+    },
   };
 }
 
@@ -4912,6 +4939,328 @@ function addFrozenCarryForwardWorkflow(
   return { ticketId, binding };
 }
 
+function addDeepBoundChildrenWorkflow(
+  fixture: Fixture,
+  adaptersPerChild = 12,
+): {
+  readonly bindingCount: number;
+  readonly transitionCount: number;
+} {
+  const childIds = [CHILD_ID, uuid(54_900)] as const;
+  const summaries: Array<Readonly<Record<string, unknown>>> = [];
+  const bindings: Array<Readonly<Record<string, unknown>>> = [];
+  let position = 2n;
+
+  for (const [childIndex, childSessionId] of childIds.entries()) {
+    const forkPosition = position;
+    const start = childAuthority(childSessionId, forkPosition);
+    rawInsert(fixture.connection, "streams", {
+      project_id: PROJECT_ID,
+      stream_id: `session/${childSessionId}`,
+      stream_type: "session",
+      current_version: 1,
+      created_at: NOW,
+      updated_at: NOW,
+    });
+    rawEvent(fixture.connection, {
+      globalPosition: forkPosition,
+      streamId: `session/${childSessionId}`,
+      streamVersion: 1n,
+      eventType: "SessionForked",
+      eventSchemaVersion: 1,
+      sessionId: childSessionId,
+      parentSessionId: ROOT_ID,
+      payload: {
+        parentSessionId: ROOT_ID,
+        assignment: {
+          assignmentId: uuid(55_900 + childIndex),
+          summary: `Task 12J additive child ${childIndex + 1}`,
+          scope: "tests/qualified-checkpoint-full-integrity.test.ts",
+        },
+        rootOwnerGeneration: 1,
+        directAccessEnabled: true,
+        authorityCommitment: start.authority_commitment,
+        sourceTransferTicketId: null,
+      },
+    });
+    rawInsert(fixture.connection, "session_authority", start);
+    let projection = testChildProjection({
+      projectId: PROJECT_ID,
+      childSessionId,
+      eventPosition: forkPosition,
+      streamVersion: 1n,
+      rootSessionId: ROOT_ID,
+      childState: "active",
+      latestCheckpointId: null,
+      latestCheckpointEventPosition: null,
+      authorityCommitment: String(start.authority_commitment),
+      terminalEventType: null,
+      terminalEventPosition: null,
+      reportCount: 0,
+      latestReportId: null,
+      reportIndexFingerprint: referenceReportIndexGenesisFingerprint(
+        PROJECT_ID,
+        childSessionId,
+      ),
+      completionReportId: null,
+      reportedReportId: null,
+      reportedItemCount: null,
+      reportedItemSetFingerprint: null,
+      previousFingerprint: null,
+    });
+    insertTestChildProjection(fixture.connection, projection);
+
+    const adapterSessions: Array<Readonly<Record<string, unknown>>> = [];
+    let streamVersion = 1n;
+    for (let adapterIndex = 0; adapterIndex < adaptersPerChild; adapterIndex += 1) {
+      position += 1n;
+      streamVersion += 1n;
+      const seed = 80_000 + childIndex * 1_000 + adapterIndex;
+      const coverage = addQualifiedCoverageBatch(fixture, {
+        sessionId: childSessionId,
+        parentSessionId: ROOT_ID,
+        position,
+        streamVersion,
+        batchId: uuid(seed),
+        adapterSessionId: uuid(seed + 100),
+        frames: [{
+          frameId: uuid(seed + 200),
+          ordinal: 0n,
+          sourceKind: "adapter-event",
+          observedAt: NOW,
+          contentFingerprint: adapterIndex % 2 === 0 ? H64 : H64_B,
+        }],
+        expected: {
+          coverageLastOrdinal: "0",
+          highestContiguousOrdinal: "0",
+          missingIntervals: [],
+          newOrdinals: [0n],
+        },
+      });
+      adapterSessions.push(coverage.checkpointEntry);
+      projection = carryTestChildProjection(projection, {
+        eventPosition: position,
+        streamVersion,
+      });
+      insertTestChildProjection(fixture.connection, projection);
+    }
+
+    const checkpointBasePosition = position;
+    const checkpointEventPosition = position + 1n;
+    const checkpointId = uuid(84_000 + childIndex);
+    const draft = checkpointDraft();
+    const checkpoint = {
+      ...qualifiedCheckpointFixture({
+        checkpointId: checkpointId as never,
+        sessionId: childSessionId as never,
+        parentSessionId: ROOT_ID as never,
+        baseEventPosition: Number(checkpointBasePosition),
+        checkpointEventPosition: Number(checkpointEventPosition),
+      }),
+      ...draft,
+      createdAt: NOW,
+      creatorAgentId: "agent-full-integrity",
+      creatorClientInstanceId: "client-full-integrity",
+      sourceState: {
+        sourceStateScopeVersion: 1,
+        workspaceId: WORKSPACE_ID,
+        branchRef: null,
+        headCommit: null,
+        dirtyWorktreeFingerprint: (childIndex === 0 ? "6" : "7").repeat(64),
+      },
+      childSummaries: [],
+      evidenceCoverage: {
+        coverageVersion: 2,
+        captureMode: "coverage-only",
+        contentRetained: false,
+        adapterSessions,
+      },
+    };
+    streamVersion += 1n;
+    insertFullCheckpoint(fixture, {
+      sessionId: childSessionId,
+      parentSessionId: ROOT_ID,
+      baseEventPosition: checkpointBasePosition,
+      checkpointEventPosition,
+      streamVersion,
+      checkpoint,
+      draft,
+      commandId: uuid(84_100 + childIndex),
+      idempotencyKey: `full-integrity/additive/child-${childIndex + 1}`,
+      targetActorRole: "untrusted",
+      targetClientInstanceId: "child-client",
+    });
+    fixture.connection.prepare(`
+      UPDATE streams SET current_version = $streamVersion, updated_at = $now
+      WHERE project_id = $projectId AND stream_id = $streamId
+    `).run({
+      $streamVersion: streamVersion,
+      $now: NOW,
+      $projectId: PROJECT_ID,
+      $streamId: `session/${childSessionId}`,
+    });
+    projection = carryTestChildProjection(projection, {
+      eventPosition: checkpointEventPosition,
+      streamVersion,
+      latestCheckpointId: checkpointId,
+      latestCheckpointEventPosition: checkpointEventPosition,
+    });
+    insertTestChildProjection(fixture.connection, projection);
+    fixture.connection.prepare(`
+      UPDATE session_authority
+      SET latest_checkpoint_id = $checkpointId,
+          latest_checkpoint_event_position = $checkpointPosition,
+          latest_checkpoint_fingerprint = $fingerprint,
+          updated_at = $now
+      WHERE project_id = $projectId AND session_id = $sessionId
+    `).run({
+      $checkpointId: checkpointId,
+      $checkpointPosition: checkpointEventPosition,
+      $fingerprint: checkpointFingerprint(checkpoint),
+      $now: NOW,
+      $projectId: PROJECT_ID,
+      $sessionId: childSessionId,
+    });
+    summaries.push({
+      childSessionId,
+      state: "active",
+      lastEventPosition: checkpointEventPosition.toString(),
+      streamVersion: streamVersion.toString(),
+      latestCheckpointId: checkpointId,
+    });
+    bindings.push({
+      bindingVersion: 1,
+      bindingKind: "current-child",
+      childSessionId,
+      childState: "active",
+      lastEventPosition: checkpointEventPosition.toString(),
+      streamVersion: streamVersion.toString(),
+      checkpointId,
+      checkpointEventPosition: checkpointEventPosition.toString(),
+      transferTicketId: null,
+      transferTicketEventPosition: null,
+    });
+    position = checkpointEventPosition + 1n;
+  }
+
+  const requestPosition = position;
+  const { workflowId } = addWorkflowRequest(fixture, { position: requestPosition });
+  const finalPosition = requestPosition + 1n;
+  const rootCheckpointId = uuid(84_200);
+  const rootDraft = checkpointDraft();
+  const byChildId = (
+    left: Readonly<Record<string, unknown>>,
+    right: Readonly<Record<string, unknown>>,
+  ): number => String(left.childSessionId) < String(right.childSessionId) ? -1 : 1;
+  summaries.sort(byChildId);
+  bindings.sort(byChildId);
+  const rootCheckpoint = {
+    ...qualifiedCheckpointFixture({
+      checkpointId: rootCheckpointId as never,
+      sessionId: ROOT_ID as never,
+      baseEventPosition: Number(requestPosition),
+      checkpointEventPosition: Number(finalPosition),
+    }),
+    ...rootDraft,
+    createdAt: NOW,
+    creatorAgentId: "agent-full-integrity",
+    creatorClientInstanceId: "client-full-integrity",
+    sourceState: {
+      sourceStateScopeVersion: 1,
+      workspaceId: WORKSPACE_ID,
+      branchRef: null,
+      headCommit: null,
+      dirtyWorktreeFingerprint: "8".repeat(64),
+    },
+    childSummaries: summaries,
+    evidenceCoverage: {
+      coverageVersion: 2,
+      captureMode: "coverage-only",
+      contentRetained: false,
+      adapterSessions: [],
+    },
+  };
+  insertFullCheckpoint(fixture, {
+    sessionId: ROOT_ID,
+    parentSessionId: null,
+    baseEventPosition: requestPosition,
+    checkpointEventPosition: finalPosition,
+    streamVersion: 3n,
+    checkpoint: rootCheckpoint,
+    draft: rootDraft,
+    commandId: uuid(84_201),
+    idempotencyKey: "full-integrity/additive/root-final",
+    internalWorkflow: {
+      workflowId,
+      workflowGeneration: 1,
+      plannedWorkId: "8".repeat(64),
+      claimOwnerId: uuid(84_202),
+    },
+  });
+  fixture.connection.prepare(`
+    UPDATE streams SET current_version = 3, updated_at = $now
+    WHERE project_id = $projectId AND stream_id = $streamId
+  `).run({ $now: NOW, $projectId: PROJECT_ID, $streamId: `session/${ROOT_ID}` });
+  fixture.connection.prepare(`
+    UPDATE session_authority
+    SET semantic_state = 'ending', latest_checkpoint_id = $checkpointId,
+        latest_checkpoint_event_position = $checkpointPosition,
+        latest_checkpoint_fingerprint = $fingerprint, updated_at = $now
+    WHERE project_id = $projectId AND session_id = $sessionId
+  `).run({
+    $checkpointId: rootCheckpointId,
+    $checkpointPosition: finalPosition,
+    $fingerprint: checkpointFingerprint(rootCheckpoint),
+    $now: NOW,
+    $projectId: PROJECT_ID,
+    $sessionId: ROOT_ID,
+  });
+  const status = {
+    resultVersion: 2,
+    sessionId: ROOT_ID,
+    workflowId,
+    workflowGeneration: 1,
+    phase: "final-checkpoint-recorded",
+    priorRootState: "active",
+    triggeringEventPosition: requestPosition.toString(),
+    finalCheckpointId: rootCheckpointId,
+    finalCheckpointEventPosition: finalPosition.toString(),
+    evidenceWindow: {
+      evidenceWindowState: "sealed",
+      evidenceFrozenCheckpointEventPosition: finalPosition.toString(),
+      evidenceFrozenGeneration: 1,
+    },
+    validationPlansReady: false,
+    qualityScore: null,
+    safeFailureCode: null,
+    materializationRequired: false,
+  };
+  fixture.connection.exec("DROP TRIGGER workflow_instances_lifecycle_update_guard");
+  fixture.connection.exec("DROP TRIGGER workflow_instances_evidence_v3_update_guard");
+  fixture.connection.prepare(`
+    UPDATE workflow_instances
+    SET phase = 'final-checkpoint-recorded', result_json = $resultJson,
+        updated_at = $now,
+        coordinator_attempt_count = 1,
+        evidence_frozen_checkpoint_event_position = $checkpointPosition,
+        evidence_frozen_generation = 1,
+        evidence_window_state = 'sealed',
+        final_ending_scope_bindings_json = $bindingsJson
+    WHERE project_id = $projectId AND workflow_id = $workflowId
+  `).run({
+    $resultJson: canonicalJson(status),
+    $now: NOW,
+    $checkpointPosition: finalPosition,
+    $bindingsJson: canonicalJson(bindings),
+    $projectId: PROJECT_ID,
+    $workflowId: workflowId,
+  });
+  return {
+    bindingCount: childIds.length,
+    transitionCount: childIds.length * adaptersPerChild,
+  };
+}
+
 function addReportResetCompletionMatrix(fixture: Fixture): void {
   const assignmentId = uuid(55_001);
   const reportAId = uuid(91_001);
@@ -6391,6 +6740,7 @@ it("full integrity advances each qualified coverage row exactly once", async () 
     checkpointEvidenceCaptures: 0,
     checkpointEvidenceEntryMaterializations: 0,
     endingBindingEvidenceRevisionLookups: 0,
+    endingBindingEvidenceAdapterInspections: 0,
   });
 
   const checkpointCountersFixture = createFixture();
@@ -6410,6 +6760,7 @@ it("full integrity advances each qualified coverage row exactly once", async () 
     checkpointEvidenceCaptures: 1,
     checkpointEvidenceEntryMaterializations: 1,
     endingBindingEvidenceRevisionLookups: 0,
+    endingBindingEvidenceAdapterInspections: 0,
   });
 
   const bindingCountersFixture = createFixture();
@@ -6428,6 +6779,31 @@ it("full integrity advances each qualified coverage row exactly once", async () 
     checkpointEvidenceCaptures: 2,
     checkpointEvidenceEntryMaterializations: 0,
     endingBindingEvidenceRevisionLookups: 1,
+    endingBindingEvidenceAdapterInspections: 0,
+  });
+});
+
+it("full integrity keeps ending-binding revision work additive with deep bound-child evidence", async () => {
+  const fixture = createFixture();
+  const represented = addDeepBoundChildrenWorkflow(fixture);
+  assert.deepEqual(represented, {
+    bindingCount: 2,
+    transitionCount: 24,
+  });
+  const counters = replayWorkCounters();
+  const issues: IntegrityIssueCode[] = [];
+
+  await lifecycleIntegrityWithCounters(fixture.connection, counters)
+    .fullCheckAsync(fixture.context, { add(code) { issues.push(code); } });
+
+  assert.deepEqual(issues, []);
+  assert.deepEqual(counters, {
+    evidenceTransitionAdapterLookups: 24,
+    evidenceEntryCanonicalizations: 24,
+    checkpointEvidenceCaptures: 3,
+    checkpointEvidenceEntryMaterializations: 24,
+    endingBindingEvidenceRevisionLookups: 2,
+    endingBindingEvidenceAdapterInspections: 0,
   });
 });
 
