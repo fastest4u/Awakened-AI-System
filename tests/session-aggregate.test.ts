@@ -587,6 +587,27 @@ describe("SessionAggregate", () => {
         )));
       }
 
+      const generationTwo = evolveSession(ending, eventAfter(ending, "SessionEndAmended", {
+        workflowId: WORKFLOW_ID,
+        previousWorkflowGeneration: 1,
+        workflowGeneration: 2,
+      }));
+      assert.equal(generationTwo.endWorkflowGeneration, 2);
+      expectIntegrity(() => evolveSession(generationTwo, eventAfter(
+        generationTwo,
+        "SessionEndCancelled",
+        { workflowId: WORKFLOW_ID, workflowGeneration: 1, restoredState: "active" },
+      )));
+      expectIntegrity(() => evolveSession(generationTwo, eventAfter(
+        generationTwo,
+        "SessionAbandoned",
+        {
+          workflowId: WORKFLOW_ID,
+          workflowGeneration: 1,
+          authorityCommitment: AUTHORITY_B,
+        },
+      )));
+
       for (const state of [rootAggregate(), suspendedRoot()] as const) {
         const abandoned = evolveSession(state, eventAfter(state, "SessionAbandoned", {
           workflowId: null,

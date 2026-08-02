@@ -18,7 +18,10 @@ import type {
   HistoricalEvidenceIntegrityProviderPort,
   IntegrityIssueCode,
 } from "../src/orchestrator/integrity/integrity.types.js";
-import { LifecycleIntegrityService } from "../src/orchestrator/integrity/lifecycle-integrity.service.js";
+import {
+  LifecycleIntegrityService,
+  type LifecycleFullReplayWorkCounters,
+} from "../src/orchestrator/integrity/lifecycle-integrity.service.js";
 import {
   authorityCommitment,
   type CommittedAuthorityV1,
@@ -86,14 +89,7 @@ interface Fixture {
   readonly context: ProjectContext;
 }
 
-interface FullReplayWorkCounters {
-  evidenceTransitionAdapterLookups: number;
-  evidenceEntryCanonicalizations: number;
-  checkpointEvidenceCaptures: number;
-  checkpointEvidenceEntryMaterializations: number;
-  endingBindingEvidenceRevisionLookups: number;
-  endingBindingEvidenceAdapterInspections: number;
-}
+type FullReplayWorkCounters = LifecycleFullReplayWorkCounters;
 
 function replayWorkCounters(): FullReplayWorkCounters {
   return {
@@ -102,7 +98,6 @@ function replayWorkCounters(): FullReplayWorkCounters {
     checkpointEvidenceCaptures: 0,
     checkpointEvidenceEntryMaterializations: 0,
     endingBindingEvidenceRevisionLookups: 0,
-    endingBindingEvidenceAdapterInspections: 0,
   };
 }
 
@@ -6740,7 +6735,6 @@ it("full integrity advances each qualified coverage row exactly once", async () 
     checkpointEvidenceCaptures: 0,
     checkpointEvidenceEntryMaterializations: 0,
     endingBindingEvidenceRevisionLookups: 0,
-    endingBindingEvidenceAdapterInspections: 0,
   });
 
   const checkpointCountersFixture = createFixture();
@@ -6760,7 +6754,6 @@ it("full integrity advances each qualified coverage row exactly once", async () 
     checkpointEvidenceCaptures: 1,
     checkpointEvidenceEntryMaterializations: 1,
     endingBindingEvidenceRevisionLookups: 0,
-    endingBindingEvidenceAdapterInspections: 0,
   });
 
   const bindingCountersFixture = createFixture();
@@ -6779,7 +6772,6 @@ it("full integrity advances each qualified coverage row exactly once", async () 
     checkpointEvidenceCaptures: 2,
     checkpointEvidenceEntryMaterializations: 0,
     endingBindingEvidenceRevisionLookups: 1,
-    endingBindingEvidenceAdapterInspections: 0,
   });
 });
 
@@ -6803,7 +6795,6 @@ it("full integrity keeps ending-binding revision work additive with deep bound-c
     checkpointEvidenceCaptures: 3,
     checkpointEvidenceEntryMaterializations: 24,
     endingBindingEvidenceRevisionLookups: 2,
-    endingBindingEvidenceAdapterInspections: 0,
   });
 });
 

@@ -162,7 +162,6 @@ export interface LifecycleFullReplayWorkCounters {
   checkpointEvidenceCaptures: number;
   checkpointEvidenceEntryMaterializations: number;
   endingBindingEvidenceRevisionLookups: number;
-  endingBindingEvidenceAdapterInspections: number;
 }
 
 interface QualifiedTransitionReplayRow {
@@ -229,7 +228,12 @@ interface EvidenceReplayState {
   readonly canonicalEntryBytes: number;
 }
 
-interface EvidenceReplaySessionState {
+interface EvidenceReplayRevisionSummary {
+  readonly revisionEventPosition: bigint | null;
+  readonly adapterCount: number;
+}
+
+interface EvidenceReplaySessionState extends EvidenceReplayRevisionSummary {
   readonly adapters: Map<string, EvidenceReplayState>;
   adapterCount: number;
   totalIntervalCount: number;
@@ -2662,7 +2666,7 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
     checkpoints: ReadonlyMap<string, Checkpoint>,
     checkpointEvidenceRevisions: ReadonlyMap<string, CheckpointEvidenceRevision>,
     preIndexes: ReplayPreIndexes,
-    evidenceStates: ReadonlyMap<string, EvidenceReplaySessionState>,
+    evidenceStates: ReadonlyMap<string, EvidenceReplayRevisionSummary>,
   ): readonly FinalEndingScopeBindingV1[] {
     const base = BigInt(checkpoint.baseEventPosition);
     const bindings = checkpoint.childSummaries.map((summary) => {
@@ -2679,8 +2683,6 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
       const currentEvidenceRevision = currentEvidenceState?.revisionEventPosition ?? null;
       const currentEvidenceAdapterCount = currentEvidenceState?.adapterCount ?? 0;
       this.incrementReplayWork("endingBindingEvidenceRevisionLookups");
-      // Binding equivalence compares captured revision summaries only, so adapter-entry
-      // inspections remain zero instead of deepening with each bound checkpoint.
       if (
         childCheckpoint === null
           ? checkpointEvidenceRevision !== null
