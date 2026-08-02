@@ -2118,8 +2118,14 @@ also exposed that the adjacent append helper's undomained SHA-256 is not the
 production payload-hash algorithm. Import and use production `payloadHash` for
 only the two synthetic payload-hash bindings, use production `commandHash` for
 only the root-start dedup binding, and align only that event row's presenting
-client with its witness. Do not change the authority payload's creating client,
-`event_hash`, `hydrateReplayEvent`, migration behavior, or upgrade-test scope.
+client with its witness. After those fixture corrections expose the deliberate
+qualified-schema-3 authority endpoint corruption, align only the existing
+ordinary-worker regression assertion with Task 12J failure precedence: it must
+reject with exact `LifecycleError("INTEGRITY_FAILURE")` for that projection
+disagreement rather than expect the legacy `SESSION_AUTHORITY_FOLD_MISMATCH`
+sink issue. Do not change the authority payload's creating client, `event_hash`,
+`hydrateReplayEvent`, migration behavior, production failure handling, or any
+other upgrade-test scope.
 
 The honest complexity contract is:
 
@@ -2664,7 +2670,9 @@ stage it for Task 12J; run the existing suite unchanged in Step 9.
 `tests/project-store-upgrade.test.ts` is otherwise a regression consumer. Its
 only permitted Task 12J edits are the two production payload-hash bindings,
 the synthetic root event's presenting-client value, and that root command's
-production dedup command hash named by the amendment.
+production dedup command hash, plus the one existing ordinary-worker assertion
+that must expect exact `INTEGRITY_FAILURE` for qualified projection disagreement,
+as named by the amendment.
 
 - [ ] **Step 10: Stage exactly the permitted Task 12J scope and commit**
 
