@@ -128,7 +128,7 @@ The required anchor test titles and initial behavioral failures are:
 | `tests/evidence-coverage.test.ts` | Accumulator, provider, interval, overlap, transaction-order, snapshot, and capacity behavior. |
 | `tests/event-integrity.test.ts` | One deferred async integrity transaction, exactly-once extension dispatch, rollback, and synchronous qualified-coverage fail-closed behavior. |
 | `tests/integrity-provider-broker.test.ts` | Strict provider IPC correlation, backend ownership, transfer limits, failure mapping, and zeroization. |
-| `tests/qualified-checkpoint-quick-integrity.test.ts` | Bounded aggregate/transition/index, capacity, and frozen event-time checks with no ordinal scan. |
+| `tests/qualified-checkpoint-quick-integrity.test.ts` | Bounded qualified-schema endpoint/status/capacity/no-write checks with no historical or ordinal scan, plus unchanged legacy/pre-qualified regression coverage. |
 | `tests/qualified-checkpoint-full-integrity.test.ts` | One-pass authenticated replay, historical snapshots, provider counts, failure mapping, and no repair. |
 | Existing checkpoint, command-store, child, upgrade, migration, and integrity tests | Cross-service integration and regression coverage. |
 
@@ -2055,6 +2055,7 @@ against the corrected HEAD.
 
 **Files:**
 - Create: `tests/qualified-checkpoint-full-integrity.test.ts`
+- Modify: `tests/qualified-checkpoint-quick-integrity.test.ts`
 - Modify: `src/orchestrator/storage/migrations/0003-qualified-checkpoint-coverage.ts`
 - Modify: `src/orchestrator/lifecycle/lifecycle-projection-folds.ts`
 - Modify: `src/orchestrator/storage/lifecycle-projection.repository.ts`
@@ -2087,6 +2088,22 @@ against the corrected HEAD.
 - Produces: exact typed historical-key, authenticated-mismatch, and structural
   failures; schema-2 per-workflow compatibility collapse; exact visit/provider
   counters; and no DML or repair behavior.
+
+**Task 12J fix-round-2 test-scope amendment:** This amendment supersedes only
+the Task 12I schema-3 historical-quick expectations. For a qualified schema-3
+project, quick integrity is endpoint-only: it must not reconstruct or validate
+historical checkpoint, frozen-binding, evidence-at-transition, or event-time
+scope state. Legacy/pre-qualified quick behavior remains unchanged, and full
+integrity remains the sole schema-3 historical replay owner.
+
+Update `tests/qualified-checkpoint-quick-integrity.test.ts` accordingly: remove
+stale schema-3 assertions and query/count expectations whose only purpose is
+historical reconstruction, or move their semantic proof to
+`tests/qualified-checkpoint-full-integrity.test.ts`. Preserve qualified quick
+coverage for endpoint shape, current-key status, prospective capacity,
+no-write behavior, and bounded/no-historical-query execution. Retain or add a
+schema-2 legacy regression proving that this narrow schema-3 boundary does not
+change legacy/pre-qualified behavior.
 
 The honest complexity contract is:
 
@@ -2630,7 +2647,7 @@ stage it for Task 12J; run the existing suite unchanged in Step 9.
 - [ ] **Step 10: Stage exactly the permitted Task 12J scope and commit**
 
 ```powershell
-git add -- src/orchestrator/storage/migrations/0003-qualified-checkpoint-coverage.ts src/orchestrator/lifecycle/lifecycle-projection-folds.ts src/orchestrator/storage/lifecycle-projection.repository.ts src/orchestrator/integrity/lifecycle-integrity.service.ts src/orchestrator/integrity/event-integrity.service.ts tests/support/lifecycle-projection-reference.ts tests/support/lifecycle-authority-reference.ts tests/qualified-checkpoint-full-integrity.test.ts tests/qualified-checkpoint-migration.test.ts tests/lifecycle-projection-folds.test.ts tests/event-integrity.test.ts tests/evidence-coverage.test.ts tests/checkpoint.service.test.ts
+git add -- src/orchestrator/storage/migrations/0003-qualified-checkpoint-coverage.ts src/orchestrator/lifecycle/lifecycle-projection-folds.ts src/orchestrator/storage/lifecycle-projection.repository.ts src/orchestrator/integrity/lifecycle-integrity.service.ts src/orchestrator/integrity/event-integrity.service.ts tests/support/lifecycle-projection-reference.ts tests/support/lifecycle-authority-reference.ts tests/qualified-checkpoint-full-integrity.test.ts tests/qualified-checkpoint-quick-integrity.test.ts tests/qualified-checkpoint-migration.test.ts tests/lifecycle-projection-folds.test.ts tests/event-integrity.test.ts tests/evidence-coverage.test.ts tests/checkpoint.service.test.ts
 $staged = @(git diff --cached --name-only)
 $allowed = @(
   'src/orchestrator/storage/migrations/0003-qualified-checkpoint-coverage.ts',
@@ -2641,6 +2658,7 @@ $allowed = @(
   'tests/support/lifecycle-projection-reference.ts',
   'tests/support/lifecycle-authority-reference.ts',
   'tests/qualified-checkpoint-full-integrity.test.ts',
+  'tests/qualified-checkpoint-quick-integrity.test.ts',
   'tests/qualified-checkpoint-migration.test.ts',
   'tests/lifecycle-projection-folds.test.ts',
   'tests/event-integrity.test.ts',
