@@ -2111,11 +2111,15 @@ change legacy/pre-qualified behavior.
 **Task 12J fix-round-3 upgrade-fixture scope amendment:** Qualified full replay
 now hydrates the synthetic lifecycle rows used by the post-upgrade integrity
 regressions in `tests/project-store-upgrade.test.ts`. The initial root helper
-used a placeholder `payload_hash`; a first focused correction exposed that the
-adjacent append helper's undomained SHA-256 is also not the production payload
-hash algorithm. Import and use the production `payloadHash` helper for only
-those two synthetic payload-hash bindings. Do not change `event_hash`, weaken
-`hydrateReplayEvent`, alter migration behavior, or broaden the upgrade test.
+used a placeholder `payload_hash`, an event presenting-client value that did
+not match its strict lifecycle-intent witness, and a whole-intent hash where
+the dedup row requires the production command hash. A first focused correction
+also exposed that the adjacent append helper's undomained SHA-256 is not the
+production payload-hash algorithm. Import and use production `payloadHash` for
+only the two synthetic payload-hash bindings, use production `commandHash` for
+only the root-start dedup binding, and align only that event row's presenting
+client with its witness. Do not change the authority payload's creating client,
+`event_hash`, `hydrateReplayEvent`, migration behavior, or upgrade-test scope.
 
 The honest complexity contract is:
 
@@ -2658,9 +2662,9 @@ witnesses, and workflow generations after the classifier move. Do not edit or
 stage it for Task 12J; run the existing suite unchanged in Step 9.
 
 `tests/project-store-upgrade.test.ts` is otherwise a regression consumer. Its
-only permitted Task 12J edit is importing the production payload-hash helper
-and replacing the strict-invalid placeholder/undomained payload-hash bindings
-in the two synthetic lifecycle-event helpers named by the amendment.
+only permitted Task 12J edits are the two production payload-hash bindings,
+the synthetic root event's presenting-client value, and that root command's
+production dedup command hash named by the amendment.
 
 - [ ] **Step 10: Stage exactly the permitted Task 12J scope and commit**
 
