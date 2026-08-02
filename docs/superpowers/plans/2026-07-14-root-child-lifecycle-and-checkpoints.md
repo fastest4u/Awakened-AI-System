@@ -144,7 +144,8 @@ The mandatory Task 13-16 behavioral anchors are:
 | `src/orchestrator/compatibility/lifecycle-v2-disabled.adapter.ts` / `src/orchestrator/compatibility/lifecycle-v2-shadow.mapper.ts` | Disabled byte-preserving pass-through and pure bounded nonmutating shadow comparison. |
 | `src/orchestrator/lifecycle/lifecycle-faults.ts` | Default-noop boundary-specific fault injection contract used only by explicit process fixtures. |
 | `src/orchestrator/runtime/lifecycle-worker-protocol.ts` | Strict lifecycle wire DTOs/codecs kept separate from domain and bearer types. |
-| `src/orchestrator/runtime/lifecycle-worker-runtime.factory.ts` | Bind one lifecycle runtime to the already-open ActiveStore connection; open no second SQLite handle. |
+| `src/orchestrator/runtime/lifecycle-worker-runtime.ts` | Own the exhaustive connection-bound lifecycle operation router/table; Tasks 14-16 replace its explicit unavailable bindings one operation at a time. |
+| `src/orchestrator/runtime/lifecycle-worker-runtime.factory.ts` | Bind one lifecycle runtime to the already-open ActiveStore connection and construct its connection-owned services; open no second SQLite handle. |
 | `src/orchestrator/runtime/worker-protocol.ts` | Strict internal integrity-provider broker codecs plus discriminated lifecycle request/response variants and dispatch to the focused codec. |
 | `src/orchestrator/runtime/project-store-worker-backend.ts` | Own optional provider-backed integrity brokering, then create/store/dispose lifecycle runtime from the same optional provider and factory; otherwise fail closed as disabled. |
 | `src/orchestrator/runtime/project-store-executor.ts` | Typed semantic, bounded, read, and internal fenced-operation methods; mutation-unknown poisoning, descriptor handoff, and no auto-generated retry identity. |
@@ -2171,156 +2172,148 @@ Do not begin Task 13 until all ten commits pass the Task 12 completion gate and 
 
 ### Task 13: Add Strict Lifecycle Worker and Executor Operations
 
+**Prerequisite:** Do not begin this task until Task 12A-12J are separately
+committed and reviewed and the Task 12 clean-worktree exit gate passes at one
+commit. Task 13 consumes the Task 12 contracts and store-owned projection hook;
+it does not reopen them.
+
 **Files:**
 - Create: `src/orchestrator/runtime/lifecycle-worker-protocol.ts`
+- Create: `src/orchestrator/runtime/lifecycle-worker-runtime.ts`
 - Create: `src/orchestrator/runtime/lifecycle-worker-runtime.factory.ts`
 - Create: `tests/lifecycle-worker-protocol.test.ts`
+- Create: `tests/lifecycle-worker-runtime.test.ts`
 - Create: `tests/lifecycle-executor.test.ts`
 - Modify: `src/orchestrator/runtime/worker-protocol.ts`
 - Modify: `src/orchestrator/runtime/project-store-executor.ts`
 - Modify: `src/orchestrator/runtime/project-store-worker-backend.ts`
-- Modify: `src/orchestrator/runtime/project-store-worker-runtime.ts`
-- Modify: `src/workers/project-store.worker.ts`
 - Modify: `src/orchestrator/lifecycle/contracts/commands.ts`
+- Modify: `src/orchestrator/lifecycle/errors.ts`
 - Modify: `src/orchestrator/lifecycle/lifecycle-operational.store.ts`
-- Modify: `src/orchestrator/lifecycle/authority/authority-material-adapter.ts`
-- Modify: `src/orchestrator/lifecycle/child-workflow.service.ts`
 - Modify: `tests/lifecycle-contracts.test.ts`
-- Modify: `tests/lifecycle-operational.store.test.ts`
+- Modify: `tests/lifecycle-operational-store.test.ts`
 - Modify: `tests/project-store-executor.test.ts`
+- Regression only, do not edit unless a failing assertion exposes a real
+  boundary defect: `tests/authority-material-adapter.test.ts`,
+  `tests/lifecycle-command-store.test.ts`,
+  `tests/lifecycle-command-processor.test.ts`, `tests/child-workflow.test.ts`,
+  `tests/checkpoint.service.test.ts`, `tests/evidence-coverage.test.ts`, and
+  `tests/event-append-transaction.test.ts`.
 
-**Interfaces:**
-- The existing protocol adds one tagged request `{ type: "lifecycle", operation }`; strict nested discriminators live in the focused lifecycle codec so success decoding is never structural guesswork.
-- Existing executor request kind `"lifecycle"` is renamed `"control"`; open/quiesce/close are control. External and internal event-appending lifecycle commands are `"mutation"` and carry their original command/idempotency identity. Bounded operations use `"bounded"`; queries use `"read"`; deterministic workflow claim/renew/release/eventless-phase/recovery and outbox work uses a separate internal `"operational"` kind and never semantic dedup.
-- `ProjectStoreWorkerBackend` dispatches lifecycle only when an injected `LifecycleWorkerRuntimeFactory` exists. During worker open, the factory binds exactly one runtime, one semantic `LifecycleCommandStore`, and one nonsemantic `LifecycleOperationalStore` to the already-open `ActiveStore` connection and its maintenance fence/provider/clock/facades; production composition injects no factory and returns `LIFECYCLE_V2_DISABLED`.
-- The codec carries strict nested-version unions for root suspension, checkpoint recording, end request, end amendment, checkpoint results, and safe evidence-window status. Dispatch reads the nested discriminator once; candidate/authoritative intent, worker result tags, and deterministic internal work identity bind that version.
+The correct operational-store test path is
+`tests/lifecycle-operational-store.test.ts` (hyphens, not a dot). Task 13 must
+not edit or own
+`src/orchestrator/storage/migrations/0003-qualified-checkpoint-coverage.ts`,
+`src/orchestrator/storage/qualified-checkpoint-migration-preflight.ts`,
+`src/orchestrator/lifecycle/lifecycle-projection-folds.ts`,
+`src/orchestrator/storage/lifecycle-projection.repository.ts`,
+`src/orchestrator/lifecycle/lifecycle-command.store.ts`, or
+`src/orchestrator/integrity/lifecycle-integrity.service.ts`. In particular, no
+worker callback writes a projection. The factory only constructs Task 12's
+existing `SqliteLifecycleProjectionRepository` as the explicit
+`LifecycleCommandStore.projectionWriter` over the already-open connection.
+
+**Interfaces and ownership:**
+
+- `worker-protocol.ts` adds the outer request
+  `{ id, type: "lifecycle", binding, operation }` and delegates only the
+  operation/result body to `lifecycle-worker-protocol.ts`. The focused lifecycle
+  codec is the sole owner of lifecycle operation/result mappings, nested-version
+  correlation, and the canonical wire-size guard.
+- Lifecycle bounded/query/fenced wire DTOs never carry `ProjectContext`. The
+  bounded authorization wire also omits `audience`. Exact decoders reject nested
+  `context`, `binding`, `audience`, actor/client, path, provider, and all unknown
+  fields. After `ProjectStoreWorkerBackend.requireActive(binding)` succeeds, the
+  connection-bound runtime injects `ActiveStore.context` exactly once and derives
+  the bounded audience from that context. The public executor accepts the same
+  exported context-free aliases, so no caller context is silently discarded.
+- For every semantic wire, first strict-decode the command and authorization as
+  separate fresh snapshots, then call the existing
+  `assertSemanticCommandAuthorization(command, authorization)` before freezing
+  and returning the prepared wire. This happens before runtime routing and thus
+  before the reserved-operation gate too. It preserves the fork-only
+  proof/child-binding-grant correlation even for unavailable semantic commands;
+  executable services keep their existing guard calls as defense in depth.
+  The wire guard owns exact shape and command/session correlation; the existing
+  connection-bound service/capability path still owns cryptographic validity and
+  proves that the presented proof is for the current root authority.
+  Decoder and outer protocol errors expose only the safe lifecycle code/message
+  and never echo the command, proof, signed grant, or malformed input.
+- `LifecycleWorkerRuntimeFactory.create` receives only active-store-owned
+  resources: the exact open `SqliteConnection`, exact `MaintenanceFence`, and
+  exact optional Task 12H `CapabilityKeyProvider`. Clock, UUID/nonce source,
+  source-state ports, integrity port, child-binding resolver, repository
+  constructors, and the sole transaction-facade builder are required constructor
+  dependencies of the factory. The backend owns none of them and supplies no
+  hidden default.
+- The concrete factory constructs one capability service, exactly five current
+  Task 1-12 state repositories (authority, lease, approval, transfer, coverage),
+  exactly one Task 12 projection writer, one event append port, exactly one
+  semantic `LifecycleCommandStore`, exactly one nonsemantic
+  `LifecycleOperationalStore`, and the current root/child/checkpoint/evidence/
+  query services over the same connection. It opens no SQLite handle. Runtime
+  disposal happens before backend connection close; the stores have no invented
+  `dispose()` API and become unreachable with the disposed runtime.
+- The parent executor optionally receives one exact
+  `AuthorityMaterialAdapter` in its constructor dependencies. It never creates an
+  adapter and no lifecycle call accepts a per-call adapter. Existing nonlifecycle
+  executors remain valid without one. Missing adapter disables only external
+  `executeLifecycleMutation`, locally before `request()`/`postMessage`; it does
+  not disable internal semantic, bounded, query, or fenced methods.
+- Backend `LIFECYCLE_V2_DISABLED` has one independent owner: after
+  `requireActive(binding)`, the exact factory, provider, or active worker runtime
+  is absent. The backend never receives, observes, or branches on a parent
+  `AuthorityMaterialAdapter`. The adapterless parent failure may use the same
+  safe code for the one external mutation API, but is not evidence that the
+  backend runtime is absent.
+
+  `LIFECYCLE_OPERATION_UNAVAILABLE` means a valid operation reached an enabled
+  runtime but Task 13 deliberately has no handler yet. Add the latter to
+  `LIFECYCLE_ERROR_CODES` with fixed message
+  `"The lifecycle operation is not available in this runtime"`,
+  `retryable: false`, and existing recovery action `"upgrade-runtime"`.
+- The exact reserved set in Task 13 is:
+  `create-child-transfer`, `request-session-end`, `amend-session-end`,
+  `cancel-session-end`, `abandon-session`, `internal-validation-result`,
+  `internal-workflow-phase`, `workflow-claim-next`, `workflow-claim`,
+  `workflow-renew`, `workflow-release`, `workflow-eventless-phase`,
+  `workflow-recovery`, `outbox-claim-next`, `outbox-claim`, `outbox-renew`,
+  `outbox-materialize`, and `outbox-failure`. The runtime rejects every member of
+  this set before invoking either store or any repository. Tasks 14-16 replace
+  these explicit unavailable bindings one operation at a time.
+- `create-child-transfer` remains in `LifecycleSemanticCommandDraft` and its
+  strict codec, but stays out of the private `ChildCommand` union and
+  `ChildWorkflowService.execute` switch. Do not widen that service and do not
+  define source state, event count, ticket contents, replay, or result semantics
+  in Task 13.
+- `outbox-materialize` carries only its stable outbox claim/fence identity.
+  Remove caller-supplied `expectedCurrentFingerprint`, `nextFingerprint`,
+  `materializedBytes`, and `acknowledgement` from both its domain member and wire.
+  Task 16's worker-owned materializer reads the claimed row, renders bytes,
+  computes/rechecks fingerprints, replaces/fsyncs, and acknowledges internally.
+  Consequently no typed array exists anywhere in the lifecycle wire and no
+  transfer-list API or binary-size policy is added in Task 13.
 
 ```ts
-export interface LifecycleWorkerRequest {
-  id: string;
-  type: "lifecycle";
-  binding: WorkerBindingAssertion;
-  operation: LifecycleWorkerOperationWire;
-}
+// lifecycle-worker-protocol.ts
+export const MAX_LIFECYCLE_WIRE_CANONICAL_BYTES = 4 * 1024 * 1024;
 
-export interface LifecycleWorkerSuccessWire {
-  operation: LifecycleWorkerOperationName;
-  nestedContractVersion: 1 | 2 | null;
-  result: JsonValue;
-}
+export function assertLifecycleWireCanonicalSize(value: unknown): void;
 
-export function lifecycleNestedContractVersion(
-  operation: LifecycleWorkerOperation,
-): 1 | 2 | null;
+export type BoundedOperationAuthorizationWire = Omit<
+  BoundedOperationAuthorization,
+  "audience"
+>;
 
-export interface LifecycleWorkerRuntime {
-  execute(operation: LifecycleWorkerOperation, context: ProjectContext): Promise<LifecycleWorkerSuccessWire>;
-  dispose(): void;
-}
+type ContextFreeBoundedOperation<O extends BoundedLifecycleOperation> =
+  O extends BoundedLifecycleOperation
+    ? Omit<O, "context" | "authorization"> & {
+        readonly authorization: BoundedOperationAuthorizationWire;
+      }
+    : never;
 
-export interface LifecycleWorkerRuntimeFactory {
-  create(input: {
-    connection: SqliteConnection;
-    maintenanceFence: MaintenanceFence;
-    keyProvider: CapabilityKeyProvider;
-    clock: Clock;
-    transactionFacadeFactory: LifecycleTransactionFacadeFactory;
-  }): LifecycleWorkerRuntime;
-}
-
-export interface LifecycleTransactionFacadeFactory {
-  readonly command: LifecycleCommandStoreOptions["transaction"];
-  readonly operational: LifecycleOperationalStoreOptions["transaction"];
-}
-
-// These two selection operations establish a fence. Unlike the existing
-// target-bound LifecycleFencedOperation members, they intentionally carry no
-// workflow/target/generation/revision/token that does not exist until claim.
-export interface WorkflowClaimNextOperation {
-  readonly operation: "workflow-claim-next";
-  readonly context: ProjectContext;
-  readonly workId: string;
-  readonly ownerId: string;
-  readonly observedNowMs: string;
-  readonly ttlMs: string;
-}
-
-export interface OutboxClaimNextOperation {
-  readonly operation: "outbox-claim-next";
-  readonly context: ProjectContext;
-  readonly workId: string;
-  readonly ownerId: string;
-  readonly observedNowMs: string;
-  readonly ttlMs: string;
-}
-
-export type LifecycleClaimNextOperation =
-  | WorkflowClaimNextOperation
-  | OutboxClaimNextOperation;
-
-// commands.ts keeps every existing target-bound member byte-for-byte in this
-// union and prepends the two explicit selection members.
-export type LifecycleFencedOperation =
-  | LifecycleClaimNextOperation
-  | (WorkflowFencedIdentity & { readonly operation: "workflow-claim"; readonly leaseUntil: string })
-  | (WorkflowFencedIdentity & { readonly operation: "workflow-renew"; readonly leaseUntil: string })
-  | (WorkflowFencedIdentity & { readonly operation: "workflow-release" })
-  | (WorkflowFencedIdentity & {
-      readonly operation: "workflow-eventless-phase";
-      readonly expectedPhase: string;
-      readonly nextPhase: string;
-    })
-  | (LifecycleFencedOperationBase & {
-      readonly operation: "workflow-recovery";
-      readonly dueBefore: string;
-      readonly limit: number;
-    })
-  | (OutboxFencedIdentity & { readonly operation: "outbox-claim"; readonly leaseUntil: string })
-  | (OutboxFencedIdentity & { readonly operation: "outbox-renew"; readonly leaseUntil: string })
-  | (OutboxFencedIdentity & {
-      readonly operation: "outbox-materialize";
-      readonly expectedCurrentFingerprint: string | null;
-      readonly nextFingerprint: string;
-      readonly materializedBytes: Uint8Array;
-      readonly acknowledgement: {
-        readonly ownerId: string;
-        readonly fencingToken: string;
-        readonly materializationRevision: string;
-        readonly nextFingerprint: string;
-      };
-    })
-  | (OutboxFencedIdentity & {
-      readonly operation: "outbox-failure";
-      readonly retryable: boolean;
-      readonly safeErrorCode: string;
-      readonly attempt: number;
-      readonly nextAttemptAt: string | null;
-    });
-
-export interface WorkflowClaimNextWorkIdentity {
-  readonly kind: "workflow-selection";
-  readonly projectId: ProjectId;
-  readonly workId: string;
-  readonly operation: "claim-next";
-  readonly ownerId: string;
-}
-
-export interface OutboxClaimNextWorkIdentity {
-  readonly kind: "outbox-selection";
-  readonly projectId: ProjectId;
-  readonly workId: string;
-  readonly operation: "claim-next";
-  readonly ownerId: string;
-}
-
-export type LifecycleOperationalWorkIdentity =
-  | WorkflowOperationalWorkIdentity
-  | OutboxOperationalWorkIdentity
-  | WorkflowClaimNextWorkIdentity
-  | OutboxClaimNextWorkIdentity;
-
-// lifecycle-operational.store.ts maps each selection identity to its matching
-// repository transaction in LifecycleOperationalTransactionFor<TWork>.
+type ContextFreeFencedOperation<O extends LifecycleFencedOperation> =
+  O extends LifecycleFencedOperation ? Omit<O, "context"> : never;
 
 type GroupedLifecycleQuery = Extract<
   BoundedLifecycleOperation,
@@ -2332,18 +2325,95 @@ type GroupedLifecycleQuery = Extract<
   }
 >;
 
-export type LifecycleQueryOperationName =
-  GroupedLifecycleQuery["operation"];
-
 export type LifecycleQuery = {
-  readonly [K in LifecycleQueryOperationName]:
+  readonly [K in GroupedLifecycleQuery["operation"]]:
     Omit<GroupedLifecycleQuery, "operation"> & { readonly operation: K };
-}[LifecycleQueryOperationName];
+}[GroupedLifecycleQuery["operation"]];
 
 export type LifecycleBoundedMutation = Extract<
   BoundedLifecycleOperation,
   { readonly operation: "renew-root-lease" }
 >;
+
+export type LifecycleBoundedMutationInput<
+  O extends LifecycleBoundedMutation = LifecycleBoundedMutation,
+> = O extends LifecycleBoundedMutation ? ContextFreeBoundedOperation<O> : never;
+
+export type LifecycleQueryInput<
+  Q extends LifecycleQuery = LifecycleQuery,
+> = Q extends LifecycleQuery ? ContextFreeBoundedOperation<Q> : never;
+
+export type LifecycleFencedInput<
+  O extends LifecycleFencedOperation = LifecycleFencedOperation,
+> = O extends LifecycleFencedOperation ? ContextFreeFencedOperation<O> : never;
+
+export type LifecycleBoundedMutationForInput<
+  I extends LifecycleBoundedMutationInput,
+> = Extract<
+  LifecycleBoundedMutation,
+  { readonly operation: I["operation"] }
+>;
+
+export type LifecycleQueryForInput<
+  I extends LifecycleQueryInput,
+> = Extract<
+  LifecycleQuery,
+  { readonly operation: I["operation"] }
+>;
+
+export type LifecycleFencedOperationForInput<
+  I extends LifecycleFencedInput,
+> = Extract<
+  LifecycleFencedOperation,
+  { readonly operation: I["operation"] }
+>;
+
+export type LifecycleSemanticOperationWire<
+  C extends LifecycleSemanticCommandDraft = LifecycleSemanticCommandDraft,
+> = C extends LifecycleSemanticCommandDraft ? {
+  readonly kind: "semantic";
+  readonly operation: C["commandType"];
+  readonly prepared: PreparedLifecycleWorkerCommand<C>;
+} : never;
+
+export type LifecycleInternalOperationWire<
+  I extends InternalWorkflowExecutionPlan = InternalWorkflowExecutionPlan,
+> = I extends InternalWorkflowExecutionPlan ? {
+  readonly kind: "internal-semantic";
+  readonly operation: I["commandType"];
+  readonly command: I;
+} : never;
+
+export type LifecycleBoundedOperationWire<
+  O extends LifecycleBoundedMutation = LifecycleBoundedMutation,
+> = O extends LifecycleBoundedMutation ? {
+  readonly kind: "bounded";
+  readonly operation: O["operation"];
+  readonly input: LifecycleBoundedMutationInput<O>;
+} : never;
+
+export type LifecycleQueryOperationWire<
+  Q extends LifecycleQuery = LifecycleQuery,
+> = Q extends LifecycleQuery ? {
+  readonly kind: "query";
+  readonly operation: Q["operation"];
+  readonly input: LifecycleQueryInput<Q>;
+} : never;
+
+export type LifecycleFencedOperationWire<
+  O extends LifecycleFencedOperation = LifecycleFencedOperation,
+> = O extends LifecycleFencedOperation ? {
+  readonly kind: "fenced";
+  readonly operation: O["operation"];
+  readonly input: LifecycleFencedInput<O>;
+} : never;
+
+export type LifecycleWorkerOperationWire =
+  | LifecycleSemanticOperationWire
+  | LifecycleInternalOperationWire
+  | LifecycleBoundedOperationWire
+  | LifecycleQueryOperationWire
+  | LifecycleFencedOperationWire;
 
 export type LifecycleWorkerOperation =
   | PreparedLifecycleWorkerCommand<LifecycleSemanticCommandDraft>
@@ -2358,53 +2428,6 @@ export type LifecycleWorkerOperationName =
   | BoundedLifecycleOperation["operation"]
   | LifecycleFencedOperation["operation"];
 
-export type LifecycleSemanticOperationWire<
-  C extends LifecycleSemanticCommandDraft = LifecycleSemanticCommandDraft,
-> = C extends LifecycleSemanticCommandDraft ? {
-  readonly kind: "semantic";
-  readonly operation: C["commandType"];
-  readonly prepared: PreparedLifecycleWorkerCommand<C>;
-} : never;
-
-export type LifecycleInternalOperationWire<
-  C extends InternalWorkflowExecutionPlan = InternalWorkflowExecutionPlan,
-> = C extends InternalWorkflowExecutionPlan ? {
-  readonly kind: "internal-semantic";
-  readonly operation: C["commandType"];
-  readonly command: C;
-} : never;
-
-export type LifecycleBoundedOperationWire<
-  O extends LifecycleBoundedMutation = LifecycleBoundedMutation,
-> = O extends LifecycleBoundedMutation ? {
-  readonly kind: "bounded";
-  readonly operation: O["operation"];
-  readonly input: O;
-} : never;
-
-export type LifecycleQueryOperationWire<
-  Q extends LifecycleQuery = LifecycleQuery,
-> = Q extends LifecycleQuery ? {
-  readonly kind: "query";
-  readonly operation: Q["operation"];
-  readonly input: Q;
-} : never;
-
-export type LifecycleFencedOperationWire<
-  O extends LifecycleFencedOperation = LifecycleFencedOperation,
-> = O extends LifecycleFencedOperation ? {
-  readonly kind: "fenced";
-  readonly operation: O["operation"];
-  readonly input: O;
-} : never;
-
-export type LifecycleWorkerOperationWire =
-  | LifecycleSemanticOperationWire
-  | LifecycleInternalOperationWire
-  | LifecycleBoundedOperationWire
-  | LifecycleQueryOperationWire
-  | LifecycleFencedOperationWire;
-
 type RootSemanticCommand = Extract<
   LifecycleSemanticCommandDraft,
   {
@@ -2416,7 +2439,7 @@ type RootSemanticCommand = Extract<
   }
 >;
 
-type ChildSemanticCommand = Extract<
+type ExecutableChildSemanticCommand = Extract<
   LifecycleSemanticCommandDraft,
   {
     readonly commandType:
@@ -2427,19 +2450,10 @@ type ChildSemanticCommand = Extract<
       | "propose-child-completion"
       | "complete-child-session"
       | "suspend-child-session"
-      | "create-child-transfer"
       | "claim-child-transfer";
   }
 >;
 
-type CheckpointSemanticCommand = Extract<
-  LifecycleSemanticCommandDraft,
-  { readonly commandType: "record-checkpoint" }
->;
-type EvidenceSemanticCommand = Extract<
-  LifecycleSemanticCommandDraft,
-  { readonly commandType: "record-evidence-batch" }
->;
 type SessionEndSemanticCommand = Extract<
   LifecycleSemanticCommandDraft,
   {
@@ -2453,34 +2467,56 @@ type SessionEndSemanticCommand = Extract<
 
 export type LifecycleResultFor<C extends LifecycleSemanticCommandDraft> =
   C extends RootSemanticCommand ? RootSessionPublicResultV2
-  : C extends ChildSemanticCommand ? ChildWorkflowResultV2
-  : C extends CheckpointSemanticCommand ? CheckpointRecordedResult
-  : C extends EvidenceSemanticCommand ? EvidenceCoverageRecordedResultV2
+  : C extends ExecutableChildSemanticCommand ? ChildWorkflowResultV2
+  : C extends Extract<LifecycleSemanticCommandDraft, { readonly commandType: "record-checkpoint" }>
+    ? CheckpointRecordedResult
+  : C extends Extract<LifecycleSemanticCommandDraft, { readonly commandType: "record-evidence-batch" }>
+    ? EvidenceCoverageRecordedResultV2
   : C extends SessionEndSemanticCommand ? SessionEndStatusV2
+  : never; // create-child-transfer is deliberately codec-visible but unavailable.
+
+export type LifecycleInternalResultFor<I extends InternalWorkflowExecutionPlan> =
+  I extends InternalValidationResultCommand ? ValidationResultRecordedResultV1
+  : I extends InternalWorkflowPhasePlan ? SessionEndPhaseResultV2
   : never;
 
-export type LifecycleInternalResultFor<
-  C extends InternalWorkflowExecutionPlan,
-> = C extends InternalValidationResultCommand
-  ? ValidationResultRecordedResultV1
-  : C extends InternalWorkflowPhasePlan
-    ? SessionEndPhaseResultV2
-    : never;
-
 export type LifecycleBoundedResultFor<O extends LifecycleBoundedMutation> =
-  O extends Extract<
-    LifecycleBoundedMutation,
-    { readonly operation: "renew-root-lease" }
-  > ? RootLeaseRenewalResultV1 : never;
+  O extends Extract<LifecycleBoundedMutation, { readonly operation: "renew-root-lease" }>
+    ? RootLeaseRenewalResultV1
+    : never;
 
 export type LifecycleQueryResultFor<Q extends LifecycleQuery> =
   Q extends Extract<LifecycleQuery, { readonly operation: "read-session-tree" }>
     ? SessionTreeSummaryV1
-    : Q extends Extract<LifecycleQuery, { readonly operation: "read-session-status" }>
-      ? SessionStatusSummaryV1
-      : Q extends Extract<LifecycleQuery, { readonly operation: "read-session-association" }>
-        ? SessionAssociationValidationV1
-        : never;
+  : Q extends Extract<LifecycleQuery, { readonly operation: "read-session-status" }>
+    ? SessionStatusSummaryV1
+  : Q extends Extract<LifecycleQuery, { readonly operation: "read-session-association" }>
+    ? SessionAssociationValidationV1
+  : never;
+
+export type CheckpointWire = Extract<
+  LifecycleSemanticOperationWire,
+  { readonly operation: "record-checkpoint" }
+>;
+
+export type RootSuspendWire = Extract<
+  LifecycleSemanticOperationWire,
+  { readonly operation: "root-suspend" }
+>;
+
+export type SessionEndRequestWire = Extract<
+  LifecycleSemanticOperationWire,
+  { readonly operation: "request-session-end" }
+>;
+
+export type SessionEndAmendWire = Extract<
+  LifecycleSemanticOperationWire,
+  { readonly operation: "amend-session-end" }
+>;
+
+export type CheckpointResultWire =
+  | CheckpointRecordedResultV1
+  | CheckpointRecordedResultV2;
 
 export type SessionEndWorkflowClaimWireV1 = JsonValue & {
   readonly resultVersion: 1;
@@ -2545,183 +2581,837 @@ export type MaterializationResultWireV1 = JsonValue & {
 export type LifecycleFencedResultFor<O extends LifecycleFencedOperation> =
   O extends Extract<LifecycleFencedOperation, { readonly operation: "workflow-claim-next" }>
     ? SessionEndWorkflowClaimWireV1 | null
-    : O extends Extract<LifecycleFencedOperation, { readonly operation: "workflow-claim" }>
-      ? SessionEndWorkflowClaimWireV1 | null
-      : O extends Extract<LifecycleFencedOperation, { readonly operation: "workflow-renew" }>
-        ? SessionEndWorkflowClaimWireV1
-        : O extends Extract<LifecycleFencedOperation, { readonly operation: "workflow-release" }>
-          ? boolean
-          : O extends Extract<LifecycleFencedOperation, { readonly operation: "workflow-eventless-phase" }>
-            ? SessionEndPhaseResultV2
-            : O extends Extract<LifecycleFencedOperation, { readonly operation: "workflow-recovery" }>
-              ? LifecycleRecoveryScanResultWireV1
-              : O extends Extract<LifecycleFencedOperation, { readonly operation: "outbox-claim-next" }>
-                ? LifecycleOutboxClaimWireV1 | null
-                : O extends Extract<LifecycleFencedOperation, { readonly operation: "outbox-claim" }>
-                  ? LifecycleOutboxClaimWireV1 | null
-                  : O extends Extract<LifecycleFencedOperation, { readonly operation: "outbox-renew" }>
-                    ? LifecycleOutboxClaimWireV1
-                    : O extends Extract<LifecycleFencedOperation, { readonly operation: "outbox-materialize" }>
-                      ? MaterializationResultWireV1
-                      : O extends Extract<LifecycleFencedOperation, { readonly operation: "outbox-failure" }>
-                        ? boolean
-                        : never;
+  : O extends Extract<LifecycleFencedOperation, { readonly operation: "workflow-claim" }>
+    ? SessionEndWorkflowClaimWireV1 | null
+  : O extends Extract<LifecycleFencedOperation, { readonly operation: "workflow-renew" }>
+    ? SessionEndWorkflowClaimWireV1
+  : O extends Extract<LifecycleFencedOperation, { readonly operation: "workflow-release" }>
+    ? boolean
+  : O extends Extract<LifecycleFencedOperation, { readonly operation: "workflow-eventless-phase" }>
+    ? SessionEndPhaseResultV2
+  : O extends Extract<LifecycleFencedOperation, { readonly operation: "workflow-recovery" }>
+    ? LifecycleRecoveryScanResultWireV1
+  : O extends Extract<LifecycleFencedOperation, { readonly operation: "outbox-claim-next" }>
+    ? LifecycleOutboxClaimWireV1 | null
+  : O extends Extract<LifecycleFencedOperation, { readonly operation: "outbox-claim" }>
+    ? LifecycleOutboxClaimWireV1 | null
+  : O extends Extract<LifecycleFencedOperation, { readonly operation: "outbox-renew" }>
+    ? LifecycleOutboxClaimWireV1
+  : O extends Extract<LifecycleFencedOperation, { readonly operation: "outbox-materialize" }>
+    ? MaterializationResultWireV1
+  : O extends Extract<LifecycleFencedOperation, { readonly operation: "outbox-failure" }>
+    ? boolean
+  : never;
 
-export class ProjectStoreExecutor {
-  executeLifecycleMutation<C extends LifecycleSemanticCommandDraft>(command: PreparedLifecycleWorkerCommand<C>): Promise<LifecycleExecutionResult<LifecycleResultFor<C>>>;
-  executeLifecycleInternalMutation<I extends InternalWorkflowExecutionPlan>(plan: I): Promise<LifecycleInternalResultFor<I>>;
-  executeLifecycleBounded<O extends LifecycleBoundedMutation>(operation: O): Promise<LifecycleBoundedResultFor<O>>;
-  queryLifecycle<Q extends LifecycleQuery>(query: Q): Promise<LifecycleQueryResultFor<Q>>;
-  executeLifecycleFenced<O extends LifecycleFencedOperation>(operation: O): Promise<LifecycleFencedResultFor<O>>;
+export interface LifecycleWorkerSuccessWire {
+  readonly operation: LifecycleWorkerOperationName;
+  readonly nestedContractVersion: 1 | 2 | null;
+  readonly result: JsonValue;
+}
+
+export function decodeLifecycleWorkerOperationWire(
+  value: unknown,
+): LifecycleWorkerOperationWire;
+
+export function materializeLifecycleWorkerOperation(
+  wire: LifecycleWorkerOperationWire,
+  context: ProjectContext,
+): LifecycleWorkerOperation;
+
+export function decodeLifecycleWorkerSuccessForOperation(
+  value: unknown,
+  requested: LifecycleWorkerOperationWire,
+): LifecycleWorkerSuccessWire;
+
+export function lifecycleNestedContractVersion(
+  operation:
+    | LifecycleWorkerOperationWire
+    | LifecycleWorkerOperation
+    | InternalWorkflowPhaseCommand,
+): 1 | 2 | null;
+
+export interface LifecycleInternalWorkVersionBinding {
+  readonly commandType: "internal-validation-result" | "internal-workflow-phase";
+  readonly workflowId: WorkflowId;
+  readonly workflowGeneration: number;
+  readonly plannedWorkId: string;
+  readonly nestedContractVersion: 1 | 2 | null;
+}
+
+export function lifecycleInternalWorkVersionBinding(
+  source: InternalWorkflowExecutionPlan | InternalWorkflowPhaseCommand,
+): LifecycleInternalWorkVersionBinding;
+```
+
+`assertLifecycleWireCanonicalSize` takes a fresh strict plain-JSON snapshot,
+calculates
+`Buffer.byteLength(canonicalJson(snapshot), "utf8")`, accepts exactly
+`MAX_LIFECYCLE_WIRE_CANONICAL_BYTES`, and rejects the next byte. Apply it to the
+complete fresh strict outer lifecycle-request snapshot (including `id`, `type`,
+`binding`, and `operation`) in `worker-protocol.ts` before backend dispatch, and
+independently to the fresh strict correlated-success snapshot before
+`decodeLifecycleWorkerSuccessForOperation` returns it. Both public decode paths
+must call this same exported function; neither reimplements its byte calculation
+or measures the caller-owned input. Operation-specific decoders still enforce
+their smaller domain bounds. Unit tests exercise the exported guard with
+exact-size request and success envelopes and limit-plus-one envelopes;
+integration tests prove both public decoders invoke it. There is no typed-array
+exception.
+
+`materializeLifecycleWorkerOperation` creates a fresh immutable domain object.
+For bounded/query operations it inserts `context` and derives an audience whose
+presenting and target role/client both equal the active binding. For fenced
+operations it inserts only `context`. Semantic and internal semantic objects are
+already context-free and are passed as newly frozen decoded snapshots. It never
+accepts a second context source.
+
+The pure nested-version helpers do not widen the public wire union. For an
+`InternalWorkflowPhasePlan`, version comes only from
+`plannedAction.action === "prepare-final-checkpoint-and-queue-ending"` and its
+`finalCheckpointDraft.checkpointVersion`. For an authoritative
+`InternalWorkflowPhaseCommand`, version comes only from
+`action.action === "record-final-checkpoint-and-queue-ending"` and its
+`finalCheckpoint.checkpointVersion`; all noncheckpoint internal actions and
+validation results return `null`. `lifecycleInternalWorkVersionBinding` copies
+only command type, workflow ID/generation, planned work ID, and that version.
+Task 14 consumes this pure binding when it enables internal execution; Task 13
+does not send the authoritative command on the wire or exercise internal
+semantic replay/dedup.
+
+```ts
+// lifecycle-worker-runtime.factory.ts
+export interface LifecycleWorkerRuntimeCreateInput {
+  readonly connection: SqliteConnection;
+  readonly maintenanceFence: MaintenanceFence;
+  readonly keyProvider: CapabilityKeyProvider;
+}
+
+export interface LifecycleRuntimeClock {
+  nowMs(): bigint;
+  now(): string;
+}
+
+export interface LifecycleRuntimeIdentitySource {
+  uuid(): string;
+  bytes(length: number): Uint8Array;
+}
+
+export interface LifecycleRuntimeRepositoryFactories {
+  authority(): SessionAuthorityRepository;
+  leases(): SessionLeaseRepository;
+  approvals(): LifecycleApprovalRepository;
+  transfers(): ChildTransferRepository;
+  coverage(provider: CapabilityKeyProvider): EvidenceCoverageRepository;
+  projection(connection: SqliteConnection): LifecycleProjectionWriter;
+}
+
+export interface LifecycleTransactionFacadeFactory {
+  command(input: {
+    readonly connection: SqliteConnection;
+    readonly authority: SessionAuthorityRepository;
+    readonly leases: SessionLeaseRepository;
+    readonly approvals: LifecycleApprovalRepository;
+    readonly transfers: ChildTransferRepository;
+    readonly coverage: EvidenceCoverageRepository;
+  }): LifecycleCommandTransaction;
+  operational(input: {
+    readonly connection: SqliteConnection;
+  }): LifecycleOperationalRepositorySet;
+}
+
+export interface LifecycleWorkerRuntimeFactoryOptions {
+  readonly clock: LifecycleRuntimeClock;
+  readonly identitySource: LifecycleRuntimeIdentitySource;
+  readonly integrity: LifecycleProcessorIntegrity;
+  readonly resumeSourceState: LifecycleResumeSourceStatePort;
+  readonly checkpointSourceStateProvider: SourceStateProvider;
+  readonly checkpointSourceStateScopeResolver: SourceStateScopeResolver;
+  readonly childBindingFingerprint: ChildWorkflowServiceOptions["childBindingFingerprint"];
+  readonly repositories: LifecycleRuntimeRepositoryFactories;
+  readonly transactionFacades: LifecycleTransactionFacadeFactory;
+}
+
+// lifecycle-worker-runtime.ts
+export interface LifecycleWorkerRuntime {
+  execute(
+    operation: LifecycleWorkerOperationWire,
+    context: ProjectContext,
+  ): Promise<LifecycleWorkerSuccessWire>;
+  dispose(): void;
+}
+
+export interface PreparedCheckpointLifecycleHandler {
+  execute(
+    context: ProjectContext,
+    prepared: PreparedLifecycleWorkerCommand<Extract<
+      LifecycleSemanticCommandDraft,
+      { readonly commandType: "record-checkpoint" }
+    >>,
+  ): WorkerLifecycleResult<CheckpointRecordedResult>;
+}
+
+export interface PreparedEvidenceLifecycleHandler {
+  execute(
+    context: ProjectContext,
+    prepared: PreparedLifecycleWorkerCommand<Extract<
+      LifecycleSemanticCommandDraft,
+      { readonly commandType: "record-evidence-batch" }
+    >>,
+  ): WorkerLifecycleResult<EvidenceCoverageRecordedResultV2>;
+}
+
+export interface ConnectionBoundLifecycleWorkerRuntimeOptions {
+  readonly rootProcessor: LifecycleCommandProcessor;
+  readonly childService: ChildWorkflowService;
+  readonly checkpointHandler: PreparedCheckpointLifecycleHandler;
+  readonly evidenceHandler: PreparedEvidenceLifecycleHandler;
+  readonly queryService: LifecycleQueryService;
+  readonly semanticStore: LifecycleCommandStore;
+  readonly operationalStore: LifecycleOperationalStore;
+}
+
+export class ConnectionBoundLifecycleWorkerRuntime
+implements LifecycleWorkerRuntime {
+  constructor(options: ConnectionBoundLifecycleWorkerRuntimeOptions);
+  execute(
+    operation: LifecycleWorkerOperationWire,
+    context: ProjectContext,
+  ): Promise<LifecycleWorkerSuccessWire>;
+  dispose(): void;
+}
+
+// lifecycle-worker-runtime.factory.ts
+export interface LifecycleWorkerRuntimeFactoryPort {
+  create(input: LifecycleWorkerRuntimeCreateInput): LifecycleWorkerRuntime;
+}
+
+export class LifecycleWorkerRuntimeFactory
+implements LifecycleWorkerRuntimeFactoryPort {
+  constructor(options: LifecycleWorkerRuntimeFactoryOptions);
+  create(input: LifecycleWorkerRuntimeCreateInput): LifecycleWorkerRuntime;
 }
 ```
 
-`lifecycle-worker-runtime.factory.ts` is the sole owner of
-`LifecycleTransactionFacadeFactory`. `lifecycle-worker-protocol.ts` is the sole
-owner of every operation/result mapping and `*WireV1` type in the block above;
-Tasks 14-16 convert their connection-bound bigint records to/from these JSON
-wire DTOs and never redeclare them. Task 12A's
-`contracts/session-end.ts` owns `SessionEndStatusV2`,
-`SessionEndPhaseResultV2`, and `ValidationResultRecordedResultV1`. As a focused
-compatibility fix, widen only the private `ChildCommand` extract in
-`child-workflow.service.ts` to include its already-existing
-`"create-child-transfer"` discriminant so the complete semantic result mapping
-is non-`never`; do not add a new operation string.
+Every property in `LifecycleWorkerRuntimeFactoryOptions` is required, validated
+as an own data property, and has no default. `create` uses its exact input as
+follows:
 
-`contracts/commands.ts` owns the two claim-next operation DTOs and appends them
-as distinct members of `LifecycleFencedOperation` without weakening any
-target-bound member. `lifecycle-operational.store.ts` owns the two selection
-work identities. They make an unknown target representable without inventing a
-workflow ID, target key, generation, revision, or fencing token; the returned
-claim supplies those values. A lost claim-next response reports
-`OPERATION_OUTCOME_UNKNOWN` with its original stable selection `workId` and is
-never auto-retried. Existing `workflow-claim`/`outbox-claim` remain exact
-target-bound recovery operations and are not used to select the next row.
+`ProjectStoreWorkerBackendOptions.lifecycleRuntimeFactory` is typed as optional
+`LifecycleWorkerRuntimeFactoryPort`, so backend tests inject a recording fake.
+Enabled composition instantiates the concrete `LifecycleWorkerRuntimeFactory`,
+whose `create` returns exactly one `ConnectionBoundLifecycleWorkerRuntime` with
+the exact seven options named above. Tasks 14-16 extend that concrete runtime
+options/table; they do not introduce another factory or runtime class.
+Factory construction may allocate objects and prepare statements but must not
+begin a transaction or mutate SQLite; the first open-path write remains executor
+registration after a complete runtime has been returned.
 
-The protocol's mapped `LifecycleQuery` intentionally distributes the existing
-grouped three-literal read member into three correlated members without changing
-the Task 1 domain contract. Consequently each `Extract` result branch is
-non-`never`, and `LifecycleQueryOperationWire` makes outer `operation` and
-`input.operation` the same literal. Compile-time exhaustiveness fixtures prove
-all three mappings and reject a mismatched outer/input pair.
+1. Construct exactly five state repositories through the injected constructor
+   set (`authority`, `leases`, `approvals`, `transfers`, `coverage`) plus exactly
+   one projection writer. Pass the exact `keyProvider` to `coverage` and exact
+   `connection` to `projection`; assert each constructor is called once.
+2. Construct `CapabilityService` with exact `keyProvider`, constructor clock,
+   and constructor identity source.
+3. Construct `EventAppendTransaction` with the exact connection and maintenance
+   fence, `new SqliteEventAppendStatements(connection)`,
+   `new BranchScopeRepository({ randomId: () => identitySource.uuid() as BranchScopeId })`,
+   `() => identitySource.uuid()`, and explicit `NO_EVENT_STORE_FAULTS`; pass every
+   constructor argument so no event-writer or branch-scope default supplies
+   identity or faults. Never pass the identity-source object where the callback
+   is required.
+4. Construct `LifecycleCommandStore` with exact connection/event port,
+   `projectionWriter` as an explicit own data property, the single command
+   facade builder, the exact coverage repository, and
+   `now: () => clock.now()`. A receiver-dependent clock fake must prove the
+   callback retains its receiver and is evaluated at use time.
+5. Construct `LifecycleOperationalStore` with the same connection and the
+   single operational facade builder. Its Task 13 workflow/outbox facades are
+   inert capabilities because the explicit reserved-operation gate runs before
+   `execute`; no Task 14-16 repository is fabricated.
+6. Construct one `LifecycleCommandProcessor`, one `ChildWorkflowService`, one
+   `LifecycleQueryService`, and the router-owned checkpoint/evidence handlers.
+   Return one runtime owning these objects. No constructor or callback opens,
+   closes, discovers, or swaps a SQLite connection.
 
-`lifecycleNestedContractVersion` returns the selected nested
-`checkpointVersion`, `requestVersion`, or `amendmentVersion` for root suspend,
-checkpoint, end request/amendment, and the internal final plan's
-`finalCheckpointDraft` (or authoritative action's `finalCheckpoint`); it
-returns `null` for every operation without a nested version. Every request
-records that value before dispatch, and success decoding requires both the
-operation tag and `nestedContractVersion` to equal the request. A V2 command
-(nested Version 1) therefore cannot accept a V3/nested-Version-2 success, even
-when both share the same operation string and public result shape.
+`lifecycle-worker-runtime.ts` owns the exhaustive operation table:
 
-```ts
-export type CheckpointWire =
-  Extract<LifecycleSemanticOperationWire, { readonly operation: "record-checkpoint" }>;
-export type RootSuspendWire =
-  Extract<LifecycleSemanticOperationWire, { readonly operation: "root-suspend" }>;
-export type SessionEndRequestWire =
-  Extract<LifecycleSemanticOperationWire, { readonly operation: "request-session-end" }>;
-export type SessionEndAmendWire =
-  Extract<LifecycleSemanticOperationWire, { readonly operation: "amend-session-end" }>;
-export type CheckpointResultWire =
-  | CheckpointRecordedResultV1
-  | CheckpointRecordedResultV2;
-```
+| Operation | Task 13 handler | Transaction path |
+|---|---|---|
+| `root-start`, `root-resume`, `root-recovery`, `root-suspend` | matching `LifecycleCommandProcessor` method | exactly one `LifecycleCommandStore.execute` inside the existing processor |
+| `fork-child`, `amend-child-assignment`, `record-child-report`, `disposition-child-report`, `propose-child-completion`, `complete-child-session`, `suspend-child-session`, `claim-child-transfer` | `ChildWorkflowService.execute` | exactly one `LifecycleCommandStore.execute` inside the existing service |
+| `record-checkpoint` | router-owned prepared-checkpoint handler | exactly one `LifecycleCommandStore.execute`; `CheckpointService.record` only inside its fresh callback |
+| `record-evidence-batch` | router-owned prepared-evidence handler | exactly one `LifecycleCommandStore.execute`; `EvidenceCoverageService.record` only inside its fresh callback |
+| `renew-root-lease` | `LifecycleCommandProcessor.renewRootLease` | existing bounded transaction; no semantic dedup/event append |
+| three `read-session-*` operations | `LifecycleQueryService.read` | deferred read only; reachable only through `queryLifecycle` |
+| every member of the reserved set | return/throw terminal `LIFECYCLE_OPERATION_UNAVAILABLE` as described below | zero store/repository/SQLite/FS effect |
 
-- [ ] **Step 1: Write failing strict wire-contract tests**
+For a prepared external semantic member of the reserved set, the runtime emits
+the correlated semantic rejected result
+`{ kind: "rejected", errorCode: "LIFECYCLE_OPERATION_UNAVAILABLE" }`; this lets
+the exact parent adapter delete the already-persisted pending authorization.
+Internal semantic, bounded, and fenced members have no parent authorization
+record, so their correlated outer worker failure uses the same exact code. The
+same rule applies at the disabled boundary: a correlated definitive error for a
+prepared semantic request is passed to adapter completion as `kind: "rejected"`;
+unknown delivery is never converted to a definitive rejection.
 
-Cover every request/response variant for root start/resume/recovery, root suspend V2/V3, lease renewal, child flow, checkpoint V2/V3, evidence, session tree, end request/amend V2/V3, end cancel/abandon, bounded `read-session-status`, checkpoint result V1/V2, `SessionEndEvidenceWindowStatusV2`, internal validation result, internal event-appending workflow phase, workflow claim-next/target-claim/renew/release/eventless phase/recovery scan, and outbox claim-next/target-claim/renew/materialize/failure. Prove claim-next accepts only stable selection identity plus trusted owner/time/TTL fields and rejects any fabricated target identity/token, while every target-bound operation requires its exact identity. Reject unknown/missing fields, unsafe numbers, noncanonical decimal/UUID/timestamp/base64url, oversized JSON, malformed binding, unsupported or mixed outer/nested versions, cross-version identity reuse, mismatched result tag, bearer-shaped `pmcap1` values, caller-selected actor/audience/time/path/validation command, standalone outbox acknowledgement, and untagged lifecycle success. Prove exact historical Version 1 replay succeeds before current gates. Permit a signed redacted child-binding grant only on fork and only alongside the current root proof; reject it on every other variant without echoing it.
+The two router-owned prepared handlers strict-decode the command and prepared
+authorization, assert the command's project/vault/workspace/branch against the
+injected active context, require the protected proof form allowed by the command,
+derive the protected replay expectation from the proof digest and active
+presenter/target, and call `LifecycleCommandStore.execute` once. On an exact
+replay the service callback and invocation scope are not entered. On a fresh
+path they resolve the current authority, aggregate, and capability generation
+through the connection-bound transaction facade, verify the proof with the
+factory's exact capability service, construct the complete persisted protected
+authorization record, and install that record in a transaction-keyed `WeakMap`
+only for the duration of the service callback.
 
-- [ ] **Step 2: Write failing executor/private-delivery/unknown-outcome tests**
-
-Prove external semantic mutation accepts only a `PreparedLifecycleWorkerCommand`, persists pending authorization before post, posts only proof/approval plus an optional fork-only signed grant, uses original IDs on timeout/death, poisons after uncertain posted mutation, requires revalidation/new executor, never auto-retries, and hands a strict descriptor to the adapter. A local target reconstructs; maintenance and fork source adapters route descriptors and provider spies observe zero reconstruction. Prove no public executor overload accepts a raw draft/private bearer/audience. Prove `executeLifecycleInternalMutation` accepts only `InternalWorkflowExecutionPlan`, constructs the stable replay expectation from the attempt/phase plan before store execution, lets a fresh callback validate the live claim and turn a final draft plan into a full authoritative checkpoint action through Task 12E's same-transaction preparation seam, persists the resulting `internal-workflow` authorization record, uses semantic dedup, replays a committed result after claim expiry without preparation/fresh callback, and preserves its planned command/idempotency identity on uncertainty. Prove workflow/outbox operational methods require exact work identity, expose renew explicitly, never call semantic dedup or event append, reject standalone acknowledgement, and return `OPERATION_OUTCOME_UNKNOWN` without inventing identity. Consume Task 12I's deferred production-routing proof here: after the lifecycle wire variant exists, a strictly valid lifecycle request through the uninjected production worker/backend must return exact `LIFECYCLE_V2_DISABLED` with zero lifecycle event, dedup, workflow, or other SQLite effect. Also prove a test backend with neither dependency, a provider without a lifecycle factory, or a factory without a provider returns disabled before SQLite mutation; a test factory receives the exact active connection and strict-equal Task 12H provider instance, opens no second handle, and both stores are disposed before that connection closes.
-
-```ts
-it("keeps semantic lifecycle commands in the mutation unknown-outcome path", async () => {
-  const pending = executor.executeLifecycleMutation(preparedResumeCommand());
-  const posted = fakeWorker.posted.at(-1)!;
-  assert.equal(posted.type, "lifecycle");
-  assert.equal(posted.operation.operation, "root-resume");
-  fakeWorker.exit(137);
-  await assert.rejects(pending, (error: ProjectStoreWorkerError) => {
-    assert.equal(error.code, "COMMAND_OUTCOME_UNKNOWN");
-    assert.equal(error.details.commandId, RESUME_COMMAND_ID);
-    assert.equal(error.details.idempotencyKey, RESUME_IDEMPOTENCY_KEY);
-    return true;
-  });
-});
-```
-
-- [ ] **Step 3: Run focused tests and observe missing lifecycle protocol**
-
-Run:
-
-```powershell
-npm run test:build
-if ($LASTEXITCODE -ne 0) { throw "Compile RED recorded; add only the Task 13 typed stubs, then rerun this gate" }
-node --test --test-concurrency=1 --test-reporter=spec --test-name-pattern="^(rejects mixed nested checkpoint and request versions|requires both lifecycle factory and the exact provider instance|production lifecycle routing stays disabled with zero SQLite effect|preserves command identity after uncertain semantic delivery|routes read operations only through queryLifecycle)$" dist-test/tests/lifecycle-worker-protocol.test.js dist-test/tests/lifecycle-executor.test.js dist-test/tests/project-store-executor.test.js
-```
-
-Expected after the compile-only scaffold: all five named anchors execute and
-fail for their exact codec/dependency/identity/routing behavior. Node never runs
-after a failed build.
-
-- [ ] **Step 4: Implement strict tagged lifecycle codecs**
-
-Use the existing exact-object, safe-integer, decimal, and binding patterns but
-keep domain conversion in `lifecycle-worker-protocol.ts`. Implement the exact
-five-member distributive `LifecycleWorkerOperationWire` already declared in
-this task. Do not introduce per-operation structural aliases: semantic/internal,
-bounded, query, and fenced members are derived from their authoritative domain
-unions, so adding/removing a domain discriminant produces a compile failure in
-the result map and codec exhaustiveness tests.
-
-Every external semantic variant has `commandId` and `idempotencyKey`, candidate intent, and adapter-prepared authorization; audience fields are not accepted from a raw command draft. Decode raw signed approvals and the optional fork-only child-binding grant directly into redacted wrappers and never include them in protocol errors. Nested checkpoint/request versions are explicit union members and participate in candidate/authoritative intent and tagged result decoding; never infer a version from object shape. Internal validation and phase-plan wires carry only the trusted stable planned-work identity, current claim assertion, and for a final phase the strict checkpoint draft/materialization target—not a fabricated full checkpoint. The runtime builds replay expectation from that stable plan before semantic-store execution. Only a fresh callback may validate the claim, prepare the full checkpoint action in the active transaction, create the persisted authoritative `InternalWorkflowPhaseCommand`/authorization record, and append. No wire field can select an origin or persisted claim record. No issued handle/token type exists in the request union. The only issuance response field is strict `AuthorityMaterialDescriptorV1`; public result, dynamic status, descriptor, operation tag, and nested version tag are decoded separately.
-
-- [ ] **Step 5: Extend backend dispatch with an explicit disabled default**
-
-Add optional `lifecycleRuntimeFactory` to backend options. Reuse the exact optional `ProjectStoreWorkerBackendOptions.keyProvider` introduced by Task 12H; do not construct a second provider or a second integrity broker. During successful store open, invoke the factory only when both dependencies exist, with the exact `ActiveStore` SQLite connection, that same provider instance, and connection-bound dependencies; store its runtime inside `ActiveStore`, and dispose it during close before the connection. On `type: "lifecycle"`, revalidate the current worker binding first. If the factory/runtime/provider is absent, throw `LIFECYCLE_V2_DISABLED` without constructing a lifecycle repository or writing SQLite. If present, pass the already re-established context and strict domain operation to it. The factory must not open, own, or discover another SQLite handle.
-
-Keep the production `src/workers/project-store.worker.ts` role `store` construction unchanged with respect to lifecycle injection. Test fixtures construct their own worker backend with deterministic external-provider profile and lifecycle runtime. No provider key or provider object crosses `workerData`.
-
-- [ ] **Step 6: Implement typed executor operations and request classification**
-
-Rename and add the explicit operational class:
+The checkpoint invocation contains exact active context, the scope returned by
+the injected `SourceStateScopeResolver`, persisted authorization, and fresh
+generation. The evidence invocation additionally contains the verified
+authorization authority, target authority, target aggregate, and `clock.now()`.
+The callback removes the `WeakMap` entry in `finally`. Both successful handlers
+wrap the committed public result in `WorkerLifecycleResult` with the fixed
+`not-issued` authority-material record; no descriptor is synthesized. Tests
+must prove direct calls to either transaction-scoped service outside this owned
+scope fail and that replay invokes neither scope nor service.
 
 ```ts
+// commands.ts: selection identities remain stable before a row is chosen.
+export interface WorkflowClaimNextOperation {
+  readonly operation: "workflow-claim-next";
+  readonly context: ProjectContext;
+  readonly workId: string;
+  readonly ownerId: string;
+  readonly observedNowMs: string;
+  readonly ttlMs: string;
+}
+
+export interface OutboxClaimNextOperation {
+  readonly operation: "outbox-claim-next";
+  readonly context: ProjectContext;
+  readonly workId: string;
+  readonly ownerId: string;
+  readonly observedNowMs: string;
+  readonly ttlMs: string;
+}
+
+// Keep every existing target-bound member; outbox-materialize is identity-only.
+export type LifecycleFencedOperation =
+  | WorkflowClaimNextOperation
+  | OutboxClaimNextOperation
+  | (WorkflowFencedIdentity & { readonly operation: "workflow-claim"; readonly leaseUntil: string })
+  | (WorkflowFencedIdentity & { readonly operation: "workflow-renew"; readonly leaseUntil: string })
+  | (WorkflowFencedIdentity & { readonly operation: "workflow-release" })
+  | (WorkflowFencedIdentity & {
+      readonly operation: "workflow-eventless-phase";
+      readonly expectedPhase: string;
+      readonly nextPhase: string;
+    })
+  | (LifecycleFencedOperationBase & {
+      readonly operation: "workflow-recovery";
+      readonly dueBefore: string;
+      readonly limit: number;
+    })
+  | (OutboxFencedIdentity & { readonly operation: "outbox-claim"; readonly leaseUntil: string })
+  | (OutboxFencedIdentity & { readonly operation: "outbox-renew"; readonly leaseUntil: string })
+  | (OutboxFencedIdentity & { readonly operation: "outbox-materialize" })
+  | (OutboxFencedIdentity & {
+      readonly operation: "outbox-failure";
+      readonly retryable: boolean;
+      readonly safeErrorCode: string;
+      readonly attempt: number;
+      readonly nextAttemptAt: string | null;
+    });
+```
+
+`lifecycle-operational.store.ts` adds exact `workflow-selection` and
+`outbox-selection` work identities containing project ID, deterministic work ID,
+`operation: "claim-next"`, and owner ID. A lost selection response therefore
+never invents a workflow ID, target key, generation, revision, or fencing token.
+The existing target identities remain byte-for-byte strict.
+
+```ts
+// project-store-executor.ts
 type RequestKind = "read" | "mutation" | "bounded" | "operational" | "control";
+
+type PendingLifecycleIdentity =
+  | {
+      readonly kind: "semantic";
+      readonly projectId: ProjectId;
+      readonly commandId: string;
+      readonly idempotencyKey: string;
+    }
+  | {
+      readonly kind: "bounded";
+      readonly operationId: string;
+      readonly requestId: string;
+    }
+  | {
+      readonly kind: "operational";
+      readonly work: JsonValue;
+    };
+
+interface PendingRequest {
+  readonly request: WorkerRequest;
+  readonly kind: RequestKind;
+  readonly identity: PendingLifecycleIdentity | null;
+  readonly timer: object;
+  posted: boolean;
+  resolve(value: unknown): void;
+  reject(error: ProjectStoreWorkerError): void;
+}
+
+export interface ProjectStoreExecutorDependencies {
+  readonly workerFactory: WorkerFactory;
+  readonly scheduler: ExecutorScheduler;
+  readonly randomId: () => string;
+  readonly confirmMaintenanceClosure: (
+    confirmation: MaintenanceClosureConfirmation,
+  ) => void | Promise<void>;
+  readonly authorityMaterialAdapter?: AuthorityMaterialAdapter;
+}
 ```
 
-Open, quiesce, and close use control. The trusted adapter prepares the draft before calling the executor; `executeLifecycleMutation` accepts only that prepared command, posts it as mutation with original identity, decodes the tagged result, and calls adapter completion. It has no bearer/approval/audience parameters. `executeLifecycleInternalMutation` is exposed only to the injected trusted coordinator; it posts a persisted validation-attempt-plan identity or deterministic workflow-phase identity as mutation. The worker constructs its replay expectation before `LifecycleCommandStore.execute`; on a dedup miss only, the fresh callback verifies the live generation/claim and constructs the persisted `internal-workflow` record. It uses normal semantic dedup and returns the original command/idempotency identity on uncertainty. `executeLifecycleBounded` retains operation/request identity and returns `OPERATION_OUTCOME_UNKNOWN` without inventing an identity if delivery is uncertain. Queries are read-only and use bounded proof where protected.
+The pending identity is deep-frozen before `postMessage`. Operational work uses
+the exact context-free wire identity with bigint fields already converted to
+canonical decimal strings and with payload fields such as lease deadline,
+failure policy, and TTL removed. Every semantic and operational `projectId`
+comes only from `this.#options.context.binding.projectId`, never from a
+contextful argument that is later stripped. Claim-next therefore retains only
+that project ID plus work ID, operation, and owner ID; target work retains its
+exact workflow/generation/owner/token or target/revision/owner/token tuple.
 
-`executeLifecycleFenced` is available only to injected trusted coordinators/materializers. Its strict union covers workflow/outbox claim-next selection plus target-bound claim/renew/release/eventless-phase/recovery/materialize/failure. Claim-next carries a deterministic project/selection-work/owner identity and establishes the returned target/generation-or-revision/token fence; every later operation carries that exact fence. It posts as `operational`, runs through `LifecycleOperationalStore`, performs no semantic command-dedup lookup or event append, never accepts capability/approval/grant fields, and returns `OPERATION_OUTCOME_UNKNOWN` with the exact selection or target work identity on uncertain delivery so the caller may explicitly inspect before deciding whether to issue new work. Materialize includes the byte recheck, replacement, fsync, and repository acknowledgement; there is no standalone acknowledgement operation. No automatic retry or replacement identity is generated.
+For any timeout, worker exit, `messageerror`, worker error, response protocol
+failure, synchronous decoder failure after a successful post, inner
+`WorkerLifecycleResult.kind === "unknown"`, or worker-reported
+`COMMAND_OUTCOME_UNKNOWN`/`OPERATION_OUTCOME_UNKNOWN`, ignore worker detail
+objects and reconstruct locally:
 
-On a posted semantic timeout, exit, message error, protocol error, or uncertain commit, poison the executor just like append mutation. Exact retry occurs only after binding revalidation and a new executor, using `resumePending` from the crash-durable store.
+- semantic -> `COMMAND_OUTCOME_UNKNOWN` with exact `commandId` and
+  `idempotencyKey`;
+- bounded -> `OPERATION_OUTCOME_UNKNOWN` with exact `operationId` and
+  `requestId`;
+- operational -> `OPERATION_OUTCOME_UNKNOWN` with exact immutable `work`
+  snapshot, including claim-next before a target exists.
 
-- [ ] **Step 7: Run protocol, executor, root/child/checkpoint/evidence, and build gates**
+Only requests whose `postMessage` completed set `posted = true`; a synchronous
+post failure is `WORKER_UNAVAILABLE`, not an invented committed outcome. Any
+uncertain semantic/bounded/operational delivery poisons the executor and is
+never automatically retried. Semantic retry requires binding revalidation, a
+new executor, and `AuthorityMaterialAdapter.resumePending` outside the executor.
+
+`executeLifecycleMutation` accepts only a prepared command. It requires the
+constructor-injected adapter before entering `request()`, posts with the semantic
+identity, strictly decodes
+the correlated operation/nested-version result, and calls that exact adapter's
+`complete` with the frozen `{ projectId, commandId, idempotencyKey }` identity.
+A correlated definitive outer lifecycle
+failure is converted to `WorkerLifecycleResult.kind: "rejected"` and completed
+through that same adapter, so terminal disabled/unavailable/rejected commands do
+not leak pending authorization when the required pair was established. An
+adapterless executor cannot clean a durable pending record prepared by some
+other adapter: lifecycle call sites must construct and validate the executor
+with its exact adapter before calling `AuthorityMaterialAdapter.prepare`. A
+structurally invalid adapterless mutation call fails locally with zero post.
+Adapter absence has no effect on internal semantic, bounded, query, or fenced
+methods. It catches an adapter-reported unknown outcome
+and replaces it with the local exact identity while leaving the durable pending
+authorization intact. It has no raw draft, bearer, approval, audience, or
+per-call adapter overload. Internal semantic execution is trusted-only; bounded
+and operational execution keep their respective identities. All three protected
+reads are exposed only by `queryLifecycle` and are posted as `read`.
+
+```ts
+export class ProjectStoreExecutor {
+  executeLifecycleMutation<C extends LifecycleSemanticCommandDraft>(
+    command: PreparedLifecycleWorkerCommand<C>,
+  ): Promise<LifecycleExecutionResult<LifecycleResultFor<C>>>;
+
+  executeLifecycleInternalMutation<I extends InternalWorkflowExecutionPlan>(
+    plan: I,
+  ): Promise<LifecycleInternalResultFor<I>>;
+
+  executeLifecycleBounded<I extends LifecycleBoundedMutationInput>(
+    operation: I,
+  ): Promise<LifecycleBoundedResultFor<
+    LifecycleBoundedMutationForInput<I>
+  >>;
+
+  queryLifecycle<I extends LifecycleQueryInput>(
+    query: I,
+  ): Promise<LifecycleQueryResultFor<LifecycleQueryForInput<I>>>;
+
+  executeLifecycleFenced<I extends LifecycleFencedInput>(
+    operation: I,
+  ): Promise<LifecycleFencedResultFor<
+    LifecycleFencedOperationForInput<I>
+  >>;
+}
+```
+
+The input itself is the inferred generic. Do not put a domain generic only
+inside a conditional parameter type: ordinary literal calls would then retain
+the whole constraint and return a result union. In
+`tests/lifecycle-executor.test.ts`, add compile assertions using valid ordinary
+object-literal calls with no explicit type arguments, no pre-cast domain input,
+and no result casts. Assign each call to its exact promised result type for:
+
+- `renew-root-lease`;
+- all three queries: `read-session-tree`, `read-session-status`, and
+  `read-session-association`; and
+- every fenced discriminator: `workflow-claim-next`, `workflow-claim`,
+  `workflow-renew`, `workflow-release`, `workflow-eventless-phase`,
+  `workflow-recovery`, `outbox-claim-next`, `outbox-claim`, `outbox-renew`,
+  `outbox-materialize`, and `outbox-failure`.
+
+For each assertion, use the one mapped result above (including the exact
+nullable/nonnullable distinction). Add `@ts-expect-error` inverse assignments
+between at least one member from each differently mapped result branch so a
+future return-union regression fails `npm run test:build`.
+
+The wire/result maps retain the Task 12 nested contract requirements:
+`RootSuspendCommandV2 | V3`, `RecordCheckpointCommandV2 | V3`,
+`RequestSessionEndCommandV2 | V3`, and `AmendSessionEndCommandV2 | V3` share
+operation names but bind their nested discriminator. Decode
+`CheckpointRecordedResultV1 | V2`, versioned end results, and
+`SessionEndEvidenceWindowStatusV2`; reject unsupported/mixed tags. Candidate and
+authoritative intent, worker result tags, and deterministic internal work
+version binding include that discriminator. Task 13 proves exact historical
+Version 1 replay before current gates and same-ID cross-version conflict through
+the executable `record-checkpoint` V1/V2 handler. Authoritative internal-phase
+exact replay and cross-version identity conflict remain Task 14 acceptance
+criteria because that handler is deliberately unavailable in Task 13.
+
+**Task 14 carry-forward:** when it replaces the reserved internal handler, add
+exact anchors `replays authoritative internal phase at the bound nested version`
+and `conflicts cross-version internal phase work identity reuse`, using
+`lifecycleInternalWorkVersionBinding` for both the plan and authoritative
+command. Those anchors belong to the Task 14 focused gate, not any Task 13 gate.
+
+- [ ] **Step 1: Record compile RED, then add typed throwing scaffolds only**
+
+Add imports and exact anchor names to the three new test files before the source
+modules exist.
 
 Run:
 
 ```powershell
 npm run test:build
-node --test --test-concurrency=1 --test-reporter=spec dist-test/tests/lifecycle-worker-protocol.test.js dist-test/tests/lifecycle-executor.test.js dist-test/tests/project-store-executor.test.js dist-test/tests/lifecycle-command-processor.test.js dist-test/tests/child-workflow.test.js dist-test/tests/checkpoint.service.test.js dist-test/tests/evidence-coverage.test.js
-npm run typecheck
-npm run build
-npm run test:build-artifacts
+if ($LASTEXITCODE -eq 0) { throw "Expected Task 13 missing-module compile RED" }
 ```
 
-Expected: both nested checkpoint/end versions and result/status unions round-trip strictly, cross-version reuse conflicts, raw authority never crosses, mutation poisoning preserves IDs, existing executor behavior remains green, schema 3 does not inject a runtime, and the production worker stays lifecycle-disabled.
-
-- [ ] **Step 8: Commit**
+Expected: TypeScript fails only because the three Task 13 runtime modules and
+their named exports do not exist. Create those modules with every named
+type/interface/value/function export in the API blocks above, including
+`MAX_LIFECYCLE_WIRE_CANONICAL_BYTES`,
+`assertLifecycleWireCanonicalSize(value: unknown): void`, the two version
+helpers, exact value exports `LifecycleWorkerRuntimeFactory` and
+`ConnectionBoundLifecycleWorkerRuntime`, and the three input-to-domain maps.
+Use typed throwing constructors/methods/functions only. Export
+`LifecycleWorkerRuntimeFactoryPort` separately for backend injection, extend the
+outer `WorkerRequest`/success unions, then rerun:
 
 ```powershell
-git add src/orchestrator/runtime/lifecycle-worker-protocol.ts src/orchestrator/runtime/lifecycle-worker-runtime.factory.ts src/orchestrator/runtime/worker-protocol.ts src/orchestrator/runtime/project-store-executor.ts src/orchestrator/runtime/project-store-worker-backend.ts src/orchestrator/runtime/project-store-worker-runtime.ts src/workers/project-store.worker.ts src/orchestrator/lifecycle/contracts/commands.ts src/orchestrator/lifecycle/lifecycle-operational.store.ts src/orchestrator/lifecycle/authority/authority-material-adapter.ts src/orchestrator/lifecycle/child-workflow.service.ts tests/lifecycle-worker-protocol.test.ts tests/lifecycle-executor.test.ts tests/lifecycle-contracts.test.ts tests/lifecycle-operational.store.test.ts tests/project-store-executor.test.ts
-git commit -m "feat: add disabled lifecycle worker protocol"
+npm run test:build
+if ($LASTEXITCODE -ne 0) { throw "test:build failed" }
 ```
+
+Expected: build succeeds; no behavioral anchor passes accidentally.
+
+- [ ] **Step 2: RED/GREEN strict codecs, context removal, size cap, and reserved wire shapes**
+
+Add exact tests named:
+
+- `rejects mixed nested checkpoint and request versions`
+- `rejects caller project context on lifecycle operation wires`
+- `caps lifecycle wire JSON at the exact UTF-8 boundary`
+- `enforces fork-only child-binding grants without echo`
+- `materialization wire carries identity only`
+- `derives internal final checkpoint version from plan and authoritative command`
+
+Cover every current and reserved request discriminator, all mapped result tags,
+outer/input operation equality, claim-next selection identity, target-bound
+fences, malformed binding, unknown/missing fields, unsafe numbers,
+noncanonical decimal/UUID/timestamp/base64url, bearer-shaped `pmcap1` data,
+standalone acknowledgement, and untagged success. Explicitly prove nested
+`context`, `binding`, `audience`, actor/client, path/provider fields are rejected;
+the active context and derived audience appear only after materialization. Prove
+the exported `assertLifecycleWireCanonicalSize` directly accepts exactly 4 MiB
+and rejects plus one byte, and prove the outer request and correlated-success
+decoders each call that same guard on their fresh strict snapshot. Prove
+`outbox-materialize` rejects bytes, current/next fingerprints, and
+acknowledgement. Add `satisfies`/`@ts-expect-error` fixtures for all three
+exported context-free parent aliases: valid inputs omit context/audience, while
+adding either field fails `npm run test:build`. Prove the pure internal helper
+returns the same Version 1 or Version 2 binding for a final-checkpoint plan and
+its authoritative command and returns `null` for both noncheckpoint forms; do
+not invoke semantic dedup for this proof.
+
+For semantic authorization correlation, use wire-level fixtures—not only direct
+service tests. A `fork-child` with `directAccessRequested: true` is accepted only
+with both its protected current-root capability proof and its required valid
+signed redacted child-binding grant. Reject the same fork when either proof or
+grant is missing, reject a grant on a fork with `directAccessRequested: false`,
+reject a malformed signed grant, and iterate every other semantic discriminator
+(including every reserved semantic discriminator) to reject any nonnull child
+binding grant. Assert an invalid reserved command fails authorization before it
+can return `LIFECYCLE_OPERATION_UNAVAILABLE`. Every failure assertion must prove
+that neither the proof, signed grant, their canary fields, nor the decoded input
+appears in the thrown error message, safe details, serialized outer response, or
+test snapshot. Keep each executable service's existing
+`assertSemanticCommandAuthorization` call; the codec check does not replace it.
+
+Run RED, then implement only protocol/contracts/error/operational identity work:
+
+```powershell
+npm run test:build
+if ($LASTEXITCODE -ne 0) { throw "test:build failed" }
+node --test --test-concurrency=1 --test-reporter=spec --test-name-pattern="^(rejects mixed nested checkpoint and request versions|rejects caller project context on lifecycle operation wires|caps lifecycle wire JSON at the exact UTF-8 boundary|enforces fork-only child-binding grants without echo|materialization wire carries identity only|derives internal final checkpoint version from plan and authoritative command)$" dist-test/tests/lifecycle-worker-protocol.test.js dist-test/tests/lifecycle-contracts.test.js dist-test/tests/lifecycle-operational-store.test.js
+if ($LASTEXITCODE -eq 0) { throw "Expected strict protocol behavioral RED" }
+```
+
+After implementing only protocol/contracts/error/operational identity work, run
+GREEN with a fresh build:
+
+```powershell
+npm run test:build
+if ($LASTEXITCODE -ne 0) { throw "test:build failed" }
+node --test --test-concurrency=1 --test-reporter=spec --test-name-pattern="^(rejects mixed nested checkpoint and request versions|rejects caller project context on lifecycle operation wires|caps lifecycle wire JSON at the exact UTF-8 boundary|enforces fork-only child-binding grants without echo|materialization wire carries identity only|derives internal final checkpoint version from plan and authoritative command)$" dist-test/tests/lifecycle-worker-protocol.test.js dist-test/tests/lifecycle-contracts.test.js dist-test/tests/lifecycle-operational-store.test.js
+if ($LASTEXITCODE -ne 0) { throw "strict protocol GREEN failed" }
+```
+
+- [ ] **Step 3: RED/GREEN backend disabled and enabled composition boundary**
+
+Add exact tests named:
+
+- `requires both lifecycle factory and the exact provider instance`
+- `production lifecycle routing stays disabled with zero SQLite effect`
+- `distinguishes an unavailable lifecycle operation from a disabled runtime`
+
+Add optional `lifecycleRuntimeFactory` to backend options. During open, create a
+runtime only when both factory and the exact existing `keyProvider` are present;
+pass the exact active connection, maintenance fence, and provider. Create it
+after store identity/event-store construction but **before** `BEGIN IMMEDIATE`
+executor registration. Only after runtime creation succeeds may the backend
+register/commit the executor and publish `ActiveStore`. On lifecycle dispatch,
+call `requireActive(binding)` first. Missing factory/provider/runtime throws
+`LIFECYCLE_V2_DISABLED`; a present runtime receives the wire and already
+re-established context. Never create a provider, concrete runtime factory,
+repository, or second SQLite handle in the backend.
+
+Open cleanup preserves the first/primary error. Track whether registration began
+and whether a runtime was returned. In `catch`, attempt rollback when active,
+then attempt exactly one `runtime.dispose()`, and close the connection in an
+unconditional final cleanup even when rollback or disposal throws. Report the
+first error only after every cleanup attempt; never publish `ActiveStore` on a
+failed open. On normal, explicit-close, and quiesce-close paths, terminate child
+workers, attempt runtime disposal, and close the connection in `finally`; clear
+`#active`/mark closed regardless, then report the first failure after all cleanup
+attempts. A throwing `dispose()` must neither suppress connection close nor
+replace an earlier operational error.
+
+Extend `requires both lifecycle factory and the exact provider instance` with
+factory-throw, registration-throw, and dispose-throw subcases. Prove factory
+throw happens before registration; registration failure rolls back with zero
+stale executor row; a returned runtime is disposed exactly once; the connection
+closes exactly once in every failure path; the first error wins; and driver open
+count remains exactly one.
+
+The production disabled anchor uses the uninjected production worker/backend
+composition and a deterministic runtime scheduler. Open a schema-3 store first,
+then snapshot all relevant tables **after successful open and immediately before**
+posting one codec-valid nonmutating lifecycle request. Assert the response keeps
+the request ID and has exact `LIFECYCLE_V2_DISABLED`. Snapshot again and prove no
+delta in events, command dedup, session authority/leases, workflows, validation,
+outbox, coverage, child/latest-report projections, or any other application-owned
+table. The post-open baseline intentionally includes the legitimate executor
+registration. Disable heartbeat advancement for this assertion and close before
+final independent inspection.
+
+Run RED after the compile-only scaffold:
+
+```powershell
+npm run test:build
+if ($LASTEXITCODE -ne 0) { throw "test:build failed" }
+node --test --test-concurrency=1 --test-reporter=spec --test-name-pattern="^(requires both lifecycle factory and the exact provider instance|production lifecycle routing stays disabled with zero SQLite effect|distinguishes an unavailable lifecycle operation from a disabled runtime)$" dist-test/tests/lifecycle-worker-runtime.test.js dist-test/tests/project-store-executor.test.js
+if ($LASTEXITCODE -eq 0) { throw "Expected backend composition behavioral RED" }
+```
+
+After implementing this boundary, run GREEN with a fresh build:
+
+```powershell
+npm run test:build
+if ($LASTEXITCODE -ne 0) { throw "test:build failed" }
+node --test --test-concurrency=1 --test-reporter=spec --test-name-pattern="^(requires both lifecycle factory and the exact provider instance|production lifecycle routing stays disabled with zero SQLite effect|distinguishes an unavailable lifecycle operation from a disabled runtime)$" dist-test/tests/lifecycle-worker-runtime.test.js dist-test/tests/project-store-executor.test.js
+if ($LASTEXITCODE -ne 0) { throw "backend composition GREEN failed" }
+```
+
+- [ ] **Step 4: RED/GREEN executor classification, exact adapter, and local unknown identities**
+
+Add exact tests named:
+
+- `preserves command identity after uncertain semantic delivery`
+- `preserves bounded identity after uncertain lifecycle delivery`
+- `preserves fenced selection identity after uncertain lifecycle delivery`
+- `routes read operations only through queryLifecycle`
+- `rejects caller project context at the executor boundary`
+- `adapter absence disables only external lifecycle mutation`
+
+Exercise timeout, exit, worker error, `messageerror`, malformed response,
+mismatched result tag/version, inner unknown, and outer unknown responses after a
+successful post. Verify local identities for semantic, bounded, target-fenced,
+and both claim-next selection forms; worker nested details must be ignored. Prove
+queries never enter mutation/bounded/operational classification, uncertain
+mutations poison, no class auto-retries, and a synchronous `postMessage` throw is
+not misreported as committed uncertainty. Use one real test
+`AuthorityMaterialAdapter` instance and assert strict identity at completion;
+the adapter receives exact `projectId` from executor options plus command and
+idempotency IDs. Missing adapter disables external mutation before `request()`
+and post but leaves internal/bounded/query/fenced calls available; the backend
+fake receives no adapter-shaped value and takes no adapter-dependent branch.
+Compile-time negative fixtures prove all three executor context-free input
+aliases reject `context` and bounded/query `audience`; no overload accepts a raw
+draft/private bearer/audience/per-call adapter. Runtime tests cast malformed
+objects through `unknown`, prove executor-side strict encoding rejects the same
+fields before post, and prove no implementation destructures/drops them.
+Add the complete exact-result compile matrix specified after the executor API:
+one bounded literal, all three query literals, and all eleven fenced literals,
+with no explicit generics or result casts. These assertions are part of every
+subsequent `npm run test:build`, not an optional type-only appendix.
+Construct the executor/adapter pair before invoking `prepare` in every positive
+fixture.
+
+Run RED after the compile-only scaffold:
+
+```powershell
+npm run test:build
+if ($LASTEXITCODE -ne 0) { throw "test:build failed" }
+node --test --test-concurrency=1 --test-reporter=spec --test-name-pattern="^(preserves command identity after uncertain semantic delivery|preserves bounded identity after uncertain lifecycle delivery|preserves fenced selection identity after uncertain lifecycle delivery|routes read operations only through queryLifecycle|rejects caller project context at the executor boundary|adapter absence disables only external lifecycle mutation)$" dist-test/tests/lifecycle-executor.test.js dist-test/tests/project-store-executor.test.js dist-test/tests/authority-material-adapter.test.js
+if ($LASTEXITCODE -eq 0) { throw "Expected executor boundary behavioral RED" }
+```
+
+After implementing this boundary, run GREEN with a fresh build:
+
+```powershell
+npm run test:build
+if ($LASTEXITCODE -ne 0) { throw "test:build failed" }
+node --test --test-concurrency=1 --test-reporter=spec --test-name-pattern="^(preserves command identity after uncertain semantic delivery|preserves bounded identity after uncertain lifecycle delivery|preserves fenced selection identity after uncertain lifecycle delivery|routes read operations only through queryLifecycle|rejects caller project context at the executor boundary|adapter absence disables only external lifecycle mutation)$" dist-test/tests/lifecycle-executor.test.js dist-test/tests/project-store-executor.test.js dist-test/tests/authority-material-adapter.test.js
+if ($LASTEXITCODE -ne 0) { throw "executor boundary GREEN failed" }
+```
+
+- [ ] **Step 5: RED/GREEN one-connection runtime composition and current Task 1-12 router**
+
+Add exact tests named:
+
+- `checkpoints run through one prepared semantic transaction`
+- `evidence batches run through one prepared semantic transaction`
+- `reserves future lifecycle handlers before every side effect`
+- `conflicts cross-version checkpoint identity reuse`
+- `constructs one connection-bound runtime with exact factory ownership`
+
+Prove fresh checkpoint and evidence execution each enters one semantic store
+transaction, establishes one verified invocation scope, calls its service once,
+lets the Task 12 store-owned projection hook run, and commits dedup once. Prove
+exact replay enters none of those fresh callbacks. Direct transaction-scoped
+service calls fail without the owned scope. Prove root/child/bounded/query routes
+hit only the table above. Iterate the entire reserved set and assert exact
+`LIFECYCLE_OPERATION_UNAVAILABLE` with zero event/dedup/workflow/repository/FS
+effect. Execute Version 1 checkpoint, exact replay, then same command/
+idempotency identity with Version 2 input and prove `IDEMPOTENCY_CONFLICT` before
+fresh service/projection work. Instantiate the named concrete factory and assert
+it returns `ConnectionBoundLifecycleWorkerRuntime`. Spy constructor/facade calls:
+exactly five state repository constructors and exactly one projection-writer
+constructor run once, all receive the required exact connection/provider/fence,
+the projection writer is an explicit own semantic-store property, all seven
+runtime options are the named instances, and driver open count remains one.
+Use a receiver-dependent clock fake whose `now()` reads mutable state through
+`this`; invoke a semantic-store path after factory construction and prove
+`now: () => clock.now()` observes the latest receiver state without an unbound
+method failure.
+
+Run RED after the compile-only scaffold:
+
+```powershell
+npm run test:build
+if ($LASTEXITCODE -ne 0) { throw "test:build failed" }
+node --test --test-concurrency=1 --test-reporter=spec --test-name-pattern="^(checkpoints run through one prepared semantic transaction|evidence batches run through one prepared semantic transaction|reserves future lifecycle handlers before every side effect|conflicts cross-version checkpoint identity reuse|constructs one connection-bound runtime with exact factory ownership)$" dist-test/tests/lifecycle-worker-runtime.test.js dist-test/tests/checkpoint.service.test.js dist-test/tests/evidence-coverage.test.js
+if ($LASTEXITCODE -eq 0) { throw "Expected runtime routing behavioral RED" }
+```
+
+After implementing this boundary, run GREEN with a fresh build:
+
+```powershell
+npm run test:build
+if ($LASTEXITCODE -ne 0) { throw "test:build failed" }
+node --test --test-concurrency=1 --test-reporter=spec --test-name-pattern="^(checkpoints run through one prepared semantic transaction|evidence batches run through one prepared semantic transaction|reserves future lifecycle handlers before every side effect|conflicts cross-version checkpoint identity reuse|constructs one connection-bound runtime with exact factory ownership)$" dist-test/tests/lifecycle-worker-runtime.test.js dist-test/tests/checkpoint.service.test.js dist-test/tests/evidence-coverage.test.js
+if ($LASTEXITCODE -ne 0) { throw "runtime routing GREEN failed" }
+```
+
+- [ ] **Step 6: Run all exact Task 13 anchors together**
+
+```powershell
+npm run test:build
+if ($LASTEXITCODE -ne 0) { throw "test:build failed" }
+$pattern = '^(rejects mixed nested checkpoint and request versions|rejects caller project context on lifecycle operation wires|caps lifecycle wire JSON at the exact UTF-8 boundary|enforces fork-only child-binding grants without echo|materialization wire carries identity only|derives internal final checkpoint version from plan and authoritative command|requires both lifecycle factory and the exact provider instance|production lifecycle routing stays disabled with zero SQLite effect|distinguishes an unavailable lifecycle operation from a disabled runtime|preserves command identity after uncertain semantic delivery|preserves bounded identity after uncertain lifecycle delivery|preserves fenced selection identity after uncertain lifecycle delivery|routes read operations only through queryLifecycle|rejects caller project context at the executor boundary|adapter absence disables only external lifecycle mutation|checkpoints run through one prepared semantic transaction|evidence batches run through one prepared semantic transaction|reserves future lifecycle handlers before every side effect|conflicts cross-version checkpoint identity reuse|constructs one connection-bound runtime with exact factory ownership)$'
+node --test --test-concurrency=1 --test-reporter=spec --test-name-pattern=$pattern dist-test/tests/lifecycle-worker-protocol.test.js dist-test/tests/lifecycle-worker-runtime.test.js dist-test/tests/lifecycle-executor.test.js dist-test/tests/project-store-executor.test.js dist-test/tests/lifecycle-contracts.test.js dist-test/tests/lifecycle-operational-store.test.js dist-test/tests/authority-material-adapter.test.js dist-test/tests/checkpoint.service.test.js dist-test/tests/evidence-coverage.test.js
+if ($LASTEXITCODE -ne 0) { throw "Task 13 exact-anchor gate failed" }
+```
+
+Expected: all twenty anchors execute and pass; no pattern is vacuous.
+
+- [ ] **Step 7: Run focused boundary and full regression gates**
+
+```powershell
+npm run test:build
+if ($LASTEXITCODE -ne 0) { throw "test:build failed" }
+node --test --test-concurrency=1 --test-reporter=spec dist-test/tests/lifecycle-worker-protocol.test.js dist-test/tests/lifecycle-worker-runtime.test.js dist-test/tests/lifecycle-executor.test.js dist-test/tests/project-store-executor.test.js dist-test/tests/lifecycle-contracts.test.js dist-test/tests/lifecycle-operational-store.test.js dist-test/tests/authority-material-adapter.test.js dist-test/tests/lifecycle-command-store.test.js dist-test/tests/lifecycle-command-processor.test.js dist-test/tests/child-workflow.test.js dist-test/tests/checkpoint.service.test.js dist-test/tests/evidence-coverage.test.js dist-test/tests/event-append-transaction.test.js
+if ($LASTEXITCODE -ne 0) { throw "Task 13 focused boundary suite failed" }
+npm run typecheck
+if ($LASTEXITCODE -ne 0) { throw "typecheck failed" }
+npm run build
+if ($LASTEXITCODE -ne 0) { throw "build failed" }
+npm run test:build-artifacts
+if ($LASTEXITCODE -ne 0) { throw "test:build-artifacts failed" }
+npm test
+if ($LASTEXITCODE -ne 0) { throw "npm test failed" }
+git diff --check
+if ($LASTEXITCODE -ne 0) { throw "git diff --check failed" }
+```
+
+Expected: strict nested versions round-trip; caller context never crosses;
+current Task 1-12 handlers execute; reserved handlers remain unavailable;
+production remains lifecycle-disabled; adapter absence affects only external
+mutation; failed-open/dispose cleanup leaves no row or handle; exact authority
+and unknown identities are preserved; the concrete factory builds five state
+repositories plus one projection writer on one connection; all focused,
+artifact, and full-suite gates pass from one commit candidate.
+
+- [ ] **Step 8: Commit the exact Task 13 scope**
+
+Confirm `git diff --name-only` contains only the files listed as Create/Modify
+above. In particular, production `src/workers/project-store.worker.ts`, the
+authority adapter, child workflow service, Task 12 projection files, and
+`.superpowers/` scratch files are not staged unless a separately reviewed real
+defect required an explicit plan amendment.
+
+```powershell
+git add src/orchestrator/runtime/lifecycle-worker-protocol.ts src/orchestrator/runtime/lifecycle-worker-runtime.ts src/orchestrator/runtime/lifecycle-worker-runtime.factory.ts src/orchestrator/runtime/worker-protocol.ts src/orchestrator/runtime/project-store-executor.ts src/orchestrator/runtime/project-store-worker-backend.ts src/orchestrator/lifecycle/contracts/commands.ts src/orchestrator/lifecycle/errors.ts src/orchestrator/lifecycle/lifecycle-operational.store.ts tests/lifecycle-worker-protocol.test.ts tests/lifecycle-worker-runtime.test.ts tests/lifecycle-executor.test.ts tests/lifecycle-contracts.test.ts tests/lifecycle-operational-store.test.ts tests/project-store-executor.test.ts
+if ($LASTEXITCODE -ne 0) { throw "Task 13 git add failed" }
+git diff --cached --name-only
+if ($LASTEXITCODE -ne 0) { throw "cached name inspection failed" }
+git diff --cached --check
+if ($LASTEXITCODE -ne 0) { throw "cached diff check failed" }
+git commit -m "feat: add disabled lifecycle worker protocol"
+if ($LASTEXITCODE -ne 0) { throw "Task 13 commit failed" }
+```
+
+After commit, run fresh specification and quality/security reviews against the
+same Task 13 base/HEAD pair. Do not begin Task 14 while any Critical or Important
+finding remains.
 
 ---
-
 ### Task 14: Create the Generation-Fenced Session-End Workflow
 
 **Files:**
@@ -2738,6 +3428,7 @@ git commit -m "feat: add disabled lifecycle worker protocol"
 - Modify: `src/orchestrator/lifecycle/child-workflow.service.ts`
 - Modify: `src/orchestrator/storage/session-authority.repository.ts`
 - Modify: `src/orchestrator/storage/child-transfer.repository.ts`
+- Modify: `src/orchestrator/runtime/lifecycle-worker-runtime.ts`
 - Modify: `src/orchestrator/runtime/lifecycle-worker-runtime.factory.ts`
 - Modify: `tests/lifecycle-executor.test.ts`
 
@@ -3139,7 +3830,7 @@ Expected: policy arithmetic, whole-scope Version 1 gating, canonical final bindi
 - [ ] **Step 8: Commit**
 
 ```powershell
-git add src/orchestrator/lifecycle/session-end-policy.ts src/orchestrator/storage/session-end.repository.ts src/orchestrator/lifecycle/session-end-workflow.service.ts src/orchestrator/lifecycle/session-end.coordinator.ts src/orchestrator/lifecycle/materialization-queue.port.ts src/orchestrator/lifecycle/contracts/session-end.ts src/orchestrator/lifecycle/contracts/commands.ts src/orchestrator/lifecycle/checkpoint.service.ts src/orchestrator/lifecycle/child-workflow.service.ts src/orchestrator/storage/session-authority.repository.ts src/orchestrator/storage/child-transfer.repository.ts src/orchestrator/runtime/lifecycle-worker-runtime.factory.ts tests/session-end-policy.test.ts tests/session-end.coordinator.test.ts tests/lifecycle-executor.test.ts
+git add src/orchestrator/lifecycle/session-end-policy.ts src/orchestrator/storage/session-end.repository.ts src/orchestrator/lifecycle/session-end-workflow.service.ts src/orchestrator/lifecycle/session-end.coordinator.ts src/orchestrator/lifecycle/materialization-queue.port.ts src/orchestrator/lifecycle/contracts/session-end.ts src/orchestrator/lifecycle/contracts/commands.ts src/orchestrator/lifecycle/checkpoint.service.ts src/orchestrator/lifecycle/child-workflow.service.ts src/orchestrator/storage/session-authority.repository.ts src/orchestrator/storage/child-transfer.repository.ts src/orchestrator/runtime/lifecycle-worker-runtime.ts src/orchestrator/runtime/lifecycle-worker-runtime.factory.ts tests/session-end-policy.test.ts tests/session-end.coordinator.test.ts tests/lifecycle-executor.test.ts
 git commit -m "feat: persist session end workflow"
 ```
 
@@ -3168,7 +3859,8 @@ git commit -m "feat: persist session end workflow"
 - Modify: `src/orchestrator/lifecycle/checkpoint.service.ts`
 - Modify: `src/orchestrator/lifecycle/lifecycle-operational.store.ts`
 - Modify: `tests/session-end.coordinator.test.ts`
-- Modify: `tests/lifecycle-operational.store.test.ts`
+- Modify: `tests/lifecycle-operational-store.test.ts`
+- Modify: `src/orchestrator/runtime/lifecycle-worker-runtime.ts`
 - Modify: `src/orchestrator/runtime/lifecycle-worker-runtime.factory.ts`
 - Modify: `tests/lifecycle-executor.test.ts`
 
@@ -3421,7 +4113,7 @@ Expected: trusted-only execution, immutable binding, deterministic policy, all t
 - [ ] **Step 9: Commit**
 
 ```powershell
-git add src/orchestrator/lifecycle/validation-profile.registry.ts src/orchestrator/lifecycle/validation-profile.runner.ts src/orchestrator/lifecycle/source-state.provider.ts src/orchestrator/lifecycle/materialization-queue.port.ts src/orchestrator/lifecycle/checkpoint.service.ts src/orchestrator/lifecycle/lifecycle-operational.store.ts src/orchestrator/storage/lifecycle-validation-result.repository.ts src/orchestrator/storage/evidence-coverage.repository.ts src/orchestrator/storage/session-authority.repository.ts src/orchestrator/storage/child-transfer.repository.ts src/orchestrator/lifecycle/lifecycle-recovery.coordinator.ts src/orchestrator/lifecycle/session-end-workflow.service.ts src/orchestrator/lifecycle/session-end.coordinator.ts src/orchestrator/lifecycle/contracts/events.ts src/orchestrator/lifecycle/contracts/session-end.ts src/orchestrator/storage/session-end.repository.ts src/orchestrator/storage/lifecycle-approval.repository.ts src/orchestrator/runtime/lifecycle-worker-runtime.factory.ts tests/validation-profile-runner.test.ts tests/lifecycle-recovery.test.ts tests/session-end.coordinator.test.ts tests/lifecycle-operational.store.test.ts tests/lifecycle-executor.test.ts
+git add src/orchestrator/lifecycle/validation-profile.registry.ts src/orchestrator/lifecycle/validation-profile.runner.ts src/orchestrator/lifecycle/source-state.provider.ts src/orchestrator/lifecycle/materialization-queue.port.ts src/orchestrator/lifecycle/checkpoint.service.ts src/orchestrator/lifecycle/lifecycle-operational.store.ts src/orchestrator/storage/lifecycle-validation-result.repository.ts src/orchestrator/storage/evidence-coverage.repository.ts src/orchestrator/storage/session-authority.repository.ts src/orchestrator/storage/child-transfer.repository.ts src/orchestrator/lifecycle/lifecycle-recovery.coordinator.ts src/orchestrator/lifecycle/session-end-workflow.service.ts src/orchestrator/lifecycle/session-end.coordinator.ts src/orchestrator/lifecycle/contracts/events.ts src/orchestrator/lifecycle/contracts/session-end.ts src/orchestrator/storage/session-end.repository.ts src/orchestrator/storage/lifecycle-approval.repository.ts src/orchestrator/runtime/lifecycle-worker-runtime.ts src/orchestrator/runtime/lifecycle-worker-runtime.factory.ts tests/validation-profile-runner.test.ts tests/lifecycle-recovery.test.ts tests/session-end.coordinator.test.ts tests/lifecycle-operational-store.test.ts tests/lifecycle-executor.test.ts
 git commit -m "feat: verify and recover session end"
 ```
 
@@ -3445,6 +4137,7 @@ git commit -m "feat: verify and recover session end"
 - Modify: `src/orchestrator/lifecycle/lifecycle-recovery.coordinator.ts`
 - Modify: `src/orchestrator/storage/session-end.repository.ts`
 - Modify: `src/orchestrator/integrity/lifecycle-integrity.service.ts`
+- Modify: `src/orchestrator/runtime/lifecycle-worker-runtime.ts`
 - Modify: `src/orchestrator/runtime/lifecycle-worker-runtime.factory.ts`
 - Modify: `tests/lifecycle-executor.test.ts`
 
@@ -3693,7 +4386,7 @@ Expected: V1/V2 golden bytes/path, privacy-preserving qualified summaries, open/
 - [ ] **Step 9: Commit**
 
 ```powershell
-git add src/orchestrator/storage/lifecycle-outbox.repository.ts src/orchestrator/materialization src/orchestrator/lifecycle/materialization-queue.port.ts src/orchestrator/lifecycle/lifecycle-operational.store.ts src/orchestrator/lifecycle/session-end-workflow.service.ts src/orchestrator/lifecycle/session-end.coordinator.ts src/orchestrator/lifecycle/lifecycle-recovery.coordinator.ts src/orchestrator/storage/session-end.repository.ts src/orchestrator/integrity/lifecycle-integrity.service.ts src/orchestrator/runtime/lifecycle-worker-runtime.factory.ts tests/compatibility-log-renderer.test.ts tests/compatibility-log-materializer.test.ts tests/lifecycle-executor.test.ts
+git add src/orchestrator/storage/lifecycle-outbox.repository.ts src/orchestrator/materialization src/orchestrator/lifecycle/materialization-queue.port.ts src/orchestrator/lifecycle/lifecycle-operational.store.ts src/orchestrator/lifecycle/session-end-workflow.service.ts src/orchestrator/lifecycle/session-end.coordinator.ts src/orchestrator/lifecycle/lifecycle-recovery.coordinator.ts src/orchestrator/storage/session-end.repository.ts src/orchestrator/integrity/lifecycle-integrity.service.ts src/orchestrator/runtime/lifecycle-worker-runtime.ts src/orchestrator/runtime/lifecycle-worker-runtime.factory.ts tests/compatibility-log-renderer.test.ts tests/compatibility-log-materializer.test.ts tests/lifecycle-executor.test.ts
 git commit -m "feat: fence compatibility log materialization"
 ```
 
