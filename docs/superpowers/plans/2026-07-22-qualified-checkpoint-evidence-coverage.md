@@ -2109,11 +2109,12 @@ schema-2 legacy regression proving that this narrow schema-3 boundary does not
 change legacy/pre-qualified behavior.
 
 **Task 12J fix-round-3 upgrade-fixture scope amendment:** Qualified full replay
-now hydrates the synthetic `SessionStarted` row used by the ordinary integrity
-worker regression in `tests/project-store-upgrade.test.ts`. That hand-built
-post-upgrade fixture used a placeholder `payload_hash` instead of the SHA-256
-of its canonical payload, while the adjacent lifecycle append helper already
-uses the correct hash. Correct only that fixture at its source; do not weaken
+now hydrates the synthetic lifecycle rows used by the post-upgrade integrity
+regressions in `tests/project-store-upgrade.test.ts`. The initial root helper
+used a placeholder `payload_hash`; a first focused correction exposed that the
+adjacent append helper's undomained SHA-256 is also not the production payload
+hash algorithm. Import and use the production `payloadHash` helper for only
+those two synthetic payload-hash bindings. Do not change `event_hash`, weaken
 `hydrateReplayEvent`, alter migration behavior, or broaden the upgrade test.
 
 The honest complexity contract is:
@@ -2657,9 +2658,9 @@ witnesses, and workflow generations after the classifier move. Do not edit or
 stage it for Task 12J; run the existing suite unchanged in Step 9.
 
 `tests/project-store-upgrade.test.ts` is otherwise a regression consumer. Its
-only permitted Task 12J edit is replacing the strict-invalid placeholder
-payload hash in the named post-upgrade fixture with the independently computed
-canonical payload hash proven by the adjacent working helper.
+only permitted Task 12J edit is importing the production payload-hash helper
+and replacing the strict-invalid placeholder/undomained payload-hash bindings
+in the two synthetic lifecycle-event helpers named by the amendment.
 
 - [ ] **Step 10: Stage exactly the permitted Task 12J scope and commit**
 
