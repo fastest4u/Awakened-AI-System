@@ -178,8 +178,36 @@ git commit -m "feat: define session end effective state"
 
 - Modify: `src/orchestrator/lifecycle/contracts/events.ts`
 - Modify: `src/orchestrator/lifecycle/session-aggregate.ts`
+- Modify: `src/orchestrator/storage/session-authority.repository.ts`
+- Modify: `src/orchestrator/lifecycle/lifecycle-projection-folds.ts`
+- Modify: `src/orchestrator/storage/lifecycle-projection.repository.ts`
+- Modify: `src/orchestrator/integrity/lifecycle-integrity.service.ts`
 - Modify: `tests/lifecycle-contracts.test.ts`
 - Modify: `tests/session-aggregate.test.ts`
+- Modify if required: `tests/session-authority.repository.test.ts`
+- Modify if required: `tests/lifecycle-projection-folds.test.ts`
+- Modify if required: `tests/lifecycle-storage.repositories.test.ts`
+- Modify if required: `tests/qualified-checkpoint-quick-integrity.test.ts`
+- Modify if required: `tests/qualified-checkpoint-full-integrity.test.ts`
+
+- [ ] **Approved fix: make raw decoding truthful and deferred consumers fail closed**
+
+`decodeLifecycleEvent(value: unknown)` returns the complete V1/V2/V3 codec
+union. Add one explicit Version 1/Version 2-only decoder that rejects outer
+Version 3. Route exactly the six unready raw-storage calls in session authority,
+projection folds, projection repository, and lifecycle integrity through that
+temporary decoder. Do not implement their Version 3 semantics in this task.
+Their owning later tasks replace the boundary as specified in design section
+5.3.
+
+```powershell
+npm run test:build
+node --test --test-concurrency=1 --test-reporter=spec --test-name-pattern="^keeps raw lifecycle decoding truthful while legacy consumers fail closed$" dist-test/tests/lifecycle-contracts.test.js
+npm run test:build
+node --test --test-concurrency=1 --test-reporter=spec dist-test/tests/lifecycle-contracts.test.js dist-test/tests/session-aggregate.test.js dist-test/tests/session-authority.repository.test.js dist-test/tests/lifecycle-projection-folds.test.js dist-test/tests/lifecycle-storage.repositories.test.js dist-test/tests/qualified-checkpoint-quick-integrity.test.js dist-test/tests/qualified-checkpoint-full-integrity.test.js
+npm run typecheck
+git diff --check
+```
 
 - [ ] **Step 1: Write the current/legacy event matrix RED**
 

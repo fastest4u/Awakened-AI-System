@@ -320,6 +320,18 @@ distinguishable from legacy same-generation history. The decoder does not
 silently generalize a historical migration preflight to accept later outer
 versions.
 
+The public unknown-input decoder returns the truthful complete codec union:
+Version 1, Version 2, or Version 3. Consumers whose owning task has not yet
+implemented Version 3 semantics must call the separate explicit Version
+1/Version 2-only decoder, which rejects every outer Version 3 event before it
+crosses that boundary. Task 14M.4 replaces this temporary boundary in workflow
+projection folds and their repository; Task 14M.5 replaces it in lifecycle
+integrity; Tasks 14R.2 and 14R.3 replace it in session-authority replay before
+the Version 3 producers land. Task 14S.2 remains responsible for the Version 2
+transfer projection, authority, and integrity lineage semantics. No overload
+may claim an unknown input returns only a historical subset while accepting a
+newer version at runtime.
+
 ### 5.4 Intent and context correlation
 
 The service and integrity paths independently prove:
