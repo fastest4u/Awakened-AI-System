@@ -822,6 +822,70 @@ function internalValidationCommand(): Record<string, unknown> {
   };
 }
 
+type TestCapabilityKind =
+  | "root-session-handle"
+  | "root-resume-token"
+  | "child-session-handle";
+
+interface TestAuthorityScope {
+  readonly projectId: string;
+  readonly vaultId: string;
+  readonly storeId: string;
+  readonly workspaceId: string;
+  readonly clientNamespace: string;
+  readonly sessionId: string;
+  readonly capabilityGeneration: string;
+}
+
+const EXPECTED_ROOT_AUTHORITY_SCOPE: TestAuthorityScope = Object.freeze({
+  projectId: IDS.project,
+  vaultId: IDS.vault,
+  storeId: IDS.store,
+  workspaceId: HASH,
+  clientNamespace: "codex",
+  sessionId: IDS.session,
+  capabilityGeneration: "1",
+});
+
+function currentAuthorityMaterial(
+  scope: TestAuthorityScope,
+  kinds: readonly TestCapabilityKind[],
+): Record<string, unknown> {
+  const target = kinds.includes("child-session-handle")
+    ? { actorRole: "untrusted", clientInstanceId: "child/client-a" }
+    : { actorRole: "primary", clientInstanceId: "codex/client-a" };
+  const materials = kinds.map((kind, index) => ({
+    claims: {
+      capabilityVersion: 1,
+      keyId: `capability-key-${index + 1}`,
+      ...scope,
+      kind,
+      issuedAt: "2026-07-17T00:00:00.000Z",
+      policyCode: kind === "child-session-handle" ? "child-default-v1" : "root-current",
+      expiryKind: "until-revoked",
+      expiresAt: null,
+      issueNonce: index === 0 ? HASH : OTHER_HASH,
+      actorRole: kind === "child-session-handle" ? "untrusted" : "primary",
+      clientInstanceId: kind === "root-resume-token" ? null : target.clientInstanceId,
+    },
+    verifier: index === 0 ? HASH : OTHER_HASH,
+  }));
+  return {
+    status: "current",
+    target,
+    authorityCommitment: OTHER_HASH,
+    capabilityGeneration: scope.capabilityGeneration,
+    descriptor: {
+      descriptorVersion: 1,
+      authorityCommitment: OTHER_HASH,
+      capabilityGeneration: scope.capabilityGeneration,
+      target,
+      materials,
+    },
+    recoveryCode: null,
+  };
+}
+
 function rootStartOperationWire(): Record<string, unknown> {
   const command = semanticCommandCases().find((candidate) => candidate.commandType === "root-start");
   assert.ok(command);
@@ -2693,56 +2757,305 @@ describe("lifecycle worker protocol", () => {
     assert.equal(decodeLifecycleWorkerSuccessForOperation.length, 2);
   });
 
+  // Production mutation caught: decode current authority material independently from its semantic result and request.
+  it("binds current authority material to the semantic result and issuance family", () => {
+    const commandFor = (operation: string): Readonly<Record<string, unknown>> => {
+      const command = semanticCommandCases().find((candidate) => candidate.commandType === operation);
+      assert.ok(command !== undefined, operation);
+      return command;
+    };
+    const requestedFor = (
+      command: Readonly<Record<string, unknown>>,
+      childBindingGrant: ChildBindingGrantV1 | null = null,
+    ): LifecycleWorkerOperationWire => decodeLifecycleWorkerOperationWire({
+      kind: "semantic",
+      operation: command.commandType,
+      prepared: prepared(
+        command as Record<string, unknown>,
+        semanticAuthorizationFor(command, childBindingGrant),
+      ),
+    });
+    const decodeCurrent = (
+      requested: LifecycleWorkerOperationWire,
+      publicResult: Record<string, unknown>,
+      authorityMaterial: Record<string, unknown>,
+    ): LifecycleWorkerSuccessWire => decodeLifecycleWorkerSuccessForOperation({
+      operation: requested.operation,
+      nestedContractVersion: lifecycleNestedContractVersion(requested),
+      result: {
+        ...semanticSuccess(publicResult),
+        authorityMaterial,
+      },
+    }, requested);
+
+    const rootOperations = [
+      "root-start",
+      "root-resume",
+      "root-recovery",
+      "root-suspend",
+    ] as const;
+    assert.equal(rootOperations.length, 4);
+    for (const operation of rootOperations) {
+      const publicResult = rootResult(operation);
+      assert.doesNotThrow(() => decodeCurrent(
+        requestedFor(commandFor(operation)),
+        publicResult,
+        currentAuthorityMaterial(
+          {
+            ...EXPECTED_ROOT_AUTHORITY_SCOPE,
+            capabilityGeneration: publicResult.ownerGeneration as string,
+          },
+          ["root-session-handle", "root-resume-token"],
+        ),
+      ), operation);
+    }
+    const rootRequested = requestedFor(commandFor("root-start"));
+    const rootCases: ReadonlyArray<{
+      readonly name: string;
+      readonly material: Record<string, unknown>;
+    }> = [
+      {
+        name: "project",
+        material: currentAuthorityMaterial(
+          { ...EXPECTED_ROOT_AUTHORITY_SCOPE, projectId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" },
+          ["root-session-handle", "root-resume-token"],
+        ),
+      },
+      {
+        name: "vault",
+        material: currentAuthorityMaterial(
+          { ...EXPECTED_ROOT_AUTHORITY_SCOPE, vaultId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb" },
+          ["root-session-handle", "root-resume-token"],
+        ),
+      },
+      {
+        name: "store",
+        material: currentAuthorityMaterial(
+          { ...EXPECTED_ROOT_AUTHORITY_SCOPE, storeId: "cccccccc-cccc-4ccc-8ccc-cccccccccccc" },
+          ["root-session-handle", "root-resume-token"],
+        ),
+      },
+      {
+        name: "workspace",
+        material: currentAuthorityMaterial(
+          { ...EXPECTED_ROOT_AUTHORITY_SCOPE, workspaceId: OTHER_HASH },
+          ["root-session-handle", "root-resume-token"],
+        ),
+      },
+      {
+        name: "client namespace",
+        material: currentAuthorityMaterial(
+          { ...EXPECTED_ROOT_AUTHORITY_SCOPE, clientNamespace: "other-client" },
+          ["root-session-handle", "root-resume-token"],
+        ),
+      },
+      {
+        name: "session",
+        material: currentAuthorityMaterial(
+          { ...EXPECTED_ROOT_AUTHORITY_SCOPE, sessionId: IDS.work },
+          ["root-session-handle", "root-resume-token"],
+        ),
+      },
+      {
+        name: "generation",
+        material: currentAuthorityMaterial(
+          { ...EXPECTED_ROOT_AUTHORITY_SCOPE, capabilityGeneration: "2" },
+          ["root-session-handle", "root-resume-token"],
+        ),
+      },
+      {
+        name: "missing resume token",
+        material: currentAuthorityMaterial(
+          EXPECTED_ROOT_AUTHORITY_SCOPE,
+          ["root-session-handle"],
+        ),
+      },
+      {
+        name: "duplicate root handle",
+        material: currentAuthorityMaterial(
+          EXPECTED_ROOT_AUTHORITY_SCOPE,
+          ["root-session-handle", "root-session-handle"],
+        ),
+      },
+    ];
+    assert.equal(rootCases.length, 9);
+    for (const entry of rootCases) {
+      expectLifecycleField(
+        () => decodeCurrent(rootRequested, rootResult(), entry.material),
+        "success.result.authorityMaterial",
+      );
+    }
+
+    const directForkCommand = {
+      ...commandFor("fork-child"),
+      directAccessRequested: true,
+    };
+    const directForkRequested = requestedFor(directForkCommand, validChildBindingGrant());
+    const directForkResult = {
+      ...childResult("fork-child"),
+      directAccessEnabled: true,
+    };
+    const expectedChildScope: TestAuthorityScope = {
+      ...EXPECTED_ROOT_AUTHORITY_SCOPE,
+      sessionId: IDS.work,
+    };
+    assert.doesNotThrow(() => decodeCurrent(
+      directForkRequested,
+      directForkResult,
+      currentAuthorityMaterial(expectedChildScope, ["child-session-handle"]),
+    ));
+    const forkCases: ReadonlyArray<{
+      readonly name: string;
+      readonly material: Record<string, unknown>;
+    }> = [
+      {
+        name: "project",
+        material: currentAuthorityMaterial(
+          { ...expectedChildScope, projectId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" },
+          ["child-session-handle"],
+        ),
+      },
+      {
+        name: "vault",
+        material: currentAuthorityMaterial(
+          { ...expectedChildScope, vaultId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb" },
+          ["child-session-handle"],
+        ),
+      },
+      {
+        name: "workspace",
+        material: currentAuthorityMaterial(
+          { ...expectedChildScope, workspaceId: OTHER_HASH },
+          ["child-session-handle"],
+        ),
+      },
+      {
+        name: "session",
+        material: currentAuthorityMaterial(
+          { ...expectedChildScope, sessionId: IDS.nonce },
+          ["child-session-handle"],
+        ),
+      },
+      {
+        name: "generation",
+        material: currentAuthorityMaterial(
+          { ...expectedChildScope, capabilityGeneration: "2" },
+          ["child-session-handle"],
+        ),
+      },
+      {
+        name: "kind",
+        material: currentAuthorityMaterial(
+          expectedChildScope,
+          ["root-session-handle"],
+        ),
+      },
+    ];
+    assert.equal(forkCases.length, 6);
+    for (const entry of forkCases) {
+      expectLifecycleField(
+        () => decodeCurrent(directForkRequested, directForkResult, entry.material),
+        "success.result.authorityMaterial",
+      );
+    }
+
+    const nonIssuingCases: ReadonlyArray<{
+      readonly requested: LifecycleWorkerOperationWire;
+      readonly publicResult: Record<string, unknown>;
+      readonly material: Record<string, unknown>;
+    }> = [
+      {
+        requested: requestedFor(commandFor("fork-child")),
+        publicResult: childResult("fork-child"),
+        material: currentAuthorityMaterial(expectedChildScope, ["child-session-handle"]),
+      },
+      {
+        requested: requestedFor(commandFor("amend-child-assignment")),
+        publicResult: childResult("amend-child-assignment"),
+        material: currentAuthorityMaterial(expectedChildScope, ["child-session-handle"]),
+      },
+    ];
+    assert.equal(nonIssuingCases.length, 2);
+    for (const entry of nonIssuingCases) {
+      expectLifecycleField(
+        () => decodeCurrent(entry.requested, entry.publicResult, entry.material),
+        "success.result.authorityMaterial",
+      );
+    }
+
+    const nonCurrentCases = [
+      { status: "stale", recoveryCode: "SESSION_HANDLE_STALE" },
+      { status: "unavailable", recoveryCode: null },
+      { status: "not-issued", recoveryCode: null },
+    ] as const;
+    assert.equal(nonCurrentCases.length, 3);
+    for (const entry of nonCurrentCases) {
+      const decoded = decodeCurrent(rootRequested, rootResult(), {
+        status: entry.status,
+        target: null,
+        authorityCommitment: null,
+        capabilityGeneration: null,
+        descriptor: null,
+        recoveryCode: entry.recoveryCode,
+      });
+      const result = decoded.result as Readonly<Record<string, JsonValue>>;
+      const authorityMaterial = result.authorityMaterial as Readonly<Record<string, JsonValue>>;
+      assert.equal(authorityMaterial.status, entry.status);
+      assert.equal(authorityMaterial.recoveryCode, entry.recoveryCode);
+    }
+  });
+
   // Production mutation caught: bind only operation-known top-level claim project identities.
   it("binds every decoded lifecycle result project identity to the outer request", () => {
+    const input = fencedOperationInputs().find(
+      (candidate) => candidate.operation === "workflow-claim-next",
+    );
+    assert.ok(input !== undefined);
+    const request = decodeWorkerRequest({
+      id: IDS.work,
+      type: "lifecycle",
+      binding: bindingAssertion(),
+      operation: { kind: "fenced", operation: "workflow-claim-next", input },
+    });
+    assert.equal(request.type, "lifecycle");
+    const data = {
+      operation: "workflow-claim-next",
+      nestedContractVersion: null,
+      result: {
+        ...workflowClaimResult(),
+        projectId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      },
+    };
+    assert.doesNotThrow(() => decodeLifecycleWorkerSuccessForOperation(
+      data,
+      request.operation,
+    ));
+    assert.throws(
+      () => decodeWorkerResponseForRequest({
+        id: IDS.work,
+        ok: true,
+        data,
+      }, request),
+      (error: unknown) => error instanceof WorkerProtocolError,
+    );
+  });
+
+  // Production mutation caught: bind decoded project identities but ignore an active-store identity.
+  it("binds every decoded lifecycle result store identity to the outer request", () => {
     const request = decodeWorkerRequest(lifecycleRequestEnvelope());
     assert.equal(request.type, "lifecycle");
-    const target = {
-      actorRole: "primary",
-      clientInstanceId: "codex/client-a",
-    };
+    const publicResult = rootResult();
+    const project = publicResult.project as Readonly<Record<string, unknown>>;
     const data = {
       operation: "root-start",
       nestedContractVersion: null,
-      result: {
-        kind: "success",
-        publicResult: rootResult(),
-        authorityMaterial: {
-          status: "current",
-          target,
-          authorityCommitment: OTHER_HASH,
-          capabilityGeneration: "1",
-          descriptor: {
-            descriptorVersion: 1,
-            authorityCommitment: OTHER_HASH,
-            capabilityGeneration: "1",
-            target,
-            materials: [{
-              claims: {
-                capabilityVersion: 1,
-                keyId: "capability-key-1",
-                projectId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
-                vaultId: IDS.vault,
-                storeId: IDS.store,
-                workspaceId: HASH,
-                clientNamespace: "codex",
-                sessionId: IDS.session,
-                kind: "root-session-handle",
-                capabilityGeneration: "1",
-                issuedAt: "2026-07-17T00:00:00.000Z",
-                policyCode: "root-current",
-                expiryKind: "until-revoked",
-                expiresAt: null,
-                issueNonce: HASH,
-                actorRole: "primary",
-                clientInstanceId: "codex/client-a",
-              },
-              verifier: HASH,
-            }],
-          },
-          recoveryCode: null,
+      result: semanticSuccess({
+        ...publicResult,
+        project: {
+          ...project,
+          storeId: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
         },
-      },
+      }),
     };
     assert.doesNotThrow(() => decodeLifecycleWorkerSuccessForOperation(
       data,

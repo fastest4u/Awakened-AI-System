@@ -925,6 +925,7 @@ function decodeOpen(value: unknown): WorkerOpenResult {
 function assertDecodedLifecycleProjectBinding(
   value: JsonValue,
   expectedProjectId: ProjectId,
+  expectedStoreId: StoreId,
 ): void {
   if (value === null || typeof value !== "object") return;
   for (const key of Reflect.ownKeys(value)) {
@@ -932,7 +933,12 @@ function assertDecodedLifecycleProjectBinding(
     const descriptor = Reflect.getOwnPropertyDescriptor(value, key);
     if (descriptor === undefined || !descriptor.enumerable || !("value" in descriptor)) continue;
     if (key === "projectId" && descriptor.value !== expectedProjectId) invalid();
-    assertDecodedLifecycleProjectBinding(descriptor.value as JsonValue, expectedProjectId);
+    if (key === "storeId" && descriptor.value !== expectedStoreId) invalid();
+    assertDecodedLifecycleProjectBinding(
+      descriptor.value as JsonValue,
+      expectedProjectId,
+      expectedStoreId,
+    );
   }
 }
 
@@ -960,6 +966,7 @@ function decodeSuccessForType(
       assertDecodedLifecycleProjectBinding(
         decoded.result,
         request.binding.projectId as ProjectId,
+        request.binding.storeId as StoreId,
       );
       return decoded;
     }

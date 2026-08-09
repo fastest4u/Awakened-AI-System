@@ -181,6 +181,33 @@ function safeDetails(value: unknown): Record<string, JsonValue> {
   return result;
 }
 
+function assertDecodedLifecycleContextBinding(
+  value: JsonValue,
+  context: ProjectContext,
+): void {
+  if (value === null || typeof value !== "object") return;
+  const expected: Readonly<Record<string, string>> = {
+    projectId: context.binding.projectId,
+    vaultId: context.binding.vaultId,
+    storeId: context.binding.storeId,
+    workspaceId: context.binding.workspaceId,
+    clientNamespace: context.binding.clientNamespace,
+  };
+  for (const key of Reflect.ownKeys(value)) {
+    if (typeof key !== "string") continue;
+    const descriptor = Reflect.getOwnPropertyDescriptor(value, key);
+    if (
+      descriptor === undefined
+      || !descriptor.enumerable
+      || !("value" in descriptor)
+    ) continue;
+    if (Object.hasOwn(expected, key) && descriptor.value !== expected[key]) {
+      throw new ProjectStoreWorkerError("WORKER_PROTOCOL_ERROR");
+    }
+    assertDecodedLifecycleContextBinding(descriptor.value as JsonValue, context);
+  }
+}
+
 export class ProjectStoreWorkerError extends Error {
   constructor(
     readonly code: string,
@@ -1031,6 +1058,10 @@ export class ProjectStoreExecutor {
     let response: WorkerResponse;
     try {
       response = decodeWorkerResponseForRequest(message, pending.request);
+      if (response.ok && pending.request.type === "lifecycle") {
+        const success = response.data as LifecycleWorkerSuccessWire;
+        assertDecodedLifecycleContextBinding(success.result, this.#options.context);
+      }
     } catch {
       this.poisonInBackground(new ProjectStoreWorkerError("WORKER_PROTOCOL_ERROR"));
       return;

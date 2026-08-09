@@ -47,7 +47,10 @@ import {
   LIFECYCLE_ERROR_CODES,
   LifecycleError,
 } from "../lifecycle/errors.js";
-import { decodeCapabilityClaims } from "../lifecycle/authority/capability-codec.js";
+import {
+  decodeCapabilityClaims,
+  type CapabilityClaimsV1,
+} from "../lifecycle/authority/capability-codec.js";
 import { decodeCheckpointRecordedResult } from "../lifecycle/checkpoint.service.js";
 import { decodeEvidenceCoverageRecordedResultV2 } from "../lifecycle/evidence-coverage.service.js";
 import { canonicalJson } from "../serialization/canonical-json.js";
@@ -1609,6 +1612,69 @@ function decodeWorkerAuthorityMaterial(value: JsonValue): Readonly<Record<string
   return material;
 }
 
+function currentAuthorityClaims(
+  material: Readonly<Record<string, JsonValue>>,
+): readonly CapabilityClaimsV1[] {
+  const descriptor = material.descriptor as Readonly<Record<string, JsonValue>>;
+  const materials = descriptor.materials as readonly JsonValue[];
+  return materials.map((value) => {
+    const stored = value as Readonly<Record<string, JsonValue>>;
+    return decodeCapabilityClaims(stored.claims);
+  });
+}
+
+function assertCurrentAuthorityMaterialCorrelation(
+  publicResult: JsonValue,
+  material: Readonly<Record<string, JsonValue>>,
+  requested: LifecycleSemanticOperationWire,
+): void {
+  if (material.status !== "current") return;
+  const claims = currentAuthorityClaims(material);
+  if (["root-start", "root-resume", "root-recovery", "root-suspend"].includes(
+    requested.operation,
+  )) {
+    const result = publicResult as unknown as RootSessionPublicResultV2;
+    const kinds = new Set(claims.map((claim) => claim.kind));
+    if (
+      claims.length !== 2
+      || kinds.size !== 2
+      || !kinds.has("root-session-handle")
+      || !kinds.has("root-resume-token")
+      || material.capabilityGeneration !== result.ownerGeneration
+      || claims.some((claim) => (
+        claim.projectId !== result.project.projectId
+        || claim.vaultId !== result.project.vaultId
+        || claim.storeId !== result.project.storeId
+        || claim.workspaceId !== result.project.workspaceId
+        || claim.clientNamespace !== result.project.clientNamespace
+        || claim.sessionId !== result.sessionId
+        || claim.capabilityGeneration !== result.ownerGeneration
+      ))
+    ) invalid("success.result.authorityMaterial");
+    return;
+  }
+  if (requested.operation === "fork-child") {
+    const result = publicResult as ChildWorkflowResultV2;
+    const command = requested.prepared.command;
+    if (
+      command.commandType !== "fork-child"
+      || command.directAccessRequested !== true
+      || requested.prepared.authorization.childBindingGrant === null
+      || result.directAccessEnabled !== true
+      || material.capabilityGeneration !== "1"
+      || claims.length !== 1
+      || claims[0]?.kind !== "child-session-handle"
+      || claims[0].projectId !== command.expectedProjectId
+      || claims[0].vaultId !== command.expectedVaultId
+      || claims[0].workspaceId !== command.expectedWorkspaceId
+      || claims[0].sessionId !== result.childSessionId
+      || claims[0].capabilityGeneration !== "1"
+    ) invalid("success.result.authorityMaterial");
+    return;
+  }
+  invalid("success.result.authorityMaterial");
+}
+
 function assertSemanticResultValue(
   actual: unknown,
   expected: unknown,
@@ -2094,10 +2160,13 @@ function decodeSemanticWorkerResult(
       ["kind", "publicResult", "authorityMaterial"],
       "success.result",
     );
+    const publicResult = decodeSemanticPublicResult(workerResult.publicResult, requested);
+    const authorityMaterial = decodeWorkerAuthorityMaterial(workerResult.authorityMaterial);
+    assertCurrentAuthorityMaterialCorrelation(publicResult, authorityMaterial, requested);
     return Object.freeze({
       kind: "success",
-      publicResult: decodeSemanticPublicResult(workerResult.publicResult, requested),
-      authorityMaterial: decodeWorkerAuthorityMaterial(workerResult.authorityMaterial),
+      publicResult,
+      authorityMaterial,
     });
   }
   const workerResult = exactSnapshot(value, ["kind", "errorCode"], "success.result");

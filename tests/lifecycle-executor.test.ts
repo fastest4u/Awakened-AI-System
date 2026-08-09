@@ -22,6 +22,7 @@ import {
 } from "../src/orchestrator/lifecycle/authority/authority-material-adapter.js";
 import { EncryptedPendingAuthorizationStore } from "../src/orchestrator/lifecycle/authority/encrypted-pending-authorization.store.js";
 import type { PendingCommandIdentity } from "../src/orchestrator/lifecycle/authority/pending-authorization.store.js";
+import { SecretString } from "../src/orchestrator/lifecycle/authority/redacted-secret.js";
 import { CapabilityService, type LifecycleAuthorityTarget, type RootOrChildAuthorityMaterial } from "../src/orchestrator/lifecycle/capability.service.js";
 import type {
   CapabilityProofV1,
@@ -70,6 +71,7 @@ const PROJECT_ID = "00000000-0000-4000-8000-000000000001" as ProjectId;
 const VAULT_ID = "00000000-0000-4000-8000-000000000002" as VaultId;
 const STORE_ID = "00000000-0000-4000-8000-000000000003" as StoreId;
 const SESSION_ID = "00000000-0000-4000-8000-000000000010" as SessionId;
+const CHILD_SESSION_ID = "00000000-0000-4000-8000-000000000012" as SessionId;
 const WORKFLOW_ID = "00000000-0000-4000-8000-000000000011" as WorkflowId;
 const COMMAND_ID = "00000000-0000-4000-8000-000000000020";
 const OPERATION_ID = "00000000-0000-4000-8000-000000000021";
@@ -371,6 +373,234 @@ function semanticSuccess(context: ProjectContext): LifecycleWorkerSuccessWire {
         descriptor: null,
         recoveryCode: null,
       },
+    },
+  };
+}
+
+async function prepareDirectFork(
+  h: Harness,
+  commandId: string,
+): Promise<PreparedLifecycleWorkerCommand<LifecycleSemanticCommandDraft>> {
+  assert.ok(h.pending !== null);
+  const command: LifecycleSemanticCommandDraft = {
+    commandType: "fork-child",
+    commandId,
+    idempotencyKey: `fork-child/${commandId}`,
+    agentId: "agent-primary",
+    expectedProjectId: h.context.binding.projectId,
+    expectedVaultId: h.context.binding.vaultId,
+    expectedWorkspaceId: h.context.binding.workspaceId,
+    expectedBranchRef: null,
+    parentSessionId: SESSION_ID,
+    expectedStreamVersion: "0",
+    assignment: {
+      assignmentId: "00000000-0000-4000-8000-000000000013",
+      summary: "Exercise nested executor context binding",
+      scope: "tests/lifecycle-executor.test.ts",
+    },
+    directAccessRequested: true,
+  };
+  const proof = {
+    proofVersion: 1 as const,
+    target: "semantic-command" as const,
+    proofNonce: "00000000-0000-4000-8000-000000000014",
+    proofFingerprint: HASH,
+  };
+  const childBindingGrant = {
+    grantVersion: 1 as const,
+    grantId: "00000000-0000-4000-8000-000000000015",
+    projectId: h.context.binding.projectId,
+    storeId: h.context.binding.storeId,
+    parentSessionId: SESSION_ID,
+    targetActorRole: "untrusted" as const,
+    targetClientInstanceId: "child-a",
+    issuedAt: NOW,
+    expiresAt: "2026-07-17T00:10:00.000Z",
+    bindingFingerprint: HASH,
+    mac: "A".repeat(43),
+  };
+  const privateGrant = SecretString.from("executor-direct-fork-grant");
+  try {
+    await h.pending.put({
+      recordVersion: 1,
+      projectId: h.context.binding.projectId,
+      storeId: h.context.binding.storeId,
+      commandId: command.commandId,
+      idempotencyKey: command.idempotencyKey,
+      command,
+      authoritySessionId: SESSION_ID,
+      targetSessionId: SESSION_ID,
+      stableBinding: {
+        projectId: h.context.binding.projectId,
+        vaultId: h.context.binding.vaultId,
+        storeId: h.context.binding.storeId,
+        workspaceId: h.context.binding.workspaceId,
+        clientNamespace: h.context.binding.clientNamespace,
+        audience: {
+          presentingActorRole: "primary",
+          presentingClientInstanceId: h.context.binding.clientInstanceId,
+          targetActorRole: "untrusted",
+          targetClientInstanceId: childBindingGrant.targetClientInstanceId,
+        },
+      },
+      candidateIntentHash: OTHER_HASH,
+      authorization: {
+        kind: "protected",
+        proof,
+        approval: null,
+        childBindingGrant: privateGrant,
+      },
+      createdAt: NOW,
+    });
+  } finally {
+    privateGrant.destroy();
+  }
+  return {
+    command,
+    candidateIntentHash: OTHER_HASH,
+    authorization: {
+      kind: "protected",
+      authoritySessionId: SESSION_ID,
+      targetSessionId: SESSION_ID,
+      proof,
+      approval: null,
+      childBindingGrant,
+    },
+  };
+}
+
+function currentRootAuthorityMaterial(
+  context: ProjectContext,
+  clientNamespace: string,
+): Readonly<Record<string, JsonValue>> {
+  const provider = new DeterministicCapabilityKeyProvider();
+  const service = new CapabilityService({
+    keyProvider: provider,
+    clock: { nowMs: () => BigInt(Date.parse(NOW)) },
+    nonceSource: new Nonces(),
+  });
+  const common = {
+    projectId: context.binding.projectId,
+    vaultId: context.binding.vaultId,
+    storeId: context.binding.storeId,
+    workspaceId: context.binding.workspaceId,
+    clientNamespace,
+    sessionId: SESSION_ID,
+    capabilityGeneration: "1",
+    expiryKind: "until-revoked" as const,
+    expiresAt: null,
+    actorRole: "primary" as const,
+  };
+  const handle = service.prepareCapability({
+    ...common,
+    kind: "root-session-handle",
+    policyCode: "root-current",
+    clientInstanceId: context.binding.clientInstanceId,
+  });
+  const resumeToken = service.prepareCapability({
+    ...common,
+    kind: "root-resume-token",
+    policyCode: "root-resume",
+    clientInstanceId: null,
+  });
+  const target = {
+    actorRole: "primary" as const,
+    clientInstanceId: context.binding.clientInstanceId,
+  };
+  const resolved = service.authorityMaterial({
+    authorityCommitment: OTHER_HASH,
+    expectedCapabilityGeneration: "1",
+    currentCapabilityGeneration: "1",
+    target,
+    materials: [handle, resumeToken],
+  });
+  assert.equal(resolved.status, "current");
+  assert.ok(resolved.descriptor !== undefined);
+  return {
+    status: "current",
+    target,
+    authorityCommitment: OTHER_HASH,
+    capabilityGeneration: "1",
+    descriptor: resolved.descriptor as unknown as JsonValue,
+    recoveryCode: null,
+  };
+}
+
+function currentChildAuthorityMaterial(
+  context: ProjectContext,
+  clientNamespace: string,
+): Readonly<Record<string, JsonValue>> {
+  const provider = new DeterministicCapabilityKeyProvider();
+  const service = new CapabilityService({
+    keyProvider: provider,
+    clock: { nowMs: () => BigInt(Date.parse(NOW)) },
+    nonceSource: new Nonces(),
+  });
+  const target = {
+    actorRole: "untrusted" as const,
+    clientInstanceId: "child-a",
+  };
+  const material = service.prepareCapability({
+    projectId: context.binding.projectId,
+    vaultId: context.binding.vaultId,
+    storeId: context.binding.storeId,
+    workspaceId: context.binding.workspaceId,
+    clientNamespace,
+    sessionId: CHILD_SESSION_ID,
+    kind: "child-session-handle",
+    capabilityGeneration: "1",
+    policyCode: "child-default-v1",
+    expiryKind: "absolute",
+    expiresAt: "2026-07-17T01:00:00.000Z",
+    actorRole: "untrusted",
+    clientInstanceId: target.clientInstanceId,
+  });
+  const resolved = service.authorityMaterial({
+    authorityCommitment: OTHER_HASH,
+    expectedCapabilityGeneration: "1",
+    currentCapabilityGeneration: "1",
+    target,
+    materials: [material],
+  });
+  assert.equal(resolved.status, "current");
+  assert.ok(resolved.descriptor !== undefined);
+  return {
+    status: "current",
+    target,
+    authorityCommitment: OTHER_HASH,
+    capabilityGeneration: "1",
+    descriptor: resolved.descriptor as unknown as JsonValue,
+    recoveryCode: null,
+  };
+}
+
+function directForkSuccess(
+  context: ProjectContext,
+  clientNamespace: string,
+): LifecycleWorkerSuccessWire {
+  return {
+    operation: "fork-child",
+    nestedContractVersion: null,
+    result: {
+      kind: "success",
+      publicResult: {
+        resultVersion: 2,
+        operation: "fork-child",
+        childSessionId: CHILD_SESSION_ID,
+        parentSessionId: SESSION_ID,
+        state: "active",
+        eventPosition: "2",
+        finalStreamVersion: "1",
+        directAccessEnabled: true,
+        rootOwnerGeneration: "1",
+        assignment: {
+          assignmentId: "00000000-0000-4000-8000-000000000013",
+          summary: "Exercise nested executor context binding",
+          scope: "tests/lifecycle-executor.test.ts",
+        },
+        assignmentRevision: "1",
+      },
+      authorityMaterial: currentChildAuthorityMaterial(context, clientNamespace),
     },
   };
 }
@@ -826,6 +1056,134 @@ describe("lifecycle executor", () => {
       prepared.command.commandId,
       prepared.command.idempotencyKey,
     ));
+  });
+
+  // Production mutation caught: trust decoded context identities without comparing them to the retained active context.
+  it("rejects swapped decoded context before adapter completion", async () => {
+    const foreignNamespace = "foreign/namespace-canary";
+    const cases = [
+      {
+        name: "root public result",
+        currentMaterial: false,
+      },
+      {
+        name: "root public result and current descriptor",
+        currentMaterial: true,
+      },
+    ] as const;
+    assert.equal(cases.length, 2);
+    const observations: Array<{
+      readonly name: string;
+      readonly error: unknown;
+      readonly commandId: string;
+      readonly idempotencyKey: string;
+      readonly terminateCalls: number;
+      readonly completionCount: number;
+      readonly pendingRetained: boolean;
+    }> = [];
+
+    for (const [index, entry] of cases.entries()) {
+      const h = await harness(true);
+      const prepared = await prepareRoot(
+        h,
+        `00000000-0000-4000-8000-${String(41 + index).padStart(12, "0")}`,
+      );
+      const pendingExecution = h.executor.executeLifecycleMutation(prepared);
+      const response = semanticSuccess(h.context);
+      const workerResult = response.result as Readonly<Record<string, JsonValue>>;
+      const publicResult = workerResult.publicResult as Readonly<Record<string, JsonValue>>;
+      const project = publicResult.project as Readonly<Record<string, JsonValue>>;
+      h.worker.succeed(lastLifecycle(h.worker), {
+        ...response,
+        result: {
+          ...workerResult,
+          publicResult: {
+            ...publicResult,
+            project: {
+              ...project,
+              clientNamespace: foreignNamespace,
+            },
+          },
+          authorityMaterial: entry.currentMaterial
+            ? currentRootAuthorityMaterial(h.context, foreignNamespace)
+            : workerResult.authorityMaterial,
+        },
+      });
+      let error: unknown;
+      try {
+        await pendingExecution;
+      } catch (observed) {
+        error = observed;
+      }
+      await turn();
+      observations.push({
+        name: entry.name,
+        error,
+        commandId: prepared.command.commandId,
+        idempotencyKey: prepared.command.idempotencyKey,
+        terminateCalls: h.worker.terminateCalls,
+        completionCount: h.adapter!.completionIdentities.length,
+        pendingRetained: await h.pending!.get(
+          PROJECT_ID,
+          prepared.command.commandId,
+          prepared.command.idempotencyKey,
+        ) !== null,
+      });
+    }
+
+    assert.equal(observations.length, 2);
+    for (const observation of observations) {
+      assert.ok(exactError("COMMAND_OUTCOME_UNKNOWN", {
+        commandId: observation.commandId,
+        idempotencyKey: observation.idempotencyKey,
+      })(observation.error), observation.name);
+      const safeSurface = `${String(observation.error)} ${JSON.stringify(observation.error)}`;
+      assert.equal(safeSurface.includes(foreignNamespace), false, observation.name);
+      assert.equal(observation.terminateCalls, 1, observation.name);
+      assert.equal(observation.completionCount, 0, observation.name);
+      assert.equal(observation.pendingRetained, true, observation.name);
+    }
+  });
+
+  // Production mutation caught: validate only the public result and skip nested decoded authority descriptors.
+  it("rejects a nested-only swapped descriptor context before adapter completion", async () => {
+    const h = await harness(true);
+    const prepared = await prepareDirectFork(
+      h,
+      "00000000-0000-4000-8000-000000000043",
+    );
+    const pendingExecution = h.executor.executeLifecycleMutation(prepared);
+    const baseline = directForkSuccess(h.context, h.context.binding.clientNamespace);
+    const baselineResult = baseline.result as Readonly<Record<string, JsonValue>>;
+    const foreignNamespace = "foreign/nested-descriptor-canary";
+    const response: LifecycleWorkerSuccessWire = {
+      ...baseline,
+      result: {
+        ...baselineResult,
+        authorityMaterial: currentChildAuthorityMaterial(h.context, foreignNamespace),
+      },
+    };
+    assert.deepEqual(
+      (response.result as Readonly<Record<string, JsonValue>>).publicResult,
+      baselineResult.publicResult,
+      "the public result remains unchanged while only nested authority material is swapped",
+    );
+    h.worker.succeed(lastLifecycle(h.worker), response);
+
+    await assert.rejects(pendingExecution, exactError("COMMAND_OUTCOME_UNKNOWN", {
+      commandId: prepared.command.commandId,
+      idempotencyKey: prepared.command.idempotencyKey,
+    }));
+    await turn();
+    assert.equal(h.worker.terminateCalls, 1);
+    assert.deepEqual(h.adapter!.completionIdentities, []);
+    assert.ok(await h.pending!.get(
+      PROJECT_ID,
+      prepared.command.commandId,
+      prepared.command.idempotencyKey,
+    ));
+    const safeSurface = `${String(await pendingExecution.catch((error: unknown) => error))}`;
+    assert.equal(safeSurface.includes(foreignNamespace), false);
   });
 
   it("preserves bounded identity after uncertain lifecycle delivery", async () => {
