@@ -29,7 +29,7 @@ import type {
   SqliteStatement,
 } from "../src/orchestrator/storage/sqlite-driver.js";
 import {
-  decodeLifecycleEvent,
+  decodeLifecycleEventV2,
   type LifecycleEvent,
   type LifecycleEventV1,
 } from "../src/orchestrator/lifecycle/contracts/events.js";
@@ -985,7 +985,7 @@ describe("SessionAuthorityRepository fold and checkpoint guards", () => {
       baseEventPosition: 1,
       checkpointEventPosition: 2,
     });
-    const checkpointEvent = decodeLifecycleEvent({
+    const checkpointEvent = decodeLifecycleEventV2({
       ...lifecycleEvent(2, "SessionCheckpointRecorded", {}, {
         authorityCommitment: base.authorityCommitment,
         sessionId: ROOT_SESSION_ID,

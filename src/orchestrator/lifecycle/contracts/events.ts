@@ -1481,8 +1481,13 @@ export function decodeLifecycleEventV3(value: unknown): LifecycleEventV3 {
   }
 }
 
-export function decodeLifecycleEvent(value: LifecycleEventV3): LifecycleEventV3;
-export function decodeLifecycleEvent(value: unknown): LifecycleEvent;
+export function decodeLegacyLifecycleEvent(value: unknown): LifecycleEvent {
+  const version = strictRecord(value, "lifecycleEvent").eventSchemaVersion;
+  if (version === 1) return decodeLifecycleEventV1(value);
+  if (version === 2) return decodeLifecycleEventV2(value);
+  return invalid("eventSchemaVersion");
+}
+
 export function decodeLifecycleEvent(value: unknown): LifecycleEventCodecResult {
   const version = strictRecord(value, "lifecycleEvent").eventSchemaVersion;
   if (version === 1) return decodeLifecycleEventV1(value);

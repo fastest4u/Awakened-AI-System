@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import type { StoredEvent } from "../contracts/event.js";
 import { canonicalJson } from "../serialization/canonical-json.js";
 import {
-  decodeLifecycleEvent,
+  decodeLegacyLifecycleEvent,
   type LifecycleEvent,
 } from "./contracts/events.js";
 import type { ChildSessionState } from "./contracts/identifiers.js";
@@ -342,7 +342,7 @@ function decodeStoredEvent(
   assertPositiveInt64(event.globalPosition);
   assertPositiveInt64(event.streamVersion);
   try {
-    return decodeLifecycleEvent({
+    return decodeLegacyLifecycleEvent({
       eventSchemaVersion: event.eventSchemaVersion,
       eventId: event.eventId,
       projectId: event.projectId,

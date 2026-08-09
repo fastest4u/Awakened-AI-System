@@ -3,7 +3,7 @@ import type { StoredEvent } from "../contracts/event.js";
 import { commandHash, payloadHash } from "../crypto/event-hash.js";
 import { canonicalJson } from "../serialization/canonical-json.js";
 import {
-  decodeLifecycleEvent,
+  decodeLegacyLifecycleEvent,
   LIFECYCLE_EVENT_TYPES,
   type EvidenceCoverageRecordedV2,
   type LifecycleEvent,
@@ -4265,7 +4265,7 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
     authorityCommitment: string,
   ): LifecycleEvent {
     try {
-      return decodeLifecycleEvent({
+      return decodeLegacyLifecycleEvent({
         eventSchemaVersion: event.eventSchemaVersion,
         eventId: event.eventId,
         projectId: event.projectId,
@@ -4478,7 +4478,7 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
         || globalPosition === null
         || row[`${prefix}_stream_type`] !== "session"
       ) throw new LifecycleError("INTEGRITY_FAILURE");
-      return decodeLifecycleEvent({
+      return decodeLegacyLifecycleEvent({
         eventSchemaVersion,
         eventId: row[`${prefix}_event_id`],
         projectId: row[`${prefix}_project_id`],
@@ -5028,7 +5028,7 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
         || authorityCommitment === null
         || row.stream_type !== "session"
       ) throw new Error("INVALID_LIFECYCLE_EVENT_ENVELOPE");
-      events.push(decodeLifecycleEvent({
+      events.push(decodeLegacyLifecycleEvent({
         eventSchemaVersion,
         eventId: row.event_id,
         projectId: row.project_id,

@@ -55,6 +55,7 @@ import {
   type ValidationAttemptPlanIdentityV1,
 } from "../src/orchestrator/lifecycle/contracts/commands.js";
 import {
+  decodeLegacyLifecycleEvent,
   decodeLifecycleEvent,
   decodeLifecycleEventV1,
   LIFECYCLE_EVENT_TYPES,
@@ -2850,6 +2851,39 @@ describe("lifecycle Version 1 contracts", () => {
         { message: /LIFECYCLE_INPUT_INVALID/ },
       );
     }
+  });
+
+  it("keeps raw lifecycle decoding truthful while legacy consumers fail closed", () => {
+    const requestedV1 = versionedLifecycleEventInput(1, "SessionEndRequested", {
+      workflowId: UUIDS.workflow,
+      workflowGeneration: 1,
+      previousState: "active",
+      childEndPolicy: "require-completed",
+      qualityThreshold: 8_000,
+      requireFullEvidence: false,
+      requireMaterialization: true,
+    });
+    const requestedV2 = versionedLifecycleEventInput(2, "SessionEndRequested", {
+      workflowId: UUIDS.workflow,
+      workflowGeneration: 1,
+      previousState: "active",
+      childEndPolicy: "require-completed",
+      qualityThreshold: 8_000,
+      requireFullEvidence: false,
+      requireMaterialization: true,
+      requestVersion: 2,
+    });
+    const requestedV3 = versionedLifecycleEventInput(3, "SessionEndRequested", {
+      workflowId: UUIDS.workflow,
+      workflowGeneration: 1,
+      previousState: "active",
+      effectiveState: sessionEndEffectiveStateFixture({ requestVersion: 2 }),
+    });
+
+    assert.equal(decodeLifecycleEvent(requestedV3).eventSchemaVersion, 3);
+    assert.equal(decodeLegacyLifecycleEvent(requestedV1).eventSchemaVersion, 1);
+    assert.equal(decodeLegacyLifecycleEvent(requestedV2).eventSchemaVersion, 2);
+    expectCode("LIFECYCLE_INPUT_INVALID", () => decodeLegacyLifecycleEvent(requestedV3));
   });
 
   it("keeps ChildWorkTransferCreated V1 frozen and admits only the internal V2 dual-checkpoint shape", () => {

@@ -2,7 +2,7 @@ import { createHash, timingSafeEqual } from "node:crypto";
 import type { ProjectId } from "../identity/contracts.js";
 import { authorityCommitment, type CommittedAuthorityV1 } from "../lifecycle/authority/authority-commitment.js";
 import {
-  decodeLifecycleEvent,
+  decodeLegacyLifecycleEvent,
   type LifecycleEvent,
 } from "../lifecycle/contracts/events.js";
 import {
@@ -519,7 +519,7 @@ function eventRows(connection: SqliteConnection, authority: SessionAuthorityReco
     const streamVersion = int64(ownData(row, "stream_version"));
     const position = int64(ownData(row, "global_position"));
     try {
-      return decodeLifecycleEvent({
+      return decodeLegacyLifecycleEvent({
         eventSchemaVersion: schemaVersion,
         eventId: ownData(row, "event_id"),
         projectId: ownData(row, "project_id"),

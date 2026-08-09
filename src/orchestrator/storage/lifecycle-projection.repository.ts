@@ -15,7 +15,7 @@ import {
   type WorkflowGenerationFoldProjection,
 } from "../lifecycle/lifecycle-projection-folds.js";
 import {
-  decodeLifecycleEvent,
+  decodeLegacyLifecycleEvent,
   type LifecycleEvent,
 } from "../lifecycle/contracts/events.js";
 import {
@@ -602,7 +602,7 @@ function decodeStoredLifecycleEvent(
   authorityCommitment: string,
 ): LifecycleEvent {
   try {
-    return decodeLifecycleEvent({
+    return decodeLegacyLifecycleEvent({
       eventSchemaVersion: event.eventSchemaVersion,
       eventId: event.eventId,
       projectId: event.projectId,
