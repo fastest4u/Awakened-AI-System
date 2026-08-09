@@ -9270,6 +9270,80 @@ it("production worker provider preserves unavailable historical-only key precede
   });
 });
 
+// Production mutation caught: map replayEvidenceTransition's authenticated
+// fingerprint-key unavailability to generic INTEGRITY_FAILURE.
+it("production worker provider preserves unavailable fingerprint precedence in full integrity", async () => {
+  const fixture = createFixture();
+  addCoverage(fixture);
+  const before = persistentSnapshot(fixture.connection);
+  const observed = observedReplayConnection(fixture.connection, { trapDml: true });
+  const calls: { operation: "status" | "fingerprint"; keyId: string }[] = [];
+  let client!: WorkerIntegrityProviderClient;
+  const port = {
+    postMessage(value: unknown): void {
+      const request = decodeIntegrityProviderRequestWire(value);
+      calls.push({ operation: request.operation, keyId: request.keyId });
+      queueMicrotask(() => {
+        if (request.operation === "status") {
+          client.accept({
+            type: "integrity-provider-response",
+            integrityRequestId: request.integrityRequestId,
+            providerRequestId: request.providerRequestId,
+            operation: "status",
+            ok: true,
+            status: "available",
+          });
+          return;
+        }
+        client.accept({
+          type: "integrity-provider-response",
+          integrityRequestId: request.integrityRequestId,
+          providerRequestId: request.providerRequestId,
+          operation: "fingerprint",
+          ok: false,
+          code: "EVIDENCE_HISTORICAL_KEY_UNAVAILABLE",
+        });
+      });
+    },
+  } as ConstructorParameters<typeof WorkerIntegrityProviderClient>[0];
+  client = new WorkerIntegrityProviderClient(port, "unavailable-full-fingerprint", "full");
+  const service = new LifecycleIntegrityService(observed.connection, client);
+  const cursors = captureReplayVisitCursors(service);
+  let observedError: unknown;
+
+  await assert.rejects(
+    () => service.fullCheckAsync(fixture.context, { add() {} }),
+    (error: unknown) => {
+      observedError = error;
+      return typeof error === "object"
+        && error !== null
+        && "code" in error
+        && error.code === "EVIDENCE_HISTORICAL_KEY_UNAVAILABLE";
+    },
+  );
+
+  assert.deepEqual(calls, [
+    { operation: "status", keyId: "key-a" },
+    { operation: "fingerprint", keyId: "key-a" },
+  ]);
+  const safeOutput = JSON.parse(JSON.stringify(observedError)) as unknown;
+  assert.deepEqual(safeOutput, {
+    code: "EVIDENCE_HISTORICAL_KEY_UNAVAILABLE",
+    retryable: false,
+    safeMessage: "Historical evidence fingerprint key material is unavailable",
+    recoveryActions: ["restore-evidence-fingerprint-key"],
+  });
+  assert.doesNotMatch(JSON.stringify(safeOutput), /key-a|coverageAccumulatorVersion/);
+  assertOpenedReplayContract({
+    label: "production worker unavailable replay fingerprint",
+    fixture,
+    before,
+    observed,
+    cursors,
+    advances: { event: 2, "coverage-transition": 0, "immutable-ordinal": 1 },
+  });
+});
+
 it("full integrity merge cursors reject missing and orphan child projection rows", async () => {
   const legal = createFixture();
   addChildFork(legal);

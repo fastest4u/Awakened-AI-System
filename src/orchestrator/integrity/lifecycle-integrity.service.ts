@@ -1796,7 +1796,10 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
             payload.coverageFingerprintKeyId,
             bytes,
           );
-        } catch {
+        } catch (error) {
+          if (error instanceof HistoricalEvidenceKeyUnavailableError) {
+            throw new LifecycleError("EVIDENCE_HISTORICAL_KEY_UNAVAILABLE");
+          }
           throw new LifecycleError("INTEGRITY_FAILURE");
         }
       } finally {
