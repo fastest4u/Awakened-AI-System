@@ -12,6 +12,7 @@ import {
   assertQualifiedCheckpointMigrationStage,
   qualifiedCheckpointMigrationFailure,
 } from "./qualified-checkpoint-migration-preflight.js";
+import { sessionEndEffectiveStateMigrationFailure } from "./session-end-effective-state-migration-preflight.js";
 
 export { migrationChecksum } from "./schema-compatibility.js";
 export { SchemaCompatibilityError as MigrationError } from "./schema-compatibility.js";
@@ -190,7 +191,9 @@ export class MigrationRunner {
       return applied;
     } catch (error) {
       rollbackPreservingOriginal(connection);
-      throw qualifiedCheckpointMigrationFailure(error) ?? error;
+      throw sessionEndEffectiveStateMigrationFailure(error)
+        ?? qualifiedCheckpointMigrationFailure(error)
+        ?? error;
     }
   }
 }

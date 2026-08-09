@@ -20,7 +20,8 @@ export type SchemaCompatibilityErrorCode =
   | "STORE_NOT_EMPTY"
   | "MIGRATION_MODE_INVALID"
   | "MIGRATION_EXPECTED_VERSION_MISMATCH"
-  | "MIGRATION_EVIDENCE_V2_PRECONDITION_FAILED";
+  | "MIGRATION_EVIDENCE_V2_PRECONDITION_FAILED"
+  | "MIGRATION_SESSION_END_EFFECTIVE_STATE_PRECONDITION_FAILED";
 
 export class SchemaCompatibilityError extends Error {
   constructor(readonly code: SchemaCompatibilityErrorCode, message = code) {

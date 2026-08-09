@@ -22,6 +22,11 @@ import {
   SqliteQualifiedCheckpointMigrationPreflight,
   type QualifiedCheckpointMigrationPreflight,
 } from "./qualified-checkpoint-migration-preflight.js";
+import {
+  sessionEndEffectiveStateMigrationFailure,
+  SqliteSessionEndEffectiveStateMigrationPreflight,
+  type SessionEndEffectiveStateMigrationPreflight,
+} from "./session-end-effective-state-migration-preflight.js";
 
 export interface ProjectStoreUpgradePlan {
   projectId: string;
@@ -108,6 +113,7 @@ export interface ProjectStoreUpgradeServiceDependencies {
   maximumAcquireAttempts?: number;
   sleep?: (milliseconds: number) => Promise<void>;
   faultInjector?: ProjectStoreUpgradeFaultInjector;
+  sessionEndPreflight?: SessionEndEffectiveStateMigrationPreflight;
 }
 
 interface ActiveOwner {
@@ -218,6 +224,7 @@ export class ProjectStoreUpgradeService {
   readonly #fence: MaintenanceFence;
   readonly #migrationRunner: MigrationRunner;
   readonly #preflight: QualifiedCheckpointMigrationPreflight;
+  readonly #sessionEndPreflight: SessionEndEffectiveStateMigrationPreflight;
   readonly #registry: UpgradeExecutorRegistry;
   readonly #manifestPreparer: UpgradeIntegrityManifestPreparer;
   readonly #manifestPublisher: UpgradeIntegrityManifestPublisher;
@@ -254,6 +261,12 @@ export class ProjectStoreUpgradeService {
     this.#fence = dependencies.maintenanceFence ?? new MaintenanceFence();
     this.#migrationRunner = dependencies.migrationRunner ?? new MigrationRunner();
     this.#preflight = preflightOverride ?? new SqliteQualifiedCheckpointMigrationPreflight();
+    if (
+      dependencies.sessionEndPreflight !== undefined
+      && typeof dependencies.sessionEndPreflight.assertEligible !== "function"
+    ) fail("MIGRATION_MODE_INVALID");
+    this.#sessionEndPreflight = dependencies.sessionEndPreflight
+      ?? new SqliteSessionEndEffectiveStateMigrationPreflight();
     this.#registry = dependencies.executorRegistry ?? NO_EXECUTORS;
     const phaseRunner = new ProjectStoreUpgradePhaseRunner(
       dependencies.upgradePhaseWorkerUrl === undefined
@@ -416,6 +429,9 @@ export class ProjectStoreUpgradeService {
                 if (migration.version === 3) {
                   this.#preflight.assertEligibleAndStage(migrationConnection, context);
                 }
+                if (migration.version === 4) {
+                  this.#sessionEndPreflight.assertEligible(migrationConnection, context);
+                }
               },
               renewMutableBoundary: () => {
                 liveLease = this.#fence.renewOwner(
@@ -428,7 +444,7 @@ export class ProjectStoreUpgradeService {
               },
               faultInjector: {
                 hit: (boundary, migration) => {
-                  if (migration.version !== 3) return;
+                  if (migration.version !== 4) return;
                   if (boundary === "after-ddl-before-migration-row") {
                     this.#faults.hit("after-target-ddl-before-migration-row");
                   } else if (boundary === "after-migration-row-before-project-version") {
@@ -509,7 +525,9 @@ export class ProjectStoreUpgradeService {
       };
     } catch (error) {
       primaryError = error;
-      throw qualifiedCheckpointMigrationFailure(error) ?? error;
+      throw sessionEndEffectiveStateMigrationFailure(error)
+        ?? qualifiedCheckpointMigrationFailure(error)
+        ?? error;
     } finally {
       if (this.#owners.get(ownerKey) === active) this.#owners.delete(ownerKey);
       try {

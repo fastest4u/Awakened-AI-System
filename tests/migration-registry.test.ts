@@ -1,7 +1,8 @@
 import { strict as assert } from "node:assert";
-import { mkdtempSync, rmSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, it } from "node:test";
 import { PROJECT_MEMORY_APPLICATION_ID } from "../src/orchestrator/runtime/runtime-capabilities.js";
@@ -12,6 +13,7 @@ import {
 import { eventCoreMigration } from "../src/orchestrator/storage/migrations/0001-event-core.js";
 import { sessionLifecycleMigration } from "../src/orchestrator/storage/migrations/0002-session-lifecycle.js";
 import { qualifiedCheckpointCoverageMigration } from "../src/orchestrator/storage/migrations/0003-qualified-checkpoint-coverage.js";
+import { sessionEndEffectiveStateMigration } from "../src/orchestrator/storage/migrations/0004-session-end-effective-state.js";
 import {
   CURRENT_PROJECT_STORE_SCHEMA_VERSION,
   PROJECT_STORE_MIGRATIONS,
@@ -101,21 +103,34 @@ afterEach(() => {
 });
 
 describe("project-store migration registry", () => {
-  it("is the frozen, contiguous, uniquely named current-schema authority", () => {
+  it("applies migration 0004 and preserves frozen 0002 0003 hashes", () => {
     assert.equal(Object.isFrozen(PROJECT_STORE_MIGRATIONS), true);
     assert.deepEqual(PROJECT_STORE_MIGRATIONS, [
       eventCoreMigration,
       sessionLifecycleMigration,
       qualifiedCheckpointCoverageMigration,
+      sessionEndEffectiveStateMigration,
     ]);
-    assert.equal(CURRENT_PROJECT_STORE_SCHEMA_VERSION, 3);
+    assert.equal(CURRENT_PROJECT_STORE_SCHEMA_VERSION, 4);
     assert.equal(
       migrationChecksum(sessionLifecycleMigration),
       "85666a0bdee4455068f03a81e9d3720df172d15fce6d8e6f0cb3f5f7d0a81293",
     );
     assert.deepEqual(
       PROJECT_STORE_MIGRATIONS.map((migration) => migration.version),
-      [1, 2, 3],
+      [1, 2, 3, 4],
+    );
+    assert.equal(
+      createHash("sha256").update(readFileSync(resolve(
+        "src/orchestrator/storage/migrations/0002-session-lifecycle.ts",
+      ))).digest("hex").toUpperCase(),
+      "68B4039048A359C523B7842F6D17BAA5760E9760D2B4E9F80BB8A48DC339EB06",
+    );
+    assert.equal(
+      createHash("sha256").update(readFileSync(resolve(
+        "src/orchestrator/storage/migrations/0003-qualified-checkpoint-coverage.ts",
+      ))).digest("hex").toUpperCase(),
+      "C023A8EDB88A94B749D4837F7300A76D081C843BF41BE058C3AA4AD5D6A158C4",
     );
     assert.equal(
       new Set(PROJECT_STORE_MIGRATIONS.map((migration) => migration.name)).size,
@@ -133,7 +148,7 @@ describe("project-store migration registry", () => {
     const inspection = inspectStoreSchema(connection);
     assert.equal(inspection.status, "upgrade-required");
     assert.equal(inspection.appliedVersion, 1);
-    assert.equal(inspection.targetVersion, 3);
+    assert.equal(inspection.targetVersion, 4);
     assert.deepEqual(
       inspection.pending.map(({ version, name, checksum }) => ({ version, name, checksum })),
       [{
@@ -144,6 +159,10 @@ describe("project-store migration registry", () => {
         version: 3,
         name: qualifiedCheckpointCoverageMigration.name,
         checksum: migrationChecksum(qualifiedCheckpointCoverageMigration),
+      }, {
+        version: 4,
+        name: sessionEndEffectiveStateMigration.name,
+        checksum: migrationChecksum(sessionEndEffectiveStateMigration),
       }],
     );
     assert.equal(
@@ -160,8 +179,8 @@ describe("project-store migration registry", () => {
   it("reports the complete registry as current", () => {
     const inspection = inspectStoreSchema(currentConnection());
     assert.equal(inspection.status, "current");
-    assert.equal(inspection.appliedVersion, 3);
-    assert.equal(inspection.targetVersion, 3);
+    assert.equal(inspection.appliedVersion, 4);
+    assert.equal(inspection.targetVersion, 4);
     assert.deepEqual(inspection.pending, []);
     assert.equal(requireCurrentStoreSchema(inspection), inspection);
     assert.equal(
@@ -175,7 +194,7 @@ describe("project-store migration registry", () => {
     dropHistoryGuards(connection);
     connection.prepare(`
       INSERT INTO schema_migrations(version, name, checksum, applied_at)
-      VALUES (4, 'future', $checksum, $appliedAt)
+      VALUES (5, 'future', $checksum, $appliedAt)
     `).run({ $checksum: "f".repeat(64), $appliedAt: NOW });
     assert.throws(() => inspectStoreSchema(connection), /SCHEMA_TOO_NEW/);
   });
