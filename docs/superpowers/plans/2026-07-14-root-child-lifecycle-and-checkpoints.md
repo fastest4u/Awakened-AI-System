@@ -133,7 +133,7 @@ The mandatory Task 13-16 behavioral anchors are:
 | `src/orchestrator/lifecycle/session-end-policy.ts` | Exact integer quality-policy arithmetic, merge rules, and child/checkpoint/evidence prerequisites. |
 | `src/orchestrator/lifecycle/session-end-workflow.service.ts` | Generation-fenced durable phase claims, retries, immutable validation binding, and completion acknowledgement. |
 | `src/orchestrator/lifecycle/session-end.coordinator.ts` | Durable end request, child resolution, checkpoint, amendment, cancellation, abandonment, terminal append, and generation fencing. |
-| `src/orchestrator/lifecycle/materialization-queue.port.ts` | Pre-Task-16 queue preparation/persistence seam with recording fakes for workflow tests. |
+| `src/orchestrator/lifecycle/materialization-queue.port.ts` | Task 14Q's frozen typed prepare/assert contract for immutable lifecycle materialization plans; Tasks 15-16 consume it unchanged. |
 | `src/orchestrator/lifecycle/validation-profile.registry.ts` | Trusted validation profile resolution. |
 | `src/orchestrator/lifecycle/validation-profile.runner.ts` | Trusted allowlisted profile execution and immutable attested result production. |
 | `src/orchestrator/storage/lifecycle-validation-result.repository.ts` | Immutable workflow/generation/profile/config/checkpoint/source-bound validation result rows. |
@@ -191,10 +191,10 @@ The mandatory Task 13-16 behavioral anchors are:
 | Checkpoint contract, bounds, triggers, and required markers (Section 12) | Task 11 |
 | Fork, report/disposition, completion, suspension, and carry-forward (Section 13) | Task 10 |
 | Qualified Checkpoint V2, Evidence V2, schema 3, authenticated coverage, bounds, and event-time integrity (2026-07-18 amendment Sections 2-9, 11) | Tasks 12A-12J in the companion plan |
-| Session-end request, phases, validation, amendment, cancellation, abandonment (Section 15) | Tasks 14-15 |
-| Deterministic revision-fenced compatibility materialization (Section 16) | Tasks 14-16 |
+| Root-anchored session-end request, effective state, one-child saga, phases, validation, amendment, cancellation, abandonment (Section 15 plus the 2026-08-09 amendment) | Task 14 companion slices 14M/14Q/14R/14S/14W and Task 15 |
+| Deterministic revision-fenced compatibility planning and materialization (Section 16 plus the 2026-08-09 amendment) | Task 14Q planning and Task 16 mutable materialization |
 | Integrity-first recovery (Section 17) | Tasks 4, 15-16 |
-| Ordered registry, migrations 0002/0003, qualified preflight, and explicit upgrade (Section 18 plus amendment Sections 5-6) | Tasks 3-4 and 12B |
+| Ordered registry, frozen migrations 0002/0003, migration 0004, qualified/session-end preflights, and explicit upgrade (Section 18 plus amendments) | Tasks 3-4, 12B, and 14M |
 | Worker/executor protocol and versioned nested checkpoint/end DTOs (Sections 19-20 plus amendment Sections 8 and 10) | Task 13 |
 | Session-end evidence freeze/open/seal and three current-state freshness gates (amendment Sections 8-10) | Tasks 14-15 |
 | Typed failures and security requirements (Sections 22-23) | Tasks 1, 5-9, 13, 18 |
@@ -3412,445 +3412,67 @@ same Task 13 base/HEAD pair. Do not begin Task 14 while any Critical or Importan
 finding remains.
 
 ---
-### Task 14: Create the Generation-Fenced Session-End Workflow
+### Task 14: Implement the Root-Anchored Session-End Saga Through Immutable Queue Planning
 
-**Files:**
-- Create: `src/orchestrator/lifecycle/session-end-policy.ts`
-- Create: `src/orchestrator/storage/session-end.repository.ts`
-- Create: `src/orchestrator/lifecycle/session-end-workflow.service.ts`
-- Create: `src/orchestrator/lifecycle/session-end.coordinator.ts`
-- Create: `src/orchestrator/lifecycle/materialization-queue.port.ts`
-- Create: `tests/session-end-policy.test.ts`
-- Create: `tests/session-end.coordinator.test.ts`
-- Modify: `src/orchestrator/lifecycle/contracts/session-end.ts`
-- Modify: `src/orchestrator/lifecycle/contracts/commands.ts`
-- Modify: `src/orchestrator/lifecycle/checkpoint.service.ts`
-- Modify: `src/orchestrator/lifecycle/child-workflow.service.ts`
-- Modify: `src/orchestrator/storage/session-authority.repository.ts`
-- Modify: `src/orchestrator/storage/child-transfer.repository.ts`
-- Modify: `src/orchestrator/runtime/lifecycle-worker-runtime.ts`
-- Modify: `src/orchestrator/runtime/lifecycle-worker-runtime.factory.ts`
-- Modify: `tests/lifecycle-executor.test.ts`
+> **Authoritative amendment (2026-08-09):** Execute the companion plan at
+> `docs/superpowers/plans/2026-08-09-task-14-root-anchored-session-end-saga.md`.
+> It replaces the former monolithic Task 14 in full. No removed Task 14 step,
+> file list, fake queue, literal workflow ID, request-time child mutation, or
+> single-commit instruction remains executable.
 
-**Interfaces:**
-- `SessionEndRepository` owns deterministic workflow identity, generation/phase/claim CAS, immutable request/policy JSON decoding, complete generation-bound validation-attempt plans, cancelled-row reopening, and event-position ordered recovery scans; it never owns immutable validation-result rows or a transaction.
-- `SessionEndWorkflowService` classifies one next action at a time. Eventless claim/plan/phase CAS uses `LifecycleOperationalTransaction`; any action that appends a lifecycle event uses `LifecycleCommandTransaction` through `executeLifecycleInternalMutation` and normal semantic dedup.
-- `SessionEndCoordinator.driveOnce` uses Task 13's explicit `workflow-claim-next` selection operation through `ProjectStoreExecutor.executeLifecycleFenced`, converts its returned `SessionEndWorkflowClaimWireV1`, and uses only target-bound renew/release/eventless operations carrying that returned workflow/generation/token. It then uses `executeLifecycleInternalMutation` for an event-appending phase. It claims at most one workflow, performs no asynchronous validation while SQLite is in a transaction, and advances at most one durable phase per call.
-- `LifecycleMaterializationQueuePort` is introduced before workflow code depends on materialization. Tasks 14-15 use a recording fake; Task 16 supplies the only SQLite/renderer/fingerprint implementation.
-- Task 14 owns the canonical current-child plus carry-forward-ticket ending-scope baseline, final-checkpoint freeze group, explicit evidence-window `open`/`seal`/`unchanged` transitions, cancellation clearing, and generation fencing. The schema/codec/guard primitives come from Task 12.
-- Extend Task 13's runtime factory composition with the connection-bound policy/repository/workflow service and coordinator adapters plus a recording `LifecycleMaterializationQueuePort`; no runtime opens another connection. `lifecycle-executor.test.ts` proves every session-end semantic/fenced operation reaches these exact instances and that disposal still occurs before `ActiveStore` closes.
+**Approved architecture:** Approach A from
+`docs/superpowers/specs/2026-08-09-task-14-root-anchored-session-end-saga-design.md`.
 
-```ts
-export type SessionEndPhase =
-  | "requested"
-  | "children-resolved"
-  | "final-checkpoint-recorded"
-  | "ending-materialization-queued"
-  | "validating"
-  | "verification-passed"
-  | "verification-failed"
-  | "completion-appended"
-  | "completed-materialization-confirmed"
-  | "completed"
-  | "cancelled"
-  | "abandoned";
+**Executable slices:**
 
-export interface SessionEndWorkflowClaim {
-  readonly projectId: ProjectId;
-  readonly workflowId: WorkflowId;
-  readonly sessionId: SessionId;
-  readonly generation: bigint;
-  readonly phase: SessionEndPhase;
-  readonly claimOwnerId: string;
-  readonly claimToken: bigint;
-  readonly claimExpiresAtMs: bigint;
-  readonly triggeringEventPosition: bigint;
-  readonly attemptCount: number;
-}
+- 14M — UUIDv5 identities, bounded event-carried effective state, current
+  event versions, migration 0004/schema 4, workflow fingerprint V2, six-key
+  validation-plan codec/storage overlays, projections, upgrade gates, and
+  integrity. Task 15 constructs and persists the generation plan.
+- 14Q — typed lifecycle pending outbox, canonical artifact path, pure Version
+  2 renderer bytes, immutable planning repository, provider-keyed planning,
+  exact planned-row reads, append-time insertion, and source-state repair.
+- 14R — policy, workflow repository, request/reopen, amendment, cancellation,
+  claims, generation fences, and evidence-window state.
+- 14S — root/child internal-command split, one-child carry-forward, Version 2
+  dual-checkpoint transfer lineage, bounded all-history resolution, final
+  checkpoint/outbox atomicity, and exact-row confirmation.
+- 14W — runtime/factory ownership, crash/replay coverage, complete integrity,
+  build-artifact smoke, and final gates.
 
-export interface SessionEndWorkflowRecord {
-  readonly projectId: ProjectId;
-  readonly workflowId: WorkflowId;
-  readonly sessionId: SessionId;
-  readonly generation: bigint;
-  readonly phase: SessionEndPhase;
-  readonly rootCommandId: string;
-  readonly triggeringEventPosition: bigint;
-  readonly expectedAuthorityCommitment: string;
-  readonly priorRootState: "active" | "suspended";
-  readonly request: SessionEndRequest;
-  readonly effectivePolicy: QualityPolicyV1;
-  readonly effectiveFinalCheckpoint: CheckpointDraft;
-  readonly evidenceWindowState: "open" | "sealed";
-  readonly evidenceFrozenCheckpointEventPosition: bigint | null;
-  readonly evidenceFrozenGeneration: bigint | null;
-  readonly finalEndingScopeBindings:
-    | readonly FinalEndingScopeBindingV1[]
-    | null;
-  readonly finalCheckpointId: CheckpointId | null;
-  readonly finalCheckpointFingerprint: string | null;
-  readonly coordinatorOwnerId: string | null;
-  readonly coordinatorClaimToken: bigint | null;
-  readonly coordinatorClaimExpiresAtMs: bigint | null;
-  readonly coordinatorAttemptCount: number;
-  readonly coordinatorFailureClass: "retryable" | "permanent" | null;
-  readonly coordinatorErrorCode: string | null;
-  readonly coordinatorNextAttemptAtMs: bigint | null;
-  readonly validationAttemptPlanGeneration: bigint | null;
-  readonly validationAttemptPlans:
-    | readonly ValidationAttemptPlanIdentityV1[]
-    | null;
-  readonly qualityScore: number | null;
-  readonly safeFailureCode: string | null;
-  readonly createdAt: string;
-  readonly updatedAt: string;
-}
+**Non-negotiable boundary:** Task 14 ends at a durable
+`ending-materialization-queued` workflow with an exact immutable outbox plan.
+It performs no target-file staging, replacement, fsync, or acknowledgement.
+Production Version 2 routing remains disabled.
 
-export interface SessionEndWorkflowInsert {
-  readonly context: ProjectContext;
-  readonly workflowId: WorkflowId;
-  readonly sessionId: SessionId;
-  readonly generation: bigint;
-  readonly rootCommandId: string;
-  readonly triggeringEventPosition: bigint;
-  readonly expectedAuthorityCommitment: string;
-  readonly priorRootState: "active" | "suspended";
-  readonly request: SessionEndRequest;
-  readonly effectivePolicy: QualityPolicyV1;
-  readonly effectiveFinalCheckpoint: CheckpointDraft;
-  readonly evidenceWindowState: "sealed";
-  readonly createdAt: string;
-  readonly updatedAt: string;
-}
+- [ ] **Step 1:** Execute and independently review slice 14M.
+- [ ] **Step 2:** Execute and independently review slice 14Q.
+- [ ] **Step 3:** Execute and independently review slice 14R.
+- [ ] **Step 4:** Execute and independently review slice 14S.
+- [ ] **Step 5:** Execute and independently review slice 14W and its full gates.
 
-export interface WorkflowClaimRequest {
-  readonly projectId: ProjectId;
-  readonly ownerId: string;
-  readonly observedNowMs: bigint;
-  readonly ttlMs: bigint;
-}
-
-export interface WorkflowPhaseCompareAndSwap {
-  readonly projectId: ProjectId;
-  readonly workflowId: WorkflowId;
-  readonly generation: bigint;
-  readonly expectedPhase: SessionEndPhase;
-  readonly nextPhase: SessionEndPhase;
-  readonly claimOwnerId: string;
-  readonly claimToken: bigint;
-  readonly observedNowMs: bigint;
-  readonly result: SessionEndPhaseResultV2;
-  readonly safeFailureCode: string | null;
-  readonly updatedAt: string;
-}
-
-export interface WorkflowAmendment {
-  readonly projectId: ProjectId;
-  readonly workflowId: WorkflowId;
-  readonly expectedGeneration: bigint;
-  readonly rootCommandId: string;
-  readonly triggeringEventPosition: bigint;
-  readonly expectedAuthorityCommitment: string;
-  readonly amendment: SessionEndAmendment;
-  readonly effectivePolicy: QualityPolicyV1;
-  readonly effectiveFinalCheckpoint: CheckpointDraft;
-  readonly evidenceWindowAction: "unchanged" | "open" | "seal";
-  readonly restartPhase: SessionEndPhase;
-  readonly updatedAt: string;
-}
-
-export type EventlessSessionEndAction =
-  | {
-      readonly action: "mark-children-resolved";
-      readonly expectedPhase: "requested";
-      readonly nextPhase: "children-resolved";
-    }
-  | {
-      readonly action: "confirm-ending-materialization";
-      readonly expectedPhase: "final-checkpoint-recorded";
-      readonly nextPhase: "ending-materialization-queued";
-      readonly triggeringEventPosition: bigint;
-    }
-  | {
-      readonly action: "begin-validation";
-      readonly expectedPhase: "ending-materialization-queued";
-      readonly nextPhase: "validating";
-    }
-  | {
-      readonly action: "confirm-completed-materialization";
-      readonly expectedPhase: "completion-appended";
-      readonly nextPhase: "completed-materialization-confirmed";
-      readonly materializationRevision: bigint;
-    }
-  | {
-      readonly action: "complete-without-materialization";
-      readonly expectedPhase: "completion-appended";
-      readonly nextPhase: "completed";
-    }
-  | {
-      readonly action: "complete-after-materialization";
-      readonly expectedPhase: "completed-materialization-confirmed";
-      readonly nextPhase: "completed";
-    };
-
-export type SessionEndNextAction =
-  | { readonly kind: "eventless"; readonly action: EventlessSessionEndAction }
-  | { readonly kind: "semantic"; readonly action: PlannedSemanticSessionEndAction }
-  | {
-      readonly kind: "validation";
-      readonly action: "run-validation";
-      readonly plans: readonly ValidationAttemptPlanIdentityV1[];
-    }
-  | {
-      readonly kind: "wait";
-      readonly reason:
-        | "claim-lost"
-        | "evidence-window-open"
-        | "validation-pending"
-        | "verification-failed"
-        | "materialization-pending"
-        | "terminal";
-    };
-
-export interface KeyedFingerprintV1 {
-  readonly algorithm: "hmac-sha256";
-  readonly schemaVersion: 1;
-  readonly keyId: string;
-  readonly domain: "pm-materialization-fingerprint-v1";
-  readonly value: string;
-}
-
-export type LifecycleMaterializationOriginV1 =
-  | {
-      readonly kind: "workflow";
-      readonly workflowId: WorkflowId;
-      readonly workflowGeneration: bigint;
-    }
-  | {
-      readonly kind: "terminal-event";
-      readonly workflowId: null;
-      readonly workflowGeneration: null;
-    };
-
-export type LifecycleMaterializationTriggerType =
-  | "SessionCheckpointRecorded"
-  | "SessionEndAmended"
-  | "SessionEndVerificationFailed"
-  | "SessionEndVerificationInvalidated"
-  | "SessionEndCancelled"
-  | "SessionAbandoned"
-  | "SessionEnded";
-
-export interface MaterializationProjectionInput {
-  readonly context: ProjectContext;
-  readonly sessionId: SessionId;
-  readonly artifactKind: "compatibility-session-log";
-  readonly origin: LifecycleMaterializationOriginV1;
-  readonly triggeringEventType: LifecycleMaterializationTriggerType;
-  readonly triggeringEventPayload: JsonValue;
-  readonly expectedPriorFingerprint: KeyedFingerprintV1 | null;
-}
-
-declare const PREPARED_MATERIALIZATION_QUEUE: unique symbol;
-
-export interface PreparedMaterializationQueue {
-  readonly [PREPARED_MATERIALIZATION_QUEUE]: true;
-  readonly projectId: ProjectId;
-  readonly storeId: StoreId;
-  readonly sessionId: SessionId;
-  readonly artifactKind: "compatibility-session-log";
-  readonly origin: LifecycleMaterializationOriginV1;
-  readonly artifactPath: string;
-  readonly triggeringEventType: LifecycleMaterializationTriggerType;
-  readonly triggeringPayloadHash: string;
-  readonly expectedPriorFingerprint: KeyedFingerprintV1 | null;
-}
-
-export interface LifecycleMaterializationQueuePort {
-  prepare(input: MaterializationProjectionInput): PreparedMaterializationQueue;
-  persist(transaction: LifecycleCommandTransaction, prepared: PreparedMaterializationQueue, triggeringEvent: StoredEvent): void;
-}
-
-export class SessionEndWorkflowService {
-  request(tx: LifecycleCommandTransaction, command: RequestSessionEndCommandV2 | RequestSessionEndCommandV3): FreshLifecycleEffect<SessionEndStatusV2>;
-  amend(tx: LifecycleCommandTransaction, command: AmendSessionEndCommandV2 | AmendSessionEndCommandV3): FreshLifecycleEffect<SessionEndStatusV2>;
-  cancel(tx: LifecycleCommandTransaction, command: CancelSessionEndCommandV2): FreshLifecycleEffect<SessionEndStatusV2>;
-  classifyNext(claim: SessionEndWorkflowClaim): SessionEndNextAction;
-  advanceOperational(tx: WorkflowOperationalTransaction, claim: SessionEndWorkflowClaim, action: EventlessSessionEndAction): SessionEndPhaseResultV2;
-  advanceSemantic(tx: LifecycleCommandTransaction, claim: SessionEndWorkflowClaim, action: PlannedSemanticSessionEndAction): FreshLifecycleEffect<SessionEndPhaseResultV2>;
-}
-
-export class SessionEndCoordinator {
-  driveOnce(executor: ProjectStoreExecutor, signal: AbortSignal): Promise<SessionEndCoordinatorResult>;
-}
-
-export type SessionEndCoordinatorResult = JsonValue & {
-  readonly resultVersion: 1;
-  readonly progressed: boolean;
-  readonly workflowId: WorkflowId | null;
-  readonly workflowGeneration: number | null;
-  readonly action: SessionEndPhaseActionV2 | "none";
-  readonly status: SessionEndStatusV2 | null;
-};
-```
-
-Ownership is exact: `session-end.repository.ts` owns every workflow record,
-insert/claim/CAS/amendment DTO; `session-end-workflow.service.ts` owns the two
-action unions; `materialization-queue.port.ts` owns fingerprint/origin/trigger,
-projection, prepared brand, and queue-port DTOs. Other modules import them and
-must not redeclare structural lookalikes. The service converts repository
-claims to Task 13's `SessionEndWorkflowClaimWireV1` only at the worker boundary.
-
-- [ ] **Step 1: Write failing quality-policy and request-gate tests**
-
-Test threshold integer range 0..10,000; at most 64 profiles; canonical profile/version order; weight 1..1,000,000; positive total; required profile inclusion/no reweight; caller adds only allowlisted optional profiles; trusted boolean OR; max trusted/caller threshold; exact checked bigint formula; required failure blocking regardless of score; and coverage-only `requireFullEvidence` failure.
-
-```ts
-it("computes deterministic weighted basis points without floating point", () => {
-  const policy = effectivePolicy({
-    threshold: 6_667,
-    profiles: [
-      { profileId: "a", profileVersion: 1, required: true, weight: 2n },
-      { profileId: "b", profileVersion: 1, required: false, weight: 1n },
-    ],
-  });
-  assert.equal(scorePolicy(policy, new Map([["a@1", "pass"], ["b@1", "fail"]])).score, 6_666);
-});
-```
-
-- [ ] **Step 2: Write failing workflow request/phase/claim/amend/cancel tests**
-
-Cover deterministic `session-end/{sessionId}`, active/suspended previous state, pre-mutation fold of every nonterminal child, require-completed zero effect, carry-forward suspension/tickets/final checkpoint inclusion, one `SessionEndRequested`, different end command while ending, exact retry, final checkpoint, recording materialization-port calls, claim expiry/takeover/token, one phase per call, stale generation/token zero effect, verification-failed waiting, amendment earliest affected phase/new generation, cancellation restore/rewrite, and crash/restart after each phase. Prove the final `SessionCheckpointRecorded` semantic transaction queues the ending projection at that exact event position; the following eventless phase only verifies that immutable row before advancing to `ending-materialization-queued`, with no invented queue event. Also prove eventless phase CAS never touches event append/dedup, event-appending phase retries use one deterministic planned-work/command identity through semantic dedup, request/amend DTOs reject result IDs/observations, a complete 1..64-profile validation-attempt-plan array is persisted once per generation, and a request → cancel → request sequence reopens the same workflow at G+1 without a second insert while all old exact retries remain historical.
-
-Add Version 1 whole-scope eligibility cases for root, current children, and retained ticket source children; root-clean plus child/ticket-covered rejects with zero effect. A stored Version 1 workflow followed by evidence must stop before finalization with `CHECKPOINT_EVIDENCE_VERSION_REQUIRED` until a non-null Version 2 amendment or cancellation. Cover canonical transferred-child summaries, direct checkpoint-event-position binding, root and descendant evidence/final commit orders, descendant fresh-checkpoint retry, multiple batches while open, stale pre-seal checkpoint, and old generation coordinator/validation/outbox work after both open and seal.
-
-- [ ] **Step 3: Run focused tests and observe missing workflow implementation**
-
-Run:
-
-```powershell
-npm run test:build
-if ($LASTEXITCODE -ne 0) { throw "Compile RED recorded; add only the Task 14 typed stubs, then rerun this gate" }
-node --test --test-concurrency=1 --test-reporter=spec --test-name-pattern="^(freezes checkpoint position generation and ending bindings atomically|blocks finalization while the evidence window is open before append|reopens the deterministic cancelled workflow at generation plus one|fences old coordinator work after seal)$" dist-test/tests/session-end.coordinator.test.js
-```
-
-Expected after the compile-only scaffold: all four workflow anchors execute and
-fail for their exact atomicity/window/reopen/fencing behavior. Node never runs
-after a failed build.
-
-- [ ] **Step 4: Implement effective policy and deterministic request**
-
-Use checked bigint arithmetic:
-
-```ts
-export function qualityScore(
-  passingWeight: bigint,
-  totalEffectiveWeight: bigint,
-): number {
-  if (totalEffectiveWeight <= 0n) throw new LifecycleError("SESSION_VALIDATION_RESULT_INVALID");
-  return Number((10_000n * passingWeight) / totalEffectiveWeight);
-}
-```
-
-Persist requested/effective child policy, threshold, policy version, canonical profile entries, `requireFullEvidence`, and `requireMaterialization` in strict Version 1 workflow JSON. Caller cannot omit/reweight trusted profiles or weaken trusted defaults, and no request/amendment field accepts a validation result ID or observation. Only server-planned result IDs from the current generation may later satisfy validation.
-
-Before `SessionEndRequested`, shortlist children from authority but fold each child stream. Under require-completed, active/completion-proposed/suspended returns `SESSION_CHILDREN_ACTIVE` with zero event/workflow change. Under carry-forward, first run both Task 12 capacity estimators against the exact prospective ticket projections, then suspend eligible children and create immutable tickets in the same lifecycle command plan. For Version 1 request/final draft, require the root, every current relevant child, and every retained ticket source child to be coverage-clean. Verify current root proof and required pre-end checkpoint, append the matching outer Version 1 or Version 2 request event, set root to ending, capture prior state, create generation 1 only when no workflow exists, or reopen the durable cancelled row at G+1 in sealed/null shape under the exact reset rules, and renew the root lease.
-
-- [ ] **Step 5: Implement fenced repository claims and one-phase advancement**
-
-```ts
-export class SessionEndRepository {
-  createOrReopenSessionEnd(connection: SqliteConnection, input: SessionEndWorkflowInsert): SessionEndWorkflowRecord;
-  claimNext(connection: SqliteConnection, input: WorkflowClaimRequest): SessionEndWorkflowClaim | null;
-  renewClaim(connection: SqliteConnection, claim: SessionEndWorkflowClaim, nowMs: bigint, ttlMs: bigint): SessionEndWorkflowClaim;
-  compareAndSwapPhase(connection: SqliteConnection, input: WorkflowPhaseCompareAndSwap): boolean;
-  incrementGeneration(connection: SqliteConnection, input: WorkflowAmendment): SessionEndWorkflowRecord;
-  releaseClaim(connection: SqliteConnection, claim: SessionEndWorkflowClaim): void;
-  scanRecoverable(connection: SqliteConnection, nowMs: bigint, limit: number): readonly SessionEndWorkflowRecord[];
-}
-```
-
-Every phase update matches project/workflow/generation/current phase/current owner/current token and a live claim expiry. Takeover increments `coordinator_claim_token`; PID/liveness never authorizes mutation. Scan order is triggering event position then workflow ID. Ordinary selection maps only `workflow-claim-next` to `SessionEndRepository.claimNext`; no fabricated workflow identity or token is present before that repository call. The returned claim is converted to Task 13's strict wire result and is the sole source of every later target-bound work identity. Claim-next, target-bound claim/renew/release, scan, validation-attempt-plan persistence, and eventless phase CAS cross the Task 13 internal fenced-operation executor port and `LifecycleOperationalStore`; they never touch semantic dedup or event append. A phase action that appends an event crosses only `executeLifecycleInternalMutation` and `LifecycleCommandStore`.
-
-One classified action performs exactly one of: resolve children; emit a stable
-`PlanFinalCheckpointAndQueueEndingActionV1 | V2`; verify the exact ending outbox
-row and eventlessly advance from `final-checkpoint-recorded` to
-`ending-materialization-queued`; move to validating; persist one complete
-canonical deterministic validation-attempt-plan array for every effective
-profile; or record a phase already proven by durable result/materialization
-completion. The coordinator sends only the plan through Task 13. On a semantic
-dedup miss, `advanceSemantic` constructs the stable `RecordCheckpointCommandV2
-| V3`, calls Task 12E `CheckpointService.prepareFinalPhase` inside the same
-transaction, persists the returned full `InternalWorkflowPhaseCommand`, calls
-`recordPreparedFinal`, and queues the position-independent ending projection in
-that effect's `afterAppend`, passing the actual committed
-`SessionCheckpointRecorded` event. A replay hit returns before preparation.
-Before the final append, preparation builds the exact sorted union of current
-authoritative child summaries and retained carry-forward ticket projections,
-validates each non-null checkpoint by direct global event position, and requires
-child/ticket coverage equality. The same transaction persists final checkpoint
-position, workflow generation, and canonical
-`final_ending_scope_bindings_json` as one frozen group. The ending row's
-`materializationRevision` is that checkpoint event position; there is no
-`MaterializationQueued` event. Each action commits before returning. Eventless
-actions use `advanceOperational`; full final, verification, and terminal events
-use `advanceSemantic`. Recording fakes prove workflow behavior here; Task 16
-owns renderer/fingerprint/outbox integration. The coordinator releases/renews
-claims between external work and never loops asynchronously while SQLite holds
-a transaction.
-
-Every coordinator-origin event-appending mutation uses a stable internal replay expectation containing workflow ID, generation, server-derived internal audience, and deterministic `plannedWorkId`; on a dedup miss, the semantic-store callback checks the live claim owner/token and persists them in the `internal-workflow` authorization record. For a phase action, canonicalize `(projectId, workflowId, generation, sourcePhase, action)` once, derive `commandId` with UUIDv5 under the fixed namespace `a7b47792-6ad9-5b32-9f20-6f53f5dc2f31`, derive `idempotencyKey = lifecycle-phase-v1/{sha256(canonical action)}`, then compute the domain-separated phase `plannedWorkId` over that action plus both derived identities. Thus there is no derivation cycle and takeover reproduces the exact command before checking the expired original claim. Before any external validation, persist the paired `validation_attempt_plan_generation` and complete canonical `validation_attempt_plans_json` once for the current generation. It contains exactly one unique plan per effective profile—run ID, result ID, result command ID, and result idempotency key—and at most 64 entries. Crash retry reuses that array; amendment or cancelled-row reopening increments generation and atomically clears it before one new array may be written. There is no ambiguous choice among multiple results in one generation.
-
-- [ ] **Step 6: Implement amendment and cancellation generation fencing**
-
-Amendment requires current root proof and the applicable pre-transition checkpoint, increments workflow generation, fences all prior coordinator/validation/outbox claims, clears earlier attempt plans, appends the matching Version 1 or Version 2 `SessionEndAmended`, queues a new materialization revision, and sets a post-transition checkpoint marker. Version 2 applies its explicit evidence-window action:
-
-- `open` is sealed-to-open only, requires a non-null Version 2 final draft, clears the frozen group/final/validation bindings, resets to the earliest affected phase, and stops claim/recovery eligibility at open `children-resolved`; prerequisite child work may progress only until that phase. The in-transaction final action rechecks the latch and returns `SESSION_END_EVIDENCE_WINDOW_OPEN` with zero event/phase/outbox/attempt/failure effect.
-- `seal` is open-to-sealed only, requires an effective Version 2 draft plus a current ordinary pre-transition Version 2 checkpoint whose exact ending scope and child/ticket coverage still match. Evidence after that checkpoint makes the assertion stale and forces retry.
-- `unchanged` preserves the window and complete frozen group even if another amendment field resets the phase before final. A non-null Version 1 draft cannot downgrade an open row; a null Version 1 amendment may preserve the stored Version 2 draft.
-
-Root evidence racing after seal is serialized into the final or rejected by its freeze. Descendant evidence-first makes the child checkpoint stale, so finalization returns `SESSION_END_COVERAGE_CHANGED` with zero effect until a fresh child Version 2 checkpoint exists.
-
-Cancellation requires the same authority/pre-checkpoint rules, appends `SessionEndCancelled`, restores only the persisted active/suspended state, increments/fences generation, clears claims/attempt plans and the complete frozen group, seals the evidence window, moves the workflow to durable `cancelled`, and queues a deterministic cancelled/restored artifact revision equal to the cancellation event position. It cannot affect ended/abandoned roots. Tests must prove restored root/child evidence commits, quick/full integrity remains healthy, and a later Version 2 end request succeeds. A new ordinary end command while ending still returns `SESSION_END_INCOMPLETE`; only amendment/cancellation may alter that generation.
-
-A later authorized end request from the restored active/suspended root calls `createOrReopenSessionEnd`: it detects the existing sealed/null cancelled deterministic row, increments generation, replaces prior-state/request/effective-policy/triggering-event fields, clears claim/retry/failure/attempt-plan state, appends a fresh matching-version `SessionEndRequested`, queues the new ending revision, and returns to `requested` atomically. It never inserts a second row. Abandonment retains a frozen historical group only if a valid final checkpoint actually committed. A crash/lost response retries by the original command identity, and all earlier request/cancel dedup rows remain immutable historical effects.
-
-- [ ] **Step 7: Run policy/workflow/child/checkpoint/transaction gates**
-
-Run:
-
-```powershell
-npm run test:build
-node --test --test-concurrency=1 --test-reporter=spec dist-test/tests/session-end-policy.test.js dist-test/tests/session-end.coordinator.test.js dist-test/tests/child-workflow.test.js dist-test/tests/checkpoint.service.test.js dist-test/tests/lifecycle-command-store.test.js
-npm run typecheck
-```
-
-Expected: policy arithmetic, whole-scope Version 1 gating, canonical final bindings/freeze, explicit open/seal/unchanged behavior, child/final evidence races, split semantic/operational transaction ownership, generation/token/validation/outbox fencing, one-phase durability, cancellation sealed/null restore, and restart tests pass.
-
-- [ ] **Step 8: Commit**
-
-```powershell
-git add src/orchestrator/lifecycle/session-end-policy.ts src/orchestrator/storage/session-end.repository.ts src/orchestrator/lifecycle/session-end-workflow.service.ts src/orchestrator/lifecycle/session-end.coordinator.ts src/orchestrator/lifecycle/materialization-queue.port.ts src/orchestrator/lifecycle/contracts/session-end.ts src/orchestrator/lifecycle/contracts/commands.ts src/orchestrator/lifecycle/checkpoint.service.ts src/orchestrator/lifecycle/child-workflow.service.ts src/orchestrator/storage/session-authority.repository.ts src/orchestrator/storage/child-transfer.repository.ts src/orchestrator/runtime/lifecycle-worker-runtime.ts src/orchestrator/runtime/lifecycle-worker-runtime.factory.ts tests/session-end-policy.test.ts tests/session-end.coordinator.test.ts tests/lifecycle-executor.test.ts
-git commit -m "feat: persist session end workflow"
-```
+Every step, path, RED/GREEN command, commit boundary, frozen constant, and
+acceptance anchor is specified in the companion plan. Do not collapse its
+commits or reorder its slices.
 
 ---
-
 ### Task 15: Run Trusted Validation, Complete or Abandon, and Recover Safely
 
+> **Amended dependency:** Task 15 consumes the real, frozen Task 14Q queue and
+> immutable planned-row reader. It never uses a recording queue fake and never
+> extends the Task 14Q trigger union.
+
 **Files:**
+
 - Create: `src/orchestrator/lifecycle/validation-profile.registry.ts`
 - Create: `src/orchestrator/lifecycle/validation-profile.runner.ts`
-- Modify: `src/orchestrator/lifecycle/source-state.provider.ts`
 - Create: `src/orchestrator/storage/lifecycle-validation-result.repository.ts`
 - Create: `src/orchestrator/lifecycle/lifecycle-recovery.coordinator.ts`
 - Create: `tests/validation-profile-runner.test.ts`
 - Create: `tests/lifecycle-recovery.test.ts`
+- Modify: `src/orchestrator/lifecycle/source-state.provider.ts`
 - Modify: `src/orchestrator/lifecycle/session-end-workflow.service.ts`
 - Modify: `src/orchestrator/lifecycle/session-end.coordinator.ts`
-- Modify: `src/orchestrator/lifecycle/materialization-queue.port.ts`
-- Modify: `src/orchestrator/lifecycle/contracts/events.ts`
-- Modify: `src/orchestrator/lifecycle/contracts/session-end.ts`
 - Modify: `src/orchestrator/storage/session-end.repository.ts`
 - Modify: `src/orchestrator/storage/lifecycle-approval.repository.ts`
 - Modify: `src/orchestrator/storage/evidence-coverage.repository.ts`
@@ -3858,540 +3480,195 @@ git commit -m "feat: persist session end workflow"
 - Modify: `src/orchestrator/storage/child-transfer.repository.ts`
 - Modify: `src/orchestrator/lifecycle/checkpoint.service.ts`
 - Modify: `src/orchestrator/lifecycle/lifecycle-operational.store.ts`
-- Modify: `tests/session-end.coordinator.test.ts`
-- Modify: `tests/lifecycle-operational-store.test.ts`
 - Modify: `src/orchestrator/runtime/lifecycle-worker-runtime.ts`
 - Modify: `src/orchestrator/runtime/lifecycle-worker-runtime.factory.ts`
+- Modify: `tests/session-end.coordinator.test.ts`
+- Modify: `tests/lifecycle-operational-store.test.ts`
+- Modify: `tests/lifecycle-worker-runtime.test.ts`
 - Modify: `tests/lifecycle-executor.test.ts`
 
-**Interfaces:**
-- `ValidationProfileRegistry` resolves IDs only from trusted configuration. A lifecycle request contains no command, executable, path, environment, CWD, script, timeout, or weight.
-- `ValidationProfileRunner` runs resolved definitions outside SQLite transactions and returns normalized redacted observations; `LifecycleValidationResultRepository` persists immutable bound results inside a semantic lifecycle command.
-- Reuse Task 11's `SourceStateProvider`: async capture runs outside SQLite transactions and synchronous finalization capture runs inside the short `SessionEnded` transaction.
-- `LifecycleRecoveryCoordinator` runs integrity first and may resume only existing idempotent workflow/outbox work.
-- `assertFinalCheckpointCoverageFresh` is the one bounded current-state comparison and is invoked at exactly three atomic gates: inside the workflow operational transaction immediately before the `begin-validation` phase CAS, and inside the semantic transactions for verification pass and terminal completion. Quick/full integrity continue to validate the frozen event-time baseline instead.
-- Task 15 extends `WorkflowOperationalTransaction` with the exact read-only authority, transfer, and coverage facades already present on `LifecycleCommandTransaction`. `LifecycleOperationalStore` selects and guards those facades in the same `BEGIN IMMEDIATE` that performs the workflow phase CAS; it never runs freshness as a separate precheck.
-- Extend the same Task 13 runtime-factory composition with the trusted validation registry/runner, immutable result repository, freshness port, and recovery coordinator. The focused executor test proves the factory imports these owners rather than structural lookalikes, routes validation/recovery through the existing operation tags, and preserves one connection/provider instance and disposal order.
+Task 15 does **not** modify
+`src/orchestrator/lifecycle/materialization-queue.port.ts`, create planning
+outbox rows outside the frozen Task 14Q API, claim/materialize an outbox row,
+or construct the six-key plan before begin-validation.
 
-```ts
-export interface ValidationExecutionContext {
-  readonly context: ProjectContext;
-  readonly sessionId: SessionId;
-  readonly workflowId: WorkflowId;
-  readonly workflowGeneration: bigint;
-  readonly finalCheckpoint: Checkpoint;
-  readonly sourceStateScope: SourceStateScopeV1;
-  readonly startedAt: string;
-}
+**Interfaces and transaction boundary:**
 
-export interface ValidationObservation {
-  readonly status: "pass" | "fail" | "unavailable";
-  readonly exitClassification:
-    | "passed"
-    | "failed"
-    | "unavailable"
-    | "not-run";
-  readonly summary: string;
-  readonly outputBytes: Uint8Array;
-  readonly artifactReferences: readonly string[];
-}
+- Trusted registry entries, never caller commands/paths/env/CWD/scripts,
+  expand the stored six-key plans into the existing public 18-key attempt
+  identities.
+- Begin-validation uses one synchronous `BEGIN IMMEDIATE`: replay check;
+  workflow/generation/claim/phase and exact ending-row revalidation; snapshot
+  hydration; trusted registry expansion/config drift checks; bounded database
+  freshness; at-most-once canonical plan persistence; then phase CAS.
+- Async source-state capture and external processes begin only after commit.
+  Only the short terminal transaction may use the approved synchronous
+  finalization capture.
+- `WorkflowOperationalTransaction` exposes workflows, validation plans,
+  immutable outbox plans, and read-only authority/transfers/coverage only.
+- Task 15 queues exactly one frozen Task 14Q revision for each committed
+  verification failure, invalidation, abandonment, and `SessionEnded` event.
+  Abandonment inside an ending workflow uses non-null workflow origin and
+  generation; direct active/suspended abandonment uses terminal-event origin
+  with null workflow fields. No other terminal-event origin is legal.
+- Task 15 runtime integration replaces only its validation/result/recovery
+  unavailable routes with the exact shared owners. Every mutable outbox route
+  remains unavailable and its Task 14W negative assertion stays green.
+- With materialization optional, completion may reach `completed`. With it
+  required, Task 15 stops at `completion-appended` after one `SessionEnded` and
+  one exact completed-revision row; Task 16 later confirms materialization.
+- Recovery may report due outbox rows through a read-only ordered scan. It does
+  not execute them or mutate Task 14Q contracts.
 
-export interface ValidationProfileDefinition {
-  readonly profileId: string;
-  readonly profileVersion: number;
-  readonly configurationHash: string;
-  readonly required: boolean;
-  readonly weight: bigint;
-  readonly timeoutMs: number;
-  execute(context: ValidationExecutionContext, signal: AbortSignal): Promise<ValidationObservation>;
-}
+- [ ] **Step 1: Write RED trusted-profile and immutable-result tests**
 
-export interface ValidationRunPlanV1 {
-  readonly planVersion: 1;
-  readonly context: ProjectContext;
-  readonly workflow: Pick<
-    SessionEndWorkflowRecord,
-    "workflowId" | "sessionId" | "generation" | "phase"
-  >;
-  readonly finalCheckpoint: Checkpoint;
-  readonly sourceStateScope: SourceStateScopeV1;
-  readonly attempts: readonly ValidationAttemptPlanIdentityV1[];
-}
+Cover allowlisted resolution, stable plan expansion, configuration drift,
+timeouts, redaction/zeroization, exact immutable result/event binding, stale or
+foreign results, and committed-result replay after claim takeover.
 
-export interface ValidationResultSubmissionV1 {
-  readonly attemptPlan: ValidationAttemptPlanIdentityV1;
-  readonly result: ValidationResultV1;
-}
+- [ ] **Step 2: Write RED begin-validation atomicity tests**
 
-export type LifecycleValidationResultV1 = ValidationResultV1;
+Use two connections to prove snapshot/plan expansion, all bounded freshness
+reads, plan persistence, and phase CAS are one winner in one transaction. A
+conflict has zero plan/phase/event/outbox/failure effect and runs no async work.
 
-export interface BoundValidationResultQuery {
-  readonly projectId: ProjectId;
-  readonly attemptPlan: ValidationAttemptPlanIdentityV1;
-  readonly expectedFinalCheckpointId: CheckpointId;
-  readonly expectedFinalCheckpointFingerprint: string;
-  readonly expectedProfileConfigurationHash: string;
-}
+- [ ] **Step 3: Write RED verification, terminal, abandonment, and recovery tests**
 
-export interface SourceStateProvider {
-  capture(context: ProjectContext, scope: SourceStateScopeV1): Promise<SourceStateFingerprintV1>;
-  captureForCheckpoint(context: ProjectContext, scope: SourceStateScopeV1): SourceStateFingerprintV1;
-  captureForFinalization(context: ProjectContext, scope: SourceStateScopeV1): SourceStateFingerprintV1;
-}
+Cover all three freshness gates, source races, required/threshold/full-evidence
+failure, pass/invalidation, exactly one terminal event, optional versus required
+materialization, signed abandonment, integrity-first recovery, and prohibition
+on inferred semantic repair.
 
-export class ValidationProfileRunner {
-  run(plan: ValidationRunPlanV1, signal: AbortSignal): Promise<readonly ValidationResultSubmissionV1[]>;
-}
+- [ ] **Step 4: Implement trusted execution and semantic branches**
 
-export interface SessionEndWorkflowClaimCandidate {
-  readonly projectId: ProjectId;
-  readonly workflowId: WorkflowId;
-  readonly sessionId: SessionId;
-  readonly generation: bigint;
-  readonly phase: SessionEndPhase;
-  readonly triggeringEventPosition: bigint;
-  readonly attemptCount: number;
-  readonly nextAttemptAtMs: bigint | null;
-}
+Use the persisted current-generation plan array, stable internal identities,
+semantic dedup before fresh claim checks, actual recorded event positions, the
+real Task 14Q queue, and exact terminal compare-and-swap rules. Do not perform
+filesystem materialization.
 
-export interface LifecycleOutboxClaimCandidate {
-  readonly projectId: ProjectId;
-  readonly targetKey: string;
-  readonly sessionId: SessionId;
-  readonly materializationRevision: bigint;
-  readonly triggeringEventPosition: bigint;
-  readonly attemptCount: number;
-  readonly nextAttemptAtMs: bigint | null;
-}
-
-export interface EndingSessionDiagnostic {
-  readonly projectId: ProjectId;
-  readonly sessionId: SessionId;
-  readonly workflowId: WorkflowId;
-  readonly workflowGeneration: bigint;
-  readonly phase: SessionEndPhase;
-  readonly triggeringEventPosition: bigint;
-}
-
-export interface LifecycleInvariantFailure {
-  readonly code: string;
-  readonly projectId: ProjectId;
-  readonly sessionId: SessionId | null;
-  readonly workflowId: WorkflowId | null;
-  readonly target: "session" | "workflow" | "outbox" | "event-stream";
-}
-
-export interface ExpiredRootLeaseDiagnostic {
-  readonly projectId: ProjectId;
-  readonly sessionId: SessionId;
-  readonly generation: bigint;
-  readonly expiredAtMs: bigint;
-}
-
-export interface LifecycleRecoveryScanResult {
-  readonly workflows: readonly SessionEndWorkflowClaimCandidate[];
-  readonly outbox: readonly LifecycleOutboxClaimCandidate[];
-  readonly endingWithoutCoordinator: readonly EndingSessionDiagnostic[];
-  readonly invariantFailures: readonly LifecycleInvariantFailure[];
-  readonly expiredRootLeases: readonly ExpiredRootLeaseDiagnostic[];
-}
-
-export interface FinalCheckpointCoverageFreshnessPort {
-  assertFinalCheckpointCoverageFresh(
-    tx: FinalCheckpointCoverageTransaction,
-    workflow: SessionEndWorkflowRecord,
-  ): void;
-}
-
-export interface WorkflowOperationalTransaction {
-  readonly workflows: ConnectionBoundSessionEndWorkflowOperations;
-  readonly authority: LifecycleCommandTransaction["authority"];
-  readonly transfers: LifecycleCommandTransaction["transfers"];
-  readonly coverage: LifecycleCommandTransaction["coverage"];
-}
-
-export type FinalCheckpointCoverageTransaction =
-  | LifecycleCommandTransaction
-  | WorkflowOperationalTransaction;
-```
-
-Ownership is exact: `validation-profile.registry.ts` owns execution context,
-observation, and profile definition; `validation-profile.runner.ts` owns run
-plan/submission; `lifecycle-validation-result.repository.ts` owns the result
-alias and bound query; `lifecycle-recovery.coordinator.ts` owns both recovery
-candidates, diagnostics, invariant failures, and the scan result. Task 16's
-outbox repository imports the recovery candidate contract rather than declaring
-a structural duplicate.
-
-- [ ] **Step 1: Write failing trusted-profile and immutable-result tests**
-
-Cover allowlisted resolution, required/optional canonical order, caller-supplied command/path/env/CWD/script/result-ID/observation rejection at wire decode, timeout normalization, pass/fail/unavailable, no raw stdout/stderr retention, keyed output fingerprint and artifact refs, scoped source state at start/completion, exact persisted run/result/command/idempotency identity, runner identity, workflow/generation/profile/config/checkpoint binding, stale/future/wrong-project result rejection, duplicate immutable result, missing/wrong recorded event position, and handle/process closure. Prove only the complete persisted attempt-plan array for the current generation is selectable; a committed result replays by its stable plan identity after the original claim expires/takes over without invoking fresh validation, while a dedup miss must verify the current live claim.
-
-- [ ] **Step 2: Write failing pass/fail/source-race/terminal tests**
-
-Cover required failure, threshold failure, unavailable weight zero, coverage-only full-evidence failure, fresh all-pass path, source change before pass, source change between pass and terminal transaction, `SessionEndVerificationInvalidated`, exactly one `SessionEnded`, authority revocation, terminal amendment/cancel/resume/abandon rejection, optional/required completion materialization behavior, and response loss after validation result/pass/end. At each of the three freshness gates cover root latest checkpoint ID/event/body/index, checkpoint-required marker, root adapter state and zero-new latest-batch movement, exact ending-scope set, child fold/stream/latest-checkpoint movement, direct historical checkpoint-position lookup after the mutable index advances, immutable ticket/event/terminal-child bindings, child V2 coverage before/after final, Version 1 whole-scope cleanliness, and distinct-profile historical-key status. For validation start, use two connections and prove the freshness read and `ending-materialization-queued` → `validating` CAS occupy one `BEGIN IMMEDIATE`: a concurrent evidence/child/authority writer is one-winner and no stale phase can be committed after the comparison. Prove `EVIDENCE_HISTORICAL_KEY_UNAVAILABLE` or `SESSION_END_COVERAGE_CHANGED` has zero phase/event/outbox/attempt/failure effect. Prove ending/failed/completed compatibility target and committed temp writes leave the scoped witness unchanged, while a normal tracked or untracked project edit still causes `SESSION_SOURCE_STATE_CONFLICT`.
-
-- [ ] **Step 3: Write failing abandonment and recovery tests**
-
-Test root proof plus signed abandonment approval, action separation, pre-checkpoint reference, single-use consumption, no capability recipient, terminal `SessionAbandoned`, queued abandoned rewrite, active/suspended/ending entry, generation fencing of an ending workflow, and no successful-completion claim. Test recovery scan ordering, integrity failure read-only mode, ending without coordinator, expired lease diagnostics only, retryable versus permanent work, and prohibition on inferred end/transfer/abandonment.
-
-- [ ] **Step 4: Run focused tests and observe missing validation/recovery modules**
-
-Run:
+- [ ] **Step 5: Run amended Task 15 focused gates**
 
 ```powershell
 npm run test:build
-if ($LASTEXITCODE -ne 0) { throw "Compile RED recorded; add only the Task 15 typed stubs, then rerun this gate" }
-node --test --test-concurrency=1 --test-reporter=spec --test-name-pattern="^(replays a committed validation result after claim expiry|rejects stale final coverage at validation start with zero effect|rejects stale final coverage at verification pass with zero effect|rejects stale final coverage at terminal completion with zero effect|invalidates completion when source state changes inside final transaction|returns read-only recovery after quick integrity failure)$" dist-test/tests/validation-profile-runner.test.js dist-test/tests/session-end.coordinator.test.js dist-test/tests/lifecycle-recovery.test.js
-```
-
-Expected after the compile-only scaffold: all six replay/freshness/source/risk
-anchors execute and fail for the exact missing behavior. Node never runs after a
-failed build.
-
-- [ ] **Step 5: Implement trusted execution and immutable result persistence**
-
-Resolve profile definitions from the persisted effective policy and trusted registry; reject version/configuration/weight drift. Load the complete current-generation attempt-plan array from Task 14 and run each definition with its unique exact run/result/command/idempotency identity plus an internal `AbortController` deadline, never a caller command. A retry after crash reuses the same array entry; it never generates a second identity. Normalize observation to status, exit classification, concise redacted summary, artifact references, and provider-keyed output fingerprint. Destroy raw output buffers after fingerprint/summary generation.
-
-Persist through:
-
-```ts
-export class LifecycleValidationResultRepository {
-  insert(connection: SqliteConnection, attemptPlan: ValidationAttemptPlanIdentityV1, result: LifecycleValidationResultV1, recordedEvent: StoredEvent): void;
-  getBound(connection: SqliteConnection, query: BoundValidationResultQuery): LifecycleValidationResultV1 | null;
-  listForGeneration(connection: SqliteConnection, projectId: string, workflowId: string, generation: bigint): readonly LifecycleValidationResultV1[];
-}
-```
-
-The trusted coordinator submits the normalized observation through `executeLifecycleInternalMutation` using the one persisted attempt-plan command/result identity as `plannedWorkId`. Before store execution, the runtime selects that trusted plan and constructs the stable internal replay expectation without treating the current claim as a replay prerequisite. `LifecycleCommandStore` checks dedup first: a committed exact replay returns even after the original claim expires. Only on a dedup miss does the fresh callback verify the current workflow/generation/claim, construct the complete persisted `internal-workflow` authorization record, and prepare `SessionValidationResultRecorded`. In `afterAppend`, it passes the actual committed event position to the connection-bound repository insert, which requires the deferred event foreign key and then deduplicates by the persisted result command. The row stores run/runner identity, both versioned source-state-scope/project/workspace/branch/HEAD/dirty witnesses, output algorithm/schema/key/domain/value, artifact references, freshness, and recorded event position. The event/result retain fingerprints and redacted metadata only.
-
-- [ ] **Step 6: Implement verification branches and terminal compare-and-swap**
-
-When `advanceOperational` receives `begin-validation`, its one
-`LifecycleOperationalStore` callback first calls
-`assertFinalCheckpointCoverageFresh(tx, workflow)` and then performs the
-generation/phase/owner/token CAS using that same
-`WorkflowOperationalTransaction`; both are synchronous inside one
-`BEGIN IMMEDIATE`. A freshness failure throws before the CAS and the store rolls
-back, so there is no phase, attempt-plan, event, outbox, failure-counter, or
-claim mutation. No caller can invoke a standalone freshness precheck. After
-that atomic transition, load each current generation's server-planned result
-through `LifecycleValidationResultRepository.getBound`; accept only the single
-immutable result whose project, workflow generation, attempt plan, profile
-config, final-checkpoint fingerprint, source-state scope/witnesses, recorded
-event, and freshness all match. Calculate score with Task 14 arithmetic. Any
-missing/ambiguous/stale planned result, required failure, low score, unavailable
-required result, or effective `requireFullEvidence` appends
-`SessionEndVerificationFailed`, queues a failed-state materialization revision
-through the port, and moves to the waiting branch through one internal semantic
-mutation; eventless waiting/claim bookkeeping remains operational.
-
-Before pass, call `assertFinalCheckpointCoverageFresh`, resolve the trusted scope again, recapture source state, and require the same scope version and semantic witness as checkpoint/validation completion; system-owned exact store/pending/materialization target/temp paths are filtered. Otherwise append failed with `SESSION_SOURCE_STATE_CONFLICT` and queue its failed-state revision. On success append `SessionEndVerificationPassed` and move to verification-passed.
-
-The final transaction calls `assertFinalCheckpointCoverageFresh`, then synchronous `captureForFinalization(context, trustedScope)` after `BEGIN IMMEDIATE` and immediately before its terminal compare-and-swap. It compares scope version and semantic witness with the final checkpoint, validation-completion witness, and the witness accepted by `SessionEndVerificationPassed`. This trusted fixed implementation performs no `await`, caller-selected command, or unrelated validation work and keeps the transaction bounded. If changed, append `SessionEndVerificationInvalidated`, queue that event-position revision, and atomically return to verification-failed. Otherwise append exactly one `SessionEnded`, set authority terminal/revocation fields and commitment, revoke root/children as policy requires, queue the completed revision equal to the end event position, and move to completion-appended. If materialization is not required, advance directly to completed; otherwise wait for acknowledgement of that exact revision from Task 16.
-
-Each freshness call requires the root frozen checkpoint tuple and null checkpoint-required pair, exact current qualified root coverage, exact current child/ticket binding set versus `final_ending_scope_bindings_json`, every child/ticket checkpoint resolved by its stored global event position, and available status once per distinct historical profile. A current mismatch returns `SESSION_END_COVERAGE_CHANGED`; unavailable key status returns `EVIDENCE_HISTORICAL_KEY_UNAVAILABLE`. Neither is storage corruption, and neither changes phase, events, outbox, attempt plans, or failure counters.
-
-- [ ] **Step 7: Implement approved abandonment and integrity-first recovery**
-
-Abandonment verifies both current root semantic proof and `AbandonmentApprovalV1`, current generation/audience/intent, required pre-checkpoint, and healthy integrity. It fences any ending workflow, moves that row to durable `abandoned`, retains a historical frozen group only when a strictly bound final checkpoint actually exists, appends `SessionAbandoned`, revokes authority, writes the complete approval-consumption tuple, stores no recipient descriptor, and queues the abandoned-state revision in one transaction. Ending abandonment uses workflow origin/generation plus the new revision; active/suspended abandonment uses `terminal-event` origin with null workflow fields and `materializationRevision = SessionAbandoned` position. Recovery and integrity validate any retained group at event time and never mistake later current-state divergence for corruption.
-
-Recovery performs quick integrity first. On failure it returns read-only `INTEGRITY_FAILURE`. Otherwise it scans nonterminal workflows and due outbox revisions in deterministic triggering-position order, ending roots without a live claim, fold/index mismatches, and expired root leases. `recoverOnce` may claim and advance an existing generation or due artifact revision only; it cannot append pass/end, transfer ownership, consume approval, or infer abandonment without the exact durable prerequisites.
-
-- [ ] **Step 8: Run validation, end, recovery, approval, and integrity gates**
-
-Run:
-
-```powershell
-npm run test:build
-node --test --test-concurrency=1 --test-reporter=spec dist-test/tests/validation-profile-runner.test.js dist-test/tests/session-end-policy.test.js dist-test/tests/session-end.coordinator.test.js dist-test/tests/lifecycle-recovery.test.js dist-test/tests/lifecycle-approval.test.js dist-test/tests/event-integrity.test.js
+node --test --test-concurrency=1 --test-reporter=spec dist-test/tests/validation-profile-runner.test.js dist-test/tests/session-end.coordinator.test.js dist-test/tests/lifecycle-recovery.test.js dist-test/tests/lifecycle-operational-store.test.js dist-test/tests/lifecycle-worker-runtime.test.js dist-test/tests/lifecycle-executor.test.js dist-test/tests/lifecycle-materialization-queue.test.js dist-test/tests/lifecycle-outbox.repository.test.js
 npm run typecheck
+npm run build
+npm run test:build-artifacts
 ```
 
-Expected: trusted-only execution, immutable binding, deterministic policy, all three evidence/current-state freshness gates, both source-race branches, exact typed zero-effect stale/key failures, exactly one terminal event, historically correct abandonment, and integrity-first recovery all pass.
-
-- [ ] **Step 9: Commit**
+- [ ] **Step 6: Commit only the amended Task 15 scope**
 
 ```powershell
-git add src/orchestrator/lifecycle/validation-profile.registry.ts src/orchestrator/lifecycle/validation-profile.runner.ts src/orchestrator/lifecycle/source-state.provider.ts src/orchestrator/lifecycle/materialization-queue.port.ts src/orchestrator/lifecycle/checkpoint.service.ts src/orchestrator/lifecycle/lifecycle-operational.store.ts src/orchestrator/storage/lifecycle-validation-result.repository.ts src/orchestrator/storage/evidence-coverage.repository.ts src/orchestrator/storage/session-authority.repository.ts src/orchestrator/storage/child-transfer.repository.ts src/orchestrator/lifecycle/lifecycle-recovery.coordinator.ts src/orchestrator/lifecycle/session-end-workflow.service.ts src/orchestrator/lifecycle/session-end.coordinator.ts src/orchestrator/lifecycle/contracts/events.ts src/orchestrator/lifecycle/contracts/session-end.ts src/orchestrator/storage/session-end.repository.ts src/orchestrator/storage/lifecycle-approval.repository.ts src/orchestrator/runtime/lifecycle-worker-runtime.ts src/orchestrator/runtime/lifecycle-worker-runtime.factory.ts tests/validation-profile-runner.test.ts tests/lifecycle-recovery.test.ts tests/session-end.coordinator.test.ts tests/lifecycle-operational-store.test.ts tests/lifecycle-executor.test.ts
-git commit -m "feat: verify and recover session end"
+git add src/orchestrator/lifecycle/validation-profile.registry.ts src/orchestrator/lifecycle/validation-profile.runner.ts src/orchestrator/lifecycle/source-state.provider.ts src/orchestrator/storage/lifecycle-validation-result.repository.ts src/orchestrator/lifecycle/lifecycle-recovery.coordinator.ts src/orchestrator/lifecycle/session-end-workflow.service.ts src/orchestrator/lifecycle/session-end.coordinator.ts src/orchestrator/storage/session-end.repository.ts src/orchestrator/storage/lifecycle-approval.repository.ts src/orchestrator/storage/evidence-coverage.repository.ts src/orchestrator/storage/session-authority.repository.ts src/orchestrator/storage/child-transfer.repository.ts src/orchestrator/lifecycle/checkpoint.service.ts src/orchestrator/lifecycle/lifecycle-operational.store.ts src/orchestrator/runtime/lifecycle-worker-runtime.ts src/orchestrator/runtime/lifecycle-worker-runtime.factory.ts tests/validation-profile-runner.test.ts tests/lifecycle-recovery.test.ts tests/session-end.coordinator.test.ts tests/lifecycle-operational-store.test.ts tests/lifecycle-worker-runtime.test.ts tests/lifecycle-executor.test.ts
+git commit -m "feat: validate and complete ending sessions"
 ```
+
+**Acceptance boundary:** Task 15 is executable through validation and terminal
+semantics. Required-materialization workflows may remain durably pending; that
+is expected, not a fake success or a missing Task 15 implementation.
 
 ---
-
 ### Task 16: Materialize Deterministic Compatibility Logs with Revision Fencing
 
+> **Amended ownership:** Task 16 consumes Task 14Q's path, renderer, typed
+> pending payload, connection-bound queue, immutable planning repository, and
+> exact plan reader unchanged. It owns only mutable operational work and
+> filesystem durability.
+
 **Files:**
-- Create: `src/orchestrator/storage/lifecycle-outbox.repository.ts`
-- Create: `src/orchestrator/materialization/vault-artifact-path.ts`
-- Create: `src/orchestrator/materialization/compatibility-log.renderer.ts`
-- Create: `src/orchestrator/materialization/sqlite-lifecycle-materialization-queue.ts`
+
 - Create: `src/orchestrator/materialization/atomic-artifact-replacer.ts`
 - Create: `src/orchestrator/materialization/compatibility-log.materializer.ts`
-- Create: `tests/compatibility-log-renderer.test.ts`
 - Create: `tests/compatibility-log-materializer.test.ts`
-- Modify: `src/orchestrator/lifecycle/materialization-queue.port.ts`
+- Modify: `src/orchestrator/storage/lifecycle-outbox.repository.ts`
 - Modify: `src/orchestrator/lifecycle/lifecycle-operational.store.ts`
 - Modify: `src/orchestrator/lifecycle/session-end-workflow.service.ts`
 - Modify: `src/orchestrator/lifecycle/session-end.coordinator.ts`
 - Modify: `src/orchestrator/lifecycle/lifecycle-recovery.coordinator.ts`
 - Modify: `src/orchestrator/storage/session-end.repository.ts`
 - Modify: `src/orchestrator/integrity/lifecycle-integrity.service.ts`
+- Modify: `src/orchestrator/lifecycle/source-state.provider.ts`
 - Modify: `src/orchestrator/runtime/lifecycle-worker-runtime.ts`
 - Modify: `src/orchestrator/runtime/lifecycle-worker-runtime.factory.ts`
+- Modify: `tests/session-end.coordinator.test.ts`
+- Modify: `tests/lifecycle-recovery.test.ts`
 - Modify: `tests/lifecycle-executor.test.ts`
+- Modify: `tests/source-state.provider.test.ts`
+- Modify: `tests/lifecycle-worker-runtime.test.ts`
+- Modify: `tests/lifecycle-outbox.repository.test.ts`
+- Modify: `tests/lifecycle-operational-store.test.ts`
+- Modify: `tests/qualified-checkpoint-quick-integrity.test.ts`
+- Modify: `tests/qualified-checkpoint-full-integrity.test.ts`
+- Modify: `tests/directory-durability.test.ts`
 
-**Interfaces:**
-- The target path is derived only from committed `SessionStarted` UTC date and session ID: `05_Agent_Session_Logs/{yyyy-mm-dd}-session-{sessionId}.md`.
-- `CompatibilityLogRenderer` is pure and renders committed events only through the outbox triggering position.
-- `SqliteLifecycleMaterializationQueue` implements `LifecycleMaterializationQueuePort` by composing the pure renderer, provider-keyed fingerprint service, and connection-bound `tx.outbox.insertLifecycle`; the raw `LifecycleOutboxRepository` remains storage-only. Its `acknowledge` method is private to the materializer's atomic operational callback and is never exposed as a coordinator/executor wire operation.
-- Each immutable row retains one planned fingerprint per revision and uses `targetKey = lifecycle-log/{sessionId}/{materializationRevision}` so the Version 1 `(project_id, target_key)` primary key can store history while every revision still derives the same artifact path.
-- `CompatibilityLogMaterializer` is bound inside the lifecycle worker runtime and performs the approved temp-write/fingerprint/recheck/replace/fsync/ack sequence. A trusted materialization coordinator invokes Task 13's explicit `outbox-claim-next` selection, then only target-bound renew/materialize/failure operations derived from the returned `LifecycleOutboxClaimWireV1`, through `ProjectStoreExecutor.executeLifecycleFenced`; no target/revision/token is fabricated before selection. `materialize` uses `LifecycleOperationalStore` for the one short replacement-plus-ack transaction. That transaction recognizes an exact already-completed row before enforcing lease expiry, verifies its retained acknowledgement tuple and current latest target bytes, and returns the stored completion. The materializer never recursively calls the executor, semantic dedup, or the Version 1 `NoteRepository`.
-- Rendering strict-decodes `CheckpointV1 | CheckpointV2` once. Version 2 output preserves the canonical qualified adapter summary but never renders frames, ordinal rows/fingerprints, `observedAt`, provider/key material, or raw evidence.
-- Replace the recording materialization binding in Task 13's runtime factory with `SqliteLifecycleMaterializationQueue`, connection-bound outbox operations, and `CompatibilityLogMaterializer`. The executor test proves claim/renew/materialize/failure route to those exact instances, standalone acknowledgement remains impossible, and all materialization resources dispose before the active connection closes.
+Task 16 does **not** create or redefine
+`vault-artifact-path.ts`, `compatibility-log.renderer.ts`,
+`sqlite-lifecycle-materialization-queue.ts`, their planning DTOs, or renderer
+golden fixtures. Those are frozen Task 14Q APIs.
+
+**Operational extension:**
 
 ```ts
-export interface LifecycleOutboxInsert {
-  readonly context: ProjectContext;
-  readonly targetKey: string;
-  readonly sessionId: SessionId;
-  readonly artifactKind: "compatibility-session-log";
-  readonly artifactPath: string;
-  readonly origin: LifecycleMaterializationOriginV1;
-  readonly materializationRevision: bigint;
-  readonly triggeringEventPosition: bigint;
-  readonly triggeringEventType: LifecycleMaterializationTriggerType;
-  readonly triggeringPayloadHash: string;
-  readonly expectedPriorFingerprint: KeyedFingerprintV1 | null;
-  readonly nextFingerprint: KeyedFingerprintV1;
-  readonly createdAt: string;
-}
-
-export interface LifecycleOutboxClaim {
-  readonly projectId: ProjectId;
-  readonly targetKey: string;
-  readonly sessionId: SessionId;
-  readonly artifactKind: "compatibility-session-log";
-  readonly artifactPath: string;
-  readonly origin: LifecycleMaterializationOriginV1;
-  readonly materializationRevision: bigint;
-  readonly triggeringEventPosition: bigint;
-  readonly triggeringEventType: LifecycleMaterializationTriggerType;
-  readonly triggeringPayloadHash: string;
-  readonly expectedPriorFingerprint: KeyedFingerprintV1 | null;
-  readonly nextFingerprint: KeyedFingerprintV1;
-  readonly claimOwnerId: string;
-  readonly claimToken: bigint;
-  readonly claimExpiresAtMs: bigint;
-  readonly attemptCount: number;
-  readonly acknowledgedFingerprint: KeyedFingerprintV1 | null;
-  readonly acknowledgedAt: string | null;
-}
-
-export interface OutboxClaimRequest {
-  readonly projectId: ProjectId;
-  readonly ownerId: string;
-  readonly observedNowMs: bigint;
-  readonly ttlMs: bigint;
-}
-
-export interface OutboxClaimRenewal {
-  readonly projectId: ProjectId;
-  readonly targetKey: string;
-  readonly materializationRevision: bigint;
-  readonly ownerId: string;
-  readonly claimToken: bigint;
-  readonly observedNowMs: bigint;
-  readonly ttlMs: bigint;
-}
-
-export interface OutboxAcknowledgement {
-  readonly projectId: ProjectId;
-  readonly targetKey: string;
-  readonly materializationRevision: bigint;
-  readonly ownerId: string;
-  readonly claimToken: bigint;
-  readonly observedNowMs: bigint;
-  readonly fingerprint: KeyedFingerprintV1;
-  readonly acknowledgedAt: string;
-}
-
-export interface OutboxFailure {
-  readonly projectId: ProjectId;
-  readonly targetKey: string;
-  readonly materializationRevision: bigint;
-  readonly ownerId: string;
-  readonly claimToken: bigint;
-  readonly observedNowMs: bigint;
-  readonly failureClass: "retryable" | "permanent";
-  readonly safeErrorCode: string;
-  readonly nextAttemptAtMs: bigint | null;
-}
-
-export interface CompatibilityLogRenderInput {
-  readonly context: ProjectContext;
-  readonly sessionId: SessionId;
-  readonly throughEventPosition: bigint;
-  readonly events: readonly StoredEvent[];
-}
-
-export type MaterializationResultV1 = JsonValue & {
-  readonly resultVersion: 1;
-  readonly status: "completed" | "superseded-after-completion";
-  readonly targetKey: string;
-  readonly artifactPath: string;
-  readonly materializationRevision: string;
-  readonly fingerprint: KeyedFingerprintV1;
-  readonly acknowledged: boolean;
-};
-
-export class LifecycleOutboxRepository {
-  insertLifecycle(connection: SqliteConnection, input: LifecycleOutboxInsert): void;
-  claimNext(connection: SqliteConnection, input: OutboxClaimRequest): LifecycleOutboxClaim | null;
-  renewClaim(connection: SqliteConnection, input: OutboxClaimRenewal): LifecycleOutboxClaim;
-  acknowledge(connection: SqliteConnection, input: OutboxAcknowledgement): boolean;
-  recordFailure(connection: SqliteConnection, input: OutboxFailure): boolean;
-  listCommittedLowerRevisionFingerprints(connection: SqliteConnection, claim: LifecycleOutboxClaim): readonly KeyedFingerprintV1[];
-}
-
-export class SqliteLifecycleMaterializationQueue implements LifecycleMaterializationQueuePort {
-  prepare(input: MaterializationProjectionInput): PreparedMaterializationQueue;
-  persist(tx: LifecycleCommandTransaction, prepared: PreparedMaterializationQueue, triggeringEvent: StoredEvent): void;
-}
-
-export class CompatibilityLogRenderer {
-  render(input: CompatibilityLogRenderInput): Uint8Array;
-}
-
-export class CompatibilityLogMaterializer {
-  materialize(claim: LifecycleOutboxClaim): MaterializationResultV1;
+export interface LifecycleOutboxOperationalRepository
+  extends LifecycleOutboxPlanReader {
+  claimNext(input: OutboxClaimRequest): LifecycleOutboxClaim | null;
+  getExactClaim(input: ExactOutboxClaimQuery): LifecycleOutboxClaim;
+  renewClaim(input: OutboxClaimRenewal): LifecycleOutboxClaim;
+  listCommittedLowerRevisionFingerprints(
+    claim: LifecycleOutboxClaim,
+  ): readonly KeyedFingerprintV1[];
+  recordFailure(input: OutboxFailure): LifecycleOutboxClaim;
+  acknowledgeAfterReplacement(
+    input: OutboxAcknowledgement,
+  ): MaterializationResultV1;
 }
 ```
 
-Ownership is exact: `lifecycle-outbox.repository.ts` owns insert/claim/request/
-renewal/acknowledgement/failure DTOs; `compatibility-log.renderer.ts` owns its
-render input; `compatibility-log.materializer.ts` owns the domain result and
-converts it to Task 13's `MaterializationResultWireV1` at the worker boundary.
-No other module redeclares these shapes. `acknowledge` remains reachable only
-inside materialization's atomic operational callback; the absence of a public
-wire operation is part of the type boundary.
+- Claims originate only from `outbox-claim-next` or an exact recovery target;
+  callers do not fabricate target/revision/token identities.
+- Private acknowledgement is reachable only inside replacement reconciliation;
+  no standalone acknowledgement wire exists.
+- Completed replay reconciles retained acknowledgement and current target bytes
+  before lease enforcement. A newer revision returns bounded
+  `superseded-after-completion` without changing bytes.
+- A noncompleted attempt verifies current revision, workflow generation, live
+  owner/token/expiry, fingerprint tuple, and acceptable prior bytes before
+  replace/fsync/private acknowledgement.
+- Lower-revision history is keyed by project/session/artifact kind and uses the
+  Task 14Q canonical path and verified fingerprint lineage.
+- Task 16 runtime integration replaces only outbox claim-next/exact-claim,
+  renewal, materialize, and failure unavailable routes with exact shared
+  owners. Validation/recovery owners installed by Task 15 remain unchanged;
+  standalone acknowledgement remains impossible.
 
-- [ ] **Step 1: Write failing deterministic renderer/path tests**
+- [ ] **Step 1: Write RED claim, takeover, and completed-replay tests**
+- [ ] **Step 2: Write RED staging, symlink, replace, fsync, conflict, and crash tests**
+- [ ] **Step 3: Implement the operational repository extension and contained replacer**
+- [ ] **Step 4: Implement render/stage/recheck/replace/fsync/private-ack materialization**
+- [ ] **Step 5: Integrate completion confirmation and integrity-first recovery**
 
-Create golden byte fixtures for both checkpoint versions across active-ending, failed-validation, cancelled/restored, abandoned, ended-with-accepted-child-results, and ended-with-transfer-follow-ups. Prove same events/position produce identical UTF-8/LF bytes across retry, process, topic changes, workflow generation, and locale; path uses original UTC start date; visible ending marker appears only for folded ending state; materialized position and identity/source/fingerprint metadata are exact; Version 2 qualified adapters remain sorted; and no frame, ordinal fingerprint, `observedAt`, provider material, raw evidence/output, or secret appears.
-
-- [ ] **Step 2: Write failing claim/replacement/crash/fencing tests**
-
-Cover queue-port integration through renderer/fingerprint/connection-bound insert; deterministic revision-bearing target keys with one shared path; ordered claims, expired claim takeover/token increment, live renewal, stale token/revision/workflow generation, expiry during staging, next fingerprint committed before write, absent/equal/acknowledged-prior targets, unknown bytes permanent conflict, write-before-ack lost response, and replacement-before-ack followed by newer ending → validation-failed → completed, open → seal, amendment, cancellation, and abandonment revisions replacing committed lower-revision fingerprints. After both open and seal, stale old-generation claim/materialize/ack work has zero byte/row effect, exact committed replay remains idempotent, and the newer amendment revision wins. Include exact `materialize` retry after committed acknowledgement/lost response and after the original lease expires: matching retained owner/token/revision/fingerprint plus latest target bytes returns the stored completion without reclaim, while missing/changed bytes, a mismatched tuple, or an unacknowledged expired row cannot succeed. Also cover deterministic superseded-after-completion status when a newer revision exists, rejection of any standalone acknowledgement wire, active/suspended abandonment with terminal-event origin/null workflow, retryable backoff, permanent conflict nonretry, file/directory fsync, symlink/path substitution, Windows handle closure, and source-state witnesses that remain unchanged across system target/temp writes.
-
-```ts
-it("lets a newer revision replace committed stale bytes after lost acknowledgement", () => {
-  const revision41 = queueAndClaimRevision(41n);
-  materializerFaults.stopAfterReplace(revision41);
-  assert.throws(() => materializer.materialize(revision41), /INJECTED_CRASH/);
-  const staleBytes = readFileSync(targetPath);
-
-  const revision52 = amendAndClaimRevision(52n);
-  const result = materializer.materialize(revision52);
-  assert.equal(result.status, "completed");
-  assert.notDeepEqual(readFileSync(targetPath), staleBytes);
-  assert.equal(loadOutbox(revision52).status, "completed");
-});
-```
-
-- [ ] **Step 3: Run focused tests and observe missing materializer implementation**
-
-Run:
+- [ ] **Step 6: Run amended Task 16 gates**
 
 ```powershell
 npm run test:build
-if ($LASTEXITCODE -ne 0) { throw "Compile RED recorded; add only the Task 16 typed stubs, then rerun this gate" }
-node --test --test-concurrency=1 --test-reporter=spec --test-name-pattern="^(renders checkpoint v1 and v2 golden bytes deterministically|replays completed materialization after byte reconciliation before lease enforcement|lets a newer revision replace committed lower-revision bytes after lost acknowledgement|rejects standalone outbox acknowledgement|fences stale generation materialize after open and seal)$" dist-test/tests/compatibility-log-renderer.test.js dist-test/tests/compatibility-log-materializer.test.js dist-test/tests/session-end.coordinator.test.js
-```
-
-Expected after the compile-only scaffold: all five renderer/replay/revision/
-protocol/fencing anchors execute and fail for their exact missing behavior. Node
-never runs after a failed build.
-
-- [ ] **Step 4: Implement canonical path and byte rendering**
-
-Derive start date from the first committed `SessionStarted`, validate lowercase session UUID, construct only the fixed relative path, canonicalize the existing parent, reject symlink substitution/outside containment, and create no other target. Temporary names are a fixed hidden encoding of the exact target/session/materialization-revision/claim-token tuple; the source-state scope resolver excludes one only when that tuple matches a committed outbox claim.
-
-Renderer folds events through `triggeringEventPosition`, strict-dispatches the checkpoint version once, and emits fixed headings/order, JSON-scalar escaping, LF endings, final newline, explicit semantic state, accepted child items, deferred/rejected/unresolved transfer work, final checkpoint, validation status/fingerprints/artifacts, project/workspace/branch assertions, and materialized position. Version 2 emits only the sorted qualified adapter summary. It never reads wall clock, process ID, current topic, frames, ordinal content fingerprints, `observedAt`, provider material, or raw evidence.
-
-- [ ] **Step 5: Implement generation-fenced outbox claims and deterministic fingerprints**
-
-When a lifecycle transaction queues materialization, `SqliteLifecycleMaterializationQueue.prepare` strict-decodes and freezes only the position-independent projected event/fold input. Its `persist` method receives the actual triggering `StoredEvent` in `afterAppend`, requires its identity/type/payload to match the projection, renders bytes through that committed position, computes the provider-keyed `nextFingerprint`, and calls only `tx.outbox.insertLifecycle` with algorithm/schema/key/domain before commit. `materializationRevision` must equal that committed triggering position. Target identity is `(project, session, artifact kind, materialization revision)`, encoded into the revision-bearing `targetKey`, while all revisions derive the same path. The immutable rows are the planned-fingerprint history. Port integration tests prove the persisted fingerprint equals a later independent render; repository tests retain raw connection-taking methods only inside storage-focused fixtures.
-
-`outbox-claim-next` alone maps its stable selection request to
-`LifecycleOutboxRepository.claimNext` and converts the selected record to Task
-13's `LifecycleOutboxClaimWireV1`; it has no caller-supplied target key,
-revision, or token. Claims returned by that operation are the sole source for
-renewal/materialize/failure identities. Recovery may instead use Task 13's
-existing exact target-bound `outbox-claim` only after a durable scan supplied
-that target and revision. Claims, renewals, failures, and a noncompleted
-materialize operation match project/target/latest
-revision/status/owner/token/live expiry and, for workflow origin, current
-workflow generation. `renewClaim` compare-and-swaps
-project/target/revision/owner/token while the claim is live and the revision
-remains current; staging that outlives expiry must renew successfully before
-replacement or stop. On materialize entry, however, exact completed-state
-replay is checked first under the operational transaction: the row must retain
-completed status, acknowledgement owner/token/revision and `nextFingerprint`.
-If it is still latest, current target bytes must match that fingerprint before
-the stored completion is returned even when the old lease is expired; if a
-newer revision exists, return bounded `superseded-after-completion` without
-touching bytes. Only a noncompleted row proceeds to live-lease enforcement and
-replacement. Each operation is a strict internal `LifecycleFencedOperation`,
-never a semantic mutation, and uncertain delivery reports the exact selection
-or target work identity for explicit state inspection/retry. Repository
-acknowledgement is reachable only inside materialize after
-target-byte/fingerprint reconciliation. Failure rows store only
-retryable/permanent classification, safe code, bounded attempt count, and next
-attempt time. Backoff is deterministic and capped; permanent
-integrity/path/conflict failures are never auto-retried.
-
-- [ ] **Step 6: Implement the exact replace/ack sequence**
-
-The materializer:
-
-1. folds/renders deterministic bytes through triggering position;
-2. stages a same-directory exclusive temp file, fsyncs it, and computes keyed fingerprint;
-3. enters `LifecycleOperationalStore`, which opens the only short `BEGIN IMMEDIATE` and loads the exact row by project/target/revision/owner/token;
-4. if the row is completed and still latest, verifies retained acknowledgement/fingerprint fields and current target bytes equal committed `nextFingerprint`, removes the known temp, commits, and returns the stored completion without checking lease expiry; if a newer revision exists, returns `superseded-after-completion` without a write;
-5. otherwise requires claimed/noncompleted status and rechecks live claim token/expiry, latest materialization revision, applicable current workflow generation, fingerprint algorithm/schema/key/domain, and committed `nextFingerprint`;
-6. accepts target only when absent, already equal to new bytes, equal to acknowledged expected prior, or equal to a committed `nextFingerprint` of a now-fenced lower revision for the same project/session/kind/path;
-7. atomically replaces, fsyncs target and directory where supported;
-8. records acknowledgement/fingerprint/token; and
-9. commits before success response.
-
-Any other bytes throw permanent `MATERIALIZATION_CONFLICT`. Cleanup removes only the known contained temp path. A lost response retries the complete `materialize` operation with the exact identity; completed-state replay precedes live-lease enforcement and returns the one stored completion only after byte reconciliation. An expired pending/unacknowledged claim must be taken over and retried under its new exact identity. No caller can acknowledge without byte reconciliation. After required completed-materialization acknowledgement, the end workflow advances through confirmed to completed without appending another `SessionEnded`.
-
-- [ ] **Step 7: Integrate cancellation, abandonment, and recovery**
-
-Validation failure/invalidation, completion, amendment, cancellation, and abandonment each queue a new revision targeting the same path. Renderer derives failed, completed, cancelled/restored, or abandoned state, so a stale ending/completed marker cannot remain. Direct active/suspended abandonment uses terminal-event origin; all other session-end rewrites retain their workflow binding. Recovery claims only due current revisions, respects permanent failure and integrity read-only mode, and reports terminal semantic state separately from incomplete materialization.
-
-- [ ] **Step 8: Run materialization, end/recovery, durability, and integrity gates**
-
-Run:
-
-```powershell
-npm run test:build
-node --test --test-concurrency=1 --test-reporter=spec dist-test/tests/compatibility-log-renderer.test.js dist-test/tests/compatibility-log-materializer.test.js dist-test/tests/session-end.coordinator.test.js dist-test/tests/lifecycle-recovery.test.js dist-test/tests/directory-durability.test.js dist-test/tests/event-integrity.test.js
+node --test --test-concurrency=1 --test-reporter=spec dist-test/tests/compatibility-log-renderer.test.js dist-test/tests/compatibility-log-materializer.test.js dist-test/tests/session-end.coordinator.test.js dist-test/tests/lifecycle-recovery.test.js dist-test/tests/lifecycle-worker-runtime.test.js dist-test/tests/lifecycle-executor.test.js dist-test/tests/lifecycle-materialization-queue.test.js dist-test/tests/lifecycle-outbox.repository.test.js dist-test/tests/lifecycle-operational-store.test.js dist-test/tests/source-state.provider.test.js dist-test/tests/directory-durability.test.js dist-test/tests/event-integrity.test.js dist-test/tests/qualified-checkpoint-quick-integrity.test.js dist-test/tests/qualified-checkpoint-full-integrity.test.js
 npm run typecheck
+npm run build
+npm run test:build-artifacts
 ```
 
-Expected: V1/V2 golden bytes/path, privacy-preserving qualified summaries, open/seal stale-generation fencing, crash retry, lower-revision recognition, conflict fencing, rewrites, completion confirmation, durability, and handle closure all pass.
-
-- [ ] **Step 9: Commit**
+- [ ] **Step 7: Commit only mutable materialization ownership**
 
 ```powershell
-git add src/orchestrator/storage/lifecycle-outbox.repository.ts src/orchestrator/materialization src/orchestrator/lifecycle/materialization-queue.port.ts src/orchestrator/lifecycle/lifecycle-operational.store.ts src/orchestrator/lifecycle/session-end-workflow.service.ts src/orchestrator/lifecycle/session-end.coordinator.ts src/orchestrator/lifecycle/lifecycle-recovery.coordinator.ts src/orchestrator/storage/session-end.repository.ts src/orchestrator/integrity/lifecycle-integrity.service.ts src/orchestrator/runtime/lifecycle-worker-runtime.ts src/orchestrator/runtime/lifecycle-worker-runtime.factory.ts tests/compatibility-log-renderer.test.ts tests/compatibility-log-materializer.test.ts tests/lifecycle-executor.test.ts
+git add src/orchestrator/materialization/atomic-artifact-replacer.ts src/orchestrator/materialization/compatibility-log.materializer.ts src/orchestrator/storage/lifecycle-outbox.repository.ts src/orchestrator/lifecycle/lifecycle-operational.store.ts src/orchestrator/lifecycle/session-end-workflow.service.ts src/orchestrator/lifecycle/session-end.coordinator.ts src/orchestrator/lifecycle/lifecycle-recovery.coordinator.ts src/orchestrator/storage/session-end.repository.ts src/orchestrator/integrity/lifecycle-integrity.service.ts src/orchestrator/lifecycle/source-state.provider.ts src/orchestrator/runtime/lifecycle-worker-runtime.ts src/orchestrator/runtime/lifecycle-worker-runtime.factory.ts tests/compatibility-log-materializer.test.ts tests/session-end.coordinator.test.ts tests/lifecycle-recovery.test.ts tests/lifecycle-worker-runtime.test.ts tests/lifecycle-executor.test.ts tests/source-state.provider.test.ts tests/lifecycle-outbox.repository.test.ts tests/lifecycle-operational-store.test.ts tests/qualified-checkpoint-quick-integrity.test.ts tests/qualified-checkpoint-full-integrity.test.ts tests/directory-durability.test.ts
 git commit -m "feat: fence compatibility log materialization"
 ```
 
----
+**Acceptance boundary:** Task 16 never changes Task 14Q planning bytes or row
+meaning. It can only consume an exact planned revision, durably reconcile the
+one canonical target, acknowledge privately, and advance a waiting workflow.
 
+---
 ### Task 17: Keep Version 2 Disabled and Shadow Mapping Pure
 
 **Files:**
