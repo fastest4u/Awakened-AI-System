@@ -54,6 +54,23 @@ function priorTriggerSql(name: string): string {
   return qualifiedCheckpointCoverageMigration.sql.slice(start, end + 5);
 }
 
+function withOutboxLifecycleDescriptorUpdateGuard(sql: string): string {
+  const insertName = "outbox_lifecycle_descriptor_v4_insert_guard";
+  const start = sql.indexOf(`CREATE TRIGGER ${insertName}`);
+  const end = sql.indexOf("\nEND;", start);
+  if (start < 0 || end < 0) {
+    throw new Error("Missing schema-4 lifecycle outbox descriptor insert guard");
+  }
+  const insertTrigger = sql.slice(start, end + 5);
+  const updateTrigger = insertTrigger
+    .replace(insertName, "outbox_lifecycle_descriptor_v4_update_guard")
+    .replace("BEFORE INSERT ON outbox", "BEFORE UPDATE ON outbox");
+  if (updateTrigger === insertTrigger) {
+    throw new Error("Unable to derive schema-4 lifecycle outbox update guard");
+  }
+  return sql.replace(insertTrigger, `${insertTrigger}\n\n${updateTrigger}`);
+}
+
 const LEGACY_WORKFLOW_FOLD_GUARD = priorTriggerSql(
   "lifecycle_workflow_generation_folds_insert_guard",
 )
@@ -169,7 +186,7 @@ const VALIDATION_PLAN_V4_INVALID = `NEW.validation_attempt_plans_json IS NOT NUL
 export const sessionEndEffectiveStateMigration: Migration = {
   version: 4,
   name: "session-end-effective-state",
-  sql: `
+  sql: withOutboxLifecycleDescriptorUpdateGuard(`
 DROP TRIGGER events_lifecycle_version_v3_guard;
 DROP TRIGGER lifecycle_workflow_generation_folds_insert_guard;
 DROP TRIGGER workflow_instances_evidence_v3_update_guard;
@@ -986,6 +1003,14 @@ BEGIN
           AND json_extract(
             NEW.lifecycle_intent_json, '$.intent.command.expectedBranchRef'
           ) IS NEW.branch_ref
+          AND json_type(
+            NEW.lifecycle_intent_json,
+            '$.intent.command.expectedStreamVersion'
+          ) IS 'text'
+          AND json_extract(
+            NEW.lifecycle_intent_json,
+            '$.intent.command.expectedStreamVersion'
+          ) IS CAST(NEW.stream_version - 1 AS TEXT)
           AND json_extract(
             NEW.lifecycle_intent_json, '$.intent.binding.projectId'
           ) = NEW.project_id
@@ -1255,7 +1280,12 @@ BEGIN
           OR json_extract(NEW.payload_json, '$.workflowId') NOT GLOB '${UUID_GLOB}'
           OR json_type(NEW.payload_json, '$.workflowGeneration') <> 'integer'
           OR json_extract(NEW.payload_json, '$.workflowGeneration') < 1
-          OR json_extract(NEW.payload_json, '$.previousState') NOT IN ('active', 'suspended')
+          OR json_type(NEW.payload_json, '$.previousState') IS NOT 'text'
+          OR coalesce(
+            json_extract(NEW.payload_json, '$.previousState')
+              IN ('active', 'suspended'),
+            0
+          ) = 0
           OR json_type(NEW.payload_json, '$.effectiveState') <> 'object'
         )
       )
@@ -1275,8 +1305,12 @@ BEGIN
           OR json_type(NEW.payload_json, '$.workflowGeneration') <> 'integer'
           OR json_extract(NEW.payload_json, '$.workflowGeneration')
             <> json_extract(NEW.payload_json, '$.previousWorkflowGeneration') + 1
-          OR json_extract(NEW.payload_json, '$.evidenceWindowAction')
-            NOT IN ('unchanged', 'open', 'seal')
+          OR json_type(NEW.payload_json, '$.evidenceWindowAction') IS NOT 'text'
+          OR coalesce(
+            json_extract(NEW.payload_json, '$.evidenceWindowAction')
+              IN ('unchanged', 'open', 'seal'),
+            0
+          ) = 0
           OR json_type(NEW.payload_json, '$.effectiveState') <> 'object'
         )
       )
@@ -1291,13 +1325,19 @@ BEGIN
               'workflowGeneration', 'restoredState', 'preTransitionCheckpointId'
             )
           )
-          OR json_extract(NEW.payload_json, '$.cancellationVersion') <> 1
+          OR json_type(NEW.payload_json, '$.cancellationVersion') IS NOT 'integer'
+          OR json_extract(NEW.payload_json, '$.cancellationVersion') IS NOT 1
           OR json_type(NEW.payload_json, '$.previousWorkflowGeneration') <> 'integer'
           OR json_extract(NEW.payload_json, '$.previousWorkflowGeneration') < 1
           OR json_type(NEW.payload_json, '$.workflowGeneration') <> 'integer'
           OR json_extract(NEW.payload_json, '$.workflowGeneration')
             <> json_extract(NEW.payload_json, '$.previousWorkflowGeneration') + 1
-          OR json_extract(NEW.payload_json, '$.restoredState') NOT IN ('active', 'suspended')
+          OR json_type(NEW.payload_json, '$.restoredState') IS NOT 'text'
+          OR coalesce(
+            json_extract(NEW.payload_json, '$.restoredState')
+              IN ('active', 'suspended'),
+            0
+          ) = 0
         )
       )
       OR (
@@ -1330,9 +1370,17 @@ BEGIN
               'effectivePolicy', 'effectiveFinalCheckpoint', 'effectiveStateHash'
             )
           )
-          OR json_extract(NEW.payload_json, '$.effectiveState.effectiveStateVersion') <> 1
+          OR json_type(
+            NEW.payload_json, '$.effectiveState.effectiveStateVersion'
+          ) IS NOT 'integer'
+          OR json_extract(
+            NEW.payload_json, '$.effectiveState.effectiveStateVersion'
+          ) IS NOT 1
+          OR json_type(
+            NEW.payload_json, '$.effectiveState.effectiveStateDomain'
+          ) IS NOT 'text'
           OR json_extract(NEW.payload_json, '$.effectiveState.effectiveStateDomain')
-            <> 'project-memory/session-end-effective-state/v1'
+            IS NOT 'project-memory/session-end-effective-state/v1'
           OR json_type(NEW.payload_json, '$.effectiveState.request') <> 'object'
           OR json_type(NEW.payload_json, '$.effectiveState.effectivePolicy') <> 'object'
           OR json_type(NEW.payload_json, '$.effectiveState.effectiveFinalCheckpoint') <> 'object'
@@ -1361,9 +1409,15 @@ BEGIN
           OR json_type(
             NEW.payload_json, '$.effectiveState.request.sessionId'
           ) <> 'text'
-          OR json_extract(
+          OR json_type(
             NEW.payload_json, '$.effectiveState.request.childEndPolicy'
-          ) NOT IN ('require-completed', 'suspend-and-carry-forward')
+          ) IS NOT 'text'
+          OR coalesce(
+            json_extract(
+              NEW.payload_json, '$.effectiveState.request.childEndPolicy'
+            ) IN ('require-completed', 'suspend-and-carry-forward'),
+            0
+          ) = 0
           OR json_type(
             NEW.payload_json, '$.effectiveState.request.finalCheckpoint'
           ) <> 'object'
@@ -1432,10 +1486,14 @@ BEGIN
               'requireFullEvidence', 'requireMaterialization'
             )
           )
+          OR json_type(
+            NEW.payload_json,
+            '$.effectiveState.effectivePolicy.qualityPolicyVersion'
+          ) IS NOT 'integer'
           OR json_extract(
             NEW.payload_json,
             '$.effectiveState.effectivePolicy.qualityPolicyVersion'
-          ) <> 1
+          ) IS NOT 1
           OR json_type(
             NEW.payload_json, '$.effectiveState.effectivePolicy.profiles'
           ) <> 'array'
@@ -1583,5 +1641,5 @@ BEGIN
     THEN RAISE(ABORT, 'SESSION_END_EVENT_V3_INVALID')
   END;
 END;
-`,
+`),
 };

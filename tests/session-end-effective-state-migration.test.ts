@@ -527,6 +527,7 @@ function protectedLifecycleIntent(
 function seedStrictLegacyCancelledHistory(
   connection: SqliteConnection,
   workflowTriggerPosition = 2,
+  workflowOverrides: Readonly<Record<string, SqliteValue>> = {},
 ): void {
   const requestCommandId = "11111111-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
   const cancelCommandId = "22222222-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
@@ -635,10 +636,14 @@ function seedStrictLegacyCancelledHistory(
   seedWorkflow(connection, "cancelled", {
     root_command_id: cancelCommandId,
     triggering_event_position: workflowTriggerPosition,
+    ...workflowOverrides,
   });
 }
 
-function seedLegacyRequestThenV3Cancellation(connection: SqliteConnection): void {
+function seedLegacyRequestThenV3Cancellation(
+  connection: SqliteConnection,
+  cancellationPayloadOverrides: Readonly<Record<string, unknown>> = {},
+): void {
   const requestCommandId = "11111111-dddd-4ddd-8ddd-dddddddddddd";
   const cancelCommandId = "22222222-eeee-4eee-8eee-eeeeeeeeeeee";
   const checkpointId = "33333333-ffff-4fff-8fff-ffffffffffff";
@@ -750,6 +755,7 @@ function seedLegacyRequestThenV3Cancellation(connection: SqliteConnection): void
       workflowGeneration: 2,
       restoredState: "active",
       preTransitionCheckpointId: checkpointId,
+      ...cancellationPayloadOverrides,
     },
     lifecycleIntent: protectedLifecycleIntent({
       commandType: "cancel-session-end",
@@ -1378,9 +1384,19 @@ describe("session-end effective-state migration", () => {
       [{ ...first, idempotencyKey: "x".repeat(262_145) }],
     ];
 
+    const valid = schema3Connection();
+    seedStrictLegacyCancelledHistory(valid, 2, {
+      validation_attempt_plan_generation: 1,
+      validation_attempt_plans_json: canonicalJson([first, second]),
+    });
+    const validBefore = snapshotDatabase(valid);
+    new SqliteSessionEndEffectiveStateMigrationPreflight()
+      .assertEligible(valid, context);
+    assert.equal(snapshotDatabase(valid), validBefore);
+
     for (const plans of violations) {
       const connection = schema3Connection();
-      seedWorkflow(connection, "cancelled", {
+      seedStrictLegacyCancelledHistory(connection, 2, {
         validation_attempt_plan_generation: 1,
         validation_attempt_plans_json: canonicalJson(plans),
       });
@@ -1868,6 +1884,36 @@ describe("session-end effective-state migration", () => {
     }
   });
 
+  it("binds V3 request intent to the prior stream version", () => {
+    const fixture = v3ReopenRequestFixture(2);
+    const valid = schema4Connection();
+    seedStrictLegacyCancelledHistory(valid);
+    appendV3ReopenRequest(valid, 2);
+    assert.equal(
+      valid.prepare(`
+        SELECT count(*) AS count FROM events WHERE global_position = 3
+      `).get()?.count,
+      1n,
+    );
+
+    const lifecycleIntent = structuredClone(fixture.lifecycleIntent) as {
+      intent: { command: Record<string, unknown> };
+    };
+    lifecycleIntent.intent.command.expectedStreamVersion = "1";
+    const hostile = schema4Connection();
+    seedStrictLegacyCancelledHistory(hostile);
+    assert.throws(
+      () => appendV3ReopenRequest(hostile, 2, { lifecycleIntent }),
+      /SESSION_END_EVENT_V3_INVALID/,
+    );
+    assert.equal(
+      hostile.prepare(`
+        SELECT count(*) AS count FROM events WHERE global_position = 3
+      `).get()?.count,
+      0n,
+    );
+  });
+
   it("binds V3 amendments and cancellations to durable predecessor state", () => {
     const effectiveState = sessionEndEffectiveStateFixture({ requestVersion: 2 });
     const appendMutation = (
@@ -2109,6 +2155,112 @@ describe("session-end effective-state migration", () => {
         hostile.name,
       );
     }
+  });
+
+  it("rejects explicit null for every required V3 scalar", () => {
+    type MutableJsonObject = Record<string, unknown>;
+    type RequestMutationTarget = {
+      readonly effectiveState: MutableJsonObject;
+      readonly request: MutableJsonObject;
+      readonly effectivePolicy: MutableJsonObject;
+    };
+    const asObject = (value: unknown): MutableJsonObject => {
+      assert.ok(typeof value === "object" && value !== null && !Array.isArray(value));
+      return value as MutableJsonObject;
+    };
+    const requestFixture = v3ReopenRequestFixture(2);
+    const mutatedRequest = (
+      mutation: (target: RequestMutationTarget) => void,
+    ): Parameters<typeof appendV3ReopenRequest>[2] => {
+      const payload = structuredClone(requestFixture.payload) as MutableJsonObject;
+      const effectiveState = asObject(payload.effectiveState);
+      const request = asObject(effectiveState.request);
+      const effectivePolicy = asObject(effectiveState.effectivePolicy);
+      mutation({ effectiveState, request, effectivePolicy });
+      const lifecycleIntent = structuredClone(
+        requestFixture.lifecycleIntent,
+      ) as MutableJsonObject;
+      const command = asObject(asObject(lifecycleIntent.intent).command);
+      command.request = structuredClone(request);
+      return { payload, lifecycleIntent };
+    };
+
+    const validRequest = schema4Connection();
+    seedStrictLegacyCancelledHistory(validRequest);
+    appendV3ReopenRequest(validRequest, 2);
+    assert.equal(
+      validRequest.prepare(`
+        SELECT count(*) AS count FROM events WHERE global_position = 3
+      `).get()?.count,
+      1n,
+    );
+
+    const validCancellation = schema4Connection();
+    seedLegacyRequestThenV3Cancellation(validCancellation);
+    assert.equal(
+      validCancellation.prepare(`
+        SELECT count(*) AS count FROM events WHERE global_position = 3
+      `).get()?.count,
+      1n,
+    );
+
+    const requestHostiles = [
+      {
+        name: "null effective state version",
+        overrides: mutatedRequest(({ effectiveState }) => {
+          effectiveState.effectiveStateVersion = null;
+        }),
+      },
+      {
+        name: "null effective state domain",
+        overrides: mutatedRequest(({ effectiveState }) => {
+          effectiveState.effectiveStateDomain = null;
+        }),
+      },
+      {
+        name: "null child end policy",
+        overrides: mutatedRequest(({ request }) => {
+          request.childEndPolicy = null;
+        }),
+      },
+      {
+        name: "null quality policy version",
+        overrides: mutatedRequest(({ effectivePolicy }) => {
+          effectivePolicy.qualityPolicyVersion = null;
+        }),
+      },
+    ] as const;
+
+    for (const hostile of requestHostiles) {
+      const connection = schema4Connection();
+      seedStrictLegacyCancelledHistory(connection);
+      assert.throws(
+        () => appendV3ReopenRequest(connection, 2, hostile.overrides),
+        /SESSION_END_EVENT_V3_INVALID/,
+        hostile.name,
+      );
+      assert.equal(
+        connection.prepare(`
+          SELECT count(*) AS count FROM events WHERE global_position = 3
+        `).get()?.count,
+        0n,
+        hostile.name,
+      );
+    }
+
+    const nullCancellationVersion = schema4Connection();
+    assert.throws(
+      () => seedLegacyRequestThenV3Cancellation(nullCancellationVersion, {
+        cancellationVersion: null,
+      }),
+      /SESSION_END_EVENT_V3_INVALID/,
+    );
+    assert.equal(
+      nullCancellationVersion.prepare(`
+        SELECT count(*) AS count FROM events WHERE global_position = 3
+      `).get()?.count,
+      0n,
+    );
   });
 
   it("makes nested schema-4 JSON guards missing-key and duplicate-key total", () => {
@@ -2533,6 +2685,77 @@ describe("session-end effective-state migration", () => {
     assert.equal(
       hostile.prepare("SELECT count(*) AS count FROM outbox").get()?.count,
       0n,
+    );
+  });
+
+  it("blocks generic outbox updates into reserved lifecycle descriptors", () => {
+    const valid = schema4Connection();
+    seedDirectAbandonedEvent(valid);
+    rawInsert(valid, "outbox", lifecycleOutboxValues());
+    valid.prepare(`
+      UPDATE outbox
+      SET status = 'claimed',
+          attempt_count = 1,
+          claim_owner = 'materializer',
+          claim_token = 1,
+          claim_expires_at = $claimExpiresAt,
+          updated_at = $updatedAt
+      WHERE project_id = $projectId AND target_key = $targetKey
+    `).run({
+      $claimExpiresAt: "2026-08-09T00:01:00.000Z",
+      $updatedAt: NOW,
+      $projectId: PROJECT_ID,
+      $targetKey: `lifecycle-log/${ROOT_ID}/2`,
+    });
+    assert.equal(
+      valid.prepare(`
+        SELECT status FROM outbox
+        WHERE project_id = $projectId AND target_key = $targetKey
+      `).get({
+        $projectId: PROJECT_ID,
+        $targetKey: `lifecycle-log/${ROOT_ID}/2`,
+      })?.status,
+      "claimed",
+    );
+
+    const connection = schema4Connection();
+    seedGenericSessionEvent(connection);
+    rawInsert(connection, "outbox", {
+      project_id: PROJECT_ID,
+      target_key: "generic/1",
+      event_position: 1,
+      kind: "generic-test-work",
+      payload_json: "{}",
+      content_hash: H64,
+      status: "pending",
+      attempt_count: 0,
+      claim_owner: null,
+      claim_token: null,
+      claim_expires_at: null,
+      created_at: NOW,
+      updated_at: NOW,
+    });
+    const before = connection.prepare(`
+      SELECT kind, payload_json, session_id, origin_kind
+      FROM outbox
+      WHERE project_id = $projectId AND target_key = $targetKey
+    `).get({ $projectId: PROJECT_ID, $targetKey: "generic/1" });
+
+    assert.throws(
+      () => connection.prepare(`
+        UPDATE outbox
+        SET kind = 'materialize-lifecycle-log'
+        WHERE project_id = $projectId AND target_key = $targetKey
+      `).run({ $projectId: PROJECT_ID, $targetKey: "generic/1" }),
+      /OUTBOX_LIFECYCLE_DESCRIPTOR_V4_INVALID/,
+    );
+    assert.deepEqual(
+      connection.prepare(`
+        SELECT kind, payload_json, session_id, origin_kind
+        FROM outbox
+        WHERE project_id = $projectId AND target_key = $targetKey
+      `).get({ $projectId: PROJECT_ID, $targetKey: "generic/1" }),
+      before,
     );
   });
 
