@@ -17,6 +17,8 @@ import {
   sessionEndWorkflowId,
 } from "../src/orchestrator/lifecycle/session-end-identifiers.js";
 import { uuidV5 } from "../src/orchestrator/crypto/uuid-v5.js";
+import * as sessionEndIdentifiers from
+  "../src/orchestrator/lifecycle/session-end-identifiers.js";
 
 const SESSION_ID = "44444444-4444-4444-8444-444444444444" as SessionId;
 const PROJECT_ID = "11111111-1111-4111-8111-111111111111" as ProjectId;
@@ -42,6 +44,13 @@ function canonicalTuple(value: readonly JsonValue[]): string {
 }
 
 describe("session end deterministic identities", () => {
+  it("publishes the shared root child lifetime history bound", () => {
+    assert.equal(
+      Reflect.get(sessionEndIdentifiers, "MAX_ROOT_CHILD_HISTORY_V1"),
+      1_000,
+    );
+  });
+
   it("derives RFC and session-end UUIDv5 golden vectors", () => {
     assert.equal(
       uuidV5(

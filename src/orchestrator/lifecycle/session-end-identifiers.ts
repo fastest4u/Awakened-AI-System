@@ -21,6 +21,7 @@ export const SESSION_END_PHASE_COMMAND_NAMESPACE =
   "a7b47792-6ad9-5b32-9f20-6f53f5dc2f31";
 export const SESSION_END_TRANSFER_TICKET_NAMESPACE =
   "89378abd-6226-5669-ad6d-f24d4297935e";
+export const MAX_ROOT_CHILD_HISTORY_V1 = 1_000;
 
 export interface SessionEndPhaseIdentityInputV1 {
   readonly projectId: ProjectId;
