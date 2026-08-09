@@ -119,15 +119,14 @@ Implement one local RFC 4122 UUIDv5 byte routine in `src/orchestrator/crypto/uui
 
 - [ ] **Step 3: Write the effective-state RED tests**
 
-Cover exact keys, canonical sorting, deep freeze, strict request/policy/context correlation, hash stability, own `__proto__` preservation/rejection, 1,048,576 UTF-8 bytes accepted, 1,048,577 rejected, and multibyte fixtures whose scalar count differs from byte count.
+Cover exact keys, canonical sorting, deep freeze, strict request/policy/context correlation, hash stability, and own `__proto__` preservation/rejection. Preserve every subordinate checkpoint/profile/request limit. Exercise the whole-state 1 MiB defense-in-depth limit through a raw canonical-size guard independently of subordinate decoding: exactly 1,048,576 canonical UTF-8 bytes passes the size guard and 1,048,577 fails it. Separately prove that genuinely decodable effective states remain valid under their authoritative subordinate maxima. Use multibyte fixtures whose scalar count differs from byte count. Never claim that an exact-cap raw probe is a valid effective state.
 
 ```ts
-it("strictly decodes and hashes bounded effective state at exact UTF-8 cap", () => {
-  const exact = effectiveStateAtCanonicalBytes(SESSION_END_EFFECTIVE_STATE_MAX_CANONICAL_BYTES);
-  assert.deepEqual(decodeSessionEndEffectiveStateV1(exact), exact);
-  assert.match(sessionEndEffectiveStateHashV1(exact), /^[0-9a-f]{64}$/);
+it("enforces the session end effective-state raw UTF-8 guard at exact cap", () => {
+  const exact = rawCanonicalProbeAtBytes(SESSION_END_EFFECTIVE_STATE_MAX_CANONICAL_BYTES);
+  assert.doesNotThrow(() => assertSessionEndEffectiveStateCanonicalSizeV1(exact));
   assert.throws(
-    () => decodeSessionEndEffectiveStateV1(effectiveStateAtCanonicalBytes(1_048_577)),
+    () => assertSessionEndEffectiveStateCanonicalSizeV1(rawCanonicalProbeAtBytes(1_048_577)),
     hasCode("LIFECYCLE_INPUT_INVALID"),
   );
 });
@@ -137,10 +136,10 @@ it("strictly decodes and hashes bounded effective state at exact UTF-8 cap", () 
 
 ```powershell
 npm run test:build
-node --test --test-concurrency=1 --test-reporter=spec --test-name-pattern="^strictly decodes and hashes bounded effective state at exact UTF-8 cap$" dist-test/tests/session-end-effective-state.test.js
+node --test --test-concurrency=1 --test-reporter=spec --test-name-pattern="^enforces the session end effective-state raw UTF-8 guard at exact cap$" dist-test/tests/session-end-effective-state.test.js
 ```
 
-Implement `SessionEndEffectiveStateV1`, its exact-key decoders, canonical UTF-8 cap, domain-separated SHA-256 hash, immutable policy/context fields, and evidence-window/context correlation helpers from design sections 5.1-5.4. Reuse existing strict canonical JSON helpers; copy own properties with descriptors so `__proto__` cannot disappear.
+Implement `SessionEndEffectiveStateV1`, its exact-key decoders, the shared raw canonical-size guard `assertSessionEndEffectiveStateCanonicalSizeV1`, canonical UTF-8 cap, domain-separated SHA-256 hash, immutable policy/context fields, and evidence-window/context correlation helpers from design sections 5.1-5.4. The decoder must call the same guard, but an exact-cap raw probe is not claimed to be a valid effective state. Reuse existing strict canonical JSON helpers; copy own properties with descriptors so `__proto__` cannot disappear.
 
 ```ts
 export interface PersistedQualityPolicyInputV1 {
@@ -1393,7 +1392,7 @@ test("covers every approved Task 14 crash and replay case", () => {
 
 ```powershell
 npm run test:build
-$pattern = '^(derives RFC and session-end UUIDv5 golden vectors|strictly decodes and hashes bounded effective state at exact UTF-8 cap|keeps legacy request amend cancel decoders and accepts only V3 current events|keeps ChildWorkTransferCreated V1 frozen and admits only the internal V2 dual-checkpoint shape|applies migration 0004 and preserves frozen 0002 0003 hashes|rejects schema-3 nonterminal workflows with zero writes|computes exact V2 workflow-generation fingerprint predecessor chains|strictly decodes the six-key persisted validation plan and rejects ordering identity cap violations|renders compatibility log golden bytes deterministically|derives prior fingerprint from the immediate lower revision regardless of status|preserves authoritative lifecycle command hash while recording the outbox target|requests G1 without outbox and reopens cancelled G2 as G3|amend unchanged preserves phase and frozen bytes|selects one eligible child by binary UUID order|carries an already suspended child with a newer governing checkpoint|proves children resolved from all bounded child and ticket history|rolls back final checkpoint and outbox together at every fault boundary|confirms the exact planned row before advancing phase|routes carry-forward only to the dedicated child-target handler|covers every approved Task 14 crash and replay case)$'
+$pattern = '^(derives RFC and session-end UUIDv5 golden vectors|enforces the session end effective-state raw UTF-8 guard at exact cap|keeps legacy request amend cancel decoders and accepts only V3 current events|keeps ChildWorkTransferCreated V1 frozen and admits only the internal V2 dual-checkpoint shape|applies migration 0004 and preserves frozen 0002 0003 hashes|rejects schema-3 nonterminal workflows with zero writes|computes exact V2 workflow-generation fingerprint predecessor chains|strictly decodes the six-key persisted validation plan and rejects ordering identity cap violations|renders compatibility log golden bytes deterministically|derives prior fingerprint from the immediate lower revision regardless of status|preserves authoritative lifecycle command hash while recording the outbox target|requests G1 without outbox and reopens cancelled G2 as G3|amend unchanged preserves phase and frozen bytes|selects one eligible child by binary UUID order|carries an already suspended child with a newer governing checkpoint|proves children resolved from all bounded child and ticket history|rolls back final checkpoint and outbox together at every fault boundary|confirms the exact planned row before advancing phase|routes carry-forward only to the dedicated child-target handler|covers every approved Task 14 crash and replay case)$'
 node --test --test-concurrency=1 --test-reporter=spec --test-name-pattern=$pattern dist-test/tests/session-end-identifiers.test.js dist-test/tests/session-end-effective-state.test.js dist-test/tests/lifecycle-contracts.test.js dist-test/tests/session-end-effective-state-migration.test.js dist-test/tests/session-end.repository.test.js dist-test/tests/compatibility-log-renderer.test.js dist-test/tests/lifecycle-outbox.repository.test.js dist-test/tests/event-append-transaction.test.js dist-test/tests/session-end-workflow.test.js dist-test/tests/session-end-child-saga.test.js dist-test/tests/session-end.coordinator.test.js dist-test/tests/lifecycle-worker-runtime.test.js dist-test/tests/session-end.crash.test.js
 ```
 

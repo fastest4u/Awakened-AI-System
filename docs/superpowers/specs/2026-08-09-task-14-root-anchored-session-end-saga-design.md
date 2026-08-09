@@ -263,8 +263,13 @@ canonicalJson({
 
 `effectiveStateHash` is the lowercase SHA-256 hex digest of those bytes.
 
-The complete canonical `effectiveState`, including its hash, is capped at
-exactly 1,048,576 UTF-8 bytes. Existing subordinate limits remain authoritative:
+The complete canonical `effectiveState`, including its hash, has a
+defense-in-depth cap of exactly 1,048,576 UTF-8 bytes. The shared raw
+canonical-size guard is tested independently at exactly 1,048,576 bytes and at
+1,048,577 bytes. Those raw boundary probes are not claimed to be valid
+effective states. Separately, genuinely decodable effective-state fixtures
+prove the strict codec under every authoritative subordinate limit. Existing
+subordinate limits remain authoritative:
 
 - checkpoint draft: 262,144 canonical UTF-8 bytes;
 - effective profiles: 1 through 64;
