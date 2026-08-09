@@ -55,6 +55,7 @@ import {
   type ValidationAttemptPlanIdentityV1,
 } from "../src/orchestrator/lifecycle/contracts/commands.js";
 import {
+  decodeLifecycleEvent,
   decodeLifecycleEventV1,
   LIFECYCLE_EVENT_TYPES,
   type LifecycleEventV1,
@@ -79,6 +80,10 @@ import {
 import {
   decodeEvidenceCoverageRecordedResultV2,
 } from "../src/orchestrator/lifecycle/evidence-coverage.service.js";
+import {
+  EFFECTIVE_STATE_SESSION_ID,
+  sessionEndEffectiveStateFixture,
+} from "./support/session-end-effective-state-reference.js";
 
 type RequiredContractSurface = readonly [
   SessionId,
@@ -626,6 +631,84 @@ function validLifecycleEvent(
     causationId: null,
     commandId: UUIDS.command,
     idempotencyKey: DETERMINISTIC_IDEMPOTENCY_KEY,
+    occurredAt: "2026-07-14T10:11:12.123Z",
+    authorityCommitment: "a".repeat(64),
+    payload,
+  };
+}
+
+const VERSIONED_EVENT_KEYS = [
+  "eventSchemaVersion",
+  "eventId",
+  "projectId",
+  "vaultId",
+  "storeId",
+  "workspaceId",
+  "streamId",
+  "streamVersion",
+  "globalPosition",
+  "sessionId",
+  "parentSessionId",
+  "eventType",
+  "correlationId",
+  "causationId",
+  "commandId",
+  "idempotencyKey",
+  "occurredAt",
+  "authorityCommitment",
+  "payload",
+] as const;
+
+function versionedLifecycleEventInput(
+  eventSchemaVersion: 1 | 2 | 3,
+  eventType: "SessionEndRequested" | "SessionEndAmended" | "SessionEndCancelled",
+  payload: Readonly<Record<string, unknown>>,
+): Record<string, unknown> {
+  return {
+    eventSchemaVersion,
+    eventId: UUIDS.item3,
+    projectId: UUIDS.item1,
+    vaultId: UUIDS.item2,
+    storeId: UUIDS.item3,
+    workspaceId: "a".repeat(64),
+    streamId: `session/${EFFECTIVE_STATE_SESSION_ID}`,
+    streamVersion: "7",
+    globalPosition: "17",
+    sessionId: EFFECTIVE_STATE_SESSION_ID,
+    parentSessionId: null,
+    eventType,
+    correlationId: UUIDS.parent,
+    causationId: UUIDS.item1,
+    commandId: UUIDS.command,
+    idempotencyKey: "session-end-version-matrix",
+    occurredAt: "2026-07-14T10:11:12.123Z",
+    authorityCommitment: "a".repeat(64),
+    payload,
+  };
+}
+
+function independentlyExpectedVersionedLifecycleEvent(
+  eventSchemaVersion: 1 | 2 | 3,
+  eventType: "SessionEndRequested" | "SessionEndAmended" | "SessionEndCancelled",
+  payload: Readonly<Record<string, unknown>>,
+): Record<string, unknown> {
+  return {
+    eventSchemaVersion,
+    eventId: "33333333-3333-4333-8333-333333333333",
+    projectId: "11111111-1111-4111-8111-111111111111",
+    vaultId: "22222222-2222-4222-8222-222222222222",
+    storeId: "33333333-3333-4333-8333-333333333333",
+    workspaceId: "a".repeat(64),
+    streamId: "session/44444444-4444-4444-8444-444444444444",
+    streamVersion: "7",
+    globalPosition: "17",
+    sessionId: "44444444-4444-4444-8444-444444444444",
+    parentSessionId: null,
+    eventType,
+    correlationId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+    causationId: "11111111-1111-4111-8111-111111111111",
+    commandId: "44444444-4444-4444-8444-444444444444",
+    idempotencyKey: "session-end-version-matrix",
     occurredAt: "2026-07-14T10:11:12.123Z",
     authorityCommitment: "a".repeat(64),
     payload,
@@ -2599,6 +2682,276 @@ describe("lifecycle Version 1 contracts", () => {
     assert.deepEqual(LIFECYCLE_EVENT_TYPES, expected);
     assert.ok(Object.isFrozen(LIFECYCLE_EVENT_TYPES));
     assert.equal(null as LifecycleEventV1 | null, null);
+  });
+
+  it("keeps legacy request amend cancel decoders and accepts only V3 current events", () => {
+    const requestedV1Input = {
+      workflowId: UUIDS.workflow,
+      workflowGeneration: 1,
+      previousState: "active",
+      childEndPolicy: "require-completed",
+      qualityThreshold: 8_000,
+      requireFullEvidence: false,
+      requireMaterialization: true,
+    };
+    const requestedV1Expected = {
+      workflowId: "77777777-7777-4777-8777-777777777777",
+      workflowGeneration: 1,
+      previousState: "active",
+      childEndPolicy: "require-completed",
+      qualityThreshold: 8_000,
+      requireFullEvidence: false,
+      requireMaterialization: true,
+    };
+    const requestedV2Input = { ...requestedV1Input, requestVersion: 2 };
+    const requestedV2Expected = { ...requestedV1Expected, requestVersion: 2 };
+    const amendedV1Input = {
+      workflowId: UUIDS.workflow,
+      previousWorkflowGeneration: 1,
+      workflowGeneration: 2,
+      preTransitionCheckpointId: UUIDS.checkpoint,
+    };
+    const amendedV1Expected = {
+      workflowId: "77777777-7777-4777-8777-777777777777",
+      previousWorkflowGeneration: 1,
+      workflowGeneration: 2,
+      preTransitionCheckpointId: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+    };
+    const amendedV2Input = {
+      ...amendedV1Input,
+      amendmentVersion: 2,
+      finalCheckpointVersion: 2,
+      evidenceWindowAction: "open",
+    };
+    const amendedV2Expected = {
+      ...amendedV1Expected,
+      amendmentVersion: 2,
+      finalCheckpointVersion: 2,
+      evidenceWindowAction: "open",
+    };
+    const cancelledV1Input = {
+      workflowId: UUIDS.workflow,
+      workflowGeneration: 2,
+      restoredState: "active",
+      preTransitionCheckpointId: UUIDS.checkpoint,
+    };
+    const cancelledV1Expected = {
+      workflowId: "77777777-7777-4777-8777-777777777777",
+      workflowGeneration: 2,
+      restoredState: "active",
+      preTransitionCheckpointId: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+    };
+    const requestedV3Input = {
+      workflowId: UUIDS.workflow,
+      workflowGeneration: 1,
+      previousState: "active",
+      effectiveState: sessionEndEffectiveStateFixture({ requestVersion: 2 }),
+    };
+    const requestedV3Expected = {
+      workflowId: "77777777-7777-4777-8777-777777777777",
+      workflowGeneration: 1,
+      previousState: "active",
+      effectiveState: sessionEndEffectiveStateFixture({ requestVersion: 2 }),
+    };
+    const amendedV3Input = {
+      workflowId: UUIDS.workflow,
+      previousWorkflowGeneration: 1,
+      workflowGeneration: 2,
+      preTransitionCheckpointId: UUIDS.checkpoint,
+      evidenceWindowAction: "seal",
+      effectiveState: sessionEndEffectiveStateFixture({ requestVersion: 2 }),
+    };
+    const amendedV3Expected = {
+      workflowId: "77777777-7777-4777-8777-777777777777",
+      previousWorkflowGeneration: 1,
+      workflowGeneration: 2,
+      preTransitionCheckpointId: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+      evidenceWindowAction: "seal",
+      effectiveState: sessionEndEffectiveStateFixture({ requestVersion: 2 }),
+    };
+    const cancelledV3Input = {
+      cancellationVersion: 1,
+      workflowId: UUIDS.workflow,
+      previousWorkflowGeneration: 1,
+      workflowGeneration: 2,
+      restoredState: "active",
+      preTransitionCheckpointId: UUIDS.checkpoint,
+    };
+    const cancelledV3Expected = {
+      cancellationVersion: 1,
+      workflowId: "77777777-7777-4777-8777-777777777777",
+      previousWorkflowGeneration: 1,
+      workflowGeneration: 2,
+      restoredState: "active",
+      preTransitionCheckpointId: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+    };
+    const cases = [
+      [1, "SessionEndRequested", requestedV1Input, requestedV1Expected, [
+        "workflowId", "workflowGeneration", "previousState", "childEndPolicy", "qualityThreshold",
+        "requireFullEvidence", "requireMaterialization",
+      ]],
+      [2, "SessionEndRequested", requestedV2Input, requestedV2Expected, [
+        "workflowId", "workflowGeneration", "previousState", "childEndPolicy", "qualityThreshold",
+        "requireFullEvidence", "requireMaterialization", "requestVersion",
+      ]],
+      [1, "SessionEndAmended", amendedV1Input, amendedV1Expected, [
+        "workflowId", "previousWorkflowGeneration", "workflowGeneration", "preTransitionCheckpointId",
+      ]],
+      [2, "SessionEndAmended", amendedV2Input, amendedV2Expected, [
+        "workflowId", "previousWorkflowGeneration", "workflowGeneration", "preTransitionCheckpointId",
+        "amendmentVersion", "finalCheckpointVersion", "evidenceWindowAction",
+      ]],
+      [1, "SessionEndCancelled", cancelledV1Input, cancelledV1Expected, [
+        "workflowId", "workflowGeneration", "restoredState", "preTransitionCheckpointId",
+      ]],
+      [3, "SessionEndRequested", requestedV3Input, requestedV3Expected, [
+        "workflowId", "workflowGeneration", "previousState", "effectiveState",
+      ]],
+      [3, "SessionEndAmended", amendedV3Input, amendedV3Expected, [
+        "workflowId", "previousWorkflowGeneration", "workflowGeneration", "preTransitionCheckpointId",
+        "evidenceWindowAction", "effectiveState",
+      ]],
+      [3, "SessionEndCancelled", cancelledV3Input, cancelledV3Expected, [
+        "cancellationVersion", "workflowId", "previousWorkflowGeneration", "workflowGeneration",
+        "restoredState", "preTransitionCheckpointId",
+      ]],
+    ] as const;
+
+    for (const [version, eventType, inputPayload, expectedPayload, payloadKeys] of cases) {
+      const input = versionedLifecycleEventInput(version, eventType, inputPayload);
+      const expected = independentlyExpectedVersionedLifecycleEvent(version, eventType, expectedPayload);
+      assert.deepEqual(Object.keys(input), VERSIONED_EVENT_KEYS);
+      assert.deepEqual(Object.keys(inputPayload), payloadKeys);
+      assert.deepEqual(decodeLifecycleEvent(input), expected);
+    }
+
+    assert.throws(
+      () => decodeLifecycleEvent(versionedLifecycleEventInput(2, "SessionEndCancelled", cancelledV1Input)),
+      { message: /LIFECYCLE_INPUT_INVALID/ },
+    );
+    for (const [eventType, payload] of [
+      ["SessionEndRequested", requestedV3Input],
+      ["SessionEndAmended", amendedV3Input],
+      ["SessionEndCancelled", cancelledV3Input],
+    ] as const) {
+      assert.throws(
+        () => decodeLifecycleEvent(versionedLifecycleEventInput(3, eventType, { ...payload, unknown: true })),
+        { message: /LIFECYCLE_INPUT_INVALID/ },
+      );
+    }
+    for (const payload of [
+      { ...cancelledV3Input, workflowGeneration: 1 },
+      { ...cancelledV3Input, workflowGeneration: 3 },
+      { ...cancelledV3Input, previousWorkflowGeneration: 2 },
+      { ...cancelledV3Input, cancellationVersion: 2 },
+    ]) {
+      assert.throws(
+        () => decodeLifecycleEvent(versionedLifecycleEventInput(3, "SessionEndCancelled", payload)),
+        { message: /LIFECYCLE_INPUT_INVALID/ },
+      );
+    }
+  });
+
+  it("keeps ChildWorkTransferCreated V1 frozen and admits only the internal V2 dual-checkpoint shape", () => {
+    const transferV1Input = validLifecycleEvent("ChildWorkTransferCreated", {
+      transferTicketId: UUIDS.item3,
+      checkpointId: UUIDS.checkpoint,
+      authorityCommitment: "a".repeat(64),
+    });
+    const transferV1Expected = {
+      eventSchemaVersion: 1,
+      eventId: "33333333-3333-4333-8333-333333333333",
+      projectId: "11111111-1111-4111-8111-111111111111",
+      vaultId: "22222222-2222-4222-8222-222222222222",
+      storeId: "33333333-3333-4333-8333-333333333333",
+      workspaceId: "a".repeat(64),
+      streamId: "session/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      streamVersion: "1",
+      globalPosition: "1",
+      sessionId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      parentSessionId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+      eventType: "ChildWorkTransferCreated",
+      correlationId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+      causationId: null,
+      commandId: "44444444-4444-4444-8444-444444444444",
+      idempotencyKey: DETERMINISTIC_IDEMPOTENCY_KEY,
+      occurredAt: "2026-07-14T10:11:12.123Z",
+      authorityCommitment: "a".repeat(64),
+      payload: {
+        transferTicketId: "33333333-3333-4333-8333-333333333333",
+        checkpointId: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+        authorityCommitment: "a".repeat(64),
+      },
+    };
+    const suspensionCheckpointId = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+    const transferV2Input = {
+      ...validLifecycleEvent("ChildWorkTransferCreated", {}),
+      eventSchemaVersion: 2,
+      payload: {
+        transferTicketId: UUIDS.item3,
+        suspensionCheckpointId,
+        checkpointId: UUIDS.checkpoint,
+        authorityCommitment: "a".repeat(64),
+      },
+    };
+    const transferV2Expected = {
+      eventSchemaVersion: 2,
+      eventId: "33333333-3333-4333-8333-333333333333",
+      projectId: "11111111-1111-4111-8111-111111111111",
+      vaultId: "22222222-2222-4222-8222-222222222222",
+      storeId: "33333333-3333-4333-8333-333333333333",
+      workspaceId: "a".repeat(64),
+      streamId: "session/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      streamVersion: "1",
+      globalPosition: "1",
+      sessionId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      parentSessionId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+      eventType: "ChildWorkTransferCreated",
+      correlationId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+      causationId: null,
+      commandId: "44444444-4444-4444-8444-444444444444",
+      idempotencyKey: DETERMINISTIC_IDEMPOTENCY_KEY,
+      occurredAt: "2026-07-14T10:11:12.123Z",
+      authorityCommitment: "a".repeat(64),
+      payload: {
+        transferTicketId: "33333333-3333-4333-8333-333333333333",
+        suspensionCheckpointId: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+        checkpointId: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+        authorityCommitment: "a".repeat(64),
+      },
+    };
+
+    assert.deepEqual(Object.keys(transferV1Input), VERSIONED_EVENT_KEYS);
+    assert.deepEqual(Object.keys(transferV1Input.payload as object), [
+      "transferTicketId", "checkpointId", "authorityCommitment",
+    ]);
+    assert.deepEqual(decodeLifecycleEvent(transferV1Input), transferV1Expected);
+    assert.deepEqual(Object.keys(transferV2Input), VERSIONED_EVENT_KEYS);
+    assert.deepEqual(Object.keys(transferV2Input.payload), [
+      "transferTicketId", "suspensionCheckpointId", "checkpointId", "authorityCommitment",
+    ]);
+    assert.deepEqual(decodeLifecycleEvent(transferV2Input), transferV2Expected);
+
+    assert.throws(
+      () => decodeLifecycleEvent({
+        ...transferV1Input,
+        payload: { ...transferV1Input.payload as object, suspensionCheckpointId },
+      }),
+      { message: /LIFECYCLE_INPUT_INVALID/ },
+    );
+    for (const payload of [
+      { ...transferV2Input.payload, unknown: true },
+      {
+        transferTicketId: UUIDS.item3,
+        checkpointId: UUIDS.checkpoint,
+        authorityCommitment: "a".repeat(64),
+      },
+    ]) {
+      assert.throws(
+        () => decodeLifecycleEvent({ ...transferV2Input, payload }),
+        { message: /LIFECYCLE_INPUT_INVALID/ },
+      );
+    }
   });
 
   it("strictly decodes every typed lifecycle event as JSON-safe data", () => {

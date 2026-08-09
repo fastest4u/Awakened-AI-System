@@ -51,6 +51,11 @@ import {
   decodeValidationResultV1,
   type ValidationResultV1,
 } from "./session-end.js";
+import {
+  assertSessionEndEffectiveStateSessionCorrelationV1,
+  decodeSessionEndEffectiveStateV1,
+  type SessionEndEffectiveStateV1,
+} from "../session-end-effective-state.js";
 
 export const LIFECYCLE_EVENT_TYPES = Object.freeze([
   "SessionStarted",
@@ -348,8 +353,20 @@ export type SessionEndAmendedPayloadV2 = LifecycleEventPayloadMapV1["SessionEndA
   readonly evidenceWindowAction: "unchanged" | "open" | "seal";
 };
 
+export interface ChildWorkTransferCreatedPayloadV2 {
+  readonly transferTicketId: TransferTicketId;
+  readonly suspensionCheckpointId: CheckpointId;
+  readonly checkpointId: CheckpointId;
+  readonly authorityCommitment: string;
+}
+
 type LifecycleEventBaseV2<
-  T extends "EvidenceCoverageRecorded" | "SessionCheckpointRecorded" | "SessionEndRequested" | "SessionEndAmended",
+  T extends
+    | "EvidenceCoverageRecorded"
+    | "SessionCheckpointRecorded"
+    | "SessionEndRequested"
+    | "SessionEndAmended"
+    | "ChildWorkTransferCreated",
   P,
 > = Omit<LifecycleEventBaseV1<T>, "eventSchemaVersion" | "payload"> & {
   readonly eventSchemaVersion: 2;
@@ -360,9 +377,49 @@ export type LifecycleEventV2 =
   | LifecycleEventBaseV2<"EvidenceCoverageRecorded", EvidenceCoverageRecordedV2>
   | LifecycleEventBaseV2<"SessionCheckpointRecorded", SessionCheckpointRecordedPayloadV2>
   | LifecycleEventBaseV2<"SessionEndRequested", SessionEndRequestedPayloadV2>
-  | LifecycleEventBaseV2<"SessionEndAmended", SessionEndAmendedPayloadV2>;
+  | LifecycleEventBaseV2<"SessionEndAmended", SessionEndAmendedPayloadV2>
+  | LifecycleEventBaseV2<"ChildWorkTransferCreated", ChildWorkTransferCreatedPayloadV2>;
+
+export interface SessionEndRequestedPayloadV3 {
+  readonly workflowId: WorkflowId;
+  readonly workflowGeneration: number;
+  readonly previousState: "active" | "suspended";
+  readonly effectiveState: SessionEndEffectiveStateV1;
+}
+
+export interface SessionEndAmendedPayloadV3 {
+  readonly workflowId: WorkflowId;
+  readonly previousWorkflowGeneration: number;
+  readonly workflowGeneration: number;
+  readonly preTransitionCheckpointId: CheckpointId;
+  readonly evidenceWindowAction: "unchanged" | "open" | "seal";
+  readonly effectiveState: SessionEndEffectiveStateV1;
+}
+
+export interface SessionEndCancelledPayloadV3 {
+  readonly cancellationVersion: 1;
+  readonly workflowId: WorkflowId;
+  readonly previousWorkflowGeneration: number;
+  readonly workflowGeneration: number;
+  readonly restoredState: "active" | "suspended";
+  readonly preTransitionCheckpointId: CheckpointId;
+}
+
+type LifecycleEventBaseV3<
+  T extends "SessionEndRequested" | "SessionEndAmended" | "SessionEndCancelled",
+  P,
+> = Omit<LifecycleEventBaseV1<T>, "eventSchemaVersion" | "payload"> & {
+  readonly eventSchemaVersion: 3;
+  readonly payload: P;
+};
+
+export type LifecycleEventV3 =
+  | LifecycleEventBaseV3<"SessionEndRequested", SessionEndRequestedPayloadV3>
+  | LifecycleEventBaseV3<"SessionEndAmended", SessionEndAmendedPayloadV3>
+  | LifecycleEventBaseV3<"SessionEndCancelled", SessionEndCancelledPayloadV3>;
 
 export type LifecycleEvent = LifecycleEventV1 | LifecycleEventV2;
+export type LifecycleEventCodecResult = LifecycleEvent | LifecycleEventV3;
 
 function invalid(field: string): never {
   throw new LifecycleError("LIFECYCLE_INPUT_INVALID", { field });
@@ -1007,6 +1064,7 @@ const LIFECYCLE_EVENT_TYPES_V2 = [
   "SessionCheckpointRecorded",
   "SessionEndRequested",
   "SessionEndAmended",
+  "ChildWorkTransferCreated",
 ] as const;
 
 export function decodeEvidenceCoverageRecordedV2(value: unknown): EvidenceCoverageRecordedV2 {
@@ -1202,6 +1260,26 @@ function decodePayloadV2(
         evidenceWindowAction: payload.evidenceWindowAction,
       });
     }
+    case "ChildWorkTransferCreated": {
+      const payload = exactRecord(value, [
+        "transferTicketId",
+        "suspensionCheckpointId",
+        "checkpointId",
+        "authorityCommitment",
+      ], "event.payload");
+      return Object.freeze({
+        transferTicketId: parseLifecycleId<TransferTicketId>(
+          payload.transferTicketId,
+          "event.payload.transferTicketId",
+        ),
+        suspensionCheckpointId: checkpointId(
+          payload.suspensionCheckpointId,
+          "event.payload.suspensionCheckpointId",
+        ),
+        checkpointId: checkpointId(payload.checkpointId, "event.payload.checkpointId"),
+        authorityCommitment: hash(payload.authorityCommitment, "event.payload.authorityCommitment"),
+      });
+    }
   }
 }
 
@@ -1220,7 +1298,16 @@ export function decodeLifecycleEventV2(value: unknown): LifecycleEventV2 {
       (eventType === "SessionEndRequested" || eventType === "SessionEndAmended")
       && parentSessionId !== null
     ) invalid("parentSessionId");
+    if (eventType === "ChildWorkTransferCreated" && parentSessionId === null) invalid("parentSessionId");
     const payload = decodePayloadV2(eventType, event.payload);
+    const authorityCommitment = hash(event.authorityCommitment, "authorityCommitment");
+    if (
+      eventType === "ChildWorkTransferCreated"
+      && (
+        !("authorityCommitment" in payload)
+        || payload.authorityCommitment !== authorityCommitment
+      )
+    ) invalid("event.payload.authorityCommitment");
     if (eventType === "SessionCheckpointRecorded") {
       const checkpointPayload = payload as SessionCheckpointRecordedPayloadV2;
       if (
@@ -1252,7 +1339,7 @@ export function decodeLifecycleEventV2(value: unknown): LifecycleEventV2 {
         LIFECYCLE_IDEMPOTENCY_KEY_MAX_SCALARS,
       ),
       occurredAt: parseCanonicalTimestamp(event.occurredAt, "occurredAt"),
-      authorityCommitment: hash(event.authorityCommitment, "authorityCommitment"),
+      authorityCommitment,
       payload,
     }) as LifecycleEventV2;
   } catch {
@@ -1260,9 +1347,146 @@ export function decodeLifecycleEventV2(value: unknown): LifecycleEventV2 {
   }
 }
 
-export function decodeLifecycleEvent(value: unknown): LifecycleEvent {
+const LIFECYCLE_EVENT_TYPES_V3 = [
+  "SessionEndRequested",
+  "SessionEndAmended",
+  "SessionEndCancelled",
+] as const;
+
+function decodePayloadV3(
+  eventType: LifecycleEventV3["eventType"],
+  value: unknown,
+): LifecycleEventV3["payload"] {
+  switch (eventType) {
+    case "SessionEndRequested": {
+      const payload = exactRecord(value, [
+        "workflowId",
+        "workflowGeneration",
+        "previousState",
+        "effectiveState",
+      ], "event.payload");
+      return Object.freeze({
+        workflowId: workflowId(payload.workflowId),
+        workflowGeneration: generation(payload.workflowGeneration, "event.payload.workflowGeneration"),
+        previousState: parseEnum(payload.previousState, ROOT_PREVIOUS_STATES, "event.payload.previousState"),
+        effectiveState: decodeSessionEndEffectiveStateV1(payload.effectiveState),
+      });
+    }
+    case "SessionEndAmended": {
+      const payload = exactRecord(value, [
+        "workflowId",
+        "previousWorkflowGeneration",
+        "workflowGeneration",
+        "preTransitionCheckpointId",
+        "evidenceWindowAction",
+        "effectiveState",
+      ], "event.payload");
+      const previousWorkflowGeneration = generation(
+        payload.previousWorkflowGeneration,
+        "event.payload.previousWorkflowGeneration",
+      );
+      const workflowGeneration = generation(payload.workflowGeneration, "event.payload.workflowGeneration");
+      if (workflowGeneration !== previousWorkflowGeneration + 1) invalid("event.payload.workflowGeneration");
+      return Object.freeze({
+        workflowId: workflowId(payload.workflowId),
+        previousWorkflowGeneration,
+        workflowGeneration,
+        preTransitionCheckpointId: checkpointId(
+          payload.preTransitionCheckpointId,
+          "event.payload.preTransitionCheckpointId",
+        ),
+        evidenceWindowAction: parseEnum(
+          payload.evidenceWindowAction,
+          ["unchanged", "open", "seal"] as const,
+          "event.payload.evidenceWindowAction",
+        ),
+        effectiveState: decodeSessionEndEffectiveStateV1(payload.effectiveState),
+      });
+    }
+    case "SessionEndCancelled": {
+      const payload = exactRecord(value, [
+        "cancellationVersion",
+        "workflowId",
+        "previousWorkflowGeneration",
+        "workflowGeneration",
+        "restoredState",
+        "preTransitionCheckpointId",
+      ], "event.payload");
+      if (payload.cancellationVersion !== 1) invalid("event.payload.cancellationVersion");
+      const previousWorkflowGeneration = generation(
+        payload.previousWorkflowGeneration,
+        "event.payload.previousWorkflowGeneration",
+      );
+      const workflowGeneration = generation(payload.workflowGeneration, "event.payload.workflowGeneration");
+      if (workflowGeneration !== previousWorkflowGeneration + 1) invalid("event.payload.workflowGeneration");
+      return Object.freeze({
+        cancellationVersion: 1,
+        workflowId: workflowId(payload.workflowId),
+        previousWorkflowGeneration,
+        workflowGeneration,
+        restoredState: parseEnum(payload.restoredState, ROOT_PREVIOUS_STATES, "event.payload.restoredState"),
+        preTransitionCheckpointId: checkpointId(
+          payload.preTransitionCheckpointId,
+          "event.payload.preTransitionCheckpointId",
+        ),
+      });
+    }
+  }
+}
+
+export function decodeLifecycleEventV3(value: unknown): LifecycleEventV3 {
+  try {
+    const event = exactRecord(value, EVENT_BASE_KEYS, "lifecycleEvent");
+    if (event.eventSchemaVersion !== 3) invalid("eventSchemaVersion");
+    const eventType = parseEnum(event.eventType, LIFECYCLE_EVENT_TYPES_V3, "eventType");
+    const workspaceId = event.workspaceId;
+    if (typeof workspaceId !== "string" || !LOWER_HASH.test(workspaceId)) invalid("workspaceId");
+    const streamVersion = parseDecimalString(event.streamVersion, "streamVersion");
+    const globalPosition = parseDecimalString(event.globalPosition, "globalPosition");
+    if (streamVersion === "0" || globalPosition === "0") invalid("event.position");
+    const parentSessionId = parseNullableUuid<SessionId>(event.parentSessionId, "parentSessionId");
+    if (parentSessionId !== null) invalid("parentSessionId");
+    const sessionId = parseLifecycleId<SessionId>(event.sessionId, "sessionId");
+    const payload = decodePayloadV3(eventType, event.payload);
+    if ("effectiveState" in payload) {
+      assertSessionEndEffectiveStateSessionCorrelationV1(payload.effectiveState, sessionId);
+    }
+    return Object.freeze({
+      eventSchemaVersion: 3,
+      eventId: parseLifecycleId(event.eventId, "eventId"),
+      projectId: parseLifecycleId<ProjectId>(event.projectId, "projectId"),
+      vaultId: parseLifecycleId<VaultId>(event.vaultId, "vaultId"),
+      storeId: parseLifecycleId<StoreId>(event.storeId, "storeId"),
+      workspaceId: workspaceId as WorkspaceId,
+      streamId: parseBoundedString(event.streamId, "streamId", 512),
+      streamVersion,
+      globalPosition,
+      sessionId,
+      parentSessionId,
+      eventType,
+      correlationId: parseLifecycleId(event.correlationId, "correlationId"),
+      causationId: parseNullableUuid(event.causationId, "causationId"),
+      commandId: parseLifecycleId(event.commandId, "commandId"),
+      idempotencyKey: parseBoundedString(
+        event.idempotencyKey,
+        "idempotencyKey",
+        LIFECYCLE_IDEMPOTENCY_KEY_MAX_SCALARS,
+      ),
+      occurredAt: parseCanonicalTimestamp(event.occurredAt, "occurredAt"),
+      authorityCommitment: hash(event.authorityCommitment, "authorityCommitment"),
+      payload,
+    }) as LifecycleEventV3;
+  } catch {
+    invalid("lifecycleEvent");
+  }
+}
+
+export function decodeLifecycleEvent(value: LifecycleEventV3): LifecycleEventV3;
+export function decodeLifecycleEvent(value: unknown): LifecycleEvent;
+export function decodeLifecycleEvent(value: unknown): LifecycleEventCodecResult {
   const version = strictRecord(value, "lifecycleEvent").eventSchemaVersion;
   if (version === 1) return decodeLifecycleEventV1(value);
   if (version === 2) return decodeLifecycleEventV2(value);
+  if (version === 3) return decodeLifecycleEventV3(value);
   return invalid("eventSchemaVersion");
 }

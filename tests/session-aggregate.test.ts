@@ -12,13 +12,18 @@ import {
   type SessionAuthorityMirror,
 } from "../src/orchestrator/lifecycle/session-aggregate.js";
 import {
+  decodeLifecycleEventV2,
+  decodeLifecycleEventV3,
   LIFECYCLE_EVENT_TYPES,
   type LifecycleEventBaseV1,
   type LifecycleEventPayloadMapV1,
   type LifecycleEventType,
   type LifecycleEvent,
   type LifecycleEventV1,
+  type LifecycleEventV2,
+  type LifecycleEventV3,
 } from "../src/orchestrator/lifecycle/contracts/events.js";
+import type { SessionEndEffectiveStateV1 } from "../src/orchestrator/lifecycle/session-end-effective-state.js";
 import type {
   CheckpointId,
   ChildSessionState,
@@ -63,6 +68,10 @@ import {
   rootAggregate,
   validationResultFixture,
 } from "./support/lifecycle-fixtures.js";
+import {
+  referenceSessionEndEffectiveStateHashV1,
+  sessionEndEffectiveStateFixture,
+} from "./support/session-end-effective-state-reference.js";
 
 type SessionAggregateModule = typeof import("../src/orchestrator/lifecycle/session-aggregate.js");
 type TransitionPolicyIsPrivate = "isSessionTransitionAllowed" extends keyof SessionAggregateModule
@@ -127,6 +136,54 @@ function eventAfter<T extends LifecycleEventType>(
     authorityCommitment: payloadCommitment ?? aggregate.authorityCommitment,
     ...options,
   });
+}
+
+function rootEffectiveState(profileCount = 2): SessionEndEffectiveStateV1 {
+  const fixture = sessionEndEffectiveStateFixture({ requestVersion: 2, profileCount });
+  const withoutHash = {
+    effectiveStateVersion: fixture.effectiveStateVersion,
+    effectiveStateDomain: fixture.effectiveStateDomain,
+    request: { ...fixture.request, sessionId: ROOT_SESSION_ID },
+    effectivePolicy: fixture.effectivePolicy,
+    effectiveFinalCheckpoint: fixture.effectiveFinalCheckpoint,
+  };
+  return Object.freeze({
+    ...withoutHash,
+    effectiveStateHash: referenceSessionEndEffectiveStateHashV1(withoutHash),
+  });
+}
+
+function currentSessionEndEvent(
+  aggregate: RootAggregateState,
+  eventType: LifecycleEventV3["eventType"],
+  payload: LifecycleEventV3["payload"],
+): LifecycleEventV3 {
+  const envelope = eventAfter(aggregate, eventType);
+  return decodeLifecycleEventV3({
+    ...envelope,
+    eventSchemaVersion: 3,
+    payload,
+  });
+}
+
+function internalTransferEventV2(
+  aggregate: ChildAggregateState,
+  suspensionCheckpointId: CheckpointId,
+  checkpointId: CheckpointId,
+): Extract<LifecycleEventV2, { readonly eventType: "ChildWorkTransferCreated" }> {
+  const envelope = eventAfter(aggregate, "ChildWorkTransferCreated", {
+    authorityCommitment: AUTHORITY_C,
+  }, { authorityCommitment: AUTHORITY_C });
+  return decodeLifecycleEventV2({
+    ...envelope,
+    eventSchemaVersion: 2,
+    payload: {
+      transferTicketId: TRANSFER_TICKET_ID,
+      suspensionCheckpointId,
+      checkpointId,
+      authorityCommitment: AUTHORITY_C,
+    },
+  }) as Extract<LifecycleEventV2, { readonly eventType: "ChildWorkTransferCreated" }>;
 }
 
 function suspendRequestedRoot(): RootAggregateState {
@@ -509,6 +566,71 @@ describe("SessionAggregate", () => {
       expectIntegrity(() => evolveSession(cancelled, eventAfter(cancelled, "SessionEndRequested", {
         workflowGeneration: 1,
       })));
+    });
+
+    it("folds current effective state through strict G1 request G2 cancel G3 reopen", () => {
+      type EffectiveRoot = RootAggregateState & {
+        readonly endEffectiveState: SessionEndEffectiveStateV1 | null;
+        readonly endEffectiveStateHash: string | null;
+      };
+      const initial = rootAggregate();
+      const requestedState = rootEffectiveState(2);
+      const requested = evolveSession(initial, currentSessionEndEvent(initial, "SessionEndRequested", {
+        workflowId: WORKFLOW_ID,
+        workflowGeneration: 1,
+        previousState: "active",
+        effectiveState: requestedState,
+      })) as EffectiveRoot;
+      assert.equal(requested.endWorkflowGeneration, 1);
+      assert.deepEqual(requested.endEffectiveState, requestedState);
+      assert.equal(requested.endEffectiveStateHash, requestedState.effectiveStateHash);
+
+      const amendedState = rootEffectiveState(3);
+      const amended = evolveSession(requested, currentSessionEndEvent(requested, "SessionEndAmended", {
+        workflowId: WORKFLOW_ID,
+        previousWorkflowGeneration: 1,
+        workflowGeneration: 2,
+        preTransitionCheckpointId: CHECKPOINT_ID,
+        evidenceWindowAction: "seal",
+        effectiveState: amendedState,
+      })) as EffectiveRoot;
+      assert.equal(amended.endWorkflowGeneration, 2);
+      assert.deepEqual(amended.endEffectiveState, amendedState);
+      assert.equal(amended.endEffectiveStateHash, amendedState.effectiveStateHash);
+
+      expectIntegrity(() => evolveSession(requested, currentSessionEndEvent(requested, "SessionEndCancelled", {
+        cancellationVersion: 1,
+        workflowId: WORKFLOW_ID,
+        previousWorkflowGeneration: 2,
+        workflowGeneration: 3,
+        restoredState: "active",
+        preTransitionCheckpointId: CHECKPOINT_ID,
+      })));
+
+      const cancelled = evolveSession(requested, currentSessionEndEvent(requested, "SessionEndCancelled", {
+        cancellationVersion: 1,
+        workflowId: WORKFLOW_ID,
+        previousWorkflowGeneration: 1,
+        workflowGeneration: 2,
+        restoredState: "active",
+        preTransitionCheckpointId: CHECKPOINT_ID,
+      })) as EffectiveRoot;
+      assert.equal(cancelled.state, "active");
+      assert.equal(cancelled.endWorkflowGeneration, 2);
+      assert.equal(cancelled.endEffectiveState, requested.endEffectiveState);
+      assert.equal(cancelled.endEffectiveStateHash, requested.endEffectiveStateHash);
+
+      const reopenedState = rootEffectiveState(4);
+      const reopened = evolveSession(cancelled, currentSessionEndEvent(cancelled, "SessionEndRequested", {
+        workflowId: WORKFLOW_ID,
+        workflowGeneration: 3,
+        previousState: "active",
+        effectiveState: reopenedState,
+      })) as EffectiveRoot;
+      assert.equal(reopened.state, "ending");
+      assert.equal(reopened.endWorkflowGeneration, 3);
+      assert.deepEqual(reopened.endEffectiveState, reopenedState);
+      assert.equal(reopened.endEffectiveStateHash, reopenedState.effectiveStateHash);
     });
 
     it("accepts current or exactly-next identified terminal generations", () => {
@@ -961,6 +1083,43 @@ describe("SessionAggregate", () => {
         authorityCommitment: AUTHORITY_C,
       }));
       assert.equal(transferred.state, "transferred");
+    });
+
+    it("folds internal transfer V2 with distinct suspension and governing checkpoints", () => {
+      const suspended = suspendedChild();
+      const newerCheckpointId = lifecycleUuid<CheckpointId>(618);
+      const newerCheckpointPosition = suspended.eventPosition + 1n;
+      const recheckpointed = evolveSession(suspended, eventAfter(suspended, "SessionCheckpointRecorded", {
+        checkpoint: checkpointFixture({
+          sessionId: suspended.sessionId,
+          parentSessionId: suspended.parentSessionId,
+          checkpointId: newerCheckpointId,
+          baseEventPosition: suspended.eventPosition,
+          checkpointEventPosition: newerCheckpointPosition,
+        }),
+        baseEventPosition: suspended.eventPosition.toString(),
+        checkpointEventPosition: newerCheckpointPosition.toString(),
+      }));
+
+      expectIntegrity(() => evolveSession(recheckpointed, internalTransferEventV2(
+        recheckpointed,
+        lifecycleUuid<CheckpointId>(619),
+        newerCheckpointId,
+      )));
+      expectIntegrity(() => evolveSession(recheckpointed, internalTransferEventV2(
+        recheckpointed,
+        CHECKPOINT_ID,
+        CHECKPOINT_ID,
+      )));
+
+      const transferred = evolveSession(recheckpointed, internalTransferEventV2(
+        recheckpointed,
+        CHECKPOINT_ID,
+        newerCheckpointId,
+      ));
+      assert.equal(transferred.state, "transferred");
+      assert.equal(transferred.suspensionCheckpointId, CHECKPOINT_ID);
+      assert.equal(transferred.latestCheckpointId, newerCheckpointId);
     });
 
     it("enforces assignment revisions and immutable assignment identity in every allowed nonterminal state", () => {

@@ -4,7 +4,15 @@ import type {
   VaultId,
   WorkspaceId,
 } from "../identity/contracts.js";
-import type { LifecycleAssignmentV1, LifecycleEvent, LifecycleEventType } from "./contracts/events.js";
+import type {
+  LifecycleAssignmentV1,
+  LifecycleEvent as LegacyLifecycleEvent,
+  LifecycleEventType,
+  LifecycleEventV3,
+} from "./contracts/events.js";
+import type { SessionEndEffectiveStateV1 } from "./session-end-effective-state.js";
+
+type LifecycleEvent = LegacyLifecycleEvent | LifecycleEventV3;
 import type {
   CheckpointId,
   ChildSessionState,
@@ -27,6 +35,12 @@ const VERSION_2_EVENT_TYPES = new Set<LifecycleEventType>([
   "SessionCheckpointRecorded",
   "SessionEndRequested",
   "SessionEndAmended",
+  "ChildWorkTransferCreated",
+]);
+const VERSION_3_EVENT_TYPES = new Set<LifecycleEventType>([
+  "SessionEndRequested",
+  "SessionEndAmended",
+  "SessionEndCancelled",
 ]);
 
 function rootStates(...states: RootSessionState[]): readonly RootSessionState[] {
@@ -148,6 +162,8 @@ export interface RootAggregateState extends AggregateBase {
   readonly endWorkflowId: WorkflowId | null;
   readonly endWorkflowGeneration: number | null;
   readonly endPreviousState: "active" | "suspended" | null;
+  readonly endEffectiveState: SessionEndEffectiveStateV1 | null;
+  readonly endEffectiveStateHash: string | null;
   readonly endVerificationState: EndVerificationState;
   readonly verificationPassedEventPosition: bigint | null;
 }
@@ -221,8 +237,13 @@ function payloadCommitment(event: LifecycleEvent): string | null {
 }
 
 function assertEnvelope(event: LifecycleEvent): { readonly streamVersion: bigint; readonly eventPosition: bigint } {
-  if (event.eventSchemaVersion !== 1 && event.eventSchemaVersion !== 2) integrity();
+  if (
+    event.eventSchemaVersion !== 1
+    && event.eventSchemaVersion !== 2
+    && event.eventSchemaVersion !== 3
+  ) integrity();
   if (event.eventSchemaVersion === 2 && !VERSION_2_EVENT_TYPES.has(event.eventType)) integrity();
+  if (event.eventSchemaVersion === 3 && !VERSION_3_EVENT_TYPES.has(event.eventType)) integrity();
   const streamVersion = decimalPosition(event.streamVersion, false);
   const eventPosition = decimalPosition(event.globalPosition, false);
   if (event.streamId !== deterministicStreamId(event.sessionId)) integrity();
@@ -296,6 +317,8 @@ function initializeSession(event: LifecycleEvent): SessionAggregateState {
       endWorkflowId: null,
       endWorkflowGeneration: null,
       endPreviousState: null,
+      endEffectiveState: null,
+      endEffectiveStateHash: null,
       endVerificationState: "none",
       verificationPassedEventPosition: null,
     });
@@ -568,6 +591,15 @@ function evolveRoot(
         endWorkflowId: event.payload.workflowId,
         endWorkflowGeneration: event.payload.workflowGeneration,
         endPreviousState: event.payload.previousState,
+        ...(event.eventSchemaVersion === 3
+          ? {
+              endEffectiveState: event.payload.effectiveState,
+              endEffectiveStateHash: event.payload.effectiveState.effectiveStateHash,
+            }
+          : {
+              endEffectiveState: null,
+              endEffectiveStateHash: null,
+            }),
         endVerificationState: "pending",
         verificationPassedEventPosition: null,
       });
@@ -577,6 +609,12 @@ function evolveRoot(
       if (event.payload.workflowGeneration !== event.payload.previousWorkflowGeneration + 1) integrity();
       return withRootEvent(state, event, streamVersion, eventPosition, {
         endWorkflowGeneration: event.payload.workflowGeneration,
+        ...(event.eventSchemaVersion === 3
+          ? {
+              endEffectiveState: event.payload.effectiveState,
+              endEffectiveStateHash: event.payload.effectiveState.effectiveStateHash,
+            }
+          : {}),
         endVerificationState: "pending",
         verificationPassedEventPosition: null,
       });
@@ -624,7 +662,12 @@ function evolveRoot(
       });
     }
     case "SessionEndCancelled":
-      assertTerminalWorkflow(state, event.payload.workflowId, event.payload.workflowGeneration);
+      if (event.eventSchemaVersion === 3) {
+        assertWorkflow(state, event.payload.workflowId, event.payload.previousWorkflowGeneration);
+        if (event.payload.workflowGeneration !== event.payload.previousWorkflowGeneration + 1) integrity();
+      } else {
+        assertTerminalWorkflow(state, event.payload.workflowId, event.payload.workflowGeneration);
+      }
       if (state.endPreviousState === null || event.payload.restoredState !== state.endPreviousState) integrity();
       return withRootEvent(state, event, streamVersion, eventPosition, {
         state: event.payload.restoredState,
@@ -684,9 +727,6 @@ function evolveChild(
       const changes = checkpointChanges(state, event, eventPosition);
       return withChildEvent(state, event, streamVersion, eventPosition, {
         ...changes,
-        ...(state.state === "suspended"
-          ? { suspensionCheckpointId: changes.latestCheckpointId }
-          : {}),
       });
     }
     case "EvidenceCoverageRecorded":
@@ -767,7 +807,15 @@ function evolveChild(
     case "ChildWorkTransferCreated":
       if (
         state.suspensionCheckpointId === null
-        || event.payload.checkpointId !== state.suspensionCheckpointId
+        || state.latestCheckpointId === null
+        || (
+          event.eventSchemaVersion === 1
+            ? event.payload.checkpointId !== state.latestCheckpointId
+            : (
+                event.payload.suspensionCheckpointId !== state.suspensionCheckpointId
+                || event.payload.checkpointId !== state.latestCheckpointId
+              )
+        )
       ) integrity();
       return withChildEvent(state, event, streamVersion, eventPosition, {
         state: "transferred",
