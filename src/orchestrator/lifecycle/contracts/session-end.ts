@@ -70,6 +70,14 @@ export interface QualityPolicyV1 {
   readonly totalEffectiveWeight: number;
 }
 
+export interface PersistedQualityPolicyInputV1 {
+  readonly qualityPolicyVersion: 1;
+  readonly profiles: readonly QualityProfileV1[];
+  readonly qualityThreshold: number;
+  readonly requireFullEvidence: boolean;
+  readonly requireMaterialization: boolean;
+}
+
 export interface SessionEndRequestV1 {
   readonly requestVersion: 1;
   readonly sessionId: SessionId;

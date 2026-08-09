@@ -64,6 +64,7 @@ import {
   decodeSessionEndRequestV1,
   decodeValidationResultV1,
   type QualityPolicyV1,
+  type PersistedQualityPolicyInputV1,
   type SessionEndRequestV1,
   type ValidationResultV1,
 } from "../src/orchestrator/lifecycle/contracts/session-end.js";
@@ -110,6 +111,7 @@ type RequiredContractSurface = readonly [
   LifecycleEventV1,
   SessionEndRequestV1,
   QualityPolicyV1,
+  PersistedQualityPolicyInputV1,
   CheckpointDraftV1,
   ChildReportDraftV1,
   LifecycleErrorCode,
