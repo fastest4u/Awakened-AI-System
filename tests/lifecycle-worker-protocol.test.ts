@@ -58,6 +58,7 @@ import {
 import {
   decodeWorkerRequest,
   decodeWorkerResponseForRequest,
+  WorkerProtocolError,
   type WorkerRequest,
 } from "../src/orchestrator/runtime/worker-protocol.js";
 
@@ -459,7 +460,7 @@ function semanticCommandCases(version: 1 | 2 = 1): readonly Readonly<Record<stri
       ...commandBase("record-checkpoint"),
       sessionId: IDS.session,
       expectedStreamVersion: "2",
-      expectedBaseEventPosition: "1",
+      expectedBaseEventPosition: "4",
       draft: checkpointDraft(version),
     },
     {
@@ -669,7 +670,8 @@ function endStatus(): Record<string, unknown> {
   };
 }
 
-function rootResult(): Record<string, unknown> {
+function rootResult(operation = "root-start"): Record<string, unknown> {
+  const suspended = operation === "root-suspend";
   return {
     resultVersion: 2,
     project: {
@@ -680,14 +682,14 @@ function rootResult(): Record<string, unknown> {
       clientNamespace: "codex",
     },
     sessionId: IDS.session,
-    ownerGeneration: "1",
+    ownerGeneration: operation === "root-resume" || operation === "root-recovery" ? "2" : "1",
     continuityKey: "thread:stable",
-    state: "active",
-    resumedFromSessionId: null,
-    latestCheckpointEventPosition: null,
-    eventPosition: "1",
-    handleIssued: false,
-    resumeTokenIssued: false,
+    state: suspended ? "suspended" : "active",
+    resumedFromSessionId: operation === "root-resume" ? IDS.session : null,
+    latestCheckpointEventPosition: suspended ? "3" : null,
+    eventPosition: suspended ? "5" : "1",
+    handleIssued: true,
+    resumeTokenIssued: true,
     contextPackUnavailable: true,
   };
 }
@@ -715,7 +717,7 @@ function checkpointRequested(version: 1 | 2): LifecycleWorkerOperationWire {
       command: {
         ...commandBase("record-checkpoint"),
         sessionId: IDS.session,
-        expectedStreamVersion: "3",
+        expectedStreamVersion: "2",
         expectedBaseEventPosition: "4",
         draft: { checkpointVersion: version },
       },
@@ -732,7 +734,7 @@ function requestEndRequested(version: 1 | 2): LifecycleWorkerOperationWire {
     prepared: {
       command: {
         ...commandBase("request-session-end"),
-        request: { requestVersion: version },
+        request: endRequest(version),
       },
       candidateIntentHash: OTHER_HASH,
       authorization: protectedAuthorization(),
@@ -843,27 +845,53 @@ function lifecycleRequestEnvelope(
 }
 
 function childResult(operation: string): Record<string, unknown> {
+  const state = operation === "propose-child-completion"
+    ? "completion-proposed"
+    : operation === "complete-child-session"
+      ? "completed"
+      : operation === "suspend-child-session"
+        ? "transferred"
+        : "active";
+  const finalStreamVersion = operation === "fork-child"
+    ? "1"
+    : operation === "suspend-child-session"
+      ? "4"
+      : operation === "claim-child-transfer"
+        ? "2"
+        : "3";
   const common = {
     resultVersion: 2,
     operation,
     childSessionId: IDS.work,
     parentSessionId: IDS.session,
-    state: "active",
+    state,
     eventPosition: "2",
-    finalStreamVersion: "2",
+    finalStreamVersion,
   };
-  const assignment = {
-    assignmentId: IDS.nonce,
-    summary: "Inspect lifecycle protocol",
-    scope: "src/orchestrator/runtime",
-  };
+  const assignment = operation === "fork-child"
+    ? {
+        assignmentId: IDS.work,
+        summary: "Inspect lifecycle",
+        scope: "src/orchestrator",
+      }
+    : operation === "amend-child-assignment"
+      ? {
+          assignmentId: IDS.work,
+          summary: "Inspect strict protocol",
+          scope: "src/orchestrator",
+        }
+      : {
+          assignmentId: IDS.nonce,
+          summary: "Inspect lifecycle protocol",
+          scope: "src/orchestrator/runtime",
+        };
   switch (operation) {
     case "fork-child":
       return { ...common, directAccessEnabled: false, rootOwnerGeneration: "1", assignment, assignmentRevision: "1" };
     case "amend-child-assignment":
       return { ...common, assignment, assignmentRevision: "2" };
     case "record-child-report":
-      return { ...common, assignmentRevision: "1", reportId: IDS.grant, reportItemIds: [IDS.nonce] };
+      return { ...common, assignmentRevision: "1", reportId: IDS.grant, reportItemIds: [] };
     case "disposition-child-report":
       return { ...common, disposition: { kind: "accepted", reportId: IDS.grant } };
     case "propose-child-completion":
@@ -875,7 +903,7 @@ function childResult(operation: string): Record<string, unknown> {
       return {
         ...common,
         previousChildSessionId: IDS.nonce,
-        transferTicketId: IDS.grant,
+        transferTicketId: IDS.work,
         assignment,
         assignmentRevision: "1",
         directAccessEnabled: false,
@@ -1054,9 +1082,31 @@ function materializationResult(): Record<string, unknown> {
   };
 }
 
+function semanticPublicResult(operation: string): Record<string, unknown> {
+  if (["root-start", "root-resume", "root-recovery", "root-suspend"].includes(operation)) {
+    return rootResult(operation);
+  }
+  if ([
+    "fork-child",
+    "amend-child-assignment",
+    "record-child-report",
+    "disposition-child-report",
+    "propose-child-completion",
+    "complete-child-session",
+    "suspend-child-session",
+    "claim-child-transfer",
+  ].includes(operation)) return childResult(operation);
+  if (operation === "record-checkpoint") return checkpointResult(1);
+  if (operation === "record-evidence-batch") return evidenceResult();
+  if (["request-session-end", "amend-session-end", "cancel-session-end", "abandon-session"].includes(operation)) {
+    return endStatus();
+  }
+  throw new Error(`Unknown executable semantic result operation: ${operation}`);
+}
+
 function resultForOperation(operation: string): Record<string, unknown> | boolean | null {
   if (["root-start", "root-resume", "root-recovery", "root-suspend"].includes(operation)) {
-    return semanticSuccess(rootResult());
+    return semanticSuccess(rootResult(operation));
   }
   if ([
     "fork-child",
@@ -1308,6 +1358,16 @@ function exactByteEnvelope<T>(factory: (padding: string) => T): readonly [T, str
   const envelope = factory(padding);
   assert.equal(canonicalJsonBytes(envelope), MAX_LIFECYCLE_WIRE_CANONICAL_BYTES);
   return [envelope, padding] as const;
+}
+
+function withOwnProtoDataProperty<T extends object>(target: T, value: unknown): T {
+  Object.defineProperty(target, "__proto__", {
+    value,
+    enumerable: true,
+    writable: true,
+    configurable: true,
+  });
+  return target;
 }
 
 describe("lifecycle worker protocol", () => {
@@ -1855,8 +1915,11 @@ describe("lifecycle worker protocol", () => {
   });
 
   it("enforces child result domain bounds", () => {
-    const requestedChild = (operation: string): LifecycleWorkerOperationWire => {
-      const command = semanticCommandCases().find(
+    const requestedChild = (
+      operation: string,
+      suppliedCommand?: Readonly<Record<string, unknown>>,
+    ): LifecycleWorkerOperationWire => {
+      const command = suppliedCommand ?? semanticCommandCases().find(
         (candidate) => candidate.commandType === operation,
       );
       assert.ok(command !== undefined);
@@ -1869,11 +1932,12 @@ describe("lifecycle worker protocol", () => {
     const decodeChildSuccess = (
       operation: string,
       result: Readonly<Record<string, unknown>>,
+      command?: Readonly<Record<string, unknown>>,
     ): LifecycleWorkerSuccessWire => decodeLifecycleWorkerSuccessForOperation({
       operation,
       nestedContractVersion: null,
       result: semanticSuccess(result as Record<string, unknown>),
-    }, requestedChild(operation));
+    }, requestedChild(operation, command));
 
     for (const field of ["summary", "scope"] as const) {
       const result = childResult("fork-child");
@@ -1892,7 +1956,14 @@ describe("lifecycle worker protocol", () => {
       summary: "x".repeat(4_000),
       scope: "x".repeat(4_000),
     };
-    assert.doesNotThrow(() => decodeChildSuccess("fork-child", assignmentBoundary));
+    const forkCommand = semanticCommandCases().find(
+      (candidate) => candidate.commandType === "fork-child",
+    );
+    assert.ok(forkCommand !== undefined);
+    assert.doesNotThrow(() => decodeChildSuccess("fork-child", assignmentBoundary, {
+      ...forkCommand,
+      assignment: assignmentBoundary.assignment,
+    }));
 
     const reportId = (index: number): string =>
       `00000000-0000-4000-8000-${index.toString(16).padStart(12, "0")}`;
@@ -1906,9 +1977,24 @@ describe("lifecycle worker protocol", () => {
         "success.result.reportItemIds",
       );
     }
+    const reportCommand = semanticCommandCases().find(
+      (candidate) => candidate.commandType === "record-child-report",
+    );
+    assert.ok(reportCommand !== undefined);
+    const boundaryReportItem = {
+      summary: "Boundary report item",
+      evidenceReferences: [],
+      confidence: "high",
+    };
     assert.doesNotThrow(() => decodeChildSuccess("record-child-report", {
       ...childResult("record-child-report"),
       reportItemIds: reportIds.slice(0, 200),
+    }, {
+      ...reportCommand,
+      report: {
+        ...reportDraft(),
+        findings: Array.from({ length: 200 }, () => boundaryReportItem),
+      },
     }));
 
     expectLifecycleField(
@@ -1925,8 +2011,8 @@ describe("lifecycle worker protocol", () => {
       "suspended",
       "transferred",
     ]) {
-      assert.doesNotThrow(() => decodeChildSuccess("fork-child", {
-        ...childResult("fork-child"),
+      assert.doesNotThrow(() => decodeChildSuccess("amend-child-assignment", {
+        ...childResult("amend-child-assignment"),
         state,
       }));
     }
@@ -1938,15 +2024,40 @@ describe("lifecycle worker protocol", () => {
       }),
       "success.result.disposition.kind",
     );
-    for (const kind of [
-      "accepted",
-      "partially-accepted",
-      "rejected",
-      "superseded",
-    ]) {
+    const dispositionCommand = semanticCommandCases().find(
+      (candidate) => candidate.commandType === "disposition-child-report",
+    );
+    assert.ok(dispositionCommand !== undefined);
+    const dispositionByKind = {
+      accepted: acceptedDisposition(),
+      "partially-accepted": {
+        ...acceptedDisposition(),
+        kind: "partially-accepted",
+        acceptedItemIds: [IDS.nonce],
+        rejectedItemIds: [IDS.work],
+        allReportItemIds: [IDS.nonce, IDS.work],
+      },
+      rejected: {
+        ...acceptedDisposition(),
+        kind: "rejected",
+        acceptedItemIds: [],
+        rejectedItemIds: [IDS.nonce],
+      },
+      superseded: {
+        ...acceptedDisposition(),
+        kind: "superseded",
+        acceptedItemIds: [],
+        rejectedItemIds: [IDS.nonce],
+        supersededByReportId: IDS.work,
+      },
+    } as const;
+    for (const [kind, disposition] of Object.entries(dispositionByKind)) {
       assert.doesNotThrow(() => decodeChildSuccess("disposition-child-report", {
         ...childResult("disposition-child-report"),
         disposition: { kind, reportId: IDS.grant },
+      }, {
+        ...dispositionCommand,
+        disposition,
       }));
     }
   });
@@ -1977,6 +2088,674 @@ describe("lifecycle worker protocol", () => {
       [canary],
     );
     assert.equal(getterCalls, 0);
+  });
+
+  // Production mutation caught: accept shape-valid semantic success with identity from another command.
+  it("correlates executable semantic success identities to the requested command", () => {
+    const otherId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    type CorrelationCase = Readonly<{
+      name: string;
+      operation: string;
+      field: string;
+      mutate: (result: Record<string, unknown>) => Record<string, unknown>;
+    }>;
+    const cases: readonly CorrelationCase[] = [
+      {
+        name: "root project",
+        operation: "root-start",
+        field: "success.result.project.projectId",
+        mutate: (result) => ({
+          ...result,
+          project: { ...(result.project as Record<string, unknown>), projectId: otherId },
+        }),
+      },
+      {
+        name: "root vault",
+        operation: "root-start",
+        field: "success.result.project.vaultId",
+        mutate: (result) => ({
+          ...result,
+          project: { ...(result.project as Record<string, unknown>), vaultId: otherId },
+        }),
+      },
+      {
+        name: "root workspace",
+        operation: "root-start",
+        field: "success.result.project.workspaceId",
+        mutate: (result) => ({
+          ...result,
+          project: { ...(result.project as Record<string, unknown>), workspaceId: OTHER_HASH },
+        }),
+      },
+      {
+        name: "root-start continuity",
+        operation: "root-start",
+        field: "success.result.continuityKey",
+        mutate: (result) => ({ ...result, continuityKey: "thread:other" }),
+      },
+      {
+        name: "root-start resume source",
+        operation: "root-start",
+        field: "success.result.resumedFromSessionId",
+        mutate: (result) => ({ ...result, resumedFromSessionId: otherId }),
+      },
+      {
+        name: "root-resume selected session",
+        operation: "root-resume",
+        field: "success.result.sessionId",
+        mutate: (result) => ({ ...result, sessionId: otherId }),
+      },
+      {
+        name: "root-resume source session",
+        operation: "root-resume",
+        field: "success.result.resumedFromSessionId",
+        mutate: (result) => ({ ...result, resumedFromSessionId: otherId }),
+      },
+      {
+        name: "root-resume continuity",
+        operation: "root-resume",
+        field: "success.result.continuityKey",
+        mutate: (result) => ({ ...result, continuityKey: "thread:other" }),
+      },
+      {
+        name: "root-recovery session",
+        operation: "root-recovery",
+        field: "success.result.sessionId",
+        mutate: (result) => ({ ...result, sessionId: otherId }),
+      },
+      {
+        name: "root-suspend session",
+        operation: "root-suspend",
+        field: "success.result.sessionId",
+        mutate: (result) => ({ ...result, sessionId: otherId }),
+      },
+      {
+        name: "fork parent",
+        operation: "fork-child",
+        field: "success.result.parentSessionId",
+        mutate: (result) => ({ ...result, parentSessionId: otherId }),
+      },
+      {
+        name: "fork assignment id",
+        operation: "fork-child",
+        field: "success.result.assignment.assignmentId",
+        mutate: (result) => ({
+          ...result,
+          assignment: { ...(result.assignment as Record<string, unknown>), assignmentId: otherId },
+        }),
+      },
+      {
+        name: "fork assignment summary",
+        operation: "fork-child",
+        field: "success.result.assignment.summary",
+        mutate: (result) => ({
+          ...result,
+          assignment: { ...(result.assignment as Record<string, unknown>), summary: "Other assignment" },
+        }),
+      },
+      {
+        name: "fork assignment scope",
+        operation: "fork-child",
+        field: "success.result.assignment.scope",
+        mutate: (result) => ({
+          ...result,
+          assignment: { ...(result.assignment as Record<string, unknown>), scope: "tests/other" },
+        }),
+      },
+      {
+        name: "fork direct access",
+        operation: "fork-child",
+        field: "success.result.directAccessEnabled",
+        mutate: (result) => ({ ...result, directAccessEnabled: true }),
+      },
+      {
+        name: "amend parent",
+        operation: "amend-child-assignment",
+        field: "success.result.parentSessionId",
+        mutate: (result) => ({ ...result, parentSessionId: otherId }),
+      },
+      {
+        name: "amend child",
+        operation: "amend-child-assignment",
+        field: "success.result.childSessionId",
+        mutate: (result) => ({ ...result, childSessionId: otherId }),
+      },
+      {
+        name: "amend assignment",
+        operation: "amend-child-assignment",
+        field: "success.result.assignment.summary",
+        mutate: (result) => ({
+          ...result,
+          assignment: { ...(result.assignment as Record<string, unknown>), summary: "Other amendment" },
+        }),
+      },
+      {
+        name: "report parent",
+        operation: "record-child-report",
+        field: "success.result.parentSessionId",
+        mutate: (result) => ({ ...result, parentSessionId: otherId }),
+      },
+      {
+        name: "report child",
+        operation: "record-child-report",
+        field: "success.result.childSessionId",
+        mutate: (result) => ({ ...result, childSessionId: otherId }),
+      },
+      {
+        name: "disposition parent",
+        operation: "disposition-child-report",
+        field: "success.result.parentSessionId",
+        mutate: (result) => ({ ...result, parentSessionId: otherId }),
+      },
+      {
+        name: "disposition child",
+        operation: "disposition-child-report",
+        field: "success.result.childSessionId",
+        mutate: (result) => ({ ...result, childSessionId: otherId }),
+      },
+      {
+        name: "disposition kind",
+        operation: "disposition-child-report",
+        field: "success.result.disposition.kind",
+        mutate: (result) => ({
+          ...result,
+          disposition: { ...(result.disposition as Record<string, unknown>), kind: "rejected" },
+        }),
+      },
+      {
+        name: "disposition report",
+        operation: "disposition-child-report",
+        field: "success.result.disposition.reportId",
+        mutate: (result) => ({
+          ...result,
+          disposition: { ...(result.disposition as Record<string, unknown>), reportId: otherId },
+        }),
+      },
+      {
+        name: "proposal child",
+        operation: "propose-child-completion",
+        field: "success.result.childSessionId",
+        mutate: (result) => ({ ...result, childSessionId: otherId }),
+      },
+      {
+        name: "proposal report",
+        operation: "propose-child-completion",
+        field: "success.result.reportId",
+        mutate: (result) => ({ ...result, reportId: otherId }),
+      },
+      {
+        name: "completion parent",
+        operation: "complete-child-session",
+        field: "success.result.parentSessionId",
+        mutate: (result) => ({ ...result, parentSessionId: otherId }),
+      },
+      {
+        name: "completion child",
+        operation: "complete-child-session",
+        field: "success.result.childSessionId",
+        mutate: (result) => ({ ...result, childSessionId: otherId }),
+      },
+      {
+        name: "completion report",
+        operation: "complete-child-session",
+        field: "success.result.reportId",
+        mutate: (result) => ({ ...result, reportId: otherId }),
+      },
+      {
+        name: "suspension parent",
+        operation: "suspend-child-session",
+        field: "success.result.parentSessionId",
+        mutate: (result) => ({ ...result, parentSessionId: otherId }),
+      },
+      {
+        name: "suspension child",
+        operation: "suspend-child-session",
+        field: "success.result.childSessionId",
+        mutate: (result) => ({ ...result, childSessionId: otherId }),
+      },
+      {
+        name: "transfer parent",
+        operation: "claim-child-transfer",
+        field: "success.result.parentSessionId",
+        mutate: (result) => ({ ...result, parentSessionId: otherId }),
+      },
+      {
+        name: "transfer ticket",
+        operation: "claim-child-transfer",
+        field: "success.result.transferTicketId",
+        mutate: (result) => ({ ...result, transferTicketId: otherId }),
+      },
+      {
+        name: "checkpoint session",
+        operation: "record-checkpoint",
+        field: "success.result.sessionId",
+        mutate: (result) => ({ ...result, sessionId: otherId }),
+      },
+      {
+        name: "checkpoint base position",
+        operation: "record-checkpoint",
+        field: "success.result.baseEventPosition",
+        mutate: (result) => ({
+          ...result,
+          baseEventPosition: "5",
+          checkpointEventPosition: "6",
+        }),
+      },
+      {
+        name: "evidence session",
+        operation: "record-evidence-batch",
+        field: "success.result.sessionId",
+        mutate: (result) => ({ ...result, sessionId: otherId }),
+      },
+      {
+        name: "evidence adapter session",
+        operation: "record-evidence-batch",
+        field: "success.result.adapterSessionId",
+        mutate: (result) => ({ ...result, adapterSessionId: otherId }),
+      },
+      {
+        name: "evidence batch",
+        operation: "record-evidence-batch",
+        field: "success.result.batchId",
+        mutate: (result) => ({ ...result, batchId: otherId }),
+      },
+      {
+        name: "evidence first ordinal",
+        operation: "record-evidence-batch",
+        field: "success.result.batchFirstOrdinal",
+        mutate: (result) => ({
+          ...result,
+          batchFirstOrdinal: "1",
+          batchLastOrdinal: "1",
+          coverageLastOrdinal: "1",
+          highestContiguousOrdinal: "1",
+        }),
+      },
+      {
+        name: "evidence last ordinal",
+        operation: "record-evidence-batch",
+        field: "success.result.batchLastOrdinal",
+        mutate: (result) => ({
+          ...result,
+          batchLastOrdinal: "1",
+          coverageLastOrdinal: "1",
+          highestContiguousOrdinal: "1",
+        }),
+      },
+      {
+        name: "root-start initial owner generation",
+        operation: "root-start",
+        field: "success.result.ownerGeneration",
+        mutate: (result) => ({ ...result, ownerGeneration: "2" }),
+      },
+      {
+        name: "root-start active state",
+        operation: "root-start",
+        field: "success.result.state",
+        mutate: (result) => ({ ...result, state: "suspended" }),
+      },
+      {
+        name: "root-start empty checkpoint history",
+        operation: "root-start",
+        field: "success.result.latestCheckpointEventPosition",
+        mutate: (result) => ({ ...result, latestCheckpointEventPosition: "1" }),
+      },
+      {
+        name: "root-start handle issuance",
+        operation: "root-start",
+        field: "success.result.handleIssued",
+        mutate: (result) => ({ ...result, handleIssued: false }),
+      },
+      {
+        name: "root-start resume-token issuance",
+        operation: "root-start",
+        field: "success.result.resumeTokenIssued",
+        mutate: (result) => ({ ...result, resumeTokenIssued: false }),
+      },
+      {
+        name: "root-resume owner increment",
+        operation: "root-resume",
+        field: "success.result.ownerGeneration",
+        mutate: (result) => ({ ...result, ownerGeneration: "3" }),
+      },
+      {
+        name: "root-resume active state",
+        operation: "root-resume",
+        field: "success.result.state",
+        mutate: (result) => ({ ...result, state: "suspended" }),
+      },
+      {
+        name: "root-resume handle issuance",
+        operation: "root-resume",
+        field: "success.result.handleIssued",
+        mutate: (result) => ({ ...result, handleIssued: false }),
+      },
+      {
+        name: "root-resume resume-token issuance",
+        operation: "root-resume",
+        field: "success.result.resumeTokenIssued",
+        mutate: (result) => ({ ...result, resumeTokenIssued: false }),
+      },
+      {
+        name: "root-recovery owner increment",
+        operation: "root-recovery",
+        field: "success.result.ownerGeneration",
+        mutate: (result) => ({ ...result, ownerGeneration: "3" }),
+      },
+      {
+        name: "root-recovery handle issuance",
+        operation: "root-recovery",
+        field: "success.result.handleIssued",
+        mutate: (result) => ({ ...result, handleIssued: false }),
+      },
+      {
+        name: "root-recovery resume-token issuance",
+        operation: "root-recovery",
+        field: "success.result.resumeTokenIssued",
+        mutate: (result) => ({ ...result, resumeTokenIssued: false }),
+      },
+      {
+        name: "root-suspend state",
+        operation: "root-suspend",
+        field: "success.result.state",
+        mutate: (result) => ({ ...result, state: "active" }),
+      },
+      {
+        name: "root-suspend event position",
+        operation: "root-suspend",
+        field: "success.result.eventPosition",
+        mutate: (result) => ({ ...result, eventPosition: "6" }),
+      },
+      {
+        name: "root-suspend handle issuance",
+        operation: "root-suspend",
+        field: "success.result.handleIssued",
+        mutate: (result) => ({ ...result, handleIssued: false }),
+      },
+      {
+        name: "root-suspend resume-token issuance",
+        operation: "root-suspend",
+        field: "success.result.resumeTokenIssued",
+        mutate: (result) => ({ ...result, resumeTokenIssued: false }),
+      },
+      {
+        name: "fork initial assignment revision",
+        operation: "fork-child",
+        field: "success.result.assignmentRevision",
+        mutate: (result) => ({ ...result, assignmentRevision: "2" }),
+      },
+      {
+        name: "fork active state",
+        operation: "fork-child",
+        field: "success.result.state",
+        mutate: (result) => ({ ...result, state: "completed" }),
+      },
+      {
+        name: "fork initial stream version",
+        operation: "fork-child",
+        field: "success.result.finalStreamVersion",
+        mutate: (result) => ({ ...result, finalStreamVersion: "2" }),
+      },
+      {
+        name: "amend assignment revision increment",
+        operation: "amend-child-assignment",
+        field: "success.result.assignmentRevision",
+        mutate: (result) => ({ ...result, assignmentRevision: "3" }),
+      },
+      {
+        name: "amend stream increment",
+        operation: "amend-child-assignment",
+        field: "success.result.finalStreamVersion",
+        mutate: (result) => ({ ...result, finalStreamVersion: "4" }),
+      },
+      {
+        name: "report stream increment",
+        operation: "record-child-report",
+        field: "success.result.finalStreamVersion",
+        mutate: (result) => ({ ...result, finalStreamVersion: "4" }),
+      },
+      {
+        name: "report item count",
+        operation: "record-child-report",
+        field: "success.result.reportItemIds",
+        mutate: (result) => ({ ...result, reportItemIds: [IDS.nonce] }),
+      },
+      {
+        name: "disposition stream increment",
+        operation: "disposition-child-report",
+        field: "success.result.finalStreamVersion",
+        mutate: (result) => ({ ...result, finalStreamVersion: "4" }),
+      },
+      {
+        name: "proposal stream increment",
+        operation: "propose-child-completion",
+        field: "success.result.finalStreamVersion",
+        mutate: (result) => ({ ...result, finalStreamVersion: "4" }),
+      },
+      {
+        name: "proposal state",
+        operation: "propose-child-completion",
+        field: "success.result.state",
+        mutate: (result) => ({ ...result, state: "active" }),
+      },
+      {
+        name: "completion stream increment",
+        operation: "complete-child-session",
+        field: "success.result.finalStreamVersion",
+        mutate: (result) => ({ ...result, finalStreamVersion: "4" }),
+      },
+      {
+        name: "completion state",
+        operation: "complete-child-session",
+        field: "success.result.state",
+        mutate: (result) => ({ ...result, state: "active" }),
+      },
+      {
+        name: "suspension two-event stream increment",
+        operation: "suspend-child-session",
+        field: "success.result.finalStreamVersion",
+        mutate: (result) => ({ ...result, finalStreamVersion: "5" }),
+      },
+      {
+        name: "suspension transferred state",
+        operation: "suspend-child-session",
+        field: "success.result.state",
+        mutate: (result) => ({ ...result, state: "suspended" }),
+      },
+      {
+        name: "claim initial assignment revision",
+        operation: "claim-child-transfer",
+        field: "success.result.assignmentRevision",
+        mutate: (result) => ({ ...result, assignmentRevision: "2" }),
+      },
+      {
+        name: "claim local-only direct access",
+        operation: "claim-child-transfer",
+        field: "success.result.directAccessEnabled",
+        mutate: (result) => ({ ...result, directAccessEnabled: true }),
+      },
+      {
+        name: "claim active state",
+        operation: "claim-child-transfer",
+        field: "success.result.state",
+        mutate: (result) => ({ ...result, state: "transferred" }),
+      },
+      {
+        name: "claim two-event stream version",
+        operation: "claim-child-transfer",
+        field: "success.result.finalStreamVersion",
+        mutate: (result) => ({ ...result, finalStreamVersion: "3" }),
+      },
+      {
+        name: "checkpoint stream increment",
+        operation: "record-checkpoint",
+        field: "success.result.finalStreamVersion",
+        mutate: (result) => ({ ...result, finalStreamVersion: "4" }),
+      },
+      {
+        name: "end request session",
+        operation: "request-session-end",
+        field: "success.result.sessionId",
+        mutate: (result) => ({ ...result, sessionId: otherId }),
+      },
+      {
+        name: "end amendment session",
+        operation: "amend-session-end",
+        field: "success.result.sessionId",
+        mutate: (result) => ({ ...result, sessionId: otherId }),
+      },
+      {
+        name: "end amendment workflow",
+        operation: "amend-session-end",
+        field: "success.result.workflowId",
+        mutate: (result) => ({ ...result, workflowId: otherId }),
+      },
+      {
+        name: "end cancellation session",
+        operation: "cancel-session-end",
+        field: "success.result.sessionId",
+        mutate: (result) => ({ ...result, sessionId: otherId }),
+      },
+      {
+        name: "end cancellation workflow",
+        operation: "cancel-session-end",
+        field: "success.result.workflowId",
+        mutate: (result) => ({ ...result, workflowId: otherId }),
+      },
+      {
+        name: "abandonment session",
+        operation: "abandon-session",
+        field: "success.result.sessionId",
+        mutate: (result) => ({ ...result, sessionId: otherId }),
+      },
+    ];
+
+    assert.equal(cases.length, 81);
+    assert.equal(new Set(cases.map((entry) => entry.operation)).size, 18);
+    const requestedByOperation = new Map<string, LifecycleWorkerOperationWire>();
+    const requestedFor = (operation: string): LifecycleWorkerOperationWire => {
+      const cached = requestedByOperation.get(operation);
+      if (cached !== undefined) return cached;
+      const command = semanticCommandCases().find(
+        (candidate) => candidate.commandType === operation,
+      );
+      assert.ok(command !== undefined, operation);
+      const requested = decodeLifecycleWorkerOperationWire({
+        kind: "semantic",
+        operation,
+        prepared: prepared(
+          command as Record<string, unknown>,
+          semanticAuthorizationFor(command),
+        ),
+      });
+      requestedByOperation.set(operation, requested);
+      return requested;
+    };
+    const decodeSuccess = (
+      requested: LifecycleWorkerOperationWire,
+      publicResult: Record<string, unknown>,
+    ): LifecycleWorkerSuccessWire => decodeLifecycleWorkerSuccessForOperation({
+      operation: requested.operation,
+      nestedContractVersion: lifecycleNestedContractVersion(requested),
+      result: semanticSuccess(publicResult),
+    }, requested);
+
+    for (const operation of new Set(cases.map((entry) => entry.operation))) {
+      const requested = requestedFor(operation);
+      assert.doesNotThrow(
+        () => decodeSuccess(requested, semanticPublicResult(operation)),
+        `${operation} correlated baseline`,
+      );
+    }
+    for (const entry of cases) {
+      const requested = requestedFor(entry.operation);
+      expectLifecycleField(
+        () => decodeSuccess(
+          requested,
+          entry.mutate(semanticPublicResult(entry.operation)),
+        ),
+        entry.field,
+      );
+    }
+    const checkpoint = requestedFor("record-checkpoint");
+    expectSafeLifecycleFailure(
+      "LIFECYCLE_INPUT_INVALID",
+      () => decodeSuccess(checkpoint, {
+        ...checkpointResult(1),
+        checkpointEventPosition: "6",
+      }),
+      [],
+    );
+  });
+
+  // Production mutation caught: retain an undocumented optional third focused-decoder argument.
+  it("exposes the exact two-input lifecycle success decoder", () => {
+    assert.equal(decodeLifecycleWorkerSuccessForOperation.length, 2);
+  });
+
+  // Production mutation caught: bind only operation-known top-level claim project identities.
+  it("binds every decoded lifecycle result project identity to the outer request", () => {
+    const request = decodeWorkerRequest(lifecycleRequestEnvelope());
+    assert.equal(request.type, "lifecycle");
+    const target = {
+      actorRole: "primary",
+      clientInstanceId: "codex/client-a",
+    };
+    const data = {
+      operation: "root-start",
+      nestedContractVersion: null,
+      result: {
+        kind: "success",
+        publicResult: rootResult(),
+        authorityMaterial: {
+          status: "current",
+          target,
+          authorityCommitment: OTHER_HASH,
+          capabilityGeneration: "1",
+          descriptor: {
+            descriptorVersion: 1,
+            authorityCommitment: OTHER_HASH,
+            capabilityGeneration: "1",
+            target,
+            materials: [{
+              claims: {
+                capabilityVersion: 1,
+                keyId: "capability-key-1",
+                projectId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                vaultId: IDS.vault,
+                storeId: IDS.store,
+                workspaceId: HASH,
+                clientNamespace: "codex",
+                sessionId: IDS.session,
+                kind: "root-session-handle",
+                capabilityGeneration: "1",
+                issuedAt: "2026-07-17T00:00:00.000Z",
+                policyCode: "root-current",
+                expiryKind: "until-revoked",
+                expiresAt: null,
+                issueNonce: HASH,
+                actorRole: "primary",
+                clientInstanceId: "codex/client-a",
+              },
+              verifier: HASH,
+            }],
+          },
+          recoveryCode: null,
+        },
+      },
+    };
+    assert.doesNotThrow(() => decodeLifecycleWorkerSuccessForOperation(
+      data,
+      request.operation,
+    ));
+    assert.throws(
+      () => decodeWorkerResponseForRequest({
+        id: IDS.work,
+        ok: true,
+        data,
+      }, request),
+      (error: unknown) => error instanceof WorkerProtocolError,
+    );
   });
 
   it("correlates bounded query and fenced success identities", () => {
@@ -2195,7 +2974,7 @@ describe("lifecycle worker protocol", () => {
       const result = operation === "workflow-claim-next"
         ? workflowClaimResult()
         : outboxClaimResult();
-      expectLifecycleField(() => decodeWorkerResponseForRequest({
+      assert.throws(() => decodeWorkerResponseForRequest({
         id: IDS.work,
         ok: true,
         data: {
@@ -2203,8 +2982,64 @@ describe("lifecycle worker protocol", () => {
           nestedContractVersion: null,
           result: { ...result, projectId: otherId },
         },
-      }, request), "success.result.projectId");
+      }, request), (error: unknown) => {
+        assert.ok(error instanceof WorkerProtocolError);
+        assert.equal(error.message, "WORKER_PROTOCOL_INVALID");
+        assert.equal(JSON.stringify(error).includes(otherId), false);
+        return true;
+      });
     }
+  });
+
+  // Production mutation caught: copy own JSON keys through inherited __proto__ assignment semantics.
+  it("counts own __proto__ data properties at the lifecycle 4 MiB guard", () => {
+    const [exact, padding] = exactByteEnvelope((value) =>
+      withOwnProtoDataProperty({}, value));
+    assert.equal(Object.prototype.hasOwnProperty.call(exact, "__proto__"), true);
+    assert.doesNotThrow(() => assertLifecycleWireCanonicalSize(exact));
+
+    const plusOne = withOwnProtoDataProperty({}, `${padding}x`);
+    assert.equal(canonicalJsonBytes(plusOne), MAX_LIFECYCLE_WIRE_CANONICAL_BYTES + 1);
+    expectLifecycleField(() => assertLifecycleWireCanonicalSize(plusOne), "lifecycleWire");
+  });
+
+  // Production mutation caught: drop an unknown own __proto__ field before exact request validation.
+  it("rejects rather than drops own __proto__ data properties during lifecycle request decode", () => {
+    const input = fencedOperationInputs().find(
+      (candidate) => candidate.operation === "workflow-claim-next",
+    );
+    assert.ok(input !== undefined);
+    const request = lifecycleRequestEnvelope(IDS.work, {
+      kind: "fenced",
+      operation: "workflow-claim-next",
+      input: withOwnProtoDataProperty({ ...input }, "request-canary"),
+    });
+    assert.equal(JSON.parse(JSON.stringify(request)).operation.input.__proto__, "request-canary");
+    expectLifecycleField(() => decodeWorkerRequest(request), "operation.input");
+  });
+
+  // Production mutation caught: drop an unknown own __proto__ field before exact success validation.
+  it("rejects rather than drops own __proto__ data properties during lifecycle success decode", () => {
+    const input = fencedOperationInputs().find(
+      (candidate) => candidate.operation === "workflow-claim-next",
+    );
+    assert.ok(input !== undefined);
+    const request = decodeWorkerRequest(lifecycleRequestEnvelope(IDS.work, {
+      kind: "fenced",
+      operation: "workflow-claim-next",
+      input,
+    }));
+    const result = withOwnProtoDataProperty(workflowClaimResult(), "success-canary");
+    assert.equal(JSON.parse(JSON.stringify(result)).__proto__, "success-canary");
+    expectLifecycleField(() => decodeWorkerResponseForRequest({
+      id: IDS.work,
+      ok: true,
+      data: {
+        operation: "workflow-claim-next",
+        nestedContractVersion: null,
+        result,
+      },
+    }, request), "success.result");
   });
 
   it("caps lifecycle wire JSON at the exact UTF-8 boundary", () => {

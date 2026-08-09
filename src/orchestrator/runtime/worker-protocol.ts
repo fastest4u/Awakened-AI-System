@@ -922,6 +922,20 @@ function decodeOpen(value: unknown): WorkerOpenResult {
   }), executorId: string(result.executorId) };
 }
 
+function assertDecodedLifecycleProjectBinding(
+  value: JsonValue,
+  expectedProjectId: ProjectId,
+): void {
+  if (value === null || typeof value !== "object") return;
+  for (const key of Reflect.ownKeys(value)) {
+    if (typeof key !== "string") continue;
+    const descriptor = Reflect.getOwnPropertyDescriptor(value, key);
+    if (descriptor === undefined || !descriptor.enumerable || !("value" in descriptor)) continue;
+    if (key === "projectId" && descriptor.value !== expectedProjectId) invalid();
+    assertDecodedLifecycleProjectBinding(descriptor.value as JsonValue, expectedProjectId);
+  }
+}
+
 function decodeSuccessForType(
   type: WorkerRequest["type"],
   value: unknown,
@@ -939,11 +953,15 @@ function decodeSuccessForType(
     case "append": return encodeAppendResultWire(decodeAppendResultWire(value));
     case "lifecycle": {
       if (request?.type !== "lifecycle") invalid();
-      return decodeLifecycleWorkerSuccessForOperation(
+      const decoded = decodeLifecycleWorkerSuccessForOperation(
         value,
         request.operation,
+      );
+      assertDecodedLifecycleProjectBinding(
+        decoded.result,
         request.binding.projectId as ProjectId,
       );
+      return decoded;
     }
     case "quickIntegrity":
     case "fullIntegrity": return decodeIntegrityReport(value);

@@ -2795,6 +2795,87 @@ describe("ProjectStoreWorkerBackend open identity", () => {
     }
   }
 
+  // Production mutation caught: acquire maintenance outside cleanup ownership after opening SQLite.
+  it("closes the authoritative connection when maintenance construction fails", async () => {
+    const context = await realContext();
+    const maintenanceError = new Error("maintenance construction failed first");
+    const originalOpen = NodeSqliteDriver.prototype.open;
+    let authoritativeOpenCalls = 0;
+    let authoritativeCloseCalls = 0;
+    const authoritativeConnections: SqliteConnection[] = [];
+    let maintenanceFactoryCalls = 0;
+    let eventStoreFactoryCalls = 0;
+    let runtimeFactoryCalls = 0;
+
+    NodeSqliteDriver.prototype.open = function instrumentedOpen(path, options): SqliteConnection {
+      const connection = originalOpen.call(this, path, options);
+      if (options.mode === "existing") {
+        authoritativeOpenCalls += 1;
+        authoritativeConnections.push(connection);
+        const close = connection.close.bind(connection);
+        connection.close = () => {
+          authoritativeCloseCalls += 1;
+          close();
+        };
+      }
+      return connection;
+    };
+
+    const backend = new ProjectStoreWorkerBackend({
+      selfUrl: WORKER_URL,
+      executorLeaseMs: 15_000,
+      appendRetryDeadlineMs: 10_000,
+      keyProvider: {} as CapabilityKeyProvider,
+      lifecycleRuntimeFactory: {
+        create() {
+          runtimeFactoryCalls += 1;
+          throw new Error("runtime factory must not run");
+        },
+      },
+      maintenanceFactory: () => {
+        maintenanceFactoryCalls += 1;
+        throw maintenanceError;
+      },
+      eventStoreFactory: () => {
+        eventStoreFactoryCalls += 1;
+        throw new Error("event store factory must not run");
+      },
+    });
+
+    try {
+      await assert.rejects(backend.dispatch({
+        id: "open-maintenance-failure",
+        type: "open",
+        binding: encodeWorkerBinding(context),
+      }), (error: unknown) => {
+        assert.equal(error, maintenanceError);
+        return true;
+      });
+      assert.equal(authoritativeOpenCalls, 1);
+      assert.equal(maintenanceFactoryCalls, 1);
+      assert.equal(eventStoreFactoryCalls, 0);
+      assert.equal(runtimeFactoryCalls, 0);
+      await assert.rejects(backend.dispatch({
+        id: "lifecycle-after-maintenance-failure",
+        type: "lifecycle",
+        binding: encodeWorkerBindingAssertion(context),
+        operation: lifecycleOperationFixture(),
+      }), backendErrorCode("WORKER_CLOSED"));
+
+      const observer = new DatabaseSync(context.binding.storeRoute.eventsPath, { readOnly: true });
+      assert.equal(observer.prepare("SELECT count(*) AS count FROM executor_leases").get()?.count, 0);
+      observer.close();
+
+      await backend.close();
+      assert.equal(authoritativeCloseCalls, 1);
+    } finally {
+      NodeSqliteDriver.prototype.open = originalOpen;
+      if (authoritativeCloseCalls === 0) {
+        authoritativeConnections[0]?.close();
+      }
+    }
+  });
+
   it("requires both lifecycle factory and the exact provider instance", async () => {
     const provider = Object.freeze({ marker: "exact-provider" }) as unknown as CapabilityKeyProvider;
     const operation = lifecycleOperationFixture();

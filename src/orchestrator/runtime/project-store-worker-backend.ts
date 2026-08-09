@@ -515,12 +515,12 @@ export class ProjectStoreWorkerBackend implements WorkerRuntimeBackend {
       mode: "existing",
       busyTimeoutMs: DEFAULT_BUSY_TIMEOUT_MS,
     });
-    const maintenance = this.#options.maintenanceFactory?.() ?? new MaintenanceFence();
-    const executorId = randomUUID();
-    const now = new Date().toISOString();
     let lifecycleRuntime: LifecycleWorkerRuntime | null = null;
     let registrationBegan = false;
     try {
+      const maintenance = this.#options.maintenanceFactory?.() ?? new MaintenanceFence();
+      const executorId = randomUUID();
+      const now = new Date().toISOString();
       identityFromConnection(
         connection,
         { projectId: context.binding.projectId, vaultId: context.binding.vaultId },
@@ -564,6 +564,14 @@ export class ProjectStoreWorkerBackend implements WorkerRuntimeBackend {
         lifecycleRuntime,
         executorId,
       };
+      return {
+        projectId: context.binding.projectId,
+        vaultId: context.binding.vaultId,
+        storeId: context.binding.storeId,
+        bindingGeneration: context.binding.generation,
+        contextFingerprint: context.binding.contextFingerprint,
+        executorId,
+      };
     } catch (error) {
       if (registrationBegan) {
         try { connection.exec("ROLLBACK"); } catch { /* preserve the first open failure */ }
@@ -574,14 +582,6 @@ export class ProjectStoreWorkerBackend implements WorkerRuntimeBackend {
       try { connection.close(); } catch { /* preserve the first open failure */ }
       throw error;
     }
-    return {
-      projectId: context.binding.projectId,
-      vaultId: context.binding.vaultId,
-      storeId: context.binding.storeId,
-      bindingGeneration: context.binding.generation,
-      contextFingerprint: context.binding.contextFingerprint,
-      executorId,
-    };
   }
 
   private active(): ActiveStore {

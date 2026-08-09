@@ -353,8 +353,8 @@ function semanticSuccess(context: ProjectContext): LifecycleWorkerSuccessWire {
     resumedFromSessionId: null,
     latestCheckpointEventPosition: null,
     eventPosition: "1",
-    handleIssued: false,
-    resumeTokenIssued: false,
+    handleIssued: true,
+    resumeTokenIssued: true,
     contextPackUnavailable: true,
   };
   return {
@@ -790,6 +790,42 @@ describe("lifecycle executor", () => {
       error instanceof ProjectStoreWorkerError && error.code === "WORKER_TIMEOUT"
     ));
     assert.equal(timed.worker.posted.length, postsAfterPoison);
+  });
+
+  // Production mutation caught: complete and delete pending authorization for a swapped semantic result.
+  it("rejects swapped semantic result identity before adapter completion", async () => {
+    const h = await harness(true);
+    const prepared = await prepareRoot(
+      h,
+      "00000000-0000-4000-8000-000000000038",
+    );
+    const pendingExecution = h.executor.executeLifecycleMutation(prepared);
+    const response = semanticSuccess(h.context);
+    const workerResult = response.result as Readonly<Record<string, JsonValue>>;
+    const publicResult = workerResult.publicResult as Readonly<Record<string, JsonValue>>;
+    h.worker.succeed(lastLifecycle(h.worker), {
+      ...response,
+      result: {
+        ...workerResult,
+        publicResult: {
+          ...publicResult,
+          continuityKey: "executor-swapped-continuity",
+        },
+      },
+    });
+
+    await assert.rejects(pendingExecution, exactError("COMMAND_OUTCOME_UNKNOWN", {
+      commandId: prepared.command.commandId,
+      idempotencyKey: prepared.command.idempotencyKey,
+    }));
+    await turn();
+    assert.equal(h.worker.terminateCalls, 1);
+    assert.deepEqual(h.adapter!.completionIdentities, []);
+    assert.ok(await h.pending!.get(
+      PROJECT_ID,
+      prepared.command.commandId,
+      prepared.command.idempotencyKey,
+    ));
   });
 
   it("preserves bounded identity after uncertain lifecycle delivery", async () => {

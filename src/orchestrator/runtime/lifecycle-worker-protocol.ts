@@ -85,7 +85,12 @@ function strictDataRecord(
     if (descriptor === undefined || !descriptor.enumerable || !("value" in descriptor)) {
       invalid(field);
     }
-    result[key] = descriptor.value;
+    Object.defineProperty(result, key, {
+      value: descriptor.value,
+      enumerable: true,
+      writable: true,
+      configurable: true,
+    });
   }
   return result;
 }
@@ -128,7 +133,12 @@ function strictJsonSnapshot(value: unknown, field = "lifecycleWorkerProtocol"): 
       const record = strictDataRecord(current, undefined, currentField);
       const snapshot: Record<string, JsonValue> = {};
       for (const [key, item] of Object.entries(record)) {
-        snapshot[key] = copy(item, `${currentField}.${key}`);
+        Object.defineProperty(snapshot, key, {
+          value: copy(item, `${currentField}.${key}`),
+          enumerable: true,
+          writable: true,
+          configurable: true,
+        });
       }
       return Object.freeze(snapshot);
     } finally {
@@ -1384,19 +1394,9 @@ function decodeMaterializationResult(value: JsonValue): MaterializationResultWir
   return result as MaterializationResultWireV1;
 }
 
-function assertProjectResult(
-  result: SessionEndWorkflowClaimWireV1 | LifecycleOutboxClaimWireV1,
-  expectedProjectId: ProjectId | undefined,
-): void {
-  if (expectedProjectId !== undefined && result.projectId !== expectedProjectId) {
-    invalid("success.result.projectId");
-  }
-}
-
 function decodeFencedResult(
   value: JsonValue,
   requested: LifecycleFencedOperationWire,
-  expectedProjectId?: ProjectId,
 ): JsonValue {
   const operation = requested.operation;
   switch (operation) {
@@ -1407,7 +1407,6 @@ function decodeFencedResult(
       >;
       if (value === null) return null;
       const result = decodeWorkflowClaimResult(value);
-      assertProjectResult(result, expectedProjectId);
       if (result.ownerId !== input.ownerId) invalid("success.result.ownerId");
       return result;
     }
@@ -1418,7 +1417,6 @@ function decodeFencedResult(
       >;
       if (value === null) return null;
       const result = decodeWorkflowClaimResult(value);
-      assertProjectResult(result, expectedProjectId);
       if (result.workflowId !== input.workflowId) invalid("success.result.workflowId");
       if (result.workflowGeneration !== input.workflowGeneration) {
         invalid("success.result.workflowGeneration");
@@ -1434,7 +1432,6 @@ function decodeFencedResult(
         { readonly operation: "workflow-renew" }
       >;
       const result = decodeWorkflowClaimResult(value);
-      assertProjectResult(result, expectedProjectId);
       if (result.workflowId !== input.workflowId) invalid("success.result.workflowId");
       if (result.workflowGeneration !== input.workflowGeneration) {
         invalid("success.result.workflowGeneration");
@@ -1470,7 +1467,6 @@ function decodeFencedResult(
       >;
       if (value === null) return null;
       const result = decodeOutboxClaimResult(value);
-      assertProjectResult(result, expectedProjectId);
       if (result.ownerId !== input.ownerId) invalid("success.result.ownerId");
       return result;
     }
@@ -1481,7 +1477,6 @@ function decodeFencedResult(
       >;
       if (value === null) return null;
       const result = decodeOutboxClaimResult(value);
-      assertProjectResult(result, expectedProjectId);
       if (result.targetKey !== input.targetKey) invalid("success.result.targetKey");
       if (result.materializationRevision !== input.materializationRevision) {
         invalid("success.result.materializationRevision");
@@ -1497,7 +1492,6 @@ function decodeFencedResult(
         { readonly operation: "outbox-renew" }
       >;
       const result = decodeOutboxClaimResult(value);
-      assertProjectResult(result, expectedProjectId);
       if (result.targetKey !== input.targetKey) invalid("success.result.targetKey");
       if (result.materializationRevision !== input.materializationRevision) {
         invalid("success.result.materializationRevision");
@@ -1615,29 +1609,474 @@ function decodeWorkerAuthorityMaterial(value: JsonValue): Readonly<Record<string
   return material;
 }
 
+function assertSemanticResultValue(
+  actual: unknown,
+  expected: unknown,
+  field: string,
+): void {
+  if (actual !== expected) invalid(field);
+}
+
+function incrementDecimal(value: string, amount: bigint): string {
+  return (BigInt(value) + amount).toString();
+}
+
+function assertIssuedRootMaterial(result: RootSessionPublicResultV2): void {
+  assertSemanticResultValue(result.handleIssued, true, "success.result.handleIssued");
+  assertSemanticResultValue(
+    result.resumeTokenIssued,
+    true,
+    "success.result.resumeTokenIssued",
+  );
+}
+
+function assertRootResultCorrelation(
+  result: RootSessionPublicResultV2,
+  requested: LifecycleSemanticOperationWire,
+): void {
+  const command = requested.prepared.command;
+  assertSemanticResultValue(
+    result.project.projectId,
+    command.expectedProjectId,
+    "success.result.project.projectId",
+  );
+  assertSemanticResultValue(
+    result.project.vaultId,
+    command.expectedVaultId,
+    "success.result.project.vaultId",
+  );
+  assertSemanticResultValue(
+    result.project.workspaceId,
+    command.expectedWorkspaceId,
+    "success.result.project.workspaceId",
+  );
+  switch (command.commandType) {
+    case "root-start":
+      assertSemanticResultValue(
+        result.continuityKey,
+        command.continuityKey,
+        "success.result.continuityKey",
+      );
+      assertSemanticResultValue(
+        result.resumedFromSessionId,
+        null,
+        "success.result.resumedFromSessionId",
+      );
+      assertSemanticResultValue(result.ownerGeneration, "1", "success.result.ownerGeneration");
+      assertSemanticResultValue(result.state, "active", "success.result.state");
+      assertSemanticResultValue(
+        result.latestCheckpointEventPosition,
+        null,
+        "success.result.latestCheckpointEventPosition",
+      );
+      assertIssuedRootMaterial(result);
+      return;
+    case "root-resume": {
+      const selectedSessionId = requested.prepared.authorization.targetSessionId;
+      assertSemanticResultValue(
+        result.sessionId,
+        selectedSessionId,
+        "success.result.sessionId",
+      );
+      assertSemanticResultValue(
+        result.resumedFromSessionId,
+        selectedSessionId,
+        "success.result.resumedFromSessionId",
+      );
+      if (command.continuityKey !== null) {
+        assertSemanticResultValue(
+          result.continuityKey,
+          command.continuityKey,
+          "success.result.continuityKey",
+        );
+      }
+      assertSemanticResultValue(
+        result.ownerGeneration,
+        incrementDecimal(command.expectedOwnerGeneration, 1n),
+        "success.result.ownerGeneration",
+      );
+      assertSemanticResultValue(result.state, "active", "success.result.state");
+      assertIssuedRootMaterial(result);
+      return;
+    }
+    case "root-recovery":
+      assertSemanticResultValue(
+        result.sessionId,
+        command.sessionId,
+        "success.result.sessionId",
+      );
+      assertSemanticResultValue(
+        result.resumedFromSessionId,
+        null,
+        "success.result.resumedFromSessionId",
+      );
+      assertSemanticResultValue(
+        result.ownerGeneration,
+        incrementDecimal(command.expectedOwnerGeneration, 1n),
+        "success.result.ownerGeneration",
+      );
+      assertIssuedRootMaterial(result);
+      return;
+    case "root-suspend":
+      assertSemanticResultValue(
+        result.sessionId,
+        command.sessionId,
+        "success.result.sessionId",
+      );
+      assertSemanticResultValue(
+        result.resumedFromSessionId,
+        null,
+        "success.result.resumedFromSessionId",
+      );
+      assertSemanticResultValue(result.state, "suspended", "success.result.state");
+      if (result.latestCheckpointEventPosition === null) {
+        invalid("success.result.latestCheckpointEventPosition");
+      }
+      assertSemanticResultValue(
+        result.eventPosition,
+        incrementDecimal(result.latestCheckpointEventPosition, 2n),
+        "success.result.eventPosition",
+      );
+      assertIssuedRootMaterial(result);
+      return;
+    default:
+      return invalid("success.operation");
+  }
+}
+
+function assertAssignmentCorrelation(
+  result: ChildWorkflowResultV2,
+  expected: { readonly assignmentId: string; readonly summary: string; readonly scope: string },
+): void {
+  assertSemanticResultValue(
+    result.assignment?.assignmentId,
+    expected.assignmentId,
+    "success.result.assignment.assignmentId",
+  );
+  assertSemanticResultValue(
+    result.assignment?.summary,
+    expected.summary,
+    "success.result.assignment.summary",
+  );
+  assertSemanticResultValue(
+    result.assignment?.scope,
+    expected.scope,
+    "success.result.assignment.scope",
+  );
+}
+
+function assertChildResultCorrelation(
+  result: ChildWorkflowResultV2,
+  requested: LifecycleSemanticOperationWire,
+): void {
+  const command = requested.prepared.command;
+  switch (command.commandType) {
+    case "fork-child":
+      assertSemanticResultValue(
+        result.parentSessionId,
+        command.parentSessionId,
+        "success.result.parentSessionId",
+      );
+      assertAssignmentCorrelation(result, command.assignment);
+      assertSemanticResultValue(
+        result.directAccessEnabled,
+        command.directAccessRequested,
+        "success.result.directAccessEnabled",
+      );
+      assertSemanticResultValue(
+        result.assignmentRevision,
+        "1",
+        "success.result.assignmentRevision",
+      );
+      assertSemanticResultValue(result.state, "active", "success.result.state");
+      assertSemanticResultValue(
+        result.finalStreamVersion,
+        "1",
+        "success.result.finalStreamVersion",
+      );
+      return;
+    case "amend-child-assignment":
+      assertSemanticResultValue(
+        result.parentSessionId,
+        command.parentSessionId,
+        "success.result.parentSessionId",
+      );
+      assertSemanticResultValue(
+        result.childSessionId,
+        command.childSessionId,
+        "success.result.childSessionId",
+      );
+      assertAssignmentCorrelation(result, command.assignment);
+      assertSemanticResultValue(
+        result.assignmentRevision,
+        incrementDecimal(command.expectedAssignmentRevision, 1n),
+        "success.result.assignmentRevision",
+      );
+      assertSemanticResultValue(
+        result.finalStreamVersion,
+        incrementDecimal(command.expectedStreamVersion, 1n),
+        "success.result.finalStreamVersion",
+      );
+      return;
+    case "record-child-report":
+      assertSemanticResultValue(
+        result.parentSessionId,
+        command.parentSessionId,
+        "success.result.parentSessionId",
+      );
+      assertSemanticResultValue(
+        result.childSessionId,
+        command.childSessionId,
+        "success.result.childSessionId",
+      );
+      assertSemanticResultValue(
+        result.finalStreamVersion,
+        incrementDecimal(command.expectedStreamVersion, 1n),
+        "success.result.finalStreamVersion",
+      );
+      assertSemanticResultValue(
+        result.reportItemIds?.length,
+        command.report.findings.length
+          + command.report.proposedDecisions.length
+          + command.report.filesObservedOrChanged.length
+          + command.report.verificationPerformed.length
+          + command.report.openFollowUps.length
+          + command.report.blockers.length,
+        "success.result.reportItemIds",
+      );
+      return;
+    case "disposition-child-report":
+      assertSemanticResultValue(
+        result.parentSessionId,
+        command.parentSessionId,
+        "success.result.parentSessionId",
+      );
+      assertSemanticResultValue(
+        result.childSessionId,
+        command.childSessionId,
+        "success.result.childSessionId",
+      );
+      assertSemanticResultValue(
+        result.disposition?.kind,
+        command.disposition.kind,
+        "success.result.disposition.kind",
+      );
+      assertSemanticResultValue(
+        result.disposition?.reportId,
+        command.disposition.reportId,
+        "success.result.disposition.reportId",
+      );
+      assertSemanticResultValue(
+        result.finalStreamVersion,
+        incrementDecimal(command.expectedStreamVersion, 1n),
+        "success.result.finalStreamVersion",
+      );
+      return;
+    case "propose-child-completion":
+      assertSemanticResultValue(
+        result.childSessionId,
+        command.childSessionId,
+        "success.result.childSessionId",
+      );
+      assertSemanticResultValue(
+        result.reportId,
+        command.reportId,
+        "success.result.reportId",
+      );
+      assertSemanticResultValue(
+        result.finalStreamVersion,
+        incrementDecimal(command.expectedStreamVersion, 1n),
+        "success.result.finalStreamVersion",
+      );
+      assertSemanticResultValue(
+        result.state,
+        "completion-proposed",
+        "success.result.state",
+      );
+      return;
+    case "complete-child-session":
+      assertSemanticResultValue(
+        result.parentSessionId,
+        command.parentSessionId,
+        "success.result.parentSessionId",
+      );
+      assertSemanticResultValue(
+        result.childSessionId,
+        command.childSessionId,
+        "success.result.childSessionId",
+      );
+      assertSemanticResultValue(
+        result.reportId,
+        command.reportId,
+        "success.result.reportId",
+      );
+      assertSemanticResultValue(
+        result.finalStreamVersion,
+        incrementDecimal(command.expectedStreamVersion, 1n),
+        "success.result.finalStreamVersion",
+      );
+      assertSemanticResultValue(result.state, "completed", "success.result.state");
+      return;
+    case "suspend-child-session":
+      assertSemanticResultValue(
+        result.parentSessionId,
+        command.parentSessionId,
+        "success.result.parentSessionId",
+      );
+      assertSemanticResultValue(
+        result.childSessionId,
+        command.childSessionId,
+        "success.result.childSessionId",
+      );
+      assertSemanticResultValue(
+        result.finalStreamVersion,
+        incrementDecimal(command.expectedStreamVersion, 2n),
+        "success.result.finalStreamVersion",
+      );
+      assertSemanticResultValue(result.state, "transferred", "success.result.state");
+      return;
+    case "claim-child-transfer":
+      assertSemanticResultValue(
+        result.parentSessionId,
+        command.rootSessionId,
+        "success.result.parentSessionId",
+      );
+      assertSemanticResultValue(
+        result.transferTicketId,
+        command.transferTicketId,
+        "success.result.transferTicketId",
+      );
+      assertSemanticResultValue(
+        result.assignmentRevision,
+        "1",
+        "success.result.assignmentRevision",
+      );
+      assertSemanticResultValue(
+        result.directAccessEnabled,
+        false,
+        "success.result.directAccessEnabled",
+      );
+      assertSemanticResultValue(result.state, "active", "success.result.state");
+      assertSemanticResultValue(
+        result.finalStreamVersion,
+        "2",
+        "success.result.finalStreamVersion",
+      );
+      return;
+    default:
+      return invalid("success.operation");
+  }
+}
+
 function decodeSemanticPublicResult(
   value: JsonValue,
   requested: LifecycleSemanticOperationWire,
 ): JsonValue {
   const operation = requested.operation;
   if (["root-start", "root-resume", "root-recovery", "root-suspend"].includes(operation)) {
-    return decodeRootResult(value) as unknown as JsonValue;
+    const result = decodeRootResult(value);
+    assertRootResultCorrelation(result, requested);
+    return result as unknown as JsonValue;
   }
   if ([
     "fork-child", "amend-child-assignment", "record-child-report",
     "disposition-child-report", "propose-child-completion", "complete-child-session",
     "suspend-child-session", "claim-child-transfer",
-  ].includes(operation)) return decodeChildResult(value, operation);
+  ].includes(operation)) {
+    const result = decodeChildResult(value, operation);
+    assertChildResultCorrelation(result, requested);
+    return result;
+  }
   if (operation === "record-checkpoint") {
     const checkpoint = decodeCheckpointRecordedResult(value);
-    if (checkpoint.checkpointVersion !== lifecycleNestedContractVersion(requested)) {
-      invalid("success.result.checkpointVersion");
+    const command = requested.prepared.command;
+    if (command.commandType !== "record-checkpoint") invalid("success.operation");
+    if (
+      checkpoint.checkpointVersion !== lifecycleNestedContractVersion(requested)
+      || checkpoint.checkpointVersion !== command.draft.checkpointVersion
+    ) invalid("success.result.checkpointVersion");
+    assertSemanticResultValue(
+      checkpoint.sessionId,
+      command.sessionId,
+      "success.result.sessionId",
+    );
+    if (command.expectedBaseEventPosition !== null) {
+      assertSemanticResultValue(
+        checkpoint.baseEventPosition,
+        command.expectedBaseEventPosition,
+        "success.result.baseEventPosition",
+      );
     }
+    assertSemanticResultValue(
+      checkpoint.checkpointEventPosition,
+      incrementDecimal(checkpoint.baseEventPosition, 1n),
+      "success.result.checkpointEventPosition",
+    );
+    assertSemanticResultValue(
+      checkpoint.finalStreamVersion,
+      incrementDecimal(command.expectedStreamVersion, 1n),
+      "success.result.finalStreamVersion",
+    );
     return checkpoint;
   }
-  if (operation === "record-evidence-batch") return decodeEvidenceCoverageRecordedResultV2(value);
+  if (operation === "record-evidence-batch") {
+    const result = decodeEvidenceCoverageRecordedResultV2(value);
+    const command = requested.prepared.command;
+    if (command.commandType !== "record-evidence-batch") invalid("success.operation");
+    assertSemanticResultValue(result.sessionId, command.sessionId, "success.result.sessionId");
+    assertSemanticResultValue(
+      result.adapterSessionId,
+      command.adapterSessionId,
+      "success.result.adapterSessionId",
+    );
+    assertSemanticResultValue(result.batchId, command.batchId, "success.result.batchId");
+    assertSemanticResultValue(
+      result.batchFirstOrdinal,
+      command.firstOrdinal,
+      "success.result.batchFirstOrdinal",
+    );
+    assertSemanticResultValue(
+      result.batchLastOrdinal,
+      command.lastOrdinal,
+      "success.result.batchLastOrdinal",
+    );
+    return result;
+  }
   if (["request-session-end", "amend-session-end", "cancel-session-end", "abandon-session"].includes(operation)) {
-    return decodeSessionEndStatus(value);
+    const result = decodeSessionEndStatus(value);
+    const command = requested.prepared.command;
+    switch (command.commandType) {
+      case "request-session-end":
+        assertSemanticResultValue(
+          result.sessionId,
+          command.request.sessionId,
+          "success.result.sessionId",
+        );
+        break;
+      case "amend-session-end":
+      case "cancel-session-end":
+        assertSemanticResultValue(
+          result.sessionId,
+          command.sessionId,
+          "success.result.sessionId",
+        );
+        assertSemanticResultValue(
+          result.workflowId,
+          command.workflowId,
+          "success.result.workflowId",
+        );
+        break;
+      case "abandon-session":
+        assertSemanticResultValue(
+          result.sessionId,
+          command.sessionId,
+          "success.result.sessionId",
+        );
+        break;
+      default:
+        return invalid("success.operation");
+    }
+    return result;
   }
   return invalid("success.operation");
 }
@@ -1680,7 +2119,6 @@ function decodeSemanticWorkerResult(
 function decodeSuccessResult(
   value: JsonValue,
   requested: LifecycleWorkerOperationWire,
-  expectedProjectId?: ProjectId,
 ): JsonValue {
   if (requested.kind === "semantic") {
     return decodeSemanticWorkerResult(value, requested);
@@ -1696,13 +2134,12 @@ function decodeSuccessResult(
   if (requested.kind === "query") {
     return decodeQueryResult(value, requested) as unknown as JsonValue;
   }
-  return decodeFencedResult(value, requested, expectedProjectId);
+  return decodeFencedResult(value, requested);
 }
 
 export function decodeLifecycleWorkerSuccessForOperation(
   value: unknown,
   requested: LifecycleWorkerOperationWire,
-  expectedProjectId?: ProjectId,
 ): LifecycleWorkerSuccessWire {
   const success = exactSnapshot(
     value,
@@ -1720,7 +2157,7 @@ export function decodeLifecycleWorkerSuccessForOperation(
   if (success.nestedContractVersion !== expectedVersion) {
     invalid("lifecycleSuccess.nestedContractVersion");
   }
-  const result = decodeSuccessResult(success.result, requested, expectedProjectId);
+  const result = decodeSuccessResult(success.result, requested);
   return Object.freeze({
     operation: requested.operation,
     nestedContractVersion: expectedVersion,
