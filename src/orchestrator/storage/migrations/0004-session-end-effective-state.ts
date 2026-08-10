@@ -1003,14 +1003,13 @@ BEGIN
           AND json_extract(
             NEW.lifecycle_intent_json, '$.intent.command.expectedBranchRef'
           ) IS NEW.branch_ref
-          AND json_type(
-            NEW.lifecycle_intent_json,
-            '$.intent.command.expectedStreamVersion'
-          ) IS 'text'
-          AND json_extract(
-            NEW.lifecycle_intent_json,
-            '$.intent.command.expectedStreamVersion'
-          ) IS CAST(NEW.stream_version - 1 AS TEXT)
+          AND EXISTS (
+            SELECT 1
+            FROM streams AS stream_head
+            WHERE stream_head.project_id = NEW.project_id
+              AND stream_head.stream_id = NEW.stream_id
+              AND stream_head.current_version IS NEW.stream_version - 1
+          )
           AND json_extract(
             NEW.lifecycle_intent_json, '$.intent.binding.projectId'
           ) = NEW.project_id

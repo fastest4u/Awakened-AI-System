@@ -5,7 +5,9 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, it } from "node:test";
 import type { ProjectContext } from "../src/orchestrator/identity/contracts.js";
+import type { LifecycleSemanticCommandDraft } from "../src/orchestrator/lifecycle/contracts/commands.js";
 import { decodeLifecycleEvent } from "../src/orchestrator/lifecycle/contracts/events.js";
+import { buildLifecycleIntentWitness } from "../src/orchestrator/lifecycle/lifecycle-intent-witness.js";
 import { canonicalJson } from "../src/orchestrator/serialization/canonical-json.js";
 import { MigrationRunner } from "../src/orchestrator/storage/migration-runner.js";
 import { eventCoreMigration } from "../src/orchestrator/storage/migrations/0001-event-core.js";
@@ -781,6 +783,35 @@ function v3ReopenRequestFixture(requestVersion: 1 | 2): {
     ? "33333333-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
     : "33333333-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
   const effectiveState = sessionEndEffectiveStateFixture({ requestVersion });
+  const lifecycleIntent = buildLifecycleIntentWitness({
+    commandType: "request-session-end",
+    commandId,
+    idempotencyKey: `raw/${commandId}`,
+    agentId: "agent",
+    expectedProjectId: PROJECT_ID,
+    expectedVaultId: VAULT_ID,
+    expectedWorkspaceId: H64,
+    expectedBranchRef: null,
+    request: effectiveState.request,
+  } as unknown as LifecycleSemanticCommandDraft, {
+    authorizationKind: "protected",
+    authorizationSessionId: ROOT_ID,
+    targetSessionId: ROOT_ID,
+    projectId: PROJECT_ID,
+    vaultId: VAULT_ID,
+    storeId: STORE_ID,
+    workspaceId: H64,
+    clientNamespace: "client",
+    capabilityKind: "root-session-handle",
+    capabilityGeneration: "1",
+    presentingActorRole: "primary",
+    presentingClientInstanceId: "client",
+    targetActorRole: "primary",
+    targetClientInstanceId: "client",
+    internalWorkflowId: null,
+    internalWorkflowGeneration: null,
+    internalPlannedWorkId: null,
+  }).witness;
   return {
     commandId,
     payload: {
@@ -789,16 +820,7 @@ function v3ReopenRequestFixture(requestVersion: 1 | 2): {
       previousState: "active",
       effectiveState,
     },
-    lifecycleIntent: protectedLifecycleIntent({
-      commandType: "request-session-end",
-      commandId,
-      idempotencyKey: `raw/${commandId}`,
-      expectedProjectId: PROJECT_ID,
-      expectedVaultId: VAULT_ID,
-      expectedWorkspaceId: H64,
-      expectedStreamVersion: "2",
-      request: effectiveState.request,
-    }),
+    lifecycleIntent: lifecycleIntent as unknown as Readonly<Record<string, unknown>>,
   };
 }
 
@@ -809,14 +831,16 @@ function appendV3ReopenRequest(
     readonly payload?: unknown;
     readonly lifecycleIntent?: unknown;
     readonly omitLifecycleIntent?: boolean;
+    readonly streamHead?: number;
   } = {},
 ): string {
   const fixture = v3ReopenRequestFixture(requestVersion);
   connection.prepare(`
     UPDATE streams
-    SET current_version = 3, updated_at = $updatedAt
+    SET current_version = $currentVersion, updated_at = $updatedAt
     WHERE project_id = $projectId AND stream_id = $streamId
   `).run({
+    $currentVersion: overrides.streamHead ?? 2,
     $updatedAt: NOW,
     $projectId: PROJECT_ID,
     $streamId: `session/${ROOT_ID}`,
@@ -834,6 +858,15 @@ function appendV3ReopenRequest(
       ? {}
       : { lifecycleIntent: overrides.lifecycleIntent ?? fixture.lifecycleIntent }),
   }));
+  connection.prepare(`
+    UPDATE streams
+    SET current_version = 3, updated_at = $updatedAt
+    WHERE project_id = $projectId AND stream_id = $streamId
+  `).run({
+    $updatedAt: NOW,
+    $projectId: PROJECT_ID,
+    $streamId: `session/${ROOT_ID}`,
+  });
   return fixture.commandId;
 }
 
@@ -1884,8 +1917,7 @@ describe("session-end effective-state migration", () => {
     }
   });
 
-  it("binds V3 request intent to the prior stream version", () => {
-    const fixture = v3ReopenRequestFixture(2);
+  it("admits a production-builder-valid V3 RequestSessionEnd witness", () => {
     const valid = schema4Connection();
     seedStrictLegacyCancelledHistory(valid);
     appendV3ReopenRequest(valid, 2);
@@ -1895,15 +1927,23 @@ describe("session-end effective-state migration", () => {
       `).get()?.count,
       1n,
     );
+    assert.equal(
+      valid.prepare(`
+        SELECT current_version AS currentVersion FROM streams
+        WHERE project_id = $projectId AND stream_id = $streamId
+      `).get({
+        $projectId: PROJECT_ID,
+        $streamId: `session/${ROOT_ID}`,
+      })?.currentVersion,
+      3n,
+    );
+  });
 
-    const lifecycleIntent = structuredClone(fixture.lifecycleIntent) as {
-      intent: { command: Record<string, unknown> };
-    };
-    lifecycleIntent.intent.command.expectedStreamVersion = "1";
+  it("rejects V3 RequestSessionEnd when the durable stream head is not its predecessor", () => {
     const hostile = schema4Connection();
     seedStrictLegacyCancelledHistory(hostile);
     assert.throws(
-      () => appendV3ReopenRequest(hostile, 2, { lifecycleIntent }),
+      () => appendV3ReopenRequest(hostile, 2, { streamHead: 1 }),
       /SESSION_END_EVENT_V3_INVALID/,
     );
     assert.equal(
@@ -1911,6 +1951,16 @@ describe("session-end effective-state migration", () => {
         SELECT count(*) AS count FROM events WHERE global_position = 3
       `).get()?.count,
       0n,
+    );
+    assert.equal(
+      hostile.prepare(`
+        SELECT current_version AS currentVersion FROM streams
+        WHERE project_id = $projectId AND stream_id = $streamId
+      `).get({
+        $projectId: PROJECT_ID,
+        $streamId: `session/${ROOT_ID}`,
+      })?.currentVersion,
+      1n,
     );
   });
 
@@ -2273,7 +2323,7 @@ describe("session-end effective-state migration", () => {
       seedStrictLegacyCancelledHistory(connection);
       connection.prepare(`
         UPDATE streams
-        SET current_version = 3, updated_at = $updatedAt
+        SET current_version = 2, updated_at = $updatedAt
         WHERE project_id = $projectId AND stream_id = $streamId
       `).run({
         $updatedAt: NOW,
@@ -2293,6 +2343,15 @@ describe("session-end effective-state migration", () => {
           lifecycleIntent: requestFixture.lifecycleIntent,
         }),
         payload_json: payloadJson,
+      });
+      connection.prepare(`
+        UPDATE streams
+        SET current_version = 3, updated_at = $updatedAt
+        WHERE project_id = $projectId AND stream_id = $streamId
+      `).run({
+        $updatedAt: NOW,
+        $projectId: PROJECT_ID,
+        $streamId: `session/${ROOT_ID}`,
       });
     };
 
