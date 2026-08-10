@@ -334,6 +334,16 @@ export class BoundSessionEndRepository {
     return readPersistedValidationAttemptPlansV1(this.#connection, projectId, workflowId);
   }
 
+  hydrateSessionEndEffectiveStateV1(input: {
+    readonly projectId: string;
+    readonly workflowId: string;
+    readonly workflowGeneration: number;
+    readonly sessionId: string;
+    readonly eventPosition: bigint;
+  }): HydratedSessionEndEffectiveStateV1 {
+    return hydrateSessionEndEffectiveStateV1(this.#connection, input);
+  }
+
   writePersistedValidationAttemptPlansV1(input: {
     readonly projectId: string;
     readonly workflowId: string;
