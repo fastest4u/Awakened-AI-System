@@ -1,4 +1,5 @@
 import { LifecycleError } from "../lifecycle/errors.js";
+import { decodeLifecycleIntentWitness } from "../lifecycle/lifecycle-intent-witness.js";
 import {
   decodeSessionEndEffectiveStateV1,
   type SessionEndEffectiveStateV1,
@@ -116,8 +117,8 @@ export interface HydratedSessionEndEffectiveStateV1 {
   readonly effectiveState: SessionEndEffectiveStateV1;
 }
 
-/** Hydrates a Version-3 snapshot only from its immutable triggering event.
- * The workflow row is used only as a cross-check, never as a snapshot source. */
+/** Hydrates a Version-3 snapshot only from the immutable event selected by the
+ * immutable generation fold. The mutable workflow row is identity-only. */
 export function hydrateSessionEndEffectiveStateV1(
   connection: SqliteConnection,
   input: {
@@ -134,9 +135,22 @@ export function hydrateSessionEndEffectiveStateV1(
       || !Number.isSafeInteger(input.workflowGeneration) || input.workflowGeneration <= 0
       || input.eventPosition <= 0n
     ) integrity();
+    const fold = oneOrNone(connection.prepare(`
+      SELECT fingerprint_schema_version, session_id, trigger_event_position,
+             effective_state_source_event_position, effective_state_version,
+             effective_state_hash
+      FROM lifecycle_workflow_generation_folds
+      WHERE project_id = $projectId AND workflow_id = $workflowId
+        AND workflow_generation = $workflowGeneration
+      LIMIT 2
+    `).all({
+      $projectId: input.projectId,
+      $workflowId: input.workflowId,
+      $workflowGeneration: BigInt(input.workflowGeneration),
+    }));
     const event = oneOrNone(connection.prepare(`
       SELECT event_type, event_schema_version, payload_json, event_hash,
-             session_id, command_id
+             session_id, command_id, command_event_index, lifecycle_intent_json
       FROM events
       WHERE project_id = $projectId AND global_position = $eventPosition
       LIMIT 2
@@ -147,13 +161,17 @@ export function hydrateSessionEndEffectiveStateV1(
       WHERE project_id = $projectId AND workflow_id = $workflowId
       LIMIT 2
     `).all({ $projectId: input.projectId, $workflowId: input.workflowId }));
-    if (event === null || workflow === null
+    if (event === null || workflow === null || fold === null
       || rowString(event, "session_id") !== input.sessionId
+      || rowString(fold, "session_id") !== input.sessionId
       || rowString(workflow, "session_id") !== input.sessionId
-      || rowIntegerLike(workflow["generation"]) !== input.workflowGeneration
-      || rowInt64(workflow["triggering_event_position"]) !== input.eventPosition
+      || rowIntegerLike(fold["fingerprint_schema_version"]) !== 2
+      || rowIntegerLike(fold["effective_state_version"]) !== 1
+      || rowInt64(fold["effective_state_source_event_position"]) !== input.eventPosition
+      || rowIntegerLike(workflow["generation"]) < input.workflowGeneration
       || rowString(workflow, "workflow_id") !== input.workflowId
       || rowIntegerLike(event["event_schema_version"]) !== 3
+      || rowIntegerLike(event["command_event_index"]) !== 0
       || (rowString(event, "event_type") !== "SessionEndRequested"
         && rowString(event, "event_type") !== "SessionEndAmended")
     ) integrity();
@@ -162,10 +180,25 @@ export function hydrateSessionEndEffectiveStateV1(
     if (canonicalJson(payload) !== rowString(event, "payload_json")
       || typeof payload !== "object" || payload === null || Array.isArray(payload)) integrity();
     const record = payload as Record<string, unknown>;
-    if (record.workflowId !== input.workflowId || record.workflowGeneration !== input.workflowGeneration) integrity();
+    if (record.workflowId !== input.workflowId) integrity();
     const effectiveState = decodeSessionEndEffectiveStateV1(record.effectiveState);
     const eventHash = rowString(event, "event_hash");
-    if (!/^[0-9a-f]{64}$/u.test(eventHash)) integrity();
+    if (
+      !/^[0-9a-f]{64}$/u.test(eventHash)
+      || effectiveState.effectiveStateHash !== rowString(fold, "effective_state_hash")
+    ) integrity();
+    const source = rowString(event, "lifecycle_intent_json");
+    const witness = decodeLifecycleIntentWitness(source);
+    const command = witness.intent.command as Readonly<Record<string, unknown>>;
+    if (
+      command.commandId !== rowString(event, "command_id")
+      || (rowString(event, "event_type") === "SessionEndRequested"
+        && canonicalJson(command.request) !== canonicalJson(effectiveState.request))
+      || (rowString(event, "event_type") === "SessionEndAmended"
+        && (command.commandType !== "amend-session-end"
+          || command.sessionId !== input.sessionId
+          || command.workflowId !== input.workflowId))
+    ) integrity();
     return Object.freeze({
       eventPosition: input.eventPosition,
       eventHash,

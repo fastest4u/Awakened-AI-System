@@ -175,6 +175,94 @@ it("computes exact V2 workflow-generation fingerprint predecessor chains", () =>
   );
 });
 
+it("rejects a legacy workflow event after a Version-2 predecessor", () => {
+  const previous = Object.freeze({
+    projectId: PROJECT_ID,
+    workflowId: WORKFLOW_ID,
+    workflowGeneration: 1,
+    sessionId: ROOT_SESSION_ID,
+    triggerEventPosition: 1n,
+    rootCommandId: lifecycleUuid(91_001),
+    evidenceWindowState: "sealed" as const,
+    replacementCheckpointVersion: 1 as const,
+    effectiveCheckpointVersion: 1 as const,
+    effectiveDraftSourceEventPosition: 1n,
+    fingerprintSchemaVersion: 2 as const,
+    effectiveStateSourceEventPosition: 1n,
+    effectiveStateVersion: 1 as const,
+    effectiveStateHash: "a".repeat(64),
+    previousFingerprint: null,
+    fingerprint: "b".repeat(64),
+  });
+  const commandId = lifecycleUuid(91_002);
+  const legacyCancellation = rootStored({
+    position: 2n,
+    streamVersion: 2n,
+    eventType: "SessionEndCancelled",
+    eventSchemaVersion: 1,
+    commandId,
+    payload: {
+      workflowId: WORKFLOW_ID,
+      workflowGeneration: 2,
+      restoredState: "active",
+      preTransitionCheckpointId: lifecycleUuid(91_003),
+    },
+  });
+  assert.throws(() => foldWorkflowGenerationProjection(
+    previous,
+    legacyCancellation,
+    intent({
+      commandType: "cancel-session-end",
+      commandId,
+      idempotencyKey: "projection/no-downgrade",
+      agentId: "agent-primary",
+      expectedProjectId: PROJECT_ID,
+      expectedVaultId: VAULT_ID,
+      expectedWorkspaceId: WORKSPACE_ID,
+      expectedBranchRef: null,
+      sessionId: ROOT_SESSION_ID,
+      workflowId: WORKFLOW_ID,
+      expectedStreamVersion: "1",
+      preTransitionCheckpointId: lifecycleUuid(91_003),
+    }),
+    "live-schema-3",
+  ));
+});
+
+it("binds every V2 fingerprint preimage field across predecessor forms", () => {
+  const fingerprint = lifecycleProjectionFolds.workflowFingerprintV2;
+  const base = {
+    projectId: "11111111-1111-4111-8111-111111111111", workflowId: "22222222-2222-4222-8222-222222222222",
+    workflowGeneration: 2, sessionId: "33333333-3333-4333-8333-333333333333", triggerEventPosition: 10n,
+    triggerEventHash: "a".repeat(64), rootCommandId: "44444444-4444-4444-8444-444444444444",
+    evidenceWindowState: "sealed" as const, replacementCheckpointVersion: null,
+    effectiveCheckpointVersion: 2 as const, effectiveDraftSourceEventPosition: 9n,
+    effectiveStateSourceEventPosition: 9n, effectiveStateVersion: 1 as const, effectiveStateHash: "b".repeat(64),
+  };
+  const forms = [
+    { ...base, previousFingerprintSchemaVersion: null, previousFingerprint: null },
+    { ...base, previousFingerprintSchemaVersion: 1 as const, previousFingerprint: "c".repeat(64) },
+    { ...base, previousFingerprintSchemaVersion: 2 as const, previousFingerprint: "d".repeat(64) },
+  ];
+  for (const form of forms) {
+    const expected = fingerprint(form);
+    for (const mutation of [
+      { projectId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" }, { workflowId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb" },
+      { workflowGeneration: 3 }, { sessionId: "cccccccc-cccc-4ccc-8ccc-cccccccccccc" },
+      { triggerEventHash: "e".repeat(64) }, { rootCommandId: "dddddddd-dddd-4ddd-8ddd-dddddddddddd" },
+      { evidenceWindowState: "open" as const }, { effectiveCheckpointVersion: 1 as const },
+      { effectiveDraftSourceEventPosition: 8n }, { effectiveStateSourceEventPosition: 8n }, { effectiveStateHash: "f".repeat(64) },
+    ]) assert.notEqual(fingerprint({ ...form, ...mutation }), expected);
+    assert.throws(() => fingerprint({ ...form, effectiveStateVersion: null }));
+    if (form.previousFingerprint !== null) {
+      assert.notEqual(fingerprint({ ...form, previousFingerprint: "0".repeat(64) }), expected);
+      assert.notEqual(fingerprint({ ...form, previousFingerprintSchemaVersion: form.previousFingerprintSchemaVersion === 1 ? 2 : 1 }), expected);
+    } else {
+      assert.throws(() => fingerprint({ ...form, previousFingerprintSchemaVersion: 1 }));
+    }
+  }
+});
+
 function rootStored(input: {
   readonly position: bigint;
   readonly streamVersion: bigint;
@@ -511,6 +599,33 @@ describe("authenticated lifecycle projection folds", () => {
     assert.equal(cursor.visits, 0);
     cursor.close();
     assert.equal(rows.returned(), 1);
+  });
+
+  it("hydrates schema-4 Version-2 workflow fold metadata without falling back to Version 1", () => {
+    const connection = singleReusableRowConnection({
+      project_id: PROJECT_ID,
+      workflow_id: WORKFLOW_ID,
+      workflow_generation: 2n,
+      session_id: ROOT_SESSION_ID,
+      trigger_event_position: 8n,
+      root_command_id: lifecycleUuid(82_100),
+      evidence_window_state: "sealed",
+      replacement_checkpoint_version: null,
+      effective_checkpoint_version: 2n,
+      effective_draft_source_event_position: 7n,
+      fingerprint_schema_version: 2n,
+      effective_state_source_event_position: 7n,
+      effective_state_version: 1n,
+      effective_state_hash: "a".repeat(64),
+      previous_fingerprint: "b".repeat(64),
+      fingerprint: "c".repeat(64),
+    });
+    const cursor = openWorkflowGenerationFoldCursor(connection.connection, PROJECT_ID);
+    const row = cursor.advance();
+    assert.equal(row.fingerprintSchemaVersion, 2);
+    assert.equal(row.effectiveStateSourceEventPosition, 7n);
+    assert.equal(row.effectiveStateVersion, 1);
+    assert.equal(row.effectiveStateHash, "a".repeat(64));
   });
 
   it("shares the asymmetric child projection classifier with the writer and replay", () => {

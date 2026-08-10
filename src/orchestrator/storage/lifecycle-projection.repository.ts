@@ -480,7 +480,9 @@ const WORKFLOW_COLUMNS = `
   project_id, workflow_id, workflow_generation, session_id,
   trigger_event_position, root_command_id, evidence_window_state,
   replacement_checkpoint_version, effective_checkpoint_version,
-  effective_draft_source_event_position, previous_fingerprint, fingerprint
+  effective_draft_source_event_position, fingerprint_schema_version,
+  effective_state_source_event_position, effective_state_version,
+  effective_state_hash, previous_fingerprint, fingerprint
 `;
 
 function storedEventFromRow(row: SqliteRow): StoredEvent {
@@ -897,6 +899,7 @@ implements LifecycleProjectionWriter {
       || (predecessor !== null && (
         predecessor.sessionId !== projection.sessionId
         || predecessor.triggerEventPosition >= projection.triggerEventPosition
+        || projection.previousFingerprint !== predecessor.fingerprint
       ))
       || workflowFingerprintV2({
         ...workflowWithoutFingerprint(projection),

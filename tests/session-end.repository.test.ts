@@ -1,5 +1,53 @@
 import { strict as assert } from "node:assert";
+import { DatabaseSync } from "node:sqlite";
 import { it } from "node:test";
+import {
+  BoundSessionEndRepository,
+  readPersistedValidationAttemptPlansV1,
+  writePersistedValidationAttemptPlansV1,
+} from "../src/orchestrator/storage/session-end.repository.js";
+import type {
+  SqliteConnection,
+  SqliteParams,
+  SqliteRow,
+  SqliteRunResult,
+  SqliteStatement,
+} from "../src/orchestrator/storage/sqlite-driver.js";
+
+class NativeStatement implements SqliteStatement {
+  constructor(private readonly statement: import("node:sqlite").StatementSync) {
+    statement.setReadBigInts(true);
+  }
+  run(params?: SqliteParams): SqliteRunResult {
+    const result = params === undefined ? this.statement.run() : this.statement.run(params);
+    return { changes: result.changes as bigint, lastInsertRowid: result.lastInsertRowid as bigint };
+  }
+  get(params?: SqliteParams): SqliteRow | undefined { return (params === undefined ? this.statement.get() : this.statement.get(params)) as SqliteRow | undefined; }
+  all(params?: SqliteParams): SqliteRow[] { return (params === undefined ? this.statement.all() : this.statement.all(params)) as SqliteRow[]; }
+  iterate(params?: SqliteParams): IterableIterator<SqliteRow> { return (params === undefined ? this.statement.iterate() : this.statement.iterate(params)) as IterableIterator<SqliteRow>; }
+}
+
+class NativeConnection implements SqliteConnection {
+  readonly database = new DatabaseSync(":memory:");
+  exec(sql: string): void { this.database.exec(sql); }
+  prepare(sql: string): SqliteStatement { return new NativeStatement(this.database.prepare(sql)); }
+  close(): void { this.database.close(); }
+}
+
+function planConnection(): NativeConnection {
+  const connection = new NativeConnection();
+  connection.exec(`CREATE TABLE workflow_instances (
+    project_id TEXT NOT NULL, workflow_id TEXT NOT NULL, session_id TEXT NOT NULL,
+    generation INTEGER NOT NULL, validation_attempt_plan_generation INTEGER,
+    validation_attempt_plans_json TEXT, PRIMARY KEY(project_id, workflow_id)
+  ) STRICT;
+  INSERT INTO workflow_instances VALUES (
+    '11111111-1111-4111-8111-111111111111',
+    '22222222-2222-4222-8222-222222222222',
+    '33333333-3333-4333-8333-333333333333', 1, NULL, NULL
+  );`);
+  return connection;
+}
 
 const moduleUrl = new URL(
   "../src/orchestrator/storage/session-end.repository.js",
@@ -48,4 +96,22 @@ it("strictly decodes the six-key persisted validation plan and rejects ordering 
     Reflect.apply(decode as Function, undefined, [planAtCanonicalByteLength(262_144)]),
     planAtCanonicalByteLength(262_144),
   );
+});
+
+it("stores six-key plans once through connection and bound facades", () => {
+  const connection = planConnection();
+  const input = {
+    projectId: "11111111-1111-4111-8111-111111111111",
+    workflowId: "22222222-2222-4222-8222-222222222222",
+    workflowGeneration: 1,
+    plans: validPlans(),
+  };
+  writePersistedValidationAttemptPlansV1(connection, input);
+  assert.deepEqual(readPersistedValidationAttemptPlansV1(connection, input.projectId, input.workflowId), {
+    workflowGeneration: 1,
+    plans: validPlans(),
+  });
+  assert.throws(() => new BoundSessionEndRepository(connection)
+    .writePersistedValidationAttemptPlansV1(input));
+  connection.close();
 });
