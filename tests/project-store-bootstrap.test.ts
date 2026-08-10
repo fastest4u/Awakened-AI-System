@@ -36,16 +36,71 @@ import {
   type ProjectStoreBootstrapDependencies,
 } from "../src/orchestrator/storage/project-store-bootstrap.service.js";
 import { NodeSqliteDriver } from "../src/orchestrator/storage/node-sqlite-driver.js";
+import {
+  MigrationRunner,
+  type MigrationApplyMode,
+} from "../src/orchestrator/storage/migration-runner.js";
+import type { Migration } from "../src/orchestrator/storage/migration.js";
 import { expectedSchemaFingerprint } from "../src/orchestrator/storage/schema-fingerprint.js";
 import { eventCoreMigration } from "../src/orchestrator/storage/migrations/0001-event-core.js";
 import {
   CURRENT_PROJECT_STORE_SCHEMA_VERSION,
   PROJECT_STORE_MIGRATIONS,
 } from "../src/orchestrator/storage/migrations/registry.js";
+import type { SqliteConnection } from "../src/orchestrator/storage/sqlite-driver.js";
 import { canonicalMkdtemp } from "./support/canonical-temp.js";
 
 const roots: string[] = [];
 const driver = new NodeSqliteDriver({ DatabaseSync });
+
+class SeedNonterminalBeforeVersion4Runner extends MigrationRunner {
+  override apply(
+    connection: SqliteConnection,
+    registry: readonly Migration[],
+    appliedAt: string,
+    mode: MigrationApplyMode,
+  ): number[] {
+    return super.apply(connection, registry, appliedAt, {
+      ...mode,
+      beforeMigration: (migrationConnection, migration): void => {
+        if (migration.version === 4) {
+          const identity = migrationConnection.prepare(`
+            SELECT project_id FROM project_meta WHERE singleton = 1
+          `).get();
+          assert.equal(typeof identity?.project_id, "string");
+          migrationConnection.prepare(`
+            INSERT INTO workflow_instances(
+              project_id, workflow_id, workflow_type, generation, state, phase,
+              root_command_id, result_json, error_code, created_at, updated_at,
+              session_id, triggering_event_position,
+              expected_authority_commitment, coordinator_owner_id,
+              coordinator_claim_token, coordinator_claim_expires_at,
+              coordinator_attempt_count, coordinator_failure_class,
+              coordinator_error_code, coordinator_next_attempt_at,
+              validation_attempt_plan_generation,
+              validation_attempt_plans_json,
+              evidence_frozen_checkpoint_event_position,
+              evidence_frozen_generation, evidence_window_state,
+              final_ending_scope_bindings_json
+            ) VALUES (
+              $projectId, '22222222-2222-4222-8222-222222222222',
+              'session-end', 1, 'active', 'requested',
+              '33333333-3333-4333-8333-333333333333', NULL, NULL,
+              $now, $now, '44444444-4444-4444-8444-444444444444', 1,
+              $commitment, NULL, NULL, NULL, 0, NULL, NULL, NULL,
+              NULL, NULL, NULL, NULL, 'open', NULL
+            )
+          `).run({
+            $projectId: identity!.project_id,
+            $now: appliedAt,
+            $commitment: "a".repeat(64),
+          });
+        }
+        mode.beforeMigration(migrationConnection, migration);
+      },
+    });
+  }
+}
 
 function fixture(): { root: string; projectRoot: string; vaultRoot: string } {
   const root = canonicalMkdtemp("memory-bootstrap-");
@@ -158,7 +213,13 @@ describe("DefaultProjectStoreBootstrapService", () => {
       assert.equal(meta?.vault_id, result.descriptor.vaultId);
       assert.equal(meta?.store_id, result.manifest.storeId);
       assert.equal(meta?.schema_version, BigInt(CURRENT_PROJECT_STORE_SCHEMA_VERSION));
+      assert.equal(meta?.schema_version, 4n);
       assert.equal(result.manifest.schemaVersion, 1);
+      assert.deepEqual(
+        database.prepare("SELECT version FROM schema_migrations ORDER BY version").all()
+          .map((row) => row.version),
+        [1n, 2n, 3n, 4n],
+      );
       assert.deepEqual(
         database.prepare("SELECT version, name FROM schema_migrations ORDER BY version").all()
           .map((row) => ({ version: row.version, name: row.name })),
@@ -184,6 +245,21 @@ describe("DefaultProjectStoreBootstrapService", () => {
     assert.equal(again.recoveredManifest, false);
     assert.deepEqual(again.descriptor, result.descriptor);
     assert.deepEqual(again.manifest, result.manifest);
+  });
+
+  it("runs the schema 4 read-only preflight during direct bootstrap", async () => {
+    const { projectRoot, vaultRoot } = fixture();
+    const expected = paths(vaultRoot);
+    const service = new DefaultProjectStoreBootstrapService({
+      migrationRunner: new SeedNonterminalBeforeVersion4Runner(),
+    });
+
+    await assert.rejects(
+      service.initialize({ projectRoot, vaultRoot }),
+      errorCode("MIGRATION_SESSION_END_EFFECTIVE_STATE_PRECONDITION_FAILED"),
+    );
+    assert.equal(existsSync(expected.events), false);
+    assert.equal(existsSync(expected.manifest), false);
   });
 
   it("replays every Git-store ancestor when a contender pre-created the complete tree", async () => {
@@ -793,9 +869,13 @@ describe("DefaultProjectStoreBootstrapService", () => {
     database.exec("DROP TRIGGER schema_migrations_no_update");
     database.prepare(`
       UPDATE schema_migrations
-      SET version = 4, name = 'future', checksum = $checksum
-      WHERE version = 3
-    `).run({ $checksum: "f".repeat(64) });
+      SET version = $futureVersion, name = 'future', checksum = $checksum
+      WHERE version = $currentVersion
+    `).run({
+      $checksum: "f".repeat(64),
+      $currentVersion: CURRENT_PROJECT_STORE_SCHEMA_VERSION,
+      $futureVersion: CURRENT_PROJECT_STORE_SCHEMA_VERSION + 1,
+    });
     database.close();
 
     await assert.rejects(

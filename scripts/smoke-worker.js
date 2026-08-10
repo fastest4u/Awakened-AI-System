@@ -250,8 +250,8 @@ function decodeUpgrade(value) {
   );
   if (
     !Array.isArray(result.appliedVersions)
-    || JSON.stringify(result.appliedVersions) !== "[2,3]"
-  ) throw new Error("Bundled upgrade did not apply pending Versions 2 and 3 exactly once");
+    || JSON.stringify(result.appliedVersions) !== "[2,3,4]"
+  ) throw new Error("Bundled upgrade did not apply pending Versions 2, 3, and 4 exactly once");
   const integrity = record(result.integrity, "upgrade integrity");
   if (integrity.ok !== true) throw new Error("Bundled upgrade integrity did not pass");
   return result;
@@ -311,8 +311,14 @@ async function smokeBundledUpgrade() {
       const versions = database.prepare(
         "SELECT version FROM schema_migrations ORDER BY version",
       ).all().map((row) => Number(row.version));
-      if (JSON.stringify(versions) !== "[1,2,3]") {
+      if (JSON.stringify(versions) !== "[1,2,3,4]") {
         throw new Error(`Bundled upgrade recorded unexpected migrations ${JSON.stringify(versions)}`);
+      }
+      const schemaVersion = Number(database.prepare(`
+        SELECT schema_version FROM project_meta WHERE singleton = 1
+      `).get()?.schema_version);
+      if (schemaVersion !== 4) {
+        throw new Error(`Bundled upgrade recorded schema version ${schemaVersion}`);
       }
     } finally {
       database.close();

@@ -56,6 +56,10 @@ import {
   SqliteQualifiedCheckpointMigrationPreflight,
   type QualifiedCheckpointMigrationPreflight,
 } from "./qualified-checkpoint-migration-preflight.js";
+import {
+  SqliteSessionEndEffectiveStateMigrationPreflight,
+  type SessionEndEffectiveStateMigrationPreflight,
+} from "./session-end-effective-state-migration-preflight.js";
 
 type DatabaseSyncConstructor = typeof import("node:sqlite").DatabaseSync;
 type NodeSqliteModule = Pick<typeof import("node:sqlite"), "DatabaseSync">;
@@ -395,10 +399,12 @@ export class DefaultProjectStoreBootstrapService implements ProjectStoreBootstra
 
   readonly #dependencies: ResolvedProjectStoreBootstrapDependencies;
   readonly #preflight: QualifiedCheckpointMigrationPreflight;
+  readonly #sessionEndPreflight: SessionEndEffectiveStateMigrationPreflight;
   #nodeSqlite: Promise<NodeSqliteModule> | undefined;
 
   constructor(dependencies: Partial<ProjectStoreBootstrapDependencies> = {}) {
     this.#preflight = new SqliteQualifiedCheckpointMigrationPreflight();
+    this.#sessionEndPreflight = new SqliteSessionEndEffectiveStateMigrationPreflight();
     this.#dependencies = {
       descriptorRepository: dependencies.descriptorRepository
         ?? new ProjectDescriptorRepository(),
@@ -609,25 +615,33 @@ export class DefaultProjectStoreBootstrapService implements ProjectStoreBootstra
         {
           kind: "bootstrap-empty",
           beforeMigration: (migrationConnection, migration) => {
-            if (migration.version !== 3) return;
-            this.#dependencies.faultInjector.hit("after-temp-schema-before-identity");
-            const createdAt = this.#dependencies.now();
-            insertBootstrapIdentity(
-              migrationConnection,
-              descriptor,
-              storeId,
-              createdAt,
-            );
-            this.#preflight.assertEligibleAndStage(
-              migrationConnection,
-              {
-                binding: {
-                  projectId: descriptor.projectId,
-                  vaultId: descriptor.vaultId,
-                  storeId,
-                },
-              } as ProjectContext,
-            );
+            const migrationContext = {
+              binding: {
+                projectId: descriptor.projectId,
+                vaultId: descriptor.vaultId,
+                storeId,
+              },
+            } as ProjectContext;
+            if (migration.version === 3) {
+              this.#dependencies.faultInjector.hit("after-temp-schema-before-identity");
+              const createdAt = this.#dependencies.now();
+              insertBootstrapIdentity(
+                migrationConnection,
+                descriptor,
+                storeId,
+                createdAt,
+              );
+              this.#preflight.assertEligibleAndStage(
+                migrationConnection,
+                migrationContext,
+              );
+            }
+            if (migration.version === 4) {
+              this.#sessionEndPreflight.assertEligible(
+                migrationConnection,
+                migrationContext,
+              );
+            }
           },
         },
       );
