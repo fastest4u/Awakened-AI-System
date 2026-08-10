@@ -112,23 +112,49 @@ function record(value: unknown): Readonly<Record<string, unknown>> {
 function assertAmendmentSnapshotCorrelation(
   command: Readonly<Record<string, unknown>>,
   state: SessionEndEffectiveStateV1,
+  predecessor: SessionEndEffectiveStateV1,
+  eventAction: unknown,
+  predecessorEvidenceWindowState: unknown,
+  evidenceWindowState: unknown,
+  effectiveCheckpointVersion: unknown,
 ): void {
   if (command.commandType !== "amend-session-end") integrity();
   const amendment = record(command.amendment);
   const request = state.request;
+  const previousRequest = predecessor.request;
   if (
     amendment.amendmentVersion !== 2
-    || (amendment.childEndPolicy !== null && amendment.childEndPolicy !== request.childEndPolicy)
+    || amendment.evidenceWindowAction !== eventAction
+    || (amendment.childEndPolicy !== null
+      ? amendment.childEndPolicy !== request.childEndPolicy
+      : request.childEndPolicy !== previousRequest.childEndPolicy)
     || (amendment.finalCheckpoint !== null
-      && canonicalJson(amendment.finalCheckpoint) !== canonicalJson(request.finalCheckpoint))
+      ? canonicalJson(amendment.finalCheckpoint) !== canonicalJson(request.finalCheckpoint)
+      : canonicalJson(request.finalCheckpoint) !== canonicalJson(previousRequest.finalCheckpoint))
     || (amendment.validationProfileIds !== null
-      && canonicalJson(amendment.validationProfileIds) !== canonicalJson(request.validationProfileIds))
+      ? canonicalJson(amendment.validationProfileIds) !== canonicalJson(request.validationProfileIds)
+      : canonicalJson(request.validationProfileIds) !== canonicalJson(previousRequest.validationProfileIds))
     || (amendment.requestedQualityThreshold !== null
-      && amendment.requestedQualityThreshold !== request.requestedQualityThreshold)
+      ? amendment.requestedQualityThreshold !== request.requestedQualityThreshold
+      : request.requestedQualityThreshold !== previousRequest.requestedQualityThreshold)
     || (amendment.requireFullEvidence !== null
-      && amendment.requireFullEvidence !== request.requireFullEvidence)
+      ? amendment.requireFullEvidence !== request.requireFullEvidence
+      : request.requireFullEvidence !== previousRequest.requireFullEvidence)
     || (amendment.requireMaterialization !== null
-      && amendment.requireMaterialization !== request.requireMaterialization)
+      ? amendment.requireMaterialization !== request.requireMaterialization
+      : request.requireMaterialization !== previousRequest.requireMaterialization)
+    || !(
+      (amendment.evidenceWindowAction === "unchanged"
+        && predecessorEvidenceWindowState === evidenceWindowState)
+      || (amendment.evidenceWindowAction === "open"
+        && predecessorEvidenceWindowState === "sealed"
+        && evidenceWindowState === "open"
+        && effectiveCheckpointVersion === 2)
+      || (amendment.evidenceWindowAction === "seal"
+        && predecessorEvidenceWindowState === "open"
+        && evidenceWindowState === "sealed"
+        && effectiveCheckpointVersion === 2)
+    )
   ) integrity();
 }
 
@@ -164,7 +190,9 @@ export function hydrateSessionEndEffectiveStateV1(
       || input.eventPosition <= 0n
     ) integrity();
     const fold = oneOrNone(connection.prepare(`
-      SELECT fingerprint_schema_version, session_id, trigger_event_position,
+      SELECT workflow_generation, fingerprint_schema_version, session_id, trigger_event_position,
+             evidence_window_state, effective_checkpoint_version,
+             effective_draft_source_event_position,
              effective_state_source_event_position, effective_state_version,
              effective_state_hash
       FROM lifecycle_workflow_generation_folds
@@ -183,19 +211,43 @@ export function hydrateSessionEndEffectiveStateV1(
       WHERE project_id = $projectId AND global_position = $eventPosition
       LIMIT 2
     `).all({ $projectId: input.projectId, $eventPosition: input.eventPosition }));
+    const sourceFold = oneOrNone(connection.prepare(`
+      SELECT workflow_generation, fingerprint_schema_version, session_id,
+             evidence_window_state, effective_checkpoint_version,
+             effective_draft_source_event_position,
+             effective_state_source_event_position, effective_state_version,
+             effective_state_hash
+      FROM lifecycle_workflow_generation_folds
+      WHERE project_id = $projectId AND workflow_id = $workflowId
+        AND trigger_event_position = $eventPosition
+        AND effective_state_source_event_position = $eventPosition
+      LIMIT 2
+    `).all({
+      $projectId: input.projectId,
+      $workflowId: input.workflowId,
+      $eventPosition: input.eventPosition,
+    }));
     const workflow = oneOrNone(connection.prepare(`
       SELECT workflow_id, generation, session_id, triggering_event_position
       FROM workflow_instances
       WHERE project_id = $projectId AND workflow_id = $workflowId
       LIMIT 2
     `).all({ $projectId: input.projectId, $workflowId: input.workflowId }));
-    if (event === null || workflow === null || fold === null
+    if (event === null || workflow === null || fold === null || sourceFold === null
       || rowString(event, "session_id") !== input.sessionId
       || rowString(fold, "session_id") !== input.sessionId
       || rowString(workflow, "session_id") !== input.sessionId
       || rowIntegerLike(fold["fingerprint_schema_version"]) !== 2
+      || rowIntegerLike(sourceFold["fingerprint_schema_version"]) !== 2
       || rowIntegerLike(fold["effective_state_version"]) !== 1
+      || rowIntegerLike(sourceFold["effective_state_version"]) !== 1
       || rowInt64(fold["effective_state_source_event_position"]) !== input.eventPosition
+      || rowInt64(sourceFold["effective_state_source_event_position"]) !== input.eventPosition
+      || rowIntegerLike(sourceFold["workflow_generation"]) > input.workflowGeneration
+      || rowString(sourceFold, "session_id") !== input.sessionId
+      || rowString(sourceFold, "effective_state_hash") !== rowString(fold, "effective_state_hash")
+      || rowIntegerLike(sourceFold["effective_state_version"])
+        !== rowIntegerLike(fold["effective_state_version"])
       || rowIntegerLike(workflow["generation"]) < input.workflowGeneration
       || rowString(workflow, "workflow_id") !== input.workflowId
       || rowIntegerLike(event["event_schema_version"]) !== 3
@@ -228,7 +280,54 @@ export function hydrateSessionEndEffectiveStateV1(
           || command.workflowId !== input.workflowId))
     ) integrity();
     if (rowString(event, "event_type") === "SessionEndAmended") {
-      assertAmendmentSnapshotCorrelation(command, effectiveState);
+      const sourceGeneration = rowIntegerLike(sourceFold["workflow_generation"]);
+      if (
+        sourceGeneration <= 1
+        || rowIntegerLike(fold["effective_checkpoint_version"])
+          !== rowIntegerLike(sourceFold["effective_checkpoint_version"])
+        || rowInt64(fold["effective_draft_source_event_position"])
+          !== rowInt64(sourceFold["effective_draft_source_event_position"])
+      ) integrity();
+      const predecessorFold = oneOrNone(connection.prepare(`
+        SELECT evidence_window_state, effective_state_source_event_position
+        FROM lifecycle_workflow_generation_folds
+        WHERE project_id = $projectId AND workflow_id = $workflowId
+          AND workflow_generation = $workflowGeneration
+        LIMIT 2
+      `).all({
+        $projectId: input.projectId,
+        $workflowId: input.workflowId,
+        $workflowGeneration: BigInt(sourceGeneration - 1),
+      }));
+      if (predecessorFold === null) integrity();
+      const predecessorEvent = oneOrNone(connection.prepare(`
+        SELECT payload_json FROM events
+        WHERE project_id = $projectId AND global_position = $eventPosition
+        LIMIT 2
+      `).all({
+        $projectId: input.projectId,
+        $eventPosition: rowInt64(predecessorFold["effective_state_source_event_position"]),
+      }));
+      if (predecessorEvent === null) integrity();
+      let predecessorPayload: unknown;
+      try { predecessorPayload = JSON.parse(rowString(predecessorEvent, "payload_json")); } catch { return integrity(); }
+      if (
+        canonicalJson(predecessorPayload) !== rowString(predecessorEvent, "payload_json")
+        || typeof predecessorPayload !== "object" || predecessorPayload === null
+        || Array.isArray(predecessorPayload)
+      ) integrity();
+      const predecessor = decodeSessionEndEffectiveStateV1(
+        (predecessorPayload as Readonly<Record<string, unknown>>).effectiveState,
+      );
+      assertAmendmentSnapshotCorrelation(
+        command,
+        effectiveState,
+        predecessor,
+        record.evidenceWindowAction,
+        rowString(predecessorFold, "evidence_window_state"),
+        rowString(sourceFold, "evidence_window_state"),
+        rowIntegerLike(sourceFold["effective_checkpoint_version"]),
+      );
     }
     return Object.freeze({
       eventPosition: input.eventPosition,

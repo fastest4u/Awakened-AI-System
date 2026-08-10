@@ -82,31 +82,85 @@ function requestIntent(state: ReturnType<typeof sessionEndEffectiveStateFixture>
   } as never).source;
 }
 
-function hydrationConnection(options: { readonly amend?: boolean; readonly cancelled?: boolean; readonly mutateIntent?: boolean; readonly mutateHash?: boolean; readonly sourcePosition?: bigint; readonly foldSourcePosition?: bigint } = {}): NativeConnection {
+type EvidenceWindowAction = "unchanged" | "open" | "seal";
+
+function hydrationConnection(options: {
+  readonly amend?: boolean;
+  readonly cancelled?: boolean;
+  readonly mutateIntent?: boolean;
+  readonly mutateHash?: boolean;
+  readonly malformedSourceEvent?: boolean;
+  readonly sourcePosition?: bigint;
+  readonly foldSourcePosition?: bigint;
+  readonly evidenceWindowAction?: EvidenceWindowAction;
+  readonly previousEvidenceWindowState?: "open" | "sealed";
+  readonly evidenceWindowState?: "open" | "sealed";
+  readonly amendmentMutation?: Readonly<Record<string, unknown>>;
+  readonly malformedAmendmentVersion?: boolean;
+} = {}): NativeConnection {
   const connection = new NativeConnection();
   const state = sessionEndEffectiveStateFixture({ requestVersion: 2 });
   const eventType = options.amend ? "SessionEndAmended" : "SessionEndRequested";
   const generation = options.amend ? 2 : 1;
+  const evidenceWindowAction = options.evidenceWindowAction ?? "unchanged";
+  const amendment = {
+    amendmentVersion: 2 as const,
+    childEndPolicy: null,
+    finalCheckpoint: null,
+    validationProfileIds: null,
+    requestedQualityThreshold: null,
+    requireFullEvidence: null,
+    requireMaterialization: null,
+    evidenceWindowAction,
+  };
   const command = options.amend ? {
     commandType: "amend-session-end", commandId: HYDRATION_COMMAND, idempotencyKey: "hydration/amend", agentId: "agent-primary",
     expectedProjectId: HYDRATION_PROJECT, expectedVaultId: "55555555-5555-4555-8555-555555555555", expectedWorkspaceId: "a".repeat(64), expectedBranchRef: null,
     sessionId: EFFECTIVE_STATE_SESSION_ID, workflowId: HYDRATION_WORKFLOW, expectedStreamVersion: "1",
-    amendment: { amendmentVersion: 2 as const, childEndPolicy: null, finalCheckpoint: null, validationProfileIds: null, requestedQualityThreshold: null, requireFullEvidence: null, requireMaterialization: null, evidenceWindowAction: "unchanged" as const },
+    amendment: { ...amendment, ...options.amendmentMutation },
   } : null;
   const assertions = {
     authorizationKind: "protected", authorizationSessionId: EFFECTIVE_STATE_SESSION_ID, targetSessionId: EFFECTIVE_STATE_SESSION_ID,
     projectId: HYDRATION_PROJECT, vaultId: "55555555-5555-4555-8555-555555555555", storeId: "66666666-6666-4666-8666-666666666666", workspaceId: "a".repeat(64), clientNamespace: "tests", capabilityKind: "root-session-handle", capabilityGeneration: "1", presentingActorRole: "primary", presentingClientInstanceId: "client-primary", targetActorRole: "primary", targetClientInstanceId: "client-primary", internalWorkflowId: null, internalWorkflowGeneration: null, internalPlannedWorkId: null,
   } as never;
-  const intentSource = command === null ? requestIntent(state) : buildLifecycleIntentWitness(command as never, assertions).source;
+  let intentSource = command === null ? requestIntent(state) : buildLifecycleIntentWitness(command as never, assertions).source;
+  if (options.malformedAmendmentVersion) {
+    const witness = JSON.parse(intentSource) as { intent: { command: { amendment: { amendmentVersion: unknown } } } };
+    witness.intent.command.amendment.amendmentVersion = 1;
+    intentSource = canonicalJson(witness);
+  }
   const position = options.sourcePosition ?? 10n;
-  const payload = eventType === "SessionEndRequested"
+  const payload = options.malformedSourceEvent ? { workflowId: HYDRATION_WORKFLOW }
+    : eventType === "SessionEndRequested"
     ? { workflowId: HYDRATION_WORKFLOW, workflowGeneration: generation, previousState: "active", effectiveState: state }
-    : { workflowId: HYDRATION_WORKFLOW, previousWorkflowGeneration: 1, workflowGeneration: 2, preTransitionCheckpointId: "77777777-7777-4777-8777-777777777777", evidenceWindowAction: "unchanged", effectiveState: state };
+    : { workflowId: HYDRATION_WORKFLOW, previousWorkflowGeneration: 1, workflowGeneration: 2, preTransitionCheckpointId: "77777777-7777-4777-8777-777777777777", evidenceWindowAction, effectiveState: state };
   connection.exec(`CREATE TABLE events (global_position INTEGER PRIMARY KEY, project_id TEXT, event_type TEXT, event_schema_version INTEGER, payload_json TEXT, event_hash TEXT, session_id TEXT, command_id TEXT, command_event_index INTEGER, lifecycle_intent_json TEXT) STRICT;
-CREATE TABLE lifecycle_workflow_generation_folds (project_id TEXT, workflow_id TEXT, workflow_generation INTEGER, fingerprint_schema_version INTEGER, session_id TEXT, trigger_event_position INTEGER, effective_state_source_event_position INTEGER, effective_state_version INTEGER, effective_state_hash TEXT) STRICT;
+CREATE TABLE lifecycle_workflow_generation_folds (project_id TEXT, workflow_id TEXT, workflow_generation INTEGER, fingerprint_schema_version INTEGER, session_id TEXT, trigger_event_position INTEGER, evidence_window_state TEXT, effective_checkpoint_version INTEGER, effective_draft_source_event_position INTEGER, effective_state_source_event_position INTEGER, effective_state_version INTEGER, effective_state_hash TEXT) STRICT;
 CREATE TABLE workflow_instances (project_id TEXT, workflow_id TEXT, generation INTEGER, session_id TEXT, triggering_event_position INTEGER, validation_attempt_plan_generation INTEGER, validation_attempt_plans_json TEXT) STRICT;`);
   connection.prepare(`INSERT INTO events VALUES ($p,$project,$type,3,$payload,$hash,$session,$command,0,$intent)`).run({ $p: position, $project: HYDRATION_PROJECT, $type: eventType, $payload: canonicalJson(payload), $hash: options.mutateHash ? "0".repeat(64) : "b".repeat(64), $session: EFFECTIVE_STATE_SESSION_ID, $command: HYDRATION_COMMAND, $intent: options.mutateIntent ? requestIntent(state) : intentSource });
-  connection.prepare(`INSERT INTO lifecycle_workflow_generation_folds VALUES ($project,$workflow,$generation,2,$session,$trigger,$source,1,$hash)`).run({ $project: HYDRATION_PROJECT, $workflow: HYDRATION_WORKFLOW, $generation: options.cancelled ? 3n : BigInt(generation), $session: EFFECTIVE_STATE_SESSION_ID, $trigger: options.cancelled ? 11n : position, $source: options.foldSourcePosition ?? position, $hash: options.mutateHash ? "0".repeat(64) : state.effectiveStateHash });
+  if (options.amend) {
+    connection.prepare(`INSERT INTO events VALUES (9,$project,'SessionEndRequested',3,$payload,$hash,$session,$command,0,$intent)`).run({
+      $project: HYDRATION_PROJECT,
+      $payload: canonicalJson({ workflowId: HYDRATION_WORKFLOW, workflowGeneration: 1, previousState: "active", effectiveState: state }),
+      $hash: "a".repeat(64), $session: EFFECTIVE_STATE_SESSION_ID, $command: HYDRATION_COMMAND,
+      $intent: requestIntent(state),
+    });
+    connection.prepare(`INSERT INTO lifecycle_workflow_generation_folds VALUES ($project,$workflow,1,2,$session,9,$window,2,9,9,1,$hash)`).run({
+      $project: HYDRATION_PROJECT, $workflow: HYDRATION_WORKFLOW, $session: EFFECTIVE_STATE_SESSION_ID,
+      $window: options.previousEvidenceWindowState ?? "sealed", $hash: state.effectiveStateHash,
+    });
+  }
+  connection.prepare(`INSERT INTO lifecycle_workflow_generation_folds VALUES ($project,$workflow,$generation,2,$session,$trigger,$window,2,$draft,$source,1,$hash)`).run({ $project: HYDRATION_PROJECT, $workflow: HYDRATION_WORKFLOW, $generation: options.cancelled ? 3n : BigInt(generation), $session: EFFECTIVE_STATE_SESSION_ID, $trigger: options.cancelled ? 11n : position, $window: options.evidenceWindowState ?? "sealed", $draft: position, $source: options.foldSourcePosition ?? position, $hash: options.mutateHash ? "0".repeat(64) : state.effectiveStateHash });
+  if (options.cancelled) {
+    connection.prepare(`INSERT INTO lifecycle_workflow_generation_folds VALUES ($project,$workflow,2,2,$session,$trigger,$window,2,$draft,$source,1,$hash)`).run({
+      $project: HYDRATION_PROJECT, $workflow: HYDRATION_WORKFLOW, $session: EFFECTIVE_STATE_SESSION_ID,
+      $trigger: position, $window: options.evidenceWindowState ?? "sealed", $draft: position,
+      $source: options.foldSourcePosition ?? position, $hash: options.mutateHash ? "0".repeat(64) : state.effectiveStateHash,
+    });
+    connection.prepare(`INSERT INTO events VALUES (11,$project,'SessionEndCancelled',3,$payload,$hash,$session,$command,0,$intent)`).run({
+      $project: HYDRATION_PROJECT, $payload: canonicalJson({ cancellationVersion: 1, workflowId: HYDRATION_WORKFLOW, previousWorkflowGeneration: 2, workflowGeneration: 3, restoredState: "active", preTransitionCheckpointId: "77777777-7777-4777-8777-777777777777" }), $hash: "c".repeat(64), $session: EFFECTIVE_STATE_SESSION_ID, $command: "88888888-8888-4888-8888-888888888888", $intent: "cancellation-not-a-snapshot-source",
+    });
+  }
   connection.prepare(`INSERT INTO workflow_instances VALUES ($project,$workflow,3,$session,11,NULL,NULL)`).run({ $project: HYDRATION_PROJECT, $workflow: HYDRATION_WORKFLOW, $session: EFFECTIVE_STATE_SESSION_ID });
   return connection;
 }
@@ -183,6 +237,12 @@ it("hydrates exact request amendment and cancellation-carried effective-state so
     });
     assert.equal(hydrated.eventPosition, 10n);
     assert.equal(hydrated.effectiveState.request.sessionId, EFFECTIVE_STATE_SESSION_ID);
+    if (options.cancelled) {
+      assert.throws(() => new BoundSessionEndRepository(connection).hydrateSessionEndEffectiveStateV1({
+        projectId: HYDRATION_PROJECT, workflowId: HYDRATION_WORKFLOW, workflowGeneration: generation,
+        sessionId: EFFECTIVE_STATE_SESSION_ID, eventPosition: 11n,
+      }), /INTEGRITY_FAILURE/);
+    }
     const facade = new BoundSessionEndRepository(connection);
     facade.writePersistedValidationAttemptPlansV1({
       projectId: HYDRATION_PROJECT, workflowId: HYDRATION_WORKFLOW,
@@ -193,6 +253,68 @@ it("hydrates exact request amendment and cancellation-carried effective-state so
     )?.plans, validPlans());
     connection.close();
   }
+});
+
+it("correlates every non-null amendment field and evidence-window action to the immutable fold", () => {
+  for (const options of [
+    { evidenceWindowAction: "unchanged" as const, previousEvidenceWindowState: "sealed" as const, evidenceWindowState: "sealed" as const },
+    { evidenceWindowAction: "open" as const, previousEvidenceWindowState: "sealed" as const, evidenceWindowState: "open" as const, amendmentMutation: { finalCheckpoint: sessionEndEffectiveStateFixture({ requestVersion: 2 }).request.finalCheckpoint } },
+    { evidenceWindowAction: "seal" as const, previousEvidenceWindowState: "open" as const, evidenceWindowState: "sealed" as const },
+  ]) {
+    const control = hydrationConnection({ amend: true, ...options });
+    assert.equal(hydrateSessionEndEffectiveStateV1(control, {
+      projectId: HYDRATION_PROJECT, workflowId: HYDRATION_WORKFLOW, workflowGeneration: 2,
+      sessionId: EFFECTIVE_STATE_SESSION_ID, eventPosition: 10n,
+    }).eventPosition, 10n);
+    control.close();
+  }
+  const state = sessionEndEffectiveStateFixture({ requestVersion: 2 });
+  for (const amendmentMutation of [
+    { childEndPolicy: "require-completed" },
+    { finalCheckpoint: { ...state.request.finalCheckpoint, taskSummary: "different immutable draft" } },
+    { validationProfileIds: [] },
+    { requestedQualityThreshold: 8 },
+    { requireFullEvidence: false },
+    { requireMaterialization: true },
+    { evidenceWindowAction: "seal" },
+  ]) {
+    const validField = "finalCheckpoint" in amendmentMutation
+      ? { finalCheckpoint: state.request.finalCheckpoint }
+      : "childEndPolicy" in amendmentMutation
+        ? { childEndPolicy: state.request.childEndPolicy }
+        : "validationProfileIds" in amendmentMutation
+          ? { validationProfileIds: state.request.validationProfileIds }
+          : "requestedQualityThreshold" in amendmentMutation
+            ? { requestedQualityThreshold: state.request.requestedQualityThreshold }
+            : "requireFullEvidence" in amendmentMutation
+              ? { requireFullEvidence: state.request.requireFullEvidence }
+              : "requireMaterialization" in amendmentMutation
+                ? { requireMaterialization: state.request.requireMaterialization }
+                : {};
+    const valid = hydrationConnection({ amend: true, amendmentMutation: validField });
+    assert.equal(hydrateSessionEndEffectiveStateV1(valid, {
+      projectId: HYDRATION_PROJECT, workflowId: HYDRATION_WORKFLOW, workflowGeneration: 2,
+      sessionId: EFFECTIVE_STATE_SESSION_ID, eventPosition: 10n,
+    }).eventPosition, 10n);
+    valid.close();
+    const connection = hydrationConnection({
+      amend: true, evidenceWindowAction: "open", previousEvidenceWindowState: "sealed",
+      evidenceWindowState: "open", amendmentMutation: "evidenceWindowAction" in amendmentMutation
+        ? amendmentMutation
+        : { finalCheckpoint: state.request.finalCheckpoint, ...amendmentMutation },
+    });
+    assert.throws(() => hydrateSessionEndEffectiveStateV1(connection, {
+      projectId: HYDRATION_PROJECT, workflowId: HYDRATION_WORKFLOW, workflowGeneration: 2,
+      sessionId: EFFECTIVE_STATE_SESSION_ID, eventPosition: 10n,
+    }), /INTEGRITY_FAILURE/, canonicalJson(amendmentMutation));
+    connection.close();
+  }
+  const malformedVersion = hydrationConnection({ amend: true, malformedAmendmentVersion: true });
+  assert.throws(() => hydrateSessionEndEffectiveStateV1(malformedVersion, {
+    projectId: HYDRATION_PROJECT, workflowId: HYDRATION_WORKFLOW, workflowGeneration: 2,
+    sessionId: EFFECTIVE_STATE_SESSION_ID, eventPosition: 10n,
+  }), /INTEGRITY_FAILURE/, "amendmentVersion");
+  malformedVersion.close();
 });
 
 it("rejects event-position hydration intent fold hash and immutable-event disagreements", () => {
@@ -215,4 +337,10 @@ it("rejects event-position hydration intent fold hash and immutable-event disagr
     sessionId: EFFECTIVE_STATE_SESSION_ID, eventPosition: 9n,
   }), /INTEGRITY_FAILURE/);
   missing.close();
+  const malformed = hydrationConnection({ malformedSourceEvent: true });
+  assert.throws(() => hydrateSessionEndEffectiveStateV1(malformed, {
+    projectId: HYDRATION_PROJECT, workflowId: HYDRATION_WORKFLOW, workflowGeneration: 1,
+    sessionId: EFFECTIVE_STATE_SESSION_ID, eventPosition: 10n,
+  }), /INTEGRITY_FAILURE/);
+  malformed.close();
 });
