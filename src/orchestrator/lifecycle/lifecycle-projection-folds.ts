@@ -1008,7 +1008,7 @@ export function foldWorkflowGenerationProjection(
     previous !== null
     && (
       previous.projectId !== event.projectId
-      || previous.fingerprintSchemaVersion !== fingerprintSchemaVersion
+      || (previous.fingerprintSchemaVersion === 2 && fingerprintSchemaVersion !== 2)
       || trigger.globalPosition <= previous.triggerEventPosition
       || (previous.fingerprintSchemaVersion === 1
         ? previous.fingerprint !== workflowGenerationFingerprint(withoutWorkflowFingerprint(previous))

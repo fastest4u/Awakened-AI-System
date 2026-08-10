@@ -104,6 +104,34 @@ function oneOrNone(rows: SqliteRow[]): SqliteRow | null {
   return rows[0] ?? null;
 }
 
+function record(value: unknown): Readonly<Record<string, unknown>> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) integrity();
+  return value as Readonly<Record<string, unknown>>;
+}
+
+function assertAmendmentSnapshotCorrelation(
+  command: Readonly<Record<string, unknown>>,
+  state: SessionEndEffectiveStateV1,
+): void {
+  if (command.commandType !== "amend-session-end") integrity();
+  const amendment = record(command.amendment);
+  const request = state.request;
+  if (
+    amendment.amendmentVersion !== 2
+    || (amendment.childEndPolicy !== null && amendment.childEndPolicy !== request.childEndPolicy)
+    || (amendment.finalCheckpoint !== null
+      && canonicalJson(amendment.finalCheckpoint) !== canonicalJson(request.finalCheckpoint))
+    || (amendment.validationProfileIds !== null
+      && canonicalJson(amendment.validationProfileIds) !== canonicalJson(request.validationProfileIds))
+    || (amendment.requestedQualityThreshold !== null
+      && amendment.requestedQualityThreshold !== request.requestedQualityThreshold)
+    || (amendment.requireFullEvidence !== null
+      && amendment.requireFullEvidence !== request.requireFullEvidence)
+    || (amendment.requireMaterialization !== null
+      && amendment.requireMaterialization !== request.requireMaterialization)
+  ) integrity();
+}
+
 export interface StoredValidationAttemptPlansV1 {
   readonly workflowGeneration: number;
   readonly plans: readonly PersistedValidationAttemptPlanV1[];
@@ -199,6 +227,9 @@ export function hydrateSessionEndEffectiveStateV1(
           || command.sessionId !== input.sessionId
           || command.workflowId !== input.workflowId))
     ) integrity();
+    if (rowString(event, "event_type") === "SessionEndAmended") {
+      assertAmendmentSnapshotCorrelation(command, effectiveState);
+    }
     return Object.freeze({
       eventPosition: input.eventPosition,
       eventHash,
