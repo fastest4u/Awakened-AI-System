@@ -7,6 +7,7 @@ import { DatabaseSync } from "node:sqlite";
 import { afterEach, it } from "node:test";
 
 import type { ProjectContext } from "../src/orchestrator/identity/contracts.js";
+import { EventIntegrityService } from "../src/orchestrator/integrity/event-integrity.service.js";
 import { LifecycleIntegrityService } from "../src/orchestrator/integrity/lifecycle-integrity.service.js";
 import type {
   HistoricalEvidenceIntegrityProviderPort,
@@ -1437,6 +1438,17 @@ async function quickIssues(
   return { issues, recorder, reads };
 }
 
+async function publicQuickIssueCodes(
+  fixture: Fixture,
+): Promise<readonly IntegrityIssueCode[]> {
+  const report = await new EventIntegrityService(
+    fixture.connection,
+    PROJECT_STORE_MIGRATIONS,
+    [new LifecycleIntegrityService(fixture.connection)],
+  ).quickCheckAsync(fixture.context);
+  return report.issues.map((entry) => entry.code);
+}
+
 function dropTrigger(connection: SqliteConnection, name: string): void {
   connection.exec(`DROP TRIGGER ${name}`);
 }
@@ -1451,15 +1463,17 @@ function workflowStatus(
   phase: string,
   finalCheckpointId: string | null,
   finalCheckpointPosition: string | null,
+  triggeringEventPosition = "1",
+  workflowId = `session-end/${ROOT_ID}`,
 ): Record<string, unknown> {
   return {
     resultVersion: 2,
     sessionId: ROOT_ID,
-    workflowId: `session-end/${ROOT_ID}`,
+    workflowId,
     workflowGeneration: 1,
     phase,
     priorRootState: "active",
-    triggeringEventPosition: "1",
+    triggeringEventPosition,
     finalCheckpointId,
     finalCheckpointEventPosition: finalCheckpointPosition,
     evidenceWindow: {
@@ -1510,24 +1524,78 @@ function addWorkflow(
   });
 }
 
-function addMigratedLegacyWorkflowProjection(fixture: Fixture): void {
-  dropTrigger(
-    fixture.connection,
-    "lifecycle_workflow_generation_folds_v4_legacy_insert_guard",
-  );
-  insertWorkflowProjection(fixture.connection, workflowProjection({
-    projectId: PROJECT_ID,
-    workflowId: `session-end/${ROOT_ID}`,
-    workflowGeneration: 1,
+function addCurrentSchemaSealedWorkflowProjection(
+  fixture: Fixture,
+  requestPosition: bigint,
+): { readonly workflowId: string; readonly commandId: string } {
+  const workflowId = uuid(89_009);
+  const offset = Number(requestPosition % 100_000n);
+  const commandId = uuid(30_000 + offset);
+  const effectiveState = sessionEndEffectiveStateFixture({ requestVersion: 1 });
+  rawEvent(fixture.connection, {
+    globalPosition: requestPosition,
+    streamId: `session/${ROOT_ID}`,
+    streamVersion: 2n,
+    eventType: "SessionEndRequested",
+    eventSchemaVersion: 3,
     sessionId: ROOT_ID,
-    triggerEventPosition: 1n,
-    rootCommandId: "root-command",
-    evidenceWindowState: "sealed",
-    replacementCheckpointVersion: null,
-    effectiveCheckpointVersion: 2,
-    effectiveDraftSourceEventPosition: 1n,
-    previousFingerprint: null,
-  }));
+    payload: {
+      workflowId,
+      workflowGeneration: 1,
+      previousState: "active",
+      effectiveState,
+    },
+    lifecycleIntent: schema4RequestWitness(commandId, effectiveState.request),
+    idempotencyKey: "quick-integrity/end-request/3",
+  });
+  fixture.connection.prepare(`
+    UPDATE streams SET current_version = 2, updated_at = $now
+    WHERE project_id = $projectId AND stream_id = $streamId
+  `).run({
+    $now: NOW,
+    $projectId: PROJECT_ID,
+    $streamId: `session/${ROOT_ID}`,
+  });
+  const fingerprint = createHash("sha256")
+    .update("project-memory/lifecycle/workflow-generation/v2\n", "utf8")
+    .update(canonicalJson([
+      PROJECT_ID,
+      workflowId,
+      "1",
+      ROOT_ID,
+      requestPosition.toString(),
+      H64,
+      commandId,
+      "sealed",
+      1,
+      1,
+      requestPosition.toString(),
+      requestPosition.toString(),
+      1,
+      effectiveState.effectiveStateHash,
+      null,
+      null,
+    ]), "utf8")
+    .digest("hex");
+  rawInsert(fixture.connection, "lifecycle_workflow_generation_folds", {
+    project_id: PROJECT_ID,
+    workflow_id: workflowId,
+    workflow_generation: 1,
+    session_id: ROOT_ID,
+    trigger_event_position: requestPosition,
+    root_command_id: commandId,
+    evidence_window_state: "sealed",
+    replacement_checkpoint_version: 1,
+    effective_checkpoint_version: 1,
+    effective_draft_source_event_position: requestPosition,
+    fingerprint_schema_version: 2,
+    effective_state_source_event_position: requestPosition,
+    effective_state_version: 1,
+    effective_state_hash: effectiveState.effectiveStateHash,
+    previous_fingerprint: null,
+    fingerprint,
+  });
+  return { workflowId, commandId };
 }
 
 function checkpointDraft(version: 1 | 2): Record<string, unknown> {
@@ -2741,30 +2809,111 @@ function openAmendmentFixture(finalCheckpointVersion: 1 | null): Fixture {
   }
   return fixture;
 }
+
+function collapsedLegacyCancellationFixture(): Fixture {
+  const fixture = createFixture();
+  const workflowId = uuid(89_007);
+  const requestCommandId = uuid(30_002);
+  const cancelCommandId = uuid(30_003);
+  const checkpointId = uuid(89_008);
+  rawEvent(fixture.connection, {
+    globalPosition: 2n,
+    streamId: `session/${ROOT_ID}`,
+    streamVersion: 2n,
+    eventType: "SessionEndRequested",
+    eventSchemaVersion: 1,
+    sessionId: ROOT_ID,
+    payload: {
+      workflowId,
+      workflowGeneration: 1,
+      previousState: "active",
+      childEndPolicy: "require-completed",
+      qualityThreshold: 0,
+      requireFullEvidence: false,
+      requireMaterialization: false,
+    },
+    lifecycleIntent: requestWitness(1, requestCommandId),
+    idempotencyKey: "quick-integrity/end-request/1",
+  });
+  rawEvent(fixture.connection, {
+    globalPosition: 3n,
+    streamId: `session/${ROOT_ID}`,
+    streamVersion: 3n,
+    eventType: "SessionEndCancelled",
+    eventSchemaVersion: 1,
+    sessionId: ROOT_ID,
+    payload: {
+      workflowId,
+      workflowGeneration: 1,
+      restoredState: "active",
+      preTransitionCheckpointId: checkpointId,
+    },
+    lifecycleIntent: schema4CancelWitness(
+      workflowId,
+      cancelCommandId,
+      checkpointId,
+      "2",
+    ),
+    idempotencyKey: "quick-integrity/end-cancel/3",
+  });
+  fixture.connection.prepare(`
+    UPDATE streams SET current_version = 3
+    WHERE project_id = $projectId AND stream_id = $streamId
+  `).run({ $projectId: PROJECT_ID, $streamId: `session/${ROOT_ID}` });
+  addWorkflow(fixture, {
+    workflow_id: workflowId,
+    state: "completed",
+    phase: "cancelled",
+    root_command_id: cancelCommandId,
+    triggering_event_position: 3,
+    expected_authority_commitment: rootAuthority().authority_commitment,
+    evidence_window_state: "sealed",
+  });
+  insertWorkflowProjection(fixture.connection, workflowProjection({
+    projectId: PROJECT_ID,
+    workflowId,
+    workflowGeneration: 1,
+    sessionId: ROOT_ID,
+    triggerEventPosition: 3n,
+    rootCommandId: cancelCommandId,
+    evidenceWindowState: "sealed",
+    replacementCheckpointVersion: null,
+    effectiveCheckpointVersion: 1,
+    effectiveDraftSourceEventPosition: 2n,
+    previousFingerprint: null,
+  }));
+  return fixture;
+}
+
 function frozenInt64RootFixture(): Fixture {
   const fixture = createFixture();
+  const requestPosition = 2n;
+  const workflow = addCurrentSchemaSealedWorkflowProjection(
+    fixture,
+    requestPosition,
+  );
   const frozenPosition = 9_223_372_036_854_775_807n;
   const checkpoint = qualifiedCheckpointFixture({
     checkpointId: uuid(89_020) as never,
     sessionId: ROOT_ID as never,
-    baseEventPosition: 1n,
+    baseEventPosition: requestPosition,
     checkpointEventPosition: frozenPosition,
   });
   rawEvent(fixture.connection, {
     globalPosition: frozenPosition,
     streamId: `session/${ROOT_ID}`,
-    streamVersion: 2n,
+    streamVersion: 3n,
     eventType: "SessionCheckpointRecorded",
     eventSchemaVersion: 2,
     sessionId: ROOT_ID,
     payload: {
       checkpoint,
-      baseEventPosition: "1",
+      baseEventPosition: requestPosition.toString(),
       checkpointEventPosition: frozenPosition.toString(),
     },
   });
   fixture.connection.prepare(`
-    UPDATE streams SET current_version = 2
+    UPDATE streams SET current_version = 3
     WHERE project_id = $projectId AND stream_id = $streamId
   `).run({ $projectId: PROJECT_ID, $streamId: `session/${ROOT_ID}` });
   dropTrigger(fixture.connection, "workflow_instances_evidence_v3_insert_guard");
@@ -2774,13 +2923,18 @@ function frozenInt64RootFixture(): Fixture {
       "final-checkpoint-recorded",
       checkpoint.checkpointId,
       frozenPosition.toString(),
+      requestPosition.toString(),
+      workflow.workflowId,
     )),
+    workflow_id: workflow.workflowId,
+    root_command_id: workflow.commandId,
+    triggering_event_position: requestPosition,
+    expected_authority_commitment: rootAuthority().authority_commitment,
     evidence_frozen_checkpoint_event_position: frozenPosition,
     evidence_frozen_generation: 1,
     evidence_window_state: "sealed",
     final_ending_scope_bindings_json: "[]",
   });
-  addMigratedLegacyWorkflowProjection(fixture);
   return fixture;
 }
 
@@ -2912,7 +3066,8 @@ function frozenCurrentChildFixture(
   const childCheckpointPosition = 3n;
   const childLastPosition = hasCheckpoint || hasCoverage ? 3n : 2n;
   const childStreamVersion = hasCheckpoint || hasCoverage ? 2n : 1n;
-  const rootCheckpointPosition = childLastPosition + 1n;
+  const workflowRequestPosition = childLastPosition + 3n;
+  const rootCheckpointPosition = workflowRequestPosition + 1n;
   const childCheckpoint = qualifiedCheckpointFixture({
     checkpointId: childCheckpointId as never,
     sessionId: CHILD_ID as never,
@@ -2995,7 +3150,7 @@ function frozenCurrentChildFixture(
     ...qualifiedCheckpointFixture({
       checkpointId: uuid(89_031) as never,
       sessionId: ROOT_ID as never,
-      baseEventPosition: 1n,
+      baseEventPosition: workflowRequestPosition,
       checkpointEventPosition: rootCheckpointPosition,
     }),
     childSummaries: [{
@@ -3006,21 +3161,25 @@ function frozenCurrentChildFixture(
       latestCheckpointId: hasCheckpoint ? childCheckpointId : null,
     }],
   };
+  const workflow = addCurrentSchemaSealedWorkflowProjection(
+    fixture,
+    workflowRequestPosition,
+  );
   rawEvent(fixture.connection, {
     globalPosition: rootCheckpointPosition,
     streamId: `session/${ROOT_ID}`,
-    streamVersion: 2n,
+    streamVersion: 3n,
     eventType: "SessionCheckpointRecorded",
     eventSchemaVersion: 2,
     sessionId: ROOT_ID,
     payload: {
       checkpoint: rootCheckpoint,
-      baseEventPosition: "1",
+      baseEventPosition: workflowRequestPosition.toString(),
       checkpointEventPosition: rootCheckpointPosition.toString(),
     },
   });
   fixture.connection.prepare(`
-    UPDATE streams SET current_version = 2
+    UPDATE streams SET current_version = 3
     WHERE project_id = $projectId AND stream_id = $streamId
   `).run({ $projectId: PROJECT_ID, $streamId: `session/${ROOT_ID}` });
   dropTrigger(fixture.connection, "workflow_instances_evidence_v3_insert_guard");
@@ -3030,13 +3189,18 @@ function frozenCurrentChildFixture(
       "final-checkpoint-recorded",
       String(rootCheckpoint.checkpointId),
       rootCheckpointPosition.toString(),
+      workflowRequestPosition.toString(),
+      workflow.workflowId,
     )),
+    workflow_id: workflow.workflowId,
+    root_command_id: workflow.commandId,
+    triggering_event_position: workflowRequestPosition,
+    expected_authority_commitment: rootAuthority().authority_commitment,
     evidence_frozen_checkpoint_event_position: rootCheckpointPosition,
     evidence_frozen_generation: 1,
     evidence_window_state: "sealed",
     final_ending_scope_bindings_json: canonicalJson([binding]),
   });
-  addMigratedLegacyWorkflowProjection(fixture);
   const genesisProjection = genesisChildProjection(
     CHILD_ID,
     2n,
@@ -3186,12 +3350,14 @@ function nonLatestReportFixture(): {
   });
   insertChildProjection(fixture.connection, projection);
 
+  const workflowRequestPosition = 7n;
+  const rootCheckpointPosition = 8n;
   const rootCheckpoint = {
     ...qualifiedCheckpointFixture({
       checkpointId: uuid(93_001) as never,
       sessionId: ROOT_ID as never,
-      baseEventPosition: 1n,
-      checkpointEventPosition: 7n,
+      baseEventPosition: workflowRequestPosition,
+      checkpointEventPosition: rootCheckpointPosition,
     }),
     childSummaries: [{
       childSessionId: CHILD_ID,
@@ -3201,21 +3367,25 @@ function nonLatestReportFixture(): {
       latestCheckpointId: null,
     }],
   };
+  const workflow = addCurrentSchemaSealedWorkflowProjection(
+    fixture,
+    workflowRequestPosition,
+  );
   rawEvent(fixture.connection, {
-    globalPosition: 7n,
+    globalPosition: rootCheckpointPosition,
     streamId: `session/${ROOT_ID}`,
-    streamVersion: 2n,
+    streamVersion: 3n,
     eventType: "SessionCheckpointRecorded",
     eventSchemaVersion: 2,
     sessionId: ROOT_ID,
     payload: {
       checkpoint: rootCheckpoint,
-      baseEventPosition: "1",
-      checkpointEventPosition: "7",
+      baseEventPosition: workflowRequestPosition.toString(),
+      checkpointEventPosition: rootCheckpointPosition.toString(),
     },
   });
   fixture.connection.prepare(`
-    UPDATE streams SET current_version = 2
+    UPDATE streams SET current_version = 3
     WHERE project_id = $projectId AND stream_id = $streamId
   `).run({ $projectId: PROJECT_ID, $streamId: `session/${ROOT_ID}` });
   const binding = {
@@ -3236,14 +3406,19 @@ function nonLatestReportFixture(): {
     result_json: canonicalJson(workflowStatus(
       "final-checkpoint-recorded",
       String(rootCheckpoint.checkpointId),
-      "7",
+      rootCheckpointPosition.toString(),
+      workflowRequestPosition.toString(),
+      workflow.workflowId,
     )),
-    evidence_frozen_checkpoint_event_position: 7,
+    workflow_id: workflow.workflowId,
+    root_command_id: workflow.commandId,
+    triggering_event_position: workflowRequestPosition,
+    expected_authority_commitment: rootAuthority().authority_commitment,
+    evidence_frozen_checkpoint_event_position: rootCheckpointPosition,
     evidence_frozen_generation: 1,
     evidence_window_state: "sealed",
     final_ending_scope_bindings_json: canonicalJson([binding]),
   });
-  addMigratedLegacyWorkflowProjection(fixture);
   return { fixture, reportAEventPosition: 3n };
 }
 
@@ -3553,7 +3728,7 @@ it("bounded quick integrity rejects noncanonical top-level scalar escapes while 
   ).run({ $payload: opaqueFramePayload });
   assert.deepEqual((await quickIssues(escapedFrame)).issues, []);
 });
-it("bounded quick integrity performs only a current workflow endpoint read", async () => {
+it("bounded quick integrity performs only fixed current workflow endpoint reads", async () => {
   const frozen = frozenCurrentChildFixture("checkpoint");
   seedCoverage(frozen.fixture, {
     sessionId: CHILD_ID,
@@ -3567,7 +3742,7 @@ it("bounded quick integrity performs only a current workflow endpoint read", asy
   assert.equal(result.reads.childProjectionTargetReads(), 0);
   assert.equal(result.reads.childProjectionPredecessorReads(), 0);
   assert.equal(result.reads.reportWitnessReads(), 0);
-  assert.equal(result.reads.workflowProjectionReads(), 1);
+  assert.equal(result.reads.workflowProjectionReads(), 3);
 });
 
 it("bounded quick integrity accepts clean open-window endpoints with fixed reads", async () => {
@@ -3577,7 +3752,7 @@ it("bounded quick integrity accepts clean open-window endpoints with fixed reads
   assert.equal(result.reads.childProjectionTargetReads(), 0);
   assert.equal(result.reads.childProjectionPredecessorReads(), 0);
   assert.equal(result.reads.reportWitnessReads(), 0);
-  assert.equal(result.reads.workflowProjectionReads(), 1);
+  assert.equal(result.reads.workflowProjectionReads(), 2);
 
   const maintenanceInspection = openAmendmentFixture(null);
   const maintenanceContext = {
@@ -3596,7 +3771,7 @@ it("bounded quick integrity accepts clean open-window endpoints with fixed reads
   assert.equal(maintenance.reads.childProjectionTargetReads(), 0);
   assert.equal(maintenance.reads.childProjectionPredecessorReads(), 0);
   assert.equal(maintenance.reads.reportWitnessReads(), 0);
-  assert.equal(maintenance.reads.workflowProjectionReads(), 1);
+  assert.equal(maintenance.reads.workflowProjectionReads(), 2);
 });
 
 it("bounded quick integrity does not read historical report witnesses for clean endpoints", async () => {
@@ -3606,7 +3781,7 @@ it("bounded quick integrity does not read historical report witnesses for clean 
   assert.equal(result.reads.childProjectionTargetReads(), 0);
   assert.equal(result.reads.childProjectionPredecessorReads(), 0);
   assert.equal(result.reads.reportWitnessReads(), 0);
-  assert.equal(result.reads.workflowProjectionReads(), 1);
+  assert.equal(result.reads.workflowProjectionReads(), 3);
 });
 
 it("schema 2 quick integrity retains the legacy historical workflow mode", async () => {
@@ -3964,6 +4139,108 @@ it("schema 4 integrity admits V3 cancellation after a legacy workflow fingerprin
 
   assert.deepEqual((await quickIssues(control)).issues, []);
   assert.deepEqual(directWorkflowShapeIssues(control, false), []);
+});
+
+it("schema 4 public async quick authenticates a V1 endpoint against its trigger and predecessor", async () => {
+  const control = openAmendmentFixture(null);
+  assert.deepEqual((await quickIssues(control)).issues, []);
+  assert.ok(!(await publicQuickIssueCodes(control)).includes(
+    "LIFECYCLE_WORKFLOW_INVARIANT_MISMATCH",
+  ));
+  assert.deepEqual(
+    (await quickIssues(collapsedLegacyCancellationFixture())).issues,
+    [],
+  );
+
+  const observed: Array<{
+    readonly label: string;
+    readonly directRejected: boolean;
+    readonly publicRejected: boolean;
+  }> = [];
+  for (const corruption of [
+    {
+      label: "effective checkpoint version",
+      effectiveCheckpointVersion: 1 as const,
+      previousFingerprint: undefined,
+    },
+    {
+      label: "previous fingerprint",
+      effectiveCheckpointVersion: 2 as const,
+      previousFingerprint: H64_B,
+    },
+  ]) {
+    const fixture = openAmendmentFixture(null);
+    const predecessor = fixture.connection.prepare(`
+      SELECT fingerprint
+      FROM lifecycle_workflow_generation_folds
+      WHERE project_id = $projectId
+        AND workflow_id = $workflowId
+        AND workflow_generation = 1
+    `).get({ $projectId: PROJECT_ID, $workflowId: uuid(89_005) });
+    assert.equal(typeof predecessor?.fingerprint, "string");
+    const previousFingerprint = corruption.previousFingerprint
+      ?? String(predecessor!.fingerprint);
+    assert.notEqual(previousFingerprint, "");
+    if (corruption.previousFingerprint !== undefined) {
+      assert.notEqual(previousFingerprint, predecessor!.fingerprint);
+    }
+    const corrupted = workflowProjection({
+      projectId: PROJECT_ID,
+      workflowId: uuid(89_005),
+      workflowGeneration: 2,
+      sessionId: ROOT_ID,
+      triggerEventPosition: 3n,
+      rootCommandId: uuid(30_003),
+      evidenceWindowState: "open",
+      replacementCheckpointVersion: null,
+      effectiveCheckpointVersion: corruption.effectiveCheckpointVersion,
+      effectiveDraftSourceEventPosition: 2n,
+      previousFingerprint,
+    });
+    fixture.connection.exec(
+      "DROP TRIGGER lifecycle_workflow_generation_folds_no_update",
+    );
+    fixture.connection.exec("PRAGMA ignore_check_constraints = ON");
+    fixture.connection.prepare(`
+      UPDATE lifecycle_workflow_generation_folds
+      SET effective_checkpoint_version = $effectiveCheckpointVersion,
+          previous_fingerprint = $previousFingerprint,
+          fingerprint = $fingerprint
+      WHERE project_id = $projectId
+        AND workflow_id = $workflowId
+        AND workflow_generation = 2
+    `).run({
+      $effectiveCheckpointVersion: corrupted.effectiveCheckpointVersion,
+      $previousFingerprint: corrupted.previousFingerprint,
+      $fingerprint: corrupted.fingerprint,
+      $projectId: PROJECT_ID,
+      $workflowId: corrupted.workflowId,
+    });
+    fixture.connection.exec("PRAGMA ignore_check_constraints = OFF");
+
+    const direct = await quickIssues(fixture);
+    observed.push({
+      label: corruption.label,
+      directRejected: direct.issues.includes(
+        "LIFECYCLE_WORKFLOW_INVARIANT_MISMATCH",
+      ),
+      publicRejected: (await publicQuickIssueCodes(fixture)).includes(
+        "LIFECYCLE_WORKFLOW_INVARIANT_MISMATCH",
+      ),
+    });
+  }
+  assert.deepEqual(observed, [
+    {
+      label: "effective checkpoint version",
+      directRejected: true,
+      publicRejected: true,
+    },
+    {
+      label: "previous fingerprint",
+      directRejected: true,
+      publicRejected: true,
+    },
+  ]);
 });
 
 it("schema 4 quick integrity recomputes the immediate V2 predecessor fingerprint", async () => {

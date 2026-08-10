@@ -5871,17 +5871,18 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
       || projection.rootCommandId !== workflow.root_command_id
       || projection.evidenceWindowState !== workflow.evidence_window_state
     ) throw new LifecycleError("INTEGRITY_FAILURE");
-    if (projection.fingerprintSchemaVersion !== 2) {
-      if (integer(rootTrigger?.event_schema_version) === 3) {
-        throw new LifecycleError("INTEGRITY_FAILURE");
-      }
-      return null;
-    }
     const predecessor = generation === 1 ? null : this.schema4WorkflowProjection(
       context.binding.projectId,
       projection.workflowId,
       generation - 1,
     );
+    if (projection.fingerprintSchemaVersion !== 2) {
+      if (integer(rootTrigger?.event_schema_version) === 3) {
+        throw new LifecycleError("INTEGRITY_FAILURE");
+      }
+      this.assertSchema4V1ProjectionEndpoint(context, projection, predecessor);
+      return null;
+    }
     const predecessorBase = generation <= 2 ? null : this.schema4WorkflowProjection(
       context.binding.projectId,
       projection.workflowId,
@@ -5895,6 +5896,61 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
       );
     }
     return this.assertSchema4ProjectionEndpoint(context, projection, predecessor);
+  }
+
+  private assertSchema4V1ProjectionEndpoint(
+    context: ProjectContext,
+    projection: WorkflowGenerationFoldProjection,
+    predecessor: WorkflowGenerationFoldProjection | null,
+  ): void {
+    const trigger = this.storedEventAt(projection.triggerEventPosition);
+    const intent = this.commandIntentEventZero(context, trigger);
+    let expected: WorkflowGenerationFoldProjection;
+    try {
+      let collapsed: WorkflowGenerationFoldProjection | null = null;
+      if (
+        projection.effectiveDraftSourceEventPosition
+          < projection.triggerEventPosition
+      ) {
+        const source = this.storedEventAt(
+          projection.effectiveDraftSourceEventPosition,
+        );
+        const classified = classifyWorkflowProjectionEvent(source);
+        if (
+          classified.kind === "identified"
+          && classified.workflowId === projection.workflowId
+          && classified.workflowGeneration === projection.workflowGeneration
+        ) {
+          collapsed = foldWorkflowGenerationProjection(
+            predecessor,
+            source,
+            this.commandIntentEventZero(context, source),
+            "live-schema-3",
+          );
+        }
+      }
+      expected = foldWorkflowGenerationProjection(
+        collapsed ?? predecessor,
+        trigger,
+        intent,
+        collapsed === null ? "live-schema-3" : "schema-2-preflight",
+      );
+    } catch {
+      throw new LifecycleError("INTEGRITY_FAILURE");
+    }
+    if (
+      projection.fingerprintSchemaVersion !== 1
+      || projection.projectId !== context.binding.projectId
+      || (projection.workflowGeneration === 1) !== (predecessor === null)
+      || (predecessor !== null && (
+        predecessor.workflowGeneration !== projection.workflowGeneration - 1
+        || predecessor.fingerprint !== projection.previousFingerprint
+        || predecessor.triggerEventPosition >= projection.triggerEventPosition
+      ))
+      || trigger.eventSchemaVersion === 3
+      || !this.sameWorkflowProjection(projection, expected)
+    ) throw new LifecycleError("INTEGRITY_FAILURE");
+    this.assertEffectiveWorkflowSource(context, projection);
   }
 
   private assertSchema4ProjectionEndpoint(
