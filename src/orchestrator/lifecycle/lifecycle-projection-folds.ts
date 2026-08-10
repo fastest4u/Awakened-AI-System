@@ -2,8 +2,8 @@ import { createHash } from "node:crypto";
 import type { StoredEvent } from "../contracts/event.js";
 import { canonicalJson } from "../serialization/canonical-json.js";
 import {
-  decodeLegacyLifecycleEvent,
-  type LifecycleEvent,
+  decodeLifecycleEvent,
+  type LifecycleEventCodecResult,
 } from "./contracts/events.js";
 import type { ChildSessionState } from "./contracts/identifiers.js";
 import type { LifecycleIntentWitnessV1 } from "./lifecycle-intent-witness.js";
@@ -18,6 +18,8 @@ const CHILD_EVENT_FOLD_DOMAIN =
   "project-memory/lifecycle/child-event-fold/v1\n";
 const WORKFLOW_GENERATION_DOMAIN =
   "project-memory/lifecycle/workflow-generation/v1\n";
+const WORKFLOW_GENERATION_V2_DOMAIN =
+  "project-memory/lifecycle/workflow-generation/v2\n";
 const LOWER_HASH = /^[0-9a-f]{64}$/;
 const CHILD_REPORT_LIMIT = 200;
 
@@ -58,8 +60,31 @@ export interface WorkflowGenerationFoldProjection {
   readonly replacementCheckpointVersion: 1 | 2 | null;
   readonly effectiveCheckpointVersion: 1 | 2;
   readonly effectiveDraftSourceEventPosition: bigint;
+  readonly fingerprintSchemaVersion: 1 | 2;
+  readonly effectiveStateSourceEventPosition: bigint | null;
+  readonly effectiveStateVersion: 1 | null;
+  readonly effectiveStateHash: string | null;
   readonly previousFingerprint: string | null;
   readonly fingerprint: string;
+}
+
+export interface WorkflowFingerprintV2Input {
+  readonly projectId: string;
+  readonly workflowId: string;
+  readonly workflowGeneration: number;
+  readonly sessionId: string;
+  readonly triggerEventPosition: bigint;
+  readonly triggerEventHash: string;
+  readonly rootCommandId: string;
+  readonly evidenceWindowState: "open" | "sealed";
+  readonly replacementCheckpointVersion: 1 | 2 | null;
+  readonly effectiveCheckpointVersion: 1 | 2;
+  readonly effectiveDraftSourceEventPosition: bigint;
+  readonly effectiveStateSourceEventPosition: bigint | null;
+  readonly effectiveStateVersion: 1 | null;
+  readonly effectiveStateHash: string | null;
+  readonly previousFingerprintSchemaVersion: 1 | 2 | null;
+  readonly previousFingerprint: string | null;
 }
 
 export type ChildProjectionEventClassification =
@@ -331,10 +356,68 @@ export function workflowGenerationFingerprint(
   ]);
 }
 
+/** The schema-4 workflow fold fingerprint. Its preimage is deliberately
+ * independent of the V1 projection shape, which remains frozen. */
+export function workflowFingerprintV2(input: WorkflowFingerprintV2Input): string {
+  assertPositiveInt64(input.triggerEventPosition);
+  assertPositiveInt64(input.effectiveDraftSourceEventPosition);
+  assertHash(input.triggerEventHash);
+  if (
+    input.projectId.length === 0
+    || input.workflowId.length === 0
+    || input.sessionId.length === 0
+    || input.rootCommandId.length === 0
+    || !Number.isSafeInteger(input.workflowGeneration)
+    || input.workflowGeneration <= 0
+    || input.effectiveDraftSourceEventPosition > input.triggerEventPosition
+    || (input.evidenceWindowState !== "open" && input.evidenceWindowState !== "sealed")
+    || (input.replacementCheckpointVersion !== null
+      && input.replacementCheckpointVersion !== 1
+      && input.replacementCheckpointVersion !== 2)
+    || (input.effectiveCheckpointVersion !== 1 && input.effectiveCheckpointVersion !== 2)
+    || (input.evidenceWindowState === "open" && input.effectiveCheckpointVersion !== 2)
+    || (input.replacementCheckpointVersion !== null
+      && (input.replacementCheckpointVersion !== input.effectiveCheckpointVersion
+        || input.effectiveDraftSourceEventPosition !== input.triggerEventPosition))
+    || (input.effectiveStateSourceEventPosition === null)
+      !== (input.effectiveStateVersion === null)
+    || (input.effectiveStateSourceEventPosition === null)
+      !== (input.effectiveStateHash === null)
+    || (input.effectiveStateSourceEventPosition !== null
+      && (input.effectiveStateSourceEventPosition > input.triggerEventPosition
+        || input.effectiveStateVersion !== 1))
+    || (input.effectiveStateHash !== null && !LOWER_HASH.test(input.effectiveStateHash))
+    || (input.previousFingerprintSchemaVersion === null)
+      !== (input.previousFingerprint === null)
+    || (input.previousFingerprintSchemaVersion !== null
+      && input.previousFingerprintSchemaVersion !== 1
+      && input.previousFingerprintSchemaVersion !== 2)
+  ) invalid();
+  if (input.previousFingerprint !== null) assertHash(input.previousFingerprint);
+  return hash(WORKFLOW_GENERATION_V2_DOMAIN, [
+    input.projectId,
+    input.workflowId,
+    input.workflowGeneration.toString(),
+    input.sessionId,
+    input.triggerEventPosition.toString(),
+    input.triggerEventHash,
+    input.rootCommandId,
+    input.evidenceWindowState,
+    input.replacementCheckpointVersion,
+    input.effectiveCheckpointVersion,
+    input.effectiveDraftSourceEventPosition.toString(),
+    input.effectiveStateSourceEventPosition?.toString() ?? null,
+    input.effectiveStateVersion,
+    input.effectiveStateHash,
+    input.previousFingerprintSchemaVersion,
+    input.previousFingerprint,
+  ]);
+}
+
 function decodeStoredEvent(
   event: StoredEvent,
   authorityCommitment: string,
-): LifecycleEvent {
+): LifecycleEventCodecResult {
   if (
     event.streamType !== "session"
     || event.sessionId === null
@@ -342,7 +425,7 @@ function decodeStoredEvent(
   assertPositiveInt64(event.globalPosition);
   assertPositiveInt64(event.streamVersion);
   try {
-    return decodeLegacyLifecycleEvent({
+    return decodeLifecycleEvent({
       eventSchemaVersion: event.eventSchemaVersion,
       eventId: event.eventId,
       projectId: event.projectId,
@@ -650,10 +733,21 @@ export function foldChildEventProjection(
 
 function finishWorkflow(
   row: Omit<WorkflowGenerationFoldProjection, "fingerprint">,
+  triggerEventHash: string | null,
+  previousFingerprintSchemaVersion: 1 | 2 | null,
 ): WorkflowGenerationFoldProjection {
+  const fingerprint = row.fingerprintSchemaVersion === 1
+    ? workflowGenerationFingerprint(row)
+    : triggerEventHash === null
+      ? invalid()
+      : workflowFingerprintV2({
+          ...row,
+          triggerEventHash,
+          previousFingerprintSchemaVersion,
+        });
   return Object.freeze({
     ...row,
-    fingerprint: workflowGenerationFingerprint(row),
+    fingerprint,
   });
 }
 
@@ -701,20 +795,33 @@ export function foldWorkflowGenerationProjection(
   let effectiveCheckpointVersion: 1 | 2;
   let effectiveDraftSourceEventPosition: bigint;
   let previousFingerprint = previous?.fingerprint ?? null;
+  const previousFingerprintSchemaVersion = previous?.fingerprintSchemaVersion ?? null;
+  const fingerprintSchemaVersion = event.eventSchemaVersion === 3 ? 2 : 1;
+  let effectiveStateSourceEventPosition: bigint | null = null;
+  let effectiveStateVersion: 1 | null = null;
+  let effectiveStateHash: string | null = null;
 
   switch (event.eventType) {
     case "SessionEndRequested": {
       if (command.commandType !== "request-session-end") invalid();
       const request = record(command.request);
-      if (
-        request.sessionId !== event.sessionId
-        || request.childEndPolicy !== event.payload.childEndPolicy
+      if (request.sessionId !== event.sessionId) invalid();
+      if (event.eventSchemaVersion !== 3 && (
+        request.childEndPolicy !== event.payload.childEndPolicy
         || request.requestedQualityThreshold !== event.payload.qualityThreshold
         || request.requireFullEvidence !== event.payload.requireFullEvidence
         || request.requireMaterialization !== event.payload.requireMaterialization
-      ) invalid();
+      )) invalid();
       const version = checkpointVersion(request.finalCheckpoint);
-      if (
+      if (event.eventSchemaVersion === 3) {
+        if (
+          canonicalJson(request) !== canonicalJson(event.payload.effectiveState.request)
+          || request.requestVersion !== event.payload.effectiveState.request.requestVersion
+        ) invalid();
+        effectiveStateSourceEventPosition = trigger.globalPosition;
+        effectiveStateVersion = event.payload.effectiveState.effectiveStateVersion;
+        effectiveStateHash = event.payload.effectiveState.effectiveStateHash;
+      } else if (
         (event.eventSchemaVersion === 1 && request.requestVersion !== 1)
         || (event.eventSchemaVersion === 2 && request.requestVersion !== 2)
       ) invalid();
@@ -762,9 +869,35 @@ export function foldWorkflowGenerationProjection(
         evidenceWindowState = previous.evidenceWindowState;
       } else {
         if (
-          amendment.amendmentVersion !== 2
-          || amendment.evidenceWindowAction !== event.payload.evidenceWindowAction
-          || event.payload.finalCheckpointVersion !== replacementCheckpointVersion
+          (event.eventSchemaVersion === 2 && (
+            amendment.amendmentVersion !== 2
+            || amendment.evidenceWindowAction !== event.payload.evidenceWindowAction
+            || event.payload.finalCheckpointVersion !== replacementCheckpointVersion
+          ))
+          || (event.eventSchemaVersion === 3 && (
+            amendment.amendmentVersion !== 2
+            || amendment.evidenceWindowAction !== event.payload.evidenceWindowAction
+            || event.payload.effectiveState.request.sessionId !== event.sessionId
+            || event.payload.effectiveState.request.requestVersion
+              !== event.payload.effectiveState.effectiveFinalCheckpoint.checkpointVersion
+            || (amendment.childEndPolicy !== null
+              && amendment.childEndPolicy !== event.payload.effectiveState.request.childEndPolicy)
+            || (amendment.finalCheckpoint !== null
+              && canonicalJson(amendment.finalCheckpoint)
+                !== canonicalJson(event.payload.effectiveState.request.finalCheckpoint))
+            || (amendment.validationProfileIds !== null
+              && canonicalJson(amendment.validationProfileIds)
+                !== canonicalJson(event.payload.effectiveState.request.validationProfileIds))
+            || (amendment.requestedQualityThreshold !== null
+              && amendment.requestedQualityThreshold
+                !== event.payload.effectiveState.request.requestedQualityThreshold)
+            || (amendment.requireFullEvidence !== null
+              && amendment.requireFullEvidence
+                !== event.payload.effectiveState.request.requireFullEvidence)
+            || (amendment.requireMaterialization !== null
+              && amendment.requireMaterialization
+                !== event.payload.effectiveState.request.requireMaterialization)
+          ))
         ) invalid();
         if (
           event.payload.evidenceWindowAction === "open"
@@ -782,6 +915,15 @@ export function foldWorkflowGenerationProjection(
           : event.payload.evidenceWindowAction === "seal"
             ? "sealed"
             : previous.evidenceWindowState;
+      }
+      if (event.eventSchemaVersion === 3) {
+        effectiveStateSourceEventPosition = trigger.globalPosition;
+        effectiveStateVersion = event.payload.effectiveState.effectiveStateVersion;
+        effectiveStateHash = event.payload.effectiveState.effectiveStateHash;
+      } else {
+        effectiveStateSourceEventPosition = previous.effectiveStateSourceEventPosition;
+        effectiveStateVersion = previous.effectiveStateVersion;
+        effectiveStateHash = previous.effectiveStateHash;
       }
       effectiveCheckpointVersion = replacementCheckpointVersion
         ?? previous.effectiveCheckpointVersion;
@@ -818,6 +960,9 @@ export function foldWorkflowGenerationProjection(
       effectiveDraftSourceEventPosition =
         previous.effectiveDraftSourceEventPosition;
       evidenceWindowState = "sealed";
+      effectiveStateSourceEventPosition = previous.effectiveStateSourceEventPosition;
+      effectiveStateVersion = previous.effectiveStateVersion;
+      effectiveStateHash = previous.effectiveStateHash;
       break;
     }
     case "SessionAbandoned": {
@@ -850,6 +995,9 @@ export function foldWorkflowGenerationProjection(
       effectiveDraftSourceEventPosition =
         previous.effectiveDraftSourceEventPosition;
       evidenceWindowState = "sealed";
+      effectiveStateSourceEventPosition = previous.effectiveStateSourceEventPosition;
+      effectiveStateVersion = previous.effectiveStateVersion;
+      effectiveStateHash = previous.effectiveStateHash;
       break;
     }
     default:
@@ -861,9 +1009,9 @@ export function foldWorkflowGenerationProjection(
     && (
       previous.projectId !== event.projectId
       || trigger.globalPosition <= previous.triggerEventPosition
-      || previous.fingerprint !== workflowGenerationFingerprint(
-        withoutWorkflowFingerprint(previous),
-      )
+      || (previous.fingerprintSchemaVersion === 1
+        ? previous.fingerprint !== workflowGenerationFingerprint(withoutWorkflowFingerprint(previous))
+        : previous.fingerprintSchemaVersion !== 2)
     )
   ) invalid();
   if (
@@ -889,6 +1037,10 @@ export function foldWorkflowGenerationProjection(
     replacementCheckpointVersion,
     effectiveCheckpointVersion,
     effectiveDraftSourceEventPosition,
+    fingerprintSchemaVersion,
+    effectiveStateSourceEventPosition,
+    effectiveStateVersion,
+    effectiveStateHash,
     previousFingerprint,
-  });
+  }, fingerprintSchemaVersion === 2 ? trigger.eventHash : null, previousFingerprintSchemaVersion);
 }

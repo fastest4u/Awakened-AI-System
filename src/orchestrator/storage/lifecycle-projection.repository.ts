@@ -10,13 +10,14 @@ import {
   foldChildEventProjection,
   foldWorkflowGenerationProjection,
   reportItemSetFingerprint,
+  workflowFingerprintV2,
   workflowGenerationFingerprint,
   type ChildEventFoldProjection,
   type WorkflowGenerationFoldProjection,
 } from "../lifecycle/lifecycle-projection-folds.js";
 import {
-  decodeLegacyLifecycleEvent,
-  type LifecycleEvent,
+  decodeLifecycleEvent,
+  type LifecycleEventCodecResult,
 } from "../lifecycle/contracts/events.js";
 import {
   decodeLifecycleIntentWitness,
@@ -300,10 +301,23 @@ function hydrateWorkflow(row: SqliteRow): WorkflowGenerationFoldProjection {
     row,
     "effective_draft_source_event_position",
   );
+  const fingerprintSchemaVersion = row["fingerprint_schema_version"] === undefined
+    ? 1
+    : rowInteger(row, "fingerprint_schema_version");
+  const effectiveStateSourceEventPosition = row["effective_state_source_event_position"] === undefined
+    ? null
+    : nullableRowBigint(row, "effective_state_source_event_position");
+  const effectiveStateVersion = row["effective_state_version"] === undefined
+    ? null
+    : nullableRowInteger(row, "effective_state_version");
+  const effectiveStateHash = row["effective_state_hash"] === undefined
+    ? null
+    : nullableRowString(row, "effective_state_hash");
   const previousFingerprint = nullableRowString(row, "previous_fingerprint");
   const fingerprint = rowString(row, "fingerprint");
   if (
     workflowGeneration <= 0
+    || (fingerprintSchemaVersion !== 1 && fingerprintSchemaVersion !== 2)
     || (evidenceWindowState !== "open" && evidenceWindowState !== "sealed")
     || (
       replacementCheckpointVersion !== null
@@ -323,6 +337,18 @@ function hydrateWorkflow(row: SqliteRow): WorkflowGenerationFoldProjection {
     || (workflowGeneration === 1) !== (previousFingerprint === null)
     || (previousFingerprint !== null && !LOWER_HASH.test(previousFingerprint))
     || !LOWER_HASH.test(fingerprint)
+    || (fingerprintSchemaVersion === 1 && (
+      effectiveStateSourceEventPosition !== null
+      || effectiveStateVersion !== null
+      || effectiveStateHash !== null
+    ))
+    || (fingerprintSchemaVersion === 2 && (
+      effectiveStateSourceEventPosition === null
+      || effectiveStateVersion !== 1
+      || effectiveStateHash === null
+      || effectiveStateSourceEventPosition > triggerEventPosition
+      || !LOWER_HASH.test(effectiveStateHash)
+    ))
   ) {
     return integrity();
   }
@@ -337,11 +363,16 @@ function hydrateWorkflow(row: SqliteRow): WorkflowGenerationFoldProjection {
     replacementCheckpointVersion,
     effectiveCheckpointVersion,
     effectiveDraftSourceEventPosition,
+    fingerprintSchemaVersion: fingerprintSchemaVersion as 1 | 2,
+    effectiveStateSourceEventPosition,
+    effectiveStateVersion: effectiveStateVersion as 1 | null,
+    effectiveStateHash,
     previousFingerprint,
     fingerprint,
   });
   if (
-    workflowGenerationFingerprint(workflowWithoutFingerprint(projection))
+    fingerprintSchemaVersion === 1
+    && workflowGenerationFingerprint(workflowWithoutFingerprint(projection))
       !== fingerprint
   ) {
     return integrity();
@@ -600,9 +631,9 @@ const EVENT_COLUMNS = `
 function decodeStoredLifecycleEvent(
   event: StoredEvent,
   authorityCommitment: string,
-): LifecycleEvent {
+): LifecycleEventCodecResult {
   try {
-    return decodeLegacyLifecycleEvent({
+    return decodeLifecycleEvent({
       eventSchemaVersion: event.eventSchemaVersion,
       eventId: event.eventId,
       projectId: event.projectId,
@@ -807,7 +838,7 @@ implements LifecycleProjectionWriter {
         $workflowId: workflowId,
         $workflowGeneration: BigInt(workflowGeneration),
       }));
-      return row === null ? null : hydrateWorkflow(row);
+      return row === null ? null : this.#verifyWorkflowHydration(hydrateWorkflow(row));
     } catch (error) {
       if (error instanceof LifecycleError && error.code === "INTEGRITY_FAILURE") {
         throw error;
@@ -841,6 +872,39 @@ implements LifecycleProjectionWriter {
       LIMIT 2
     `).all({ $globalPosition: globalPosition }));
     return row === null ? integrity() : storedEventFromRow(row);
+  }
+
+  #verifyWorkflowHydration(
+    projection: WorkflowGenerationFoldProjection,
+  ): WorkflowGenerationFoldProjection {
+    if (projection.fingerprintSchemaVersion === 1) return projection;
+    const trigger = this.#eventAt(projection.triggerEventPosition);
+    const predecessor = projection.workflowGeneration === 1
+      ? null
+      : this.findWorkflowGeneration(
+          projection.projectId,
+          projection.workflowId,
+          projection.workflowGeneration - 1,
+        );
+    if (
+      trigger.projectId !== projection.projectId
+      || trigger.sessionId !== projection.sessionId
+      || trigger.commandId !== projection.rootCommandId
+      || trigger.eventSchemaVersion !== 3
+      || trigger.eventHash.length !== 64
+      || !LOWER_HASH.test(trigger.eventHash)
+      || (projection.workflowGeneration === 1) !== (predecessor === null)
+      || (predecessor !== null && (
+        predecessor.sessionId !== projection.sessionId
+        || predecessor.triggerEventPosition >= projection.triggerEventPosition
+      ))
+      || workflowFingerprintV2({
+        ...workflowWithoutFingerprint(projection),
+        triggerEventHash: trigger.eventHash,
+        previousFingerprintSchemaVersion: predecessor?.fingerprintSchemaVersion ?? null,
+      }) !== projection.fingerprint
+    ) integrity();
+    return projection;
   }
 
   #intentFor(event: StoredEvent): LifecycleIntentWitnessV1 {
@@ -1099,12 +1163,16 @@ implements LifecycleProjectionWriter {
         project_id, workflow_id, workflow_generation, session_id,
         trigger_event_position, root_command_id, evidence_window_state,
         replacement_checkpoint_version, effective_checkpoint_version,
-        effective_draft_source_event_position, previous_fingerprint, fingerprint
+        effective_draft_source_event_position, fingerprint_schema_version,
+        effective_state_source_event_position, effective_state_version,
+        effective_state_hash, previous_fingerprint, fingerprint
       ) VALUES (
         $projectId, $workflowId, $workflowGeneration, $sessionId,
         $triggerEventPosition, $rootCommandId, $evidenceWindowState,
         $replacementCheckpointVersion, $effectiveCheckpointVersion,
-        $effectiveDraftSourceEventPosition, $previousFingerprint, $fingerprint
+        $effectiveDraftSourceEventPosition, $fingerprintSchemaVersion,
+        $effectiveStateSourceEventPosition, $effectiveStateVersion,
+        $effectiveStateHash, $previousFingerprint, $fingerprint
       )
     `).run({
       $projectId: projection.projectId,
@@ -1118,6 +1186,13 @@ implements LifecycleProjectionWriter {
       $effectiveCheckpointVersion: projection.effectiveCheckpointVersion,
       $effectiveDraftSourceEventPosition:
         projection.effectiveDraftSourceEventPosition,
+      $fingerprintSchemaVersion: BigInt(projection.fingerprintSchemaVersion),
+      $effectiveStateSourceEventPosition:
+        projection.effectiveStateSourceEventPosition,
+      $effectiveStateVersion: projection.effectiveStateVersion === null
+        ? null
+        : BigInt(projection.effectiveStateVersion),
+      $effectiveStateHash: projection.effectiveStateHash,
       $previousFingerprint: projection.previousFingerprint,
       $fingerprint: projection.fingerprint,
     });

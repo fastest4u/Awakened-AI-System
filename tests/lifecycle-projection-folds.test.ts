@@ -30,6 +30,7 @@ import {
   reportWitnessFingerprint,
   workflowGenerationFingerprint,
 } from "../src/orchestrator/lifecycle/lifecycle-projection-folds.js";
+import * as lifecycleProjectionFolds from "../src/orchestrator/lifecycle/lifecycle-projection-folds.js";
 import { canonicalJson } from "../src/orchestrator/serialization/canonical-json.js";
 import {
   CHILD_SESSION_ID,
@@ -100,6 +101,79 @@ function stored(
     ...overrides,
   } as StoredEvent;
 }
+
+it("computes exact V2 workflow-generation fingerprint predecessor chains", () => {
+  const initialFixture = Object.freeze({
+    projectId: "11111111-1111-4111-8111-111111111111",
+    workflowId: "22222222-2222-4222-8222-222222222222",
+    workflowGeneration: 1,
+    sessionId: "33333333-3333-4333-8333-333333333333",
+    triggerEventPosition: 10n,
+    triggerEventHash: "a".repeat(64),
+    rootCommandId: "44444444-4444-4444-8444-444444444444",
+    evidenceWindowState: "open" as const,
+    replacementCheckpointVersion: 2 as const,
+    effectiveCheckpointVersion: 2 as const,
+    effectiveDraftSourceEventPosition: 10n,
+    effectiveStateSourceEventPosition: 10n,
+    effectiveStateVersion: 1 as const,
+    effectiveStateHash: "b".repeat(64),
+    previousFingerprintSchemaVersion: null,
+    previousFingerprint: null,
+  });
+  const fromV1Fixture = Object.freeze({
+    ...initialFixture,
+    workflowGeneration: 2,
+    triggerEventPosition: 11n,
+    triggerEventHash: "c".repeat(64),
+    effectiveDraftSourceEventPosition: 11n,
+    effectiveStateSourceEventPosition: 11n,
+    effectiveStateHash: "d".repeat(64),
+    previousFingerprintSchemaVersion: 1 as const,
+    previousFingerprint: "e".repeat(64),
+  });
+  const fromV2Fixture = Object.freeze({
+    ...fromV1Fixture,
+    workflowGeneration: 3,
+    triggerEventPosition: 12n,
+    triggerEventHash: "f".repeat(64),
+    effectiveDraftSourceEventPosition: 12n,
+    effectiveStateSourceEventPosition: 12n,
+    effectiveStateHash: "0".repeat(64),
+    previousFingerprintSchemaVersion: 2 as const,
+    previousFingerprint: "f79660ccfca717a2b476cb0c3b600a800b9ef07fb806a621298f4e866c3eed9b",
+  });
+  const fingerprint = Reflect.get(lifecycleProjectionFolds, "workflowFingerprintV2");
+  assert.equal(typeof fingerprint, "function");
+  assert.equal(Reflect.apply(fingerprint as Function, undefined, [initialFixture]), "edcc178050728d5b2212a7c60ccad2749365ea6ca810cb0ce22cfac30429278a");
+  assert.equal(Reflect.apply(fingerprint as Function, undefined, [fromV1Fixture]), "f79660ccfca717a2b476cb0c3b600a800b9ef07fb806a621298f4e866c3eed9b");
+  assert.equal(Reflect.apply(fingerprint as Function, undefined, [fromV2Fixture]), "0da57b84f113b56efd20c7b034edf27e48f458fcd56b1b4aab28b470c6edd2e4");
+  for (const mutation of [
+    { projectId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" },
+    { workflowId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb" },
+    { workflowGeneration: 2 },
+    { sessionId: "cccccccc-cccc-4ccc-8ccc-cccccccccccc" },
+    { triggerEventHash: "d".repeat(64) },
+    { rootCommandId: "dddddddd-dddd-4ddd-8ddd-dddddddddddd" },
+    { evidenceWindowState: "sealed" as const },
+    { replacementCheckpointVersion: null },
+    { effectiveStateSourceEventPosition: 9n },
+    { effectiveStateHash: "e".repeat(64) },
+  ]) {
+    assert.notEqual(
+      Reflect.apply(fingerprint as Function, undefined, [{ ...initialFixture, ...mutation }]),
+      "edcc178050728d5b2212a7c60ccad2749365ea6ca810cb0ce22cfac30429278a",
+    );
+  }
+  assert.notEqual(
+    Reflect.apply(fingerprint as Function, undefined, [{ ...fromV1Fixture, previousFingerprint: "0".repeat(64) }]),
+    "f79660ccfca717a2b476cb0c3b600a800b9ef07fb806a621298f4e866c3eed9b",
+  );
+  assert.notEqual(
+    Reflect.apply(fingerprint as Function, undefined, [{ ...fromV1Fixture, previousFingerprintSchemaVersion: 2 }]),
+    "f79660ccfca717a2b476cb0c3b600a800b9ef07fb806a621298f4e866c3eed9b",
+  );
+});
 
 function rootStored(input: {
   readonly position: bigint;
