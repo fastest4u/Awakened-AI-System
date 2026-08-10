@@ -77,6 +77,7 @@ import type {
   SqliteConnection,
   SqliteDriver,
   SqliteOpenOptions,
+  SqliteValue,
 } from "../src/orchestrator/storage/sqlite-driver.js";
 import { canonicalJson } from "../src/orchestrator/serialization/canonical-json.js";
 import type { RootStartCommandV2 } from "../src/orchestrator/lifecycle/contracts/commands.js";
@@ -84,6 +85,10 @@ import { buildLifecycleIntentWitness } from "../src/orchestrator/lifecycle/lifec
 import type { LifecycleEventV1 } from "../src/orchestrator/lifecycle/contracts/events.js";
 import { LifecycleError } from "../src/orchestrator/lifecycle/errors.js";
 import type { SessionId } from "../src/orchestrator/lifecycle/contracts/identifiers.js";
+import {
+  authorityCommitment,
+  type CommittedAuthorityV1,
+} from "../src/orchestrator/lifecycle/authority/authority-commitment.js";
 import {
   checkpointFixture,
   lifecycleEvent,
@@ -378,6 +383,93 @@ function lifecycleIssueCodes(
   return codes;
 }
 
+function authorityCommitmentForStoredRow(
+  row: Readonly<Record<string, SqliteValue>>,
+): string {
+  const text = (name: string): string | null => row[name] as string | null;
+  const number = (name: string): number | null => {
+    const value = row[name];
+    return value === null ? null : Number(value);
+  };
+  const decimal = (name: string): string | null => {
+    const value = row[name];
+    return value === null ? null : String(value);
+  };
+  return authorityCommitment({
+    authorityVersion: 1,
+    projectId: String(row.project_id),
+    sessionId: String(row.session_id),
+    sessionKind: row.session_kind as CommittedAuthorityV1["sessionKind"],
+    parentSessionId: text("parent_session_id"),
+    workspaceId: String(row.workspace_id),
+    clientNamespace: String(row.client_namespace),
+    ownerGeneration: decimal("owner_generation"),
+    childCapabilityGeneration: decimal("child_capability_generation"),
+    directAccessEnabled: row.direct_access_enabled === 1,
+    continuityFingerprintAlgorithm: text("continuity_fingerprint_algorithm"),
+    continuityFingerprintSchemaVersion: number("continuity_fingerprint_schema_version"),
+    continuityFingerprintKeyId: text("continuity_fingerprint_key_id"),
+    continuityFingerprintDomain: text("continuity_fingerprint_domain"),
+    continuityFingerprint: text("continuity_fingerprint"),
+    rootHandleCapabilityVersion: number("root_handle_capability_version"),
+    rootHandleKeyId: text("root_handle_key_id"),
+    rootHandleIssueNonce: text("root_handle_issue_nonce"),
+    rootHandleIssuedAt: text("root_handle_issued_at"),
+    rootHandlePolicyCode: text("root_handle_policy_code"),
+    rootHandleExpiryKind: text("root_handle_expiry_kind") as CommittedAuthorityV1["rootHandleExpiryKind"],
+    rootHandleExpiresAt: text("root_handle_expires_at"),
+    rootHandleActorRole: text("root_handle_actor_role") as CommittedAuthorityV1["rootHandleActorRole"],
+    rootHandleClientInstanceId: text("root_handle_client_instance_id"),
+    rootHandleVerifier: text("root_handle_verifier"),
+    resumeTokenCapabilityVersion: number("resume_token_capability_version"),
+    resumeTokenKeyId: text("resume_token_key_id"),
+    resumeTokenIssueNonce: text("resume_token_issue_nonce"),
+    resumeTokenIssuedAt: text("resume_token_issued_at"),
+    resumeTokenPolicyCode: text("resume_token_policy_code"),
+    resumeTokenExpiryKind: text("resume_token_expiry_kind") as CommittedAuthorityV1["resumeTokenExpiryKind"],
+    resumeTokenExpiresAt: text("resume_token_expires_at"),
+    resumeTokenActorRole: text("resume_token_actor_role") as CommittedAuthorityV1["resumeTokenActorRole"],
+    resumeTokenVerifier: text("resume_token_verifier"),
+    childHandleCapabilityVersion: number("child_handle_capability_version"),
+    childHandleKeyId: text("child_handle_key_id"),
+    childHandleIssueNonce: text("child_handle_issue_nonce"),
+    childHandleIssuedAt: text("child_handle_issued_at"),
+    childHandlePolicyCode: text("child_handle_policy_code"),
+    childHandleExpiryKind: text("child_handle_expiry_kind") as CommittedAuthorityV1["childHandleExpiryKind"],
+    childHandleExpiresAt: text("child_handle_expires_at"),
+    childHandleActorRole: text("child_handle_actor_role") as CommittedAuthorityV1["childHandleActorRole"],
+    childHandleClientInstanceId: text("child_handle_client_instance_id"),
+    childHandleVerifier: text("child_handle_verifier"),
+    revocationReasonCode: text("revocation_reason_code"),
+    revocationEventPosition: decimal("revocation_event_position"),
+    revokedAt: text("revoked_at"),
+    terminalEventPosition: decimal("terminal_event_position"),
+    terminalEventType: text("terminal_event_type"),
+    terminalAt: text("terminal_at"),
+  });
+}
+
+function refreshStoredAuthorityCommitment(
+  connection: SqliteConnection,
+  sessionId: string,
+): string {
+  const row = connection.prepare(`
+    SELECT * FROM session_authority
+    WHERE project_id = $projectId AND session_id = $sessionId
+  `).get({ $projectId: PROJECT_ID, $sessionId: sessionId });
+  assert.notEqual(row, undefined);
+  const commitment = authorityCommitmentForStoredRow(row!);
+  connection.prepare(`
+    UPDATE session_authority SET authority_commitment = $commitment
+    WHERE project_id = $projectId AND session_id = $sessionId
+  `).run({
+    $commitment: commitment,
+    $projectId: PROJECT_ID,
+    $sessionId: sessionId,
+  });
+  return commitment;
+}
+
 function rootStartIntent(values: {
   commandId: string;
   idempotencyKey: string;
@@ -538,7 +630,7 @@ function seedFoldableRootAuthority(
   const sessionId = FOLD_SESSION_ID;
   const commandId = "99999999-9999-4999-8999-999999999999";
   const workspaceId = "e".repeat(64) as WorkspaceId;
-  const authorityCommitment = "a".repeat(64);
+  const continuityFingerprint = "a".repeat(64);
   const intent = rootStartIntent({
     commandId,
     idempotencyKey: "upgrade-test/root-start",
@@ -551,6 +643,58 @@ function seedFoldableRootAuthority(
     binding: { ...context.binding, workspaceId },
     workspace: { ...context.workspace, workspaceId },
   };
+  const authorityCommitmentValue = authorityCommitment({
+    authorityVersion: 1,
+    projectId: PROJECT_ID,
+    sessionId,
+    sessionKind: "root",
+    parentSessionId: null,
+    workspaceId,
+    clientNamespace: foldContext.binding.clientNamespace,
+    ownerGeneration: "1",
+    childCapabilityGeneration: null,
+    directAccessEnabled: false,
+    continuityFingerprintAlgorithm: "hmac-sha256",
+    continuityFingerprintSchemaVersion: 1,
+    continuityFingerprintKeyId: "continuity-key-1",
+    continuityFingerprintDomain: "pm-continuity-v1",
+    continuityFingerprint,
+    rootHandleCapabilityVersion: 1,
+    rootHandleKeyId: "capability-key-1",
+    rootHandleIssueNonce: "c".repeat(64),
+    rootHandleIssuedAt: NOW,
+    rootHandlePolicyCode: "root-default-v1",
+    rootHandleExpiryKind: "until-revoked",
+    rootHandleExpiresAt: null,
+    rootHandleActorRole: "primary",
+    rootHandleClientInstanceId: "fold-client",
+    rootHandleVerifier: "d".repeat(64),
+    resumeTokenCapabilityVersion: 1,
+    resumeTokenKeyId: "capability-key-1",
+    resumeTokenIssueNonce: "d".repeat(64),
+    resumeTokenIssuedAt: NOW,
+    resumeTokenPolicyCode: "resume-default-v1",
+    resumeTokenExpiryKind: "until-revoked",
+    resumeTokenExpiresAt: null,
+    resumeTokenActorRole: "primary",
+    resumeTokenVerifier: "d".repeat(64),
+    childHandleCapabilityVersion: null,
+    childHandleKeyId: null,
+    childHandleIssueNonce: null,
+    childHandleIssuedAt: null,
+    childHandlePolicyCode: null,
+    childHandleExpiryKind: null,
+    childHandleExpiresAt: null,
+    childHandleActorRole: null,
+    childHandleClientInstanceId: null,
+    childHandleVerifier: null,
+    revocationReasonCode: null,
+    revocationEventPosition: null,
+    revokedAt: null,
+    terminalEventPosition: null,
+    terminalEventType: null,
+    terminalAt: null,
+  });
   connection.prepare(`
     INSERT INTO streams(
       project_id, stream_id, stream_type, current_version, created_at, updated_at
@@ -567,7 +711,7 @@ function seedFoldableRootAuthority(
     clientNamespace: foldContext.binding.clientNamespace,
     creatingAgentId: "fold-agent",
     creatingClientInstanceId: "fold-client",
-    authorityCommitment,
+    authorityCommitment: authorityCommitmentValue,
   };
   connection.prepare(`
     INSERT INTO events(
@@ -640,7 +784,7 @@ function seedFoldableRootAuthority(
     ) VALUES (
       $projectId, $sessionId, $streamId, 'root', NULL, $workspaceId,
       $clientNamespace, 'active', 1, NULL, 0, 'hmac-sha256', 1,
-      'continuity-key-1', 'pm-continuity-v1', $authorityCommitment, 1,
+      'continuity-key-1', 'pm-continuity-v1', $continuityFingerprint, 1,
       'capability-key-1', $nonce, $now, 'root-default-v1', 'until-revoked',
       NULL, 'primary', 'fold-client', $hash, 'cccccccc-cccc-4ccc-8ccc-cccccccccccc',
       1, 'capability-key-1', $hash, $now, 'resume-default-v1', 'until-revoked',
@@ -655,7 +799,8 @@ function seedFoldableRootAuthority(
     $streamId: `session/${sessionId}`,
     $workspaceId: workspaceId,
     $clientNamespace: foldContext.binding.clientNamespace,
-    $authorityCommitment: authorityCommitment,
+    $continuityFingerprint: continuityFingerprint,
+    $authorityCommitment: authorityCommitmentValue,
     $nonce: "c".repeat(64),
     $hash: "d".repeat(64),
     $now: NOW,
@@ -780,6 +925,7 @@ function seedCheckpointedRootAuthority(
     $projectId: PROJECT_ID,
     $sessionId: FOLD_SESSION_ID,
   });
+  refreshStoredAuthorityCommitment(connection, FOLD_SESSION_ID);
   return { context: foldContext, checkpointId: checkpoint.checkpointId, fingerprint };
 }
 
@@ -813,6 +959,7 @@ function seedSuspensionMarker(
     $projectId: PROJECT_ID,
     $sessionId: FOLD_SESSION_ID,
   });
+  refreshStoredAuthorityCommitment(connection, FOLD_SESSION_ID);
   return seeded.context;
 }
 
@@ -821,9 +968,9 @@ function seedAbandonedRootAuthority(
   context: ProjectContext,
 ): { context: ProjectContext; occurredAt: string } {
   const foldContext = seedFoldableRootAuthority(connection, context);
-  const abandoned = lifecycleEvent(2, "SessionAbandoned", {
+  const occurrenceProbe = lifecycleEvent(2, "SessionAbandoned", {
     reasonCode: "approved-abandonment",
-    authorityCommitment: "b".repeat(64),
+    authorityCommitment: "0".repeat(64),
   }, {
     projectId: PROJECT_ID,
     vaultId: VAULT_ID,
@@ -833,7 +980,35 @@ function seedAbandonedRootAuthority(
     parentSessionId: null,
     streamId: `session/${FOLD_SESSION_ID}`,
     correlationId: FOLD_CORRELATION_ID,
-    authorityCommitment: "b".repeat(64),
+    authorityCommitment: "0".repeat(64),
+  }) as LifecycleEventV1;
+  const authorityRow = connection.prepare(`
+    SELECT * FROM session_authority
+    WHERE project_id = $projectId AND session_id = $sessionId
+  `).get({ $projectId: PROJECT_ID, $sessionId: FOLD_SESSION_ID });
+  assert.notEqual(authorityRow, undefined);
+  const abandonedCommitment = authorityCommitmentForStoredRow({
+    ...authorityRow!,
+    revocation_reason_code: "approved-abandonment",
+    revocation_event_position: 2,
+    revoked_at: occurrenceProbe.occurredAt,
+    terminal_event_position: 2,
+    terminal_event_type: "SessionAbandoned",
+    terminal_at: occurrenceProbe.occurredAt,
+  });
+  const abandoned = lifecycleEvent(2, "SessionAbandoned", {
+    reasonCode: "approved-abandonment",
+    authorityCommitment: abandonedCommitment,
+  }, {
+    projectId: PROJECT_ID,
+    vaultId: VAULT_ID,
+    storeId: STORE_ID,
+    workspaceId: foldContext.binding.workspaceId,
+    sessionId: FOLD_SESSION_ID,
+    parentSessionId: null,
+    streamId: `session/${FOLD_SESSION_ID}`,
+    correlationId: FOLD_CORRELATION_ID,
+    authorityCommitment: abandonedCommitment,
   }) as LifecycleEventV1;
   appendLifecycleEvent(connection, abandoned);
   connection.prepare(`
@@ -1920,6 +2095,7 @@ describe("explicit project-store upgrade", () => {
       UPDATE session_authority SET semantic_state = 'suspended'
       WHERE project_id = $projectId
     `).run({ $projectId: PROJECT_ID });
+    refreshStoredAuthorityCommitment(connection, FOLD_SESSION_ID);
     assert.equal(
       lifecycleIssueCodes(connection, foldContext, "full")
         .includes("SESSION_AUTHORITY_FOLD_MISMATCH"),
@@ -1977,6 +2153,7 @@ describe("explicit project-store upgrade", () => {
       $projectId: PROJECT_ID,
       $sessionId: FOLD_SESSION_ID,
     });
+    refreshStoredAuthorityCommitment(connection, FOLD_SESSION_ID);
 
     assert.equal(
       lifecycleIssueCodes(connection, seeded.context, "full")
@@ -2003,6 +2180,7 @@ describe("explicit project-store upgrade", () => {
       UPDATE session_authority SET checkpoint_required_reason = 'ownership-recovery'
       WHERE project_id = $projectId AND session_id = $sessionId
     `).run({ $projectId: PROJECT_ID, $sessionId: FOLD_SESSION_ID });
+    refreshStoredAuthorityCommitment(connection, FOLD_SESSION_ID);
 
     assert.equal(
       lifecycleIssueCodes(connection, foldContext, "full")
@@ -2034,6 +2212,7 @@ describe("explicit project-store upgrade", () => {
         UPDATE session_authority SET revoked_at = '2026-07-14T00:01:00.000Z'
         WHERE project_id = $projectId AND session_id = $sessionId
       `).run({ $projectId: PROJECT_ID, $sessionId: FOLD_SESSION_ID });
+      refreshStoredAuthorityCommitment(connection, FOLD_SESSION_ID);
 
       assert.equal(
         lifecycleIssueCodes(connection, seeded.context, "full")
@@ -2062,6 +2241,7 @@ describe("explicit project-store upgrade", () => {
       UPDATE session_authority SET terminal_at = '2026-07-14T00:01:00.000Z'
       WHERE project_id = $projectId AND session_id = $sessionId
     `).run({ $projectId: PROJECT_ID, $sessionId: FOLD_SESSION_ID });
+    refreshStoredAuthorityCommitment(connection, FOLD_SESSION_ID);
 
     assert.equal(
       lifecycleIssueCodes(connection, seeded.context, "full")
@@ -2082,6 +2262,7 @@ describe("explicit project-store upgrade", () => {
       UPDATE session_authority SET semantic_state = 'suspended'
       WHERE project_id = $projectId
     `).run({ $projectId: PROJECT_ID });
+    refreshStoredAuthorityCommitment(connection, FOLD_SESSION_ID);
 
     await assert.rejects(
       runIntegrityChild(foldContext, {
