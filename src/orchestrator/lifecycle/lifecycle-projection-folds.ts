@@ -875,8 +875,12 @@ export function foldWorkflowGenerationProjection(
             || event.payload.finalCheckpointVersion !== replacementCheckpointVersion
           ))
           || (event.eventSchemaVersion === 3 && (
-            amendment.amendmentVersion !== 2
-            || amendment.evidenceWindowAction !== event.payload.evidenceWindowAction
+            !(
+              (amendment.amendmentVersion === 1
+                && event.payload.evidenceWindowAction === "unchanged")
+              || (amendment.amendmentVersion === 2
+                && amendment.evidenceWindowAction === event.payload.evidenceWindowAction)
+            )
             || event.payload.effectiveState.request.sessionId !== event.sessionId
             || event.payload.effectiveState.request.requestVersion
               !== event.payload.effectiveState.effectiveFinalCheckpoint.checkpointVersion

@@ -20,6 +20,7 @@ import type {
 } from "../src/orchestrator/lifecycle/contracts/identifiers.js";
 import {
   type ChildEventFoldProjection,
+  type WorkflowFingerprintV2Input,
   advanceReportIndexFingerprint,
   childEventFoldFingerprint,
   classifyChildProjectionEvent,
@@ -56,6 +57,10 @@ import {
   referenceReportWitnessFingerprint,
   referenceWorkflowGenerationFingerprint,
 } from "./support/lifecycle-projection-reference.js";
+import {
+  referenceSessionEndEffectiveStateHashV1,
+  sessionEndEffectiveStateFixture,
+} from "./support/session-end-effective-state-reference.js";
 
 function stored(
   event: ReturnType<typeof lifecycleEvent>,
@@ -125,55 +130,31 @@ it("computes exact V2 workflow-generation fingerprint predecessor chains", () =>
   const fromV1Fixture = Object.freeze({
     ...initialFixture,
     workflowGeneration: 2,
-    triggerEventPosition: 11n,
+    triggerEventPosition: 10n,
     triggerEventHash: "c".repeat(64),
-    effectiveDraftSourceEventPosition: 11n,
-    effectiveStateSourceEventPosition: 11n,
+    evidenceWindowState: "sealed" as const,
+    replacementCheckpointVersion: null,
+    effectiveDraftSourceEventPosition: 9n,
+    effectiveStateSourceEventPosition: 10n,
     effectiveStateHash: "d".repeat(64),
     previousFingerprintSchemaVersion: 1 as const,
-    previousFingerprint: "e".repeat(64),
+    previousFingerprint: "f8139b1cc425178e9d4c09362948aff72f8571971d31995887f90d657cf7c99c",
   });
   const fromV2Fixture = Object.freeze({
     ...fromV1Fixture,
     workflowGeneration: 3,
-    triggerEventPosition: 12n,
+    triggerEventPosition: 11n,
     triggerEventHash: "f".repeat(64),
-    effectiveDraftSourceEventPosition: 12n,
-    effectiveStateSourceEventPosition: 12n,
+    effectiveStateSourceEventPosition: 11n,
     effectiveStateHash: "0".repeat(64),
     previousFingerprintSchemaVersion: 2 as const,
-    previousFingerprint: "f79660ccfca717a2b476cb0c3b600a800b9ef07fb806a621298f4e866c3eed9b",
+    previousFingerprint: "0f44ff88228b42170931ea68e2c244e766e12f06de619f6784453daaa8a485a0",
   });
   const fingerprint = Reflect.get(lifecycleProjectionFolds, "workflowFingerprintV2");
   assert.equal(typeof fingerprint, "function");
   assert.equal(Reflect.apply(fingerprint as Function, undefined, [initialFixture]), "edcc178050728d5b2212a7c60ccad2749365ea6ca810cb0ce22cfac30429278a");
-  assert.equal(Reflect.apply(fingerprint as Function, undefined, [fromV1Fixture]), "f79660ccfca717a2b476cb0c3b600a800b9ef07fb806a621298f4e866c3eed9b");
-  assert.equal(Reflect.apply(fingerprint as Function, undefined, [fromV2Fixture]), "0da57b84f113b56efd20c7b034edf27e48f458fcd56b1b4aab28b470c6edd2e4");
-  for (const mutation of [
-    { projectId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" },
-    { workflowId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb" },
-    { workflowGeneration: 2 },
-    { sessionId: "cccccccc-cccc-4ccc-8ccc-cccccccccccc" },
-    { triggerEventHash: "d".repeat(64) },
-    { rootCommandId: "dddddddd-dddd-4ddd-8ddd-dddddddddddd" },
-    { evidenceWindowState: "sealed" as const },
-    { replacementCheckpointVersion: null },
-    { effectiveStateSourceEventPosition: 9n },
-    { effectiveStateHash: "e".repeat(64) },
-  ]) {
-    assert.notEqual(
-      Reflect.apply(fingerprint as Function, undefined, [{ ...initialFixture, ...mutation }]),
-      "edcc178050728d5b2212a7c60ccad2749365ea6ca810cb0ce22cfac30429278a",
-    );
-  }
-  assert.notEqual(
-    Reflect.apply(fingerprint as Function, undefined, [{ ...fromV1Fixture, previousFingerprint: "0".repeat(64) }]),
-    "f79660ccfca717a2b476cb0c3b600a800b9ef07fb806a621298f4e866c3eed9b",
-  );
-  assert.notEqual(
-    Reflect.apply(fingerprint as Function, undefined, [{ ...fromV1Fixture, previousFingerprintSchemaVersion: 2 }]),
-    "f79660ccfca717a2b476cb0c3b600a800b9ef07fb806a621298f4e866c3eed9b",
-  );
+  assert.equal(Reflect.apply(fingerprint as Function, undefined, [fromV1Fixture]), "0f44ff88228b42170931ea68e2c244e766e12f06de619f6784453daaa8a485a0");
+  assert.equal(Reflect.apply(fingerprint as Function, undefined, [fromV2Fixture]), "7ca14d8564fd48d5418d55fe43ac59f483ae312af3e760650b52e6f4386922ad");
 });
 
 it("rejects a legacy workflow event after a Version-2 predecessor", () => {
@@ -230,44 +211,92 @@ it("rejects a legacy workflow event after a Version-2 predecessor", () => {
   ));
 });
 
-it("binds every V2 fingerprint preimage field across predecessor forms", () => {
-  const fingerprint = lifecycleProjectionFolds.workflowFingerprintV2;
-  const base = {
-    projectId: "11111111-1111-4111-8111-111111111111", workflowId: "22222222-2222-4222-8222-222222222222",
-    workflowGeneration: 2, sessionId: "33333333-3333-4333-8333-333333333333", triggerEventPosition: 10n,
-    triggerEventHash: "a".repeat(64), rootCommandId: "44444444-4444-4444-8444-444444444444",
-    evidenceWindowState: "sealed" as const, replacementCheckpointVersion: null,
-    effectiveCheckpointVersion: 2 as const, effectiveDraftSourceEventPosition: 9n,
-    effectiveStateSourceEventPosition: 9n, effectiveStateVersion: 1 as const, effectiveStateHash: "b".repeat(64),
+it("folds a Version-1 null-draft amendment as implicit unchanged over a Version-2 snapshot", () => {
+  const fixture = sessionEndEffectiveStateFixture({ requestVersion: 2 });
+  const stateWithoutHash = {
+    effectiveStateVersion: fixture.effectiveStateVersion,
+    effectiveStateDomain: fixture.effectiveStateDomain,
+    request: { ...fixture.request, sessionId: ROOT_SESSION_ID },
+    effectivePolicy: fixture.effectivePolicy,
+    effectiveFinalCheckpoint: fixture.effectiveFinalCheckpoint,
   };
-  const forms = [
-    { ...base, previousFingerprintSchemaVersion: null, previousFingerprint: null },
-    { ...base, previousFingerprintSchemaVersion: 1 as const, previousFingerprint: "c".repeat(64) },
-    { ...base, previousFingerprintSchemaVersion: 2 as const, previousFingerprint: "d".repeat(64) },
-  ];
-  for (const form of forms) {
-    const expected = fingerprint(form);
-    for (const mutation of [
-      { projectId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" }, { workflowId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb" },
-      { workflowGeneration: 3 }, { sessionId: "cccccccc-cccc-4ccc-8ccc-cccccccccccc" },
-      { triggerEventHash: "e".repeat(64) }, { rootCommandId: "dddddddd-dddd-4ddd-8ddd-dddddddddddd" },
-      { evidenceWindowState: "open" as const }, { effectiveCheckpointVersion: 1 as const },
-      { effectiveDraftSourceEventPosition: 8n }, { effectiveStateSourceEventPosition: 8n }, { effectiveStateHash: "f".repeat(64) },
-    ]) assert.notEqual(fingerprint({ ...form, ...mutation }), expected);
-    assert.throws(() => fingerprint({ ...form, effectiveStateVersion: null }));
-    if (form.previousFingerprint !== null) {
-      assert.notEqual(fingerprint({ ...form, previousFingerprint: "0".repeat(64) }), expected);
-      assert.notEqual(fingerprint({ ...form, previousFingerprintSchemaVersion: form.previousFingerprintSchemaVersion === 1 ? 2 : 1 }), expected);
-    } else {
-      assert.throws(() => fingerprint({ ...form, previousFingerprintSchemaVersion: 1 }));
-    }
-  }
+  const effectiveState = {
+    ...stateWithoutHash,
+    effectiveStateHash: referenceSessionEndEffectiveStateHashV1(stateWithoutHash),
+  };
+  const requestCommandId = lifecycleUuid(91_010);
+  const request = rootStored({
+    position: 1n,
+    streamVersion: 1n,
+    eventType: "SessionEndRequested",
+    eventSchemaVersion: 3,
+    commandId: requestCommandId,
+    payload: {
+      workflowId: WORKFLOW_ID,
+      workflowGeneration: 1,
+      previousState: "active",
+      effectiveState,
+    },
+  });
+  const generationOne = foldWorkflowGenerationProjection(null, request, intent({
+    commandType: "request-session-end",
+    commandId: requestCommandId,
+    idempotencyKey: "projection/v1-over-v2/request",
+    agentId: "agent-primary",
+    expectedProjectId: PROJECT_ID,
+    expectedVaultId: VAULT_ID,
+    expectedWorkspaceId: WORKSPACE_ID,
+    expectedBranchRef: null,
+    request: effectiveState.request,
+  }), "live-schema-3");
+  assert.equal(generationOne.evidenceWindowState, "open");
+
+  const amendmentCommandId = lifecycleUuid(91_011);
+  const amendment = rootStored({
+    position: 2n,
+    streamVersion: 2n,
+    eventType: "SessionEndAmended",
+    eventSchemaVersion: 3,
+    commandId: amendmentCommandId,
+    payload: {
+      workflowId: WORKFLOW_ID,
+      previousWorkflowGeneration: 1,
+      workflowGeneration: 2,
+      preTransitionCheckpointId: lifecycleUuid(91_012),
+      evidenceWindowAction: "unchanged",
+      effectiveState,
+    },
+  });
+  const generationTwo = foldWorkflowGenerationProjection(generationOne, amendment, intent({
+    commandType: "amend-session-end",
+    commandId: amendmentCommandId,
+    idempotencyKey: "projection/v1-over-v2/amend",
+    agentId: "agent-primary",
+    expectedProjectId: PROJECT_ID,
+    expectedVaultId: VAULT_ID,
+    expectedWorkspaceId: WORKSPACE_ID,
+    expectedBranchRef: null,
+    sessionId: ROOT_SESSION_ID,
+    workflowId: WORKFLOW_ID,
+    expectedStreamVersion: "1",
+    amendment: {
+      amendmentVersion: 1,
+      childEndPolicy: null,
+      finalCheckpoint: null,
+      validationProfileIds: null,
+      requestedQualityThreshold: null,
+      requireFullEvidence: null,
+      requireMaterialization: false,
+    },
+  }), "live-schema-3");
+  assert.equal(generationTwo.evidenceWindowState, "open");
+  assert.equal(generationTwo.effectiveCheckpointVersion, 2);
+  assert.equal(generationTwo.effectiveDraftSourceEventPosition, 1n);
+  assert.equal(generationTwo.effectiveStateSourceEventPosition, 2n);
 });
 
-it("independently hashes every V2 canonical field for initial V1-to-V2 and V2-to-V2 forms", () => {
-  const reference = (input: Record<string, unknown>): string => createHash("sha256")
-    .update("project-memory/lifecycle/workflow-generation/v2\n", "utf8")
-    .update(canonicalJson([
+it("independently reference-hashes every exact V2 field across predecessor forms", () => {
+  const referencePreimage = (input: WorkflowFingerprintV2Input): readonly unknown[] => [
       input.projectId, input.workflowId, String(input.workflowGeneration), input.sessionId,
       String(input.triggerEventPosition), input.triggerEventHash, input.rootCommandId,
       input.evidenceWindowState, input.replacementCheckpointVersion,
@@ -275,52 +304,200 @@ it("independently hashes every V2 canonical field for initial V1-to-V2 and V2-to
       input.effectiveStateSourceEventPosition === null ? null : String(input.effectiveStateSourceEventPosition),
       input.effectiveStateVersion, input.effectiveStateHash,
       input.previousFingerprintSchemaVersion, input.previousFingerprint,
+    ];
+  const reference = (input: WorkflowFingerprintV2Input): string => createHash("sha256")
+    .update("project-memory/lifecycle/workflow-generation/v2\n", "utf8")
+    .update(JSON.stringify(referencePreimage(input)), "utf8")
+    .digest("hex");
+  const projectId = "11111111-1111-4111-8111-111111111111";
+  const workflowId = "22222222-2222-4222-8222-222222222222";
+  const sessionId = "33333333-3333-4333-8333-333333333333";
+  const rootCommandId = "44444444-4444-4444-8444-444444444444";
+  const v1Predecessor = createHash("sha256")
+    .update("project-memory/lifecycle/workflow-generation/v1\n", "utf8")
+    .update(JSON.stringify([
+      projectId, workflowId, "1", sessionId, "9", rootCommandId,
+      "sealed", 1, 1, "9", null,
     ]), "utf8")
     .digest("hex");
-  const base = {
-    projectId: "11111111-1111-4111-8111-111111111111", workflowId: "22222222-2222-4222-8222-222222222222",
-    workflowGeneration: 3, sessionId: "33333333-3333-4333-8333-333333333333", triggerEventPosition: 10n,
-    triggerEventHash: "a".repeat(64), rootCommandId: "44444444-4444-4444-8444-444444444444",
-    evidenceWindowState: "sealed" as const, replacementCheckpointVersion: null,
-    effectiveCheckpointVersion: 2 as const, effectiveDraftSourceEventPosition: 9n,
-    effectiveStateSourceEventPosition: 9n, effectiveStateVersion: 1 as const, effectiveStateHash: "b".repeat(64),
-  };
-  const forms = [
-    { ...base, previousFingerprintSchemaVersion: null, previousFingerprint: null },
-    { ...base, previousFingerprintSchemaVersion: 1 as const, previousFingerprint: "c".repeat(64) },
-    { ...base, previousFingerprintSchemaVersion: 2 as const, previousFingerprint: "d".repeat(64) },
+  assert.equal(
+    v1Predecessor,
+    "f8139b1cc425178e9d4c09362948aff72f8571971d31995887f90d657cf7c99c",
+  );
+  const forms: readonly { readonly name: string; readonly input: WorkflowFingerprintV2Input }[] = [
+    {
+      name: "initial",
+      input: {
+        projectId, workflowId, workflowGeneration: 1, sessionId, triggerEventPosition: 10n,
+        triggerEventHash: "a".repeat(64), rootCommandId, evidenceWindowState: "open",
+        replacementCheckpointVersion: 2, effectiveCheckpointVersion: 2,
+        effectiveDraftSourceEventPosition: 10n, effectiveStateSourceEventPosition: 10n,
+        effectiveStateVersion: 1, effectiveStateHash: "b".repeat(64),
+        previousFingerprintSchemaVersion: null, previousFingerprint: null,
+      },
+    },
+    {
+      name: "V1-to-V2",
+      input: {
+        projectId, workflowId, workflowGeneration: 2, sessionId, triggerEventPosition: 10n,
+        triggerEventHash: "c".repeat(64), rootCommandId, evidenceWindowState: "sealed",
+        replacementCheckpointVersion: null, effectiveCheckpointVersion: 2,
+        effectiveDraftSourceEventPosition: 9n, effectiveStateSourceEventPosition: 10n,
+        effectiveStateVersion: 1, effectiveStateHash: "d".repeat(64),
+        previousFingerprintSchemaVersion: 1,
+        previousFingerprint: v1Predecessor,
+      },
+    },
+    {
+      name: "V2-to-V2",
+      input: {
+        projectId, workflowId, workflowGeneration: 3, sessionId, triggerEventPosition: 11n,
+        triggerEventHash: "f".repeat(64), rootCommandId, evidenceWindowState: "sealed",
+        replacementCheckpointVersion: null, effectiveCheckpointVersion: 2,
+        effectiveDraftSourceEventPosition: 9n, effectiveStateSourceEventPosition: 11n,
+        effectiveStateVersion: 1, effectiveStateHash: "0".repeat(64),
+        previousFingerprintSchemaVersion: 2,
+        previousFingerprint: "0f44ff88228b42170931ea68e2c244e766e12f06de619f6784453daaa8a485a0",
+      },
+    },
   ];
+  const validMutations: readonly {
+    readonly name: string;
+    readonly prepare?: (input: WorkflowFingerprintV2Input) => WorkflowFingerprintV2Input;
+    readonly mutate: (input: WorkflowFingerprintV2Input) => WorkflowFingerprintV2Input;
+  }[] = [
+    { name: "projectId", mutate: (input) => ({ ...input, projectId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" }) },
+    { name: "workflowId", mutate: (input) => ({ ...input, workflowId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb" }) },
+    { name: "workflowGeneration", mutate: (input) => ({ ...input, workflowGeneration: input.workflowGeneration + 10 }) },
+    { name: "sessionId", mutate: (input) => ({ ...input, sessionId: "cccccccc-cccc-4ccc-8ccc-cccccccccccc" }) },
+    {
+      name: "triggerEventPosition",
+      prepare: (input) => ({ ...input, replacementCheckpointVersion: null }),
+      mutate: (input) => ({ ...input, triggerEventPosition: input.triggerEventPosition + 1n }),
+    },
+    { name: "triggerEventHash", mutate: (input) => ({ ...input, triggerEventHash: "7".repeat(64) }) },
+    { name: "rootCommandId", mutate: (input) => ({ ...input, rootCommandId: "dddddddd-dddd-4ddd-8ddd-dddddddddddd" }) },
+    { name: "evidenceWindowState", mutate: (input) => ({ ...input, evidenceWindowState: input.evidenceWindowState === "open" ? "sealed" : "open" }) },
+    {
+      name: "replacementCheckpointVersion",
+      prepare: (input) => ({
+        ...input, replacementCheckpointVersion: 2, effectiveCheckpointVersion: 2,
+        effectiveDraftSourceEventPosition: input.triggerEventPosition,
+      }),
+      mutate: (input) => ({ ...input, replacementCheckpointVersion: null }),
+    },
+    {
+      name: "effectiveCheckpointVersion",
+      prepare: (input) => ({ ...input, evidenceWindowState: "sealed", replacementCheckpointVersion: null }),
+      mutate: (input) => ({ ...input, effectiveCheckpointVersion: 1 }),
+    },
+    {
+      name: "effectiveDraftSourceEventPosition",
+      prepare: (input) => ({ ...input, replacementCheckpointVersion: null }),
+      mutate: (input) => ({
+        ...input,
+        effectiveDraftSourceEventPosition: input.effectiveDraftSourceEventPosition === input.triggerEventPosition
+          ? input.triggerEventPosition - 1n
+          : input.triggerEventPosition,
+      }),
+    },
+    {
+      name: "effectiveStateSourceEventPosition",
+      mutate: (input) => ({
+        ...input,
+        effectiveStateSourceEventPosition: input.effectiveStateSourceEventPosition === input.triggerEventPosition
+          ? input.triggerEventPosition - 1n
+          : input.triggerEventPosition,
+      }),
+    },
+    { name: "effectiveStateHash", mutate: (input) => ({ ...input, effectiveStateHash: "9".repeat(64) }) },
+  ];
+  const assertValidBinding = (
+    formName: string,
+    fieldName: string,
+    baseline: WorkflowFingerprintV2Input,
+    candidate: WorkflowFingerprintV2Input,
+  ): void => {
+    assert.equal(
+      referencePreimage(baseline).filter((value, index) => (
+        !Object.is(value, referencePreimage(candidate)[index])
+      )).length,
+      1,
+      `${formName}.${fieldName}.single-field mutation`,
+    );
+    const baselineExpected = reference(baseline);
+    const candidateExpected = reference(candidate);
+    assert.equal(
+      lifecycleProjectionFolds.workflowFingerprintV2(baseline),
+      baselineExpected,
+      `${formName}.${fieldName}.baseline`,
+    );
+    assert.equal(
+      lifecycleProjectionFolds.workflowFingerprintV2(candidate),
+      candidateExpected,
+      `${formName}.${fieldName}.candidate`,
+    );
+    assert.notEqual(candidateExpected, baselineExpected, `${formName}.${fieldName}.binding`);
+  };
+
   for (const form of forms) {
-    const expected = reference(form);
-    assert.equal(lifecycleProjectionFolds.workflowFingerprintV2(form), expected);
-    for (const mutation of [
-      { projectId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" },
-      { workflowId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb" },
-      { workflowGeneration: 4 }, { sessionId: "cccccccc-cccc-4ccc-8ccc-cccccccccccc" },
-      { triggerEventPosition: 11n }, { triggerEventHash: "e".repeat(64) },
-      { rootCommandId: "dddddddd-dddd-4ddd-8ddd-dddddddddddd" }, { evidenceWindowState: "open" as const },
-      { effectiveCheckpointVersion: 1 as const }, { effectiveDraftSourceEventPosition: 8n },
-      { effectiveStateSourceEventPosition: 8n }, { effectiveStateHash: "f".repeat(64) },
-      ...(form.previousFingerprint === null
-        ? []
-        : [{ previousFingerprint: "0".repeat(64) }, {
-          previousFingerprintSchemaVersion: form.previousFingerprintSchemaVersion === 1 ? 2 as const : 1 as const,
-        }]),
-    ]) {
-      const candidate = { ...form, ...mutation };
-      assert.notEqual(lifecycleProjectionFolds.workflowFingerprintV2(candidate), expected);
-      assert.equal(lifecycleProjectionFolds.workflowFingerprintV2(candidate), reference(candidate));
+    assert.equal(referencePreimage(form.input).length, 16, `${form.name}.canonical field count`);
+    assert.equal(
+      lifecycleProjectionFolds.workflowFingerprintV2(form.input),
+      reference(form.input),
+      `${form.name}.golden`,
+    );
+    for (const mutation of validMutations) {
+      const baseline = mutation.prepare?.(form.input) ?? form.input;
+      assertValidBinding(form.name, mutation.name, baseline, mutation.mutate(baseline));
     }
-    assert.throws(() => lifecycleProjectionFolds.workflowFingerprintV2({ ...form, replacementCheckpointVersion: 2 }));
-    assert.throws(() => lifecycleProjectionFolds.workflowFingerprintV2({ ...form, effectiveStateVersion: null }));
-    assert.throws(() => lifecycleProjectionFolds.workflowFingerprintV2({
-      ...form, previousFingerprintSchemaVersion: form.previousFingerprintSchemaVersion === null ? 1 : null,
-    }));
-    const nullState = {
-      ...form, effectiveStateSourceEventPosition: null, effectiveStateVersion: null, effectiveStateHash: null,
-    };
-    assert.equal(lifecycleProjectionFolds.workflowFingerprintV2(nullState), reference(nullState));
-    assert.notEqual(lifecycleProjectionFolds.workflowFingerprintV2(nullState), expected);
+
+    // Version 1 is the only non-null effective-state version. Null is legal
+    // only when the source-position and hash are also null, so no valid
+    // singleton alternate exists for this canonical field.
+    assert.throws(
+      () => lifecycleProjectionFolds.workflowFingerprintV2({
+        ...form.input,
+        effectiveStateVersion: null,
+      }),
+      `${form.name}.effectiveStateVersion.null-pair invariant`,
+    );
+    assert.throws(
+      () => lifecycleProjectionFolds.workflowFingerprintV2({
+        ...form.input,
+        effectiveStateVersion: 2,
+      } as never),
+      `${form.name}.effectiveStateVersion.exact-version invariant`,
+    );
+
+    if (form.input.previousFingerprint === null) {
+      // Initial rows require the predecessor pair to remain null/null; each
+      // singleton mutation is independently rejected.
+      assert.throws(
+        () => lifecycleProjectionFolds.workflowFingerprintV2({
+          ...form.input,
+          previousFingerprint: "8".repeat(64),
+        }),
+        "initial.previousFingerprint",
+      );
+      assert.throws(
+        () => lifecycleProjectionFolds.workflowFingerprintV2({
+          ...form.input,
+          previousFingerprintSchemaVersion: 1,
+        }),
+        "initial.previousFingerprintSchemaVersion",
+      );
+    } else {
+      assertValidBinding(form.name, "previousFingerprint", form.input, {
+        ...form.input,
+        previousFingerprint: "8".repeat(64),
+      });
+      assertValidBinding(form.name, "previousFingerprintSchemaVersion", form.input, {
+        ...form.input,
+        previousFingerprintSchemaVersion:
+          form.input.previousFingerprintSchemaVersion === 1 ? 2 : 1,
+      });
+    }
   }
 });
 
@@ -332,7 +509,7 @@ function rootStored(input: {
     | "SessionEndAmended"
     | "SessionEndCancelled"
     | "SessionAbandoned";
-  readonly eventSchemaVersion: 1 | 2;
+  readonly eventSchemaVersion: 1 | 2 | 3;
   readonly payload: Readonly<Record<string, unknown>>;
   readonly commandId?: string;
   readonly commandEventIndex?: number;

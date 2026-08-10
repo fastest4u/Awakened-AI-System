@@ -10,6 +10,14 @@ import type { SqliteConnection, SqliteParams, SqliteRow } from "./sqlite-driver.
 const MAX_PLAN_BYTES = 262_144;
 const MAX_PLANS = 64;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
+const LOWER_HASH = /^[0-9a-f]{64}$/u;
+const REQUEST_SNAPSHOT_KEYS = [
+  "effectiveState", "previousState", "workflowGeneration", "workflowId",
+] as const;
+const AMENDMENT_SNAPSHOT_KEYS = [
+  "effectiveState", "evidenceWindowAction", "preTransitionCheckpointId",
+  "previousWorkflowGeneration", "workflowGeneration", "workflowId",
+] as const;
 
 /** The durable validation-plan shape.  Configuration material deliberately
  * does not cross this storage boundary; Task 15 derives it from the trusted
@@ -109,6 +117,46 @@ function record(value: unknown): Readonly<Record<string, unknown>> {
   return value as Readonly<Record<string, unknown>>;
 }
 
+function assertExactKeys(
+  value: Readonly<Record<string, unknown>>,
+  expected: readonly string[],
+): void {
+  const keys = Object.keys(value).sort();
+  const sortedExpected = [...expected].sort();
+  if (
+    keys.length !== sortedExpected.length
+    || keys.some((key, index) => key !== sortedExpected[index])
+  ) integrity();
+}
+
+function assertSnapshotPayloadIdentity(
+  eventType: string,
+  payload: Readonly<Record<string, unknown>>,
+  workflowId: string,
+  workflowGeneration: number,
+): void {
+  if (payload.workflowId !== workflowId) integrity();
+  if (eventType === "SessionEndRequested") {
+    assertExactKeys(payload, REQUEST_SNAPSHOT_KEYS);
+    if (
+      payload.workflowGeneration !== workflowGeneration
+      || (payload.previousState !== "active" && payload.previousState !== "suspended")
+    ) integrity();
+    return;
+  }
+  if (eventType !== "SessionEndAmended") integrity();
+  assertExactKeys(payload, AMENDMENT_SNAPSHOT_KEYS);
+  if (
+    payload.workflowGeneration !== workflowGeneration
+    || payload.previousWorkflowGeneration !== workflowGeneration - 1
+    || typeof payload.preTransitionCheckpointId !== "string"
+    || !UUID.test(payload.preTransitionCheckpointId)
+    || (payload.evidenceWindowAction !== "unchanged"
+      && payload.evidenceWindowAction !== "open"
+      && payload.evidenceWindowAction !== "seal")
+  ) integrity();
+}
+
 function assertAmendmentSnapshotCorrelation(
   command: Readonly<Record<string, unknown>>,
   state: SessionEndEffectiveStateV1,
@@ -120,11 +168,16 @@ function assertAmendmentSnapshotCorrelation(
 ): void {
   if (command.commandType !== "amend-session-end") integrity();
   const amendment = record(command.amendment);
+  const amendmentAction = amendment.amendmentVersion === 1
+    ? "unchanged"
+    : amendment.amendmentVersion === 2
+      ? amendment.evidenceWindowAction
+      : null;
   const request = state.request;
   const previousRequest = predecessor.request;
   if (
-    amendment.amendmentVersion !== 2
-    || amendment.evidenceWindowAction !== eventAction
+    amendmentAction === null
+    || amendmentAction !== eventAction
     || (amendment.childEndPolicy !== null
       ? amendment.childEndPolicy !== request.childEndPolicy
       : request.childEndPolicy !== previousRequest.childEndPolicy)
@@ -144,13 +197,13 @@ function assertAmendmentSnapshotCorrelation(
       ? amendment.requireMaterialization !== request.requireMaterialization
       : request.requireMaterialization !== previousRequest.requireMaterialization)
     || !(
-      (amendment.evidenceWindowAction === "unchanged"
+      (amendmentAction === "unchanged"
         && predecessorEvidenceWindowState === evidenceWindowState)
-      || (amendment.evidenceWindowAction === "open"
+      || (amendmentAction === "open"
         && predecessorEvidenceWindowState === "sealed"
         && evidenceWindowState === "open"
         && effectiveCheckpointVersion === 2)
-      || (amendment.evidenceWindowAction === "seal"
+      || (amendmentAction === "seal"
         && predecessorEvidenceWindowState === "open"
         && evidenceWindowState === "sealed"
         && effectiveCheckpointVersion === 2)
@@ -243,6 +296,7 @@ export function hydrateSessionEndEffectiveStateV1(
       || rowIntegerLike(sourceFold["effective_state_version"]) !== 1
       || rowInt64(fold["effective_state_source_event_position"]) !== input.eventPosition
       || rowInt64(sourceFold["effective_state_source_event_position"]) !== input.eventPosition
+      || rowIntegerLike(sourceFold["workflow_generation"]) < 1
       || rowIntegerLike(sourceFold["workflow_generation"]) > input.workflowGeneration
       || rowString(sourceFold, "session_id") !== input.sessionId
       || rowString(sourceFold, "effective_state_hash") !== rowString(fold, "effective_state_hash")
@@ -260,11 +314,17 @@ export function hydrateSessionEndEffectiveStateV1(
     if (canonicalJson(payload) !== rowString(event, "payload_json")
       || typeof payload !== "object" || payload === null || Array.isArray(payload)) integrity();
     const record = payload as Record<string, unknown>;
-    if (record.workflowId !== input.workflowId) integrity();
+    const eventType = rowString(event, "event_type");
+    const sourceGeneration = rowIntegerLike(sourceFold["workflow_generation"]);
+    assertSnapshotPayloadIdentity(eventType, record, input.workflowId, sourceGeneration);
     const effectiveState = decodeSessionEndEffectiveStateV1(record.effectiveState);
     const eventHash = rowString(event, "event_hash");
     if (
-      !/^[0-9a-f]{64}$/u.test(eventHash)
+      !LOWER_HASH.test(eventHash)
+      || effectiveState.request.sessionId !== input.sessionId
+      || effectiveState.effectiveStateVersion
+        !== rowIntegerLike(sourceFold["effective_state_version"])
+      || effectiveState.effectiveStateHash !== rowString(sourceFold, "effective_state_hash")
       || effectiveState.effectiveStateHash !== rowString(fold, "effective_state_hash")
     ) integrity();
     const source = rowString(event, "lifecycle_intent_json");
@@ -272,15 +332,15 @@ export function hydrateSessionEndEffectiveStateV1(
     const command = witness.intent.command as Readonly<Record<string, unknown>>;
     if (
       command.commandId !== rowString(event, "command_id")
-      || (rowString(event, "event_type") === "SessionEndRequested"
-        && canonicalJson(command.request) !== canonicalJson(effectiveState.request))
-      || (rowString(event, "event_type") === "SessionEndAmended"
+      || (eventType === "SessionEndRequested"
+        && (command.commandType !== "request-session-end"
+          || canonicalJson(command.request) !== canonicalJson(effectiveState.request)))
+      || (eventType === "SessionEndAmended"
         && (command.commandType !== "amend-session-end"
           || command.sessionId !== input.sessionId
           || command.workflowId !== input.workflowId))
     ) integrity();
-    if (rowString(event, "event_type") === "SessionEndAmended") {
-      const sourceGeneration = rowIntegerLike(sourceFold["workflow_generation"]);
+    if (eventType === "SessionEndAmended") {
       if (
         sourceGeneration <= 1
         || rowIntegerLike(fold["effective_checkpoint_version"])
@@ -289,7 +349,10 @@ export function hydrateSessionEndEffectiveStateV1(
           !== rowInt64(sourceFold["effective_draft_source_event_position"])
       ) integrity();
       const predecessorFold = oneOrNone(connection.prepare(`
-        SELECT evidence_window_state, effective_state_source_event_position
+        SELECT workflow_generation, fingerprint_schema_version, session_id,
+               trigger_event_position, evidence_window_state,
+               effective_state_source_event_position, effective_state_version,
+               effective_state_hash
         FROM lifecycle_workflow_generation_folds
         WHERE project_id = $projectId AND workflow_id = $workflowId
           AND workflow_generation = $workflowGeneration
@@ -300,15 +363,35 @@ export function hydrateSessionEndEffectiveStateV1(
         $workflowGeneration: BigInt(sourceGeneration - 1),
       }));
       if (predecessorFold === null) integrity();
+      const predecessorSourcePosition = rowInt64(
+        predecessorFold["effective_state_source_event_position"],
+      );
       const predecessorEvent = oneOrNone(connection.prepare(`
-        SELECT payload_json FROM events
+        SELECT event_type, event_schema_version, payload_json, event_hash,
+               session_id, command_event_index
+        FROM events
         WHERE project_id = $projectId AND global_position = $eventPosition
         LIMIT 2
       `).all({
         $projectId: input.projectId,
-        $eventPosition: rowInt64(predecessorFold["effective_state_source_event_position"]),
+        $eventPosition: predecessorSourcePosition,
       }));
-      if (predecessorEvent === null) integrity();
+      const predecessorGeneration = rowIntegerLike(predecessorFold["workflow_generation"]);
+      if (
+        predecessorEvent === null
+        || predecessorGeneration !== sourceGeneration - 1
+        || rowIntegerLike(predecessorFold["fingerprint_schema_version"]) !== 2
+        || rowString(predecessorFold, "session_id") !== input.sessionId
+        || rowInt64(predecessorFold["trigger_event_position"]) !== predecessorSourcePosition
+        || rowIntegerLike(predecessorFold["effective_state_version"]) !== 1
+        || !LOWER_HASH.test(rowString(predecessorFold, "effective_state_hash"))
+        || (rowString(predecessorEvent, "event_type") !== "SessionEndRequested"
+          && rowString(predecessorEvent, "event_type") !== "SessionEndAmended")
+        || rowIntegerLike(predecessorEvent["event_schema_version"]) !== 3
+        || rowString(predecessorEvent, "session_id") !== input.sessionId
+        || rowIntegerLike(predecessorEvent["command_event_index"]) !== 0
+        || !LOWER_HASH.test(rowString(predecessorEvent, "event_hash"))
+      ) integrity();
       let predecessorPayload: unknown;
       try { predecessorPayload = JSON.parse(rowString(predecessorEvent, "payload_json")); } catch { return integrity(); }
       if (
@@ -316,9 +399,20 @@ export function hydrateSessionEndEffectiveStateV1(
         || typeof predecessorPayload !== "object" || predecessorPayload === null
         || Array.isArray(predecessorPayload)
       ) integrity();
-      const predecessor = decodeSessionEndEffectiveStateV1(
-        (predecessorPayload as Readonly<Record<string, unknown>>).effectiveState,
+      const predecessorRecord = predecessorPayload as Readonly<Record<string, unknown>>;
+      assertSnapshotPayloadIdentity(
+        rowString(predecessorEvent, "event_type"),
+        predecessorRecord,
+        input.workflowId,
+        predecessorGeneration,
       );
+      const predecessor = decodeSessionEndEffectiveStateV1(predecessorRecord.effectiveState);
+      if (
+        predecessor.request.sessionId !== input.sessionId
+        || predecessor.effectiveStateVersion
+          !== rowIntegerLike(predecessorFold["effective_state_version"])
+        || predecessor.effectiveStateHash !== rowString(predecessorFold, "effective_state_hash")
+      ) integrity();
       assertAmendmentSnapshotCorrelation(
         command,
         effectiveState,
