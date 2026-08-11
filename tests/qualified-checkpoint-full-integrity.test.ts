@@ -10897,7 +10897,7 @@ it("full integrity reports unavailable historical keys and never repairs state",
       addSchema4WorkflowRequest(endpointOnly);
       addCoverage(endpointOnly, { position: 3n, streamVersion: 3n });
     } else {
-      addFrozenCurrentChildWorkflow(endpointOnly, { finalIntent: "manual" });
+      addFrozenCurrentChildWorkflow(endpointOnly, { finalIntent: "internal-workflow" });
       addCoverage(endpointOnly, { position: 5n, streamVersion: 4n });
     }
     const observedEndpointOnly = observedReplayConnection(endpointOnly.connection, {
@@ -10922,7 +10922,7 @@ it("full integrity reports unavailable historical keys and never repairs state",
       addSchema4WorkflowRequest(endpointOnly);
       addCoverage(endpointOnly, { position: 3n, streamVersion: 3n });
     } else {
-      addFrozenCurrentChildWorkflow(endpointOnly, { finalIntent: "manual" });
+      addFrozenCurrentChildWorkflow(endpointOnly, { finalIntent: "internal-workflow" });
       addCoverage(endpointOnly, { position: 5n, streamVersion: 4n });
     }
     const observedEndpointOnly = observedReplayConnection(endpointOnly.connection, {

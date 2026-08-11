@@ -4118,7 +4118,9 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
         marker,
         row.expected_authority_commitment,
       );
-      if (decodedMarker.eventSchemaVersion !== 3) continue;
+      if (decodedMarker.eventSchemaVersion !== 3) {
+        throw new LifecycleError("INTEGRITY_FAILURE");
+      }
       const witness = this.commandIntentEventZero(context, marker);
       const command = witness.intent.command;
       if (
