@@ -1071,9 +1071,11 @@ it("lifecycle projection writer persists every workflow generation and unchanged
   );
 });
 
-it("hydrates a deep V2 workflow generation with bounded immediate-predecessor queries", () => {
+it("hydrates G256 V2 workflow state and the G257 append predecessor with bounded queries", () => {
   const connection = projectionFixture();
-  seedWorkflowHydrationChain(connection, 5_000);
+  const requestedGeneration = 256;
+  const appendGeneration = 257;
+  seedWorkflowHydrationChain(connection, requestedGeneration);
   const observed = new ProjectionHydrationQueryConnection(connection);
   let projection;
   try {
@@ -1081,17 +1083,17 @@ it("hydrates a deep V2 workflow generation with bounded immediate-predecessor qu
       .findWorkflowGeneration(
         PROJECTION_PROJECT_ID,
         PROJECTION_WORKFLOW_ID,
-        5_000,
+        requestedGeneration,
       );
   } catch (error) {
     assert.fail(
-      `deep hydration threw after ${observed.workflowQueries} workflow and ${
-        observed.eventQueries
-      } event queries: ${String(error)}`,
+      `G${requestedGeneration} hydration threw after ${
+        observed.workflowQueries
+      } workflow and ${observed.eventQueries} event queries: ${String(error)}`,
     );
   }
 
-  assert.equal(projection?.workflowGeneration, 5_000);
+  assert.equal(projection?.workflowGeneration, requestedGeneration);
   assert.deepEqual({
     workflowQueries: observed.workflowQueries,
     eventQueries: observed.eventQueries,
@@ -1105,9 +1107,9 @@ it("hydrates a deep V2 workflow generation with bounded immediate-predecessor qu
     .findWorkflowPredecessor(
       PROJECTION_PROJECT_ID,
       PROJECTION_WORKFLOW_ID,
-      5_001,
+      appendGeneration,
     );
-  assert.equal(predecessor?.workflowGeneration, 5_000);
+  assert.equal(predecessor?.workflowGeneration, requestedGeneration);
   assert.deepEqual({
     workflowQueries: appendLookup.workflowQueries,
     eventQueries: appendLookup.eventQueries,
