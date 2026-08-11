@@ -17,6 +17,7 @@ import type {
 } from "../src/orchestrator/storage/event-append-transaction.js";
 import type { ProjectContext } from "../src/orchestrator/identity/contracts.js";
 import {
+  connectionBoundEvidenceCoverage,
   LifecycleCommandStore,
   LifecycleCommandStoreError,
   type LifecycleCommandEnvelope,
@@ -177,6 +178,48 @@ class TransactionConnection implements SqliteConnection {
   }
 
   prepare(_sql: string): SqliteStatement { throw new Error("raw SQL must remain private"); }
+  close(): void {}
+}
+
+class FrozenWorkflowProbeConnection implements SqliteConnection {
+  readonly statements: string[] = [];
+
+  exec(_sql: string): void {}
+
+  prepare(sql: string): SqliteStatement {
+    this.statements.push(sql);
+    const get = () => {
+      if (/FROM project_meta/i.test(sql)) {
+        return { project_id: CONTEXT.binding.projectId };
+      }
+      if (/FROM session_authority/i.test(sql)) {
+        return {
+          stream_id: `session/${SEMANTIC_COMMAND.sessionId}`,
+          session_kind: "root",
+          parent_session_id: null,
+          workspace_id: CONTEXT.binding.workspaceId,
+          client_namespace: CONTEXT.binding.clientNamespace,
+          owner_generation: 1n,
+          child_capability_generation: null,
+        };
+      }
+      if (/FROM workflow_instances/i.test(sql) && /bindings_is_null/i.test(sql)) {
+        return {
+          workflow_type: "session-end",
+          generation: 2n,
+          phase: "validating",
+          session_id: SEMANTIC_COMMAND.sessionId,
+          evidence_frozen_checkpoint_event_position: 4n,
+          evidence_frozen_generation: 1n,
+          evidence_window_state: "sealed",
+          bindings_is_null: 0n,
+        };
+      }
+      return undefined;
+    };
+    return { get } as unknown as SqliteStatement;
+  }
+
   close(): void {}
 }
 
@@ -526,6 +569,39 @@ function isLifecycleInputInvalid(error: unknown): boolean {
 }
 
 describe("LifecycleCommandStore", () => {
+  it("treats only Version 3 checkpoint markers as frozen final state", () => {
+    const connection = new FrozenWorkflowProbeConnection();
+    const coverage = connectionBoundEvidenceCoverage(connection, {} as never);
+    assert.throws(() => coverage.assertEvidenceWindowWritable(
+      SEMANTIC_COMMAND.sessionId as never,
+    ));
+    const frozenQuery = connection.statements.find((sql) => (
+      /FROM workflow_instances AS workflow/i.test(sql)
+      && /frozen_valid/i.test(sql)
+    ));
+    assert.ok(frozenQuery);
+    assert.match(frozenQuery, /event\.event_schema_version = 3/);
+  });
+
+  it("carries an earlier final marker only through marker-preserving amendments", () => {
+    const connection = new FrozenWorkflowProbeConnection();
+    const coverage = connectionBoundEvidenceCoverage(connection, {} as never);
+    assert.throws(() => coverage.assertEvidenceWindowWritable(
+      SEMANTIC_COMMAND.sessionId as never,
+    ));
+    const frozenQuery = connection.statements.find((sql) => (
+      /FROM workflow_instances AS workflow/i.test(sql)
+      && /frozen_valid/i.test(sql)
+    ));
+    assert.ok(frozenQuery);
+    assert.match(frozenQuery, /NOT EXISTS \(\s*SELECT 1\s*FROM events AS carried_event/s);
+    assert.match(
+      frozenQuery,
+      /\$\.evidenceWindowAction'\s*\)\s+IN \('unchanged', 'seal'\)/,
+    );
+    assert.match(frozenQuery, /FROM events AS duplicate_generation/);
+  });
+
   it("lifecycle command store writes projections after service postwrites and before dedup", () => {
     const order: string[] = [];
     const connection = new TransactionConnection(false, order);

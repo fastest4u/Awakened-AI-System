@@ -116,6 +116,10 @@ describe("project-store migration registry", () => {
       migrationChecksum(sessionLifecycleMigration),
       "85666a0bdee4455068f03a81e9d3720df172d15fce6d8e6f0cb3f5f7d0a81293",
     );
+    assert.equal(
+      migrationChecksum(sessionEndEffectiveStateMigration),
+      "4df903ef630f1d0d1fdb65fcd3b1fa9c39df67f9b5853f4dd26e5a4bd9d87edc",
+    );
     assert.deepEqual(
       PROJECT_STORE_MIGRATIONS.map((migration) => migration.version),
       [1, 2, 3, 4],

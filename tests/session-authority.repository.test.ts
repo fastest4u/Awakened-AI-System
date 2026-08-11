@@ -30,6 +30,7 @@ import type {
 } from "../src/orchestrator/storage/sqlite-driver.js";
 import {
   decodeLifecycleEventV2,
+  decodeLifecycleEventV3,
   type LifecycleEvent,
   type LifecycleEventV1,
 } from "../src/orchestrator/lifecycle/contracts/events.js";
@@ -493,6 +494,29 @@ function eventRow(event: LifecycleEvent): SqliteRow {
   };
 }
 
+function finalCheckpointMarker(
+  checkpoint: ReturnType<typeof checkpointFixture> | ReturnType<typeof qualifiedCheckpointFixture>,
+): LifecycleEvent {
+  return decodeLifecycleEventV3({
+    ...lifecycleEvent(2, "SessionCheckpointRecorded", {}, {
+      globalPosition: 2,
+      streamVersion: 2,
+      sessionId: ROOT_SESSION_ID,
+      parentSessionId: null,
+      streamId: `session/${ROOT_SESSION_ID}`,
+    }),
+    eventSchemaVersion: 3,
+    payload: {
+      checkpoint,
+      baseEventPosition: "1",
+      checkpointEventPosition: "2",
+      finalCheckpointBindingVersion: 1,
+      workflowId: "00000000-0000-4000-8000-000000000020",
+      workflowGeneration: 1,
+    },
+  }) as unknown as LifecycleEvent;
+}
+
 describe("SessionAuthorityRepository strict rows", () => {
   it("decodes every explicit field, preserves int64 bigint boundaries, and recomputes commitments", () => {
     const expected = rootAuthority({ ownerGeneration: 9_223_372_036_854_775_807n });
@@ -770,6 +794,26 @@ describe("SessionAuthorityRepository fold and checkpoint guards", () => {
     assert.equal(connection.calls[0]?.kind, "get");
   });
 
+  it("reads outer Version 3 final checkpoints with nested Version 1 or Version 2 bodies", () => {
+    const repository = new SessionAuthorityRepository();
+    for (const checkpoint of [
+      checkpointFixture({ baseEventPosition: 1, checkpointEventPosition: 2 }),
+      qualifiedCheckpointFixture({ baseEventPosition: 1, checkpointEventPosition: 2 }),
+    ] as const) {
+      const event = finalCheckpointMarker(checkpoint);
+      const connection = new RecordingConnection((_sql, kind) => {
+        if (kind === "get") return eventRow(event);
+        throw new Error("unexpected statement method");
+      });
+      assert.deepEqual(repository.requireCheckpointAtEventPosition(connection, {
+        projectId: PROJECT_ID,
+        sessionId: ROOT_SESSION_ID,
+        checkpointId: checkpoint.checkpointId,
+        checkpointEventPosition: 2n,
+      }), checkpoint);
+    }
+  });
+
   it("resolves an older real SQLite checkpoint after the mutable latest index advances", () => {
     const connection = new NativeConnection();
     const repository = new SessionAuthorityRepository();
@@ -1034,6 +1078,30 @@ describe("SessionAuthorityRepository fold and checkpoint guards", () => {
         latestCheckpointFingerprint: version1Fingerprint,
       }),
     );
+  });
+
+  it("selects the latest outer Version 3 checkpoint by its nested checkpoint domain", () => {
+    const checkpoint = qualifiedCheckpointFixture({ baseEventPosition: 1, checkpointEventPosition: 2 });
+    const marker = finalCheckpointMarker(checkpoint);
+    const started = lifecycleEvent(1, "SessionStarted", {}, {
+      authorityCommitment: rootAuthority().authorityCommitment,
+    }) as LifecycleEvent;
+    const fingerprint = createHash("sha256")
+      .update("project-memory/checkpoint/v2\n", "utf8")
+      .update(canonicalJson(checkpoint), "utf8")
+      .digest("hex");
+    const authority = rootAuthority({
+      latestCheckpointId: checkpoint.checkpointId,
+      latestCheckpointEventPosition: 2n,
+      latestCheckpointFingerprint: fingerprint,
+    });
+    const connection = new RecordingConnection((sql, kind) => {
+      if (kind === "all" && /FROM events/iu.test(sql)) {
+        return [eventRow(started), eventRow(marker)];
+      }
+      throw new Error("unexpected statement method");
+    });
+    assert.deepEqual(new SessionAuthorityRepository().latestCheckpoint(connection, authority), checkpoint);
   });
 
   it("rejects direct checkpoint lookup when any supplied or nested binding differs", () => {

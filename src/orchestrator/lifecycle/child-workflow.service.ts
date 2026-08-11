@@ -56,7 +56,10 @@ import {
   type RecordChildReportCommandV2,
   type SuspendChildSessionCommandV2,
 } from "./contracts/commands.js";
-import type { LifecycleEventV1 } from "./contracts/events.js";
+import type {
+  LifecycleEventCodecResult,
+  LifecycleEventV1,
+} from "./contracts/events.js";
 import { CHECKPOINT_MAX_CANONICAL_BYTES } from "./contracts/checkpoint.js";
 import type {
   ChildSessionState,
@@ -168,7 +171,7 @@ interface ChildAuthorityOperations {
   }): boolean;
   latestCheckpoint(input: SessionAuthorityRecord): import("./contracts/checkpoint.js").CheckpointV1 | null;
   nextGlobalPosition(): bigint;
-  loadEvents(input: SessionAuthorityRecord): readonly LifecycleEventV1[];
+  loadEvents(input: SessionAuthorityRecord): readonly LifecycleEventCodecResult[];
   requireFoldMatch(input: SessionAuthorityRecord): SessionAggregateState;
   listNonterminalChildren(projectId: string, rootSessionId: string): readonly SessionAuthorityRecord[];
   listNonterminalChildEndingScopeProjectionsBounded(
@@ -630,7 +633,7 @@ function pendingEvent(
   };
 }
 
-function latestEventId(events: readonly LifecycleEventV1[]): string {
+function latestEventId(events: readonly LifecycleEventCodecResult[]): string {
   const event = events.at(-1);
   if (event === undefined) invalid("INTEGRITY_FAILURE");
   return event.eventId;

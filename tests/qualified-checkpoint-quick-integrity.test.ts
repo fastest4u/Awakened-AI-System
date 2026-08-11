@@ -3229,6 +3229,92 @@ function frozenCurrentChildFixture(
     rootCheckpointPosition,
   };
 }
+
+function authenticatedVersion3FinalMarkerFixture(): {
+  readonly fixture: Fixture;
+  readonly rootCheckpointPosition: bigint;
+} {
+  const frozen = frozenCurrentChildFixture("checkpoint");
+  const workflow = frozen.fixture.connection.prepare(`
+    SELECT workflow_id FROM workflow_instances
+    WHERE project_id = $projectId AND session_id = $sessionId
+  `).get({ $projectId: PROJECT_ID, $sessionId: ROOT_ID });
+  assert.equal(typeof workflow?.workflow_id, "string");
+  const workflowId = String(workflow!.workflow_id);
+  const commandId = uuid(30_000 + Number(frozen.rootCheckpointPosition % 100_000n));
+  const plannedWorkId = "8".repeat(64);
+  const claimOwnerId = uuid(89_021);
+  const intent = buildLifecycleIntentWitness({
+    commandType: "internal-workflow-phase",
+    commandId,
+    idempotencyKey: `quick-integrity/${frozen.rootCheckpointPosition}`,
+    agentId: "agent-quick-integrity",
+    expectedProjectId: PROJECT_ID,
+    expectedVaultId: VAULT_ID,
+    expectedWorkspaceId: WORKSPACE_ID,
+    expectedBranchRef: null,
+    workflowId,
+    workflowGeneration: 1,
+    plannedWorkId,
+    sourcePhase: "children-resolved",
+    claim: {
+      workflowId,
+      workflowGeneration: 1,
+      claimOwnerId,
+      claimToken: "1",
+      claimExpiresAt: "2026-08-01T00:10:00.000Z",
+    },
+    action: {
+      action: "record-final-checkpoint-and-queue-ending",
+      finalCheckpoint: frozen.rootCheckpoint,
+      materializationTarget: "memory/session-end.md",
+    },
+  } as never, {
+    authorizationKind: "internal-workflow",
+    authorizationSessionId: ROOT_ID,
+    targetSessionId: ROOT_ID,
+    projectId: PROJECT_ID,
+    vaultId: VAULT_ID,
+    storeId: STORE_ID,
+    workspaceId: WORKSPACE_ID,
+    clientNamespace: "tests",
+    capabilityKind: null,
+    capabilityGeneration: null,
+    presentingActorRole: "primary",
+    presentingClientInstanceId: "client-quick-integrity",
+    targetActorRole: "primary",
+    targetClientInstanceId: "client-quick-integrity",
+    internalWorkflowId: workflowId,
+    internalWorkflowGeneration: 1,
+    internalPlannedWorkId: plannedWorkId,
+  });
+  frozen.fixture.connection.exec("DROP TRIGGER events_no_update");
+  frozen.fixture.connection.prepare(`
+    UPDATE events
+    SET event_schema_version = 3,
+        lifecycle_intent_json = $intent,
+        payload_json = $payload
+    WHERE project_id = $projectId AND global_position = $eventPosition
+  `).run({
+    $intent: intent.source,
+    $payload: canonicalJson({
+      checkpoint: frozen.rootCheckpoint,
+      baseEventPosition: (frozen.rootCheckpointPosition - 1n).toString(),
+      checkpointEventPosition: frozen.rootCheckpointPosition.toString(),
+      finalCheckpointBindingVersion: 1,
+      workflowId,
+      workflowGeneration: 1,
+    }),
+    $projectId: PROJECT_ID,
+    $eventPosition: frozen.rootCheckpointPosition,
+  });
+  frozen.fixture.connection.prepare(`
+    UPDATE workflow_instances
+    SET coordinator_attempt_count = 1
+    WHERE project_id = $projectId AND workflow_id = $workflowId
+  `).run({ $projectId: PROJECT_ID, $workflowId: workflowId });
+  return { fixture: frozen.fixture, rootCheckpointPosition: frozen.rootCheckpointPosition };
+}
 function addCapacityChildren(fixture: Fixture, count: number): readonly {
   bindingKind: "current-child";
   childSessionId: string;
@@ -3729,7 +3815,7 @@ it("bounded quick integrity rejects noncanonical top-level scalar escapes while 
   assert.deepEqual((await quickIssues(escapedFrame)).issues, []);
 });
 it("bounded quick integrity performs only fixed current workflow endpoint reads", async () => {
-  const frozen = frozenCurrentChildFixture("checkpoint");
+  const frozen = authenticatedVersion3FinalMarkerFixture();
   seedCoverage(frozen.fixture, {
     sessionId: CHILD_ID,
     adapterSessionId: uuid(66_090),
@@ -3739,10 +3825,36 @@ it("bounded quick integrity performs only fixed current workflow endpoint reads"
   });
   const result = await quickIssues(frozen.fixture);
   assert.deepEqual(result.issues, []);
-  assert.equal(result.reads.childProjectionTargetReads(), 0);
-  assert.equal(result.reads.childProjectionPredecessorReads(), 0);
+  assert.equal(result.reads.childProjectionTargetReads(), 1);
+  assert.equal(result.reads.childProjectionPredecessorReads(), 1);
   assert.equal(result.reads.reportWitnessReads(), 0);
   assert.equal(result.reads.workflowProjectionReads(), 3);
+});
+
+it("quick integrity binds the Version 3 final marker", async () => {
+  const control = authenticatedVersion3FinalMarkerFixture();
+  assert.deepEqual((await quickIssues(control.fixture)).issues, []);
+
+  const corrupted = authenticatedVersion3FinalMarkerFixture();
+  corrupted.fixture.connection.exec("DROP TRIGGER IF EXISTS events_no_update");
+  const row = corrupted.fixture.connection.prepare(`
+    SELECT payload_json FROM events
+    WHERE project_id = $projectId AND global_position = $eventPosition
+  `).get({ $projectId: PROJECT_ID, $eventPosition: corrupted.rootCheckpointPosition });
+  assert.equal(typeof row?.payload_json, "string");
+  const payload = JSON.parse(String(row!.payload_json)) as Record<string, unknown>;
+  payload.workflowGeneration = 2;
+  corrupted.fixture.connection.prepare(`
+    UPDATE events SET payload_json = $payload
+    WHERE project_id = $projectId AND global_position = $eventPosition
+  `).run({
+    $payload: canonicalJson(payload),
+    $projectId: PROJECT_ID,
+    $eventPosition: corrupted.rootCheckpointPosition,
+  });
+  assert.ok((await quickIssues(corrupted.fixture)).issues.includes(
+    "LIFECYCLE_WORKFLOW_INVARIANT_MISMATCH",
+  ));
 });
 
 it("bounded quick integrity accepts clean open-window endpoints with fixed reads", async () => {

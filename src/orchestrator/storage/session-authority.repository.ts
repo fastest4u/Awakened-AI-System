@@ -2,8 +2,8 @@ import { createHash, timingSafeEqual } from "node:crypto";
 import type { ProjectId } from "../identity/contracts.js";
 import { authorityCommitment, type CommittedAuthorityV1 } from "../lifecycle/authority/authority-commitment.js";
 import {
-  decodeLegacyLifecycleEvent,
-  type LifecycleEvent,
+  decodeLifecycleEvent,
+  type LifecycleEventCodecResult,
 } from "../lifecycle/contracts/events.js";
 import {
   decodeCheckpointV1,
@@ -490,7 +490,10 @@ function mutationParams(input: SessionAuthorityMutation): SqliteParams {
   return params;
 }
 
-function eventRows(connection: SqliteConnection, authority: SessionAuthorityRecord): readonly LifecycleEvent[] {
+function eventRows(
+  connection: SqliteConnection,
+  authority: SessionAuthorityRecord,
+): readonly LifecycleEventCodecResult[] {
   const columns = [
     "global_position", "event_id", "project_id", "vault_id", "store_id", "workspace_id",
     "stream_id", "stream_type", "stream_version", "event_type", "event_schema_version",
@@ -519,7 +522,7 @@ function eventRows(connection: SqliteConnection, authority: SessionAuthorityReco
     const streamVersion = int64(ownData(row, "stream_version"));
     const position = int64(ownData(row, "global_position"));
     try {
-      return decodeLegacyLifecycleEvent({
+      return decodeLifecycleEvent({
         eventSchemaVersion: schemaVersion,
         eventId: ownData(row, "event_id"),
         projectId: ownData(row, "project_id"),
@@ -656,20 +659,42 @@ export class SessionAuthorityRepository {
       || streamId !== `session/${sessionId}`
       || ownData(row, "stream_type") !== "session"
       || ownData(row, "event_type") !== "SessionCheckpointRecorded"
-      || (schemaVersion !== 1 && schemaVersion !== 2)) integrity();
+      || (schemaVersion !== 1 && schemaVersion !== 2 && schemaVersion !== 3)) integrity();
     const payload = parseCanonical(text(ownData(row, "payload_json"), 1_000_000));
     if (typeof payload !== "object" || payload === null || Array.isArray(payload)) integrity();
-    exactKeys(payload, ["checkpoint", "baseEventPosition", "checkpointEventPosition"]);
     const payloadRecord = payload as Readonly<Record<string, unknown>>;
+    if (schemaVersion === 3) {
+      exactKeys(payloadRecord, [
+        "checkpoint",
+        "baseEventPosition",
+        "checkpointEventPosition",
+        "finalCheckpointBindingVersion",
+        "workflowId",
+        "workflowGeneration",
+      ]);
+      if (
+        payloadRecord.finalCheckpointBindingVersion !== 1
+        || typeof payloadRecord.workflowGeneration !== "number"
+        || !Number.isSafeInteger(payloadRecord.workflowGeneration)
+        || payloadRecord.workflowGeneration < 1
+      ) integrity();
+      uuid(payloadRecord.workflowId);
+    } else {
+      exactKeys(payloadRecord, ["checkpoint", "baseEventPosition", "checkpointEventPosition"]);
+    }
     let checkpoint: Checkpoint;
     try {
-      checkpoint = schemaVersion === 1
+      const checkpointVersion = (payloadRecord.checkpoint as Record<string, unknown> | null)
+        ?.checkpointVersion;
+      checkpoint = checkpointVersion === 1
         ? decodeCheckpointV1(payloadRecord.checkpoint)
-        : decodeCheckpointV2(payloadRecord.checkpoint);
+        : checkpointVersion === 2
+          ? decodeCheckpointV2(payloadRecord.checkpoint)
+          : integrity();
     } catch {
       integrity();
     }
-    if (checkpoint.checkpointVersion !== schemaVersion
+    if ((schemaVersion !== 3 && checkpoint.checkpointVersion !== schemaVersion)
       || checkpoint.checkpointId !== checkpointId
       || checkpoint.sessionId !== sessionId
       || checkpoint.parentSessionId !== parentSessionId
@@ -695,7 +720,7 @@ export class SessionAuthorityRepository {
   loadEvents(
     connection: SqliteConnection,
     authority: SessionAuthorityRecord,
-  ): readonly LifecycleEvent[] {
+  ): readonly LifecycleEventCodecResult[] {
     return Object.freeze([...eventRows(connection, authority)]);
   }
 
@@ -1000,7 +1025,7 @@ export class SessionAuthorityRepository {
   ): Checkpoint | null {
     const events = eventRows(connection, authority);
     const checkpoints = events.filter((event): event is Extract<
-      LifecycleEvent,
+      LifecycleEventCodecResult,
       { readonly eventType: "SessionCheckpointRecorded" }
     > => event.eventType === "SessionCheckpointRecorded");
     const latest = checkpoints.at(-1) ?? null;

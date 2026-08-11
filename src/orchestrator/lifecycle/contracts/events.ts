@@ -405,8 +405,21 @@ export interface SessionEndCancelledPayloadV3 {
   readonly preTransitionCheckpointId: CheckpointId;
 }
 
+export interface SessionCheckpointRecordedPayloadV3 {
+  readonly checkpoint: CheckpointV1 | CheckpointV2;
+  readonly baseEventPosition: string;
+  readonly checkpointEventPosition: string;
+  readonly finalCheckpointBindingVersion: 1;
+  readonly workflowId: WorkflowId;
+  readonly workflowGeneration: number;
+}
+
 type LifecycleEventBaseV3<
-  T extends "SessionEndRequested" | "SessionEndAmended" | "SessionEndCancelled",
+  T extends
+    | "SessionEndRequested"
+    | "SessionEndAmended"
+    | "SessionEndCancelled"
+    | "SessionCheckpointRecorded",
   P,
 > = Omit<LifecycleEventBaseV1<T>, "eventSchemaVersion" | "payload"> & {
   readonly eventSchemaVersion: 3;
@@ -416,7 +429,8 @@ type LifecycleEventBaseV3<
 export type LifecycleEventV3 =
   | LifecycleEventBaseV3<"SessionEndRequested", SessionEndRequestedPayloadV3>
   | LifecycleEventBaseV3<"SessionEndAmended", SessionEndAmendedPayloadV3>
-  | LifecycleEventBaseV3<"SessionEndCancelled", SessionEndCancelledPayloadV3>;
+  | LifecycleEventBaseV3<"SessionEndCancelled", SessionEndCancelledPayloadV3>
+  | LifecycleEventBaseV3<"SessionCheckpointRecorded", SessionCheckpointRecordedPayloadV3>;
 
 export type LifecycleEvent = LifecycleEventV1 | LifecycleEventV2;
 export type LifecycleEventCodecResult = LifecycleEvent | LifecycleEventV3;
@@ -1351,6 +1365,7 @@ const LIFECYCLE_EVENT_TYPES_V3 = [
   "SessionEndRequested",
   "SessionEndAmended",
   "SessionEndCancelled",
+  "SessionCheckpointRecorded",
 ] as const;
 
 function decodePayloadV3(
@@ -1431,7 +1446,70 @@ function decodePayloadV3(
         ),
       });
     }
+    case "SessionCheckpointRecorded": {
+      const payload = exactRecord(value, [
+        "checkpoint",
+        "baseEventPosition",
+        "checkpointEventPosition",
+        "finalCheckpointBindingVersion",
+        "workflowId",
+        "workflowGeneration",
+      ], "event.payload");
+      const nestedVersion = strictRecord(payload.checkpoint, "event.payload.checkpoint").checkpointVersion;
+      const checkpoint = nestedVersion === 1
+        ? decodeCheckpointV1(payload.checkpoint)
+        : nestedVersion === 2
+          ? decodeCheckpointV2(payload.checkpoint)
+          : invalid("event.payload.checkpoint.checkpointVersion");
+      const baseEventPosition = parseDecimalString(
+        payload.baseEventPosition,
+        "event.payload.baseEventPosition",
+      );
+      const checkpointEventPosition = parseDecimalString(
+        payload.checkpointEventPosition,
+        "event.payload.checkpointEventPosition",
+      );
+      if (
+        payload.finalCheckpointBindingVersion !== 1
+        || checkpoint.baseEventPosition !== baseEventPosition
+        || checkpoint.checkpointEventPosition !== checkpointEventPosition
+      ) invalid("event.payload");
+      return Object.freeze({
+        checkpoint,
+        baseEventPosition,
+        checkpointEventPosition,
+        finalCheckpointBindingVersion: 1,
+        workflowId: workflowId(payload.workflowId),
+        workflowGeneration: generation(payload.workflowGeneration, "event.payload.workflowGeneration"),
+      });
+    }
   }
+}
+
+/**
+ * Decodes an event payload without inventing envelope fields. Callers that
+ * already possess authenticated envelope witnesses must apply those
+ * correlations separately.
+ */
+export function decodeLifecycleEventPayload(
+  eventType: LifecycleEventType,
+  eventSchemaVersion: number,
+  value: unknown,
+): LifecycleEventCodecResult["payload"] {
+  if (eventSchemaVersion === 1) return decodePayload(eventType, value);
+  if (
+    eventSchemaVersion === 2
+    && (LIFECYCLE_EVENT_TYPES_V2 as readonly string[]).includes(eventType)
+  ) {
+    return decodePayloadV2(eventType as LifecycleEventV2["eventType"], value);
+  }
+  if (
+    eventSchemaVersion === 3
+    && (LIFECYCLE_EVENT_TYPES_V3 as readonly string[]).includes(eventType)
+  ) {
+    return decodePayloadV3(eventType as LifecycleEventV3["eventType"], value);
+  }
+  return invalid("eventSchemaVersion");
 }
 
 export function decodeLifecycleEventV3(value: unknown): LifecycleEventV3 {
@@ -1450,6 +1528,16 @@ export function decodeLifecycleEventV3(value: unknown): LifecycleEventV3 {
     const payload = decodePayloadV3(eventType, event.payload);
     if ("effectiveState" in payload) {
       assertSessionEndEffectiveStateSessionCorrelationV1(payload.effectiveState, sessionId);
+    }
+    if (eventType === "SessionCheckpointRecorded") {
+      const checkpointPayload = payload as SessionCheckpointRecordedPayloadV3;
+      if (
+        event.streamId !== `session/${sessionId}`
+        || checkpointPayload.checkpointEventPosition !== globalPosition
+        || checkpointPayload.checkpoint.sessionId !== sessionId
+        || checkpointPayload.checkpoint.parentSessionId !== null
+        || checkpointPayload.checkpoint.sourceState.workspaceId !== workspaceId
+      ) invalid("event.payload.checkpoint");
     }
     return Object.freeze({
       eventSchemaVersion: 3,

@@ -57,6 +57,7 @@ import {
 import {
   decodeLegacyLifecycleEvent,
   decodeLifecycleEvent,
+  decodeLifecycleEventV3,
   decodeLifecycleEventV1,
   LIFECYCLE_EVENT_TYPES,
   type LifecycleEventV1,
@@ -638,6 +639,19 @@ function validLifecycleEvent(
   };
 }
 
+function validCheckpointV2(): Record<string, unknown> {
+  return {
+    ...validCheckpoint(),
+    checkpointVersion: 2,
+    evidenceCoverage: {
+      coverageVersion: 2,
+      captureMode: "coverage-only",
+      contentRetained: false,
+      adapterSessions: [],
+    },
+  };
+}
+
 const VERSIONED_EVENT_KEYS = [
   "eventSchemaVersion",
   "eventId",
@@ -686,6 +700,41 @@ function versionedLifecycleEventInput(
     authorityCommitment: "a".repeat(64),
     payload,
   };
+}
+
+function finalMarker(checkpointVersion: 1 | 2): Record<string, unknown> {
+  return {
+    ...validLifecycleEvent("SessionCheckpointRecorded", {
+      checkpoint: checkpointVersion === 1 ? validCheckpoint() : validCheckpointV2(),
+      baseEventPosition: "12",
+      checkpointEventPosition: "13",
+      finalCheckpointBindingVersion: 1,
+      workflowId: UUIDS.workflow,
+      workflowGeneration: 1,
+    }),
+    eventSchemaVersion: 3,
+  };
+}
+
+function hostileFinalMarkers(): readonly Record<string, unknown>[] {
+  const valid = finalMarker(1);
+  const payload = valid.payload as Record<string, unknown>;
+  const checkpoint = payload.checkpoint as Record<string, unknown>;
+  return [
+    ...Object.keys(payload).map((key) => ({
+      ...valid,
+      payload: { ...payload, [key]: key === "workflowGeneration" ? 0 : null },
+    })),
+    { ...valid, payload: { ...payload, extra: true } },
+    { ...valid, parentSessionId: UUIDS.parent },
+    { ...valid, streamId: `session/${UUIDS.parent}` },
+    { ...valid, globalPosition: "14" },
+    { ...valid, payload: { ...payload, checkpoint: { ...checkpoint, sessionId: UUIDS.parent } } },
+    { ...valid, payload: { ...payload, baseEventPosition: "11" } },
+    { ...valid, payload: { ...payload, checkpointEventPosition: "14" } },
+    { ...valid, payload: { ...payload, workflowId: "not-a-uuid" } },
+    { ...valid, payload: { ...payload, workflowGeneration: Number.MAX_SAFE_INTEGER + 1 } },
+  ];
 }
 
 function independentlyExpectedVersionedLifecycleEvent(
@@ -2850,6 +2899,14 @@ describe("lifecycle Version 1 contracts", () => {
         () => decodeLifecycleEvent(versionedLifecycleEventInput(3, "SessionEndCancelled", payload)),
         { message: /LIFECYCLE_INPUT_INVALID/ },
       );
+    }
+  });
+
+  it("decodes only exact root-bound Version 3 final checkpoint markers", () => {
+    assert.equal(decodeLifecycleEventV3(finalMarker(1)).eventType, "SessionCheckpointRecorded");
+    assert.equal(decodeLifecycleEventV3(finalMarker(2)).eventType, "SessionCheckpointRecorded");
+    for (const hostile of hostileFinalMarkers()) {
+      expectCode("LIFECYCLE_INPUT_INVALID", () => decodeLifecycleEventV3(hostile));
     }
   });
 

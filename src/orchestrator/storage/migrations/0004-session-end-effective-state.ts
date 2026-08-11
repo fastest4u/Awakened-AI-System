@@ -83,8 +83,35 @@ const LEGACY_WORKFLOW_FOLD_GUARD = priorTriggerSql(
     "WHEN NEW.fingerprint_schema_version = 1\n  AND NOT EXISTS (",
   );
 
+function withVersion3FinalMarkerBinding(sql: string): string {
+  const versionBound = sql.replace(
+    "final_checkpoint_event.event_schema_version IN (1, 2)",
+    "final_checkpoint_event.event_schema_version = 3",
+  );
+  const checkpointPositionBinding = `AND json_extract(final_checkpoint_event.payload_json,
+          '$.checkpoint.checkpointEventPosition')
+          IS CAST(NEW.evidence_frozen_checkpoint_event_position AS TEXT)`;
+  const workflowBinding = `${checkpointPositionBinding}
+        AND json_extract(final_checkpoint_event.payload_json, '$.workflowId')
+          IS NEW.workflow_id
+        AND json_extract(
+          final_checkpoint_event.payload_json, '$.workflowGeneration'
+        ) IS NEW.evidence_frozen_generation`;
+  const bound = versionBound.replace(checkpointPositionBinding, workflowBinding);
+  if (versionBound === sql || bound === versionBound) {
+    throw new Error("Missing frozen migration final-checkpoint binding");
+  }
+  return bound;
+}
+
+const WORKFLOW_EVIDENCE_V4_INSERT_GUARD = withVersion3FinalMarkerBinding(
+  priorTriggerSql("workflow_instances_evidence_v3_insert_guard"),
+);
+
 const WORKFLOW_EVIDENCE_V4_UPDATE_GUARD = (() => {
-  const frozen = priorTriggerSql("workflow_instances_evidence_v3_update_guard");
+  const frozen = withVersion3FinalMarkerBinding(
+    priorTriggerSql("workflow_instances_evidence_v3_update_guard"),
+  );
   const reopenBranch = /\(\n\s+NEW\.generation = OLD\.generation \+ 1\n\s+AND OLD\.phase = 'cancelled'\n\s+AND NEW\.phase = 'requested'\n[\s\S]*?\n\s+AND NEW\.triggering_event_position > OLD\.triggering_event_position\n\s+\)/u;
   const replacement = `(
       NEW.generation = OLD.generation + 1
@@ -189,6 +216,7 @@ export const sessionEndEffectiveStateMigration: Migration = {
   sql: withOutboxLifecycleDescriptorUpdateGuard(`
 DROP TRIGGER events_lifecycle_version_v3_guard;
 DROP TRIGGER lifecycle_workflow_generation_folds_insert_guard;
+DROP TRIGGER workflow_instances_evidence_v3_insert_guard;
 DROP TRIGGER workflow_instances_evidence_v3_update_guard;
 
 ALTER TABLE lifecycle_workflow_generation_folds
@@ -210,6 +238,8 @@ ALTER TABLE lifecycle_workflow_generation_folds
   );
 
 ${LEGACY_WORKFLOW_FOLD_GUARD}
+
+${WORKFLOW_EVIDENCE_V4_INSERT_GUARD}
 
 ${WORKFLOW_EVIDENCE_V4_UPDATE_GUARD}
 
@@ -443,6 +473,93 @@ ON child_transfer_tickets(
   project_id, source_parent_session_id, source_child_session_id
 );
 
+DROP TRIGGER child_transfer_tickets_update_guard;
+CREATE TRIGGER child_transfer_tickets_update_guard
+BEFORE UPDATE ON child_transfer_tickets
+WHEN NEW.project_id IS NOT OLD.project_id
+  OR NEW.transfer_ticket_id IS NOT OLD.transfer_ticket_id
+  OR NEW.source_parent_session_id IS NOT OLD.source_parent_session_id
+  OR NEW.source_child_session_id IS NOT OLD.source_child_session_id
+  OR NEW.source_assignment_json IS NOT OLD.source_assignment_json
+  OR NEW.source_scope_json IS NOT OLD.source_scope_json
+  OR NEW.checkpoint_id IS NOT OLD.checkpoint_id
+  OR NEW.follow_ups_json IS NOT OLD.follow_ups_json
+  OR NEW.source_state_json IS NOT OLD.source_state_json
+  OR NEW.lineage_json IS NOT OLD.lineage_json
+  OR NEW.created_event_position IS NOT OLD.created_event_position
+  OR NEW.created_at IS NOT OLD.created_at
+  OR (OLD.claimed_by_root_session_id IS NOT NULL AND (
+    NEW.claimed_by_root_session_id IS NOT OLD.claimed_by_root_session_id
+    OR NEW.claimed_child_session_id IS NOT OLD.claimed_child_session_id
+    OR NEW.claimed_event_position IS NOT OLD.claimed_event_position
+    OR NEW.claimed_at IS NOT OLD.claimed_at
+  ))
+  OR (NEW.claimed_by_root_session_id IS NULL)
+    <> (NEW.claimed_child_session_id IS NULL)
+  OR (NEW.claimed_by_root_session_id IS NULL)
+    <> (NEW.claimed_event_position IS NULL)
+  OR (NEW.claimed_by_root_session_id IS NULL) <> (NEW.claimed_at IS NULL)
+  OR (
+    OLD.claimed_by_root_session_id IS NULL
+    AND NEW.claimed_by_root_session_id IS NOT NULL
+    AND coalesce((EXISTS (
+      SELECT 1
+      FROM events AS source_transfer
+      JOIN events AS claim
+        ON claim.project_id = source_transfer.project_id
+        AND claim.global_position = NEW.claimed_event_position
+        AND claim.session_id = NEW.claimed_child_session_id
+        AND claim.parent_session_id = NEW.claimed_by_root_session_id
+        AND claim.stream_id = 'session/' || NEW.claimed_child_session_id
+        AND claim.stream_type = 'session'
+        AND claim.stream_version = 2
+        AND claim.event_type = 'ChildWorkTransferClaimed'
+        AND claim.event_schema_version = 1
+        AND claim.command_event_index = 1
+        AND json_extract(claim.payload_json, '$.transferTicketId')
+          = NEW.transfer_ticket_id
+        AND json_extract(claim.payload_json, '$.previousChildSessionId')
+          = NEW.source_child_session_id
+        AND json_extract(
+          claim.payload_json, '$.previousTransferEventPosition'
+        ) = CAST(NEW.created_event_position AS TEXT)
+      JOIN events AS fork
+        ON fork.project_id = claim.project_id
+        AND fork.stream_id = claim.stream_id
+        AND fork.session_id = claim.session_id
+        AND fork.parent_session_id = claim.parent_session_id
+        AND fork.stream_version = 1
+        AND fork.global_position + 1 = claim.global_position
+        AND fork.event_type = 'SessionForked'
+        AND fork.event_schema_version = 1
+        AND fork.command_event_index = 0
+        AND fork.command_id = claim.command_id
+        AND fork.idempotency_key = claim.idempotency_key
+        AND claim.causation_id = fork.event_id
+        AND fork.causation_id = source_transfer.event_id
+        AND fork.vault_id = claim.vault_id
+        AND fork.store_id = claim.store_id
+        AND fork.workspace_id = claim.workspace_id
+        AND fork.branch_scope_id IS claim.branch_scope_id
+        AND fork.branch_ref IS claim.branch_ref
+        AND json_extract(fork.payload_json, '$.sourceTransferTicketId')
+          = NEW.transfer_ticket_id
+      WHERE source_transfer.project_id = NEW.project_id
+        AND source_transfer.global_position = NEW.created_event_position
+        AND source_transfer.session_id = NEW.source_child_session_id
+        AND source_transfer.parent_session_id = NEW.source_parent_session_id
+        AND source_transfer.event_type = 'ChildWorkTransferCreated'
+        AND source_transfer.event_schema_version IN (1, 2)
+        AND json_extract(source_transfer.payload_json, '$.transferTicketId')
+          = NEW.transfer_ticket_id
+        AND json_extract(source_transfer.payload_json, '$.checkpointId')
+          = NEW.checkpoint_id
+    )), 0) = 0
+  )
+BEGIN
+  SELECT RAISE(ABORT, 'CHILD_TRANSFER_TICKET_IMMUTABLE');
+END;
+
 CREATE TRIGGER session_authority_child_history_v4_insert_guard
 BEFORE INSERT ON session_authority
 WHEN NEW.session_kind = 'child'
@@ -588,6 +705,12 @@ WHEN NEW.kind = 'materialize-lifecycle-log'
             AND (
               (
                 trigger_event.event_type = 'SessionCheckpointRecorded'
+                AND trigger_event.event_schema_version = 3
+                AND json_extract(trigger_event.payload_json, '$.workflowId')
+                  = NEW.workflow_id
+                AND json_extract(
+                  trigger_event.payload_json, '$.workflowGeneration'
+                ) = NEW.workflow_generation
                 AND EXISTS (
                   SELECT 1 FROM workflow_instances AS workflow
                   WHERE workflow.project_id = NEW.project_id
@@ -636,6 +759,38 @@ WHEN NEW.stream_type = 'session' AND NEW.session_id IS NOT NULL AND (
     OR (NEW.event_schema_version = 2
       AND json_type(NEW.payload_json, '$.checkpoint.checkpointVersion') IS 'integer'
       AND json_extract(NEW.payload_json, '$.checkpoint.checkpointVersion') IS 2)
+    OR (NEW.event_schema_version = 3
+      AND NEW.parent_session_id IS NULL
+      AND NEW.stream_id = 'session/' || NEW.session_id
+      AND json_valid(NEW.payload_json)
+      AND json(NEW.payload_json) = NEW.payload_json
+      AND json_type(NEW.payload_json) = 'object'
+      AND (SELECT count(*) FROM json_each(NEW.payload_json)) = 6
+      AND NOT EXISTS (
+        SELECT 1 FROM json_each(NEW.payload_json)
+        WHERE key NOT IN (
+          'checkpoint', 'baseEventPosition', 'checkpointEventPosition',
+          'finalCheckpointBindingVersion', 'workflowId', 'workflowGeneration'
+        )
+      )
+      AND json_type(NEW.payload_json, '$.checkpoint.checkpointVersion') IS 'integer'
+      AND json_extract(NEW.payload_json, '$.checkpoint.checkpointVersion') IN (1, 2)
+      AND json_type(NEW.payload_json, '$.baseEventPosition') = 'text'
+      AND json_type(NEW.payload_json, '$.checkpointEventPosition') = 'text'
+      AND json_extract(NEW.payload_json, '$.checkpointEventPosition')
+        = CAST(NEW.global_position AS TEXT)
+      AND json_extract(NEW.payload_json, '$.finalCheckpointBindingVersion') IS 1
+      AND ${canonicalUuid("json_extract(NEW.payload_json, '$.workflowId')")}
+      AND json_type(NEW.payload_json, '$.workflowGeneration') = 'integer'
+      AND json_extract(NEW.payload_json, '$.workflowGeneration') BETWEEN 1 AND 9007199254740991
+      AND json_extract(NEW.payload_json, '$.checkpoint.sessionId') = NEW.session_id
+      AND json_extract(NEW.payload_json, '$.checkpoint.parentSessionId') IS NULL
+      AND json_extract(NEW.payload_json, '$.checkpoint.baseEventPosition')
+        = json_extract(NEW.payload_json, '$.baseEventPosition')
+      AND json_extract(NEW.payload_json, '$.checkpoint.checkpointEventPosition')
+        = json_extract(NEW.payload_json, '$.checkpointEventPosition')
+      AND json_extract(NEW.payload_json, '$.checkpoint.sourceState.workspaceId')
+        = NEW.workspace_id)
   ))
   OR (NEW.event_type = 'SessionEndRequested' AND NOT (
     (NEW.event_schema_version = 1
@@ -670,6 +825,129 @@ WHEN NEW.stream_type = 'session' AND NEW.session_id IS NOT NULL AND (
 )
 BEGIN
   SELECT RAISE(ABORT, 'LIFECYCLE_EVENT_VERSION_INVALID');
+END;
+
+CREATE TRIGGER events_final_checkpoint_v4_guard
+BEFORE INSERT ON events
+WHEN NEW.stream_type = 'session'
+  AND NEW.session_id IS NOT NULL
+  AND NEW.event_type = 'SessionCheckpointRecorded'
+  AND NEW.event_schema_version = 3
+  AND coalesce((
+    NEW.parent_session_id IS NULL
+    AND NEW.stream_id = 'session/' || NEW.session_id
+    AND NEW.command_event_index = 0
+    AND json_type(NEW.lifecycle_intent_json) = 'object'
+    AND json(NEW.lifecycle_intent_json) = NEW.lifecycle_intent_json
+    AND json_extract(
+      NEW.lifecycle_intent_json, '$.intent.command.commandType'
+    ) = 'internal-workflow-phase'
+    AND json_extract(
+      NEW.lifecycle_intent_json, '$.intent.command.commandId'
+    ) = NEW.command_id
+    AND json_extract(
+      NEW.lifecycle_intent_json, '$.intent.command.idempotencyKey'
+    ) = NEW.idempotency_key
+    AND json_extract(
+      NEW.lifecycle_intent_json, '$.intent.command.agentId'
+    ) = NEW.agent_id
+    AND json_extract(
+      NEW.lifecycle_intent_json, '$.intent.command.expectedProjectId'
+    ) = NEW.project_id
+    AND json_extract(
+      NEW.lifecycle_intent_json, '$.intent.command.expectedVaultId'
+    ) = NEW.vault_id
+    AND json_extract(
+      NEW.lifecycle_intent_json, '$.intent.command.expectedWorkspaceId'
+    ) = NEW.workspace_id
+    AND json_extract(
+      NEW.lifecycle_intent_json, '$.intent.command.expectedBranchRef'
+    ) IS NEW.branch_ref
+    AND json_extract(
+      NEW.lifecycle_intent_json, '$.intent.command.workflowId'
+    ) = json_extract(NEW.payload_json, '$.workflowId')
+    AND json_extract(
+      NEW.lifecycle_intent_json, '$.intent.command.workflowGeneration'
+    ) = json_extract(NEW.payload_json, '$.workflowGeneration')
+    AND json_extract(
+      NEW.lifecycle_intent_json, '$.intent.command.sourcePhase'
+    ) = 'children-resolved'
+    AND json_extract(
+      NEW.lifecycle_intent_json, '$.intent.command.action.action'
+    ) = 'record-final-checkpoint-and-queue-ending'
+    AND json(json_extract(
+      NEW.lifecycle_intent_json, '$.intent.command.action.finalCheckpoint'
+    )) = json(json_extract(NEW.payload_json, '$.checkpoint'))
+    AND json_extract(
+      NEW.lifecycle_intent_json,
+      '$.persistedAssertions.authorizationKind'
+    ) = 'internal-workflow'
+    AND json_extract(
+      NEW.lifecycle_intent_json,
+      '$.persistedAssertions.authorizationSessionId'
+    ) = NEW.session_id
+    AND json_extract(
+      NEW.lifecycle_intent_json, '$.persistedAssertions.targetSessionId'
+    ) = NEW.session_id
+    AND json_extract(
+      NEW.lifecycle_intent_json, '$.persistedAssertions.internalWorkflowId'
+    ) = json_extract(NEW.payload_json, '$.workflowId')
+    AND json_extract(
+      NEW.lifecycle_intent_json,
+      '$.persistedAssertions.internalWorkflowGeneration'
+    ) = json_extract(NEW.payload_json, '$.workflowGeneration')
+    AND json_extract(
+      NEW.lifecycle_intent_json, '$.persistedAssertions.projectId'
+    ) = NEW.project_id
+    AND json_extract(
+      NEW.lifecycle_intent_json, '$.persistedAssertions.vaultId'
+    ) = NEW.vault_id
+    AND json_extract(
+      NEW.lifecycle_intent_json, '$.persistedAssertions.storeId'
+    ) = NEW.store_id
+    AND json_extract(
+      NEW.lifecycle_intent_json, '$.persistedAssertions.workspaceId'
+    ) = NEW.workspace_id
+    AND json_extract(
+      NEW.lifecycle_intent_json, '$.persistedAssertions.presentingActorRole'
+    ) = NEW.actor_role
+    AND json_extract(
+      NEW.lifecycle_intent_json,
+      '$.persistedAssertions.presentingClientInstanceId'
+    ) = NEW.client_instance_id
+    AND EXISTS (
+      SELECT 1
+      FROM workflow_instances AS workflow
+      WHERE workflow.project_id = NEW.project_id
+        AND workflow.workflow_id = json_extract(
+          NEW.payload_json, '$.workflowId'
+        )
+        AND workflow.session_id = NEW.session_id
+        AND workflow.workflow_type = 'session-end'
+        AND workflow.generation = json_extract(
+          NEW.payload_json, '$.workflowGeneration'
+        )
+        AND workflow.phase = 'children-resolved'
+        AND workflow.evidence_window_state = 'sealed'
+        AND workflow.evidence_frozen_checkpoint_event_position IS NULL
+        AND workflow.evidence_frozen_generation IS NULL
+        AND workflow.final_ending_scope_bindings_json IS NULL
+    )
+    AND EXISTS (
+      SELECT 1
+      FROM session_authority AS authority
+      WHERE authority.project_id = NEW.project_id
+        AND authority.session_id = NEW.session_id
+        AND authority.stream_id = NEW.stream_id
+        AND authority.session_kind = 'root'
+        AND authority.parent_session_id IS NULL
+        AND authority.workspace_id = NEW.workspace_id
+        AND authority.semantic_state = 'ending'
+        AND authority.terminal_event_position IS NULL
+    )
+  ), 0) = 0
+BEGIN
+  SELECT RAISE(ABORT, 'FINAL_CHECKPOINT_V4_INVALID');
 END;
 
 CREATE TRIGGER events_child_work_transfer_v2_guard
@@ -1640,5 +1918,17 @@ BEGIN
     THEN RAISE(ABORT, 'SESSION_END_EVENT_V3_INVALID')
   END;
 END;
+
+CREATE INDEX events_lifecycle_direct_child_v4
+ON events(project_id, parent_session_id, global_position)
+WHERE stream_type = 'session'
+  AND event_type = 'SessionForked'
+  AND event_schema_version = 1;
+
+CREATE INDEX events_lifecycle_transfer_claim_v4
+ON events(project_id, json_extract(payload_json, '$.transferTicketId'), global_position)
+WHERE stream_type = 'session'
+  AND event_type = 'ChildWorkTransferClaimed'
+  AND event_schema_version = 1;
 `),
 };

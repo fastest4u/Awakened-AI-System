@@ -136,7 +136,7 @@ function assertLifecycleOutboxDescriptor(
     ) fail();
 
     const trigger = connection.prepare(`
-      SELECT event_type, payload_json, payload_hash, command_event_index,
+      SELECT event_type, event_schema_version, payload_json, payload_hash, command_event_index,
              session_id, stream_type, stream_id
       FROM events
       WHERE project_id = $projectId AND global_position = $eventPosition
@@ -173,6 +173,11 @@ function assertLifecycleOutboxDescriptor(
         || workflowGeneration < 1
       ) fail();
       if (trigger.event_type === "SessionCheckpointRecorded") {
+        if (
+          integer(trigger.event_schema_version) !== 3
+          || triggerPayload.workflowId !== row.workflow_id
+          || integer(triggerPayload.workflowGeneration) !== workflowGeneration
+        ) fail();
         const workflow = connection.prepare(`
           SELECT 1
           FROM workflow_instances
@@ -564,6 +569,157 @@ implements SessionEndEffectiveStateMigrationPreflight {
     for (const row of lifecycleOutboxRows) {
       assertLifecycleOutboxDescriptor(connection, row);
     }
+
+    const legacyFinalPointer = connection.prepare(`
+      SELECT 1
+      FROM workflow_instances
+      WHERE session_id IS NOT NULL
+        AND workflow_type = 'session-end'
+        AND (
+          evidence_frozen_checkpoint_event_position IS NOT NULL
+          OR evidence_frozen_generation IS NOT NULL
+          OR final_ending_scope_bindings_json IS NOT NULL
+        )
+      LIMIT 1
+    `).get();
+    if (legacyFinalPointer !== undefined) fail();
+
+    const forkAuthorityDrift = connection.prepare(`
+      SELECT 1
+      FROM session_authority AS child
+      WHERE child.session_kind = 'child'
+        AND (
+          SELECT count(*)
+          FROM events AS fork
+          WHERE fork.project_id = child.project_id
+            AND fork.session_id = child.session_id
+            AND fork.stream_id = child.stream_id
+            AND fork.stream_type = 'session'
+            AND fork.stream_version = 1
+            AND fork.event_type = 'SessionForked'
+            AND fork.event_schema_version = 1
+            AND fork.parent_session_id IS child.parent_session_id
+            AND fork.workspace_id = child.workspace_id
+            AND json_extract(fork.payload_json, '$.parentSessionId')
+              IS child.parent_session_id
+        ) <> 1
+      UNION ALL
+      SELECT 1
+      FROM events AS fork
+      WHERE fork.stream_type = 'session'
+        AND fork.event_type = 'SessionForked'
+        AND fork.event_schema_version = 1
+        AND fork.stream_version = 1
+        AND NOT EXISTS (
+          SELECT 1
+          FROM session_authority AS child
+          WHERE child.project_id = fork.project_id
+            AND child.session_id = fork.session_id
+            AND child.stream_id = fork.stream_id
+            AND child.session_kind = 'child'
+            AND child.parent_session_id IS fork.parent_session_id
+            AND child.workspace_id = fork.workspace_id
+        )
+      LIMIT 1
+    `).get();
+    if (forkAuthorityDrift !== undefined) fail();
+
+    const ticketClaimDrift = connection.prepare(`
+      SELECT 1
+      FROM child_transfer_tickets AS ticket
+      LEFT JOIN events AS source_transfer
+        ON source_transfer.project_id = ticket.project_id
+        AND source_transfer.global_position = ticket.created_event_position
+        AND source_transfer.session_id = ticket.source_child_session_id
+        AND source_transfer.parent_session_id IS ticket.source_parent_session_id
+        AND source_transfer.event_type = 'ChildWorkTransferCreated'
+        AND source_transfer.event_schema_version IN (1, 2)
+        AND json_extract(source_transfer.payload_json, '$.transferTicketId')
+          IS ticket.transfer_ticket_id
+        AND json_extract(source_transfer.payload_json, '$.checkpointId')
+          IS ticket.checkpoint_id
+      LEFT JOIN events AS claim
+        ON claim.project_id = ticket.project_id
+        AND json_extract(claim.payload_json, '$.transferTicketId')
+          IS ticket.transfer_ticket_id
+        AND claim.event_type = 'ChildWorkTransferClaimed'
+        AND claim.event_schema_version = 1
+      LEFT JOIN events AS fork
+        ON fork.project_id = claim.project_id
+        AND fork.stream_id = claim.stream_id
+        AND fork.stream_version = 1
+        AND fork.event_type = 'SessionForked'
+        AND fork.event_schema_version = 1
+      WHERE source_transfer.global_position IS NULL
+        OR (
+          ticket.claimed_event_position IS NULL
+          AND claim.global_position IS NOT NULL
+        )
+        OR (
+          ticket.claimed_event_position IS NOT NULL
+          AND (
+            claim.global_position IS NULL
+            OR claim.global_position IS NOT ticket.claimed_event_position
+            OR claim.session_id IS NOT ticket.claimed_child_session_id
+            OR claim.parent_session_id IS NOT ticket.claimed_by_root_session_id
+            OR claim.stream_id IS NOT 'session/' || ticket.claimed_child_session_id
+            OR claim.stream_version IS NOT 2
+            OR claim.command_event_index IS NOT 1
+            OR fork.global_position IS NULL
+            OR fork.global_position + 1 IS NOT claim.global_position
+            OR fork.session_id IS NOT claim.session_id
+            OR fork.parent_session_id IS NOT claim.parent_session_id
+            OR fork.command_event_index IS NOT 0
+            OR fork.command_id IS NOT claim.command_id
+            OR fork.idempotency_key IS NOT claim.idempotency_key
+            OR claim.causation_id IS NOT fork.event_id
+            OR fork.causation_id IS NOT source_transfer.event_id
+            OR fork.vault_id IS NOT claim.vault_id
+            OR fork.store_id IS NOT claim.store_id
+            OR fork.workspace_id IS NOT claim.workspace_id
+            OR fork.branch_scope_id IS NOT claim.branch_scope_id
+            OR fork.branch_ref IS NOT claim.branch_ref
+            OR json_extract(fork.payload_json, '$.sourceTransferTicketId')
+              IS NOT ticket.transfer_ticket_id
+            OR json_extract(claim.payload_json, '$.previousChildSessionId')
+              IS NOT ticket.source_child_session_id
+            OR json_extract(
+              claim.payload_json, '$.previousTransferEventPosition'
+            ) IS NOT CAST(ticket.created_event_position AS TEXT)
+          )
+        )
+      GROUP BY ticket.project_id, ticket.transfer_ticket_id
+      HAVING count(claim.global_position) <> CASE
+        WHEN ticket.claimed_event_position IS NULL THEN 0 ELSE 1 END
+        OR source_transfer.global_position IS NULL
+        OR ticket.claimed_event_position IS NOT NULL AND (
+          min(claim.global_position) IS NOT ticket.claimed_event_position
+          OR min(fork.global_position) + 1 IS NOT min(claim.global_position)
+        )
+      LIMIT 1
+    `).get();
+    if (ticketClaimDrift !== undefined) fail();
+
+    const orphanClaim = connection.prepare(`
+      SELECT 1
+      FROM events AS claim
+      WHERE claim.stream_type = 'session'
+        AND claim.event_type = 'ChildWorkTransferClaimed'
+        AND claim.event_schema_version = 1
+        AND (
+          SELECT count(*)
+          FROM child_transfer_tickets AS ticket
+          WHERE ticket.project_id = claim.project_id
+            AND ticket.transfer_ticket_id IS json_extract(
+              claim.payload_json, '$.transferTicketId'
+            )
+            AND ticket.claimed_event_position IS claim.global_position
+            AND ticket.claimed_child_session_id IS claim.session_id
+            AND ticket.claimed_by_root_session_id IS claim.parent_session_id
+        ) <> 1
+      LIMIT 1
+    `).get();
+    if (orphanClaim !== undefined) fail();
 
     const overChildHistory = connection.prepare(`
       SELECT 1

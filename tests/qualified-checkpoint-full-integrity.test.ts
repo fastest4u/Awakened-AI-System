@@ -566,6 +566,8 @@ function rawEvent(
     readonly payload: unknown;
     readonly commandId?: string;
     readonly idempotencyKey?: string;
+    readonly commandEventIndex?: number;
+    readonly causationId?: string | null;
     readonly lifecycleIntent?: string | null;
     readonly projectId?: string;
     readonly vaultId?: string;
@@ -597,10 +599,10 @@ function rawEvent(
     agent_id: "agent-full-integrity",
     client_instance_id: "client-full-integrity",
     correlation_id: input.sessionId ?? `generic/${input.globalPosition}`,
-    causation_id: null,
+    causation_id: input.causationId ?? null,
     command_id: input.commandId ?? uuid(30_000 + offset),
     idempotency_key: input.idempotencyKey ?? `full-integrity/${input.globalPosition}`,
-    command_event_index: 0,
+    command_event_index: input.commandEventIndex ?? 0,
     occurred_at: input.occurredAt ?? NOW,
     recorded_at: input.recordedAt ?? input.occurredAt ?? NOW,
     visibility_scope: "session",
@@ -2276,22 +2278,48 @@ function insertFullCheckpoint(
     internalWorkflowGeneration: internal?.workflowGeneration ?? null,
     internalPlannedWorkId: internal?.plannedWorkId ?? null,
   });
+  if (internal !== undefined) {
+    withRestoredTriggers(fixture.connection, [
+      "workflow_instances_lifecycle_update_guard",
+      "workflow_instances_evidence_v3_update_guard",
+    ], () => {
+      fixture.connection.prepare(`
+        UPDATE workflow_instances
+        SET phase = 'children-resolved', evidence_window_state = 'sealed',
+            updated_at = $now
+        WHERE project_id = $projectId AND workflow_id = $workflowId
+      `).run({
+        $now: NOW,
+        $projectId: PROJECT_ID,
+        $workflowId: internal.workflowId,
+      });
+    });
+  }
   rawEvent(fixture.connection, {
     globalPosition: input.checkpointEventPosition,
     streamId: `session/${input.sessionId}`,
     streamVersion: input.streamVersion,
     eventType: "SessionCheckpointRecorded",
-    eventSchemaVersion: checkpointVersion,
+    eventSchemaVersion: internal === undefined ? checkpointVersion : 3,
     sessionId: input.sessionId,
     parentSessionId: input.parentSessionId,
     commandId: input.commandId,
     idempotencyKey: input.idempotencyKey,
     lifecycleIntent: intent.source,
-    payload: {
-      checkpoint: input.checkpoint,
-      baseEventPosition: input.baseEventPosition.toString(),
-      checkpointEventPosition: input.checkpointEventPosition.toString(),
-    },
+    payload: internal === undefined
+      ? {
+          checkpoint: input.checkpoint,
+          baseEventPosition: input.baseEventPosition.toString(),
+          checkpointEventPosition: input.checkpointEventPosition.toString(),
+        }
+      : {
+          checkpoint: input.checkpoint,
+          baseEventPosition: input.baseEventPosition.toString(),
+          checkpointEventPosition: input.checkpointEventPosition.toString(),
+          finalCheckpointBindingVersion: 1,
+          workflowId: internal.workflowId,
+          workflowGeneration: internal.workflowGeneration,
+        },
   });
   const response = {
     checkpointVersion,
@@ -4016,6 +4044,7 @@ function addSchema4FullTerminalLifecycleOutbox(
     WHERE project_id = $projectId AND global_position = 2
   `).get({ $projectId: PROJECT_ID });
   assert.equal(typeof event?.payload_hash, "string");
+  const triggeringPayloadHash = String(event!.payload_hash);
   const targetKey = `lifecycle-log/${ROOT_ID}/2`;
   const artifactPath = `05_Agent_Session_Logs/2026-07-31-session-${ROOT_ID}.md`;
   const payload = {
@@ -4025,7 +4054,7 @@ function addSchema4FullTerminalLifecycleOutbox(
     artifactKind: "compatibility-session-log",
     artifactPath,
     materializationRevision: "2",
-    triggeringPayloadHash: event!.payload_hash,
+    triggeringPayloadHash,
     nextFingerprint: {
       algorithm: "hmac-sha256",
       schemaVersion: 1,
@@ -4061,6 +4090,74 @@ function addSchema4FullTerminalLifecycleOutbox(
     artifact_kind: "compatibility-session-log",
     artifact_path: artifactPath,
     materialization_revision: 2,
+    expected_prior_fingerprint: null,
+    next_fingerprint: H64_B,
+    fingerprint_algorithm: "hmac-sha256",
+    fingerprint_schema_version: 1,
+    fingerprint_key_id: "materialization-key",
+    fingerprint_domain: "pm-materialization-fingerprint-v1",
+    failure_class: null,
+    safe_error_code: null,
+    next_attempt_at: null,
+  });
+  return targetKey;
+}
+
+function addVersion3FinalMarkerLifecycleOutbox(
+  fixture: Fixture,
+  workflowId: string,
+): string {
+  const event = fixture.connection.prepare(`
+    SELECT payload_hash FROM events
+    WHERE project_id = $projectId AND global_position = 4
+  `).get({ $projectId: PROJECT_ID });
+  assert.equal(typeof event?.payload_hash, "string");
+  const triggeringPayloadHash = String(event!.payload_hash);
+  const targetKey = `lifecycle-log/${ROOT_ID}/4`;
+  const artifactPath = `05_Agent_Session_Logs/${NOW.slice(0, 10)}-session-${ROOT_ID}.md`;
+  const payload = {
+    payloadVersion: 1,
+    targetKey,
+    sessionId: ROOT_ID,
+    artifactKind: "compatibility-session-log",
+    artifactPath,
+    materializationRevision: "4",
+    triggeringPayloadHash,
+    nextFingerprint: {
+      algorithm: "hmac-sha256",
+      schemaVersion: 1,
+      keyId: "materialization-key",
+      domain: "pm-materialization-fingerprint-v1",
+      value: H64_B,
+    },
+    origin: {
+      kind: "workflow",
+      workflowId,
+      workflowGeneration: 1,
+    },
+    triggeringEventType: "SessionCheckpointRecorded",
+  };
+  rawInsert(fixture.connection, "outbox", {
+    project_id: PROJECT_ID,
+    target_key: targetKey,
+    event_position: 4,
+    kind: "materialize-lifecycle-log",
+    payload_json: canonicalJson(payload),
+    content_hash: outboxHash(payload),
+    status: "pending",
+    attempt_count: 0,
+    claim_owner: null,
+    claim_token: null,
+    claim_expires_at: null,
+    created_at: NOW,
+    updated_at: NOW,
+    session_id: ROOT_ID,
+    origin_kind: "workflow",
+    workflow_id: workflowId,
+    workflow_generation: 1,
+    artifact_kind: "compatibility-session-log",
+    artifact_path: artifactPath,
+    materialization_revision: 4,
     expected_prior_fingerprint: null,
     next_fingerprint: H64_B,
     fingerprint_algorithm: "hmac-sha256",
@@ -4802,22 +4899,48 @@ function addFrozenCurrentChildWorkflow(
     internalWorkflowGeneration: internalWorkflow ? 1 : null,
     internalPlannedWorkId: internalWorkflow ? plannedWorkId : null,
   });
+  if (internalWorkflow) {
+    withRestoredTriggers(fixture.connection, [
+      "workflow_instances_lifecycle_update_guard",
+      "workflow_instances_evidence_v3_update_guard",
+    ], () => {
+      fixture.connection.prepare(`
+        UPDATE workflow_instances
+        SET phase = 'children-resolved', evidence_window_state = 'sealed',
+            updated_at = $now
+        WHERE project_id = $projectId AND workflow_id = $workflowId
+      `).run({
+        $now: NOW,
+        $projectId: PROJECT_ID,
+        $workflowId: workflowId,
+      });
+    });
+  }
   rawEvent(fixture.connection, {
     globalPosition: 4n,
     streamId: `session/${ROOT_ID}`,
     streamVersion: 3n,
     eventType: "SessionCheckpointRecorded",
-    eventSchemaVersion: 2,
+    eventSchemaVersion: internalWorkflow ? 3 : 2,
     sessionId: ROOT_ID,
     parentSessionId: null,
     commandId: checkpointCommandId,
     idempotencyKey: checkpointKey,
     lifecycleIntent: checkpointIntent.source,
-    payload: {
-      checkpoint,
-      baseEventPosition: "3",
-      checkpointEventPosition: "4",
-    },
+    payload: internalWorkflow
+      ? {
+          checkpoint,
+          baseEventPosition: "3",
+          checkpointEventPosition: "4",
+          finalCheckpointBindingVersion: 1,
+          workflowId,
+          workflowGeneration: 1,
+        }
+      : {
+          checkpoint,
+          baseEventPosition: "3",
+          checkpointEventPosition: "4",
+        },
   });
   const response = {
     checkpointVersion: 2,
@@ -5804,6 +5927,39 @@ function addFrozenCarryForwardWorkflow(
     previous_fingerprint: null,
     fingerprint: workflowFingerprint,
   });
+  rawInsert(fixture.connection, "workflow_instances", {
+    project_id: PROJECT_ID,
+    workflow_id: workflowId,
+    workflow_type: "session-end",
+    generation: 1,
+    state: "active",
+    phase: "children-resolved",
+    root_command_id: requestCommandId,
+    result_json: null,
+    error_code: null,
+    created_at: NOW,
+    updated_at: NOW,
+    session_id: ROOT_ID,
+    triggering_event_position: 6,
+    expected_authority_commitment: rootAuthority().authority_commitment,
+    coordinator_owner_id: null,
+    coordinator_claim_token: null,
+    coordinator_claim_expires_at: null,
+    coordinator_attempt_count: 1,
+    coordinator_failure_class: null,
+    coordinator_error_code: null,
+    coordinator_next_attempt_at: null,
+    validation_attempt_plan_generation: null,
+    validation_attempt_plans_json: null,
+    evidence_frozen_checkpoint_event_position: null,
+    evidence_frozen_generation: null,
+    evidence_window_state: "sealed",
+    final_ending_scope_bindings_json: null,
+  });
+  fixture.connection.prepare(`
+    UPDATE session_authority SET semantic_state = 'ending', updated_at = $now
+    WHERE project_id = $projectId AND session_id = $sessionId
+  `).run({ $now: NOW, $projectId: PROJECT_ID, $sessionId: ROOT_ID });
   const rootCheckpointId = uuid(99_032);
   const rootDraft = checkpointDraft();
   const rootCheckpoint = {
@@ -5904,38 +6060,31 @@ function addFrozenCarryForwardWorkflow(
     safeFailureCode: null,
     materializationRequired: false,
   };
+  const transitionResult = {
+    resultVersion: 2,
+    action: "record-final-checkpoint-and-queue-ending",
+    progressed: true,
+    previousPhase: "children-resolved",
+    status,
+  } as const;
   assert.equal(fixture.connection.prepare(`
     SELECT count(*) AS count FROM sqlite_schema
     WHERE type = 'trigger' AND name = 'workflow_instances_evidence_v3_insert_guard'
   `).get()?.count, 1n);
-  rawInsert(fixture.connection, "workflow_instances", {
-    project_id: PROJECT_ID,
-    workflow_id: workflowId,
-    workflow_type: "session-end",
-    generation: 1,
-    state: "active",
-    phase: "final-checkpoint-recorded",
-    root_command_id: requestCommandId,
-    result_json: canonicalJson(status),
-    error_code: null,
-    created_at: NOW,
-    updated_at: NOW,
-    session_id: ROOT_ID,
-    triggering_event_position: 6,
-    expected_authority_commitment: rootAuthority().authority_commitment,
-    coordinator_owner_id: null,
-    coordinator_claim_token: null,
-    coordinator_claim_expires_at: null,
-    coordinator_attempt_count: 1,
-    coordinator_failure_class: null,
-    coordinator_error_code: null,
-    coordinator_next_attempt_at: null,
-    validation_attempt_plan_generation: null,
-    validation_attempt_plans_json: null,
-    evidence_frozen_checkpoint_event_position: 7,
-    evidence_frozen_generation: 1,
-    evidence_window_state: "sealed",
-    final_ending_scope_bindings_json: canonicalJson([binding]),
+  fixture.connection.prepare(`
+    UPDATE workflow_instances
+    SET phase = 'final-checkpoint-recorded', result_json = $resultJson,
+        evidence_frozen_checkpoint_event_position = 7,
+        evidence_frozen_generation = 1,
+        final_ending_scope_bindings_json = $bindingsJson,
+        updated_at = $now
+    WHERE project_id = $projectId AND workflow_id = $workflowId
+  `).run({
+    $resultJson: canonicalJson(transitionResult),
+    $bindingsJson: canonicalJson([binding]),
+    $now: NOW,
+    $projectId: PROJECT_ID,
+    $workflowId: workflowId,
   });
   if (transferAfterFreeze) {
     rawEvent(fixture.connection, {
@@ -6705,6 +6854,8 @@ function addClaimAfterFrozenCarry(
   ticketId: string,
 ): void {
   const claimedChildId = uuid(55_031);
+  const claimCommandId = uuid(30_080);
+  const claimIdempotencyKey = "full-integrity/carry/claim";
   const claimed: Record<string, SqliteValue> = {
     ...childAuthority(claimedChildId, 8n),
     child_capability_generation: null,
@@ -6740,6 +6891,10 @@ function addClaimAfterFrozenCarry(
     eventSchemaVersion: 1,
     sessionId: claimedChildId,
     parentSessionId: ROOT_ID,
+    commandId: claimCommandId,
+    idempotencyKey: claimIdempotencyKey,
+    commandEventIndex: 0,
+    causationId: uuid(10_005),
     payload: {
       parentSessionId: ROOT_ID,
       assignment: {
@@ -6761,6 +6916,10 @@ function addClaimAfterFrozenCarry(
     eventSchemaVersion: 1,
     sessionId: claimedChildId,
     parentSessionId: ROOT_ID,
+    commandId: claimCommandId,
+    idempotencyKey: claimIdempotencyKey,
+    commandEventIndex: 1,
+    causationId: uuid(10_008),
     payload: {
       transferTicketId: ticketId,
       previousChildSessionId: CHILD_ID,
@@ -7579,6 +7738,147 @@ it("full integrity replays trusted V3 materialization policy strengthening", asy
     includeResult: true,
   });
   assert.deepEqual(await fullIssues(fixture), []);
+});
+
+it("full integrity binds the Version 3 final marker", async () => {
+  const control = createFixture();
+  addFrozenCurrentChildWorkflow(control);
+  assert.deepEqual(await fullIssues(control), []);
+
+  const corruptions: readonly {
+    readonly label: string;
+    readonly mutate: (fixture: Fixture) => void;
+  }[] = [
+    {
+      label: "payload",
+      mutate(fixture) {
+        fixture.connection.exec("DROP TRIGGER events_no_update");
+        const row = fixture.connection.prepare(`
+          SELECT payload_json FROM events
+          WHERE project_id = $projectId AND global_position = 4
+        `).get({ $projectId: PROJECT_ID });
+        assert.equal(typeof row?.payload_json, "string");
+        const payload = JSON.parse(String(row!.payload_json)) as Record<string, unknown>;
+        payload.baseEventPosition = "2";
+        fixture.connection.prepare(`
+          UPDATE events SET payload_json = $payload
+          WHERE project_id = $projectId AND global_position = 4
+        `).run({ $payload: canonicalJson(payload), $projectId: PROJECT_ID });
+      },
+    },
+    {
+      label: "workflow generation",
+      mutate(fixture) {
+        fixture.connection.exec("DROP TRIGGER events_no_update");
+        const row = fixture.connection.prepare(`
+          SELECT payload_json FROM events
+          WHERE project_id = $projectId AND global_position = 4
+        `).get({ $projectId: PROJECT_ID });
+        assert.equal(typeof row?.payload_json, "string");
+        const payload = JSON.parse(String(row!.payload_json)) as Record<string, unknown>;
+        payload.workflowGeneration = 2;
+        fixture.connection.prepare(`
+          UPDATE events SET payload_json = $payload
+          WHERE project_id = $projectId AND global_position = 4
+        `).run({ $payload: canonicalJson(payload), $projectId: PROJECT_ID });
+      },
+    },
+    {
+      label: "intent command hash",
+      mutate(fixture) {
+        fixture.connection.exec("DROP TRIGGER command_dedup_no_update");
+        fixture.connection.prepare(`
+          UPDATE command_dedup SET command_hash = $commandHash
+          WHERE project_id = $projectId AND idempotency_key = $idempotencyKey
+        `).run({
+          $commandHash: H64_B,
+          $projectId: PROJECT_ID,
+          $idempotencyKey: "full-integrity/frozen/checkpoint",
+        });
+      },
+    },
+  ];
+  for (const corruption of corruptions) {
+    const fixture = createFixture();
+    addFrozenCurrentChildWorkflow(fixture);
+    corruption.mutate(fixture);
+    await assert.rejects(
+      () => fullIssues(fixture),
+      (error: unknown) => (error as { readonly code?: unknown }).code === "INTEGRITY_FAILURE",
+      corruption.label,
+    );
+  }
+
+  const outboxControl = createFixture();
+  const outboxMarker = addFrozenCurrentChildWorkflow(outboxControl);
+  const outboxTargetKey = addVersion3FinalMarkerLifecycleOutbox(
+    outboxControl,
+    outboxMarker.workflowId,
+  );
+  assert.deepEqual(await fullIssues(outboxControl), []);
+
+  const outboxCorruption = createFixture();
+  const outboxCorruptedMarker = addFrozenCurrentChildWorkflow(outboxCorruption);
+  const corruptedOutboxTargetKey = addVersion3FinalMarkerLifecycleOutbox(
+    outboxCorruption,
+    outboxCorruptedMarker.workflowId,
+  );
+  withRestoredTriggers(outboxCorruption.connection, [
+    "outbox_lifecycle_descriptor_v4_update_guard",
+    "outbox_lifecycle_update_guard",
+    "outbox_lifecycle_planned_immutable",
+  ], () => {
+    const row = outboxCorruption.connection.prepare(`
+      SELECT payload_json FROM outbox
+      WHERE project_id = $projectId AND target_key = $targetKey
+    `).get({ $projectId: PROJECT_ID, $targetKey: corruptedOutboxTargetKey });
+    assert.equal(typeof row?.payload_json, "string");
+    const payload = JSON.parse(String(row!.payload_json)) as Record<string, unknown>;
+    payload.origin = {
+      kind: "workflow",
+      workflowId: uuid(89_099),
+      workflowGeneration: 1,
+    };
+    outboxCorruption.connection.prepare(`
+      UPDATE outbox
+      SET workflow_id = $workflowId, payload_json = $payload, content_hash = $contentHash
+      WHERE project_id = $projectId AND target_key = $targetKey
+    `).run({
+      $workflowId: uuid(89_099),
+      $payload: canonicalJson(payload),
+      $contentHash: outboxHash(payload),
+      $projectId: PROJECT_ID,
+      $targetKey: corruptedOutboxTargetKey,
+    });
+  });
+  assert.ok((await fullIssues(outboxCorruption)).includes(
+    "LIFECYCLE_OUTBOX_INVARIANT_MISMATCH",
+  ));
+
+  const foreignClaimCorruption = createFixture();
+  const foreignClaim = addFrozenCarryForwardWorkflow(foreignClaimCorruption);
+  addClaimAfterFrozenCarry(foreignClaimCorruption, foreignClaim.ticketId);
+  foreignClaimCorruption.connection.exec("DROP TRIGGER events_no_update");
+  const claim = foreignClaimCorruption.connection.prepare(`
+    SELECT payload_json FROM events
+    WHERE project_id = $projectId AND global_position = 9
+  `).get({ $projectId: PROJECT_ID });
+  assert.equal(typeof claim?.payload_json, "string");
+  const claimPayload = JSON.parse(String(claim!.payload_json)) as Record<string, unknown>;
+  claimPayload.previousChildSessionId = uuid(55_099);
+  foreignClaimCorruption.connection.prepare(`
+    UPDATE events SET payload_json = $payload, payload_hash = $payloadHash
+    WHERE project_id = $projectId AND global_position = 9
+  `).run({
+    $payload: canonicalJson(claimPayload),
+    $payloadHash: payloadHash(claimPayload),
+    $projectId: PROJECT_ID,
+  });
+  await assert.rejects(
+    () => fullIssues(foreignClaimCorruption),
+    (error: unknown) => (error as { readonly code?: unknown }).code === "INTEGRITY_FAILURE",
+    "foreign claim",
+  );
 });
 
 it("quick full integrity detects snapshot fold workflow disagreement", async () => {
@@ -10594,14 +10894,13 @@ it("full integrity reports unavailable historical keys and never repairs state",
   for (const history of ["open-workflow", "frozen-workflow"] as const) {
     const endpointOnly = createFixture();
     if (history === "open-workflow") {
-      addWorkflowRequest(endpointOnly);
+      addSchema4WorkflowRequest(endpointOnly);
       addCoverage(endpointOnly, { position: 3n, streamVersion: 3n });
     } else {
       addFrozenCurrentChildWorkflow(endpointOnly, { finalIntent: "manual" });
       addCoverage(endpointOnly, { position: 5n, streamVersion: 4n });
     }
     const observedEndpointOnly = observedReplayConnection(endpointOnly.connection, {
-      trapUnmarkedHistorical: true,
       trapDml: true,
     });
     const issues: IntegrityIssueCode[] = [];
@@ -10614,14 +10913,13 @@ it("full integrity reports unavailable historical keys and never repairs state",
       add(code) { issues.push(code); },
     });
     assert.deepEqual(issues, [], `${history} qualified quick issues`);
-    assert.equal(observedEndpointOnly.unmarkedHistoricalPrepares(), 0, history);
-    assert.deepEqual([...observedEndpointOnly.counts.keys()], [], history);
+    assert.equal(observedEndpointOnly.dmlAttempts(), 0, history);
   }
 
   for (const history of ["open-workflow", "frozen-workflow"] as const) {
     const endpointOnly = createFixture();
     if (history === "open-workflow") {
-      addWorkflowRequest(endpointOnly);
+      addSchema4WorkflowRequest(endpointOnly);
       addCoverage(endpointOnly, { position: 3n, streamVersion: 3n });
     } else {
       addFrozenCurrentChildWorkflow(endpointOnly, { finalIntent: "manual" });

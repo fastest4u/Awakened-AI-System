@@ -20,6 +20,11 @@ import type {
 } from "../identity/project-binding.request.js";
 import { canonicalJson } from "../serialization/canonical-json.js";
 import {
+  decodeLifecycleEventPayload,
+  type LifecycleEventType,
+  type SessionCheckpointRecordedPayloadV3,
+} from "./contracts/events.js";
+import {
   parseCanonicalTimestamp,
   parseCanonicalUuid,
   parseInteger,
@@ -28,13 +33,14 @@ import {
   type WorkflowId,
 } from "./contracts/identifiers.js";
 import { LifecycleError } from "./errors.js";
+import type { SessionEndEffectiveStateV1 } from "./session-end-effective-state.js";
 
 const LOWER_HASH = /^[0-9a-f]{64}$/u;
 const LOWER_GIT_COMMIT = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u;
 const POSITIVE_DECIMAL = /^[1-9][0-9]*$/u;
 const SQLITE_INT64_MAX = 9_223_372_036_854_775_807n;
 const SQLITE_INT64_MAX_DECIMAL = "9223372036854775807";
-const ARTIFACT_KIND = "compatibility-session-log";
+export const COMPATIBILITY_SESSION_LOG_ARTIFACT_KIND = "compatibility-session-log";
 const LIFECYCLE_OUTBOX_KIND = "materialize-lifecycle-log";
 const FINGERPRINT_DOMAIN = "pm-materialization-fingerprint-v1";
 
@@ -389,7 +395,7 @@ export function decodeLifecycleMaterializationPayloadV1(
   if (source.payloadVersion !== 1) {
     return invalid("lifecycleMaterializationPayload.payloadVersion");
   }
-  if (source.artifactKind !== ARTIFACT_KIND) {
+  if (source.artifactKind !== COMPATIBILITY_SESSION_LOG_ARTIFACT_KIND) {
     return invalid("lifecycleMaterializationPayload.artifactKind");
   }
   const sessionId = lifecycleId<SessionId>(
@@ -416,7 +422,7 @@ export function decodeLifecycleMaterializationPayloadV1(
     payloadVersion: 1 as const,
     targetKey,
     sessionId,
-    artifactKind: ARTIFACT_KIND,
+    artifactKind: COMPATIBILITY_SESSION_LOG_ARTIFACT_KIND,
     artifactPath: stringValue(
       source.artifactPath,
       "lifecycleMaterializationPayload.artifactPath",
@@ -719,7 +725,7 @@ export function decodeMaterializationProjectionInputV1(
     "origin",
     "triggeringEventType",
   ], "materializationProjection");
-  if (source.artifactKind !== ARTIFACT_KIND) {
+  if (source.artifactKind !== COMPATIBILITY_SESSION_LOG_ARTIFACT_KIND) {
     return invalid("materializationProjection.artifactKind");
   }
   const relation = decodeTriggerOrigin(
@@ -727,30 +733,73 @@ export function decodeMaterializationProjectionInputV1(
     source.triggeringEventType,
     "materializationProjection",
   );
+  const context = decodeProjectContext(source.context);
+  const sessionId = lifecycleId<SessionId>(
+    source.sessionId,
+    "materializationProjection.sessionId",
+  );
+  const expectedTriggerPosition = positiveSqliteInt64(
+    source.expectedTriggerPosition,
+    "materializationProjection.expectedTriggerPosition",
+  );
+  const triggeringEventSchemaVersion = positiveSafeInteger(
+    source.triggeringEventSchemaVersion,
+    "materializationProjection.triggeringEventSchemaVersion",
+  );
+  const expectedSchemaVersion = (
+    relation.triggeringEventType === "SessionCheckpointRecorded"
+    || relation.triggeringEventType === "SessionEndAmended"
+    || relation.triggeringEventType === "SessionEndCancelled"
+  ) ? 3 : 1;
+  if (triggeringEventSchemaVersion !== expectedSchemaVersion) {
+    return invalid("materializationProjection.triggeringEventSchemaVersion");
+  }
+  const triggeringEventPayload = decodeLifecycleEventPayload(
+    relation.triggeringEventType,
+    triggeringEventSchemaVersion,
+    source.triggeringEventPayload,
+  );
+  if (relation.origin.kind === "workflow") {
+    if (
+      !("workflowId" in triggeringEventPayload)
+      || !("workflowGeneration" in triggeringEventPayload)
+      || triggeringEventPayload.workflowId !== relation.origin.workflowId
+      || triggeringEventPayload.workflowGeneration !== relation.origin.workflowGeneration
+    ) return invalid("materializationProjection.origin");
+  } else if (
+    !("workflowId" in triggeringEventPayload)
+    || !("workflowGeneration" in triggeringEventPayload)
+    || triggeringEventPayload.workflowId !== null
+    || triggeringEventPayload.workflowGeneration !== null
+  ) return invalid("materializationProjection.origin");
+  if (relation.triggeringEventType === "SessionCheckpointRecorded") {
+    const checkpointPayload = triggeringEventPayload as SessionCheckpointRecordedPayloadV3;
+    if (
+      checkpointPayload.checkpointEventPosition !== expectedTriggerPosition.toString()
+      || checkpointPayload.checkpoint.sessionId !== sessionId
+      || checkpointPayload.checkpoint.parentSessionId !== null
+      || checkpointPayload.checkpoint.sourceState.workspaceId !== context.binding.workspaceId
+    ) return invalid("materializationProjection.triggeringEventPayload.checkpoint");
+  }
+  if (
+    "effectiveState" in triggeringEventPayload
+    && triggeringEventPayload.effectiveState.request.sessionId !== sessionId
+  ) return invalid("materializationProjection.triggeringEventPayload.effectiveState");
   return Object.freeze({
-    context: decodeProjectContext(source.context),
-    sessionId: lifecycleId<SessionId>(source.sessionId, "materializationProjection.sessionId"),
-    artifactKind: ARTIFACT_KIND,
+    context,
+    sessionId,
+    artifactKind: COMPATIBILITY_SESSION_LOG_ARTIFACT_KIND,
     triggeringEventIndex: exactZero(
       source.triggeringEventIndex,
       "materializationProjection.triggeringEventIndex",
     ),
-    expectedTriggerPosition: positiveSqliteInt64(
-      source.expectedTriggerPosition,
-      "materializationProjection.expectedTriggerPosition",
-    ),
-    triggeringEventSchemaVersion: positiveSafeInteger(
-      source.triggeringEventSchemaVersion,
-      "materializationProjection.triggeringEventSchemaVersion",
-    ),
+    expectedTriggerPosition,
+    triggeringEventSchemaVersion,
     triggeringOccurredAt: timestampValue(
       source.triggeringOccurredAt,
       "materializationProjection.triggeringOccurredAt",
     ),
-    triggeringEventPayload: strictJsonSnapshot(
-      source.triggeringEventPayload,
-      "materializationProjection.triggeringEventPayload",
-    ),
+    triggeringEventPayload: triggeringEventPayload as JsonValue,
     origin: relation.origin,
     triggeringEventType: relation.triggeringEventType,
   }) as MaterializationProjectionInputV1;
@@ -802,13 +851,52 @@ export interface LifecycleOutboxPlanReader {
   ): LifecycleOutboxPlannedRevision;
 }
 
-interface LifecycleMaterializationPlanningReads {
+export interface LifecycleRenderEventV1 {
+  readonly projectId: ProjectId;
+  readonly vaultId: VaultId;
+  readonly storeId: StoreId;
+  readonly workspaceId: WorkspaceId;
+  readonly branchScopeId: BranchScopeId | null;
+  readonly branchRef: string | null;
+  readonly streamId: string;
+  readonly streamVersion: string;
+  readonly globalPosition: string;
+  readonly sessionId: SessionId;
+  readonly parentSessionId: SessionId | null;
+  readonly eventType: LifecycleEventType;
+  readonly eventSchemaVersion: number;
+  readonly occurredAt: string;
+  readonly payload: JsonValue;
+  readonly materializationOrigin: LifecycleMaterializationOriginV1 | null;
+  readonly legacyIntentSemantics: Readonly<{
+    effectiveState: SessionEndEffectiveStateV1;
+    evidenceWindowAction: "unchanged" | "open" | "seal" | null;
+  }> | null;
+}
+
+export type LifecycleRenderTriggerV1 = LifecycleRenderEventV1 & {
+  readonly materializationOrigin: LifecycleMaterializationOriginV1;
+};
+
+export interface LifecycleRenderClosureV1 {
+  readonly root: readonly LifecycleRenderEventV1[];
+  readonly directChildren: readonly Readonly<{
+    childSessionId: SessionId;
+    events: readonly LifecycleRenderEventV1[];
+  }>[];
+  readonly foreignClaims: readonly Readonly<{
+    fork: LifecycleRenderEventV1;
+    claim: LifecycleRenderEventV1;
+  }>[];
+}
+
+export interface LifecycleMaterializationPlanningReads {
   readGlobalTailPosition(): bigint;
-  readStrictLifecyclePrefix(
+  readStrictLifecycleClosure(
     projectId: ProjectId,
-    sessionId: SessionId,
+    rootSessionId: SessionId,
     throughPositionExclusive: bigint,
-  ): readonly StoredEvent[];
+  ): LifecycleRenderClosureV1;
   readVerifiedImmediatePredecessor(
     projectId: ProjectId,
     sessionId: SessionId,

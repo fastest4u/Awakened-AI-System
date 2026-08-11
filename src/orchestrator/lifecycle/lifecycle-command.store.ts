@@ -31,11 +31,12 @@ import type {
   MinimumCheckpointCapacityInput,
   MinimumEndingScopeCapacityInput,
 } from "./checkpoint-capacity.js";
+import type { CheckpointEvidenceCoverageV2 } from "./contracts/checkpoint.js";
 import {
-  decodeCheckpointV2,
-  type CheckpointEvidenceCoverageV2,
-} from "./contracts/checkpoint.js";
-import type { EvidenceCoverageRecordedV2 } from "./contracts/events.js";
+  decodeLifecycleEventPayload,
+  type EvidenceCoverageRecordedV2,
+  type SessionCheckpointRecordedPayloadV3,
+} from "./contracts/events.js";
 import { decodeFinalEndingScopeBindingsV1 } from "./contracts/session-end.js";
 import type { SessionId } from "./contracts/identifiers.js";
 import type {
@@ -533,10 +534,132 @@ function assertFrozenWorkflowIntegrity(
         AND json_valid(event.payload_json)
         AND json(event.payload_json) = event.payload_json
         AND json_type(event.payload_json) = 'object'
-        AND (SELECT count(*) FROM json_each(event.payload_json)) = 3
+        AND (SELECT count(*) FROM json_each(event.payload_json)) = 6
         AND NOT EXISTS (
           SELECT 1 FROM json_each(event.payload_json) AS field
-          WHERE field.key NOT IN ('checkpoint', 'baseEventPosition', 'checkpointEventPosition')
+          WHERE field.key NOT IN (
+            'checkpoint', 'baseEventPosition', 'checkpointEventPosition',
+            'finalCheckpointBindingVersion', 'workflowId', 'workflowGeneration'
+          )
+        )
+        AND json_extract(event.payload_json, '$.finalCheckpointBindingVersion') = 1
+        AND json_extract(event.payload_json, '$.workflowId') = workflow.workflow_id
+        AND json_extract(event.payload_json, '$.workflowGeneration')
+          = workflow.evidence_frozen_generation
+        AND (
+          workflow.evidence_frozen_generation = workflow.generation
+          OR (
+            workflow.evidence_frozen_generation < workflow.generation
+            AND workflow.triggering_event_position > event.global_position
+            AND (
+              SELECT count(*)
+              FROM events AS preserving_amendment
+              WHERE preserving_amendment.project_id = workflow.project_id
+                AND preserving_amendment.session_id = workflow.session_id
+                AND preserving_amendment.stream_id = 'session/' || workflow.session_id
+                AND preserving_amendment.stream_type = 'session'
+                AND preserving_amendment.parent_session_id IS NULL
+                AND preserving_amendment.event_type = 'SessionEndAmended'
+                AND preserving_amendment.event_schema_version = 3
+                AND preserving_amendment.global_position > event.global_position
+                AND preserving_amendment.global_position
+                  <= workflow.triggering_event_position
+                AND json_extract(preserving_amendment.payload_json, '$.workflowId')
+                  = workflow.workflow_id
+                AND json_extract(
+                  preserving_amendment.payload_json,
+                  '$.workflowGeneration'
+                ) > workflow.evidence_frozen_generation
+                AND json_extract(
+                  preserving_amendment.payload_json,
+                  '$.workflowGeneration'
+                ) <= workflow.generation
+                AND json_extract(
+                  preserving_amendment.payload_json,
+                  '$.previousWorkflowGeneration'
+                ) = json_extract(
+                  preserving_amendment.payload_json,
+                  '$.workflowGeneration'
+                ) - 1
+                AND json_extract(
+                  preserving_amendment.payload_json,
+                  '$.evidenceWindowAction'
+                ) = 'unchanged'
+            ) = workflow.generation - workflow.evidence_frozen_generation
+            AND NOT EXISTS (
+              SELECT 1
+              FROM events AS carried_event
+              WHERE carried_event.project_id = workflow.project_id
+                AND carried_event.session_id = workflow.session_id
+                AND carried_event.stream_id = 'session/' || workflow.session_id
+                AND carried_event.stream_type = 'session'
+                AND carried_event.parent_session_id IS NULL
+                AND carried_event.global_position > event.global_position
+                AND carried_event.global_position <= workflow.triggering_event_position
+                AND NOT (
+                  carried_event.event_type = 'SessionEndAmended'
+                  AND carried_event.event_schema_version = 3
+                  AND json_extract(carried_event.payload_json, '$.workflowId')
+                    = workflow.workflow_id
+                  AND json_extract(carried_event.payload_json, '$.workflowGeneration')
+                    > workflow.evidence_frozen_generation
+                  AND json_extract(carried_event.payload_json, '$.workflowGeneration')
+                    <= workflow.generation
+                  AND json_extract(
+                    carried_event.payload_json,
+                    '$.previousWorkflowGeneration'
+                  ) = json_extract(
+                    carried_event.payload_json,
+                    '$.workflowGeneration'
+                  ) - 1
+                  AND json_extract(
+                    carried_event.payload_json,
+                    '$.evidenceWindowAction'
+                  ) IN ('unchanged', 'seal')
+                )
+            )
+            AND NOT EXISTS (
+              SELECT 1
+              FROM events AS duplicate_generation
+              WHERE duplicate_generation.project_id = workflow.project_id
+                AND duplicate_generation.session_id = workflow.session_id
+                AND duplicate_generation.stream_id = 'session/' || workflow.session_id
+                AND duplicate_generation.stream_type = 'session'
+                AND duplicate_generation.parent_session_id IS NULL
+                AND duplicate_generation.event_type = 'SessionEndAmended'
+                AND duplicate_generation.event_schema_version = 3
+                AND duplicate_generation.global_position > event.global_position
+                AND duplicate_generation.global_position
+                  <= workflow.triggering_event_position
+              GROUP BY json_extract(
+                duplicate_generation.payload_json,
+                '$.workflowGeneration'
+              )
+              HAVING count(*) <> 1
+            )
+            AND EXISTS (
+              SELECT 1
+              FROM events AS latest_preserving_amendment
+              WHERE latest_preserving_amendment.project_id = workflow.project_id
+                AND latest_preserving_amendment.global_position
+                  = workflow.triggering_event_position
+                AND latest_preserving_amendment.session_id = workflow.session_id
+                AND latest_preserving_amendment.event_type = 'SessionEndAmended'
+                AND latest_preserving_amendment.event_schema_version = 3
+                AND json_extract(
+                  latest_preserving_amendment.payload_json,
+                  '$.workflowId'
+                ) = workflow.workflow_id
+                AND json_extract(
+                  latest_preserving_amendment.payload_json,
+                  '$.workflowGeneration'
+                ) = workflow.generation
+                AND json_extract(
+                  latest_preserving_amendment.payload_json,
+                  '$.evidenceWindowAction'
+                ) = 'unchanged'
+            )
+          )
         )
         AND json_type(event.payload_json, '$.checkpoint') = 'object'
         AND (
@@ -546,7 +669,7 @@ function assertFrozenWorkflowIntegrity(
           SELECT 1 FROM json_each(event.payload_json, '$.checkpoint') AS field
           WHERE field.key NOT IN (${CHECKPOINT_KEYS})
         )
-        AND json_extract(event.payload_json, '$.checkpoint.checkpointVersion') = 2
+        AND json_extract(event.payload_json, '$.checkpoint.checkpointVersion') IN (1, 2)
         AND json_extract(event.payload_json, '$.checkpoint.sessionId') = workflow.session_id
         AND json_type(event.payload_json, '$.checkpoint.parentSessionId') = 'null'
         AND json_extract(event.payload_json, '$.checkpoint.checkpointEventPosition')
@@ -567,20 +690,12 @@ function assertFrozenWorkflowIntegrity(
         AND json_type(event.payload_json, '$.checkpoint.evidenceCoverage') = 'object'
         AND json_extract(
           event.payload_json,
-          '$.checkpoint.evidenceCoverage.coverageVersion'
-        ) = 2
-        AND json_extract(
-          event.payload_json,
           '$.checkpoint.evidenceCoverage.captureMode'
         ) = 'coverage-only'
         AND json_type(
           event.payload_json,
           '$.checkpoint.evidenceCoverage.contentRetained'
         ) = 'false'
-        AND json_type(
-          event.payload_json,
-          '$.checkpoint.evidenceCoverage.adapterSessions'
-        ) = 'array'
         AND json_valid(workflow.final_ending_scope_bindings_json)
         AND json(workflow.final_ending_scope_bindings_json)
           = workflow.final_ending_scope_bindings_json
@@ -809,7 +924,7 @@ function assertFrozenWorkflowIntegrity(
        AND event.stream_type = 'session'
        AND event.parent_session_id IS NULL
        AND event.event_type = 'SessionCheckpointRecorded'
-       AND event.event_schema_version = 2
+       AND event.event_schema_version = 3
       WHERE workflow.project_id = $projectId
         AND workflow.workflow_id = $workflowId
         AND workflow.session_id = $rootSessionId
@@ -842,8 +957,12 @@ function assertFrozenWorkflowIntegrity(
     const payloadJson = rowString(row, "checkpoint_payload_json");
     const payload = JSON.parse(payloadJson) as unknown;
     if (!isPlainRecord(payload)) return storageIntegrity();
-    const checkpoint = decodeCheckpointV2(payload.checkpoint);
-    if (canonicalJson(checkpoint) !== canonicalJson(payload.checkpoint)) {
+    const checkpointPayload = decodeLifecycleEventPayload(
+      "SessionCheckpointRecorded",
+      3,
+      payload,
+    ) as SessionCheckpointRecordedPayloadV3;
+    if (canonicalJson(checkpointPayload) !== payloadJson) {
       return storageIntegrity();
     }
     const bindingsJson = rowString(row, "ending_scope_bindings_json");
@@ -978,7 +1097,7 @@ function assertEvidenceWindowWritable(
   if (completeGroup) {
     if (
       frozenPosition < 1n
-      || frozenGeneration !== generation
+      || frozenGeneration > generation
       || windowState !== "sealed"
     ) return storageIntegrity();
     assertFrozenWorkflowIntegrity(

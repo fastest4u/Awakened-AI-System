@@ -28,6 +28,10 @@ import { SchemaCompatibilityError } from "../src/orchestrator/storage/schema-com
 import {
   sessionEndEffectiveStateFixture,
 } from "./support/session-end-effective-state-reference.js";
+import {
+  checkpointFixture,
+  qualifiedCheckpointFixture,
+} from "./support/lifecycle-fixtures.js";
 
 const NOW = "2026-08-09T00:00:00.000Z";
 const PROJECT_ID = "11111111-1111-4111-8111-111111111111";
@@ -35,6 +39,9 @@ const VAULT_ID = "22222222-2222-4222-8222-222222222222";
 const STORE_ID = "33333333-3333-4333-8333-333333333333";
 const ROOT_ID = "44444444-4444-4444-8444-444444444444";
 const CHILD_ID = "55555555-5555-4555-8555-555555555555";
+const FOREIGN_ROOT_ID = "66666666-6666-4666-8666-666666666666";
+const FOREIGN_CHILD_ID = "77777777-7777-4777-8777-777777777777";
+const TRANSFER_TICKET_ID = "88888888-8888-4888-8888-888888888888";
 const WORKFLOW_ID = "b6c2d359-82a6-567e-86c7-bf9e780cf20b";
 const H64 = "a".repeat(64);
 const driver = new NodeSqliteDriver({ DatabaseSync });
@@ -1189,6 +1196,41 @@ function lifecycleOutboxValues(
   };
 }
 
+function finalMarkerOutboxValues(
+  workflowGeneration = 1,
+): Record<string, SqliteValue> {
+  const targetKey = `lifecycle-log/${ROOT_ID}/2`;
+  const artifactPath = `05_Agent_Session_Logs/2026-08-09-session-${ROOT_ID}.md`;
+  return {
+    ...lifecycleOutboxValues(),
+    payload_json: canonicalJson({
+      payloadVersion: 1,
+      targetKey,
+      sessionId: ROOT_ID,
+      artifactKind: "compatibility-session-log",
+      artifactPath,
+      materializationRevision: "2",
+      triggeringPayloadHash: H64,
+      nextFingerprint: {
+        algorithm: "hmac-sha256",
+        schemaVersion: 1,
+        keyId: "materialization-key",
+        domain: "pm-materialization-fingerprint-v1",
+        value: H64,
+      },
+      origin: {
+        kind: "workflow",
+        workflowId: WORKFLOW_ID,
+        workflowGeneration,
+      },
+      triggeringEventType: "SessionCheckpointRecorded",
+    }),
+    origin_kind: "workflow",
+    workflow_id: WORKFLOW_ID,
+    workflow_generation: workflowGeneration,
+  };
+}
+
 function seedGenericSessionEvent(connection: SqliteConnection): void {
   rawInsert(connection, "streams", {
     project_id: PROJECT_ID,
@@ -1238,6 +1280,216 @@ function seedGenericSessionEvent(connection: SqliteConnection): void {
   });
 }
 
+function finalCheckpointIntent(
+  checkpoint: Readonly<Record<string, unknown>>,
+  overrides: Readonly<Record<string, unknown>> = {},
+): string {
+  const command = {
+    commandType: "internal-workflow-phase",
+    commandId: "88888888-8888-4888-8888-888888888888",
+    idempotencyKey: "raw/88888888-8888-4888-8888-888888888888",
+    agentId: "agent",
+    expectedProjectId: PROJECT_ID,
+    expectedVaultId: VAULT_ID,
+    expectedWorkspaceId: H64,
+    expectedBranchRef: null,
+    workflowId: WORKFLOW_ID,
+    workflowGeneration: 1,
+    plannedWorkId: H64,
+    sourcePhase: "children-resolved",
+    claim: {
+      workflowId: WORKFLOW_ID,
+      workflowGeneration: 1,
+      claimOwnerId: "99999999-9999-4999-8999-999999999999",
+      claimToken: "1",
+      claimExpiresAt: "2026-08-09T00:10:00.000Z",
+    },
+    action: {
+      action: "record-final-checkpoint-and-queue-ending",
+      finalCheckpoint: checkpoint,
+      materializationTarget: "memory/session-end.md",
+    },
+    ...overrides,
+  } as const;
+  return buildLifecycleIntentWitness(command as never, {
+    authorizationKind: "internal-workflow",
+    authorizationSessionId: ROOT_ID,
+    targetSessionId: ROOT_ID,
+    projectId: PROJECT_ID,
+    vaultId: VAULT_ID,
+    storeId: STORE_ID,
+    workspaceId: H64,
+    clientNamespace: "client",
+    capabilityKind: null,
+    capabilityGeneration: null,
+    presentingActorRole: "primary",
+    presentingClientInstanceId: "client",
+    targetActorRole: "primary",
+    targetClientInstanceId: "client",
+    internalWorkflowId: WORKFLOW_ID,
+    internalWorkflowGeneration: 1,
+    internalPlannedWorkId: H64,
+  }).source;
+}
+
+function finalMarkerCheckpoint(version: 1 | 2): Readonly<Record<string, unknown>> {
+  const source = version === 1
+    ? checkpointFixture({
+        sessionId: ROOT_ID as never,
+        parentSessionId: null,
+        baseEventPosition: 1,
+        checkpointEventPosition: 2,
+      })
+    : qualifiedCheckpointFixture({
+        sessionId: ROOT_ID as never,
+        parentSessionId: null,
+        baseEventPosition: 1,
+        checkpointEventPosition: 2,
+      });
+  return {
+    ...source,
+    sourceState: {
+      ...source.sourceState,
+      workspaceId: H64,
+    },
+  } as unknown as Readonly<Record<string, unknown>>;
+}
+
+function seedFinalMarkerContext(connection: SqliteConnection): void {
+  rawInsert(connection, "streams", {
+    project_id: PROJECT_ID,
+    stream_id: `session/${ROOT_ID}`,
+    stream_type: "session",
+    current_version: 1,
+    created_at: NOW,
+    updated_at: NOW,
+  });
+  rawInsert(connection, "events", rawSessionEventValues({
+    globalPosition: 1,
+    streamVersion: 1,
+    eventType: "SessionStarted",
+    eventSchemaVersion: 1,
+    sessionId: ROOT_ID,
+    parentSessionId: null,
+    commandId: "77777777-7777-4777-8777-777777777777",
+    payload: {
+      sessionKind: "root",
+      ownerGeneration: 1,
+      continuityKey: H64,
+      clientNamespace: "client",
+      creatingAgentId: "agent",
+      creatingClientInstanceId: "client",
+      authorityCommitment: H64,
+    },
+  }));
+  withTriggersTemporarilyDropped(connection, ["session_authority_insert_guard"], () => {
+    rawInsert(connection, "session_authority", {
+      project_id: PROJECT_ID,
+      session_id: ROOT_ID,
+      stream_id: `session/${ROOT_ID}`,
+      session_kind: "root",
+      parent_session_id: null,
+      workspace_id: H64,
+      client_namespace: "client",
+      semantic_state: "ending",
+      owner_generation: 1,
+      direct_access_enabled: 1,
+      authority_commitment: H64,
+      authority_event_position: 1,
+      created_at: NOW,
+      updated_at: NOW,
+    });
+  });
+  seedWorkflow(connection, "children-resolved", {
+    root_command_id: "77777777-7777-4777-8777-777777777777",
+    triggering_event_position: 1,
+  });
+}
+
+function finalMarkerEventValues(
+  checkpointVersion: 1 | 2,
+  mutate: (values: Record<string, SqliteValue>, payload: Record<string, unknown>) => void
+    = () => undefined,
+): Record<string, SqliteValue> {
+  const checkpoint = finalMarkerCheckpoint(checkpointVersion);
+  const payload: Record<string, unknown> = {
+    checkpoint,
+    baseEventPosition: "1",
+    checkpointEventPosition: "2",
+    finalCheckpointBindingVersion: 1,
+    workflowId: WORKFLOW_ID,
+    workflowGeneration: 1,
+  };
+  const values = rawSessionEventValues({
+    globalPosition: 2,
+    streamVersion: 2,
+    eventType: "SessionCheckpointRecorded",
+    eventSchemaVersion: 3,
+    sessionId: ROOT_ID,
+    parentSessionId: null,
+    commandId: "88888888-8888-4888-8888-888888888888",
+    payload,
+    lifecycleIntent: JSON.parse(finalCheckpointIntent(checkpoint)),
+  });
+  mutate(values, payload);
+  values.payload_json = canonicalJson(payload);
+  return values;
+}
+
+function frozenWorkflowStatus(
+  generation: number,
+  phase: string,
+  checkpoint: Readonly<Record<string, unknown>>,
+): Readonly<Record<string, unknown>> {
+  return {
+    resultVersion: 2,
+    sessionId: ROOT_ID,
+    workflowId: WORKFLOW_ID,
+    workflowGeneration: generation,
+    phase,
+    priorRootState: "active",
+    triggeringEventPosition: "1",
+    finalCheckpointId: checkpoint.checkpointId,
+    finalCheckpointEventPosition: "2",
+    evidenceWindow: {
+      evidenceWindowState: "sealed",
+      evidenceFrozenCheckpointEventPosition: "2",
+      evidenceFrozenGeneration: 1,
+    },
+    validationPlansReady: false,
+    qualityScore: null,
+    safeFailureCode: null,
+    materializationRequired: true,
+  };
+}
+
+function freezeWorkflowAtFinalMarker(connection: SqliteConnection): void {
+  const checkpoint = finalMarkerCheckpoint(1);
+  seedFinalMarkerContext(connection);
+  rawInsert(connection, "events", finalMarkerEventValues(1));
+  connection.prepare(`
+    UPDATE workflow_instances
+    SET phase = 'final-checkpoint-recorded',
+        result_json = $resultJson,
+        evidence_frozen_checkpoint_event_position = 2,
+        evidence_frozen_generation = 1,
+        final_ending_scope_bindings_json = '[]',
+        updated_at = $updatedAt
+    WHERE project_id = $projectId AND workflow_id = $workflowId
+  `).run({
+    $resultJson: canonicalJson({
+      resultVersion: 2,
+      action: "record-final-checkpoint-and-queue-ending",
+      progressed: true,
+      previousPhase: "children-resolved",
+      status: frozenWorkflowStatus(1, "final-checkpoint-recorded", checkpoint),
+    }),
+    $updatedAt: NOW,
+    $projectId: PROJECT_ID,
+    $workflowId: WORKFLOW_ID,
+  });
+}
+
 function rawSnapshotAtBytes(targetBytes: number): Readonly<Record<string, unknown>> {
   const shellBytes = Buffer.byteLength(canonicalJson({ padding: "" }), "utf8");
   const payloadBytes = targetBytes - shellBytes;
@@ -1262,6 +1514,54 @@ function seedHistoryRows(
     DROP TRIGGER session_authority_insert_guard;
     DROP TRIGGER child_transfer_tickets_insert_guard;
   `);
+  const eventTriggerNames = connection.prepare(`
+    SELECT name FROM sqlite_schema
+    WHERE type = 'trigger' AND tbl_name = 'events'
+    ORDER BY name
+  `).all().map((row) => String(row.name));
+  withTriggersTemporarilyDropped(connection, eventTriggerNames, () => {
+    for (let index = 1; index <= directChildren; index += 1) {
+      const sessionId = historyUuid("a", index);
+      rawInsert(connection, "events", rawSessionEventValues({
+        globalPosition: index,
+        streamVersion: 1,
+        eventType: "SessionForked",
+        eventSchemaVersion: 1,
+        sessionId,
+        parentSessionId: ROOT_ID,
+        commandId: historyUuid("6", index),
+        payload: {
+          parentSessionId: ROOT_ID,
+          assignment: {
+            assignmentId: historyUuid("d", index),
+            summary: "capacity fixture",
+            scope: "migration preflight",
+          },
+          rootOwnerGeneration: 1,
+          directAccessEnabled: false,
+          authorityCommitment: H64,
+          sourceTransferTicketId: null,
+        },
+      }));
+    }
+    for (let index = 1; index <= sourceTickets; index += 1) {
+      const childIndex = ((index - 1) % Math.max(1, directChildren)) + 1;
+      rawInsert(connection, "events", rawSessionEventValues({
+        globalPosition: directChildren + index,
+        streamVersion: 2 + Math.floor((index - 1) / Math.max(1, directChildren)),
+        eventType: "ChildWorkTransferCreated",
+        eventSchemaVersion: 1,
+        sessionId: historyUuid("a", childIndex),
+        parentSessionId: ROOT_ID,
+        commandId: historyUuid("7", index),
+        payload: {
+          transferTicketId: historyUuid("b", index),
+          checkpointId: historyUuid("c", index),
+          authorityCommitment: H64,
+        },
+      }));
+    }
+  });
   const insertChild = connection.prepare(`
     INSERT INTO session_authority(
       project_id, session_id, stream_id, session_kind, parent_session_id,
@@ -1275,6 +1575,9 @@ function seedHistoryRows(
   `);
   for (let index = 1; index <= directChildren; index += 1) {
     const sessionId = historyUuid("a", index);
+    const authorityEventPosition = index <= sourceTickets
+      ? directChildren + index
+      : index;
     insertChild.run({
       $projectId: PROJECT_ID,
       $sessionId: sessionId,
@@ -1283,7 +1586,7 @@ function seedHistoryRows(
       $workspaceId: H64,
       $semanticState: index <= sourceTickets ? "transferred" : "completed",
       $authorityCommitment: H64,
-      $authorityEventPosition: index,
+      $authorityEventPosition: authorityEventPosition,
       $createdAt: NOW,
       $updatedAt: NOW,
     });
@@ -1307,10 +1610,181 @@ function seedHistoryRows(
       $parentSessionId: ROOT_ID,
       $childSessionId: historyUuid("a", childIndex),
       $checkpointId: historyUuid("c", index),
-      $eventPosition: index,
+      $eventPosition: directChildren + index,
       $createdAt: NOW,
     });
   }
+  connection.exec("PRAGMA foreign_keys = ON");
+}
+
+function seedAuthenticatedForeignClaimHistory(
+  connection: SqliteConnection,
+  claimed = true,
+): void {
+  const foreignWorkspace = "b".repeat(64);
+  connection.exec("PRAGMA foreign_keys = OFF");
+  const eventTriggerNames = connection.prepare(`
+    SELECT name FROM sqlite_schema
+    WHERE type = 'trigger' AND tbl_name = 'events'
+    ORDER BY name
+  `).all().map((row) => String(row.name));
+  withTriggersTemporarilyDropped(connection, eventTriggerNames, () => {
+    const sourceFork = rawSessionEventValues({
+      globalPosition: 1,
+      streamVersion: 1,
+      eventType: "SessionForked",
+      eventSchemaVersion: 1,
+      sessionId: CHILD_ID,
+      parentSessionId: ROOT_ID,
+      commandId: "11111111-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      payload: {
+        parentSessionId: ROOT_ID,
+        assignment: {
+          assignmentId: "11111111-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+          summary: "source child",
+          scope: "migration preflight",
+        },
+        rootOwnerGeneration: 1,
+        directAccessEnabled: false,
+        authorityCommitment: H64,
+        sourceTransferTicketId: null,
+      },
+    });
+    const sourceTransfer = rawSessionEventValues({
+      globalPosition: 2,
+      streamVersion: 2,
+      eventType: "ChildWorkTransferCreated",
+      eventSchemaVersion: 1,
+      sessionId: CHILD_ID,
+      parentSessionId: ROOT_ID,
+      commandId: "22222222-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      payload: {
+        transferTicketId: TRANSFER_TICKET_ID,
+        checkpointId: "99999999-9999-4999-8999-999999999999",
+        authorityCommitment: H64,
+      },
+    });
+    const claimCommandId = "33333333-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const foreignFork = rawSessionEventValues({
+      globalPosition: 3,
+      streamVersion: 1,
+      eventType: "SessionForked",
+      eventSchemaVersion: 1,
+      sessionId: FOREIGN_CHILD_ID,
+      parentSessionId: FOREIGN_ROOT_ID,
+      commandId: claimCommandId,
+      payload: {
+        parentSessionId: FOREIGN_ROOT_ID,
+        assignment: {
+          assignmentId: "33333333-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+          summary: "claimed child",
+          scope: "migration preflight",
+        },
+        rootOwnerGeneration: 1,
+        directAccessEnabled: false,
+        authorityCommitment: H64,
+        sourceTransferTicketId: TRANSFER_TICKET_ID,
+      },
+    });
+    foreignFork.workspace_id = foreignWorkspace;
+    foreignFork.causation_id = sourceTransfer.event_id!;
+    const claim = rawSessionEventValues({
+      globalPosition: 4,
+      streamVersion: 2,
+      eventType: "ChildWorkTransferClaimed",
+      eventSchemaVersion: 1,
+      sessionId: FOREIGN_CHILD_ID,
+      parentSessionId: FOREIGN_ROOT_ID,
+      commandId: claimCommandId,
+      commandEventIndex: 1,
+      payload: {
+        transferTicketId: TRANSFER_TICKET_ID,
+        previousChildSessionId: CHILD_ID,
+        previousTransferEventPosition: "2",
+      },
+    });
+    claim.workspace_id = foreignWorkspace;
+    claim.causation_id = foreignFork.event_id!;
+    rawInsert(connection, "events", sourceFork);
+    rawInsert(connection, "events", sourceTransfer);
+    rawInsert(connection, "events", foreignFork);
+    rawInsert(connection, "events", claim);
+  });
+  withTriggersTemporarilyDropped(connection, ["session_authority_insert_guard"], () => {
+    for (const child of [
+      {
+        id: CHILD_ID,
+        parentId: ROOT_ID,
+        workspaceId: H64,
+        state: "transferred",
+        authorityPosition: 2,
+      },
+      {
+        id: FOREIGN_CHILD_ID,
+        parentId: FOREIGN_ROOT_ID,
+        workspaceId: foreignWorkspace,
+        state: "active",
+        authorityPosition: 3,
+      },
+    ] as const) {
+      rawInsert(connection, "session_authority", {
+        project_id: PROJECT_ID,
+        session_id: child.id,
+        stream_id: `session/${child.id}`,
+        session_kind: "child",
+        parent_session_id: child.parentId,
+        workspace_id: child.workspaceId,
+        client_namespace: "client",
+        semantic_state: child.state,
+        direct_access_enabled: 0,
+        authority_commitment: H64,
+        authority_event_position: child.authorityPosition,
+        created_at: NOW,
+        updated_at: NOW,
+      });
+    }
+    for (const root of [
+      { id: ROOT_ID, workspaceId: H64, authorityPosition: 1 },
+      { id: FOREIGN_ROOT_ID, workspaceId: foreignWorkspace, authorityPosition: 3 },
+    ] as const) {
+      rawInsert(connection, "session_authority", {
+        project_id: PROJECT_ID,
+        session_id: root.id,
+        stream_id: `session/${root.id}`,
+        session_kind: "root",
+        parent_session_id: null,
+        workspace_id: root.workspaceId,
+        client_namespace: "client",
+        semantic_state: "active",
+        owner_generation: 1,
+        direct_access_enabled: 1,
+        authority_commitment: H64,
+        authority_event_position: root.authorityPosition,
+        created_at: NOW,
+        updated_at: NOW,
+      });
+    }
+  });
+  withTriggersTemporarilyDropped(connection, ["child_transfer_tickets_insert_guard"], () => {
+    rawInsert(connection, "child_transfer_tickets", {
+      project_id: PROJECT_ID,
+      transfer_ticket_id: TRANSFER_TICKET_ID,
+      source_parent_session_id: ROOT_ID,
+      source_child_session_id: CHILD_ID,
+      source_assignment_json: "{}",
+      source_scope_json: "{}",
+      checkpoint_id: "99999999-9999-4999-8999-999999999999",
+      follow_ups_json: "[]",
+      source_state_json: "{}",
+      lineage_json: "{}",
+      created_event_position: 2,
+      created_at: NOW,
+      claimed_by_root_session_id: claimed ? FOREIGN_ROOT_ID : null,
+      claimed_child_session_id: claimed ? FOREIGN_CHILD_ID : null,
+      claimed_event_position: claimed ? 4 : null,
+      claimed_at: claimed ? NOW : null,
+    });
+  });
   connection.exec("PRAGMA foreign_keys = ON");
 }
 
@@ -1344,7 +1818,386 @@ afterEach(() => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 
+it("indexes direct-child forks and transfer claims as immutable event witnesses", () => {
+  assert.match(sessionEndEffectiveStateMigration.sql, /CREATE INDEX events_lifecycle_direct_child_v4/);
+  assert.match(sessionEndEffectiveStateMigration.sql, /CREATE INDEX events_lifecycle_transfer_claim_v4/);
+  const connection = schema4Connection();
+  const directPlan = connection.prepare(`
+    EXPLAIN QUERY PLAN
+    SELECT global_position FROM events
+    WHERE project_id = $projectId
+      AND parent_session_id = $rootSessionId
+      AND stream_type = 'session'
+      AND event_type = 'SessionForked'
+      AND event_schema_version = 1
+      AND global_position < $cutoff
+    ORDER BY global_position
+  `).all({
+    $projectId: PROJECT_ID,
+    $rootSessionId: ROOT_ID,
+    $cutoff: 10,
+  });
+  const claimPlan = connection.prepare(`
+    EXPLAIN QUERY PLAN
+    SELECT global_position FROM events
+    WHERE project_id = $projectId
+      AND json_extract(payload_json, '$.transferTicketId') = $ticketId
+      AND stream_type = 'session'
+      AND event_type = 'ChildWorkTransferClaimed'
+      AND event_schema_version = 1
+    ORDER BY global_position
+  `).all({ $projectId: PROJECT_ID, $ticketId: TRANSFER_TICKET_ID });
+  assert.match(directPlan.map((row) => String(row.detail)).join("\n"), /events_lifecycle_direct_child_v4/u);
+  assert.match(claimPlan.map((row) => String(row.detail)).join("\n"), /events_lifecycle_transfer_claim_v4/u);
+});
+
+it("requires Version 3 markers in schema-4 lifecycle event guards", () => {
+  const sql = sessionEndEffectiveStateMigration.sql;
+  assert.match(sql, /SessionCheckpointRecorded[\s\S]{0,500}NEW\.event_schema_version = 3/);
+  assert.match(sql, /finalCheckpointBindingVersion/);
+  assert.match(sql, /workflowGeneration/);
+});
+
+it("admits only authenticated Version 3 final markers at schema 4", () => {
+  for (const checkpointVersion of [1, 2] as const) {
+    const accepted = schema4Connection();
+    seedFinalMarkerContext(accepted);
+    assert.doesNotThrow(() => rawInsert(
+      accepted,
+      "events",
+      finalMarkerEventValues(checkpointVersion),
+    ));
+  }
+
+  const mutations: readonly ((
+    values: Record<string, SqliteValue>,
+    payload: Record<string, unknown>,
+  ) => void)[] = [
+    (_values, payload) => { delete payload.finalCheckpointBindingVersion; },
+    (_values, payload) => { payload.extra = true; },
+    (_values, payload) => { payload.checkpoint = null; },
+    (_values, payload) => { payload.baseEventPosition = null; },
+    (_values, payload) => { payload.checkpointEventPosition = null; },
+    (_values, payload) => { payload.finalCheckpointBindingVersion = null; },
+    (_values, payload) => { payload.workflowId = null; },
+    (_values, payload) => { payload.workflowGeneration = null; },
+    (_values, payload) => { payload.workflowGeneration = 0; },
+    (_values, payload) => { payload.baseEventPosition = "2"; },
+    (_values, payload) => { payload.checkpointEventPosition = "3"; },
+    (_values, payload) => {
+      const checkpoint = payload.checkpoint as Record<string, unknown>;
+      payload.checkpoint = { ...checkpoint, sessionId: CHILD_ID };
+    },
+    (_values, payload) => {
+      const checkpoint = payload.checkpoint as Record<string, unknown>;
+      payload.checkpoint = { ...checkpoint, parentSessionId: CHILD_ID };
+    },
+    (_values, payload) => {
+      const checkpoint = payload.checkpoint as Record<string, unknown>;
+      payload.checkpoint = {
+        ...checkpoint,
+        sourceState: {
+          ...(checkpoint.sourceState as Record<string, unknown>),
+          workspaceId: "b".repeat(64),
+        },
+      };
+    },
+    (values) => { values.parent_session_id = CHILD_ID; },
+    (values) => { values.stream_id = `session/${CHILD_ID}`; },
+    (values) => { values.command_event_index = 1; },
+    (values) => { values.lifecycle_intent_json = null; },
+    (values) => {
+      const witness = JSON.parse(String(values.lifecycle_intent_json)) as Record<string, unknown>;
+      const intent = witness.intent as Record<string, unknown>;
+      const command = intent.command as Record<string, unknown>;
+      command.sourcePhase = "requested";
+      values.lifecycle_intent_json = canonicalJson(witness);
+    },
+    (values) => {
+      const witness = JSON.parse(String(values.lifecycle_intent_json)) as Record<string, unknown>;
+      const intent = witness.intent as Record<string, unknown>;
+      const command = intent.command as Record<string, unknown>;
+      command.workflowGeneration = 2;
+      values.lifecycle_intent_json = canonicalJson(witness);
+    },
+    (values) => {
+      const witness = JSON.parse(String(values.lifecycle_intent_json)) as Record<string, unknown>;
+      const intent = witness.intent as Record<string, unknown>;
+      const command = intent.command as Record<string, unknown>;
+      const action = command.action as Record<string, unknown>;
+      action.action = "mark-children-resolved";
+      values.lifecycle_intent_json = canonicalJson(witness);
+    },
+  ];
+
+  for (const [mutationIndex, mutation] of mutations.entries()) {
+    const rejected = schema4Connection();
+    seedFinalMarkerContext(rejected);
+    assert.throws(
+      () => rawInsert(rejected, "events", finalMarkerEventValues(1, mutation)),
+      /FINAL_CHECKPOINT_V4_INVALID|LIFECYCLE_EVENT_VERSION_INVALID|LIFECYCLE_INTENT_WITNESS_INVALID/,
+      `final marker mutation ${mutationIndex} must fail`,
+    );
+    assert.equal(
+      rejected.prepare("SELECT count(*) AS count FROM events").get()?.count,
+      1n,
+    );
+  }
+
+  for (const workflowMutation of [
+    "phase = 'requested'",
+    "evidence_window_state = 'open'",
+    "evidence_frozen_checkpoint_event_position = 1, evidence_frozen_generation = 1, final_ending_scope_bindings_json = '[]'",
+  ]) {
+    const rejected = schema4Connection();
+    seedFinalMarkerContext(rejected);
+    withTriggersTemporarilyDropped(
+      rejected,
+      ["workflow_instances_evidence_v3_update_guard"],
+      () => rejected.prepare(`
+        UPDATE workflow_instances SET ${workflowMutation}
+        WHERE project_id = $projectId AND workflow_id = $workflowId
+      `).run({ $projectId: PROJECT_ID, $workflowId: WORKFLOW_ID }),
+    );
+    assert.throws(
+      () => rawInsert(rejected, "events", finalMarkerEventValues(1)),
+      /FINAL_CHECKPOINT_V4_INVALID/,
+    );
+  }
+});
+
+it("requires Version 3 markers in both workflow evidence guards", () => {
+  for (const name of [
+    "workflow_instances_evidence_v3_insert_guard",
+    "workflow_instances_evidence_v3_update_guard",
+  ] as const) {
+    const trigger = new RegExp(`CREATE TRIGGER ${name}[\\s\\S]*?\\nEND;`, "u")
+      .exec(sessionEndEffectiveStateMigration.sql)?.[0];
+    assert.equal(typeof trigger, "string", `missing ${name}`);
+    assert.match(trigger!, /final_checkpoint_event\.event_schema_version = 3/u);
+    assert.match(trigger!, /\$\.workflowId'[\s\S]*?NEW\.workflow_id/u);
+    assert.match(trigger!, /\$\.workflowGeneration'[\s\S]*?NEW\.evidence_frozen_generation/u);
+    assert.doesNotMatch(trigger!, /final_checkpoint_event\.event_schema_version IN \(1, 2\)/u);
+  }
+});
+
+it("preserves an earlier Version 3 marker through unchanged workflow carry", () => {
+  const connection = schema4Connection();
+  freezeWorkflowAtFinalMarker(connection);
+  const checkpoint = finalMarkerCheckpoint(1);
+
+  assert.doesNotThrow(() => connection.prepare(`
+    UPDATE workflow_instances
+    SET generation = 2,
+        result_json = $resultJson,
+        updated_at = $updatedAt
+    WHERE project_id = $projectId AND workflow_id = $workflowId
+  `).run({
+    $resultJson: canonicalJson(
+      frozenWorkflowStatus(2, "final-checkpoint-recorded", checkpoint),
+    ),
+    $updatedAt: NOW,
+    $projectId: PROJECT_ID,
+    $workflowId: WORKFLOW_ID,
+  }));
+  const row = connection.prepare(`
+    SELECT generation, evidence_frozen_checkpoint_event_position,
+           evidence_frozen_generation, final_ending_scope_bindings_json
+    FROM workflow_instances
+    WHERE project_id = $projectId AND workflow_id = $workflowId
+  `).get({ $projectId: PROJECT_ID, $workflowId: WORKFLOW_ID });
+  assert.deepEqual({ ...row }, {
+    generation: 2n,
+    evidence_frozen_checkpoint_event_position: 2n,
+    evidence_frozen_generation: 1n,
+    final_ending_scope_bindings_json: "[]",
+  });
+});
+
+it("rejects frozen marker rewrite during unchanged workflow carry", () => {
+  const connection = schema4Connection();
+  freezeWorkflowAtFinalMarker(connection);
+  const checkpoint = finalMarkerCheckpoint(1);
+  const before = connection.prepare(`
+    SELECT * FROM workflow_instances
+    WHERE project_id = $projectId AND workflow_id = $workflowId
+  `).get({ $projectId: PROJECT_ID, $workflowId: WORKFLOW_ID });
+
+  assert.throws(() => connection.prepare(`
+    UPDATE workflow_instances
+    SET generation = 2,
+        evidence_frozen_generation = 2,
+        result_json = $resultJson,
+        updated_at = $updatedAt
+    WHERE project_id = $projectId AND workflow_id = $workflowId
+  `).run({
+    $resultJson: canonicalJson({
+      ...frozenWorkflowStatus(2, "final-checkpoint-recorded", checkpoint),
+      evidenceWindow: {
+        evidenceWindowState: "sealed",
+        evidenceFrozenCheckpointEventPosition: "2",
+        evidenceFrozenGeneration: 2,
+      },
+    }),
+    $updatedAt: NOW,
+    $projectId: PROJECT_ID,
+    $workflowId: WORKFLOW_ID,
+  }), /WORKFLOW_EVIDENCE_STATE_INVALID/);
+  assert.deepEqual(connection.prepare(`
+    SELECT * FROM workflow_instances
+    WHERE project_id = $projectId AND workflow_id = $workflowId
+  `).get({ $projectId: PROJECT_ID, $workflowId: WORKFLOW_ID }), before);
+});
+
+it("binds Version 3 checkpoint outbox origin directly to payload workflow identity", () => {
+  const accepted = schema4Connection();
+  seedFinalMarkerContext(accepted);
+  rawInsert(accepted, "events", finalMarkerEventValues(1));
+  assert.doesNotThrow(() => rawInsert(accepted, "outbox", finalMarkerOutboxValues()));
+
+  const rejected = schema4Connection();
+  seedFinalMarkerContext(rejected);
+  rawInsert(rejected, "events", finalMarkerEventValues(1));
+  withTriggersTemporarilyDropped(
+    rejected,
+    ["workflow_instances_evidence_v3_update_guard"],
+    () => rejected.prepare(`
+      UPDATE workflow_instances SET generation = 2
+      WHERE project_id = $projectId AND workflow_id = $workflowId
+    `).run({ $projectId: PROJECT_ID, $workflowId: WORKFLOW_ID }),
+  );
+  assert.throws(
+    () => rawInsert(rejected, "outbox", finalMarkerOutboxValues(2)),
+    /OUTBOX_LIFECYCLE_DESCRIPTOR_V4_INVALID/,
+  );
+});
+
 describe("session-end effective-state migration", () => {
+  it("rejects schema-3 ticket claim pointer drift before schema 4", () => {
+    const connection = schema3Connection();
+    seedHistoryRows(connection, 1, 1);
+    connection.exec(`
+      PRAGMA foreign_keys = OFF;
+      DROP TRIGGER child_transfer_tickets_update_guard;
+      UPDATE child_transfer_tickets
+      SET claimed_by_root_session_id = '${ROOT_ID}',
+          claimed_child_session_id = '${CHILD_ID}',
+          claimed_event_position = 1,
+          claimed_at = '${NOW}';
+      PRAGMA foreign_keys = ON;
+    `);
+    const before = snapshotDatabase(connection);
+    assert.throws(
+      () => new SqliteSessionEndEffectiveStateMigrationPreflight()
+        .assertEligible(connection, context),
+      hasCode("MIGRATION_SESSION_END_EFFECTIVE_STATE_PRECONDITION_FAILED"),
+    );
+    assert.equal(snapshotDatabase(connection), before);
+  });
+
+  it("rejects schema-3 fork authority drift before schema 4", () => {
+    const connection = schema3Connection();
+    seedHistoryRows(connection, 1, 0);
+    connection.exec(`
+      PRAGMA foreign_keys = OFF;
+      DROP TRIGGER events_no_update;
+      UPDATE events
+      SET parent_session_id = '${CHILD_ID}'
+      WHERE event_type = 'SessionForked';
+      PRAGMA foreign_keys = ON;
+    `);
+    const before = snapshotDatabase(connection);
+    assert.throws(
+      () => new SqliteSessionEndEffectiveStateMigrationPreflight()
+        .assertEligible(connection, context),
+      hasCode("MIGRATION_SESSION_END_EFFECTIVE_STATE_PRECONDITION_FAILED"),
+    );
+    assert.equal(snapshotDatabase(connection), before);
+  });
+
+  it("rejects schema-3 legacy final pointers before schema 4", () => {
+    const connection = schema3Connection();
+    seedStrictLegacyCancelledHistory(connection);
+    withTriggersTemporarilyDropped(
+      connection,
+      ["workflow_instances_evidence_v3_update_guard"],
+      () => connection.prepare(`
+        UPDATE workflow_instances
+        SET evidence_frozen_checkpoint_event_position = 1,
+            evidence_frozen_generation = 1,
+            final_ending_scope_bindings_json = '[]'
+      `).run(),
+    );
+    const before = snapshotDatabase(connection);
+    assert.throws(
+      () => new SqliteSessionEndEffectiveStateMigrationPreflight()
+        .assertEligible(connection, context),
+      hasCode("MIGRATION_SESSION_END_EFFECTIVE_STATE_PRECONDITION_FAILED"),
+    );
+    assert.equal(snapshotDatabase(connection), before);
+  });
+
+  it("upgrades an authenticated cross-workspace foreign claim pair", () => {
+    const connection = schema3Connection();
+    seedAuthenticatedForeignClaimHistory(connection);
+    const before = snapshotDatabase(connection);
+    new SqliteSessionEndEffectiveStateMigrationPreflight()
+      .assertEligible(connection, context);
+    assert.equal(snapshotDatabase(connection), before);
+
+    new MigrationRunner().apply(connection, [
+      eventCoreMigration,
+      sessionLifecycleMigration,
+      qualifiedCheckpointCoverageMigration,
+      sessionEndEffectiveStateMigration,
+    ], NOW, {
+      kind: "explicit-upgrade",
+      expectedAppliedVersion: 3,
+      beforeMigration: () => undefined,
+    });
+    assert.equal(
+      connection.prepare("SELECT schema_version FROM project_meta WHERE singleton = 1")
+        .get()?.schema_version,
+      4n,
+    );
+  });
+
+  it("binds null-to-claimed ticket updates to immutable fork claim witnesses", () => {
+    const accepted = schema4Connection();
+    seedAuthenticatedForeignClaimHistory(accepted, false);
+    assert.doesNotThrow(() => accepted.prepare(`
+      UPDATE child_transfer_tickets
+      SET claimed_by_root_session_id = $claimedRoot,
+          claimed_child_session_id = $claimedChild,
+          claimed_event_position = 4,
+          claimed_at = $claimedAt
+      WHERE project_id = $projectId AND transfer_ticket_id = $ticketId
+    `).run({
+      $claimedRoot: FOREIGN_ROOT_ID,
+      $claimedChild: FOREIGN_CHILD_ID,
+      $claimedAt: NOW,
+      $projectId: PROJECT_ID,
+      $ticketId: TRANSFER_TICKET_ID,
+    }));
+
+    const rejected = schema4Connection();
+    seedAuthenticatedForeignClaimHistory(rejected, false);
+    assert.throws(() => rejected.prepare(`
+      UPDATE child_transfer_tickets
+      SET claimed_by_root_session_id = $claimedRoot,
+          claimed_child_session_id = $claimedChild,
+          claimed_event_position = 4,
+          claimed_at = $claimedAt
+      WHERE project_id = $projectId AND transfer_ticket_id = $ticketId
+    `).run({
+      $claimedRoot: FOREIGN_ROOT_ID,
+      $claimedChild: CHILD_ID,
+      $claimedAt: NOW,
+      $projectId: PROJECT_ID,
+      $ticketId: TRANSFER_TICKET_ID,
+    }), /CHILD_TRANSFER_TICKET_IMMUTABLE/);
+  });
+
   it("rejects schema-3 nonterminal workflows with zero writes", () => {
     const connection = schema3Connection();
     seedWorkflow(connection, "requested");

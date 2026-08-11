@@ -1,13 +1,23 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import test from "node:test";
 
-import { decodeGenericPendingOutbox } from "../src/orchestrator/contracts/event.js";
-import { computeProjectContextFingerprint } from "../src/orchestrator/identity/project-binding.service.js";
 import {
+  decodeGenericPendingOutbox,
+  type StoredEvent,
+} from "../src/orchestrator/contracts/event.js";
+import { computeProjectContextFingerprint } from "../src/orchestrator/identity/project-binding.service.js";
+import { PreparedMaterializationHandleOwner } from "../src/orchestrator/materialization/prepared-materialization-handle.js";
+import {
+  COMPATIBILITY_SESSION_LOG_ARTIFACT_KIND,
   decodeMaterializationProjectionInputV1,
   decodePendingLifecycleOutboxV1,
+  type LifecycleMaterializationPlanningReads,
   type LifecycleMaterializationTriggerType,
+  type LifecycleRenderClosureV1,
 } from "../src/orchestrator/lifecycle/materialization-queue.port.js";
+import { checkpointFixture } from "./support/lifecycle-fixtures.js";
+import { sessionEndEffectiveStateFixture } from "./support/session-end-effective-state-reference.js";
 
 const SESSION_ID = "44444444-4444-4444-8444-444444444444";
 const WORKFLOW_ID = "55555555-5555-4555-8555-555555555555";
@@ -169,6 +179,8 @@ function pending(
 function projection(
   triggeringEventType: string = "SessionEndAmended",
   origin: Record<string, unknown> = workflowOrigin(),
+  triggeringEventSchemaVersion = prospectiveSchemaVersion(triggeringEventType),
+  triggeringEventPayload: unknown = prospectivePayload(triggeringEventType),
 ): Record<string, unknown> {
   return {
     context: projectContext(),
@@ -176,14 +188,143 @@ function projection(
     artifactKind: "compatibility-session-log",
     triggeringEventIndex: 0,
     expectedTriggerPosition: 7n,
-    triggeringEventSchemaVersion: 3,
+    triggeringEventSchemaVersion,
     triggeringOccurredAt: "2026-08-09T00:02:00.000Z",
-    triggeringEventPayload: {
-      nested: [{ accepted: true }],
-      qualityScore: 0.75,
-    },
+    triggeringEventPayload,
     origin,
     triggeringEventType,
+  };
+}
+
+function prospectiveSchemaVersion(triggeringEventType: string): number {
+  return triggeringEventType === "SessionCheckpointRecorded"
+      || triggeringEventType === "SessionEndAmended"
+      || triggeringEventType === "SessionEndCancelled"
+    ? 3
+    : 1;
+}
+
+function finalCheckpointPayload(): Record<string, unknown> {
+  const source = checkpointFixture({
+    sessionId: SESSION_ID as never,
+    parentSessionId: null,
+    baseEventPosition: "6",
+    checkpointEventPosition: "7",
+  });
+  const checkpoint = {
+    ...source,
+    sourceState: {
+      ...source.sourceState,
+      workspaceId: WORKSPACE_ID,
+    },
+  };
+  return {
+    checkpoint,
+    baseEventPosition: "6",
+    checkpointEventPosition: "7",
+    finalCheckpointBindingVersion: 1,
+    workflowId: WORKFLOW_ID,
+    workflowGeneration: 2,
+  };
+}
+
+function prospectivePayload(triggeringEventType: string): Record<string, unknown> {
+  switch (triggeringEventType) {
+    case "SessionCheckpointRecorded":
+      return finalCheckpointPayload();
+    case "SessionEndAmended":
+      return {
+        workflowId: WORKFLOW_ID,
+        previousWorkflowGeneration: 1,
+        workflowGeneration: 2,
+        preTransitionCheckpointId: "66666666-6666-4666-8666-666666666666",
+        evidenceWindowAction: "unchanged",
+        effectiveState: sessionEndEffectiveStateFixture({ requestVersion: 2 }),
+      };
+    case "SessionEndCancelled":
+      return {
+        cancellationVersion: 1,
+        workflowId: WORKFLOW_ID,
+        previousWorkflowGeneration: 1,
+        workflowGeneration: 2,
+        restoredState: "active",
+        preTransitionCheckpointId: "66666666-6666-4666-8666-666666666666",
+      };
+    case "SessionEndVerificationFailed":
+      return {
+        workflowId: WORKFLOW_ID,
+        workflowGeneration: 2,
+        validationResultIds: [],
+        safeFailureCode: "SESSION_VALIDATION_RESULT_INVALID",
+      };
+    case "SessionEndVerificationInvalidated":
+      return {
+        workflowId: WORKFLOW_ID,
+        workflowGeneration: 2,
+        previousVerificationEventPosition: "6",
+        safeFailureCode: "SESSION_SOURCE_STATE_CONFLICT",
+      };
+    case "SessionAbandoned":
+      return {
+        workflowId: WORKFLOW_ID,
+        workflowGeneration: 2,
+        approvalId: "77777777-7777-4777-8777-777777777777",
+        preTransitionCheckpointId: "66666666-6666-4666-8666-666666666666",
+        reasonCode: "operator-request",
+        authorityCommitment: HASH_A,
+      };
+    case "SessionEnded":
+      return {
+        workflowId: WORKFLOW_ID,
+        workflowGeneration: 2,
+        verificationEventPosition: "6",
+        authorityCommitment: HASH_A,
+      };
+    default:
+      throw new Error(`Unsupported prospective trigger ${triggeringEventType}`);
+  }
+}
+
+function plannedEvent(overrides: Partial<StoredEvent> = {}): StoredEvent {
+  return {
+    globalPosition: 7n,
+    eventId: "88888888-8888-4888-8888-888888888888",
+    projectId: PROJECT_ID as never,
+    vaultId: VAULT_ID as never,
+    storeId: STORE_ID as never,
+    workspaceId: WORKSPACE_ID as never,
+    branchScopeId: null,
+    branchRef: null,
+    streamId: `session/${SESSION_ID}`,
+    streamType: "session",
+    streamVersion: 7n,
+    eventType: "SessionEndAmended",
+    eventSchemaVersion: 3,
+    sessionId: SESSION_ID,
+    parentSessionId: null,
+    actorRole: "primary",
+    agentId: "agent-primary",
+    clientInstanceId: "client-primary",
+    correlationId: "99999999-9999-4999-8999-999999999999",
+    causationId: null,
+    commandId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    idempotencyKey: "materialize-7",
+    commandEventIndex: 0,
+    occurredAt: "2026-08-09T00:02:00.000Z",
+    recordedAt: "2026-08-09T00:02:01.000Z",
+    visibilityScope: "project",
+    confidence: "high",
+    verificationStatus: "verified",
+    sourceRefs: Object.freeze(["event:6"]),
+    evidenceRefs: Object.freeze([]),
+    evidenceDigests: Object.freeze([]),
+    payload: Object.freeze({ workflowId: WORKFLOW_ID, workflowGeneration: 2 }),
+    payloadJson: `{"workflowGeneration":2,"workflowId":"${WORKFLOW_ID}"}`,
+    payloadHash: HASH_A,
+    previousGlobalHash: HASH_B,
+    eventHash: "d".repeat(64),
+    lifecycleIntentJson: null,
+    ...overrides,
   };
 }
 
@@ -241,6 +382,76 @@ test("strict-decodes every lifecycle materialization trigger and origin pair", (
     workflowId: WORKFLOW_ID,
     workflowGeneration: null,
   }));
+});
+
+test("enforces the complete prospective trigger schema payload and origin matrix", () => {
+  for (const trigger of WORKFLOW_TRIGGERS) {
+    assert.doesNotThrow(() => decodeMaterializationProjectionInputV1(projection(trigger)));
+    const wrongSchema = prospectiveSchemaVersion(trigger) === 3 ? 1 : 3;
+    assert.throws(() => decodeMaterializationProjectionInputV1(
+      projection(trigger, workflowOrigin(), wrongSchema),
+    ));
+  }
+
+  const directPayload = {
+    ...prospectivePayload("SessionAbandoned"),
+    workflowId: null,
+    workflowGeneration: null,
+  };
+  assert.doesNotThrow(() => decodeMaterializationProjectionInputV1(
+    projection("SessionAbandoned", terminalOrigin(), 1, directPayload),
+  ));
+  for (const trigger of WORKFLOW_TRIGGERS.filter((value) => value !== "SessionAbandoned")) {
+    assert.throws(() => decodeMaterializationProjectionInputV1(
+      projection(trigger, terminalOrigin()),
+    ));
+  }
+
+  for (const trigger of WORKFLOW_TRIGGERS) {
+    const extra = prospectivePayload(trigger);
+    extra.unexpected = true;
+    assert.throws(() => decodeMaterializationProjectionInputV1(
+      projection(trigger, workflowOrigin(), prospectiveSchemaVersion(trigger), extra),
+    ));
+  }
+});
+
+test("requires Version 3 final checkpoint triggers to match workflow origin", () => {
+  assert.doesNotThrow(() => decodeMaterializationProjectionInputV1(
+    projection("SessionCheckpointRecorded"),
+  ));
+  assert.throws(() => decodeMaterializationProjectionInputV1(
+    projection("SessionCheckpointRecorded", workflowOrigin(), 2),
+  ));
+  assert.throws(() => decodeMaterializationProjectionInputV1(
+    projection("SessionCheckpointRecorded", {
+      ...workflowOrigin(),
+      workflowId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    }),
+  ));
+
+  for (const mutate of [
+    (candidate: Record<string, unknown>) => { candidate.checkpointEventPosition = "8"; },
+    (candidate: Record<string, unknown>) => {
+      candidate.checkpoint = { ...(candidate.checkpoint as object), sessionId: PROJECT_ID };
+    },
+    (candidate: Record<string, unknown>) => {
+      const checkpoint = candidate.checkpoint as Record<string, unknown>;
+      candidate.checkpoint = {
+        ...checkpoint,
+        sourceState: {
+          ...(checkpoint.sourceState as object),
+          workspaceId: "e".repeat(64),
+        },
+      };
+    },
+  ]) {
+    const payload = finalCheckpointPayload();
+    mutate(payload);
+    assert.throws(() => decodeMaterializationProjectionInputV1(
+      projection("SessionCheckpointRecorded", workflowOrigin(), 3, payload),
+    ));
+  }
 });
 
 test("rejects lifecycle outbox event indexes other than zero", () => {
@@ -306,13 +517,15 @@ test("deep-freezes the canonical lifecycle pending descriptor", () => {
   );
   assertDeepFrozen(projectionDecoded);
   const triggerPayload = projectionSource.triggeringEventPayload as {
-    nested: Array<{ accepted: boolean }>;
+    effectiveState: { effectivePolicy: { requireMaterialization: boolean } };
   };
-  triggerPayload.nested[0]!.accepted = false;
-  assert.deepEqual(projectionDecoded.triggeringEventPayload, {
-    nested: [{ accepted: true }],
-    qualityScore: 0.75,
-  });
+  triggerPayload.effectiveState.effectivePolicy.requireMaterialization = true;
+  assert.equal(
+    (projectionDecoded.triggeringEventPayload as {
+      effectiveState: { effectivePolicy: { requireMaterialization: boolean } };
+    }).effectiveState.effectivePolicy.requireMaterialization,
+    false,
+  );
 
   for (const headCommitLength of [40, 64] as const) {
     const gitProjection = projection();
@@ -667,4 +880,117 @@ test("preserves the generic pending outbox string domain", () => {
     kind: longKind,
   });
   assert.equal(decodedLongKind.kind, longKind);
+});
+
+test("owns and burns opaque prepared handles at runtime", () => {
+  const owner = new PreparedMaterializationHandleOwner();
+  const handle = owner.create(decodePendingLifecycleOutboxV1(pending()));
+  const event = plannedEvent();
+  owner.capturePlanned(handle, event, () => undefined);
+  owner.consumeCommitted(handle, structuredClone(event), () => undefined);
+  assert.throws(() => owner.consumeCommitted(handle, event, () => undefined));
+});
+
+test("uses one audited opaque handle construction site", () => {
+  const ownerSource = readFileSync(
+    "src/orchestrator/materialization/prepared-materialization-handle.ts",
+    "utf8",
+  );
+  const queueSource = readFileSync(
+    "src/orchestrator/lifecycle/materialization-queue.port.ts",
+    "utf8",
+  );
+  assert.equal((ownerSource.match(/as PreparedMaterializationQueueV1/gu) ?? []).length, 1);
+  assert.equal(queueSource.includes("as PreparedMaterializationQueueV1"), false);
+});
+
+test("burns handles when planned or committed validation throws", () => {
+  const owner = new PreparedMaterializationHandleOwner();
+  const plannedFailure = owner.create(decodePendingLifecycleOutboxV1(pending()));
+  assert.throws(() => owner.capturePlanned(plannedFailure, plannedEvent(), () => {
+    throw new Error("planned validation failed");
+  }));
+  assert.throws(() => owner.capturePlanned(plannedFailure, plannedEvent(), () => undefined));
+
+  const committedFailure = owner.create(decodePendingLifecycleOutboxV1(pending()));
+  owner.capturePlanned(committedFailure, plannedEvent(), () => undefined);
+  assert.throws(() => owner.consumeCommitted(committedFailure, plannedEvent(), () => {
+    throw new Error("committed validation failed");
+  }));
+  assert.throws(() => owner.consumeCommitted(committedFailure, plannedEvent(), () => undefined));
+});
+
+test("rejects forged foreign skipped reversed and reused handles", () => {
+  const owner = new PreparedMaterializationHandleOwner();
+  const otherOwner = new PreparedMaterializationHandleOwner();
+  const foreign = otherOwner.create(decodePendingLifecycleOutboxV1(pending()));
+  assert.throws(() => owner.capturePlanned(foreign, plannedEvent(), () => undefined));
+
+  const forged = Object.freeze({ pendingOutbox: decodePendingLifecycleOutboxV1(pending()) });
+  assert.throws(() => owner.capturePlanned(forged as never, plannedEvent(), () => undefined));
+
+  const reversed = owner.create(decodePendingLifecycleOutboxV1(pending()));
+  assert.throws(() => owner.consumeCommitted(reversed, plannedEvent(), () => undefined));
+  assert.throws(() => owner.capturePlanned(reversed, plannedEvent(), () => undefined));
+
+  const skipped = owner.create(decodePendingLifecycleOutboxV1(pending()));
+  owner.capturePlanned(skipped, plannedEvent(), () => undefined);
+  assert.throws(() => owner.capturePlanned(skipped, plannedEvent(), () => undefined));
+  assert.throws(() => owner.consumeCommitted(skipped, plannedEvent(), () => undefined));
+
+  const reused = owner.create(decodePendingLifecycleOutboxV1(pending()));
+  owner.capturePlanned(reused, plannedEvent(), () => undefined);
+  owner.consumeCommitted(reused, plannedEvent(), () => undefined);
+  assert.throws(() => owner.consumeCommitted(reused, plannedEvent(), () => undefined));
+});
+
+test("captures the complete planned StoredEvent before commit", () => {
+  const owner = new PreparedMaterializationHandleOwner();
+  const handle = owner.create(decodePendingLifecycleOutboxV1(pending()));
+  const event = plannedEvent({ sourceRefs: ["event:6"] });
+  owner.capturePlanned(handle, event, () => undefined);
+  (event.sourceRefs as string[])[0] = "tampered-after-plan";
+  owner.consumeCommitted(handle, plannedEvent({ sourceRefs: ["event:6"] }), () => undefined);
+
+  for (const mismatch of [
+    { branchRef: "refs/heads/foreign" },
+    { eventHash: "e".repeat(64) },
+    { lifecycleIntentJson: "{}" },
+    { payload: { workflowId: WORKFLOW_ID, workflowGeneration: 3 } },
+  ] satisfies readonly Partial<StoredEvent>[]) {
+    const mismatchOwner = new PreparedMaterializationHandleOwner();
+    const mismatchHandle = mismatchOwner.create(decodePendingLifecycleOutboxV1(pending()));
+    mismatchOwner.capturePlanned(mismatchHandle, plannedEvent(), () => undefined);
+    assert.throws(() => mismatchOwner.consumeCommitted(
+      mismatchHandle,
+      plannedEvent(mismatch),
+      () => undefined,
+    ));
+  }
+});
+
+test("exports the authenticated lifecycle closure planning-read contract", () => {
+  const closure: LifecycleRenderClosureV1 = Object.freeze({
+    root: Object.freeze([]),
+    directChildren: Object.freeze([]),
+    foreignClaims: Object.freeze([]),
+  });
+  const reads: LifecycleMaterializationPlanningReads = {
+    readGlobalTailPosition: () => 7n,
+    readStrictLifecycleClosure: (_projectId, _rootSessionId, throughPositionExclusive) => {
+      assert.equal(throughPositionExclusive, 8n);
+      return closure;
+    },
+    readVerifiedImmediatePredecessor: () => null,
+  };
+
+  assert.equal(COMPATIBILITY_SESSION_LOG_ARTIFACT_KIND, "compatibility-session-log");
+  assert.equal(
+    reads.readStrictLifecycleClosure(
+      PROJECT_ID as Parameters<LifecycleMaterializationPlanningReads["readStrictLifecycleClosure"]>[0],
+      SESSION_ID as Parameters<LifecycleMaterializationPlanningReads["readStrictLifecycleClosure"]>[1],
+      8n,
+    ),
+    closure,
+  );
 });

@@ -166,6 +166,27 @@ function currentSessionEndEvent(
   });
 }
 
+function finalMarkerEvent(
+  aggregate: RootAggregateState,
+  workflowId: WorkflowId,
+  workflowGeneration: number,
+): Extract<LifecycleEventV3, { readonly eventType: "SessionCheckpointRecorded" }> {
+  const checkpointEventPosition = aggregate.eventPosition + 1n;
+  return currentSessionEndEvent(aggregate, "SessionCheckpointRecorded", {
+    checkpoint: checkpointFixture({
+      sessionId: aggregate.sessionId,
+      parentSessionId: null,
+      baseEventPosition: aggregate.eventPosition,
+      checkpointEventPosition,
+    }),
+    baseEventPosition: aggregate.eventPosition.toString(),
+    checkpointEventPosition: checkpointEventPosition.toString(),
+    finalCheckpointBindingVersion: 1,
+    workflowId,
+    workflowGeneration,
+  }) as Extract<LifecycleEventV3, { readonly eventType: "SessionCheckpointRecorded" }>;
+}
+
 function internalTransferEventV2(
   aggregate: ChildAggregateState,
   suspensionCheckpointId: CheckpointId,
@@ -272,6 +293,15 @@ describe("SessionAggregate", () => {
     const ending = evolveSession(afterEvidence, requestedV2);
     assert.equal(ending.kind, "root");
     assert.equal(ending.state, "ending");
+  });
+
+  it("binds a Version 3 final marker to the current ending workflow", () => {
+    const ending = endingRoot();
+    assert.doesNotThrow(() => evolveSession(ending, finalMarkerEvent(ending, WORKFLOW_ID, 1)));
+    expectLifecycleCode(
+      "INTEGRITY_FAILURE",
+      () => evolveSession(ending, finalMarkerEvent(ending, WORKFLOW_ID, 2)),
+    );
   });
 
   describe("first-event and stream identity rules", () => {

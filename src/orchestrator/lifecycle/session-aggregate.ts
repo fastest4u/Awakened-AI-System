@@ -41,6 +41,7 @@ const VERSION_3_EVENT_TYPES = new Set<LifecycleEventType>([
   "SessionEndRequested",
   "SessionEndAmended",
   "SessionEndCancelled",
+  "SessionCheckpointRecorded",
 ]);
 
 function rootStates(...states: RootSessionState[]): readonly RootSessionState[] {
@@ -564,6 +565,13 @@ function evolveRoot(
         suspendRequestedCheckpointId: null,
       });
     case "SessionCheckpointRecorded":
+      if (event.eventSchemaVersion === 3) {
+        assertWorkflow(
+          state,
+          event.payload.workflowId,
+          event.payload.workflowGeneration,
+        );
+      }
       return withRootEvent(
         state,
         event,

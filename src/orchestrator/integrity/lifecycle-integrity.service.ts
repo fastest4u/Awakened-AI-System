@@ -760,7 +760,13 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
     if (!this.hasLifecycleSchema()) return;
     const qualifiedSchema = this.hasQualifiedLifecycleSchema();
     this.runQuickCheck(context, sink, qualifiedSchema);
-    await this.checkQualifiedQuick(context, sink, !qualifiedSchema, qualifiedSchema);
+    await this.checkQualifiedQuick(
+      context,
+      sink,
+      !qualifiedSchema,
+      qualifiedSchema,
+      true,
+    );
   }
 
   async fullCheckAsync(
@@ -821,6 +827,7 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
     sink: IntegrityIssueSink,
     includeBoundedHistory = true,
     qualifiedSchema = this.hasQualifiedLifecycleSchema(),
+    verifyFrozenMarkerBindings = false,
   ): Promise<QualifiedQuickResult> {
     const statuses = new Map<string, "available">();
     const readonlyAvailableStatuses: ReadonlyMap<string, "available"> = statuses;
@@ -920,17 +927,19 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
       },
     };
     const coverage = new EvidenceCoverageRepository(cached);
+    if (verifyFrozenMarkerBindings) {
+      try {
+        this.checkFrozenWorkflowIntegrity(context);
+      } catch {
+        issue(sink, "LIFECYCLE_WORKFLOW_INVARIANT_MISMATCH");
+        return { qualifiedSchema: true, statuses: readonlyAvailableStatuses };
+      }
+    }
     if (includeBoundedHistory) {
       try {
         this.checkCurrentCheckpointIndexes(context);
       } catch {
         issue(sink, "SESSION_AUTHORITY_FOLD_MISMATCH");
-        return { qualifiedSchema: true, statuses: readonlyAvailableStatuses };
-      }
-      try {
-        this.checkFrozenWorkflowIntegrity(context);
-      } catch {
-        issue(sink, "LIFECYCLE_WORKFLOW_INVARIANT_MISMATCH");
         return { qualifiedSchema: true, statuses: readonlyAvailableStatuses };
       }
     }
@@ -2677,8 +2686,9 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
           && typeof amendment.requireMaterialization !== "boolean"
         )
       ) throw new LifecycleError("INTEGRITY_FAILURE");
-      const unchanged = event.eventSchemaVersion !== 1
-        && event.payload.evidenceWindowAction === "unchanged";
+      const markerPreserving = event.eventSchemaVersion === 3
+        && (event.payload.evidenceWindowAction === "unchanged"
+          || event.payload.evidenceWindowAction === "seal");
       const materializationRequired = event.eventSchemaVersion === 3
         ? event.payload.effectiveState.effectivePolicy.requireMaterialization
         : amendment.requireMaterialization === null
@@ -2692,22 +2702,22 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
         expectedAuthorityCommitment: aggregate.authorityCommitment,
         materializationRequired,
         evidenceWindowState: head.evidenceWindowState,
-        phase: unchanged ? previous.phase : "requested" as const,
-        frozenCheckpointId: unchanged ? previous.frozenCheckpointId : null,
-        frozenCheckpointEventPosition: unchanged
+        phase: markerPreserving ? previous.phase : "requested" as const,
+        frozenCheckpointId: markerPreserving ? previous.frozenCheckpointId : null,
+        frozenCheckpointEventPosition: markerPreserving
           ? previous.frozenCheckpointEventPosition
           : null,
-        frozenGeneration: unchanged ? previous.frozenGeneration : null,
-        endingBindingsJson: unchanged ? previous.endingBindingsJson : null,
-        validationResultIds: unchanged
+        frozenGeneration: markerPreserving ? previous.frozenGeneration : null,
+        endingBindingsJson: markerPreserving ? previous.endingBindingsJson : null,
+        validationResultIds: markerPreserving
           ? previous.validationResultIds
           : new Set<string>(),
-        qualityScore: unchanged ? previous.qualityScore : null,
-        safeFailureCode: unchanged ? previous.safeFailureCode : null,
-        verificationEventPosition: unchanged
+        qualityScore: markerPreserving ? previous.qualityScore : null,
+        safeFailureCode: markerPreserving ? previous.safeFailureCode : null,
+        verificationEventPosition: markerPreserving
           ? previous.verificationEventPosition
           : null,
-        completionEventPosition: unchanged ? previous.completionEventPosition : null,
+        completionEventPosition: markerPreserving ? previous.completionEventPosition : null,
       });
     }
     if (event.eventType === "SessionEndCancelled") {
@@ -2768,10 +2778,15 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
     if (!record(command) || command.commandType === "record-checkpoint") return;
     const action = record(command.action) ? command.action : null;
     if (
-      command.commandType !== "internal-workflow-phase"
+      event.eventSchemaVersion !== 3
+      || event.payload.finalCheckpointBindingVersion !== 1
+      || stored.commandEventIndex !== 0
+      || command.commandType !== "internal-workflow-phase"
       || action === null
       || action.action !== "record-final-checkpoint-and-queue-ending"
       || command.sourcePhase !== "children-resolved"
+      || event.payload.workflowId !== command.workflowId
+      || event.payload.workflowGeneration !== command.workflowGeneration
       || canonicalJson(action.finalCheckpoint) !== canonicalJson(event.payload.checkpoint)
     ) throw new LifecycleError("INTEGRITY_FAILURE");
     const previous = states.get(command.workflowId as string);
@@ -4043,7 +4058,8 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
     context: ProjectContext,
   ): void {
     const rows = this.connection.prepare(`
-      SELECT session_id, generation, phase, result_json,
+      SELECT workflow_id, session_id, generation, phase, result_json,
+             expected_authority_commitment,
              evidence_frozen_checkpoint_event_position,
              evidence_frozen_generation, evidence_window_state,
              final_ending_scope_bindings_json
@@ -4057,6 +4073,10 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
     for (const row of rows) {
       if (
         typeof row.session_id !== "string"
+        || typeof row.workflow_id !== "string"
+        || !LOWER_UUID.test(row.workflow_id)
+        || typeof row.expected_authority_commitment !== "string"
+        || !LOWER_HASH.test(row.expected_authority_commitment)
         || typeof row.result_json !== "string"
         || typeof row.final_ending_scope_bindings_json !== "string"
       ) throw new LifecycleError("INTEGRITY_FAILURE");
@@ -4077,6 +4097,8 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
       if (
         status.phase !== row.phase
         || status.sessionId !== row.session_id
+        || status.workflowId !== row.workflow_id
+        || integer(status.workflowGeneration) !== generation
         || status.finalCheckpointEventPosition !== frozenPosition.toString()
         || typeof status.finalCheckpointId !== "string"
       ) throw new LifecycleError("INTEGRITY_FAILURE");
@@ -4091,6 +4113,36 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
         checkpointId: status.finalCheckpointId as never,
         checkpointEventPosition: frozenPosition,
       });
+      const marker = this.storedEventAt(frozenPosition);
+      const decodedMarker = this.decodeStoredLifecycleEvent(
+        marker,
+        row.expected_authority_commitment,
+      );
+      if (decodedMarker.eventSchemaVersion !== 3) continue;
+      const witness = this.commandIntentEventZero(context, marker);
+      const command = witness.intent.command;
+      if (
+        !this.eventMatchesContext(context, marker)
+        || marker.streamId !== `session/${row.session_id}`
+        || marker.streamType !== "session"
+        || marker.sessionId !== row.session_id
+        || marker.parentSessionId !== null
+        || marker.commandEventIndex !== 0
+        || decodedMarker.eventType !== "SessionCheckpointRecorded"
+        || decodedMarker.payload.finalCheckpointBindingVersion !== 1
+        || decodedMarker.payload.workflowId !== row.workflow_id
+        || decodedMarker.payload.workflowGeneration !== frozenGeneration
+        || canonicalJson(decodedMarker.payload.checkpoint) !== canonicalJson(rootCheckpoint)
+        || !record(command)
+        || command.commandType !== "internal-workflow-phase"
+        || command.workflowId !== row.workflow_id
+        || command.workflowGeneration !== frozenGeneration
+        || command.sourcePhase !== "children-resolved"
+        || !record(command.action)
+        || command.action.action !== "record-final-checkpoint-and-queue-ending"
+        || canonicalJson(command.action.finalCheckpoint)
+          !== canonicalJson(decodedMarker.payload.checkpoint)
+      ) throw new LifecycleError("INTEGRITY_FAILURE");
       if (rootCheckpoint.parentSessionId !== null) {
         throw new LifecycleError("INTEGRITY_FAILURE");
       }
