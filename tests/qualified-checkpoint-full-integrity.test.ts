@@ -7,6 +7,7 @@ import { DatabaseSync } from "node:sqlite";
 import { afterEach, it } from "node:test";
 
 import type { ProjectContext } from "../src/orchestrator/identity/contracts.js";
+import { EventIntegrityService } from "../src/orchestrator/integrity/event-integrity.service.js";
 import {
   commandHash,
   internalPhasePlannedWorkId,
@@ -7010,6 +7011,26 @@ function synchronousFullIssues(
   return issues;
 }
 
+async function publicFullIssueCodes(fixture: Fixture): Promise<{
+  readonly sync: readonly IntegrityIssueCode[];
+  readonly async: readonly IntegrityIssueCode[];
+}> {
+  const sync = new EventIntegrityService(
+    fixture.connection,
+    PROJECT_STORE_MIGRATIONS,
+    [new LifecycleIntegrityService(fixture.connection)],
+  ).fullCheck(fixture.context);
+  const async = await new EventIntegrityService(
+    fixture.connection,
+    PROJECT_STORE_MIGRATIONS,
+    [new LifecycleIntegrityService(fixture.connection)],
+  ).fullCheckAsync(fixture.context);
+  return {
+    sync: sync.issues.map((entry) => entry.code),
+    async: async.issues.map((entry) => entry.code),
+  };
+}
+
 function version2CarryForwardControl(): {
   readonly fixture: Fixture;
   readonly transfer: ReturnType<typeof addFrozenCarryForwardWorkflow>;
@@ -7552,6 +7573,49 @@ it("full integrity publicly dispatches schema 4 lifecycle outbox overlay", async
   assert.ok((await fullIssues(corrupted)).includes(
     "LIFECYCLE_OUTBOX_INVARIANT_MISMATCH",
   ));
+});
+
+it("schema 4 public full integrity rejects a fabricated lifecycle outbox chain root", async () => {
+  const control = createFixture();
+  addNullIdentityAbandon(control);
+  addSchema4FullTerminalLifecycleOutbox(control);
+  const controlPublic = await publicFullIssueCodes(control);
+  assert.ok(!controlPublic.sync.includes(
+    "LIFECYCLE_OUTBOX_INVARIANT_MISMATCH",
+  ));
+  assert.ok(!controlPublic.async.includes(
+    "LIFECYCLE_OUTBOX_INVARIANT_MISMATCH",
+  ));
+
+  const corrupted = createFixture();
+  addNullIdentityAbandon(corrupted);
+  const targetKey = addSchema4FullTerminalLifecycleOutbox(corrupted);
+  for (const trigger of [
+    "outbox_lifecycle_descriptor_v4_update_guard",
+    "outbox_lifecycle_update_guard",
+    "outbox_lifecycle_planned_immutable",
+  ]) corrupted.connection.exec(`DROP TRIGGER IF EXISTS ${trigger}`);
+  corrupted.connection.prepare(`
+    UPDATE outbox SET expected_prior_fingerprint = $expectedPriorFingerprint
+    WHERE project_id = $projectId AND target_key = $targetKey
+  `).run({
+    $expectedPriorFingerprint: H64,
+    $projectId: PROJECT_ID,
+    $targetKey: targetKey,
+  });
+
+  const corruptedPublic = await publicFullIssueCodes(corrupted);
+  assert.deepEqual({
+    syncRejected: corruptedPublic.sync.includes(
+      "LIFECYCLE_OUTBOX_INVARIANT_MISMATCH",
+    ),
+    asyncRejected: corruptedPublic.async.includes(
+      "LIFECYCLE_OUTBOX_INVARIANT_MISMATCH",
+    ),
+  }, {
+    syncRejected: true,
+    asyncRejected: true,
+  });
 });
 
 it("full integrity owns schema 4 lifetime history without workflow endpoints", () => {

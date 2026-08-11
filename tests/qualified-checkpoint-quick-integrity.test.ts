@@ -4141,6 +4141,94 @@ it("schema 4 integrity admits V3 cancellation after a legacy workflow fingerprin
   assert.deepEqual(directWorkflowShapeIssues(control, false), []);
 });
 
+it("schema 4 public async quick authenticates a V1 predecessor below a V2 endpoint", async () => {
+  const control = schema4CancellationAfterLegacyPredecessorFixture();
+  const controlResult = await quickIssues(control);
+  const controlPublicIssues = await publicQuickIssueCodes(control);
+  assert.deepEqual(controlResult.issues, []);
+  assert.equal(controlResult.reads.workflowProjectionReads(), 3);
+  assert.ok(!controlPublicIssues.includes(
+    "LIFECYCLE_WORKFLOW_INVARIANT_MISMATCH",
+  ));
+
+  const corrupted = schema4CancellationAfterLegacyPredecessorFixture();
+  const workflowId = uuid(89_005);
+  const generationOne = corrupted.connection.prepare(`
+    SELECT fingerprint
+    FROM lifecycle_workflow_generation_folds
+    WHERE project_id = $projectId AND workflow_id = $workflowId
+      AND workflow_generation = 1
+  `).get({ $projectId: PROJECT_ID, $workflowId: workflowId });
+  assert.equal(typeof generationOne?.fingerprint, "string");
+  const hostileRootCommandId = uuid(30_099);
+  const hostilePredecessor = workflowProjection({
+    projectId: PROJECT_ID,
+    workflowId,
+    workflowGeneration: 2,
+    sessionId: ROOT_ID,
+    triggerEventPosition: 3n,
+    rootCommandId: hostileRootCommandId,
+    evidenceWindowState: "open",
+    replacementCheckpointVersion: null,
+    effectiveCheckpointVersion: 2,
+    effectiveDraftSourceEventPosition: 2n,
+    previousFingerprint: String(generationOne!.fingerprint),
+  });
+  const rechainedCurrentFingerprint = createHash("sha256")
+    .update("project-memory/lifecycle/workflow-generation/v2\n", "utf8")
+    .update(canonicalJson([
+      PROJECT_ID,
+      workflowId,
+      "3",
+      ROOT_ID,
+      "5",
+      H64,
+      uuid(30_005),
+      "sealed",
+      null,
+      2,
+      "2",
+      null,
+      null,
+      null,
+      1,
+      hostilePredecessor.fingerprint,
+    ]), "utf8")
+    .digest("hex");
+  const foldUpdateGuard = corrupted.connection.prepare(`
+    SELECT sql FROM sqlite_schema
+    WHERE type = 'trigger'
+      AND name = 'lifecycle_workflow_generation_folds_no_update'
+  `).get();
+  assert.equal(typeof foldUpdateGuard?.sql, "string");
+  corrupted.connection.exec(
+    "DROP TRIGGER lifecycle_workflow_generation_folds_no_update",
+  );
+  corrupted.connection.prepare(`
+    UPDATE lifecycle_workflow_generation_folds
+    SET root_command_id = CASE workflow_generation
+          WHEN 2 THEN $hostileRootCommandId ELSE root_command_id END,
+        previous_fingerprint = CASE workflow_generation
+          WHEN 3 THEN $hostilePredecessorFingerprint ELSE previous_fingerprint END,
+        fingerprint = CASE workflow_generation
+          WHEN 2 THEN $hostilePredecessorFingerprint
+          WHEN 3 THEN $rechainedCurrentFingerprint ELSE fingerprint END
+    WHERE project_id = $projectId AND workflow_id = $workflowId
+  `).run({
+    $hostileRootCommandId: hostileRootCommandId,
+    $hostilePredecessorFingerprint: hostilePredecessor.fingerprint,
+    $rechainedCurrentFingerprint: rechainedCurrentFingerprint,
+    $projectId: PROJECT_ID,
+    $workflowId: workflowId,
+  });
+  corrupted.connection.exec(String(foldUpdateGuard!.sql));
+
+  const corruptedPublicIssues = await publicQuickIssueCodes(corrupted);
+  assert.ok(corruptedPublicIssues.includes(
+    "LIFECYCLE_WORKFLOW_INVARIANT_MISMATCH",
+  ), JSON.stringify({ controlPublicIssues, corruptedPublicIssues }));
+});
+
 it("schema 4 public async quick authenticates a V1 endpoint against its trigger and predecessor", async () => {
   const control = openAmendmentFixture(null);
   assert.deepEqual((await quickIssues(control)).issues, []);

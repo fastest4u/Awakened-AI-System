@@ -5894,6 +5894,12 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
         predecessor,
         predecessorBase,
       );
+    } else if (predecessor !== null) {
+      this.assertSchema4V1ProjectionEndpoint(
+        context,
+        predecessor,
+        predecessorBase,
+      );
     }
     return this.assertSchema4ProjectionEndpoint(context, projection, predecessor);
   }
@@ -7181,11 +7187,12 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
       }
       const prior = previous.get(key);
       if (
-        prior !== undefined && (
+        (prior === undefined && row.expected_prior_fingerprint !== null)
+        || (prior !== undefined && (
           revision <= prior.revision
           || row.expected_prior_fingerprint !== prior.fingerprint
           || row.artifact_path !== prior.artifactPath
-        )
+        ))
       ) {
         issue(sink, "LIFECYCLE_OUTBOX_INVARIANT_MISMATCH");
         return;
