@@ -31,13 +31,14 @@ import type {
 import { ProjectDescriptorRepository } from "../src/orchestrator/identity/project-descriptor.repository.js";
 import { computeProjectContextFingerprint } from "../src/orchestrator/identity/project-binding.service.js";
 import { ProjectStoreRouter } from "../src/orchestrator/identity/project-store.router.js";
-import { commandHash, payloadHash } from "../src/orchestrator/crypto/event-hash.js";
+import { payloadHash } from "../src/orchestrator/crypto/event-hash.js";
 import {
   StoreManifestRepository,
   type PreparedStoreIntegrityManifest,
 } from "../src/orchestrator/identity/store-manifest.repository.js";
 import { EventIntegrityService } from "../src/orchestrator/integrity/event-integrity.service.js";
 import { LifecycleIntegrityService } from "../src/orchestrator/integrity/lifecycle-integrity.service.js";
+import { lifecycleIntentHashFromWitnessSource } from "../src/orchestrator/lifecycle/lifecycle-intent-witness.js";
 import type {
   IntegrityIssueCode,
   IntegrityReport,
@@ -755,7 +756,7 @@ function seedFoldableRootAuthority(
     kind: "initial-authority",
     witnessAlreadyPresent: true,
     witnessJson: intent.source,
-    commandHash: commandHash(intent.witness.intent.command),
+    commandHash: lifecycleIntentHashFromWitnessSource(intent.source),
   });
   connection.prepare(`
     INSERT INTO session_authority(

@@ -686,7 +686,8 @@ export function foldChildEventProjection(
       break;
     case "ChildWorkTransferCreated":
       if (
-        previous.latestCheckpointId === null
+        decoded.eventSchemaVersion !== 1
+        || previous.latestCheckpointId === null
         || decoded.payload.checkpointId !== previous.latestCheckpointId
         || reportWitness !== null
       ) invalid();
@@ -950,13 +951,12 @@ export function foldWorkflowGenerationProjection(
       workflowId = event.payload.workflowId;
       workflowGeneration = event.payload.workflowGeneration;
       const sameGeneration = workflowGeneration === previous.workflowGeneration;
+      const sameGenerationCompatible = event.eventSchemaVersion === 1
+        && compatibilityMode === "schema-2-preflight"
+        && sameGeneration;
       if (
-        compatibilityMode === "live-schema-3"
-          ? workflowGeneration !== previous.workflowGeneration + 1
-          : (
-              !sameGeneration
-              && workflowGeneration !== previous.workflowGeneration + 1
-            )
+        !sameGenerationCompatible
+        && workflowGeneration !== previous.workflowGeneration + 1
       ) invalid();
       if (sameGeneration) previousFingerprint = previous.previousFingerprint;
       replacementCheckpointVersion = null;

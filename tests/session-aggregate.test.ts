@@ -1058,7 +1058,7 @@ describe("SessionAggregate", () => {
       assert.equal(transferred.state, "transferred");
     });
 
-    it("makes a newer suspended-child checkpoint govern transfer", () => {
+    it("keeps the frozen V1 suspension checkpoint authoritative after recheckpointing", () => {
       const suspended = suspendedChild();
       const newerCheckpointId = lifecycleUuid<CheckpointId>(617);
       const newerCheckpointPosition = suspended.eventPosition + 1n;
@@ -1075,17 +1075,17 @@ describe("SessionAggregate", () => {
       }));
 
       expectIntegrity(() => evolveSession(recheckpointed, eventAfter(recheckpointed, "ChildWorkTransferCreated", {
-        checkpointId: CHECKPOINT_ID,
+        checkpointId: newerCheckpointId,
         authorityCommitment: AUTHORITY_C,
       })));
       const transferred = evolveSession(recheckpointed, eventAfter(recheckpointed, "ChildWorkTransferCreated", {
-        checkpointId: newerCheckpointId,
+        checkpointId: CHECKPOINT_ID,
         authorityCommitment: AUTHORITY_C,
       }));
       assert.equal(transferred.state, "transferred");
     });
 
-    it("folds internal transfer V2 with distinct suspension and governing checkpoints", () => {
+    it("defers internal transfer V2 semantic folding to Task 14S", () => {
       const suspended = suspendedChild();
       const newerCheckpointId = lifecycleUuid<CheckpointId>(618);
       const newerCheckpointPosition = suspended.eventPosition + 1n;
@@ -1103,23 +1103,9 @@ describe("SessionAggregate", () => {
 
       expectIntegrity(() => evolveSession(recheckpointed, internalTransferEventV2(
         recheckpointed,
-        lifecycleUuid<CheckpointId>(619),
-        newerCheckpointId,
-      )));
-      expectIntegrity(() => evolveSession(recheckpointed, internalTransferEventV2(
-        recheckpointed,
-        CHECKPOINT_ID,
-        CHECKPOINT_ID,
-      )));
-
-      const transferred = evolveSession(recheckpointed, internalTransferEventV2(
-        recheckpointed,
         CHECKPOINT_ID,
         newerCheckpointId,
-      ));
-      assert.equal(transferred.state, "transferred");
-      assert.equal(transferred.suspensionCheckpointId, CHECKPOINT_ID);
-      assert.equal(transferred.latestCheckpointId, newerCheckpointId);
+      )));
     });
 
     it("enforces assignment revisions and immutable assignment identity in every allowed nonterminal state", () => {

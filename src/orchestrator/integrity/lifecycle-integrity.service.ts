@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import type { StoredEvent } from "../contracts/event.js";
-import { commandHash, payloadHash } from "../crypto/event-hash.js";
+import { payloadHash } from "../crypto/event-hash.js";
 import { canonicalJson } from "../serialization/canonical-json.js";
 import {
   decodeLifecycleEvent,
@@ -28,7 +28,10 @@ import {
   type FinalEndingScopeBindingV1,
 } from "../lifecycle/contracts/session-end.js";
 import { LifecycleError } from "../lifecycle/errors.js";
-import { decodeLifecycleIntentWitness } from "../lifecycle/lifecycle-intent-witness.js";
+import {
+  decodeLifecycleIntentWitness,
+  lifecycleIntentHashFromWitnessSource,
+} from "../lifecycle/lifecycle-intent-witness.js";
 import {
   foldChildEventProjection,
   foldWorkflowGenerationProjection,
@@ -2439,7 +2442,9 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
       ) throw new LifecycleError("INTEGRITY_FAILURE");
       if (
         storedCommandHash !== null
-        && storedCommandHash !== commandHash(witness.intent.command)
+        && storedCommandHash !== lifecycleIntentHashFromWitnessSource(
+          event.lifecycleIntentJson,
+        )
       ) throw new LifecycleError("INTEGRITY_FAILURE");
       intents.set(event.commandId, deeplyFreeze({
         witness,
@@ -2618,6 +2623,9 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
       const eventRequest = event.eventSchemaVersion === 3
         ? event.payload.effectiveState.request
         : event.payload;
+      const materializationRequired = event.eventSchemaVersion === 3
+        ? event.payload.effectiveState.effectivePolicy.requireMaterialization
+        : eventRequest.requireMaterialization;
       if (
         command.commandType !== "request-session-end"
         || request === null
@@ -2639,7 +2647,7 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
         rootCommandId: head.rootCommandId,
         expectedAuthorityCommitment: aggregate.authorityCommitment,
         priorRootState: event.payload.previousState,
-        materializationRequired: eventRequest.requireMaterialization,
+        materializationRequired,
         evidenceWindowState: head.evidenceWindowState,
         phase: "requested" as const,
         frozenCheckpointId: null,
@@ -2671,14 +2679,11 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
       ) throw new LifecycleError("INTEGRITY_FAILURE");
       const unchanged = event.eventSchemaVersion !== 1
         && event.payload.evidenceWindowAction === "unchanged";
-      const materializationRequired = amendment.requireMaterialization === null
-        ? previous.materializationRequired
-        : amendment.requireMaterialization as boolean;
-      if (
-        event.eventSchemaVersion === 3
-        && materializationRequired
-          !== event.payload.effectiveState.effectivePolicy.requireMaterialization
-      ) throw new LifecycleError("INTEGRITY_FAILURE");
+      const materializationRequired = event.eventSchemaVersion === 3
+        ? event.payload.effectiveState.effectivePolicy.requireMaterialization
+        : amendment.requireMaterialization === null
+          ? previous.materializationRequired
+          : amendment.requireMaterialization as boolean;
       return deeplyFreeze({
         ...previous,
         generation: head.workflowGeneration,

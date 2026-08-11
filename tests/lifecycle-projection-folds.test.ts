@@ -15,6 +15,7 @@ import {
 } from "../src/orchestrator/storage/lifecycle-projection.repository.js";
 import type { LifecycleIntentWitnessV1 } from "../src/orchestrator/lifecycle/lifecycle-intent-witness.js";
 import type {
+  CheckpointId,
   ReportId,
   ReportItemId,
 } from "../src/orchestrator/lifecycle/contracts/identifiers.js";
@@ -209,6 +210,223 @@ it("rejects a legacy workflow event after a Version-2 predecessor", () => {
     }),
     "live-schema-3",
   ));
+});
+
+it("requires V3 cancellation to advance exactly one generation in every compatibility mode", () => {
+  const requestCommandId = lifecycleUuid(91_100);
+  const request = rootStored({
+    position: 1n,
+    streamVersion: 1n,
+    eventType: "SessionEndRequested",
+    eventSchemaVersion: 1,
+    commandId: requestCommandId,
+    payload: {
+      workflowId: WORKFLOW_ID,
+      workflowGeneration: 1,
+      previousState: "active",
+      childEndPolicy: "require-completed",
+      qualityThreshold: 0,
+      requireFullEvidence: false,
+      requireMaterialization: false,
+    },
+  });
+  const generationOne = foldWorkflowGenerationProjection(null, request, intent({
+    commandType: "request-session-end",
+    commandId: requestCommandId,
+    idempotencyKey: "projection/cancel-version/request",
+    agentId: "agent-primary",
+    expectedProjectId: PROJECT_ID,
+    expectedVaultId: VAULT_ID,
+    expectedWorkspaceId: WORKSPACE_ID,
+    expectedBranchRef: null,
+    request: {
+      requestVersion: 1,
+      sessionId: ROOT_SESSION_ID,
+      childEndPolicy: "require-completed",
+      finalCheckpoint: checkpointDraft(1),
+      validationProfileIds: [],
+      requestedQualityThreshold: 0,
+      requireFullEvidence: false,
+      requireMaterialization: false,
+    },
+  }), "live-schema-3");
+  const amendmentCheckpointId = lifecycleUuid(91_101);
+  const amendmentCommandId = lifecycleUuid(91_102);
+  const amendment = rootStored({
+    position: 2n,
+    streamVersion: 2n,
+    eventType: "SessionEndAmended",
+    eventSchemaVersion: 1,
+    commandId: amendmentCommandId,
+    payload: {
+      workflowId: WORKFLOW_ID,
+      previousWorkflowGeneration: 1,
+      workflowGeneration: 2,
+      preTransitionCheckpointId: amendmentCheckpointId,
+    },
+  });
+  const previous = foldWorkflowGenerationProjection(
+    generationOne,
+    amendment,
+    intent({
+      commandType: "amend-session-end",
+      commandId: amendmentCommandId,
+      idempotencyKey: "projection/cancel-version/amend",
+      agentId: "agent-primary",
+      expectedProjectId: PROJECT_ID,
+      expectedVaultId: VAULT_ID,
+      expectedWorkspaceId: WORKSPACE_ID,
+      expectedBranchRef: null,
+      sessionId: ROOT_SESSION_ID,
+      workflowId: WORKFLOW_ID,
+      expectedStreamVersion: "1",
+      amendment: {
+        amendmentVersion: 1,
+        childEndPolicy: null,
+        finalCheckpoint: null,
+        validationProfileIds: null,
+        requestedQualityThreshold: null,
+        requireFullEvidence: null,
+        requireMaterialization: null,
+      },
+    }),
+    "live-schema-3",
+  );
+  const checkpointId = lifecycleUuid(91_103);
+  const commandId = lifecycleUuid(91_104);
+  const cancellation = (
+    previousWorkflowGeneration: number,
+    workflowGeneration: number,
+  ): StoredEvent => rootStored({
+    position: 3n,
+    streamVersion: 3n,
+    eventType: "SessionEndCancelled",
+    eventSchemaVersion: 3,
+    commandId,
+    payload: {
+      cancellationVersion: 1,
+      workflowId: WORKFLOW_ID,
+      previousWorkflowGeneration,
+      workflowGeneration,
+      restoredState: "active",
+      preTransitionCheckpointId: checkpointId,
+    },
+  });
+  const cancellationIntent = intent({
+    commandType: "cancel-session-end",
+    commandId,
+    idempotencyKey: "projection/cancel-version/cancel",
+    agentId: "agent-primary",
+    expectedProjectId: PROJECT_ID,
+    expectedVaultId: VAULT_ID,
+    expectedWorkspaceId: WORKSPACE_ID,
+    expectedBranchRef: null,
+    sessionId: ROOT_SESSION_ID,
+    workflowId: WORKFLOW_ID,
+    expectedStreamVersion: "2",
+    preTransitionCheckpointId: checkpointId,
+  });
+
+  for (const mode of ["live-schema-3", "schema-2-preflight"] as const) {
+    assert.equal(
+      foldWorkflowGenerationProjection(
+        previous,
+        cancellation(2, 3),
+        cancellationIntent,
+        mode,
+      ).workflowGeneration,
+      3,
+      mode,
+    );
+    assert.throws(() => foldWorkflowGenerationProjection(
+      previous,
+      cancellation(1, 2),
+      cancellationIntent,
+      mode,
+    ), /LIFECYCLE_PROJECTION_INVALID/, mode);
+  }
+});
+
+it("admits same-generation V1 cancellation only during schema-2 preflight", () => {
+  const requestCommandId = lifecycleUuid(91_110);
+  const request = rootStored({
+    position: 1n,
+    streamVersion: 1n,
+    eventType: "SessionEndRequested",
+    eventSchemaVersion: 1,
+    commandId: requestCommandId,
+    payload: {
+      workflowId: WORKFLOW_ID,
+      workflowGeneration: 1,
+      previousState: "active",
+      childEndPolicy: "require-completed",
+      qualityThreshold: 0,
+      requireFullEvidence: false,
+      requireMaterialization: false,
+    },
+  });
+  const previous = foldWorkflowGenerationProjection(null, request, intent({
+    commandType: "request-session-end",
+    commandId: requestCommandId,
+    idempotencyKey: "projection/legacy-cancel/request",
+    agentId: "agent-primary",
+    expectedProjectId: PROJECT_ID,
+    expectedVaultId: VAULT_ID,
+    expectedWorkspaceId: WORKSPACE_ID,
+    expectedBranchRef: null,
+    request: {
+      requestVersion: 1,
+      sessionId: ROOT_SESSION_ID,
+      childEndPolicy: "require-completed",
+      finalCheckpoint: checkpointDraft(1),
+      validationProfileIds: [],
+      requestedQualityThreshold: 0,
+      requireFullEvidence: false,
+      requireMaterialization: false,
+    },
+  }), "live-schema-3");
+  const checkpointId = lifecycleUuid(91_111);
+  const commandId = lifecycleUuid(91_112);
+  const cancellation = rootStored({
+    position: 2n,
+    streamVersion: 2n,
+    eventType: "SessionEndCancelled",
+    eventSchemaVersion: 1,
+    commandId,
+    payload: {
+      workflowId: WORKFLOW_ID,
+      workflowGeneration: 1,
+      restoredState: "active",
+      preTransitionCheckpointId: checkpointId,
+    },
+  });
+  const cancellationIntent = intent({
+    commandType: "cancel-session-end",
+    commandId,
+    idempotencyKey: "projection/legacy-cancel/cancel",
+    agentId: "agent-primary",
+    expectedProjectId: PROJECT_ID,
+    expectedVaultId: VAULT_ID,
+    expectedWorkspaceId: WORKSPACE_ID,
+    expectedBranchRef: null,
+    sessionId: ROOT_SESSION_ID,
+    workflowId: WORKFLOW_ID,
+    expectedStreamVersion: "1",
+    preTransitionCheckpointId: checkpointId,
+  });
+
+  assert.equal(foldWorkflowGenerationProjection(
+    previous,
+    cancellation,
+    cancellationIntent,
+    "schema-2-preflight",
+  ).workflowGeneration, 1);
+  assert.throws(() => foldWorkflowGenerationProjection(
+    previous,
+    cancellation,
+    cancellationIntent,
+    "live-schema-3",
+  ), /LIFECYCLE_PROJECTION_INVALID/);
 });
 
 it("folds a Version-1 null-draft amendment as implicit unchanged over a Version-2 snapshot", () => {
@@ -1214,6 +1432,67 @@ describe("authenticated lifecycle projection folds", () => {
       } as never),
       referenceWorkflowGenerationFingerprint(generationTwo),
     );
+  });
+
+  it("defers internal transfer V2 child projection folding to Task 14S", () => {
+    const fork = foldChildEventProjection(
+      null,
+      stored(lifecycleEvent(1, "SessionForked")),
+      null,
+    );
+    const suspensionCheckpoint = checkpointFixture({
+      sessionId: CHILD_SESSION_ID,
+      parentSessionId: ROOT_SESSION_ID,
+      baseEventPosition: 1,
+      checkpointEventPosition: 2,
+    });
+    const checkpointed = foldChildEventProjection(
+      fork,
+      stored(lifecycleEvent(2, "SessionCheckpointRecorded", {
+        checkpoint: suspensionCheckpoint,
+        baseEventPosition: "1",
+        checkpointEventPosition: "2",
+      })),
+      null,
+    );
+    const suspended = foldChildEventProjection(
+      checkpointed,
+      stored(lifecycleEvent(3, "ChildSessionSuspended", {
+        checkpointId: suspensionCheckpoint.checkpointId,
+      })),
+      null,
+    );
+    const latestCheckpoint = checkpointFixture({
+      sessionId: CHILD_SESSION_ID,
+      parentSessionId: ROOT_SESSION_ID,
+      checkpointId: lifecycleUuid<CheckpointId>(52_099),
+      baseEventPosition: 3,
+      checkpointEventPosition: 4,
+    });
+    const recheckpointed = foldChildEventProjection(
+      suspended,
+      stored(lifecycleEvent(4, "SessionCheckpointRecorded", {
+        checkpoint: latestCheckpoint,
+        baseEventPosition: "3",
+        checkpointEventPosition: "4",
+      })),
+      null,
+    );
+    const payload = {
+      transferTicketId: lifecycleUuid(52_100),
+      suspensionCheckpointId: suspensionCheckpoint.checkpointId,
+      checkpointId: latestCheckpoint.checkpointId,
+      authorityCommitment: "a".repeat(64),
+    };
+    assert.throws(() => foldChildEventProjection(
+      recheckpointed,
+      stored(lifecycleEvent(5, "ChildWorkTransferCreated"), {
+        eventSchemaVersion: 2,
+        payload,
+        payloadJson: canonicalJson(payload),
+      }),
+      null,
+    ), /LIFECYCLE_PROJECTION_INVALID/);
   });
 
   it("workflow projection fold rejects cancel and abandon event-intent parity mismatches", () => {

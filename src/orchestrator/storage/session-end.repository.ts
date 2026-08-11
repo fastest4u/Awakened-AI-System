@@ -18,6 +18,9 @@ const AMENDMENT_SNAPSHOT_KEYS = [
   "effectiveState", "evidenceWindowAction", "preTransitionCheckpointId",
   "previousWorkflowGeneration", "workflowGeneration", "workflowId",
 ] as const;
+const VALIDATION_PLAN_KEYS = [
+  "commandId", "idempotencyKey", "profileId", "profileVersion", "resultId", "runId",
+] as const;
 
 /** The durable validation-plan shape.  Configuration material deliberately
  * does not cross this storage boundary; Task 15 derives it from the trusted
@@ -37,13 +40,24 @@ function integrity(): never {
 
 function exactPlan(value: unknown): PersistedValidationAttemptPlanV1 {
   if (typeof value !== "object" || value === null || Array.isArray(value)) integrity();
-  const source = value as Record<string, unknown>;
-  const keys = Object.keys(source).sort();
-  const expected = [
-    "commandId", "idempotencyKey", "profileId", "profileVersion", "resultId", "runId",
-  ];
-  if (keys.length !== expected.length || keys.some((key, index) => key !== expected[index])) {
-    integrity();
+  const prototype = Object.getPrototypeOf(value) as unknown;
+  if (prototype !== Object.prototype && prototype !== null) integrity();
+  const keys = Reflect.ownKeys(value);
+  if (
+    keys.length !== VALIDATION_PLAN_KEYS.length
+    || keys.some((key) => (
+      typeof key !== "string" || !VALIDATION_PLAN_KEYS.includes(key as never)
+    ))
+  ) integrity();
+  const source = Object.create(null) as Record<string, unknown>;
+  for (const key of VALIDATION_PLAN_KEYS) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (
+      descriptor === undefined
+      || descriptor.enumerable !== true
+      || !("value" in descriptor)
+    ) integrity();
+    source[key] = descriptor.value;
   }
   const { profileId, profileVersion, runId, resultId, commandId, idempotencyKey } = source;
   if (
@@ -57,14 +71,41 @@ function exactPlan(value: unknown): PersistedValidationAttemptPlanV1 {
   return Object.freeze({ profileId, profileVersion, runId, resultId, commandId, idempotencyKey });
 }
 
+function exactPlanArray(value: unknown): readonly unknown[] {
+  if (!Array.isArray(value) || Object.getPrototypeOf(value) !== Array.prototype) {
+    integrity();
+  }
+  const lengthDescriptor = Object.getOwnPropertyDescriptor(value, "length");
+  if (
+    lengthDescriptor === undefined
+    || !("value" in lengthDescriptor)
+    || lengthDescriptor.enumerable !== false
+    || !Number.isSafeInteger(lengthDescriptor.value)
+    || lengthDescriptor.value < 1
+    || lengthDescriptor.value > MAX_PLANS
+  ) integrity();
+  const length = lengthDescriptor.value as number;
+  if (Reflect.ownKeys(value).length !== length + 1) integrity();
+  const items: unknown[] = [];
+  for (let index = 0; index < length; index += 1) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+    if (
+      descriptor === undefined
+      || descriptor.enumerable !== true
+      || !("value" in descriptor)
+    ) integrity();
+    items.push(descriptor.value);
+  }
+  return items;
+}
+
 /** Strictly decodes the JSON-compatible six-key plan array, including every
  * migration-4 overlay invariant. */
 export function decodePersistedValidationPlansV1(
   value: unknown,
 ): readonly PersistedValidationAttemptPlanV1[] {
   try {
-    if (!Array.isArray(value) || value.length < 1 || value.length > MAX_PLANS) integrity();
-    const plans = value.map(exactPlan);
+    const plans = exactPlanArray(value).map(exactPlan);
     if (Buffer.byteLength(canonicalJson(plans), "utf8") > MAX_PLAN_BYTES) integrity();
     const profileKeys = new Set<string>();
     const runIds = new Set<string>();

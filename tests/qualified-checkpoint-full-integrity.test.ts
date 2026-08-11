@@ -1,17 +1,25 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, it } from "node:test";
 
-import type { ProjectContext } from "../src/orchestrator/identity/contracts.js";
+import type {
+  NonGitWorkspaceSnapshot,
+  ProjectBinding,
+  ProjectContext,
+} from "../src/orchestrator/identity/contracts.js";
+import { ProjectDescriptorRepository } from "../src/orchestrator/identity/project-descriptor.repository.js";
+import { ProjectStoreRouter } from "../src/orchestrator/identity/project-store.router.js";
+import { StoreManifestRepository } from "../src/orchestrator/identity/store-manifest.repository.js";
 import { EventIntegrityService } from "../src/orchestrator/integrity/event-integrity.service.js";
 import {
-  commandHash,
+  eventHash,
   internalPhasePlannedWorkId,
   internalValidationPlannedWorkId,
+  outboxHash,
   payloadHash,
   responseHash,
 } from "../src/orchestrator/crypto/event-hash.js";
@@ -32,6 +40,7 @@ import {
 import {
   buildLifecycleIntentWitness,
   decodeLifecycleIntentWitness,
+  lifecycleIntentHashFromWitnessSource,
 } from "../src/orchestrator/lifecycle/lifecycle-intent-witness.js";
 import { decodeSessionEndEffectiveStateV1 } from "../src/orchestrator/lifecycle/session-end-effective-state.js";
 import { decodeLifecycleEvent } from "../src/orchestrator/lifecycle/contracts/events.js";
@@ -2131,7 +2140,7 @@ function addHistoricalCheckpoint(
     idempotency_key: idempotencyKey,
     command_id: commandId,
     command_type: "record-checkpoint",
-    command_hash: commandHash(intent.command),
+    command_hash: lifecycleIntentHashFromWitnessSource(intent.source),
     workspace_head_commit: null,
     outbox_order_json: "[]",
     state: "committed",
@@ -2298,9 +2307,7 @@ function insertFullCheckpoint(
     idempotency_key: input.idempotencyKey,
     command_id: input.commandId,
     command_type: command.commandType,
-    command_hash: commandHash(
-      decodeLifecycleIntentWitness(intent.source).intent.command,
-    ),
+    command_hash: lifecycleIntentHashFromWitnessSource(intent.source),
     workspace_head_commit: null,
     outbox_order_json: "[]",
     state: "committed",
@@ -3211,7 +3218,14 @@ function schema4FullRequestWitness(
   }).source;
 }
 
-function addSchema4WorkflowRequest(fixture: Fixture): {
+function addSchema4WorkflowRequest(
+  fixture: Fixture,
+  input: {
+    readonly requestRequireMaterialization?: boolean;
+    readonly effectiveRequireMaterialization?: boolean;
+    readonly includeResult?: boolean;
+  } = {},
+): {
   readonly workflowId: string;
   readonly commandId: string;
   readonly fingerprint: string;
@@ -3220,7 +3234,28 @@ function addSchema4WorkflowRequest(fixture: Fixture): {
   const workflowId = uuid(89_091);
   const commandId = uuid(30_091);
   const idempotencyKey = "full-integrity/end-request/3";
-  const effectiveState = sessionEndEffectiveStateFixture({ requestVersion: 2 });
+  const effectiveStateSeed = sessionEndEffectiveStateFixture({ requestVersion: 2 });
+  const requestRequireMaterialization = input.requestRequireMaterialization
+    ?? effectiveStateSeed.request.requireMaterialization;
+  const effectiveRequireMaterialization = input.effectiveRequireMaterialization
+    ?? requestRequireMaterialization;
+  const effectiveStateWithoutHash = {
+    ...effectiveStateSeed,
+    request: {
+      ...effectiveStateSeed.request,
+      requireMaterialization: requestRequireMaterialization,
+    },
+    effectivePolicy: {
+      ...effectiveStateSeed.effectivePolicy,
+      requireMaterialization: effectiveRequireMaterialization,
+    },
+  };
+  const effectiveState = {
+    ...effectiveStateWithoutHash,
+    effectiveStateHash: referenceSessionEndEffectiveStateHashV1(
+      effectiveStateWithoutHash,
+    ),
+  };
   const witness = schema4FullRequestWitness(
     commandId,
     idempotencyKey,
@@ -3264,7 +3299,28 @@ function addSchema4WorkflowRequest(fixture: Fixture): {
     state: "active",
     phase: "requested",
     root_command_id: commandId,
-    result_json: null,
+    result_json: input.includeResult === true
+      ? canonicalJson({
+          resultVersion: 2,
+          sessionId: ROOT_ID,
+          workflowId,
+          workflowGeneration: 1,
+          phase: "requested",
+          priorRootState: "active",
+          triggeringEventPosition: "2",
+          finalCheckpointId: null,
+          finalCheckpointEventPosition: null,
+          evidenceWindow: {
+            evidenceWindowState: "open",
+            evidenceFrozenCheckpointEventPosition: null,
+            evidenceFrozenGeneration: null,
+          },
+          validationPlansReady: false,
+          qualityScore: null,
+          safeFailureCode: null,
+          materializationRequired: effectiveRequireMaterialization,
+        })
+      : null,
     error_code: null,
     created_at: NOW,
     updated_at: NOW,
@@ -3327,12 +3383,20 @@ function addSchema4WorkflowRequest(fixture: Fixture): {
   return { workflowId, commandId, fingerprint, effectiveState };
 }
 
-function addSchema4WorkflowAmendment(fixture: Fixture): {
+function addSchema4WorkflowAmendment(
+  fixture: Fixture,
+  input: { readonly trustedPolicyStrengthening?: boolean } = {},
+): {
   readonly workflowId: string;
   readonly fingerprint: string;
   readonly effectiveState: ReturnType<typeof sessionEndEffectiveStateFixture>;
 } {
-  const request = addSchema4WorkflowRequest(fixture);
+  const request = addSchema4WorkflowRequest(fixture, input.trustedPolicyStrengthening === true
+    ? {
+        requestRequireMaterialization: false,
+        effectiveRequireMaterialization: true,
+      }
+    : {});
   addHistoricalCheckpoint(fixture, { emptyEvidence: true });
   const commandId = uuid(30_092);
   const idempotencyKey = "full-integrity/end-amend/3";
@@ -3428,7 +3492,8 @@ function addSchema4WorkflowAmendment(fixture: Fixture): {
       validationPlansReady: false,
       qualityScore: null,
       safeFailureCode: null,
-      materializationRequired: false,
+      materializationRequired:
+        request.effectiveState.effectivePolicy.requireMaterialization,
     }),
     $now: NOW,
     $projectId: PROJECT_ID,
@@ -3942,7 +4007,10 @@ function addNullIdentityAbandon(fixture: Fixture): void {
   });
 }
 
-function addSchema4FullTerminalLifecycleOutbox(fixture: Fixture): string {
+function addSchema4FullTerminalLifecycleOutbox(
+  fixture: Fixture,
+  options: { readonly authenticated?: boolean } = {},
+): string {
   const event = fixture.connection.prepare(`
     SELECT payload_hash FROM events
     WHERE project_id = $projectId AND global_position = 2
@@ -3950,34 +4018,35 @@ function addSchema4FullTerminalLifecycleOutbox(fixture: Fixture): string {
   assert.equal(typeof event?.payload_hash, "string");
   const targetKey = `lifecycle-log/${ROOT_ID}/2`;
   const artifactPath = `05_Agent_Session_Logs/2026-07-31-session-${ROOT_ID}.md`;
+  const payload = {
+    payloadVersion: 1,
+    targetKey,
+    sessionId: ROOT_ID,
+    artifactKind: "compatibility-session-log",
+    artifactPath,
+    materializationRevision: "2",
+    triggeringPayloadHash: event!.payload_hash,
+    nextFingerprint: {
+      algorithm: "hmac-sha256",
+      schemaVersion: 1,
+      keyId: "materialization-key",
+      domain: "pm-materialization-fingerprint-v1",
+      value: H64_B,
+    },
+    origin: {
+      kind: "terminal-event",
+      workflowId: null,
+      workflowGeneration: null,
+    },
+    triggeringEventType: "SessionAbandoned",
+  };
   rawInsert(fixture.connection, "outbox", {
     project_id: PROJECT_ID,
     target_key: targetKey,
     event_position: 2,
     kind: "materialize-lifecycle-log",
-    payload_json: canonicalJson({
-      payloadVersion: 1,
-      targetKey,
-      sessionId: ROOT_ID,
-      artifactKind: "compatibility-session-log",
-      artifactPath,
-      materializationRevision: "2",
-      triggeringPayloadHash: event!.payload_hash,
-      nextFingerprint: {
-        algorithm: "hmac-sha256",
-        schemaVersion: 1,
-        keyId: "materialization-key",
-        domain: "pm-materialization-fingerprint-v1",
-        value: H64_B,
-      },
-      origin: {
-        kind: "terminal-event",
-        workflowId: null,
-        workflowGeneration: null,
-      },
-      triggeringEventType: "SessionAbandoned",
-    }),
-    content_hash: H64,
+    payload_json: canonicalJson(payload),
+    content_hash: options.authenticated ? outboxHash(payload) : H64,
     status: "pending",
     attempt_count: 0,
     claim_owner: null,
@@ -4003,6 +4072,335 @@ function addSchema4FullTerminalLifecycleOutbox(fixture: Fixture): string {
     next_attempt_at: null,
   });
   return targetKey;
+}
+
+function withRestoredTriggers(
+  connection: SqliteConnection,
+  triggerNames: readonly string[],
+  mutate: () => void,
+): void {
+  const triggers = triggerNames.map((name) => {
+    const row = connection.prepare(`
+      SELECT sql FROM sqlite_schema WHERE type = 'trigger' AND name = $name
+    `).get({ $name: name });
+    assert.equal(typeof row?.sql, "string", `missing trigger ${name}`);
+    return { name, sql: String(row!.sql) };
+  });
+  try {
+    for (const trigger of triggers) connection.exec(`DROP TRIGGER ${trigger.name}`);
+    mutate();
+  } finally {
+    for (const trigger of triggers) connection.exec(trigger.sql);
+  }
+}
+
+function rehashAuthenticatedEventChain(connection: SqliteConnection): void {
+  withRestoredTriggers(connection, ["events_no_update"], () => {
+    let previousGlobalHash = "0".repeat(64);
+    const rows = connection.prepare(`
+      SELECT * FROM events ORDER BY global_position
+    `).all();
+    for (const row of rows) {
+      const text = (name: string): string => {
+        assert.equal(typeof row[name], "string", name);
+        return String(row[name]);
+      };
+      const nullableText = (name: string): string | null => {
+        const value = row[name];
+        assert.ok(value === null || typeof value === "string", name);
+        return value as string | null;
+      };
+      const integer = (name: string): number => {
+        const value = row[name];
+        assert.ok(typeof value === "bigint" || typeof value === "number", name);
+        return Number(value);
+      };
+      const lifecycleIntentSource = row.lifecycle_intent_json;
+      assert.ok(
+        lifecycleIntentSource === null || typeof lifecycleIntentSource === "string",
+      );
+      const nextEventHash = eventHash({
+        globalPosition: String(row.global_position),
+        eventId: text("event_id"),
+        projectId: text("project_id"),
+        vaultId: text("vault_id"),
+        storeId: text("store_id"),
+        workspaceId: text("workspace_id"),
+        branchScopeId: nullableText("branch_scope_id"),
+        branchRef: nullableText("branch_ref"),
+        streamId: text("stream_id"),
+        streamType: text("stream_type"),
+        streamVersion: String(row.stream_version),
+        eventType: text("event_type"),
+        eventSchemaVersion: integer("event_schema_version"),
+        sessionId: nullableText("session_id"),
+        parentSessionId: nullableText("parent_session_id"),
+        actorRole: text("actor_role"),
+        agentId: text("agent_id"),
+        clientInstanceId: text("client_instance_id"),
+        correlationId: text("correlation_id"),
+        causationId: nullableText("causation_id"),
+        commandId: text("command_id"),
+        idempotencyKey: text("idempotency_key"),
+        commandEventIndex: integer("command_event_index"),
+        occurredAt: text("occurred_at"),
+        recordedAt: text("recorded_at"),
+        visibilityScope: text("visibility_scope"),
+        confidence: text("confidence"),
+        verificationStatus: text("verification_status"),
+        sourceRefs: JSON.parse(text("source_refs_json")),
+        evidenceRefs: JSON.parse(text("evidence_refs_json")),
+        evidenceDigests: JSON.parse(text("evidence_digests_json")),
+        payloadHash: text("payload_hash"),
+        previousGlobalHash,
+        ...(typeof lifecycleIntentSource === "string"
+          ? { lifecycleIntent: decodeLifecycleIntentWitness(lifecycleIntentSource) }
+          : {}),
+      } as never);
+      connection.prepare(`
+        UPDATE events
+        SET previous_global_hash = $previousGlobalHash, event_hash = $eventHash
+        WHERE global_position = $globalPosition
+      `).run({
+        $previousGlobalHash: previousGlobalHash,
+        $eventHash: nextEventHash,
+        $globalPosition: row.global_position as SqliteValue,
+      });
+      previousGlobalHash = nextEventHash;
+    }
+  });
+}
+
+function insertAuthenticatedPublicCommands(
+  fixture: Fixture,
+  outboxTargetKey: string,
+): void {
+  const rootEvent = fixture.connection.prepare(`
+    SELECT * FROM events WHERE global_position = 1
+  `).get()!;
+  assert.equal(typeof rootEvent.lifecycle_intent_json, "string");
+  const rootResponse = {
+    eventIds: [String(rootEvent.event_id)],
+    firstGlobalPosition: "1",
+    lastGlobalPosition: "1",
+    finalStreamVersion: "1",
+    response: { sessionId: ROOT_ID },
+  };
+  rawInsert(fixture.connection, "command_dedup", {
+    project_id: PROJECT_ID,
+    idempotency_key: String(rootEvent.idempotency_key),
+    command_id: String(rootEvent.command_id),
+    command_type: "root-start",
+    command_hash: lifecycleIntentHashFromWitnessSource(
+      String(rootEvent.lifecycle_intent_json),
+    ),
+    workspace_head_commit: null,
+    outbox_order_json: "[]",
+    state: "committed",
+    first_global_position: 1,
+    last_global_position: 1,
+    final_stream_version: 1,
+    event_ids_json: canonicalJson([String(rootEvent.event_id)]),
+    response_json: canonicalJson(rootResponse),
+    response_hash: responseHash(rootResponse),
+    committed_at: NOW,
+    lifecycle_authorization_kind: "initial-authority",
+    authorization_proof_version: null,
+    authorization_proof_nonce: null,
+    authorization_proof_digest: null,
+    authorization_approval_id: null,
+    authorization_approval_digest: null,
+    authorization_session_id: null,
+    target_session_id: ROOT_ID,
+    presenting_actor_role: "primary",
+    presenting_client_instance_id: "client-full-integrity",
+    target_actor_role: "primary",
+    target_client_instance_id: "client-full-integrity",
+    internal_workflow_id: null,
+    internal_workflow_generation: null,
+    internal_planned_work_id: null,
+    internal_claim_owner_id: null,
+    internal_claim_token: null,
+  });
+
+  const abandonEvent = fixture.connection.prepare(`
+    SELECT * FROM events WHERE global_position = 2
+  `).get()!;
+  assert.equal(typeof abandonEvent.lifecycle_intent_json, "string");
+  const abandonResponse = {
+    eventIds: [String(abandonEvent.event_id)],
+    firstGlobalPosition: "2",
+    lastGlobalPosition: "2",
+    finalStreamVersion: "2",
+    response: { sessionId: ROOT_ID, state: "abandoned" },
+  };
+  rawInsert(fixture.connection, "command_dedup", {
+    project_id: PROJECT_ID,
+    idempotency_key: String(abandonEvent.idempotency_key),
+    command_id: String(abandonEvent.command_id),
+    command_type: "abandon-session",
+    command_hash: lifecycleIntentHashFromWitnessSource(
+      String(abandonEvent.lifecycle_intent_json),
+    ),
+    workspace_head_commit: null,
+    outbox_order_json: canonicalJson([outboxTargetKey]),
+    state: "committed",
+    first_global_position: 2,
+    last_global_position: 2,
+    final_stream_version: 2,
+    event_ids_json: canonicalJson([String(abandonEvent.event_id)]),
+    response_json: canonicalJson(abandonResponse),
+    response_hash: responseHash(abandonResponse),
+    committed_at: NOW,
+    lifecycle_authorization_kind: "protected",
+    authorization_proof_version: 1,
+    authorization_proof_nonce: uuid(99_005),
+    authorization_proof_digest: H64,
+    authorization_approval_id: uuid(87_005),
+    authorization_approval_digest: H64_B,
+    authorization_session_id: ROOT_ID,
+    target_session_id: ROOT_ID,
+    presenting_actor_role: "primary",
+    presenting_client_instance_id: "client-full-integrity",
+    target_actor_role: "primary",
+    target_client_instance_id: "client-full-integrity",
+    internal_workflow_id: null,
+    internal_workflow_generation: null,
+    internal_planned_work_id: null,
+    internal_claim_owner_id: null,
+    internal_claim_token: null,
+  });
+}
+
+function createAuthenticatedPublicOutboxFixture(): {
+  readonly fixture: Fixture;
+  readonly targetKey: string;
+} {
+  const root = mkdtempSync(join(tmpdir(), "qualified-public-outbox-"));
+  roots.push(root);
+  const projectRoot = join(root, "project");
+  const vaultRoot = join(projectRoot, "memory");
+  mkdirSync(vaultRoot, { recursive: true });
+  const generatedIds = [PROJECT_ID, VAULT_ID];
+  const descriptor = new ProjectDescriptorRepository({
+    now: () => NOW,
+    randomId: () => generatedIds.shift() as never,
+  }).createExplicit(projectRoot, vaultRoot);
+  const workspace: NonGitWorkspaceSnapshot = {
+    kind: "non-git",
+    workspaceRoot: projectRoot,
+    workspaceId: WORKSPACE_ID as never,
+  };
+  const route = new ProjectStoreRouter().route(descriptor, vaultRoot, workspace);
+  mkdirSync(route.storeRoot, { recursive: true });
+  new StoreManifestRepository({ now: () => NOW }).createExplicit(route, {
+    projectId: PROJECT_ID as never,
+    vaultId: VAULT_ID as never,
+    storeId: STORE_ID as never,
+  });
+  const connection = driver.open(route.eventsPath, {
+    mode: "create",
+    busyTimeoutMs: 1_000,
+  });
+  connections.push(connection);
+  applyCurrentProjectStoreSchema(connection, {
+    projectId: PROJECT_ID as never,
+    vaultId: VAULT_ID as never,
+    storeId: STORE_ID as never,
+  }, NOW);
+  rawInsert(connection, "streams", {
+    project_id: PROJECT_ID,
+    stream_id: `session/${ROOT_ID}`,
+    stream_type: "session",
+    current_version: 1,
+    created_at: NOW,
+    updated_at: NOW,
+  });
+  const rootRow = rootAuthority();
+  const rootCommandId = uuid(30_001);
+  const rootIdempotencyKey = "full-integrity/1";
+  const rootIntent = buildLifecycleIntentWitness({
+    commandType: "root-start",
+    commandId: rootCommandId,
+    idempotencyKey: rootIdempotencyKey,
+    agentId: "agent-full-integrity",
+    continuityKey: "continuity-key",
+    expectedProjectId: PROJECT_ID,
+    expectedVaultId: VAULT_ID,
+    expectedWorkspaceId: WORKSPACE_ID,
+    expectedBranchRef: null,
+    resumePolicy: "new",
+  } as never, {
+    authorizationKind: "initial-authority",
+    authorizationSessionId: null,
+    targetSessionId: ROOT_ID,
+    projectId: PROJECT_ID,
+    vaultId: VAULT_ID,
+    storeId: STORE_ID,
+    workspaceId: WORKSPACE_ID,
+    clientNamespace: "tests",
+    capabilityKind: null,
+    capabilityGeneration: null,
+    presentingActorRole: "primary",
+    presentingClientInstanceId: "client-full-integrity",
+    targetActorRole: "primary",
+    targetClientInstanceId: "client-full-integrity",
+    internalWorkflowId: null,
+    internalWorkflowGeneration: null,
+    internalPlannedWorkId: null,
+  });
+  rawEvent(connection, {
+    globalPosition: 1n,
+    streamId: `session/${ROOT_ID}`,
+    streamVersion: 1n,
+    eventType: "SessionStarted",
+    eventSchemaVersion: 1,
+    sessionId: ROOT_ID,
+    parentSessionId: null,
+    commandId: rootCommandId,
+    idempotencyKey: rootIdempotencyKey,
+    lifecycleIntent: rootIntent.source,
+    payload: {
+      sessionKind: "root",
+      ownerGeneration: 1,
+      continuityKey: "continuity-key",
+      clientNamespace: "tests",
+      creatingAgentId: "agent-full-integrity",
+      creatingClientInstanceId: "client-full-integrity",
+      authorityCommitment: rootRow.authority_commitment,
+    },
+  });
+  rawInsert(connection, "session_authority", rootRow);
+  const binding: ProjectBinding = {
+    projectBindingId: "binding-qualified-public-outbox",
+    generation: 1,
+    contextFingerprint: "f".repeat(64),
+    source: "explicit-cli",
+    projectId: PROJECT_ID as never,
+    vaultId: VAULT_ID as never,
+    storeId: STORE_ID as never,
+    workspaceId: WORKSPACE_ID as never,
+    clientNamespace: "tests",
+    clientInstanceId: "client-full-integrity",
+    actorRole: "primary",
+    projectRoot,
+    vaultRoot,
+    descriptorPath: join(vaultRoot, ".memory-mcp", "project-identity.json"),
+    storeRoute: route,
+    workspace,
+    establishedAt: NOW,
+  };
+  const fixture = {
+    connection,
+    context: { binding, workspace, checkedAt: NOW },
+  } satisfies Fixture;
+  addNullIdentityAbandon(fixture);
+  const targetKey = addSchema4FullTerminalLifecycleOutbox(fixture, {
+    authenticated: true,
+  });
+  rehashAuthenticatedEventChain(connection);
+  insertAuthenticatedPublicCommands(fixture, targetKey);
+  return { fixture, targetKey };
 }
 
 function addLaterGenerationAfterCollapsedCancel(fixture: Fixture): void {
@@ -4435,9 +4833,7 @@ function addFrozenCurrentChildWorkflow(
     idempotency_key: checkpointKey,
     command_id: checkpointCommandId,
     command_type: checkpointCommand.commandType,
-    command_hash: commandHash(
-      decodeLifecycleIntentWitness(checkpointIntent.source).intent.command,
-    ),
+    command_hash: lifecycleIntentHashFromWitnessSource(checkpointIntent.source),
     workspace_head_commit: null,
     outbox_order_json: "[]",
     state: "committed",
@@ -7175,6 +7571,16 @@ it("full integrity replays schema 4 request snapshots", async () => {
   });
 });
 
+it("full integrity replays trusted V3 materialization policy strengthening", async () => {
+  const fixture = createFixture();
+  addSchema4WorkflowRequest(fixture, {
+    requestRequireMaterialization: false,
+    effectiveRequireMaterialization: true,
+    includeResult: true,
+  });
+  assert.deepEqual(await fullIssues(fixture), []);
+});
+
 it("quick full integrity detects snapshot fold workflow disagreement", async () => {
   const control = createFixture();
   addSchema4WorkflowRequest(control);
@@ -7229,6 +7635,12 @@ it("full integrity replays schema 4 amendment and cancellation snapshots", async
   await assert.doesNotReject(async () => {
     assert.deepEqual(await fullIssues(cancelled), []);
   });
+});
+
+it("full integrity carries durable V3 materialization policy through amendment results", async () => {
+  const fixture = createFixture();
+  addSchema4WorkflowAmendment(fixture, { trustedPolicyStrengthening: true });
+  assert.deepEqual(await fullIssues(fixture), []);
 });
 
 it("full integrity preserves V1 transfer truth while deferring V2 lineage semantics", async () => {
@@ -7542,79 +7954,64 @@ it("full integrity retains V2 transfer authority structure", async () => {
 });
 
 it("full integrity publicly dispatches schema 4 lifecycle outbox overlay", async () => {
-  const control = createFixture();
-  addNullIdentityAbandon(control);
-  addSchema4FullTerminalLifecycleOutbox(control);
-  assert.deepEqual(await fullIssues(control), []);
+  const control = createAuthenticatedPublicOutboxFixture();
+  assert.deepEqual(await publicFullIssueCodes(control.fixture), {
+    sync: [],
+    async: [],
+  });
 
-  const corrupted = createFixture();
-  addNullIdentityAbandon(corrupted);
-  const targetKey = addSchema4FullTerminalLifecycleOutbox(corrupted);
-  for (const trigger of [
+  const corrupted = createAuthenticatedPublicOutboxFixture();
+  withRestoredTriggers(corrupted.fixture.connection, [
     "outbox_lifecycle_descriptor_v4_update_guard",
     "outbox_lifecycle_update_guard",
     "outbox_lifecycle_planned_immutable",
-  ]) corrupted.connection.exec(`DROP TRIGGER IF EXISTS ${trigger}`);
-  const row = corrupted.connection.prepare(`
-    SELECT payload_json FROM outbox
-    WHERE project_id = $projectId AND target_key = $targetKey
-  `).get({ $projectId: PROJECT_ID, $targetKey: targetKey });
-  assert.equal(typeof row?.payload_json, "string");
-  const payload = JSON.parse(String(row!.payload_json)) as Record<string, unknown>;
-  corrupted.connection.prepare(`
-    UPDATE outbox SET payload_json = $payload
-    WHERE project_id = $projectId AND target_key = $targetKey
-  `).run({
-    $payload: canonicalJson({ ...payload, targetKey: "lifecycle-log/hostile/2" }),
-    $projectId: PROJECT_ID,
-    $targetKey: targetKey,
+  ], () => {
+    const row = corrupted.fixture.connection.prepare(`
+      SELECT payload_json FROM outbox
+      WHERE project_id = $projectId AND target_key = $targetKey
+    `).get({ $projectId: PROJECT_ID, $targetKey: corrupted.targetKey });
+    assert.equal(typeof row?.payload_json, "string");
+    const payload = JSON.parse(String(row!.payload_json)) as Record<string, unknown>;
+    corrupted.fixture.connection.prepare(`
+      UPDATE outbox SET payload_json = $payload
+      WHERE project_id = $projectId AND target_key = $targetKey
+    `).run({
+      $payload: canonicalJson({ ...payload, targetKey: "lifecycle-log/hostile/2" }),
+      $projectId: PROJECT_ID,
+      $targetKey: corrupted.targetKey,
+    });
   });
 
-  assert.ok((await fullIssues(corrupted)).includes(
-    "LIFECYCLE_OUTBOX_INVARIANT_MISMATCH",
-  ));
+  assert.deepEqual(await publicFullIssueCodes(corrupted.fixture), {
+    sync: ["LIFECYCLE_OUTBOX_INVARIANT_MISMATCH"],
+    async: ["LIFECYCLE_OUTBOX_INVARIANT_MISMATCH"],
+  });
 });
 
 it("schema 4 public full integrity rejects a fabricated lifecycle outbox chain root", async () => {
-  const control = createFixture();
-  addNullIdentityAbandon(control);
-  addSchema4FullTerminalLifecycleOutbox(control);
-  const controlPublic = await publicFullIssueCodes(control);
-  assert.ok(!controlPublic.sync.includes(
-    "LIFECYCLE_OUTBOX_INVARIANT_MISMATCH",
-  ));
-  assert.ok(!controlPublic.async.includes(
-    "LIFECYCLE_OUTBOX_INVARIANT_MISMATCH",
-  ));
+  const control = createAuthenticatedPublicOutboxFixture();
+  const controlPublic = await publicFullIssueCodes(control.fixture);
+  assert.deepEqual(controlPublic, { sync: [], async: [] });
 
-  const corrupted = createFixture();
-  addNullIdentityAbandon(corrupted);
-  const targetKey = addSchema4FullTerminalLifecycleOutbox(corrupted);
-  for (const trigger of [
+  const corrupted = createAuthenticatedPublicOutboxFixture();
+  withRestoredTriggers(corrupted.fixture.connection, [
     "outbox_lifecycle_descriptor_v4_update_guard",
     "outbox_lifecycle_update_guard",
     "outbox_lifecycle_planned_immutable",
-  ]) corrupted.connection.exec(`DROP TRIGGER IF EXISTS ${trigger}`);
-  corrupted.connection.prepare(`
-    UPDATE outbox SET expected_prior_fingerprint = $expectedPriorFingerprint
-    WHERE project_id = $projectId AND target_key = $targetKey
-  `).run({
-    $expectedPriorFingerprint: H64,
-    $projectId: PROJECT_ID,
-    $targetKey: targetKey,
+  ], () => {
+    corrupted.fixture.connection.prepare(`
+      UPDATE outbox SET expected_prior_fingerprint = $expectedPriorFingerprint
+      WHERE project_id = $projectId AND target_key = $targetKey
+    `).run({
+      $expectedPriorFingerprint: H64,
+      $projectId: PROJECT_ID,
+      $targetKey: corrupted.targetKey,
+    });
   });
 
-  const corruptedPublic = await publicFullIssueCodes(corrupted);
-  assert.deepEqual({
-    syncRejected: corruptedPublic.sync.includes(
-      "LIFECYCLE_OUTBOX_INVARIANT_MISMATCH",
-    ),
-    asyncRejected: corruptedPublic.async.includes(
-      "LIFECYCLE_OUTBOX_INVARIANT_MISMATCH",
-    ),
-  }, {
-    syncRejected: true,
-    asyncRejected: true,
+  assert.deepEqual(await publicFullIssueCodes(corrupted.fixture), {
+    sync: ["LIFECYCLE_OUTBOX_INVARIANT_MISMATCH"],
+    async: ["LIFECYCLE_OUTBOX_INVARIANT_MISMATCH"],
   });
 });
 

@@ -327,6 +327,87 @@ it("strictly decodes the six-key persisted validation plan and rejects ordering 
   );
 });
 
+it("rejects descriptor-hostile validation plan containers without invoking accessors", async () => {
+  const repository = await (new Function("url", "return import(url)") as (
+    url: string,
+  ) => Promise<Record<string, unknown>>)(moduleUrl);
+  const decode = repository.decodePersistedValidationPlansV1;
+  assert.equal(typeof decode, "function");
+  const valid = { ...validPlans()[0]! };
+
+  const customPrototype = Object.assign(
+    Object.create({ inheritedMarker: true }) as Record<string, unknown>,
+    valid,
+  );
+  const inheritedKey = Object.assign(
+    Object.create({ profileId: valid.profileId }) as Record<string, unknown>,
+    Object.fromEntries(
+      Object.entries(valid).filter(([key]) => key !== "profileId"),
+    ),
+  );
+  let planAccessorCalls = 0;
+  const accessorPlan = { ...valid };
+  Object.defineProperty(accessorPlan, "profileId", {
+    configurable: true,
+    enumerable: true,
+    get() {
+      planAccessorCalls += 1;
+      return valid.profileId;
+    },
+  });
+  const symbolPlan = { ...valid };
+  Object.defineProperty(symbolPlan, Symbol("hostile"), {
+    enumerable: true,
+    value: "unexpected",
+  });
+  const nonEnumerablePlan = { ...valid };
+  Object.defineProperty(nonEnumerablePlan, "hidden", {
+    enumerable: false,
+    value: "unexpected",
+  });
+  class HostilePlanArray extends Array<unknown> {
+    static get [Symbol.species](): ArrayConstructor { return Array; }
+  }
+  const subclass = new HostilePlanArray(customPrototype);
+  const overriddenIteration = [{ ...valid }];
+  Object.defineProperty(overriddenIteration, Symbol.iterator, {
+    enumerable: false,
+    value: function* hostileIterator(): IterableIterator<never> {
+      throw new Error("must not iterate");
+    },
+  });
+  let arrayAccessorCalls = 0;
+  const accessorArray: unknown[] = [];
+  Object.defineProperty(accessorArray, "0", {
+    configurable: true,
+    enumerable: true,
+    get() {
+      arrayAccessorCalls += 1;
+      return { ...valid };
+    },
+  });
+  Object.defineProperty(accessorArray, "length", { value: 1 });
+
+  for (const hostile of [
+    [customPrototype],
+    [inheritedKey],
+    [accessorPlan],
+    [symbolPlan],
+    [nonEnumerablePlan],
+    subclass,
+    overriddenIteration,
+    accessorArray,
+  ]) {
+    assert.throws(() => Reflect.apply(decode as Function, undefined, [hostile]),
+      (error: unknown) => (
+        typeof error === "object" && error !== null && "code" in error
+          && (error as { code?: unknown }).code === "INTEGRITY_FAILURE"
+      ));
+  }
+  assert.equal(planAccessorCalls, 0);
+  assert.equal(arrayAccessorCalls, 0);
+});
+
 it("stores six-key plans once through connection and bound facades", () => {
   const connection = planConnection();
   const input = {
