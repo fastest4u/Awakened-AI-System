@@ -7,6 +7,7 @@ import type {
   WorkspaceId,
 } from "../identity/contracts.js";
 import type { TrustedActorRole } from "../identity/project-binding.request.js";
+import { canonicalJson } from "../serialization/canonical-json.js";
 
 export type JsonPrimitive = null | boolean | number | string;
 export type JsonValue = JsonPrimitive | JsonValue[] | { [key: string]: JsonValue };
@@ -46,10 +47,154 @@ export interface PendingEvent {
 }
 
 export interface PendingOutbox {
-  targetKey: string;
-  kind: string;
-  eventIndex: number;
-  payload: JsonValue;
+  readonly targetKey: string;
+  readonly kind: string;
+  readonly eventIndex: number;
+  readonly payload: JsonValue;
+}
+
+const RESERVED_LIFECYCLE_OUTBOX_KIND = "materialize-lifecycle-log";
+
+function invalidGenericPendingOutbox(): never {
+  throw new TypeError("PENDING_OUTBOX_INVALID");
+}
+
+function exactOwnDataRecord(
+  value: unknown,
+  expectedKeys: readonly string[] | undefined,
+): Record<string, unknown> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return invalidGenericPendingOutbox();
+  }
+  const prototype = Object.getPrototypeOf(value) as unknown;
+  if (prototype !== Object.prototype && prototype !== null) {
+    return invalidGenericPendingOutbox();
+  }
+  const keys = Reflect.ownKeys(value);
+  if (keys.some((key) => typeof key !== "string" || key === "__proto__")) {
+    return invalidGenericPendingOutbox();
+  }
+  if (
+    expectedKeys !== undefined
+    && (
+      keys.length !== expectedKeys.length
+      || keys.some((key) => !expectedKeys.includes(key as string))
+    )
+  ) return invalidGenericPendingOutbox();
+
+  const snapshot: Record<string, unknown> = {};
+  for (const key of keys as string[]) {
+    const descriptor = Reflect.getOwnPropertyDescriptor(value, key);
+    if (descriptor === undefined || !descriptor.enumerable || !("value" in descriptor)) {
+      return invalidGenericPendingOutbox();
+    }
+    Object.defineProperty(snapshot, key, {
+      value: descriptor.value,
+      enumerable: true,
+      writable: true,
+      configurable: true,
+    });
+  }
+  return snapshot;
+}
+
+function strictJsonSnapshot(value: unknown): JsonValue {
+  const ancestors = new Set<object>();
+  const copy = (current: unknown): JsonValue => {
+    if (current === null || typeof current === "string" || typeof current === "boolean") {
+      return current;
+    }
+    if (typeof current === "number") {
+      if (!Number.isFinite(current)) return invalidGenericPendingOutbox();
+      return Object.is(current, -0) ? 0 : current;
+    }
+    if (typeof current !== "object" || ancestors.has(current)) {
+      return invalidGenericPendingOutbox();
+    }
+
+    ancestors.add(current);
+    try {
+      if (Array.isArray(current)) {
+        if (Object.getPrototypeOf(current) !== Array.prototype) {
+          return invalidGenericPendingOutbox();
+        }
+        const descriptors = Object.getOwnPropertyDescriptors(current);
+        const length = Reflect.getOwnPropertyDescriptor(current, "length")?.value;
+        if (!Number.isSafeInteger(length) || Number(length) < 0) {
+          return invalidGenericPendingOutbox();
+        }
+        const expectedKeys = [
+          ...Array.from({ length: Number(length) }, (_, index) => String(index)),
+          "length",
+        ];
+        const keys = Reflect.ownKeys(current);
+        if (
+          keys.length !== expectedKeys.length
+          || keys.some((key, index) => key !== expectedKeys[index])
+        ) return invalidGenericPendingOutbox();
+        const result: JsonValue[] = [];
+        for (let index = 0; index < Number(length); index += 1) {
+          const descriptor = descriptors[String(index)];
+          if (descriptor === undefined || !descriptor.enumerable || !("value" in descriptor)) {
+            return invalidGenericPendingOutbox();
+          }
+          result.push(copy(descriptor.value));
+        }
+        return Object.freeze(result) as JsonValue;
+      }
+
+      const record = exactOwnDataRecord(current, undefined);
+      const result: Record<string, JsonValue> = {};
+      for (const key of Object.keys(record)) {
+        Object.defineProperty(result, key, {
+          value: copy(record[key]),
+          enumerable: true,
+          writable: true,
+          configurable: true,
+        });
+      }
+      return Object.freeze(result);
+    } finally {
+      ancestors.delete(current);
+    }
+  };
+
+  const snapshot = copy(value);
+  canonicalJson(snapshot);
+  return snapshot;
+}
+
+function boundedNonemptyString(value: unknown, maximumScalars: number): string {
+  if (
+    typeof value !== "string"
+    || value.length === 0
+    || Array.from(value).length > maximumScalars
+  ) return invalidGenericPendingOutbox();
+  return value;
+}
+
+/**
+ * Strictly decodes only the generic outbox branch. The lifecycle materializer
+ * literal is reserved for its closed descriptor codec.
+ */
+export function decodeGenericPendingOutbox(value: unknown): PendingOutbox {
+  const source = exactOwnDataRecord(
+    value,
+    ["targetKey", "kind", "eventIndex", "payload"],
+  );
+  const targetKey = boundedNonemptyString(source.targetKey, 4_096);
+  const kind = boundedNonemptyString(source.kind, 128);
+  if (kind === RESERVED_LIFECYCLE_OUTBOX_KIND) return invalidGenericPendingOutbox();
+  if (!Number.isSafeInteger(source.eventIndex) || Number(source.eventIndex) < 0) {
+    return invalidGenericPendingOutbox();
+  }
+  const payload = strictJsonSnapshot(source.payload);
+  return Object.freeze({
+    targetKey,
+    kind,
+    eventIndex: Number(source.eventIndex),
+    payload,
+  });
 }
 
 export interface AppendCommand<TResponse extends JsonValue> {
