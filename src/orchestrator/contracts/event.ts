@@ -164,11 +164,10 @@ function strictJsonSnapshot(value: unknown): JsonValue {
   return snapshot;
 }
 
-function boundedNonemptyString(value: unknown, maximumScalars: number): string {
+function nonemptyString(value: unknown): string {
   if (
     typeof value !== "string"
-    || value.length === 0
-    || Array.from(value).length > maximumScalars
+    || value.trim().length === 0
   ) return invalidGenericPendingOutbox();
   return value;
 }
@@ -182,8 +181,8 @@ export function decodeGenericPendingOutbox(value: unknown): PendingOutbox {
     value,
     ["targetKey", "kind", "eventIndex", "payload"],
   );
-  const targetKey = boundedNonemptyString(source.targetKey, 4_096);
-  const kind = boundedNonemptyString(source.kind, 128);
+  const targetKey = nonemptyString(source.targetKey);
+  const kind = nonemptyString(source.kind);
   if (kind === RESERVED_LIFECYCLE_OUTBOX_KIND) return invalidGenericPendingOutbox();
   if (!Number.isSafeInteger(source.eventIndex) || Number(source.eventIndex) < 0) {
     return invalidGenericPendingOutbox();

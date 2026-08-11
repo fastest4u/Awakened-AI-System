@@ -13,6 +13,7 @@ import type {
   WorkspaceId,
   WorkspaceSnapshot,
 } from "../identity/contracts.js";
+import { computeProjectContextFingerprint } from "../identity/project-binding.service.js";
 import type {
   ProjectBindingSource,
   TrustedActorRole,
@@ -164,13 +165,15 @@ function strictJsonSnapshot(value: unknown, field: string): JsonValue {
 function stringValue(
   value: unknown,
   field: string,
-  maximumScalars: number,
-  allowEmpty = false,
+  maximumScalars?: number,
 ): string {
   if (
     typeof value !== "string"
-    || (!allowEmpty && value.length === 0)
-    || Array.from(value).length > maximumScalars
+    || value.trim().length === 0
+    || (
+      maximumScalars !== undefined
+      && Array.from(value).length > maximumScalars
+    )
   ) return invalid(field);
   return value;
 }
@@ -400,7 +403,6 @@ export function decodeLifecycleMaterializationPayloadV1(
   const targetKey = stringValue(
     source.targetKey,
     "lifecycleMaterializationPayload.targetKey",
-    4_096,
   );
   if (targetKey !== `lifecycle-log/${sessionId}/${materializationRevision}`) {
     return invalid("lifecycleMaterializationPayload.targetKey");
@@ -418,7 +420,6 @@ export function decodeLifecycleMaterializationPayloadV1(
     artifactPath: stringValue(
       source.artifactPath,
       "lifecycleMaterializationPayload.artifactPath",
-      4_096,
     ),
     materializationRevision,
     triggeringPayloadHash: hashValue(
@@ -449,7 +450,7 @@ export function decodePendingLifecycleOutboxV1(value: unknown): PendingLifecycle
   if (source.kind !== LIFECYCLE_OUTBOX_KIND) return invalid("pendingLifecycleOutbox.kind");
   const eventIndex = exactZero(source.eventIndex, "pendingLifecycleOutbox.eventIndex");
   const payload = decodeLifecycleMaterializationPayloadV1(source.payload);
-  const targetKey = stringValue(source.targetKey, "pendingLifecycleOutbox.targetKey", 4_096);
+  const targetKey = stringValue(source.targetKey, "pendingLifecycleOutbox.targetKey");
   if (targetKey !== payload.targetKey) return invalid("pendingLifecycleOutbox.targetKey");
   return Object.freeze({
     targetKey,
@@ -496,17 +497,21 @@ function decodeStoreRoute(value: unknown): ProjectStoreRoute {
   }
   return Object.freeze({
     kind: source.kind,
-    storeRoot: stringValue(source.storeRoot, "materializationProjection.context.binding.storeRoute.storeRoot", 4_096),
-    eventsPath: stringValue(source.eventsPath, "materializationProjection.context.binding.storeRoute.eventsPath", 4_096),
+    storeRoot: stringValue(
+      source.storeRoot,
+      "materializationProjection.context.binding.storeRoute.storeRoot",
+    ),
+    eventsPath: stringValue(
+      source.eventsPath,
+      "materializationProjection.context.binding.storeRoute.eventsPath",
+    ),
     storeManifestPath: stringValue(
       source.storeManifestPath,
       "materializationProjection.context.binding.storeRoute.storeManifestPath",
-      4_096,
     ),
     projectionManifestPath: stringValue(
       source.projectionManifestPath,
       "materializationProjection.context.binding.storeRoute.projectionManifestPath",
-      4_096,
     ),
   });
 }
@@ -521,7 +526,7 @@ function decodeWorkspace(value: unknown, field: string): WorkspaceSnapshot {
     const source = strictRecord(value, ["kind", "workspaceRoot", "workspaceId"], field);
     return Object.freeze({
       kind: "non-git" as const,
-      workspaceRoot: stringValue(source.workspaceRoot, `${field}.workspaceRoot`, 4_096),
+      workspaceRoot: stringValue(source.workspaceRoot, `${field}.workspaceRoot`),
       workspaceId: workspaceIdValue(source.workspaceId, `${field}.workspaceId`),
     });
   }
@@ -545,15 +550,18 @@ function decodeWorkspace(value: unknown, field: string): WorkspaceSnapshot {
     if (source.detached !== true && source.detached !== false) {
       return invalid(`${field}.detached`);
     }
+    if (source.detached !== (source.branchRef === null)) {
+      return invalid(`${field}.branchRef`);
+    }
     return Object.freeze({
       kind: "git" as const,
-      worktreeRoot: stringValue(source.worktreeRoot, `${field}.worktreeRoot`, 4_096),
-      gitDir: stringValue(source.gitDir, `${field}.gitDir`, 4_096),
-      gitCommonDir: stringValue(source.gitCommonDir, `${field}.gitCommonDir`, 4_096),
+      worktreeRoot: stringValue(source.worktreeRoot, `${field}.worktreeRoot`),
+      gitDir: stringValue(source.gitDir, `${field}.gitDir`),
+      gitCommonDir: stringValue(source.gitCommonDir, `${field}.gitCommonDir`),
       headCommit: source.headCommit,
       branchRef: source.branchRef === null
         ? null
-        : stringValue(source.branchRef, `${field}.branchRef`, 1_024),
+        : stringValue(source.branchRef, `${field}.branchRef`),
       detached: source.detached,
       workspaceId: workspaceIdValue(source.workspaceId, `${field}.workspaceId`),
     });
@@ -616,6 +624,9 @@ function decodeProjectContext(value: unknown): ProjectContext {
         "materializationProjection.context.branchScopeId",
       )
     : undefined;
+  if (branchScopeId !== undefined && workspace.kind !== "git") {
+    return invalid("materializationProjection.context.branchScopeId");
+  }
   const decodedBinding = Object.freeze({
     projectBindingId: uuidValue(
       binding.projectBindingId,
@@ -637,20 +648,23 @@ function decodeProjectContext(value: unknown): ProjectContext {
     clientNamespace: stringValue(
       binding.clientNamespace,
       "materializationProjection.context.binding.clientNamespace",
-      1_024,
     ),
     clientInstanceId: stringValue(
       binding.clientInstanceId,
       "materializationProjection.context.binding.clientInstanceId",
-      1_024,
     ),
     actorRole: binding.actorRole as TrustedActorRole,
-    projectRoot: stringValue(binding.projectRoot, "materializationProjection.context.binding.projectRoot", 4_096),
-    vaultRoot: stringValue(binding.vaultRoot, "materializationProjection.context.binding.vaultRoot", 4_096),
+    projectRoot: stringValue(
+      binding.projectRoot,
+      "materializationProjection.context.binding.projectRoot",
+    ),
+    vaultRoot: stringValue(
+      binding.vaultRoot,
+      "materializationProjection.context.binding.vaultRoot",
+    ),
     descriptorPath: stringValue(
       binding.descriptorPath,
       "materializationProjection.context.binding.descriptorPath",
-      4_096,
     ),
     storeRoute: decodeStoreRoute(binding.storeRoute),
     workspace: bindingWorkspace,
@@ -659,6 +673,29 @@ function decodeProjectContext(value: unknown): ProjectContext {
       "materializationProjection.context.binding.establishedAt",
     ),
   });
+  const computedContextFingerprint = computeProjectContextFingerprint({
+    generation: decodedBinding.generation,
+    source: decodedBinding.source,
+    projectId: decodedBinding.projectId,
+    vaultId: decodedBinding.vaultId,
+    storeId: decodedBinding.storeId,
+    workspaceId: decodedBinding.workspaceId,
+    clientNamespace: decodedBinding.clientNamespace,
+    clientInstanceId: decodedBinding.clientInstanceId,
+    actorRole: decodedBinding.actorRole,
+    projectRoot: decodedBinding.projectRoot,
+    vaultRoot: decodedBinding.vaultRoot,
+    descriptorPath: decodedBinding.descriptorPath,
+    storeRoute: decodedBinding.storeRoute,
+    workspace: decodedBinding.workspace,
+  });
+  if (decodedBinding.contextFingerprint !== computedContextFingerprint) {
+    return invalid("materializationProjection.context.binding.contextFingerprint");
+  }
+  if (
+    (workspace.kind === "git" && decodedBinding.storeRoute.kind !== "git-common")
+    || (workspace.kind === "non-git" && decodedBinding.storeRoute.kind !== "vault-local")
+  ) return invalid("materializationProjection.context.binding.storeRoute.kind");
   return Object.freeze({
     binding: decodedBinding,
     workspace,

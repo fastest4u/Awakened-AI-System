@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { decodeGenericPendingOutbox } from "../src/orchestrator/contracts/event.js";
+import { computeProjectContextFingerprint } from "../src/orchestrator/identity/project-binding.service.js";
 import {
   decodeMaterializationProjectionInputV1,
   decodePendingLifecycleOutboxV1,
@@ -27,13 +28,40 @@ const WORKFLOW_TRIGGERS = [
   "SessionEnded",
 ] as const satisfies readonly LifecycleMaterializationTriggerType[];
 
+function bindingOf(context: Record<string, unknown>): Record<string, unknown> {
+  return context.binding as Record<string, unknown>;
+}
+
+function refreshProjectContextFingerprint(
+  context: Record<string, unknown>,
+): Record<string, unknown> {
+  const binding = bindingOf(context);
+  binding.contextFingerprint = computeProjectContextFingerprint({
+    generation: binding.generation,
+    source: binding.source,
+    projectId: binding.projectId,
+    vaultId: binding.vaultId,
+    storeId: binding.storeId,
+    workspaceId: binding.workspaceId,
+    clientNamespace: binding.clientNamespace,
+    clientInstanceId: binding.clientInstanceId,
+    actorRole: binding.actorRole,
+    projectRoot: binding.projectRoot,
+    vaultRoot: binding.vaultRoot,
+    descriptorPath: binding.descriptorPath,
+    storeRoute: binding.storeRoute,
+    workspace: binding.workspace,
+  } as Parameters<typeof computeProjectContextFingerprint>[0]);
+  return context;
+}
+
 function projectContext(): Record<string, unknown> {
   const workspace = {
     kind: "non-git",
     workspaceRoot: "C:\\project",
     workspaceId: WORKSPACE_ID,
   };
-  return {
+  return refreshProjectContextFingerprint({
     binding: {
       projectBindingId: "77777777-7777-4777-8777-777777777777",
       generation: 1,
@@ -61,7 +89,7 @@ function projectContext(): Record<string, unknown> {
     },
     workspace,
     checkedAt: "2026-08-09T00:01:00.000Z",
-  };
+  });
 }
 
 function gitProjectContext(headCommitLength: 40 | 64 = 64): Record<string, unknown> {
@@ -84,7 +112,7 @@ function gitProjectContext(headCommitLength: 40 | 64 = 64): Record<string, unkno
   binding.workspace = structuredClone(workspace);
   context.workspace = workspace;
   context.branchScopeId = "66666666-6666-4666-8666-666666666666";
-  return context;
+  return refreshProjectContextFingerprint(context);
 }
 
 function workflowOrigin(): Record<string, unknown> {
@@ -468,4 +496,175 @@ test("deep-freezes the canonical lifecycle pending descriptor", () => {
     candidate.triggeringEventSchemaVersion = invalidVersion;
     assert.throws(() => decodeMaterializationProjectionInputV1(candidate));
   }
+});
+
+test("authenticates the canonical project context fingerprint", () => {
+  const canonical = projection();
+  const decoded = decodeMaterializationProjectionInputV1(canonical);
+  assert.equal(
+    decoded.context.binding.contextFingerprint,
+    bindingOf(canonical.context as Record<string, unknown>).contextFingerprint,
+  );
+
+  const staleAfterBindingTamper = projection();
+  bindingOf(staleAfterBindingTamper.context as Record<string, unknown>).clientNamespace =
+    "tampered-after-fingerprint";
+  assert.throws(() => decodeMaterializationProjectionInputV1(staleAfterBindingTamper));
+
+  const forgedFingerprint = projection();
+  bindingOf(forgedFingerprint.context as Record<string, unknown>).contextFingerprint =
+    "f".repeat(64);
+  assert.throws(() => decodeMaterializationProjectionInputV1(forgedFingerprint));
+});
+
+test("rejects incoherent project context variants", () => {
+  const detachedWithBranch = gitProjectContext();
+  for (const workspace of [
+    bindingOf(detachedWithBranch).workspace,
+    detachedWithBranch.workspace,
+  ] as Array<Record<string, unknown>>) {
+    workspace.detached = true;
+    workspace.branchRef = "refs/heads/main";
+  }
+  refreshProjectContextFingerprint(detachedWithBranch);
+
+  const attachedWithoutBranch = gitProjectContext();
+  for (const workspace of [
+    bindingOf(attachedWithoutBranch).workspace,
+    attachedWithoutBranch.workspace,
+  ] as Array<Record<string, unknown>>) {
+    workspace.detached = false;
+    workspace.branchRef = null;
+  }
+  refreshProjectContextFingerprint(attachedWithoutBranch);
+
+  const gitWithVaultRoute = gitProjectContext();
+  (bindingOf(gitWithVaultRoute).storeRoute as Record<string, unknown>).kind = "vault-local";
+  refreshProjectContextFingerprint(gitWithVaultRoute);
+
+  const nonGitWithGitRoute = projectContext();
+  (bindingOf(nonGitWithGitRoute).storeRoute as Record<string, unknown>).kind = "git-common";
+  refreshProjectContextFingerprint(nonGitWithGitRoute);
+
+  const nonGitWithBranchScope = projectContext();
+  nonGitWithBranchScope.branchScopeId = "66666666-6666-4666-8666-666666666666";
+
+  for (const context of [
+    detachedWithBranch,
+    attachedWithoutBranch,
+    gitWithVaultRoute,
+    nonGitWithGitRoute,
+    nonGitWithBranchScope,
+  ]) {
+    const candidate = projection();
+    candidate.context = context;
+    assert.throws(() => decodeMaterializationProjectionInputV1(candidate));
+  }
+
+  const gitWithoutBranchScope = gitProjectContext();
+  delete gitWithoutBranchScope.branchScopeId;
+  const accepted = projection();
+  accepted.context = gitWithoutBranchScope;
+  const decoded = decodeMaterializationProjectionInputV1(accepted);
+  assert.equal(Object.hasOwn(decoded.context, "branchScopeId"), false);
+});
+
+test("accepts upstream-valid unbounded project context strings", () => {
+  const longRoot = `C:\\${"p".repeat(4_100)}`;
+  const longContext = projectContext();
+  const binding = bindingOf(longContext);
+  binding.clientNamespace = "n".repeat(1_025);
+  binding.clientInstanceId = "i".repeat(1_025);
+  binding.projectRoot = longRoot;
+  binding.vaultRoot = `${longRoot}\\memory`;
+  binding.descriptorPath = `${longRoot}\\memory\\.project-memory.json`;
+  binding.storeRoute = {
+    kind: "vault-local",
+    storeRoot: `${longRoot}\\store`,
+    eventsPath: `${longRoot}\\events.sqlite`,
+    storeManifestPath: `${longRoot}\\store.json`,
+    projectionManifestPath: `${longRoot}\\projection.json`,
+  };
+  const workspace = {
+    kind: "non-git",
+    workspaceRoot: longRoot,
+    workspaceId: WORKSPACE_ID,
+  };
+  binding.workspace = structuredClone(workspace);
+  longContext.workspace = workspace;
+  refreshProjectContextFingerprint(longContext);
+  const candidate = projection();
+  candidate.context = longContext;
+  const decoded = decodeMaterializationProjectionInputV1(candidate);
+  assert.equal(decoded.context.binding.clientNamespace.length, 1_025);
+  assert.equal(decoded.context.binding.projectRoot.length > 4_096, true);
+  assert.equal(decoded.context.binding.storeRoute.eventsPath.length > 4_096, true);
+
+  const longArtifact = pending();
+  (longArtifact.payload as Record<string, unknown>).artifactPath =
+    `05_Agent_Session_Logs/${"a".repeat(4_097)}.md`;
+  assert.equal(
+    decodePendingLifecycleOutboxV1(longArtifact).payload.artifactPath.length > 4_096,
+    true,
+  );
+
+  for (const mutate of [
+    (context: Record<string, unknown>) => {
+      bindingOf(context).clientNamespace = "   ";
+    },
+    (context: Record<string, unknown>) => {
+      (bindingOf(context).storeRoute as Record<string, unknown>).eventsPath = "   ";
+    },
+    (context: Record<string, unknown>) => {
+      const blankWorkspace = {
+        kind: "non-git",
+        workspaceRoot: "   ",
+        workspaceId: WORKSPACE_ID,
+      };
+      bindingOf(context).workspace = structuredClone(blankWorkspace);
+      context.workspace = blankWorkspace;
+    },
+  ]) {
+    const blank = projectContext();
+    mutate(blank);
+    refreshProjectContextFingerprint(blank);
+    const blankCandidate = projection();
+    blankCandidate.context = blank;
+    assert.throws(() => decodeMaterializationProjectionInputV1(blankCandidate));
+  }
+
+  const blankArtifact = pending();
+  (blankArtifact.payload as Record<string, unknown>).artifactPath = "   ";
+  assertRejected(blankArtifact);
+});
+
+test("preserves the generic pending outbox string domain", () => {
+  const generic = {
+    targetKey: "generic/target",
+    kind: "notify-observer",
+    eventIndex: 0,
+    payload: { accepted: true },
+  };
+  for (const field of ["targetKey", "kind"] as const) {
+    for (const value of ["", " ", "\t\r\n"]) {
+      assert.throws(() => decodeGenericPendingOutbox({
+        ...generic,
+        [field]: value,
+      }));
+    }
+  }
+
+  const longTarget = "t".repeat(4_097);
+  const decodedLongTarget = decodeGenericPendingOutbox({
+    ...generic,
+    targetKey: longTarget,
+  });
+  assert.equal(decodedLongTarget.targetKey, longTarget);
+
+  const longKind = "k".repeat(129);
+  const decodedLongKind = decodeGenericPendingOutbox({
+    ...generic,
+    kind: longKind,
+  });
+  assert.equal(decodedLongKind.kind, longKind);
 });
