@@ -2,17 +2,18 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Implement the approved Approach A session-end workflow through a durable `ending-materialization-queued` boundary, including schema 4, event-carried effective state, one-child-at-a-time carry-forward, and deterministic lifecycle outbox planning without enabling Version 2 production routing.
+**Goal:** Implement the approved Approach A session-end workflow through a durable `ending-materialization-queued` boundary, including schema 4, event-carried effective state, one-child-at-a-time carry-forward, an explicit Version 3 final-checkpoint marker, and deterministic event-authoritative lifecycle-log planning without enabling Version 2 production routing.
 
-**Architecture:** A root `SessionEndRequested` Version 3 event anchors one deterministic workflow UUID and one bounded effective-state snapshot. A coordinator advances at most one durable action per drive, delegating child carry-forward to a dedicated child-targeted internal semantic command. Task 14Q plans compatibility-log bytes and inserts the immutable lifecycle outbox row atomically with the triggering event; Task 15 later validates and appends terminal semantics, while Task 16 alone owns mutable claims, filesystem replacement, and acknowledgement.
+**Architecture:** A root `SessionEndRequested` Version 3 event anchors one deterministic workflow UUID and one bounded effective-state snapshot. A coordinator advances at most one durable action per drive, delegating child carry-forward to a dedicated child-targeted internal semantic command. Task 14Q renders one authenticated root/direct-child/foreign-claim event closure, uses an exact outer Version 3 checkpoint as the final marker, and inserts the immutable lifecycle outbox row atomically with the triggering event; Task 15 later validates and appends terminal semantics, while Task 16 alone owns mutable claims, filesystem replacement, and acknowledgement.
 
 **Tech Stack:** TypeScript 5.8, Node.js 22 test runner, SQLite migrations/transactions, canonical JSON, Node `crypto`, existing lifecycle semantic/operational stores and worker runtime.
 
 ---
 
-## Authority, prerequisite, and execution rules
+## Global Constraints
 
 - Approved design: `docs/superpowers/specs/2026-08-09-task-14-root-anchored-session-end-saga-design.md` at commit `72f4fce6c6a867c96be02b2afbf4506447c6964e`.
+- Approved Task 14Q.2 addendum: `docs/superpowers/specs/2026-08-11-task-14q-2-compatibility-log-renderer-contract-addendum-design.md` at commit `2b0f045`; it is authoritative for Q.2-Q.6 and the affected S.3 integration wherever it conflicts with the 2026-08-09 design or this plan's older prose.
 - Parent plan: `docs/superpowers/plans/2026-07-14-root-child-lifecycle-and-checkpoints.md`; its amended Task 14-16 boundaries are authoritative over the superseded prose in older `.superpowers/sdd/task-*.md` briefs.
 - Execute slices in strict order: **14M → 14Q → 14R → 14S → 14W**. Within a slice, execute tasks in order unless the plan explicitly permits independent test-only preparation.
 - Start every slice from a clean tracked worktree and the prior slice's reviewed commit. Do not stage ignored `.superpowers` reports.
@@ -49,6 +50,8 @@ The grouped commands below are consolidation gates after every constituent case 
 | 10-11 amendment, cancellation, reopening | 14R.3 |
 | 12 final checkpoint/frozen scope | 14S.3 |
 | 13 deterministic queue planning | 14Q.1-14Q.6 and 14S.3 integration |
+| Q.2 addendum Sections 3-5 final marker, normalization, closure | 14Q.2a, 14Q.3-14Q.5 |
+| Q.2 addendum Sections 6-9 frozen epochs, validation, bytes, handle state | 14Q.2b, 14Q.4, 14Q.6, 14S.3 |
 | 14 Task 15/16 boundaries | amended parent Tasks 15-16 |
 | 15-17 phase/runtime/error ownership | 14R-14W |
 | 18 crash/replay acceptance matrix | 14W.2 |
@@ -70,6 +73,10 @@ export const COMPATIBILITY_SESSION_LOG_ARTIFACT_KIND =
 - Migration 0002 hash remains `68B4039048A359C523B7842F6D17BAA5760E9760D2B4E9F80BB8A48DC339EB06`; migration 0003 remains `C023A8EDB88A94B749D4837F7300A76D081C843BF41BE058C3AA4AD5D6A158C4`.
 - Schema 4 adds migration `0004-session-end-effective-state`; Version 1 remains the production authority.
 - `SessionEndRequested`, `SessionEndAmended`, and current cancellation use Version 3. Legacy Version 1/2 event decoding remains immutable, including legacy Version 1 cancellation replay. `ChildWorkTransferCreated` Version 1 remains byte-for-byte unchanged; only the internal Task 14 child path may emit the Version 2 dual-checkpoint transfer.
+- Only outer `SessionCheckpointRecorded` Version 3 is a final marker. Its exact payload keys are `checkpoint`, `baseEventPosition`, `checkpointEventPosition`, `finalCheckpointBindingVersion`, `workflowId`, and `workflowGeneration`; its nested checkpoint remains Version 1 or Version 2. Outer checkpoint Version 1/2 stays ordinary forever.
+- Renderer authority is the strict source-root stream, every lifetime direct-child stream, and the exact foreign claimant-child fork/claim pair for source-root tickets claimed before the trigger. Global positions may gap; each included stream prefix is contiguous.
+- At the Version 3 marker, accepted, deferred, rejected, and unresolved-ticket bytes freeze together with the exact checkpoint and per-child heads. Post-marker child events or claims cannot rewrite a preserved revision.
+- Outer Version 1/2 amendments reset validation. Outer Version 3 `open` resets; outer Version 3 `seal`/`unchanged` preserve. Marker/child-snapshot action dispatch is separate from validation dispatch.
 - Current workflow fingerprint is Version 2. Legacy Version 1 fingerprints remain replayable and are never silently rewritten.
 - Every lifecycle materialization projection has `triggeringEventIndex === 0`, every pending descriptor has `eventIndex === 0`, every referenced event has `command_event_index = 0`, and `materializationRevision === triggeringEventPosition`.
 - `command_dedup.command_hash` remains the authoritative lifecycle intent hash. The lifecycle target remains in `command_dedup.outbox_order_json`; the descriptor is bound by its canonical payload/content hash, target ordering, actual triggering event, deterministic path/revision/origin, and predecessor fingerprint chain.
@@ -610,14 +617,16 @@ export interface CompatibilityLogProjectionV2 {
 
 Event-to-field mapping is closed:
 
-- `identity`, `source.streamId`, `source.streamType`, and `source.startEventPosition` come only from the first strict committed root `SessionStarted`; `source.streamId` must equal the canonical `session/${identity.sessionId}` and context fields must match every included event. `source.through*` comes from the exact planned/committed trigger.
+- `identity`, `source.streamId`, `source.streamType`, and `source.startEventPosition` come only from the first strict committed root `SessionStarted`; `source.streamId` must equal the canonical `session/${identity.sessionId}`. Source-root/direct-child events match that full context. A foreign claim pair matches source project/vault/store and matches itself on workspace/branch, but never replaces rendered source identity. `source.through*` comes from the exact planned/committed trigger.
 - `lifecycle` is the strict root aggregate through the candidate trigger plus the already-decoded workflow origin. Request/amend effective state supplies child policy/window; cancellation restores active/suspended; abandonment and end produce their terminal states. Direct abandonment has null workflow/policy/window.
-- `acceptedChildren` includes only report items selected by the latest valid accepted/partially-accepted disposition through the trigger. It sorts by binary `(childSessionId, reportId, category, itemIndex, itemId)`.
-- `unresolvedFollowUps` includes the complementary deferred/rejected disposition items plus still-unclaimed source-root carry-forward tickets. It sorts by binary `(kind, sourceChildSessionId, reportId-or-transferTicketId, category-or-empty, itemIndex-or-minus-one, itemId-or-empty)`.
-- `finalCheckpoint` is the latest strictly bound root checkpoint through the trigger plus the workflow's frozen fingerprint, or null. Version 1 coverage is copied exactly. Version 2 coverage maps only the DTO above, sorted by binary `adapterSessionId`; frame/coverage algorithms, key IDs, domains, fingerprints, and ordinal frames are excluded.
+- `acceptedChildren` resolves dispositions per report. No disposition or latest `superseded` omits that report; accepted emits every item; partially accepted splits accepted from deferred/rejected; rejected emits every item as unresolved. Before a marker it folds at the trigger cutoff. While a marker is in force it folds at the exact frozen per-child heads. It sorts by binary `(childSessionId, reportId, category, itemIndex, itemId)`.
+- `unresolvedFollowUps` includes the complementary deferred/rejected disposition items plus source-root carry-forward tickets unclaimed at the active cutoff. A Version 3 final marker freezes these bytes with accepted children; preserving triggers reuse them even if a later claim commits. It sorts by binary `(kind, sourceChildSessionId, reportId-or-transferTicketId, category-or-empty, itemIndex-or-minus-one, itemId-or-empty)`.
+- `finalCheckpoint` is non-null only while an outer Version 3 `SessionCheckpointRecorded` marker is in force. Its exact six-key payload binds workflow ID/generation and nests strict Checkpoint V1 or V2. The fingerprint is recomputed as SHA-256 over `project-memory/checkpoint/v{checkpointVersion}\n` plus canonical checkpoint JSON; it is not duplicated in the event. Version 1 coverage is copied exactly. Version 2 coverage maps only the DTO above, sorted by binary `adapterSessionId`; frame/coverage algorithms, key IDs, domains, fingerprints, and ordinal frames are excluded.
 - `validation` follows the exhaustive fold table below. `results` contains only strict retained results for the rendered workflow state and sorts by binary `resultId`; every non-null `validationResultIds` array uses the same order. Committed start/completion times and validation output fingerprint metadata remain because they are semantic event fields, not renderer state.
 - `materialization` is derived before rendering from `MaterializationProjectionInputV1` and the exact candidate. It explicitly excludes `expectedPriorFingerprint`, `nextFingerprint`, row `content_hash`, status, attempts, claims, tokens, failure data, and acknowledgement data; including any of them would create a circular or operationally unstable byte contract.
 - Every event/checkpoint/materialization position is a positive canonical decimal string; coverage ordinals and stream versions use their existing nonnegative canonical rules. The declared JSON numbers are `documentVersion`, workflow generation, item index, checkpoint/profile versions, and quality score. Every timestamp is an already-committed canonical semantic timestamp; `recordedAt`, current time, and process time are never rendered.
+
+The renderer input is one authenticated closure at positions strictly before the trigger plus one normalized trigger. The closure contains the complete source-root prefix, every lifetime direct-child prefix, and the exact foreign `SessionForked` stream-version-1 plus `ChildWorkTransferClaimed` stream-version-2 pair for each pre-trigger claim. Global gaps are legal; every included stream starts at version 1 and is contiguous. Candidate input and committed `StoredEvent` normalize to one semantic shape; no unavailable event, command, clock, intent, or hash field is fabricated.
 
 Validation projection is closed over strict workflow replay; it never reads mutable runner state:
 
@@ -629,7 +638,7 @@ Validation projection is closed over strict workflow replay; it never reads muta
 | Latest in-force verdict is `SessionEndVerificationFailed` | status `failed` | exactly the event's complete sorted `validationResultIds` and the matching strict results | `null` | exact event `safeFailureCode` |
 | Latest in-force verdict is `SessionEndVerificationInvalidated` | status `invalidated` | carry exactly the IDs/results from the passed event named by `previousVerificationEventPosition`; the invalidation event cannot replace them | reset to `null` | exact invalidation event `safeFailureCode` |
 
-A new/reopened request starts the retained set empty. An `open` amendment and cancellation clear it and emit `not-run` if materialized; `seal` and `unchanged` preserve the folded set/verdict exactly. A workflow-origin abandonment preserves the last folded validation projection. `SessionEnded` preserves the passed projection whose event position it names. Any missing/extra result, result from another workflow lineage, unsorted/duplicate ID, verdict/result-set mismatch, or invalidation that does not name the in-force passed event is `INTEGRITY_FAILURE`. The committed golden fixtures cover `not-run` (`ending-v2` and `cancelled-v2`), `passed` (`completed-v2`), `failed` (`failed-v2`), `invalidated` (`invalidated-v2`), and null (`abandoned-v2`).
+A new/reopened request starts the retained set empty. Outer Version 1/2 `SessionEndAmended` always resets validation, including Version 2 `seal`/`unchanged`. Outer Version 3 `open` and cancellation reset; outer Version 3 `seal`/`unchanged` preserve exactly. Marker/child-snapshot dispatch remains separate: Version 1 implicit unchanged and Version 2/3 explicit unchanged preserve the frozen marker epoch. A workflow-origin abandonment preserves the last valid validation projection. `SessionEnded` preserves the passed projection whose event position it names. Any missing/extra result, result from another workflow lineage without a contiguous Version 3 carry chain, unsorted/duplicate ID, verdict/result-set mismatch, post-verdict result, or invalidation/end that does not name the in-force passed event is `INTEGRITY_FAILURE`. The committed golden fixtures cover `not-run` (`ending-v2` and `cancelled-v2`), `passed` (`completed-v2`), `failed` (`failed-v2`), `invalidated` (`invalidated-v2`), and null (`abandoned-v2`).
 
 The renderer emits exactly these sections in this order, with `\n` line endings and one terminal newline:
 
@@ -764,13 +773,282 @@ git add src/orchestrator/lifecycle/materialization-queue.port.ts src/orchestrato
 git commit -m "feat: freeze lifecycle materialization queue contracts"
 ```
 
-### Task 14Q.2: Implement the canonical path and pure renderer
+### Task 14Q.2a: Add the Version 3 final marker and authenticated closure contract
+
+**Files:**
+
+- Modify: `src/orchestrator/lifecycle/contracts/events.ts`
+- Modify: `src/orchestrator/lifecycle/materialization-queue.port.ts`
+- Modify: `src/orchestrator/lifecycle/session-aggregate.ts`
+- Modify: `src/orchestrator/lifecycle/lifecycle-command.store.ts`
+- Modify: `src/orchestrator/lifecycle/child-workflow.service.ts`
+- Create: `src/orchestrator/materialization/prepared-materialization-handle.ts`
+- Modify: `src/orchestrator/storage/session-authority.repository.ts`
+- Modify: `src/orchestrator/storage/session-end-effective-state-migration-preflight.ts`
+- Modify: `src/orchestrator/storage/migrations/0004-session-end-effective-state.ts`
+- Modify: `src/orchestrator/integrity/lifecycle-integrity.service.ts`
+- Modify: `tests/lifecycle-contracts.test.ts`
+- Modify: `tests/lifecycle-materialization-queue.test.ts`
+- Modify: `tests/session-aggregate.test.ts`
+- Modify: `tests/lifecycle-projection-folds.test.ts`
+- Modify: `tests/lifecycle-command-store.test.ts`
+- Modify: `tests/session-authority.repository.test.ts`
+- Modify: `tests/session-end-effective-state-migration.test.ts`
+- Modify: `tests/migration-registry.test.ts`
+- Modify: `tests/qualified-checkpoint-quick-integrity.test.ts`
+- Modify: `tests/qualified-checkpoint-full-integrity.test.ts`
+
+**Interfaces:**
+
+- Consumes: strict `CheckpointV1`/`CheckpointV2`, `LifecycleEventBaseV1`, Q.1 `MaterializationProjectionInputV1`, workflow origin, and the existing lifecycle intent witness hash/domain.
+- Produces: `SessionCheckpointRecordedPayloadV3`, a Version 3 checkpoint member in `LifecycleEventV3`, `LifecycleRenderEventV1`, `LifecycleRenderClosureV1`, `readStrictLifecycleClosure(projectId, rootSessionId, throughPositionExclusive)`, and a queue-private prepared-handle owner for Q.2b/Q.4.
+
+```ts
+export interface SessionCheckpointRecordedPayloadV3 {
+  readonly checkpoint: CheckpointV1 | CheckpointV2;
+  readonly baseEventPosition: string;
+  readonly checkpointEventPosition: string;
+  readonly finalCheckpointBindingVersion: 1;
+  readonly workflowId: WorkflowId;
+  readonly workflowGeneration: number;
+}
+
+export interface LifecycleRenderEventV1 {
+  readonly projectId: ProjectId;
+  readonly vaultId: VaultId;
+  readonly storeId: StoreId;
+  readonly workspaceId: WorkspaceId;
+  readonly branchScopeId: BranchScopeId | null;
+  readonly branchRef: string | null;
+  readonly streamId: string;
+  readonly streamVersion: string;
+  readonly globalPosition: string;
+  readonly sessionId: SessionId;
+  readonly parentSessionId: SessionId | null;
+  readonly eventType: LifecycleEventType;
+  readonly eventSchemaVersion: number;
+  readonly occurredAt: string;
+  readonly payload: JsonValue;
+  readonly materializationOrigin: LifecycleMaterializationOriginV1 | null;
+  readonly legacyIntentSemantics: {
+    readonly effectiveState: SessionEndEffectiveStateV1;
+    readonly evidenceWindowAction: "unchanged" | "open" | "seal" | null;
+  } | null;
+}
+
+export type LifecycleRenderTriggerV1 = LifecycleRenderEventV1 & {
+  readonly materializationOrigin: LifecycleMaterializationOriginV1;
+};
+
+export interface LifecycleRenderClosureV1 {
+  readonly root: readonly LifecycleRenderEventV1[];
+  readonly directChildren: readonly Readonly<{
+    childSessionId: SessionId;
+    events: readonly LifecycleRenderEventV1[];
+  }>[];
+  readonly foreignClaims: readonly Readonly<{
+    fork: LifecycleRenderEventV1;
+    claim: LifecycleRenderEventV1;
+  }>[];
+}
+
+export interface LifecycleMaterializationPlanningReads {
+  readGlobalTailPosition(): bigint;
+  readStrictLifecycleClosure(
+    projectId: ProjectId,
+    rootSessionId: SessionId,
+    throughPositionExclusive: bigint,
+  ): LifecycleRenderClosureV1;
+  readVerifiedImmediatePredecessor(
+    projectId: ProjectId,
+    sessionId: SessionId,
+    artifactKind: "compatibility-session-log",
+    beforeRevision: bigint,
+  ): LifecycleOutboxPlannedRevision | null;
+}
+
+export class PreparedMaterializationHandleOwner {
+  create(pendingOutbox: PendingLifecycleOutboxV1): PreparedMaterializationQueueV1;
+  capturePlanned(
+    handle: PreparedMaterializationQueueV1,
+    event: StoredEvent,
+    validate: (event: StoredEvent) => void,
+  ): void;
+  consumeCommitted(
+    handle: PreparedMaterializationQueueV1,
+    event: StoredEvent,
+    validate: (event: StoredEvent) => void,
+  ): void;
+}
+```
+
+The planning-read interface is exported only from this internal module so the
+concrete queue can receive it; do not re-export it from a public semantic API.
+Both handle transition methods first enter a non-reentrant internal validating
+state, then run the validator inside the owner. On success they snapshot and
+advance; on throw they move the handle to terminal `failed` before rethrowing,
+so callers cannot forget a separate cleanup call.
+
+- [ ] **Step 1: Write the exact Version 3 marker codec RED**
+
+Add one valid nested-V1 marker and one valid nested-V2 marker. Mutate each of the six payload keys independently, add an extra key, use explicit null, move the event to a child stream, mismatch checkpoint/event positions/session, use a malformed workflow UUID, and use zero/unsafe workflow generation. An exact but foreign workflow ID/generation is codec-valid and is rejected later by aggregate/Q.1/SQL/integrity binding tests.
+
+```ts
+it("decodes only exact root-bound Version 3 final checkpoint markers", () => {
+  assert.equal(decodeLifecycleEventV3(finalMarker(1)).eventType, "SessionCheckpointRecorded");
+  assert.equal(decodeLifecycleEventV3(finalMarker(2)).eventType, "SessionCheckpointRecorded");
+  for (const hostile of hostileFinalMarkers()) {
+    expectCode("LIFECYCLE_INPUT_INVALID", () => decodeLifecycleEventV3(hostile));
+  }
+});
+```
+
+- [ ] **Step 2: Run the codec RED, add the exact type/decoder, and return GREEN**
+
+Run:
+
+```powershell
+npm run test:build
+node --test --test-concurrency=1 --test-reporter=spec --test-name-pattern="^decodes only exact root-bound Version 3 final checkpoint markers$" dist-test/tests/lifecycle-contracts.test.js
+```
+
+Expected RED: `SessionCheckpointRecorded` is outside `LIFECYCLE_EVENT_TYPES_V3` or the valid marker is rejected. Add the new union member, exact `decodePayloadV3` branch, nested checkpoint-version dispatch, root/session/position correlations, and deep freeze. Do not change outer Version 1/2 decoders.
+
+- [ ] **Step 3: Write aggregate and authority-reader RED cases**
+
+Require a valid marker only on an ending root whose current workflow ID/generation matches. Require `requireCheckpointAtEventPosition`, authority `loadEvents`, and `latestCheckpoint` to accept nested V1/V2 inside outer V3 while retaining exact outer Version 1/2 reads and selecting by the nested checkpoint's fingerprint domain. Widen the authority return type to `LifecycleEventCodecResult` and update child-workflow type guards so current child operations still admit only their exact historical event variants. After codec GREEN, retain the existing projection-classifier cases as characterization regressions; do not claim them as behavioral RED because classification by event type is already correct.
+
+```ts
+it("binds a Version 3 final marker to the current ending workflow", () => {
+  const ending = foldSession([started(), requestedV3(WORKFLOW_ID, 1)]);
+  assert.doesNotThrow(() => evolveSession(ending, finalMarkerEvent(WORKFLOW_ID, 1)));
+  expectLifecycleCode(
+    "INTEGRITY_FAILURE",
+    () => evolveSession(ending, finalMarkerEvent(WORKFLOW_ID, 2)),
+  );
+});
+```
+
+- [ ] **Step 4: Run the replay REDs, implement the allowlists/bindings, and return GREEN**
+
+Run:
+
+```powershell
+npm run test:build
+node --test --test-concurrency=1 --test-reporter=spec --test-name-pattern="^(binds a Version 3 final marker to the current ending workflow|reads outer Version 3 final checkpoints with nested Version 1 or Version 2 bodies|selects the latest outer Version 3 checkpoint by its nested checkpoint domain)$" dist-test/tests/session-aggregate.test.js dist-test/tests/session-authority.repository.test.js
+```
+
+Expected RED: the aggregate allowlist rejects the event and the authority reader uses `decodeLegacyLifecycleEvent`/three-key payload assumptions. Extend only the current Version 3 allowlist; use `decodeLifecycleEvent`, dispatch the nested checkpoint by `checkpointVersion`, and require exact marker workflow binding without changing schema-2/schema-3 legacy preflight behavior.
+
+- [ ] **Step 5: Write migration-0004/index RED cases**
+
+Apply current schema, insert one production-decodable authenticated marker/outbox control with each nested checkpoint version, then independently corrupt payload keys, SQL nulls, canonical root stream/parent, source workspace, command index, internal action/intent, workflow phase/generation, sealed evidence window, existing frozen checkpoint, base/global/checkpoint correlation, outbox schema, and origin binding. Exercise both workflow-evidence INSERT and UPDATE paths so neither can freeze an outer Version 1/2 checkpoint. Add a positive generation-G2 row reached by Version 3 `unchanged` that preserves a marker created at G1, plus a negative that rewrites any frozen pointer/bytes during that carry; the guard binds marker payload generation to `evidence_frozen_generation` (G1), not the current workflow generation (G2). Assert the direct-child and claim event indexes exist and `EXPLAIN QUERY PLAN` selects them for exact lookups. Before applying 0004, seed each direction of schema-3 ticket/claim pointer drift, fork/authority drift, and an active frozen pointer or checkpoint-origin lifecycle row that treats outer Version 1/2 as final; require preflight to reject each with zero migration writes while ordinary Version 1/2 checkpoint history remains upgradeable. As the positive identity control, upgrade an otherwise-valid schema-3 foreign fork/claim pair whose claimant workspace/branch differs from the source but whose project/vault/store and internal pair relation are exact. Reassert frozen 0002/0003 hashes.
+
+```ts
+it("admits only authenticated Version 3 final markers at schema 4", () => {
+  const store = schema4Store();
+  assert.doesNotThrow(() => insertAuthenticatedFinalMarker(store));
+  for (const mutation of FINAL_MARKER_SQL_MUTATIONS) {
+    assert.throws(() => insertMutatedFinalMarker(schema4Store(), mutation));
+  }
+});
+
+it("indexes direct-child forks and transfer claims as immutable event witnesses", () => {
+  const indexes = migrationIndexes(sessionEndEffectiveStateMigration);
+  assert(indexes.has("events_lifecycle_direct_child_v4"));
+  assert(indexes.has("events_lifecycle_transfer_claim_v4"));
+});
+```
+
+- [ ] **Step 6: Run the migration REDs, change only 0004, and return GREEN**
+
+Run:
+
+```powershell
+npm run test:build
+node --test --test-concurrency=1 --test-reporter=spec --test-name-pattern="^(rejects schema-3 ticket claim pointer drift before schema 4|rejects schema-3 fork authority drift before schema 4|rejects schema-3 legacy final pointers before schema 4|upgrades an authenticated cross-workspace foreign claim pair|admits only authenticated Version 3 final markers at schema 4|requires Version 3 markers in both workflow evidence guards|preserves an earlier Version 3 marker through unchanged workflow carry|rejects frozen marker rewrite during unchanged workflow carry|binds Version 3 checkpoint outbox origin directly to payload workflow identity|indexes direct-child forks and transfer claims as immutable event witnesses|applies migration 0004 and preserves frozen 0002 0003 hashes)$" dist-test/tests/session-end-effective-state-migration.test.js dist-test/tests/migration-registry.test.js
+```
+
+Expected RED: schema 4 rejects outer Version 3 checkpoints and the indexes are absent. Add null-total guards to 0004; drop and recreate both copied `workflow_instances_evidence_v3_insert_guard` and `workflow_instances_evidence_v3_update_guard` so a new or changed frozen group requires the exact marker; require checkpoint outbox outer Version 3 and direct payload/origin equality; and add:
+
+```sql
+CREATE INDEX events_lifecycle_direct_child_v4
+ON events(project_id, parent_session_id, global_position)
+WHERE stream_type = 'session'
+  AND event_type = 'SessionForked'
+  AND event_schema_version = 1;
+
+CREATE INDEX events_lifecycle_transfer_claim_v4
+ON events(project_id, json_extract(payload_json, '$.transferTicketId'), global_position)
+WHERE stream_type = 'session'
+  AND event_type = 'ChildWorkTransferClaimed'
+  AND event_schema_version = 1;
+```
+
+The claim command inserts fork/claim events before its ticket CAS. Therefore no event INSERT trigger may require the mutable ticket pointer to be set already. Add a ticket UPDATE guard that proves any null-to-claimed tuple against the already-inserted indexed fork/claim pair. Preflight proves fork/authority and ticket/claim equivalence in both directions before 0004, including orphan/duplicate/null-pointer negatives and exact fork-v1/claim-v2 command/index/causation linkage. Full integrity repeats the event-authoritative proof after upgrade. Do not reorder the command, edit migrations 0002/0003, or let schema-3 preflight admit Version 3.
+
+After the SQL and all mutation tests are GREEN, compute migration 0004's new
+checksum once and commit it as an independent literal assertion in
+`migration-registry.test.ts`; never derive the expected value from the migration
+object under test. This freezes the unreleased schema-4 contract from Q.2a
+forward while the source-file hashes for 0002/0003 remain unchanged.
+
+- [ ] **Step 7: Write queue-contract, frozen-workflow, and integrity RED cases**
+
+At Q.1 input, table the complete prospective trigger schema/payload/origin matrix: checkpoint/amend/cancel are current outer Version 3; verification failure/invalidation, workflow/direct abandonment, and ended retain their frozen outer versions; only direct abandonment accepts terminal-event origin. Promote the port's private artifact literal to the exported `COMPATIBILITY_SESSION_LOG_ARTIFACT_KIND` and reuse it throughout the port. Reuse a shared payload-only decoder; never duplicate event codecs or synthesize a fake event envelope. Checkpoint adds exact six-key payload, position/session/workspace correlations, and workflow-origin equality. Branch scope/ref is authenticated later from the closure; the Q.1 `context.branchScopeId` remains assertion-only. Rename the private read seam to `readStrictLifecycleClosure`. Add an executable prepared-handle owner with an owner-local `WeakMap`, full immutable planned-`StoredEvent` capture, fail-first validator wrappers, and exact prepared → planned → committed progression. The owner module contains the sole audited cast/factory that can construct the private branded handle; assert by source/API review that the concrete queue and every other module have no `as PreparedMaterializationQueueV1` construction site. In command-store/full replay, outer V1/V2 checkpoints never create final state; outer V3 does. An earlier marker may survive only a contiguous marker-preserving amendment chain; open/cancel/reopen clear it. Quick/full integrity must reject marker/payload/intent/workflow/outbox mismatches.
+
+```ts
+it("requires Version 3 final checkpoint triggers to match workflow origin", () => {
+  assert.doesNotThrow(() => decodeMaterializationProjectionInputV1(finalProjection(3)));
+  assert.throws(() => decodeMaterializationProjectionInputV1(finalProjection(2)));
+  assert.throws(() => decodeMaterializationProjectionInputV1(finalProjection(3, { foreignOrigin: true })));
+});
+
+it("owns and burns opaque prepared handles at runtime", () => {
+  const owner = new PreparedMaterializationHandleOwner();
+  const handle = owner.create(pendingLifecycle());
+  owner.capturePlanned(handle, plannedEvent(), () => undefined);
+  owner.consumeCommitted(handle, plannedEvent(), () => undefined);
+  assert.throws(() => owner.consumeCommitted(handle, plannedEvent(), () => undefined));
+});
+```
+
+- [ ] **Step 8: Run the invariant REDs, implement the smallest replay changes, and return GREEN**
+
+Run:
+
+```powershell
+npm run test:build
+node --test --test-concurrency=1 --test-reporter=spec --test-name-pattern="^(enforces the complete prospective trigger schema payload and origin matrix|requires Version 3 final checkpoint triggers to match workflow origin|owns and burns opaque prepared handles at runtime|uses one audited opaque handle construction site|burns handles when planned or committed validation throws|rejects forged foreign skipped reversed and reused handles|captures the complete planned StoredEvent before commit|treats only Version 3 checkpoint markers as frozen final state|carries an earlier final marker only through marker-preserving amendments|quick integrity binds the Version 3 final marker|full integrity binds the Version 3 final marker)$" dist-test/tests/lifecycle-materialization-queue.test.js dist-test/tests/lifecycle-command-store.test.js dist-test/tests/qualified-checkpoint-quick-integrity.test.js dist-test/tests/qualified-checkpoint-full-integrity.test.js
+```
+
+Expected RED: Q.1 accepts checkpoint schema 1/2 and replay infers finality from intent/position. Make marker presence event-version-driven. Preserve legacy amendment validation behavior; do not reinterpret outer Version 1/2 validation here.
+
+- [ ] **Step 9: Run the Q.2a consolidation gate and commit**
+
+```powershell
+npm run test:build
+node --test --test-concurrency=1 --test-reporter=spec dist-test/tests/lifecycle-contracts.test.js dist-test/tests/lifecycle-materialization-queue.test.js dist-test/tests/session-aggregate.test.js dist-test/tests/lifecycle-projection-folds.test.js dist-test/tests/session-authority.repository.test.js dist-test/tests/child-workflow.test.js dist-test/tests/lifecycle-command-store.test.js dist-test/tests/session-end-effective-state-migration.test.js dist-test/tests/migration-registry.test.js dist-test/tests/project-store-bootstrap.test.js dist-test/tests/project-store-upgrade.test.js dist-test/tests/project-store-upgrade-phase-runner.test.js dist-test/tests/qualified-checkpoint-quick-integrity.test.js dist-test/tests/qualified-checkpoint-full-integrity.test.js
+npm run typecheck
+git diff --check
+git diff --exit-code 72f4fce -- src/orchestrator/storage/migrations/0002-session-lifecycle.ts src/orchestrator/storage/migrations/0003-qualified-checkpoint-coverage.ts
+git add src/orchestrator/lifecycle/contracts/events.ts src/orchestrator/lifecycle/materialization-queue.port.ts src/orchestrator/lifecycle/session-aggregate.ts src/orchestrator/lifecycle/lifecycle-command.store.ts src/orchestrator/lifecycle/child-workflow.service.ts src/orchestrator/materialization/prepared-materialization-handle.ts src/orchestrator/storage/session-authority.repository.ts src/orchestrator/storage/session-end-effective-state-migration-preflight.ts src/orchestrator/storage/migrations/0004-session-end-effective-state.ts src/orchestrator/integrity/lifecycle-integrity.service.ts tests/lifecycle-contracts.test.ts tests/lifecycle-materialization-queue.test.ts tests/session-aggregate.test.ts tests/lifecycle-projection-folds.test.ts tests/lifecycle-command-store.test.ts tests/session-authority.repository.test.ts tests/session-end-effective-state-migration.test.ts tests/migration-registry.test.ts tests/qualified-checkpoint-quick-integrity.test.ts tests/qualified-checkpoint-full-integrity.test.ts
+git commit -m "feat: mark final workflow checkpoints explicitly"
+```
+
+### Task 14Q.2b: Implement semantic normalization, projection, and literal rendering
 
 **Files:**
 
 - Create: `src/orchestrator/materialization/vault-artifact-path.ts`
+- Create: `src/orchestrator/materialization/lifecycle-render-event.ts`
+- Create: `src/orchestrator/materialization/sqlite-lifecycle-render-closure.reader.ts`
+- Create: `src/orchestrator/materialization/compatibility-log.projection.ts`
 - Create: `src/orchestrator/materialization/compatibility-log.renderer.ts`
+- Create: `tests/support/compatibility-log-reference.ts`
+- Create: `tests/lifecycle-render-closure.reader.test.ts`
 - Create: `tests/compatibility-log-renderer.test.ts`
+- Create: `tests/fixtures/compatibility-log/.gitattributes`
 - Create: `tests/fixtures/compatibility-log/ending-v2.md`
 - Create: `tests/fixtures/compatibility-log/failed-v2.md`
 - Create: `tests/fixtures/compatibility-log/cancelled-v2.md`
@@ -778,29 +1056,211 @@ git commit -m "feat: freeze lifecycle materialization queue contracts"
 - Create: `tests/fixtures/compatibility-log/abandoned-v2.md`
 - Create: `tests/fixtures/compatibility-log/completed-v2.md`
 
-- [ ] **Step 1: Commit literal RED fixtures and independent expected projections**
+**Interfaces:**
 
-Write literal UTF-8/LF fixtures by hand from the normative grammar above. Cover both checkpoint versions across the fixture set, accepted child results, transferred/unresolved work, qualified adapter ordering, null/empty shapes, JSON escaping, the conditional ending marker, the canonical session stream, candidate position without an unavailable event hash, and all five validation projections with their carry/reset rules. The test reads literal bytes and must not generate its expected value through production helpers.
+- Consumes: Q.2a `LifecycleRenderClosureV1`, `LifecycleRenderEventV1`, strict committed `StoredEvent`, Q.1 projection input/origin, canonical JSON, and the frozen compatibility DTO grammar above.
+- Produces: canonical artifact target derivation, two strict trigger normalizers, one pure projection fold, and one fresh caller-owned UTF-8/LF render buffer for Q.4.
 
-- [ ] **Step 2: Run renderer/path RED anchors**
+```ts
+export interface CompatibilityLogTargetV1 {
+  readonly artifactPath: string;
+  readonly targetKey: string;
+  readonly materializationRevision: string;
+}
 
-```powershell
-npm run test:build
-node --test --test-concurrency=1 --test-reporter=spec --test-name-pattern="^(derives one canonical path and revision-bearing target|renders compatibility log golden bytes deterministically|binds source stream to the canonical root session and candidate position|folds every validation byte state with exact carry and reset semantics|renders committed prefix plus the exact candidate identically to committed replay|omits random ids clocks locale topics secrets and raw evidence)$" dist-test/tests/compatibility-log-renderer.test.js
+export interface CompatibilityLogProjectionInputV2 {
+  readonly closure: LifecycleRenderClosureV1;
+  readonly trigger: LifecycleRenderTriggerV1;
+  readonly target: CompatibilityLogTargetV1;
+}
+
+export interface AuthenticatedLifecycleCommandV1 {
+  readonly commandHash: string;
+  readonly lifecycleAuthorizationKind: LifecycleIntentAuthorizationKind | null;
+  readonly intentWitnessJson: string | null;
+  readonly witnessEventId: string | null;
+}
+
+export interface AuthenticatedStoredLifecycleEventV1 {
+  readonly event: StoredEvent;
+  readonly command: AuthenticatedLifecycleCommandV1;
+}
+
+export function deriveCompatibilityLogTarget(
+  startedAt: string,
+  sessionId: SessionId,
+  triggeringEventPosition: bigint,
+): CompatibilityLogTargetV1;
+
+export function normalizeCandidateLifecycleRenderEvent(
+  input: MaterializationProjectionInputV1,
+  closure: LifecycleRenderClosureV1,
+): LifecycleRenderTriggerV1;
+
+export function normalizeCommittedLifecycleRenderEvent(
+  input: AuthenticatedStoredLifecycleEventV1,
+): LifecycleRenderTriggerV1;
+
+export function normalizeCommittedLifecycleClosureEvent(
+  input: AuthenticatedStoredLifecycleEventV1,
+): LifecycleRenderEventV1;
+
+export class SqliteLifecycleRenderClosureReader {
+  constructor(connection: SqliteConnection);
+  readStrictLifecycleClosure(
+    projectId: ProjectId,
+    rootSessionId: SessionId,
+    throughPositionExclusive: bigint,
+  ): LifecycleRenderClosureV1;
+}
+
+export function projectCompatibilityLogV2(
+  input: CompatibilityLogProjectionInputV2,
+): CompatibilityLogProjectionV2;
+
+export function renderCompatibilityLogV2(
+  projection: CompatibilityLogProjectionV2,
+): Buffer;
 ```
 
-- [ ] **Step 3: Implement pure projection and rendering**
+- [ ] **Step 1: Add literal fixtures, the independent oracle, and typed throwing scaffolds**
 
-Derive `05_Agent_Session_Logs/{yyyy-mm-dd}-session-{sessionId}.md` only from the first committed `SessionStarted` UTC date. Validate the lowercase session UUID and contained relative path. Fold only the strict ordered committed prefix plus optional exact candidate, reject gaps/foreign sessions/future positions, build the narrow projection, render the fixed section grammar with canonical JSON, and zero transient byte buffers after the caller fingerprints them. No filesystem access belongs in the renderer.
+Put `*.md text eol=lf` in the scoped `.gitattributes`. Copy `ending-v2.md` byte-for-byte from this plan. Before importing or implementing any production renderer code, hand-author all six exact structural projections and an independent canonical/reference renderer in `tests/support/compatibility-log-reference.ts`. That helper imports only Node primitives, declares its own local structural types, and must not import production DTOs, fixtures, canonical JSON, sort, checkpoint-fingerprint, projector, or renderer code.
 
-- [ ] **Step 4: Run 14Q.2 GREEN and commit**
+```ts
+export interface CompatibilityLogReferenceCase {
+  readonly fixtureName:
+    | "ending-v2.md"
+    | "failed-v2.md"
+    | "cancelled-v2.md"
+    | "invalidated-v2.md"
+    | "abandoned-v2.md"
+    | "completed-v2.md";
+  readonly projection: Readonly<Record<string, unknown>>;
+  readonly literalUtf8: string;
+  readonly byteLength: number;
+  readonly sha256: string;
+}
+
+export function compatibilityLogReferenceCases():
+  readonly CompatibilityLogReferenceCase[];
+```
+
+The six hand-authored cases are exhaustive and fixed before production GREEN:
+
+| Fixture | Trigger | Frozen/final state | Validation |
+|---|---|---|---|
+| `ending-v2.md` | Version 3 `SessionEndAmended` at position 7 | live, no marker, one carry ticket; use the already reviewed literal/hash above | empty `not-run` |
+| `failed-v2.md` | Version 1 `SessionEndVerificationFailed` | Version 3 marker with nested Checkpoint V1, one accepted and one rejected/deferred child item | one exact retained result, `failed` |
+| `cancelled-v2.md` | Version 3 `SessionEndCancelled` | marker cleared; live ticket/item state at cancellation | reset empty `not-run` |
+| `invalidated-v2.md` | Version 1 `SessionEndVerificationInvalidated` | Version 3 marker with nested Checkpoint V2 qualified coverage and frozen child/ticket bytes | retain the exact named passed result, null score, conflict code |
+| `abandoned-v2.md` | Version 1 direct-origin `SessionAbandoned` | live child/ticket projection, null workflow and final checkpoint | whole validation object is null |
+| `completed-v2.md` | Version 1 `SessionEnded` | preserve the same nested-V2 marker/frozen projection | preserve the exact named passed result and score |
+
+Every projection record spells every field literally; no object is produced by spreading a production/test fixture. The local reference renderer yields `literalUtf8`; copy those bytes into the five new Markdown fixtures, then calculate each byte length/SHA-256 once with Node primitives and paste both as hard-coded literals back into the reference cases. The test first asserts the reviewed ending case remains exactly 1729 bytes/`9c8c...72ce`, then asserts every hard-coded digest against the committed file. It must not calculate the expected digest from the file during the assertion. Do not add production throwing scaffolds until the six literal files and six literal digest records are complete and reviewed in the diff.
+
+Load the source directory from compiled tests with:
+
+```ts
+const FIXTURE_ROOT = new URL(
+  "../../tests/fixtures/compatibility-log/",
+  import.meta.url,
+);
+```
+
+Add only typed production exports that throw `new LifecycleError("INTEGRITY_FAILURE")` so `npm run test:build` succeeds before accepting a behavioral RED. The first behavioral RED compares those throwing exports to the already-frozen independent cases; do not revise reference objects, fixture bytes, lengths, or hashes to make production GREEN.
+
+- [ ] **Step 2: Write and run path/normalization RED cases**
+
+```ts
+it("normalizes candidate and committed triggers without fabricating storage fields", () => {
+  const candidate = normalizeCandidateLifecycleRenderEvent(projectionInput(), closure());
+  const committed = normalizeCommittedLifecycleRenderEvent(authenticatedCommittedTrigger());
+  assert.deepEqual(candidate, committed);
+  assert.equal("eventId" in candidate, false);
+  assert.equal("eventHash" in candidate, false);
+});
+```
+
+Run:
 
 ```powershell
 npm run test:build
-node --test --test-concurrency=1 --test-reporter=spec dist-test/tests/compatibility-log-renderer.test.js
+node --test --test-concurrency=1 --test-reporter=spec --test-name-pattern="^(derives one canonical path and revision-bearing target|normalizes candidate and committed triggers without fabricating storage fields|accepts global gaps and rejects incomplete lifecycle closure|authenticates an exact cross-workspace foreign fork claim pair|authenticates a multi-event command from its event-zero intent witness|rejects every malformed foreign fork claim pair|discovers post-cutoff claims for pointer proof but excludes them from the closure|derives candidate branch scope from the authenticated root closure|derives legacy effective state before stripping the intent witness|rejects unauthenticated legacy intent semantics before reduction)$" dist-test/tests/lifecycle-render-closure.reader.test.js dist-test/tests/compatibility-log-renderer.test.js
+```
+
+In the reader test, make `authenticates an exact cross-workspace foreign fork
+claim pair` and `rejects every malformed foreign fork claim pair` operate on raw
+authenticated `StoredEvent` rows before reduction. The positive pair matches
+the source on project/vault/store while retaining one internally consistent
+foreign workspace/branch. Independently mutate stream versions, command
+indexes, command/idempotency identity, consecutive global positions,
+fork/claim causation, source transfer event ID/position, ticket/source child,
+context, and strict intent relation. Prove the reader queries each source ticket
+through the expression index even when its mutable claim pointer is null, and
+that it discovers every direct child from the immutable fork index rather than
+trusting the authority table. Add a later legitimate claim whose mutable pointer
+is already non-null but whose fork/claim positions are at or after the render
+cutoff: the reader discovers and authenticates it for two-way pointer proof,
+then excludes it from the returned semantic closure so the earlier marker still
+freezes the ticket as unresolved.
+
+Expected RED: throwing scaffolds return `INTEGRITY_FAILURE`. Implement path containment/lowercase UUID/canonical date, full committed envelope/hash/witness validation before reduction, root-derived candidate branch scope, exact next root stream version, global numeric ordering, per-stream continuity, and the complete raw foreign-pair relation above. The reader groups events by exact command/idempotency identity and joins the command to its dedup row. For an authorized command, require exactly its command-event-index-zero event to carry the strict witness, prove `commandHash === lifecycleIntentHashFromWitnessSource(indexZero.lifecycleIntentJson)` once, and require later command events to carry null witness while sharing the authenticated command context. Thus the fork authenticates the index-one claim; the claim is not required to duplicate the witness. Legacy request/amend semantics may be derived only from this authenticated event-zero witness. Missing, duplicate, generic-domain, or mismatched witness/command linkage fails. Only after the command-level proof may `normalizeCommittedLifecycleClosureEvent` strip storage/command/intent fields. Global-position gaps remain valid; unrelated foreign streams and incomplete child/root prefixes fail closed.
+
+- [ ] **Step 3: Write per-report and live/frozen child-ticket epoch RED cases**
+
+Cover multiple reports in one child, accepted/partial/rejected/superseded dispositions, exact partition and supersession positions, live pre-marker claims, marker-time freeze, post-marker child events/claims, unchanged carry to a later generation, open/cancel clear, seal-live state, and refreeze. Use checkpoint summaries for nonterminal heads and terminal events for completed/transferred heads. Independently reject a missing/extra/wrong nonterminal checkpoint summary or named head, an omitted child without exactly one completed/transferred terminal head, a terminal head at/after checkpoint base, and any report/disposition consumed after the selected frozen head. Table marker-epoch dispatch separately from validation: outer Version 1 implicit `unchanged` and outer Version 2/3 explicit `unchanged` preserve; Version 2/3 `open`, cancellation, and reopen clear; `seal` stays live after that clear. Direct abandonment uses live children/tickets with null final/validation, while failure/pass/invalidation/workflow abandonment/end preserve the entire frozen child/ticket/checkpoint projection.
+
+```ts
+it("freezes every child and ticket byte at the Version 3 marker", () => {
+  const atMarker = projectCompatibilityLogV2(markerHistory());
+  const afterClaim = projectCompatibilityLogV2(postMarkerClaimHistory());
+  assert.deepEqual(afterClaim.acceptedChildren, atMarker.acceptedChildren);
+  assert.deepEqual(afterClaim.unresolvedFollowUps, atMarker.unresolvedFollowUps);
+  assert.deepEqual(afterClaim.finalCheckpoint, atMarker.finalCheckpoint);
+});
+```
+
+- [ ] **Step 4: Run the child/ticket REDs, implement the fold, and return GREEN**
+
+```powershell
+npm run test:build
+node --test --test-concurrency=1 --test-reporter=spec --test-name-pattern="^(folds every child disposition independently per report|enforces exact supersession event ordering|excludes claims committed before the live cutoff|freezes every child and ticket byte at the Version 3 marker|rejects checkpoint child summary and frozen head drift|rejects terminal child heads outside the marker base|ignores every report and disposition after the frozen head|dispatches the frozen marker epoch by outer amendment schema|preserves the frozen epoch through every preserving trigger|clears frozen child and ticket state on open cancel and reopen|keeps seal live until a replacement marker|renders direct abandonment from live scope with null final state)$" dist-test/tests/compatibility-log-renderer.test.js
+```
+
+Expected RED: projection scaffolds throw or drift after the post-marker claim. Implement first an event-time live projection, then an explicit marker epoch that captures the exact per-child heads and unresolved ticket set. Never read mutable workflow/ticket state as semantic authority.
+
+- [ ] **Step 5: Write and run schema-aware validation RED cases**
+
+Table outer V1 reset, outer V2 `unchanged`/`seal` reset, outer V3 `open` reset, outer V3 `seal`/`unchanged` carry, command-V1-inside-outer-V3 carry, cancel/reopen reset, accumulating not-run results, pass, fail, invalidation, workflow/direct abandonment, and ended named-pass preservation. Require the Version 3 marker to precede every result/verdict in the finalized generation. Reject unsorted/duplicate/missing/extra IDs, wrong lineage/checkpoint/generation, old result resurrection, result-after-verdict, validation-before-marker, and wrong invalidation/end position.
+
+```powershell
+npm run test:build
+node --test --test-concurrency=1 --test-reporter=spec --test-name-pattern="^(resets validation on every outer Version 1 or Version 2 amendment|carries validation only through Version 3 preserving amendments|rejects validation that precedes the final marker|rejects old validation results after an epoch reset|renders not-run passed failed invalidated and null validation exactly|requires invalidation and end to name the in-force passed event)$" dist-test/tests/compatibility-log-renderer.test.js
+```
+
+Expected RED: no validation fold exists. Implement an independent epoch state; do not call `foldSession` or use workflow/runner rows as the expected oracle.
+
+- [ ] **Step 6: Write and run the literal-byte, parity, and ownership RED cases**
+
+For all six fixtures, compare exact bytes, independent projection, SHA-256, absence of CR/BOM, and one terminal LF. Cover both nested checkpoint versions, qualified adapter ordering, JSON escaping, null/empty shapes, conditional ending marker, omissions, and fresh detached buffers. Candidate and committed replay must match bytes/payload hash. Fingerprint equality is tested only under one fixed algorithm/schema/key-ID/domain/key tuple; Q.3/Q.4 preserve and carry rotated tuples while Q.6 performs historical-key verification, so rotation never changes document bytes. Every direct renderer test wraps the returned caller-owned buffer in `try/finally { bytes.fill(0); }`.
+
+```powershell
+npm run test:build
+node --test --test-concurrency=1 --test-reporter=spec --test-name-pattern="^(renders all six compatibility log literals byte for byte|renders candidate and committed replay identically|returns fresh caller-owned buffers detached from projection input|omits random ids clocks locale topics secrets commands and raw evidence)$" dist-test/tests/compatibility-log-renderer.test.js
+```
+
+Expected RED: render scaffolds throw or fixture bytes differ. Render exactly the frozen section order with compact `canonicalJson`, LF separators, and one terminal LF. Return a new `Buffer` and retain no reference; Q.4 owns `fill(0)` after hashing.
+
+- [ ] **Step 7: Run the Q.2b consolidation gate and commit**
+
+```powershell
+npm run test:build
+node --test --test-concurrency=1 --test-reporter=spec dist-test/tests/lifecycle-render-closure.reader.test.js dist-test/tests/compatibility-log-renderer.test.js dist-test/tests/lifecycle-contracts.test.js dist-test/tests/lifecycle-materialization-queue.test.js
 npm run typecheck
-git add src/orchestrator/materialization/vault-artifact-path.ts src/orchestrator/materialization/compatibility-log.renderer.ts tests/compatibility-log-renderer.test.ts tests/fixtures/compatibility-log/ending-v2.md tests/fixtures/compatibility-log/failed-v2.md tests/fixtures/compatibility-log/cancelled-v2.md tests/fixtures/compatibility-log/invalidated-v2.md tests/fixtures/compatibility-log/abandoned-v2.md tests/fixtures/compatibility-log/completed-v2.md
-git commit -m "feat: render deterministic compatibility session logs"
+git diff --check
+git add src/orchestrator/materialization/vault-artifact-path.ts src/orchestrator/materialization/lifecycle-render-event.ts src/orchestrator/materialization/sqlite-lifecycle-render-closure.reader.ts src/orchestrator/materialization/compatibility-log.projection.ts src/orchestrator/materialization/compatibility-log.renderer.ts tests/support/compatibility-log-reference.ts tests/lifecycle-render-closure.reader.test.ts tests/compatibility-log-renderer.test.ts tests/fixtures/compatibility-log/.gitattributes tests/fixtures/compatibility-log/ending-v2.md tests/fixtures/compatibility-log/failed-v2.md tests/fixtures/compatibility-log/cancelled-v2.md tests/fixtures/compatibility-log/invalidated-v2.md tests/fixtures/compatibility-log/abandoned-v2.md tests/fixtures/compatibility-log/completed-v2.md
+git commit -m "feat: render event-authoritative compatibility logs"
 ```
 
 ### Task 14Q.3: Persist and read exact immutable lifecycle outbox plans
@@ -811,15 +1271,28 @@ git commit -m "feat: render deterministic compatibility session logs"
 - Create: `tests/lifecycle-outbox.repository.test.ts`
 - Modify: `src/orchestrator/storage/lifecycle-storage.types.ts`
 
+**Interfaces:**
+
+- Consumes: Q.1 exact pending payload/origin codecs, Q.2a Version 3 marker contract, Q.2b canonical path/target derivation, actual committed `StoredEvent`, and stored keyed fingerprint tuples.
+- Produces: the exact `insertLifecycle`, `getExactPlannedRevision`, and `assertExactPlannedRevision` methods consumed by Q.4-Q.6 and S.3.
+
 - [ ] **Step 1: Write repository RED tests**
 
-Test no predecessor, immediate lower revision across every operational status, gaps, key rotation, malformed tuples, canonical path drift, foreign trigger, wrong content hash, wrong origin, non-immediate predecessor, and strict absence versus corruption. Separately table pending, claimed, completed, and failed as the status of the exact queried row: `getExactPlannedRevision`/`assertExactPlannedRevision` return identical immutable plan data for all four without rerender/refingerprint. The predecessor lookup key is exactly `(project_id, session_id, artifact_kind)` and never includes path.
+Test no predecessor, immediate lower revision across every operational status, gaps, key rotation, malformed tuples, canonical path drift, foreign trigger, wrong content hash, wrong origin, non-immediate predecessor, and strict absence versus corruption. A checkpoint trigger is legal only when the actual event is outer Version 3 and payload workflow ID/generation equal the workflow origin; outer Version 1/2 checkpoints are rejected even when otherwise authentic. Separately table pending, claimed, completed, and failed as the status of the exact queried row: `getExactPlannedRevision`/`assertExactPlannedRevision` return identical immutable plan data for all four without rerender/refingerprint. The predecessor lookup key is exactly `(project_id, session_id, artifact_kind)` and never includes path. After key rotation, repository reads preserve the complete stored predecessor/current tuples byte-for-byte; cryptographic re-verification belongs to Q.6 full replay because this storage-only layer does not have the historical render bytes.
+
+```ts
+it("requires a Version 3 checkpoint and direct workflow-origin binding", () => {
+  assert.doesNotThrow(() => repository.insertLifecycle(db, pendingFinal(), finalMarkerV3(), NOW));
+  assert.throws(() => repository.insertLifecycle(db, pendingFinal(), ordinaryCheckpointV2(), NOW));
+  assert.throws(() => repository.insertLifecycle(db, foreignOriginFinal(), finalMarkerV3(), NOW));
+});
+```
 
 - [ ] **Step 2: Run repository RED anchors**
 
 ```powershell
 npm run test:build
-node --test --test-concurrency=1 --test-reporter=spec --test-name-pattern="^(derives prior fingerprint from the immediate lower revision regardless of status|uses null prior only when no lower revision exists|rejects a lower revision on a foreign canonical path|returns the exact planned revision in every operational status|returns only an exact strictly bound planned revision|rejects malformed rows instead of reporting absence)$" dist-test/tests/lifecycle-outbox.repository.test.js
+node --test --test-concurrency=1 --test-reporter=spec --test-name-pattern="^(requires a Version 3 checkpoint and direct workflow-origin binding|recomputes lifecycle content hash before insert and read|derives prior fingerprint from the immediate lower revision regardless of status|uses null prior only when no lower revision exists|rejects a lower revision on a foreign canonical path|preserves historical key tuples without replacing them after rotation|returns the exact planned revision in every operational status|returns only an exact strictly bound planned revision|rejects malformed rows instead of reporting absence)$" dist-test/tests/lifecycle-outbox.repository.test.js
 ```
 
 - [ ] **Step 3: Implement storage-only insert/read seams**
@@ -843,13 +1316,13 @@ export class LifecycleOutboxRepository {
 }
 ```
 
-Insert only after the event row exists. Revalidate the payload against the actual event, derive the original-session path independently, select and fully verify the immediate predecessor inside the same `BEGIN IMMEDIATE`, copy its complete keyed fingerprint tuple, and write the immutable row. Return null only for true absence.
+Insert only after the event row exists. Strict-decode and recompute `outboxHash(payload)`, revalidate the complete trigger/origin matrix against the actual event, and apply the checkpoint-specific outer-Version-3/direct-payload-origin rule. Derive the original-session path independently, select and structurally/cross-row verify the immediate predecessor inside the same `BEGIN IMMEDIATE`, and copy its complete stored algorithm/schema/key-ID/domain/value tuple. Historical reads preserve that tuple and never mint a replacement with the current provider key; Q.6 full replay performs cryptographic verification against historical render bytes. Return null only for true absence; malformed or cross-bound rows are `INTEGRITY_FAILURE`.
 
 - [ ] **Step 4: Run 14Q.3 GREEN and commit**
 
 ```powershell
 npm run test:build
-node --test --test-concurrency=1 --test-reporter=spec dist-test/tests/lifecycle-outbox.repository.test.js dist-test/tests/session-lifecycle-migration.test.js
+node --test --test-concurrency=1 --test-reporter=spec dist-test/tests/lifecycle-outbox.repository.test.js dist-test/tests/session-lifecycle-migration.test.js dist-test/tests/compatibility-log-renderer.test.js
 npm run typecheck
 git add src/orchestrator/storage/lifecycle-outbox.repository.ts src/orchestrator/storage/lifecycle-storage.types.ts tests/lifecycle-outbox.repository.test.ts
 git commit -m "feat: persist immutable lifecycle materialization plans"
@@ -859,29 +1332,48 @@ git commit -m "feat: persist immutable lifecycle materialization plans"
 
 **Files:**
 
+- Create: `src/orchestrator/materialization/sqlite-lifecycle-materialization-planning-reads.ts`
 - Create: `src/orchestrator/materialization/sqlite-lifecycle-materialization-queue.ts`
 - Modify: `tests/lifecycle-materialization-queue.test.ts`
 
+**Interfaces:**
+
+- Consumes: Q.2a planning-read contract and prepared-handle owner, Q.2b `SqliteLifecycleRenderClosureReader` plus target/normalizer/projector/renderer, Q.3 immutable plan reader, and the existing provider-keyed fingerprint service.
+- Produces: the concrete `LifecycleMaterializationQueuePort` used by semantic transactions in R/S, without exposing raw reads or mutable workflow operations.
+
 - [ ] **Step 1: Write branded-state and zeroization RED tests**
 
-Inject read/renderer/key-provider spies. Prove the queue receives only tail/prefix/predecessor reads, checks the exact next global position, renders once, fingerprints once, zeroizes bytes even on failure, returns a deeply frozen instance-owned plan, rejects foreign/reused plans, and asserts planned/committed events without rerendering.
+Inject read/renderer/key-provider spies. Prove the queue receives only indexed tail/strict-closure/immediate-predecessor reads, never scans unrelated project history, checks the exact next global position, derives candidate branch scope from the authenticated root closure, renders once, fingerprints once, and zeroizes the caller-owned buffer in `finally` after every key/hash/fingerprint/predecessor success or failure once rendering has returned it. A renderer throw returns no buffer to the queue and must not expose a handle or cached state. The queue constructs one private handle owner per instance, returns a deeply frozen instance-owned plan, burns failed post-prepare validations, rejects handles from another queue plus reused/out-of-order handles, captures the complete actual planned `StoredEvent`, and asserts the committed event/row without rerendering. Mutate every captured field family independently: event/command/correlation/causation/idempotency IDs, actor/agent/client, branch/source envelope, stream/global positions, semantic and recorded times, payload object/JSON/hash, previous/event hashes, visibility/confidence/verification, refs/digests, and lifecycle authorization/intent witness.
+
+```ts
+it("zeroizes returned render bytes on every later planning failure", () => {
+  for (const fault of POST_RENDER_PLANNING_FAULTS) {
+    const bytes = Buffer.from("secret render bytes", "utf8");
+    const harness = queueHarness({ fault, renderedBytes: bytes });
+    assert.throws(() => harness.queue.prepare(harness.input));
+    assert(bytes.every((value) => value === 0));
+  }
+});
+```
 
 - [ ] **Step 2: Run RED, implement, and rerun GREEN**
 
 ```powershell
 npm run test:build
-node --test --test-concurrency=1 --test-reporter=spec --test-name-pattern="^(plans one provider-keyed fingerprint and zeroizes render bytes|requires the transaction next global position|accepts its opaque prepared plan exactly once|asserts planned and committed triggers without rerendering)$" dist-test/tests/lifecycle-materialization-queue.test.js
+node --test --test-concurrency=1 --test-reporter=spec --test-name-pattern="^(plans one provider-keyed fingerprint from an authenticated lifecycle closure|uses indexed closure reads without scanning unrelated project history|derives candidate branch scope from the root closure|requires the transaction next global position|returns no handle when rendering fails|zeroizes returned render bytes on every later planning failure|accepts its opaque prepared plan exactly once|rejects a handle created by another queue instance|captures every planned StoredEvent field before commit|asserts planned intent action and complete envelope before insert|asserts committed trigger and exact row without rerendering|carries historical predecessor tuples without reminting after rotation)$" dist-test/tests/lifecycle-materialization-queue.test.js
 ```
 
-Use a private `WeakMap` state machine (`prepared -> planned -> committed`) and instance token. The constructor accepts only `LifecycleMaterializationPlanningReads`, the provider-keyed fingerprint service, path deriver, renderer, and immutable plan reader; it never receives `LifecycleCommandTransaction` or mutable workflow/authority capabilities.
+Expected RED: the concrete queue does not exist. Implement `SqliteLifecycleMaterializationPlanningReads` as the narrow connection-bound composition of exact global tail, Q.2b strict closure reader, and Q.3 immediate-predecessor reader; it exposes no general query capability. Implement `prepare` as Q.1 decode/correlation → exact tail → strict exclusive closure → semantic candidate → target/projection/render → predecessor → keyed fingerprint, with the render buffer owned by one `try/finally { bytes.fill(0); }`. `prepare` validates only facts available from Q.1 input and closure. `assertPlanned` receives the actual planned event and passes the exact authoritative-intent/action/command/branch/full-envelope validation closure into `owner.capturePlanned`; the owner enters a non-reentrant validating state, captures/advances on success, and moves to terminal failed before rethrowing on error. `assertCommitted` likewise delegates exact stored-event/row comparison to `owner.consumeCommitted`, never rerenders/refingerprints/inserts, and consumes only on success. Every thrown validator terminally burns the handle.
+
+The constructor accepts only `LifecycleMaterializationPlanningReads`, the provider-keyed fingerprint service, target deriver, projector/renderer, and immutable plan reader; it privately constructs its own `PreparedMaterializationHandleOwner` and never shares it or receives `LifecycleCommandTransaction`/mutable workflow/authority capabilities.
 
 - [ ] **Step 3: Commit 14Q.4**
 
 ```powershell
 npm run test:build
-node --test --test-concurrency=1 --test-reporter=spec dist-test/tests/lifecycle-materialization-queue.test.js dist-test/tests/compatibility-log-renderer.test.js dist-test/tests/lifecycle-outbox.repository.test.js
+node --test --test-concurrency=1 --test-reporter=spec dist-test/tests/lifecycle-materialization-queue.test.js dist-test/tests/lifecycle-render-closure.reader.test.js dist-test/tests/compatibility-log-renderer.test.js dist-test/tests/lifecycle-outbox.repository.test.js
 npm run typecheck
-git add src/orchestrator/materialization/sqlite-lifecycle-materialization-queue.ts tests/lifecycle-materialization-queue.test.ts
+git add src/orchestrator/materialization/sqlite-lifecycle-materialization-planning-reads.ts src/orchestrator/materialization/sqlite-lifecycle-materialization-queue.ts tests/lifecycle-materialization-queue.test.ts
 git commit -m "feat: plan lifecycle materialization fingerprints"
 ```
 
@@ -892,26 +1384,31 @@ git commit -m "feat: plan lifecycle materialization fingerprints"
 - Modify: `src/orchestrator/storage/event-append-transaction.ts`
 - Modify: `tests/event-append-transaction.test.ts`
 
+**Interfaces:**
+
+- Consumes: the Q.1 strict pending-outbox union, Q.3 `LifecycleOutboxRepository.insertLifecycle`, and the actual `StoredEvent` created for pending `eventIndex: 0`.
+- Produces: one atomic event-plus-lifecycle-plan write path; it does not render, fingerprint, mutate prepared-handle state, or redefine the authoritative lifecycle command hash.
+
 - [ ] **Step 1: Write append-order/hash/rollback RED tests**
 
-Prove strict normalization preserves the full descriptor, the generic branch cannot insert the lifecycle kind, the actual event is inserted before the lifecycle row, an insertion failure rolls back event/outbox/projection/dedup, replay retains one target without reinsertion, and `command_dedup.command_hash` is still the supplied authoritative intent hash.
+Prove strict normalization preserves the complete lifecycle descriptor and its zero event index; the generic branch cannot insert the reserved lifecycle kind; the actual trigger row is visible before lifecycle insertion; the repository receives that exact committed identity rather than a fabricated event; and event/payload/origin/path/hash drift is rejected. Inject faults after the event insert and during lifecycle insertion and prove event/outbox/projection/dedup all roll back. Replay of the same command returns the original one-target result without rerendering or reinsertion. `command_dedup.command_hash` remains the supplied authoritative lifecycle-intent-witness hash and generic non-lifecycle commands keep their existing generic hash domain.
 
 - [ ] **Step 2: Run the exact RED anchors**
 
 ```powershell
 npm run test:build
-node --test --test-concurrency=1 --test-reporter=spec --test-name-pattern="^(preserves authoritative lifecycle command hash while recording the outbox target|inserts lifecycle outbox only after its actual event|rolls back event and lifecycle row when planning insertion fails|replay retains one ordered lifecycle target without reinsertion)$" dist-test/tests/event-append-transaction.test.js
+node --test --test-concurrency=1 --test-reporter=spec --test-name-pattern="^(preserves authoritative lifecycle command hash while recording the outbox target|keeps generic command hashing outside the lifecycle witness domain|never routes the reserved lifecycle kind through generic outbox insertion|inserts lifecycle outbox only after its exact actual event|rejects a lifecycle descriptor bound to a different actual event|rolls back event and lifecycle row when planning insertion fails|replay retains one ordered lifecycle target without reinsertion)$" dist-test/tests/event-append-transaction.test.js
 ```
 
 - [ ] **Step 3: Implement the strict append union**
 
-Give `SqliteEventAppendStatements` the connection-bound planning writer. `validateAppendCommand` retains the typed descriptor. `appendPlanned` dispatches `materialize-lifecycle-log` to `insertLifecycle(pending, actualStoredEvent, recordedAt)` and all other kinds to the existing generic insert. Do not add a lifecycle `afterAppend` side channel and do not hash the descriptor into the authoritative intent hash.
+Give `SqliteEventAppendStatements` the connection-bound lifecycle-plan writer. `validateAppendCommand` strict-decodes and retains the typed descriptor. In `appendPlanned`, build the exact stored identity once, insert its event row first, then dispatch `materialize-lifecycle-log` to `insertLifecycle(connection, pending, actualStoredEvent, recordedAt)`; route every other kind through the existing generic insertion. Let any writer error abort the surrounding transaction. Do not add a lifecycle `afterAppend` side channel, synthesize a second event object, rerender/refingerprint, or hash the descriptor into the authoritative intent hash. Q.4/S.3 own `assertPlanned` before this method and `assertCommitted` after the exact row exists.
 
 - [ ] **Step 4: Run 14Q.5 GREEN and commit**
 
 ```powershell
 npm run test:build
-node --test --test-concurrency=1 --test-reporter=spec dist-test/tests/event-append-transaction.test.js dist-test/tests/event-integrity.test.js dist-test/tests/lifecycle-command-store.test.js
+node --test --test-concurrency=1 --test-reporter=spec dist-test/tests/event-append-transaction.test.js dist-test/tests/lifecycle-outbox.repository.test.js dist-test/tests/event-integrity.test.js dist-test/tests/lifecycle-command-store.test.js
 npm run typecheck
 git add src/orchestrator/storage/event-append-transaction.ts tests/event-append-transaction.test.ts
 git commit -m "feat: append typed lifecycle materialization plans atomically"
@@ -928,36 +1425,53 @@ git commit -m "feat: append typed lifecycle materialization plans atomically"
 - Modify: `tests/lifecycle-operational-store.test.ts`
 - Modify: `tests/source-state.provider.test.ts`
 - Modify: `tests/event-integrity.test.ts`
+- Modify: `tests/lifecycle-outbox.repository.test.ts`
 - Modify: `tests/qualified-checkpoint-quick-integrity.test.ts`
 - Modify: `tests/qualified-checkpoint-full-integrity.test.ts`
 - Modify: `tests/session-end-effective-state-migration.test.ts`
 
-- [ ] **Step 1: Write capability/source/integrity RED tests**
+**Interfaces:**
 
-Require `WorkflowOperationalTransaction.outboxPlans` to expose only exact immutable get/assert. Prove claim/acknowledge are absent. Replace the stale `session-log` query literal with the shared `compatibility-session-log` constant and prove it is not retained as an alias. Table every allowed and forbidden trigger-origin pair at codec/queue, migration hostile-SQL, repository, quick-integrity, and full-integrity layers. At the codec/queue boundary independently reject a nonzero `MaterializationProjectionInputV1.triggeringEventIndex` and a nonzero pending descriptor `eventIndex`. At migration, repository, quick-integrity, and full-integrity boundaries require the referenced `events.command_event_index` to be zero. Strict payload decoding must reject invented keys, including `triggeringEventIndex`; that key is never added to the lifecycle payload union. Corrupt each payload/event/path/fingerprint predecessor binding independently. The matrix includes workflow-origin `SessionAbandoned` and direct terminal-event/null-workflow `SessionAbandoned`; no other terminal-event trigger is legal.
+- Consumes: Q.3 `LifecycleOutboxPlanReader`, the shared `compatibility-session-log` artifact kind, exact event/outbox rows, Q.2a marker/closure rules, and Q.2b committed replay/rendering.
+- Produces: a read-only workflow capability plus quick/full proofs that independently bind descriptor bytes, trigger identity, canonical path, immediate predecessor, provider-keyed fingerprint tuple, Version 3 marker, and event-authoritative child/claim closure.
 
-- [ ] **Step 2: Run RED anchors and implement exact read-only boundaries**
+- [ ] **Step 1: Write capability and source-state RED tests**
+
+Require `WorkflowOperationalTransaction.outboxPlans` to expose only exact immutable get/assert. Prove claim, lease, acknowledge, fail, retry, and generic outbox mutation are absent both structurally and at runtime. Replace the stale `session-log` query literal with the shared `compatibility-session-log` constant and prove the old string is not retained as an alias or query fallback.
+
+- [ ] **Step 2: Write the descriptor/hash/lineage integrity RED matrix**
+
+Reuse Q.2a's complete prospective trigger schema/payload/origin table at migration, repository, quick-integrity, and full-integrity layers. Independently reject nonzero pending `eventIndex` and referenced `events.command_event_index`, invented payload keys such as `triggeringEventIndex`, wrong event type/schema/position/payload hash, checkpoint outer Version 1/2, workflow/direct-abandonment origin confusion, foreign path, and wrong materialization revision. Start from an authenticated full control whose sync and async reports are exactly empty.
+
+Corrupt only `content_hash` to another valid lowercase 64-hex value and require `EventIntegrityService` to recompute `outboxHash(decodedPayload)` for the lifecycle-authoritative branch. Then corrupt descriptor fields coherently with their row columns and require the same mismatch. The authenticated test fixture may temporarily drop only the exact immutable outbox guards needed for corruption, but must reinstall their byte-identical current-schema SQL before the integrity call so schema fingerprinting remains clean; assert the control reports exactly zero sync and async issues before each independent mutation. Preserve the lifecycle witness-domain `command_dedup.command_hash`; prove the non-lifecycle branch still reconstructs generic `commandHash`.
+
+For lineage, cover null predecessor only at the first revision, every operational predecessor status, a missing/duplicate/non-immediate/foreign-path predecessor, stored algorithm/schema/key-ID/domain/value drift, historical-key verification after rotation, and a fabricated first-row predecessor. Quick integrity validates the exact local row/event/predecessor tuple through indexed reads. Full integrity additionally replays the authenticated closure through the committed trigger, renders fresh bytes, verifies the trigger payload hash and provider-keyed next fingerprint under the row's stored tuple, and zeroizes its buffer in `finally`. It treats only outer Version 3 as a final marker and proves fork/authority plus ticket/claim equivalence in both directions while accepting the approved cross-workspace foreign claimant pair.
+
+- [ ] **Step 3: Run RED anchors and implement exact read-only/integrity boundaries**
 
 ```powershell
 npm run test:build
-node --test --test-concurrency=1 --test-reporter=spec --test-name-pattern="^(exposes immutable outbox plans only to workflow operations|does not expose claim or acknowledgement to workflow operations|excludes compatibility log targets with the canonical artifact kind|does not retain session-log as a source-state alias|rejects every lifecycle trigger origin and index violation in schema 4|repository enforces the complete lifecycle trigger origin and index matrix|quick integrity enforces the complete lifecycle trigger origin and index matrix|full integrity enforces the complete lifecycle trigger origin and index matrix|integrity binds lifecycle payload content hash and triggering event|full integrity verifies immediate fingerprint lineage and canonical path|lifecycle descriptor integrity does not redefine command hash)$" dist-test/tests/session-end-effective-state-migration.test.js dist-test/tests/lifecycle-outbox.repository.test.js dist-test/tests/lifecycle-operational-store.test.js dist-test/tests/source-state.provider.test.js dist-test/tests/event-integrity.test.js dist-test/tests/qualified-checkpoint-quick-integrity.test.js dist-test/tests/qualified-checkpoint-full-integrity.test.js
+node --test --test-concurrency=1 --test-reporter=spec --test-name-pattern="^(exposes immutable outbox plans only to workflow operations|does not expose lifecycle plan mutation capabilities to workflow operations|excludes compatibility log targets with the canonical artifact kind|does not retain session-log as a source-state alias|rejects every lifecycle trigger origin and index violation in schema 4|repository enforces the complete lifecycle trigger origin and index matrix|quick integrity enforces the complete lifecycle trigger origin and index matrix|full integrity enforces the complete lifecycle trigger origin and index matrix|event integrity recomputes lifecycle outbox content hash|lifecycle descriptor integrity does not redefine command hash|generic descriptor integrity retains generic command hashing|quick integrity verifies immediate fingerprint lineage and canonical path|full integrity rerenders and verifies provider-keyed fingerprint lineage|full integrity accepts an authenticated cross-workspace claim closure|full integrity rejects fork authority and ticket claim drift)$" dist-test/tests/session-end-effective-state-migration.test.js dist-test/tests/lifecycle-outbox.repository.test.js dist-test/tests/lifecycle-operational-store.test.js dist-test/tests/source-state.provider.test.js dist-test/tests/event-integrity.test.js dist-test/tests/qualified-checkpoint-quick-integrity.test.js dist-test/tests/qualified-checkpoint-full-integrity.test.js
 ```
 
-- [ ] **Step 3: Run the complete 14Q gate**
+Implement the operational wrapper as a narrow `LifecycleOutboxPlanReader` delegation. Use the shared artifact-kind constant in source-state exclusion. In event integrity, strict-decode lifecycle payloads and compare `content_hash` with `outboxHash(payload)` before any branch-specific command reconstruction; lifecycle command hashes continue to use `lifecycleIntentHashFromWitnessSource`, while null-authorization/generic rows continue to use `commandHash`. In quick integrity, prove the exact V3 event/origin/index/path/predecessor tuple without project-wide replay. In full integrity, use Q.2a's strict closure and Q.2b's committed normalizer/projector/renderer, verify with the stored fingerprint algorithm/schema/key ID/domain and key material, and zero the render buffer on success and every failure. Mutable workflow, authority, and ticket rows are cross-checks/locators only, never renderer authority.
+
+- [ ] **Step 4: Run the complete 14Q gate**
 
 ```powershell
 npm run test:build
-node --test --test-concurrency=1 --test-reporter=spec dist-test/tests/lifecycle-materialization-queue.test.js dist-test/tests/lifecycle-outbox.repository.test.js dist-test/tests/compatibility-log-renderer.test.js dist-test/tests/event-append-transaction.test.js dist-test/tests/event-integrity.test.js dist-test/tests/lifecycle-operational-store.test.js dist-test/tests/source-state.provider.test.js dist-test/tests/lifecycle-command-store.test.js dist-test/tests/session-end-effective-state-migration.test.js dist-test/tests/qualified-checkpoint-quick-integrity.test.js dist-test/tests/qualified-checkpoint-full-integrity.test.js
+node --test --test-concurrency=1 --test-reporter=spec dist-test/tests/lifecycle-contracts.test.js dist-test/tests/lifecycle-materialization-queue.test.js dist-test/tests/lifecycle-render-closure.reader.test.js dist-test/tests/compatibility-log-renderer.test.js dist-test/tests/lifecycle-outbox.repository.test.js dist-test/tests/session-aggregate.test.js dist-test/tests/lifecycle-projection-folds.test.js dist-test/tests/session-authority.repository.test.js dist-test/tests/child-workflow.test.js dist-test/tests/lifecycle-command-store.test.js dist-test/tests/event-append-transaction.test.js dist-test/tests/event-integrity.test.js dist-test/tests/lifecycle-operational-store.test.js dist-test/tests/source-state.provider.test.js dist-test/tests/session-end-effective-state-migration.test.js dist-test/tests/migration-registry.test.js dist-test/tests/project-store-bootstrap.test.js dist-test/tests/project-store-upgrade.test.js dist-test/tests/project-store-upgrade-phase-runner.test.js dist-test/tests/qualified-checkpoint-quick-integrity.test.js dist-test/tests/qualified-checkpoint-full-integrity.test.js
 npm run typecheck
 npm run build
 npm run test:build-artifacts
 git diff --check
+git diff --exit-code 72f4fce -- src/orchestrator/storage/migrations/0002-session-lifecycle.ts src/orchestrator/storage/migrations/0003-qualified-checkpoint-coverage.ts
 ```
 
-- [ ] **Step 4: Commit and review slice 14Q**
+- [ ] **Step 5: Commit and review slice 14Q**
 
 ```powershell
-git add src/orchestrator/lifecycle/lifecycle-operational.store.ts src/orchestrator/lifecycle/source-state.provider.ts src/orchestrator/integrity/event-integrity.service.ts src/orchestrator/integrity/lifecycle-integrity.service.ts tests/lifecycle-operational-store.test.ts tests/source-state.provider.test.ts tests/event-integrity.test.ts tests/qualified-checkpoint-quick-integrity.test.ts tests/qualified-checkpoint-full-integrity.test.ts tests/session-end-effective-state-migration.test.ts
+git add src/orchestrator/lifecycle/lifecycle-operational.store.ts src/orchestrator/lifecycle/source-state.provider.ts src/orchestrator/integrity/event-integrity.service.ts src/orchestrator/integrity/lifecycle-integrity.service.ts tests/lifecycle-operational-store.test.ts tests/source-state.provider.test.ts tests/event-integrity.test.ts tests/lifecycle-outbox.repository.test.ts tests/qualified-checkpoint-quick-integrity.test.ts tests/qualified-checkpoint-full-integrity.test.ts tests/session-end-effective-state-migration.test.ts
 git commit -m "fix: separate lifecycle plan reads from materialization operations"
 git status --short
 ```
@@ -1299,13 +1813,31 @@ git commit -m "feat: carry session end child work forward"
 - Modify: `tests/checkpoint.service.test.ts`
 - Modify: `tests/lifecycle-operational-store.test.ts`
 
+**Interfaces:**
+
+- Consumes: a claimed `children-resolved` workflow with sealed evidence, the event-authoritative bounded child/ticket proof, Q.2a `SessionCheckpointRecordedPayloadV3`, Q.1/Q.4 prepared queue, Q.3 exact plan reader, and the existing nested `CheckpointV1 | CheckpointV2` builders/fingerprint domain.
+- Produces: the sole `record-final-checkpoint-and-queue-ending` producer of an outer Version 3 marker plus its atomic lifecycle plan/frozen workflow transition. Ordinary public/internal non-final checkpoints continue to emit their historical outer Version 1 or Version 2 envelope.
+
+```ts
+export interface FinalCheckpointPhasePreparationInput {
+  readonly command: RecordCheckpointCommandV2 | RecordCheckpointCommandV3;
+  readonly materializationTarget: string;
+  readonly workflowClaim: WorkflowClaimAssertionV1;
+}
+```
+
+The checkpoint service uses `workflowClaim.workflowId` and
+`workflowClaim.workflowGeneration` for the marker but must revalidate the whole
+claim token/owner/expiry against the same connection-bound workflow row; caller
+values alone are never authority.
+
 - [ ] **Step 1: Write children-resolved proof RED tests**
 
-Scan all direct child and source-root ticket history with binary order and `MAX_ROOT_CHILD_HISTORY_V1 + 1`. Validate claimed and unclaimed tickets, all-null/all-non-null claim tuples, transferred child exactly-one-ticket, no current-child/ticket double representation, terminal/claimed history counting, overflow as integrity failure, eventless CAS response loss, and no semantic event/outbox during the proof.
+Scan all direct-child and source-root ticket history with binary order and `MAX_ROOT_CHILD_HISTORY_V1 + 1`. Authenticate each child from its immutable event stream and each foreign claim from the exact fork-v1/claim-v2 witness pair; mutable authority/ticket tuples are locator/CAS cross-checks only. Validate claimed and unclaimed tickets, all-null/all-non-null claim tuples, transferred child exactly-one-ticket, no current-child/ticket double representation, terminal/claimed history counting, approved cross-workspace claims, duplicate/orphan/mismatched claims, overflow as integrity failure, eventless CAS response loss, and no semantic event/outbox during the proof.
 
 - [ ] **Step 2: Write final freeze/confirmation RED tests**
 
-Cover sealed window, exact root/descendant coverage, direct historical checkpoint reads, canonical ending-scope union, capacity boundary, typed pending descriptor before append prepare, actual event/outbox atomicity, authoritative command hash, target order, rollback at renderer/key/repository/index/after-append boundaries, and a later eventless exact-row assertion before phase CAS.
+Cover sealed window, exact root/descendant coverage, direct historical checkpoint reads, canonical ending-scope union, capacity boundary, and both nested checkpoint versions. The final path must emit the exact six-key outer Version 3 payload, bind workflow ID/generation to the claimed `children-resolved` row and authoritative intent, use `command_event_index = 0`, and supply that same marker to Q.1 preparation. Prove ordinary checkpoints remain outer Version 1/2 and cannot become final by intent inference. Cover actual event/outbox atomicity, authoritative command hash, target order, rollback at renderer/key/repository/index/after-append boundaries, and a later eventless exact-row assertion before phase CAS.
 
 ```ts
 it("rolls back final checkpoint and outbox together at every fault boundary", () => {
@@ -1321,18 +1853,20 @@ it("rolls back final checkpoint and outbox together at every fault boundary", ()
 
 ```powershell
 npm run test:build
-node --test --test-concurrency=1 --test-reporter=spec --test-name-pattern="^(proves children resolved from all bounded child and ticket history|treats a 1001-row proof read as integrity failure|freezes only current children and validated unclaimed tickets|rolls back final checkpoint and outbox together at every fault boundary|confirms the exact planned row before advancing phase|leaves phase unchanged when the planned row is absent or mismatched)$" dist-test/tests/session-end.coordinator.test.js dist-test/tests/session-end-workflow.test.js dist-test/tests/checkpoint.service.test.js
+node --test --test-concurrency=1 --test-reporter=spec --test-name-pattern="^(proves children resolved from all bounded child and ticket history|authenticates cross-root transfer claims from immutable fork claim witnesses|treats a 1001-row proof read as integrity failure|emits only an exact Version 3 marker for the final workflow checkpoint|keeps ordinary Version 1 and Version 2 checkpoints non-final|binds the marker projection origin intent and claimed workflow exactly|freezes only current children and validated unclaimed tickets|rolls back final checkpoint and outbox together at every fault boundary|confirms the exact planned row before advancing phase|leaves phase unchanged when the planned row is absent or mismatched)$" dist-test/tests/session-end.coordinator.test.js dist-test/tests/session-end-workflow.test.js dist-test/tests/checkpoint.service.test.js
 ```
 
 - [ ] **Step 4: Implement one-action-per-drive coordination and final queue ordering**
 
-Each `driveOnce` claims or renews, performs at most one child command or one root phase action, commits/returns, and never loops while SQLite is locked. After no child selection, the operational proof moves `requested -> children-resolved`. The semantic final transaction follows design section 13.5 exactly: queue prepare, append planning, `assertPlanned`, actual event plus lifecycle insert, checkpoint/frozen phase update, `assertCommitted`, projection/dedup, commit. The next eventless operation asserts the exact row and only then CASes `final-checkpoint-recorded -> ending-materialization-queued`.
+Each `driveOnce` claims or renews, performs at most one child command or one root phase action, commits/returns, and never loops while SQLite is locked. After no child selection, the operational proof moves `requested -> children-resolved`. In the final checkpoint service, leave `pendingCheckpointEvent` unchanged for ordinary writes and add a final-only builder that wraps its strict nested checkpoint in outer schema Version 3 with `finalCheckpointBindingVersion: 1`, the exact workflow ID/generation, and correlated base/checkpoint positions. Require source phase `children-resolved`, sealed evidence, no active frozen marker, and action `record-final-checkpoint-and-queue-ending` before returning it.
+
+The semantic final transaction follows design section 13.5 exactly: derive the expected next position; queue `prepare` with the Version 3 candidate; append planning; queue `assertPlanned` so the owner captures the complete actual envelope; insert the actual event then lifecycle row; update checkpoint/frozen phase using the marker's workflow binding and nested-checkpoint fingerprint; queue `assertCommitted` against the exact event/row; apply projection/dedup; commit. Every fault rolls back and burns the handle. The next eventless operation calls `assertExactPlannedRevision` and only then CASes `final-checkpoint-recorded -> ending-materialization-queued`.
 
 - [ ] **Step 5: Run complete 14S gate, commit, and review**
 
 ```powershell
 npm run test:build
-node --test --test-concurrency=1 --test-reporter=spec dist-test/tests/session-end-child-saga.test.js dist-test/tests/session-end.coordinator.test.js dist-test/tests/session-end-workflow.test.js dist-test/tests/child-workflow.test.js dist-test/tests/checkpoint.service.test.js dist-test/tests/session-aggregate.test.js dist-test/tests/lifecycle-projection-folds.test.js dist-test/tests/lifecycle-command-store.test.js dist-test/tests/lifecycle-operational-store.test.js dist-test/tests/lifecycle-materialization-queue.test.js dist-test/tests/lifecycle-outbox.repository.test.js dist-test/tests/event-append-transaction.test.js dist-test/tests/event-integrity.test.js dist-test/tests/qualified-checkpoint-quick-integrity.test.js dist-test/tests/qualified-checkpoint-full-integrity.test.js
+node --test --test-concurrency=1 --test-reporter=spec dist-test/tests/session-end-child-saga.test.js dist-test/tests/session-end.coordinator.test.js dist-test/tests/session-end-workflow.test.js dist-test/tests/child-workflow.test.js dist-test/tests/checkpoint.service.test.js dist-test/tests/lifecycle-contracts.test.js dist-test/tests/session-aggregate.test.js dist-test/tests/lifecycle-projection-folds.test.js dist-test/tests/session-authority.repository.test.js dist-test/tests/lifecycle-command-store.test.js dist-test/tests/lifecycle-operational-store.test.js dist-test/tests/lifecycle-materialization-queue.test.js dist-test/tests/lifecycle-render-closure.reader.test.js dist-test/tests/compatibility-log-renderer.test.js dist-test/tests/lifecycle-outbox.repository.test.js dist-test/tests/event-append-transaction.test.js dist-test/tests/event-integrity.test.js dist-test/tests/qualified-checkpoint-quick-integrity.test.js dist-test/tests/qualified-checkpoint-full-integrity.test.js
 npm run typecheck
 npm run build
 npm run test:build-artifacts
@@ -1420,17 +1954,17 @@ test("covers every approved Task 14 crash and replay case", () => {
 
 ```powershell
 npm run test:build
-$pattern = '^(derives RFC and session-end UUIDv5 golden vectors|enforces the session end effective-state raw UTF-8 guard at exact cap|keeps legacy request amend cancel decoders and accepts only V3 current events|keeps ChildWorkTransferCreated V1 frozen and admits only the internal V2 dual-checkpoint shape|applies migration 0004 and preserves frozen 0002 0003 hashes|rejects schema-3 nonterminal workflows with zero writes|computes exact V2 workflow-generation fingerprint predecessor chains|strictly decodes the six-key persisted validation plan and rejects ordering identity cap violations|renders compatibility log golden bytes deterministically|derives prior fingerprint from the immediate lower revision regardless of status|preserves authoritative lifecycle command hash while recording the outbox target|requests G1 without outbox and reopens cancelled G2 as G3|amend unchanged preserves phase and frozen bytes|selects one eligible child by binary UUID order|carries an already suspended child with a newer governing checkpoint|proves children resolved from all bounded child and ticket history|rolls back final checkpoint and outbox together at every fault boundary|confirms the exact planned row before advancing phase|routes carry-forward only to the dedicated child-target handler|covers every approved Task 14 crash and replay case)$'
-node --test --test-concurrency=1 --test-reporter=spec --test-name-pattern=$pattern dist-test/tests/session-end-identifiers.test.js dist-test/tests/session-end-effective-state.test.js dist-test/tests/lifecycle-contracts.test.js dist-test/tests/session-end-effective-state-migration.test.js dist-test/tests/session-end.repository.test.js dist-test/tests/compatibility-log-renderer.test.js dist-test/tests/lifecycle-outbox.repository.test.js dist-test/tests/event-append-transaction.test.js dist-test/tests/session-end-workflow.test.js dist-test/tests/session-end-child-saga.test.js dist-test/tests/session-end.coordinator.test.js dist-test/tests/lifecycle-worker-runtime.test.js dist-test/tests/session-end.crash.test.js
+$pattern = '^(derives RFC and session-end UUIDv5 golden vectors|enforces the session end effective-state raw UTF-8 guard at exact cap|keeps legacy request amend cancel decoders and accepts only V3 current events|keeps ChildWorkTransferCreated V1 frozen and admits only the internal V2 dual-checkpoint shape|decodes only exact root-bound Version 3 final checkpoint markers|applies migration 0004 and preserves frozen 0002 0003 hashes|rejects schema-3 nonterminal workflows with zero writes|computes exact V2 workflow-generation fingerprint predecessor chains|strictly decodes the six-key persisted validation plan and rejects ordering identity cap violations|selects the latest outer Version 3 checkpoint by its nested checkpoint domain|authenticates an exact cross-workspace foreign fork claim pair|renders all six compatibility log literals byte for byte|derives prior fingerprint from the immediate lower revision regardless of status|preserves authoritative lifecycle command hash while recording the outbox target|event integrity recomputes lifecycle outbox content hash|full integrity rerenders and verifies provider-keyed fingerprint lineage|requests G1 without outbox and reopens cancelled G2 as G3|amend unchanged preserves phase and frozen bytes|selects one eligible child by binary UUID order|carries an already suspended child with a newer governing checkpoint|proves children resolved from all bounded child and ticket history|rolls back final checkpoint and outbox together at every fault boundary|confirms the exact planned row before advancing phase|routes carry-forward only to the dedicated child-target handler|covers every approved Task 14 crash and replay case)$'
+node --test --test-concurrency=1 --test-reporter=spec --test-name-pattern=$pattern dist-test/tests/session-end-identifiers.test.js dist-test/tests/session-end-effective-state.test.js dist-test/tests/lifecycle-contracts.test.js dist-test/tests/session-end-effective-state-migration.test.js dist-test/tests/session-end.repository.test.js dist-test/tests/session-authority.repository.test.js dist-test/tests/lifecycle-render-closure.reader.test.js dist-test/tests/compatibility-log-renderer.test.js dist-test/tests/lifecycle-outbox.repository.test.js dist-test/tests/event-append-transaction.test.js dist-test/tests/event-integrity.test.js dist-test/tests/qualified-checkpoint-full-integrity.test.js dist-test/tests/session-end-workflow.test.js dist-test/tests/session-end-child-saga.test.js dist-test/tests/session-end.coordinator.test.js dist-test/tests/lifecycle-worker-runtime.test.js dist-test/tests/session-end.crash.test.js
 ```
 
-Confirm all 20 names appear in output; file-level zero-match wrapper entries do not count as anchors.
+Confirm all 25 names appear in output; file-level zero-match wrapper entries do not count as anchors.
 
 - [ ] **Step 3: Run the focused Task 14 boundary suite**
 
 ```powershell
 npm run test:build
-node --test --test-concurrency=1 --test-reporter=spec dist-test/tests/session-end-identifiers.test.js dist-test/tests/session-end-effective-state.test.js dist-test/tests/session-end-effective-state-migration.test.js dist-test/tests/session-end.repository.test.js dist-test/tests/session-end-policy.test.js dist-test/tests/session-end-workflow.test.js dist-test/tests/session-end-child-saga.test.js dist-test/tests/session-end.coordinator.test.js dist-test/tests/session-end.crash.test.js dist-test/tests/lifecycle-materialization-queue.test.js dist-test/tests/lifecycle-outbox.repository.test.js dist-test/tests/compatibility-log-renderer.test.js dist-test/tests/lifecycle-contracts.test.js dist-test/tests/lifecycle-intent.test.js dist-test/tests/lifecycle-command-store.test.js dist-test/tests/lifecycle-operational-store.test.js dist-test/tests/lifecycle-worker-protocol.test.js dist-test/tests/lifecycle-worker-runtime.test.js dist-test/tests/lifecycle-executor.test.js dist-test/tests/event-append-transaction.test.js dist-test/tests/event-integrity.test.js dist-test/tests/source-state.provider.test.js dist-test/tests/child-workflow.test.js dist-test/tests/checkpoint.service.test.js dist-test/tests/session-aggregate.test.js dist-test/tests/lifecycle-projection-folds.test.js dist-test/tests/qualified-checkpoint-quick-integrity.test.js dist-test/tests/qualified-checkpoint-full-integrity.test.js dist-test/tests/project-store-upgrade.test.js dist-test/tests/project-store-upgrade-phase-runner.test.js
+node --test --test-concurrency=1 --test-reporter=spec dist-test/tests/session-end-identifiers.test.js dist-test/tests/session-end-effective-state.test.js dist-test/tests/session-end-effective-state-migration.test.js dist-test/tests/session-end.repository.test.js dist-test/tests/session-end-policy.test.js dist-test/tests/session-end-workflow.test.js dist-test/tests/session-end-child-saga.test.js dist-test/tests/session-end.coordinator.test.js dist-test/tests/session-end.crash.test.js dist-test/tests/lifecycle-materialization-queue.test.js dist-test/tests/lifecycle-render-closure.reader.test.js dist-test/tests/lifecycle-outbox.repository.test.js dist-test/tests/compatibility-log-renderer.test.js dist-test/tests/lifecycle-contracts.test.js dist-test/tests/lifecycle-intent.test.js dist-test/tests/lifecycle-command-store.test.js dist-test/tests/lifecycle-operational-store.test.js dist-test/tests/lifecycle-worker-protocol.test.js dist-test/tests/lifecycle-worker-runtime.test.js dist-test/tests/lifecycle-executor.test.js dist-test/tests/event-append-transaction.test.js dist-test/tests/event-integrity.test.js dist-test/tests/source-state.provider.test.js dist-test/tests/child-workflow.test.js dist-test/tests/checkpoint.service.test.js dist-test/tests/session-aggregate.test.js dist-test/tests/lifecycle-projection-folds.test.js dist-test/tests/session-authority.repository.test.js dist-test/tests/qualified-checkpoint-quick-integrity.test.js dist-test/tests/qualified-checkpoint-full-integrity.test.js dist-test/tests/project-store-upgrade.test.js dist-test/tests/project-store-upgrade-phase-runner.test.js
 ```
 
 - [ ] **Step 4: Run full verification and immutable-scope checks**
