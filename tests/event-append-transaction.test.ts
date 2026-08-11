@@ -47,6 +47,7 @@ import type {
 import {
   SqliteLifecycleProjectionRepository,
 } from "../src/orchestrator/storage/lifecycle-projection.repository.js";
+import { workflowFingerprintV2 } from "../src/orchestrator/lifecycle/lifecycle-projection-folds.js";
 import { canonicalJson } from "../src/orchestrator/serialization/canonical-json.js";
 import { applyCurrentProjectStoreSchema } from "./support/current-project-store-schema.js";
 import {
@@ -104,6 +105,28 @@ class RecordingConnection implements SqliteConnection {
   }
 
   prepare(sql: string): SqliteStatement { return this.inner.prepare(sql); }
+  close(): void { this.inner.close(); }
+}
+
+class ProjectionHydrationQueryConnection implements SqliteConnection {
+  workflowQueries = 0;
+  eventQueries = 0;
+
+  constructor(readonly inner: SqliteConnection) {}
+
+  exec(sql: string): void { this.inner.exec(sql); }
+
+  prepare(sql: string): SqliteStatement {
+    const normalized = sql.replace(/\s+/g, " ").toLowerCase();
+    if (normalized.includes("from lifecycle_workflow_generation_folds")) {
+      this.workflowQueries += 1;
+    }
+    if (normalized.includes("from events") && normalized.includes("global_position")) {
+      this.eventQueries += 1;
+    }
+    return this.inner.prepare(sql);
+  }
+
   close(): void { this.inner.close(); }
 }
 
@@ -583,6 +606,139 @@ function workflowProjectionEvent(
   });
 }
 
+function withProjectionTriggersDisabled(
+  connection: SqliteConnection,
+  triggerNames: readonly string[],
+  action: () => void,
+): void {
+  const triggers = triggerNames.map((name) => {
+    const row = connection.prepare(`
+      SELECT sql FROM sqlite_schema WHERE type = 'trigger' AND name = $name
+    `).get({ $name: name });
+    assert.equal(typeof row?.sql, "string", `missing trigger ${name}`);
+    return { name, sql: String(row!.sql) };
+  });
+  try {
+    for (const trigger of triggers) connection.exec(`DROP TRIGGER ${trigger.name}`);
+    action();
+  } finally {
+    for (const trigger of triggers) connection.exec(trigger.sql);
+  }
+}
+
+function seedWorkflowHydrationChain(
+  connection: SqliteConnection,
+  generations: number,
+): void {
+  const insertFold = connection.prepare(`
+    INSERT INTO lifecycle_workflow_generation_folds(
+      project_id, workflow_id, workflow_generation, session_id,
+      trigger_event_position, root_command_id, evidence_window_state,
+      replacement_checkpoint_version, effective_checkpoint_version,
+      effective_draft_source_event_position, fingerprint_schema_version,
+      effective_state_source_event_position, effective_state_version,
+      effective_state_hash, previous_fingerprint, fingerprint
+    ) VALUES (
+      $projectId, $workflowId, $workflowGeneration, $sessionId,
+      $triggerEventPosition, $rootCommandId, 'open',
+      $replacementCheckpointVersion, 2,
+      1, 2, 1, 1, $effectiveStateHash, $previousFingerprint, $fingerprint
+    )
+  `);
+  let previousFingerprint: string | null = null;
+  withProjectionTriggersDisabled(
+    connection,
+    [
+      "events_lifecycle_version_v4_guard",
+      "events_session_end_v4_guard",
+      "lifecycle_workflow_generation_folds_v4_insert_guard",
+    ],
+    () => {
+      connection.exec("BEGIN IMMEDIATE");
+      try {
+        for (let generation = 1; generation <= generations; generation += 1) {
+          const position = BigInt(generation);
+          const commandId = lifecycleUuid(200_000 + generation);
+          const triggerEventHash = generation.toString(16).padStart(64, "0");
+          const eventType = generation === 1
+            ? "SessionEndRequested"
+            : "SessionEndAmended";
+          const payload = generation === 1
+            ? {
+                workflowId: PROJECTION_WORKFLOW_ID,
+                workflowGeneration: generation,
+                previousState: "active",
+              }
+            : {
+                workflowId: PROJECTION_WORKFLOW_ID,
+                previousWorkflowGeneration: generation - 1,
+                workflowGeneration: generation,
+                preTransitionCheckpointId: PROJECTION_CHECKPOINT_ID,
+              };
+          const event = projectionStored(lifecycleEvent(
+            generation,
+            eventType,
+            payload as never,
+            {
+              globalPosition: generation,
+              streamVersion: generation,
+              sessionId: PROJECTION_ROOT_ID,
+              parentSessionId: null,
+              workspaceId: PROJECTION_WORKSPACE_ID,
+            },
+          ), {
+            eventSchemaVersion: 3,
+            streamId: `session/${PROJECTION_ROOT_ID}`,
+            streamVersion: position,
+            sessionId: PROJECTION_ROOT_ID,
+            parentSessionId: null,
+            commandId,
+            idempotencyKey: `projection/deep-workflow/${generation}`,
+            eventHash: triggerEventHash,
+          });
+          insertProjectionEvent(connection, event);
+          const replacementCheckpointVersion = generation === 1 ? 2 : null;
+          const fingerprint = workflowFingerprintV2({
+            projectId: PROJECTION_PROJECT_ID,
+            workflowId: PROJECTION_WORKFLOW_ID,
+            workflowGeneration: generation,
+            sessionId: PROJECTION_ROOT_ID,
+            triggerEventPosition: position,
+            triggerEventHash,
+            rootCommandId: commandId,
+            evidenceWindowState: "open",
+            replacementCheckpointVersion,
+            effectiveCheckpointVersion: 2,
+            effectiveDraftSourceEventPosition: 1n,
+            effectiveStateSourceEventPosition: 1n,
+            effectiveStateVersion: 1,
+            effectiveStateHash: "a".repeat(64),
+            previousFingerprintSchemaVersion: generation === 1 ? null : 2,
+            previousFingerprint,
+          });
+          insertFold.run({
+            $projectId: PROJECTION_PROJECT_ID,
+            $workflowId: PROJECTION_WORKFLOW_ID,
+            $workflowGeneration: generation,
+            $sessionId: PROJECTION_ROOT_ID,
+            $triggerEventPosition: position,
+            $rootCommandId: commandId,
+            $replacementCheckpointVersion: replacementCheckpointVersion,
+            $effectiveStateHash: "a".repeat(64),
+            $previousFingerprint: previousFingerprint,
+            $fingerprint: fingerprint,
+          });
+          previousFingerprint = fingerprint;
+        }
+        connection.exec("COMMIT");
+      } catch (error) {
+        connection.exec("ROLLBACK");
+        throw error;
+      }
+    },
+  );
+}
+
 function reportEvent(position: number, reportOrdinal: number): {
   readonly event: StoredEvent;
   readonly reportId: ReturnType<typeof childReportFixture>["reportId"];
@@ -905,9 +1061,119 @@ it("lifecycle projection writer persists every workflow generation and unchanged
     { generation: 4, state: "open", replacement: 2, effective: 2, source: 13n },
     { generation: 5, state: "sealed", replacement: null, effective: 2, source: 13n },
   ]);
+  assert.equal(
+    repository.findWorkflowGeneration(
+      PROJECTION_PROJECT_ID,
+      PROJECTION_WORKFLOW_ID,
+      5,
+    )?.fingerprintSchemaVersion,
+    1,
+  );
 });
 
-it("schema 3 projects existing version 1 lifecycle writes", () => {
+it("hydrates a deep V2 workflow generation with bounded immediate-predecessor queries", () => {
+  const connection = projectionFixture();
+  seedWorkflowHydrationChain(connection, 5_000);
+  const observed = new ProjectionHydrationQueryConnection(connection);
+  let projection;
+  try {
+    projection = new SqliteLifecycleProjectionRepository(observed)
+      .findWorkflowGeneration(
+        PROJECTION_PROJECT_ID,
+        PROJECTION_WORKFLOW_ID,
+        5_000,
+      );
+  } catch (error) {
+    assert.fail(
+      `deep hydration threw after ${observed.workflowQueries} workflow and ${
+        observed.eventQueries
+      } event queries: ${String(error)}`,
+    );
+  }
+
+  assert.equal(projection?.workflowGeneration, 5_000);
+  assert.deepEqual({
+    workflowQueries: observed.workflowQueries,
+    eventQueries: observed.eventQueries,
+  }, {
+    workflowQueries: 2,
+    eventQueries: 1,
+  });
+
+  const appendLookup = new ProjectionHydrationQueryConnection(connection);
+  const predecessor = new SqliteLifecycleProjectionRepository(appendLookup)
+    .findWorkflowPredecessor(
+      PROJECTION_PROJECT_ID,
+      PROJECTION_WORKFLOW_ID,
+      5_001,
+    );
+  assert.equal(predecessor?.workflowGeneration, 5_000);
+  assert.deepEqual({
+    workflowQueries: appendLookup.workflowQueries,
+    eventQueries: appendLookup.eventQueries,
+  }, {
+    workflowQueries: 2,
+    eventQueries: 1,
+  });
+});
+
+it("rejects corrupt requested workflow rows and missing immediate predecessors", () => {
+  const corrupt = projectionFixture();
+  seedWorkflowHydrationChain(corrupt, 3);
+  withProjectionTriggersDisabled(
+    corrupt,
+    ["lifecycle_workflow_generation_folds_no_update"],
+    () => {
+      corrupt.prepare(`
+        UPDATE lifecycle_workflow_generation_folds
+        SET fingerprint = $fingerprint
+        WHERE project_id = $projectId
+          AND workflow_id = $workflowId
+          AND workflow_generation = 3
+      `).run({
+        $fingerprint: "f".repeat(64),
+        $projectId: PROJECTION_PROJECT_ID,
+        $workflowId: PROJECTION_WORKFLOW_ID,
+      });
+    },
+  );
+  assert.throws(
+    () => new SqliteLifecycleProjectionRepository(corrupt)
+      .findWorkflowGeneration(PROJECTION_PROJECT_ID, PROJECTION_WORKFLOW_ID, 3),
+    (error: unknown) => typeof error === "object"
+      && error !== null
+      && "code" in error
+      && error.code === "INTEGRITY_FAILURE",
+  );
+
+  const missing = projectionFixture();
+  seedWorkflowHydrationChain(missing, 3);
+  withProjectionTriggersDisabled(
+    missing,
+    ["lifecycle_workflow_generation_folds_no_delete"],
+    () => {
+      missing.prepare(`
+        DELETE FROM lifecycle_workflow_generation_folds
+        WHERE project_id = $projectId
+          AND workflow_id = $workflowId
+          AND workflow_generation = 2
+      `).run({
+        $projectId: PROJECTION_PROJECT_ID,
+        $workflowId: PROJECTION_WORKFLOW_ID,
+      });
+    },
+  );
+  assert.throws(
+    () => new SqliteLifecycleProjectionRepository(missing)
+      .findWorkflowGeneration(PROJECTION_PROJECT_ID, PROJECTION_WORKFLOW_ID, 3),
+    (error: unknown) => typeof error === "object"
+      && error !== null
+      && "code" in error
+      && error.code === "INTEGRITY_FAILURE",
+  );
+});
+
+it("current schema projects existing version 1 lifecycle writes", () => {
   const connection = projectionFixture();
   const fork = projectionStored(lifecycleEvent(1, "SessionForked"));
   insertProjectionEvent(connection, fork);
@@ -917,7 +1183,7 @@ it("schema 3 projects existing version 1 lifecycle writes", () => {
   connection.exec("COMMIT");
   assert.equal(
     connection.prepare("SELECT schema_version FROM project_meta").get()?.schema_version,
-    3n,
+    4n,
   );
   assert.equal(
     connection.prepare("SELECT count(*) AS count FROM lifecycle_child_event_folds").get()?.count,

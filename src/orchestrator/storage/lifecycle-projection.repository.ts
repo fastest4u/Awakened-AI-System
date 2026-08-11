@@ -828,19 +828,12 @@ implements LifecycleProjectionWriter {
       if (!Number.isSafeInteger(workflowGeneration) || workflowGeneration <= 0) {
         integrity();
       }
-      const row = exactZeroOrOne(this.#connection.prepare(`
-        SELECT ${WORKFLOW_COLUMNS}
-        FROM lifecycle_workflow_generation_folds
-        WHERE project_id = $projectId
-          AND workflow_id = $workflowId
-          AND workflow_generation = $workflowGeneration
-        LIMIT 2
-      `).all({
-        $projectId: projectId,
-        $workflowId: workflowId,
-        $workflowGeneration: BigInt(workflowGeneration),
-      }));
-      return row === null ? null : this.#verifyWorkflowHydration(hydrateWorkflow(row));
+      const projection = this.#workflowGenerationRow(
+        projectId,
+        workflowId,
+        workflowGeneration,
+      );
+      return projection === null ? null : this.#verifyWorkflowHydration(projection);
     } catch (error) {
       if (error instanceof LifecycleError && error.code === "INTEGRITY_FAILURE") {
         throw error;
@@ -876,6 +869,26 @@ implements LifecycleProjectionWriter {
     return row === null ? integrity() : storedEventFromRow(row);
   }
 
+  #workflowGenerationRow(
+    projectId: string,
+    workflowId: string,
+    workflowGeneration: number,
+  ): WorkflowGenerationFoldProjection | null {
+    const row = exactZeroOrOne(this.#connection.prepare(`
+      SELECT ${WORKFLOW_COLUMNS}
+      FROM lifecycle_workflow_generation_folds
+      WHERE project_id = $projectId
+        AND workflow_id = $workflowId
+        AND workflow_generation = $workflowGeneration
+      LIMIT 2
+    `).all({
+      $projectId: projectId,
+      $workflowId: workflowId,
+      $workflowGeneration: BigInt(workflowGeneration),
+    }));
+    return row === null ? null : hydrateWorkflow(row);
+  }
+
   #verifyWorkflowHydration(
     projection: WorkflowGenerationFoldProjection,
   ): WorkflowGenerationFoldProjection {
@@ -883,7 +896,7 @@ implements LifecycleProjectionWriter {
     const trigger = this.#eventAt(projection.triggerEventPosition);
     const predecessor = projection.workflowGeneration === 1
       ? null
-      : this.findWorkflowGeneration(
+      : this.#workflowGenerationRow(
           projection.projectId,
           projection.workflowId,
           projection.workflowGeneration - 1,
