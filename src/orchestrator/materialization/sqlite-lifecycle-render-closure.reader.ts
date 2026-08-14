@@ -20,8 +20,10 @@ import type {
   LifecycleRenderClosureV1,
   LifecycleRenderEventV1,
 } from "../lifecycle/materialization-queue.port.js";
+import type { SessionEndEffectiveStateV1 } from "../lifecycle/session-end-effective-state.js";
 import { canonicalJson } from "../serialization/canonical-json.js";
 import type { SqliteConnection, SqliteRow } from "../storage/sqlite-driver.js";
+import { readLegacySessionEndEffectiveStateSourceV1 } from "../storage/legacy-session-end-effective-state-source.js";
 import { normalizeCommittedLifecycleClosureEvent } from "./lifecycle-render-event.js";
 
 export interface AuthenticatedLifecycleCommandV1 {
@@ -29,6 +31,7 @@ export interface AuthenticatedLifecycleCommandV1 {
   readonly lifecycleAuthorizationKind: LifecycleIntentAuthorizationKind | null;
   readonly intentWitnessJson: string | null;
   readonly witnessEventId: string | null;
+  readonly legacyEffectiveState?: SessionEndEffectiveStateV1 | null;
 }
 
 interface RawEvent {
@@ -520,11 +523,21 @@ export class SqliteLifecycleRenderClosureReader {
       || requiredString(dedup, "command_type") !== (witness.intent.command as { commandType: string }).commandType
     ) return integrity();
     this.#assertAuthorizationRow(dedup, witness.persistedAssertions);
+    const legacyEffectiveState = (
+      (first.eventType === "SessionEndRequested" || first.eventType === "SessionEndAmended")
+      && (first.eventSchemaVersion === 1 || first.eventSchemaVersion === 2)
+    )
+      ? readLegacySessionEndEffectiveStateSourceV1(this.#connection, {
+        projectId: first.projectId,
+        sourceEventPosition: first.globalPosition,
+      }).effectiveState
+      : null;
     const command = Object.freeze({
       commandHash,
       lifecycleAuthorizationKind: kind as LifecycleIntentAuthorizationKind,
       intentWitnessJson: witnessJson,
       witnessEventId: first.eventId,
+      legacyEffectiveState,
     });
     const authenticated = Object.freeze({ command, events: Object.freeze(events) });
     this.#commandCache.set(cacheKey, authenticated);

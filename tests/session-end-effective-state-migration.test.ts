@@ -2073,6 +2073,36 @@ it("binds Version 3 checkpoint outbox origin directly to payload workflow identi
 });
 
 describe("session-end effective-state migration", () => {
+  it("adds the immutable legacy effective-state sidecar without a new schema version", () => {
+    const connection = schema4Connection();
+
+    const table = connection.prepare(`
+      SELECT type, name, sql
+      FROM sqlite_schema
+      WHERE type = 'table'
+        AND name = 'lifecycle_legacy_effective_state_sources'
+    `).get();
+    assert.equal(table?.type, "table");
+    assert.equal(table?.name, "lifecycle_legacy_effective_state_sources");
+    assert.match(String(table?.sql), /STRICT/u);
+    assert.equal(
+      connection.prepare(`
+        SELECT version FROM schema_migrations WHERE version = 4
+      `).get()?.version,
+      4n,
+    );
+    const indexes = connection.prepare(`
+      SELECT name FROM sqlite_schema
+      WHERE type = 'index'
+        AND name LIKE 'lifecycle_legacy_effective_state_sources_%'
+      ORDER BY name
+    `).all().map((row) => row.name);
+    assert.deepEqual(indexes, [
+      "lifecycle_legacy_effective_state_sources_command_lookup",
+      "lifecycle_legacy_effective_state_sources_event_lookup",
+    ]);
+  });
+
   it("rejects schema-3 ticket claim pointer drift before schema 4", () => {
     const connection = schema3Connection();
     seedHistoryRows(connection, 1, 1);

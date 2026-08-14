@@ -46,6 +46,178 @@ function strictPositiveDecimal(expression: string): string {
   )`;
 }
 
+const EFFECTIVE_STATE_KEYS = [
+  "effectiveStateVersion",
+  "effectiveStateDomain",
+  "request",
+  "effectivePolicy",
+  "effectiveFinalCheckpoint",
+  "effectiveStateHash",
+] as const;
+const EFFECTIVE_REQUEST_KEYS = [
+  "requestVersion",
+  "sessionId",
+  "childEndPolicy",
+  "finalCheckpoint",
+  "validationProfileIds",
+  "requestedQualityThreshold",
+  "requireFullEvidence",
+  "requireMaterialization",
+] as const;
+const EFFECTIVE_POLICY_KEYS = [
+  "qualityPolicyVersion",
+  "profiles",
+  "qualityThreshold",
+  "requireFullEvidence",
+  "requireMaterialization",
+] as const;
+const EFFECTIVE_POLICY_PROFILE_KEYS = [
+  "profileId",
+  "profileVersion",
+  "required",
+  "weight",
+] as const;
+const EFFECTIVE_CHECKPOINT_KEYS = [
+  "checkpointVersion",
+  "taskSummary",
+  "completedItems",
+  "inProgressItems",
+  "blockers",
+  "nextActions",
+  "decisions",
+  "assumptions",
+  "unresolvedConflicts",
+  "filesTouched",
+  "artifactReferences",
+  "sourceReferences",
+  "commandResults",
+  "testResults",
+  "materialClaims",
+] as const;
+const EFFECTIVE_TEXT_ITEM_KEYS = ["summary", "confidence"] as const;
+const EFFECTIVE_FILE_KEYS = [
+  "path", "action", "contentHash", "branchRef", "confidence",
+] as const;
+const EFFECTIVE_ARTIFACT_KEYS = [
+  "artifactId", "path", "summary", "contentHash", "confidence",
+] as const;
+const EFFECTIVE_SOURCE_KEYS = [
+  "sourceId", "path", "summary", "contentHash", "confidence",
+] as const;
+const EFFECTIVE_EXECUTION_KEYS = [
+  "label", "result", "exitClassification", "outputFingerprint",
+  "artifactReference", "confidence",
+] as const;
+const EFFECTIVE_OUTPUT_FINGERPRINT_KEYS = [
+  "fingerprintSchemaVersion", "fingerprintKeyId", "fingerprintDomain", "fingerprint",
+] as const;
+const EFFECTIVE_CLAIM_KEYS = [
+  "claimId", "summary", "evidenceReferences", "confidence",
+] as const;
+
+function canonicalObjectKeySequence(
+  expression: string,
+  path: string | null,
+  keys: readonly string[],
+): string {
+  const expected = [...keys].sort().join("|");
+  const jsonEach = path === null
+    ? `json_each(${expression})`
+    : `json_each(${expression}, '${path}')`;
+  return `(SELECT group_concat(key, '|') FROM ${jsonEach}) IS '${expected}'`;
+}
+
+function canonicalArrayObjectKeySequences(
+  expression: string,
+  path: string,
+  keys: readonly string[],
+  nestedObjectPath: string | null = null,
+  nestedObjectKeys: readonly string[] = [],
+): string {
+  const itemKeyGuard = canonicalObjectKeySequence("item.value", null, keys);
+  const nested = nestedObjectPath === null
+    ? ""
+    : `
+      OR (
+        coalesce(json_type(item.value, '${nestedObjectPath}'), 'missing')
+          NOT IN ('null', 'object')
+        OR (
+          json_type(item.value, '${nestedObjectPath}') IS 'object'
+          AND NOT (${canonicalObjectKeySequence("item.value", nestedObjectPath, nestedObjectKeys)})
+        )
+      )`;
+  return `(
+    json_type(${expression}, '${path}') IS 'array'
+    AND NOT EXISTS (
+      SELECT 1
+      FROM json_each(${expression}, '${path}') AS item
+      WHERE json_type(item.value) IS NOT 'object'
+        OR NOT (${itemKeyGuard})${nested}
+    )
+  )`;
+}
+
+function effectiveStateCanonicalGuard(expression: string): string {
+  return [
+    canonicalObjectKeySequence(expression, "$", EFFECTIVE_STATE_KEYS),
+    canonicalObjectKeySequence(expression, "$.request", EFFECTIVE_REQUEST_KEYS),
+    canonicalObjectKeySequence(expression, "$.effectivePolicy", EFFECTIVE_POLICY_KEYS),
+    canonicalArrayObjectKeySequences(expression, "$.effectivePolicy.profiles", EFFECTIVE_POLICY_PROFILE_KEYS),
+    canonicalObjectKeySequence(expression, "$.effectiveFinalCheckpoint", EFFECTIVE_CHECKPOINT_KEYS),
+    canonicalObjectKeySequence(expression, "$.request.finalCheckpoint", EFFECTIVE_CHECKPOINT_KEYS),
+    canonicalArrayObjectKeySequences(expression, "$.effectiveFinalCheckpoint.completedItems", EFFECTIVE_TEXT_ITEM_KEYS),
+    canonicalArrayObjectKeySequences(expression, "$.effectiveFinalCheckpoint.inProgressItems", EFFECTIVE_TEXT_ITEM_KEYS),
+    canonicalArrayObjectKeySequences(expression, "$.effectiveFinalCheckpoint.blockers", EFFECTIVE_TEXT_ITEM_KEYS),
+    canonicalArrayObjectKeySequences(expression, "$.effectiveFinalCheckpoint.nextActions", EFFECTIVE_TEXT_ITEM_KEYS),
+    canonicalArrayObjectKeySequences(expression, "$.effectiveFinalCheckpoint.decisions", EFFECTIVE_TEXT_ITEM_KEYS),
+    canonicalArrayObjectKeySequences(expression, "$.effectiveFinalCheckpoint.assumptions", EFFECTIVE_TEXT_ITEM_KEYS),
+    canonicalArrayObjectKeySequences(expression, "$.effectiveFinalCheckpoint.unresolvedConflicts", EFFECTIVE_TEXT_ITEM_KEYS),
+    canonicalArrayObjectKeySequences(expression, "$.effectiveFinalCheckpoint.filesTouched", EFFECTIVE_FILE_KEYS),
+    canonicalArrayObjectKeySequences(expression, "$.effectiveFinalCheckpoint.artifactReferences", EFFECTIVE_ARTIFACT_KEYS),
+    canonicalArrayObjectKeySequences(expression, "$.effectiveFinalCheckpoint.sourceReferences", EFFECTIVE_SOURCE_KEYS),
+    canonicalArrayObjectKeySequences(
+      expression,
+      "$.effectiveFinalCheckpoint.commandResults",
+      EFFECTIVE_EXECUTION_KEYS,
+      "$.outputFingerprint",
+      EFFECTIVE_OUTPUT_FINGERPRINT_KEYS,
+    ),
+    canonicalArrayObjectKeySequences(
+      expression,
+      "$.effectiveFinalCheckpoint.testResults",
+      EFFECTIVE_EXECUTION_KEYS,
+      "$.outputFingerprint",
+      EFFECTIVE_OUTPUT_FINGERPRINT_KEYS,
+    ),
+    canonicalArrayObjectKeySequences(expression, "$.effectiveFinalCheckpoint.materialClaims", EFFECTIVE_CLAIM_KEYS),
+    canonicalArrayObjectKeySequences(expression, "$.request.finalCheckpoint.completedItems", EFFECTIVE_TEXT_ITEM_KEYS),
+    canonicalArrayObjectKeySequences(expression, "$.request.finalCheckpoint.inProgressItems", EFFECTIVE_TEXT_ITEM_KEYS),
+    canonicalArrayObjectKeySequences(expression, "$.request.finalCheckpoint.blockers", EFFECTIVE_TEXT_ITEM_KEYS),
+    canonicalArrayObjectKeySequences(expression, "$.request.finalCheckpoint.nextActions", EFFECTIVE_TEXT_ITEM_KEYS),
+    canonicalArrayObjectKeySequences(expression, "$.request.finalCheckpoint.decisions", EFFECTIVE_TEXT_ITEM_KEYS),
+    canonicalArrayObjectKeySequences(expression, "$.request.finalCheckpoint.assumptions", EFFECTIVE_TEXT_ITEM_KEYS),
+    canonicalArrayObjectKeySequences(expression, "$.request.finalCheckpoint.unresolvedConflicts", EFFECTIVE_TEXT_ITEM_KEYS),
+    canonicalArrayObjectKeySequences(expression, "$.request.finalCheckpoint.filesTouched", EFFECTIVE_FILE_KEYS),
+    canonicalArrayObjectKeySequences(expression, "$.request.finalCheckpoint.artifactReferences", EFFECTIVE_ARTIFACT_KEYS),
+    canonicalArrayObjectKeySequences(expression, "$.request.finalCheckpoint.sourceReferences", EFFECTIVE_SOURCE_KEYS),
+    canonicalArrayObjectKeySequences(
+      expression,
+      "$.request.finalCheckpoint.commandResults",
+      EFFECTIVE_EXECUTION_KEYS,
+      "$.outputFingerprint",
+      EFFECTIVE_OUTPUT_FINGERPRINT_KEYS,
+    ),
+    canonicalArrayObjectKeySequences(
+      expression,
+      "$.request.finalCheckpoint.testResults",
+      EFFECTIVE_EXECUTION_KEYS,
+      "$.outputFingerprint",
+      EFFECTIVE_OUTPUT_FINGERPRINT_KEYS,
+    ),
+    canonicalArrayObjectKeySequences(expression, "$.request.finalCheckpoint.materialClaims", EFFECTIVE_CLAIM_KEYS),
+  ].join("\n      AND ");
+}
+
 function priorTriggerSql(name: string): string {
   const marker = `CREATE TRIGGER ${name}`;
   const start = qualifiedCheckpointCoverageMigration.sql.indexOf(marker);
@@ -1930,5 +2102,438 @@ ON events(project_id, json_extract(payload_json, '$.transferTicketId'), global_p
 WHERE stream_type = 'session'
   AND event_type = 'ChildWorkTransferClaimed'
   AND event_schema_version = 1;
+
+CREATE TABLE lifecycle_legacy_effective_state_sources (
+  project_id TEXT NOT NULL,
+  source_event_position INTEGER NOT NULL CHECK (source_event_position > 0),
+  source_event_hash TEXT NOT NULL CHECK (
+    length(source_event_hash) = 64
+    AND lower(source_event_hash) = source_event_hash
+    AND source_event_hash NOT GLOB '*[^0-9a-f]*'
+  ),
+  command_id TEXT NOT NULL,
+  command_hash TEXT NOT NULL CHECK (
+    length(command_hash) = 64
+    AND lower(command_hash) = command_hash
+    AND command_hash NOT GLOB '*[^0-9a-f]*'
+  ),
+  session_id TEXT NOT NULL,
+  workflow_id TEXT NOT NULL,
+  workflow_generation INTEGER NOT NULL CHECK (workflow_generation > 0),
+  effective_state_json TEXT NOT NULL CHECK (
+    coalesce((
+      json_valid(effective_state_json)
+      AND length(CAST(effective_state_json AS BLOB)) <= 1048576
+      AND json(effective_state_json) IS effective_state_json
+      AND json_type(effective_state_json, '$.effectiveStateVersion') = 'integer'
+      AND json_extract(effective_state_json, '$.effectiveStateVersion') IS 1
+      AND json_type(effective_state_json, '$.effectiveStateDomain') = 'text'
+      AND json_extract(effective_state_json, '$.effectiveStateDomain')
+        IS 'project-memory/session-end-effective-state/v1'
+      AND json_type(effective_state_json, '$.request') = 'object'
+      AND json_type(effective_state_json, '$.effectivePolicy') = 'object'
+      AND json_type(effective_state_json, '$.effectiveFinalCheckpoint') = 'object'
+      AND json_type(effective_state_json, '$.effectiveStateHash') = 'text'
+      AND length(json_extract(effective_state_json, '$.effectiveStateHash')) = 64
+      AND lower(json_extract(effective_state_json, '$.effectiveStateHash'))
+        = json_extract(effective_state_json, '$.effectiveStateHash')
+      AND json_extract(effective_state_json, '$.effectiveStateHash')
+        NOT GLOB '*[^0-9a-f]*'
+    ), 0) = 1
+  ),
+  effective_state_hash TEXT NOT NULL CHECK (
+    length(effective_state_hash) = 64
+    AND lower(effective_state_hash) = effective_state_hash
+    AND effective_state_hash NOT GLOB '*[^0-9a-f]*'
+  ),
+  evidence_window_state TEXT NOT NULL CHECK (
+    evidence_window_state IN ('open', 'sealed')
+  ),
+  effective_checkpoint_version INTEGER NOT NULL CHECK (
+    effective_checkpoint_version IN (1, 2)
+  ),
+  predecessor_event_position INTEGER,
+  predecessor_event_hash TEXT CHECK (
+    predecessor_event_hash IS NULL OR (
+      length(predecessor_event_hash) = 64
+      AND lower(predecessor_event_hash) = predecessor_event_hash
+      AND predecessor_event_hash NOT GLOB '*[^0-9a-f]*'
+    )
+  ),
+  source_contract_version INTEGER NOT NULL CHECK (source_contract_version = 1),
+  PRIMARY KEY (project_id, source_event_position),
+  UNIQUE (project_id, command_id),
+  FOREIGN KEY (project_id) REFERENCES project_meta(project_id),
+  CHECK (
+    (predecessor_event_position IS NULL)
+      = (predecessor_event_hash IS NULL)
+  ),
+  CHECK (
+    predecessor_event_position IS NULL
+    OR predecessor_event_position < source_event_position
+  ),
+  CHECK (
+    (workflow_generation = 1 AND predecessor_event_position IS NULL)
+    OR (workflow_generation > 1 AND predecessor_event_position IS NOT NULL)
+  ),
+  CHECK (
+    coalesce((
+      json_extract(effective_state_json, '$.effectiveStateHash')
+        IS effective_state_hash
+      AND json_extract(effective_state_json, '$.request.sessionId') IS session_id
+      AND json_extract(effective_state_json, '$.effectiveFinalCheckpoint.checkpointVersion')
+        IS effective_checkpoint_version
+      AND json_extract(effective_state_json, '$.request.requestVersion')
+        IS effective_checkpoint_version
+    ), 0) = 1
+  )
+) STRICT;
+
+CREATE INDEX lifecycle_legacy_effective_state_sources_event_lookup
+ON lifecycle_legacy_effective_state_sources(
+  project_id, source_event_position, source_event_hash
+);
+
+CREATE INDEX lifecycle_legacy_effective_state_sources_command_lookup
+ON lifecycle_legacy_effective_state_sources(project_id, command_id, command_hash);
+
+CREATE TRIGGER lifecycle_legacy_effective_state_sources_insert_guard
+BEFORE INSERT ON lifecycle_legacy_effective_state_sources
+WHEN NOT EXISTS (
+  SELECT 1
+  FROM events AS source_event
+  JOIN command_dedup AS command
+    ON command.project_id = source_event.project_id
+    AND command.command_id = source_event.command_id
+    AND command.idempotency_key = source_event.idempotency_key
+  LEFT JOIN lifecycle_legacy_effective_state_sources AS predecessor
+    ON predecessor.project_id = NEW.project_id
+    AND predecessor.source_event_position = NEW.predecessor_event_position
+  WHERE source_event.project_id IS NEW.project_id
+    AND source_event.global_position IS NEW.source_event_position
+    AND source_event.event_hash IS NEW.source_event_hash
+    AND source_event.event_type IN ('SessionEndRequested', 'SessionEndAmended')
+    AND source_event.event_schema_version IN (1, 2)
+    AND source_event.stream_type IS 'session'
+    AND source_event.stream_id IS 'session/' || NEW.session_id
+    AND source_event.session_id IS NEW.session_id
+    AND source_event.parent_session_id IS NULL
+    AND source_event.command_event_index = 0
+    AND source_event.lifecycle_intent_json IS NOT NULL
+    AND source_event.command_id IS NEW.command_id
+    AND command.state IS 'committed'
+    AND command.command_hash IS NEW.command_hash
+    AND (
+      (
+        NEW.workflow_generation = 1
+        AND source_event.event_type IS 'SessionEndRequested'
+        AND command.command_type IS 'request-session-end'
+        AND source_event.event_schema_version IS NEW.effective_checkpoint_version
+        AND json_extract(
+          source_event.lifecycle_intent_json,
+          '$.intent.command.request.requestVersion'
+        ) IS NEW.effective_checkpoint_version
+        AND json(json_extract(
+          source_event.lifecycle_intent_json, '$.intent.command.request'
+        )) IS json_extract(NEW.effective_state_json, '$.request')
+      )
+      OR (
+        NEW.workflow_generation > 1
+        AND source_event.event_type IS 'SessionEndAmended'
+        AND command.command_type IS 'amend-session-end'
+        AND json_extract(
+          source_event.lifecycle_intent_json, '$.intent.command.sessionId'
+        ) IS NEW.session_id
+        AND json_extract(
+          source_event.lifecycle_intent_json, '$.intent.command.workflowId'
+        ) IS NEW.workflow_id
+        AND json_extract(
+          source_event.payload_json, '$.previousWorkflowGeneration'
+        ) IS NEW.workflow_generation - 1
+        AND json_extract(
+          source_event.lifecycle_intent_json,
+          '$.intent.command.amendment.amendmentVersion'
+        ) IS source_event.event_schema_version
+        AND (
+          (
+            source_event.event_schema_version = 1
+            AND json_type(source_event.payload_json, '$.evidenceWindowAction') IS NULL
+          )
+          OR (
+            source_event.event_schema_version = 2
+            AND json_extract(
+              source_event.payload_json, '$.evidenceWindowAction'
+            ) IS json_extract(
+              source_event.lifecycle_intent_json,
+              '$.intent.command.amendment.evidenceWindowAction'
+            )
+          )
+        )
+        AND EXISTS (
+          SELECT 1
+          FROM lifecycle_legacy_effective_state_sources AS predecessor
+          WHERE predecessor.project_id IS NEW.project_id
+            AND predecessor.source_event_position = NEW.predecessor_event_position
+            AND predecessor.source_event_hash IS NEW.predecessor_event_hash
+            AND predecessor.session_id IS NEW.session_id
+            AND predecessor.workflow_id IS NEW.workflow_id
+            AND predecessor.workflow_generation = NEW.workflow_generation - 1
+        )
+        AND (
+          (
+            json_type(
+              source_event.lifecycle_intent_json,
+              '$.intent.command.amendment.childEndPolicy'
+            ) IS 'null'
+            AND json_extract(
+              NEW.effective_state_json, '$.request.childEndPolicy'
+            ) IS json_extract(
+              predecessor.effective_state_json, '$.request.childEndPolicy'
+            )
+          )
+          OR (
+            json_type(
+              source_event.lifecycle_intent_json,
+              '$.intent.command.amendment.childEndPolicy'
+            ) IS NOT NULL
+            AND json_type(
+              source_event.lifecycle_intent_json,
+              '$.intent.command.amendment.childEndPolicy'
+            ) IS NOT 'null'
+            AND json_extract(
+              NEW.effective_state_json, '$.request.childEndPolicy'
+            ) IS json_extract(
+              source_event.lifecycle_intent_json,
+              '$.intent.command.amendment.childEndPolicy'
+            )
+          )
+        )
+        AND (
+          (
+            json_type(
+              source_event.lifecycle_intent_json,
+              '$.intent.command.amendment.finalCheckpoint'
+            ) IS 'null'
+            AND json(json_extract(
+              NEW.effective_state_json, '$.request.finalCheckpoint'
+            )) IS json(json_extract(
+              predecessor.effective_state_json, '$.request.finalCheckpoint'
+            ))
+          )
+          OR (
+            json_type(
+              source_event.lifecycle_intent_json,
+              '$.intent.command.amendment.finalCheckpoint'
+            ) IS NOT NULL
+            AND json_type(
+              source_event.lifecycle_intent_json,
+              '$.intent.command.amendment.finalCheckpoint'
+            ) IS NOT 'null'
+            AND json(json_extract(
+              NEW.effective_state_json, '$.request.finalCheckpoint'
+            )) IS json(json_extract(
+              source_event.lifecycle_intent_json,
+              '$.intent.command.amendment.finalCheckpoint'
+            ))
+          )
+        )
+        AND (
+          (
+            json_type(
+              source_event.lifecycle_intent_json,
+              '$.intent.command.amendment.validationProfileIds'
+            ) IS 'null'
+            AND json(json_extract(
+              NEW.effective_state_json, '$.request.validationProfileIds'
+            )) IS json(json_extract(
+              predecessor.effective_state_json, '$.request.validationProfileIds'
+            ))
+          )
+          OR (
+            json_type(
+              source_event.lifecycle_intent_json,
+              '$.intent.command.amendment.validationProfileIds'
+            ) IS NOT NULL
+            AND json_type(
+              source_event.lifecycle_intent_json,
+              '$.intent.command.amendment.validationProfileIds'
+            ) IS NOT 'null'
+            AND json(json_extract(
+              NEW.effective_state_json, '$.request.validationProfileIds'
+            )) IS json(json_extract(
+              source_event.lifecycle_intent_json,
+              '$.intent.command.amendment.validationProfileIds'
+            ))
+          )
+        )
+        AND (
+          (
+            json_type(
+              source_event.lifecycle_intent_json,
+              '$.intent.command.amendment.requestedQualityThreshold'
+            ) IS 'null'
+            AND json_extract(
+              NEW.effective_state_json, '$.request.requestedQualityThreshold'
+            ) IS json_extract(
+              predecessor.effective_state_json, '$.request.requestedQualityThreshold'
+            )
+          )
+          OR (
+            json_type(
+              source_event.lifecycle_intent_json,
+              '$.intent.command.amendment.requestedQualityThreshold'
+            ) IS NOT NULL
+            AND json_type(
+              source_event.lifecycle_intent_json,
+              '$.intent.command.amendment.requestedQualityThreshold'
+            ) IS NOT 'null'
+            AND json_extract(
+              NEW.effective_state_json, '$.request.requestedQualityThreshold'
+            ) IS json_extract(
+              source_event.lifecycle_intent_json,
+              '$.intent.command.amendment.requestedQualityThreshold'
+            )
+          )
+        )
+        AND (
+          (
+            json_type(
+              source_event.lifecycle_intent_json,
+              '$.intent.command.amendment.requireFullEvidence'
+            ) IS 'null'
+            AND json_extract(
+              NEW.effective_state_json, '$.request.requireFullEvidence'
+            ) IS json_extract(
+              predecessor.effective_state_json, '$.request.requireFullEvidence'
+            )
+          )
+          OR (
+            json_type(
+              source_event.lifecycle_intent_json,
+              '$.intent.command.amendment.requireFullEvidence'
+            ) IS NOT NULL
+            AND json_type(
+              source_event.lifecycle_intent_json,
+              '$.intent.command.amendment.requireFullEvidence'
+            ) IS NOT 'null'
+            AND json_extract(
+              NEW.effective_state_json, '$.request.requireFullEvidence'
+            ) IS json_extract(
+              source_event.lifecycle_intent_json,
+              '$.intent.command.amendment.requireFullEvidence'
+            )
+          )
+        )
+        AND (
+          (
+            json_type(
+              source_event.lifecycle_intent_json,
+              '$.intent.command.amendment.requireMaterialization'
+            ) IS 'null'
+            AND json_extract(
+              NEW.effective_state_json, '$.request.requireMaterialization'
+            ) IS json_extract(
+              predecessor.effective_state_json, '$.request.requireMaterialization'
+            )
+          )
+          OR (
+            json_type(
+              source_event.lifecycle_intent_json,
+              '$.intent.command.amendment.requireMaterialization'
+            ) IS NOT NULL
+            AND json_type(
+              source_event.lifecycle_intent_json,
+              '$.intent.command.amendment.requireMaterialization'
+            ) IS NOT 'null'
+            AND json_extract(
+              NEW.effective_state_json, '$.request.requireMaterialization'
+            ) IS json_extract(
+              source_event.lifecycle_intent_json,
+              '$.intent.command.amendment.requireMaterialization'
+            )
+          )
+        )
+        AND (
+          (
+            CASE
+              WHEN source_event.event_schema_version = 1 THEN 'unchanged'
+              ELSE json_extract(source_event.payload_json, '$.evidenceWindowAction')
+            END IS 'unchanged'
+            AND NEW.evidence_window_state IS (
+              SELECT predecessor.evidence_window_state
+              FROM lifecycle_legacy_effective_state_sources AS predecessor
+              WHERE predecessor.project_id IS NEW.project_id
+                AND predecessor.source_event_position = NEW.predecessor_event_position
+            )
+            AND NEW.effective_checkpoint_version IS (
+              SELECT predecessor.effective_checkpoint_version
+              FROM lifecycle_legacy_effective_state_sources AS predecessor
+              WHERE predecessor.project_id IS NEW.project_id
+                AND predecessor.source_event_position = NEW.predecessor_event_position
+            )
+          )
+          OR (
+            json_extract(source_event.payload_json, '$.evidenceWindowAction') IS 'open'
+            AND NEW.evidence_window_state IS 'open'
+            AND NEW.effective_checkpoint_version IS 2
+            AND (
+              SELECT predecessor.evidence_window_state
+              FROM lifecycle_legacy_effective_state_sources AS predecessor
+              WHERE predecessor.project_id IS NEW.project_id
+                AND predecessor.source_event_position = NEW.predecessor_event_position
+            ) IS 'sealed'
+          )
+          OR (
+            json_extract(source_event.payload_json, '$.evidenceWindowAction') IS 'seal'
+            AND NEW.evidence_window_state IS 'sealed'
+            AND NEW.effective_checkpoint_version IS 2
+            AND (
+              SELECT predecessor.evidence_window_state
+              FROM lifecycle_legacy_effective_state_sources AS predecessor
+              WHERE predecessor.project_id IS NEW.project_id
+                AND predecessor.source_event_position = NEW.predecessor_event_position
+            ) IS 'open'
+          )
+        )
+      )
+    )
+    AND json_type(source_event.payload_json, '$.workflowId') = 'text'
+    AND json_extract(source_event.payload_json, '$.workflowId') IS NEW.workflow_id
+    AND json_type(source_event.payload_json, '$.workflowGeneration') = 'integer'
+    AND json_extract(source_event.payload_json, '$.workflowGeneration') IS NEW.workflow_generation
+    AND json_type(NEW.effective_state_json, '$.effectiveStateHash') = 'text'
+    AND json_extract(NEW.effective_state_json, '$.effectiveStateHash') IS NEW.effective_state_hash
+    AND coalesce((
+      ${effectiveStateCanonicalGuard("NEW.effective_state_json")}
+    ), 0) = 1
+    AND json_type(NEW.effective_state_json, '$.request.sessionId') = 'text'
+    AND json_extract(NEW.effective_state_json, '$.request.sessionId') IS NEW.session_id
+    AND json_type(NEW.effective_state_json, '$.request.requestVersion') = 'integer'
+    AND json_extract(NEW.effective_state_json, '$.request.requestVersion') IS NEW.effective_checkpoint_version
+    AND json_type(NEW.effective_state_json, '$.effectiveFinalCheckpoint.checkpointVersion') = 'integer'
+    AND json_extract(NEW.effective_state_json, '$.effectiveFinalCheckpoint.checkpointVersion') IS NEW.effective_checkpoint_version
+    AND (
+      source_event.event_type IS NOT 'SessionEndRequested'
+      OR NEW.evidence_window_state IS CASE
+        WHEN NEW.effective_checkpoint_version = 1 THEN 'sealed'
+        ELSE 'open'
+      END
+    )
+)
+BEGIN
+  SELECT RAISE(ABORT, 'LEGACY_EFFECTIVE_STATE_SOURCE_INVALID');
+END;
+
+CREATE TRIGGER lifecycle_legacy_effective_state_sources_no_update
+BEFORE UPDATE ON lifecycle_legacy_effective_state_sources
+BEGIN
+  SELECT RAISE(ABORT, 'LEGACY_EFFECTIVE_STATE_SOURCE_IMMUTABLE');
+END;
+
+CREATE TRIGGER lifecycle_legacy_effective_state_sources_no_delete
+BEFORE DELETE ON lifecycle_legacy_effective_state_sources
+BEGIN
+  SELECT RAISE(ABORT, 'LEGACY_EFFECTIVE_STATE_SOURCE_IMMUTABLE');
+END;
 `),
 };

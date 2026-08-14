@@ -26,7 +26,6 @@ import {
   type LifecycleRenderTriggerV1,
   type MaterializationProjectionInputV1,
 } from "../lifecycle/materialization-queue.port.js";
-import { decodeSessionEndEffectiveStateV1 } from "../lifecycle/session-end-effective-state.js";
 import { canonicalJson } from "../serialization/canonical-json.js";
 import type { AuthenticatedLifecycleCommandV1 } from "./sqlite-lifecycle-render-closure.reader.js";
 
@@ -252,18 +251,18 @@ function legacySemantics(
   eventType: LifecycleEventType,
   eventSchemaVersion: number,
   payload: Record<string, unknown>,
+  command: AuthenticatedLifecycleCommandV1,
   witness: LifecycleIntentWitnessV1,
 ): LifecycleRenderEventV1["legacyIntentSemantics"] {
   if (eventType !== "SessionEndRequested" && eventType !== "SessionEndAmended") return null;
   if (eventSchemaVersion === 3) return null;
-  const command = record(witness.intent.command);
+  const witnessCommand = record(witness.intent.command);
   const expectedCommandType = eventType === "SessionEndRequested"
     ? "request-session-end"
     : "amend-session-end";
-  if (command.commandType !== expectedCommandType) return integrity();
-  const effectiveStateSource = command.effectiveState;
-  if (effectiveStateSource === undefined) return integrity();
-  const effectiveState = decodeSessionEndEffectiveStateV1(effectiveStateSource);
+  if (witnessCommand.commandType !== expectedCommandType) return integrity();
+  const effectiveState = command.legacyEffectiveState ?? null;
+  if (effectiveState === null) return integrity();
   const evidenceWindowAction = eventType === "SessionEndAmended"
     ? eventSchemaVersion === 1
       ? "unchanged"
@@ -308,6 +307,7 @@ function semanticEvent(
       eventType,
       event.eventSchemaVersion,
       payloadRecord,
+      command,
       validated.witness,
     ),
   });
