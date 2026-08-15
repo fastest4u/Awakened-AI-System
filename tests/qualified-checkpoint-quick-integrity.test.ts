@@ -9,6 +9,7 @@ import { afterEach, it } from "node:test";
 import type { ProjectContext } from "../src/orchestrator/identity/contracts.js";
 import { EventIntegrityService } from "../src/orchestrator/integrity/event-integrity.service.js";
 import { LifecycleIntegrityService } from "../src/orchestrator/integrity/lifecycle-integrity.service.js";
+import { outboxHash, payloadHash } from "../src/orchestrator/crypto/event-hash.js";
 import type {
   HistoricalEvidenceIntegrityProviderPort,
   IntegrityIssueCode,
@@ -320,6 +321,7 @@ function rawEvent(
     readonly sessionId: string;
     readonly parentSessionId?: string | null;
     readonly payload: unknown;
+    readonly payloadHashValue?: string;
     readonly lifecycleIntent?: string | null;
     readonly idempotencyKey?: string;
   },
@@ -358,7 +360,7 @@ function rawEvent(
     evidence_refs_json: "[]",
     evidence_digests_json: "[]",
     payload_json: canonicalJson(input.payload),
-    payload_hash: H64,
+    payload_hash: input.payloadHashValue ?? H64,
     previous_global_hash: H64_B,
     event_hash: H64,
     lifecycle_intent_json: input.lifecycleIntent ?? null,
@@ -713,6 +715,14 @@ function addSchema4TerminalLifecycleOutbox(fixture: Fixture): string {
     terminal_event_type: "SessionAbandoned",
     terminal_at: NOW,
   });
+  const eventPayload = {
+    workflowId: null,
+    workflowGeneration: null,
+    approvalId: uuid(700_001),
+    preTransitionCheckpointId: uuid(700_002),
+    reasonCode: "direct-abandon",
+    authorityCommitment: abandoned.authority_commitment,
+  } as const;
   rawEvent(fixture.connection, {
     globalPosition: 2n,
     streamId: `session/${ROOT_ID}`,
@@ -720,14 +730,8 @@ function addSchema4TerminalLifecycleOutbox(fixture: Fixture): string {
     eventType: "SessionAbandoned",
     eventSchemaVersion: 1,
     sessionId: ROOT_ID,
-    payload: {
-      workflowId: null,
-      workflowGeneration: null,
-      approvalId: uuid(700_001),
-      preTransitionCheckpointId: uuid(700_002),
-      reasonCode: "direct-abandon",
-      authorityCommitment: abandoned.authority_commitment,
-    },
+    payload: eventPayload,
+    payloadHashValue: payloadHash(eventPayload),
   });
   fixture.connection.prepare(`
     UPDATE streams SET current_version = 2, updated_at = $now
@@ -758,34 +762,40 @@ function addSchema4TerminalLifecycleOutbox(fixture: Fixture): string {
   });
   const targetKey = `lifecycle-log/${ROOT_ID}/2`;
   const artifactPath = `05_Agent_Session_Logs/2026-07-30-session-${ROOT_ID}.md`;
+  const triggeringEvent = fixture.connection.prepare(`
+    SELECT payload_hash FROM events
+    WHERE project_id = $projectId AND global_position = 2
+  `).get({ $projectId: PROJECT_ID });
+  assert.equal(typeof triggeringEvent?.payload_hash, "string");
+  const payload = {
+    payloadVersion: 1,
+    targetKey,
+    sessionId: ROOT_ID,
+    artifactKind: "compatibility-session-log",
+    artifactPath,
+    materializationRevision: "2",
+    triggeringPayloadHash: String(triggeringEvent!.payload_hash),
+    nextFingerprint: {
+      algorithm: "hmac-sha256",
+      schemaVersion: 1,
+      keyId: "materialization-key",
+      domain: "pm-materialization-fingerprint-v1",
+      value: H64_B,
+    },
+    origin: {
+      kind: "terminal-event",
+      workflowId: null,
+      workflowGeneration: null,
+    },
+    triggeringEventType: "SessionAbandoned",
+  } as const;
   rawInsert(fixture.connection, "outbox", {
     project_id: PROJECT_ID,
     target_key: targetKey,
     event_position: 2,
     kind: "materialize-lifecycle-log",
-    payload_json: canonicalJson({
-      payloadVersion: 1,
-      targetKey,
-      sessionId: ROOT_ID,
-      artifactKind: "compatibility-session-log",
-      artifactPath,
-      materializationRevision: "2",
-      triggeringPayloadHash: H64,
-      nextFingerprint: {
-        algorithm: "hmac-sha256",
-        schemaVersion: 1,
-        keyId: "materialization-key",
-        domain: "pm-materialization-fingerprint-v1",
-        value: H64_B,
-      },
-      origin: {
-        kind: "terminal-event",
-        workflowId: null,
-        workflowGeneration: null,
-      },
-      triggeringEventType: "SessionAbandoned",
-    }),
-    content_hash: H64,
+    payload_json: canonicalJson(payload),
+    content_hash: outboxHash(payload),
     status: "pending",
     attempt_count: 0,
     claim_owner: null,
@@ -1329,17 +1339,22 @@ function observedConnection(connection: SqliteConnection): {
       && /LIMIT\s+1001/i.test(sql)
       && !/GROUP\s+BY|HAVING/i.test(sql)
     )) unboundedLifetimeReads += 1;
-    const quickOutboxProbe = /lifecycle-quick:outbox-/i.test(sql);
+    const quickOutboxProbe = /lifecycle-quick:outbox-(?!start)/i.test(sql);
     if (quickOutboxProbe) {
       const nullSessionProbe = /lifecycle-quick:outbox-null-session/i.test(sql);
+      const predecessorProbe = /lifecycle-quick:outbox-predecessor/i.test(sql);
       const expectedIndex = nullSessionProbe
         ? /INDEXED\s+BY\s+outbox_delivery_order/i
         : /INDEXED\s+BY\s+outbox_lifecycle_latest_artifact/i;
       if (
         !expectedIndex.test(sql)
         || !/project_id\s*=\s*\$projectId/i.test(sql)
-        || !/LIMIT\s+1/i.test(sql)
+        || !(predecessorProbe ? /LIMIT\s+2/i : /LIMIT\s+1/i).test(sql)
         || /ORDER\s+BY|GROUP\s+BY|HAVING/i.test(sql)
+        || (
+          !nullSessionProbe && !predecessorProbe
+          && !/artifact_kind\s*=\s*'compatibility-session-log'/i.test(sql)
+        )
       ) unboundedOutboxReads += 1;
     }
     if (
@@ -1356,6 +1371,7 @@ function observedConnection(connection: SqliteConnection): {
       /SELECT\s+occurred_at\s+FROM\s+events/i.test(sql)
       && /event_type\s*=\s*'SessionStarted'/i.test(sql)
       && /\$sessionId/i.test(sql)
+      && !/lifecycle-(?:quick|full):outbox-start/i.test(sql)
     ) unboundedOutboxReads += 1;
     if (
       /FROM\s+session_evidence_coverage_transitions/i.test(sql)
@@ -4653,7 +4669,9 @@ it("schema 4 full integrity owns lifecycle outbox overlay discovery while quick 
     $projectId: PROJECT_ID,
     $targetKey: targetKey,
   });
-  assert.deepEqual((await quickIssues(corrupted)).issues, []);
+  assert.deepEqual((await quickIssues(corrupted)).issues, [
+    "LIFECYCLE_OUTBOX_INVARIANT_MISMATCH",
+  ]);
   assert.ok(directOutboxShapeIssues(corrupted, true).includes(
     "LIFECYCLE_OUTBOX_INVARIANT_MISMATCH",
   ));
@@ -4672,7 +4690,9 @@ it("schema 4 full integrity rejects reserved lifecycle work with a null session"
     UPDATE outbox SET kind = 'materialize-lifecycle-log'
     WHERE project_id = $projectId AND target_key = $targetKey
   `).run({ $projectId: PROJECT_ID, $targetKey: targetKey });
-  assert.deepEqual((await quickIssues(corrupted)).issues, []);
+  assert.deepEqual((await quickIssues(corrupted)).issues, [
+    "LIFECYCLE_OUTBOX_INVARIANT_MISMATCH",
+  ]);
   assert.ok(directOutboxShapeIssues(corrupted, true).includes(
     "LIFECYCLE_OUTBOX_INVARIANT_MISMATCH",
   ));
@@ -4722,7 +4742,9 @@ it("schema 4 full integrity enforces outbox attempt and claim parity", async () 
     if ("ignoreChecks" in mutation && mutation.ignoreChecks === true) {
       corrupted.connection.exec("PRAGMA ignore_check_constraints = OFF");
     }
-    assert.deepEqual((await quickIssues(corrupted)).issues, [], mutation.label);
+    assert.deepEqual((await quickIssues(corrupted)).issues, [
+      "LIFECYCLE_OUTBOX_INVARIANT_MISMATCH",
+    ], mutation.label);
     assert.ok(
       directOutboxShapeIssues(corrupted, true).includes(
         "LIFECYCLE_OUTBOX_INVARIANT_MISMATCH",
@@ -4868,7 +4890,13 @@ it("schema 4 full integrity independently binds every lifecycle outbox field", a
     const targetKey = addSchema4TerminalLifecycleOutbox(corrupted);
     dropSchema4OutboxMutationGuards(corrupted.connection);
     mutation.apply(corrupted, targetKey);
-    assert.deepEqual((await quickIssues(corrupted)).issues, [], mutation.label);
+    assert.deepEqual(
+      (await quickIssues(corrupted)).issues,
+      mutation.label === "outer artifact kind"
+        ? []
+        : ["LIFECYCLE_OUTBOX_INVARIANT_MISMATCH"],
+      mutation.label,
+    );
     assert.ok(
       directOutboxShapeIssues(corrupted, true).includes(
         "LIFECYCLE_OUTBOX_INVARIANT_MISMATCH",

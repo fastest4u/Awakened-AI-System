@@ -71,6 +71,12 @@ function transaction(connection: OperationalConnection): LifecycleOperationalRep
   return {
     workflows: { stage },
     outbox: { stage },
+    outboxPlans: {
+      getExactPlannedRevision: () => null,
+      assertExactPlannedRevision: () => {
+        throw new Error("no planned lifecycle outbox in operational test");
+      },
+    },
   };
 }
 
@@ -180,7 +186,7 @@ describe("LifecycleOperationalStore", () => {
     });
 
     store.execute(work(), (received) => {
-      assert.deepEqual(Object.keys(received), ["workflows"]);
+      assert.deepEqual(Object.keys(received), ["workflows", "outboxPlans"]);
       assert.equal("outbox" in received, false);
       stage(received.workflows, "workflow-only");
       return null;
@@ -199,7 +205,7 @@ describe("LifecycleOperationalStore", () => {
 
     const result = store.execute(work(), (received) => {
       assert.notEqual(received, tx);
-      assert.deepEqual(Object.keys(received), ["workflows"]);
+      assert.deepEqual(Object.keys(received), ["workflows", "outboxPlans"]);
       stage(received.workflows, "workflow-renew");
       return { renewed: true };
     });
@@ -208,6 +214,46 @@ describe("LifecycleOperationalStore", () => {
     assert.deepEqual(result.work, work());
     assert.deepEqual(connection.statements, ["BEGIN IMMEDIATE", "COMMIT"]);
     assert.deepEqual(connection.committed, ["workflow-renew"]);
+  });
+
+  it("exposes immutable outbox plans only to workflow operations", () => {
+    const connection = new OperationalConnection();
+    const store = new LifecycleOperationalStore({
+      connection,
+      transaction: () => transaction(connection),
+    });
+
+    store.execute(work(), (received) => {
+      assert.deepEqual(Object.keys(received), ["workflows", "outboxPlans"]);
+      assert.equal(typeof received.outboxPlans.getExactPlannedRevision, "function");
+      assert.equal(typeof received.outboxPlans.assertExactPlannedRevision, "function");
+      assert.equal("outbox" in received, false);
+      assert.equal("claim" in received.outboxPlans, false);
+      assert.equal("acknowledge" in received.outboxPlans, false);
+      return null;
+    });
+
+    store.execute(outboxWork(), (received) => {
+      assert.deepEqual(Object.keys(received), ["outbox"]);
+      assert.equal("outboxPlans" in received, false);
+      return null;
+    });
+  });
+
+  it("does not expose lifecycle plan mutation capabilities to workflow operations", () => {
+    const connection = new OperationalConnection();
+    const store = new LifecycleOperationalStore({
+      connection,
+      transaction: () => transaction(connection),
+    });
+
+    store.execute(work(), (received) => {
+      const plans = received.outboxPlans as unknown as Record<string, unknown>;
+      for (const mutation of ["claim", "lease", "acknowledge", "fail", "retry", "insertLifecycle"]) {
+        assert.equal(mutation in plans, false, mutation);
+      }
+      return null;
+    });
   });
 
   it("projects only the outbox facade for materialization work", () => {
@@ -524,12 +570,18 @@ void compileTimeSynchronousAfterCommit;
 function compileTimeKindSpecificOperationalBoundary(store: LifecycleOperationalStore): void {
   store.execute(work(), (tx) => {
     void tx.workflows;
+    void tx.outboxPlans.getExactPlannedRevision;
+    void tx.outboxPlans.assertExactPlannedRevision;
+    // @ts-expect-error workflow work cannot access mutable lifecycle outbox operations
+    tx.outboxPlans.claim("target");
     // @ts-expect-error workflow work cannot access the outbox facade
     void tx.outbox;
     return null;
   });
   store.execute(outboxWork(), (tx) => {
     void tx.outbox;
+    // @ts-expect-error outbox work cannot access immutable lifecycle plan reads
+    void tx.outboxPlans;
     // @ts-expect-error outbox work cannot access the workflow facade
     void tx.workflows;
     return null;

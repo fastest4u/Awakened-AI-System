@@ -1,16 +1,25 @@
 import { createHash } from "node:crypto";
 import type { StoredEvent } from "../contracts/event.js";
-import { payloadHash } from "../crypto/event-hash.js";
+import { outboxHash, payloadHash } from "../crypto/event-hash.js";
 import { canonicalJson } from "../serialization/canonical-json.js";
 import {
   decodeLifecycleEvent,
   decodeLegacyLifecycleEvent,
+  decodeLifecycleEventPayload,
   LIFECYCLE_EVENT_TYPES,
   type EvidenceCoverageRecordedV2,
   type LifecycleEvent,
   type LifecycleEventCodecResult,
   type LifecycleEvidenceFrameRecordedV1,
 } from "../lifecycle/contracts/events.js";
+import {
+  COMPATIBILITY_SESSION_LOG_ARTIFACT_KIND,
+  decodeLifecycleMaterializationPayloadV1,
+  type LifecycleRenderClosureV1,
+  type LifecycleRenderEventV1,
+  type LifecycleRenderTriggerV1,
+  type LifecycleMaterializationPayloadV1,
+} from "../lifecycle/materialization-queue.port.js";
 import {
   advanceEvidenceCoverageIntervals,
 } from "../lifecycle/evidence-coverage-accumulator.js";
@@ -66,6 +75,10 @@ import {
   type WorkflowGenerationFoldCursor,
 } from "../storage/lifecycle-projection.repository.js";
 import { SessionAuthorityRepository } from "../storage/session-authority.repository.js";
+import { SqliteLifecycleRenderClosureReader } from "../materialization/sqlite-lifecycle-render-closure.reader.js";
+import { projectCompatibilityLogV2 } from "../materialization/compatibility-log.projection.js";
+import { renderCompatibilityLogV2 } from "../materialization/compatibility-log.renderer.js";
+import { deriveCompatibilityLogTarget } from "../materialization/vault-artifact-path.js";
 import {
   decodePersistedValidationPlansV1,
   hydrateSessionEndEffectiveStateV1,
@@ -788,6 +801,7 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
     } else {
       this.runFullOnly(context, sink, true);
     }
+    await this.checkLifecycleOutboxFullReplay(context, sink);
   }
 
   private runQuickCheck(
@@ -820,6 +834,124 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
     this.checkWorkflowClaims(context, sink, historyAlreadyReplayed);
     this.checkSchema4LifetimeFull(context, sink);
     this.checkOutboxShape(context, sink, true);
+  }
+
+  private async checkLifecycleOutboxFullReplay(
+    context: ProjectContext,
+    sink: IntegrityIssueSink,
+  ): Promise<void> {
+    if (!this.hasSchema4LifecycleSchema(context)) return;
+    const rows = this.connection.prepare(`
+      SELECT outbox.*
+      FROM outbox
+      WHERE outbox.project_id = $projectId
+        AND outbox.kind = 'materialize-lifecycle-log'
+        AND outbox.session_id IS NOT NULL
+        AND outbox.artifact_kind = '${COMPATIBILITY_SESSION_LOG_ARTIFACT_KIND}'
+      ORDER BY outbox.session_id, outbox.materialization_revision
+    `).all({ $projectId: context.binding.projectId });
+    const reader = new SqliteLifecycleRenderClosureReader(this.connection);
+    for (const row of rows) {
+      let rendered: Buffer | null = null;
+      try {
+        this.assertSchema4LifecycleOutboxDescriptor(context, row, true);
+        const rawPayload = parsedCanonicalJson(row.payload_json);
+        const payload = decodeLifecycleMaterializationPayloadV1(rawPayload);
+        const revision = int64(row.event_position);
+        const sessionId = row.session_id;
+        if (
+          revision === null
+          || revision >= SQLITE_INT64_MAX
+          || typeof sessionId !== "string"
+        ) throw new LifecycleError("INTEGRITY_FAILURE");
+
+        const expanded = reader.readStrictLifecycleClosure(
+          context.binding.projectId,
+          sessionId as never,
+          revision + 1n,
+        );
+        const triggerEvent = expanded.root.find((event) => (
+          BigInt(event.globalPosition) === revision
+        ));
+        if (triggerEvent === undefined) throw new LifecycleError("INTEGRITY_FAILURE");
+        const before = (event: LifecycleRenderEventV1): boolean => (
+          BigInt(event.globalPosition) < revision
+        );
+        const closure: LifecycleRenderClosureV1 = Object.freeze({
+          root: Object.freeze(expanded.root.filter(before)),
+          directChildren: Object.freeze(expanded.directChildren.map((child) => Object.freeze({
+            childSessionId: child.childSessionId,
+            events: Object.freeze(child.events.filter(before)),
+          }))),
+          foreignClaims: Object.freeze(expanded.foreignClaims
+            .filter((pair) => before(pair.fork) && before(pair.claim))),
+        });
+        const trigger: LifecycleRenderTriggerV1 = Object.freeze({
+          ...triggerEvent,
+          materializationOrigin: payload.origin,
+        });
+        const started = closure.root[0];
+        if (started === undefined) throw new LifecycleError("INTEGRITY_FAILURE");
+        const target = deriveCompatibilityLogTarget(
+          started.occurredAt,
+          sessionId as never,
+          revision,
+        );
+        if (
+          target.targetKey !== payload.targetKey
+          || target.artifactPath !== payload.artifactPath
+          || target.materializationRevision !== payload.materializationRevision
+          || target.targetKey !== row.target_key
+          || target.artifactPath !== row.artifact_path
+        ) throw new LifecycleError("INTEGRITY_FAILURE");
+        const projection = projectCompatibilityLogV2({ closure, trigger, target });
+        if (
+          projection.materialization.triggeringEventType !== payload.triggeringEventType
+          || projection.materialization.triggeringEventPosition !== revision.toString()
+          || projection.materialization.triggeringPayloadHash !== payload.triggeringPayloadHash
+        ) throw new LifecycleError("INTEGRITY_FAILURE");
+        rendered = renderCompatibilityLogV2(projection);
+
+        if (this.provider !== undefined) {
+          const keyId = payload.nextFingerprint.keyId;
+          let status: "available" | "revoked" | "unavailable";
+          try {
+            status = await this.provider.status(keyId);
+          } catch (error) {
+            if (error instanceof HistoricalEvidenceKeyUnavailableError) {
+              throw new LifecycleError("EVIDENCE_HISTORICAL_KEY_UNAVAILABLE");
+            }
+            throw new LifecycleError("INTEGRITY_FAILURE");
+          }
+          if (status === "revoked" || status === "unavailable") {
+            throw new LifecycleError("EVIDENCE_HISTORICAL_KEY_UNAVAILABLE");
+          }
+          if (status !== "available") throw new LifecycleError("INTEGRITY_FAILURE");
+          let recomputed: string;
+          try {
+            recomputed = await this.provider.fingerprint(keyId, rendered);
+          } catch (error) {
+            if (error instanceof HistoricalEvidenceKeyUnavailableError) {
+              throw new LifecycleError("EVIDENCE_HISTORICAL_KEY_UNAVAILABLE");
+            }
+            throw new LifecycleError("INTEGRITY_FAILURE");
+          }
+          if (
+            !LOWER_HASH.test(recomputed)
+            || recomputed !== payload.nextFingerprint.value
+            || recomputed !== row.next_fingerprint
+          ) throw new LifecycleError("INTEGRITY_FAILURE");
+        }
+      } catch (error) {
+        if (
+          error instanceof LifecycleError
+          && error.code === "EVIDENCE_HISTORICAL_KEY_UNAVAILABLE"
+        ) throw error;
+        issue(sink, "LIFECYCLE_OUTBOX_INVARIANT_MISMATCH");
+      } finally {
+        rendered?.fill(0);
+      }
+    }
   }
 
   private async checkQualifiedQuick(
@@ -7128,10 +7260,9 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
     full: boolean,
   ): void {
     const schema4 = this.hasSchema4LifecycleSchema(context);
-    if (schema4 && !full) return;
     if (schema4) {
       const reservedWithoutSession = this.connection.prepare(`
-        SELECT /* lifecycle-full:outbox-null-session */ 1 AS invalid
+        SELECT /* lifecycle-${full ? "full" : "quick"}:outbox-null-session */ 1 AS invalid
         FROM outbox INDEXED BY outbox_delivery_order
         WHERE project_id = $projectId
           AND kind = 'materialize-lifecycle-log'
@@ -7143,19 +7274,42 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
         return;
       }
     }
-    const rows = this.connection.prepare(`
-      SELECT outbox.*, event.session_id AS event_session_id,
-             workflow.generation AS current_workflow_generation
-      FROM outbox
-      LEFT JOIN events AS event ON event.global_position = outbox.event_position
-      LEFT JOIN workflow_instances AS workflow
-        ON workflow.project_id = outbox.project_id
-       AND workflow.workflow_id = outbox.workflow_id
-      WHERE outbox.project_id = $projectId AND outbox.session_id IS NOT NULL
-      ORDER BY outbox.session_id, outbox.artifact_kind, outbox.materialization_revision
-    `).all({ $projectId: context.binding.projectId });
+    const rows = this.connection.prepare(full
+      ? `
+        SELECT outbox.*, event.session_id AS event_session_id,
+               workflow.generation AS current_workflow_generation
+        FROM outbox
+        LEFT JOIN events AS event ON event.global_position = outbox.event_position
+        LEFT JOIN workflow_instances AS workflow
+          ON workflow.project_id = outbox.project_id
+         AND workflow.workflow_id = outbox.workflow_id
+        WHERE outbox.project_id = $projectId AND outbox.session_id IS NOT NULL
+        ORDER BY outbox.session_id, outbox.artifact_kind, outbox.materialization_revision
+      `
+      : `
+        SELECT outbox.*, event.session_id AS event_session_id,
+               workflow.generation AS current_workflow_generation
+        FROM outbox INDEXED BY outbox_lifecycle_latest_artifact
+        LEFT JOIN events AS event ON event.global_position = outbox.event_position
+        LEFT JOIN workflow_instances AS workflow
+          ON workflow.project_id = outbox.project_id
+         AND workflow.workflow_id = outbox.workflow_id
+        WHERE outbox.project_id = $projectId
+          AND outbox.session_id IS NOT NULL
+          AND outbox.artifact_kind = '${COMPATIBILITY_SESSION_LOG_ARTIFACT_KIND}'
+      `).all({ $projectId: context.binding.projectId });
+    if (!full) {
+      rows.sort((left, right) => {
+        const session = String(left.session_id).localeCompare(String(right.session_id));
+        if (session !== 0) return session;
+        const revision = int64(left.materialization_revision);
+        const otherRevision = int64(right.materialization_revision);
+        if (revision === null || otherRevision === null) return 0;
+        return revision < otherRevision ? -1 : revision > otherRevision ? 1 : 0;
+      });
+    }
     const previous = new Map<string, {
-      revision: number;
+      revision: bigint;
       fingerprint: unknown;
       artifactPath: unknown;
     }>();
@@ -7179,7 +7333,7 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
           && positive(row.workflow_generation);
       const statusValid = row.status === "pending"
         ? integer(row.attempt_count) !== null
-          && integer(row.attempt_count)! >= 0
+          && integer(row.attempt_count)! === 0
           && allNull(row, ["claim_owner", "claim_token", "claim_expires_at"])
           && (
             allNull(row, ["failure_class", "safe_error_code", "next_attempt_at"])
@@ -7203,7 +7357,9 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
               && row.claim_expires_at === null
               && allNull(row, ["failure_class", "safe_error_code", "next_attempt_at"])
             : row.status === "failed"
-              ? allNull(row, ["claim_owner", "claim_token", "claim_expires_at"])
+              ? integer(row.attempt_count) !== null
+                && integer(row.attempt_count)! > 0
+                && allNull(row, ["claim_owner", "claim_token", "claim_expires_at"])
                 && (row.failure_class === "retryable" || row.failure_class === "permanent")
                 && nonEmpty(row.safe_error_code)
                 && ((row.failure_class === "retryable") === nonEmpty(row.next_attempt_at))
@@ -7211,7 +7367,7 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
       let schema4DescriptorValid = true;
       if (schema4 && row.kind === "materialize-lifecycle-log") {
         try {
-          this.assertSchema4LifecycleOutboxDescriptor(context, row);
+          this.assertSchema4LifecycleOutboxDescriptor(context, row, full);
         } catch {
           schema4DescriptorValid = false;
         }
@@ -7229,13 +7385,23 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
         issue(sink, "LIFECYCLE_OUTBOX_INVARIANT_MISMATCH");
         return;
       }
-      if (!full) continue;
+      if (!full) {
+        if (
+          schema4
+          && row.kind === "materialize-lifecycle-log"
+          && !this.quickOutboxPredecessorValid(row)
+        ) {
+          issue(sink, "LIFECYCLE_OUTBOX_INVARIANT_MISMATCH");
+          return;
+        }
+        continue;
+      }
       const key = `${String(row.session_id)}\u0000${String(row.artifact_kind)}`;
-      const revision = integer(row.materialization_revision);
+      const revision = int64(row.materialization_revision);
       if (
         revision === null
         || revision < 1
-        || !sameInteger(row.materialization_revision, row.event_position)
+        || int64(row.event_position) !== revision
         || (row.origin_kind === "workflow" && (
           row.current_workflow_generation === null
           || integer(row.workflow_generation)! > integer(row.current_workflow_generation)!
@@ -7248,7 +7414,7 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
       if (
         (prior === undefined && row.expected_prior_fingerprint !== null)
         || (prior !== undefined && (
-          revision <= prior.revision
+          revision !== prior.revision + 1n
           || row.expected_prior_fingerprint !== prior.fingerprint
           || row.artifact_path !== prior.artifactPath
         ))
@@ -7264,18 +7430,59 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
     }
   }
 
+  private quickOutboxPredecessorValid(row: Readonly<SqliteRow>): boolean {
+    const revision = int64(row.materialization_revision);
+    if (
+      revision === null
+      || revision < 1n
+      || typeof row.project_id !== "string"
+      || typeof row.session_id !== "string"
+      || typeof row.artifact_kind !== "string"
+    ) return false;
+    const predecessors = revision === 1n
+      ? []
+      : this.connection.prepare(`
+        SELECT /* lifecycle-quick:outbox-predecessor */ next_fingerprint, artifact_path
+        FROM outbox INDEXED BY outbox_lifecycle_latest_artifact
+        WHERE project_id = $projectId
+          AND session_id = $sessionId
+          AND artifact_kind = $artifactKind
+          AND materialization_revision = $revision
+        LIMIT 2
+      `).all({
+        $projectId: row.project_id,
+        $sessionId: row.session_id,
+        $artifactKind: row.artifact_kind,
+        $revision: revision - 1n,
+      });
+    if (predecessors.length > 1) return false;
+    const predecessor = predecessors[0];
+    return predecessor === undefined
+      ? row.expected_prior_fingerprint === null
+      : row.expected_prior_fingerprint === predecessor.next_fingerprint
+        && row.artifact_path === predecessor.artifact_path;
+  }
+
   private assertSchema4LifecycleOutboxDescriptor(
     context: ProjectContext,
     row: Readonly<SqliteRow>,
+    full: boolean,
   ): void {
-    const payload = parsedCanonicalJson(row.payload_json);
-    if (!record(payload) || !exactRecordKeys(payload, LIFECYCLE_OUTBOX_PAYLOAD_KEYS)) {
+    const rawPayload = parsedCanonicalJson(row.payload_json);
+    if (!record(rawPayload) || !exactRecordKeys(rawPayload, LIFECYCLE_OUTBOX_PAYLOAD_KEYS)) {
+      throw new LifecycleError("INTEGRITY_FAILURE");
+    }
+    let payload: LifecycleMaterializationPayloadV1;
+    try {
+      payload = decodeLifecycleMaterializationPayloadV1(rawPayload);
+      if (canonicalJson(payload) !== row.payload_json) throw new LifecycleError("INTEGRITY_FAILURE");
+    } catch {
       throw new LifecycleError("INTEGRITY_FAILURE");
     }
     const nextFingerprint = payload.nextFingerprint;
     const origin = payload.origin;
-    const eventPosition = integer(row.event_position);
-    const revision = integer(row.materialization_revision);
+    const eventPosition = int64(row.event_position);
+    const revision = int64(row.materialization_revision);
     const workflowGeneration = row.workflow_generation === null
       ? null
       : integer(row.workflow_generation);
@@ -7294,11 +7501,11 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
       || payload.payloadVersion !== 1
       || payload.targetKey !== row.target_key
       || payload.sessionId !== row.session_id
-      || payload.artifactKind !== "compatibility-session-log"
+      || payload.artifactKind !== COMPATIBILITY_SESSION_LOG_ARTIFACT_KIND
       || payload.artifactKind !== row.artifact_kind
       || payload.artifactPath !== row.artifact_path
-      || payload.materializationRevision !== String(revision)
-      || row.target_key !== `lifecycle-log/${row.session_id as string}/${revision}`
+      || payload.materializationRevision !== revision?.toString()
+      || row.target_key !== `lifecycle-log/${row.session_id as string}/${revision?.toString()}`
       || typeof payload.triggeringPayloadHash !== "string"
       || !LOWER_HASH.test(payload.triggeringPayloadHash)
       || typeof payload.triggeringEventType !== "string"
@@ -7322,11 +7529,13 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
         : integer(origin.workflowGeneration) !== workflowGeneration)
       || typeof row.content_hash !== "string"
       || !LOWER_HASH.test(row.content_hash)
+      || row.content_hash !== outboxHash(payload)
     ) throw new LifecycleError("INTEGRITY_FAILURE");
 
     const triggers = this.connection.prepare(`
-      SELECT event_type, payload_json, payload_hash, command_event_index,
-             session_id, stream_type, stream_id
+      SELECT global_position, event_type, event_schema_version, payload_json,
+             payload_hash, command_event_index, session_id,
+             parent_session_id, stream_type, stream_id
       FROM events
       WHERE project_id = $projectId AND global_position = $eventPosition
       LIMIT 2
@@ -7336,23 +7545,50 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
     });
     if (triggers.length !== 1) throw new LifecycleError("INTEGRITY_FAILURE");
     const trigger = triggers[0]!;
+    const triggerSchemaVersion = integer(trigger.event_schema_version);
+    const expectedTriggerSchemaVersion = payload.triggeringEventType === "SessionCheckpointRecorded"
+      || payload.triggeringEventType === "SessionEndAmended"
+      || payload.triggeringEventType === "SessionEndCancelled"
+      ? 3
+      : 1;
     if (
-      trigger.session_id !== row.session_id
+      int64(trigger.global_position) !== eventPosition
+      || trigger.session_id !== row.session_id
+      || trigger.parent_session_id !== null
       || trigger.stream_type !== "session"
       || trigger.stream_id !== `session/${row.session_id as string}`
       || integer(trigger.command_event_index) !== 0
       || trigger.event_type !== payload.triggeringEventType
+      || triggerSchemaVersion !== expectedTriggerSchemaVersion
       || trigger.payload_hash !== payload.triggeringPayloadHash
     ) throw new LifecycleError("INTEGRITY_FAILURE");
     const triggerPayload = parsedCanonicalJson(trigger.payload_json);
     if (!record(triggerPayload)) throw new LifecycleError("INTEGRITY_FAILURE");
+    if (payloadHash(triggerPayload) !== trigger.payload_hash) {
+      throw new LifecycleError("INTEGRITY_FAILURE");
+    }
+    let decodedTriggerPayload: Record<string, unknown>;
+    try {
+      const decoded = decodeLifecycleEventPayload(
+        payload.triggeringEventType,
+        expectedTriggerSchemaVersion,
+        triggerPayload,
+      );
+      if (!record(decoded)) throw new LifecycleError("INTEGRITY_FAILURE");
+      decodedTriggerPayload = decoded;
+      if (canonicalJson(decodedTriggerPayload) !== trigger.payload_json) {
+        throw new LifecycleError("INTEGRITY_FAILURE");
+      }
+    } catch {
+      throw new LifecycleError("INTEGRITY_FAILURE");
+    }
     if (row.origin_kind === "terminal-event") {
       if (
         row.workflow_id !== null
         || workflowGeneration !== null
         || trigger.event_type !== "SessionAbandoned"
-        || triggerPayload.workflowId !== null
-        || triggerPayload.workflowGeneration !== null
+        || decodedTriggerPayload.workflowId !== null
+        || decodedTriggerPayload.workflowGeneration !== null
       ) throw new LifecycleError("INTEGRITY_FAILURE");
     } else if (row.origin_kind === "workflow") {
       if (
@@ -7377,16 +7613,17 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
           $workflowGeneration: workflowGeneration,
         });
         if (workflows.length !== 1) throw new LifecycleError("INTEGRITY_FAILURE");
-      } else if (
-        triggerPayload.workflowId !== row.workflow_id
-        || integer(triggerPayload.workflowGeneration) !== workflowGeneration
+      }
+      if (
+        decodedTriggerPayload.workflowId !== row.workflow_id
+        || integer(decodedTriggerPayload.workflowGeneration) !== workflowGeneration
       ) throw new LifecycleError("INTEGRITY_FAILURE");
     } else {
       throw new LifecycleError("INTEGRITY_FAILURE");
     }
 
     const starts = this.connection.prepare(`
-      SELECT occurred_at
+      SELECT /* lifecycle-${full ? "full" : "quick"}:outbox-start */ occurred_at
       FROM events
       WHERE project_id = $projectId
         AND session_id = $sessionId

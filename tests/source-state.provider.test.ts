@@ -543,8 +543,10 @@ describe("SourceStateProvider trusted capture", () => {
     const sessionId = "33333333-3333-4333-8333-333333333333";
     const artifactPath = `05_Agent_Session_Logs/2026-07-18-session-${sessionId}.md`;
     let committedArtifactPath = artifactPath;
+    const statements: string[] = [];
     const connection = {
       prepare(sql: string) {
+        statements.push(sql);
         return {
           all() {
             if (sql.includes("FROM events")) {
@@ -570,6 +572,11 @@ describe("SourceStateProvider trusted capture", () => {
     });
 
     const scope = resolver.resolve(connection, fixture.context);
+
+    const outboxSql = statements.find((sql) => sql.includes("FROM outbox"));
+    assert.equal(typeof outboxSql, "string");
+    assert.match(outboxSql!, /artifact_kind\s*=\s*'compatibility-session-log'/u);
+    assert.doesNotMatch(outboxSql!, /artifact_kind\s*=\s*'session-log'/u);
 
     assert.deepEqual(scope.exactMaterializationTargets, [join(fixture.context.binding.vaultRoot, artifactPath)]);
     assert.deepEqual(scope.exactCommittedTempPaths, [join(

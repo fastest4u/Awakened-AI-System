@@ -24,6 +24,7 @@ import { canonicalJson } from "../serialization/canonical-json.js";
 import type { SqliteConnection, SqliteValue } from "../storage/sqlite-driver.js";
 import type { SourceStateFingerprintV1 } from "./contracts/checkpoint.js";
 import { LifecycleError } from "./errors.js";
+import { COMPATIBILITY_SESSION_LOG_ARTIFACT_KIND } from "./materialization-queue.port.js";
 
 const GIT_EXECUTABLE = "git";
 const GIT_TIMEOUT_MS = 5_000;
@@ -673,7 +674,7 @@ export class SqliteSourceStateScopeResolver implements SourceStateScopeResolver 
              status, claim_owner, claim_token
       FROM outbox
       WHERE project_id = $projectId
-        AND artifact_kind = 'session-log'
+        AND artifact_kind = '${COMPATIBILITY_SESSION_LOG_ARTIFACT_KIND}'
         AND session_id IS NOT NULL
       ORDER BY event_position ASC, target_key ASC
     `).all({ $projectId: context.binding.projectId });

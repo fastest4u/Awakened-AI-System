@@ -15,6 +15,15 @@ import {
   decodeLifecycleIntentWitness,
   lifecycleIntentHashFromWitnessSource,
 } from "../lifecycle/lifecycle-intent-witness.js";
+import {
+  decodeLifecycleEventPayload,
+  type LifecycleEventType,
+} from "../lifecycle/contracts/events.js";
+import {
+  COMPATIBILITY_SESSION_LOG_ARTIFACT_KIND,
+  decodePendingLifecycleOutboxV1,
+  type LifecycleMaterializationPayloadV1,
+} from "../lifecycle/materialization-queue.port.js";
 import { GENESIS_GLOBAL_HASH } from "../storage/event-store.js";
 import type { Migration } from "../storage/migration.js";
 import { migrationChecksum } from "../storage/migration-runner.js";
@@ -26,6 +35,7 @@ import {
 } from "../storage/schema-fingerprint.js";
 import type {
   SqliteConnection,
+  SqliteParams,
   SqliteRow,
 } from "../storage/sqlite-driver.js";
 import {
@@ -187,6 +197,7 @@ interface StructuralCheck {
 }
 
 class CommandWitnessInvalidError extends Error {}
+class LifecycleOutboxInvalidError extends Error {}
 
 function isCommandWitnessInvalid(error: unknown): boolean {
   return error instanceof CommandWitnessInvalidError
@@ -1042,6 +1053,7 @@ export class EventIntegrityService {
     if (!metadataMatches) issues.add("COMMAND_METADATA_MISMATCH", location);
 
     try {
+      this.validateLifecycleOutboxDescriptors(command, rows);
       const expectedHash = command.lifecycleAuthorizationKind === null
         ? this.reconstructCommandHash(command, rows)
         : this.reconstructLifecycleIntentHash(command, rows);
@@ -1049,11 +1061,207 @@ export class EventIntegrityService {
         issues.add("COMMAND_HASH_MISMATCH", location);
       }
     } catch (error) {
+      if (error instanceof LifecycleOutboxInvalidError) {
+        // The lifecycle intent witness remains the authoritative command hash;
+        // an outbox descriptor failure must not redefine that hash domain.
+        issues.add("COMMAND_METADATA_MISMATCH", location);
+        return;
+      }
       if (!isCommandWitnessInvalid(error)) throw error;
       issues.add("COMMAND_METADATA_MISMATCH", location);
       if (command.lifecycleAuthorizationKind !== null) {
         issues.add("COMMAND_HASH_MISMATCH", location);
       }
+    }
+  }
+
+  private validateLifecycleOutboxDescriptors(
+    command: CommandRow,
+    sourceRows: readonly SqliteRow[],
+  ): void {
+    const invalid = (): never => {
+      throw new LifecycleOutboxInvalidError("LIFECYCLE_OUTBOX_INVALID");
+    };
+    let parsedOrder: unknown;
+    try {
+      parsedOrder = canonicalJsonValue(command.outboxOrderJson);
+    } catch {
+      return invalid();
+    }
+    if (
+      !Array.isArray(parsedOrder)
+      || parsedOrder.some((target) => typeof target !== "string" || target.length === 0)
+      || new Set(parsedOrder).size !== parsedOrder.length
+    ) return invalid();
+    const outboxColumns = new Set(this.connection.prepare(`
+      PRAGMA table_info(outbox)
+    `).all().map((row) => row.name));
+    if (!outboxColumns.has("artifact_kind")) return;
+    if ([
+      "session_id",
+      "origin_kind",
+      "workflow_id",
+      "workflow_generation",
+      "artifact_path",
+      "materialization_revision",
+      "next_fingerprint",
+      "fingerprint_algorithm",
+      "fingerprint_schema_version",
+      "fingerprint_key_id",
+      "fingerprint_domain",
+    ].some((column) => !outboxColumns.has(column))) return invalid();
+    const outboxRows = this.connection.prepare(`
+      SELECT outbox.target_key, outbox.kind, outbox.payload_json,
+             outbox.content_hash, outbox.event_position,
+             outbox.session_id, outbox.origin_kind, outbox.workflow_id,
+             outbox.workflow_generation, outbox.artifact_kind,
+             outbox.artifact_path, outbox.materialization_revision,
+             outbox.next_fingerprint, outbox.fingerprint_algorithm,
+             outbox.fingerprint_schema_version, outbox.fingerprint_key_id,
+             outbox.fingerprint_domain,
+             events.global_position AS triggering_global_position,
+             events.event_type AS triggering_event_type,
+             events.event_schema_version AS triggering_event_schema_version,
+             events.payload_json AS triggering_payload_json,
+             events.payload_hash AS triggering_payload_hash,
+             events.command_event_index AS triggering_command_event_index,
+             events.command_id AS triggering_command_id,
+             events.session_id AS triggering_session_id,
+             events.parent_session_id AS triggering_parent_session_id,
+             events.stream_type AS triggering_stream_type,
+             events.stream_id AS triggering_stream_id
+      FROM outbox
+      LEFT JOIN events
+        ON events.project_id = outbox.project_id
+       AND events.global_position = outbox.event_position
+      WHERE outbox.project_id = $projectId
+        AND outbox.target_key IN (${parsedOrder.map((_, index) => `$target${index}`).join(", ")})
+    `).all({
+      $projectId: command.projectId,
+      ...Object.fromEntries(parsedOrder.map((target, index) => [`$target${index}`, target])),
+    } as SqliteParams);
+    if (outboxRows.length !== parsedOrder.length) return invalid();
+    const rowsByTarget = new Map<string, SqliteRow>();
+    for (const row of outboxRows) {
+      const target = stringValue(row, "target_key");
+      if (rowsByTarget.has(target)) return invalid();
+      rowsByTarget.set(target, row);
+    }
+    for (const targetValue of parsedOrder) {
+      const target = targetValue as string;
+      const row = rowsByTarget.get(target);
+      if (row === undefined) return invalid();
+      const kind = stringValue(row, "kind");
+      if (kind !== "materialize-lifecycle-log") continue;
+      if (command.lifecycleAuthorizationKind === null) return invalid();
+
+      let payload: LifecycleMaterializationPayloadV1;
+      try {
+        const pending = decodePendingLifecycleOutboxV1({
+          targetKey: target,
+          kind,
+          eventIndex: 0,
+          payload: canonicalJsonValue(stringValue(row, "payload_json")),
+        });
+        payload = pending.payload;
+      } catch {
+        return invalid();
+      }
+      if (outboxHash(payload) !== stringValue(row, "content_hash")) return invalid();
+      const descriptor = payload;
+      const origin = descriptor.origin;
+      const nextFingerprint = descriptor.nextFingerprint;
+      const eventPosition = bigintValue(row, "event_position");
+      const triggeringPosition = row.triggering_global_position;
+      if (
+        typeof triggeringPosition !== "bigint"
+        || triggeringPosition !== eventPosition
+        || row.session_id !== descriptor.sessionId
+        || row.origin_kind !== origin.kind
+        || row.workflow_id !== origin.workflowId
+        || row.workflow_generation !== (
+          origin.workflowGeneration === null ? null : BigInt(origin.workflowGeneration)
+        )
+        || descriptor.artifactKind !== COMPATIBILITY_SESSION_LOG_ARTIFACT_KIND
+        || row.artifact_kind !== descriptor.artifactKind
+        || row.artifact_path !== descriptor.artifactPath
+        || descriptor.materializationRevision !== eventPosition.toString()
+        || row.materialization_revision !== eventPosition
+        || row.next_fingerprint !== nextFingerprint.value
+        || row.fingerprint_algorithm !== nextFingerprint.algorithm
+        || row.fingerprint_schema_version !== BigInt(nextFingerprint.schemaVersion)
+        || row.fingerprint_key_id !== nextFingerprint.keyId
+        || row.fingerprint_domain !== nextFingerprint.domain
+        || descriptor.sessionId !== row.triggering_session_id
+        || row.triggering_command_id !== command.commandId
+        || row.triggering_parent_session_id !== null
+        || row.triggering_stream_type !== "session"
+        || row.triggering_stream_id !== `session/${String(descriptor.sessionId)}`
+        || row.triggering_command_event_index !== 0n
+        || row.triggering_event_type !== descriptor.triggeringEventType
+        || row.triggering_payload_hash !== descriptor.triggeringPayloadHash
+      ) return invalid();
+      const eventType = descriptor.triggeringEventType;
+      if (typeof eventType !== "string") return invalid();
+      const expectedSchemaVersion = eventType === "SessionCheckpointRecorded"
+        || eventType === "SessionEndAmended"
+        || eventType === "SessionEndCancelled"
+        ? 3
+        : 1;
+      if (row.triggering_event_schema_version !== BigInt(expectedSchemaVersion)) return invalid();
+      let eventPayload: unknown;
+      try {
+        eventPayload = canonicalJsonValue(String(row.triggering_payload_json));
+        if (payloadHash(eventPayload) !== String(row.triggering_payload_hash)) return invalid();
+        const decoded = decodeLifecycleEventPayload(
+          eventType as LifecycleEventType,
+          expectedSchemaVersion,
+          eventPayload,
+        ) as Record<string, unknown>;
+        if (canonicalJson(decoded) !== String(row.triggering_payload_json)) return invalid();
+        if (origin.kind === "terminal-event") {
+          if (
+            eventType !== "SessionAbandoned"
+            || decoded.workflowId !== null
+            || decoded.workflowGeneration !== null
+          ) return invalid();
+        } else if (
+          origin.kind !== "workflow"
+          || decoded.workflowId !== origin.workflowId
+          || decoded.workflowGeneration !== origin.workflowGeneration
+        ) return invalid();
+      } catch {
+        return invalid();
+      }
+      const starts = this.connection.prepare(`
+        SELECT occurred_at
+        FROM events
+        WHERE project_id = $projectId
+          AND session_id = $sessionId
+          AND stream_id = $streamId
+          AND stream_version = 1
+          AND event_type = 'SessionStarted'
+          AND event_schema_version = 1
+        LIMIT 2
+      `).all({
+        $projectId: command.projectId,
+        $sessionId: String(descriptor.sessionId),
+        $streamId: `session/${String(descriptor.sessionId)}`,
+      });
+      if (
+        starts.length !== 1
+        || typeof starts[0]?.occurred_at !== "string"
+        || descriptor.artifactPath
+          !== `05_Agent_Session_Logs/${String(starts[0]!.occurred_at).slice(0, 10)}-session-${String(descriptor.sessionId)}.md`
+      ) return invalid();
+      const sourceEvent = sourceRows.find((candidate) => (
+        candidate.command_event_index === 0n
+      ));
+      if (
+        sourceEvent === undefined
+        || bigintValue(sourceEvent, "command_event_index") !== 0n
+        || bigintValue(sourceEvent, "global_position") !== eventPosition
+      ) return invalid();
     }
   }
 

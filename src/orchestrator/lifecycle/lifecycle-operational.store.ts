@@ -1,7 +1,13 @@
 import { isPrimarySqliteBusy } from "../storage/event-append-transaction.js";
 import type { JsonValue } from "../contracts/event.js";
 import type { SqliteConnection } from "../storage/sqlite-driver.js";
+import { LifecycleOutboxRepository } from "../storage/lifecycle-outbox.repository.js";
 import { LifecycleError } from "./errors.js";
+import type {
+  ExactPlannedRevisionQuery,
+  LifecycleOutboxPlanReader,
+  LifecycleOutboxPlannedRevision,
+} from "./materialization-queue.port.js";
 
 const SQLITE_INT64_MAX = 9_223_372_036_854_775_807n;
 const LOWER_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
@@ -56,14 +62,19 @@ export type LifecycleOperationalWorkIdentity =
 
 export interface ConnectionBoundSessionEndWorkflowOperations {}
 export interface ConnectionBoundLifecycleOutboxOperations {}
+/** Read-only lifecycle plan capability bound to the active SQLite transaction. */
+export interface ConnectionBoundLifecycleOutboxPlanReads extends LifecycleOutboxPlanReader {}
 
 export interface LifecycleOperationalRepositorySet {
   readonly workflows: ConnectionBoundSessionEndWorkflowOperations;
   readonly outbox: ConnectionBoundLifecycleOutboxOperations;
+  /** Optional for legacy factories; the store supplies its narrow connection-bound adapter. */
+  readonly outboxPlans?: ConnectionBoundLifecycleOutboxPlanReads;
 }
 
 export interface WorkflowOperationalTransaction {
   readonly workflows: ConnectionBoundSessionEndWorkflowOperations;
+  readonly outboxPlans: ConnectionBoundLifecycleOutboxPlanReads;
 }
 
 export interface OutboxOperationalTransaction {
@@ -338,6 +349,26 @@ function undefinedCallbackResult(
   return undefined;
 }
 
+/**
+ * The operational layer may receive an older repository bundle that has not
+ * installed the plan-read facade yet. Keep that compatibility at the bundle
+ * boundary while exposing only the two immutable plan-read methods to the
+ * workflow callback.
+ */
+class SqliteLifecycleOutboxPlanReads implements ConnectionBoundLifecycleOutboxPlanReads {
+  readonly #repository = new LifecycleOutboxRepository();
+
+  constructor(private readonly connection: SqliteConnection) {}
+
+  getExactPlannedRevision(query: ExactPlannedRevisionQuery): LifecycleOutboxPlannedRevision | null {
+    return this.#repository.getExactPlannedRevision(this.connection, query);
+  }
+
+  assertExactPlannedRevision(query: ExactPlannedRevisionQuery): LifecycleOutboxPlannedRevision {
+    return this.#repository.assertExactPlannedRevision(this.connection, query);
+  }
+}
+
 function invokeSynchronousTransactionCallback<TTransaction extends object, T, TResult>(
   transaction: TTransaction,
   work: LifecycleOperationalWorkIdentity,
@@ -398,7 +429,11 @@ export class LifecycleOperationalStore {
       transactionBegan = true;
       const repositories = this.#transaction(this.#connection);
       const focused = workSnapshot.kind === "workflow" || workSnapshot.kind === "workflow-selection"
-        ? { workflows: repositories.workflows }
+        ? {
+            workflows: repositories.workflows,
+            outboxPlans: repositories.outboxPlans
+              ?? new SqliteLifecycleOutboxPlanReads(this.#connection),
+          }
         : { outbox: repositories.outbox };
       const result = invokeSynchronousTransactionCallback(
         focused as LifecycleOperationalTransactionFor<TWork>,

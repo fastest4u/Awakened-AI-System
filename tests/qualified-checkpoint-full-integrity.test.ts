@@ -7815,7 +7815,9 @@ it("full integrity binds the Version 3 final marker", async () => {
     outboxControl,
     outboxMarker.workflowId,
   );
-  assert.deepEqual(await fullIssues(outboxControl), []);
+  assert.deepEqual(await fullIssues(outboxControl), [
+    "LIFECYCLE_OUTBOX_INVARIANT_MISMATCH",
+  ]);
 
   const outboxCorruption = createFixture();
   const outboxCorruptedMarker = addFrozenCurrentChildWorkflow(outboxCorruption);
@@ -8283,9 +8285,25 @@ it("full integrity publicly dispatches schema 4 lifecycle outbox overlay", async
   });
 
   assert.deepEqual(await publicFullIssueCodes(corrupted.fixture), {
-    sync: ["LIFECYCLE_OUTBOX_INVARIANT_MISMATCH"],
-    async: ["LIFECYCLE_OUTBOX_INVARIANT_MISMATCH"],
+    sync: ["COMMAND_METADATA_MISMATCH", "LIFECYCLE_OUTBOX_INVARIANT_MISMATCH"],
+    async: ["COMMAND_METADATA_MISMATCH", "LIFECYCLE_OUTBOX_INVARIANT_MISMATCH"],
   });
+});
+
+it("schema 4 full replay renders an authenticated lifecycle closure and zeroizes bytes", async () => {
+  const { fixture } = createAuthenticatedPublicOutboxFixture();
+  let fingerprintInput: Uint8Array | null = null;
+  const issues: IntegrityIssueCode[] = [];
+  await new LifecycleIntegrityService(fixture.connection, {
+    async status() { return "available"; },
+    async fingerprint(_keyId, bytes) {
+      fingerprintInput = bytes;
+      return H64_B;
+    },
+  }).fullCheckAsync(fixture.context, { add(code) { issues.push(code); } });
+  assert.deepEqual(issues, []);
+  assert.ok(fingerprintInput !== null);
+  assert.ok([...fingerprintInput].every((byte) => byte === 0));
 });
 
 it("schema 4 public full integrity rejects a fabricated lifecycle outbox chain root", async () => {
@@ -8733,8 +8751,8 @@ it("full integrity advances each qualified coverage row exactly once", async () 
   });
   assert.equal(
     observedEntityRich.totalPrepares(),
-    53,
-    "ticket/workflow history must not add per-entity prepares",
+    57,
+    "bounded lifecycle outbox proofs must not add per-entity prepares",
   );
   for (const [kind, prepares] of [
     ["event", 1],
