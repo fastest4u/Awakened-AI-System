@@ -11,6 +11,7 @@ import type {
   StoredEvent,
   VisibilityScope,
 } from "../contracts/event.js";
+import { decodeGenericPendingOutbox } from "../contracts/event.js";
 import {
   commandHash,
   eventHash,
@@ -27,8 +28,13 @@ import {
   lifecycleIntentHashFromWitnessSource,
   type TrustedLifecycleIntentAssertionsV1,
 } from "../lifecycle/lifecycle-intent-witness.js";
+import {
+  decodePendingLifecycleOutboxV1,
+  type PendingLifecycleOutboxV1,
+} from "../lifecycle/materialization-queue.port.js";
 import { canonicalJson } from "../serialization/canonical-json.js";
 import { BranchScopeRepository } from "./branch-scope.repository.js";
+import { LifecycleOutboxRepository } from "./lifecycle-outbox.repository.js";
 import {
   MaintenanceFence,
   MaintenanceFenceError,
@@ -84,6 +90,7 @@ const VERIFICATION_VALUES = new Set([
   "conflicted",
 ]);
 const ACTOR_ROLES = new Set(["primary", "maintenance", "untrusted"]);
+const LIFECYCLE_OUTBOX_KIND = "materialize-lifecycle-log";
 
 export class EventStoreError extends Error {
   constructor(
@@ -102,6 +109,7 @@ interface ValidatedAppendCommand {
   eventIds: string[];
   payloadJson: string[];
   payloadHashes: string[];
+  outbox: readonly PendingOutbox[];
   lifecycleIntentJson: string | null;
   lifecycleIntent: JsonValue | null;
 }
@@ -133,6 +141,15 @@ interface StreamHead {
   streamType: string;
 }
 
+export interface LifecycleOutboxWriter {
+  insertLifecycle(
+    connection: SqliteConnection,
+    pending: PendingLifecycleOutboxV1,
+    triggeringEvent: StoredEvent,
+    createdAt: string,
+  ): void;
+}
+
 export interface EventAppendStatements {
   matchesProjectIdentity(projectId: string, vaultId: string, storeId: string): boolean;
   findDedup(projectId: string, idempotencyKey: string): DedupRow | undefined;
@@ -157,6 +174,11 @@ export interface EventAppendStatements {
     pending: PendingOutbox,
     event: StoredEvent,
     contentHash: string,
+    now: string,
+  ): void;
+  insertLifecycleOutbox(
+    pending: PendingLifecycleOutboxV1,
+    event: StoredEvent,
     now: string,
   ): void;
   insertDedup<T extends JsonValue>(
@@ -445,7 +467,7 @@ function validateAppendCommand<T extends JsonValue>(
     }
   }
 
-  const normalizedOutbox = command.outbox.map((item) => {
+  const normalizedOutbox: PendingOutbox[] = command.outbox.map((item) => {
     if (!isPlainRecord(item)
       || !nonEmptyString(item.targetKey)
       || !nonEmptyString(item.kind)) {
@@ -453,20 +475,23 @@ function validateAppendCommand<T extends JsonValue>(
     }
     if (!Number.isSafeInteger(item.eventIndex)
       || Number(item.eventIndex) < 0
-      || Number(item.eventIndex) >= command.events.length) {
+      || Number(item.eventIndex) >= command.events.length
+      || (item.kind === LIFECYCLE_OUTBOX_KIND && item.eventIndex !== 0)) {
       throw new EventStoreError("OUTBOX_EVENT_INDEX_INVALID");
     }
     if (targetKeys.has(item.targetKey)) {
       throw new EventStoreError("OUTBOX_TARGET_CONFLICT");
     }
-    targetKeys.add(item.targetKey);
-    canonical(item.payload);
-    return {
-      targetKey: item.targetKey,
-      kind: item.kind,
-      eventIndex: item.eventIndex,
-      payload: item.payload,
-    };
+    let normalized: PendingOutbox;
+    try {
+      normalized = item.kind === LIFECYCLE_OUTBOX_KIND
+        ? decodePendingLifecycleOutboxV1(item)
+        : decodeGenericPendingOutbox(item);
+    } catch {
+      throw new EventStoreError("OUTBOX_INVALID");
+    }
+    targetKeys.add(normalized.targetKey);
+    return normalized;
   });
   const hashMaterial: Record<string, JsonValue> = {
     commandId: command.commandId,
@@ -485,7 +510,7 @@ function validateAppendCommand<T extends JsonValue>(
     correlationId: command.correlationId,
     agentId: command.agentId,
     events: normalizedEvents,
-    outbox: normalizedOutbox,
+    outbox: normalizedOutbox as unknown as JsonValue,
   };
   const requestMaterial: JsonValue = {
     ...hashMaterial,
@@ -504,6 +529,7 @@ function validateAppendCommand<T extends JsonValue>(
     eventIds,
     payloadJson,
     payloadHashes,
+    outbox: Object.freeze(normalizedOutbox),
     lifecycleIntentJson,
     lifecycleIntent,
   };
@@ -956,6 +982,8 @@ function persistedAssertions(
 }
 
 export class SqliteEventAppendStatements implements EventAppendStatements {
+  readonly #connection: SqliteConnection;
+  readonly #lifecycleOutbox: LifecycleOutboxWriter;
   readonly #lifecycleSchema: boolean;
   readonly #identity: SqliteStatement;
   readonly #findDedup: SqliteStatement;
@@ -969,7 +997,12 @@ export class SqliteEventAppendStatements implements EventAppendStatements {
   readonly #insertOutbox: SqliteStatement;
   readonly #insertDedup: SqliteStatement;
 
-  constructor(connection: SqliteConnection) {
+  constructor(
+    connection: SqliteConnection,
+    lifecycleOutbox: LifecycleOutboxWriter = new LifecycleOutboxRepository(),
+  ) {
+    this.#connection = connection;
+    this.#lifecycleOutbox = lifecycleOutbox;
     this.#lifecycleSchema = connection.prepare("PRAGMA table_info(command_dedup)")
       .all()
       .some((row) => row.name === "lifecycle_authorization_kind");
@@ -1321,6 +1354,14 @@ export class SqliteEventAppendStatements implements EventAppendStatements {
     });
   }
 
+  insertLifecycleOutbox(
+    pending: PendingLifecycleOutboxV1,
+    event: StoredEvent,
+    now: string,
+  ): void {
+    this.#lifecycleOutbox.insertLifecycle(this.#connection, pending, event, now);
+  }
+
   insertDedup<T extends JsonValue>(
     command: AppendCommand<T>,
     commandHashValue: string,
@@ -1646,11 +1687,24 @@ export class EventAppendTransaction {
       prepared.recordedAt,
     );
     if (changes !== 1n) throw new EventStoreError("EVENT_CONFLICT");
-    for (const pendingOutbox of command.outbox) {
+    for (const pendingOutbox of prepared[PREPARED].outbox) {
+      const actualEvent = planned.events[pendingOutbox.eventIndex];
+      if (actualEvent === undefined) throw new EventStoreError("OUTBOX_EVENT_INDEX_INVALID");
+      if (pendingOutbox.kind === LIFECYCLE_OUTBOX_KIND) {
+        if (pendingOutbox.eventIndex !== 0) {
+          throw new EventStoreError("OUTBOX_EVENT_INDEX_INVALID");
+        }
+        this.statements.insertLifecycleOutbox(
+          pendingOutbox as PendingLifecycleOutboxV1,
+          actualEvent,
+          prepared.recordedAt,
+        );
+        continue;
+      }
       this.statements.insertOutbox(
         command.context.binding.projectId,
         pendingOutbox,
-        planned.events[pendingOutbox.eventIndex]!,
+        actualEvent,
         outboxHash(pendingOutbox.payload),
         prepared.recordedAt,
       );

@@ -11,6 +11,7 @@ import type {
   PersistedLifecycleAuthorizationRecord,
   StoredEvent,
 } from "../src/orchestrator/contracts/event.js";
+import { payloadHash } from "../src/orchestrator/crypto/event-hash.js";
 import type {
   ProjectContext,
   ProjectId,
@@ -47,6 +48,12 @@ import type {
 import {
   SqliteLifecycleProjectionRepository,
 } from "../src/orchestrator/storage/lifecycle-projection.repository.js";
+import {
+  COMPATIBILITY_SESSION_LOG_ARTIFACT_KIND,
+  decodePendingLifecycleOutboxV1,
+  type PendingLifecycleOutboxV1,
+} from "../src/orchestrator/lifecycle/materialization-queue.port.js";
+import { LifecycleOutboxRepository } from "../src/orchestrator/storage/lifecycle-outbox.repository.js";
 import { workflowFingerprintV2 } from "../src/orchestrator/lifecycle/lifecycle-projection-folds.js";
 import { canonicalJson } from "../src/orchestrator/serialization/canonical-json.js";
 import { applyCurrentProjectStoreSchema } from "./support/current-project-store-schema.js";
@@ -349,7 +356,9 @@ function fixture(): { connection: RecordingConnection; tx: EventAppendTransactio
   };
 }
 
-function lifecycleFixture(): {
+function lifecycleFixture(
+  lifecycleOutbox = new LifecycleOutboxRepository(),
+): {
   connection: RecordingConnection;
   statements: SqliteEventAppendStatements;
   tx: EventAppendTransaction;
@@ -367,7 +376,8 @@ function lifecycleFixture(): {
     storeId: STORE_ID,
   }, NOW);
   connection.transactionStatements.length = 0;
-  const statements = new SqliteEventAppendStatements(connection);
+  const statements = new SqliteEventAppendStatements(connection, lifecycleOutbox);
+  let generatedEventId = 0;
   return {
     connection,
     statements,
@@ -376,8 +386,177 @@ function lifecycleFixture(): {
       statements,
       new MaintenanceFence(),
       new BranchScopeRepository(),
-      () => "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      () => lifecycleUuid(60_000 + generatedEventId++),
     ),
+  };
+}
+
+function lifecycleMaterializationPending(
+  triggeringPayload: JsonValue,
+  overrides: {
+    triggeringEventType?: string;
+    triggeringPayloadHash?: string;
+    materializationRevision?: string;
+    origin?: Record<string, unknown>;
+  } = {},
+): PendingLifecycleOutboxV1 {
+  const materializationRevision = overrides.materializationRevision ?? "2";
+  const targetKey = `lifecycle-log/${ROOT_SESSION_ID}/${materializationRevision}`;
+  return decodePendingLifecycleOutboxV1({
+    targetKey,
+    kind: "materialize-lifecycle-log",
+    eventIndex: 0,
+    payload: {
+      payloadVersion: 1,
+      targetKey,
+      sessionId: ROOT_SESSION_ID,
+      artifactKind: COMPATIBILITY_SESSION_LOG_ARTIFACT_KIND,
+      artifactPath: `05_Agent_Session_Logs/${NOW.slice(0, 10)}-session-${ROOT_SESSION_ID}.md`,
+      materializationRevision,
+      triggeringPayloadHash: overrides.triggeringPayloadHash ?? payloadHash(triggeringPayload),
+      nextFingerprint: {
+        algorithm: "hmac-sha256",
+        schemaVersion: 1,
+        keyId: "materialization-key-1",
+        domain: "pm-materialization-fingerprint-v1",
+        value: "d".repeat(64),
+      },
+      origin: overrides.origin ?? {
+        kind: "terminal-event",
+        workflowId: null,
+        workflowGeneration: null,
+      },
+      triggeringEventType: overrides.triggeringEventType ?? "SessionAbandoned",
+    },
+  });
+}
+
+function lifecycleMaterializationCommand(options: {
+  readonly withWitness?: boolean;
+  readonly pending?: PendingLifecycleOutboxV1;
+} = {}): {
+  readonly append: AppendCommand<JsonValue>;
+  readonly intentHash: string | null;
+  readonly expectation: LifecycleReplayExpectation | null;
+} {
+  const witnessed = options.withWitness === true ? lifecycleCommand() : null;
+  const source = lifecycleEvent(2, "SessionAbandoned", {}, {
+    sessionId: ROOT_SESSION_ID as never,
+    parentSessionId: null,
+    workspaceId: LIFECYCLE_WORKSPACE_ID,
+    globalPosition: 2,
+    streamVersion: 2,
+  });
+  const payload = source.payload as unknown as JsonValue;
+  const append: AppendCommand<JsonValue> = {
+    context: lifecycleContext(),
+    commandId: witnessed?.append.commandId
+      ?? "66666666-6666-4666-8666-666666666666",
+    idempotencyKey: witnessed?.append.idempotencyKey ?? "materialize:abandon:1",
+    commandType: witnessed?.append.commandType ?? "session-abandoned",
+    correlationId: witnessed?.append.correlationId ?? "77777777-7777-4777-8777-777777777777",
+    agentId: witnessed?.append.agentId ?? "agent-primary",
+    expectedStreamVersion: 1n,
+    streamId: `session/${ROOT_SESSION_ID}`,
+    streamType: "session",
+    events: [{
+      eventType: "SessionAbandoned",
+      eventSchemaVersion: 1,
+      occurredAt: source.occurredAt,
+      visibilityScope: "session",
+      sessionId: ROOT_SESSION_ID,
+      parentSessionId: undefined,
+      confidence: "high",
+      verificationStatus: "verified",
+      payload,
+      sourceRefs: [],
+      evidenceRefs: [],
+      evidenceDigests: [],
+    }],
+    outbox: [options.pending ?? lifecycleMaterializationPending(payload)],
+    publicResponse: { sessionId: ROOT_SESSION_ID },
+    ...(witnessed?.append.lifecycleIntentWitness === undefined
+      ? {}
+      : { lifecycleIntentWitness: witnessed.append.lifecycleIntentWitness }),
+  };
+  return {
+    append,
+    intentHash: witnessed?.intentHash ?? null,
+    expectation: witnessed?.expectation ?? null,
+  };
+}
+
+function seedLifecycleSession(
+  connection: RecordingConnection,
+  tx: EventAppendTransaction,
+): void {
+  const seed: AppendCommand<JsonValue> = {
+    context: lifecycleContext(),
+    commandId: "99999999-9999-4999-8999-999999999999",
+    idempotencyKey: "seed:session-start",
+    commandType: "seed-session-start",
+    correlationId: "88888888-8888-4888-8888-888888888888",
+    agentId: "agent-primary",
+    expectedStreamVersion: 0n,
+    streamId: `session/${ROOT_SESSION_ID}`,
+    streamType: "session",
+    events: [{
+      eventType: "SessionStarted",
+      eventSchemaVersion: 1,
+      occurredAt: NOW,
+      visibilityScope: "session",
+      sessionId: ROOT_SESSION_ID,
+      confidence: "high",
+      verificationStatus: "verified",
+      payload: {
+        sessionId: ROOT_SESSION_ID,
+        clientNamespace: "lifecycle-tests",
+      },
+      sourceRefs: [],
+      evidenceRefs: [],
+      evidenceDigests: [],
+    }],
+    outbox: [],
+    publicResponse: { sessionId: ROOT_SESSION_ID },
+  };
+  connection.exec("BEGIN IMMEDIATE");
+  const prepared = tx.prepare(seed, NOW);
+  const planned = tx.planPrepared(prepared);
+  tx.appendPlanned(planned);
+  connection.exec("COMMIT");
+}
+
+function appendLifecycleDirect(
+  connection: RecordingConnection,
+  tx: EventAppendTransaction,
+  append: AppendCommand<JsonValue>,
+  persistDedup = false,
+  authorization: PersistedLifecycleAuthorizationRecord | null = null,
+  commandHashOverride?: string,
+): ReturnType<EventAppendTransaction["result"]> {
+  connection.exec("BEGIN IMMEDIATE");
+  try {
+    const prepared = tx.prepare(append, NOW, commandHashOverride);
+    const planned = tx.planPrepared(prepared);
+    const committed = tx.appendPlanned(planned);
+    if (persistDedup) tx.insertDedup(prepared, committed, authorization);
+    connection.exec("COMMIT");
+    return tx.result(committed);
+  } catch (error) {
+    connection.exec("ROLLBACK");
+    throw error;
+  }
+}
+
+function lifecycleCounts(connection: SqliteConnection): {
+  readonly events: bigint;
+  readonly outbox: bigint;
+  readonly dedup: bigint;
+} {
+  return {
+    events: connection.prepare("SELECT count(*) AS count FROM events").get()?.count as bigint,
+    outbox: connection.prepare("SELECT count(*) AS count FROM outbox").get()?.count as bigint,
+    dedup: connection.prepare("SELECT count(*) AS count FROM command_dedup").get()?.count as bigint,
   };
 }
 
@@ -1784,5 +1963,237 @@ it("runs LifecycleCommandStore through the real primitive and replays before onN
     "BEGIN IMMEDIATE", "ROLLBACK",
     "BEGIN IMMEDIATE", "ROLLBACK",
     "BEGIN IMMEDIATE", "ROLLBACK",
+  ]);
+});
+
+it("preserves authoritative lifecycle command hash while recording the outbox target", () => {
+  const { connection, tx } = lifecycleFixture();
+  seedLifecycleSession(connection, tx);
+  persistRootAuthority(connection, 1n);
+  const request = lifecycleMaterializationCommand({ withWitness: true });
+
+  connection.exec("BEGIN IMMEDIATE");
+  const prepared = tx.prepare(request.append, NOW, request.intentHash ?? undefined);
+  assert.equal(prepared.commandHash, request.intentHash);
+  const planned = tx.planPrepared(prepared);
+  const committed = tx.appendPlanned(planned);
+  tx.insertDedup(prepared, committed, initialAuthorization());
+  connection.exec("COMMIT");
+
+  const dedup = connection.prepare(`
+    SELECT command_hash, outbox_order_json
+    FROM command_dedup
+    WHERE project_id = $projectId AND idempotency_key = $idempotencyKey
+  `).get({
+    $projectId: PROJECT_ID,
+    $idempotencyKey: request.append.idempotencyKey,
+  }) as { command_hash: string; outbox_order_json: string };
+  assert.equal(dedup.command_hash, request.intentHash);
+  assert.deepEqual(JSON.parse(dedup.outbox_order_json), [
+    `lifecycle-log/${ROOT_SESSION_ID}/2`,
+  ]);
+});
+
+it("keeps generic command hashing outside the lifecycle witness domain", () => {
+  const { tx } = fixture();
+  const first = {
+    ...command(),
+    outbox: [{
+      targetKey: "generic-target",
+      kind: "generic-kind",
+      eventIndex: 0,
+      payload: { version: 1 },
+    }],
+  } satisfies AppendCommand<JsonValue>;
+  const second = {
+    ...first,
+    outbox: [{
+      ...first.outbox[0]!,
+      payload: { version: 2 },
+    }],
+  } satisfies AppendCommand<JsonValue>;
+  assert.notEqual(tx.prepare(first, NOW).commandHash, tx.prepare(second, NOW).commandHash);
+});
+
+it("never routes the reserved lifecycle kind through generic outbox insertion", () => {
+  const { connection, tx } = lifecycleFixture();
+  seedLifecycleSession(connection, tx);
+  const request = lifecycleMaterializationCommand();
+  const result = appendLifecycleDirect(connection, tx, request.append);
+
+  assert.equal(result.deduplicated, false);
+  const row = connection.prepare(`
+    SELECT kind, event_position, artifact_kind, materialization_revision
+    FROM outbox
+    WHERE project_id = $projectId AND target_key = $targetKey
+  `).get({
+    $projectId: PROJECT_ID,
+    $targetKey: `lifecycle-log/${ROOT_SESSION_ID}/2`,
+  }) as {
+    kind: string;
+    event_position: bigint;
+    artifact_kind: string;
+    materialization_revision: bigint;
+  };
+  assert.deepEqual({ ...row }, {
+    kind: "materialize-lifecycle-log",
+    event_position: 2n,
+    artifact_kind: COMPATIBILITY_SESSION_LOG_ARTIFACT_KIND,
+    materialization_revision: 2n,
+  });
+});
+
+it("inserts lifecycle outbox only after its exact actual event", () => {
+  const { connection, tx } = lifecycleFixture();
+  seedLifecycleSession(connection, tx);
+  const request = lifecycleMaterializationCommand();
+  const result = appendLifecycleDirect(connection, tx, request.append);
+
+  const event = connection.prepare(`
+    SELECT event_id, event_type, payload_json, payload_hash
+    FROM events
+    WHERE global_position = 2
+  `).get() as {
+    event_id: string;
+    event_type: string;
+    payload_json: string;
+    payload_hash: string;
+  };
+  const outbox = connection.prepare(`
+    SELECT event_position, payload_json, content_hash
+    FROM outbox
+    WHERE project_id = $projectId AND target_key = $targetKey
+  `).get({
+    $projectId: PROJECT_ID,
+    $targetKey: `lifecycle-log/${ROOT_SESSION_ID}/2`,
+  }) as { event_position: bigint; payload_json: string; content_hash: string };
+  assert.equal(result.eventIds[0], event.event_id);
+  assert.equal(event.event_type, "SessionAbandoned");
+  assert.equal(outbox.event_position, 2n);
+  assert.equal(JSON.parse(outbox.payload_json).triggeringPayloadHash, event.payload_hash);
+  assert.equal(outbox.content_hash.length, 64);
+});
+
+it("rejects a lifecycle descriptor bound to a different actual event", () => {
+  const { connection, tx } = lifecycleFixture();
+  seedLifecycleSession(connection, tx);
+  const source = lifecycleEvent(2, "SessionAbandoned", {}, {
+    sessionId: ROOT_SESSION_ID as never,
+    parentSessionId: null,
+    workspaceId: LIFECYCLE_WORKSPACE_ID,
+    globalPosition: 2,
+    streamVersion: 2,
+  });
+  const request = lifecycleMaterializationCommand({
+    pending: lifecycleMaterializationPending(source.payload as unknown as JsonValue, {
+      triggeringEventType: "SessionEnded",
+      origin: {
+        kind: "workflow",
+        workflowId: "00000000-0000-4000-8000-000000000020",
+        workflowGeneration: 1,
+      },
+    }),
+  });
+  const before = lifecycleCounts(connection);
+  assert.throws(
+    () => appendLifecycleDirect(connection, tx, request.append),
+    /INTEGRITY_FAILURE|LIFECYCLE_INPUT_INVALID/,
+  );
+  assert.deepEqual(lifecycleCounts(connection), before);
+});
+
+it("rolls back event and lifecycle row when planning insertion fails", () => {
+  const failedDescriptor = lifecycleFixture();
+  seedLifecycleSession(failedDescriptor.connection, failedDescriptor.tx);
+  const source = lifecycleEvent(2, "SessionAbandoned", {}, {
+    sessionId: ROOT_SESSION_ID as never,
+    parentSessionId: null,
+    workspaceId: LIFECYCLE_WORKSPACE_ID,
+    globalPosition: 2,
+    streamVersion: 2,
+  });
+  const request = lifecycleMaterializationCommand({
+    pending: lifecycleMaterializationPending(source.payload as unknown as JsonValue, {
+      triggeringPayloadHash: "0".repeat(64),
+    }),
+  });
+  const before = lifecycleCounts(failedDescriptor.connection);
+  assert.throws(
+    () => appendLifecycleDirect(
+      failedDescriptor.connection,
+      failedDescriptor.tx,
+      request.append,
+    ),
+    /INTEGRITY_FAILURE|LIFECYCLE_INPUT_INVALID/,
+  );
+  assert.deepEqual(lifecycleCounts(failedDescriptor.connection), before);
+
+  const faulted = lifecycleFixture();
+  seedLifecycleSession(faulted.connection, faulted.tx);
+  const faultInjector = {
+    hit(boundary: "before-begin" | "after-first-insert-before-commit" | "after-commit-before-response"): void {
+      if (boundary === "after-first-insert-before-commit") {
+        throw new Error("fault-after-event-insert");
+      }
+    },
+  };
+  const faultBefore = lifecycleCounts(faulted.connection);
+  let generatedEventId = 80_000;
+  const faultedTx = new EventAppendTransaction(
+    faulted.connection,
+    faulted.statements,
+    new MaintenanceFence(),
+    new BranchScopeRepository(),
+    () => lifecycleUuid(generatedEventId++),
+    faultInjector,
+  );
+  assert.throws(
+    () => appendLifecycleDirect(
+      faulted.connection,
+      faultedTx,
+      lifecycleMaterializationCommand().append,
+    ),
+    /fault-after-event-insert/,
+  );
+  assert.deepEqual(lifecycleCounts(faulted.connection), faultBefore);
+});
+
+it("replay retains one ordered lifecycle target without reinsertion", () => {
+  const { connection, tx } = lifecycleFixture();
+  seedLifecycleSession(connection, tx);
+  persistRootAuthority(connection, 1n);
+  const request = lifecycleMaterializationCommand({ withWitness: true });
+  const first = appendLifecycleDirect(
+    connection,
+    tx,
+    request.append,
+    true,
+    initialAuthorization(),
+    request.intentHash ?? undefined,
+  );
+  connection.exec("BEGIN IMMEDIATE");
+  const prepared = tx.prepare(request.append, NOW, request.intentHash ?? undefined);
+  const replay = tx.findReplay(prepared, request.expectation);
+  connection.exec("ROLLBACK");
+
+  assert.equal(first.deduplicated, false);
+  assert.ok(replay);
+  assert.equal(replay.deduplicated, true);
+  assert.deepEqual(replay.response, first.response);
+  assert.deepEqual(lifecycleCounts(connection), {
+    events: 2n,
+    outbox: 1n,
+    dedup: 1n,
+  });
+  const order = connection.prepare(`
+    SELECT outbox_order_json
+    FROM command_dedup
+    WHERE project_id = $projectId AND idempotency_key = $idempotencyKey
+  `).get({
+    $projectId: PROJECT_ID,
+    $idempotencyKey: request.append.idempotencyKey,
+  }) as { outbox_order_json: string };
+  assert.deepEqual(JSON.parse(order.outbox_order_json), [
+    `lifecycle-log/${ROOT_SESSION_ID}/2`,
   ]);
 });
