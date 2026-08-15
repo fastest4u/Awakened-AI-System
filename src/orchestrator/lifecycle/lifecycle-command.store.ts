@@ -31,6 +31,7 @@ import type {
   MinimumCheckpointCapacityInput,
   MinimumEndingScopeCapacityInput,
 } from "./checkpoint-capacity.js";
+import type { SessionEndWorkflowOperations } from "../storage/lifecycle-storage.types.js";
 import type { CheckpointEvidenceCoverageV2 } from "./contracts/checkpoint.js";
 import {
   decodeLifecycleEventPayload,
@@ -130,7 +131,8 @@ export interface ConnectionBoundEvidenceCoverage {
     input: MinimumEndingScopeCapacityInput,
   ): number;
 }
-export interface ConnectionBoundSessionEndWorkflows {}
+/** Optional until the request/reopen slice wires the semantic command path. */
+export interface ConnectionBoundSessionEndWorkflows extends Partial<SessionEndWorkflowOperations> {}
 export interface ConnectionBoundValidationResults {}
 export interface ConnectionBoundLifecycleOutbox {}
 

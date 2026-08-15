@@ -3,6 +3,36 @@ import type {
   RootSessionState,
 } from "../lifecycle/contracts/identifiers.js";
 import type { TerminalLifecycleEventType } from "../lifecycle/session-aggregate.js";
+import type {
+  PersistedValidationAttemptPlansWriteV1,
+  SessionEndWorkflowClaimInputV1,
+  SessionEndWorkflowClaimNextInputV1,
+  SessionEndWorkflowClaimV1,
+  SessionEndWorkflowEventlessPhaseInputV1,
+  SessionEndWorkflowRecordV1,
+  SessionEndWorkflowReleaseInputV1,
+  SessionEndWorkflowRenewInputV1,
+  StoredValidationAttemptPlansV1,
+} from "./session-end.repository.js";
+
+/**
+ * The only session-end workflow capabilities that may cross a transaction
+ * boundary.  The implementation is connection-bound, but the connection
+ * itself is intentionally absent from this contract.
+ */
+export interface SessionEndWorkflowOperations {
+  read(projectId: string, workflowId: string): SessionEndWorkflowRecordV1 | null;
+  claimNext(input: SessionEndWorkflowClaimNextInputV1): SessionEndWorkflowClaimV1 | null;
+  claim(input: SessionEndWorkflowClaimInputV1): SessionEndWorkflowClaimV1 | null;
+  renew(input: SessionEndWorkflowRenewInputV1): SessionEndWorkflowClaimV1 | null;
+  release(input: SessionEndWorkflowReleaseInputV1): boolean;
+  advanceEventlessPhase(input: SessionEndWorkflowEventlessPhaseInputV1): boolean;
+  readPersistedValidationAttemptPlansV1(
+    projectId: string,
+    workflowId: string,
+  ): StoredValidationAttemptPlansV1 | null;
+  writePersistedValidationAttemptPlansV1(input: PersistedValidationAttemptPlansWriteV1): void;
+}
 
 export type LifecycleJsonValue =
   | null

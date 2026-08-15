@@ -68,8 +68,19 @@ function outboxWork(): OutboxOperationalWorkIdentity {
 
 function transaction(connection: OperationalConnection): LifecycleOperationalRepositorySet {
   const stage = (value: string) => connection.stage(value);
+  const workflows = {
+    stage,
+    read: (..._arguments: unknown[]) => null,
+    claimNext: (..._arguments: unknown[]) => null,
+    claim: (..._arguments: unknown[]) => null,
+    renew: (..._arguments: unknown[]) => null,
+    release: (..._arguments: unknown[]) => false,
+    advanceEventlessPhase: (..._arguments: unknown[]) => false,
+    readPersistedValidationAttemptPlansV1: (..._arguments: unknown[]) => null,
+    writePersistedValidationAttemptPlansV1: (..._arguments: unknown[]) => undefined,
+  };
   return {
-    workflows: { stage },
+    workflows,
     outbox: { stage },
     outboxPlans: {
       getExactPlannedRevision: () => null,
@@ -305,7 +316,7 @@ describe("LifecycleOperationalStore", () => {
     let capturedMethod: StagingFacade["stage"] | undefined;
 
     store.execute(work(), (tx) => {
-      capturedFacade = tx.workflows as StagingFacade;
+      capturedFacade = tx.workflows as unknown as StagingFacade;
       capturedMethod = capturedFacade.stage;
       stage(tx.workflows, "during-callback");
       return null;
@@ -319,7 +330,7 @@ describe("LifecycleOperationalStore", () => {
   it("guards object-valued method results so explicit self returns cannot expose a raw repository", () => {
     const connection = new OperationalConnection();
     const repositories = transaction(connection);
-    (repositories.workflows as StagingFacade & { returnSelf?: () => StagingFacade }).returnSelf =
+    (repositories.workflows as unknown as StagingFacade & { returnSelf?: () => StagingFacade }).returnSelf =
       function(this: StagingFacade) { return this; };
     const store = new LifecycleOperationalStore({
       connection,
@@ -328,7 +339,7 @@ describe("LifecycleOperationalStore", () => {
     let escaped: StagingFacade | undefined;
 
     store.execute(work(), (tx) => {
-      escaped = (tx.workflows as StagingFacade & { returnSelf(): StagingFacade }).returnSelf();
+      escaped = (tx.workflows as unknown as StagingFacade & { returnSelf(): StagingFacade }).returnSelf();
       return null;
     });
 
@@ -365,7 +376,7 @@ describe("LifecycleOperationalStore", () => {
   it("rejects a Promise returned by a connection-bound repository method", () => {
     const connection = new OperationalConnection();
     const repositories = transaction(connection);
-    (repositories.workflows as { readLater?: () => Promise<{ renewed: boolean }> }).readLater =
+    (repositories.workflows as unknown as { readLater?: () => Promise<{ renewed: boolean }> }).readLater =
       () => Promise.resolve({ renewed: true });
     const store = new LifecycleOperationalStore({
       connection,
@@ -374,7 +385,7 @@ describe("LifecycleOperationalStore", () => {
 
     assert.throws(
       () => store.execute(work(), (tx) => {
-        void (tx.workflows as { readLater(): Promise<unknown> }).readLater();
+        void (tx.workflows as unknown as { readLater(): Promise<unknown> }).readLater();
         return null;
       }),
       isLifecycleInputInvalid,
@@ -385,7 +396,7 @@ describe("LifecycleOperationalStore", () => {
   it("snapshots a plain public DTO returned by a guarded repository method", () => {
     const connection = new OperationalConnection();
     const repositories = transaction(connection);
-    (repositories.workflows as { readCurrent?: () => { renewed: boolean } }).readCurrent =
+    (repositories.workflows as unknown as { readCurrent?: () => { renewed: boolean } }).readCurrent =
       () => ({ renewed: true });
     const store = new LifecycleOperationalStore({
       connection,
@@ -393,7 +404,7 @@ describe("LifecycleOperationalStore", () => {
     });
 
     const result = store.execute(work(), (tx) =>
-      (tx.workflows as { readCurrent(): { renewed: boolean } }).readCurrent());
+      (tx.workflows as unknown as { readCurrent(): { renewed: boolean } }).readCurrent());
 
     assert.deepEqual(result.publicResult, { renewed: true });
     assertDeeplyFrozen(result.publicResult);

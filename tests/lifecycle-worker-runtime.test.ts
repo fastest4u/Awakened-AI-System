@@ -1066,7 +1066,7 @@ function structurallyValidFactoryOptions(
     },
     transactionFacades: {
       command: () => ({} as never),
-      operational: () => ({ workflows: {}, outbox: {} }),
+      operational: () => ({ workflows: {} as never, outbox: {} }),
     },
   };
 }

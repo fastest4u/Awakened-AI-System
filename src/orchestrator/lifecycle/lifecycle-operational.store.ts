@@ -2,6 +2,7 @@ import { isPrimarySqliteBusy } from "../storage/event-append-transaction.js";
 import type { JsonValue } from "../contracts/event.js";
 import type { SqliteConnection } from "../storage/sqlite-driver.js";
 import { LifecycleOutboxRepository } from "../storage/lifecycle-outbox.repository.js";
+import type { SessionEndWorkflowOperations } from "../storage/lifecycle-storage.types.js";
 import { LifecycleError } from "./errors.js";
 import type {
   ExactPlannedRevisionQuery,
@@ -60,7 +61,7 @@ export type LifecycleOperationalWorkIdentity =
   | WorkflowOperationalWorkIdentity
   | OutboxOperationalWorkIdentity;
 
-export interface ConnectionBoundSessionEndWorkflowOperations {}
+export interface ConnectionBoundSessionEndWorkflowOperations extends SessionEndWorkflowOperations {}
 export interface ConnectionBoundLifecycleOutboxOperations {}
 /** Read-only lifecycle plan capability bound to the active SQLite transaction. */
 export interface ConnectionBoundLifecycleOutboxPlanReads extends LifecycleOutboxPlanReader {}

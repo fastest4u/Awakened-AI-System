@@ -1,4 +1,8 @@
 import { LifecycleError } from "../lifecycle/errors.js";
+import {
+  SESSION_END_PHASES,
+  type SessionEndPhase,
+} from "../lifecycle/contracts/session-end.js";
 import { decodeLifecycleIntentWitness } from "../lifecycle/lifecycle-intent-witness.js";
 import {
   decodeSessionEndEffectiveStateV1,
@@ -21,6 +25,107 @@ const AMENDMENT_SNAPSHOT_KEYS = [
 const VALIDATION_PLAN_KEYS = [
   "commandId", "idempotencyKey", "profileId", "profileVersion", "resultId", "runId",
 ] as const;
+const WORKFLOW_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
+const WORKFLOW_TIMESTAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u;
+const SQLITE_INT64_MAX = 9_223_372_036_854_775_807n;
+const ACTIVE_WORKFLOW_PHASES = new Set<SessionEndPhase>([
+  "requested",
+  "children-resolved",
+  "final-checkpoint-recorded",
+  "ending-materialization-queued",
+  "validating",
+  "verification-passed",
+  "verification-failed",
+  "completion-appended",
+  "completed-materialization-confirmed",
+]);
+const EVENTLESS_PHASE_TRANSITIONS = new Map<SessionEndPhase, SessionEndPhase>([
+  ["requested", "children-resolved"],
+]);
+
+export interface SessionEndWorkflowRecordV1 {
+  readonly projectId: string;
+  readonly workflowId: string;
+  readonly workflowType: "session-end";
+  readonly generation: number;
+  readonly state: string;
+  readonly phase: SessionEndPhase;
+  readonly rootCommandId: string;
+  readonly resultJson: string | null;
+  readonly errorCode: string | null;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+  readonly sessionId: string;
+  readonly triggeringEventPosition: bigint;
+  readonly expectedAuthorityCommitment: string;
+  readonly coordinatorOwnerId: string | null;
+  readonly coordinatorClaimToken: bigint | null;
+  readonly coordinatorClaimExpiresAt: string | null;
+  readonly coordinatorAttemptCount: bigint;
+  readonly coordinatorFailureClass: "retryable" | "permanent" | null;
+  readonly coordinatorErrorCode: string | null;
+  readonly coordinatorNextAttemptAt: string | null;
+  readonly validationAttemptPlanGeneration: number | null;
+  readonly validationAttemptPlansJson: string | null;
+  readonly evidenceFrozenCheckpointEventPosition: bigint | null;
+  readonly evidenceFrozenGeneration: number | null;
+  readonly evidenceWindowState: "open" | "sealed" | null;
+  readonly finalEndingScopeBindingsJson: string | null;
+}
+
+export interface SessionEndWorkflowClaimV1 {
+  readonly projectId: string;
+  readonly workflowId: string;
+  readonly sessionId: string;
+  readonly workflowGeneration: number;
+  readonly phase: SessionEndPhase;
+  readonly ownerId: string;
+  readonly claimToken: bigint;
+  readonly claimExpiresAt: string;
+  readonly triggeringEventPosition: bigint;
+  readonly attemptCount: number;
+}
+
+export interface SessionEndWorkflowClaimNextInputV1 {
+  readonly projectId: string;
+  readonly ownerId: string;
+  readonly observedNowMs: bigint;
+  readonly leaseDurationMs: bigint;
+}
+
+export interface SessionEndWorkflowClaimInputV1 extends SessionEndWorkflowClaimNextInputV1 {
+  readonly workflowId: string;
+  readonly workflowGeneration: number;
+}
+
+export interface SessionEndWorkflowRenewInputV1 {
+  readonly projectId: string;
+  readonly workflowId: string;
+  readonly workflowGeneration: number;
+  readonly ownerId: string;
+  readonly claimToken: bigint;
+  readonly observedNowMs: bigint;
+  readonly leaseDurationMs: bigint;
+}
+
+export interface SessionEndWorkflowReleaseInputV1 {
+  readonly projectId: string;
+  readonly workflowId: string;
+  readonly workflowGeneration: number;
+  readonly ownerId: string;
+  readonly claimToken: bigint;
+}
+
+export interface SessionEndWorkflowEventlessPhaseInputV1 {
+  readonly projectId: string;
+  readonly workflowId: string;
+  readonly workflowGeneration: number;
+  readonly ownerId: string;
+  readonly claimToken: bigint;
+  readonly expectedPhase: SessionEndPhase;
+  readonly nextPhase: SessionEndPhase;
+  readonly observedNowMs: bigint;
+}
 
 /** The durable validation-plan shape.  Configuration material deliberately
  * does not cross this storage boundary; Task 15 derives it from the trusted
@@ -32,6 +137,13 @@ export interface PersistedValidationAttemptPlanV1 {
   readonly resultId: string;
   readonly commandId: string;
   readonly idempotencyKey: string;
+}
+
+export interface PersistedValidationAttemptPlansWriteV1 {
+  readonly projectId: string;
+  readonly workflowId: string;
+  readonly workflowGeneration: number;
+  readonly plans: unknown;
 }
 
 function integrity(): never {
@@ -525,12 +637,7 @@ export function readPersistedValidationAttemptPlansV1(
 
 export function writePersistedValidationAttemptPlansV1(
   connection: SqliteConnection,
-  input: {
-    readonly projectId: string;
-    readonly workflowId: string;
-    readonly workflowGeneration: number;
-    readonly plans: unknown;
-  },
+  input: PersistedValidationAttemptPlansWriteV1,
 ): void {
   try {
     if (!Number.isSafeInteger(input.workflowGeneration) || input.workflowGeneration <= 0) integrity();
@@ -554,6 +661,489 @@ export function writePersistedValidationAttemptPlansV1(
   } catch (error) {
     if (error instanceof LifecycleError && error.code === "INTEGRITY_FAILURE") throw error;
     return integrity();
+  }
+}
+
+function workflowFailure(): never {
+  throw new LifecycleError("INTEGRITY_FAILURE");
+}
+
+function workflowInputFailure(field: string): never {
+  throw new LifecycleError("LIFECYCLE_INPUT_INVALID", { field });
+}
+
+function workflowUuid(value: unknown, field: string): string {
+  if (typeof value !== "string" || !WORKFLOW_UUID.test(value)) workflowInputFailure(field);
+  return value;
+}
+
+function workflowOwner(value: unknown, field: string): string {
+  if (typeof value !== "string" || value.length === 0 || value.length > 256) {
+    workflowInputFailure(field);
+  }
+  return value;
+}
+
+function workflowGeneration(value: unknown, field: string): number {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value <= 0) {
+    workflowInputFailure(field);
+  }
+  return value;
+}
+
+function workflowInt64(value: unknown, field: string, allowZero = false): bigint {
+  if (
+    typeof value !== "bigint"
+    || value < (allowZero ? 0n : 1n)
+    || value > SQLITE_INT64_MAX
+  ) workflowInputFailure(field);
+  return value;
+}
+
+function workflowTime(value: bigint, field: string): string {
+  workflowInt64(value, field, true);
+  if (value > 8_640_000_000_000_000n) workflowInputFailure(field);
+  return new Date(Number(value)).toISOString();
+}
+
+function workflowLeaseUntil(observedNowMs: bigint, leaseDurationMs: bigint): string {
+  workflowInt64(observedNowMs, "observedNowMs", true);
+  workflowInt64(leaseDurationMs, "leaseDurationMs");
+  const expires = observedNowMs + leaseDurationMs;
+  if (expires > 8_640_000_000_000_000n || expires > SQLITE_INT64_MAX) {
+    workflowInputFailure("leaseDurationMs");
+  }
+  return workflowTime(expires, "leaseUntil");
+}
+
+function nullableWorkflowText(row: SqliteRow, field: string): string | null {
+  const value = row[field];
+  if (value === null) return null;
+  if (typeof value !== "string" || value.length === 0) workflowFailure();
+  return value;
+}
+
+function workflowRowInt64(
+  row: SqliteRow,
+  field: string,
+  allowNull = false,
+  allowZero = false,
+): bigint | null {
+  const value = row[field];
+  if (value === null && allowNull) return null;
+  const minimum = allowZero ? 0n : 1n;
+  if (typeof value === "bigint" && value >= minimum && value <= SQLITE_INT64_MAX) {
+    return value;
+  }
+  if (typeof value === "number" && Number.isSafeInteger(value) && value >= Number(minimum)) {
+    return BigInt(value);
+  }
+  workflowFailure();
+}
+
+function workflowRowNumber(row: SqliteRow, field: string, allowNull = false): number | null {
+  const value = workflowRowInt64(row, field, allowNull);
+  if (value === null) return null;
+  if (value > BigInt(Number.MAX_SAFE_INTEGER)) workflowFailure();
+  return Number(value);
+}
+
+function workflowTimestamp(value: unknown, field: string, allowNull = false): string | null {
+  if (value === null && allowNull) return null;
+  if (typeof value !== "string" || !WORKFLOW_TIMESTAMP.test(value)) workflowFailure();
+  const milliseconds = Date.parse(value);
+  if (!Number.isFinite(milliseconds) || new Date(milliseconds).toISOString() !== value) {
+    workflowFailure();
+  }
+  return value;
+}
+
+function requiredWorkflowTimestamp(row: SqliteRow, field: string): string {
+  const value = workflowTimestamp(row[field], field);
+  if (value === null) workflowFailure();
+  return value;
+}
+
+function workflowJson(value: unknown, field: string, allowNull = false): string | null {
+  if (value === null && allowNull) return null;
+  if (typeof value !== "string") workflowFailure();
+  let parsed: unknown;
+  try { parsed = JSON.parse(value); } catch { workflowFailure(); }
+  if (canonicalJson(parsed) !== value) workflowFailure();
+  return value;
+}
+
+function decodeWorkflowRow(row: SqliteRow): SessionEndWorkflowRecordV1 {
+  const projectId = rowString(row, "project_id");
+  const workflowId = rowString(row, "workflow_id");
+  const workflowType = rowString(row, "workflow_type");
+  const phase = rowString(row, "phase");
+  const state = rowString(row, "state");
+  const sessionId = rowString(row, "session_id");
+  const generation = workflowRowNumber(row, "generation");
+  const triggeringEventPosition = workflowRowInt64(row, "triggering_event_position");
+  const coordinatorAttemptCount = workflowRowInt64(row, "coordinator_attempt_count", true, true);
+  const validationAttemptPlanGeneration = workflowRowNumber(
+    row,
+    "validation_attempt_plan_generation",
+    true,
+  );
+  const evidenceFrozenGeneration = workflowRowNumber(row, "evidence_frozen_generation", true);
+  if (
+    !WORKFLOW_UUID.test(projectId)
+    || !WORKFLOW_UUID.test(workflowId)
+    || workflowType !== "session-end"
+    || generation === null
+    || !SESSION_END_PHASES.includes(phase as SessionEndPhase)
+    || !WORKFLOW_UUID.test(sessionId)
+    || triggeringEventPosition === null
+    || coordinatorAttemptCount === null
+    || coordinatorAttemptCount > SQLITE_INT64_MAX
+    || (evidenceFrozenGeneration !== null && evidenceFrozenGeneration <= 0)
+  ) workflowFailure();
+  const evidenceWindowState = nullableWorkflowText(row, "evidence_window_state");
+  if (evidenceWindowState === null
+    || (evidenceWindowState !== "open" && evidenceWindowState !== "sealed")) {
+    workflowFailure();
+  }
+  const coordinatorOwnerId = nullableWorkflowText(row, "coordinator_owner_id");
+  const coordinatorClaimToken = workflowRowInt64(row, "coordinator_claim_token", true);
+  const coordinatorClaimExpiresAt = workflowTimestamp(
+    row["coordinator_claim_expires_at"],
+    "coordinator_claim_expires_at",
+    true,
+  );
+  if ((coordinatorOwnerId === null)
+    !== (coordinatorClaimToken === null)
+    || (coordinatorOwnerId === null) !== (coordinatorClaimExpiresAt === null)) {
+    workflowFailure();
+  }
+  if (coordinatorClaimToken !== null && coordinatorClaimToken > coordinatorAttemptCount) {
+    workflowFailure();
+  }
+  const coordinatorFailureClass = nullableWorkflowText(row, "coordinator_failure_class");
+  const coordinatorErrorCode = nullableWorkflowText(row, "coordinator_error_code");
+  if (coordinatorFailureClass !== null
+    && coordinatorFailureClass !== "retryable"
+    && coordinatorFailureClass !== "permanent") workflowFailure();
+  const coordinatorNextAttemptAt = workflowTimestamp(
+    row["coordinator_next_attempt_at"],
+    "coordinator_next_attempt_at",
+    true,
+  );
+  if ((coordinatorFailureClass === null) !== (coordinatorErrorCode === null)
+    || (coordinatorFailureClass === null && coordinatorNextAttemptAt !== null)
+    || (coordinatorFailureClass === "retryable" && coordinatorNextAttemptAt === null)
+    || (coordinatorFailureClass === "permanent" && coordinatorNextAttemptAt !== null)) {
+    workflowFailure();
+  }
+  const validationAttemptPlansJson = workflowJson(
+    row["validation_attempt_plans_json"],
+    "validation_attempt_plans_json",
+    true,
+  );
+  if ((validationAttemptPlanGeneration === null) !== (validationAttemptPlansJson === null)
+    || (validationAttemptPlanGeneration !== null && validationAttemptPlanGeneration !== generation)) {
+    workflowFailure();
+  }
+  const resultJson = workflowJson(row["result_json"], "result_json", true);
+  const finalEndingScopeBindingsJson = workflowJson(
+    row["final_ending_scope_bindings_json"],
+    "final_ending_scope_bindings_json",
+    true,
+  );
+  const frozenCheckpointPosition = workflowRowInt64(
+    row,
+    "evidence_frozen_checkpoint_event_position",
+    true,
+  );
+  const frozenGroupComplete = frozenCheckpointPosition !== null
+    && evidenceFrozenGeneration !== null
+    && finalEndingScopeBindingsJson !== null;
+  if (
+    (frozenCheckpointPosition === null)
+      !== (evidenceFrozenGeneration === null)
+    || (frozenCheckpointPosition === null) !== (finalEndingScopeBindingsJson === null)
+    || (frozenGroupComplete && evidenceWindowState !== "sealed")
+  ) workflowFailure();
+  return Object.freeze({
+    projectId,
+    workflowId,
+    workflowType: "session-end",
+    generation,
+    state,
+    phase: phase as SessionEndPhase,
+    rootCommandId: rowString(row, "root_command_id"),
+    resultJson,
+    errorCode: nullableWorkflowText(row, "error_code"),
+    createdAt: requiredWorkflowTimestamp(row, "created_at"),
+    updatedAt: requiredWorkflowTimestamp(row, "updated_at"),
+    sessionId,
+    triggeringEventPosition,
+    expectedAuthorityCommitment: (() => {
+      const value = rowString(row, "expected_authority_commitment");
+      if (!LOWER_HASH.test(value)) workflowFailure();
+      return value;
+    })(),
+    coordinatorOwnerId,
+    coordinatorClaimToken,
+    coordinatorClaimExpiresAt,
+    coordinatorAttemptCount,
+    coordinatorFailureClass,
+    coordinatorErrorCode,
+    coordinatorNextAttemptAt,
+    validationAttemptPlanGeneration,
+    validationAttemptPlansJson,
+    evidenceFrozenCheckpointEventPosition: frozenCheckpointPosition,
+    evidenceFrozenGeneration,
+    evidenceWindowState: evidenceWindowState as "open" | "sealed" | null,
+    finalEndingScopeBindingsJson,
+  });
+}
+
+const WORKFLOW_READ_COLUMNS = `
+  project_id, workflow_id, workflow_type, generation, state, phase,
+  root_command_id, result_json, error_code, created_at, updated_at,
+  session_id, triggering_event_position, expected_authority_commitment,
+  coordinator_owner_id, coordinator_claim_token, coordinator_claim_expires_at,
+  coordinator_attempt_count, coordinator_failure_class, coordinator_error_code,
+  coordinator_next_attempt_at, validation_attempt_plan_generation,
+  validation_attempt_plans_json, evidence_frozen_checkpoint_event_position,
+  evidence_frozen_generation, evidence_window_state, final_ending_scope_bindings_json
+`;
+
+function claimFromWorkflow(
+  workflow: SessionEndWorkflowRecordV1,
+): SessionEndWorkflowClaimV1 | null {
+  if (
+    workflow.coordinatorOwnerId === null
+    || workflow.coordinatorClaimToken === null
+    || workflow.coordinatorClaimExpiresAt === null
+  ) return null;
+  if (workflow.coordinatorAttemptCount > BigInt(Number.MAX_SAFE_INTEGER)) workflowFailure();
+  return Object.freeze({
+    projectId: workflow.projectId,
+    workflowId: workflow.workflowId,
+    sessionId: workflow.sessionId,
+    workflowGeneration: workflow.generation,
+    phase: workflow.phase,
+    ownerId: workflow.coordinatorOwnerId,
+    claimToken: workflow.coordinatorClaimToken,
+    claimExpiresAt: workflow.coordinatorClaimExpiresAt,
+    triggeringEventPosition: workflow.triggeringEventPosition,
+    attemptCount: Number(workflow.coordinatorAttemptCount),
+  });
+}
+
+const ACTIVE_PHASE_SQL = [...ACTIVE_WORKFLOW_PHASES].map((phase) => `'${phase}'`).join(", ");
+
+function changed(result: { readonly changes: bigint }): boolean {
+  return result.changes === 1n || (result.changes as unknown) === 1;
+}
+
+/** Storage-only, connection-bound operations for the session-end workflow row. */
+export class SessionEndWorkflowRepository {
+  readonly #connection: SqliteConnection;
+
+  constructor(connection: SqliteConnection) {
+    this.#connection = connection;
+  }
+
+  read(projectId: string, workflowId: string): SessionEndWorkflowRecordV1 | null {
+    workflowUuid(projectId, "projectId");
+    workflowUuid(workflowId, "workflowId");
+    const rows = this.#connection.prepare(`
+      SELECT ${WORKFLOW_READ_COLUMNS}
+      FROM workflow_instances
+      WHERE project_id = $projectId AND workflow_id = $workflowId
+      LIMIT 2
+    `).all({ $projectId: projectId, $workflowId: workflowId });
+    const row = oneOrNone(rows);
+    return row === null ? null : decodeWorkflowRow(row);
+  }
+
+  claimNext(input: SessionEndWorkflowClaimNextInputV1): SessionEndWorkflowClaimV1 | null {
+    workflowUuid(input.projectId, "projectId");
+    workflowOwner(input.ownerId, "ownerId");
+    workflowTime(input.observedNowMs, "observedNowMs");
+    workflowLeaseUntil(input.observedNowMs, input.leaseDurationMs);
+    const candidates = this.#connection.prepare(`
+      SELECT workflow_id, generation
+      FROM workflow_instances
+      WHERE project_id = $projectId
+        AND workflow_type = 'session-end'
+        AND state = 'active'
+        AND session_id IS NOT NULL
+        AND phase IN (${ACTIVE_PHASE_SQL})
+        AND (coordinator_owner_id IS NULL OR coordinator_claim_expires_at <= $observedAt)
+        AND (coordinator_next_attempt_at IS NULL OR coordinator_next_attempt_at <= $observedAt)
+      ORDER BY triggering_event_position ASC, workflow_id COLLATE BINARY ASC
+      LIMIT 1
+    `).all({
+      $projectId: input.projectId,
+      $observedAt: workflowTime(input.observedNowMs, "observedNowMs"),
+    });
+    const candidate = candidates[0] ?? null;
+    if (candidate === null) return null;
+    const workflowId = workflowUuid(candidate.workflow_id, "workflowId");
+    const generation = workflowRowNumber(candidate, "generation");
+    if (generation === null) workflowFailure();
+    return this.claim({
+      ...input,
+      workflowId,
+      workflowGeneration: generation,
+    });
+  }
+
+  claim(input: SessionEndWorkflowClaimInputV1): SessionEndWorkflowClaimV1 | null {
+    workflowUuid(input.projectId, "projectId");
+    workflowUuid(input.workflowId, "workflowId");
+    workflowGeneration(input.workflowGeneration, "workflowGeneration");
+    workflowOwner(input.ownerId, "ownerId");
+    workflowInt64(input.observedNowMs, "observedNowMs", true);
+    const observedAt = workflowTime(input.observedNowMs, "observedNowMs");
+    const claimExpiresAt = workflowLeaseUntil(input.observedNowMs, input.leaseDurationMs);
+    const result = this.#connection.prepare(`
+      UPDATE workflow_instances
+      SET coordinator_owner_id = $ownerId,
+          coordinator_claim_token = coordinator_attempt_count + 1,
+          coordinator_claim_expires_at = $claimExpiresAt,
+          coordinator_attempt_count = coordinator_attempt_count + 1,
+          coordinator_failure_class = NULL,
+          coordinator_error_code = NULL,
+          coordinator_next_attempt_at = NULL,
+          updated_at = $updatedAt
+      WHERE project_id = $projectId
+        AND workflow_id = $workflowId
+        AND workflow_type = 'session-end'
+        AND generation = $workflowGeneration
+        AND state = 'active'
+        AND session_id IS NOT NULL
+        AND phase IN (${ACTIVE_PHASE_SQL})
+        AND coordinator_attempt_count < $maxInt64
+        AND (coordinator_owner_id IS NULL OR coordinator_claim_expires_at <= $observedAt)
+    `).run({
+      $projectId: input.projectId,
+      $workflowId: input.workflowId,
+      $workflowGeneration: BigInt(input.workflowGeneration),
+      $ownerId: input.ownerId,
+      $claimExpiresAt: claimExpiresAt,
+      $updatedAt: observedAt,
+      $maxInt64: SQLITE_INT64_MAX,
+      $observedAt: observedAt,
+    });
+    if (!changed(result)) return null;
+    return claimFromWorkflow(this.read(input.projectId, input.workflowId)!);
+  }
+
+  renew(input: SessionEndWorkflowRenewInputV1): SessionEndWorkflowClaimV1 | null {
+    workflowUuid(input.projectId, "projectId");
+    workflowUuid(input.workflowId, "workflowId");
+    workflowGeneration(input.workflowGeneration, "workflowGeneration");
+    workflowOwner(input.ownerId, "ownerId");
+    workflowInt64(input.claimToken, "claimToken");
+    const observedAt = workflowTime(input.observedNowMs, "observedNowMs");
+    const claimExpiresAt = workflowLeaseUntil(input.observedNowMs, input.leaseDurationMs);
+    const result = this.#connection.prepare(`
+      UPDATE workflow_instances
+      SET coordinator_claim_expires_at = $claimExpiresAt,
+          updated_at = $updatedAt
+      WHERE project_id = $projectId AND workflow_id = $workflowId
+        AND workflow_type = 'session-end' AND generation = $workflowGeneration
+        AND coordinator_owner_id = $ownerId
+        AND coordinator_claim_token = $claimToken
+        AND coordinator_claim_expires_at > $observedAt
+        AND phase IN (${ACTIVE_PHASE_SQL})
+    `).run({
+      $projectId: input.projectId,
+      $workflowId: input.workflowId,
+      $workflowGeneration: BigInt(input.workflowGeneration),
+      $ownerId: input.ownerId,
+      $claimToken: input.claimToken,
+      $claimExpiresAt: claimExpiresAt,
+      $updatedAt: observedAt,
+      $observedAt: observedAt,
+    });
+    if (!changed(result)) return null;
+    return claimFromWorkflow(this.read(input.projectId, input.workflowId)!);
+  }
+
+  release(input: SessionEndWorkflowReleaseInputV1): boolean {
+    workflowUuid(input.projectId, "projectId");
+    workflowUuid(input.workflowId, "workflowId");
+    workflowGeneration(input.workflowGeneration, "workflowGeneration");
+    workflowOwner(input.ownerId, "ownerId");
+    workflowInt64(input.claimToken, "claimToken");
+    const result = this.#connection.prepare(`
+      UPDATE workflow_instances
+      SET coordinator_owner_id = NULL,
+          coordinator_claim_token = NULL,
+          coordinator_claim_expires_at = NULL,
+          updated_at = updated_at
+      WHERE project_id = $projectId AND workflow_id = $workflowId
+        AND workflow_type = 'session-end' AND generation = $workflowGeneration
+        AND coordinator_owner_id = $ownerId
+        AND coordinator_claim_token = $claimToken
+    `).run({
+      $projectId: input.projectId,
+      $workflowId: input.workflowId,
+      $workflowGeneration: BigInt(input.workflowGeneration),
+      $ownerId: input.ownerId,
+      $claimToken: input.claimToken,
+    });
+    return changed(result);
+  }
+
+  advanceEventlessPhase(input: SessionEndWorkflowEventlessPhaseInputV1): boolean {
+    workflowUuid(input.projectId, "projectId");
+    workflowUuid(input.workflowId, "workflowId");
+    workflowGeneration(input.workflowGeneration, "workflowGeneration");
+    workflowOwner(input.ownerId, "ownerId");
+    workflowInt64(input.claimToken, "claimToken");
+    workflowTime(input.observedNowMs, "observedNowMs");
+    if (!ACTIVE_WORKFLOW_PHASES.has(input.expectedPhase)
+      || !SESSION_END_PHASES.includes(input.nextPhase)
+      || EVENTLESS_PHASE_TRANSITIONS.get(input.expectedPhase) !== input.nextPhase) {
+      workflowInputFailure("phase");
+    }
+    const result = this.#connection.prepare(`
+      UPDATE workflow_instances
+      SET phase = $nextPhase,
+          coordinator_owner_id = NULL,
+          coordinator_claim_token = NULL,
+          coordinator_claim_expires_at = NULL,
+          updated_at = $updatedAt
+      WHERE project_id = $projectId AND workflow_id = $workflowId
+        AND workflow_type = 'session-end' AND generation = $workflowGeneration
+        AND phase = $expectedPhase
+        AND coordinator_owner_id = $ownerId
+        AND coordinator_claim_token = $claimToken
+        AND coordinator_claim_expires_at > $observedAt
+    `).run({
+      $projectId: input.projectId,
+      $workflowId: input.workflowId,
+      $workflowGeneration: BigInt(input.workflowGeneration),
+      $expectedPhase: input.expectedPhase,
+      $nextPhase: input.nextPhase,
+      $ownerId: input.ownerId,
+      $claimToken: input.claimToken,
+      $updatedAt: workflowTime(input.observedNowMs, "observedNowMs"),
+      $observedAt: workflowTime(input.observedNowMs, "observedNowMs"),
+    });
+    return changed(result);
+  }
+
+  readPersistedValidationAttemptPlansV1(
+    projectId: string,
+    workflowId: string,
+  ): StoredValidationAttemptPlansV1 | null {
+    return readPersistedValidationAttemptPlansV1(this.#connection, projectId, workflowId);
+  }
+
+  writePersistedValidationAttemptPlansV1(
+    input: PersistedValidationAttemptPlansWriteV1,
+  ): void {
+    writePersistedValidationAttemptPlansV1(this.#connection, input);
   }
 }
 

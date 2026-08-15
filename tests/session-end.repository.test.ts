@@ -5,6 +5,7 @@ import {
   BoundSessionEndRepository,
   hydrateSessionEndEffectiveStateV1,
   readPersistedValidationAttemptPlansV1,
+  SessionEndWorkflowRepository,
   writePersistedValidationAttemptPlansV1,
 } from "../src/orchestrator/storage/session-end.repository.js";
 import { buildLifecycleIntentWitness } from "../src/orchestrator/lifecycle/lifecycle-intent-witness.js";
@@ -65,6 +66,79 @@ const moduleUrl = new URL(
 const HYDRATION_PROJECT = "11111111-1111-4111-8111-111111111111";
 const HYDRATION_WORKFLOW = "22222222-2222-4222-8222-222222222222";
 const HYDRATION_COMMAND = "33333333-3333-4333-8333-333333333333";
+
+const WORKFLOW_PROJECT = "99999999-9999-4999-8999-999999999999";
+const WORKFLOW_SESSION_A = "99999999-9999-4999-8999-999999999991";
+const WORKFLOW_SESSION_B = "99999999-9999-4999-8999-999999999992";
+const WORKFLOW_ID_A = "99999999-9999-4999-8999-999999999981";
+const WORKFLOW_ID_B = "99999999-9999-4999-8999-999999999982";
+
+function workflowRepositoryConnection(): NativeConnection {
+  const connection = new NativeConnection();
+  connection.exec(`
+    CREATE TABLE workflow_instances (
+      project_id TEXT NOT NULL,
+      workflow_id TEXT NOT NULL,
+      workflow_type TEXT NOT NULL,
+      generation INTEGER NOT NULL,
+      state TEXT NOT NULL,
+      phase TEXT NOT NULL,
+      root_command_id TEXT NOT NULL,
+      result_json TEXT,
+      error_code TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      session_id TEXT NOT NULL,
+      triggering_event_position INTEGER NOT NULL,
+      expected_authority_commitment TEXT NOT NULL,
+      coordinator_owner_id TEXT,
+      coordinator_claim_token INTEGER,
+      coordinator_claim_expires_at TEXT,
+      coordinator_attempt_count INTEGER NOT NULL,
+      coordinator_failure_class TEXT,
+      coordinator_error_code TEXT,
+      coordinator_next_attempt_at TEXT,
+      validation_attempt_plan_generation INTEGER,
+      validation_attempt_plans_json TEXT,
+      evidence_frozen_checkpoint_event_position INTEGER,
+      evidence_frozen_generation INTEGER,
+      evidence_window_state TEXT,
+      final_ending_scope_bindings_json TEXT,
+      PRIMARY KEY(project_id, workflow_id)
+    ) STRICT;
+  `);
+  const insert = connection.prepare(`
+    INSERT INTO workflow_instances(
+      project_id, workflow_id, workflow_type, generation, state, phase,
+      root_command_id, result_json, error_code, created_at, updated_at,
+      session_id, triggering_event_position, expected_authority_commitment,
+      coordinator_owner_id, coordinator_claim_token, coordinator_claim_expires_at,
+      coordinator_attempt_count, coordinator_failure_class, coordinator_error_code,
+      coordinator_next_attempt_at, validation_attempt_plan_generation,
+      validation_attempt_plans_json, evidence_frozen_checkpoint_event_position,
+      evidence_frozen_generation, evidence_window_state, final_ending_scope_bindings_json
+    ) VALUES (
+      $projectId, $workflowId, 'session-end', 1, 'active', 'requested',
+      $commandId, NULL, NULL, $now, $now, $sessionId, $position, $commitment,
+      NULL, NULL, NULL, 0, NULL, NULL, NULL, NULL, NULL, NULL, NULL, 'sealed', NULL
+    )
+  `);
+  for (const [workflowId, sessionId, commandId, position] of [
+    [WORKFLOW_ID_A, WORKFLOW_SESSION_A, "99999999-9999-4999-8999-999999999971", 20n],
+    [WORKFLOW_ID_B, WORKFLOW_SESSION_B, "99999999-9999-4999-8999-999999999972", 10n],
+  ] as const) {
+    insert.run({
+      $projectId: WORKFLOW_PROJECT,
+      $workflowId: workflowId,
+      $commandId: commandId,
+      $now: "2026-08-15T00:00:00.000Z",
+      $sessionId: sessionId,
+      $position: position,
+      $commitment: "a".repeat(64),
+    });
+  }
+  return connection;
+}
 
 function requestIntent(state: ReturnType<typeof sessionEndEffectiveStateFixture>) {
   const requestSessionId = state.request.sessionId;
@@ -903,4 +977,106 @@ it("rejects event-position hydration intent fold hash and immutable-event disagr
     sessionId: EFFECTIVE_STATE_SESSION_ID, eventPosition: 10n,
   }), /INTEGRITY_FAILURE/);
   malformed.close();
+});
+
+it("claims session-end workflows in triggering-position workflow-id order", () => {
+  const connection = workflowRepositoryConnection();
+  const repository = new SessionEndWorkflowRepository(connection);
+  const claim = repository.claimNext({
+    projectId: WORKFLOW_PROJECT,
+    ownerId: "coordinator-a",
+    observedNowMs: 0n,
+    leaseDurationMs: 1_000n,
+  });
+  assert.equal(claim?.workflowId, WORKFLOW_ID_B);
+  assert.equal(claim?.sessionId, WORKFLOW_SESSION_B);
+  assert.equal(claim?.claimToken, 1n);
+  assert.equal(claim?.attemptCount, 1);
+  assert.equal(claim?.claimExpiresAt, "1970-01-01T00:00:01.000Z");
+  connection.close();
+});
+
+it("fences workflow renewal and permits expired takeover", () => {
+  const connection = workflowRepositoryConnection();
+  const repository = new SessionEndWorkflowRepository(connection);
+  const first = repository.claim({
+    projectId: WORKFLOW_PROJECT,
+    workflowId: WORKFLOW_ID_A,
+    workflowGeneration: 1,
+    ownerId: "coordinator-a",
+    observedNowMs: 0n,
+    leaseDurationMs: 1_000n,
+  });
+  assert.equal(first?.claimToken, 1n);
+  assert.equal(repository.renew({
+    projectId: WORKFLOW_PROJECT,
+    workflowId: WORKFLOW_ID_A,
+    workflowGeneration: 1,
+    ownerId: "coordinator-b",
+    claimToken: 1n,
+    observedNowMs: 100n,
+    leaseDurationMs: 1_000n,
+  }), null);
+  const takenOver = repository.claim({
+    projectId: WORKFLOW_PROJECT,
+    workflowId: WORKFLOW_ID_A,
+    workflowGeneration: 1,
+    ownerId: "coordinator-b",
+    observedNowMs: 1_000n,
+    leaseDurationMs: 2_000n,
+  });
+  assert.equal(takenOver?.claimToken, 2n);
+  assert.equal(takenOver?.ownerId, "coordinator-b");
+  assert.equal(takenOver?.claimExpiresAt, "1970-01-01T00:00:03.000Z");
+  assert.equal(repository.release({
+    projectId: WORKFLOW_PROJECT,
+    workflowId: WORKFLOW_ID_A,
+    workflowGeneration: 1,
+    ownerId: "coordinator-a",
+    claimToken: 1n,
+  }), false);
+  assert.equal(repository.release({
+    projectId: WORKFLOW_PROJECT,
+    workflowId: WORKFLOW_ID_A,
+    workflowGeneration: 1,
+    ownerId: "coordinator-b",
+    claimToken: 2n,
+  }), true);
+  connection.close();
+});
+
+it("advances an eventless workflow phase only for the live claim", () => {
+  const connection = workflowRepositoryConnection();
+  const repository = new SessionEndWorkflowRepository(connection);
+  const claim = repository.claim({
+    projectId: WORKFLOW_PROJECT,
+    workflowId: WORKFLOW_ID_A,
+    workflowGeneration: 1,
+    ownerId: "coordinator-a",
+    observedNowMs: 0n,
+    leaseDurationMs: 1_000n,
+  });
+  assert.equal(claim?.claimToken, 1n);
+  assert.equal(repository.advanceEventlessPhase({
+    projectId: WORKFLOW_PROJECT,
+    workflowId: WORKFLOW_ID_A,
+    workflowGeneration: 1,
+    ownerId: "coordinator-b",
+    claimToken: 1n,
+    expectedPhase: "requested",
+    nextPhase: "children-resolved",
+    observedNowMs: 100n,
+  }), false);
+  assert.equal(repository.advanceEventlessPhase({
+    projectId: WORKFLOW_PROJECT,
+    workflowId: WORKFLOW_ID_A,
+    workflowGeneration: 1,
+    ownerId: "coordinator-a",
+    claimToken: 1n,
+    expectedPhase: "requested",
+    nextPhase: "children-resolved",
+    observedNowMs: 100n,
+  }), true);
+  assert.equal(repository.read(WORKFLOW_PROJECT, WORKFLOW_ID_A)?.phase, "children-resolved");
+  connection.close();
 });

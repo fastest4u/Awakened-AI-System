@@ -539,7 +539,7 @@ function transaction(connection: TransactionConnection): LifecycleCommandTransac
       minimumCheckpointUpperBound: () => 0,
       minimumFinalEndingScopeBindingsUpperBound: () => 0,
     },
-    workflows: { stage },
+    workflows: { stage } as never,
     validation: { stage },
     outbox: { stage },
   };
