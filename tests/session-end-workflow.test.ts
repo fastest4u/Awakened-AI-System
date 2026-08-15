@@ -8,8 +8,16 @@ import {
 } from "../src/orchestrator/lifecycle/lifecycle-operational.store.js";
 import {
   ConnectionBoundSessionEndWorkflowOperations,
+  requestedSessionEndStatusV2,
   SessionEndWorkflowService,
 } from "../src/orchestrator/lifecycle/session-end-workflow.service.js";
+import {
+  SessionEndWorkflowRepository,
+  type SessionEndWorkflowRequestedInputV1,
+} from "../src/orchestrator/storage/session-end.repository.js";
+import { sessionEndEffectiveStateHashV1 } from "../src/orchestrator/lifecycle/session-end-effective-state.js";
+import type { SessionEndEffectiveStateV1 } from "../src/orchestrator/lifecycle/session-end-effective-state.js";
+import { canonicalJson } from "../src/orchestrator/serialization/canonical-json.js";
 import type {
   SqliteConnection,
   SqliteParams,
@@ -56,6 +64,51 @@ const ROOT_COMMAND_ID = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
 const RUN_ID = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
 const RESULT_ID = "ffffffff-ffff-4fff-8fff-ffffffffffff";
 const COMMAND_ID = "11111111-2222-4333-8444-555555555555";
+
+const REQUEST = Object.freeze({
+  requestVersion: 1 as const,
+  sessionId: SESSION_ID,
+  childEndPolicy: "require-completed" as const,
+  finalCheckpoint: Object.freeze({
+    checkpointVersion: 1 as const,
+    taskSummary: "done",
+    completedItems: [],
+    inProgressItems: [],
+    blockers: [],
+    nextActions: [],
+    decisions: [],
+    assumptions: [],
+    unresolvedConflicts: [],
+    filesTouched: [],
+    artifactReferences: [],
+    sourceReferences: [],
+    commandResults: [],
+    testResults: [],
+    materialClaims: [],
+  }),
+  validationProfileIds: ["profile-a"],
+  requestedQualityThreshold: 1,
+  requireFullEvidence: false,
+  requireMaterialization: false,
+});
+
+const EFFECTIVE_STATE_WITHOUT_HASH = Object.freeze({
+  effectiveStateVersion: 1 as const,
+  effectiveStateDomain: "project-memory/session-end-effective-state/v1" as const,
+  request: REQUEST,
+  effectivePolicy: Object.freeze({
+    qualityPolicyVersion: 1 as const,
+    profiles: [{ profileId: "profile-a", profileVersion: 1, required: true, weight: 1 }],
+    qualityThreshold: 1,
+    requireFullEvidence: false,
+    requireMaterialization: false,
+  }),
+  effectiveFinalCheckpoint: REQUEST.finalCheckpoint,
+});
+const EFFECTIVE_STATE = Object.freeze({
+  ...EFFECTIVE_STATE_WITHOUT_HASH,
+  effectiveStateHash: sessionEndEffectiveStateHashV1(EFFECTIVE_STATE_WITHOUT_HASH),
+}) as unknown as SessionEndEffectiveStateV1;
 
 function workflowConnection(): NativeConnection {
   const connection = new NativeConnection();
@@ -127,6 +180,57 @@ function repositorySet(workflows: object): LifecycleOperationalRepositorySet {
 }
 
 describe("SessionEndWorkflowService", () => {
+  it("anchors requested status and reopens one cancelled row at the next generation", () => {
+    const connection = workflowConnection();
+    const repository = new SessionEndWorkflowRepository(connection);
+    connection.prepare("DELETE FROM workflow_instances WHERE project_id = $projectId AND workflow_id = $workflowId").run({
+      $projectId: PROJECT_ID,
+      $workflowId: WORKFLOW_ID,
+    });
+    const first = requestedSessionEndStatusV2({
+      sessionId: SESSION_ID,
+      workflowId: WORKFLOW_ID,
+      workflowGeneration: 1,
+      priorRootState: "active",
+      triggeringEventPosition: 8n,
+      evidenceWindowState: "sealed",
+      materializationRequired: false,
+    });
+    const input: SessionEndWorkflowRequestedInputV1 = {
+      projectId: PROJECT_ID,
+      workflowId: WORKFLOW_ID,
+      workflowGeneration: 1,
+      rootCommandId: ROOT_COMMAND_ID,
+      sessionId: SESSION_ID,
+      triggeringEventPosition: 8n,
+      expectedAuthorityCommitment: "a".repeat(64),
+      priorRootState: "active",
+      resultJson: canonicalJson(first),
+      evidenceWindowState: "sealed",
+      now: "2026-08-15T00:00:00.000Z",
+      effectiveState: EFFECTIVE_STATE,
+    };
+    repository.createRequested(input);
+    connection.prepare(`UPDATE workflow_instances SET phase = 'cancelled', generation = 2, result_json = NULL, evidence_window_state = 'sealed' WHERE project_id = $projectId AND workflow_id = $workflowId`).run({
+      $projectId: PROJECT_ID,
+      $workflowId: WORKFLOW_ID,
+    });
+    repository.reopenCancelled({
+      ...input,
+      workflowGeneration: 3,
+      rootCommandId: COMMAND_ID,
+      triggeringEventPosition: 12n,
+      resultJson: null,
+    });
+    const row = repository.read(PROJECT_ID, WORKFLOW_ID);
+    assert.equal(row?.generation, 3);
+    assert.equal(row?.phase, "requested");
+    assert.equal(row?.rootCommandId, COMMAND_ID);
+    assert.equal(row?.triggeringEventPosition, 12n);
+    assert.equal(row?.resultJson, null);
+    connection.close();
+  });
+
   it("exposes only connection-bound workflow capabilities and persists immutable validation plans", () => {
     const connection = workflowConnection();
     const service = new SessionEndWorkflowService({ connection });

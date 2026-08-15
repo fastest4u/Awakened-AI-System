@@ -10,8 +10,60 @@ import {
   type SessionEndWorkflowReleaseInputV1,
   type SessionEndWorkflowRenewInputV1,
   type StoredValidationAttemptPlansV1,
+  type SessionEndWorkflowRequestedInputV1,
 } from "../storage/session-end.repository.js";
 import type { SessionEndWorkflowOperations } from "../storage/lifecycle-storage.types.js";
+import type {
+  SessionEndPhase,
+  SessionEndStatusV2,
+} from "./contracts/session-end.js";
+
+export interface RequestedSessionEndStatusInputV2 {
+  readonly sessionId: string;
+  readonly workflowId: string;
+  readonly workflowGeneration: number;
+  readonly priorRootState: "active" | "suspended";
+  readonly triggeringEventPosition: bigint;
+  readonly evidenceWindowState: "open" | "sealed";
+  readonly materializationRequired: boolean;
+}
+
+/** Builds the canonical status stored alongside a newly requested workflow. */
+export function requestedSessionEndStatusV2(
+  input: RequestedSessionEndStatusInputV2,
+): SessionEndStatusV2 {
+  if (!Number.isSafeInteger(input.workflowGeneration) || input.workflowGeneration <= 0) {
+    throw new Error("invalid workflow generation");
+  }
+  if (input.triggeringEventPosition <= 0n) throw new Error("invalid triggering position");
+  if (input.evidenceWindowState !== "open" && input.evidenceWindowState !== "sealed") {
+    throw new Error("invalid evidence window");
+  }
+  if (typeof input.materializationRequired !== "boolean") {
+    throw new Error("invalid materialization requirement");
+  }
+  const evidenceWindow = Object.freeze({
+    evidenceWindowState: input.evidenceWindowState,
+    evidenceFrozenCheckpointEventPosition: null,
+    evidenceFrozenGeneration: null,
+  });
+  return Object.freeze({
+    resultVersion: 2,
+    sessionId: input.sessionId,
+    workflowId: input.workflowId,
+    workflowGeneration: input.workflowGeneration,
+    phase: "requested" as SessionEndPhase,
+    priorRootState: input.priorRootState,
+    triggeringEventPosition: input.triggeringEventPosition.toString(),
+    finalCheckpointId: null,
+    finalCheckpointEventPosition: null,
+    evidenceWindow,
+    validationPlansReady: false,
+    qualityScore: null,
+    safeFailureCode: null,
+    materializationRequired: input.materializationRequired,
+  }) as SessionEndStatusV2;
+}
 
 /**
  * A plain own-property facade is required by the transaction guard.  Every
@@ -74,13 +126,26 @@ export interface SessionEndWorkflowServiceOptions {
  */
 export class SessionEndWorkflowService {
   readonly #operations: ConnectionBoundSessionEndWorkflowOperations;
+  readonly #repository: SessionEndWorkflowRepository;
 
   constructor(options: SessionEndWorkflowServiceOptions) {
+    this.#repository = new SessionEndWorkflowRepository(options.connection);
     this.#operations = new ConnectionBoundSessionEndWorkflowOperations(options.connection);
   }
 
   get operations(): ConnectionBoundSessionEndWorkflowOperations {
     return this.#operations;
   }
-}
 
+  read(projectId: string, workflowId: string): SessionEndWorkflowRecordV1 | null {
+    return this.#repository.read(projectId, workflowId);
+  }
+
+  createRequested(input: SessionEndWorkflowRequestedInputV1): void {
+    this.#repository.createRequested(input);
+  }
+
+  reopenCancelled(input: SessionEndWorkflowRequestedInputV1): void {
+    this.#repository.reopenCancelled(input);
+  }
+}

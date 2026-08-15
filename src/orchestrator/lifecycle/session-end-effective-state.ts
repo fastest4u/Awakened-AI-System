@@ -160,6 +160,43 @@ export function sessionEndEffectiveStateHashV1(value: unknown): string {
   }
 }
 
+/**
+ * Builds the immutable Version-1 request snapshot used by every semantic
+ * session-end event.  Callers supply only already-derived policy material;
+ * this function re-decodes the request, policy, and draft before hashing so
+ * the bytes written to the event cannot differ from the bytes validated here.
+ */
+export function createSessionEndEffectiveStateV1(input: {
+  readonly request: SessionEndRequest;
+  readonly effectivePolicy: PersistedQualityPolicyInputV1;
+  readonly effectiveFinalCheckpoint?: CheckpointDraftV1 | CheckpointDraftV2;
+}): SessionEndEffectiveStateV1 {
+  const request = decodeSessionEndRequest(input.request);
+  const effectivePolicy = decodePersistedQualityPolicyInputV1(input.effectivePolicy);
+  const effectiveFinalCheckpoint = decodeCheckpointDraft(
+    input.effectiveFinalCheckpoint ?? request.finalCheckpoint,
+  );
+  if (
+    request.requestVersion !== effectiveFinalCheckpoint.checkpointVersion
+    || canonicalJson(request.finalCheckpoint) !== canonicalJson(effectiveFinalCheckpoint)
+  ) invalid("effectiveFinalCheckpoint");
+  const withoutHash = Object.freeze({
+    effectiveStateVersion: 1 as const,
+    effectiveStateDomain: SESSION_END_EFFECTIVE_STATE_DOMAIN,
+    request,
+    effectivePolicy,
+    effectiveFinalCheckpoint,
+  });
+  assertSessionEndEffectiveStateCanonicalSizeV1({
+    ...withoutHash,
+    effectiveStateHash: "0".repeat(64),
+  });
+  return decodeSessionEndEffectiveStateV1({
+    ...withoutHash,
+    effectiveStateHash: sessionEndEffectiveStateHashV1(withoutHash),
+  });
+}
+
 export function decodeSessionEndEffectiveStateV1(value: unknown): SessionEndEffectiveStateV1 {
   assertSessionEndEffectiveStateCanonicalSizeV1(value);
   const source = exactOwnDataRecord(value, EFFECTIVE_STATE_KEYS, "effectiveState");

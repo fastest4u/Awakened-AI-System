@@ -16,6 +16,7 @@ import type {
   RootStartCommandV2,
   RootSuspendCommandV2,
   RootSuspendCommandV3,
+  RequestSessionEndCommandV3,
 } from "../src/orchestrator/lifecycle/contracts/commands.js";
 import type {
   CheckpointEvidenceCoverageV2,
@@ -23,6 +24,18 @@ import type {
   CheckpointDraftV2,
   SourceStateFingerprintV1,
 } from "../src/orchestrator/lifecycle/contracts/checkpoint.js";
+import type { SessionEndStatusV2 } from "../src/orchestrator/lifecycle/contracts/session-end.js";
+import {
+  createSessionEndEffectiveStateV1,
+} from "../src/orchestrator/lifecycle/session-end-effective-state.js";
+import {
+  requestedSessionEndStatusV2,
+} from "../src/orchestrator/lifecycle/session-end-workflow.service.js";
+import {
+  MAX_ROOT_CHILD_HISTORY_V1,
+  sessionEndWorkflowId,
+} from "../src/orchestrator/lifecycle/session-end-identifiers.js";
+import { SessionEndWorkflowRepository } from "../src/orchestrator/storage/session-end.repository.js";
 import {
   createCapabilityProof,
   type BoundedOperationProofTargetV1,
@@ -123,6 +136,10 @@ interface LifecycleCommandProcessorLike {
     projectContext: ProjectContext,
     command: PreparedLifecycleWorkerCommand<RootSuspendCommandV2 | RootSuspendCommandV3>,
   ): WorkerLifecycleResult<RootSessionPublicResultV2>;
+  requestSessionEnd(
+    projectContext: ProjectContext,
+    command: PreparedLifecycleWorkerCommand<RequestSessionEndCommandV3>,
+  ): WorkerLifecycleResult<SessionEndStatusV2>;
   recoverRoot(
     projectContext: ProjectContext,
     command: PreparedLifecycleWorkerCommand<RootRecoveryCommandV2>,
@@ -590,6 +607,120 @@ function preparedSuspend<C extends RootSuspendCommandV2 | RootSuspendCommandV3>(
   }
 }
 
+function requestSessionEndCommand(
+  ordinal: number,
+  sessionId: string,
+  requestVersion: 1 | 2 = 2,
+): RequestSessionEndCommandV3 {
+  return {
+    commandType: "request-session-end",
+    commandId: lifecycleUuid(ordinal),
+    idempotencyKey: `request-session-end/${ordinal}`,
+    agentId: "agent-primary",
+    expectedProjectId: PROJECT_ID,
+    expectedVaultId: VAULT_ID,
+    expectedWorkspaceId: WORKSPACE_ID,
+    expectedBranchRef: null,
+    request: {
+      requestVersion,
+      sessionId: sessionId as RequestSessionEndCommandV3["request"]["sessionId"],
+      childEndPolicy: "suspend-and-carry-forward",
+      finalCheckpoint: {
+        checkpointVersion: requestVersion,
+        taskSummary: "finish session",
+        completedItems: [],
+        inProgressItems: [],
+        blockers: [],
+        nextActions: [],
+        decisions: [],
+        assumptions: [],
+        unresolvedConflicts: [],
+        filesTouched: [],
+        artifactReferences: [],
+        sourceReferences: [],
+        commandResults: [],
+        testResults: [],
+        materialClaims: [],
+      },
+      validationProfileIds: ["profile-a"],
+      requestedQualityThreshold: 1,
+      requireFullEvidence: false,
+      requireMaterialization: false,
+    },
+  } as RequestSessionEndCommandV3;
+}
+
+function preparedRequestSessionEnd(
+  item: Fixture,
+  projectContext: ProjectContext,
+  issued: Extract<WorkerLifecycleResult<RootSessionPublicResultV2>, { kind: "success" }>,
+  command: RequestSessionEndCommandV3,
+): PreparedLifecycleWorkerCommand<RequestSessionEndCommandV3> {
+  const descriptor = issued.authorityMaterial.descriptor;
+  const descriptorTarget = issued.authorityMaterial.target;
+  assert.ok(descriptor !== null && descriptorTarget !== null);
+  const material = item.capabilities.reconstructForTarget(descriptor, descriptorTarget);
+  try {
+    assert.equal(material.kind, "root");
+    const generation = issued.publicResult.ownerGeneration;
+    const candidateIntentHash = buildLifecycleIntentWitness(command, {
+      authorizationKind: "protected",
+      authorizationSessionId: command.request.sessionId,
+      targetSessionId: command.request.sessionId,
+      projectId: projectContext.binding.projectId,
+      vaultId: projectContext.binding.vaultId,
+      storeId: projectContext.binding.storeId,
+      workspaceId: projectContext.binding.workspaceId,
+      clientNamespace: projectContext.binding.clientNamespace,
+      capabilityKind: "root-session-handle",
+      capabilityGeneration: generation,
+      presentingActorRole: "primary",
+      presentingClientInstanceId: projectContext.binding.clientInstanceId,
+      targetActorRole: "primary",
+      targetClientInstanceId: projectContext.binding.clientInstanceId,
+      internalWorkflowId: null,
+      internalWorkflowGeneration: null,
+      internalPlannedWorkId: null,
+    }).intentHash;
+    const proofTarget: SemanticCommandProofTargetV1 = {
+      proofVersion: 1,
+      target: "semantic-command",
+      projectId: projectContext.binding.projectId,
+      vaultId: projectContext.binding.vaultId,
+      storeId: projectContext.binding.storeId,
+      workspaceId: projectContext.binding.workspaceId,
+      clientNamespace: projectContext.binding.clientNamespace,
+      authoritySessionId: command.request.sessionId,
+      targetSessionId: command.request.sessionId,
+      presentingActorRole: "primary",
+      presentingClientInstanceId: projectContext.binding.clientInstanceId,
+      targetActorRole: "primary",
+      targetClientInstanceId: projectContext.binding.clientInstanceId,
+      capabilityKind: "root-session-handle",
+      capabilityGeneration: generation,
+      commandId: command.commandId,
+      idempotencyKey: command.idempotencyKey,
+      intentHash: candidateIntentHash,
+      proofNonce: lifecycleUuid(Number(command.commandId.slice(-12)) + 40_000),
+    };
+    return {
+      command,
+      candidateIntentHash,
+      authorization: {
+        kind: "protected",
+        authoritySessionId: command.request.sessionId,
+        targetSessionId: command.request.sessionId,
+        proof: createCapabilityProof(material.handle, proofTarget),
+        approval: null,
+        childBindingGrant: null,
+      },
+    };
+  } finally {
+    material.handle.destroy();
+    if (material.kind === "root") material.resumeToken?.destroy();
+  }
+}
+
 function recoveryCommand(
   ordinal: number,
   sessionId: string,
@@ -850,9 +981,9 @@ function renewalOperation(
   }
 }
 
-function success(
-  result: WorkerLifecycleResult<RootSessionPublicResultV2>,
-): Extract<WorkerLifecycleResult<RootSessionPublicResultV2>, { kind: "success" }> {
+function success<T extends JsonValue>(
+  result: WorkerLifecycleResult<T>,
+): Extract<WorkerLifecycleResult<T>, { kind: "success" }> {
   assert.equal(result.kind, "success");
   if (result.kind !== "success") assert.fail("expected lifecycle success");
   return result;
@@ -893,6 +1024,7 @@ interface FixtureOptions {
   readonly eventFault?: (
     boundary: "before-begin" | "after-first-insert-before-commit" | "after-commit-before-response",
   ) => void;
+  readonly skipProjection?: boolean;
 }
 
 function checkpointSourceState(projectContext: ProjectContext): SourceStateFingerprintV1 {
@@ -950,7 +1082,9 @@ function fixture(
   const store = new LifecycleCommandStore({
     connection,
     events,
-    projectionWriter: new SqliteLifecycleProjectionRepository(connection),
+    projectionWriter: options.skipProjection
+      ? { append: () => undefined }
+      : new SqliteLifecycleProjectionRepository(connection),
     transaction: (current) => ({
       authority: {
         get: (projectId: string, sessionId: string) => authority.get(current, projectId, sessionId),
@@ -1218,6 +1352,179 @@ function seedRootCheckpoint(item: Fixture, sessionId: string, ordinal: number) {
     throw error;
   }
   return checkpoint;
+}
+
+function seedOversizedCarryForwardHistory(item: Fixture, rootSessionId: string): void {
+  item.connection.exec(`
+    DROP TRIGGER child_transfer_tickets_insert_guard;
+    DROP TRIGGER child_transfer_tickets_history_v4_insert_guard;
+    DROP INDEX child_transfer_tickets_source_child_v4;
+  `);
+  item.connection.exec("BEGIN IMMEDIATE");
+  try {
+    const insert = item.connection.prepare(`
+      INSERT INTO child_transfer_tickets(
+        project_id, transfer_ticket_id, source_parent_session_id, source_child_session_id,
+        source_assignment_json, source_scope_json, checkpoint_id, follow_ups_json,
+        source_state_json, lineage_json, created_event_position, created_at,
+        claimed_by_root_session_id, claimed_child_session_id, claimed_event_position, claimed_at
+      ) VALUES (
+        $projectId, $transferTicketId, $sourceParentSessionId, $sourceChildSessionId,
+        '{}', '{}', $checkpointId, '[]', '{}', '{}', 1, $createdAt,
+        NULL, NULL, NULL, NULL
+      )
+    `);
+    for (let index = 0; index <= MAX_ROOT_CHILD_HISTORY_V1; index += 1) {
+      insert.run({
+        $projectId: PROJECT_ID,
+        $transferTicketId: lifecycleUuid(50_000 + index),
+        $sourceParentSessionId: rootSessionId,
+        $sourceChildSessionId: rootSessionId,
+        $checkpointId: lifecycleUuid(60_000 + index),
+        $createdAt: NOW,
+      });
+    }
+    item.connection.exec("COMMIT");
+  } catch (error) {
+    item.connection.exec("ROLLBACK");
+    throw error;
+  }
+}
+
+function seedCancelledSessionEndWorkflow(item: Fixture, sessionId: string): void {
+  const authority = item.authority.get(item.connection, PROJECT_ID, sessionId);
+  assert.ok(authority !== null && authority.sessionKind === "root");
+  assert.ok(authority.latestCheckpointEventPosition !== null);
+  const request = requestSessionEndCommand(1304, sessionId, 2).request;
+  const effectiveState = createSessionEndEffectiveStateV1({
+    request,
+    effectivePolicy: {
+      qualityPolicyVersion: 1,
+      profiles: [{ profileId: "profile-a", profileVersion: 1, required: true, weight: 1 }],
+      qualityThreshold: 1,
+      requireFullEvidence: false,
+      requireMaterialization: false,
+    },
+  });
+  const workflowId = sessionEndWorkflowId(sessionId as never);
+  const requestedStatus = requestedSessionEndStatusV2({
+    sessionId,
+    workflowId,
+    workflowGeneration: 1,
+    priorRootState: "active",
+    triggeringEventPosition: authority.latestCheckpointEventPosition,
+    evidenceWindowState: "open",
+    materializationRequired: false,
+  });
+  const repository = new SessionEndWorkflowRepository(item.connection);
+  repository.createRequested({
+    projectId: PROJECT_ID,
+    workflowId,
+    workflowGeneration: 1,
+    rootCommandId: lifecycleUuid(1305),
+    sessionId,
+    triggeringEventPosition: authority.latestCheckpointEventPosition,
+    expectedAuthorityCommitment: authority.authorityCommitment,
+    priorRootState: "active",
+    resultJson: canonicalJson(requestedStatus),
+    evidenceWindowState: "open",
+    now: NOW,
+    effectiveState,
+  });
+  const cancelledStatus = {
+    resultVersion: 2,
+    sessionId: requestedStatus.sessionId,
+    workflowId: requestedStatus.workflowId,
+    workflowGeneration: 2,
+    phase: "cancelled",
+    priorRootState: requestedStatus.priorRootState,
+    triggeringEventPosition: requestedStatus.triggeringEventPosition,
+    finalCheckpointId: null,
+    finalCheckpointEventPosition: null,
+    evidenceWindow: {
+      evidenceWindowState: "sealed",
+      evidenceFrozenCheckpointEventPosition: null,
+      evidenceFrozenGeneration: null,
+    },
+    validationPlansReady: false,
+    qualityScore: null,
+    safeFailureCode: null,
+    materializationRequired: false,
+  } as SessionEndStatusV2;
+  item.connection.prepare(`
+    UPDATE workflow_instances
+    SET generation = 2,
+        phase = 'cancelled',
+        result_json = $resultJson,
+        error_code = 'SESSION_END_CANCELLED',
+        evidence_window_state = 'sealed'
+    WHERE project_id = $projectId AND workflow_id = $workflowId
+  `).run({
+    $resultJson: canonicalJson(cancelledStatus),
+    $projectId: PROJECT_ID,
+    $workflowId: workflowId,
+  });
+  item.connection.prepare(`
+    UPDATE workflow_instances
+    SET coordinator_owner_id = 'old-coordinator',
+        coordinator_claim_token = 7,
+        coordinator_claim_expires_at = '2026-07-17T00:02:00.000Z',
+        coordinator_attempt_count = 8,
+        coordinator_failure_class = 'retryable',
+        coordinator_error_code = 'OLD_FAILURE',
+        coordinator_next_attempt_at = '2026-07-17T00:01:00.000Z',
+        validation_attempt_plan_generation = 2,
+        validation_attempt_plans_json = $plans
+    WHERE project_id = $projectId AND workflow_id = $workflowId
+  `).run({
+    $plans: canonicalJson([{
+      profileId: "profile-a",
+      profileVersion: 1,
+      runId: lifecycleUuid(1306),
+      resultId: lifecycleUuid(1307),
+      commandId: lifecycleUuid(1308),
+      idempotencyKey: "old-validation/1306",
+    }]),
+    $projectId: PROJECT_ID,
+    $workflowId: workflowId,
+  });
+  const cancelled = repository.read(PROJECT_ID, workflowId);
+  assert.ok(cancelled !== null);
+  assert.equal(cancelled.phase, "cancelled");
+  assert.equal(cancelled.generation, 2);
+}
+
+function prepareCancelledReopen(
+  Processor: LifecycleCommandProcessorConstructor,
+  options: FixtureOptions = {},
+  ordinal = 1320,
+): {
+  readonly item: Fixture;
+  readonly projectContext: ProjectContext;
+  readonly started: Extract<WorkerLifecycleResult<RootSessionPublicResultV2>, { kind: "success" }>;
+  readonly command: RequestSessionEndCommandV3;
+  readonly beforeLease: RootLeaseRecord;
+  readonly workflowId: string;
+} {
+  const item = fixture(Processor, options);
+  const projectContext = context(`request-reopen-${ordinal}`);
+  const started = success(item.processor.startRoot(
+    projectContext,
+    preparedStart(projectContext, startCommand(ordinal, `request-reopen-${ordinal}`)),
+  ));
+  seedRootCheckpoint(item, started.publicResult.sessionId, ordinal + 1);
+  seedCancelledSessionEndWorkflow(item, started.publicResult.sessionId);
+  item.clock.now = NOW_MS + 1_000n;
+  const beforeLease = item.leases.current(item.connection, PROJECT_ID, started.publicResult.sessionId);
+  assert.ok(beforeLease !== null);
+  return {
+    item,
+    projectContext,
+    started,
+    command: requestSessionEndCommand(ordinal + 9, started.publicResult.sessionId, 2),
+    beforeLease,
+    workflowId: sessionEndWorkflowId(started.publicResult.sessionId as never),
+  };
 }
 
 function transitionRootToEnding(
@@ -1657,6 +1964,426 @@ describe("LifecycleCommandProcessor root start", () => {
         (error: unknown) => (error as { code?: string }).code === "SESSION_CAPABILITY_INVALID",
       );
       assert.equal(item.connection.prepare("SELECT COUNT(*) AS count FROM events").get()?.count, 1n);
+    } finally {
+      item.connection.close();
+    }
+  });
+});
+
+describe("LifecycleCommandProcessor session-end request", () => {
+  it("requests G1 with one Version 3 event, ending root state, and no outbox", async () => {
+    const Processor = await loadProcessorConstructor();
+    assert.ok(Processor !== null, "LifecycleCommandProcessor must implement session-end request");
+    const item = fixture(Processor);
+    try {
+      const projectContext = context();
+      const started = success(item.processor.startRoot(
+        projectContext,
+        preparedStart(projectContext, startCommand(1200, "request-thread")),
+      ));
+      seedRootCheckpoint(item, started.publicResult.sessionId, 1201);
+      const command = requestSessionEndCommand(1203, started.publicResult.sessionId, 2);
+      const requested = item.processor.requestSessionEnd(
+        projectContext,
+        preparedRequestSessionEnd(item, projectContext, started, command),
+      );
+      assert.equal(requested.kind, "success");
+      if (requested.kind !== "success") assert.fail("request should succeed");
+      assert.equal((requested.publicResult as { workflowGeneration: number }).workflowGeneration, 1);
+
+      const authority = item.authority.get(item.connection, PROJECT_ID, started.publicResult.sessionId);
+      assert.ok(authority !== null);
+      assert.equal(authority.semanticState, "ending");
+      assert.equal(item.connection.prepare(
+        "SELECT COUNT(*) AS count FROM events WHERE event_type = 'SessionEndRequested'",
+      ).get()?.count, 1n);
+      assert.equal(item.connection.prepare("SELECT COUNT(*) AS count FROM outbox").get()?.count, 0n);
+      const event = item.connection.prepare(`
+        SELECT event_schema_version, payload_json
+        FROM events
+        WHERE event_type = 'SessionEndRequested'
+        ORDER BY global_position DESC
+        LIMIT 1
+      `).get();
+      assert.equal(event?.event_schema_version, 3n);
+      const payload = JSON.parse(String(event?.payload_json)) as {
+        workflowGeneration: number;
+        effectiveState: { request: { requestVersion: number } };
+      };
+      assert.equal(payload.workflowGeneration, 1);
+      assert.equal(payload.effectiveState.request.requestVersion, 2);
+    } finally {
+      item.connection.close();
+    }
+  });
+
+  it("initializes evidence window from request version", async () => {
+    const Processor = await loadProcessorConstructor();
+    assert.ok(Processor !== null);
+    for (const testCase of [
+      { requestVersion: 1 as const, expectedWindow: "sealed" as const, ordinal: 1220 },
+      { requestVersion: 2 as const, expectedWindow: "open" as const, ordinal: 1230 },
+    ]) {
+      const item = fixture(Processor);
+      try {
+        const projectContext = context(`request-version-${testCase.requestVersion}`);
+        const started = success(item.processor.startRoot(
+          projectContext,
+          preparedStart(projectContext, startCommand(testCase.ordinal, `request-version-${testCase.requestVersion}`)),
+        ));
+        seedRootCheckpoint(item, started.publicResult.sessionId, testCase.ordinal + 1);
+        const requested = success(item.processor.requestSessionEnd(
+          projectContext,
+          preparedRequestSessionEnd(
+            item,
+            projectContext,
+            started,
+            requestSessionEndCommand(testCase.ordinal + 3, started.publicResult.sessionId, testCase.requestVersion),
+          ),
+        ));
+        assert.equal(requested.publicResult.evidenceWindow.evidenceWindowState, testCase.expectedWindow);
+        assert.equal(requested.publicResult.evidenceWindow.evidenceFrozenCheckpointEventPosition, null);
+        assert.equal(requested.publicResult.evidenceWindow.evidenceFrozenGeneration, null);
+      } finally {
+        item.connection.close();
+      }
+    }
+  });
+
+  it("rejects unfinishable carry-forward before identity allocation", async () => {
+    const Processor = await loadProcessorConstructor();
+    assert.ok(Processor !== null);
+    const item = fixture(Processor);
+    try {
+      const projectContext = context("request-capacity-thread");
+      const started = success(item.processor.startRoot(
+        projectContext,
+        preparedStart(projectContext, startCommand(1240, "request-capacity")),
+      ));
+      seedRootCheckpoint(item, started.publicResult.sessionId, 1241);
+      seedOversizedCarryForwardHistory(item, started.publicResult.sessionId);
+      const eventsBefore = item.connection.prepare("SELECT COUNT(*) AS count FROM events").get()?.count;
+      const dedupBefore = item.connection.prepare("SELECT COUNT(*) AS count FROM command_dedup").get()?.count;
+      const preparationTraceBefore = [...item.checkpointPreparationTrace];
+
+      assert.throws(
+        () => item.processor.requestSessionEnd(
+          projectContext,
+          preparedRequestSessionEnd(
+            item,
+            projectContext,
+            started,
+            requestSessionEndCommand(1243, started.publicResult.sessionId, 2),
+          ),
+        ),
+        (error: unknown) => (error as { code?: string }).code === "CHECKPOINT_CAPACITY_EXCEEDED",
+      );
+      assert.deepEqual(item.checkpointPreparationTrace, preparationTraceBefore);
+      assert.equal(item.connection.prepare("SELECT COUNT(*) AS count FROM events").get()?.count, eventsBefore);
+      assert.equal(item.connection.prepare("SELECT COUNT(*) AS count FROM command_dedup").get()?.count, dedupBefore);
+      assert.equal(item.authority.get(item.connection, PROJECT_ID, started.publicResult.sessionId)?.semanticState, "active");
+      assert.equal(item.connection.prepare("SELECT COUNT(*) AS count FROM workflow_instances").get()?.count, 0n);
+    } finally {
+      item.connection.close();
+    }
+  });
+
+  it("requests G1 without outbox and reopens cancelled G2 as G3", async () => {
+    const Processor = await loadProcessorConstructor();
+    assert.ok(Processor !== null);
+
+    const initial = fixture(Processor);
+    try {
+      const projectContext = context();
+      const started = success(initial.processor.startRoot(
+        projectContext,
+        preparedStart(projectContext, startCommand(1290, "request-g1-thread")),
+      ));
+      seedRootCheckpoint(initial, started.publicResult.sessionId, 1291);
+      const requested = success(initial.processor.requestSessionEnd(
+        projectContext,
+        preparedRequestSessionEnd(
+          initial,
+          projectContext,
+          started,
+          requestSessionEndCommand(1293, started.publicResult.sessionId, 2),
+        ),
+      ));
+      assert.equal(requested.publicResult.workflowGeneration, 1);
+      assert.equal(initial.connection.prepare("SELECT COUNT(*) AS count FROM outbox").get()?.count, 0n);
+    } finally {
+      initial.connection.close();
+    }
+
+    const reopened = fixture(Processor, { skipProjection: true });
+    try {
+      const projectContext = context();
+      const started = success(reopened.processor.startRoot(
+        projectContext,
+        preparedStart(projectContext, startCommand(1300, "request-reopen-thread")),
+      ));
+      seedRootCheckpoint(reopened, started.publicResult.sessionId, 1301);
+      seedCancelledSessionEndWorkflow(reopened, started.publicResult.sessionId);
+      reopened.clock.now = NOW_MS + 1_000n;
+      const beforeLease = reopened.leases.current(
+        reopened.connection,
+        PROJECT_ID,
+        started.publicResult.sessionId,
+      );
+      assert.ok(beforeLease !== null);
+      const command = requestSessionEndCommand(1309, started.publicResult.sessionId, 2);
+      const requested = success(reopened.processor.requestSessionEnd(
+        projectContext,
+        preparedRequestSessionEnd(reopened, projectContext, started, command),
+      ));
+      assert.equal(requested.publicResult.workflowGeneration, 3);
+
+      const authority = reopened.authority.get(
+        reopened.connection,
+        PROJECT_ID,
+        started.publicResult.sessionId,
+      );
+      assert.ok(authority !== null);
+      assert.equal(authority.semanticState, "ending");
+      const workflowId = sessionEndWorkflowId(started.publicResult.sessionId as never);
+      const row = new SessionEndWorkflowRepository(reopened.connection).read(PROJECT_ID, workflowId);
+      assert.ok(row !== null);
+      assert.equal(row.generation, 3);
+      assert.equal(row.phase, "requested");
+      assert.equal(row.rootCommandId, command.commandId);
+      assert.equal(row.triggeringEventPosition, 3n);
+      assert.equal(row.resultJson, null);
+      assert.equal(row.errorCode, null);
+      assert.equal(row.coordinatorOwnerId, null);
+      assert.equal(row.coordinatorClaimToken, null);
+      assert.equal(row.coordinatorAttemptCount, 0n);
+      assert.equal(row.coordinatorFailureClass, null);
+      assert.equal(row.coordinatorErrorCode, null);
+      assert.equal(row.coordinatorNextAttemptAt, null);
+      assert.equal(row.validationAttemptPlanGeneration, null);
+      assert.equal(row.validationAttemptPlansJson, null);
+      assert.equal(row.evidenceFrozenCheckpointEventPosition, null);
+      assert.equal(row.evidenceFrozenGeneration, null);
+      assert.equal(row.evidenceWindowState, "open");
+      assert.equal(row.finalEndingScopeBindingsJson, null);
+      assert.equal(reopened.connection.prepare(
+        "SELECT COUNT(*) AS count FROM workflow_instances WHERE project_id = $projectId AND workflow_id = $workflowId",
+      ).get({ $projectId: PROJECT_ID, $workflowId: workflowId })?.count, 1n);
+      assert.equal(reopened.connection.prepare(
+        "SELECT COUNT(*) AS count FROM events WHERE event_type = 'SessionEndRequested'",
+      ).get()?.count, 1n);
+      assert.equal(reopened.connection.prepare("SELECT COUNT(*) AS count FROM outbox").get()?.count, 0n);
+      const afterLease = reopened.leases.current(
+        reopened.connection,
+        PROJECT_ID,
+        started.publicResult.sessionId,
+      );
+      assert.ok(afterLease !== null);
+      assert.ok(afterLease.expiresAtMs > beforeLease.expiresAtMs);
+    } finally {
+      reopened.connection.close();
+    }
+  });
+
+  it("replaces every cancelled-row semantic pointer on reopen", async () => {
+    const Processor = await loadProcessorConstructor();
+    assert.ok(Processor !== null);
+    const scenario = prepareCancelledReopen(Processor, { skipProjection: true }, 1330);
+    try {
+      const repository = new SessionEndWorkflowRepository(scenario.item.connection);
+      const before = repository.read(PROJECT_ID, scenario.workflowId);
+      assert.ok(before !== null);
+      const requested = success(scenario.item.processor.requestSessionEnd(
+        scenario.projectContext,
+        preparedRequestSessionEnd(
+          scenario.item,
+          scenario.projectContext,
+          scenario.started,
+          scenario.command,
+        ),
+      ));
+      const after = repository.read(PROJECT_ID, scenario.workflowId);
+      assert.ok(after !== null);
+      assert.equal(after.generation, before.generation + 1);
+      assert.equal(after.rootCommandId, scenario.command.commandId);
+      assert.notEqual(after.rootCommandId, before.rootCommandId);
+      assert.ok(after.triggeringEventPosition > before.triggeringEventPosition);
+      assert.equal(after.resultJson, null);
+      assert.equal(requested.publicResult.workflowGeneration, 3);
+    } finally {
+      scenario.item.connection.close();
+    }
+  });
+
+  it("clears every stale cancelled-row operational and final field on reopen", async () => {
+    const Processor = await loadProcessorConstructor();
+    assert.ok(Processor !== null);
+    const scenario = prepareCancelledReopen(Processor, { skipProjection: true }, 1340);
+    try {
+      const repository = new SessionEndWorkflowRepository(scenario.item.connection);
+      success(scenario.item.processor.requestSessionEnd(
+        scenario.projectContext,
+        preparedRequestSessionEnd(
+          scenario.item,
+          scenario.projectContext,
+          scenario.started,
+          scenario.command,
+        ),
+      ));
+      const row = repository.read(PROJECT_ID, scenario.workflowId);
+      assert.ok(row !== null);
+      for (const field of [
+        "coordinatorOwnerId",
+        "coordinatorClaimToken",
+        "coordinatorClaimExpiresAt",
+        "coordinatorFailureClass",
+        "coordinatorErrorCode",
+        "coordinatorNextAttemptAt",
+        "validationAttemptPlanGeneration",
+        "validationAttemptPlansJson",
+        "evidenceFrozenCheckpointEventPosition",
+        "evidenceFrozenGeneration",
+        "finalEndingScopeBindingsJson",
+      ] as const) {
+        assert.equal(row[field], null, field);
+      }
+      assert.equal(row.coordinatorAttemptCount, 0n);
+      assert.equal(row.errorCode, null);
+      assert.equal(row.evidenceWindowState, "open");
+    } finally {
+      scenario.item.connection.close();
+    }
+  });
+
+  it("binds reopened trigger position and renews root authority atomically", async () => {
+    const Processor = await loadProcessorConstructor();
+    assert.ok(Processor !== null);
+    const scenario = prepareCancelledReopen(Processor, { skipProjection: true }, 1350);
+    try {
+      success(scenario.item.processor.requestSessionEnd(
+        scenario.projectContext,
+        preparedRequestSessionEnd(
+          scenario.item,
+          scenario.projectContext,
+          scenario.started,
+          scenario.command,
+        ),
+      ));
+      const row = new SessionEndWorkflowRepository(scenario.item.connection).read(
+        PROJECT_ID,
+        scenario.workflowId,
+      );
+      assert.ok(row !== null);
+      const trigger = scenario.item.connection.prepare(`
+        SELECT global_position FROM events
+        WHERE event_type = 'SessionEndRequested'
+        ORDER BY global_position DESC LIMIT 1
+      `).get();
+      assert.equal(row.triggeringEventPosition, trigger?.global_position);
+      assert.equal(
+        scenario.item.authority.get(
+          scenario.item.connection,
+          PROJECT_ID,
+          scenario.started.publicResult.sessionId,
+        )?.semanticState,
+        "ending",
+      );
+      const afterLease = scenario.item.leases.current(
+        scenario.item.connection,
+        PROJECT_ID,
+        scenario.started.publicResult.sessionId,
+      );
+      assert.ok(afterLease !== null);
+      assert.ok(afterLease.expiresAtMs > scenario.beforeLease.expiresAtMs);
+    } finally {
+      scenario.item.connection.close();
+    }
+  });
+
+  it("rolls reopen back at every field-update boundary", async () => {
+    const Processor = await loadProcessorConstructor();
+    assert.ok(Processor !== null);
+    let failAppend = false;
+    const item = fixture(Processor, {
+      skipProjection: true,
+      eventFault: (boundary) => {
+        if (failAppend && boundary === "after-first-insert-before-commit") {
+          throw new Error("injected-reopen-append-failure");
+        }
+      },
+    });
+    try {
+      const projectContext = context("request-reopen-rollback-thread");
+      const started = success(item.processor.startRoot(
+        projectContext,
+        preparedStart(projectContext, startCommand(1310, "request-reopen-rollback")),
+      ));
+      seedRootCheckpoint(item, started.publicResult.sessionId, 1311);
+      seedCancelledSessionEndWorkflow(item, started.publicResult.sessionId);
+      item.clock.now = NOW_MS + 1_000n;
+      const workflowId = sessionEndWorkflowId(started.publicResult.sessionId as never);
+      const workflowBefore = new SessionEndWorkflowRepository(item.connection).read(PROJECT_ID, workflowId);
+      const eventsBefore = item.connection.prepare("SELECT COUNT(*) AS count FROM events").get()?.count;
+      failAppend = true;
+      assert.throws(
+        () => item.processor.requestSessionEnd(
+          projectContext,
+          preparedRequestSessionEnd(
+            item,
+            projectContext,
+            started,
+            requestSessionEndCommand(1319, started.publicResult.sessionId, 2),
+          ),
+        ),
+        /injected-reopen-append-failure/u,
+      );
+      failAppend = false;
+      assert.deepEqual(
+        new SessionEndWorkflowRepository(item.connection).read(PROJECT_ID, workflowId),
+        workflowBefore,
+      );
+      assert.equal(item.connection.prepare("SELECT COUNT(*) AS count FROM events").get()?.count, eventsBefore);
+      assert.equal(item.authority.get(item.connection, PROJECT_ID, started.publicResult.sessionId)?.semanticState, "active");
+    } finally {
+      item.connection.close();
+    }
+  });
+
+  it("replays a committed request before current authority checks", async () => {
+    const Processor = await loadProcessorConstructor();
+    assert.ok(Processor !== null);
+    let rejectFreshChecks = false;
+    const item = fixture(Processor, {
+      assertQuickHealthy: () => {
+        if (rejectFreshChecks) throw new Error("fresh-authority-check-reached");
+      },
+    });
+    try {
+      const projectContext = context();
+      const started = success(item.processor.startRoot(
+        projectContext,
+        preparedStart(projectContext, startCommand(1210, "request-v1-thread")),
+      ));
+      seedRootCheckpoint(item, started.publicResult.sessionId, 1211);
+      const command = requestSessionEndCommand(1213, started.publicResult.sessionId, 1);
+      const prepared = preparedRequestSessionEnd(item, projectContext, started, command);
+      const first = item.processor.requestSessionEnd(projectContext, prepared);
+      assert.equal(first.kind, "success");
+      if (first.kind !== "success") assert.fail("request should succeed");
+      const firstPayload = first.publicResult as SessionEndStatusV2;
+      assert.equal(firstPayload.workflowGeneration, 1);
+      assert.equal(firstPayload.evidenceWindow.evidenceWindowState, "sealed");
+      assert.equal(firstPayload.evidenceWindow.evidenceFrozenCheckpointEventPosition, null);
+      assert.equal(firstPayload.evidenceWindow.evidenceFrozenGeneration, null);
+      const eventCount = item.connection.prepare("SELECT COUNT(*) AS count FROM events").get()?.count;
+
+      rejectFreshChecks = true;
+      const replayed = item.processor.requestSessionEnd(projectContext, prepared);
+      assert.equal(replayed.kind, "success");
+      if (replayed.kind !== "success") assert.fail("replay should succeed");
+      assert.deepEqual(replayed.publicResult, first.publicResult);
+      assert.equal(item.connection.prepare("SELECT COUNT(*) AS count FROM events").get()?.count, eventCount);
+      assert.equal(item.connection.prepare("SELECT COUNT(*) AS count FROM outbox").get()?.count, 0n);
     } finally {
       item.connection.close();
     }

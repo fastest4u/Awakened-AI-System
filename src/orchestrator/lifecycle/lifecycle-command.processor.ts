@@ -31,6 +31,8 @@ import type {
   RootStartCommandV2,
   RootSuspendCommandV2,
   RootSuspendCommandV3,
+  RequestSessionEndCommandV2,
+  RequestSessionEndCommandV3,
 } from "./contracts/commands.js";
 import {
   assertSemanticCommandAuthorization,
@@ -39,7 +41,7 @@ import {
 import type { RootSessionState, SessionId } from "./contracts/identifiers.js";
 import {
   decodeCheckpointV1,
-  type CheckpointV1,
+  type Checkpoint,
   type SourceStateFingerprintV1,
 } from "./contracts/checkpoint.js";
 import {
@@ -63,9 +65,40 @@ import {
   type SemanticCommandProofTargetV1,
 } from "./authority/capability-codec.js";
 import type { SessionAggregateState } from "./session-aggregate.js";
+import type {
+  PersistedQualityPolicyInputV1,
+  SessionEndRequest,
+  SessionEndStatusV2,
+  FinalEndingScopeBindingV1,
+} from "./contracts/session-end.js";
+import {
+  deriveEffectiveQualityPolicyV1,
+  type EffectiveQualityPolicyInputV1,
+} from "./session-end-policy.js";
+import {
+  createSessionEndEffectiveStateV1,
+  initialSessionEndEvidenceWindowStateV1,
+} from "./session-end-effective-state.js";
+import {
+  MAX_ROOT_CHILD_HISTORY_V1,
+  sessionEndWorkflowId,
+} from "./session-end-identifiers.js";
+import {
+  SessionEndWorkflowService,
+  requestedSessionEndStatusV2,
+} from "./session-end-workflow.service.js";
 import type { LifecycleApprovalRepository } from "../storage/lifecycle-approval.repository.js";
 import type { SessionAuthorityRepository } from "../storage/session-authority.repository.js";
 import type { SessionLeaseRepository } from "../storage/session-lease.repository.js";
+import type {
+  CarryForwardEndingScopeProjectionRecord,
+} from "../storage/lifecycle-storage.types.js";
+import {
+  CHECKPOINT_MAX_CANONICAL_BYTES,
+} from "./contracts/checkpoint.js";
+import {
+  FINAL_ENDING_SCOPE_BINDINGS_MAX_CANONICAL_BYTES,
+} from "./contracts/session-end.js";
 import { canonicalJson } from "../serialization/canonical-json.js";
 import { isPrimarySqliteBusy } from "../storage/event-append-transaction.js";
 import { MAX_CANONICAL_TIMESTAMP_MS } from "../runtime/clock.js";
@@ -127,6 +160,13 @@ export interface LifecycleProcessorIntegrity {
   assertQuickHealthy(context: ProjectContext): void;
 }
 
+export interface LifecycleSessionEndPolicyResolver {
+  resolve(
+    context: ProjectContext,
+    request: SessionEndRequest,
+  ): EffectiveQualityPolicyInputV1;
+}
+
 export interface LifecycleResumeSourceStatePort {
   captureCurrent(context: ProjectContext): SourceStateFingerprintV1;
 }
@@ -144,6 +184,7 @@ export interface LifecycleCommandProcessorOptions {
   readonly resumeSourceState: LifecycleResumeSourceStatePort;
   readonly checkpointSourceStateProvider: SourceStateProvider;
   readonly checkpointSourceStateScopeResolver: SourceStateScopeResolver;
+  readonly sessionEndPolicy?: LifecycleSessionEndPolicyResolver;
 }
 
 interface RootAuthorityOperations {
@@ -161,7 +202,7 @@ interface RootAuthorityOperations {
     rootSessionId: string,
   ): readonly SessionAuthorityRecord[];
   rootContinuityKey(authority: SessionAuthorityRecord): string;
-  latestCheckpoint(authority: SessionAuthorityRecord): CheckpointV1 | null;
+  latestCheckpoint(authority: SessionAuthorityRecord): Checkpoint | null;
   nextGlobalPosition(): bigint;
   requireFoldMatch(input: SessionAuthorityRecord): SessionAggregateState;
   compareAndSwap(input: {
@@ -465,6 +506,186 @@ function rootOperations(transaction: LifecycleCommandTransaction): RootAuthority
   });
 }
 
+function optionalOwnMethod<T extends (...arguments_: never[]) => unknown>(
+  value: object,
+  name: string,
+): T | undefined {
+  const descriptor = Object.getOwnPropertyDescriptor(value, name);
+  if (descriptor === undefined) return undefined;
+  if (!descriptor.enumerable || !("value" in descriptor) || typeof descriptor.value !== "function") {
+    invalid("INTEGRITY_FAILURE");
+  }
+  return descriptor.value as T;
+}
+
+function currentChildEndingScopeBinding(
+  child: SessionAuthorityRecord,
+  aggregate: SessionAggregateState,
+): FinalEndingScopeBindingV1 {
+  if (
+    child.sessionKind !== "child"
+    || aggregate.kind !== "child"
+    || (aggregate.state !== "active"
+      && aggregate.state !== "completion-proposed"
+      && aggregate.state !== "suspended")
+    || child.terminalEventPosition !== null
+  ) invalid("INTEGRITY_FAILURE");
+  return Object.freeze({
+    bindingVersion: 1,
+    bindingKind: "current-child",
+    childSessionId: child.sessionId as SessionId,
+    childState: aggregate.state,
+    lastEventPosition: aggregate.eventPosition.toString(),
+    streamVersion: aggregate.streamVersion.toString(),
+    checkpointId: aggregate.latestCheckpointId,
+    checkpointEventPosition: aggregate.latestCheckpointEventPosition?.toString() ?? null,
+    transferTicketId: null,
+    transferTicketEventPosition: null,
+  });
+}
+
+function carryForwardEndingScopeBinding(
+  projection: CarryForwardEndingScopeProjectionRecord,
+): FinalEndingScopeBindingV1 {
+  if (
+    projection.childState !== "transferred"
+    || projection.lastEventPosition <= 0n
+    || projection.streamVersion <= 0n
+    || projection.checkpointEventPosition <= 0n
+    || projection.transferTicketEventPosition <= 0n
+  ) invalid("INTEGRITY_FAILURE");
+  return Object.freeze({
+    bindingVersion: 1,
+    bindingKind: "carry-forward-ticket",
+    childSessionId: projection.childSessionId as SessionId,
+    childState: "transferred",
+    lastEventPosition: projection.lastEventPosition.toString(),
+    streamVersion: projection.streamVersion.toString(),
+    checkpointId: projection.checkpointId as FinalEndingScopeBindingV1["checkpointId"],
+    checkpointEventPosition: projection.checkpointEventPosition.toString(),
+    transferTicketId: projection.transferTicketId as FinalEndingScopeBindingV1["transferTicketId"],
+    transferTicketEventPosition: projection.transferTicketEventPosition.toString(),
+  });
+}
+
+function sortEndingScopeBindings(
+  bindings: readonly FinalEndingScopeBindingV1[],
+): readonly FinalEndingScopeBindingV1[] {
+  const sorted = [...bindings].sort((left, right) => Buffer.compare(
+    Buffer.from(left.childSessionId, "utf8"),
+    Buffer.from(right.childSessionId, "utf8"),
+  ));
+  for (let index = 1; index < sorted.length; index += 1) {
+    if (sorted[index - 1]?.childSessionId === sorted[index]?.childSessionId) {
+      invalid("INTEGRITY_FAILURE");
+    }
+  }
+  return Object.freeze(sorted);
+}
+
+function requestEndingScopeBindings(
+  transaction: LifecycleCommandTransaction,
+  root: SessionAuthorityRecord,
+  children: readonly { readonly authority: SessionAuthorityRecord; readonly aggregate: SessionAggregateState }[],
+): readonly FinalEndingScopeBindingV1[] {
+  const currentBindings = children.map(({ authority, aggregate }) =>
+    currentChildEndingScopeBinding(authority, aggregate));
+  const listTickets = optionalOwnMethod<(
+    projectId: string,
+    sourceRootSessionId: string,
+    limit: number,
+  ) => readonly CarryForwardEndingScopeProjectionRecord[]>(
+    transaction.transfers as object,
+    "listUnclaimedEndingScopeProjectionsBySourceRoot",
+  );
+  const tickets = listTickets === undefined
+    ? Object.freeze([]) as readonly CarryForwardEndingScopeProjectionRecord[]
+    : listTickets(root.projectId, root.sessionId, MAX_ROOT_CHILD_HISTORY_V1);
+  if (!Array.isArray(tickets) || tickets.length > MAX_ROOT_CHILD_HISTORY_V1) {
+    invalid("INTEGRITY_FAILURE");
+  }
+  if (tickets.length > MAX_ROOT_CHILD_HISTORY_V1) {
+    throw new LifecycleError("CHECKPOINT_CAPACITY_EXCEEDED");
+  }
+  return sortEndingScopeBindings([
+    ...currentBindings,
+    ...tickets.map(carryForwardEndingScopeBinding),
+  ]);
+}
+
+function countRowValue(row: Readonly<Record<string, unknown>>, field: string): bigint {
+  const value = row[field];
+  if (typeof value === "bigint") return value;
+  if (typeof value === "number" && Number.isSafeInteger(value) && value >= 0) return BigInt(value);
+  invalid("INTEGRITY_FAILURE");
+}
+
+function assertRootChildHistoryCapacity(
+  connection: SqliteConnection,
+  root: SessionAuthorityRecord,
+  childEndPolicy: "require-completed" | "suspend-and-carry-forward",
+): void {
+  const childCount = countRowValue(connection.prepare(`
+    SELECT COUNT(*) AS count
+    FROM session_authority
+    WHERE project_id = $projectId
+      AND parent_session_id = $rootSessionId
+      AND session_kind = 'child'
+  `).get({
+    $projectId: root.projectId,
+    $rootSessionId: root.sessionId,
+  }) ?? {}, "count");
+  const ticketCount = countRowValue(connection.prepare(`
+    SELECT COUNT(*) AS count
+    FROM child_transfer_tickets
+    WHERE project_id = $projectId
+      AND source_parent_session_id = $rootSessionId
+  `).get({
+    $projectId: root.projectId,
+    $rootSessionId: root.sessionId,
+  }) ?? {}, "count");
+  if (childCount > BigInt(MAX_ROOT_CHILD_HISTORY_V1)
+    || ticketCount > BigInt(MAX_ROOT_CHILD_HISTORY_V1)) {
+    throw new LifecycleError("CHECKPOINT_CAPACITY_EXCEEDED");
+  }
+  if (childEndPolicy === "suspend-and-carry-forward") {
+    const eligibleWithoutTicket = countRowValue(connection.prepare(`
+      SELECT COUNT(*) AS count
+      FROM session_authority AS child
+      WHERE child.project_id = $projectId
+        AND child.parent_session_id = $rootSessionId
+        AND child.session_kind = 'child'
+        AND child.terminal_event_position IS NULL
+        AND child.semantic_state IN ('active', 'completion-proposed', 'suspended')
+        AND NOT EXISTS (
+          SELECT 1
+          FROM child_transfer_tickets AS ticket
+          WHERE ticket.project_id = child.project_id
+            AND ticket.source_parent_session_id = child.parent_session_id
+            AND ticket.source_child_session_id = child.session_id
+        )
+    `).get({
+      $projectId: root.projectId,
+      $rootSessionId: root.sessionId,
+    }) ?? {}, "count");
+    if (ticketCount + eligibleWithoutTicket > BigInt(MAX_ROOT_CHILD_HISTORY_V1)) {
+      throw new LifecycleError("CHECKPOINT_CAPACITY_EXCEEDED");
+    }
+  }
+}
+
+function persistedQualityPolicy(
+  policy: ReturnType<typeof deriveEffectiveQualityPolicyV1>,
+): PersistedQualityPolicyInputV1 {
+  return Object.freeze({
+    qualityPolicyVersion: 1,
+    profiles: policy.profiles,
+    qualityThreshold: policy.qualityThreshold,
+    requireFullEvidence: policy.requireFullEvidence,
+    requireMaterialization: policy.requireMaterialization,
+  });
+}
+
 function registerAffectedExistingSession(
   transaction: LifecycleCommandTransaction,
   sessionId: SessionId,
@@ -521,7 +742,9 @@ function validateContext(
     | RootStartCommandV2
     | RootResumeCommandV2
     | RootSuspendCommandV2
-    | RootSuspendCommandV3,
+    | RootSuspendCommandV3
+    | RequestSessionEndCommandV2
+    | RequestSessionEndCommandV3,
 ): void {
   const binding = context?.binding;
   if (
@@ -864,6 +1087,8 @@ export class LifecycleCommandProcessor {
   readonly #checkpointSourceState: SourceStateProvider;
   readonly #checkpointSourceStateScopes: SourceStateScopeResolver;
   readonly #checkpoints: CheckpointService;
+  readonly #sessionEndWorkflows: SessionEndWorkflowService;
+  readonly #sessionEndPolicy: LifecycleSessionEndPolicyResolver;
 
   constructor(options: LifecycleCommandProcessorOptions) {
     this.#connection = options.connection;
@@ -877,6 +1102,30 @@ export class LifecycleCommandProcessor {
     this.#resumeSourceState = options.resumeSourceState;
     this.#checkpointSourceState = options.checkpointSourceStateProvider;
     this.#checkpointSourceStateScopes = options.checkpointSourceStateScopeResolver;
+    this.#sessionEndWorkflows = new SessionEndWorkflowService({ connection: options.connection });
+    this.#sessionEndPolicy = options.sessionEndPolicy ?? {
+      resolve: (_context, request) => {
+        const requestedProfiles = request.validationProfileIds.length === 0
+          ? [{ profileId: "default", profileVersion: 1, required: true, weight: 1 }]
+          : request.validationProfileIds.map((profileId) => ({
+              profileId,
+              profileVersion: 1,
+              required: true,
+              weight: 1,
+            }));
+        return {
+          trustedProfiles: requestedProfiles,
+          optionalProfiles: [],
+          requestedProfileIds: request.validationProfileIds,
+          requestedQualityThreshold: request.requestedQualityThreshold,
+          trustedMinimumQualityThreshold: 0,
+          trustedRequireFullEvidence: false,
+          requestedRequireFullEvidence: request.requireFullEvidence,
+          trustedRequireMaterialization: false,
+          requestedRequireMaterialization: request.requireMaterialization,
+        };
+      },
+    };
     this.#checkpoints = new CheckpointService({
       invocationScope: {
         current: () => invalid("INTEGRITY_FAILURE"),
@@ -1341,7 +1590,7 @@ export class LifecycleCommandProcessor {
         if (page.length !== 0) afterSessionId = page.at(-1)!.sessionId;
 
         let compatible: SessionAuthorityRecord[] = page;
-        const pageCheckpoints = new Map<string, CheckpointV1>();
+        const pageCheckpoints = new Map<string, Checkpoint>();
         const pageAggregates = new Map<
           string,
           Extract<SessionAggregateState, { readonly kind: "root" }>
@@ -2363,6 +2612,355 @@ export class LifecycleCommandProcessor {
         context,
         authority,
         execution.publicResult.ownerGeneration,
+        execution.authorizationRecord.target,
+      ),
+    });
+  }
+
+  requestSessionEnd(
+    context: ProjectContext,
+    input: PreparedLifecycleWorkerCommand<
+      RequestSessionEndCommandV2 | RequestSessionEndCommandV3
+    >,
+  ): WorkerLifecycleResult<SessionEndStatusV2> {
+    const decoded = decodeLifecycleSemanticCommandDraft(input.command);
+    if (decoded.commandType !== "request-session-end") invalid();
+    const command = decoded;
+    assertSemanticCommandAuthorization(command, input.authorization);
+    validateContext(context, command);
+    if (
+      input.authorization.kind !== "protected"
+      || input.authorization.proof === null
+      || input.authorization.approval !== null
+      || input.authorization.childBindingGrant !== null
+      || input.authorization.authoritySessionId !== command.request.sessionId
+      || input.authorization.targetSessionId !== command.request.sessionId
+    ) throw new LifecycleError("SESSION_CAPABILITY_INVALID");
+    if (!LOWER_HASH.test(input.candidateIntentHash)) {
+      throw new LifecycleError("IDEMPOTENCY_CONFLICT");
+    }
+    const proof = input.authorization.proof;
+    const proofBytes = Buffer.from(proof.proofFingerprint, "hex");
+    let proofDigest: string;
+    try {
+      if (proofBytes.length !== 32) throw new LifecycleError("SESSION_CAPABILITY_INVALID");
+      proofDigest = capabilityProofDigest(proofBytes);
+    } finally {
+      proofBytes.fill(0);
+    }
+    const principal = Object.freeze({
+      actorRole: "primary" as const,
+      clientInstanceId: context.binding.clientInstanceId,
+    });
+    const replayExpectation: Extract<LifecycleReplayExpectation, { kind: "protected" }> = Object.freeze({
+      kind: "protected",
+      proof: Object.freeze({
+        version: 1,
+        nonce: proof.proofNonce,
+        digest: proofDigest,
+      }),
+      approval: null,
+      authorizationSessionId: command.request.sessionId,
+      targetSessionId: command.request.sessionId,
+      presenting: principal,
+      target: principal,
+    });
+    const execution = this.#store.execute<SessionEndStatusV2>({
+      context,
+      commandId: command.commandId,
+      idempotencyKey: command.idempotencyKey,
+      commandType: command.commandType,
+      candidateIntentHash: input.candidateIntentHash,
+      authoritativeIntentHash: input.candidateIntentHash,
+      semanticCommand: command,
+      capabilityKind: "root-session-handle",
+      capabilityGeneration: null,
+      capabilityGenerationResolution: "fresh-commit",
+      replayExpectation,
+    }, (transaction) => {
+      this.#integrity.assertQuickHealthy(context);
+      const authority = rootOperations(transaction);
+      const leases = leaseOperations(transaction);
+      const now = exactNow(this.#clock);
+      const observed = authority.get(context.binding.projectId, command.request.sessionId);
+      if (observed === null) throw new LifecycleError("SESSION_NOT_FOUND");
+      const current = Object.freeze({ ...observed }) as SessionAuthorityRecord;
+      if (
+        current.sessionKind !== "root"
+        || current.parentSessionId !== null
+        || current.ownerGeneration === null
+        || current.terminalEventPosition !== null
+        || (current.semanticState !== "active" && current.semanticState !== "suspended")
+      ) throw new LifecycleError("SESSION_STATE_CONFLICT");
+      if (current.rootHandleClientInstanceId !== context.binding.clientInstanceId) {
+        throw new LifecycleError("SESSION_HANDLE_STALE");
+      }
+      const aggregate = authority.requireFoldMatch(current);
+      if (
+        aggregate.kind !== "root"
+        || aggregate.state !== current.semanticState
+        || aggregate.terminalEventPosition !== null
+      ) throw new LifecycleError("SESSION_STATE_CONFLICT");
+      const currentLease = leases.current(context.binding.projectId, current.sessionId);
+      if (
+        currentLease === null
+        || currentLease.ownerGeneration !== current.ownerGeneration
+        || currentLease.ownerClientInstanceId !== context.binding.clientInstanceId
+      ) throw new LifecycleError("SESSION_HANDLE_STALE");
+
+      const generation = current.ownerGeneration.toString();
+      const assertions = {
+        authorizationKind: "protected" as const,
+        authorizationSessionId: command.request.sessionId,
+        targetSessionId: command.request.sessionId,
+        projectId: context.binding.projectId,
+        vaultId: context.binding.vaultId,
+        storeId: context.binding.storeId,
+        workspaceId: context.binding.workspaceId,
+        clientNamespace: context.binding.clientNamespace,
+        capabilityKind: "root-session-handle" as const,
+        capabilityGeneration: generation,
+        presentingActorRole: "primary" as const,
+        presentingClientInstanceId: context.binding.clientInstanceId,
+        targetActorRole: "primary" as const,
+        targetClientInstanceId: context.binding.clientInstanceId,
+        internalWorkflowId: null,
+        internalWorkflowGeneration: null,
+        internalPlannedWorkId: null,
+      };
+      const authoritative = buildLifecycleIntentWitness(command, assertions);
+      if (authoritative.intentHash !== input.candidateIntentHash) {
+        throw new LifecycleError("IDEMPOTENCY_CONFLICT");
+      }
+      const handleMaterial = materialFromAuthority(context, current).find(
+        (material) => material.claims.kind === "root-session-handle",
+      );
+      if (handleMaterial === undefined) invalid("INTEGRITY_FAILURE");
+      const proofTarget: SemanticCommandProofTargetV1 = {
+        proofVersion: 1,
+        target: "semantic-command",
+        projectId: context.binding.projectId,
+        vaultId: context.binding.vaultId,
+        storeId: context.binding.storeId,
+        workspaceId: context.binding.workspaceId,
+        clientNamespace: context.binding.clientNamespace,
+        authoritySessionId: command.request.sessionId,
+        targetSessionId: command.request.sessionId,
+        presentingActorRole: "primary",
+        presentingClientInstanceId: context.binding.clientInstanceId,
+        targetActorRole: "primary",
+        targetClientInstanceId: context.binding.clientInstanceId,
+        capabilityKind: "root-session-handle",
+        capabilityGeneration: generation,
+        commandId: command.commandId,
+        idempotencyKey: command.idempotencyKey,
+        intentHash: authoritative.intentHash,
+        proofNonce: proof.proofNonce,
+      };
+      const verifiedProof = this.#capabilities.verifyProof(handleMaterial, proofTarget, proof);
+      if (verifiedProof.digest !== proofDigest) invalid("INTEGRITY_FAILURE");
+
+      const relevantChildren = riskyTransitionChildren(authority, current);
+      if (
+        command.request.childEndPolicy === "require-completed"
+        && relevantChildren.some(({ aggregate: childAggregate }) => (
+          childAggregate.kind === "child"
+          && (childAggregate.state === "active"
+            || childAggregate.state === "completion-proposed"
+            || childAggregate.state === "suspended")
+        ))
+      ) throw new LifecycleError("SESSION_CHILDREN_ACTIVE");
+      const checkpoint = requireRiskyTransitionCheckpointV1({
+        authority: current,
+        aggregate,
+        checkpoint: authority.latestCheckpoint(current),
+        relevantChildren,
+      });
+      const currentSourceState = this.#resumeSourceState.captureCurrent(context);
+      if (canonicalJson(currentSourceState) !== canonicalJson(checkpoint.sourceState)) {
+        throw new LifecycleError("SESSION_SOURCE_STATE_CONFLICT");
+      }
+      assertRootChildHistoryCapacity(
+        this.#connection,
+        current,
+        command.request.childEndPolicy,
+      );
+      const endingScopeBindings = requestEndingScopeBindings(
+        transaction,
+        current,
+        relevantChildren,
+      );
+      if (command.request.requestVersion === 1) {
+        const eligibleWholeScope = [
+          current.sessionId as SessionId,
+          ...endingScopeBindings.map((binding) => binding.childSessionId as SessionId),
+        ];
+        transaction.coverage.assertVersion1Eligible(Object.freeze(eligibleWholeScope));
+      }
+      const evidenceCoverage = transaction.coverage.snapshotV2(
+        current.sessionId as SessionId,
+        aggregate.eventPosition,
+      );
+      const minimumCheckpointBytes = transaction.coverage.minimumCheckpointUpperBound({
+        evidenceCoverage,
+        endingScopeBindings,
+      });
+      const minimumEndingScopeBytes = transaction.coverage.minimumFinalEndingScopeBindingsUpperBound({
+        endingScopeBindings,
+      });
+      if (
+        !Number.isSafeInteger(minimumCheckpointBytes)
+        || minimumCheckpointBytes < 0
+        || !Number.isSafeInteger(minimumEndingScopeBytes)
+        || minimumEndingScopeBytes < 0
+      ) invalid("INTEGRITY_FAILURE");
+      if (
+        minimumCheckpointBytes > CHECKPOINT_MAX_CANONICAL_BYTES
+        || minimumEndingScopeBytes > FINAL_ENDING_SCOPE_BINDINGS_MAX_CANONICAL_BYTES
+      ) throw new LifecycleError("CHECKPOINT_CAPACITY_EXCEEDED");
+
+      const policyInput = this.#sessionEndPolicy.resolve(context, command.request);
+      const effectivePolicy = persistedQualityPolicy(
+        deriveEffectiveQualityPolicyV1(policyInput),
+      );
+      const effectiveState = createSessionEndEffectiveStateV1({
+        request: command.request,
+        effectivePolicy,
+      });
+      const workflowId = sessionEndWorkflowId(current.sessionId as SessionId);
+      const existing = this.#sessionEndWorkflows.read(context.binding.projectId, workflowId);
+      if (existing !== null && existing.sessionId !== current.sessionId) {
+        invalid("INTEGRITY_FAILURE");
+      }
+      let workflowGeneration = 1;
+      if (existing !== null) {
+        if (existing.phase !== "cancelled") {
+          throw new LifecycleError("SESSION_END_INCOMPLETE");
+        }
+        if (existing.generation >= Number.MAX_SAFE_INTEGER) invalid("INTEGRITY_FAILURE");
+        workflowGeneration = existing.generation + 1;
+      }
+      const eventPosition = authority.nextGlobalPosition();
+      if (eventPosition <= aggregate.eventPosition || eventPosition > SQLITE_INT64_MAX) {
+        invalid("INTEGRITY_FAILURE");
+      }
+      const evidenceWindowState = initialSessionEndEvidenceWindowStateV1(command.request);
+      const status = requestedSessionEndStatusV2({
+        sessionId: current.sessionId,
+        workflowId,
+        workflowGeneration,
+        priorRootState: current.semanticState,
+        triggeringEventPosition: eventPosition,
+        evidenceWindowState,
+        materializationRequired: effectivePolicy.requireMaterialization,
+      });
+      const nextAuthority = Object.freeze({
+        ...current,
+        semanticState: "ending" as const,
+        updatedAt: now.timestamp,
+      });
+      const authorizationRecord: PersistedLifecycleAuthorizationRecord = Object.freeze({
+        ...replayExpectation,
+        proof: Object.freeze(verifiedProof),
+      });
+      const requestedInput = {
+        projectId: current.projectId,
+        workflowId,
+        workflowGeneration,
+        rootCommandId: command.commandId,
+        sessionId: current.sessionId,
+        triggeringEventPosition: eventPosition,
+        expectedAuthorityCommitment: current.authorityCommitment,
+        priorRootState: current.semanticState,
+        resultJson: existing === null ? canonicalJson(status) : null,
+        evidenceWindowState,
+        now: now.timestamp,
+        effectiveState,
+      } as const;
+      return {
+        append: {
+          context,
+          commandId: command.commandId,
+          idempotencyKey: command.idempotencyKey,
+          commandType: command.commandType,
+          correlationId: aggregate.correlationId,
+          agentId: command.agentId,
+          expectedStreamVersion: aggregate.streamVersion,
+          streamId: current.streamId,
+          streamType: "session",
+          events: [{
+            eventType: "SessionEndRequested",
+            eventSchemaVersion: 3,
+            occurredAt: now.timestamp,
+            visibilityScope: "session",
+            sessionId: current.sessionId,
+            confidence: "high",
+            verificationStatus: "verified",
+            payload: {
+              workflowId,
+              workflowGeneration,
+              previousState: current.semanticState,
+              effectiveState,
+            } as unknown as JsonValue,
+            sourceRefs: [],
+            evidenceRefs: [],
+            evidenceDigests: [],
+          }],
+          outbox: [],
+          publicResponse: status,
+        },
+        authorizationRecord,
+        freshCapabilityGeneration: generation,
+        beforeAppend: (planned) => {
+          if (planned.events.length !== 1 || planned.events[0]?.globalPosition !== eventPosition) {
+            invalid("INTEGRITY_FAILURE");
+          }
+        },
+        afterAppend: (committed, currentTransaction) => {
+          if (committed.events.length !== 1 || committed.events[0]?.globalPosition !== eventPosition) {
+            invalid("INTEGRITY_FAILURE");
+          }
+          const currentAuthority = rootOperations(currentTransaction);
+          const currentLeases = leaseOperations(currentTransaction);
+          if (!currentAuthority.compareAndSwap({
+            projectId: current.projectId,
+            sessionId: current.sessionId,
+            expectedState: current.semanticState as "active" | "suspended",
+            expectedOwnerGeneration: current.ownerGeneration!,
+            expectedChildCapabilityGeneration: null,
+            expectedAuthorityCommitment: current.authorityCommitment,
+            next: authorityMutation(nextAuthority),
+          })) throw new LifecycleError("SESSION_HANDLE_STALE");
+          if (existing === null) {
+            this.#sessionEndWorkflows.createRequested(requestedInput);
+          } else {
+            this.#sessionEndWorkflows.reopenCancelled(requestedInput);
+          }
+          currentLeases.renewCurrent({
+            projectId: current.projectId,
+            sessionId: current.sessionId,
+            ownerGeneration: current.ownerGeneration!,
+            ownerClientInstanceId: context.binding.clientInstanceId,
+            observedNowMs: now.milliseconds,
+            leaseDurationMs: OWNER_LEASE_DURATION_MS,
+          });
+        },
+      };
+    });
+    const authority = this.#authority.get(
+      this.#connection,
+      context.binding.projectId,
+      execution.authorizationRecord.targetSessionId,
+    );
+    if (authority === null || authority.ownerGeneration === null) invalid("INTEGRITY_FAILURE");
+    return Object.freeze({
+      kind: "success",
+      publicResult: execution.publicResult,
+      authorityMaterial: workerMaterial(
+        this.#capabilities,
+        context,
+        authority,
+        authority.ownerGeneration.toString(),
         execution.authorizationRecord.target,
       ),
     });
