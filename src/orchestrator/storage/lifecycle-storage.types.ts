@@ -350,3 +350,37 @@ export interface EvidenceFingerprintRecord {
   readonly recordedEventPosition: bigint;
   readonly createdAt: string;
 }
+
+export type LifecycleOutboxStatus = "pending" | "claimed" | "completed" | "failed";
+
+export interface LifecycleOutboxStorageRecord {
+  readonly projectId: string;
+  readonly targetKey: string;
+  readonly eventPosition: bigint;
+  readonly kind: "materialize-lifecycle-log";
+  readonly payloadJson: string;
+  readonly contentHash: string;
+  readonly status: LifecycleOutboxStatus;
+  readonly attemptCount: bigint;
+  readonly claimOwner: string | null;
+  readonly claimToken: bigint | null;
+  readonly claimExpiresAt: string | null;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+  readonly sessionId: string;
+  readonly originKind: "workflow" | "terminal-event";
+  readonly workflowId: string | null;
+  readonly workflowGeneration: bigint | null;
+  readonly artifactKind: "compatibility-session-log";
+  readonly artifactPath: string;
+  readonly materializationRevision: bigint;
+  readonly expectedPriorFingerprint: string | null;
+  readonly nextFingerprint: string;
+  readonly fingerprintAlgorithm: "hmac-sha256";
+  readonly fingerprintSchemaVersion: bigint;
+  readonly fingerprintKeyId: string;
+  readonly fingerprintDomain: "pm-materialization-fingerprint-v1";
+  readonly failureClass: "retryable" | "permanent" | null;
+  readonly safeErrorCode: string | null;
+  readonly nextAttemptAt: string | null;
+}
