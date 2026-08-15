@@ -14,6 +14,7 @@ import type { SessionId } from "../src/orchestrator/lifecycle/contracts/identifi
 import { canonicalJson } from "../src/orchestrator/serialization/canonical-json.js";
 import { LifecycleOutboxRepository } from "../src/orchestrator/storage/lifecycle-outbox.repository.js";
 import type { SqliteConnection } from "../src/orchestrator/storage/sqlite-driver.js";
+import { checkpointFixture } from "./support/lifecycle-fixtures.js";
 
 const PROJECT_ID = "11111111-1111-4111-8111-111111111111" as ProjectId;
 const SESSION_ID = "44444444-4444-4444-8444-444444444444" as SessionId;
@@ -30,6 +31,7 @@ function db(): SqliteConnection {
     CREATE TABLE events (
       project_id TEXT NOT NULL,
       global_position INTEGER NOT NULL,
+      event_id TEXT NOT NULL,
       session_id TEXT,
       stream_type TEXT NOT NULL,
       stream_id TEXT NOT NULL,
@@ -37,6 +39,7 @@ function db(): SqliteConnection {
       command_event_index INTEGER NOT NULL,
       event_type TEXT NOT NULL,
       event_schema_version INTEGER NOT NULL,
+      parent_session_id TEXT,
       payload_json TEXT NOT NULL,
       payload_hash TEXT NOT NULL,
       occurred_at TEXT NOT NULL
@@ -179,17 +182,18 @@ function event(
 function insertEvent(connection: SqliteConnection, stored: StoredEvent): void {
   connection.prepare(`
     INSERT INTO events(
-      project_id, global_position, session_id, stream_type, stream_id,
-      stream_version, command_event_index, event_type, event_schema_version, payload_json,
+      project_id, global_position, event_id, session_id, stream_type, stream_id,
+      stream_version, command_event_index, event_type, event_schema_version, parent_session_id, payload_json,
       payload_hash, occurred_at
     ) VALUES (
-      $projectId, $position, $sessionId, $streamType, $streamId,
-      $streamVersion, $eventIndex, $eventType, $eventSchemaVersion, $payloadJson,
+      $projectId, $position, $eventId, $sessionId, $streamType, $streamId,
+      $streamVersion, $eventIndex, $eventType, $eventSchemaVersion, $parentSessionId, $payloadJson,
       $payloadHash, $occurredAt
     )
   `).run({
     $projectId: stored.projectId,
     $position: stored.globalPosition,
+    $eventId: stored.eventId,
     $sessionId: stored.sessionId,
     $streamType: stored.streamType,
     $streamId: stored.streamId,
@@ -197,6 +201,7 @@ function insertEvent(connection: SqliteConnection, stored: StoredEvent): void {
     $eventIndex: stored.commandEventIndex,
     $eventType: stored.eventType,
     $eventSchemaVersion: stored.eventSchemaVersion,
+    $parentSessionId: stored.parentSessionId,
     $payloadJson: stored.payloadJson,
     $payloadHash: stored.payloadHash,
     $occurredAt: stored.occurredAt,
@@ -206,13 +211,14 @@ function insertEvent(connection: SqliteConnection, stored: StoredEvent): void {
 function seedStartedAndWorkflow(connection: SqliteConnection): void {
   connection.prepare(`
     INSERT INTO events(
-      project_id, global_position, session_id, stream_type, stream_id,
-      stream_version, command_event_index, event_type, event_schema_version, payload_json,
+      project_id, global_position, event_id, session_id, stream_type, stream_id,
+      stream_version, command_event_index, event_type, event_schema_version, parent_session_id, payload_json,
       payload_hash, occurred_at
-    ) VALUES ($projectId, 1, $sessionId, 'session', $streamId, 1, 0,
-      'SessionStarted', 1, '{}', $payloadHash, '2026-08-09T00:00:00.000Z')
+    ) VALUES ($projectId, 1, $eventId, $sessionId, 'session', $streamId, 1, 0,
+      'SessionStarted', 1, NULL, '{}', $payloadHash, '2026-08-09T00:00:00.000Z')
   `).run({
     $projectId: PROJECT_ID,
+    $eventId: "66666666-6666-4666-8666-666666666666",
     $sessionId: SESSION_ID,
     $streamId: `session/${SESSION_ID}`,
     $payloadHash: payloadHash({}),
@@ -273,17 +279,41 @@ describe("LifecycleOutboxRepository", () => {
     ));
 
     const checkpoint = setup(7n, false);
-    const checkpointEvent = event(7n, "SessionCheckpointRecorded", 1, {
+    const nestedCheckpoint = checkpointFixture({
+      sessionId: SESSION_ID,
+      parentSessionId: null,
+      baseEventPosition: "6",
+      checkpointEventPosition: "7",
+    });
+    const checkpointEvent = event(7n, "SessionCheckpointRecorded", 3, {
+      checkpoint: {
+        ...nestedCheckpoint,
+        sourceState: {
+          ...nestedCheckpoint.sourceState,
+          workspaceId: WORKSPACE_ID,
+        },
+      },
+      baseEventPosition: "6",
+      checkpointEventPosition: "7",
+      finalCheckpointBindingVersion: 1,
       workflowId: WORKFLOW_ID,
       workflowGeneration: 1,
-      validationResultIds: [],
-      safeFailureCode: "SESSION_VALIDATION_RESULT_INVALID",
     });
     insertEvent(checkpoint.connection, checkpointEvent);
-    assert.throws(() => checkpoint.repository.insertLifecycle(
+    assert.doesNotThrow(() => checkpoint.repository.insertLifecycle(
       checkpoint.connection,
       pending(7n, "SessionCheckpointRecorded", undefined, FINGERPRINT_A, checkpointEvent.payloadHash),
       checkpointEvent,
+      NOW,
+    ));
+
+    const legacyCheckpoint = setup(7n, false);
+    const legacyCheckpointEvent = event(7n, "SessionCheckpointRecorded", 2, nestedCheckpoint as unknown as Record<string, unknown>);
+    insertEvent(legacyCheckpoint.connection, legacyCheckpointEvent);
+    assert.throws(() => legacyCheckpoint.repository.insertLifecycle(
+      legacyCheckpoint.connection,
+      pending(7n, "SessionCheckpointRecorded", undefined, FINGERPRINT_A, legacyCheckpointEvent.payloadHash),
+      legacyCheckpointEvent,
       NOW,
     ), /INTEGRITY_FAILURE/);
 
@@ -413,8 +443,10 @@ describe("LifecycleOutboxRepository", () => {
       }
       const plan = fixture.repository.getExactPlannedRevision(fixture.connection, query(7n));
       assert.ok(plan);
+      const asserted = fixture.repository.assertExactPlannedRevision(fixture.connection, query(7n));
       assert.equal(plan.targetKey, fixture.pendingOutbox.targetKey);
       assert.deepEqual(plan.nextFingerprint, fixture.pendingOutbox.payload.nextFingerprint);
+      assert.deepEqual(asserted, plan);
     }
   });
 
@@ -434,5 +466,61 @@ describe("LifecycleOutboxRepository", () => {
     fixture.repository.insertLifecycle(fixture.connection, fixture.pendingOutbox, fixture.storedEvent, NOW);
     fixture.connection.exec("UPDATE outbox SET payload_json = '{}' ");
     assert.throws(() => fixture.repository.getExactPlannedRevision(fixture.connection, query(7n)), /INTEGRITY_FAILURE/);
+  });
+
+  it("rejects persisted kind and cross-bound target-key corruption", () => {
+    const kind = setup();
+    kind.repository.insertLifecycle(kind.connection, kind.pendingOutbox, kind.storedEvent, NOW);
+    kind.connection.exec("UPDATE outbox SET kind = 'notify-observer'");
+    assert.throws(() => kind.repository.getExactPlannedRevision(kind.connection, query(7n)), /INTEGRITY_FAILURE/);
+
+    const bound = setup();
+    bound.repository.insertLifecycle(bound.connection, bound.pendingOutbox, bound.storedEvent, NOW);
+    bound.connection.prepare("UPDATE outbox SET session_id = $foreignSession").run({
+      $foreignSession: "99999999-9999-4999-8999-999999999999",
+    });
+    assert.throws(() => bound.repository.getExactPlannedRevision(bound.connection, query(7n)), /INTEGRITY_FAILURE/);
+  });
+
+  it("recomputes and canonicalizes the triggering event payload on reads", () => {
+    const noncanonical = setup();
+    noncanonical.repository.insertLifecycle(
+      noncanonical.connection,
+      noncanonical.pendingOutbox,
+      noncanonical.storedEvent,
+      NOW,
+    );
+    noncanonical.connection.prepare("UPDATE events SET payload_json = $payload").run({
+      $payload: `{"workflowId":"${WORKFLOW_ID}","workflowGeneration":1,"validationResultIds":[],"safeFailureCode":"SESSION_VALIDATION_RESULT_INVALID"}`,
+    });
+    assert.throws(
+      () => noncanonical.repository.getExactPlannedRevision(noncanonical.connection, query(7n)),
+      /INTEGRITY_FAILURE/,
+    );
+
+    const hash = setup();
+    hash.repository.insertLifecycle(hash.connection, hash.pendingOutbox, hash.storedEvent, NOW);
+    hash.connection.prepare("UPDATE events SET payload_json = $payload").run({
+      $payload: canonicalJson({
+        workflowId: WORKFLOW_ID,
+        workflowGeneration: 2,
+        validationResultIds: [],
+        safeFailureCode: "SESSION_VALIDATION_RESULT_INVALID",
+      }),
+    });
+    assert.throws(() => hash.repository.getExactPlannedRevision(hash.connection, query(7n)), /INTEGRITY_FAILURE/);
+  });
+
+  it("rejects malformed trigger envelope fields on reads", () => {
+    for (const columnValue of [
+      ["parent_session_id", SESSION_ID],
+      ["stream_version", 0],
+      ["event_id", "not-a-uuid"],
+    ] as const) {
+      const fixture = setup();
+      fixture.repository.insertLifecycle(fixture.connection, fixture.pendingOutbox, fixture.storedEvent, NOW);
+      fixture.connection.prepare(`UPDATE events SET ${columnValue[0]} = $value`).run({ $value: columnValue[1] });
+      assert.throws(() => fixture.repository.getExactPlannedRevision(fixture.connection, query(7n)), /INTEGRITY_FAILURE/);
+    }
   });
 });

@@ -3,6 +3,10 @@ import { outboxHash, payloadHash } from "../crypto/event-hash.js";
 import type { ProjectId } from "../identity/contracts.js";
 import { LifecycleError } from "../lifecycle/errors.js";
 import {
+  decodeLifecycleEventPayload,
+  type LifecycleEventType,
+} from "../lifecycle/contracts/events.js";
+import {
   COMPATIBILITY_SESSION_LOG_ARTIFACT_KIND,
   decodeKeyedFingerprintV1,
   decodeLifecycleMaterializationPayloadV1,
@@ -134,6 +138,8 @@ function rowField(row: SqliteRow, field: string): unknown {
 }
 
 function decodeStorageRow(row: SqliteRow): LifecycleOutboxStorageRecord {
+  const kind = stringValue(rowField(row, "kind"));
+  if (kind !== LIFECYCLE_OUTBOX_KIND) integrity();
   const status = stringValue(rowField(row, "status"));
   if (
     status !== "pending"
@@ -242,7 +248,7 @@ function decodeStorageRow(row: SqliteRow): LifecycleOutboxStorageRecord {
     projectId: stringValue(rowField(row, "project_id")),
     targetKey: stringValue(rowField(row, "target_key")),
     eventPosition: positiveIntegerValue(rowField(row, "event_position")),
-    kind: LIFECYCLE_OUTBOX_KIND,
+    kind: "materialize-lifecycle-log",
     payloadJson: stringValue(rowField(row, "payload_json")),
     contentHash: hashValue(rowField(row, "content_hash")),
     status: status as LifecycleOutboxStatus,
@@ -272,27 +278,44 @@ function decodeStorageRow(row: SqliteRow): LifecycleOutboxStorageRecord {
 }
 
 interface TriggerRow {
+  readonly eventId: string;
   readonly eventType: string;
   readonly eventSchemaVersion: bigint;
+  readonly streamVersion: bigint;
   readonly payloadJson: string;
   readonly payloadHash: string;
   readonly commandEventIndex: bigint;
   readonly sessionId: string | null;
+  readonly parentSessionId: string | null;
   readonly streamType: string;
   readonly streamId: string;
   readonly occurredAt?: string;
 }
 
 function decodeTriggerRow(row: SqliteRow): TriggerRow {
+  const eventId = stringValue(rowField(row, "event_id"));
+  try {
+    parseCanonicalUuid(eventId, "trigger.eventId");
+  } catch {
+    integrity();
+  }
+  const streamVersion = positiveIntegerValue(rowField(row, "stream_version"));
+  const parentSessionId = rowField(row, "parent_session_id") === null
+    ? null
+    : stringValue(rowField(row, "parent_session_id"));
+  if (parentSessionId !== null) integrity();
   return Object.freeze({
+    eventId,
     eventType: stringValue(rowField(row, "event_type")),
     eventSchemaVersion: integerValue(rowField(row, "event_schema_version")),
+    streamVersion,
     payloadJson: stringValue(rowField(row, "payload_json")),
     payloadHash: hashValue(rowField(row, "payload_hash")),
     commandEventIndex: integerValue(rowField(row, "command_event_index")),
     sessionId: rowField(row, "session_id") === null
       ? null
       : stringValue(rowField(row, "session_id")),
+    parentSessionId,
     streamType: stringValue(rowField(row, "stream_type")),
     streamId: stringValue(rowField(row, "stream_id")),
     ...(rowField(row, "occurred_at") === undefined
@@ -307,8 +330,9 @@ function readTriggerRow(
   eventPosition: bigint,
 ): TriggerRow {
   const rows = connection.prepare(`
-    SELECT event_type, event_schema_version, payload_json, payload_hash,
-           command_event_index, session_id, stream_type, stream_id, occurred_at
+    SELECT event_id, event_type, event_schema_version, stream_version,
+           payload_json, payload_hash, command_event_index, session_id,
+           parent_session_id, stream_type, stream_id, occurred_at
     FROM events
     WHERE project_id = $projectId AND global_position = $eventPosition
   `).all({
@@ -321,7 +345,9 @@ function readTriggerRow(
 
 function parsePayloadObject(payloadJson: string): Record<string, unknown> {
   try {
-    return jsonRecord(JSON.parse(payloadJson) as unknown);
+    const parsed = JSON.parse(payloadJson) as unknown;
+    if (canonicalJson(parsed) !== payloadJson) integrity();
+    return jsonRecord(parsed);
   } catch {
     integrity();
   }
@@ -330,6 +356,7 @@ function parsePayloadObject(payloadJson: string): Record<string, unknown> {
 function assertTriggerBinding(
   connection: SqliteConnection,
   projectId: string,
+  eventPosition: bigint,
   payload: LifecycleMaterializationPayloadV1,
   trigger: TriggerRow,
 ): void {
@@ -338,6 +365,7 @@ function assertTriggerBinding(
     || trigger.eventType !== payload.triggeringEventType
     || trigger.commandEventIndex !== 0n
     || trigger.sessionId !== payload.sessionId
+    || trigger.parentSessionId !== null
     || trigger.streamType !== "session"
     || trigger.streamId !== `session/${payload.sessionId}`
     || trigger.payloadHash !== payload.triggeringPayloadHash
@@ -345,15 +373,31 @@ function assertTriggerBinding(
   let eventPayload: Record<string, unknown>;
   try {
     eventPayload = parsePayloadObject(trigger.payloadJson);
+    if (payloadHash(eventPayload) !== trigger.payloadHash) integrity();
   } catch {
     integrity();
   }
-  const workflowId = eventPayload.workflowId;
-  const workflowGeneration = eventPayload.workflowGeneration;
+  const expectedSchemaVersion = payload.triggeringEventType === "SessionCheckpointRecorded"
+    ? 3
+    : (payload.triggeringEventType === "SessionEndAmended"
+      || payload.triggeringEventType === "SessionEndCancelled" ? 3 : 1);
+  if (trigger.eventSchemaVersion !== BigInt(expectedSchemaVersion)) integrity();
+  let decodedEventPayload: Record<string, unknown>;
+  try {
+    decodedEventPayload = jsonRecord(decodeLifecycleEventPayload(
+      payload.triggeringEventType as LifecycleEventType,
+      safeNumber(trigger.eventSchemaVersion),
+      eventPayload,
+    ));
+    if (canonicalJson(decodedEventPayload) !== trigger.payloadJson) integrity();
+  } catch {
+    integrity();
+  }
+  const workflowId = decodedEventPayload.workflowId;
+  const workflowGeneration = decodedEventPayload.workflowGeneration;
   if (payload.origin.kind === "terminal-event") {
     if (
       payload.triggeringEventType !== "SessionAbandoned"
-      || trigger.eventSchemaVersion !== 1n
       || workflowId !== null
       || workflowGeneration !== null
     ) integrity();
@@ -365,12 +409,13 @@ function assertTriggerBinding(
     || (typeof workflowGeneration !== "number" && typeof workflowGeneration !== "bigint")
     || BigInt(workflowGeneration) !== BigInt(payload.origin.workflowGeneration)
   ) integrity();
-  const expectedSchemaVersion = payload.triggeringEventType === "SessionCheckpointRecorded"
-    ? 3n
-    : (payload.triggeringEventType === "SessionEndAmended"
-      || payload.triggeringEventType === "SessionEndCancelled" ? 3n : 1n);
-  if (trigger.eventSchemaVersion !== expectedSchemaVersion) integrity();
   if (payload.triggeringEventType === "SessionCheckpointRecorded") {
+    const checkpoint = jsonRecord(decodedEventPayload.checkpoint);
+    if (
+      decodedEventPayload.checkpointEventPosition !== eventPosition.toString()
+      || checkpoint.sessionId !== payload.sessionId
+      || checkpoint.parentSessionId !== null
+    ) integrity();
     const workflow = connection.prepare(`
       SELECT 1 AS present
       FROM workflow_instances
@@ -436,6 +481,22 @@ function queryRowByIdentity(
     $sessionId: sessionId,
     $artifactKind: artifactKind,
     $materializationRevision: materializationRevision,
+  });
+}
+
+function queryRowByTargetKey(
+  connection: SqliteConnection,
+  projectId: string,
+  targetKey: string,
+): SqliteRow[] {
+  return connection.prepare(`
+    SELECT *
+    FROM outbox
+    WHERE project_id = $projectId
+      AND target_key = $targetKey
+  `).all({
+    $projectId: projectId,
+    $targetKey: targetKey,
   });
 }
 
@@ -511,7 +572,7 @@ function validateRow(
   if (trigger.payloadJson.length === 0 || trigger.payloadHash !== payload.triggeringPayloadHash) {
     integrity();
   }
-  assertTriggerBinding(connection, record.projectId, payload, trigger);
+  assertTriggerBinding(connection, record.projectId, record.eventPosition, payload, trigger);
   const artifactPath = artifactPathFor(connection, record.projectId, record.sessionId);
   if (artifactPath !== record.artifactPath) integrity();
 
@@ -572,24 +633,36 @@ function validateProvidedEvent(
     || triggeringEvent.sessionId !== payload.sessionId
     || triggeringEvent.streamType !== "session"
     || triggeringEvent.streamId !== `session/${payload.sessionId}`
+    || triggeringEvent.parentSessionId !== null
     || triggeringEvent.commandEventIndex !== 0
     || triggeringEvent.eventType !== payload.triggeringEventType
     || triggeringEvent.payloadHash !== payload.triggeringPayloadHash
     || canonicalJson(triggeringEvent.payload) !== triggeringEvent.payloadJson
     || payloadHash(triggeringEvent.payload) !== triggeringEvent.payloadHash
   ) integrity();
+  try {
+    parseCanonicalUuid(triggeringEvent.eventId, "triggeringEvent.eventId");
+    if (triggeringEvent.streamVersion < 1n || triggeringEvent.streamVersion > MAX_SQLITE_INT64) {
+      integrity();
+    }
+  } catch {
+    integrity();
+  }
   const trigger = readTriggerRow(connection, triggeringEvent.projectId, triggeringEvent.globalPosition);
   if (
     trigger.eventType !== triggeringEvent.eventType
+    || trigger.eventId !== triggeringEvent.eventId
     || trigger.eventSchemaVersion !== BigInt(triggeringEvent.eventSchemaVersion)
+    || trigger.streamVersion !== triggeringEvent.streamVersion
     || trigger.sessionId !== triggeringEvent.sessionId
+    || trigger.parentSessionId !== triggeringEvent.parentSessionId
     || trigger.streamType !== triggeringEvent.streamType
     || trigger.streamId !== triggeringEvent.streamId
     || trigger.commandEventIndex !== BigInt(triggeringEvent.commandEventIndex)
     || trigger.payloadJson !== triggeringEvent.payloadJson
     || trigger.payloadHash !== triggeringEvent.payloadHash
   ) integrity();
-  assertTriggerBinding(connection, triggeringEvent.projectId, payload, trigger);
+  assertTriggerBinding(connection, triggeringEvent.projectId, triggeringEvent.globalPosition, payload, trigger);
   const artifactPath = artifactPathFor(connection, triggeringEvent.projectId, payload.sessionId);
   if (artifactPath !== payload.artifactPath) integrity();
 }
@@ -734,7 +807,15 @@ export class LifecycleOutboxRepository {
         query.artifactKind,
         query.materializationRevision,
       );
-      if (rows.length === 0) return null;
+      if (rows.length === 0) {
+        const targetRows = queryRowByTargetKey(
+          connection,
+          query.projectId,
+          `lifecycle-log/${query.sessionId}/${query.materializationRevision.toString()}`,
+        );
+        if (targetRows.length !== 0) integrity();
+        return null;
+      }
       if (rows.length !== 1) integrity();
       const plan = validateRow(connection, rows[0]!, 0);
       compareQuery(query, plan);
