@@ -4619,6 +4619,67 @@ it("schema 4 full integrity owns lifecycle outbox overlay discovery while quick 
   const control = createFixture();
   addSchema4TerminalLifecycleOutbox(control);
   assert.deepEqual((await quickIssues(control)).issues, []);
+
+  const boundedHistory = createFixture();
+  addSchema4TerminalLifecycleOutbox(boundedHistory);
+  boundedHistory.connection.exec("DROP TRIGGER outbox_lifecycle_insert_guard");
+  boundedHistory.connection.exec("DROP TRIGGER outbox_lifecycle_descriptor_v4_insert_guard");
+  for (let index = 0; index < 1_000; index += 1) {
+    const sessionId = uuid(0x9000_0000 + index);
+    const targetKey = `lifecycle-log/${sessionId}/1`;
+    const artifactPath = `05_Agent_Session_Logs/2026-07-30-session-${sessionId}.md`;
+    const payload = {
+      payloadVersion: 1,
+      targetKey,
+      sessionId,
+      artifactKind: "compatibility-session-log",
+      artifactPath,
+      materializationRevision: "1",
+      triggeringPayloadHash: H64,
+      nextFingerprint: {
+        algorithm: "hmac-sha256",
+        schemaVersion: 1,
+        keyId: "materialization-key",
+        domain: "pm-materialization-fingerprint-v1",
+        value: H64_B,
+      },
+      origin: { kind: "terminal-event", workflowId: null, workflowGeneration: null },
+      triggeringEventType: "SessionAbandoned",
+    } as const;
+    rawInsert(boundedHistory.connection, "outbox", {
+      project_id: PROJECT_ID,
+      target_key: targetKey,
+      event_position: 2,
+      kind: "materialize-lifecycle-log",
+      payload_json: canonicalJson(payload),
+      content_hash: outboxHash(payload),
+      status: "pending",
+      attempt_count: 0,
+      claim_owner: null,
+      claim_token: null,
+      claim_expires_at: null,
+      created_at: NOW,
+      updated_at: NOW,
+      session_id: sessionId,
+      origin_kind: "terminal-event",
+      workflow_id: null,
+      workflow_generation: null,
+      artifact_kind: "compatibility-session-log",
+      artifact_path: artifactPath,
+      materialization_revision: 1,
+      expected_prior_fingerprint: null,
+      next_fingerprint: H64_B,
+      fingerprint_algorithm: "hmac-sha256",
+      fingerprint_schema_version: 1,
+      fingerprint_key_id: "materialization-key",
+      fingerprint_domain: "pm-materialization-fingerprint-v1",
+      failure_class: null,
+      safe_error_code: null,
+      next_attempt_at: null,
+    });
+  }
+  assert.deepEqual(directOutboxShapeIssues(boundedHistory, false), []);
+
   const observerMutationControl = observedConnection(control.connection);
   observerMutationControl.connection.prepare(`
     SELECT outbox.*, event.session_id AS event_session_id

@@ -912,36 +912,37 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
         ) throw new LifecycleError("INTEGRITY_FAILURE");
         rendered = renderCompatibilityLogV2(projection);
 
-        if (this.provider !== undefined) {
-          const keyId = payload.nextFingerprint.keyId;
-          let status: "available" | "revoked" | "unavailable";
-          try {
-            status = await this.provider.status(keyId);
-          } catch (error) {
-            if (error instanceof HistoricalEvidenceKeyUnavailableError) {
-              throw new LifecycleError("EVIDENCE_HISTORICAL_KEY_UNAVAILABLE");
-            }
-            throw new LifecycleError("INTEGRITY_FAILURE");
-          }
-          if (status === "revoked" || status === "unavailable") {
+        if (this.provider === undefined) {
+          throw new LifecycleError("EVIDENCE_HISTORICAL_KEY_UNAVAILABLE");
+        }
+        const keyId = payload.nextFingerprint.keyId;
+        let status: "available" | "revoked" | "unavailable";
+        try {
+          status = await this.provider.status(keyId);
+        } catch (error) {
+          if (error instanceof HistoricalEvidenceKeyUnavailableError) {
             throw new LifecycleError("EVIDENCE_HISTORICAL_KEY_UNAVAILABLE");
           }
-          if (status !== "available") throw new LifecycleError("INTEGRITY_FAILURE");
-          let recomputed: string;
-          try {
-            recomputed = await this.provider.fingerprint(keyId, rendered);
-          } catch (error) {
-            if (error instanceof HistoricalEvidenceKeyUnavailableError) {
-              throw new LifecycleError("EVIDENCE_HISTORICAL_KEY_UNAVAILABLE");
-            }
-            throw new LifecycleError("INTEGRITY_FAILURE");
-          }
-          if (
-            !LOWER_HASH.test(recomputed)
-            || recomputed !== payload.nextFingerprint.value
-            || recomputed !== row.next_fingerprint
-          ) throw new LifecycleError("INTEGRITY_FAILURE");
+          throw new LifecycleError("INTEGRITY_FAILURE");
         }
+        if (status === "revoked" || status === "unavailable") {
+          throw new LifecycleError("EVIDENCE_HISTORICAL_KEY_UNAVAILABLE");
+        }
+        if (status !== "available") throw new LifecycleError("INTEGRITY_FAILURE");
+        let recomputed: string;
+        try {
+          recomputed = await this.provider.fingerprint(keyId, rendered);
+        } catch (error) {
+          if (error instanceof HistoricalEvidenceKeyUnavailableError) {
+            throw new LifecycleError("EVIDENCE_HISTORICAL_KEY_UNAVAILABLE");
+          }
+          throw new LifecycleError("INTEGRITY_FAILURE");
+        }
+        if (
+          !LOWER_HASH.test(recomputed)
+          || recomputed !== payload.nextFingerprint.value
+          || recomputed !== row.next_fingerprint
+        ) throw new LifecycleError("INTEGRITY_FAILURE");
       } catch (error) {
         if (
           error instanceof LifecycleError
@@ -7287,7 +7288,8 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
         ORDER BY outbox.session_id, outbox.artifact_kind, outbox.materialization_revision
       `
       : `
-        SELECT outbox.*, event.session_id AS event_session_id,
+        SELECT /* lifecycle-quick:outbox-current */
+               outbox.*, event.session_id AS event_session_id,
                workflow.generation AS current_workflow_generation
         FROM outbox INDEXED BY outbox_lifecycle_latest_artifact
         LEFT JOIN events AS event ON event.global_position = outbox.event_position
@@ -7297,17 +7299,8 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
         WHERE outbox.project_id = $projectId
           AND outbox.session_id IS NOT NULL
           AND outbox.artifact_kind = '${COMPATIBILITY_SESSION_LOG_ARTIFACT_KIND}'
+        LIMIT 1
       `).all({ $projectId: context.binding.projectId });
-    if (!full) {
-      rows.sort((left, right) => {
-        const session = String(left.session_id).localeCompare(String(right.session_id));
-        if (session !== 0) return session;
-        const revision = int64(left.materialization_revision);
-        const otherRevision = int64(right.materialization_revision);
-        if (revision === null || otherRevision === null) return 0;
-        return revision < otherRevision ? -1 : revision > otherRevision ? 1 : 0;
-      });
-    }
     const previous = new Map<string, {
       revision: bigint;
       fingerprint: unknown;

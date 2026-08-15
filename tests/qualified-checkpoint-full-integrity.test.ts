@@ -7578,7 +7578,10 @@ async function publicFullIssueCodes(fixture: Fixture): Promise<{
   const async = await new EventIntegrityService(
     fixture.connection,
     PROJECT_STORE_MIGRATIONS,
-    [new LifecycleIntegrityService(fixture.connection)],
+    [new LifecycleIntegrityService(fixture.connection, {
+      async status() { return "available"; },
+      async fingerprint() { return H64_B; },
+    })],
   ).fullCheckAsync(fixture.context);
   return {
     sync: sync.issues.map((entry) => entry.code),
@@ -8288,6 +8291,20 @@ it("full integrity publicly dispatches schema 4 lifecycle outbox overlay", async
     sync: ["COMMAND_METADATA_MISMATCH", "LIFECYCLE_OUTBOX_INVARIANT_MISMATCH"],
     async: ["COMMAND_METADATA_MISMATCH", "LIFECYCLE_OUTBOX_INVARIANT_MISMATCH"],
   });
+});
+
+it("schema 4 full replay fails closed when the fingerprint provider is absent", async () => {
+  const { fixture } = createAuthenticatedPublicOutboxFixture();
+  await assert.rejects(
+    () => new LifecycleIntegrityService(fixture.connection)
+      .fullCheckAsync(fixture.context, { add() {} }),
+    (error: unknown) => (
+      typeof error === "object"
+      && error !== null
+      && "code" in error
+      && error.code === "EVIDENCE_HISTORICAL_KEY_UNAVAILABLE"
+    ),
+  );
 });
 
 it("schema 4 full replay renders an authenticated lifecycle closure and zeroizes bytes", async () => {
