@@ -1,20 +1,38 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
+import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 
 import {
   decodeGenericPendingOutbox,
   type StoredEvent,
 } from "../src/orchestrator/contracts/event.js";
+import { payloadHash } from "../src/orchestrator/crypto/event-hash.js";
 import { computeProjectContextFingerprint } from "../src/orchestrator/identity/project-binding.service.js";
+import type { CapabilityKeyProvider } from "../src/orchestrator/lifecycle/authority/capability-key-provider.js";
 import { PreparedMaterializationHandleOwner } from "../src/orchestrator/materialization/prepared-materialization-handle.js";
+import {
+  SqliteLifecycleMaterializationQueue,
+  type LifecycleMaterializationQueueDependencies,
+} from "../src/orchestrator/materialization/sqlite-lifecycle-materialization-queue.js";
+import { SqliteLifecycleMaterializationPlanningReads } from "../src/orchestrator/materialization/sqlite-lifecycle-materialization-planning-reads.js";
+import type { SqliteConnection } from "../src/orchestrator/storage/sqlite-driver.js";
+import {
+  projectCompatibilityLogV2,
+  type CompatibilityLogProjectionInputV2,
+} from "../src/orchestrator/materialization/compatibility-log.projection.js";
+import { canonicalJson } from "../src/orchestrator/serialization/canonical-json.js";
 import {
   COMPATIBILITY_SESSION_LOG_ARTIFACT_KIND,
   decodeMaterializationProjectionInputV1,
   decodePendingLifecycleOutboxV1,
   type LifecycleMaterializationPlanningReads,
+  type LifecycleOutboxPlanReader,
+  type LifecycleOutboxPlannedRevision,
   type LifecycleMaterializationTriggerType,
   type LifecycleRenderClosureV1,
+  type LifecycleRenderEventV1,
+  type MaterializationProjectionInputV1,
 } from "../src/orchestrator/lifecycle/materialization-queue.port.js";
 import { checkpointFixture } from "./support/lifecycle-fixtures.js";
 import { sessionEndEffectiveStateFixture } from "./support/session-end-effective-state-reference.js";
@@ -27,6 +45,7 @@ const STORE_ID = "33333333-3333-4333-8333-333333333333";
 const WORKSPACE_ID = "a".repeat(64);
 const HASH_A = "b".repeat(64);
 const HASH_B = "c".repeat(64);
+const NOW = "2026-08-09T00:10:00.000Z";
 
 const WORKFLOW_TRIGGERS = [
   "SessionCheckpointRecorded",
@@ -993,4 +1012,408 @@ test("exports the authenticated lifecycle closure planning-read contract", () =>
     ),
     closure,
   );
+});
+
+function terminalQueueInput(context: Record<string, unknown> = projectContext()): MaterializationProjectionInputV1 {
+  return decodeMaterializationProjectionInputV1({
+    context,
+    sessionId: SESSION_ID,
+    artifactKind: COMPATIBILITY_SESSION_LOG_ARTIFACT_KIND,
+    triggeringEventIndex: 0,
+    expectedTriggerPosition: 2n,
+    triggeringEventSchemaVersion: 1,
+    triggeringOccurredAt: "2026-08-09T00:01:00.000Z",
+    triggeringEventPayload: {
+      workflowId: null,
+      workflowGeneration: null,
+      approvalId: "77777777-7777-4777-8777-777777777777",
+      preTransitionCheckpointId: "66666666-6666-4666-8666-666666666666",
+      reasonCode: "operator-request",
+      authorityCommitment: HASH_A,
+    },
+    origin: terminalOrigin(),
+    triggeringEventType: "SessionAbandoned",
+  });
+}
+
+function startedRenderEvent(context: Record<string, unknown>): LifecycleRenderEventV1 {
+  const binding = bindingOf(context);
+  const workspace = context.workspace as Record<string, unknown>;
+  return Object.freeze({
+    projectId: binding.projectId as never,
+    vaultId: binding.vaultId as never,
+    storeId: binding.storeId as never,
+    workspaceId: binding.workspaceId as never,
+    branchScopeId: (context.branchScopeId ?? null) as never,
+    branchRef: workspace.kind === "git" ? workspace.branchRef as string | null : null,
+    streamId: `session/${SESSION_ID}`,
+    streamVersion: "1",
+    globalPosition: "1",
+    sessionId: SESSION_ID as never,
+    parentSessionId: null,
+    eventType: "SessionStarted",
+    eventSchemaVersion: 1,
+    occurredAt: "2026-08-09T00:00:00.000Z",
+    payload: {
+      sessionKind: "root",
+      ownerGeneration: 1,
+      continuityKey: HASH_A,
+      clientNamespace: "tests",
+      creatingAgentId: "agent-primary",
+      creatingClientInstanceId: "client-primary",
+      authorityCommitment: HASH_A,
+    },
+    materializationOrigin: null,
+    legacyIntentSemantics: null,
+  });
+}
+
+function terminalClosure(input: MaterializationProjectionInputV1): LifecycleRenderClosureV1 {
+  return Object.freeze({
+    root: Object.freeze([startedRenderEvent(input.context as unknown as Record<string, unknown>)]),
+    directChildren: Object.freeze([]),
+    foreignClaims: Object.freeze([]),
+  });
+}
+
+function terminalStoredEvent(
+  input: MaterializationProjectionInputV1,
+  overrides: Partial<StoredEvent> = {},
+): StoredEvent {
+  const payload = input.triggeringEventPayload;
+  const payloadJson = canonicalJson(payload);
+  const context = input.context;
+  return {
+    globalPosition: input.expectedTriggerPosition,
+    eventId: "88888888-8888-4888-8888-888888888888",
+    projectId: context.binding.projectId,
+    vaultId: context.binding.vaultId,
+    storeId: context.binding.storeId,
+    workspaceId: context.binding.workspaceId,
+    branchScopeId: context.branchScopeId ?? null,
+    branchRef: context.workspace.kind === "git" ? context.workspace.branchRef : null,
+    streamId: `session/${SESSION_ID}`,
+    streamType: "session",
+    streamVersion: 2n,
+    eventType: input.triggeringEventType,
+    eventSchemaVersion: input.triggeringEventSchemaVersion,
+    sessionId: input.sessionId,
+    parentSessionId: null,
+    actorRole: "primary",
+    agentId: "agent-primary",
+    clientInstanceId: "client-primary",
+    correlationId: "99999999-9999-4999-8999-999999999999",
+    causationId: null,
+    commandId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    idempotencyKey: "materialize-2",
+    commandEventIndex: 0,
+    occurredAt: input.triggeringOccurredAt,
+    recordedAt: "2026-08-09T00:01:01.000Z",
+    visibilityScope: "project",
+    confidence: "high",
+    verificationStatus: "verified",
+    sourceRefs: ["event:1"],
+    evidenceRefs: [],
+    evidenceDigests: [],
+    payload,
+    payloadJson,
+    payloadHash: payloadHash(payload),
+    previousGlobalHash: HASH_B,
+    eventHash: "d".repeat(64),
+    lifecycleIntentJson: null,
+    ...overrides,
+  } as unknown as StoredEvent;
+}
+
+function fingerprintTuple(value = HASH_B, keyId = "materialization-key-1"): LifecycleOutboxPlannedRevision["nextFingerprint"] {
+  return Object.freeze({
+    algorithm: "hmac-sha256",
+    schemaVersion: 1,
+    keyId,
+    domain: "pm-materialization-fingerprint-v1",
+    value,
+  });
+}
+
+interface QueueHarnessOptions {
+  readonly input?: MaterializationProjectionInputV1;
+  readonly tail?: bigint;
+  readonly predecessor?: LifecycleOutboxPlannedRevision | null;
+  readonly predecessorError?: boolean;
+  readonly currentKeyError?: boolean;
+  readonly fingerprintError?: boolean;
+  readonly fingerprintValue?: string;
+  readonly renderError?: boolean;
+  readonly projectError?: boolean;
+  readonly projected?: (input: CompatibilityLogProjectionInputV2) => void;
+}
+
+function queueHarness(options: QueueHarnessOptions = {}): {
+  readonly queue: SqliteLifecycleMaterializationQueue;
+  readonly input: MaterializationProjectionInputV1;
+  readonly closure: LifecycleRenderClosureV1;
+  readonly calls: {
+    readonly sequence: string[];
+    readonly project: { value: number };
+    readonly render: { value: number };
+    readonly predecessor: { value: number };
+    readonly currentKey: { value: number };
+    readonly fingerprint: { value: number };
+    readonly plan: { value: number };
+  };
+  readonly renderedBytes: { value: Buffer | null };
+  readonly providerInputs: Uint8Array[];
+} {
+  const input = options.input ?? terminalQueueInput();
+  const closure = terminalClosure(input);
+  const sequence: string[] = [];
+  const calls = {
+    sequence,
+    project: { value: 0 },
+    render: { value: 0 },
+    predecessor: { value: 0 },
+    currentKey: { value: 0 },
+    fingerprint: { value: 0 },
+    plan: { value: 0 },
+  };
+  const renderedBytes = { value: null as Buffer | null };
+  const providerInputs: Uint8Array[] = [];
+
+  const reads: LifecycleMaterializationPlanningReads = {
+    readGlobalTailPosition: () => {
+      sequence.push("tail");
+      return options.tail ?? 1n;
+    },
+    readStrictLifecycleClosure: (projectId, sessionId, throughPositionExclusive) => {
+      sequence.push("closure");
+      assert.equal(projectId, input.context.binding.projectId);
+      assert.equal(sessionId, input.sessionId);
+      assert.equal(throughPositionExclusive, input.expectedTriggerPosition);
+      return closure;
+    },
+    readVerifiedImmediatePredecessor: () => {
+      sequence.push("predecessor");
+      calls.predecessor.value += 1;
+      if (options.predecessorError) throw new Error("predecessor-failure");
+      return options.predecessor ?? null;
+    },
+  };
+
+  const keyProvider: Pick<CapabilityKeyProvider, "currentKey" | "fingerprint"> = {
+    currentKey: () => {
+      sequence.push("current-key");
+      calls.currentKey.value += 1;
+      if (options.currentKeyError) throw new Error("key-failure");
+      return Object.freeze({ keyId: "materialization-key-1" });
+    },
+    fingerprint: (providerInput) => {
+      sequence.push("fingerprint");
+      calls.fingerprint.value += 1;
+      providerInputs.push(providerInput.bytes);
+      if (options.fingerprintError) throw new Error("fingerprint-failure");
+      return options.fingerprintValue ?? HASH_B;
+    },
+  };
+
+  const planReader: LifecycleOutboxPlanReader = {
+    getExactPlannedRevision: () => null,
+    assertExactPlannedRevision: (query) => {
+      calls.plan.value += 1;
+      const predecessor = options.predecessor ?? null;
+      const nextFingerprint = fingerprintTuple(options.fingerprintValue ?? HASH_B);
+      return Object.freeze({
+        ...query,
+        targetKey: `lifecycle-log/${query.sessionId}/${query.materializationRevision}`,
+        artifactPath: `05_Agent_Session_Logs/2026-08-09-session-${query.sessionId}.md`,
+        triggeringPayloadHash: payloadHash(input.triggeringEventPayload),
+        expectedPriorFingerprint: predecessor?.nextFingerprint ?? null,
+        nextFingerprint,
+        createdAt: NOW,
+      });
+    },
+  };
+
+  const dependencies: LifecycleMaterializationQueueDependencies = {
+    reads,
+    keyProvider,
+    planReader,
+    project: (projection) => {
+      sequence.push("project");
+      calls.project.value += 1;
+      if (options.projectError) throw new Error("project-failure");
+      options.projected?.(projection);
+      return projectCompatibilityLogV2(projection);
+    },
+    render: () => {
+      sequence.push("render");
+      calls.render.value += 1;
+      if (options.renderError) throw new Error("render-failure");
+      const bytes = Buffer.from("secret render bytes", "utf8");
+      renderedBytes.value = bytes;
+      return bytes;
+    },
+  };
+  return {
+    queue: new SqliteLifecycleMaterializationQueue(dependencies),
+    input,
+    closure,
+    calls,
+    renderedBytes,
+    providerInputs,
+  };
+}
+
+test("plans one provider-keyed fingerprint from an authenticated lifecycle closure", () => {
+  const harness = queueHarness();
+  const prepared = harness.queue.prepare(harness.input);
+  assert.equal(prepared.pendingOutbox.payload.targetKey, `lifecycle-log/${SESSION_ID}/2`);
+  assert.equal(prepared.pendingOutbox.payload.materializationRevision, "2");
+  assert.equal(prepared.pendingOutbox.payload.triggeringPayloadHash, payloadHash(harness.input.triggeringEventPayload));
+  assert.deepEqual(prepared.pendingOutbox.payload.nextFingerprint, fingerprintTuple());
+  assert.deepEqual(harness.calls.sequence, ["tail", "closure", "project", "render", "predecessor", "current-key", "fingerprint"]);
+  assert.equal(harness.calls.render.value, 1);
+  assert.equal(harness.calls.fingerprint.value, 1);
+  assert.ok(harness.renderedBytes.value?.every((value) => value === 0));
+});
+
+test("uses indexed closure reads without scanning unrelated project history", () => {
+  const harness = queueHarness();
+  harness.queue.prepare(harness.input);
+  assert.deepEqual(harness.calls.sequence.slice(0, 2), ["tail", "closure"]);
+  assert.equal(harness.calls.predecessor.value, 1);
+});
+
+test("derives candidate branch scope from the authenticated root closure", () => {
+  const input = terminalQueueInput(gitProjectContext());
+  let observed: LifecycleRenderEventV1 | null = null;
+  const harness = queueHarness({
+    input,
+    projected: (projection) => { observed = projection.trigger; },
+  });
+  harness.queue.prepare(input);
+  const observedEvent = observed as LifecycleRenderEventV1 | null;
+  assert.equal(observedEvent?.branchScopeId, input.context.branchScopeId);
+  assert.equal(observedEvent?.branchRef, input.context.workspace.kind === "git" ? input.context.workspace.branchRef : null);
+});
+
+test("requires the transaction next global position", () => {
+  const harness = queueHarness({ tail: 0n });
+  assert.throws(() => harness.queue.prepare(harness.input), /INTEGRITY_FAILURE/);
+  assert.equal(harness.calls.sequence.includes("closure"), false);
+});
+
+test("returns no handle when rendering fails", () => {
+  const harness = queueHarness({ renderError: true });
+  assert.throws(() => harness.queue.prepare(harness.input), /render-failure|INTEGRITY_FAILURE/);
+  assert.equal(harness.calls.predecessor.value, 0);
+  assert.equal(harness.calls.fingerprint.value, 0);
+});
+
+test("zeroizes returned render bytes on every later planning failure", () => {
+  for (const options of [
+    { predecessorError: true },
+    { currentKeyError: true },
+    { fingerprintError: true },
+    { fingerprintValue: "not-a-hash" },
+  ]) {
+    const harness = queueHarness(options);
+    assert.throws(() => harness.queue.prepare(harness.input));
+    assert.ok(harness.renderedBytes.value);
+    assert.ok(harness.renderedBytes.value.every((value) => value === 0));
+  }
+});
+
+test("accepts its opaque prepared plan exactly once", () => {
+  const harness = queueHarness();
+  const prepared = harness.queue.prepare(harness.input);
+  const planned = terminalStoredEvent(harness.input);
+  harness.queue.assertPlanned(prepared, planned);
+  harness.queue.assertCommitted(prepared, structuredClone(planned));
+  assert.throws(() => harness.queue.assertCommitted(prepared, planned));
+});
+
+test("rejects a handle created by another queue instance", () => {
+  const first = queueHarness();
+  const second = queueHarness();
+  const prepared = first.queue.prepare(first.input);
+  assert.throws(() => second.queue.assertPlanned(prepared, terminalStoredEvent(second.input)));
+});
+
+test("captures every planned StoredEvent field before commit", () => {
+  const harness = queueHarness();
+  const prepared = harness.queue.prepare(harness.input);
+  const planned = terminalStoredEvent(harness.input);
+  const committed = structuredClone(planned);
+  harness.queue.assertPlanned(prepared, planned);
+  (planned.sourceRefs as string[])[0] = "tampered-after-plan";
+  harness.queue.assertCommitted(prepared, committed);
+  assert.equal(harness.calls.plan.value, 1);
+});
+
+test("asserts planned intent action and complete envelope before insert", () => {
+  for (const mismatch of [
+    { projectId: "99999999-9999-4999-8999-999999999999" as never },
+    { globalPosition: 3n },
+    { streamVersion: 1n },
+    { eventType: "SessionEnded" },
+    { eventSchemaVersion: 3 },
+    { occurredAt: "2026-08-09T00:02:00.000Z" },
+    { payloadHash: HASH_A },
+    { commandEventIndex: 1 },
+  ] satisfies readonly Partial<StoredEvent>[]) {
+    const harness = queueHarness();
+    const prepared = harness.queue.prepare(harness.input);
+    assert.throws(() => harness.queue.assertPlanned(
+      prepared,
+      terminalStoredEvent(harness.input, mismatch),
+    ));
+  }
+});
+
+test("asserts committed trigger and exact row without rerendering", () => {
+  const harness = queueHarness();
+  const prepared = harness.queue.prepare(harness.input);
+  const event = terminalStoredEvent(harness.input);
+  harness.queue.assertPlanned(prepared, event);
+  const renderCalls = harness.calls.render.value;
+  const fingerprintCalls = harness.calls.fingerprint.value;
+  const plan = harness.queue.assertCommitted(prepared, structuredClone(event));
+  assert.equal(plan.materializationRevision, 2n);
+  assert.equal(harness.calls.render.value, renderCalls);
+  assert.equal(harness.calls.fingerprint.value, fingerprintCalls);
+  assert.equal(harness.calls.plan.value, 1);
+});
+
+test("carries historical predecessor tuples without reminting after rotation", () => {
+  const predecessor = Object.freeze({
+    ...({
+      projectId: PROJECT_ID,
+      sessionId: SESSION_ID,
+      artifactKind: COMPATIBILITY_SESSION_LOG_ARTIFACT_KIND,
+      materializationRevision: 1n,
+      triggeringEventPosition: 1n,
+      origin: terminalOrigin(),
+      triggeringEventType: "SessionAbandoned",
+      targetKey: `lifecycle-log/${SESSION_ID}/1`,
+      artifactPath: `05_Agent_Session_Logs/2026-08-09-session-${SESSION_ID}.md`,
+      triggeringPayloadHash: HASH_A,
+      expectedPriorFingerprint: null,
+      nextFingerprint: fingerprintTuple(HASH_A, "historical-key"),
+      createdAt: NOW,
+    } as unknown as LifecycleOutboxPlannedRevision),
+  });
+  const harness = queueHarness({ predecessor });
+  const prepared = harness.queue.prepare(harness.input);
+  assert.equal(prepared.pendingOutbox.payload.nextFingerprint.keyId, "materialization-key-1");
+  assert.equal(harness.calls.predecessor.value, 1);
+  assert.equal(harness.calls.fingerprint.value, 1);
+});
+
+test("planning reads return the exact global event tail", () => {
+  const connection = new DatabaseSync(":memory:") as unknown as SqliteConnection;
+  connection.exec("CREATE TABLE events(global_position INTEGER NOT NULL)");
+  connection.prepare("INSERT INTO events(global_position) VALUES (1), (7), (3)").run();
+  const reads = new SqliteLifecycleMaterializationPlanningReads(connection);
+  assert.equal(reads.readGlobalTailPosition(), 7n);
+  connection.close();
 });
