@@ -23,6 +23,29 @@ const PROJECT_ID = "11111111-1111-4111-8111-111111111111";
 const VAULT_ID = "22222222-2222-4222-8222-222222222222";
 const STORE_ID = "33333333-3333-4333-8333-333333333333";
 const WORKSPACE_ID = "build-artifact-smoke-workspace";
+const FROZEN_0002_SHA256 = "68B4039048A359C523B7842F6D17BAA5760E9760D2B4E9F80BB8A48DC339EB06";
+const FROZEN_0002_SQL_SHA256 = "85666a0bdee4455068f03a81e9d3720df172d15fce6d8e6f0cb3f5f7d0a81293";
+const FROZEN_SCHEMA_TWO_READER_SHA256 = "570c7130332e89ce55891c72fc1d97b87d8a5c55fb4dfa59f46247b802a90d1a";
+const OLD_SCHEMA_TWO_READER_SOURCE = `
+const { parentPort, workerData } = require("node:worker_threads");
+const { DatabaseSync } = require("node:sqlite");
+const database = new DatabaseSync(workerData.eventsPath, { readOnly: true });
+let decodeInvocations = 0;
+try {
+  const versions = database.prepare("SELECT version FROM schema_migrations ORDER BY version").all();
+  if (versions.some((row) => Number(row.version) > 2)) {
+    parentPort.postMessage({ code: "SCHEMA_TOO_NEW", decodeInvocations });
+  } else {
+    for (const event of database.prepare("SELECT event_type, event_schema_version FROM events").all()) {
+      decodeInvocations += 1;
+      void event;
+    }
+    parentPort.postMessage({ code: "OK", decodeInvocations });
+  }
+} finally {
+  database.close();
+}
+`;
 
 function parseStableVersion(value, label) {
   const match = /^(\d+)\.(\d+)\.(\d+)$/.exec(value);
@@ -114,6 +137,93 @@ function decodeClose(value) {
   const closed = exact(value, ["closed"], "close response");
   if (closed.closed !== true) throw new Error("Worker did not acknowledge close");
   return closed;
+}
+
+function responseEnvelope(value, id) {
+  const response = record(value, "worker response");
+  if (response.id !== id || typeof response.ok !== "boolean") {
+    throw new Error("Worker returned an unexpected response envelope");
+  }
+  return response;
+}
+
+function workerRequest(worker, message) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`Worker ${message.type} request timed out`)), REQUEST_TIMEOUT_MS);
+    const finish = (callback, value) => {
+      clearTimeout(timer);
+      worker.off("message", onMessage);
+      worker.off("messageerror", onMessageError);
+      worker.off("error", onError);
+      callback(value);
+    };
+    const onMessage = (value) => {
+      try {
+        const response = responseEnvelope(value, message.id);
+        finish(resolve, response);
+      } catch (error) {
+        if (typeof value === "object" && value !== null && value.type === "upgrade-quiesce-required") return;
+        finish(reject, error);
+      }
+    };
+    const onMessageError = () => finish(reject, new Error("Worker emitted an unreadable message"));
+    const onError = (error) => finish(reject, error);
+    worker.on("message", onMessage);
+    worker.on("messageerror", onMessageError);
+    worker.on("error", onError);
+    worker.postMessage(message);
+  });
+}
+
+function lifecycleRecoveryProbe() {
+  return {
+    kind: "fenced",
+    operation: "workflow-recovery",
+    input: {
+      operation: "workflow-recovery",
+      workId: "smoke-recovery-scan",
+      ownerId: "smoke-worker",
+      fencingToken: "1",
+      dueBefore: "2026-07-17T00:00:00.000Z",
+      limit: 1,
+    },
+  };
+}
+
+function lifecycleRowCounts(eventsPath) {
+  const database = new DatabaseSync(eventsPath, { readOnly: true });
+  try {
+    return {
+      event_count: Number(database.prepare("SELECT count(*) AS count FROM events").get()?.count),
+      dedup_count: Number(database.prepare("SELECT count(*) AS count FROM command_dedup").get()?.count),
+      workflow_count: Number(database.prepare("SELECT count(*) AS count FROM workflow_instances").get()?.count),
+    };
+  } finally {
+    database.close();
+  }
+}
+
+async function assertOldSchemaTwoReaderRejectsBeforeEventDecode(eventsPath) {
+  const sourceHash = createHash("sha256").update(OLD_SCHEMA_TWO_READER_SOURCE, "utf8").digest("hex");
+  if (sourceHash !== FROZEN_SCHEMA_TWO_READER_SHA256) {
+    throw new Error("Frozen schema-2 reader fixture checksum changed");
+  }
+  const reader = new Worker(OLD_SCHEMA_TWO_READER_SOURCE, {
+    eval: true,
+    workerData: { eventsPath },
+  });
+  try {
+    const result = await new Promise((resolve, reject) => {
+      reader.once("message", resolve);
+      reader.once("error", reject);
+      reader.once("messageerror", () => reject(new Error("Old schema-2 reader emitted unreadable output")));
+    });
+    if (result?.code !== "SCHEMA_TOO_NEW" || result.decodeInvocations !== 0) {
+      throw new Error("Old schema-2 reader must report SCHEMA_TOO_NEW before lifecycle-event decoding");
+    }
+  } finally {
+    await reader.terminate().catch(() => undefined);
+  }
 }
 
 function canonicalJson(value) {
@@ -250,8 +360,8 @@ function decodeUpgrade(value) {
   );
   if (
     !Array.isArray(result.appliedVersions)
-    || JSON.stringify(result.appliedVersions) !== "[2,3,4]"
-  ) throw new Error("Bundled upgrade did not apply pending Versions 2, 3, and 4 exactly once");
+    || JSON.stringify(result.appliedVersions) !== "[2,3,4,5]"
+  ) throw new Error("Bundled upgrade did not apply pending Versions 2 through 5 exactly once");
   const integrity = record(result.integrity, "upgrade integrity");
   if (integrity.ok !== true) throw new Error("Bundled upgrade integrity did not pass");
   return result;
@@ -311,14 +421,27 @@ async function smokeBundledUpgrade() {
       const versions = database.prepare(
         "SELECT version FROM schema_migrations ORDER BY version",
       ).all().map((row) => Number(row.version));
-      if (JSON.stringify(versions) !== "[1,2,3,4]") {
+      if (JSON.stringify(versions) !== "[1,2,3,4,5]") {
         throw new Error(`Bundled upgrade recorded unexpected migrations ${JSON.stringify(versions)}`);
       }
       const schemaVersion = Number(database.prepare(`
         SELECT schema_version FROM project_meta WHERE singleton = 1
       `).get()?.schema_version);
-      if (schemaVersion !== 4) {
+      if (schemaVersion !== 5) {
         throw new Error(`Bundled upgrade recorded schema version ${schemaVersion}`);
+      }
+      const migration0002 = database.prepare(
+        "SELECT checksum FROM schema_migrations WHERE version = 2",
+      ).get()?.checksum;
+      const frozenMigration0002 = createHash("sha256").update(readFileSync(
+        new URL("../src/orchestrator/storage/migrations/0002-session-lifecycle.ts", import.meta.url),
+        "utf8",
+      ).replace(/\r\n?/g, "\n"), "utf8").digest("hex").toUpperCase();
+      if (
+        frozenMigration0002 !== FROZEN_0002_SHA256
+        || migration0002 !== FROZEN_0002_SQL_SHA256
+      ) {
+        throw new Error("Bundled upgrade changed frozen migration 0002 checksum");
       }
     } finally {
       database.close();
@@ -326,6 +449,51 @@ async function smokeBundledUpgrade() {
     const manifest = JSON.parse(readFileSync(fixture.manifestPath, "utf8"));
     if (manifest.lastIntegrity?.status !== "passed") {
       throw new Error("Bundled upgrade did not publish the integrity manifest");
+    }
+    if (manifest.schemaVersion !== 1) {
+      throw new Error("Bundled upgrade did not preserve manifest format version 1");
+    }
+    await assertOldSchemaTwoReaderRejectsBeforeEventDecode(fixture.eventsPath);
+
+    const storeWorker = new Worker(WORKER_URL, {
+      workerData: {
+        role: "store",
+        executorLeaseMs: 15_000,
+        heartbeatIntervalMs: 5_000,
+        appendRetryDeadlineMs: 15_000,
+      },
+    });
+    try {
+      const opened = await workerRequest(storeWorker, {
+        id: "smoke-disabled-open",
+        type: "open",
+        binding: fixture.binding,
+      });
+      if (opened.ok !== true) throw new Error("Worker open failed before disabled lifecycle probe");
+      const before = lifecycleRowCounts(fixture.eventsPath);
+      const lifecycle = await workerRequest(storeWorker, {
+        id: "smoke-disabled-lifecycle",
+        type: "lifecycle",
+        binding: {
+          projectId: fixture.binding.projectId,
+          vaultId: fixture.binding.vaultId,
+          storeId: fixture.binding.storeId,
+          bindingGeneration: fixture.binding.bindingGeneration,
+          contextFingerprint: fixture.binding.contextFingerprint,
+        },
+        operation: lifecycleRecoveryProbe(),
+      });
+      if (lifecycle.ok !== false || lifecycle.error?.code !== "LIFECYCLE_V2_DISABLED") {
+        throw new Error("Production lifecycle V2 must remain disabled");
+      }
+      const after = lifecycleRowCounts(fixture.eventsPath);
+      if (JSON.stringify(before) !== JSON.stringify(after)) {
+        throw new Error("Disabled lifecycle probe had non-zero lifecycle event/dedup/workflow effect");
+      }
+      const closed = await workerRequest(storeWorker, { id: "smoke-disabled-close", type: "close" });
+      if (closed.ok !== true) throw new Error("Worker close failed after disabled lifecycle probe");
+    } finally {
+      await storeWorker.terminate().catch(() => undefined);
     }
   } finally {
     await worker.terminate().catch(() => undefined);
