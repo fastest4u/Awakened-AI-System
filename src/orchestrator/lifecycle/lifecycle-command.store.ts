@@ -59,6 +59,7 @@ import {
 import { LifecycleError } from "./errors.js";
 import {
   NO_LIFECYCLE_FAULTS,
+  type LifecycleDurableBoundary,
   type LifecycleFaultContext,
   type LifecycleFaultInjector,
 } from "./lifecycle-faults.js";
@@ -1969,6 +1970,71 @@ function lifecycleFaultContext(command: LifecycleCommandEnvelope): LifecycleFaul
   });
 }
 
+function semanticActionName(
+  command: LifecycleCommandEnvelope["semanticCommand"],
+): string | null {
+  const candidate = command as unknown as Readonly<Record<string, unknown>>;
+  const action = candidate.action;
+  if (typeof action !== "object" || action === null || Array.isArray(action)) return null;
+  const descriptor = Reflect.getOwnPropertyDescriptor(action, "action");
+  return descriptor !== undefined && "value" in descriptor && typeof descriptor.value === "string"
+    ? descriptor.value
+    : null;
+}
+
+/**
+ * Logical aliases whose commit boundary is owned by this outer transaction.
+ * Physical repository sub-boundaries remain classified at their exact owners.
+ */
+export function lifecycleSemanticFaultBoundaries(
+  command: LifecycleCommandEnvelope["semanticCommand"],
+): readonly LifecycleDurableBoundary[] {
+  const boundaries: LifecycleDurableBoundary[] = ["event-append"];
+  switch (command.commandType) {
+    case "root-resume":
+    case "claim-child-transfer":
+      boundaries.push("generation-fence");
+      break;
+    case "root-recovery":
+      boundaries.push("ownership-recovery", "generation-fence");
+      break;
+    case "root-suspend":
+      boundaries.push("session-suspend");
+      break;
+    case "request-session-end":
+      boundaries.push("workflow-create");
+      break;
+    case "cancel-session-end":
+      boundaries.push("cancellation-rewrite");
+      break;
+    case "abandon-session":
+      boundaries.push("abandonment-rewrite");
+      break;
+    case "internal-validation-result":
+      boundaries.push("validation-result");
+      break;
+    case "internal-workflow-phase": {
+      boundaries.push("workflow-phase");
+      const action = semanticActionName(command);
+      if (action === "record-final-checkpoint-and-queue-ending") {
+        boundaries.push("final-checkpoint", "outbox-insert");
+      } else if (
+        action === "record-verification-passed"
+        || action === "record-verification-failed"
+        || action === "invalidate-verification"
+      ) {
+        boundaries.push("verification-event");
+      } else if (action === "append-terminal-completion") {
+        boundaries.push("final-source-state-check", "session-ended");
+      } else if (action === "abandon-root" || action === "abandon-generation") {
+        boundaries.push("abandonment-rewrite");
+      }
+      break;
+    }
+  }
+  return Object.freeze(boundaries);
+}
+
 export class LifecycleCommandStore {
   readonly #connection: SqliteConnection;
   readonly #events: LifecycleEventAppendPort;
@@ -2096,6 +2162,9 @@ export class LifecycleCommandStore {
             commandType: next.resolvedSemanticCommand.commandType,
           });
       assertEnvelope(resolvedEnvelope);
+      const semanticFaultBoundaries = lifecycleSemanticFaultBoundaries(
+        resolvedEnvelope.semanticCommand,
+      );
       const authorizationFingerprint = integrityFingerprint(next.authorizationRecord);
       assertAppendIdentity(resolvedEnvelope, next);
       freshIntegrity.assertRegistered(
@@ -2153,6 +2222,13 @@ export class LifecycleCommandStore {
         ...faultContext,
         eventPosition: committed.storedResponse.lastGlobalPosition,
       }));
+      for (const boundary of semanticFaultBoundaries) {
+        if (boundary === "event-append") continue;
+        this.#faults.hit(boundary, "after-commit-before-response", Object.freeze({
+          ...faultContext,
+          eventPosition: committed.storedResponse.lastGlobalPosition,
+        }));
+      }
       const appendResult = this.#events.result(committed);
       return {
         deduplicated: false,

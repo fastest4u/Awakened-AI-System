@@ -448,7 +448,7 @@ function undefinedCallbackResult(
 }
 
 function operationalFaultBoundary(work: LifecycleOperationalWorkIdentity): LifecycleDurableBoundary {
-  if (work.kind === "workflow-recovery") return "ownership-recovery";
+  if (work.kind === "workflow-recovery") return "workflow-phase";
   if (work.kind === "workflow" || work.kind === "workflow-selection") return "workflow-phase";
   if (work.kind === "outbox-selection") return "outbox-claim";
   switch (work.operation) {
@@ -666,7 +666,9 @@ export class LifecycleOperationalStore {
     try {
       this.#connection.exec("BEGIN IMMEDIATE");
       transactionBegan = true;
-      this.#faults.hit(faultBoundary, "before-write", faultContext);
+      if (workSnapshot.kind !== "outbox" || workSnapshot.operation !== "materialize") {
+        this.#faults.hit(faultBoundary, "before-write", faultContext);
+      }
       const repositories = this.#decorateTransaction(
         this.#transaction(this.#connection),
         this.#connection,
@@ -688,7 +690,9 @@ export class LifecycleOperationalStore {
         onCurrent,
         immutableOperationalSnapshot,
       );
-      this.#faults.hit(faultBoundary, "after-write-before-commit", faultContext);
+      if (workSnapshot.kind !== "outbox" || workSnapshot.operation !== "materialize") {
+        this.#faults.hit(faultBoundary, "after-write-before-commit", faultContext);
+      }
       commitAttempted = true;
       try {
         this.#connection.exec("COMMIT");

@@ -18,6 +18,7 @@ import type {
 import type { ProjectContext } from "../src/orchestrator/identity/contracts.js";
 import {
   connectionBoundEvidenceCoverage,
+  lifecycleSemanticFaultBoundaries,
   LifecycleCommandStore,
   LifecycleCommandStoreError,
   type LifecycleCommandEnvelope,
@@ -570,6 +571,30 @@ function isLifecycleInputInvalid(error: unknown): boolean {
 }
 
 describe("LifecycleCommandStore", () => {
+  it("classifies semantic inner milestones without replacing event append", () => {
+    const classify = (commandType: string, action?: string) => lifecycleSemanticFaultBoundaries({
+      commandType,
+      ...(action === undefined ? {} : { action: { action } }),
+    } as never);
+
+    assert.deepEqual(classify("request-session-end"), ["event-append", "workflow-create"]);
+    assert.deepEqual(classify("cancel-session-end"), ["event-append", "cancellation-rewrite"]);
+    assert.deepEqual(classify("abandon-session"), ["event-append", "abandonment-rewrite"]);
+    assert.deepEqual(classify("internal-validation-result"), ["event-append", "validation-result"]);
+    assert.deepEqual(classify(
+      "internal-workflow-phase",
+      "record-final-checkpoint-and-queue-ending",
+    ), ["event-append", "workflow-phase", "final-checkpoint", "outbox-insert"]);
+    assert.deepEqual(classify(
+      "internal-workflow-phase",
+      "record-verification-passed",
+    ), ["event-append", "workflow-phase", "verification-event"]);
+    assert.deepEqual(classify(
+      "internal-workflow-phase",
+      "append-terminal-completion",
+    ), ["event-append", "workflow-phase", "final-source-state-check", "session-ended"]);
+  });
+
   it("treats only Version 3 checkpoint markers as frozen final state", () => {
     const connection = new FrozenWorkflowProbeConnection();
     const coverage = connectionBoundEvidenceCoverage(connection, {} as never);
@@ -674,6 +699,35 @@ describe("LifecycleCommandStore", () => {
     assert.equal(hits[0]?.commandId, SEMANTIC_COMMAND.commandId);
     assert.deepEqual(connection.committed, []);
     assert.deepEqual(connection.statements.slice(-2), ["BEGIN IMMEDIATE", "ROLLBACK"]);
+  });
+
+  it("dispatches logical aliases only at the outer post-commit boundary", () => {
+    const connection = new TransactionConnection();
+    const events = new FakeEvents(connection);
+    const hits: string[] = [];
+    const store = new LifecycleCommandStore({
+      connection,
+      events,
+      projectionWriter: recordingProjectionWriter(),
+      transaction: () => transaction(connection),
+      now: () => NOW,
+      faultInjector: {
+        hit(boundary, point): void { hits.push(`${boundary}/${point}`); },
+      },
+    });
+
+    store.execute(envelope(), () => ({
+      append: appendCommand(),
+      authorizationRecord: authorization(),
+      afterAppend: () => undefined,
+    }));
+
+    assert.deepEqual(hits, [
+      "event-append/before-write",
+      "event-append/after-write-before-commit",
+      "event-append/after-commit-before-response",
+      "generation-fence/after-commit-before-response",
+    ]);
   });
 
   it("lifecycle command replay performs no projection write", () => {

@@ -135,6 +135,52 @@ describe("LifecycleOperationalStore", () => {
     assert.deepEqual(connection.statements, ["BEGIN IMMEDIATE", "ROLLBACK"]);
   });
 
+  it("classifies workflow recovery as a workflow phase transaction", () => {
+    const connection = new OperationalConnection();
+    const boundaries: string[] = [];
+    const store = new LifecycleOperationalStore({
+      connection,
+      transaction: () => transaction(connection),
+      faultInjector: {
+        hit(boundary): void { boundaries.push(boundary); },
+      },
+    });
+
+    store.execute({
+      kind: "workflow-recovery",
+      projectId: work().projectId,
+      workId: "workflow-recovery-1",
+      operation: "recovery",
+      ownerId: "coordinator-a",
+      claimToken: 1n,
+    }, () => null);
+
+    assert.deepEqual(boundaries, ["workflow-phase", "workflow-phase", "workflow-phase"]);
+  });
+
+  it("leaves materialization pre-commit fault ownership inside byte reconciliation", () => {
+    const connection = new OperationalConnection();
+    const order: string[] = [];
+    const store = new LifecycleOperationalStore({
+      connection,
+      transaction: () => transaction(connection),
+      faultInjector: {
+        hit(boundary, point): void { order.push(`${boundary}/${point}`); },
+      },
+    });
+
+    store.execute(outboxWork(), (received) => {
+      order.push("reconcile-bytes");
+      stage(received.outbox, "materialize-and-ack");
+      return null;
+    });
+
+    assert.deepEqual(order, [
+      "reconcile-bytes",
+      "materialization-ack/after-commit-before-response",
+    ]);
+  });
+
   it("preserves claim-next identities before a target row exists", () => {
     const connection = new OperationalConnection();
     const store = new LifecycleOperationalStore({

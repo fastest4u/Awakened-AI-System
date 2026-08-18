@@ -6,7 +6,9 @@ import type {
   WorkflowId,
 } from "../src/orchestrator/lifecycle/contracts/identifiers.js";
 import {
+  LIFECYCLE_FAULT_POINTS_BY_BOUNDARY,
   NO_LIFECYCLE_FAULTS,
+  selectLifecycleFault,
   type LifecycleDurableBoundary,
   type LifecycleExternalFaultPoint,
   type LifecycleFilesystemFaultPoint,
@@ -100,6 +102,76 @@ const context: LifecycleFaultContext = {
 };
 
 describe("lifecycle fault contract", () => {
+  it("publishes the exact immutable Task 18 fault matrix for all 24 boundaries", () => {
+    const sqlite = [
+      "before-write",
+      "after-write-before-commit",
+      "after-commit-before-response",
+    ] as const;
+    assert.deepEqual(LIFECYCLE_FAULT_POINTS_BY_BOUNDARY, {
+      "authority-cas": sqlite,
+      "event-append": sqlite,
+      "lease-update": sqlite,
+      "workflow-create": sqlite,
+      "workflow-phase": sqlite,
+      "final-checkpoint": sqlite,
+      "validation-result": [
+        "before-external-start",
+        "after-external-complete-before-result-commit",
+        ...sqlite,
+      ],
+      "final-source-state-check": sqlite,
+      "outbox-insert": sqlite,
+      "outbox-claim": sqlite,
+      "temporary-file-write": [
+        "before-temp-write",
+        "after-temp-fsync-before-replace",
+      ],
+      "artifact-replace": ["after-replace-before-ack"],
+      "materialization-ack": [
+        "before-write",
+        "after-write-before-commit",
+        "after-replace-before-ack",
+        "after-commit-before-response",
+      ],
+      "outbox-failure": sqlite,
+      "session-suspend": sqlite,
+      "transfer-create": sqlite,
+      "transfer-claim": sqlite,
+      "ownership-recovery": sqlite,
+      "generation-fence": sqlite,
+      "cancellation-rewrite": sqlite,
+      "abandonment-rewrite": sqlite,
+      "verification-event": sqlite,
+      "session-ended": sqlite,
+      "response-delivery": ["after-commit-before-response"],
+    });
+    assert.equal(Object.keys(LIFECYCLE_FAULT_POINTS_BY_BOUNDARY).length, 24);
+    assert.equal(Object.isFrozen(LIFECYCLE_FAULT_POINTS_BY_BOUNDARY), true);
+    for (const points of Object.values(LIFECYCLE_FAULT_POINTS_BY_BOUNDARY)) {
+      assert.equal(Object.isFrozen(points), true);
+    }
+  });
+
+  it("strict-selects only an authoritative boundary and point pair at arm time", () => {
+    assert.deepEqual(
+      selectLifecycleFault("validation-result", "before-external-start"),
+      { boundary: "validation-result", point: "before-external-start" },
+    );
+    assert.equal(
+      Object.isFrozen(selectLifecycleFault("event-append", "before-write")),
+      true,
+    );
+    assert.throws(
+      () => selectLifecycleFault("not-a-boundary", "before-write"),
+      /LIFECYCLE_FAULT_SELECTION_INVALID/,
+    );
+    assert.throws(
+      () => selectLifecycleFault("artifact-replace", "before-write"),
+      /LIFECYCLE_FAULT_SELECTION_INVALID/,
+    );
+  });
+
   it("exports the exact fault points, boundaries, context, and injector shape", () => {
     assert.equal(typeof NO_LIFECYCLE_FAULTS.hit, "function");
     assert.equal(
