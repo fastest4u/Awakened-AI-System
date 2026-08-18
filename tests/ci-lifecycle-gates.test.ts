@@ -35,43 +35,108 @@ function workflowJobs(yaml: string): ReadonlyMap<string, string> {
 interface WorkflowStep {
   readonly name: string | null;
   readonly body: string;
+  readonly ownerJob: string;
 }
 
-function workflowSteps(job: string): readonly WorkflowStep[] {
+function normalizeYamlScalar(raw: string): string {
+  let value = raw.trim();
+  if (value.startsWith('"') && value.endsWith('"')) value = JSON.parse(value) as string;
+  else if (value.startsWith("'") && value.endsWith("'")) value = value.slice(1, -1).replace(/''/g, "'");
+  else value = value.replace(/\s+#.*$/, "");
+  const expression = /^\$\{\{\s*([\s\S]*?)\s*\}\}$/.exec(value);
+  return expression?.[1]?.trim() ?? value;
+}
+
+function yamlScalar(block: string, key: string): string | null {
+  const match = new RegExp(`(?:^|\\n)\\s*${key}:\\s*(.+)$`, "m").exec(block);
+  return match === null ? null : normalizeYamlScalar(match[1]!);
+}
+
+function workflowSteps(job: string, ownerJob = "unknown"): readonly WorkflowStep[] {
   return [...job.matchAll(/^      -(?<first>[^\n]*)(?:\n|$)(?<rest>[\s\S]*?)(?=^      -|^  [a-z][a-z0-9_-]*:|(?![\s\S]))/gm)]
     .map((match) => {
       const first = match.groups?.first ?? "";
-      const name = /^ name: (.+)$/.exec(first)?.[1] ?? null;
-      return { name, body: `${first}\n${match.groups?.rest ?? ""}` };
+      const name = /^ name: (.+)$/.exec(first)?.[1];
+      return {
+        name: name === undefined ? null : normalizeYamlScalar(name),
+        body: `${first}\n${match.groups?.rest ?? ""}`,
+        ownerJob,
+      };
     });
 }
 
-function assertReachable(block: string, label: string): void {
-  assert.doesNotMatch(
-    block,
-    /^\s*if:\s*(?:false|(?:always\(\)\s*&&\s*)?false|\$\{\{[^\n}]*?(?:\bfalse\b|\b0\b|1\s*==\s*2)[^\n}]*?\}\})\s*(?:#.*)?$/mi,
-    `${label} must not be disabled`,
-  );
+function assertNoJobIf(job: string, label: string): void {
+  assert.doesNotMatch(job, /^    if:\s*/m, `${label} must not declare if`);
 }
 
 function requiredStep(job: string, name: string): WorkflowStep {
   const step = workflowSteps(job).find((candidate) => candidate.name === name);
   assert.ok(step, `missing executable ${name} step`);
-  assertReachable(step.body, name);
+  assert.equal(yamlScalar(step.body, "if"), null, `${name} must not declare if`);
   return step;
 }
 
-function workflowActions(job: string): readonly {
+function workflowActions(job: string, ownerJob: string): readonly {
   readonly step: WorkflowStep;
   readonly uses: string;
   readonly withPath: string | null;
 }[] {
-  return workflowSteps(job).flatMap((step) => [...step.body.matchAll(/(?:^|\n)\s*uses:\s*([^\s#]+)/g)]
+  return workflowSteps(job, ownerJob).flatMap((step) => [...step.body.matchAll(/(?:^|\n)\s*uses:\s*(.+)$/gm)]
     .map((match) => ({
       step,
-      uses: match[1]!,
-      withPath: /^\s*path:\s*(.+)$/mi.exec(step.body)?.[1] ?? null,
+      uses: normalizeYamlScalar(match[1]!),
+      withPath: yamlScalar(step.body, "path"),
     })));
+}
+
+function assertWorkflowReleaseContract(ci: string, stress: string): void {
+  const ciJobs = workflowJobs(ci);
+  const stressJobs = workflowJobs(stress);
+  const releaseGates = ciJobs.get("release-gates");
+  const minimumRuntime = ciJobs.get("minimum-runtime-rejection");
+  const stressJob = stressJobs.get("stress");
+  assert.ok(releaseGates, "CI must have a release-gates job");
+  assert.ok(minimumRuntime, "CI must retain the minimum-runtime rejection job");
+  assert.ok(stressJob, "stress workflow must have a stress job");
+  assertNoJobIf(releaseGates!, "release-gates job");
+  assertNoJobIf(minimumRuntime!, "minimum-runtime-rejection job");
+  assertNoJobIf(stressJob!, "stress job");
+  const checkouts = [...ciJobs.entries(), ...stressJobs.entries()]
+    .flatMap(([ownerJob, job]) => workflowSteps(job, ownerJob))
+    .filter((step) => step.name === "Check out repository");
+  assert.equal(checkouts.length, 3, "every checkout site must be explicit");
+  for (const checkout of checkouts) {
+    assert.equal(yamlScalar(checkout.body, "if"), null, "checkout must not declare if");
+    assert.equal(yamlScalar(checkout.body, "uses"), "actions/checkout@v6");
+    assert.equal(yamlScalar(checkout.body, "fetch-depth"), "0");
+  }
+  assert.equal(yamlScalar(requiredStep(releaseGates!, "Run lifecycle release gates").body, "run"), "npm run test:subproject-2");
+  assert.equal(yamlScalar(requiredStep(releaseGates!, "Require immutable lifecycle base commit").body, "run"), `git cat-file -e "${BASE}^{commit}"`);
+  assert.equal(yamlScalar(requiredStep(releaseGates!, "Protect Version 1 production routing").body, "run"), `git diff --exit-code ${BASE} -- src/app.ts src/index.ts src/controllers src/schemas src/services`);
+  assert.equal(yamlScalar(requiredStep(releaseGates!, "Build").body, "run"), "npm run build");
+  assert.equal(yamlScalar(requiredStep(releaseGates!, "Test build artifacts").body, "run"), "npm run test:build-artifacts");
+  assert.equal(workflowSteps(minimumRuntime!).filter((step) => step.name === "Check out repository").length, 1);
+  assert.match(stressJob!, /max-parallel: 1/);
+  assert.match(requiredStep(stressJob!, "Run default and lifecycle concurrent, crash, and security tests").body, /event-store\.concurrent\.test\.js.*event-store\.crash\.test\.js.*lifecycle\.concurrent\.test\.js.*lifecycle\.crash\.test\.js.*lifecycle\.security\.test\.js/s);
+  assert.match(requiredStep(stressJob!, "Run release stress test").body, /npm run test:stress/);
+  assert.match(requiredStep(stressJob!, "Run lifecycle stress test").body, /npm run test:lifecycle-stress/);
+  const actions = [...ciJobs.entries(), ...stressJobs.entries()]
+    .flatMap(([ownerJob, job]) => workflowActions(job, ownerJob));
+  for (const action of actions) {
+    assert.ok(action.uses.length > 0, "workflow action must have a non-empty uses scalar");
+    if (action.withPath !== null) {
+      assert.doesNotMatch(action.withPath, /\*\.sqlite\*|\.memory-mcp|pending[-_ ]?(authorization|credential)|\.md\b/i);
+    }
+  }
+  const uploads = actions.filter((action) => action.uses.startsWith("actions/upload-artifact@"));
+  assert.equal(uploads.length, 1, "exactly one upload-artifact v7 step is allowed");
+  const [upload] = uploads;
+  assert.equal(upload?.step.ownerJob, "stress", "upload artifact must belong to stress");
+  assert.equal(upload?.uses, "actions/upload-artifact@v7");
+  assert.equal(yamlScalar(upload?.step.body ?? "", "if"), "always()", "upload must use exact always() reachability");
+  assert.equal(upload?.withPath, "ci-logs/sqlite-stress-${{ matrix.os }}.log");
+  assert.match(upload?.step.body ?? "", /retention-days: 14/);
+  assert.doesNotMatch(upload?.withPath ?? "", /\*\.sqlite\*|\.memory-mcp|pending[-_ ]?(authorization|credential)|\.md\b/i);
 }
 
 test("release configuration gates lifecycle V2 without production routing", () => {
@@ -89,51 +154,7 @@ test("release configuration gates lifecycle V2 without production routing", () =
 
   const ci = source(".github/workflows/ci.yml");
   const stress = source(".github/workflows/sqlite-stress.yml");
-  const ciJobs = workflowJobs(ci);
-  const stressJobs = workflowJobs(stress);
-  const releaseGates = ciJobs.get("release-gates");
-  const minimumRuntime = ciJobs.get("minimum-runtime-rejection");
-  const stressJob = stressJobs.get("stress");
-  assert.ok(releaseGates, "CI must have a release-gates job");
-  assert.ok(minimumRuntime, "CI must retain the minimum-runtime rejection job");
-  assert.ok(stressJob, "stress workflow must have a stress job");
-  assertReachable(releaseGates!, "release-gates job");
-  assertReachable(minimumRuntime!, "minimum-runtime-rejection job");
-  assertReachable(stressJob!, "stress job");
-  const checkouts = [...ciJobs.values(), ...stressJobs.values()]
-    .flatMap(workflowSteps)
-    .filter((step) => step.name === "Check out repository");
-  assert.equal(checkouts.length, 3, "every checkout site must be explicit");
-  for (const checkout of checkouts) {
-    assert.match(checkout.body, /uses: actions\/checkout@v6\n        with:\n          fetch-depth: 0/);
-  }
-  assert.match(requiredStep(releaseGates!, "Run lifecycle release gates").body, /run: npm run test:subproject-2/);
-  assert.match(requiredStep(releaseGates!, "Require immutable lifecycle base commit").body, new RegExp(`run: git cat-file -e "${BASE}\\^\\{commit\\}"`));
-  assert.match(requiredStep(releaseGates!, "Protect Version 1 production routing").body, new RegExp(`run: git diff --exit-code ${BASE} -- src/app\\.ts src/index\\.ts src/controllers src/schemas src/services`));
-  assert.match(requiredStep(releaseGates!, "Build").body, /run: npm run build/);
-  assert.match(requiredStep(releaseGates!, "Test build artifacts").body, /run: npm run test:build-artifacts/);
-  assert.equal(workflowSteps(minimumRuntime!).filter((step) => step.name === "Check out repository").length, 1);
-  assert.match(stressJob!, /max-parallel: 1/);
-  assert.match(requiredStep(stressJob!, "Run default and lifecycle concurrent, crash, and security tests").body, /event-store\.concurrent\.test\.js.*event-store\.crash\.test\.js.*lifecycle\.concurrent\.test\.js.*lifecycle\.crash\.test\.js.*lifecycle\.security\.test\.js/s);
-  assert.match(requiredStep(stressJob!, "Run release stress test").body, /npm run test:stress/);
-  assert.match(requiredStep(stressJob!, "Run lifecycle stress test").body, /npm run test:lifecycle-stress/);
-  const actions = [...ciJobs.values(), ...stressJobs.values()].flatMap(workflowActions);
-  for (const action of actions) {
-    assert.ok(action.uses.length > 0, "workflow action must have an executable uses value");
-    if (action.withPath !== null) {
-      assert.doesNotMatch(action.withPath, /\*\.sqlite\*|\.memory-mcp|pending[-_ ]?(authorization|credential)|\.md\b/i);
-    }
-  }
-  const uploads = actions
-    .filter((action) => action.uses.startsWith("actions/upload-artifact@"));
-  assert.equal(uploads.length, 1, "only the stress job may upload an artifact");
-  const [upload] = uploads;
-  assert.equal(upload?.step.name, "Upload stress logs");
-  assert.equal(upload?.uses, "actions/upload-artifact@v7");
-  const uploadPath = upload?.withPath;
-  assert.equal(uploadPath, "ci-logs/sqlite-stress-${{ matrix.os }}.log");
-  assert.match(upload?.step.body ?? "", /retention-days: 14/);
-  assert.doesNotMatch(uploadPath ?? "", /\*\.sqlite\*|\.memory-mcp|pending[-_ ]?(authorization|credential)|\.md\b/i);
+  assertWorkflowReleaseContract(ci, stress);
 
   const smoke = source("scripts/smoke-worker.js");
   assert.match(smoke, /\[1,2,3,4,5\]/);
@@ -158,4 +179,43 @@ test("release configuration gates lifecycle V2 without production routing", () =
   assert.match(smoke, /LIFECYCLE_V2_DISABLED/);
   assert.match(smoke, /zero lifecycle event\/dedup\/workflow effect/);
   assert.match(smoke, /event_count.*dedup_count.*workflow_count/s);
+});
+
+test("workflow parser closes conditional, scalar, and upload-owner bypasses", () => {
+  const ci = source(".github/workflows/ci.yml");
+  const stress = source(".github/workflows/sqlite-stress.yml");
+  assert.throws(
+    () => assertWorkflowReleaseContract(
+      ci.replace("  release-gates:\n", "  release-gates:\n    if: ${{ !true }}\n"),
+      stress,
+    ),
+    /release-gates job must not declare if/,
+  );
+
+  const quotedUnnamedUpload = stress.replace(
+    "      - name: Upload stress logs\n        if: ${{ always() }}\n        uses: actions/upload-artifact@v7",
+    "      - uses: \"actions/upload-artifact@v7\"\n        if: '${{ always() }}'",
+  );
+  assert.doesNotThrow(() => assertWorkflowReleaseContract(ci, quotedUnnamedUpload));
+
+  const uploadBlock = [
+    "      - uses: actions/upload-artifact@v7",
+    "        if: ${{ always() }}",
+    "        with:",
+    "          path: ci-logs/sqlite-stress-${{ matrix.os }}.log",
+    "          retention-days: 14",
+  ].join("\n");
+  assert.throws(
+    () => assertWorkflowReleaseContract(
+      ci.replace("\n  minimum-runtime-rejection:", `\n${uploadBlock}\n\n  minimum-runtime-rejection:`),
+      stress.replace(/\n      - name: Upload stress logs[\s\S]*$/m, "\n"),
+    ),
+    /upload artifact must belong to stress/,
+  );
+
+  const extraUploader = stress.replace(
+    "      - name: Upload stress logs",
+    `${uploadBlock.replace("actions/upload-artifact@v7", "actions/upload-artifact@v6")}\n\n      - name: Upload stress logs`,
+  );
+  assert.throws(() => assertWorkflowReleaseContract(ci, extraUploader), /exactly one upload-artifact/);
 });
