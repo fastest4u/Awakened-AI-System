@@ -25,6 +25,15 @@ const FOCUSED_TESTS = [
   "lifecycle-fixture-protocol", "lifecycle-worker-runtime", "lifecycle.stress",
 ];
 
+const PLAIN_WORKFLOW_KEY = "[A-Za-z][A-Za-z0-9_-]*";
+const PLAIN_MAPPING_LINE = new RegExp(`^ *${PLAIN_WORKFLOW_KEY}:(?: .*)?$`);
+const PLAIN_LIST_MAPPING_LINE = new RegExp(`^ *- ${PLAIN_WORKFLOW_KEY}:(?: .*)?$`);
+const PLAIN_SCALAR_LIST_ITEM = /^ *- (?![?&*!|>{[\],])\S(?:.*\S)?$/;
+
+function isPermittedRunBlockHeader(line: string): boolean {
+  return /^ *run: \|(?:\s+#.*)?$/.test(line);
+}
+
 function structuralWorkflowLines(yaml: string): readonly string[] {
   const structuralLines: string[] = [];
   let blockScalarIndent: number | null = null;
@@ -35,7 +44,7 @@ function structuralWorkflowLines(yaml: string): readonly string[] {
       blockScalarIndent = null;
     }
     structuralLines.push(line);
-    if (/^\s*(?:-\s+)?[A-Za-z][A-Za-z0-9_-]*:\s*[>|][+-]?(?:\s+#.*)?$/.test(line)) {
+    if (isPermittedRunBlockHeader(line)) {
       blockScalarIndent = indentation;
     }
   }
@@ -51,17 +60,34 @@ function unquotedStructuralLine(line: string): string {
 
 function assertCanonicalWorkflowGrammar(yaml: string, label: string): void {
   for (const line of structuralWorkflowLines(yaml)) {
-    if (line.trimStart().startsWith("#")) continue;
+    assert.doesNotMatch(line, /\t/, `${label} contains unsupported YAML tab`);
+    if (line.trim().length === 0 || line.trimStart().startsWith("#")) continue;
+    assert.doesNotMatch(line, /^\s*%/, `${label} contains unsupported YAML directive`);
+    assert.doesNotMatch(line, /^\s*(?:---|\.\.\.)(?:\s+#.*)?$/, `${label} contains unsupported YAML document marker`);
+    assert.doesNotMatch(line, /^\s*(?:-\s*)?\?/, `${label} contains explicit YAML key`);
+    assert.doesNotMatch(line, /^\s*(?:-\s*)?:/, `${label} contains explicit YAML value`);
     assert.doesNotMatch(
       line,
       /^\s*(?:-\s*)?(?:"(?:\\.|[^"\\])*"|'(?:''|[^'])*')\s*:/,
       `${label} contains quoted YAML mapping key`,
     );
+    if (isPermittedRunBlockHeader(line)) continue;
     const structural = unquotedStructuralLine(line);
     assert.doesNotMatch(structural, /[{}\[\]]/, `${label} contains unsupported flow-style YAML`);
     assert.doesNotMatch(structural, /(?:^|\s)<<\s*:/, `${label} contains unsupported YAML merge key`);
     assert.doesNotMatch(structural, /[&*]/, `${label} contains unsupported YAML anchor or alias`);
     assert.doesNotMatch(structural, /!/, `${label} contains unsupported YAML tag`);
+    assert.doesNotMatch(
+      structural,
+      /^\s*(?:-\s*)?[A-Za-z][A-Za-z0-9_-]*:\s*[>|]/,
+      `${label} contains unsupported YAML block scalar`,
+    );
+    assert.ok(
+      PLAIN_MAPPING_LINE.test(structural)
+        || PLAIN_LIST_MAPPING_LINE.test(structural)
+        || PLAIN_SCALAR_LIST_ITEM.test(structural),
+      `${label} contains non-canonical YAML structural line`,
+    );
   }
 }
 
@@ -314,5 +340,40 @@ test("workflow parser rejects YAML anchors, aliases, merges, and tags in structu
   ];
   for (const mutatedCi of mutations) {
     assert.throws(() => assertWorkflowReleaseContract(mutatedCi, stress), /unsupported YAML (?:anchor|alias|merge key|tag)/);
+  }
+});
+
+test("workflow parser rejects explicit YAML keys and values before reading jobs or actions", () => {
+  const ci = source(".github/workflows/ci.yml");
+  const stress = source(".github/workflows/sqlite-stress.yml");
+  const explicitCondition = ci.replace(
+    "  release-gates:\n",
+    ["  release-gates:", "    ? if", "    : ${{ !true }}", ""].join("\n"),
+  );
+  assert.throws(() => assertWorkflowReleaseContract(explicitCondition, stress), /explicit YAML key/);
+
+  const hiddenExplicitUpload = stress.replace(
+    "      - name: Upload stress logs",
+    [
+      "      ? \"uses\"",
+      "      : actions/upload-artifact@v7",
+      "",
+      "      - name: Upload stress logs",
+    ].join("\n"),
+  );
+  assert.throws(() => assertWorkflowReleaseContract(ci, hiddenExplicitUpload), /explicit YAML key/);
+});
+
+test("workflow parser rejects directives, document markers, tabs, and exotic block scalars", () => {
+  const ci = source(".github/workflows/ci.yml");
+  const stress = source(".github/workflows/sqlite-stress.yml");
+  const mutations = [
+    `%YAML 1.2\n${ci}`,
+    `---\n${ci}`,
+    ci.replace("    name: Node", "\tname: Node"),
+    ci.replace("    name: Node", "    name: >"),
+  ];
+  for (const mutatedCi of mutations) {
+    assert.throws(() => assertWorkflowReleaseContract(mutatedCi, stress), /(?:directive|document marker|tab|block scalar)/);
   }
 });
