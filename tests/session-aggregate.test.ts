@@ -1115,7 +1115,7 @@ describe("SessionAggregate", () => {
       assert.equal(transferred.state, "transferred");
     });
 
-    it("defers internal transfer V2 semantic folding to Task 14S", () => {
+    it("accepts internal transfer V2 with a newer governing checkpoint", () => {
       const suspended = suspendedChild();
       const newerCheckpointId = lifecycleUuid<CheckpointId>(618);
       const newerCheckpointPosition = suspended.eventPosition + 1n;
@@ -1131,11 +1131,12 @@ describe("SessionAggregate", () => {
         checkpointEventPosition: newerCheckpointPosition.toString(),
       }));
 
-      expectIntegrity(() => evolveSession(recheckpointed, internalTransferEventV2(
+      const transferred = evolveSession(recheckpointed, internalTransferEventV2(
         recheckpointed,
         CHECKPOINT_ID,
         newerCheckpointId,
-      )));
+      ));
+      assert.equal(transferred.state, "transferred");
     });
 
     it("enforces assignment revisions and immutable assignment identity in every allowed nonterminal state", () => {

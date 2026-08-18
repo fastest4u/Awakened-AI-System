@@ -15,6 +15,7 @@ import { deriveNonGitWorkspaceId } from "../src/orchestrator/identity/git-worksp
 import { computeProjectContextFingerprint } from "../src/orchestrator/identity/project-binding.service.js";
 import {
   AuthorityMaterialAdapter,
+  type AuthorityMaterialCompletionOptions,
   type LifecycleExecutionResult,
   type PrivateAuthorityChannel,
   type RevalidatedTrustedLifecycleContext,
@@ -209,9 +210,10 @@ class RecordingAuthorityMaterialAdapter extends AuthorityMaterialAdapter {
   override async complete<T extends JsonValue>(
     identity: PendingCommandIdentity,
     result: WorkerLifecycleResult<T>,
+    options?: AuthorityMaterialCompletionOptions,
   ): Promise<LifecycleExecutionResult<T>> {
     this.completionIdentities.push(identity);
-    return super.complete(identity, result);
+    return super.complete(identity, result, options);
   }
 }
 
@@ -264,7 +266,10 @@ function openResult(context: ProjectContext): WorkerOpenResult {
   };
 }
 
-async function harness(withAdapter = false): Promise<Harness> {
+async function harness(
+  withAdapter = false,
+  lifecycleFaultInjector?: ProjectStoreExecutorDependencies["lifecycleFaultInjector"],
+): Promise<Harness> {
   const root = temporaryRoot();
   const context = contextFixture(root);
   writeFileSync(context.binding.storeRoute.eventsPath, "fixture", "utf8");
@@ -276,6 +281,7 @@ async function harness(withAdapter = false): Promise<Harness> {
     scheduler,
     randomId: () => "00000000-0000-4000-8000-000000000098",
     ...(authority === null ? {} : { authorityMaterialAdapter: authority.adapter }),
+    ...(lifecycleFaultInjector === undefined ? {} : { lifecycleFaultInjector }),
   };
   const executor = new ProjectStoreExecutor({
     workerUrl: WORKER_URL,
@@ -372,6 +378,44 @@ function semanticSuccess(context: ProjectContext): LifecycleWorkerSuccessWire {
         capabilityGeneration: null,
         descriptor: null,
         recoveryCode: null,
+      },
+    },
+  };
+}
+
+function semanticUnavailableAuthoritySuccess(context: ProjectContext): LifecycleWorkerSuccessWire {
+  return {
+    operation: "root-start",
+    nestedContractVersion: null,
+    result: {
+      kind: "success",
+      publicResult: {
+        resultVersion: 2,
+        project: {
+          projectId: context.binding.projectId,
+          vaultId: context.binding.vaultId,
+          storeId: context.binding.storeId,
+          workspaceId: context.binding.workspaceId,
+          clientNamespace: context.binding.clientNamespace,
+        },
+        sessionId: SESSION_ID,
+        ownerGeneration: "1",
+        continuityKey: "executor-identity-test",
+        state: "active",
+        resumedFromSessionId: null,
+        latestCheckpointEventPosition: null,
+        eventPosition: "1",
+        handleIssued: true,
+        resumeTokenIssued: true,
+        contextPackUnavailable: true,
+      },
+      authorityMaterial: {
+        status: "unavailable",
+        target: null,
+        authorityCommitment: null,
+        capabilityGeneration: null,
+        descriptor: null,
+        recoveryCode: "SESSION_CAPABILITY_KEY_UNAVAILABLE",
       },
     },
   };
@@ -901,6 +945,123 @@ void [
 ];
 
 describe("lifecycle executor", () => {
+  it("turns an injected post-commit response-delivery loss into the exact semantic retry outcome", async () => {
+    let armed = false;
+    const h = await harness(true, {
+      hit(boundary, point, context) {
+        if (!armed) return;
+        assert.equal(boundary, "response-delivery");
+        assert.equal(point, "after-commit-before-response");
+        assert.deepEqual(context, {
+          projectId: h.context.binding.projectId,
+          sessionId: null,
+          workflowId: null,
+          commandId: COMMAND_ID,
+          idempotencyKeyHash: null,
+          workId: null,
+          eventPosition: null,
+          materializationRevision: null,
+        });
+        throw new Error("INJECTED_RESPONSE_DELIVERY_LOSS");
+      },
+    });
+    const prepared = await prepareRoot(h);
+    const execution = h.executor.executeLifecycleMutation(prepared);
+    armed = true;
+
+    assert.doesNotThrow(() => {
+      h.worker.succeed(lastLifecycle(h.worker), semanticSuccess(h.context));
+    });
+    await assert.rejects(execution, exactError("COMMAND_OUTCOME_UNKNOWN", {
+      commandId: prepared.command.commandId,
+      idempotencyKey: prepared.command.idempotencyKey,
+    }));
+    assert.deepEqual(h.adapter!.completionIdentities, [{
+      projectId: h.context.binding.projectId,
+      commandId: prepared.command.commandId,
+      idempotencyKey: prepared.command.idempotencyKey,
+    }]);
+    await turn();
+    assert.equal(h.worker.terminateCalls, 1);
+    assert.ok(await h.pending!.get(
+      PROJECT_ID,
+      prepared.command.commandId,
+      prepared.command.idempotencyKey,
+    ));
+  });
+
+  it("turns unavailable semantic authority delivery through the response fault into the exact retry outcome", async () => {
+    let armed = false;
+    const h = await harness(true, {
+      hit(boundary, point) {
+        if (!armed) return;
+        assert.equal(boundary, "response-delivery");
+        assert.equal(point, "after-commit-before-response");
+        throw new Error("INJECTED_UNAVAILABLE_AUTHORITY_RESPONSE_LOSS");
+      },
+    });
+    const prepared = await prepareRoot(h);
+    const execution = h.executor.executeLifecycleMutation(prepared);
+    armed = true;
+
+    h.worker.succeed(lastLifecycle(h.worker), semanticUnavailableAuthoritySuccess(h.context));
+    await assert.rejects(execution, exactError("COMMAND_OUTCOME_UNKNOWN", {
+      commandId: prepared.command.commandId,
+      idempotencyKey: prepared.command.idempotencyKey,
+    }));
+    assert.ok(await h.pending!.get(
+      PROJECT_ID,
+      prepared.command.commandId,
+      prepared.command.idempotencyKey,
+    ));
+  });
+
+  it("turns an injected post-commit response-delivery loss into the exact operational retry outcome", async () => {
+    let armed = false;
+    let observedContext: unknown;
+    const h = await harness(false, {
+      hit(boundary, point, context) {
+        if (!armed) return;
+        assert.equal(boundary, "response-delivery");
+        assert.equal(point, "after-commit-before-response");
+        observedContext = context;
+        throw new Error("INJECTED_OPERATIONAL_RESPONSE_DELIVERY_LOSS");
+      },
+    });
+    const input = workflowSelection();
+    const execution = h.executor.executeLifecycleFenced(input);
+    armed = true;
+
+    assert.doesNotThrow(() => {
+      h.worker.succeed(lastLifecycle(h.worker), {
+        operation: "workflow-claim-next",
+        nestedContractVersion: null,
+        result: null,
+      });
+    });
+    await assert.rejects(execution, exactError("OPERATION_OUTCOME_UNKNOWN", {
+      work: {
+        kind: "workflow-selection",
+        projectId: PROJECT_ID,
+        workId: WORK_ID,
+        operation: "claim-next",
+        ownerId: "coordinator-a",
+      },
+    }));
+    assert.deepEqual(observedContext, {
+      projectId: h.context.binding.projectId,
+      sessionId: null,
+      workflowId: null,
+      commandId: null,
+      idempotencyKeyHash: null,
+      workId: WORK_ID,
+      eventPosition: null,
+      materializationRevision: null,
+    });
+    await turn();
+    assert.equal(h.worker.terminateCalls, 1);
+  });
+
   it("preserves command identity after uncertain semantic delivery", async () => {
     const successful = await harness(true);
     const prepared = await prepareRoot(successful);
@@ -1260,8 +1421,8 @@ describe("lifecycle executor", () => {
         materializationRevision: "4", operation: "record-failure", ownerId: "materializer-a", claimToken: "9",
       }],
       [workflowRecovery(), {
-        projectId: PROJECT_ID, workId: "workflow-recovery-1", operation: "workflow-recovery",
-        ownerId: "coordinator-a", fencingToken: "11",
+        kind: "workflow-recovery", projectId: PROJECT_ID, workId: "workflow-recovery-1",
+        operation: "recovery", ownerId: "coordinator-a", claimToken: "11",
       }],
     ];
     for (const [input, work] of cases) {

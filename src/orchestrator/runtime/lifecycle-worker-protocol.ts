@@ -2,13 +2,17 @@ import type { JsonValue } from "../contracts/event.js";
 import type { ProjectContext, ProjectId } from "../identity/contracts.js";
 import {
   assertInternalValidationResultBinding,
+  decodeCarryForwardChildActionV1,
   assertSemanticCommandAuthorization,
   decodeLifecycleSemanticCommandDraft,
   type CapabilityProofV1,
   type BoundedLifecycleOperation,
   type BoundedOperationAuthorization,
+  type CarryForwardChildActionV1,
+  type InternalCarryForwardChildPlanV1,
   type InternalValidationResultCommand,
   type InternalWorkflowExecutionPlan,
+  type InternalRootWorkflowPhasePlan,
   type InternalWorkflowPhaseCommand,
   type InternalWorkflowPhasePlan,
   type LifecycleFencedOperation,
@@ -24,6 +28,7 @@ import type {
   SessionEndPhase,
   SessionEndPhaseResultV2,
   SessionEndStatusV2,
+  CarryForwardChildResultV1,
   ValidationResultRecordedResultV1,
 } from "../lifecycle/contracts/session-end.js";
 import type {
@@ -401,7 +406,8 @@ export type LifecycleResultFor<C extends LifecycleSemanticCommandDraft> =
 
 export type LifecycleInternalResultFor<I extends InternalWorkflowExecutionPlan> =
   I extends InternalValidationResultCommand ? ValidationResultRecordedResultV1
-  : I extends InternalWorkflowPhasePlan ? SessionEndPhaseResultV2
+  : I extends InternalCarryForwardChildPlanV1 ? CarryForwardChildResultV1
+  : I extends InternalRootWorkflowPhasePlan ? SessionEndPhaseResultV2
   : never;
 
 export type LifecycleBoundedResultFor<O extends LifecycleBoundedMutation> =
@@ -601,6 +607,9 @@ function validateValidationResultIds(value: JsonValue, field: string): void {
 function validatePlannedAction(value: JsonValue): void {
   const action = strictDataRecord(value, undefined, "operation.command.plannedAction");
   switch (action.action) {
+    case "carry-forward-child":
+      decodeCarryForwardChildActionV1(value);
+      return;
     case "prepare-final-checkpoint-and-queue-ending": {
       const planned = exactSnapshot(
         value,
@@ -698,6 +707,14 @@ function decodeInternalOperation(
       claim.workflowId !== record.workflowId
       || claim.workflowGeneration !== record.workflowGeneration
     ) invalid("operation.command.claim");
+    const plannedAction = record.plannedAction as JsonValue;
+    if (
+      typeof plannedAction === "object"
+      && plannedAction !== null
+      && !Array.isArray(plannedAction)
+      && (plannedAction as Readonly<Record<string, JsonValue>>).action === "carry-forward-child"
+      && record.sourcePhase !== "requested"
+    ) invalid("operation.command.sourcePhase");
     validatePlannedAction(record.plannedAction);
   } else {
     invalid("operation.operation");
@@ -1196,6 +1213,84 @@ function decodeValidationRecordedResult(value: JsonValue): ValidationResultRecor
   decimalValue(result.eventPosition, "success.result.eventPosition", 1n);
   decimalValue(result.finalStreamVersion, "success.result.finalStreamVersion", 1n);
   return result as ValidationResultRecordedResultV1;
+}
+
+export function decodeCarryForwardChildResultV1(
+  value: JsonValue,
+  action: CarryForwardChildActionV1,
+): CarryForwardChildResultV1 {
+  const result = exactSnapshot(
+    value,
+    [
+      "resultVersion",
+      "action",
+      "workflowId",
+      "workflowGeneration",
+      "plannedWorkId",
+      "rootSessionId",
+      "childSessionId",
+      "previousChildState",
+      "childState",
+      "transferTicketId",
+      "suspensionEventPosition",
+      "transferTicketEventPosition",
+      "finalChildStreamVersion",
+    ],
+    "success.result",
+  );
+  if (result.resultVersion !== 1 || result.action !== "carry-forward-child") {
+    invalid("success.result");
+  }
+  uuidValue(result.workflowId, "success.result.workflowId");
+  integerValue(result.workflowGeneration, "success.result.workflowGeneration", 1);
+  hashValue(result.plannedWorkId, "success.result.plannedWorkId");
+  uuidValue(result.rootSessionId, "success.result.rootSessionId");
+  uuidValue(result.childSessionId, "success.result.childSessionId");
+  if (
+    result.rootSessionId !== action.rootSessionId
+    || result.childSessionId !== action.childSessionId
+  ) invalid("success.result.session");
+  if (result.previousChildState !== action.expectedChildState) {
+    invalid("success.result.previousChildState");
+  }
+  if (result.childState !== "transferred") invalid("success.result.childState");
+  uuidValue(result.transferTicketId, "success.result.transferTicketId");
+  const suspensionEventPosition = decimalValue(
+    result.suspensionEventPosition,
+    "success.result.suspensionEventPosition",
+    1n,
+  );
+  const transferTicketEventPosition = decimalValue(
+    result.transferTicketEventPosition,
+    "success.result.transferTicketEventPosition",
+    1n,
+  );
+  const finalChildStreamVersion = decimalValue(
+    result.finalChildStreamVersion,
+    "success.result.finalChildStreamVersion",
+    1n,
+  );
+  const expectedHead = BigInt(action.expectedChildHeadEventPosition);
+  const expectedStream = BigInt(action.expectedChildStreamVersion);
+  const suspension = BigInt(suspensionEventPosition);
+  const transfer = BigInt(transferTicketEventPosition);
+  if (transfer <= suspension) invalid("success.result.transferTicketEventPosition");
+  if (action.expectedChildState === "suspended") {
+    if (action.expectedSuspensionEventPosition !== suspensionEventPosition) {
+      invalid("success.result.suspensionEventPosition");
+    }
+    if (transfer <= expectedHead || BigInt(finalChildStreamVersion) !== expectedStream + 1n) {
+      invalid("success.result");
+    }
+  } else if (
+    action.expectedSuspensionEventPosition !== null
+    || suspension <= expectedHead
+    || transfer !== suspension + 1n
+    || BigInt(finalChildStreamVersion) !== expectedStream + 2n
+  ) {
+    invalid("success.result");
+  }
+  return result as unknown as CarryForwardChildResultV1;
 }
 
 function decodeLeaseResult(
@@ -2193,9 +2288,20 @@ function decodeSuccessResult(
     return decodeSemanticWorkerResult(value, requested);
   }
   if (requested.kind === "internal-semantic") {
-    return requested.operation === "internal-validation-result"
-      ? decodeValidationRecordedResult(value)
-      : decodeSessionEndPhaseResult(value);
+    if (requested.operation === "internal-validation-result") {
+      return decodeValidationRecordedResult(value);
+    }
+    const command = requested.command as InternalWorkflowPhasePlan;
+    if (command.plannedAction.action === "carry-forward-child") {
+      const result = decodeCarryForwardChildResultV1(value, command.plannedAction);
+      if (
+        result.workflowId !== command.workflowId
+        || result.workflowGeneration !== command.workflowGeneration
+        || result.plannedWorkId !== command.plannedWorkId
+      ) invalid("success.result.workflow");
+      return result;
+    }
+    return decodeSessionEndPhaseResult(value);
   }
   if (requested.kind === "bounded") {
     return decodeLeaseResult(value, requested) as unknown as JsonValue;
@@ -2270,11 +2376,13 @@ export function lifecycleNestedContractVersion(
           : invalid("nestedContractVersion");
     case "internal-workflow-phase": {
       const planned = command.plannedAction as Record<string, unknown> | undefined;
+      if (planned?.action === "carry-forward-child") return 1;
       if (planned?.action === "prepare-final-checkpoint-and-queue-ending") {
         const version = (planned.finalCheckpointDraft as { checkpointVersion?: unknown }).checkpointVersion;
         return version === 1 || version === 2 ? version : invalid("nestedContractVersion");
       }
       const authoritative = command.action as Record<string, unknown> | undefined;
+      if (authoritative?.action === "carry-forward-child") return 1;
       if (authoritative?.action === "record-final-checkpoint-and-queue-ending") {
         const version = (authoritative.finalCheckpoint as { checkpointVersion?: unknown }).checkpointVersion;
         return version === 1 || version === 2 ? version : invalid("nestedContractVersion");

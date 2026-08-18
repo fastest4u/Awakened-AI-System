@@ -1572,6 +1572,28 @@ describe("EventIntegrityService immutable command witnesses", () => {
     assert.ok(issueCodes(report).includes("COMMAND_METADATA_MISMATCH"));
   });
 
+  it("event integrity recomputes lifecycle outbox content hash", () => {
+    const fixture = createFixture({ append: false });
+    fixture.store.append({
+      ...appendCommand(
+        fixture.context,
+        COMMAND_A,
+        "integrity:outbox-content-hash",
+        "stream-outbox-content-hash",
+        "outbox-content-hash",
+        1,
+      ),
+      outbox: twoOutboxItems(),
+    });
+    const row = fixture.connection.prepare(`
+      SELECT payload_json, content_hash
+      FROM outbox
+      WHERE target_key = 'integrity/outbox/first'
+    `).get() as { payload_json: string; content_hash: string };
+    assert.equal(row.content_hash, outboxHash(JSON.parse(row.payload_json) as JsonValue));
+    assert.equal(fixture.integrity.fullCheck(fixture.context).ok, true);
+  });
+
   const outboxCorruptions: ReadonlyArray<{
     name: string;
     expectedCode: "COMMAND_HASH_MISMATCH" | "COMMAND_METADATA_MISMATCH";

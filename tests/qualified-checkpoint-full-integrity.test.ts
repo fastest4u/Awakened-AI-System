@@ -9066,7 +9066,7 @@ it("full integrity keeps ending-binding revision work additive with deep bound-c
   });
 });
 
-it("full integrity fingerprints each non-zero transition exactly once", async () => {
+it("full integrity rerenders and verifies provider-keyed fingerprint lineage", async () => {
   const fixture = createFixture();
   addCoverage(fixture);
   addZeroNewCoverage(fixture);
@@ -9651,12 +9651,12 @@ it("full integrity fingerprints each non-zero transition exactly once", async ()
       },
     },
   );
-  assert.deepEqual(migratedVersions, [3, 4]);
+  assert.deepEqual(migratedVersions, [3, 4, 5]);
   assert.equal(
     migrated.connection.prepare(`
       SELECT schema_version FROM project_meta WHERE singleton = 1
     `).get()?.schema_version,
-    4n,
+    5n,
   );
   const liveEquivalent = createFixture();
   addChildFork(liveEquivalent);

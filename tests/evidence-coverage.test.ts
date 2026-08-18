@@ -64,6 +64,7 @@ import {
   checkpointFixture,
   lifecycleEvent,
 } from "./support/lifecycle-fixtures.js";
+import { sessionEndWorkflowId } from "../src/orchestrator/lifecycle/session-end-identifiers.js";
 
 const NOW = "2026-07-27T00:00:00.000Z";
 const PROJECT_ID = "11111111-1111-4111-8111-111111111111";
@@ -1038,13 +1039,18 @@ function frozenCheckpointPayload(
   childSummaries: readonly unknown[] = [],
   checkpointEventPosition = "2",
 ): Readonly<Record<string, unknown>> {
+  const baseCheckpoint = checkpointFixture({
+    sessionId: SESSION_ID as never,
+    checkpointId: checkpointId as never,
+    baseEventPosition: "1",
+    checkpointEventPosition,
+  });
   const checkpoint = {
-    ...checkpointFixture({
-      sessionId: SESSION_ID as never,
-      checkpointId: checkpointId as never,
-      baseEventPosition: "1",
-      checkpointEventPosition,
-    }),
+    ...baseCheckpoint,
+    sourceState: {
+      ...baseCheckpoint.sourceState,
+      workspaceId: "c".repeat(64),
+    },
     checkpointVersion: 2,
     childSummaries,
     evidenceCoverage: {
@@ -1058,6 +1064,9 @@ function frozenCheckpointPayload(
     checkpoint,
     baseEventPosition: "1",
     checkpointEventPosition,
+    finalCheckpointBindingVersion: 1,
+    workflowId: sessionEndWorkflowId(SESSION_ID as never),
+    workflowGeneration: 1,
   };
 }
 
@@ -1068,7 +1077,7 @@ function frozenWorkflowResult(
   return {
     resultVersion: 2,
     sessionId: SESSION_ID,
-    workflowId: `session-end/${SESSION_ID}`,
+    workflowId: sessionEndWorkflowId(SESSION_ID as never),
     workflowGeneration: 1,
     phase: "final-checkpoint-recorded",
     priorRootState: "active",
@@ -1666,10 +1675,11 @@ describe("evidence coverage repository", () => {
     connection.exec("DROP TRIGGER workflow_instances_lifecycle_insert_guard");
     connection.exec("DROP TRIGGER workflow_instances_lifecycle_update_guard");
     connection.exec("DROP TRIGGER workflow_instances_evidence_v3_insert_guard");
+    connection.exec("DROP TRIGGER events_final_checkpoint_v4_guard");
     connection.exec("DROP TRIGGER workflow_instances_evidence_v3_update_guard");
     rawInsert(connection, "workflow_instances", {
       project_id: PROJECT_ID,
-      workflow_id: `session-end/${SESSION_ID}`,
+      workflow_id: sessionEndWorkflowId(SESSION_ID as never),
       workflow_type: "session-end",
       generation: 1n,
       state: "active",
@@ -1733,7 +1743,7 @@ describe("evidence coverage repository", () => {
       stream_type: "session",
       stream_version: 2n,
       event_type: "SessionCheckpointRecorded",
-      event_schema_version: 2n,
+      event_schema_version: 3n,
       session_id: SESSION_ID,
       parent_session_id: null,
       actor_role: "primary",
@@ -2148,9 +2158,10 @@ describe("evidence coverage repository", () => {
     }];
     connection.exec("DROP TRIGGER workflow_instances_lifecycle_insert_guard");
     connection.exec("DROP TRIGGER workflow_instances_evidence_v3_insert_guard");
+    connection.exec("DROP TRIGGER events_final_checkpoint_v4_guard");
     rawInsert(connection, "workflow_instances", {
       project_id: PROJECT_ID,
-      workflow_id: `session-end/${SESSION_ID}`,
+      workflow_id: sessionEndWorkflowId(SESSION_ID as never),
       workflow_type: "session-end",
       generation: 1n,
       state: "active",
@@ -2193,7 +2204,7 @@ describe("evidence coverage repository", () => {
       stream_type: "session",
       stream_version: 2n,
       event_type: "SessionCheckpointRecorded",
-      event_schema_version: 2n,
+      event_schema_version: 3n,
       session_id: SESSION_ID,
       parent_session_id: null,
       actor_role: "primary",
@@ -2233,6 +2244,27 @@ describe("evidence coverage repository", () => {
       frozen,
     );
 
+    connection.exec("DROP TRIGGER events_no_update");
+    connection.prepare(`
+      UPDATE events
+      SET event_schema_version = 2,
+          payload_json = $payload
+      WHERE global_position = $transferPosition
+    `).run({
+      $transferPosition: 5,
+      $payload: canonicalJson({
+        transferTicketId: transfer.transferTicketId,
+        suspensionCheckpointId: transfer.checkpointId,
+        checkpointId: transfer.checkpointId,
+        authorityCommitment: "f".repeat(64),
+      }),
+    });
+    assert.throws(
+      () => facade.assertEvidenceWindowWritable(SESSION_ID as never),
+      frozen,
+    );
+
+    connection.exec("DROP TRIGGER child_transfer_tickets_update_guard");
     connection.prepare(`
       UPDATE child_transfer_tickets
       SET claimed_by_root_session_id = $rootSessionId,
@@ -2318,9 +2350,10 @@ describe("evidence coverage repository", () => {
       }
       connection.exec("DROP TRIGGER workflow_instances_lifecycle_insert_guard");
       connection.exec("DROP TRIGGER workflow_instances_evidence_v3_insert_guard");
+      connection.exec("DROP TRIGGER events_final_checkpoint_v4_guard");
       rawInsert(connection, "workflow_instances", {
         project_id: PROJECT_ID,
-        workflow_id: `session-end/${SESSION_ID}`,
+        workflow_id: sessionEndWorkflowId(SESSION_ID as never),
         workflow_type: "session-end",
         generation: 1n,
         state: "active",
@@ -2368,7 +2401,7 @@ describe("evidence coverage repository", () => {
         stream_type: "session",
         stream_version: 2n,
         event_type: "SessionCheckpointRecorded",
-        event_schema_version: 2n,
+        event_schema_version: 3n,
         session_id: SESSION_ID,
         parent_session_id: null,
         actor_role: "primary",

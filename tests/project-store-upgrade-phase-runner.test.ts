@@ -284,7 +284,7 @@ it("bundled upgrade applies 2 3 4", async () => {
       readonly appliedVersions: readonly number[];
       readonly integrity: { readonly ok: boolean };
     };
-    assert.deepEqual(result.appliedVersions, [2, 3, 4]);
+    assert.deepEqual(result.appliedVersions, [2, 3, 4, 5]);
     assert.equal(result.integrity.ok, true);
     assert.deepEqual(phases, ["quiesce-required", "quiesce-complete", "result"]);
 
@@ -293,13 +293,13 @@ it("bundled upgrade applies 2 3 4", async () => {
       assert.deepEqual(
         database.prepare("SELECT version FROM schema_migrations ORDER BY version")
           .all().map((row) => Number(row.version)),
-        [1, 2, 3, 4],
+        [1, 2, 3, 4, 5],
       );
       assert.equal(
         Number(database.prepare(`
           SELECT schema_version FROM project_meta WHERE singleton = 1
         `).get()?.schema_version),
-        4,
+        5,
       );
     } finally {
       database.close();

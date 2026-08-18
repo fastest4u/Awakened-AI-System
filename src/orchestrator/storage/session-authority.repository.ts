@@ -245,7 +245,7 @@ function parseCanonical(value: string): unknown {
   return parsed;
 }
 
-function committedAuthority(record: SessionAuthorityRecord): CommittedAuthorityV1 {
+export function committedAuthority(record: SessionAuthorityRecord): CommittedAuthorityV1 {
   return {
     authorityVersion: 1,
     projectId: record.projectId,
@@ -297,6 +297,70 @@ function committedAuthority(record: SessionAuthorityRecord): CommittedAuthorityV
     terminalEventPosition: record.terminalEventPosition?.toString() ?? null,
     terminalEventType: record.terminalEventType,
     terminalAt: record.terminalAt,
+  };
+}
+
+/** Builds the exact mutable-field shape required by compareAndSwap. */
+export function authorityMutation(
+  record: SessionAuthorityRecord,
+  overrides: Partial<SessionAuthorityMutation> = {},
+): SessionAuthorityMutation {
+  return {
+    semanticState: overrides.semanticState ?? record.semanticState,
+    ownerGeneration: overrides.ownerGeneration ?? record.ownerGeneration,
+    childCapabilityGeneration: overrides.childCapabilityGeneration ?? record.childCapabilityGeneration,
+    directAccessEnabled: overrides.directAccessEnabled ?? record.directAccessEnabled,
+    continuityFingerprintAlgorithm: overrides.continuityFingerprintAlgorithm ?? record.continuityFingerprintAlgorithm,
+    continuityFingerprintSchemaVersion: overrides.continuityFingerprintSchemaVersion ?? record.continuityFingerprintSchemaVersion,
+    continuityFingerprintKeyId: overrides.continuityFingerprintKeyId ?? record.continuityFingerprintKeyId,
+    continuityFingerprintDomain: overrides.continuityFingerprintDomain ?? record.continuityFingerprintDomain,
+    continuityFingerprint: overrides.continuityFingerprint ?? record.continuityFingerprint,
+    rootHandleCapabilityVersion: overrides.rootHandleCapabilityVersion ?? record.rootHandleCapabilityVersion,
+    rootHandleKeyId: overrides.rootHandleKeyId ?? record.rootHandleKeyId,
+    rootHandleIssueNonce: overrides.rootHandleIssueNonce ?? record.rootHandleIssueNonce,
+    rootHandleIssuedAt: overrides.rootHandleIssuedAt ?? record.rootHandleIssuedAt,
+    rootHandlePolicyCode: overrides.rootHandlePolicyCode ?? record.rootHandlePolicyCode,
+    rootHandleExpiryKind: overrides.rootHandleExpiryKind ?? record.rootHandleExpiryKind,
+    rootHandleExpiresAt: overrides.rootHandleExpiresAt ?? record.rootHandleExpiresAt,
+    rootHandleActorRole: overrides.rootHandleActorRole ?? record.rootHandleActorRole,
+    rootHandleClientInstanceId: overrides.rootHandleClientInstanceId ?? record.rootHandleClientInstanceId,
+    rootHandleVerifier: overrides.rootHandleVerifier ?? record.rootHandleVerifier,
+    rootHandleIssuanceId: overrides.rootHandleIssuanceId ?? record.rootHandleIssuanceId,
+    resumeTokenCapabilityVersion: overrides.resumeTokenCapabilityVersion ?? record.resumeTokenCapabilityVersion,
+    resumeTokenKeyId: overrides.resumeTokenKeyId ?? record.resumeTokenKeyId,
+    resumeTokenIssueNonce: overrides.resumeTokenIssueNonce ?? record.resumeTokenIssueNonce,
+    resumeTokenIssuedAt: overrides.resumeTokenIssuedAt ?? record.resumeTokenIssuedAt,
+    resumeTokenPolicyCode: overrides.resumeTokenPolicyCode ?? record.resumeTokenPolicyCode,
+    resumeTokenExpiryKind: overrides.resumeTokenExpiryKind ?? record.resumeTokenExpiryKind,
+    resumeTokenExpiresAt: overrides.resumeTokenExpiresAt ?? record.resumeTokenExpiresAt,
+    resumeTokenActorRole: overrides.resumeTokenActorRole ?? record.resumeTokenActorRole,
+    resumeTokenVerifier: overrides.resumeTokenVerifier ?? record.resumeTokenVerifier,
+    resumeTokenIssuanceId: overrides.resumeTokenIssuanceId ?? record.resumeTokenIssuanceId,
+    childHandleCapabilityVersion: overrides.childHandleCapabilityVersion ?? record.childHandleCapabilityVersion,
+    childHandleKeyId: overrides.childHandleKeyId ?? record.childHandleKeyId,
+    childHandleIssueNonce: overrides.childHandleIssueNonce ?? record.childHandleIssueNonce,
+    childHandleIssuedAt: overrides.childHandleIssuedAt ?? record.childHandleIssuedAt,
+    childHandlePolicyCode: overrides.childHandlePolicyCode ?? record.childHandlePolicyCode,
+    childHandleExpiryKind: overrides.childHandleExpiryKind ?? record.childHandleExpiryKind,
+    childHandleExpiresAt: overrides.childHandleExpiresAt ?? record.childHandleExpiresAt,
+    childHandleActorRole: overrides.childHandleActorRole ?? record.childHandleActorRole,
+    childHandleClientInstanceId: overrides.childHandleClientInstanceId ?? record.childHandleClientInstanceId,
+    childHandleVerifier: overrides.childHandleVerifier ?? record.childHandleVerifier,
+    childHandleIssuanceId: overrides.childHandleIssuanceId ?? record.childHandleIssuanceId,
+    authorityCommitment: overrides.authorityCommitment ?? record.authorityCommitment,
+    authorityEventPosition: overrides.authorityEventPosition ?? record.authorityEventPosition,
+    latestCheckpointId: overrides.latestCheckpointId ?? record.latestCheckpointId,
+    latestCheckpointEventPosition: overrides.latestCheckpointEventPosition ?? record.latestCheckpointEventPosition,
+    latestCheckpointFingerprint: overrides.latestCheckpointFingerprint ?? record.latestCheckpointFingerprint,
+    checkpointRequiredReason: overrides.checkpointRequiredReason ?? record.checkpointRequiredReason,
+    checkpointRequiredEventPosition: overrides.checkpointRequiredEventPosition ?? record.checkpointRequiredEventPosition,
+    revocationReasonCode: overrides.revocationReasonCode ?? record.revocationReasonCode,
+    revocationEventPosition: overrides.revocationEventPosition ?? record.revocationEventPosition,
+    revokedAt: overrides.revokedAt ?? record.revokedAt,
+    terminalEventPosition: overrides.terminalEventPosition ?? record.terminalEventPosition,
+    terminalEventType: overrides.terminalEventType ?? record.terminalEventType,
+    terminalAt: overrides.terminalAt ?? record.terminalAt,
+    updatedAt: overrides.updatedAt ?? record.updatedAt,
   };
 }
 
@@ -799,6 +863,34 @@ export class SessionAuthorityRepository {
         AND terminal_event_position IS NULL
       ORDER BY session_id
     `).all({ $projectId: projectId, $rootSessionId: rootSessionId }).map(decodeAuthorityRow));
+  }
+
+  /**
+   * Returns the immutable direct-child history for a root.  This deliberately
+   * includes terminal rows; callers use limit-plus-one to enforce the
+   * lifetime history boundary before allocating identities or mutating state.
+   */
+  listChildHistoryBounded(
+    connection: SqliteConnection,
+    projectId: string,
+    rootSessionId: string,
+    limit: number,
+  ): readonly SessionAuthorityRecord[] {
+    if (!LOWER_UUID.test(projectId) || !LOWER_UUID.test(rootSessionId)
+      || !Number.isSafeInteger(limit) || limit < 1 || limit > 1_001) invalid();
+    return Object.freeze(connection.prepare(`
+      SELECT ${SELECT_AUTHORITY}
+      FROM session_authority
+      WHERE project_id = $projectId
+        AND parent_session_id = $rootSessionId
+        AND session_kind = 'child'
+      ORDER BY session_id COLLATE BINARY
+      LIMIT $limit
+    `).all({
+      $projectId: projectId,
+      $rootSessionId: rootSessionId,
+      $limit: BigInt(limit),
+    }).map(decodeAuthorityRow));
   }
 
   listNonterminalChildEndingScopeProjectionsBounded(

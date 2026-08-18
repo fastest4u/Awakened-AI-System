@@ -1,6 +1,7 @@
 import { canonicalJson } from "../serialization/canonical-json.js";
 import {
   assertInternalValidationResultBinding,
+  decodeCarryForwardChildActionV1,
   decodeLifecycleSemanticCommandDraft,
   type InternalValidationResultCommand,
   type InternalWorkflowExecutionPlan,
@@ -339,6 +340,9 @@ function decodeValidationResultIds(value: unknown, field: string): readonly Vali
 
 function decodePhaseAction(value: unknown): InternalWorkflowPhaseCommand["action"] {
   const source = exactRecord(value, Object.keys(value as object), "lifecycleIntent.action");
+  if (source.action === "carry-forward-child") {
+    return decodeCarryForwardChildActionV1(value);
+  }
   switch (source.action) {
     case "record-final-checkpoint-and-queue-ending": {
       const action = exactRecord(
@@ -433,6 +437,9 @@ function decodePhaseAction(value: unknown): InternalWorkflowPhaseCommand["action
 
 function decodePlannedPhaseAction(value: unknown): InternalWorkflowPhasePlan["plannedAction"] {
   const source = exactRecord(value, Object.keys(value as object), "lifecycleIntent.plannedAction");
+  if (source.action === "carry-forward-child") {
+    return decodeCarryForwardChildActionV1(value);
+  }
   if (source.action === "prepare-final-checkpoint-and-queue-ending") {
     const action = exactRecord(
       value,
@@ -616,12 +623,28 @@ function normalize(
       || assertions.internalPlannedWorkId !== command.plannedWorkId
     ) invalid();
     stable = stableInternalCommand(command);
+    assertInternalWorkflowAudience(stable, assertions);
   } else {
     const decoded = decodeLifecycleSemanticCommandDraft(command);
     assertExternalSessionBinding(decoded, assertions);
     stable = decoded;
   }
   return normalizeStable(stable, assertions);
+}
+
+function assertInternalWorkflowAudience(
+  command: InternalValidationStableCommand
+    | InternalWorkflowPhaseStableCommand
+    | InternalWorkflowPhasePlanStableCommand,
+  assertions: TrustedLifecycleIntentAssertionsV1,
+): void {
+  if (command.commandType !== "internal-workflow-phase") return;
+  const action = "plannedAction" in command ? command.plannedAction : command.action;
+  if (action.action !== "carry-forward-child") return;
+  if (
+    assertions.authorizationSessionId !== action.rootSessionId
+    || assertions.targetSessionId !== action.childSessionId
+  ) invalid();
 }
 
 function normalizeStable(

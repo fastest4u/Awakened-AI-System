@@ -17,6 +17,8 @@ import type {
   RootSuspendCommandV2,
   RootSuspendCommandV3,
   RequestSessionEndCommandV3,
+  AmendSessionEndCommandV2,
+  CancelSessionEndCommandV2,
 } from "../src/orchestrator/lifecycle/contracts/commands.js";
 import type {
   CheckpointEvidenceCoverageV2,
@@ -139,6 +141,14 @@ interface LifecycleCommandProcessorLike {
   requestSessionEnd(
     projectContext: ProjectContext,
     command: PreparedLifecycleWorkerCommand<RequestSessionEndCommandV3>,
+  ): WorkerLifecycleResult<SessionEndStatusV2>;
+  amendSessionEnd(
+    projectContext: ProjectContext,
+    command: PreparedLifecycleWorkerCommand<AmendSessionEndCommandV2>,
+  ): WorkerLifecycleResult<SessionEndStatusV2>;
+  cancelSessionEnd(
+    projectContext: ProjectContext,
+    command: PreparedLifecycleWorkerCommand<CancelSessionEndCommandV2>,
   ): WorkerLifecycleResult<SessionEndStatusV2>;
   recoverRoot(
     projectContext: ProjectContext,
@@ -719,6 +729,132 @@ function preparedRequestSessionEnd(
     material.handle.destroy();
     if (material.kind === "root") material.resumeToken?.destroy();
   }
+}
+
+function preparedSessionEndMutation(
+  item: Fixture,
+  projectContext: ProjectContext,
+  issued: { readonly authorityMaterial: Extract<
+    WorkerLifecycleResult<RootSessionPublicResultV2>,
+    { kind: "success" }
+  >["authorityMaterial"] },
+  capabilityGeneration: string,
+  command: AmendSessionEndCommandV2 | CancelSessionEndCommandV2,
+): PreparedLifecycleWorkerCommand<AmendSessionEndCommandV2> | PreparedLifecycleWorkerCommand<CancelSessionEndCommandV2> {
+  const descriptor = issued.authorityMaterial.descriptor;
+  const descriptorTarget = issued.authorityMaterial.target;
+  assert.ok(descriptor !== null && descriptorTarget !== null);
+  const material = item.capabilities.reconstructForTarget(descriptor, descriptorTarget);
+  try {
+    assert.equal(material.kind, "root");
+    const candidateIntentHash = buildLifecycleIntentWitness(command, {
+      authorizationKind: "protected",
+      authorizationSessionId: command.sessionId,
+      targetSessionId: command.sessionId,
+      projectId: projectContext.binding.projectId,
+      vaultId: projectContext.binding.vaultId,
+      storeId: projectContext.binding.storeId,
+      workspaceId: projectContext.binding.workspaceId,
+      clientNamespace: projectContext.binding.clientNamespace,
+      capabilityKind: "root-session-handle",
+      capabilityGeneration,
+      presentingActorRole: "primary",
+      presentingClientInstanceId: projectContext.binding.clientInstanceId,
+      targetActorRole: "primary",
+      targetClientInstanceId: projectContext.binding.clientInstanceId,
+      internalWorkflowId: null,
+      internalWorkflowGeneration: null,
+      internalPlannedWorkId: null,
+    }).intentHash;
+    const proofTarget: SemanticCommandProofTargetV1 = {
+      proofVersion: 1,
+      target: "semantic-command",
+      projectId: projectContext.binding.projectId,
+      vaultId: projectContext.binding.vaultId,
+      storeId: projectContext.binding.storeId,
+      workspaceId: projectContext.binding.workspaceId,
+      clientNamespace: projectContext.binding.clientNamespace,
+      authoritySessionId: command.sessionId,
+      targetSessionId: command.sessionId,
+      presentingActorRole: "primary",
+      presentingClientInstanceId: projectContext.binding.clientInstanceId,
+      targetActorRole: "primary",
+      targetClientInstanceId: projectContext.binding.clientInstanceId,
+      capabilityKind: "root-session-handle",
+      capabilityGeneration,
+      commandId: command.commandId,
+      idempotencyKey: command.idempotencyKey,
+      intentHash: candidateIntentHash,
+      proofNonce: lifecycleUuid(Number(command.commandId.slice(-12)) + 50_000),
+    };
+    const authorization = {
+      kind: "protected" as const,
+      authoritySessionId: command.sessionId,
+      targetSessionId: command.sessionId,
+      proof: createCapabilityProof(material.handle, proofTarget),
+      approval: null,
+      childBindingGrant: null,
+    };
+    return { command, candidateIntentHash, authorization } as
+      PreparedLifecycleWorkerCommand<AmendSessionEndCommandV2> |
+      PreparedLifecycleWorkerCommand<CancelSessionEndCommandV2>;
+  } finally {
+    material.handle.destroy();
+    if (material.kind === "root") material.resumeToken?.destroy();
+  }
+}
+
+function amendSessionEndCommand(
+  ordinal: number,
+  sessionId: string,
+  workflowId: string,
+  expectedStreamVersion: string,
+): AmendSessionEndCommandV2 {
+  return {
+    commandType: "amend-session-end",
+    commandId: lifecycleUuid(ordinal),
+    idempotencyKey: `amend-session-end/${ordinal}`,
+    agentId: "agent-primary",
+    expectedProjectId: PROJECT_ID,
+    expectedVaultId: VAULT_ID,
+    expectedWorkspaceId: WORKSPACE_ID,
+    expectedBranchRef: null,
+    sessionId: sessionId as AmendSessionEndCommandV2["sessionId"],
+    workflowId: workflowId as AmendSessionEndCommandV2["workflowId"],
+    expectedStreamVersion,
+    amendment: {
+      amendmentVersion: 1,
+      childEndPolicy: null,
+      finalCheckpoint: null,
+      validationProfileIds: ["profile-a"],
+      requestedQualityThreshold: null,
+      requireFullEvidence: null,
+      requireMaterialization: null,
+    },
+  };
+}
+
+function cancelSessionEndCommand(
+  ordinal: number,
+  sessionId: string,
+  workflowId: string,
+  expectedStreamVersion: string,
+  preTransitionCheckpointId: string,
+): CancelSessionEndCommandV2 {
+  return {
+    commandType: "cancel-session-end",
+    commandId: lifecycleUuid(ordinal),
+    idempotencyKey: `cancel-session-end/${ordinal}`,
+    agentId: "agent-primary",
+    expectedProjectId: PROJECT_ID,
+    expectedVaultId: VAULT_ID,
+    expectedWorkspaceId: WORKSPACE_ID,
+    expectedBranchRef: null,
+    sessionId: sessionId as CancelSessionEndCommandV2["sessionId"],
+    workflowId: workflowId as CancelSessionEndCommandV2["workflowId"],
+    expectedStreamVersion,
+    preTransitionCheckpointId: preTransitionCheckpointId as CancelSessionEndCommandV2["preTransitionCheckpointId"],
+  };
 }
 
 function recoveryCommand(
@@ -2012,6 +2148,75 @@ describe("LifecycleCommandProcessor session-end request", () => {
       };
       assert.equal(payload.workflowGeneration, 1);
       assert.equal(payload.effectiveState.request.requestVersion, 2);
+    } finally {
+      item.connection.close();
+    }
+  });
+
+  it("amends and cancels the anchored workflow with fenced Version 3 events", async () => {
+    const Processor = await loadProcessorConstructor();
+    assert.ok(Processor !== null);
+    const item = fixture(Processor);
+    try {
+      const projectContext = context("amend-cancel-thread");
+      const started = success(item.processor.startRoot(
+        projectContext,
+        preparedStart(projectContext, startCommand(1210, "amend-cancel-thread")),
+      ));
+      const checkpoint = seedRootCheckpoint(item, started.publicResult.sessionId, 1211);
+      const requested = success(item.processor.requestSessionEnd(
+        projectContext,
+        preparedRequestSessionEnd(
+          item,
+          projectContext,
+          started,
+          requestSessionEndCommand(1215, started.publicResult.sessionId, 2),
+        ),
+      ));
+      const workflowId = sessionEndWorkflowId(started.publicResult.sessionId as never);
+      const afterRequest = item.authority.get(item.connection, PROJECT_ID, started.publicResult.sessionId);
+      assert.ok(afterRequest !== null);
+      const requestAggregate = item.authority.requireFoldMatch(item.connection, afterRequest);
+      const amendment = amendSessionEndCommand(
+        1216,
+        started.publicResult.sessionId,
+        workflowId,
+        requestAggregate.streamVersion.toString(),
+      );
+      const amended = success(item.processor.amendSessionEnd(
+        projectContext,
+        preparedSessionEndMutation(item, projectContext, requested, afterRequest.ownerGeneration!.toString(), amendment) as
+          PreparedLifecycleWorkerCommand<AmendSessionEndCommandV2>,
+      ));
+      assert.equal(amended.publicResult.workflowGeneration, 2);
+      assert.equal(amended.publicResult.phase, "requested");
+      assert.equal(amended.publicResult.evidenceWindow.evidenceWindowState, "open");
+      assert.equal(item.connection.prepare(
+        "SELECT COUNT(*) AS count FROM events WHERE event_type = 'SessionEndAmended'",
+      ).get()?.count, 1n);
+
+      const afterAmendment = item.authority.get(item.connection, PROJECT_ID, started.publicResult.sessionId);
+      assert.ok(afterAmendment !== null);
+      const amendmentAggregate = item.authority.requireFoldMatch(item.connection, afterAmendment);
+      const cancellation = cancelSessionEndCommand(
+        1217,
+        started.publicResult.sessionId,
+        workflowId,
+        amendmentAggregate.streamVersion.toString(),
+        checkpoint.checkpointId,
+      );
+      const cancelled = success(item.processor.cancelSessionEnd(
+        projectContext,
+        preparedSessionEndMutation(item, projectContext, amended, afterAmendment.ownerGeneration!.toString(), cancellation) as
+          PreparedLifecycleWorkerCommand<CancelSessionEndCommandV2>,
+      ));
+      assert.equal(cancelled.publicResult.workflowGeneration, 3);
+      assert.equal(cancelled.publicResult.phase, "cancelled");
+      assert.equal(item.authority.get(item.connection, PROJECT_ID, started.publicResult.sessionId)?.semanticState, "active");
+      assert.equal(item.connection.prepare(
+        "SELECT COUNT(*) AS count FROM events WHERE event_type = 'SessionEndCancelled'",
+      ).get()?.count, 1n);
+      assert.equal(new SessionEndWorkflowRepository(item.connection).read(PROJECT_ID, workflowId)?.phase, "cancelled");
     } finally {
       item.connection.close();
     }

@@ -11,6 +11,8 @@ import {
   requestedSessionEndStatusV2,
   SessionEndWorkflowService,
 } from "../src/orchestrator/lifecycle/session-end-workflow.service.js";
+import type { SessionEndStatusV2 } from "../src/orchestrator/lifecycle/contracts/session-end.js";
+import type { LifecycleFaultInjector } from "../src/orchestrator/lifecycle/lifecycle-faults.js";
 import {
   SessionEndWorkflowRepository,
   type SessionEndWorkflowRequestedInputV1,
@@ -25,6 +27,7 @@ import type {
   SqliteRunResult,
   SqliteStatement,
 } from "../src/orchestrator/storage/sqlite-driver.js";
+import { lifecycleUuid } from "./support/lifecycle-fixtures.js";
 
 class NativeStatement implements SqliteStatement {
   constructor(private readonly statement: import("node:sqlite").StatementSync) {
@@ -180,6 +183,265 @@ function repositorySet(workflows: object): LifecycleOperationalRepositorySet {
 }
 
 describe("SessionEndWorkflowService", () => {
+  it("emits workflow-create before writing a requested workflow row", () => {
+    const connection = workflowConnection();
+    connection.prepare("DELETE FROM workflow_instances WHERE project_id = $projectId AND workflow_id = $workflowId").run({
+      $projectId: PROJECT_ID,
+      $workflowId: WORKFLOW_ID,
+    });
+    const hits: Array<{
+      readonly boundary: string;
+      readonly point: string;
+      readonly context: unknown;
+    }> = [];
+    const faultInjector: LifecycleFaultInjector = {
+      hit(boundary, point, context): void {
+        hits.push({ boundary, point, context });
+        throw new Error("INJECTED_WORKFLOW_CREATE_FAULT");
+      },
+    };
+    const repository = new SessionEndWorkflowRepository(connection, { faultInjector });
+    const requested = requestedSessionEndStatusV2({
+      sessionId: SESSION_ID,
+      workflowId: WORKFLOW_ID,
+      workflowGeneration: 1,
+      priorRootState: "active",
+      triggeringEventPosition: 8n,
+      evidenceWindowState: "sealed",
+      materializationRequired: false,
+    });
+
+    assert.throws(
+      () => repository.createRequested({
+        projectId: PROJECT_ID,
+        workflowId: WORKFLOW_ID,
+        workflowGeneration: 1,
+        rootCommandId: ROOT_COMMAND_ID,
+        sessionId: SESSION_ID,
+        triggeringEventPosition: 8n,
+        expectedAuthorityCommitment: "a".repeat(64),
+        priorRootState: "active",
+        resultJson: canonicalJson(requested),
+        evidenceWindowState: "sealed",
+        now: "2026-08-15T00:00:00.000Z",
+        effectiveState: EFFECTIVE_STATE,
+      }),
+      (error: unknown): boolean => {
+        assert.ok(error instanceof Error);
+        assert.equal(error.message, "INJECTED_WORKFLOW_CREATE_FAULT");
+        return true;
+      },
+    );
+    assert.deepEqual(hits, [{
+      boundary: "workflow-create",
+      point: "before-write",
+      context: {
+        projectId: PROJECT_ID,
+        sessionId: SESSION_ID,
+        workflowId: WORKFLOW_ID,
+        commandId: ROOT_COMMAND_ID,
+        idempotencyKeyHash: null,
+        workId: null,
+        eventPosition: "8",
+        materializationRevision: null,
+      },
+    }]);
+    assert.equal(
+      connection.prepare("SELECT count(*) AS count FROM workflow_instances WHERE project_id = $projectId AND workflow_id = $workflowId").get({
+        $projectId: PROJECT_ID,
+        $workflowId: WORKFLOW_ID,
+      })?.count,
+      0n,
+    );
+    connection.close();
+  });
+
+  it("emits cancellation-rewrite before rewriting an eligible workflow row", () => {
+    const connection = workflowConnection();
+    const hits: Array<{
+      readonly boundary: string;
+      readonly point: string;
+      readonly context: unknown;
+    }> = [];
+    const faultInjector: LifecycleFaultInjector = {
+      hit(boundary, point, context): void {
+        hits.push({ boundary, point, context });
+        throw new Error("INJECTED_CANCELLATION_REWRITE_FAULT");
+      },
+    };
+    const repository = new SessionEndWorkflowRepository(connection, { faultInjector });
+
+    assert.throws(
+      () => repository.cancelGeneration({
+        projectId: PROJECT_ID,
+        workflowId: WORKFLOW_ID,
+        previousWorkflowGeneration: 1,
+        workflowGeneration: 2,
+        rootCommandId: COMMAND_ID,
+        sessionId: SESSION_ID,
+        triggeringEventPosition: 8n,
+        expectedAuthorityCommitment: "a".repeat(64),
+        restoredState: "active",
+        resultJson: canonicalJson({ phase: "cancelled", workflowGeneration: 2 }),
+        now: "2026-08-15T00:00:01.000Z",
+      }),
+      (error: unknown): boolean => {
+        assert.ok(error instanceof Error);
+        assert.equal(error.message, "INJECTED_CANCELLATION_REWRITE_FAULT");
+        return true;
+      },
+    );
+    assert.deepEqual(hits, [{
+      boundary: "cancellation-rewrite",
+      point: "before-write",
+      context: {
+        projectId: PROJECT_ID,
+        sessionId: SESSION_ID,
+        workflowId: WORKFLOW_ID,
+        commandId: COMMAND_ID,
+        idempotencyKeyHash: null,
+        workId: null,
+        eventPosition: "8",
+        materializationRevision: null,
+      },
+    }]);
+    const after = repository.read(PROJECT_ID, WORKFLOW_ID);
+    assert.equal(after?.generation, 1);
+    assert.equal(after?.phase, "requested");
+    connection.close();
+  });
+
+  it("emits abandonment-rewrite before abandoning an eligible workflow row", () => {
+    const connection = workflowConnection();
+    const hits: Array<{
+      readonly boundary: string;
+      readonly point: string;
+      readonly context: unknown;
+    }> = [];
+    const faultInjector: LifecycleFaultInjector = {
+      hit(boundary, point, context): void {
+        hits.push({ boundary, point, context });
+        throw new Error("INJECTED_ABANDONMENT_REWRITE_FAULT");
+      },
+    };
+    const repository = new SessionEndWorkflowRepository(connection, { faultInjector });
+
+    assert.throws(
+      () => repository.abandonGeneration({
+        projectId: PROJECT_ID,
+        workflowId: WORKFLOW_ID,
+        workflowGeneration: 1,
+        rootCommandId: COMMAND_ID,
+        sessionId: SESSION_ID,
+        triggeringEventPosition: 8n,
+        expectedAuthorityCommitment: "a".repeat(64),
+        resultJson: canonicalJson({ phase: "abandoned", workflowGeneration: 1 }),
+        now: "2026-08-15T00:00:01.000Z",
+      }),
+      (error: unknown): boolean => {
+        assert.ok(error instanceof Error);
+        assert.equal(error.message, "INJECTED_ABANDONMENT_REWRITE_FAULT");
+        return true;
+      },
+    );
+    assert.deepEqual(hits, [{
+      boundary: "abandonment-rewrite",
+      point: "before-write",
+      context: {
+        projectId: PROJECT_ID,
+        sessionId: SESSION_ID,
+        workflowId: WORKFLOW_ID,
+        commandId: COMMAND_ID,
+        idempotencyKeyHash: null,
+        workId: null,
+        eventPosition: "8",
+        materializationRevision: null,
+      },
+    }]);
+    const after = repository.read(PROJECT_ID, WORKFLOW_ID);
+    assert.equal(after?.state, "active");
+    assert.equal(after?.phase, "requested");
+    connection.close();
+  });
+
+  it("emits final-checkpoint before recording an eligible checkpoint", () => {
+    const connection = workflowConnection();
+    connection.prepare(`
+      UPDATE workflow_instances
+      SET phase = 'children-resolved',
+          coordinator_owner_id = 'coordinator-a',
+          coordinator_claim_token = 1,
+          coordinator_claim_expires_at = '2026-08-15T00:01:00.000Z',
+          coordinator_attempt_count = 1,
+          evidence_window_state = 'sealed',
+          evidence_frozen_checkpoint_event_position = NULL,
+          evidence_frozen_generation = NULL,
+          final_ending_scope_bindings_json = NULL
+      WHERE project_id = $projectId AND workflow_id = $workflowId
+    `).run({
+      $projectId: PROJECT_ID,
+      $workflowId: WORKFLOW_ID,
+    });
+    const hits: Array<{
+      readonly boundary: string;
+      readonly point: string;
+      readonly context: unknown;
+    }> = [];
+    const injected = new Error("INJECTED_FINAL_CHECKPOINT_FAULT");
+    const faultInjector: LifecycleFaultInjector = {
+      hit(boundary, point, context): void {
+        hits.push({ boundary, point, context });
+        throw injected;
+      },
+    };
+    const repository = new SessionEndWorkflowRepository(connection, { faultInjector });
+
+    assert.throws(
+      () => repository.recordFinalCheckpoint({
+        projectId: PROJECT_ID,
+        workflowId: WORKFLOW_ID,
+        workflowGeneration: 1,
+        sessionId: SESSION_ID,
+        rootCommandId: COMMAND_ID,
+        ownerId: "coordinator-a",
+        claimToken: 1n,
+        checkpointId: RESULT_ID,
+        checkpointEventPosition: 8n,
+        checkpointFingerprint: "b".repeat(64),
+        finalEndingScopeBindingsJson: canonicalJson([]),
+        resultJson: canonicalJson({ phase: "final-checkpoint-recorded" }),
+        now: "2026-08-15T00:00:01.000Z",
+      }),
+      (error: unknown): boolean => {
+        assert.equal(error, injected);
+        return true;
+      },
+    );
+    assert.deepEqual(hits, [{
+      boundary: "final-checkpoint",
+      point: "before-write",
+      context: {
+        projectId: PROJECT_ID,
+        sessionId: SESSION_ID,
+        workflowId: WORKFLOW_ID,
+        commandId: COMMAND_ID,
+        idempotencyKeyHash: null,
+        workId: null,
+        eventPosition: "8",
+        materializationRevision: null,
+      },
+    }]);
+    const after = repository.read(PROJECT_ID, WORKFLOW_ID);
+    assert.equal(after?.phase, "children-resolved");
+    assert.equal(after?.evidenceFrozenCheckpointEventPosition, null);
+    assert.equal(after?.evidenceFrozenGeneration, null);
+    assert.equal(after?.finalEndingScopeBindingsJson, null);
+    assert.equal(after?.coordinatorOwnerId, "coordinator-a");
+    assert.equal(after?.coordinatorClaimToken, 1n);
+    assert.equal(after?.coordinatorClaimExpiresAt, "2026-08-15T00:01:00.000Z");
+    connection.close();
+  });
+
   it("anchors requested status and reopens one cancelled row at the next generation", () => {
     const connection = workflowConnection();
     const repository = new SessionEndWorkflowRepository(connection);
@@ -228,6 +490,114 @@ describe("SessionEndWorkflowService", () => {
     assert.equal(row?.rootCommandId, COMMAND_ID);
     assert.equal(row?.triggeringEventPosition, 12n);
     assert.equal(row?.resultJson, null);
+    connection.close();
+  });
+
+  it("fences amendment and cancellation generations while clearing stale operational state", () => {
+    const connection = workflowConnection();
+    const repository = new SessionEndWorkflowRepository(connection);
+    connection.prepare("DELETE FROM workflow_instances WHERE project_id = $projectId AND workflow_id = $workflowId").run({
+      $projectId: PROJECT_ID,
+      $workflowId: WORKFLOW_ID,
+    });
+    const requested = requestedSessionEndStatusV2({
+      sessionId: SESSION_ID,
+      workflowId: WORKFLOW_ID,
+      workflowGeneration: 1,
+      priorRootState: "active",
+      triggeringEventPosition: 8n,
+      evidenceWindowState: "sealed",
+      materializationRequired: false,
+    });
+    const requestedObject = JSON.parse(canonicalJson(requested)) as Record<string, unknown>;
+    repository.createRequested({
+      projectId: PROJECT_ID,
+      workflowId: WORKFLOW_ID,
+      workflowGeneration: 1,
+      rootCommandId: ROOT_COMMAND_ID,
+      sessionId: SESSION_ID,
+      triggeringEventPosition: 8n,
+      expectedAuthorityCommitment: "a".repeat(64),
+      priorRootState: "active",
+      resultJson: canonicalJson(requested),
+      evidenceWindowState: "sealed",
+      now: "2026-08-15T00:00:00.000Z",
+      effectiveState: EFFECTIVE_STATE,
+    });
+    connection.prepare(`
+      UPDATE workflow_instances
+      SET coordinator_owner_id = 'old-coordinator', coordinator_claim_token = 1,
+          coordinator_claim_expires_at = '2026-08-15T00:01:00.000Z',
+          coordinator_attempt_count = 1, validation_attempt_plan_generation = 1,
+          validation_attempt_plans_json = '[]', error_code = 'OLD_FAILURE'
+      WHERE project_id = $projectId AND workflow_id = $workflowId
+    `).run({ $projectId: PROJECT_ID, $workflowId: WORKFLOW_ID });
+    const amended = {
+      ...requestedObject,
+      workflowGeneration: 2,
+      phase: "requested" as const,
+      triggeringEventPosition: "9",
+      evidenceWindow: {
+        evidenceWindowState: "open" as const,
+        evidenceFrozenCheckpointEventPosition: null,
+        evidenceFrozenGeneration: null,
+      },
+    } as unknown as SessionEndStatusV2;
+    repository.amendGeneration({
+      projectId: PROJECT_ID,
+      workflowId: WORKFLOW_ID,
+      previousWorkflowGeneration: 1,
+      workflowGeneration: 2,
+      rootCommandId: COMMAND_ID,
+      sessionId: SESSION_ID,
+      triggeringEventPosition: 9n,
+      expectedAuthorityCommitment: "a".repeat(64),
+      phase: "requested",
+      resultJson: canonicalJson(amended),
+      evidenceWindowState: "open",
+      clearFrozenGroup: true,
+      now: "2026-08-15T00:00:01.000Z",
+    });
+    const afterAmendment = repository.read(PROJECT_ID, WORKFLOW_ID);
+    assert.equal(afterAmendment?.generation, 2);
+    assert.equal(afterAmendment?.rootCommandId, COMMAND_ID);
+    assert.equal(afterAmendment?.coordinatorOwnerId, null);
+    assert.equal(afterAmendment?.coordinatorAttemptCount, 0n);
+    assert.equal(afterAmendment?.validationAttemptPlansJson, null);
+    assert.equal(afterAmendment?.evidenceWindowState, "open");
+    assert.equal(afterAmendment?.errorCode, null);
+
+    const cancelled = {
+      ...(JSON.parse(canonicalJson(amended)) as Record<string, unknown>),
+      workflowGeneration: 3,
+      phase: "cancelled" as const,
+      triggeringEventPosition: "10",
+      evidenceWindow: {
+        evidenceWindowState: "sealed" as const,
+        evidenceFrozenCheckpointEventPosition: null,
+        evidenceFrozenGeneration: null,
+      },
+    } as unknown as SessionEndStatusV2;
+    repository.cancelGeneration({
+      projectId: PROJECT_ID,
+      workflowId: WORKFLOW_ID,
+      previousWorkflowGeneration: 2,
+      workflowGeneration: 3,
+      rootCommandId: lifecycleUuid(12),
+      sessionId: SESSION_ID,
+      triggeringEventPosition: 10n,
+      expectedAuthorityCommitment: "a".repeat(64),
+      restoredState: "active",
+      resultJson: canonicalJson(cancelled),
+      now: "2026-08-15T00:00:02.000Z",
+    });
+    const afterCancellation = repository.read(PROJECT_ID, WORKFLOW_ID);
+    assert.equal(afterCancellation?.generation, 3);
+    assert.equal(afterCancellation?.phase, "cancelled");
+    assert.equal(afterCancellation?.evidenceWindowState, "sealed");
+    assert.equal(afterCancellation?.coordinatorOwnerId, null);
+    assert.equal(afterCancellation?.validationAttemptPlanGeneration, null);
+    assert.equal(afterCancellation?.evidenceFrozenCheckpointEventPosition, null);
     connection.close();
   });
 

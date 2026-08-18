@@ -1,5 +1,4 @@
 import { createHash } from "node:crypto";
-
 import type {
   JsonValue,
   PendingEvent,
@@ -13,6 +12,7 @@ import type {
   CheckpointIndexCompareAndSwap,
   SessionAuthorityRecord,
 } from "../storage/lifecycle-storage.types.js";
+import type { SessionEndWorkflowRecordV1 } from "../storage/session-end.repository.js";
 import {
   decodeCheckpointDraftV2,
   decodeCheckpointDraftV1,
@@ -27,6 +27,8 @@ import {
 } from "./contracts/checkpoint.js";
 import {
   decodeLifecycleSemanticCommandDraft,
+  type InternalRootWorkflowPhaseCommand,
+  type WorkflowClaimAssertionV1,
   type RecordFinalCheckpointAndQueueEndingActionV1,
   type RecordFinalCheckpointAndQueueEndingActionV2,
   type RecordCheckpointCommandV2,
@@ -34,8 +36,31 @@ import {
   type RootSuspendCommandV2,
   type RootSuspendCommandV3,
 } from "./contracts/commands.js";
-import type { CheckpointId, SessionId } from "./contracts/identifiers.js";
+import {
+  parseBoundedString,
+  parseCanonicalTimestamp,
+  parseDecimalString,
+  parseInteger,
+  parseLifecycleId,
+  type CheckpointId,
+  type SessionId,
+  type WorkflowId,
+} from "./contracts/identifiers.js";
+import {
+  decodeFinalEndingScopeBindingsV1,
+  type FinalEndingScopeBindingV1,
+  type SessionEndPhaseResultV2,
+} from "./contracts/session-end.js";
+import type {
+  LifecycleMaterializationQueuePort,
+  PreparedMaterializationQueueV1,
+} from "./materialization-queue.port.js";
 import { LifecycleError } from "./errors.js";
+import type {
+  LifecycleDurableBoundary,
+  LifecycleFaultContext,
+  LifecycleFaultInjector,
+} from "./lifecycle-faults.js";
 import type {
   LifecycleCommandTransaction,
   PreparedLifecycleCommit,
@@ -49,6 +74,40 @@ import type {
 const SQLITE_INT64_MAX = 9_223_372_036_854_775_807n;
 const CANONICAL_TIMESTAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u;
 const CHECKPOINT_AGE_LIMIT_MILLISECONDS_V1 = 900_000n;
+
+function checkpointFaultContext(
+  context: ProjectContext,
+  command: { readonly commandId: string; readonly idempotencyKey: string; readonly sessionId: SessionId },
+  eventPosition: bigint,
+): LifecycleFaultContext {
+  return Object.freeze({
+    projectId: context.binding.projectId,
+    sessionId: command.sessionId,
+    workflowId: null,
+    commandId: command.commandId,
+    idempotencyKeyHash: createHash("sha256")
+      .update(command.idempotencyKey, "utf8")
+      .digest("hex"),
+    workId: null,
+    eventPosition: eventPosition.toString(),
+    materializationRevision: null,
+  });
+}
+
+function invokeCheckpointFault(
+  injector: CheckpointFaultInjector | undefined,
+  legacyPoint: "before-checkpoint-index-cas" | "after-checkpoint-index-before-marker-clear",
+  boundary: LifecycleDurableBoundary,
+  point: "before-write" | "after-write-before-commit",
+  context: LifecycleFaultContext,
+): void {
+  if (injector === undefined) return;
+  if (typeof injector === "function") {
+    injector(legacyPoint);
+    return;
+  }
+  injector.hit(boundary, point, context);
+}
 
 export const RISKY_TRANSITIONS_V1 = Object.freeze([
   "ownership-transfer",
@@ -93,6 +152,7 @@ export interface TrustedCheckpointInvocationV1 {
   readonly sourceStateScope: SourceStateScopeV1;
   readonly authorizationRecord: PersistedLifecycleAuthorizationRecord;
   readonly freshCapabilityGeneration?: string;
+  readonly workflowClaim?: WorkflowClaimAssertionV1;
 }
 
 export interface CheckpointInvocationScope {
@@ -116,7 +176,26 @@ export interface CheckpointCoverageSnapshotPort {
 export interface FinalCheckpointPhasePreparationInput {
   readonly command: RecordCheckpointCommandV2 | RecordCheckpointCommandV3;
   readonly materializationTarget: string;
+  readonly workflowClaim?: WorkflowClaimAssertionV1;
 }
+
+export interface FinalCheckpointWorkflowPhasePreparationInput
+  extends FinalCheckpointPhasePreparationInput {
+  readonly workflowClaim: WorkflowClaimAssertionV1;
+  readonly internalCommand: Pick<InternalRootWorkflowPhaseCommand, "commandType" | "agentId">;
+  readonly finalEndingScopeBindings: readonly FinalEndingScopeBindingV1[];
+  readonly finalizeWorkflow: (
+    transaction: LifecycleCommandTransaction,
+    checkpoint: Checkpoint,
+    checkpointFingerprint: string,
+    checkpointEventPosition: bigint,
+    occurredAt: string,
+  ) => void;
+}
+
+export type CheckpointFaultInjector =
+  | ((point: "before-checkpoint-index-cas" | "after-checkpoint-index-before-marker-clear") => void)
+  | LifecycleFaultInjector;
 
 const PREPARED_FINAL_CHECKPOINT_PHASE = Symbol("prepared-final-checkpoint-phase");
 
@@ -134,9 +213,8 @@ export interface CheckpointServiceOptions {
   readonly identitySource: CheckpointIdentitySource;
   readonly clock: CheckpointClock;
   readonly coverageSnapshot?: CheckpointCoverageSnapshotPort;
-  readonly faultInjector?: (
-    point: "before-checkpoint-index-cas" | "after-checkpoint-index-before-marker-clear",
-  ) => void;
+  readonly materializationQueue?: LifecycleMaterializationQueuePort;
+  readonly faultInjector?: CheckpointFaultInjector;
 }
 
 export interface RootSuspensionCheckpointPreparationInput {
@@ -167,6 +245,9 @@ export interface RiskyTransitionCheckpointInputV1 {
   readonly checkpoint: Checkpoint | null;
   readonly explicitCheckpointId?: string;
   readonly minimumBaseEventPosition?: bigint;
+  /** Session-end amendments/cancellation validate the latest ordinary
+   * checkpoint while the root stream already contains the request event. */
+  readonly allowTrailingRootEvents?: boolean;
   readonly relevantChildren: readonly RiskyTransitionRelevantChildV1[];
 }
 
@@ -379,6 +460,49 @@ function assertAuthorityAndAggregate(
   }
 }
 
+function finalWorkflowRow(
+  transaction: LifecycleCommandTransaction,
+  projectId: string,
+  claim: WorkflowClaimAssertionV1,
+): SessionEndWorkflowRecordV1 {
+  const workflows = transaction.workflows as object;
+  const descriptor = Object.getOwnPropertyDescriptor(workflows, "read");
+  if (descriptor === undefined || !descriptor.enumerable || !("value" in descriptor)
+    || typeof descriptor.value !== "function") invalid("INTEGRITY_FAILURE");
+  const workflow = (descriptor.value as (projectId: string, workflowId: string) => SessionEndWorkflowRecordV1 | null)(
+    projectId,
+    claim.workflowId,
+  );
+  if (workflow === null) invalid("INTEGRITY_FAILURE");
+  return workflow;
+}
+
+function assertFinalWorkflowClaim(
+  transaction: LifecycleCommandTransaction,
+  context: ProjectContext,
+  command: RecordCheckpointCommandV2 | RecordCheckpointCommandV3,
+  claim: WorkflowClaimAssertionV1,
+  now: string,
+): SessionEndWorkflowRecordV1 {
+  const workflow = finalWorkflowRow(transaction, context.binding.projectId, claim);
+  if (workflow.projectId !== context.binding.projectId
+    || workflow.sessionId !== command.sessionId
+    || workflow.workflowId !== claim.workflowId
+    || workflow.generation !== claim.workflowGeneration
+    || workflow.phase !== "children-resolved"
+    || workflow.evidenceWindowState !== "sealed"
+    || workflow.evidenceFrozenCheckpointEventPosition !== null
+    || workflow.evidenceFrozenGeneration !== null
+    || workflow.finalEndingScopeBindingsJson !== null
+    || workflow.coordinatorOwnerId !== claim.claimOwnerId
+    || workflow.coordinatorClaimToken !== BigInt(claim.claimToken)
+    || workflow.coordinatorClaimExpiresAt !== claim.claimExpiresAt
+    || Date.parse(workflow.coordinatorClaimExpiresAt ?? "") <= Date.parse(now)) {
+    throw new LifecycleError("SESSION_END_INCOMPLETE");
+  }
+  return workflow;
+}
+
 function syncValue<T>(value: T): T {
   if (typeof value === "object" && value !== null && "then" in value
     && typeof (value as { readonly then?: unknown }).then === "function") invalid();
@@ -390,7 +514,9 @@ function finalCheckpointPreparationInput(
 ): FinalCheckpointPhasePreparationInput {
   if (typeof value !== "object" || value === null || Array.isArray(value)) invalid();
   const keys = Reflect.ownKeys(value);
-  if (keys.length !== 2 || !keys.includes("command") || !keys.includes("materializationTarget")) {
+  if ((keys.length !== 2 && keys.length !== 3)
+    || !keys.includes("command")
+    || !keys.includes("materializationTarget")) {
     invalid();
   }
   const command = Object.getOwnPropertyDescriptor(value, "command");
@@ -399,9 +525,48 @@ function finalCheckpointPreparationInput(
     || target === undefined || !target.enumerable || !("value" in target)
     || typeof target.value !== "string" || target.value.length === 0
     || Array.from(target.value).length > 1_024) invalid();
+  const claimDescriptor = Object.getOwnPropertyDescriptor(value, "workflowClaim");
+  if (keys.length === 3 && (claimDescriptor === undefined
+    || !claimDescriptor.enumerable
+    || !("value" in claimDescriptor))) invalid();
   return Object.freeze({
     command: command.value as RecordCheckpointCommandV2 | RecordCheckpointCommandV3,
     materializationTarget: target.value,
+    ...(keys.length === 3
+      ? { workflowClaim: decodeWorkflowClaim(claimDescriptor!.value) }
+      : {}),
+  });
+}
+
+function decodeWorkflowClaim(value: unknown): WorkflowClaimAssertionV1 {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) invalid();
+  const keys = Reflect.ownKeys(value);
+  const expected = [
+    "workflowId",
+    "workflowGeneration",
+    "claimOwnerId",
+    "claimToken",
+    "claimExpiresAt",
+  ];
+  if (keys.length !== expected.length
+    || keys.some((key) => typeof key !== "string" || !expected.includes(key))) invalid();
+  const data: Record<string, unknown> = {};
+  for (const key of expected) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (descriptor === undefined || !descriptor.enumerable || !("value" in descriptor)) invalid();
+    data[key] = descriptor.value;
+  }
+  return Object.freeze({
+    workflowId: parseLifecycleId<WorkflowId>(data.workflowId, "workflowClaim.workflowId"),
+    workflowGeneration: parseInteger(
+      data.workflowGeneration,
+      "workflowClaim.workflowGeneration",
+      1,
+      Number.MAX_SAFE_INTEGER,
+    ),
+    claimOwnerId: parseBoundedString(data.claimOwnerId, "workflowClaim.claimOwnerId", 256),
+    claimToken: parseDecimalString(data.claimToken, "workflowClaim.claimToken"),
+    claimExpiresAt: parseCanonicalTimestamp(data.claimExpiresAt, "workflowClaim.claimExpiresAt"),
   });
 }
 
@@ -602,7 +767,8 @@ export function requireRiskyTransitionCheckpointV1(
     || aggregate.latestCheckpointBaseEventPosition === null
     || BigInt(checkpoint.checkpointEventPosition) !== authority.latestCheckpointEventPosition
     || BigInt(checkpoint.checkpointEventPosition) !== aggregate.latestCheckpointEventPosition
-    || BigInt(checkpoint.checkpointEventPosition) !== aggregate.eventPosition
+    || (!input.allowTrailingRootEvents
+      && BigInt(checkpoint.checkpointEventPosition) !== aggregate.eventPosition)
     || BigInt(checkpoint.baseEventPosition) !== aggregate.latestCheckpointBaseEventPosition
     || authority.latestCheckpointFingerprint !== checkpointFingerprint(checkpoint)) {
     throw new LifecycleError("CHECKPOINT_BASE_INVALID");
@@ -654,21 +820,32 @@ function pendingCheckpointEvent(
   checkpoint: Checkpoint,
   parentSessionId: string | null,
   occurredAt: string,
+  finalWorkflowClaim?: WorkflowClaimAssertionV1,
 ): PendingEvent {
+  const payload = finalWorkflowClaim === undefined
+    ? {
+        checkpoint: checkpoint as unknown as JsonValue,
+        baseEventPosition: checkpoint.baseEventPosition,
+        checkpointEventPosition: checkpoint.checkpointEventPosition,
+      }
+    : {
+        checkpoint: checkpoint as unknown as JsonValue,
+        baseEventPosition: checkpoint.baseEventPosition,
+        checkpointEventPosition: checkpoint.checkpointEventPosition,
+        finalCheckpointBindingVersion: 1,
+        workflowId: finalWorkflowClaim.workflowId,
+        workflowGeneration: finalWorkflowClaim.workflowGeneration,
+      } as unknown as JsonValue;
   return {
     eventType: "SessionCheckpointRecorded",
-    eventSchemaVersion: checkpoint.checkpointVersion,
+    eventSchemaVersion: finalWorkflowClaim === undefined ? checkpoint.checkpointVersion : 3,
     occurredAt,
     visibilityScope: "session",
     sessionId: checkpoint.sessionId,
     ...(parentSessionId === null ? {} : { parentSessionId }),
     confidence: "high",
     verificationStatus: "verified",
-    payload: {
-      checkpoint: checkpoint as unknown as JsonValue,
-      baseEventPosition: checkpoint.baseEventPosition,
-      checkpointEventPosition: checkpoint.checkpointEventPosition,
-    },
+    payload: payload as JsonValue,
     sourceRefs: [],
     evidenceRefs: [],
     evidenceDigests: [],
@@ -689,6 +866,7 @@ interface CheckpointPreparationInput {
   readonly childSummaries: () => CheckpointV1["childSummaries"];
   readonly version1EligibilitySessionIds: readonly SessionId[];
   readonly finalization: boolean;
+  readonly finalWorkflowClaim?: WorkflowClaimAssertionV1;
 }
 
 interface PreparedCheckpoint {
@@ -697,12 +875,19 @@ interface PreparedCheckpoint {
   readonly event: PendingEvent;
 }
 
+type FinalCheckpointRuntimeInput = FinalCheckpointPhasePreparationInput & {
+  readonly internalCommand?: Pick<InternalRootWorkflowPhaseCommand, "commandType" | "agentId">;
+  readonly finalEndingScopeBindings?: readonly FinalEndingScopeBindingV1[];
+  readonly finalizeWorkflow?: FinalCheckpointWorkflowPhasePreparationInput["finalizeWorkflow"];
+};
+
 export class CheckpointService {
   readonly #invocations: CheckpointInvocationScope;
   readonly #sourceState: SourceStateProvider;
   readonly #ids: CheckpointIdentitySource;
   readonly #clock: CheckpointClock;
   readonly #faultInjector: CheckpointServiceOptions["faultInjector"];
+  readonly #materializationQueue: LifecycleMaterializationQueuePort | undefined;
   readonly #preparedFinals = new WeakMap<
     PreparedFinalCheckpointPhase,
     {
@@ -719,12 +904,15 @@ export class CheckpointService {
       || typeof options.identitySource?.uuid !== "function"
       || typeof options.clock?.now !== "function"
       || (options.coverageSnapshot !== undefined && typeof options.coverageSnapshot.capture !== "function")
-      || (options.faultInjector !== undefined && typeof options.faultInjector !== "function")) invalid();
+      || (options.faultInjector !== undefined
+        && typeof options.faultInjector !== "function"
+        && typeof options.faultInjector.hit !== "function")) invalid();
     this.#invocations = options.invocationScope;
     this.#sourceState = options.sourceStateProvider;
     this.#ids = options.identitySource;
     this.#clock = options.clock;
     this.#faultInjector = options.faultInjector;
+    this.#materializationQueue = options.materializationQueue;
   }
 
   record(
@@ -820,7 +1008,9 @@ export class CheckpointService {
     input: FinalCheckpointPhasePreparationInput,
   ): PreparedFinalCheckpointPhase {
     const preparedInput = finalCheckpointPreparationInput(input);
-    const effect = immutablePreparedEffect(this.#record(transaction, preparedInput.command, true));
+    const effect = immutablePreparedEffect(
+      this.#record(transaction, preparedInput.command, true, preparedInput),
+    );
     const pending = effect.append.events[0];
     if (pending?.eventType !== "SessionCheckpointRecorded"
       || typeof pending.payload !== "object" || pending.payload === null
@@ -831,6 +1021,56 @@ export class CheckpointService {
       : preparedInput.command.draft.checkpointVersion === 2
         ? decodeCheckpointV2(checkpointInput)
         : invalid("INTEGRITY_FAILURE");
+    const action = Object.freeze({
+      action: "record-final-checkpoint-and-queue-ending" as const,
+      finalCheckpoint: checkpoint,
+      materializationTarget: preparedInput.materializationTarget,
+    });
+    const prepared = Object.freeze({
+      [PREPARED_FINAL_CHECKPOINT_PHASE]: true as const,
+      action,
+      effect,
+    }) as PreparedFinalCheckpointPhase;
+    this.#preparedFinals.set(prepared, Object.freeze({ transaction, effect }));
+    return prepared;
+  }
+
+  /**
+   * Internal coordinator entry point.  The public two/three-key preparation
+   * above remains compatible with ordinary checkpoint fixtures; this path
+   * additionally binds the V3 marker to the claimed workflow and supplies the
+   * final ending-scope freeze callback.
+   */
+  prepareFinalWorkflowPhase(
+    transaction: LifecycleCommandTransaction,
+    input: FinalCheckpointWorkflowPhasePreparationInput,
+  ): PreparedFinalCheckpointPhase {
+    if (typeof input !== "object" || input === null
+      || input.workflowClaim === undefined
+      || input.internalCommand === undefined
+      || !Array.isArray(input.finalEndingScopeBindings)
+      || typeof input.finalizeWorkflow !== "function") invalid("INTEGRITY_FAILURE");
+    const preparedInput = finalCheckpointPreparationInput({
+      command: input.command,
+      materializationTarget: input.materializationTarget,
+      workflowClaim: input.workflowClaim,
+    });
+    const effect = immutablePreparedEffect(
+      this.#record(transaction, preparedInput.command, true, {
+        ...preparedInput,
+        internalCommand: input.internalCommand,
+        finalEndingScopeBindings: input.finalEndingScopeBindings,
+        finalizeWorkflow: input.finalizeWorkflow,
+      }),
+    );
+    const pending = effect.append.events[0];
+    if (pending?.eventType !== "SessionCheckpointRecorded"
+      || typeof pending.payload !== "object" || pending.payload === null
+      || Array.isArray(pending.payload)) invalid("INTEGRITY_FAILURE");
+    const checkpointInput = (pending.payload as Readonly<Record<string, JsonValue>>).checkpoint;
+    const checkpoint = preparedInput.command.draft.checkpointVersion === 1
+      ? decodeCheckpointV1(checkpointInput)
+      : decodeCheckpointV2(checkpointInput);
     const action = Object.freeze({
       action: "record-final-checkpoint-and-queue-ending" as const,
       finalCheckpoint: checkpoint,
@@ -939,6 +1179,7 @@ export class CheckpointService {
         checkpoint,
         input.current.parentSessionId,
         createdAt,
+        input.finalWorkflowClaim,
       ),
     });
   }
@@ -947,6 +1188,7 @@ export class CheckpointService {
     transaction: LifecycleCommandTransaction,
     commandInput: RecordCheckpointCommandV2 | RecordCheckpointCommandV3,
     finalization: boolean,
+    finalInput?: FinalCheckpointRuntimeInput,
   ): FreshLifecycleEffect<CheckpointRecordedResult> {
     const decoded = decodeLifecycleSemanticCommandDraft(commandInput);
     if (decoded.commandType !== "record-checkpoint") invalid();
@@ -954,6 +1196,13 @@ export class CheckpointService {
     const command = decoded;
     const invocation = this.#invocations.current(transaction, command);
     assertContext(invocation.context, command);
+    const workflowClaim = finalization
+      ? finalInput?.workflowClaim ?? invocation.workflowClaim
+      : undefined;
+    if (finalization && workflowClaim !== undefined
+      && this.#materializationQueue === undefined) {
+      invalid("INTEGRITY_FAILURE");
+    }
     const draft = command.draft.checkpointVersion === 1
       ? decodeCheckpointDraftV1(command.draft)
       : decodeCheckpointDraftV2(command.draft);
@@ -967,6 +1216,15 @@ export class CheckpointService {
       ...authority.requireFoldMatch(current),
     }) as SessionAggregateState;
     assertAuthorityAndAggregate(current, aggregate);
+    // Ordinary checkpoint writes must not touch the finalization clock (or
+    // any other final-only witness) before their normal evidence validation
+    // has completed.  Apart from keeping the two paths audibly separate,
+    // this is important for callers that deliberately provide a clock only
+    // for final workflow work.
+    const now = workflowClaim === undefined ? null : canonicalNow(this.#clock);
+    if (workflowClaim !== undefined) {
+      assertFinalWorkflowClaim(transaction, invocation.context, command, workflowClaim, now!);
+    }
     authority.latestCheckpoint(current);
     if (BigInt(command.expectedStreamVersion) !== aggregate.streamVersion) {
       throw new LifecycleError("EVENT_CONFLICT");
@@ -988,6 +1246,9 @@ export class CheckpointService {
       throw new LifecycleError("CHECKPOINT_BASE_INVALID");
     }
 
+    const endingScopeBindings = finalInput?.finalEndingScopeBindings === undefined
+      ? Object.freeze([]) as readonly FinalEndingScopeBindingV1[]
+      : decodeFinalEndingScopeBindingsV1(finalInput.finalEndingScopeBindings);
     const prepared = this.#prepareCheckpoint({
       transaction,
       context: invocation.context,
@@ -1005,8 +1266,12 @@ export class CheckpointService {
           aggregate,
           baseEventPosition,
         ),
-      version1EligibilitySessionIds: Object.freeze([current.sessionId as SessionId]),
+      version1EligibilitySessionIds: Object.freeze([
+        current.sessionId as SessionId,
+        ...endingScopeBindings.map((binding) => binding.childSessionId),
+      ]),
       finalization,
+      ...(workflowClaim === undefined ? {} : { finalWorkflowClaim: workflowClaim }),
     });
     const { checkpoint } = prepared;
     const createdAt = checkpoint.createdAt;
@@ -1022,19 +1287,47 @@ export class CheckpointService {
       checkpointRequiredCleared,
     });
     const event = prepared.event;
+    let preparedMaterialization: PreparedMaterializationQueueV1 | undefined;
+    if (workflowClaim !== undefined) {
+      const queue = this.#materializationQueue;
+      if (queue === undefined || finalInput?.materializationTarget === undefined) {
+        invalid("INTEGRITY_FAILURE");
+      }
+      preparedMaterialization = queue.prepare({
+        context: invocation.context,
+        sessionId: current.sessionId as SessionId,
+        artifactKind: "compatibility-session-log",
+        triggeringEventIndex: 0,
+        expectedTriggerPosition: checkpointPosition,
+        triggeringEventSchemaVersion: 3,
+        triggeringOccurredAt: event.occurredAt,
+        triggeringEventPayload: event.payload as JsonValue,
+        origin: {
+          kind: "workflow",
+          workflowId: workflowClaim.workflowId,
+          workflowGeneration: workflowClaim.workflowGeneration,
+        },
+        triggeringEventType: "SessionCheckpointRecorded",
+      });
+    }
+    const internalCommand = finalInput?.internalCommand;
+    const appendCommandType = internalCommand?.commandType ?? command.commandType;
+    const appendAgentId = internalCommand?.agentId ?? command.agentId;
     return {
       append: {
         context: invocation.context,
         commandId: command.commandId,
         idempotencyKey: command.idempotencyKey,
-        commandType: command.commandType,
+        commandType: appendCommandType,
         correlationId: aggregate.correlationId,
-        agentId: command.agentId,
+        agentId: appendAgentId,
         expectedStreamVersion: aggregate.streamVersion,
         streamId: current.streamId,
         streamType: "session",
         events: [event],
-        outbox: [],
+        outbox: preparedMaterialization === undefined
+          ? []
+          : [preparedMaterialization.pendingOutbox],
         publicResponse: result,
       },
       authorizationRecord: invocation.authorizationRecord,
@@ -1045,12 +1338,28 @@ export class CheckpointService {
         if (planned.events.length !== 1
           || planned.events[0]?.globalPosition !== checkpointPosition
           || planned.events[0]?.streamVersion !== aggregate.streamVersion + 1n) invalid("INTEGRITY_FAILURE");
+        if (preparedMaterialization !== undefined) {
+          const plannedTrigger = planned.events[0];
+          if (plannedTrigger === undefined) invalid("INTEGRITY_FAILURE");
+          this.#materializationQueue?.assertPlanned(preparedMaterialization, plannedTrigger);
+        }
       },
       afterAppend: (committed, currentTransaction) => {
         if (committed.events.length !== 1
           || committed.events[0]?.globalPosition !== checkpointPosition
           || committed.events[0]?.streamVersion !== aggregate.streamVersion + 1n) invalid("INTEGRITY_FAILURE");
-        this.#faultInjector?.("before-checkpoint-index-cas");
+        const faultContext = checkpointFaultContext(
+          invocation.context,
+          command,
+          checkpointPosition,
+        );
+        invokeCheckpointFault(
+          this.#faultInjector,
+          "before-checkpoint-index-cas",
+          "authority-cas",
+          "before-write",
+          faultContext,
+        );
         const currentAuthority = authorityOperations(currentTransaction);
         if (!currentAuthority.updateCheckpointIndex({
           projectId: current.projectId,
@@ -1063,13 +1372,33 @@ export class CheckpointService {
           checkpointFingerprint: fingerprint,
           updatedAt: createdAt,
         })) throw new LifecycleError("EVENT_CONFLICT");
-        this.#faultInjector?.("after-checkpoint-index-before-marker-clear");
+        invokeCheckpointFault(
+          this.#faultInjector,
+          "after-checkpoint-index-before-marker-clear",
+          "final-checkpoint",
+          "after-write-before-commit",
+          faultContext,
+        );
         if (checkpointRequiredCleared && !currentAuthority.clearCheckpointRequired({
           projectId: current.projectId,
           sessionId: current.sessionId,
           checkpointBaseEventPosition: baseEventPosition,
           updatedAt: createdAt,
         })) invalid("INTEGRITY_FAILURE");
+        if (workflowClaim !== undefined && finalInput?.finalizeWorkflow !== undefined) {
+          finalInput.finalizeWorkflow(
+            currentTransaction,
+            checkpoint,
+            fingerprint,
+            checkpointPosition,
+            createdAt,
+          );
+        }
+        if (preparedMaterialization !== undefined) {
+          const committedTrigger = committed.events[0];
+          if (committedTrigger === undefined) invalid("INTEGRITY_FAILURE");
+          this.#materializationQueue?.assertCommitted(preparedMaterialization, committedTrigger);
+        }
       },
     };
   }

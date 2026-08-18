@@ -14,6 +14,7 @@ import type {
   SqliteConnection,
   SqliteStatement,
 } from "../src/orchestrator/storage/sqlite-driver.js";
+import type { LifecycleFaultContext } from "../src/orchestrator/lifecycle/lifecycle-faults.js";
 
 class OperationalConnection implements SqliteConnection {
   readonly statements: string[] = [];
@@ -109,6 +110,31 @@ function isLifecycleInputInvalid(error: unknown): boolean {
 }
 
 describe("LifecycleOperationalStore", () => {
+  it("exposes an operational before-write boundary with a stable work context", () => {
+    const connection = new OperationalConnection();
+    const hits: LifecycleFaultContext[] = [];
+    const store = new LifecycleOperationalStore({
+      connection,
+      transaction: () => transaction(connection),
+      faultInjector: {
+        hit(boundary, point, context): void {
+          assert.equal(boundary, "workflow-phase");
+          assert.equal(point, "before-write");
+          hits.push(context);
+          throw new Error("fixture crash");
+        },
+      },
+    });
+
+    assert.throws(() => store.execute(work(), () => ({ progressed: true })), /fixture crash/);
+    assert.equal(hits.length, 1);
+    assert.equal(hits[0]?.projectId, work().projectId);
+    assert.equal(hits[0]?.workflowId, work().workflowId);
+    assert.equal(hits[0]?.workId, null);
+    assert.deepEqual(connection.committed, []);
+    assert.deepEqual(connection.statements, ["BEGIN IMMEDIATE", "ROLLBACK"]);
+  });
+
   it("preserves claim-next identities before a target row exists", () => {
     const connection = new OperationalConnection();
     const store = new LifecycleOperationalStore({

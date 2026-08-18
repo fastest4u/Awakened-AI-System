@@ -443,10 +443,10 @@ describe("MigrationRunner", () => {
             );
           },
         },
-      ), [2, 3, 4]);
+      ), [2, 3, 4, 5]);
       assert.equal(
         connection.prepare("SELECT schema_version FROM project_meta").get()?.schema_version,
-        4n,
+        5n,
       );
     } finally {
       connection.close();

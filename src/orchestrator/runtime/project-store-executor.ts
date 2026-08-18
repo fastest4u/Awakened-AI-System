@@ -46,6 +46,7 @@ import {
   type LifecycleWorkerOperationWire,
   type LifecycleWorkerSuccessWire,
 } from "./lifecycle-worker-protocol.js";
+import type { LifecycleFaultInjector } from "../lifecycle/lifecycle-faults.js";
 import {
   decodeAppendResultWire,
   decodeIntegrityReport,
@@ -139,6 +140,7 @@ export interface ProjectStoreExecutorDependencies {
     confirmation: MaintenanceClosureConfirmation,
   ) => void | Promise<void>;
   readonly authorityMaterialAdapter?: AuthorityMaterialAdapter;
+  readonly lifecycleFaultInjector?: LifecycleFaultInjector;
 }
 
 export interface MaintenanceClosureConfirmation {
@@ -307,11 +309,12 @@ function operationalIdentity(
       break;
     case "workflow-recovery":
       work = Object.freeze({
+        kind: "workflow-recovery",
         projectId,
         workId: input.workId,
-        operation: "workflow-recovery",
+        operation: "recovery",
         ownerId: input.ownerId,
-        fencingToken: input.fencingToken,
+        claimToken: input.fencingToken,
       });
       break;
     case "workflow-claim":
@@ -377,6 +380,15 @@ function identityOutcomeUnknown(identity: PendingLifecycleIdentity): ProjectStor
         work: identity.work,
       }));
   }
+}
+
+function faultWorkId(identity: PendingLifecycleIdentity | null): string | null {
+  if (identity === null || identity.kind !== "operational") return null;
+  if (typeof identity.work !== "object" || identity.work === null || Array.isArray(identity.work)) {
+    return null;
+  }
+  const workId = (identity.work as Readonly<Record<string, unknown>>).workId;
+  return typeof workId === "string" ? workId : null;
 }
 
 interface PendingRequest {
@@ -552,6 +564,9 @@ export class ProjectStoreExecutor {
       ...(dependencies.authorityMaterialAdapter === undefined
         ? {}
         : { authorityMaterialAdapter: dependencies.authorityMaterialAdapter }),
+      ...(dependencies.lifecycleFaultInjector === undefined
+        ? {}
+        : { lifecycleFaultInjector: dependencies.lifecycleFaultInjector }),
     };
     this.#workerExit = new Promise<number>((resolveExit) => {
       this.#resolveWorkerExit = resolveExit;
@@ -752,9 +767,24 @@ export class ProjectStoreExecutor {
       }
       throw error;
     }
+    let responseDeliveryFault = false;
     try {
-      return await adapter.complete(completionIdentity, result);
+      return await adapter.complete(completionIdentity, result, {
+        afterAuthorityDeliveryBeforePendingDelete: () => {
+          try {
+            this.#invokeResponseDeliveryFault(identity);
+          } catch (error) {
+            responseDeliveryFault = true;
+            throw error;
+          }
+        },
+      });
     } catch (error) {
+      if (responseDeliveryFault) {
+        const exactUnknown = identityOutcomeUnknown(identity);
+        await this.poison(exactUnknown);
+        throw exactUnknown;
+      }
       if (
         error instanceof LifecycleError
         && (error.code === "COMMAND_OUTCOME_UNKNOWN" || error.code === "OPERATION_OUTCOME_UNKNOWN")
@@ -1091,9 +1121,38 @@ export class ProjectStoreExecutor {
         this.poisonInBackground(error);
       }
     } else {
+      try {
+        if (pending.identity?.kind !== "semantic") {
+          this.#invokeResponseDeliveryFault(pending.identity);
+        }
+      } catch {
+        const error = this.unknownOutcome(pending)
+          ?? new ProjectStoreWorkerError("WORKER_PROTOCOL_ERROR");
+        pending.reject(error);
+        this.poisonInBackground(error);
+        this.notifyDrain();
+        return;
+      }
       pending.resolve(response.data);
     }
     this.notifyDrain();
+  }
+
+  #invokeResponseDeliveryFault(identity: PendingLifecycleIdentity | null): void {
+    this.#dependencies.lifecycleFaultInjector?.hit(
+      "response-delivery",
+      "after-commit-before-response",
+      Object.freeze({
+        projectId: this.#options.context.binding.projectId,
+        sessionId: null,
+        workflowId: null,
+        commandId: identity?.kind === "semantic" ? identity.commandId : null,
+        idempotencyKeyHash: null,
+        workId: faultWorkId(identity),
+        eventPosition: null,
+        materializationRevision: null,
+      }),
+    );
   }
 
   private onNotification(notification: WorkerNotification): void {

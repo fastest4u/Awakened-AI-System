@@ -1,14 +1,40 @@
+import { createHash } from "node:crypto";
 import { isPrimarySqliteBusy } from "../storage/event-append-transaction.js";
-import type { JsonValue } from "../contracts/event.js";
+import type { ProjectId } from "../identity/contracts.js";
 import type { SqliteConnection } from "../storage/sqlite-driver.js";
 import { LifecycleOutboxRepository } from "../storage/lifecycle-outbox.repository.js";
-import type { SessionEndWorkflowOperations } from "../storage/lifecycle-storage.types.js";
+import type {
+  LifecycleChildTransferReadOperations,
+  LifecycleEvidenceCoverageReadOperations,
+  LifecycleSessionAuthorityReadOperations,
+  LifecycleValidationPlanReadOperations,
+  LifecycleOutboxAcknowledgementInputV1,
+  LifecycleOutboxClaimNextInputV1,
+  LifecycleOutboxClaimV1,
+  LifecycleOutboxCompletionQueryV1,
+  LifecycleOutboxExactClaimInputV1,
+  LifecycleOutboxFailureInputV1,
+  LifecycleOutboxMaterializationResultV1,
+  LifecycleOutboxRenewInputV1,
+  SessionEndWorkflowOperations,
+} from "../storage/lifecycle-storage.types.js";
 import { LifecycleError } from "./errors.js";
+import {
+  NO_LIFECYCLE_FAULTS,
+  type LifecycleDurableBoundary,
+  type LifecycleFaultContext,
+  type LifecycleFaultInjector,
+} from "./lifecycle-faults.js";
+import type { WorkflowId } from "./contracts/identifiers.js";
 import type {
   ExactPlannedRevisionQuery,
   LifecycleOutboxPlanReader,
   LifecycleOutboxPlannedRevision,
 } from "./materialization-queue.port.js";
+import type {
+  CompatibilityLogMaterializationInput,
+  LifecycleOutboxMaterializationOperations,
+} from "../materialization/compatibility-log.materializer.js";
 
 const SQLITE_INT64_MAX = 9_223_372_036_854_775_807n;
 const LOWER_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
@@ -45,6 +71,15 @@ export interface WorkflowOperationalWorkIdentity {
   readonly claimToken: bigint;
 }
 
+export interface WorkflowRecoveryOperationalWorkIdentity {
+  readonly kind: "workflow-recovery";
+  readonly projectId: string;
+  readonly workId: string;
+  readonly operation: "recovery";
+  readonly ownerId: string;
+  readonly claimToken: bigint;
+}
+
 export interface OutboxOperationalWorkIdentity {
   readonly kind: "outbox";
   readonly projectId: string;
@@ -59,21 +94,56 @@ export type LifecycleOperationalWorkIdentity =
   | WorkflowSelectionOperationalWorkIdentity
   | OutboxSelectionOperationalWorkIdentity
   | WorkflowOperationalWorkIdentity
+  | WorkflowRecoveryOperationalWorkIdentity
   | OutboxOperationalWorkIdentity;
 
 export interface ConnectionBoundSessionEndWorkflowOperations extends SessionEndWorkflowOperations {}
-export interface ConnectionBoundLifecycleOutboxOperations {}
+export interface ConnectionBoundLifecycleOutboxOperations {
+  /** Optional keeps older injected repository bundles structurally compatible. */
+  stage?: (value: string) => void;
+  claimNext?(input: LifecycleOutboxClaimNextInputV1): LifecycleOutboxClaimV1 | null;
+  getExactClaim?(input: LifecycleOutboxExactClaimInputV1): LifecycleOutboxClaimV1;
+  renewClaim?(input: LifecycleOutboxRenewInputV1): LifecycleOutboxClaimV1 | null;
+  isLatestRevision?(plan: LifecycleOutboxClaimV1["planned"]): boolean;
+  isCurrentWorkflowGeneration?(plan: LifecycleOutboxClaimV1["planned"]): boolean;
+  listCommittedLowerRevisionFingerprints?(
+    claim: LifecycleOutboxClaimV1,
+  ): readonly import("./materialization-queue.port.js").KeyedFingerprintV1[];
+  recordFailure?(input: LifecycleOutboxFailureInputV1): boolean;
+  materialize?(
+    input: import("../materialization/compatibility-log.materializer.js").CompatibilityLogMaterializationInput,
+  ): LifecycleOutboxMaterializationResultV1;
+}
+
+export interface LifecycleMaterializationCompletionReadOperations {
+  isCompleted(input: LifecycleOutboxCompletionQueryV1): boolean;
+}
 /** Read-only lifecycle plan capability bound to the active SQLite transaction. */
 export interface ConnectionBoundLifecycleOutboxPlanReads extends LifecycleOutboxPlanReader {}
+
+/** Optional read-only sidecars; each is connection-bound by the repository factory. */
+export interface LifecycleOperationalReadFacades {
+  readonly validationPlans?: LifecycleValidationPlanReadOperations;
+  readonly authority?: LifecycleSessionAuthorityReadOperations;
+  readonly transfers?: LifecycleChildTransferReadOperations;
+  readonly coverage?: LifecycleEvidenceCoverageReadOperations;
+  readonly materializations?: LifecycleMaterializationCompletionReadOperations;
+}
 
 export interface LifecycleOperationalRepositorySet {
   readonly workflows: ConnectionBoundSessionEndWorkflowOperations;
   readonly outbox: ConnectionBoundLifecycleOutboxOperations;
   /** Optional for legacy factories; the store supplies its narrow connection-bound adapter. */
   readonly outboxPlans?: ConnectionBoundLifecycleOutboxPlanReads;
+  /** Optional Task 15 read-only sidecars for newer repository factories. */
+  readonly validationPlans?: LifecycleValidationPlanReadOperations;
+  readonly authority?: LifecycleSessionAuthorityReadOperations;
+  readonly transfers?: LifecycleChildTransferReadOperations;
+  readonly coverage?: LifecycleEvidenceCoverageReadOperations;
+  readonly materializations?: LifecycleMaterializationCompletionReadOperations;
 }
 
-export interface WorkflowOperationalTransaction {
+export interface WorkflowOperationalTransaction extends LifecycleOperationalReadFacades {
   readonly workflows: ConnectionBoundSessionEndWorkflowOperations;
   readonly outboxPlans: ConnectionBoundLifecycleOutboxPlanReads;
 }
@@ -88,7 +158,7 @@ export type LifecycleOperationalTransaction =
 
 export type LifecycleOperationalTransactionFor<
   TWork extends LifecycleOperationalWorkIdentity,
-> = TWork extends WorkflowOperationalWorkIdentity
+> = TWork extends WorkflowOperationalWorkIdentity | WorkflowRecoveryOperationalWorkIdentity
   ? WorkflowOperationalTransaction
   : TWork extends WorkflowSelectionOperationalWorkIdentity
     ? WorkflowOperationalTransaction
@@ -106,8 +176,21 @@ export interface LifecycleOperationalStoreOptions {
   readonly connection: SqliteConnection;
   /** Facade capabilities must be explicit own data properties; prototypes/accessors are excluded. */
   readonly transaction: (connection: SqliteConnection) => LifecycleOperationalRepositorySet;
+  /** Optional connection-bound augmentation applied after the base facade is created. */
+  readonly decorateTransaction?: (
+    repositories: LifecycleOperationalRepositorySet,
+    connection: SqliteConnection,
+  ) => LifecycleOperationalRepositorySet;
   readonly afterCommit?: (work: LifecycleOperationalWorkIdentity) => undefined;
+  /** Optional fixture-only durable-boundary fault injection. */
+  readonly faultInjector?: LifecycleFaultInjector;
 }
+
+type SynchronousCallbackArity<T> = [T] extends [never]
+  ? []
+  : T extends PromiseLike<unknown>
+    ? [never]
+    : [];
 
 export class LifecycleOperationalStoreError extends LifecycleError {
   readonly work: LifecycleOperationalWorkIdentity | null;
@@ -190,6 +273,20 @@ function decodeWork(value: unknown): LifecycleOperationalWorkIdentity {
       workflowId: canonicalUuid(work.workflowId),
       workflowGeneration: positiveSqliteInt64(work.workflowGeneration),
       operation: work.operation as WorkflowOperationalWorkIdentity["operation"],
+      ownerId: nonEmptyString(work.ownerId),
+      claimToken: positiveSqliteInt64(work.claimToken),
+    });
+  }
+  if (kindDescriptor.value === "workflow-recovery") {
+    const work = strictDataRecord(value, [
+      "kind", "projectId", "workId", "operation", "ownerId", "claimToken",
+    ]);
+    if (work.operation !== "recovery") invalidWork();
+    return Object.freeze({
+      kind: "workflow-recovery" as const,
+      projectId: canonicalUuid(work.projectId),
+      workId: nonEmptyString(work.workId),
+      operation: "recovery" as const,
       ownerId: nonEmptyString(work.ownerId),
       claimToken: positiveSqliteInt64(work.claimToken),
     });
@@ -350,6 +447,46 @@ function undefinedCallbackResult(
   return undefined;
 }
 
+function operationalFaultBoundary(work: LifecycleOperationalWorkIdentity): LifecycleDurableBoundary {
+  if (work.kind === "workflow-recovery") return "ownership-recovery";
+  if (work.kind === "workflow" || work.kind === "workflow-selection") return "workflow-phase";
+  if (work.kind === "outbox-selection") return "outbox-claim";
+  switch (work.operation) {
+    case "materialize": return "materialization-ack";
+    case "record-failure": return "outbox-failure";
+    default: return "outbox-claim";
+  }
+}
+
+function operationalFaultContext(work: LifecycleOperationalWorkIdentity): LifecycleFaultContext {
+  const workflowId = work.kind === "workflow"
+    ? work.workflowId as WorkflowId
+    : null;
+  const workId = work.kind === "workflow-selection"
+    || work.kind === "outbox-selection"
+    || work.kind === "workflow-recovery"
+    ? work.workId
+    : work.kind === "outbox"
+      ? work.targetKey
+    : null;
+  const materializationRevision = work.kind === "outbox"
+    ? work.materializationRevision.toString()
+    : null;
+  const workIdentity = JSON.stringify(work, (_key, value: unknown) => (
+    typeof value === "bigint" ? value.toString() : value
+  ));
+  return Object.freeze({
+    projectId: work.projectId as ProjectId,
+    sessionId: null,
+    workflowId,
+    commandId: null,
+    idempotencyKeyHash: createHash("sha256").update(workIdentity, "utf8").digest("hex"),
+    workId,
+    eventPosition: null,
+    materializationRevision,
+  });
+}
+
 /**
  * The operational layer may receive an older repository bundle that has not
  * installed the plan-read facade yet. Keep that compatibility at the bundle
@@ -370,6 +507,90 @@ class SqliteLifecycleOutboxPlanReads implements ConnectionBoundLifecycleOutboxPl
   }
 }
 
+export interface LifecycleOutboxMaterializerRunner {
+  materialize(
+    input: CompatibilityLogMaterializationInput,
+    operations: LifecycleOutboxMaterializationOperations,
+  ): LifecycleOutboxMaterializationResultV1;
+}
+
+export function createConnectionBoundLifecycleOutboxOperations(
+  connection: SqliteConnection,
+  repository: LifecycleOutboxRepository,
+  materializer: LifecycleOutboxMaterializerRunner,
+): ConnectionBoundLifecycleOutboxOperations {
+  const base = {
+    claimNext: (input: LifecycleOutboxClaimNextInputV1) => repository.claimNext(connection, input),
+    getExactClaim: (input: LifecycleOutboxExactClaimInputV1) => repository.getExactClaim(connection, input),
+    renewClaim: (input: LifecycleOutboxRenewInputV1) => repository.renewClaim(connection, input),
+    isLatestRevision: (plan: LifecycleOutboxClaimV1["planned"]) => repository.isLatestRevision(connection, plan),
+    isCurrentWorkflowGeneration: (plan: LifecycleOutboxClaimV1["planned"]) =>
+      repository.isCurrentWorkflowGeneration(connection, plan),
+    listCommittedLowerRevisionFingerprints: (claim: LifecycleOutboxClaimV1) =>
+      repository.listCommittedLowerRevisionFingerprints(connection, claim),
+    recordFailure: (input: LifecycleOutboxFailureInputV1) => repository.recordFailure(connection, input),
+  };
+  const materializationOperations: LifecycleOutboxMaterializationOperations = {
+    ...base,
+    acknowledgeAfterReplacement: (input: LifecycleOutboxAcknowledgementInputV1) =>
+      repository.acknowledgeAfterReplacement(connection, input),
+  };
+  return Object.freeze({
+    ...base,
+    materialize: (input: CompatibilityLogMaterializationInput) =>
+      materializer.materialize(input, materializationOperations),
+  });
+}
+
+export function createConnectionBoundLifecycleMaterializationReads(
+  connection: SqliteConnection,
+  repository: LifecycleOutboxRepository,
+): LifecycleMaterializationCompletionReadOperations {
+  return Object.freeze({
+    isCompleted: (input: LifecycleOutboxCompletionQueryV1) =>
+      repository.isCompleted(connection, input),
+  });
+}
+
+function ownOptionalDataProperty<T>(source: object, property: string): T | undefined {
+  const descriptor = Reflect.getOwnPropertyDescriptor(source, property);
+  if (descriptor === undefined) return undefined;
+  if (!("value" in descriptor)) invalidWork();
+  return descriptor.value as T | undefined;
+}
+
+function operationalReadFacades(
+  repositories: LifecycleOperationalRepositorySet,
+): LifecycleOperationalReadFacades {
+  const validationPlans = ownOptionalDataProperty<LifecycleValidationPlanReadOperations>(
+    repositories,
+    "validationPlans",
+  );
+  const authority = ownOptionalDataProperty<LifecycleSessionAuthorityReadOperations>(
+    repositories,
+    "authority",
+  );
+  const transfers = ownOptionalDataProperty<LifecycleChildTransferReadOperations>(
+    repositories,
+    "transfers",
+  );
+  const coverage = ownOptionalDataProperty<LifecycleEvidenceCoverageReadOperations>(
+    repositories,
+    "coverage",
+  );
+  const materializations = ownOptionalDataProperty<LifecycleMaterializationCompletionReadOperations>(
+    repositories,
+    "materializations",
+  );
+  return Object.freeze({
+    ...(validationPlans === undefined ? {} : { validationPlans }),
+    ...(authority === undefined ? {} : { authority }),
+    ...(transfers === undefined ? {} : { transfers }),
+    ...(coverage === undefined ? {} : { coverage }),
+    ...(materializations === undefined ? {} : { materializations }),
+  });
+}
+
 function invokeSynchronousTransactionCallback<TTransaction extends object, T, TResult>(
   transaction: TTransaction,
   work: LifecycleOperationalWorkIdentity,
@@ -384,23 +605,30 @@ function invokeSynchronousTransactionCallback<TTransaction extends object, T, TR
   }
 }
 
-function immutableJsonSnapshot<T extends JsonValue>(value: T): T {
+/**
+ * Operational transactions return typed repository records as well as public
+ * JSON DTOs.  SQLite integer columns are intentionally represented as bigint,
+ * so preserve those scalar values while still rejecting opaque or mutable
+ * result objects at the transaction boundary.
+ */
+function immutableOperationalSnapshot<T>(value: T): T {
   if (value === null || typeof value === "string" || typeof value === "boolean") return value;
   if (typeof value === "number") {
     if (!Number.isFinite(value)) invalidWork();
     return value;
   }
+  if (typeof value === "bigint") return value;
   if (Array.isArray(value)) {
-    return Object.freeze(value.map((item) => immutableJsonSnapshot(item))) as T;
+    return Object.freeze(value.map((item) => immutableOperationalSnapshot(item))) as T;
   }
   if (typeof value !== "object") invalidWork();
   const record = strictDataRecord(value, Reflect.ownKeys(value).map((key) => {
     if (typeof key !== "string") invalidWork();
     return key;
   }));
-  const snapshot: Record<string, JsonValue> = {};
+  const snapshot: Record<string, unknown> = {};
   for (const [key, item] of Object.entries(record)) {
-    snapshot[key] = immutableJsonSnapshot(item as JsonValue);
+    snapshot[key] = immutableOperationalSnapshot(item);
   }
   return Object.freeze(snapshot) as T;
 }
@@ -408,29 +636,47 @@ function immutableJsonSnapshot<T extends JsonValue>(value: T): T {
 export class LifecycleOperationalStore {
   readonly #connection: SqliteConnection;
   readonly #transaction: (connection: SqliteConnection) => LifecycleOperationalRepositorySet;
+  readonly #decorateTransaction: (
+    repositories: LifecycleOperationalRepositorySet,
+    connection: SqliteConnection,
+  ) => LifecycleOperationalRepositorySet;
   readonly #afterCommit: (work: LifecycleOperationalWorkIdentity) => undefined;
+  readonly #faults: LifecycleFaultInjector;
 
   constructor(options: LifecycleOperationalStoreOptions) {
     this.#connection = options.connection;
     this.#transaction = options.transaction;
+    this.#decorateTransaction = options.decorateTransaction ?? ((repositories) => repositories);
     this.#afterCommit = options.afterCommit ?? (() => undefined);
+    this.#faults = options.faultInjector ?? NO_LIFECYCLE_FAULTS;
   }
 
-  execute<TWork extends LifecycleOperationalWorkIdentity, T extends JsonValue>(
+  execute<TWork extends LifecycleOperationalWorkIdentity, T>(
     work: TWork,
     onCurrent: (transaction: LifecycleOperationalTransactionFor<TWork>) => T,
+    ..._synchronousCallbackOnly: SynchronousCallbackArity<T>
   ): LifecycleOperationalResult<T, TWork> {
     const workSnapshot = decodeWork(work) as TWork;
     let transactionBegan = false;
     let commitAttempted = false;
     let commitFailed = false;
     let commitCompleted = false;
+    const faultBoundary = operationalFaultBoundary(workSnapshot);
+    const faultContext = operationalFaultContext(workSnapshot);
     try {
       this.#connection.exec("BEGIN IMMEDIATE");
       transactionBegan = true;
-      const repositories = this.#transaction(this.#connection);
-      const focused = workSnapshot.kind === "workflow" || workSnapshot.kind === "workflow-selection"
+      this.#faults.hit(faultBoundary, "before-write", faultContext);
+      const repositories = this.#decorateTransaction(
+        this.#transaction(this.#connection),
+        this.#connection,
+      );
+      const readFacades = operationalReadFacades(repositories);
+      const focused = workSnapshot.kind === "workflow"
+        || workSnapshot.kind === "workflow-recovery"
+        || workSnapshot.kind === "workflow-selection"
         ? {
+            ...readFacades,
             workflows: repositories.workflows,
             outboxPlans: repositories.outboxPlans
               ?? new SqliteLifecycleOutboxPlanReads(this.#connection),
@@ -440,8 +686,9 @@ export class LifecycleOperationalStore {
         focused as LifecycleOperationalTransactionFor<TWork>,
         workSnapshot,
         onCurrent,
-        immutableJsonSnapshot,
+        immutableOperationalSnapshot,
       );
+      this.#faults.hit(faultBoundary, "after-write-before-commit", faultContext);
       commitAttempted = true;
       try {
         this.#connection.exec("COMMIT");
@@ -451,6 +698,7 @@ export class LifecycleOperationalStore {
       }
       commitCompleted = true;
       transactionBegan = false;
+      this.#faults.hit(faultBoundary, "after-commit-before-response", faultContext);
       undefinedCallbackResult(
         synchronousCallbackResult(this.#afterCommit(workSnapshot), workSnapshot),
         workSnapshot,

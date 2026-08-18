@@ -135,6 +135,15 @@ export interface LifecycleExecutionResult<T extends JsonValue> {
   readonly recoveryCode: AuthorityDeliveryRecoveryCode | null;
 }
 
+/**
+ * Parent-side acknowledgement boundary.  It runs only after any private
+ * authority material has been delivered or routed, while the sealed retry
+ * record is still retained.
+ */
+export interface AuthorityMaterialCompletionOptions {
+  readonly afterAuthorityDeliveryBeforePendingDelete?: () => void | Promise<void>;
+}
+
 export interface AuthorityMaterialAdapterOptions {
   readonly pendingStore: PendingAuthorizationStore;
   readonly keyProvider: CapabilityKeyProvider;
@@ -1027,7 +1036,19 @@ export class AuthorityMaterialAdapter {
   async complete<T extends JsonValue>(
     identityInput: PendingCommandIdentity,
     resultInput: WorkerLifecycleResult<T>,
+    completionOptions?: AuthorityMaterialCompletionOptions,
   ): Promise<LifecycleExecutionResult<T>> {
+    if (
+      completionOptions !== undefined
+      && (
+        typeof completionOptions !== "object"
+        || completionOptions === null
+        || (
+          completionOptions.afterAuthorityDeliveryBeforePendingDelete !== undefined
+          && typeof completionOptions.afterAuthorityDeliveryBeforePendingDelete !== "function"
+        )
+      )
+    ) invalid();
     const identity = decodeIdentity(identityInput);
     const result = decodeWorkerResult(resultInput);
     const record = await this.#pending.get(identity.projectId, identity.commandId, identity.idempotencyKey);
@@ -1063,7 +1084,14 @@ export class AuthorityMaterialAdapter {
           recoveryCode = "AUTHORITY_TARGET_DETACHED";
         }
       }
-      if (status !== "unavailable") {
+      if (status === "unavailable") {
+        // The committed public response still crosses a final delivery
+        // boundary even when private authority cannot be delivered.  Keep the
+        // encrypted retry record, but surface an injected loss as unknown so
+        // the exact semantic identity must replay.
+        await completionOptions?.afterAuthorityDeliveryBeforePendingDelete?.();
+      } else {
+        await completionOptions?.afterAuthorityDeliveryBeforePendingDelete?.();
         await this.#pending.delete(identity.projectId, identity.commandId, identity.idempotencyKey);
       }
       return Object.freeze({

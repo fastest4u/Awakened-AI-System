@@ -11,6 +11,8 @@ import {
   type PendingLifecycleOutboxV1,
 } from "../src/orchestrator/lifecycle/materialization-queue.port.js";
 import type { SessionId } from "../src/orchestrator/lifecycle/contracts/identifiers.js";
+import { LifecycleError } from "../src/orchestrator/lifecycle/errors.js";
+import type { LifecycleFaultInjector } from "../src/orchestrator/lifecycle/lifecycle-faults.js";
 import { canonicalJson } from "../src/orchestrator/serialization/canonical-json.js";
 import { LifecycleOutboxRepository } from "../src/orchestrator/storage/lifecycle-outbox.repository.js";
 import type { SqliteConnection } from "../src/orchestrator/storage/sqlite-driver.js";
@@ -269,6 +271,286 @@ function setup(revision = 7n, insertTrigger = true): {
 }
 
 describe("LifecycleOutboxRepository", () => {
+  it("normalizes a before-write insert fault without persisting an outbox row", () => {
+    const fixture = setup();
+    const hits: Array<{
+      readonly boundary: string;
+      readonly point: string;
+      readonly context: unknown;
+    }> = [];
+    const faultInjector: LifecycleFaultInjector = {
+      hit(boundary, point, context): void {
+        hits.push({ boundary, point, context });
+        throw new Error("INJECTED_OUTBOX_INSERT_FAULT");
+      },
+    };
+    const repository = new LifecycleOutboxRepository({ faultInjector });
+
+    assert.throws(
+      () => repository.insertLifecycle(
+        fixture.connection,
+        fixture.pendingOutbox,
+        fixture.storedEvent,
+        NOW,
+      ),
+      (error: unknown): boolean => {
+        assert.ok(error instanceof LifecycleError);
+        assert.equal(error.code, "INTEGRITY_FAILURE");
+        return true;
+      },
+    );
+    assert.deepEqual(hits, [{
+      boundary: "outbox-insert",
+      point: "before-write",
+      context: {
+        projectId: PROJECT_ID,
+        sessionId: SESSION_ID,
+        workflowId: WORKFLOW_ID,
+        commandId: "88888888-8888-4888-8888-888888888888",
+        idempotencyKeyHash: null,
+        workId: `lifecycle-log/${SESSION_ID}/7`,
+        eventPosition: "7",
+        materializationRevision: "7",
+      },
+    }]);
+    assert.equal(
+      fixture.connection.prepare("SELECT count(*) AS count FROM outbox").get()?.count,
+      0,
+    );
+  });
+
+  it("claims the current pending revision with a fresh fenced token", () => {
+    const fixture = setup();
+    fixture.repository.insertLifecycle(
+      fixture.connection,
+      fixture.pendingOutbox,
+      fixture.storedEvent,
+      NOW,
+    );
+
+    const claim = fixture.repository.claimNext(fixture.connection, {
+      projectId: PROJECT_ID,
+      ownerId: "materializer-a",
+      observedNowMs: BigInt(Date.parse(NOW)),
+      leaseDurationMs: 30_000n,
+    });
+
+    assert.equal(claim?.planned.materializationRevision, 7n);
+    assert.equal(claim?.status, "claimed");
+    assert.equal(claim?.claimOwner, "materializer-a");
+    assert.equal(claim?.claimToken, 1n);
+    assert.equal(claim?.claimExpiresAt, "2026-08-09T00:10:30.000Z");
+    assert.equal(fixture.repository.claimNext(fixture.connection, {
+      projectId: PROJECT_ID,
+      ownerId: "materializer-b",
+      observedNowMs: BigInt(Date.parse(NOW)),
+      leaseDurationMs: 30_000n,
+    }), null);
+  });
+
+  it("takes over an expired claim with an incremented token", () => {
+    const fixture = setup();
+    fixture.repository.insertLifecycle(
+      fixture.connection,
+      fixture.pendingOutbox,
+      fixture.storedEvent,
+      NOW,
+    );
+    const first = fixture.repository.claimNext(fixture.connection, {
+      projectId: PROJECT_ID,
+      ownerId: "materializer-a",
+      observedNowMs: BigInt(Date.parse(NOW)),
+      leaseDurationMs: 30_000n,
+    });
+    assert.equal(first?.claimToken, 1n);
+
+    const takeover = fixture.repository.claimNext(fixture.connection, {
+      projectId: PROJECT_ID,
+      ownerId: "materializer-b",
+      observedNowMs: BigInt(Date.parse("2026-08-09T00:10:31.000Z")),
+      leaseDurationMs: 30_000n,
+    });
+    assert.equal(takeover?.claimOwner, "materializer-b");
+    assert.equal(takeover?.claimToken, 2n);
+    assert.equal(takeover?.attemptCount, 2n);
+  });
+
+  it("claims only the newest revision for a canonical artifact", () => {
+    const fixture = setup(7n);
+    fixture.repository.insertLifecycle(
+      fixture.connection,
+      fixture.pendingOutbox,
+      fixture.storedEvent,
+      NOW,
+    );
+    const nextEvent = event(8n);
+    insertEvent(fixture.connection, nextEvent);
+    fixture.repository.insertLifecycle(
+      fixture.connection,
+      pending(8n, "SessionEndVerificationFailed", undefined, FINGERPRINT_B, nextEvent.payloadHash),
+      nextEvent,
+      NOW,
+    );
+
+    const claim = fixture.repository.claimNext(fixture.connection, {
+      projectId: PROJECT_ID,
+      ownerId: "materializer-a",
+      observedNowMs: BigInt(Date.parse(NOW)),
+      leaseDurationMs: 30_000n,
+    });
+    assert.equal(claim?.planned.materializationRevision, 8n);
+    assert.equal(fixture.connection.prepare(
+      "SELECT status FROM outbox WHERE materialization_revision = 7",
+    ).get()?.status, "pending");
+  });
+
+  it("returns an exact live claim and renews only its owner and token", () => {
+    const fixture = setup();
+    fixture.repository.insertLifecycle(
+      fixture.connection,
+      fixture.pendingOutbox,
+      fixture.storedEvent,
+      NOW,
+    );
+    const claim = fixture.repository.claimNext(fixture.connection, {
+      projectId: PROJECT_ID,
+      ownerId: "materializer-a",
+      observedNowMs: BigInt(Date.parse(NOW)),
+      leaseDurationMs: 30_000n,
+    });
+    assert.ok(claim);
+
+    const exact = fixture.repository.getExactClaim(fixture.connection, {
+      projectId: PROJECT_ID,
+      targetKey: fixture.pendingOutbox.targetKey,
+      materializationRevision: 7n,
+      ownerId: "materializer-a",
+      claimToken: claim.claimToken,
+    });
+    assert.equal(exact.status, "claimed");
+    assert.equal(exact.claimExpiresAt, "2026-08-09T00:10:30.000Z");
+
+    const renewed = fixture.repository.renewClaim(fixture.connection, {
+      projectId: PROJECT_ID,
+      targetKey: fixture.pendingOutbox.targetKey,
+      materializationRevision: 7n,
+      ownerId: "materializer-a",
+      claimToken: claim.claimToken,
+      observedNowMs: BigInt(Date.parse("2026-08-09T00:10:05.000Z")),
+      leaseDurationMs: 60_000n,
+    });
+    assert.equal(renewed?.claimExpiresAt, "2026-08-09T00:11:05.000Z");
+    assert.equal(fixture.repository.renewClaim(fixture.connection, {
+      projectId: PROJECT_ID,
+      targetKey: fixture.pendingOutbox.targetKey,
+      materializationRevision: 7n,
+      ownerId: "stale-owner",
+      claimToken: claim.claimToken,
+      observedNowMs: BigInt(Date.parse("2026-08-09T00:10:06.000Z")),
+      leaseDurationMs: 60_000n,
+    }), null);
+  });
+
+  it("lists only committed lower-revision fingerprints for the exact artifact lineage", () => {
+    const fixture = setup(7n);
+    fixture.repository.insertLifecycle(fixture.connection, fixture.pendingOutbox, fixture.storedEvent, NOW);
+    fixture.connection.exec("UPDATE outbox SET status = 'completed', attempt_count = 1, claim_owner = 'worker', claim_token = 1");
+    const nextEvent = event(8n);
+    insertEvent(fixture.connection, nextEvent);
+    fixture.repository.insertLifecycle(
+      fixture.connection,
+      pending(8n, "SessionEndVerificationFailed", undefined, FINGERPRINT_B, nextEvent.payloadHash),
+      nextEvent,
+      NOW,
+    );
+    const claim = fixture.repository.claimNext(fixture.connection, {
+      projectId: PROJECT_ID,
+      ownerId: "materializer-a",
+      observedNowMs: BigInt(Date.parse(NOW)),
+      leaseDurationMs: 30_000n,
+    });
+    assert.ok(claim);
+    assert.deepEqual(
+      fixture.repository.listCommittedLowerRevisionFingerprints(fixture.connection, claim),
+      [fixture.pendingOutbox.payload.nextFingerprint],
+    );
+  });
+
+  it("records bounded retry backoff and permanent failure under the live fence", () => {
+    const retry = setup();
+    retry.repository.insertLifecycle(retry.connection, retry.pendingOutbox, retry.storedEvent, NOW);
+    const retryClaim = retry.repository.claimNext(retry.connection, {
+      projectId: PROJECT_ID,
+      ownerId: "materializer-a",
+      observedNowMs: BigInt(Date.parse(NOW)),
+      leaseDurationMs: 30_000n,
+    });
+    assert.ok(retryClaim);
+    assert.equal(retry.repository.recordFailure(retry.connection, {
+      projectId: PROJECT_ID,
+      targetKey: retry.pendingOutbox.targetKey,
+      materializationRevision: 7n,
+      ownerId: retryClaim.claimOwner,
+      claimToken: retryClaim.claimToken,
+      observedNowMs: BigInt(Date.parse(NOW)),
+      failureClass: "retryable",
+      safeErrorCode: "MATERIALIZATION_CONFLICT",
+      nextAttemptAt: "2026-08-09T00:10:01.000Z",
+    }), true);
+    assert.equal(retry.connection.prepare("SELECT status, next_attempt_at FROM outbox").get()?.status, "failed");
+    assert.equal(retry.connection.prepare("SELECT next_attempt_at FROM outbox").get()?.next_attempt_at, "2026-08-09T00:10:01.000Z");
+
+    const permanent = setup();
+    permanent.repository.insertLifecycle(permanent.connection, permanent.pendingOutbox, permanent.storedEvent, NOW);
+    const permanentClaim = permanent.repository.claimNext(permanent.connection, {
+      projectId: PROJECT_ID,
+      ownerId: "materializer-a",
+      observedNowMs: BigInt(Date.parse(NOW)),
+      leaseDurationMs: 30_000n,
+    });
+    assert.ok(permanentClaim);
+    assert.equal(permanent.repository.recordFailure(permanent.connection, {
+      projectId: PROJECT_ID,
+      targetKey: permanent.pendingOutbox.targetKey,
+      materializationRevision: 7n,
+      ownerId: permanentClaim.claimOwner,
+      claimToken: permanentClaim.claimToken,
+      observedNowMs: BigInt(Date.parse(NOW)),
+      failureClass: "permanent",
+      safeErrorCode: "INTEGRITY_FAILURE",
+      nextAttemptAt: null,
+    }), true);
+    const permanentRow = permanent.connection.prepare("SELECT status, next_attempt_at FROM outbox").get();
+    assert.equal(permanentRow?.status, "failed");
+    assert.equal(permanentRow?.next_attempt_at, null);
+  });
+
+  it("acknowledges only the exact replaced fingerprint and retains the completion fence", () => {
+    const fixture = setup();
+    fixture.repository.insertLifecycle(fixture.connection, fixture.pendingOutbox, fixture.storedEvent, NOW);
+    const claim = fixture.repository.claimNext(fixture.connection, {
+      projectId: PROJECT_ID,
+      ownerId: "materializer-a",
+      observedNowMs: BigInt(Date.parse(NOW)),
+      leaseDurationMs: 30_000n,
+    });
+    assert.ok(claim);
+    const result = fixture.repository.acknowledgeAfterReplacement(fixture.connection, {
+      projectId: PROJECT_ID,
+      targetKey: fixture.pendingOutbox.targetKey,
+      materializationRevision: 7n,
+      ownerId: claim.claimOwner,
+      claimToken: claim.claimToken,
+      completedAt: NOW,
+      targetPath: fixture.pendingOutbox.payload.artifactPath,
+      targetFingerprint: fixture.pendingOutbox.payload.nextFingerprint,
+    });
+    assert.equal(result.status, "completed");
+    assert.equal(result.claim.status, "completed");
+    assert.equal(result.claim.claimExpiresAt, null);
+    assert.equal(fixture.connection.prepare("SELECT status FROM outbox").get()?.status, "completed");
+  });
+
   it("requires a Version 3 checkpoint and direct workflow-origin binding", () => {
     const fixture = setup();
     assert.doesNotThrow(() => fixture.repository.insertLifecycle(
@@ -450,7 +732,7 @@ describe("LifecycleOutboxRepository", () => {
     }
   });
 
-  it("returns only an exact strictly bound planned revision", () => {
+  it("confirms the exact planned row before advancing phase", () => {
     const fixture = setup();
     fixture.repository.insertLifecycle(fixture.connection, fixture.pendingOutbox, fixture.storedEvent, NOW);
     assert.equal(fixture.repository.getExactPlannedRevision(fixture.connection, query(6n)), null);

@@ -686,9 +686,15 @@ export function foldChildEventProjection(
       break;
     case "ChildWorkTransferCreated":
       if (
-        decoded.eventSchemaVersion !== 1
-        || previous.latestCheckpointId === null
-        || decoded.payload.checkpointId !== previous.latestCheckpointId
+        previous.latestCheckpointId === null
+        || (
+          decoded.eventSchemaVersion === 1
+            ? decoded.payload.checkpointId !== previous.latestCheckpointId
+            : decoded.eventSchemaVersion === 2
+              ? decoded.payload.suspensionCheckpointId === null
+                || decoded.payload.checkpointId !== previous.latestCheckpointId
+              : true
+        )
         || reportWitness !== null
       ) invalid();
       childState = "transferred";

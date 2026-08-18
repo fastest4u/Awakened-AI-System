@@ -1080,3 +1080,28 @@ it("advances an eventless workflow phase only for the live claim", () => {
   assert.equal(repository.read(WORKFLOW_PROJECT, WORKFLOW_ID_A)?.phase, "children-resolved");
   connection.close();
 });
+
+it("advances the frozen ending workflow into validation only for the live claim", () => {
+  const connection = workflowRepositoryConnection();
+  const repository = new SessionEndWorkflowRepository(connection);
+  connection.prepare(`
+    UPDATE workflow_instances
+    SET phase = 'ending-materialization-queued',
+        coordinator_owner_id = 'coordinator-a',
+        coordinator_claim_token = 1,
+        coordinator_claim_expires_at = '1970-01-01T00:10:00.000Z'
+    WHERE project_id = $projectId AND workflow_id = $workflowId
+  `).run({ $projectId: WORKFLOW_PROJECT, $workflowId: WORKFLOW_ID_A });
+  assert.equal(repository.advanceEventlessPhase({
+    projectId: WORKFLOW_PROJECT,
+    workflowId: WORKFLOW_ID_A,
+    workflowGeneration: 1,
+    ownerId: "coordinator-a",
+    claimToken: 1n,
+    expectedPhase: "ending-materialization-queued",
+    nextPhase: "validating",
+    observedNowMs: 100n,
+  }), true);
+  assert.equal(repository.read(WORKFLOW_PROJECT, WORKFLOW_ID_A)?.phase, "validating");
+  connection.close();
+});

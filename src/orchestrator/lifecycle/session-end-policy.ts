@@ -38,6 +38,33 @@ export interface Version1WholeScopeMemberV1 {
   readonly eligible: boolean;
 }
 
+export type CoverageOnlyVerificationTerminalActionV1 =
+  | {
+      readonly action: "record-verification-failed";
+      readonly safeFailureCode: string;
+    }
+  | {
+      readonly action: "record-verification-passed";
+    };
+
+export type CoverageOnlyVerificationTerminalClassificationV1 =
+  | "standard"
+  | "coverage-incomplete";
+
+export type CoverageOnlyVerificationTerminalActionWithResultsV1<
+  TValidationResultId extends string,
+> =
+  | {
+      readonly action: "record-verification-failed";
+      readonly validationResultIds: readonly TValidationResultId[];
+      readonly safeFailureCode: string;
+    }
+  | {
+      readonly action: "record-verification-passed";
+      readonly validationResultIds: readonly TValidationResultId[];
+      readonly qualityScore: number;
+    };
+
 function invalid(field: string): never {
   throw new LifecycleError("LIFECYCLE_INPUT_INVALID", { field });
 }
@@ -212,6 +239,47 @@ export function calculateQualityScoreV1(
   }
   const qualityScore = Number((10_000n * passed) / totalWeight);
   return Object.freeze({ passingWeight, qualityScore, requiredFailure });
+}
+
+/**
+ * Version 1 checkpoints retain evidence coverage only.  A policy requiring
+ * full evidence therefore cannot reach the verification-passed terminal
+ * branch; callers must persist the safe evidence-incomplete failure instead.
+ */
+export function classifyCoverageOnlyVerificationTerminalActionV1(
+  policy: Pick<QualityPolicyV1, "requireFullEvidence">,
+  action: CoverageOnlyVerificationTerminalActionV1,
+): CoverageOnlyVerificationTerminalClassificationV1 {
+  if (policy.requireFullEvidence && action.action === "record-verification-passed") {
+    throw new LifecycleError("EVIDENCE_CAPTURE_INCOMPLETE");
+  }
+  return policy.requireFullEvidence
+    && action.action === "record-verification-failed"
+    && action.safeFailureCode === "EVIDENCE_CAPTURE_INCOMPLETE"
+    ? "coverage-incomplete"
+    : "standard";
+}
+
+/**
+ * Version 1 stores coverage summaries, not retained evidence.  Turn a
+ * semantically successful validation plan into its durable safe failure
+ * before it enters the command transaction, so the same append records the
+ * verification-failed branch rather than rolling the workflow back.
+ */
+export function normalizeCoverageOnlyVerificationTerminalActionV1<
+  TValidationResultId extends string,
+>(
+  policy: Pick<QualityPolicyV1, "requireFullEvidence">,
+  action: CoverageOnlyVerificationTerminalActionWithResultsV1<TValidationResultId>,
+): CoverageOnlyVerificationTerminalActionWithResultsV1<TValidationResultId> {
+  if (policy.requireFullEvidence && action.action === "record-verification-passed") {
+    return Object.freeze({
+      action: "record-verification-failed" as const,
+      validationResultIds: action.validationResultIds,
+      safeFailureCode: "EVIDENCE_CAPTURE_INCOMPLETE",
+    });
+  }
+  return action;
 }
 
 export function assertVersion1WholeScopeEligibleV1(

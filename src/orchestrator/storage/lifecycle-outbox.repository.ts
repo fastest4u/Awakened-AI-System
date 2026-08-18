@@ -3,6 +3,10 @@ import { outboxHash, payloadHash } from "../crypto/event-hash.js";
 import type { ProjectId } from "../identity/contracts.js";
 import { LifecycleError } from "../lifecycle/errors.js";
 import {
+  NO_LIFECYCLE_FAULTS,
+  type LifecycleFaultInjector,
+} from "../lifecycle/lifecycle-faults.js";
+import {
   decodeLifecycleEventPayload,
   type LifecycleEventType,
 } from "../lifecycle/contracts/events.js";
@@ -24,6 +28,14 @@ import {
 } from "../lifecycle/contracts/identifiers.js";
 import { canonicalJson } from "../serialization/canonical-json.js";
 import type {
+  LifecycleOutboxClaimNextInputV1,
+  LifecycleOutboxAcknowledgementInputV1,
+  LifecycleOutboxExactClaimInputV1,
+  LifecycleOutboxCompletionQueryV1,
+  LifecycleOutboxFailureInputV1,
+  LifecycleOutboxMaterializationResultV1,
+  LifecycleOutboxRenewInputV1,
+  LifecycleOutboxClaimV1,
   LifecycleOutboxStorageRecord,
   LifecycleOutboxStatus,
 } from "./lifecycle-storage.types.js";
@@ -32,6 +44,9 @@ import type { SqliteConnection, SqliteParams, SqliteRow } from "./sqlite-driver.
 const LOWER_HASH = /^[0-9a-f]{64}$/u;
 const POSITIVE_DECIMAL = /^[1-9][0-9]*$/u;
 const MAX_SQLITE_INT64 = 9_223_372_036_854_775_807n;
+const MAX_TIMESTAMP_MS = 8_640_000_000_000_000n;
+const FAILURE_BACKOFF_BASE_MS = 1_000n;
+const FAILURE_BACKOFF_MAX_MS = 60_000n;
 const MAX_RECURSION = 1_024;
 const LIFECYCLE_OUTBOX_KIND = "materialize-lifecycle-log";
 const LIFECYCLE_TRIGGER_TYPES = new Set([
@@ -93,6 +108,80 @@ function positiveIntegerValue(value: unknown): bigint {
   const result = integerValue(value);
   if (result <= 0n) integrity();
   return result;
+}
+
+function inputFailure(): never {
+  throw new LifecycleError("LIFECYCLE_INPUT_INVALID");
+}
+
+function ownerValue(value: unknown): string {
+  if (typeof value !== "string" || value.length === 0 || value.length > 256) inputFailure();
+  return value;
+}
+
+function targetKeyValue(value: unknown): string {
+  if (typeof value !== "string" || value.length === 0 || value.length > 1_024) inputFailure();
+  return value;
+}
+
+function revisionInput(value: unknown): bigint {
+  if (
+    typeof value !== "bigint"
+    || value < 1n
+    || value > MAX_SQLITE_INT64
+  ) inputFailure();
+  return value;
+}
+
+function claimTokenInput(value: unknown): bigint {
+  return revisionInput(value);
+}
+
+function timestampInput(value: unknown, field: string): string {
+  if (typeof value !== "string") inputFailure();
+  try {
+    parseCanonicalTimestamp(value, field);
+  } catch {
+    inputFailure();
+  }
+  return value;
+}
+
+function safeErrorCodeInput(value: unknown): string {
+  if (typeof value !== "string" || value.length === 0 || value.length > 128) inputFailure();
+  return value;
+}
+
+function timeFromMs(value: unknown, field: string): string {
+  if (
+    typeof value !== "bigint"
+    || value < 0n
+    || value > MAX_TIMESTAMP_MS
+    || value > MAX_SQLITE_INT64
+  ) inputFailure();
+  try {
+    return new Date(Number(value)).toISOString();
+  } catch {
+    inputFailure();
+  }
+}
+
+function leaseUntil(observedNowMs: unknown, leaseDurationMs: unknown): string {
+  if (typeof observedNowMs !== "bigint" || typeof leaseDurationMs !== "bigint") inputFailure();
+  if (leaseDurationMs <= 0n || leaseDurationMs > MAX_SQLITE_INT64) inputFailure();
+  timeFromMs(observedNowMs, "observedNowMs");
+  const observed = observedNowMs;
+  const expires = observed + leaseDurationMs;
+  if (expires > MAX_TIMESTAMP_MS || expires > MAX_SQLITE_INT64) inputFailure();
+  return timeFromMs(expires, "leaseExpiresAt");
+}
+
+function retryAt(observedNowMs: bigint, attemptCount: bigint): string {
+  if (attemptCount <= 0n) inputFailure();
+  const exponent = attemptCount > 7n ? 6n : attemptCount - 1n;
+  const uncapped = FAILURE_BACKOFF_BASE_MS << exponent;
+  const delay = uncapped > FAILURE_BACKOFF_MAX_MS ? FAILURE_BACKOFF_MAX_MS : uncapped;
+  return timeFromMs(observedNowMs + delay, "nextAttemptAt");
 }
 
 function nullableIntegerValue(value: unknown): bigint | null {
@@ -500,6 +589,140 @@ function queryRowByTargetKey(
   });
 }
 
+function claimFromRawRow(
+  connection: SqliteConnection,
+  rawRow: SqliteRow,
+): LifecycleOutboxClaimV1 {
+  const record = decodeStorageRow(rawRow);
+  if (
+    (record.status !== "claimed" && record.status !== "completed")
+    || record.claimOwner === null
+    || record.claimToken === null
+  ) integrity();
+  const planned = validateRow(connection, rawRow, 0);
+  return Object.freeze({
+    planned,
+    status: record.status,
+    attemptCount: record.attemptCount,
+    claimOwner: record.claimOwner,
+    claimToken: record.claimToken,
+    claimExpiresAt: record.claimExpiresAt,
+  });
+}
+
+interface ExactClaimValues {
+  readonly projectId: string;
+  readonly targetKey: string;
+  readonly materializationRevision: bigint;
+  readonly ownerId: string;
+  readonly claimToken: bigint;
+}
+
+function exactClaimValues(
+  input: LifecycleOutboxExactClaimInputV1,
+): ExactClaimValues {
+  return {
+    projectId: parseCanonicalUuid(input.projectId, "outbox.projectId"),
+    targetKey: targetKeyValue(input.targetKey),
+    materializationRevision: revisionInput(input.materializationRevision),
+    ownerId: ownerValue(input.ownerId),
+    claimToken: claimTokenInput(input.claimToken),
+  };
+}
+
+function exactClaimRows(
+  connection: SqliteConnection,
+  values: ExactClaimValues,
+): SqliteRow[] {
+  return connection.prepare(`
+    SELECT *
+    FROM outbox
+    WHERE project_id = $projectId
+      AND target_key = $targetKey
+      AND materialization_revision = $materializationRevision
+  `).all({
+    $projectId: values.projectId,
+    $targetKey: values.targetKey,
+    $materializationRevision: values.materializationRevision,
+  });
+}
+
+function requireCurrentWorkflowGeneration(
+  connection: SqliteConnection,
+  plan: LifecycleOutboxPlannedRevision,
+): void {
+  if (hasCurrentWorkflowGeneration(connection, plan)) return;
+  throw new LifecycleError("EVENT_CONFLICT");
+}
+
+function hasCurrentWorkflowGeneration(
+  connection: SqliteConnection,
+  plan: LifecycleOutboxPlannedRevision,
+): boolean {
+  if (plan.origin.kind === "terminal-event") return true;
+  const row = connection.prepare(`
+    SELECT 1 AS present
+    FROM workflow_instances
+    WHERE project_id = $projectId
+      AND workflow_id = $workflowId
+      AND session_id = $sessionId
+      AND generation = $workflowGeneration
+    LIMIT 2
+  `).get({
+    $projectId: plan.projectId,
+    $workflowId: plan.origin.workflowId,
+    $sessionId: plan.sessionId,
+    $workflowGeneration: BigInt(plan.origin.workflowGeneration),
+  });
+  return row !== undefined;
+}
+
+function latestRevision(
+  connection: SqliteConnection,
+  plan: LifecycleOutboxPlannedRevision,
+): bigint {
+  const row = connection.prepare(`
+    SELECT MAX(materialization_revision) AS latest_revision
+    FROM outbox
+    WHERE project_id = $projectId
+      AND session_id = $sessionId
+      AND artifact_kind = $artifactKind
+  `).get({
+    $projectId: plan.projectId,
+    $sessionId: plan.sessionId,
+    $artifactKind: plan.artifactKind,
+  });
+  if (row === undefined || row.latest_revision === null) integrity();
+  return positiveIntegerValue(row.latest_revision);
+}
+
+function sameFingerprint(left: KeyedFingerprintV1, right: KeyedFingerprintV1): boolean {
+  return left.algorithm === right.algorithm
+    && left.schemaVersion === right.schemaVersion
+    && left.keyId === right.keyId
+    && left.domain === right.domain
+    && left.value === right.value;
+}
+
+function assertClaimMatches(
+  expected: LifecycleOutboxClaimV1,
+  actual: LifecycleOutboxClaimV1,
+): void {
+  const planSnapshot = (plan: LifecycleOutboxPlannedRevision) => canonicalJson({
+    ...plan,
+    materializationRevision: plan.materializationRevision.toString(),
+    triggeringEventPosition: plan.triggeringEventPosition.toString(),
+  });
+  if (
+    expected.status !== actual.status
+    || expected.attemptCount !== actual.attemptCount
+    || expected.claimOwner !== actual.claimOwner
+    || expected.claimToken !== actual.claimToken
+    || expected.claimExpiresAt !== actual.claimExpiresAt
+    || planSnapshot(expected.planned) !== planSnapshot(actual.planned)
+  ) integrity();
+}
+
 function queryPriorRow(
   connection: SqliteConnection,
   record: LifecycleOutboxStorageRecord,
@@ -668,6 +891,12 @@ function validateProvidedEvent(
 }
 
 export class LifecycleOutboxRepository {
+  readonly #faultInjector: LifecycleFaultInjector;
+
+  constructor(options: { readonly faultInjector?: LifecycleFaultInjector } = {}) {
+    this.#faultInjector = options.faultInjector ?? NO_LIFECYCLE_FAULTS;
+  }
+
   insertLifecycle(
     connection: SqliteConnection,
     pendingInput: PendingLifecycleOutboxV1,
@@ -770,6 +999,22 @@ export class LifecycleOutboxRepository {
         $nextAttemptAt: null,
       };
       try {
+        this.#faultInjector.hit(
+          "outbox-insert",
+          "before-write",
+          {
+            projectId: triggeringEvent.projectId,
+            sessionId: pending.payload.sessionId,
+            workflowId: pending.payload.origin.kind === "workflow"
+              ? pending.payload.origin.workflowId
+              : null,
+            commandId: triggeringEvent.commandId,
+            idempotencyKeyHash: null,
+            workId: pending.targetKey,
+            eventPosition: triggeringEvent.globalPosition.toString(),
+            materializationRevision: provisionalRecord.materializationRevision.toString(),
+          },
+        );
         connection.prepare(`
           INSERT INTO outbox(
             project_id, target_key, event_position, kind, payload_json,
@@ -793,6 +1038,415 @@ export class LifecycleOutboxRepository {
         integrity();
       }
     });
+  }
+
+  claimNext(
+    connection: SqliteConnection,
+    input: LifecycleOutboxClaimNextInputV1,
+  ): LifecycleOutboxClaimV1 | null {
+    const projectId = parseCanonicalUuid(input.projectId, "outbox.projectId");
+    const ownerId = ownerValue(input.ownerId);
+    const observedAt = timeFromMs(input.observedNowMs, "observedNowMs");
+    const claimExpiresAt = leaseUntil(input.observedNowMs, input.leaseDurationMs);
+    const candidate = connection.prepare(`
+      SELECT o.*
+      FROM outbox AS o
+      WHERE o.project_id = $projectId
+        AND o.kind = $kind
+        AND o.session_id IS NOT NULL
+        AND o.materialization_revision = (
+          SELECT max(latest.materialization_revision)
+          FROM outbox AS latest
+          WHERE latest.project_id = o.project_id
+            AND latest.session_id = o.session_id
+            AND latest.artifact_kind = o.artifact_kind
+        )
+        AND (
+          o.status = 'pending'
+          OR (o.status = 'failed' AND o.failure_class = 'retryable' AND o.next_attempt_at <= $observedAt)
+          OR (o.status = 'claimed' AND o.claim_expires_at <= $observedAt)
+        )
+        AND (
+          o.origin_kind = 'terminal-event'
+          OR EXISTS (
+            SELECT 1
+            FROM workflow_instances AS w
+            WHERE w.project_id = o.project_id
+              AND w.workflow_id = o.workflow_id
+              AND w.session_id = o.session_id
+              AND w.generation = o.workflow_generation
+          )
+        )
+      ORDER BY o.materialization_revision ASC, o.target_key COLLATE BINARY ASC
+      LIMIT 1
+    `).get({
+      $projectId: projectId,
+      $kind: LIFECYCLE_OUTBOX_KIND,
+      $observedAt: observedAt,
+    });
+    if (candidate === undefined) return null;
+    const candidateRecord = decodeStorageRow(candidate);
+    const candidatePlan = validateRow(connection, candidate, 0);
+    const nextAttemptCount = candidateRecord.attemptCount + 1n;
+    if (nextAttemptCount > MAX_SQLITE_INT64) inputFailure();
+    const changed = connection.prepare(`
+      UPDATE outbox
+      SET status = 'claimed',
+          attempt_count = attempt_count + 1,
+          claim_owner = $ownerId,
+          claim_token = attempt_count + 1,
+          claim_expires_at = $claimExpiresAt,
+          updated_at = $updatedAt,
+          failure_class = NULL,
+          safe_error_code = NULL,
+          next_attempt_at = NULL
+      WHERE project_id = $projectId
+        AND target_key = $targetKey
+        AND materialization_revision = $materializationRevision
+        AND status = $status
+        AND attempt_count = $attemptCount
+        AND (
+          status = 'pending'
+          OR (status = 'failed' AND failure_class = 'retryable' AND next_attempt_at <= $observedAt)
+          OR (status = 'claimed' AND claim_expires_at <= $observedAt)
+        )
+        AND (
+          origin_kind = 'terminal-event'
+          OR EXISTS (
+            SELECT 1
+            FROM workflow_instances AS w
+            WHERE w.project_id = outbox.project_id
+              AND w.workflow_id = outbox.workflow_id
+              AND w.session_id = outbox.session_id
+              AND w.generation = outbox.workflow_generation
+          )
+        )
+    `).run({
+      $projectId: projectId,
+      $targetKey: candidateRecord.targetKey,
+      $materializationRevision: candidateRecord.materializationRevision,
+      $status: candidateRecord.status,
+      $attemptCount: candidateRecord.attemptCount,
+      $ownerId: ownerId,
+      $claimExpiresAt: claimExpiresAt,
+      $updatedAt: observedAt,
+      $observedAt: observedAt,
+    });
+    const changedCount = BigInt(changed.changes as unknown as bigint | number);
+    if (changedCount === 0n) return null;
+    if (changedCount !== 1n) integrity();
+    const row = queryRowByTargetKey(connection, projectId, candidatePlan.targetKey);
+    if (row.length !== 1) integrity();
+    return claimFromRawRow(connection, row[0]!);
+  }
+
+  getExactClaim(
+    connection: SqliteConnection,
+    input: LifecycleOutboxExactClaimInputV1,
+  ): LifecycleOutboxClaimV1 {
+    const values = exactClaimValues(input);
+    const rows = exactClaimRows(connection, values);
+    if (rows.length === 0) throw new LifecycleError("EVENT_CONFLICT");
+    if (rows.length !== 1) integrity();
+    const record = decodeStorageRow(rows[0]!);
+    if (
+      record.status !== "claimed"
+      && record.status !== "completed"
+    ) throw new LifecycleError("EVENT_CONFLICT");
+    if (record.claimOwner !== values.ownerId || record.claimToken !== values.claimToken) {
+      throw new LifecycleError("EVENT_CONFLICT");
+    }
+    const claim = claimFromRawRow(connection, rows[0]!);
+    if (claim.status === "claimed") requireCurrentWorkflowGeneration(connection, claim.planned);
+    return claim;
+  }
+
+  renewClaim(
+    connection: SqliteConnection,
+    input: LifecycleOutboxRenewInputV1,
+  ): LifecycleOutboxClaimV1 | null {
+    const values = exactClaimValues(input);
+    const observedAt = timeFromMs(input.observedNowMs, "observedNowMs");
+    const claimExpiresAt = leaseUntil(input.observedNowMs, input.leaseDurationMs);
+    const rows = exactClaimRows(connection, values);
+    if (rows.length === 0) return null;
+    if (rows.length !== 1) integrity();
+    const current = decodeStorageRow(rows[0]!);
+    const plan = validateRow(connection, rows[0]!, 0);
+    if (
+      current.status !== "claimed"
+      || current.claimOwner !== values.ownerId
+      || current.claimToken !== values.claimToken
+      || latestRevision(connection, plan) !== values.materializationRevision
+    ) return null;
+    requireCurrentWorkflowGeneration(connection, plan);
+    const changed = connection.prepare(`
+      UPDATE outbox
+      SET claim_expires_at = $claimExpiresAt,
+          updated_at = $updatedAt
+      WHERE project_id = $projectId
+        AND target_key = $targetKey
+        AND materialization_revision = $materializationRevision
+        AND status = 'claimed'
+        AND claim_owner = $ownerId
+        AND claim_token = $claimToken
+        AND claim_expires_at > $observedAt
+        AND (
+          origin_kind = 'terminal-event'
+          OR EXISTS (
+            SELECT 1
+            FROM workflow_instances AS w
+            WHERE w.project_id = outbox.project_id
+              AND w.workflow_id = outbox.workflow_id
+              AND w.session_id = outbox.session_id
+              AND w.generation = outbox.workflow_generation
+          )
+        )
+    `).run({
+      $projectId: values.projectId,
+      $targetKey: values.targetKey,
+      $materializationRevision: values.materializationRevision,
+      $ownerId: values.ownerId,
+      $claimToken: values.claimToken,
+      $claimExpiresAt: claimExpiresAt,
+      $updatedAt: observedAt,
+      $observedAt: observedAt,
+    });
+    const changedCount = BigInt(changed.changes as unknown as bigint | number);
+    if (changedCount === 0n) return null;
+    if (changedCount !== 1n) integrity();
+    const refreshed = exactClaimRows(connection, values);
+    if (refreshed.length !== 1) integrity();
+    return claimFromRawRow(connection, refreshed[0]!);
+  }
+
+  listCommittedLowerRevisionFingerprints(
+    connection: SqliteConnection,
+    claim: LifecycleOutboxClaimV1,
+  ): readonly KeyedFingerprintV1[] {
+    const exact = this.getExactClaim(connection, {
+      projectId: claim.planned.projectId,
+      targetKey: claim.planned.targetKey,
+      materializationRevision: claim.planned.materializationRevision,
+      ownerId: claim.claimOwner,
+      claimToken: claim.claimToken,
+    });
+    assertClaimMatches(claim, exact);
+    const rows = connection.prepare(`
+      SELECT *
+      FROM outbox
+      WHERE project_id = $projectId
+        AND session_id = $sessionId
+        AND artifact_kind = $artifactKind
+        AND artifact_path = $artifactPath
+        AND materialization_revision < $materializationRevision
+      ORDER BY materialization_revision ASC
+    `).all({
+      $projectId: claim.planned.projectId,
+      $sessionId: claim.planned.sessionId,
+      $artifactKind: claim.planned.artifactKind,
+      $artifactPath: claim.planned.artifactPath,
+      $materializationRevision: claim.planned.materializationRevision,
+    });
+    const fingerprints: KeyedFingerprintV1[] = [];
+    for (const row of rows) {
+      const record = decodeStorageRow(row);
+      if (record.status !== "completed") continue;
+      const plan = validateRow(connection, row, 0);
+      if (
+        plan.projectId !== claim.planned.projectId
+        || plan.sessionId !== claim.planned.sessionId
+        || plan.artifactKind !== claim.planned.artifactKind
+        || plan.artifactPath !== claim.planned.artifactPath
+      ) integrity();
+      fingerprints.push(plan.nextFingerprint);
+    }
+    return Object.freeze(fingerprints);
+  }
+
+  isLatestRevision(
+    connection: SqliteConnection,
+    plan: LifecycleOutboxPlannedRevision,
+  ): boolean {
+    return latestRevision(connection, plan) === plan.materializationRevision;
+  }
+
+  isCurrentWorkflowGeneration(
+    connection: SqliteConnection,
+    plan: LifecycleOutboxPlannedRevision,
+  ): boolean {
+    return hasCurrentWorkflowGeneration(connection, plan);
+  }
+
+  isCompleted(
+    connection: SqliteConnection,
+    input: LifecycleOutboxCompletionQueryV1,
+  ): boolean {
+    const projectId = parseCanonicalUuid(input.projectId, "outbox.projectId");
+    const targetKey = targetKeyValue(input.targetKey);
+    const materializationRevision = revisionInput(input.materializationRevision);
+    const rows = connection.prepare(`
+      SELECT *
+      FROM outbox
+      WHERE project_id = $projectId
+        AND target_key = $targetKey
+        AND materialization_revision = $materializationRevision
+    `).all({
+      $projectId: projectId,
+      $targetKey: targetKey,
+      $materializationRevision: materializationRevision,
+    });
+    if (rows.length === 0) return false;
+    if (rows.length !== 1) integrity();
+    const record = decodeStorageRow(rows[0]!);
+    void validateRow(connection, rows[0]!, 0);
+    return record.status === "completed";
+  }
+
+  recordFailure(
+    connection: SqliteConnection,
+    input: LifecycleOutboxFailureInputV1,
+  ): boolean {
+    const values = exactClaimValues(input);
+    const observedAt = timeFromMs(input.observedNowMs, "observedNowMs");
+    const failureClass = input.failureClass;
+    if (failureClass !== "retryable" && failureClass !== "permanent") inputFailure();
+    const safeErrorCode = safeErrorCodeInput(input.safeErrorCode);
+    const rows = exactClaimRows(connection, values);
+    if (rows.length === 0) return false;
+    if (rows.length !== 1) integrity();
+    const current = decodeStorageRow(rows[0]!);
+    const plan = validateRow(connection, rows[0]!, 0);
+    if (
+      current.status !== "claimed"
+      || current.claimOwner !== values.ownerId
+      || current.claimToken !== values.claimToken
+      || latestRevision(connection, plan) !== values.materializationRevision
+    ) return false;
+    if (input.attemptCount !== undefined && input.attemptCount !== current.attemptCount) {
+      inputFailure();
+    }
+    requireCurrentWorkflowGeneration(connection, plan);
+    const expectedNextAttemptAt = failureClass === "retryable"
+      ? retryAt(input.observedNowMs, current.attemptCount)
+      : null;
+    if (input.nextAttemptAt !== expectedNextAttemptAt) inputFailure();
+    const changed = connection.prepare(`
+      UPDATE outbox
+      SET status = 'failed',
+          claim_owner = NULL,
+          claim_token = NULL,
+          claim_expires_at = NULL,
+          updated_at = $updatedAt,
+          failure_class = $failureClass,
+          safe_error_code = $safeErrorCode,
+          next_attempt_at = $nextAttemptAt
+      WHERE project_id = $projectId
+        AND target_key = $targetKey
+        AND materialization_revision = $materializationRevision
+        AND status = 'claimed'
+        AND claim_owner = $ownerId
+        AND claim_token = $claimToken
+        AND claim_expires_at > $observedAt
+        AND (
+          origin_kind = 'terminal-event'
+          OR EXISTS (
+            SELECT 1
+            FROM workflow_instances AS w
+            WHERE w.project_id = outbox.project_id
+              AND w.workflow_id = outbox.workflow_id
+              AND w.session_id = outbox.session_id
+              AND w.generation = outbox.workflow_generation
+          )
+        )
+    `).run({
+      $projectId: values.projectId,
+      $targetKey: values.targetKey,
+      $materializationRevision: values.materializationRevision,
+      $ownerId: values.ownerId,
+      $claimToken: values.claimToken,
+      $updatedAt: observedAt,
+      $failureClass: failureClass,
+      $safeErrorCode: safeErrorCode,
+      $nextAttemptAt: expectedNextAttemptAt,
+      $observedAt: observedAt,
+    });
+    const changedCount = BigInt(changed.changes as unknown as bigint | number);
+    if (changedCount > 1n) integrity();
+    return changedCount === 1n;
+  }
+
+  acknowledgeAfterReplacement(
+    connection: SqliteConnection,
+    input: LifecycleOutboxAcknowledgementInputV1,
+  ): LifecycleOutboxMaterializationResultV1 {
+    const values = exactClaimValues(input);
+    const completedAt = timestampInput(input.completedAt, "completedAt");
+    const targetPath = input.targetPath;
+    if (typeof targetPath !== "string" || targetPath.length === 0 || targetPath.length > 4_096) inputFailure();
+    let targetFingerprint: KeyedFingerprintV1;
+    try {
+      targetFingerprint = decodeKeyedFingerprintV1(input.targetFingerprint);
+    } catch {
+      inputFailure();
+    }
+    const rows = exactClaimRows(connection, values);
+    if (rows.length === 0) throw new LifecycleError("EVENT_CONFLICT");
+    if (rows.length !== 1) integrity();
+    const current = decodeStorageRow(rows[0]!);
+    const plan = validateRow(connection, rows[0]!, 0);
+    if (targetPath !== plan.artifactPath || !sameFingerprint(targetFingerprint, plan.nextFingerprint)) {
+      throw new LifecycleError("MATERIALIZATION_CONFLICT");
+    }
+    const latest = latestRevision(connection, plan);
+    if (current.status === "completed") {
+      if (
+        current.claimOwner !== values.ownerId
+        || current.claimToken !== values.claimToken
+      ) throw new LifecycleError("EVENT_CONFLICT");
+      const claim = claimFromRawRow(connection, rows[0]!);
+      return Object.freeze({
+        status: latest > plan.materializationRevision
+          ? "superseded-after-completion"
+          : "completed",
+        claim,
+      });
+    }
+    if (
+      current.status !== "claimed"
+      || current.claimOwner !== values.ownerId
+      || current.claimToken !== values.claimToken
+      || latest !== plan.materializationRevision
+    ) throw new LifecycleError("EVENT_CONFLICT");
+    requireCurrentWorkflowGeneration(connection, plan);
+    const changed = connection.prepare(`
+      UPDATE outbox
+      SET status = 'completed',
+          claim_expires_at = NULL,
+          updated_at = $updatedAt,
+          failure_class = NULL,
+          safe_error_code = NULL,
+          next_attempt_at = NULL
+      WHERE project_id = $projectId
+        AND target_key = $targetKey
+        AND materialization_revision = $materializationRevision
+        AND status = 'claimed'
+        AND claim_owner = $ownerId
+        AND claim_token = $claimToken
+    `).run({
+      $projectId: values.projectId,
+      $targetKey: values.targetKey,
+      $materializationRevision: values.materializationRevision,
+      $ownerId: values.ownerId,
+      $claimToken: values.claimToken,
+      $updatedAt: completedAt,
+    });
+    const changedCount = BigInt(changed.changes as unknown as bigint | number);
+    if (changedCount !== 1n) throw new LifecycleError("EVENT_CONFLICT");
+    const completedRows = exactClaimRows(connection, values);
+    if (completedRows.length !== 1) integrity();
+    const claim = claimFromRawRow(connection, completedRows[0]!);
+    return Object.freeze({ status: "completed", claim });
   }
 
   getExactPlannedRevision(

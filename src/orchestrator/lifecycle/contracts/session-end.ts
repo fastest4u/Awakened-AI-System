@@ -159,6 +159,22 @@ export type SessionEndPhaseResultV2 = JsonValue & {
   readonly status: SessionEndStatusV2;
 };
 
+export type CarryForwardChildResultV1 = JsonValue & {
+  readonly resultVersion: 1;
+  readonly action: "carry-forward-child";
+  readonly workflowId: WorkflowId;
+  readonly workflowGeneration: number;
+  readonly plannedWorkId: string;
+  readonly rootSessionId: SessionId;
+  readonly childSessionId: SessionId;
+  readonly previousChildState: "active" | "completion-proposed" | "suspended";
+  readonly childState: "transferred";
+  readonly transferTicketId: TransferTicketId;
+  readonly suspensionEventPosition: string;
+  readonly transferTicketEventPosition: string;
+  readonly finalChildStreamVersion: string;
+};
+
 export type ValidationResultRecordedResultV1 = JsonValue & {
   readonly resultVersion: 1;
   readonly resultId: ValidationResultId;

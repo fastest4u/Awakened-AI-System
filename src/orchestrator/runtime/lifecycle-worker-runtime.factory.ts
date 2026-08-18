@@ -49,8 +49,35 @@ import { LifecycleCommandStore } from "../lifecycle/lifecycle-command.store.js";
 import type {
   LifecycleOperationalRepositorySet,
 } from "../lifecycle/lifecycle-operational.store.js";
-import { LifecycleOperationalStore } from "../lifecycle/lifecycle-operational.store.js";
+import {
+  createConnectionBoundLifecycleOutboxOperations,
+  createConnectionBoundLifecycleMaterializationReads,
+  LifecycleOperationalStore,
+} from "../lifecycle/lifecycle-operational.store.js";
 import { LifecycleQueryService } from "../lifecycle/lifecycle-query.service.js";
+import { SessionEndChildService } from "../lifecycle/session-end-child.service.js";
+import { SessionEndCoordinator } from "../lifecycle/session-end.coordinator.js";
+import { LifecycleRecoveryCoordinator } from "../lifecycle/lifecycle-recovery.coordinator.js";
+import { ConnectionBoundSessionEndWorkflowOperations } from "../lifecycle/session-end-workflow.service.js";
+import type { PendingLifecycleOutboxV1 } from "../lifecycle/materialization-queue.port.js";
+import type { StoredEvent } from "../contracts/event.js";
+import { SqliteLifecycleMaterializationQueue } from "../materialization/sqlite-lifecycle-materialization-queue.js";
+import { SqliteLifecycleMaterializationPlanningReads } from "../materialization/sqlite-lifecycle-materialization-planning-reads.js";
+import { CompatibilityLogMaterializer } from "../materialization/compatibility-log.materializer.js";
+import { LifecycleOutboxRepository } from "../storage/lifecycle-outbox.repository.js";
+import {
+  readPersistedValidationAttemptPlansV1,
+  SessionEndWorkflowRepository,
+} from "../storage/session-end.repository.js";
+import { LifecycleValidationResultRepository } from "../storage/lifecycle-validation-result.repository.js";
+import type {
+  LifecycleEvidenceCoverageReadOperations,
+  LifecycleSessionAuthorityReadOperations,
+  LifecycleChildTransferReadOperations,
+  LifecycleValidationPlanReadOperations,
+} from "../storage/lifecycle-storage.types.js";
+import type { TrustedValidationProfileRegistry } from "../lifecycle/validation-profile.registry.js";
+import type { LifecycleFaultInjector } from "../lifecycle/lifecycle-faults.js";
 import { buildLifecycleIntentWitness } from "../lifecycle/lifecycle-intent-witness.js";
 import type {
   SourceStateProvider,
@@ -62,8 +89,12 @@ import type { EvidenceCoverageRepository } from "../storage/evidence-coverage.re
 import type { LifecycleProjectionWriter } from "../storage/lifecycle-projection.repository.js";
 import type { SessionAuthorityRecord } from "../storage/lifecycle-storage.types.js";
 import type { MaintenanceFence } from "../storage/maintenance-fence.js";
-import type { SessionAuthorityRepository } from "../storage/session-authority.repository.js";
+import type {
+  CheckpointAtEventPositionInput,
+  SessionAuthorityRepository,
+} from "../storage/session-authority.repository.js";
 import type { SessionLeaseRepository } from "../storage/session-lease.repository.js";
+import type { PersistedValidationAttemptPlansWriteV1 } from "../storage/session-end.repository.js";
 import type { SqliteConnection } from "../storage/sqlite-driver.js";
 import { BranchScopeRepository } from "../storage/branch-scope.repository.js";
 import {
@@ -127,6 +158,12 @@ export interface LifecycleWorkerRuntimeFactoryOptions {
   readonly childBindingFingerprint: ChildWorkflowServiceOptions["childBindingFingerprint"];
   readonly repositories: LifecycleRuntimeRepositoryFactories;
   readonly transactionFacades: LifecycleTransactionFacadeFactory;
+  /** Optional until a deployment supplies its immutable trusted profile table. */
+  readonly validationProfileRegistry?: TrustedValidationProfileRegistry;
+  /** Fixture-only fault injection; production composition leaves this unset. */
+  readonly faultInjector?: LifecycleFaultInjector;
+  /** Fixture-only observer for exercising the fully composed session-end driver. */
+  readonly onSessionEndCoordinatorCreated?: (coordinator: SessionEndCoordinator) => void;
 }
 
 export interface LifecycleWorkerRuntimeFactoryPort {
@@ -176,6 +213,13 @@ function ownDataProperty<T>(value: object, key: string): T {
     return integrityFailure();
   }
   return descriptor.value as T;
+}
+
+function ownOptionalDataProperty<T>(value: object, key: string): T | undefined {
+  const descriptor = Reflect.getOwnPropertyDescriptor(value, key);
+  if (descriptor === undefined) return undefined;
+  if (!("value" in descriptor) || !descriptor.enumerable) return integrityFailure();
+  return descriptor.value as T | undefined;
 }
 
 function ownMethod<T extends (...arguments_: never[]) => unknown>(
@@ -517,6 +561,7 @@ implements PreparedCheckpointLifecycleHandler {
     sourceStateProvider: SourceStateProvider,
     identitySource: LifecycleRuntimeIdentitySource,
     clock: LifecycleRuntimeClock,
+    faultInjector?: LifecycleFaultInjector,
   ) {
     this.#connection = connection;
     this.#store = store;
@@ -533,6 +578,7 @@ implements PreparedCheckpointLifecycleHandler {
       sourceStateProvider,
       identitySource,
       clock: { now: () => clock.now() },
+      ...(faultInjector === undefined ? {} : { faultInjector }),
     });
   }
 
@@ -594,6 +640,7 @@ implements PreparedEvidenceLifecycleHandler {
     store: LifecycleCommandStore,
     capabilities: CapabilityService,
     clock: LifecycleRuntimeClock,
+    faultInjector?: LifecycleFaultInjector,
   ) {
     this.#store = store;
     this.#capabilities = capabilities;
@@ -606,6 +653,7 @@ implements PreparedEvidenceLifecycleHandler {
           return scope;
         },
       },
+      ...(faultInjector === undefined ? {} : { faultInjector }),
     });
   }
 
@@ -688,6 +736,14 @@ function validateFactoryOptions(
     options,
     "transactionFacades",
   );
+  const validationProfileRegistry = ownOptionalDataProperty<TrustedValidationProfileRegistry>(
+    options,
+    "validationProfileRegistry",
+  );
+  const faultInjector = ownOptionalDataProperty<LifecycleFaultInjector>(options, "faultInjector");
+  const onSessionEndCoordinatorCreated = ownOptionalDataProperty<
+    NonNullable<LifecycleWorkerRuntimeFactoryOptions["onSessionEndCoordinatorCreated"]>
+  >(options, "onSessionEndCoordinatorCreated");
   if (
     typeof clock?.nowMs !== "function"
     || typeof clock.now !== "function"
@@ -708,6 +764,10 @@ function validateFactoryOptions(
     || typeof repositories.projection !== "function"
     || typeof transactionFacades?.command !== "function"
     || typeof transactionFacades.operational !== "function"
+    || (validationProfileRegistry !== undefined
+      && (typeof validationProfileRegistry.resolve !== "function"
+        || typeof validationProfileRegistry.list !== "function"))
+    || (onSessionEndCoordinatorCreated !== undefined && typeof onSessionEndCoordinatorCreated !== "function")
   ) return integrityFailure();
   return Object.freeze({
     clock,
@@ -719,6 +779,9 @@ function validateFactoryOptions(
     childBindingFingerprint,
     repositories,
     transactionFacades,
+    validationProfileRegistry,
+    ...(faultInjector === undefined ? {} : { faultInjector }),
+    ...(onSessionEndCoordinatorCreated === undefined ? {} : { onSessionEndCoordinatorCreated }),
   });
 }
 
@@ -759,12 +822,50 @@ implements LifecycleWorkerRuntimeFactoryPort {
   create(inputValue: LifecycleWorkerRuntimeCreateInput): LifecycleWorkerRuntime {
     const input = validateCreateInput(inputValue);
     const options = this.#options;
+    const faultInjectorOptions = options.faultInjector === undefined
+      ? {}
+      : { faultInjector: options.faultInjector };
     const authority = options.repositories.authority();
     const leases = options.repositories.leases();
     const approvals = options.repositories.approvals();
     const transfers = options.repositories.transfers();
     const coverage = options.repositories.coverage(input.keyProvider);
     const projectionWriter = options.repositories.projection(input.connection);
+    const validationResultsRepository = new LifecycleValidationResultRepository();
+    const outboxRepository = new LifecycleOutboxRepository(faultInjectorOptions);
+    const compatibilityLogMaterializer = new CompatibilityLogMaterializer({
+      connection: input.connection,
+      keyProvider: input.keyProvider,
+      nowMs: () => options.clock.nowMs(),
+      ...(options.faultInjector === undefined ? {} : { faultInjector: options.faultInjector }),
+    });
+    const connectionBoundOutbox = createConnectionBoundLifecycleOutboxOperations(
+      input.connection,
+      outboxRepository,
+      compatibilityLogMaterializer,
+    );
+    const planningReads = new SqliteLifecycleMaterializationPlanningReads(input.connection, {
+      outboxRepository,
+    });
+    const planReader = Object.freeze({
+      getExactPlannedRevision: (query: import("../lifecycle/materialization-queue.port.js").ExactPlannedRevisionQuery) =>
+        outboxRepository.getExactPlannedRevision(input.connection, query),
+      assertExactPlannedRevision: (query: import("../lifecycle/materialization-queue.port.js").ExactPlannedRevisionQuery) =>
+        outboxRepository.assertExactPlannedRevision(input.connection, query),
+    });
+    const materializationQueue = new SqliteLifecycleMaterializationQueue({
+      reads: planningReads,
+      keyProvider: input.keyProvider,
+      planReader,
+    });
+    const lifecycleOutboxWriter = Object.freeze({
+      insertLifecycle: (
+        connection: SqliteConnection,
+        pending: PendingLifecycleOutboxV1,
+        triggeringEvent: StoredEvent,
+        createdAt: string,
+      ) => outboxRepository.insertLifecycle(connection, pending, triggeringEvent, createdAt),
+    });
     const capabilities = new CapabilityService({
       keyProvider: input.keyProvider,
       clock: options.clock,
@@ -772,7 +873,7 @@ implements LifecycleWorkerRuntimeFactoryPort {
     });
     const events = new EventAppendTransaction(
       input.connection,
-      new SqliteEventAppendStatements(input.connection),
+      new SqliteEventAppendStatements(input.connection, lifecycleOutboxWriter),
       input.maintenanceFence,
       new BranchScopeRepository({
         randomId: () => options.identitySource.uuid() as BranchScopeId,
@@ -786,7 +887,7 @@ implements LifecycleWorkerRuntimeFactoryPort {
       projectionWriter,
       transaction: (connection) => {
         if (connection !== input.connection) return integrityFailure();
-        return options.transactionFacades.command({
+        const provided = options.transactionFacades.command({
           connection,
           authority,
           leases,
@@ -794,15 +895,128 @@ implements LifecycleWorkerRuntimeFactoryPort {
           transfers,
           coverage,
         });
+        return Object.freeze({
+          ...provided,
+          authority: Object.freeze({
+            ...provided.authority,
+            listChildHistoryBounded: (projectId: string, rootSessionId: string, limit: number) =>
+              authority.listChildHistoryBounded(connection, projectId, rootSessionId, limit),
+          }),
+          transfers: Object.freeze({
+            ...provided.transfers,
+            listBySourceRoot: (projectId: string, rootSessionId: string, limit: number) =>
+              transfers.listBySourceRoot(connection, projectId, rootSessionId, limit),
+          }),
+          workflows: new ConnectionBoundSessionEndWorkflowOperations(connection, faultInjectorOptions),
+        });
       },
       evidenceCoverageRepository: coverage,
+      validationResultsRepository,
       now: () => options.clock.now(),
+      ...(options.faultInjector === undefined ? {} : { faultInjector: options.faultInjector }),
     });
     const operationalStore = new LifecycleOperationalStore({
       connection: input.connection,
       transaction: (connection) => {
         if (connection !== input.connection) return integrityFailure();
         return options.transactionFacades.operational({ connection });
+      },
+      ...(options.faultInjector === undefined ? {} : { faultInjector: options.faultInjector }),
+      decorateTransaction: (provided, connection) => {
+        const workflows = typeof provided.workflows.read === "function"
+          && typeof provided.workflows.claimNext === "function"
+          ? provided.workflows
+          : new ConnectionBoundSessionEndWorkflowOperations(connection, faultInjectorOptions);
+        const outboxPlans = provided.outboxPlans ?? planReader;
+        const validationPlans: LifecycleValidationPlanReadOperations = provided.validationPlans
+          ?? Object.freeze({
+            readPersistedValidationAttemptPlansV1: (projectId: string, workflowId: string) =>
+              readPersistedValidationAttemptPlansV1(connection, projectId, workflowId),
+            writePersistedValidationAttemptPlansV1: (
+              planInput: PersistedValidationAttemptPlansWriteV1,
+            ) => {
+              new SessionEndWorkflowRepository(connection, faultInjectorOptions)
+                .writePersistedValidationAttemptPlansV1(planInput);
+            },
+          });
+        const authorityReads: LifecycleSessionAuthorityReadOperations = provided.authority
+          ?? Object.freeze({
+            get: (projectId: string, sessionId: string) =>
+              authority.get(connection, projectId, sessionId),
+            listNonterminalChildren: (projectId: string, rootSessionId: string) =>
+              authority.listNonterminalChildren(connection, projectId, rootSessionId),
+            listChildHistoryBounded: (projectId: string, rootSessionId: string, limit: number) =>
+              authority.listChildHistoryBounded(connection, projectId, rootSessionId, limit),
+            requireFoldMatch: (record: SessionAuthorityRecord) =>
+              authority.requireFoldMatch(connection, record),
+            latestCheckpoint: (record: SessionAuthorityRecord) =>
+              authority.latestCheckpoint(connection, record),
+            requireCheckpointAtEventPosition: (checkpointInput: CheckpointAtEventPositionInput) =>
+              authority.requireCheckpointAtEventPosition(connection, checkpointInput),
+          });
+        const transferReads: LifecycleChildTransferReadOperations = provided.transfers
+          ?? Object.freeze({
+            get: (projectId: string, transferTicketId: string) =>
+              transfers.get(connection, projectId, transferTicketId),
+            listUnclaimedBySourceRoot: (
+              projectId: string,
+              sourceParentSessionId: string,
+              limit: number,
+            ) => transfers.listUnclaimedBySourceRoot(
+              connection,
+              projectId,
+              sourceParentSessionId,
+              limit,
+            ),
+            listBySourceRoot: (
+              projectId: string,
+              sourceParentSessionId: string,
+              limit: number,
+            ) => transfers.listBySourceRoot(
+              connection,
+              projectId,
+              sourceParentSessionId,
+              limit,
+            ),
+            listUnclaimedEndingScopeProjectionsBySourceRoot: (
+              projectId: string,
+              sourceParentSessionId: string,
+              limit: number,
+            ) => transfers.listUnclaimedEndingScopeProjectionsBySourceRoot(
+              connection,
+              projectId,
+              sourceParentSessionId,
+              limit,
+            ),
+          });
+        const coverageReads: LifecycleEvidenceCoverageReadOperations = provided.coverage
+          ?? Object.freeze({
+            assertQuickHealthy: (sessionIds: readonly import("../lifecycle/contracts/identifiers.js").SessionId[]) =>
+              coverage.assertQuickHealthy(connection, sessionIds),
+            assertVersion1Eligible: (sessionIds: readonly import("../lifecycle/contracts/identifiers.js").SessionId[]) =>
+              coverage.assertVersion1Eligible(connection, sessionIds),
+            snapshotV2: (
+              sessionId: import("../lifecycle/contracts/identifiers.js").SessionId,
+              baseEventPosition: bigint,
+            ) => coverage.snapshotV2(connection, sessionId, baseEventPosition),
+          });
+        const outbox = provided.outbox !== undefined
+          && typeof provided.outbox.materialize === "function"
+          ? provided.outbox
+          : connectionBoundOutbox;
+        const materializations = provided.materializations
+          ?? createConnectionBoundLifecycleMaterializationReads(connection, outboxRepository);
+        return Object.freeze({
+          ...provided,
+          workflows,
+          outbox,
+          materializations,
+          outboxPlans,
+          validationPlans,
+          authority: authorityReads,
+          transfers: transferReads,
+          coverage: coverageReads,
+        });
       },
     });
     const rootProcessor = new LifecycleCommandProcessor({
@@ -818,6 +1032,8 @@ implements LifecycleWorkerRuntimeFactoryPort {
       resumeSourceState: options.resumeSourceState,
       checkpointSourceStateProvider: options.checkpointSourceStateProvider,
       checkpointSourceStateScopeResolver: options.checkpointSourceStateScopeResolver,
+      materializationQueue,
+      ...faultInjectorOptions,
     });
     const childService = new ChildWorkflowService({
       connection: input.connection,
@@ -827,6 +1043,29 @@ implements LifecycleWorkerRuntimeFactoryPort {
       clock: options.clock,
       identitySource: options.identitySource,
       childBindingFingerprint: options.childBindingFingerprint,
+    });
+    const sessionEndChildService = new SessionEndChildService({
+      connection: input.connection,
+      commandStore: semanticStore,
+      authorityRepository: authority,
+      transferRepository: transfers,
+      clock: options.clock,
+    });
+    const sessionEndCoordinator = new SessionEndCoordinator({
+      connection: input.connection,
+      commandStore: semanticStore,
+      operationalStore,
+      authorityRepository: authority,
+      transferRepository: transfers,
+      childService: sessionEndChildService,
+      materializationQueue,
+      clock: options.clock,
+      identitySource: options.identitySource,
+      sourceStateProvider: options.checkpointSourceStateProvider,
+      sourceStateScopeResolver: options.checkpointSourceStateScopeResolver,
+      validationProfileRegistry: options.validationProfileRegistry,
+      validationResultsRepository,
+      ...faultInjectorOptions,
     });
     const queryService = new LifecycleQueryService({
       connection: input.connection,
@@ -841,13 +1080,15 @@ implements LifecycleWorkerRuntimeFactoryPort {
       options.checkpointSourceStateProvider,
       options.identitySource,
       options.clock,
+      options.faultInjector,
     );
     const evidenceHandler = new ConnectionBoundPreparedEvidenceHandler(
       semanticStore,
       capabilities,
       options.clock,
+      options.faultInjector,
     );
-    return new ConnectionBoundLifecycleWorkerRuntime({
+    const runtime = new ConnectionBoundLifecycleWorkerRuntime({
       rootProcessor,
       childService,
       checkpointHandler,
@@ -856,5 +1097,11 @@ implements LifecycleWorkerRuntimeFactoryPort {
       semanticStore,
       operationalStore,
     });
+    const recoveryCoordinator = new LifecycleRecoveryCoordinator({ operationalStore });
+    runtime.configureSessionEndRouting(sessionEndChildService, sessionEndCoordinator);
+    runtime.configureRecoveryRouting(recoveryCoordinator);
+    runtime.configureFencingClock(() => options.clock.nowMs());
+    options.onSessionEndCoordinatorCreated?.(sessionEndCoordinator);
+    return runtime;
   }
 }

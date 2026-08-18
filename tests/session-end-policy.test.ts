@@ -2,10 +2,13 @@ import { strict as assert } from "node:assert";
 import { describe, it } from "node:test";
 import {
   calculateQualityScoreV1,
+  classifyCoverageOnlyVerificationTerminalActionV1,
   deriveEffectiveQualityPolicyV1,
+  normalizeCoverageOnlyVerificationTerminalActionV1,
   assertVersion1WholeScopeEligibleV1,
   type EffectiveQualityPolicyInputV1,
 } from "../src/orchestrator/lifecycle/session-end-policy.js";
+import { LifecycleError } from "../src/orchestrator/lifecycle/errors.js";
 
 const trusted = [
   { profileId: "required-a", profileVersion: 1, required: true, weight: 3 },
@@ -62,6 +65,47 @@ describe("session-end policy arithmetic", () => {
         { sessionId: "child", eligible: false },
       ]),
       /LIFECYCLE_INPUT_INVALID/,
+    );
+  });
+
+  it("rejects verification-passed when full evidence is required in the coverage-only phase", () => {
+    const policy = deriveEffectiveQualityPolicyV1(policyInput());
+
+    assert.throws(
+      () => classifyCoverageOnlyVerificationTerminalActionV1(policy, {
+        action: "record-verification-passed",
+      }),
+      (error: unknown) => error instanceof LifecycleError
+        && error.code === "EVIDENCE_CAPTURE_INCOMPLETE",
+    );
+  });
+
+  it("rewrites an otherwise passing coverage-only terminal plan to the durable evidence failure", () => {
+    const policy = deriveEffectiveQualityPolicyV1(policyInput());
+
+    assert.deepEqual(
+      normalizeCoverageOnlyVerificationTerminalActionV1(policy, {
+        action: "record-verification-passed",
+        validationResultIds: ["validation-result-1"],
+        qualityScore: 10_000,
+      }),
+      {
+        action: "record-verification-failed",
+        validationResultIds: ["validation-result-1"],
+        safeFailureCode: "EVIDENCE_CAPTURE_INCOMPLETE",
+      },
+    );
+  });
+
+  it("marks the explicit coverage failure so all-pass validation results remain terminally failed", () => {
+    const policy = deriveEffectiveQualityPolicyV1(policyInput());
+
+    assert.equal(
+      classifyCoverageOnlyVerificationTerminalActionV1(policy, {
+        action: "record-verification-failed",
+        safeFailureCode: "EVIDENCE_CAPTURE_INCOMPLETE",
+      }),
+      "coverage-incomplete",
     );
   });
 });

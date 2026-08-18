@@ -46,6 +46,7 @@ import {
   internalValidationPlannedWorkId,
 } from "../src/orchestrator/crypto/event-hash.js";
 import { canonicalJson } from "../src/orchestrator/serialization/canonical-json.js";
+import type { LifecycleFaultContext } from "../src/orchestrator/lifecycle/lifecycle-faults.js";
 import type {
   LifecycleProjectionWriter,
 } from "../src/orchestrator/storage/lifecycle-projection.repository.js";
@@ -641,6 +642,38 @@ describe("LifecycleCommandStore", () => {
       "commit",
     ]);
     assert.deepEqual(connection.committed, ["event", "service", "projection", "dedup"]);
+  });
+
+  it("exposes the semantic before-write fault boundary with identity context", () => {
+    const connection = new TransactionConnection();
+    const events = new FakeEvents(connection);
+    const hits: LifecycleFaultContext[] = [];
+    const store = new LifecycleCommandStore({
+      connection,
+      events,
+      projectionWriter: recordingProjectionWriter(),
+      transaction: () => transaction(connection),
+      now: () => NOW,
+      faultInjector: {
+        hit(boundary, point, context): void {
+          assert.equal(boundary, "event-append");
+          assert.equal(point, "before-write");
+          hits.push(context);
+          throw new Error("fixture crash");
+        },
+      },
+    });
+
+    assert.throws(() => store.execute(envelope(), () => ({
+      append: appendCommand(),
+      authorizationRecord: authorization(),
+      afterAppend: () => undefined,
+    })), /fixture crash/);
+    assert.equal(hits.length, 1);
+    assert.equal(hits[0]?.projectId, CONTEXT.binding.projectId);
+    assert.equal(hits[0]?.commandId, SEMANTIC_COMMAND.commandId);
+    assert.deepEqual(connection.committed, []);
+    assert.deepEqual(connection.statements.slice(-2), ["BEGIN IMMEDIATE", "ROLLBACK"]);
   });
 
   it("lifecycle command replay performs no projection write", () => {

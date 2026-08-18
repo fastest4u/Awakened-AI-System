@@ -1,7 +1,12 @@
 import type {
   ChildSessionState,
   RootSessionState,
+  SessionId,
+  WorkflowId,
 } from "../lifecycle/contracts/identifiers.js";
+import type { CheckpointEvidenceCoverageV2 } from "../lifecycle/contracts/checkpoint.js";
+import type { Checkpoint } from "../lifecycle/contracts/checkpoint.js";
+import type { SessionAggregateState } from "../lifecycle/session-aggregate.js";
 import type { TerminalLifecycleEventType } from "../lifecycle/session-aggregate.js";
 import type {
   PersistedValidationAttemptPlansWriteV1,
@@ -9,11 +14,20 @@ import type {
   SessionEndWorkflowClaimNextInputV1,
   SessionEndWorkflowClaimV1,
   SessionEndWorkflowEventlessPhaseInputV1,
+  SessionEndWorkflowEventfulPhaseInputV1,
+  SessionEndWorkflowFinalCheckpointInputV1,
+  SessionEndWorkflowAbandonmentInputV1,
+  SessionEndWorkflowRecoveryInputV1,
+  SessionEndWorkflowRecoveryResultV1,
   SessionEndWorkflowRecordV1,
   SessionEndWorkflowReleaseInputV1,
   SessionEndWorkflowRenewInputV1,
   StoredValidationAttemptPlansV1,
 } from "./session-end.repository.js";
+import type {
+  KeyedFingerprintV1,
+  LifecycleOutboxPlannedRevision,
+} from "../lifecycle/materialization-queue.port.js";
 
 /**
  * The only session-end workflow capabilities that may cross a transaction
@@ -27,11 +41,73 @@ export interface SessionEndWorkflowOperations {
   renew(input: SessionEndWorkflowRenewInputV1): SessionEndWorkflowClaimV1 | null;
   release(input: SessionEndWorkflowReleaseInputV1): boolean;
   advanceEventlessPhase(input: SessionEndWorkflowEventlessPhaseInputV1): boolean;
+  readonly advanceEventfulPhase?: (input: SessionEndWorkflowEventfulPhaseInputV1) => boolean;
+  readonly recover?: (input: SessionEndWorkflowRecoveryInputV1) => SessionEndWorkflowRecoveryResultV1;
+  readonly abandonGeneration?: (input: SessionEndWorkflowAbandonmentInputV1) => void;
+  readonly recordFinalCheckpoint?: (input: SessionEndWorkflowFinalCheckpointInputV1) => void;
   readPersistedValidationAttemptPlansV1(
     projectId: string,
     workflowId: string,
   ): StoredValidationAttemptPlansV1 | null;
   writePersistedValidationAttemptPlansV1(input: PersistedValidationAttemptPlansWriteV1): void;
+}
+
+/** Read-only validation-plan capability for an active operational transaction. */
+export interface LifecycleValidationPlanReadOperations {
+  readPersistedValidationAttemptPlansV1(
+    projectId: string,
+    workflowId: string,
+  ): StoredValidationAttemptPlansV1 | null;
+  writePersistedValidationAttemptPlansV1(input: PersistedValidationAttemptPlansWriteV1): void;
+}
+
+/** Narrow authority reads exposed to operational callbacks; no mutation or transaction control. */
+export interface LifecycleSessionAuthorityReadOperations {
+  get(projectId: string, sessionId: string): SessionAuthorityRecord | null;
+  listNonterminalChildren(
+    projectId: string,
+    rootSessionId: string,
+  ): readonly SessionAuthorityRecord[];
+  listChildHistoryBounded(
+    projectId: string,
+    rootSessionId: string,
+    limit: number,
+  ): readonly SessionAuthorityRecord[];
+  requireFoldMatch(authority: SessionAuthorityRecord): SessionAggregateState;
+  latestCheckpoint(authority: SessionAuthorityRecord): Checkpoint | null;
+  requireCheckpointAtEventPosition(input: {
+    readonly projectId: string;
+    readonly sessionId: string;
+    readonly checkpointId: string;
+    readonly checkpointEventPosition: bigint;
+  }): Checkpoint;
+}
+
+/** Narrow transfer-ticket reads exposed to operational callbacks. */
+export interface LifecycleChildTransferReadOperations {
+  get(projectId: string, transferTicketId: string): ChildTransferTicketRecord | null;
+  listUnclaimedBySourceRoot(
+    projectId: string,
+    sourceParentSessionId: string,
+    limit: number,
+  ): readonly ChildTransferTicketRecord[];
+  listBySourceRoot(
+    projectId: string,
+    sourceParentSessionId: string,
+    limit: number,
+  ): readonly ChildTransferTicketRecord[];
+  listUnclaimedEndingScopeProjectionsBySourceRoot(
+    projectId: string,
+    sourceParentSessionId: string,
+    limit: number,
+  ): readonly CarryForwardEndingScopeProjectionRecord[];
+}
+
+/** Narrow evidence-coverage reads/assertions exposed to operational callbacks. */
+export interface LifecycleEvidenceCoverageReadOperations {
+  assertQuickHealthy(sessionIds: readonly SessionId[]): void;
+  assertVersion1Eligible(sessionIds: readonly SessionId[]): void;
+  snapshotV2(sessionId: SessionId, baseEventPosition: bigint): CheckpointEvidenceCoverageV2;
 }
 
 export type LifecycleJsonValue =
@@ -246,6 +322,24 @@ export interface ChildTransferTicketInsert {
   readonly createdAtMs: bigint;
 }
 
+/**
+ * The immutable lineage carried by an automatic session-end transfer ticket.
+ * Positions are decimal strings at this boundary because the value is also
+ * persisted inside canonical JSON and later compared with immutable events.
+ */
+export interface SessionEndCarryForwardTicketLineageV1 {
+  readonly lineageKind: "session-end-carry-forward-v1";
+  readonly workflowId: WorkflowId;
+  readonly workflowGeneration: number;
+  readonly plannedWorkId: string;
+  readonly previousParentSessionId: SessionId;
+  readonly previousChildSessionId: SessionId;
+  readonly correlationId: string;
+  readonly suspensionEventPosition: string;
+  readonly checkpointEventPosition: string;
+  readonly transferEventPosition: string;
+}
+
 export interface ChildTransferClaim {
   readonly projectId: string;
   readonly transferTicketId: string;
@@ -413,4 +507,66 @@ export interface LifecycleOutboxStorageRecord {
   readonly failureClass: "retryable" | "permanent" | null;
   readonly safeErrorCode: string | null;
   readonly nextAttemptAt: string | null;
+}
+
+export interface LifecycleOutboxClaimV1 {
+  readonly planned: LifecycleOutboxPlannedRevision;
+  readonly status: "claimed" | "completed";
+  readonly attemptCount: bigint;
+  readonly claimOwner: string;
+  readonly claimToken: bigint;
+  readonly claimExpiresAt: string | null;
+}
+
+export interface LifecycleOutboxClaimNextInputV1 {
+  readonly projectId: string;
+  readonly ownerId: string;
+  readonly observedNowMs: bigint;
+  readonly leaseDurationMs: bigint;
+}
+
+export interface LifecycleOutboxClaimIdentityV1 {
+  readonly targetKey: string;
+  readonly materializationRevision: bigint;
+  readonly ownerId: string;
+  readonly claimToken: bigint;
+}
+
+export interface LifecycleOutboxExactClaimInputV1 extends LifecycleOutboxClaimIdentityV1 {
+  readonly projectId: string;
+}
+
+export interface LifecycleOutboxCompletionQueryV1 {
+  readonly projectId: string;
+  readonly targetKey: string;
+  readonly materializationRevision: bigint;
+}
+
+export interface LifecycleOutboxRenewInputV1 extends LifecycleOutboxExactClaimInputV1 {
+  readonly observedNowMs: bigint;
+  readonly leaseDurationMs: bigint;
+}
+
+export interface LifecycleOutboxFailureInputV1 extends LifecycleOutboxExactClaimInputV1 {
+  readonly observedNowMs: bigint;
+  readonly failureClass: "retryable" | "permanent";
+  readonly safeErrorCode: string;
+  readonly nextAttemptAt: string | null;
+  readonly attemptCount?: bigint;
+}
+
+export interface LifecycleOutboxAcknowledgementInputV1 {
+  readonly projectId: string;
+  readonly targetKey: string;
+  readonly materializationRevision: bigint;
+  readonly ownerId: string;
+  readonly claimToken: bigint;
+  readonly completedAt: string;
+  readonly targetPath: string;
+  readonly targetFingerprint: KeyedFingerprintV1;
+}
+
+export interface LifecycleOutboxMaterializationResultV1 {
+  readonly status: "completed" | "superseded-after-completion";
+  readonly claim: LifecycleOutboxClaimV1;
 }

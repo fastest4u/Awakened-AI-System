@@ -421,6 +421,121 @@ export interface WorkflowClaimAssertionV1 {
   readonly claimExpiresAt: string;
 }
 
+export interface CarryForwardChildActionV1 {
+  readonly action: "carry-forward-child";
+  readonly actionVersion: 1;
+  readonly rootSessionId: SessionId;
+  readonly childSessionId: SessionId;
+  readonly expectedChildState: "active" | "completion-proposed" | "suspended";
+  readonly expectedChildHeadEventPosition: string;
+  readonly expectedChildStreamVersion: string;
+  readonly expectedChildAuthorityCommitment: string;
+  readonly expectedChildCapabilityGeneration: string;
+  readonly expectedSuspensionEventPosition: string | null;
+  readonly checkpointId: CheckpointId;
+  readonly checkpointEventPosition: string;
+  readonly checkpointFingerprint: string;
+}
+
+function parsePositivePosition(value: unknown, field: string): string {
+  const parsed = parseDecimalString(value, field);
+  if (parsed === "0") throw new LifecycleError("LIFECYCLE_INPUT_INVALID", { field });
+  return parsed;
+}
+
+export function decodeCarryForwardChildActionV1(value: unknown): CarryForwardChildActionV1 {
+  const action = exactRecord(
+    value,
+    [
+      "action",
+      "actionVersion",
+      "rootSessionId",
+      "childSessionId",
+      "expectedChildState",
+      "expectedChildHeadEventPosition",
+      "expectedChildStreamVersion",
+      "expectedChildAuthorityCommitment",
+      "expectedChildCapabilityGeneration",
+      "expectedSuspensionEventPosition",
+      "checkpointId",
+      "checkpointEventPosition",
+      "checkpointFingerprint",
+    ],
+    "carryForwardChildAction",
+  );
+  const rootSessionId = parseLifecycleId<SessionId>(action.rootSessionId, "carryForwardChildAction.rootSessionId");
+  const childSessionId = parseLifecycleId<SessionId>(action.childSessionId, "carryForwardChildAction.childSessionId");
+  if (rootSessionId === childSessionId) {
+    throw new LifecycleError("LIFECYCLE_INPUT_INVALID", { field: "carryForwardChildAction" });
+  }
+  if (action.action !== "carry-forward-child" || action.actionVersion !== 1) {
+    throw new LifecycleError("LIFECYCLE_INPUT_INVALID", { field: "carryForwardChildAction" });
+  }
+  const expectedChildAuthorityCommitment = parseBoundedString(
+    action.expectedChildAuthorityCommitment,
+    "carryForwardChildAction.expectedChildAuthorityCommitment",
+    64,
+  );
+  if (!LOWER_HASH.test(expectedChildAuthorityCommitment)) {
+    throw new LifecycleError("LIFECYCLE_INPUT_INVALID", {
+      field: "carryForwardChildAction.expectedChildAuthorityCommitment",
+    });
+  }
+  const checkpointFingerprint = parseBoundedString(
+    action.checkpointFingerprint,
+    "carryForwardChildAction.checkpointFingerprint",
+    64,
+  );
+  if (!LOWER_HASH.test(checkpointFingerprint)) {
+    throw new LifecycleError("LIFECYCLE_INPUT_INVALID", {
+      field: "carryForwardChildAction.checkpointFingerprint",
+    });
+  }
+  const expectedSuspensionEventPosition = action.expectedSuspensionEventPosition === null
+    ? null
+    : parsePositivePosition(
+        action.expectedSuspensionEventPosition,
+        "carryForwardChildAction.expectedSuspensionEventPosition",
+      );
+  const expectedChildState = parseEnum(
+    action.expectedChildState,
+    ["active", "completion-proposed", "suspended"] as const,
+    "carryForwardChildAction.expectedChildState",
+  );
+  if ((expectedChildState === "suspended") !== (expectedSuspensionEventPosition !== null)) {
+    throw new LifecycleError("LIFECYCLE_INPUT_INVALID", {
+      field: "carryForwardChildAction.expectedSuspensionEventPosition",
+    });
+  }
+  return Object.freeze({
+    action: "carry-forward-child",
+    actionVersion: 1,
+    rootSessionId,
+    childSessionId,
+    expectedChildState,
+    expectedChildHeadEventPosition: parsePositivePosition(
+      action.expectedChildHeadEventPosition,
+      "carryForwardChildAction.expectedChildHeadEventPosition",
+    ),
+    expectedChildStreamVersion: parseDecimalString(
+      action.expectedChildStreamVersion,
+      "carryForwardChildAction.expectedChildStreamVersion",
+    ),
+    expectedChildAuthorityCommitment,
+    expectedChildCapabilityGeneration: parsePositivePosition(
+      action.expectedChildCapabilityGeneration,
+      "carryForwardChildAction.expectedChildCapabilityGeneration",
+    ),
+    expectedSuspensionEventPosition,
+    checkpointId: parseLifecycleId<CheckpointId>(action.checkpointId, "carryForwardChildAction.checkpointId"),
+    checkpointEventPosition: parsePositivePosition(
+      action.checkpointEventPosition,
+      "carryForwardChildAction.checkpointEventPosition",
+    ),
+    checkpointFingerprint,
+  });
+}
+
 export interface RecordFinalCheckpointAndQueueEndingActionV1 {
   readonly action: "record-final-checkpoint-and-queue-ending";
   readonly finalCheckpoint: CheckpointV1;
@@ -514,24 +629,46 @@ export interface InternalValidationResultCommand extends LifecycleCommandBase {
   readonly result: ValidationResultV1;
 }
 
-export interface InternalWorkflowPhaseCommand extends LifecycleCommandBase {
+export interface InternalWorkflowPhaseBase extends LifecycleCommandBase {
   readonly commandType: "internal-workflow-phase";
   readonly workflowId: WorkflowId;
   readonly workflowGeneration: number;
   readonly sourcePhase: string;
   readonly plannedWorkId: string;
   readonly claim: WorkflowClaimAssertionV1;
+}
+
+export interface InternalRootWorkflowPhaseCommand extends InternalWorkflowPhaseBase {
   readonly action: SemanticSessionEndAction;
+}
+
+export interface InternalCarryForwardChildCommandV1 extends InternalWorkflowPhaseBase {
+  readonly sourcePhase: "requested";
+  readonly action: CarryForwardChildActionV1;
 }
 
 export type InternalWorkflowSemanticCommand =
   | InternalValidationResultCommand
-  | InternalWorkflowPhaseCommand;
+  | InternalRootWorkflowPhaseCommand
+  | InternalCarryForwardChildCommandV1;
 
-export interface InternalWorkflowPhasePlan
-  extends Omit<InternalWorkflowPhaseCommand, "action"> {
+export type InternalWorkflowPhaseCommand =
+  | InternalRootWorkflowPhaseCommand
+  | InternalCarryForwardChildCommandV1;
+
+export interface InternalRootWorkflowPhasePlan
+  extends Omit<InternalRootWorkflowPhaseCommand, "action"> {
   readonly plannedAction: PlannedSemanticSessionEndAction;
 }
+
+export interface InternalCarryForwardChildPlanV1
+  extends Omit<InternalCarryForwardChildCommandV1, "action"> {
+  readonly plannedAction: CarryForwardChildActionV1;
+}
+
+export type InternalWorkflowPhasePlan =
+  | InternalRootWorkflowPhasePlan
+  | InternalCarryForwardChildPlanV1;
 
 export type InternalWorkflowExecutionPlan =
   | InternalValidationResultCommand

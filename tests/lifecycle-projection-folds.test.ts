@@ -1434,7 +1434,7 @@ describe("authenticated lifecycle projection folds", () => {
     );
   });
 
-  it("defers internal transfer V2 child projection folding to Task 14S", () => {
+  it("folds internal transfer V2 against the newer governing checkpoint", () => {
     const fork = foldChildEventProjection(
       null,
       stored(lifecycleEvent(1, "SessionForked")),
@@ -1484,7 +1484,7 @@ describe("authenticated lifecycle projection folds", () => {
       checkpointId: latestCheckpoint.checkpointId,
       authorityCommitment: "a".repeat(64),
     };
-    assert.throws(() => foldChildEventProjection(
+    const transferred = foldChildEventProjection(
       recheckpointed,
       stored(lifecycleEvent(5, "ChildWorkTransferCreated"), {
         eventSchemaVersion: 2,
@@ -1492,7 +1492,8 @@ describe("authenticated lifecycle projection folds", () => {
         payloadJson: canonicalJson(payload),
       }),
       null,
-    ), /LIFECYCLE_PROJECTION_INVALID/);
+    );
+    assert.equal(transferred.childState, "transferred");
   });
 
   it("workflow projection fold rejects cancel and abandon event-intent parity mismatches", () => {

@@ -306,6 +306,34 @@ export class ChildTransferRepository {
     }).map(decode));
   }
 
+  /**
+   * Returns claimed and unclaimed transfer history in the canonical binary
+   * source-child/ticket order.  The caller may request limit-plus-one to
+   * enforce the bounded source-root history contract.
+   */
+  listBySourceRoot(
+    connection: SqliteConnection,
+    projectId: string,
+    sourceParentSessionId: string,
+    limit: number,
+  ): readonly ChildTransferTicketRecord[] {
+    uuid(projectId, invalid);
+    uuid(sourceParentSessionId, invalid);
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1_001) invalid();
+    return Object.freeze(connection.prepare(`
+      SELECT ${COLUMNS.join(", ")}
+      FROM child_transfer_tickets
+      WHERE project_id = $projectId
+        AND source_parent_session_id = $sourceParentSessionId
+      ORDER BY source_child_session_id COLLATE BINARY, transfer_ticket_id COLLATE BINARY
+      LIMIT $limit
+    `).all({
+      $projectId: projectId,
+      $sourceParentSessionId: sourceParentSessionId,
+      $limit: BigInt(limit),
+    }).map(decode));
+  }
+
   listUnclaimedEndingScopeProjectionsBySourceRoot(
     connection: SqliteConnection,
     projectId: string,
@@ -314,7 +342,7 @@ export class ChildTransferRepository {
   ): readonly CarryForwardEndingScopeProjectionRecord[] {
     uuid(projectId, invalid);
     uuid(sourceParentSessionId, invalid);
-    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1_000) invalid();
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1_001) invalid();
     return Object.freeze(connection.prepare(`
       SELECT
         ticket.project_id AS project_id,
@@ -350,7 +378,7 @@ export class ChildTransferRepository {
           AND transfer_event.session_id = ticket.source_child_session_id
           AND transfer_event.parent_session_id = ticket.source_parent_session_id
           AND transfer_event.event_type = 'ChildWorkTransferCreated'
-          AND transfer_event.event_schema_version = 1
+          AND transfer_event.event_schema_version IN (1, 2)
           AND json_valid(transfer_event.payload_json)
           AND json(transfer_event.payload_json) = transfer_event.payload_json
           AND json_extract(
@@ -365,6 +393,36 @@ export class ChildTransferRepository {
             transfer_event.payload_json,
             '$.authorityCommitment'
           ) = source_child.authority_commitment
+          AND (
+            transfer_event.event_schema_version = 1
+            OR (
+              json_extract(
+                transfer_event.payload_json,
+                '$.suspensionCheckpointId'
+              ) IS NOT NULL
+              AND EXISTS (
+                SELECT 1
+                FROM events AS suspension_event
+                WHERE suspension_event.project_id = ticket.project_id
+                  AND suspension_event.stream_id = source_child.stream_id
+                  AND suspension_event.stream_type = 'session'
+                  AND suspension_event.session_id = ticket.source_child_session_id
+                  AND suspension_event.parent_session_id = ticket.source_parent_session_id
+                  AND suspension_event.event_type = 'ChildSessionSuspended'
+                  AND suspension_event.event_schema_version = 1
+                  AND suspension_event.global_position < ticket.created_event_position
+                  AND json_valid(suspension_event.payload_json)
+                  AND json(suspension_event.payload_json) = suspension_event.payload_json
+                  AND json_extract(
+                    suspension_event.payload_json,
+                    '$.checkpointId'
+                  ) = json_extract(
+                    transfer_event.payload_json,
+                    '$.suspensionCheckpointId'
+                  )
+              )
+            )
+          )
           AND checkpoint_event.project_id = ticket.project_id
           AND checkpoint_event.global_position
             = source_child.latest_checkpoint_event_position
@@ -398,6 +456,7 @@ export class ChildTransferRepository {
           ) = CAST(source_child.latest_checkpoint_event_position AS TEXT)
         THEN 1 ELSE 0 END AS projection_valid
       FROM child_transfer_tickets AS ticket
+        INDEXED BY child_transfer_tickets_unclaimed_source_root
       LEFT JOIN session_authority AS source_child
         ON source_child.project_id = ticket.project_id
         AND source_child.session_id = ticket.source_child_session_id

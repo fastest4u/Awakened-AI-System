@@ -1,7 +1,8 @@
 import { strict as assert } from "node:assert";
-import { mkdtempSync, rmSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, it } from "node:test";
 import type { ProjectContext } from "../src/orchestrator/identity/contracts.js";
@@ -9,7 +10,7 @@ import type { LifecycleSemanticCommandDraft } from "../src/orchestrator/lifecycl
 import { decodeLifecycleEvent } from "../src/orchestrator/lifecycle/contracts/events.js";
 import { buildLifecycleIntentWitness } from "../src/orchestrator/lifecycle/lifecycle-intent-witness.js";
 import { canonicalJson } from "../src/orchestrator/serialization/canonical-json.js";
-import { MigrationRunner } from "../src/orchestrator/storage/migration-runner.js";
+import { MigrationRunner, migrationChecksum } from "../src/orchestrator/storage/migration-runner.js";
 import { eventCoreMigration } from "../src/orchestrator/storage/migrations/0001-event-core.js";
 import { sessionLifecycleMigration } from "../src/orchestrator/storage/migrations/0002-session-lifecycle.js";
 import { qualifiedCheckpointCoverageMigration } from "../src/orchestrator/storage/migrations/0003-qualified-checkpoint-coverage.js";
@@ -19,6 +20,10 @@ import { SqliteQualifiedCheckpointMigrationPreflight } from "../src/orchestrator
 import {
   SqliteSessionEndEffectiveStateMigrationPreflight,
 } from "../src/orchestrator/storage/session-end-effective-state-migration-preflight.js";
+import {
+  CURRENT_PROJECT_STORE_SCHEMA_VERSION,
+  PROJECT_STORE_MIGRATIONS,
+} from "../src/orchestrator/storage/migrations/registry.js";
 import type {
   SqliteConnection,
   SqliteParams,
@@ -54,6 +59,25 @@ const context = {
     storeId: STORE_ID,
   },
 } as ProjectContext;
+
+it("preserves migration 0004 and registers the schema-5 final-checkpoint transition", () => {
+  assert.equal(CURRENT_PROJECT_STORE_SCHEMA_VERSION, 5);
+  assert.deepEqual(PROJECT_STORE_MIGRATIONS.map((migration) => migration.version), [1, 2, 3, 4, 5]);
+  assert.equal(migrationChecksum(sessionLifecycleMigration), "85666a0bdee4455068f03a81e9d3720df172d15fce6d8e6f0cb3f5f7d0a81293");
+  assert.equal(
+    createHash("sha256").update(readFileSync(resolve(
+      "src/orchestrator/storage/migrations/0002-session-lifecycle.ts",
+    ))).digest("hex").toUpperCase(),
+    "68B4039048A359C523B7842F6D17BAA5760E9760D2B4E9F80BB8A48DC339EB06",
+  );
+  assert.equal(
+    createHash("sha256").update(readFileSync(resolve(
+      "src/orchestrator/storage/migrations/0003-qualified-checkpoint-coverage.ts",
+    ))).digest("hex").toUpperCase(),
+    "C023A8EDB88A94B749D4837F7300A76D081C843BF41BE058C3AA4AD5D6A158C4",
+  );
+  assert.equal(sessionEndEffectiveStateMigration.version, 4);
+});
 
 function emptyConnection(): SqliteConnection {
   const root = mkdtempSync(join(tmpdir(), "session-end-migration-"));
@@ -1981,7 +2005,7 @@ it("requires Version 3 markers in both workflow evidence guards", () => {
   }
 });
 
-it("preserves an earlier Version 3 marker through unchanged workflow carry", () => {
+it("amend unchanged preserves phase and frozen bytes", () => {
   const connection = schema4Connection();
   freezeWorkflowAtFinalMarker(connection);
   const checkpoint = finalMarkerCheckpoint(1);
@@ -2001,13 +2025,14 @@ it("preserves an earlier Version 3 marker through unchanged workflow carry", () 
     $workflowId: WORKFLOW_ID,
   }));
   const row = connection.prepare(`
-    SELECT generation, evidence_frozen_checkpoint_event_position,
+    SELECT generation, phase, evidence_frozen_checkpoint_event_position,
            evidence_frozen_generation, final_ending_scope_bindings_json
     FROM workflow_instances
     WHERE project_id = $projectId AND workflow_id = $workflowId
   `).get({ $projectId: PROJECT_ID, $workflowId: WORKFLOW_ID });
   assert.deepEqual({ ...row }, {
     generation: 2n,
+    phase: "final-checkpoint-recorded",
     evidence_frozen_checkpoint_event_position: 2n,
     evidence_frozen_generation: 1n,
     final_ending_scope_bindings_json: "[]",

@@ -19,7 +19,7 @@ import {
 } from "../src/orchestrator/lifecycle/contracts/checkpoint.js";
 import type {
   InternalWorkflowExecutionPlan,
-  InternalWorkflowPhaseCommand,
+  InternalRootWorkflowPhaseCommand,
   InternalWorkflowPhasePlan,
   RecordCheckpointCommandV2,
   RecordCheckpointCommandV3,
@@ -75,7 +75,7 @@ interface CheckpointServiceLike {
     readonly afterAppend: (committed: unknown, transaction: unknown) => void;
   };
   prepareFinalPhase(transaction: unknown, input: unknown): {
-    readonly action: InternalWorkflowPhaseCommand["action"];
+    readonly action: InternalRootWorkflowPhaseCommand["action"];
     readonly effect: ReturnType<CheckpointServiceLike["record"]>;
   };
   recordPreparedFinal(
@@ -1935,7 +1935,7 @@ describe("CheckpointService transactional enrichment", () => {
           sequence.push("prepared");
 
           const { plannedAction: _plannedAction, ...stablePlan } = plan;
-          const authoritativeCommand: InternalWorkflowPhaseCommand = {
+          const authoritativeCommand: InternalRootWorkflowPhaseCommand = {
             ...stablePlan,
             action: prepared.action,
           };

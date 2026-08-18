@@ -15,12 +15,14 @@ import {
 } from "./contracts/identifiers.js";
 import type {
   PersistedQualityPolicyInputV1,
+  SessionEndAmendment,
   SessionEndRequest,
   SessionEndRequestV1,
   SessionEndRequestV2,
 } from "./contracts/session-end.js";
 import {
   decodeQualityPolicyV1,
+  decodeSessionEndAmendment,
   decodeSessionEndRequest,
 } from "./contracts/session-end.js";
 import { LifecycleError } from "./errors.js";
@@ -194,6 +196,51 @@ export function createSessionEndEffectiveStateV1(input: {
   return decodeSessionEndEffectiveStateV1({
     ...withoutHash,
     effectiveStateHash: sessionEndEffectiveStateHashV1(withoutHash),
+  });
+}
+
+/**
+ * Folds a decoded amendment over the prior immutable request snapshot.
+ * Nullable amendment fields mean "retain the prior value"; the resulting
+ * request version follows the effective final checkpoint version so a V1
+ * amendment can retain an existing V2 draft without silently downgrading it.
+ */
+export function foldSessionEndAmendmentV1(input: {
+  readonly previous: SessionEndEffectiveStateV1;
+  readonly amendment: SessionEndAmendment;
+  readonly effectivePolicy: PersistedQualityPolicyInputV1;
+}): SessionEndEffectiveStateV1 {
+  const previous = decodeSessionEndEffectiveStateV1(input.previous);
+  const amendment = decodeSessionEndAmendment(input.amendment);
+  const priorRequest = previous.request;
+  const finalCheckpoint = amendment.finalCheckpoint ?? priorRequest.finalCheckpoint;
+  const request: SessionEndRequest = finalCheckpoint.checkpointVersion === 1
+    ? {
+      requestVersion: 1,
+      sessionId: priorRequest.sessionId,
+      childEndPolicy: amendment.childEndPolicy ?? priorRequest.childEndPolicy,
+      finalCheckpoint,
+      validationProfileIds: amendment.validationProfileIds ?? priorRequest.validationProfileIds,
+      requestedQualityThreshold:
+        amendment.requestedQualityThreshold ?? priorRequest.requestedQualityThreshold,
+      requireFullEvidence: amendment.requireFullEvidence ?? priorRequest.requireFullEvidence,
+      requireMaterialization: amendment.requireMaterialization ?? priorRequest.requireMaterialization,
+    }
+    : {
+      requestVersion: 2,
+      sessionId: priorRequest.sessionId,
+      childEndPolicy: amendment.childEndPolicy ?? priorRequest.childEndPolicy,
+      finalCheckpoint,
+      validationProfileIds: amendment.validationProfileIds ?? priorRequest.validationProfileIds,
+      requestedQualityThreshold:
+        amendment.requestedQualityThreshold ?? priorRequest.requestedQualityThreshold,
+      requireFullEvidence: amendment.requireFullEvidence ?? priorRequest.requireFullEvidence,
+      requireMaterialization: amendment.requireMaterialization ?? priorRequest.requireMaterialization,
+    };
+  return createSessionEndEffectiveStateV1({
+    request,
+    effectivePolicy: input.effectivePolicy,
+    effectiveFinalCheckpoint: finalCheckpoint,
   });
 }
 

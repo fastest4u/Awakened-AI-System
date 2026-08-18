@@ -8,6 +8,7 @@ import {
   assertSessionEndEffectiveStateRequestCorrelationV1,
   assertSessionEndEffectiveStateSessionCorrelationV1,
   decodeSessionEndEffectiveStateV1,
+  foldSessionEndAmendmentV1,
   initialSessionEndEvidenceWindowStateV1,
   sessionEndEffectiveStateHashV1,
   type SessionEndEffectiveStateV1,
@@ -31,6 +32,30 @@ function withReferenceHash(
 }
 
 describe("session end effective state", () => {
+  it("folds an amendment over the prior snapshot and preserves an omitted V2 draft", () => {
+    const previous = decodeSessionEndEffectiveStateV1(
+      sessionEndEffectiveStateFixture({ requestVersion: 2 }),
+    );
+    const amended = foldSessionEndAmendmentV1({
+      previous,
+      amendment: {
+        amendmentVersion: 1,
+        childEndPolicy: "require-completed",
+        finalCheckpoint: null,
+        validationProfileIds: null,
+        requestedQualityThreshold: null,
+        requireFullEvidence: null,
+        requireMaterialization: null,
+      },
+      effectivePolicy: previous.effectivePolicy,
+    });
+    assert.equal(amended.request.requestVersion, 2);
+    assert.equal(amended.request.childEndPolicy, "require-completed");
+    assert.deepEqual(amended.request.finalCheckpoint, previous.request.finalCheckpoint);
+    assert.deepEqual(amended.effectiveFinalCheckpoint, amended.request.finalCheckpoint);
+    assert.equal(amended.effectiveStateHash, sessionEndEffectiveStateHashV1(amended));
+  });
+
   it("enforces the session end effective-state raw UTF-8 guard at exact cap", () => {
     const exact = rawCanonicalProbeAtBytes(SESSION_END_EFFECTIVE_STATE_MAX_CANONICAL_BYTES);
     const over = rawCanonicalProbeAtBytes(SESSION_END_EFFECTIVE_STATE_MAX_CANONICAL_BYTES + 1);

@@ -5954,7 +5954,7 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
       FROM project_meta
       WHERE singleton = 1 AND project_id = $projectId
     `).get({ $projectId: context.binding.projectId });
-    return integer(row?.schema_version) === 4;
+    return (integer(row?.schema_version) ?? 0) >= 4;
   }
 
   private schema4LifetimeWithinCap(

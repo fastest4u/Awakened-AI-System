@@ -33,6 +33,10 @@ import type {
   RootSuspendCommandV3,
   RequestSessionEndCommandV2,
   RequestSessionEndCommandV3,
+  AmendSessionEndCommandV2,
+  AmendSessionEndCommandV3,
+  CancelSessionEndCommandV2,
+  AbandonSessionCommandV2,
 } from "./contracts/commands.js";
 import {
   assertSemanticCommandAuthorization,
@@ -49,6 +53,7 @@ import {
   LifecycleError,
   MAX_SESSION_AMBIGUITY_SUMMARIES,
 } from "./errors.js";
+import type { LifecycleFaultInjector } from "./lifecycle-faults.js";
 import {
   CapabilityService,
   MAX_BOUNDED_PROOF_HORIZON_MS,
@@ -77,6 +82,7 @@ import {
 } from "./session-end-policy.js";
 import {
   createSessionEndEffectiveStateV1,
+  foldSessionEndAmendmentV1,
   initialSessionEndEvidenceWindowStateV1,
 } from "./session-end-effective-state.js";
 import {
@@ -85,6 +91,7 @@ import {
 } from "./session-end-identifiers.js";
 import {
   SessionEndWorkflowService,
+  sessionEndGenerationStatusV2,
   requestedSessionEndStatusV2,
 } from "./session-end-workflow.service.js";
 import type { LifecycleApprovalRepository } from "../storage/lifecycle-approval.repository.js";
@@ -110,6 +117,10 @@ import type {
   SourceStateProvider,
   SourceStateScopeResolver,
 } from "./source-state.provider.js";
+import type {
+  LifecycleMaterializationQueuePort,
+  PreparedMaterializationQueueV1,
+} from "./materialization-queue.port.js";
 
 const OWNER_LEASE_DURATION_MS = 120_000n;
 const SQLITE_INT64_MAX = 9_223_372_036_854_775_807n;
@@ -185,6 +196,8 @@ export interface LifecycleCommandProcessorOptions {
   readonly checkpointSourceStateProvider: SourceStateProvider;
   readonly checkpointSourceStateScopeResolver: SourceStateScopeResolver;
   readonly sessionEndPolicy?: LifecycleSessionEndPolicyResolver;
+  readonly materializationQueue?: LifecycleMaterializationQueuePort;
+  readonly faultInjector?: LifecycleFaultInjector;
 }
 
 interface RootAuthorityOperations {
@@ -744,7 +757,11 @@ function validateContext(
     | RootSuspendCommandV2
     | RootSuspendCommandV3
     | RequestSessionEndCommandV2
-    | RequestSessionEndCommandV3,
+    | RequestSessionEndCommandV3
+    | AmendSessionEndCommandV2
+    | AmendSessionEndCommandV3
+    | CancelSessionEndCommandV2
+    | AbandonSessionCommandV2,
 ): void {
   const binding = context?.binding;
   if (
@@ -1035,6 +1052,50 @@ function recoveryReplayExpectation(
   });
 }
 
+function abandonmentReplayExpectation(
+  context: ProjectContext,
+  command: AbandonSessionCommandV2,
+  approval: RedactedLifecycleApproval,
+  proof: { readonly nonce: string; readonly digest: string },
+  candidateIntentHash: string,
+): Extract<LifecycleReplayExpectation, { kind: "protected" }> {
+  if (
+    !LOWER_HASH.test(candidateIntentHash)
+    || approval.action !== "abandon-root"
+    || approval.reasonCode !== command.reasonCode
+    || approval.projectId !== context.binding.projectId
+    || approval.vaultId !== context.binding.vaultId
+    || approval.storeId !== context.binding.storeId
+    || approval.workspaceId !== context.binding.workspaceId
+    || approval.sessionId !== command.sessionId
+    || approval.commandId !== command.commandId
+    || approval.idempotencyKey !== command.idempotencyKey
+    || approval.intentHash !== candidateIntentHash
+    || approval.executorActorRole !== context.binding.actorRole
+    || approval.executorClientInstanceId !== context.binding.clientInstanceId
+    || approval.targetActorRole !== "primary"
+    || approval.targetClientInstanceId.length === 0
+  ) throw new LifecycleError("LIFECYCLE_APPROVAL_INVALID");
+  return Object.freeze({
+    kind: "protected",
+    proof: Object.freeze({ version: 1, nonce: proof.nonce, digest: proof.digest }),
+    approval: Object.freeze({
+      approvalId: approval.approvalId,
+      digest: approval.approvalFingerprint,
+    }),
+    authorizationSessionId: command.sessionId,
+    targetSessionId: command.sessionId,
+    presenting: Object.freeze({
+      actorRole: context.binding.actorRole,
+      clientInstanceId: context.binding.clientInstanceId,
+    }),
+    target: Object.freeze({
+      actorRole: "primary",
+      clientInstanceId: approval.targetClientInstanceId,
+    }),
+  });
+}
+
 function workerMaterial(
   capabilityService: CapabilityService,
   context: ProjectContext,
@@ -1089,6 +1150,7 @@ export class LifecycleCommandProcessor {
   readonly #checkpoints: CheckpointService;
   readonly #sessionEndWorkflows: SessionEndWorkflowService;
   readonly #sessionEndPolicy: LifecycleSessionEndPolicyResolver;
+  readonly #materializationQueue: LifecycleMaterializationQueuePort | undefined;
 
   constructor(options: LifecycleCommandProcessorOptions) {
     this.#connection = options.connection;
@@ -1102,7 +1164,11 @@ export class LifecycleCommandProcessor {
     this.#resumeSourceState = options.resumeSourceState;
     this.#checkpointSourceState = options.checkpointSourceStateProvider;
     this.#checkpointSourceStateScopes = options.checkpointSourceStateScopeResolver;
-    this.#sessionEndWorkflows = new SessionEndWorkflowService({ connection: options.connection });
+    this.#sessionEndWorkflows = new SessionEndWorkflowService({
+      connection: options.connection,
+      ...(options.faultInjector === undefined ? {} : { faultInjector: options.faultInjector }),
+    });
+    this.#materializationQueue = options.materializationQueue;
     this.#sessionEndPolicy = options.sessionEndPolicy ?? {
       resolve: (_context, request) => {
         const requestedProfiles = request.validationProfileIds.length === 0
@@ -2944,6 +3010,1135 @@ export class LifecycleCommandProcessor {
             observedNowMs: now.milliseconds,
             leaseDurationMs: OWNER_LEASE_DURATION_MS,
           });
+        },
+      };
+    });
+    const authority = this.#authority.get(
+      this.#connection,
+      context.binding.projectId,
+      execution.authorizationRecord.targetSessionId,
+    );
+    if (authority === null || authority.ownerGeneration === null) invalid("INTEGRITY_FAILURE");
+    return Object.freeze({
+      kind: "success",
+      publicResult: execution.publicResult,
+      authorityMaterial: workerMaterial(
+        this.#capabilities,
+        context,
+        authority,
+        authority.ownerGeneration.toString(),
+        execution.authorizationRecord.target,
+      ),
+    });
+  }
+
+  amendSessionEnd(
+    context: ProjectContext,
+    input: PreparedLifecycleWorkerCommand<AmendSessionEndCommandV2 | AmendSessionEndCommandV3>,
+  ): WorkerLifecycleResult<SessionEndStatusV2> {
+    const decoded = decodeLifecycleSemanticCommandDraft(input.command);
+    if (decoded.commandType !== "amend-session-end") invalid();
+    const command = decoded;
+    assertSemanticCommandAuthorization(command, input.authorization);
+    validateContext(context, command);
+    if (
+      input.authorization.kind !== "protected"
+      || input.authorization.proof === null
+      || input.authorization.approval !== null
+      || input.authorization.childBindingGrant !== null
+      || input.authorization.authoritySessionId !== command.sessionId
+      || input.authorization.targetSessionId !== command.sessionId
+    ) throw new LifecycleError("SESSION_CAPABILITY_INVALID");
+    if (!LOWER_HASH.test(input.candidateIntentHash)) {
+      throw new LifecycleError("IDEMPOTENCY_CONFLICT");
+    }
+    const proof = input.authorization.proof;
+    const proofBytes = Buffer.from(proof.proofFingerprint, "hex");
+    let proofDigest: string;
+    try {
+      if (proofBytes.length !== 32) throw new LifecycleError("SESSION_CAPABILITY_INVALID");
+      proofDigest = capabilityProofDigest(proofBytes);
+    } finally {
+      proofBytes.fill(0);
+    }
+    const principal = Object.freeze({
+      actorRole: "primary" as const,
+      clientInstanceId: context.binding.clientInstanceId,
+    });
+    const replayExpectation: Extract<LifecycleReplayExpectation, { kind: "protected" }> = Object.freeze({
+      kind: "protected",
+      proof: Object.freeze({
+        version: 1,
+        nonce: proof.proofNonce,
+        digest: proofDigest,
+      }),
+      approval: null,
+      authorizationSessionId: command.sessionId,
+      targetSessionId: command.sessionId,
+      presenting: principal,
+      target: principal,
+    });
+    const execution = this.#store.execute<SessionEndStatusV2>({
+      context,
+      commandId: command.commandId,
+      idempotencyKey: command.idempotencyKey,
+      commandType: command.commandType,
+      candidateIntentHash: input.candidateIntentHash,
+      authoritativeIntentHash: input.candidateIntentHash,
+      semanticCommand: command,
+      capabilityKind: "root-session-handle",
+      capabilityGeneration: null,
+      capabilityGenerationResolution: "fresh-commit",
+      replayExpectation,
+    }, (transaction) => {
+      this.#integrity.assertQuickHealthy(context);
+      const authority = rootOperations(transaction);
+      const leases = leaseOperations(transaction);
+      const now = exactNow(this.#clock);
+      const observed = authority.get(context.binding.projectId, command.sessionId);
+      if (observed === null) throw new LifecycleError("SESSION_NOT_FOUND");
+      const current = Object.freeze({ ...observed }) as SessionAuthorityRecord;
+      if (
+        current.sessionKind !== "root"
+        || current.parentSessionId !== null
+        || current.ownerGeneration === null
+        || current.terminalEventPosition !== null
+        || current.semanticState !== "ending"
+        || current.rootHandleClientInstanceId !== context.binding.clientInstanceId
+      ) throw new LifecycleError("SESSION_STATE_CONFLICT");
+      const aggregate = authority.requireFoldMatch(current);
+      if (
+        aggregate.kind !== "root"
+        || aggregate.state !== "ending"
+        || aggregate.terminalEventPosition !== null
+        || BigInt(command.expectedStreamVersion) !== aggregate.streamVersion
+      ) throw new LifecycleError("SESSION_STATE_CONFLICT");
+      const currentLease = leases.current(context.binding.projectId, current.sessionId);
+      if (
+        currentLease === null
+        || currentLease.ownerGeneration !== current.ownerGeneration
+        || currentLease.ownerClientInstanceId !== context.binding.clientInstanceId
+      ) throw new LifecycleError("SESSION_HANDLE_STALE");
+      const generation = current.ownerGeneration.toString();
+      const assertions = {
+        authorizationKind: "protected" as const,
+        authorizationSessionId: command.sessionId,
+        targetSessionId: command.sessionId,
+        projectId: context.binding.projectId,
+        vaultId: context.binding.vaultId,
+        storeId: context.binding.storeId,
+        workspaceId: context.binding.workspaceId,
+        clientNamespace: context.binding.clientNamespace,
+        capabilityKind: "root-session-handle" as const,
+        capabilityGeneration: generation,
+        presentingActorRole: "primary" as const,
+        presentingClientInstanceId: context.binding.clientInstanceId,
+        targetActorRole: "primary" as const,
+        targetClientInstanceId: context.binding.clientInstanceId,
+        internalWorkflowId: null,
+        internalWorkflowGeneration: null,
+        internalPlannedWorkId: null,
+      };
+      const authoritative = buildLifecycleIntentWitness(command, assertions);
+      if (authoritative.intentHash !== input.candidateIntentHash) {
+        throw new LifecycleError("IDEMPOTENCY_CONFLICT");
+      }
+      const handleMaterial = materialFromAuthority(context, current).find(
+        (material) => material.claims.kind === "root-session-handle",
+      );
+      if (handleMaterial === undefined) invalid("INTEGRITY_FAILURE");
+      const proofTarget: SemanticCommandProofTargetV1 = {
+        proofVersion: 1,
+        target: "semantic-command",
+        projectId: context.binding.projectId,
+        vaultId: context.binding.vaultId,
+        storeId: context.binding.storeId,
+        workspaceId: context.binding.workspaceId,
+        clientNamespace: context.binding.clientNamespace,
+        authoritySessionId: command.sessionId,
+        targetSessionId: command.sessionId,
+        presentingActorRole: "primary",
+        presentingClientInstanceId: context.binding.clientInstanceId,
+        targetActorRole: "primary",
+        targetClientInstanceId: context.binding.clientInstanceId,
+        capabilityKind: "root-session-handle",
+        capabilityGeneration: generation,
+        commandId: command.commandId,
+        idempotencyKey: command.idempotencyKey,
+        intentHash: authoritative.intentHash,
+        proofNonce: proof.proofNonce,
+      };
+      const verifiedProof = this.#capabilities.verifyProof(handleMaterial, proofTarget, proof);
+      if (verifiedProof.digest !== proofDigest) invalid("INTEGRITY_FAILURE");
+
+      const workflowId = sessionEndWorkflowId(current.sessionId as SessionId);
+      if (command.workflowId !== workflowId) throw new LifecycleError("SESSION_STATE_CONFLICT");
+      const existing = this.#sessionEndWorkflows.read(context.binding.projectId, workflowId);
+      if (
+        existing === null
+        || existing.sessionId !== current.sessionId
+        || existing.phase === "cancelled"
+        || existing.phase === "abandoned"
+        || existing.phase === "completed"
+        || aggregate.endWorkflowId !== workflowId
+        || aggregate.endWorkflowGeneration !== existing.generation
+      ) throw new LifecycleError("SESSION_END_INCOMPLETE");
+      const hydrated = this.#sessionEndWorkflows.hydrateEffectiveStateV1({
+        projectId: current.projectId,
+        workflowId,
+        workflowGeneration: existing.generation,
+        sessionId: current.sessionId,
+        eventPosition: existing.triggeringEventPosition,
+      });
+      const relevantChildren = riskyTransitionChildren(authority, current);
+      const checkpoint = requireRiskyTransitionCheckpointV1({
+        authority: current,
+        aggregate,
+        checkpoint: authority.latestCheckpoint(current),
+        allowTrailingRootEvents: true,
+        relevantChildren,
+      });
+      const currentSourceState = this.#resumeSourceState.captureCurrent(context);
+      if (canonicalJson(currentSourceState) !== canonicalJson(checkpoint.sourceState)) {
+        throw new LifecycleError("SESSION_SOURCE_STATE_CONFLICT");
+      }
+      const amendment = command.amendment;
+      const evidenceWindowAction = amendment.amendmentVersion === 1
+        ? "unchanged" as const
+        : amendment.evidenceWindowAction;
+      if (evidenceWindowAction === "open" && existing.evidenceWindowState !== "sealed") {
+        throw new LifecycleError("SESSION_END_EVIDENCE_WINDOW_OPEN");
+      }
+      if (evidenceWindowAction === "seal" && existing.evidenceWindowState !== "open") {
+        throw new LifecycleError("SESSION_END_EVIDENCE_FROZEN");
+      }
+      const provisional = foldSessionEndAmendmentV1({
+        previous: hydrated.effectiveState,
+        amendment,
+        effectivePolicy: hydrated.effectiveState.effectivePolicy,
+      });
+      const policyInput = this.#sessionEndPolicy.resolve(context, provisional.request);
+      const effectivePolicy = persistedQualityPolicy(
+        deriveEffectiveQualityPolicyV1(policyInput),
+      );
+      const effectiveState = foldSessionEndAmendmentV1({
+        previous: hydrated.effectiveState,
+        amendment,
+        effectivePolicy,
+      });
+      const requestChanged = canonicalJson(hydrated.effectiveState.request)
+        !== canonicalJson(effectiveState.request);
+      const policyChanged = canonicalJson(hydrated.effectiveState.effectivePolicy)
+        !== canonicalJson(effectiveState.effectivePolicy);
+      if (
+        evidenceWindowAction === "unchanged"
+        && (requestChanged || policyChanged)
+        && existing.phase !== "requested"
+        && existing.phase !== "children-resolved"
+      ) throw new LifecycleError("SESSION_END_INCOMPLETE");
+      if (evidenceWindowAction === "seal") {
+        if (effectiveState.request.requestVersion !== 2 || checkpoint.checkpointVersion !== 2) {
+          throw new LifecycleError("CHECKPOINT_EVIDENCE_VERSION_REQUIRED");
+        }
+        const evidenceCoverage = transaction.coverage.snapshotV2(
+          current.sessionId as SessionId,
+          aggregate.eventPosition,
+        );
+        if (canonicalJson(evidenceCoverage) !== canonicalJson(checkpoint.evidenceCoverage)) {
+          throw new LifecycleError("SESSION_END_COVERAGE_CHANGED");
+        }
+      }
+      if (
+        effectiveState.request.childEndPolicy === "require-completed"
+        && relevantChildren.some(({ aggregate: childAggregate }) => (
+          childAggregate.kind === "child"
+          && (childAggregate.state === "active"
+            || childAggregate.state === "completion-proposed"
+            || childAggregate.state === "suspended")
+        ))
+      ) throw new LifecycleError("SESSION_CHILDREN_ACTIVE");
+      assertRootChildHistoryCapacity(
+        this.#connection,
+        current,
+        effectiveState.request.childEndPolicy,
+      );
+      const endingScopeBindings = requestEndingScopeBindings(
+        transaction,
+        current,
+        relevantChildren,
+      );
+      if (amendment.amendmentVersion === 1) {
+        const wholeScope = [
+          current.sessionId as SessionId,
+          ...endingScopeBindings.map((binding) => binding.childSessionId as SessionId),
+        ];
+        transaction.coverage.assertVersion1Eligible(Object.freeze(wholeScope));
+      }
+      const evidenceCoverage = transaction.coverage.snapshotV2(
+        current.sessionId as SessionId,
+        aggregate.eventPosition,
+      );
+      const minimumCheckpointBytes = transaction.coverage.minimumCheckpointUpperBound({
+        evidenceCoverage,
+        endingScopeBindings,
+      });
+      const minimumEndingScopeBytes = transaction.coverage.minimumFinalEndingScopeBindingsUpperBound({
+        endingScopeBindings,
+      });
+      if (
+        !Number.isSafeInteger(minimumCheckpointBytes)
+        || minimumCheckpointBytes < 0
+        || !Number.isSafeInteger(minimumEndingScopeBytes)
+        || minimumEndingScopeBytes < 0
+      ) invalid("INTEGRITY_FAILURE");
+      if (
+        minimumCheckpointBytes > CHECKPOINT_MAX_CANONICAL_BYTES
+        || minimumEndingScopeBytes > FINAL_ENDING_SCOPE_BINDINGS_MAX_CANONICAL_BYTES
+      ) throw new LifecycleError("CHECKPOINT_CAPACITY_EXCEEDED");
+      const nextGeneration = existing.generation + 1;
+      if (nextGeneration > Number.MAX_SAFE_INTEGER) invalid("INTEGRITY_FAILURE");
+      const nextPhase = evidenceWindowAction === "open"
+        ? (relevantChildren.length > 0 ? "requested" : "children-resolved")
+        : evidenceWindowAction === "seal"
+          ? existing.phase
+          : existing.phase;
+      const clearFrozenGroup = evidenceWindowAction !== "unchanged";
+      const priorRootState = this.#sessionEndWorkflows.priorRootState(existing);
+      const status = sessionEndGenerationStatusV2({
+        current: existing,
+        priorRootState,
+        workflowGeneration: nextGeneration,
+        triggeringEventPosition: authority.nextGlobalPosition(),
+        phase: nextPhase,
+        evidenceWindowState: evidenceWindowAction === "open"
+          ? "open"
+          : evidenceWindowAction === "seal"
+            ? "sealed"
+            : existing.evidenceWindowState!,
+        materializationRequired: effectivePolicy.requireMaterialization,
+        clearFrozenGroup,
+      });
+      const eventPosition = BigInt(status.triggeringEventPosition);
+      if (eventPosition <= aggregate.eventPosition || eventPosition > SQLITE_INT64_MAX) {
+        invalid("INTEGRITY_FAILURE");
+      }
+      const amendmentPayload = {
+        workflowId,
+        previousWorkflowGeneration: existing.generation,
+        workflowGeneration: nextGeneration,
+        preTransitionCheckpointId: checkpoint.checkpointId,
+        evidenceWindowAction,
+        effectiveState,
+      } as unknown as JsonValue;
+      const materializationQueue = this.#materializationQueue;
+      let preparedMaterialization: PreparedMaterializationQueueV1 | undefined;
+      if (materializationQueue !== undefined) {
+        preparedMaterialization = materializationQueue.prepare({
+          context,
+          sessionId: current.sessionId as SessionId,
+          artifactKind: "compatibility-session-log",
+          triggeringEventIndex: 0,
+          expectedTriggerPosition: eventPosition,
+          triggeringEventSchemaVersion: 3,
+          triggeringOccurredAt: now.timestamp,
+          triggeringEventPayload: amendmentPayload,
+          origin: {
+            kind: "workflow",
+            workflowId,
+            workflowGeneration: nextGeneration,
+          },
+          triggeringEventType: "SessionEndAmended",
+        });
+      }
+      const authorizationRecord: PersistedLifecycleAuthorizationRecord = Object.freeze({
+        ...replayExpectation,
+        proof: Object.freeze(verifiedProof),
+      });
+      return {
+        append: {
+          context,
+          commandId: command.commandId,
+          idempotencyKey: command.idempotencyKey,
+          commandType: command.commandType,
+          correlationId: aggregate.correlationId,
+          agentId: command.agentId,
+          expectedStreamVersion: aggregate.streamVersion,
+          streamId: current.streamId,
+          streamType: "session",
+          events: [{
+            eventType: "SessionEndAmended",
+            eventSchemaVersion: 3,
+            occurredAt: now.timestamp,
+            visibilityScope: "session",
+            sessionId: current.sessionId,
+            confidence: "high",
+            verificationStatus: "verified",
+            payload: amendmentPayload,
+            sourceRefs: [],
+            evidenceRefs: [],
+            evidenceDigests: [],
+          }],
+          outbox: preparedMaterialization === undefined
+            ? []
+            : [preparedMaterialization.pendingOutbox],
+          publicResponse: status,
+        },
+        authorizationRecord,
+        freshCapabilityGeneration: generation,
+        beforeAppend: (planned) => {
+          if (planned.events.length !== 1 || planned.events[0]?.globalPosition !== eventPosition) {
+            invalid("INTEGRITY_FAILURE");
+          }
+          if (preparedMaterialization !== undefined) {
+            const plannedTrigger = planned.events[0];
+            if (plannedTrigger === undefined) invalid("INTEGRITY_FAILURE");
+            materializationQueue?.assertPlanned(preparedMaterialization, plannedTrigger);
+          }
+        },
+        afterAppend: (committed) => {
+          if (committed.events.length !== 1 || committed.events[0]?.globalPosition !== eventPosition) {
+            invalid("INTEGRITY_FAILURE");
+          }
+          this.#sessionEndWorkflows.amendGeneration({
+            projectId: current.projectId,
+            workflowId,
+            previousWorkflowGeneration: existing.generation,
+            workflowGeneration: nextGeneration,
+            rootCommandId: command.commandId,
+            sessionId: current.sessionId,
+            triggeringEventPosition: eventPosition,
+            expectedAuthorityCommitment: current.authorityCommitment,
+            phase: nextPhase,
+            resultJson: canonicalJson(status),
+            evidenceWindowState: status.evidenceWindow.evidenceWindowState,
+            clearFrozenGroup,
+            now: now.timestamp,
+          });
+          if (preparedMaterialization !== undefined) {
+            const committedTrigger = committed.events[0];
+            if (committedTrigger === undefined) invalid("INTEGRITY_FAILURE");
+            materializationQueue?.assertCommitted(preparedMaterialization, committedTrigger);
+          }
+        },
+      };
+    });
+    const authority = this.#authority.get(
+      this.#connection,
+      context.binding.projectId,
+      execution.authorizationRecord.targetSessionId,
+    );
+    if (authority === null || authority.ownerGeneration === null) invalid("INTEGRITY_FAILURE");
+    return Object.freeze({
+      kind: "success",
+      publicResult: execution.publicResult,
+      authorityMaterial: workerMaterial(
+        this.#capabilities,
+        context,
+        authority,
+        authority.ownerGeneration.toString(),
+        execution.authorizationRecord.target,
+      ),
+    });
+  }
+
+  cancelSessionEnd(
+    context: ProjectContext,
+    input: PreparedLifecycleWorkerCommand<CancelSessionEndCommandV2>,
+  ): WorkerLifecycleResult<SessionEndStatusV2> {
+    const decoded = decodeLifecycleSemanticCommandDraft(input.command);
+    if (decoded.commandType !== "cancel-session-end") invalid();
+    const command = decoded;
+    assertSemanticCommandAuthorization(command, input.authorization);
+    validateContext(context, command);
+    if (
+      input.authorization.kind !== "protected"
+      || input.authorization.proof === null
+      || input.authorization.approval !== null
+      || input.authorization.childBindingGrant !== null
+      || input.authorization.authoritySessionId !== command.sessionId
+      || input.authorization.targetSessionId !== command.sessionId
+    ) throw new LifecycleError("SESSION_CAPABILITY_INVALID");
+    if (!LOWER_HASH.test(input.candidateIntentHash)) {
+      throw new LifecycleError("IDEMPOTENCY_CONFLICT");
+    }
+    const proof = input.authorization.proof;
+    const proofBytes = Buffer.from(proof.proofFingerprint, "hex");
+    let proofDigest: string;
+    try {
+      if (proofBytes.length !== 32) throw new LifecycleError("SESSION_CAPABILITY_INVALID");
+      proofDigest = capabilityProofDigest(proofBytes);
+    } finally {
+      proofBytes.fill(0);
+    }
+    const principal = Object.freeze({
+      actorRole: "primary" as const,
+      clientInstanceId: context.binding.clientInstanceId,
+    });
+    const replayExpectation: Extract<LifecycleReplayExpectation, { kind: "protected" }> = Object.freeze({
+      kind: "protected",
+      proof: Object.freeze({
+        version: 1,
+        nonce: proof.proofNonce,
+        digest: proofDigest,
+      }),
+      approval: null,
+      authorizationSessionId: command.sessionId,
+      targetSessionId: command.sessionId,
+      presenting: principal,
+      target: principal,
+    });
+    const execution = this.#store.execute<SessionEndStatusV2>({
+      context,
+      commandId: command.commandId,
+      idempotencyKey: command.idempotencyKey,
+      commandType: command.commandType,
+      candidateIntentHash: input.candidateIntentHash,
+      authoritativeIntentHash: input.candidateIntentHash,
+      semanticCommand: command,
+      capabilityKind: "root-session-handle",
+      capabilityGeneration: null,
+      capabilityGenerationResolution: "fresh-commit",
+      replayExpectation,
+    }, (transaction) => {
+      this.#integrity.assertQuickHealthy(context);
+      const authority = rootOperations(transaction);
+      const leases = leaseOperations(transaction);
+      const now = exactNow(this.#clock);
+      const observed = authority.get(context.binding.projectId, command.sessionId);
+      if (observed === null) throw new LifecycleError("SESSION_NOT_FOUND");
+      const current = Object.freeze({ ...observed }) as SessionAuthorityRecord;
+      if (
+        current.sessionKind !== "root"
+        || current.parentSessionId !== null
+        || current.ownerGeneration === null
+        || current.terminalEventPosition !== null
+        || current.semanticState !== "ending"
+        || current.rootHandleClientInstanceId !== context.binding.clientInstanceId
+      ) throw new LifecycleError("SESSION_STATE_CONFLICT");
+      const aggregate = authority.requireFoldMatch(current);
+      if (
+        aggregate.kind !== "root"
+        || aggregate.state !== "ending"
+        || aggregate.terminalEventPosition !== null
+        || BigInt(command.expectedStreamVersion) !== aggregate.streamVersion
+      ) throw new LifecycleError("SESSION_STATE_CONFLICT");
+      const currentLease = leases.current(context.binding.projectId, current.sessionId);
+      if (
+        currentLease === null
+        || currentLease.ownerGeneration !== current.ownerGeneration
+        || currentLease.ownerClientInstanceId !== context.binding.clientInstanceId
+      ) throw new LifecycleError("SESSION_HANDLE_STALE");
+      const generation = current.ownerGeneration.toString();
+      const assertions = {
+        authorizationKind: "protected" as const,
+        authorizationSessionId: command.sessionId,
+        targetSessionId: command.sessionId,
+        projectId: context.binding.projectId,
+        vaultId: context.binding.vaultId,
+        storeId: context.binding.storeId,
+        workspaceId: context.binding.workspaceId,
+        clientNamespace: context.binding.clientNamespace,
+        capabilityKind: "root-session-handle" as const,
+        capabilityGeneration: generation,
+        presentingActorRole: "primary" as const,
+        presentingClientInstanceId: context.binding.clientInstanceId,
+        targetActorRole: "primary" as const,
+        targetClientInstanceId: context.binding.clientInstanceId,
+        internalWorkflowId: null,
+        internalWorkflowGeneration: null,
+        internalPlannedWorkId: null,
+      };
+      const authoritative = buildLifecycleIntentWitness(command, assertions);
+      if (authoritative.intentHash !== input.candidateIntentHash) {
+        throw new LifecycleError("IDEMPOTENCY_CONFLICT");
+      }
+      const handleMaterial = materialFromAuthority(context, current).find(
+        (material) => material.claims.kind === "root-session-handle",
+      );
+      if (handleMaterial === undefined) invalid("INTEGRITY_FAILURE");
+      const proofTarget: SemanticCommandProofTargetV1 = {
+        proofVersion: 1,
+        target: "semantic-command",
+        projectId: context.binding.projectId,
+        vaultId: context.binding.vaultId,
+        storeId: context.binding.storeId,
+        workspaceId: context.binding.workspaceId,
+        clientNamespace: context.binding.clientNamespace,
+        authoritySessionId: command.sessionId,
+        targetSessionId: command.sessionId,
+        presentingActorRole: "primary",
+        presentingClientInstanceId: context.binding.clientInstanceId,
+        targetActorRole: "primary",
+        targetClientInstanceId: context.binding.clientInstanceId,
+        capabilityKind: "root-session-handle",
+        capabilityGeneration: generation,
+        commandId: command.commandId,
+        idempotencyKey: command.idempotencyKey,
+        intentHash: authoritative.intentHash,
+        proofNonce: proof.proofNonce,
+      };
+      const verifiedProof = this.#capabilities.verifyProof(handleMaterial, proofTarget, proof);
+      if (verifiedProof.digest !== proofDigest) invalid("INTEGRITY_FAILURE");
+      const workflowId = sessionEndWorkflowId(current.sessionId as SessionId);
+      if (command.workflowId !== workflowId) throw new LifecycleError("SESSION_STATE_CONFLICT");
+      const existing = this.#sessionEndWorkflows.read(context.binding.projectId, workflowId);
+      if (
+        existing === null
+        || existing.sessionId !== current.sessionId
+        || existing.phase === "cancelled"
+        || existing.phase === "abandoned"
+        || existing.phase === "completed"
+        || aggregate.endWorkflowId !== workflowId
+        || aggregate.endWorkflowGeneration !== existing.generation
+      ) throw new LifecycleError("SESSION_END_INCOMPLETE");
+      const relevantChildren = riskyTransitionChildren(authority, current);
+      const checkpoint = requireRiskyTransitionCheckpointV1({
+        authority: current,
+        aggregate,
+        checkpoint: authority.latestCheckpoint(current),
+        explicitCheckpointId: command.preTransitionCheckpointId,
+        allowTrailingRootEvents: true,
+        relevantChildren,
+      });
+      const currentSourceState = this.#resumeSourceState.captureCurrent(context);
+      if (canonicalJson(currentSourceState) !== canonicalJson(checkpoint.sourceState)) {
+        throw new LifecycleError("SESSION_SOURCE_STATE_CONFLICT");
+      }
+      const priorRootState = this.#sessionEndWorkflows.priorRootState(existing);
+      const eventPosition = authority.nextGlobalPosition();
+      if (eventPosition <= aggregate.eventPosition || eventPosition > SQLITE_INT64_MAX) {
+        invalid("INTEGRITY_FAILURE");
+      }
+      const status = sessionEndGenerationStatusV2({
+        current: existing,
+        priorRootState,
+        workflowGeneration: existing.generation + 1,
+        triggeringEventPosition: eventPosition,
+        phase: "cancelled",
+        evidenceWindowState: "sealed",
+        materializationRequired: existing.resultJson === null
+          ? false
+          : (() => {
+              const parsed = JSON.parse(existing.resultJson) as Record<string, unknown>;
+              const status = typeof parsed.status === "object" && parsed.status !== null
+                ? parsed.status as Record<string, unknown>
+                : parsed;
+              return status.materializationRequired === true;
+            })(),
+        clearFrozenGroup: true,
+      });
+      const nextAuthority = Object.freeze({
+        ...current,
+        semanticState: priorRootState,
+        updatedAt: now.timestamp,
+      });
+      const cancellationPayload = {
+        cancellationVersion: 1,
+        workflowId,
+        previousWorkflowGeneration: existing.generation,
+        workflowGeneration: existing.generation + 1,
+        restoredState: priorRootState,
+        preTransitionCheckpointId: command.preTransitionCheckpointId,
+      } as unknown as JsonValue;
+      const materializationQueue = this.#materializationQueue;
+      let preparedMaterialization: PreparedMaterializationQueueV1 | undefined;
+      if (materializationQueue !== undefined) {
+        preparedMaterialization = materializationQueue.prepare({
+          context,
+          sessionId: current.sessionId as SessionId,
+          artifactKind: "compatibility-session-log",
+          triggeringEventIndex: 0,
+          expectedTriggerPosition: eventPosition,
+          triggeringEventSchemaVersion: 3,
+          triggeringOccurredAt: now.timestamp,
+          triggeringEventPayload: cancellationPayload,
+          origin: {
+            kind: "workflow",
+            workflowId,
+            workflowGeneration: existing.generation + 1,
+          },
+          triggeringEventType: "SessionEndCancelled",
+        });
+      }
+      const authorizationRecord: PersistedLifecycleAuthorizationRecord = Object.freeze({
+        ...replayExpectation,
+        proof: Object.freeze(verifiedProof),
+      });
+      return {
+        append: {
+          context,
+          commandId: command.commandId,
+          idempotencyKey: command.idempotencyKey,
+          commandType: command.commandType,
+          correlationId: aggregate.correlationId,
+          agentId: command.agentId,
+          expectedStreamVersion: aggregate.streamVersion,
+          streamId: current.streamId,
+          streamType: "session",
+          events: [{
+            eventType: "SessionEndCancelled",
+            eventSchemaVersion: 3,
+            occurredAt: now.timestamp,
+            visibilityScope: "session",
+            sessionId: current.sessionId,
+            confidence: "high",
+            verificationStatus: "verified",
+            payload: cancellationPayload,
+            sourceRefs: [],
+            evidenceRefs: [],
+            evidenceDigests: [],
+          }],
+          outbox: preparedMaterialization === undefined
+            ? []
+            : [preparedMaterialization.pendingOutbox],
+          publicResponse: status,
+        },
+        authorizationRecord,
+        freshCapabilityGeneration: generation,
+        beforeAppend: (planned) => {
+          if (planned.events.length !== 1 || planned.events[0]?.globalPosition !== eventPosition) {
+            invalid("INTEGRITY_FAILURE");
+          }
+          if (preparedMaterialization !== undefined) {
+            const plannedTrigger = planned.events[0];
+            if (plannedTrigger === undefined) invalid("INTEGRITY_FAILURE");
+            materializationQueue?.assertPlanned(preparedMaterialization, plannedTrigger);
+          }
+        },
+        afterAppend: (committed, currentTransaction) => {
+          if (committed.events.length !== 1 || committed.events[0]?.globalPosition !== eventPosition) {
+            invalid("INTEGRITY_FAILURE");
+          }
+          const currentAuthority = rootOperations(currentTransaction);
+          const currentLeases = leaseOperations(currentTransaction);
+          if (!currentAuthority.compareAndSwap({
+            projectId: current.projectId,
+            sessionId: current.sessionId,
+            expectedState: "ending",
+            expectedOwnerGeneration: current.ownerGeneration!,
+            expectedChildCapabilityGeneration: null,
+            expectedAuthorityCommitment: current.authorityCommitment,
+            next: authorityMutation(nextAuthority),
+          })) throw new LifecycleError("SESSION_HANDLE_STALE");
+          this.#sessionEndWorkflows.cancelGeneration({
+            projectId: current.projectId,
+            workflowId,
+            previousWorkflowGeneration: existing.generation,
+            workflowGeneration: existing.generation + 1,
+            rootCommandId: command.commandId,
+            sessionId: current.sessionId,
+            triggeringEventPosition: eventPosition,
+            expectedAuthorityCommitment: current.authorityCommitment,
+            restoredState: priorRootState,
+            resultJson: canonicalJson(status),
+            now: now.timestamp,
+          });
+          currentLeases.renewCurrent({
+            projectId: current.projectId,
+            sessionId: current.sessionId,
+            ownerGeneration: current.ownerGeneration!,
+            ownerClientInstanceId: context.binding.clientInstanceId,
+            observedNowMs: now.milliseconds,
+            leaseDurationMs: OWNER_LEASE_DURATION_MS,
+          });
+          if (preparedMaterialization !== undefined) {
+            const committedTrigger = committed.events[0];
+            if (committedTrigger === undefined) invalid("INTEGRITY_FAILURE");
+            materializationQueue?.assertCommitted(preparedMaterialization, committedTrigger);
+          }
+        },
+      };
+    });
+    const authority = this.#authority.get(
+      this.#connection,
+      context.binding.projectId,
+      execution.authorizationRecord.targetSessionId,
+    );
+    if (authority === null || authority.ownerGeneration === null) invalid("INTEGRITY_FAILURE");
+    return Object.freeze({
+      kind: "success",
+      publicResult: execution.publicResult,
+      authorityMaterial: workerMaterial(
+        this.#capabilities,
+        context,
+        authority,
+        authority.ownerGeneration.toString(),
+        execution.authorizationRecord.target,
+      ),
+    });
+  }
+
+  abandonSession(
+    context: ProjectContext,
+    input: PreparedLifecycleWorkerCommand<AbandonSessionCommandV2>,
+  ): WorkerLifecycleResult<SessionEndStatusV2> {
+    const decoded = decodeLifecycleSemanticCommandDraft(input.command);
+    if (decoded.commandType !== "abandon-session") invalid();
+    const command = decoded;
+    assertSemanticCommandAuthorization(command, input.authorization);
+    validateContext(context, command);
+    if (
+      input.authorization.kind !== "protected"
+      || input.authorization.proof === null
+      || input.authorization.approval === null
+      || input.authorization.childBindingGrant !== null
+      || input.authorization.authoritySessionId !== command.sessionId
+      || input.authorization.targetSessionId !== command.sessionId
+    ) throw new LifecycleError("SESSION_CAPABILITY_INVALID");
+    if (!LOWER_HASH.test(input.candidateIntentHash)) {
+      throw new LifecycleError("IDEMPOTENCY_CONFLICT");
+    }
+    const proof = input.authorization.proof;
+    const approval = input.authorization.approval;
+    const proofBytes = Buffer.from(proof.proofFingerprint, "hex");
+    let proofDigest: string;
+    try {
+      if (proofBytes.length !== 32) throw new LifecycleError("SESSION_CAPABILITY_INVALID");
+      proofDigest = capabilityProofDigest(proofBytes);
+    } finally {
+      proofBytes.fill(0);
+    }
+    const replayExpectation = abandonmentReplayExpectation(
+      context,
+      command,
+      approval,
+      { nonce: proof.proofNonce, digest: proofDigest },
+      input.candidateIntentHash,
+    );
+    const execution = this.#store.execute<SessionEndStatusV2>({
+      context,
+      commandId: command.commandId,
+      idempotencyKey: command.idempotencyKey,
+      commandType: command.commandType,
+      candidateIntentHash: input.candidateIntentHash,
+      authoritativeIntentHash: input.candidateIntentHash,
+      semanticCommand: command,
+      capabilityKind: "root-session-handle",
+      capabilityGeneration: null,
+      capabilityGenerationResolution: "fresh-commit",
+      replayExpectation,
+    }, (transaction) => {
+      const now = exactNow(this.#clock);
+      const issuedAtMs = BigInt(Date.parse(approval.issuedAt));
+      const expiresAtMs = BigInt(Date.parse(approval.expiresAt));
+      if (now.milliseconds < issuedAtMs) {
+        throw new LifecycleError("LIFECYCLE_APPROVAL_INVALID");
+      }
+      if (now.milliseconds >= expiresAtMs) {
+        throw new LifecycleError("LIFECYCLE_APPROVAL_EXPIRED");
+      }
+      this.#integrity.assertQuickHealthy(context);
+      const authority = rootOperations(transaction);
+      const leases = leaseOperations(transaction);
+      const observed = authority.get(context.binding.projectId, command.sessionId);
+      if (observed === null) throw new LifecycleError("SESSION_NOT_FOUND");
+      const current = Object.freeze({ ...observed }) as SessionAuthorityRecord;
+      if (
+        current.sessionKind !== "root"
+        || current.parentSessionId !== null
+        || current.ownerGeneration === null
+        || current.terminalEventPosition !== null
+        || (current.semanticState !== "active"
+          && current.semanticState !== "suspended"
+          && current.semanticState !== "ending")
+        || current.rootHandleClientInstanceId !== context.binding.clientInstanceId
+      ) throw new LifecycleError("SESSION_STATE_CONFLICT");
+      const aggregate = authority.requireFoldMatch(current);
+      if (
+        aggregate.kind !== "root"
+        || aggregate.state !== current.semanticState
+        || BigInt(command.expectedStreamVersion) !== aggregate.streamVersion
+      ) throw new LifecycleError("SESSION_STATE_CONFLICT");
+      if (approval.expectedOwnerGeneration !== current.ownerGeneration.toString()
+        || approval.targetClientInstanceId !== current.rootHandleClientInstanceId) {
+        throw new LifecycleError("SESSION_HANDLE_STALE");
+      }
+      const currentLease = leases.current(context.binding.projectId, current.sessionId);
+      if (
+        currentLease === null
+        || currentLease.ownerGeneration !== current.ownerGeneration
+        || currentLease.ownerClientInstanceId !== context.binding.clientInstanceId
+      ) throw new LifecycleError("SESSION_HANDLE_STALE");
+      const generation = current.ownerGeneration.toString();
+      const assertions = {
+        authorizationKind: "protected" as const,
+        authorizationSessionId: command.sessionId,
+        targetSessionId: command.sessionId,
+        projectId: context.binding.projectId,
+        vaultId: context.binding.vaultId,
+        storeId: context.binding.storeId,
+        workspaceId: context.binding.workspaceId,
+        clientNamespace: context.binding.clientNamespace,
+        capabilityKind: "root-session-handle" as const,
+        capabilityGeneration: generation,
+        presentingActorRole: "primary" as const,
+        presentingClientInstanceId: context.binding.clientInstanceId,
+        targetActorRole: "primary" as const,
+        targetClientInstanceId: context.binding.clientInstanceId,
+        internalWorkflowId: null,
+        internalWorkflowGeneration: null,
+        internalPlannedWorkId: null,
+      };
+      const authoritative = buildLifecycleIntentWitness(command, assertions);
+      if (authoritative.intentHash !== input.candidateIntentHash) {
+        throw new LifecycleError("IDEMPOTENCY_CONFLICT");
+      }
+      const handleMaterial = materialFromAuthority(context, current).find(
+        (material) => material.claims.kind === "root-session-handle",
+      );
+      if (handleMaterial === undefined) invalid("INTEGRITY_FAILURE");
+      const proofTarget: SemanticCommandProofTargetV1 = {
+        proofVersion: 1,
+        target: "semantic-command",
+        projectId: context.binding.projectId,
+        vaultId: context.binding.vaultId,
+        storeId: context.binding.storeId,
+        workspaceId: context.binding.workspaceId,
+        clientNamespace: context.binding.clientNamespace,
+        authoritySessionId: command.sessionId,
+        targetSessionId: command.sessionId,
+        presentingActorRole: "primary",
+        presentingClientInstanceId: context.binding.clientInstanceId,
+        targetActorRole: "primary",
+        targetClientInstanceId: context.binding.clientInstanceId,
+        capabilityKind: "root-session-handle",
+        capabilityGeneration: generation,
+        commandId: command.commandId,
+        idempotencyKey: command.idempotencyKey,
+        intentHash: authoritative.intentHash,
+        proofNonce: proof.proofNonce,
+      };
+      const verifiedProof = this.#capabilities.verifyProof(handleMaterial, proofTarget, proof);
+      if (verifiedProof.digest !== proofDigest) invalid("INTEGRITY_FAILURE");
+
+      const relevantChildren = riskyTransitionChildren(authority, current);
+      const checkpoint = requireRiskyTransitionCheckpointV1({
+        authority: current,
+        aggregate,
+        checkpoint: authority.latestCheckpoint(current),
+        explicitCheckpointId: command.preTransitionCheckpointId,
+        allowTrailingRootEvents: current.semanticState === "ending",
+        relevantChildren,
+      });
+      const currentSourceState = this.#resumeSourceState.captureCurrent(context);
+      if (canonicalJson(currentSourceState) !== canonicalJson(checkpoint.sourceState)) {
+        throw new LifecycleError("SESSION_SOURCE_STATE_CONFLICT");
+      }
+
+      const workflowId = sessionEndWorkflowId(current.sessionId as SessionId);
+      const existing = this.#sessionEndWorkflows.read(context.binding.projectId, workflowId);
+      const inEndingWorkflow = current.semanticState === "ending";
+      if (inEndingWorkflow) {
+        if (
+          existing === null
+          || existing.sessionId !== current.sessionId
+          || existing.phase === "cancelled"
+          || existing.phase === "abandoned"
+          || existing.phase === "completed"
+          || aggregate.endWorkflowId !== workflowId
+          || aggregate.endWorkflowGeneration !== existing.generation
+        ) throw new LifecycleError("SESSION_END_INCOMPLETE");
+      } else if (existing !== null
+        && existing.sessionId === current.sessionId
+        && existing.phase !== "cancelled"
+        && existing.phase !== "abandoned"
+        && existing.phase !== "completed") {
+        throw new LifecycleError("INTEGRITY_FAILURE");
+      }
+
+      const eventPosition = authority.nextGlobalPosition();
+      if (eventPosition <= aggregate.eventPosition || eventPosition > SQLITE_INT64_MAX) {
+        invalid("INTEGRITY_FAILURE");
+      }
+      const occurredAt = now.timestamp;
+      const provisional: SessionAuthorityRecord = Object.freeze({
+        ...current,
+        semanticState: "abandoned" as const,
+        authorityEventPosition: eventPosition,
+        terminalEventPosition: eventPosition,
+        terminalEventType: "SessionAbandoned" as const,
+        terminalAt: occurredAt,
+        updatedAt: occurredAt,
+      });
+      const nextCommitment = authorityCommitment(committedAuthority(provisional));
+      const nextAuthority = authorityMutation(Object.freeze({
+        ...provisional,
+        authorityCommitment: nextCommitment,
+      }));
+      const workflowGeneration = inEndingWorkflow && existing !== null
+        ? existing.generation
+        : null;
+      const payload = Object.freeze({
+        workflowId: inEndingWorkflow ? workflowId : null,
+        workflowGeneration,
+        approvalId: approval.approvalId,
+        preTransitionCheckpointId: command.preTransitionCheckpointId,
+        reasonCode: command.reasonCode,
+        authorityCommitment: nextCommitment,
+      }) as unknown as JsonValue;
+      const status: SessionEndStatusV2 = inEndingWorkflow && existing !== null
+        ? sessionEndGenerationStatusV2({
+            current: existing,
+            priorRootState: existing.state === "suspended" ? "suspended" : "active",
+            workflowGeneration: existing.generation,
+            triggeringEventPosition: eventPosition,
+            phase: "abandoned",
+            evidenceWindowState: "sealed",
+            materializationRequired: false,
+            clearFrozenGroup: true,
+          })
+        : Object.freeze({
+            resultVersion: 2,
+            sessionId: current.sessionId as SessionId,
+            workflowId,
+            workflowGeneration: 1,
+            priorRootState: current.semanticState === "suspended" ? "suspended" : "active",
+            phase: "abandoned" as const,
+            triggeringEventPosition: eventPosition.toString(),
+            finalCheckpointId: null,
+            finalCheckpointEventPosition: null,
+            evidenceWindow: Object.freeze({
+              evidenceWindowState: "sealed" as const,
+              evidenceFrozenCheckpointEventPosition: null,
+              evidenceFrozenGeneration: null,
+            }),
+            validationPlansReady: false,
+            qualityScore: null,
+            safeFailureCode: null,
+            materializationRequired: false,
+          });
+      const materializationQueue = this.#materializationQueue;
+      if (materializationQueue === undefined) {
+        throw new LifecycleError("LIFECYCLE_OPERATION_UNAVAILABLE");
+      }
+      const preparedMaterialization = inEndingWorkflow && existing !== null
+        ? materializationQueue.prepare({
+            context,
+            sessionId: current.sessionId as SessionId,
+            artifactKind: "compatibility-session-log",
+            triggeringEventIndex: 0,
+            expectedTriggerPosition: eventPosition,
+            triggeringEventSchemaVersion: 1,
+            triggeringOccurredAt: occurredAt,
+            triggeringEventPayload: payload,
+            origin: {
+              kind: "workflow" as const,
+              workflowId,
+              workflowGeneration: existing.generation,
+            },
+            triggeringEventType: "SessionAbandoned" as const,
+          })
+        : materializationQueue.prepare({
+            context,
+            sessionId: current.sessionId as SessionId,
+            artifactKind: "compatibility-session-log",
+            triggeringEventIndex: 0,
+            expectedTriggerPosition: eventPosition,
+            triggeringEventSchemaVersion: 1,
+            triggeringOccurredAt: occurredAt,
+            triggeringEventPayload: payload,
+            origin: {
+              kind: "terminal-event" as const,
+              workflowId: null,
+              workflowGeneration: null,
+            },
+            triggeringEventType: "SessionAbandoned" as const,
+          });
+      const authorizationRecord: PersistedLifecycleAuthorizationRecord = Object.freeze({
+        ...replayExpectation,
+        proof: Object.freeze(verifiedProof),
+      });
+      return {
+        append: {
+          context,
+          commandId: command.commandId,
+          idempotencyKey: command.idempotencyKey,
+          commandType: command.commandType,
+          correlationId: aggregate.correlationId,
+          agentId: command.agentId,
+          expectedStreamVersion: aggregate.streamVersion,
+          streamId: current.streamId,
+          streamType: "session",
+          events: [{
+            eventType: "SessionAbandoned",
+            eventSchemaVersion: 1,
+            occurredAt,
+            visibilityScope: "session",
+            sessionId: current.sessionId,
+            confidence: "high",
+            verificationStatus: "verified",
+            payload,
+            sourceRefs: [],
+            evidenceRefs: [],
+            evidenceDigests: [],
+          }],
+          outbox: [preparedMaterialization.pendingOutbox],
+          publicResponse: status,
+        },
+        authorizationRecord,
+        freshCapabilityGeneration: generation,
+        beforeAppend: (planned, currentTransaction) => {
+          const trigger = planned.events[0];
+          if (planned.events.length !== 1
+            || trigger === undefined
+            || trigger.globalPosition !== eventPosition) invalid("INTEGRITY_FAILURE");
+          materializationQueue.assertPlanned(preparedMaterialization, trigger);
+          const currentAuthority = rootOperations(currentTransaction);
+          const currentLeases = leaseOperations(currentTransaction);
+          currentLeases.releaseCurrent({
+            projectId: current.projectId,
+            sessionId: current.sessionId,
+            ownerGeneration: current.ownerGeneration!,
+            ownerClientInstanceId: currentLease.ownerClientInstanceId,
+            expectedLastObservedAtMs: currentLease.lastObservedAtMs,
+            expectedExpiresAtMs: currentLease.expiresAtMs,
+            observedNowMs: now.milliseconds,
+          });
+          if (!currentAuthority.compareAndSwap({
+            projectId: current.projectId,
+            sessionId: current.sessionId,
+            expectedState: current.semanticState as RootSessionState,
+            expectedOwnerGeneration: current.ownerGeneration!,
+            expectedChildCapabilityGeneration: null,
+            expectedAuthorityCommitment: current.authorityCommitment,
+            next: nextAuthority,
+          })) throw new LifecycleError("SESSION_HANDLE_STALE");
+        },
+        afterAppend: (committed, currentTransaction) => {
+          const abandonedEvent = committed.events[0];
+          if (committed.events.length !== 1
+            || abandonedEvent === undefined
+            || abandonedEvent.globalPosition !== eventPosition
+            || abandonedEvent.eventType !== "SessionAbandoned") {
+            invalid("INTEGRITY_FAILURE");
+          }
+          approvalOperations(currentTransaction).consume({
+            approvalId: approval.approvalId,
+            nonceDigest: approval.nonceDigest,
+            projectId: current.projectId,
+            sessionId: current.sessionId,
+            action: "abandon-root",
+            commandId: command.commandId,
+            targetActorRole: "primary",
+            targetClientInstanceId: approval.targetClientInstanceId,
+            redactedApprovalReference: approval.redactedApprovalReference,
+            consumedEventPosition: abandonedEvent.globalPosition,
+            consumedAtMs: now.milliseconds,
+          });
+          if (inEndingWorkflow && existing !== null) {
+            this.#sessionEndWorkflows.abandonGeneration({
+              projectId: current.projectId,
+              workflowId,
+              workflowGeneration: existing.generation,
+              rootCommandId: command.commandId,
+              sessionId: current.sessionId,
+              triggeringEventPosition: abandonedEvent.globalPosition,
+              expectedAuthorityCommitment: nextCommitment,
+              resultJson: canonicalJson(status),
+              now: occurredAt,
+            });
+          }
+          materializationQueue.assertCommitted(preparedMaterialization, abandonedEvent);
         },
       };
     });

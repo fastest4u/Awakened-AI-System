@@ -814,10 +814,16 @@ function evolveChild(
       });
     case "ChildWorkTransferCreated":
       if (
-        event.eventSchemaVersion !== 1
-        || state.suspensionCheckpointId === null
+        state.suspensionCheckpointId === null
         || state.latestCheckpointId === null
-        || event.payload.checkpointId !== state.suspensionCheckpointId
+        || (
+          event.eventSchemaVersion === 1
+            ? event.payload.checkpointId !== state.suspensionCheckpointId
+            : event.eventSchemaVersion === 2
+              ? event.payload.suspensionCheckpointId !== state.suspensionCheckpointId
+                || event.payload.checkpointId !== state.latestCheckpointId
+              : true
+        )
       ) integrity();
       return withChildEvent(state, event, streamVersion, eventPosition, {
         state: "transferred",

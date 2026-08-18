@@ -1508,6 +1508,46 @@ describe("lifecycle worker runtime", () => {
       (error) => error instanceof LifecycleError && error.code === "LIFECYCLE_V2_DISABLED",
     );
   });
+
+  it("routes carry-forward only to the dedicated child-target handler", async () => {
+    const calls: string[] = [];
+    const runtime = runtimeWithRouteRecorder(calls);
+    runtime.configureSessionEndRouting(
+      { execute: (_context: unknown, _plan: unknown) => {
+        calls.push("session-end-child");
+        return { action: "carry-forward-child" };
+      } } as never,
+      { execute: (_context: unknown, _plan: unknown) => {
+        calls.push("session-end-root");
+        return { action: "record-final-checkpoint-and-queue-ending" };
+      } } as never,
+    );
+    const command = {
+      commandType: "internal-workflow-phase",
+      plannedAction: { action: "carry-forward-child" },
+    };
+    const result = await runtime.execute({
+      kind: "internal-semantic",
+      operation: "internal-workflow-phase",
+      command,
+    } as unknown as LifecycleWorkerOperationWire, PROJECT_CONTEXT);
+    assert.equal((result.result as { action: string }).action, "carry-forward-child");
+    assert.deepEqual(calls, ["session-end-child"]);
+  });
+
+  it("disposes Task 14 resources before active store close", async () => {
+    const runtime = runtimeWithRouteRecorder([]);
+    runtime.dispose();
+    await assert.rejects(
+      runtime.execute({
+        kind: "query",
+        operation: "read-session-status",
+        input: { operation: "read-session-status", authorization: {} },
+      } as unknown as LifecycleWorkerOperationWire, PROJECT_CONTEXT),
+      (error) => error instanceof LifecycleError && error.code === "LIFECYCLE_V2_DISABLED",
+    );
+  });
+
   it("conflicts cross-version checkpoint identity reuse", async () => {
     const item = runtimeFixture();
     let root: StartedRoot | null = null;
@@ -1546,7 +1586,7 @@ describe("lifecycle worker runtime", () => {
     }
   });
 
-  it("constructs one connection-bound runtime with exact factory ownership", async () => {
+  it("constructs one connection-bound runtime with exact factory ownership for Task 14", async () => {
     const item = runtimeFixture();
     let root: StartedRoot | null = null;
     try {
@@ -1602,7 +1642,7 @@ describe("lifecycle worker runtime", () => {
       ), "utf8");
       assert.equal(factorySource.match(/\bnew CapabilityService\s*\(/g)?.length ?? 0, 1);
       assert.match(factorySource, /new CapabilityService\(\{\s*keyProvider: input\.keyProvider,\s*clock: options\.clock,\s*nonceSource: options\.identitySource,\s*\}\)/);
-      assert.match(factorySource, /new EventAppendTransaction\(\s*input\.connection,\s*new SqliteEventAppendStatements\(input\.connection\),\s*input\.maintenanceFence,\s*new BranchScopeRepository\(\{\s*randomId: \(\) => options\.identitySource\.uuid\(\) as BranchScopeId,\s*\}\),\s*\(\) => options\.identitySource\.uuid\(\),\s*NO_EVENT_STORE_FAULTS,\s*\)/);
+      assert.match(factorySource, /const lifecycleOutboxWriter = Object\.freeze\(\{[\s\S]*?insertLifecycle:[\s\S]*?outboxRepository\.insertLifecycle\(connection, pending, triggeringEvent, createdAt\),[\s\S]*?\}\);[\s\S]*?new EventAppendTransaction\(\s*input\.connection,\s*new SqliteEventAppendStatements\(input\.connection, lifecycleOutboxWriter\),\s*input\.maintenanceFence,\s*new BranchScopeRepository\(\{\s*randomId: \(\) => options\.identitySource\.uuid\(\) as BranchScopeId,\s*\}\),\s*\(\) => options\.identitySource\.uuid\(\),\s*NO_EVENT_STORE_FAULTS,\s*\)/);
       assert.match(factorySource, /new LifecycleCommandStore\(\{\s*connection: input\.connection,\s*events,\s*projectionWriter,/);
       assert.match(factorySource, /new LifecycleOperationalStore\(\{\s*connection: input\.connection,\s*transaction: \(connection\) => \{\s*if \(connection !== input\.connection\) return integrityFailure\(\);\s*return options\.transactionFacades\.operational\(\{ connection \}\);/);
       assert.equal(

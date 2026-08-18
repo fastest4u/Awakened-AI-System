@@ -38,6 +38,7 @@ import {
 import { MaintenanceFence } from "../src/orchestrator/storage/maintenance-fence.js";
 import { MigrationRunner } from "../src/orchestrator/storage/migration-runner.js";
 import { eventCoreMigration } from "../src/orchestrator/storage/migrations/0001-event-core.js";
+import { CURRENT_PROJECT_STORE_SCHEMA_VERSION } from "../src/orchestrator/storage/migrations/registry.js";
 import { NodeSqliteDriver } from "../src/orchestrator/storage/node-sqlite-driver.js";
 import type {
   SqliteConnection,
@@ -1364,7 +1365,7 @@ it("current schema projects existing version 1 lifecycle writes", () => {
   connection.exec("COMMIT");
   assert.equal(
     connection.prepare("SELECT schema_version FROM project_meta").get()?.schema_version,
-    4n,
+    BigInt(CURRENT_PROJECT_STORE_SCHEMA_VERSION),
   );
   assert.equal(
     connection.prepare("SELECT count(*) AS count FROM lifecycle_child_event_folds").get()?.count,
@@ -2102,7 +2103,7 @@ it("rejects a lifecycle descriptor bound to a different actual event", () => {
   assert.deepEqual(lifecycleCounts(connection), before);
 });
 
-it("rolls back event and lifecycle row when planning insertion fails", () => {
+it("rolls back final checkpoint and outbox together at every fault boundary", () => {
   const failedDescriptor = lifecycleFixture();
   seedLifecycleSession(failedDescriptor.connection, failedDescriptor.tx);
   const source = lifecycleEvent(2, "SessionAbandoned", {}, {

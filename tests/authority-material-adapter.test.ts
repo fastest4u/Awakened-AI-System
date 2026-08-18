@@ -14,6 +14,7 @@ import type {
 import {
   CHILD_BINDING_GRANT_DOMAIN,
   AuthorityMaterialAdapter,
+  type AuthorityMaterialCompletionOptions,
   type ChildBindingGrantV1,
   type PrivateAuthorityChannel,
   type PrivateLifecycleAuthorization,
@@ -1057,6 +1058,36 @@ describe("authority material adapter", () => {
     });
     assert.deepEqual(local.channel.deliveries, [{ target: PRIMARY_A, kind: "root" }]);
     assert.equal(await local.pending.get(PROJECT_ID, command.commandId, command.idempotencyKey), null);
+  });
+
+  it("runs the response-delivery checkpoint after private authority delivery and before retry-state deletion", async () => {
+    const local = harness();
+    local.channel.local = PRIMARY_A;
+    local.channel.attached.add(targetKey(PRIMARY_A));
+    const command = rootStart("00000000-0000-4000-8000-000000000027");
+    const context = trustedContext({
+      authoritySessionId: null,
+      targetSessionId: null,
+      capabilityKind: null,
+      capabilityGeneration: null,
+    });
+    await local.adapter.prepare(command, { kind: "initial-authority" }, context);
+    const issued = descriptor(local.capabilityService, local.provider, PRIMARY_A);
+
+    await assert.rejects(
+      local.adapter.complete(
+        identity(command),
+        success({ sessionId: ROOT_SESSION_ID }, issued),
+        {
+          afterAuthorityDeliveryBeforePendingDelete: () => {
+            assert.deepEqual(local.channel.deliveries, [{ target: PRIMARY_A, kind: "root" }]);
+            throw new Error("INJECTED_PRIVATE_AUTHORITY_DELIVERY_LOSS");
+          },
+        } satisfies AuthorityMaterialCompletionOptions,
+      ),
+      /INJECTED_PRIVATE_AUTHORITY_DELIVERY_LOSS/,
+    );
+    assert.ok(await local.pending.get(PROJECT_ID, command.commandId, command.idempotencyKey));
   });
 
   it("returns only safe status and retains unavailable material until exact replay is acknowledged", async () => {

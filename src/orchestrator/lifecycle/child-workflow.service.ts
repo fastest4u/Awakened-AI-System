@@ -73,6 +73,7 @@ import {
   FINAL_ENDING_SCOPE_BINDINGS_MAX_CANONICAL_BYTES,
   type FinalEndingScopeBindingV1,
 } from "./contracts/session-end.js";
+import { MAX_ROOT_CHILD_HISTORY_V1 } from "./session-end-identifiers.js";
 import type {
   MinimumCheckpointCapacityInput,
   MinimumEndingScopeCapacityInput,
@@ -86,6 +87,7 @@ import {
 import { buildLifecycleIntentWitness } from "./lifecycle-intent-witness.js";
 import type { ChildAggregateState, SessionAggregateState } from "./session-aggregate.js";
 import { requireRiskyTransitionCheckpointV1 } from "./checkpoint.service.js";
+import { decodeSessionEndCarryForwardTicketLineageV1 } from "./session-end-child.service.js";
 
 const LOWER_HASH = /^[0-9a-f]{64}$/;
 const SQLITE_INT64_MAX = 9_223_372_036_854_775_807n;
@@ -99,6 +101,12 @@ const REPORT_FIELDS = [
   "openFollowUps",
   "blockers",
 ] as const;
+const SESSION_END_TRANSFER_INTERVENING_EVENTS = new Set([
+  "SessionCheckpointRecorded",
+  "EvidenceCoverageRecorded",
+  "ChildAssignmentAmended",
+  "ChildWorkReported",
+]);
 
 type ChildCommand = Extract<LifecycleSemanticCommandDraft, {
   readonly commandType:
@@ -174,6 +182,11 @@ interface ChildAuthorityOperations {
   loadEvents(input: SessionAuthorityRecord): readonly LifecycleEventCodecResult[];
   requireFoldMatch(input: SessionAuthorityRecord): SessionAggregateState;
   listNonterminalChildren(projectId: string, rootSessionId: string): readonly SessionAuthorityRecord[];
+  listChildHistoryBounded?: (
+    projectId: string,
+    rootSessionId: string,
+    limit: number,
+  ) => readonly SessionAuthorityRecord[];
   listNonterminalChildEndingScopeProjectionsBounded(
     projectId: string,
     rootSessionId: string,
@@ -196,6 +209,11 @@ interface ChildTransferOperations {
     sourceRootSessionId: string,
     limit: number,
   ): readonly CarryForwardEndingScopeProjectionRecord[];
+  listBySourceRoot?: (
+    projectId: string,
+    sourceRootSessionId: string,
+    limit: number,
+  ) => readonly import("../storage/lifecycle-storage.types.js").ChildTransferTicketRecord[];
   insert(input: ChildTransferTicketInsert): void;
   claim(input: import("../storage/lifecycle-storage.types.js").ChildTransferClaim): unknown;
 }
@@ -231,8 +249,21 @@ function ownMethod<T extends (...arguments_: never[]) => unknown>(value: object,
   return descriptor.value as T;
 }
 
+function optionalOwnMethod<T extends (...arguments_: never[]) => unknown>(value: object, name: string): T | undefined {
+  const descriptor = Object.getOwnPropertyDescriptor(value, name);
+  if (descriptor === undefined) return undefined;
+  if (!descriptor.enumerable || !("value" in descriptor) || typeof descriptor.value !== "function") {
+    invalid("INTEGRITY_FAILURE");
+  }
+  return descriptor.value as T;
+}
+
 function authorityOperations(transaction: LifecycleCommandTransaction): ChildAuthorityOperations {
   const value = transaction.authority as object;
+  const listChildHistoryBounded = optionalOwnMethod<NonNullable<ChildAuthorityOperations["listChildHistoryBounded"]>>(
+    value,
+    "listChildHistoryBounded",
+  );
   return Object.freeze({
     get: ownMethod<ChildAuthorityOperations["get"]>(value, "get"),
     insertChild: ownMethod<ChildAuthorityOperations["insertChild"]>(value, "insertChild"),
@@ -245,6 +276,7 @@ function authorityOperations(transaction: LifecycleCommandTransaction): ChildAut
       value,
       "listNonterminalChildren",
     ),
+    ...(listChildHistoryBounded === undefined ? {} : { listChildHistoryBounded }),
     listNonterminalChildEndingScopeProjectionsBounded: ownMethod<
       ChildAuthorityOperations["listNonterminalChildEndingScopeProjectionsBounded"]
     >(value, "listNonterminalChildEndingScopeProjectionsBounded"),
@@ -270,6 +302,10 @@ function riskyTransitionChildren(
 
 function transferOperations(transaction: LifecycleCommandTransaction): ChildTransferOperations {
   const value = transaction.transfers as object;
+  const listBySourceRoot = optionalOwnMethod<NonNullable<ChildTransferOperations["listBySourceRoot"]>>(
+    value,
+    "listBySourceRoot",
+  );
   return Object.freeze({
     get: ownMethod<ChildTransferOperations["get"]>(value, "get"),
     findCreatedEventPosition: ownMethod<ChildTransferOperations["findCreatedEventPosition"]>(value, "findCreatedEventPosition"),
@@ -278,7 +314,34 @@ function transferOperations(transaction: LifecycleCommandTransaction): ChildTran
     >(value, "listUnclaimedEndingScopeProjectionsBySourceRoot"),
     insert: ownMethod<ChildTransferOperations["insert"]>(value, "insert"),
     claim: ownMethod<ChildTransferOperations["claim"]>(value, "claim"),
+    ...(listBySourceRoot === undefined ? {} : { listBySourceRoot }),
   });
+}
+
+function assertChildHistoryCapacity(
+  authority: ChildAuthorityOperations,
+  transfers: ChildTransferOperations,
+  root: SessionAuthorityRecord,
+  requireTicketHistory: boolean,
+): void {
+  const children = authority.listChildHistoryBounded?.(
+    root.projectId,
+    root.sessionId,
+    MAX_ROOT_CHILD_HISTORY_V1 + 1,
+  );
+  if (children !== undefined && children.length > MAX_ROOT_CHILD_HISTORY_V1) {
+    throw new LifecycleError("CHECKPOINT_CAPACITY_EXCEEDED");
+  }
+  if (requireTicketHistory) {
+    const tickets = transfers.listBySourceRoot?.(
+      root.projectId,
+      root.sessionId,
+      MAX_ROOT_CHILD_HISTORY_V1 + 1,
+    );
+    if (tickets !== undefined && tickets.length > MAX_ROOT_CHILD_HISTORY_V1) {
+      throw new LifecycleError("CHECKPOINT_CAPACITY_EXCEEDED");
+    }
+  }
 }
 
 function registerAffectedExistingSession(
@@ -1066,6 +1129,7 @@ export class ChildWorkflowService {
       aggregate,
       endingScopeBindings,
     );
+    assertChildHistoryCapacity(authority, transfers, parent, false);
     const childSessionId = this.#ids.uuid();
     const targetMaterial = targetClientInstanceId === null
       ? null
@@ -1385,6 +1449,7 @@ export class ChildWorkflowService {
       throw new LifecycleError("CHILD_DISPOSITION_INVALID");
     }
     const verified = this.#verify(transaction, command, parent);
+    assertChildHistoryCapacity(authority, transferOperations(transaction), parent, true);
     const now = exactNow(this.#clock);
     const eventPosition = authority.nextGlobalPosition();
     const completionDispositionRequestsMoreWork = aggregate.state === "completion-proposed"
@@ -1809,15 +1874,9 @@ export class ChildWorkflowService {
       && BigInt(event.globalPosition) === ticket.createdEventPosition
       && event.payload.transferTicketId === ticket.transferTicketId);
     const transferEvent = sourceEvents[transferEventIndex];
-    const suspensionEvent = sourceEvents[transferEventIndex - 1];
     const checkpoint = authority.latestCheckpoint(source);
     if (transferEvent === undefined || transferEvent.eventType !== "ChildWorkTransferCreated"
-      || suspensionEvent === undefined || suspensionEvent.eventType !== "ChildSessionSuspended"
       || checkpoint === null
-      || transferEvent.payload.checkpointId !== ticket.checkpointId
-      || suspensionEvent.payload.checkpointId !== ticket.checkpointId
-      || sourceAggregate.suspensionCheckpointId !== ticket.checkpointId
-      || sourceAggregate.latestCheckpointId !== ticket.checkpointId
       || ticket.createdAtMs !== BigInt(Date.parse(transferEvent.occurredAt))
       || canonicalJson(ticket.sourceAssignment) !== canonicalJson({
         assignmentId: sourceAggregate.assignment.assignmentId,
@@ -1826,15 +1885,58 @@ export class ChildWorkflowService {
         assignmentRevision: sourceAggregate.assignmentRevision,
       })
       || canonicalJson(ticket.sourceScope) !== canonicalJson({ scope: sourceAggregate.assignment.scope })
-      || canonicalJson(ticket.sourceState) !== canonicalJson(checkpoint.sourceState)
-      || canonicalJson(ticket.lineage) !== canonicalJson({
-        previousParentSessionId: source.parentSessionId,
-        previousChildSessionId: source.sessionId,
-        correlationId: sourceAggregate.correlationId,
-        transferEventPosition: ticket.createdEventPosition.toString(),
-      })
-      || canonicalJson(ticket.blockers) !== canonicalJson(suspensionEvent.payload.blockers)
-      || canonicalJson(ticket.followUps) !== canonicalJson(suspensionEvent.payload.followUps)) {
+      || canonicalJson(ticket.sourceState) !== canonicalJson(checkpoint.sourceState)) {
+      invalid("INTEGRITY_FAILURE");
+    }
+    let suspensionEvent: Extract<LifecycleEventCodecResult, { readonly eventType: "ChildSessionSuspended" }> | undefined;
+    if (transferEvent.eventSchemaVersion === 1) {
+      const previousEvent = sourceEvents[transferEventIndex - 1];
+      if (previousEvent?.eventType === "ChildSessionSuspended") suspensionEvent = previousEvent;
+      if (suspensionEvent === undefined || suspensionEvent.eventType !== "ChildSessionSuspended"
+        || transferEvent.payload.checkpointId !== ticket.checkpointId
+        || suspensionEvent.payload.checkpointId !== ticket.checkpointId
+        || sourceAggregate.suspensionCheckpointId !== ticket.checkpointId
+        || sourceAggregate.latestCheckpointId !== ticket.checkpointId
+        || canonicalJson(ticket.lineage) !== canonicalJson({
+          previousParentSessionId: source.parentSessionId,
+          previousChildSessionId: source.sessionId,
+          correlationId: sourceAggregate.correlationId,
+          transferEventPosition: ticket.createdEventPosition.toString(),
+        })
+        || canonicalJson(ticket.blockers) !== canonicalJson(suspensionEvent?.payload.blockers)
+        || canonicalJson(ticket.followUps) !== canonicalJson(suspensionEvent?.payload.followUps)) {
+        invalid("INTEGRITY_FAILURE");
+      }
+    } else if (transferEvent.eventSchemaVersion === 2) {
+      const transferPayload = transferEvent.payload as unknown as Readonly<Record<string, unknown>>;
+      const lineage = decodeSessionEndCarryForwardTicketLineageV1(ticket.lineage);
+      if (lineage.previousParentSessionId !== source.parentSessionId
+        || lineage.previousChildSessionId !== source.sessionId
+        || lineage.correlationId !== sourceAggregate.correlationId
+        || lineage.transferEventPosition !== ticket.createdEventPosition.toString()
+        || lineage.checkpointEventPosition !== checkpoint.checkpointEventPosition
+        || transferPayload.suspensionCheckpointId !== sourceAggregate.suspensionCheckpointId
+        || transferPayload.checkpointId !== ticket.checkpointId
+        || transferPayload.checkpointId !== sourceAggregate.latestCheckpointId
+        || BigInt(lineage.suspensionEventPosition) >= ticket.createdEventPosition) {
+        invalid("INTEGRITY_FAILURE");
+      }
+      const foundSuspensionEvent = sourceEvents.find((event) => event.eventType === "ChildSessionSuspended"
+        && BigInt(event.globalPosition) === BigInt(lineage.suspensionEventPosition));
+      if (foundSuspensionEvent?.eventType === "ChildSessionSuspended") suspensionEvent = foundSuspensionEvent;
+      if (suspensionEvent === undefined || suspensionEvent.eventType !== "ChildSessionSuspended"
+        || suspensionEvent.payload.checkpointId !== transferPayload.suspensionCheckpointId) {
+        invalid("INTEGRITY_FAILURE");
+      }
+      const suspensionIndex = sourceEvents.findIndex((event) => event.eventId === suspensionEvent!.eventId);
+      for (const event of sourceEvents.slice(suspensionIndex + 1, transferEventIndex)) {
+        if (!SESSION_END_TRANSFER_INTERVENING_EVENTS.has(event.eventType)) invalid("INTEGRITY_FAILURE");
+      }
+      if (canonicalJson(ticket.blockers) !== canonicalJson(suspensionEvent.payload.blockers)
+        || canonicalJson(ticket.followUps) !== canonicalJson(suspensionEvent.payload.followUps)) {
+        invalid("INTEGRITY_FAILURE");
+      }
+    } else {
       invalid("INTEGRITY_FAILURE");
     }
     const assignment = ticket.sourceAssignment as Readonly<Record<string, JsonValue>>;
@@ -1865,6 +1967,7 @@ export class ChildWorkflowService {
       rootAggregate,
       endingScopeBindings,
     );
+    assertChildHistoryCapacity(authority, transfers, root, true);
     const now = exactNow(this.#clock);
     const forkPosition = authority.nextGlobalPosition();
     if (forkPosition > SQLITE_INT64_MAX - 1n) invalid("INTEGRITY_FAILURE");

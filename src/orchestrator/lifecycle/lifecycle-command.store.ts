@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type {
   AppendCommand,
   AppendResult,
@@ -17,6 +18,7 @@ import {
   matchesLifecycleReplayAuthorization,
 } from "../storage/event-append-transaction.js";
 import type { SqliteConnection } from "../storage/sqlite-driver.js";
+import { LifecycleValidationResultRepository } from "../storage/lifecycle-validation-result.repository.js";
 import type {
   EvidenceCoverageBatchInput,
   PreparedEvidenceCoverageBatch,
@@ -38,8 +40,12 @@ import {
   type EvidenceCoverageRecordedV2,
   type SessionCheckpointRecordedPayloadV3,
 } from "./contracts/events.js";
-import { decodeFinalEndingScopeBindingsV1 } from "./contracts/session-end.js";
-import type { SessionId } from "./contracts/identifiers.js";
+import {
+  decodeFinalEndingScopeBindingsV1,
+  type ValidationResultV1,
+} from "./contracts/session-end.js";
+import type { SessionId, WorkflowId } from "./contracts/identifiers.js";
+import { sessionEndWorkflowId } from "./session-end-identifiers.js";
 import type {
   InternalWorkflowPhasePlan,
   InternalWorkflowSemanticCommand,
@@ -51,6 +57,11 @@ import {
   type TrustedLifecycleIntentAssertionsV1,
 } from "./lifecycle-intent-witness.js";
 import { LifecycleError } from "./errors.js";
+import {
+  NO_LIFECYCLE_FAULTS,
+  type LifecycleFaultContext,
+  type LifecycleFaultInjector,
+} from "./lifecycle-faults.js";
 
 const LOWER_HASH = /^[0-9a-f]{64}$/;
 const LOWER_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
@@ -133,7 +144,18 @@ export interface ConnectionBoundEvidenceCoverage {
 }
 /** Optional until the request/reopen slice wires the semantic command path. */
 export interface ConnectionBoundSessionEndWorkflows extends Partial<SessionEndWorkflowOperations> {}
-export interface ConnectionBoundValidationResults {}
+export interface ConnectionBoundValidationResults {
+  /** Legacy mocks may carry unrelated test-only members. */
+  readonly [key: string]: unknown;
+  /** Optional for legacy transaction mocks; present when the repository is wired. */
+  readonly record?: (input: ValidationResultV1, event: StoredEvent) => void;
+  readonly get?: (projectId: string, resultId: string) => ValidationResultV1 | null;
+  readonly list?: (input: {
+    readonly projectId: string;
+    readonly workflowId: string;
+    readonly workflowGeneration: number;
+  }) => readonly ValidationResultV1[];
+}
 export interface ConnectionBoundLifecycleOutbox {}
 
 export interface LifecycleCommandTransaction {
@@ -162,6 +184,10 @@ export interface PreparedLifecycleCommit<T extends JsonValue> {
     committed: EventAppendBatch<T>,
     transaction: LifecycleCommandTransaction,
   ) => undefined;
+  /** Internal coordinators may resolve a planner command to the exact
+   * append-time command after connection-bound evidence is prepared. */
+  readonly resolvedSemanticCommand?: LifecycleCommandEnvelope["semanticCommand"];
+  readonly resolvedAuthoritativeIntentHash?: string;
 }
 
 export type AuthorityMaterialStatus = "current" | "stale" | "unavailable" | "not-issued";
@@ -205,10 +231,14 @@ export interface LifecycleCommandStoreOptions {
   readonly transaction: (connection: SqliteConnection) => LifecycleCommandTransaction;
   /** Optional schema-3 coverage repository; kept production-unwired until lifecycle V2 routing lands. */
   readonly evidenceCoverageRepository?: EvidenceCoverageRepository;
+  /** Optional Task 15 validation-result repository; legacy transaction factories may omit it. */
+  readonly validationResultsRepository?: LifecycleValidationResultRepository;
   readonly now?: () => string;
   readonly authorityMaterialStatus?: (
     authorization: PersistedLifecycleAuthorizationRecord,
   ) => AuthorityMaterialStatus;
+  /** Optional fixture-only durable-boundary fault injection. */
+  readonly faultInjector?: LifecycleFaultInjector;
 }
 
 const PREFINAL_SESSION_END_PHASES = new Set([
@@ -839,7 +869,7 @@ function assertFrozenWorkflowIntegrity(
                       = immutable_ticket.source_parent_session_id
                     AND immutable_transfer_event.event_type
                       = 'ChildWorkTransferCreated'
-                    AND immutable_transfer_event.event_schema_version = 1
+                    AND immutable_transfer_event.event_schema_version IN (1, 2)
                     AND json_valid(immutable_transfer_event.payload_json)
                     AND json(immutable_transfer_event.payload_json)
                       = immutable_transfer_event.payload_json
@@ -851,6 +881,43 @@ function assertFrozenWorkflowIntegrity(
                       immutable_transfer_event.payload_json,
                       '$.checkpointId'
                     ) = immutable_ticket.checkpoint_id
+                    AND (
+                      immutable_transfer_event.event_schema_version = 1
+                      OR (
+                        json_extract(
+                          immutable_transfer_event.payload_json,
+                          '$.suspensionCheckpointId'
+                        ) IS NOT NULL
+                        AND EXISTS (
+                          SELECT 1
+                          FROM events AS immutable_suspension_event
+                          WHERE immutable_suspension_event.project_id
+                              = immutable_ticket.project_id
+                            AND immutable_suspension_event.stream_id
+                              = immutable_transfer_event.stream_id
+                            AND immutable_suspension_event.stream_type = 'session'
+                            AND immutable_suspension_event.session_id
+                              = immutable_ticket.source_child_session_id
+                            AND immutable_suspension_event.parent_session_id
+                              = immutable_ticket.source_parent_session_id
+                            AND immutable_suspension_event.event_type
+                              = 'ChildSessionSuspended'
+                            AND immutable_suspension_event.event_schema_version = 1
+                            AND immutable_suspension_event.global_position
+                              < immutable_ticket.created_event_position
+                            AND json_valid(immutable_suspension_event.payload_json)
+                            AND json(immutable_suspension_event.payload_json)
+                              = immutable_suspension_event.payload_json
+                            AND json_extract(
+                              immutable_suspension_event.payload_json,
+                              '$.checkpointId'
+                            ) = json_extract(
+                              immutable_transfer_event.payload_json,
+                              '$.suspensionCheckpointId'
+                            )
+                        )
+                      )
+                    )
                   WHERE immutable_ticket.project_id = workflow.project_id
                     AND immutable_ticket.source_parent_session_id
                       = workflow.session_id
@@ -1068,7 +1135,7 @@ function assertEvidenceWindowWritable(
       AND workflow_id = $workflowId
   `).get({
     $projectId: projectId,
-    $workflowId: `session-end/${rootSessionId}`,
+    $workflowId: sessionEndWorkflowId(rootSessionId),
   });
   if (workflow === undefined) return;
   const workflowType = rowString(workflow, "workflow_type");
@@ -1105,7 +1172,7 @@ function assertEvidenceWindowWritable(
     assertFrozenWorkflowIntegrity(
       connection,
       projectId,
-      `session-end/${rootSessionId}`,
+      sessionEndWorkflowId(rootSessionId),
       rootSessionId,
       frozenPosition,
     );
@@ -1166,6 +1233,24 @@ export function connectionBoundEvidenceCoverage(
       repository.minimumFinalEndingScopeBindingsUpperBound(connection, input),
   };
   return Object.freeze(facade);
+}
+
+export function connectionBoundValidationResults(
+  connection: SqliteConnection,
+  repository: LifecycleValidationResultRepository,
+): ConnectionBoundValidationResults {
+  return Object.freeze({
+    record: (input: ValidationResultV1, event: StoredEvent): void => {
+      repository.record(connection, input, event);
+    },
+    get: (projectId: string, resultId: string): ValidationResultV1 | null =>
+      repository.get(connection, projectId, resultId),
+    list: (input: {
+      readonly projectId: string;
+      readonly workflowId: string;
+      readonly workflowGeneration: number;
+    }): readonly ValidationResultV1[] => repository.list(connection, input),
+  });
 }
 
 export class LifecycleCommandStoreError extends LifecycleError {
@@ -1470,6 +1555,8 @@ interface SnapshottedLifecycleCommit<T extends JsonValue> {
   readonly freshCapabilityGeneration?: string;
   readonly beforeAppend?: PreparedLifecycleCommit<T>["beforeAppend"];
   readonly afterAppend: PreparedLifecycleCommit<T>["afterAppend"];
+  readonly resolvedSemanticCommand?: LifecycleCommandEnvelope["semanticCommand"];
+  readonly resolvedAuthoritativeIntentHash?: string;
 }
 
 function dataProperty(record: Record<string, unknown>, property: string): unknown {
@@ -1493,6 +1580,8 @@ function snapshotPreparedCommit<T extends JsonValue>(
   const afterAppend = dataProperty(value, "afterAppend");
   const beforeDescriptor = Reflect.getOwnPropertyDescriptor(value, "beforeAppend");
   const generationDescriptor = Reflect.getOwnPropertyDescriptor(value, "freshCapabilityGeneration");
+  const resolvedCommandDescriptor = Reflect.getOwnPropertyDescriptor(value, "resolvedSemanticCommand");
+  const resolvedHashDescriptor = Reflect.getOwnPropertyDescriptor(value, "resolvedAuthoritativeIntentHash");
   if (typeof afterAppend !== "function"
     || (beforeDescriptor !== undefined
       && (!("value" in beforeDescriptor)
@@ -1501,6 +1590,19 @@ function snapshotPreparedCommit<T extends JsonValue>(
       && (!("value" in generationDescriptor)
         || (generationDescriptor.value !== undefined
           && typeof generationDescriptor.value !== "string")))) {
+    callbackBoundaryFailure();
+  }
+  if (resolvedCommandDescriptor !== undefined
+    && (!(("value" in resolvedCommandDescriptor)
+      && (resolvedCommandDescriptor.value === undefined
+        || isPlainRecord(resolvedCommandDescriptor.value))))) {
+    callbackBoundaryFailure();
+  }
+  if (resolvedHashDescriptor !== undefined
+    && (!(("value" in resolvedHashDescriptor)
+      && (resolvedHashDescriptor.value === undefined
+        || (typeof resolvedHashDescriptor.value === "string"
+          && LOWER_HASH.test(resolvedHashDescriptor.value)))))) {
     callbackBoundaryFailure();
   }
   return Object.freeze({
@@ -1513,6 +1615,14 @@ function snapshotPreparedCommit<T extends JsonValue>(
       ? {}
       : { beforeAppend: beforeDescriptor.value as PreparedLifecycleCommit<T>["beforeAppend"] }),
     afterAppend: afterAppend as PreparedLifecycleCommit<T>["afterAppend"],
+    ...(resolvedCommandDescriptor?.value === undefined
+      ? {}
+      : { resolvedSemanticCommand: immutableSnapshot(
+          resolvedCommandDescriptor.value as LifecycleCommandEnvelope["semanticCommand"],
+        ) }),
+    ...(resolvedHashDescriptor?.value === undefined
+      ? {}
+      : { resolvedAuthoritativeIntentHash: resolvedHashDescriptor.value as string }),
   });
 }
 
@@ -1714,6 +1824,12 @@ function affectedExistingSessionIds(
       if (envelope.replayExpectation.kind !== "internal-workflow") {
         return storageIntegrity();
       }
+      if (command.commandType === "internal-workflow-phase") {
+        const action = "plannedAction" in command ? command.plannedAction : command.action;
+        if (action.action === "carry-forward-child") {
+          return Object.freeze([action.rootSessionId, action.childSessionId]);
+        }
+      }
       return Object.freeze([
         envelope.replayExpectation.targetSessionId as SessionId,
       ]);
@@ -1831,14 +1947,38 @@ function callbackRequiredAffectedSessionIds<T extends JsonValue>(
   return Object.freeze([previousChildSessionId as SessionId]);
 }
 
+function lifecycleFaultContext(command: LifecycleCommandEnvelope): LifecycleFaultContext {
+  const semantic = command.semanticCommand as unknown as Readonly<Record<string, unknown>>;
+  const sessionId = typeof semantic.sessionId === "string"
+    ? semantic.sessionId as SessionId
+    : null;
+  const workflowId = typeof semantic.workflowId === "string"
+    ? semantic.workflowId as WorkflowId
+    : null;
+  return Object.freeze({
+    projectId: command.context.binding.projectId,
+    sessionId,
+    workflowId,
+    commandId: command.commandId,
+    idempotencyKeyHash: createHash("sha256")
+      .update(command.idempotencyKey, "utf8")
+      .digest("hex"),
+    workId: null,
+    eventPosition: null,
+    materializationRevision: null,
+  });
+}
+
 export class LifecycleCommandStore {
   readonly #connection: SqliteConnection;
   readonly #events: LifecycleEventAppendPort;
   readonly #projectionWriter: LifecycleProjectionWriter;
   readonly #transaction: (connection: SqliteConnection) => LifecycleCommandTransaction;
   readonly #coverageRepository: EvidenceCoverageRepository | undefined;
+  readonly #validationResultsRepository: LifecycleValidationResultRepository | undefined;
   readonly #now: () => string;
   readonly #materialStatus: NonNullable<LifecycleCommandStoreOptions["authorityMaterialStatus"]>;
+  readonly #faults: LifecycleFaultInjector;
 
   constructor(options: LifecycleCommandStoreOptions) {
     const projectionWriterDescriptor = Reflect.getOwnPropertyDescriptor(
@@ -1861,8 +2001,10 @@ export class LifecycleCommandStore {
       projectionWriterDescriptor.value as LifecycleProjectionWriter;
     this.#transaction = options.transaction;
     this.#coverageRepository = options.evidenceCoverageRepository;
+    this.#validationResultsRepository = options.validationResultsRepository;
     this.#now = options.now ?? (() => new Date().toISOString());
     this.#materialStatus = options.authorityMaterialStatus ?? (() => "unavailable");
+    this.#faults = options.faultInjector ?? NO_LIFECYCLE_FAULTS;
   }
 
   execute<T extends JsonValue>(
@@ -1877,6 +2019,7 @@ export class LifecycleCommandStore {
     let commitCompleted = false;
     let focused: LifecycleCommandTransaction | undefined;
     let freshIntegrity: FreshIntegrityCoordinator | undefined;
+    const faultContext = lifecycleFaultContext(envelope);
     try {
       this.#connection.exec("BEGIN IMMEDIATE");
       transactionBegan = true;
@@ -1906,6 +2049,7 @@ export class LifecycleCommandStore {
         };
       }
 
+      this.#faults.hit("event-append", "before-write", faultContext);
       this.#events.assertCommandIdentityAvailable(envelope);
       this.#events.assertAppendAllowed();
       const rawTransaction = this.#transaction(this.#connection);
@@ -1916,11 +2060,20 @@ export class LifecycleCommandStore {
             coverage: connectionBoundEvidenceCoverage(
               this.#connection,
               this.#coverageRepository,
+              ),
+            });
+      const withValidation = this.#validationResultsRepository === undefined
+        ? projected
+        : {
+            ...projected,
+            validation: connectionBoundValidationResults(
+              this.#connection,
+              this.#validationResultsRepository,
             ),
-          });
+          };
       freshIntegrity = createFreshIntegrityCoordinator(projected.coverage);
       focused = {
-        ...projected,
+        ...withValidation,
         coverage: freshIntegrity.coverage,
       };
       invokeSynchronousTransactionCallback(
@@ -1930,7 +2083,19 @@ export class LifecycleCommandStore {
       );
       const next = invokeSynchronousTransactionCallback(focused, onNew, snapshotPreparedCommit);
       freshIntegrity.seal();
-      const resolvedEnvelope = resolveFreshCapabilityGeneration(envelope, next);
+      const capabilityResolvedEnvelope = resolveFreshCapabilityGeneration(envelope, next);
+      const resolvedEnvelope = next.resolvedSemanticCommand === undefined
+        ? capabilityResolvedEnvelope
+        : Object.freeze({
+            ...capabilityResolvedEnvelope,
+            semanticCommand: next.resolvedSemanticCommand,
+            authoritativeIntentHash: next.resolvedAuthoritativeIntentHash
+              ?? capabilityResolvedEnvelope.authoritativeIntentHash,
+            candidateIntentHash: next.resolvedAuthoritativeIntentHash
+              ?? capabilityResolvedEnvelope.candidateIntentHash,
+            commandType: next.resolvedSemanticCommand.commandType,
+          });
+      assertEnvelope(resolvedEnvelope);
       const authorizationFingerprint = integrityFingerprint(next.authorizationRecord);
       assertAppendIdentity(resolvedEnvelope, next);
       freshIntegrity.assertRegistered(
@@ -1940,7 +2105,7 @@ export class LifecycleCommandStore {
       const prepared = this.#events.prepare(
         trustedAppend,
         this.#now(),
-        envelope.authoritativeIntentHash,
+        resolvedEnvelope.authoritativeIntentHash,
       );
       const planned = this.#events.planPrepared(prepared);
       const plannedFingerprint = batchFingerprint(planned);
@@ -1968,6 +2133,10 @@ export class LifecycleCommandStore {
         ), undefinedCallbackResult);
       assertBatchUnchanged(committed, committedFingerprint);
       this.#events.insertDedup(prepared, committed, next.authorizationRecord);
+      this.#faults.hit("event-append", "after-write-before-commit", Object.freeze({
+        ...faultContext,
+        eventPosition: committed.storedResponse.lastGlobalPosition,
+      }));
       const authorityMaterialStatus = materialStatusResult(synchronousCallbackResult(
         this.#materialStatus(next.authorizationRecord),
       ));
@@ -1980,6 +2149,10 @@ export class LifecycleCommandStore {
       }
       commitCompleted = true;
       transactionBegan = false;
+      this.#faults.hit("event-append", "after-commit-before-response", Object.freeze({
+        ...faultContext,
+        eventPosition: committed.storedResponse.lastGlobalPosition,
+      }));
       const appendResult = this.#events.result(committed);
       return {
         deduplicated: false,

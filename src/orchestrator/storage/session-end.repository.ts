@@ -1,6 +1,7 @@
 import { LifecycleError } from "../lifecycle/errors.js";
 import {
   SESSION_END_PHASES,
+  decodeFinalEndingScopeBindingsV1,
   type SessionEndPhase,
 } from "../lifecycle/contracts/session-end.js";
 import { decodeLifecycleIntentWitness } from "../lifecycle/lifecycle-intent-witness.js";
@@ -8,6 +9,11 @@ import {
   decodeSessionEndEffectiveStateV1,
   type SessionEndEffectiveStateV1,
 } from "../lifecycle/session-end-effective-state.js";
+import {
+  NO_LIFECYCLE_FAULTS,
+  type LifecycleFaultContext,
+  type LifecycleFaultInjector,
+} from "../lifecycle/lifecycle-faults.js";
 import { canonicalJson } from "../serialization/canonical-json.js";
 import type { SqliteConnection, SqliteParams, SqliteRow } from "./sqlite-driver.js";
 
@@ -41,6 +47,17 @@ const ACTIVE_WORKFLOW_PHASES = new Set<SessionEndPhase>([
 ]);
 const EVENTLESS_PHASE_TRANSITIONS = new Map<SessionEndPhase, SessionEndPhase>([
   ["requested", "children-resolved"],
+  ["final-checkpoint-recorded", "ending-materialization-queued"],
+  ["ending-materialization-queued", "validating"],
+  ["completion-appended", "completed"],
+  ["completed-materialization-confirmed", "completed"],
+]);
+const COMPLETED_MATERIALIZATION_TRANSITION = "completion-appended\u0000completed-materialization-confirmed";
+const EVENTFUL_PHASE_TRANSITIONS = new Set([
+  "validating\u0000verification-failed",
+  "validating\u0000verification-passed",
+  "verification-passed\u0000verification-failed",
+  "verification-passed\u0000completion-appended",
 ]);
 
 export interface SessionEndWorkflowRecordV1 {
@@ -86,6 +103,64 @@ export interface SessionEndWorkflowRequestedInputV1 {
   readonly evidenceWindowState: "open" | "sealed";
   readonly now: string;
   readonly effectiveState: SessionEndEffectiveStateV1;
+}
+
+export interface SessionEndWorkflowAmendmentInputV1 {
+  readonly projectId: string;
+  readonly workflowId: string;
+  readonly previousWorkflowGeneration: number;
+  readonly workflowGeneration: number;
+  readonly rootCommandId: string;
+  readonly sessionId: string;
+  readonly triggeringEventPosition: bigint;
+  readonly expectedAuthorityCommitment: string;
+  readonly phase: SessionEndPhase;
+  readonly resultJson: string;
+  readonly evidenceWindowState: "open" | "sealed";
+  readonly clearFrozenGroup: boolean;
+  readonly now: string;
+}
+
+export interface SessionEndWorkflowCancellationInputV1 {
+  readonly projectId: string;
+  readonly workflowId: string;
+  readonly previousWorkflowGeneration: number;
+  readonly workflowGeneration: number;
+  readonly rootCommandId: string;
+  readonly sessionId: string;
+  readonly triggeringEventPosition: bigint;
+  readonly expectedAuthorityCommitment: string;
+  readonly restoredState: "active" | "suspended";
+  readonly resultJson: string;
+  readonly now: string;
+}
+
+export interface SessionEndWorkflowAbandonmentInputV1 {
+  readonly projectId: string;
+  readonly workflowId: string;
+  readonly workflowGeneration: number;
+  readonly rootCommandId: string;
+  readonly sessionId: string;
+  readonly triggeringEventPosition: bigint;
+  readonly expectedAuthorityCommitment: string;
+  readonly resultJson: string;
+  readonly now: string;
+}
+
+export interface SessionEndWorkflowFinalCheckpointInputV1 {
+  readonly projectId: string;
+  readonly workflowId: string;
+  readonly workflowGeneration: number;
+  readonly sessionId: string;
+  readonly rootCommandId: string;
+  readonly ownerId: string;
+  readonly claimToken: bigint;
+  readonly checkpointId: string;
+  readonly checkpointEventPosition: bigint;
+  readonly checkpointFingerprint: string;
+  readonly finalEndingScopeBindingsJson: string;
+  readonly resultJson: string;
+  readonly now: string;
 }
 
 export interface SessionEndWorkflowClaimV1 {
@@ -140,6 +215,37 @@ export interface SessionEndWorkflowEventlessPhaseInputV1 {
   readonly expectedPhase: SessionEndPhase;
   readonly nextPhase: SessionEndPhase;
   readonly observedNowMs: bigint;
+  readonly resultJson?: string;
+}
+
+export interface SessionEndWorkflowEventfulPhaseInputV1 {
+  readonly projectId: string;
+  readonly workflowId: string;
+  readonly workflowGeneration: number;
+  readonly ownerId: string;
+  readonly claimToken: bigint;
+  readonly expectedPhase: SessionEndPhase;
+  readonly nextPhase: SessionEndPhase;
+  readonly eventPosition: bigint;
+  readonly resultJson: string;
+  readonly now: string;
+}
+
+export interface SessionEndWorkflowRecoveryInputV1 {
+  readonly projectId: string;
+  readonly dueBefore: string;
+  readonly limit: number;
+}
+
+export interface SessionEndWorkflowRecoveryResultV1 {
+  readonly resultVersion: 1;
+  readonly integrityOk: boolean;
+  readonly readOnly: true;
+  readonly workflowCandidateCount: number;
+  readonly outboxCandidateCount: number;
+  readonly endingSessionCount: number;
+  readonly expiredRootLeaseCount: number;
+  readonly invariantFailureCodes: readonly string[];
 }
 
 /** The durable validation-plan shape.  Configuration material deliberately
@@ -390,6 +496,46 @@ export interface HydratedSessionEndEffectiveStateV1 {
   readonly workflowId: string;
   readonly workflowGeneration: number;
   readonly effectiveState: SessionEndEffectiveStateV1;
+}
+
+/** Reads the immutable fold-selected source position for a generation.  The
+ * mutable workflow row points at the final checkpoint after finalization, so
+ * callers must not feed that row position back into effective-state hydration. */
+export function readEffectiveStateSourceEventPositionV1(
+  connection: SqliteConnection,
+  input: {
+    readonly projectId: string;
+    readonly workflowId: string;
+    readonly workflowGeneration: number;
+  },
+): bigint {
+  try {
+    if (
+      typeof input.projectId !== "string"
+      || input.projectId.length === 0
+      || typeof input.workflowId !== "string"
+      || input.workflowId.length === 0
+      || !Number.isSafeInteger(input.workflowGeneration)
+      || input.workflowGeneration <= 0
+    ) integrity();
+    const row = oneOrNone(connection.prepare(`
+      SELECT effective_state_source_event_position
+      FROM lifecycle_workflow_generation_folds
+      WHERE project_id = $projectId
+        AND workflow_id = $workflowId
+        AND workflow_generation = $workflowGeneration
+      LIMIT 2
+    `).all({
+      $projectId: input.projectId,
+      $workflowId: input.workflowId,
+      $workflowGeneration: BigInt(input.workflowGeneration),
+    }));
+    if (row === null) integrity();
+    return rowInt64(row["effective_state_source_event_position"]);
+  } catch (error) {
+    if (error instanceof LifecycleError && error.code === "INTEGRITY_FAILURE") throw error;
+    return integrity();
+  }
 }
 
 /** Hydrates a Version-3 snapshot only from the immutable event selected by the
@@ -967,6 +1113,7 @@ function validateRequestedInput(
   readonly sessionId: string;
   readonly triggeringEventPosition: bigint;
   readonly authorityCommitment: string;
+  readonly priorRootState: "active" | "suspended";
   readonly resultJson: string | null;
   readonly evidenceWindowState: "open" | "sealed";
   readonly now: string;
@@ -1017,6 +1164,7 @@ function validateRequestedInput(
     sessionId,
     triggeringEventPosition,
     authorityCommitment: input.expectedAuthorityCommitment,
+    priorRootState: input.priorRootState,
     resultJson,
     evidenceWindowState: input.evidenceWindowState,
     now,
@@ -1026,9 +1174,14 @@ function validateRequestedInput(
 /** Storage-only, connection-bound operations for the session-end workflow row. */
 export class SessionEndWorkflowRepository {
   readonly #connection: SqliteConnection;
+  readonly #faultInjector: LifecycleFaultInjector;
 
-  constructor(connection: SqliteConnection) {
+  constructor(
+    connection: SqliteConnection,
+    options: { readonly faultInjector?: LifecycleFaultInjector } = {},
+  ) {
     this.#connection = connection;
+    this.#faultInjector = options.faultInjector ?? NO_LIFECYCLE_FAULTS;
   }
 
   read(projectId: string, workflowId: string): SessionEndWorkflowRecordV1 | null {
@@ -1047,6 +1200,20 @@ export class SessionEndWorkflowRepository {
   createRequested(input: SessionEndWorkflowRequestedInputV1): void {
     const values = validateRequestedInput(input, false);
     if (values.resultJson === null) workflowInputFailure("resultJson");
+    this.#faultInjector.hit(
+      "workflow-create",
+      "before-write",
+      {
+        projectId: values.projectId as LifecycleFaultContext["projectId"],
+        sessionId: values.sessionId as LifecycleFaultContext["sessionId"],
+        workflowId: values.workflowId as LifecycleFaultContext["workflowId"],
+        commandId: values.rootCommandId,
+        idempotencyKeyHash: null,
+        workId: null,
+        eventPosition: values.triggeringEventPosition.toString(),
+        materializationRevision: null,
+      },
+    );
     const result = this.#connection.prepare(`
       INSERT INTO workflow_instances(
         project_id, workflow_id, workflow_type, generation, state, phase,
@@ -1058,7 +1225,7 @@ export class SessionEndWorkflowRepository {
         validation_attempt_plans_json, evidence_frozen_checkpoint_event_position,
         evidence_frozen_generation, evidence_window_state, final_ending_scope_bindings_json
       ) VALUES (
-        $projectId, $workflowId, 'session-end', $generation, 'active', 'requested',
+        $projectId, $workflowId, 'session-end', $generation, $state, 'requested',
         $rootCommandId, $resultJson, NULL, $now, $now,
         $sessionId, $triggeringEventPosition, $authorityCommitment,
         NULL, NULL, NULL, 0, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
@@ -1068,6 +1235,7 @@ export class SessionEndWorkflowRepository {
       $projectId: values.projectId,
       $workflowId: values.workflowId,
       $generation: BigInt(values.generation),
+      $state: values.priorRootState,
       $rootCommandId: values.rootCommandId,
       $resultJson: values.resultJson,
       $now: values.now,
@@ -1093,7 +1261,7 @@ export class SessionEndWorkflowRepository {
     const result = this.#connection.prepare(`
       UPDATE workflow_instances
       SET generation = $generation,
-          state = 'active',
+          state = $state,
           phase = 'requested',
           root_command_id = $rootCommandId,
           result_json = $resultJson,
@@ -1121,6 +1289,7 @@ export class SessionEndWorkflowRepository {
         AND phase = 'cancelled'
     `).run({
       $generation: BigInt(values.generation),
+      $state: values.priorRootState,
       $rootCommandId: values.rootCommandId,
       $resultJson: values.resultJson,
       $now: values.now,
@@ -1130,6 +1299,293 @@ export class SessionEndWorkflowRepository {
       $projectId: values.projectId,
       $workflowId: values.workflowId,
       $previousGeneration: BigInt(existing.generation),
+    } satisfies SqliteParams);
+    if (!changed(result)) throw new LifecycleError("EVENT_CONFLICT");
+  }
+
+  amendGeneration(input: SessionEndWorkflowAmendmentInputV1): void {
+    const projectId = workflowUuid(input.projectId, "projectId");
+    const workflowId = workflowUuid(input.workflowId, "workflowId");
+    const sessionId = workflowUuid(input.sessionId, "sessionId");
+    const previousWorkflowGeneration = workflowGeneration(
+      input.previousWorkflowGeneration,
+      "previousWorkflowGeneration",
+    );
+    const workflowGenerationValue = workflowGeneration(
+      input.workflowGeneration,
+      "workflowGeneration",
+    );
+    if (workflowGenerationValue !== previousWorkflowGeneration + 1) {
+      workflowInputFailure("workflowGeneration");
+    }
+    const rootCommandId = workflowUuid(input.rootCommandId, "rootCommandId");
+    const triggeringEventPosition = workflowInt64(
+      input.triggeringEventPosition,
+      "triggeringEventPosition",
+    );
+    if (typeof input.expectedAuthorityCommitment !== "string"
+      || !LOWER_HASH.test(input.expectedAuthorityCommitment)) {
+      workflowInputFailure("expectedAuthorityCommitment");
+    }
+    if (!ACTIVE_WORKFLOW_PHASES.has(input.phase)
+      || input.phase === "completed") {
+      workflowInputFailure("phase");
+    }
+    if (input.evidenceWindowState !== "open" && input.evidenceWindowState !== "sealed") {
+      workflowInputFailure("evidenceWindowState");
+    }
+    if (typeof input.clearFrozenGroup !== "boolean") {
+      workflowInputFailure("clearFrozenGroup");
+    }
+    const resultJson = workflowJson(input.resultJson, "resultJson");
+    if (resultJson === null) workflowInputFailure("resultJson");
+    const now = workflowTimestamp(input.now, "now");
+    if (now === null) workflowInputFailure("now");
+    const existing = this.read(projectId, workflowId);
+    if (existing === null
+      || existing.sessionId !== sessionId
+      || existing.generation !== previousWorkflowGeneration
+      || !ACTIVE_WORKFLOW_PHASES.has(existing.phase)
+      || existing.phase === "completed"
+      || existing.rootCommandId === rootCommandId
+      || triggeringEventPosition <= existing.triggeringEventPosition) {
+      throw new LifecycleError("EVENT_CONFLICT");
+    }
+    if (!input.clearFrozenGroup
+      && input.evidenceWindowState !== existing.evidenceWindowState) {
+      workflowInputFailure("evidenceWindowState");
+    }
+    const frozenAssignments = input.clearFrozenGroup
+      ? `
+          evidence_frozen_checkpoint_event_position = NULL,
+          evidence_frozen_generation = NULL,
+          final_ending_scope_bindings_json = NULL,`
+      : "";
+    const result = this.#connection.prepare(`
+      UPDATE workflow_instances
+      SET generation = $generation,
+          phase = $phase,
+          root_command_id = $rootCommandId,
+          result_json = $resultJson,
+          error_code = NULL,
+          updated_at = $now,
+          triggering_event_position = $triggeringEventPosition,
+          expected_authority_commitment = $authorityCommitment,
+          coordinator_owner_id = NULL,
+          coordinator_claim_token = NULL,
+          coordinator_claim_expires_at = NULL,
+          coordinator_attempt_count = 0,
+          coordinator_failure_class = NULL,
+          coordinator_error_code = NULL,
+          coordinator_next_attempt_at = NULL,
+          validation_attempt_plan_generation = NULL,
+          validation_attempt_plans_json = NULL,
+          evidence_window_state = $evidenceWindowState,${frozenAssignments}
+          state = state
+      WHERE project_id = $projectId
+        AND workflow_id = $workflowId
+        AND workflow_type = 'session-end'
+        AND session_id = $sessionId
+        AND generation = $previousGeneration
+        AND phase NOT IN ('cancelled', 'abandoned', 'completed')
+    `).run({
+      $generation: BigInt(workflowGenerationValue),
+      $phase: input.phase,
+      $rootCommandId: rootCommandId,
+      $resultJson: resultJson,
+      $now: now,
+      $triggeringEventPosition: triggeringEventPosition,
+      $authorityCommitment: input.expectedAuthorityCommitment,
+      $evidenceWindowState: input.evidenceWindowState,
+      $projectId: projectId,
+      $workflowId: workflowId,
+      $sessionId: sessionId,
+      $previousGeneration: BigInt(previousWorkflowGeneration),
+    } satisfies SqliteParams);
+    if (!changed(result)) throw new LifecycleError("EVENT_CONFLICT");
+  }
+
+  cancelGeneration(input: SessionEndWorkflowCancellationInputV1): void {
+    const projectId = workflowUuid(input.projectId, "projectId");
+    const workflowId = workflowUuid(input.workflowId, "workflowId");
+    const sessionId = workflowUuid(input.sessionId, "sessionId");
+    const previousWorkflowGeneration = workflowGeneration(
+      input.previousWorkflowGeneration,
+      "previousWorkflowGeneration",
+    );
+    const workflowGenerationValue = workflowGeneration(
+      input.workflowGeneration,
+      "workflowGeneration",
+    );
+    if (workflowGenerationValue !== previousWorkflowGeneration + 1) {
+      workflowInputFailure("workflowGeneration");
+    }
+    const rootCommandId = workflowUuid(input.rootCommandId, "rootCommandId");
+    const triggeringEventPosition = workflowInt64(
+      input.triggeringEventPosition,
+      "triggeringEventPosition",
+    );
+    if (typeof input.expectedAuthorityCommitment !== "string"
+      || !LOWER_HASH.test(input.expectedAuthorityCommitment)) {
+      workflowInputFailure("expectedAuthorityCommitment");
+    }
+    if (input.restoredState !== "active" && input.restoredState !== "suspended") {
+      workflowInputFailure("restoredState");
+    }
+    const resultJson = workflowJson(input.resultJson, "resultJson");
+    if (resultJson === null) workflowInputFailure("resultJson");
+    const now = workflowTimestamp(input.now, "now");
+    if (now === null) workflowInputFailure("now");
+    const existing = this.read(projectId, workflowId);
+    if (existing === null
+      || existing.sessionId !== sessionId
+      || existing.generation !== previousWorkflowGeneration
+      || !ACTIVE_WORKFLOW_PHASES.has(existing.phase)
+      || existing.phase === "completed"
+      || existing.rootCommandId === rootCommandId
+      || triggeringEventPosition <= existing.triggeringEventPosition) {
+      throw new LifecycleError("EVENT_CONFLICT");
+    }
+    this.#faultInjector.hit(
+      "cancellation-rewrite",
+      "before-write",
+      {
+        projectId: projectId as LifecycleFaultContext["projectId"],
+        sessionId: sessionId as LifecycleFaultContext["sessionId"],
+        workflowId: workflowId as LifecycleFaultContext["workflowId"],
+        commandId: rootCommandId,
+        idempotencyKeyHash: null,
+        workId: null,
+        eventPosition: triggeringEventPosition.toString(),
+        materializationRevision: null,
+      },
+    );
+    const result = this.#connection.prepare(`
+      UPDATE workflow_instances
+      SET generation = $generation,
+          state = $restoredState,
+          phase = 'cancelled',
+          root_command_id = $rootCommandId,
+          result_json = $resultJson,
+          error_code = NULL,
+          updated_at = $now,
+          triggering_event_position = $triggeringEventPosition,
+          expected_authority_commitment = $authorityCommitment,
+          coordinator_owner_id = NULL,
+          coordinator_claim_token = NULL,
+          coordinator_claim_expires_at = NULL,
+          coordinator_attempt_count = 0,
+          coordinator_failure_class = NULL,
+          coordinator_error_code = NULL,
+          coordinator_next_attempt_at = NULL,
+          validation_attempt_plan_generation = NULL,
+          validation_attempt_plans_json = NULL,
+          evidence_frozen_checkpoint_event_position = NULL,
+          evidence_frozen_generation = NULL,
+          evidence_window_state = 'sealed',
+          final_ending_scope_bindings_json = NULL
+      WHERE project_id = $projectId
+        AND workflow_id = $workflowId
+        AND workflow_type = 'session-end'
+        AND session_id = $sessionId
+        AND generation = $previousGeneration
+        AND phase NOT IN ('cancelled', 'abandoned', 'completed')
+    `).run({
+      $generation: BigInt(workflowGenerationValue),
+      $restoredState: input.restoredState,
+      $rootCommandId: rootCommandId,
+      $resultJson: resultJson,
+      $now: now,
+      $triggeringEventPosition: triggeringEventPosition,
+      $authorityCommitment: input.expectedAuthorityCommitment,
+      $projectId: projectId,
+      $workflowId: workflowId,
+      $sessionId: sessionId,
+      $previousGeneration: BigInt(previousWorkflowGeneration),
+    } satisfies SqliteParams);
+    if (!changed(result)) throw new LifecycleError("EVENT_CONFLICT");
+  }
+
+  abandonGeneration(input: SessionEndWorkflowAbandonmentInputV1): void {
+    const projectId = workflowUuid(input.projectId, "projectId");
+    const workflowId = workflowUuid(input.workflowId, "workflowId");
+    const sessionId = workflowUuid(input.sessionId, "sessionId");
+    const generation = workflowGeneration(input.workflowGeneration, "workflowGeneration");
+    const rootCommandId = workflowUuid(input.rootCommandId, "rootCommandId");
+    const triggeringEventPosition = workflowInt64(
+      input.triggeringEventPosition,
+      "triggeringEventPosition",
+    );
+    if (typeof input.expectedAuthorityCommitment !== "string"
+      || !LOWER_HASH.test(input.expectedAuthorityCommitment)) {
+      workflowInputFailure("expectedAuthorityCommitment");
+    }
+    const resultJson = workflowJson(input.resultJson, "resultJson");
+    if (resultJson === null) workflowInputFailure("resultJson");
+    const now = workflowTimestamp(input.now, "now");
+    if (now === null) workflowInputFailure("now");
+    const existing = this.read(projectId, workflowId);
+    if (existing === null
+      || existing.sessionId !== sessionId
+      || existing.generation !== generation
+      || !ACTIVE_WORKFLOW_PHASES.has(existing.phase)
+      || existing.rootCommandId === rootCommandId
+      || triggeringEventPosition <= existing.triggeringEventPosition) {
+      throw new LifecycleError("EVENT_CONFLICT");
+    }
+    this.#faultInjector.hit(
+      "abandonment-rewrite",
+      "before-write",
+      {
+        projectId: projectId as LifecycleFaultContext["projectId"],
+        sessionId: sessionId as LifecycleFaultContext["sessionId"],
+        workflowId: workflowId as LifecycleFaultContext["workflowId"],
+        commandId: rootCommandId,
+        idempotencyKeyHash: null,
+        workId: null,
+        eventPosition: triggeringEventPosition.toString(),
+        materializationRevision: null,
+      },
+    );
+    const result = this.#connection.prepare(`
+      UPDATE workflow_instances
+      SET state = 'abandoned',
+          phase = 'abandoned',
+          root_command_id = $rootCommandId,
+          result_json = $resultJson,
+          error_code = NULL,
+          updated_at = $now,
+          triggering_event_position = $triggeringEventPosition,
+          expected_authority_commitment = $authorityCommitment,
+          coordinator_owner_id = NULL,
+          coordinator_claim_token = NULL,
+          coordinator_claim_expires_at = NULL,
+          coordinator_attempt_count = 0,
+          coordinator_failure_class = NULL,
+          coordinator_error_code = NULL,
+          coordinator_next_attempt_at = NULL,
+          validation_attempt_plan_generation = NULL,
+          validation_attempt_plans_json = NULL,
+          evidence_frozen_checkpoint_event_position = NULL,
+          evidence_frozen_generation = NULL,
+          evidence_window_state = 'sealed',
+          final_ending_scope_bindings_json = NULL
+      WHERE project_id = $projectId
+        AND workflow_id = $workflowId
+        AND workflow_type = 'session-end'
+        AND session_id = $sessionId
+        AND generation = $generation
+        AND phase NOT IN ('cancelled', 'abandoned', 'completed')
+    `).run({
+      $rootCommandId: rootCommandId,
+      $resultJson: resultJson,
+      $now: now,
+      $triggeringEventPosition: triggeringEventPosition,
+      $authorityCommitment: input.expectedAuthorityCommitment,
+      $projectId: projectId,
+      $workflowId: workflowId,
+      $sessionId: sessionId,
+      $generation: BigInt(generation),
     } satisfies SqliteParams);
     if (!changed(result)) throw new LifecycleError("EVENT_CONFLICT");
   }
@@ -1144,7 +1600,7 @@ export class SessionEndWorkflowRepository {
       FROM workflow_instances
       WHERE project_id = $projectId
         AND workflow_type = 'session-end'
-        AND state = 'active'
+        AND state IN ('active', 'suspended')
         AND session_id IS NOT NULL
         AND phase IN (${ACTIVE_PHASE_SQL})
         AND (coordinator_owner_id IS NULL OR coordinator_claim_expires_at <= $observedAt)
@@ -1189,7 +1645,7 @@ export class SessionEndWorkflowRepository {
         AND workflow_id = $workflowId
         AND workflow_type = 'session-end'
         AND generation = $workflowGeneration
-        AND state = 'active'
+        AND state IN ('active', 'suspended')
         AND session_id IS NOT NULL
         AND phase IN (${ACTIVE_PHASE_SQL})
         AND coordinator_attempt_count < $maxInt64
@@ -1275,12 +1731,20 @@ export class SessionEndWorkflowRepository {
     workflowTime(input.observedNowMs, "observedNowMs");
     if (!ACTIVE_WORKFLOW_PHASES.has(input.expectedPhase)
       || !SESSION_END_PHASES.includes(input.nextPhase)
-      || EVENTLESS_PHASE_TRANSITIONS.get(input.expectedPhase) !== input.nextPhase) {
+      || (EVENTLESS_PHASE_TRANSITIONS.get(input.expectedPhase) !== input.nextPhase
+        && `${input.expectedPhase}\u0000${input.nextPhase}` !== COMPLETED_MATERIALIZATION_TRANSITION)) {
       workflowInputFailure("phase");
+    }
+    const resultJson = input.resultJson === undefined
+      ? null
+      : workflowJson(input.resultJson, "resultJson");
+    if (input.resultJson !== undefined && resultJson === null) {
+      workflowInputFailure("resultJson");
     }
     const result = this.#connection.prepare(`
       UPDATE workflow_instances
       SET phase = $nextPhase,
+          result_json = COALESCE($resultJson, result_json),
           coordinator_owner_id = NULL,
           coordinator_claim_token = NULL,
           coordinator_claim_expires_at = NULL,
@@ -1297,12 +1761,234 @@ export class SessionEndWorkflowRepository {
       $workflowGeneration: BigInt(input.workflowGeneration),
       $expectedPhase: input.expectedPhase,
       $nextPhase: input.nextPhase,
+      $resultJson: resultJson,
       $ownerId: input.ownerId,
       $claimToken: input.claimToken,
       $updatedAt: workflowTime(input.observedNowMs, "observedNowMs"),
       $observedAt: workflowTime(input.observedNowMs, "observedNowMs"),
     });
     return changed(result);
+  }
+
+  advanceEventfulPhase(input: SessionEndWorkflowEventfulPhaseInputV1): boolean {
+    workflowUuid(input.projectId, "projectId");
+    workflowUuid(input.workflowId, "workflowId");
+    workflowGeneration(input.workflowGeneration, "workflowGeneration");
+    workflowOwner(input.ownerId, "ownerId");
+    workflowInt64(input.claimToken, "claimToken");
+    workflowInt64(input.eventPosition, "eventPosition");
+    const now = workflowTimestamp(input.now, "now");
+    if (now === null) workflowInputFailure("now");
+    if (!ACTIVE_WORKFLOW_PHASES.has(input.expectedPhase)
+      || !SESSION_END_PHASES.includes(input.nextPhase)
+      || !EVENTFUL_PHASE_TRANSITIONS.has(`${input.expectedPhase}\u0000${input.nextPhase}`)) {
+      workflowInputFailure("phase");
+    }
+    const resultJson = workflowJson(input.resultJson, "resultJson");
+    if (resultJson === null) workflowInputFailure("resultJson");
+    const result = this.#connection.prepare(`
+      UPDATE workflow_instances
+      SET phase = $nextPhase,
+          result_json = $resultJson,
+          coordinator_owner_id = NULL,
+          coordinator_claim_token = NULL,
+          coordinator_claim_expires_at = NULL,
+          updated_at = $updatedAt
+      WHERE project_id = $projectId AND workflow_id = $workflowId
+        AND workflow_type = 'session-end' AND generation = $workflowGeneration
+        AND phase = $expectedPhase
+        AND coordinator_owner_id = $ownerId
+        AND coordinator_claim_token = $claimToken
+        AND coordinator_claim_expires_at > $observedAt
+    `).run({
+      $projectId: input.projectId,
+      $workflowId: input.workflowId,
+      $workflowGeneration: BigInt(input.workflowGeneration),
+      $expectedPhase: input.expectedPhase,
+      $nextPhase: input.nextPhase,
+      $resultJson: resultJson,
+      $ownerId: input.ownerId,
+      $claimToken: input.claimToken,
+      $updatedAt: now,
+      $observedAt: now,
+    });
+    return changed(result);
+  }
+
+  /** Read-only recovery inventory.  Claim ownership stays with the
+   * operational store; this method only reports bounded due work. */
+  recover(input: SessionEndWorkflowRecoveryInputV1): SessionEndWorkflowRecoveryResultV1 {
+    const projectId = workflowUuid(input.projectId, "projectId");
+    const dueBefore = workflowTimestamp(input.dueBefore, "dueBefore");
+    if (dueBefore === null) workflowInputFailure("dueBefore");
+    if (!Number.isSafeInteger(input.limit) || input.limit < 1 || input.limit > 1_000) {
+      workflowInputFailure("limit");
+    }
+    const count = (sql: string, params: SqliteParams): number => {
+      const row = this.#connection.prepare(sql).get(params);
+      if (row === undefined || typeof row.count !== "bigint"
+        || row.count < 0n || row.count > BigInt(Number.MAX_SAFE_INTEGER)) {
+        throw new LifecycleError("INTEGRITY_FAILURE");
+      }
+      return Math.min(Number(row.count), input.limit);
+    };
+    const workflowCandidateCount = count(`
+      SELECT count(*) AS count
+      FROM workflow_instances
+      WHERE project_id = $projectId
+        AND workflow_type = 'session-end'
+        AND state IN ('active', 'suspended')
+        AND phase IN (${ACTIVE_PHASE_SQL})
+        AND (
+          coordinator_owner_id IS NULL
+          OR coordinator_claim_expires_at <= $dueBefore
+          OR coordinator_next_attempt_at IS NULL
+          OR coordinator_next_attempt_at <= $dueBefore
+        )
+    `, { $projectId: projectId, $dueBefore: dueBefore });
+    const outboxCandidateCount = count(`
+      SELECT count(*) AS count
+      FROM outbox
+      WHERE project_id = $projectId
+        AND status IN ('pending', 'failed')
+        AND (next_attempt_at IS NULL OR next_attempt_at <= $dueBefore)
+    `, { $projectId: projectId, $dueBefore: dueBefore });
+    const endingSessionCount = count(`
+      SELECT count(*) AS count
+      FROM session_authority
+      WHERE project_id = $projectId
+        AND session_kind = 'root'
+        AND semantic_state = 'ending'
+        AND terminal_event_position IS NULL
+    `, { $projectId: projectId });
+    const expiredRootLeaseCount = count(`
+      SELECT count(*) AS count
+      FROM session_leases
+      WHERE project_id = $projectId
+        AND session_id IN (
+          SELECT session_id FROM session_authority
+          WHERE project_id = $projectId AND session_kind = 'root'
+        )
+        AND expires_at <= $dueBefore
+    `, { $projectId: projectId, $dueBefore: dueBefore });
+    return Object.freeze({
+      resultVersion: 1,
+      integrityOk: true,
+      readOnly: true,
+      workflowCandidateCount,
+      outboxCandidateCount,
+      endingSessionCount,
+      expiredRootLeaseCount,
+      invariantFailureCodes: Object.freeze([]),
+    });
+  }
+
+  recordFinalCheckpoint(input: SessionEndWorkflowFinalCheckpointInputV1): void {
+    const projectId = workflowUuid(input.projectId, "projectId");
+    const workflowId = workflowUuid(input.workflowId, "workflowId");
+    const sessionId = workflowUuid(input.sessionId, "sessionId");
+    const generation = workflowGeneration(input.workflowGeneration, "workflowGeneration");
+    const rootCommandId = workflowUuid(input.rootCommandId, "rootCommandId");
+    const ownerId = workflowOwner(input.ownerId, "ownerId");
+    const claimToken = workflowInt64(input.claimToken, "claimToken");
+    const checkpointId = workflowUuid(input.checkpointId, "checkpointId");
+    const checkpointEventPosition = workflowInt64(
+      input.checkpointEventPosition,
+      "checkpointEventPosition",
+    );
+    if (typeof input.checkpointFingerprint !== "string"
+      || !LOWER_HASH.test(input.checkpointFingerprint)) {
+      workflowInputFailure("checkpointFingerprint");
+    }
+    const finalEndingScopeBindingsJson = workflowJson(
+      input.finalEndingScopeBindingsJson,
+      "finalEndingScopeBindingsJson",
+    );
+    if (finalEndingScopeBindingsJson === null) {
+      workflowInputFailure("finalEndingScopeBindingsJson");
+    }
+    try {
+      const parsed = JSON.parse(finalEndingScopeBindingsJson) as unknown;
+      decodeFinalEndingScopeBindingsV1(parsed);
+    } catch (error) {
+      if (error instanceof LifecycleError) throw error;
+      workflowInputFailure("finalEndingScopeBindingsJson");
+    }
+    const resultJson = workflowJson(input.resultJson, "resultJson");
+    if (resultJson === null) workflowInputFailure("resultJson");
+    const now = workflowTimestamp(input.now, "now");
+    if (now === null) workflowInputFailure("now");
+    const existing = this.read(projectId, workflowId);
+    if (existing === null
+      || existing.sessionId !== sessionId
+      || existing.generation !== generation
+      || existing.phase !== "children-resolved"
+      || existing.evidenceWindowState !== "sealed"
+      || existing.evidenceFrozenCheckpointEventPosition !== null
+      || existing.evidenceFrozenGeneration !== null
+      || existing.finalEndingScopeBindingsJson !== null
+      || existing.coordinatorOwnerId !== ownerId
+      || existing.coordinatorClaimToken !== claimToken
+      || existing.coordinatorClaimExpiresAt === null
+      || Date.parse(existing.coordinatorClaimExpiresAt) <= Date.parse(now)) {
+      throw new LifecycleError("EVENT_CONFLICT");
+    }
+    this.#faultInjector.hit(
+      "final-checkpoint",
+      "before-write",
+      {
+        projectId: projectId as LifecycleFaultContext["projectId"],
+        sessionId: sessionId as LifecycleFaultContext["sessionId"],
+        workflowId: workflowId as LifecycleFaultContext["workflowId"],
+        commandId: rootCommandId,
+        idempotencyKeyHash: null,
+        workId: null,
+        eventPosition: checkpointEventPosition.toString(),
+        materializationRevision: null,
+      },
+    );
+    const result = this.#connection.prepare(`
+      UPDATE workflow_instances
+      SET phase = 'final-checkpoint-recorded',
+          root_command_id = $rootCommandId,
+          result_json = $resultJson,
+          error_code = NULL,
+          updated_at = $now,
+          triggering_event_position = $checkpointEventPosition,
+          coordinator_owner_id = NULL,
+          coordinator_claim_token = NULL,
+          coordinator_claim_expires_at = NULL,
+          evidence_frozen_checkpoint_event_position = $checkpointEventPosition,
+          evidence_frozen_generation = $generation,
+          evidence_window_state = 'sealed',
+          final_ending_scope_bindings_json = $finalEndingScopeBindingsJson
+      WHERE project_id = $projectId
+        AND workflow_id = $workflowId
+        AND workflow_type = 'session-end'
+        AND session_id = $sessionId
+        AND generation = $generation
+        AND phase = 'children-resolved'
+        AND coordinator_owner_id = $ownerId
+        AND coordinator_claim_token = $claimToken
+        AND coordinator_claim_expires_at > $now
+        AND evidence_frozen_checkpoint_event_position IS NULL
+        AND evidence_frozen_generation IS NULL
+        AND final_ending_scope_bindings_json IS NULL
+    `).run({
+      $projectId: projectId,
+      $workflowId: workflowId,
+      $sessionId: sessionId,
+      $generation: BigInt(generation),
+      $rootCommandId: rootCommandId,
+      $ownerId: ownerId,
+      $claimToken: claimToken,
+      $checkpointEventPosition: checkpointEventPosition,
+      $resultJson: resultJson,
+      $now: now,
+      $finalEndingScopeBindingsJson: finalEndingScopeBindingsJson,
+    } satisfies SqliteParams);
+    if (!changed(result)) throw new LifecycleError("EVENT_CONFLICT");
+    void checkpointId;
   }
 
   readPersistedValidationAttemptPlansV1(
