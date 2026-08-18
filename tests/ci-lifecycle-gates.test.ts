@@ -32,19 +32,46 @@ function workflowJobs(yaml: string): ReadonlyMap<string, string> {
   return jobs;
 }
 
-function workflowSteps(job: string): readonly { readonly name: string; readonly body: string }[] {
-  return [...job.matchAll(/^      - name: (.+)\n([\s\S]*?)(?=^      - name:|^  [a-z][a-z0-9_-]*:|(?![\s\S]))/gm)]
-    .map((match) => ({ name: match[1]!, body: match[2]! }));
+interface WorkflowStep {
+  readonly name: string | null;
+  readonly body: string;
 }
 
-function requiredStep(job: string, name: string): string {
+function workflowSteps(job: string): readonly WorkflowStep[] {
+  return [...job.matchAll(/^      -(?<first>[^\n]*)(?:\n|$)(?<rest>[\s\S]*?)(?=^      -|^  [a-z][a-z0-9_-]*:|(?![\s\S]))/gm)]
+    .map((match) => {
+      const first = match.groups?.first ?? "";
+      const name = /^ name: (.+)$/.exec(first)?.[1] ?? null;
+      return { name, body: `${first}\n${match.groups?.rest ?? ""}` };
+    });
+}
+
+function assertReachable(block: string, label: string): void {
+  assert.doesNotMatch(
+    block,
+    /^\s*if:\s*(?:false|(?:always\(\)\s*&&\s*)?false|\$\{\{[^\n}]*?(?:\bfalse\b|\b0\b|1\s*==\s*2)[^\n}]*?\}\})\s*(?:#.*)?$/mi,
+    `${label} must not be disabled`,
+  );
+}
+
+function requiredStep(job: string, name: string): WorkflowStep {
   const step = workflowSteps(job).find((candidate) => candidate.name === name);
   assert.ok(step, `missing executable ${name} step`);
-  return step.body;
+  assertReachable(step.body, name);
+  return step;
 }
 
-function uploadSteps(job: string): readonly { readonly name: string; readonly body: string }[] {
-  return workflowSteps(job).filter((step) => /\n        uses: actions\/upload-artifact@/.test(step.body));
+function workflowActions(job: string): readonly {
+  readonly step: WorkflowStep;
+  readonly uses: string;
+  readonly withPath: string | null;
+}[] {
+  return workflowSteps(job).flatMap((step) => [...step.body.matchAll(/(?:^|\n)\s*uses:\s*([^\s#]+)/g)]
+    .map((match) => ({
+      step,
+      uses: match[1]!,
+      withPath: /^\s*path:\s*(.+)$/mi.exec(step.body)?.[1] ?? null,
+    })));
 }
 
 test("release configuration gates lifecycle V2 without production routing", () => {
@@ -70,6 +97,9 @@ test("release configuration gates lifecycle V2 without production routing", () =
   assert.ok(releaseGates, "CI must have a release-gates job");
   assert.ok(minimumRuntime, "CI must retain the minimum-runtime rejection job");
   assert.ok(stressJob, "stress workflow must have a stress job");
+  assertReachable(releaseGates!, "release-gates job");
+  assertReachable(minimumRuntime!, "minimum-runtime-rejection job");
+  assertReachable(stressJob!, "stress job");
   const checkouts = [...ciJobs.values(), ...stressJobs.values()]
     .flatMap(workflowSteps)
     .filter((step) => step.name === "Check out repository");
@@ -77,23 +107,33 @@ test("release configuration gates lifecycle V2 without production routing", () =
   for (const checkout of checkouts) {
     assert.match(checkout.body, /uses: actions\/checkout@v6\n        with:\n          fetch-depth: 0/);
   }
-  assert.match(requiredStep(releaseGates!, "Run lifecycle release gates"), /run: npm run test:subproject-2/);
-  assert.match(requiredStep(releaseGates!, "Require immutable lifecycle base commit"), new RegExp(`run: git cat-file -e "${BASE}\\^\\{commit\\}"`));
-  assert.match(requiredStep(releaseGates!, "Protect Version 1 production routing"), new RegExp(`run: git diff --exit-code ${BASE} -- src/app\\.ts src/index\\.ts src/controllers src/schemas src/services`));
-  assert.match(requiredStep(releaseGates!, "Build"), /run: npm run build/);
-  assert.match(requiredStep(releaseGates!, "Test build artifacts"), /run: npm run test:build-artifacts/);
+  assert.match(requiredStep(releaseGates!, "Run lifecycle release gates").body, /run: npm run test:subproject-2/);
+  assert.match(requiredStep(releaseGates!, "Require immutable lifecycle base commit").body, new RegExp(`run: git cat-file -e "${BASE}\\^\\{commit\\}"`));
+  assert.match(requiredStep(releaseGates!, "Protect Version 1 production routing").body, new RegExp(`run: git diff --exit-code ${BASE} -- src/app\\.ts src/index\\.ts src/controllers src/schemas src/services`));
+  assert.match(requiredStep(releaseGates!, "Build").body, /run: npm run build/);
+  assert.match(requiredStep(releaseGates!, "Test build artifacts").body, /run: npm run test:build-artifacts/);
   assert.equal(workflowSteps(minimumRuntime!).filter((step) => step.name === "Check out repository").length, 1);
   assert.match(stressJob!, /max-parallel: 1/);
-  assert.match(requiredStep(stressJob!, "Run default and lifecycle concurrent, crash, and security tests"), /event-store\.concurrent\.test\.js.*event-store\.crash\.test\.js.*lifecycle\.concurrent\.test\.js.*lifecycle\.crash\.test\.js.*lifecycle\.security\.test\.js/s);
-  assert.match(requiredStep(stressJob!, "Run release stress test"), /npm run test:stress/);
-  assert.match(requiredStep(stressJob!, "Run lifecycle stress test"), /npm run test:lifecycle-stress/);
-  const uploads = [...ciJobs.values(), ...stressJobs.values()].flatMap(uploadSteps);
+  assert.match(requiredStep(stressJob!, "Run default and lifecycle concurrent, crash, and security tests").body, /event-store\.concurrent\.test\.js.*event-store\.crash\.test\.js.*lifecycle\.concurrent\.test\.js.*lifecycle\.crash\.test\.js.*lifecycle\.security\.test\.js/s);
+  assert.match(requiredStep(stressJob!, "Run release stress test").body, /npm run test:stress/);
+  assert.match(requiredStep(stressJob!, "Run lifecycle stress test").body, /npm run test:lifecycle-stress/);
+  const actions = [...ciJobs.values(), ...stressJobs.values()].flatMap(workflowActions);
+  for (const action of actions) {
+    assert.ok(action.uses.length > 0, "workflow action must have an executable uses value");
+    if (action.withPath !== null) {
+      assert.doesNotMatch(action.withPath, /\*\.sqlite\*|\.memory-mcp|pending[-_ ]?(authorization|credential)|\.md\b/i);
+    }
+  }
+  const uploads = actions
+    .filter((action) => action.uses.startsWith("actions/upload-artifact@"));
   assert.equal(uploads.length, 1, "only the stress job may upload an artifact");
   const [upload] = uploads;
-  assert.equal(upload?.name, "Upload stress logs");
-  assert.match(upload?.body ?? "", /path: ci-logs\/sqlite-stress-\$\{\{ matrix\.os \}\}\.log/);
-  assert.match(upload?.body ?? "", /retention-days: 14/);
-  assert.doesNotMatch(upload?.body ?? "", /\*\.sqlite\*|\.memory-mcp|pending[-_ ]?(authorization|credential)|\.md\b/i);
+  assert.equal(upload?.step.name, "Upload stress logs");
+  assert.equal(upload?.uses, "actions/upload-artifact@v7");
+  const uploadPath = upload?.withPath;
+  assert.equal(uploadPath, "ci-logs/sqlite-stress-${{ matrix.os }}.log");
+  assert.match(upload?.step.body ?? "", /retention-days: 14/);
+  assert.doesNotMatch(uploadPath ?? "", /\*\.sqlite\*|\.memory-mcp|pending[-_ ]?(authorization|credential)|\.md\b/i);
 
   const smoke = source("scripts/smoke-worker.js");
   assert.match(smoke, /\[1,2,3,4,5\]/);
@@ -107,6 +147,10 @@ test("release configuration gates lifecycle V2 without production routing", () =
     "both frozen migration values must be in one executable gate",
   );
   assert.match(smoke, new RegExp(SCHEMA_TWO_PROVENANCE));
+  assert.match(smoke, /execFileSync\("git", \["show",/);
+  assert.match(smoke, /HISTORICAL_SCHEMA_TWO_READER_PROVENANCE\.sourceSha256/);
+  assert.match(smoke, /workerData\.registry/);
+  assert.match(smoke, /historicalSchemaTwoRegistry/);
   assert.match(smoke, /verifyRecordedMigrationPrefix/);
   assert.match(smoke, /setTimeout\(/);
   assert.match(smoke, /reader\.off\("message"/);

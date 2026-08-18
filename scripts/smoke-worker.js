@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { execFileSync } from "node:child_process";
 import {
   mkdirSync,
   mkdtempSync,
@@ -30,7 +31,19 @@ const HISTORICAL_SCHEMA_TWO_READER_PROVENANCE = Object.freeze({
   sourcePath: "src/orchestrator/storage/schema-compatibility.ts",
   sourceSha256: "3523c39c117309d6d7a6e0f0b0a5e0a00631e7f44df55927c146f519bdf5972a",
 });
-const FROZEN_SCHEMA_TWO_READER_ARTIFACT_SHA256 = "319fcf007c23add75641dc1e82940cee3b020ffad189c932a58b4ea078a346ce";
+const HISTORICAL_SCHEMA_TWO_MIGRATIONS = Object.freeze([
+  Object.freeze({
+    version: 1,
+    name: "event-core",
+    sourcePath: "src/orchestrator/storage/migrations/0001-event-core.ts",
+  }),
+  Object.freeze({
+    version: 2,
+    name: "session-lifecycle",
+    sourcePath: "src/orchestrator/storage/migrations/0002-session-lifecycle.ts",
+  }),
+]);
+const FROZEN_SCHEMA_TWO_READER_ARTIFACT_SHA256 = "e3d5f2e12320cfc81821ab937fbabd49f2d3ef231f93822971791a7a90e1ec45";
 const HISTORICAL_SCHEMA_TWO_READER_ARTIFACT = `
 const { parentPort, workerData } = require("node:worker_threads");
 const { createHash } = require("node:crypto");
@@ -87,10 +100,11 @@ function verifyRecordedMigrationPrefix(recorded, registry) {
   }
 }
 
-const PROJECT_STORE_MIGRATIONS = Object.freeze([
-  { version: 1, name: "event-core", sql: "historical-schema-two-prefix" },
-  { version: 2, name: "session-lifecycle", sql: "historical-schema-two-prefix" },
-]);
+const PROJECT_STORE_MIGRATIONS = Object.freeze(workerData.registry.map((migration) => Object.freeze({
+  version: migration.version,
+  name: migration.name,
+  sql: migration.sql,
+})));
 const database = new DatabaseSync(workerData.eventsPath, { readOnly: true });
 let decodeInvocations = 0;
 try {
@@ -267,24 +281,36 @@ function lifecycleRowCounts(eventsPath) {
   }
 }
 
-async function assertOldSchemaTwoReaderRejectsBeforeEventDecode(eventsPath) {
+function verifyHistoricalSchemaTwoReaderArtifact() {
   const sourceHash = createHash("sha256")
     .update(HISTORICAL_SCHEMA_TWO_READER_ARTIFACT, "utf8")
     .digest("hex");
   if (sourceHash !== FROZEN_SCHEMA_TWO_READER_ARTIFACT_SHA256) {
     throw new Error("Frozen historical schema-2 reader artifact checksum changed");
   }
+}
+
+async function runHistoricalSchemaTwoReader(eventsPath, registry) {
   const reader = new Worker(HISTORICAL_SCHEMA_TWO_READER_ARTIFACT, {
     eval: true,
-    workerData: { eventsPath },
+    workerData: { eventsPath, registry },
   });
   try {
-    const result = await waitForHistoricalSchemaTwoReader(reader);
-    if (result?.code !== "SCHEMA_TOO_NEW" || result.decodeInvocations !== 0) {
-      throw new Error("Old schema-2 reader must report SCHEMA_TOO_NEW before lifecycle-event decoding");
-    }
+    return await waitForHistoricalSchemaTwoReader(reader);
   } finally {
     await reader.terminate().catch(() => undefined);
+  }
+}
+
+async function assertHistoricalSchemaTwoReaderCompatibility(schemaTwoEventsPath, schemaFiveEventsPath, registry) {
+  verifyHistoricalSchemaTwoReaderArtifact();
+  const schemaTwo = await runHistoricalSchemaTwoReader(schemaTwoEventsPath, registry);
+  if (schemaTwo?.code !== "OK" || schemaTwo.decodeInvocations !== 0) {
+    throw new Error("Historical schema-2 reader must accept a valid schema-2 store");
+  }
+  const schemaFive = await runHistoricalSchemaTwoReader(schemaFiveEventsPath, registry);
+  if (schemaFive?.code !== "SCHEMA_TOO_NEW" || schemaFive.decodeInvocations !== 0) {
+    throw new Error("Old schema-2 reader must report SCHEMA_TOO_NEW before lifecycle-event decoding");
   }
 }
 
@@ -321,6 +347,38 @@ function canonicalJson(value) {
   )).join(",")}}`;
 }
 
+function historicalGitShow(sourcePath) {
+  try {
+    return execFileSync("git", ["show", `${HISTORICAL_SCHEMA_TWO_READER_PROVENANCE.commit}:${sourcePath}`]);
+  } catch {
+    throw new Error("Historical schema-2 provenance is unavailable");
+  }
+}
+
+function historicalMigrationFromSource(sourcePath, expectedVersion, expectedName) {
+  const source = historicalGitShow(sourcePath).toString("utf8");
+  const match = /version:\s*(\d+),\s*\n\s*name:\s*"([^"]+)",\s*\n\s*sql:\s*`([\s\S]*?)`,\s*\n};/.exec(source);
+  if (match === null || Number(match[1]) !== expectedVersion || match[2] !== expectedName) {
+    throw new Error("Historical schema-2 migration provenance is invalid");
+  }
+  return Object.freeze({
+    version: expectedVersion,
+    name: expectedName,
+    sql: match[3],
+    checksum: createHash("sha256").update(match[3], "utf8").digest("hex"),
+  });
+}
+
+function historicalSchemaTwoRegistry() {
+  const sourceBytes = historicalGitShow(HISTORICAL_SCHEMA_TWO_READER_PROVENANCE.sourcePath);
+  const sourceHash = createHash("sha256").update(sourceBytes).digest("hex");
+  if (sourceHash !== HISTORICAL_SCHEMA_TWO_READER_PROVENANCE.sourceSha256) {
+    throw new Error("Historical schema-2 compatibility source checksum changed");
+  }
+  return Object.freeze(HISTORICAL_SCHEMA_TWO_MIGRATIONS.map((migration) =>
+    historicalMigrationFromSource(migration.sourcePath, migration.version, migration.name)));
+}
+
 function eventCoreSql() {
   const source = readFileSync(
     new URL("../src/orchestrator/storage/migrations/0001-event-core.ts", import.meta.url),
@@ -331,7 +389,7 @@ function eventCoreSql() {
   return match[1];
 }
 
-function createUpgradeFixture() {
+function createUpgradeFixture(historicalRegistry) {
   const root = realpathSync.native(mkdtempSync(join(tmpdir(), "memory-build-upgrade-")));
   const projectRoot = join(root, "project");
   const vaultRoot = join(projectRoot, "memory");
@@ -387,6 +445,43 @@ function createUpgradeFixture() {
     database.close();
   }
 
+  const schemaTwoEventsPath = join(storeRoot, "historical-schema-two.sqlite");
+  const schemaTwo = new DatabaseSync(schemaTwoEventsPath);
+  try {
+    const [eventCore, sessionLifecycle] = historicalRegistry;
+    if (eventCore === undefined || sessionLifecycle === undefined) {
+      throw new Error("Historical schema-2 registry is incomplete");
+    }
+    schemaTwo.exec(`
+      PRAGMA journal_mode = WAL;
+      PRAGMA synchronous = FULL;
+      PRAGMA application_id = ${PROJECT_MEMORY_APPLICATION_ID};
+    `);
+    schemaTwo.exec(eventCore.sql);
+    schemaTwo.prepare(`
+      INSERT INTO schema_migrations(version, name, checksum, applied_at)
+      VALUES (?, ?, ?, ?)
+    `).run(eventCore.version, eventCore.name, eventCore.checksum, NOW);
+    schemaTwo.prepare(`
+      INSERT INTO project_meta(
+        singleton, project_id, vault_id, store_id, schema_version, created_at
+      ) VALUES (1, ?, ?, ?, 1, ?)
+    `).run(PROJECT_ID, VAULT_ID, STORE_ID, NOW);
+    schemaTwo.exec(`
+      INSERT INTO maintenance_state(
+        singleton, epoch, mode, owner_id, fencing_token, lease_expires_at, requested_at
+      ) VALUES (1, 0, 'idle', NULL, 0, NULL, NULL)
+    `);
+    schemaTwo.exec(sessionLifecycle.sql);
+    schemaTwo.prepare(`
+      INSERT INTO schema_migrations(version, name, checksum, applied_at)
+      VALUES (?, ?, ?, ?)
+    `).run(sessionLifecycle.version, sessionLifecycle.name, sessionLifecycle.checksum, NOW);
+    schemaTwo.prepare("UPDATE project_meta SET schema_version = 2 WHERE singleton = 1").run();
+  } finally {
+    schemaTwo.close();
+  }
+
   const workspace = {
     kind: "non-git",
     workspaceRoot: projectRoot,
@@ -414,6 +509,7 @@ function createUpgradeFixture() {
   return {
     root,
     eventsPath: storeRoute.eventsPath,
+    schemaTwoEventsPath,
     manifestPath: storeRoute.storeManifestPath,
     binding: {
       projectId: PROJECT_ID,
@@ -455,7 +551,8 @@ function decodeUpgrade(value) {
 }
 
 async function smokeBundledUpgrade() {
-  const fixture = createUpgradeFixture();
+  const historicalRegistry = historicalSchemaTwoRegistry();
+  const fixture = createUpgradeFixture(historicalRegistry);
   const worker = new Worker(WORKER_URL, {
     workerData: { role: "upgrade", binding: fixture.binding },
   });
@@ -540,7 +637,11 @@ async function smokeBundledUpgrade() {
     if (manifest.schemaVersion !== 1) {
       throw new Error("Bundled upgrade did not preserve manifest format version 1");
     }
-    await assertOldSchemaTwoReaderRejectsBeforeEventDecode(fixture.eventsPath);
+    await assertHistoricalSchemaTwoReaderCompatibility(
+      fixture.schemaTwoEventsPath,
+      fixture.eventsPath,
+      historicalRegistry,
+    );
 
     const storeWorker = new Worker(WORKER_URL, {
       workerData: {
