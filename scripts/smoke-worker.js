@@ -25,23 +25,87 @@ const STORE_ID = "33333333-3333-4333-8333-333333333333";
 const WORKSPACE_ID = "build-artifact-smoke-workspace";
 const FROZEN_0002_SHA256 = "68B4039048A359C523B7842F6D17BAA5760E9760D2B4E9F80BB8A48DC339EB06";
 const FROZEN_0002_SQL_SHA256 = "85666a0bdee4455068f03a81e9d3720df172d15fce6d8e6f0cb3f5f7d0a81293";
-const FROZEN_SCHEMA_TWO_READER_SHA256 = "570c7130332e89ce55891c72fc1d97b87d8a5c55fb4dfa59f46247b802a90d1a";
-const OLD_SCHEMA_TWO_READER_SOURCE = `
+const HISTORICAL_SCHEMA_TWO_READER_PROVENANCE = Object.freeze({
+  commit: "866bb0d22ac4225b8a06db9e528a9eaed847c02c",
+  sourcePath: "src/orchestrator/storage/schema-compatibility.ts",
+  sourceSha256: "3523c39c117309d6d7a6e0f0b0a5e0a00631e7f44df55927c146f519bdf5972a",
+});
+const FROZEN_SCHEMA_TWO_READER_ARTIFACT_SHA256 = "319fcf007c23add75641dc1e82940cee3b020ffad189c932a58b4ea078a346ce";
+const HISTORICAL_SCHEMA_TWO_READER_ARTIFACT = `
 const { parentPort, workerData } = require("node:worker_threads");
+const { createHash } = require("node:crypto");
 const { DatabaseSync } = require("node:sqlite");
+
+class SchemaCompatibilityError extends Error {
+  constructor(code) {
+    super(code);
+    this.code = code;
+  }
+}
+
+function fail(code) {
+  throw new SchemaCompatibilityError(code);
+}
+
+function migrationChecksum(migration) {
+  return createHash("sha256").update(migration.sql, "utf8").digest("hex");
+}
+
+function numeric(value) {
+  if (typeof value !== "number" && typeof value !== "bigint") return undefined;
+  const result = Number(value);
+  return Number.isSafeInteger(result) ? result : undefined;
+}
+
+function tableExists(connection, name) {
+  return numeric(connection.prepare("SELECT count(*) AS count FROM sqlite_schema WHERE type = 'table' AND name = $name").get({ $name: name })?.count) === 1;
+}
+
+function readRecordedMigrations(connection) {
+  if (!tableExists(connection, "schema_migrations")) return [];
+  return connection.prepare("SELECT version, name, checksum FROM schema_migrations ORDER BY version").all().map((row) => {
+    const version = numeric(row.version);
+    if (version === undefined || version <= 0 || typeof row.name !== "string" || typeof row.checksum !== "string") {
+      fail("MIGRATION_CHECKSUM_MISMATCH");
+    }
+    return { version, name: row.name, checksum: row.checksum };
+  });
+}
+
+function verifyRecordedMigrationPrefix(recorded, registry) {
+  const targetVersion = registry.length;
+  if (recorded.some((row) => row.version > targetVersion)) fail("SCHEMA_TOO_NEW");
+  for (const [index, row] of recorded.entries()) {
+    const expected = registry[index];
+    if (
+      expected === undefined
+      || row.version !== index + 1
+      || row.version !== expected.version
+      || row.name !== expected.name
+      || row.checksum !== migrationChecksum(expected)
+    ) fail("MIGRATION_CHECKSUM_MISMATCH");
+  }
+}
+
+const PROJECT_STORE_MIGRATIONS = Object.freeze([
+  { version: 1, name: "event-core", sql: "historical-schema-two-prefix" },
+  { version: 2, name: "session-lifecycle", sql: "historical-schema-two-prefix" },
+]);
 const database = new DatabaseSync(workerData.eventsPath, { readOnly: true });
 let decodeInvocations = 0;
 try {
-  const versions = database.prepare("SELECT version FROM schema_migrations ORDER BY version").all();
-  if (versions.some((row) => Number(row.version) > 2)) {
-    parentPort.postMessage({ code: "SCHEMA_TOO_NEW", decodeInvocations });
-  } else {
-    for (const event of database.prepare("SELECT event_type, event_schema_version FROM events").all()) {
-      decodeInvocations += 1;
-      void event;
-    }
-    parentPort.postMessage({ code: "OK", decodeInvocations });
+  const recorded = readRecordedMigrations(database);
+  verifyRecordedMigrationPrefix(recorded, PROJECT_STORE_MIGRATIONS);
+  for (const event of database.prepare("SELECT event_type, event_schema_version FROM events").all()) {
+    decodeInvocations += 1;
+    void event;
   }
+  parentPort.postMessage({ code: "OK", decodeInvocations });
+} catch (error) {
+  parentPort.postMessage({
+    code: error instanceof SchemaCompatibilityError ? error.code : "STORE_UNAVAILABLE",
+    decodeInvocations,
+  });
 } finally {
   database.close();
 }
@@ -204,26 +268,49 @@ function lifecycleRowCounts(eventsPath) {
 }
 
 async function assertOldSchemaTwoReaderRejectsBeforeEventDecode(eventsPath) {
-  const sourceHash = createHash("sha256").update(OLD_SCHEMA_TWO_READER_SOURCE, "utf8").digest("hex");
-  if (sourceHash !== FROZEN_SCHEMA_TWO_READER_SHA256) {
-    throw new Error("Frozen schema-2 reader fixture checksum changed");
+  const sourceHash = createHash("sha256")
+    .update(HISTORICAL_SCHEMA_TWO_READER_ARTIFACT, "utf8")
+    .digest("hex");
+  if (sourceHash !== FROZEN_SCHEMA_TWO_READER_ARTIFACT_SHA256) {
+    throw new Error("Frozen historical schema-2 reader artifact checksum changed");
   }
-  const reader = new Worker(OLD_SCHEMA_TWO_READER_SOURCE, {
+  const reader = new Worker(HISTORICAL_SCHEMA_TWO_READER_ARTIFACT, {
     eval: true,
     workerData: { eventsPath },
   });
   try {
-    const result = await new Promise((resolve, reject) => {
-      reader.once("message", resolve);
-      reader.once("error", reject);
-      reader.once("messageerror", () => reject(new Error("Old schema-2 reader emitted unreadable output")));
-    });
+    const result = await waitForHistoricalSchemaTwoReader(reader);
     if (result?.code !== "SCHEMA_TOO_NEW" || result.decodeInvocations !== 0) {
       throw new Error("Old schema-2 reader must report SCHEMA_TOO_NEW before lifecycle-event decoding");
     }
   } finally {
     await reader.terminate().catch(() => undefined);
   }
+}
+
+function waitForHistoricalSchemaTwoReader(reader) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = (callback, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      reader.off("message", onMessage);
+      reader.off("messageerror", onMessageError);
+      reader.off("error", onError);
+      callback(value);
+    };
+    const onMessage = (value) => finish(resolve, value);
+    const onMessageError = () => finish(reject, new Error("Old schema-2 reader emitted unreadable output"));
+    const onError = (error) => finish(reject, error);
+    const timer = setTimeout(
+      () => finish(reject, new Error("Old schema-2 reader timed out")),
+      REQUEST_TIMEOUT_MS,
+    );
+    reader.on("message", onMessage);
+    reader.on("messageerror", onMessageError);
+    reader.on("error", onError);
+  });
 }
 
 function canonicalJson(value) {
