@@ -80,6 +80,79 @@ function workflowPhase(eventsPath: string): string {
   }
 }
 
+function workflowGenerationState(eventsPath: string): {
+  readonly generation: string;
+  readonly phase: string;
+  readonly evidenceWindowState: string;
+  readonly frozenGeneration: string;
+  readonly frozenPosition: string;
+  readonly finalEndingScopeBindingsJson: string;
+  readonly validationPlanGeneration: string | null;
+} {
+  const database = new DatabaseSync(eventsPath, { readOnly: true });
+  try {
+    const row = database.prepare(`
+      SELECT generation,
+        phase,
+        evidence_window_state AS evidenceWindowState,
+        evidence_frozen_generation AS frozenGeneration,
+        evidence_frozen_checkpoint_event_position AS frozenPosition,
+        final_ending_scope_bindings_json AS finalEndingScopeBindingsJson,
+        validation_attempt_plan_generation AS validationPlanGeneration
+      FROM workflow_instances
+      WHERE workflow_type = 'session-end'
+    `).get() as Record<string, unknown> | undefined;
+    assert.ok(row);
+    const phase = row.phase;
+    const evidenceWindowState = row.evidenceWindowState;
+    const finalEndingScopeBindingsJson = row.finalEndingScopeBindingsJson;
+    if (typeof phase !== "string"
+      || typeof evidenceWindowState !== "string"
+      || typeof finalEndingScopeBindingsJson !== "string") {
+      assert.fail("workflow frozen state was not fully persisted");
+    }
+    return {
+      generation: String(row.generation),
+      phase,
+      evidenceWindowState,
+      frozenGeneration: String(row.frozenGeneration),
+      frozenPosition: String(row.frozenPosition),
+      finalEndingScopeBindingsJson,
+      validationPlanGeneration: row.validationPlanGeneration === null
+        ? null
+        : String(row.validationPlanGeneration),
+    };
+  } finally {
+    database.close();
+  }
+}
+
+function frozenWorkflowTuple(state: ReturnType<typeof workflowGenerationState>) {
+  return {
+    evidenceWindowState: state.evidenceWindowState,
+    frozenGeneration: state.frozenGeneration,
+    frozenPosition: state.frozenPosition,
+    finalEndingScopeBindingsJson: state.finalEndingScopeBindingsJson,
+  };
+}
+
+function sessionEndEffectiveStates(eventsPath: string): readonly string[] {
+  const database = new DatabaseSync(eventsPath, { readOnly: true });
+  try {
+    return database.prepare(`
+      SELECT json_extract(payload_json, '$.effectiveState') AS effectiveState
+      FROM events
+      WHERE event_type = 'SessionEndAmended'
+      ORDER BY global_position
+    `).all().map((row) => {
+      assert.equal(typeof row.effectiveState, "string");
+      return row.effectiveState as string;
+    });
+  } finally {
+    database.close();
+  }
+}
+
 function lifecycleOutboxRows(eventsPath: string): readonly {
   readonly targetKey: string;
   readonly materializationRevision: string;
@@ -121,6 +194,141 @@ function lifecycleOutboxRows(eventsPath: string): readonly {
 }
 
 describe("Task 18 lifecycle crash recovery", () => {
+  it("preserves a committed final checkpoint across an unchanged amendment and reaches validating", async () => {
+    const root = mkdtempSync(join(tmpdir(), "task18-unchanged-final-checkpoint-"));
+    roots.push(root);
+    const projectRoot = join(root, "project");
+    const vaultRoot = join(projectRoot, "memory");
+    mkdirSync(vaultRoot, { recursive: true });
+    const broker = new LifecycleTestKeyBroker({ seed: "task18-unchanged-final-checkpoint-broker" });
+    const rootStart = {
+      operation: "root-start",
+      commandId: randomUUID(),
+      continuityKey: "task18-unchanged-final-checkpoint-root",
+      idempotencyKey: "task18-unchanged-final-checkpoint-root-start",
+    };
+    const driver = {
+      operation: "drive-session-end",
+      ownerId: "18180000-0000-4000-8000-000000000099",
+      observedNowMs: String(Date.now()),
+      leaseDurationMs: "30000",
+    };
+    try {
+      const client = new LifecycleFixtureClient({
+        fixturePath: FIXTURE_PATH,
+        timeoutMs: 20_000,
+        cleanupTimeoutMs: 20_000,
+        keyBroker: broker,
+      });
+      clients.add(client);
+      await client.ready();
+      const started = await client.start({
+        projectRoot,
+        vaultRoot,
+        clientInstanceId: "task18-unchanged-final-checkpoint",
+        useParentKeyBroker: true,
+      });
+      assert.equal(started.type, "started");
+      const eventsPath = (started.payload as Record<string, unknown>).eventsPath;
+      if (typeof eventsPath !== "string") assert.fail("fixture did not report eventsPath");
+      assert.equal((valueOf(await client.mutation(rootStart)).result as Record<string, unknown>).kind, "success");
+      await client.mutation({ operation: "record-root-checkpoint" });
+      const requested = valueOf(await client.mutation({
+        operation: "request-session-end",
+        commandId: randomUUID(),
+        idempotencyKey: "task18-unchanged-final-checkpoint-request",
+        proofNonce: randomUUID(),
+      }));
+      const workflowId = ((requested.result as Record<string, unknown>).publicResult as Record<string, unknown>).workflowId;
+      if (typeof workflowId !== "string") assert.fail("session-end request did not return a workflow id");
+      await client.mutation(driver);
+      await client.mutation({
+        operation: "seal-session-end",
+        commandId: randomUUID(),
+        idempotencyKey: "task18-unchanged-final-checkpoint-seal",
+        proofNonce: randomUUID(),
+        workflowId,
+        expectedStreamVersion: "3",
+      });
+      const frozen = valueOf(await client.mutation({ ...driver, observedNowMs: String(Date.now()) }));
+      assert.equal(
+        ((frozen.result as Record<string, unknown>).publicResult as Record<string, unknown>).phase,
+        "final-checkpoint-recorded",
+      );
+      const generation2 = workflowGenerationState(eventsPath);
+      assert.equal(generation2.generation, "2");
+      assert.equal(generation2.phase, "final-checkpoint-recorded");
+      assert.deepEqual(frozenWorkflowTuple(generation2), {
+        evidenceWindowState: "sealed",
+        frozenGeneration: "2",
+        frozenPosition: "5",
+        finalEndingScopeBindingsJson: "[]",
+      });
+      assert.equal(generation2.validationPlanGeneration, null);
+      assert.equal((valueOf(await client.mutation(rootStart)).result as Record<string, unknown>).kind, "success");
+      const unchanged = valueOf(await client.mutation({
+        operation: "unchanged-session-end",
+        commandId: randomUUID(),
+        idempotencyKey: "task18-unchanged-final-checkpoint-amend",
+        proofNonce: randomUUID(),
+        workflowId,
+        expectedStreamVersion: "5",
+      }));
+      assert.equal(unchanged.operation, "unchanged-session-end");
+      const generation3 = workflowGenerationState(eventsPath);
+      assert.equal(generation3.generation, "3");
+      assert.equal(generation3.phase, generation2.phase);
+      assert.deepEqual(frozenWorkflowTuple(generation3), frozenWorkflowTuple(generation2));
+      assert.equal(generation3.validationPlanGeneration, null);
+      assert.equal(new Set(sessionEndEffectiveStates(eventsPath)).size, 1);
+
+      const pendingMaterializations = lifecycleOutboxRows(eventsPath)
+        .filter((row) => row.status === "pending");
+      assert.equal(pendingMaterializations.length, 3);
+      const claim = (valueOf(await client.mutation({
+        operation: "outbox-claim-next",
+        workId: randomUUID(),
+        ownerId: "task18-unchanged-final-checkpoint-materializer",
+        observedNowMs: String(Date.now()),
+        ttlMs: "30000",
+      })).result as Record<string, unknown>).publicResult as Record<string, unknown> | null;
+      if (claim === null
+        || typeof claim.claimToken !== "string"
+        || typeof claim.targetKey !== "string"
+        || typeof claim.materializationRevision !== "string") {
+        assert.fail("fixture did not return a complete outbox claim");
+      }
+      assert.equal(claim.materializationRevision, "6");
+      await client.mutation({
+        operation: "outbox-materialize",
+        workId: randomUUID(),
+        ownerId: "task18-unchanged-final-checkpoint-materializer",
+        fencingToken: claim.claimToken,
+        targetKey: claim.targetKey,
+        materializationRevision: claim.materializationRevision,
+      });
+      const materialized = valueOf(await client.mutation({ ...driver, observedNowMs: String(Date.now() + 60_000) }));
+      assert.equal(
+        ((materialized.result as Record<string, unknown>).publicResult as Record<string, unknown>).phase,
+        "ending-materialization-queued",
+      );
+      const validating = valueOf(await client.mutation({ ...driver, observedNowMs: String(Date.now() + 120_000) }));
+      assert.equal(
+        ((validating.result as Record<string, unknown>).publicResult as Record<string, unknown>).phase,
+        "validating",
+      );
+      const validationState = workflowGenerationState(eventsPath);
+      assert.equal(validationState.generation, "3");
+      assert.equal(validationState.phase, "validating");
+      assert.deepEqual(frozenWorkflowTuple(validationState), frozenWorkflowTuple(generation2));
+      assert.equal(validationState.validationPlanGeneration, "3");
+      await client.close();
+      clients.delete(client);
+    } finally {
+      broker.shutdown();
+    }
+  });
+
   it("materializes a real session-end final checkpoint through a fenced outbox claim and exact replay", async () => {
     const root = mkdtempSync(join(tmpdir(), "task18-session-end-outbox-"));
     roots.push(root);

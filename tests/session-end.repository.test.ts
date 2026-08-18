@@ -8,6 +8,7 @@ import {
   SessionEndWorkflowRepository,
   writePersistedValidationAttemptPlansV1,
 } from "../src/orchestrator/storage/session-end.repository.js";
+import { SessionEndWorkflowService } from "../src/orchestrator/lifecycle/session-end-workflow.service.js";
 import { buildLifecycleIntentWitness } from "../src/orchestrator/lifecycle/lifecycle-intent-witness.js";
 import { canonicalJson } from "../src/orchestrator/serialization/canonical-json.js";
 import {
@@ -500,6 +501,22 @@ it("stores six-key plans once through connection and bound facades", () => {
   connection.close();
 });
 
+it("reports an unplanned validation generation as absent and rejects a partial plan pair", () => {
+  const connection = planConnection();
+  assert.equal(readPersistedValidationAttemptPlansV1(
+    connection,
+    "11111111-1111-4111-8111-111111111111",
+    "22222222-2222-4222-8222-222222222222",
+  ), null);
+  connection.exec("UPDATE workflow_instances SET validation_attempt_plan_generation = 1");
+  assert.throws(() => readPersistedValidationAttemptPlansV1(
+    connection,
+    "11111111-1111-4111-8111-111111111111",
+    "22222222-2222-4222-8222-222222222222",
+  ), /INTEGRITY_FAILURE/);
+  connection.close();
+});
+
 it("hydrates exact request amendment and cancellation-carried effective-state sources", () => {
   for (const options of [{}, { amend: true }, { amend: true, cancelled: true }]) {
     const connection = hydrationConnection(options);
@@ -526,6 +543,24 @@ it("hydrates exact request amendment and cancellation-carried effective-state so
     )?.plans, validPlans());
     connection.close();
   }
+});
+
+it("resolves the immutable effective-state source after the mutable workflow trigger advances", () => {
+  const connection = hydrationConnection({ amend: true });
+  connection.prepare(`
+    UPDATE workflow_instances
+    SET triggering_event_position = 11
+    WHERE project_id = $projectId AND workflow_id = $workflowId
+  `).run({ $projectId: HYDRATION_PROJECT, $workflowId: HYDRATION_WORKFLOW });
+  const hydrated = new SessionEndWorkflowService({ connection }).hydrateEffectiveStateV1({
+    projectId: HYDRATION_PROJECT,
+    workflowId: HYDRATION_WORKFLOW,
+    workflowGeneration: 2,
+    sessionId: EFFECTIVE_STATE_SESSION_ID,
+  });
+  assert.equal(hydrated.eventPosition, 10n);
+  assert.equal(hydrated.workflowGeneration, 2);
+  connection.close();
 });
 
 it("correlates every non-null amendment field and evidence-window action to the immutable fold", () => {

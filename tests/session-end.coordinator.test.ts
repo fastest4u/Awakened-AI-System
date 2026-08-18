@@ -13,6 +13,7 @@ import type { SessionEndRequestV1 } from "../src/orchestrator/lifecycle/contract
 import type { SessionAggregateState } from "../src/orchestrator/lifecycle/session-aggregate.js";
 import {
   SessionEndCoordinator,
+  finalCheckpointRevisionQueryV1,
   normalizeCoverageOnlyTerminalPhasePlanIdentityV1,
   type SessionEndCoordinatorDriveInput,
 } from "../src/orchestrator/lifecycle/session-end.coordinator.js";
@@ -29,6 +30,7 @@ import {
 import {
   SessionEndWorkflowRepository,
   type SessionEndWorkflowClaimV1,
+  type SessionEndWorkflowRecordV1,
 } from "../src/orchestrator/storage/session-end.repository.js";
 import type { SessionAuthorityRecord } from "../src/orchestrator/storage/lifecycle-storage.types.js";
 import type { LifecycleOutboxPlannedRevision } from "../src/orchestrator/lifecycle/materialization-queue.port.js";
@@ -344,6 +346,35 @@ function authorityWithChildren(children: readonly SessionAuthorityRecord[]) {
 }
 
 describe("SessionEndCoordinator", () => {
+  it("queries a preserved final checkpoint with its frozen generation", () => {
+    const workflow = {
+      projectId: PROJECT_ID,
+      sessionId: ROOT_SESSION_ID,
+      workflowId: WORKFLOW_ID,
+      generation: 3,
+      evidenceFrozenCheckpointEventPosition: 42n,
+      evidenceFrozenGeneration: 2,
+    } as unknown as SessionEndWorkflowRecordV1;
+
+    assert.deepEqual(finalCheckpointRevisionQueryV1(workflow), {
+      projectId: PROJECT_ID,
+      sessionId: ROOT_SESSION_ID,
+      artifactKind: "compatibility-session-log",
+      materializationRevision: 42n,
+      triggeringEventPosition: 42n,
+      origin: {
+        kind: "workflow",
+        workflowId: WORKFLOW_ID,
+        workflowGeneration: 2,
+      },
+      triggeringEventType: "SessionCheckpointRecorded",
+    });
+    assert.throws(() => finalCheckpointRevisionQueryV1({
+      ...workflow,
+      evidenceFrozenGeneration: 4,
+    }), /SESSION_END_INCOMPLETE/);
+  });
+
   it("regenerates the complete deterministic tuple when coverage-only policy rewrites a passing terminal action", () => {
     const passedAction = {
       action: "record-verification-passed" as const,

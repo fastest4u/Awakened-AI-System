@@ -511,12 +511,20 @@ function assertTriggerBinding(
       WHERE project_id = $projectId
         AND workflow_id = $workflowId
         AND session_id = $sessionId
-        AND generation = $workflowGeneration
+        AND (
+          generation = $workflowGeneration
+          OR (
+            generation > $workflowGeneration
+            AND evidence_frozen_generation = $workflowGeneration
+            AND evidence_frozen_checkpoint_event_position = $eventPosition
+          )
+        )
     `).get({
       $projectId: projectId,
       $workflowId: payload.origin.workflowId,
       $sessionId: payload.sessionId,
       $workflowGeneration: payload.origin.workflowGeneration,
+      $eventPosition: eventPosition,
     } as SqliteParams);
     if (workflow === undefined) integrity();
   }

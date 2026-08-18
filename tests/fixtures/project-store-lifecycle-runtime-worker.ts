@@ -31,6 +31,7 @@ import type {
 import { connectionBoundEvidenceCoverage } from "../../src/orchestrator/lifecycle/lifecycle-command.store.js";
 import { LifecycleWorkerRuntimeFactory } from "../../src/orchestrator/runtime/lifecycle-worker-runtime.factory.js";
 import type { SessionEndCoordinator } from "../../src/orchestrator/lifecycle/session-end.coordinator.js";
+import { createTrustedValidationProfileRegistry } from "../../src/orchestrator/lifecycle/validation-profile.registry.js";
 import { ProjectStoreWorkerBackend } from "../../src/orchestrator/runtime/project-store-worker-backend.js";
 import {
   DEFAULT_HEARTBEAT_INTERVAL_MS,
@@ -94,6 +95,17 @@ const RESPONSE_DELIVERY_FAULT_POINTS = new Set<LifecycleFaultPoint>([
   "after-commit-before-response",
 ]);
 const SQLITE_INT64_MAX = 9_223_372_036_854_775_807n;
+const VALIDATION_REGISTRY = createTrustedValidationProfileRegistry([{
+  profileId: "default",
+  profileVersion: 1,
+  executable: process.execPath,
+  args: ["--version"],
+  cwd: process.cwd(),
+  env: {},
+  timeoutMs: 1_000,
+  maxOutputBytes: 4_096,
+  runnerId: "99999999-9999-4999-8999-999999999998",
+}]);
 
 if (parentPort === null) throw new Error("TASK18_RUNTIME_PARENT_REQUIRED");
 
@@ -381,6 +393,9 @@ function createLifecycleRuntimeFactory(
     clock: { now: () => new Date().toISOString(), nowMs: () => BigInt(Date.now()) },
     identitySource: { uuid: () => randomUUID(), bytes: (length: number) => randomBytes(length) },
     integrity: { assertQuickHealthy: () => undefined },
+    ...(capturePrimarySessionEndCoordinator
+      ? { validationProfileRegistry: VALIDATION_REGISTRY }
+      : {}),
     resumeSourceState: { captureCurrent: (context) => sourceState(context) },
     checkpointSourceStateProvider: {
       capture: async (active) => sourceState(active),
@@ -973,7 +988,10 @@ interface SealSessionEndRequest {
   readonly expectedStreamVersion: string;
 }
 
-function sealSessionEndRequest(payload: RecordValue): SealSessionEndRequest {
+function sealSessionEndRequest(
+  payload: RecordValue,
+  operation: "seal-session-end" | "unchanged-session-end" = "seal-session-end",
+): SealSessionEndRequest {
   exactFields(payload, [
     "operation",
     "commandId",
@@ -982,7 +1000,7 @@ function sealSessionEndRequest(payload: RecordValue): SealSessionEndRequest {
     "workflowId",
     "expectedStreamVersion",
   ]);
-  if (payload.operation !== "seal-session-end") throw new Error("TASK18_RUNTIME_PROTOCOL_ERROR");
+  if (payload.operation !== operation) throw new Error("TASK18_RUNTIME_PROTOCOL_ERROR");
   return Object.freeze({
     commandId: text(payload, "commandId"),
     idempotencyKey: text(payload, "idempotencyKey"),
@@ -992,7 +1010,11 @@ function sealSessionEndRequest(payload: RecordValue): SealSessionEndRequest {
   });
 }
 
-function sealSessionEndCommand(root: ActiveRoot, request: SealSessionEndRequest): RecordValue {
+function sealSessionEndCommand(
+  root: ActiveRoot,
+  request: SealSessionEndRequest,
+  evidenceWindowAction: "seal" | "unchanged" = "seal",
+): RecordValue {
   return Object.freeze({
     commandType: "amend-session-end",
     commandId: request.commandId,
@@ -1013,7 +1035,7 @@ function sealSessionEndCommand(root: ActiveRoot, request: SealSessionEndRequest)
       requestedQualityThreshold: null,
       requireFullEvidence: null,
       requireMaterialization: null,
-      evidenceWindowAction: "seal",
+      evidenceWindowAction,
     },
   });
 }
@@ -1038,6 +1060,30 @@ async function sealSessionEnd(payload: RecordValue): Promise<RecordValue> {
   );
   return Object.freeze({
     operation: "seal-session-end",
+    result: Object.freeze({ kind: "success", publicResult: workerPublicResult(response) }),
+  });
+}
+
+async function unchangedSessionEnd(payload: RecordValue): Promise<RecordValue> {
+  const root = activeRoot;
+  if (root === null) throw new Error("TASK18_RUNTIME_PROTOCOL_ERROR");
+  const request = sealSessionEndRequest(payload, "unchanged-session-end");
+  const response = await executeProtectedSemantic(
+    backend,
+    active.context,
+    "amend-session-end",
+    sealSessionEndCommand(root, request, "unchanged"),
+    {
+      authoritySessionId: root.sessionId,
+      targetSessionId: root.sessionId,
+      capabilityKind: "root-session-handle",
+      capabilityGeneration: root.ownerGeneration,
+      material: root.material,
+      proofNonce: request.proofNonce,
+    },
+  );
+  return Object.freeze({
+    operation: "unchanged-session-end",
     result: Object.freeze({ kind: "success", publicResult: workerPublicResult(response) }),
   });
 }
@@ -1724,6 +1770,11 @@ parentPort.on("message", (message: unknown) => {
         }
         case "seal-session-end": {
           const value = await sealSessionEnd(record(request.payload));
+          parentPort!.postMessage({ type: "result", requestId, value });
+          return;
+        }
+        case "unchanged-session-end": {
+          const value = await unchangedSessionEnd(record(request.payload));
           parentPort!.postMessage({ type: "result", requestId, value });
           return;
         }

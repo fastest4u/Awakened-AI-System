@@ -159,6 +159,10 @@ class NestedLifecycleRuntime {
     return this.#request("seal-session-end", payload);
   }
 
+  unchangedSessionEnd(payload: JsonRecord): Promise<JsonRecord> {
+    return this.#request("unchanged-session-end", payload);
+  }
+
   driveSessionEnd(payload: JsonRecord): Promise<JsonRecord> {
     return this.#request("drive-session-end", payload);
   }
@@ -603,6 +607,8 @@ async function mutation(message: FixtureMessage): Promise<void> {
             ? await nestedRuntime.requestSessionEnd(payload)
             : payload.operation === "seal-session-end"
               ? await nestedRuntime.sealSessionEnd(payload)
+            : payload.operation === "unchanged-session-end"
+              ? await nestedRuntime.unchangedSessionEnd(payload)
             : payload.operation === "drive-session-end"
               ? await nestedRuntime.driveSessionEnd(payload)
               : payload.operation === "outbox-claim-next"

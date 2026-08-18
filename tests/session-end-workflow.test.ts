@@ -28,6 +28,7 @@ import type {
   SqliteStatement,
 } from "../src/orchestrator/storage/sqlite-driver.js";
 import { lifecycleUuid } from "./support/lifecycle-fixtures.js";
+import { applyCurrentProjectStoreSchema } from "./support/current-project-store-schema.js";
 
 class NativeStatement implements SqliteStatement {
   constructor(private readonly statement: import("node:sqlite").StatementSync) {
@@ -67,6 +68,15 @@ const ROOT_COMMAND_ID = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
 const RUN_ID = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
 const RESULT_ID = "ffffffff-ffff-4fff-8fff-ffffffffffff";
 const COMMAND_ID = "11111111-2222-4333-8444-555555555555";
+const VALIDATION_ATTEMPT_PLANS = Object.freeze([Object.freeze({
+  profileId: "profile-a",
+  profileVersion: 1,
+  runId: RUN_ID,
+  resultId: RESULT_ID,
+  commandId: COMMAND_ID,
+  idempotencyKey: "validation/profile-a/1",
+})]);
+const VALIDATION_ATTEMPT_PLANS_JSON = canonicalJson(VALIDATION_ATTEMPT_PLANS);
 
 const REQUEST = Object.freeze({
   requestVersion: 1 as const,
@@ -163,6 +173,80 @@ function workflowConnection(): NativeConnection {
     );
   `);
   return connection;
+}
+
+function migratedWorkflowConnection(): NativeConnection {
+  const connection = new NativeConnection();
+  applyCurrentProjectStoreSchema(connection, {
+    projectId: PROJECT_ID,
+    vaultId: lifecycleUuid(2),
+    storeId: lifecycleUuid(3),
+  }, "2026-08-15T00:00:00.000Z");
+  return connection;
+}
+
+function seedMigratedWorkflow(connection: SqliteConnection): {
+  readonly repository: SessionEndWorkflowRepository;
+  readonly requestedObject: Record<string, unknown>;
+} {
+  const repository = new SessionEndWorkflowRepository(connection);
+  const requested = requestedSessionEndStatusV2({
+    sessionId: SESSION_ID,
+    workflowId: WORKFLOW_ID,
+    workflowGeneration: 1,
+    priorRootState: "active",
+    triggeringEventPosition: 8n,
+    evidenceWindowState: "sealed",
+    materializationRequired: false,
+  });
+  repository.createRequested({
+    projectId: PROJECT_ID,
+    workflowId: WORKFLOW_ID,
+    workflowGeneration: 1,
+    rootCommandId: ROOT_COMMAND_ID,
+    sessionId: SESSION_ID,
+    triggeringEventPosition: 8n,
+    expectedAuthorityCommitment: "a".repeat(64),
+    priorRootState: "active",
+    resultJson: canonicalJson(requested),
+    evidenceWindowState: "sealed",
+    now: "2026-08-15T00:00:00.000Z",
+    effectiveState: EFFECTIVE_STATE,
+  });
+  repository.writePersistedValidationAttemptPlansV1({
+    projectId: PROJECT_ID,
+    workflowId: WORKFLOW_ID,
+    workflowGeneration: 1,
+    plans: VALIDATION_ATTEMPT_PLANS,
+  });
+  return {
+    repository,
+    requestedObject: JSON.parse(canonicalJson(requested)) as Record<string, unknown>,
+  };
+}
+
+function unchangedAmendmentInput(requestedObject: Record<string, unknown>) {
+  const amended = {
+    ...requestedObject,
+    workflowGeneration: 2,
+    phase: "requested" as const,
+    triggeringEventPosition: "9",
+  } as unknown as SessionEndStatusV2;
+  return {
+    projectId: PROJECT_ID,
+    workflowId: WORKFLOW_ID,
+    previousWorkflowGeneration: 1,
+    workflowGeneration: 2,
+    rootCommandId: COMMAND_ID,
+    sessionId: SESSION_ID,
+    triggeringEventPosition: 9n,
+    expectedAuthorityCommitment: "a".repeat(64),
+    phase: "requested" as const,
+    resultJson: canonicalJson(amended),
+    evidenceWindowState: "sealed" as const,
+    clearFrozenGroup: false,
+    now: "2026-08-15T00:00:01.000Z",
+  };
 }
 
 function workflowWork(): WorkflowSelectionOperationalWorkIdentity {
@@ -598,6 +682,70 @@ describe("SessionEndWorkflowService", () => {
     assert.equal(afterCancellation?.coordinatorOwnerId, null);
     assert.equal(afterCancellation?.validationAttemptPlanGeneration, null);
     assert.equal(afterCancellation?.evidenceFrozenCheckpointEventPosition, null);
+    connection.close();
+  });
+
+  it("carries exact canonical validation-plan bytes across a generation on the migrated schema", () => {
+    const connection = migratedWorkflowConnection();
+    const { repository, requestedObject } = seedMigratedWorkflow(connection);
+    assert.equal(
+      repository.read(PROJECT_ID, WORKFLOW_ID)?.validationAttemptPlansJson,
+      VALIDATION_ATTEMPT_PLANS_JSON,
+    );
+
+    connection.exec("BEGIN IMMEDIATE");
+    try {
+      repository.amendGeneration(unchangedAmendmentInput(requestedObject));
+      connection.exec("COMMIT");
+    } catch (error) {
+      connection.exec("ROLLBACK");
+      throw error;
+    }
+
+    const amended = repository.read(PROJECT_ID, WORKFLOW_ID);
+    assert.equal(amended?.generation, 2);
+    assert.equal(amended?.validationAttemptPlanGeneration, 2);
+    assert.equal(amended?.validationAttemptPlansJson, VALIDATION_ATTEMPT_PLANS_JSON);
+    assert.equal(repository.claim({
+      projectId: PROJECT_ID,
+      workflowId: WORKFLOW_ID,
+      workflowGeneration: 1,
+      ownerId: "stale-validator",
+      observedNowMs: 0n,
+      leaseDurationMs: 1_000n,
+    }), null);
+    connection.close();
+  });
+
+  it("rolls back the generation advance when guarded validation-plan restoration fails", () => {
+    const connection = migratedWorkflowConnection();
+    const { repository, requestedObject } = seedMigratedWorkflow(connection);
+    const before = repository.read(PROJECT_ID, WORKFLOW_ID);
+    assert.ok(before !== null);
+    connection.exec(`
+      CREATE TEMP TRIGGER reject_validation_plan_restore
+      BEFORE UPDATE OF validation_attempt_plans_json ON workflow_instances
+      WHEN OLD.generation = NEW.generation
+        AND OLD.validation_attempt_plans_json IS NULL
+        AND NEW.validation_attempt_plans_json IS NOT NULL
+      BEGIN
+        SELECT RAISE(ABORT, 'INJECTED_VALIDATION_PLAN_RESTORE_FAILURE');
+      END
+    `);
+
+    connection.exec("BEGIN IMMEDIATE");
+    try {
+      assert.throws(
+        () => repository.amendGeneration(unchangedAmendmentInput(requestedObject)),
+        /INJECTED_VALIDATION_PLAN_RESTORE_FAILURE/,
+      );
+      connection.exec("ROLLBACK");
+    } catch (error) {
+      connection.exec("ROLLBACK");
+      throw error;
+    }
+
+    assert.deepEqual(repository.read(PROJECT_ID, WORKFLOW_ID), before);
     connection.close();
   });
 

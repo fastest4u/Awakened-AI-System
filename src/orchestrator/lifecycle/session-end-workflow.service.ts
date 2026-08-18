@@ -2,6 +2,7 @@ import type { SqliteConnection } from "../storage/sqlite-driver.js";
 import {
   SessionEndWorkflowRepository,
   hydrateSessionEndEffectiveStateV1,
+  readEffectiveStateSourceEventPositionV1,
   type PersistedValidationAttemptPlansWriteV1,
   type SessionEndWorkflowClaimInputV1,
   type SessionEndWorkflowClaimNextInputV1,
@@ -386,9 +387,11 @@ export class SessionEndWorkflowService {
     readonly workflowId: string;
     readonly workflowGeneration: number;
     readonly sessionId: string;
-    readonly eventPosition: bigint;
   }): HydratedSessionEndEffectiveStateV1 {
-    return hydrateSessionEndEffectiveStateV1(this.#connection, input);
+    return hydrateSessionEndEffectiveStateV1(this.#connection, {
+      ...input,
+      eventPosition: readEffectiveStateSourceEventPositionV1(this.#connection, input),
+    });
   }
 
   priorRootState(workflow: SessionEndWorkflowRecordV1): "active" | "suspended" {

@@ -171,6 +171,39 @@ export function normalizeCoverageOnlyTerminalPhasePlanIdentityV1(
   }) as InternalRootWorkflowPhasePlan;
 }
 
+function preservedFrozenGeneration(workflow: SessionEndWorkflowRecordV1): number {
+  const frozenGeneration = workflow.evidenceFrozenGeneration;
+  if (frozenGeneration === null
+    || !Number.isSafeInteger(frozenGeneration)
+    || frozenGeneration < 1
+    || frozenGeneration > workflow.generation) {
+    throw new LifecycleError("SESSION_END_INCOMPLETE");
+  }
+  return frozenGeneration;
+}
+
+export function finalCheckpointRevisionQueryV1(
+  workflow: SessionEndWorkflowRecordV1,
+): ExactPlannedRevisionQuery {
+  const frozenGeneration = preservedFrozenGeneration(workflow);
+  if (workflow.evidenceFrozenCheckpointEventPosition === null) {
+    throw new LifecycleError("SESSION_END_INCOMPLETE");
+  }
+  return Object.freeze({
+    projectId: workflow.projectId as ProjectContext["binding"]["projectId"],
+    sessionId: workflow.sessionId as SessionId,
+    artifactKind: "compatibility-session-log" as const,
+    materializationRevision: workflow.evidenceFrozenCheckpointEventPosition,
+    triggeringEventPosition: workflow.evidenceFrozenCheckpointEventPosition,
+    origin: Object.freeze({
+      kind: "workflow" as const,
+      workflowId: workflow.workflowId as WorkflowId,
+      workflowGeneration: frozenGeneration,
+    }),
+    triggeringEventType: "SessionCheckpointRecorded" as const,
+  });
+}
+
 /**
  * Durable session-end driver.  Selection and proof are deliberately kept
  * small and synchronous: one invocation claims at most one workflow action,
@@ -385,24 +418,11 @@ export class SessionEndCoordinator {
     if (workflow.phase !== "final-checkpoint-recorded"
       || workflow.evidenceWindowState !== "sealed"
       || workflow.evidenceFrozenCheckpointEventPosition === null
-      || workflow.evidenceFrozenGeneration !== workflow.generation
       || workflow.finalEndingScopeBindingsJson === null
       || claim.phase !== "final-checkpoint-recorded") {
       throw new LifecycleError("SESSION_END_INCOMPLETE");
     }
-    const exactQuery: ExactPlannedRevisionQuery = {
-      projectId: workflow.projectId as ProjectContext["binding"]["projectId"],
-      sessionId: workflow.sessionId as SessionId,
-      artifactKind: "compatibility-session-log",
-      materializationRevision: workflow.evidenceFrozenCheckpointEventPosition,
-      triggeringEventPosition: workflow.evidenceFrozenCheckpointEventPosition,
-      origin: {
-        kind: "workflow",
-        workflowId: workflow.workflowId as WorkflowId,
-        workflowGeneration: workflow.generation,
-      },
-      triggeringEventType: "SessionCheckpointRecorded",
-    };
+    const exactQuery = finalCheckpointRevisionQueryV1(workflow);
     const result = this.#operationalStore.execute({
       kind: "workflow",
       projectId: claim.projectId,
@@ -465,26 +485,13 @@ export class SessionEndCoordinator {
         || current.phase !== "ending-materialization-queued"
         || current.evidenceWindowState !== "sealed"
         || current.evidenceFrozenCheckpointEventPosition === null
-        || current.evidenceFrozenGeneration !== current.generation
         || current.finalEndingScopeBindingsJson === null
         || current.coordinatorOwnerId !== claim.ownerId
         || current.coordinatorClaimToken !== claim.claimToken
         || current.coordinatorClaimExpiresAt !== claim.claimExpiresAt
       ) throw new LifecycleError("SESSION_END_INCOMPLETE");
 
-      const exactQuery: ExactPlannedRevisionQuery = {
-        projectId: current.projectId as ProjectContext["binding"]["projectId"],
-        sessionId: current.sessionId as SessionId,
-        artifactKind: "compatibility-session-log",
-        materializationRevision: current.evidenceFrozenCheckpointEventPosition,
-        triggeringEventPosition: current.evidenceFrozenCheckpointEventPosition,
-        origin: {
-          kind: "workflow",
-          workflowId: current.workflowId as WorkflowId,
-          workflowGeneration: current.generation,
-        },
-        triggeringEventType: "SessionCheckpointRecorded",
-      };
+      const exactQuery = finalCheckpointRevisionQueryV1(current);
       transaction.outboxPlans.assertExactPlannedRevision(exactQuery);
 
       const root = this.#authority.get(
@@ -1254,12 +1261,12 @@ export class SessionEndCoordinator {
       || root.latestCheckpointEventPosition === null
       || root.latestCheckpointFingerprint === null
       || workflow.evidenceFrozenCheckpointEventPosition === null
-      || workflow.evidenceFrozenGeneration !== workflow.generation
       || workflow.finalEndingScopeBindingsJson === null
       || aggregate.kind !== "root"
       || aggregate.state !== "ending") {
       throw new LifecycleError("SESSION_SOURCE_STATE_CONFLICT");
     }
+    preservedFrozenGeneration(workflow);
     if (root.latestCheckpointEventPosition !== workflow.evidenceFrozenCheckpointEventPosition) {
       throw new LifecycleError("SESSION_SOURCE_STATE_CONFLICT");
     }

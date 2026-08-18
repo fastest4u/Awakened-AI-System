@@ -782,6 +782,10 @@ export function readPersistedValidationAttemptPlansV1(
       LIMIT 2
     `).all({ $projectId: projectId, $workflowId: workflowId }));
     if (row === null) return null;
+    const storedGeneration = row["validation_attempt_plan_generation"];
+    const storedPlans = row["validation_attempt_plans_json"];
+    if (storedGeneration === null && storedPlans === null) return null;
+    if (storedGeneration === null || storedPlans === null) integrity();
     const source = rowString(row, "validation_attempt_plans_json");
     let parsed: unknown;
     try { parsed = JSON.parse(source); } catch { return integrity(); }
@@ -1355,6 +1359,20 @@ export class SessionEndWorkflowRepository {
       && input.evidenceWindowState !== existing.evidenceWindowState) {
       workflowInputFailure("evidenceWindowState");
     }
+    const preservedValidationAttemptPlansJson = (() => {
+      if (input.clearFrozenGroup || existing.validationAttemptPlansJson === null) return null;
+      if (existing.validationAttemptPlanGeneration !== previousWorkflowGeneration) {
+        workflowFailure();
+      }
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(existing.validationAttemptPlansJson);
+      } catch {
+        return workflowFailure();
+      }
+      decodePersistedValidationPlansV1(parsed);
+      return existing.validationAttemptPlansJson;
+    })();
     const frozenAssignments = input.clearFrozenGroup
       ? `
           evidence_frozen_checkpoint_event_position = NULL,
@@ -1403,6 +1421,33 @@ export class SessionEndWorkflowRepository {
       $previousGeneration: BigInt(previousWorkflowGeneration),
     } satisfies SqliteParams);
     if (!changed(result)) throw new LifecycleError("EVENT_CONFLICT");
+    if (preservedValidationAttemptPlansJson !== null) {
+      const restored = this.#connection.prepare(`
+        UPDATE workflow_instances
+        SET validation_attempt_plan_generation = $generation,
+            validation_attempt_plans_json = $validationAttemptPlansJson
+        WHERE project_id = $projectId
+          AND workflow_id = $workflowId
+          AND workflow_type = 'session-end'
+          AND session_id = $sessionId
+          AND generation = $generation
+          AND phase = $phase
+          AND root_command_id = $rootCommandId
+          AND triggering_event_position = $triggeringEventPosition
+          AND validation_attempt_plan_generation IS NULL
+          AND validation_attempt_plans_json IS NULL
+      `).run({
+        $projectId: projectId,
+        $workflowId: workflowId,
+        $sessionId: sessionId,
+        $generation: BigInt(workflowGenerationValue),
+        $phase: input.phase,
+        $rootCommandId: rootCommandId,
+        $triggeringEventPosition: triggeringEventPosition,
+        $validationAttemptPlansJson: preservedValidationAttemptPlansJson,
+      } satisfies SqliteParams);
+      if (!changed(restored)) throw new LifecycleError("EVENT_CONFLICT");
+    }
   }
 
   cancelGeneration(input: SessionEndWorkflowCancellationInputV1): void {

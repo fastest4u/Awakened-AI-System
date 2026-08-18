@@ -50,7 +50,9 @@ function db(): SqliteConnection {
       project_id TEXT NOT NULL,
       workflow_id TEXT NOT NULL,
       session_id TEXT NOT NULL,
-      generation INTEGER NOT NULL
+      generation INTEGER NOT NULL,
+      evidence_frozen_checkpoint_event_position INTEGER,
+      evidence_frozen_generation INTEGER
     ) STRICT;
     CREATE TABLE outbox (
       project_id TEXT NOT NULL,
@@ -610,6 +612,53 @@ describe("LifecycleOutboxRepository", () => {
       foreign.storedEvent,
       NOW,
     ), /INTEGRITY_FAILURE/);
+  });
+
+  it("accepts a historical final-checkpoint outbox only through its preserved frozen tuple", () => {
+    const fixture = setup(7n, false);
+    const nestedCheckpoint = checkpointFixture({
+      sessionId: SESSION_ID,
+      parentSessionId: null,
+      baseEventPosition: "6",
+      checkpointEventPosition: "7",
+    });
+    const checkpointEvent = event(7n, "SessionCheckpointRecorded", 3, {
+      checkpoint: {
+        ...nestedCheckpoint,
+        sourceState: { ...nestedCheckpoint.sourceState, workspaceId: WORKSPACE_ID },
+      },
+      baseEventPosition: "6",
+      checkpointEventPosition: "7",
+      finalCheckpointBindingVersion: 1,
+      workflowId: WORKFLOW_ID,
+      workflowGeneration: 1,
+    });
+    const checkpointPending = pending(
+      7n,
+      "SessionCheckpointRecorded",
+      undefined,
+      FINGERPRINT_A,
+      checkpointEvent.payloadHash,
+    );
+    insertEvent(fixture.connection, checkpointEvent);
+    fixture.repository.insertLifecycle(fixture.connection, checkpointPending, checkpointEvent, NOW);
+    fixture.connection.prepare(`
+      UPDATE workflow_instances
+      SET generation = 2,
+          evidence_frozen_generation = 1,
+          evidence_frozen_checkpoint_event_position = 7
+    `).run();
+    const checkpointQuery = {
+      ...query(7n),
+      triggeringEventType: "SessionCheckpointRecorded",
+    } as ExactPlannedRevisionQuery;
+    assert.ok(fixture.repository.getExactPlannedRevision(fixture.connection, checkpointQuery));
+
+    fixture.connection.exec("UPDATE workflow_instances SET evidence_frozen_checkpoint_event_position = 6");
+    assert.throws(
+      () => fixture.repository.getExactPlannedRevision(fixture.connection, checkpointQuery),
+      /INTEGRITY_FAILURE/,
+    );
   });
 
   it("recomputes lifecycle content hash before insert and read", () => {

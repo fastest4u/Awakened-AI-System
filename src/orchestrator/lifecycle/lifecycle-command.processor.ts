@@ -3188,7 +3188,6 @@ export class LifecycleCommandProcessor {
         workflowId,
         workflowGeneration: existing.generation,
         sessionId: current.sessionId,
-        eventPosition: existing.triggeringEventPosition,
       });
       const relevantChildren = riskyTransitionChildren(authority, current);
       const checkpoint = requireRiskyTransitionCheckpointV1({
