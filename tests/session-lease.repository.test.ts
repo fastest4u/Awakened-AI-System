@@ -247,6 +247,47 @@ function release(
 }
 
 describe("SessionLeaseRepository deterministic clock rules", () => {
+  it("exposes lease-update faults around every successful lease SQL mutation", () => {
+    const current = connection();
+    try {
+      seedAuthority(current);
+      const trace: string[] = [];
+      const FaultingRepository = SessionLeaseRepository as unknown as new(options: {
+        readonly faultInjector: {
+          hit(boundary: string, point: string, context: Readonly<Record<string, unknown>>): void;
+        };
+      }) => SessionLeaseRepository;
+      const leases = new FaultingRepository({
+        faultInjector: {
+          hit(boundary, point, context): void {
+            trace.push(`${boundary}/${point}/${String(context.sessionId)}`);
+            assert.equal(context.projectId, PROJECT_ID);
+            assert.equal(context.workflowId, null);
+            assert.equal(context.commandId, null);
+            assert.equal(context.idempotencyKeyHash, null);
+            assert.equal(context.workId, null);
+            assert.equal(context.eventPosition, null);
+            assert.equal(context.materializationRevision, null);
+          },
+        },
+      });
+
+      const inserted = leases.insertGeneration(current, acquire(1_000n));
+      leases.renewCurrent(current, renew(1_001n));
+      leases.releaseCurrent(current, release(inserted, 1_002n, {
+        expectedLastObservedAtMs: 1_001n,
+        expectedExpiresAtMs: 121_001n,
+      }));
+
+      assert.deepEqual(trace, Array.from({ length: 3 }, () => [
+        `lease-update/before-write/${ROOT_ID}`,
+        `lease-update/after-write-before-commit/${ROOT_ID}`,
+      ]).flat());
+    } finally {
+      current.close();
+    }
+  });
+
   it("acquires generation one with bigint epoch fields and no sleeping", () => {
     const current = connection();
     try {
@@ -372,6 +413,29 @@ describe("SessionLeaseRepository deterministic clock rules", () => {
       expectCode("EVENT_CONFLICT", () => leases.releaseCurrent(current, release(lease, 1_001n, {
         expectedExpiresAtMs: lease.expiresAtMs + 1n,
       })));
+    } finally {
+      current.close();
+    }
+  });
+
+  it("does not report a lease write for a stale conditional release", () => {
+    const current = connection();
+    try {
+      seedAuthority(current);
+      const lease = new SessionLeaseRepository().insertGeneration(current, acquire(1_000n));
+      const hits: string[] = [];
+      const leases = new SessionLeaseRepository({
+        faultInjector: {
+          hit(boundary, point): void { hits.push(`${boundary}/${point}`); },
+        },
+      });
+
+      expectCode("EVENT_CONFLICT", () => leases.releaseCurrent(current, release(lease, 1_001n, {
+        expectedExpiresAtMs: lease.expiresAtMs + 1n,
+      })));
+
+      assert.deepEqual(hits, []);
+      assert.equal(leases.current(current, PROJECT_ID, ROOT_ID)?.releasedAtMs, null);
     } finally {
       current.close();
     }

@@ -1,4 +1,11 @@
 import { LifecycleError } from "../lifecycle/errors.js";
+import type { ProjectId } from "../identity/contracts.js";
+import type { SessionId } from "../lifecycle/contracts/identifiers.js";
+import {
+  NO_LIFECYCLE_FAULTS,
+  type LifecycleFaultContext,
+  type LifecycleFaultInjector,
+} from "../lifecycle/lifecycle-faults.js";
 import { MAX_CANONICAL_TIMESTAMP_MS } from "../runtime/clock.js";
 import type {
   RootLeaseInsert,
@@ -200,7 +207,29 @@ function priorGeneration(
   return row === undefined ? null : decode(row);
 }
 
+function leaseFaultContext(input: {
+  readonly projectId: string;
+  readonly sessionId: string;
+}): LifecycleFaultContext {
+  return Object.freeze({
+    projectId: input.projectId as ProjectId,
+    sessionId: input.sessionId as SessionId,
+    workflowId: null,
+    commandId: null,
+    idempotencyKeyHash: null,
+    workId: null,
+    eventPosition: null,
+    materializationRevision: null,
+  });
+}
+
 export class SessionLeaseRepository {
+  readonly #faults: LifecycleFaultInjector;
+
+  constructor(options: { readonly faultInjector?: LifecycleFaultInjector } = {}) {
+    this.#faults = options.faultInjector ?? NO_LIFECYCLE_FAULTS;
+  }
+
   current(
     connection: SqliteConnection,
     projectId: string,
@@ -242,6 +271,8 @@ export class SessionLeaseRepository {
       ? prior.lastObservedAtMs
       : input.observedNowMs;
     const expiresAtMs = checkedExpiry(effectiveNowMs, input.leaseDurationMs);
+    const faultContext = leaseFaultContext(input);
+    this.#faults.hit("lease-update", "before-write", faultContext);
     try {
       const result = connection.prepare(`
         INSERT INTO session_leases(
@@ -270,6 +301,7 @@ export class SessionLeaseRepository {
       }
       throw error;
     }
+    this.#faults.hit("lease-update", "after-write-before-commit", faultContext);
     const inserted = byGeneration(connection, input.projectId, input.sessionId, input.ownerGeneration);
     if (inserted === null || inserted.releasedAtMs !== null) integrity();
     return inserted;
@@ -288,6 +320,8 @@ export class SessionLeaseRepository {
       ? input.observedNowMs
       : current.lastObservedAtMs;
     const expiresAtMs = checkedExpiry(effectiveNowMs, input.leaseDurationMs);
+    const faultContext = leaseFaultContext(input);
+    this.#faults.hit("lease-update", "before-write", faultContext);
     const result = connection.prepare(`
       UPDATE session_leases
       SET renewed_at = $renewedAt,
@@ -319,6 +353,7 @@ export class SessionLeaseRepository {
       $expiresAt: timestamp(expiresAtMs, invalid),
     });
     if (result.changes !== 1n) throw new LifecycleError("SESSION_HANDLE_STALE");
+    this.#faults.hit("lease-update", "after-write-before-commit", faultContext);
     const renewed = byGeneration(connection, input.projectId, input.sessionId, input.ownerGeneration);
     if (renewed === null || renewed.releasedAtMs !== null) integrity();
     return renewed;
@@ -326,9 +361,25 @@ export class SessionLeaseRepository {
 
   releaseCurrent(connection: SqliteConnection, input: RootLeaseRelease): void {
     validateRelease(input);
+    const current = byGeneration(
+      connection,
+      input.projectId,
+      input.sessionId,
+      input.ownerGeneration,
+    );
+    if (current === null
+      || current.ownerClientInstanceId !== input.ownerClientInstanceId
+      || current.releasedAtMs !== null
+      || current.lastObservedAtMs !== input.expectedLastObservedAtMs
+      || current.expiresAtMs !== input.expectedExpiresAtMs
+      || !authorityMatches(connection, input.projectId, input.sessionId, input.ownerGeneration)) {
+      throw new LifecycleError("EVENT_CONFLICT");
+    }
     const effectiveNowMs = input.observedNowMs > input.expectedLastObservedAtMs
       ? input.observedNowMs
       : input.expectedLastObservedAtMs;
+    const faultContext = leaseFaultContext(input);
+    this.#faults.hit("lease-update", "before-write", faultContext);
     const result = connection.prepare(`
       UPDATE session_leases
       SET last_observed_at_ms = $lastObservedAtMs,
@@ -358,5 +409,6 @@ export class SessionLeaseRepository {
       $releasedAt: timestamp(effectiveNowMs, invalid),
     });
     if (result.changes !== 1n) throw new LifecycleError("EVENT_CONFLICT");
+    this.#faults.hit("lease-update", "after-write-before-commit", faultContext);
   }
 }

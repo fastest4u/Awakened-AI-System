@@ -1,4 +1,11 @@
 import { LifecycleError } from "../lifecycle/errors.js";
+import type { ProjectId } from "../identity/contracts.js";
+import type { SessionId } from "../lifecycle/contracts/identifiers.js";
+import {
+  NO_LIFECYCLE_FAULTS,
+  type LifecycleFaultContext,
+  type LifecycleFaultInjector,
+} from "../lifecycle/lifecycle-faults.js";
 import { MAX_CANONICAL_TIMESTAMP_MS } from "../runtime/clock.js";
 import { canonicalJson } from "../serialization/canonical-json.js";
 import type {
@@ -263,7 +270,31 @@ function decodeCarryProjection(
   });
 }
 
+function transferFaultContext(
+  projectId: string,
+  sessionId: string,
+  transferTicketId: string,
+  eventPosition: bigint,
+): LifecycleFaultContext {
+  return Object.freeze({
+    projectId: projectId as ProjectId,
+    sessionId: sessionId as SessionId,
+    workflowId: null,
+    commandId: null,
+    idempotencyKeyHash: null,
+    workId: transferTicketId,
+    eventPosition: eventPosition.toString(),
+    materializationRevision: null,
+  });
+}
+
 export class ChildTransferRepository {
+  readonly #faults: LifecycleFaultInjector;
+
+  constructor(options: { readonly faultInjector?: LifecycleFaultInjector } = {}) {
+    this.#faults = options.faultInjector ?? NO_LIFECYCLE_FAULTS;
+  }
+
   get(
     connection: SqliteConnection,
     projectId: string,
@@ -510,6 +541,13 @@ export class ChildTransferRepository {
 
   insert(connection: SqliteConnection, source: ChildTransferTicketInsert): void {
     const input = insertValues(source);
+    const faultContext = transferFaultContext(
+      input.projectId,
+      input.sourceChildSessionId,
+      input.transferTicketId,
+      input.createdEventPosition,
+    );
+    this.#faults.hit("transfer-create", "before-write", faultContext);
     const result = connection.prepare(`
       INSERT INTO child_transfer_tickets(
         project_id, transfer_ticket_id, source_parent_session_id, source_child_session_id,
@@ -541,10 +579,27 @@ export class ChildTransferRepository {
       $createdAt: timestampFromMs(input.createdAtMs),
     });
     if (result.changes !== 1n) integrity();
+    this.#faults.hit("transfer-create", "after-write-before-commit", faultContext);
   }
 
   claim(connection: SqliteConnection, source: ChildTransferClaim): ChildTransferTicketRecord {
     const input = claimValues(source);
+    const current = this.get(connection, input.projectId, input.transferTicketId);
+    if (current === null
+      || current.createdEventPosition !== input.expectedCreatedEventPosition
+      || current.claimedByRootSessionId !== null
+      || current.claimedChildSessionId !== null
+      || current.claimedEventPosition !== null
+      || current.claimedAtMs !== null) {
+      throw new LifecycleError("EVENT_CONFLICT");
+    }
+    const faultContext = transferFaultContext(
+      input.projectId,
+      input.claimedChildSessionId,
+      input.transferTicketId,
+      input.claimedEventPosition,
+    );
+    this.#faults.hit("transfer-claim", "before-write", faultContext);
     const result = connection.prepare(`
       UPDATE child_transfer_tickets
       SET claimed_by_root_session_id = $claimedByRootSessionId,
@@ -569,6 +624,7 @@ export class ChildTransferRepository {
     });
     if (result.changes === 0n) throw new LifecycleError("EVENT_CONFLICT");
     if (result.changes !== 1n) integrity();
+    this.#faults.hit("transfer-claim", "after-write-before-commit", faultContext);
     const claimed = this.get(connection, input.projectId, input.transferTicketId);
     if (claimed === null || claimed.claimedEventPosition !== input.claimedEventPosition) integrity();
     return claimed;

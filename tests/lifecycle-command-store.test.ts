@@ -51,6 +51,7 @@ import type { LifecycleFaultContext } from "../src/orchestrator/lifecycle/lifecy
 import type {
   LifecycleProjectionWriter,
 } from "../src/orchestrator/storage/lifecycle-projection.repository.js";
+import { checkpointFixture } from "./support/lifecycle-fixtures.js";
 
 const NOW = "2026-07-14T00:00:00.000Z";
 const CONTEXT = {
@@ -577,22 +578,91 @@ describe("LifecycleCommandStore", () => {
       ...(action === undefined ? {} : { action: { action } }),
     } as never);
 
-    assert.deepEqual(classify("request-session-end"), ["event-append", "workflow-create"]);
-    assert.deepEqual(classify("cancel-session-end"), ["event-append", "cancellation-rewrite"]);
-    assert.deepEqual(classify("abandon-session"), ["event-append", "abandonment-rewrite"]);
-    assert.deepEqual(classify("internal-validation-result"), ["event-append", "validation-result"]);
+    assert.deepEqual(classify("request-session-end"), [
+      "event-append", "authority-cas", "lease-update", "workflow-create",
+    ]);
+    assert.deepEqual(classify("cancel-session-end"), [
+      "event-append", "authority-cas", "lease-update", "cancellation-rewrite",
+    ]);
+    assert.deepEqual(classify("abandon-session"), [
+      "event-append", "authority-cas", "lease-update", "abandonment-rewrite",
+    ]);
+    assert.deepEqual(classify("internal-validation-result"), [
+      "event-append", "authority-cas", "validation-result",
+    ]);
+    assert.deepEqual(classify("record-checkpoint"), [
+      "event-append", "authority-cas",
+    ]);
     assert.deepEqual(classify(
       "internal-workflow-phase",
       "record-final-checkpoint-and-queue-ending",
-    ), ["event-append", "workflow-phase", "final-checkpoint", "outbox-insert"]);
+    ), ["event-append", "workflow-phase", "authority-cas", "final-checkpoint", "outbox-insert"]);
     assert.deepEqual(classify(
       "internal-workflow-phase",
       "record-verification-passed",
-    ), ["event-append", "workflow-phase", "verification-event"]);
+    ), ["event-append", "workflow-phase", "authority-cas", "verification-event"]);
     assert.deepEqual(classify(
       "internal-workflow-phase",
       "append-terminal-completion",
-    ), ["event-append", "workflow-phase", "final-source-state-check", "session-ended"]);
+    ), [
+      "event-append", "workflow-phase", "authority-cas", "final-source-state-check", "session-ended",
+    ]);
+  });
+
+  it("classifies post-commit physical aliases only for commands that reach them", () => {
+    const classify = (
+      commandType: string,
+      action?: Readonly<Record<string, unknown>>,
+      prepared?: { readonly beforeAppend?: unknown },
+    ) =>
+      lifecycleSemanticFaultBoundaries({
+        commandType,
+        ...(action === undefined ? {} : { action }),
+      } as never, prepared);
+
+    assert.deepEqual(classify("root-start"), ["event-append", "authority-cas", "lease-update"]);
+    assert.deepEqual(classify("root-resume"), [
+      "event-append", "authority-cas", "lease-update", "generation-fence",
+    ]);
+    assert.deepEqual(classify("root-recovery"), [
+      "event-append", "authority-cas", "lease-update", "ownership-recovery", "generation-fence",
+    ]);
+    assert.deepEqual(classify("root-suspend"), [
+      "event-append", "authority-cas", "lease-update", "session-suspend",
+    ]);
+    assert.deepEqual(classify("suspend-child-session"), [
+      "event-append", "authority-cas", "session-suspend", "transfer-create",
+    ]);
+    assert.deepEqual(classify("claim-child-transfer"), [
+      "event-append", "authority-cas", "transfer-claim", "generation-fence",
+    ]);
+    assert.deepEqual(classify("fork-child"), ["event-append", "authority-cas"]);
+    assert.deepEqual(lifecycleSemanticFaultBoundaries({
+      commandType: "disposition-child-report",
+      disposition: { kind: "accepted" },
+    } as never), ["event-append", "authority-cas"]);
+    assert.deepEqual(lifecycleSemanticFaultBoundaries({
+      commandType: "disposition-child-report",
+      disposition: { kind: "rejected" },
+    } as never), ["event-append"]);
+    assert.deepEqual(lifecycleSemanticFaultBoundaries({
+      commandType: "disposition-child-report",
+      disposition: { kind: "rejected" },
+    } as never, { beforeAppend: () => undefined }), ["event-append", "authority-cas"]);
+    assert.deepEqual(classify("propose-child-completion"), ["event-append", "authority-cas"]);
+    assert.deepEqual(classify("complete-child-session"), ["event-append", "authority-cas"]);
+    assert.deepEqual(classify("amend-child-assignment"), ["event-append"]);
+    assert.deepEqual(classify("record-child-report"), ["event-append"]);
+    assert.deepEqual(classify("internal-workflow-phase", {
+      action: "carry-forward-child",
+      expectedChildState: "active",
+    }), [
+      "event-append", "workflow-phase", "authority-cas", "session-suspend", "transfer-create",
+    ]);
+    assert.deepEqual(classify("internal-workflow-phase", {
+      action: "carry-forward-child",
+      expectedChildState: "suspended",
+    }), ["event-append", "workflow-phase", "authority-cas", "transfer-create"]);
   });
 
   it("treats only Version 3 checkpoint markers as frozen final state", () => {
@@ -726,7 +796,164 @@ describe("LifecycleCommandStore", () => {
       "event-append/before-write",
       "event-append/after-write-before-commit",
       "event-append/after-commit-before-response",
+      "authority-cas/after-commit-before-response",
+      "lease-update/after-commit-before-response",
       "generation-fence/after-commit-before-response",
+    ]);
+  });
+
+  it("dispatches the checkpoint authority alias only after the outer commit", () => {
+    const command = recordCheckpointCommand(1);
+    const intent = checkpointIntent(command);
+    const connection = new TransactionConnection();
+    const events = new FakeEvents(connection);
+    const hits: string[] = [];
+    const store = new LifecycleCommandStore({
+      connection,
+      events,
+      projectionWriter: recordingProjectionWriter(),
+      transaction: () => transaction(connection),
+      now: () => NOW,
+      faultInjector: {
+        hit(boundary, point): void { hits.push(`${boundary}/${point}`); },
+      },
+    });
+
+    store.execute(envelope({
+      commandType: command.commandType,
+      semanticCommand: command,
+      candidateIntentHash: intent.intentHash,
+      authoritativeIntentHash: intent.intentHash,
+    }), () => ({
+      append: { ...appendCommand(), commandType: command.commandType },
+      authorizationRecord: authorization(),
+      afterAppend: () => undefined,
+    }));
+
+    assert.deepEqual(hits, [
+      "event-append/before-write",
+      "event-append/after-write-before-commit",
+      "event-append/after-commit-before-response",
+      "authority-cas/after-commit-before-response",
+    ]);
+  });
+
+  it("dispatches the final-checkpoint authority alias only after the outer commit", () => {
+    const workflowId = "00000000-0000-4000-8000-000000000020" as
+      InternalWorkflowPhaseCommand["workflowId"];
+    const sessionId = "00000000-0000-4000-8000-000000000010" as
+      NonNullable<RootResumeCommandV2["sessionId"]>;
+    const plannedWorkId = "3".repeat(64);
+    const authorizationRecord: Extract<
+      PersistedLifecycleAuthorizationRecord,
+      { kind: "internal-workflow" }
+    > = {
+      kind: "internal-workflow",
+      workflowId,
+      workflowGeneration: 3n,
+      plannedWorkId,
+      claimOwnerId: "00000000-0000-4000-8000-000000000030",
+      claimToken: 7n,
+      authorizationSessionId: sessionId,
+      targetSessionId: sessionId,
+      presenting: principal("primary-a"),
+      target: principal("primary-a"),
+    };
+    const replayExpectation: LifecycleReplayExpectation = {
+      kind: "internal-workflow",
+      workflowId,
+      workflowGeneration: authorizationRecord.workflowGeneration,
+      plannedWorkId,
+      authorizationSessionId: authorizationRecord.authorizationSessionId,
+      targetSessionId: authorizationRecord.targetSessionId,
+      presenting: authorizationRecord.presenting,
+      target: authorizationRecord.target,
+    };
+    const command: InternalWorkflowPhaseCommand = {
+      commandType: "internal-workflow-phase",
+      commandId: SEMANTIC_COMMAND.commandId,
+      idempotencyKey: SEMANTIC_COMMAND.idempotencyKey,
+      agentId: SEMANTIC_COMMAND.agentId,
+      expectedProjectId: CONTEXT.binding.projectId,
+      expectedVaultId: CONTEXT.binding.vaultId,
+      expectedWorkspaceId: CONTEXT.binding.workspaceId,
+      expectedBranchRef: null,
+      workflowId,
+      workflowGeneration: 3,
+      plannedWorkId,
+      sourcePhase: "children-resolved",
+      claim: {
+        workflowId,
+        workflowGeneration: 3,
+        claimOwnerId: authorizationRecord.claimOwnerId,
+        claimToken: authorizationRecord.claimToken.toString(),
+        claimExpiresAt: "2026-07-14T00:10:00.000Z",
+      },
+      action: {
+        action: "record-final-checkpoint-and-queue-ending",
+        finalCheckpoint: checkpointFixture({
+          sessionId,
+          baseEventPosition: 1,
+          checkpointEventPosition: 2,
+        }),
+        materializationTarget: "memory/final.md",
+      },
+    };
+    const intent = buildLifecycleIntentWitness(command, {
+      authorizationKind: "internal-workflow",
+      authorizationSessionId: authorizationRecord.authorizationSessionId,
+      targetSessionId: authorizationRecord.targetSessionId,
+      projectId: CONTEXT.binding.projectId,
+      vaultId: CONTEXT.binding.vaultId,
+      storeId: CONTEXT.binding.storeId,
+      workspaceId: CONTEXT.binding.workspaceId,
+      clientNamespace: CONTEXT.binding.clientNamespace,
+      capabilityKind: null,
+      capabilityGeneration: null,
+      presentingActorRole: authorizationRecord.presenting.actorRole,
+      presentingClientInstanceId: authorizationRecord.presenting.clientInstanceId,
+      targetActorRole: authorizationRecord.target.actorRole,
+      targetClientInstanceId: authorizationRecord.target.clientInstanceId,
+      internalWorkflowId: workflowId,
+      internalWorkflowGeneration: 3,
+      internalPlannedWorkId: plannedWorkId,
+    });
+    const connection = new TransactionConnection();
+    const events = new FakeEvents(connection);
+    const hits: string[] = [];
+    const store = new LifecycleCommandStore({
+      connection,
+      events,
+      projectionWriter: recordingProjectionWriter(),
+      transaction: () => transaction(connection),
+      now: () => NOW,
+      faultInjector: {
+        hit(boundary, point): void { hits.push(`${boundary}/${point}`); },
+      },
+    });
+
+    store.execute(envelope({
+      commandType: command.commandType,
+      semanticCommand: command,
+      candidateIntentHash: intent.intentHash,
+      authoritativeIntentHash: intent.intentHash,
+      capabilityKind: null,
+      capabilityGeneration: null,
+      replayExpectation,
+    }), () => ({
+      append: { ...appendCommand(), commandType: command.commandType },
+      authorizationRecord,
+      afterAppend: () => undefined,
+    }));
+
+    assert.deepEqual(hits, [
+      "event-append/before-write",
+      "event-append/after-write-before-commit",
+      "event-append/after-commit-before-response",
+      "workflow-phase/after-commit-before-response",
+      "authority-cas/after-commit-before-response",
+      "final-checkpoint/after-commit-before-response",
+      "outbox-insert/after-commit-before-response",
     ]);
   });
 

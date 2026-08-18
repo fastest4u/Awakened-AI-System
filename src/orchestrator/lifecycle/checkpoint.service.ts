@@ -1375,7 +1375,7 @@ export class CheckpointService {
         invokeCheckpointFault(
           this.#faultInjector,
           "after-checkpoint-index-before-marker-clear",
-          "final-checkpoint",
+          "authority-cas",
           "after-write-before-commit",
           faultContext,
         );

@@ -1982,50 +1982,107 @@ function semanticActionName(
     : null;
 }
 
+function semanticActionRecord(
+  command: LifecycleCommandEnvelope["semanticCommand"],
+): Readonly<Record<string, unknown>> | null {
+  const candidate = command as unknown as Readonly<Record<string, unknown>>;
+  const action = candidate.action;
+  return typeof action === "object" && action !== null && !Array.isArray(action)
+    ? action as Readonly<Record<string, unknown>>
+    : null;
+}
+
+function semanticDispositionKind(
+  command: LifecycleCommandEnvelope["semanticCommand"],
+): string | null {
+  const candidate = command as unknown as Readonly<Record<string, unknown>>;
+  const disposition = candidate.disposition;
+  if (typeof disposition !== "object" || disposition === null || Array.isArray(disposition)) return null;
+  const descriptor = Reflect.getOwnPropertyDescriptor(disposition, "kind");
+  return descriptor !== undefined && "value" in descriptor && typeof descriptor.value === "string"
+    ? descriptor.value
+    : null;
+}
+
 /**
  * Logical aliases whose commit boundary is owned by this outer transaction.
  * Physical repository sub-boundaries remain classified at their exact owners.
  */
 export function lifecycleSemanticFaultBoundaries(
   command: LifecycleCommandEnvelope["semanticCommand"],
+  prepared?: { readonly beforeAppend?: unknown },
 ): readonly LifecycleDurableBoundary[] {
   const boundaries: LifecycleDurableBoundary[] = ["event-append"];
   switch (command.commandType) {
+    case "root-start":
+      boundaries.push("authority-cas", "lease-update");
+      break;
     case "root-resume":
-    case "claim-child-transfer":
-      boundaries.push("generation-fence");
+      boundaries.push("authority-cas", "lease-update", "generation-fence");
       break;
     case "root-recovery":
-      boundaries.push("ownership-recovery", "generation-fence");
+      boundaries.push(
+        "authority-cas",
+        "lease-update",
+        "ownership-recovery",
+        "generation-fence",
+      );
       break;
     case "root-suspend":
-      boundaries.push("session-suspend");
+      boundaries.push("authority-cas", "lease-update", "session-suspend");
+      break;
+    case "record-checkpoint":
+      boundaries.push("authority-cas");
+      break;
+    case "fork-child":
+    case "propose-child-completion":
+    case "complete-child-session":
+      boundaries.push("authority-cas");
+      break;
+    case "disposition-child-report": {
+      const kind = semanticDispositionKind(command);
+      if (kind === "accepted" || kind === "partially-accepted" || prepared?.beforeAppend !== undefined) {
+        boundaries.push("authority-cas");
+      }
+      break;
+    }
+    case "suspend-child-session":
+      boundaries.push("authority-cas", "session-suspend", "transfer-create");
+      break;
+    case "claim-child-transfer":
+      boundaries.push("authority-cas", "transfer-claim", "generation-fence");
       break;
     case "request-session-end":
-      boundaries.push("workflow-create");
+      boundaries.push("authority-cas", "lease-update", "workflow-create");
       break;
     case "cancel-session-end":
-      boundaries.push("cancellation-rewrite");
+      boundaries.push("authority-cas", "lease-update", "cancellation-rewrite");
       break;
     case "abandon-session":
-      boundaries.push("abandonment-rewrite");
+      boundaries.push("authority-cas", "lease-update", "abandonment-rewrite");
       break;
     case "internal-validation-result":
-      boundaries.push("validation-result");
+      boundaries.push("authority-cas", "validation-result");
       break;
     case "internal-workflow-phase": {
       boundaries.push("workflow-phase");
       const action = semanticActionName(command);
       if (action === "record-final-checkpoint-and-queue-ending") {
-        boundaries.push("final-checkpoint", "outbox-insert");
+        boundaries.push("authority-cas", "final-checkpoint", "outbox-insert");
+      } else if (action === "carry-forward-child") {
+        boundaries.push("authority-cas");
+        if (semanticActionRecord(command)?.expectedChildState !== "suspended") {
+          boundaries.push("session-suspend");
+        }
+        boundaries.push("transfer-create");
       } else if (
         action === "record-verification-passed"
         || action === "record-verification-failed"
         || action === "invalidate-verification"
       ) {
-        boundaries.push("verification-event");
+        boundaries.push("authority-cas", "verification-event");
       } else if (action === "append-terminal-completion") {
-        boundaries.push("final-source-state-check", "session-ended");
+        boundaries.push("authority-cas", "final-source-state-check", "session-ended");
       } else if (action === "abandon-root" || action === "abandon-generation") {
         boundaries.push("abandonment-rewrite");
       }
@@ -2164,6 +2221,7 @@ export class LifecycleCommandStore {
       assertEnvelope(resolvedEnvelope);
       const semanticFaultBoundaries = lifecycleSemanticFaultBoundaries(
         resolvedEnvelope.semanticCommand,
+        next,
       );
       const authorizationFingerprint = integrityFingerprint(next.authorizationRecord);
       assertAppendIdentity(resolvedEnvelope, next);

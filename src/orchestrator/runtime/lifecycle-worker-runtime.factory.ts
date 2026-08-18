@@ -126,10 +126,10 @@ export interface LifecycleRuntimeIdentitySource {
 }
 
 export interface LifecycleRuntimeRepositoryFactories {
-  authority(): SessionAuthorityRepository;
-  leases(): SessionLeaseRepository;
+  authority(options?: { readonly faultInjector?: LifecycleFaultInjector }): SessionAuthorityRepository;
+  leases(options?: { readonly faultInjector?: LifecycleFaultInjector }): SessionLeaseRepository;
   approvals(): LifecycleApprovalRepository;
-  transfers(): ChildTransferRepository;
+  transfers(options?: { readonly faultInjector?: LifecycleFaultInjector }): ChildTransferRepository;
   coverage(provider: CapabilityKeyProvider): EvidenceCoverageRepository;
   projection(connection: SqliteConnection): LifecycleProjectionWriter;
 }
@@ -825,10 +825,10 @@ implements LifecycleWorkerRuntimeFactoryPort {
     const faultInjectorOptions = options.faultInjector === undefined
       ? {}
       : { faultInjector: options.faultInjector };
-    const authority = options.repositories.authority();
-    const leases = options.repositories.leases();
+    const authority = options.repositories.authority(faultInjectorOptions);
+    const leases = options.repositories.leases(faultInjectorOptions);
     const approvals = options.repositories.approvals();
-    const transfers = options.repositories.transfers();
+    const transfers = options.repositories.transfers(faultInjectorOptions);
     const coverage = options.repositories.coverage(input.keyProvider);
     const projectionWriter = options.repositories.projection(input.connection);
     const validationResultsRepository = new LifecycleValidationResultRepository();

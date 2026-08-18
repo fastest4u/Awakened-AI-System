@@ -262,6 +262,7 @@ interface RuntimeCounters {
   readonly operationalFacadeInputs: unknown[];
   readonly coverageProviders: unknown[];
   readonly projectionConnections: unknown[];
+  readonly repositoryFaultInjectors: unknown[];
 }
 
 interface RuntimeFixture {
@@ -414,7 +415,7 @@ function observedRepository<T extends object>(
   });
 }
 
-function runtimeFixture(): RuntimeFixture {
+function runtimeFixture(faultInjector?: import("../src/orchestrator/lifecycle/lifecycle-faults.js").LifecycleFaultInjector): RuntimeFixture {
   const counters: RuntimeCounters = {
     repositories: { authority: 0, leases: 0, approvals: 0, transfers: 0, coverage: 0, projection: 0 },
     commandFacades: 0,
@@ -438,6 +439,7 @@ function runtimeFixture(): RuntimeFixture {
     operationalFacadeInputs: [],
     coverageProviders: [],
     projectionConnections: [],
+    repositoryFaultInjectors: [],
   };
   const driver = new NodeSqliteDriver({ DatabaseSync });
   counters.driverOpens += 1;
@@ -466,10 +468,22 @@ function runtimeFixture(): RuntimeFixture {
   let coverage: EvidenceCoverageRepository | null = null;
   let projectionWriter: LifecycleProjectionWriter | null = null;
   const repositories: LifecycleRuntimeRepositoryFactories = {
-    authority: () => { counters.repositories.authority += 1; return authority; },
-    leases: () => { counters.repositories.leases += 1; return leases; },
+    authority: (repositoryOptions) => {
+      counters.repositories.authority += 1;
+      counters.repositoryFaultInjectors.push(repositoryOptions?.faultInjector);
+      return authority;
+    },
+    leases: (repositoryOptions) => {
+      counters.repositories.leases += 1;
+      counters.repositoryFaultInjectors.push(repositoryOptions?.faultInjector);
+      return leases;
+    },
     approvals: () => { counters.repositories.approvals += 1; return approvals; },
-    transfers: () => { counters.repositories.transfers += 1; return transfers; },
+    transfers: (repositoryOptions) => {
+      counters.repositories.transfers += 1;
+      counters.repositoryFaultInjectors.push(repositoryOptions?.faultInjector);
+      return transfers;
+    },
     coverage: (observedProvider) => {
       counters.repositories.coverage += 1;
       counters.coverageProviders.push(observedProvider);
@@ -588,6 +602,7 @@ function runtimeFixture(): RuntimeFixture {
         return null;
       },
       repositories,
+      ...(faultInjector === undefined ? {} : { faultInjector }),
       transactionFacades,
     });
     const runtime = factory.create({ connection, maintenanceFence, keyProvider: provider });
@@ -1126,6 +1141,16 @@ const RESERVED_NONSEMANTIC = [
 ] as const;
 
 describe("lifecycle worker runtime", () => {
+  it("forwards one fixture fault injector to all physical semantic repositories", () => {
+    const injector = { hit: () => undefined };
+    const item = runtimeFixture(injector);
+    try {
+      assert.deepEqual(item.counters.repositoryFaultInjectors, [injector, injector, injector]);
+    } finally {
+      cleanupRuntimeFixture(item);
+    }
+  });
+
   it("checkpoints run through one prepared semantic transaction", async () => {
     const service = spyCheckpointRecords();
     const item = runtimeFixture();

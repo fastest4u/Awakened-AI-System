@@ -10,7 +10,6 @@ import type {
   CurrentChildEndingScopeProjectionRecord,
   SessionAuthorityRecord,
 } from "../storage/lifecycle-storage.types.js";
-import { createHash } from "node:crypto";
 import {
   decodeLifecycleSemanticCommandDraft,
   type RecordEvidenceBatchCommandV2,
@@ -38,11 +37,7 @@ import type { FreshLifecycleEffect } from "./checkpoint.service.js";
 import type { LifecycleCommandTransaction } from "./lifecycle-command.store.js";
 import type { SessionAggregateState } from "./session-aggregate.js";
 import { canonicalJson } from "../serialization/canonical-json.js";
-import {
-  NO_LIFECYCLE_FAULTS,
-  type LifecycleFaultContext,
-  type LifecycleFaultInjector,
-} from "./lifecycle-faults.js";
+import type { LifecycleFaultInjector } from "./lifecycle-faults.js";
 
 const LOWER_HASH = /^[0-9a-f]{64}$/u;
 const LOWER_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
@@ -616,7 +611,6 @@ function assertPreparedPayloadMatchesCommand(
 
 export class EvidenceCoverageService {
   readonly #invocations: EvidenceCoverageInvocationScope;
-  readonly #faults: LifecycleFaultInjector;
 
   constructor(options: EvidenceCoverageServiceOptions) {
     if (
@@ -625,7 +619,6 @@ export class EvidenceCoverageService {
       || typeof options.invocationScope?.current !== "function"
     ) invalid();
     this.#invocations = options.invocationScope;
-    this.#faults = options.faultInjector ?? NO_LIFECYCLE_FAULTS;
   }
 
   record(
@@ -637,18 +630,6 @@ export class EvidenceCoverageService {
     const command = decoded;
     const invocation = this.#invocations.current(transaction, command);
     assertInvocation(command, invocation);
-    const faultContext: LifecycleFaultContext = Object.freeze({
-      projectId: invocation.context.binding.projectId,
-      sessionId: command.sessionId,
-      workflowId: null,
-      commandId: command.commandId,
-      idempotencyKeyHash: createHash("sha256")
-        .update(command.idempotencyKey, "utf8")
-        .digest("hex"),
-      workId: command.batchId,
-      eventPosition: null,
-      materializationRevision: null,
-    });
     const authority = authorityOperations(transaction);
     const transfers = transferOperations(transaction);
     const coverage = coverageOperations(transaction);
@@ -741,10 +722,6 @@ export class EvidenceCoverageService {
           preparedHandle,
           event as StoredEvent,
         );
-        this.#faults.hit("event-append", "after-write-before-commit", Object.freeze({
-          ...faultContext,
-          eventPosition: event.globalPosition.toString(),
-        }));
       },
     };
   }

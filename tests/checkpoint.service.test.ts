@@ -593,6 +593,7 @@ async function checkpointServiceFixture(options: {
   readonly basePosition?: bigint;
   readonly markerPosition?: bigint | null;
   readonly faultPoint?: string;
+  readonly lifecycleFaultHits?: string[];
   readonly freshCapabilityGeneration?: string | null;
   readonly corruptLatestCheckpointFingerprint?: boolean;
   readonly corruptChildLatestCheckpointFingerprint?: boolean;
@@ -668,9 +669,15 @@ async function checkpointServiceFixture(options: {
           missingIntervals: Object.freeze([{ firstOrdinal: "5", lastOrdinal: "6" }]),
         }),
       },
-      faultInjector: options.faultPoint === undefined ? undefined : (point: string) => {
-        if (point === options.faultPoint) throw new Error("INJECTED_CHECKPOINT_CRASH");
-      },
+      faultInjector: options.lifecycleFaultHits !== undefined
+        ? {
+            hit: (boundary: string, point: string) => {
+              options.lifecycleFaultHits?.push(`${boundary}/${point}`);
+            },
+          }
+        : options.faultPoint === undefined ? undefined : (point: string) => {
+            if (point === options.faultPoint) throw new Error("INJECTED_CHECKPOINT_CRASH");
+          },
     }),
     harness,
     context,
@@ -1850,6 +1857,21 @@ describe("CheckpointService transactional enrichment", () => {
       );
       assert.equal(fixture.harness.calls.checkpointUpdates.length, 1);
       assert.equal(fixture.harness.calls.clears.length, 0);
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it("reports the checkpoint-index authority CAS on both sides of its write", async () => {
+    const hits: string[] = [];
+    const fixture = await checkpointServiceFixture({ markerPosition: 41n, lifecycleFaultHits: hits });
+    try {
+      const effect = fixture.service.record(fixture.harness.transaction, checkpointCommand());
+      effect.afterAppend(committedCheckpointBatch(), fixture.harness.transaction);
+      assert.deepEqual(hits, [
+        "authority-cas/before-write",
+        "authority-cas/after-write-before-commit",
+      ]);
     } finally {
       fixture.cleanup();
     }

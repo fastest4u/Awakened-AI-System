@@ -21,6 +21,11 @@ import {
   MAX_SESSION_AMBIGUITY_SUMMARIES,
 } from "../lifecycle/errors.js";
 import {
+  NO_LIFECYCLE_FAULTS,
+  type LifecycleFaultContext,
+  type LifecycleFaultInjector,
+} from "../lifecycle/lifecycle-faults.js";
+import {
   assertAuthorityMirror,
   foldSession,
   type SessionAggregateState,
@@ -201,6 +206,26 @@ function int64(value: unknown, allowZero = false): bigint {
 
 function nullableInt64(value: unknown, allowZero = false): bigint | null {
   return value === null ? null : int64(value, allowZero);
+}
+
+function checkpointRequirementEligible(
+  connection: SqliteConnection,
+  projectId: string,
+  sessionId: string,
+  eventPosition: bigint,
+): boolean {
+  const columns = ["checkpoint_required_event_position", "terminal_event_position"] as const;
+  const row = connection.prepare(`
+    SELECT ${columns.join(", ")}
+    FROM session_authority
+    WHERE project_id = $projectId AND session_id = $sessionId
+  `).get({ $projectId: projectId, $sessionId: sessionId });
+  if (row === undefined) return false;
+  exactKeys(row, columns);
+  const currentPosition = nullableInt64(ownData(row, "checkpoint_required_event_position"));
+  const terminalPosition = nullableInt64(ownData(row, "terminal_event_position"));
+  return terminalPosition === null
+    && (currentPosition === null || currentPosition < eventPosition);
 }
 
 function version(value: unknown): number {
@@ -668,7 +693,30 @@ function decodeCurrentChildProjection(
   });
 }
 
+function authorityFaultContext(input: {
+  readonly projectId: string;
+  readonly sessionId: string;
+  readonly authorityEventPosition: bigint;
+}): LifecycleFaultContext {
+  return Object.freeze({
+    projectId: input.projectId as ProjectId,
+    sessionId: input.sessionId as SessionId,
+    workflowId: null,
+    commandId: null,
+    idempotencyKeyHash: null,
+    workId: null,
+    eventPosition: input.authorityEventPosition.toString(),
+    materializationRevision: null,
+  });
+}
+
 export class SessionAuthorityRepository {
+  readonly #faults: LifecycleFaultInjector;
+
+  constructor(options: { readonly faultInjector?: LifecycleFaultInjector } = {}) {
+    this.#faults = options.faultInjector ?? NO_LIFECYCLE_FAULTS;
+  }
+
   requireCheckpointAtEventPosition(
     connection: SqliteConnection,
     input: CheckpointAtEventPositionInput,
@@ -800,14 +848,22 @@ export class SessionAuthorityRepository {
 
   insertRoot(connection: SqliteConnection, input: RootAuthorityInsert): void {
     if (input.sessionKind !== "root") invalid();
-    const result = connection.prepare(INSERT_AUTHORITY).run(paramsFromRecord(input));
+    const params = paramsFromRecord(input);
+    const faultContext = authorityFaultContext(input);
+    this.#faults.hit("authority-cas", "before-write", faultContext);
+    const result = connection.prepare(INSERT_AUTHORITY).run(params);
     if (result.changes !== 1n) integrity();
+    this.#faults.hit("authority-cas", "after-write-before-commit", faultContext);
   }
 
   insertChild(connection: SqliteConnection, input: ChildAuthorityInsert): void {
     if (input.sessionKind !== "child") invalid();
-    const result = connection.prepare(INSERT_AUTHORITY).run(paramsFromRecord(input));
+    const params = paramsFromRecord(input);
+    const faultContext = authorityFaultContext(input);
+    this.#faults.hit("authority-cas", "before-write", faultContext);
+    const result = connection.prepare(INSERT_AUTHORITY).run(params);
     if (result.changes !== 1n) integrity();
+    this.#faults.hit("authority-cas", "after-write-before-commit", faultContext);
   }
 
   compareAndSwap(connection: SqliteConnection, input: AuthorityCompareAndSwap): boolean {
@@ -834,6 +890,12 @@ export class SessionAuthorityRepository {
     params.$expectedChildCapabilityGeneration = input.expectedChildCapabilityGeneration;
     params.$expectedCommitment = input.expectedAuthorityCommitment;
     const assignments = MUTABLE_FIELDS.map(([, column]) => `${column} = $next_${column}`).join(", ");
+    const faultContext = authorityFaultContext({
+      projectId: input.projectId,
+      sessionId: input.sessionId,
+      authorityEventPosition: input.next.authorityEventPosition,
+    });
+    this.#faults.hit("authority-cas", "before-write", faultContext);
     const result = connection.prepare(`
       UPDATE session_authority SET ${assignments}
       WHERE project_id = $projectId
@@ -845,6 +907,7 @@ export class SessionAuthorityRepository {
     `).run(params);
     if (result.changes === 0n) return false;
     if (result.changes !== 1n) integrity();
+    this.#faults.hit("authority-cas", "after-write-before-commit", faultContext);
     return true;
   }
 
@@ -1214,6 +1277,18 @@ export class SessionAuthorityRepository {
       input.sessionId,
       input.updatedAt,
     );
+    if (!checkpointRequirementEligible(
+      connection,
+      input.projectId,
+      input.sessionId,
+      input.eventPosition,
+    )) return;
+    const faultContext = authorityFaultContext({
+      projectId: input.projectId,
+      sessionId: input.sessionId,
+      authorityEventPosition: input.eventPosition,
+    });
+    this.#faults.hit("authority-cas", "before-write", faultContext);
     const result = connection.prepare(`
       UPDATE session_authority
       SET checkpoint_required_reason = $reason,
@@ -1233,6 +1308,9 @@ export class SessionAuthorityRepository {
       $updatedAt: updatedAt,
     });
     if (result.changes > 1n) integrity();
+    if (result.changes === 1n) {
+      this.#faults.hit("authority-cas", "after-write-before-commit", faultContext);
+    }
   }
 
   clearCheckpointRequired(connection: SqliteConnection, input: CheckpointClear): boolean {

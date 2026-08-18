@@ -1549,6 +1549,214 @@ function errorCode(error: unknown): string | undefined {
 }
 
 describe("scoped child lifecycle", () => {
+  it("exposes transfer create and claim hooks at their exact SQL writes", () => {
+    const writes: string[] = [];
+    const hits: Array<{ readonly label: string; readonly context: Readonly<Record<string, unknown>> }> = [];
+    const transferTicketId = lifecycleUuid(40_001);
+    const sourceChildSessionId = lifecycleUuid(40_002);
+    const sourceParentSessionId = lifecycleUuid(40_003);
+    const checkpointId = lifecycleUuid(40_004);
+    const unclaimedRow: SqliteRow = {
+      project_id: PROJECT_ID,
+      transfer_ticket_id: transferTicketId,
+      source_parent_session_id: sourceParentSessionId,
+      source_child_session_id: sourceChildSessionId,
+      source_assignment_json: canonicalJson({}),
+      source_scope_json: canonicalJson({}),
+      checkpoint_id: checkpointId,
+      follow_ups_json: canonicalJson([{
+        childTransferAnnotationsVersion: 1,
+        blockers: [],
+        followUps: [],
+      }]),
+      source_state_json: canonicalJson({}),
+      lineage_json: canonicalJson({}),
+      created_event_position: 10n,
+      created_at: new Date(1_000).toISOString(),
+      claimed_by_root_session_id: null,
+      claimed_child_session_id: null,
+      claimed_event_position: null,
+      claimed_at: null,
+    };
+    const connection = {
+      exec: () => undefined,
+      close: () => undefined,
+      prepare: (sql: string): SqliteStatement => ({
+        run: () => {
+          writes.push(sql);
+          return { changes: 1n, lastInsertRowid: 0n };
+        },
+        get: () => unclaimedRow,
+        all: () => [],
+        iterate: () => [][Symbol.iterator]() as IterableIterator<SqliteRow>,
+      }),
+    } as SqliteConnection;
+    const FaultingRepository = ChildTransferRepository as unknown as new(options: {
+      readonly faultInjector: {
+        hit(boundary: string, point: string, context: Readonly<Record<string, unknown>>): void;
+      };
+    }) => ChildTransferRepository;
+    const repository = new FaultingRepository({
+      faultInjector: {
+        hit(boundary, point, context): void {
+          const label = `${boundary}/${point}`;
+          hits.push({ label, context });
+          if (label === "transfer-claim/after-write-before-commit") {
+            throw new Error("injected transfer claim fault");
+          }
+        },
+      },
+    });
+    repository.insert(connection, {
+      projectId: PROJECT_ID,
+      transferTicketId,
+      sourceParentSessionId,
+      sourceChildSessionId,
+      sourceAssignment: {},
+      sourceScope: {},
+      checkpointId,
+      blockers: [],
+      followUps: [],
+      sourceState: {},
+      lineage: {},
+      createdEventPosition: 10n,
+      createdAtMs: 1_000n,
+    });
+    const claimedChildSessionId = lifecycleUuid(40_005);
+    assert.throws(() => repository.claim(connection, {
+      projectId: PROJECT_ID,
+      transferTicketId,
+      expectedCreatedEventPosition: 10n,
+      claimedByRootSessionId: lifecycleUuid(40_006),
+      claimedChildSessionId,
+      claimedEventPosition: 11n,
+      claimedAtMs: 1_001n,
+    }), /injected transfer claim fault/u);
+
+    assert.equal(writes.length, 2);
+    assert.deepEqual(hits.map((hit) => hit.label), [
+      "transfer-create/before-write",
+      "transfer-create/after-write-before-commit",
+      "transfer-claim/before-write",
+      "transfer-claim/after-write-before-commit",
+    ]);
+    assert.deepEqual(hits.map((hit) => hit.context), [
+      {
+        projectId: PROJECT_ID,
+        sessionId: sourceChildSessionId,
+        workflowId: null,
+        commandId: null,
+        idempotencyKeyHash: null,
+        workId: transferTicketId,
+        eventPosition: "10",
+        materializationRevision: null,
+      },
+      {
+        projectId: PROJECT_ID,
+        sessionId: sourceChildSessionId,
+        workflowId: null,
+        commandId: null,
+        idempotencyKeyHash: null,
+        workId: transferTicketId,
+        eventPosition: "10",
+        materializationRevision: null,
+      },
+      {
+        projectId: PROJECT_ID,
+        sessionId: claimedChildSessionId,
+        workflowId: null,
+        commandId: null,
+        idempotencyKeyHash: null,
+        workId: transferTicketId,
+        eventPosition: "11",
+        materializationRevision: null,
+      },
+      {
+        projectId: PROJECT_ID,
+        sessionId: claimedChildSessionId,
+        workflowId: null,
+        commandId: null,
+        idempotencyKeyHash: null,
+        workId: transferTicketId,
+        eventPosition: "11",
+        materializationRevision: null,
+      },
+    ]);
+  });
+
+  it("does not report a transfer claim write for stale or already-claimed tickets", () => {
+    const transferTicketId = lifecycleUuid(40_011);
+    const claimedByRootSessionId = lifecycleUuid(40_012);
+    const claimedChildSessionId = lifecycleUuid(40_013);
+    const baseRow: SqliteRow = {
+      project_id: PROJECT_ID,
+      transfer_ticket_id: transferTicketId,
+      source_parent_session_id: lifecycleUuid(40_014),
+      source_child_session_id: lifecycleUuid(40_015),
+      source_assignment_json: canonicalJson({}),
+      source_scope_json: canonicalJson({}),
+      checkpoint_id: lifecycleUuid(40_016),
+      follow_ups_json: canonicalJson([{
+        childTransferAnnotationsVersion: 1,
+        blockers: [],
+        followUps: [],
+      }]),
+      source_state_json: canonicalJson({}),
+      lineage_json: canonicalJson({}),
+      created_event_position: 10n,
+      created_at: new Date(1_000).toISOString(),
+      claimed_by_root_session_id: null,
+      claimed_child_session_id: null,
+      claimed_event_position: null,
+      claimed_at: null,
+    };
+    const claimedRow: SqliteRow = {
+      ...baseRow,
+      claimed_by_root_session_id: claimedByRootSessionId,
+      claimed_child_session_id: claimedChildSessionId,
+      claimed_event_position: 11n,
+      claimed_at: new Date(1_001).toISOString(),
+    };
+
+    for (const scenario of [
+      { expectedCreatedEventPosition: 9n, row: baseRow },
+      { expectedCreatedEventPosition: 10n, row: claimedRow },
+    ]) {
+      const hits: string[] = [];
+      let writes = 0;
+      const connection = {
+        exec: () => undefined,
+        close: () => undefined,
+        prepare: (): SqliteStatement => ({
+          run: () => {
+            writes += 1;
+            return { changes: 0n, lastInsertRowid: 0n };
+          },
+          get: () => scenario.row,
+          all: () => [],
+          iterate: () => [][Symbol.iterator]() as IterableIterator<SqliteRow>,
+        }),
+      } as SqliteConnection;
+      const repository = new ChildTransferRepository({
+        faultInjector: {
+          hit(boundary, point): void { hits.push(`${boundary}/${point}`); },
+        },
+      });
+
+      assert.throws(() => repository.claim(connection, {
+        projectId: PROJECT_ID,
+        transferTicketId,
+        expectedCreatedEventPosition: scenario.expectedCreatedEventPosition,
+        claimedByRootSessionId,
+        claimedChildSessionId,
+        claimedEventPosition: 12n,
+        claimedAtMs: 1_002n,
+      }), (error: unknown) => errorCode(error) === "EVENT_CONFLICT");
+      assert.deepEqual(hits, []);
+      assert.equal(writes, 0);
+    }
+  });
+
   it("rejects an exactly-full bounded ending-scope page before estimation or state growth", () => {
     for (const projectionKind of ["current-child", "carry-forward-ticket"] as const) {
       const capacity = capacityHarness();

@@ -562,6 +562,104 @@ describe("SessionAuthorityRepository strict rows", () => {
 });
 
 describe("SessionAuthorityRepository inserts, CAS, and queries", () => {
+  it("treats root and child authority inserts as authority-cas physical writes", () => {
+    const trace: string[] = [];
+    const connection = new RecordingConnection((_sql, kind) => {
+      if (kind !== "run") throw new Error("unexpected statement method");
+      trace.push("sql-write");
+      return { changes: 1n, lastInsertRowid: 1n };
+    });
+    const FaultingRepository = SessionAuthorityRepository as unknown as new(options: {
+      readonly faultInjector: {
+        hit(boundary: string, point: string, context: Readonly<Record<string, unknown>>): void;
+      };
+    }) => SessionAuthorityRepository;
+    const repository = new FaultingRepository({
+      faultInjector: {
+        hit(boundary, point, context): void {
+          trace.push(`${boundary}/${point}/${String(context.sessionId)}/${String(context.eventPosition)}`);
+        },
+      },
+    });
+
+    repository.insertRoot(connection, rootAuthority());
+    repository.insertChild(connection, childAuthority());
+
+    assert.deepEqual(trace, [
+      `authority-cas/before-write/${ROOT_SESSION_ID}/1`,
+      "sql-write",
+      `authority-cas/after-write-before-commit/${ROOT_SESSION_ID}/1`,
+      `authority-cas/before-write/${CHILD_SESSION_ID}/2`,
+      "sql-write",
+      `authority-cas/after-write-before-commit/${CHILD_SESSION_ID}/2`,
+    ]);
+  });
+
+  it("exposes authority CAS faults only around a SQL write with exact context", () => {
+    const current = childAuthority();
+    const next = childAuthority({
+      childCapabilityGeneration: 2n,
+      childHandleIssueNonce: HASH_B,
+      childHandleVerifier: HASH_B,
+      authorityEventPosition: 3n,
+      updatedAt: LATER,
+    });
+    const trace: string[] = [];
+    const connection = new RecordingConnection((sql, kind) => {
+      if (kind === "get") return authorityRow(current);
+      if (kind === "run" && /UPDATE session_authority/iu.test(sql)) {
+        trace.push("sql-write");
+        return { changes: 1n, lastInsertRowid: 0n };
+      }
+      throw new Error("unexpected statement method");
+    });
+    const FaultingRepository = SessionAuthorityRepository as unknown as new(options: {
+      readonly faultInjector: {
+        hit(boundary: string, point: string, context: Readonly<Record<string, unknown>>): void;
+      };
+    }) => SessionAuthorityRepository;
+    const repository = new FaultingRepository({
+      faultInjector: {
+        hit(boundary, point, context): void {
+          trace.push(`${boundary}/${point}`);
+          assert.deepEqual(context, {
+            projectId: PROJECT_ID,
+            sessionId: CHILD_SESSION_ID,
+            workflowId: null,
+            commandId: null,
+            idempotencyKeyHash: null,
+            workId: null,
+            eventPosition: "3",
+            materializationRevision: null,
+          });
+        },
+      },
+    });
+    const input = {
+      projectId: PROJECT_ID,
+      sessionId: CHILD_SESSION_ID,
+      expectedState: "active" as const,
+      expectedOwnerGeneration: null,
+      expectedChildCapabilityGeneration: 1n,
+      expectedAuthorityCommitment: current.authorityCommitment,
+      next: mutation(next),
+    };
+
+    assert.equal(repository.compareAndSwap(connection, input), true);
+    assert.deepEqual(trace, [
+      "authority-cas/before-write",
+      "sql-write",
+      "authority-cas/after-write-before-commit",
+    ]);
+
+    trace.length = 0;
+    assert.equal(repository.compareAndSwap(connection, {
+      ...input,
+      expectedState: "suspended",
+    }), false);
+    assert.deepEqual(trace, [], "a rejected precondition must not report a physical write");
+  });
+
   it("uses explicit complete inserts for roots and children without owning a transaction", () => {
     const runs: string[] = [];
     const connection = new RecordingConnection((sql, kind) => {
@@ -1251,8 +1349,14 @@ describe("SessionAuthorityRepository fold and checkpoint guards", () => {
 
   it("marks requirements monotonically and clears only from a covering checkpoint base", () => {
     const outcomes = [1n, 1n, 0n];
-    const connection = new RecordingConnection((_sql, kind) => {
-      if (kind === "get") return { created_at: NOW } as SqliteRow;
+    const connection = new RecordingConnection((sql, kind) => {
+      if (kind === "get" && /SELECT created_at/iu.test(sql)) return { created_at: NOW } as SqliteRow;
+      if (kind === "get" && /SELECT checkpoint_required_event_position/iu.test(sql)) {
+        return {
+          checkpoint_required_event_position: null,
+          terminal_event_position: null,
+        } as SqliteRow;
+      }
       if (kind === "run") {
         return { changes: outcomes.shift() ?? 0n, lastInsertRowid: 0n };
       }
@@ -1292,6 +1396,87 @@ describe("SessionAuthorityRepository fold and checkpoint guards", () => {
     assert.match(clearSql, /checkpoint_required_event_position\s*<=\s*\$checkpointBaseEventPosition/iu);
     assert.deepEqual(connection.execCalls, []);
     assert.equal(connection.closeCalls, 0);
+  });
+
+  it("reports checkpoint-required authority writes without taking over checkpoint-index ownership", () => {
+    const trace: string[] = [];
+    const connection = new RecordingConnection((sql, kind) => {
+      if (kind === "get" && /SELECT created_at/iu.test(sql)) return { created_at: NOW } as SqliteRow;
+      if (kind === "get" && /SELECT checkpoint_required_event_position/iu.test(sql)) {
+        return {
+          checkpoint_required_event_position: null,
+          terminal_event_position: null,
+        } as SqliteRow;
+      }
+      if (kind === "run") {
+        trace.push("sql-write");
+        return { changes: 1n, lastInsertRowid: 0n };
+      }
+      throw new Error("unexpected statement method");
+    });
+    const repository = new SessionAuthorityRepository({
+      faultInjector: {
+        hit(boundary, point, context): void {
+          trace.push(`${boundary}/${point}/${context.eventPosition}`);
+        },
+      },
+    });
+
+    repository.markCheckpointRequired(connection, {
+      projectId: PROJECT_ID,
+      sessionId: ROOT_SESSION_ID,
+      reason: "accepted-child-report",
+      eventPosition: 21n,
+      updatedAt: LATER,
+    });
+
+    assert.deepEqual(trace, [
+      "authority-cas/before-write/21",
+      "sql-write",
+      "authority-cas/after-write-before-commit/21",
+    ]);
+  });
+
+  it("does not report checkpoint-required writes for equal or superseded markers", () => {
+    const connection = migratedNativeConnection();
+    try {
+      new SessionAuthorityRepository().insertRoot(connection, rootAuthority());
+      const hits: string[] = [];
+      const repository = new SessionAuthorityRepository({
+        faultInjector: {
+          hit(boundary, point): void { hits.push(`${boundary}/${point}`); },
+        },
+      });
+      repository.markCheckpointRequired(connection, {
+        projectId: PROJECT_ID,
+        sessionId: ROOT_SESSION_ID,
+        reason: "ownership-transfer",
+        eventPosition: 21n,
+        updatedAt: LATER,
+      });
+      assert.deepEqual(hits, [
+        "authority-cas/before-write",
+        "authority-cas/after-write-before-commit",
+      ]);
+
+      hits.length = 0;
+      for (const eventPosition of [21n, 20n]) {
+        repository.markCheckpointRequired(connection, {
+          projectId: PROJECT_ID,
+          sessionId: ROOT_SESSION_ID,
+          reason: "superseded",
+          eventPosition,
+          updatedAt: LATER,
+        });
+      }
+      assert.deepEqual(hits, []);
+      assert.equal(
+        repository.get(connection, PROJECT_ID, ROOT_SESSION_ID)?.checkpointRequiredEventPosition,
+        21n,
+      );
+    } finally {
+      connection.close();
+    }
   });
 
   it("rejects an impossible checkpoint-required timestamp without corrupting SQLite round-trip reads", () => {
