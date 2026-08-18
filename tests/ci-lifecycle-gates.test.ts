@@ -25,6 +25,46 @@ const FOCUSED_TESTS = [
   "lifecycle-fixture-protocol", "lifecycle-worker-runtime", "lifecycle.stress",
 ];
 
+function structuralWorkflowLines(yaml: string): readonly string[] {
+  const structuralLines: string[] = [];
+  let blockScalarIndent: number | null = null;
+  for (const line of yaml.split("\n")) {
+    const indentation = /^[ ]*/.exec(line)?.[0].length ?? 0;
+    if (blockScalarIndent !== null) {
+      if (line.trim().length === 0 || indentation > blockScalarIndent) continue;
+      blockScalarIndent = null;
+    }
+    structuralLines.push(line);
+    if (/^\s*(?:-\s+)?[A-Za-z][A-Za-z0-9_-]*:\s*[>|][+-]?(?:\s+#.*)?$/.test(line)) {
+      blockScalarIndent = indentation;
+    }
+  }
+  return structuralLines;
+}
+
+function unquotedStructuralLine(line: string): string {
+  return line
+    .replace(/\$\{\{[\s\S]*?\}\}/g, () => "EXPRESSION")
+    .replace(/"(?:\\.|[^"\\])*"|'(?:''|[^'])*'/g, () => "SCALAR")
+    .replace(/\s+#.*$/, "");
+}
+
+function assertCanonicalWorkflowGrammar(yaml: string, label: string): void {
+  for (const line of structuralWorkflowLines(yaml)) {
+    if (line.trimStart().startsWith("#")) continue;
+    assert.doesNotMatch(
+      line,
+      /^\s*(?:-\s*)?(?:"(?:\\.|[^"\\])*"|'(?:''|[^'])*')\s*:/,
+      `${label} contains quoted YAML mapping key`,
+    );
+    const structural = unquotedStructuralLine(line);
+    assert.doesNotMatch(structural, /[{}\[\]]/, `${label} contains unsupported flow-style YAML`);
+    assert.doesNotMatch(structural, /(?:^|\s)<<\s*:/, `${label} contains unsupported YAML merge key`);
+    assert.doesNotMatch(structural, /[&*]/, `${label} contains unsupported YAML anchor or alias`);
+    assert.doesNotMatch(structural, /!/, `${label} contains unsupported YAML tag`);
+  }
+}
+
 function workflowJobs(yaml: string): ReadonlyMap<string, string> {
   const jobs = new Map<string, string>();
   const matches = [...yaml.matchAll(/^  ([a-z][a-z0-9_-]*):\n([\s\S]*?)(?=^  [a-z][a-z0-9_-]*:|(?![\s\S]))/gm)];
@@ -90,6 +130,8 @@ function workflowActions(job: string, ownerJob: string): readonly {
 }
 
 function assertWorkflowReleaseContract(ci: string, stress: string): void {
+  assertCanonicalWorkflowGrammar(ci, "CI workflow");
+  assertCanonicalWorkflowGrammar(stress, "stress workflow");
   const ciJobs = workflowJobs(ci);
   const stressJobs = workflowJobs(stress);
   const releaseGates = ciJobs.get("release-gates");
@@ -218,4 +260,59 @@ test("workflow parser closes conditional, scalar, and upload-owner bypasses", ()
     `${uploadBlock.replace("actions/upload-artifact@v7", "actions/upload-artifact@v6")}\n\n      - name: Upload stress logs`,
   );
   assert.throws(() => assertWorkflowReleaseContract(ci, extraUploader), /exactly one upload-artifact/);
+});
+
+test("workflow parser rejects quoted conditional keys before reading jobs", () => {
+  const ci = source(".github/workflows/ci.yml");
+  const stress = source(".github/workflows/sqlite-stress.yml");
+  assert.throws(
+    () => assertWorkflowReleaseContract(
+      ci.replace("  release-gates:\n", "  release-gates:\n    \"if\": ${{ !true }}\n"),
+      stress,
+    ),
+    /quoted YAML mapping key/,
+  );
+});
+
+test("workflow parser rejects quoted action keys before enumerating uploads", () => {
+  const ci = source(".github/workflows/ci.yml");
+  const stress = source(".github/workflows/sqlite-stress.yml");
+  const hiddenQuotedUpload = stress.replace(
+    "      - name: Upload stress logs",
+    [
+      "      - 'uses': 'actions/upload-artifact@v7'",
+      "        if: '${{ always() }}'",
+      "",
+      "      - name: Upload stress logs",
+    ].join("\n"),
+  );
+  assert.throws(() => assertWorkflowReleaseContract(ci, hiddenQuotedUpload), /quoted YAML mapping key/);
+});
+
+test("workflow parser rejects flow-style actions before enumerating uploads", () => {
+  const ci = source(".github/workflows/ci.yml");
+  const stress = source(".github/workflows/sqlite-stress.yml");
+  const hiddenFlowUpload = stress.replace(
+    "      - name: Upload stress logs",
+    [
+      "      - { uses: actions/upload-artifact@v7, if: ${{ always() }}, with: { path: ci-logs/sqlite-stress-${{ matrix.os }}.log } }",
+      "",
+      "      - name: Upload stress logs",
+    ].join("\n"),
+  );
+  assert.throws(() => assertWorkflowReleaseContract(ci, hiddenFlowUpload), /flow-style YAML/);
+});
+
+test("workflow parser rejects YAML anchors, aliases, merges, and tags in structural grammar", () => {
+  const ci = source(".github/workflows/ci.yml");
+  const stress = source(".github/workflows/sqlite-stress.yml");
+  const mutations = [
+    ci.replace("    name: Node", "    name: &ci_name Node"),
+    ci.replace("    name: Node", "    name: *ci_name"),
+    ci.replace("    name: Node", "    <<: *ci_defaults\n    name: Node"),
+    ci.replace("    name: Node", "    name: !ci_tag Node"),
+  ];
+  for (const mutatedCi of mutations) {
+    assert.throws(() => assertWorkflowReleaseContract(mutatedCi, stress), /unsupported YAML (?:anchor|alias|merge key|tag)/);
+  }
 });
