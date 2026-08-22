@@ -1,4 +1,4 @@
-import matter from "gray-matter";
+import { LineCounter, parseDocument } from "yaml";
 
 /**
  * Severity taxonomy for every frontmatter / vault diagnostic.
@@ -79,12 +79,10 @@ const DELIMITER = /^---[ \t]*\r?$/;
 /**
  * Parse frontmatter from a markdown string WITHOUT EVER THROWING.
  *
- * gray-matter (js-yaml under the hood) throws a YAMLException on unclosed
- * blocks, duplicate keys, unquoted colons and bad indentation. The historic
- * read paths called `matter()` directly, so a single malformed note crashed
- * the entire retrieval surface. This wrapper performs structural pre-checks on
- * the raw delimiters, isolates the YAML parse in a try/catch, classifies the
- * failure into an actionable diagnostic, and always returns a usable result.
+ * A YAML parser can reject unclosed blocks, duplicate keys, unquoted colons,
+ * and bad indentation. This wrapper performs structural pre-checks on raw
+ * delimiters, isolates the YAML parse in a try/catch, classifies each failure
+ * into an actionable diagnostic, and always returns a usable result.
  */
 export function parseFrontmatter(input: unknown): ParsedFrontmatter {
   const raw = typeof input === "string" ? input : "";
@@ -186,34 +184,53 @@ export function parseFrontmatter(input: unknown): ParsedFrontmatter {
     }
   }
 
-  // gray-matter only recognizes frontmatter at byte 0, so feed it a copy that
-  // starts exactly at the opening delimiter (after BOM / leading-blank fixes).
-  const toParse = leadingBlank ? lines.slice(openIdx).join("\n") : content;
   try {
-    // gray-matter caches results keyed by the input string; on a re-parse of an
-    // identical malformed note it returns the cached (non-throwing, empty)
-    // result instead of throwing again, which would silently drop a critical
-    // diagnostic the second time. Clear the cache so parsing is idempotent.
-    // (clearCache exists at runtime but is absent from gray-matter's types.)
-    (matter as unknown as { clearCache?: () => void }).clearCache?.();
-    const result = matter(toParse);
-    const data = result.data && typeof result.data === "object" ? (result.data as Record<string, unknown>) : {};
-    return { hasFrontmatter: true, data, body: result.content ?? "", raw, eol, fieldLines, diagnostics };
+    const yamlSource = innerLines.join("\n");
+    const lineCounter = new LineCounter();
+    const document = parseDocument(yamlSource, {
+      schema: "yaml-1.1",
+      lineCounter,
+      strict: true,
+      uniqueKeys: true,
+    });
+    if (document.errors.length > 0) throw document.errors[0];
+
+    const data = document.toJS();
+    if (!isPlainRecord(data)) throw new FrontmatterTopLevelMappingError();
+    return { hasFrontmatter: true, data, body: lines.slice(closeIdx + 1).join("\n"), raw, eol, fieldLines, diagnostics };
   } catch (error) {
-    diagnostics.push(classifyYamlError(error, openIdx));
+    diagnostics.push(classifyYamlError(error, openIdx, innerLines.join("\n")));
     return { hasFrontmatter: true, data: {}, body: lines.slice(closeIdx + 1).join("\n"), raw, eol, fieldLines, diagnostics };
   }
 }
 
-/** Map a thrown js-yaml error to a specific, actionable diagnostic. */
-function classifyYamlError(error: unknown, openIdx: number): FrontmatterDiagnostic {
-  const message = error instanceof Error ? error.message : String(error);
-  const mark = (error as { mark?: { line?: number } } | null)?.mark;
-  // mark.line is 0-based within the YAML body (which begins on the file line
-  // AFTER the opening '---'). Convert to a 1-based file line.
-  const line = typeof mark?.line === "number" ? openIdx + 2 + mark.line : openIdx + 2;
+class FrontmatterTopLevelMappingError extends Error {
+  constructor() {
+    super("Frontmatter YAML must contain a top-level mapping.");
+  }
+}
 
-  if (/duplicated mapping key/i.test(message)) {
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
+/** Map a thrown YAML parser error to a specific, actionable diagnostic. */
+function classifyYamlError(error: unknown, openIdx: number, yamlSource: string): FrontmatterDiagnostic {
+  const message = error instanceof Error ? error.message : String(error);
+  const parserError = error as { linePos?: readonly { line?: number }[]; mark?: { line?: number } } | null;
+  const parserLine = parserError?.linePos?.[0]?.line;
+  const markLine = parserError?.mark?.line;
+  // YAML's linePos is already 1-based within the YAML body. js-yaml's mark
+  // remains supported for compatibility with callers that wrap parse errors.
+  const line = typeof parserLine === "number"
+    ? openIdx + 1 + parserLine
+    : typeof markLine === "number"
+      ? openIdx + 2 + markLine
+      : openIdx + 2;
+
+  if (/duplicated mapping key|map keys must be unique/i.test(message)) {
     return {
       code: "FRONTMATTER_DUPLICATE_KEY",
       severity: "critical",
@@ -223,7 +240,7 @@ function classifyYamlError(error: unknown, openIdx: number): FrontmatterDiagnost
       autoFixAvailable: false,
     };
   }
-  if (/bad indentation/i.test(message)) {
+  if (/bad indentation/i.test(message) || hasBadYamlIndentation(yamlSource)) {
     return {
       code: "FRONTMATTER_BAD_INDENTATION",
       severity: "critical",
@@ -233,7 +250,7 @@ function classifyYamlError(error: unknown, openIdx: number): FrontmatterDiagnost
       autoFixAvailable: false,
     };
   }
-  if (/mapping values are not allowed|incomplete explicit mapping pair|can not read|unexpected end|end of the stream|unexpected/i.test(message)) {
+  if (/mapping values are not allowed|incomplete explicit mapping pair|can not read|nested mappings are not allowed|unexpected end|end of the stream|unexpected/i.test(message)) {
     return {
       code: "FRONTMATTER_UNQUOTED_VALUE",
       severity: "critical",
@@ -251,6 +268,14 @@ function classifyYamlError(error: unknown, openIdx: number): FrontmatterDiagnost
     suggestion: "Check the YAML syntax (indentation, quotes, and colons).",
     autoFixAvailable: false,
   };
+}
+
+function hasBadYamlIndentation(yamlSource: string): boolean {
+  const lines = yamlSource.split(/\r?\n/);
+  return lines.some((line, index) => {
+    if (index === 0 || !/^[ \t]+\S/.test(line)) return false;
+    return /^[^ \t#][^:]*:\s*\S/.test(lines[index - 1]);
+  });
 }
 
 /**

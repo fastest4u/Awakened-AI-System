@@ -30,15 +30,25 @@
     "test": "npm run test:build && node --test --test-concurrency=1 --test-reporter=spec \"dist-test/tests/**/*.test.js\""
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.0.0",
+    "@modelcontextprotocol/sdk": "^1.30.0",
     "fast-glob": "^3.3.3",
-    "gray-matter": "^4.0.3",
+    "yaml": "^2.9.0",
     "zod": "^3.25.76"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
-    "esbuild": "^0.28.0",
-    "javascript-obfuscator": "^5.4.2",
+    "esbuild": "^0.28.2",
+    "javascript-obfuscator": "^5.5.1",
     "typescript": "^5.8.3"
+  },
+  "overrides": {
+    "@hono/node-server": "^1.19.15",
+    "hono": "^4.12.34",
+    "fast-uri": "^3.1.5",
+    "body-parser": "^2.3.0",
+    "ip-address": "^10.5.0",
+    "qs": "^6.15.3",
+    "brace-expansion": "^1.1.18",
+    "undici": "^6.28.0"
   }
 }
