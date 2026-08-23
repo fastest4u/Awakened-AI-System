@@ -8,6 +8,17 @@ import type {
 } from "../identity/contracts.js";
 
 /**
+ * Authenticated source authority for known projection events. The event store's
+ * canonical bytes and established payload hash are authoritative; `payload` is
+ * a redundant decoded cache and is intentionally never treated as source data.
+ */
+export const PROJECTION_SOURCE_AUTHORITY_V1 = Object.freeze({
+  canonicalPayloadField: "payloadJson",
+  payloadHashField: "payloadHash",
+  inMemoryPayloadRole: "non-authoritative-cache",
+} as const);
+
+/**
  * Immutable storage identity carried by every projected event and generation.
  * A nullable session denotes project/workspace/branch scoped material.
  */

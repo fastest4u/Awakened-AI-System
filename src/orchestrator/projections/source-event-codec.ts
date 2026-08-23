@@ -1,4 +1,5 @@
 import type { StoredEvent } from "../contracts/event.js";
+import { payloadHash } from "../crypto/event-hash.js";
 import type {
   BranchScopeId,
   ProjectId,
@@ -407,6 +408,7 @@ function validateKnownPayload(source: DecodedStoredEvent): DecodedStoredEvent {
   }
   assertBoundedJson(payload);
   if (canonicalJson(payload) !== payloadJson) return integrity();
+  if (payloadHash(payload) !== hash(source.record.payloadHash)) return integrity();
   return Object.freeze({ ...source, payload });
 }
 

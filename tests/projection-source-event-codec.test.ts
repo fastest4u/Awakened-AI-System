@@ -9,6 +9,8 @@ import type {
   VaultId,
   WorkspaceId,
 } from "../src/orchestrator/identity/contracts.js";
+import { payloadHash as eventPayloadHash } from "../src/orchestrator/crypto/event-hash.js";
+import { PROJECTION_SOURCE_AUTHORITY_V1 } from "../src/orchestrator/projections/contracts.js";
 import {
   decodeProjectionEvent,
   validateProjectionEvent,
@@ -79,7 +81,7 @@ function storedEvent(
     evidenceDigests: [],
     payload,
     payloadJson: canonicalJson(payload),
-    payloadHash: "5".repeat(64),
+    payloadHash: eventPayloadHash(payload),
     previousGlobalHash: "6".repeat(64),
     eventHash: "7".repeat(64),
     lifecycleIntentJson: null,
@@ -270,6 +272,54 @@ describe("projection source event codec", () => {
 
     assert.throws(() => decodeProjectionEvent(malformed), /INTEGRITY_FAILURE/u);
     assert.equal(ownKeysInvoked, false);
+  });
+
+  it("uses authenticated canonical bytes instead of a mismatched or accessor-bearing payload cache", () => {
+    assert.deepEqual(PROJECTION_SOURCE_AUTHORITY_V1, {
+      canonicalPayloadField: "payloadJson",
+      payloadHashField: "payloadHash",
+      inMemoryPayloadRole: "non-authoritative-cache",
+    });
+    const authoritativePayload = memoryPayload();
+    const authoritativeJson = canonicalJson(authoritativePayload);
+    const authoritativeHash = eventPayloadHash(authoritativePayload);
+    let invoked = false;
+    const accessorCache: Record<string, unknown> = {};
+    Object.defineProperty(accessorCache, "summary", {
+      enumerable: true,
+      get() {
+        invoked = true;
+        throw new Error("payload cache accessor executed");
+      },
+    });
+    const caches = [
+      memoryPayload({ summary: "This cache value is not authoritative." }),
+      accessorCache as JsonValue,
+    ];
+
+    for (const payload of caches) {
+      const decoded = decodeProjectionEvent(storedEvent("MemorySourceRecorded", authoritativePayload, {
+        payload,
+        payloadJson: authoritativeJson,
+        payloadHash: authoritativeHash,
+      }));
+      assert.equal(decoded.kind, "projected");
+      if (decoded.kind !== "projected" || decoded.event.kind !== "memory-source") continue;
+      assert.equal(
+        decoded.event.summary,
+        "Projection publication follows the authoritative event commit.",
+      );
+    }
+    assert.equal(invoked, false);
+  });
+
+  it("rejects canonical known payload bytes that do not match the stored payload hash", () => {
+    assert.throws(
+      () => decodeProjectionEvent(storedEvent("MemorySourceRecorded", memoryPayload(), {
+        payloadHash: "f".repeat(64),
+      })),
+      /INTEGRITY_FAILURE/u,
+    );
   });
 
   it("decodes governed memory and feedback sources with the complete private binding", () => {
