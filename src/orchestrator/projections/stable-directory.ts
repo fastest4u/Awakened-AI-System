@@ -23,7 +23,7 @@ const sidecarPresent = (name) => {
       return true;
     } catch (error) {
       if (error && error.code === "ENOENT") continue;
-      throw error;
+      integrity();
     }
   }
   return false;
@@ -45,7 +45,7 @@ try {
       unlinkSync(name);
     }
     process.stdout.write("cleaned");
-  } else if (operation === "assert-generation" || operation === "unlink-generation") {
+  } else if (operation === "assert-generation") {
     if (
       typeof filename !== "string"
       || basename(filename) !== filename
@@ -55,10 +55,7 @@ try {
     try {
       const entry = lstatSync(filename);
       if (!entry.isFile() || entry.isSymbolicLink()) invalid();
-      if (operation === "unlink-generation") {
-        unlinkSync(filename);
-        process.stdout.write("removed");
-      } else process.stdout.write("present");
+      process.stdout.write("present");
     } catch (error) {
       if (error && error.code === "ENOENT") process.stdout.write("missing");
       else throw error;
@@ -84,11 +81,6 @@ export interface StableProjectionDirectoryOperations {
     filename: string,
     identity: ProjectionDirectoryIdentity,
   ): void;
-  unlinkGeneration(
-    directory: string,
-    filename: string,
-    identity: ProjectionDirectoryIdentity,
-  ): "removed" | "missing";
 }
 
 function normalizedPath(path: string): string {
@@ -138,7 +130,7 @@ export function sameProjectionDirectoryIdentity(
 }
 
 function runStableMutation(
-  operation: "cleanup" | "assert-generation" | "unlink-generation",
+  operation: "cleanup" | "assert-generation",
   directory: string,
   identity: ProjectionDirectoryIdentity,
   filename?: string,
@@ -185,14 +177,5 @@ StableProjectionDirectoryOperations = Object.freeze({
     if (runStableMutation("assert-generation", directory, identity, filename) !== "present") {
       return invalid();
     }
-  },
-  unlinkGeneration(
-    directory: string,
-    filename: string,
-    identity: ProjectionDirectoryIdentity,
-  ): "removed" | "missing" {
-    const result = runStableMutation("unlink-generation", directory, identity, filename);
-    if (result !== "removed" && result !== "missing") return invalid();
-    return result;
   },
 });

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -254,6 +254,11 @@ describe("projection generation builder", () => {
     assert.equal(existsSync(generation.databasePath), true);
     assert.equal(existsSync(`${generation.databasePath}-wal`), false);
     assert.equal(existsSync(`${generation.databasePath}-shm`), false);
+    assert.deepEqual(
+      [...readFileSync(generation.databasePath).subarray(18, 20)],
+      [1, 1],
+      "published main image must use rollback journaling, not WAL header bytes",
+    );
     assert.match(generation.manifest.databaseSha256, /^[0-9a-f]{64}$/u);
 
     source.exec("ROLLBACK");
@@ -261,6 +266,8 @@ describe("projection generation builder", () => {
     source.close();
 
     const projected = new DatabaseSync(generation.databasePath, { readOnly: true });
+    assert.equal(existsSync(`${generation.databasePath}-wal`), false);
+    assert.equal(existsSync(`${generation.databasePath}-shm`), false);
     assert.deepEqual(
       projected.prepare("PRAGMA database_list").all().map((row) => row.name),
       ["main"],
@@ -289,6 +296,8 @@ describe("projection generation builder", () => {
       },
     );
     projected.close();
+    assert.equal(existsSync(`${generation.databasePath}-wal`), false);
+    assert.equal(existsSync(`${generation.databasePath}-shm`), false);
 
     assert.deepEqual(
       driver.opens.map((entry) => [entry.path, entry.options.mode]),

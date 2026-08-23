@@ -140,6 +140,18 @@ function emptySnapshot(onClose: () => void = () => undefined): ProjectionEventSn
   });
 }
 
+function denyingSidecarInspection(isArmed: () => boolean): ProjectionPathInspection {
+  return Object.freeze({
+    lstat(path: string) {
+      if (isArmed() && (path.endsWith("-wal") || path.endsWith("-shm"))) {
+        throw Object.assign(new Error("injected exact-sidecar lstat denial"), { code: "EACCES" });
+      }
+      return lstatSync(path);
+    },
+    realpath: (path: string) => realpathSync(path),
+  });
+}
+
 class PublishDuringAcquireRegistry extends ProjectionReaderLeaseRegistry {
   replacement: BuiltProjectionGeneration | null = null;
 
@@ -242,7 +254,7 @@ describe("projection build coordinator", () => {
     assert.equal(ninth.manifest.terminalEventPosition, "9");
     assert.equal(existsSync(firstDatabase), true, "leased retired generation must remain");
     oldReader.close();
-    assert.equal(existsSync(firstDatabase), false, "closed retired generation may be reclaimed");
+    assert.equal(existsSync(firstDatabase), true, "retired generation remains for audited reclamation");
 
     append(source, 10);
     const concurrent = await Promise.all([
@@ -297,7 +309,7 @@ describe("projection build coordinator", () => {
     assert.equal(lease.manifest.generation, 2);
     assert.equal(lease.manifest.terminalEventPosition, "9");
     assert.equal(existsSync(lease.databasePath), true);
-    assert.equal(existsSync(first.databasePath), false);
+    assert.equal(existsSync(first.databasePath), true);
     lease.close();
     source.close();
   });
@@ -366,6 +378,61 @@ describe("projection build coordinator", () => {
     source.close();
   });
 
+  it("maps a non-ENOENT sidecar lstat failure on manifest load to integrity failure", async () => {
+    const root = mkdtempSync(join(tmpdir(), "projection-load-sidecar-error-"));
+    roots.push(root);
+    const sourcePath = join(root, "events.sqlite");
+    const projectionDirectory = join(root, "projections");
+    const source = sourceDatabase(sourcePath);
+    append(source, 1);
+    const driver = new NodeSqliteDriver({ DatabaseSync });
+    let armed = false;
+    const coordinator = new DefaultProjectionBuildCoordinator({
+      projectionDirectory,
+      pathInspection: denyingSidecarInspection(() => armed),
+      eventReader: new SqliteProjectionEventReader({ driver, eventStorePath: sourcePath }),
+      builder: new ImmutableProjectionBuilder({ driver, projectionDirectory, now: () => NOW }),
+    });
+    await coordinator.ensurePublished(BINDING, 1n, 2_000);
+    armed = true;
+
+    await assert.rejects(
+      () => coordinator.leasePublished(BINDING),
+      (error: unknown) => error instanceof LifecycleError
+        && error.code === "INTEGRITY_FAILURE",
+    );
+    source.close();
+  });
+
+  it("preserves a lease-boundary sidecar lstat integrity failure", async () => {
+    const root = mkdtempSync(join(tmpdir(), "projection-lease-sidecar-error-"));
+    roots.push(root);
+    const sourcePath = join(root, "events.sqlite");
+    const projectionDirectory = join(root, "projections");
+    const source = sourceDatabase(sourcePath);
+    append(source, 1);
+    const driver = new NodeSqliteDriver({ DatabaseSync });
+    let armed = false;
+    const leases = new ProjectionReaderLeaseRegistry({
+      pathInspection: denyingSidecarInspection(() => armed),
+    });
+    const coordinator = new DefaultProjectionBuildCoordinator({
+      projectionDirectory,
+      leases,
+      eventReader: new SqliteProjectionEventReader({ driver, eventStorePath: sourcePath }),
+      builder: new ImmutableProjectionBuilder({ driver, projectionDirectory, now: () => NOW }),
+    });
+    await coordinator.ensurePublished(BINDING, 1n, 2_000);
+    armed = true;
+
+    await assert.rejects(
+      () => coordinator.leasePublished(BINDING),
+      (error: unknown) => error instanceof LifecycleError
+        && error.code === "INTEGRITY_FAILURE",
+    );
+    source.close();
+  });
+
   it("never reclaims a published generation main file while a sidecar entry exists", async () => {
     const root = mkdtempSync(join(tmpdir(), "projection-sidecar-reclamation-"));
     roots.push(root);
@@ -389,6 +456,44 @@ describe("projection build coordinator", () => {
     assert.equal(existsSync(published.databasePath), true);
     assert.equal(readFileSync(`${published.databasePath}-wal`, "utf8"), "unexpected published WAL");
     assert.equal(leases.reclamationIssues().length, 1);
+    source.close();
+  });
+
+  it("preserves main and sidecar when a sidecar appears after the reclamation precheck", async () => {
+    const root = mkdtempSync(join(tmpdir(), "projection-reclamation-race-"));
+    roots.push(root);
+    const sourcePath = join(root, "events.sqlite");
+    const projectionDirectory = join(root, "projections");
+    const source = sourceDatabase(sourcePath);
+    append(source, 1);
+    const driver = new NodeSqliteDriver({ DatabaseSync });
+    let injected = false;
+    const leases = new ProjectionReaderLeaseRegistry({
+      reclamationFaultInjector: {
+        hit(boundary, generation): void {
+          if (boundary !== "after-retired-generation-check-before-retention" || injected) return;
+          injected = true;
+          writeFileSync(`${generation.databasePath}-wal`, "late reclamation WAL", "utf8");
+        },
+      },
+    });
+    const coordinator = new DefaultProjectionBuildCoordinator({
+      projectionDirectory,
+      leases,
+      eventReader: new SqliteProjectionEventReader({ driver, eventStorePath: sourcePath }),
+      builder: new ImmutableProjectionBuilder({ driver, projectionDirectory, now: () => NOW }),
+    });
+    const published = await coordinator.ensurePublished(BINDING, 1n, 2_000);
+
+    leases.retire(published);
+
+    assert.equal(injected, true);
+    assert.equal(existsSync(published.databasePath), true);
+    assert.equal(readFileSync(`${published.databasePath}-wal`, "utf8"), "late reclamation WAL");
+    assert.deepEqual(
+      leases.reclamationIssues().map((issue) => issue.errorCode),
+      ["INTEGRITY_FAILURE"],
+    );
     source.close();
   });
 
@@ -637,16 +742,19 @@ describe("projection build coordinator", () => {
     renameSync(projectionDirectory, displacedAttackerDirectory);
     renameSync(originalDirectory, projectionDirectory);
     leases.retryReclamation();
-    assert.equal(existsSync(published.databasePath), false);
+    assert.equal(existsSync(published.databasePath), true);
     assert.equal(
       readFileSync(join(displacedAttackerDirectory, published.manifest.databaseFile), "utf8"),
       "outside victim",
     );
-    assert.equal(leases.reclamationIssues().length, 0);
+    assert.deepEqual(
+      leases.reclamationIssues().map((issue) => issue.errorCode),
+      ["PROJECTION_RECLAMATION_DEFERRED"],
+    );
     source.close();
   });
 
-  it("keeps publication successful and records retryable retired-file cleanup failures", async () => {
+  it("keeps publication successful while retaining retired files for audited reclamation", async () => {
     const root = mkdtempSync(join(tmpdir(), "projection-reclaim-retry-"));
     roots.push(root);
     const sourcePath = join(root, "events.sqlite");
@@ -656,11 +764,7 @@ describe("projection build coordinator", () => {
     const driver = new NodeSqliteDriver({ DatabaseSync });
     const eventReader = new SqliteProjectionEventReader({ driver, eventStorePath: sourcePath });
     const builder = new ImmutableProjectionBuilder({ driver, projectionDirectory, now: () => NOW });
-    let directorySyncs = 0;
-    const leases = new ProjectionReaderLeaseRegistry(() => {
-      directorySyncs += 1;
-      if (directorySyncs === 1) throw new Error("injected retired-directory fsync failure");
-    });
+    const leases = new ProjectionReaderLeaseRegistry();
     const coordinator = new DefaultProjectionBuildCoordinator({
       projectionDirectory,
       eventReader,
@@ -679,11 +783,17 @@ describe("projection build coordinator", () => {
       ).generation,
       second.manifest.generation,
     );
-    assert.equal(existsSync(first.databasePath), false);
-    assert.equal(leases.reclamationIssues().length, 1);
+    assert.equal(existsSync(first.databasePath), true);
+    assert.deepEqual(
+      leases.reclamationIssues().map((issue) => [issue.errorCode, issue.attempts]),
+      [["PROJECTION_RECLAMATION_DEFERRED", 1]],
+    );
     leases.retryReclamation();
-    assert.equal(leases.reclamationIssues().length, 0);
-    assert.equal(directorySyncs, 2);
+    assert.equal(existsSync(first.databasePath), true);
+    assert.deepEqual(
+      leases.reclamationIssues().map((issue) => [issue.errorCode, issue.attempts]),
+      [["PROJECTION_RECLAMATION_DEFERRED", 2]],
+    );
     source.close();
   });
 });

@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import {
+  existsSync,
   lstatSync,
   mkdtempSync,
   mkdirSync,
@@ -270,6 +271,64 @@ describe("immutable projection manifest", () => {
     );
   });
 
+  for (const boundary of [
+    "after-manifest-temp-fsync-before-replace",
+    "after-manifest-replace-before-validation",
+  ] as const) {
+    it(`preserves the previous manifest when a sidecar appears at ${boundary}`, () => {
+      const root = mkdtempSync(join(tmpdir(), "projection-manifest-publish-race-"));
+      roots.push(root);
+      const oldManifest = parseProjectionManifest(manifest({
+        generation: 1,
+        databaseFile: "projections-1-1.sqlite",
+        terminalEventPosition: "16",
+      }), BINDING);
+      const newManifest = parseProjectionManifest(manifest(), BINDING);
+      writeFileSync(join(root, oldManifest.databaseFile), "old independent projection", "utf8");
+      writeFileSync(join(root, newManifest.databaseFile), "new independent projection", "utf8");
+      const target = publishProjectionManifest({
+        projectionDirectory: root,
+        manifest: oldManifest,
+        expectedBinding: BINDING,
+      });
+      const oldAuthority = readFileSync(target);
+      let injected = false;
+
+      assert.throws(
+        () => publishProjectionManifest({
+          projectionDirectory: root,
+          manifest: newManifest,
+          expectedBinding: BINDING,
+        }, {
+          faultInjector: {
+            hit(actual): void {
+              if (actual !== boundary || injected) return;
+              injected = true;
+              writeFileSync(
+                join(root, `${newManifest.databaseFile}-wal`),
+                "sidecar injected in manifest finalization window",
+                "utf8",
+              );
+            },
+          },
+        }),
+        (error: unknown) => error instanceof LifecycleError
+          && error.code === "INTEGRITY_FAILURE",
+      );
+      assert.equal(injected, true);
+      assert.deepEqual(readFileSync(target), oldAuthority);
+      assert.equal(
+        parseProjectionManifest(JSON.parse(readFileSync(target, "utf8")), BINDING).generation,
+        oldManifest.generation,
+      );
+      assert.equal(existsSync(join(root, ".projection-manifest.json.tmp")), false);
+      assert.equal(
+        readFileSync(join(root, `${newManifest.databaseFile}-wal`), "utf8"),
+        "sidecar injected in manifest finalization window",
+      );
+    });
+  }
+
   it("treats a symlink-shaped exact sidecar sibling as an integrity failure", () => {
     const root = mkdtempSync(join(tmpdir(), "projection-manifest-sidecar-shape-"));
     roots.push(root);
@@ -297,6 +356,39 @@ describe("immutable projection manifest", () => {
           if (path === root) return regularDirectory;
           if (path === databasePath) return regularFile;
           if (path === `${databasePath}-wal`) return symlink;
+          return missingEntry();
+        },
+        realpath: (path) => path,
+      }),
+      (error: unknown) => error instanceof LifecycleError
+        && error.code === "INTEGRITY_FAILURE",
+    );
+  });
+
+  it("maps a non-ENOENT exact sidecar lstat failure to integrity failure", () => {
+    const root = mkdtempSync(join(tmpdir(), "projection-manifest-sidecar-error-"));
+    roots.push(root);
+    const databaseFile = "projections-1-2.sqlite";
+    const databasePath = join(root, databaseFile);
+    const regularDirectory = {
+      isDirectory: () => true,
+      isFile: () => false,
+      isSymbolicLink: () => false,
+    };
+    const regularFile = {
+      isDirectory: () => false,
+      isFile: () => true,
+      isSymbolicLink: () => false,
+    };
+
+    assert.throws(
+      () => verifyProjectionPublicationPaths(root, databaseFile, {
+        lstat: (path) => {
+          if (path === root) return regularDirectory;
+          if (path === databasePath) return regularFile;
+          if (path === `${databasePath}-wal`) {
+            throw Object.assign(new Error("access denied"), { code: "EACCES" });
+          }
           return missingEntry();
         },
         realpath: (path) => path,

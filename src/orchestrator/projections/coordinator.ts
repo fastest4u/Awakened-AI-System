@@ -18,6 +18,7 @@ import {
   publishProjectionManifest,
   verifyProjectionPublicationPaths,
   type ProjectionManifestV1,
+  type ProjectionManifestPublicationFaultBoundary,
   type ProjectionPathInspection,
 } from "./manifest.js";
 import {
@@ -51,7 +52,9 @@ export interface ProjectionBuildCoordinator {
   leasePublished(binding: ProjectBinding): Promise<ProjectionReaderLease>;
 }
 
-export type ProjectionBuildFaultBoundary = "after-generation-fsync-before-manifest";
+export type ProjectionBuildFaultBoundary =
+  | "after-generation-fsync-before-manifest"
+  | ProjectionManifestPublicationFaultBoundary;
 
 export interface ProjectionBuildFaultInjector {
   hit(boundary: ProjectionBuildFaultBoundary): void;
@@ -189,6 +192,8 @@ export class DefaultProjectionBuildCoordinator implements ProjectionBuildCoordin
               projectionDirectory: this.#projectionDirectory,
               manifest: built.manifest,
               expectedBinding: binding,
+            }, {
+              faultInjector: this.#faultInjector,
             });
             const published = this.#loadPublished(binding);
             if (
@@ -267,9 +272,13 @@ export class DefaultProjectionBuildCoordinator implements ProjectionBuildCoordin
       throw new Error("PROJECTION_MANIFEST_INVALID");
     }
     const manifest = parseProjectionManifest(decoded, binding);
-    const paths = verifyProjectionPublicationPaths(this.#projectionDirectory, manifest.databaseFile);
+    const paths = verifyProjectionPublicationPaths(
+      this.#projectionDirectory,
+      manifest.databaseFile,
+      this.#pathInspection,
+    );
     const databaseSha256 = sha256File(paths.databasePath);
-    assertProjectionSidecarsAbsent(paths.databasePath);
+    assertProjectionSidecarsAbsent(paths.databasePath, this.#pathInspection);
     this.#assertProjectionDirectorySafe();
     if (databaseSha256 !== manifest.databaseSha256) {
       throw new Error("PROJECTION_DATABASE_CHECKSUM_INVALID");
@@ -288,9 +297,13 @@ export class DefaultProjectionBuildCoordinator implements ProjectionBuildCoordin
       throw new Error("PROJECTION_PATH_INVALID");
     }
     const manifest = parseProjectionManifest(built.manifest, binding);
-    const paths = verifyProjectionPublicationPaths(this.#projectionDirectory, manifest.databaseFile);
+    const paths = verifyProjectionPublicationPaths(
+      this.#projectionDirectory,
+      manifest.databaseFile,
+      this.#pathInspection,
+    );
     const databaseSha256 = sha256File(paths.databasePath);
-    assertProjectionSidecarsAbsent(paths.databasePath);
+    assertProjectionSidecarsAbsent(paths.databasePath, this.#pathInspection);
     this.#assertProjectionDirectorySafe();
     if (
       resolve(paths.databasePath) !== resolve(built.databasePath)

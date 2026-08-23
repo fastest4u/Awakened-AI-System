@@ -3,8 +3,10 @@ import { createHash } from "node:crypto";
 import {
   copyFileSync,
   existsSync,
+  lstatSync,
   mkdtempSync,
   readFileSync,
+  realpathSync,
   renameSync,
   rmSync,
   writeFileSync,
@@ -206,6 +208,11 @@ function coreChecksum(path: string, name: ProjectionName, terminal: bigint): str
   }
 }
 
+function assertMainFileOnly(path: string): void {
+  assert.equal(existsSync(`${path}-wal`), false, "tamper fixture must not leave a WAL sidecar");
+  assert.equal(existsSync(`${path}-shm`), false, "tamper fixture must not leave an SHM sidecar");
+}
+
 interface Fixture {
   readonly sourcePath: string;
   readonly projectionDirectory: string;
@@ -317,9 +324,11 @@ function mutateDatabase(fixture: Fixture, sql: string): void {
   try {
     database.exec(sql);
     database.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+    assert.equal(database.prepare("PRAGMA journal_mode=DELETE").get()?.journal_mode, "delete");
   } finally {
     database.close();
   }
+  assertMainFileOnly(fixture.databasePath);
 }
 
 function mutateFtsShadowDatabase(fixture: Fixture, sql: string): void {
@@ -329,9 +338,11 @@ function mutateFtsShadowDatabase(fixture: Fixture, sql: string): void {
   try {
     database.exec(sql);
     database.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+    assert.equal(database.prepare("PRAGMA journal_mode=DELETE").get()?.journal_mode, "delete");
   } finally {
     database.close();
   }
+  assertMainFileOnly(fixture.databasePath);
 }
 
 function resignedManifest(
@@ -363,6 +374,7 @@ function expectIntegrityFailure(action: () => unknown): void {
 
 function ftsDecisionRanks(path: string): readonly Readonly<{ rowid: bigint; rank: number }>[] {
   const database = new DatabaseSync(path, { readOnly: true });
+  let rows: readonly Readonly<{ rowid: bigint; rank: number }>[];
   try {
     const query = database.prepare(`
       SELECT rowid, rank FROM lexical_chunks_fts
@@ -370,13 +382,15 @@ function ftsDecisionRanks(path: string): readonly Readonly<{ rowid: bigint; rank
       ORDER BY rowid
     `);
     query.setReadBigInts(true);
-    return Object.freeze(query.all().map((row) => Object.freeze({
+    rows = Object.freeze(query.all().map((row) => Object.freeze({
       rowid: row.rowid as bigint,
       rank: row.rank as number,
     })));
   } finally {
     database.close();
   }
+  assertMainFileOnly(path);
+  return rows;
 }
 
 function observingFullEventRows(onRow: () => void): SqliteDriver {
@@ -432,13 +446,15 @@ describe("full projection integrity replay", () => {
     const alteredSummary = "WAL sidecar rows outrank pinned main-file bytes.";
     const writer = new DatabaseSync(fixture.databasePath, { defensive: false });
     try {
-      writer.exec("PRAGMA wal_autocheckpoint = 0");
+      writer.exec("PRAGMA journal_mode = WAL; PRAGMA wal_autocheckpoint = 0");
+      const walMainBefore = databaseSha256(fixture.databasePath);
+      assert.notEqual(walMainBefore, mainBefore, "entering WAL mode changes the main header bytes");
       writer.prepare(`
         UPDATE canonical_items SET summary = ? WHERE item_id = ?
       `).run(alteredSummary, ITEM_A);
 
       assert.equal(existsSync(`${fixture.databasePath}-wal`), true);
-      assert.equal(databaseSha256(fixture.databasePath), mainBefore);
+      assert.equal(databaseSha256(fixture.databasePath), walMainBefore);
       const pathnameReader = new DatabaseSync(fixture.databasePath, { readOnly: true });
       try {
         assert.equal(
@@ -452,7 +468,7 @@ describe("full projection integrity replay", () => {
       }
 
       const reSigned = resignedManifest(fixture);
-      assert.equal(reSigned.databaseSha256, mainBefore);
+      assert.equal(reSigned.databaseSha256, walMainBefore);
       expectIntegrityFailure(() => fixture.integrity.verify(BINDING, reSigned));
     } finally {
       writer.close();
@@ -463,7 +479,7 @@ describe("full projection integrity replay", () => {
     const fixture = await createFixture();
     const writer = new DatabaseSync(fixture.databasePath, { defensive: false });
     try {
-      writer.exec("PRAGMA wal_autocheckpoint = 0");
+      writer.exec("PRAGMA journal_mode = WAL; PRAGMA wal_autocheckpoint = 0");
       writer.prepare(`
         UPDATE canonical_items SET summary = ? WHERE item_id = ?
       `).run("pathname-visible sidecar tamper", ITEM_A);
@@ -478,6 +494,26 @@ describe("full projection integrity replay", () => {
     } finally {
       writer.close();
     }
+  });
+
+  it("maps a non-ENOENT exact sidecar lstat failure through integrity verification", async () => {
+    const fixture = await createFixture();
+    const integrity = new ProjectionIntegrityService({
+      driver,
+      eventStorePath: fixture.sourcePath,
+      projectionDirectory: fixture.projectionDirectory,
+      pathInspection: {
+        lstat(path: string) {
+          if (path === `${fixture.databasePath}-wal`) {
+            throw Object.assign(new Error("injected exact-sidecar lstat denial"), { code: "EACCES" });
+          }
+          return lstatSync(path);
+        },
+        realpath: (path: string) => realpathSync(path),
+      },
+    });
+
+    expectIntegrityFailure(() => integrity.verify(BINDING, fixture.manifest));
   });
 
   it("rejects a sidecar introduced at either pinned-image inspection boundary", async () => {
@@ -816,9 +852,11 @@ describe("full projection integrity replay", () => {
         VALUES ('delete', ?, ?, ?)
       `).run(row!.row_id, row!.normalized_key, row!.text);
       database.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+      assert.equal(database.prepare("PRAGMA journal_mode=DELETE").get()?.journal_mode, "delete");
     } finally {
       database.close();
     }
+    assertMainFileOnly(fixture.databasePath);
     expectIntegrityFailure(() => fixture.integrity.verify(
       BINDING,
       resignedManifest(fixture),

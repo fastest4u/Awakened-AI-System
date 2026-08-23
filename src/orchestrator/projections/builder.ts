@@ -7,6 +7,7 @@ import {
   mkdirSync,
   openSync,
   readFileSync,
+  readSync,
   realpathSync,
   renameSync,
   unlinkSync,
@@ -89,6 +90,21 @@ function removeKnownFile(path: string): void {
 
 function sha256File(path: string): string {
   return createHash("sha256").update(readFileSync(path)).digest("hex");
+}
+
+function assertRollbackJournalHeader(path: string): void {
+  const handle = openSync(path, "r");
+  const journalBytes = Buffer.alloc(2);
+  try {
+    if (readSync(handle, journalBytes, 0, journalBytes.length, 18) !== journalBytes.length) {
+      return failure("PROJECTION_JOURNAL_MODE_INVALID");
+    }
+  } finally {
+    closeSync(handle);
+  }
+  if (journalBytes[0] !== 1 || journalBytes[1] !== 1) {
+    return failure("PROJECTION_JOURNAL_MODE_INVALID");
+  }
 }
 
 function freezeRows(rows: CanonicalProjectionRow[]): readonly CanonicalProjectionRow[] {
@@ -484,10 +500,14 @@ export class ImmutableProjectionBuilder {
         snapshot,
         coreChecksums,
       );
-      connection.prepare("PRAGMA wal_checkpoint(TRUNCATE)").get();
+      const checkpoint = connection.prepare("PRAGMA wal_checkpoint(TRUNCATE)").get();
+      if (checkpoint?.busy !== 0n) return failure("PROJECTION_CHECKPOINT_FAILED");
+      const journalMode = connection.prepare("PRAGMA journal_mode=DELETE").get();
+      if (journalMode?.journal_mode !== "delete") return failure("PROJECTION_JOURNAL_MODE_INVALID");
       connection.close();
       connection = undefined;
       assertProjectionSidecarsAbsent(tempPath);
+      assertRollbackJournalHeader(tempPath);
 
       // Windows requires a writable file handle for FlushFileBuffers/fsync.
       const handle = openSync(tempPath, "r+");
@@ -501,6 +521,7 @@ export class ImmutableProjectionBuilder {
       renameSync(tempPath, databasePath);
       this.#syncDirectory(directory);
       verifyProjectionPublicationPaths(directory, databaseFile);
+      assertRollbackJournalHeader(databasePath);
       const manifest = parseProjectionManifest({
         schemaVersion: 1,
         projectId: snapshot.binding.projectId,

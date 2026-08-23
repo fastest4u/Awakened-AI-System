@@ -1,17 +1,34 @@
-import { lstatSync, realpathSync } from "node:fs";
+import {
+  closeSync,
+  fstatSync,
+  fsyncSync,
+  lstatSync,
+  openSync,
+  readFileSync,
+  realpathSync,
+  renameSync,
+  unlinkSync,
+} from "node:fs";
 import { isAbsolute, join, normalize, relative, resolve, sep } from "node:path";
 
 import { AtomicArtifactReplacer } from "../materialization/atomic-artifact-replacer.js";
+import { fsyncDirectory } from "../identity/directory-durability.js";
 import { LifecycleError } from "../lifecycle/errors.js";
 import { canonicalJson } from "../serialization/canonical-json.js";
 import type { ProjectBinding } from "./contracts.js";
 import { PROJECTION_NAMES, type ProjectionName } from "./checksum.js";
+import {
+  filesystemStableProjectionDirectoryOperations,
+  sameProjectionDirectoryIdentity,
+  type ProjectionDirectoryIdentity,
+} from "./stable-directory.js";
 
 const HASH = /^[0-9a-f]{64}$/u;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 const POSITION = /^(?:0|[1-9][0-9]{0,18})$/u;
 const SQLITE_INT64_MAX = 9_223_372_036_854_775_807n;
 const MAX_BRANCH_REF_BYTES = 1_024;
+const MAX_MANIFEST_BYTES = 64 * 1_024;
 const MANIFEST_KEYS = Object.freeze([
   "schemaVersion",
   "projectId",
@@ -65,6 +82,18 @@ export interface PublishProjectionManifestInput {
   readonly expectedBinding: ProjectBinding;
 }
 
+export type ProjectionManifestPublicationFaultBoundary =
+  | "after-manifest-temp-fsync-before-replace"
+  | "after-manifest-replace-before-validation";
+
+export interface ProjectionManifestPublicationFaultInjector {
+  hit(boundary: ProjectionManifestPublicationFaultBoundary): void;
+}
+
+export interface PublishProjectionManifestOptions {
+  readonly faultInjector?: ProjectionManifestPublicationFaultInjector;
+}
+
 export interface ProjectionPathStat {
   isDirectory(): boolean;
   isFile(): boolean;
@@ -83,7 +112,7 @@ export interface VerifiedProjectionPublicationPaths {
   readonly tempPath: string;
 }
 
-const filesystemPathInspection: ProjectionPathInspection = Object.freeze({
+export const filesystemProjectionPathInspection: ProjectionPathInspection = Object.freeze({
   lstat: (path: string) => lstatSync(path),
   realpath: (path: string) => realpathSync(path),
 });
@@ -295,7 +324,7 @@ function assertRegularDatabase(path: string, inspection: ProjectionPathInspectio
 
 export function assertProjectionSidecarsAbsent(
   databasePath: string,
-  inspection: ProjectionPathInspection = filesystemPathInspection,
+  inspection: ProjectionPathInspection = filesystemProjectionPathInspection,
 ): void {
   if (
     typeof databasePath !== "string"
@@ -317,7 +346,7 @@ export function assertProjectionSidecarsAbsent(
 export function verifyProjectionPublicationPaths(
   projectionDirectory: string,
   databaseFile: string,
-  inspection: ProjectionPathInspection = filesystemPathInspection,
+  inspection: ProjectionPathInspection = filesystemProjectionPathInspection,
 ): VerifiedProjectionPublicationPaths {
   if (
     typeof databaseFile !== "string"
@@ -337,7 +366,94 @@ export function verifyProjectionPublicationPaths(
   return Object.freeze({ directory, databasePath, targetPath, tempPath });
 }
 
-export function publishProjectionManifest(input: PublishProjectionManifestInput): string {
+function previousManifestBytes(path: string): Uint8Array | null {
+  let handle: number | undefined;
+  try {
+    const before = lstatSync(path, { bigint: true });
+    if (
+      !before.isFile()
+      || before.isSymbolicLink()
+      || before.size < 0n
+      || before.size > BigInt(MAX_MANIFEST_BYTES)
+    ) {
+      throw new LifecycleError("MATERIALIZATION_CONFLICT");
+    }
+    handle = openSync(path, "r");
+    const opened = fstatSync(handle, { bigint: true });
+    if (
+      !opened.isFile()
+      || opened.dev !== before.dev
+      || opened.ino !== before.ino
+      || opened.size !== before.size
+    ) throw new LifecycleError("MATERIALIZATION_CONFLICT");
+    const bytes = readFileSync(handle);
+    const openedAfter = fstatSync(handle, { bigint: true });
+    const after = lstatSync(path, { bigint: true });
+    if (
+      bytes.byteLength !== Number(before.size)
+      || openedAfter.dev !== opened.dev
+      || openedAfter.ino !== opened.ino
+      || openedAfter.size !== opened.size
+      || after.dev !== before.dev
+      || after.ino !== before.ino
+      || after.size !== before.size
+      || !after.isFile()
+      || after.isSymbolicLink()
+    ) throw new LifecycleError("MATERIALIZATION_CONFLICT");
+    return Uint8Array.from(bytes);
+  } catch (error) {
+    if (errorCode(error) === "ENOENT") return null;
+    throw error;
+  } finally {
+    if (handle !== undefined) closeSync(handle);
+  }
+}
+
+function assertPinnedGeneration(
+  directory: string,
+  databaseFile: string,
+  identity: ProjectionDirectoryIdentity,
+): void {
+  filesystemStableProjectionDirectoryOperations.assertGeneration(
+    directory,
+    databaseFile,
+    identity,
+  );
+  if (!sameProjectionDirectoryIdentity(
+    identity,
+    filesystemStableProjectionDirectoryOperations.capture(directory),
+  )) pathInvalid();
+}
+
+function restorePreviousManifest(
+  paths: VerifiedProjectionPublicationPaths,
+  previousBytes: Uint8Array | null,
+): void {
+  if (previousBytes !== null) {
+    new AtomicArtifactReplacer({ durableBase: paths.directory }).replace({
+      targetPath: paths.targetPath,
+      tempPath: paths.tempPath,
+      bytes: previousBytes,
+    });
+    return;
+  }
+  try {
+    const target = lstatSync(paths.targetPath);
+    if (!target.isFile() || target.isSymbolicLink()) {
+      throw new LifecycleError("MATERIALIZATION_CONFLICT");
+    }
+    unlinkSync(paths.targetPath);
+    fsyncDirectory(paths.directory);
+  } catch (error) {
+    if (errorCode(error) === "ENOENT") return;
+    throw error;
+  }
+}
+
+export function publishProjectionManifest(
+  input: PublishProjectionManifestInput,
+  options: PublishProjectionManifestOptions = {},
+): string {
   const source = exactRecord(input, ["projectionDirectory", "manifest", "expectedBinding"]);
   const manifest = parseProjectionManifest(
     source.manifest,
@@ -347,10 +463,40 @@ export function publishProjectionManifest(input: PublishProjectionManifestInput)
     source.projectionDirectory as string,
     manifest.databaseFile,
   );
-  new AtomicArtifactReplacer({ durableBase: paths.directory }).replace({
-    targetPath: paths.targetPath,
-    tempPath: paths.tempPath,
-    bytes: serializeProjectionManifest(manifest),
-  });
+  const directoryIdentity = filesystemStableProjectionDirectoryOperations.capture(paths.directory);
+  const previousBytes = previousManifestBytes(paths.targetPath);
+  let replaced = false;
+  try {
+    new AtomicArtifactReplacer({
+      durableBase: paths.directory,
+      operations: {
+        fsync(handle): void {
+          fsyncSync(handle);
+          options.faultInjector?.hit("after-manifest-temp-fsync-before-replace");
+        },
+        rename(tempPath, targetPath): void {
+          assertPinnedGeneration(paths.directory, manifest.databaseFile, directoryIdentity);
+          renameSync(tempPath, targetPath);
+          replaced = true;
+          options.faultInjector?.hit("after-manifest-replace-before-validation");
+          assertPinnedGeneration(paths.directory, manifest.databaseFile, directoryIdentity);
+        },
+      },
+    }).replace({
+      targetPath: paths.targetPath,
+      tempPath: paths.tempPath,
+      bytes: serializeProjectionManifest(manifest),
+    });
+    assertPinnedGeneration(paths.directory, manifest.databaseFile, directoryIdentity);
+  } catch (error) {
+    if (replaced) {
+      try {
+        restorePreviousManifest(paths, previousBytes);
+      } catch {
+        return sidecarIntegrity();
+      }
+    }
+    throw error;
+  }
   return paths.targetPath;
 }

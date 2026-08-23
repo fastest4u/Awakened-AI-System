@@ -1,7 +1,12 @@
 import { join, resolve } from "node:path";
 
-import { fsyncDirectory, type DirectorySync } from "../identity/directory-durability.js";
-import type { ProjectionManifestV1 } from "./manifest.js";
+import { LifecycleError } from "../lifecycle/errors.js";
+import {
+  assertProjectionSidecarsAbsent,
+  filesystemProjectionPathInspection,
+  type ProjectionManifestV1,
+  type ProjectionPathInspection,
+} from "./manifest.js";
 import {
   filesystemStableProjectionDirectoryOperations,
   sameProjectionDirectoryIdentity,
@@ -25,7 +30,6 @@ interface LeaseEntry {
   readonly generation: LeasableProjectionGeneration;
   leases: number;
   retired: boolean;
-  fileRemoved: boolean;
   attempts: number;
   lastErrorCode: string | null;
 }
@@ -35,6 +39,21 @@ export interface ProjectionReclamationIssue {
   readonly generation: number;
   readonly attempts: number;
   readonly errorCode: string;
+}
+
+export type ProjectionReclamationFaultBoundary =
+  "after-retired-generation-check-before-retention";
+
+export interface ProjectionReclamationFaultInjector {
+  hit(
+    boundary: ProjectionReclamationFaultBoundary,
+    generation: LeasableProjectionGeneration,
+  ): void;
+}
+
+export interface ProjectionReaderLeaseRegistryOptions {
+  readonly pathInspection?: ProjectionPathInspection;
+  readonly reclamationFaultInjector?: ProjectionReclamationFaultInjector;
 }
 
 export class ProjectionLeaseUnavailableError extends Error {
@@ -52,8 +71,12 @@ function key(path: string): string {
 }
 
 function safeErrorCode(error: unknown): string {
+  if (error instanceof LifecycleError) return error.code;
   if (typeof error === "object" && error !== null && "code" in error) {
     return String(error.code).slice(0, 128);
+  }
+  if (error instanceof Error && /^PROJECTION_[A-Z_]+$/u.test(error.message)) {
+    return error.message;
   }
   if (error instanceof Error && error.name.length > 0) return error.name.slice(0, 128);
   return "PROJECTION_RECLAMATION_FAILED";
@@ -61,10 +84,12 @@ function safeErrorCode(error: unknown): string {
 
 export class ProjectionReaderLeaseRegistry {
   readonly #entries = new Map<string, LeaseEntry>();
-  readonly #syncDirectory: DirectorySync;
+  readonly #pathInspection: ProjectionPathInspection;
+  readonly #reclamationFaultInjector: ProjectionReclamationFaultInjector | undefined;
 
-  constructor(syncDirectory: DirectorySync = fsyncDirectory) {
-    this.#syncDirectory = syncDirectory;
+  constructor(options: ProjectionReaderLeaseRegistryOptions = {}) {
+    this.#pathInspection = options.pathInspection ?? filesystemProjectionPathInspection;
+    this.#reclamationFaultInjector = options.reclamationFaultInjector;
   }
 
   acquire(generation: LeasableProjectionGeneration): ProjectionReaderLease {
@@ -76,6 +101,7 @@ export class ProjectionReaderLeaseRegistry {
     const current = this.#entries.get(id);
     if (current?.retired === true) throw new ProjectionLeaseUnavailableError();
     try {
+      assertProjectionSidecarsAbsent(generation.databasePath, this.#pathInspection);
       const identity = filesystemStableProjectionDirectoryOperations.capture(
         generation.projectionDirectory,
       );
@@ -87,14 +113,14 @@ export class ProjectionReaderLeaseRegistry {
         generation.manifest.databaseFile,
         generation.directoryIdentity,
       );
-    } catch {
+    } catch (error) {
+      if (error instanceof LifecycleError && error.code === "INTEGRITY_FAILURE") throw error;
       throw new ProjectionLeaseUnavailableError();
     }
     const entry = current ?? {
       generation,
       leases: 0,
       retired: false,
-      fileRemoved: false,
       attempts: 0,
       lastErrorCode: null,
     };
@@ -113,7 +139,7 @@ export class ProjectionReaderLeaseRegistry {
           entry.lastErrorCode = "PROJECTION_LEASE_UNDERFLOW";
           return;
         }
-        this.#attemptReclamation(id, entry);
+        this.#attemptReclamation(entry);
       },
     });
   }
@@ -125,13 +151,12 @@ export class ProjectionReaderLeaseRegistry {
       generation,
       leases: 0,
       retired: false,
-      fileRemoved: false,
       attempts: 0,
       lastErrorCode: null,
     };
     entry.retired = true;
     this.#entries.set(id, entry);
-    this.#attemptReclamation(id, entry);
+    this.#attemptReclamation(entry);
   }
 
   reclamationIssues(): readonly ProjectionReclamationIssue[] {
@@ -147,26 +172,40 @@ export class ProjectionReaderLeaseRegistry {
   }
 
   retryReclamation(): void {
-    for (const [id, entry] of this.#entries) this.#attemptReclamation(id, entry);
+    for (const entry of this.#entries.values()) this.#attemptReclamation(entry);
   }
 
-  #attemptReclamation(id: string, entry: LeaseEntry): void {
+  #attemptReclamation(entry: LeaseEntry): void {
     if (!entry.retired || entry.leases !== 0) return;
     entry.attempts += 1;
     try {
-      if (!entry.fileRemoved) {
-        filesystemStableProjectionDirectoryOperations.unlinkGeneration(
-          entry.generation.projectionDirectory,
-          entry.generation.manifest.databaseFile,
-          entry.generation.directoryIdentity,
-        );
-        entry.fileRemoved = true;
+      assertProjectionSidecarsAbsent(entry.generation.databasePath, this.#pathInspection);
+      const identity = filesystemStableProjectionDirectoryOperations.capture(
+        entry.generation.projectionDirectory,
+      );
+      if (!sameProjectionDirectoryIdentity(identity, entry.generation.directoryIdentity)) {
+        throw new Error("PROJECTION_PATH_INVALID");
       }
-      this.#syncDirectory(entry.generation.projectionDirectory);
+      filesystemStableProjectionDirectoryOperations.assertGeneration(
+        entry.generation.projectionDirectory,
+        entry.generation.manifest.databaseFile,
+        entry.generation.directoryIdentity,
+      );
+      this.#reclamationFaultInjector?.hit(
+        "after-retired-generation-check-before-retention",
+        entry.generation,
+      );
+      assertProjectionSidecarsAbsent(entry.generation.databasePath, this.#pathInspection);
+      filesystemStableProjectionDirectoryOperations.assertGeneration(
+        entry.generation.projectionDirectory,
+        entry.generation.manifest.databaseFile,
+        entry.generation.directoryIdentity,
+      );
+      // Automatic unlink cannot make the sidecar-absence check atomic with removal.
+      // Retain the tombstoned generation for audited, out-of-band reclamation.
+      entry.lastErrorCode = "PROJECTION_RECLAMATION_DEFERRED";
     } catch (error) {
       entry.lastErrorCode = safeErrorCode(error);
-      return;
     }
-    this.#entries.delete(id);
   }
 }

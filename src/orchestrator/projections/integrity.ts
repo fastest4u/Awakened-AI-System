@@ -26,9 +26,11 @@ import {
 import { ProjectionFoldAccumulator } from "./folds.js";
 import {
   assertProjectionSidecarsAbsent,
+  filesystemProjectionPathInspection,
   parseProjectionManifest,
   verifyProjectionPublicationPaths,
   type ProjectionManifestV1,
+  type ProjectionPathInspection,
 } from "./manifest.js";
 import { PROJECTION_SCHEMA_SQL_V1, PROJECTION_SCHEMA_VERSION } from "./schema.js";
 import { decodeProjectionEvent } from "./source-event-codec.js";
@@ -60,6 +62,7 @@ export interface ProjectionIntegrityServiceOptions {
   readonly maxReplayEvents?: number;
   readonly maxReplayBytes?: number;
   readonly faultInjector?: ProjectionIntegrityFaultInjector;
+  readonly pathInspection?: ProjectionPathInspection;
 }
 
 export interface ProjectionIntegrityReport {
@@ -787,9 +790,10 @@ function inspectGeneration(
   expectedRows: ExpectedProjectionRows,
   busyTimeoutMs: number,
   directoryIdentity: ProjectionDirectoryIdentity,
+  pathInspection: ProjectionPathInspection,
   faultInjector?: ProjectionIntegrityFaultInjector,
 ): void {
-  assertProjectionSidecarsAbsent(path);
+  assertProjectionSidecarsAbsent(path, pathInspection);
   const generationIdentity = captureGenerationIdentity(path);
   if (!sameProjectionDirectoryIdentity(
     directoryIdentity,
@@ -799,12 +803,12 @@ function inspectGeneration(
   try {
     if (pinnedImage.sha256 !== manifest.databaseSha256) return integrity();
     faultInjector?.hit("after-generation-identity-before-open");
-    assertProjectionSidecarsAbsent(path);
+    assertProjectionSidecarsAbsent(path, pathInspection);
     const inspection = openPinnedGenerationInspection(pinnedImage, busyTimeoutMs);
     const database = inspection.database;
     try {
       faultInjector?.hit("after-generation-open-before-inspection");
-      assertProjectionSidecarsAbsent(path);
+      assertProjectionSidecarsAbsent(path, pathInspection);
       if (
         !sameGenerationIdentity(generationIdentity, captureGenerationIdentity(path))
         || !sameProjectionDirectoryIdentity(
@@ -826,7 +830,7 @@ function inspectGeneration(
       );
       assertReferences(database);
       assertFtsSemantics(database, rows.lexicalChunks);
-      assertProjectionSidecarsAbsent(path);
+      assertProjectionSidecarsAbsent(path, pathInspection);
       if (
         !sameGenerationIdentity(generationIdentity, captureGenerationIdentity(path))
         || !sameProjectionDirectoryIdentity(
@@ -842,7 +846,7 @@ function inspectGeneration(
     } finally {
       inspection.close();
     }
-    assertProjectionSidecarsAbsent(path);
+    assertProjectionSidecarsAbsent(path, pathInspection);
     if (
       !sameGenerationIdentity(generationIdentity, captureGenerationIdentity(path))
       || !sameProjectionDirectoryIdentity(
@@ -875,6 +879,7 @@ export class ProjectionIntegrityService {
       const paths = verifyProjectionPublicationPaths(
         this.#options.projectionDirectory,
         manifest.databaseFile,
+        this.#options.pathInspection ?? filesystemProjectionPathInspection,
       );
       const expectedRows = replay(binding, manifest, this.#options);
       inspectGeneration(
@@ -884,6 +889,7 @@ export class ProjectionIntegrityService {
         expectedRows,
         this.#options.busyTimeoutMs ?? DEFAULT_BUSY_TIMEOUT_MS,
         directoryIdentity,
+        this.#options.pathInspection ?? filesystemProjectionPathInspection,
         this.#options.faultInjector,
       );
       return Object.freeze({
