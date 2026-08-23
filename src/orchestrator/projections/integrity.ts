@@ -1,6 +1,19 @@
 import { createHash } from "node:crypto";
-import { closeSync, fstatSync, lstatSync, openSync, readSync, realpathSync } from "node:fs";
-import { resolve } from "node:path";
+import {
+  chmodSync,
+  closeSync,
+  fstatSync,
+  fsyncSync,
+  lstatSync,
+  mkdtempSync,
+  openSync,
+  readSync,
+  realpathSync,
+  rmSync,
+  writeSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { DatabaseSync, type StatementSync } from "node:sqlite";
 
 import { LifecycleError } from "../lifecycle/errors.js";
@@ -84,25 +97,9 @@ interface PinnedGenerationImage {
   readonly sha256: string;
 }
 
-interface DeserializableDatabase {
-  deserialize(bytes: Uint8Array, options?: { readonly dbName?: string }): void;
-}
-
-function deserializableImage(bytes: Uint8Array): Uint8Array {
-  const result = Uint8Array.from(bytes);
-  const sqliteHeader = Buffer.from("SQLite format 3\0", "binary");
-  if (
-    result.byteLength < 100
-    || !Buffer.from(result.subarray(0, sqliteHeader.byteLength)).equals(sqliteHeader)
-    || (result[18] !== 1 && result[18] !== 2)
-    || (result[19] !== 1 && result[19] !== 2)
-  ) return integrity();
-  // A serialized in-memory database has no sibling -wal file. Normalize only
-  // the journal-mode header bytes on this isolated inspection copy; the
-  // manifest hash remains over the untouched pinned on-disk bytes.
-  result[18] = 1;
-  result[19] = 1;
-  return result;
+interface PrivateGenerationInspection {
+  readonly database: DatabaseSync;
+  close(): void;
 }
 
 const TABLES = Object.freeze({
@@ -253,6 +250,157 @@ function hashGeneration(
     closeSync(descriptor);
   }
   return hash.digest("hex");
+}
+
+function hashGenerationDescriptor(
+  descriptor: number,
+  expected: ProjectionGenerationIdentity,
+): string {
+  if (!descriptorMatchesIdentity(descriptor, expected)) return integrity();
+  const hash = createHash("sha256");
+  const buffer = Buffer.allocUnsafe(1024 * 1024);
+  let offset = 0;
+  while (offset < Number(expected.size)) {
+    const bytesRead = readSync(
+      descriptor,
+      buffer,
+      0,
+      Math.min(buffer.byteLength, Number(expected.size) - offset),
+      offset,
+    );
+    if (bytesRead === 0) return integrity();
+    hash.update(buffer.subarray(0, bytesRead));
+    offset += bytesRead;
+  }
+  if (!descriptorMatchesIdentity(descriptor, expected)) return integrity();
+  return hash.digest("hex");
+}
+
+function isPrivateInspectionChild(tempBase: string, candidate: string): boolean {
+  const fromBase = relative(tempBase, candidate);
+  return isAbsolute(candidate)
+    && fromBase.length > 0
+    && fromBase !== ".."
+    && !fromBase.startsWith(`..${sep}`)
+    && !isAbsolute(fromBase)
+    && !fromBase.includes(sep)
+    && /^project-memory-projection-integrity-[A-Za-z0-9_-]{6}$/u.test(fromBase);
+}
+
+function privateInspectionRoot(): Readonly<{
+  readonly path: string;
+  readonly identity: ProjectionDirectoryIdentity;
+}> {
+  const tempBase = realpathSync.native(tmpdir());
+  const created = mkdtempSync(join(tempBase, "project-memory-projection-integrity-"));
+  try {
+    const canonical = realpathSync.native(created);
+    if (
+      normalizedPath(canonical) !== normalizedPath(created)
+      || !isPrivateInspectionChild(tempBase, canonical)
+    ) return integrity();
+    chmodSync(canonical, 0o700);
+    return Object.freeze({
+      path: canonical,
+      identity: captureProjectionDirectoryIdentity(canonical),
+    });
+  } catch (error) {
+    try {
+      const stat = lstatSync(created);
+      if (
+        stat.isDirectory()
+        && !stat.isSymbolicLink()
+        && isPrivateInspectionChild(tempBase, created)
+        && normalizedPath(realpathSync.native(created)) === normalizedPath(created)
+      ) rmSync(created, { recursive: true, force: true, maxRetries: 3, retryDelay: 25 });
+    } catch { /* preserve creation failure without risking a broad cleanup */ }
+    throw error;
+  }
+}
+
+function removePrivateInspectionRoot(
+  root: Readonly<{ readonly path: string; readonly identity: ProjectionDirectoryIdentity }>,
+): void {
+  const tempBase = realpathSync.native(tmpdir());
+  if (
+    !isPrivateInspectionChild(tempBase, root.path)
+    || !sameProjectionDirectoryIdentity(
+      root.identity,
+      captureProjectionDirectoryIdentity(root.path),
+    )
+  ) return integrity();
+  rmSync(root.path, {
+    recursive: true,
+    force: true,
+    maxRetries: 3,
+    retryDelay: 25,
+  });
+}
+
+function openPrivateGenerationInspection(
+  pinnedImage: PinnedGenerationImage,
+  busyTimeoutMs: number,
+): PrivateGenerationInspection {
+  const root = privateInspectionRoot();
+  const databasePath = join(root.path, "generation.sqlite");
+  let descriptor: number | undefined;
+  let database: DatabaseSync | undefined;
+  try {
+    descriptor = openSync(databasePath, "wx+", 0o600);
+    chmodSync(databasePath, 0o600);
+    let offset = 0;
+    while (offset < pinnedImage.bytes.byteLength) {
+      const written = writeSync(
+        descriptor,
+        pinnedImage.bytes,
+        offset,
+        pinnedImage.bytes.byteLength - offset,
+        offset,
+      );
+      if (written === 0) return integrity();
+      offset += written;
+    }
+    fsyncSync(descriptor);
+    const scratchIdentity = captureGenerationIdentity(databasePath);
+    if (
+      scratchIdentity.size !== String(pinnedImage.bytes.byteLength)
+      || !descriptorMatchesIdentity(descriptor, scratchIdentity)
+      || hashGenerationDescriptor(descriptor, scratchIdentity) !== pinnedImage.sha256
+    ) return integrity();
+    database = new DatabaseSync(databasePath, {
+      open: true,
+      readOnly: true,
+      timeout: busyTimeoutMs,
+      enableForeignKeyConstraints: true,
+      enableDoubleQuotedStringLiterals: false,
+      allowExtension: false,
+    });
+    if (!sameGenerationIdentity(scratchIdentity, captureGenerationIdentity(databasePath))) {
+      return integrity();
+    }
+    const openedDatabase = database;
+    const openedDescriptor = descriptor;
+    let closed = false;
+    return Object.freeze({
+      database: openedDatabase,
+      close(): void {
+        if (closed) return;
+        closed = true;
+        let closeError: unknown;
+        try { openedDatabase.close(); } catch (error) { closeError = error; }
+        try { closeSync(openedDescriptor); } catch (error) { closeError ??= error; }
+        try { removePrivateInspectionRoot(root); } catch (error) { closeError ??= error; }
+        if (closeError !== undefined) throw closeError;
+      },
+    });
+  } catch (error) {
+    try { database?.close(); } catch { /* preserve creation failure */ }
+    if (descriptor !== undefined) {
+      try { closeSync(descriptor); } catch { /* preserve creation failure */ }
+    }
+    try { removePrivateInspectionRoot(root); } catch { /* preserve creation failure */ }
+    throw error;
+  }
 }
 
 function projectionRowKey(
@@ -707,16 +855,9 @@ function inspectGeneration(
   const pinnedImage = readGenerationImage(path, generationIdentity);
   if (pinnedImage.sha256 !== manifest.databaseSha256) return integrity();
   faultInjector?.hit("after-generation-identity-before-open");
-  const database = new DatabaseSync(":memory:", {
-    timeout: busyTimeoutMs,
-    enableForeignKeyConstraints: true,
-    enableDoubleQuotedStringLiterals: false,
-    allowExtension: false,
-  });
+  const inspection = openPrivateGenerationInspection(pinnedImage, busyTimeoutMs);
+  const database = inspection.database;
   try {
-    (database as unknown as DeserializableDatabase).deserialize(
-      deserializableImage(pinnedImage.bytes),
-    );
     faultInjector?.hit("after-generation-open-before-inspection");
     if (
       !sameGenerationIdentity(generationIdentity, captureGenerationIdentity(path))
@@ -751,7 +892,7 @@ function inspectGeneration(
     try { database.exec("ROLLBACK"); } catch { /* preserve integrity failure */ }
     throw error;
   } finally {
-    database.close();
+    inspection.close();
   }
   if (
     !sameGenerationIdentity(generationIdentity, captureGenerationIdentity(path))
