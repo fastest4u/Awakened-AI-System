@@ -1,6 +1,11 @@
 import type { ReadonlyJsonValue, StoredEvent } from "../contracts/event.js";
 import { GENESIS_GLOBAL_HASH } from "../storage/event-store.js";
-import type { SqliteDriver, SqliteRow, SqliteValue } from "../storage/sqlite-driver.js";
+import type {
+  SqliteConnection,
+  SqliteDriver,
+  SqliteRow,
+  SqliteValue,
+} from "../storage/sqlite-driver.js";
 import type { ProjectBinding } from "./contracts.js";
 
 const DEFAULT_BUSY_TIMEOUT_MS = 5_000;
@@ -11,16 +16,24 @@ const SQLITE_INT64_MAX = 9_223_372_036_854_775_807n;
 const HASH = /^[0-9a-f]{64}$/u;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 
-const EVENT_COLUMNS = `
-  global_position, event_id, project_id, vault_id, store_id, workspace_id,
-  branch_scope_id, branch_ref, stream_id, stream_type, stream_version,
-  event_type, event_schema_version, session_id, parent_session_id,
-  actor_role, agent_id, client_instance_id, correlation_id, causation_id,
-  command_id, idempotency_key, command_event_index, occurred_at, recorded_at,
-  visibility_scope, confidence, verification_status, source_refs_json,
-  evidence_refs_json, evidence_digests_json, payload_json, payload_hash,
-  previous_global_hash, event_hash, lifecycle_intent_json
-`;
+const EVENT_FIELDS = Object.freeze([
+  "global_position", "event_id", "project_id", "vault_id", "store_id", "workspace_id",
+  "branch_scope_id", "branch_ref", "stream_id", "stream_type", "stream_version",
+  "event_type", "event_schema_version", "session_id", "parent_session_id",
+  "actor_role", "agent_id", "client_instance_id", "correlation_id", "causation_id",
+  "command_id", "idempotency_key", "command_event_index", "occurred_at", "recorded_at",
+  "visibility_scope", "confidence", "verification_status", "source_refs_json",
+  "evidence_refs_json", "evidence_digests_json", "payload_json", "payload_hash",
+  "previous_global_hash", "event_hash", "lifecycle_intent_json",
+] as const);
+const EVENT_COLUMNS = EVENT_FIELDS.join(", ");
+const EVENT_ROW_BYTE_EXPRESSION = EVENT_FIELDS.map((field) => `
+  CASE
+    WHEN ${field} IS NULL THEN 8
+    WHEN typeof(${field}) IN ('text', 'blob') THEN length(CAST(${field} AS BLOB))
+    ELSE 8
+  END
+`).join(" + ");
 
 export interface ProjectionEventSnapshot {
   readonly binding: ProjectBinding;
@@ -221,6 +234,44 @@ function rowBytes(row: SqliteRow): number {
   return bytes;
 }
 
+function preflightReplayRows(
+  connection: SqliteConnection,
+  binding: ProjectBinding,
+  terminalEventPosition: bigint,
+  maxEvents: number,
+  maxAggregateBytes: number,
+): void {
+  const row = connection.prepare(`
+    SELECT count(*) AS event_count,
+           coalesce(max(row_bytes), 0) AS maximum_row_bytes,
+           coalesce(sum(row_bytes), 0) AS aggregate_bytes
+    FROM (
+      SELECT ${EVENT_ROW_BYTE_EXPRESSION} AS row_bytes
+      FROM events
+      WHERE project_id = $projectId
+        AND workspace_id = $workspaceId
+        AND (
+          (branch_scope_id IS NULL AND $branchScopeId IS NULL)
+          OR branch_scope_id = $branchScopeId
+        )
+        AND (
+          (branch_ref IS NULL AND $branchRef IS NULL)
+          OR branch_ref = $branchRef
+        )
+        AND global_position <= $terminalEventPosition
+    )
+  `).get({
+    ...bindingParams(binding),
+    $terminalEventPosition: terminalEventPosition,
+  });
+  if (
+    row === undefined
+    || bigint(row, "event_count") > BigInt(maxEvents)
+    || bigint(row, "maximum_row_bytes") > BigInt(MAX_INTEGRITY_EVENT_BYTES)
+    || bigint(row, "aggregate_bytes") > BigInt(maxAggregateBytes)
+  ) return integrity();
+}
+
 /**
  * Reads one authenticated event row at a time in authoritative position order.
  * The callback is invoked synchronously before SQLite advances the iterator, so
@@ -267,6 +318,13 @@ export function replayCommittedProjectionEvents(
       || string(identity, "vault_id") !== binding.vaultId
       || string(identity, "store_id") !== binding.storeId
     ) return integrity();
+    preflightReplayRows(
+      connection,
+      binding,
+      terminalEventPosition,
+      maxEvents,
+      maxAggregateBytes,
+    );
     const iterator = connection.prepare(`
       SELECT ${EVENT_COLUMNS}
       FROM events

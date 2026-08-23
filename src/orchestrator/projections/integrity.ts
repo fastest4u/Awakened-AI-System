@@ -60,10 +60,14 @@ export interface ProjectionIntegrityReport {
 }
 
 type ProjectionRows = Readonly<Record<ProjectionName, readonly CanonicalProjectionRow[]>>;
+type ExpectedProjectionRows = Readonly<
+  Record<ProjectionName, ReadonlyMap<string, CanonicalProjectionRow>>
+>;
 
 interface ProjectionTable {
   readonly table: string;
   readonly columns: readonly string[];
+  readonly keyColumns: readonly string[];
   readonly order: string;
   readonly canonicalRowId?: boolean;
 }
@@ -75,41 +79,74 @@ interface ProjectionGenerationIdentity {
   readonly size: string;
 }
 
+interface PinnedGenerationImage {
+  readonly bytes: Uint8Array;
+  readonly sha256: string;
+}
+
+interface DeserializableDatabase {
+  deserialize(bytes: Uint8Array, options?: { readonly dbName?: string }): void;
+}
+
+function deserializableImage(bytes: Uint8Array): Uint8Array {
+  const result = Uint8Array.from(bytes);
+  const sqliteHeader = Buffer.from("SQLite format 3\0", "binary");
+  if (
+    result.byteLength < 100
+    || !Buffer.from(result.subarray(0, sqliteHeader.byteLength)).equals(sqliteHeader)
+    || (result[18] !== 1 && result[18] !== 2)
+    || (result[19] !== 1 && result[19] !== 2)
+  ) return integrity();
+  // A serialized in-memory database has no sibling -wal file. Normalize only
+  // the journal-mode header bytes on this isolated inspection copy; the
+  // manifest hash remains over the untouched pinned on-disk bytes.
+  result[18] = 1;
+  result[19] = 1;
+  return result;
+}
+
 const TABLES = Object.freeze({
   sessionTree: Object.freeze({
     table: "session_tree",
     columns: Object.freeze(["project_id", "session_id", "checkpoint_id", "checkpoint_version", "base_event_position", "source_event_position", "occurred_at", "task_summary"]),
+    keyColumns: Object.freeze(["project_id", "session_id"]),
     order: "project_id, session_id",
   }),
   canonicalItems: Object.freeze({
     table: "canonical_items",
     columns: Object.freeze(["project_id", "item_id", "normalized_key", "status", "confidence", "verification_method", "valid_from", "valid_to", "summary", "content_hash", "known_from_event_position", "source_event_position"]),
+    keyColumns: Object.freeze(["project_id", "item_id"]),
     order: "project_id, item_id",
   }),
   tasksFollowups: Object.freeze({
     table: "tasks_followups",
     columns: Object.freeze(["project_id", "session_id", "follow_up_id", "status", "summary", "confidence", "source_event_position"]),
+    keyColumns: Object.freeze(["project_id", "follow_up_id"]),
     order: "project_id, follow_up_id",
   }),
   artifactsFiles: Object.freeze({
     table: "artifacts_files",
     columns: Object.freeze(["project_id", "session_id", "artifact_id", "path", "summary", "action", "content_hash", "branch_ref", "confidence", "source_event_position"]),
+    keyColumns: Object.freeze(["project_id", "session_id", "artifact_id"]),
     order: "project_id, session_id, artifact_id",
   }),
   entityGraph: Object.freeze({
     table: "entity_graph",
     columns: Object.freeze(["project_id", "edge_id", "source_entity_id", "relationship", "target_entity_id", "source_event_position"]),
+    keyColumns: Object.freeze(["project_id", "edge_id"]),
     order: "project_id, edge_id",
   }),
   lexicalChunks: Object.freeze({
     table: "lexical_chunks",
     columns: Object.freeze(["project_id", "chunk_id", "item_id", "session_id", "section", "normalized_key", "text", "source_event_position"]),
+    keyColumns: Object.freeze(["project_id", "chunk_id"]),
     order: "project_id, chunk_id",
     canonicalRowId: true,
   }),
   retrievalFeedback: Object.freeze({
     table: "retrieval_feedback",
     columns: Object.freeze(["project_id", "feedback_id", "item_id", "outcome", "usefulness", "source_item_event_position", "source_event_position"]),
+    keyColumns: Object.freeze(["project_id", "feedback_id"]),
     order: "project_id, feedback_id",
   }),
 } as const satisfies Record<ProjectionName, ProjectionTable>);
@@ -169,14 +206,45 @@ function descriptorMatchesIdentity(
     && stat.size.toString() === expected.size;
 }
 
-function sha256Generation(path: string, expected: ProjectionGenerationIdentity): string {
+function readGenerationImage(
+  path: string,
+  expected: ProjectionGenerationIdentity,
+): PinnedGenerationImage {
+  const size = Number(expected.size);
+  if (!Number.isSafeInteger(size) || size < 1 || size > MAX_PROJECTION_DATABASE_BYTES) {
+    return integrity();
+  }
+  const bytes = Buffer.allocUnsafe(size);
+  const descriptor = openSync(path, "r");
+  try {
+    if (!descriptorMatchesIdentity(descriptor, expected)) return integrity();
+    let offset = 0;
+    while (offset < bytes.length) {
+      const bytesRead = readSync(descriptor, bytes, offset, bytes.length - offset, offset);
+      if (bytesRead === 0) return integrity();
+      offset += bytesRead;
+    }
+    if (!descriptorMatchesIdentity(descriptor, expected)) return integrity();
+  } finally {
+    closeSync(descriptor);
+  }
+  return Object.freeze({
+    bytes,
+    sha256: createHash("sha256").update(bytes).digest("hex"),
+  });
+}
+
+function hashGeneration(
+  path: string,
+  expected: ProjectionGenerationIdentity,
+): string {
   const hash = createHash("sha256");
   const buffer = Buffer.allocUnsafe(1024 * 1024);
   const descriptor = openSync(path, "r");
   try {
     if (!descriptorMatchesIdentity(descriptor, expected)) return integrity();
     while (true) {
-      const bytesRead = readSync(descriptor, buffer, 0, buffer.length, null);
+      const bytesRead = readSync(descriptor, buffer, 0, buffer.byteLength, null);
       if (bytesRead === 0) break;
       hash.update(buffer.subarray(0, bytesRead));
     }
@@ -187,13 +255,38 @@ function sha256Generation(path: string, expected: ProjectionGenerationIdentity):
   return hash.digest("hex");
 }
 
-function frozenRows(rows: CanonicalProjectionRow[]): readonly CanonicalProjectionRow[] {
-  return Object.freeze(rows.map((row) => Object.freeze(row)));
+function projectionRowKey(
+  definition: ProjectionTable,
+  row: CanonicalProjectionRow,
+): string {
+  let key = "";
+  for (const column of definition.keyColumns) {
+    const value = row[column];
+    if (typeof value !== "string") return integrity();
+    key += `${Buffer.byteLength(value, "utf8")}:${value}`;
+  }
+  return key;
 }
 
-function rowsFromState(state: ProjectionFoldState): ProjectionRows {
+function expectedMap<T>(
+  name: ProjectionName,
+  source: readonly T[],
+  convert: (row: T) => CanonicalProjectionRow,
+): ReadonlyMap<string, CanonicalProjectionRow> {
+  const result = new Map<string, CanonicalProjectionRow>();
+  const definition: ProjectionTable = TABLES[name];
+  for (const sourceRow of source) {
+    const row = Object.freeze(convert(sourceRow));
+    const key = projectionRowKey(definition, row);
+    if (result.has(key) || result.size >= MAX_ROWS) return integrity();
+    result.set(key, row);
+  }
+  return result;
+}
+
+function rowsFromState(state: ProjectionFoldState): ExpectedProjectionRows {
   return Object.freeze({
-    sessionTree: frozenRows(state.sessionCheckpoints.map((row) => ({
+    sessionTree: expectedMap("sessionTree", state.sessionCheckpoints, (row) => ({
       project_id: row.projectId,
       session_id: row.sessionId,
       checkpoint_id: row.checkpointId,
@@ -202,8 +295,8 @@ function rowsFromState(state: ProjectionFoldState): ProjectionRows {
       source_event_position: row.sourceEventPosition.toString(),
       occurred_at: row.occurredAt,
       task_summary: row.taskSummary,
-    })).sort((left, right) => String(left.session_id).localeCompare(String(right.session_id)))),
-    canonicalItems: frozenRows(state.canonicalItems.map((row) => ({
+    })),
+    canonicalItems: expectedMap("canonicalItems", state.canonicalItems, (row) => ({
       project_id: row.projectId,
       item_id: row.itemId,
       normalized_key: row.normalizedKey,
@@ -216,8 +309,8 @@ function rowsFromState(state: ProjectionFoldState): ProjectionRows {
       content_hash: row.contentHash,
       known_from_event_position: row.knownFromEventPosition.toString(),
       source_event_position: row.sourceEventPosition.toString(),
-    })).sort((left, right) => String(left.item_id).localeCompare(String(right.item_id)))),
-    tasksFollowups: frozenRows(state.followUps.map((row) => ({
+    })),
+    tasksFollowups: expectedMap("tasksFollowups", state.followUps, (row) => ({
       project_id: row.projectId,
       session_id: row.sessionId,
       follow_up_id: row.followUpId,
@@ -225,8 +318,8 @@ function rowsFromState(state: ProjectionFoldState): ProjectionRows {
       summary: row.summary,
       confidence: row.confidence,
       source_event_position: row.sourceEventPosition.toString(),
-    })).sort((left, right) => String(left.follow_up_id).localeCompare(String(right.follow_up_id)))),
-    artifactsFiles: frozenRows(state.artifacts.map((row) => ({
+    })),
+    artifactsFiles: expectedMap("artifactsFiles", state.artifacts, (row) => ({
       project_id: row.projectId,
       session_id: row.sessionId,
       artifact_id: row.artifactId,
@@ -237,10 +330,9 @@ function rowsFromState(state: ProjectionFoldState): ProjectionRows {
       branch_ref: row.branchRef,
       confidence: row.confidence,
       source_event_position: row.sourceEventPosition.toString(),
-    })).sort((left, right) => `${String(left.session_id)}\0${String(left.artifact_id)}`
-      .localeCompare(`${String(right.session_id)}\0${String(right.artifact_id)}`))),
-    entityGraph: Object.freeze([]),
-    lexicalChunks: frozenRows(state.lexicalChunks.map((row) => ({
+    })),
+    entityGraph: new Map<string, CanonicalProjectionRow>(),
+    lexicalChunks: expectedMap("lexicalChunks", state.lexicalChunks, (row) => ({
       project_id: row.projectId,
       chunk_id: row.chunkId,
       item_id: row.itemId,
@@ -249,8 +341,8 @@ function rowsFromState(state: ProjectionFoldState): ProjectionRows {
       normalized_key: row.normalizedKey,
       text: row.text,
       source_event_position: row.sourceEventPosition.toString(),
-    })).sort((left, right) => String(left.chunk_id).localeCompare(String(right.chunk_id)))),
-    retrievalFeedback: frozenRows(state.retrievalFeedback.map((row) => ({
+    })),
+    retrievalFeedback: expectedMap("retrievalFeedback", state.retrievalFeedback, (row) => ({
       project_id: row.projectId,
       feedback_id: row.feedbackId,
       item_id: row.itemId,
@@ -258,7 +350,7 @@ function rowsFromState(state: ProjectionFoldState): ProjectionRows {
       usefulness: row.usefulness,
       source_item_event_position: row.sourceItemEventPosition.toString(),
       source_event_position: row.sourceEventPosition.toString(),
-    })).sort((left, right) => String(left.feedback_id).localeCompare(String(right.feedback_id)))),
+    })),
   });
 }
 
@@ -266,7 +358,7 @@ function replay(
   binding: ProjectBinding,
   manifest: ProjectionManifestV1,
   options: ProjectionIntegrityServiceOptions,
-): ProjectionRows {
+): ExpectedProjectionRows {
   const terminalEventPosition = BigInt(manifest.terminalEventPosition);
   const accumulator = new ProjectionFoldAccumulator();
   const replayResult: CommittedProjectionReplayResult = replayCommittedProjectionEvents(binding, {
@@ -318,7 +410,7 @@ function sameRow(
 
 function readExactRows(
   database: DatabaseSync,
-  expectedRows: ProjectionRows,
+  expectedRows: ExpectedProjectionRows,
   projectId: string,
   terminalEventPosition: bigint,
   manifestChecksums: Readonly<Record<ProjectionName, string>>,
@@ -336,9 +428,10 @@ function readExactRows(
       ORDER BY ${definition.order}
     `).iterate();
     const rows: CanonicalProjectionRow[] = [];
+    const seen = new Set<string>();
     let index = 0;
     for (const raw of iterator) {
-      if (index >= MAX_ROWS || index >= expectedRows[name].length) return integrity();
+      if (index >= MAX_ROWS || index >= expectedRows[name].size) return integrity();
       if (definition.canonicalRowId && raw.row_id !== BigInt(index + 1)) return integrity();
       const row: Record<string, CanonicalProjectionRow[string]> = {};
       for (const column of definition.columns) {
@@ -348,11 +441,18 @@ function readExactRows(
         if (totalBytes > MAX_CANONICAL_BYTES) return integrity();
       }
       const canonical = Object.freeze(row);
-      if (!sameRow(canonical, expectedRows[name][index]!, definition.columns)) return integrity();
+      const key = projectionRowKey(definition, canonical);
+      const expected = expectedRows[name].get(key);
+      if (
+        expected === undefined
+        || seen.has(key)
+        || !sameRow(canonical, expected, definition.columns)
+      ) return integrity();
+      seen.add(key);
       rows.push(canonical);
       index += 1;
     }
-    if (index !== expectedRows[name].length) return integrity();
+    if (index !== expectedRows[name].size || seen.size !== expectedRows[name].size) return integrity();
     const frozen = Object.freeze(rows);
     const checksum = projectionCoreChecksum(
       name,
@@ -545,13 +645,56 @@ function assertFtsSemantics(
       if (left.value[column] !== right.value[column]) return integrity();
     }
   }
+  // Vocab authenticates the semantic term/posting content represented by the
+  // data/idx segment layout. The data id=1 averages record, every per-document
+  // size record, and config are additionally rank-sensitive and must match the
+  // independently populated canonical index byte-for-byte. The data id=10
+  // structure record is intentionally not byte-compared because equivalent
+  // segment histories have different physical encodings.
+  const shadows = [
+    Object.freeze({ suffix: "data", columns: Object.freeze(["id", "block"]), where: "WHERE id = 1", order: "id" }),
+    Object.freeze({ suffix: "docsize", columns: Object.freeze(["id", "sz"]), where: "", order: "id" }),
+    Object.freeze({ suffix: "config", columns: Object.freeze(["k", "v"]), where: "", order: "k" }),
+  ] as const;
+  for (const shadow of shadows) {
+    const columns = shadow.columns.join(", ");
+    const actualRows = statement(database, `
+      SELECT ${columns} FROM lexical_chunks_fts_${shadow.suffix}
+      ${shadow.where} ORDER BY ${shadow.order}
+    `).iterate();
+    const expectedRows = statement(database, `
+      SELECT ${columns} FROM temp.expected_fts_${shadow.suffix}
+      ${shadow.where} ORDER BY ${shadow.order}
+    `).iterate();
+    let count = 0;
+    while (true) {
+      const actualRow = actualRows.next();
+      const expectedRow = expectedRows.next();
+      if (actualRow.done || expectedRow.done) {
+        if (actualRow.done !== expectedRow.done) return integrity();
+        break;
+      }
+      if (count >= MAX_ROWS * 4) return integrity();
+      for (const column of shadow.columns) {
+        const actualValue = actualRow.value[column];
+        const expectedValue = expectedRow.value[column];
+        if (actualValue instanceof Uint8Array && expectedValue instanceof Uint8Array) {
+          if (
+            actualValue.byteLength !== expectedValue.byteLength
+            || !Buffer.from(actualValue).equals(Buffer.from(expectedValue))
+          ) return integrity();
+        } else if (actualValue !== expectedValue) return integrity();
+      }
+      count += 1;
+    }
+  }
 }
 
 function inspectGeneration(
   path: string,
   binding: ProjectBinding,
   manifest: ProjectionManifestV1,
-  expectedRows: ProjectionRows,
+  expectedRows: ExpectedProjectionRows,
   busyTimeoutMs: number,
   directoryIdentity: ProjectionDirectoryIdentity,
   faultInjector?: ProjectionIntegrityFaultInjector,
@@ -561,18 +704,20 @@ function inspectGeneration(
     directoryIdentity,
     captureProjectionDirectoryIdentity(directoryIdentity.canonicalPath),
   )) return integrity();
-  const beforeHash = sha256Generation(path, generationIdentity);
-  if (beforeHash !== manifest.databaseSha256) return integrity();
+  const pinnedImage = readGenerationImage(path, generationIdentity);
+  if (pinnedImage.sha256 !== manifest.databaseSha256) return integrity();
   faultInjector?.hit("after-generation-identity-before-open");
-  const database = new DatabaseSync(path, {
-    open: true,
-    readOnly: true,
+  const database = new DatabaseSync(":memory:", {
     timeout: busyTimeoutMs,
     enableForeignKeyConstraints: true,
     enableDoubleQuotedStringLiterals: false,
     allowExtension: false,
   });
   try {
+    (database as unknown as DeserializableDatabase).deserialize(
+      deserializableImage(pinnedImage.bytes),
+    );
+    faultInjector?.hit("after-generation-open-before-inspection");
     if (
       !sameGenerationIdentity(generationIdentity, captureGenerationIdentity(path))
       || !sameProjectionDirectoryIdentity(
@@ -580,7 +725,6 @@ function inspectGeneration(
         captureProjectionDirectoryIdentity(directoryIdentity.canonicalPath),
       )
     ) return integrity();
-    faultInjector?.hit("after-generation-open-before-inspection");
     database.exec("PRAGMA trusted_schema = OFF; BEGIN");
     assertCanonicalSchema(database);
     assertMetadata(database, binding, manifest);
@@ -600,7 +744,7 @@ function inspectGeneration(
         directoryIdentity,
         captureProjectionDirectoryIdentity(directoryIdentity.canonicalPath),
       )
-      || sha256Generation(path, generationIdentity) !== beforeHash
+      || hashGeneration(path, generationIdentity) !== pinnedImage.sha256
     ) return integrity();
     database.exec("COMMIT");
   } catch (error) {
@@ -615,7 +759,7 @@ function inspectGeneration(
       directoryIdentity,
       captureProjectionDirectoryIdentity(directoryIdentity.canonicalPath),
     )
-    || sha256Generation(path, generationIdentity) !== beforeHash
+    || hashGeneration(path, generationIdentity) !== pinnedImage.sha256
   ) return integrity();
 }
 

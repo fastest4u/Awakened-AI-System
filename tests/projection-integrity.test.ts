@@ -40,7 +40,13 @@ import {
 } from "../src/orchestrator/storage/event-store.js";
 import { MaintenanceFence } from "../src/orchestrator/storage/maintenance-fence.js";
 import { NodeSqliteDriver } from "../src/orchestrator/storage/node-sqlite-driver.js";
-import type { SqliteConnection } from "../src/orchestrator/storage/sqlite-driver.js";
+import type {
+  SqliteConnection,
+  SqliteDriver,
+  SqliteOpenOptions,
+  SqliteParams,
+  SqliteStatement,
+} from "../src/orchestrator/storage/sqlite-driver.js";
 import { applyCurrentProjectStoreSchema } from "./support/current-project-store-schema.js";
 
 const PROJECT_ID = "1".repeat(64) as ProjectId;
@@ -307,6 +313,22 @@ function mutateDatabase(fixture: Fixture, sql: string): void {
   }
 }
 
+function mutateFtsShadowDatabase(fixture: Fixture, sql: string): void {
+  const DefensiveDatabaseSync = DatabaseSync as unknown as new (
+    path: string,
+    options: { readonly defensive: boolean },
+  ) => DatabaseSync;
+  const database = new DefensiveDatabaseSync(fixture.databasePath, {
+    defensive: false,
+  });
+  try {
+    database.exec(sql);
+    database.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+  } finally {
+    database.close();
+  }
+}
+
 function resignedManifest(
   fixture: Fixture,
   changedChecksums: readonly ProjectionName[] = [],
@@ -332,6 +354,56 @@ function expectIntegrityFailure(action: () => unknown): void {
       && candidate.message.startsWith("INTEGRITY_FAILURE:")
       && candidate.safeMessage === "Lifecycle integrity verification failed";
   });
+}
+
+function ftsDecisionRanks(path: string): readonly Readonly<{ rowid: bigint; rank: number }>[] {
+  const database = new DatabaseSync(path, { readOnly: true });
+  try {
+    const query = database.prepare(`
+      SELECT rowid, rank FROM lexical_chunks_fts
+      WHERE lexical_chunks_fts MATCH 'decision'
+      ORDER BY rowid
+    `);
+    query.setReadBigInts(true);
+    return Object.freeze(query.all().map((row) => Object.freeze({
+      rowid: row.rowid as bigint,
+      rank: row.rank as number,
+    })));
+  } finally {
+    database.close();
+  }
+}
+
+function observingFullEventRows(onRow: () => void): SqliteDriver {
+  return {
+    open(path: string, options: SqliteOpenOptions): SqliteConnection {
+      const connection = driver.open(path, options);
+      return {
+        exec: (sql) => connection.exec(sql),
+        close: () => connection.close(),
+        prepare(sql: string): SqliteStatement {
+          const prepared = connection.prepare(sql);
+          if (!sql.includes("payload_json, payload_hash") || !sql.includes("FROM events")) {
+            return prepared;
+          }
+          return {
+            run: (params?: SqliteParams) => prepared.run(params),
+            get: (params?: SqliteParams) => prepared.get(params),
+            all: (params?: SqliteParams) => prepared.all(params),
+            iterate(params?: SqliteParams) {
+              const source = prepared.iterate(params);
+              return (function* observedRows() {
+                for (const row of source) {
+                  onRow();
+                  yield row;
+                }
+              })();
+            },
+          };
+        },
+      };
+    },
+  };
 }
 
 describe("full projection integrity replay", () => {
@@ -366,6 +438,31 @@ describe("full projection integrity replay", () => {
     });
   });
 
+  it("does not sort the full expected projection while comparing a scale generation", async () => {
+    const events = Array.from({ length: 256 }, (_, index) => pendingEvent(
+      "MemorySourceRecorded",
+      projectionPayload(
+        uuid(30_000 + index),
+        `linear:item:${index.toString().padStart(4, "0")}`,
+        `Linear comparison item ${index}.`,
+      ),
+    ));
+    const fixture = await createFixture({ events });
+    const nativeSort = Array.prototype.sort;
+    Array.prototype.sort = function guardedSort(compareFn) {
+      if (this.length >= 128) throw new Error("FULL_EXPECTED_SORT_FORBIDDEN");
+      return nativeSort.call(this, compareFn) as typeof this;
+    };
+    try {
+      assert.deepEqual(fixture.integrity.verify(BINDING, fixture.manifest), {
+        status: "passed",
+        terminalEventPosition: "256",
+      });
+    } finally {
+      Array.prototype.sort = nativeSort;
+    }
+  });
+
   it("fails closed when authoritative replay exceeds its configured event bound", async () => {
     const fixture = await createFixture({ maxReplayEvents: 2 });
 
@@ -376,6 +473,31 @@ describe("full projection integrity replay", () => {
     const fixture = await createFixture({ maxReplayBytes: 256 });
 
     expectIntegrityFailure(() => fixture.integrity.verify(BINDING, fixture.manifest));
+  });
+
+  it("rejects an oversized stored payload before a full event row reaches JavaScript", async () => {
+    const fixture = await createFixture();
+    const source = new DatabaseSync(fixture.sourcePath);
+    try {
+      source.exec(`
+        DROP TRIGGER events_no_update;
+        UPDATE events
+        SET payload_json = '"' || hex(zeroblob(524288)) || '"'
+        WHERE global_position = 1
+      `);
+      source.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+    } finally {
+      source.close();
+    }
+    let fullRowsDelivered = 0;
+    const integrity = new ProjectionIntegrityService({
+      driver: observingFullEventRows(() => { fullRowsDelivered += 1; }),
+      eventStorePath: fixture.sourcePath,
+      projectionDirectory: fixture.projectionDirectory,
+    });
+
+    expectIntegrityFailure(() => integrity.verify(BINDING, fixture.manifest));
+    assert.equal(fullRowsDelivered, 0);
   });
 
   it("rejects a same-byte generation replacement race before opening SQLite", async () => {
@@ -400,6 +522,45 @@ describe("full projection integrity replay", () => {
 
     expectIntegrityFailure(() => integrity.verify(BINDING, fixture.manifest));
     assert.equal(injected, true);
+    assert.equal(databaseSha256(fixture.databasePath), fixture.manifest.databaseSha256);
+  });
+
+  it("inspects the pinned image across a temporary A-to-B-to-A path swap", async () => {
+    const fixture = await createFixture();
+    const originalPath = `${fixture.databasePath}.original`;
+    const alternatePath = `${fixture.databasePath}.alternate`;
+    copyFileSync(fixture.databasePath, alternatePath);
+    mutateFtsShadowDatabase({ ...fixture, databasePath: alternatePath }, `
+      UPDATE lexical_chunks_fts_docsize SET sz = X'0101' WHERE id = 1
+    `);
+    assert.notEqual(databaseSha256(alternatePath), fixture.manifest.databaseSha256);
+    let swapped = false;
+    let restored = false;
+    const integrity = new ProjectionIntegrityService({
+      driver,
+      eventStorePath: fixture.sourcePath,
+      projectionDirectory: fixture.projectionDirectory,
+      faultInjector: {
+        hit(boundary): void {
+          if (boundary === "after-generation-identity-before-open" && !swapped) {
+            renameSync(fixture.databasePath, originalPath);
+            renameSync(alternatePath, fixture.databasePath);
+            swapped = true;
+          } else if (boundary === "after-generation-open-before-inspection" && !restored) {
+            renameSync(fixture.databasePath, alternatePath);
+            renameSync(originalPath, fixture.databasePath);
+            restored = true;
+          }
+        },
+      },
+    });
+
+    assert.deepEqual(integrity.verify(BINDING, fixture.manifest), {
+      status: "passed",
+      terminalEventPosition: "3",
+    });
+    assert.equal(swapped, true);
+    assert.equal(restored, true);
     assert.equal(databaseSha256(fixture.databasePath), fixture.manifest.databaseSha256);
   });
 
@@ -554,6 +715,22 @@ describe("full projection integrity replay", () => {
       INSERT INTO lexical_chunks_fts(lexical_chunks_fts, rank)
       VALUES ('rank', 'bm25(10.0, 1.0)')
     `);
+
+    expectIntegrityFailure(() => fixture.integrity.verify(
+      BINDING,
+      resignedManifest(fixture),
+    ));
+  });
+
+  it("detects rank-sensitive FTS docsize tampering after the database hash is re-signed", async () => {
+    const fixture = await createFixture();
+    const before = ftsDecisionRanks(fixture.databasePath);
+    assert.equal(before.length, 2);
+    mutateFtsShadowDatabase(fixture, `
+      UPDATE lexical_chunks_fts_docsize SET sz = X'0101' WHERE id = 1
+    `);
+    const after = ftsDecisionRanks(fixture.databasePath);
+    assert.notDeepEqual(after, before);
 
     expectIntegrityFailure(() => fixture.integrity.verify(
       BINDING,
