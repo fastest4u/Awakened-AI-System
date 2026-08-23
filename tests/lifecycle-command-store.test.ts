@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { DatabaseSync } from "node:sqlite";
+import * as nodeSqlite from "node:sqlite";
 import { describe, it } from "node:test";
 import type {
   AppendCommand,
@@ -579,20 +579,48 @@ describe("LifecycleCommandStore", () => {
   it("keeps the authoritative command transaction isolated from derived projection files", () => {
     const root = mkdtempSync(join(tmpdir(), "lifecycle-projection-isolation-"));
     const projectionPath = join(root, "projections-1-1.sqlite");
-    const projectionOwner = new DatabaseSync(projectionPath);
-    const projectionContender = new DatabaseSync(projectionPath, { timeout: 0 });
+    const projection = new nodeSqlite.DatabaseSync(projectionPath);
+    const authoritative = new nodeSqlite.DatabaseSync(":memory:");
     try {
-      projectionOwner.exec(`
+      projection.exec(`
         CREATE TABLE sentinel(value TEXT NOT NULL) STRICT;
         INSERT INTO sentinel VALUES ('unchanged');
-        BEGIN EXCLUSIVE;
       `);
-      assert.throws(
-        () => projectionContender.exec("UPDATE sentinel SET value = 'contended'"),
-        /database is locked/u,
-      );
+      projection.close();
+      authoritative.exec(`
+        ATTACH DATABASE '${projectionPath.replaceAll("'", "''")}' AS projection_probe
+      `);
+      assert.equal(authoritative.location("projection_probe"), projectionPath);
+      const sqliteRuntime = nodeSqlite as unknown as {
+        constants: { SQLITE_ATTACH: number; SQLITE_DENY: number; SQLITE_OK: number };
+      };
+      const observable = authoritative as unknown as {
+        setAuthorizer(callback: null | ((
+          actionCode: number,
+          arg1: string | null,
+          arg2: string | null,
+          databaseName: string | null,
+          triggerName: string | null,
+        ) => number)): void;
+      };
+      const projectionAccesses: unknown[][] = [];
+      observable.setAuthorizer((actionCode, arg1, arg2, databaseName, triggerName) => {
+        if (
+          actionCode === sqliteRuntime.constants.SQLITE_ATTACH
+          || databaseName === "projection_probe"
+        ) {
+          projectionAccesses.push([actionCode, arg1, arg2, databaseName, triggerName]);
+          return sqliteRuntime.constants.SQLITE_DENY;
+        }
+        return sqliteRuntime.constants.SQLITE_OK;
+      });
 
-      const connection = new TransactionConnection();
+      const connection = new class extends TransactionConnection {
+        override exec(sql: string): void {
+          authoritative.exec(sql);
+          super.exec(sql);
+        }
+      }();
       const events = new FakeEvents(connection);
       const store = new LifecycleCommandStore({
         connection,
@@ -608,22 +636,25 @@ describe("LifecycleCommandStore", () => {
       }));
 
       assert.deepEqual(connection.statements, ["BEGIN IMMEDIATE", "COMMIT"]);
-      assert.equal(
-        connection.statements.some((sql) => /attach|projection-manifest|projections-1-/iu.test(sql)),
-        false,
+      assert.deepEqual(projectionAccesses, []);
+      assert.throws(
+        () => authoritative.prepare("SELECT value FROM projection_probe.sentinel").get(),
+        /prohibited|not authorized/u,
+        "the SQLite observer must make a projection read causally observable",
       );
+      assert.equal(projectionAccesses.length, 1);
+      observable.setAuthorizer(null);
       assert.equal(
-        projectionOwner.prepare("SELECT value FROM sentinel").get()?.value,
+        authoritative.prepare("SELECT value FROM projection_probe.sentinel").get()?.value,
         "unchanged",
       );
     } finally {
       try {
-        projectionOwner.exec("ROLLBACK");
+        projection.close();
       } catch {
-        // The assertion path may fail before the exclusive transaction starts.
+        // The setup closes this connection after creating the fixture.
       }
-      projectionContender.close();
-      projectionOwner.close();
+      authoritative.close();
       rmSync(root, { recursive: true, force: true });
     }
   });

@@ -1,8 +1,12 @@
-import { lstatSync, unlinkSync } from "node:fs";
 import { join, resolve } from "node:path";
 
 import { fsyncDirectory, type DirectorySync } from "../identity/directory-durability.js";
 import type { ProjectionManifestV1 } from "./manifest.js";
+import {
+  filesystemStableProjectionDirectoryOperations,
+  sameProjectionDirectoryIdentity,
+  type ProjectionDirectoryIdentity,
+} from "./stable-directory.js";
 
 export interface ProjectionReaderLease {
   readonly manifest: ProjectionManifestV1;
@@ -14,6 +18,7 @@ export interface LeasableProjectionGeneration {
   readonly manifest: ProjectionManifestV1;
   readonly projectionDirectory: string;
   readonly databasePath: string;
+  readonly directoryIdentity: ProjectionDirectoryIdentity;
 }
 
 interface LeaseEntry {
@@ -46,10 +51,6 @@ function key(path: string): string {
   return process.platform === "win32" ? normalized.toLowerCase() : normalized;
 }
 
-function notFound(error: unknown): boolean {
-  return typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT";
-}
-
 function safeErrorCode(error: unknown): string {
   if (typeof error === "object" && error !== null && "code" in error) {
     return String(error.code).slice(0, 128);
@@ -75,12 +76,19 @@ export class ProjectionReaderLeaseRegistry {
     const current = this.#entries.get(id);
     if (current?.retired === true) throw new ProjectionLeaseUnavailableError();
     try {
-      const stat = lstatSync(generation.databasePath);
-      if (!stat.isFile() || stat.isSymbolicLink()) throw new ProjectionLeaseUnavailableError();
-    } catch (error) {
-      if (error instanceof ProjectionLeaseUnavailableError) throw error;
-      if (notFound(error)) throw new ProjectionLeaseUnavailableError();
-      throw error;
+      const identity = filesystemStableProjectionDirectoryOperations.capture(
+        generation.projectionDirectory,
+      );
+      if (!sameProjectionDirectoryIdentity(identity, generation.directoryIdentity)) {
+        throw new ProjectionLeaseUnavailableError();
+      }
+      filesystemStableProjectionDirectoryOperations.assertGeneration(
+        generation.projectionDirectory,
+        generation.manifest.databaseFile,
+        generation.directoryIdentity,
+      );
+    } catch {
+      throw new ProjectionLeaseUnavailableError();
     }
     const entry = current ?? {
       generation,
@@ -147,15 +155,11 @@ export class ProjectionReaderLeaseRegistry {
     entry.attempts += 1;
     try {
       if (!entry.fileRemoved) {
-        try {
-          const stat = lstatSync(entry.generation.databasePath);
-          if (!stat.isFile() || stat.isSymbolicLink()) {
-            throw new Error("PROJECTION_LEASE_PATH_INVALID");
-          }
-          unlinkSync(entry.generation.databasePath);
-        } catch (error) {
-          if (!notFound(error)) throw error;
-        }
+        filesystemStableProjectionDirectoryOperations.unlinkGeneration(
+          entry.generation.projectionDirectory,
+          entry.generation.manifest.databaseFile,
+          entry.generation.directoryIdentity,
+        );
         entry.fileRemoved = true;
       }
       this.#syncDirectory(entry.generation.projectionDirectory);

@@ -4,7 +4,6 @@ import {
   readFileSync,
   realpathSync,
   readdirSync,
-  unlinkSync,
 } from "node:fs";
 import { isAbsolute, join, normalize, resolve } from "node:path";
 
@@ -24,12 +23,18 @@ import {
   ProjectionReaderLeaseRegistry,
   type ProjectionReaderLease,
 } from "./reader-lease.js";
+import {
+  filesystemStableProjectionDirectoryOperations,
+  sameProjectionDirectoryIdentity,
+  type ProjectionDirectoryIdentity,
+} from "./stable-directory.js";
 
 const MAX_GENERATION = 2_147_483_647;
 const GENERATION_FILE = /^projections-1-([1-9][0-9]{0,9})\.sqlite$/u;
-const GENERATION_TEMP = /^\.projections-1-[1-9][0-9]{0,9}\.sqlite\.tmp(?:-(?:wal|shm))?$/u;
 
-export interface PublishedProjectionGeneration extends BuiltProjectionGeneration {}
+export interface PublishedProjectionGeneration extends BuiltProjectionGeneration {
+  readonly directoryIdentity: ProjectionDirectoryIdentity;
+}
 
 export interface ProjectionGenerationBuilder {
   build(snapshot: ProjectionEventSnapshot, generation: number): Promise<BuiltProjectionGeneration>;
@@ -115,6 +120,7 @@ export class DefaultProjectionBuildCoordinator implements ProjectionBuildCoordin
   readonly #now: () => number;
   readonly #sleep: (milliseconds: number) => Promise<void>;
   readonly #pathInspection: ProjectionPathInspection;
+  #directoryIdentity: ProjectionDirectoryIdentity | null = null;
   readonly #projectTails = new Map<string, Promise<void>>();
 
   constructor(options: DefaultProjectionBuildCoordinatorOptions) {
@@ -150,6 +156,7 @@ export class DefaultProjectionBuildCoordinator implements ProjectionBuildCoordin
         const current = this.#loadPublished(binding);
         if (current !== null) {
           available = position(current.manifest);
+          this.#assertBeforeDeadline(deadline, expiresAt, requiredEventPosition, available);
           if (available >= requiredEventPosition) return current;
         }
         this.#assertBeforeDeadline(deadline, expiresAt, requiredEventPosition, available);
@@ -206,6 +213,7 @@ export class DefaultProjectionBuildCoordinator implements ProjectionBuildCoordin
     return this.#deadlineResult(
       work,
       deadlineMs,
+      expiresAt,
       deadline,
       () => new ProjectionLagError(requiredEventPosition, available),
     );
@@ -265,6 +273,7 @@ export class DefaultProjectionBuildCoordinator implements ProjectionBuildCoordin
       manifest,
       projectionDirectory: this.#projectionDirectory,
       databasePath: paths.databasePath,
+      directoryIdentity: this.#requiredDirectoryIdentity(),
     });
   }
 
@@ -283,13 +292,10 @@ export class DefaultProjectionBuildCoordinator implements ProjectionBuildCoordin
 
   #cleanupKnownTemps(): void {
     if (!this.#assertProjectionDirectorySafe()) return;
-    for (const name of readdirSync(this.#projectionDirectory)) {
-      if (name !== `.${PROJECTION_MANIFEST_FILENAME}.tmp` && !GENERATION_TEMP.test(name)) continue;
-      const path = join(this.#projectionDirectory, name);
-      const stat = this.#pathInspection.lstat(path);
-      if (!stat.isFile() || stat.isSymbolicLink()) throw new Error("PROJECTION_PATH_INVALID");
-      unlinkSync(path);
-    }
+    filesystemStableProjectionDirectoryOperations.cleanupKnownTemps(
+      this.#projectionDirectory,
+      this.#requiredDirectoryIdentity(),
+    );
   }
 
   #nextGeneration(): number {
@@ -335,7 +341,19 @@ export class DefaultProjectionBuildCoordinator implements ProjectionBuildCoordin
       || normalizedPath(this.#pathInspection.realpath(this.#projectionDirectory))
         !== normalizedPath(this.#projectionDirectory)
     ) throw new Error("PROJECTION_PATH_INVALID");
+    const identity = filesystemStableProjectionDirectoryOperations.capture(
+      this.#projectionDirectory,
+    );
+    if (this.#directoryIdentity === null) this.#directoryIdentity = identity;
+    else if (!sameProjectionDirectoryIdentity(this.#directoryIdentity, identity)) {
+      throw new Error("PROJECTION_PATH_INVALID");
+    }
     return true;
+  }
+
+  #requiredDirectoryIdentity(): ProjectionDirectoryIdentity {
+    if (this.#directoryIdentity === null) throw new Error("PROJECTION_PATH_INVALID");
+    return this.#directoryIdentity;
   }
 
   #assertBeforeDeadline(
@@ -353,6 +371,7 @@ export class DefaultProjectionBuildCoordinator implements ProjectionBuildCoordin
   #deadlineResult<T>(
     work: Promise<T>,
     deadlineMs: number,
+    expiresAt: number,
     state: DeadlineState,
     lag: () => ProjectionLagError,
   ): Promise<T> {
@@ -369,12 +388,20 @@ export class DefaultProjectionBuildCoordinator implements ProjectionBuildCoordin
           if (settled) return;
           settled = true;
           clearTimeout(timer);
+          if (state.expired || this.#now() >= expiresAt) {
+            rejectResult(lag());
+            return;
+          }
           resolveResult(result);
         },
         (error: unknown) => {
           if (settled) return;
           settled = true;
           clearTimeout(timer);
+          if (state.expired || this.#now() >= expiresAt) {
+            rejectResult(lag());
+            return;
+          }
           rejectResult(error);
         },
       );

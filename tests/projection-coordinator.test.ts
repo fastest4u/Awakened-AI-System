@@ -6,6 +6,7 @@ import {
   mkdirSync,
   readFileSync,
   realpathSync,
+  renameSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
@@ -141,7 +142,7 @@ function emptySnapshot(onClose: () => void = () => undefined): ProjectionEventSn
 class PublishDuringAcquireRegistry extends ProjectionReaderLeaseRegistry {
   replacement: BuiltProjectionGeneration | null = null;
 
-  override acquire(generation: BuiltProjectionGeneration) {
+  override acquire(generation: Parameters<ProjectionReaderLeaseRegistry["acquire"]>[0]) {
     const replacement = this.replacement;
     if (replacement !== null) {
       this.replacement = null;
@@ -210,7 +211,7 @@ describe("projection build coordinator", () => {
     writeFileSync(knownManifestTemp, "stale", "utf8");
     writeFileSync(knownGenerationTemp, "stale", "utf8");
     writeFileSync(unrelatedTemp, "keep", "utf8");
-    const result = await coordinator.ensurePublished(BINDING, 8n, 200);
+    const result = await coordinator.ensurePublished(BINDING, 8n, 2_000);
     assert.equal(result.manifest.terminalEventPosition, "8");
     assert.equal(result.manifest.sessionId, null);
     assert.equal(existsSync(knownManifestTemp), false);
@@ -223,7 +224,7 @@ describe("projection build coordinator", () => {
     append(source, 9);
     failAfterFsync = true;
     await assert.rejects(
-      () => coordinator.ensurePublished(BINDING, 9n, 200),
+      () => coordinator.ensurePublished(BINDING, 9n, 2_000),
       /after-generation-fsync-before-manifest/u,
     );
     assert.equal(source.prepare("SELECT count(*) AS n FROM events").get()?.n, 9);
@@ -236,7 +237,7 @@ describe("projection build coordinator", () => {
     assert.deepEqual(readFileSync(firstDatabase), firstBytes);
 
     failAfterFsync = false;
-    const ninth = await coordinator.ensurePublished(BINDING, 9n, 200);
+    const ninth = await coordinator.ensurePublished(BINDING, 9n, 2_000);
     assert.equal(ninth.manifest.terminalEventPosition, "9");
     assert.equal(existsSync(firstDatabase), true, "leased retired generation must remain");
     oldReader.close();
@@ -244,8 +245,8 @@ describe("projection build coordinator", () => {
 
     append(source, 10);
     const concurrent = await Promise.all([
-      coordinator.ensurePublished(BINDING, 10n, 200),
-      coordinator.ensurePublished(BINDING, 10n, 200),
+      coordinator.ensurePublished(BINDING, 10n, 2_000),
+      coordinator.ensurePublished(BINDING, 10n, 2_000),
     ]);
     assert.equal(concurrent[0].manifest.terminalEventPosition, "10");
     assert.equal(concurrent[1].manifest.terminalEventPosition, "10");
@@ -280,7 +281,7 @@ describe("projection build coordinator", () => {
       projectionDirectory,
     });
 
-    const first = await coordinator.ensurePublished(BINDING, 8n, 200);
+    const first = await coordinator.ensurePublished(BINDING, 8n, 2_000);
     append(source, 9);
     const snapshot = await eventReader.openCommittedSnapshot(BINDING);
     leases.replacement = await builder.build(snapshot, 2);
@@ -322,6 +323,54 @@ describe("projection build coordinator", () => {
     );
     assert.equal(reads, 0);
     assert.equal(builds, 0);
+  });
+
+  it("returns projection lag at a zero deadline even when a sufficient generation exists", async () => {
+    const root = mkdtempSync(join(tmpdir(), "projection-existing-zero-deadline-"));
+    roots.push(root);
+    const sourcePath = join(root, "events.sqlite");
+    const projectionDirectory = join(root, "projections");
+    const source = sourceDatabase(sourcePath);
+    append(source, 1);
+    const driver = new NodeSqliteDriver({ DatabaseSync });
+    const coordinator = new DefaultProjectionBuildCoordinator({
+      projectionDirectory,
+      eventReader: new SqliteProjectionEventReader({ driver, eventStorePath: sourcePath }),
+      builder: new ImmutableProjectionBuilder({ driver, projectionDirectory, now: () => NOW }),
+    });
+    await coordinator.ensurePublished(BINDING, 1n, 2_000);
+
+    await assert.rejects(
+      () => coordinator.ensurePublished(BINDING, 1n, 0),
+      (error: unknown) => error instanceof ProjectionLagError
+        && error.availableEventPosition === 1n,
+    );
+    source.close();
+  });
+
+  it("maps a synchronously blocking source rejection observed after expiry to projection lag", async () => {
+    const root = mkdtempSync(join(tmpdir(), "projection-blocking-deadline-"));
+    roots.push(root);
+    const projectionDirectory = join(root, "projections");
+    const coordinator = new DefaultProjectionBuildCoordinator({
+      projectionDirectory,
+      eventReader: {
+        async openCommittedSnapshot() {
+          const releaseAt = Date.now() + 25;
+          while (Date.now() < releaseAt) {
+            // Deliberately block the event loop past the absolute deadline.
+          }
+          throw new Error("late synchronous source failure");
+        },
+      },
+      builder: { async build() { throw new Error("not reached"); } },
+    });
+
+    await assert.rejects(
+      () => coordinator.ensurePublished(BINDING, 1n, 5),
+      (error: unknown) => error instanceof ProjectionLagError,
+    );
+    assert.equal(existsSync(join(projectionDirectory, "projection-manifest.json")), false);
   });
 
   it("bounds a slow source snapshot and closes its late result without invoking the builder", async () => {
@@ -417,6 +466,90 @@ describe("projection build coordinator", () => {
     assert.equal(readFileSync(knownTemp, "utf8"), "outside-authority");
   });
 
+  it("does not follow a projection directory replaced after cleanup authorization", async () => {
+    const root = mkdtempSync(join(tmpdir(), "projection-cleanup-swap-"));
+    roots.push(root);
+    const projectionDirectory = join(root, "projections");
+    const originalDirectory = join(root, "original-projections");
+    const attackerDirectory = join(root, "attacker-directory");
+    mkdirSync(projectionDirectory);
+    mkdirSync(attackerDirectory);
+    const knownName = ".projection-manifest.json.tmp";
+    writeFileSync(join(projectionDirectory, knownName), "owned stale temp", "utf8");
+    writeFileSync(join(attackerDirectory, knownName), "outside victim", "utf8");
+    let directoryRealpaths = 0;
+    const inspection: ProjectionPathInspection = {
+      lstat: lstatSync,
+      realpath(path) {
+        if (path === projectionDirectory) {
+          directoryRealpaths += 1;
+          if (directoryRealpaths === 3) {
+            renameSync(projectionDirectory, originalDirectory);
+            renameSync(attackerDirectory, projectionDirectory);
+            return projectionDirectory;
+          }
+        }
+        return realpathSync(path);
+      },
+    };
+    const coordinator = new DefaultProjectionBuildCoordinator({
+      projectionDirectory,
+      pathInspection: inspection,
+      eventReader: { async openCommittedSnapshot() { throw new Error("source must not run"); } },
+      builder: { async build() { throw new Error("builder must not run"); } },
+    });
+
+    await assert.rejects(
+      () => coordinator.ensurePublished(BINDING, 1n, 2_000),
+      /PROJECTION_PATH_INVALID/u,
+    );
+    assert.equal(readFileSync(join(projectionDirectory, knownName), "utf8"), "outside victim");
+    assert.equal(readFileSync(join(originalDirectory, knownName), "utf8"), "owned stale temp");
+  });
+
+  it("never reclaims through a replaced parent and retries against the pinned directory", async () => {
+    const root = mkdtempSync(join(tmpdir(), "projection-reclaim-parent-swap-"));
+    roots.push(root);
+    const sourcePath = join(root, "events.sqlite");
+    const projectionDirectory = join(root, "projections");
+    const originalDirectory = join(root, "original-projections");
+    const attackerDirectory = join(root, "attacker-directory");
+    const displacedAttackerDirectory = join(root, "displaced-attacker");
+    const source = sourceDatabase(sourcePath);
+    append(source, 1);
+    const driver = new NodeSqliteDriver({ DatabaseSync });
+    const leases = new ProjectionReaderLeaseRegistry();
+    const coordinator = new DefaultProjectionBuildCoordinator({
+      projectionDirectory,
+      eventReader: new SqliteProjectionEventReader({ driver, eventStorePath: sourcePath }),
+      builder: new ImmutableProjectionBuilder({ driver, projectionDirectory, now: () => NOW }),
+      leases,
+    });
+    const published = await coordinator.ensurePublished(BINDING, 1n, 2_000);
+    mkdirSync(attackerDirectory);
+    writeFileSync(join(attackerDirectory, published.manifest.databaseFile), "outside victim", "utf8");
+    renameSync(projectionDirectory, originalDirectory);
+    renameSync(attackerDirectory, projectionDirectory);
+
+    leases.retire(published);
+    assert.equal(
+      readFileSync(join(projectionDirectory, published.manifest.databaseFile), "utf8"),
+      "outside victim",
+    );
+    assert.equal(leases.reclamationIssues().length, 1);
+
+    renameSync(projectionDirectory, displacedAttackerDirectory);
+    renameSync(originalDirectory, projectionDirectory);
+    leases.retryReclamation();
+    assert.equal(existsSync(published.databasePath), false);
+    assert.equal(
+      readFileSync(join(displacedAttackerDirectory, published.manifest.databaseFile), "utf8"),
+      "outside victim",
+    );
+    assert.equal(leases.reclamationIssues().length, 0);
+    source.close();
+  });
+
   it("keeps publication successful and records retryable retired-file cleanup failures", async () => {
     const root = mkdtempSync(join(tmpdir(), "projection-reclaim-retry-"));
     roots.push(root);
@@ -439,9 +572,9 @@ describe("projection build coordinator", () => {
       leases,
     });
 
-    const first = await coordinator.ensurePublished(BINDING, 1n, 200);
+    const first = await coordinator.ensurePublished(BINDING, 1n, 2_000);
     append(source, 2);
-    const second = await coordinator.ensurePublished(BINDING, 2n, 200);
+    const second = await coordinator.ensurePublished(BINDING, 2n, 2_000);
     assert.equal(second.manifest.terminalEventPosition, "2");
     assert.equal(
       parseProjectionManifest(
