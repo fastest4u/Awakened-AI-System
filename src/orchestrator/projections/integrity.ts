@@ -25,6 +25,7 @@ import {
 } from "./event-reader.js";
 import { ProjectionFoldAccumulator } from "./folds.js";
 import {
+  assertProjectionSidecarsAbsent,
   parseProjectionManifest,
   verifyProjectionPublicationPaths,
   type ProjectionManifestV1,
@@ -788,6 +789,7 @@ function inspectGeneration(
   directoryIdentity: ProjectionDirectoryIdentity,
   faultInjector?: ProjectionIntegrityFaultInjector,
 ): void {
+  assertProjectionSidecarsAbsent(path);
   const generationIdentity = captureGenerationIdentity(path);
   if (!sameProjectionDirectoryIdentity(
     directoryIdentity,
@@ -797,10 +799,12 @@ function inspectGeneration(
   try {
     if (pinnedImage.sha256 !== manifest.databaseSha256) return integrity();
     faultInjector?.hit("after-generation-identity-before-open");
+    assertProjectionSidecarsAbsent(path);
     const inspection = openPinnedGenerationInspection(pinnedImage, busyTimeoutMs);
     const database = inspection.database;
     try {
       faultInjector?.hit("after-generation-open-before-inspection");
+      assertProjectionSidecarsAbsent(path);
       if (
         !sameGenerationIdentity(generationIdentity, captureGenerationIdentity(path))
         || !sameProjectionDirectoryIdentity(
@@ -822,6 +826,7 @@ function inspectGeneration(
       );
       assertReferences(database);
       assertFtsSemantics(database, rows.lexicalChunks);
+      assertProjectionSidecarsAbsent(path);
       if (
         !sameGenerationIdentity(generationIdentity, captureGenerationIdentity(path))
         || !sameProjectionDirectoryIdentity(
@@ -837,6 +842,7 @@ function inspectGeneration(
     } finally {
       inspection.close();
     }
+    assertProjectionSidecarsAbsent(path);
     if (
       !sameGenerationIdentity(generationIdentity, captureGenerationIdentity(path))
       || !sameProjectionDirectoryIdentity(

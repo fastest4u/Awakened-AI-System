@@ -302,6 +302,96 @@ describe("projection build coordinator", () => {
     source.close();
   });
 
+  it("refuses publication when a generation sidecar appears before manifest replacement", async () => {
+    const root = mkdtempSync(join(tmpdir(), "projection-publication-sidecar-"));
+    roots.push(root);
+    const sourcePath = join(root, "events.sqlite");
+    const projectionDirectory = join(root, "projections");
+    const source = sourceDatabase(sourcePath);
+    append(source, 1);
+    const driver = new NodeSqliteDriver({ DatabaseSync });
+    let injected = false;
+    const coordinator = new DefaultProjectionBuildCoordinator({
+      projectionDirectory,
+      eventReader: new SqliteProjectionEventReader({ driver, eventStorePath: sourcePath }),
+      builder: new ImmutableProjectionBuilder({ driver, projectionDirectory, now: () => NOW }),
+      faultInjector: {
+        hit(boundary) {
+          if (boundary !== "after-generation-fsync-before-manifest" || injected) return;
+          injected = true;
+          writeFileSync(
+            join(projectionDirectory, "projections-1-1.sqlite-wal"),
+            "unexpected published-generation WAL",
+            "utf8",
+          );
+        },
+      },
+    });
+
+    await assert.rejects(
+      () => coordinator.ensurePublished(BINDING, 1n, 2_000),
+      /INTEGRITY_FAILURE/u,
+    );
+    assert.equal(injected, true);
+    assert.equal(existsSync(join(projectionDirectory, "projection-manifest.json")), false);
+    assert.equal(
+      readFileSync(join(projectionDirectory, "projections-1-1.sqlite-wal"), "utf8"),
+      "unexpected published-generation WAL",
+    );
+    source.close();
+  });
+
+  it("maps a sidecar added to the published generation to integrity failure on manifest load", async () => {
+    const root = mkdtempSync(join(tmpdir(), "projection-published-sidecar-"));
+    roots.push(root);
+    const sourcePath = join(root, "events.sqlite");
+    const projectionDirectory = join(root, "projections");
+    const source = sourceDatabase(sourcePath);
+    append(source, 1);
+    const driver = new NodeSqliteDriver({ DatabaseSync });
+    const coordinator = new DefaultProjectionBuildCoordinator({
+      projectionDirectory,
+      eventReader: new SqliteProjectionEventReader({ driver, eventStorePath: sourcePath }),
+      builder: new ImmutableProjectionBuilder({ driver, projectionDirectory, now: () => NOW }),
+    });
+    const published = await coordinator.ensurePublished(BINDING, 1n, 2_000);
+    writeFileSync(`${published.databasePath}-shm`, "unexpected published SHM", "utf8");
+
+    await assert.rejects(
+      () => coordinator.leasePublished(BINDING),
+      (error: unknown) => error instanceof LifecycleError
+        && error.code === "INTEGRITY_FAILURE",
+    );
+    assert.equal(readFileSync(`${published.databasePath}-shm`, "utf8"), "unexpected published SHM");
+    source.close();
+  });
+
+  it("never reclaims a published generation main file while a sidecar entry exists", async () => {
+    const root = mkdtempSync(join(tmpdir(), "projection-sidecar-reclamation-"));
+    roots.push(root);
+    const sourcePath = join(root, "events.sqlite");
+    const projectionDirectory = join(root, "projections");
+    const source = sourceDatabase(sourcePath);
+    append(source, 1);
+    const driver = new NodeSqliteDriver({ DatabaseSync });
+    const leases = new ProjectionReaderLeaseRegistry();
+    const coordinator = new DefaultProjectionBuildCoordinator({
+      projectionDirectory,
+      eventReader: new SqliteProjectionEventReader({ driver, eventStorePath: sourcePath }),
+      builder: new ImmutableProjectionBuilder({ driver, projectionDirectory, now: () => NOW }),
+      leases,
+    });
+    const published = await coordinator.ensurePublished(BINDING, 1n, 2_000);
+    writeFileSync(`${published.databasePath}-wal`, "unexpected published WAL", "utf8");
+
+    leases.retire(published);
+
+    assert.equal(existsSync(published.databasePath), true);
+    assert.equal(readFileSync(`${published.databasePath}-wal`, "utf8"), "unexpected published WAL");
+    assert.equal(leases.reclamationIssues().length, 1);
+    source.close();
+  });
+
   it("returns projection lag at a zero deadline without starting source or build work", async () => {
     const root = mkdtempSync(join(tmpdir(), "projection-zero-deadline-"));
     roots.push(root);

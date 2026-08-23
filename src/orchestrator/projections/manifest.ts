@@ -2,6 +2,7 @@ import { lstatSync, realpathSync } from "node:fs";
 import { isAbsolute, join, normalize, relative, resolve, sep } from "node:path";
 
 import { AtomicArtifactReplacer } from "../materialization/atomic-artifact-replacer.js";
+import { LifecycleError } from "../lifecycle/errors.js";
 import { canonicalJson } from "../serialization/canonical-json.js";
 import type { ProjectBinding } from "./contracts.js";
 import { PROJECTION_NAMES, type ProjectionName } from "./checksum.js";
@@ -93,6 +94,16 @@ function invalid(): never {
 
 function pathInvalid(): never {
   throw new TypeError("PROJECTION_MANIFEST_PATH_INVALID");
+}
+
+function sidecarIntegrity(): never {
+  throw new LifecycleError("INTEGRITY_FAILURE");
+}
+
+function errorCode(error: unknown): string | undefined {
+  return typeof error === "object" && error !== null && "code" in error
+    ? String(error.code)
+    : undefined;
 }
 
 function exactRecord(value: unknown, expectedKeys: readonly string[]): Record<string, unknown> {
@@ -282,6 +293,27 @@ function assertRegularDatabase(path: string, inspection: ProjectionPathInspectio
   }
 }
 
+export function assertProjectionSidecarsAbsent(
+  databasePath: string,
+  inspection: ProjectionPathInspection = filesystemPathInspection,
+): void {
+  if (
+    typeof databasePath !== "string"
+    || !isAbsolute(databasePath)
+    || normalize(databasePath) !== databasePath
+    || resolve(databasePath) !== databasePath
+  ) pathInvalid();
+  for (const sidecarPath of [`${databasePath}-wal`, `${databasePath}-shm`]) {
+    try {
+      inspection.lstat(sidecarPath);
+    } catch (error) {
+      if (errorCode(error) === "ENOENT") continue;
+      return sidecarIntegrity();
+    }
+    return sidecarIntegrity();
+  }
+}
+
 export function verifyProjectionPublicationPaths(
   projectionDirectory: string,
   databaseFile: string,
@@ -301,6 +333,7 @@ export function verifyProjectionPublicationPaths(
     || !contained(normalizedPath(directory), normalizedPath(tempPath))
   ) pathInvalid();
   assertRegularDatabase(databasePath, inspection);
+  assertProjectionSidecarsAbsent(databasePath, inspection);
   return Object.freeze({ directory, databasePath, targetPath, tempPath });
 }
 

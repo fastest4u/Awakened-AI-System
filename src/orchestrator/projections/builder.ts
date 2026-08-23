@@ -25,6 +25,7 @@ import type { ProjectionFoldState } from "./contracts.js";
 import type { ProjectionEventSnapshot } from "./event-reader.js";
 import { emptyProjectionFoldState, foldProjectionEvent } from "./folds.js";
 import {
+  assertProjectionSidecarsAbsent,
   parseProjectionManifest,
   verifyProjectionPublicationPaths,
   type ProjectionManifestV1,
@@ -452,6 +453,7 @@ export class ImmutableProjectionBuilder {
     const databasePath = join(directory, databaseFile);
     const tempPath = join(directory, `.projections-1-${generation}.sqlite.tmp`);
     if (existsSync(databasePath)) return failure("PROJECTION_GENERATION_EXISTS");
+    assertProjectionSidecarsAbsent(databasePath);
     for (const knownTemp of [tempPath, `${tempPath}-wal`, `${tempPath}-shm`]) removeKnownFile(knownTemp);
 
     const state = fold(snapshot);
@@ -485,7 +487,7 @@ export class ImmutableProjectionBuilder {
       connection.prepare("PRAGMA wal_checkpoint(TRUNCATE)").get();
       connection.close();
       connection = undefined;
-      for (const sidecar of [`${tempPath}-wal`, `${tempPath}-shm`]) removeKnownFile(sidecar);
+      assertProjectionSidecarsAbsent(tempPath);
 
       // Windows requires a writable file handle for FlushFileBuffers/fsync.
       const handle = openSync(tempPath, "r+");
@@ -494,8 +496,11 @@ export class ImmutableProjectionBuilder {
       } finally {
         closeSync(handle);
       }
+      assertProjectionSidecarsAbsent(tempPath);
+      assertProjectionSidecarsAbsent(databasePath);
       renameSync(tempPath, databasePath);
       this.#syncDirectory(directory);
+      verifyProjectionPublicationPaths(directory, databaseFile);
       const manifest = parseProjectionManifest({
         schemaVersion: 1,
         projectId: snapshot.binding.projectId,
@@ -513,7 +518,6 @@ export class ImmutableProjectionBuilder {
         coreChecksums: persistedCoreChecksums,
         createdAt,
       }, snapshot.binding);
-      verifyProjectionPublicationPaths(directory, databaseFile);
       return Object.freeze({ manifest, projectionDirectory: directory, databasePath });
     } catch (error) {
       try {

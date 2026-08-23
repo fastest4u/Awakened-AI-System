@@ -12,6 +12,7 @@ import type { BuiltProjectionGeneration } from "./builder.js";
 import type { ProjectBinding } from "./contracts.js";
 import type { ProjectionEventReader, ProjectionEventSnapshot } from "./event-reader.js";
 import {
+  assertProjectionSidecarsAbsent,
   parseProjectionManifest,
   PROJECTION_MANIFEST_FILENAME,
   publishProjectionManifest,
@@ -267,7 +268,10 @@ export class DefaultProjectionBuildCoordinator implements ProjectionBuildCoordin
     }
     const manifest = parseProjectionManifest(decoded, binding);
     const paths = verifyProjectionPublicationPaths(this.#projectionDirectory, manifest.databaseFile);
-    if (sha256File(paths.databasePath) !== manifest.databaseSha256) {
+    const databaseSha256 = sha256File(paths.databasePath);
+    assertProjectionSidecarsAbsent(paths.databasePath);
+    this.#assertProjectionDirectorySafe();
+    if (databaseSha256 !== manifest.databaseSha256) {
       throw new Error("PROJECTION_DATABASE_CHECKSUM_INVALID");
     }
     return Object.freeze({
@@ -285,9 +289,12 @@ export class DefaultProjectionBuildCoordinator implements ProjectionBuildCoordin
     }
     const manifest = parseProjectionManifest(built.manifest, binding);
     const paths = verifyProjectionPublicationPaths(this.#projectionDirectory, manifest.databaseFile);
+    const databaseSha256 = sha256File(paths.databasePath);
+    assertProjectionSidecarsAbsent(paths.databasePath);
+    this.#assertProjectionDirectorySafe();
     if (
       resolve(paths.databasePath) !== resolve(built.databasePath)
-      || sha256File(paths.databasePath) !== manifest.databaseSha256
+      || databaseSha256 !== manifest.databaseSha256
     ) throw new Error("PROJECTION_DATABASE_CHECKSUM_INVALID");
   }
 

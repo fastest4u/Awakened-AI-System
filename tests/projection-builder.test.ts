@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -171,13 +171,18 @@ class RecordingDriver implements SqliteDriver {
 
   constructor(
     readonly afterPopulation?: (connection: SqliteConnection) => void,
+    readonly afterCreateClose?: (path: string) => void,
   ) {}
 
   open(path: string, options: SqliteOpenOptions): SqliteConnection {
     this.opens.push({ path, options: { ...options } });
     const connection = this.#delegate.open(path, options);
-    if (options.mode !== "create" || this.afterPopulation === undefined) return connection;
+    if (
+      options.mode !== "create"
+      || (this.afterPopulation === undefined && this.afterCreateClose === undefined)
+    ) return connection;
     let commits = 0;
+    let closed = false;
     return {
       exec: (sql): void => {
         connection.exec(sql);
@@ -186,7 +191,12 @@ class RecordingDriver implements SqliteDriver {
         if (commits === 2) this.afterPopulation?.(connection);
       },
       prepare: (sql) => connection.prepare(sql),
-      close: () => connection.close(),
+      close: () => {
+        connection.close();
+        if (closed) return;
+        closed = true;
+        this.afterCreateClose?.(path);
+      },
     };
   }
 }
@@ -242,6 +252,8 @@ describe("projection generation builder", () => {
       },
     );
     assert.equal(existsSync(generation.databasePath), true);
+    assert.equal(existsSync(`${generation.databasePath}-wal`), false);
+    assert.equal(existsSync(`${generation.databasePath}-shm`), false);
     assert.match(generation.manifest.databaseSha256, /^[0-9a-f]{64}$/u);
 
     source.exec("ROLLBACK");
@@ -351,6 +363,35 @@ describe("projection generation builder", () => {
       () => builder.build(snapshot, 1),
       /PROJECTION_FTS_INVALID/u,
     );
+    snapshot.close();
+    source.close();
+  });
+
+  it("refuses a post-close WAL sidecar before the durable generation rename", async () => {
+    const root = mkdtempSync(join(tmpdir(), "projection-builder-sidecar-"));
+    roots.push(root);
+    const sourcePath = join(root, "events.sqlite");
+    const projectionDirectory = join(root, "projections");
+    const source = createSource(sourcePath);
+    insertEvent(source, 1, "MemorySourceRecorded", memoryPayload());
+    const driver = new RecordingDriver(undefined, (path) => {
+      writeFileSync(`${path}-wal`, "unexpected post-close WAL", "utf8");
+    });
+    const snapshot = await new SqliteProjectionEventReader({
+      driver,
+      eventStorePath: sourcePath,
+    }).openCommittedSnapshot(BINDING);
+    const builder = new ImmutableProjectionBuilder({
+      driver,
+      projectionDirectory,
+      now: () => NOW,
+    });
+
+    await assert.rejects(
+      () => builder.build(snapshot, 1),
+      /INTEGRITY_FAILURE/u,
+    );
+    assert.equal(existsSync(join(projectionDirectory, "projections-1-1.sqlite")), false);
     snapshot.close();
     source.close();
   });

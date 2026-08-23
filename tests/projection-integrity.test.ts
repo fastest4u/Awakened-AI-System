@@ -2,10 +2,12 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import {
   copyFileSync,
+  existsSync,
   mkdtempSync,
   readFileSync,
   renameSync,
   rmSync,
+  writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -37,6 +39,7 @@ import {
 } from "../src/orchestrator/projections/integrity.js";
 import {
   parseProjectionManifest,
+  verifyProjectionPublicationPaths,
   type ProjectionManifestV1,
 } from "../src/orchestrator/projections/manifest.js";
 import { BranchScopeRepository } from "../src/orchestrator/storage/branch-scope.repository.js";
@@ -421,6 +424,86 @@ describe("full projection integrity replay", () => {
     assert.ok(Object.isFrozen(report));
     assert.equal(databaseSha256(fixture.sourcePath), sourceBefore);
     assert.equal(databaseSha256(fixture.databasePath), generationBefore);
+  });
+
+  it("rejects a re-signed WAL-only mutation that a pathname reader observes", async () => {
+    const fixture = await createFixture();
+    const mainBefore = databaseSha256(fixture.databasePath);
+    const alteredSummary = "WAL sidecar rows outrank pinned main-file bytes.";
+    const writer = new DatabaseSync(fixture.databasePath, { defensive: false });
+    try {
+      writer.exec("PRAGMA wal_autocheckpoint = 0");
+      writer.prepare(`
+        UPDATE canonical_items SET summary = ? WHERE item_id = ?
+      `).run(alteredSummary, ITEM_A);
+
+      assert.equal(existsSync(`${fixture.databasePath}-wal`), true);
+      assert.equal(databaseSha256(fixture.databasePath), mainBefore);
+      const pathnameReader = new DatabaseSync(fixture.databasePath, { readOnly: true });
+      try {
+        assert.equal(
+          pathnameReader.prepare(`
+            SELECT summary FROM canonical_items WHERE item_id = ?
+          `).get(ITEM_A)?.summary,
+          alteredSummary,
+        );
+      } finally {
+        pathnameReader.close();
+      }
+
+      const reSigned = resignedManifest(fixture);
+      assert.equal(reSigned.databaseSha256, mainBefore);
+      expectIntegrityFailure(() => fixture.integrity.verify(BINDING, reSigned));
+    } finally {
+      writer.close();
+    }
+  });
+
+  it("maps a published generation sidecar to manifest-path integrity failure", async () => {
+    const fixture = await createFixture();
+    const writer = new DatabaseSync(fixture.databasePath, { defensive: false });
+    try {
+      writer.exec("PRAGMA wal_autocheckpoint = 0");
+      writer.prepare(`
+        UPDATE canonical_items SET summary = ? WHERE item_id = ?
+      `).run("pathname-visible sidecar tamper", ITEM_A);
+
+      assert.throws(
+        () => verifyProjectionPublicationPaths(
+          fixture.projectionDirectory,
+          fixture.manifest.databaseFile,
+        ),
+        /INTEGRITY_FAILURE/u,
+      );
+    } finally {
+      writer.close();
+    }
+  });
+
+  it("rejects a sidecar introduced at either pinned-image inspection boundary", async () => {
+    for (const [boundary, suffix] of [
+      ["after-generation-identity-before-open", "-wal"],
+      ["after-generation-open-before-inspection", "-shm"],
+    ] as const) {
+      const fixture = await createFixture();
+      let injected = false;
+      const integrity = new ProjectionIntegrityService({
+        driver,
+        eventStorePath: fixture.sourcePath,
+        projectionDirectory: fixture.projectionDirectory,
+        faultInjector: {
+          hit(actual): void {
+            if (actual !== boundary || injected) return;
+            injected = true;
+            writeFileSync(`${fixture.databasePath}${suffix}`, "late sidecar entry", "utf8");
+          },
+        },
+      });
+
+      expectIntegrityFailure(() => integrity.verify(BINDING, fixture.manifest));
+      assert.equal(injected, true);
+      assert.equal(readFileSync(`${fixture.databasePath}${suffix}`, "utf8"), "late sidecar entry");
+    }
   });
 
   it("replays a scale generation through the bounded linear core", async () => {

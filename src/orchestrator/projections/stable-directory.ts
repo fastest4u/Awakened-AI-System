@@ -2,6 +2,8 @@ import { spawnSync } from "node:child_process";
 import { lstatSync, realpathSync } from "node:fs";
 import { isAbsolute, normalize, resolve } from "node:path";
 
+import { LifecycleError } from "../lifecycle/errors.js";
+
 const MUTATION_TIMEOUT_MS = 5_000;
 const MUTATION_SCRIPT = String.raw`
 "use strict";
@@ -13,6 +15,19 @@ const normalized = (path) => {
   return process.platform === "win32" ? value.toLowerCase() : value;
 };
 const invalid = () => { throw new Error("PROJECTION_PATH_INVALID"); };
+const integrity = () => { throw new Error("INTEGRITY_FAILURE"); };
+const sidecarPresent = (name) => {
+  for (const suffix of ["-wal", "-shm"]) {
+    try {
+      lstatSync(name + suffix);
+      return true;
+    } catch (error) {
+      if (error && error.code === "ENOENT") continue;
+      throw error;
+    }
+  }
+  return false;
+};
 try {
   const directory = lstatSync(".", { bigint: true });
   if (!directory.isDirectory() || directory.isSymbolicLink()) invalid();
@@ -36,6 +51,7 @@ try {
       || basename(filename) !== filename
       || !/^projections-1-[1-9][0-9]{0,9}\.sqlite$/u.test(filename)
     ) invalid();
+    if (sidecarPresent(filename)) integrity();
     try {
       const entry = lstatSync(filename);
       if (!entry.isFile() || entry.isSymbolicLink()) invalid();
@@ -146,7 +162,12 @@ function runStableMutation(
       windowsHide: true,
     },
   );
-  if (result.status !== 0 || result.error !== undefined) return invalid(result.error ?? result.stderr);
+  if (result.status !== 0 || result.error !== undefined) {
+    if (result.error === undefined && result.stderr === "INTEGRITY_FAILURE") {
+      throw new LifecycleError("INTEGRITY_FAILURE");
+    }
+    return invalid(result.error ?? result.stderr);
+  }
   return result.stdout;
 }
 

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import {
   lstatSync,
   mkdtempSync,
+  mkdirSync,
   readFileSync,
   rmSync,
   symlinkSync,
@@ -11,6 +12,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, it } from "node:test";
 
+import { LifecycleError } from "../src/orchestrator/lifecycle/errors.js";
 import type { ProjectBinding } from "../src/orchestrator/projections/contracts.js";
 import {
   parseProjectionManifest,
@@ -39,6 +41,10 @@ const CORE_CHECKSUMS = Object.freeze({
   tasksFollowups: "7".repeat(64),
 });
 const roots: string[] = [];
+
+function missingEntry(): never {
+  throw Object.assign(new Error("missing"), { code: "ENOENT" });
+}
 
 function manifest(overrides: Readonly<Record<string, unknown>> = {}): Record<string, unknown> {
   return {
@@ -234,6 +240,72 @@ describe("immutable projection manifest", () => {
     assert.equal(readFileSync(outside, "utf8"), "outside");
   });
 
+  it("rejects exact WAL and SHM sibling entries before replacing a manifest", () => {
+    const root = mkdtempSync(join(tmpdir(), "projection-manifest-sidecars-"));
+    roots.push(root);
+    const databaseFile = "projections-1-2.sqlite";
+    const databasePath = join(root, databaseFile);
+    const target = join(root, "projection-manifest.json");
+    writeFileSync(databasePath, "independent projection", "utf8");
+    writeFileSync(target, "previous manifest bytes", "utf8");
+    writeFileSync(`${databasePath}-wal`, "unexpected WAL", "utf8");
+
+    assert.throws(
+      () => publishProjectionManifest({
+        projectionDirectory: root,
+        manifest: manifest(),
+        expectedBinding: BINDING,
+      }),
+      (error: unknown) => error instanceof LifecycleError
+        && error.code === "INTEGRITY_FAILURE",
+    );
+    assert.equal(readFileSync(target, "utf8"), "previous manifest bytes");
+
+    rmSync(`${databasePath}-wal`);
+    mkdirSync(`${databasePath}-shm`);
+    assert.throws(
+      () => verifyProjectionPublicationPaths(root, databaseFile),
+      (error: unknown) => error instanceof LifecycleError
+        && error.code === "INTEGRITY_FAILURE",
+    );
+  });
+
+  it("treats a symlink-shaped exact sidecar sibling as an integrity failure", () => {
+    const root = mkdtempSync(join(tmpdir(), "projection-manifest-sidecar-shape-"));
+    roots.push(root);
+    const databaseFile = "projections-1-2.sqlite";
+    const databasePath = join(root, databaseFile);
+    const regularDirectory = {
+      isDirectory: () => true,
+      isFile: () => false,
+      isSymbolicLink: () => false,
+    };
+    const regularFile = {
+      isDirectory: () => false,
+      isFile: () => true,
+      isSymbolicLink: () => false,
+    };
+    const symlink = {
+      isDirectory: () => false,
+      isFile: () => false,
+      isSymbolicLink: () => true,
+    };
+
+    assert.throws(
+      () => verifyProjectionPublicationPaths(root, databaseFile, {
+        lstat: (path) => {
+          if (path === root) return regularDirectory;
+          if (path === databasePath) return regularFile;
+          if (path === `${databasePath}-wal`) return symlink;
+          return missingEntry();
+        },
+        realpath: (path) => path,
+      }),
+      (error: unknown) => error instanceof LifecycleError
+        && error.code === "INTEGRITY_FAILURE",
+    );
+  });
+
   it("fails closed on symlinks through the production path-verification boundary", () => {
     const root = mkdtempSync(join(tmpdir(), "projection-manifest-inspection-"));
     roots.push(root);
@@ -258,14 +330,22 @@ describe("immutable projection manifest", () => {
 
     assert.throws(
       () => verifyProjectionPublicationPaths(root, databaseFile, {
-        lstat: (path) => path === root ? symlink : regularFile,
+        lstat: (path) => {
+          if (path === root) return symlink;
+          if (path === databasePath) return regularFile;
+          return missingEntry();
+        },
         realpath: (path) => path,
       }),
       /PROJECTION_MANIFEST_PATH_INVALID/u,
     );
     assert.throws(
       () => verifyProjectionPublicationPaths(root, databaseFile, {
-        lstat: (path) => path === root ? regularDirectory : symlink,
+        lstat: (path) => {
+          if (path === root) return regularDirectory;
+          if (path === databasePath) return symlink;
+          return missingEntry();
+        },
         realpath: (path) => path,
       }),
       /PROJECTION_MANIFEST_PATH_INVALID/u,
