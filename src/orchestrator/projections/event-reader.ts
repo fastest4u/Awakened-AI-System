@@ -4,6 +4,9 @@ import type { SqliteDriver, SqliteRow, SqliteValue } from "../storage/sqlite-dri
 import type { ProjectBinding } from "./contracts.js";
 
 const DEFAULT_BUSY_TIMEOUT_MS = 5_000;
+export const MAX_INTEGRITY_REPLAY_EVENTS = 100_000;
+export const MAX_INTEGRITY_REPLAY_BYTES = 64 * 1024 * 1024;
+const MAX_INTEGRITY_EVENT_BYTES = 1024 * 1024;
 const SQLITE_INT64_MAX = 9_223_372_036_854_775_807n;
 const HASH = /^[0-9a-f]{64}$/u;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
@@ -39,6 +42,19 @@ export interface SqliteProjectionEventReaderOptions {
 
 export interface CommittedProjectionSnapshotOptions extends SqliteProjectionEventReaderOptions {
   readonly terminalEventPosition?: bigint;
+}
+
+export interface CommittedProjectionReplayOptions extends SqliteProjectionEventReaderOptions {
+  readonly terminalEventPosition: bigint;
+  readonly maxEvents?: number;
+  readonly maxAggregateBytes?: number;
+}
+
+export interface CommittedProjectionReplayResult {
+  readonly eventCount: number;
+  readonly aggregateBytes: number;
+  readonly terminalEventPosition: bigint;
+  readonly terminalEventHash: string;
 }
 
 function integrity(): never {
@@ -186,6 +202,126 @@ function sameBinding(event: StoredEvent, expected: ProjectBinding): boolean {
     && event.workspaceId === expected.workspaceId
     && event.branchScopeId === expected.branchScopeId
     && event.branchRef === expected.branchRef;
+}
+
+function boundedPositiveInteger(value: number | undefined, fallback: number, hardMaximum: number): number {
+  const resolved = value ?? fallback;
+  if (!Number.isSafeInteger(resolved) || resolved < 1 || resolved > hardMaximum) return integrity();
+  return resolved;
+}
+
+function rowBytes(row: SqliteRow): number {
+  let bytes = 0;
+  for (const value of Object.values(row)) {
+    if (typeof value === "string") bytes += Buffer.byteLength(value, "utf8");
+    else if (value instanceof Uint8Array) bytes += value.byteLength;
+    else bytes += 8;
+    if (!Number.isSafeInteger(bytes) || bytes > MAX_INTEGRITY_EVENT_BYTES) return integrity();
+  }
+  return bytes;
+}
+
+/**
+ * Reads one authenticated event row at a time in authoritative position order.
+ * The callback is invoked synchronously before SQLite advances the iterator, so
+ * replay retains at most one source row plus its aggregate working state.
+ */
+export function replayCommittedProjectionEvents(
+  bindingValue: ProjectBinding,
+  options: CommittedProjectionReplayOptions,
+  consume: (event: StoredEvent) => void,
+): CommittedProjectionReplayResult {
+  const binding = validateBinding(bindingValue);
+  const terminalEventPosition = options.terminalEventPosition;
+  if (
+    typeof terminalEventPosition !== "bigint"
+    || terminalEventPosition < 0n
+    || terminalEventPosition > SQLITE_INT64_MAX
+    || typeof consume !== "function"
+  ) return integrity();
+  const maxEvents = boundedPositiveInteger(
+    options.maxEvents,
+    MAX_INTEGRITY_REPLAY_EVENTS,
+    MAX_INTEGRITY_REPLAY_EVENTS,
+  );
+  const maxAggregateBytes = boundedPositiveInteger(
+    options.maxAggregateBytes,
+    MAX_INTEGRITY_REPLAY_BYTES,
+    MAX_INTEGRITY_REPLAY_BYTES,
+  );
+  const connection = options.driver.open(options.eventStorePath, {
+    mode: "read-only-existing",
+    busyTimeoutMs: options.busyTimeoutMs ?? DEFAULT_BUSY_TIMEOUT_MS,
+  });
+  let transactionOpen = false;
+  try {
+    connection.exec("BEGIN");
+    transactionOpen = true;
+    const identity = connection.prepare(`
+      SELECT project_id, vault_id, store_id
+      FROM project_meta WHERE singleton = 1
+    `).get();
+    if (
+      identity === undefined
+      || string(identity, "project_id") !== binding.projectId
+      || string(identity, "vault_id") !== binding.vaultId
+      || string(identity, "store_id") !== binding.storeId
+    ) return integrity();
+    const iterator = connection.prepare(`
+      SELECT ${EVENT_COLUMNS}
+      FROM events
+      WHERE project_id = $projectId
+        AND workspace_id = $workspaceId
+        AND (
+          (branch_scope_id IS NULL AND $branchScopeId IS NULL)
+          OR branch_scope_id = $branchScopeId
+        )
+        AND (
+          (branch_ref IS NULL AND $branchRef IS NULL)
+          OR branch_ref = $branchRef
+        )
+        AND global_position <= $terminalEventPosition
+      ORDER BY global_position
+    `).iterate({
+      ...bindingParams(binding),
+      $terminalEventPosition: terminalEventPosition,
+    });
+    let eventCount = 0;
+    let aggregateBytes = 0;
+    let priorPosition = 0n;
+    let replayTerminalPosition = 0n;
+    let replayTerminalHash = GENESIS_GLOBAL_HASH;
+    for (const row of iterator) {
+      if (eventCount >= maxEvents) return integrity();
+      const bytes = rowBytes(row);
+      aggregateBytes += bytes;
+      if (!Number.isSafeInteger(aggregateBytes) || aggregateBytes > maxAggregateBytes) {
+        return integrity();
+      }
+      const event = storedEvent(row);
+      if (!sameBinding(event, binding) || event.globalPosition <= priorPosition) return integrity();
+      consume(event);
+      eventCount += 1;
+      priorPosition = event.globalPosition;
+      replayTerminalPosition = event.globalPosition;
+      replayTerminalHash = event.eventHash;
+    }
+    connection.exec("COMMIT");
+    transactionOpen = false;
+    return Object.freeze({
+      eventCount,
+      aggregateBytes,
+      terminalEventPosition: replayTerminalPosition,
+      terminalEventHash: replayTerminalHash,
+    });
+  } catch (error) {
+    if (transactionOpen) {
+      try { connection.exec("ROLLBACK"); } catch { /* preserve replay failure */ }
+    }
+    throw error;
+  } finally {
+    try { connection.close(); } catch { /* preserve replay failure */ }
+  }
 }
 
 export class SqliteProjectionEventReader implements ProjectionEventReader {

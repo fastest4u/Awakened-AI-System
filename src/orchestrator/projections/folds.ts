@@ -614,3 +614,189 @@ export function foldProjectionEvent(
     return integrity();
   }
 }
+
+/**
+ * Incremental replay fold used by integrity verification. Unlike
+ * foldProjectionEvent(), this keeps indexed mutable working sets and performs
+ * the expensive whole-state validation once, when replay is complete.
+ */
+export class ProjectionFoldAccumulator {
+  #binding: ProjectBinding | null = null;
+  #terminalEventPosition: bigint | null = null;
+  readonly #sessionCheckpoints = new Map<string, SessionCheckpointProjection>();
+  readonly #checkpointOwners = new Map<string, string>();
+  readonly #canonicalItems = new Map<string, CanonicalItemProjection>();
+  readonly #normalizedKeyOwners = new Map<string, string>();
+  readonly #followUps = new Map<string, FollowUpProjection>();
+  readonly #sessionFollowUps = new Map<string, Set<string>>();
+  readonly #artifacts = new Map<string, ArtifactProjection>();
+  readonly #sessionArtifacts = new Map<string, Set<string>>();
+  readonly #lexicalChunks = new Map<string, LexicalChunkProjection>();
+  readonly #sessionChunks = new Map<string, Set<string>>();
+  readonly #retrievalFeedback = new Map<string, RetrievalFeedbackProjection>();
+
+  append(value: ProjectionEvent): void {
+    const event = validateProjectionEvent(value);
+    if (this.#binding !== null && !sameProjectionScope(this.#binding, event.binding)) {
+      return integrity();
+    }
+    if (
+      this.#terminalEventPosition !== null
+      && event.sourceEventPosition <= this.#terminalEventPosition
+    ) return integrity();
+    this.#binding ??= event.binding;
+    if (event.kind === "checkpoint") this.#appendCheckpoint(event);
+    else if (event.kind === "memory-source") this.#appendMemorySource(event);
+    else this.#appendFeedback(event);
+    this.#terminalEventPosition = event.sourceEventPosition;
+  }
+
+  finish(): ProjectionFoldState {
+    return validateState(Object.freeze({
+      schemaVersion: 1,
+      binding: this.#binding,
+      terminalEventPosition: this.#terminalEventPosition,
+      sessionCheckpoints: Object.freeze([...this.#sessionCheckpoints.values()]),
+      canonicalItems: Object.freeze([...this.#canonicalItems.values()]),
+      followUps: Object.freeze([...this.#followUps.values()]),
+      artifacts: Object.freeze([...this.#artifacts.values()]),
+      lexicalChunks: Object.freeze([...this.#lexicalChunks.values()]),
+      retrievalFeedback: Object.freeze([...this.#retrievalFeedback.values()]),
+    }));
+  }
+
+  #assertRoom(size: number, replacing: boolean): void {
+    if (!replacing && size >= MAX_ROWS_PER_PROJECTION) return integrity();
+  }
+
+  #deleteSessionRows<T>(
+    sessionId: string,
+    keysBySession: Map<string, Set<string>>,
+    rows: Map<string, T>,
+  ): void {
+    for (const key of keysBySession.get(sessionId) ?? []) rows.delete(key);
+    keysBySession.delete(sessionId);
+  }
+
+  #appendCheckpoint(event: CheckpointProjectionEvent): void {
+    const sessionId = event.binding.sessionId;
+    if (sessionId === null) return integrity();
+    const prior = this.#sessionCheckpoints.get(sessionId);
+    const owner = this.#checkpointOwners.get(event.checkpointId);
+    if (owner !== undefined && owner !== sessionId) return integrity();
+    this.#assertRoom(this.#sessionCheckpoints.size, prior !== undefined);
+    if (prior !== undefined && prior.checkpointId !== event.checkpointId) {
+      this.#checkpointOwners.delete(prior.checkpointId);
+    }
+    this.#sessionCheckpoints.set(sessionId, Object.freeze({
+      projectId: event.binding.projectId,
+      sessionId,
+      checkpointId: event.checkpointId,
+      checkpointVersion: event.checkpointVersion,
+      baseEventPosition: event.baseEventPosition,
+      sourceEventPosition: event.sourceEventPosition,
+      occurredAt: event.occurredAt,
+      taskSummary: event.taskSummary,
+    }));
+    this.#checkpointOwners.set(event.checkpointId, sessionId);
+
+    this.#deleteSessionRows(sessionId, this.#sessionFollowUps, this.#followUps);
+    const followUps = checkpointFollowUps(event);
+    if (this.#followUps.size + followUps.length > MAX_ROWS_PER_PROJECTION) return integrity();
+    const followUpKeys = new Set<string>();
+    for (const row of followUps) {
+      if (this.#followUps.has(row.followUpId)) return integrity();
+      this.#followUps.set(row.followUpId, row);
+      followUpKeys.add(row.followUpId);
+    }
+    this.#sessionFollowUps.set(sessionId, followUpKeys);
+
+    this.#deleteSessionRows(sessionId, this.#sessionArtifacts, this.#artifacts);
+    const artifacts = checkpointArtifacts(event);
+    if (this.#artifacts.size + artifacts.length > MAX_ROWS_PER_PROJECTION) return integrity();
+    const artifactKeys = new Set<string>();
+    for (const row of artifacts) {
+      const key = `${row.sessionId}\u0000${row.artifactId}`;
+      if (this.#artifacts.has(key)) return integrity();
+      this.#artifacts.set(key, row);
+      artifactKeys.add(key);
+    }
+    this.#sessionArtifacts.set(sessionId, artifactKeys);
+
+    this.#deleteSessionRows(sessionId, this.#sessionChunks, this.#lexicalChunks);
+    const chunks = checkpointChunks(event);
+    if (this.#lexicalChunks.size + chunks.length > MAX_ROWS_PER_PROJECTION) return integrity();
+    const chunkKeys = new Set<string>();
+    for (const row of chunks) {
+      if (this.#lexicalChunks.has(row.chunkId)) return integrity();
+      this.#lexicalChunks.set(row.chunkId, row);
+      chunkKeys.add(row.chunkId);
+    }
+    this.#sessionChunks.set(sessionId, chunkKeys);
+  }
+
+  #appendMemorySource(event: MemorySourceProjectionEvent): void {
+    const current = this.#canonicalItems.get(event.itemId);
+    if (current === undefined && !allowedInitialStatus(event.status)) return integrity();
+    if (current !== undefined && (
+      current.normalizedKey !== event.normalizedKey
+      || current.validFrom !== event.validFrom
+      || (
+        current.status !== event.status
+        && !STATUS_TRANSITIONS[current.status].includes(event.status)
+      )
+    )) return integrity();
+    const normalizedKeyOwner = this.#normalizedKeyOwners.get(event.normalizedKey);
+    if (normalizedKeyOwner !== undefined && normalizedKeyOwner !== event.itemId) return integrity();
+    this.#assertRoom(this.#canonicalItems.size, current !== undefined);
+    this.#canonicalItems.set(event.itemId, Object.freeze({
+      projectId: event.binding.projectId,
+      itemId: event.itemId,
+      normalizedKey: event.normalizedKey,
+      status: event.status,
+      confidence: event.confidence,
+      verificationMethod: event.verificationMethod,
+      validFrom: event.validFrom,
+      validTo: event.validTo,
+      summary: event.summary,
+      contentHash: event.contentHash,
+      knownFromEventPosition: current?.knownFromEventPosition ?? event.sourceEventPosition,
+      sourceEventPosition: event.sourceEventPosition,
+    }));
+    this.#normalizedKeyOwners.set(event.normalizedKey, event.itemId);
+    const chunkId = `item/${event.itemId}`;
+    this.#assertRoom(this.#lexicalChunks.size, this.#lexicalChunks.has(chunkId));
+    this.#lexicalChunks.set(chunkId, Object.freeze({
+      projectId: event.binding.projectId,
+      chunkId,
+      itemId: event.itemId,
+      sessionId: event.binding.sessionId,
+      section: "canonical-item",
+      normalizedKey: event.normalizedKey,
+      text: event.summary,
+      sourceEventPosition: event.sourceEventPosition,
+    }));
+  }
+
+  #appendFeedback(
+    event: Extract<ProjectionEvent, { readonly kind: "retrieval-feedback" }>,
+  ): void {
+    const item = this.#canonicalItems.get(event.itemId);
+    if (
+      item === undefined
+      || event.sourceItemEventPosition < item.knownFromEventPosition
+      || item.sourceEventPosition < event.sourceItemEventPosition
+      || this.#retrievalFeedback.has(event.feedbackId)
+    ) return integrity();
+    this.#assertRoom(this.#retrievalFeedback.size, false);
+    this.#retrievalFeedback.set(event.feedbackId, Object.freeze({
+      projectId: event.binding.projectId,
+      feedbackId: event.feedbackId,
+      itemId: event.itemId,
+      outcome: event.outcome,
+      usefulness: event.usefulness,
+      sourceItemEventPosition: event.sourceItemEventPosition,
+      sourceEventPosition: event.sourceEventPosition,
+    }));
+  }
+}

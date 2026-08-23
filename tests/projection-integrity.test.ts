@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { copyFileSync, mkdtempSync, readFileSync, renameSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -199,7 +199,13 @@ interface Fixture {
   readonly integrity: ProjectionIntegrityService;
 }
 
-async function createFixture(): Promise<Fixture> {
+interface FixtureOptions {
+  readonly events?: readonly PendingEvent[];
+  readonly maxReplayEvents?: number;
+  readonly maxReplayBytes?: number;
+}
+
+async function createFixture(options: FixtureOptions = {}): Promise<Fixture> {
   const root = mkdtempSync(join(tmpdir(), "projection-full-integrity-"));
   roots.push(root);
   const sourcePath = join(root, "events.sqlite");
@@ -221,7 +227,7 @@ async function createFixture(): Promise<Fixture> {
     () => NOW,
     () => uuid(nextId++),
   );
-  const events = [
+  const events = options.events ?? [
     pendingEvent("MemorySourceRecorded", projectionPayload(
       ITEM_A,
       "decision:authoritative-replay",
@@ -242,21 +248,27 @@ async function createFixture(): Promise<Fixture> {
       sourceItemEventPosition: "1",
     }),
   ];
-  const command: AppendCommand<JsonValue> = {
-    context: trustedContext(root),
-    commandId: uuid(500),
-    idempotencyKey: "projection-integrity/build/1",
-    commandType: "RecordProjectionSources",
-    correlationId: uuid(501),
-    agentId: "projection-integrity-agent",
-    expectedStreamVersion: 0n,
-    streamId: `session/${SESSION_ID}`,
-    streamType: "session",
-    events,
-    outbox: [],
-    publicResponse: { recorded: true },
-  };
-  eventStore.append(command);
+  let expectedStreamVersion = 0n;
+  for (let offset = 0; offset < events.length; offset += 128) {
+    const batch = events.slice(offset, offset + 128);
+    const commandIndex = Math.floor(offset / 128);
+    const command: AppendCommand<JsonValue> = {
+      context: trustedContext(root),
+      commandId: uuid(900_000 + commandIndex),
+      idempotencyKey: `projection-integrity/build/${commandIndex}`,
+      commandType: "RecordProjectionSources",
+      correlationId: uuid(910_000 + commandIndex),
+      agentId: "projection-integrity-agent",
+      expectedStreamVersion,
+      streamId: `session/${SESSION_ID}`,
+      streamType: "session",
+      events: batch,
+      outbox: [],
+      publicResponse: { recorded: true },
+    };
+    eventStore.append(command);
+    expectedStreamVersion += BigInt(batch.length);
+  }
 
   const snapshot = await new SqliteProjectionEventReader({
     driver,
@@ -279,6 +291,8 @@ async function createFixture(): Promise<Fixture> {
       driver,
       eventStorePath: sourcePath,
       projectionDirectory,
+      maxReplayEvents: options.maxReplayEvents,
+      maxReplayBytes: options.maxReplayBytes,
     }),
   };
 }
@@ -324,12 +338,69 @@ describe("full projection integrity replay", () => {
   it("returns a frozen pass report only for an exact authoritative replay", async () => {
     const fixture = await createFixture();
     const sourceBefore = databaseSha256(fixture.sourcePath);
+    const generationBefore = databaseSha256(fixture.databasePath);
+    assert.equal(fixture.manifest.databaseSha256, generationBefore);
 
     const report = fixture.integrity.verify(BINDING, fixture.manifest);
 
     assert.deepEqual(report, { status: "passed", terminalEventPosition: "3" });
     assert.ok(Object.isFrozen(report));
     assert.equal(databaseSha256(fixture.sourcePath), sourceBefore);
+    assert.equal(databaseSha256(fixture.databasePath), generationBefore);
+  });
+
+  it("replays a scale generation through the bounded linear core", async () => {
+    const events = Array.from({ length: 256 }, (_, index) => pendingEvent(
+      "MemorySourceRecorded",
+      projectionPayload(
+        uuid(20_000 + index),
+        `scale:item:${index.toString().padStart(4, "0")}`,
+        `Authoritative scale item ${index}.`,
+      ),
+    ));
+    const fixture = await createFixture({ events });
+
+    assert.deepEqual(fixture.integrity.verify(BINDING, fixture.manifest), {
+      status: "passed",
+      terminalEventPosition: "256",
+    });
+  });
+
+  it("fails closed when authoritative replay exceeds its configured event bound", async () => {
+    const fixture = await createFixture({ maxReplayEvents: 2 });
+
+    expectIntegrityFailure(() => fixture.integrity.verify(BINDING, fixture.manifest));
+  });
+
+  it("fails closed when authoritative replay exceeds its configured byte bound", async () => {
+    const fixture = await createFixture({ maxReplayBytes: 256 });
+
+    expectIntegrityFailure(() => fixture.integrity.verify(BINDING, fixture.manifest));
+  });
+
+  it("rejects a same-byte generation replacement race before opening SQLite", async () => {
+    const fixture = await createFixture();
+    const replacementPath = `${fixture.databasePath}.replacement`;
+    const retiredPath = `${fixture.databasePath}.retired`;
+    copyFileSync(fixture.databasePath, replacementPath);
+    let injected = false;
+    const integrity = new ProjectionIntegrityService({
+      driver,
+      eventStorePath: fixture.sourcePath,
+      projectionDirectory: fixture.projectionDirectory,
+      faultInjector: {
+        hit(boundary): void {
+          if (boundary !== "after-generation-identity-before-open" || injected) return;
+          injected = true;
+          renameSync(fixture.databasePath, retiredPath);
+          renameSync(replacementPath, fixture.databasePath);
+        },
+      },
+    });
+
+    expectIntegrityFailure(() => integrity.verify(BINDING, fixture.manifest));
+    assert.equal(injected, true);
+    assert.equal(databaseSha256(fixture.databasePath), fixture.manifest.databaseSha256);
   });
 
   it("detects a missing derived row after outer hashes are recomputed", async () => {
@@ -461,6 +532,29 @@ describe("full projection integrity replay", () => {
     } finally {
       database.close();
     }
+    expectIntegrityFailure(() => fixture.integrity.verify(
+      BINDING,
+      resignedManifest(fixture),
+    ));
+  });
+
+  it("detects a dropped required retrieval index after the database hash is re-signed", async () => {
+    const fixture = await createFixture();
+    mutateDatabase(fixture, "DROP INDEX retrieval_feedback_item_idx");
+
+    expectIntegrityFailure(() => fixture.integrity.verify(
+      BINDING,
+      resignedManifest(fixture),
+    ));
+  });
+
+  it("detects persistent FTS rank configuration tampering after the database hash is re-signed", async () => {
+    const fixture = await createFixture();
+    mutateDatabase(fixture, `
+      INSERT INTO lexical_chunks_fts(lexical_chunks_fts, rank)
+      VALUES ('rank', 'bm25(10.0, 1.0)')
+    `);
+
     expectIntegrityFailure(() => fixture.integrity.verify(
       BINDING,
       resignedManifest(fixture),

@@ -496,7 +496,7 @@ export class LifecycleError extends Error implements LifecycleErrorEnvelope {
     const safeDetails = readSafeDetails(code, details);
     const definition = FAILURE_DEFINITIONS[code];
     super(`${code}: ${definition.safeMessage}`);
-    Object.defineProperty(this, "name", { value: "LifecycleError", enumerable: false });
+    Object.defineProperty(this, "name", { value: new.target.name, enumerable: false });
     this.code = code;
     this.retryable = definition.retryable;
     this.safeMessage = definition.safeMessage;

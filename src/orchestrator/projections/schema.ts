@@ -2,7 +2,7 @@ import type { SqliteConnection } from "../storage/sqlite-driver.js";
 
 export const PROJECTION_SCHEMA_VERSION = 1 as const;
 
-const PROJECTION_SCHEMA_SQL = `
+export const PROJECTION_SCHEMA_SQL_V1 = `
   CREATE TABLE projection_metadata (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
     schema_version INTEGER NOT NULL CHECK (schema_version = 1),
@@ -198,7 +198,7 @@ const PROJECTION_SCHEMA_SQL = `
 export function createProjectionSchema(connection: SqliteConnection): void {
   connection.exec("BEGIN IMMEDIATE");
   try {
-    connection.exec(PROJECTION_SCHEMA_SQL);
+    connection.exec(PROJECTION_SCHEMA_SQL_V1);
     connection.exec("COMMIT");
   } catch (error) {
     try {

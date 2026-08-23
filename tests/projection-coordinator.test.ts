@@ -257,6 +257,7 @@ describe("projection build coordinator", () => {
       () => coordinator.ensurePublished(BINDING, 11n, 5),
       (error: unknown) => error instanceof ProjectionLagError
         && error instanceof LifecycleError
+        && error.name === "ProjectionLagError"
         && error.code === "PROJECTION_LAG"
         && error.retryable
         && error.safeMessage === "The required projection consistency was not reached"
