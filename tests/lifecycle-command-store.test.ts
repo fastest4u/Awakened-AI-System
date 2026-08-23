@@ -572,6 +572,30 @@ function isLifecycleInputInvalid(error: unknown): boolean {
 }
 
 describe("LifecycleCommandStore", () => {
+  it("keeps the authoritative command transaction isolated from derived projection files", () => {
+    const connection = new TransactionConnection();
+    const events = new FakeEvents(connection);
+    const store = new LifecycleCommandStore({
+      connection,
+      events,
+      projectionWriter: recordingProjectionWriter(),
+      transaction: () => transaction(connection),
+      now: () => NOW,
+    });
+
+    store.execute(envelope(), () => ({
+      append: appendCommand(),
+      authorizationRecord: authorization(),
+      afterAppend: () => undefined,
+    }));
+
+    assert.deepEqual(connection.statements, ["BEGIN IMMEDIATE", "COMMIT"]);
+    assert.equal(
+      connection.statements.some((sql) => /ATTACH|PROJECTION-MANIFEST|PROJECTIONS-1-/u.test(sql)),
+      false,
+    );
+  });
+
   it("classifies semantic inner milestones without replacing event append", () => {
     const classify = (commandType: string, action?: string) => lifecycleSemanticFaultBoundaries({
       commandType,
