@@ -2,12 +2,10 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import {
   copyFileSync,
-  mkdirSync,
   mkdtempSync,
   readFileSync,
   renameSync,
   rmSync,
-  writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -322,11 +320,7 @@ function mutateDatabase(fixture: Fixture, sql: string): void {
 }
 
 function mutateFtsShadowDatabase(fixture: Fixture, sql: string): void {
-  const DefensiveDatabaseSync = DatabaseSync as unknown as new (
-    path: string,
-    options: { readonly defensive: boolean },
-  ) => DatabaseSync;
-  const database = new DefensiveDatabaseSync(fixture.databasePath, {
+  const database = new DatabaseSync(fixture.databasePath, {
     defensive: false,
   });
   try {
@@ -533,7 +527,7 @@ describe("full projection integrity replay", () => {
     assert.equal(databaseSha256(fixture.databasePath), fixture.manifest.databaseSha256);
   });
 
-  it("inspects the pinned image across a temporary A-to-B-to-A path swap", async () => {
+  it("keeps descriptor-captured A bytes across an A-to-B-to-A generation pathname swap", async () => {
     const fixture = await createFixture();
     const originalPath = `${fixture.databasePath}.original`;
     const alternatePath = `${fixture.databasePath}.alternate`;
@@ -572,46 +566,45 @@ describe("full projection integrity replay", () => {
     assert.equal(databaseSha256(fixture.databasePath), fixture.manifest.databaseSha256);
   });
 
-  it("does not recursively clean a private inspection root replaced after authorization", async () => {
+  it("does not create or clean any scratch inspection pathname", async () => {
     const fixture = await createFixture();
-    const attackRoot = mkdtempSync(join(tmpdir(), "projection-integrity-cleanup-swap-"));
-    roots.push(attackRoot);
-    const attackerDirectory = join(attackRoot, "attacker");
-    const displacedInspectionRoot = join(attackRoot, "displaced-inspection-root");
-    const sentinelName = "outside-sentinel.txt";
-    mkdirSync(attackerDirectory);
-    writeFileSync(join(attackerDirectory, sentinelName), "outside authority", "utf8");
-    let swappedInspectionRoot: string | undefined;
+    const boundaries: string[] = [];
     const integrity = new ProjectionIntegrityService({
       driver,
       eventStorePath: fixture.sourcePath,
       projectionDirectory: fixture.projectionDirectory,
       faultInjector: {
-        hit(boundary, inspectionRoot): void {
-          if (
-            boundary !== "after-private-root-validation-before-cleanup"
-            || typeof inspectionRoot !== "string"
-            || swappedInspectionRoot !== undefined
-          ) return;
-          renameSync(inspectionRoot, displacedInspectionRoot);
-          renameSync(attackerDirectory, inspectionRoot);
-          swappedInspectionRoot = inspectionRoot;
+        hit(boundary): void {
+          boundaries.push(String(boundary));
         },
       },
     });
 
-    try {
-      expectIntegrityFailure(() => integrity.verify(BINDING, fixture.manifest));
-      assert.equal(typeof swappedInspectionRoot, "string");
-      assert.equal(
-        readFileSync(join(swappedInspectionRoot!, sentinelName), "utf8"),
-        "outside authority",
-      );
-    } finally {
-      if (swappedInspectionRoot !== undefined) {
-        renameSync(swappedInspectionRoot, attackerDirectory);
-      }
-    }
+    assert.deepEqual(integrity.verify(BINDING, fixture.manifest), {
+      status: "passed",
+      terminalEventPosition: "3",
+    });
+    assert.deepEqual(boundaries, [
+      "after-generation-identity-before-open",
+      "after-generation-open-before-inspection",
+    ]);
+  });
+
+  it("opens the pinned byte image only through in-memory deserialization", () => {
+    const source = readFileSync(
+      join(process.cwd(), "src", "orchestrator", "projections", "integrity.ts"),
+      "utf8",
+    );
+
+    assert.match(source, /new DatabaseSync\(\s*":memory:"/);
+    assert.match(source, /\.deserialize\(\s*deserializableImage\(pinnedImage\.bytes\)\s*\)/);
+    assert.match(source, /const result = Uint8Array\.from\(bytes\)/);
+    assert.equal(source.match(/openSync\(path,\s*"r"\)/g)?.length, 1);
+    assert.doesNotMatch(source, /function hashGeneration\(/);
+    assert.doesNotMatch(
+      source,
+      /PRIVATE_INSPECTION|mkdtempSync|project-memory-projection-integrity-|after-private-root-validation-before-cleanup/,
+    );
   });
 
   it("detects a missing derived row after outer hashes are recomputed", async () => {

@@ -158,13 +158,15 @@ function outputCapture(): {
 }
 
 const RUNTIME: RuntimeCapabilityReport = {
-  nodeVersion: "22.22.3",
+  nodeVersion: "24.16.0",
   sqliteVersion: "3.51.3",
   nodeVersionAtLeastMinimum: true,
   sqliteVersionAtLeastMinimum: true,
   nodeSqlite: true,
   wal: true,
   fts5: true,
+  sqliteDeserialize: true,
+  queryOnly: true,
   foreignKeys: true,
   synchronousFull: true,
   busyTimeoutMs: 5000,

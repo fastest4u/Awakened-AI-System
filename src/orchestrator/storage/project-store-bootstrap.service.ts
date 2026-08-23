@@ -37,6 +37,7 @@ import {
 import {
   DEFAULT_BUSY_TIMEOUT_MS,
   PROJECT_MEMORY_APPLICATION_ID,
+  assertMinimumNodeVersion,
   probeRuntimeCapabilities,
   type RuntimeCapabilityResult,
 } from "../runtime/runtime-capabilities.js";
@@ -548,6 +549,7 @@ export class DefaultProjectStoreBootstrapService implements ProjectStoreBootstra
 
   private async databaseSync(): Promise<DatabaseSyncConstructor> {
     try {
+      assertMinimumNodeVersion();
       this.#nodeSqlite ??= this.#dependencies.loadNodeSqlite();
       const sqlite = await this.#nodeSqlite;
       if (typeof sqlite.DatabaseSync !== "function") {

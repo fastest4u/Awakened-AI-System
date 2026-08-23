@@ -185,6 +185,18 @@ event count, projected-event count, intentionally-unprojected count, and the
 terminal event position/hash. Full integrity replay recomputes all of them and
 rejects missing, extra, cross-project, noncanonical, or out-of-order rows.
 
+Production full-integrity inspection requires Node.js 24.16.0 or newer. It
+captures and hashes the immutable generation's exact raw bytes through a pinned
+source descriptor, keeps that descriptor pinned for unchanged-byte rechecks,
+then deserializes a private clone into an isolated in-memory database. The source
+generation is never reopened by pathname after capture and
+no scratch database pathname exists. The manifest database hash remains in the
+raw on-disk byte domain. After hash verification, the inspection-only clone may
+normalize SQLite WAL header bytes so the standalone in-memory image does not
+depend on sibling WAL files. Defensive mode and `query_only` are enabled before
+derived state is read. This contract is durable in the
+[Node 24 projection-integrity runtime amendment](2026-08-23-node-24-projection-integrity-runtime-amendment.md).
+
 Vector cache rows are separate from core checksums and are keyed by source hash,
 provider, model, chunker version, dimensions, and output hash. A cache manifest
 validates stored bytes without claiming that a regenerated external vector must

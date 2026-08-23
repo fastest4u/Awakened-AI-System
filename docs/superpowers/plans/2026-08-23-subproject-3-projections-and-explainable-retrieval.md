@@ -6,7 +6,7 @@
 
 **Architecture:** Authoritative events commit only to the existing per-project SQLite/WAL store. A separate coordinator reads a committed event snapshot, builds and verifies an immutable projection generation, then atomically publishes a manifest. Retrieval pins one published generation, applies every scope/temporal/status filter before any channel ranks candidates, and exposes only internal contracts until Subproject 5 enables shadow mode.
 
-**Tech Stack:** Node.js 22.22.3+, TypeScript 5.8, node:sqlite through the existing SqliteDriver abstraction, SQLite FTS5, existing canonical JSON and SHA-256 utilities, Node test runner.
+**Tech Stack:** Node.js 24.16.0+, TypeScript 5.8, node:sqlite through the existing SqliteDriver abstraction, SQLite 3.51.3+ with WAL and FTS5, existing canonical JSON and SHA-256 utilities, Node test runner.
 
 **Spec:** docs/superpowers/specs/2026-08-23-subproject-3-projections-and-explainable-retrieval-design.md
 
@@ -357,6 +357,16 @@ retryability, and recovery actions are explicitly defined in lifecycle errors.
 Map projection corruption and manifest identity mismatches to
 INTEGRITY_FAILURE. The verifier reads each ordered event and expected row once,
 does not call providers, and does not perform a repair.
+
+Runtime integrity amendment: production requires Node.js 24.16.0 or newer. Full
+projection integrity reads and hashes the exact generation bytes through a
+pinned source descriptor, retains that descriptor for unchanged-byte rechecks,
+then inspects an isolated in-memory database via
+`DatabaseSync.deserialize()`. It never reopens the generation or a scratch copy
+by pathname after byte capture. The manifest database hash remains defined over
+the raw on-disk bytes; only a private clone used for in-memory inspection may
+normalize SQLite WAL header bytes after the raw hash is verified. See the
+[Node 24 projection-integrity runtime amendment](../specs/2026-08-23-node-24-projection-integrity-runtime-amendment.md).
 
 - [ ] **Step 4: Run focused tests and complete projection tests**
 

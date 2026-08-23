@@ -72,7 +72,7 @@ MCP Server สำหรับระบบความจำแบบ project-loc
 
 ## การติดตั้ง
 
-ต้องมี Node.js `22.22.3` หรือใหม่กว่า พร้อม runtime SQLite `3.51.3` หรือใหม่กว่า โดยแนะนำ Node.js `24.16.0` หรือใหม่กว่าในสาย Node.js 24 LTS จากนั้นติดตั้ง dependency:
+ต้องมี Node.js `24.16.0` หรือใหม่กว่าในสาย Node.js 24 LTS พร้อม runtime SQLite `3.51.3` หรือใหม่กว่า จากนั้นติดตั้ง dependency:
 
 ```bash
 npm install
@@ -101,7 +101,7 @@ npm run build
 
 | Command | รายละเอียด |
 | --- | --- |
-| `npm run check:runtime` | ตรวจ Node.js, `node:sqlite`, SQLite, WAL, FTS5 และ capability ที่จำเป็นแบบ fail-closed |
+| `npm run check:runtime` | ตรวจ Node.js, `node:sqlite`, SQLite, WAL, FTS5, การ deserialize ฐานข้อมูลในหน่วยความจำ และโหมด query-only แบบ fail-closed |
 | `npm run start` | ตรวจ runtime แล้วรัน `node dist/index.js` |
 | `npm run build` | ตรวจ runtime แล้วสร้าง server, CLI, worker และ build metadata ใต้ `dist/` |
 | `npm run typecheck` | ตรวจ TypeScript โดยไม่ emit |
@@ -113,7 +113,7 @@ npm run build
 | `npm run memory-vault -- <command>` | เรียก CLI ที่ build แล้วโดยไม่ต้อง `npm link` |
 | `npm run dev` | build แล้วรัน server |
 
-GitHub Actions ที่ `.github/workflows/ci.yml` รัน runtime probe, typecheck, default tests, build และ artifact smoke test บน Ubuntu/Windows ด้วย Node.js `22.22.3` และ `24.16.0` ส่วน `.github/workflows/sqlite-stress.yml` รัน stress suite แบบ serialized ทุกสัปดาห์หรือเมื่อสั่ง manual dispatch
+GitHub Actions ที่ `.github/workflows/ci.yml` รัน runtime probe, typecheck, default tests, build และ artifact smoke test บน Ubuntu/Windows ด้วย Node.js `24.16.0` พร้อม negative gate ที่ยืนยันว่า Node.js `22.22.3` ถูกปฏิเสธก่อนเปิด authoritative store ส่วน `.github/workflows/sqlite-stress.yml` รัน stress suite แบบ serialized ทุกสัปดาห์หรือเมื่อสั่ง manual dispatch
 
 ## V2 Administration CLI
 

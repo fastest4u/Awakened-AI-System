@@ -9,7 +9,7 @@
     "memory-vault": "dist/cli.js"
   },
   "engines": {
-    "node": ">=22.22.3"
+    "node": ">=24.16.0"
   },
   "scripts": {
     "dev": "npm run build && node dist/index.js",
@@ -36,7 +36,7 @@
     "zod": "^3.25.76"
   },
   "devDependencies": {
-    "@types/node": "^22.0.0",
+    "@types/node": "^24.0.0",
     "esbuild": "^0.28.2",
     "javascript-obfuscator": "^5.5.1",
     "typescript": "^5.8.3"

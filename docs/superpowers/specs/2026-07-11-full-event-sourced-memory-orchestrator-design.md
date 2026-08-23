@@ -2,8 +2,8 @@
 
 Status: Approved architecture design
 Date: 2026-07-11
-Runtime floor: Node.js 22.22.3 with runtime SQLite 3.51.3 or newer
-Recommended runtime: Node.js 24.16.0 or newer within the supported Node.js 24 LTS line
+Runtime floor: Node.js 24.16.0 or newer within the supported Node.js 24 LTS line, with runtime SQLite 3.51.3 or newer
+Projection-integrity runtime amendment: docs/superpowers/specs/2026-08-23-node-24-projection-integrity-runtime-amendment.md
 Current decision record: memory/04_Architecture_Decisions/adopt-a-strictly-isolated-full-event-sourced-project-memory-orchestrator-2.md
 Historical decision record: memory/04_Architecture_Decisions/adopt-a-strictly-isolated-full-event-sourced-project-memory-orchestrator.md (its Node.js 22.13 runtime clause is superseded)
 Runtime safety decision: memory/04_Architecture_Decisions/require-a-wal-safe-sqlite-runtime-for-the-event-sourced-memory-store.md
@@ -82,8 +82,8 @@ The pre-change baseline is 406 passing tests plus a passing TypeScript typecheck
 
 ### 3.3 Operational goals
 
-- Run unflagged on Node.js 22.22.3 or newer and fail closed unless runtime SQLite is 3.51.3 or newer.
-- Recommend Node.js 24.16.0 or newer within the supported Node.js 24 LTS line while insulating storage code from release-candidate API changes.
+- Run unflagged on Node.js 24.16.0 or newer and fail closed unless runtime SQLite is 3.51.3 or newer.
+- Enforce the Node.js 24.16.0 floor through package metadata, startup probes, authoritative-store bootstrap, build targets, and CI rather than relying on a declaration alone.
 - Permit multiple MCP server processes to use the same project safely.
 - Keep legacy Markdown memory available throughout migration and rollback.
 - Detect identity mismatch, corruption, projection lag, broken lineage, and incomplete session closure.
@@ -255,19 +255,20 @@ Retrieval defaults to includeGlobal=false. When enabled, local project results a
 
 ## 7. Runtime and SQLite contract
 
-Node.js 22.22.3 is the minimum because it combines unflagged node:sqlite with bundled SQLite 3.51.3, the first upstream release that fixes the WAL-reset corruption bug affecting concurrent writers or checkpointers in separate threads or processes. Node.js 24.16.0 or newer within the supported Node.js 24 LTS line is recommended. All new authoritative-store API use sits behind a SqliteDriver interface and a startup capability probe; the pre-existing optional Zed workspace-diagnostic shim remains non-authorizing and is not reused by the event store.
+Node.js 24.16.0 or newer within the supported Node.js 24 LTS line is the minimum. The former Node.js 22.22.3 floor supplied unflagged `node:sqlite` and SQLite 3.51.3, but it has no portable API for inspecting the exact descriptor-pinned byte image of a projection generation. Reopening a private scratch copy by pathname allowed a same-user A→B→A substitution between identity checks and SQLite open. Node.js 24.16.0 supplies `DatabaseSync.deserialize()`, so the verifier can inspect an isolated in-memory database created from bytes read and hash-verified through the pinned source descriptor. All new authoritative-store API use sits behind a SqliteDriver interface or a startup capability probe; the pre-existing optional Zed workspace-diagnostic shim remains non-authorizing and is not reused by the event store.
 
-The runtime gate checks both process.versions.node and SELECT sqlite_version(). Production multi-process WAL mode fails closed unless Node.js is 22.22.3 or newer, node:sqlite can be loaded, and SQLite is 3.51.3 or newer. A semver declaration alone is insufficient because node:sqlite may be disabled and future runtime packaging can change the bundled SQLite engine.
+The runtime gate checks both `process.versions.node` and `SELECT sqlite_version()`. Production multi-process WAL mode fails closed unless Node.js is 24.16.0 or newer, `node:sqlite` can be loaded, SQLite is 3.51.3 or newer, and functional WAL, FTS5, transaction rollback, in-memory deserialization, defensive, and query-only probes pass. The minimum-version check runs before authoritative-store bootstrap loads SQLite. A semver declaration alone is insufficient because `node:sqlite` may be disabled and future runtime packaging can change the bundled SQLite engine.
 
 The driver must prove support for:
 
-- DatabaseSync;
+- DatabaseSync and `DatabaseSync.deserialize()` into an isolated in-memory database;
 - SQLite 3.51.3 or newer at runtime;
 - prepared statements and bound parameters;
 - required PRAGMAs;
 - transactions with BEGIN IMMEDIATE, COMMIT, and ROLLBACK;
 - functional FTS5 create, insert, and query behavior for lexical projections, or a tested local fallback;
 - confirmed WAL activation rather than requested-WAL configuration alone;
+- defensive mode and `PRAGMA query_only=ON` on deserialized projection inspection databases;
 - consistent backup through either the runtime backup API or the quiesced snapshot path.
 
 Each writer connection applies and verifies:
@@ -884,7 +885,7 @@ The server never repairs authoritative events by guessing. It can rebuild projec
 
 On runtimes with a proven node:sqlite online backup capability, the BackupProvider uses it and verifies the resulting SQLite file and manifest.
 
-The Node.js 22.22.3-compatible fallback:
+The quiesced snapshot fallback:
 
 1. uses compare-and-swap to acquire a maintenance epoch with owner, fencing token, and deadline;
 2. makes every new write transaction observe that epoch inside BEGIN IMMEDIATE and wait or fail before appending;
@@ -1237,6 +1238,5 @@ The following are valid future programs but do not block this design:
 - Node.js command-line SQLite availability: https://nodejs.org/docs/latest-v24.x/api/cli.html
 - SQLite WAL-reset bug and fixed-version guidance: https://www.sqlite.org/wal.html#the_wal_reset_bug
 - SQLite 3.51.3 release: https://sqlite.org/releaselog/3_51_3.html
-- Node.js 22.22.3 release: https://nodejs.org/uk/blog/release/v22.22.3
 - Node.js 24.16.0 release: https://nodejs.org/en/blog/release/v24.16.0
 - Audit insight: memory/07_Insights/single-active-lifecycle-causes-session-ownership-inversion-in-multi-agent-workfl.md

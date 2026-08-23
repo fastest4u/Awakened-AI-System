@@ -19,7 +19,6 @@ jobs:
           - ubuntu-latest
           - windows-latest
         node-version:
-          - "22.22.3"
           - "24.16.0"
 
     steps:
@@ -61,7 +60,7 @@ jobs:
         run: npm run test:build-artifacts
 
   minimum-runtime-rejection:
-    name: Reject Node 22.13.0
+    name: Reject Node 22.22.3
     runs-on: ubuntu-latest
 
     steps:
@@ -70,10 +69,10 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Set up Node.js 22.13.0
+      - name: Set up Node.js 22.22.3
         uses: actions/setup-node@v6
         with:
-          node-version: "22.13.0"
+          node-version: "22.22.3"
 
       - name: Require the documented minimum-runtime rejection
         shell: bash
@@ -85,7 +84,7 @@ jobs:
 
           printf '%s\n' "$output"
 
-          expected='{"ok":false,"code":"SQLITE_CAPABILITY_MISSING","message":"Node 22.13.0 is below 22.22.3"}'
+          expected='{"ok":false,"code":"SQLITE_CAPABILITY_MISSING","message":"Node 22.22.3 is below 24.16.0"}'
           if [[ "$status" -ne 1 ]]; then
             echo "Expected check-runtime to exit 1, received $status" >&2
             exit 1

@@ -24,7 +24,7 @@ async function build() {
         platform: 'node',
         format: 'esm',
         outfile: outFile,
-        target: 'node22',
+        target: 'node24.16',
         minify: true, // Minify the bundle first
         packages: 'external', // Do not bundle node_modules
     });
@@ -73,7 +73,7 @@ async function build() {
         platform: 'node',
         format: 'esm',
         outfile: path.join(outDir, 'cli.js'),
-        target: 'node22',
+        target: 'node24.16',
         minify: true,
         packages: 'external',
         banner: { js: '#!/usr/bin/env node' },
@@ -86,7 +86,7 @@ async function build() {
         platform: 'node',
         format: 'esm',
         outfile: path.join(outDir, 'workers', 'project-store.worker.js'),
-        target: 'node22',
+        target: 'node24.16',
         minify: true,
         packages: 'external',
     });
@@ -98,7 +98,7 @@ async function build() {
         platform: 'node',
         format: 'esm',
         outfile: path.join(outDir, 'workers', 'project-store-upgrade-phase.worker.js'),
-        target: 'node22',
+        target: 'node24.16',
         minify: true,
         packages: 'external',
     });

@@ -1,20 +1,13 @@
-import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
-  chmodSync,
   closeSync,
   fstatSync,
-  fsyncSync,
   lstatSync,
-  mkdtempSync,
   openSync,
   readSync,
   realpathSync,
-  rmdirSync,
-  writeSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
-import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import { resolve } from "node:path";
 import { DatabaseSync, type StatementSync } from "node:sqlite";
 
 import { LifecycleError } from "../lifecycle/errors.js";
@@ -52,11 +45,10 @@ const MAX_PROJECTION_DATABASE_BYTES = 128 * 1024 * 1024;
 
 export type ProjectionIntegrityFaultBoundary =
   | "after-generation-identity-before-open"
-  | "after-generation-open-before-inspection"
-  | "after-private-root-validation-before-cleanup";
+  | "after-generation-open-before-inspection";
 
 export interface ProjectionIntegrityFaultInjector {
-  hit(boundary: ProjectionIntegrityFaultBoundary, inspectionRootPath?: string): void;
+  hit(boundary: ProjectionIntegrityFaultBoundary): void;
 }
 
 export interface ProjectionIntegrityServiceOptions {
@@ -97,9 +89,11 @@ interface ProjectionGenerationIdentity {
 interface PinnedGenerationImage {
   readonly bytes: Uint8Array;
   readonly sha256: string;
+  assertUnchanged(): void;
+  close(): void;
 }
 
-interface PrivateGenerationInspection {
+interface PinnedGenerationInspection {
   readonly database: DatabaseSync;
   close(): void;
 }
@@ -151,74 +145,25 @@ const TABLES = Object.freeze({
 } as const satisfies Record<ProjectionName, ProjectionTable>);
 
 const INTEGER_NUMBER_COLUMNS = new Set(["checkpoint_version", "usefulness"]);
-const PRIVATE_INSPECTION_CLEANUP_TIMEOUT_MS = 5_000;
-const PRIVATE_INSPECTION_CLEANUP_SCRIPT = String.raw`
-"use strict";
-const { lstatSync, realpathSync, readdirSync, unlinkSync } = require("node:fs");
-const { resolve } = require("node:path");
-const [expectedPath, expectedDevice, expectedInode] = process.argv.slice(1);
-const normalized = (path) => {
-  const value = resolve(path);
-  return process.platform === "win32" ? value.toLowerCase() : value;
-};
-const invalid = () => { throw new Error("PROJECTION_PATH_INVALID"); };
-const sleep = (milliseconds) => Atomics.wait(
-  new Int32Array(new SharedArrayBuffer(4)),
-  0,
-  0,
-  milliseconds,
-);
-const assertDirectory = () => {
-  const directory = lstatSync(".", { bigint: true });
-  if (!directory.isDirectory() || directory.isSymbolicLink()) invalid();
-  if (
-    normalized(realpathSync.native(".")) !== normalized(expectedPath)
-    || directory.dev.toString() !== expectedDevice
-    || directory.ino.toString() !== expectedInode
-  ) invalid();
-};
-const allowed = new Set([
-  "generation.sqlite",
-  "generation.sqlite-journal",
-  "generation.sqlite-shm",
-  "generation.sqlite-wal",
-]);
-try {
-  assertDirectory();
-  const names = readdirSync(".");
-  if (names.some((name) => !allowed.has(name))) invalid();
-  for (const name of names) {
-    let removed = false;
-    for (let attempt = 0; attempt < 4 && !removed; attempt += 1) {
-      assertDirectory();
-      try {
-        const entry = lstatSync(name);
-        if (!entry.isFile() || entry.isSymbolicLink()) invalid();
-        unlinkSync(name);
-        removed = true;
-      } catch (error) {
-        if (error && error.code === "ENOENT") removed = true;
-        else if (
-          attempt < 3
-          && error
-          && (error.code === "EBUSY" || error.code === "EMFILE" || error.code === "ENFILE"
-            || error.code === "ENOTEMPTY" || error.code === "EPERM")
-        ) sleep(25);
-        else throw error;
-      }
-    }
-  }
-  assertDirectory();
-  if (readdirSync(".").length !== 0) invalid();
-  process.stdout.write("cleaned");
-} catch (error) {
-  process.stderr.write(error instanceof Error ? error.message : "PROJECTION_PATH_INVALID");
-  process.exitCode = 2;
-}
-`;
-
 function integrity(): never {
   throw new LifecycleError("INTEGRITY_FAILURE");
+}
+
+function deserializableImage(bytes: Uint8Array): Uint8Array {
+  const result = Uint8Array.from(bytes);
+  const sqliteHeader = Buffer.from("SQLite format 3\0", "binary");
+  if (
+    result.byteLength < 100
+    || !Buffer.from(result.subarray(0, sqliteHeader.byteLength)).equals(sqliteHeader)
+    || (result[18] !== 1 && result[18] !== 2)
+    || (result[19] !== 1 && result[19] !== 2)
+  ) return integrity();
+  // A deserialized in-memory database has no sibling WAL. Normalize only the
+  // isolated copy's journal header; the manifest SHA domain and pinned bytes
+  // remain the exact raw on-disk image.
+  result[18] = 1;
+  result[19] = 1;
+  return result;
 }
 
 function statement(database: DatabaseSync, sql: string): StatementSync {
@@ -270,6 +215,25 @@ function descriptorMatchesIdentity(
     && stat.size.toString() === expected.size;
 }
 
+function hashDescriptor(descriptor: number, size: number): string {
+  const hash = createHash("sha256");
+  const buffer = Buffer.allocUnsafe(Math.min(size, 1024 * 1024));
+  let offset = 0;
+  while (offset < size) {
+    const bytesRead = readSync(
+      descriptor,
+      buffer,
+      0,
+      Math.min(buffer.byteLength, size - offset),
+      offset,
+    );
+    if (bytesRead === 0) return integrity();
+    hash.update(buffer.subarray(0, bytesRead));
+    offset += bytesRead;
+  }
+  return hash.digest("hex");
+}
+
 function readGenerationImage(
   path: string,
   expected: ProjectionGenerationIdentity,
@@ -289,188 +253,72 @@ function readGenerationImage(
       offset += bytesRead;
     }
     if (!descriptorMatchesIdentity(descriptor, expected)) return integrity();
-  } finally {
-    closeSync(descriptor);
-  }
-  return Object.freeze({
-    bytes,
-    sha256: createHash("sha256").update(bytes).digest("hex"),
-  });
-}
-
-function hashGeneration(
-  path: string,
-  expected: ProjectionGenerationIdentity,
-): string {
-  const hash = createHash("sha256");
-  const buffer = Buffer.allocUnsafe(1024 * 1024);
-  const descriptor = openSync(path, "r");
-  try {
-    if (!descriptorMatchesIdentity(descriptor, expected)) return integrity();
-    while (true) {
-      const bytesRead = readSync(descriptor, buffer, 0, buffer.byteLength, null);
-      if (bytesRead === 0) break;
-      hash.update(buffer.subarray(0, bytesRead));
-    }
-    if (!descriptorMatchesIdentity(descriptor, expected)) return integrity();
-  } finally {
-    closeSync(descriptor);
-  }
-  return hash.digest("hex");
-}
-
-function hashGenerationDescriptor(
-  descriptor: number,
-  expected: ProjectionGenerationIdentity,
-): string {
-  if (!descriptorMatchesIdentity(descriptor, expected)) return integrity();
-  const hash = createHash("sha256");
-  const buffer = Buffer.allocUnsafe(1024 * 1024);
-  let offset = 0;
-  while (offset < Number(expected.size)) {
-    const bytesRead = readSync(
-      descriptor,
-      buffer,
-      0,
-      Math.min(buffer.byteLength, Number(expected.size) - offset),
-      offset,
-    );
-    if (bytesRead === 0) return integrity();
-    hash.update(buffer.subarray(0, bytesRead));
-    offset += bytesRead;
-  }
-  if (!descriptorMatchesIdentity(descriptor, expected)) return integrity();
-  return hash.digest("hex");
-}
-
-function isPrivateInspectionChild(tempBase: string, candidate: string): boolean {
-  const fromBase = relative(tempBase, candidate);
-  return isAbsolute(candidate)
-    && fromBase.length > 0
-    && fromBase !== ".."
-    && !fromBase.startsWith(`..${sep}`)
-    && !isAbsolute(fromBase)
-    && !fromBase.includes(sep)
-    && /^project-memory-projection-integrity-[A-Za-z0-9_-]{6}$/u.test(fromBase);
-}
-
-function privateInspectionRoot(): Readonly<{
-  readonly path: string;
-  readonly identity: ProjectionDirectoryIdentity;
-}> {
-  const tempBase = realpathSync.native(tmpdir());
-  const created = mkdtempSync(join(tempBase, "project-memory-projection-integrity-"));
-  let root: Readonly<{
-    readonly path: string;
-    readonly identity: ProjectionDirectoryIdentity;
-  }> | undefined;
-  try {
-    const canonical = realpathSync.native(created);
-    if (
-      normalizedPath(canonical) !== normalizedPath(created)
-      || !isPrivateInspectionChild(tempBase, canonical)
-    ) return integrity();
-    chmodSync(canonical, 0o700);
-    root = Object.freeze({
-      path: canonical,
-      identity: captureProjectionDirectoryIdentity(canonical),
+    const sha256 = createHash("sha256").update(bytes).digest("hex");
+    let closed = false;
+    return Object.freeze({
+      bytes,
+      sha256,
+      assertUnchanged(): void {
+        if (
+          closed
+          || !descriptorMatchesIdentity(descriptor, expected)
+          || hashDescriptor(descriptor, size) !== sha256
+          || !descriptorMatchesIdentity(descriptor, expected)
+        ) return integrity();
+      },
+      close(): void {
+        if (closed) return;
+        closed = true;
+        closeSync(descriptor);
+      },
     });
-    return root;
   } catch (error) {
-    if (root !== undefined) {
-      try { removePrivateInspectionRoot(root); } catch { /* preserve creation failure */ }
-    }
+    try { closeSync(descriptor); } catch { /* preserve capture failure */ }
     throw error;
   }
 }
 
-function removePrivateInspectionRoot(
-  root: Readonly<{ readonly path: string; readonly identity: ProjectionDirectoryIdentity }>,
-  faultInjector?: ProjectionIntegrityFaultInjector,
-): void {
-  const tempBase = realpathSync.native(tmpdir());
-  if (
-    !isPrivateInspectionChild(tempBase, root.path)
-    || !sameProjectionDirectoryIdentity(
-      root.identity,
-      captureProjectionDirectoryIdentity(root.path),
-    )
-  ) return integrity();
-  faultInjector?.hit("after-private-root-validation-before-cleanup", root.path);
-  const result = spawnSync(
-    process.execPath,
-    [
-      "-e",
-      PRIVATE_INSPECTION_CLEANUP_SCRIPT,
-      root.identity.canonicalPath,
-      root.identity.device,
-      root.identity.inode,
-    ],
-    {
-      cwd: root.path,
-      encoding: "utf8",
-      maxBuffer: 1_024,
-      timeout: PRIVATE_INSPECTION_CLEANUP_TIMEOUT_MS,
-      windowsHide: true,
-    },
-  );
-  if (result.status !== 0 || result.error !== undefined || result.stdout !== "cleaned") {
-    return integrity();
-  }
-  if (!sameProjectionDirectoryIdentity(
-    root.identity,
-    captureProjectionDirectoryIdentity(root.path),
-  )) return integrity();
-  // Only the now-empty directory entry is removed by pathname. Recursive
-  // deletion is deliberately forbidden: a replacement can at worst make this
-  // non-recursive rmdir fail, never expose another tree to deletion.
-  rmdirSync(root.path);
-}
-
-function openPrivateGenerationInspection(
+function openPinnedGenerationInspection(
   pinnedImage: PinnedGenerationImage,
   busyTimeoutMs: number,
-  faultInjector?: ProjectionIntegrityFaultInjector,
-): PrivateGenerationInspection {
-  const root = privateInspectionRoot();
-  const databasePath = join(root.path, "generation.sqlite");
-  let descriptor: number | undefined;
+): PinnedGenerationInspection {
   let database: DatabaseSync | undefined;
   try {
-    descriptor = openSync(databasePath, "wx+", 0o600);
-    chmodSync(databasePath, 0o600);
-    let offset = 0;
-    while (offset < pinnedImage.bytes.byteLength) {
-      const written = writeSync(
-        descriptor,
-        pinnedImage.bytes,
-        offset,
-        pinnedImage.bytes.byteLength - offset,
-        offset,
-      );
-      if (written === 0) return integrity();
-      offset += written;
-    }
-    fsyncSync(descriptor);
-    const scratchIdentity = captureGenerationIdentity(databasePath);
-    if (
-      scratchIdentity.size !== String(pinnedImage.bytes.byteLength)
-      || !descriptorMatchesIdentity(descriptor, scratchIdentity)
-      || hashGenerationDescriptor(descriptor, scratchIdentity) !== pinnedImage.sha256
-    ) return integrity();
-    database = new DatabaseSync(databasePath, {
+    database = new DatabaseSync(":memory:", {
       open: true,
-      readOnly: true,
+      readOnly: false,
       timeout: busyTimeoutMs,
       enableForeignKeyConstraints: true,
       enableDoubleQuotedStringLiterals: false,
       allowExtension: false,
+      allowBareNamedParameters: false,
+      allowUnknownNamedParameters: false,
+      defensive: true,
     });
-    if (!sameGenerationIdentity(scratchIdentity, captureGenerationIdentity(databasePath))) {
+    database.deserialize(deserializableImage(pinnedImage.bytes));
+    database.enableDefensive(true);
+    database.exec(`
+      CREATE VIRTUAL TABLE temp.actual_vocab USING fts5vocab(
+        main,
+        lexical_chunks_fts,
+        instance
+      );
+      PRAGMA query_only = ON;
+    `);
+    database.exec(`
+      PRAGMA trusted_schema = OFF;
+      PRAGMA foreign_keys = ON;
+      PRAGMA busy_timeout = ${busyTimeoutMs};
+    `);
+    if (
+      Number(database.prepare("PRAGMA query_only").get()?.query_only) !== 1
+      || Number(database.prepare("PRAGMA trusted_schema").get()?.trusted_schema) !== 0
+      || Number(database.prepare("PRAGMA foreign_keys").get()?.foreign_keys) !== 1
+      || Number(database.prepare("PRAGMA busy_timeout").get()?.timeout) !== busyTimeoutMs
+    ) {
       return integrity();
     }
     const openedDatabase = database;
-    const openedDescriptor = descriptor;
     let closed = false;
     return Object.freeze({
       database: openedDatabase,
@@ -479,17 +327,11 @@ function openPrivateGenerationInspection(
         closed = true;
         let closeError: unknown;
         try { openedDatabase.close(); } catch (error) { closeError = error; }
-        try { closeSync(openedDescriptor); } catch (error) { closeError ??= error; }
-        try { removePrivateInspectionRoot(root, faultInjector); } catch (error) { closeError ??= error; }
         if (closeError !== undefined) throw closeError;
       },
     });
   } catch (error) {
     try { database?.close(); } catch { /* preserve creation failure */ }
-    if (descriptor !== undefined) {
-      try { closeSync(descriptor); } catch { /* preserve creation failure */ }
-    }
-    try { removePrivateInspectionRoot(root, faultInjector); } catch { /* preserve creation failure */ }
     throw error;
   }
 }
@@ -841,91 +683,99 @@ function assertFtsSemantics(
   database: DatabaseSync,
   lexicalRows: readonly CanonicalProjectionRow[],
 ): void {
-  database.exec(`
-    CREATE VIRTUAL TABLE temp.expected_fts USING fts5(
-      normalized_key,
-      text,
-      tokenize = 'unicode61 remove_diacritics 2'
-    );
-    CREATE VIRTUAL TABLE temp.actual_vocab USING fts5vocab(
-      main,
-      lexical_chunks_fts,
-      instance
-    );
-    CREATE VIRTUAL TABLE temp.expected_vocab USING fts5vocab(
-      temp,
-      expected_fts,
-      instance
-    );
-  `);
-  const insert = database.prepare(`
-    INSERT INTO temp.expected_fts(rowid, normalized_key, text) VALUES (?, ?, ?)
-  `);
-  for (let index = 0; index < lexicalRows.length; index += 1) {
-    const row = lexicalRows[index]!;
-    insert.run(index + 1, row.normalized_key as string, row.text as string);
-  }
-  const actual = statement(database, `
-    SELECT term, doc, col, offset FROM temp.actual_vocab
-    ORDER BY term, doc, col, offset
-  `).iterate();
-  const expected = statement(database, `
-    SELECT term, doc, col, offset FROM temp.expected_vocab
-    ORDER BY term, doc, col, offset
-  `).iterate();
-  while (true) {
-    const left = actual.next();
-    const right = expected.next();
-    if (left.done || right.done) {
-      if (left.done !== right.done) return integrity();
-      break;
+  const reference = new DatabaseSync(":memory:", {
+    enableForeignKeyConstraints: true,
+    enableDoubleQuotedStringLiterals: false,
+    allowExtension: false,
+    allowBareNamedParameters: false,
+    allowUnknownNamedParameters: false,
+    defensive: true,
+  });
+  try {
+    reference.enableDefensive(true);
+    reference.exec(`
+      CREATE VIRTUAL TABLE expected_fts USING fts5(
+        normalized_key,
+        text,
+        tokenize = 'unicode61 remove_diacritics 2'
+      );
+      CREATE VIRTUAL TABLE expected_vocab USING fts5vocab(
+        expected_fts,
+        instance
+      );
+      PRAGMA trusted_schema = OFF;
+    `);
+    const insert = reference.prepare(`
+      INSERT INTO expected_fts(rowid, normalized_key, text) VALUES (?, ?, ?)
+    `);
+    for (let index = 0; index < lexicalRows.length; index += 1) {
+      const row = lexicalRows[index]!;
+      insert.run(index + 1, row.normalized_key as string, row.text as string);
     }
-    for (const column of ["term", "doc", "col", "offset"] as const) {
-      if (left.value[column] !== right.value[column]) return integrity();
-    }
-  }
-  // Vocab authenticates the semantic term/posting content represented by the
-  // data/idx segment layout. The data id=1 averages record, every per-document
-  // size record, and config are additionally rank-sensitive and must match the
-  // independently populated canonical index byte-for-byte. The data id=10
-  // structure record is intentionally not byte-compared because equivalent
-  // segment histories have different physical encodings.
-  const shadows = [
-    Object.freeze({ suffix: "data", columns: Object.freeze(["id", "block"]), where: "WHERE id = 1", order: "id" }),
-    Object.freeze({ suffix: "docsize", columns: Object.freeze(["id", "sz"]), where: "", order: "id" }),
-    Object.freeze({ suffix: "config", columns: Object.freeze(["k", "v"]), where: "", order: "k" }),
-  ] as const;
-  for (const shadow of shadows) {
-    const columns = shadow.columns.join(", ");
-    const actualRows = statement(database, `
-      SELECT ${columns} FROM lexical_chunks_fts_${shadow.suffix}
-      ${shadow.where} ORDER BY ${shadow.order}
+    const actual = statement(database, `
+      SELECT term, doc, col, offset FROM temp.actual_vocab
+      ORDER BY term, doc, col, offset
     `).iterate();
-    const expectedRows = statement(database, `
-      SELECT ${columns} FROM temp.expected_fts_${shadow.suffix}
-      ${shadow.where} ORDER BY ${shadow.order}
+    const expected = statement(reference, `
+      SELECT term, doc, col, offset FROM expected_vocab
+      ORDER BY term, doc, col, offset
     `).iterate();
-    let count = 0;
     while (true) {
-      const actualRow = actualRows.next();
-      const expectedRow = expectedRows.next();
-      if (actualRow.done || expectedRow.done) {
-        if (actualRow.done !== expectedRow.done) return integrity();
+      const left = actual.next();
+      const right = expected.next();
+      if (left.done || right.done) {
+        if (left.done !== right.done) return integrity();
         break;
       }
-      if (count >= MAX_ROWS * 4) return integrity();
-      for (const column of shadow.columns) {
-        const actualValue = actualRow.value[column];
-        const expectedValue = expectedRow.value[column];
-        if (actualValue instanceof Uint8Array && expectedValue instanceof Uint8Array) {
-          if (
-            actualValue.byteLength !== expectedValue.byteLength
-            || !Buffer.from(actualValue).equals(Buffer.from(expectedValue))
-          ) return integrity();
-        } else if (actualValue !== expectedValue) return integrity();
+      for (const column of ["term", "doc", "col", "offset"] as const) {
+        if (left.value[column] !== right.value[column]) return integrity();
       }
-      count += 1;
     }
+    // Vocab authenticates the semantic term/posting content represented by the
+    // data/idx segment layout. The data id=1 averages record, every per-document
+    // size record, and config are additionally rank-sensitive and must match the
+    // independently populated canonical index byte-for-byte. The data id=10
+    // structure record is intentionally not byte-compared because equivalent
+    // segment histories have different physical encodings.
+    const shadows = [
+      Object.freeze({ suffix: "data", columns: Object.freeze(["id", "block"]), where: "WHERE id = 1", order: "id" }),
+      Object.freeze({ suffix: "docsize", columns: Object.freeze(["id", "sz"]), where: "", order: "id" }),
+      Object.freeze({ suffix: "config", columns: Object.freeze(["k", "v"]), where: "", order: "k" }),
+    ] as const;
+    for (const shadow of shadows) {
+      const columns = shadow.columns.join(", ");
+      const actualRows = statement(database, `
+        SELECT ${columns} FROM lexical_chunks_fts_${shadow.suffix}
+        ${shadow.where} ORDER BY ${shadow.order}
+      `).iterate();
+      const expectedRows = statement(reference, `
+        SELECT ${columns} FROM expected_fts_${shadow.suffix}
+        ${shadow.where} ORDER BY ${shadow.order}
+      `).iterate();
+      let count = 0;
+      while (true) {
+        const actualRow = actualRows.next();
+        const expectedRow = expectedRows.next();
+        if (actualRow.done || expectedRow.done) {
+          if (actualRow.done !== expectedRow.done) return integrity();
+          break;
+        }
+        if (count >= MAX_ROWS * 4) return integrity();
+        for (const column of shadow.columns) {
+          const actualValue = actualRow.value[column];
+          const expectedValue = expectedRow.value[column];
+          if (actualValue instanceof Uint8Array && expectedValue instanceof Uint8Array) {
+            if (
+              actualValue.byteLength !== expectedValue.byteLength
+              || !Buffer.from(actualValue).equals(Buffer.from(expectedValue))
+            ) return integrity();
+          } else if (actualValue !== expectedValue) return integrity();
+        }
+        count += 1;
+      }
+    }
+  } finally {
+    reference.close();
   }
 }
 
@@ -944,12 +794,49 @@ function inspectGeneration(
     captureProjectionDirectoryIdentity(directoryIdentity.canonicalPath),
   )) return integrity();
   const pinnedImage = readGenerationImage(path, generationIdentity);
-  if (pinnedImage.sha256 !== manifest.databaseSha256) return integrity();
-  faultInjector?.hit("after-generation-identity-before-open");
-  const inspection = openPrivateGenerationInspection(pinnedImage, busyTimeoutMs, faultInjector);
-  const database = inspection.database;
   try {
-    faultInjector?.hit("after-generation-open-before-inspection");
+    if (pinnedImage.sha256 !== manifest.databaseSha256) return integrity();
+    faultInjector?.hit("after-generation-identity-before-open");
+    const inspection = openPinnedGenerationInspection(pinnedImage, busyTimeoutMs);
+    const database = inspection.database;
+    try {
+      faultInjector?.hit("after-generation-open-before-inspection");
+      if (
+        !sameGenerationIdentity(generationIdentity, captureGenerationIdentity(path))
+        || !sameProjectionDirectoryIdentity(
+          directoryIdentity,
+          captureProjectionDirectoryIdentity(directoryIdentity.canonicalPath),
+        )
+      ) return integrity();
+      pinnedImage.assertUnchanged();
+      database.exec("PRAGMA trusted_schema = OFF; BEGIN");
+      assertCanonicalSchema(database);
+      assertMetadata(database, binding, manifest);
+      assertSqliteIntegrity(database);
+      const rows = readExactRows(
+        database,
+        expectedRows,
+        binding.projectId,
+        BigInt(manifest.terminalEventPosition),
+        manifest.coreChecksums,
+      );
+      assertReferences(database);
+      assertFtsSemantics(database, rows.lexicalChunks);
+      if (
+        !sameGenerationIdentity(generationIdentity, captureGenerationIdentity(path))
+        || !sameProjectionDirectoryIdentity(
+          directoryIdentity,
+          captureProjectionDirectoryIdentity(directoryIdentity.canonicalPath),
+        )
+      ) return integrity();
+      pinnedImage.assertUnchanged();
+      database.exec("COMMIT");
+    } catch (error) {
+      try { database.exec("ROLLBACK"); } catch { /* preserve integrity failure */ }
+      throw error;
+    } finally {
+      inspection.close();
+    }
     if (
       !sameGenerationIdentity(generationIdentity, captureGenerationIdentity(path))
       || !sameProjectionDirectoryIdentity(
@@ -957,42 +844,10 @@ function inspectGeneration(
         captureProjectionDirectoryIdentity(directoryIdentity.canonicalPath),
       )
     ) return integrity();
-    database.exec("PRAGMA trusted_schema = OFF; BEGIN");
-    assertCanonicalSchema(database);
-    assertMetadata(database, binding, manifest);
-    assertSqliteIntegrity(database);
-    const rows = readExactRows(
-      database,
-      expectedRows,
-      binding.projectId,
-      BigInt(manifest.terminalEventPosition),
-      manifest.coreChecksums,
-    );
-    assertReferences(database);
-    assertFtsSemantics(database, rows.lexicalChunks);
-    if (
-      !sameGenerationIdentity(generationIdentity, captureGenerationIdentity(path))
-      || !sameProjectionDirectoryIdentity(
-        directoryIdentity,
-        captureProjectionDirectoryIdentity(directoryIdentity.canonicalPath),
-      )
-      || hashGeneration(path, generationIdentity) !== pinnedImage.sha256
-    ) return integrity();
-    database.exec("COMMIT");
-  } catch (error) {
-    try { database.exec("ROLLBACK"); } catch { /* preserve integrity failure */ }
-    throw error;
+    pinnedImage.assertUnchanged();
   } finally {
-    inspection.close();
+    pinnedImage.close();
   }
-  if (
-    !sameGenerationIdentity(generationIdentity, captureGenerationIdentity(path))
-    || !sameProjectionDirectoryIdentity(
-      directoryIdentity,
-      captureProjectionDirectoryIdentity(directoryIdentity.canonicalPath),
-    )
-    || hashGeneration(path, generationIdentity) !== pinnedImage.sha256
-  ) return integrity();
 }
 
 export class ProjectionIntegrityService {

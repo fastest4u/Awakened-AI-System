@@ -13,7 +13,7 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { Worker } from "node:worker_threads";
 
-const MINIMUM_NODE_VERSION = "22.22.3";
+const MINIMUM_NODE_VERSION = "24.16.0";
 const MINIMUM_SQLITE_VERSION = "3.51.3";
 const REQUEST_TIMEOUT_MS = 10_000;
 const UPGRADE_TIMEOUT_MS = 30_000;

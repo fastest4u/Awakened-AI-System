@@ -411,6 +411,8 @@ function runtimeSnapshot(result: unknown): RuntimeCapabilityReport {
     nodeSqlite: snapshotTrue(Reflect.get(result, "nodeSqlite")),
     wal: snapshotTrue(Reflect.get(result, "wal")),
     fts5: snapshotTrue(Reflect.get(result, "fts5")),
+    sqliteDeserialize: snapshotTrue(Reflect.get(result, "sqliteDeserialize")),
+    queryOnly: snapshotTrue(Reflect.get(result, "queryOnly")),
     foreignKeys: snapshotTrue(Reflect.get(result, "foreignKeys")),
     synchronousFull: snapshotTrue(Reflect.get(result, "synchronousFull")),
     busyTimeoutMs: 5000,

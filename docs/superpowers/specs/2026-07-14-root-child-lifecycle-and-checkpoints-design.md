@@ -1977,8 +1977,8 @@ and must fail every requireFullEvidence gate.
 
 Subproject 2 exits only when all of these pass:
 
-1. Runtime capability check on Node.js 22.22.3 minimum and recommended Node.js
-   24.16.0 or newer.
+1. Runtime capability check on Node.js 24.16.0 or newer with runtime SQLite
+   3.51.3 or newer.
 2. Typecheck and complete existing regression suite.
 3. New lifecycle unit, migration, contract, cross-process, and fault suites.
 4. One primary plus 32 children without an incorrect root transition.

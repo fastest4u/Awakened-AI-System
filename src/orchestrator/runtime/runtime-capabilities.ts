@@ -1,4 +1,6 @@
-export const MINIMUM_NODE_VERSION = "22.22.3";
+import { readFileSync } from "node:fs";
+
+export const MINIMUM_NODE_VERSION = "24.16.0";
 export const MINIMUM_SQLITE_VERSION = "3.51.3";
 export const DEFAULT_BUSY_TIMEOUT_MS = 5000;
 export const PROJECT_MEMORY_APPLICATION_ID = 0x504d454d;
@@ -11,6 +13,8 @@ export interface RuntimeCapabilityReport {
   nodeSqlite: true;
   wal: true;
   fts5: true;
+  sqliteDeserialize: true;
+  queryOnly: true;
   foreignKeys: true;
   synchronousFull: true;
   busyTimeoutMs: 5000;
@@ -36,6 +40,8 @@ type CapabilityChecks = {
   sqliteVersionAtLeastMinimum: boolean;
   wal: boolean;
   fts5: boolean;
+  sqliteDeserialize: boolean;
+  queryOnly: boolean;
   foreignKeys: boolean;
   synchronousFull: boolean;
   busyTimeout: boolean;
@@ -62,6 +68,14 @@ export function compareVersions(left: string, right: string): -1 | 0 | 1 {
   return 0;
 }
 
+export function assertMinimumNodeVersion(
+  nodeVersion: string = process.versions.node,
+): void {
+  if (compareVersions(nodeVersion, MINIMUM_NODE_VERSION) < 0) {
+    throw new Error(`Node ${nodeVersion} is below ${MINIMUM_NODE_VERSION}`);
+  }
+}
+
 function rowValue(
   row: Record<string, import("node:sqlite").SQLOutputValue> | undefined,
   key: string,
@@ -79,6 +93,8 @@ function initialChecks(): CapabilityChecks {
     sqliteVersionAtLeastMinimum: false,
     wal: false,
     fts5: false,
+    sqliteDeserialize: false,
+    queryOnly: false,
     foreignKeys: false,
     synchronousFull: false,
     busyTimeout: false,
@@ -88,6 +104,22 @@ function initialChecks(): CapabilityChecks {
   };
 }
 
+function deserializableImage(bytes: Uint8Array): Uint8Array {
+  const result = Uint8Array.from(bytes);
+  const sqliteHeader = Buffer.from("SQLite format 3\0", "binary");
+  if (
+    result.byteLength < 100
+    || !Buffer.from(result.subarray(0, sqliteHeader.byteLength)).equals(sqliteHeader)
+    || (result[18] !== 1 && result[18] !== 2)
+    || (result[19] !== 1 && result[19] !== 2)
+  ) {
+    throw new Error("SQLite database image is not deserializable");
+  }
+  result[18] = 1;
+  result[19] = 1;
+  return result;
+}
+
 export async function probeRuntimeCapabilities(
   probePath: string,
 ): Promise<RuntimeCapabilityResult> {
@@ -95,15 +127,14 @@ export async function probeRuntimeCapabilities(
   let sqliteVersion: string | undefined;
   const checks = initialChecks();
   let database: import("node:sqlite").DatabaseSync | undefined;
+  let inspectionDatabase: import("node:sqlite").DatabaseSync | undefined;
 
   try {
     checks.nodeVersionAtLeastMinimum = compareVersions(
       nodeVersion,
       MINIMUM_NODE_VERSION,
     ) >= 0;
-    if (!checks.nodeVersionAtLeastMinimum) {
-      throw new Error("Minimum Node.js version is unavailable");
-    }
+    assertMinimumNodeVersion(nodeVersion);
 
     const sqlite = await import("node:sqlite");
     checks.nodeSqlite = typeof sqlite.DatabaseSync === "function";
@@ -185,6 +216,34 @@ export async function probeRuntimeCapabilities(
       ),
     ) === 0;
 
+    inspectionDatabase = new sqlite.DatabaseSync(":memory:", {
+      open: true,
+      readOnly: false,
+      enableForeignKeyConstraints: true,
+      enableDoubleQuotedStringLiterals: false,
+      allowExtension: false,
+      allowBareNamedParameters: false,
+      allowUnknownNamedParameters: false,
+      timeout: DEFAULT_BUSY_TIMEOUT_MS,
+      defensive: true,
+    });
+    database.prepare("PRAGMA wal_checkpoint(TRUNCATE)").get();
+    inspectionDatabase.deserialize(deserializableImage(readFileSync(probePath)));
+    inspectionDatabase.exec("PRAGMA query_only = ON");
+    inspectionDatabase.enableDefensive(true);
+    inspectionDatabase.exec("PRAGMA trusted_schema = OFF");
+    checks.sqliteDeserialize = Number(
+      rowValue(
+        inspectionDatabase
+          .prepare("SELECT count(*) AS count FROM capability_fts WHERE capability_fts MATCH ?")
+          .get("\"wal-safe-token\""),
+        "count",
+      ),
+    ) === 1;
+    checks.queryOnly = Number(
+      rowValue(inspectionDatabase.prepare("PRAGMA query_only").get(), "query_only"),
+    ) === 1;
+
     if (Object.values(checks).some((passed) => !passed)) {
       throw new Error("One or more required SQLite capabilities failed");
     }
@@ -198,6 +257,8 @@ export async function probeRuntimeCapabilities(
       nodeSqlite: true,
       wal: true,
       fts5: true,
+      sqliteDeserialize: true,
+      queryOnly: true,
       foreignKeys: true,
       synchronousFull: true,
       busyTimeoutMs: DEFAULT_BUSY_TIMEOUT_MS,
@@ -215,6 +276,7 @@ export async function probeRuntimeCapabilities(
       checks: { ...checks },
     };
   } finally {
+    inspectionDatabase?.close();
     database?.close();
   }
 }

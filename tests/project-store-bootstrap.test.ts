@@ -142,6 +142,36 @@ afterEach(() => {
 });
 
 describe("DefaultProjectStoreBootstrapService", () => {
+  it("rejects Node 22.22.3 before loading SQLite or opening an authoritative store", async () => {
+    const { projectRoot, vaultRoot } = fixture();
+    const expected = paths(vaultRoot);
+    const original = Object.getOwnPropertyDescriptor(process.versions, "node");
+    assert.ok(original);
+    let loads = 0;
+    const service = new DefaultProjectStoreBootstrapService({
+      async loadNodeSqlite() {
+        loads += 1;
+        throw new Error("node:sqlite must not load below the runtime floor");
+      },
+    });
+    try {
+      Object.defineProperty(process.versions, "node", {
+        ...original,
+        value: "22.22.3",
+      });
+      await assert.rejects(
+        service.initialize({ projectRoot, vaultRoot }),
+        errorCode("SQLITE_CAPABILITY_MISSING"),
+      );
+    } finally {
+      Object.defineProperty(process.versions, "node", original);
+    }
+
+    assert.equal(loads, 0);
+    assert.equal(existsSync(expected.descriptor), false);
+    assert.equal(existsSync(expected.events), false);
+  });
+
   it("does not load node:sqlite until initialize and caches the native module", async () => {
     const { projectRoot, vaultRoot } = fixture();
     const expected = paths(vaultRoot);
