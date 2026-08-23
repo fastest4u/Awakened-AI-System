@@ -1,6 +1,14 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { copyFileSync, mkdtempSync, readFileSync, renameSync, rmSync } from "node:fs";
+import {
+  copyFileSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -562,6 +570,48 @@ describe("full projection integrity replay", () => {
     assert.equal(swapped, true);
     assert.equal(restored, true);
     assert.equal(databaseSha256(fixture.databasePath), fixture.manifest.databaseSha256);
+  });
+
+  it("does not recursively clean a private inspection root replaced after authorization", async () => {
+    const fixture = await createFixture();
+    const attackRoot = mkdtempSync(join(tmpdir(), "projection-integrity-cleanup-swap-"));
+    roots.push(attackRoot);
+    const attackerDirectory = join(attackRoot, "attacker");
+    const displacedInspectionRoot = join(attackRoot, "displaced-inspection-root");
+    const sentinelName = "outside-sentinel.txt";
+    mkdirSync(attackerDirectory);
+    writeFileSync(join(attackerDirectory, sentinelName), "outside authority", "utf8");
+    let swappedInspectionRoot: string | undefined;
+    const integrity = new ProjectionIntegrityService({
+      driver,
+      eventStorePath: fixture.sourcePath,
+      projectionDirectory: fixture.projectionDirectory,
+      faultInjector: {
+        hit(boundary, inspectionRoot): void {
+          if (
+            boundary !== "after-private-root-validation-before-cleanup"
+            || typeof inspectionRoot !== "string"
+            || swappedInspectionRoot !== undefined
+          ) return;
+          renameSync(inspectionRoot, displacedInspectionRoot);
+          renameSync(attackerDirectory, inspectionRoot);
+          swappedInspectionRoot = inspectionRoot;
+        },
+      },
+    });
+
+    try {
+      expectIntegrityFailure(() => integrity.verify(BINDING, fixture.manifest));
+      assert.equal(typeof swappedInspectionRoot, "string");
+      assert.equal(
+        readFileSync(join(swappedInspectionRoot!, sentinelName), "utf8"),
+        "outside authority",
+      );
+    } finally {
+      if (swappedInspectionRoot !== undefined) {
+        renameSync(swappedInspectionRoot, attackerDirectory);
+      }
+    }
   });
 
   it("detects a missing derived row after outer hashes are recomputed", async () => {

@@ -1,3 +1,4 @@
+import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   chmodSync,
@@ -9,7 +10,7 @@ import {
   openSync,
   readSync,
   realpathSync,
-  rmSync,
+  rmdirSync,
   writeSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -51,10 +52,11 @@ const MAX_PROJECTION_DATABASE_BYTES = 128 * 1024 * 1024;
 
 export type ProjectionIntegrityFaultBoundary =
   | "after-generation-identity-before-open"
-  | "after-generation-open-before-inspection";
+  | "after-generation-open-before-inspection"
+  | "after-private-root-validation-before-cleanup";
 
 export interface ProjectionIntegrityFaultInjector {
-  hit(boundary: ProjectionIntegrityFaultBoundary): void;
+  hit(boundary: ProjectionIntegrityFaultBoundary, inspectionRootPath?: string): void;
 }
 
 export interface ProjectionIntegrityServiceOptions {
@@ -149,6 +151,71 @@ const TABLES = Object.freeze({
 } as const satisfies Record<ProjectionName, ProjectionTable>);
 
 const INTEGER_NUMBER_COLUMNS = new Set(["checkpoint_version", "usefulness"]);
+const PRIVATE_INSPECTION_CLEANUP_TIMEOUT_MS = 5_000;
+const PRIVATE_INSPECTION_CLEANUP_SCRIPT = String.raw`
+"use strict";
+const { lstatSync, realpathSync, readdirSync, unlinkSync } = require("node:fs");
+const { resolve } = require("node:path");
+const [expectedPath, expectedDevice, expectedInode] = process.argv.slice(1);
+const normalized = (path) => {
+  const value = resolve(path);
+  return process.platform === "win32" ? value.toLowerCase() : value;
+};
+const invalid = () => { throw new Error("PROJECTION_PATH_INVALID"); };
+const sleep = (milliseconds) => Atomics.wait(
+  new Int32Array(new SharedArrayBuffer(4)),
+  0,
+  0,
+  milliseconds,
+);
+const assertDirectory = () => {
+  const directory = lstatSync(".", { bigint: true });
+  if (!directory.isDirectory() || directory.isSymbolicLink()) invalid();
+  if (
+    normalized(realpathSync.native(".")) !== normalized(expectedPath)
+    || directory.dev.toString() !== expectedDevice
+    || directory.ino.toString() !== expectedInode
+  ) invalid();
+};
+const allowed = new Set([
+  "generation.sqlite",
+  "generation.sqlite-journal",
+  "generation.sqlite-shm",
+  "generation.sqlite-wal",
+]);
+try {
+  assertDirectory();
+  const names = readdirSync(".");
+  if (names.some((name) => !allowed.has(name))) invalid();
+  for (const name of names) {
+    let removed = false;
+    for (let attempt = 0; attempt < 4 && !removed; attempt += 1) {
+      assertDirectory();
+      try {
+        const entry = lstatSync(name);
+        if (!entry.isFile() || entry.isSymbolicLink()) invalid();
+        unlinkSync(name);
+        removed = true;
+      } catch (error) {
+        if (error && error.code === "ENOENT") removed = true;
+        else if (
+          attempt < 3
+          && error
+          && (error.code === "EBUSY" || error.code === "EMFILE" || error.code === "ENFILE"
+            || error.code === "ENOTEMPTY" || error.code === "EPERM")
+        ) sleep(25);
+        else throw error;
+      }
+    }
+  }
+  assertDirectory();
+  if (readdirSync(".").length !== 0) invalid();
+  process.stdout.write("cleaned");
+} catch (error) {
+  process.stderr.write(error instanceof Error ? error.message : "PROJECTION_PATH_INVALID");
+  process.exitCode = 2;
+}
+`;
 
 function integrity(): never {
   throw new LifecycleError("INTEGRITY_FAILURE");
@@ -293,6 +360,10 @@ function privateInspectionRoot(): Readonly<{
 }> {
   const tempBase = realpathSync.native(tmpdir());
   const created = mkdtempSync(join(tempBase, "project-memory-projection-integrity-"));
+  let root: Readonly<{
+    readonly path: string;
+    readonly identity: ProjectionDirectoryIdentity;
+  }> | undefined;
   try {
     const canonical = realpathSync.native(created);
     if (
@@ -300,26 +371,22 @@ function privateInspectionRoot(): Readonly<{
       || !isPrivateInspectionChild(tempBase, canonical)
     ) return integrity();
     chmodSync(canonical, 0o700);
-    return Object.freeze({
+    root = Object.freeze({
       path: canonical,
       identity: captureProjectionDirectoryIdentity(canonical),
     });
+    return root;
   } catch (error) {
-    try {
-      const stat = lstatSync(created);
-      if (
-        stat.isDirectory()
-        && !stat.isSymbolicLink()
-        && isPrivateInspectionChild(tempBase, created)
-        && normalizedPath(realpathSync.native(created)) === normalizedPath(created)
-      ) rmSync(created, { recursive: true, force: true, maxRetries: 3, retryDelay: 25 });
-    } catch { /* preserve creation failure without risking a broad cleanup */ }
+    if (root !== undefined) {
+      try { removePrivateInspectionRoot(root); } catch { /* preserve creation failure */ }
+    }
     throw error;
   }
 }
 
 function removePrivateInspectionRoot(
   root: Readonly<{ readonly path: string; readonly identity: ProjectionDirectoryIdentity }>,
+  faultInjector?: ProjectionIntegrityFaultInjector,
 ): void {
   const tempBase = realpathSync.native(tmpdir());
   if (
@@ -329,17 +396,41 @@ function removePrivateInspectionRoot(
       captureProjectionDirectoryIdentity(root.path),
     )
   ) return integrity();
-  rmSync(root.path, {
-    recursive: true,
-    force: true,
-    maxRetries: 3,
-    retryDelay: 25,
-  });
+  faultInjector?.hit("after-private-root-validation-before-cleanup", root.path);
+  const result = spawnSync(
+    process.execPath,
+    [
+      "-e",
+      PRIVATE_INSPECTION_CLEANUP_SCRIPT,
+      root.identity.canonicalPath,
+      root.identity.device,
+      root.identity.inode,
+    ],
+    {
+      cwd: root.path,
+      encoding: "utf8",
+      maxBuffer: 1_024,
+      timeout: PRIVATE_INSPECTION_CLEANUP_TIMEOUT_MS,
+      windowsHide: true,
+    },
+  );
+  if (result.status !== 0 || result.error !== undefined || result.stdout !== "cleaned") {
+    return integrity();
+  }
+  if (!sameProjectionDirectoryIdentity(
+    root.identity,
+    captureProjectionDirectoryIdentity(root.path),
+  )) return integrity();
+  // Only the now-empty directory entry is removed by pathname. Recursive
+  // deletion is deliberately forbidden: a replacement can at worst make this
+  // non-recursive rmdir fail, never expose another tree to deletion.
+  rmdirSync(root.path);
 }
 
 function openPrivateGenerationInspection(
   pinnedImage: PinnedGenerationImage,
   busyTimeoutMs: number,
+  faultInjector?: ProjectionIntegrityFaultInjector,
 ): PrivateGenerationInspection {
   const root = privateInspectionRoot();
   const databasePath = join(root.path, "generation.sqlite");
@@ -389,7 +480,7 @@ function openPrivateGenerationInspection(
         let closeError: unknown;
         try { openedDatabase.close(); } catch (error) { closeError = error; }
         try { closeSync(openedDescriptor); } catch (error) { closeError ??= error; }
-        try { removePrivateInspectionRoot(root); } catch (error) { closeError ??= error; }
+        try { removePrivateInspectionRoot(root, faultInjector); } catch (error) { closeError ??= error; }
         if (closeError !== undefined) throw closeError;
       },
     });
@@ -398,7 +489,7 @@ function openPrivateGenerationInspection(
     if (descriptor !== undefined) {
       try { closeSync(descriptor); } catch { /* preserve creation failure */ }
     }
-    try { removePrivateInspectionRoot(root); } catch { /* preserve creation failure */ }
+    try { removePrivateInspectionRoot(root, faultInjector); } catch { /* preserve creation failure */ }
     throw error;
   }
 }
@@ -855,7 +946,7 @@ function inspectGeneration(
   const pinnedImage = readGenerationImage(path, generationIdentity);
   if (pinnedImage.sha256 !== manifest.databaseSha256) return integrity();
   faultInjector?.hit("after-generation-identity-before-open");
-  const inspection = openPrivateGenerationInspection(pinnedImage, busyTimeoutMs);
+  const inspection = openPrivateGenerationInspection(pinnedImage, busyTimeoutMs, faultInjector);
   const database = inspection.database;
   try {
     faultInjector?.hit("after-generation-open-before-inspection");
