@@ -54,7 +54,7 @@ export interface ProjectionManifestV1 {
   readonly terminalEventHash: string;
   readonly databaseFile: string;
   readonly databaseSha256: string;
-  readonly coreChecksums: Readonly<Partial<Record<ProjectionName, string>>>;
+  readonly coreChecksums: Readonly<Record<ProjectionName, string>>;
   readonly createdAt: string;
 }
 
@@ -147,6 +147,7 @@ function validateExpectedBinding(value: unknown): ProjectBinding {
   assertNullableUuid(source.branchScopeId);
   assertNullableBranchRef(source.branchRef);
   assertNullableUuid(source.sessionId);
+  if (source.sessionId !== null) invalid();
   return source as unknown as ProjectBinding;
 }
 
@@ -157,19 +158,21 @@ function validateTimestamp(value: unknown): string {
   return value;
 }
 
-function validateCoreChecksums(value: unknown): Readonly<Partial<Record<ProjectionName, string>>> {
+function validateCoreChecksums(value: unknown): Readonly<Record<ProjectionName, string>> {
   if (typeof value !== "object" || value === null || Array.isArray(value)) invalid();
   const prototype = Object.getPrototypeOf(value) as unknown;
   if (prototype !== Object.prototype && prototype !== null) invalid();
   const keys = Reflect.ownKeys(value);
-  if (keys.length < 1 || keys.length > PROJECTION_NAMES.length) invalid();
-  const result: Partial<Record<ProjectionName, string>> = {};
+  if (keys.length !== PROJECTION_NAMES.length) invalid();
   for (const key of keys) {
     if (typeof key !== "string" || !PROJECTION_NAMES.includes(key as ProjectionName)) invalid();
-    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+  }
+  const result = {} as Record<ProjectionName, string>;
+  for (const name of PROJECTION_NAMES) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, name);
     if (descriptor === undefined || !descriptor.enumerable || !("value" in descriptor)) invalid();
     assertHash(descriptor.value);
-    result[key as ProjectionName] = descriptor.value;
+    result[name] = descriptor.value;
   }
   return Object.freeze(result);
 }

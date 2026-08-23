@@ -29,6 +29,15 @@ const BINDING: ProjectBinding = Object.freeze({
   sessionId: null,
 });
 const HASH = "a".repeat(64);
+const CORE_CHECKSUMS = Object.freeze({
+  artifactsFiles: "c".repeat(64),
+  canonicalItems: "d".repeat(64),
+  entityGraph: "e".repeat(64),
+  lexicalChunks: "f".repeat(64),
+  retrievalFeedback: "5".repeat(64),
+  sessionTree: "6".repeat(64),
+  tasksFollowups: "7".repeat(64),
+});
 const roots: string[] = [];
 
 function manifest(overrides: Readonly<Record<string, unknown>> = {}): Record<string, unknown> {
@@ -46,7 +55,7 @@ function manifest(overrides: Readonly<Record<string, unknown>> = {}): Record<str
     terminalEventHash: HASH,
     databaseFile: "projections-1-2.sqlite",
     databaseSha256: "b".repeat(64),
-    coreChecksums: { sessionTree: "c".repeat(64) },
+    coreChecksums: CORE_CHECKSUMS,
     createdAt: "2026-08-23T02:00:00.000Z",
     ...overrides,
   };
@@ -64,6 +73,7 @@ describe("immutable projection manifest", () => {
     assert.equal(parsed.sessionId, null);
     assert.equal(Object.isFrozen(parsed), true);
     assert.equal(Object.isFrozen(parsed.coreChecksums), true);
+    assert.deepEqual(parsed.coreChecksums, CORE_CHECKSUMS);
 
     for (const [field, value] of [
       ["projectId", "9".repeat(64)],
@@ -83,6 +93,13 @@ describe("immutable projection manifest", () => {
       () => parseProjectionManifest(manifest(), { ...BINDING, projectId: "9".repeat(64) as never }),
       /PROJECTION_MANIFEST_INVALID/u,
     );
+    assert.throws(
+      () => parseProjectionManifest(manifest(), {
+        ...BINDING,
+        sessionId: "00000000-0000-4000-8000-000000000042",
+      }),
+      /PROJECTION_MANIFEST_INVALID/u,
+    );
   });
 
   it("rejects aliases, traversal, noncanonical identities and hashes, and oversized checksum maps", () => {
@@ -97,6 +114,7 @@ describe("immutable projection manifest", () => {
       manifest({ databaseSha256: "b".repeat(63) }),
       manifest({ sessionId: "00000000-0000-4000-8000-000000000042" }),
       manifest({ coreChecksums: {} }),
+      manifest({ coreChecksums: { sessionTree: "6".repeat(64) } }),
       manifest({ coreChecksums: { session_tree: "c".repeat(64) } }),
       manifest({ coreChecksums: Object.fromEntries(Array.from({ length: 1_000 }, (_, index) => [`alias${index}`, HASH])) }),
       { ...manifest(), manifestPath: "projection-manifest.json" },
@@ -147,7 +165,7 @@ describe("immutable projection manifest", () => {
     const expected = `${JSON.stringify({
       branchRef: BINDING.branchRef,
       branchScopeId: BINDING.branchScopeId,
-      coreChecksums: { sessionTree: "c".repeat(64) },
+      coreChecksums: CORE_CHECKSUMS,
       createdAt: "2026-08-23T02:00:00.000Z",
       databaseFile: "projections-1-2.sqlite",
       databaseSha256: "b".repeat(64),
