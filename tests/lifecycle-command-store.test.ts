@@ -1,5 +1,9 @@
 import { strict as assert } from "node:assert";
 import { createHash } from "node:crypto";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { describe, it } from "node:test";
 import type {
   AppendCommand,
@@ -573,27 +577,55 @@ function isLifecycleInputInvalid(error: unknown): boolean {
 
 describe("LifecycleCommandStore", () => {
   it("keeps the authoritative command transaction isolated from derived projection files", () => {
-    const connection = new TransactionConnection();
-    const events = new FakeEvents(connection);
-    const store = new LifecycleCommandStore({
-      connection,
-      events,
-      projectionWriter: recordingProjectionWriter(),
-      transaction: () => transaction(connection),
-      now: () => NOW,
-    });
+    const root = mkdtempSync(join(tmpdir(), "lifecycle-projection-isolation-"));
+    const projectionPath = join(root, "projections-1-1.sqlite");
+    const projectionOwner = new DatabaseSync(projectionPath);
+    const projectionContender = new DatabaseSync(projectionPath, { timeout: 0 });
+    try {
+      projectionOwner.exec(`
+        CREATE TABLE sentinel(value TEXT NOT NULL) STRICT;
+        INSERT INTO sentinel VALUES ('unchanged');
+        BEGIN EXCLUSIVE;
+      `);
+      assert.throws(
+        () => projectionContender.exec("UPDATE sentinel SET value = 'contended'"),
+        /database is locked/u,
+      );
 
-    store.execute(envelope(), () => ({
-      append: appendCommand(),
-      authorizationRecord: authorization(),
-      afterAppend: () => undefined,
-    }));
+      const connection = new TransactionConnection();
+      const events = new FakeEvents(connection);
+      const store = new LifecycleCommandStore({
+        connection,
+        events,
+        projectionWriter: recordingProjectionWriter(),
+        transaction: () => transaction(connection),
+        now: () => NOW,
+      });
+      store.execute(envelope(), () => ({
+        append: appendCommand(),
+        authorizationRecord: authorization(),
+        afterAppend: () => undefined,
+      }));
 
-    assert.deepEqual(connection.statements, ["BEGIN IMMEDIATE", "COMMIT"]);
-    assert.equal(
-      connection.statements.some((sql) => /ATTACH|PROJECTION-MANIFEST|PROJECTIONS-1-/u.test(sql)),
-      false,
-    );
+      assert.deepEqual(connection.statements, ["BEGIN IMMEDIATE", "COMMIT"]);
+      assert.equal(
+        connection.statements.some((sql) => /attach|projection-manifest|projections-1-/iu.test(sql)),
+        false,
+      );
+      assert.equal(
+        projectionOwner.prepare("SELECT value FROM sentinel").get()?.value,
+        "unchanged",
+      );
+    } finally {
+      try {
+        projectionOwner.exec("ROLLBACK");
+      } catch {
+        // The assertion path may fail before the exclusive transaction starts.
+      }
+      projectionContender.close();
+      projectionOwner.close();
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it("classifies semantic inner milestones without replacing event append", () => {

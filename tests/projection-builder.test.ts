@@ -169,9 +169,25 @@ class RecordingDriver implements SqliteDriver {
   readonly opens: Array<{ path: string; options: SqliteOpenOptions }> = [];
   readonly #delegate = new NodeSqliteDriver({ DatabaseSync });
 
+  constructor(
+    readonly afterPopulation?: (connection: SqliteConnection) => void,
+  ) {}
+
   open(path: string, options: SqliteOpenOptions): SqliteConnection {
     this.opens.push({ path, options: { ...options } });
-    return this.#delegate.open(path, options);
+    const connection = this.#delegate.open(path, options);
+    if (options.mode !== "create" || this.afterPopulation === undefined) return connection;
+    let commits = 0;
+    return {
+      exec: (sql): void => {
+        connection.exec(sql);
+        if (sql.trim().toUpperCase() !== "COMMIT") return;
+        commits += 1;
+        if (commits === 2) this.afterPopulation?.(connection);
+      },
+      prepare: (sql) => connection.prepare(sql),
+      close: () => connection.close(),
+    };
   }
 }
 
@@ -269,5 +285,73 @@ describe("projection generation builder", () => {
         [join(projectionDirectory, ".projections-1-1.sqlite.tmp"), "create"],
       ],
     );
+  });
+
+  it("rejects a generation whose persisted rows no longer match its intended core checksums", async () => {
+    const root = mkdtempSync(join(tmpdir(), "projection-persisted-checksum-"));
+    roots.push(root);
+    const sourcePath = join(root, "events.sqlite");
+    const source = createSource(sourcePath);
+    insertEvent(source, 1, "MemorySourceRecorded", memoryPayload());
+    const driver = new RecordingDriver((connection) => {
+      connection.prepare(`
+        UPDATE canonical_items SET summary = 'tampered after insert'
+      `).run();
+    });
+    const snapshot = await new SqliteProjectionEventReader({
+      driver,
+      eventStorePath: sourcePath,
+    }).openCommittedSnapshot(BINDING);
+    const builder = new ImmutableProjectionBuilder({
+      driver,
+      projectionDirectory: join(root, "projections"),
+      now: () => NOW,
+    });
+
+    await assert.rejects(
+      () => builder.build(snapshot, 1),
+      /PROJECTION_CHECKSUM_INVALID/u,
+    );
+    snapshot.close();
+    source.close();
+  });
+
+  it("runs the FTS external-content integrity check before publishing a generation", async () => {
+    const root = mkdtempSync(join(tmpdir(), "projection-fts-integrity-"));
+    roots.push(root);
+    const sourcePath = join(root, "events.sqlite");
+    const source = createSource(sourcePath);
+    insertEvent(source, 1, "MemorySourceRecorded", memoryPayload());
+    const driver = new RecordingDriver((connection) => {
+      const row = connection.prepare(`
+        SELECT row_id, normalized_key, text FROM lexical_chunks LIMIT 1
+      `).get();
+      assert.notEqual(row, undefined);
+      connection.prepare(`
+        INSERT INTO lexical_chunks_fts(
+          lexical_chunks_fts, rowid, normalized_key, text
+        ) VALUES ('delete', $rowId, $normalizedKey, $text)
+      `).run({
+        $rowId: row!.row_id!,
+        $normalizedKey: row!.normalized_key!,
+        $text: row!.text!,
+      });
+    });
+    const snapshot = await new SqliteProjectionEventReader({
+      driver,
+      eventStorePath: sourcePath,
+    }).openCommittedSnapshot(BINDING);
+    const builder = new ImmutableProjectionBuilder({
+      driver,
+      projectionDirectory: join(root, "projections"),
+      now: () => NOW,
+    });
+
+    await assert.rejects(
+      () => builder.build(snapshot, 1),
+      /PROJECTION_FTS_INVALID/u,
+    );
+    snapshot.close();
+    source.close();
   });
 });

@@ -231,6 +231,85 @@ const TABLES = Object.freeze({
   ],
 } as const);
 
+const TABLE_ORDER = Object.freeze({
+  sessionTree: "project_id, session_id",
+  canonicalItems: "project_id, item_id",
+  tasksFollowups: "project_id, follow_up_id",
+  artifactsFiles: "project_id, session_id, artifact_id",
+  entityGraph: "project_id, edge_id",
+  lexicalChunks: "project_id, chunk_id",
+  retrievalFeedback: "project_id, feedback_id",
+} as const satisfies Record<ProjectionName, string>);
+
+const INTEGER_NUMBER_COLUMNS = new Set(["checkpoint_version", "usefulness"]);
+
+function canonicalPersistedValue(
+  value: unknown,
+  column: string,
+): CanonicalProjectionRow[string] {
+  if (value === null || typeof value === "string") return value;
+  if (typeof value === "bigint") {
+    if (INTEGER_NUMBER_COLUMNS.has(column)) {
+      if (value < BigInt(Number.MIN_SAFE_INTEGER) || value > BigInt(Number.MAX_SAFE_INTEGER)) {
+        return failure("PROJECTION_STRUCTURE_INVALID");
+      }
+      return Number(value);
+    }
+    return value.toString();
+  }
+  if (typeof value === "number" && Number.isSafeInteger(value)) {
+    return INTEGER_NUMBER_COLUMNS.has(column) ? value : value.toString();
+  }
+  return failure("PROJECTION_STRUCTURE_INVALID");
+}
+
+function persistedRows(connection: SqliteConnection): ProjectionRows {
+  const result = {} as Record<ProjectionName, readonly CanonicalProjectionRow[]>;
+  for (const name of PROJECTION_NAMES) {
+    const [table, columns] = TABLES[name];
+    result[name] = freezeRows(connection.prepare(`
+      SELECT ${columns.join(", ")} FROM ${table} ORDER BY ${TABLE_ORDER[name]}
+    `).all().map((row) => {
+      const canonical: Record<string, CanonicalProjectionRow[string]> = {};
+      for (const column of columns) {
+        if (!(column in row)) return failure("PROJECTION_STRUCTURE_INVALID");
+        canonical[column] = canonicalPersistedValue(row[column], column);
+      }
+      return canonical;
+    }));
+  }
+  return Object.freeze(result);
+}
+
+function verifyPersistedChecksums(
+  connection: SqliteConnection,
+  snapshot: ProjectionEventSnapshot,
+  expected: Readonly<Record<ProjectionName, string>>,
+): Readonly<Record<ProjectionName, string>> {
+  const rows = persistedRows(connection);
+  const verified = {} as Record<ProjectionName, string>;
+  for (const name of PROJECTION_NAMES) {
+    const checksum = projectionCoreChecksum(
+      name,
+      PROJECTION_SCHEMA_VERSION,
+      snapshot.binding.projectId,
+      snapshot.terminalEventPosition,
+      rows[name],
+    );
+    if (checksum !== expected[name]) return failure("PROJECTION_CHECKSUM_INVALID");
+    verified[name] = checksum;
+  }
+  try {
+    connection.prepare(`
+      INSERT INTO lexical_chunks_fts(lexical_chunks_fts, rank)
+      VALUES ('integrity-check', 1)
+    `).run();
+  } catch {
+    return failure("PROJECTION_FTS_INVALID");
+  }
+  return Object.freeze(verified);
+}
+
 function populate(
   connection: SqliteConnection,
   snapshot: ProjectionEventSnapshot,
@@ -398,6 +477,11 @@ export class ImmutableProjectionBuilder {
       createProjectionSchema(connection);
       populate(connection, snapshot, generation, createdAt, rows);
       verifyStructure(connection, snapshot, generation, rows);
+      const persistedCoreChecksums = verifyPersistedChecksums(
+        connection,
+        snapshot,
+        coreChecksums,
+      );
       connection.prepare("PRAGMA wal_checkpoint(TRUNCATE)").get();
       connection.close();
       connection = undefined;
@@ -426,7 +510,7 @@ export class ImmutableProjectionBuilder {
         terminalEventHash: snapshot.terminalEventHash,
         databaseFile,
         databaseSha256: sha256File(databasePath),
-        coreChecksums: Object.freeze(coreChecksums),
+        coreChecksums: persistedCoreChecksums,
         createdAt,
       }, snapshot.binding);
       verifyProjectionPublicationPaths(directory, databaseFile);

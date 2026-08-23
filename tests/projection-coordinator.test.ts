@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
 import {
   existsSync,
+  lstatSync,
   mkdtempSync,
   mkdirSync,
   readFileSync,
+  realpathSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
@@ -20,15 +22,26 @@ import type {
   VaultId,
   WorkspaceId,
 } from "../src/orchestrator/identity/contracts.js";
-import { ImmutableProjectionBuilder } from "../src/orchestrator/projections/builder.js";
+import {
+  ImmutableProjectionBuilder,
+  type BuiltProjectionGeneration,
+} from "../src/orchestrator/projections/builder.js";
 import {
   DefaultProjectionBuildCoordinator,
   ProjectionLagError,
   type ProjectionGenerationBuilder,
 } from "../src/orchestrator/projections/coordinator.js";
 import type { ProjectBinding } from "../src/orchestrator/projections/contracts.js";
-import { SqliteProjectionEventReader } from "../src/orchestrator/projections/event-reader.js";
-import { parseProjectionManifest } from "../src/orchestrator/projections/manifest.js";
+import {
+  SqliteProjectionEventReader,
+  type ProjectionEventReader,
+  type ProjectionEventSnapshot,
+} from "../src/orchestrator/projections/event-reader.js";
+import {
+  parseProjectionManifest,
+  publishProjectionManifest,
+  type ProjectionPathInspection,
+} from "../src/orchestrator/projections/manifest.js";
 import { ProjectionReaderLeaseRegistry } from "../src/orchestrator/projections/reader-lease.js";
 import { PROJECT_MEMORY_APPLICATION_ID } from "../src/orchestrator/runtime/runtime-capabilities.js";
 import { canonicalJson } from "../src/orchestrator/serialization/canonical-json.js";
@@ -108,6 +121,39 @@ function append(database: DatabaseSync, position: number): void {
     position === 1 ? "0".repeat(64) : String(position - 1).repeat(64).slice(0, 64),
     String(position).repeat(64).slice(0, 64),
   );
+}
+
+function emptySnapshot(onClose: () => void = () => undefined): ProjectionEventSnapshot {
+  let closed = false;
+  return Object.freeze({
+    binding: BINDING,
+    events: Object.freeze([]),
+    terminalEventPosition: 0n,
+    terminalEventHash: "0".repeat(64),
+    close(): void {
+      if (closed) return;
+      closed = true;
+      onClose();
+    },
+  });
+}
+
+class PublishDuringAcquireRegistry extends ProjectionReaderLeaseRegistry {
+  replacement: BuiltProjectionGeneration | null = null;
+
+  override acquire(generation: BuiltProjectionGeneration) {
+    const replacement = this.replacement;
+    if (replacement !== null) {
+      this.replacement = null;
+      publishProjectionManifest({
+        projectionDirectory: replacement.projectionDirectory,
+        manifest: replacement.manifest,
+        expectedBinding: BINDING,
+      });
+      this.retire(generation);
+    }
+    return super.acquire(generation);
+  }
 }
 
 describe("projection build coordinator", () => {
@@ -213,6 +259,202 @@ describe("projection build coordinator", () => {
         && error.availableEventPosition === 10n,
     );
     assert.equal(existsSync(unrelatedTemp), true);
+    source.close();
+  });
+
+  it("reselects the manifest when publication retires a generation between load and acquire", async () => {
+    const root = mkdtempSync(join(tmpdir(), "projection-lease-race-"));
+    roots.push(root);
+    const sourcePath = join(root, "events.sqlite");
+    const projectionDirectory = join(root, "projections");
+    const source = sourceDatabase(sourcePath);
+    for (let position = 1; position <= 8; position += 1) append(source, position);
+    const driver = new NodeSqliteDriver({ DatabaseSync });
+    const eventReader = new SqliteProjectionEventReader({ driver, eventStorePath: sourcePath });
+    const builder = new ImmutableProjectionBuilder({ driver, projectionDirectory, now: () => NOW });
+    const leases = new PublishDuringAcquireRegistry();
+    const coordinator = new DefaultProjectionBuildCoordinator({
+      eventReader,
+      builder,
+      leases,
+      projectionDirectory,
+    });
+
+    const first = await coordinator.ensurePublished(BINDING, 8n, 200);
+    append(source, 9);
+    const snapshot = await eventReader.openCommittedSnapshot(BINDING);
+    leases.replacement = await builder.build(snapshot, 2);
+    snapshot.close();
+
+    const lease = await coordinator.leasePublished(BINDING);
+    assert.equal(lease.manifest.generation, 2);
+    assert.equal(lease.manifest.terminalEventPosition, "9");
+    assert.equal(existsSync(lease.databasePath), true);
+    assert.equal(existsSync(first.databasePath), false);
+    lease.close();
+    source.close();
+  });
+
+  it("returns projection lag at a zero deadline without starting source or build work", async () => {
+    const root = mkdtempSync(join(tmpdir(), "projection-zero-deadline-"));
+    roots.push(root);
+    let reads = 0;
+    let builds = 0;
+    const coordinator = new DefaultProjectionBuildCoordinator({
+      projectionDirectory: join(root, "projections"),
+      eventReader: {
+        async openCommittedSnapshot() {
+          reads += 1;
+          return emptySnapshot();
+        },
+      },
+      builder: {
+        async build() {
+          builds += 1;
+          throw new Error("builder must not run");
+        },
+      },
+    });
+
+    await assert.rejects(
+      () => coordinator.ensurePublished(BINDING, 1n, 0),
+      (error: unknown) => error instanceof ProjectionLagError,
+    );
+    assert.equal(reads, 0);
+    assert.equal(builds, 0);
+  });
+
+  it("bounds a slow source snapshot and closes its late result without invoking the builder", async () => {
+    const root = mkdtempSync(join(tmpdir(), "projection-slow-snapshot-"));
+    roots.push(root);
+    let closed = 0;
+    let builds = 0;
+    const eventReader: ProjectionEventReader = {
+      async openCommittedSnapshot() {
+        await new Promise<void>((resolve) => setTimeout(resolve, 35));
+        return emptySnapshot(() => { closed += 1; });
+      },
+    };
+    const coordinator = new DefaultProjectionBuildCoordinator({
+      projectionDirectory: join(root, "projections"),
+      eventReader,
+      builder: {
+        async build() {
+          builds += 1;
+          throw new Error("late builder must not run");
+        },
+      },
+    });
+
+    await assert.rejects(
+      () => coordinator.ensurePublished(BINDING, 1n, 5),
+      (error: unknown) => error instanceof ProjectionLagError,
+    );
+    await new Promise<void>((resolve) => setTimeout(resolve, 50));
+    assert.equal(closed, 1);
+    assert.equal(builds, 0);
+  });
+
+  it("does not publish a build that completes after its caller deadline", async () => {
+    const root = mkdtempSync(join(tmpdir(), "projection-slow-build-"));
+    roots.push(root);
+    const sourcePath = join(root, "events.sqlite");
+    const projectionDirectory = join(root, "projections");
+    const source = sourceDatabase(sourcePath);
+    append(source, 1);
+    const driver = new NodeSqliteDriver({ DatabaseSync });
+    const eventReader = new SqliteProjectionEventReader({ driver, eventStorePath: sourcePath });
+    const concrete = new ImmutableProjectionBuilder({ driver, projectionDirectory, now: () => NOW });
+    const coordinator = new DefaultProjectionBuildCoordinator({
+      projectionDirectory,
+      eventReader,
+      builder: {
+        async build(snapshot, generation) {
+          await new Promise<void>((resolve) => setTimeout(resolve, 35));
+          return concrete.build(snapshot, generation);
+        },
+      },
+    });
+
+    await assert.rejects(
+      () => coordinator.ensurePublished(BINDING, 1n, 5),
+      (error: unknown) => error instanceof ProjectionLagError,
+    );
+    await new Promise<void>((resolve) => setTimeout(resolve, 70));
+    assert.equal(existsSync(join(projectionDirectory, "projection-manifest.json")), false);
+    source.close();
+  });
+
+  it("rejects a symlink-shaped projection directory before cleanup traversal", () => {
+    const root = mkdtempSync(join(tmpdir(), "projection-path-safety-"));
+    roots.push(root);
+    const projectionDirectory = join(root, "projections");
+    mkdirSync(projectionDirectory);
+    const knownTemp = join(projectionDirectory, ".projection-manifest.json.tmp");
+    writeFileSync(knownTemp, "outside-authority", "utf8");
+    const inspection: ProjectionPathInspection = {
+      lstat(path) {
+        const stat = lstatSync(path);
+        if (path !== projectionDirectory) return stat;
+        return {
+          isDirectory: () => true,
+          isFile: () => false,
+          isSymbolicLink: () => true,
+        };
+      },
+      realpath: realpathSync,
+    };
+
+    assert.throws(
+      () => new DefaultProjectionBuildCoordinator({
+        projectionDirectory,
+        eventReader: { async openCommittedSnapshot() { return emptySnapshot(); } },
+        builder: { async build() { throw new Error("not reached"); } },
+        pathInspection: inspection,
+      }),
+      /PROJECTION_PATH_INVALID/u,
+    );
+    assert.equal(readFileSync(knownTemp, "utf8"), "outside-authority");
+  });
+
+  it("keeps publication successful and records retryable retired-file cleanup failures", async () => {
+    const root = mkdtempSync(join(tmpdir(), "projection-reclaim-retry-"));
+    roots.push(root);
+    const sourcePath = join(root, "events.sqlite");
+    const projectionDirectory = join(root, "projections");
+    const source = sourceDatabase(sourcePath);
+    append(source, 1);
+    const driver = new NodeSqliteDriver({ DatabaseSync });
+    const eventReader = new SqliteProjectionEventReader({ driver, eventStorePath: sourcePath });
+    const builder = new ImmutableProjectionBuilder({ driver, projectionDirectory, now: () => NOW });
+    let directorySyncs = 0;
+    const leases = new ProjectionReaderLeaseRegistry(() => {
+      directorySyncs += 1;
+      if (directorySyncs === 1) throw new Error("injected retired-directory fsync failure");
+    });
+    const coordinator = new DefaultProjectionBuildCoordinator({
+      projectionDirectory,
+      eventReader,
+      builder,
+      leases,
+    });
+
+    const first = await coordinator.ensurePublished(BINDING, 1n, 200);
+    append(source, 2);
+    const second = await coordinator.ensurePublished(BINDING, 2n, 200);
+    assert.equal(second.manifest.terminalEventPosition, "2");
+    assert.equal(
+      parseProjectionManifest(
+        JSON.parse(readFileSync(join(projectionDirectory, "projection-manifest.json"), "utf8")),
+        BINDING,
+      ).generation,
+      second.manifest.generation,
+    );
+    assert.equal(existsSync(first.databasePath), false);
+    assert.equal(leases.reclamationIssues().length, 1);
+    leases.retryReclamation();
+    assert.equal(leases.reclamationIssues().length, 0);
+    assert.equal(directorySyncs, 2);
     source.close();
   });
 });

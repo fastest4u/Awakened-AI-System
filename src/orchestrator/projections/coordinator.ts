@@ -1,8 +1,8 @@
 import { createHash } from "node:crypto";
 import {
-  existsSync,
   lstatSync,
   readFileSync,
+  realpathSync,
   readdirSync,
   unlinkSync,
 } from "node:fs";
@@ -17,8 +17,10 @@ import {
   publishProjectionManifest,
   verifyProjectionPublicationPaths,
   type ProjectionManifestV1,
+  type ProjectionPathInspection,
 } from "./manifest.js";
 import {
+  ProjectionLeaseUnavailableError,
   ProjectionReaderLeaseRegistry,
   type ProjectionReaderLease,
 } from "./reader-lease.js";
@@ -56,6 +58,7 @@ export interface DefaultProjectionBuildCoordinatorOptions {
   readonly faultInjector?: ProjectionBuildFaultInjector;
   readonly now?: () => number;
   readonly sleep?: (milliseconds: number) => Promise<void>;
+  readonly pathInspection?: ProjectionPathInspection;
 }
 
 export class ProjectionLagError extends Error {
@@ -89,6 +92,20 @@ function canonicalDirectory(path: string): string {
   return path;
 }
 
+const filesystemPathInspection: ProjectionPathInspection = Object.freeze({
+  lstat: (path: string) => lstatSync(path),
+  realpath: (path: string) => realpathSync(path),
+});
+
+function normalizedPath(path: string): string {
+  const value = resolve(path);
+  return process.platform === "win32" ? value.toLowerCase() : value;
+}
+
+interface DeadlineState {
+  expired: boolean;
+}
+
 export class DefaultProjectionBuildCoordinator implements ProjectionBuildCoordinator {
   readonly #eventReader: ProjectionEventReader;
   readonly #builder: ProjectionGenerationBuilder;
@@ -97,6 +114,7 @@ export class DefaultProjectionBuildCoordinator implements ProjectionBuildCoordin
   readonly #faultInjector: ProjectionBuildFaultInjector | undefined;
   readonly #now: () => number;
   readonly #sleep: (milliseconds: number) => Promise<void>;
+  readonly #pathInspection: ProjectionPathInspection;
   readonly #projectTails = new Map<string, Promise<void>>();
 
   constructor(options: DefaultProjectionBuildCoordinatorOptions) {
@@ -109,6 +127,8 @@ export class DefaultProjectionBuildCoordinator implements ProjectionBuildCoordin
     this.#sleep = options.sleep ?? ((milliseconds) => new Promise<void>((resolveSleep) => {
       setTimeout(resolveSleep, milliseconds);
     }));
+    this.#pathInspection = options.pathInspection ?? filesystemPathInspection;
+    this.#assertProjectionDirectorySafe();
   }
 
   async ensurePublished(
@@ -123,23 +143,22 @@ export class DefaultProjectionBuildCoordinator implements ProjectionBuildCoordin
       || deadlineMs < 0
     ) throw new TypeError("PROJECTION_REQUEST_INVALID");
     const expiresAt = this.#now() + deadlineMs;
-    return this.#serialized(binding.projectId, async () => {
-      let available = 0n;
-      let attemptedSnapshot = false;
+    const deadline: DeadlineState = { expired: deadlineMs === 0 };
+    let available = 0n;
+    const work = this.#serialized(binding.projectId, async () => {
       while (true) {
         const current = this.#loadPublished(binding);
         if (current !== null) {
           available = position(current.manifest);
           if (available >= requiredEventPosition) return current;
         }
-        if (attemptedSnapshot && this.#now() >= expiresAt) {
-          throw new ProjectionLagError(requiredEventPosition, available);
-        }
+        this.#assertBeforeDeadline(deadline, expiresAt, requiredEventPosition, available);
 
         this.#cleanupKnownTemps();
+        this.#assertBeforeDeadline(deadline, expiresAt, requiredEventPosition, available);
         const snapshot = await this.#eventReader.openCommittedSnapshot(binding);
-        attemptedSnapshot = true;
         try {
+          this.#assertBeforeDeadline(deadline, expiresAt, requiredEventPosition, available);
           if (snapshot.terminalEventPosition < available) {
             throw new Error("PROJECTION_SOURCE_REGRESSION");
           }
@@ -150,9 +169,13 @@ export class DefaultProjectionBuildCoordinator implements ProjectionBuildCoordin
           ) throw new Error("INTEGRITY_FAILURE");
           available = snapshot.terminalEventPosition;
           if (current === null || snapshot.terminalEventPosition > position(current.manifest)) {
+            this.#assertBeforeDeadline(deadline, expiresAt, requiredEventPosition, available);
             const built = await this.#builder.build(snapshot, this.#nextGeneration());
+            this.#assertBeforeDeadline(deadline, expiresAt, requiredEventPosition, available);
             this.#verifyBuilt(binding, built);
+            this.#assertBeforeDeadline(deadline, expiresAt, requiredEventPosition, available);
             this.#faultInjector?.hit("after-generation-fsync-before-manifest");
+            this.#assertBeforeDeadline(deadline, expiresAt, requiredEventPosition, available);
             publishProjectionManifest({
               projectionDirectory: this.#projectionDirectory,
               manifest: built.manifest,
@@ -177,17 +200,48 @@ export class DefaultProjectionBuildCoordinator implements ProjectionBuildCoordin
         const remaining = expiresAt - this.#now();
         if (remaining <= 0) throw new ProjectionLagError(requiredEventPosition, available);
         await this.#sleep(Math.min(10, remaining));
+        this.#assertBeforeDeadline(deadline, expiresAt, requiredEventPosition, available);
       }
     });
+    return this.#deadlineResult(
+      work,
+      deadlineMs,
+      deadline,
+      () => new ProjectionLagError(requiredEventPosition, available),
+    );
   }
 
   async leasePublished(binding: ProjectBinding): Promise<ProjectionReaderLease> {
-    const current = this.#loadPublished(binding);
-    if (current === null) throw new ProjectionLagError(0n, 0n);
-    return this.#leases.acquire(current);
+    return this.#serialized(binding.projectId, async () => {
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        const selected = this.#loadPublished(binding);
+        if (selected === null) throw new ProjectionLagError(0n, 0n);
+        let lease: ProjectionReaderLease;
+        try {
+          lease = this.#leases.acquire(selected);
+        } catch (error) {
+          if (error instanceof ProjectionLeaseUnavailableError) continue;
+          throw error;
+        }
+        try {
+          const confirmed = this.#loadPublished(binding);
+          if (
+            confirmed !== null
+            && confirmed.databasePath === selected.databasePath
+            && confirmed.manifest.databaseSha256 === selected.manifest.databaseSha256
+          ) return lease;
+        } catch (error) {
+          lease.close();
+          throw error;
+        }
+        lease.close();
+      }
+      throw new ProjectionLeaseUnavailableError();
+    });
   }
 
   #loadPublished(binding: ProjectBinding): PublishedProjectionGeneration | null {
+    if (!this.#assertProjectionDirectorySafe()) return null;
     const manifestPath = join(this.#projectionDirectory, PROJECTION_MANIFEST_FILENAME);
     let bytes: string;
     try {
@@ -215,6 +269,7 @@ export class DefaultProjectionBuildCoordinator implements ProjectionBuildCoordin
   }
 
   #verifyBuilt(binding: ProjectBinding, built: BuiltProjectionGeneration): void {
+    if (!this.#assertProjectionDirectorySafe()) throw new Error("PROJECTION_PATH_INVALID");
     if (resolve(built.projectionDirectory) !== resolve(this.#projectionDirectory)) {
       throw new Error("PROJECTION_PATH_INVALID");
     }
@@ -227,29 +282,103 @@ export class DefaultProjectionBuildCoordinator implements ProjectionBuildCoordin
   }
 
   #cleanupKnownTemps(): void {
-    if (!existsSync(this.#projectionDirectory)) return;
+    if (!this.#assertProjectionDirectorySafe()) return;
     for (const name of readdirSync(this.#projectionDirectory)) {
       if (name !== `.${PROJECTION_MANIFEST_FILENAME}.tmp` && !GENERATION_TEMP.test(name)) continue;
       const path = join(this.#projectionDirectory, name);
-      const stat = lstatSync(path);
+      const stat = this.#pathInspection.lstat(path);
       if (!stat.isFile() || stat.isSymbolicLink()) throw new Error("PROJECTION_PATH_INVALID");
       unlinkSync(path);
     }
   }
 
   #nextGeneration(): number {
-    if (!existsSync(this.#projectionDirectory)) return 1;
+    if (!this.#assertProjectionDirectorySafe()) return 1;
     let maximum = 0;
     for (const name of readdirSync(this.#projectionDirectory)) {
       const match = GENERATION_FILE.exec(name);
       if (match === null) continue;
       const path = join(this.#projectionDirectory, name);
-      const stat = lstatSync(path);
+      const stat = this.#pathInspection.lstat(path);
       if (!stat.isFile() || stat.isSymbolicLink()) throw new Error("PROJECTION_PATH_INVALID");
       maximum = Math.max(maximum, Number(match[1]));
     }
     if (maximum >= MAX_GENERATION) throw new Error("PROJECTION_GENERATION_EXHAUSTED");
     return maximum + 1;
+  }
+
+  #assertProjectionDirectorySafe(): boolean {
+    let stat;
+    try {
+      stat = this.#pathInspection.lstat(this.#projectionDirectory);
+    } catch (error) {
+      if (!notFound(error)) throw error;
+      const parent = resolve(this.#projectionDirectory, "..");
+      try {
+        const parentStat = this.#pathInspection.lstat(parent);
+        if (
+          !parentStat.isDirectory()
+          || parentStat.isSymbolicLink()
+          || normalizedPath(this.#pathInspection.realpath(parent)) !== normalizedPath(parent)
+        ) throw new Error("PROJECTION_PATH_INVALID");
+      } catch (parentError) {
+        if (parentError instanceof Error && parentError.message === "PROJECTION_PATH_INVALID") {
+          throw parentError;
+        }
+        throw new Error("PROJECTION_PATH_INVALID", { cause: parentError });
+      }
+      return false;
+    }
+    if (
+      !stat.isDirectory()
+      || stat.isSymbolicLink()
+      || normalizedPath(this.#pathInspection.realpath(this.#projectionDirectory))
+        !== normalizedPath(this.#projectionDirectory)
+    ) throw new Error("PROJECTION_PATH_INVALID");
+    return true;
+  }
+
+  #assertBeforeDeadline(
+    state: DeadlineState,
+    expiresAt: number,
+    requiredEventPosition: bigint,
+    availableEventPosition: bigint,
+  ): void {
+    if (state.expired || this.#now() >= expiresAt) {
+      state.expired = true;
+      throw new ProjectionLagError(requiredEventPosition, availableEventPosition);
+    }
+  }
+
+  #deadlineResult<T>(
+    work: Promise<T>,
+    deadlineMs: number,
+    state: DeadlineState,
+    lag: () => ProjectionLagError,
+  ): Promise<T> {
+    return new Promise<T>((resolveResult, rejectResult) => {
+      let settled = false;
+      const timer = setTimeout(() => {
+        state.expired = true;
+        if (settled) return;
+        settled = true;
+        rejectResult(lag());
+      }, deadlineMs);
+      work.then(
+        (result) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          resolveResult(result);
+        },
+        (error: unknown) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          rejectResult(error);
+        },
+      );
+    });
   }
 
   async #serialized<T>(projectId: string, operation: () => Promise<T>): Promise<T> {
