@@ -23,6 +23,7 @@ import type {
   VaultId,
   WorkspaceId,
 } from "../src/orchestrator/identity/contracts.js";
+import { LifecycleError } from "../src/orchestrator/lifecycle/errors.js";
 import {
   ImmutableProjectionBuilder,
   type BuiltProjectionGeneration,
@@ -255,7 +256,11 @@ describe("projection build coordinator", () => {
     await assert.rejects(
       () => coordinator.ensurePublished(BINDING, 11n, 5),
       (error: unknown) => error instanceof ProjectionLagError
+        && error instanceof LifecycleError
         && error.code === "PROJECTION_LAG"
+        && error.retryable
+        && error.safeMessage === "The required projection consistency was not reached"
+        && error.recoveryActions[0] === "wait-for-projection"
         && error.requiredEventPosition === 11n
         && error.availableEventPosition === 10n,
     );

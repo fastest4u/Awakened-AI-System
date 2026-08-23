@@ -4,6 +4,7 @@ import type { SqliteDriver, SqliteRow, SqliteValue } from "../storage/sqlite-dri
 import type { ProjectBinding } from "./contracts.js";
 
 const DEFAULT_BUSY_TIMEOUT_MS = 5_000;
+const SQLITE_INT64_MAX = 9_223_372_036_854_775_807n;
 const HASH = /^[0-9a-f]{64}$/u;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 
@@ -34,6 +35,10 @@ export interface SqliteProjectionEventReaderOptions {
   readonly driver: SqliteDriver;
   readonly eventStorePath: string;
   readonly busyTimeoutMs?: number;
+}
+
+export interface CommittedProjectionSnapshotOptions extends SqliteProjectionEventReaderOptions {
+  readonly terminalEventPosition?: bigint;
 }
 
 function integrity(): never {
@@ -195,11 +200,38 @@ export class SqliteProjectionEventReader implements ProjectionEventReader {
   }
 
   async openCommittedSnapshot(bindingValue: ProjectBinding): Promise<ProjectionEventSnapshot> {
-    const binding = validateBinding(bindingValue);
-    const connection = this.#driver.open(this.#eventStorePath, {
-      mode: "read-only-existing",
+    return openCommittedProjectionEventSnapshot(bindingValue, {
+      driver: this.#driver,
+      eventStorePath: this.#eventStorePath,
       busyTimeoutMs: this.#busyTimeoutMs,
     });
+  }
+}
+
+/**
+ * Synchronous core used by full integrity replay so the public verifier can
+ * return a report or typed failure without changing the Task 4 contract. The
+ * existing asynchronous reader remains a compatibility wrapper around this
+ * exact authenticated event-store read.
+ */
+export function openCommittedProjectionEventSnapshot(
+  bindingValue: ProjectBinding,
+  options: CommittedProjectionSnapshotOptions,
+): ProjectionEventSnapshot {
+  const binding = validateBinding(bindingValue);
+  const terminalEventPosition = options.terminalEventPosition;
+  if (
+    terminalEventPosition !== undefined
+    && (
+      typeof terminalEventPosition !== "bigint"
+      || terminalEventPosition < 0n
+      || terminalEventPosition > SQLITE_INT64_MAX
+    )
+  ) return integrity();
+  const connection = options.driver.open(options.eventStorePath, {
+    mode: "read-only-existing",
+    busyTimeoutMs: options.busyTimeoutMs ?? DEFAULT_BUSY_TIMEOUT_MS,
+  });
     let transactionOpen = false;
     try {
       connection.exec("BEGIN");
@@ -214,6 +246,9 @@ export class SqliteProjectionEventReader implements ProjectionEventReader {
         || string(identity, "vault_id") !== binding.vaultId
         || string(identity, "store_id") !== binding.storeId
       ) return integrity();
+      const upperBound = terminalEventPosition === undefined
+        ? ""
+        : "AND global_position <= $terminalEventPosition";
       const rows = connection.prepare(`
         SELECT ${EVENT_COLUMNS}
         FROM events
@@ -227,8 +262,14 @@ export class SqliteProjectionEventReader implements ProjectionEventReader {
             (branch_ref IS NULL AND $branchRef IS NULL)
             OR branch_ref = $branchRef
           )
+          ${upperBound}
         ORDER BY global_position
-      `).all(bindingParams(binding));
+      `).all(terminalEventPosition === undefined
+        ? bindingParams(binding)
+        : {
+            ...bindingParams(binding),
+            $terminalEventPosition: terminalEventPosition,
+          });
       const events = rows.map(storedEvent);
       if (events.some((event) => !sameBinding(event, binding))) return integrity();
       for (let index = 1; index < events.length; index += 1) {
@@ -264,5 +305,4 @@ export class SqliteProjectionEventReader implements ProjectionEventReader {
       }
       throw error;
     }
-  }
 }

@@ -7,6 +7,7 @@ import {
 } from "node:fs";
 import { isAbsolute, join, normalize, resolve } from "node:path";
 
+import { LifecycleError } from "../lifecycle/errors.js";
 import type { BuiltProjectionGeneration } from "./builder.js";
 import type { ProjectBinding } from "./contracts.js";
 import type { ProjectionEventReader, ProjectionEventSnapshot } from "./event-reader.js";
@@ -66,15 +67,15 @@ export interface DefaultProjectionBuildCoordinatorOptions {
   readonly pathInspection?: ProjectionPathInspection;
 }
 
-export class ProjectionLagError extends Error {
-  readonly code = "PROJECTION_LAG" as const;
-
+export class ProjectionLagError extends LifecycleError {
   constructor(
     readonly requiredEventPosition: bigint,
     readonly availableEventPosition: bigint,
   ) {
-    super("PROJECTION_LAG");
-    this.name = "ProjectionLagError";
+    super("PROJECTION_LAG", {
+      expectedPosition: requiredEventPosition.toString(),
+      actualPosition: availableEventPosition.toString(),
+    });
   }
 }
 
