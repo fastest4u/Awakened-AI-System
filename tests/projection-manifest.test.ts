@@ -393,6 +393,146 @@ describe("immutable projection manifest", () => {
     );
   });
 
+  it("does not claim a later manifest first observed after its own target rename", () => {
+    const root = mkdtempSync(join(tmpdir(), "projection-manifest-post-rename-observation-"));
+    roots.push(root);
+    const first = parseProjectionManifest(manifest({
+      generation: 1,
+      databaseFile: "projections-1-1.sqlite",
+      terminalEventPosition: "16",
+    }), BINDING);
+    const second = parseProjectionManifest(manifest(), BINDING);
+    const third = parseProjectionManifest(manifest({
+      generation: 3,
+      databaseFile: "projections-1-3.sqlite",
+      terminalEventPosition: "18",
+    }), BINDING);
+    for (const candidate of [first, second, third]) {
+      writeFileSync(join(root, candidate.databaseFile), `generation ${candidate.generation}`, "utf8");
+    }
+    const target = publishProjectionManifest({
+      projectionDirectory: root,
+      manifest: first,
+      expectedBinding: BINDING,
+    });
+    let captures = 0;
+    let nestedPublished = false;
+
+    assert.throws(
+      () => publishProjectionManifest({
+        projectionDirectory: root,
+        manifest: second,
+        expectedBinding: BINDING,
+      }, {
+        directoryOperations: {
+          ...filesystemStableProjectionDirectoryOperations,
+          captureManifest(directory, identity): StableProjectionManifestSnapshot {
+            captures += 1;
+            if (captures === 3) {
+              nestedPublished = true;
+              publishProjectionManifest({
+                projectionDirectory: root,
+                manifest: third,
+                expectedBinding: BINDING,
+              });
+            }
+            return filesystemStableProjectionDirectoryOperations.captureManifest(
+              directory,
+              identity,
+            );
+          },
+        },
+      }),
+      (error: unknown) => error instanceof LifecycleError
+        && error.code === "MATERIALIZATION_CONFLICT"
+        && error.retryable,
+    );
+    assert.equal(captures, 3, "an unowned observation must not enter rollback");
+    assert.equal(nestedPublished, true);
+    assert.equal(
+      parseProjectionManifest(JSON.parse(readFileSync(target, "utf8")), BINDING).generation,
+      3,
+      "an observation of generation 3 cannot make the generation-2 attempt own generation 3",
+    );
+  });
+
+  it("does not restore stale authority when a nested publish starts at rollback entry", () => {
+    const root = mkdtempSync(join(tmpdir(), "projection-manifest-rollback-entry-"));
+    roots.push(root);
+    const first = parseProjectionManifest(manifest({
+      generation: 1,
+      databaseFile: "projections-1-1.sqlite",
+      terminalEventPosition: "16",
+    }), BINDING);
+    const second = parseProjectionManifest(manifest(), BINDING);
+    const third = parseProjectionManifest(manifest({
+      generation: 3,
+      databaseFile: "projections-1-3.sqlite",
+      terminalEventPosition: "18",
+    }), BINDING);
+    for (const candidate of [first, second, third]) {
+      writeFileSync(join(root, candidate.databaseFile), `generation ${candidate.generation}`, "utf8");
+    }
+    const target = publishProjectionManifest({
+      projectionDirectory: root,
+      manifest: first,
+      expectedBinding: BINDING,
+    });
+    let captures = 0;
+    let nestedPublished = false;
+
+    assert.throws(
+      () => publishProjectionManifest({
+        projectionDirectory: root,
+        manifest: second,
+        expectedBinding: BINDING,
+      }, {
+        directoryOperations: {
+          ...filesystemStableProjectionDirectoryOperations,
+          captureManifest(directory, identity): StableProjectionManifestSnapshot {
+            captures += 1;
+            const snapshot = filesystemStableProjectionDirectoryOperations.captureManifest(
+              directory,
+              identity,
+            );
+            if (captures === 4) {
+              nestedPublished = true;
+              publishProjectionManifest({
+                projectionDirectory: root,
+                manifest: third,
+                expectedBinding: BINDING,
+              });
+            }
+            return snapshot;
+          },
+        },
+        faultInjector: {
+          hit(boundary): void {
+            if (boundary === "after-manifest-replace-before-validation") {
+              writeFileSync(
+                `${join(root, second.databaseFile)}-wal`,
+                "outer sidecar failure",
+                "utf8",
+              );
+            }
+          },
+        },
+      }),
+      (error: unknown) => error instanceof LifecycleError
+        && error.code === "INTEGRITY_FAILURE",
+    );
+    assert.equal(
+      captures,
+      4,
+      "the publication epoch must stop rollback before a stale second comparison",
+    );
+    assert.equal(nestedPublished, true);
+    assert.equal(
+      parseProjectionManifest(JSON.parse(readFileSync(target, "utf8")), BINDING).generation,
+      3,
+    );
+  });
+
   it("does not replace a manifest source changed after prior capture", () => {
     const root = mkdtempSync(join(tmpdir(), "projection-manifest-source-cas-"));
     roots.push(root);

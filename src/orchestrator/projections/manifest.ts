@@ -518,15 +518,66 @@ function snapshotHasBytes(
     && snapshot.fileIdentity.sha256 === createHash("sha256").update(expected).digest("hex");
 }
 
+interface ManifestPublicationEpochState {
+  activeAttempts: number;
+  epoch: bigint;
+}
+
+interface ManifestPublicationAttempt {
+  readonly key: string;
+  readonly state: ManifestPublicationEpochState;
+  readonly epoch: bigint;
+}
+
+const manifestPublicationEpochs = new Map<string, ManifestPublicationEpochState>();
+
+// Publication is synchronous, but injected boundaries can re-enter it. A newer
+// same-directory attempt fences the outer attempt from claiming or restoring a
+// target. Cross-process writers remain governed by the filesystem snapshot CAS.
+function beginManifestPublicationAttempt(
+  identity: ProjectionDirectoryIdentity,
+): ManifestPublicationAttempt {
+  const key = JSON.stringify([
+    normalizedPath(identity.canonicalPath),
+    identity.device,
+    identity.inode,
+  ]);
+  let state = manifestPublicationEpochs.get(key);
+  if (state === undefined) {
+    state = { activeAttempts: 0, epoch: 0n };
+    manifestPublicationEpochs.set(key, state);
+  }
+  state.activeAttempts += 1;
+  state.epoch += 1n;
+  return Object.freeze({ key, state, epoch: state.epoch });
+}
+
+function manifestPublicationAttemptIsCurrent(attempt: ManifestPublicationAttempt): boolean {
+  return attempt.state.epoch === attempt.epoch;
+}
+
+function finishManifestPublicationAttempt(attempt: ManifestPublicationAttempt): void {
+  attempt.state.activeAttempts -= 1;
+  if (
+    attempt.state.activeAttempts === 0
+    && manifestPublicationEpochs.get(attempt.key) === attempt.state
+  ) manifestPublicationEpochs.delete(attempt.key);
+}
+
 function restorePreviousManifestIfOwned(
   paths: VerifiedProjectionPublicationPaths,
   directoryIdentity: ProjectionDirectoryIdentity,
   previous: StableProjectionManifestSnapshot,
   installed: StableProjectionManifestSnapshot,
   operations: StableProjectionDirectoryOperations,
+  publicationAttempt: ManifestPublicationAttempt,
 ): "restored" | "removed" | "superseded" {
+  if (!manifestPublicationAttemptIsCurrent(publicationAttempt)) return "superseded";
   const current = captureManifestSnapshot(paths.directory, directoryIdentity, operations);
-  if (!sameManifestSnapshot(current, installed)) return "superseded";
+  if (
+    !manifestPublicationAttemptIsCurrent(publicationAttempt)
+    || !sameManifestSnapshot(current, installed)
+  ) return "superseded";
   if (previous.state === "missing") {
     if (installed.state !== "present") return materializationConflict();
     let result: "removed" | "changed" | "missing";
@@ -535,6 +586,7 @@ function restorePreviousManifestIfOwned(
     } catch {
       return materializationConflict();
     }
+    if (!manifestPublicationAttemptIsCurrent(publicationAttempt)) return "superseded";
     return result === "removed" ? "removed" : "superseded";
   }
   let superseded = false;
@@ -543,13 +595,24 @@ function restorePreviousManifestIfOwned(
       durableBase: paths.directory,
       operations: {
         rename(tempPath, targetPath): void {
+          if (!manifestPublicationAttemptIsCurrent(publicationAttempt)) {
+            superseded = true;
+            return materializationConflict();
+          }
           const before = captureManifestSnapshot(paths.directory, directoryIdentity, operations);
-          if (!sameManifestSnapshot(before, installed)) {
+          if (
+            !manifestPublicationAttemptIsCurrent(publicationAttempt)
+            || !sameManifestSnapshot(before, installed)
+          ) {
             superseded = true;
             return materializationConflict();
           }
           renameSync(tempPath, targetPath);
           const restored = captureManifestSnapshot(paths.directory, directoryIdentity, operations);
+          if (!manifestPublicationAttemptIsCurrent(publicationAttempt)) {
+            superseded = true;
+            return materializationConflict();
+          }
           if (!snapshotHasBytes(restored, Buffer.from(previous.bytesBase64, "base64"))) {
             return materializationConflict();
           }
@@ -564,7 +627,9 @@ function restorePreviousManifestIfOwned(
     if (superseded) return "superseded";
     throw error;
   }
+  if (!manifestPublicationAttemptIsCurrent(publicationAttempt)) return "superseded";
   const restored = captureManifestSnapshot(paths.directory, directoryIdentity, operations);
+  if (!manifestPublicationAttemptIsCurrent(publicationAttempt)) return "superseded";
   if (!snapshotHasBytes(restored, Buffer.from(previous.bytesBase64, "base64"))) {
     return materializationConflict();
   }
@@ -592,82 +657,101 @@ export function publishProjectionManifest(
   } catch {
     return materializationConflict();
   }
-  const previous = captureManifestSnapshot(paths.directory, directoryIdentity, directoryOperations);
-  const manifestBytes = serializeProjectionManifest(manifest);
-  let replaced = false;
-  let installed: StableProjectionManifestSnapshot | undefined;
+  const publicationAttempt = beginManifestPublicationAttempt(directoryIdentity);
   try {
-    new AtomicArtifactReplacer({
-      durableBase: paths.directory,
-      operations: {
-        fsync(handle): void {
-          fsyncSync(handle);
-          options.faultInjector?.hit("after-manifest-temp-fsync-before-replace");
+    const previous = captureManifestSnapshot(paths.directory, directoryIdentity, directoryOperations);
+    const manifestBytes = serializeProjectionManifest(manifest);
+    let replaced = false;
+    let installed: StableProjectionManifestSnapshot | undefined;
+    try {
+      new AtomicArtifactReplacer({
+        durableBase: paths.directory,
+        operations: {
+          fsync(handle): void {
+            fsyncSync(handle);
+            options.faultInjector?.hit("after-manifest-temp-fsync-before-replace");
+          },
+          rename(tempPath, targetPath): void {
+            assertPinnedGeneration(
+              paths.directory,
+              manifest.databaseFile,
+              directoryIdentity,
+              directoryOperations,
+            );
+            const current = captureManifestSnapshot(
+              paths.directory,
+              directoryIdentity,
+              directoryOperations,
+            );
+            if (
+              !manifestPublicationAttemptIsCurrent(publicationAttempt)
+              || !sameManifestSnapshot(current, previous)
+            ) return materializationConflict();
+            renameSync(tempPath, targetPath);
+            replaced = true;
+            const observedInstalled = captureManifestSnapshot(
+              paths.directory,
+              directoryIdentity,
+              directoryOperations,
+            );
+            if (
+              !manifestPublicationAttemptIsCurrent(publicationAttempt)
+              || !snapshotHasBytes(observedInstalled, manifestBytes)
+            ) return materializationConflict();
+            installed = observedInstalled;
+            options.faultInjector?.hit("after-manifest-replace-before-validation");
+            assertPinnedGeneration(
+              paths.directory,
+              manifest.databaseFile,
+              directoryIdentity,
+              directoryOperations,
+            );
+          },
         },
-        rename(tempPath, targetPath): void {
-          assertPinnedGeneration(
-            paths.directory,
-            manifest.databaseFile,
+      }).replace({
+        targetPath: paths.targetPath,
+        tempPath: paths.tempPath,
+        bytes: manifestBytes,
+      });
+      assertPinnedGeneration(
+        paths.directory,
+        manifest.databaseFile,
+        directoryIdentity,
+        directoryOperations,
+      );
+      const finalManifest = captureManifestSnapshot(
+        paths.directory,
+        directoryIdentity,
+        directoryOperations,
+      );
+      if (
+        installed === undefined
+        || !manifestPublicationAttemptIsCurrent(publicationAttempt)
+        || !sameManifestSnapshot(finalManifest, installed)
+      ) return materializationConflict();
+    } catch (error) {
+      if (replaced) {
+        if (
+          installed === undefined
+          || !manifestPublicationAttemptIsCurrent(publicationAttempt)
+        ) throw error;
+        try {
+          restorePreviousManifestIfOwned(
+            paths,
             directoryIdentity,
+            previous,
+            installed,
             directoryOperations,
+            publicationAttempt,
           );
-          const current = captureManifestSnapshot(
-            paths.directory,
-            directoryIdentity,
-            directoryOperations,
-          );
-          if (!sameManifestSnapshot(current, previous)) return materializationConflict();
-          renameSync(tempPath, targetPath);
-          replaced = true;
-          installed = captureManifestSnapshot(
-            paths.directory,
-            directoryIdentity,
-            directoryOperations,
-          );
-          if (!snapshotHasBytes(installed, manifestBytes)) return materializationConflict();
-          options.faultInjector?.hit("after-manifest-replace-before-validation");
-          assertPinnedGeneration(
-            paths.directory,
-            manifest.databaseFile,
-            directoryIdentity,
-            directoryOperations,
-          );
-        },
-      },
-    }).replace({
-      targetPath: paths.targetPath,
-      tempPath: paths.tempPath,
-      bytes: manifestBytes,
-    });
-    assertPinnedGeneration(
-      paths.directory,
-      manifest.databaseFile,
-      directoryIdentity,
-      directoryOperations,
-    );
-    if (
-      installed === undefined
-      || !sameManifestSnapshot(
-        captureManifestSnapshot(paths.directory, directoryIdentity, directoryOperations),
-        installed,
-      )
-    ) return materializationConflict();
-  } catch (error) {
-    if (replaced) {
-      if (installed === undefined) return materializationConflict();
-      try {
-        restorePreviousManifestIfOwned(
-          paths,
-          directoryIdentity,
-          previous,
-          installed,
-          directoryOperations,
-        );
-      } catch {
-        return materializationConflict();
+        } catch {
+          return materializationConflict();
+        }
       }
+      throw error;
     }
-    throw error;
+    return paths.targetPath;
+  } finally {
+    finishManifestPublicationAttempt(publicationAttempt);
   }
-  return paths.targetPath;
 }
