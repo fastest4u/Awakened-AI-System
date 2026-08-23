@@ -5,6 +5,7 @@ import {
   mkdtempSync,
   mkdirSync,
   readFileSync,
+  readdirSync,
   realpathSync,
   renameSync,
   rmSync,
@@ -46,6 +47,7 @@ import {
 } from "../src/orchestrator/projections/manifest.js";
 import { ProjectionReaderLeaseRegistry } from "../src/orchestrator/projections/reader-lease.js";
 import {
+  filesystemStableProjectionDirectoryOperations,
   PROJECTION_MANIFEST_PUBLICATION_LOCK_FILENAME,
 } from "../src/orchestrator/projections/stable-directory.js";
 import { PROJECT_MEMORY_APPLICATION_ID } from "../src/orchestrator/runtime/runtime-capabilities.js";
@@ -431,6 +433,116 @@ describe("projection build coordinator", () => {
         && error.retryable,
     );
     assert.equal(readFileSync(lockPath, "utf8"), "foreign publication in progress");
+    source.close();
+  });
+
+  it("retains the publication lock and prior hold when installed-manifest observation is ambiguous", async () => {
+    const root = mkdtempSync(join(tmpdir(), "projection-installed-observation-error-"));
+    roots.push(root);
+    const sourcePath = join(root, "events.sqlite");
+    const projectionDirectory = join(root, "projections");
+    const source = sourceDatabase(sourcePath);
+    append(source, 1);
+    const driver = new NodeSqliteDriver({ DatabaseSync });
+    const eventReader = new SqliteProjectionEventReader({ driver, eventStorePath: sourcePath });
+    const builder = new ImmutableProjectionBuilder({ driver, projectionDirectory, now: () => NOW });
+    const coordinator = new DefaultProjectionBuildCoordinator({
+      projectionDirectory,
+      eventReader,
+      builder,
+    });
+    const first = await coordinator.ensurePublished(BINDING, 1n, 2_000);
+    const validLease = await coordinator.leasePublished(BINDING);
+    assert.equal(first.manifest.generation, 1);
+    assert.equal(validLease.manifest.generation, 1);
+    validLease.close();
+
+    append(source, 2);
+    const snapshot = await eventReader.openCommittedSnapshot(BINDING);
+    const second = await builder.build(snapshot, 2);
+    snapshot.close();
+    let installed = false;
+    let observationDenied = false;
+
+    assert.throws(
+      () => publishProjectionManifest({
+        projectionDirectory,
+        manifest: second.manifest,
+        expectedBinding: BINDING,
+      }, {
+        directoryOperations: {
+          ...filesystemStableProjectionDirectoryOperations,
+          installManifestIfExpected(directory, identity, lockToken, attemptToken, expected) {
+            const result = filesystemStableProjectionDirectoryOperations.installManifestIfExpected(
+              directory,
+              identity,
+              lockToken,
+              attemptToken,
+              expected,
+            );
+            installed = result === "installed";
+            return result;
+          },
+          captureManifest(directory, identity) {
+            if (installed && !observationDenied) {
+              observationDenied = true;
+              writeFileSync(`${second.databasePath}-wal`, "post-install observation ambiguity", "utf8");
+              throw Object.assign(new Error("injected installed-manifest observation denial"), {
+                code: "EACCES",
+              });
+            }
+            return filesystemStableProjectionDirectoryOperations.captureManifest(directory, identity);
+          },
+        },
+      }),
+      (error: unknown) => error instanceof LifecycleError
+        && error.code === "MATERIALIZATION_CONFLICT"
+        && error.retryable
+        && error.recoveryActions.includes("reconcile-materialization"),
+    );
+    assert.equal(installed, true);
+    assert.equal(observationDenied, true);
+
+    const manifestPath = join(projectionDirectory, "projection-manifest.json");
+    const manifestGeneration = parseProjectionManifest(
+      JSON.parse(readFileSync(manifestPath, "utf8")),
+      BINDING,
+    ).generation;
+    const priorHolds = readdirSync(projectionDirectory).filter((name) => (
+      /^\.projection-manifest\.previous-[0-9a-f]{32}$/u.test(name)
+    ));
+    const priorHoldGenerations = priorHolds.map((name) => parseProjectionManifest(
+      JSON.parse(readFileSync(join(projectionDirectory, name), "utf8")),
+      BINDING,
+    ).generation);
+    const lockPath = join(projectionDirectory, PROJECTION_MANIFEST_PUBLICATION_LOCK_FILENAME);
+    const lockToken = existsSync(lockPath) ? readFileSync(lockPath, "utf8") : null;
+    let readerFailureCode: string | null = null;
+    try {
+      const lease = await coordinator.leasePublished(BINDING);
+      lease.close();
+    } catch (error) {
+      if (!(error instanceof LifecycleError)) throw error;
+      readerFailureCode = error.code;
+    }
+    const lockTokenAfterReader = existsSync(lockPath) ? readFileSync(lockPath, "utf8") : null;
+
+    assert.deepEqual({
+      manifestGeneration,
+      priorHoldGenerations,
+      lockRetained: typeof lockToken === "string" && /^[0-9a-f]{32}$/u.test(lockToken),
+      lockUnchangedAfterReader: lockTokenAfterReader === lockToken && lockToken !== null,
+      sidecarRetained: readFileSync(`${second.databasePath}-wal`, "utf8")
+        === "post-install observation ambiguity",
+      readerFailureCode,
+    }, {
+      manifestGeneration: 2,
+      priorHoldGenerations: [1],
+      lockRetained: true,
+      lockUnchangedAfterReader: true,
+      sidecarRetained: true,
+      readerFailureCode: "MATERIALIZATION_CONFLICT",
+    });
     source.close();
   });
 

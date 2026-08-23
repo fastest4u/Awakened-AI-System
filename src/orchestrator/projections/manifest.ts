@@ -723,6 +723,7 @@ export function publishProjectionManifest(
     const manifestBytes = serializeProjectionManifest(manifest);
     let replaced = false;
     let installed: StableProjectionManifestSnapshot | undefined;
+    let observedDifferentAuthority = false;
     try {
       new AtomicArtifactReplacer({
         durableBase: paths.directory,
@@ -769,9 +770,15 @@ export function publishProjectionManifest(
               directoryIdentity,
               directoryOperations,
             );
+            const installedHasExpectedBytes = snapshotHasBytes(observedInstalled, manifestBytes);
+            observedDifferentAuthority = observedInstalled.state === "present"
+              && (
+                !installedHasExpectedBytes
+                || publicationAttempt.state.authorityEpoch !== publicationAttempt.authorityEpoch
+              );
             if (
               !manifestPublicationAttemptIsCurrent(publicationAttempt)
-              || !snapshotHasBytes(observedInstalled, manifestBytes)
+              || !installedHasExpectedBytes
             ) return materializationConflict();
             installed = observedInstalled;
             options.faultInjector?.hit("after-manifest-replace-before-validation");
@@ -813,6 +820,9 @@ export function publishProjectionManifest(
           installed === undefined
           || !manifestPublicationAttemptIsCurrent(publicationAttempt)
         ) {
+          if (installed === undefined && !observedDifferentAuthority) {
+            return poisonManifestPublication(publicationAttempt);
+          }
           commitManifestPublication(paths, previous, publicationAttempt);
           throw error;
         }

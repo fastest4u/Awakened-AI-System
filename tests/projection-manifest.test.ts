@@ -7,6 +7,7 @@ import {
   mkdtempSync,
   mkdirSync,
   readFileSync,
+  readdirSync,
   renameSync,
   rmSync,
   symlinkSync,
@@ -519,6 +520,72 @@ describe("immutable projection manifest", () => {
       parseProjectionManifest(JSON.parse(readFileSync(target, "utf8")), BINDING).generation,
       3,
       "an observation of generation 3 cannot make the generation-2 attempt own generation 3",
+    );
+  });
+
+  it("retains recovery evidence when the installed-target observation reports no authority", () => {
+    const root = mkdtempSync(join(tmpdir(), "projection-manifest-missing-observation-"));
+    roots.push(root);
+    const first = parseProjectionManifest(manifest({
+      generation: 1,
+      databaseFile: "projections-1-1.sqlite",
+      terminalEventPosition: "16",
+    }), BINDING);
+    const second = parseProjectionManifest(manifest(), BINDING);
+    for (const candidate of [first, second]) {
+      writeFileSync(join(root, candidate.databaseFile), `generation ${candidate.generation}`, "utf8");
+    }
+    const target = publishProjectionManifest({
+      projectionDirectory: root,
+      manifest: first,
+      expectedBinding: BINDING,
+    });
+    let installed = false;
+    let reportedMissing = false;
+
+    assert.throws(
+      () => publishProjectionManifest({
+        projectionDirectory: root,
+        manifest: second,
+        expectedBinding: BINDING,
+      }, {
+        directoryOperations: {
+          ...filesystemStableProjectionDirectoryOperations,
+          installManifestIfExpected(directory, identity, lockToken, attemptToken, expected) {
+            const result = filesystemStableProjectionDirectoryOperations.installManifestIfExpected(
+              directory,
+              identity,
+              lockToken,
+              attemptToken,
+              expected,
+            );
+            installed = result === "installed";
+            return result;
+          },
+          captureManifest(directory, identity): StableProjectionManifestSnapshot {
+            if (installed && !reportedMissing) {
+              reportedMissing = true;
+              return Object.freeze({ state: "missing", directoryIdentity: identity });
+            }
+            return filesystemStableProjectionDirectoryOperations.captureManifest(directory, identity);
+          },
+        },
+      }),
+      (error: unknown) => error instanceof LifecycleError
+        && error.code === "MATERIALIZATION_CONFLICT"
+        && error.retryable,
+    );
+    assert.equal(installed, true);
+    assert.equal(reportedMissing, true);
+    assert.equal(publishedGeneration(target), 2);
+    const priorHolds = readdirSync(root).filter((name) => (
+      /^\.projection-manifest\.previous-[0-9a-f]{32}$/u.test(name)
+    ));
+    assert.equal(priorHolds.length, 1);
+    assert.equal(publishedGeneration(join(root, priorHolds[0] as string)), 1);
+    assert.match(
+      readFileSync(join(root, PROJECTION_MANIFEST_PUBLICATION_LOCK_FILENAME), "utf8"),
+      /^[0-9a-f]{32}$/u,
     );
   });
 
