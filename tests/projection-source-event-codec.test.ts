@@ -251,6 +251,27 @@ describe("projection source event codec", () => {
     assert.ok(traversedNodes <= 256, `traversed ${traversedNodes} payload nodes`);
   });
 
+  it("does not enumerate a very-wide in-memory payload beyond the declared node ceiling", () => {
+    const widePayload: Record<string, unknown> = {};
+    for (let index = 0; index <= 256 * 1_024; index += 1) {
+      widePayload[`key-${index}`] = index;
+    }
+    let ownKeysInvoked = false;
+    const measuredPayload = new Proxy(widePayload, {
+      ownKeys(target) {
+        ownKeysInvoked = true;
+        return Reflect.ownKeys(target);
+      },
+    });
+    const malformed = storedEvent("MemorySourceRecorded", memoryPayload(), {
+      payload: measuredPayload as JsonValue,
+      payloadJson: "{}",
+    });
+
+    assert.throws(() => decodeProjectionEvent(malformed), /INTEGRITY_FAILURE/u);
+    assert.equal(ownKeysInvoked, false);
+  });
+
   it("decodes governed memory and feedback sources with the complete private binding", () => {
     const source = decodeProjectionEvent(storedEvent("MemorySourceRecorded", memoryPayload()));
     assert.equal(source.kind, "projected");

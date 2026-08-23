@@ -28,6 +28,8 @@ const DECIMAL = /^(0|[1-9][0-9]*)$/u;
 const MAX_EVENT_PAYLOAD_BYTES = 256 * 1024;
 const MAX_EVENT_PAYLOAD_DEPTH = 128;
 const MAX_EVENT_PAYLOAD_NODES = 256 * 1024;
+// Every canonical object member needs at least two quotes, one colon, and one value byte.
+const MAX_CANONICAL_OBJECT_KEYS = Math.floor(MAX_EVENT_PAYLOAD_BYTES / 4);
 const MAX_SUMMARY_BYTES = 16 * 1024;
 
 const STORED_EVENT_KEYS = [
@@ -289,6 +291,8 @@ function assertBoundedJson(value: unknown): void {
       (isArray && prototype !== Array.prototype)
       || (!isArray && prototype !== Object.prototype && prototype !== null)
     ) return integrity();
+    // `current` is produced only by JSON.parse of an already byte-bounded canonical string.
+    // The JSON grammar therefore proves this allocation cannot exceed the bounds above.
     const keys = Reflect.ownKeys(current);
     const valueKeys = isArray ? keys.filter((key) => key !== "length") : keys;
     if (entry.depth >= MAX_EVENT_PAYLOAD_DEPTH && valueKeys.length > 0) return integrity();
@@ -309,6 +313,7 @@ function assertBoundedJson(value: unknown): void {
       }
       addBytes(2 + Math.max(0, Number(length) - 1));
     } else {
+      if (keys.length > MAX_CANONICAL_OBJECT_KEYS) return integrity();
       if (keys.some((key) => typeof key !== "string" || key === "__proto__")) return integrity();
       if (keys.length > MAX_EVENT_PAYLOAD_NODES - nodes) return integrity();
       addBytes(2 + Math.max(0, keys.length - 1));
@@ -385,10 +390,24 @@ function decodeStoredEventEnvelope(value: unknown): DecodedStoredEvent {
 }
 
 function validateKnownPayload(source: DecodedStoredEvent): DecodedStoredEvent {
+  // ECMAScript has no exact own-key cardinality primitive that does not first materialize
+  // the keys. Treat the event store's bounded canonical bytes as the payload representation;
+  // the redundant object is checked only as an opaque plain container and never enumerated.
   const payloadJson = boundedString(source.record.payloadJson, MAX_EVENT_PAYLOAD_BYTES, true);
-  assertBoundedJson(source.payload);
-  if (canonicalJson(source.payload) !== payloadJson) return integrity();
-  return source;
+  if (typeof source.payload !== "object" || source.payload === null || Array.isArray(source.payload)) {
+    return integrity();
+  }
+  const payloadPrototype = Object.getPrototypeOf(source.payload) as unknown;
+  if (payloadPrototype !== Object.prototype && payloadPrototype !== null) return integrity();
+  let payload: unknown;
+  try {
+    payload = JSON.parse(payloadJson) as unknown;
+  } catch {
+    return integrity();
+  }
+  assertBoundedJson(payload);
+  if (canonicalJson(payload) !== payloadJson) return integrity();
+  return Object.freeze({ ...source, payload });
 }
 
 function baseProjection(source: DecodedStoredEvent) {
