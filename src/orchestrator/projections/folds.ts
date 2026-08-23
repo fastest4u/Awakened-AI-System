@@ -1,0 +1,570 @@
+import type {
+  ArtifactProjection,
+  CanonicalItemProjection,
+  CheckpointProjectionEvent,
+  FollowUpProjection,
+  LexicalChunkProjection,
+  MemorySourceProjectionEvent,
+  ProjectBinding,
+  ProjectionEvent,
+  ProjectionFoldState,
+  ProjectionItemStatus,
+  RetrievalFeedbackProjection,
+  SessionCheckpointProjection,
+} from "./contracts.js";
+import { validateProjectionEvent } from "./source-event-codec.js";
+
+const MAX_ROWS_PER_PROJECTION = 100_000;
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
+const HASH = /^[0-9a-f]{64}$/u;
+
+const STATUS_TRANSITIONS: Readonly<Record<ProjectionItemStatus, readonly ProjectionItemStatus[]>> =
+  Object.freeze({
+    candidate: Object.freeze(["provisional", "verified", "conflicted", "retracted", "expired", "erased-evidence"] as const),
+    provisional: Object.freeze(["verified", "conflicted", "retracted", "expired", "erased-evidence"] as const),
+    verified: Object.freeze(["conflicted", "superseded", "retracted", "expired", "erased-evidence"] as const),
+    conflicted: Object.freeze(["verified", "retracted", "expired", "erased-evidence"] as const),
+    superseded: Object.freeze(["erased-evidence"] as const),
+    retracted: Object.freeze(["erased-evidence"] as const),
+    expired: Object.freeze(["erased-evidence"] as const),
+    "erased-evidence": Object.freeze([] as const),
+  });
+
+function integrity(): never {
+  throw new Error("INTEGRITY_FAILURE");
+}
+
+function exactRecord(value: unknown, expectedKeys: readonly string[]): Record<string, unknown> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return integrity();
+  const prototype = Object.getPrototypeOf(value) as unknown;
+  if (prototype !== Object.prototype && prototype !== null) return integrity();
+  const keys = Reflect.ownKeys(value);
+  if (
+    keys.length !== expectedKeys.length
+    || keys.some((key) => typeof key !== "string" || key === "__proto__" || !expectedKeys.includes(key))
+  ) return integrity();
+  const result: Record<string, unknown> = {};
+  for (const key of keys as string[]) {
+    const descriptor = Reflect.getOwnPropertyDescriptor(value, key);
+    if (descriptor === undefined || descriptor.enumerable !== true || !("value" in descriptor)) {
+      return integrity();
+    }
+    Object.defineProperty(result, key, {
+      value: descriptor.value,
+      enumerable: true,
+      configurable: true,
+      writable: true,
+    });
+  }
+  return result;
+}
+
+function strictArray(value: unknown): readonly unknown[] {
+  if (!Array.isArray(value) || Object.getPrototypeOf(value) !== Array.prototype) return integrity();
+  const descriptors = Object.getOwnPropertyDescriptors(value);
+  const length = Reflect.getOwnPropertyDescriptor(value, "length")?.value;
+  if (
+    !Number.isSafeInteger(length)
+    || Number(length) < 0
+    || Number(length) > MAX_ROWS_PER_PROJECTION
+  ) return integrity();
+  const keys = Reflect.ownKeys(value);
+  const expected = [
+    ...Array.from({ length: Number(length) }, (_, index) => String(index)),
+    "length",
+  ];
+  if (keys.length !== expected.length || keys.some((key, index) => key !== expected[index])) {
+    return integrity();
+  }
+  const result: unknown[] = [];
+  for (let index = 0; index < Number(length); index += 1) {
+    const descriptor = descriptors[String(index)];
+    if (descriptor === undefined || descriptor.enumerable !== true || !("value" in descriptor)) {
+      return integrity();
+    }
+    result.push(descriptor.value);
+  }
+  return result;
+}
+
+function assertString(value: unknown): asserts value is string {
+  if (typeof value !== "string") return integrity();
+}
+
+function assertUuid(value: unknown): asserts value is string {
+  if (typeof value !== "string" || !UUID.test(value)) return integrity();
+}
+
+function validateBinding(value: unknown): ProjectBinding {
+  const source = exactRecord(value, [
+    "projectId",
+    "vaultId",
+    "storeId",
+    "workspaceId",
+    "branchScopeId",
+    "branchRef",
+    "sessionId",
+  ]);
+  for (const key of ["projectId", "vaultId", "storeId", "workspaceId"] as const) {
+    if (typeof source[key] !== "string" || !HASH.test(source[key])) return integrity();
+  }
+  if (source.branchScopeId !== null) assertUuid(source.branchScopeId);
+  if (source.branchRef !== null) assertString(source.branchRef);
+  if (source.sessionId !== null) assertUuid(source.sessionId);
+  return Object.freeze({
+    projectId: source.projectId as ProjectBinding["projectId"],
+    vaultId: source.vaultId as ProjectBinding["vaultId"],
+    storeId: source.storeId as ProjectBinding["storeId"],
+    workspaceId: source.workspaceId as ProjectBinding["workspaceId"],
+    branchScopeId: source.branchScopeId as ProjectBinding["branchScopeId"],
+    branchRef: source.branchRef as string | null,
+    sessionId: source.sessionId as string | null,
+  });
+}
+
+function inspectRows(value: unknown, expectedKeys: readonly string[]): readonly Record<string, unknown>[] {
+  return Object.freeze(strictArray(value).map((row) => Object.freeze(exactRecord(row, expectedKeys))));
+}
+
+function assertPositiveBigint(value: unknown): asserts value is bigint {
+  if (typeof value !== "bigint" || value < 1n) return integrity();
+}
+
+function assertNumber(value: unknown, minimum: number, maximum: number): asserts value is number {
+  if (!Number.isSafeInteger(value) || Number(value) < minimum || Number(value) > maximum) {
+    return integrity();
+  }
+}
+
+function assertTimestamp(value: unknown): asserts value is string {
+  if (typeof value !== "string") return integrity();
+  const milliseconds = Date.parse(value);
+  if (!Number.isFinite(milliseconds) || new Date(milliseconds).toISOString() !== value) return integrity();
+}
+
+function assertOneOf<T extends string>(value: unknown, values: readonly T[]): asserts value is T {
+  if (typeof value !== "string" || !values.includes(value as T)) return integrity();
+}
+
+function assertProjectRows(
+  rows: readonly Record<string, unknown>[],
+  binding: ProjectBinding | null,
+  terminalEventPosition: bigint | null,
+): void {
+  if (rows.length > 0 && (binding === null || terminalEventPosition === null)) return integrity();
+  for (const row of rows) {
+    if (
+      row.projectId !== binding?.projectId
+      || typeof row.sourceEventPosition !== "bigint"
+      || row.sourceEventPosition < 1n
+      || (terminalEventPosition !== null && row.sourceEventPosition > terminalEventPosition)
+    ) return integrity();
+  }
+}
+
+function validateState(value: unknown): ProjectionFoldState {
+  const source = exactRecord(value, [
+    "schemaVersion",
+    "binding",
+    "terminalEventPosition",
+    "sessionCheckpoints",
+    "canonicalItems",
+    "followUps",
+    "artifacts",
+    "lexicalChunks",
+    "retrievalFeedback",
+  ]);
+  if (source.schemaVersion !== 1) return integrity();
+  const binding = source.binding === null ? null : validateBinding(source.binding);
+  if (
+    source.terminalEventPosition !== null
+    && (typeof source.terminalEventPosition !== "bigint" || source.terminalEventPosition < 1n)
+  ) return integrity();
+  const sessionCheckpoints = inspectRows(source.sessionCheckpoints, [
+    "projectId", "sessionId", "checkpointId", "checkpointVersion", "baseEventPosition",
+    "sourceEventPosition", "occurredAt", "taskSummary",
+  ]);
+  const canonicalItems = inspectRows(source.canonicalItems, [
+    "projectId", "itemId", "normalizedKey", "status", "confidence", "verificationMethod",
+    "validFrom", "validTo", "summary", "contentHash", "knownFromEventPosition",
+    "sourceEventPosition",
+  ]);
+  const followUps = inspectRows(source.followUps, [
+    "projectId", "sessionId", "followUpId", "status", "summary", "confidence",
+    "sourceEventPosition",
+  ]);
+  const artifacts = inspectRows(source.artifacts, [
+    "projectId", "sessionId", "artifactId", "path", "summary", "action", "contentHash",
+    "branchRef", "confidence", "sourceEventPosition",
+  ]);
+  const lexicalChunks = inspectRows(source.lexicalChunks, [
+    "projectId", "chunkId", "itemId", "sessionId", "section", "normalizedKey", "text",
+    "sourceEventPosition",
+  ]);
+  const retrievalFeedback = inspectRows(source.retrievalFeedback, [
+    "projectId", "feedbackId", "itemId", "outcome", "usefulness",
+    "sourceItemEventPosition", "sourceEventPosition",
+  ]);
+  const terminalEventPosition = source.terminalEventPosition as bigint | null;
+  for (const rows of [sessionCheckpoints, canonicalItems, followUps, artifacts, lexicalChunks, retrievalFeedback]) {
+    assertProjectRows(rows, binding, terminalEventPosition);
+  }
+  for (const row of sessionCheckpoints) {
+    assertUuid(row.sessionId);
+    assertUuid(row.checkpointId);
+    if (row.checkpointVersion !== 1 && row.checkpointVersion !== 2) return integrity();
+    assertPositiveBigint(row.baseEventPosition);
+    assertPositiveBigint(row.sourceEventPosition);
+    if (row.baseEventPosition > row.sourceEventPosition) return integrity();
+    assertTimestamp(row.occurredAt);
+    assertString(row.taskSummary);
+  }
+  for (const row of canonicalItems) {
+    assertUuid(row.itemId);
+    assertString(row.normalizedKey);
+    if (row.normalizedKey.normalize("NFKC").trim().toLowerCase() !== row.normalizedKey) return integrity();
+    assertOneOf(row.status, [
+      "candidate", "provisional", "verified", "conflicted", "superseded", "retracted",
+      "expired", "erased-evidence",
+    ] as const);
+    assertOneOf(row.confidence, ["high", "medium", "low", "guess"] as const);
+    assertString(row.verificationMethod);
+    assertTimestamp(row.validFrom);
+    if (row.validTo !== null) {
+      assertTimestamp(row.validTo);
+      if (Date.parse(row.validTo) <= Date.parse(row.validFrom)) return integrity();
+    }
+    assertString(row.summary);
+    if (typeof row.contentHash !== "string" || !HASH.test(row.contentHash)) return integrity();
+    assertPositiveBigint(row.knownFromEventPosition);
+    assertPositiveBigint(row.sourceEventPosition);
+    if (row.knownFromEventPosition > row.sourceEventPosition) return integrity();
+  }
+  for (const row of followUps) {
+    assertUuid(row.sessionId);
+    assertString(row.followUpId);
+    assertOneOf(row.status, ["open", "blocked"] as const);
+    assertString(row.summary);
+    assertOneOf(row.confidence, ["high", "medium", "low", "guess"] as const);
+  }
+  for (const row of artifacts) {
+    assertUuid(row.sessionId);
+    assertString(row.artifactId);
+    assertString(row.path);
+    if (row.summary !== null) assertString(row.summary);
+    assertString(row.action);
+    if (row.contentHash !== null && (typeof row.contentHash !== "string" || !HASH.test(row.contentHash))) {
+      return integrity();
+    }
+    if (row.branchRef !== null) assertString(row.branchRef);
+    assertOneOf(row.confidence, ["high", "medium", "low", "guess"] as const);
+  }
+  for (const row of lexicalChunks) {
+    assertString(row.chunkId);
+    if (row.itemId !== null) assertUuid(row.itemId);
+    if (row.sessionId !== null) assertUuid(row.sessionId);
+    assertString(row.section);
+    assertString(row.normalizedKey);
+    assertString(row.text);
+  }
+  for (const row of retrievalFeedback) {
+    assertUuid(row.feedbackId);
+    assertUuid(row.itemId);
+    assertOneOf(row.outcome, ["accepted", "dismissed", "corrected"] as const);
+    assertNumber(row.usefulness, 0, 10_000);
+    assertPositiveBigint(row.sourceItemEventPosition);
+    assertPositiveBigint(row.sourceEventPosition);
+    if (row.sourceItemEventPosition > row.sourceEventPosition) return integrity();
+  }
+  if (
+    binding === null
+    && (
+      terminalEventPosition !== null
+      || sessionCheckpoints.length > 0
+      || canonicalItems.length > 0
+      || followUps.length > 0
+      || artifacts.length > 0
+      || lexicalChunks.length > 0
+      || retrievalFeedback.length > 0
+    )
+  ) return integrity();
+  return Object.freeze({
+    schemaVersion: 1,
+    binding,
+    terminalEventPosition,
+    sessionCheckpoints: sessionCheckpoints as unknown as readonly SessionCheckpointProjection[],
+    canonicalItems: canonicalItems as unknown as readonly CanonicalItemProjection[],
+    followUps: followUps as unknown as readonly FollowUpProjection[],
+    artifacts: artifacts as unknown as readonly ArtifactProjection[],
+    lexicalChunks: lexicalChunks as unknown as readonly LexicalChunkProjection[],
+    retrievalFeedback: retrievalFeedback as unknown as readonly RetrievalFeedbackProjection[],
+  });
+}
+
+function sameProjectionScope(left: ProjectBinding, right: ProjectBinding): boolean {
+  return left.projectId === right.projectId
+    && left.vaultId === right.vaultId
+    && left.storeId === right.storeId
+    && left.workspaceId === right.workspaceId
+    && left.branchScopeId === right.branchScopeId
+    && left.branchRef === right.branchRef;
+}
+
+function frozenRows<T>(rows: readonly T[]): readonly T[] {
+  if (rows.length > MAX_ROWS_PER_PROJECTION) return integrity();
+  return Object.freeze(rows);
+}
+
+export function emptyProjectionFoldState(): ProjectionFoldState {
+  return Object.freeze({
+    schemaVersion: 1,
+    binding: null,
+    terminalEventPosition: null,
+    sessionCheckpoints: Object.freeze([]),
+    canonicalItems: Object.freeze([]),
+    followUps: Object.freeze([]),
+    artifacts: Object.freeze([]),
+    lexicalChunks: Object.freeze([]),
+    retrievalFeedback: Object.freeze([]),
+  });
+}
+
+function replaceBy<T>(
+  values: readonly T[],
+  predicate: (value: T) => boolean,
+  replacement: T,
+): readonly T[] {
+  const index = values.findIndex(predicate);
+  if (index < 0) return frozenRows([...values, replacement]);
+  const result = [...values];
+  result[index] = replacement;
+  return frozenRows(result);
+}
+
+function checkpointFollowUps(event: CheckpointProjectionEvent): readonly FollowUpProjection[] {
+  const sessionId = event.binding.sessionId;
+  if (sessionId === null) return integrity();
+  return frozenRows(event.workItems.flatMap((item) => {
+    if (item.kind !== "in-progress" && item.kind !== "blocker" && item.kind !== "next-action") {
+      return [];
+    }
+    return [Object.freeze({
+      projectId: event.binding.projectId,
+      sessionId,
+      followUpId: `${event.sourceEventId}/follow-up/${item.kind}/${item.ordinal}`,
+      status: item.kind === "blocker" ? "blocked" as const : "open" as const,
+      summary: item.summary,
+      confidence: item.confidence,
+      sourceEventPosition: event.sourceEventPosition,
+    })];
+  }));
+}
+
+function checkpointArtifacts(event: CheckpointProjectionEvent): readonly ArtifactProjection[] {
+  const sessionId = event.binding.sessionId;
+  if (sessionId === null) return integrity();
+  const files = event.files.map((file) => Object.freeze({
+    projectId: event.binding.projectId,
+    sessionId,
+    artifactId: `${event.sourceEventId}/file/${file.ordinal}`,
+    path: file.path,
+    summary: null,
+    action: file.action,
+    contentHash: file.contentHash,
+    branchRef: file.branchRef,
+    confidence: file.confidence,
+    sourceEventPosition: event.sourceEventPosition,
+  }));
+  const artifacts = event.artifacts.map((artifact) => Object.freeze({
+    projectId: event.binding.projectId,
+    sessionId,
+    artifactId: artifact.artifactId,
+    path: artifact.path,
+    summary: artifact.summary,
+    action: "referenced",
+    contentHash: artifact.contentHash,
+    branchRef: event.binding.branchRef,
+    confidence: artifact.confidence,
+    sourceEventPosition: event.sourceEventPosition,
+  }));
+  return frozenRows([...files, ...artifacts]);
+}
+
+function checkpointChunks(event: CheckpointProjectionEvent): readonly LexicalChunkProjection[] {
+  const sessionId = event.binding.sessionId;
+  if (sessionId === null) return integrity();
+  const summary = Object.freeze({
+    projectId: event.binding.projectId,
+    chunkId: `${event.sourceEventId}/task-summary`,
+    itemId: null,
+    sessionId,
+    section: "task-summary",
+    normalizedKey: `checkpoint:${event.checkpointId}:task-summary`,
+    text: event.taskSummary,
+    sourceEventPosition: event.sourceEventPosition,
+  });
+  return frozenRows([
+    summary,
+    ...event.workItems.map((item) => Object.freeze({
+      projectId: event.binding.projectId,
+      chunkId: `${event.sourceEventId}/${item.kind}/${item.ordinal}`,
+      itemId: null,
+      sessionId,
+      section: item.kind,
+      normalizedKey: `checkpoint:${event.checkpointId}:${item.kind}:${item.ordinal}`,
+      text: item.summary,
+      sourceEventPosition: event.sourceEventPosition,
+    })),
+  ]);
+}
+
+function foldCheckpoint(state: ProjectionFoldState, event: CheckpointProjectionEvent): ProjectionFoldState {
+  const sessionId = event.binding.sessionId;
+  if (sessionId === null) return integrity();
+  const checkpoint = Object.freeze({
+    projectId: event.binding.projectId,
+    sessionId,
+    checkpointId: event.checkpointId,
+    checkpointVersion: event.checkpointVersion,
+    baseEventPosition: event.baseEventPosition,
+    sourceEventPosition: event.sourceEventPosition,
+    occurredAt: event.occurredAt,
+    taskSummary: event.taskSummary,
+  });
+  return Object.freeze({
+    ...state,
+    sessionCheckpoints: replaceBy(
+      state.sessionCheckpoints,
+      (row) => row.sessionId === sessionId,
+      checkpoint,
+    ),
+    followUps: frozenRows([
+      ...state.followUps.filter((row) => row.sessionId !== sessionId),
+      ...checkpointFollowUps(event),
+    ]),
+    artifacts: frozenRows([
+      ...state.artifacts.filter((row) => row.sessionId !== sessionId),
+      ...checkpointArtifacts(event),
+    ]),
+    lexicalChunks: frozenRows([
+      ...state.lexicalChunks.filter((row) => row.sessionId !== sessionId || row.itemId !== null),
+      ...checkpointChunks(event),
+    ]),
+  });
+}
+
+function allowedInitialStatus(status: ProjectionItemStatus): boolean {
+  return status === "candidate"
+    || status === "provisional"
+    || status === "verified"
+    || status === "conflicted";
+}
+
+function foldMemorySource(
+  state: ProjectionFoldState,
+  event: MemorySourceProjectionEvent,
+): ProjectionFoldState {
+  const current = state.canonicalItems.find((item) => item.itemId === event.itemId);
+  if (current === undefined && !allowedInitialStatus(event.status)) return integrity();
+  if (current !== undefined) {
+    if (
+      current.normalizedKey !== event.normalizedKey
+      || current.validFrom !== event.validFrom
+      || (
+        current.status !== event.status
+        && !STATUS_TRANSITIONS[current.status].includes(event.status)
+      )
+    ) return integrity();
+  }
+  const item = Object.freeze({
+    projectId: event.binding.projectId,
+    itemId: event.itemId,
+    normalizedKey: event.normalizedKey,
+    status: event.status,
+    confidence: event.confidence,
+    verificationMethod: event.verificationMethod,
+    validFrom: event.validFrom,
+    validTo: event.validTo,
+    summary: event.summary,
+    contentHash: event.contentHash,
+    knownFromEventPosition: current?.knownFromEventPosition ?? event.sourceEventPosition,
+    sourceEventPosition: event.sourceEventPosition,
+  });
+  const chunk = Object.freeze({
+    projectId: event.binding.projectId,
+    chunkId: `item/${event.itemId}`,
+    itemId: event.itemId,
+    sessionId: event.binding.sessionId,
+    section: "canonical-item",
+    normalizedKey: event.normalizedKey,
+    text: event.summary,
+    sourceEventPosition: event.sourceEventPosition,
+  });
+  return Object.freeze({
+    ...state,
+    canonicalItems: replaceBy(state.canonicalItems, (row) => row.itemId === event.itemId, item),
+    lexicalChunks: replaceBy(
+      state.lexicalChunks,
+      (row) => row.itemId === event.itemId && row.section === "canonical-item",
+      chunk,
+    ),
+  });
+}
+
+function foldFeedback(
+  state: ProjectionFoldState,
+  event: Extract<ProjectionEvent, { readonly kind: "retrieval-feedback" }>,
+): ProjectionFoldState {
+  const item = state.canonicalItems.find((candidate) => candidate.itemId === event.itemId);
+  if (item === undefined || item.sourceEventPosition < event.sourceItemEventPosition) return integrity();
+  if (state.retrievalFeedback.some((feedback) => feedback.feedbackId === event.feedbackId)) {
+    return integrity();
+  }
+  const feedback = Object.freeze({
+    projectId: event.binding.projectId,
+    feedbackId: event.feedbackId,
+    itemId: event.itemId,
+    outcome: event.outcome,
+    usefulness: event.usefulness,
+    sourceItemEventPosition: event.sourceItemEventPosition,
+    sourceEventPosition: event.sourceEventPosition,
+  });
+  return Object.freeze({
+    ...state,
+    retrievalFeedback: frozenRows([...state.retrievalFeedback, feedback]),
+  });
+}
+
+function applyProjectionFold(state: ProjectionFoldState, event: ProjectionEvent): ProjectionFoldState {
+  const binding = state.binding ?? event.binding;
+  if (state.binding !== null && !sameProjectionScope(state.binding, event.binding)) return integrity();
+  if (
+    state.terminalEventPosition !== null
+    && event.sourceEventPosition <= state.terminalEventPosition
+  ) return integrity();
+
+  const scopedState = Object.freeze({ ...state, binding });
+  const applied = event.kind === "checkpoint"
+    ? foldCheckpoint(scopedState, event)
+    : event.kind === "memory-source"
+      ? foldMemorySource(scopedState, event)
+      : foldFeedback(scopedState, event);
+  return Object.freeze({
+    ...applied,
+    terminalEventPosition: event.sourceEventPosition,
+  });
+}
+
+export function foldProjectionEvent(
+  state: ProjectionFoldState,
+  event: ProjectionEvent,
+): ProjectionFoldState {
+  try {
+    const safeState = validateState(state);
+    const safeEvent = validateProjectionEvent(event);
+    return Object.freeze(applyProjectionFold(safeState, safeEvent));
+  } catch (error) {
+    if (error instanceof Error && error.message === "INTEGRITY_FAILURE") throw error;
+    return integrity();
+  }
+}

@@ -1,0 +1,281 @@
+import assert from "node:assert/strict";
+import { describe, it } from "node:test";
+
+import type { JsonValue, StoredEvent } from "../src/orchestrator/contracts/event.js";
+import type {
+  BranchScopeId,
+  ProjectId,
+  StoreId,
+  VaultId,
+  WorkspaceId,
+} from "../src/orchestrator/identity/contracts.js";
+import { decodeProjectionEvent } from "../src/orchestrator/projections/source-event-codec.js";
+import { canonicalJson } from "../src/orchestrator/serialization/canonical-json.js";
+
+const PROJECT_ID = "1".repeat(64) as ProjectId;
+const VAULT_ID = "2".repeat(64) as VaultId;
+const STORE_ID = "3".repeat(64) as StoreId;
+const WORKSPACE_ID = "4".repeat(64) as WorkspaceId;
+const BRANCH_SCOPE_ID = "00000000-0000-4000-8000-000000000041" as BranchScopeId;
+const SESSION_ID = "00000000-0000-4000-8000-000000000042";
+const CHECKPOINT_ID = "00000000-0000-4000-8000-000000000043";
+const ITEM_ID = "00000000-0000-4000-8000-000000000044";
+const FEEDBACK_ID = "00000000-0000-4000-8000-000000000045";
+const BRANCH_REF = "refs/heads/projection-contracts";
+const OCCURRED_AT = "2026-08-23T01:00:00.000Z";
+const RECORDED_AT = "2026-08-23T01:00:01.000Z";
+
+function binding(sessionId: string | null = SESSION_ID) {
+  return {
+    projectId: PROJECT_ID,
+    vaultId: VAULT_ID,
+    storeId: STORE_ID,
+    workspaceId: WORKSPACE_ID,
+    branchScopeId: BRANCH_SCOPE_ID,
+    branchRef: BRANCH_REF,
+    sessionId,
+  };
+}
+
+function storedEvent(
+  eventType: string,
+  payload: JsonValue,
+  overrides: Partial<StoredEvent> = {},
+): StoredEvent {
+  return {
+    globalPosition: 42n,
+    eventId: "00000000-0000-4000-8000-000000000046",
+    projectId: PROJECT_ID,
+    vaultId: VAULT_ID,
+    storeId: STORE_ID,
+    workspaceId: WORKSPACE_ID,
+    branchScopeId: BRANCH_SCOPE_ID,
+    branchRef: BRANCH_REF,
+    streamId: `session/${SESSION_ID}`,
+    streamType: "session",
+    streamVersion: 2n,
+    eventType,
+    eventSchemaVersion: 1,
+    sessionId: SESSION_ID,
+    parentSessionId: null,
+    actorRole: "primary",
+    agentId: "projection-test-agent",
+    clientInstanceId: "projection-test-client",
+    correlationId: "00000000-0000-4000-8000-000000000047",
+    causationId: null,
+    commandId: "00000000-0000-4000-8000-000000000048",
+    idempotencyKey: "projection-test/42",
+    commandEventIndex: 0,
+    occurredAt: OCCURRED_AT,
+    recordedAt: RECORDED_AT,
+    visibilityScope: "session",
+    confidence: "high",
+    verificationStatus: "verified",
+    sourceRefs: [],
+    evidenceRefs: [],
+    evidenceDigests: [],
+    payload,
+    payloadJson: canonicalJson(payload),
+    payloadHash: "5".repeat(64),
+    previousGlobalHash: "6".repeat(64),
+    eventHash: "7".repeat(64),
+    lifecycleIntentJson: null,
+    ...overrides,
+  };
+}
+
+function checkpointPayload(): JsonValue {
+  return {
+    checkpoint: {
+      checkpointVersion: 1,
+      checkpointId: CHECKPOINT_ID,
+      sessionId: SESSION_ID,
+      parentSessionId: null,
+      baseEventPosition: "41",
+      checkpointEventPosition: "42",
+      createdAt: OCCURRED_AT,
+      creatorAgentId: "projection-test-agent",
+      creatorClientInstanceId: "projection-test-client",
+      taskSummary: "Define deterministic projection contracts.",
+      completedItems: [],
+      inProgressItems: [{ summary: "Validate strict source decoding.", confidence: "high" }],
+      blockers: [],
+      nextActions: [{ summary: "Build an immutable generation.", confidence: "high" }],
+      decisions: [],
+      assumptions: [],
+      unresolvedConflicts: [],
+      filesTouched: [{
+        path: "src/orchestrator/projections/contracts.ts",
+        action: "created",
+        contentHash: "8".repeat(64),
+        branchRef: BRANCH_REF,
+        confidence: "high",
+      }],
+      artifactReferences: [],
+      sourceReferences: [],
+      commandResults: [],
+      testResults: [],
+      materialClaims: [],
+      sourceState: {
+        sourceStateScopeVersion: 1,
+        workspaceId: WORKSPACE_ID,
+        branchRef: BRANCH_REF,
+        headCommit: "9".repeat(40),
+        dirtyWorktreeFingerprint: "a".repeat(64),
+      },
+      childSummaries: [],
+      evidenceCoverage: {
+        captureMode: "coverage-only",
+        contentRetained: false,
+        highestContiguousOrdinal: null,
+        missingIntervals: [],
+      },
+    },
+    baseEventPosition: "41",
+    checkpointEventPosition: "42",
+  };
+}
+
+function memoryPayload(overrides: Record<string, unknown> = {}): JsonValue {
+  return {
+    sourceVersion: 1,
+    binding: binding(),
+    itemId: ITEM_ID,
+    normalizedKey: "decision:projection-boundary",
+    status: "provisional",
+    confidence: "high",
+    verificationMethod: "checkpoint",
+    validFrom: OCCURRED_AT,
+    validTo: null,
+    summary: "Projection publication follows the authoritative event commit.",
+    contentHash: "b".repeat(64),
+    ...overrides,
+  } as JsonValue;
+}
+
+function feedbackPayload(): JsonValue {
+  return {
+    feedbackVersion: 1,
+    binding: binding(),
+    feedbackId: FEEDBACK_ID,
+    itemId: ITEM_ID,
+    outcome: "accepted",
+    usefulness: 10_000,
+    sourceItemEventPosition: "42",
+  };
+}
+
+describe("projection source event codec", () => {
+  it("decodes a strict lifecycle checkpoint into only the allowed projection fields", () => {
+    const decoded = decodeProjectionEvent(storedEvent("SessionCheckpointRecorded", checkpointPayload()));
+    assert.equal(decoded.kind, "projected");
+    if (decoded.kind !== "projected") return;
+    assert.equal(decoded.event.kind, "checkpoint");
+    assert.equal(decoded.event.sourceEventPosition, 42n);
+    assert.deepEqual(decoded.event.binding, binding());
+    assert.equal("payload" in decoded.event, false);
+    assert.equal("commandResults" in decoded.event, false);
+    assert.equal("evidenceCoverage" in decoded.event, false);
+  });
+
+  it("reports an unknown type as intentionally unprojected without guessing its payload", () => {
+    const unknown = decodeProjectionEvent(storedEvent("UnrecognizedV99", { future: true }));
+    assert.deepEqual(unknown, {
+      kind: "unprojected",
+      eventPosition: 42n,
+      eventType: "UnrecognizedV99",
+    });
+  });
+
+  it("decodes governed memory and feedback sources with the complete private binding", () => {
+    const source = decodeProjectionEvent(storedEvent("MemorySourceRecorded", memoryPayload()));
+    assert.equal(source.kind, "projected");
+    if (source.kind !== "projected") return;
+    assert.equal(source.event.kind, "memory-source");
+    assert.deepEqual(source.event.binding, binding());
+
+    const feedbackEvent = storedEvent("RetrievalFeedbackRecorded", feedbackPayload(), {
+      globalPosition: 43n,
+      payloadJson: canonicalJson(feedbackPayload()),
+    });
+    const feedback = decodeProjectionEvent(feedbackEvent);
+    assert.equal(feedback.kind, "projected");
+    if (feedback.kind !== "projected") return;
+    assert.equal(feedback.event.kind, "retrieval-feedback");
+    assert.deepEqual(feedback.event.binding, binding());
+  });
+
+  it("rejects known future versions, malformed canonical payloads, and invalid positions or time", () => {
+    assert.throws(
+      () => decodeProjectionEvent(storedEvent("MemorySourceRecorded", memoryPayload(), {
+        eventSchemaVersion: 2,
+      })),
+      /INTEGRITY_FAILURE/u,
+    );
+    assert.throws(
+      () => decodeProjectionEvent(storedEvent("MemorySourceRecorded", memoryPayload(), {
+        payloadJson: `${canonicalJson(memoryPayload())} `,
+      })),
+      /INTEGRITY_FAILURE/u,
+    );
+    assert.throws(
+      () => decodeProjectionEvent(storedEvent("MemorySourceRecorded", memoryPayload(), {
+        globalPosition: 0n,
+      })),
+      /INTEGRITY_FAILURE/u,
+    );
+    assert.throws(
+      () => decodeProjectionEvent(storedEvent("MemorySourceRecorded", memoryPayload(), {
+        occurredAt: "2026-08-23",
+      })),
+      /INTEGRITY_FAILURE/u,
+    );
+  });
+
+  it("rejects non-normalized keys, invalid intervals, and a payload bound to another project", () => {
+    assert.throws(
+      () => decodeProjectionEvent(storedEvent(
+        "MemorySourceRecorded",
+        memoryPayload({ normalizedKey: " Decision:Projection-Boundary " }),
+      )),
+      /INTEGRITY_FAILURE/u,
+    );
+    assert.throws(
+      () => decodeProjectionEvent(storedEvent(
+        "MemorySourceRecorded",
+        memoryPayload({ validTo: OCCURRED_AT }),
+      )),
+      /INTEGRITY_FAILURE/u,
+    );
+    assert.throws(
+      () => decodeProjectionEvent(storedEvent("MemorySourceRecorded", memoryPayload({
+        binding: { ...binding(), projectId: "f".repeat(64) },
+      }))),
+      /INTEGRITY_FAILURE/u,
+    );
+  });
+
+  it("rejects prototype and accessor input without invoking accessors", () => {
+    const pollutedPayload = Object.assign(Object.create({ inherited: true }), memoryPayload());
+    const polluted = storedEvent("MemorySourceRecorded", memoryPayload(), {
+      payload: pollutedPayload,
+      payloadJson: canonicalJson(memoryPayload()),
+    });
+    assert.throws(() => decodeProjectionEvent(polluted), /INTEGRITY_FAILURE/u);
+
+    let invoked = false;
+    const accessor = storedEvent("MemorySourceRecorded", memoryPayload()) as unknown as Record<string, unknown>;
+    Object.defineProperty(accessor, "eventType", {
+      enumerable: true,
+      get() {
+        invoked = true;
+        throw new Error("accessor executed");
+      },
+    });
+    assert.throws(
+      () => decodeProjectionEvent(accessor as unknown as StoredEvent),
+      /INTEGRITY_FAILURE/u,
+    );
+    assert.equal(invoked, false);
+  });
+});
