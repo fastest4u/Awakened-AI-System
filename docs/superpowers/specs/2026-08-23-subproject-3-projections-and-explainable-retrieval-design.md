@@ -1,6 +1,6 @@
 # Subproject 3: Deterministic Projections and Explainable Retrieval Design
 
-**Status:** Proposed for review
+**Status:** Approved 2026-08-23; asynchronous publish boundary approved 2026-08-23
 **Program:** Full Event-Sourced Project Memory Orchestrator
 **Depends on:** Subprojects 1 and 2, including the Version 2-disabled release gate
 **Unblocks:** Subproject 4 privacy and governed memory, then Subproject 5 migration, parity, backup, and cutover
@@ -117,23 +117,34 @@ promotion and state-change producers. Subproject 5 owns legacy import
 producers. This keeps projection logic usable and testable without letting an
 indexer invent authoritative content.
 
-### 4.3 Projection writer and rebuilds
+### 4.3 Asynchronous projection publish and rebuilds
 
-Add one store-owned DerivedProjectionWriter composition point. For a committed
-event batch, the existing lifecycle projection writer runs first, followed by
-the derived writer in ascending global-position order, inside the same event
-transaction. Failure rolls back the event batch, lifecycle folds, derived
-projection delta, and dedup record together.
+The existing lifecycle projection writer continues to maintain only its
+authoritative, same-store lifecycle folds inside the event transaction. It must
+not attach, write, or coordinate a transaction with a derived projection file.
+The Version 2 projection database is an asynchronous derived read model.
 
-The live delta is only an acceleration mechanism. A full rebuild always begins
-at event position zero or a verified immutable projection snapshot, applies the
-same pure folds, and produces the same logical rows and core checksums. Replay
-never calls an embedding or reranking provider.
+After an authoritative event commit, a ProjectionBuildCoordinator observes the
+committed event store from the position after the last published manifest. It
+opens a bounded read snapshot, records that snapshot's terminal event position
+and hash, writes one new projection generation, validates identity, row counts,
+references, and core checksums, and atomically publishes the generation
+manifest. A process crash can leave an unpublished temporary generation but
+cannot change the authoritative event store; startup discards that temporary
+file and resumes from the last verified manifest.
 
-When a required projection position is not available, a reader either waits for
-the configured bounded consistency deadline or returns PROJECTION_LAG with the
-current and required event positions. It must not return an older generation
-while claiming a stronger consistency level.
+The live builder may copy an already verified generation as an input
+optimization, but every published generation is independently validated and
+fully replayable. A full rebuild always begins at event position zero or a
+verified immutable projection snapshot, applies the same pure folds, and
+produces the same logical rows and core checksums. Replay never calls an
+embedding or reranking provider.
+
+When a request requires a projection event position that has not been
+published, the reader signals the coordinator and waits only until its bounded
+consistency deadline. It then returns PROJECTION_LAG with the current and
+required positions. It must not return an older generation while claiming a
+stronger consistency level.
 
 ### 4.4 Core projections
 
