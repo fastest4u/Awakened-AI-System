@@ -1,18 +1,8 @@
-import {
-  closeSync,
-  fstatSync,
-  fsyncSync,
-  lstatSync,
-  openSync,
-  readFileSync,
-  realpathSync,
-  renameSync,
-  unlinkSync,
-} from "node:fs";
+import { createHash } from "node:crypto";
+import { fsyncSync, lstatSync, realpathSync, renameSync } from "node:fs";
 import { isAbsolute, join, normalize, relative, resolve, sep } from "node:path";
 
 import { AtomicArtifactReplacer } from "../materialization/atomic-artifact-replacer.js";
-import { fsyncDirectory } from "../identity/directory-durability.js";
 import { LifecycleError } from "../lifecycle/errors.js";
 import { canonicalJson } from "../serialization/canonical-json.js";
 import type { ProjectBinding } from "./contracts.js";
@@ -21,6 +11,8 @@ import {
   filesystemStableProjectionDirectoryOperations,
   sameProjectionDirectoryIdentity,
   type ProjectionDirectoryIdentity,
+  type StableProjectionDirectoryOperations,
+  type StableProjectionManifestSnapshot,
 } from "./stable-directory.js";
 
 const HASH = /^[0-9a-f]{64}$/u;
@@ -92,6 +84,7 @@ export interface ProjectionManifestPublicationFaultInjector {
 
 export interface PublishProjectionManifestOptions {
   readonly faultInjector?: ProjectionManifestPublicationFaultInjector;
+  readonly directoryOperations?: StableProjectionDirectoryOperations;
 }
 
 export interface ProjectionPathStat {
@@ -127,6 +120,10 @@ function pathInvalid(): never {
 
 function sidecarIntegrity(): never {
   throw new LifecycleError("INTEGRITY_FAILURE");
+}
+
+function materializationConflict(): never {
+  throw new LifecycleError("MATERIALIZATION_CONFLICT");
 }
 
 function errorCode(error: unknown): string | undefined {
@@ -366,88 +363,212 @@ export function verifyProjectionPublicationPaths(
   return Object.freeze({ directory, databasePath, targetPath, tempPath });
 }
 
-function previousManifestBytes(path: string): Uint8Array | null {
-  let handle: number | undefined;
-  try {
-    const before = lstatSync(path, { bigint: true });
-    if (
-      !before.isFile()
-      || before.isSymbolicLink()
-      || before.size < 0n
-      || before.size > BigInt(MAX_MANIFEST_BYTES)
-    ) {
-      throw new LifecycleError("MATERIALIZATION_CONFLICT");
-    }
-    handle = openSync(path, "r");
-    const opened = fstatSync(handle, { bigint: true });
-    if (
-      !opened.isFile()
-      || opened.dev !== before.dev
-      || opened.ino !== before.ino
-      || opened.size !== before.size
-    ) throw new LifecycleError("MATERIALIZATION_CONFLICT");
-    const bytes = readFileSync(handle);
-    const openedAfter = fstatSync(handle, { bigint: true });
-    const after = lstatSync(path, { bigint: true });
-    if (
-      bytes.byteLength !== Number(before.size)
-      || openedAfter.dev !== opened.dev
-      || openedAfter.ino !== opened.ino
-      || openedAfter.size !== opened.size
-      || after.dev !== before.dev
-      || after.ino !== before.ino
-      || after.size !== before.size
-      || !after.isFile()
-      || after.isSymbolicLink()
-    ) throw new LifecycleError("MATERIALIZATION_CONFLICT");
-    return Uint8Array.from(bytes);
-  } catch (error) {
-    if (errorCode(error) === "ENOENT") return null;
-    throw error;
-  } finally {
-    if (handle !== undefined) closeSync(handle);
-  }
-}
-
 function assertPinnedGeneration(
   directory: string,
   databaseFile: string,
   identity: ProjectionDirectoryIdentity,
+  operations: StableProjectionDirectoryOperations,
 ): void {
-  filesystemStableProjectionDirectoryOperations.assertGeneration(
-    directory,
-    databaseFile,
-    identity,
-  );
-  if (!sameProjectionDirectoryIdentity(
-    identity,
-    filesystemStableProjectionDirectoryOperations.capture(directory),
-  )) pathInvalid();
+  try {
+    operations.assertGeneration(directory, databaseFile, identity);
+    if (!sameProjectionDirectoryIdentity(identity, operations.capture(directory))) {
+      return materializationConflict();
+    }
+  } catch (error) {
+    if (error instanceof LifecycleError && error.code === "INTEGRITY_FAILURE") throw error;
+    if (error instanceof LifecycleError && error.code === "MATERIALIZATION_CONFLICT") throw error;
+    return materializationConflict();
+  }
 }
 
-function restorePreviousManifest(
+function dataRecord(value: unknown, keys: readonly string[]): Record<string, unknown> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return materializationConflict();
+  }
+  const actual = Reflect.ownKeys(value);
+  if (actual.length !== keys.length || actual.some(
+    (key) => typeof key !== "string" || !keys.includes(key),
+  )) return materializationConflict();
+  const result: Record<string, unknown> = {};
+  for (const key of keys) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (descriptor === undefined || !("value" in descriptor) || !descriptor.enumerable) {
+      return materializationConflict();
+    }
+    result[key] = descriptor.value;
+  }
+  return result;
+}
+
+function projectionDirectoryIdentity(value: unknown): ProjectionDirectoryIdentity {
+  const source = dataRecord(value, ["canonicalPath", "device", "inode"]);
+  if (
+    typeof source.canonicalPath !== "string"
+    || typeof source.device !== "string"
+    || !/^(?:0|[1-9][0-9]*)$/u.test(source.device)
+    || typeof source.inode !== "string"
+    || !/^(?:0|[1-9][0-9]*)$/u.test(source.inode)
+  ) return materializationConflict();
+  return Object.freeze({
+    canonicalPath: source.canonicalPath,
+    device: source.device,
+    inode: source.inode,
+  });
+}
+
+function validatedManifestSnapshot(
+  value: unknown,
+  expectedDirectoryIdentity: ProjectionDirectoryIdentity,
+): StableProjectionManifestSnapshot {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return materializationConflict();
+  }
+  const state = Object.getOwnPropertyDescriptor(value, "state");
+  if (state === undefined || !("value" in state)) return materializationConflict();
+  if (state.value === "missing") {
+    const source = dataRecord(value, ["state", "directoryIdentity"]);
+    const directoryIdentity = projectionDirectoryIdentity(source.directoryIdentity);
+    if (!sameProjectionDirectoryIdentity(directoryIdentity, expectedDirectoryIdentity)) {
+      return materializationConflict();
+    }
+    return Object.freeze({ state: "missing", directoryIdentity });
+  }
+  if (state.value !== "present") return materializationConflict();
+  const source = dataRecord(value, [
+    "state",
+    "directoryIdentity",
+    "fileIdentity",
+    "bytesBase64",
+  ]);
+  const directoryIdentity = projectionDirectoryIdentity(source.directoryIdentity);
+  if (!sameProjectionDirectoryIdentity(directoryIdentity, expectedDirectoryIdentity)) {
+    return materializationConflict();
+  }
+  const fileIdentity = dataRecord(source.fileIdentity, ["device", "inode", "size", "sha256"]);
+  for (const key of ["device", "inode", "size"] as const) {
+    if (typeof fileIdentity[key] !== "string" || !/^(?:0|[1-9][0-9]*)$/u.test(fileIdentity[key])) {
+      return materializationConflict();
+    }
+  }
+  if (
+    BigInt(fileIdentity.size as string) > BigInt(MAX_MANIFEST_BYTES)
+    || typeof fileIdentity.sha256 !== "string"
+    || !HASH.test(fileIdentity.sha256)
+    || typeof source.bytesBase64 !== "string"
+  ) return materializationConflict();
+  const bytes = Buffer.from(source.bytesBase64, "base64");
+  if (
+    bytes.toString("base64") !== source.bytesBase64
+    || BigInt(bytes.byteLength) !== BigInt(fileIdentity.size as string)
+    || createHash("sha256").update(bytes).digest("hex") !== fileIdentity.sha256
+  ) return materializationConflict();
+  return Object.freeze({
+    state: "present",
+    directoryIdentity,
+    fileIdentity: Object.freeze({
+      device: fileIdentity.device as string,
+      inode: fileIdentity.inode as string,
+      size: fileIdentity.size as string,
+      sha256: fileIdentity.sha256,
+    }),
+    bytesBase64: source.bytesBase64,
+  });
+}
+
+function captureManifestSnapshot(
+  directory: string,
+  directoryIdentity: ProjectionDirectoryIdentity,
+  operations: StableProjectionDirectoryOperations,
+): StableProjectionManifestSnapshot {
+  try {
+    return validatedManifestSnapshot(
+      operations.captureManifest(directory, directoryIdentity),
+      directoryIdentity,
+    );
+  } catch (error) {
+    if (error instanceof LifecycleError && error.code === "MATERIALIZATION_CONFLICT") throw error;
+    return materializationConflict();
+  }
+}
+
+function sameManifestSnapshot(
+  left: StableProjectionManifestSnapshot,
+  right: StableProjectionManifestSnapshot,
+): boolean {
+  if (
+    left.state !== right.state
+    || !sameProjectionDirectoryIdentity(left.directoryIdentity, right.directoryIdentity)
+  ) return false;
+  if (left.state === "missing" || right.state === "missing") return true;
+  return left.fileIdentity.device === right.fileIdentity.device
+    && left.fileIdentity.inode === right.fileIdentity.inode
+    && left.fileIdentity.size === right.fileIdentity.size
+    && left.fileIdentity.sha256 === right.fileIdentity.sha256
+    && left.bytesBase64 === right.bytesBase64;
+}
+
+function snapshotHasBytes(
+  snapshot: StableProjectionManifestSnapshot,
+  bytes: Uint8Array,
+): boolean {
+  if (snapshot.state !== "present") return false;
+  const expected = Buffer.from(bytes);
+  return snapshot.bytesBase64 === expected.toString("base64")
+    && snapshot.fileIdentity.size === String(expected.byteLength)
+    && snapshot.fileIdentity.sha256 === createHash("sha256").update(expected).digest("hex");
+}
+
+function restorePreviousManifestIfOwned(
   paths: VerifiedProjectionPublicationPaths,
-  previousBytes: Uint8Array | null,
-): void {
-  if (previousBytes !== null) {
-    new AtomicArtifactReplacer({ durableBase: paths.directory }).replace({
+  directoryIdentity: ProjectionDirectoryIdentity,
+  previous: StableProjectionManifestSnapshot,
+  installed: StableProjectionManifestSnapshot,
+  operations: StableProjectionDirectoryOperations,
+): "restored" | "removed" | "superseded" {
+  const current = captureManifestSnapshot(paths.directory, directoryIdentity, operations);
+  if (!sameManifestSnapshot(current, installed)) return "superseded";
+  if (previous.state === "missing") {
+    if (installed.state !== "present") return materializationConflict();
+    let result: "removed" | "changed" | "missing";
+    try {
+      result = operations.removeManifestIfMatches(paths.directory, directoryIdentity, installed);
+    } catch {
+      return materializationConflict();
+    }
+    return result === "removed" ? "removed" : "superseded";
+  }
+  let superseded = false;
+  try {
+    new AtomicArtifactReplacer({
+      durableBase: paths.directory,
+      operations: {
+        rename(tempPath, targetPath): void {
+          const before = captureManifestSnapshot(paths.directory, directoryIdentity, operations);
+          if (!sameManifestSnapshot(before, installed)) {
+            superseded = true;
+            return materializationConflict();
+          }
+          renameSync(tempPath, targetPath);
+          const restored = captureManifestSnapshot(paths.directory, directoryIdentity, operations);
+          if (!snapshotHasBytes(restored, Buffer.from(previous.bytesBase64, "base64"))) {
+            return materializationConflict();
+          }
+        },
+      },
+    }).replace({
       targetPath: paths.targetPath,
       tempPath: paths.tempPath,
-      bytes: previousBytes,
+      bytes: Buffer.from(previous.bytesBase64, "base64"),
     });
-    return;
-  }
-  try {
-    const target = lstatSync(paths.targetPath);
-    if (!target.isFile() || target.isSymbolicLink()) {
-      throw new LifecycleError("MATERIALIZATION_CONFLICT");
-    }
-    unlinkSync(paths.targetPath);
-    fsyncDirectory(paths.directory);
   } catch (error) {
-    if (errorCode(error) === "ENOENT") return;
+    if (superseded) return "superseded";
     throw error;
   }
+  const restored = captureManifestSnapshot(paths.directory, directoryIdentity, operations);
+  if (!snapshotHasBytes(restored, Buffer.from(previous.bytesBase64, "base64"))) {
+    return materializationConflict();
+  }
+  return "restored";
 }
 
 export function publishProjectionManifest(
@@ -463,9 +584,18 @@ export function publishProjectionManifest(
     source.projectionDirectory as string,
     manifest.databaseFile,
   );
-  const directoryIdentity = filesystemStableProjectionDirectoryOperations.capture(paths.directory);
-  const previousBytes = previousManifestBytes(paths.targetPath);
+  const directoryOperations = options.directoryOperations
+    ?? filesystemStableProjectionDirectoryOperations;
+  let directoryIdentity: ProjectionDirectoryIdentity;
+  try {
+    directoryIdentity = directoryOperations.capture(paths.directory);
+  } catch {
+    return materializationConflict();
+  }
+  const previous = captureManifestSnapshot(paths.directory, directoryIdentity, directoryOperations);
+  const manifestBytes = serializeProjectionManifest(manifest);
   let replaced = false;
+  let installed: StableProjectionManifestSnapshot | undefined;
   try {
     new AtomicArtifactReplacer({
       durableBase: paths.directory,
@@ -475,25 +605,66 @@ export function publishProjectionManifest(
           options.faultInjector?.hit("after-manifest-temp-fsync-before-replace");
         },
         rename(tempPath, targetPath): void {
-          assertPinnedGeneration(paths.directory, manifest.databaseFile, directoryIdentity);
+          assertPinnedGeneration(
+            paths.directory,
+            manifest.databaseFile,
+            directoryIdentity,
+            directoryOperations,
+          );
+          const current = captureManifestSnapshot(
+            paths.directory,
+            directoryIdentity,
+            directoryOperations,
+          );
+          if (!sameManifestSnapshot(current, previous)) return materializationConflict();
           renameSync(tempPath, targetPath);
           replaced = true;
+          installed = captureManifestSnapshot(
+            paths.directory,
+            directoryIdentity,
+            directoryOperations,
+          );
+          if (!snapshotHasBytes(installed, manifestBytes)) return materializationConflict();
           options.faultInjector?.hit("after-manifest-replace-before-validation");
-          assertPinnedGeneration(paths.directory, manifest.databaseFile, directoryIdentity);
+          assertPinnedGeneration(
+            paths.directory,
+            manifest.databaseFile,
+            directoryIdentity,
+            directoryOperations,
+          );
         },
       },
     }).replace({
       targetPath: paths.targetPath,
       tempPath: paths.tempPath,
-      bytes: serializeProjectionManifest(manifest),
+      bytes: manifestBytes,
     });
-    assertPinnedGeneration(paths.directory, manifest.databaseFile, directoryIdentity);
+    assertPinnedGeneration(
+      paths.directory,
+      manifest.databaseFile,
+      directoryIdentity,
+      directoryOperations,
+    );
+    if (
+      installed === undefined
+      || !sameManifestSnapshot(
+        captureManifestSnapshot(paths.directory, directoryIdentity, directoryOperations),
+        installed,
+      )
+    ) return materializationConflict();
   } catch (error) {
     if (replaced) {
+      if (installed === undefined) return materializationConflict();
       try {
-        restorePreviousManifest(paths, previousBytes);
+        restorePreviousManifestIfOwned(
+          paths,
+          directoryIdentity,
+          previous,
+          installed,
+          directoryOperations,
+        );
       } catch {
-        return sidecarIntegrity();
+        return materializationConflict();
       }
     }
     throw error;

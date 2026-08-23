@@ -1,10 +1,12 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import {
   existsSync,
   lstatSync,
   mkdtempSync,
   mkdirSync,
   readFileSync,
+  renameSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -21,6 +23,10 @@ import {
   serializeProjectionManifest,
   verifyProjectionPublicationPaths,
 } from "../src/orchestrator/projections/manifest.js";
+import {
+  filesystemStableProjectionDirectoryOperations,
+  type StableProjectionManifestSnapshot,
+} from "../src/orchestrator/projections/stable-directory.js";
 
 const BINDING: ProjectBinding = Object.freeze({
   projectId: "1".repeat(64) as ProjectBinding["projectId"],
@@ -328,6 +334,306 @@ describe("immutable projection manifest", () => {
       );
     });
   }
+
+  it("does not roll an outer failure over a later successful nested publication", () => {
+    const root = mkdtempSync(join(tmpdir(), "projection-manifest-nested-publish-"));
+    roots.push(root);
+    const first = parseProjectionManifest(manifest({
+      generation: 1,
+      databaseFile: "projections-1-1.sqlite",
+      terminalEventPosition: "16",
+    }), BINDING);
+    const second = parseProjectionManifest(manifest(), BINDING);
+    const third = parseProjectionManifest(manifest({
+      generation: 3,
+      databaseFile: "projections-1-3.sqlite",
+      terminalEventPosition: "18",
+    }), BINDING);
+    for (const candidate of [first, second, third]) {
+      writeFileSync(join(root, candidate.databaseFile), `generation ${candidate.generation}`, "utf8");
+    }
+    const target = publishProjectionManifest({
+      projectionDirectory: root,
+      manifest: first,
+      expectedBinding: BINDING,
+    });
+    let nestedPublished = false;
+
+    assert.throws(
+      () => publishProjectionManifest({
+        projectionDirectory: root,
+        manifest: second,
+        expectedBinding: BINDING,
+      }, {
+        faultInjector: {
+          hit(boundary): void {
+            if (boundary !== "after-manifest-replace-before-validation" || nestedPublished) return;
+            nestedPublished = true;
+            publishProjectionManifest({
+              projectionDirectory: root,
+              manifest: third,
+              expectedBinding: BINDING,
+            });
+            assert.equal(
+              parseProjectionManifest(JSON.parse(readFileSync(target, "utf8")), BINDING).generation,
+              3,
+            );
+            writeFileSync(`${join(root, second.databaseFile)}-wal`, "outer sidecar failure", "utf8");
+          },
+        },
+      }),
+      (error: unknown) => error instanceof LifecycleError
+        && error.code === "INTEGRITY_FAILURE",
+    );
+    assert.equal(nestedPublished, true);
+    assert.equal(
+      parseProjectionManifest(JSON.parse(readFileSync(target, "utf8")), BINDING).generation,
+      3,
+      "outer rollback must not overwrite the later successful publication",
+    );
+  });
+
+  it("does not replace a manifest source changed after prior capture", () => {
+    const root = mkdtempSync(join(tmpdir(), "projection-manifest-source-cas-"));
+    roots.push(root);
+    const first = parseProjectionManifest(manifest({
+      generation: 1,
+      databaseFile: "projections-1-1.sqlite",
+      terminalEventPosition: "16",
+    }), BINDING);
+    const second = parseProjectionManifest(manifest(), BINDING);
+    const third = parseProjectionManifest(manifest({
+      generation: 3,
+      databaseFile: "projections-1-3.sqlite",
+      terminalEventPosition: "18",
+    }), BINDING);
+    for (const candidate of [first, second, third]) {
+      writeFileSync(join(root, candidate.databaseFile), `generation ${candidate.generation}`, "utf8");
+    }
+    const target = publishProjectionManifest({
+      projectionDirectory: root,
+      manifest: first,
+      expectedBinding: BINDING,
+    });
+    const concurrent = join(root, "concurrent-manifest.json");
+    writeFileSync(concurrent, serializeProjectionManifest(third));
+    let replacedByConcurrent = false;
+
+    assert.throws(
+      () => publishProjectionManifest({
+        projectionDirectory: root,
+        manifest: second,
+        expectedBinding: BINDING,
+      }, {
+        faultInjector: {
+          hit(boundary): void {
+            if (boundary !== "after-manifest-temp-fsync-before-replace" || replacedByConcurrent) return;
+            replacedByConcurrent = true;
+            renameSync(concurrent, target);
+          },
+        },
+      }),
+      (error: unknown) => error instanceof LifecycleError
+        && error.code === "MATERIALIZATION_CONFLICT"
+        && error.retryable
+        && error.recoveryActions.includes("reconcile-materialization"),
+    );
+    assert.equal(replacedByConcurrent, true);
+    assert.equal(
+      parseProjectionManifest(JSON.parse(readFileSync(target, "utf8")), BINDING).generation,
+      3,
+    );
+  });
+
+  it("removes only its own failed first publication when no prior manifest exists", () => {
+    const root = mkdtempSync(join(tmpdir(), "projection-manifest-first-rollback-"));
+    roots.push(root);
+    const second = parseProjectionManifest(manifest(), BINDING);
+    const databasePath = join(root, second.databaseFile);
+    const target = join(root, "projection-manifest.json");
+    writeFileSync(databasePath, "generation 2", "utf8");
+
+    assert.throws(
+      () => publishProjectionManifest({
+        projectionDirectory: root,
+        manifest: second,
+        expectedBinding: BINDING,
+      }, {
+        faultInjector: {
+          hit(boundary): void {
+            if (boundary === "after-manifest-replace-before-validation") {
+              writeFileSync(`${databasePath}-wal`, "first-publication sidecar", "utf8");
+            }
+          },
+        },
+      }),
+      (error: unknown) => error instanceof LifecycleError
+        && error.code === "INTEGRITY_FAILURE",
+    );
+    assert.equal(existsSync(target), false);
+  });
+
+  it("does not source rollback bytes through an A-to-B-to-A directory swap", () => {
+    const root = mkdtempSync(join(tmpdir(), "projection-manifest-capture-swap-"));
+    roots.push(root);
+    const projectionDirectory = join(root, "projections");
+    const originalDirectory = join(root, "original-projections");
+    const alternateDirectory = join(root, "alternate-projections");
+    mkdirSync(projectionDirectory);
+    mkdirSync(alternateDirectory);
+    const first = parseProjectionManifest(manifest({
+      generation: 1,
+      databaseFile: "projections-1-1.sqlite",
+      terminalEventPosition: "16",
+    }), BINDING);
+    const second = parseProjectionManifest(manifest(), BINDING);
+    const third = parseProjectionManifest(manifest({
+      generation: 3,
+      databaseFile: "projections-1-3.sqlite",
+      terminalEventPosition: "18",
+    }), BINDING);
+    writeFileSync(join(projectionDirectory, first.databaseFile), "generation 1", "utf8");
+    writeFileSync(join(projectionDirectory, second.databaseFile), "generation 2", "utf8");
+    writeFileSync(join(alternateDirectory, third.databaseFile), "generation 3", "utf8");
+    publishProjectionManifest({
+      projectionDirectory,
+      manifest: first,
+      expectedBinding: BINDING,
+    });
+    publishProjectionManifest({
+      projectionDirectory: alternateDirectory,
+      manifest: third,
+      expectedBinding: BINDING,
+    });
+    let swapped = false;
+    const captureManifest = (): StableProjectionManifestSnapshot => {
+      renameSync(projectionDirectory, originalDirectory);
+      renameSync(alternateDirectory, projectionDirectory);
+      swapped = true;
+      try {
+        const directoryIdentity = filesystemStableProjectionDirectoryOperations.capture(
+          projectionDirectory,
+        );
+        const target = join(projectionDirectory, "projection-manifest.json");
+        const stat = lstatSync(target, { bigint: true });
+        const bytes = readFileSync(target);
+        return Object.freeze({
+          state: "present",
+          directoryIdentity,
+          fileIdentity: Object.freeze({
+            device: stat.dev.toString(),
+            inode: stat.ino.toString(),
+            size: stat.size.toString(),
+            sha256: createHash("sha256").update(bytes).digest("hex"),
+          }),
+          bytesBase64: bytes.toString("base64"),
+        });
+      } finally {
+        renameSync(projectionDirectory, alternateDirectory);
+        renameSync(originalDirectory, projectionDirectory);
+      }
+    };
+
+    assert.throws(
+      () => publishProjectionManifest({
+        projectionDirectory,
+        manifest: second,
+        expectedBinding: BINDING,
+      }, {
+        directoryOperations: {
+          ...filesystemStableProjectionDirectoryOperations,
+          captureManifest,
+        },
+      }),
+      (error: unknown) => error instanceof LifecycleError
+        && error.code === "MATERIALIZATION_CONFLICT",
+    );
+    assert.equal(swapped, true);
+    assert.equal(
+      parseProjectionManifest(
+        JSON.parse(readFileSync(join(projectionDirectory, "projection-manifest.json"), "utf8")),
+        BINDING,
+      ).generation,
+      1,
+    );
+    assert.equal(
+      parseProjectionManifest(
+        JSON.parse(readFileSync(join(alternateDirectory, "projection-manifest.json"), "utf8")),
+        BINDING,
+      ).generation,
+      3,
+    );
+  });
+
+  it("does not roll back through a replaced projection directory", () => {
+    const root = mkdtempSync(join(tmpdir(), "projection-manifest-rollback-directory-"));
+    roots.push(root);
+    const projectionDirectory = join(root, "projections");
+    const originalDirectory = join(root, "original-projections");
+    const alternateDirectory = join(root, "alternate-projections");
+    mkdirSync(projectionDirectory);
+    mkdirSync(alternateDirectory);
+    const first = parseProjectionManifest(manifest({
+      generation: 1,
+      databaseFile: "projections-1-1.sqlite",
+      terminalEventPosition: "16",
+    }), BINDING);
+    const second = parseProjectionManifest(manifest(), BINDING);
+    const third = parseProjectionManifest(manifest({
+      generation: 3,
+      databaseFile: "projections-1-3.sqlite",
+      terminalEventPosition: "18",
+    }), BINDING);
+    writeFileSync(join(projectionDirectory, first.databaseFile), "generation 1", "utf8");
+    writeFileSync(join(projectionDirectory, second.databaseFile), "generation 2", "utf8");
+    writeFileSync(join(alternateDirectory, third.databaseFile), "generation 3", "utf8");
+    publishProjectionManifest({
+      projectionDirectory,
+      manifest: first,
+      expectedBinding: BINDING,
+    });
+    publishProjectionManifest({
+      projectionDirectory: alternateDirectory,
+      manifest: third,
+      expectedBinding: BINDING,
+    });
+    let swapped = false;
+    try {
+      assert.throws(
+        () => publishProjectionManifest({
+          projectionDirectory,
+          manifest: second,
+          expectedBinding: BINDING,
+        }, {
+          faultInjector: {
+            hit(boundary): void {
+              if (boundary !== "after-manifest-replace-before-validation" || swapped) return;
+              renameSync(projectionDirectory, originalDirectory);
+              renameSync(alternateDirectory, projectionDirectory);
+              swapped = true;
+            },
+          },
+        }),
+        (error: unknown) => error instanceof LifecycleError
+          && error.code === "MATERIALIZATION_CONFLICT"
+          && error.retryable,
+      );
+      assert.equal(swapped, true);
+      assert.equal(
+        parseProjectionManifest(
+          JSON.parse(readFileSync(join(projectionDirectory, "projection-manifest.json"), "utf8")),
+          BINDING,
+        ).generation,
+        3,
+        "rollback must not overwrite authority in the replacement directory",
+      );
+    } finally {
+      if (swapped) {
+        renameSync(projectionDirectory, alternateDirectory);
+        renameSync(originalDirectory, projectionDirectory);
+      }
+    }
+  });
 
   it("treats a symlink-shaped exact sidecar sibling as an integrity failure", () => {
     const root = mkdtempSync(join(tmpdir(), "projection-manifest-sidecar-shape-"));
