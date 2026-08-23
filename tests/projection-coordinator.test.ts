@@ -45,6 +45,9 @@ import {
   type ProjectionPathInspection,
 } from "../src/orchestrator/projections/manifest.js";
 import { ProjectionReaderLeaseRegistry } from "../src/orchestrator/projections/reader-lease.js";
+import {
+  PROJECTION_MANIFEST_PUBLICATION_LOCK_FILENAME,
+} from "../src/orchestrator/projections/stable-directory.js";
 import { PROJECT_MEMORY_APPLICATION_ID } from "../src/orchestrator/runtime/runtime-capabilities.js";
 import { canonicalJson } from "../src/orchestrator/serialization/canonical-json.js";
 import { NodeSqliteDriver } from "../src/orchestrator/storage/node-sqlite-driver.js";
@@ -401,6 +404,33 @@ describe("projection build coordinator", () => {
       (error: unknown) => error instanceof LifecycleError
         && error.code === "INTEGRITY_FAILURE",
     );
+    source.close();
+  });
+
+  it("fails closed while a manifest publication lock is present", async () => {
+    const root = mkdtempSync(join(tmpdir(), "projection-load-publication-lock-"));
+    roots.push(root);
+    const sourcePath = join(root, "events.sqlite");
+    const projectionDirectory = join(root, "projections");
+    const source = sourceDatabase(sourcePath);
+    append(source, 1);
+    const driver = new NodeSqliteDriver({ DatabaseSync });
+    const coordinator = new DefaultProjectionBuildCoordinator({
+      projectionDirectory,
+      eventReader: new SqliteProjectionEventReader({ driver, eventStorePath: sourcePath }),
+      builder: new ImmutableProjectionBuilder({ driver, projectionDirectory, now: () => NOW }),
+    });
+    await coordinator.ensurePublished(BINDING, 1n, 2_000);
+    const lockPath = join(projectionDirectory, PROJECTION_MANIFEST_PUBLICATION_LOCK_FILENAME);
+    writeFileSync(lockPath, "foreign publication in progress", "utf8");
+
+    await assert.rejects(
+      () => coordinator.leasePublished(BINDING),
+      (error: unknown) => error instanceof LifecycleError
+        && error.code === "MATERIALIZATION_CONFLICT"
+        && error.retryable,
+    );
+    assert.equal(readFileSync(lockPath, "utf8"), "foreign publication in progress");
     source.close();
   });
 

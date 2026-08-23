@@ -1,5 +1,5 @@
-import { createHash } from "node:crypto";
-import { fsyncSync, lstatSync, realpathSync, renameSync } from "node:fs";
+import { createHash, randomBytes } from "node:crypto";
+import { fsyncSync, lstatSync, realpathSync } from "node:fs";
 import { isAbsolute, join, normalize, relative, resolve, sep } from "node:path";
 
 import { AtomicArtifactReplacer } from "../materialization/atomic-artifact-replacer.js";
@@ -518,50 +518,135 @@ function snapshotHasBytes(
     && snapshot.fileIdentity.sha256 === createHash("sha256").update(expected).digest("hex");
 }
 
-interface ManifestPublicationEpochState {
+interface ManifestPublicationLockState {
   activeAttempts: number;
-  epoch: bigint;
+  authorityEpoch: bigint;
+  readonly directory: string;
+  readonly directoryIdentity: ProjectionDirectoryIdentity;
+  readonly lockToken: string;
+  readonly lockOperations: StableProjectionDirectoryOperations;
+  poisoned: boolean;
 }
 
 interface ManifestPublicationAttempt {
   readonly key: string;
-  readonly state: ManifestPublicationEpochState;
-  readonly epoch: bigint;
+  readonly state: ManifestPublicationLockState;
+  readonly authorityEpoch: bigint;
+  readonly transactionToken: string;
 }
 
-const manifestPublicationEpochs = new Map<string, ManifestPublicationEpochState>();
+const manifestPublicationLocks = new Map<string, ManifestPublicationLockState>();
 
-// Publication is synchronous, but injected boundaries can re-enter it. A newer
-// same-directory attempt fences the outer attempt from claiming or restoring a
-// target. Cross-process writers remain governed by the filesystem snapshot CAS.
+function publicationToken(): string {
+  return randomBytes(16).toString("hex");
+}
+
+// On a local filesystem that honors exclusive creation, the lock serializes
+// cooperative processes and workers. It is not a manifest CAS and does not
+// constrain direct pathname writers; the stable mutation helper separately
+// uses move-aside plus link-if-absent so those writers are never overwritten.
+// Same-stack publication re-enters, and only a successful authority change
+// fences older rollback ownership.
 function beginManifestPublicationAttempt(
+  directory: string,
   identity: ProjectionDirectoryIdentity,
+  operations: StableProjectionDirectoryOperations,
 ): ManifestPublicationAttempt {
   const key = JSON.stringify([
     normalizedPath(identity.canonicalPath),
     identity.device,
     identity.inode,
   ]);
-  let state = manifestPublicationEpochs.get(key);
+  let state = manifestPublicationLocks.get(key);
   if (state === undefined) {
-    state = { activeAttempts: 0, epoch: 0n };
-    manifestPublicationEpochs.set(key, state);
+    const lockToken = publicationToken();
+    let acquired: "acquired" | "busy";
+    try {
+      acquired = operations.acquireManifestPublicationLock(directory, identity, lockToken);
+    } catch {
+      return materializationConflict();
+    }
+    if (acquired !== "acquired") return materializationConflict();
+    state = {
+      activeAttempts: 0,
+      authorityEpoch: 0n,
+      directory,
+      directoryIdentity: identity,
+      lockToken,
+      lockOperations: operations,
+      poisoned: false,
+    };
+    manifestPublicationLocks.set(key, state);
   }
+  if (state.poisoned) return materializationConflict();
   state.activeAttempts += 1;
-  state.epoch += 1n;
-  return Object.freeze({ key, state, epoch: state.epoch });
+  return Object.freeze({
+    key,
+    state,
+    authorityEpoch: state.authorityEpoch,
+    transactionToken: publicationToken(),
+  });
 }
 
 function manifestPublicationAttemptIsCurrent(attempt: ManifestPublicationAttempt): boolean {
-  return attempt.state.epoch === attempt.epoch;
+  return !attempt.state.poisoned
+    && attempt.state.authorityEpoch === attempt.authorityEpoch;
 }
 
 function finishManifestPublicationAttempt(attempt: ManifestPublicationAttempt): void {
   attempt.state.activeAttempts -= 1;
+  if (attempt.state.activeAttempts !== 0) return;
+  if (!attempt.state.poisoned) {
+    let released: "released" | "poisoned";
+    try {
+      released = attempt.state.lockOperations.releaseManifestPublicationLock(
+        attempt.state.directory,
+        attempt.state.directoryIdentity,
+        attempt.state.lockToken,
+      );
+    } catch {
+      attempt.state.poisoned = true;
+      return materializationConflict();
+    }
+    if (released !== "released") {
+      attempt.state.poisoned = true;
+      return materializationConflict();
+    }
+  }
   if (
-    attempt.state.activeAttempts === 0
-    && manifestPublicationEpochs.get(attempt.key) === attempt.state
-  ) manifestPublicationEpochs.delete(attempt.key);
+    !attempt.state.poisoned
+    && manifestPublicationLocks.get(attempt.key) === attempt.state
+  ) manifestPublicationLocks.delete(attempt.key);
+}
+
+function poisonManifestPublication(attempt: ManifestPublicationAttempt): never {
+  attempt.state.poisoned = true;
+  return materializationConflict();
+}
+
+function commitManifestPublication(
+  paths: VerifiedProjectionPublicationPaths,
+  previous: StableProjectionManifestSnapshot,
+  attempt: ManifestPublicationAttempt,
+): void {
+  let result: "committed" | "poisoned";
+  try {
+    result = attempt.state.lockOperations.commitManifestPublication(
+      paths.directory,
+      attempt.state.directoryIdentity,
+      attempt.state.lockToken,
+      attempt.transactionToken,
+      previous,
+    );
+  } catch {
+    return poisonManifestPublication(attempt);
+  }
+  if (result !== "committed") return poisonManifestPublication(attempt);
+}
+
+function recordManifestPublicationSuccess(attempt: ManifestPublicationAttempt): void {
+  if (!manifestPublicationAttemptIsCurrent(attempt)) return materializationConflict();
+  attempt.state.authorityEpoch += 1n;
 }
 
 function restorePreviousManifestIfOwned(
@@ -572,68 +657,39 @@ function restorePreviousManifestIfOwned(
   operations: StableProjectionDirectoryOperations,
   publicationAttempt: ManifestPublicationAttempt,
 ): "restored" | "removed" | "superseded" {
-  if (!manifestPublicationAttemptIsCurrent(publicationAttempt)) return "superseded";
+  const supersededBeforeRollback = (): "superseded" => {
+    commitManifestPublication(paths, previous, publicationAttempt);
+    return "superseded";
+  };
+  if (!manifestPublicationAttemptIsCurrent(publicationAttempt)) {
+    return supersededBeforeRollback();
+  }
   const current = captureManifestSnapshot(paths.directory, directoryIdentity, operations);
   if (
     !manifestPublicationAttemptIsCurrent(publicationAttempt)
     || !sameManifestSnapshot(current, installed)
-  ) return "superseded";
-  if (previous.state === "missing") {
-    if (installed.state !== "present") return materializationConflict();
-    let result: "removed" | "changed" | "missing";
-    try {
-      result = operations.removeManifestIfMatches(paths.directory, directoryIdentity, installed);
-    } catch {
-      return materializationConflict();
-    }
-    if (!manifestPublicationAttemptIsCurrent(publicationAttempt)) return "superseded";
-    return result === "removed" ? "removed" : "superseded";
-  }
-  let superseded = false;
+  ) return supersededBeforeRollback();
+  const before = captureManifestSnapshot(paths.directory, directoryIdentity, operations);
+  if (
+    !manifestPublicationAttemptIsCurrent(publicationAttempt)
+    || !sameManifestSnapshot(before, installed)
+  ) return supersededBeforeRollback();
+  if (installed.state !== "present") return materializationConflict();
+  let result: "restored" | "removed" | "superseded" | "poisoned";
   try {
-    new AtomicArtifactReplacer({
-      durableBase: paths.directory,
-      operations: {
-        rename(tempPath, targetPath): void {
-          if (!manifestPublicationAttemptIsCurrent(publicationAttempt)) {
-            superseded = true;
-            return materializationConflict();
-          }
-          const before = captureManifestSnapshot(paths.directory, directoryIdentity, operations);
-          if (
-            !manifestPublicationAttemptIsCurrent(publicationAttempt)
-            || !sameManifestSnapshot(before, installed)
-          ) {
-            superseded = true;
-            return materializationConflict();
-          }
-          renameSync(tempPath, targetPath);
-          const restored = captureManifestSnapshot(paths.directory, directoryIdentity, operations);
-          if (!manifestPublicationAttemptIsCurrent(publicationAttempt)) {
-            superseded = true;
-            return materializationConflict();
-          }
-          if (!snapshotHasBytes(restored, Buffer.from(previous.bytesBase64, "base64"))) {
-            return materializationConflict();
-          }
-        },
-      },
-    }).replace({
-      targetPath: paths.targetPath,
-      tempPath: paths.tempPath,
-      bytes: Buffer.from(previous.bytesBase64, "base64"),
-    });
-  } catch (error) {
-    if (superseded) return "superseded";
-    throw error;
+    result = publicationAttempt.state.lockOperations.rollbackManifestPublication(
+      paths.directory,
+      directoryIdentity,
+      publicationAttempt.state.lockToken,
+      publicationAttempt.transactionToken,
+      previous,
+      installed,
+    );
+  } catch {
+    return poisonManifestPublication(publicationAttempt);
   }
-  if (!manifestPublicationAttemptIsCurrent(publicationAttempt)) return "superseded";
-  const restored = captureManifestSnapshot(paths.directory, directoryIdentity, operations);
-  if (!manifestPublicationAttemptIsCurrent(publicationAttempt)) return "superseded";
-  if (!snapshotHasBytes(restored, Buffer.from(previous.bytesBase64, "base64"))) {
-    return materializationConflict();
-  }
-  return "restored";
+  if (result === "poisoned") return poisonManifestPublication(publicationAttempt);
+  return result;
 }
 
 export function publishProjectionManifest(
@@ -657,7 +713,11 @@ export function publishProjectionManifest(
   } catch {
     return materializationConflict();
   }
-  const publicationAttempt = beginManifestPublicationAttempt(directoryIdentity);
+  const publicationAttempt = beginManifestPublicationAttempt(
+    paths.directory,
+    directoryIdentity,
+    directoryOperations,
+  );
   try {
     const previous = captureManifestSnapshot(paths.directory, directoryIdentity, directoryOperations);
     const manifestBytes = serializeProjectionManifest(manifest);
@@ -671,7 +731,7 @@ export function publishProjectionManifest(
             fsyncSync(handle);
             options.faultInjector?.hit("after-manifest-temp-fsync-before-replace");
           },
-          rename(tempPath, targetPath): void {
+          rename(): void {
             assertPinnedGeneration(
               paths.directory,
               manifest.databaseFile,
@@ -687,7 +747,22 @@ export function publishProjectionManifest(
               !manifestPublicationAttemptIsCurrent(publicationAttempt)
               || !sameManifestSnapshot(current, previous)
             ) return materializationConflict();
-            renameSync(tempPath, targetPath);
+            let installResult: "installed" | "superseded" | "poisoned";
+            try {
+              installResult = publicationAttempt.state.lockOperations.installManifestIfExpected(
+                paths.directory,
+                directoryIdentity,
+                publicationAttempt.state.lockToken,
+                publicationAttempt.transactionToken,
+                previous,
+              );
+            } catch {
+              return poisonManifestPublication(publicationAttempt);
+            }
+            if (installResult === "poisoned") {
+              return poisonManifestPublication(publicationAttempt);
+            }
+            if (installResult !== "installed") return materializationConflict();
             replaced = true;
             const observedInstalled = captureManifestSnapshot(
               paths.directory,
@@ -708,6 +783,7 @@ export function publishProjectionManifest(
             );
           },
         },
+        syncDirectory: () => undefined,
       }).replace({
         targetPath: paths.targetPath,
         tempPath: paths.tempPath,
@@ -729,12 +805,17 @@ export function publishProjectionManifest(
         || !manifestPublicationAttemptIsCurrent(publicationAttempt)
         || !sameManifestSnapshot(finalManifest, installed)
       ) return materializationConflict();
+      commitManifestPublication(paths, previous, publicationAttempt);
+      recordManifestPublicationSuccess(publicationAttempt);
     } catch (error) {
       if (replaced) {
         if (
           installed === undefined
           || !manifestPublicationAttemptIsCurrent(publicationAttempt)
-        ) throw error;
+        ) {
+          commitManifestPublication(paths, previous, publicationAttempt);
+          throw error;
+        }
         try {
           restorePreviousManifestIfOwned(
             paths,

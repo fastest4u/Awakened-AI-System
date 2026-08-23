@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   existsSync,
@@ -25,6 +26,7 @@ import {
 } from "../src/orchestrator/projections/manifest.js";
 import {
   filesystemStableProjectionDirectoryOperations,
+  PROJECTION_MANIFEST_PUBLICATION_LOCK_FILENAME,
   type StableProjectionManifestSnapshot,
 } from "../src/orchestrator/projections/stable-directory.js";
 
@@ -51,6 +53,70 @@ const roots: string[] = [];
 
 function missingEntry(): never {
   throw Object.assign(new Error("missing"), { code: "ENOENT" });
+}
+
+function installManifestFromIsolatedProcess(source: string, target: string): void {
+  const result = spawnSync(
+    process.execPath,
+    [
+      "-e",
+      'const { renameSync } = require("node:fs"); renameSync(process.argv[1], process.argv[2]);',
+      source,
+      target,
+    ],
+    { encoding: "utf8", windowsHide: true },
+  );
+  assert.equal(result.error, undefined);
+  assert.equal(result.status, 0, result.stderr);
+}
+
+function publishManifestFromIsolatedProcess(
+  projectionDirectory: string,
+  candidate: unknown,
+): Readonly<{ status: "published" } | { status: "rejected"; code: string | null }> {
+  const moduleUrl = new URL(
+    "../src/orchestrator/projections/manifest.js",
+    import.meta.url,
+  ).href;
+  const script = String.raw`
+const [moduleUrl, projectionDirectory, manifestJson, bindingJson] = process.argv.slice(1);
+const { publishProjectionManifest } = await import(moduleUrl);
+try {
+  publishProjectionManifest({
+    projectionDirectory,
+    manifest: JSON.parse(manifestJson),
+    expectedBinding: JSON.parse(bindingJson),
+  });
+  process.stdout.write(JSON.stringify({ status: "published" }));
+} catch (error) {
+  process.stdout.write(JSON.stringify({
+    status: "rejected",
+    code: error && typeof error === "object" && "code" in error ? String(error.code) : null,
+  }));
+}
+`;
+  const result = spawnSync(
+    process.execPath,
+    [
+      "--input-type=module",
+      "-e",
+      script,
+      moduleUrl,
+      projectionDirectory,
+      JSON.stringify(candidate),
+      JSON.stringify(BINDING),
+    ],
+    { encoding: "utf8", windowsHide: true },
+  );
+  assert.equal(result.error, undefined);
+  assert.equal(result.status, 0, result.stderr);
+  return JSON.parse(result.stdout) as Readonly<
+    { status: "published" } | { status: "rejected"; code: string | null }
+  >;
+}
+
+function publishedGeneration(target: string): number {
+  return parseProjectionManifest(JSON.parse(readFileSync(target, "utf8")), BINDING).generation;
 }
 
 function manifest(overrides: Readonly<Record<string, unknown>> = {}): Record<string, unknown> {
@@ -531,6 +597,270 @@ describe("immutable projection manifest", () => {
       parseProjectionManifest(JSON.parse(readFileSync(target, "utf8")), BINDING).generation,
       3,
     );
+  });
+
+  it("does not overwrite external authority installed after the final success snapshot", () => {
+    const root = mkdtempSync(join(tmpdir(), "projection-manifest-external-success-gap-"));
+    roots.push(root);
+    const first = parseProjectionManifest(manifest({
+      generation: 1,
+      databaseFile: "projections-1-1.sqlite",
+      terminalEventPosition: "16",
+    }), BINDING);
+    const second = parseProjectionManifest(manifest(), BINDING);
+    const third = parseProjectionManifest(manifest({
+      generation: 3,
+      databaseFile: "projections-1-3.sqlite",
+      terminalEventPosition: "18",
+    }), BINDING);
+    for (const candidate of [first, second, third]) {
+      writeFileSync(join(root, candidate.databaseFile), `generation ${candidate.generation}`, "utf8");
+    }
+    const target = publishProjectionManifest({
+      projectionDirectory: root,
+      manifest: first,
+      expectedBinding: BINDING,
+    });
+    const external = join(root, "external-generation-3.json");
+    writeFileSync(external, serializeProjectionManifest(third));
+    let captures = 0;
+    let injected = false;
+
+    assert.throws(
+      () => publishProjectionManifest({
+        projectionDirectory: root,
+        manifest: second,
+        expectedBinding: BINDING,
+      }, {
+        directoryOperations: {
+          ...filesystemStableProjectionDirectoryOperations,
+          captureManifest(directory, identity): StableProjectionManifestSnapshot {
+            captures += 1;
+            const snapshot = filesystemStableProjectionDirectoryOperations.captureManifest(
+              directory,
+              identity,
+            );
+            if (captures === 2) {
+              installManifestFromIsolatedProcess(external, target);
+              injected = true;
+            }
+            return snapshot;
+          },
+        },
+      }),
+      (error: unknown) => error instanceof LifecycleError
+        && error.code === "MATERIALIZATION_CONFLICT"
+        && error.retryable,
+    );
+    assert.equal(injected, true);
+    assert.equal(publishedGeneration(target), 3);
+  });
+
+  it("does not overwrite external authority installed after the final rollback snapshot", () => {
+    const root = mkdtempSync(join(tmpdir(), "projection-manifest-external-rollback-gap-"));
+    roots.push(root);
+    const first = parseProjectionManifest(manifest({
+      generation: 1,
+      databaseFile: "projections-1-1.sqlite",
+      terminalEventPosition: "16",
+    }), BINDING);
+    const second = parseProjectionManifest(manifest(), BINDING);
+    const third = parseProjectionManifest(manifest({
+      generation: 3,
+      databaseFile: "projections-1-3.sqlite",
+      terminalEventPosition: "18",
+    }), BINDING);
+    for (const candidate of [first, second, third]) {
+      writeFileSync(join(root, candidate.databaseFile), `generation ${candidate.generation}`, "utf8");
+    }
+    const target = publishProjectionManifest({
+      projectionDirectory: root,
+      manifest: first,
+      expectedBinding: BINDING,
+    });
+    const external = join(root, "external-generation-3.json");
+    writeFileSync(external, serializeProjectionManifest(third));
+    let captures = 0;
+    let injected = false;
+
+    assert.throws(
+      () => publishProjectionManifest({
+        projectionDirectory: root,
+        manifest: second,
+        expectedBinding: BINDING,
+      }, {
+        directoryOperations: {
+          ...filesystemStableProjectionDirectoryOperations,
+          captureManifest(directory, identity): StableProjectionManifestSnapshot {
+            captures += 1;
+            const snapshot = filesystemStableProjectionDirectoryOperations.captureManifest(
+              directory,
+              identity,
+            );
+            if (captures === 5) {
+              installManifestFromIsolatedProcess(external, target);
+              injected = true;
+            }
+            return snapshot;
+          },
+        },
+        faultInjector: {
+          hit(boundary): void {
+            if (boundary === "after-manifest-replace-before-validation") {
+              writeFileSync(`${join(root, second.databaseFile)}-wal`, "outer failure", "utf8");
+            }
+          },
+        },
+      }),
+      (error: unknown) => error instanceof LifecycleError
+        && error.code === "INTEGRITY_FAILURE",
+    );
+    assert.equal(injected, true);
+    assert.equal(publishedGeneration(target), 3);
+  });
+
+  it("restores prior authority after a nested publication attempt fails before replacement", () => {
+    const root = mkdtempSync(join(tmpdir(), "projection-manifest-nested-failure-"));
+    roots.push(root);
+    const first = parseProjectionManifest(manifest({
+      generation: 1,
+      databaseFile: "projections-1-1.sqlite",
+      terminalEventPosition: "16",
+    }), BINDING);
+    const second = parseProjectionManifest(manifest(), BINDING);
+    const third = parseProjectionManifest(manifest({
+      generation: 3,
+      databaseFile: "projections-1-3.sqlite",
+      terminalEventPosition: "18",
+    }), BINDING);
+    for (const candidate of [first, second, third]) {
+      writeFileSync(join(root, candidate.databaseFile), `generation ${candidate.generation}`, "utf8");
+    }
+    const target = publishProjectionManifest({
+      projectionDirectory: root,
+      manifest: first,
+      expectedBinding: BINDING,
+    });
+    let nestedFailed = false;
+
+    assert.throws(
+      () => publishProjectionManifest({
+        projectionDirectory: root,
+        manifest: second,
+        expectedBinding: BINDING,
+      }, {
+        faultInjector: {
+          hit(boundary): void {
+            if (boundary !== "after-manifest-replace-before-validation") return;
+            try {
+              publishProjectionManifest({
+                projectionDirectory: root,
+                manifest: third,
+                expectedBinding: BINDING,
+              }, {
+                faultInjector: {
+                  hit(nestedBoundary): void {
+                    if (nestedBoundary === "after-manifest-temp-fsync-before-replace") {
+                      throw new Error("nested pre-replacement failure");
+                    }
+                  },
+                },
+              });
+            } catch (error) {
+              assert.match(String(error), /nested pre-replacement failure/u);
+              nestedFailed = true;
+            }
+            writeFileSync(`${join(root, second.databaseFile)}-wal`, "outer failure", "utf8");
+          },
+        },
+      }),
+      (error: unknown) => error instanceof LifecycleError
+        && error.code === "INTEGRITY_FAILURE",
+    );
+    assert.equal(nestedFailed, true);
+    assert.equal(publishedGeneration(target), 1);
+  });
+
+  it("fences a cooperative isolated publisher for the complete outer transaction", () => {
+    const root = mkdtempSync(join(tmpdir(), "projection-manifest-process-lock-"));
+    roots.push(root);
+    const first = parseProjectionManifest(manifest({
+      generation: 1,
+      databaseFile: "projections-1-1.sqlite",
+      terminalEventPosition: "16",
+    }), BINDING);
+    const second = parseProjectionManifest(manifest(), BINDING);
+    const third = parseProjectionManifest(manifest({
+      generation: 3,
+      databaseFile: "projections-1-3.sqlite",
+      terminalEventPosition: "18",
+    }), BINDING);
+    for (const candidate of [first, second, third]) {
+      writeFileSync(join(root, candidate.databaseFile), `generation ${candidate.generation}`, "utf8");
+    }
+    const target = publishProjectionManifest({
+      projectionDirectory: root,
+      manifest: first,
+      expectedBinding: BINDING,
+    });
+    let isolatedResult: ReturnType<typeof publishManifestFromIsolatedProcess> | undefined;
+
+    assert.throws(
+      () => publishProjectionManifest({
+        projectionDirectory: root,
+        manifest: second,
+        expectedBinding: BINDING,
+      }, {
+        faultInjector: {
+          hit(boundary): void {
+            if (boundary !== "after-manifest-replace-before-validation") return;
+            isolatedResult = publishManifestFromIsolatedProcess(root, third);
+            writeFileSync(`${join(root, second.databaseFile)}-wal`, "outer failure", "utf8");
+          },
+        },
+      }),
+      (error: unknown) => error instanceof LifecycleError
+        && error.code === "INTEGRITY_FAILURE",
+    );
+    assert.deepEqual(isolatedResult, {
+      status: "rejected",
+      code: "MATERIALIZATION_CONFLICT",
+    });
+    assert.equal(publishedGeneration(target), 1);
+  });
+
+  it("fails closed on a foreign publication lock without stealing or rewriting it", () => {
+    const root = mkdtempSync(join(tmpdir(), "projection-manifest-foreign-lock-"));
+    roots.push(root);
+    const first = parseProjectionManifest(manifest({
+      generation: 1,
+      databaseFile: "projections-1-1.sqlite",
+      terminalEventPosition: "16",
+    }), BINDING);
+    const second = parseProjectionManifest(manifest(), BINDING);
+    for (const candidate of [first, second]) {
+      writeFileSync(join(root, candidate.databaseFile), `generation ${candidate.generation}`, "utf8");
+    }
+    const target = publishProjectionManifest({
+      projectionDirectory: root,
+      manifest: first,
+      expectedBinding: BINDING,
+    });
+    const lockPath = join(root, PROJECTION_MANIFEST_PUBLICATION_LOCK_FILENAME);
+    writeFileSync(lockPath, "foreign producer lock", "utf8");
+
+    assert.throws(
+      () => publishProjectionManifest({
+        projectionDirectory: root,
+        manifest: second,
+        expectedBinding: BINDING,
+      }),
+      (error: unknown) => error instanceof LifecycleError
+        && error.code === "MATERIALIZATION_CONFLICT"
+        && error.retryable,
+    );
+    assert.equal(readFileSync(lockPath, "utf8"), "foreign producer lock");
+    assert.equal(publishedGeneration(target), 1);
   });
 
   it("does not replace a manifest source changed after prior capture", () => {

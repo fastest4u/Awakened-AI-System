@@ -28,6 +28,7 @@ import {
 } from "./reader-lease.js";
 import {
   filesystemStableProjectionDirectoryOperations,
+  PROJECTION_MANIFEST_PUBLICATION_LOCK_FILENAME,
   sameProjectionDirectoryIdentity,
   type ProjectionDirectoryIdentity,
 } from "./stable-directory.js";
@@ -257,13 +258,13 @@ export class DefaultProjectionBuildCoordinator implements ProjectionBuildCoordin
 
   #loadPublished(binding: ProjectBinding): PublishedProjectionGeneration | null {
     if (!this.#assertProjectionDirectorySafe()) return null;
+    this.#assertManifestPublicationUnlocked();
     const manifestPath = join(this.#projectionDirectory, PROJECTION_MANIFEST_FILENAME);
-    let bytes: string;
-    try {
-      bytes = readFileSync(manifestPath, "utf8");
-    } catch (error) {
-      if (notFound(error)) return null;
-      throw error;
+    const bytes = this.#readManifestBytes(manifestPath);
+    if (bytes === null) {
+      this.#assertManifestPublicationUnlocked();
+      if (this.#readManifestBytes(manifestPath) === null) return null;
+      throw new LifecycleError("MATERIALIZATION_CONFLICT");
     }
     let decoded: unknown;
     try {
@@ -280,6 +281,9 @@ export class DefaultProjectionBuildCoordinator implements ProjectionBuildCoordin
     const databaseSha256 = sha256File(paths.databasePath);
     assertProjectionSidecarsAbsent(paths.databasePath, this.#pathInspection);
     this.#assertProjectionDirectorySafe();
+    const confirmedBytes = this.#readManifestBytes(manifestPath);
+    this.#assertManifestPublicationUnlocked();
+    if (confirmedBytes !== bytes) throw new LifecycleError("MATERIALIZATION_CONFLICT");
     if (databaseSha256 !== manifest.databaseSha256) {
       throw new Error("PROJECTION_DATABASE_CHECKSUM_INVALID");
     }
@@ -289,6 +293,29 @@ export class DefaultProjectionBuildCoordinator implements ProjectionBuildCoordin
       databasePath: paths.databasePath,
       directoryIdentity: this.#requiredDirectoryIdentity(),
     });
+  }
+
+  #readManifestBytes(path: string): string | null {
+    try {
+      return readFileSync(path, "utf8");
+    } catch (error) {
+      if (notFound(error)) return null;
+      throw error;
+    }
+  }
+
+  #assertManifestPublicationUnlocked(): void {
+    const lockPath = join(
+      this.#projectionDirectory,
+      PROJECTION_MANIFEST_PUBLICATION_LOCK_FILENAME,
+    );
+    try {
+      this.#pathInspection.lstat(lockPath);
+    } catch (error) {
+      if (notFound(error)) return;
+      throw new LifecycleError("MATERIALIZATION_CONFLICT");
+    }
+    throw new LifecycleError("MATERIALIZATION_CONFLICT");
   }
 
   #verifyBuilt(binding: ProjectBinding, built: BuiltProjectionGeneration): void {

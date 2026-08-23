@@ -7,20 +7,24 @@ import { LifecycleError } from "../lifecycle/errors.js";
 
 const MUTATION_TIMEOUT_MS = 5_000;
 const MAX_STABLE_MANIFEST_BYTES = 64 * 1_024;
+export const PROJECTION_MANIFEST_PUBLICATION_LOCK_FILENAME =
+  ".projection-manifest.publish.lock" as const;
 const MUTATION_SCRIPT = String.raw`
 "use strict";
 const { createHash } = require("node:crypto");
 const {
   closeSync, fstatSync, fsyncSync, lstatSync, openSync, readFileSync,
-  realpathSync, readdirSync, unlinkSync,
+  realpathSync, readdirSync, linkSync, renameSync, unlinkSync, writeSync,
 } = require("node:fs");
 const { basename, resolve } = require("node:path");
 const [
-  operation, expectedPath, expectedDevice, expectedInode, filename,
-  expectedManifestDevice, expectedManifestInode, expectedManifestSize,
-  expectedManifestSha256,
+  operation, expectedPath, expectedDevice, expectedInode, ...operationArguments
 ] = process.argv.slice(1);
 const MAX_MANIFEST_BYTES = ${String(MAX_STABLE_MANIFEST_BYTES)};
+const MANIFEST_NAME = "projection-manifest.json";
+const MANIFEST_TEMP_NAME = ".projection-manifest.json.tmp";
+const LOCK_NAME = ${JSON.stringify(PROJECTION_MANIFEST_PUBLICATION_LOCK_FILENAME)};
+const TOKEN = /^[0-9a-f]{32}$/u;
 const normalized = (path) => {
   const value = resolve(path);
   return process.platform === "win32" ? value.toLowerCase() : value;
@@ -38,7 +42,7 @@ const assertDirectory = () => {
   return directory;
 };
 const captureManifest = () => {
-  const manifestName = "projection-manifest.json";
+  const manifestName = MANIFEST_NAME;
   let before;
   try {
     before = lstatSync(manifestName, { bigint: true });
@@ -126,6 +130,82 @@ const sidecarPresent = (name) => {
   }
   return false;
 };
+const captureFileIdentity = (name) => {
+  const before = lstatSync(name, { bigint: true });
+  if (
+    !before.isFile()
+    || before.isSymbolicLink()
+    || before.size < 0n
+    || before.size > BigInt(MAX_MANIFEST_BYTES)
+  ) invalid();
+  let handle;
+  try {
+    handle = openSync(name, "r");
+    const opened = fstatSync(handle, { bigint: true });
+    if (
+      !opened.isFile()
+      || opened.dev !== before.dev
+      || opened.ino !== before.ino
+      || opened.size !== before.size
+    ) invalid();
+    const bytes = readFileSync(handle);
+    const openedAfter = fstatSync(handle, { bigint: true });
+    const after = lstatSync(name, { bigint: true });
+    if (
+      bytes.byteLength !== Number(before.size)
+      || openedAfter.dev !== opened.dev
+      || openedAfter.ino !== opened.ino
+      || openedAfter.size !== opened.size
+      || after.dev !== before.dev
+      || after.ino !== before.ino
+      || after.size !== before.size
+      || !after.isFile()
+      || after.isSymbolicLink()
+    ) invalid();
+    assertDirectory();
+    return {
+      device: opened.dev.toString(),
+      inode: opened.ino.toString(),
+      size: opened.size.toString(),
+      sha256: createHash("sha256").update(bytes).digest("hex"),
+      bytes,
+    };
+  } finally {
+    if (handle !== undefined) closeSync(handle);
+  }
+};
+const assertToken = (token) => {
+  if (typeof token !== "string" || !TOKEN.test(token)) invalid();
+  return token;
+};
+const assertLock = (token) => {
+  const lock = captureFileIdentity(LOCK_NAME);
+  if (lock.bytes.toString("utf8") !== token) invalid();
+};
+const linkIfAbsent = (source, target) => {
+  try {
+    linkSync(source, target);
+    return true;
+  } catch (error) {
+    if (error && error.code === "EEXIST") return false;
+    throw error;
+  }
+};
+const removeRegularFile = (name) => {
+  const entry = lstatSync(name);
+  if (!entry.isFile() || entry.isSymbolicLink()) invalid();
+  unlinkSync(name);
+};
+const fileMatchesArguments = (file, offset) => (
+  file.device === operationArguments[offset]
+  && file.inode === operationArguments[offset + 1]
+  && file.size === operationArguments[offset + 2]
+  && file.sha256 === operationArguments[offset + 3]
+);
+const transactionNames = (attemptToken) => ({
+  previous: ".projection-manifest.previous-" + attemptToken,
+  failed: ".projection-manifest.failed-" + attemptToken,
+});
 try {
   assertDirectory();
   if (operation === "cleanup") {
@@ -139,28 +219,8 @@ try {
     process.stdout.write("cleaned");
   } else if (operation === "capture-manifest") {
     process.stdout.write(JSON.stringify(captureManifest()));
-  } else if (operation === "remove-manifest-if-matches") {
-    const snapshot = captureManifest();
-    if (snapshot.state === "missing") process.stdout.write("missing");
-    else if (
-      snapshot.device !== expectedManifestDevice
-      || snapshot.inode !== expectedManifestInode
-      || snapshot.size !== expectedManifestSize
-      || snapshot.sha256 !== expectedManifestSha256
-    ) process.stdout.write("changed");
-    else {
-      unlinkSync("projection-manifest.json");
-      syncDirectory();
-      assertDirectory();
-      try {
-        lstatSync("projection-manifest.json");
-        process.stdout.write("changed");
-      } catch (error) {
-        if (error && error.code === "ENOENT") process.stdout.write("removed");
-        else throw error;
-      }
-    }
   } else if (operation === "assert-generation") {
+    const [filename] = operationArguments;
     if (
       typeof filename !== "string"
       || basename(filename) !== filename
@@ -174,6 +234,184 @@ try {
     } catch (error) {
       if (error && error.code === "ENOENT") process.stdout.write("missing");
       else throw error;
+    }
+  } else if (operation === "acquire-manifest-lock") {
+    const lockToken = assertToken(operationArguments[0]);
+    let handle;
+    try {
+      handle = openSync(LOCK_NAME, "wx", 0o600);
+    } catch (error) {
+      if (error && error.code === "EEXIST") {
+        process.stdout.write("busy");
+      } else throw error;
+    }
+    if (handle !== undefined) {
+      try {
+        const bytes = Buffer.from(lockToken, "utf8");
+        let offset = 0;
+        while (offset < bytes.byteLength) {
+          const written = writeSync(handle, bytes, offset, bytes.byteLength - offset, offset);
+          if (!Number.isSafeInteger(written) || written <= 0) invalid();
+          offset += written;
+        }
+        fsyncSync(handle);
+      } finally {
+        closeSync(handle);
+      }
+      syncDirectory();
+      assertLock(lockToken);
+      process.stdout.write("acquired");
+    }
+  } else if (operation === "release-manifest-lock") {
+    const lockToken = assertToken(operationArguments[0]);
+    assertLock(lockToken);
+    const retained = readdirSync(".").some((name) => (
+      name.startsWith(".projection-manifest.previous-")
+      || name.startsWith(".projection-manifest.failed-")
+    ));
+    if (retained) process.stdout.write("poisoned");
+    else {
+      removeRegularFile(LOCK_NAME);
+      syncDirectory();
+      assertDirectory();
+      process.stdout.write("released");
+    }
+  } else if (operation === "install-manifest") {
+    const lockToken = assertToken(operationArguments[0]);
+    const attemptToken = assertToken(operationArguments[1]);
+    const expectedState = operationArguments[2];
+    if (expectedState !== "missing" && expectedState !== "present") invalid();
+    const names = transactionNames(attemptToken);
+    assertLock(lockToken);
+    captureFileIdentity(MANIFEST_TEMP_NAME);
+    for (const name of [names.previous, names.failed]) {
+      try {
+        lstatSync(name);
+        invalid();
+      } catch (error) {
+        if (!error || error.code !== "ENOENT") throw error;
+      }
+    }
+    if (expectedState === "missing") {
+      if (!linkIfAbsent(MANIFEST_TEMP_NAME, MANIFEST_NAME)) {
+        process.stdout.write("superseded");
+      } else {
+        removeRegularFile(MANIFEST_TEMP_NAME);
+        syncDirectory();
+        assertLock(lockToken);
+        process.stdout.write("installed");
+      }
+    } else {
+      let moved = false;
+      try {
+        renameSync(MANIFEST_NAME, names.previous);
+        moved = true;
+      } catch (error) {
+        if (!error || error.code !== "ENOENT") throw error;
+      }
+      if (!moved) process.stdout.write("superseded");
+      else {
+        const previous = captureFileIdentity(names.previous);
+        if (!fileMatchesArguments(previous, 3)) {
+          if (!linkIfAbsent(names.previous, MANIFEST_NAME)) {
+            process.stdout.write("poisoned");
+          } else {
+            removeRegularFile(names.previous);
+            syncDirectory();
+            process.stdout.write("superseded");
+          }
+        } else if (!linkIfAbsent(MANIFEST_TEMP_NAME, MANIFEST_NAME)) {
+          removeRegularFile(names.previous);
+          syncDirectory();
+          process.stdout.write("superseded");
+        } else {
+          removeRegularFile(MANIFEST_TEMP_NAME);
+          syncDirectory();
+          assertLock(lockToken);
+          process.stdout.write("installed");
+        }
+      }
+    }
+  } else if (operation === "commit-manifest") {
+    const lockToken = assertToken(operationArguments[0]);
+    const attemptToken = assertToken(operationArguments[1]);
+    const previousState = operationArguments[2];
+    if (previousState !== "missing" && previousState !== "present") invalid();
+    const names = transactionNames(attemptToken);
+    assertLock(lockToken);
+    if (previousState === "present") removeRegularFile(names.previous);
+    try {
+      lstatSync(names.failed);
+      invalid();
+    } catch (error) {
+      if (!error || error.code !== "ENOENT") throw error;
+    }
+    syncDirectory();
+    assertLock(lockToken);
+    process.stdout.write("committed");
+  } else if (operation === "rollback-manifest") {
+    const lockToken = assertToken(operationArguments[0]);
+    const attemptToken = assertToken(operationArguments[1]);
+    const previousState = operationArguments[2];
+    if (previousState !== "missing" && previousState !== "present") invalid();
+    const names = transactionNames(attemptToken);
+    assertLock(lockToken);
+    if (previousState === "present") {
+      const previous = captureFileIdentity(names.previous);
+      if (!fileMatchesArguments(previous, 3)) invalid();
+    }
+    try {
+      lstatSync(names.failed);
+      invalid();
+    } catch (error) {
+      if (!error || error.code !== "ENOENT") throw error;
+    }
+    let moved = false;
+    try {
+      renameSync(MANIFEST_NAME, names.failed);
+      moved = true;
+    } catch (error) {
+      if (!error || error.code !== "ENOENT") throw error;
+    }
+    if (!moved) {
+      if (previousState === "present") {
+        const restored = linkIfAbsent(names.previous, MANIFEST_NAME);
+        removeRegularFile(names.previous);
+        syncDirectory();
+        process.stdout.write(restored ? "restored" : "superseded");
+      } else {
+        syncDirectory();
+        process.stdout.write("removed");
+      }
+    } else {
+      const failed = captureFileIdentity(names.failed);
+      if (!fileMatchesArguments(failed, 7)) {
+        if (!linkIfAbsent(names.failed, MANIFEST_NAME)) {
+          process.stdout.write("poisoned");
+        } else {
+          removeRegularFile(names.failed);
+          if (previousState === "present") removeRegularFile(names.previous);
+          syncDirectory();
+          process.stdout.write("superseded");
+        }
+      } else {
+        let outcome;
+        if (previousState === "present") {
+          outcome = linkIfAbsent(names.previous, MANIFEST_NAME) ? "restored" : "superseded";
+          removeRegularFile(names.previous);
+        } else {
+          try {
+            lstatSync(MANIFEST_NAME);
+            outcome = "superseded";
+          } catch (error) {
+            if (error && error.code === "ENOENT") outcome = "removed";
+            else throw error;
+          }
+        }
+        removeRegularFile(names.failed);
+        syncDirectory();
+        process.stdout.write(outcome);
+      }
     }
   } else invalid();
 } catch (error) {
@@ -219,11 +457,38 @@ export interface StableProjectionDirectoryOperations {
     directory: string,
     identity: ProjectionDirectoryIdentity,
   ): StableProjectionManifestSnapshot;
-  removeManifestIfMatches(
+  acquireManifestPublicationLock(
     directory: string,
     identity: ProjectionDirectoryIdentity,
-    expected: Extract<StableProjectionManifestSnapshot, { readonly state: "present" }>,
-  ): "removed" | "changed" | "missing";
+    lockToken: string,
+  ): "acquired" | "busy";
+  installManifestIfExpected(
+    directory: string,
+    identity: ProjectionDirectoryIdentity,
+    lockToken: string,
+    attemptToken: string,
+    expected: StableProjectionManifestSnapshot,
+  ): "installed" | "superseded" | "poisoned";
+  commitManifestPublication(
+    directory: string,
+    identity: ProjectionDirectoryIdentity,
+    lockToken: string,
+    attemptToken: string,
+    previous: StableProjectionManifestSnapshot,
+  ): "committed" | "poisoned";
+  rollbackManifestPublication(
+    directory: string,
+    identity: ProjectionDirectoryIdentity,
+    lockToken: string,
+    attemptToken: string,
+    previous: StableProjectionManifestSnapshot,
+    installed: Extract<StableProjectionManifestSnapshot, { readonly state: "present" }>,
+  ): "restored" | "removed" | "superseded" | "poisoned";
+  releaseManifestPublicationLock(
+    directory: string,
+    identity: ProjectionDirectoryIdentity,
+    lockToken: string,
+  ): "released" | "poisoned";
 }
 
 function normalizedPath(path: string): string {
@@ -273,7 +538,15 @@ export function sameProjectionDirectoryIdentity(
 }
 
 function runStableMutation(
-  operation: "cleanup" | "assert-generation" | "capture-manifest" | "remove-manifest-if-matches",
+  operation:
+    | "cleanup"
+    | "assert-generation"
+    | "capture-manifest"
+    | "acquire-manifest-lock"
+    | "install-manifest"
+    | "commit-manifest"
+    | "rollback-manifest"
+    | "release-manifest-lock",
   directory: string,
   identity: ProjectionDirectoryIdentity,
   argumentsAfterIdentity: readonly string[] = [],
@@ -304,6 +577,19 @@ function runStableMutation(
     return invalid(result.error ?? result.stderr);
   }
   return result.stdout;
+}
+
+function snapshotIdentityArguments(
+  snapshot: StableProjectionManifestSnapshot,
+): readonly [string, string, string, string, string] {
+  if (snapshot.state === "missing") return ["missing", "", "", "", ""];
+  return [
+    "present",
+    snapshot.fileIdentity.device,
+    snapshot.fileIdentity.inode,
+    snapshot.fileIdentity.size,
+    snapshot.fileIdentity.sha256,
+  ];
 }
 
 function decimal(value: unknown): value is string {
@@ -386,20 +672,83 @@ StableProjectionDirectoryOperations = Object.freeze({
       identity.canonicalPath,
     );
   },
-  removeManifestIfMatches(
+  acquireManifestPublicationLock(
     directory: string,
     identity: ProjectionDirectoryIdentity,
-    expected: Extract<StableProjectionManifestSnapshot, { readonly state: "present" }>,
-  ): "removed" | "changed" | "missing" {
+    lockToken: string,
+  ): "acquired" | "busy" {
+    const result = runStableMutation("acquire-manifest-lock", directory, identity, [lockToken]);
+    if (result !== "acquired" && result !== "busy") return invalid();
+    return result;
+  },
+  installManifestIfExpected(
+    directory: string,
+    identity: ProjectionDirectoryIdentity,
+    lockToken: string,
+    attemptToken: string,
+    expected: StableProjectionManifestSnapshot,
+  ): "installed" | "superseded" | "poisoned" {
     if (!sameProjectionDirectoryIdentity(identity, expected.directoryIdentity)) return invalid();
-    const result = runStableMutation("remove-manifest-if-matches", directory, identity, [
-      "projection-manifest.json",
-      expected.fileIdentity.device,
-      expected.fileIdentity.inode,
-      expected.fileIdentity.size,
-      expected.fileIdentity.sha256,
+    const result = runStableMutation("install-manifest", directory, identity, [
+      lockToken,
+      attemptToken,
+      ...snapshotIdentityArguments(expected),
     ]);
-    if (result !== "removed" && result !== "changed" && result !== "missing") return invalid();
+    if (result !== "installed" && result !== "superseded" && result !== "poisoned") {
+      return invalid();
+    }
+    return result;
+  },
+  commitManifestPublication(
+    directory: string,
+    identity: ProjectionDirectoryIdentity,
+    lockToken: string,
+    attemptToken: string,
+    previous: StableProjectionManifestSnapshot,
+  ): "committed" | "poisoned" {
+    if (!sameProjectionDirectoryIdentity(identity, previous.directoryIdentity)) return invalid();
+    const result = runStableMutation("commit-manifest", directory, identity, [
+      lockToken,
+      attemptToken,
+      previous.state,
+    ]);
+    if (result !== "committed" && result !== "poisoned") return invalid();
+    return result;
+  },
+  rollbackManifestPublication(
+    directory: string,
+    identity: ProjectionDirectoryIdentity,
+    lockToken: string,
+    attemptToken: string,
+    previous: StableProjectionManifestSnapshot,
+    installed: Extract<StableProjectionManifestSnapshot, { readonly state: "present" }>,
+  ): "restored" | "removed" | "superseded" | "poisoned" {
+    if (
+      !sameProjectionDirectoryIdentity(identity, previous.directoryIdentity)
+      || !sameProjectionDirectoryIdentity(identity, installed.directoryIdentity)
+    ) return invalid();
+    const installedIdentity = snapshotIdentityArguments(installed);
+    const result = runStableMutation("rollback-manifest", directory, identity, [
+      lockToken,
+      attemptToken,
+      ...snapshotIdentityArguments(previous),
+      ...installedIdentity.slice(1),
+    ]);
+    if (
+      result !== "restored"
+      && result !== "removed"
+      && result !== "superseded"
+      && result !== "poisoned"
+    ) return invalid();
+    return result;
+  },
+  releaseManifestPublicationLock(
+    directory: string,
+    identity: ProjectionDirectoryIdentity,
+    lockToken: string,
+  ): "released" | "poisoned" {
+    const result = runStableMutation("release-manifest-lock", directory, identity, [lockToken]);
+    if (result !== "released" && result !== "poisoned") return invalid();
     return result;
   },
 });
