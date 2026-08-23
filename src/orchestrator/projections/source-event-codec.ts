@@ -26,6 +26,8 @@ const HASH = /^[0-9a-f]{64}$/u;
 const TIMESTAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u;
 const DECIMAL = /^(0|[1-9][0-9]*)$/u;
 const MAX_EVENT_PAYLOAD_BYTES = 256 * 1024;
+const MAX_EVENT_PAYLOAD_DEPTH = 128;
+const MAX_EVENT_PAYLOAD_NODES = 256 * 1024;
 const MAX_SUMMARY_BYTES = 16 * 1024;
 
 const STORED_EVENT_KEYS = [
@@ -235,7 +237,101 @@ interface DecodedStoredEvent {
   readonly payload: unknown;
 }
 
-function decodeStoredEvent(value: unknown): DecodedStoredEvent {
+function assertBoundedJson(value: unknown): void {
+  type Pending =
+    | Readonly<{ kind: "value"; value: unknown; depth: number }>
+    | Readonly<{ kind: "exit"; value: object }>;
+  const pending: Pending[] = [{ kind: "value", value, depth: 0 }];
+  const ancestors = new Set<object>();
+  let bytes = 0;
+  let nodes = 0;
+  const addBytes = (count: number): void => {
+    bytes += count;
+    if (bytes > MAX_EVENT_PAYLOAD_BYTES) return integrity();
+  };
+  const addJsonString = (text: string): void => {
+    if (Buffer.byteLength(text, "utf8") > MAX_EVENT_PAYLOAD_BYTES - bytes) return integrity();
+    addBytes(Buffer.byteLength(JSON.stringify(text), "utf8"));
+  };
+
+  while (pending.length > 0) {
+    const entry = pending.pop();
+    if (entry === undefined) return integrity();
+    if (entry.kind === "exit") {
+      ancestors.delete(entry.value);
+      continue;
+    }
+    nodes += 1;
+    if (nodes > MAX_EVENT_PAYLOAD_NODES) return integrity();
+    const current = entry.value;
+    if (current === null) {
+      addBytes(4);
+      continue;
+    }
+    if (typeof current === "string") {
+      addJsonString(current);
+      continue;
+    }
+    if (typeof current === "boolean") {
+      addBytes(current ? 4 : 5);
+      continue;
+    }
+    if (typeof current === "number") {
+      if (!Number.isFinite(current)) return integrity();
+      addBytes(Buffer.byteLength(JSON.stringify(current), "utf8"));
+      continue;
+    }
+    if (typeof current !== "object") return integrity();
+    if (ancestors.has(current)) return integrity();
+    const isArray = Array.isArray(current);
+    const prototype = Object.getPrototypeOf(current) as unknown;
+    if (
+      (isArray && prototype !== Array.prototype)
+      || (!isArray && prototype !== Object.prototype && prototype !== null)
+    ) return integrity();
+    const keys = Reflect.ownKeys(current);
+    const valueKeys = isArray ? keys.filter((key) => key !== "length") : keys;
+    if (entry.depth >= MAX_EVENT_PAYLOAD_DEPTH && valueKeys.length > 0) return integrity();
+    if (isArray) {
+      const lengthDescriptor = Reflect.getOwnPropertyDescriptor(current, "length");
+      const length = lengthDescriptor?.value;
+      if (
+        !Number.isSafeInteger(length)
+        || Number(length) < 0
+        || Number(length) > MAX_EVENT_PAYLOAD_NODES - nodes
+      ) return integrity();
+      const expected = [
+        ...Array.from({ length: Number(length) }, (_, index) => String(index)),
+        "length",
+      ];
+      if (keys.length !== expected.length || keys.some((key, index) => key !== expected[index])) {
+        return integrity();
+      }
+      addBytes(2 + Math.max(0, Number(length) - 1));
+    } else {
+      if (keys.some((key) => typeof key !== "string" || key === "__proto__")) return integrity();
+      if (keys.length > MAX_EVENT_PAYLOAD_NODES - nodes) return integrity();
+      addBytes(2 + Math.max(0, keys.length - 1));
+      for (const key of keys as string[]) {
+        addJsonString(key);
+        addBytes(1);
+      }
+    }
+    ancestors.add(current);
+    pending.push({ kind: "exit", value: current });
+    for (let index = valueKeys.length - 1; index >= 0; index -= 1) {
+      const key = valueKeys[index];
+      if (key === undefined) return integrity();
+      const descriptor = Reflect.getOwnPropertyDescriptor(current, key);
+      if (descriptor === undefined || descriptor.enumerable !== true || !("value" in descriptor)) {
+        return integrity();
+      }
+      pending.push({ kind: "value", value: descriptor.value, depth: entry.depth + 1 });
+    }
+  }
+}
+
+function decodeStoredEventEnvelope(value: unknown): DecodedStoredEvent {
   const record = storedEventRecord(value);
   const eventPosition = positiveBigint(record.globalPosition);
   uuid(record.eventId);
@@ -270,8 +366,6 @@ function decodeStoredEvent(value: unknown): DecodedStoredEvent {
   for (const reference of strictArray(record.sourceRefs, 128)) boundedString(reference, 2_048);
   if (strictArray(record.evidenceRefs, 0).length !== 0) return integrity();
   if (strictArray(record.evidenceDigests, 0).length !== 0) return integrity();
-  const payloadJson = boundedString(record.payloadJson, MAX_EVENT_PAYLOAD_BYTES, true);
-  if (canonicalJson(record.payload) !== payloadJson) return integrity();
   hash(record.payloadHash);
   hash(record.previousGlobalHash);
   hash(record.eventHash);
@@ -288,6 +382,13 @@ function decodeStoredEvent(value: unknown): DecodedStoredEvent {
     binding,
     payload: record.payload,
   });
+}
+
+function validateKnownPayload(source: DecodedStoredEvent): DecodedStoredEvent {
+  const payloadJson = boundedString(source.record.payloadJson, MAX_EVENT_PAYLOAD_BYTES, true);
+  assertBoundedJson(source.payload);
+  if (canonicalJson(source.payload) !== payloadJson) return integrity();
+  return source;
 }
 
 function baseProjection(source: DecodedStoredEvent) {
@@ -462,10 +563,9 @@ const PROJECTION_BASE_KEYS = [
   "binding",
 ] as const;
 
-function validateWorkItem(value: unknown, index: number): CheckpointWorkItem {
+function validateWorkItem(value: unknown): CheckpointWorkItem {
   const source = exactRecord(value, ["kind", "ordinal", "summary", "confidence"]);
   const ordinal = safeInteger(source.ordinal, 0, 99);
-  if (ordinal !== index && ordinal > index) return integrity();
   return Object.freeze({
     kind: oneOf(source.kind, [
       "completed",
@@ -480,6 +580,33 @@ function validateWorkItem(value: unknown, index: number): CheckpointWorkItem {
     summary: boundedString(source.summary, MAX_SUMMARY_BYTES),
     confidence: oneOf(source.confidence, ["high", "medium", "low", "guess"] as const),
   });
+}
+
+function validateWorkItems(value: unknown): readonly CheckpointWorkItem[] {
+  const nextOrdinal = new Map<CheckpointWorkItem["kind"], number>();
+  return Object.freeze(strictArray(value, 700).map((item) => {
+    const decoded = validateWorkItem(item);
+    const expected = nextOrdinal.get(decoded.kind) ?? 0;
+    if (decoded.ordinal !== expected) return integrity();
+    nextOrdinal.set(decoded.kind, expected + 1);
+    return decoded;
+  }));
+}
+
+function validateFiles(value: unknown): readonly CheckpointFileItem[] {
+  return Object.freeze(strictArray(value, 200).map((item, index) => {
+    const decoded = validateFile(item);
+    if (decoded.ordinal !== index) return integrity();
+    return decoded;
+  }));
+}
+
+function validateArtifacts(value: unknown): readonly CheckpointArtifactItem[] {
+  return Object.freeze(strictArray(value, 200).map((item, index) => {
+    const decoded = validateArtifact(item);
+    if (decoded.ordinal !== index) return integrity();
+    return decoded;
+  }));
 }
 
 function validateFile(value: unknown): CheckpointFileItem {
@@ -553,9 +680,9 @@ export function validateProjectionEvent(value: unknown): ProjectionEvent {
         checkpointVersion: oneOf(source.checkpointVersion, [1, 2] as const),
         baseEventPosition,
         taskSummary: boundedString(source.taskSummary, MAX_SUMMARY_BYTES),
-        workItems: Object.freeze(strictArray(source.workItems, 700).map(validateWorkItem)),
-        files: Object.freeze(strictArray(source.files, 200).map(validateFile)),
-        artifacts: Object.freeze(strictArray(source.artifacts, 200).map(validateArtifact)),
+        workItems: validateWorkItems(source.workItems),
+        files: validateFiles(source.files),
+        artifacts: validateArtifacts(source.artifacts),
       }) as CheckpointProjectionEvent;
     }
     if (kind === "memory-source") {
@@ -640,14 +767,20 @@ export function validateProjectionEvent(value: unknown): ProjectionEvent {
 
 export function decodeProjectionEvent(event: StoredEvent): ProjectionEventDecodeResult {
   try {
-    const source = decodeStoredEvent(event);
-    if (source.eventType === "SessionCheckpointRecorded") return decodeCheckpointEvent(source);
-    if (source.eventType === "MemorySourceRecorded") return decodeMemorySource(source);
-    if (source.eventType === "RetrievalFeedbackRecorded") return decodeFeedback(source);
+    const envelope = decodeStoredEventEnvelope(event);
+    if (envelope.eventType === "SessionCheckpointRecorded") {
+      return decodeCheckpointEvent(validateKnownPayload(envelope));
+    }
+    if (envelope.eventType === "MemorySourceRecorded") {
+      return decodeMemorySource(validateKnownPayload(envelope));
+    }
+    if (envelope.eventType === "RetrievalFeedbackRecorded") {
+      return decodeFeedback(validateKnownPayload(envelope));
+    }
     return Object.freeze({
       kind: "unprojected",
-      eventPosition: source.eventPosition,
-      eventType: source.eventType,
+      eventPosition: envelope.eventPosition,
+      eventType: envelope.eventType,
     });
   } catch (error) {
     if (error instanceof Error && error.message === "INTEGRITY_FAILURE") throw error;

@@ -9,7 +9,10 @@ import type {
   VaultId,
   WorkspaceId,
 } from "../src/orchestrator/identity/contracts.js";
-import { decodeProjectionEvent } from "../src/orchestrator/projections/source-event-codec.js";
+import {
+  decodeProjectionEvent,
+  validateProjectionEvent,
+} from "../src/orchestrator/projections/source-event-codec.js";
 import { canonicalJson } from "../src/orchestrator/serialization/canonical-json.js";
 
 const PROJECT_ID = "1".repeat(64) as ProjectId;
@@ -187,6 +190,67 @@ describe("projection source event codec", () => {
     });
   });
 
+  it("does not inspect accessor, cyclic, or oversized payload content for an unknown type", () => {
+    let invoked = false;
+    const accessorPayload: Record<string, unknown> = {};
+    Object.defineProperty(accessorPayload, "future", {
+      enumerable: true,
+      get() {
+        invoked = true;
+        throw new Error("unknown payload accessor executed");
+      },
+    });
+    const cyclicPayload: Record<string, unknown> = {};
+    cyclicPayload.self = cyclicPayload;
+    const oversizedPayload = { future: "x".repeat(300 * 1_024) };
+
+    for (const [payload, payloadJson] of [
+      [accessorPayload, "{}"],
+      [cyclicPayload, "{}"],
+      [oversizedPayload, "x".repeat(300 * 1_024)],
+    ] as const) {
+      const unknown = storedEvent("UnrecognizedV99", {}, {
+        payload: payload as JsonValue,
+        payloadJson,
+      });
+      assert.deepEqual(decodeProjectionEvent(unknown), {
+        kind: "unprojected",
+        eventPosition: 42n,
+        eventType: "UnrecognizedV99",
+      });
+    }
+    assert.equal(invoked, false);
+  });
+
+  it("bounds known in-memory payload traversal before canonical comparison", () => {
+    let traversedNodes = 0;
+    let deepPayload: Record<string, unknown> = {};
+    for (let depth = 0; depth < 2_000; depth += 1) {
+      deepPayload = new Proxy({ next: deepPayload }, {
+        ownKeys(target) {
+          traversedNodes += 1;
+          return Reflect.ownKeys(target);
+        },
+      });
+    }
+    const deep = storedEvent("MemorySourceRecorded", memoryPayload(), {
+      payload: deepPayload as JsonValue,
+      payloadJson: "{}",
+    });
+    const oversized = storedEvent("MemorySourceRecorded", memoryPayload(), {
+      payload: { summary: "x".repeat(300 * 1_024) },
+      payloadJson: "{}",
+    });
+
+    for (const malformed of [deep, oversized]) {
+      assert.throws(
+        () => decodeProjectionEvent(malformed),
+        (error: unknown) => error instanceof Error && error.message === "INTEGRITY_FAILURE",
+      );
+    }
+    assert.ok(traversedNodes <= 256, `traversed ${traversedNodes} payload nodes`);
+  });
+
   it("decodes governed memory and feedback sources with the complete private binding", () => {
     const source = decodeProjectionEvent(storedEvent("MemorySourceRecorded", memoryPayload()));
     assert.equal(source.kind, "projected");
@@ -277,5 +341,49 @@ describe("projection source event codec", () => {
       /INTEGRITY_FAILURE/u,
     );
     assert.equal(invoked, false);
+  });
+
+  it("requires exact ordinal sequences for each checkpoint-derived identity", () => {
+    const decoded = decodeProjectionEvent(storedEvent("SessionCheckpointRecorded", checkpointPayload()));
+    assert.equal(decoded.kind, "projected");
+    if (decoded.kind !== "projected" || decoded.event.kind !== "checkpoint") return;
+    const checkpoint = decoded.event;
+    const firstWork = checkpoint.workItems[0];
+    const firstFile = checkpoint.files[0];
+    assert.ok(firstWork);
+    assert.ok(firstFile);
+
+    assert.throws(
+      () => validateProjectionEvent({
+        ...checkpoint,
+        workItems: [firstWork, { ...firstWork, summary: "Duplicate derived work identity." }],
+      }),
+      /INTEGRITY_FAILURE/u,
+    );
+    assert.throws(
+      () => validateProjectionEvent({
+        ...checkpoint,
+        files: [firstFile, { ...firstFile, path: "src/orchestrator/projections/folds.ts" }],
+      }),
+      /INTEGRITY_FAILURE/u,
+    );
+    const artifact = {
+      ordinal: 0,
+      artifactId: "00000000-0000-4000-8000-000000000049",
+      path: "projection-manifest.json",
+      summary: "Immutable projection manifest.",
+      contentHash: "c".repeat(64),
+      confidence: "high" as const,
+    };
+    assert.throws(
+      () => validateProjectionEvent({
+        ...checkpoint,
+        artifacts: [artifact, {
+          ...artifact,
+          artifactId: "00000000-0000-4000-8000-000000000050",
+        }],
+      }),
+      /INTEGRITY_FAILURE/u,
+    );
   });
 });

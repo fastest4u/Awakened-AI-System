@@ -15,6 +15,8 @@ import type {
 import { validateProjectionEvent } from "./source-event-codec.js";
 
 const MAX_ROWS_PER_PROJECTION = 100_000;
+const MAX_SUMMARY_BYTES = 16 * 1024;
+const SQLITE_INT64_MAX = 9_223_372_036_854_775_807n;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 const HASH = /^[0-9a-f]{64}$/u;
 
@@ -87,8 +89,16 @@ function strictArray(value: unknown): readonly unknown[] {
   return result;
 }
 
-function assertString(value: unknown): asserts value is string {
-  if (typeof value !== "string") return integrity();
+function assertBoundedString(
+  value: unknown,
+  maximumBytes: number,
+  allowEmpty = false,
+): asserts value is string {
+  if (
+    typeof value !== "string"
+    || (!allowEmpty && value.length === 0)
+    || Buffer.byteLength(value, "utf8") > maximumBytes
+  ) return integrity();
 }
 
 function assertUuid(value: unknown): asserts value is string {
@@ -109,7 +119,7 @@ function validateBinding(value: unknown): ProjectBinding {
     if (typeof source[key] !== "string" || !HASH.test(source[key])) return integrity();
   }
   if (source.branchScopeId !== null) assertUuid(source.branchScopeId);
-  if (source.branchRef !== null) assertString(source.branchRef);
+  if (source.branchRef !== null) assertBoundedString(source.branchRef, 1_024);
   if (source.sessionId !== null) assertUuid(source.sessionId);
   return Object.freeze({
     projectId: source.projectId as ProjectBinding["projectId"],
@@ -127,7 +137,7 @@ function inspectRows(value: unknown, expectedKeys: readonly string[]): readonly 
 }
 
 function assertPositiveBigint(value: unknown): asserts value is bigint {
-  if (typeof value !== "bigint" || value < 1n) return integrity();
+  if (typeof value !== "bigint" || value < 1n || value > SQLITE_INT64_MAX) return integrity();
 }
 
 function assertNumber(value: unknown, minimum: number, maximum: number): asserts value is number {
@@ -137,7 +147,7 @@ function assertNumber(value: unknown, minimum: number, maximum: number): asserts
 }
 
 function assertTimestamp(value: unknown): asserts value is string {
-  if (typeof value !== "string") return integrity();
+  assertBoundedString(value, 24);
   const milliseconds = Date.parse(value);
   if (!Number.isFinite(milliseconds) || new Date(milliseconds).toISOString() !== value) return integrity();
 }
@@ -157,8 +167,21 @@ function assertProjectRows(
       row.projectId !== binding?.projectId
       || typeof row.sourceEventPosition !== "bigint"
       || row.sourceEventPosition < 1n
+      || row.sourceEventPosition > SQLITE_INT64_MAX
       || (terminalEventPosition !== null && row.sourceEventPosition > terminalEventPosition)
     ) return integrity();
+  }
+}
+
+function assertUniqueIdentities(
+  rows: readonly Record<string, unknown>[],
+  identity: (row: Record<string, unknown>) => string,
+): void {
+  const seen = new Set<string>();
+  for (const row of rows) {
+    const key = identity(row);
+    if (seen.has(key)) return integrity();
+    seen.add(key);
   }
 }
 
@@ -178,7 +201,11 @@ function validateState(value: unknown): ProjectionFoldState {
   const binding = source.binding === null ? null : validateBinding(source.binding);
   if (
     source.terminalEventPosition !== null
-    && (typeof source.terminalEventPosition !== "bigint" || source.terminalEventPosition < 1n)
+    && (
+      typeof source.terminalEventPosition !== "bigint"
+      || source.terminalEventPosition < 1n
+      || source.terminalEventPosition > SQLITE_INT64_MAX
+    )
   ) return integrity();
   const sessionCheckpoints = inspectRows(source.sessionCheckpoints, [
     "projectId", "sessionId", "checkpointId", "checkpointVersion", "baseEventPosition",
@@ -217,24 +244,24 @@ function validateState(value: unknown): ProjectionFoldState {
     assertPositiveBigint(row.sourceEventPosition);
     if (row.baseEventPosition > row.sourceEventPosition) return integrity();
     assertTimestamp(row.occurredAt);
-    assertString(row.taskSummary);
+    assertBoundedString(row.taskSummary, MAX_SUMMARY_BYTES);
   }
   for (const row of canonicalItems) {
     assertUuid(row.itemId);
-    assertString(row.normalizedKey);
+    assertBoundedString(row.normalizedKey, 512);
     if (row.normalizedKey.normalize("NFKC").trim().toLowerCase() !== row.normalizedKey) return integrity();
     assertOneOf(row.status, [
       "candidate", "provisional", "verified", "conflicted", "superseded", "retracted",
       "expired", "erased-evidence",
     ] as const);
     assertOneOf(row.confidence, ["high", "medium", "low", "guess"] as const);
-    assertString(row.verificationMethod);
+    assertBoundedString(row.verificationMethod, 128);
     assertTimestamp(row.validFrom);
     if (row.validTo !== null) {
       assertTimestamp(row.validTo);
       if (Date.parse(row.validTo) <= Date.parse(row.validFrom)) return integrity();
     }
-    assertString(row.summary);
+    assertBoundedString(row.summary, MAX_SUMMARY_BYTES);
     if (typeof row.contentHash !== "string" || !HASH.test(row.contentHash)) return integrity();
     assertPositiveBigint(row.knownFromEventPosition);
     assertPositiveBigint(row.sourceEventPosition);
@@ -242,30 +269,30 @@ function validateState(value: unknown): ProjectionFoldState {
   }
   for (const row of followUps) {
     assertUuid(row.sessionId);
-    assertString(row.followUpId);
+    assertBoundedString(row.followUpId, 256);
     assertOneOf(row.status, ["open", "blocked"] as const);
-    assertString(row.summary);
+    assertBoundedString(row.summary, MAX_SUMMARY_BYTES);
     assertOneOf(row.confidence, ["high", "medium", "low", "guess"] as const);
   }
   for (const row of artifacts) {
     assertUuid(row.sessionId);
-    assertString(row.artifactId);
-    assertString(row.path);
-    if (row.summary !== null) assertString(row.summary);
-    assertString(row.action);
+    assertBoundedString(row.artifactId, 256);
+    assertBoundedString(row.path, 2_048);
+    if (row.summary !== null) assertBoundedString(row.summary, MAX_SUMMARY_BYTES);
+    assertOneOf(row.action, ["created", "modified", "deleted", "observed", "renamed", "referenced"] as const);
     if (row.contentHash !== null && (typeof row.contentHash !== "string" || !HASH.test(row.contentHash))) {
       return integrity();
     }
-    if (row.branchRef !== null) assertString(row.branchRef);
+    if (row.branchRef !== null) assertBoundedString(row.branchRef, 1_024);
     assertOneOf(row.confidence, ["high", "medium", "low", "guess"] as const);
   }
   for (const row of lexicalChunks) {
-    assertString(row.chunkId);
+    assertBoundedString(row.chunkId, 256);
     if (row.itemId !== null) assertUuid(row.itemId);
     if (row.sessionId !== null) assertUuid(row.sessionId);
-    assertString(row.section);
-    assertString(row.normalizedKey);
-    assertString(row.text);
+    assertBoundedString(row.section, 128);
+    assertBoundedString(row.normalizedKey, 512);
+    assertBoundedString(row.text, MAX_SUMMARY_BYTES);
   }
   for (const row of retrievalFeedback) {
     assertUuid(row.feedbackId);
@@ -276,6 +303,21 @@ function validateState(value: unknown): ProjectionFoldState {
     assertPositiveBigint(row.sourceEventPosition);
     if (row.sourceItemEventPosition > row.sourceEventPosition) return integrity();
   }
+  assertUniqueIdentities(sessionCheckpoints, (row) => row.sessionId as string);
+  assertUniqueIdentities(sessionCheckpoints, (row) => row.checkpointId as string);
+  assertUniqueIdentities(canonicalItems, (row) => row.itemId as string);
+  assertUniqueIdentities(canonicalItems, (row) => row.normalizedKey as string);
+  assertUniqueIdentities(followUps, (row) => row.followUpId as string);
+  assertUniqueIdentities(
+    artifacts,
+    (row) => `${String(row.sessionId)}\u0000${String(row.artifactId)}`,
+  );
+  assertUniqueIdentities(lexicalChunks, (row) => row.chunkId as string);
+  assertUniqueIdentities(
+    lexicalChunks.filter((row) => row.itemId !== null),
+    (row) => `${String(row.itemId)}\u0000${String(row.section)}`,
+  );
+  assertUniqueIdentities(retrievalFeedback, (row) => row.feedbackId as string);
   if (
     binding === null
     && (
@@ -516,7 +558,11 @@ function foldFeedback(
   event: Extract<ProjectionEvent, { readonly kind: "retrieval-feedback" }>,
 ): ProjectionFoldState {
   const item = state.canonicalItems.find((candidate) => candidate.itemId === event.itemId);
-  if (item === undefined || item.sourceEventPosition < event.sourceItemEventPosition) return integrity();
+  if (
+    item === undefined
+    || event.sourceItemEventPosition < item.knownFromEventPosition
+    || item.sourceEventPosition < event.sourceItemEventPosition
+  ) return integrity();
   if (state.retrievalFeedback.some((feedback) => feedback.feedbackId === event.feedbackId)) {
     return integrity();
   }
