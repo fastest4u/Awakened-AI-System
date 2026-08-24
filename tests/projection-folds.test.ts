@@ -13,6 +13,7 @@ import type {
 import {
   emptyProjectionFoldState,
   foldProjectionEvent,
+  ProjectionFoldAccumulator,
 } from "../src/orchestrator/projections/folds.js";
 
 const BINDING: ProjectBinding = Object.freeze({
@@ -30,6 +31,7 @@ const OCCURRED_AT = "2026-08-23T01:00:00.000Z";
 const RECORDED_AT = "2026-08-23T01:00:01.000Z";
 const ROOT_ID = "00000000-0000-4000-8000-000000000060";
 const CHILD_ID = "00000000-0000-4000-8000-000000000061";
+const GRANDCHILD_ID = "00000000-0000-4000-8000-000000000074";
 const ENTITY_A = "00000000-0000-4000-8000-000000000062";
 const ENTITY_B = "00000000-0000-4000-8000-000000000063";
 
@@ -599,6 +601,106 @@ describe("projection folds", () => {
       () => foldProjectionEvent(closed, lifecycleEvent(4n, ROOT_ID, "SessionResumed")),
       /INTEGRITY_FAILURE/u,
     );
+  });
+
+  it("rejects a stale fork owner generation in the pure fold", () => {
+    const root = foldProjectionEvent(
+      emptyProjectionFoldState(),
+      lifecycleEvent(1n, ROOT_ID, "SessionStarted"),
+    );
+    const child = foldProjectionEvent(root, lifecycleEvent(2n, CHILD_ID, "SessionForked", {
+      binding: Object.freeze({ ...BINDING, sessionId: CHILD_ID }),
+      parentSessionId: ROOT_ID,
+      ownerGeneration: 1,
+    }));
+    const transferred = foldProjectionEvent(child, lifecycleEvent(
+      3n,
+      ROOT_ID,
+      "SessionOwnerTransferred",
+      { ownerGeneration: 2, previousOwnerGeneration: 1, sourceStreamVersion: 2n },
+    ));
+    const fork = (ownerGeneration: number) => lifecycleEvent(4n, GRANDCHILD_ID, "SessionForked", {
+      binding: Object.freeze({ ...BINDING, sessionId: GRANDCHILD_ID }),
+      parentSessionId: CHILD_ID,
+      ownerGeneration,
+    });
+
+    assert.throws(() => foldProjectionEvent(transferred, fork(1)), /INTEGRITY_FAILURE/u);
+    assert.equal(foldProjectionEvent(transferred, fork(2)).sessionTree[2]?.ownerGeneration, 2);
+  });
+
+  it("rejects a stale fork owner generation in the linear accumulator", () => {
+    const accumulator = new ProjectionFoldAccumulator();
+    accumulator.append(lifecycleEvent(1n, ROOT_ID, "SessionStarted"));
+    accumulator.append(lifecycleEvent(2n, CHILD_ID, "SessionForked", {
+      binding: Object.freeze({ ...BINDING, sessionId: CHILD_ID }),
+      parentSessionId: ROOT_ID,
+      ownerGeneration: 1,
+    }));
+    accumulator.append(lifecycleEvent(3n, ROOT_ID, "SessionOwnerTransferred", {
+      ownerGeneration: 2,
+      previousOwnerGeneration: 1,
+      sourceStreamVersion: 2n,
+    }));
+    const fork = (ownerGeneration: number) => lifecycleEvent(4n, GRANDCHILD_ID, "SessionForked", {
+      binding: Object.freeze({ ...BINDING, sessionId: GRANDCHILD_ID }),
+      parentSessionId: CHILD_ID,
+      ownerGeneration,
+    });
+
+    assert.throws(() => accumulator.append(fork(1)), /INTEGRITY_FAILURE/u);
+    accumulator.append(fork(2));
+    assert.equal(accumulator.finish().sessionTree[2]?.ownerGeneration, 2);
+  });
+
+  it("rejects closing an ancestor with an open descendant in the pure fold", () => {
+    const root = foldProjectionEvent(
+      emptyProjectionFoldState(),
+      lifecycleEvent(1n, ROOT_ID, "SessionStarted"),
+    );
+    const child = foldProjectionEvent(root, lifecycleEvent(2n, CHILD_ID, "SessionForked", {
+      binding: Object.freeze({ ...BINDING, sessionId: CHILD_ID }),
+      parentSessionId: ROOT_ID,
+      ownerGeneration: 1,
+    }));
+    const closeRoot = (position: bigint) => lifecycleEvent(position, ROOT_ID, "SessionEnded", {
+      sourceStreamVersion: 2n,
+    });
+
+    assert.throws(() => foldProjectionEvent(child, closeRoot(3n)), /INTEGRITY_FAILURE/u);
+    const childClosed = foldProjectionEvent(child, lifecycleEvent(
+      3n,
+      CHILD_ID,
+      "ChildSessionCompleted",
+      {
+        binding: Object.freeze({ ...BINDING, sessionId: CHILD_ID }),
+        parentSessionId: ROOT_ID,
+        sourceStreamVersion: 2n,
+      },
+    ));
+    assert.equal(foldProjectionEvent(childClosed, closeRoot(4n)).sessionTree[0]?.lifecycleState, "closed");
+  });
+
+  it("rejects closing an ancestor with an open descendant in the linear accumulator", () => {
+    const accumulator = new ProjectionFoldAccumulator();
+    accumulator.append(lifecycleEvent(1n, ROOT_ID, "SessionStarted"));
+    accumulator.append(lifecycleEvent(2n, CHILD_ID, "SessionForked", {
+      binding: Object.freeze({ ...BINDING, sessionId: CHILD_ID }),
+      parentSessionId: ROOT_ID,
+      ownerGeneration: 1,
+    }));
+    const closeRoot = (position: bigint) => lifecycleEvent(position, ROOT_ID, "SessionEnded", {
+      sourceStreamVersion: 2n,
+    });
+
+    assert.throws(() => accumulator.append(closeRoot(3n)), /INTEGRITY_FAILURE/u);
+    accumulator.append(lifecycleEvent(3n, CHILD_ID, "ChildSessionCompleted", {
+      binding: Object.freeze({ ...BINDING, sessionId: CHILD_ID }),
+      parentSessionId: ROOT_ID,
+      sourceStreamVersion: 2n,
+    }));
+    accumulator.append(closeRoot(4n));
+    assert.equal(accumulator.finish().sessionTree[0]?.lifecycleState, "closed");
   });
 
   it("rejects unknown/self/cross-binding parents, second openings, and forged cycles", () => {

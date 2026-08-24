@@ -245,6 +245,7 @@ function validateState(value: unknown): ProjectionFoldState {
     if (row.parentSessionId === null) continue;
     const parent = treeById.get(String(row.parentSessionId));
     if (parent === undefined || parent.rootSessionId !== row.rootSessionId) return integrity();
+    if (row.lifecycleState === "open" && parent.lifecycleState !== "open") return integrity();
     const visited = new Set<string>([String(row.sessionId)]);
     let cursor: Record<string, unknown> | undefined = parent;
     while (cursor !== undefined) {
@@ -491,16 +492,34 @@ function checkpointChunks(event: CheckpointProjectionEvent): readonly LexicalChu
   ]);
 }
 
+function openingParent(
+  tree: ReadonlyMap<string, SessionTreeProjection>,
+  event: SessionLifecycleProjectionEvent,
+): SessionTreeProjection | null {
+  if (event.eventType === "SessionStarted") {
+    if (event.parentSessionId !== null) return integrity();
+    return null;
+  }
+  const parentSessionId = event.parentSessionId;
+  if (parentSessionId === null || parentSessionId === event.sessionId) return integrity();
+  const parent = tree.get(parentSessionId);
+  if (parent === undefined || parent.lifecycleState !== "open") return integrity();
+  const root = tree.get(parent.rootSessionId);
+  if (
+    root === undefined
+    || root.parentSessionId !== null
+    || root.lifecycleState !== "open"
+    || event.ownerGeneration !== root.ownerGeneration
+  ) return integrity();
+  return parent;
+}
+
 function foldLifecycle(state: ProjectionFoldState, event: SessionLifecycleProjectionEvent): ProjectionFoldState {
   const current = state.sessionTree.find((row) => row.sessionId === event.sessionId);
   if (event.eventType === "SessionStarted" || event.eventType === "SessionForked") {
     if (current !== undefined || event.sourceStreamVersion !== 1n || event.ownerGeneration === null) return integrity();
-    const parent = event.parentSessionId === null ? null : state.sessionTree.find((row) => row.sessionId === event.parentSessionId);
-    if (event.eventType === "SessionStarted") {
-      if (parent !== null) return integrity();
-    } else if (parent === undefined || parent === null || parent.lifecycleState !== "open" || parent.sessionId === event.sessionId) {
-      return integrity();
-    }
+    const tree = new Map(state.sessionTree.map((row) => [row.sessionId, row] as const));
+    const parent = openingParent(tree, event);
     const row: SessionTreeProjection = Object.freeze({
       projectId: event.binding.projectId, sessionId: event.sessionId,
       rootSessionId: parent === null ? event.sessionId : parent.rootSessionId,
@@ -526,6 +545,12 @@ function foldLifecycle(state: ProjectionFoldState, event: SessionLifecycleProjec
     )
   ) return integrity();
   const terminal = TERMINAL_LIFECYCLE_EVENTS.has(event.eventType);
+  if (
+    terminal
+    && state.sessionTree.some((row) => (
+      row.parentSessionId === current.sessionId && row.lifecycleState === "open"
+    ))
+  ) return integrity();
   const row: SessionTreeProjection = Object.freeze({
     ...current,
     lifecycleState: terminal ? "closed" : "open",
@@ -704,6 +729,7 @@ export class ProjectionFoldAccumulator {
   #binding: ProjectBinding | null = null;
   #terminalEventPosition: bigint | null = null;
   readonly #sessionTree = new Map<string, SessionTreeProjection>();
+  readonly #openChildCounts = new Map<string, number>();
   readonly #sessionCheckpoints: SessionCheckpointProjection[] = [];
   readonly #checkpointIds = new Set<string>();
   readonly #canonicalItems = new Map<string, CanonicalItemProjection>();
@@ -776,12 +802,7 @@ export class ProjectionFoldAccumulator {
     const current = this.#sessionTree.get(event.sessionId);
     if (event.eventType === "SessionStarted" || event.eventType === "SessionForked") {
       if (current !== undefined || event.sourceStreamVersion !== 1n || event.ownerGeneration === null) return integrity();
-      const parent = event.parentSessionId === null ? null : this.#sessionTree.get(event.parentSessionId);
-      if (event.eventType === "SessionStarted") {
-        if (parent !== null) return integrity();
-      } else if (parent === undefined || parent === null || parent.lifecycleState !== "open" || parent.sessionId === event.sessionId) {
-        return integrity();
-      }
+      const parent = openingParent(this.#sessionTree, event);
       this.#room(this.#sessionTree.size, false);
       this.#sessionTree.set(event.sessionId, Object.freeze({
         projectId: event.binding.projectId, sessionId: event.sessionId,
@@ -792,6 +813,13 @@ export class ProjectionFoldAccumulator {
         sourceEventId: event.sourceEventId, sourceEventPosition: event.sourceEventPosition,
         latestStreamVersion: event.sourceStreamVersion, anchor: null,
       }));
+      this.#openChildCounts.set(event.sessionId, 0);
+      if (parent !== null) {
+        this.#openChildCounts.set(
+          parent.sessionId,
+          (this.#openChildCounts.get(parent.sessionId) ?? 0) + 1,
+        );
+      }
       return;
     }
     if (
@@ -808,6 +836,12 @@ export class ProjectionFoldAccumulator {
       )
     ) return integrity();
     const terminal = TERMINAL_LIFECYCLE_EVENTS.has(event.eventType);
+    if (terminal && (this.#openChildCounts.get(current.sessionId) ?? 0) !== 0) return integrity();
+    if (terminal && current.parentSessionId !== null) {
+      const parentOpenChildren = this.#openChildCounts.get(current.parentSessionId);
+      if (parentOpenChildren === undefined || parentOpenChildren < 1) return integrity();
+      this.#openChildCounts.set(current.parentSessionId, parentOpenChildren - 1);
+    }
     this.#sessionTree.set(event.sessionId, Object.freeze({
       ...current,
       lifecycleState: terminal ? "closed" : "open",
