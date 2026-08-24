@@ -661,24 +661,15 @@ function recordManifestPublicationSuccess(attempt: ManifestPublicationAttempt): 
   attempt.state.authorityEpoch += 1n;
 }
 
-function verifyDifferentManifestAuthority(
+function verifyPresentManifestAuthority(
   paths: VerifiedProjectionPublicationPaths,
   observed: StableProjectionManifestSnapshot,
-  attemptedBytes: Uint8Array,
   expectedBinding: ProjectBinding,
   directoryIdentity: ProjectionDirectoryIdentity,
   operations: StableProjectionDirectoryOperations,
   publicationAttempt: ManifestPublicationAttempt,
 ): void {
   if (publicationAttempt.state.poisoned || observed.state !== "present") {
-    return poisonManifestPublication(publicationAttempt);
-  }
-  if (publicationAttempt.state.authorityEpoch !== publicationAttempt.authorityEpoch) {
-    // The epoch advances only after another re-entrant attempt fully verifies
-    // and commits its manifest authority.
-    return;
-  }
-  if (snapshotHasBytes(observed, attemptedBytes)) {
     return poisonManifestPublication(publicationAttempt);
   }
   try {
@@ -703,6 +694,51 @@ function verifyDifferentManifestAuthority(
   }
 }
 
+function verifyDifferentManifestAuthority(
+  paths: VerifiedProjectionPublicationPaths,
+  observed: StableProjectionManifestSnapshot,
+  attemptedBytes: Uint8Array,
+  expectedBinding: ProjectBinding,
+  directoryIdentity: ProjectionDirectoryIdentity,
+  operations: StableProjectionDirectoryOperations,
+  publicationAttempt: ManifestPublicationAttempt,
+): void {
+  verifyPresentManifestAuthority(
+    paths,
+    observed,
+    expectedBinding,
+    directoryIdentity,
+    operations,
+    publicationAttempt,
+  );
+  if (
+    publicationAttempt.state.authorityEpoch === publicationAttempt.authorityEpoch
+    && snapshotHasBytes(observed, attemptedBytes)
+  ) return poisonManifestPublication(publicationAttempt);
+}
+
+function verifyRestoredManifestAuthority(
+  paths: VerifiedProjectionPublicationPaths,
+  observed: StableProjectionManifestSnapshot,
+  previous: StableProjectionManifestSnapshot,
+  expectedBinding: ProjectBinding,
+  directoryIdentity: ProjectionDirectoryIdentity,
+  operations: StableProjectionDirectoryOperations,
+  publicationAttempt: ManifestPublicationAttempt,
+): void {
+  if (!sameManifestSnapshot(observed, previous)) {
+    return poisonManifestPublication(publicationAttempt);
+  }
+  verifyPresentManifestAuthority(
+    paths,
+    observed,
+    expectedBinding,
+    directoryIdentity,
+    operations,
+    publicationAttempt,
+  );
+}
+
 function restorePreviousManifestIfOwned(
   paths: VerifiedProjectionPublicationPaths,
   directoryIdentity: ProjectionDirectoryIdentity,
@@ -718,9 +754,7 @@ function restorePreviousManifestIfOwned(
     commitManifestPublication(paths, previous, attempted, publicationAttempt);
     return "superseded";
   };
-  if (!manifestPublicationAttemptIsCurrent(publicationAttempt)) {
-    return supersededBeforeRollback();
-  }
+  if (publicationAttempt.state.poisoned) return poisonManifestPublication(publicationAttempt);
   let current: StableProjectionManifestSnapshot;
   try {
     current = captureManifestSnapshot(paths.directory, directoryIdentity, operations);
@@ -780,7 +814,23 @@ function restorePreviousManifestIfOwned(
     return poisonManifestPublication(publicationAttempt);
   }
   if (result === "poisoned") return poisonManifestPublication(publicationAttempt);
-  if (result === "restored" || result === "superseded") {
+  if (result === "restored") {
+    let authority: StableProjectionManifestSnapshot;
+    try {
+      authority = captureManifestSnapshot(paths.directory, directoryIdentity, operations);
+    } catch {
+      return poisonManifestPublication(publicationAttempt);
+    }
+    verifyRestoredManifestAuthority(
+      paths,
+      authority,
+      previous,
+      expectedBinding,
+      directoryIdentity,
+      operations,
+      publicationAttempt,
+    );
+  } else if (result === "superseded") {
     let authority: StableProjectionManifestSnapshot;
     try {
       authority = captureManifestSnapshot(paths.directory, directoryIdentity, operations);

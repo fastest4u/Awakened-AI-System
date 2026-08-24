@@ -454,6 +454,44 @@ describe("immutable projection manifest", () => {
     });
   }
 
+  it("cleans evidence after a verified rollback restores byte-identical prior authority", () => {
+    const { root, second, target } = replacementFixture(
+      "projection-manifest-identical-rollback-",
+      false,
+    );
+    publishProjectionManifest({
+      projectionDirectory: root,
+      manifest: second,
+      expectedBinding: BINDING,
+    });
+    const priorBytes = readFileSync(target);
+    const injectedFailure = new Error("injected post-install failure");
+    let failure: unknown;
+
+    try {
+      publishProjectionManifest({
+        projectionDirectory: root,
+        manifest: second,
+        expectedBinding: BINDING,
+      }, {
+        faultInjector: {
+          hit(boundary): void {
+            if (boundary === "after-manifest-replace-before-validation") {
+              throw injectedFailure;
+            }
+          },
+        },
+      });
+    } catch (error) {
+      failure = error;
+    }
+
+    assert.equal(failure, injectedFailure);
+    assert.deepEqual(readFileSync(target), priorBytes);
+    assert.equal(publicationLockRetained(root), false);
+    assert.deepEqual(publicationPrivateEntries(root), []);
+  });
+
   it("does not roll an outer failure over a later successful nested publication", () => {
     const root = mkdtempSync(join(tmpdir(), "projection-manifest-nested-publish-"));
     roots.push(root);
@@ -512,6 +550,67 @@ describe("immutable projection manifest", () => {
     );
   });
 
+  it("retains evidence when a nested publication becomes sidecar-invalid", () => {
+    const root = mkdtempSync(join(tmpdir(), "projection-manifest-nested-invalid-authority-"));
+    roots.push(root);
+    const first = projectionManifest(1);
+    const second = projectionManifest(2);
+    const third = projectionManifest(3);
+    for (const candidate of [first, second, third]) {
+      writeFileSync(join(root, candidate.databaseFile), `generation ${candidate.generation}`, "utf8");
+    }
+    const target = publishProjectionManifest({
+      projectionDirectory: root,
+      manifest: first,
+      expectedBinding: BINDING,
+    });
+    let nestedPublished = false;
+    let failure: unknown;
+
+    try {
+      publishProjectionManifest({
+        projectionDirectory: root,
+        manifest: second,
+        expectedBinding: BINDING,
+      }, {
+        faultInjector: {
+          hit(boundary): void {
+            if (boundary !== "after-manifest-replace-before-validation" || nestedPublished) return;
+            nestedPublished = true;
+            publishProjectionManifest({
+              projectionDirectory: root,
+              manifest: third,
+              expectedBinding: BINDING,
+            });
+            writeFileSync(
+              `${join(root, third.databaseFile)}-wal`,
+              "nested authority invalidated after publication",
+              "utf8",
+            );
+          },
+        },
+      });
+    } catch (error) {
+      failure = error;
+    }
+
+    assert.deepEqual({
+      attempted: publicationEvidenceGenerations(root, "attempted"),
+      code: failure instanceof LifecycleError ? failure.code : null,
+      lockRetained: publicationLockRetained(root),
+      manifestGeneration: publishedGeneration(target),
+      nestedPublished,
+      previous: publicationEvidenceGenerations(root, "previous"),
+    }, {
+      attempted: [2],
+      code: "MATERIALIZATION_CONFLICT",
+      lockRetained: true,
+      manifestGeneration: 3,
+      nestedPublished: true,
+      previous: [1],
+    });
+  });
+
   it("does not claim a later manifest first observed after its own target rename", () => {
     const root = mkdtempSync(join(tmpdir(), "projection-manifest-post-rename-observation-"));
     roots.push(root);
@@ -566,7 +665,11 @@ describe("immutable projection manifest", () => {
         && error.code === "MATERIALIZATION_CONFLICT"
         && error.retryable,
     );
-    assert.equal(captures, 3, "an unowned observation must not enter rollback");
+    assert.equal(
+      captures,
+      4,
+      "the superseding authority must be stably recaptured before cleanup",
+    );
     assert.equal(nestedPublished, true);
     assert.equal(
       parseProjectionManifest(JSON.parse(readFileSync(target, "utf8")), BINDING).generation,
@@ -1106,18 +1209,22 @@ describe("immutable projection manifest", () => {
         },
       }),
       (error: unknown) => error instanceof LifecycleError
-        && error.code === "INTEGRITY_FAILURE",
+        && error.code === "MATERIALIZATION_CONFLICT"
+        && error.retryable,
     );
     assert.equal(
       captures,
       4,
-      "the publication epoch must stop rollback before a stale second comparison",
+      "the publication epoch must not bypass verification of stale authority",
     );
     assert.equal(nestedPublished, true);
     assert.equal(
       parseProjectionManifest(JSON.parse(readFileSync(target, "utf8")), BINDING).generation,
       3,
     );
+    assert.equal(publicationLockRetained(root), true);
+    assert.deepEqual(publicationEvidenceGenerations(root, "attempted"), [2]);
+    assert.deepEqual(publicationEvidenceGenerations(root, "previous"), [1]);
   });
 
   it("does not overwrite external authority installed after the final success snapshot", () => {
