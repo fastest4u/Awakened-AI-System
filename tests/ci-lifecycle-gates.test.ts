@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { readFileSync, readdirSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import test from "node:test";
 
 const ROOT = new URL("../../", import.meta.url);
@@ -24,6 +26,46 @@ const FOCUSED_TESTS = [
   "lifecycle-materialization-queue", "lifecycle-render-closure.reader", "lifecycle-faults",
   "lifecycle-fixture-protocol", "lifecycle-worker-runtime", "lifecycle.stress",
 ];
+
+const PROTECTED_VERSION_ONE_PATHS = [
+  "src/app.ts", "src/index.ts", "src/controllers", "src/schemas", "src/services",
+] as const;
+
+function typescriptFiles(directory: string): readonly string[] {
+  const files: string[] = [];
+  const visit = (relativeDirectory: string): void => {
+    for (const entry of readdirSync(new URL(`${relativeDirectory}/`, ROOT), { withFileTypes: true })) {
+      const relativePath = `${relativeDirectory}/${entry.name}`;
+      if (entry.isDirectory()) visit(relativePath);
+      else if (entry.isFile() && entry.name.endsWith(".ts")) files.push(relativePath);
+    }
+  };
+  visit(directory);
+  return Object.freeze(files.sort());
+}
+
+const PRODUCTION_CONTROLLER_PATHS = typescriptFiles("src/controllers");
+const PROTECTED_VERSION_ONE_SOURCE_PATHS = Object.freeze([
+  "src/app.ts",
+  "src/index.ts",
+  ...PRODUCTION_CONTROLLER_PATHS,
+  ...typescriptFiles("src/schemas"),
+  ...typescriptFiles("src/services"),
+]);
+
+function productionToolNames(): readonly string[] {
+  return Object.freeze(["src/app.ts", ...PRODUCTION_CONTROLLER_PATHS].flatMap((path) => (
+    [...source(path).matchAll(/registerTool\(\s*["']([^"']+)["']/g)]
+      .map((match) => match[1]!)
+  )));
+}
+
+function subproject3Script(): string {
+  const packageJson = JSON.parse(source("package.json")) as { scripts?: Record<string, string> };
+  const script = packageJson.scripts?.["test:subproject-3"];
+  if (typeof script !== "string") assert.fail("test:subproject-3 must exist");
+  return script;
+}
 
 const PLAIN_WORKFLOW_KEY = "[A-Za-z][A-Za-z0-9_-]*";
 const PLAIN_MAPPING_LINE = new RegExp(`^ *${PLAIN_WORKFLOW_KEY}:(?: .*)?$`);
@@ -375,5 +417,43 @@ test("workflow parser rejects directives, document markers, tabs, and exotic blo
   ];
   for (const mutatedCi of mutations) {
     assert.throws(() => assertWorkflowReleaseContract(mutatedCi, stress), /(?:directive|document marker|tab|block scalar)/);
+  }
+});
+
+test("Subproject 3 evaluation and projection runtime remain internal-only", () => {
+  const toolNames = productionToolNames();
+  assert.equal(toolNames.includes("memory_retrievalExplain"), false);
+  assert.equal(
+    toolNames.some((name) => /^memory_(?:retrieval|projection)/.test(name)),
+    false,
+    "no Version 2 retrieval or projection tool may be registered",
+  );
+
+  const script = subproject3Script();
+  assert.match(script, /npm run test:build/);
+  assert.match(script, /projection-runtime\.test\.js/);
+  assert.match(script, /retrieval-evaluation\.test\.js/);
+  assert.match(script, /ci-lifecycle-gates\.test\.js/);
+  assert.ok(
+    script.indexOf("projection-runtime.test.js") < script.indexOf("retrieval-evaluation.test.js"),
+    "the runtime matrix must finish before corpus evaluation",
+  );
+  assert.ok(
+    script.indexOf("retrieval-evaluation.test.js") < script.indexOf("ci-lifecycle-gates.test.js"),
+    "corpus evaluation must finish before the isolation gate",
+  );
+
+  const protectedDiff = execFileSync(
+    "git",
+    ["diff", "--name-only", BASE, "--", ...PROTECTED_VERSION_ONE_PATHS],
+    { cwd: fileURLToPath(ROOT), encoding: "utf8" },
+  ).trim();
+  assert.equal(protectedDiff, "", "Version 1 production paths must remain byte-unchanged");
+  for (const path of PROTECTED_VERSION_ONE_SOURCE_PATHS) {
+    assert.doesNotMatch(
+      source(path),
+      /orchestrator\/(?:projections|retrieval|runtime\/projection-runtime)/,
+      `${path} must not import the Version 2 projection runtime`,
+    );
   }
 });
