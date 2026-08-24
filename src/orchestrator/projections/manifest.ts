@@ -98,6 +98,8 @@ export interface ProjectionManifestV2 {
   readonly createdAt: string;
 }
 
+export type ProjectionManifest = ProjectionManifestV1 | ProjectionManifestV2;
+
 export interface PublishProjectionManifestInput {
   readonly projectionDirectory: string;
   readonly manifest: unknown;
@@ -115,6 +117,10 @@ export interface ProjectionManifestPublicationFaultInjector {
 export interface PublishProjectionManifestOptions {
   readonly faultInjector?: ProjectionManifestPublicationFaultInjector;
   readonly directoryOperations?: StableProjectionDirectoryOperations;
+  /** Runs only while the manifest-publication lock is held and before the manifest can name the generation. */
+  readonly beforeManifestInstall?: Readonly<{
+    install(directory: string, identity: ProjectionDirectoryIdentity, lockToken: string): void;
+  }>;
 }
 
 export interface ProjectionPathStat {
@@ -347,7 +353,20 @@ export function parseProjectionManifestV2(
   });
 }
 
-export function serializeProjectionManifest(manifest: ProjectionManifestV1 | ProjectionManifestV2): Uint8Array {
+/** Parses either immutable manifest version for internal publication only. */
+export function parseProjectionManifestForPublication(
+  value: unknown,
+  expectedBinding: ProjectBinding,
+): ProjectionManifest {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) invalid();
+  const schemaVersion = Object.getOwnPropertyDescriptor(value, "schemaVersion");
+  if (schemaVersion === undefined || !("value" in schemaVersion)) invalid();
+  if (schemaVersion.value === 1) return parseProjectionManifest(value, expectedBinding);
+  if (schemaVersion.value === 2) return parseProjectionManifestV2(value, expectedBinding);
+  return invalid();
+}
+
+export function serializeProjectionManifest(manifest: ProjectionManifest): Uint8Array {
   return Buffer.from(`${canonicalJson(manifest)}\n`, "utf8");
 }
 
@@ -436,6 +455,27 @@ export function verifyProjectionPublicationPaths(
   ) pathInvalid();
   assertRegularDatabase(databasePath, inspection);
   assertProjectionSidecarsAbsent(databasePath, inspection);
+  return Object.freeze({ directory, databasePath, targetPath, tempPath });
+}
+
+function unpublishedProjectionManifestPaths(
+  projectionDirectory: string,
+  databaseFile: string,
+  inspection: ProjectionPathInspection = filesystemProjectionPathInspection,
+): VerifiedProjectionPublicationPaths {
+  if (
+    typeof databaseFile !== "string"
+    || !/^projections-[12]-[1-9][0-9]{0,9}\.sqlite$/u.test(databaseFile)
+  ) pathInvalid();
+  const directory = safeProjectionDirectory(projectionDirectory, inspection);
+  const databasePath = join(directory, databaseFile);
+  const targetPath = join(directory, PROJECTION_MANIFEST_FILENAME);
+  const tempPath = join(directory, `.${PROJECTION_MANIFEST_FILENAME}.tmp`);
+  if (
+    !contained(normalizedPath(directory), normalizedPath(databasePath))
+    || !contained(normalizedPath(directory), normalizedPath(targetPath))
+    || !contained(normalizedPath(directory), normalizedPath(tempPath))
+  ) pathInvalid();
   return Object.freeze({ directory, databasePath, targetPath, tempPath });
 }
 
@@ -750,7 +790,7 @@ function verifyPresentManifestAuthority(
   try {
     const bytes = Buffer.from(observed.bytesBase64, "base64");
     const decoded = JSON.parse(bytes.toString("utf8")) as unknown;
-    const manifest = parseProjectionManifest(decoded, expectedBinding);
+    const manifest = parseProjectionManifestForPublication(decoded, expectedBinding);
     if (!Buffer.from(serializeProjectionManifest(manifest)).equals(bytes)) {
       return poisonManifestPublication(publicationAttempt);
     }
@@ -932,11 +972,10 @@ export function publishProjectionManifest(
 ): string {
   const source = exactRecord(input, ["projectionDirectory", "manifest", "expectedBinding"]);
   const expectedBinding = source.expectedBinding as ProjectBinding;
-  const manifest = parseProjectionManifest(source.manifest, expectedBinding);
-  const paths = verifyProjectionPublicationPaths(
-    source.projectionDirectory as string,
-    manifest.databaseFile,
-  );
+  const manifest = parseProjectionManifestForPublication(source.manifest, expectedBinding);
+  const paths = options.beforeManifestInstall === undefined
+    ? verifyProjectionPublicationPaths(source.projectionDirectory as string, manifest.databaseFile)
+    : unpublishedProjectionManifestPaths(source.projectionDirectory as string, manifest.databaseFile);
   const directoryOperations = options.directoryOperations
     ?? filesystemStableProjectionDirectoryOperations;
   let directoryIdentity: ProjectionDirectoryIdentity;
@@ -966,6 +1005,11 @@ export function publishProjectionManifest(
             options.faultInjector?.hit("after-manifest-temp-fsync-before-replace");
           },
           rename(): void {
+            options.beforeManifestInstall?.install(
+              paths.directory,
+              directoryIdentity,
+              publicationAttempt.state.lockToken,
+            );
             assertPinnedGeneration(
               paths.directory,
               manifest.databaseFile,

@@ -1,23 +1,27 @@
 import { createHash } from "node:crypto";
 import {
+  existsSync,
   lstatSync,
   readFileSync,
   realpathSync,
   readdirSync,
 } from "node:fs";
-import { isAbsolute, join, normalize, resolve } from "node:path";
+import { basename, isAbsolute, join, normalize, resolve } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 
 import { LifecycleError } from "../lifecycle/errors.js";
-import type { BuiltProjectionGeneration } from "./builder.js";
+import type { BuiltProjectionGeneration, StagedProjectionGeneration } from "./builder.js";
 import type { ProjectBinding } from "./contracts.js";
 import type { ProjectionEventReader, ProjectionEventSnapshot } from "./event-reader.js";
 import {
   assertProjectionSidecarsAbsent,
   parseProjectionManifest,
+  parseProjectionManifestV2,
   PROJECTION_MANIFEST_FILENAME,
   publishProjectionManifest,
   verifyProjectionPublicationPaths,
   type ProjectionManifestV1,
+  type ProjectionManifestV2,
   type ProjectionManifestPublicationFaultBoundary,
   type ProjectionPathInspection,
 } from "./manifest.js";
@@ -31,10 +35,12 @@ import {
   PROJECTION_MANIFEST_PUBLICATION_LOCK_FILENAME,
   sameProjectionDirectoryIdentity,
   type ProjectionDirectoryIdentity,
+  type StableProjectionGenerationIdentity,
 } from "./stable-directory.js";
 
 const MAX_GENERATION = 2_147_483_647;
 const GENERATION_FILE = /^projections-1-([1-9][0-9]{0,9})\.sqlite$/u;
+const V2_GENERATION_FILE = /^projections-2-([1-9][0-9]{0,9})\.sqlite$/u;
 
 export interface PublishedProjectionGeneration extends BuiltProjectionGeneration {
   readonly directoryIdentity: ProjectionDirectoryIdentity;
@@ -42,6 +48,28 @@ export interface PublishedProjectionGeneration extends BuiltProjectionGeneration
 
 export interface ProjectionGenerationBuilder {
   build(snapshot: ProjectionEventSnapshot, generation: number): Promise<BuiltProjectionGeneration>;
+}
+
+export interface V2ProjectionGenerationBuilder {
+  buildV2(snapshot: ProjectionEventSnapshot, generation: number): Promise<StagedProjectionGeneration>;
+}
+
+export interface PublishedProjectionGenerationV2 {
+  readonly manifest: ProjectionManifestV2;
+  readonly projectionDirectory: string;
+  readonly databasePath: string;
+  readonly directoryIdentity: ProjectionDirectoryIdentity;
+}
+
+export interface V2ProjectionBuildCoordinatorOptions {
+  readonly eventReader: ProjectionEventReader;
+  readonly builder: V2ProjectionGenerationBuilder;
+  readonly projectionDirectory: string;
+  readonly leasedFilenames?: () => readonly string[];
+  readonly faultInjector?: Readonly<{
+    hit(boundary: "after-v2-generation-install-before-manifest" | ProjectionManifestPublicationFaultBoundary): void;
+  }>;
+  readonly now?: () => number;
 }
 
 export interface ProjectionBuildCoordinator {
@@ -473,6 +501,265 @@ export class DefaultProjectionBuildCoordinator implements ProjectionBuildCoordin
     try {
       return await operation();
     } finally {
+      release();
+      if (this.#projectTails.get(projectId) === tail) this.#projectTails.delete(projectId);
+    }
+  }
+}
+
+/**
+ * Internal-only V2 adoption boundary. It intentionally has no reader-lease
+ * method, so production V1 routing cannot consume a V2 generation.
+ */
+export class V2ProjectionBuildCoordinator {
+  readonly #eventReader: ProjectionEventReader;
+  readonly #builder: V2ProjectionGenerationBuilder;
+  readonly #projectionDirectory: string;
+  readonly #leasedFilenames: () => readonly string[];
+  readonly #faultInjector: V2ProjectionBuildCoordinatorOptions["faultInjector"];
+  readonly #now: () => number;
+  readonly #projectTails = new Map<string, Promise<void>>();
+
+  constructor(options: V2ProjectionBuildCoordinatorOptions) {
+    this.#eventReader = options.eventReader;
+    this.#builder = options.builder;
+    this.#projectionDirectory = canonicalDirectory(options.projectionDirectory);
+    this.#leasedFilenames = options.leasedFilenames ?? (() => Object.freeze([]));
+    this.#faultInjector = options.faultInjector;
+    this.#now = options.now ?? Date.now;
+  }
+
+  async ensurePublished(
+    binding: ProjectBinding,
+    requiredEventPosition: bigint,
+    deadlineMs: number,
+  ): Promise<PublishedProjectionGenerationV2> {
+    if (
+      typeof requiredEventPosition !== "bigint"
+      || requiredEventPosition < 0n
+      || !Number.isSafeInteger(deadlineMs)
+      || deadlineMs < 0
+    ) throw new TypeError("PROJECTION_REQUEST_INVALID");
+    const expiresAt = this.#now() + deadlineMs;
+    return this.#serialized(binding.projectId, async () => {
+      const current = this.#loadPublished(binding);
+      if (current !== null && BigInt(current.manifest.terminalEventPosition) >= requiredEventPosition) {
+        return current;
+      }
+      this.#assertDeadline(expiresAt, requiredEventPosition, current);
+      this.#cleanupKnownTemps();
+      const snapshot = await this.#eventReader.openCommittedSnapshot(binding);
+      try {
+        this.#assertDeadline(expiresAt, requiredEventPosition, current);
+        const staged = await this.#builder.buildV2(snapshot, this.#nextGeneration());
+        this.#assertDeadline(expiresAt, requiredEventPosition, current);
+        const stagedIdentity = this.#verifyStaged(binding, staged);
+        const operations = filesystemStableProjectionDirectoryOperations;
+        let installed = false;
+        publishProjectionManifest({
+          projectionDirectory: this.#projectionDirectory,
+          manifest: staged.manifest,
+          expectedBinding: binding,
+        }, {
+          faultInjector: this.#faultInjector,
+          beforeManifestInstall: {
+            install: (_directory, identity, lockToken): void => {
+              const active = this.#loadPublished(binding);
+              this.#reconcileUnpublished(active, identity, lockToken, binding);
+              const outcome = operations.installGeneration(
+                this.#projectionDirectory,
+                identity,
+                lockToken,
+                basename(staged.temporaryDatabasePath),
+                staged.manifest.databaseFile,
+                stagedIdentity,
+              );
+              if (outcome !== "installed") throw new LifecycleError("MATERIALIZATION_CONFLICT");
+              installed = true;
+              this.#faultInjector?.hit("after-v2-generation-install-before-manifest");
+              this.#assertDeadline(expiresAt, requiredEventPosition, active);
+            },
+          },
+        });
+        if (!installed) throw new Error("PROJECTION_PUBLICATION_INVALID");
+        const published = this.#loadPublished(binding);
+        if (
+          published === null
+          || published.manifest.generation !== staged.manifest.generation
+          || published.manifest.databaseSha256 !== staged.manifest.databaseSha256
+        ) throw new Error("PROJECTION_PUBLICATION_INVALID");
+        return published;
+      } finally {
+        snapshot.close();
+      }
+    });
+  }
+
+  #loadPublished(binding: ProjectBinding): PublishedProjectionGenerationV2 | null {
+    const manifestPath = join(this.#projectionDirectory, PROJECTION_MANIFEST_FILENAME);
+    const bytes = this.#readManifestBytes(manifestPath);
+    if (bytes === null) return null;
+    const manifest = parseProjectionManifestV2(JSON.parse(bytes) as unknown, binding);
+    const paths = verifyProjectionPublicationPaths(this.#projectionDirectory, manifest.databaseFile);
+    if (sha256File(paths.databasePath) !== manifest.databaseSha256) {
+      throw new Error("PROJECTION_DATABASE_CHECKSUM_INVALID");
+    }
+    const identity = filesystemStableProjectionDirectoryOperations.capture(this.#projectionDirectory);
+    filesystemStableProjectionDirectoryOperations.assertGeneration(
+      this.#projectionDirectory,
+      manifest.databaseFile,
+      identity,
+    );
+    return Object.freeze({
+      manifest,
+      projectionDirectory: this.#projectionDirectory,
+      databasePath: paths.databasePath,
+      directoryIdentity: identity,
+    });
+  }
+
+  #verifyStaged(binding: ProjectBinding, staged: StagedProjectionGeneration): StableProjectionGenerationIdentity {
+    if (resolve(staged.projectionDirectory) !== resolve(this.#projectionDirectory)) {
+      throw new Error("PROJECTION_PATH_INVALID");
+    }
+    const manifest = parseProjectionManifestV2(staged.manifest, binding);
+    const temporaryFilename = basename(staged.temporaryDatabasePath);
+    if (
+      resolve(join(this.#projectionDirectory, temporaryFilename)) !== resolve(staged.temporaryDatabasePath)
+      || !/^\.projections-2-[1-9][0-9]{0,9}-[0-9a-f]{32}\.sqlite\.tmp$/u.test(temporaryFilename)
+      || manifest.databaseFile !== `projections-2-${manifest.generation}.sqlite`
+    ) throw new Error("PROJECTION_PATH_INVALID");
+    const freshIdentity = filesystemStableProjectionDirectoryOperations.capture(this.#projectionDirectory);
+    if (!sameProjectionDirectoryIdentity(freshIdentity, staged.directoryIdentity)) {
+      throw new Error("PROJECTION_PATH_INVALID");
+    }
+    assertProjectionSidecarsAbsent(staged.temporaryDatabasePath);
+    const stat = lstatSync(staged.temporaryDatabasePath, { bigint: true });
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.size < 0n || sha256File(staged.temporaryDatabasePath) !== manifest.databaseSha256) {
+      throw new Error("PROJECTION_DATABASE_CHECKSUM_INVALID");
+    }
+    return Object.freeze({
+      filename: temporaryFilename,
+      device: stat.dev.toString(),
+      inode: stat.ino.toString(),
+      size: stat.size.toString(),
+      sha256: manifest.databaseSha256,
+    });
+  }
+
+  #reconcileUnpublished(
+    active: PublishedProjectionGenerationV2 | null,
+    identity: ProjectionDirectoryIdentity,
+    lockToken: string,
+    binding: ProjectBinding,
+  ): readonly string[] {
+    const leased = new Set(this.#leasedFilenames());
+    const removed: string[] = [];
+    for (const filename of readdirSync(this.#projectionDirectory).sort()) {
+      if (V2_GENERATION_FILE.test(filename) === false) continue;
+      if (active?.manifest.databaseFile === filename || leased.has(filename)) continue;
+      const candidate = filesystemStableProjectionDirectoryOperations.captureGeneration(
+        this.#projectionDirectory,
+        filename,
+        identity,
+      );
+      this.#assertUnpublishedV2Candidate(join(this.#projectionDirectory, filename), filename, binding);
+      filesystemStableProjectionDirectoryOperations.removeGeneration(
+        this.#projectionDirectory,
+        identity,
+        lockToken,
+        candidate,
+      );
+      removed.push(filename);
+    }
+    return Object.freeze(removed);
+  }
+
+  #assertUnpublishedV2Candidate(path: string, filename: string, binding: ProjectBinding): void {
+    // The file must be a readable schema-2 image bound to this request; a name
+    // alone is never enough authority to remove it.
+    let database: DatabaseSync | undefined;
+    try {
+      database = new DatabaseSync(path, { readOnly: true });
+      const metadata = database.prepare(`
+        SELECT schema_version, project_id, vault_id, store_id, workspace_id,
+               branch_scope_id, branch_ref, session_id, generation
+        FROM projection_metadata WHERE singleton = 1
+      `).get();
+      const match = V2_GENERATION_FILE.exec(filename);
+      const schemaVersion = typeof metadata?.schema_version === "bigint"
+        ? metadata.schema_version
+        : typeof metadata?.schema_version === "number" && Number.isSafeInteger(metadata.schema_version)
+          ? BigInt(metadata.schema_version)
+          : -1n;
+      const generation = typeof metadata?.generation === "bigint"
+        ? metadata.generation
+        : typeof metadata?.generation === "number" && Number.isSafeInteger(metadata.generation)
+          ? BigInt(metadata.generation)
+          : -1n;
+      if (
+        metadata === undefined || match === null || schemaVersion !== 2n
+        || metadata.project_id !== binding.projectId || metadata.vault_id !== binding.vaultId
+        || metadata.store_id !== binding.storeId || metadata.workspace_id !== binding.workspaceId
+        || metadata.branch_scope_id !== binding.branchScopeId || metadata.branch_ref !== binding.branchRef
+        || metadata.session_id !== null || generation !== BigInt(match[1]!)
+        || database.prepare("PRAGMA integrity_check").get()?.integrity_check !== "ok"
+      ) throw new Error("PROJECTION_PUBLICATION_RECOVERY_REQUIRED");
+    } catch (error) {
+      if (error instanceof Error && error.message === "PROJECTION_PUBLICATION_RECOVERY_REQUIRED") throw error;
+      throw new Error("PROJECTION_PUBLICATION_RECOVERY_REQUIRED", { cause: error });
+    } finally {
+      database?.close();
+    }
+  }
+
+  #nextGeneration(): number {
+    try {
+      let maximum = 0;
+      for (const filename of readdirSync(this.#projectionDirectory)) {
+        const match = V2_GENERATION_FILE.exec(filename);
+        if (match !== null) maximum = Math.max(maximum, Number(match[1]));
+      }
+      if (maximum >= MAX_GENERATION) throw new Error("PROJECTION_GENERATION_EXHAUSTED");
+      return maximum + 1;
+    } catch (error) {
+      if (notFound(error)) return 1;
+      throw error;
+    }
+  }
+
+  #cleanupKnownTemps(): void {
+    if (!existsSync(this.#projectionDirectory)) return;
+    try {
+      const identity = filesystemStableProjectionDirectoryOperations.capture(this.#projectionDirectory);
+      filesystemStableProjectionDirectoryOperations.cleanupKnownTemps(this.#projectionDirectory, identity);
+    } catch (error) {
+      if (!notFound(error)) throw error;
+    }
+  }
+
+  #readManifestBytes(path: string): string | null {
+    try { return readFileSync(path, "utf8"); } catch (error) { if (notFound(error)) return null; throw error; }
+  }
+
+  #assertDeadline(
+    expiresAt: number,
+    required: bigint,
+    current: PublishedProjectionGenerationV2 | null,
+  ): void {
+    if (this.#now() >= expiresAt) {
+      throw new ProjectionLagError(required, current === null ? 0n : BigInt(current.manifest.terminalEventPosition));
+    }
+  }
+
+  async #serialized<T>(projectId: string, operation: () => Promise<T>): Promise<T> {
+    const previous = this.#projectTails.get(projectId) ?? Promise.resolve();
+    let release = (): void => undefined;
+    const current = new Promise<void>((resolveCurrent) => { release = resolveCurrent; });
+    const tail = previous.catch(() => undefined).then(() => current);
+    this.#projectTails.set(projectId, tail);
+    await previous.catch(() => undefined);
+    try { return await operation(); } finally {
       release();
       if (this.#projectTails.get(projectId) === tail) this.#projectTails.delete(projectId);
     }

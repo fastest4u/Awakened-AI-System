@@ -7,6 +7,7 @@ import { LifecycleError } from "../lifecycle/errors.js";
 
 const MUTATION_TIMEOUT_MS = 5_000;
 const MAX_STABLE_MANIFEST_BYTES = 64 * 1_024;
+const MAX_STABLE_GENERATION_BYTES = 512 * 1_024 * 1_024;
 export const PROJECTION_MANIFEST_PUBLICATION_LOCK_FILENAME =
   ".projection-manifest.publish.lock" as const;
 const MUTATION_SCRIPT = String.raw`
@@ -21,6 +22,7 @@ const [
   operation, expectedPath, expectedDevice, expectedInode, ...operationArguments
 ] = process.argv.slice(1);
 const MAX_MANIFEST_BYTES = ${String(MAX_STABLE_MANIFEST_BYTES)};
+const MAX_GENERATION_BYTES = ${String(MAX_STABLE_GENERATION_BYTES)};
 const MANIFEST_NAME = "projection-manifest.json";
 const MANIFEST_TEMP_NAME = ".projection-manifest.json.tmp";
 const LOCK_NAME = ${JSON.stringify(PROJECTION_MANIFEST_PUBLICATION_LOCK_FILENAME)};
@@ -130,13 +132,13 @@ const sidecarPresent = (name) => {
   }
   return false;
 };
-const captureFileIdentity = (name) => {
+const captureFileIdentity = (name, maximumBytes = MAX_MANIFEST_BYTES) => {
   const before = lstatSync(name, { bigint: true });
   if (
     !before.isFile()
     || before.isSymbolicLink()
     || before.size < 0n
-    || before.size > BigInt(MAX_MANIFEST_BYTES)
+    || before.size > BigInt(maximumBytes)
   ) invalid();
   let handle;
   try {
@@ -211,7 +213,7 @@ const transactionNames = (attemptToken) => ({
 try {
   assertDirectory();
   if (operation === "cleanup") {
-    const generationTemp = /^\.projections-1-[1-9][0-9]{0,9}\.sqlite\.tmp(?:-(?:wal|shm))?$/u;
+    const generationTemp = /^\.projections-[12]-[1-9][0-9]{0,9}(?:-[0-9a-f]{32})?\.sqlite\.tmp(?:-(?:wal|shm))?$/u;
     for (const name of readdirSync(".")) {
       if (name !== ".projection-manifest.json.tmp" && !generationTemp.test(name)) continue;
       const entry = lstatSync(name);
@@ -226,7 +228,7 @@ try {
     if (
       typeof filename !== "string"
       || basename(filename) !== filename
-      || !/^projections-1-[1-9][0-9]{0,9}\.sqlite$/u.test(filename)
+      || !/^projections-[12]-[1-9][0-9]{0,9}\.sqlite$/u.test(filename)
     ) invalid();
     if (sidecarPresent(filename)) integrity();
     try {
@@ -237,6 +239,75 @@ try {
       if (error && error.code === "ENOENT") process.stdout.write("missing");
       else throw error;
     }
+  } else if (operation === "capture-generation") {
+    const [filename] = operationArguments;
+    if (
+      typeof filename !== "string"
+      || basename(filename) !== filename
+      || !/^projections-2-[1-9][0-9]{0,9}\.sqlite$/u.test(filename)
+    ) invalid();
+    if (sidecarPresent(filename)) integrity();
+    const captured = captureFileIdentity(filename, MAX_GENERATION_BYTES);
+    process.stdout.write(JSON.stringify({
+      device: captured.device,
+      inode: captured.inode,
+      size: captured.size,
+      sha256: captured.sha256,
+    }));
+  } else if (operation === "install-generation") {
+    const [lockToken, temporaryFilename, finalFilename, device, inode, size, sha256] = operationArguments;
+    assertLock(assertToken(lockToken));
+    if (
+      typeof temporaryFilename !== "string"
+      || !/^\.projections-2-[1-9][0-9]{0,9}-[0-9a-f]{32}\.sqlite\.tmp$/u.test(temporaryFilename)
+      || typeof finalFilename !== "string"
+      || !/^projections-2-[1-9][0-9]{0,9}\.sqlite$/u.test(finalFilename)
+    ) invalid();
+    const temporary = captureFileIdentity(temporaryFilename, MAX_GENERATION_BYTES);
+    if (
+      temporary.device !== device || temporary.inode !== inode
+      || temporary.size !== size || temporary.sha256 !== sha256
+      || sidecarPresent(temporaryFilename) || sidecarPresent(finalFilename)
+    ) invalid();
+    if (!linkIfAbsent(temporaryFilename, finalFilename)) {
+      process.stdout.write("superseded");
+    } else {
+      const installed = captureFileIdentity(finalFilename, MAX_GENERATION_BYTES);
+      if (
+        installed.device !== temporary.device || installed.inode !== temporary.inode
+        || installed.size !== temporary.size || installed.sha256 !== temporary.sha256
+      ) integrity();
+      removeRegularFile(temporaryFilename);
+      syncDirectory();
+      assertLock(lockToken);
+      process.stdout.write("installed");
+    }
+  } else if (operation === "remove-generation") {
+    const [lockToken, filename, device, inode, size, sha256] = operationArguments;
+    assertLock(assertToken(lockToken));
+    if (
+      typeof filename !== "string"
+      || !/^projections-2-[1-9][0-9]{0,9}\.sqlite$/u.test(filename)
+    ) invalid();
+    const candidate = captureFileIdentity(filename, MAX_GENERATION_BYTES);
+    if (
+      candidate.device !== device || candidate.inode !== inode
+      || candidate.size !== size || candidate.sha256 !== sha256 || sidecarPresent(filename)
+    ) invalid();
+    let lastError;
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try {
+        removeRegularFile(filename);
+        syncDirectory();
+        assertLock(lockToken);
+        process.stdout.write("removed");
+        lastError = undefined;
+        break;
+      } catch (error) {
+        lastError = error;
+      }
+    }
+    if (lastError !== undefined) throw lastError;
   } else if (operation === "acquire-manifest-lock") {
     const lockToken = assertToken(operationArguments[0]);
     let handle;
@@ -531,6 +602,14 @@ export interface StableProjectionManifestContentIdentity {
   readonly sha256: string;
 }
 
+export interface StableProjectionGenerationIdentity {
+  readonly filename: string;
+  readonly device: string;
+  readonly inode: string;
+  readonly size: string;
+  readonly sha256: string;
+}
+
 export type StableProjectionManifestSnapshot =
   | Readonly<{
     readonly state: "missing";
@@ -551,6 +630,25 @@ export interface StableProjectionDirectoryOperations {
     filename: string,
     identity: ProjectionDirectoryIdentity,
   ): void;
+  captureGeneration(
+    directory: string,
+    filename: string,
+    identity: ProjectionDirectoryIdentity,
+  ): StableProjectionGenerationIdentity;
+  installGeneration(
+    directory: string,
+    identity: ProjectionDirectoryIdentity,
+    lockToken: string,
+    temporaryFilename: string,
+    finalFilename: string,
+    expected: StableProjectionGenerationIdentity,
+  ): "installed" | "superseded";
+  removeGeneration(
+    directory: string,
+    identity: ProjectionDirectoryIdentity,
+    lockToken: string,
+    expected: StableProjectionGenerationIdentity,
+  ): "removed";
   captureManifest(
     directory: string,
     identity: ProjectionDirectoryIdentity,
@@ -647,6 +745,9 @@ function runStableMutation(
   operation:
     | "cleanup"
     | "assert-generation"
+    | "capture-generation"
+    | "install-generation"
+    | "remove-generation"
     | "capture-manifest"
     | "acquire-manifest-lock"
     | "prepare-manifest"
@@ -701,6 +802,33 @@ function snapshotIdentityArguments(
 
 function decimal(value: unknown): value is string {
   return typeof value === "string" && /^(?:0|[1-9][0-9]*)$/u.test(value);
+}
+
+function decodeGenerationIdentity(value: string, filename: string): StableProjectionGenerationIdentity {
+  let decoded: unknown;
+  try {
+    decoded = JSON.parse(value) as unknown;
+  } catch {
+    return invalid();
+  }
+  if (typeof decoded !== "object" || decoded === null || Array.isArray(decoded)) return invalid();
+  const source = decoded as Record<string, unknown>;
+  if (
+    Reflect.ownKeys(source).length !== 4
+    || !decimal(source.device)
+    || !decimal(source.inode)
+    || !decimal(source.size)
+    || BigInt(source.size) > BigInt(MAX_STABLE_GENERATION_BYTES)
+    || typeof source.sha256 !== "string"
+    || !/^[0-9a-f]{64}$/u.test(source.sha256)
+  ) return invalid();
+  return Object.freeze({
+    filename,
+    device: source.device,
+    inode: source.inode,
+    size: source.size,
+    sha256: source.sha256,
+  });
 }
 
 function decodeManifestSnapshot(
@@ -769,6 +897,53 @@ StableProjectionDirectoryOperations = Object.freeze({
     if (runStableMutation("assert-generation", directory, identity, [filename]) !== "present") {
       return invalid();
     }
+  },
+  captureGeneration(
+    directory: string,
+    filename: string,
+    identity: ProjectionDirectoryIdentity,
+  ): StableProjectionGenerationIdentity {
+    return decodeGenerationIdentity(
+      runStableMutation("capture-generation", directory, identity, [filename]),
+      filename,
+    );
+  },
+  installGeneration(
+    directory: string,
+    identity: ProjectionDirectoryIdentity,
+    lockToken: string,
+    temporaryFilename: string,
+    finalFilename: string,
+    expected: StableProjectionGenerationIdentity,
+  ): "installed" | "superseded" {
+    const result = runStableMutation("install-generation", directory, identity, [
+      lockToken,
+      temporaryFilename,
+      finalFilename,
+      expected.device,
+      expected.inode,
+      expected.size,
+      expected.sha256,
+    ]);
+    if (result !== "installed" && result !== "superseded") return invalid();
+    return result;
+  },
+  removeGeneration(
+    directory: string,
+    identity: ProjectionDirectoryIdentity,
+    lockToken: string,
+    expected: StableProjectionGenerationIdentity,
+  ): "removed" {
+    const result = runStableMutation("remove-generation", directory, identity, [
+      lockToken,
+      expected.filename,
+      expected.device,
+      expected.inode,
+      expected.size,
+      expected.sha256,
+    ]);
+    if (result !== "removed") return invalid();
+    return result;
   },
   captureManifest(
     directory: string,

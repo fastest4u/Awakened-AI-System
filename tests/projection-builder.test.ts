@@ -605,11 +605,11 @@ describe("projection generation builder", () => {
         branchRef: BRANCH_REF,
       },
     );
-    assert.equal(existsSync(generation.databasePath), true);
-    assert.equal(existsSync(`${generation.databasePath}-wal`), false);
-    assert.equal(existsSync(`${generation.databasePath}-shm`), false);
+    assert.equal(existsSync(generation.temporaryDatabasePath), true);
+    assert.equal(existsSync(`${generation.temporaryDatabasePath}-wal`), false);
+    assert.equal(existsSync(`${generation.temporaryDatabasePath}-shm`), false);
     assert.deepEqual(
-      [...readFileSync(generation.databasePath).subarray(18, 20)],
+      [...readFileSync(generation.temporaryDatabasePath).subarray(18, 20)],
       [1, 1],
       "published main image must use rollback journaling, not WAL header bytes",
     );
@@ -619,9 +619,9 @@ describe("projection generation builder", () => {
     assert.equal(source.prepare("SELECT count(*) AS n FROM events").get()?.n, 8);
     source.close();
 
-    const projected = new DatabaseSync(generation.databasePath, { readOnly: true });
-    assert.equal(existsSync(`${generation.databasePath}-wal`), false);
-    assert.equal(existsSync(`${generation.databasePath}-shm`), false);
+    const projected = new DatabaseSync(generation.temporaryDatabasePath, { readOnly: true });
+    assert.equal(existsSync(`${generation.temporaryDatabasePath}-wal`), false);
+    assert.equal(existsSync(`${generation.temporaryDatabasePath}-shm`), false);
     assert.deepEqual(
       projected.prepare("PRAGMA database_list").all().map((row) => row.name),
       ["main"],
@@ -651,14 +651,14 @@ describe("projection generation builder", () => {
       },
     );
     projected.close();
-    assert.equal(existsSync(`${generation.databasePath}-wal`), false);
-    assert.equal(existsSync(`${generation.databasePath}-shm`), false);
+    assert.equal(existsSync(`${generation.temporaryDatabasePath}-wal`), false);
+    assert.equal(existsSync(`${generation.temporaryDatabasePath}-shm`), false);
 
     assert.deepEqual(
       driver.opens.map((entry) => [entry.path, entry.options.mode]),
       [
         [sourcePath, "read-only-existing"],
-        [join(projectionDirectory, ".projections-2-1.sqlite.tmp"), "create"],
+        [generation.temporaryDatabasePath, "create"],
       ],
     );
   });
@@ -777,7 +777,7 @@ describe("projection generation builder", () => {
     snapshot.close();
     source.close();
 
-    const projected = new DatabaseSync(generation.databasePath, { readOnly: true });
+    const projected = new DatabaseSync(generation.temporaryDatabasePath, { readOnly: true });
     try {
       assert.deepEqual(projected.prepare(`
         SELECT session_id, root_session_id, parent_session_id, lifecycle_state,
@@ -1046,6 +1046,37 @@ describe("projection generation builder", () => {
       /INTEGRITY_FAILURE/u,
     );
     assert.equal(existsSync(join(projectionDirectory, "projections-2-1.sqlite")), false);
+    snapshot.close();
+    source.close();
+  });
+
+  it("keeps a V2 build staged until the coordinator adopts its verified bytes", async () => {
+    const root = mkdtempSync(join(tmpdir(), "projection-builder-v2-stage-"));
+    roots.push(root);
+    const sourcePath = join(root, "events.sqlite");
+    const projectionDirectory = join(root, "projections");
+    const source = createSource(sourcePath);
+    insertEvent(source, 1, "MemorySourceRecorded", memoryPayload());
+    const snapshot = await new SqliteProjectionEventReader({
+      driver: new NodeSqliteDriver({ DatabaseSync }),
+      eventStorePath: sourcePath,
+    }).openCommittedSnapshot(BINDING);
+
+    const staged = await new ImmutableProjectionBuilder({
+      driver: new NodeSqliteDriver({ DatabaseSync }),
+      projectionDirectory,
+      now: () => NOW,
+    }).buildV2(snapshot, 1);
+
+    assert.equal(
+      existsSync(join(projectionDirectory, "projections-2-1.sqlite")),
+      false,
+      "a builder must not expose a final V2 generation before manifest authority exists",
+    );
+    const temporaryDatabasePath = (staged as unknown as Record<string, unknown>).temporaryDatabasePath;
+    if (typeof temporaryDatabasePath !== "string") assert.fail("staged build must expose its temporary path");
+    assert.match(temporaryDatabasePath, /\.projections-2-1-[0-9a-f]{32}\.sqlite\.tmp$/u);
+    assert.equal(existsSync(temporaryDatabasePath), true);
     snapshot.close();
     source.close();
   });

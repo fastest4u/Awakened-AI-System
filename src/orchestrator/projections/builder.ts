@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import {
   closeSync,
   existsSync,
@@ -38,6 +38,10 @@ import {
   type ProjectionManifestV2,
 } from "./manifest.js";
 import {
+  captureProjectionDirectoryIdentity,
+  type ProjectionDirectoryIdentity,
+} from "./stable-directory.js";
+import {
   createProjectionSchema,
   PROJECTION_SCHEMA_SQL_V1,
   PROJECTION_SCHEMA_VERSION,
@@ -53,11 +57,15 @@ export interface BuiltProjectionGeneration {
   readonly databasePath: string;
 }
 
-export interface BuiltProjectionGenerationV2 {
+export interface StagedProjectionGeneration {
   readonly manifest: ProjectionManifestV2;
   readonly projectionDirectory: string;
-  readonly databasePath: string;
+  readonly temporaryDatabasePath: string;
+  readonly directoryIdentity: ProjectionDirectoryIdentity;
 }
+
+/** @deprecated Use StagedProjectionGeneration; V2 files are never final at build time. */
+export type BuiltProjectionGenerationV2 = StagedProjectionGeneration;
 
 export interface ImmutableProjectionBuilderOptions {
   readonly driver: SqliteDriver;
@@ -892,14 +900,17 @@ export class ImmutableProjectionBuilder {
     }
   }
 
-  async buildV2(snapshot: ProjectionEventSnapshot, generation: number): Promise<BuiltProjectionGenerationV2> {
+  async buildV2(snapshot: ProjectionEventSnapshot, generation: number): Promise<StagedProjectionGeneration> {
     if (!Number.isSafeInteger(generation) || generation < 1 || generation > MAX_GENERATION) {
       return failure("PROJECTION_GENERATION_INVALID");
     }
     const directory = safeDirectory(this.#projectionDirectory, this.#syncDirectory);
     const databaseFile = `projections-2-${generation}.sqlite`;
     const databasePath = join(directory, databaseFile);
-    const tempPath = join(directory, `.projections-2-${generation}.sqlite.tmp`);
+    const tempPath = join(
+      directory,
+      `.projections-2-${generation}-${randomBytes(16).toString("hex")}.sqlite.tmp`,
+    );
     if (existsSync(databasePath)) return failure("PROJECTION_GENERATION_EXISTS");
     assertProjectionSidecarsAbsent(databasePath);
     for (const knownTemp of [tempPath, `${tempPath}-wal`, `${tempPath}-shm`]) removeKnownFile(knownTemp);
@@ -949,11 +960,7 @@ export class ImmutableProjectionBuilder {
         closeSync(handle);
       }
       assertProjectionSidecarsAbsent(tempPath);
-      assertProjectionSidecarsAbsent(databasePath);
-      renameSync(tempPath, databasePath);
-      this.#syncDirectory(directory);
-      verifyProjectionPublicationPaths(directory, databaseFile);
-      assertRollbackJournalHeader(databasePath);
+      const directoryIdentity = captureProjectionDirectoryIdentity(directory);
       const manifest = parseProjectionManifestV2({
         schemaVersion: 2,
         projectId: snapshot.binding.projectId,
@@ -967,11 +974,16 @@ export class ImmutableProjectionBuilder {
         terminalEventPosition: snapshot.terminalEventPosition.toString(),
         terminalEventHash: snapshot.terminalEventHash,
         databaseFile,
-        databaseSha256: sha256File(databasePath),
+        databaseSha256: sha256File(tempPath),
         coreChecksums: persistedCoreChecksums,
         createdAt,
       }, snapshot.binding);
-      return Object.freeze({ manifest, projectionDirectory: directory, databasePath });
+      return Object.freeze({
+        manifest,
+        projectionDirectory: directory,
+        temporaryDatabasePath: tempPath,
+        directoryIdentity,
+      });
     } catch (error) {
       try {
         connection?.close();

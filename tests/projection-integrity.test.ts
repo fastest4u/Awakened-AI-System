@@ -28,6 +28,7 @@ import type {
   WorkspaceId,
 } from "../src/orchestrator/identity/contracts.js";
 import { ImmutableProjectionBuilder } from "../src/orchestrator/projections/builder.js";
+import { V2ProjectionBuildCoordinator } from "../src/orchestrator/projections/coordinator.js";
 import {
   PROJECTION_NAMES,
   projectionCoreChecksum,
@@ -308,18 +309,13 @@ async function createFixture(options: FixtureOptions = {}): Promise<Fixture> {
     expectedStreamVersion += BigInt(batch.length);
   }
 
-  const snapshot = await new SqliteProjectionEventReader({
-    driver,
-    eventStorePath: sourcePath,
-  }).openCommittedSnapshot(BINDING);
-  const generation = await new ImmutableProjectionBuilder({
-    driver,
-    projectionDirectory,
-    now: () => NOW,
-  }).buildV2(snapshot, 1);
-  snapshot.close();
   connection.close();
   connections.splice(connections.indexOf(connection), 1);
+  const generation = await new V2ProjectionBuildCoordinator({
+    projectionDirectory,
+    eventReader: new SqliteProjectionEventReader({ driver, eventStorePath: sourcePath }),
+    builder: new ImmutableProjectionBuilder({ driver, projectionDirectory, now: () => NOW }),
+  }).ensurePublished(BINDING, expectedStreamVersion, 10_000);
   return {
     sourcePath,
     projectionDirectory,
