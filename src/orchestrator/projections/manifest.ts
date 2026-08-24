@@ -1070,6 +1070,31 @@ export function publishProjectionManifest(
           installed === undefined
           || !manifestPublicationAttemptIsCurrent(publicationAttempt)
         ) {
+          if (
+            publicationAttempt.state.authorityEpoch !== publicationAttempt.authorityEpoch
+            && !observedDifferentAuthority
+          ) {
+            let superseding: StableProjectionManifestSnapshot;
+            try {
+              superseding = captureManifestSnapshot(
+                paths.directory,
+                directoryIdentity,
+                directoryOperations,
+              );
+            } catch {
+              return poisonManifestPublication(publicationAttempt);
+            }
+            verifyDifferentManifestAuthority(
+              paths,
+              superseding,
+              manifestBytes,
+              expectedBinding,
+              directoryIdentity,
+              directoryOperations,
+              publicationAttempt,
+            );
+            observedDifferentAuthority = true;
+          }
           if (installed === undefined && !observedDifferentAuthority) {
             return poisonManifestPublication(publicationAttempt);
           }

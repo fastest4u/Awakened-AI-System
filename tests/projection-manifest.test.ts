@@ -611,6 +611,70 @@ describe("immutable projection manifest", () => {
     });
   });
 
+  it("retains evidence when an exception follows sidecar-invalid nested publication", () => {
+    const root = mkdtempSync(join(tmpdir(), "projection-manifest-nested-invalid-exception-"));
+    roots.push(root);
+    const first = projectionManifest(1);
+    const second = projectionManifest(2);
+    const third = projectionManifest(3);
+    for (const candidate of [first, second, third]) {
+      writeFileSync(join(root, candidate.databaseFile), `generation ${candidate.generation}`, "utf8");
+    }
+    const target = publishProjectionManifest({
+      projectionDirectory: root,
+      manifest: first,
+      expectedBinding: BINDING,
+    });
+    const nestedWal = `${join(root, third.databaseFile)}-wal`;
+    const injectedFailure = new Error("injected after nested publication");
+    let nestedPublished = false;
+    let failure: unknown;
+
+    try {
+      publishProjectionManifest({
+        projectionDirectory: root,
+        manifest: second,
+        expectedBinding: BINDING,
+      }, {
+        faultInjector: {
+          hit(boundary): void {
+            if (boundary !== "after-manifest-replace-before-validation" || nestedPublished) return;
+            nestedPublished = true;
+            publishProjectionManifest({
+              projectionDirectory: root,
+              manifest: third,
+              expectedBinding: BINDING,
+            });
+            writeFileSync(nestedWal, "nested authority invalidated before exception", "utf8");
+            throw injectedFailure;
+          },
+        },
+      });
+    } catch (error) {
+      failure = error;
+    }
+
+    assert.deepEqual({
+      attempted: publicationEvidenceGenerations(root, "attempted"),
+      code: failure instanceof LifecycleError ? failure.code : null,
+      injectedFailureEscaped: failure === injectedFailure,
+      lockRetained: publicationLockRetained(root),
+      manifestGeneration: publishedGeneration(target),
+      nestedPublished,
+      previous: publicationEvidenceGenerations(root, "previous"),
+      walRetained: existsSync(nestedWal),
+    }, {
+      attempted: [2],
+      code: "MATERIALIZATION_CONFLICT",
+      injectedFailureEscaped: false,
+      lockRetained: true,
+      manifestGeneration: 3,
+      nestedPublished: true,
+      previous: [1],
+      walRetained: true,
+    });
+  });
+
   it("does not claim a later manifest first observed after its own target rename", () => {
     const root = mkdtempSync(join(tmpdir(), "projection-manifest-post-rename-observation-"));
     roots.push(root);
