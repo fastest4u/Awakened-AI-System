@@ -14,6 +14,10 @@ import {
   type RetrievalItem,
   type RetrievalRanker,
   type ValidatedInternalRetrievalRequest,
+  type VectorCacheManifestV1,
+  type VectorCandidateChannel,
+  type VectorChannelFailureCode,
+  type VectorChannelResult,
 } from "./contracts.js";
 import {
   buildRetrievalExplanation,
@@ -46,11 +50,28 @@ import {
   type RankingCandidate,
   type RationalScore,
 } from "./ranking.js";
+import {
+  disabledVectorChannel,
+  parseVectorCacheManifest,
+  unavailableVectorChannel,
+} from "./vector-cache.js";
 
 export interface InternalRetrievalServiceOptions {
   readonly projections: ProjectionLeaseProvider;
   readonly candidates: RetrievalCandidateRepository;
   readonly ranker?: RetrievalRanker;
+  readonly vectorChannel?: VectorCandidateChannel;
+}
+
+export interface VectorChannelDiagnostic {
+  readonly used: boolean;
+  readonly failureCode: VectorChannelFailureCode | null;
+  readonly candidateCount: number;
+  readonly manifest: VectorCacheManifestV1 | null;
+}
+
+export interface InternalRetrievalChannelDiagnostics {
+  readonly vector: VectorChannelDiagnostic;
 }
 
 export interface RankedInternalRetrievalResultItem extends InternalRetrievalResultItem {
@@ -69,6 +90,7 @@ export interface RankedInternalRetrievalResult extends InternalRetrievalResult {
   readonly conflicts: readonly RankedConflictGroup[];
   readonly conflictTruncated: boolean;
   readonly conflictCursor: string | null;
+  readonly channels: InternalRetrievalChannelDiagnostics;
   readonly explanation?: RetrievalExplanation;
   readonly explanationTruncated: boolean;
 }
@@ -400,15 +422,91 @@ function withExplanation(
   return Object.freeze({ ...base, explanation, explanationTruncated: false });
 }
 
+function vectorDiagnostic(
+  result: VectorChannelResult,
+  request: ValidatedInternalRetrievalRequest,
+): VectorChannelDiagnostic {
+  if (!Array.isArray(result.candidates) || result.candidates.length > request.candidateLimit) {
+    throw new TypeError("VECTOR_CHANNEL_INVALID");
+  }
+  if (!result.used) {
+    if (result.candidates.length !== 0 || result.manifest !== null) {
+      throw new TypeError("VECTOR_CHANNEL_INVALID");
+    }
+    if (result.failureCode === null) {
+      return Object.freeze({
+        used: false,
+        failureCode: null,
+        candidateCount: 0,
+        manifest: null,
+      });
+    }
+    if (result.failureCode === "PROVIDER_UNAVAILABLE") {
+      return Object.freeze({
+        used: false,
+        failureCode: "PROVIDER_UNAVAILABLE",
+        candidateCount: 0,
+        manifest: null,
+      });
+    }
+    throw new TypeError("VECTOR_CHANNEL_INVALID");
+  }
+  if (result.failureCode !== null) throw new TypeError("VECTOR_CHANNEL_INVALID");
+  if (result.manifest === null) throw new TypeError("VECTOR_CHANNEL_INVALID");
+  const seen = new Set<string>();
+  let candidateCount = 0;
+  for (const candidate of result.candidates) {
+    if (
+      typeof candidate.candidateId !== "string"
+      || candidate.candidateId.length === 0
+      || Buffer.byteLength(candidate.candidateId, "utf8") > 4_096
+      || !Number.isSafeInteger(candidate.rank)
+      || candidate.rank < 1
+      || typeof candidate.similarity !== "number"
+      || !Number.isFinite(candidate.similarity)
+      || candidate.similarity < -1
+      || candidate.similarity > 1
+    ) throw new TypeError("VECTOR_CHANNEL_INVALID");
+    const key = `${candidate.item.kind}:${candidate.item.id}`;
+    if (seen.has(key) || denialReason(candidate.item, request) !== null) continue;
+    seen.add(key);
+    candidateCount += 1;
+  }
+  const manifest = parseVectorCacheManifest(result.manifest);
+  return Object.freeze({
+    used: true,
+    failureCode: null,
+    candidateCount,
+    manifest,
+  });
+}
+
+async function searchOptionalVectorChannel(
+  channel: VectorCandidateChannel | undefined,
+  request: ValidatedInternalRetrievalRequest,
+  lease: Parameters<VectorCandidateChannel["search"]>[1],
+): Promise<VectorChannelDiagnostic> {
+  if (!request.vector.enabled || channel === undefined) {
+    return vectorDiagnostic(disabledVectorChannel(), request);
+  }
+  try {
+    return vectorDiagnostic(await channel.search(request, lease), request);
+  } catch {
+    return vectorDiagnostic(unavailableVectorChannel(), request);
+  }
+}
+
 export class InternalRetrievalService {
   readonly #projections: ProjectionLeaseProvider;
   readonly #candidates: RetrievalCandidateRepository;
   readonly #customRanker: RetrievalRanker | undefined;
+  readonly #vectorChannel: VectorCandidateChannel | undefined;
 
   constructor(options: InternalRetrievalServiceOptions) {
     this.#projections = options.projections;
     this.#candidates = options.candidates;
     this.#customRanker = options.ranker;
+    this.#vectorChannel = options.vectorChannel;
   }
 
   async retrieve(input: InternalRetrievalRequest): Promise<RankedInternalRetrievalResult> {
@@ -427,6 +525,7 @@ export class InternalRetrievalService {
       }
       const collected = this.#candidates.collectEligible(lease, request);
       const filtered = filterCandidates(collected, request);
+      const vector = await searchOptionalVectorChannel(this.#vectorChannel, request, lease);
       const fused = fuseCandidates(rankingChannels(filtered.collection), DEFAULT_RANKING_POLICY);
 
       let items: readonly RankedInternalRetrievalResultItem[];
@@ -477,6 +576,7 @@ export class InternalRetrievalService {
         conflicts,
         conflictTruncated,
         conflictCursor,
+        channels: Object.freeze({ vector }),
       });
       return withExplanation(base, request, manifest);
     } finally {

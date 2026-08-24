@@ -53,6 +53,10 @@ export interface RetrievalConsistency {
   readonly deadlineMs: number;
 }
 
+export interface RetrievalVectorOptions {
+  readonly enabled: boolean;
+}
+
 export interface InternalRetrievalRequest {
   readonly binding: ProjectBinding;
   readonly query: string;
@@ -67,6 +71,8 @@ export interface InternalRetrievalRequest {
   readonly visibility?: RetrievalVisibility;
   readonly validAt?: string;
   readonly knownAt?: bigint;
+  /** Local vector retrieval is an explicit per-request opt-in and defaults off. */
+  readonly vector?: RetrievalVectorOptions;
 }
 
 export interface ValidatedInternalRetrievalRequest extends InternalRetrievalRequest {
@@ -74,6 +80,7 @@ export interface ValidatedInternalRetrievalRequest extends InternalRetrievalRequ
   readonly explain: boolean;
   readonly explainByteLimit: number;
   readonly includeGlobal: false;
+  readonly vector: RetrievalVectorOptions;
 }
 
 export interface RetrievalItem {
@@ -121,6 +128,53 @@ export interface RetrievalCandidate {
 export interface RetrievalChannelResult {
   readonly channel: RetrievalChannel;
   readonly candidates: readonly RetrievalCandidate[];
+}
+
+export type VectorChannelFailureCode = "PROVIDER_UNAVAILABLE";
+
+export interface VectorCacheManifestRowV1 {
+  readonly cacheKey: string;
+  readonly sourceHash: string;
+  readonly providerId: string;
+  readonly model: string;
+  readonly chunkerVersion: string;
+  readonly dimensions: number;
+  readonly outputHash: string;
+  readonly byteLength: number;
+}
+
+/**
+ * Integrity metadata for derived vector bytes. Provider objects, endpoints,
+ * credentials, input text, and projection authority never enter this shape.
+ */
+export interface VectorCacheManifestV1 {
+  readonly schemaVersion: 1;
+  readonly rowCount: number;
+  readonly byteLength: number;
+  readonly rowsSha256: string;
+  readonly rows: readonly VectorCacheManifestRowV1[];
+}
+
+export interface VectorCandidate {
+  readonly candidateId: string;
+  readonly rank: number;
+  readonly similarity: number;
+  readonly item: RetrievalItem;
+}
+
+export interface VectorChannelResult {
+  readonly used: boolean;
+  readonly failureCode: VectorChannelFailureCode | null;
+  readonly candidates: readonly VectorCandidate[];
+  readonly manifest: VectorCacheManifestV1 | null;
+}
+
+/** Optional local-only port. Its result is shadow data until a measured policy consumes it. */
+export interface VectorCandidateChannel {
+  search(
+    request: InternalRetrievalRequest,
+    lease: ProjectionReaderLease,
+  ): Promise<VectorChannelResult>;
 }
 
 export interface RetrievalConflictGroup {
@@ -256,7 +310,7 @@ export function validateInternalRetrievalRequest(
     [
       "binding", "query", "limit", "tokenBudget", "consistency", "candidateLimit",
       "explain", "explainByteLimit", "includeGlobal", "sessionId", "visibility",
-      "validAt", "knownAt",
+      "validAt", "knownAt", "vector",
     ],
     ["binding", "query", "limit", "tokenBudget", "consistency"],
   );
@@ -309,6 +363,11 @@ export function validateInternalRetrievalRequest(
       || source.knownAt > SQLITE_INT64_MAX
     )
   ) return invalid();
+  const vectorSource = source.vector === undefined
+    ? undefined
+    : exactDataRecord(source.vector, ["enabled"], ["enabled"]);
+  if (vectorSource !== undefined && typeof vectorSource.enabled !== "boolean") return invalid();
+  const vector = Object.freeze({ enabled: vectorSource?.enabled === true });
 
   return Object.freeze({
     binding: privateBinding,
@@ -323,6 +382,7 @@ export function validateInternalRetrievalRequest(
     explain,
     explainByteLimit,
     includeGlobal: false,
+    vector,
     ...(source.sessionId === undefined ? {} : { sessionId: source.sessionId as string }),
     ...(source.visibility === undefined ? {} : { visibility: source.visibility as RetrievalVisibility }),
     ...(validAt === undefined ? {} : { validAt }),
