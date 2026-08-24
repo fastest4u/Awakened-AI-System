@@ -353,4 +353,34 @@ describe("retrieval evaluation metrics", () => {
     assert.equal(report.citationPrecision, 1);
     assert.equal(fixture.closed(), 500);
   });
+
+  it("counts cross-project contamination before collapsing duplicate identifiers", async () => {
+    const corpus = readCorpus();
+    const fixture = createEvaluationService(corpus);
+    const [contaminatedQuery] = corpus.queries;
+    assert.ok(contaminatedQuery);
+    const contaminatedService = Object.freeze({
+      async retrieve(request: InternalRetrievalRequest) {
+        const result = await fixture.service.retrieve(request);
+        if (request.query !== contaminatedQuery.queryText) return result;
+        const [eligibleItem] = result.items;
+        assert.ok(eligibleItem);
+        const crossProjectDuplicate = Object.freeze({
+          ...eligibleItem,
+          projectId: "9".repeat(64) as ProjectId,
+        });
+        return Object.freeze({
+          ...result,
+          items: Object.freeze([eligibleItem, crossProjectDuplicate]),
+        });
+      },
+    });
+
+    const report = await evaluateRetrieval(corpus, contaminatedService);
+
+    assert.equal(report.crossProjectContamination, 1);
+    assert.equal(report.recallAt10, 1);
+    assert.equal(report.ndcgAt10, 1);
+    assert.equal(fixture.closed(), 500);
+  });
 });

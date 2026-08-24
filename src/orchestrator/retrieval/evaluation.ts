@@ -484,8 +484,9 @@ function outcomeFor(
   query: RetrievalEvaluationQueryV1,
   result: RankedInternalRetrievalResult | null,
 ): RetrievalEvaluationOutcome {
+  const returnedItems = result?.items ?? [];
   const seenItemIds = new Set<string>();
-  const items = (result?.items.slice(0, 10) ?? []).filter((item) => {
+  const items = returnedItems.slice(0, 10).filter((item) => {
     if (seenItemIds.has(item.id)) return false;
     seenItemIds.add(item.id);
     return true;
@@ -520,7 +521,7 @@ function outcomeFor(
     expectedCitationCount: expectedCitations.size,
     staleActiveCount: items.filter(staleOrInactive).length,
     returnedItemCount: items.length,
-    crossProjectContamination: items.filter((item) => (
+    crossProjectContamination: returnedItems.filter((item) => (
       item.projectId !== query.eligibleScope.projectId
     )).length,
     bitemporalCorrect: query.expectations.bitemporal
