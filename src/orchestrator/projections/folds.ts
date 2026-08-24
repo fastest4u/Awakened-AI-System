@@ -212,7 +212,7 @@ function validateState(value: unknown): ProjectionFoldState {
     "sourceEventPosition", "occurredAt", "taskSummary",
   ]);
   const canonicalItems = inspectRows(source.canonicalItems, [
-    "projectId", "itemId", "normalizedKey", "status", "confidence", "verificationMethod",
+    "projectId", "sessionId", "itemId", "normalizedKey", "status", "confidence", "verificationMethod",
     "validFrom", "validTo", "summary", "contentHash", "knownFromEventPosition",
     "sourceEventPosition",
   ]);
@@ -247,6 +247,7 @@ function validateState(value: unknown): ProjectionFoldState {
     assertBoundedString(row.taskSummary, MAX_SUMMARY_BYTES);
   }
   for (const row of canonicalItems) {
+    if (row.sessionId !== null) assertUuid(row.sessionId);
     assertUuid(row.itemId);
     assertBoundedString(row.normalizedKey, 512);
     if (row.normalizedKey.normalize("NFKC").trim().toLowerCase() !== row.normalizedKey) return integrity();
@@ -511,6 +512,7 @@ function foldMemorySource(
   if (current !== undefined) {
     if (
       current.normalizedKey !== event.normalizedKey
+      || current.sessionId !== event.binding.sessionId
       || current.validFrom !== event.validFrom
       || (
         current.status !== event.status
@@ -520,6 +522,7 @@ function foldMemorySource(
   }
   const item = Object.freeze({
     projectId: event.binding.projectId,
+    sessionId: event.binding.sessionId,
     itemId: event.itemId,
     normalizedKey: event.normalizedKey,
     status: event.status,
@@ -740,6 +743,7 @@ export class ProjectionFoldAccumulator {
     if (current === undefined && !allowedInitialStatus(event.status)) return integrity();
     if (current !== undefined && (
       current.normalizedKey !== event.normalizedKey
+      || current.sessionId !== event.binding.sessionId
       || current.validFrom !== event.validFrom
       || (
         current.status !== event.status
@@ -751,6 +755,7 @@ export class ProjectionFoldAccumulator {
     this.#assertRoom(this.#canonicalItems.size, current !== undefined);
     this.#canonicalItems.set(event.itemId, Object.freeze({
       projectId: event.binding.projectId,
+      sessionId: event.binding.sessionId,
       itemId: event.itemId,
       normalizedKey: event.normalizedKey,
       status: event.status,

@@ -83,6 +83,11 @@ describe("independent projection schema", () => {
         const definition = objects.find((row) => row.name === table)?.sql;
         assert.match(String(definition), /\bSTRICT\b/u);
       }
+      assert.equal(
+        connection.prepare("PRAGMA table_info(canonical_items)").all()
+          .some((row) => row.name === "session_id" && row.notnull === 0n),
+        true,
+      );
       assert.deepEqual(
         connection.prepare("PRAGMA database_list").all().map((row) => row.name),
         ["main"],

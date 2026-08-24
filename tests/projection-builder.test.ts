@@ -285,10 +285,11 @@ describe("projection generation builder", () => {
     );
     assert.deepEqual(
       { ...projected.prepare(`
-        SELECT item_id, normalized_key, summary, source_event_position
+        SELECT session_id, item_id, normalized_key, summary, source_event_position
         FROM canonical_items
       `).get() },
       {
+        session_id: SESSION_ID,
         item_id: ITEM_ID,
         normalized_key: "decision:immutable-projections",
         summary: "Published projection generations are immutable.",

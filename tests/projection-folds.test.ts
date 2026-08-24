@@ -87,6 +87,7 @@ describe("projection folds", () => {
     assert.deepEqual(folded.binding, BINDING);
     assert.equal(folded.terminalEventPosition, 42n);
     assert.equal(folded.canonicalItems.length, 1);
+    assert.equal(folded.canonicalItems[0]?.sessionId, BINDING.sessionId);
     assert.equal(folded.canonicalItems[0]?.knownFromEventPosition, 42n);
     assert.equal(folded.canonicalItems[0]?.validTo, null);
     assert.equal(initial.binding, null);
@@ -122,6 +123,21 @@ describe("projection folds", () => {
     );
     assert.equal(verified.canonicalItems[0]?.status, "verified");
     assert.equal(verified.terminalEventPosition, 42n);
+  });
+
+  it("rejects changing an existing canonical item's session authority", () => {
+    const state = foldProjectionEvent(emptyProjectionFoldState(), memoryEvent(42n));
+    assert.throws(
+      () => foldProjectionEvent(state, memoryEvent(43n, {
+        binding: Object.freeze({
+          ...BINDING,
+          sessionId: "00000000-0000-4000-8000-000000000043",
+        }),
+      })),
+      /INTEGRITY_FAILURE/u,
+    );
+    assert.equal(state.canonicalItems[0]?.sessionId, BINDING.sessionId);
+    assert.equal(state.terminalEventPosition, 42n);
   });
 
   it("rejects cross-project and non-monotonic source events without changing state", () => {

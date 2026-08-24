@@ -66,6 +66,7 @@ export const PROJECTION_SCHEMA_SQL_V1 = `
 
   CREATE TABLE canonical_items (
     project_id TEXT NOT NULL,
+    session_id TEXT,
     item_id TEXT NOT NULL,
     normalized_key TEXT NOT NULL,
     status TEXT NOT NULL CHECK (status IN (
@@ -86,7 +87,7 @@ export const PROJECTION_SCHEMA_SQL_V1 = `
   ) STRICT;
 
   CREATE INDEX canonical_items_candidates_idx
-    ON canonical_items(project_id, status, valid_from, valid_to, source_event_position DESC, item_id);
+    ON canonical_items(project_id, session_id, status, valid_from, valid_to, source_event_position DESC, item_id);
 
   CREATE TABLE tasks_followups (
     project_id TEXT NOT NULL,

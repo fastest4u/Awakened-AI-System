@@ -142,6 +142,7 @@ export interface SessionCheckpointProjection {
 
 export interface CanonicalItemProjection {
   readonly projectId: ProjectId;
+  readonly sessionId: string | null;
   readonly itemId: string;
   readonly normalizedKey: string;
   readonly status: ProjectionItemStatus;

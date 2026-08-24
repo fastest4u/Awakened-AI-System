@@ -27,31 +27,10 @@ import { isEligible } from "./eligibility.js";
 type SqliteParameter = null | number | bigint | string | Uint8Array;
 type Row = Record<string, unknown>;
 
-interface EligibleLexicalRow {
-  readonly rowId: bigint;
-  readonly chunkId: string;
-  readonly normalizedKey: string;
-  readonly text: string;
-  readonly item: RetrievalItem;
-}
-
-interface AliasRow {
-  readonly source: string;
-  readonly target: string;
-  readonly sourceEventPosition: bigint;
-}
-
-interface EligibilitySnapshot {
-  readonly items: ReadonlyMap<string, RetrievalItem>;
-  readonly canonicalById: ReadonlyMap<string, RetrievalItem>;
-  readonly canonicalByKey: ReadonlyMap<string, RetrievalItem>;
-  readonly lexical: readonly EligibleLexicalRow[];
-  readonly aliases: readonly AliasRow[];
-  readonly artifacts: readonly RetrievalItem[];
-  readonly checkpoints: readonly RetrievalItem[];
-  readonly followUps: readonly RetrievalItem[];
+interface ChannelSelection {
+  readonly items: readonly RetrievalItem[];
   readonly dropped: number;
-  readonly truncated: boolean;
+  readonly overflow: boolean;
 }
 
 const CONFIDENCE = new Set<Confidence>(["high", "medium", "low", "guess"]);
@@ -108,8 +87,8 @@ function confidence(source: Row, key = "confidence"): Confidence {
   return value as Confidence;
 }
 
-function status(source: Row): ProjectionItemStatus {
-  const value = source.status;
+function status(source: Row, key = "status"): ProjectionItemStatus {
+  const value = source[key];
   if (typeof value !== "string" || !CANONICAL_STATUS.has(value as ProjectionItemStatus)) {
     return projectionInvalid();
   }
@@ -145,26 +124,28 @@ function canonicalItem(
   source: Row,
   manifest: ProjectionManifestV1,
   terminalPosition: bigint,
+  prefix = "",
 ): RetrievalItem {
-  const sourcePosition = bigintValue(source, "source_event_position");
+  const sourcePosition = bigintValue(source, `${prefix}source_event_position`);
+  const sessionId = nullableString(source, `${prefix}session_id`);
   return frozenItem({
-    id: stringValue(source, "item_id"),
+    id: stringValue(source, `${prefix}item_id`),
     kind: "canonical",
-    projectId: stringValue(source, "project_id") as ProjectId,
+    projectId: stringValue(source, `${prefix}project_id`) as ProjectId,
     workspaceId: manifest.workspaceId,
     branchScopeId: manifest.branchScopeId,
     branchRef: manifest.branchRef,
-    sessionId: null,
-    visibility: "project",
-    status: status(source),
-    confidence: confidence(source),
-    verificationMethod: stringValue(source, "verification_method"),
-    validFrom: stringValue(source, "valid_from"),
-    validTo: nullableString(source, "valid_to"),
-    knownFromEventPosition: bigintValue(source, "known_from_event_position"),
+    sessionId,
+    visibility: sessionId === null ? "project" : "session",
+    status: status(source, `${prefix}status`),
+    confidence: confidence(source, `${prefix}confidence`),
+    verificationMethod: stringValue(source, `${prefix}verification_method`),
+    validFrom: stringValue(source, `${prefix}valid_from`),
+    validTo: nullableString(source, `${prefix}valid_to`),
+    knownFromEventPosition: bigintValue(source, `${prefix}known_from_event_position`),
     sourceEventPosition: sourcePosition,
-    summary: stringValue(source, "summary"),
-    normalizedKey: stringValue(source, "normalized_key"),
+    summary: stringValue(source, `${prefix}summary`),
+    normalizedKey: stringValue(source, `${prefix}normalized_key`),
     anchor: null,
     freshness: freshness(sourcePosition, terminalPosition),
   });
@@ -244,9 +225,23 @@ function verifyMetadata(
   ) throw new InternalRetrievalError("PROJECTION_SCOPE_MISMATCH");
 }
 
-function scanParameters(
+function normalized(value: string): string {
+  return value.normalize("NFKC").trim().toLocaleLowerCase("en-US");
+}
+
+function ftsExpression(query: string): string | null {
+  const terms = query.split(/\s+/u)
+    .map((term) => term.trim())
+    .filter((term) => term.length > 0)
+    .slice(0, 64);
+  if (terms.length === 0) return null;
+  return terms.map((term) => `"${term.replaceAll('"', '""')}"`).join(" AND ");
+}
+
+function channelParameters(
   request: ValidatedInternalRetrievalRequest,
   terminalPosition: bigint,
+  query: string,
 ): Readonly<Record<string, SqliteParameter>> {
   const visibility = request.visibility
     ?? (request.sessionId === undefined ? "branch" : "session");
@@ -264,149 +259,215 @@ function scanParameters(
     $visibilityLevel: visibilityLevel,
     $sessionId: request.sessionId ?? null,
     $branchRef: request.binding.branchRef,
+    $query: query,
     $scanLimit: request.candidateLimit + 1,
   });
 }
 
-function collectEligibility(
+function lexicalItem(
+  source: Row,
+  manifest: ProjectionManifestV1,
+  terminalPosition: bigint,
+): RetrievalItem {
+  const sourcePosition = bigintValue(source, "source_event_position");
+  const sessionId = nullableString(source, "session_id");
+  return frozenItem({
+    id: stringValue(source, "chunk_id"),
+    kind: "lexical",
+    projectId: stringValue(source, "project_id") as ProjectId,
+    workspaceId: manifest.workspaceId,
+    branchScopeId: manifest.branchScopeId,
+    branchRef: manifest.branchRef,
+    sessionId,
+    visibility: sessionId === null ? "branch" : "session",
+    status: "active",
+    confidence: "medium",
+    verificationMethod: "projection-chunk",
+    validFrom: null,
+    validTo: null,
+    knownFromEventPosition: sourcePosition,
+    sourceEventPosition: sourcePosition,
+    summary: stringValue(source, "text"),
+    normalizedKey: stringValue(source, "normalized_key"),
+    anchor: stringValue(source, "section"),
+    freshness: freshness(sourcePosition, terminalPosition),
+  });
+}
+
+function boundedSelection(
+  rows: readonly Row[],
+  request: ValidatedInternalRetrievalRequest,
+  convert: (source: Row) => RetrievalItem,
+): ChannelSelection {
+  const selected = new Map<string, RetrievalItem>();
+  let dropped = 0;
+  for (const source of rows) {
+    const candidate = convert(source);
+    if (!isEligible(candidate, request, request.binding)) {
+      dropped += 1;
+      continue;
+    }
+    selected.set(`${candidate.kind}:${candidate.id}`, candidate);
+  }
+  const overflow = selected.size > request.candidateLimit;
+  return Object.freeze({
+    items: Object.freeze([...selected.values()].slice(0, request.candidateLimit)),
+    dropped,
+    overflow,
+  });
+}
+
+const CANONICAL_ELIGIBILITY_SQL = `
+  item.project_id = $projectId
+  AND item.source_event_position <= $terminalPosition
+  AND item.status NOT IN ('retracted', 'expired', 'erased-evidence')
+  AND (
+    item.session_id IS NULL
+    OR (item.session_id = $sessionId AND $visibilityLevel >= 3)
+  )
+  AND (
+    $knownAt IS NULL
+    OR (
+      item.known_from_event_position <= $knownAt
+      AND item.source_event_position <= $knownAt
+    )
+  )
+  AND (
+    $validAt IS NULL
+    OR (
+      item.valid_from <= $validAt
+      AND (item.valid_to IS NULL OR $validAt < item.valid_to)
+    )
+  )
+`;
+
+function exactSelection(
   database: DatabaseSync,
   manifest: ProjectionManifestV1,
   request: ValidatedInternalRetrievalRequest,
-): EligibilitySnapshot {
+  parameters: Readonly<Record<string, SqliteParameter>>,
+): ChannelSelection {
+  const rows = preparedRows(database, `
+    SELECT item.project_id, item.session_id, item.item_id, item.normalized_key, item.status,
+           item.confidence, item.verification_method, item.valid_from, item.valid_to,
+           item.summary, item.known_from_event_position, item.source_event_position
+    FROM canonical_items AS item
+    WHERE ${CANONICAL_ELIGIBILITY_SQL}
+      AND (lower(item.item_id) = $query OR item.normalized_key = $query)
+    ORDER BY item.source_event_position DESC, item.item_id
+    LIMIT $scanLimit
+  `, parameters);
   const terminalPosition = BigInt(manifest.terminalEventPosition);
-  const parameters = scanParameters(request, terminalPosition);
-  const items = new Map<string, RetrievalItem>();
-  const canonicalById = new Map<string, RetrievalItem>();
-  const canonicalByKey = new Map<string, RetrievalItem>();
-  const lexical: EligibleLexicalRow[] = [];
-  const aliases: AliasRow[] = [];
-  const artifacts: RetrievalItem[] = [];
-  const checkpoints: RetrievalItem[] = [];
-  const followUps: RetrievalItem[] = [];
-  let dropped = 0;
-  let truncated = false;
+  return boundedSelection(rows, request, (source) => (
+    canonicalItem(source, manifest, terminalPosition)
+  ));
+}
 
-  const bounded = (rows: readonly Row[]): readonly Row[] => {
-    if (rows.length > request.candidateLimit) truncated = true;
-    return rows.slice(0, request.candidateLimit);
-  };
-  const accept = (candidate: RetrievalItem): boolean => {
-    if (!isEligible(candidate, request, request.binding)) {
-      dropped += 1;
-      return false;
-    }
-    items.set(`${candidate.kind}:${candidate.id}`, candidate);
-    return true;
-  };
+function aliasSelection(
+  database: DatabaseSync,
+  manifest: ProjectionManifestV1,
+  request: ValidatedInternalRetrievalRequest,
+  parameters: Readonly<Record<string, SqliteParameter>>,
+): ChannelSelection {
+  const rows = preparedRows(database, `
+    SELECT item.project_id, item.session_id, item.item_id, item.normalized_key, item.status,
+           item.confidence, item.verification_method, item.valid_from, item.valid_to,
+           item.summary, item.known_from_event_position, item.source_event_position
+    FROM entity_graph AS edge
+    JOIN canonical_items AS item
+      ON item.project_id = edge.project_id
+     AND (
+       (
+         lower(edge.source_entity_id) = $query
+         AND (
+           lower(item.item_id) = lower(edge.target_entity_id)
+           OR item.normalized_key = lower(edge.target_entity_id)
+         )
+       )
+       OR (
+         lower(edge.target_entity_id) = $query
+         AND (
+           lower(item.item_id) = lower(edge.source_entity_id)
+           OR item.normalized_key = lower(edge.source_entity_id)
+         )
+       )
+     )
+    WHERE edge.project_id = $projectId
+      AND edge.relationship = 'alias'
+      AND edge.source_event_position <= $terminalPosition
+      AND ($knownAt IS NULL OR edge.source_event_position <= $knownAt)
+      AND ${CANONICAL_ELIGIBILITY_SQL}
+    ORDER BY edge.source_event_position DESC, item.item_id
+    LIMIT $scanLimit
+  `, parameters);
+  const terminalPosition = BigInt(manifest.terminalEventPosition);
+  return boundedSelection(rows, request, (source) => (
+    canonicalItem(source, manifest, terminalPosition)
+  ));
+}
 
-  for (const source of bounded(preparedRows(database, `
-    SELECT project_id, item_id, normalized_key, status, confidence, verification_method,
-           valid_from, valid_to, summary, known_from_event_position, source_event_position
-    FROM canonical_items
-    WHERE project_id = $projectId
-      AND source_event_position <= $terminalPosition
-      AND status NOT IN ('retracted', 'expired', 'erased-evidence')
+function lexicalSelection(
+  database: DatabaseSync,
+  manifest: ProjectionManifestV1,
+  request: ValidatedInternalRetrievalRequest,
+  parameters: Readonly<Record<string, SqliteParameter>>,
+  expression: string | null,
+): ChannelSelection {
+  if (expression === null) return Object.freeze({ items: Object.freeze([]), dropped: 0, overflow: false });
+  const lexicalParameters = Object.freeze({ ...parameters, $ftsQuery: expression });
+  const rows = preparedRows(database, `
+    SELECT bm25(lexical_chunks_fts) AS fts_score,
+           chunk.project_id, chunk.chunk_id, chunk.item_id, chunk.session_id, chunk.section,
+           chunk.normalized_key, chunk.text, chunk.source_event_position,
+           item.project_id AS canonical_project_id,
+           item.session_id AS canonical_session_id,
+           item.item_id AS canonical_item_id,
+           item.normalized_key AS canonical_normalized_key,
+           item.status AS canonical_status,
+           item.confidence AS canonical_confidence,
+           item.verification_method AS canonical_verification_method,
+           item.valid_from AS canonical_valid_from,
+           item.valid_to AS canonical_valid_to,
+           item.summary AS canonical_summary,
+           item.known_from_event_position AS canonical_known_from_event_position,
+           item.source_event_position AS canonical_source_event_position
+    FROM lexical_chunks_fts
+    JOIN lexical_chunks AS chunk ON chunk.row_id = lexical_chunks_fts.rowid
+    LEFT JOIN canonical_items AS item
+      ON item.project_id = chunk.project_id AND item.item_id = chunk.item_id
+    WHERE lexical_chunks_fts MATCH $ftsQuery
+      AND chunk.project_id = $projectId
+      AND chunk.source_event_position <= $terminalPosition
+      AND ($knownAt IS NULL OR chunk.source_event_position <= $knownAt)
       AND (
-        $knownAt IS NULL
-        OR (
-          known_from_event_position <= $knownAt
-          AND source_event_position <= $knownAt
-        )
+        (chunk.session_id IS NULL AND $visibilityLevel >= 2)
+        OR (chunk.session_id = $sessionId AND $visibilityLevel >= 3)
       )
       AND (
-        $validAt IS NULL
-        OR (
-          valid_from <= $validAt
-          AND (valid_to IS NULL OR $validAt < valid_to)
-        )
+        chunk.item_id IS NULL
+        OR (${CANONICAL_ELIGIBILITY_SQL})
       )
-    ORDER BY source_event_position DESC, item_id
+    ORDER BY fts_score, COALESCE(item.item_id, chunk.chunk_id), chunk.chunk_id
     LIMIT $scanLimit
-  `, parameters))) {
-    const candidate = canonicalItem(source, manifest, terminalPosition);
-    if (!accept(candidate)) continue;
-    canonicalById.set(candidate.id, candidate);
-    canonicalByKey.set(candidate.normalizedKey, candidate);
-  }
-
-  for (const source of bounded(preparedRows(database, `
-    SELECT row_id, project_id, chunk_id, item_id, session_id, section, normalized_key, text,
-           source_event_position
-    FROM lexical_chunks
-    WHERE project_id = $projectId
-      AND source_event_position <= $terminalPosition
-      AND ($knownAt IS NULL OR source_event_position <= $knownAt)
-      AND (
-        (session_id IS NULL AND $visibilityLevel >= 2)
-        OR (session_id = $sessionId AND $visibilityLevel >= 3)
-      )
-    ORDER BY source_event_position DESC, chunk_id
-    LIMIT $scanLimit
-  `, parameters))) {
-    const sourcePosition = bigintValue(source, "source_event_position");
-    const sessionId = nullableString(source, "session_id");
-    const chunkId = stringValue(source, "chunk_id");
-    const chunk = frozenItem({
-      id: chunkId,
-      kind: "lexical",
-      projectId: stringValue(source, "project_id") as ProjectId,
-      workspaceId: manifest.workspaceId,
-      branchScopeId: manifest.branchScopeId,
-      branchRef: manifest.branchRef,
-      sessionId,
-      visibility: sessionId === null ? "branch" : "session",
-      status: "active",
-      confidence: "medium",
-      verificationMethod: "projection-chunk",
-      validFrom: null,
-      validTo: null,
-      knownFromEventPosition: sourcePosition,
-      sourceEventPosition: sourcePosition,
-      summary: stringValue(source, "text"),
-      normalizedKey: stringValue(source, "normalized_key"),
-      anchor: stringValue(source, "section"),
-      freshness: freshness(sourcePosition, terminalPosition),
-    });
-    const targetId = nullableString(source, "item_id");
-    const target = targetId === null ? chunk : canonicalById.get(targetId);
-    if (!isEligible(chunk, request, request.binding) || target === undefined) {
-      dropped += 1;
-      continue;
+  `, lexicalParameters);
+  const terminalPosition = BigInt(manifest.terminalEventPosition);
+  return boundedSelection(rows, request, (source) => {
+    if (typeof source.fts_score !== "number" || !Number.isFinite(source.fts_score)) {
+      return projectionInvalid();
     }
-    if (target === chunk) accept(chunk);
-    lexical.push(Object.freeze({
-      rowId: bigintValue(source, "row_id"),
-      chunkId,
-      normalizedKey: chunk.normalizedKey,
-      text: chunk.summary,
-      item: target,
-    }));
-  }
+    return source.item_id === null
+      ? lexicalItem(source, manifest, terminalPosition)
+      : canonicalItem(source, manifest, terminalPosition, "canonical_");
+  });
+}
 
-  for (const source of bounded(preparedRows(database, `
-    SELECT project_id, edge_id, source_entity_id, relationship, target_entity_id,
-           source_event_position
-    FROM entity_graph
-    WHERE project_id = $projectId
-      AND relationship = 'alias'
-      AND source_event_position <= $terminalPosition
-      AND ($knownAt IS NULL OR source_event_position <= $knownAt)
-    ORDER BY source_event_position DESC, edge_id
-    LIMIT $scanLimit
-  `, parameters))) {
-    const sourcePosition = bigintValue(source, "source_event_position");
-    if (request.knownAt !== undefined && sourcePosition > request.knownAt) {
-      dropped += 1;
-      continue;
-    }
-    aliases.push(Object.freeze({
-      source: stringValue(source, "source_entity_id"),
-      target: stringValue(source, "target_entity_id"),
-      sourceEventPosition: sourcePosition,
-    }));
-  }
-
-  for (const source of bounded(preparedRows(database, `
+function symbolPathSelection(
+  database: DatabaseSync,
+  manifest: ProjectionManifestV1,
+  request: ValidatedInternalRetrievalRequest,
+  parameters: Readonly<Record<string, SqliteParameter>>,
+): ChannelSelection {
+  const rows = preparedRows(database, `
     SELECT project_id, session_id, artifact_id, path, summary, branch_ref, confidence,
            source_event_position
     FROM artifacts_files
@@ -416,10 +477,20 @@ function collectEligibility(
       AND (branch_ref IS NULL OR branch_ref = $branchRef)
       AND session_id = $sessionId
       AND $visibilityLevel >= 3
+      AND (
+        instr(lower(artifact_id), $query) > 0
+        OR instr(lower(path), $query) > 0
+        OR instr(lower(COALESCE(summary, '')), $query) > 0
+      )
     ORDER BY source_event_position DESC, artifact_id
     LIMIT $scanLimit
-  `, parameters))) {
-    const candidate = scopedItem(source, manifest, terminalPosition, {
+  `, parameters);
+  const terminalPosition = BigInt(manifest.terminalEventPosition);
+  return boundedSelection(rows, request, (source) => scopedItem(
+    source,
+    manifest,
+    terminalPosition,
+    {
       idColumn: "artifact_id",
       kind: "artifact",
       status: "active",
@@ -428,11 +499,17 @@ function collectEligibility(
       anchorColumn: "path",
       verificationMethod: "checkpoint-artifact",
       branchRef: nullableString(source, "branch_ref") ?? manifest.branchRef,
-    });
-    if (accept(candidate)) artifacts.push(candidate);
-  }
+    },
+  ));
+}
 
-  for (const source of bounded(preparedRows(database, `
+function checkpointSelection(
+  database: DatabaseSync,
+  manifest: ProjectionManifestV1,
+  request: ValidatedInternalRetrievalRequest,
+  parameters: Readonly<Record<string, SqliteParameter>>,
+): ChannelSelection {
+  const rows = preparedRows(database, `
     SELECT project_id, session_id, checkpoint_id, task_summary, source_event_position,
            'high' AS confidence
     FROM session_tree
@@ -441,20 +518,35 @@ function collectEligibility(
       AND ($knownAt IS NULL OR source_event_position <= $knownAt)
       AND session_id = $sessionId
       AND $visibilityLevel >= 3
+      AND (
+        instr(lower(checkpoint_id), $query) > 0
+        OR instr(lower(task_summary), $query) > 0
+      )
     ORDER BY source_event_position DESC, checkpoint_id
     LIMIT $scanLimit
-  `, parameters))) {
-    const candidate = scopedItem(source, manifest, terminalPosition, {
+  `, parameters);
+  const terminalPosition = BigInt(manifest.terminalEventPosition);
+  return boundedSelection(rows, request, (source) => scopedItem(
+    source,
+    manifest,
+    terminalPosition,
+    {
       idColumn: "checkpoint_id",
       kind: "checkpoint",
       status: "active",
       summaryColumn: "task_summary",
       verificationMethod: "session-checkpoint",
-    });
-    if (accept(candidate)) checkpoints.push(candidate);
-  }
+    },
+  ));
+}
 
-  for (const source of bounded(preparedRows(database, `
+function followUpSelection(
+  database: DatabaseSync,
+  manifest: ProjectionManifestV1,
+  request: ValidatedInternalRetrievalRequest,
+  parameters: Readonly<Record<string, SqliteParameter>>,
+): ChannelSelection {
+  const rows = preparedRows(database, `
     SELECT project_id, session_id, follow_up_id, status, summary, confidence,
            source_event_position
     FROM tasks_followups
@@ -464,180 +556,82 @@ function collectEligibility(
       AND ($knownAt IS NULL OR source_event_position <= $knownAt)
       AND session_id = $sessionId
       AND $visibilityLevel >= 3
+      AND (
+        instr(lower(follow_up_id), $query) > 0
+        OR instr(lower(summary), $query) > 0
+      )
     ORDER BY source_event_position DESC, follow_up_id
     LIMIT $scanLimit
-  `, parameters))) {
+  `, parameters);
+  const terminalPosition = BigInt(manifest.terminalEventPosition);
+  return boundedSelection(rows, request, (source) => {
     const itemStatus = source.status;
     if (itemStatus !== "open" && itemStatus !== "blocked") return projectionInvalid();
-    const candidate = scopedItem(source, manifest, terminalPosition, {
+    return scopedItem(source, manifest, terminalPosition, {
       idColumn: "follow_up_id",
       kind: "follow-up",
       status: itemStatus,
       summaryColumn: "summary",
       verificationMethod: "open-follow-up",
     });
-    if (accept(candidate)) followUps.push(candidate);
-  }
-
-  return Object.freeze({
-    items,
-    canonicalById,
-    canonicalByKey,
-    lexical: Object.freeze(lexical),
-    aliases: Object.freeze(aliases),
-    artifacts: Object.freeze(artifacts),
-    checkpoints: Object.freeze(checkpoints),
-    followUps: Object.freeze(followUps),
-    dropped,
-    truncated,
   });
-}
-
-function normalized(value: string): string {
-  return value.normalize("NFKC").trim().toLocaleLowerCase("en-US");
-}
-
-function includesQuery(candidate: string, query: string): boolean {
-  return normalized(candidate).includes(query);
-}
-
-function exactChannel(snapshot: EligibilitySnapshot, query: string): readonly RetrievalItem[] {
-  const results = new Map<string, RetrievalItem>();
-  for (const item of snapshot.canonicalById.values()) {
-    if (normalized(item.id) === query || normalized(item.normalizedKey) === query) {
-      results.set(item.id, item);
-    }
-  }
-  return Object.freeze([...results.values()].sort((left, right) => left.id.localeCompare(right.id)));
-}
-
-function aliasChannel(snapshot: EligibilitySnapshot, query: string): readonly RetrievalItem[] {
-  const results = new Map<string, RetrievalItem>();
-  for (const alias of snapshot.aliases) {
-    let identity: string | undefined;
-    if (normalized(alias.source) === query) identity = alias.target;
-    else if (normalized(alias.target) === query) identity = alias.source;
-    if (identity === undefined) continue;
-    const target = snapshot.canonicalById.get(identity) ?? snapshot.canonicalByKey.get(identity);
-    if (target !== undefined) results.set(target.id, target);
-  }
-  return Object.freeze([...results.values()].sort((left, right) => left.id.localeCompare(right.id)));
-}
-
-function ftsExpression(query: string): string | null {
-  const terms = query.split(/\s+/u)
-    .map((term) => term.trim())
-    .filter((term) => term.length > 0)
-    .slice(0, 64);
-  if (terms.length === 0) return null;
-  return terms.map((term) => `"${term.replaceAll('"', '""')}"`).join(" AND ");
-}
-
-function lexicalChannel(
-  database: DatabaseSync,
-  snapshot: EligibilitySnapshot,
-  query: string,
-  limit: number,
-): readonly RetrievalItem[] {
-  // The snapshot is complete before FTS5 is prepared. Query one eligible rowid
-  // at a time so an ineligible chunk cannot enter the lexical candidate set.
-  if (snapshot.lexical.length === 0) return Object.freeze([]);
-  const expression = ftsExpression(query);
-  if (expression === null) return Object.freeze([]);
-  try {
-    const statement = database.prepare(`
-      SELECT bm25(lexical_chunks_fts) AS score
-      FROM lexical_chunks_fts
-      WHERE lexical_chunks_fts.rowid = $rowId
-        AND lexical_chunks_fts MATCH $query
-      LIMIT 1
-    `);
-    const matches: Array<{
-      readonly chunkId: string;
-      readonly item: RetrievalItem;
-      readonly score: number;
-    }> = [];
-    for (const lexical of snapshot.lexical) {
-      const hit = statement.get({ $rowId: lexical.rowId, $query: expression });
-      if (hit === undefined) continue;
-      if (typeof hit.score !== "number" || !Number.isFinite(hit.score)) {
-        return projectionInvalid();
-      }
-      matches.push({ chunkId: lexical.chunkId, item: lexical.item, score: hit.score });
-    }
-    matches.sort((left, right) => left.score - right.score
-      || left.item.id.localeCompare(right.item.id)
-      || left.chunkId.localeCompare(right.chunkId));
-    const results = new Map<string, RetrievalItem>();
-    for (const match of matches) {
-      results.set(match.item.id, match.item);
-      if (results.size >= limit) break;
-    }
-    return Object.freeze([...results.values()]);
-  } catch (error) {
-    if (error instanceof InternalRetrievalError) throw error;
-    return projectionInvalid();
-  }
-}
-
-function matchingItems(
-  items: readonly RetrievalItem[],
-  query: string,
-  fields: (item: RetrievalItem) => readonly string[],
-): readonly RetrievalItem[] {
-  return Object.freeze(items
-    .filter((item) => fields(item).some((value) => includesQuery(value, query)))
-    .sort((left, right) => (
-      right.sourceEventPosition === left.sourceEventPosition
-        ? left.id.localeCompare(right.id)
-        : right.sourceEventPosition > left.sourceEventPosition ? 1 : -1
-    )));
 }
 
 function candidateId(channel: RetrievalChannel, item: RetrievalItem): string {
   return `${channel}:${item.kind}:${item.id}`;
 }
 
-function channels(
+function collectChannels(
   database: DatabaseSync,
-  snapshot: EligibilitySnapshot,
+  manifest: ProjectionManifestV1,
   request: ValidatedInternalRetrievalRequest,
-): readonly RetrievalChannelResult[] {
+): Readonly<{
+  channels: readonly RetrievalChannelResult[];
+  eligibleItemCount: number;
+  droppedItemCount: number;
+  truncated: boolean;
+}> {
   const query = normalized(request.query);
-  const candidates = new Map<RetrievalChannel, readonly RetrievalItem[]>([
-    ["exact", exactChannel(snapshot, query)],
-    ["alias", aliasChannel(snapshot, query)],
-    ["lexical", lexicalChannel(database, snapshot, query, request.candidateLimit)],
-    ["symbol-path", matchingItems(
-      snapshot.artifacts,
-      query,
-      (item) => [item.id, item.normalizedKey, item.summary, item.anchor ?? ""],
-    )],
-    ["session-checkpoint", matchingItems(
-      snapshot.checkpoints,
-      query,
-      (item) => [item.id, item.summary],
-    )],
-    ["open-follow-up", matchingItems(
-      snapshot.followUps,
-      query,
-      (item) => [item.id, item.summary],
-    )],
+  const terminalPosition = BigInt(manifest.terminalEventPosition);
+  const parameters = channelParameters(request, terminalPosition, query);
+  const candidates = new Map<RetrievalChannel, ChannelSelection>([
+    ["exact", exactSelection(database, manifest, request, parameters)],
+    ["alias", aliasSelection(database, manifest, request, parameters)],
+    ["lexical", lexicalSelection(database, manifest, request, parameters, ftsExpression(query))],
+    ["symbol-path", symbolPathSelection(database, manifest, request, parameters)],
+    ["session-checkpoint", checkpointSelection(database, manifest, request, parameters)],
+    ["open-follow-up", followUpSelection(database, manifest, request, parameters)],
   ]);
-  let remaining = request.candidateLimit;
   const output: RetrievalChannelResult[] = [];
-  for (const [channel, items] of candidates) {
-    const selected = items.slice(0, remaining);
-    remaining -= selected.length;
-    const ranked: RetrievalCandidate[] = selected.map((item, index) => Object.freeze({
-      candidateId: candidateId(channel, item),
-      channel,
-      rank: index + 1,
-      item,
-    }));
+  const unique = new Set<string>();
+  let dropped = 0;
+  let truncated = false;
+  for (const [channel, selection] of candidates) {
+    dropped += selection.dropped;
+    truncated ||= selection.overflow;
+    const ranked: RetrievalCandidate[] = [];
+    for (const [index, item] of selection.items.entries()) {
+      const key = `${item.kind}:${item.id}`;
+      if (!unique.has(key) && unique.size >= request.candidateLimit) {
+        truncated = true;
+        continue;
+      }
+      unique.add(key);
+      ranked.push(Object.freeze({
+        candidateId: candidateId(channel, item),
+        channel,
+        rank: index + 1,
+        item,
+      }));
+    }
     output.push(Object.freeze({ channel, candidates: Object.freeze(ranked) }));
   }
-  return Object.freeze(output);
+  return Object.freeze({
+    channels: Object.freeze(output),
+    eligibleItemCount: unique.size,
+    droppedItemCount: dropped,
+    truncated,
+  });
 }
 
 function openProjection(path: string, deadlineMs: number): DatabaseSync {
@@ -686,18 +680,16 @@ export class SqliteRetrievalCandidateRepository {
     const database = openProjection(lease.databasePath, request.consistency.deadlineMs);
     try {
       verifyMetadata(database, manifest);
-      const eligible = collectEligibility(database, manifest, request);
-      const channelResults = channels(database, eligible, request);
-      const candidateCount = channelResults.reduce(
-        (total, channel) => total + channel.candidates.length,
-        0,
-      );
+      const collected = collectChannels(database, manifest, request);
       return Object.freeze({
-        channels: channelResults,
-        eligibleItemCount: eligible.items.size,
-        droppedItemCount: eligible.dropped,
-        truncated: eligible.truncated || candidateCount >= request.candidateLimit,
+        channels: collected.channels,
+        eligibleItemCount: collected.eligibleItemCount,
+        droppedItemCount: collected.droppedItemCount,
+        truncated: collected.truncated,
       });
+    } catch (error) {
+      if (error instanceof InternalRetrievalError) throw error;
+      return projectionInvalid();
     } finally {
       database.close();
       assertProjectionSidecarsAbsent(lease.databasePath);

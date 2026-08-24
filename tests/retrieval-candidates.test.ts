@@ -5,6 +5,8 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, it } from "node:test";
 
+import type { JsonValue, StoredEvent } from "../src/orchestrator/contracts/event.js";
+import { payloadHash } from "../src/orchestrator/crypto/event-hash.js";
 import type {
   BranchScopeId,
   ProjectId,
@@ -12,7 +14,9 @@ import type {
   VaultId,
   WorkspaceId,
 } from "../src/orchestrator/identity/contracts.js";
+import { ImmutableProjectionBuilder } from "../src/orchestrator/projections/builder.js";
 import type { ProjectBinding } from "../src/orchestrator/projections/contracts.js";
+import type { ProjectionEventSnapshot } from "../src/orchestrator/projections/event-reader.js";
 import type { ProjectionManifestV1 } from "../src/orchestrator/projections/manifest.js";
 import type { ProjectionReaderLease } from "../src/orchestrator/projections/reader-lease.js";
 import { PROJECTION_SCHEMA_SQL_V1 } from "../src/orchestrator/projections/schema.js";
@@ -22,6 +26,8 @@ import type {
   RetrievalCandidateCollection,
   RetrievalChannel,
 } from "../src/orchestrator/retrieval/contracts.js";
+import { canonicalJson } from "../src/orchestrator/serialization/canonical-json.js";
+import { NodeSqliteDriver } from "../src/orchestrator/storage/node-sqlite-driver.js";
 
 const PROJECT_ID = "1".repeat(64) as ProjectId;
 const OTHER_PROJECT_ID = "9".repeat(64) as ProjectId;
@@ -31,6 +37,7 @@ const SESSION_ID = "00000000-0000-4000-8000-000000000512";
 const OTHER_SESSION_ID = "00000000-0000-4000-8000-000000000513";
 const ITEM_ID = "00000000-0000-4000-8000-000000000514";
 const FUTURE_ITEM_ID = "00000000-0000-4000-8000-000000000515";
+const NOW = "2026-08-24T00:00:00.000Z";
 
 const BINDING: ProjectBinding = Object.freeze({
   projectId: PROJECT_ID,
@@ -121,6 +128,14 @@ function createLease(options: { readonly dropFts?: boolean } = {}): ProjectionRe
     OTHER_PROJECT_ID, "00000000-0000-4000-8000-000000000517", "decision:cross-project", "verified",
     "2026-01-01T00:00:00.000Z", null, "same task ระบบ retrieval", "7".repeat(64), 2, 2,
   );
+  item.run(
+    PROJECT_ID, "00000000-0000-4000-8000-000000000518", "decision:newer-unrelated-one", "verified",
+    "2026-01-01T00:00:00.000Z", null, "newer unrelated alpha", "a".repeat(64), 12, 12,
+  );
+  item.run(
+    PROJECT_ID, "00000000-0000-4000-8000-000000000519", "decision:newer-unrelated-two", "verified",
+    "2026-01-01T00:00:00.000Z", null, "newer unrelated beta", "b".repeat(64), 14, 14,
+  );
 
   const chunk = database.prepare(`
     INSERT INTO lexical_chunks(
@@ -131,6 +146,8 @@ function createLease(options: { readonly dropFts?: boolean } = {}): ProjectionRe
   chunk.run(PROJECT_ID, "chunk-eligible", ITEM_ID, SESSION_ID, "summary", "decision:same-task", "same task ระบบ retrieval", 10);
   chunk.run(PROJECT_ID, "chunk-future", FUTURE_ITEM_ID, SESSION_ID, "summary", "decision:future-task", "future ระบบ retrieval", 13);
   chunk.run(OTHER_PROJECT_ID, "chunk-cross", "00000000-0000-4000-8000-000000000517", SESSION_ID, "summary", "decision:cross-project", "same task ระบบ retrieval", 2);
+  chunk.run(PROJECT_ID, "chunk-newer-one", "00000000-0000-4000-8000-000000000518", SESSION_ID, "summary", "decision:newer-unrelated-one", "newer unrelated alpha", 12);
+  chunk.run(PROJECT_ID, "chunk-newer-two", "00000000-0000-4000-8000-000000000519", SESSION_ID, "summary", "decision:newer-unrelated-two", "newer unrelated beta", 14);
 
   database.prepare(`
     INSERT INTO entity_graph(
@@ -153,6 +170,8 @@ function createLease(options: { readonly dropFts?: boolean } = {}): ProjectionRe
   `);
   artifact.run(PROJECT_ID, SESSION_ID, "artifact-symbol", "src/orchestrator/symbol.ts", "loadSymbol", "8".repeat(64), BINDING.branchRef, 9);
   artifact.run(PROJECT_ID, SESSION_ID, "artifact-other-branch", "src/orchestrator/other.ts", "loadOther", "9".repeat(64), "refs/heads/other", 9);
+  artifact.run(PROJECT_ID, SESSION_ID, "artifact-newer-one", "src/newer/alpha.ts", "newer alpha", "a".repeat(64), BINDING.branchRef, 11);
+  artifact.run(PROJECT_ID, SESSION_ID, "artifact-newer-two", "src/newer/beta.ts", "newer beta", "b".repeat(64), BINDING.branchRef, 12);
 
   database.prepare(`
     INSERT INTO session_tree(
@@ -211,6 +230,98 @@ function channelIds(
   return collection.channels
     .find((entry) => entry.channel === channel)?.candidates.map((candidate) => candidate.item.id)
     ?? [];
+}
+
+function createCanonicalLimitLease(count: 1 | 2): ProjectionReaderLease {
+  const root = mkdtempSync(join(tmpdir(), "retrieval-truncation-"));
+  roots.push(root);
+  const databasePath = join(root, "projections-1-1.sqlite");
+  const database = new DatabaseSync(databasePath);
+  database.exec(PROJECTION_SCHEMA_SQL_V1);
+  database.prepare(`
+    UPDATE projection_metadata SET
+      project_id = ?, vault_id = ?, store_id = ?, workspace_id = ?,
+      branch_scope_id = ?, branch_ref = ?, session_id = NULL, generation = 1,
+      terminal_event_position = 20, terminal_event_hash = ?, created_at = ?
+    WHERE singleton = 1
+  `).run(
+    BINDING.projectId, BINDING.vaultId, BINDING.storeId, BINDING.workspaceId,
+    BINDING.branchScopeId, BINDING.branchRef, "a".repeat(64), NOW,
+  );
+  const insert = database.prepare(`
+    INSERT INTO canonical_items(
+      project_id, item_id, normalized_key, status, confidence, verification_method,
+      valid_from, valid_to, summary, content_hash, known_from_event_position,
+      source_event_position
+    ) VALUES (?, ?, ?, 'verified', 'high', 'committed-event', ?, NULL, ?, ?, ?, ?)
+  `);
+  insert.run(
+    PROJECT_ID, ITEM_ID, "decision:limit-only", "2026-01-01T00:00:00.000Z",
+    "limit-only", "c".repeat(64), 1, 1,
+  );
+  if (count === 2) {
+    insert.run(
+      PROJECT_ID, "00000000-0000-4000-8000-000000000520", ITEM_ID,
+      "2026-01-01T00:00:00.000Z", "second exact identity", "d".repeat(64), 2, 2,
+    );
+  }
+  database.close();
+  return Object.freeze({ manifest: manifest(), databasePath, close: () => undefined });
+}
+
+function memoryStoredEvent(): StoredEvent {
+  const payload: JsonValue = {
+    sourceVersion: 1,
+    binding: { ...BINDING, sessionId: SESSION_ID },
+    itemId: ITEM_ID,
+    normalizedKey: "decision:session-a-only",
+    status: "verified",
+    confidence: "high",
+    verificationMethod: "committed-event",
+    validFrom: "2026-01-01T00:00:00.000Z",
+    validTo: null,
+    summary: "Session A private decision.",
+    contentHash: "e".repeat(64),
+  };
+  return Object.freeze({
+    globalPosition: 1n,
+    eventId: "00000000-0000-4000-8000-000000000521",
+    projectId: PROJECT_ID,
+    vaultId: BINDING.vaultId,
+    storeId: BINDING.storeId,
+    workspaceId: WORKSPACE_ID,
+    branchScopeId: BRANCH_SCOPE_ID,
+    branchRef: BINDING.branchRef,
+    streamId: `session/${SESSION_ID}`,
+    streamType: "session",
+    streamVersion: 1n,
+    eventType: "MemorySourceRecorded",
+    eventSchemaVersion: 1,
+    sessionId: SESSION_ID,
+    parentSessionId: null,
+    actorRole: "primary",
+    agentId: "retrieval-test-agent",
+    clientInstanceId: "retrieval-test-client",
+    correlationId: "00000000-0000-4000-8000-000000000522",
+    causationId: null,
+    commandId: "00000000-0000-4000-8000-000000000523",
+    idempotencyKey: "retrieval/session-scope/1",
+    commandEventIndex: 0,
+    occurredAt: NOW,
+    recordedAt: NOW,
+    visibilityScope: "session",
+    confidence: "high",
+    verificationStatus: "verified",
+    sourceRefs: Object.freeze([]),
+    evidenceRefs: Object.freeze([]) as readonly [],
+    evidenceDigests: Object.freeze([]) as readonly [],
+    payload,
+    payloadJson: canonicalJson(payload),
+    payloadHash: payloadHash(payload),
+    previousGlobalHash: "0".repeat(64),
+    eventHash: "f".repeat(64),
+    lifecycleIntentJson: null,
+  });
 }
 
 describe("local retrieval candidate channels", () => {
@@ -274,6 +385,76 @@ describe("local retrieval candidate channels", () => {
       repository.collectEligible(lease, request("follow-up-current", { candidateLimit: 1 })),
       "open-follow-up",
     ), ["follow-up-current"]);
+  });
+
+  it("matches inside each bounded channel before recency limiting", () => {
+    const lease = createLease();
+    const repository = new SqliteRetrievalCandidateRepository();
+    const bounded = { candidateLimit: 1, knownAt: 12n };
+
+    assert.deepEqual(channelIds(
+      repository.collectEligible(lease, request("decision:same-task", bounded)),
+      "exact",
+    ), [ITEM_ID]);
+    assert.deepEqual(channelIds(
+      repository.collectEligible(lease, request("ระบบ", bounded)),
+      "lexical",
+    ), [ITEM_ID]);
+    assert.deepEqual(channelIds(
+      repository.collectEligible(lease, request("loadSymbol", bounded)),
+      "symbol-path",
+    ), ["artifact-symbol"]);
+  });
+
+  it("reports truncation only when a channel observes a real limit-plus-one overflow", () => {
+    const repository = new SqliteRetrievalCandidateRepository();
+
+    const exactLimit = repository.collectEligible(
+      createCanonicalLimitLease(1),
+      request(ITEM_ID, { candidateLimit: 1, knownAt: 20n }),
+    );
+    assert.deepEqual(channelIds(exactLimit, "exact"), [ITEM_ID]);
+    assert.equal(exactLimit.truncated, false);
+
+    const overflow = repository.collectEligible(
+      createCanonicalLimitLease(2),
+      request(ITEM_ID, { candidateLimit: 1, knownAt: 20n }),
+    );
+    assert.equal(channelIds(overflow, "exact").length, 1);
+    assert.equal(overflow.truncated, true);
+  });
+
+  it("keeps builder-projected session canonical data out of another session", async () => {
+    const root = mkdtempSync(join(tmpdir(), "retrieval-builder-scope-"));
+    roots.push(root);
+    const event = memoryStoredEvent();
+    const snapshot: ProjectionEventSnapshot = Object.freeze({
+      binding: BINDING,
+      events: Object.freeze([event]),
+      terminalEventPosition: event.globalPosition,
+      terminalEventHash: event.eventHash,
+      close: () => undefined,
+    });
+    const generation = await new ImmutableProjectionBuilder({
+      driver: new NodeSqliteDriver({ DatabaseSync }),
+      projectionDirectory: join(root, "projections"),
+      now: () => NOW,
+    }).build(snapshot, 1);
+    const lease: ProjectionReaderLease = Object.freeze({
+      manifest: generation.manifest,
+      databasePath: generation.databasePath,
+      close: () => undefined,
+    });
+    const repository = new SqliteRetrievalCandidateRepository();
+
+    assert.deepEqual(channelIds(repository.collectEligible(lease, request(
+      "decision:session-a-only",
+      { sessionId: OTHER_SESSION_ID, visibility: "session" },
+    )), "exact"), []);
+    assert.deepEqual(channelIds(repository.collectEligible(lease, request(
+      "decision:session-a-only",
+      { sessionId: SESSION_ID, visibility: "session" },
+    )), "exact"), [ITEM_ID]);
   });
 
   it("fails closed instead of bypassing a missing published FTS5 index", () => {

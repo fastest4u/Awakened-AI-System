@@ -128,6 +128,7 @@ function rowsFromState(state: ProjectionFoldState): ProjectionRows {
     canonicalItems: freezeRows(state.canonicalItems
       .map((row) => ({
         project_id: row.projectId,
+        session_id: row.sessionId,
         item_id: row.itemId,
         normalized_key: row.normalizedKey,
         status: row.status,
@@ -224,7 +225,7 @@ const TABLES = Object.freeze({
   ],
   canonicalItems: [
     "canonical_items",
-    ["project_id", "item_id", "normalized_key", "status", "confidence", "verification_method", "valid_from", "valid_to", "summary", "content_hash", "known_from_event_position", "source_event_position"],
+    ["project_id", "session_id", "item_id", "normalized_key", "status", "confidence", "verification_method", "valid_from", "valid_to", "summary", "content_hash", "known_from_event_position", "source_event_position"],
   ],
   tasksFollowups: [
     "tasks_followups",
@@ -426,7 +427,8 @@ function verifyStructure(
       SELECT count(*) AS n FROM lexical_chunks AS chunk
       LEFT JOIN canonical_items AS item
         ON item.project_id = chunk.project_id AND item.item_id = chunk.item_id
-      WHERE chunk.item_id IS NOT NULL AND item.item_id IS NULL
+      WHERE chunk.item_id IS NOT NULL
+        AND (item.item_id IS NULL OR NOT (chunk.session_id IS item.session_id))
     `) !== 0n
   ) return failure("PROJECTION_REFERENCE_INVALID");
   const integrity = connection.prepare("PRAGMA integrity_check").get();

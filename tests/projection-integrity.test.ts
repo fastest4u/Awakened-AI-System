@@ -171,7 +171,7 @@ function trustedContext(root: string): ProjectContext {
 
 const TABLES = Object.freeze({
   sessionTree: ["session_tree", ["project_id", "session_id", "checkpoint_id", "checkpoint_version", "base_event_position", "source_event_position", "occurred_at", "task_summary"], "project_id, session_id"],
-  canonicalItems: ["canonical_items", ["project_id", "item_id", "normalized_key", "status", "confidence", "verification_method", "valid_from", "valid_to", "summary", "content_hash", "known_from_event_position", "source_event_position"], "project_id, item_id"],
+  canonicalItems: ["canonical_items", ["project_id", "session_id", "item_id", "normalized_key", "status", "confidence", "verification_method", "valid_from", "valid_to", "summary", "content_hash", "known_from_event_position", "source_event_position"], "project_id, item_id"],
   tasksFollowups: ["tasks_followups", ["project_id", "session_id", "follow_up_id", "status", "summary", "confidence", "source_event_position"], "project_id, follow_up_id"],
   artifactsFiles: ["artifacts_files", ["project_id", "session_id", "artifact_id", "path", "summary", "action", "content_hash", "branch_ref", "confidence", "source_event_position"], "project_id, session_id, artifact_id"],
   entityGraph: ["entity_graph", ["project_id", "edge_id", "source_entity_id", "relationship", "target_entity_id", "source_event_position"], "project_id, edge_id"],
