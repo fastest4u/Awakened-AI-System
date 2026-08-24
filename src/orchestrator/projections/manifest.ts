@@ -65,6 +65,35 @@ export interface ProjectionManifestV1 {
   readonly terminalEventHash: string;
   readonly databaseFile: string;
   readonly databaseSha256: string;
+  readonly coreChecksums: Readonly<Record<ProjectionNameV1, string>>;
+  readonly createdAt: string;
+}
+
+export const PROJECTION_NAMES_V1 = Object.freeze([
+  "sessionTree",
+  "canonicalItems",
+  "tasksFollowups",
+  "artifactsFiles",
+  "entityGraph",
+  "lexicalChunks",
+  "retrievalFeedback",
+] as const);
+export type ProjectionNameV1 = (typeof PROJECTION_NAMES_V1)[number];
+
+export interface ProjectionManifestV2 {
+  readonly schemaVersion: 2;
+  readonly projectId: ProjectBinding["projectId"];
+  readonly vaultId: ProjectBinding["vaultId"];
+  readonly storeId: ProjectBinding["storeId"];
+  readonly workspaceId: ProjectBinding["workspaceId"];
+  readonly branchScopeId: ProjectBinding["branchScopeId"];
+  readonly branchRef: string | null;
+  readonly sessionId: null;
+  readonly generation: number;
+  readonly terminalEventPosition: string;
+  readonly terminalEventHash: string;
+  readonly databaseFile: string;
+  readonly databaseSha256: string;
   readonly coreChecksums: Readonly<Record<ProjectionName, string>>;
   readonly createdAt: string;
 }
@@ -196,17 +225,20 @@ function validateTimestamp(value: unknown): string {
   return value;
 }
 
-function validateCoreChecksums(value: unknown): Readonly<Record<ProjectionName, string>> {
+function validateCoreChecksums<T extends string>(
+  value: unknown,
+  names: readonly T[],
+): Readonly<Record<T, string>> {
   if (typeof value !== "object" || value === null || Array.isArray(value)) invalid();
   const prototype = Object.getPrototypeOf(value) as unknown;
   if (prototype !== Object.prototype && prototype !== null) invalid();
   const keys = Reflect.ownKeys(value);
-  if (keys.length !== PROJECTION_NAMES.length) invalid();
+  if (keys.length !== names.length) invalid();
   for (const key of keys) {
-    if (typeof key !== "string" || !PROJECTION_NAMES.includes(key as ProjectionName)) invalid();
+    if (typeof key !== "string" || !names.includes(key as T)) invalid();
   }
-  const result = {} as Record<ProjectionName, string>;
-  for (const name of PROJECTION_NAMES) {
+  const result = {} as Record<T, string>;
+  for (const name of names) {
     const descriptor = Object.getOwnPropertyDescriptor(value, name);
     if (descriptor === undefined || !descriptor.enumerable || !("value" in descriptor)) invalid();
     assertHash(descriptor.value);
@@ -250,7 +282,7 @@ export function parseProjectionManifest(
   assertHash(source.databaseSha256);
   const databaseFile = `projections-1-${String(source.generation)}.sqlite`;
   if (source.databaseFile !== databaseFile) invalid();
-  const coreChecksums = validateCoreChecksums(source.coreChecksums);
+  const coreChecksums = validateCoreChecksums(source.coreChecksums, PROJECTION_NAMES_V1);
   const createdAt = validateTimestamp(source.createdAt);
 
   return Object.freeze({
@@ -272,7 +304,50 @@ export function parseProjectionManifest(
   });
 }
 
-export function serializeProjectionManifest(manifest: ProjectionManifestV1): Uint8Array {
+export function parseProjectionManifestV2(
+  value: unknown,
+  expectedBinding: ProjectBinding,
+): ProjectionManifestV2 {
+  const source = exactRecord(value, MANIFEST_KEYS);
+  const expected = validateExpectedBinding(expectedBinding);
+  if (source.schemaVersion !== 2 || source.sessionId !== null || !sameScope(source, expected)) invalid();
+  for (const key of ["projectId", "vaultId", "storeId", "workspaceId"] as const) assertHash(source[key]);
+  assertNullableUuid(source.branchScopeId);
+  assertNullableBranchRef(source.branchRef);
+  if (!Number.isSafeInteger(source.generation) || Number(source.generation) < 1 || Number(source.generation) > 2_147_483_647) {
+    invalid();
+  }
+  if (
+    typeof source.terminalEventPosition !== "string"
+    || !POSITION.test(source.terminalEventPosition)
+    || BigInt(source.terminalEventPosition) > SQLITE_INT64_MAX
+  ) invalid();
+  assertHash(source.terminalEventHash);
+  assertHash(source.databaseSha256);
+  const databaseFile = `projections-2-${String(source.generation)}.sqlite`;
+  if (source.databaseFile !== databaseFile) invalid();
+  const coreChecksums = validateCoreChecksums(source.coreChecksums, PROJECTION_NAMES);
+  const createdAt = validateTimestamp(source.createdAt);
+  return Object.freeze({
+    schemaVersion: 2,
+    projectId: source.projectId as ProjectBinding["projectId"],
+    vaultId: source.vaultId as ProjectBinding["vaultId"],
+    storeId: source.storeId as ProjectBinding["storeId"],
+    workspaceId: source.workspaceId as ProjectBinding["workspaceId"],
+    branchScopeId: source.branchScopeId as ProjectBinding["branchScopeId"],
+    branchRef: source.branchRef as string | null,
+    sessionId: null,
+    generation: source.generation as number,
+    terminalEventPosition: source.terminalEventPosition,
+    terminalEventHash: source.terminalEventHash,
+    databaseFile,
+    databaseSha256: source.databaseSha256,
+    coreChecksums,
+    createdAt,
+  });
+}
+
+export function serializeProjectionManifest(manifest: ProjectionManifestV1 | ProjectionManifestV2): Uint8Array {
   return Buffer.from(`${canonicalJson(manifest)}\n`, "utf8");
 }
 
@@ -348,7 +423,7 @@ export function verifyProjectionPublicationPaths(
 ): VerifiedProjectionPublicationPaths {
   if (
     typeof databaseFile !== "string"
-    || !/^projections-1-[1-9][0-9]{0,9}\.sqlite$/u.test(databaseFile)
+    || !/^projections-[12]-[1-9][0-9]{0,9}\.sqlite$/u.test(databaseFile)
   ) pathInvalid();
   const directory = safeProjectionDirectory(projectionDirectory, inspection);
   const databasePath = join(directory, databaseFile);

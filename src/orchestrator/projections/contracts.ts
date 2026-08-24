@@ -44,6 +44,13 @@ export type ProjectionItemStatus =
 
 export type ProjectionFeedbackOutcome = "accepted" | "dismissed" | "corrected";
 
+export type FollowUpStatus =
+  | "open"
+  | "blocked"
+  | "completed"
+  | "carried-forward"
+  | "abandoned";
+
 export type CheckpointWorkKind =
   | "completed"
   | "in-progress"
@@ -56,6 +63,7 @@ export type CheckpointWorkKind =
 export interface ProjectionEventSource {
   readonly sourceEventId: string;
   readonly sourceEventPosition: bigint;
+  readonly sourceStreamVersion: bigint;
   readonly sourceEventSchemaVersion: number;
   readonly occurredAt: string;
   readonly recordedAt: string;
@@ -100,6 +108,7 @@ export interface CheckpointProjectionEvent extends ProjectionEventSource {
 
 export interface MemorySourceProjectionEvent extends ProjectionEventSource {
   readonly kind: "memory-source";
+  readonly sourceEventSchemaVersion: 1 | 2;
   readonly itemId: string;
   readonly normalizedKey: string;
   readonly status: ProjectionItemStatus;
@@ -115,6 +124,118 @@ export interface MemorySourceProjectionEvent extends ProjectionEventSource {
   readonly supersedingItemId: string | null;
 }
 
+export interface GovernedCanonicalItem {
+  readonly itemId: string;
+  readonly normalizedKey: string;
+  readonly status: ProjectionItemStatus;
+  readonly confidence: Confidence;
+  readonly verificationMethod: string;
+  readonly validFrom: string;
+  readonly validTo: string | null;
+  readonly summary: string;
+  readonly contentHash: string;
+  readonly conflictGroupId: string | null;
+  readonly supersedingItemId: string | null;
+  readonly anchor: string | null;
+}
+
+export interface GovernedFollowUp {
+  readonly followUpId: string;
+  readonly status: FollowUpStatus;
+  readonly summary: string;
+  readonly confidence: Confidence;
+  readonly anchor: string | null;
+}
+
+export interface GovernedArtifact {
+  readonly artifactId: string;
+  readonly path: string;
+  readonly summary: string | null;
+  readonly action: "created" | "modified" | "deleted" | "observed" | "renamed" | "referenced";
+  readonly contentHash: string | null;
+  readonly branchRef: string | null;
+  readonly confidence: Confidence;
+  readonly symbol: string | null;
+  readonly commitHash: string | null;
+  readonly heading: string | null;
+  readonly anchor: string | null;
+}
+
+export interface GovernedEntity {
+  readonly entityId: string;
+  readonly normalizedName: string;
+  readonly entityType: string;
+  readonly validFrom: string;
+  readonly validTo: string | null;
+  readonly anchor: string | null;
+}
+
+export interface GovernedEntityAlias {
+  readonly aliasId: string;
+  readonly entityId: string;
+  readonly normalizedAlias: string;
+  readonly validFrom: string;
+  readonly validTo: string | null;
+  readonly anchor: string | null;
+}
+
+export interface GovernedEntityEdge {
+  readonly edgeId: string;
+  readonly sourceEntityId: string;
+  readonly targetEntityId: string;
+  readonly edgeType: string;
+  readonly validFrom: string;
+  readonly validTo: string | null;
+  readonly anchor: string | null;
+}
+
+export interface GovernedMemorySourceProjectionEvent extends ProjectionEventSource {
+  readonly kind: "governed-memory-source";
+  readonly sourceEventSchemaVersion: 3;
+  readonly item: GovernedCanonicalItem;
+  readonly followUps: readonly GovernedFollowUp[];
+  readonly artifacts: readonly GovernedArtifact[];
+  readonly entities: readonly GovernedEntity[];
+  readonly aliases: readonly GovernedEntityAlias[];
+  readonly edges: readonly GovernedEntityEdge[];
+}
+
+export type SessionLifecycleEventType =
+  | "SessionStarted"
+  | "SessionOwnerTransferred"
+  | "SessionOwnershipRecovered"
+  | "SessionSuspendRequested"
+  | "SessionSuspended"
+  | "SessionResumed"
+  | "EvidenceCoverageRecorded"
+  | "SessionForked"
+  | "ChildAssignmentAmended"
+  | "ChildWorkReported"
+  | "ChildWorkDispositioned"
+  | "ChildCompletionProposed"
+  | "ChildSessionCompleted"
+  | "ChildSessionSuspended"
+  | "ChildWorkTransferCreated"
+  | "ChildWorkTransferClaimed"
+  | "SessionEndRequested"
+  | "SessionEndAmended"
+  | "SessionValidationResultRecorded"
+  | "SessionEndVerificationPassed"
+  | "SessionEndVerificationFailed"
+  | "SessionEndVerificationInvalidated"
+  | "SessionEndCancelled"
+  | "SessionAbandoned"
+  | "SessionEnded";
+
+export interface SessionLifecycleProjectionEvent extends ProjectionEventSource {
+  readonly kind: "session-lifecycle";
+  readonly sessionId: string;
+  readonly parentSessionId: string | null;
+  readonly eventType: SessionLifecycleEventType;
+  readonly ownerGeneration: number | null;
+  readonly previousOwnerGeneration: number | null;
+}
+
 export interface RetrievalFeedbackProjectionEvent extends ProjectionEventSource {
   readonly kind: "retrieval-feedback";
   readonly feedbackId: string;
@@ -127,6 +248,8 @@ export interface RetrievalFeedbackProjectionEvent extends ProjectionEventSource 
 export type ProjectionEvent =
   | CheckpointProjectionEvent
   | MemorySourceProjectionEvent
+  | GovernedMemorySourceProjectionEvent
+  | SessionLifecycleProjectionEvent
   | RetrievalFeedbackProjectionEvent;
 
 export type ProjectionEventDecodeResult =
@@ -142,6 +265,25 @@ export interface SessionCheckpointProjection {
   readonly sourceEventPosition: bigint;
   readonly occurredAt: string;
   readonly taskSummary: string;
+  readonly sourceEventId: string;
+  readonly anchor: string | null;
+}
+
+export interface SessionTreeProjection {
+  readonly projectId: ProjectId;
+  readonly sessionId: string;
+  readonly rootSessionId: string;
+  readonly parentSessionId: string | null;
+  readonly lifecycleState: "open" | "closed";
+  readonly ownerGeneration: number;
+  readonly openedEventPosition: bigint;
+  readonly closedEventPosition: bigint | null;
+  readonly latestCheckpointId: string | null;
+  readonly latestCheckpointEventPosition: bigint | null;
+  readonly sourceEventId: string;
+  readonly sourceEventPosition: bigint;
+  readonly latestStreamVersion: bigint;
+  readonly anchor: string | null;
 }
 
 export interface CanonicalItemProjection {
@@ -159,20 +301,32 @@ export interface CanonicalItemProjection {
   readonly conflictGroupId: string | null;
   readonly supersedingItemId: string | null;
   readonly knownFromEventPosition: bigint;
+  readonly sourceEventId: string;
   readonly sourceEventPosition: bigint;
+  readonly anchor: string | null;
 }
 
 export interface FollowUpProjection {
   readonly projectId: ProjectId;
   readonly sessionId: string;
   readonly followUpId: string;
-  readonly status: "open" | "blocked";
+  readonly status: FollowUpStatus;
   readonly summary: string;
   readonly confidence: Confidence;
+  readonly sourceEventId: string;
   readonly sourceEventPosition: bigint;
+  readonly anchor: string | null;
 }
 
-export interface ArtifactProjection {
+export interface ProvenancedArtifactProjection {
+  readonly symbol: string | null;
+  readonly commitHash: string | null;
+  readonly heading: string | null;
+  readonly sourceEventId: string;
+  readonly anchor: string | null;
+}
+
+export interface ArtifactProjection extends ProvenancedArtifactProjection {
   readonly projectId: ProjectId;
   readonly sessionId: string;
   readonly artifactId: string;
@@ -185,6 +339,43 @@ export interface ArtifactProjection {
   readonly sourceEventPosition: bigint;
 }
 
+export interface EntityNodeProjection {
+  readonly projectId: ProjectId;
+  readonly entityId: string;
+  readonly normalizedName: string;
+  readonly entityType: string;
+  readonly validFrom: string;
+  readonly validTo: string | null;
+  readonly sourceEventId: string;
+  readonly sourceEventPosition: bigint;
+  readonly anchor: string | null;
+}
+
+export interface EntityAliasProjection {
+  readonly projectId: ProjectId;
+  readonly aliasId: string;
+  readonly entityId: string;
+  readonly normalizedAlias: string;
+  readonly validFrom: string;
+  readonly validTo: string | null;
+  readonly sourceEventId: string;
+  readonly sourceEventPosition: bigint;
+  readonly anchor: string | null;
+}
+
+export interface EntityEdgeProjection {
+  readonly projectId: ProjectId;
+  readonly edgeId: string;
+  readonly sourceEntityId: string;
+  readonly targetEntityId: string;
+  readonly edgeType: string;
+  readonly validFrom: string;
+  readonly validTo: string | null;
+  readonly sourceEventId: string;
+  readonly sourceEventPosition: bigint;
+  readonly anchor: string | null;
+}
+
 export interface LexicalChunkProjection {
   readonly projectId: ProjectId;
   readonly chunkId: string;
@@ -193,7 +384,9 @@ export interface LexicalChunkProjection {
   readonly section: string;
   readonly normalizedKey: string;
   readonly text: string;
+  readonly sourceEventId: string;
   readonly sourceEventPosition: bigint;
+  readonly anchor: string | null;
 }
 
 export interface RetrievalFeedbackProjection {
@@ -203,17 +396,23 @@ export interface RetrievalFeedbackProjection {
   readonly outcome: ProjectionFeedbackOutcome;
   readonly usefulness: number;
   readonly sourceItemEventPosition: bigint;
+  readonly sourceEventId: string;
   readonly sourceEventPosition: bigint;
+  readonly anchor: string | null;
 }
 
 export interface ProjectionFoldState {
-  readonly schemaVersion: 1;
+  readonly schemaVersion: 2;
   readonly binding: ProjectBinding | null;
   readonly terminalEventPosition: bigint | null;
+  readonly sessionTree: readonly SessionTreeProjection[];
   readonly sessionCheckpoints: readonly SessionCheckpointProjection[];
   readonly canonicalItems: readonly CanonicalItemProjection[];
   readonly followUps: readonly FollowUpProjection[];
   readonly artifacts: readonly ArtifactProjection[];
+  readonly entityNodes: readonly EntityNodeProjection[];
+  readonly entityAliases: readonly EntityAliasProjection[];
+  readonly entityEdges: readonly EntityEdgeProjection[];
   readonly lexicalChunks: readonly LexicalChunkProjection[];
   readonly retrievalFeedback: readonly RetrievalFeedbackProjection[];
 }

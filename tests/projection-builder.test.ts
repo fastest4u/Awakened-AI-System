@@ -41,6 +41,10 @@ const BRANCH_SCOPE_ID = "00000000-0000-4000-8000-000000000041" as BranchScopeId;
 const BRANCH_REF = "refs/heads/projection-builder";
 const SESSION_ID = "00000000-0000-4000-8000-000000000042";
 const ITEM_ID = "00000000-0000-4000-8000-000000000043";
+const ROOT_SESSION_ID = "00000000-0000-4000-8000-000000000044";
+const CHILD_SESSION_ID = "00000000-0000-4000-8000-000000000045";
+const ENTITY_A = "00000000-0000-4000-8000-000000000046";
+const ENTITY_B = "00000000-0000-4000-8000-000000000047";
 const NOW = "2026-08-23T02:00:00.000Z";
 
 const BINDING: ProjectBinding = Object.freeze({
@@ -132,11 +136,170 @@ function memoryPayload(): JsonValue {
   };
 }
 
+function rootStartedPayload(): JsonValue {
+  return {
+    sessionKind: "root",
+    ownerGeneration: 1,
+    continuityKey: "projection-root",
+    clientNamespace: "projection-builder-tests",
+    creatingAgentId: "builder-test",
+    creatingClientInstanceId: "builder-client",
+    authorityCommitment: "b".repeat(64),
+  };
+}
+
+function childForkedPayload(): JsonValue {
+  return {
+    parentSessionId: ROOT_SESSION_ID,
+    assignment: {
+      assignmentId: "00000000-0000-4000-8000-000000000048",
+      summary: "Materialize schema V2",
+      scope: "projection remediation",
+    },
+    rootOwnerGeneration: 1,
+    directAccessEnabled: false,
+    authorityCommitment: "c".repeat(64),
+    sourceTransferTicketId: null,
+  };
+}
+
+function childCheckpointPayload(): JsonValue {
+  return {
+    checkpoint: {
+      checkpointVersion: 1,
+      checkpointId: "00000000-0000-4000-8000-000000000049",
+      sessionId: CHILD_SESSION_ID,
+      parentSessionId: ROOT_SESSION_ID,
+      baseEventPosition: "2",
+      checkpointEventPosition: "3",
+      createdAt: NOW,
+      creatorAgentId: "builder-test",
+      creatorClientInstanceId: "builder-client",
+      taskSummary: "Materialize every V2 relation.",
+      completedItems: [],
+      inProgressItems: [],
+      blockers: [],
+      nextActions: [],
+      decisions: [],
+      assumptions: [],
+      unresolvedConflicts: [],
+      filesTouched: [],
+      artifactReferences: [],
+      sourceReferences: [],
+      commandResults: [],
+      testResults: [],
+      materialClaims: [],
+      sourceState: {
+        sourceStateScopeVersion: 1,
+        workspaceId: WORKSPACE_ID,
+        branchRef: BRANCH_REF,
+        headCommit: "d".repeat(40),
+        dirtyWorktreeFingerprint: "e".repeat(64),
+      },
+      childSummaries: [],
+      evidenceCoverage: {
+        captureMode: "coverage-only",
+        contentRetained: false,
+        highestContiguousOrdinal: null,
+        missingIntervals: [],
+      },
+    },
+    baseEventPosition: "2",
+    checkpointEventPosition: "3",
+  };
+}
+
+function governedPayload(): JsonValue {
+  const statuses = ["open", "blocked", "completed", "carried-forward", "abandoned"] as const;
+  return {
+    sourceVersion: 2,
+    binding: { ...BINDING, sessionId: CHILD_SESSION_ID },
+    item: {
+      itemId: ITEM_ID,
+      normalizedKey: "decision:immutable-projections",
+      status: "verified",
+      confidence: "high",
+      verificationMethod: "governed-source",
+      validFrom: NOW,
+      validTo: null,
+      summary: "Published projection generations are immutable.",
+      contentHash: "a".repeat(64),
+      conflictGroupId: null,
+      supersedingItemId: null,
+      anchor: "memory/items#immutable-projections",
+    },
+    followUps: statuses.map((status, index) => ({
+      followUpId: `00000000-0000-4000-8000-${String(50 + index).padStart(12, "0")}`,
+      status,
+      summary: `Follow-up ${status}`,
+      confidence: "high",
+      anchor: index === 0 ? "memory/follow-ups#open" : null,
+    })),
+    artifacts: [{
+      artifactId: "00000000-0000-4000-8000-000000000055",
+      path: "src/orchestrator/projections/schema.ts",
+      summary: "Projection schema",
+      action: "modified",
+      contentHash: "f".repeat(64),
+      branchRef: BRANCH_REF,
+      confidence: "high",
+      symbol: "PROJECTION_SCHEMA_VERSION",
+      commitHash: "a".repeat(64),
+      heading: "Schema V2",
+      anchor: null,
+    }],
+    entities: [
+      {
+        entityId: ENTITY_A,
+        normalizedName: "projection schema",
+        entityType: "contract",
+        validFrom: NOW,
+        validTo: null,
+        anchor: "memory/entities#projection-schema",
+      },
+      {
+        entityId: ENTITY_B,
+        normalizedName: "integrity replay",
+        entityType: "verification",
+        validFrom: NOW,
+        validTo: null,
+        anchor: null,
+      },
+    ],
+    aliases: [{
+      aliasId: "00000000-0000-4000-8000-000000000056",
+      entityId: ENTITY_A,
+      normalizedAlias: "schema v2",
+      validFrom: NOW,
+      validTo: null,
+      anchor: null,
+    }],
+    edges: [{
+      edgeId: "00000000-0000-4000-8000-000000000057",
+      sourceEntityId: ENTITY_A,
+      targetEntityId: ENTITY_B,
+      edgeType: "verified-by",
+      validFrom: NOW,
+      validTo: null,
+      anchor: "memory/entities#verified-by",
+    }],
+  };
+}
+
+interface InsertEventOptions {
+  readonly eventSchemaVersion?: number;
+  readonly sessionId?: string;
+  readonly parentSessionId?: string | null;
+  readonly streamVersion?: number;
+  readonly visibilityScope?: "session" | "workspace" | "branch" | "project";
+}
+
 function insertEvent(
   database: DatabaseSync,
   position: number,
   eventType = "IgnoredEvent",
   payload: JsonValue = {},
+  options: InsertEventOptions = {},
 ): void {
   const eventId = `00000000-0000-4000-8000-${String(position).padStart(12, "0")}`;
   const commandId = `00000000-0000-4000-9000-${String(position).padStart(12, "0")}`;
@@ -146,6 +309,11 @@ function insertEvent(
     ? GENESIS_GLOBAL_HASH
     : database.prepare("SELECT event_hash FROM events WHERE global_position = ?").get(position - 1)?.event_hash;
   if (typeof previousGlobalHash !== "string") throw new Error("missing predecessor fixture hash");
+  const sessionId = options.sessionId ?? SESSION_ID;
+  const parentSessionId = options.parentSessionId ?? null;
+  const streamVersion = options.streamVersion ?? position;
+  const eventSchemaVersion = options.eventSchemaVersion ?? 1;
+  const visibilityScope = options.visibilityScope ?? "session";
   const hashMaterial = {
     globalPosition: String(position),
     eventId,
@@ -155,13 +323,13 @@ function insertEvent(
     workspaceId: WORKSPACE_ID,
     branchScopeId: BRANCH_SCOPE_ID,
     branchRef: BRANCH_REF,
-    streamId: `session/${SESSION_ID}`,
+    streamId: `session/${sessionId}`,
     streamType: "session",
-    streamVersion: String(position),
+    streamVersion: String(streamVersion),
     eventType,
-    eventSchemaVersion: 1,
-    sessionId: SESSION_ID,
-    parentSessionId: null,
+    eventSchemaVersion,
+    sessionId,
+    parentSessionId,
     actorRole: "primary",
     agentId: "builder-test",
     clientInstanceId: "builder-client",
@@ -172,7 +340,7 @@ function insertEvent(
     commandEventIndex: 0,
     occurredAt: NOW,
     recordedAt: NOW,
-    visibilityScope: "session",
+    visibilityScope,
     confidence: "high",
     verificationStatus: "verified",
     sourceRefs: [],
@@ -182,34 +350,50 @@ function insertEvent(
     previousGlobalHash,
   };
   database.prepare(`
-    INSERT INTO events VALUES (
-      ?, ?, ?, ?, ?, ?, ?, ?, ?, 'session', ?, ?, 1, ?, NULL,
-      'primary', 'builder-test', 'builder-client', ?, NULL, ?, ?, 0,
-      ?, ?, 'session', 'high', 'verified', '[]', '[]', '[]', ?, ?, ?, ?, NULL
+    INSERT INTO events(
+      global_position, event_id, project_id, vault_id, store_id, workspace_id,
+      branch_scope_id, branch_ref, stream_id, stream_type, stream_version,
+      event_type, event_schema_version, session_id, parent_session_id, actor_role,
+      agent_id, client_instance_id, correlation_id, causation_id, command_id,
+      idempotency_key, command_event_index, occurred_at, recorded_at, visibility_scope,
+      confidence, verification_status, source_refs_json, evidence_refs_json,
+      evidence_digests_json, payload_json, payload_hash, previous_global_hash,
+      event_hash, lifecycle_intent_json
+    ) VALUES (
+      $globalPosition, $eventId, $projectId, $vaultId, $storeId, $workspaceId,
+      $branchScopeId, $branchRef, $streamId, 'session', $streamVersion,
+      $eventType, $eventSchemaVersion, $sessionId, $parentSessionId, 'primary',
+      'builder-test', 'builder-client', $correlationId, NULL, $commandId,
+      $idempotencyKey, 0, $occurredAt, $recordedAt, $visibilityScope,
+      'high', 'verified', '[]', '[]', '[]', $payloadJson, $payloadHash,
+      $previousGlobalHash, $eventHash, NULL
     )
-  `).run(
-    position,
-    eventId,
-    PROJECT_ID,
-    VAULT_ID,
-    STORE_ID,
-    WORKSPACE_ID,
-    BRANCH_SCOPE_ID,
-    BRANCH_REF,
-    `session/${SESSION_ID}`,
-    position,
-    eventType,
-    SESSION_ID,
-    `00000000-0000-4000-a000-${String(position).padStart(12, "0")}`,
-    commandId,
-    `builder/${position}`,
-    NOW,
-    NOW,
-    payloadJson,
-    hashedPayload,
-    previousGlobalHash,
-    eventHash(hashMaterial),
-  );
+  `).run({
+    $globalPosition: position,
+    $eventId: eventId,
+    $projectId: PROJECT_ID,
+    $vaultId: VAULT_ID,
+    $storeId: STORE_ID,
+    $workspaceId: WORKSPACE_ID,
+    $branchScopeId: BRANCH_SCOPE_ID,
+    $branchRef: BRANCH_REF,
+    $streamId: `session/${sessionId}`,
+    $streamVersion: streamVersion,
+    $eventType: eventType,
+    $eventSchemaVersion: eventSchemaVersion,
+    $sessionId: sessionId,
+    $parentSessionId: parentSessionId,
+    $correlationId: `00000000-0000-4000-a000-${String(position).padStart(12, "0")}`,
+    $commandId: commandId,
+    $idempotencyKey: `builder/${position}`,
+    $occurredAt: NOW,
+    $recordedAt: NOW,
+    $visibilityScope: visibilityScope,
+    $payloadJson: payloadJson,
+    $payloadHash: hashedPayload,
+    $previousGlobalHash: previousGlobalHash,
+    $eventHash: eventHash(hashMaterial),
+  });
 }
 
 type StreamingSnapshot = Omit<ProjectionEventSnapshot, "events"> & {
@@ -396,9 +580,11 @@ describe("projection generation builder", () => {
       projectionDirectory,
       now: () => NOW,
     });
-    const generation = await builder.build(snapshot, 1);
+    const generation = await builder.buildV2(snapshot, 1);
     snapshot.close();
 
+    assert.equal(generation.manifest.schemaVersion, 2);
+    assert.equal(generation.manifest.databaseFile, "projections-2-1.sqlite");
     assert.equal(generation.manifest.terminalEventPosition, "8");
     assert.equal(generation.manifest.sessionId, null);
     assert.deepEqual(
@@ -472,9 +658,212 @@ describe("projection generation builder", () => {
       driver.opens.map((entry) => [entry.path, entry.options.mode]),
       [
         [sourcePath, "read-only-existing"],
-        [join(projectionDirectory, ".projections-1-1.sqlite.tmp"), "create"],
+        [join(projectionDirectory, ".projections-2-1.sqlite.tmp"), "create"],
       ],
     );
+  });
+
+  it("keeps the production V1 build on its historical standalone latest-checkpoint fold", async () => {
+    const root = mkdtempSync(join(tmpdir(), "projection-builder-v1-boundary-"));
+    roots.push(root);
+    const sourcePath = join(root, "events.sqlite");
+    const projectionDirectory = join(root, "projections");
+    const source = createSource(sourcePath);
+    insertEvent(source, 1);
+    insertEvent(source, 2);
+    insertEvent(source, 3, "SessionCheckpointRecorded", childCheckpointPayload(), {
+      sessionId: CHILD_SESSION_ID,
+      parentSessionId: ROOT_SESSION_ID,
+      streamVersion: 1,
+    });
+
+    const snapshot = await new SqliteProjectionEventReader({
+      driver: new NodeSqliteDriver({ DatabaseSync }),
+      eventStorePath: sourcePath,
+    }).openCommittedSnapshot(BINDING);
+    const generation = await new ImmutableProjectionBuilder({
+      driver: new NodeSqliteDriver({ DatabaseSync }),
+      projectionDirectory,
+      now: () => NOW,
+    }).build(snapshot, 1);
+    snapshot.close();
+    source.close();
+
+    assert.equal(generation.manifest.schemaVersion, 1);
+    assert.equal(generation.manifest.databaseFile, "projections-1-1.sqlite");
+    const projected = new DatabaseSync(generation.databasePath, { readOnly: true });
+    try {
+      assert.deepEqual({ ...projected.prepare(`
+        SELECT session_id, checkpoint_id, source_event_position
+        FROM session_tree
+      `).get() }, {
+        session_id: CHILD_SESSION_ID,
+        checkpoint_id: "00000000-0000-4000-8000-000000000049",
+        source_event_position: 3,
+      });
+    } finally {
+      projected.close();
+    }
+  });
+
+  it("keeps governed schema-3 material out of the production V1 build", async () => {
+    const root = mkdtempSync(join(tmpdir(), "projection-builder-v1-governed-boundary-"));
+    roots.push(root);
+    const sourcePath = join(root, "events.sqlite");
+    const projectionDirectory = join(root, "projections");
+    const source = createSource(sourcePath);
+    insertEvent(source, 1, "MemorySourceRecorded", governedPayload(), {
+      eventSchemaVersion: 3,
+      sessionId: CHILD_SESSION_ID,
+      parentSessionId: ROOT_SESSION_ID,
+      streamVersion: 1,
+      visibilityScope: "project",
+    });
+
+    const snapshot = await new SqliteProjectionEventReader({
+      driver: new NodeSqliteDriver({ DatabaseSync }),
+      eventStorePath: sourcePath,
+    }).openCommittedSnapshot(BINDING);
+    const builder = new ImmutableProjectionBuilder({
+      driver: new NodeSqliteDriver({ DatabaseSync }),
+      projectionDirectory,
+      now: () => NOW,
+    });
+
+    await assert.rejects(() => builder.build(snapshot, 1), /INTEGRITY_FAILURE/u);
+    assert.equal(existsSync(join(projectionDirectory, "projections-1-1.sqlite")), false);
+    snapshot.close();
+    source.close();
+  });
+
+  it("builds a production-decodable root/child/checkpoint and every governed V2 relation", async () => {
+    const root = mkdtempSync(join(tmpdir(), "projection-builder-v2-relations-"));
+    roots.push(root);
+    const sourcePath = join(root, "events.sqlite");
+    const projectionDirectory = join(root, "projections");
+    const source = createSource(sourcePath);
+    insertEvent(source, 1, "SessionStarted", rootStartedPayload(), {
+      sessionId: ROOT_SESSION_ID,
+      parentSessionId: null,
+      streamVersion: 1,
+    });
+    insertEvent(source, 2, "SessionForked", childForkedPayload(), {
+      sessionId: CHILD_SESSION_ID,
+      parentSessionId: ROOT_SESSION_ID,
+      streamVersion: 1,
+    });
+    insertEvent(source, 3, "SessionCheckpointRecorded", childCheckpointPayload(), {
+      sessionId: CHILD_SESSION_ID,
+      parentSessionId: ROOT_SESSION_ID,
+      streamVersion: 2,
+    });
+    insertEvent(source, 4, "MemorySourceRecorded", governedPayload(), {
+      eventSchemaVersion: 3,
+      sessionId: CHILD_SESSION_ID,
+      parentSessionId: ROOT_SESSION_ID,
+      streamVersion: 3,
+      visibilityScope: "project",
+    });
+
+    const snapshot = await new SqliteProjectionEventReader({
+      driver: new NodeSqliteDriver({ DatabaseSync }),
+      eventStorePath: sourcePath,
+    }).openCommittedSnapshot(BINDING);
+    const generation = await new ImmutableProjectionBuilder({
+      driver: new NodeSqliteDriver({ DatabaseSync }),
+      projectionDirectory,
+      now: () => NOW,
+    }).buildV2(snapshot, 1);
+    snapshot.close();
+    source.close();
+
+    const projected = new DatabaseSync(generation.databasePath, { readOnly: true });
+    try {
+      assert.deepEqual(projected.prepare(`
+        SELECT session_id, root_session_id, parent_session_id, lifecycle_state,
+               owner_generation, source_event_id
+        FROM session_tree ORDER BY opened_event_position
+      `).all().map((row) => ({ ...row })), [
+        {
+          session_id: ROOT_SESSION_ID,
+          root_session_id: ROOT_SESSION_ID,
+          parent_session_id: null,
+          lifecycle_state: "open",
+          owner_generation: 1,
+          source_event_id: "00000000-0000-4000-8000-000000000001",
+        },
+        {
+          session_id: CHILD_SESSION_ID,
+          root_session_id: ROOT_SESSION_ID,
+          parent_session_id: ROOT_SESSION_ID,
+          lifecycle_state: "open",
+          owner_generation: 1,
+          source_event_id: "00000000-0000-4000-8000-000000000002",
+        },
+      ]);
+      assert.deepEqual({ ...projected.prepare(`
+        SELECT checkpoint_id, source_event_id, source_event_position, anchor
+        FROM session_checkpoints
+      `).get() }, {
+        checkpoint_id: "00000000-0000-4000-8000-000000000049",
+        source_event_id: "00000000-0000-4000-8000-000000000003",
+        source_event_position: 3,
+        anchor: null,
+      });
+      assert.deepEqual(projected.prepare(`
+        SELECT status, source_event_id, anchor
+        FROM tasks_followups ORDER BY follow_up_id
+      `).all().map((row) => ({ ...row })), [
+        { status: "open", source_event_id: "00000000-0000-4000-8000-000000000004", anchor: "memory/follow-ups#open" },
+        { status: "blocked", source_event_id: "00000000-0000-4000-8000-000000000004", anchor: null },
+        { status: "completed", source_event_id: "00000000-0000-4000-8000-000000000004", anchor: null },
+        { status: "carried-forward", source_event_id: "00000000-0000-4000-8000-000000000004", anchor: null },
+        { status: "abandoned", source_event_id: "00000000-0000-4000-8000-000000000004", anchor: null },
+      ]);
+      assert.deepEqual({ ...projected.prepare(`
+        SELECT symbol, commit_hash, heading, source_event_id, anchor
+        FROM artifacts_files
+      `).get() }, {
+        symbol: "PROJECTION_SCHEMA_VERSION",
+        commit_hash: "a".repeat(64),
+        heading: "Schema V2",
+        source_event_id: "00000000-0000-4000-8000-000000000004",
+        anchor: null,
+      });
+      assert.equal(projected.prepare("SELECT count(*) AS n FROM entity_nodes").get()?.n, 2);
+      assert.deepEqual({ ...projected.prepare(`
+        SELECT entity_id, normalized_alias, source_event_id, anchor FROM entity_aliases
+      `).get() }, {
+        entity_id: ENTITY_A,
+        normalized_alias: "schema v2",
+        source_event_id: "00000000-0000-4000-8000-000000000004",
+        anchor: null,
+      });
+      assert.deepEqual({ ...projected.prepare(`
+        SELECT source_entity_id, target_entity_id, edge_type, source_event_id, anchor
+        FROM entity_edges
+      `).get() }, {
+        source_entity_id: ENTITY_A,
+        target_entity_id: ENTITY_B,
+        edge_type: "verified-by",
+        source_event_id: "00000000-0000-4000-8000-000000000004",
+        anchor: "memory/entities#verified-by",
+      });
+      assert.deepEqual({ ...projected.prepare(`
+        SELECT source_event_id, anchor FROM canonical_items WHERE item_id = ?
+      `).get(ITEM_ID) }, {
+        source_event_id: "00000000-0000-4000-8000-000000000004",
+        anchor: "memory/items#immutable-projections",
+      });
+      assert.deepEqual({ ...projected.prepare(`
+        SELECT source_event_id, anchor FROM lexical_chunks WHERE item_id = ?
+      `).get(ITEM_ID) }, {
+        source_event_id: "00000000-0000-4000-8000-000000000004",
+        anchor: "memory/items#immutable-projections",
+      });
+    } finally {
+      projected.close();
+    }
   });
 
   it("rejects an over-limit prefix before reading a full event row", async () => {
@@ -542,8 +931,8 @@ describe("projection generation builder", () => {
       now: () => NOW,
     });
 
-    await assert.rejects(() => builder.build(snapshot, 1), /INTEGRITY_FAILURE/u);
-    assert.equal(existsSync(join(projectionDirectory, "projections-1-1.sqlite")), false);
+    await assert.rejects(() => builder.buildV2(snapshot, 1), /INTEGRITY_FAILURE/u);
+    assert.equal(existsSync(join(projectionDirectory, "projections-2-1.sqlite")), false);
     snapshot.close();
     source.close();
   });
@@ -586,7 +975,7 @@ describe("projection generation builder", () => {
     });
 
     await assert.rejects(
-      () => builder.build(snapshot, 1),
+      () => builder.buildV2(snapshot, 1),
       /PROJECTION_CHECKSUM_INVALID/u,
     );
     snapshot.close();
@@ -625,7 +1014,7 @@ describe("projection generation builder", () => {
     });
 
     await assert.rejects(
-      () => builder.build(snapshot, 1),
+      () => builder.buildV2(snapshot, 1),
       /PROJECTION_FTS_INVALID/u,
     );
     snapshot.close();
@@ -653,10 +1042,10 @@ describe("projection generation builder", () => {
     });
 
     await assert.rejects(
-      () => builder.build(snapshot, 1),
+      () => builder.buildV2(snapshot, 1),
       /INTEGRITY_FAILURE/u,
     );
-    assert.equal(existsSync(join(projectionDirectory, "projections-1-1.sqlite")), false);
+    assert.equal(existsSync(join(projectionDirectory, "projections-2-1.sqlite")), false);
     snapshot.close();
     source.close();
   });

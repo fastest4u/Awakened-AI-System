@@ -8,17 +8,30 @@ import type {
   WorkspaceId,
 } from "../identity/contracts.js";
 import { decodeCheckpoint } from "../lifecycle/contracts/checkpoint.js";
+import {
+  decodeLifecycleEventPayload,
+  LIFECYCLE_EVENT_TYPES,
+  type LifecycleEventType,
+} from "../lifecycle/contracts/events.js";
 import { canonicalJson } from "../serialization/canonical-json.js";
 import type {
   CheckpointArtifactItem,
   CheckpointFileItem,
   CheckpointProjectionEvent,
   CheckpointWorkItem,
+  GovernedArtifact,
+  GovernedCanonicalItem,
+  GovernedEntity,
+  GovernedEntityAlias,
+  GovernedEntityEdge,
+  GovernedFollowUp,
+  GovernedMemorySourceProjectionEvent,
   MemorySourceProjectionEvent,
   ProjectBinding,
   ProjectionEvent,
   ProjectionEventDecodeResult,
   RetrievalFeedbackProjectionEvent,
+  SessionLifecycleProjectionEvent,
 } from "./contracts.js";
 
 const SQLITE_INT64_MAX = 9_223_372_036_854_775_807n;
@@ -32,6 +45,8 @@ const MAX_EVENT_PAYLOAD_NODES = 256 * 1024;
 // Every canonical object member needs at least two quotes, one colon, and one value byte.
 const MAX_CANONICAL_OBJECT_KEYS = Math.floor(MAX_EVENT_PAYLOAD_BYTES / 4);
 const MAX_SUMMARY_BYTES = 16 * 1024;
+const MAX_ORDINARY_TEXT_BYTES = 4 * 1024;
+const MAX_GOVERNED_ROWS = 200;
 
 const STORED_EVENT_KEYS = [
   "globalPosition",
@@ -206,6 +221,203 @@ function nullableBoundedString(value: unknown, maximumBytes: number): string | n
   return value === null ? null : boundedString(value, maximumBytes);
 }
 
+function normalizedText(value: unknown, maximumBytes: number): string {
+  const decoded = boundedString(value, maximumBytes);
+  if (decoded.normalize("NFKC").trim().toLowerCase() !== decoded) return integrity();
+  return decoded;
+}
+
+function nullableAnchor(value: unknown): string | null {
+  return nullableBoundedString(value, MAX_ORDINARY_TEXT_BYTES);
+}
+
+function nullableHash(value: unknown): string | null {
+  return value === null ? null : hash(value);
+}
+
+function nullableCommitHash(value: unknown): string | null {
+  return value === null ? null : hash(value);
+}
+
+function validity(
+  validFromValue: unknown,
+  validToValue: unknown,
+  rejectEqual: boolean,
+): Readonly<{ validFrom: string; validTo: string | null }> {
+  const validFrom = timestamp(validFromValue);
+  const validTo = validToValue === null ? null : timestamp(validToValue);
+  if (
+    validTo !== null
+    && (rejectEqual ? Date.parse(validTo) <= Date.parse(validFrom) : Date.parse(validTo) < Date.parse(validFrom))
+  ) return integrity();
+  return Object.freeze({ validFrom, validTo });
+}
+
+function uniqueIds<T>(values: readonly T[], identity: (value: T) => string): readonly T[] {
+  const seen = new Set<string>();
+  for (const value of values) {
+    const id = identity(value);
+    if (seen.has(id)) return integrity();
+    seen.add(id);
+  }
+  return values;
+}
+
+function decodeGovernedItem(value: unknown): GovernedCanonicalItem {
+  const source = exactRecord(value, [
+    "itemId",
+    "normalizedKey",
+    "status",
+    "confidence",
+    "verificationMethod",
+    "validFrom",
+    "validTo",
+    "summary",
+    "contentHash",
+    "conflictGroupId",
+    "supersedingItemId",
+    "anchor",
+  ]);
+  const itemId = uuid(source.itemId);
+  const interval = validity(source.validFrom, source.validTo, false);
+  const supersedingItemId = nullableUuid(source.supersedingItemId);
+  if (supersedingItemId === itemId) return integrity();
+  return Object.freeze({
+    itemId,
+    normalizedKey: normalizedText(source.normalizedKey, 512),
+    status: oneOf(source.status, [
+      "candidate",
+      "provisional",
+      "verified",
+      "conflicted",
+      "superseded",
+      "retracted",
+      "expired",
+      "erased-evidence",
+    ] as const),
+    confidence: oneOf(source.confidence, ["high", "medium", "low", "guess"] as const),
+    verificationMethod: boundedString(source.verificationMethod, 128),
+    ...interval,
+    summary: boundedString(source.summary, MAX_SUMMARY_BYTES),
+    contentHash: hash(source.contentHash),
+    conflictGroupId: nullableUuid(source.conflictGroupId),
+    supersedingItemId,
+    anchor: nullableAnchor(source.anchor),
+  });
+}
+
+function decodeGovernedFollowUps(value: unknown): readonly GovernedFollowUp[] {
+  const rows = strictArray(value, MAX_GOVERNED_ROWS).map((entry) => {
+    const source = exactRecord(entry, ["followUpId", "status", "summary", "confidence", "anchor"]);
+    return Object.freeze({
+      followUpId: uuid(source.followUpId),
+      status: oneOf(source.status, [
+        "open", "blocked", "completed", "carried-forward", "abandoned",
+      ] as const),
+      summary: boundedString(source.summary, MAX_SUMMARY_BYTES),
+      confidence: oneOf(source.confidence, ["high", "medium", "low", "guess"] as const),
+      anchor: nullableAnchor(source.anchor),
+    });
+  });
+  return Object.freeze(uniqueIds(rows, (row) => row.followUpId));
+}
+
+function decodeGovernedArtifacts(value: unknown): readonly GovernedArtifact[] {
+  const rows = strictArray(value, MAX_GOVERNED_ROWS).map((entry) => {
+    const source = exactRecord(entry, [
+      "artifactId", "path", "summary", "action", "contentHash", "branchRef", "confidence",
+      "symbol", "commitHash", "heading", "anchor",
+    ]);
+    return Object.freeze({
+      artifactId: uuid(source.artifactId),
+      path: boundedString(source.path, 2_048),
+      summary: nullableBoundedString(source.summary, MAX_SUMMARY_BYTES),
+      action: oneOf(source.action, [
+        "created", "modified", "deleted", "observed", "renamed", "referenced",
+      ] as const),
+      contentHash: nullableHash(source.contentHash),
+      branchRef: nullableBoundedString(source.branchRef, 1_024),
+      confidence: oneOf(source.confidence, ["high", "medium", "low", "guess"] as const),
+      symbol: nullableBoundedString(source.symbol, MAX_ORDINARY_TEXT_BYTES),
+      commitHash: nullableCommitHash(source.commitHash),
+      heading: nullableBoundedString(source.heading, MAX_ORDINARY_TEXT_BYTES),
+      anchor: nullableAnchor(source.anchor),
+    });
+  });
+  return Object.freeze(uniqueIds(rows, (row) => row.artifactId));
+}
+
+function decodeGovernedEntities(value: unknown): readonly GovernedEntity[] {
+  const rows = strictArray(value, MAX_GOVERNED_ROWS).map((entry) => {
+    const source = exactRecord(entry, [
+      "entityId", "normalizedName", "entityType", "validFrom", "validTo", "anchor",
+    ]);
+    return Object.freeze({
+      entityId: uuid(source.entityId),
+      normalizedName: normalizedText(source.normalizedName, MAX_ORDINARY_TEXT_BYTES),
+      entityType: boundedString(source.entityType, MAX_ORDINARY_TEXT_BYTES),
+      ...validity(source.validFrom, source.validTo, false),
+      anchor: nullableAnchor(source.anchor),
+    });
+  });
+  return Object.freeze(uniqueIds(rows, (row) => row.entityId));
+}
+
+function decodeGovernedAliases(value: unknown): readonly GovernedEntityAlias[] {
+  const rows = strictArray(value, MAX_GOVERNED_ROWS).map((entry) => {
+    const source = exactRecord(entry, [
+      "aliasId", "entityId", "normalizedAlias", "validFrom", "validTo", "anchor",
+    ]);
+    return Object.freeze({
+      aliasId: uuid(source.aliasId),
+      entityId: uuid(source.entityId),
+      normalizedAlias: normalizedText(source.normalizedAlias, MAX_ORDINARY_TEXT_BYTES),
+      ...validity(source.validFrom, source.validTo, false),
+      anchor: nullableAnchor(source.anchor),
+    });
+  });
+  return Object.freeze(uniqueIds(rows, (row) => row.aliasId));
+}
+
+function decodeGovernedEdges(value: unknown): readonly GovernedEntityEdge[] {
+  const rows = strictArray(value, MAX_GOVERNED_ROWS).map((entry) => {
+    const source = exactRecord(entry, [
+      "edgeId", "sourceEntityId", "targetEntityId", "edgeType", "validFrom", "validTo", "anchor",
+    ]);
+    const sourceEntityId = uuid(source.sourceEntityId);
+    const targetEntityId = uuid(source.targetEntityId);
+    if (sourceEntityId === targetEntityId) return integrity();
+    return Object.freeze({
+      edgeId: uuid(source.edgeId),
+      sourceEntityId,
+      targetEntityId,
+      edgeType: boundedString(source.edgeType, MAX_ORDINARY_TEXT_BYTES),
+      ...validity(source.validFrom, source.validTo, false),
+      anchor: nullableAnchor(source.anchor),
+    });
+  });
+  return Object.freeze(uniqueIds(rows, (row) => row.edgeId));
+}
+
+function assertGovernedRowIdsUnique(
+  item: GovernedCanonicalItem,
+  followUps: readonly GovernedFollowUp[],
+  artifacts: readonly GovernedArtifact[],
+  entities: readonly GovernedEntity[],
+  aliases: readonly GovernedEntityAlias[],
+  edges: readonly GovernedEntityEdge[],
+): void {
+  const ids = [
+    item.itemId,
+    ...followUps.map((row) => row.followUpId),
+    ...artifacts.map((row) => row.artifactId),
+    ...entities.map((row) => row.entityId),
+    ...aliases.map((row) => row.aliasId),
+    ...edges.map((row) => row.edgeId),
+  ];
+  if (new Set(ids).size !== ids.length) return integrity();
+}
+
 function decodeBinding(value: unknown): ProjectBinding {
   const source = exactRecord(value, BINDING_KEYS);
   return Object.freeze({
@@ -237,6 +449,7 @@ interface DecodedStoredEvent {
   readonly occurredAt: string;
   readonly recordedAt: string;
   readonly binding: ProjectBinding;
+  readonly streamVersion: bigint;
   readonly payload: unknown;
 }
 
@@ -351,7 +564,7 @@ function decodeStoredEventEnvelope(value: unknown): DecodedStoredEvent {
     sessionId: record.sessionId,
   });
   nullableUuid(record.parentSessionId);
-  positiveBigint(record.streamVersion);
+  const streamVersion = positiveBigint(record.streamVersion);
   const eventType = boundedString(record.eventType, 128);
   const eventSchemaVersion = safeInteger(record.eventSchemaVersion, 1, 1_000);
   boundedString(record.streamId, 1_024);
@@ -386,6 +599,7 @@ function decodeStoredEventEnvelope(value: unknown): DecodedStoredEvent {
     occurredAt,
     recordedAt,
     binding,
+    streamVersion,
     payload: record.payload,
   });
 }
@@ -416,6 +630,7 @@ function baseProjection(source: DecodedStoredEvent) {
   return {
     sourceEventId: uuid(source.record.eventId),
     sourceEventPosition: source.eventPosition,
+    sourceStreamVersion: source.streamVersion,
     sourceEventSchemaVersion: source.eventSchemaVersion,
     occurredAt: source.occurredAt,
     recordedAt: source.recordedAt,
@@ -466,22 +681,18 @@ function checkpointArtifacts(
 }
 
 function decodeCheckpointEvent(source: DecodedStoredEvent): ProjectionEventDecodeResult {
-  if (![1, 2, 3].includes(source.eventSchemaVersion)) return integrity();
-  const payload = source.eventSchemaVersion === 3
-    ? exactRecord(source.payload, [
-        "checkpoint",
-        "baseEventPosition",
-        "checkpointEventPosition",
-        "finalCheckpointBindingVersion",
-        "workflowId",
-        "workflowGeneration",
-      ])
-    : exactRecord(source.payload, ["checkpoint", "baseEventPosition", "checkpointEventPosition"]);
-  if (source.eventSchemaVersion === 3) {
-    if (payload.finalCheckpointBindingVersion !== 1) return integrity();
-    uuid(payload.workflowId);
-    positiveDecimal(payload.workflowGeneration);
-  }
+  const sessionId = source.binding.sessionId;
+  if (
+    sessionId === null
+    || source.record.streamType !== "session"
+    || source.record.streamId !== `session/${sessionId}`
+    || source.record.visibilityScope !== "session"
+  ) return integrity();
+  const payload = decodedRecord(decodeLifecycleEventPayload(
+    "SessionCheckpointRecorded",
+    source.eventSchemaVersion,
+    source.payload,
+  ));
   const checkpoint = decodeCheckpoint(payload.checkpoint);
   const baseEventPosition = positiveDecimal(payload.baseEventPosition);
   const checkpointEventPosition = positiveDecimal(payload.checkpointEventPosition);
@@ -489,7 +700,7 @@ function decodeCheckpointEvent(source: DecodedStoredEvent): ProjectionEventDecod
     checkpointEventPosition !== source.eventPosition
     || checkpoint.baseEventPosition !== baseEventPosition.toString()
     || checkpoint.checkpointEventPosition !== checkpointEventPosition.toString()
-    || checkpoint.sessionId !== source.binding.sessionId
+    || checkpoint.sessionId !== sessionId
     || checkpoint.parentSessionId !== source.record.parentSessionId
     || checkpoint.sourceState.workspaceId !== source.binding.workspaceId
     || checkpoint.sourceState.branchRef !== source.binding.branchRef
@@ -515,6 +726,7 @@ function decodeCheckpointEvent(source: DecodedStoredEvent): ProjectionEventDecod
 }
 
 function decodeMemorySource(source: DecodedStoredEvent): ProjectionEventDecodeResult {
+  if (source.eventSchemaVersion === 3) return decodeGovernedMemorySource(source);
   if (source.eventSchemaVersion !== 1 && source.eventSchemaVersion !== 2) return integrity();
   const version2 = source.eventSchemaVersion === 2;
   const payload = exactRecord(source.payload, [
@@ -552,6 +764,135 @@ function decodeMemorySource(source: DecodedStoredEvent): ProjectionEventDecodeRe
   return Object.freeze({ kind: "projected", event });
 }
 
+function decodeGovernedMemorySource(source: DecodedStoredEvent): ProjectionEventDecodeResult {
+  const payload = exactRecord(source.payload, [
+    "sourceVersion",
+    "binding",
+    "item",
+    "followUps",
+    "artifacts",
+    "entities",
+    "aliases",
+    "edges",
+  ]);
+  if (payload.sourceVersion !== 2) return integrity();
+  const payloadBinding = decodeBinding(payload.binding);
+  if (!sameBinding(payloadBinding, source.binding)) return integrity();
+  const item = decodeGovernedItem(payload.item);
+  const followUps = decodeGovernedFollowUps(payload.followUps);
+  const artifacts = decodeGovernedArtifacts(payload.artifacts);
+  const entities = decodeGovernedEntities(payload.entities);
+  const aliases = decodeGovernedAliases(payload.aliases);
+  const edges = decodeGovernedEdges(payload.edges);
+  assertGovernedRowIdsUnique(item, followUps, artifacts, entities, aliases, edges);
+  const event = validateProjectionEvent({
+    kind: "governed-memory-source",
+    ...baseProjection(source),
+    item,
+    followUps,
+    artifacts,
+    entities,
+    aliases,
+    edges,
+  });
+  return Object.freeze({ kind: "projected", event });
+}
+
+const ROOT_ONLY_LIFECYCLE_EVENTS = new Set<LifecycleEventType>([
+  "SessionStarted",
+  "SessionOwnerTransferred",
+  "SessionOwnershipRecovered",
+  "SessionSuspendRequested",
+  "SessionSuspended",
+  "SessionResumed",
+  "SessionEndRequested",
+  "SessionEndAmended",
+  "SessionValidationResultRecorded",
+  "SessionEndVerificationPassed",
+  "SessionEndVerificationFailed",
+  "SessionEndVerificationInvalidated",
+  "SessionEndCancelled",
+  "SessionAbandoned",
+  "SessionEnded",
+]);
+
+const CHILD_ONLY_LIFECYCLE_EVENTS = new Set<LifecycleEventType>([
+  "SessionForked",
+  "ChildAssignmentAmended",
+  "ChildWorkReported",
+  "ChildWorkDispositioned",
+  "ChildCompletionProposed",
+  "ChildSessionCompleted",
+  "ChildSessionSuspended",
+  "ChildWorkTransferCreated",
+  "ChildWorkTransferClaimed",
+]);
+
+function decodedRecord(value: unknown): Readonly<Record<string, unknown>> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return integrity();
+  return value as Readonly<Record<string, unknown>>;
+}
+
+function decodeLifecycleProjection(source: DecodedStoredEvent): ProjectionEventDecodeResult {
+  if (!(LIFECYCLE_EVENT_TYPES as readonly string[]).includes(source.eventType)) return integrity();
+  const eventType = source.eventType as LifecycleEventType;
+  if (eventType === "SessionCheckpointRecorded") return decodeCheckpointEvent(source);
+  const sessionId = source.binding.sessionId;
+  const parentSessionId = nullableUuid(source.record.parentSessionId);
+  if (
+    sessionId === null
+    || source.record.streamType !== "session"
+    || source.record.streamId !== `session/${sessionId}`
+    || source.record.visibilityScope !== "session"
+    || (ROOT_ONLY_LIFECYCLE_EVENTS.has(eventType) && parentSessionId !== null)
+    || (CHILD_ONLY_LIFECYCLE_EVENTS.has(eventType) && parentSessionId === null)
+    || ((eventType === "SessionStarted" || eventType === "SessionForked") && source.streamVersion !== 1n)
+    || ((eventType !== "SessionStarted" && eventType !== "SessionForked") && source.streamVersion === 1n)
+  ) return integrity();
+  const payload = decodeLifecycleEventPayload(eventType, source.eventSchemaVersion, source.payload);
+  const payloadRecord = decodedRecord(payload);
+  if (eventType === "SessionForked" && payloadRecord.parentSessionId !== parentSessionId) {
+    return integrity();
+  }
+  if (eventType === "ChildWorkReported") {
+    const report = decodedRecord(payloadRecord.report);
+    if (report.childSessionId !== sessionId || report.parentSessionId !== parentSessionId) {
+      return integrity();
+    }
+  }
+  if (eventType === "SessionValidationResultRecorded") {
+    const validation = decodedRecord(payloadRecord.validationResult);
+    if (
+      validation.projectId !== source.binding.projectId
+      || validation.vaultId !== source.binding.vaultId
+      || validation.storeId !== source.binding.storeId
+      || validation.workspaceId !== source.binding.workspaceId
+      || validation.sessionId !== sessionId
+    ) return integrity();
+  }
+  const ownerGeneration = eventType === "SessionStarted"
+    ? safeInteger(payloadRecord.ownerGeneration, 1, 2_147_483_647)
+    : eventType === "SessionForked"
+      ? safeInteger(payloadRecord.rootOwnerGeneration, 1, 2_147_483_647)
+      : eventType === "SessionOwnerTransferred" || eventType === "SessionOwnershipRecovered"
+        ? safeInteger(payloadRecord.ownerGeneration, 1, 2_147_483_647)
+        : null;
+  const previousOwnerGeneration = eventType === "SessionOwnerTransferred"
+    || eventType === "SessionOwnershipRecovered"
+    ? safeInteger(payloadRecord.previousOwnerGeneration, 1, 2_147_483_647)
+    : null;
+  const event = validateProjectionEvent({
+    kind: "session-lifecycle",
+    ...baseProjection(source),
+    sessionId,
+    parentSessionId,
+    eventType,
+    ownerGeneration,
+    previousOwnerGeneration,
+  });
+  return Object.freeze({ kind: "projected", event });
+}
+
 function decodeFeedback(source: DecodedStoredEvent): ProjectionEventDecodeResult {
   if (source.eventSchemaVersion !== 1) return integrity();
   const payload = exactRecord(source.payload, [
@@ -582,6 +923,7 @@ const PROJECTION_BASE_KEYS = [
   "kind",
   "sourceEventId",
   "sourceEventPosition",
+  "sourceStreamVersion",
   "sourceEventSchemaVersion",
   "occurredAt",
   "recordedAt",
@@ -697,6 +1039,7 @@ export function validateProjectionEvent(value: unknown): ProjectionEvent {
         kind: "checkpoint",
         sourceEventId: uuid(source.sourceEventId),
         sourceEventPosition,
+        sourceStreamVersion: positiveBigint(source.sourceStreamVersion),
         sourceEventSchemaVersion: safeInteger(source.sourceEventSchemaVersion, 1, 3),
         occurredAt: timestamp(source.occurredAt),
         recordedAt: timestamp(source.recordedAt),
@@ -742,6 +1085,7 @@ export function validateProjectionEvent(value: unknown): ProjectionEvent {
         kind: "memory-source",
         sourceEventId: uuid(source.sourceEventId),
         sourceEventPosition: positiveBigint(source.sourceEventPosition),
+        sourceStreamVersion: positiveBigint(source.sourceStreamVersion),
         sourceEventSchemaVersion: safeInteger(source.sourceEventSchemaVersion, 1, 2),
         occurredAt: timestamp(source.occurredAt),
         recordedAt: timestamp(source.recordedAt),
@@ -768,6 +1112,90 @@ export function validateProjectionEvent(value: unknown): ProjectionEvent {
         supersedingItemId,
       }) as MemorySourceProjectionEvent;
     }
+    if (kind === "governed-memory-source") {
+      const source = exactRecord(value, [
+        ...PROJECTION_BASE_KEYS,
+        "item",
+        "followUps",
+        "artifacts",
+        "entities",
+        "aliases",
+        "edges",
+      ]);
+      if (source.sourceEventSchemaVersion !== 3) return integrity();
+      const item = decodeGovernedItem(source.item);
+      const followUps = decodeGovernedFollowUps(source.followUps);
+      const artifacts = decodeGovernedArtifacts(source.artifacts);
+      const entities = decodeGovernedEntities(source.entities);
+      const aliases = decodeGovernedAliases(source.aliases);
+      const edges = decodeGovernedEdges(source.edges);
+      assertGovernedRowIdsUnique(item, followUps, artifacts, entities, aliases, edges);
+      return Object.freeze({
+        kind: "governed-memory-source",
+        sourceEventId: uuid(source.sourceEventId),
+        sourceEventPosition: positiveBigint(source.sourceEventPosition),
+        sourceStreamVersion: positiveBigint(source.sourceStreamVersion),
+        sourceEventSchemaVersion: 3,
+        occurredAt: timestamp(source.occurredAt),
+        recordedAt: timestamp(source.recordedAt),
+        binding: decodeBinding(source.binding),
+        item,
+        followUps,
+        artifacts,
+        entities,
+        aliases,
+        edges,
+      }) as GovernedMemorySourceProjectionEvent;
+    }
+    if (kind === "session-lifecycle") {
+      const source = exactRecord(value, [
+        ...PROJECTION_BASE_KEYS,
+        "sessionId",
+        "parentSessionId",
+        "eventType",
+        "ownerGeneration",
+        "previousOwnerGeneration",
+      ]);
+      const binding = decodeBinding(source.binding);
+      const sessionId = uuid(source.sessionId);
+      const parentSessionId = nullableUuid(source.parentSessionId);
+      if (binding.sessionId !== sessionId) return integrity();
+      const eventType = oneOf(source.eventType, LIFECYCLE_EVENT_TYPES.filter(
+        (candidate) => candidate !== "SessionCheckpointRecorded",
+      ));
+      const opens = eventType === "SessionStarted" || eventType === "SessionForked";
+      const changesOwner = eventType === "SessionOwnerTransferred"
+        || eventType === "SessionOwnershipRecovered";
+      const ownerGeneration = opens || changesOwner
+        ? safeInteger(source.ownerGeneration, 1, 2_147_483_647)
+        : source.ownerGeneration === null
+          ? null
+          : integrity();
+      const previousOwnerGeneration = changesOwner
+        ? safeInteger(source.previousOwnerGeneration, 1, 2_147_483_647)
+        : source.previousOwnerGeneration === null
+          ? null
+          : integrity();
+      if (
+        (eventType === "SessionStarted" && parentSessionId !== null)
+        || (eventType === "SessionForked" && parentSessionId === null)
+      ) return integrity();
+      return Object.freeze({
+        kind: "session-lifecycle",
+        sourceEventId: uuid(source.sourceEventId),
+        sourceEventPosition: positiveBigint(source.sourceEventPosition),
+        sourceStreamVersion: positiveBigint(source.sourceStreamVersion),
+        sourceEventSchemaVersion: safeInteger(source.sourceEventSchemaVersion, 1, 3),
+        occurredAt: timestamp(source.occurredAt),
+        recordedAt: timestamp(source.recordedAt),
+        binding,
+        sessionId,
+        parentSessionId,
+        eventType: eventType as SessionLifecycleProjectionEvent["eventType"],
+        ownerGeneration,
+        previousOwnerGeneration,
+      }) as SessionLifecycleProjectionEvent;
+    }
     if (kind === "retrieval-feedback") {
       const source = exactRecord(value, [
         ...PROJECTION_BASE_KEYS,
@@ -784,6 +1212,7 @@ export function validateProjectionEvent(value: unknown): ProjectionEvent {
         kind: "retrieval-feedback",
         sourceEventId: uuid(source.sourceEventId),
         sourceEventPosition,
+        sourceStreamVersion: positiveBigint(source.sourceStreamVersion),
         sourceEventSchemaVersion: safeInteger(source.sourceEventSchemaVersion, 1, 1),
         occurredAt: timestamp(source.occurredAt),
         recordedAt: timestamp(source.recordedAt),
@@ -805,11 +1234,39 @@ export function validateProjectionEvent(value: unknown): ProjectionEvent {
 export function decodeProjectionEvent(event: StoredEvent): ProjectionEventDecodeResult {
   try {
     const envelope = decodeStoredEventEnvelope(event);
+    if ((LIFECYCLE_EVENT_TYPES as readonly string[]).includes(envelope.eventType)) {
+      return decodeLifecycleProjection(validateKnownPayload(envelope));
+    }
+    if (envelope.eventType === "MemorySourceRecorded") {
+      return decodeMemorySource(validateKnownPayload(envelope));
+    }
+    if (envelope.eventType === "RetrievalFeedbackRecorded") {
+      return decodeFeedback(validateKnownPayload(envelope));
+    }
+    return Object.freeze({
+      kind: "unprojected",
+      eventPosition: envelope.eventPosition,
+      eventType: envelope.eventType,
+    });
+  } catch (error) {
+    if (error instanceof Error && error.message === "INTEGRITY_FAILURE") throw error;
+    return integrity();
+  }
+}
+
+/** Task-3 compatibility boundary for the still-published schema V1 builder. */
+export function decodeProjectionEventV1(event: StoredEvent): ProjectionEventDecodeResult {
+  try {
+    const envelope = decodeStoredEventEnvelope(event);
     if (envelope.eventType === "SessionCheckpointRecorded") {
       return decodeCheckpointEvent(validateKnownPayload(envelope));
     }
     if (envelope.eventType === "MemorySourceRecorded") {
-      return decodeMemorySource(validateKnownPayload(envelope));
+      const authenticated = validateKnownPayload(envelope);
+      if (authenticated.eventSchemaVersion !== 1 && authenticated.eventSchemaVersion !== 2) {
+        return integrity();
+      }
+      return decodeMemorySource(authenticated);
     }
     if (envelope.eventType === "RetrievalFeedbackRecorded") {
       return decodeFeedback(validateKnownPayload(envelope));

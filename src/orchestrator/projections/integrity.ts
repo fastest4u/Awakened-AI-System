@@ -27,12 +27,12 @@ import { ProjectionFoldAccumulator } from "./folds.js";
 import {
   assertProjectionSidecarsAbsent,
   filesystemProjectionPathInspection,
-  parseProjectionManifest,
+  parseProjectionManifestV2,
   verifyProjectionPublicationPaths,
-  type ProjectionManifestV1,
+  type ProjectionManifestV2,
   type ProjectionPathInspection,
 } from "./manifest.js";
-import { PROJECTION_SCHEMA_SQL_V1, PROJECTION_SCHEMA_VERSION } from "./schema.js";
+import { PROJECTION_SCHEMA_SQL_V2, PROJECTION_SCHEMA_VERSION } from "./schema.js";
 import { decodeProjectionEvent } from "./source-event-codec.js";
 import {
   captureProjectionDirectoryIdentity,
@@ -105,50 +105,56 @@ interface PinnedGenerationInspection {
 const TABLES = Object.freeze({
   sessionTree: Object.freeze({
     table: "session_tree",
-    columns: Object.freeze(["project_id", "session_id", "checkpoint_id", "checkpoint_version", "base_event_position", "source_event_position", "occurred_at", "task_summary"]),
+    columns: Object.freeze(["project_id", "session_id", "root_session_id", "parent_session_id", "lifecycle_state", "owner_generation", "opened_event_position", "closed_event_position", "latest_checkpoint_id", "latest_checkpoint_event_position", "source_event_id", "source_event_position", "anchor"]),
     keyColumns: Object.freeze(["project_id", "session_id"]),
     order: "project_id, session_id",
   }),
+  sessionCheckpoints: Object.freeze({
+    table: "session_checkpoints",
+    columns: Object.freeze(["project_id", "session_id", "checkpoint_id", "checkpoint_version", "base_event_position", "source_event_id", "source_event_position", "occurred_at", "task_summary", "anchor"]),
+    keyColumns: Object.freeze(["project_id", "checkpoint_id"]),
+    order: "project_id, session_id, source_event_position, checkpoint_id",
+  }),
   canonicalItems: Object.freeze({
     table: "canonical_items",
-    columns: Object.freeze(["project_id", "session_id", "item_id", "normalized_key", "conflict_group_id", "superseding_item_id", "status", "confidence", "verification_method", "valid_from", "valid_to", "summary", "content_hash", "known_from_event_position", "source_event_position"]),
+    columns: Object.freeze(["project_id", "session_id", "item_id", "normalized_key", "conflict_group_id", "superseding_item_id", "status", "confidence", "verification_method", "valid_from", "valid_to", "summary", "content_hash", "known_from_event_position", "source_event_id", "source_event_position", "anchor"]),
     keyColumns: Object.freeze(["project_id", "item_id"]),
     order: "project_id, item_id",
   }),
   tasksFollowups: Object.freeze({
     table: "tasks_followups",
-    columns: Object.freeze(["project_id", "session_id", "follow_up_id", "status", "summary", "confidence", "source_event_position"]),
+    columns: Object.freeze(["project_id", "session_id", "follow_up_id", "status", "summary", "confidence", "source_event_id", "source_event_position", "anchor"]),
     keyColumns: Object.freeze(["project_id", "follow_up_id"]),
     order: "project_id, follow_up_id",
   }),
   artifactsFiles: Object.freeze({
     table: "artifacts_files",
-    columns: Object.freeze(["project_id", "session_id", "artifact_id", "path", "summary", "action", "content_hash", "branch_ref", "confidence", "source_event_position"]),
+    columns: Object.freeze(["project_id", "session_id", "artifact_id", "path", "summary", "action", "content_hash", "branch_ref", "confidence", "symbol", "commit_hash", "heading", "source_event_id", "source_event_position", "anchor"]),
     keyColumns: Object.freeze(["project_id", "session_id", "artifact_id"]),
     order: "project_id, session_id, artifact_id",
   }),
-  entityGraph: Object.freeze({
-    table: "entity_graph",
-    columns: Object.freeze(["project_id", "edge_id", "source_entity_id", "relationship", "target_entity_id", "source_event_position"]),
-    keyColumns: Object.freeze(["project_id", "edge_id"]),
-    order: "project_id, edge_id",
-  }),
   lexicalChunks: Object.freeze({
     table: "lexical_chunks",
-    columns: Object.freeze(["project_id", "chunk_id", "item_id", "session_id", "section", "normalized_key", "text", "source_event_position"]),
+    columns: Object.freeze(["project_id", "chunk_id", "item_id", "session_id", "section", "normalized_key", "text", "source_event_id", "source_event_position", "anchor"]),
     keyColumns: Object.freeze(["project_id", "chunk_id"]),
     order: "project_id, chunk_id",
     canonicalRowId: true,
   }),
   retrievalFeedback: Object.freeze({
     table: "retrieval_feedback",
-    columns: Object.freeze(["project_id", "feedback_id", "item_id", "outcome", "usefulness", "source_item_event_position", "source_event_position"]),
+    columns: Object.freeze(["project_id", "feedback_id", "item_id", "outcome", "usefulness", "source_item_event_position", "source_event_id", "source_event_position", "anchor"]),
     keyColumns: Object.freeze(["project_id", "feedback_id"]),
     order: "project_id, feedback_id",
   }),
-} as const satisfies Record<ProjectionName, ProjectionTable>);
+} as const satisfies Record<Exclude<ProjectionName, "entityGraph">, ProjectionTable>);
 
-const INTEGER_NUMBER_COLUMNS = new Set(["checkpoint_version", "usefulness"]);
+const ENTITY_TABLES = Object.freeze([
+  Object.freeze({ relation: "node", table: "entity_nodes", columns: Object.freeze(["project_id", "entity_id", "normalized_name", "entity_type", "valid_from", "valid_to", "source_event_id", "source_event_position", "anchor"]), key: "entity_id", order: "project_id, entity_id" }),
+  Object.freeze({ relation: "alias", table: "entity_aliases", columns: Object.freeze(["project_id", "alias_id", "entity_id", "normalized_alias", "valid_from", "valid_to", "source_event_id", "source_event_position", "anchor"]), key: "alias_id", order: "project_id, alias_id" }),
+  Object.freeze({ relation: "edge", table: "entity_edges", columns: Object.freeze(["project_id", "edge_id", "source_entity_id", "target_entity_id", "edge_type", "valid_from", "valid_to", "source_event_id", "source_event_position", "anchor"]), key: "edge_id", order: "project_id, edge_id" }),
+] as const);
+
+const INTEGER_NUMBER_COLUMNS = new Set(["checkpoint_version", "owner_generation", "usefulness"]);
 function integrity(): never {
   throw new LifecycleError("INTEGRITY_FAILURE");
 }
@@ -354,7 +360,7 @@ function projectionRowKey(
 }
 
 function expectedMap<T>(
-  name: ProjectionName,
+  name: Exclude<ProjectionName, "entityGraph">,
   source: readonly T[],
   convert: (row: T) => CanonicalProjectionRow,
 ): ReadonlyMap<string, CanonicalProjectionRow> {
@@ -369,17 +375,53 @@ function expectedMap<T>(
   return result;
 }
 
+function entityRowKey(row: CanonicalProjectionRow): string {
+  const relation = row.relation;
+  const projectId = row.project_id;
+  const identity = relation === "node" ? row.entity_id : relation === "alias" ? row.alias_id : row.edge_id;
+  if (typeof relation !== "string" || typeof projectId !== "string" || typeof identity !== "string") return integrity();
+  return `${relation.length}:${relation}${projectId.length}:${projectId}${identity.length}:${identity}`;
+}
+
+function expectedEntityMap(rows: readonly CanonicalProjectionRow[]): ReadonlyMap<string, CanonicalProjectionRow> {
+  const result = new Map<string, CanonicalProjectionRow>();
+  for (const row of rows) {
+    const frozen = Object.freeze(row);
+    const key = entityRowKey(frozen);
+    if (result.has(key) || result.size >= MAX_ROWS) return integrity();
+    result.set(key, frozen);
+  }
+  return result;
+}
+
 function rowsFromState(state: ProjectionFoldState): ExpectedProjectionRows {
   return Object.freeze({
-    sessionTree: expectedMap("sessionTree", state.sessionCheckpoints, (row) => ({
+    sessionTree: expectedMap("sessionTree", state.sessionTree, (row) => ({
+      project_id: row.projectId,
+      session_id: row.sessionId,
+      root_session_id: row.rootSessionId,
+      parent_session_id: row.parentSessionId,
+      lifecycle_state: row.lifecycleState,
+      owner_generation: row.ownerGeneration,
+      opened_event_position: row.openedEventPosition.toString(),
+      closed_event_position: row.closedEventPosition?.toString() ?? null,
+      latest_checkpoint_id: row.latestCheckpointId,
+      latest_checkpoint_event_position: row.latestCheckpointEventPosition?.toString() ?? null,
+      source_event_id: row.sourceEventId,
+      source_event_position: row.sourceEventPosition.toString(),
+      anchor: row.anchor,
+    })),
+    sessionCheckpoints: expectedMap("sessionCheckpoints", state.sessionCheckpoints, (row) => ({
       project_id: row.projectId,
       session_id: row.sessionId,
       checkpoint_id: row.checkpointId,
       checkpoint_version: row.checkpointVersion,
       base_event_position: row.baseEventPosition.toString(),
+      source_event_id: row.sourceEventId,
       source_event_position: row.sourceEventPosition.toString(),
       occurred_at: row.occurredAt,
       task_summary: row.taskSummary,
+      anchor: row.anchor,
     })),
     canonicalItems: expectedMap("canonicalItems", state.canonicalItems, (row) => ({
       project_id: row.projectId,
@@ -396,7 +438,9 @@ function rowsFromState(state: ProjectionFoldState): ExpectedProjectionRows {
       summary: row.summary,
       content_hash: row.contentHash,
       known_from_event_position: row.knownFromEventPosition.toString(),
+      source_event_id: row.sourceEventId,
       source_event_position: row.sourceEventPosition.toString(),
+      anchor: row.anchor,
     })),
     tasksFollowups: expectedMap("tasksFollowups", state.followUps, (row) => ({
       project_id: row.projectId,
@@ -405,7 +449,9 @@ function rowsFromState(state: ProjectionFoldState): ExpectedProjectionRows {
       status: row.status,
       summary: row.summary,
       confidence: row.confidence,
+      source_event_id: row.sourceEventId,
       source_event_position: row.sourceEventPosition.toString(),
+      anchor: row.anchor,
     })),
     artifactsFiles: expectedMap("artifactsFiles", state.artifacts, (row) => ({
       project_id: row.projectId,
@@ -417,9 +463,32 @@ function rowsFromState(state: ProjectionFoldState): ExpectedProjectionRows {
       content_hash: row.contentHash,
       branch_ref: row.branchRef,
       confidence: row.confidence,
+      symbol: row.symbol,
+      commit_hash: row.commitHash,
+      heading: row.heading,
+      source_event_id: row.sourceEventId,
       source_event_position: row.sourceEventPosition.toString(),
+      anchor: row.anchor,
     })),
-    entityGraph: new Map<string, CanonicalProjectionRow>(),
+    entityGraph: expectedEntityMap([
+      ...state.entityNodes.map((row) => ({
+        relation: "node", project_id: row.projectId, entity_id: row.entityId,
+        normalized_name: row.normalizedName, entity_type: row.entityType, valid_from: row.validFrom,
+        valid_to: row.validTo, source_event_id: row.sourceEventId,
+        source_event_position: row.sourceEventPosition.toString(), anchor: row.anchor,
+      })),
+      ...state.entityAliases.map((row) => ({
+        relation: "alias", project_id: row.projectId, alias_id: row.aliasId, entity_id: row.entityId,
+        normalized_alias: row.normalizedAlias, valid_from: row.validFrom, valid_to: row.validTo,
+        source_event_id: row.sourceEventId, source_event_position: row.sourceEventPosition.toString(), anchor: row.anchor,
+      })),
+      ...state.entityEdges.map((row) => ({
+        relation: "edge", project_id: row.projectId, edge_id: row.edgeId,
+        source_entity_id: row.sourceEntityId, target_entity_id: row.targetEntityId, edge_type: row.edgeType,
+        valid_from: row.validFrom, valid_to: row.validTo, source_event_id: row.sourceEventId,
+        source_event_position: row.sourceEventPosition.toString(), anchor: row.anchor,
+      })),
+    ]),
     lexicalChunks: expectedMap("lexicalChunks", state.lexicalChunks, (row) => ({
       project_id: row.projectId,
       chunk_id: row.chunkId,
@@ -428,7 +497,9 @@ function rowsFromState(state: ProjectionFoldState): ExpectedProjectionRows {
       section: row.section,
       normalized_key: row.normalizedKey,
       text: row.text,
+      source_event_id: row.sourceEventId,
       source_event_position: row.sourceEventPosition.toString(),
+      anchor: row.anchor,
     })),
     retrievalFeedback: expectedMap("retrievalFeedback", state.retrievalFeedback, (row) => ({
       project_id: row.projectId,
@@ -437,14 +508,16 @@ function rowsFromState(state: ProjectionFoldState): ExpectedProjectionRows {
       outcome: row.outcome,
       usefulness: row.usefulness,
       source_item_event_position: row.sourceItemEventPosition.toString(),
+      source_event_id: row.sourceEventId,
       source_event_position: row.sourceEventPosition.toString(),
+      anchor: row.anchor,
     })),
   });
 }
 
 function replay(
   binding: ProjectBinding,
-  manifest: ProjectionManifestV1,
+  manifest: ProjectionManifestV2,
   options: ProjectionIntegrityServiceOptions,
 ): ExpectedProjectionRows {
   const terminalEventPosition = BigInt(manifest.terminalEventPosition);
@@ -506,6 +579,40 @@ function readExactRows(
   const result = {} as Record<ProjectionName, readonly CanonicalProjectionRow[]>;
   let totalBytes = 0;
   for (const name of PROJECTION_NAMES) {
+    if (name === "entityGraph") {
+      const graphRows: CanonicalProjectionRow[] = [];
+      const seen = new Set<string>();
+      for (const entity of ENTITY_TABLES) {
+        for (const raw of statement(database, `
+          SELECT ${entity.columns.join(", ")} FROM ${entity.table} ORDER BY ${entity.order}
+        `).iterate()) {
+          if (graphRows.length >= MAX_ROWS || graphRows.length >= expectedRows.entityGraph.size) return integrity();
+          const row: Record<string, CanonicalProjectionRow[string]> = { relation: entity.relation };
+          for (const column of entity.columns) {
+            if (!(column in raw)) return integrity();
+            row[column] = canonicalValue(raw[column], column);
+            totalBytes += Buffer.byteLength(JSON.stringify(row[column]), "utf8");
+            if (totalBytes > MAX_CANONICAL_BYTES) return integrity();
+          }
+          const canonical = Object.freeze(row);
+          const key = entityRowKey(canonical);
+          const expected = expectedRows.entityGraph.get(key);
+          if (
+            expected === undefined || seen.has(key)
+            || !sameRow(canonical, expected, ["relation", ...entity.columns])
+          ) return integrity();
+          seen.add(key);
+          graphRows.push(canonical);
+        }
+      }
+      if (graphRows.length !== expectedRows.entityGraph.size || seen.size !== expectedRows.entityGraph.size) return integrity();
+      const frozenGraph = Object.freeze(graphRows);
+      if (projectionCoreChecksum(name, PROJECTION_SCHEMA_VERSION, projectId, terminalEventPosition, frozenGraph) !== manifestChecksums[name]) {
+        return integrity();
+      }
+      result[name] = frozenGraph;
+      continue;
+    }
     const definition: ProjectionTable = TABLES[name];
     const selected = definition.canonicalRowId
       ? ["row_id", ...definition.columns]
@@ -601,7 +708,7 @@ function assertCanonicalSchema(database: DatabaseSync): void {
     allowExtension: false,
   });
   try {
-    reference.exec(PROJECTION_SCHEMA_SQL_V1);
+    reference.exec(PROJECTION_SCHEMA_SQL_V2);
     if (
       !sameRecords(schemaRows(database), schemaRows(reference), ["type", "name", "tbl_name", "sql"])
       || !sameRecords(ftsConfigRows(database), ftsConfigRows(reference), ["k", "v"])
@@ -614,7 +721,7 @@ function assertCanonicalSchema(database: DatabaseSync): void {
 function assertMetadata(
   database: DatabaseSync,
   binding: ProjectBinding,
-  manifest: ProjectionManifestV1,
+  manifest: ProjectionManifestV2,
 ): void {
   const iterator = statement(database, `
     SELECT singleton, schema_version, project_id, vault_id, store_id, workspace_id,
@@ -627,7 +734,7 @@ function assertMetadata(
   const row = first.value;
   if (
     row.singleton !== 1n
-    || row.schema_version !== 1n
+    || row.schema_version !== 2n
     || row.project_id !== binding.projectId
     || row.vault_id !== binding.vaultId
     || row.store_id !== binding.storeId
@@ -681,6 +788,20 @@ function assertReferences(database: DatabaseSync): void {
       LEFT JOIN session_tree AS session
         ON session.project_id = artifact.project_id AND session.session_id = artifact.session_id
       WHERE session.session_id IS NULL
+    `) !== 0n
+    || scalarCount(database, `
+      SELECT count(*) AS n FROM entity_aliases AS alias
+      LEFT JOIN entity_nodes AS entity
+        ON entity.project_id = alias.project_id AND entity.entity_id = alias.entity_id
+      WHERE entity.entity_id IS NULL
+    `) !== 0n
+    || scalarCount(database, `
+      SELECT count(*) AS n FROM entity_edges AS edge
+      LEFT JOIN entity_nodes AS source
+        ON source.project_id = edge.project_id AND source.entity_id = edge.source_entity_id
+      LEFT JOIN entity_nodes AS target
+        ON target.project_id = edge.project_id AND target.entity_id = edge.target_entity_id
+      WHERE source.entity_id IS NULL OR target.entity_id IS NULL
     `) !== 0n
   ) return integrity();
 }
@@ -797,7 +918,7 @@ function assertFtsSemantics(
 function inspectGeneration(
   path: string,
   binding: ProjectBinding,
-  manifest: ProjectionManifestV1,
+  manifest: ProjectionManifestV2,
   expectedRows: ExpectedProjectionRows,
   busyTimeoutMs: number,
   directoryIdentity: ProjectionDirectoryIdentity,
@@ -881,9 +1002,10 @@ export class ProjectionIntegrityService {
     });
   }
 
-  verify(binding: ProjectBinding, manifestValue: ProjectionManifestV1): ProjectionIntegrityReport {
+  verify(binding: ProjectBinding, manifestValue: unknown): ProjectionIntegrityReport {
     try {
-      const manifest = parseProjectionManifest(manifestValue, binding);
+      // Parse and reject non-V2 metadata before any directory or generation-byte inspection.
+      const manifest = parseProjectionManifestV2(manifestValue, binding);
       const directoryIdentity = captureProjectionDirectoryIdentity(
         this.#options.projectionDirectory,
       );

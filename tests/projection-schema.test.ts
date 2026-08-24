@@ -5,8 +5,14 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, it } from "node:test";
 
-import { projectionCoreChecksum } from "../src/orchestrator/projections/checksum.js";
-import { createProjectionSchema } from "../src/orchestrator/projections/schema.js";
+import {
+  PROJECTION_NAMES,
+  projectionCoreChecksum,
+} from "../src/orchestrator/projections/checksum.js";
+import {
+  createProjectionSchema,
+  PROJECTION_SCHEMA_VERSION,
+} from "../src/orchestrator/projections/schema.js";
 import { DEFAULT_BUSY_TIMEOUT_MS } from "../src/orchestrator/runtime/runtime-capabilities.js";
 import { NodeSqliteDriver } from "../src/orchestrator/storage/node-sqlite-driver.js";
 
@@ -21,7 +27,7 @@ describe("independent projection schema", () => {
     const root = mkdtempSync(join(tmpdir(), "projection-schema-"));
     roots.push(root);
     const connection = new NodeSqliteDriver({ DatabaseSync }).open(
-      join(root, "projections-1-2.sqlite"),
+      join(root, "projections-2-2.sqlite"),
       { mode: "create", busyTimeoutMs: DEFAULT_BUSY_TIMEOUT_MS },
     );
     try {
@@ -33,7 +39,7 @@ describe("independent projection schema", () => {
       );
       assert.equal(
         connection.prepare("SELECT schema_version FROM projection_metadata WHERE singleton = 1").get()?.schema_version,
-        1n,
+        2n,
       );
       assert.deepEqual(
         connection.prepare("PRAGMA table_info(projection_metadata)").all().map((row) => row.name),
@@ -62,10 +68,13 @@ describe("independent projection schema", () => {
       for (const table of [
         "projection_metadata",
         "session_tree",
+        "session_checkpoints",
         "canonical_items",
         "tasks_followups",
         "artifacts_files",
-        "entity_graph",
+        "entity_nodes",
+        "entity_aliases",
+        "entity_edges",
         "lexical_chunks",
         "retrieval_feedback",
         "lexical_chunks_fts",
@@ -73,10 +82,13 @@ describe("independent projection schema", () => {
       for (const table of [
         "projection_metadata",
         "session_tree",
+        "session_checkpoints",
         "canonical_items",
         "tasks_followups",
         "artifacts_files",
-        "entity_graph",
+        "entity_nodes",
+        "entity_aliases",
+        "entity_edges",
         "lexical_chunks",
         "retrieval_feedback",
       ]) {
@@ -87,6 +99,63 @@ describe("independent projection schema", () => {
         connection.prepare("PRAGMA table_info(canonical_items)").all()
           .some((row) => row.name === "session_id" && row.notnull === 0n),
         true,
+      );
+      assert.equal(PROJECTION_SCHEMA_VERSION, 2);
+      assert.deepEqual(PROJECTION_NAMES, [
+        "sessionTree",
+        "sessionCheckpoints",
+        "canonicalItems",
+        "tasksFollowups",
+        "artifactsFiles",
+        "entityGraph",
+        "lexicalChunks",
+        "retrievalFeedback",
+      ]);
+      assert.deepEqual(
+        connection.prepare("PRAGMA table_info(session_tree)").all().map((row) => row.name),
+        [
+          "project_id", "session_id", "root_session_id", "parent_session_id",
+          "lifecycle_state", "owner_generation", "opened_event_position",
+          "closed_event_position", "latest_checkpoint_id", "latest_checkpoint_event_position",
+          "source_event_id", "source_event_position", "anchor",
+        ],
+      );
+      assert.deepEqual(
+        connection.prepare("PRAGMA table_info(session_checkpoints)").all().map((row) => row.name),
+        [
+          "project_id", "session_id", "checkpoint_id", "checkpoint_version",
+          "base_event_position", "source_event_id", "source_event_position",
+          "occurred_at", "task_summary", "anchor",
+        ],
+      );
+      assert.deepEqual(
+        connection.prepare("PRAGMA table_info(artifacts_files)").all().map((row) => row.name),
+        [
+          "project_id", "session_id", "artifact_id", "path", "summary", "action",
+          "content_hash", "branch_ref", "confidence", "symbol", "commit_hash", "heading",
+          "source_event_id", "source_event_position", "anchor",
+        ],
+      );
+      assert.deepEqual(
+        connection.prepare("PRAGMA table_info(entity_aliases)").all().map((row) => row.name),
+        [
+          "project_id", "alias_id", "entity_id", "normalized_alias", "valid_from", "valid_to",
+          "source_event_id", "source_event_position", "anchor",
+        ],
+      );
+      assert.throws(
+        () => connection.prepare(`
+          INSERT INTO tasks_followups(
+            project_id, session_id, follow_up_id, status, summary, confidence,
+            source_event_id, source_event_position, anchor
+          ) VALUES ($projectId, $sessionId, $followUpId, 'invented', 'x', 'high', $sourceEventId, 1, NULL)
+        `).run({
+          $projectId: "1".repeat(64),
+          $sessionId: "00000000-0000-4000-8000-000000000001",
+          $followUpId: "00000000-0000-4000-8000-000000000002",
+          $sourceEventId: "00000000-0000-4000-8000-000000000003",
+        }),
+        /constraint/iu,
       );
       assert.deepEqual(
         connection.prepare("PRAGMA database_list").all().map((row) => row.name),
@@ -100,21 +169,21 @@ describe("independent projection schema", () => {
   it("computes domain-separated canonical checksums without depending on object key order", () => {
     const first = projectionCoreChecksum(
       "canonicalItems",
-      1,
+      2,
       "1".repeat(64),
       17n,
       [{ itemId: "item-1", sourceEventPosition: "17", summary: "Decision" }],
     );
     const reordered = projectionCoreChecksum(
       "canonicalItems",
-      1,
+      2,
       "1".repeat(64),
       17n,
       [{ summary: "Decision", sourceEventPosition: "17", itemId: "item-1" }],
     );
     const otherOrder = projectionCoreChecksum(
       "canonicalItems",
-      1,
+      2,
       "1".repeat(64),
       17n,
       [
@@ -127,8 +196,30 @@ describe("independent projection schema", () => {
     assert.equal(reordered, first);
     assert.notEqual(otherOrder, first);
     assert.throws(
-      () => projectionCoreChecksum("invented" as never, 1, "1".repeat(64), 17n, []),
+      () => projectionCoreChecksum("invented" as never, 2, "1".repeat(64), 17n, []),
       /PROJECTION_CHECKSUM_INVALID/u,
     );
+    const graph = projectionCoreChecksum(
+      "entityGraph",
+      2,
+      "1".repeat(64),
+      17n,
+      [
+        { relation: "node", entity_id: "a", source_event_id: "event-a" },
+        { relation: "alias", alias_id: "b", source_event_id: "event-b" },
+        { relation: "edge", edge_id: "c", source_event_id: "event-c" },
+      ],
+    );
+    assert.notEqual(graph, projectionCoreChecksum(
+      "entityGraph",
+      2,
+      "1".repeat(64),
+      17n,
+      [
+        { relation: "alias", alias_id: "b", source_event_id: "event-b" },
+        { relation: "node", entity_id: "a", source_event_id: "event-a" },
+        { relation: "edge", edge_id: "c", source_event_id: "event-c" },
+      ],
+    ));
   });
 });

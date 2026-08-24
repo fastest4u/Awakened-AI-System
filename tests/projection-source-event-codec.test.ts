@@ -28,6 +28,20 @@ const ITEM_ID = "00000000-0000-4000-8000-000000000044";
 const FEEDBACK_ID = "00000000-0000-4000-8000-000000000045";
 const CONFLICT_GROUP_ID = "00000000-0000-4000-8000-000000000049";
 const SUPERSEDING_ITEM_ID = "00000000-0000-4000-8000-000000000050";
+const ROOT_SESSION_ID = "00000000-0000-4000-8000-000000000051";
+const CHILD_SESSION_ID = "00000000-0000-4000-8000-000000000052";
+const FOLLOW_UP_IDS = [
+  "00000000-0000-4000-8000-000000000053",
+  "00000000-0000-4000-8000-000000000054",
+  "00000000-0000-4000-8000-000000000055",
+  "00000000-0000-4000-8000-000000000056",
+  "00000000-0000-4000-8000-000000000057",
+] as const;
+const ARTIFACT_ID = "00000000-0000-4000-8000-000000000058";
+const ENTITY_A = "00000000-0000-4000-8000-000000000059";
+const ENTITY_B = "00000000-0000-4000-8000-000000000060";
+const ALIAS_ID = "00000000-0000-4000-8000-000000000061";
+const EDGE_ID = "00000000-0000-4000-8000-000000000062";
 const BRANCH_REF = "refs/heads/projection-contracts";
 const OCCURRED_AT = "2026-08-23T01:00:00.000Z";
 const RECORDED_AT = "2026-08-23T01:00:01.000Z";
@@ -169,6 +183,111 @@ function feedbackPayload(): JsonValue {
     outcome: "accepted",
     usefulness: 10_000,
     sourceItemEventPosition: "42",
+  };
+}
+
+function governedPayload(overrides: Record<string, unknown> = {}): JsonValue {
+  const statuses = ["open", "blocked", "completed", "carried-forward", "abandoned"] as const;
+  return {
+    sourceVersion: 2,
+    binding: binding(),
+    item: {
+      itemId: ITEM_ID,
+      normalizedKey: "decision:projection-boundary",
+      status: "verified",
+      confidence: "high",
+      verificationMethod: "governed-source",
+      validFrom: OCCURRED_AT,
+      validTo: null,
+      summary: "The summary mentions symbol=Fake and heading=Invented, but those are not structure.",
+      contentHash: "b".repeat(64),
+      conflictGroupId: CONFLICT_GROUP_ID,
+      supersedingItemId: null,
+      anchor: null,
+    },
+    followUps: statuses.map((status, index) => ({
+      followUpId: FOLLOW_UP_IDS[index],
+      status,
+      summary: `Follow-up ${status}`,
+      confidence: "high",
+      anchor: index === 0 ? "memory/follow-ups#open" : null,
+    })),
+    artifacts: [{
+      artifactId: ARTIFACT_ID,
+      path: "src/orchestrator/projections/schema.ts",
+      summary: "Projection schema",
+      action: "modified",
+      contentHash: "c".repeat(64),
+      branchRef: BRANCH_REF,
+      confidence: "high",
+      symbol: "PROJECTION_SCHEMA_VERSION",
+      commitHash: "d".repeat(64),
+      heading: "Schema V2",
+      anchor: "src/orchestrator/projections/schema.ts#L3",
+    }],
+    entities: [
+      {
+        entityId: ENTITY_A,
+        normalizedName: "projection schema",
+        entityType: "technical-contract",
+        validFrom: OCCURRED_AT,
+        validTo: null,
+        anchor: "memory/entities#projection-schema",
+      },
+      {
+        entityId: ENTITY_B,
+        normalizedName: "integrity replay",
+        entityType: "verification-process",
+        validFrom: OCCURRED_AT,
+        validTo: OCCURRED_AT,
+        anchor: null,
+      },
+    ],
+    aliases: [{
+      aliasId: ALIAS_ID,
+      entityId: ENTITY_A,
+      normalizedAlias: "schema v2",
+      validFrom: OCCURRED_AT,
+      validTo: null,
+      anchor: null,
+    }],
+    edges: [{
+      edgeId: EDGE_ID,
+      sourceEntityId: ENTITY_A,
+      targetEntityId: ENTITY_B,
+      edgeType: "verified-by",
+      validFrom: OCCURRED_AT,
+      validTo: null,
+      anchor: "memory/entities#verified-by",
+    }],
+    ...overrides,
+  } as JsonValue;
+}
+
+function rootStartedPayload(): JsonValue {
+  return {
+    sessionKind: "root",
+    ownerGeneration: 1,
+    continuityKey: "projection-root",
+    clientNamespace: "projection-tests",
+    creatingAgentId: "projection-test-agent",
+    creatingClientInstanceId: "projection-test-client",
+    authorityCommitment: "e".repeat(64),
+  };
+}
+
+function childForkedPayload(): JsonValue {
+  return {
+    parentSessionId: ROOT_SESSION_ID,
+    assignment: {
+      assignmentId: "00000000-0000-4000-8000-000000000063",
+      summary: "Verify schema V2",
+      scope: "projection remediation",
+    },
+    rootOwnerGeneration: 3,
+    directAccessEnabled: false,
+    authorityCommitment: "f".repeat(64),
+    sourceTransferTicketId: null,
   };
 }
 
@@ -360,6 +479,151 @@ describe("projection source event codec", () => {
       () => decodeProjectionEvent(storedEvent("MemorySourceRecorded", memoryPayload({
         conflictGroupId: CONFLICT_GROUP_ID,
       }))),
+      /INTEGRITY_FAILURE/u,
+    );
+  });
+
+  it("decodes the exact governed schema-3 form without inferring structured fields from summary text", () => {
+    const decoded = decodeProjectionEvent(storedEvent(
+      "MemorySourceRecorded",
+      governedPayload(),
+      { eventSchemaVersion: 3 },
+    ));
+
+    assert.equal(decoded.kind, "projected");
+    if (decoded.kind !== "projected" || decoded.event.kind !== "governed-memory-source") return;
+    assert.equal(decoded.event.item.anchor, null);
+    assert.deepEqual(decoded.event.followUps.map((row) => row.status), [
+      "open", "blocked", "completed", "carried-forward", "abandoned",
+    ]);
+    assert.equal(decoded.event.artifacts[0]?.symbol, "PROJECTION_SCHEMA_VERSION");
+    assert.equal(decoded.event.artifacts[0]?.commitHash, "d".repeat(64));
+    assert.equal(decoded.event.artifacts[0]?.heading, "Schema V2");
+    assert.equal(decoded.event.entities[1]?.anchor, null);
+    assert.equal(decoded.event.aliases[0]?.entityId, ENTITY_A);
+    assert.equal(decoded.event.edges[0]?.edgeType, "verified-by");
+    assert.equal("symbol" in decoded.event.item, false);
+    assert.equal("heading" in decoded.event.item, false);
+  });
+
+  it("keeps MemorySourceRecorded schemas 1 and 2 explicit and rejects schema-3 omissions or aliases", () => {
+    for (const [eventSchemaVersion, payload] of [
+      [1, memoryPayload()],
+      [2, memoryPayload({
+        sourceVersion: 2,
+        conflictGroupId: CONFLICT_GROUP_ID,
+        supersedingItemId: null,
+      })],
+    ] as const) {
+      const decoded = decodeProjectionEvent(storedEvent("MemorySourceRecorded", payload, {
+        eventSchemaVersion,
+      }));
+      assert.equal(decoded.kind, "projected");
+      if (decoded.kind !== "projected") continue;
+      assert.equal(decoded.event.kind, "memory-source");
+    }
+
+    const governed = governedPayload() as Record<string, unknown>;
+    const { edges: _edges, ...missingEdges } = governed;
+    assert.throws(
+      () => decodeProjectionEvent(storedEvent("MemorySourceRecorded", missingEdges as JsonValue, {
+        eventSchemaVersion: 3,
+      })),
+      /INTEGRITY_FAILURE/u,
+    );
+    assert.throws(
+      () => decodeProjectionEvent(storedEvent("MemorySourceRecorded", {
+        ...governed,
+        entityEdges: governed.edges,
+      } as JsonValue, { eventSchemaVersion: 3 })),
+      /INTEGRITY_FAILURE/u,
+    );
+  });
+
+  it("rejects duplicate, self, invalid-validity, and over-bound governed structures", () => {
+    const governed = governedPayload() as Record<string, unknown>;
+    const entities = governed.entities as Array<Record<string, unknown>>;
+    const aliases = governed.aliases as Array<Record<string, unknown>>;
+    const edges = governed.edges as Array<Record<string, unknown>>;
+    const followUps = governed.followUps as Array<Record<string, unknown>>;
+    const item = governed.item as Record<string, unknown>;
+    assert.equal(decodeProjectionEvent(storedEvent("MemorySourceRecorded", {
+      ...governed,
+      item: { ...item, validTo: item.validFrom },
+    } as JsonValue, { eventSchemaVersion: 3 })).kind, "projected");
+    const invalidPayloads: JsonValue[] = [
+      { ...governed, followUps: [followUps[0], followUps[0]] } as JsonValue,
+      { ...governed, entities: [entities[0], entities[0]] } as JsonValue,
+      {
+        ...governed,
+        followUps: [{ ...followUps[0], followUpId: (governed.artifacts as Array<Record<string, unknown>>)[0]?.artifactId }],
+      } as JsonValue,
+      {
+        ...governed,
+        edges: [{ ...edges[0], targetEntityId: ENTITY_A }],
+      } as JsonValue,
+      {
+        ...governed,
+        entities: [{
+          ...entities[0],
+          validFrom: "2026-08-24T01:00:00.000Z",
+          validTo: OCCURRED_AT,
+        }, entities[1]],
+      } as JsonValue,
+      { ...governed, artifacts: Array.from({ length: 201 }, () => governed.artifacts as never) } as JsonValue,
+      {
+        ...governed,
+        aliases: [{ ...aliases[0], normalizedAlias: "x".repeat((4 * 1_024) + 1) }],
+      } as JsonValue,
+    ];
+    for (const payload of invalidPayloads) {
+      assert.throws(
+        () => decodeProjectionEvent(storedEvent("MemorySourceRecorded", payload, {
+          eventSchemaVersion: 3,
+        })),
+        /INTEGRITY_FAILURE/u,
+      );
+    }
+  });
+
+  it("decodes production-compatible lifecycle opening records from authenticated envelopes", () => {
+    const root = decodeProjectionEvent(storedEvent("SessionStarted", rootStartedPayload(), {
+      globalPosition: 1n,
+      streamVersion: 1n,
+      sessionId: ROOT_SESSION_ID,
+      parentSessionId: null,
+      streamId: `session/${ROOT_SESSION_ID}`,
+    }));
+    assert.equal(root.kind, "projected");
+    if (root.kind !== "projected" || root.event.kind !== "session-lifecycle") return;
+    assert.equal(root.event.sessionId, ROOT_SESSION_ID);
+    assert.equal(root.event.parentSessionId, null);
+    assert.equal(root.event.ownerGeneration, 1);
+
+    const child = decodeProjectionEvent(storedEvent("SessionForked", childForkedPayload(), {
+      globalPosition: 2n,
+      streamVersion: 1n,
+      sessionId: CHILD_SESSION_ID,
+      parentSessionId: ROOT_SESSION_ID,
+      streamId: `session/${CHILD_SESSION_ID}`,
+    }));
+    assert.equal(child.kind, "projected");
+    if (child.kind !== "projected" || child.event.kind !== "session-lifecycle") return;
+    assert.equal(child.event.sessionId, CHILD_SESSION_ID);
+    assert.equal(child.event.parentSessionId, ROOT_SESSION_ID);
+    assert.equal(child.event.ownerGeneration, 3);
+
+    assert.throws(
+      () => decodeProjectionEvent(storedEvent("SessionForked", {
+        ...childForkedPayload() as Record<string, unknown>,
+        assignment: { summary: "hand-invented incomplete DTO" },
+      } as JsonValue, {
+        globalPosition: 2n,
+        streamVersion: 1n,
+        sessionId: CHILD_SESSION_ID,
+        parentSessionId: ROOT_SESSION_ID,
+        streamId: `session/${CHILD_SESSION_ID}`,
+      })),
       /INTEGRITY_FAILURE/u,
     );
   });

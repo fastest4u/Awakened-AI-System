@@ -4,6 +4,7 @@ import { canonicalJson } from "../serialization/canonical-json.js";
 
 export const PROJECTION_NAMES = Object.freeze([
   "sessionTree",
+  "sessionCheckpoints",
   "canonicalItems",
   "tasksFollowups",
   "artifactsFiles",

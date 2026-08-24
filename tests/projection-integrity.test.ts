@@ -41,8 +41,9 @@ import {
 } from "../src/orchestrator/projections/integrity.js";
 import {
   parseProjectionManifest,
+  parseProjectionManifestV2,
   verifyProjectionPublicationPaths,
-  type ProjectionManifestV1,
+  type ProjectionManifestV2,
 } from "../src/orchestrator/projections/manifest.js";
 import { BranchScopeRepository } from "../src/orchestrator/storage/branch-scope.repository.js";
 import {
@@ -170,16 +171,22 @@ function trustedContext(root: string): ProjectContext {
 }
 
 const TABLES = Object.freeze({
-  sessionTree: ["session_tree", ["project_id", "session_id", "checkpoint_id", "checkpoint_version", "base_event_position", "source_event_position", "occurred_at", "task_summary"], "project_id, session_id"],
-  canonicalItems: ["canonical_items", ["project_id", "session_id", "item_id", "normalized_key", "conflict_group_id", "superseding_item_id", "status", "confidence", "verification_method", "valid_from", "valid_to", "summary", "content_hash", "known_from_event_position", "source_event_position"], "project_id, item_id"],
-  tasksFollowups: ["tasks_followups", ["project_id", "session_id", "follow_up_id", "status", "summary", "confidence", "source_event_position"], "project_id, follow_up_id"],
-  artifactsFiles: ["artifacts_files", ["project_id", "session_id", "artifact_id", "path", "summary", "action", "content_hash", "branch_ref", "confidence", "source_event_position"], "project_id, session_id, artifact_id"],
-  entityGraph: ["entity_graph", ["project_id", "edge_id", "source_entity_id", "relationship", "target_entity_id", "source_event_position"], "project_id, edge_id"],
-  lexicalChunks: ["lexical_chunks", ["project_id", "chunk_id", "item_id", "session_id", "section", "normalized_key", "text", "source_event_position"], "project_id, chunk_id"],
-  retrievalFeedback: ["retrieval_feedback", ["project_id", "feedback_id", "item_id", "outcome", "usefulness", "source_item_event_position", "source_event_position"], "project_id, feedback_id"],
-} as const satisfies Record<ProjectionName, readonly [string, readonly string[], string]>);
+  sessionTree: ["session_tree", ["project_id", "session_id", "root_session_id", "parent_session_id", "lifecycle_state", "owner_generation", "opened_event_position", "closed_event_position", "latest_checkpoint_id", "latest_checkpoint_event_position", "source_event_id", "source_event_position", "anchor"], "project_id, session_id"],
+  sessionCheckpoints: ["session_checkpoints", ["project_id", "session_id", "checkpoint_id", "checkpoint_version", "base_event_position", "source_event_id", "source_event_position", "occurred_at", "task_summary", "anchor"], "project_id, session_id, source_event_position, checkpoint_id"],
+  canonicalItems: ["canonical_items", ["project_id", "session_id", "item_id", "normalized_key", "conflict_group_id", "superseding_item_id", "status", "confidence", "verification_method", "valid_from", "valid_to", "summary", "content_hash", "known_from_event_position", "source_event_id", "source_event_position", "anchor"], "project_id, item_id"],
+  tasksFollowups: ["tasks_followups", ["project_id", "session_id", "follow_up_id", "status", "summary", "confidence", "source_event_id", "source_event_position", "anchor"], "project_id, follow_up_id"],
+  artifactsFiles: ["artifacts_files", ["project_id", "session_id", "artifact_id", "path", "summary", "action", "content_hash", "branch_ref", "confidence", "symbol", "commit_hash", "heading", "source_event_id", "source_event_position", "anchor"], "project_id, session_id, artifact_id"],
+  lexicalChunks: ["lexical_chunks", ["project_id", "chunk_id", "item_id", "session_id", "section", "normalized_key", "text", "source_event_id", "source_event_position", "anchor"], "project_id, chunk_id"],
+  retrievalFeedback: ["retrieval_feedback", ["project_id", "feedback_id", "item_id", "outcome", "usefulness", "source_item_event_position", "source_event_id", "source_event_position", "anchor"], "project_id, feedback_id"],
+} as const satisfies Record<Exclude<ProjectionName, "entityGraph">, readonly [string, readonly string[], string]>);
 
-const NUMBER_COLUMNS = new Set(["checkpoint_version", "usefulness"]);
+const ENTITY_TABLES = Object.freeze([
+  ["node", "entity_nodes", ["project_id", "entity_id", "normalized_name", "entity_type", "valid_from", "valid_to", "source_event_id", "source_event_position", "anchor"], "project_id, entity_id"],
+  ["alias", "entity_aliases", ["project_id", "alias_id", "entity_id", "normalized_alias", "valid_from", "valid_to", "source_event_id", "source_event_position", "anchor"], "project_id, alias_id"],
+  ["edge", "entity_edges", ["project_id", "edge_id", "source_entity_id", "target_entity_id", "edge_type", "valid_from", "valid_to", "source_event_id", "source_event_position", "anchor"], "project_id, edge_id"],
+] as const);
+
+const NUMBER_COLUMNS = new Set(["checkpoint_version", "owner_generation", "usefulness"]);
 
 function canonicalValue(value: unknown, column: string): null | number | string {
   if (value === null || typeof value === "string") return value;
@@ -194,15 +201,24 @@ function databaseSha256(path: string): string {
 function coreChecksum(path: string, name: ProjectionName, terminal: bigint): string {
   const database = new DatabaseSync(path, { readOnly: true });
   try {
-    const [table, columns, order] = TABLES[name];
-    const rows = database.prepare(`SELECT ${columns.join(", ")} FROM ${table} ORDER BY ${order}`)
-      .all()
-      .map((raw) => {
+    const rows: CanonicalProjectionRow[] = [];
+    if (name === "entityGraph") {
+      for (const [relation, table, columns, order] of ENTITY_TABLES) {
+        for (const raw of database.prepare(`SELECT ${columns.join(", ")} FROM ${table} ORDER BY ${order}`).all()) {
+          const row: Record<string, null | number | string> = { relation };
+          for (const column of columns) row[column] = canonicalValue(raw[column], column);
+          rows.push(row as CanonicalProjectionRow);
+        }
+      }
+    } else {
+      const [table, columns, order] = TABLES[name];
+      for (const raw of database.prepare(`SELECT ${columns.join(", ")} FROM ${table} ORDER BY ${order}`).all()) {
         const row: Record<string, null | number | string> = {};
         for (const column of columns) row[column] = canonicalValue(raw[column], column);
-        return row as CanonicalProjectionRow;
-      });
-    return projectionCoreChecksum(name, 1, PROJECT_ID, terminal, rows);
+        rows.push(row as CanonicalProjectionRow);
+      }
+    }
+    return projectionCoreChecksum(name, 2, PROJECT_ID, terminal, rows);
   } finally {
     database.close();
   }
@@ -217,7 +233,7 @@ interface Fixture {
   readonly sourcePath: string;
   readonly projectionDirectory: string;
   readonly databasePath: string;
-  readonly manifest: ProjectionManifestV1;
+  readonly manifest: ProjectionManifestV2;
   readonly integrity: ProjectionIntegrityService;
 }
 
@@ -300,7 +316,7 @@ async function createFixture(options: FixtureOptions = {}): Promise<Fixture> {
     driver,
     projectionDirectory,
     now: () => NOW,
-  }).build(snapshot, 1);
+  }).buildV2(snapshot, 1);
   snapshot.close();
   connection.close();
   connections.splice(connections.indexOf(connection), 1);
@@ -348,13 +364,13 @@ function mutateFtsShadowDatabase(fixture: Fixture, sql: string): void {
 function resignedManifest(
   fixture: Fixture,
   changedChecksums: readonly ProjectionName[] = [],
-): ProjectionManifestV1 {
+): ProjectionManifestV2 {
   const terminal = BigInt(fixture.manifest.terminalEventPosition);
   const coreChecksums = { ...fixture.manifest.coreChecksums };
   for (const name of changedChecksums) {
     coreChecksums[name] = coreChecksum(fixture.databasePath, name, terminal);
   }
-  return parseProjectionManifest({
+  return parseProjectionManifestV2({
     ...fixture.manifest,
     databaseSha256: databaseSha256(fixture.databasePath),
     coreChecksums,
@@ -754,16 +770,32 @@ describe("full projection integrity replay", () => {
   it("detects an extra derived row after outer hashes are recomputed", async () => {
     const fixture = await createFixture();
     mutateDatabase(fixture, `
-      INSERT INTO entity_graph(
-        project_id, edge_id, source_entity_id, relationship, target_entity_id,
-        source_event_position
+      INSERT INTO entity_nodes(
+        project_id, entity_id, normalized_name, entity_type, valid_from, valid_to,
+        source_event_id, source_event_position, anchor
       ) VALUES (
-        '${PROJECT_ID}', 'extra-edge', 'source', 'invented', 'target', 3
+        '${PROJECT_ID}', '00000000-0000-4000-8000-000000000499',
+        'invented entity', 'invented', '${NOW}', NULL,
+        '00000000-0000-4000-8000-000000000498', 3, NULL
       )
     `);
     expectIntegrityFailure(() => fixture.integrity.verify(
       BINDING,
       resignedManifest(fixture, ["entityGraph"]),
+    ));
+  });
+
+  it("detects provenance-tampered V2 rows after database and logical hashes are recomputed", async () => {
+    const fixture = await createFixture();
+    mutateDatabase(fixture, `
+      UPDATE canonical_items
+      SET source_event_id = '00000000-0000-4000-8000-000000000499',
+          anchor = 'memory/items#forged'
+      WHERE item_id = '${ITEM_A}'
+    `);
+    expectIntegrityFailure(() => fixture.integrity.verify(
+      BINDING,
+      resignedManifest(fixture, ["canonicalItems"]),
     ));
   });
 
@@ -806,7 +838,7 @@ describe("full projection integrity replay", () => {
     const fixture = await createFixture();
     const sourceBefore = databaseSha256(fixture.sourcePath);
     const projectionBefore = databaseSha256(fixture.databasePath);
-    const manifest = parseProjectionManifest({
+    const manifest = parseProjectionManifestV2({
       ...fixture.manifest,
       coreChecksums: {
         ...fixture.manifest.coreChecksums,
@@ -825,8 +857,45 @@ describe("full projection integrity replay", () => {
     const mismatched = {
       ...fixture.manifest,
       projectId: OTHER_PROJECT_ID,
-    } as ProjectionManifestV1;
+    } as ProjectionManifestV2;
     expectIntegrityFailure(() => fixture.integrity.verify(BINDING, mismatched));
+  });
+
+  it("rejects a valid V1 manifest before any V2 source or projection byte path is opened", async () => {
+    const fixture = await createFixture();
+    const { sessionCheckpoints: _sessionCheckpoints, ...v1Checksums } = fixture.manifest.coreChecksums;
+    const v1 = parseProjectionManifest({
+      ...fixture.manifest,
+      schemaVersion: 1,
+      databaseFile: "projections-1-1.sqlite",
+      coreChecksums: v1Checksums,
+    }, BINDING);
+    let sourceOpens = 0;
+    let pathInspections = 0;
+    const failBeforeOpen = new ProjectionIntegrityService({
+      driver: {
+        open(): never {
+          sourceOpens += 1;
+          throw new Error("V1_SOURCE_OPENED");
+        },
+      },
+      eventStorePath: fixture.sourcePath,
+      projectionDirectory: fixture.projectionDirectory,
+      pathInspection: {
+        lstat(): never {
+          pathInspections += 1;
+          throw new Error("V1_PROJECTION_PATH_INSPECTED");
+        },
+        realpath(): never {
+          pathInspections += 1;
+          throw new Error("V1_PROJECTION_PATH_INSPECTED");
+        },
+      },
+    });
+
+    expectIntegrityFailure(() => failBeforeOpen.verify(BINDING, v1 as never));
+    assert.equal(sourceOpens, 0);
+    assert.equal(pathInspections, 0);
   });
 
   it("detects projection metadata and terminal identity tampering", async () => {
