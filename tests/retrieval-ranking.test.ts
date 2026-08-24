@@ -15,6 +15,7 @@ import type {
 } from "../src/orchestrator/retrieval/contracts.js";
 import {
   DEFAULT_RANKING_POLICY,
+  RANKING_UNIT_SCALE,
   fuseCandidates,
   rerankCandidates,
   selectRankedCandidates,
@@ -73,15 +74,21 @@ function item(
     normalizedKey: `decision:${id}`,
     anchor: null,
     freshness: "fresh",
+    conflictGroupId: null,
+    supersedingItemId: null,
+    retrievalFeedbackScoreUnits: 0,
     ...overrides,
   });
 }
 
 describe("deterministic retrieval ranking", () => {
   it("uses frozen versioned weighted RRF and stable identifier tie breaks", () => {
-    assert.equal(weightedRrf(1, 2), 2 / 61);
+    assert.deepEqual(weightedRrf(1, 2 * RANKING_UNIT_SCALE), {
+      numerator: 2n,
+      denominator: 61n,
+    });
     assert.equal(Object.isFrozen(DEFAULT_RANKING_POLICY), true);
-    assert.equal(Object.isFrozen(DEFAULT_RANKING_POLICY.channelWeights), true);
+    assert.equal(Object.isFrozen(DEFAULT_RANKING_POLICY.channelWeightUnits), true);
     assert.equal(Object.isFrozen(DEFAULT_RANKING_POLICY.temporalDecay), true);
     assert.equal(Object.isFrozen(DEFAULT_RANKING_POLICY.rerankFeatureNames), true);
     assert.equal(Object.isFrozen(DEFAULT_RANKING_POLICY.diversity), true);
@@ -113,8 +120,8 @@ describe("deterministic retrieval ranking", () => {
 
     const policyWithUnknownWeight = {
       ...DEFAULT_RANKING_POLICY,
-      channelWeights: {
-        ...DEFAULT_RANKING_POLICY.channelWeights,
+      channelWeightUnits: {
+        ...DEFAULT_RANKING_POLICY.channelWeightUnits,
         covertProvider: 1,
       },
     } as unknown as RankingPolicy;
@@ -122,6 +129,25 @@ describe("deterministic retrieval ranking", () => {
       () => fuseCandidates([], policyWithUnknownWeight),
       /ranking policy channel weights/u,
     );
+  });
+
+  it("compares exact equal policy scores by best rank instead of floating-point residue", () => {
+    const fused = fuseCandidates([
+      [
+        { id: "A", rank: 4, channel: "exact" as const },
+        { id: "B", rank: 12, channel: "exact" as const },
+      ],
+      [
+        { id: "A", rank: 66, channel: "alias" as const },
+        { id: "B", rank: 36, channel: "alias" as const },
+      ],
+    ], DEFAULT_RANKING_POLICY);
+
+    assert.deepEqual(fused.map(({ id, bestRank }) => ({ id, bestRank })), [
+      { id: "A", bestRank: 4 },
+      { id: "B", bestRank: 12 },
+    ]);
+    assert.deepEqual(fused[0]?.fusionScore, fused[1]?.fusionScore);
   });
 
   it("reranks deterministically with only the frozen feature set and never changes membership", () => {
@@ -228,5 +254,10 @@ describe("deterministic retrieval ranking", () => {
     assert.equal(bounded.conflicts[0]?.cursor?.includes("decision:conflict-set"), false);
     assert.equal(bounded.truncated, true);
     assert.equal(bounded.droppedByReason.tokenBudget, 2);
+    assert.equal(bounded.droppedByReason.conflictSuppressed, 1);
+    assert.equal(
+      Object.values(bounded.droppedByReason).reduce((total, count) => total + count, 0),
+      ranked.length - bounded.candidates.length,
+    );
   });
 });

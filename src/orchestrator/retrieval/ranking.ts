@@ -14,7 +14,10 @@ const CHANNELS = Object.freeze([
   "symbol-path",
   "session-checkpoint",
   "open-follow-up",
+  "conflict-closure",
 ] as const satisfies readonly RetrievalChannel[]);
+
+export const RANKING_UNIT_SCALE = 10_000 as const;
 
 export const RERANK_FEATURE_NAMES = Object.freeze([
   "verificationState",
@@ -32,13 +35,13 @@ export type RerankFeatureName = typeof RERANK_FEATURE_NAMES[number];
 export interface RankingPolicy {
   readonly version: string;
   readonly rrfK: number;
-  readonly channelWeights: Readonly<Record<RetrievalChannel, number>>;
+  readonly channelWeightUnits: Readonly<Record<RetrievalChannel, number>>;
   readonly temporalDecay: Readonly<{
     readonly eventHalfLife: number;
-    readonly floor: number;
+    readonly floorUnits: number;
   }>;
   readonly rerankFeatureNames: readonly RerankFeatureName[];
-  readonly rerankWeights: Readonly<Record<RerankFeatureName, number>>;
+  readonly rerankWeightUnits: Readonly<Record<RerankFeatureName, number>>;
   readonly diversity: Readonly<{
     readonly maxPerSource: number;
     readonly maxPerEntity: number;
@@ -50,30 +53,31 @@ export interface RankingPolicy {
  * bilingual evaluation task records a successor policy version.
  */
 export const DEFAULT_RANKING_POLICY: RankingPolicy = Object.freeze({
-  version: "retrieval-ranking-v1-shadow",
+  version: "retrieval-ranking-v2-shadow-fixed-units",
   rrfK: 60,
-  channelWeights: Object.freeze({
-    exact: 2.5,
-    alias: 1.75,
-    lexical: 1,
-    "symbol-path": 2,
-    "session-checkpoint": 1.8,
-    "open-follow-up": 1.8,
+  channelWeightUnits: Object.freeze({
+    exact: 25_000,
+    alias: 17_500,
+    lexical: 10_000,
+    "symbol-path": 20_000,
+    "session-checkpoint": 18_000,
+    "open-follow-up": 18_000,
+    "conflict-closure": 0,
   }),
   temporalDecay: Object.freeze({
     eventHalfLife: 10_000,
-    floor: 0.25,
+    floorUnits: 2_500,
   }),
   rerankFeatureNames: RERANK_FEATURE_NAMES,
-  rerankWeights: Object.freeze({
-    verificationState: 0.012,
-    provenanceQuality: 0.006,
-    temporalValidity: 0.004,
-    queryIntent: 0.012,
-    scopeDistance: 0.004,
-    conflictState: 0.004,
-    sourceFreshness: 0.004,
-    retrievalFeedback: 0.002,
+  rerankWeightUnits: Object.freeze({
+    verificationState: 120,
+    provenanceQuality: 60,
+    temporalValidity: 40,
+    queryIntent: 120,
+    scopeDistance: 40,
+    conflictState: 40,
+    sourceFreshness: 40,
+    retrievalFeedback: 20,
   }),
   diversity: Object.freeze({
     maxPerSource: 2,
@@ -91,14 +95,21 @@ export interface RankingCandidate {
   readonly sourceKey?: string | null;
   readonly entityKey?: string | null;
   readonly estimatedTokens?: number;
-  readonly feedbackScore?: number;
+  readonly feedbackScoreUnits?: number;
+  readonly conflictTotalMemberCount?: number;
+  readonly conflictCursor?: string | null;
+}
+
+export interface RationalScore {
+  readonly numerator: bigint;
+  readonly denominator: bigint;
 }
 
 export interface FusionContribution {
   readonly channel: RetrievalChannel;
   readonly rank: number;
-  readonly weight: number;
-  readonly score: number;
+  readonly weightUnits: number;
+  readonly score: RationalScore;
 }
 
 export interface FusedCandidate {
@@ -109,16 +120,18 @@ export interface FusedCandidate {
   readonly sourceKey: string | null;
   readonly entityKey: string | null;
   readonly estimatedTokens: number | null;
-  readonly feedbackScore: number;
+  readonly feedbackScoreUnits: number;
+  readonly conflictTotalMemberCount: number | null;
+  readonly conflictCursor: string | null;
   readonly contributions: readonly FusionContribution[];
-  readonly fusionScore: number;
+  readonly fusionScore: RationalScore;
   readonly bestRank: number;
 }
 
 export interface RerankedCandidate extends FusedCandidate {
   readonly features: Readonly<Record<RerankFeatureName, number>>;
-  readonly featureScore: number;
-  readonly rerankScore: number;
+  readonly featureScore: RationalScore;
+  readonly rerankScore: RationalScore;
 }
 
 export interface RankedConflictGroup {
@@ -139,6 +152,7 @@ export interface RankedSelection {
     readonly diversity: number;
     readonly resultLimit: number;
     readonly tokenBudget: number;
+    readonly conflictSuppressed: number;
   }>;
 }
 
@@ -152,8 +166,8 @@ function compareText(left: string, right: string): number {
   return left < right ? -1 : left > right ? 1 : 0;
 }
 
-function finiteNonnegative(value: number, name: string): number {
-  if (!Number.isFinite(value) || value < 0) throw new TypeError(name);
+function nonnegativeInteger(value: number, name: string): number {
+  if (!Number.isSafeInteger(value) || value < 0) throw new TypeError(name);
   return value;
 }
 
@@ -197,20 +211,20 @@ function assertPolicy(policy: RankingPolicy): void {
   assertExactRecord(policy, [
     "version",
     "rrfK",
-    "channelWeights",
+    "channelWeightUnits",
     "temporalDecay",
     "rerankFeatureNames",
-    "rerankWeights",
+    "rerankWeightUnits",
     "diversity",
   ], "ranking policy");
-  assertExactRecord(policy.channelWeights, CHANNELS, "ranking policy channel weights");
+  assertExactRecord(policy.channelWeightUnits, CHANNELS, "ranking policy channel weights");
   assertExactRecord(
     policy.temporalDecay,
-    ["eventHalfLife", "floor"],
+    ["eventHalfLife", "floorUnits"],
     "ranking policy temporal decay",
   );
   assertExactRecord(
-    policy.rerankWeights,
+    policy.rerankWeightUnits,
     RERANK_FEATURE_NAMES,
     "ranking policy rerank weights",
   );
@@ -226,27 +240,69 @@ function assertPolicy(policy: RankingPolicy): void {
   ) throw new TypeError("ranking policy version");
   positiveInteger(policy.rrfK, "ranking policy rrfK");
   for (const channel of CHANNELS) {
-    finiteNonnegative(policy.channelWeights[channel], `ranking weight ${channel}`);
+    nonnegativeInteger(policy.channelWeightUnits[channel], `ranking weight ${channel}`);
   }
   positiveInteger(policy.temporalDecay.eventHalfLife, "temporal event half-life");
-  const floor = finiteNonnegative(policy.temporalDecay.floor, "temporal floor");
-  if (floor > 1) throw new TypeError("temporal floor");
+  const floor = nonnegativeInteger(policy.temporalDecay.floorUnits, "temporal floor");
+  if (floor > RANKING_UNIT_SCALE) throw new TypeError("temporal floor");
   if (
     policy.rerankFeatureNames.length !== RERANK_FEATURE_NAMES.length
     || policy.rerankFeatureNames.some((name, index) => name !== RERANK_FEATURE_NAMES[index])
   ) throw new TypeError("rerank feature set");
   for (const name of RERANK_FEATURE_NAMES) {
-    finiteNonnegative(policy.rerankWeights[name], `rerank weight ${name}`);
+    nonnegativeInteger(policy.rerankWeightUnits[name], `rerank weight ${name}`);
   }
   positiveInteger(policy.diversity.maxPerSource, "source diversity");
   positiveInteger(policy.diversity.maxPerEntity, "entity diversity");
 }
 
-export function weightedRrf(rank: number, weight: number, k = 60): number {
+function absolute(value: bigint): bigint {
+  return value < 0n ? -value : value;
+}
+
+function greatestCommonDivisor(left: bigint, right: bigint): bigint {
+  let a = absolute(left);
+  let b = absolute(right);
+  while (b !== 0n) [a, b] = [b, a % b];
+  return a === 0n ? 1n : a;
+}
+
+function rational(numerator: bigint, denominator: bigint): RationalScore {
+  if (denominator <= 0n) throw new TypeError("rational score denominator");
+  if (numerator === 0n) return Object.freeze({ numerator: 0n, denominator: 1n });
+  const divisor = greatestCommonDivisor(numerator, denominator);
+  return Object.freeze({
+    numerator: numerator / divisor,
+    denominator: denominator / divisor,
+  });
+}
+
+export function addRationalScores(left: RationalScore, right: RationalScore): RationalScore {
+  return rational(
+    left.numerator * right.denominator + right.numerator * left.denominator,
+    left.denominator * right.denominator,
+  );
+}
+
+export function compareRationalScores(left: RationalScore, right: RationalScore): number {
+  const comparison = left.numerator * right.denominator - right.numerator * left.denominator;
+  return comparison < 0n ? -1 : comparison > 0n ? 1 : 0;
+}
+
+export function formatRationalScore(score: RationalScore): string {
+  return `${score.numerator}/${score.denominator}`;
+}
+
+const ZERO_SCORE = rational(0n, 1n);
+
+export function weightedRrf(rank: number, weightUnits: number, k = 60): RationalScore {
   positiveInteger(rank, "RRF rank");
-  finiteNonnegative(weight, "RRF weight");
+  nonnegativeInteger(weightUnits, "RRF weight units");
   positiveInteger(k, "RRF k");
-  return weight / (k + rank);
+  return rational(
+    BigInt(weightUnits),
+    BigInt(RANKING_UNIT_SCALE) * BigInt(k + rank),
+  );
 }
 
 function fromChannelResult(result: RetrievalChannelResult): readonly RankingCandidate[] {
@@ -255,6 +311,8 @@ function fromChannelResult(result: RetrievalChannelResult): readonly RankingCand
     rank: candidate.rank,
     channel: candidate.channel,
     item: candidate.item,
+    conflictGroupId: candidate.item.conflictGroupId,
+    feedbackScoreUnits: candidate.item.retrievalFeedbackScoreUnits,
   }));
 }
 
@@ -280,6 +338,9 @@ function candidateSignature(candidate: RankingCandidate): string {
     candidate.sourceKey ?? "",
     candidate.entityKey ?? "",
     candidate.estimatedTokens?.toString() ?? "",
+    candidate.feedbackScoreUnits?.toString() ?? "",
+    candidate.conflictTotalMemberCount?.toString() ?? "",
+    candidate.conflictCursor ?? "",
   ].join("\u0000");
 }
 
@@ -310,13 +371,17 @@ function validateCandidate(candidate: RankingCandidate): void {
   if (candidate.estimatedTokens !== undefined) {
     positiveInteger(candidate.estimatedTokens, "estimated candidate tokens");
   }
-  if (candidate.feedbackScore !== undefined) {
-    const score = candidate.feedbackScore;
-    if (!Number.isFinite(score) || score < -1 || score > 1) {
+  if (candidate.feedbackScoreUnits !== undefined) {
+    const score = candidate.feedbackScoreUnits;
+    if (!Number.isSafeInteger(score) || score < -RANKING_UNIT_SCALE || score > RANKING_UNIT_SCALE) {
       throw new TypeError("retrieval feedback score");
     }
   }
+  if (candidate.conflictTotalMemberCount !== undefined) {
+    positiveInteger(candidate.conflictTotalMemberCount, "conflict total member count");
+  }
   boundedKey(candidate.conflictGroupId, "conflict group id");
+  boundedKey(candidate.conflictCursor, "conflict cursor");
   boundedKey(candidate.sourceKey, "source diversity key");
   boundedKey(candidate.entityKey, "entity diversity key");
 }
@@ -350,21 +415,24 @@ export function fuseCandidates(
     const representative = sources.find((candidate) => candidate.item !== undefined) ?? sources[0];
     if (representative === undefined) continue;
     const contributions = sources.map((candidate): FusionContribution => {
-      const weight = policy.channelWeights[candidate.channel];
+      const weightUnits = policy.channelWeightUnits[candidate.channel];
       return Object.freeze({
         channel: candidate.channel,
         rank: candidate.rank,
-        weight,
-        score: weightedRrf(candidate.rank, weight, policy.rrfK),
+        weightUnits,
+        score: weightedRrf(candidate.rank, weightUnits, policy.rrfK),
       });
     });
     const estimated = sources
       .map((candidate) => candidate.estimatedTokens)
       .filter((value): value is number => value !== undefined);
     const feedback = sources
-      .map((candidate) => candidate.feedbackScore)
+      .map((candidate) => candidate.feedbackScoreUnits)
       .filter((value): value is number => value !== undefined)
       .sort((left, right) => right - left)[0] ?? 0;
+    const conflictTotals = sources
+      .map((candidate) => candidate.conflictTotalMemberCount)
+      .filter((value): value is number => value !== undefined);
     const output: FusedCandidate = {
       id,
       ...(representative.item === undefined ? {} : { item: representative.item }),
@@ -377,15 +445,20 @@ export function fuseCandidates(
       sourceKey: smallestKey(sources, (candidate) => candidate.sourceKey, "source diversity key"),
       entityKey: smallestKey(sources, (candidate) => candidate.entityKey, "entity diversity key"),
       estimatedTokens: estimated.length === 0 ? null : Math.max(...estimated),
-      feedbackScore: feedback,
+      feedbackScoreUnits: feedback,
+      conflictTotalMemberCount: conflictTotals.length === 0 ? null : Math.max(...conflictTotals),
+      conflictCursor: smallestKey(sources, (candidate) => candidate.conflictCursor, "conflict cursor"),
       contributions: Object.freeze(contributions),
-      fusionScore: contributions.reduce((total, contribution) => total + contribution.score, 0),
+      fusionScore: contributions.reduce(
+        (total, contribution) => addRationalScores(total, contribution.score),
+        ZERO_SCORE,
+      ),
       bestRank: Math.min(...contributions.map((contribution) => contribution.rank)),
     };
     fused.push(Object.freeze(output));
   }
   fused.sort((left, right) => (
-    right.fusionScore - left.fusionScore
+    compareRationalScores(right.fusionScore, left.fusionScore)
     || left.bestRank - right.bestRank
     || compareText(left.id, right.id)
   ));
@@ -399,20 +472,20 @@ function normalized(value: string): string {
 function verificationFeature(item: RetrievalItem | undefined): number {
   if (item === undefined) return 0;
   const status = {
-    verified: 1,
-    active: 0.9,
-    open: 0.9,
-    blocked: 0.8,
-    conflicted: 0.8,
-    provisional: 0.45,
-    candidate: 0.25,
-    superseded: 0.15,
+    verified: 10_000,
+    active: 9_000,
+    open: 9_000,
+    blocked: 8_000,
+    conflicted: 8_000,
+    provisional: 4_500,
+    candidate: 2_500,
+    superseded: 1_500,
     retracted: 0,
     expired: 0,
     "erased-evidence": 0,
   }[item.status];
-  const confidence = { high: 1, medium: 0.75, low: 0.4, guess: 0.1 }[item.confidence];
-  return (status + confidence) / 2;
+  const confidence = { high: 10_000, medium: 7_500, low: 4_000, guess: 1_000 }[item.confidence];
+  return Math.trunc((status + confidence) / 2);
 }
 
 function provenanceFeature(item: RetrievalItem | undefined): number {
@@ -422,9 +495,9 @@ function provenanceFeature(item: RetrievalItem | undefined): number {
     || item.verificationMethod === "session-checkpoint"
     || item.verificationMethod === "checkpoint-artifact"
     || item.verificationMethod === "open-follow-up"
-  ) return 1;
-  if (item.verificationMethod === "projection-chunk") return 0.65;
-  return 0.35;
+  ) return 10_000;
+  if (item.verificationMethod === "projection-chunk") return 6_500;
+  return 3_500;
 }
 
 function temporalFeature(
@@ -436,13 +509,11 @@ function temporalFeature(
   const reference = request.knownAt ?? request.consistency.requiredEventPosition;
   if (item.sourceEventPosition > reference) return 0;
   const distance = reference - item.sourceEventPosition;
-  const boundedDistance = distance > BigInt(Number.MAX_SAFE_INTEGER)
-    ? Number.MAX_SAFE_INTEGER
-    : Number(distance);
-  return Math.max(
-    policy.temporalDecay.floor,
-    2 ** (-boundedDistance / policy.temporalDecay.eventHalfLife),
+  const halfLife = BigInt(policy.temporalDecay.eventHalfLife);
+  const decayed = Number(
+    (BigInt(RANKING_UNIT_SCALE) * halfLife) / (halfLife + distance),
   );
+  return Math.max(policy.temporalDecay.floorUnits, decayed);
 }
 
 function queryFeature(item: RetrievalItem | undefined, query: string): number {
@@ -451,12 +522,12 @@ function queryFeature(item: RetrievalItem | undefined, query: string): number {
   const exact = [item.id, item.normalizedKey, item.anchor]
     .filter((value): value is string => value !== null)
     .map(normalized);
-  if (exact.includes(needle)) return 1;
+  if (exact.includes(needle)) return 10_000;
   if (
     needle.length >= 3
     && exact.some((value) => value.length >= 3
       && (value.includes(needle) || needle.includes(value)))
-  ) return 0.5;
+  ) return 5_000;
   return 0;
 }
 
@@ -466,12 +537,12 @@ function scopeFeature(item: RetrievalItem | undefined, request: InternalRetrieva
   const requested = request.visibility
     ?? (request.sessionId === undefined ? "branch" : "session");
   const distance = Math.abs(level[requested] - level[item.visibility]);
-  return Math.max(0, 1 - distance / 3);
+  return Math.max(0, RANKING_UNIT_SCALE - Math.trunc(distance * RANKING_UNIT_SCALE / 3));
 }
 
 function conflictFeature(candidate: FusedCandidate): number {
-  if (candidate.conflictGroupId !== null || candidate.item?.status === "conflicted") return 1;
-  if (candidate.item?.status === "superseded") return 0.25;
+  if (candidate.conflictGroupId !== null || candidate.item?.status === "conflicted") return 10_000;
+  if (candidate.item?.status === "superseded") return 2_500;
   return 0;
 }
 
@@ -487,8 +558,8 @@ function features(
     queryIntent: queryFeature(candidate.item, request.query),
     scopeDistance: scopeFeature(candidate.item, request),
     conflictState: conflictFeature(candidate),
-    sourceFreshness: candidate.item?.freshness === "fresh" ? 1 : 0,
-    retrievalFeedback: (candidate.feedbackScore + 1) / 2,
+    sourceFreshness: candidate.item?.freshness === "fresh" ? 10_000 : 0,
+    retrievalFeedback: Math.trunc((candidate.feedbackScoreUnits + RANKING_UNIT_SCALE) / 2),
   });
 }
 
@@ -504,19 +575,21 @@ export function rerankCandidates(
     seen.add(candidate.id);
     const values = features(candidate, request, policy);
     const featureScore = RERANK_FEATURE_NAMES.reduce(
-      (total, name) => total + values[name] * policy.rerankWeights[name],
-      0,
+      (total, name) => addRationalScores(total, rational(
+        BigInt(values[name]) * BigInt(policy.rerankWeightUnits[name]),
+        BigInt(RANKING_UNIT_SCALE) * BigInt(RANKING_UNIT_SCALE),
+      )),
+      ZERO_SCORE,
     );
     return Object.freeze({
       ...candidate,
       features: values,
       featureScore,
-      rerankScore: candidate.fusionScore + featureScore,
+      rerankScore: addRationalScores(candidate.fusionScore, featureScore),
     });
   });
   reranked.sort((left, right) => (
-    right.rerankScore - left.rerankScore
-    || right.fusionScore - left.fusionScore
+    compareRationalScores(right.rerankScore, left.rerankScore)
     || left.bestRank - right.bestRank
     || compareText(left.id, right.id)
   ));
@@ -560,8 +633,7 @@ export function selectRankedCandidates(
   positiveInteger(bounds.limit, "retrieval result limit");
   positiveInteger(bounds.tokenBudget, "retrieval token budget");
   const ordered = [...candidates].sort((left, right) => (
-    right.rerankScore - left.rerankScore
-    || right.fusionScore - left.fusionScore
+    compareRationalScores(right.rerankScore, left.rerankScore)
     || left.bestRank - right.bestRank
     || compareText(left.id, right.id)
   ));
@@ -586,16 +658,19 @@ export function selectRankedCandidates(
   const entityCounts = new Map<string, number>();
   let usedTokens = 0;
   let haltedForHighImpactConflict = false;
-  const dropped = { diversity: 0, resultLimit: 0, tokenBudget: 0 };
+  const droppedIds = new Set<string>();
+  const dropped = { diversity: 0, resultLimit: 0, tokenBudget: 0, conflictSuppressed: 0 };
 
   const admit = (candidate: RerankedCandidate, bypassDiversity: boolean): "selected" | "limit" | "budget" | "diversity" => {
     if (selected.length >= bounds.limit) {
       dropped.resultLimit += 1;
+      droppedIds.add(candidate.id);
       return "limit";
     }
     const tokens = candidate.estimatedTokens ?? estimateCandidateTokens(candidate);
     if (usedTokens + tokens > bounds.tokenBudget) {
       dropped.tokenBudget += 1;
+      droppedIds.add(candidate.id);
       return "budget";
     }
     if (!bypassDiversity && (
@@ -605,6 +680,7 @@ export function selectRankedCandidates(
         && (entityCounts.get(candidate.entityKey) ?? 0) >= policy.diversity.maxPerEntity)
     )) {
       dropped.diversity += 1;
+      droppedIds.add(candidate.id);
       return "diversity";
     }
     selected.push(candidate);
@@ -636,18 +712,35 @@ export function selectRankedCandidates(
     }
   }
 
+  if (haltedForHighImpactConflict) {
+    for (const candidate of ordered) {
+      if (selectedIds.has(candidate.id) || droppedIds.has(candidate.id)) continue;
+      dropped.conflictSuppressed += 1;
+      droppedIds.add(candidate.id);
+    }
+  }
+
   const conflicts: RankedConflictGroup[] = [];
   for (const [conflictGroupId, members] of groups) {
     const selectedMemberCount = members.filter((member) => selectedIds.has(member.id)).length;
-    const truncated = selectedMemberCount < members.length;
+    const declaredMemberCount = members
+      .map((member) => member.conflictTotalMemberCount)
+      .filter((count): count is number => count !== null)
+      .reduce((maximum, count) => Math.max(maximum, count), 0);
+    const totalMemberCount = Math.max(members.length, declaredMemberCount);
+    const truncated = selectedMemberCount < totalMemberCount;
+    const repositoryCursor = members
+      .map((member) => member.conflictCursor)
+      .filter((cursor): cursor is string => cursor !== null)
+      .sort(compareText)[0] ?? null;
     conflicts.push(Object.freeze({
       conflictGroupId,
-      totalMemberCount: members.length,
+      totalMemberCount,
       selectedMemberCount,
       highImpact: members.some((member) => member.highImpact),
       truncated,
       cursor: truncated
-        ? conflictCursor(policy, conflictGroupId, selectedMemberCount)
+        ? repositoryCursor ?? conflictCursor(policy, conflictGroupId, selectedMemberCount)
         : null,
     }));
   }

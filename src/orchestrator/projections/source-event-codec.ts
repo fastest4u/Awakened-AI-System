@@ -515,7 +515,8 @@ function decodeCheckpointEvent(source: DecodedStoredEvent): ProjectionEventDecod
 }
 
 function decodeMemorySource(source: DecodedStoredEvent): ProjectionEventDecodeResult {
-  if (source.eventSchemaVersion !== 1) return integrity();
+  if (source.eventSchemaVersion !== 1 && source.eventSchemaVersion !== 2) return integrity();
+  const version2 = source.eventSchemaVersion === 2;
   const payload = exactRecord(source.payload, [
     "sourceVersion",
     "binding",
@@ -528,8 +529,9 @@ function decodeMemorySource(source: DecodedStoredEvent): ProjectionEventDecodeRe
     "validTo",
     "summary",
     "contentHash",
+    ...(version2 ? ["conflictGroupId", "supersedingItemId"] : []),
   ]);
-  if (payload.sourceVersion !== 1) return integrity();
+  if (payload.sourceVersion !== source.eventSchemaVersion) return integrity();
   const payloadBinding = decodeBinding(payload.binding);
   if (!sameBinding(payloadBinding, source.binding)) return integrity();
   const event = validateProjectionEvent({
@@ -544,6 +546,8 @@ function decodeMemorySource(source: DecodedStoredEvent): ProjectionEventDecodeRe
     validTo: payload.validTo,
     summary: payload.summary,
     contentHash: payload.contentHash,
+    conflictGroupId: version2 ? payload.conflictGroupId : null,
+    supersedingItemId: version2 ? payload.supersedingItemId : null,
   });
   return Object.freeze({ kind: "projected", event });
 }
@@ -707,6 +711,7 @@ export function validateProjectionEvent(value: unknown): ProjectionEvent {
       }) as CheckpointProjectionEvent;
     }
     if (kind === "memory-source") {
+      const version2 = discriminator.sourceEventSchemaVersion === 2;
       const source = exactRecord(value, [
         ...PROJECTION_BASE_KEYS,
         "itemId",
@@ -718,21 +723,30 @@ export function validateProjectionEvent(value: unknown): ProjectionEvent {
         "validTo",
         "summary",
         "contentHash",
+        "conflictGroupId",
+        "supersedingItemId",
       ]);
       const normalizedKey = boundedString(source.normalizedKey, 512);
       if (normalizedKey.normalize("NFKC").trim().toLowerCase() !== normalizedKey) return integrity();
       const validFrom = timestamp(source.validFrom);
       const validTo = source.validTo === null ? null : timestamp(source.validTo);
       if (validTo !== null && Date.parse(validTo) <= Date.parse(validFrom)) return integrity();
+      const itemId = uuid(source.itemId);
+      const conflictGroupId = version2 ? nullableUuid(source.conflictGroupId) : null;
+      const supersedingItemId = version2 ? nullableUuid(source.supersedingItemId) : null;
+      if (!version2 && (source.conflictGroupId !== null || source.supersedingItemId !== null)) {
+        return integrity();
+      }
+      if (supersedingItemId === itemId) return integrity();
       return Object.freeze({
         kind: "memory-source",
         sourceEventId: uuid(source.sourceEventId),
         sourceEventPosition: positiveBigint(source.sourceEventPosition),
-        sourceEventSchemaVersion: safeInteger(source.sourceEventSchemaVersion, 1, 1),
+        sourceEventSchemaVersion: safeInteger(source.sourceEventSchemaVersion, 1, 2),
         occurredAt: timestamp(source.occurredAt),
         recordedAt: timestamp(source.recordedAt),
         binding: decodeBinding(source.binding),
-        itemId: uuid(source.itemId),
+        itemId,
         normalizedKey,
         status: oneOf(source.status, [
           "candidate",
@@ -750,6 +764,8 @@ export function validateProjectionEvent(value: unknown): ProjectionEvent {
         validTo,
         summary: boundedString(source.summary, MAX_SUMMARY_BYTES),
         contentHash: hash(source.contentHash),
+        conflictGroupId,
+        supersedingItemId,
       }) as MemorySourceProjectionEvent;
     }
     if (kind === "retrieval-feedback") {

@@ -28,6 +28,7 @@ const OTHER_PROJECT_ID = "9".repeat(64) as ProjectId;
 const WORKSPACE_ID = "2".repeat(64) as WorkspaceId;
 const BRANCH_SCOPE_ID = "00000000-0000-4000-8000-000000000611" as BranchScopeId;
 const SESSION_ID = "00000000-0000-4000-8000-000000000612";
+const CONFLICT_GROUP_ID = "00000000-0000-4000-8000-000000000613";
 
 const BINDING: ProjectBinding = Object.freeze({
   projectId: PROJECT_ID,
@@ -66,6 +67,7 @@ function item(
   id: string,
   overrides: Partial<RetrievalItem> = {},
 ): RetrievalItem {
+  const status = overrides.status ?? "conflicted";
   return Object.freeze({
     id,
     kind: "canonical",
@@ -75,7 +77,7 @@ function item(
     branchRef: "refs/heads/task-6",
     sessionId: SESSION_ID,
     visibility: "session",
-    status: "conflicted",
+    status,
     confidence: "high",
     verificationMethod: "committed-event",
     validFrom: "2026-01-01T00:00:00.000Z",
@@ -86,6 +88,9 @@ function item(
     normalizedKey: "decision:conflict-set",
     anchor: null,
     freshness: "fresh",
+    conflictGroupId: status === "conflicted" ? CONFLICT_GROUP_ID : null,
+    supersedingItemId: null,
+    retrievalFeedbackScoreUnits: 0,
     ...overrides,
   });
 }
@@ -142,7 +147,7 @@ describe("redacted retrieval explanations", () => {
         selectedCount: 1,
         bestRank: 1,
         worstRank: 2,
-        fusionContribution: 0.25,
+        fusionContribution: "1/4",
         providerInput: "capability-secret",
       }],
       manifest: { generation: 6, capabilityHandle: "capability-secret" },
@@ -176,7 +181,7 @@ describe("redacted retrieval explanations", () => {
       selectedCount: 1,
       bestRank: 1,
       worstRank: 2,
-      fusionContribution: 0.25,
+      fusionContribution: "1/4",
     }]);
     assert.deepEqual(explanation.consistency, {
       projectionGeneration: 6,
@@ -211,6 +216,13 @@ describe("redacted retrieval explanations", () => {
       eligibleItemCount: 3,
       droppedItemCount: 0,
       truncated: false,
+      conflictGroups: Object.freeze([Object.freeze({
+        conflictGroupId: CONFLICT_GROUP_ID,
+        eligibleMemberCount: 3,
+        returnedMemberCount: 3,
+        truncated: false,
+        cursor: null,
+      })]),
     });
     const service = new InternalRetrievalService({
       projections: { async pin() { return lease; } },
@@ -242,16 +254,19 @@ describe("redacted retrieval explanations", () => {
         kind: "canonical",
         status: "active",
         normalizedKey: "decision:canonical-source",
+        conflictGroupId: null,
       }),
       item("lexical-source", {
         kind: "lexical",
         status: "active",
         normalizedKey: "decision:lexical-source",
+        conflictGroupId: null,
       }),
       item("artifact-source", {
         kind: "artifact",
         status: "active",
         normalizedKey: "decision:artifact-source",
+        conflictGroupId: null,
       }),
     ];
     const collection: RetrievalCandidateCollection = Object.freeze({
@@ -267,6 +282,7 @@ describe("redacted retrieval explanations", () => {
       eligibleItemCount: sameSource.length,
       droppedItemCount: 0,
       truncated: false,
+      conflictGroups: Object.freeze([]),
     });
     const service = new InternalRetrievalService({
       projections: { async pin() { return lease; } },
@@ -278,6 +294,57 @@ describe("redacted retrieval explanations", () => {
     assert.equal(result.items.length, DEFAULT_RANKING_POLICY.diversity.maxPerSource);
     assert.equal(result.redactedDropCounts.byReason.diversity, 1);
     assert.equal(result.truncated, true);
+  });
+
+  it("accounts every candidate suppressed after a high-impact conflict truncates", async () => {
+    const lease: ProjectionReaderLease = Object.freeze({
+      manifest: MANIFEST,
+      databasePath: "unused-by-injected-repository.sqlite",
+      close: () => undefined,
+    });
+    const candidates = [
+      item("conflict-a"),
+      item("conflict-b"),
+      item("conflict-c"),
+      item("lower-priority", {
+        status: "active",
+        conflictGroupId: null,
+        normalizedKey: "decision:lower-priority",
+      }),
+    ];
+    const collection: RetrievalCandidateCollection = Object.freeze({
+      channels: Object.freeze([Object.freeze({
+        channel: "exact",
+        candidates: Object.freeze(candidates.map((candidate, index) => Object.freeze({
+          candidateId: `exact:${candidate.id}`,
+          channel: "exact" as const,
+          rank: index + 1,
+          item: candidate,
+        }))),
+      })]),
+      eligibleItemCount: candidates.length,
+      droppedItemCount: 0,
+      truncated: false,
+      conflictGroups: Object.freeze([Object.freeze({
+        conflictGroupId: CONFLICT_GROUP_ID,
+        eligibleMemberCount: 3,
+        returnedMemberCount: 3,
+        truncated: false,
+        cursor: null,
+      })]),
+    });
+    const service = new InternalRetrievalService({
+      projections: { async pin() { return lease; } },
+      candidates: { collectEligible() { return collection; } },
+    });
+
+    const result = await service.retrieve(request({ tokenBudget: 1 }));
+
+    assert.equal(result.redactedDropCounts.byReason.tokenBudget, 3);
+    assert.equal(result.redactedDropCounts.byReason.conflictSuppressed, 1);
+    assert.equal(result.redactedDropCounts.total, 4);
+    assert.equal(result.explanation?.dropped.byReason.conflictSuppressed, 1);
+    assert.equal(JSON.stringify(result.explanation).includes("lower-priority"), false);
   });
 
   it("omits an explanation that cannot fit its caller-provided byte bound", async () => {
@@ -295,6 +362,7 @@ describe("redacted retrieval explanations", () => {
             eligibleItemCount: 0,
             droppedItemCount: 0,
             truncated: false,
+            conflictGroups: Object.freeze([]),
           });
         },
       },

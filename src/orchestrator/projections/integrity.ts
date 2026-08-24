@@ -111,7 +111,7 @@ const TABLES = Object.freeze({
   }),
   canonicalItems: Object.freeze({
     table: "canonical_items",
-    columns: Object.freeze(["project_id", "session_id", "item_id", "normalized_key", "status", "confidence", "verification_method", "valid_from", "valid_to", "summary", "content_hash", "known_from_event_position", "source_event_position"]),
+    columns: Object.freeze(["project_id", "session_id", "item_id", "normalized_key", "conflict_group_id", "superseding_item_id", "status", "confidence", "verification_method", "valid_from", "valid_to", "summary", "content_hash", "known_from_event_position", "source_event_position"]),
     keyColumns: Object.freeze(["project_id", "item_id"]),
     order: "project_id, item_id",
   }),
@@ -386,6 +386,8 @@ function rowsFromState(state: ProjectionFoldState): ExpectedProjectionRows {
       session_id: row.sessionId,
       item_id: row.itemId,
       normalized_key: row.normalizedKey,
+      conflict_group_id: row.conflictGroupId,
+      superseding_item_id: row.supersedingItemId,
       status: row.status,
       confidence: row.confidence,
       verification_method: row.verificationMethod,
@@ -648,6 +650,13 @@ function scalarCount(database: DatabaseSync, sql: string): bigint {
 
 function assertReferences(database: DatabaseSync): void {
   if (
+    scalarCount(database, `
+      SELECT count(*) AS n FROM canonical_items AS item
+      LEFT JOIN canonical_items AS target
+        ON target.project_id = item.project_id AND target.item_id = item.superseding_item_id
+      WHERE item.superseding_item_id IS NOT NULL AND target.item_id IS NULL
+    `) !== 0n
+    ||
     scalarCount(database, `
       SELECT count(*) AS n FROM retrieval_feedback AS feedback
       LEFT JOIN canonical_items AS item

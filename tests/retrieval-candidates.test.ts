@@ -21,6 +21,7 @@ import type { ProjectionManifestV1 } from "../src/orchestrator/projections/manif
 import type { ProjectionReaderLease } from "../src/orchestrator/projections/reader-lease.js";
 import { PROJECTION_SCHEMA_SQL_V1 } from "../src/orchestrator/projections/schema.js";
 import { SqliteRetrievalCandidateRepository } from "../src/orchestrator/retrieval/candidates.js";
+import { InternalRetrievalService } from "../src/orchestrator/retrieval/service.js";
 import type {
   InternalRetrievalRequest,
   RetrievalCandidateCollection,
@@ -37,6 +38,9 @@ const SESSION_ID = "00000000-0000-4000-8000-000000000512";
 const OTHER_SESSION_ID = "00000000-0000-4000-8000-000000000513";
 const ITEM_ID = "00000000-0000-4000-8000-000000000514";
 const FUTURE_ITEM_ID = "00000000-0000-4000-8000-000000000515";
+const CONFLICT_ALTERNATIVE_ID = "00000000-0000-4000-8000-000000000524";
+const CONFLICT_HIDDEN_ID = "00000000-0000-4000-8000-000000000525";
+const CONFLICT_GROUP_ID = "00000000-0000-4000-8000-000000000526";
 const NOW = "2026-08-24T00:00:00.000Z";
 
 const BINDING: ProjectBinding = Object.freeze({
@@ -269,35 +273,52 @@ function createCanonicalLimitLease(count: 1 | 2): ProjectionReaderLease {
   return Object.freeze({ manifest: manifest(), databasePath, close: () => undefined });
 }
 
-function memoryStoredEvent(): StoredEvent {
+function memoryStoredEvent(options: Readonly<{
+  position?: number;
+  itemId?: string;
+  normalizedKey?: string;
+  summary?: string;
+  sessionId?: string;
+  status?: "verified" | "conflicted";
+  conflictGroupId?: string | null;
+  supersedingItemId?: string | null;
+}> = {}): StoredEvent {
+  const position = options.position ?? 1;
+  const sessionId = options.sessionId ?? SESSION_ID;
+  const sourceVersion = options.conflictGroupId === undefined
+    && options.supersedingItemId === undefined ? 1 : 2;
   const payload: JsonValue = {
-    sourceVersion: 1,
-    binding: { ...BINDING, sessionId: SESSION_ID },
-    itemId: ITEM_ID,
-    normalizedKey: "decision:session-a-only",
-    status: "verified",
+    sourceVersion,
+    binding: { ...BINDING, sessionId },
+    itemId: options.itemId ?? ITEM_ID,
+    normalizedKey: options.normalizedKey ?? "decision:session-a-only",
+    status: options.status ?? "verified",
     confidence: "high",
     verificationMethod: "committed-event",
     validFrom: "2026-01-01T00:00:00.000Z",
     validTo: null,
-    summary: "Session A private decision.",
+    summary: options.summary ?? "Session A private decision.",
     contentHash: "e".repeat(64),
+    ...(sourceVersion === 2 ? {
+      conflictGroupId: options.conflictGroupId ?? null,
+      supersedingItemId: options.supersedingItemId ?? null,
+    } : {}),
   };
   return Object.freeze({
-    globalPosition: 1n,
-    eventId: "00000000-0000-4000-8000-000000000521",
+    globalPosition: BigInt(position),
+    eventId: `00000000-0000-4000-8000-${String(520 + position).padStart(12, "0")}`,
     projectId: PROJECT_ID,
     vaultId: BINDING.vaultId,
     storeId: BINDING.storeId,
     workspaceId: WORKSPACE_ID,
     branchScopeId: BRANCH_SCOPE_ID,
     branchRef: BINDING.branchRef,
-    streamId: `session/${SESSION_ID}`,
+    streamId: `session/${sessionId}`,
     streamType: "session",
-    streamVersion: 1n,
+    streamVersion: BigInt(position),
     eventType: "MemorySourceRecorded",
-    eventSchemaVersion: 1,
-    sessionId: SESSION_ID,
+    eventSchemaVersion: sourceVersion,
+    sessionId,
     parentSessionId: null,
     actorRole: "primary",
     agentId: "retrieval-test-agent",
@@ -305,7 +326,7 @@ function memoryStoredEvent(): StoredEvent {
     correlationId: "00000000-0000-4000-8000-000000000522",
     causationId: null,
     commandId: "00000000-0000-4000-8000-000000000523",
-    idempotencyKey: "retrieval/session-scope/1",
+    idempotencyKey: `retrieval/session-scope/${position}`,
     commandEventIndex: 0,
     occurredAt: NOW,
     recordedAt: NOW,
@@ -318,8 +339,8 @@ function memoryStoredEvent(): StoredEvent {
     payload,
     payloadJson: canonicalJson(payload),
     payloadHash: payloadHash(payload),
-    previousGlobalHash: "0".repeat(64),
-    eventHash: "f".repeat(64),
+    previousGlobalHash: position === 1 ? "0".repeat(64) : `${position - 1}`.repeat(64).slice(0, 64),
+    eventHash: `${position}`.repeat(64).slice(0, 64),
     lifecycleIntentJson: null,
   });
 }
@@ -455,6 +476,113 @@ describe("local retrieval candidate channels", () => {
       "decision:session-a-only",
       { sessionId: SESSION_ID, visibility: "session" },
     )), "exact"), [ITEM_ID]);
+  });
+
+  it("expands a builder-persisted V2 conflict group under hard filters and reports true closure state", async () => {
+    const root = mkdtempSync(join(tmpdir(), "retrieval-builder-conflicts-"));
+    roots.push(root);
+    const events = Object.freeze([
+      memoryStoredEvent({
+        position: 1,
+        itemId: ITEM_ID,
+        normalizedKey: "decision:closure-anchor",
+        summary: "Conflict closure anchor.",
+        status: "conflicted",
+        conflictGroupId: CONFLICT_GROUP_ID,
+      }),
+      memoryStoredEvent({
+        position: 2,
+        itemId: CONFLICT_ALTERNATIVE_ID,
+        normalizedKey: "decision:closure-alternative",
+        summary: "Eligible conflicting alternative.",
+        status: "conflicted",
+        conflictGroupId: CONFLICT_GROUP_ID,
+      }),
+      memoryStoredEvent({
+        position: 3,
+        itemId: CONFLICT_HIDDEN_ID,
+        normalizedKey: "decision:closure-hidden",
+        summary: "Other-session conflicting alternative.",
+        sessionId: OTHER_SESSION_ID,
+        status: "conflicted",
+        conflictGroupId: CONFLICT_GROUP_ID,
+      }),
+    ]);
+    const snapshot: ProjectionEventSnapshot = Object.freeze({
+      binding: BINDING,
+      events,
+      terminalEventPosition: 3n,
+      terminalEventHash: events[2]!.eventHash,
+      close: () => undefined,
+    });
+    const generation = await new ImmutableProjectionBuilder({
+      driver: new NodeSqliteDriver({ DatabaseSync }),
+      projectionDirectory: join(root, "projections"),
+      now: () => NOW,
+    }).build(snapshot, 1);
+    const lease: ProjectionReaderLease = Object.freeze({
+      manifest: generation.manifest,
+      databasePath: generation.databasePath,
+      close: () => undefined,
+    });
+    const repository = new SqliteRetrievalCandidateRepository();
+
+    const complete = repository.collectEligible(lease, request("decision:closure-anchor", {
+      knownAt: 3n,
+      consistency: { requiredEventPosition: 3n, deadlineMs: 100 },
+    }));
+    assert.deepEqual(channelIds(complete, "exact"), [ITEM_ID]);
+    assert.deepEqual(channelIds(complete, "conflict-closure"), [
+      ITEM_ID,
+      CONFLICT_ALTERNATIVE_ID,
+    ]);
+    assert.deepEqual(complete.conflictGroups, [{
+      conflictGroupId: CONFLICT_GROUP_ID,
+      eligibleMemberCount: 2,
+      returnedMemberCount: 2,
+      truncated: false,
+      cursor: null,
+    }]);
+    assert.equal(complete.eligibleItemCount, 2);
+    assert.equal(complete.channels.some((channel) => channel.candidates.some(
+      (candidate) => candidate.item.id === CONFLICT_HIDDEN_ID,
+    )), false);
+    const service = new InternalRetrievalService({
+      projections: { async pin() { return lease; } },
+      candidates: repository,
+    });
+    const ranked = await service.retrieve(request("decision:closure-anchor", {
+      knownAt: 3n,
+      consistency: { requiredEventPosition: 3n, deadlineMs: 100 },
+    }));
+    assert.deepEqual(ranked.items.map((item) => item.id), [
+      ITEM_ID,
+      CONFLICT_ALTERNATIVE_ID,
+    ]);
+    assert.equal(ranked.conflicts[0]?.totalMemberCount, 2);
+    assert.equal(ranked.conflicts[0]?.truncated, false);
+
+    const bounded = repository.collectEligible(lease, request("decision:closure-anchor", {
+      candidateLimit: 1,
+      knownAt: 3n,
+      consistency: { requiredEventPosition: 3n, deadlineMs: 100 },
+    }));
+    assert.equal(bounded.conflictGroups[0]?.eligibleMemberCount, 2);
+    assert.equal(bounded.conflictGroups[0]?.returnedMemberCount, 1);
+    assert.equal(bounded.conflictGroups[0]?.truncated, true);
+    assert.notEqual(bounded.conflictGroups[0]?.cursor, null);
+    assert.equal(bounded.conflictGroups[0]?.cursor?.includes(CONFLICT_GROUP_ID), false);
+    const boundedRanked = await service.retrieve(request("decision:closure-anchor", {
+      candidateLimit: 1,
+      knownAt: 3n,
+      consistency: { requiredEventPosition: 3n, deadlineMs: 100 },
+    }));
+    assert.equal(boundedRanked.eligibleCount, 2);
+    assert.equal(boundedRanked.conflicts[0]?.totalMemberCount, 2);
+    assert.equal(boundedRanked.conflicts[0]?.selectedMemberCount, 1);
+    assert.equal(boundedRanked.conflicts[0]?.truncated, true);
+    assert.notEqual(boundedRanked.conflictCursor, null);
+    assert.equal(boundedRanked.redactedDropCounts.byReason.candidateBound, 1);
   });
 
   it("fails closed instead of bypassing a missing published FTS5 index", () => {

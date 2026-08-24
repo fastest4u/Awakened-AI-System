@@ -69,6 +69,12 @@ export const PROJECTION_SCHEMA_SQL_V1 = `
     session_id TEXT,
     item_id TEXT NOT NULL,
     normalized_key TEXT NOT NULL,
+    conflict_group_id TEXT CHECK (conflict_group_id IS NULL OR length(conflict_group_id) = 36),
+    superseding_item_id TEXT CHECK (
+      superseding_item_id IS NULL OR (
+        length(superseding_item_id) = 36 AND superseding_item_id <> item_id
+      )
+    ),
     status TEXT NOT NULL CHECK (status IN (
       'candidate', 'provisional', 'verified', 'conflicted', 'superseded',
       'retracted', 'expired', 'erased-evidence'
@@ -88,6 +94,10 @@ export const PROJECTION_SCHEMA_SQL_V1 = `
 
   CREATE INDEX canonical_items_candidates_idx
     ON canonical_items(project_id, session_id, status, valid_from, valid_to, source_event_position DESC, item_id);
+
+  CREATE INDEX canonical_items_conflict_group_idx
+    ON canonical_items(project_id, conflict_group_id, source_event_position DESC, item_id)
+    WHERE conflict_group_id IS NOT NULL;
 
   CREATE TABLE tasks_followups (
     project_id TEXT NOT NULL,

@@ -47,6 +47,8 @@ function memoryEvent(
     validTo: null,
     summary: "Projection publication follows the authoritative event commit.",
     contentHash: "b".repeat(64),
+    conflictGroupId: null,
+    supersedingItemId: null,
     ...overrides,
   });
 }
@@ -111,6 +113,19 @@ describe("projection folds", () => {
     assert.equal(verified.canonicalItems[0]?.sourceEventPosition, 43n);
     assert.equal(verified.canonicalItems[0]?.validFrom, OCCURRED_AT);
     assert.equal(verified.canonicalItems[0]?.validTo, "2026-08-24T01:00:00.000Z");
+  });
+
+  it("folds explicit Version 2 conflict metadata without changing the normalized-key identity", () => {
+    const conflictGroupId = "00000000-0000-4000-8000-000000000052";
+    const folded = foldProjectionEvent(emptyProjectionFoldState(), memoryEvent(42n, {
+      sourceEventSchemaVersion: 2,
+      status: "conflicted",
+      conflictGroupId,
+    }));
+
+    assert.equal(folded.canonicalItems[0]?.normalizedKey, "decision:projection-boundary");
+    assert.equal(folded.canonicalItems[0]?.conflictGroupId, conflictGroupId);
+    assert.equal(folded.canonicalItems[0]?.supersedingItemId, null);
   });
 
   it("rejects illegal status regression and leaves the prior fold unchanged", () => {

@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 
 import type { Confidence } from "../contracts/event.js";
@@ -17,6 +18,7 @@ import {
   type RetrievalCandidateCollection,
   type RetrievalChannel,
   type RetrievalChannelResult,
+  type RetrievalConflictGroup,
   type RetrievalFreshness,
   type RetrievalItem,
   type RetrievalItemStatus,
@@ -38,6 +40,7 @@ const CANONICAL_STATUS = new Set<ProjectionItemStatus>([
   "candidate", "provisional", "verified", "conflicted", "superseded",
   "retracted", "expired", "erased-evidence",
 ]);
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 
 function projectionInvalid(): never {
   throw new InternalRetrievalError("RETRIEVAL_PROJECTION_INVALID");
@@ -63,10 +66,23 @@ function nullableString(source: Row, key: string): string | null {
   return value;
 }
 
+function nullableUuid(source: Row, key: string): string | null {
+  const value = nullableString(source, key);
+  if (value !== null && !UUID.test(value)) return projectionInvalid();
+  return value;
+}
+
 function bigintValue(source: Row, key: string): bigint {
   const value = source[key];
   if (typeof value === "bigint" && value >= 0n) return value;
   if (typeof value === "number" && Number.isSafeInteger(value) && value >= 0) return BigInt(value);
+  return projectionInvalid();
+}
+
+function signedBigintValue(source: Row, key: string): bigint {
+  const value = source[key];
+  if (typeof value === "bigint") return value;
+  if (typeof value === "number" && Number.isSafeInteger(value)) return BigInt(value);
   return projectionInvalid();
 }
 
@@ -148,6 +164,9 @@ function canonicalItem(
     normalizedKey: stringValue(source, `${prefix}normalized_key`),
     anchor: null,
     freshness: freshness(sourcePosition, terminalPosition),
+    conflictGroupId: nullableUuid(source, `${prefix}conflict_group_id`),
+    supersedingItemId: nullableUuid(source, `${prefix}superseding_item_id`),
+    retrievalFeedbackScoreUnits: 0,
   });
 }
 
@@ -195,6 +214,9 @@ function scopedItem(
     normalizedKey,
     anchor,
     freshness: freshness(sourcePosition, terminalPosition),
+    conflictGroupId: null,
+    supersedingItemId: null,
+    retrievalFeedbackScoreUnits: 0,
   });
 }
 
@@ -291,6 +313,9 @@ function lexicalItem(
     normalizedKey: stringValue(source, "normalized_key"),
     anchor: stringValue(source, "section"),
     freshness: freshness(sourcePosition, terminalPosition),
+    conflictGroupId: null,
+    supersedingItemId: null,
+    retrievalFeedbackScoreUnits: 0,
   });
 }
 
@@ -348,7 +373,8 @@ function exactSelection(
   parameters: Readonly<Record<string, SqliteParameter>>,
 ): ChannelSelection {
   const rows = preparedRows(database, `
-    SELECT item.project_id, item.session_id, item.item_id, item.normalized_key, item.status,
+    SELECT item.project_id, item.session_id, item.item_id, item.normalized_key,
+           item.conflict_group_id, item.superseding_item_id, item.status,
            item.confidence, item.verification_method, item.valid_from, item.valid_to,
            item.summary, item.known_from_event_position, item.source_event_position
     FROM canonical_items AS item
@@ -370,7 +396,8 @@ function aliasSelection(
   parameters: Readonly<Record<string, SqliteParameter>>,
 ): ChannelSelection {
   const rows = preparedRows(database, `
-    SELECT item.project_id, item.session_id, item.item_id, item.normalized_key, item.status,
+    SELECT item.project_id, item.session_id, item.item_id, item.normalized_key,
+           item.conflict_group_id, item.superseding_item_id, item.status,
            item.confidence, item.verification_method, item.valid_from, item.valid_to,
            item.summary, item.known_from_event_position, item.source_event_position
     FROM entity_graph AS edge
@@ -423,6 +450,8 @@ function lexicalSelection(
            item.session_id AS canonical_session_id,
            item.item_id AS canonical_item_id,
            item.normalized_key AS canonical_normalized_key,
+           item.conflict_group_id AS canonical_conflict_group_id,
+           item.superseding_item_id AS canonical_superseding_item_id,
            item.status AS canonical_status,
            item.confidence AS canonical_confidence,
            item.verification_method AS canonical_verification_method,
@@ -581,6 +610,143 @@ function candidateId(channel: RetrievalChannel, item: RetrievalItem): string {
   return `${channel}:${item.kind}:${item.id}`;
 }
 
+function itemKey(item: RetrievalItem): string {
+  return `${item.kind}:${item.id}`;
+}
+
+function conflictCursor(
+  manifest: ProjectionManifestV1,
+  conflictGroupId: string,
+  returnedMemberCount: number,
+): string {
+  const digest = createHash("sha256")
+    .update("retrieval-conflict-closure-v1")
+    .update("\u0000")
+    .update(manifest.generation.toString())
+    .update("\u0000")
+    .update(manifest.terminalEventPosition)
+    .update("\u0000")
+    .update(conflictGroupId)
+    .update("\u0000")
+    .update(returnedMemberCount.toString())
+    .digest("hex")
+    .slice(0, 32);
+  return `retrieval-conflict-closure-v1:${returnedMemberCount}:${digest}`;
+}
+
+function conflictClosure(
+  database: DatabaseSync,
+  manifest: ProjectionManifestV1,
+  request: ValidatedInternalRetrievalRequest,
+  parameters: Readonly<Record<string, SqliteParameter>>,
+  conflictGroupIds: readonly string[],
+): Readonly<{
+  readonly items: readonly RetrievalItem[];
+  readonly eligibleCounts: ReadonlyMap<string, number>;
+}> {
+  if (conflictGroupIds.length === 0) {
+    return Object.freeze({ items: Object.freeze([]), eligibleCounts: new Map() });
+  }
+  const groupParameters: Record<string, SqliteParameter> = { ...parameters };
+  const placeholders = conflictGroupIds.map((groupId, index) => {
+    const name = `$conflictGroup${index}`;
+    groupParameters[name] = groupId;
+    return name;
+  });
+  groupParameters.$closureLimit = request.candidateLimit;
+  const membership = placeholders.join(", ");
+  const countRows = preparedRows(database, `
+    SELECT item.conflict_group_id, count(*) AS eligible_member_count
+    FROM canonical_items AS item
+    WHERE ${CANONICAL_ELIGIBILITY_SQL}
+      AND item.conflict_group_id IN (${membership})
+    GROUP BY item.conflict_group_id
+    ORDER BY item.conflict_group_id
+  `, groupParameters);
+  const eligibleCounts = new Map<string, number>();
+  for (const source of countRows) {
+    const groupId = nullableUuid(source, "conflict_group_id");
+    if (groupId === null || !conflictGroupIds.includes(groupId)) return projectionInvalid();
+    const count = numberValue(source, "eligible_member_count");
+    if (count < 1) return projectionInvalid();
+    eligibleCounts.set(groupId, count);
+  }
+  if (eligibleCounts.size !== conflictGroupIds.length) return projectionInvalid();
+  const rows = preparedRows(database, `
+    SELECT item.project_id, item.session_id, item.item_id, item.normalized_key,
+           item.conflict_group_id, item.superseding_item_id, item.status,
+           item.confidence, item.verification_method, item.valid_from, item.valid_to,
+           item.summary, item.known_from_event_position, item.source_event_position
+    FROM canonical_items AS item
+    WHERE ${CANONICAL_ELIGIBILITY_SQL}
+      AND item.conflict_group_id IN (${membership})
+    ORDER BY item.conflict_group_id, item.item_id
+    LIMIT $closureLimit
+  `, groupParameters);
+  const terminalPosition = BigInt(manifest.terminalEventPosition);
+  const items = rows.map((source) => canonicalItem(source, manifest, terminalPosition));
+  if (items.some((item) => !isEligible(item, request, request.binding))) {
+    return projectionInvalid();
+  }
+  return Object.freeze({ items: Object.freeze(items), eligibleCounts });
+}
+
+function feedbackScores(
+  database: DatabaseSync,
+  parameters: Readonly<Record<string, SqliteParameter>>,
+  items: readonly RetrievalItem[],
+): ReadonlyMap<string, number> {
+  const itemIds = [...new Set(items
+    .filter((item) => item.kind === "canonical")
+    .map((item) => item.id))].sort();
+  if (itemIds.length === 0) return new Map();
+  const feedbackParameters: Record<string, SqliteParameter> = { ...parameters };
+  const placeholders = itemIds.map((itemId, index) => {
+    const name = `$feedbackItem${index}`;
+    feedbackParameters[name] = itemId;
+    return name;
+  });
+  const rows = preparedRows(database, `
+    SELECT feedback.item_id,
+           sum(CASE feedback.outcome
+             WHEN 'accepted' THEN feedback.usefulness
+             ELSE -feedback.usefulness
+           END) AS signed_usefulness_units,
+           count(*) AS feedback_count
+    FROM retrieval_feedback AS feedback
+    JOIN canonical_items AS item
+      ON item.project_id = feedback.project_id
+     AND item.item_id = feedback.item_id
+     AND item.source_event_position = feedback.source_item_event_position
+    WHERE feedback.project_id = $projectId
+      AND feedback.item_id IN (${placeholders.join(", ")})
+      AND feedback.source_event_position <= $terminalPosition
+      AND ($knownAt IS NULL OR feedback.source_event_position <= $knownAt)
+    GROUP BY feedback.item_id
+    ORDER BY feedback.item_id
+  `, feedbackParameters);
+  const scores = new Map<string, number>();
+  for (const source of rows) {
+    const itemId = stringValue(source, "item_id");
+    if (!itemIds.includes(itemId)) return projectionInvalid();
+    const total = signedBigintValue(source, "signed_usefulness_units");
+    const count = BigInt(numberValue(source, "feedback_count"));
+    if (count < 1n || total < -10_000n * count || total > 10_000n * count) {
+      return projectionInvalid();
+    }
+    scores.set(itemId, Number(total / count));
+  }
+  return scores;
+}
+
+function applyFeedback(item: RetrievalItem, scores: ReadonlyMap<string, number>): RetrievalItem {
+  if (item.kind !== "canonical") return item;
+  return Object.freeze({
+    ...item,
+    retrievalFeedbackScoreUnits: scores.get(item.id) ?? 0,
+  });
+}
+
 function collectChannels(
   database: DatabaseSync,
   manifest: ProjectionManifestV1,
@@ -590,6 +756,7 @@ function collectChannels(
   eligibleItemCount: number;
   droppedItemCount: number;
   truncated: boolean;
+  conflictGroups: readonly RetrievalConflictGroup[];
 }> {
   const query = normalized(request.query);
   const terminalPosition = BigInt(manifest.terminalEventPosition);
@@ -602,8 +769,8 @@ function collectChannels(
     ["session-checkpoint", checkpointSelection(database, manifest, request, parameters)],
     ["open-follow-up", followUpSelection(database, manifest, request, parameters)],
   ]);
-  const output: RetrievalChannelResult[] = [];
-  const unique = new Set<string>();
+  const directOutput: RetrievalChannelResult[] = [];
+  const directUnique = new Map<string, RetrievalItem>();
   let dropped = 0;
   let truncated = false;
   for (const [channel, selection] of candidates) {
@@ -611,12 +778,12 @@ function collectChannels(
     truncated ||= selection.overflow;
     const ranked: RetrievalCandidate[] = [];
     for (const [index, item] of selection.items.entries()) {
-      const key = `${item.kind}:${item.id}`;
-      if (!unique.has(key) && unique.size >= request.candidateLimit) {
+      const key = itemKey(item);
+      if (!directUnique.has(key) && directUnique.size >= request.candidateLimit) {
         truncated = true;
         continue;
       }
-      unique.add(key);
+      directUnique.set(key, item);
       ranked.push(Object.freeze({
         candidateId: candidateId(channel, item),
         channel,
@@ -624,13 +791,91 @@ function collectChannels(
         item,
       }));
     }
-    output.push(Object.freeze({ channel, candidates: Object.freeze(ranked) }));
+    directOutput.push(Object.freeze({ channel, candidates: Object.freeze(ranked) }));
   }
+  const conflictGroupIds = [...new Set([...directUnique.values()]
+    .map((item) => item.conflictGroupId)
+    .filter((groupId): groupId is string => groupId !== null))].sort();
+  const closure = conflictClosure(
+    database,
+    manifest,
+    request,
+    parameters,
+    conflictGroupIds,
+  );
+  const allowed = new Map<string, RetrievalItem>();
+  for (const conflictGroupId of conflictGroupIds) {
+    const anchor = [...directUnique.values()]
+      .filter((item) => item.conflictGroupId === conflictGroupId)
+      .sort((left, right) => itemKey(left).localeCompare(itemKey(right)))[0];
+    if (anchor === undefined) return projectionInvalid();
+    allowed.set(itemKey(anchor), anchor);
+  }
+  for (const item of closure.items) {
+    if (allowed.size >= request.candidateLimit) break;
+    allowed.set(itemKey(item), item);
+  }
+  for (const [key, item] of directUnique) {
+    if (allowed.size >= request.candidateLimit) break;
+    allowed.set(key, item);
+  }
+  const groupedDirect = new Set([...directUnique]
+    .filter(([, item]) => item.conflictGroupId !== null)
+    .map(([key]) => key));
+  const eligibleItemCount = directUnique.size - groupedDirect.size
+    + [...closure.eligibleCounts.values()].reduce((total, count) => total + count, 0);
+  truncated ||= eligibleItemCount > allowed.size;
+  const rawChannels: RetrievalChannelResult[] = directOutput.map((channel) => {
+    const filtered = channel.candidates.filter((candidate) => allowed.has(itemKey(candidate.item)));
+    return Object.freeze({
+      channel: channel.channel,
+      candidates: Object.freeze(filtered.map((candidate, index) => Object.freeze({
+        ...candidate,
+        rank: index + 1,
+      }))),
+    });
+  });
+  const closureItems = closure.items.filter((item) => allowed.has(itemKey(item)));
+  rawChannels.push(Object.freeze({
+    channel: "conflict-closure",
+    candidates: Object.freeze(closureItems.map((item, index) => Object.freeze({
+      candidateId: candidateId("conflict-closure", item),
+      channel: "conflict-closure" as const,
+      rank: index + 1,
+      item,
+    }))),
+  }));
+  const scores = feedbackScores(database, parameters, [...allowed.values()]);
+  const output = rawChannels.map((channel) => Object.freeze({
+    channel: channel.channel,
+    candidates: Object.freeze(channel.candidates.map((candidate) => Object.freeze({
+      ...candidate,
+      item: applyFeedback(candidate.item, scores),
+    }))),
+  }));
+  const conflictGroups = conflictGroupIds.map((conflictGroupId): RetrievalConflictGroup => {
+    const eligibleMemberCount = closure.eligibleCounts.get(conflictGroupId);
+    if (eligibleMemberCount === undefined) return projectionInvalid();
+    const returnedMemberCount = [...allowed.values()].filter(
+      (item) => item.conflictGroupId === conflictGroupId,
+    ).length;
+    const groupTruncated = returnedMemberCount < eligibleMemberCount;
+    return Object.freeze({
+      conflictGroupId,
+      eligibleMemberCount,
+      returnedMemberCount,
+      truncated: groupTruncated,
+      cursor: groupTruncated
+        ? conflictCursor(manifest, conflictGroupId, returnedMemberCount)
+        : null,
+    });
+  });
   return Object.freeze({
     channels: Object.freeze(output),
-    eligibleItemCount: unique.size,
+    eligibleItemCount,
     droppedItemCount: dropped,
     truncated,
+    conflictGroups: Object.freeze(conflictGroups),
   });
 }
 
@@ -686,6 +931,7 @@ export class SqliteRetrievalCandidateRepository {
         eligibleItemCount: collected.eligibleItemCount,
         droppedItemCount: collected.droppedItemCount,
         truncated: collected.truncated,
+        conflictGroups: collected.conflictGroups,
       });
     } catch (error) {
       if (error instanceof InternalRetrievalError) throw error;

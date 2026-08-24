@@ -109,6 +109,10 @@ export interface MemorySourceProjectionEvent extends ProjectionEventSource {
   readonly validTo: string | null;
   readonly summary: string;
   readonly contentHash: string;
+  /** Version 2 conflict-set identity; null for Version 1 source events. */
+  readonly conflictGroupId: string | null;
+  /** Version 2 supersession target; null when this item is not superseded. */
+  readonly supersedingItemId: string | null;
 }
 
 export interface RetrievalFeedbackProjectionEvent extends ProjectionEventSource {
@@ -152,6 +156,8 @@ export interface CanonicalItemProjection {
   readonly validTo: string | null;
   readonly summary: string;
   readonly contentHash: string;
+  readonly conflictGroupId: string | null;
+  readonly supersedingItemId: string | null;
   readonly knownFromEventPosition: bigint;
   readonly sourceEventPosition: bigint;
 }

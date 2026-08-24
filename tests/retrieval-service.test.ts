@@ -30,6 +30,7 @@ const OTHER_PROJECT_ID = "9".repeat(64) as ProjectId;
 const WORKSPACE_ID = "2".repeat(64) as WorkspaceId;
 const BRANCH_SCOPE_ID = "00000000-0000-4000-8000-000000000521" as BranchScopeId;
 const ITEM_ID = "00000000-0000-4000-8000-000000000522";
+const FEEDBACK_PEER_ID = "00000000-0000-4000-8000-000000000524";
 
 const BINDING: ProjectBinding = Object.freeze({
   projectId: PROJECT_ID,
@@ -151,6 +152,60 @@ describe("internal retrieval service", () => {
     assert.equal(result.terminalEventPosition, 12n);
     assert.equal(result.truncated, false);
     assert.equal(closed, 1);
+  });
+
+  it("plumbs source-position-aware projected feedback through the real repository into ranking", async () => {
+    const lease = createLease(() => undefined);
+    const database = new DatabaseSync(lease.databasePath);
+    database.prepare(`
+      INSERT INTO canonical_items(
+        project_id, item_id, normalized_key, status, confidence, verification_method,
+        valid_from, valid_to, summary, content_hash, known_from_event_position,
+        source_event_position
+      ) VALUES (?, ?, 'decision:feedback-peer', 'verified', 'high', 'committed-event',
+                ?, NULL, 'feedback-order', ?, 8, 8)
+    `).run(PROJECT_ID, FEEDBACK_PEER_ID, "2026-01-01T00:00:00.000Z", "7".repeat(64));
+    const chunk = database.prepare(`
+      INSERT INTO lexical_chunks(
+        project_id, chunk_id, item_id, session_id, section, normalized_key, text,
+        source_event_position
+      ) VALUES (?, ?, ?, NULL, 'summary', ?, 'feedback-order', 8)
+    `);
+    chunk.run(PROJECT_ID, "chunk-feedback-negative", ITEM_ID, "decision:feedback-negative");
+    chunk.run(PROJECT_ID, "chunk-feedback-positive", FEEDBACK_PEER_ID, "decision:feedback-positive");
+    const feedback = database.prepare(`
+      INSERT INTO retrieval_feedback(
+        project_id, feedback_id, item_id, outcome, usefulness,
+        source_item_event_position, source_event_position
+      ) VALUES (?, ?, ?, ?, 10000, ?, ?)
+    `);
+    feedback.run(
+      PROJECT_ID, "00000000-0000-4000-8000-000000000525", ITEM_ID,
+      "accepted", 7, 9,
+    );
+    feedback.run(
+      PROJECT_ID, "00000000-0000-4000-8000-000000000526", ITEM_ID,
+      "dismissed", 8, 10,
+    );
+    feedback.run(
+      PROJECT_ID, "00000000-0000-4000-8000-000000000527", FEEDBACK_PEER_ID,
+      "accepted", 8, 11,
+    );
+    database.close();
+    const service = new InternalRetrievalService({
+      projections: { async pin() { return lease; } },
+      candidates: new SqliteRetrievalCandidateRepository(),
+    });
+
+    const result = await service.retrieve(request({ query: "feedback-order" }));
+
+    assert.deepEqual(result.items.slice(0, 2).map((item) => ({
+      id: item.id,
+      feedback: item.retrievalFeedbackScoreUnits,
+    })), [
+      { id: FEEDBACK_PEER_ID, feedback: 10_000 },
+      { id: ITEM_ID, feedback: -10_000 },
+    ]);
   });
 
   it("applies known-at before any channel can return a future-known item", async () => {

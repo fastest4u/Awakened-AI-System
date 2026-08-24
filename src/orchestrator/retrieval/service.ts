@@ -33,7 +33,10 @@ import {
 import {
   DEFAULT_RANKING_POLICY,
   RERANK_FEATURE_NAMES,
+  addRationalScores,
+  compareRationalScores,
   estimateCandidateTokens,
+  formatRationalScore,
   fuseCandidates,
   rerankCandidates,
   selectRankedCandidates,
@@ -41,6 +44,7 @@ import {
   type RankedConflictGroup,
   type RankedSelection,
   type RankingCandidate,
+  type RationalScore,
 } from "./ranking.js";
 
 export interface InternalRetrievalServiceOptions {
@@ -93,6 +97,7 @@ function emptyDropCounts(): MutableDropCounts {
     diversity: 0,
     resultLimit: 0,
     tokenBudget: 0,
+    conflictSuppressed: 0,
   };
 }
 
@@ -124,6 +129,8 @@ function filterCandidates(
   const drops = emptyDropCounts();
   const channels: RetrievalChannelResult[] = [];
   const unique = new Set<string>();
+  const deniedUnique = new Set<string>();
+  const deniedByConflictGroup = new Map<string, Set<string>>();
   for (const channel of eligible.channels) {
     const candidates: RetrievalCandidate[] = [];
     for (const candidate of channel.candidates) {
@@ -133,6 +140,13 @@ function filterCandidates(
       const reason = denialReason(candidate.item, request);
       if (reason !== null) {
         drops[reason] += 1;
+        const deniedKey = `${candidate.item.kind}:${candidate.item.id}`;
+        deniedUnique.add(deniedKey);
+        if (candidate.item.conflictGroupId !== null) {
+          const denied = deniedByConflictGroup.get(candidate.item.conflictGroupId) ?? new Set<string>();
+          denied.add(deniedKey);
+          deniedByConflictGroup.set(candidate.item.conflictGroupId, denied);
+        }
         continue;
       }
       const ranked = Object.freeze({
@@ -147,40 +161,68 @@ function filterCandidates(
       candidates: Object.freeze(candidates),
     }));
   }
+  const conflictGroups = eligible.conflictGroups.map((group) => {
+    const denied = deniedByConflictGroup.get(group.conflictGroupId)?.size ?? 0;
+    const returnedMemberCount = [...unique].filter((key) => channels.some((channel) => (
+      channel.candidates.some((candidate) => (
+        `${candidate.item.kind}:${candidate.item.id}` === key
+        && candidate.item.conflictGroupId === group.conflictGroupId
+      ))
+    ))).length;
+    const eligibleMemberCount = Math.max(
+      returnedMemberCount,
+      group.eligibleMemberCount - denied,
+    );
+    const truncated = returnedMemberCount < eligibleMemberCount;
+    return Object.freeze({
+      conflictGroupId: group.conflictGroupId,
+      eligibleMemberCount,
+      returnedMemberCount,
+      truncated,
+      cursor: truncated ? group.cursor : null,
+    });
+  });
   return Object.freeze({
     collection: Object.freeze({
       channels: Object.freeze(channels),
-      eligibleItemCount: unique.size,
+      eligibleItemCount: Math.max(unique.size, eligible.eligibleItemCount - deniedUnique.size),
       droppedItemCount: eligible.droppedItemCount
         + Object.values(drops).reduce((total, count) => total + count, 0),
       truncated: eligible.truncated,
+      conflictGroups: Object.freeze(conflictGroups),
     }),
     defensiveDrops: Object.freeze(drops),
   });
 }
 
-function conflictGroupId(item: RetrievalItem): string | null {
-  return item.status === "conflicted" ? item.normalizedKey : null;
-}
-
 function rankingChannels(
   eligible: RetrievalCandidateCollection,
 ): readonly (readonly RankingCandidate[])[] {
+  const conflictGroups = new Map(eligible.conflictGroups.map((group) => [
+    group.conflictGroupId,
+    group,
+  ]));
   return Object.freeze(eligible.channels.map((channel) => Object.freeze(
     channel.candidates.map((candidate): RankingCandidate => {
-      const groupId = conflictGroupId(candidate.item);
+      const groupId = candidate.item.conflictGroupId;
+      const group = groupId === null ? undefined : conflictGroups.get(groupId);
       const rankable: RankingCandidate = {
         id: `${candidate.item.kind}:${candidate.item.id}`,
         rank: candidate.rank,
         channel: candidate.channel,
         item: candidate.item,
         conflictGroupId: groupId,
-        highImpact: groupId !== null,
+        highImpact: groupId !== null && candidate.item.status === "conflicted",
         sourceKey: candidate.item.sourceEventPosition.toString(),
         entityKey: candidate.item.normalizedKey,
         estimatedTokens: estimateCandidateTokens({
           id: `${candidate.item.kind}:${candidate.item.id}`,
           item: candidate.item,
+        }),
+        feedbackScoreUnits: candidate.item.retrievalFeedbackScoreUnits,
+        ...(group === undefined ? {} : {
+          conflictTotalMemberCount: group.eligibleMemberCount,
+          conflictCursor: group.cursor,
         }),
       };
       return Object.freeze(rankable);
@@ -190,7 +232,7 @@ function rankingChannels(
 
 function selectionReason(candidate: FusedCandidate): InternalRetrievalResultItem["selectionReason"] {
   const contribution = [...candidate.contributions].sort((left, right) => (
-    right.score - left.score
+    compareRationalScores(right.score, left.score)
     || left.rank - right.rank
     || (left.channel < right.channel ? -1 : left.channel > right.channel ? 1 : 0)
   ))[0];
@@ -257,7 +299,7 @@ function customRank(
       ...item,
       channels: Object.freeze([...selected.channels]),
       selectionReason: selected.selectionReason,
-      conflictGroupId: conflictGroupId(item),
+      conflictGroupId: item.conflictGroupId,
     }));
   }
   return Object.freeze({ result, items: Object.freeze(items) });
@@ -268,6 +310,7 @@ function channelContributions(
   fused: readonly FusedCandidate[],
   selectedIds: ReadonlySet<string>,
 ): readonly RetrievalChannelContribution[] {
+  const zeroScore: RationalScore = Object.freeze({ numerator: 0n, denominator: 1n });
   return Object.freeze(eligible.channels.map((channel) => {
     const ranks = channel.candidates.map((candidate) => candidate.rank);
     const relevant = fused.filter((candidate) => (
@@ -279,11 +322,14 @@ function channelContributions(
       selectedCount: relevant.filter((candidate) => selectedIds.has(candidate.id)).length,
       bestRank: ranks.length === 0 ? null : Math.min(...ranks),
       worstRank: ranks.length === 0 ? null : Math.max(...ranks),
-      fusionContribution: relevant.reduce((total, candidate) => (
-        total + candidate.contributions
+      fusionContribution: formatRationalScore(relevant.reduce((total, candidate) => (
+        candidate.contributions
           .filter((contribution) => contribution.channel === channel.channel)
-          .reduce((subtotal, contribution) => subtotal + contribution.score, 0)
-      ), 0),
+          .reduce(
+            (subtotal, contribution) => addRationalScores(subtotal, contribution.score),
+            total,
+          )
+      ), zeroScore)),
     });
   }));
 }
@@ -299,11 +345,18 @@ function redactedDropCounts(
     number,
   ]>) counts[reason] += count;
   counts.eligibilityDenied += eligible.droppedItemCount;
-  counts.candidateBound += eligible.truncated ? 1 : 0;
+  const materialized = new Set(eligible.channels.flatMap((channel) => (
+    channel.candidates.map((candidate) => `${candidate.item.kind}:${candidate.item.id}`)
+  ))).size;
+  counts.candidateBound += Math.max(
+    eligible.truncated ? 1 : 0,
+    eligible.eligibleItemCount - materialized,
+  );
   if (selection !== null) {
     counts.diversity += selection.droppedByReason.diversity;
     counts.resultLimit += selection.droppedByReason.resultLimit;
     counts.tokenBudget += selection.droppedByReason.tokenBudget;
+    counts.conflictSuppressed += selection.droppedByReason.conflictSuppressed;
   }
   const byReason = Object.freeze(counts);
   return Object.freeze({
@@ -414,7 +467,7 @@ export class InternalRetrievalService {
         terminalEventPosition: available,
         candidateCount,
         truncated,
-        eligibleCount: fused.length,
+        eligibleCount: filtered.collection.eligibleItemCount,
         rankingPolicyVersion: DEFAULT_RANKING_POLICY.version,
         rerankFeatureNames: RERANK_FEATURE_NAMES,
         redactedDropCounts: dropCounts,

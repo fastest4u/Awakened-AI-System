@@ -26,6 +26,8 @@ const SESSION_ID = "00000000-0000-4000-8000-000000000042";
 const CHECKPOINT_ID = "00000000-0000-4000-8000-000000000043";
 const ITEM_ID = "00000000-0000-4000-8000-000000000044";
 const FEEDBACK_ID = "00000000-0000-4000-8000-000000000045";
+const CONFLICT_GROUP_ID = "00000000-0000-4000-8000-000000000049";
+const SUPERSEDING_ITEM_ID = "00000000-0000-4000-8000-000000000050";
 const BRANCH_REF = "refs/heads/projection-contracts";
 const OCCURRED_AT = "2026-08-23T01:00:00.000Z";
 const RECORDED_AT = "2026-08-23T01:00:01.000Z";
@@ -338,6 +340,28 @@ describe("projection source event codec", () => {
     if (feedback.kind !== "projected") return;
     assert.equal(feedback.event.kind, "retrieval-feedback");
     assert.deepEqual(feedback.event.binding, binding());
+  });
+
+  it("decodes only explicit Version 2 conflict and supersession references", () => {
+    const payload = memoryPayload({
+      sourceVersion: 2,
+      conflictGroupId: CONFLICT_GROUP_ID,
+      supersedingItemId: SUPERSEDING_ITEM_ID,
+    });
+    const decoded = decodeProjectionEvent(storedEvent("MemorySourceRecorded", payload, {
+      eventSchemaVersion: 2,
+    }));
+
+    assert.equal(decoded.kind, "projected");
+    if (decoded.kind !== "projected" || decoded.event.kind !== "memory-source") return;
+    assert.equal(decoded.event.conflictGroupId, CONFLICT_GROUP_ID);
+    assert.equal(decoded.event.supersedingItemId, SUPERSEDING_ITEM_ID);
+    assert.throws(
+      () => decodeProjectionEvent(storedEvent("MemorySourceRecorded", memoryPayload({
+        conflictGroupId: CONFLICT_GROUP_ID,
+      }))),
+      /INTEGRITY_FAILURE/u,
+    );
   });
 
   it("rejects known future versions, malformed canonical payloads, and invalid positions or time", () => {

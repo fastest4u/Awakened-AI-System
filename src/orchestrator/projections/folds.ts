@@ -213,7 +213,7 @@ function validateState(value: unknown): ProjectionFoldState {
   ]);
   const canonicalItems = inspectRows(source.canonicalItems, [
     "projectId", "sessionId", "itemId", "normalizedKey", "status", "confidence", "verificationMethod",
-    "validFrom", "validTo", "summary", "contentHash", "knownFromEventPosition",
+    "validFrom", "validTo", "summary", "contentHash", "conflictGroupId", "supersedingItemId", "knownFromEventPosition",
     "sourceEventPosition",
   ]);
   const followUps = inspectRows(source.followUps, [
@@ -264,6 +264,11 @@ function validateState(value: unknown): ProjectionFoldState {
     }
     assertBoundedString(row.summary, MAX_SUMMARY_BYTES);
     if (typeof row.contentHash !== "string" || !HASH.test(row.contentHash)) return integrity();
+    if (row.conflictGroupId !== null) assertUuid(row.conflictGroupId);
+    if (row.supersedingItemId !== null) {
+      assertUuid(row.supersedingItemId);
+      if (row.supersedingItemId === row.itemId) return integrity();
+    }
     assertPositiveBigint(row.knownFromEventPosition);
     assertPositiveBigint(row.sourceEventPosition);
     if (row.knownFromEventPosition > row.sourceEventPosition) return integrity();
@@ -532,6 +537,8 @@ function foldMemorySource(
     validTo: event.validTo,
     summary: event.summary,
     contentHash: event.contentHash,
+    conflictGroupId: event.conflictGroupId,
+    supersedingItemId: event.supersedingItemId,
     knownFromEventPosition: current?.knownFromEventPosition ?? event.sourceEventPosition,
     sourceEventPosition: event.sourceEventPosition,
   });
@@ -765,6 +772,8 @@ export class ProjectionFoldAccumulator {
       validTo: event.validTo,
       summary: event.summary,
       contentHash: event.contentHash,
+      conflictGroupId: event.conflictGroupId,
+      supersedingItemId: event.supersedingItemId,
       knownFromEventPosition: current?.knownFromEventPosition ?? event.sourceEventPosition,
       sourceEventPosition: event.sourceEventPosition,
     }));

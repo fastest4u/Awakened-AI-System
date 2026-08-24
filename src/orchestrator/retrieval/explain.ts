@@ -19,6 +19,7 @@ export const REDACTED_DROP_REASONS = Object.freeze([
   "diversity",
   "resultLimit",
   "tokenBudget",
+  "conflictSuppressed",
 ] as const);
 
 export type RedactedDropReason = typeof REDACTED_DROP_REASONS[number];
@@ -34,7 +35,7 @@ export interface RetrievalChannelContribution {
   readonly selectedCount: number;
   readonly bestRank: number | null;
   readonly worstRank: number | null;
-  readonly fusionContribution: number;
+  readonly fusionContribution: string;
 }
 
 export interface RankedRetrieval {
@@ -90,6 +91,7 @@ const CHANNELS = Object.freeze([
   "symbol-path",
   "session-checkpoint",
   "open-follow-up",
+  "conflict-closure",
 ] as const satisfies readonly RetrievalChannel[]);
 const CHANNEL_SET = new Set<RetrievalChannel>(CHANNELS);
 const FEATURE_SET = new Set<string>(RERANK_FEATURE_NAMES);
@@ -106,10 +108,29 @@ function safeRank(value: unknown): number | null {
     : null;
 }
 
-function safeScore(value: unknown): number {
-  return typeof value === "number" && Number.isFinite(value) && value >= 0
-    ? value
-    : 0;
+function greatestCommonDivisor(left: bigint, right: bigint): bigint {
+  let a = left < 0n ? -left : left;
+  let b = right < 0n ? -right : right;
+  while (b !== 0n) [a, b] = [b, a % b];
+  return a === 0n ? 1n : a;
+}
+
+function safeScore(value: unknown): readonly [bigint, bigint] {
+  if (typeof value !== "string" || !/^(0|[1-9][0-9]*)\/(1|[1-9][0-9]*)$/u.test(value)) {
+    return [0n, 1n];
+  }
+  const [numeratorText, denominatorText] = value.split("/") as [string, string];
+  if (numeratorText.length > 256 || denominatorText.length > 256) return [0n, 1n];
+  return [BigInt(numeratorText), BigInt(denominatorText)];
+}
+
+function addScores(left: string, right: unknown): string {
+  const [leftNumerator, leftDenominator] = safeScore(left);
+  const [rightNumerator, rightDenominator] = safeScore(right);
+  const numerator = leftNumerator * rightDenominator + rightNumerator * leftDenominator;
+  const denominator = leftDenominator * rightDenominator;
+  const divisor = greatestCommonDivisor(numerator, denominator);
+  return `${numerator / divisor}/${denominator / divisor}`;
 }
 
 function safePosition(value: unknown): string {
@@ -154,8 +175,10 @@ function channelContributions(
       worstRank: current?.worstRank === null || current === undefined
         ? worst
         : worst === null ? current.worstRank : Math.max(current.worstRank, worst),
-      fusionContribution: (current?.fusionContribution ?? 0)
-        + safeScore(contribution.fusionContribution),
+      fusionContribution: addScores(
+        current?.fusionContribution ?? "0/1",
+        contribution.fusionContribution,
+      ),
     }));
   }
   return Object.freeze(CHANNELS.flatMap((channel) => {

@@ -96,6 +96,10 @@ export interface RetrievalItem {
   readonly normalizedKey: string;
   readonly anchor: string | null;
   readonly freshness: RetrievalFreshness;
+  readonly conflictGroupId: string | null;
+  readonly supersedingItemId: string | null;
+  /** Signed, source-version-aware average in the inclusive [-10000, 10000] range. */
+  readonly retrievalFeedbackScoreUnits: number;
 }
 
 export type RetrievalChannel =
@@ -104,7 +108,8 @@ export type RetrievalChannel =
   | "lexical"
   | "symbol-path"
   | "session-checkpoint"
-  | "open-follow-up";
+  | "open-follow-up"
+  | "conflict-closure";
 
 export interface RetrievalCandidate {
   readonly candidateId: string;
@@ -118,11 +123,21 @@ export interface RetrievalChannelResult {
   readonly candidates: readonly RetrievalCandidate[];
 }
 
+export interface RetrievalConflictGroup {
+  readonly conflictGroupId: string;
+  readonly eligibleMemberCount: number;
+  readonly returnedMemberCount: number;
+  readonly truncated: boolean;
+  /** Opaque continuation token; never copied into a redacted explanation. */
+  readonly cursor: string | null;
+}
+
 export interface RetrievalCandidateCollection {
   readonly channels: readonly RetrievalChannelResult[];
   readonly eligibleItemCount: number;
   readonly droppedItemCount: number;
   readonly truncated: boolean;
+  readonly conflictGroups: readonly RetrievalConflictGroup[];
 }
 
 export interface InternalRetrievalResultItem extends RetrievalItem {

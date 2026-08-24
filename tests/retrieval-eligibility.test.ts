@@ -71,6 +71,9 @@ function item(overrides: Partial<RetrievalItem> = {}): RetrievalItem {
     normalizedKey: "decision:same-task",
     anchor: null,
     freshness: "fresh",
+    conflictGroupId: null,
+    supersedingItemId: null,
+    retrievalFeedbackScoreUnits: 0,
     ...overrides,
   });
 }
