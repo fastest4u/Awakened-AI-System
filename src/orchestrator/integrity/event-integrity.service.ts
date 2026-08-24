@@ -1,11 +1,11 @@
 import { readFileSync } from "node:fs";
 import {
   commandHash,
-  eventHash,
   outboxHash,
   payloadHash,
   responseHash,
 } from "../crypto/event-hash.js";
+import type { StoredEvent } from "../contracts/event.js";
 import type { ProjectContext } from "../identity/contracts.js";
 import { parseProjectDescriptor } from "../identity/project-descriptor.schema.js";
 import { parseStoreManifest } from "../identity/store-manifest.schema.js";
@@ -48,6 +48,10 @@ import {
   type IntegrityMode,
   type IntegrityReport,
 } from "./integrity.types.js";
+import {
+  authenticateStoredEvent,
+  StoredEventAuthenticationError,
+} from "./stored-event-authenticator.js";
 
 export const DEFAULT_QUICK_TAIL_EVENTS = 256;
 export const MAX_QUICK_TAIL_EVENTS = 4096;
@@ -294,6 +298,61 @@ function canonicalJsonValue(source: string): unknown {
   const value = jsonValue(source);
   if (canonicalJson(value) !== source) throw new Error("INTEGRITY_JSON_NONCANONICAL");
   return value;
+}
+
+function storedEventForAuthentication(row: SqliteRow): StoredEvent {
+  const eventSchemaVersion = safeNumber(bigintValue(row, "event_schema_version"));
+  const commandEventIndex = safeNumber(bigintValue(row, "command_event_index"));
+  if (eventSchemaVersion === undefined || commandEventIndex === undefined) {
+    throw new Error("INTEGRITY_ROW_INVALID");
+  }
+  const lifecycleIntentJson = row.lifecycle_intent_json;
+  if (
+    lifecycleIntentJson !== undefined
+    && lifecycleIntentJson !== null
+    && typeof lifecycleIntentJson !== "string"
+  ) {
+    throw new Error("INTEGRITY_ROW_INVALID");
+  }
+  return {
+    globalPosition: bigintValue(row, "global_position"),
+    eventId: stringValue(row, "event_id"),
+    projectId: stringValue(row, "project_id") as StoredEvent["projectId"],
+    vaultId: stringValue(row, "vault_id") as StoredEvent["vaultId"],
+    storeId: stringValue(row, "store_id") as StoredEvent["storeId"],
+    workspaceId: stringValue(row, "workspace_id") as StoredEvent["workspaceId"],
+    branchScopeId: nullableStringValue(row, "branch_scope_id") as StoredEvent["branchScopeId"],
+    branchRef: nullableStringValue(row, "branch_ref"),
+    streamId: stringValue(row, "stream_id"),
+    streamType: stringValue(row, "stream_type"),
+    streamVersion: bigintValue(row, "stream_version"),
+    eventType: stringValue(row, "event_type"),
+    eventSchemaVersion,
+    sessionId: nullableStringValue(row, "session_id"),
+    parentSessionId: nullableStringValue(row, "parent_session_id"),
+    actorRole: stringValue(row, "actor_role") as StoredEvent["actorRole"],
+    agentId: stringValue(row, "agent_id"),
+    clientInstanceId: stringValue(row, "client_instance_id"),
+    correlationId: stringValue(row, "correlation_id"),
+    causationId: nullableStringValue(row, "causation_id"),
+    commandId: stringValue(row, "command_id"),
+    idempotencyKey: stringValue(row, "idempotency_key"),
+    commandEventIndex,
+    occurredAt: stringValue(row, "occurred_at"),
+    recordedAt: stringValue(row, "recorded_at"),
+    visibilityScope: stringValue(row, "visibility_scope") as StoredEvent["visibilityScope"],
+    confidence: stringValue(row, "confidence") as StoredEvent["confidence"],
+    verificationStatus: stringValue(row, "verification_status") as StoredEvent["verificationStatus"],
+    sourceRefs: canonicalJsonValue(stringValue(row, "source_refs_json")) as StoredEvent["sourceRefs"],
+    evidenceRefs: canonicalJsonValue(stringValue(row, "evidence_refs_json")) as StoredEvent["evidenceRefs"],
+    evidenceDigests: canonicalJsonValue(stringValue(row, "evidence_digests_json")) as StoredEvent["evidenceDigests"],
+    payload: Object.freeze({}),
+    payloadJson: stringValue(row, "payload_json"),
+    payloadHash: stringValue(row, "payload_hash"),
+    previousGlobalHash: stringValue(row, "previous_global_hash"),
+    eventHash: stringValue(row, "event_hash"),
+    ...(lifecycleIntentJson === undefined ? {} : { lifecycleIntentJson }),
+  };
 }
 
 function plainRecord(value: unknown): value is Record<string, unknown> {
@@ -1594,23 +1653,28 @@ export class EventIntegrityService {
       const position = bigintValue(row, "global_position");
       const globalPosition = position.toString();
       const streamId = stringValue(row, "stream_id");
-      if (position !== expectedPosition) {
-        issues.add("GLOBAL_POSITION_NONCONTIGUOUS", { globalPosition });
-      }
-      if (
-        expectedPreviousHash === undefined
-        || stringValue(row, "previous_global_hash") !== expectedPreviousHash
-      ) {
-        issues.add("EVENT_PREVIOUS_HASH_MISMATCH", { globalPosition });
-      }
-      let payload: unknown;
       try {
-        payload = canonicalJsonValue(stringValue(row, "payload_json"));
-        if (payloadHash(payload) !== stringValue(row, "payload_hash")) {
-          issues.add("EVENT_PAYLOAD_HASH_MISMATCH", { globalPosition });
+        authenticateStoredEvent(storedEventForAuthentication(row), {
+          expectedPosition,
+          previousEventHash: expectedPreviousHash ?? "",
+        });
+      } catch (error) {
+        if (error instanceof StoredEventAuthenticationError) {
+          if (error.failures.position) {
+            issues.add("GLOBAL_POSITION_NONCONTIGUOUS", { globalPosition });
+          }
+          if (error.failures.predecessor) {
+            issues.add("EVENT_PREVIOUS_HASH_MISMATCH", { globalPosition });
+          }
+          if (error.failures.payload) {
+            issues.add("EVENT_PAYLOAD_HASH_MISMATCH", { globalPosition });
+          }
+          if (error.failures.eventHash) {
+            issues.add("EVENT_HASH_MISMATCH", { globalPosition });
+          }
+        } else {
+          issues.add("EVENT_HASH_MISMATCH", { globalPosition });
         }
-      } catch {
-        issues.add("EVENT_PAYLOAD_HASH_MISMATCH", { globalPosition });
       }
       if (options.verifyTimestamps) {
         if (
@@ -1628,9 +1692,6 @@ export class EventIntegrityService {
         }
         streamVersions.set(streamId, observedVersion);
       }
-      if (!this.matchesEventHash(row)) {
-        issues.add("EVENT_HASH_MISMATCH", { globalPosition });
-      }
       const event = eventIndex(row);
       this.checkEventIdentities(context, [event], issues);
       expectedPosition = position + 1n;
@@ -1640,59 +1701,16 @@ export class EventIntegrityService {
 
   private matchesEventHash(row: SqliteRow): boolean {
     try {
-      const eventSchemaVersion = safeNumber(bigintValue(row, "event_schema_version"));
-      const commandEventIndex = safeNumber(bigintValue(row, "command_event_index"));
-      if (eventSchemaVersion === undefined || commandEventIndex === undefined) return false;
-      const lifecycleIntentSource = row.lifecycle_intent_json;
-      if (
-        lifecycleIntentSource !== undefined
-        && lifecycleIntentSource !== null
-        && typeof lifecycleIntentSource !== "string"
-      ) {
-        return false;
-      }
-      const lifecycleIntent = typeof lifecycleIntentSource === "string"
-        ? decodeLifecycleIntentWitness(lifecycleIntentSource)
-        : undefined;
-      const material = {
-        globalPosition: bigintValue(row, "global_position").toString(),
-        eventId: stringValue(row, "event_id"),
-        projectId: stringValue(row, "project_id"),
-        vaultId: stringValue(row, "vault_id"),
-        storeId: stringValue(row, "store_id"),
-        workspaceId: stringValue(row, "workspace_id"),
-        branchScopeId: nullableStringValue(row, "branch_scope_id"),
-        branchRef: nullableStringValue(row, "branch_ref"),
-        streamId: stringValue(row, "stream_id"),
-        streamType: stringValue(row, "stream_type"),
-        streamVersion: bigintValue(row, "stream_version").toString(),
-        eventType: stringValue(row, "event_type"),
-        eventSchemaVersion,
-        sessionId: nullableStringValue(row, "session_id"),
-        parentSessionId: nullableStringValue(row, "parent_session_id"),
-        actorRole: stringValue(row, "actor_role"),
-        agentId: stringValue(row, "agent_id"),
-        clientInstanceId: stringValue(row, "client_instance_id"),
-        correlationId: stringValue(row, "correlation_id"),
-        causationId: nullableStringValue(row, "causation_id"),
-        commandId: stringValue(row, "command_id"),
-        idempotencyKey: stringValue(row, "idempotency_key"),
-        commandEventIndex,
-        occurredAt: stringValue(row, "occurred_at"),
-        recordedAt: stringValue(row, "recorded_at"),
-        visibilityScope: stringValue(row, "visibility_scope"),
-        confidence: stringValue(row, "confidence"),
-        verificationStatus: stringValue(row, "verification_status"),
-        sourceRefs: canonicalJsonValue(stringValue(row, "source_refs_json")),
-        evidenceRefs: canonicalJsonValue(stringValue(row, "evidence_refs_json")),
-        evidenceDigests: canonicalJsonValue(stringValue(row, "evidence_digests_json")),
-        payloadHash: stringValue(row, "payload_hash"),
-        previousGlobalHash: stringValue(row, "previous_global_hash"),
-        ...(lifecycleIntent === undefined ? {} : { lifecycleIntent }),
-      };
-      return eventHash(material) === stringValue(row, "event_hash");
-    } catch {
-      return false;
+      const event = storedEventForAuthentication(row);
+      authenticateStoredEvent(event, {
+        expectedPosition: event.globalPosition,
+        previousEventHash: event.previousGlobalHash,
+      });
+      return true;
+    } catch (error) {
+      return error instanceof StoredEventAuthenticationError
+        ? !error.failures.eventHash
+        : false;
     }
   }
 
