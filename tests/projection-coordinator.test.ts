@@ -413,6 +413,69 @@ describe("projection build coordinator", () => {
     source.close();
   });
 
+  it("poisons and retains the publication lock when fresh reconciliation cannot verify a final V2 candidate", async () => {
+    const root = mkdtempSync(join(tmpdir(), "projection-v2-fresh-poison-"));
+    roots.push(root);
+    const sourcePath = join(root, "events.sqlite");
+    const projectionDirectory = join(root, "projections");
+    const source = sourceDatabase(sourcePath);
+    append(source, 1);
+    const driver = new NodeSqliteDriver({ DatabaseSync });
+    const coordinator = new V2ProjectionBuildCoordinator({
+      projectionDirectory,
+      eventReader: new SqliteProjectionEventReader({ driver, eventStorePath: sourcePath }),
+      builder: new ImmutableProjectionBuilder({ driver, projectionDirectory, now: () => NOW }),
+    });
+    await coordinator.ensurePublished(BINDING, 1n, 2_000);
+    const uncertain = join(projectionDirectory, "projections-2-2.sqlite");
+    writeFileSync(uncertain, "not a sqlite image", "utf8");
+
+    await assert.rejects(
+      () => coordinator.ensurePublished(BINDING, 1n, 2_000),
+      /PROJECTION_PUBLICATION_RECOVERY_REQUIRED/u,
+    );
+    assert.equal(existsSync(uncertain), true);
+    assert.equal(
+      existsSync(join(projectionDirectory, PROJECTION_MANIFEST_PUBLICATION_LOCK_FILENAME)),
+      true,
+      "uncertain reconciliation must retain the lock as recovery evidence",
+    );
+    source.close();
+  });
+
+  it("reconciles before opening a source snapshot for a non-fresh V2 request", async () => {
+    const root = mkdtempSync(join(tmpdir(), "projection-v2-nonfresh-entry-reconcile-"));
+    roots.push(root);
+    const sourcePath = join(root, "events.sqlite");
+    const projectionDirectory = join(root, "projections");
+    const source = sourceDatabase(sourcePath);
+    append(source, 1);
+    const driver = new NodeSqliteDriver({ DatabaseSync });
+    const published = new V2ProjectionBuildCoordinator({
+      projectionDirectory,
+      eventReader: new SqliteProjectionEventReader({ driver, eventStorePath: sourcePath }),
+      builder: new ImmutableProjectionBuilder({ driver, projectionDirectory, now: () => NOW }),
+    });
+    await published.ensurePublished(BINDING, 1n, 2_000);
+    writeFileSync(join(projectionDirectory, "projections-2-2.sqlite"), "not a sqlite image", "utf8");
+    let sourceOpened = false;
+    const coordinator = new V2ProjectionBuildCoordinator({
+      projectionDirectory,
+      eventReader: { async openCommittedSnapshot() {
+        sourceOpened = true;
+        throw new Error("source must not run");
+      } },
+      builder: { async buildV2() { throw new Error("builder must not run"); } },
+    });
+
+    await assert.rejects(
+      () => coordinator.ensurePublished(BINDING, 2n, 2_000),
+      /PROJECTION_PUBLICATION_RECOVERY_REQUIRED/u,
+    );
+    assert.equal(sourceOpened, false);
+    source.close();
+  });
+
   it("does not reconcile a final V2 generation named by the lease registry", async () => {
     const root = mkdtempSync(join(tmpdir(), "projection-v2-orphan-lease-"));
     roots.push(root);

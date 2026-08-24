@@ -520,6 +520,7 @@ export class V2ProjectionBuildCoordinator {
   readonly #now: () => number;
   readonly #pathInspection: ProjectionPathInspection;
   #directoryIdentity: ProjectionDirectoryIdentity | null = null;
+  #generationFloor = 0;
   readonly #projectTails = new Map<string, Promise<void>>();
 
   constructor(options: V2ProjectionBuildCoordinatorOptions) {
@@ -546,9 +547,9 @@ export class V2ProjectionBuildCoordinator {
     ) throw new TypeError("PROJECTION_REQUEST_INVALID");
     const expiresAt = this.#now() + deadlineMs;
     return this.#serialized(binding.projectId, async () => {
-      const current = this.#loadPublished(binding);
+      const current = this.#reconcileEntry(binding, this.#loadPublished(binding));
       if (current !== null && BigInt(current.manifest.terminalEventPosition) >= requiredEventPosition) {
-        return this.#reconcileFreshPublished(binding, current);
+        return current;
       }
       this.#assertDeadline(expiresAt, requiredEventPosition, current);
       this.#cleanupKnownTemps();
@@ -574,7 +575,6 @@ export class V2ProjectionBuildCoordinator {
                 || !sameProjectionDirectoryIdentity(identity, this.#requiredDirectoryIdentity())
               ) throw new Error("PROJECTION_PATH_INVALID");
               const active = this.#loadPublishedLocked(binding, identity);
-              this.#reconcileUnpublished(active, identity, lockToken, binding);
               const outcome = operations.installGeneration(
                 this.#projectionDirectory,
                 identity,
@@ -690,13 +690,13 @@ export class V2ProjectionBuildCoordinator {
     });
   }
 
-  #reconcileFreshPublished(
+  #reconcileEntry(
     binding: ProjectBinding,
-    current: PublishedProjectionGenerationV2,
-  ): PublishedProjectionGenerationV2 {
-    if (!this.#assertProjectionDirectorySafe()) throw new Error("PROJECTION_PATH_INVALID");
+    current: PublishedProjectionGenerationV2 | null,
+  ): PublishedProjectionGenerationV2 | null {
+    if (!this.#assertProjectionDirectorySafe()) return current;
     const identity = this.#requiredDirectoryIdentity();
-    if (!sameProjectionDirectoryIdentity(identity, current.directoryIdentity)) {
+    if (current !== null && !sameProjectionDirectoryIdentity(identity, current.directoryIdentity)) {
       throw new Error("PROJECTION_PATH_INVALID");
     }
     const lockToken = randomBytes(16).toString("hex");
@@ -704,17 +704,26 @@ export class V2ProjectionBuildCoordinator {
     if (operations.acquireManifestPublicationLock(this.#projectionDirectory, identity, lockToken) !== "acquired") {
       throw new LifecycleError("MATERIALIZATION_CONFLICT");
     }
+    let release = true;
     try {
       const active = this.#loadPublishedLocked(binding, identity);
-      if (active === null) throw new LifecycleError("MATERIALIZATION_CONFLICT");
       this.#reconcileUnpublished(active, identity, lockToken, binding);
       if (!this.#assertProjectionDirectorySafe() || !sameProjectionDirectoryIdentity(
         identity,
         this.#requiredDirectoryIdentity(),
       )) throw new Error("PROJECTION_PATH_INVALID");
       return active;
+    } catch (error) {
+      // Retain the lock as recovery evidence whenever a candidate cannot be
+      // observed and verified well enough to authorize its removal.
+      release = false;
+      throw error;
     } finally {
-      if (operations.releaseManifestPublicationLock(this.#projectionDirectory, identity, lockToken) !== "released") {
+      if (release && operations.releaseManifestPublicationLock(
+        this.#projectionDirectory,
+        identity,
+        lockToken,
+      ) !== "released") {
         throw new LifecycleError("MATERIALIZATION_CONFLICT");
       }
     }
@@ -764,7 +773,9 @@ export class V2ProjectionBuildCoordinator {
     const leased = new Set(this.#leasedFilenames());
     const removed: string[] = [];
     for (const filename of readdirSync(this.#projectionDirectory).sort()) {
-      if (V2_GENERATION_FILE.test(filename) === false) continue;
+      const match = V2_GENERATION_FILE.exec(filename);
+      if (match === null) continue;
+      this.#generationFloor = Math.max(this.#generationFloor, Number(match[1]));
       if (active?.manifest.databaseFile === filename || leased.has(filename)) continue;
       const candidate = filesystemStableProjectionDirectoryOperations.captureGeneration(
         this.#projectionDirectory,
@@ -824,7 +835,7 @@ export class V2ProjectionBuildCoordinator {
   #nextGeneration(): number {
     if (!this.#assertProjectionDirectorySafe()) return 1;
     try {
-      let maximum = 0;
+      let maximum = this.#generationFloor;
       for (const filename of readdirSync(this.#projectionDirectory)) {
         const match = V2_GENERATION_FILE.exec(filename);
         if (match !== null) maximum = Math.max(maximum, Number(match[1]));
