@@ -204,6 +204,8 @@ const fileMatchesArguments = (file, offset) => (
 );
 const transactionNames = (attemptToken) => ({
   previous: ".projection-manifest.previous-" + attemptToken,
+  attempted: ".projection-manifest.attempted-" + attemptToken,
+  displaced: ".projection-manifest.displaced-" + attemptToken,
   failed: ".projection-manifest.failed-" + attemptToken,
 });
 try {
@@ -267,6 +269,8 @@ try {
     assertLock(lockToken);
     const retained = readdirSync(".").some((name) => (
       name.startsWith(".projection-manifest.previous-")
+      || name.startsWith(".projection-manifest.attempted-")
+      || name.startsWith(".projection-manifest.displaced-")
       || name.startsWith(".projection-manifest.failed-")
     ));
     if (retained) process.stdout.write("poisoned");
@@ -276,6 +280,53 @@ try {
       assertDirectory();
       process.stdout.write("released");
     }
+  } else if (operation === "prepare-manifest") {
+    const lockToken = assertToken(operationArguments[0]);
+    const attemptToken = assertToken(operationArguments[1]);
+    const expectedState = operationArguments[2];
+    if (expectedState !== "missing" && expectedState !== "present") invalid();
+    const names = transactionNames(attemptToken);
+    assertLock(lockToken);
+    const candidate = captureFileIdentity(MANIFEST_TEMP_NAME);
+    for (const name of Object.values(names)) {
+      try {
+        lstatSync(name);
+        invalid();
+      } catch (error) {
+        if (!error || error.code !== "ENOENT") throw error;
+      }
+    }
+    if (!linkIfAbsent(MANIFEST_TEMP_NAME, names.attempted)) invalid();
+    const attempted = captureFileIdentity(names.attempted);
+    if (
+      attempted.device !== candidate.device
+      || attempted.inode !== candidate.inode
+      || attempted.size !== candidate.size
+      || attempted.sha256 !== candidate.sha256
+    ) invalid();
+    let outcome = "prepared";
+    if (expectedState === "present") {
+      try {
+        linkSync(MANIFEST_NAME, names.previous);
+      } catch (error) {
+        if (error && error.code === "ENOENT") outcome = "poisoned";
+        else throw error;
+      }
+      if (outcome === "prepared") {
+        const previous = captureFileIdentity(names.previous);
+        if (!fileMatchesArguments(previous, 3)) outcome = "superseded";
+      }
+    } else {
+      try {
+        lstatSync(MANIFEST_NAME);
+        outcome = "superseded";
+      } catch (error) {
+        if (!error || error.code !== "ENOENT") throw error;
+      }
+    }
+    syncDirectory();
+    assertLock(lockToken);
+    process.stdout.write(outcome);
   } else if (operation === "install-manifest") {
     const lockToken = assertToken(operationArguments[0]);
     const attemptToken = assertToken(operationArguments[1]);
@@ -283,8 +334,19 @@ try {
     if (expectedState !== "missing" && expectedState !== "present") invalid();
     const names = transactionNames(attemptToken);
     assertLock(lockToken);
-    captureFileIdentity(MANIFEST_TEMP_NAME);
-    for (const name of [names.previous, names.failed]) {
+    const attempted = captureFileIdentity(names.attempted);
+    if (expectedState === "present") {
+      const previous = captureFileIdentity(names.previous);
+      if (!fileMatchesArguments(previous, 3)) invalid();
+    } else {
+      try {
+        lstatSync(names.previous);
+        invalid();
+      } catch (error) {
+        if (!error || error.code !== "ENOENT") throw error;
+      }
+    }
+    for (const name of [names.displaced, names.failed]) {
       try {
         lstatSync(name);
         invalid();
@@ -293,7 +355,7 @@ try {
       }
     }
     if (expectedState === "missing") {
-      if (!linkIfAbsent(MANIFEST_TEMP_NAME, MANIFEST_NAME)) {
+      if (!linkIfAbsent(names.attempted, MANIFEST_NAME)) {
         process.stdout.write("superseded");
       } else {
         removeRegularFile(MANIFEST_TEMP_NAME);
@@ -304,24 +366,22 @@ try {
     } else {
       let moved = false;
       try {
-        renameSync(MANIFEST_NAME, names.previous);
+        renameSync(MANIFEST_NAME, names.displaced);
         moved = true;
       } catch (error) {
         if (!error || error.code !== "ENOENT") throw error;
       }
-      if (!moved) process.stdout.write("superseded");
+      if (!moved) process.stdout.write("poisoned");
       else {
-        const previous = captureFileIdentity(names.previous);
-        if (!fileMatchesArguments(previous, 3)) {
-          if (!linkIfAbsent(names.previous, MANIFEST_NAME)) {
+        const displaced = captureFileIdentity(names.displaced);
+        if (!fileMatchesArguments(displaced, 3)) {
+          if (!linkIfAbsent(names.displaced, MANIFEST_NAME)) {
             process.stdout.write("poisoned");
           } else {
-            removeRegularFile(names.previous);
             syncDirectory();
             process.stdout.write("superseded");
           }
-        } else if (!linkIfAbsent(MANIFEST_TEMP_NAME, MANIFEST_NAME)) {
-          removeRegularFile(names.previous);
+        } else if (!linkIfAbsent(names.attempted, MANIFEST_NAME)) {
           syncDirectory();
           process.stdout.write("superseded");
         } else {
@@ -339,13 +399,39 @@ try {
     if (previousState !== "missing" && previousState !== "present") invalid();
     const names = transactionNames(attemptToken);
     assertLock(lockToken);
-    if (previousState === "present") removeRegularFile(names.previous);
-    try {
-      lstatSync(names.failed);
-      invalid();
-    } catch (error) {
-      if (!error || error.code !== "ENOENT") throw error;
+    const attemptedSize = operationArguments[7];
+    const attemptedSha256 = operationArguments[8];
+    if (
+      typeof attemptedSize !== "string"
+      || !/^(?:0|[1-9][0-9]*)$/u.test(attemptedSize)
+      || BigInt(attemptedSize) > BigInt(MAX_MANIFEST_BYTES)
+      || typeof attemptedSha256 !== "string"
+      || !/^[0-9a-f]{64}$/u.test(attemptedSha256)
+    ) invalid();
+    const attempted = captureFileIdentity(names.attempted);
+    if (attempted.size !== attemptedSize || attempted.sha256 !== attemptedSha256) invalid();
+    if (previousState === "present") {
+      captureFileIdentity(names.previous);
+    } else {
+      try {
+        lstatSync(names.previous);
+        invalid();
+      } catch (error) {
+        if (!error || error.code !== "ENOENT") throw error;
+      }
     }
+    const retained = [];
+    for (const name of [names.displaced, names.failed]) {
+      try {
+        captureFileIdentity(name);
+        retained.push(name);
+      } catch (error) {
+        if (!error || error.code !== "ENOENT") throw error;
+      }
+    }
+    removeRegularFile(names.attempted);
+    if (previousState === "present") removeRegularFile(names.previous);
+    for (const name of retained) removeRegularFile(name);
     syncDirectory();
     assertLock(lockToken);
     process.stdout.write("committed");
@@ -356,9 +442,22 @@ try {
     if (previousState !== "missing" && previousState !== "present") invalid();
     const names = transactionNames(attemptToken);
     assertLock(lockToken);
+    const attempted = captureFileIdentity(names.attempted);
+    if (!fileMatchesArguments(attempted, 7)) invalid();
     if (previousState === "present") {
       const previous = captureFileIdentity(names.previous);
       if (!fileMatchesArguments(previous, 3)) invalid();
+      const displaced = captureFileIdentity(names.displaced);
+      if (!fileMatchesArguments(displaced, 3)) invalid();
+    } else {
+      for (const name of [names.previous, names.displaced]) {
+        try {
+          lstatSync(name);
+          invalid();
+        } catch (error) {
+          if (!error || error.code !== "ENOENT") throw error;
+        }
+      }
     }
     try {
       lstatSync(names.failed);
@@ -374,23 +473,14 @@ try {
       if (!error || error.code !== "ENOENT") throw error;
     }
     if (!moved) {
-      if (previousState === "present") {
-        const restored = linkIfAbsent(names.previous, MANIFEST_NAME);
-        removeRegularFile(names.previous);
-        syncDirectory();
-        process.stdout.write(restored ? "restored" : "superseded");
-      } else {
-        syncDirectory();
-        process.stdout.write("removed");
-      }
+      syncDirectory();
+      process.stdout.write("poisoned");
     } else {
       const failed = captureFileIdentity(names.failed);
       if (!fileMatchesArguments(failed, 7)) {
         if (!linkIfAbsent(names.failed, MANIFEST_NAME)) {
-          process.stdout.write("poisoned");
+          process.stdout.write("superseded");
         } else {
-          removeRegularFile(names.failed);
-          if (previousState === "present") removeRegularFile(names.previous);
           syncDirectory();
           process.stdout.write("superseded");
         }
@@ -398,7 +488,10 @@ try {
         let outcome;
         if (previousState === "present") {
           outcome = linkIfAbsent(names.previous, MANIFEST_NAME) ? "restored" : "superseded";
-          removeRegularFile(names.previous);
+          if (outcome === "restored") {
+            const restored = captureFileIdentity(MANIFEST_NAME);
+            if (!fileMatchesArguments(restored, 3)) invalid();
+          }
         } else {
           try {
             lstatSync(MANIFEST_NAME);
@@ -408,8 +501,8 @@ try {
             else throw error;
           }
         }
-        removeRegularFile(names.failed);
         syncDirectory();
+        assertLock(lockToken);
         process.stdout.write(outcome);
       }
     }
@@ -429,6 +522,11 @@ export interface ProjectionDirectoryIdentity {
 export interface StableProjectionManifestFileIdentity {
   readonly device: string;
   readonly inode: string;
+  readonly size: string;
+  readonly sha256: string;
+}
+
+export interface StableProjectionManifestContentIdentity {
   readonly size: string;
   readonly sha256: string;
 }
@@ -462,6 +560,13 @@ export interface StableProjectionDirectoryOperations {
     identity: ProjectionDirectoryIdentity,
     lockToken: string,
   ): "acquired" | "busy";
+  prepareManifestPublication(
+    directory: string,
+    identity: ProjectionDirectoryIdentity,
+    lockToken: string,
+    attemptToken: string,
+    expected: StableProjectionManifestSnapshot,
+  ): "prepared" | "superseded" | "poisoned";
   installManifestIfExpected(
     directory: string,
     identity: ProjectionDirectoryIdentity,
@@ -475,6 +580,7 @@ export interface StableProjectionDirectoryOperations {
     lockToken: string,
     attemptToken: string,
     previous: StableProjectionManifestSnapshot,
+    attempted: StableProjectionManifestContentIdentity,
   ): "committed" | "poisoned";
   rollbackManifestPublication(
     directory: string,
@@ -543,6 +649,7 @@ function runStableMutation(
     | "assert-generation"
     | "capture-manifest"
     | "acquire-manifest-lock"
+    | "prepare-manifest"
     | "install-manifest"
     | "commit-manifest"
     | "rollback-manifest"
@@ -681,6 +788,24 @@ StableProjectionDirectoryOperations = Object.freeze({
     if (result !== "acquired" && result !== "busy") return invalid();
     return result;
   },
+  prepareManifestPublication(
+    directory: string,
+    identity: ProjectionDirectoryIdentity,
+    lockToken: string,
+    attemptToken: string,
+    expected: StableProjectionManifestSnapshot,
+  ): "prepared" | "superseded" | "poisoned" {
+    if (!sameProjectionDirectoryIdentity(identity, expected.directoryIdentity)) return invalid();
+    const result = runStableMutation("prepare-manifest", directory, identity, [
+      lockToken,
+      attemptToken,
+      ...snapshotIdentityArguments(expected),
+    ]);
+    if (result !== "prepared" && result !== "superseded" && result !== "poisoned") {
+      return invalid();
+    }
+    return result;
+  },
   installManifestIfExpected(
     directory: string,
     identity: ProjectionDirectoryIdentity,
@@ -705,12 +830,20 @@ StableProjectionDirectoryOperations = Object.freeze({
     lockToken: string,
     attemptToken: string,
     previous: StableProjectionManifestSnapshot,
+    attempted: StableProjectionManifestContentIdentity,
   ): "committed" | "poisoned" {
-    if (!sameProjectionDirectoryIdentity(identity, previous.directoryIdentity)) return invalid();
+    if (
+      !sameProjectionDirectoryIdentity(identity, previous.directoryIdentity)
+      || !decimal(attempted.size)
+      || BigInt(attempted.size) > BigInt(MAX_STABLE_MANIFEST_BYTES)
+      || !/^[0-9a-f]{64}$/u.test(attempted.sha256)
+    ) return invalid();
     const result = runStableMutation("commit-manifest", directory, identity, [
       lockToken,
       attemptToken,
-      previous.state,
+      ...snapshotIdentityArguments(previous),
+      attempted.size,
+      attempted.sha256,
     ]);
     if (result !== "committed" && result !== "poisoned") return invalid();
     return result;

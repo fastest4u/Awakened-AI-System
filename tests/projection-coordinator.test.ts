@@ -515,6 +515,12 @@ describe("projection build coordinator", () => {
       JSON.parse(readFileSync(join(projectionDirectory, name), "utf8")),
       BINDING,
     ).generation);
+    const attemptedHoldGenerations = readdirSync(projectionDirectory)
+      .filter((name) => /^\.projection-manifest\.attempted-[0-9a-f]{32}$/u.test(name))
+      .map((name) => parseProjectionManifest(
+        JSON.parse(readFileSync(join(projectionDirectory, name), "utf8")),
+        BINDING,
+      ).generation);
     const lockPath = join(projectionDirectory, PROJECTION_MANIFEST_PUBLICATION_LOCK_FILENAME);
     const lockToken = existsSync(lockPath) ? readFileSync(lockPath, "utf8") : null;
     let readerFailureCode: string | null = null;
@@ -528,6 +534,7 @@ describe("projection build coordinator", () => {
     const lockTokenAfterReader = existsSync(lockPath) ? readFileSync(lockPath, "utf8") : null;
 
     assert.deepEqual({
+      attemptedHoldGenerations,
       manifestGeneration,
       priorHoldGenerations,
       lockRetained: typeof lockToken === "string" && /^[0-9a-f]{32}$/u.test(lockToken),
@@ -536,6 +543,7 @@ describe("projection build coordinator", () => {
         === "post-install observation ambiguity",
       readerFailureCode,
     }, {
+      attemptedHoldGenerations: [2],
       manifestGeneration: 2,
       priorHoldGenerations: [1],
       lockRetained: true,

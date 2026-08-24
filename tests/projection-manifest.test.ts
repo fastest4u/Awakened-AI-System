@@ -120,6 +120,29 @@ function publishedGeneration(target: string): number {
   return parseProjectionManifest(JSON.parse(readFileSync(target, "utf8")), BINDING).generation;
 }
 
+function publicationEvidenceGenerations(
+  root: string,
+  kind: "attempted" | "failed" | "previous",
+): readonly number[] {
+  const pattern = new RegExp(`^\\.projection-manifest\\.${kind}-[0-9a-f]{32}$`, "u");
+  return readdirSync(root)
+    .filter((name) => pattern.test(name))
+    .map((name) => publishedGeneration(join(root, name)))
+    .sort((left, right) => left - right);
+}
+
+function publicationLockRetained(root: string): boolean {
+  const lockPath = join(root, PROJECTION_MANIFEST_PUBLICATION_LOCK_FILENAME);
+  return existsSync(lockPath)
+    && /^[0-9a-f]{32}$/u.test(readFileSync(lockPath, "utf8"));
+}
+
+function publicationPrivateEntries(root: string): readonly string[] {
+  return readdirSync(root).filter((name) => (
+    /^\.projection-manifest\.(?:attempted|displaced|failed|previous)-[0-9a-f]{32}$/u.test(name)
+  ));
+}
+
 function manifest(overrides: Readonly<Record<string, unknown>> = {}): Record<string, unknown> {
   return {
     schemaVersion: 1,
@@ -139,6 +162,33 @@ function manifest(overrides: Readonly<Record<string, unknown>> = {}): Record<str
     createdAt: "2026-08-23T02:00:00.000Z",
     ...overrides,
   };
+}
+
+function projectionManifest(generation: number) {
+  return parseProjectionManifest(manifest({
+    generation,
+    databaseFile: `projections-1-${generation}.sqlite`,
+    terminalEventPosition: String(15 + generation),
+  }), BINDING);
+}
+
+function replacementFixture(prefix: string, publishFirst = true) {
+  const root = mkdtempSync(join(tmpdir(), prefix));
+  roots.push(root);
+  const first = projectionManifest(1);
+  const second = projectionManifest(2);
+  for (const candidate of [first, second]) {
+    writeFileSync(join(root, candidate.databaseFile), `generation ${candidate.generation}`, "utf8");
+  }
+  const target = join(root, "projection-manifest.json");
+  if (publishFirst) {
+    publishProjectionManifest({
+      projectionDirectory: root,
+      manifest: first,
+      expectedBinding: BINDING,
+    });
+  }
+  return { first, root, second, target } as const;
 }
 
 afterEach(() => {
@@ -269,6 +319,8 @@ describe("immutable projection manifest", () => {
     assert.equal(target, join(root, "projection-manifest.json"));
     assert.equal(readFileSync(target, "utf8"), expected);
     assert.equal(lstatSync(target).isSymbolicLink(), false);
+    assert.equal(existsSync(join(root, PROJECTION_MANIFEST_PUBLICATION_LOCK_FILENAME)), false);
+    assert.deepEqual(publicationPrivateEntries(root), []);
 
     const outside = mkdtempSync(join(tmpdir(), "projection-manifest-outside-"));
     roots.push(outside);
@@ -589,6 +641,408 @@ describe("immutable projection manifest", () => {
     );
   });
 
+  it("poisons a rollback observation that reports missing after validated installation", () => {
+    const { root, second, target } = replacementFixture(
+      "projection-manifest-rollback-missing-",
+    );
+    let captures = 0;
+    let failure: unknown;
+
+    try {
+      publishProjectionManifest({
+        projectionDirectory: root,
+        manifest: second,
+        expectedBinding: BINDING,
+      }, {
+        directoryOperations: {
+          ...filesystemStableProjectionDirectoryOperations,
+          captureManifest(directory, identity): StableProjectionManifestSnapshot {
+            captures += 1;
+            if (captures === 4) {
+              return Object.freeze({ state: "missing", directoryIdentity: identity });
+            }
+            return filesystemStableProjectionDirectoryOperations.captureManifest(directory, identity);
+          },
+        },
+        faultInjector: {
+          hit(boundary): void {
+            if (boundary === "after-manifest-replace-before-validation") {
+              writeFileSync(`${join(root, second.databaseFile)}-wal`, "rollback missing", "utf8");
+            }
+          },
+        },
+      });
+    } catch (error) {
+      failure = error;
+    }
+
+    assert.deepEqual({
+      attempted: publicationEvidenceGenerations(root, "attempted"),
+      code: failure instanceof LifecycleError ? failure.code : null,
+      lockRetained: publicationLockRetained(root),
+      manifestGeneration: publishedGeneration(target),
+      previous: publicationEvidenceGenerations(root, "previous"),
+    }, {
+      attempted: [2],
+      code: "MATERIALIZATION_CONFLICT",
+      lockRetained: true,
+      manifestGeneration: 2,
+      previous: [1],
+    });
+  });
+
+  for (const finalObservation of ["missing", "error"] as const) {
+    it(`poisons a final commit observation that reports ${finalObservation}`, () => {
+      const { root, second, target } = replacementFixture(
+        `projection-manifest-final-${finalObservation}-`,
+      );
+      let captures = 0;
+      let failure: unknown;
+
+      try {
+        publishProjectionManifest({
+          projectionDirectory: root,
+          manifest: second,
+          expectedBinding: BINDING,
+        }, {
+          directoryOperations: {
+            ...filesystemStableProjectionDirectoryOperations,
+            captureManifest(directory, identity): StableProjectionManifestSnapshot {
+              captures += 1;
+              if (captures === 4) {
+                if (finalObservation === "missing") {
+                  return Object.freeze({ state: "missing", directoryIdentity: identity });
+                }
+                throw Object.assign(new Error("injected final observation denial"), {
+                  code: "EACCES",
+                });
+              }
+              return filesystemStableProjectionDirectoryOperations.captureManifest(directory, identity);
+            },
+          },
+        });
+      } catch (error) {
+        failure = error;
+      }
+
+      assert.deepEqual({
+        attempted: publicationEvidenceGenerations(root, "attempted"),
+        code: failure instanceof LifecycleError ? failure.code : null,
+        lockRetained: publicationLockRetained(root),
+        manifestGeneration: publishedGeneration(target),
+        previous: publicationEvidenceGenerations(root, "previous"),
+      }, {
+        attempted: [2],
+        code: "MATERIALIZATION_CONFLICT",
+        lockRetained: true,
+        manifestGeneration: 2,
+        previous: [1],
+      });
+    });
+  }
+
+  it("poisons when an expected-present target disappears during installation", () => {
+    const { root, second, target } = replacementFixture(
+      "projection-manifest-install-missing-",
+    );
+    let targetRemoved = false;
+    let failure: unknown;
+
+    try {
+      publishProjectionManifest({
+        projectionDirectory: root,
+        manifest: second,
+        expectedBinding: BINDING,
+      }, {
+        directoryOperations: {
+          ...filesystemStableProjectionDirectoryOperations,
+          installManifestIfExpected(directory, identity, lockToken, attemptToken, expected) {
+            rmSync(target);
+            targetRemoved = true;
+            return filesystemStableProjectionDirectoryOperations.installManifestIfExpected(
+              directory,
+              identity,
+              lockToken,
+              attemptToken,
+              expected,
+            );
+          },
+        },
+      });
+    } catch (error) {
+      failure = error;
+    }
+
+    assert.deepEqual({
+      attempted: publicationEvidenceGenerations(root, "attempted"),
+      code: failure instanceof LifecycleError ? failure.code : null,
+      lockRetained: publicationLockRetained(root),
+      previous: publicationEvidenceGenerations(root, "previous"),
+      targetPresent: existsSync(target),
+      targetRemoved,
+    }, {
+      attempted: [2],
+      code: "MATERIALIZATION_CONFLICT",
+      lockRetained: true,
+      previous: [1],
+      targetPresent: false,
+      targetRemoved: true,
+    });
+  });
+
+  for (const priorAuthority of ["present", "missing"] as const) {
+    it(`poisons a throwing rollback capture with prior authority ${priorAuthority}`, () => {
+      const { root, second, target } = replacementFixture(
+        `projection-manifest-rollback-error-${priorAuthority}-`,
+        priorAuthority === "present",
+      );
+      let captures = 0;
+      let failure: unknown;
+
+      try {
+        publishProjectionManifest({
+          projectionDirectory: root,
+          manifest: second,
+          expectedBinding: BINDING,
+        }, {
+          directoryOperations: {
+            ...filesystemStableProjectionDirectoryOperations,
+            captureManifest(directory, identity): StableProjectionManifestSnapshot {
+              captures += 1;
+              if (captures === 4) {
+                throw Object.assign(new Error("injected rollback capture denial"), {
+                  code: "EACCES",
+                });
+              }
+              return filesystemStableProjectionDirectoryOperations.captureManifest(directory, identity);
+            },
+          },
+          faultInjector: {
+            hit(boundary): void {
+              if (boundary === "after-manifest-replace-before-validation") {
+                writeFileSync(`${join(root, second.databaseFile)}-wal`, "rollback capture error", "utf8");
+              }
+            },
+          },
+        });
+      } catch (error) {
+        failure = error;
+      }
+
+      assert.deepEqual({
+        attempted: publicationEvidenceGenerations(root, "attempted"),
+        code: failure instanceof LifecycleError ? failure.code : null,
+        lockRetained: publicationLockRetained(root),
+        manifestGeneration: publishedGeneration(target),
+        previous: publicationEvidenceGenerations(root, "previous"),
+      }, {
+        attempted: [2],
+        code: "MATERIALIZATION_CONFLICT",
+        lockRetained: true,
+        manifestGeneration: 2,
+        previous: priorAuthority === "present" ? [1] : [],
+      });
+    });
+  }
+
+  it("poisons a malformed present observation instead of treating it as authority", () => {
+    const { root, second, target } = replacementFixture(
+      "projection-manifest-malformed-authority-",
+    );
+    const malformed = Buffer.from("not a projection manifest\n", "utf8");
+    let installed = false;
+    let malformedReported = false;
+    let failure: unknown;
+
+    try {
+      publishProjectionManifest({
+        projectionDirectory: root,
+        manifest: second,
+        expectedBinding: BINDING,
+      }, {
+        directoryOperations: {
+          ...filesystemStableProjectionDirectoryOperations,
+          installManifestIfExpected(directory, identity, lockToken, attemptToken, expected) {
+            const result = filesystemStableProjectionDirectoryOperations.installManifestIfExpected(
+              directory,
+              identity,
+              lockToken,
+              attemptToken,
+              expected,
+            );
+            installed = result === "installed";
+            return result;
+          },
+          captureManifest(directory, identity): StableProjectionManifestSnapshot {
+            if (installed && !malformedReported) {
+              malformedReported = true;
+              return Object.freeze({
+                state: "present",
+                directoryIdentity: identity,
+                fileIdentity: Object.freeze({
+                  device: "1",
+                  inode: "1",
+                  size: String(malformed.byteLength),
+                  sha256: createHash("sha256").update(malformed).digest("hex"),
+                }),
+                bytesBase64: malformed.toString("base64"),
+              });
+            }
+            return filesystemStableProjectionDirectoryOperations.captureManifest(directory, identity);
+          },
+        },
+      });
+    } catch (error) {
+      failure = error;
+    }
+
+    assert.deepEqual({
+      attempted: publicationEvidenceGenerations(root, "attempted"),
+      code: failure instanceof LifecycleError ? failure.code : null,
+      lockRetained: publicationLockRetained(root),
+      malformedReported,
+      manifestGeneration: publishedGeneration(target),
+      previous: publicationEvidenceGenerations(root, "previous"),
+    }, {
+      attempted: [2],
+      code: "MATERIALIZATION_CONFLICT",
+      lockRetained: true,
+      malformedReported: true,
+      manifestGeneration: 2,
+      previous: [1],
+    });
+  });
+
+  it("poisons a present different authority whose generation has a sidecar", () => {
+    const { root, second, target } = replacementFixture(
+      "projection-manifest-sidecar-authority-",
+    );
+    const third = projectionManifest(3);
+    writeFileSync(join(root, third.databaseFile), "generation 3", "utf8");
+    const external = join(root, "external-generation-3-sidecar.json");
+    writeFileSync(external, serializeProjectionManifest(third));
+    let injected = false;
+    let failure: unknown;
+
+    try {
+      publishProjectionManifest({
+        projectionDirectory: root,
+        manifest: second,
+        expectedBinding: BINDING,
+      }, {
+        directoryOperations: {
+          ...filesystemStableProjectionDirectoryOperations,
+          installManifestIfExpected(directory, identity, lockToken, attemptToken, expected) {
+            const result = filesystemStableProjectionDirectoryOperations.installManifestIfExpected(
+              directory,
+              identity,
+              lockToken,
+              attemptToken,
+              expected,
+            );
+            if (result === "installed") {
+              renameSync(external, target);
+              writeFileSync(`${join(root, third.databaseFile)}-wal`, "unverified authority", "utf8");
+              injected = true;
+            }
+            return result;
+          },
+        },
+      });
+    } catch (error) {
+      failure = error;
+    }
+
+    assert.deepEqual({
+      attempted: publicationEvidenceGenerations(root, "attempted"),
+      code: failure instanceof LifecycleError ? failure.code : null,
+      injected,
+      lockRetained: publicationLockRetained(root),
+      manifestGeneration: publishedGeneration(target),
+      previous: publicationEvidenceGenerations(root, "previous"),
+    }, {
+      attempted: [2],
+      code: "MATERIALIZATION_CONFLICT",
+      injected: true,
+      lockRetained: true,
+      manifestGeneration: 3,
+      previous: [1],
+    });
+  });
+
+  it("poisons an identity-changing different-authority verification", () => {
+    const { root, second, target } = replacementFixture(
+      "projection-manifest-changing-authority-",
+    );
+    const third = projectionManifest(3);
+    const fourth = projectionManifest(4);
+    for (const candidate of [third, fourth]) {
+      writeFileSync(join(root, candidate.databaseFile), `generation ${candidate.generation}`, "utf8");
+    }
+    const externalThird = join(root, "external-generation-3-changing.json");
+    const externalFourth = join(root, "external-generation-4-changing.json");
+    writeFileSync(externalThird, serializeProjectionManifest(third));
+    writeFileSync(externalFourth, serializeProjectionManifest(fourth));
+    let installed = false;
+    let changed = false;
+    let failure: unknown;
+
+    try {
+      publishProjectionManifest({
+        projectionDirectory: root,
+        manifest: second,
+        expectedBinding: BINDING,
+      }, {
+        directoryOperations: {
+          ...filesystemStableProjectionDirectoryOperations,
+          installManifestIfExpected(directory, identity, lockToken, attemptToken, expected) {
+            const result = filesystemStableProjectionDirectoryOperations.installManifestIfExpected(
+              directory,
+              identity,
+              lockToken,
+              attemptToken,
+              expected,
+            );
+            if (result === "installed") {
+              renameSync(externalThird, target);
+              installed = true;
+            }
+            return result;
+          },
+          captureManifest(directory, identity): StableProjectionManifestSnapshot {
+            const snapshot = filesystemStableProjectionDirectoryOperations.captureManifest(
+              directory,
+              identity,
+            );
+            if (installed && !changed) {
+              renameSync(externalFourth, target);
+              changed = true;
+            }
+            return snapshot;
+          },
+        },
+      });
+    } catch (error) {
+      failure = error;
+    }
+
+    assert.deepEqual({
+      attempted: publicationEvidenceGenerations(root, "attempted"),
+      changed,
+      code: failure instanceof LifecycleError ? failure.code : null,
+      lockRetained: publicationLockRetained(root),
+      manifestGeneration: publishedGeneration(target),
+      previous: publicationEvidenceGenerations(root, "previous"),
+    }, {
+      attempted: [2],
+      changed: true,
+      code: "MATERIALIZATION_CONFLICT",
+      lockRetained: true,
+      manifestGeneration: 4,
+      previous: [1],
+    });
+  });
+
   it("does not restore stale authority when a nested publish starts at rollback entry", () => {
     const root = mkdtempSync(join(tmpdir(), "projection-manifest-rollback-entry-"));
     roots.push(root);
@@ -721,6 +1175,8 @@ describe("immutable projection manifest", () => {
     );
     assert.equal(injected, true);
     assert.equal(publishedGeneration(target), 3);
+    assert.equal(existsSync(join(root, PROJECTION_MANIFEST_PUBLICATION_LOCK_FILENAME)), false);
+    assert.deepEqual(publicationPrivateEntries(root), []);
   });
 
   it("does not overwrite external authority installed after the final rollback snapshot", () => {
@@ -784,6 +1240,8 @@ describe("immutable projection manifest", () => {
     );
     assert.equal(injected, true);
     assert.equal(publishedGeneration(target), 3);
+    assert.equal(existsSync(join(root, PROJECTION_MANIFEST_PUBLICATION_LOCK_FILENAME)), false);
+    assert.deepEqual(publicationPrivateEntries(root), []);
   });
 
   it("restores prior authority after a nested publication attempt fails before replacement", () => {
