@@ -115,6 +115,7 @@ function normalizedPath(path: string): string {
 
 interface DeadlineState {
   expired: boolean;
+  activeSnapshot: ProjectionEventSnapshot | null;
 }
 
 export class DefaultProjectionBuildCoordinator implements ProjectionBuildCoordinator {
@@ -155,7 +156,7 @@ export class DefaultProjectionBuildCoordinator implements ProjectionBuildCoordin
       || deadlineMs < 0
     ) throw new TypeError("PROJECTION_REQUEST_INVALID");
     const expiresAt = this.#now() + deadlineMs;
-    const deadline: DeadlineState = { expired: deadlineMs === 0 };
+    const deadline: DeadlineState = { expired: deadlineMs === 0, activeSnapshot: null };
     let available = 0n;
     const work = this.#serialized(binding.projectId, async () => {
       while (true) {
@@ -170,6 +171,7 @@ export class DefaultProjectionBuildCoordinator implements ProjectionBuildCoordin
         this.#cleanupKnownTemps();
         this.#assertBeforeDeadline(deadline, expiresAt, requiredEventPosition, available);
         const snapshot = await this.#eventReader.openCommittedSnapshot(binding);
+        deadline.activeSnapshot = snapshot;
         try {
           this.#assertBeforeDeadline(deadline, expiresAt, requiredEventPosition, available);
           if (snapshot.terminalEventPosition < available) {
@@ -209,6 +211,7 @@ export class DefaultProjectionBuildCoordinator implements ProjectionBuildCoordin
             if (available >= requiredEventPosition) return published;
           }
         } finally {
+          if (deadline.activeSnapshot === snapshot) deadline.activeSnapshot = null;
           snapshot.close();
         }
 
@@ -412,6 +415,7 @@ export class DefaultProjectionBuildCoordinator implements ProjectionBuildCoordin
   ): void {
     if (state.expired || this.#now() >= expiresAt) {
       state.expired = true;
+      try { state.activeSnapshot?.close(); } catch { /* deadline failure remains authoritative */ }
       throw new ProjectionLagError(requiredEventPosition, availableEventPosition);
     }
   }
@@ -427,6 +431,7 @@ export class DefaultProjectionBuildCoordinator implements ProjectionBuildCoordin
       let settled = false;
       const timer = setTimeout(() => {
         state.expired = true;
+        try { state.activeSnapshot?.close(); } catch { /* deadline failure remains authoritative */ }
         if (settled) return;
         settled = true;
         rejectResult(lag());

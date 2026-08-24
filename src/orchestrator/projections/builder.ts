@@ -449,7 +449,7 @@ function verifyStructure(
 
 function fold(snapshot: ProjectionEventSnapshot): ProjectionFoldState {
   let state = emptyProjectionFoldState();
-  for (const source of snapshot.events) {
+  for (const source of snapshot.events()) {
     const decoded = decodeProjectionEvent(source);
     if (decoded.kind === "projected") state = foldProjectionEvent(state, decoded.event);
   }

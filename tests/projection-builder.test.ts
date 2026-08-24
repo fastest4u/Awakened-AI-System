@@ -5,8 +5,8 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, it } from "node:test";
 
-import type { JsonValue } from "../src/orchestrator/contracts/event.js";
-import { payloadHash } from "../src/orchestrator/crypto/event-hash.js";
+import type { JsonValue, StoredEvent } from "../src/orchestrator/contracts/event.js";
+import { eventHash, payloadHash } from "../src/orchestrator/crypto/event-hash.js";
 import type {
   BranchScopeId,
   ProjectId,
@@ -16,14 +16,21 @@ import type {
 } from "../src/orchestrator/identity/contracts.js";
 import type { ProjectBinding } from "../src/orchestrator/projections/contracts.js";
 import { ImmutableProjectionBuilder } from "../src/orchestrator/projections/builder.js";
-import { SqliteProjectionEventReader } from "../src/orchestrator/projections/event-reader.js";
+import {
+  SqliteProjectionEventReader,
+  type ProjectionEventSnapshot,
+} from "../src/orchestrator/projections/event-reader.js";
 import { PROJECT_MEMORY_APPLICATION_ID } from "../src/orchestrator/runtime/runtime-capabilities.js";
 import { canonicalJson } from "../src/orchestrator/serialization/canonical-json.js";
 import { NodeSqliteDriver } from "../src/orchestrator/storage/node-sqlite-driver.js";
+import { GENESIS_GLOBAL_HASH } from "../src/orchestrator/storage/event-store.js";
 import type {
   SqliteConnection,
   SqliteDriver,
   SqliteOpenOptions,
+  SqliteParams,
+  SqliteRow,
+  SqliteStatement,
 } from "../src/orchestrator/storage/sqlite-driver.js";
 
 const PROJECT_ID = "1".repeat(64) as ProjectId;
@@ -134,6 +141,46 @@ function insertEvent(
   const eventId = `00000000-0000-4000-8000-${String(position).padStart(12, "0")}`;
   const commandId = `00000000-0000-4000-9000-${String(position).padStart(12, "0")}`;
   const payloadJson = canonicalJson(payload);
+  const hashedPayload = payloadHash(payload);
+  const previousGlobalHash = position === 1
+    ? GENESIS_GLOBAL_HASH
+    : database.prepare("SELECT event_hash FROM events WHERE global_position = ?").get(position - 1)?.event_hash;
+  if (typeof previousGlobalHash !== "string") throw new Error("missing predecessor fixture hash");
+  const hashMaterial = {
+    globalPosition: String(position),
+    eventId,
+    projectId: PROJECT_ID,
+    vaultId: VAULT_ID,
+    storeId: STORE_ID,
+    workspaceId: WORKSPACE_ID,
+    branchScopeId: BRANCH_SCOPE_ID,
+    branchRef: BRANCH_REF,
+    streamId: `session/${SESSION_ID}`,
+    streamType: "session",
+    streamVersion: String(position),
+    eventType,
+    eventSchemaVersion: 1,
+    sessionId: SESSION_ID,
+    parentSessionId: null,
+    actorRole: "primary",
+    agentId: "builder-test",
+    clientInstanceId: "builder-client",
+    correlationId: `00000000-0000-4000-a000-${String(position).padStart(12, "0")}`,
+    causationId: null,
+    commandId,
+    idempotencyKey: `builder/${position}`,
+    commandEventIndex: 0,
+    occurredAt: NOW,
+    recordedAt: NOW,
+    visibilityScope: "session",
+    confidence: "high",
+    verificationStatus: "verified",
+    sourceRefs: [],
+    evidenceRefs: [],
+    evidenceDigests: [],
+    payloadHash: hashedPayload,
+    previousGlobalHash,
+  };
   database.prepare(`
     INSERT INTO events VALUES (
       ?, ?, ?, ?, ?, ?, ?, ?, ?, 'session', ?, ?, 1, ?, NULL,
@@ -159,10 +206,129 @@ function insertEvent(
     NOW,
     NOW,
     payloadJson,
-    payloadHash(payload),
-    position === 1 ? "0".repeat(64) : String(position - 1).repeat(64).slice(0, 64),
-    String(position).repeat(64).slice(0, 64),
+    hashedPayload,
+    previousGlobalHash,
+    eventHash(hashMaterial),
   );
+}
+
+type StreamingSnapshot = Omit<ProjectionEventSnapshot, "events"> & {
+  readonly eventCount: number;
+  readonly aggregateBytes: number;
+  events(): Iterable<StoredEvent>;
+};
+
+function streamingSnapshot(snapshot: ProjectionEventSnapshot): StreamingSnapshot {
+  return snapshot as unknown as StreamingSnapshot;
+}
+
+function inertStatement(options: {
+  readonly get?: () => SqliteRow | undefined;
+  readonly all?: () => SqliteRow[];
+  readonly iterate?: () => IterableIterator<SqliteRow>;
+}): SqliteStatement {
+  return {
+    run(): { changes: bigint; lastInsertRowid: bigint } {
+      throw new Error("unexpected run");
+    },
+    get(): SqliteRow | undefined {
+      return options.get?.();
+    },
+    all(): SqliteRow[] {
+      return options.all?.() ?? [];
+    },
+    iterate(): IterableIterator<SqliteRow> {
+      return options.iterate?.() ?? [][Symbol.iterator]();
+    },
+  };
+}
+
+function readerForPreflight(bounds: {
+  readonly eventCount: number;
+  readonly aggregateBytes: number;
+}): Readonly<{
+  reader: SqliteProjectionEventReader;
+  observations: { fullRowReads: number; closes: number; rollbacks: number };
+}> {
+  const observations = { fullRowReads: 0, closes: 0, rollbacks: 0 };
+  const driver: SqliteDriver = {
+    open(): SqliteConnection {
+      return {
+        exec(sql): void {
+          if (sql.trim().toUpperCase() === "ROLLBACK") observations.rollbacks += 1;
+        },
+        close(): void {
+          observations.closes += 1;
+        },
+        prepare(sql): SqliteStatement {
+          if (sql.includes("FROM project_meta")) {
+            return inertStatement({
+              get: () => ({ project_id: PROJECT_ID, vault_id: VAULT_ID, store_id: STORE_ID }),
+            });
+          }
+          if (sql.includes("ORDER BY global_position DESC")) {
+            return inertStatement({
+              get: () => bounds.eventCount === 0 ? undefined : {
+                global_position: BigInt(bounds.eventCount),
+                event_hash: "a".repeat(64),
+              },
+            });
+          }
+          if (sql.includes("event_count") && sql.includes("aggregate_bytes")) {
+            return inertStatement({
+              get: () => ({
+                event_count: BigInt(bounds.eventCount),
+                maximum_row_bytes: 1n,
+                aggregate_bytes: BigInt(bounds.aggregateBytes),
+              }),
+            });
+          }
+          if (sql.includes("FROM events")) {
+            return inertStatement({
+              all: () => {
+                observations.fullRowReads += 1;
+                return [];
+              },
+              iterate: () => (function* rows(): IterableIterator<SqliteRow> {
+                observations.fullRowReads += 1;
+              })(),
+            });
+          }
+          throw new Error(`unexpected SQL: ${sql}`);
+        },
+      };
+    },
+  };
+  return Object.freeze({
+    reader: new SqliteProjectionEventReader({ driver, eventStorePath: "preflight.sqlite" }),
+    observations,
+  });
+}
+
+function terminalTamperingDriver(): SqliteDriver {
+  const delegate = new NodeSqliteDriver({ DatabaseSync });
+  return {
+    open(path: string, options: SqliteOpenOptions): SqliteConnection {
+      const connection = delegate.open(path, options);
+      return {
+        exec: (sql) => connection.exec(sql),
+        close: () => connection.close(),
+        prepare(sql: string): SqliteStatement {
+          const statement = connection.prepare(sql);
+          if (!sql.includes("ORDER BY global_position DESC")) return statement;
+          return {
+            run: (params?: SqliteParams) => statement.run(params),
+            all: (params?: SqliteParams) => statement.all(params),
+            iterate: (params?: SqliteParams) => statement.iterate(params),
+            get(params?: SqliteParams): SqliteRow | undefined {
+              const row = statement.get(params);
+              return row === undefined ? undefined : { ...row, event_hash: "f".repeat(64) };
+            },
+          };
+        },
+      };
+    },
+  };
 }
 
 class RecordingDriver implements SqliteDriver {
@@ -221,7 +387,9 @@ describe("projection generation builder", () => {
     });
     const snapshot = await reader.openCommittedSnapshot(BINDING);
     assert.equal(snapshot.terminalEventPosition, 8n);
-    assert.equal(snapshot.events.length, 8);
+    assert.equal(streamingSnapshot(snapshot).eventCount, 8);
+    assert.ok(streamingSnapshot(snapshot).aggregateBytes > 0);
+    const expectedTerminalHash = snapshot.terminalEventHash;
 
     const builder = new ImmutableProjectionBuilder({
       driver,
@@ -279,7 +447,7 @@ describe("projection generation builder", () => {
       `).get() },
       {
         terminal_event_position: 8,
-        terminal_event_hash: "8".repeat(64),
+        terminal_event_hash: expectedTerminalHash,
         session_id: null,
       },
     );
@@ -307,6 +475,93 @@ describe("projection generation builder", () => {
         [join(projectionDirectory, ".projections-1-1.sqlite.tmp"), "create"],
       ],
     );
+  });
+
+  it("rejects an over-limit prefix before reading a full event row", async () => {
+    const fixture = readerForPreflight({ eventCount: 100_001, aggregateBytes: 1 });
+
+    await assert.rejects(
+      () => fixture.reader.openCommittedSnapshot(BINDING),
+      /INTEGRITY_FAILURE/u,
+    );
+    assert.equal(fixture.observations.fullRowReads, 0);
+    assert.equal(fixture.observations.rollbacks, 1);
+    assert.equal(fixture.observations.closes, 1);
+  });
+
+  it("rejects aggregate full-row byte overflow before reading a full event row", async () => {
+    const fixture = readerForPreflight({
+      eventCount: 1,
+      aggregateBytes: (64 * 1024 * 1024) + 1,
+    });
+
+    await assert.rejects(
+      () => fixture.reader.openCommittedSnapshot(BINDING),
+      /INTEGRITY_FAILURE/u,
+    );
+    assert.equal(fixture.observations.fullRowReads, 0);
+    assert.equal(fixture.observations.closes, 1);
+  });
+
+  it("streams authenticated events in ascending order exactly once", async () => {
+    const root = mkdtempSync(join(tmpdir(), "projection-streaming-reader-"));
+    roots.push(root);
+    const sourcePath = join(root, "events.sqlite");
+    const source = createSource(sourcePath);
+    for (let position = 1; position <= 3; position += 1) insertEvent(source, position);
+    const snapshot = streamingSnapshot(await new SqliteProjectionEventReader({
+      driver: new NodeSqliteDriver({ DatabaseSync }),
+      eventStorePath: sourcePath,
+    }).openCommittedSnapshot(BINDING));
+
+    assert.equal(snapshot.eventCount, 3);
+    assert.deepEqual(
+      [...snapshot.events()].map((event) => event.globalPosition),
+      [1n, 2n, 3n],
+    );
+    assert.throws(() => snapshot.events(), /INTEGRITY_FAILURE/u);
+    snapshot.close();
+    source.close();
+  });
+
+  it("rejects metadata tamper before a projection event is folded", async () => {
+    const root = mkdtempSync(join(tmpdir(), "projection-source-metadata-tamper-"));
+    roots.push(root);
+    const sourcePath = join(root, "events.sqlite");
+    const projectionDirectory = join(root, "projections");
+    const source = createSource(sourcePath);
+    insertEvent(source, 1, "MemorySourceRecorded", memoryPayload());
+    source.prepare("UPDATE events SET agent_id = 'forged-agent' WHERE global_position = 1").run();
+    const snapshot = await new SqliteProjectionEventReader({
+      driver: new NodeSqliteDriver({ DatabaseSync }),
+      eventStorePath: sourcePath,
+    }).openCommittedSnapshot(BINDING);
+    const builder = new ImmutableProjectionBuilder({
+      driver: new NodeSqliteDriver({ DatabaseSync }),
+      projectionDirectory,
+      now: () => NOW,
+    });
+
+    await assert.rejects(() => builder.build(snapshot, 1), /INTEGRITY_FAILURE/u);
+    assert.equal(existsSync(join(projectionDirectory, "projections-1-1.sqlite")), false);
+    snapshot.close();
+    source.close();
+  });
+
+  it("rejects a final authentication cursor that differs from the captured terminal", async () => {
+    const root = mkdtempSync(join(tmpdir(), "projection-terminal-cursor-"));
+    roots.push(root);
+    const sourcePath = join(root, "events.sqlite");
+    const source = createSource(sourcePath);
+    insertEvent(source, 1);
+    const snapshot = streamingSnapshot(await new SqliteProjectionEventReader({
+      driver: terminalTamperingDriver(),
+      eventStorePath: sourcePath,
+    }).openCommittedSnapshot(BINDING));
+
+    assert.throws(() => [...snapshot.events()], /INTEGRITY_FAILURE/u);
+    snapshot.close();
+    source.close();
   });
 
   it("rejects a generation whose persisted rows no longer match its intended core checksums", async () => {

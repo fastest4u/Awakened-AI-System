@@ -449,11 +449,18 @@ describe("local retrieval candidate channels", () => {
     const root = mkdtempSync(join(tmpdir(), "retrieval-builder-scope-"));
     roots.push(root);
     const event = memoryStoredEvent();
+    let streamed = false;
     const snapshot: ProjectionEventSnapshot = Object.freeze({
       binding: BINDING,
-      events: Object.freeze([event]),
+      eventCount: 1,
+      aggregateBytes: Buffer.byteLength(event.payloadJson, "utf8"),
       terminalEventPosition: event.globalPosition,
       terminalEventHash: event.eventHash,
+      events(): Iterable<typeof event> {
+        if (streamed) throw new Error("INTEGRITY_FAILURE");
+        streamed = true;
+        return Object.freeze([event]);
+      },
       close: () => undefined,
     });
     const generation = await new ImmutableProjectionBuilder({
@@ -508,11 +515,21 @@ describe("local retrieval candidate channels", () => {
         conflictGroupId: CONFLICT_GROUP_ID,
       }),
     ]);
+    let streamed = false;
     const snapshot: ProjectionEventSnapshot = Object.freeze({
       binding: BINDING,
-      events,
+      eventCount: events.length,
+      aggregateBytes: events.reduce(
+        (bytes, event) => bytes + Buffer.byteLength(event.payloadJson, "utf8"),
+        0,
+      ),
       terminalEventPosition: 3n,
       terminalEventHash: events[2]!.eventHash,
+      events(): Iterable<(typeof events)[number]> {
+        if (streamed) throw new Error("INTEGRITY_FAILURE");
+        streamed = true;
+        return events;
+      },
       close: () => undefined,
     });
     const generation = await new ImmutableProjectionBuilder({

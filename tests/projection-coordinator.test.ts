@@ -16,7 +16,7 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, it } from "node:test";
 
-import { payloadHash } from "../src/orchestrator/crypto/event-hash.js";
+import { eventHash, payloadHash } from "../src/orchestrator/crypto/event-hash.js";
 import type {
   BranchScopeId,
   ProjectId,
@@ -53,6 +53,7 @@ import {
 import { PROJECT_MEMORY_APPLICATION_ID } from "../src/orchestrator/runtime/runtime-capabilities.js";
 import { canonicalJson } from "../src/orchestrator/serialization/canonical-json.js";
 import { NodeSqliteDriver } from "../src/orchestrator/storage/node-sqlite-driver.js";
+import { GENESIS_GLOBAL_HASH } from "../src/orchestrator/storage/event-store.js";
 
 const PROJECT_ID = "1".repeat(64) as ProjectId;
 const VAULT_ID = "2".repeat(64) as VaultId;
@@ -100,8 +101,63 @@ function sourceDatabase(path: string): DatabaseSync {
   return database;
 }
 
-function append(database: DatabaseSync, position: number): void {
-  const json = canonicalJson({ ignored: position });
+function append(
+  database: DatabaseSync,
+  position: number,
+  scope: Readonly<{
+    workspaceId?: string;
+    branchScopeId?: string | null;
+    branchRef?: string | null;
+  }> = {},
+): void {
+  const workspaceId = scope.workspaceId ?? WORKSPACE_ID;
+  const branchScopeId = scope.branchScopeId === undefined ? BRANCH_SCOPE_ID : scope.branchScopeId;
+  const branchRef = scope.branchRef === undefined ? BRANCH_REF : scope.branchRef;
+  const payload = { ignored: position };
+  const json = canonicalJson(payload);
+  const eventId = `00000000-0000-4000-8000-${String(position).padStart(12, "0")}`;
+  const correlationId = `00000000-0000-4000-a000-${String(position).padStart(12, "0")}`;
+  const commandId = `00000000-0000-4000-9000-${String(position).padStart(12, "0")}`;
+  const hashedPayload = payloadHash(payload);
+  const previousGlobalHash = position === 1
+    ? GENESIS_GLOBAL_HASH
+    : database.prepare("SELECT event_hash FROM events WHERE global_position = ?").get(position - 1)?.event_hash;
+  if (typeof previousGlobalHash !== "string") throw new Error("missing predecessor fixture hash");
+  const hashMaterial = {
+    globalPosition: String(position),
+    eventId,
+    projectId: PROJECT_ID,
+    vaultId: VAULT_ID,
+    storeId: STORE_ID,
+    workspaceId,
+    branchScopeId,
+    branchRef,
+    streamId: "project",
+    streamType: "project",
+    streamVersion: String(position),
+    eventType: "IgnoredEvent",
+    eventSchemaVersion: 1,
+    sessionId: null,
+    parentSessionId: null,
+    actorRole: "primary",
+    agentId: "coordinator-test",
+    clientInstanceId: "coordinator-client",
+    correlationId,
+    causationId: null,
+    commandId,
+    idempotencyKey: `coordinator/${position}`,
+    commandEventIndex: 0,
+    occurredAt: NOW,
+    recordedAt: NOW,
+    visibilityScope: "project",
+    confidence: "high",
+    verificationStatus: "verified",
+    sourceRefs: [],
+    evidenceRefs: [],
+    evidenceDigests: [],
+    payloadHash: hashedPayload,
+    previousGlobalHash,
+  };
   database.prepare(`
     INSERT INTO events VALUES (
       ?, ?, ?, ?, ?, ?, ?, ?, 'project', 'project', ?, 'IgnoredEvent', 1, NULL, NULL,
@@ -110,39 +166,46 @@ function append(database: DatabaseSync, position: number): void {
     )
   `).run(
     position,
-    `00000000-0000-4000-8000-${String(position).padStart(12, "0")}`,
+    eventId,
     PROJECT_ID,
     VAULT_ID,
     STORE_ID,
-    WORKSPACE_ID,
-    BRANCH_SCOPE_ID,
-    BRANCH_REF,
+    workspaceId,
+    branchScopeId,
+    branchRef,
     position,
-    `00000000-0000-4000-a000-${String(position).padStart(12, "0")}`,
-    `00000000-0000-4000-9000-${String(position).padStart(12, "0")}`,
+    correlationId,
+    commandId,
     `coordinator/${position}`,
     NOW,
     NOW,
     json,
-    payloadHash({ ignored: position }),
-    position === 1 ? "0".repeat(64) : String(position - 1).repeat(64).slice(0, 64),
-    String(position).repeat(64).slice(0, 64),
+    hashedPayload,
+    previousGlobalHash,
+    eventHash(hashMaterial),
   );
 }
 
 function emptySnapshot(onClose: () => void = () => undefined): ProjectionEventSnapshot {
   let closed = false;
+  let streamed = false;
   return Object.freeze({
     binding: BINDING,
-    events: Object.freeze([]),
+    eventCount: 0,
+    aggregateBytes: 0,
     terminalEventPosition: 0n,
     terminalEventHash: "0".repeat(64),
+    events(): Iterable<never> {
+      if (streamed) throw new Error("INTEGRITY_FAILURE");
+      streamed = true;
+      return Object.freeze([]);
+    },
     close(): void {
       if (closed) return;
       closed = true;
       onClose();
     },
-  });
+  }) as unknown as ProjectionEventSnapshot;
 }
 
 function denyingSidecarInspection(isArmed: () => boolean): ProjectionPathInspection {
@@ -283,6 +346,44 @@ describe("projection build coordinator", () => {
         && error.availableEventPosition === 10n,
     );
     assert.equal(existsSync(unrelatedTemp), true);
+    source.close();
+  });
+
+  it("rejects a forged chain hash outside the requested projection binding", async () => {
+    const root = mkdtempSync(join(tmpdir(), "projection-cross-scope-chain-"));
+    roots.push(root);
+    const sourcePath = join(root, "events.sqlite");
+    const projectionDirectory = join(root, "projections");
+    const source = sourceDatabase(sourcePath);
+    append(source, 1, {
+      workspaceId: "5".repeat(64),
+      branchScopeId: null,
+      branchRef: null,
+    });
+    append(source, 2);
+    const driver = new NodeSqliteDriver({ DatabaseSync });
+    const eventReader = new SqliteProjectionEventReader({ driver, eventStorePath: sourcePath });
+    const validSnapshot = await eventReader.openCommittedSnapshot(BINDING);
+    assert.equal(validSnapshot.eventCount, 2);
+    assert.deepEqual(
+      [...validSnapshot.events()].map((event) => event.globalPosition),
+      [2n],
+    );
+    validSnapshot.close();
+    source.prepare(`
+      UPDATE events SET event_hash = ? WHERE global_position = 1
+    `).run("f".repeat(64));
+    const coordinator = new DefaultProjectionBuildCoordinator({
+      projectionDirectory,
+      eventReader,
+      builder: new ImmutableProjectionBuilder({ driver, projectionDirectory, now: () => NOW }),
+    });
+
+    await assert.rejects(
+      () => coordinator.ensurePublished(BINDING, 2n, 5_000),
+      /INTEGRITY_FAILURE/u,
+    );
+    assert.equal(existsSync(join(projectionDirectory, "projection-manifest.json")), false);
     source.close();
   });
 
@@ -753,6 +854,37 @@ describe("projection build coordinator", () => {
     await new Promise<void>((resolve) => setTimeout(resolve, 50));
     assert.equal(closed, 1);
     assert.equal(builds, 0);
+  });
+
+  it("closes an active source snapshot as soon as the build deadline expires", async () => {
+    const root = mkdtempSync(join(tmpdir(), "projection-active-snapshot-deadline-"));
+    roots.push(root);
+    let closed = 0;
+    let rejectBuild = (_error: Error): void => undefined;
+    const blockedBuild = new Promise<BuiltProjectionGeneration>((_resolve, reject) => {
+      rejectBuild = reject;
+    });
+    const coordinator = new DefaultProjectionBuildCoordinator({
+      projectionDirectory: join(root, "projections"),
+      eventReader: {
+        async openCommittedSnapshot() {
+          return emptySnapshot(() => { closed += 1; });
+        },
+      },
+      builder: {
+        async build() {
+          return blockedBuild;
+        },
+      },
+    });
+
+    await assert.rejects(
+      () => coordinator.ensurePublished(BINDING, 1n, 5),
+      (error: unknown) => error instanceof ProjectionLagError,
+    );
+    assert.equal(closed, 1);
+    rejectBuild(new Error("release blocked build"));
+    await new Promise<void>((resolve) => setTimeout(resolve, 5));
   });
 
   it("does not publish a build that completes after its caller deadline", async () => {

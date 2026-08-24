@@ -1,17 +1,22 @@
 import type { ReadonlyJsonValue, StoredEvent } from "../contracts/event.js";
+import {
+  authenticateStoredEvent,
+  type StoredEventChainCursor,
+} from "../integrity/stored-event-authenticator.js";
 import { GENESIS_GLOBAL_HASH } from "../storage/event-store.js";
 import type {
   SqliteConnection,
   SqliteDriver,
   SqliteRow,
-  SqliteValue,
 } from "../storage/sqlite-driver.js";
 import type { ProjectBinding } from "./contracts.js";
 
 const DEFAULT_BUSY_TIMEOUT_MS = 5_000;
-export const MAX_INTEGRITY_REPLAY_EVENTS = 100_000;
-export const MAX_INTEGRITY_REPLAY_BYTES = 64 * 1024 * 1024;
-const MAX_INTEGRITY_EVENT_BYTES = 1024 * 1024;
+export const MAX_PROJECTION_SOURCE_EVENTS = 100_000;
+export const MAX_PROJECTION_SOURCE_BYTES = 64 * 1024 * 1024;
+const MAX_PROJECTION_SOURCE_EVENT_BYTES = 1024 * 1024;
+export const MAX_INTEGRITY_REPLAY_EVENTS = MAX_PROJECTION_SOURCE_EVENTS;
+export const MAX_INTEGRITY_REPLAY_BYTES = MAX_PROJECTION_SOURCE_BYTES;
 const SQLITE_INT64_MAX = 9_223_372_036_854_775_807n;
 const HASH = /^[0-9a-f]{64}$/u;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
@@ -37,9 +42,11 @@ const EVENT_ROW_BYTE_EXPRESSION = EVENT_FIELDS.map((field) => `
 
 export interface ProjectionEventSnapshot {
   readonly binding: ProjectBinding;
-  readonly events: readonly StoredEvent[];
+  readonly eventCount: number;
+  readonly aggregateBytes: number;
   readonly terminalEventPosition: bigint;
   readonly terminalEventHash: string;
+  events(): Iterable<StoredEvent>;
   close(): void;
 }
 
@@ -115,15 +122,6 @@ function emptyArray(row: SqliteRow, field: string): readonly [] {
   const value = json(string(row, field));
   if (!Array.isArray(value) || value.length !== 0) return integrity();
   return Object.freeze([]);
-}
-
-function bindingParams(binding: ProjectBinding): Record<`$${string}`, SqliteValue> {
-  return {
-    $projectId: binding.projectId,
-    $workspaceId: binding.workspaceId,
-    $branchScopeId: binding.branchScopeId,
-    $branchRef: binding.branchRef,
-  };
 }
 
 function validateBinding(binding: ProjectBinding): ProjectBinding {
@@ -217,30 +215,29 @@ function sameBinding(event: StoredEvent, expected: ProjectBinding): boolean {
     && event.branchRef === expected.branchRef;
 }
 
+function sameStore(event: StoredEvent, expected: ProjectBinding): boolean {
+  return event.projectId === expected.projectId
+    && event.vaultId === expected.vaultId
+    && event.storeId === expected.storeId;
+}
+
 function boundedPositiveInteger(value: number | undefined, fallback: number, hardMaximum: number): number {
   const resolved = value ?? fallback;
   if (!Number.isSafeInteger(resolved) || resolved < 1 || resolved > hardMaximum) return integrity();
   return resolved;
 }
 
-function rowBytes(row: SqliteRow): number {
-  let bytes = 0;
-  for (const value of Object.values(row)) {
-    if (typeof value === "string") bytes += Buffer.byteLength(value, "utf8");
-    else if (value instanceof Uint8Array) bytes += value.byteLength;
-    else bytes += 8;
-    if (!Number.isSafeInteger(bytes) || bytes > MAX_INTEGRITY_EVENT_BYTES) return integrity();
-  }
-  return bytes;
+interface ProjectionSourceBounds {
+  readonly eventCount: number;
+  readonly aggregateBytes: number;
 }
 
-function preflightReplayRows(
+function preflightSourceRows(
   connection: SqliteConnection,
-  binding: ProjectBinding,
   terminalEventPosition: bigint,
   maxEvents: number,
   maxAggregateBytes: number,
-): void {
+): ProjectionSourceBounds {
   const row = connection.prepare(`
     SELECT count(*) AS event_count,
            coalesce(max(row_bytes), 0) AS maximum_row_bytes,
@@ -248,28 +245,27 @@ function preflightReplayRows(
     FROM (
       SELECT ${EVENT_ROW_BYTE_EXPRESSION} AS row_bytes
       FROM events
-      WHERE project_id = $projectId
-        AND workspace_id = $workspaceId
-        AND (
-          (branch_scope_id IS NULL AND $branchScopeId IS NULL)
-          OR branch_scope_id = $branchScopeId
-        )
-        AND (
-          (branch_ref IS NULL AND $branchRef IS NULL)
-          OR branch_ref = $branchRef
-        )
-        AND global_position <= $terminalEventPosition
+      WHERE global_position <= $terminalEventPosition
     )
   `).get({
-    ...bindingParams(binding),
     $terminalEventPosition: terminalEventPosition,
   });
+  if (row === undefined) return integrity();
+  const eventCount = bigint(row, "event_count");
+  const maximumRowBytes = bigint(row, "maximum_row_bytes");
+  const aggregateBytes = bigint(row, "aggregate_bytes");
   if (
-    row === undefined
-    || bigint(row, "event_count") > BigInt(maxEvents)
-    || bigint(row, "maximum_row_bytes") > BigInt(MAX_INTEGRITY_EVENT_BYTES)
-    || bigint(row, "aggregate_bytes") > BigInt(maxAggregateBytes)
+    eventCount < 0n
+    || maximumRowBytes < 0n
+    || aggregateBytes < 0n
+    || eventCount > BigInt(maxEvents)
+    || maximumRowBytes > BigInt(MAX_PROJECTION_SOURCE_EVENT_BYTES)
+    || aggregateBytes > BigInt(maxAggregateBytes)
   ) return integrity();
+  return Object.freeze({
+    eventCount: Number(eventCount),
+    aggregateBytes: Number(aggregateBytes),
+  });
 }
 
 /**
@@ -282,7 +278,6 @@ export function replayCommittedProjectionEvents(
   options: CommittedProjectionReplayOptions,
   consume: (event: StoredEvent) => void,
 ): CommittedProjectionReplayResult {
-  const binding = validateBinding(bindingValue);
   const terminalEventPosition = options.terminalEventPosition;
   if (
     typeof terminalEventPosition !== "bigint"
@@ -300,85 +295,22 @@ export function replayCommittedProjectionEvents(
     MAX_INTEGRITY_REPLAY_BYTES,
     MAX_INTEGRITY_REPLAY_BYTES,
   );
-  const connection = options.driver.open(options.eventStorePath, {
-    mode: "read-only-existing",
-    busyTimeoutMs: options.busyTimeoutMs ?? DEFAULT_BUSY_TIMEOUT_MS,
+  const snapshot = openBoundedProjectionEventSnapshot(bindingValue, {
+    ...options,
+    terminalEventPosition,
+    maxEvents,
+    maxAggregateBytes,
   });
-  let transactionOpen = false;
   try {
-    connection.exec("BEGIN");
-    transactionOpen = true;
-    const identity = connection.prepare(`
-      SELECT project_id, vault_id, store_id
-      FROM project_meta WHERE singleton = 1
-    `).get();
-    if (
-      identity === undefined
-      || string(identity, "project_id") !== binding.projectId
-      || string(identity, "vault_id") !== binding.vaultId
-      || string(identity, "store_id") !== binding.storeId
-    ) return integrity();
-    preflightReplayRows(
-      connection,
-      binding,
-      terminalEventPosition,
-      maxEvents,
-      maxAggregateBytes,
-    );
-    const iterator = connection.prepare(`
-      SELECT ${EVENT_COLUMNS}
-      FROM events
-      WHERE project_id = $projectId
-        AND workspace_id = $workspaceId
-        AND (
-          (branch_scope_id IS NULL AND $branchScopeId IS NULL)
-          OR branch_scope_id = $branchScopeId
-        )
-        AND (
-          (branch_ref IS NULL AND $branchRef IS NULL)
-          OR branch_ref = $branchRef
-        )
-        AND global_position <= $terminalEventPosition
-      ORDER BY global_position
-    `).iterate({
-      ...bindingParams(binding),
-      $terminalEventPosition: terminalEventPosition,
-    });
-    let eventCount = 0;
-    let aggregateBytes = 0;
-    let priorPosition = 0n;
-    let replayTerminalPosition = 0n;
-    let replayTerminalHash = GENESIS_GLOBAL_HASH;
-    for (const row of iterator) {
-      if (eventCount >= maxEvents) return integrity();
-      const bytes = rowBytes(row);
-      aggregateBytes += bytes;
-      if (!Number.isSafeInteger(aggregateBytes) || aggregateBytes > maxAggregateBytes) {
-        return integrity();
-      }
-      const event = storedEvent(row);
-      if (!sameBinding(event, binding) || event.globalPosition <= priorPosition) return integrity();
-      consume(event);
-      eventCount += 1;
-      priorPosition = event.globalPosition;
-      replayTerminalPosition = event.globalPosition;
-      replayTerminalHash = event.eventHash;
-    }
-    connection.exec("COMMIT");
-    transactionOpen = false;
+    for (const event of snapshot.events()) consume(event);
     return Object.freeze({
-      eventCount,
-      aggregateBytes,
-      terminalEventPosition: replayTerminalPosition,
-      terminalEventHash: replayTerminalHash,
+      eventCount: snapshot.eventCount,
+      aggregateBytes: snapshot.aggregateBytes,
+      terminalEventPosition: snapshot.terminalEventPosition,
+      terminalEventHash: snapshot.terminalEventHash,
     });
-  } catch (error) {
-    if (transactionOpen) {
-      try { connection.exec("ROLLBACK"); } catch { /* preserve replay failure */ }
-    }
-    throw error;
   } finally {
-    try { connection.close(); } catch { /* preserve replay failure */ }
+    snapshot.close();
   }
 }
 
@@ -402,101 +334,164 @@ export class SqliteProjectionEventReader implements ProjectionEventReader {
   }
 }
 
-/**
- * Synchronous core used by full integrity replay so the public verifier can
- * return a report or typed failure without changing the Task 4 contract. The
- * existing asynchronous reader remains a compatibility wrapper around this
- * exact authenticated event-store read.
- */
-export function openCommittedProjectionEventSnapshot(
+interface BoundedProjectionSnapshotOptions extends CommittedProjectionSnapshotOptions {
+  readonly maxEvents: number;
+  readonly maxAggregateBytes: number;
+}
+
+function openBoundedProjectionEventSnapshot(
   bindingValue: ProjectBinding,
-  options: CommittedProjectionSnapshotOptions,
+  options: BoundedProjectionSnapshotOptions,
 ): ProjectionEventSnapshot {
   const binding = validateBinding(bindingValue);
-  const terminalEventPosition = options.terminalEventPosition;
+  const terminalCeiling = options.terminalEventPosition;
   if (
-    terminalEventPosition !== undefined
+    terminalCeiling !== undefined
     && (
-      typeof terminalEventPosition !== "bigint"
-      || terminalEventPosition < 0n
-      || terminalEventPosition > SQLITE_INT64_MAX
+      typeof terminalCeiling !== "bigint"
+      || terminalCeiling < 0n
+      || terminalCeiling > SQLITE_INT64_MAX
     )
   ) return integrity();
   const connection = options.driver.open(options.eventStorePath, {
     mode: "read-only-existing",
     busyTimeoutMs: options.busyTimeoutMs ?? DEFAULT_BUSY_TIMEOUT_MS,
   });
-    let transactionOpen = false;
-    try {
-      connection.exec("BEGIN");
-      transactionOpen = true;
-      const identity = connection.prepare(`
-        SELECT project_id, vault_id, store_id
-        FROM project_meta WHERE singleton = 1
-      `).get();
-      if (
-        identity === undefined
-        || string(identity, "project_id") !== binding.projectId
-        || string(identity, "vault_id") !== binding.vaultId
-        || string(identity, "store_id") !== binding.storeId
-      ) return integrity();
-      const upperBound = terminalEventPosition === undefined
-        ? ""
-        : "AND global_position <= $terminalEventPosition";
-      const rows = connection.prepare(`
-        SELECT ${EVENT_COLUMNS}
-        FROM events
-        WHERE project_id = $projectId
-          AND workspace_id = $workspaceId
-          AND (
-            (branch_scope_id IS NULL AND $branchScopeId IS NULL)
-            OR branch_scope_id = $branchScopeId
-          )
-          AND (
-            (branch_ref IS NULL AND $branchRef IS NULL)
-            OR branch_ref = $branchRef
-          )
-          ${upperBound}
-        ORDER BY global_position
-      `).all(terminalEventPosition === undefined
-        ? bindingParams(binding)
-        : {
-            ...bindingParams(binding),
-            $terminalEventPosition: terminalEventPosition,
-          });
-      const events = rows.map(storedEvent);
-      if (events.some((event) => !sameBinding(event, binding))) return integrity();
-      for (let index = 1; index < events.length; index += 1) {
-        if (events[index]!.globalPosition <= events[index - 1]!.globalPosition) return integrity();
-      }
-      const terminal = events.at(-1);
-      connection.exec("COMMIT");
-      transactionOpen = false;
-      connection.close();
-      let closed = false;
-      return Object.freeze({
-        binding,
-        events: Object.freeze(events),
-        terminalEventPosition: terminal?.globalPosition ?? 0n,
-        terminalEventHash: terminal?.eventHash ?? GENESIS_GLOBAL_HASH,
-        close(): void {
-          if (closed) return;
-          closed = true;
-        },
-      });
-    } catch (error) {
+  let transactionOpen = false;
+  let released = false;
+  try {
+    connection.exec("BEGIN");
+    transactionOpen = true;
+    const identity = connection.prepare(`
+      SELECT project_id, vault_id, store_id
+      FROM project_meta WHERE singleton = 1
+    `).get();
+    if (
+      identity === undefined
+      || string(identity, "project_id") !== binding.projectId
+      || string(identity, "vault_id") !== binding.vaultId
+      || string(identity, "store_id") !== binding.storeId
+    ) return integrity();
+
+    const terminalStatement = connection.prepare(`
+      SELECT global_position, event_hash
+      FROM events
+      ${terminalCeiling === undefined ? "" : "WHERE global_position <= $terminalEventPosition"}
+      ORDER BY global_position DESC
+      LIMIT 1
+    `);
+    const terminal = terminalCeiling === undefined
+      ? terminalStatement.get()
+      : terminalStatement.get({ $terminalEventPosition: terminalCeiling });
+    const terminalEventPosition = terminal === undefined
+      ? 0n
+      : bigint(terminal, "global_position");
+    const terminalEventHash = terminal === undefined
+      ? GENESIS_GLOBAL_HASH
+      : string(terminal, "event_hash");
+    if (
+      terminalEventPosition < 0n
+      || terminalEventPosition > SQLITE_INT64_MAX
+      || !HASH.test(terminalEventHash)
+    ) return integrity();
+    const bounds = preflightSourceRows(
+      connection,
+      terminalEventPosition,
+      options.maxEvents,
+      options.maxAggregateBytes,
+    );
+    const rows = connection.prepare(`
+      SELECT ${EVENT_COLUMNS}
+      FROM events
+      WHERE global_position <= $terminalEventPosition
+      ORDER BY global_position
+    `);
+    const release = (commit: boolean): void => {
+      if (released) return;
+      released = true;
+      let releaseError: unknown;
       if (transactionOpen) {
         try {
-          connection.exec("ROLLBACK");
-        } catch {
-          // Preserve the snapshot failure.
+          connection.exec(commit ? "COMMIT" : "ROLLBACK");
+        } catch (error) {
+          releaseError = error;
+        } finally {
+          transactionOpen = false;
         }
       }
       try {
         connection.close();
-      } catch {
-        // Preserve the snapshot failure.
+      } catch (error) {
+        releaseError ??= error;
       }
-      throw error;
+      if (releaseError !== undefined) throw releaseError;
+    };
+    let streamRequested = false;
+    let streamComplete = false;
+    return Object.freeze({
+      binding,
+      eventCount: bounds.eventCount,
+      aggregateBytes: bounds.aggregateBytes,
+      terminalEventPosition,
+      terminalEventHash,
+      events(): Iterable<StoredEvent> {
+        if (released || streamRequested) return integrity();
+        streamRequested = true;
+        return (function* authenticatedEvents(): IterableIterator<StoredEvent> {
+          let completed = false;
+          let cursor: StoredEventChainCursor = {
+            expectedPosition: 1n,
+            previousEventHash: GENESIS_GLOBAL_HASH,
+          };
+          try {
+            for (const row of rows.iterate({ $terminalEventPosition: terminalEventPosition })) {
+              if (released) return integrity();
+              const authenticated = authenticateStoredEvent(storedEvent(row), cursor);
+              cursor = authenticated.nextCursor;
+              if (!sameStore(authenticated.event, binding)) return integrity();
+              if (sameBinding(authenticated.event, binding)) yield authenticated.event;
+            }
+            if (
+              cursor.expectedPosition !== terminalEventPosition + 1n
+              || cursor.previousEventHash !== terminalEventHash
+            ) return integrity();
+            completed = true;
+            streamComplete = true;
+          } finally {
+            if (!completed) {
+              try { release(false); } catch { /* preserve stream failure */ }
+            }
+          }
+        })();
+      },
+      close(): void {
+        release(streamComplete);
+      },
+    });
+  } catch (error) {
+    if (transactionOpen) {
+      try { connection.exec("ROLLBACK"); } catch { /* preserve snapshot failure */ }
+      transactionOpen = false;
     }
+    if (!released) {
+      try { connection.close(); } catch { /* preserve snapshot failure */ }
+      released = true;
+    }
+    throw error;
+  }
+}
+
+/**
+ * Synchronous core used by full integrity replay so the public verifier can
+ * return a report or typed failure without changing its public contract.
+ */
+export function openCommittedProjectionEventSnapshot(
+  bindingValue: ProjectBinding,
+  options: CommittedProjectionSnapshotOptions,
+): ProjectionEventSnapshot {
+  return openBoundedProjectionEventSnapshot(bindingValue, {
+    ...options,
+    maxEvents: MAX_PROJECTION_SOURCE_EVENTS,
+    maxAggregateBytes: MAX_PROJECTION_SOURCE_BYTES,
+  });
 }

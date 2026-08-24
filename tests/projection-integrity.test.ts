@@ -596,6 +596,22 @@ describe("full projection integrity replay", () => {
     expectIntegrityFailure(() => fixture.integrity.verify(BINDING, fixture.manifest));
   });
 
+  it("reuses stored-event authentication to reject authoritative metadata tamper", async () => {
+    const fixture = await createFixture();
+    const source = new DatabaseSync(fixture.sourcePath);
+    try {
+      source.exec(`
+        DROP TRIGGER events_no_update;
+        UPDATE events SET agent_id = 'forged-replay-agent' WHERE global_position = 1;
+        PRAGMA wal_checkpoint(TRUNCATE);
+      `);
+    } finally {
+      source.close();
+    }
+
+    expectIntegrityFailure(() => fixture.integrity.verify(BINDING, fixture.manifest));
+  });
+
   it("rejects an oversized stored payload before a full event row reaches JavaScript", async () => {
     const fixture = await createFixture();
     const source = new DatabaseSync(fixture.sourcePath);
