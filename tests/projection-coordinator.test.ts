@@ -315,6 +315,78 @@ describe("projection build coordinator", () => {
     source.close();
   });
 
+  it("reconciles an identified V2 orphan even when its active generation already meets the request", async () => {
+    const root = mkdtempSync(join(tmpdir(), "projection-v2-fresh-orphan-"));
+    roots.push(root);
+    const sourcePath = join(root, "events.sqlite");
+    const projectionDirectory = join(root, "projections");
+    const source = sourceDatabase(sourcePath);
+    append(source, 1);
+    const driver = new NodeSqliteDriver({ DatabaseSync });
+    const healthy = new V2ProjectionBuildCoordinator({
+      projectionDirectory,
+      eventReader: new SqliteProjectionEventReader({ driver, eventStorePath: sourcePath }),
+      builder: new ImmutableProjectionBuilder({ driver, projectionDirectory, now: () => NOW }),
+    });
+    await healthy.ensurePublished(BINDING, 1n, 2_000);
+
+    append(source, 2);
+    const faulted = new V2ProjectionBuildCoordinator({
+      projectionDirectory,
+      eventReader: new SqliteProjectionEventReader({ driver, eventStorePath: sourcePath }),
+      builder: new ImmutableProjectionBuilder({ driver, projectionDirectory, now: () => NOW }),
+      faultInjector: { hit: (boundary) => {
+        if (boundary === "after-v2-generation-install-before-manifest") throw new Error("post-install");
+      } },
+    });
+    await assert.rejects(() => faulted.ensurePublished(BINDING, 2n, 2_000), /post-install/u);
+    const orphan = join(projectionDirectory, "projections-2-2.sqlite");
+    assert.equal(existsSync(orphan), true);
+
+    const fresh = await healthy.ensurePublished(BINDING, 1n, 2_000);
+    assert.equal(fresh.manifest.generation, 1);
+    assert.equal(existsSync(orphan), false, "fresh reads must reconcile a verified orphan before return");
+    source.close();
+  });
+
+  it("fails closed if the V2 projection directory swaps after authorization", async () => {
+    const root = mkdtempSync(join(tmpdir(), "projection-v2-directory-swap-"));
+    roots.push(root);
+    const projectionDirectory = join(root, "projections");
+    const originalDirectory = join(root, "original-projections");
+    const attackerDirectory = join(root, "attacker-projections");
+    mkdirSync(projectionDirectory);
+    mkdirSync(attackerDirectory);
+    const knownTemp = ".projections-2-1-deadbeefdeadbeefdeadbeefdeadbeef.sqlite.tmp";
+    writeFileSync(join(projectionDirectory, knownTemp), "owned stale temp", "utf8");
+    writeFileSync(join(attackerDirectory, knownTemp), "outside victim", "utf8");
+    let directoryRealpaths = 0;
+    const inspection: ProjectionPathInspection = {
+      lstat: lstatSync,
+      realpath(path: string): string {
+        if (path === projectionDirectory && ++directoryRealpaths === 3) {
+          renameSync(projectionDirectory, originalDirectory);
+          renameSync(attackerDirectory, projectionDirectory);
+          return projectionDirectory;
+        }
+        return realpathSync(path);
+      },
+    };
+    const coordinator = new V2ProjectionBuildCoordinator({
+      projectionDirectory,
+      pathInspection: inspection,
+      eventReader: { async openCommittedSnapshot() { throw new Error("source must not run"); } },
+      builder: { async buildV2() { throw new Error("builder must not run"); } },
+    });
+
+    await assert.rejects(
+      () => coordinator.ensurePublished(BINDING, 1n, 2_000),
+      /PROJECTION_PATH_INVALID/u,
+    );
+    assert.equal(readFileSync(join(projectionDirectory, knownTemp), "utf8"), "outside victim");
+    assert.equal(readFileSync(join(originalDirectory, knownTemp), "utf8"), "owned stale temp");
+  });
+
   it("retains an unreadable final-named V2 candidate rather than deleting on uncertain observation", async () => {
     const root = mkdtempSync(join(tmpdir(), "projection-v2-orphan-uncertain-"));
     roots.push(root);

@@ -1,6 +1,5 @@
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import {
-  existsSync,
   lstatSync,
   readFileSync,
   realpathSync,
@@ -70,6 +69,7 @@ export interface V2ProjectionBuildCoordinatorOptions {
     hit(boundary: "after-v2-generation-install-before-manifest" | ProjectionManifestPublicationFaultBoundary): void;
   }>;
   readonly now?: () => number;
+  readonly pathInspection?: ProjectionPathInspection;
 }
 
 export interface ProjectionBuildCoordinator {
@@ -518,6 +518,8 @@ export class V2ProjectionBuildCoordinator {
   readonly #leasedFilenames: () => readonly string[];
   readonly #faultInjector: V2ProjectionBuildCoordinatorOptions["faultInjector"];
   readonly #now: () => number;
+  readonly #pathInspection: ProjectionPathInspection;
+  #directoryIdentity: ProjectionDirectoryIdentity | null = null;
   readonly #projectTails = new Map<string, Promise<void>>();
 
   constructor(options: V2ProjectionBuildCoordinatorOptions) {
@@ -527,6 +529,8 @@ export class V2ProjectionBuildCoordinator {
     this.#leasedFilenames = options.leasedFilenames ?? (() => Object.freeze([]));
     this.#faultInjector = options.faultInjector;
     this.#now = options.now ?? Date.now;
+    this.#pathInspection = options.pathInspection ?? filesystemPathInspection;
+    this.#assertProjectionDirectorySafe();
   }
 
   async ensurePublished(
@@ -544,7 +548,7 @@ export class V2ProjectionBuildCoordinator {
     return this.#serialized(binding.projectId, async () => {
       const current = this.#loadPublished(binding);
       if (current !== null && BigInt(current.manifest.terminalEventPosition) >= requiredEventPosition) {
-        return current;
+        return this.#reconcileFreshPublished(binding, current);
       }
       this.#assertDeadline(expiresAt, requiredEventPosition, current);
       this.#cleanupKnownTemps();
@@ -564,7 +568,12 @@ export class V2ProjectionBuildCoordinator {
           faultInjector: this.#faultInjector,
           beforeManifestInstall: {
             install: (_directory, identity, lockToken): void => {
-              const active = this.#loadPublished(binding);
+              if (
+                !sameProjectionDirectoryIdentity(identity, staged.directoryIdentity)
+                || !this.#assertProjectionDirectorySafe()
+                || !sameProjectionDirectoryIdentity(identity, this.#requiredDirectoryIdentity())
+              ) throw new Error("PROJECTION_PATH_INVALID");
+              const active = this.#loadPublishedLocked(binding, identity);
               this.#reconcileUnpublished(active, identity, lockToken, binding);
               const outcome = operations.installGeneration(
                 this.#projectionDirectory,
@@ -596,15 +605,30 @@ export class V2ProjectionBuildCoordinator {
   }
 
   #loadPublished(binding: ProjectBinding): PublishedProjectionGenerationV2 | null {
+    if (!this.#assertProjectionDirectorySafe()) return null;
+    this.#assertManifestPublicationUnlocked();
     const manifestPath = join(this.#projectionDirectory, PROJECTION_MANIFEST_FILENAME);
     const bytes = this.#readManifestBytes(manifestPath);
-    if (bytes === null) return null;
+    if (bytes === null) {
+      this.#assertManifestPublicationUnlocked();
+      if (this.#readManifestBytes(manifestPath) === null) return null;
+      throw new LifecycleError("MATERIALIZATION_CONFLICT");
+    }
     const manifest = parseProjectionManifestV2(JSON.parse(bytes) as unknown, binding);
-    const paths = verifyProjectionPublicationPaths(this.#projectionDirectory, manifest.databaseFile);
+    const paths = verifyProjectionPublicationPaths(
+      this.#projectionDirectory,
+      manifest.databaseFile,
+      this.#pathInspection,
+    );
     if (sha256File(paths.databasePath) !== manifest.databaseSha256) {
       throw new Error("PROJECTION_DATABASE_CHECKSUM_INVALID");
     }
-    const identity = filesystemStableProjectionDirectoryOperations.capture(this.#projectionDirectory);
+    assertProjectionSidecarsAbsent(paths.databasePath, this.#pathInspection);
+    this.#assertProjectionDirectorySafe();
+    const confirmedBytes = this.#readManifestBytes(manifestPath);
+    this.#assertManifestPublicationUnlocked();
+    if (confirmedBytes !== bytes) throw new LifecycleError("MATERIALIZATION_CONFLICT");
+    const identity = this.#requiredDirectoryIdentity();
     filesystemStableProjectionDirectoryOperations.assertGeneration(
       this.#projectionDirectory,
       manifest.databaseFile,
@@ -618,8 +642,90 @@ export class V2ProjectionBuildCoordinator {
     });
   }
 
+  #loadPublishedLocked(
+    binding: ProjectBinding,
+    identity: ProjectionDirectoryIdentity,
+  ): PublishedProjectionGenerationV2 | null {
+    if (!this.#assertProjectionDirectorySafe() || !sameProjectionDirectoryIdentity(
+      identity,
+      this.#requiredDirectoryIdentity(),
+    )) throw new Error("PROJECTION_PATH_INVALID");
+    const snapshot = filesystemStableProjectionDirectoryOperations.captureManifest(
+      this.#projectionDirectory,
+      identity,
+    );
+    if (snapshot.state === "missing") return null;
+    const bytes = Buffer.from(snapshot.bytesBase64, "base64").toString("utf8");
+    const manifest = parseProjectionManifestV2(JSON.parse(bytes) as unknown, binding);
+    const paths = verifyProjectionPublicationPaths(
+      this.#projectionDirectory,
+      manifest.databaseFile,
+      this.#pathInspection,
+    );
+    assertProjectionSidecarsAbsent(paths.databasePath, this.#pathInspection);
+    if (sha256File(paths.databasePath) !== manifest.databaseSha256) {
+      throw new Error("PROJECTION_DATABASE_CHECKSUM_INVALID");
+    }
+    if (!this.#assertProjectionDirectorySafe() || !sameProjectionDirectoryIdentity(
+      identity,
+      this.#requiredDirectoryIdentity(),
+    )) throw new Error("PROJECTION_PATH_INVALID");
+    const confirmed = filesystemStableProjectionDirectoryOperations.captureManifest(
+      this.#projectionDirectory,
+      identity,
+    );
+    if (confirmed.state !== "present" || confirmed.bytesBase64 !== snapshot.bytesBase64) {
+      throw new LifecycleError("MATERIALIZATION_CONFLICT");
+    }
+    filesystemStableProjectionDirectoryOperations.assertGeneration(
+      this.#projectionDirectory,
+      manifest.databaseFile,
+      identity,
+    );
+    return Object.freeze({
+      manifest,
+      projectionDirectory: this.#projectionDirectory,
+      databasePath: paths.databasePath,
+      directoryIdentity: identity,
+    });
+  }
+
+  #reconcileFreshPublished(
+    binding: ProjectBinding,
+    current: PublishedProjectionGenerationV2,
+  ): PublishedProjectionGenerationV2 {
+    if (!this.#assertProjectionDirectorySafe()) throw new Error("PROJECTION_PATH_INVALID");
+    const identity = this.#requiredDirectoryIdentity();
+    if (!sameProjectionDirectoryIdentity(identity, current.directoryIdentity)) {
+      throw new Error("PROJECTION_PATH_INVALID");
+    }
+    const lockToken = randomBytes(16).toString("hex");
+    const operations = filesystemStableProjectionDirectoryOperations;
+    if (operations.acquireManifestPublicationLock(this.#projectionDirectory, identity, lockToken) !== "acquired") {
+      throw new LifecycleError("MATERIALIZATION_CONFLICT");
+    }
+    try {
+      const active = this.#loadPublishedLocked(binding, identity);
+      if (active === null) throw new LifecycleError("MATERIALIZATION_CONFLICT");
+      this.#reconcileUnpublished(active, identity, lockToken, binding);
+      if (!this.#assertProjectionDirectorySafe() || !sameProjectionDirectoryIdentity(
+        identity,
+        this.#requiredDirectoryIdentity(),
+      )) throw new Error("PROJECTION_PATH_INVALID");
+      return active;
+    } finally {
+      if (operations.releaseManifestPublicationLock(this.#projectionDirectory, identity, lockToken) !== "released") {
+        throw new LifecycleError("MATERIALIZATION_CONFLICT");
+      }
+    }
+  }
+
   #verifyStaged(binding: ProjectBinding, staged: StagedProjectionGeneration): StableProjectionGenerationIdentity {
-    if (resolve(staged.projectionDirectory) !== resolve(this.#projectionDirectory)) {
+    if (
+      !this.#assertProjectionDirectorySafe()
+      || resolve(staged.projectionDirectory) !== resolve(this.#projectionDirectory)
+      || !sameProjectionDirectoryIdentity(staged.directoryIdentity, this.#requiredDirectoryIdentity())
+    ) {
       throw new Error("PROJECTION_PATH_INVALID");
     }
     const manifest = parseProjectionManifestV2(staged.manifest, binding);
@@ -629,8 +735,10 @@ export class V2ProjectionBuildCoordinator {
       || !/^\.projections-2-[1-9][0-9]{0,9}-[0-9a-f]{32}\.sqlite\.tmp$/u.test(temporaryFilename)
       || manifest.databaseFile !== `projections-2-${manifest.generation}.sqlite`
     ) throw new Error("PROJECTION_PATH_INVALID");
-    const freshIdentity = filesystemStableProjectionDirectoryOperations.capture(this.#projectionDirectory);
-    if (!sameProjectionDirectoryIdentity(freshIdentity, staged.directoryIdentity)) {
+    if (!this.#assertProjectionDirectorySafe() || !sameProjectionDirectoryIdentity(
+      staged.directoryIdentity,
+      this.#requiredDirectoryIdentity(),
+    )) {
       throw new Error("PROJECTION_PATH_INVALID");
     }
     assertProjectionSidecarsAbsent(staged.temporaryDatabasePath);
@@ -714,6 +822,7 @@ export class V2ProjectionBuildCoordinator {
   }
 
   #nextGeneration(): number {
+    if (!this.#assertProjectionDirectorySafe()) return 1;
     try {
       let maximum = 0;
       for (const filename of readdirSync(this.#projectionDirectory)) {
@@ -729,9 +838,9 @@ export class V2ProjectionBuildCoordinator {
   }
 
   #cleanupKnownTemps(): void {
-    if (!existsSync(this.#projectionDirectory)) return;
+    if (!this.#assertProjectionDirectorySafe()) return;
     try {
-      const identity = filesystemStableProjectionDirectoryOperations.capture(this.#projectionDirectory);
+      const identity = this.#requiredDirectoryIdentity();
       filesystemStableProjectionDirectoryOperations.cleanupKnownTemps(this.#projectionDirectory, identity);
     } catch (error) {
       if (!notFound(error)) throw error;
@@ -740,6 +849,56 @@ export class V2ProjectionBuildCoordinator {
 
   #readManifestBytes(path: string): string | null {
     try { return readFileSync(path, "utf8"); } catch (error) { if (notFound(error)) return null; throw error; }
+  }
+
+  #assertManifestPublicationUnlocked(): void {
+    const lockPath = join(this.#projectionDirectory, PROJECTION_MANIFEST_PUBLICATION_LOCK_FILENAME);
+    try {
+      this.#pathInspection.lstat(lockPath);
+    } catch (error) {
+      if (notFound(error)) return;
+      throw new LifecycleError("MATERIALIZATION_CONFLICT");
+    }
+    throw new LifecycleError("MATERIALIZATION_CONFLICT");
+  }
+
+  #assertProjectionDirectorySafe(): boolean {
+    let stat;
+    try {
+      stat = this.#pathInspection.lstat(this.#projectionDirectory);
+    } catch (error) {
+      if (!notFound(error)) throw error;
+      const parent = resolve(this.#projectionDirectory, "..");
+      try {
+        const parentStat = this.#pathInspection.lstat(parent);
+        if (
+          !parentStat.isDirectory()
+          || parentStat.isSymbolicLink()
+          || normalizedPath(this.#pathInspection.realpath(parent)) !== normalizedPath(parent)
+        ) throw new Error("PROJECTION_PATH_INVALID");
+      } catch (parentError) {
+        if (parentError instanceof Error && parentError.message === "PROJECTION_PATH_INVALID") throw parentError;
+        throw new Error("PROJECTION_PATH_INVALID", { cause: parentError });
+      }
+      return false;
+    }
+    if (
+      !stat.isDirectory()
+      || stat.isSymbolicLink()
+      || normalizedPath(this.#pathInspection.realpath(this.#projectionDirectory))
+        !== normalizedPath(this.#projectionDirectory)
+    ) throw new Error("PROJECTION_PATH_INVALID");
+    const identity = filesystemStableProjectionDirectoryOperations.capture(this.#projectionDirectory);
+    if (this.#directoryIdentity === null) this.#directoryIdentity = identity;
+    else if (!sameProjectionDirectoryIdentity(this.#directoryIdentity, identity)) {
+      throw new Error("PROJECTION_PATH_INVALID");
+    }
+    return true;
+  }
+
+  #requiredDirectoryIdentity(): ProjectionDirectoryIdentity {
+    if (this.#directoryIdentity === null) throw new Error("PROJECTION_PATH_INVALID");
+    return this.#directoryIdentity;
   }
 
   #assertDeadline(
