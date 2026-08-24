@@ -27,8 +27,10 @@ import {
   createVectorCacheManifest,
   searchVectorChannel,
   verifyVectorCacheManifest,
+  type LocalVectorCacheStore,
   type LocalVectorProvider,
   type RedactedCanonicalChunk,
+  type VectorCacheRowV1,
 } from "../src/orchestrator/retrieval/vector-cache.js";
 
 const PROJECT_ID = "1".repeat(64) as ProjectId;
@@ -44,6 +46,15 @@ const BINDING: ProjectBinding = Object.freeze({
   branchScopeId: BRANCH_SCOPE_ID,
   branchRef: "refs/heads/task-7",
   sessionId: null,
+});
+
+const OTHER_BINDING: ProjectBinding = Object.freeze({
+  ...BINDING,
+  projectId: OTHER_PROJECT_ID,
+  vaultId: "8".repeat(64) as VaultId,
+  storeId: "7".repeat(64) as StoreId,
+  branchScopeId: "00000000-0000-4000-8000-000000000705" as BranchScopeId,
+  branchRef: "refs/heads/task-7-other-project",
 });
 
 const MANIFEST: ProjectionManifestV1 = Object.freeze({
@@ -216,6 +227,18 @@ function service(vectorChannel?: VectorCandidateChannel): InternalRetrievalServi
   });
 }
 
+async function withWatchdog<T>(promise: Promise<T>, milliseconds: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const watchdog = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => reject(new Error("VECTOR_DEADLINE_NOT_ENFORCED")), milliseconds);
+  });
+  try {
+    return await Promise.race([promise, watchdog]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
 describe("optional local vector cache", () => {
   it("is disabled by default and does not invoke an installed provider", async () => {
     const provider = new RecordingProvider();
@@ -319,6 +342,136 @@ describe("optional local vector cache", () => {
       ...stored.slice(1),
     ]);
     assert.equal(verifyVectorCacheManifest(first.manifest, corrupted), false);
+  });
+
+  it("does not expose cached project A row metadata in an empty project B request manifest", async () => {
+    const provider = new RecordingProvider();
+    const cache = new InMemoryVectorCacheStore();
+    const enabled = request({ vector: { enabled: true } });
+    const seeded = await searchVectorChannel(provider, enabled, {
+      chunks: Object.freeze([chunk(PRIMARY)]),
+      cache,
+    });
+    assert.equal(seeded.manifest?.rowCount, 1);
+
+    provider.inputs.length = 0;
+    const emptyOtherProject = await searchVectorChannel(
+      provider,
+      request({ binding: OTHER_BINDING, vector: { enabled: true } }),
+      { chunks: Object.freeze([]), cache },
+    );
+
+    assert.equal(emptyOtherProject.used, true);
+    assert.equal(emptyOtherProject.failureCode, null);
+    assert.equal(emptyOtherProject.manifest?.rowCount, 0);
+    assert.deepEqual(emptyOtherProject.manifest?.rows, []);
+    assert.deepEqual(provider.inputs, [enabled.query]);
+  });
+
+  it("bounds a never-settling vector provider and returns the primary result with its lease closed", async () => {
+    let providerSignal: AbortSignal | undefined;
+    const provider: LocalVectorProvider = Object.freeze({
+      providerId: "never-settling-provider",
+      model: "blocked-v1",
+      embed(_text: string, signal?: AbortSignal): Promise<readonly number[]> {
+        providerSignal = signal;
+        return new Promise((_resolve, reject) => {
+          signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
+        });
+      },
+    });
+    let closes = 0;
+    const retrieval = new InternalRetrievalService({
+      projections: { async pin() { return lease(() => { closes += 1; }); } },
+      candidates: { collectEligible() { return collection(); } },
+      vectorChannel: new LocalVectorCandidateChannel({
+        provider,
+        chunks: { async load() { return Object.freeze([chunk(PRIMARY)]); } },
+      }),
+    });
+
+    const result = await withWatchdog(
+      retrieval.retrieve(request({
+        consistency: Object.freeze({ requiredEventPosition: 12n, deadlineMs: 20 }),
+        vector: { enabled: true },
+      })),
+      1_000,
+    );
+
+    assert.equal(result.channels.vector.used, false);
+    assert.equal(result.channels.vector.failureCode, "PROVIDER_UNAVAILABLE");
+    assert.deepEqual(result.items.map(({ id }) => id), [PRIMARY.id]);
+    assert.equal(providerSignal?.aborted, true);
+    assert.equal(closes, 1);
+  });
+
+  it("rejects a misrouted alpha cache row before satisfying a beta lookup", async () => {
+    const provider = new RecordingProvider();
+    const sourceCache = new InMemoryVectorCacheStore();
+    const enabled = request({ vector: { enabled: true } });
+    const alpha = item("00000000-0000-4000-8000-000000000706", "alpha");
+    const beta = item("00000000-0000-4000-8000-000000000707", "beta");
+    await searchVectorChannel(provider, enabled, {
+      chunks: Object.freeze([chunk(alpha)]),
+      cache: sourceCache,
+    });
+    const alphaRow = sourceCache.snapshot()[0];
+    assert.ok(alphaRow !== undefined);
+    const writes: VectorCacheRowV1[] = [];
+    const misroutingCache: LocalVectorCacheStore = Object.freeze({
+      find() { return alphaRow; },
+      put(row: VectorCacheRowV1) { writes.push(row); },
+      snapshot() { return Object.freeze([...writes]); },
+    });
+
+    provider.inputs.length = 0;
+    const result = await searchVectorChannel(provider, enabled, {
+      chunks: Object.freeze([chunk(beta)]),
+      cache: misroutingCache,
+    });
+
+    assert.equal(result.used, true);
+    assert.deepEqual(provider.inputs, [enabled.query, beta.summary]);
+    assert.equal(writes.length, 1);
+    assert.equal(writes[0]?.sourceHash, sourceHash(beta.summary));
+    assert.equal(result.manifest?.rowCount, 1);
+    assert.equal(result.manifest?.rows[0]?.sourceHash, sourceHash(beta.summary));
+  });
+
+  it("deterministically evicts the oldest row so entry 513 can be cached", async () => {
+    const provider = new RecordingProvider();
+    const cache = new InMemoryVectorCacheStore();
+    const stale = Object.freeze(Array.from(
+      { length: VECTOR_CACHE_LIMITS.rows },
+      (_unused, index) => chunk(item(`capacity-${index.toString().padStart(3, "0")}`, `stale-vector-${index}`)),
+    ));
+    const fill = await searchVectorChannel(
+      provider,
+      request({
+        candidateLimit: VECTOR_CACHE_LIMITS.rows,
+        consistency: Object.freeze({ requiredEventPosition: 12n, deadlineMs: 30_000 }),
+        vector: { enabled: true },
+      }),
+      { chunks: stale, cache },
+    );
+    assert.equal(fill.used, true);
+    assert.equal(cache.snapshot().length, VECTOR_CACHE_LIMITS.rows);
+
+    const fresh = item("capacity-513", "fresh-vector-513");
+    const result = await searchVectorChannel(
+      provider,
+      request({ vector: { enabled: true } }),
+      { chunks: Object.freeze([chunk(fresh)]), cache },
+    );
+    const stored = cache.snapshot();
+
+    assert.equal(result.used, true);
+    assert.equal(result.failureCode, null);
+    assert.equal(result.manifest?.rowCount, 1);
+    assert.equal(result.manifest?.rows[0]?.sourceHash, sourceHash(fresh.summary));
+    assert.equal(stored.length, VECTOR_CACHE_LIMITS.rows);
+    assert.equal(stored.some((row) => row.sourceHash === sourceHash(fresh.summary)), true);
+    assert.equal(stored.some((row) => row.sourceHash === sourceHash("stale-vector-0")), false);
   });
 
   it("degrades malformed or oversized provider output without persisting it", async () => {

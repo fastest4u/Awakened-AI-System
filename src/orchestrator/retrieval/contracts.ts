@@ -174,6 +174,7 @@ export interface VectorCandidateChannel {
   search(
     request: InternalRetrievalRequest,
     lease: ProjectionReaderLease,
+    signal?: AbortSignal,
   ): Promise<VectorChannelResult>;
 }
 

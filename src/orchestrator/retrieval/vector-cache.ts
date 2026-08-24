@@ -40,7 +40,7 @@ export const VECTOR_CACHE_LIMITS = Object.freeze({
 export interface LocalVectorProvider {
   readonly providerId: string;
   readonly model: string;
-  embed(text: string): Promise<readonly number[]>;
+  embed(text: string, signal?: AbortSignal): Promise<readonly number[]>;
 }
 
 /** `text` is already-redacted canonical content; sourceHash is its SHA-256. */
@@ -55,6 +55,7 @@ export interface RedactedCanonicalChunkSource {
   load(
     request: ValidatedInternalRetrievalRequest,
     lease: ProjectionReaderLease,
+    signal?: AbortSignal,
   ): Promise<readonly RedactedCanonicalChunk[]>;
 }
 
@@ -79,6 +80,7 @@ export interface LocalVectorCacheStore {
 export interface SearchVectorChannelOptions {
   readonly chunks?: readonly RedactedCanonicalChunk[];
   readonly cache?: LocalVectorCacheStore;
+  readonly signal?: AbortSignal;
 }
 
 export interface LocalVectorCandidateChannelOptions {
@@ -89,6 +91,60 @@ export interface LocalVectorCandidateChannelOptions {
 
 function invalid(): never {
   throw new TypeError("VECTOR_CACHE_INVALID");
+}
+
+function abortError(signal: AbortSignal): Error {
+  return signal.reason instanceof Error
+    ? signal.reason
+    : new Error("VECTOR_OPERATION_ABORTED");
+}
+
+function throwIfAborted(signal: AbortSignal): void {
+  if (signal.aborted) throw abortError(signal);
+}
+
+/** Bounds the complete optional operation even when a provider ignores cancellation. */
+export async function withVectorDeadline<T>(
+  deadlineMs: number,
+  operation: (signal: AbortSignal) => Promise<T>,
+  parentSignal?: AbortSignal,
+): Promise<T> {
+  const controller = new AbortController();
+  const deadlineError = new Error("VECTOR_OPERATION_DEADLINE_EXCEEDED");
+  if (parentSignal?.aborted === true) {
+    controller.abort(abortError(parentSignal));
+    throw abortError(parentSignal);
+  }
+  if (deadlineMs === 0) {
+    controller.abort(deadlineError);
+    throw deadlineError;
+  }
+
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let rejectBoundary: ((reason: Error) => void) | undefined;
+  const fail = (reason: Error): void => {
+    if (!controller.signal.aborted) controller.abort(reason);
+    rejectBoundary?.(reason);
+  };
+  const onParentAbort = (): void => {
+    if (parentSignal !== undefined) fail(abortError(parentSignal));
+  };
+  const boundary = new Promise<never>((_resolve, reject) => {
+    rejectBoundary = reject;
+    timer = setTimeout(() => fail(deadlineError), deadlineMs);
+    parentSignal?.addEventListener("abort", onParentAbort, { once: true });
+  });
+  const pending = Promise.resolve().then(async () => {
+    throwIfAborted(controller.signal);
+    return await operation(controller.signal);
+  });
+  try {
+    return await Promise.race([pending, boundary]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+    parentSignal?.removeEventListener("abort", onParentAbort);
+    rejectBoundary = undefined;
+  }
 }
 
 function exactRecord(value: unknown, keys: readonly string[]): Record<string, unknown> {
@@ -292,16 +348,21 @@ export class InMemoryVectorCacheStore implements LocalVectorCacheStore {
 
   put(value: VectorCacheRowV1): void {
     const row = cacheRow(value);
-    if (!this.#rows.has(row.cacheKey) && this.#rows.size >= VECTOR_CACHE_LIMITS.rows) {
-      return invalid();
-    }
-    const existingBytes = [...this.#rows.values()].reduce(
+    this.#rows.delete(row.cacheKey);
+    let existingBytes = [...this.#rows.values()].reduce(
       (total, current) => total + current.byteLength,
       0,
     );
-    const replacedBytes = this.#rows.get(row.cacheKey)?.byteLength ?? 0;
-    if (existingBytes - replacedBytes + row.byteLength > VECTOR_CACHE_LIMITS.totalBytes) {
-      return invalid();
+    while (
+      this.#rows.size >= VECTOR_CACHE_LIMITS.rows
+      || existingBytes + row.byteLength > VECTOR_CACHE_LIMITS.totalBytes
+    ) {
+      const oldestKey = this.#rows.keys().next().value as string | undefined;
+      if (oldestKey === undefined) return invalid();
+      const oldest = this.#rows.get(oldestKey);
+      if (oldest === undefined) return invalid();
+      this.#rows.delete(oldestKey);
+      existingBytes -= oldest.byteLength;
     }
     this.#rows.set(row.cacheKey, cloneRow(row));
   }
@@ -502,63 +563,78 @@ export async function searchVectorChannel(
   const request = validateInternalRetrievalRequest(input);
   if (!request.vector.enabled || provider === undefined) return disabledVectorChannel();
   try {
-    const identity = providerIdentity(provider);
-    const cache = options.cache ?? new InMemoryVectorCacheStore();
-    const chunks = boundedEligibleChunks(options.chunks ?? frozenEmpty(), request);
-    const queryBytes = encodeVector(await provider.embed(request.query));
-    const dimensions = queryBytes.byteLength / 8;
-    const queryVector = decodeVector(queryBytes, dimensions);
-    if (chunks.length === 0) {
+    return await withVectorDeadline(request.consistency.deadlineMs, async (signal) => {
+      const identity = providerIdentity(provider);
+      const cache = options.cache ?? new InMemoryVectorCacheStore();
+      const chunks = boundedEligibleChunks(options.chunks ?? frozenEmpty(), request);
+      const queryBytes = encodeVector(await provider.embed(request.query, signal));
+      throwIfAborted(signal);
+      const dimensions = queryBytes.byteLength / 8;
+      const queryVector = decodeVector(queryBytes, dimensions);
+      if (chunks.length === 0) {
+        return Object.freeze({
+          used: true,
+          failureCode: null,
+          candidates: frozenEmpty(),
+          manifest: createVectorCacheManifest([]),
+        });
+      }
+      const pendingRows: VectorCacheRowV1[] = [];
+      const usedRows = new Map<string, VectorCacheRowV1>();
+      const scored: Array<{ item: RetrievalItem; sourceHash: string; similarity: number }> = [];
+      for (const source of chunks) {
+        throwIfAborted(signal);
+        const lookup = Object.freeze({
+          sourceHash: source.sourceHash,
+          providerId: identity.providerId,
+          model: identity.model,
+          chunkerVersion: source.chunkerVersion,
+          dimensions,
+        });
+        const found = cache.find(lookup);
+        const candidate = found === undefined ? undefined : cacheRow(found);
+        const cached = candidate !== undefined && sameLookup(candidate, lookup)
+          ? candidate
+          : undefined;
+        const row = cached ?? rowForVector(
+          source,
+          identity,
+          await provider.embed(source.text, signal),
+        );
+        throwIfAborted(signal);
+        if (row.dimensions !== dimensions) return invalid();
+        const vector = decodeVector(row.vectorBytes, row.dimensions);
+        const similarity = cosine(queryVector, vector);
+        if (!Number.isFinite(similarity)) return invalid();
+        if (cached === undefined) pendingRows.push(row);
+        usedRows.set(row.cacheKey, row);
+        scored.push({
+          item: source.item,
+          sourceHash: source.sourceHash,
+          similarity: Math.max(-1, Math.min(1, similarity)),
+        });
+      }
+      throwIfAborted(signal);
+      for (const row of pendingRows) cache.put(row);
+      scored.sort((left, right) => (
+        right.similarity - left.similarity
+        || `${left.item.kind}:${left.item.id}:${left.sourceHash}`.localeCompare(
+          `${right.item.kind}:${right.item.id}:${right.sourceHash}`,
+        )
+      ));
+      const candidates = Object.freeze(scored.map((value, index): VectorCandidate => Object.freeze({
+        candidateId: candidateId(value.item, value.sourceHash),
+        rank: index + 1,
+        similarity: value.similarity,
+        item: value.item,
+      })));
       return Object.freeze({
         used: true,
         failureCode: null,
-        candidates: frozenEmpty(),
-        manifest: createVectorCacheManifest(cache.snapshot()),
+        candidates,
+        manifest: createVectorCacheManifest([...usedRows.values()]),
       });
-    }
-    const pendingRows: VectorCacheRowV1[] = [];
-    const scored: Array<{ item: RetrievalItem; sourceHash: string; similarity: number }> = [];
-    for (const source of chunks) {
-      const lookup = Object.freeze({
-        sourceHash: source.sourceHash,
-        providerId: identity.providerId,
-        model: identity.model,
-        chunkerVersion: source.chunkerVersion,
-        dimensions,
-      });
-      const found = cache.find(lookup);
-      const cached = found === undefined ? undefined : cacheRow(found);
-      const row = cached ?? rowForVector(source, identity, await provider.embed(source.text));
-      if (row.dimensions !== dimensions) return invalid();
-      const vector = decodeVector(row.vectorBytes, row.dimensions);
-      const similarity = cosine(queryVector, vector);
-      if (!Number.isFinite(similarity)) return invalid();
-      if (cached === undefined) pendingRows.push(row);
-      scored.push({
-        item: source.item,
-        sourceHash: source.sourceHash,
-        similarity: Math.max(-1, Math.min(1, similarity)),
-      });
-    }
-    for (const row of pendingRows) cache.put(row);
-    scored.sort((left, right) => (
-      right.similarity - left.similarity
-      || `${left.item.kind}:${left.item.id}:${left.sourceHash}`.localeCompare(
-        `${right.item.kind}:${right.item.id}:${right.sourceHash}`,
-      )
-    ));
-    const candidates = Object.freeze(scored.map((value, index): VectorCandidate => Object.freeze({
-      candidateId: candidateId(value.item, value.sourceHash),
-      rank: index + 1,
-      similarity: value.similarity,
-      item: value.item,
-    })));
-    return Object.freeze({
-      used: true,
-      failureCode: null,
-      candidates,
-      manifest: createVectorCacheManifest(cache.snapshot()),
-    });
+    }, options.signal);
   } catch {
     return unavailableVectorChannel();
   }
@@ -578,15 +654,20 @@ export class LocalVectorCandidateChannel implements VectorCandidateChannel {
   async search(
     input: InternalRetrievalRequest,
     lease: ProjectionReaderLease,
+    parentSignal?: AbortSignal,
   ): Promise<VectorChannelResult> {
     const request = validateInternalRetrievalRequest(input);
     if (!request.vector.enabled || this.#provider === undefined) return disabledVectorChannel();
     try {
-      const chunks = await this.#chunks.load(request, lease);
-      return await searchVectorChannel(this.#provider, request, {
-        chunks,
-        cache: this.#cache,
-      });
+      return await withVectorDeadline(request.consistency.deadlineMs, async (signal) => {
+        const chunks = await this.#chunks.load(request, lease, signal);
+        throwIfAborted(signal);
+        return await searchVectorChannel(this.#provider, request, {
+          chunks,
+          cache: this.#cache,
+          signal,
+        });
+      }, parentSignal);
     } catch {
       return unavailableVectorChannel();
     }

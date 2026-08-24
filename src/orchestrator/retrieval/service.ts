@@ -54,6 +54,7 @@ import {
   disabledVectorChannel,
   parseVectorCacheManifest,
   unavailableVectorChannel,
+  withVectorDeadline,
 } from "./vector-cache.js";
 
 export interface InternalRetrievalServiceOptions {
@@ -490,7 +491,11 @@ async function searchOptionalVectorChannel(
     return vectorDiagnostic(disabledVectorChannel(), request);
   }
   try {
-    return vectorDiagnostic(await channel.search(request, lease), request);
+    const result = await withVectorDeadline(
+      request.consistency.deadlineMs,
+      (signal) => channel.search(request, lease, signal),
+    );
+    return vectorDiagnostic(result, request);
   } catch {
     return vectorDiagnostic(unavailableVectorChannel(), request);
   }
