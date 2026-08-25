@@ -288,6 +288,45 @@ function readGenerationImage(
   }
 }
 
+/** Opens a detached immutable SQLite image without consulting a filesystem path. */
+export function openImmutableProjectionImage(
+  bytes: Uint8Array,
+  busyTimeoutMs = DEFAULT_BUSY_TIMEOUT_MS,
+): DatabaseSync {
+  let database: DatabaseSync | undefined;
+  try {
+    database = new DatabaseSync(":memory:", {
+      open: true,
+      readOnly: false,
+      timeout: busyTimeoutMs,
+      enableForeignKeyConstraints: true,
+      enableDoubleQuotedStringLiterals: false,
+      allowExtension: false,
+      allowBareNamedParameters: false,
+      allowUnknownNamedParameters: false,
+      defensive: true,
+    });
+    database.deserialize(deserializableImage(bytes));
+    database.enableDefensive(true);
+    database.exec(`
+      PRAGMA query_only = ON;
+      PRAGMA trusted_schema = OFF;
+      PRAGMA foreign_keys = ON;
+      PRAGMA busy_timeout = ${busyTimeoutMs};
+    `);
+    if (
+      Number(database.prepare("PRAGMA query_only").get()?.query_only) !== 1
+      || Number(database.prepare("PRAGMA trusted_schema").get()?.trusted_schema) !== 0
+      || Number(database.prepare("PRAGMA foreign_keys").get()?.foreign_keys) !== 1
+      || Number(database.prepare("PRAGMA busy_timeout").get()?.timeout) !== busyTimeoutMs
+    ) return integrity();
+    return database;
+  } catch (error) {
+    try { database?.close(); } catch { /* preserve immutable-image failure */ }
+    throw error;
+  }
+}
+
 function openPinnedGenerationInspection(
   pinnedImage: PinnedGenerationImage,
   busyTimeoutMs: number,

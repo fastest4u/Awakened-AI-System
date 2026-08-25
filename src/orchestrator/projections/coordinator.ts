@@ -1,6 +1,7 @@
 import { createHash, randomBytes } from "node:crypto";
 import {
   lstatSync,
+  mkdirSync,
   readFileSync,
   realpathSync,
   readdirSync,
@@ -20,6 +21,7 @@ import type { ProjectBinding } from "./contracts.js";
 import type { ProjectionEventReader, ProjectionEventSnapshot } from "./event-reader.js";
 import {
   assertProjectionSidecarsAbsent,
+  acquireProjectionManifestPublicationLease,
   parseProjectionManifest,
   parseProjectionManifestV2,
   PROJECTION_MANIFEST_FILENAME,
@@ -30,6 +32,8 @@ import {
   type ProjectionManifestPublicationFaultBoundary,
   type ProjectionPathInspection,
 } from "./manifest.js";
+import { V2ReconciliationJournal } from "./reconciliation-journal.js";
+import { openImmutableProjectionImage } from "./integrity.js";
 import {
   ProjectionLeaseUnavailableError,
   ProjectionReaderLeaseRegistry,
@@ -96,7 +100,9 @@ export interface V2ProjectionBuildCoordinatorOptions {
   readonly faultInjector?: Readonly<{
     hit(boundary:
       | "after-v2-generation-install-before-manifest"
-      | "after-v2-orphan-capture-before-validation"
+      | "after-v2-orphan-image-before-validation"
+      | "after-v2-orphan-reservation-before-quarantine"
+      | "after-v2-orphan-quarantine-before-confirm"
       | ProjectionManifestPublicationFaultBoundary): void;
   }>;
   readonly now?: () => number;
@@ -691,6 +697,7 @@ export class V2ProjectionBuildCoordinator {
   readonly #faultInjector: V2ProjectionBuildCoordinatorOptions["faultInjector"];
   readonly #now: () => number;
   readonly #pathInspection: ProjectionPathInspection;
+  readonly #reconciliationJournal = new V2ReconciliationJournal();
   #directoryIdentity: ProjectionDirectoryIdentity | null = null;
   readonly #projectTails = new Map<string, Promise<void>>();
 
@@ -718,77 +725,98 @@ export class V2ProjectionBuildCoordinator {
     ) throw new TypeError("PROJECTION_REQUEST_INVALID");
     const expiresAt = this.#now() + deadlineMs;
     return this.#serialized(binding.projectId, async () => {
-      const reconciled = this.#reconcileEntry(binding, this.#loadPublished(binding));
-      const current = this.#persistObservedGeneration(
-        binding,
-        reconciled.current,
-        reconciled.highestObservedGeneration,
-      );
-      if (current !== null && BigInt(current.manifest.terminalEventPosition) >= requiredEventPosition) {
-        return current;
+      const identity = this.#ensureProjectionDirectory();
+      const lease = acquireProjectionManifestPublicationLease(this.#projectionDirectory);
+      if (!sameProjectionDirectoryIdentity(identity, lease.directoryIdentity)) {
+        lease.release(true);
+        throw new Error("PROJECTION_PATH_INVALID");
       }
-      this.#assertDeadline(expiresAt, requiredEventPosition, current);
-      this.#cleanupKnownTemps();
-      const snapshot = await this.#eventReader.openCommittedSnapshot(binding);
+      let retainLock = true;
       try {
+        const reconciled = this.#reconcileEntry(
+          binding,
+          this.#loadPublishedLocked(binding, identity),
+          identity,
+          lease.lockToken,
+        );
+        const current = this.#persistObservedGeneration(
+          binding,
+          reconciled.current,
+          reconciled.highestObservedGeneration,
+          identity,
+        );
+        // A completed reconciliation is durable in the journal. Ordinary
+        // source/build failures can release the cooperative lock; any later
+        // publication ambiguity poisons its nested manifest attempt itself.
+        retainLock = false;
+        if (current !== null && BigInt(current.manifest.terminalEventPosition) >= requiredEventPosition) {
+          return current;
+        }
         this.#assertDeadline(expiresAt, requiredEventPosition, current);
-        const generationFloor = Math.max(
+        this.#cleanupKnownTemps();
+        const snapshot = await this.#eventReader.openCommittedSnapshot(binding);
+        try {
+          this.#assertDeadline(expiresAt, requiredEventPosition, current);
+          const generationFloor = Math.max(
           reconciled.highestObservedGeneration,
           current?.manifest.highestObservedGeneration ?? 0,
           current?.manifest.generation ?? 0,
-        );
-        const staged = await this.#builder.buildV2(snapshot, this.#nextGeneration(generationFloor));
-        const stagedManifest = parseProjectionManifestV2({
-          ...staged.manifest,
-          highestObservedGeneration: Math.max(generationFloor, staged.manifest.generation),
-        }, binding);
-        const stagedForPublication = Object.freeze({ ...staged, manifest: stagedManifest });
-        this.#assertDeadline(expiresAt, requiredEventPosition, current);
-        const stagedIdentity = this.#verifyStaged(binding, stagedForPublication);
-        const operations = filesystemStableProjectionDirectoryOperations;
-        let installed = false;
-        publishProjectionManifest({
-          projectionDirectory: this.#projectionDirectory,
-          manifest: stagedForPublication.manifest,
-          expectedBinding: binding,
-        }, {
-          faultInjector: this.#faultInjector,
-          beforeManifestInstall: {
-            install: (_directory, identity, lockToken): void => {
-              if (
-                !sameProjectionDirectoryIdentity(identity, stagedForPublication.directoryIdentity)
-                || !this.#assertProjectionDirectorySafe()
-                || !sameProjectionDirectoryIdentity(identity, this.#requiredDirectoryIdentity())
-              ) throw new Error("PROJECTION_PATH_INVALID");
-              const active = this.#loadPublishedLocked(binding, identity);
-              if (active !== null && active.manifest.highestObservedGeneration > stagedForPublication.manifest.highestObservedGeneration) {
-                throw new LifecycleError("MATERIALIZATION_CONFLICT");
-              }
-              const outcome = operations.installGeneration(
-                this.#projectionDirectory,
-                identity,
-                lockToken,
-                basename(stagedForPublication.temporaryDatabasePath),
-                stagedForPublication.manifest.databaseFile,
-                stagedIdentity,
-              );
-              if (outcome !== "installed") throw new LifecycleError("MATERIALIZATION_CONFLICT");
-              installed = true;
-              this.#faultInjector?.hit("after-v2-generation-install-before-manifest");
-              this.#assertDeadline(expiresAt, requiredEventPosition, active);
+          );
+          const staged = await this.#builder.buildV2(snapshot, this.#nextGeneration(generationFloor));
+          const stagedManifest = parseProjectionManifestV2({
+            ...staged.manifest,
+            highestObservedGeneration: Math.max(generationFloor, staged.manifest.generation),
+          }, binding);
+          const stagedForPublication = Object.freeze({ ...staged, manifest: stagedManifest });
+          this.#assertDeadline(expiresAt, requiredEventPosition, current);
+          const stagedIdentity = this.#verifyStaged(binding, stagedForPublication);
+          const operations = filesystemStableProjectionDirectoryOperations;
+          let installed = false;
+          publishProjectionManifest({
+            projectionDirectory: this.#projectionDirectory,
+            manifest: stagedForPublication.manifest,
+            expectedBinding: binding,
+          }, {
+            faultInjector: this.#faultInjector,
+            beforeManifestInstall: {
+              install: (_directory, lockedIdentity, lockToken): void => {
+                if (
+                  !sameProjectionDirectoryIdentity(lockedIdentity, stagedForPublication.directoryIdentity)
+                  || !this.#assertProjectionDirectorySafe()
+                  || !sameProjectionDirectoryIdentity(lockedIdentity, this.#requiredDirectoryIdentity())
+                ) throw new Error("PROJECTION_PATH_INVALID");
+                const active = this.#loadPublishedLocked(binding, lockedIdentity);
+                if (active !== null && active.manifest.highestObservedGeneration > stagedForPublication.manifest.highestObservedGeneration) {
+                  throw new LifecycleError("MATERIALIZATION_CONFLICT");
+                }
+                const outcome = operations.installGeneration(
+                  this.#projectionDirectory,
+                  lockedIdentity,
+                  lockToken,
+                  basename(stagedForPublication.temporaryDatabasePath),
+                  stagedForPublication.manifest.databaseFile,
+                  stagedIdentity,
+                );
+                if (outcome !== "installed") throw new LifecycleError("MATERIALIZATION_CONFLICT");
+                installed = true;
+                this.#faultInjector?.hit("after-v2-generation-install-before-manifest");
+                this.#assertDeadline(expiresAt, requiredEventPosition, active);
+              },
             },
-          },
-        });
-        if (!installed) throw new Error("PROJECTION_PUBLICATION_INVALID");
-        const published = this.#loadPublished(binding);
-        if (
-          published === null
-          || published.manifest.generation !== stagedForPublication.manifest.generation
-          || published.manifest.databaseSha256 !== stagedForPublication.manifest.databaseSha256
-        ) throw new Error("PROJECTION_PUBLICATION_INVALID");
-        return published;
+          });
+          if (!installed) throw new Error("PROJECTION_PUBLICATION_INVALID");
+          const published = this.#loadPublishedLocked(binding, identity);
+          if (
+            published === null
+            || published.manifest.generation !== stagedForPublication.manifest.generation
+            || published.manifest.databaseSha256 !== stagedForPublication.manifest.databaseSha256
+          ) throw new Error("PROJECTION_PUBLICATION_INVALID");
+          return published;
+        } finally {
+          snapshot.close();
+        }
       } finally {
-        snapshot.close();
+        lease.release(retainLock);
       }
     });
   }
@@ -882,58 +910,33 @@ export class V2ProjectionBuildCoordinator {
   #reconcileEntry(
     binding: ProjectBinding,
     current: PublishedProjectionGenerationV2 | null,
+    identity: ProjectionDirectoryIdentity,
+    lockToken: string,
   ): V2ReconciliationEntry {
-    if (!this.#assertProjectionDirectorySafe()) {
-      return Object.freeze({
-        current,
-        highestObservedGeneration: current?.manifest.highestObservedGeneration ?? 0,
-      });
-    }
-    const identity = this.#requiredDirectoryIdentity();
     if (current !== null && !sameProjectionDirectoryIdentity(identity, current.directoryIdentity)) {
       throw new Error("PROJECTION_PATH_INVALID");
     }
-    const lockToken = randomBytes(16).toString("hex");
-    const operations = filesystemStableProjectionDirectoryOperations;
-    if (operations.acquireManifestPublicationLock(this.#projectionDirectory, identity, lockToken) !== "acquired") {
-      throw new LifecycleError("MATERIALIZATION_CONFLICT");
-    }
-    let release = true;
-    try {
-      const active = this.#loadPublishedLocked(binding, identity);
-      const highestObservedGeneration = this.#reconcileUnpublished(active, identity, lockToken, binding);
-      if (!this.#assertProjectionDirectorySafe() || !sameProjectionDirectoryIdentity(
-        identity,
-        this.#requiredDirectoryIdentity(),
-      )) throw new Error("PROJECTION_PATH_INVALID");
-      return Object.freeze({
-        current: active,
-        highestObservedGeneration: Math.max(
-          highestObservedGeneration,
-          active?.manifest.generation ?? 0,
-          active?.manifest.highestObservedGeneration ?? 0,
-        ),
-      });
-    } catch (error) {
-      // Retain the lock as recovery evidence whenever a candidate cannot be
-      // observed and verified well enough to authorize its removal.
-      release = false;
-      throw error;
-    } finally {
-      if (release && operations.releaseManifestPublicationLock(
-        this.#projectionDirectory,
-        identity,
-        lockToken,
-      ) !== "released") {
-        throw new LifecycleError("MATERIALIZATION_CONFLICT");
-      }
-    }
+    const active = this.#loadPublishedLocked(binding, identity);
+    const highestObservedGeneration = this.#reconcileUnpublished(active, identity, lockToken, binding);
+    if (!this.#assertProjectionDirectorySafe() || !sameProjectionDirectoryIdentity(
+      identity,
+      this.#requiredDirectoryIdentity(),
+    )) throw new Error("PROJECTION_PATH_INVALID");
+    return Object.freeze({
+      current: active,
+      highestObservedGeneration: Math.max(
+        highestObservedGeneration,
+        active?.manifest.generation ?? 0,
+        active?.manifest.highestObservedGeneration ?? 0,
+      ),
+    });
   }
 
   #persistObservedGeneration(
     binding: ProjectBinding,
     current: PublishedProjectionGenerationV2 | null,
     highestObservedGeneration: number,
+    identity: ProjectionDirectoryIdentity,
   ): PublishedProjectionGenerationV2 | null {
     if (current === null || highestObservedGeneration <= current.manifest.highestObservedGeneration) {
       return current;
@@ -947,7 +950,7 @@ export class V2ProjectionBuildCoordinator {
       manifest,
       expectedBinding: binding,
     });
-    const published = this.#loadPublished(binding);
+    const published = this.#loadPublishedLocked(binding, identity);
     if (published === null || published.manifest.highestObservedGeneration < highestObservedGeneration) {
       throw new Error("PROJECTION_PUBLICATION_INVALID");
     }
@@ -997,45 +1000,58 @@ export class V2ProjectionBuildCoordinator {
     binding: ProjectBinding,
   ): number {
     const leased = new Set(this.#leasedFilenames());
+    const filenames = readdirSync(this.#projectionDirectory).sort();
     let highestObservedGeneration = active?.manifest.highestObservedGeneration ?? 0;
-    for (const filename of readdirSync(this.#projectionDirectory).sort()) {
+    for (const filename of filenames) {
       const match = V2_GENERATION_FILE.exec(filename);
       if (match === null) continue;
+      highestObservedGeneration = Math.max(highestObservedGeneration, Number(match[1]));
+    }
+    highestObservedGeneration = this.#reconciliationJournal.reserveAtLeast(
+      this.#projectionDirectory,
+      identity,
+      lockToken,
+      highestObservedGeneration,
+    );
+    this.#faultInjector?.hit("after-v2-orphan-reservation-before-quarantine");
+    for (const filename of filenames) {
+      if (V2_GENERATION_FILE.exec(filename) === null) continue;
       if (active?.manifest.databaseFile === filename || leased.has(filename)) continue;
-      const capture = filesystemStableProjectionDirectoryOperations.captureGenerationForValidation(
+      const image = filesystemStableProjectionDirectoryOperations.readGenerationImage(
         this.#projectionDirectory,
         identity,
         lockToken,
         filename,
-        randomBytes(16).toString("hex"),
       );
-      this.#faultInjector?.hit("after-v2-orphan-capture-before-validation");
+      this.#faultInjector?.hit("after-v2-orphan-image-before-validation");
       this.#assertUnpublishedV2Candidate(
-        join(this.#projectionDirectory, capture.capturedFilename),
+        image.bytes,
         filename,
         binding,
       );
-      highestObservedGeneration = Math.max(highestObservedGeneration, Number(match[1]));
-      filesystemStableProjectionDirectoryOperations.removeGeneration(
+      const quarantined = filesystemStableProjectionDirectoryOperations.quarantineGeneration(
         this.#projectionDirectory,
         identity,
         lockToken,
-        capture.identity,
+        image.identity,
+        randomBytes(16).toString("hex"),
       );
-      filesystemStableProjectionDirectoryOperations.removeGenerationValidationCapture(
+      this.#faultInjector?.hit("after-v2-orphan-quarantine-before-confirm");
+      filesystemStableProjectionDirectoryOperations.removeQuarantinedGeneration(
         this.#projectionDirectory,
         identity,
         lockToken,
-        capture,
+        quarantined.filename,
+        quarantined,
       );
     }
     return highestObservedGeneration;
   }
 
-  #assertUnpublishedV2Candidate(path: string, filename: string, binding: ProjectBinding): void {
+  #assertUnpublishedV2Candidate(bytes: Uint8Array, filename: string, binding: ProjectBinding): void {
     let database: DatabaseSync | undefined;
     try {
-      database = new DatabaseSync(path, { readOnly: true });
+      database = openImmutableProjectionImage(bytes);
       assertUnpublishedV2Image(database, filename, binding);
     } catch (error) {
       if (error instanceof Error && error.message === "PROJECTION_PUBLICATION_RECOVERY_REQUIRED") throw error;
@@ -1043,6 +1059,20 @@ export class V2ProjectionBuildCoordinator {
     } finally {
       database?.close();
     }
+  }
+
+  #ensureProjectionDirectory(): ProjectionDirectoryIdentity {
+    if (!this.#assertProjectionDirectorySafe()) {
+      try {
+        mkdirSync(this.#projectionDirectory, { recursive: false });
+      } catch (error) {
+        if (!notFound(error) && !(typeof error === "object" && error !== null && "code" in error && error.code === "EEXIST")) {
+          throw error;
+        }
+      }
+      if (!this.#assertProjectionDirectorySafe()) throw new Error("PROJECTION_PATH_INVALID");
+    }
+    return this.#requiredDirectoryIdentity();
   }
 
   #nextGeneration(minimumGeneration: number): number {

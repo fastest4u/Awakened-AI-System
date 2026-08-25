@@ -684,6 +684,12 @@ interface ManifestPublicationAttempt {
   readonly transactionToken: string;
 }
 
+export interface ProjectionManifestPublicationLease {
+  readonly directoryIdentity: ProjectionDirectoryIdentity;
+  readonly lockToken: string;
+  release(retainAsRecoveryEvidence?: boolean): void;
+}
+
 const manifestPublicationLocks = new Map<string, ManifestPublicationLockState>();
 
 function publicationToken(): string {
@@ -766,6 +772,39 @@ function finishManifestPublicationAttempt(attempt: ManifestPublicationAttempt): 
     !attempt.state.poisoned
     && manifestPublicationLocks.get(attempt.key) === attempt.state
   ) manifestPublicationLocks.delete(attempt.key);
+}
+
+/**
+ * Acquires the same cooperative lock used by manifest publication. Nested
+ * publishProjectionManifest calls in this process re-enter this lease, so a
+ * V2 reconciliation can retain one lock from entry through publication.
+ */
+export function acquireProjectionManifestPublicationLease(
+  projectionDirectory: string,
+): ProjectionManifestPublicationLease {
+  const directory = safeProjectionDirectory(projectionDirectory, filesystemProjectionPathInspection);
+  let identity: ProjectionDirectoryIdentity;
+  try {
+    identity = filesystemStableProjectionDirectoryOperations.capture(directory);
+  } catch {
+    return materializationConflict();
+  }
+  const attempt = beginManifestPublicationAttempt(
+    directory,
+    identity,
+    filesystemStableProjectionDirectoryOperations,
+  );
+  let finished = false;
+  return Object.freeze({
+    directoryIdentity: identity,
+    lockToken: attempt.state.lockToken,
+    release(retainAsRecoveryEvidence = false): void {
+      if (finished) return materializationConflict();
+      finished = true;
+      if (retainAsRecoveryEvidence) attempt.state.poisoned = true;
+      finishManifestPublicationAttempt(attempt);
+    },
+  });
 }
 
 function poisonManifestPublication(attempt: ManifestPublicationAttempt): never {
