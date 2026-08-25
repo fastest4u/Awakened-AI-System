@@ -46,8 +46,10 @@ Update the existing post-rename A-to-B swap regression in the same test file
 to locate a strict `.projections-2-retired-<32hex>.sqlite` entry rather than a
 quarantine entry.  At the existing post-rename fault boundary, move that
 retired file aside and place forged bytes at the same retired filename.  The
-test must continue to expect a fail-closed error and retained evidence.  This
-is the direct negative control for the four-field continuity predicate: a
+test must expect `PROJECTION_PUBLICATION_RECOVERY_REQUIRED` and retained
+evidence: after the coordinator-owned rename, a changed pathname is a
+publication-recovery ambiguity, not a normal stable-path input error.  This is
+the direct negative control for the four-field continuity predicate: a
 timestamp change is permitted, but a changed device/inode/size/SHA-256 is not.
 
 - [ ] **Step 2: Run the focused test and verify RED on the current exact-post-rename code**
