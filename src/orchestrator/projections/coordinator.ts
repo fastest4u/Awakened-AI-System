@@ -7,16 +7,9 @@ import {
   readdirSync,
 } from "node:fs";
 import { basename, isAbsolute, join, normalize, resolve } from "node:path";
-import { DatabaseSync } from "node:sqlite";
 
 import { LifecycleError } from "../lifecycle/errors.js";
 import type { BuiltProjectionGeneration, StagedProjectionGeneration } from "./builder.js";
-import {
-  PROJECTION_NAMES,
-  projectionCoreChecksum,
-  type CanonicalProjectionRow,
-  type ProjectionName,
-} from "./checksum.js";
 import type { ProjectBinding } from "./contracts.js";
 import type { ProjectionEventReader, ProjectionEventSnapshot } from "./event-reader.js";
 import {
@@ -33,7 +26,7 @@ import {
   type ProjectionPathInspection,
 } from "./manifest.js";
 import { V2ReconciliationJournal } from "./reconciliation-journal.js";
-import { openImmutableProjectionImage } from "./integrity.js";
+import { assertUnpublishedProjectionV2Image } from "./integrity.js";
 import {
   ProjectionLeaseUnavailableError,
   ProjectionReaderLeaseRegistry,
@@ -46,27 +39,10 @@ import {
   type ProjectionDirectoryIdentity,
   type StableProjectionGenerationIdentity,
 } from "./stable-directory.js";
-import { PROJECTION_SCHEMA_SQL_V2, PROJECTION_SCHEMA_VERSION } from "./schema.js";
 
 const MAX_GENERATION = 2_147_483_647;
 const GENERATION_FILE = /^projections-1-([1-9][0-9]{0,9})\.sqlite$/u;
 const V2_GENERATION_FILE = /^projections-2-([1-9][0-9]{0,9})\.sqlite$/u;
-const HASH = /^[0-9a-f]{64}$/u;
-const RECOVERY_INTEGER_COLUMNS = new Set(["checkpoint_version", "owner_generation", "usefulness"]);
-const RECOVERY_TABLES = Object.freeze({
-  sessionTree: ["session_tree", ["project_id", "session_id", "root_session_id", "parent_session_id", "lifecycle_state", "owner_generation", "opened_event_position", "closed_event_position", "latest_checkpoint_id", "latest_checkpoint_event_position", "source_event_id", "source_event_position", "anchor"], "project_id, session_id"],
-  sessionCheckpoints: ["session_checkpoints", ["project_id", "session_id", "checkpoint_id", "checkpoint_version", "base_event_position", "source_event_id", "source_event_position", "occurred_at", "task_summary", "anchor"], "project_id, session_id, source_event_position, checkpoint_id"],
-  canonicalItems: ["canonical_items", ["project_id", "session_id", "item_id", "normalized_key", "conflict_group_id", "superseding_item_id", "status", "confidence", "verification_method", "valid_from", "valid_to", "summary", "content_hash", "known_from_event_position", "source_event_id", "source_event_position", "anchor"], "project_id, item_id"],
-  tasksFollowups: ["tasks_followups", ["project_id", "session_id", "follow_up_id", "status", "summary", "confidence", "source_event_id", "source_event_position", "anchor"], "project_id, follow_up_id"],
-  artifactsFiles: ["artifacts_files", ["project_id", "session_id", "artifact_id", "path", "summary", "action", "content_hash", "branch_ref", "confidence", "symbol", "commit_hash", "heading", "source_event_id", "source_event_position", "anchor"], "project_id, session_id, artifact_id"],
-  lexicalChunks: ["lexical_chunks", ["project_id", "chunk_id", "item_id", "session_id", "section", "normalized_key", "text", "source_event_id", "source_event_position", "anchor"], "project_id, chunk_id"],
-  retrievalFeedback: ["retrieval_feedback", ["project_id", "feedback_id", "item_id", "outcome", "usefulness", "source_item_event_position", "source_event_id", "source_event_position", "anchor"], "project_id, feedback_id"],
-} as const satisfies Record<Exclude<ProjectionName, "entityGraph">, readonly [string, readonly string[], string]>);
-const RECOVERY_ENTITY_TABLES = Object.freeze([
-  ["node", "entity_nodes", ["project_id", "entity_id", "normalized_name", "entity_type", "valid_from", "valid_to", "source_event_id", "source_event_position", "anchor"], "project_id, entity_id"],
-  ["alias", "entity_aliases", ["project_id", "alias_id", "entity_id", "normalized_alias", "valid_from", "valid_to", "source_event_id", "source_event_position", "anchor"], "project_id, alias_id"],
-  ["edge", "entity_edges", ["project_id", "edge_id", "source_entity_id", "target_entity_id", "edge_type", "valid_from", "valid_to", "source_event_id", "source_event_position", "anchor"], "project_id, edge_id"],
-] as const);
 
 export interface PublishedProjectionGeneration extends BuiltProjectionGeneration {
   readonly directoryIdentity: ProjectionDirectoryIdentity;
@@ -159,147 +135,6 @@ function sha256File(path: string): string {
 
 function position(manifest: ProjectionManifestV1): bigint {
   return BigInt(manifest.terminalEventPosition);
-}
-
-function recoveryStatement(database: DatabaseSync, sql: string) {
-  const result = database.prepare(sql);
-  result.setReadBigInts(true);
-  return result;
-}
-
-function recoveryCanonicalValue(value: unknown, column: string): CanonicalProjectionRow[string] {
-  if (value === null || typeof value === "string") return value;
-  if (typeof value === "bigint") {
-    if (RECOVERY_INTEGER_COLUMNS.has(column)) {
-      if (value < BigInt(Number.MIN_SAFE_INTEGER) || value > BigInt(Number.MAX_SAFE_INTEGER)) {
-        throw new Error("PROJECTION_PUBLICATION_RECOVERY_REQUIRED");
-      }
-      return Number(value);
-    }
-    return value.toString();
-  }
-  if (typeof value === "number" && Number.isSafeInteger(value)) {
-    return RECOVERY_INTEGER_COLUMNS.has(column) ? value : value.toString();
-  }
-  throw new Error("PROJECTION_PUBLICATION_RECOVERY_REQUIRED");
-}
-
-function recoverySchemaRows(database: DatabaseSync): readonly string[] {
-  return recoveryStatement(database, `
-    SELECT type, name, tbl_name, sql FROM sqlite_schema ORDER BY type, name, tbl_name
-  `).all().map((row) => JSON.stringify([row.type, row.name, row.tbl_name, row.sql], (_key, value) => (
-    typeof value === "bigint" ? value.toString() : value
-  )));
-}
-
-function assertRecoveryV2Schema(database: DatabaseSync): void {
-  const reference = new DatabaseSync(":memory:", {
-    enableDoubleQuotedStringLiterals: false,
-    allowExtension: false,
-  });
-  try {
-    reference.exec(PROJECTION_SCHEMA_SQL_V2);
-    if (JSON.stringify(recoverySchemaRows(database)) !== JSON.stringify(recoverySchemaRows(reference))) {
-      throw new Error("PROJECTION_PUBLICATION_RECOVERY_REQUIRED");
-    }
-    const actualFts = recoveryStatement(database, `
-      SELECT k, v FROM lexical_chunks_fts_config ORDER BY k
-    `).all().map((row) => JSON.stringify([row.k, row.v], (_key, value) => (
-      typeof value === "bigint" ? value.toString() : value
-    )));
-    const referenceFts = recoveryStatement(reference, `
-      SELECT k, v FROM lexical_chunks_fts_config ORDER BY k
-    `).all().map((row) => JSON.stringify([row.k, row.v], (_key, value) => (
-      typeof value === "bigint" ? value.toString() : value
-    )));
-    if (JSON.stringify(actualFts) !== JSON.stringify(referenceFts)) {
-      throw new Error("PROJECTION_PUBLICATION_RECOVERY_REQUIRED");
-    }
-  } finally {
-    reference.close();
-  }
-}
-
-function recoveryRows(
-  database: DatabaseSync,
-  name: ProjectionName,
-): readonly CanonicalProjectionRow[] {
-  if (name === "entityGraph") {
-    const result: CanonicalProjectionRow[] = [];
-    for (const [relation, table, columns, order] of RECOVERY_ENTITY_TABLES) {
-      for (const raw of recoveryStatement(database, `
-        SELECT ${columns.join(", ")} FROM ${table} ORDER BY ${order}
-      `).iterate()) {
-        const row: Record<string, CanonicalProjectionRow[string]> = { relation };
-        for (const column of columns) row[column] = recoveryCanonicalValue(raw[column], column);
-        result.push(Object.freeze(row));
-      }
-    }
-    return Object.freeze(result);
-  }
-  const [table, columns, order] = RECOVERY_TABLES[name];
-  const rows: CanonicalProjectionRow[] = [];
-  for (const raw of recoveryStatement(database, `
-    SELECT ${columns.join(", ")} FROM ${table} ORDER BY ${order}
-  `).iterate()) {
-    const row: Record<string, CanonicalProjectionRow[string]> = {};
-    for (const column of columns) row[column] = recoveryCanonicalValue(raw[column], column);
-    rows.push(Object.freeze(row));
-  }
-  return Object.freeze(rows);
-}
-
-function assertUnpublishedV2Image(
-  database: DatabaseSync,
-  filename: string,
-  binding: ProjectBinding,
-): void {
-  database.exec("PRAGMA trusted_schema = OFF; PRAGMA query_only = ON;");
-  assertRecoveryV2Schema(database);
-  const metadataRows = recoveryStatement(database, `
-    SELECT singleton, schema_version, project_id, vault_id, store_id, workspace_id,
-           branch_scope_id, branch_ref, session_id, generation,
-           terminal_event_position, terminal_event_hash, created_at
-    FROM projection_metadata ORDER BY singleton
-  `).all();
-  const metadata = metadataRows.length === 1 ? metadataRows[0] : undefined;
-  const match = V2_GENERATION_FILE.exec(filename);
-  const terminalPosition = metadata?.terminal_event_position;
-  if (
-    metadata === undefined || match === null || metadata.singleton !== 1n || metadata.schema_version !== 2n
-    || metadata.project_id !== binding.projectId || metadata.vault_id !== binding.vaultId
-    || metadata.store_id !== binding.storeId || metadata.workspace_id !== binding.workspaceId
-    || metadata.branch_scope_id !== binding.branchScopeId || metadata.branch_ref !== binding.branchRef
-    || metadata.session_id !== null || metadata.generation !== BigInt(match[1]!)
-    || typeof terminalPosition !== "bigint" || terminalPosition < 0n
-    || typeof metadata.terminal_event_hash !== "string" || !HASH.test(metadata.terminal_event_hash)
-    || typeof metadata.created_at !== "string" || metadata.created_at.length === 0 || metadata.created_at.length > 128
-  ) throw new Error("PROJECTION_PUBLICATION_RECOVERY_REQUIRED");
-  const persisted = new Map<string, string>();
-  for (const row of recoveryStatement(database, `
-    SELECT projection_name, checksum FROM projection_core_checksums ORDER BY projection_name
-  `).iterate()) {
-    if (typeof row.projection_name !== "string" || typeof row.checksum !== "string" || !HASH.test(row.checksum)) {
-      throw new Error("PROJECTION_PUBLICATION_RECOVERY_REQUIRED");
-    }
-    if (persisted.has(row.projection_name)) throw new Error("PROJECTION_PUBLICATION_RECOVERY_REQUIRED");
-    persisted.set(row.projection_name, row.checksum);
-  }
-  if (persisted.size !== PROJECTION_NAMES.length) throw new Error("PROJECTION_PUBLICATION_RECOVERY_REQUIRED");
-  for (const name of PROJECTION_NAMES) {
-    const actual = projectionCoreChecksum(
-      name,
-      PROJECTION_SCHEMA_VERSION,
-      binding.projectId,
-      terminalPosition,
-      recoveryRows(database, name),
-    );
-    if (persisted.get(name) !== actual) throw new Error("PROJECTION_PUBLICATION_RECOVERY_REQUIRED");
-  }
-  if (
-    recoveryStatement(database, "PRAGMA integrity_check").get()?.integrity_check !== "ok"
-    || recoveryStatement(database, "PRAGMA foreign_key_check").all().length !== 0
-  ) throw new Error("PROJECTION_PUBLICATION_RECOVERY_REQUIRED");
 }
 
 function canonicalDirectory(path: string): string {
@@ -1049,15 +884,11 @@ export class V2ProjectionBuildCoordinator {
   }
 
   #assertUnpublishedV2Candidate(bytes: Uint8Array, filename: string, binding: ProjectBinding): void {
-    let database: DatabaseSync | undefined;
     try {
-      database = openImmutableProjectionImage(bytes);
-      assertUnpublishedV2Image(database, filename, binding);
+      assertUnpublishedProjectionV2Image(bytes, filename, binding);
     } catch (error) {
       if (error instanceof Error && error.message === "PROJECTION_PUBLICATION_RECOVERY_REQUIRED") throw error;
       throw new Error("PROJECTION_PUBLICATION_RECOVERY_REQUIRED", { cause: error });
-    } finally {
-      database?.close();
     }
   }
 

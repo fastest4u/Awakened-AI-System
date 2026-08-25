@@ -45,6 +45,8 @@ const MAX_ROWS = 100_000;
 const MAX_VALUE_BYTES = 256 * 1_024;
 const MAX_CANONICAL_BYTES = 32 * 1024 * 1024;
 const MAX_PROJECTION_DATABASE_BYTES = 128 * 1024 * 1024;
+const UNPUBLISHED_V2_GENERATION_FILE = /^projections-2-([1-9][0-9]{0,9})\.sqlite$/u;
+const HASH = /^[0-9a-f]{64}$/u;
 
 export type ProjectionIntegrityFaultBoundary =
   | "after-generation-identity-before-open"
@@ -951,6 +953,148 @@ function assertFtsSemantics(
     }
   } finally {
     reference.close();
+  }
+}
+
+function assertUnpublishedV2Metadata(
+  database: DatabaseSync,
+  filename: string,
+  binding: ProjectBinding,
+): bigint {
+  const iterator = statement(database, `
+    SELECT singleton, schema_version, project_id, vault_id, store_id, workspace_id,
+           branch_scope_id, branch_ref, session_id, generation,
+           terminal_event_position, terminal_event_hash, created_at
+    FROM projection_metadata ORDER BY singleton
+  `).iterate();
+  const first = iterator.next();
+  const filenameMatch = UNPUBLISHED_V2_GENERATION_FILE.exec(filename);
+  if (first.done || !iterator.next().done || filenameMatch === null) return integrity();
+  const metadata = first.value;
+  const terminalEventPosition = metadata.terminal_event_position;
+  if (
+    metadata.singleton !== 1n
+    || metadata.schema_version !== BigInt(PROJECTION_SCHEMA_VERSION)
+    || metadata.project_id !== binding.projectId
+    || metadata.vault_id !== binding.vaultId
+    || metadata.store_id !== binding.storeId
+    || metadata.workspace_id !== binding.workspaceId
+    || metadata.branch_scope_id !== binding.branchScopeId
+    || metadata.branch_ref !== binding.branchRef
+    || metadata.session_id !== null
+    || metadata.generation !== BigInt(filenameMatch[1]!)
+    || typeof terminalEventPosition !== "bigint" || terminalEventPosition < 0n
+    || typeof metadata.terminal_event_hash !== "string" || !HASH.test(metadata.terminal_event_hash)
+    || typeof metadata.created_at !== "string" || metadata.created_at.length === 0 || metadata.created_at.length > 128
+  ) return integrity();
+  return terminalEventPosition;
+}
+
+function persistedCoreChecksums(database: DatabaseSync): Readonly<Record<ProjectionName, string>> {
+  const result = {} as Record<ProjectionName, string>;
+  const seen = new Set<string>();
+  for (const row of statement(database, `
+    SELECT projection_name, checksum FROM projection_core_checksums ORDER BY projection_name
+  `).iterate()) {
+    if (
+      typeof row.projection_name !== "string"
+      || typeof row.checksum !== "string"
+      || !HASH.test(row.checksum)
+      || seen.has(row.projection_name)
+      || !PROJECTION_NAMES.includes(row.projection_name as ProjectionName)
+    ) return integrity();
+    seen.add(row.projection_name);
+    result[row.projection_name as ProjectionName] = row.checksum;
+  }
+  if (seen.size !== PROJECTION_NAMES.length) return integrity();
+  return Object.freeze(result);
+}
+
+function readUnpublishedCoreRows(database: DatabaseSync): ProjectionRows {
+  const result = {} as Record<ProjectionName, readonly CanonicalProjectionRow[]>;
+  let totalBytes = 0;
+  for (const name of PROJECTION_NAMES) {
+    if (name === "entityGraph") {
+      const rows: CanonicalProjectionRow[] = [];
+      for (const entity of ENTITY_TABLES) {
+        for (const raw of statement(database, `
+          SELECT ${entity.columns.join(", ")} FROM ${entity.table} ORDER BY ${entity.order}
+        `).iterate()) {
+          if (rows.length >= MAX_ROWS) return integrity();
+          const row: Record<string, CanonicalProjectionRow[string]> = { relation: entity.relation };
+          for (const column of entity.columns) {
+            if (!(column in raw)) return integrity();
+            row[column] = canonicalValue(raw[column], column);
+            totalBytes += Buffer.byteLength(JSON.stringify(row[column]), "utf8");
+            if (totalBytes > MAX_CANONICAL_BYTES) return integrity();
+          }
+          rows.push(Object.freeze(row));
+        }
+      }
+      result[name] = Object.freeze(rows);
+      continue;
+    }
+    const definition: ProjectionTable = TABLES[name];
+    const selected = definition.canonicalRowId
+      ? ["row_id", ...definition.columns]
+      : definition.columns;
+    const rows: CanonicalProjectionRow[] = [];
+    for (const raw of statement(database, `
+      SELECT ${selected.join(", ")} FROM ${definition.table} ORDER BY ${definition.order}
+    `).iterate()) {
+      if (rows.length >= MAX_ROWS) return integrity();
+      if (definition.canonicalRowId && raw.row_id !== BigInt(rows.length + 1)) return integrity();
+      const row: Record<string, CanonicalProjectionRow[string]> = {};
+      for (const column of definition.columns) {
+        if (!(column in raw)) return integrity();
+        row[column] = canonicalValue(raw[column], column);
+        totalBytes += Buffer.byteLength(JSON.stringify(row[column]), "utf8");
+        if (totalBytes > MAX_CANONICAL_BYTES) return integrity();
+      }
+      rows.push(Object.freeze(row));
+    }
+    result[name] = Object.freeze(rows);
+  }
+  return Object.freeze(result);
+}
+
+/**
+ * Validates an unpublished V2 generation from immutable bytes before any
+ * reconciliation disposition can be considered.
+ */
+export function assertUnpublishedProjectionV2Image(
+  bytes: Uint8Array,
+  filename: string,
+  binding: ProjectBinding,
+): void {
+  let database: DatabaseSync | undefined;
+  try {
+    database = openImmutableProjectionImage(bytes);
+    database.exec("BEGIN");
+    assertCanonicalSchema(database);
+    const terminalEventPosition = assertUnpublishedV2Metadata(database, filename, binding);
+    assertSqliteIntegrity(database);
+    const checksums = persistedCoreChecksums(database);
+    const rows = readUnpublishedCoreRows(database);
+    for (const name of PROJECTION_NAMES) {
+      if (
+        projectionCoreChecksum(
+          name,
+          PROJECTION_SCHEMA_VERSION,
+          binding.projectId,
+          terminalEventPosition,
+          rows[name],
+        ) !== checksums[name]
+      ) return integrity();
+    }
+    assertReferences(database);
+    assertFtsSemantics(database, rows.lexicalChunks);
+    database.exec("COMMIT");
+  } catch (error) {
+    try { database?.exec("ROLLBACK"); } catch { /* preserve integrity failure */ }
+    throw error;
+  } finally {
+    database?.close();
   }
 }
 

@@ -12,7 +12,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, it } from "node:test";
 
@@ -38,6 +38,7 @@ import {
 import type { ProjectBinding } from "../src/orchestrator/projections/contracts.js";
 import { SqliteProjectionEventReader } from "../src/orchestrator/projections/event-reader.js";
 import {
+  assertUnpublishedProjectionV2Image,
   ProjectionIntegrityService,
 } from "../src/orchestrator/projections/integrity.js";
 import {
@@ -371,6 +372,30 @@ function resignedManifest(
     databaseSha256: databaseSha256(fixture.databasePath),
     coreChecksums,
   }, BINDING);
+}
+
+function resignedUnpublishedImage(fixture: Fixture): Uint8Array {
+  const terminal = BigInt(fixture.manifest.terminalEventPosition);
+  const database = new DatabaseSync(fixture.databasePath);
+  try {
+    const update = database.prepare(`
+      UPDATE projection_core_checksums SET checksum = ? WHERE projection_name = ?
+    `);
+    for (const name of PROJECTION_NAMES) update.run(coreChecksum(fixture.databasePath, name, terminal), name);
+    database.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+    assert.equal(database.prepare("PRAGMA journal_mode=DELETE").get()?.journal_mode, "delete");
+  } finally {
+    database.close();
+  }
+  assertMainFileOnly(fixture.databasePath);
+  return readFileSync(fixture.databasePath);
+}
+
+function expectUnpublishedImageRejection(
+  fixture: Fixture,
+  bytes: Uint8Array,
+): void {
+  assert.throws(() => assertUnpublishedProjectionV2Image(bytes, basename(fixture.databasePath), BINDING));
 }
 
 function expectIntegrityFailure(action: () => unknown): void {
@@ -921,6 +946,16 @@ describe("full projection integrity replay", () => {
     ));
   });
 
+  it("rejects a re-signed unpublished V2 image with a corrupt cross-table reference", async () => {
+    const fixture = await createFixture();
+    mutateDatabase(fixture, `
+      UPDATE retrieval_feedback SET item_id = '00000000-0000-4000-8000-000000000499'
+      WHERE feedback_id = '${FEEDBACK_ID}'
+    `);
+
+    expectUnpublishedImageRejection(fixture, resignedUnpublishedImage(fixture));
+  });
+
   it("detects FTS index tampering even when core rows and checksums are unchanged", async () => {
     const fixture = await createFixture();
     const database = new DatabaseSync(fixture.databasePath);
@@ -943,6 +978,27 @@ describe("full projection integrity replay", () => {
       BINDING,
       resignedManifest(fixture),
     ));
+  });
+
+  it("rejects a re-signed unpublished V2 image with FTS semantic tampering", async () => {
+    const fixture = await createFixture();
+    const database = new DatabaseSync(fixture.databasePath);
+    try {
+      const row = database.prepare(`
+        SELECT row_id, normalized_key, text FROM lexical_chunks WHERE item_id = ?
+      `).get(ITEM_A);
+      assert.notEqual(row, undefined);
+      database.prepare(`
+        INSERT INTO lexical_chunks_fts(lexical_chunks_fts, rowid, normalized_key, text)
+        VALUES ('delete', ?, ?, ?)
+      `).run(row!.row_id, row!.normalized_key, row!.text);
+      database.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+      assert.equal(database.prepare("PRAGMA journal_mode=DELETE").get()?.journal_mode, "delete");
+    } finally {
+      database.close();
+    }
+
+    expectUnpublishedImageRejection(fixture, resignedUnpublishedImage(fixture));
   });
 
   it("detects a dropped required retrieval index after the database hash is re-signed", async () => {
