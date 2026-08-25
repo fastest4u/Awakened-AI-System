@@ -311,6 +311,11 @@ export function openImmutableProjectionImage(
     database.deserialize(deserializableImage(bytes));
     database.enableDefensive(true);
     database.exec(`
+      CREATE VIRTUAL TABLE temp.actual_vocab USING fts5vocab(
+        main,
+        lexical_chunks_fts,
+        instance
+      );
       PRAGMA query_only = ON;
       PRAGMA trusted_schema = OFF;
       PRAGMA foreign_keys = ON;

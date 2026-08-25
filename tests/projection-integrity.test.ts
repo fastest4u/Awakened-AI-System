@@ -395,7 +395,11 @@ function expectUnpublishedImageRejection(
   fixture: Fixture,
   bytes: Uint8Array,
 ): void {
-  assert.throws(() => assertUnpublishedProjectionV2Image(bytes, basename(fixture.databasePath), BINDING));
+  assert.throws(
+    () => assertUnpublishedProjectionV2Image(bytes, basename(fixture.databasePath), BINDING),
+    (error: unknown) => typeof error === "object" && error !== null
+      && (error as { code?: unknown }).code === "INTEGRITY_FAILURE",
+  );
 }
 
 function expectIntegrityFailure(action: () => unknown): void {
@@ -932,6 +936,16 @@ describe("full projection integrity replay", () => {
         resignedManifest(fixture),
       ));
     }
+  });
+
+  it("accepts a valid unpublished V2 image through the shared semantic validator", async () => {
+    const fixture = await createFixture();
+
+    assert.doesNotThrow(() => assertUnpublishedProjectionV2Image(
+      readFileSync(fixture.databasePath),
+      basename(fixture.databasePath),
+      BINDING,
+    ));
   });
 
   it("detects invalid derived references after outer hashes are recomputed", async () => {
