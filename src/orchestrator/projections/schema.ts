@@ -233,6 +233,14 @@ export const PROJECTION_SCHEMA_SQL_V2 = `
   ) STRICT;
   INSERT INTO projection_metadata(singleton, schema_version) VALUES (1, 2);
 
+  CREATE TABLE projection_core_checksums (
+    projection_name TEXT PRIMARY KEY CHECK (projection_name IN (
+      'sessionTree', 'sessionCheckpoints', 'canonicalItems', 'tasksFollowups',
+      'artifactsFiles', 'entityGraph', 'lexicalChunks', 'retrievalFeedback'
+    )),
+    checksum TEXT NOT NULL CHECK (length(checksum) = 64 AND checksum NOT GLOB '*[^0-9a-f]*')
+  ) STRICT;
+
   CREATE TABLE session_tree (
     project_id TEXT NOT NULL,
     session_id TEXT NOT NULL,

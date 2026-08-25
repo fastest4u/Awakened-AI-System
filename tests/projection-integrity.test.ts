@@ -860,8 +860,9 @@ describe("full projection integrity replay", () => {
   it("rejects a valid V1 manifest before any V2 source or projection byte path is opened", async () => {
     const fixture = await createFixture();
     const { sessionCheckpoints: _sessionCheckpoints, ...v1Checksums } = fixture.manifest.coreChecksums;
+    const { highestObservedGeneration: _highestObservedGeneration, ...v1Manifest } = fixture.manifest;
     const v1 = parseProjectionManifest({
-      ...fixture.manifest,
+      ...v1Manifest,
       schemaVersion: 1,
       databaseFile: "projections-1-1.sqlite",
       coreChecksums: v1Checksums,

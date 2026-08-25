@@ -502,7 +502,14 @@ function verifyPersistedChecksums(
       rows[name],
     );
     if (checksum !== expected[name]) return failure("PROJECTION_CHECKSUM_INVALID");
+    const persisted = connection.prepare(`
+      SELECT checksum FROM projection_core_checksums WHERE projection_name = $projectionName
+    `).get({ $projectionName: name });
+    if (persisted?.checksum !== checksum) return failure("PROJECTION_CHECKSUM_INVALID");
     verified[name] = checksum;
+  }
+  if (scalarCount(connection, "SELECT count(*) AS n FROM projection_core_checksums") !== BigInt(PROJECTION_NAMES.length)) {
+    return failure("PROJECTION_CHECKSUM_INVALID");
   }
   try {
     connection.prepare(`
@@ -552,6 +559,7 @@ function populate(
   generation: number,
   createdAt: string,
   rows: ProjectionRows,
+  coreChecksums: Readonly<Record<ProjectionName, string>>,
 ): void {
   connection.exec("BEGIN IMMEDIATE");
   try {
@@ -581,6 +589,12 @@ function populate(
       $terminalEventHash: snapshot.terminalEventHash,
       $createdAt: createdAt,
     });
+    for (const name of PROJECTION_NAMES) {
+      connection.prepare(`
+        INSERT INTO projection_core_checksums(projection_name, checksum)
+        VALUES ($projectionName, $checksum)
+      `).run({ $projectionName: name, $checksum: coreChecksums[name] });
+    }
     for (const name of PROJECTION_NAMES) {
       if (name === "entityGraph") {
         const relationRows = rows.entityGraph;
@@ -936,7 +950,7 @@ export class ImmutableProjectionBuilder {
         busyTimeoutMs: this.#busyTimeoutMs,
       });
       createProjectionSchema(connection);
-      populate(connection, snapshot, generation, createdAt, rows);
+      populate(connection, snapshot, generation, createdAt, rows, coreChecksums);
       verifyStructure(connection, snapshot, generation, rows);
       const persistedCoreChecksums = verifyPersistedChecksums(
         connection,
@@ -971,6 +985,7 @@ export class ImmutableProjectionBuilder {
         branchRef: snapshot.binding.branchRef,
         sessionId: null,
         generation,
+        highestObservedGeneration: generation,
         terminalEventPosition: snapshot.terminalEventPosition.toString(),
         terminalEventHash: snapshot.terminalEventHash,
         databaseFile,

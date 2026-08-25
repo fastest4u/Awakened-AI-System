@@ -39,6 +39,24 @@ const MANIFEST_KEYS = Object.freeze([
   "coreChecksums",
   "createdAt",
 ] as const);
+const MANIFEST_V2_KEYS = Object.freeze([
+  "schemaVersion",
+  "projectId",
+  "vaultId",
+  "storeId",
+  "workspaceId",
+  "branchScopeId",
+  "branchRef",
+  "sessionId",
+  "generation",
+  "highestObservedGeneration",
+  "terminalEventPosition",
+  "terminalEventHash",
+  "databaseFile",
+  "databaseSha256",
+  "coreChecksums",
+  "createdAt",
+] as const);
 const BINDING_KEYS = Object.freeze([
   "projectId",
   "vaultId",
@@ -90,6 +108,7 @@ export interface ProjectionManifestV2 {
   readonly branchRef: string | null;
   readonly sessionId: null;
   readonly generation: number;
+  readonly highestObservedGeneration: number;
   readonly terminalEventPosition: string;
   readonly terminalEventHash: string;
   readonly databaseFile: string;
@@ -314,7 +333,7 @@ export function parseProjectionManifestV2(
   value: unknown,
   expectedBinding: ProjectBinding,
 ): ProjectionManifestV2 {
-  const source = exactRecord(value, MANIFEST_KEYS);
+  const source = exactRecord(value, MANIFEST_V2_KEYS);
   const expected = validateExpectedBinding(expectedBinding);
   if (source.schemaVersion !== 2 || source.sessionId !== null || !sameScope(source, expected)) invalid();
   for (const key of ["projectId", "vaultId", "storeId", "workspaceId"] as const) assertHash(source[key]);
@@ -323,6 +342,11 @@ export function parseProjectionManifestV2(
   if (!Number.isSafeInteger(source.generation) || Number(source.generation) < 1 || Number(source.generation) > 2_147_483_647) {
     invalid();
   }
+  if (
+    !Number.isSafeInteger(source.highestObservedGeneration)
+    || Number(source.highestObservedGeneration) < Number(source.generation)
+    || Number(source.highestObservedGeneration) > 2_147_483_647
+  ) invalid();
   if (
     typeof source.terminalEventPosition !== "string"
     || !POSITION.test(source.terminalEventPosition)
@@ -344,6 +368,7 @@ export function parseProjectionManifestV2(
     branchRef: source.branchRef as string | null,
     sessionId: null,
     generation: source.generation as number,
+    highestObservedGeneration: source.highestObservedGeneration as number,
     terminalEventPosition: source.terminalEventPosition,
     terminalEventHash: source.terminalEventHash,
     databaseFile,

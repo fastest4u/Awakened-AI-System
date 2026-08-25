@@ -27,6 +27,8 @@ const MANIFEST_NAME = "projection-manifest.json";
 const MANIFEST_TEMP_NAME = ".projection-manifest.json.tmp";
 const LOCK_NAME = ${JSON.stringify(PROJECTION_MANIFEST_PUBLICATION_LOCK_FILENAME)};
 const TOKEN = /^[0-9a-f]{32}$/u;
+const V2_GENERATION = /^projections-2-([1-9][0-9]{0,9})\.sqlite$/u;
+const V2_VALIDATION_CAPTURE = /^\.projections-2-validation-([0-9a-f]{32})\.sqlite$/u;
 const normalized = (path) => {
   const value = resolve(path);
   return process.platform === "win32" ? value.toLowerCase() : value;
@@ -149,6 +151,7 @@ const captureFileIdentity = (name, maximumBytes = MAX_MANIFEST_BYTES) => {
       || opened.dev !== before.dev
       || opened.ino !== before.ino
       || opened.size !== before.size
+      || opened.ctimeNs !== before.ctimeNs
     ) invalid();
     const bytes = readFileSync(handle);
     const openedAfter = fstatSync(handle, { bigint: true });
@@ -158,9 +161,11 @@ const captureFileIdentity = (name, maximumBytes = MAX_MANIFEST_BYTES) => {
       || openedAfter.dev !== opened.dev
       || openedAfter.ino !== opened.ino
       || openedAfter.size !== opened.size
+      || openedAfter.ctimeNs !== opened.ctimeNs
       || after.dev !== before.dev
       || after.ino !== before.ino
       || after.size !== before.size
+      || after.ctimeNs !== before.ctimeNs
       || !after.isFile()
       || after.isSymbolicLink()
     ) invalid();
@@ -169,6 +174,7 @@ const captureFileIdentity = (name, maximumBytes = MAX_MANIFEST_BYTES) => {
       device: opened.dev.toString(),
       inode: opened.ino.toString(),
       size: opened.size.toString(),
+      ctimeNs: opened.ctimeNs.toString(),
       sha256: createHash("sha256").update(bytes).digest("hex"),
       bytes,
     };
@@ -204,6 +210,7 @@ const fileMatchesArguments = (file, offset) => (
   && file.size === operationArguments[offset + 2]
   && file.sha256 === operationArguments[offset + 3]
 );
+const validationCaptureName = (token) => ".projections-2-validation-" + token + ".sqlite";
 const transactionNames = (attemptToken) => ({
   previous: ".projection-manifest.previous-" + attemptToken,
   attempted: ".projection-manifest.attempted-" + attemptToken,
@@ -252,6 +259,43 @@ try {
       device: captured.device,
       inode: captured.inode,
       size: captured.size,
+      ctimeNs: captured.ctimeNs,
+      sha256: captured.sha256,
+    }));
+  } else if (operation === "capture-generation-for-validation") {
+    const [lockToken, filename, captureToken] = operationArguments;
+    assertLock(assertToken(lockToken));
+    if (
+      typeof filename !== "string"
+      || !V2_GENERATION.test(filename)
+      || typeof captureToken !== "string"
+      || !TOKEN.test(captureToken)
+    ) invalid();
+    const capturedFilename = validationCaptureName(captureToken);
+    try {
+      lstatSync(capturedFilename);
+      invalid();
+    } catch (error) {
+      if (!error || error.code !== "ENOENT") throw error;
+    }
+    if (sidecarPresent(filename)) integrity();
+    const captured = captureFileIdentity(filename, MAX_GENERATION_BYTES);
+    linkSync(filename, capturedFilename);
+    const linked = captureFileIdentity(capturedFilename, MAX_GENERATION_BYTES);
+    if (
+      linked.device !== captured.device || linked.inode !== captured.inode
+      || linked.size !== captured.size || linked.sha256 !== captured.sha256
+      || sidecarPresent(filename) || sidecarPresent(capturedFilename)
+    ) integrity();
+    syncDirectory();
+    assertLock(lockToken);
+    process.stdout.write(JSON.stringify({
+      filename,
+      capturedFilename,
+      device: captured.device,
+      inode: captured.inode,
+      size: captured.size,
+      ctimeNs: linked.ctimeNs,
       sha256: captured.sha256,
     }));
   } else if (operation === "install-generation") {
@@ -283,7 +327,7 @@ try {
       process.stdout.write("installed");
     }
   } else if (operation === "remove-generation") {
-    const [lockToken, filename, device, inode, size, sha256] = operationArguments;
+    const [lockToken, filename, device, inode, size, ctimeNs, sha256] = operationArguments;
     assertLock(assertToken(lockToken));
     if (
       typeof filename !== "string"
@@ -292,7 +336,8 @@ try {
     const candidate = captureFileIdentity(filename, MAX_GENERATION_BYTES);
     if (
       candidate.device !== device || candidate.inode !== inode
-      || candidate.size !== size || candidate.sha256 !== sha256 || sidecarPresent(filename)
+      || candidate.size !== size || candidate.ctimeNs !== ctimeNs
+      || candidate.sha256 !== sha256 || sidecarPresent(filename)
     ) invalid();
     let lastError;
     for (let attempt = 0; attempt < 3; attempt += 1) {
@@ -308,6 +353,20 @@ try {
       }
     }
     if (lastError !== undefined) throw lastError;
+  } else if (operation === "remove-generation-capture") {
+    const [lockToken, capturedFilename, device, inode, size, sha256] = operationArguments;
+    assertLock(assertToken(lockToken));
+    if (typeof capturedFilename !== "string" || !V2_VALIDATION_CAPTURE.test(capturedFilename)) invalid();
+    const capture = captureFileIdentity(capturedFilename, MAX_GENERATION_BYTES);
+    if (
+      capture.device !== device || capture.inode !== inode
+      || capture.size !== size || capture.sha256 !== sha256
+      || sidecarPresent(capturedFilename)
+    ) invalid();
+    removeRegularFile(capturedFilename);
+    syncDirectory();
+    assertLock(lockToken);
+    process.stdout.write("removed");
   } else if (operation === "acquire-manifest-lock") {
     const lockToken = assertToken(operationArguments[0]);
     let handle;
@@ -607,7 +666,13 @@ export interface StableProjectionGenerationIdentity {
   readonly device: string;
   readonly inode: string;
   readonly size: string;
+  readonly ctimeNs: string;
   readonly sha256: string;
+}
+
+export interface StableProjectionGenerationValidationCapture {
+  readonly identity: StableProjectionGenerationIdentity;
+  readonly capturedFilename: string;
 }
 
 export type StableProjectionManifestSnapshot =
@@ -635,6 +700,13 @@ export interface StableProjectionDirectoryOperations {
     filename: string,
     identity: ProjectionDirectoryIdentity,
   ): StableProjectionGenerationIdentity;
+  captureGenerationForValidation(
+    directory: string,
+    identity: ProjectionDirectoryIdentity,
+    lockToken: string,
+    filename: string,
+    captureToken: string,
+  ): StableProjectionGenerationValidationCapture;
   installGeneration(
     directory: string,
     identity: ProjectionDirectoryIdentity,
@@ -648,6 +720,12 @@ export interface StableProjectionDirectoryOperations {
     identity: ProjectionDirectoryIdentity,
     lockToken: string,
     expected: StableProjectionGenerationIdentity,
+  ): "removed";
+  removeGenerationValidationCapture(
+    directory: string,
+    identity: ProjectionDirectoryIdentity,
+    lockToken: string,
+    capture: StableProjectionGenerationValidationCapture,
   ): "removed";
   captureManifest(
     directory: string,
@@ -746,8 +824,10 @@ function runStableMutation(
     | "cleanup"
     | "assert-generation"
     | "capture-generation"
+    | "capture-generation-for-validation"
     | "install-generation"
     | "remove-generation"
+    | "remove-generation-capture"
     | "capture-manifest"
     | "acquire-manifest-lock"
     | "prepare-manifest"
@@ -814,10 +894,11 @@ function decodeGenerationIdentity(value: string, filename: string): StableProjec
   if (typeof decoded !== "object" || decoded === null || Array.isArray(decoded)) return invalid();
   const source = decoded as Record<string, unknown>;
   if (
-    Reflect.ownKeys(source).length !== 4
+    Reflect.ownKeys(source).length !== 5
     || !decimal(source.device)
     || !decimal(source.inode)
     || !decimal(source.size)
+    || !decimal(source.ctimeNs)
     || BigInt(source.size) > BigInt(MAX_STABLE_GENERATION_BYTES)
     || typeof source.sha256 !== "string"
     || !/^[0-9a-f]{64}$/u.test(source.sha256)
@@ -827,8 +908,35 @@ function decodeGenerationIdentity(value: string, filename: string): StableProjec
     device: source.device,
     inode: source.inode,
     size: source.size,
+    ctimeNs: source.ctimeNs,
     sha256: source.sha256,
   });
+}
+
+function decodeGenerationValidationCapture(value: string): StableProjectionGenerationValidationCapture {
+  let decoded: unknown;
+  try {
+    decoded = JSON.parse(value) as unknown;
+  } catch {
+    return invalid();
+  }
+  if (typeof decoded !== "object" || decoded === null || Array.isArray(decoded)) return invalid();
+  const source = decoded as Record<string, unknown>;
+  if (
+    Reflect.ownKeys(source).length !== 7
+    || typeof source.filename !== "string"
+    || typeof source.capturedFilename !== "string"
+    || !/^projections-2-[1-9][0-9]{0,9}\.sqlite$/u.test(source.filename)
+    || !/^\.projections-2-validation-[0-9a-f]{32}\.sqlite$/u.test(source.capturedFilename)
+  ) return invalid();
+  const identity = decodeGenerationIdentity(JSON.stringify({
+    device: source.device,
+    inode: source.inode,
+    size: source.size,
+    ctimeNs: source.ctimeNs,
+    sha256: source.sha256,
+  }), source.filename);
+  return Object.freeze({ identity, capturedFilename: source.capturedFilename });
 }
 
 function decodeManifestSnapshot(
@@ -908,6 +1016,20 @@ StableProjectionDirectoryOperations = Object.freeze({
       filename,
     );
   },
+  captureGenerationForValidation(
+    directory: string,
+    identity: ProjectionDirectoryIdentity,
+    lockToken: string,
+    filename: string,
+    captureToken: string,
+  ): StableProjectionGenerationValidationCapture {
+    return decodeGenerationValidationCapture(runStableMutation(
+      "capture-generation-for-validation",
+      directory,
+      identity,
+      [lockToken, filename, captureToken],
+    ));
+  },
   installGeneration(
     directory: string,
     identity: ProjectionDirectoryIdentity,
@@ -940,7 +1062,25 @@ StableProjectionDirectoryOperations = Object.freeze({
       expected.device,
       expected.inode,
       expected.size,
+      expected.ctimeNs,
       expected.sha256,
+    ]);
+    if (result !== "removed") return invalid();
+    return result;
+  },
+  removeGenerationValidationCapture(
+    directory: string,
+    identity: ProjectionDirectoryIdentity,
+    lockToken: string,
+    capture: StableProjectionGenerationValidationCapture,
+  ): "removed" {
+    const result = runStableMutation("remove-generation-capture", directory, identity, [
+      lockToken,
+      capture.capturedFilename,
+      capture.identity.device,
+      capture.identity.inode,
+      capture.identity.size,
+      capture.identity.sha256,
     ]);
     if (result !== "removed") return invalid();
     return result;

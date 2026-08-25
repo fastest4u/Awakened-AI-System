@@ -349,6 +349,146 @@ describe("projection build coordinator", () => {
     source.close();
   });
 
+  it("persists a retired V2 generation high-water across reconciliation and coordinator restart", async () => {
+    const root = mkdtempSync(join(tmpdir(), "projection-v2-retired-high-water-"));
+    roots.push(root);
+    const sourcePath = join(root, "events.sqlite");
+    const projectionDirectory = join(root, "projections");
+    const source = sourceDatabase(sourcePath);
+    append(source, 1);
+    const driver = new NodeSqliteDriver({ DatabaseSync });
+    const healthy = new V2ProjectionBuildCoordinator({
+      projectionDirectory,
+      eventReader: new SqliteProjectionEventReader({ driver, eventStorePath: sourcePath }),
+      builder: new ImmutableProjectionBuilder({ driver, projectionDirectory, now: () => NOW }),
+    });
+    await healthy.ensurePublished(BINDING, 1n, 2_000);
+
+    append(source, 2);
+    const faulted = new V2ProjectionBuildCoordinator({
+      projectionDirectory,
+      eventReader: new SqliteProjectionEventReader({ driver, eventStorePath: sourcePath }),
+      builder: new ImmutableProjectionBuilder({ driver, projectionDirectory, now: () => NOW }),
+      faultInjector: { hit: (boundary) => {
+        if (boundary === "after-v2-generation-install-before-manifest") throw new Error("post-install");
+      } },
+    });
+    await assert.rejects(() => faulted.ensurePublished(BINDING, 2n, 2_000), /post-install/u);
+    assert.equal(existsSync(join(projectionDirectory, "projections-2-2.sqlite")), true);
+
+    const reconciler = new V2ProjectionBuildCoordinator({
+      projectionDirectory,
+      eventReader: new SqliteProjectionEventReader({ driver, eventStorePath: sourcePath }),
+      builder: new ImmutableProjectionBuilder({ driver, projectionDirectory, now: () => NOW }),
+    });
+    await reconciler.ensurePublished(BINDING, 1n, 2_000);
+    assert.equal(existsSync(join(projectionDirectory, "projections-2-2.sqlite")), false);
+    assert.equal(
+      parseProjectionManifestV2(
+        JSON.parse(readFileSync(join(projectionDirectory, "projection-manifest.json"), "utf8")),
+        BINDING,
+      ).highestObservedGeneration,
+      2,
+    );
+
+    append(source, 3);
+    const restarted = new V2ProjectionBuildCoordinator({
+      projectionDirectory,
+      eventReader: new SqliteProjectionEventReader({ driver, eventStorePath: sourcePath }),
+      builder: new ImmutableProjectionBuilder({ driver, projectionDirectory, now: () => NOW }),
+    });
+    const published = await restarted.ensurePublished(BINDING, 3n, 2_000);
+    assert.equal(published.manifest.generation, 3, "a deleted V2 final name must remain retired after restart");
+    source.close();
+  });
+
+  it("retains a V2 orphan when its terminal metadata no longer matches its persisted core checksums", async () => {
+    const root = mkdtempSync(join(tmpdir(), "projection-v2-orphan-terminal-integrity-"));
+    roots.push(root);
+    const sourcePath = join(root, "events.sqlite");
+    const projectionDirectory = join(root, "projections");
+    const source = sourceDatabase(sourcePath);
+    append(source, 1);
+    const driver = new NodeSqliteDriver({ DatabaseSync });
+    const faulted = new V2ProjectionBuildCoordinator({
+      projectionDirectory,
+      eventReader: new SqliteProjectionEventReader({ driver, eventStorePath: sourcePath }),
+      builder: new ImmutableProjectionBuilder({ driver, projectionDirectory, now: () => NOW }),
+      faultInjector: { hit: (boundary) => {
+        if (boundary === "after-v2-generation-install-before-manifest") throw new Error("post-install");
+      } },
+    });
+    await assert.rejects(() => faulted.ensurePublished(BINDING, 1n, 2_000), /post-install/u);
+    const orphan = join(projectionDirectory, "projections-2-1.sqlite");
+    const forged = new DatabaseSync(orphan);
+    try {
+      forged.exec(`
+        UPDATE projection_metadata
+        SET terminal_event_position = 0, terminal_event_hash = '${"0".repeat(64)}'
+        WHERE singleton = 1
+      `);
+    } finally {
+      forged.close();
+    }
+
+    const recovery = new V2ProjectionBuildCoordinator({
+      projectionDirectory,
+      eventReader: new SqliteProjectionEventReader({ driver, eventStorePath: sourcePath }),
+      builder: new ImmutableProjectionBuilder({ driver, projectionDirectory, now: () => NOW }),
+    });
+    await assert.rejects(
+      () => recovery.ensurePublished(BINDING, 1n, 2_000),
+      /PROJECTION_PUBLICATION_RECOVERY_REQUIRED/u,
+    );
+    assert.equal(existsSync(orphan), true);
+    assert.equal(existsSync(join(projectionDirectory, PROJECTION_MANIFEST_PUBLICATION_LOCK_FILENAME)), true);
+    source.close();
+  });
+
+  it("retains a swapped V2 orphan instead of deleting a pathname that differs from its validated capture", async () => {
+    const root = mkdtempSync(join(tmpdir(), "projection-v2-orphan-capture-swap-"));
+    roots.push(root);
+    const sourcePath = join(root, "events.sqlite");
+    const projectionDirectory = join(root, "projections");
+    const source = sourceDatabase(sourcePath);
+    append(source, 1);
+    const driver = new NodeSqliteDriver({ DatabaseSync });
+    const faulted = new V2ProjectionBuildCoordinator({
+      projectionDirectory,
+      eventReader: new SqliteProjectionEventReader({ driver, eventStorePath: sourcePath }),
+      builder: new ImmutableProjectionBuilder({ driver, projectionDirectory, now: () => NOW }),
+      faultInjector: { hit: (boundary) => {
+        if (boundary === "after-v2-generation-install-before-manifest") throw new Error("post-install");
+      } },
+    });
+    await assert.rejects(() => faulted.ensurePublished(BINDING, 1n, 2_000), /post-install/u);
+    const orphan = join(projectionDirectory, "projections-2-1.sqlite");
+    const displaced = join(projectionDirectory, "displaced-valid-orphan.sqlite");
+    const forged = join(projectionDirectory, "forged-orphan.sqlite");
+    writeFileSync(forged, "not a sqlite image", "utf8");
+
+    const recovery = new V2ProjectionBuildCoordinator({
+      projectionDirectory,
+      eventReader: new SqliteProjectionEventReader({ driver, eventStorePath: sourcePath }),
+      builder: new ImmutableProjectionBuilder({ driver, projectionDirectory, now: () => NOW }),
+      faultInjector: { hit(boundary: unknown): void {
+        if (boundary !== "after-v2-orphan-capture-before-validation") return;
+        renameSync(orphan, displaced);
+        renameSync(forged, orphan);
+        renameSync(orphan, forged);
+        renameSync(displaced, orphan);
+      } },
+    });
+    await assert.rejects(
+      () => recovery.ensurePublished(BINDING, 1n, 2_000),
+      /PROJECTION_PATH_INVALID/u,
+    );
+    assert.equal(existsSync(orphan), true);
+    assert.equal(readFileSync(forged, "utf8"), "not a sqlite image");
+    assert.equal(existsSync(join(projectionDirectory, PROJECTION_MANIFEST_PUBLICATION_LOCK_FILENAME)), true);
+    source.close();
+  });
+
   it("fails closed if the V2 projection directory swaps after authorization", async () => {
     const root = mkdtempSync(join(tmpdir(), "projection-v2-directory-swap-"));
     roots.push(root);
@@ -473,6 +613,43 @@ describe("projection build coordinator", () => {
       /PROJECTION_PUBLICATION_RECOVERY_REQUIRED/u,
     );
     assert.equal(sourceOpened, false);
+    source.close();
+  });
+
+  it("removes a verified V2 orphan before a non-fresh source failure", async () => {
+    const root = mkdtempSync(join(tmpdir(), "projection-v2-nonfresh-valid-reconcile-"));
+    roots.push(root);
+    const sourcePath = join(root, "events.sqlite");
+    const projectionDirectory = join(root, "projections");
+    const source = sourceDatabase(sourcePath);
+    append(source, 1);
+    const driver = new NodeSqliteDriver({ DatabaseSync });
+    const healthy = new V2ProjectionBuildCoordinator({
+      projectionDirectory,
+      eventReader: new SqliteProjectionEventReader({ driver, eventStorePath: sourcePath }),
+      builder: new ImmutableProjectionBuilder({ driver, projectionDirectory, now: () => NOW }),
+    });
+    await healthy.ensurePublished(BINDING, 1n, 2_000);
+    append(source, 2);
+    const faulted = new V2ProjectionBuildCoordinator({
+      projectionDirectory,
+      eventReader: new SqliteProjectionEventReader({ driver, eventStorePath: sourcePath }),
+      builder: new ImmutableProjectionBuilder({ driver, projectionDirectory, now: () => NOW }),
+      faultInjector: { hit: (boundary) => {
+        if (boundary === "after-v2-generation-install-before-manifest") throw new Error("post-install");
+      } },
+    });
+    await assert.rejects(() => faulted.ensurePublished(BINDING, 2n, 2_000), /post-install/u);
+    const orphan = join(projectionDirectory, "projections-2-2.sqlite");
+    assert.equal(existsSync(orphan), true);
+
+    const recovery = new V2ProjectionBuildCoordinator({
+      projectionDirectory,
+      eventReader: { async openCommittedSnapshot() { throw new Error("SOURCE_UNAVAILABLE"); } },
+      builder: { async buildV2() { throw new Error("builder must not run"); } },
+    });
+    await assert.rejects(() => recovery.ensurePublished(BINDING, 2n, 10_000), /SOURCE_UNAVAILABLE/u);
+    assert.equal(existsSync(orphan), false);
     source.close();
   });
 
