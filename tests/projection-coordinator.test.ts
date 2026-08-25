@@ -1444,6 +1444,53 @@ describe("projection build coordinator", () => {
         /PROJECTION_PATH_INVALID/u,
       );
       assert.deepEqual(evaluationLeases.activeFilenames(), []);
+      assert.equal(
+        existsSync(join(originalDirectory, PROJECTION_MANIFEST_PUBLICATION_LOCK_FILENAME)),
+        true,
+      );
+    } finally {
+      fixture.source.close();
+    }
+  });
+
+  it("retains swapped V2 evaluator acquisition lock evidence when the lock sees another directory identity", async () => {
+    const fixture = await publishedV2CoordinatorFixture();
+    try {
+      const root = join(fixture.projectionDirectory, "..");
+      const originalDirectory = join(root, "original-projections");
+      const attackerDirectory = join(root, "attacker-projections");
+      mkdirSync(attackerDirectory);
+      const nativeRealpath = realpathSync.native;
+      let stableCaptures = 0;
+      realpathSync.native = ((path: string): string => {
+        const canonical = nativeRealpath(path);
+        if (path === fixture.projectionDirectory && ++stableCaptures === 2) {
+          renameSync(fixture.projectionDirectory, originalDirectory);
+          renameSync(attackerDirectory, fixture.projectionDirectory);
+        }
+        return canonical;
+      }) as typeof realpathSync.native;
+      const evaluationLeases = new V2ProjectionReaderLeaseRegistry();
+      const coordinator = new V2ProjectionBuildCoordinator({
+        projectionDirectory: fixture.projectionDirectory,
+        evaluationLeases,
+        eventReader: { async openCommittedSnapshot() { throw new Error("source must not run"); } },
+        builder: { async buildV2() { throw new Error("builder must not run"); } },
+      });
+
+      try {
+        await assert.rejects(
+          () => coordinator.leasePublishedForEvaluation(BINDING),
+          /PROJECTION_PATH_INVALID/u,
+        );
+        assert.deepEqual(evaluationLeases.activeFilenames(), []);
+        assert.equal(
+          existsSync(join(fixture.projectionDirectory, PROJECTION_MANIFEST_PUBLICATION_LOCK_FILENAME)),
+          true,
+        );
+      } finally {
+        realpathSync.native = nativeRealpath;
+      }
     } finally {
       fixture.source.close();
     }

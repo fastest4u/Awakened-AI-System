@@ -685,7 +685,7 @@ export class V2ProjectionBuildCoordinator {
       const identity = this.#ensureProjectionDirectory();
       const publicationLease = acquireProjectionManifestPublicationLease(this.#projectionDirectory);
       if (!sameProjectionDirectoryIdentity(identity, publicationLease.directoryIdentity)) {
-        publicationLease.release(false);
+        publicationLease.release(true);
         throw new Error("PROJECTION_PATH_INVALID");
       }
       let failure: unknown;
