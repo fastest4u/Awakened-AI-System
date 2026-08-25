@@ -474,6 +474,52 @@ describe("projection build coordinator", () => {
     source.close();
   });
 
+  it("rejects a zero retired V2 generation high-water record without rewriting evidence", async () => {
+    const root = mkdtempSync(join(tmpdir(), "projection-v2-zero-retired-generation-"));
+    roots.push(root);
+    const sourcePath = join(root, "events.sqlite");
+    const projectionDirectory = join(root, "projections");
+    const source = sourceDatabase(sourcePath);
+    append(source, 1);
+    const driver = new NodeSqliteDriver({ DatabaseSync });
+    const coordinator = new V2ProjectionBuildCoordinator({
+      projectionDirectory,
+      eventReader: new SqliteProjectionEventReader({ driver, eventStorePath: sourcePath }),
+      builder: new ImmutableProjectionBuilder({ driver, projectionDirectory, now: () => NOW }),
+    });
+    await coordinator.ensurePublished(BINDING, 1n, 5_000);
+
+    const retiredFilename = `.projections-2-retired-${"a".repeat(32)}.sqlite`;
+    const retiredPath = join(projectionDirectory, retiredFilename);
+    writeFileSync(retiredPath, "retained evidence", "utf8");
+    const journalPath = join(projectionDirectory, "projection-reconciliation-v2.json");
+    const journalBytes = `${JSON.stringify({
+      highestReservedGeneration: 1,
+      retirements: [{
+        state: "retired",
+        generation: 0,
+        retiredFilename,
+        image: {
+          device: "0",
+          inode: "0",
+          size: "0",
+          ctimeNs: "0",
+          sha256: "0".repeat(64),
+        },
+      }],
+    })}\n`;
+    writeFileSync(journalPath, journalBytes, "utf8");
+
+    await assert.rejects(
+      () => coordinator.ensurePublished(BINDING, 1n, 5_000),
+      /PROJECTION_PUBLICATION_RECOVERY_REQUIRED/u,
+    );
+    assert.equal(readFileSync(journalPath, "utf8"), journalBytes);
+    assert.equal(readFileSync(retiredPath, "utf8"), "retained evidence");
+    assert.equal(existsSync(join(projectionDirectory, PROJECTION_MANIFEST_PUBLICATION_LOCK_FILENAME)), true);
+    source.close();
+  });
+
   it("does not reuse a reserved V2 final generation after restart without an active manifest", async () => {
     const root = mkdtempSync(join(tmpdir(), "projection-v2-journal-without-manifest-"));
     roots.push(root);

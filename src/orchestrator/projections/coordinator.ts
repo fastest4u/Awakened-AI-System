@@ -864,7 +864,11 @@ export class V2ProjectionBuildCoordinator {
         filename,
       );
       this.#faultInjector?.hit("after-v2-orphan-image-before-validation");
-      assertUnpublishedProjectionV2Image(image.bytes, filename, binding);
+      this.#assertUnpublishedV2Candidate(
+        image.bytes,
+        filename,
+        binding,
+      );
       const retiredFilename = `.projections-2-retired-${randomBytes(16).toString("hex")}.sqlite`;
       const intent = this.#reconciliationJournal.beginRetirement(
         this.#projectionDirectory,
@@ -904,6 +908,15 @@ export class V2ProjectionBuildCoordinator {
       );
     }
     return highestObservedGeneration;
+  }
+
+  #assertUnpublishedV2Candidate(bytes: Uint8Array, filename: string, binding: ProjectBinding): void {
+    try {
+      assertUnpublishedProjectionV2Image(bytes, filename, binding);
+    } catch (error) {
+      if (error instanceof Error && error.message === "PROJECTION_PUBLICATION_RECOVERY_REQUIRED") throw error;
+      throw new Error("PROJECTION_PUBLICATION_RECOVERY_REQUIRED", { cause: error });
+    }
   }
 
   #ensureProjectionDirectory(): ProjectionDirectoryIdentity {

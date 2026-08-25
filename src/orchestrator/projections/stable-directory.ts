@@ -240,6 +240,9 @@ const exactKeys = (value, keys) => (
 const validGeneration = (value) => (
   Number.isSafeInteger(value) && value >= 0 && value <= 2147483647
 );
+const validRetirementGeneration = (value) => (
+  Number.isSafeInteger(value) && value >= 1 && value <= 2147483647
+);
 const exactRetirementImage = (value) => {
   if (
     !exactKeys(value, ["device", "inode", "size", "ctimeNs", "sha256"])
@@ -259,7 +262,7 @@ const exactRetirementImage = (value) => {
   };
 };
 const exactRetirement = (value) => {
-  if (!validGeneration(value && value.generation)) invalid();
+  if (!validRetirementGeneration(value && value.generation)) invalid();
   if (value.state === "intent") {
     if (
       !exactKeys(value, ["state", "generation", "finalFilename", "retiredFilename", "image"])
@@ -330,7 +333,7 @@ const readJournal = () => {
     return exactJournal(captureFileIdentity(RECONCILIATION_JOURNAL_NAME).bytes);
   } catch (error) {
     if (error && error.code === "ENOENT") return { highestReservedGeneration: 0, retirements: [] };
-    throw error;
+    throw new Error("PROJECTION_PUBLICATION_RECOVERY_REQUIRED");
   }
 };
 const writeDurable = (name, bytes) => {
@@ -1081,6 +1084,9 @@ function runStableMutation(
     if (result.error === undefined && result.stderr === "INTEGRITY_FAILURE") {
       throw new LifecycleError("INTEGRITY_FAILURE");
     }
+    if (result.error === undefined && result.stderr === "PROJECTION_PUBLICATION_RECOVERY_REQUIRED") {
+      throw new Error("PROJECTION_PUBLICATION_RECOVERY_REQUIRED");
+    }
     return invalid(result.error ?? result.stderr);
   }
   return result.stdout;
@@ -1213,17 +1219,21 @@ function decodeRetirementImage(value: unknown): V2RetirementImage {
   });
 }
 
+function validRetirementGeneration(value: unknown): value is number {
+  return Number.isSafeInteger(value)
+    && (value as number) >= 1
+    && (value as number) <= 2_147_483_647;
+}
+
 function decodeRetirementRecord(value: unknown): V2RetirementIntent | V2RetiredGeneration {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return invalid();
   const source = value as Record<PropertyKey, unknown>;
   if (
-    !Number.isSafeInteger(source.generation)
-    || (source.generation as number) < 0
-    || (source.generation as number) > 2_147_483_647
+    !validRetirementGeneration(source.generation)
     || typeof source.retiredFilename !== "string"
     || !/^\.projections-2-retired-[0-9a-f]{32}\.sqlite$/u.test(source.retiredFilename)
   ) return invalid();
-  const generation = source.generation as number;
+  const generation = source.generation;
   const image = decodeRetirementImage(source.image);
   if (source.state === "intent") {
     if (
