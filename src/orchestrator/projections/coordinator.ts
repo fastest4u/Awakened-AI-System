@@ -604,6 +604,7 @@ export class V2ProjectionBuildCoordinator {
           reconciled.highestObservedGeneration,
           identity,
         );
+        this.#assertDeadline(expiresAt, requiredEventPosition, current);
         // A completed reconciliation is durable in the journal. Ordinary
         // source/build failures can release the cooperative lock; any later
         // publication ambiguity poisons its nested manifest attempt itself.
@@ -611,7 +612,6 @@ export class V2ProjectionBuildCoordinator {
         if (current !== null && BigInt(current.manifest.terminalEventPosition) >= requiredEventPosition) {
           return current;
         }
-        this.#assertDeadline(expiresAt, requiredEventPosition, current);
         this.#cleanupKnownTemps();
         const snapshot = await this.#eventReader.openCommittedSnapshot(binding);
         try {

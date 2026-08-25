@@ -70,6 +70,7 @@ const WORKSPACE_ID = "4".repeat(64) as WorkspaceId;
 const BRANCH_SCOPE_ID = "00000000-0000-4000-8000-000000000051" as BranchScopeId;
 const BRANCH_REF = "refs/heads/projection-coordinator";
 const NOW = "2026-08-23T03:00:00.000Z";
+const FUNCTIONAL_TEST_DEADLINE_MS = 15_000;
 const BINDING: ProjectBinding = Object.freeze({
   projectId: PROJECT_ID,
   vaultId: VAULT_ID,
@@ -271,6 +272,53 @@ async function publishedV2CoordinatorFixture(
   });
   await coordinator.ensurePublished(BINDING, 1n, 2_000);
   return Object.freeze({ source, coordinator, projectionDirectory });
+}
+
+interface V2DeadlineFixture {
+  readonly source: DatabaseSync;
+  readonly coordinator: V2ProjectionBuildCoordinator;
+  readonly projectionDirectory: string;
+  readonly calls: Readonly<{ sourceSnapshots: number; builds: number }>;
+  setNow(now: () => number): void;
+}
+
+async function v2DeadlineFixture(): Promise<V2DeadlineFixture> {
+  const root = mkdtempSync(join(tmpdir(), "projection-v2-deadline-"));
+  roots.push(root);
+  const sourcePath = join(root, "events.sqlite");
+  const projectionDirectory = join(root, "projections");
+  const source = sourceDatabase(sourcePath);
+  append(source, 1);
+  const driver = new NodeSqliteDriver({ DatabaseSync });
+  const eventReader = new SqliteProjectionEventReader({ driver, eventStorePath: sourcePath });
+  const builder = new ImmutableProjectionBuilder({ driver, projectionDirectory, now: () => NOW });
+  let currentNow: () => number = () => 0;
+  let sourceSnapshots = 0;
+  let builds = 0;
+  const coordinator = new V2ProjectionBuildCoordinator({
+    projectionDirectory,
+    eventReader: {
+      async openCommittedSnapshot(binding) {
+        sourceSnapshots += 1;
+        return eventReader.openCommittedSnapshot(binding);
+      },
+    },
+    builder: {
+      async buildV2(snapshot, generation) {
+        builds += 1;
+        return builder.buildV2(snapshot, generation);
+      },
+    },
+    now: () => currentNow(),
+  });
+  await coordinator.ensurePublished(BINDING, 1n, FUNCTIONAL_TEST_DEADLINE_MS);
+  return Object.freeze({
+    source,
+    coordinator,
+    projectionDirectory,
+    get calls() { return Object.freeze({ sourceSnapshots, builds }); },
+    setNow(now: () => number): void { currentNow = now; },
+  });
 }
 
 function assertOriginalV2EvaluationLease(lease: V2ProjectionReaderLease): void {
@@ -2381,6 +2429,47 @@ describe("projection build coordinator", () => {
     await new Promise<void>((resolve) => setTimeout(resolve, 70));
     assert.equal(existsSync(join(projectionDirectory, "projection-manifest.json")), false);
     source.close();
+  });
+
+  it("returns V2 projection lag at a zero deadline when a sufficient generation exists", async () => {
+    const fixture = await v2DeadlineFixture();
+    try {
+      const manifest = readFileSync(join(fixture.projectionDirectory, "projection-manifest.json"), "utf8");
+      const calls = fixture.calls;
+      fixture.setNow(() => 50);
+
+      await assert.rejects(
+        () => fixture.coordinator.ensurePublished(BINDING, 1n, 0),
+        (error: unknown) => error instanceof ProjectionLagError
+          && error.requiredEventPosition === 1n
+          && error.availableEventPosition === 1n,
+      );
+      assert.deepEqual(fixture.calls, calls);
+      assert.equal(readFileSync(join(fixture.projectionDirectory, "projection-manifest.json"), "utf8"), manifest);
+    } finally {
+      fixture.source.close();
+    }
+  });
+
+  it("returns V2 projection lag when a positive deadline elapses before its current-generation return", async () => {
+    const fixture = await v2DeadlineFixture();
+    try {
+      const manifest = readFileSync(join(fixture.projectionDirectory, "projection-manifest.json"), "utf8");
+      const calls = fixture.calls;
+      const ticks = [100, 101];
+      fixture.setNow(() => ticks.shift() ?? 101);
+
+      await assert.rejects(
+        () => fixture.coordinator.ensurePublished(BINDING, 1n, 1),
+        (error: unknown) => error instanceof ProjectionLagError
+          && error.requiredEventPosition === 1n
+          && error.availableEventPosition === 1n,
+      );
+      assert.deepEqual(fixture.calls, calls);
+      assert.equal(readFileSync(join(fixture.projectionDirectory, "projection-manifest.json"), "utf8"), manifest);
+    } finally {
+      fixture.source.close();
+    }
   });
 
   it("rejects a symlink-shaped projection directory before cleanup traversal", () => {
