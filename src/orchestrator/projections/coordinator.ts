@@ -689,6 +689,7 @@ export class V2ProjectionBuildCoordinator {
         throw new Error("PROJECTION_PATH_INVALID");
       }
       let failure: unknown;
+      let retainLock = true;
       try {
         if (!sameProjectionDirectoryIdentity(identity, this.#requiredDirectoryIdentity())) {
           throw new Error("PROJECTION_PATH_INVALID");
@@ -701,13 +702,15 @@ export class V2ProjectionBuildCoordinator {
           publicationLease.lockToken,
           published.manifest.databaseFile,
         );
-        return this.#evaluationLeases.acquire(Object.freeze({ manifest: published.manifest, image }));
+        const evaluatorLease = this.#evaluationLeases.acquire(Object.freeze({ manifest: published.manifest, image }));
+        retainLock = false;
+        return evaluatorLease;
       } catch (error) {
         failure = error;
         throw error;
       } finally {
         try {
-          publicationLease.release(false);
+          publicationLease.release(retainLock);
         } catch (error) {
           if (failure === undefined) throw error;
         }

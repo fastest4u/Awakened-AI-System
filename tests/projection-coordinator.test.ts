@@ -1507,9 +1507,32 @@ describe("projection build coordinator", () => {
           (error: unknown) => error instanceof LifecycleError && error.code === "INTEGRITY_FAILURE",
         );
         assert.deepEqual(evaluationLeases.activeFilenames(), []);
+        assert.equal(
+          existsSync(join(fixture.projectionDirectory, PROJECTION_MANIFEST_PUBLICATION_LOCK_FILENAME)),
+          true,
+        );
       } finally {
         fixture.source.close();
       }
+    }
+  });
+
+  it("retains V2 evaluator acquisition lock evidence when the published final checksum no longer matches", async () => {
+    const evaluationLeases = new V2ProjectionReaderLeaseRegistry();
+    const fixture = await publishedV2CoordinatorFixture(evaluationLeases);
+    try {
+      truncateSync(join(fixture.projectionDirectory, "projections-2-1.sqlite"), 0);
+      await assert.rejects(
+        () => fixture.coordinator.leasePublishedForEvaluation(BINDING),
+        /PROJECTION_DATABASE_CHECKSUM_INVALID/u,
+      );
+      assert.deepEqual(evaluationLeases.activeFilenames(), []);
+      assert.equal(
+        existsSync(join(fixture.projectionDirectory, PROJECTION_MANIFEST_PUBLICATION_LOCK_FILENAME)),
+        true,
+      );
+    } finally {
+      fixture.source.close();
     }
   });
 
