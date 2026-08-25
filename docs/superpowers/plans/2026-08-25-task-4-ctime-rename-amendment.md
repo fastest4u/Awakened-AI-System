@@ -171,7 +171,7 @@ git commit -m "fix: retain reconciled V2 orphan generations"
 ### Task 2: Recover a ctime-changing retirement intent without weakening completed evidence
 
 **Files:**
-- Modify: `src/orchestrator/projections/coordinator.ts:80-87, 830-910`
+- Modify: `src/orchestrator/projections/coordinator.ts:80-92, 841-1035`
 - Modify: `tests/projection-coordinator.test.ts:400-700`
 
 - [ ] **Step 1: Write failing ctime-aware recovery tests**
@@ -182,6 +182,7 @@ boundaries:
 ```ts
 | "after-v2-retirement-intent-before-rename"
 | "after-v2-retirement-rename-before-complete"
+| "after-v2-retirement-recovery-before-final-scan"
 ```
 
 Add a restart case that injects at
@@ -212,6 +213,22 @@ second rename changes `ctimeNs` on Windows.  Assert rejection with
 the retained file still exists.  This proves the continuity exception cannot
 be reused after a `retired` record has been committed.
 
+Add two post-recovery observation cases. Set up a completed `retired` record,
+then use `after-v2-retirement-recovery-before-final-scan` after its first
+exact observation but before the final directory pass. In one case remove the
+retired pathname; in the other move it aside and place forged bytes at its
+strict retired name. Each must reject
+`PROJECTION_PUBLICATION_RECOVERY_REQUIRED`, retain the publication lock, and
+leave every surviving evidence file untouched. These prove the second
+directory pass re-requires and exactly re-captures each journaled retired
+record rather than merely rejecting unknown filenames.
+
+Keep a directory-swap control that fires after the V2 publication lock is
+held and before the journal snapshot. It must continue to return
+`PROJECTION_PATH_INVALID`; malformed journal evidence, by contrast, is
+already forwarded by the stable child as
+`PROJECTION_PUBLICATION_RECOVERY_REQUIRED`.
+
 Keep the approved swapped-retired-path, unjournaled-retired, legacy-quarantine,
 forged-reference, and forged-FTS tests from the parent Task 4 plan.
 
@@ -225,14 +242,19 @@ node --test --test-concurrency=1 --test-name-pattern="retirement intent|retired 
 ```
 
 Expected: the post-rename restart case fails because recovery has not yet
-scanned journal records.  The completed-evidence mutation must not be accepted
-by an implementation that incorrectly applies continuity to a `retired`
-record.
+scanned journal records; the two new post-recovery mutations also fail because
+the final pass has not yet re-captured expected evidence.  The completed-evidence
+mutation must not be accepted by an implementation that incorrectly applies
+continuity to a `retired` record, and the directory-swap control must expose the
+incorrect recovery-required reclassification until the snapshot catch is removed.
 
 - [ ] **Step 3: Implement deterministic ctime-aware recovery before the final scan**
 
 At the start of `#reconcileUnpublished`, while the V2 lock and pinned directory
-identity are held, read `this.#reconciliationJournal.snapshot(...)`.  First
+identity are held, read `this.#reconciliationJournal.snapshot(...)` directly.
+Do not blanket-catch it: the stable child already maps only malformed or
+unreadable journal evidence to `PROJECTION_PUBLICATION_RECOVERY_REQUIRED`,
+while directory and lock attacks must remain `PROJECTION_PATH_INVALID`. First
 reject any strict legacy quarantine name, unjournaled strict retired name,
 sidecar, duplicate record, or malformed/unknown record as
 `PROJECTION_PUBLICATION_RECOVERY_REQUIRED`.
@@ -272,6 +294,60 @@ writing the observed retired record.  Invoke
 `completeRetirement`.  The new happy-path intent boundary must fire after
 `beginRetirement` and before `retireGeneration`.
 
+Keep a mutable `resolvedRecords` copy of the snapshot.  When an `intent` is
+completed, replace its element with the returned `V2RetiredGeneration`; the
+post-recovery pass must validate against this current durable record, not the
+now-stale `intent` snapshot.  Do not conceal a path or lock failure while
+normalizing an individual recovery operation.  Add this narrow helper to the
+coordinator and use it only in the `catch (error)` surrounding capture, read,
+rename, and complete operations:
+
+```ts
+#throwReconciliationRecovery(error: unknown): never {
+  if (
+    error instanceof Error
+    && (
+      error.message === "PROJECTION_PATH_INVALID"
+      || error.message === "PROJECTION_PUBLICATION_RECOVERY_REQUIRED"
+    )
+  ) throw error;
+  throw new Error("PROJECTION_PUBLICATION_RECOVERY_REQUIRED", { cause: error });
+}
+```
+
+After all record transitions and before computing high-water or considering
+any final candidate, invoke the new recovery boundary, list and sort the
+directory again, and run both directions of strict evidence validation.  The
+fresh listing must reject unknown retired files *and* require every resolved
+retired name to exist and be newly captured with exact five-field identity:
+
+```ts
+this.#faultInjector?.hit("after-v2-retirement-recovery-before-final-scan");
+const filenames = readdirSync(this.#projectionDirectory).sort();
+const filenamesPresent = new Set(filenames);
+assertStrictRetirementEvidence(filenamesPresent);
+for (const record of resolvedRecords) {
+  if (record.state !== "retired" || !filenamesPresent.has(record.retiredFilename)) {
+    throw new Error("PROJECTION_PUBLICATION_RECOVERY_REQUIRED");
+  }
+  let observed: StableProjectionGenerationIdentity | null;
+  try {
+    observed = filesystemStableProjectionDirectoryOperations.captureRetiredGeneration(
+      this.#projectionDirectory, identity, lockToken, record.retiredFilename,
+    );
+  } catch (error) {
+    this.#throwReconciliationRecovery(error);
+  }
+  if (observed === null || !sameRetirementImage(observed, record.image)) {
+    throw new Error("PROJECTION_PUBLICATION_RECOVERY_REQUIRED");
+  }
+}
+```
+
+Only this refreshed `filenames` value may feed the high-water and final-candidate
+loops.  The initial scan remains a pre-recovery validation, never an authority
+for later final processing.
+
 Never use `sameRetirementRenameContinuity` for a `retired` record, final-path
 authorization, publication selection, leases, or manifest files.
 
@@ -287,9 +363,10 @@ npm run typecheck
 ```
 
 Expected: an after-rename crash completes one time using continuity and stores
-the observed identity; any later timestamp-only mutation of a completed
-retained file fails closed; swaps and unjournaled/legacy evidence retain the
-lock; V1 tests and typecheck pass.
+the observed identity; any later timestamp-only mutation or post-recovery
+removal/swap of a completed retained file fails closed; directory/lock attacks
+remain `PROJECTION_PATH_INVALID`; swaps and unjournaled/legacy evidence retain
+the lock; V1 tests and typecheck pass.
 
 - [ ] **Step 5: Commit durable ctime-aware recovery**
 
@@ -327,6 +404,8 @@ The reviewer must verify the final diff and focused fault matrix prove all of:
 4. An existing retired record is checked with exact five-field identity, including ctimeNs.
 5. No V2 final or retired candidate path invokes unlink or a removal helper.
 6. Full immutable-byte validation, lock-before-source, high-water, lease and manifest exclusions remain intact.
+7. A post-recovery directory refresh re-requires and exactly re-captures every resolved retired record before high-water/final processing.
+8. Only the stable journal child maps malformed or unreadable journal evidence to recovery-required; directory/lock errors preserve path-invalid semantics.
 ```
 
 - [ ] **Step 3: Record approval without committing ignored SDD artifacts**
