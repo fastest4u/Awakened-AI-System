@@ -288,6 +288,25 @@ function assertOriginalV2EvaluationLease(lease: V2ProjectionReaderLease): void {
   );
 }
 
+class SwapAfterV2EvaluatorLeaseRegistry extends V2ProjectionReaderLeaseRegistry {
+  captured: V2ProjectionReaderLease | undefined;
+  readonly #afterAcquire: () => void;
+
+  constructor(afterAcquire: () => void) {
+    super();
+    this.#afterAcquire = afterAcquire;
+  }
+
+  override acquire(
+    generation: Parameters<V2ProjectionReaderLeaseRegistry["acquire"]>[0],
+  ): V2ProjectionReaderLease {
+    const lease = super.acquire(generation);
+    this.captured = lease;
+    this.#afterAcquire();
+    return lease;
+  }
+}
+
 describe("projection build coordinator", () => {
   it("adopts a staged V2 generation before publishing its manifest authority", async () => {
     const root = mkdtempSync(join(tmpdir(), "projection-v2-adoption-"));
@@ -1529,6 +1548,36 @@ describe("projection build coordinator", () => {
       assert.deepEqual(evaluationLeases.activeFilenames(), []);
       assert.equal(
         existsSync(join(fixture.projectionDirectory, PROJECTION_MANIFEST_PUBLICATION_LOCK_FILENAME)),
+        true,
+      );
+    } finally {
+      fixture.source.close();
+    }
+  });
+
+  it("closes an unreturned V2 evaluator lease when publication release fails after acquisition", async () => {
+    let swapAfterAcquire = (): void => undefined;
+    const evaluationLeases = new SwapAfterV2EvaluatorLeaseRegistry(() => swapAfterAcquire());
+    const fixture = await publishedV2CoordinatorFixture(evaluationLeases);
+    try {
+      const root = join(fixture.projectionDirectory, "..");
+      const originalDirectory = join(root, "original-projections");
+      const attackerDirectory = join(root, "attacker-projections");
+      mkdirSync(attackerDirectory);
+      swapAfterAcquire = (): void => {
+        renameSync(fixture.projectionDirectory, originalDirectory);
+        renameSync(attackerDirectory, fixture.projectionDirectory);
+      };
+
+      await assert.rejects(
+        () => fixture.coordinator.leasePublishedForEvaluation(BINDING),
+        (error: unknown) => error instanceof LifecycleError && error.code === "MATERIALIZATION_CONFLICT",
+      );
+      assert.deepEqual(evaluationLeases.activeFilenames(), []);
+      assert.notEqual(evaluationLeases.captured, undefined);
+      assert.throws(() => evaluationLeases.captured!.database.prepare("SELECT 1").get());
+      assert.equal(
+        existsSync(join(originalDirectory, PROJECTION_MANIFEST_PUBLICATION_LOCK_FILENAME)),
         true,
       );
     } finally {

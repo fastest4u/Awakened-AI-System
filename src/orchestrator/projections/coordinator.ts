@@ -689,6 +689,7 @@ export class V2ProjectionBuildCoordinator {
         throw new Error("PROJECTION_PATH_INVALID");
       }
       let failure: unknown;
+      let evaluatorLease: V2ProjectionReaderLease | undefined;
       let retainLock = true;
       try {
         if (!sameProjectionDirectoryIdentity(identity, this.#requiredDirectoryIdentity())) {
@@ -702,9 +703,8 @@ export class V2ProjectionBuildCoordinator {
           publicationLease.lockToken,
           published.manifest.databaseFile,
         );
-        const evaluatorLease = this.#evaluationLeases.acquire(Object.freeze({ manifest: published.manifest, image }));
+        evaluatorLease = this.#evaluationLeases.acquire(Object.freeze({ manifest: published.manifest, image }));
         retainLock = false;
-        return evaluatorLease;
       } catch (error) {
         failure = error;
         throw error;
@@ -712,9 +712,15 @@ export class V2ProjectionBuildCoordinator {
         try {
           publicationLease.release(retainLock);
         } catch (error) {
+          if (evaluatorLease !== undefined) {
+            try { evaluatorLease.close(); } catch { /* preserve publication-lock release failure */ }
+            evaluatorLease = undefined;
+          }
           if (failure === undefined) throw error;
         }
       }
+      if (evaluatorLease === undefined) throw new LifecycleError("MATERIALIZATION_CONFLICT");
+      return evaluatorLease;
     });
   }
 
