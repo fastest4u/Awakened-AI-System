@@ -422,6 +422,58 @@ describe("projection build coordinator", () => {
     source.close();
   });
 
+  it("migrates a prior canonical retired V2 generation high-water journal during reconciliation", async () => {
+    const root = mkdtempSync(join(tmpdir(), "projection-v2-legacy-journal-"));
+    roots.push(root);
+    const sourcePath = join(root, "events.sqlite");
+    const projectionDirectory = join(root, "projections");
+    const source = sourceDatabase(sourcePath);
+    append(source, 1);
+    const driver = new NodeSqliteDriver({ DatabaseSync });
+    const healthy = new V2ProjectionBuildCoordinator({
+      projectionDirectory,
+      eventReader: new SqliteProjectionEventReader({ driver, eventStorePath: sourcePath }),
+      builder: new ImmutableProjectionBuilder({ driver, projectionDirectory, now: () => NOW }),
+    });
+    await healthy.ensurePublished(BINDING, 1n, 2_000);
+
+    append(source, 2);
+    const faulted = new V2ProjectionBuildCoordinator({
+      projectionDirectory,
+      eventReader: new SqliteProjectionEventReader({ driver, eventStorePath: sourcePath }),
+      builder: new ImmutableProjectionBuilder({ driver, projectionDirectory, now: () => NOW }),
+      faultInjector: { hit(boundary): void {
+        if (boundary === "after-v2-generation-install-before-manifest") throw new Error("post-install");
+      } },
+    });
+    await assert.rejects(() => faulted.ensurePublished(BINDING, 2n, 2_000), /post-install/u);
+    assert.equal(existsSync(join(projectionDirectory, "projections-2-2.sqlite")), true);
+
+    writeFileSync(
+      join(projectionDirectory, "projection-reconciliation-v2.json"),
+      '{"highestReservedGeneration":1,"schemaVersion":1}\n',
+      "utf8",
+    );
+    await healthy.ensurePublished(BINDING, 1n, 2_000);
+
+    const journalText = readFileSync(
+      join(projectionDirectory, "projection-reconciliation-v2.json"),
+      "utf8",
+    );
+    const journal = JSON.parse(journalText) as {
+      highestReservedGeneration: number;
+      retirements: Array<{ state: string; retiredFilename: string }>;
+      schemaVersion?: unknown;
+    };
+    assert.equal(journal.highestReservedGeneration, 2);
+    assert.equal(journal.retirements.length, 1);
+    assert.equal(journal.retirements[0]?.state, "retired");
+    assert.match(journal.retirements[0]?.retiredFilename ?? "", /^\.projections-2-retired-[0-9a-f]{32}\.sqlite$/u);
+    assert.equal(Object.prototype.hasOwnProperty.call(journal, "schemaVersion"), false);
+    assert.equal(journalText, `${JSON.stringify(journal)}\n`);
+    source.close();
+  });
+
   it("does not reuse a reserved V2 final generation after restart without an active manifest", async () => {
     const root = mkdtempSync(join(tmpdir(), "projection-v2-journal-without-manifest-"));
     roots.push(root);

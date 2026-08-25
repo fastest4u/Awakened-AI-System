@@ -298,6 +298,11 @@ const exactJournal = (bytes) => {
     if (!canonicalJournalBytes(legacy).equals(bytes)) throw new Error("JOURNAL_FORMAT_MISMATCH");
     return { highestReservedGeneration: legacy.highestReservedGeneration, retirements: [] };
   }
+  if (exactKeys(value, ["highestReservedGeneration", "schemaVersion"]) && value.schemaVersion === 1) {
+    const legacy = { highestReservedGeneration: value.highestReservedGeneration, schemaVersion: 1 };
+    if (!canonicalJournalBytes(legacy).equals(bytes)) throw new Error("JOURNAL_FORMAT_MISMATCH");
+    return { highestReservedGeneration: legacy.highestReservedGeneration, retirements: [] };
+  }
   if (
     !exactKeys(value, ["highestReservedGeneration", "retirements"])
     || !Array.isArray(value.retirements)
