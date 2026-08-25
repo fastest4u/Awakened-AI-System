@@ -4,6 +4,11 @@ import { lstatSync, realpathSync } from "node:fs";
 import { isAbsolute, normalize, resolve } from "node:path";
 
 import { LifecycleError } from "../lifecycle/errors.js";
+import type {
+  V2RetiredGeneration,
+  V2RetirementImage,
+  V2RetirementIntent,
+} from "./reconciliation-journal.js";
 
 const MUTATION_TIMEOUT_MS = 5_000;
 const MAX_STABLE_MANIFEST_BYTES = 64 * 1_024;
@@ -32,7 +37,7 @@ const RECONCILIATION_JOURNAL_NAME = ${JSON.stringify(PROJECTION_RECONCILIATION_J
 const RECONCILIATION_JOURNAL_TEMP_NAME = ".projection-reconciliation-v2.json.tmp";
 const TOKEN = /^[0-9a-f]{32}$/u;
 const V2_GENERATION = /^projections-2-([1-9][0-9]{0,9})\.sqlite$/u;
-const V2_QUARANTINE = /^\.projections-2-quarantine-([0-9a-f]{32})\.sqlite$/u;
+const V2_RETIRED = /^\.projections-2-retired-([0-9a-f]{32})\.sqlite$/u;
 const normalized = (path) => {
   const value = resolve(path);
   return process.platform === "win32" ? value.toLowerCase() : value;
@@ -221,30 +226,105 @@ const sameGenerationIdentity = (file, expected) => (
   && file.ctimeNs === expected.ctimeNs
   && file.sha256 === expected.sha256
 );
-const quarantineName = (token) => ".projections-2-quarantine-" + token + ".sqlite";
+const sameGenerationRenameContinuity = (file, expected) => (
+  file.device === expected.device
+  && file.inode === expected.inode
+  && file.size === expected.size
+  && file.sha256 === expected.sha256
+);
+const exactKeys = (value, keys) => (
+  typeof value === "object" && value !== null && !Array.isArray(value)
+  && Reflect.ownKeys(value).length === keys.length
+  && keys.every((key) => Object.prototype.hasOwnProperty.call(value, key))
+);
+const validGeneration = (value) => (
+  Number.isSafeInteger(value) && value >= 0 && value <= 2147483647
+);
+const exactRetirementImage = (value) => {
+  if (
+    !exactKeys(value, ["device", "inode", "size", "ctimeNs", "sha256"])
+    || typeof value.device !== "string" || !/^(?:0|[1-9][0-9]*)$/u.test(value.device)
+    || typeof value.inode !== "string" || !/^(?:0|[1-9][0-9]*)$/u.test(value.inode)
+    || typeof value.size !== "string" || !/^(?:0|[1-9][0-9]*)$/u.test(value.size)
+    || BigInt(value.size) > BigInt(MAX_GENERATION_BYTES)
+    || typeof value.ctimeNs !== "string" || !/^(?:0|[1-9][0-9]*)$/u.test(value.ctimeNs)
+    || typeof value.sha256 !== "string" || !/^[0-9a-f]{64}$/u.test(value.sha256)
+  ) invalid();
+  return {
+    device: value.device,
+    inode: value.inode,
+    size: value.size,
+    ctimeNs: value.ctimeNs,
+    sha256: value.sha256,
+  };
+};
+const exactRetirement = (value) => {
+  if (!validGeneration(value && value.generation)) invalid();
+  if (value.state === "intent") {
+    if (
+      !exactKeys(value, ["state", "generation", "finalFilename", "retiredFilename", "image"])
+      || typeof value.finalFilename !== "string"
+      || !V2_GENERATION.test(value.finalFilename)
+      || Number(V2_GENERATION.exec(value.finalFilename)[1]) !== value.generation
+      || typeof value.retiredFilename !== "string" || !V2_RETIRED.test(value.retiredFilename)
+    ) invalid();
+    return {
+      state: "intent",
+      generation: value.generation,
+      finalFilename: value.finalFilename,
+      retiredFilename: value.retiredFilename,
+      image: exactRetirementImage(value.image),
+    };
+  }
+  if (
+    value.state !== "retired"
+    || !exactKeys(value, ["state", "generation", "retiredFilename", "image"])
+    || typeof value.retiredFilename !== "string" || !V2_RETIRED.test(value.retiredFilename)
+  ) invalid();
+  return {
+    state: "retired",
+    generation: value.generation,
+    retiredFilename: value.retiredFilename,
+    image: exactRetirementImage(value.image),
+  };
+};
+const canonicalJournalBytes = (journal) => Buffer.from(JSON.stringify(journal) + "\n", "utf8");
 const exactJournal = (bytes) => {
   let value;
   try { value = JSON.parse(bytes.toString("utf8")); } catch { invalid(); }
+  if (!validGeneration(value && value.highestReservedGeneration)) invalid();
+  if (exactKeys(value, ["highestReservedGeneration"])) {
+    const legacy = { highestReservedGeneration: value.highestReservedGeneration };
+    if (!canonicalJournalBytes(legacy).equals(bytes)) throw new Error("JOURNAL_FORMAT_MISMATCH");
+    return { highestReservedGeneration: legacy.highestReservedGeneration, retirements: [] };
+  }
   if (
-    typeof value !== "object" || value === null || Array.isArray(value)
-    || Object.keys(value).length !== 2
-    || value.schemaVersion !== 1
-    || !Number.isSafeInteger(value.highestReservedGeneration)
-    || value.highestReservedGeneration < 0
-    || value.highestReservedGeneration > 2147483647
+    !exactKeys(value, ["highestReservedGeneration", "retirements"])
+    || !Array.isArray(value.retirements)
+    || value.retirements.length > 100000
   ) invalid();
-  const canonical = Buffer.from(
-    '{"highestReservedGeneration":' + value.highestReservedGeneration + ',"schemaVersion":1}\n',
-    "utf8",
-  );
-  if (!canonical.equals(bytes)) throw new Error("JOURNAL_FORMAT_MISMATCH");
-  return value.highestReservedGeneration;
+  const generations = new Set();
+  const retiredFilenames = new Set();
+  const retirements = value.retirements.map((record) => {
+    const retirement = exactRetirement(record);
+    if (
+      retirement.generation > value.highestReservedGeneration
+      || generations.has(retirement.generation)
+      || retiredFilenames.has(retirement.retiredFilename)
+    ) invalid();
+    generations.add(retirement.generation);
+    retiredFilenames.add(retirement.retiredFilename);
+    return retirement;
+  });
+  const canonical = { highestReservedGeneration: value.highestReservedGeneration, retirements };
+  if (!canonicalJournalBytes(canonical).equals(bytes)) throw new Error("JOURNAL_FORMAT_MISMATCH");
+  return canonical;
 };
 const readJournal = () => {
   try {
     return exactJournal(captureFileIdentity(RECONCILIATION_JOURNAL_NAME).bytes);
   } catch (error) {
-    if (error && error.code === "ENOENT") return 0;
+    if (error && error.code === "ENOENT") return { highestReservedGeneration: 0, retirements: [] };
     throw error;
   }
 };
@@ -262,6 +342,20 @@ const writeDurable = (name, bytes) => {
   } finally {
     if (handle !== undefined) closeSync(handle);
   }
+};
+const writeJournal = (journal) => {
+  try {
+    lstatSync(RECONCILIATION_JOURNAL_TEMP_NAME);
+    invalid();
+  } catch (error) {
+    if (!error || error.code !== "ENOENT") throw error;
+  }
+  const bytes = canonicalJournalBytes(journal);
+  writeDurable(RECONCILIATION_JOURNAL_TEMP_NAME, bytes);
+  renameSync(RECONCILIATION_JOURNAL_TEMP_NAME, RECONCILIATION_JOURNAL_NAME);
+  syncDirectory();
+  const observed = readJournal();
+  if (!canonicalJournalBytes(observed).equals(bytes)) throw new Error("JOURNAL_VERIFY_MISMATCH");
 };
 const transactionNames = (attemptToken) => ({
   previous: ".projection-manifest.previous-" + attemptToken,
@@ -304,23 +398,70 @@ try {
     if (typeof requested !== "string" || !/^(?:0|[1-9][0-9]*)$/u.test(requested)) invalid();
     const requestedGeneration = Number(requested);
     if (!Number.isSafeInteger(requestedGeneration) || requestedGeneration > 2147483647) invalid();
-    const next = Math.max(readJournal(), requestedGeneration);
-    const bytes = Buffer.from(
-      '{"highestReservedGeneration":' + next + ',"schemaVersion":1}\n',
-      "utf8",
-    );
-    try {
-      lstatSync(RECONCILIATION_JOURNAL_TEMP_NAME);
-      invalid();
-    } catch (error) {
-      if (!error || error.code !== "ENOENT") throw error;
-    }
-    writeDurable(RECONCILIATION_JOURNAL_TEMP_NAME, bytes);
-    renameSync(RECONCILIATION_JOURNAL_TEMP_NAME, RECONCILIATION_JOURNAL_NAME);
-    syncDirectory();
-    if (readJournal() !== next) throw new Error("JOURNAL_VERIFY_MISMATCH");
+    const journal = readJournal();
+    const next = Math.max(journal.highestReservedGeneration, requestedGeneration);
+    writeJournal({ highestReservedGeneration: next, retirements: journal.retirements });
     assertLock(lockToken);
     process.stdout.write(String(next));
+  } else if (operation === "begin-reconciliation-retirement") {
+    const [lockToken, encodedIntent] = operationArguments;
+    assertLock(assertToken(lockToken));
+    if (typeof encodedIntent !== "string") invalid();
+    let input;
+    try { input = JSON.parse(encodedIntent); } catch { invalid(); }
+    const intent = exactRetirement(input);
+    if (intent.state !== "intent" || JSON.stringify(intent) !== encodedIntent) invalid();
+    const journal = readJournal();
+    if (
+      intent.generation > journal.highestReservedGeneration
+      || journal.retirements.some((record) => (
+        record.generation === intent.generation || record.retiredFilename === intent.retiredFilename
+      ))
+    ) invalid();
+    writeJournal({
+      highestReservedGeneration: journal.highestReservedGeneration,
+      retirements: [...journal.retirements, intent],
+    });
+    assertLock(lockToken);
+    process.stdout.write(JSON.stringify(intent));
+  } else if (operation === "complete-reconciliation-retirement") {
+    const [lockToken, encodedIntent, encodedImage] = operationArguments;
+    assertLock(assertToken(lockToken));
+    if (typeof encodedIntent !== "string" || typeof encodedImage !== "string") invalid();
+    let intentInput;
+    let imageInput;
+    try {
+      intentInput = JSON.parse(encodedIntent);
+      imageInput = JSON.parse(encodedImage);
+    } catch { invalid(); }
+    const intent = exactRetirement(intentInput);
+    const image = exactRetirementImage(imageInput);
+    if (
+      intent.state !== "intent"
+      || JSON.stringify(intent) !== encodedIntent
+      || JSON.stringify(image) !== encodedImage
+      || !sameGenerationRenameContinuity(image, intent.image)
+    ) invalid();
+    const journal = readJournal();
+    const index = journal.retirements.findIndex((record) => record.generation === intent.generation);
+    if (index < 0 || JSON.stringify(journal.retirements[index]) !== JSON.stringify(intent)) invalid();
+    const retired = {
+      state: "retired",
+      generation: intent.generation,
+      retiredFilename: intent.retiredFilename,
+      image,
+    };
+    const retirements = [...journal.retirements];
+    retirements[index] = retired;
+    writeJournal({ highestReservedGeneration: journal.highestReservedGeneration, retirements });
+    assertLock(lockToken);
+    process.stdout.write(JSON.stringify(retired));
+  } else if (operation === "read-reconciliation-retirements") {
+    const [lockToken] = operationArguments;
+    assertLock(assertToken(lockToken));
+    const journal = readJournal();
+    assertLock(lockToken);
+    process.stdout.write(JSON.stringify(journal.retirements));
   } else if (operation === "read-generation-image") {
     const [lockToken, filename] = operationArguments;
     assertLock(assertToken(lockToken));
@@ -337,54 +478,57 @@ try {
       sha256: image.sha256,
       bytesBase64: image.bytes.toString("base64"),
     }));
-  } else if (operation === "quarantine-generation") {
-    const [lockToken, filename, quarantineToken, device, inode, size, ctimeNs, sha256] = operationArguments;
+  } else if (operation === "retire-generation") {
+    const [lockToken, filename, retiredFilename, device, inode, size, ctimeNs, sha256] = operationArguments;
     assertLock(assertToken(lockToken));
     if (
       typeof filename !== "string" || !V2_GENERATION.test(filename)
-      || typeof quarantineToken !== "string" || !TOKEN.test(quarantineToken)
+      || typeof retiredFilename !== "string" || !V2_RETIRED.test(retiredFilename)
     ) invalid();
-    const quarantinedFilename = quarantineName(quarantineToken);
     try {
-      lstatSync(quarantinedFilename);
+      lstatSync(retiredFilename);
       invalid();
     } catch (error) {
       if (!error || error.code !== "ENOENT") throw error;
     }
-    if (sidecarPresent(filename)) integrity();
-    const current = lstatSync(filename, { bigint: true });
-    if (
-      !current.isFile() || current.isSymbolicLink()
-      || current.dev.toString() !== device || current.ino.toString() !== inode
-      || current.size.toString() !== size || current.ctimeNs.toString() !== ctimeNs
-    ) invalid();
-    renameSync(filename, quarantinedFilename);
+    if (sidecarPresent(filename) || sidecarPresent(retiredFilename)) integrity();
+    const expected = { device, inode, size, ctimeNs, sha256 };
+    const current = captureFileIdentity(filename, MAX_GENERATION_BYTES);
+    if (!sameGenerationIdentity(current, expected)) invalid();
+    renameSync(filename, retiredFilename);
     syncDirectory();
-    const quarantined = captureFileIdentity(quarantinedFilename, MAX_GENERATION_BYTES);
-    if (
-      quarantined.device !== device || quarantined.inode !== inode
-      || quarantined.size !== size || quarantined.sha256 !== sha256
-    ) invalid();
+    const retired = captureFileIdentity(retiredFilename, MAX_GENERATION_BYTES);
+    if (!sameGenerationRenameContinuity(retired, expected)) invalid();
     assertLock(lockToken);
     process.stdout.write(JSON.stringify({
-      filename: quarantinedFilename,
-      device: quarantined.device,
-      inode: quarantined.inode,
-      size: quarantined.size,
-      ctimeNs: quarantined.ctimeNs,
-      sha256: quarantined.sha256,
+      filename: retiredFilename,
+      device: retired.device,
+      inode: retired.inode,
+      size: retired.size,
+      ctimeNs: retired.ctimeNs,
+      sha256: retired.sha256,
     }));
-  } else if (operation === "remove-quarantined-generation") {
-    const [lockToken, quarantinedFilename, device, inode, size, ctimeNs, sha256] = operationArguments;
+  } else if (operation === "capture-retired-generation") {
+    const [lockToken, retiredFilename] = operationArguments;
     assertLock(assertToken(lockToken));
-    if (typeof quarantinedFilename !== "string" || !V2_QUARANTINE.test(quarantinedFilename)) invalid();
-    if (sidecarPresent(quarantinedFilename)) integrity();
-    const quarantined = captureFileIdentity(quarantinedFilename, MAX_GENERATION_BYTES);
-    if (!sameGenerationIdentity(quarantined, { device, inode, size, ctimeNs, sha256 })) invalid();
-    removeRegularFile(quarantinedFilename);
-    syncDirectory();
+    if (typeof retiredFilename !== "string" || !V2_RETIRED.test(retiredFilename)) invalid();
+    if (sidecarPresent(retiredFilename)) integrity();
+    let retired;
+    try {
+      retired = captureFileIdentity(retiredFilename, MAX_GENERATION_BYTES);
+    } catch (error) {
+      if (!error || error.code !== "ENOENT") throw error;
+      assertDirectory();
+    }
     assertLock(lockToken);
-    process.stdout.write("removed");
+    process.stdout.write(retired === undefined ? "null" : JSON.stringify({
+      filename: retiredFilename,
+      device: retired.device,
+      inode: retired.inode,
+      size: retired.size,
+      ctimeNs: retired.ctimeNs,
+      sha256: retired.sha256,
+    }));
   } else if (operation === "install-generation") {
     const [lockToken, temporaryFilename, finalFilename, device, inode, size, sha256] = operationArguments;
     assertLock(assertToken(lockToken));
@@ -747,19 +891,43 @@ export interface StableProjectionDirectoryOperations {
     lockToken: string,
     minimumGeneration: number,
   ): number;
+  beginReconciliationRetirement(
+    directory: string,
+    identity: ProjectionDirectoryIdentity,
+    lockToken: string,
+    intent: V2RetirementIntent,
+  ): V2RetirementIntent;
+  completeReconciliationRetirement(
+    directory: string,
+    identity: ProjectionDirectoryIdentity,
+    lockToken: string,
+    intent: V2RetirementIntent,
+    image: V2RetirementImage,
+  ): V2RetiredGeneration;
+  readReconciliationRetirements(
+    directory: string,
+    identity: ProjectionDirectoryIdentity,
+    lockToken: string,
+  ): readonly (V2RetirementIntent | V2RetiredGeneration)[];
   readGenerationImage(
     directory: string,
     identity: ProjectionDirectoryIdentity,
     lockToken: string,
     filename: string,
   ): StableProjectionGenerationImage;
-  quarantineGeneration(
+  retireGeneration(
     directory: string,
     identity: ProjectionDirectoryIdentity,
     lockToken: string,
     expected: StableProjectionGenerationIdentity,
-    quarantineToken: string,
+    retiredFilename: string,
   ): StableProjectionGenerationIdentity;
+  captureRetiredGeneration(
+    directory: string,
+    identity: ProjectionDirectoryIdentity,
+    lockToken: string,
+    retiredFilename: string,
+  ): StableProjectionGenerationIdentity | null;
   installGeneration(
     directory: string,
     identity: ProjectionDirectoryIdentity,
@@ -768,13 +936,6 @@ export interface StableProjectionDirectoryOperations {
     finalFilename: string,
     expected: StableProjectionGenerationIdentity,
   ): "installed" | "superseded";
-  removeQuarantinedGeneration(
-    directory: string,
-    identity: ProjectionDirectoryIdentity,
-    lockToken: string,
-    quarantinedFilename: string,
-    expected: StableProjectionGenerationIdentity,
-  ): "removed";
   captureManifest(
     directory: string,
     identity: ProjectionDirectoryIdentity,
@@ -872,10 +1033,13 @@ function runStableMutation(
     | "cleanup"
     | "assert-generation"
     | "reserve-reconciliation-journal"
+    | "begin-reconciliation-retirement"
+    | "complete-reconciliation-retirement"
+    | "read-reconciliation-retirements"
     | "read-generation-image"
-    | "quarantine-generation"
+    | "retire-generation"
+    | "capture-retired-generation"
     | "install-generation"
-    | "remove-quarantined-generation"
     | "capture-manifest"
     | "acquire-manifest-lock"
     | "prepare-manifest"
@@ -994,7 +1158,7 @@ function decodeGenerationImage(value: string): StableProjectionGenerationImage {
   return Object.freeze({ identity, bytes });
 }
 
-function decodeQuarantinedGeneration(value: string): StableProjectionGenerationIdentity {
+function decodeRetiredGeneration(value: string): StableProjectionGenerationIdentity {
   let decoded: unknown;
   try {
     decoded = JSON.parse(value) as unknown;
@@ -1006,7 +1170,7 @@ function decodeQuarantinedGeneration(value: string): StableProjectionGenerationI
   if (
     Reflect.ownKeys(source).length !== 6
     || typeof source.filename !== "string"
-    || !/^\.projections-2-quarantine-[0-9a-f]{32}\.sqlite$/u.test(source.filename)
+    || !/^\.projections-2-retired-[0-9a-f]{32}\.sqlite$/u.test(source.filename)
   ) return invalid();
   return decodeGenerationIdentity(JSON.stringify({
     device: source.device,
@@ -1015,6 +1179,106 @@ function decodeQuarantinedGeneration(value: string): StableProjectionGenerationI
     ctimeNs: source.ctimeNs,
     sha256: source.sha256,
   }), source.filename);
+}
+
+function exactRecordKeys(source: Record<PropertyKey, unknown>, keys: readonly string[]): boolean {
+  return Reflect.ownKeys(source).length === keys.length
+    && keys.every((key) => Object.prototype.hasOwnProperty.call(source, key));
+}
+
+function decodeRetirementImage(value: unknown): V2RetirementImage {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return invalid();
+  const source = value as Record<PropertyKey, unknown>;
+  if (
+    !exactRecordKeys(source, ["device", "inode", "size", "ctimeNs", "sha256"])
+    || !decimal(source.device)
+    || !decimal(source.inode)
+    || !decimal(source.size)
+    || BigInt(source.size) > BigInt(MAX_STABLE_GENERATION_BYTES)
+    || !decimal(source.ctimeNs)
+    || typeof source.sha256 !== "string"
+    || !/^[0-9a-f]{64}$/u.test(source.sha256)
+  ) return invalid();
+  return Object.freeze({
+    device: source.device,
+    inode: source.inode,
+    size: source.size,
+    ctimeNs: source.ctimeNs,
+    sha256: source.sha256,
+  });
+}
+
+function decodeRetirementRecord(value: unknown): V2RetirementIntent | V2RetiredGeneration {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return invalid();
+  const source = value as Record<PropertyKey, unknown>;
+  if (
+    !Number.isSafeInteger(source.generation)
+    || (source.generation as number) < 0
+    || (source.generation as number) > 2_147_483_647
+    || typeof source.retiredFilename !== "string"
+    || !/^\.projections-2-retired-[0-9a-f]{32}\.sqlite$/u.test(source.retiredFilename)
+  ) return invalid();
+  const generation = source.generation as number;
+  const image = decodeRetirementImage(source.image);
+  if (source.state === "intent") {
+    if (
+      !exactRecordKeys(source, ["state", "generation", "finalFilename", "retiredFilename", "image"])
+      || typeof source.finalFilename !== "string"
+      || !/^projections-2-[1-9][0-9]{0,9}\.sqlite$/u.test(source.finalFilename)
+      || Number(/^projections-2-([1-9][0-9]{0,9})\.sqlite$/u.exec(source.finalFilename)?.[1]) !== generation
+    ) return invalid();
+    return Object.freeze({
+      state: "intent",
+      generation,
+      finalFilename: source.finalFilename,
+      retiredFilename: source.retiredFilename,
+      image,
+    });
+  }
+  if (source.state !== "retired" || !exactRecordKeys(
+    source,
+    ["state", "generation", "retiredFilename", "image"],
+  )) return invalid();
+  return Object.freeze({
+    state: "retired",
+    generation,
+    retiredFilename: source.retiredFilename,
+    image,
+  });
+}
+
+function decodeRetirementRecordText(value: string): V2RetirementIntent | V2RetiredGeneration {
+  let decoded: unknown;
+  try {
+    decoded = JSON.parse(value) as unknown;
+  } catch {
+    return invalid();
+  }
+  return decodeRetirementRecord(decoded);
+}
+
+function decodeReconciliationRetirements(
+  value: string,
+): readonly (V2RetirementIntent | V2RetiredGeneration)[] {
+  let decoded: unknown;
+  try {
+    decoded = JSON.parse(value) as unknown;
+  } catch {
+    return invalid();
+  }
+  if (!Array.isArray(decoded) || decoded.length > 100_000) return invalid();
+  const generations = new Set<number>();
+  const retiredFilenames = new Set<string>();
+  const records = decoded.map((value) => {
+    const record = decodeRetirementRecord(value);
+    if (generations.has(record.generation) || retiredFilenames.has(record.retiredFilename)) {
+      return invalid();
+    }
+    generations.add(record.generation);
+    retiredFilenames.add(record.retiredFilename);
+    return record;
+  });
+  return Object.freeze(records);
 }
 
 function decodeManifestSnapshot(
@@ -1102,6 +1366,61 @@ StableProjectionDirectoryOperations = Object.freeze({
     if (!decimal(result) || Number(result) > 2_147_483_647) return invalid();
     return Number(result);
   },
+  beginReconciliationRetirement(
+    directory: string,
+    identity: ProjectionDirectoryIdentity,
+    lockToken: string,
+    intent: V2RetirementIntent,
+  ): V2RetirementIntent {
+    const validated = decodeRetirementRecord(intent);
+    if (validated.state !== "intent") return invalid();
+    const result = decodeRetirementRecordText(runStableMutation(
+      "begin-reconciliation-retirement",
+      directory,
+      identity,
+      [lockToken, JSON.stringify(validated)],
+    ));
+    if (result.state !== "intent" || JSON.stringify(result) !== JSON.stringify(validated)) {
+      return invalid();
+    }
+    return result;
+  },
+  completeReconciliationRetirement(
+    directory: string,
+    identity: ProjectionDirectoryIdentity,
+    lockToken: string,
+    intent: V2RetirementIntent,
+    image: V2RetirementImage,
+  ): V2RetiredGeneration {
+    const validatedIntent = decodeRetirementRecord(intent);
+    if (validatedIntent.state !== "intent") return invalid();
+    const validatedImage = decodeRetirementImage(image);
+    const result = decodeRetirementRecordText(runStableMutation(
+      "complete-reconciliation-retirement",
+      directory,
+      identity,
+      [lockToken, JSON.stringify(validatedIntent), JSON.stringify(validatedImage)],
+    ));
+    if (
+      result.state !== "retired"
+      || result.generation !== validatedIntent.generation
+      || result.retiredFilename !== validatedIntent.retiredFilename
+      || JSON.stringify(result.image) !== JSON.stringify(validatedImage)
+    ) return invalid();
+    return result;
+  },
+  readReconciliationRetirements(
+    directory: string,
+    identity: ProjectionDirectoryIdentity,
+    lockToken: string,
+  ): readonly (V2RetirementIntent | V2RetiredGeneration)[] {
+    return decodeReconciliationRetirements(runStableMutation(
+      "read-reconciliation-retirements",
+      directory,
+      identity,
+      [lockToken],
+    ));
+  },
   readGenerationImage(
     directory: string,
     identity: ProjectionDirectoryIdentity,
@@ -1115,24 +1434,41 @@ StableProjectionDirectoryOperations = Object.freeze({
       [lockToken, filename],
     ));
   },
-  quarantineGeneration(
+  retireGeneration(
     directory: string,
     identity: ProjectionDirectoryIdentity,
     lockToken: string,
     expected: StableProjectionGenerationIdentity,
-    quarantineToken: string,
+    retiredFilename: string,
   ): StableProjectionGenerationIdentity {
-    const result = runStableMutation("quarantine-generation", directory, identity, [
+    if (!/^projections-2-[1-9][0-9]{0,9}\.sqlite$/u.test(expected.filename)) return invalid();
+    if (!/^\.projections-2-retired-[0-9a-f]{32}\.sqlite$/u.test(retiredFilename)) return invalid();
+    const result = runStableMutation("retire-generation", directory, identity, [
       lockToken,
       expected.filename,
-      quarantineToken,
+      retiredFilename,
       expected.device,
       expected.inode,
       expected.size,
       expected.ctimeNs,
       expected.sha256,
     ]);
-    return decodeQuarantinedGeneration(result);
+    return decodeRetiredGeneration(result);
+  },
+  captureRetiredGeneration(
+    directory: string,
+    identity: ProjectionDirectoryIdentity,
+    lockToken: string,
+    retiredFilename: string,
+  ): StableProjectionGenerationIdentity | null {
+    if (!/^\.projections-2-retired-[0-9a-f]{32}\.sqlite$/u.test(retiredFilename)) return invalid();
+    const result = runStableMutation(
+      "capture-retired-generation",
+      directory,
+      identity,
+      [lockToken, retiredFilename],
+    );
+    return result === "null" ? null : decodeRetiredGeneration(result);
   },
   installGeneration(
     directory: string,
@@ -1152,25 +1488,6 @@ StableProjectionDirectoryOperations = Object.freeze({
       expected.sha256,
     ]);
     if (result !== "installed" && result !== "superseded") return invalid();
-    return result;
-  },
-  removeQuarantinedGeneration(
-    directory: string,
-    identity: ProjectionDirectoryIdentity,
-    lockToken: string,
-    quarantinedFilename: string,
-    expected: StableProjectionGenerationIdentity,
-  ): "removed" {
-    const result = runStableMutation("remove-quarantined-generation", directory, identity, [
-      lockToken,
-      quarantinedFilename,
-      expected.device,
-      expected.inode,
-      expected.size,
-      expected.ctimeNs,
-      expected.sha256,
-    ]);
-    if (result !== "removed") return invalid();
     return result;
   },
   captureManifest(

@@ -25,7 +25,11 @@ import {
   type ProjectionManifestPublicationFaultBoundary,
   type ProjectionPathInspection,
 } from "./manifest.js";
-import { V2ReconciliationJournal } from "./reconciliation-journal.js";
+import {
+  sameRetirementRenameContinuity,
+  toRetirementImage,
+  V2ReconciliationJournal,
+} from "./reconciliation-journal.js";
 import { assertUnpublishedProjectionV2Image } from "./integrity.js";
 import {
   ProjectionLeaseUnavailableError,
@@ -850,7 +854,8 @@ export class V2ProjectionBuildCoordinator {
     );
     this.#faultInjector?.hit("after-v2-orphan-reservation-before-quarantine");
     for (const filename of filenames) {
-      if (V2_GENERATION_FILE.exec(filename) === null) continue;
+      const match = V2_GENERATION_FILE.exec(filename);
+      if (match === null) continue;
       if (active?.manifest.databaseFile === filename || leased.has(filename)) continue;
       const image = filesystemStableProjectionDirectoryOperations.readGenerationImage(
         this.#projectionDirectory,
@@ -859,37 +864,46 @@ export class V2ProjectionBuildCoordinator {
         filename,
       );
       this.#faultInjector?.hit("after-v2-orphan-image-before-validation");
-      this.#assertUnpublishedV2Candidate(
-        image.bytes,
-        filename,
-        binding,
+      assertUnpublishedProjectionV2Image(image.bytes, filename, binding);
+      const retiredFilename = `.projections-2-retired-${randomBytes(16).toString("hex")}.sqlite`;
+      const intent = this.#reconciliationJournal.beginRetirement(
+        this.#projectionDirectory,
+        identity,
+        lockToken,
+        Object.freeze({
+          state: "intent",
+          generation: Number(match[1]),
+          finalFilename: filename,
+          retiredFilename,
+          image: toRetirementImage(image.identity),
+        }),
       );
-      const quarantined = filesystemStableProjectionDirectoryOperations.quarantineGeneration(
+      filesystemStableProjectionDirectoryOperations.retireGeneration(
         this.#projectionDirectory,
         identity,
         lockToken,
         image.identity,
-        randomBytes(16).toString("hex"),
+        intent.retiredFilename,
       );
       this.#faultInjector?.hit("after-v2-orphan-quarantine-before-confirm");
-      filesystemStableProjectionDirectoryOperations.removeQuarantinedGeneration(
+      const observed = filesystemStableProjectionDirectoryOperations.captureRetiredGeneration(
         this.#projectionDirectory,
         identity,
         lockToken,
-        quarantined.filename,
-        quarantined,
+        intent.retiredFilename,
+      );
+      if (observed === null || !sameRetirementRenameContinuity(observed, intent.image)) {
+        throw new Error("PROJECTION_PUBLICATION_RECOVERY_REQUIRED");
+      }
+      this.#reconciliationJournal.completeRetirement(
+        this.#projectionDirectory,
+        identity,
+        lockToken,
+        intent,
+        toRetirementImage(observed),
       );
     }
     return highestObservedGeneration;
-  }
-
-  #assertUnpublishedV2Candidate(bytes: Uint8Array, filename: string, binding: ProjectBinding): void {
-    try {
-      assertUnpublishedProjectionV2Image(bytes, filename, binding);
-    } catch (error) {
-      if (error instanceof Error && error.message === "PROJECTION_PUBLICATION_RECOVERY_REQUIRED") throw error;
-      throw new Error("PROJECTION_PUBLICATION_RECOVERY_REQUIRED", { cause: error });
-    }
   }
 
   #ensureProjectionDirectory(): ProjectionDirectoryIdentity {

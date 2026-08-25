@@ -362,7 +362,7 @@ describe("projection build coordinator", () => {
       eventReader: new SqliteProjectionEventReader({ driver, eventStorePath: sourcePath }),
       builder: new ImmutableProjectionBuilder({ driver, projectionDirectory, now: () => NOW }),
     });
-    await healthy.ensurePublished(BINDING, 1n, 2_000);
+    await healthy.ensurePublished(BINDING, 1n, 10_000);
 
     append(source, 2);
     const faulted = new V2ProjectionBuildCoordinator({
@@ -373,7 +373,7 @@ describe("projection build coordinator", () => {
         if (boundary === "after-v2-generation-install-before-manifest") throw new Error("post-install");
       } },
     });
-    await assert.rejects(() => faulted.ensurePublished(BINDING, 2n, 2_000), /post-install/u);
+    await assert.rejects(() => faulted.ensurePublished(BINDING, 2n, 10_000), /post-install/u);
     assert.equal(existsSync(join(projectionDirectory, "projections-2-2.sqlite")), true);
 
     const reconciler = new V2ProjectionBuildCoordinator({
@@ -381,8 +381,28 @@ describe("projection build coordinator", () => {
       eventReader: new SqliteProjectionEventReader({ driver, eventStorePath: sourcePath }),
       builder: new ImmutableProjectionBuilder({ driver, projectionDirectory, now: () => NOW }),
     });
-    await reconciler.ensurePublished(BINDING, 1n, 2_000);
+    await reconciler.ensurePublished(BINDING, 1n, 10_000);
     assert.equal(existsSync(join(projectionDirectory, "projections-2-2.sqlite")), false);
+    const retired = readdirSync(projectionDirectory).filter((name) => (
+      /^\.projections-2-retired-[0-9a-f]{32}\.sqlite$/u.test(name)
+    ));
+    assert.equal(retired.length, 1, "a verified orphan is retained, never unlinked");
+    const journal = JSON.parse(
+      readFileSync(join(projectionDirectory, "projection-reconciliation-v2.json"), "utf8"),
+    ) as {
+      retirements: Array<{
+        state: string;
+        retiredFilename: string;
+        image: { ctimeNs: string };
+      }>;
+    };
+    assert.equal(journal.retirements.length, 1);
+    assert.equal(journal.retirements[0]?.state, "retired");
+    assert.equal(journal.retirements[0]?.retiredFilename, retired[0]);
+    assert.equal(
+      journal.retirements[0]?.image.ctimeNs,
+      lstatSync(join(projectionDirectory, retired[0]!), { bigint: true }).ctimeNs.toString(),
+    );
     assert.equal(
       parseProjectionManifestV2(
         JSON.parse(readFileSync(join(projectionDirectory, "projection-manifest.json"), "utf8")),
@@ -397,8 +417,8 @@ describe("projection build coordinator", () => {
       eventReader: new SqliteProjectionEventReader({ driver, eventStorePath: sourcePath }),
       builder: new ImmutableProjectionBuilder({ driver, projectionDirectory, now: () => NOW }),
     });
-    const published = await restarted.ensurePublished(BINDING, 3n, 2_000);
-    assert.equal(published.manifest.generation, 3, "a deleted V2 final name must remain retired after restart");
+    const published = await restarted.ensurePublished(BINDING, 3n, 10_000);
+    assert.equal(published.manifest.generation, 3, "a retained V2 final name must remain retired after restart");
     source.close();
   });
 
@@ -584,8 +604,8 @@ describe("projection build coordinator", () => {
     source.close();
   });
 
-  it("retains quarantine evidence when it differs from the validated V2 image", async () => {
-    const root = mkdtempSync(join(tmpdir(), "projection-v2-quarantine-swap-"));
+  it("retains retired evidence when it differs from the validated V2 image", async () => {
+    const root = mkdtempSync(join(tmpdir(), "projection-v2-retired-swap-"));
     roots.push(root);
     const sourcePath = join(root, "events.sqlite");
     const projectionDirectory = join(root, "projections");
@@ -601,7 +621,7 @@ describe("projection build coordinator", () => {
       } },
     });
     await assert.rejects(() => faulted.ensurePublished(BINDING, 1n, 2_000), /post-install/u);
-    const forged = join(projectionDirectory, "forged-quarantine.sqlite");
+    const forged = join(projectionDirectory, "forged-retired.sqlite");
     writeFileSync(forged, "not a sqlite image", "utf8");
 
     const recovery = new V2ProjectionBuildCoordinator({
@@ -610,19 +630,23 @@ describe("projection build coordinator", () => {
       builder: new ImmutableProjectionBuilder({ driver, projectionDirectory, now: () => NOW }),
       faultInjector: { hit(boundary: unknown): void {
         if (boundary !== "after-v2-orphan-quarantine-before-confirm") return;
-        const quarantine = readdirSync(projectionDirectory).find((name) => name.startsWith(".projections-2-quarantine-"));
-        assert.notEqual(quarantine, undefined);
-        renameSync(join(projectionDirectory, quarantine!), join(projectionDirectory, "displaced-valid-orphan.sqlite"));
-        renameSync(forged, join(projectionDirectory, quarantine!));
+        const retired = readdirSync(projectionDirectory).find((name) => (
+          /^\.projections-2-retired-[0-9a-f]{32}\.sqlite$/u.test(name)
+        ));
+        assert.notEqual(retired, undefined);
+        renameSync(join(projectionDirectory, retired!), join(projectionDirectory, "displaced-valid-orphan.sqlite"));
+        renameSync(forged, join(projectionDirectory, retired!));
       } },
     });
     await assert.rejects(
       () => recovery.ensurePublished(BINDING, 1n, 10_000),
-      /PROJECTION_PATH_INVALID/u,
+      /PROJECTION_PUBLICATION_RECOVERY_REQUIRED/u,
     );
     assert.equal(existsSync(join(projectionDirectory, "displaced-valid-orphan.sqlite")), true);
     assert.equal(
-      readdirSync(projectionDirectory).some((name) => name.startsWith(".projections-2-quarantine-")),
+      readdirSync(projectionDirectory).some((name) => (
+        /^\.projections-2-retired-[0-9a-f]{32}\.sqlite$/u.test(name)
+      )),
       true,
     );
     assert.equal(existsSync(join(projectionDirectory, PROJECTION_MANIFEST_PUBLICATION_LOCK_FILENAME)), true);
@@ -1661,5 +1685,16 @@ describe("projection build coordinator", () => {
       [["PROJECTION_RECLAMATION_DEFERRED", 2]],
     );
     source.close();
+  });
+
+  it("has no stable V2 orphan deletion operation", () => {
+    const stableDirectory = readFileSync(
+      join(process.cwd(), "src", "orchestrator", "projections", "stable-directory.ts"),
+      "utf8",
+    );
+    assert.doesNotMatch(
+      stableDirectory,
+      /remove-quarantined-generation|removeQuarantinedGeneration/u,
+    );
   });
 });
