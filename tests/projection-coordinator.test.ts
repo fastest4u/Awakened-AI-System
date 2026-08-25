@@ -10,6 +10,7 @@ import {
   realpathSync,
   renameSync,
   rmSync,
+  truncateSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -53,6 +54,10 @@ import {
   filesystemStableProjectionDirectoryOperations,
   PROJECTION_MANIFEST_PUBLICATION_LOCK_FILENAME,
 } from "../src/orchestrator/projections/stable-directory.js";
+import {
+  V2ProjectionReaderLeaseRegistry,
+  type V2ProjectionReaderLease,
+} from "../src/orchestrator/projections/v2-reader-lease.js";
 import { PROJECT_MEMORY_APPLICATION_ID } from "../src/orchestrator/runtime/runtime-capabilities.js";
 import { canonicalJson } from "../src/orchestrator/serialization/canonical-json.js";
 import { NodeSqliteDriver } from "../src/orchestrator/storage/node-sqlite-driver.js";
@@ -239,6 +244,48 @@ class PublishDuringAcquireRegistry extends ProjectionReaderLeaseRegistry {
     }
     return super.acquire(generation);
   }
+}
+
+interface PublishedV2CoordinatorFixture {
+  readonly source: DatabaseSync;
+  readonly coordinator: V2ProjectionBuildCoordinator;
+  readonly projectionDirectory: string;
+}
+
+async function publishedV2CoordinatorFixture(
+  evaluationLeases?: V2ProjectionReaderLeaseRegistry,
+): Promise<PublishedV2CoordinatorFixture> {
+  const root = mkdtempSync(join(tmpdir(), "projection-v2-evaluation-lease-"));
+  roots.push(root);
+  const sourcePath = join(root, "events.sqlite");
+  const projectionDirectory = join(root, "projections");
+  const source = sourceDatabase(sourcePath);
+  append(source, 1);
+  const driver = new NodeSqliteDriver({ DatabaseSync });
+  const coordinator = new V2ProjectionBuildCoordinator({
+    projectionDirectory,
+    eventReader: new SqliteProjectionEventReader({ driver, eventStorePath: sourcePath }),
+    builder: new ImmutableProjectionBuilder({ driver, projectionDirectory, now: () => NOW }),
+    evaluationLeases,
+    now: () => 0,
+  });
+  await coordinator.ensurePublished(BINDING, 1n, 2_000);
+  return Object.freeze({ source, coordinator, projectionDirectory });
+}
+
+function assertOriginalV2EvaluationLease(lease: V2ProjectionReaderLease): void {
+  assert.equal(
+    Number(lease.database.prepare("SELECT schema_version FROM projection_metadata").get()?.schema_version),
+    2,
+  );
+  assert.equal(
+    Number(lease.database.prepare("SELECT terminal_event_position FROM projection_metadata").get()?.terminal_event_position),
+    1,
+  );
+  assert.equal(
+    lease.database.prepare("SELECT created_at FROM projection_metadata").get()?.created_at,
+    NOW,
+  );
 }
 
 describe("projection build coordinator", () => {
@@ -1348,6 +1395,195 @@ describe("projection build coordinator", () => {
     await restarted.ensurePublished(BINDING, 2n, 2_000);
     assert.equal(existsSync(join(projectionDirectory, "projections-2-1.sqlite")), true);
     source.close();
+  });
+
+  it("acquires a published V2 evaluator lease from a stable private image", async () => {
+    const fixture = await publishedV2CoordinatorFixture();
+    try {
+      const lease = await fixture.coordinator.leasePublishedForEvaluation(BINDING);
+      try {
+        assert.equal(lease.manifest.databaseFile, "projections-2-1.sqlite");
+        assertOriginalV2EvaluationLease(lease);
+      } finally {
+        lease.close();
+      }
+    } finally {
+      fixture.source.close();
+    }
+  });
+
+  it("fails closed without an evaluator lease when the V2 directory swaps during acquisition", async () => {
+    const fixture = await publishedV2CoordinatorFixture();
+    try {
+      const root = join(fixture.projectionDirectory, "..");
+      const originalDirectory = join(root, "original-projections");
+      const attackerDirectory = join(root, "attacker-projections");
+      mkdirSync(attackerDirectory);
+      let directoryRealpaths = 0;
+      const evaluationLeases = new V2ProjectionReaderLeaseRegistry();
+      const coordinator = new V2ProjectionBuildCoordinator({
+        projectionDirectory: fixture.projectionDirectory,
+        evaluationLeases,
+        pathInspection: {
+          lstat: lstatSync,
+          realpath(path: string): string {
+            if (path === fixture.projectionDirectory && ++directoryRealpaths === 3) {
+              renameSync(fixture.projectionDirectory, originalDirectory);
+              renameSync(attackerDirectory, fixture.projectionDirectory);
+              return fixture.projectionDirectory;
+            }
+            return realpathSync(path);
+          },
+        },
+        eventReader: { async openCommittedSnapshot() { throw new Error("source must not run"); } },
+        builder: { async buildV2() { throw new Error("builder must not run"); } },
+      });
+
+      await assert.rejects(
+        () => coordinator.leasePublishedForEvaluation(BINDING),
+        /PROJECTION_PATH_INVALID/u,
+      );
+      assert.deepEqual(evaluationLeases.activeFilenames(), []);
+    } finally {
+      fixture.source.close();
+    }
+  });
+
+  it("rejects final V2 WAL and SHM sidecars before acquiring evaluator leases", async () => {
+    for (const suffix of ["-wal", "-shm"]) {
+      const evaluationLeases = new V2ProjectionReaderLeaseRegistry();
+      const fixture = await publishedV2CoordinatorFixture(evaluationLeases);
+      try {
+        writeFileSync(join(fixture.projectionDirectory, `projections-2-1.sqlite${suffix}`), "sidecar", "utf8");
+        await assert.rejects(
+          () => fixture.coordinator.leasePublishedForEvaluation(BINDING),
+          (error: unknown) => error instanceof LifecycleError && error.code === "INTEGRITY_FAILURE",
+        );
+        assert.deepEqual(evaluationLeases.activeFilenames(), []);
+      } finally {
+        fixture.source.close();
+      }
+    }
+  });
+
+  it("keeps a V2 evaluator lease usable after its original final file is renamed away", async () => {
+    const fixture = await publishedV2CoordinatorFixture();
+    try {
+      const lease = await fixture.coordinator.leasePublishedForEvaluation(BINDING);
+      try {
+        const finalPath = join(fixture.projectionDirectory, lease.manifest.databaseFile);
+        renameSync(finalPath, `${finalPath}.moved`);
+        assertOriginalV2EvaluationLease(lease);
+      } finally {
+        lease.close();
+      }
+    } finally {
+      fixture.source.close();
+    }
+  });
+
+  it("keeps a V2 evaluator lease on its original image after another valid final replaces its filename", async () => {
+    const fixture = await publishedV2CoordinatorFixture();
+    try {
+      const lease = await fixture.coordinator.leasePublishedForEvaluation(BINDING);
+      try {
+        append(fixture.source, 2);
+        const replacement = await fixture.coordinator.ensurePublished(BINDING, 2n, 2_000);
+        const finalPath = join(fixture.projectionDirectory, lease.manifest.databaseFile);
+        const replacementPath = join(fixture.projectionDirectory, replacement.manifest.databaseFile);
+        renameSync(finalPath, `${finalPath}.original`);
+        renameSync(replacementPath, finalPath);
+        const replaced = new DatabaseSync(finalPath);
+        try {
+          assert.equal(
+            Number(replaced.prepare("SELECT terminal_event_position FROM projection_metadata").get()?.terminal_event_position),
+            2,
+          );
+        } finally {
+          replaced.close();
+        }
+        assertOriginalV2EvaluationLease(lease);
+      } finally {
+        lease.close();
+      }
+    } finally {
+      fixture.source.close();
+    }
+  });
+
+  it("keeps a V2 evaluator lease usable after its original final file is truncated", async () => {
+    const fixture = await publishedV2CoordinatorFixture();
+    try {
+      const lease = await fixture.coordinator.leasePublishedForEvaluation(BINDING);
+      try {
+        truncateSync(join(fixture.projectionDirectory, lease.manifest.databaseFile), 0);
+        assertOriginalV2EvaluationLease(lease);
+      } finally {
+        lease.close();
+      }
+    } finally {
+      fixture.source.close();
+    }
+  });
+
+  it("keeps a V2 evaluator lease on its original image after the final SQLite content changes", async () => {
+    const fixture = await publishedV2CoordinatorFixture();
+    try {
+      const lease = await fixture.coordinator.leasePublishedForEvaluation(BINDING);
+      try {
+        const final = new DatabaseSync(join(fixture.projectionDirectory, lease.manifest.databaseFile));
+        try {
+          final.prepare("UPDATE projection_metadata SET created_at = ? WHERE singleton = 1").run("mutated");
+        } finally {
+          final.close();
+        }
+        assertOriginalV2EvaluationLease(lease);
+      } finally {
+        lease.close();
+      }
+    } finally {
+      fixture.source.close();
+    }
+  });
+
+  it("retains a V2 evaluator-leased generation until its lease closes, then retires it", async () => {
+    const evaluationLeases = new V2ProjectionReaderLeaseRegistry();
+    const fixture = await publishedV2CoordinatorFixture(evaluationLeases);
+    try {
+      const lease = await fixture.coordinator.leasePublishedForEvaluation(BINDING);
+      const firstFinal = lease.manifest.databaseFile;
+      try {
+        append(fixture.source, 2);
+        const second = await fixture.coordinator.ensurePublished(BINDING, 2n, 2_000);
+        assert.equal(second.manifest.databaseFile, "projections-2-2.sqlite");
+
+        await fixture.coordinator.ensurePublished(BINDING, 2n, 2_000);
+        assert.equal(existsSync(join(fixture.projectionDirectory, firstFinal)), true);
+        assert.deepEqual(evaluationLeases.activeFilenames(), [firstFinal]);
+      } finally {
+        lease.close();
+      }
+
+      await fixture.coordinator.ensurePublished(BINDING, 2n, 2_000);
+      assert.equal(existsSync(join(fixture.projectionDirectory, firstFinal)), false);
+      assert.deepEqual(
+        readdirSync(fixture.projectionDirectory).filter((name) => /^projections-2-[1-9][0-9]*\.sqlite$/u.test(name)),
+        ["projections-2-2.sqlite"],
+      );
+      const retired = readdirSync(fixture.projectionDirectory).filter((name) => (
+        /^\.projections-2-retired-[0-9a-f]{32}\.sqlite$/u.test(name)
+      ));
+      assert.equal(retired.length, 1);
+      const journal = JSON.parse(
+        readFileSync(join(fixture.projectionDirectory, "projection-reconciliation-v2.json"), "utf8"),
+      ) as { retirements: Array<{ state: string; generation: number; retiredFilename: string }> };
+      assert.equal(journal.retirements.length, 1);
+      assert.equal(journal.retirements[0]?.state, "retired");
+      assert.equal(journal.retirements[0]?.generation, 1);
+      assert.equal(journal.retirements[0]?.retiredFilename, retired[0]);
+    } finally {
+      fixture.source.close();
+    }
   });
 
   it("publishes atomically, preserves crash-window authority, serializes builds, and pins leases", async () => {

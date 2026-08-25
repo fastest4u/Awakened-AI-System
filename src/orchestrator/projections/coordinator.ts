@@ -38,6 +38,11 @@ import {
   type ProjectionReaderLease,
 } from "./reader-lease.js";
 import {
+  V2ProjectionLeaseUnavailableError,
+  V2ProjectionReaderLeaseRegistry,
+  type V2ProjectionReaderLease,
+} from "./v2-reader-lease.js";
+import {
   filesystemStableProjectionDirectoryOperations,
   PROJECTION_MANIFEST_PUBLICATION_LOCK_FILENAME,
   sameProjectionDirectoryIdentity,
@@ -81,6 +86,7 @@ export interface V2ProjectionBuildCoordinatorOptions {
   readonly builder: V2ProjectionGenerationBuilder;
   readonly projectionDirectory: string;
   readonly leasedFilenames?: () => readonly string[];
+  readonly evaluationLeases?: V2ProjectionReaderLeaseRegistry;
   readonly faultInjector?: Readonly<{
     hit(boundary:
       | "after-v2-generation-install-before-manifest"
@@ -539,6 +545,8 @@ export class V2ProjectionBuildCoordinator {
   readonly #eventReader: ProjectionEventReader;
   readonly #builder: V2ProjectionGenerationBuilder;
   readonly #projectionDirectory: string;
+  readonly #externalLeasedFilenames: () => readonly string[];
+  readonly #evaluationLeases: V2ProjectionReaderLeaseRegistry;
   readonly #leasedFilenames: () => readonly string[];
   readonly #faultInjector: V2ProjectionBuildCoordinatorOptions["faultInjector"];
   readonly #now: () => number;
@@ -551,7 +559,12 @@ export class V2ProjectionBuildCoordinator {
     this.#eventReader = options.eventReader;
     this.#builder = options.builder;
     this.#projectionDirectory = canonicalDirectory(options.projectionDirectory);
-    this.#leasedFilenames = options.leasedFilenames ?? (() => Object.freeze([]));
+    this.#externalLeasedFilenames = options.leasedFilenames ?? (() => Object.freeze([]));
+    this.#evaluationLeases = options.evaluationLeases ?? new V2ProjectionReaderLeaseRegistry();
+    this.#leasedFilenames = () => Object.freeze([...new Set([
+      ...this.#externalLeasedFilenames(),
+      ...this.#evaluationLeases.activeFilenames(),
+    ])].sort());
     this.#faultInjector = options.faultInjector;
     this.#now = options.now ?? Date.now;
     this.#pathInspection = options.pathInspection ?? filesystemPathInspection;
@@ -663,6 +676,41 @@ export class V2ProjectionBuildCoordinator {
         }
       } finally {
         lease.release(retainLock);
+      }
+    });
+  }
+
+  async leasePublishedForEvaluation(binding: ProjectBinding): Promise<V2ProjectionReaderLease> {
+    return this.#serialized(binding.projectId, async () => {
+      const identity = this.#ensureProjectionDirectory();
+      const publicationLease = acquireProjectionManifestPublicationLease(this.#projectionDirectory);
+      if (!sameProjectionDirectoryIdentity(identity, publicationLease.directoryIdentity)) {
+        publicationLease.release(false);
+        throw new Error("PROJECTION_PATH_INVALID");
+      }
+      let failure: unknown;
+      try {
+        if (!sameProjectionDirectoryIdentity(identity, this.#requiredDirectoryIdentity())) {
+          throw new Error("PROJECTION_PATH_INVALID");
+        }
+        const published = this.#loadPublishedLocked(binding, identity);
+        if (published === null) throw new V2ProjectionLeaseUnavailableError();
+        const image = filesystemStableProjectionDirectoryOperations.readGenerationImage(
+          this.#projectionDirectory,
+          identity,
+          publicationLease.lockToken,
+          published.manifest.databaseFile,
+        );
+        return this.#evaluationLeases.acquire(Object.freeze({ manifest: published.manifest, image }));
+      } catch (error) {
+        failure = error;
+        throw error;
+      } finally {
+        try {
+          publicationLease.release(false);
+        } catch (error) {
+          if (failure === undefined) throw error;
+        }
       }
     });
   }
