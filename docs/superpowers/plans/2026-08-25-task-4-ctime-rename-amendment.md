@@ -110,14 +110,36 @@ check.  `complete-reconciliation-retirement` must replace the `intent` with a
 `ctimeNs`, then write/fsync/reread/reassert the lock exactly as the current
 journal implementation does.
 
-In `coordinator.ts`, import the new predicate and replace only the post-rename
-comparison:
+In `coordinator.ts`, import the new predicate.  The identity returned by
+`retireGeneration` proves the rename itself, but it is stale after the
+post-rename fault seam.  After that seam and immediately before
+`completeRetirement`, recapture the strict retired pathname and compare that
+current observation to the intent before writing the journal:
 
 ```ts
-if (!sameRetirementRenameContinuity(retired, intent.image)) {
+const observed = filesystemStableProjectionDirectoryOperations.captureRetiredGeneration(
+  this.#projectionDirectory,
+  identity,
+  lockToken,
+  intent.retiredFilename,
+);
+if (observed === null || !sameRetirementRenameContinuity(observed, intent.image)) {
   throw new Error("PROJECTION_PUBLICATION_RECOVERY_REQUIRED");
 }
+this.#reconciliationJournal.completeRetirement(
+  this.#projectionDirectory,
+  identity,
+  lockToken,
+  intent,
+  toRetirementImage(observed),
+);
 ```
+
+Keep `retireGeneration`'s own returned post-rename observation and continuity
+check: the final recapture is a second, narrower authorization that makes the
+explicit A-to-B swap fault seam fail closed.  A later swap cannot trigger an
+automatic delete because reconciliation never unlinks; the exact retained
+record check in Task 3 detects any stale evidence on a later read.
 
 Keep the full immutable-byte validator, intent-before-rename order, random
 128-bit retired name, no-unlink rule, and exact retired-record decoding
@@ -129,7 +151,7 @@ Run:
 
 ```bash
 npm run test:build
-node --test --test-concurrency=1 --test-name-pattern="retired V2 generation high-water|no stable V2 orphan deletion|fresh reads must reconcile" dist-test/tests/projection-coordinator.test.js
+node --test --test-concurrency=1 --test-name-pattern="retired V2 generation high-water|retains retired evidence|no stable V2 orphan deletion|fresh reads must reconcile" dist-test/tests/projection-coordinator.test.js
 npm run typecheck
 ```
 
