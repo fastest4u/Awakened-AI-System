@@ -89,6 +89,7 @@ export interface V2ProjectionBuildCoordinatorOptions {
       | "after-v2-orphan-quarantine-before-confirm"
       | "after-v2-retirement-intent-before-rename"
       | "after-v2-retirement-rename-before-complete"
+      | "after-v2-retirement-recovery-before-final-scan"
       | ProjectionManifestPublicationFaultBoundary): void;
   }>;
   readonly now?: () => number;
@@ -845,16 +846,11 @@ export class V2ProjectionBuildCoordinator {
     binding: ProjectBinding,
   ): number {
     const leased = new Set(this.#leasedFilenames());
-    let records: ReturnType<V2ReconciliationJournal["snapshot"]>;
-    try {
-      records = this.#reconciliationJournal.snapshot(
-        this.#projectionDirectory,
-        identity,
-        lockToken,
-      );
-    } catch {
-      throw new Error("PROJECTION_PUBLICATION_RECOVERY_REQUIRED");
-    }
+    const records = this.#reconciliationJournal.snapshot(
+      this.#projectionDirectory,
+      identity,
+      lockToken,
+    );
     const initialFilenames = readdirSync(this.#projectionDirectory).sort();
     const initialFilenamesPresent = new Set(initialFilenames);
     const retiredFilenames = new Set<string>();
@@ -886,7 +882,8 @@ export class V2ProjectionBuildCoordinator {
       }
     };
     assertStrictRetirementEvidence(initialFilenamesPresent);
-    for (const record of records) {
+    const resolvedRecords = [...records];
+    for (const [index, record] of records.entries()) {
       let retired: StableProjectionGenerationIdentity | null;
       try {
         retired = filesystemStableProjectionDirectoryOperations.captureRetiredGeneration(
@@ -895,8 +892,8 @@ export class V2ProjectionBuildCoordinator {
           lockToken,
           record.retiredFilename,
         );
-      } catch {
-        throw new Error("PROJECTION_PUBLICATION_RECOVERY_REQUIRED");
+      } catch (error) {
+        this.#throwReconciliationRecovery(error);
       }
       if (record.state === "retired") {
         if (retired === null || !sameRetirementImage(retired, record.image)) {
@@ -910,15 +907,15 @@ export class V2ProjectionBuildCoordinator {
           || !sameRetirementRenameContinuity(retired, record.image)
         ) throw new Error("PROJECTION_PUBLICATION_RECOVERY_REQUIRED");
         try {
-          this.#reconciliationJournal.completeRetirement(
+          resolvedRecords[index] = this.#reconciliationJournal.completeRetirement(
             this.#projectionDirectory,
             identity,
             lockToken,
             record,
             toRetirementImage(retired),
           );
-        } catch {
-          throw new Error("PROJECTION_PUBLICATION_RECOVERY_REQUIRED");
+        } catch (error) {
+          this.#throwReconciliationRecovery(error);
         }
         continue;
       }
@@ -930,8 +927,8 @@ export class V2ProjectionBuildCoordinator {
           lockToken,
           record.finalFilename,
         );
-      } catch {
-        throw new Error("PROJECTION_PUBLICATION_RECOVERY_REQUIRED");
+      } catch (error) {
+        this.#throwReconciliationRecovery(error);
       }
       if (!sameRetirementImage(finalImage.identity, record.image)) {
         throw new Error("PROJECTION_PUBLICATION_RECOVERY_REQUIRED");
@@ -945,8 +942,8 @@ export class V2ProjectionBuildCoordinator {
           finalImage.identity,
           record.retiredFilename,
         );
-      } catch {
-        throw new Error("PROJECTION_PUBLICATION_RECOVERY_REQUIRED");
+      } catch (error) {
+        this.#throwReconciliationRecovery(error);
       }
       this.#faultInjector?.hit("after-v2-retirement-rename-before-complete");
       try {
@@ -956,27 +953,47 @@ export class V2ProjectionBuildCoordinator {
           lockToken,
           record.retiredFilename,
         );
-      } catch {
-        throw new Error("PROJECTION_PUBLICATION_RECOVERY_REQUIRED");
+      } catch (error) {
+        this.#throwReconciliationRecovery(error);
       }
       if (retired === null || !sameRetirementRenameContinuity(retired, record.image)) {
         throw new Error("PROJECTION_PUBLICATION_RECOVERY_REQUIRED");
       }
       try {
-        this.#reconciliationJournal.completeRetirement(
+        resolvedRecords[index] = this.#reconciliationJournal.completeRetirement(
           this.#projectionDirectory,
           identity,
           lockToken,
           record,
           toRetirementImage(retired),
         );
-      } catch {
-        throw new Error("PROJECTION_PUBLICATION_RECOVERY_REQUIRED");
+      } catch (error) {
+        this.#throwReconciliationRecovery(error);
       }
     }
+    this.#faultInjector?.hit("after-v2-retirement-recovery-before-final-scan");
     const filenames = readdirSync(this.#projectionDirectory).sort();
     const filenamesPresent = new Set(filenames);
     assertStrictRetirementEvidence(filenamesPresent);
+    for (const record of resolvedRecords) {
+      if (record.state !== "retired" || !filenamesPresent.has(record.retiredFilename)) {
+        throw new Error("PROJECTION_PUBLICATION_RECOVERY_REQUIRED");
+      }
+      let retired: StableProjectionGenerationIdentity | null;
+      try {
+        retired = filesystemStableProjectionDirectoryOperations.captureRetiredGeneration(
+          this.#projectionDirectory,
+          identity,
+          lockToken,
+          record.retiredFilename,
+        );
+      } catch (error) {
+        this.#throwReconciliationRecovery(error);
+      }
+      if (retired === null || !sameRetirementImage(retired, record.image)) {
+        throw new Error("PROJECTION_PUBLICATION_RECOVERY_REQUIRED");
+      }
+    }
     let highestObservedGeneration = active?.manifest.highestObservedGeneration ?? 0;
     for (const filename of filenames) {
       const match = V2_GENERATION_FILE.exec(filename);
@@ -1047,6 +1064,17 @@ export class V2ProjectionBuildCoordinator {
       );
     }
     return highestObservedGeneration;
+  }
+
+  #throwReconciliationRecovery(error: unknown): never {
+    if (
+      error instanceof Error
+      && (
+        error.message === "PROJECTION_PATH_INVALID"
+        || error.message === "PROJECTION_PUBLICATION_RECOVERY_REQUIRED"
+      )
+    ) throw error;
+    throw new Error("PROJECTION_PUBLICATION_RECOVERY_REQUIRED", { cause: error });
   }
 
   #assertUnpublishedV2Candidate(bytes: Uint8Array, filename: string, binding: ProjectBinding): void {

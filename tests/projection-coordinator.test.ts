@@ -480,7 +480,7 @@ describe("projection build coordinator", () => {
         }),
       });
       await coordinator.ensurePublished(${JSON.stringify(BINDING)}, 1n, 10_000);
-    `], { cwd: process.cwd(), encoding: "utf8" });
+    `], { cwd: process.cwd(), encoding: "utf8", timeout: 15_000 });
     assert.equal(restart.status, 0, restart.stderr);
     const retiredName = readdirSync(projectionDirectory).find((name) => (
       /^\.projections-2-retired-[0-9a-f]{32}\.sqlite$/u.test(name)
@@ -558,7 +558,7 @@ describe("projection build coordinator", () => {
         }),
       });
       await coordinator.ensurePublished(${JSON.stringify(BINDING)}, 1n, 10_000);
-    `], { cwd: process.cwd(), encoding: "utf8" });
+    `], { cwd: process.cwd(), encoding: "utf8", timeout: 15_000 });
     assert.equal(restart.status, 0, restart.stderr);
     const retiredName = readdirSync(projectionDirectory).find((name) => (
       /^\.projections-2-retired-[0-9a-f]{32}\.sqlite$/u.test(name)
@@ -630,6 +630,107 @@ describe("projection build coordinator", () => {
       /PROJECTION_PUBLICATION_RECOVERY_REQUIRED/u,
     );
     assert.equal(existsSync(retiredPath), true);
+    assert.equal(existsSync(join(projectionDirectory, PROJECTION_MANIFEST_PUBLICATION_LOCK_FILENAME)), true);
+    source.close();
+  });
+
+  it("rejects missing retired evidence after recovery before the final scan", async () => {
+    const root = mkdtempSync(join(tmpdir(), "projection-v2-retired-evidence-missing-"));
+    roots.push(root);
+    const sourcePath = join(root, "events.sqlite");
+    const projectionDirectory = join(root, "projections");
+    const source = sourceDatabase(sourcePath);
+    append(source, 1);
+    const driver = new NodeSqliteDriver({ DatabaseSync });
+    const faulted = new V2ProjectionBuildCoordinator({
+      projectionDirectory,
+      eventReader: new SqliteProjectionEventReader({ driver, eventStorePath: sourcePath }),
+      builder: new ImmutableProjectionBuilder({ driver, projectionDirectory, now: () => NOW }),
+      faultInjector: { hit(boundary): void {
+        if (boundary === "after-v2-generation-install-before-manifest") throw new Error("post-install");
+      } },
+    });
+    await assert.rejects(() => faulted.ensurePublished(BINDING, 1n, 10_000), /post-install/u);
+
+    const reconciler = new V2ProjectionBuildCoordinator({
+      projectionDirectory,
+      eventReader: new SqliteProjectionEventReader({ driver, eventStorePath: sourcePath }),
+      builder: new ImmutableProjectionBuilder({ driver, projectionDirectory, now: () => NOW }),
+    });
+    await reconciler.ensurePublished(BINDING, 1n, 10_000);
+    const retiredName = readdirSync(projectionDirectory).find((name) => (
+      /^\.projections-2-retired-[0-9a-f]{32}\.sqlite$/u.test(name)
+    ));
+    assert.notEqual(retiredName, undefined);
+    const retiredPath = join(projectionDirectory, retiredName!);
+
+    const recovery = new V2ProjectionBuildCoordinator({
+      projectionDirectory,
+      eventReader: new SqliteProjectionEventReader({ driver, eventStorePath: sourcePath }),
+      builder: new ImmutableProjectionBuilder({ driver, projectionDirectory, now: () => NOW }),
+      faultInjector: { hit(boundary): void {
+        if (boundary === "after-v2-retirement-recovery-before-final-scan") rmSync(retiredPath);
+      } },
+    });
+    await assert.rejects(
+      () => recovery.ensurePublished(BINDING, 1n, 10_000),
+      /PROJECTION_PUBLICATION_RECOVERY_REQUIRED/u,
+    );
+    assert.equal(existsSync(retiredPath), false);
+    assert.equal(existsSync(join(projectionDirectory, PROJECTION_MANIFEST_PUBLICATION_LOCK_FILENAME)), true);
+    source.close();
+  });
+
+  it("retains swapped retired evidence after recovery before the final scan", async () => {
+    const root = mkdtempSync(join(tmpdir(), "projection-v2-retired-evidence-swap-"));
+    roots.push(root);
+    const sourcePath = join(root, "events.sqlite");
+    const projectionDirectory = join(root, "projections");
+    const source = sourceDatabase(sourcePath);
+    append(source, 1);
+    const driver = new NodeSqliteDriver({ DatabaseSync });
+    const faulted = new V2ProjectionBuildCoordinator({
+      projectionDirectory,
+      eventReader: new SqliteProjectionEventReader({ driver, eventStorePath: sourcePath }),
+      builder: new ImmutableProjectionBuilder({ driver, projectionDirectory, now: () => NOW }),
+      faultInjector: { hit(boundary): void {
+        if (boundary === "after-v2-generation-install-before-manifest") throw new Error("post-install");
+      } },
+    });
+    await assert.rejects(() => faulted.ensurePublished(BINDING, 1n, 10_000), /post-install/u);
+
+    const reconciler = new V2ProjectionBuildCoordinator({
+      projectionDirectory,
+      eventReader: new SqliteProjectionEventReader({ driver, eventStorePath: sourcePath }),
+      builder: new ImmutableProjectionBuilder({ driver, projectionDirectory, now: () => NOW }),
+    });
+    await reconciler.ensurePublished(BINDING, 1n, 10_000);
+    const retiredName = readdirSync(projectionDirectory).find((name) => (
+      /^\.projections-2-retired-[0-9a-f]{32}\.sqlite$/u.test(name)
+    ));
+    assert.notEqual(retiredName, undefined);
+    const retiredPath = join(projectionDirectory, retiredName!);
+    const retainedBytes = readFileSync(retiredPath);
+    const displacedPath = join(projectionDirectory, "displaced-retired-evidence.sqlite");
+    const forgedPath = join(projectionDirectory, "forged-retired-evidence.sqlite");
+    writeFileSync(forgedPath, "forged retained evidence", "utf8");
+
+    const recovery = new V2ProjectionBuildCoordinator({
+      projectionDirectory,
+      eventReader: new SqliteProjectionEventReader({ driver, eventStorePath: sourcePath }),
+      builder: new ImmutableProjectionBuilder({ driver, projectionDirectory, now: () => NOW }),
+      faultInjector: { hit(boundary): void {
+        if (boundary !== "after-v2-retirement-recovery-before-final-scan") return;
+        renameSync(retiredPath, displacedPath);
+        renameSync(forgedPath, retiredPath);
+      } },
+    });
+    await assert.rejects(
+      () => recovery.ensurePublished(BINDING, 1n, 10_000),
+      /PROJECTION_PUBLICATION_RECOVERY_REQUIRED/u,
+    );
+    assert.deepEqual(readFileSync(displacedPath), retainedBytes);
+    assert.equal(readFileSync(retiredPath, "utf8"), "forged retained evidence");
     assert.equal(existsSync(join(projectionDirectory, PROJECTION_MANIFEST_PUBLICATION_LOCK_FILENAME)), true);
     source.close();
   });
@@ -1061,6 +1162,36 @@ describe("projection build coordinator", () => {
     );
     assert.equal(readFileSync(join(projectionDirectory, knownTemp), "utf8"), "outside victim");
     assert.equal(readFileSync(join(originalDirectory, knownTemp), "utf8"), "owned stale temp");
+  });
+
+  it("takes the V2 publication lock before a directory-swap journal snapshot", async () => {
+    const root = mkdtempSync(join(tmpdir(), "projection-v2-journal-snapshot-swap-"));
+    roots.push(root);
+    const projectionDirectory = join(root, "projections");
+    const originalDirectory = join(root, "original-projections");
+    const attackerDirectory = join(root, "attacker-projections");
+    mkdirSync(projectionDirectory);
+    mkdirSync(attackerDirectory);
+    let swapped = false;
+    const coordinator = new V2ProjectionBuildCoordinator({
+      projectionDirectory,
+      leasedFilenames: () => {
+        if (!swapped) {
+          swapped = true;
+          renameSync(projectionDirectory, originalDirectory);
+          renameSync(attackerDirectory, projectionDirectory);
+        }
+        return [];
+      },
+      eventReader: { async openCommittedSnapshot() { throw new Error("source must not run"); } },
+      builder: { async buildV2() { throw new Error("builder must not run"); } },
+    });
+
+    await assert.rejects(
+      () => coordinator.ensurePublished(BINDING, 1n, 2_000),
+      /PROJECTION_PATH_INVALID/u,
+    );
+    assert.equal(existsSync(join(originalDirectory, PROJECTION_MANIFEST_PUBLICATION_LOCK_FILENAME)), true);
   });
 
   it("retains an unreadable final-named V2 candidate rather than deleting on uncertain observation", async () => {
