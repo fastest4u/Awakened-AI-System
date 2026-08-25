@@ -153,7 +153,7 @@ Run:
 
 ```bash
 npm run test:build
-node --test --test-concurrency=1 --test-name-pattern="retired V2 generation high-water|retains retired evidence|no stable V2 orphan deletion|fresh reads must reconcile" dist-test/tests/projection-coordinator.test.js
+node --test --test-concurrency=1 --test-name-pattern="retired V2 generation high-water|retains retired evidence|no stable V2 orphan deletion|reconciles an identified" dist-test/tests/projection-coordinator.test.js
 npm run typecheck
 ```
 
