@@ -855,8 +855,8 @@ export class V2ProjectionBuildCoordinator {
     } catch {
       throw new Error("PROJECTION_PUBLICATION_RECOVERY_REQUIRED");
     }
-    const filenames = readdirSync(this.#projectionDirectory).sort();
-    const filenamesPresent = new Set(filenames);
+    const initialFilenames = readdirSync(this.#projectionDirectory).sort();
+    const initialFilenamesPresent = new Set(initialFilenames);
     const retiredFilenames = new Set<string>();
     const intentFinalFilenames = new Set<string>();
     for (const record of records) {
@@ -876,13 +876,16 @@ export class V2ProjectionBuildCoordinator {
       ) throw new Error("PROJECTION_PUBLICATION_RECOVERY_REQUIRED");
       intentFinalFilenames.add(record.finalFilename);
     }
-    for (const filename of filenames) {
-      if (
-        V2_LEGACY_QUARANTINE_FILE.test(filename)
-        || V2_RECONCILIATION_SIDECAR.test(filename)
-        || (V2_RETIRED_FILE.test(filename) && !retiredFilenames.has(filename))
-      ) throw new Error("PROJECTION_PUBLICATION_RECOVERY_REQUIRED");
-    }
+    const assertStrictRetirementEvidence = (filenamesPresent: ReadonlySet<string>): void => {
+      for (const filename of filenamesPresent) {
+        if (
+          V2_LEGACY_QUARANTINE_FILE.test(filename)
+          || V2_RECONCILIATION_SIDECAR.test(filename)
+          || (V2_RETIRED_FILE.test(filename) && !retiredFilenames.has(filename))
+        ) throw new Error("PROJECTION_PUBLICATION_RECOVERY_REQUIRED");
+      }
+    };
+    assertStrictRetirementEvidence(initialFilenamesPresent);
     for (const record of records) {
       let retired: StableProjectionGenerationIdentity | null;
       try {
@@ -903,7 +906,7 @@ export class V2ProjectionBuildCoordinator {
       }
       if (retired !== null) {
         if (
-          filenamesPresent.has(record.finalFilename)
+          initialFilenamesPresent.has(record.finalFilename)
           || !sameRetirementRenameContinuity(retired, record.image)
         ) throw new Error("PROJECTION_PUBLICATION_RECOVERY_REQUIRED");
         try {
@@ -971,6 +974,9 @@ export class V2ProjectionBuildCoordinator {
         throw new Error("PROJECTION_PUBLICATION_RECOVERY_REQUIRED");
       }
     }
+    const filenames = readdirSync(this.#projectionDirectory).sort();
+    const filenamesPresent = new Set(filenames);
+    assertStrictRetirementEvidence(filenamesPresent);
     let highestObservedGeneration = active?.manifest.highestObservedGeneration ?? 0;
     for (const filename of filenames) {
       const match = V2_GENERATION_FILE.exec(filename);

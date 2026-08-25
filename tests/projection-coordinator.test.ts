@@ -498,6 +498,93 @@ describe("projection build coordinator", () => {
     source.close();
   });
 
+  it("recovers a retirement intent before its rename in a fresh process", async () => {
+    const root = mkdtempSync(join(tmpdir(), "projection-v2-retirement-intent-prerename-"));
+    roots.push(root);
+    const sourcePath = join(root, "events.sqlite");
+    const projectionDirectory = join(root, "projections");
+    const journalPath = join(projectionDirectory, "projection-reconciliation-v2.json");
+    const source = sourceDatabase(sourcePath);
+    append(source, 1);
+    const driver = new NodeSqliteDriver({ DatabaseSync });
+    const faulted = new V2ProjectionBuildCoordinator({
+      projectionDirectory,
+      eventReader: new SqliteProjectionEventReader({ driver, eventStorePath: sourcePath }),
+      builder: new ImmutableProjectionBuilder({ driver, projectionDirectory, now: () => NOW }),
+      faultInjector: { hit(boundary): void {
+        if (boundary === "after-v2-generation-install-before-manifest") throw new Error("post-install");
+      } },
+    });
+    await assert.rejects(() => faulted.ensurePublished(BINDING, 1n, 10_000), /post-install/u);
+
+    const interrupted = new V2ProjectionBuildCoordinator({
+      projectionDirectory,
+      eventReader: new SqliteProjectionEventReader({ driver, eventStorePath: sourcePath }),
+      builder: new ImmutableProjectionBuilder({ driver, projectionDirectory, now: () => NOW }),
+      faultInjector: { hit(boundary): void {
+        if (boundary === "after-v2-retirement-intent-before-rename") {
+          throw new Error("intent-before-rename");
+        }
+      } },
+    });
+    await assert.rejects(
+      () => interrupted.ensurePublished(BINDING, 1n, 10_000),
+      /intent-before-rename/u,
+    );
+    const afterFault = JSON.parse(readFileSync(journalPath, "utf8")) as {
+      highestReservedGeneration: number;
+      retirements: readonly { state: string }[];
+    };
+    assert.equal(afterFault.highestReservedGeneration, 1);
+    assert.equal(afterFault.retirements[0]?.state, "intent");
+    assert.equal(existsSync(join(projectionDirectory, "projections-2-1.sqlite")), true);
+    rmSync(join(projectionDirectory, PROJECTION_MANIFEST_PUBLICATION_LOCK_FILENAME));
+
+    const restart = spawnSync(process.execPath, ["--input-type=module", "--eval", `
+      import { DatabaseSync } from "node:sqlite";
+      import { ImmutableProjectionBuilder } from "./dist-test/src/orchestrator/projections/builder.js";
+      import { V2ProjectionBuildCoordinator } from "./dist-test/src/orchestrator/projections/coordinator.js";
+      import { SqliteProjectionEventReader } from "./dist-test/src/orchestrator/projections/event-reader.js";
+      import { NodeSqliteDriver } from "./dist-test/src/orchestrator/storage/node-sqlite-driver.js";
+
+      const driver = new NodeSqliteDriver({ DatabaseSync });
+      const coordinator = new V2ProjectionBuildCoordinator({
+        projectionDirectory: ${JSON.stringify(projectionDirectory)},
+        eventReader: new SqliteProjectionEventReader({ driver, eventStorePath: ${JSON.stringify(sourcePath)} }),
+        builder: new ImmutableProjectionBuilder({
+          driver,
+          projectionDirectory: ${JSON.stringify(projectionDirectory)},
+          now: () => ${JSON.stringify(NOW)},
+        }),
+      });
+      await coordinator.ensurePublished(${JSON.stringify(BINDING)}, 1n, 10_000);
+    `], { cwd: process.cwd(), encoding: "utf8" });
+    assert.equal(restart.status, 0, restart.stderr);
+    const retiredName = readdirSync(projectionDirectory).find((name) => (
+      /^\.projections-2-retired-[0-9a-f]{32}\.sqlite$/u.test(name)
+    ));
+    assert.notEqual(retiredName, undefined);
+    const afterRestart = JSON.parse(readFileSync(journalPath, "utf8")) as {
+      highestReservedGeneration: number;
+      retirements: readonly { state: string; image: { ctimeNs: string } }[];
+    };
+    assert.equal(afterRestart.highestReservedGeneration, 1);
+    assert.equal(afterRestart.retirements[0]?.state, "retired");
+    assert.equal(
+      afterRestart.retirements[0]?.image.ctimeNs,
+      lstatSync(join(projectionDirectory, retiredName!), { bigint: true }).ctimeNs.toString(),
+    );
+    assert.equal(existsSync(join(projectionDirectory, "projections-2-1.sqlite")), false);
+    assert.equal(
+      parseProjectionManifestV2(
+        JSON.parse(readFileSync(join(projectionDirectory, "projection-manifest.json"), "utf8")),
+        BINDING,
+      ).generation,
+      2,
+    );
+    source.close();
+  });
+
   it("rejects ctime-changed retired evidence after its journal record is complete", async () => {
     const root = mkdtempSync(join(tmpdir(), "projection-v2-retired-evidence-ctime-"));
     roots.push(root);
