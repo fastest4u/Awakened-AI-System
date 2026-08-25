@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -163,6 +163,30 @@ function imageWith(
   return Object.freeze({ ...image, ...overrides });
 }
 
+function imageBytesWithMetadataCanary(image: StableProjectionGenerationImage): Uint8Array {
+  const root = mkdtempSync(join(tmpdir(), "v2-reader-lease-canary-"));
+  roots.push(root);
+  const path = join(root, "substituted.sqlite");
+  writeFileSync(path, image.bytes);
+  const database = new DatabaseSync(path);
+  try {
+    database.prepare("UPDATE projection_metadata SET created_at = ?").run("substituted");
+  } finally {
+    database.close();
+  }
+  return Uint8Array.from(readFileSync(path));
+}
+
+function getterBackedGeneration(
+  manifest: () => LeasableV2ProjectionGeneration["manifest"],
+  image: () => StableProjectionGenerationImage,
+): LeasableV2ProjectionGeneration {
+  return Object.freeze(Object.defineProperties({}, {
+    manifest: { enumerable: true, get: manifest },
+    image: { enumerable: true, get: image },
+  })) as LeasableV2ProjectionGeneration;
+}
+
 describe("V2 projection reader leases", () => {
   it("opens a verified published V2 image as a guarded in-memory reader lease", async () => {
     const fixture = await publishedFixture();
@@ -224,6 +248,91 @@ describe("V2 projection reader leases", () => {
         }),
       });
       assertIntegrityFailure(() => registry.acquire(malformed));
+      assert.deepEqual(registry.activeFilenames(), []);
+    } finally {
+      fixture.source.close();
+    }
+  });
+
+  it("hashes and opens one copied captured image when its bytes getter changes", async () => {
+    const fixture = await publishedFixture();
+    try {
+      const registry = new V2ProjectionReaderLeaseRegistry();
+      const original = fixture.generation.image.bytes;
+      const substituted = imageBytesWithMetadataCanary(fixture.generation.image);
+      let reads = 0;
+      const changingImage = Object.freeze(Object.defineProperties({}, {
+        identity: { enumerable: true, get: () => fixture.generation.image.identity },
+        bytes: {
+          enumerable: true,
+          get: () => {
+            reads += 1;
+            return reads === 1 ? original : substituted;
+          },
+        },
+      })) as StableProjectionGenerationImage;
+      const generation = getterBackedGeneration(
+        () => fixture.generation.manifest,
+        () => changingImage,
+      );
+      const lease = registry.acquire(generation);
+      try {
+        assert.equal(
+          lease.database.prepare("SELECT created_at FROM projection_metadata").get()?.created_at,
+          NOW,
+        );
+        assert.equal(reads, 1);
+      } finally {
+        lease.close();
+      }
+      assert.deepEqual(registry.activeFilenames(), []);
+    } finally {
+      fixture.source.close();
+    }
+  });
+
+  it("uses a generation manifest snapshot before retaining its filename", async () => {
+    const fixture = await publishedFixture();
+    try {
+      const registry = new V2ProjectionReaderLeaseRegistry();
+      let manifestReads = 0;
+      const generation = getterBackedGeneration(
+        () => {
+          manifestReads += 1;
+          if (manifestReads !== 1) throw new Error("late manifest access");
+          return fixture.generation.manifest;
+        },
+        () => fixture.generation.image,
+      );
+      const lease = registry.acquire(generation);
+      try {
+        assert.equal(manifestReads, 1);
+        assert.equal(lease.manifest.databaseFile, fixture.generation.manifest.databaseFile);
+      } finally {
+        lease.close();
+      }
+      assert.deepEqual(registry.activeFilenames(), []);
+    } finally {
+      fixture.source.close();
+    }
+  });
+
+  it("fails closed without retaining a filename when generation accessors throw", async () => {
+    const fixture = await publishedFixture();
+    try {
+      const registry = new V2ProjectionReaderLeaseRegistry();
+      const manifestGetterFailure = getterBackedGeneration(
+        () => { throw new Error("manifest getter failure"); },
+        () => fixture.generation.image,
+      );
+      assertIntegrityFailure(() => registry.acquire(manifestGetterFailure));
+      assert.deepEqual(registry.activeFilenames(), []);
+
+      const imageGetterFailure = getterBackedGeneration(
+        () => fixture.generation.manifest,
+        () => { throw new Error("image getter failure"); },
+      );
+      assertIntegrityFailure(() => registry.acquire(imageGetterFailure));
       assert.deepEqual(registry.activeFilenames(), []);
     } finally {
       fixture.source.close();
