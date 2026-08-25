@@ -8,6 +8,7 @@ import {
   assertProjectionSidecarsAbsent,
   parseProjectionManifest,
   type ProjectionManifestV1,
+  type ProjectionManifestV2,
 } from "../projections/manifest.js";
 import type { ProjectionReaderLease } from "../projections/reader-lease.js";
 import {
@@ -28,6 +29,7 @@ import { isEligible } from "./eligibility.js";
 
 type SqliteParameter = null | number | bigint | string | Uint8Array;
 type Row = Record<string, unknown>;
+type RetrievalProjectionManifest = ProjectionManifestV1 | ProjectionManifestV2;
 
 interface ChannelSelection {
   readonly items: readonly RetrievalItem[];
@@ -138,7 +140,7 @@ function frozenItem(item: RetrievalItem): RetrievalItem {
 
 function canonicalItem(
   source: Row,
-  manifest: ProjectionManifestV1,
+  manifest: RetrievalProjectionManifest,
   terminalPosition: bigint,
   prefix = "",
 ): RetrievalItem {
@@ -172,7 +174,7 @@ function canonicalItem(
 
 function scopedItem(
   source: Row,
-  manifest: ProjectionManifestV1,
+  manifest: RetrievalProjectionManifest,
   terminalPosition: bigint,
   options: Readonly<{
     idColumn: string;
@@ -222,15 +224,15 @@ function scopedItem(
 
 function verifyMetadata(
   database: DatabaseSync,
-  manifest: ProjectionManifestV1,
+  manifest: RetrievalProjectionManifest,
 ): void {
   const statement = database.prepare(`
     SELECT project_id, vault_id, store_id, workspace_id, branch_scope_id, branch_ref,
            session_id, generation, terminal_event_position, terminal_event_hash
-    FROM projection_metadata WHERE singleton = 1 AND schema_version = 1
+    FROM projection_metadata WHERE singleton = $singleton AND schema_version = $schemaVersion
   `);
   statement.setReadBigInts(true);
-  const metadata = statement.get();
+  const metadata = statement.get({ $singleton: 1, $schemaVersion: manifest.schemaVersion });
   if (metadata === undefined) return projectionInvalid();
   const source = row(metadata);
   if (
@@ -288,7 +290,7 @@ function channelParameters(
 
 function lexicalItem(
   source: Row,
-  manifest: ProjectionManifestV1,
+  manifest: RetrievalProjectionManifest,
   terminalPosition: bigint,
 ): RetrievalItem {
   const sourcePosition = bigintValue(source, "source_event_position");
@@ -368,7 +370,7 @@ const CANONICAL_ELIGIBILITY_SQL = `
 
 function exactSelection(
   database: DatabaseSync,
-  manifest: ProjectionManifestV1,
+  manifest: RetrievalProjectionManifest,
   request: ValidatedInternalRetrievalRequest,
   parameters: Readonly<Record<string, SqliteParameter>>,
 ): ChannelSelection {
@@ -391,10 +393,13 @@ function exactSelection(
 
 function aliasSelection(
   database: DatabaseSync,
-  manifest: ProjectionManifestV1,
+  manifest: RetrievalProjectionManifest,
   request: ValidatedInternalRetrievalRequest,
   parameters: Readonly<Record<string, SqliteParameter>>,
 ): ChannelSelection {
+  if (manifest.schemaVersion === 2) {
+    return Object.freeze({ items: Object.freeze([]), dropped: 0, overflow: false });
+  }
   const rows = preparedRows(database, `
     SELECT item.project_id, item.session_id, item.item_id, item.normalized_key,
            item.conflict_group_id, item.superseding_item_id, item.status,
@@ -435,7 +440,7 @@ function aliasSelection(
 
 function lexicalSelection(
   database: DatabaseSync,
-  manifest: ProjectionManifestV1,
+  manifest: RetrievalProjectionManifest,
   request: ValidatedInternalRetrievalRequest,
   parameters: Readonly<Record<string, SqliteParameter>>,
   expression: string | null,
@@ -492,7 +497,7 @@ function lexicalSelection(
 
 function symbolPathSelection(
   database: DatabaseSync,
-  manifest: ProjectionManifestV1,
+  manifest: RetrievalProjectionManifest,
   request: ValidatedInternalRetrievalRequest,
   parameters: Readonly<Record<string, SqliteParameter>>,
 ): ChannelSelection {
@@ -534,11 +539,28 @@ function symbolPathSelection(
 
 function checkpointSelection(
   database: DatabaseSync,
-  manifest: ProjectionManifestV1,
+  manifest: RetrievalProjectionManifest,
   request: ValidatedInternalRetrievalRequest,
   parameters: Readonly<Record<string, SqliteParameter>>,
 ): ChannelSelection {
-  const rows = preparedRows(database, `
+  const rows = manifest.schemaVersion === 2
+    ? preparedRows(database, `
+    SELECT project_id, session_id, checkpoint_id, task_summary, source_event_position,
+           'high' AS confidence
+    FROM session_checkpoints
+    WHERE project_id = $projectId
+      AND source_event_position <= $terminalPosition
+      AND ($knownAt IS NULL OR source_event_position <= $knownAt)
+      AND session_id = $sessionId
+      AND $visibilityLevel >= 3
+      AND (
+        instr(lower(checkpoint_id), $query) > 0
+        OR instr(lower(task_summary), $query) > 0
+      )
+    ORDER BY source_event_position DESC, checkpoint_id
+    LIMIT $scanLimit
+  `, parameters)
+    : preparedRows(database, `
     SELECT project_id, session_id, checkpoint_id, task_summary, source_event_position,
            'high' AS confidence
     FROM session_tree
@@ -550,7 +572,7 @@ function checkpointSelection(
       AND (
         instr(lower(checkpoint_id), $query) > 0
         OR instr(lower(task_summary), $query) > 0
-      )
+    )
     ORDER BY source_event_position DESC, checkpoint_id
     LIMIT $scanLimit
   `, parameters);
@@ -571,7 +593,7 @@ function checkpointSelection(
 
 function followUpSelection(
   database: DatabaseSync,
-  manifest: ProjectionManifestV1,
+  manifest: RetrievalProjectionManifest,
   request: ValidatedInternalRetrievalRequest,
   parameters: Readonly<Record<string, SqliteParameter>>,
 ): ChannelSelection {
@@ -615,12 +637,13 @@ function itemKey(item: RetrievalItem): string {
 }
 
 function conflictCursor(
-  manifest: ProjectionManifestV1,
+  manifest: RetrievalProjectionManifest,
   conflictGroupId: string,
   returnedMemberCount: number,
 ): string {
+  const cursorPrefix = `retrieval-conflict-closure-v${manifest.schemaVersion}`;
   const digest = createHash("sha256")
-    .update("retrieval-conflict-closure-v1")
+    .update(cursorPrefix)
     .update("\u0000")
     .update(manifest.generation.toString())
     .update("\u0000")
@@ -631,12 +654,12 @@ function conflictCursor(
     .update(returnedMemberCount.toString())
     .digest("hex")
     .slice(0, 32);
-  return `retrieval-conflict-closure-v1:${returnedMemberCount}:${digest}`;
+  return `${cursorPrefix}:${returnedMemberCount}:${digest}`;
 }
 
 function conflictClosure(
   database: DatabaseSync,
-  manifest: ProjectionManifestV1,
+  manifest: RetrievalProjectionManifest,
   request: ValidatedInternalRetrievalRequest,
   parameters: Readonly<Record<string, SqliteParameter>>,
   conflictGroupIds: readonly string[],
@@ -749,7 +772,7 @@ function applyFeedback(item: RetrievalItem, scores: ReadonlyMap<string, number>)
 
 function collectChannels(
   database: DatabaseSync,
-  manifest: ProjectionManifestV1,
+  manifest: RetrievalProjectionManifest,
   request: ValidatedInternalRetrievalRequest,
 ): Readonly<{
   channels: readonly RetrievalChannelResult[];
@@ -879,6 +902,23 @@ function collectChannels(
   });
 }
 
+export function collectEligibleFromProjectionDatabase(
+  database: DatabaseSync,
+  manifest: RetrievalProjectionManifest,
+  input: InternalRetrievalRequest,
+): RetrievalCandidateCollection {
+  const request = validateInternalRetrievalRequest(input);
+  verifyMetadata(database, manifest);
+  const collected = collectChannels(database, manifest, request);
+  return Object.freeze({
+    channels: collected.channels,
+    eligibleItemCount: collected.eligibleItemCount,
+    droppedItemCount: collected.droppedItemCount,
+    truncated: collected.truncated,
+    conflictGroups: collected.conflictGroups,
+  });
+}
+
 function openProjection(path: string, deadlineMs: number): DatabaseSync {
   let database: DatabaseSync | undefined;
   try {
@@ -924,15 +964,7 @@ export class SqliteRetrievalCandidateRepository {
     assertProjectionSidecarsAbsent(lease.databasePath);
     const database = openProjection(lease.databasePath, request.consistency.deadlineMs);
     try {
-      verifyMetadata(database, manifest);
-      const collected = collectChannels(database, manifest, request);
-      return Object.freeze({
-        channels: collected.channels,
-        eligibleItemCount: collected.eligibleItemCount,
-        droppedItemCount: collected.droppedItemCount,
-        truncated: collected.truncated,
-        conflictGroups: collected.conflictGroups,
-      });
+      return collectEligibleFromProjectionDatabase(database, manifest, input);
     } catch (error) {
       if (error instanceof InternalRetrievalError) throw error;
       return projectionInvalid();
