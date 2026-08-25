@@ -1,5 +1,7 @@
 # Task 5 V2 Internal Verified Lease Implementation Plan
 
+> **Execution status (2026-08-25):** Tasks 1–3 and the Task 4 audit/review actions are complete at `a55f874`. The final full Subproject 3 gate was run and is **blocked**: 242 passed, 4 `PROJECTION_LAG` deadline failures in existing coordinator coverage, and 1 expected Windows symlink skip. The newly registered V2 lease and V2 candidate suites both passed (6/6 and 4/4). This approved evaluator-only Task 5 does not provide V2 production routing or cutover.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Provide an evaluator-only V2 reader lease that queries a detached, checksum-verified SQLite byte image and protects its final filename from V2 reconciliation while it is leased.
@@ -31,7 +33,7 @@ The path captured by `StableProjectionDirectoryOperations.readGenerationImage` i
 - Test: `tests/v2-reader-lease.test.ts`
 - Reference: `src/orchestrator/projections/integrity.ts:293-337`, `src/orchestrator/projections/stable-directory.ts:855-920`, `src/orchestrator/projections/manifest.ts:101-121`
 
-- [ ] **Step 1: Write failing image/registry tests first.**
+- [x] **Step 1: Write failing image/registry tests first.**
 
   In `tests/v2-reader-lease.test.ts`, build a real V2 projection with the existing `ImmutableProjectionBuilder` and `V2ProjectionBuildCoordinator`, acquire its `StableProjectionGenerationImage` under `acquireProjectionManifestPublicationLease`, then write these tests against the desired API:
 
@@ -49,7 +51,7 @@ The path captured by `StableProjectionDirectoryOperations.readGenerationImage` i
 
   Add independent tests that (a) replace `image.identity.sha256` with a different 64-hex digest, (b) replace `image.bytes` with malformed bytes, and (c) change `image.identity.filename`.  Each must throw `LifecycleError` with code `INTEGRITY_FAILURE`, and `registry.activeFilenames()` must remain empty.  Add a test that calls `lease.close()` twice, asserts `activeFilenames()` becomes empty once, and asserts a query on `lease.database` now throws because the private database was closed.  Add a direct `PRAGMA query_only`, `PRAGMA trusted_schema`, and `PRAGMA foreign_keys` assertion on an acquired lease database.
 
-- [ ] **Step 2: Run the new tests and record RED.**
+- [x] **Step 2: Run the new tests and record RED.**
 
   Run:
 
@@ -60,7 +62,7 @@ The path captured by `StableProjectionDirectoryOperations.readGenerationImage` i
 
   Expected: the test build fails because `v2-reader-lease.ts` and its exported V2 contracts do not yet exist, or the direct test run fails because the module cannot be resolved.  Do not write production code until that is the observed failure.
 
-- [ ] **Step 3: Implement the V2-only contracts and verified image.**
+- [x] **Step 3: Implement the V2-only contracts and verified image.**
 
   Create `v2-reader-lease.ts` with these contracts; do not import `reader-lease.ts` and do not expose a database path:
 
@@ -126,7 +128,7 @@ The path captured by `StableProjectionDirectoryOperations.readGenerationImage` i
 
   `sha256Bytes` must use `createHash("sha256").update(bytes).digest("hex")`; `integrityFailure` must throw `new LifecycleError("INTEGRITY_FAILURE")`.  Reuse `openImmutableProjectionImage`, whose current implementation creates a detached normalized copy and verifies `query_only`, `trusted_schema`, `foreign_keys`, and `busy_timeout`.  Do not add a `DatabaseSync` pathname open, `readFileSync`, or path field in this module.
 
-- [ ] **Step 4: Implement atomic logical leasing.**
+- [x] **Step 4: Implement atomic logical leasing.**
 
   Implement a standalone `V2ProjectionReaderLeaseRegistry` with a private `Map<string, number>` keyed only by `manifest.databaseFile` and this observable surface:
 
@@ -159,7 +161,7 @@ The path captured by `StableProjectionDirectoryOperations.readGenerationImage` i
 
   `#release` must decrement once, delete a zero-count entry, and throw `INTEGRITY_FAILURE` only if an impossible negative count is reached.  Image construction occurs before `#leases.set`, so every checksum/deserialization failure leaves no filename reference.  Closing the private image precedes releasing its logical reference, so reconciliation cannot retire a name while a usable lease still exists.
 
-- [ ] **Step 5: Run the focused green tests and typecheck.**
+- [x] **Step 5: Run the focused green tests and typecheck.**
 
   Run:
 
@@ -171,7 +173,7 @@ The path captured by `StableProjectionDirectoryOperations.readGenerationImage` i
 
   Expected: all Task 1 tests pass; typecheck exits 0.  Confirm the test performs all assertions through a real in-memory SQLite image rather than a mocked database.
 
-- [ ] **Step 6: Commit the isolated image/registry change.**
+- [x] **Step 6: Commit the isolated image/registry change.**
 
   ```powershell
   git add src/orchestrator/projections/v2-reader-lease.ts tests/v2-reader-lease.test.ts
@@ -185,7 +187,7 @@ The path captured by `StableProjectionDirectoryOperations.readGenerationImage` i
 - Modify: `tests/projection-coordinator.test.ts`
 - Reference: `src/orchestrator/projections/v2-reader-lease.ts`, `src/orchestrator/projections/stable-directory.ts:920-927,1439-1450`
 
-- [ ] **Step 1: Write failing coordinator tests first.**
+- [x] **Step 1: Write failing coordinator tests first.**
 
   Add tests after existing V2 coordinator coverage that first publish a real V2 generation and then call the desired internal method:
 
@@ -202,7 +204,7 @@ The path captured by `StableProjectionDirectoryOperations.readGenerationImage` i
   3. After acquiring a lease, rename the final file away, replace the original pathname with a different file, truncate it, and mutate its SQLite content in separate fixture cases.  The query against `lease.database` must still return the original captured metadata/item results.
   4. Publish generation 1, acquire its lease, then publish generation 2.  Call `ensurePublished(BINDING, 2n, 2_000)` once more so its entry reconciliation observes generation 2 as active and generation 1 as an unreferenced final.  Assert generation 1's filename remains present while the V2 lease is open; close it, call `ensurePublished(BINDING, 2n, 2_000)` again, and assert generation 1 has been retired according to the existing Task 4 reconciliation protocol.
 
-- [ ] **Step 2: Run the coordinator additions and verify RED.**
+- [x] **Step 2: Run the coordinator additions and verify RED.**
 
   Run:
 
@@ -213,7 +215,7 @@ The path captured by `StableProjectionDirectoryOperations.readGenerationImage` i
 
   Expected: compilation or tests fail specifically because `leasePublishedForEvaluation` and V2-registry retention integration have not been implemented.
 
-- [ ] **Step 3: Add V2 registry ownership without changing V1 types.**
+- [x] **Step 3: Add V2 registry ownership without changing V1 types.**
 
   In `coordinator.ts`, import only the new V2 types and add an optional internal registry option:
 
@@ -242,7 +244,7 @@ The path captured by `StableProjectionDirectoryOperations.readGenerationImage` i
 
   Preserve `leasedFilenames` exactly as a test seam and use the merged private callback only in `#reconcileUnpublished`.  Do not add any V2 method to `ProjectionBuildCoordinator`, `DefaultProjectionBuildCoordinator`, or `InternalProjectionRuntime`.
 
-- [ ] **Step 4: Implement locked one-shot capture.**
+- [x] **Step 4: Implement locked one-shot capture.**
 
   Add this internal-only public method on `V2ProjectionBuildCoordinator` directly after `ensurePublished`:
 
@@ -279,7 +281,7 @@ The path captured by `StableProjectionDirectoryOperations.readGenerationImage` i
 
   Before `readGenerationImage`, require that `identity` still equals `#requiredDirectoryIdentity()` and preserve `#loadPublishedLocked`'s sidecar, manifest-content, hash, and stable-final checks.  If any path or stable-worker operation fails, do not create the registry lease; translate absence to `V2ProjectionLeaseUnavailableError`, preserve `LifecycleError`, and surface other uncertainty as `PROJECTION_PATH_INVALID` or `MATERIALIZATION_CONFLICT` according to the existing coordinator convention.  The method must release the cooperative lock after registry acquisition, never retain it during evaluator use.
 
-- [ ] **Step 5: Run focused green verification and commit.**
+- [x] **Step 5: Run focused green verification and commit.**
 
   Run:
 
@@ -308,7 +310,7 @@ The path captured by `StableProjectionDirectoryOperations.readGenerationImage` i
 - Modify: `package.json:21-33`
 - Reference: `src/orchestrator/projections/manifest.ts:101-121`, `src/orchestrator/projections/v2-reader-lease.ts`
 
-- [ ] **Step 1: Write failing V2 adapter tests first.**
+- [x] **Step 1: Write failing V2 adapter tests first.**
 
   Create `tests/v2-retrieval-candidates.test.ts` using a real coordinator lease and the desired API:
 
@@ -323,7 +325,7 @@ The path captured by `StableProjectionDirectoryOperations.readGenerationImage` i
 
   Add a TypeScript fixture that assigns the existing `SqliteRetrievalCandidateRepository` to a `ProjectionReaderLease` call and uses an unchanged V1 request, so its public signature remains protected by compilation.  Do not convert that V1 test to a V2 type.
 
-- [ ] **Step 2: Run the new adapter tests and verify RED.**
+- [x] **Step 2: Run the new adapter tests and verify RED.**
 
   Run:
 
@@ -334,7 +336,7 @@ The path captured by `StableProjectionDirectoryOperations.readGenerationImage` i
 
   Expected: the test build fails because `V2SqliteRetrievalCandidateRepository` does not exist.  Do not first add an adapter that opens a filename.
 
-- [ ] **Step 3: Extract a database-taking collection seam while preserving V1 behavior.**
+- [x] **Step 3: Extract a database-taking collection seam while preserving V1 behavior.**
 
   In `candidates.ts`, introduce the private-union alias and change only internal helper parameter types:
 
@@ -381,7 +383,7 @@ The path captured by `StableProjectionDirectoryOperations.readGenerationImage` i
 
   Rewrite the existing `SqliteRetrievalCandidateRepository.collectEligible` to preserve its current public V1 parsing, sidecar checks, `openProjection`/`finally database.close()` behavior, and errors, then call that seam after opening its own database.  It must still parse only `ProjectionManifestV1` and accept only `ProjectionReaderLease`.
 
-- [ ] **Step 4: Implement the pathless V2 adapter.**
+- [x] **Step 4: Implement the pathless V2 adapter.**
 
   Create `v2-candidates.ts` with no import from `node:sqlite`, `node:fs`, or `node:path`:
 
@@ -410,7 +412,7 @@ The path captured by `StableProjectionDirectoryOperations.readGenerationImage` i
 
   Do not close `lease.database`, accept a `databasePath`, call `assertProjectionSidecarsAbsent`, construct `DatabaseSync`, or add the adapter to `InternalRetrievalService` or runtime wiring.
 
-- [ ] **Step 5: Include the tests in the Subproject 3 gate and verify green.**
+- [x] **Step 5: Include the tests in the Subproject 3 gate and verify green.**
 
   Append these two explicit compiled tests after the other projection tests in the `test:subproject-3` script:
 
@@ -429,7 +431,7 @@ The path captured by `StableProjectionDirectoryOperations.readGenerationImage` i
 
   Expected: zero test failures, typecheck exit 0, no whitespace errors.  Confirm the original V1 retrieval test suite still runs unchanged.
 
-- [ ] **Step 6: Commit the V2 adapter.**
+- [x] **Step 6: Commit the V2 adapter.**
 
   ```powershell
   git add src/orchestrator/retrieval/candidates.ts src/orchestrator/retrieval/v2-candidates.ts tests/v2-retrieval-candidates.test.ts package.json
@@ -442,7 +444,7 @@ The path captured by `StableProjectionDirectoryOperations.readGenerationImage` i
 - Verify: `src/orchestrator/projections/reader-lease.ts`, `src/orchestrator/projections/coordinator.ts`, `src/orchestrator/runtime/projection-runtime.ts`, `src/orchestrator/retrieval/candidates.ts`, `src/orchestrator/retrieval/v2-candidates.ts`
 - Verify: `tests/projection-runtime.test.ts`, `tests/projection-coordinator.test.ts`, `tests/v2-reader-lease.test.ts`, `tests/v2-retrieval-candidates.test.ts`
 
-- [ ] **Step 1: Run the complete Task 5 release gate.**
+- [x] **Step 1: Run the complete Task 5 release gate.**
 
   Run from `C:\\Users\\Server\\.codex\\worktrees\\subproject-3-projections`:
 
@@ -455,7 +457,7 @@ The path captured by `StableProjectionDirectoryOperations.readGenerationImage` i
 
   Expected: typecheck exits 0; the complete Subproject 3 suite reports no failures (record the known Windows symlink skip only if it occurs); `git diff --check` prints nothing; status contains only intentional tracked Task 5 files or is clean after commits.
 
-- [ ] **Step 2: Perform a source-boundary audit before requesting reviews.**
+- [x] **Step 2: Perform a source-boundary audit before requesting reviews.**
 
   Run:
 
@@ -467,7 +469,7 @@ The path captured by `StableProjectionDirectoryOperations.readGenerationImage` i
 
   Expected: V2 lease symbols occur only in V2 coordinator, V2 lease, V2 adapter, and their focused tests; runtime/service search has no V2 lease or adapter wiring; the V1 `ProjectionBuildCoordinator` interface, `ProjectionReaderLease`, and V1 repository signature are unchanged.
 
-- [ ] **Step 3: Obtain independent reviews in this order.**
+- [x] **Step 3: Obtain independent reviews in this order.**
 
   1. Spec-compliance reviewer checks every required test and non-goal in the approved amendment against the exact Task 5 commits.
   2. If and only if spec review reports no open Critical or Important issue, code-quality reviewer checks error cleanup, close ordering, filename-counting, detached-byte use, and V1 isolation.
