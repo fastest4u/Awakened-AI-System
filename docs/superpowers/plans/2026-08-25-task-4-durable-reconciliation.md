@@ -135,3 +135,72 @@ Verify every-entry reconciliation, restart-safe high-water, single-identity vali
 - [ ] **Step 3: Update Task 4 status only on approval**
 
 Record commits, exact test output, known unrelated failures, and approval in the SDD ledger; only then start Task 5.
+
+---
+
+## Atomic amendment (supersedes Task 1–2 disposition details)
+
+### Task 4: Reserve, quarantine, and delete only a validated image
+
+**Files:**
+- Create: `src/orchestrator/projections/reconciliation-journal.ts`
+- Modify: `src/orchestrator/projections/coordinator.ts`
+- Modify: `src/orchestrator/projections/stable-directory.ts`
+- Modify: `src/orchestrator/projections/integrity.ts`
+- Test: `tests/projection-coordinator.test.ts`
+
+- [ ] **Step 1: Write RED durable-reservation and initial-lock tests**
+
+```ts
+it("never reuses generation after restart without an active manifest", async () => {
+  await writeVerifiedUnpublishedGeneration(2);
+  await coordinator.ensurePublished({ requiredEventPosition: 1n });
+  const next = await restartedCoordinator.ensurePublished({ requiredEventPosition: 2n });
+  assert.equal(next.manifest.generation, 3);
+});
+it("acquires the publication lock before initial source access", async () => {
+  await assert.rejects(() => coordinator.ensurePublished({ requiredEventPosition: 1n }), /SOURCE_UNAVAILABLE/);
+  assert.equal(lockWasAcquiredBeforeSource(), true);
+});
+```
+
+- [ ] **Step 2: Write RED capture-swap test**
+
+```ts
+it("retains files and lock when quarantine differs from validated bytes", async () => {
+  await scheduleFinalAndQuarantineSwap(validA, forgedB, validA);
+  await assert.rejects(() => coordinator.ensurePublished({ requiredEventPosition: 1n }), /INTEGRITY_FAILURE/);
+  assert.equal(publicationLockIsRetained(), true);
+  assert.equal(anyCandidateFileExists(), true);
+});
+```
+
+- [ ] **Step 3: Run RED**
+
+Run: `npm run test:build && node --test --test-concurrency=1 dist-test/tests/projection-coordinator.test.js`
+
+Expected: FAIL because current deletion uses a mutable capture path and no no-manifest durable reservation exists.
+
+- [ ] **Step 4: Implement atomic journal and descriptor-image disposition**
+
+```ts
+await journal.reserveAtLeast(observedGeneration); // atomic write + fsync under lock
+const image = stableDirectory.readCapturedImage(candidateName);
+verifyV2GenerationImage(image.bytes);
+const quarantine = stableDirectory.renameToUniqueQuarantine(image.identity);
+stableDirectory.assertQuarantineMatches(quarantine, image);
+stableDirectory.removeQuarantine(quarantine);
+```
+
+Acquire and retain the lock before initial source access. Never validate from a pathname and never delete a final candidate directly. On every uncertainty retain the journal, candidate/quarantine evidence, and lock.
+
+- [ ] **Step 5: Run GREEN and commit**
+
+Run: `npm run test:build && node --test --test-concurrency=1 dist-test/tests/projection-coordinator.test.js && npm run typecheck`
+
+Expected: PASS.
+
+```bash
+git add src/orchestrator/projections/reconciliation-journal.ts src/orchestrator/projections/coordinator.ts src/orchestrator/projections/stable-directory.ts src/orchestrator/projections/integrity.ts tests/projection-coordinator.test.ts
+git commit -m "fix: atomically reconcile V2 orphan generations"
+```
