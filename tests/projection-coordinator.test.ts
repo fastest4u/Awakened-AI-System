@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import {
   existsSync,
   lstatSync,
@@ -422,6 +423,130 @@ describe("projection build coordinator", () => {
     source.close();
   });
 
+  it("recovers a retirement intent after its rename before journal completion", async () => {
+    const root = mkdtempSync(join(tmpdir(), "projection-v2-retirement-intent-recovery-"));
+    roots.push(root);
+    const sourcePath = join(root, "events.sqlite");
+    const projectionDirectory = join(root, "projections");
+    const journalPath = join(projectionDirectory, "projection-reconciliation-v2.json");
+    const source = sourceDatabase(sourcePath);
+    append(source, 1);
+    const driver = new NodeSqliteDriver({ DatabaseSync });
+    const faulted = new V2ProjectionBuildCoordinator({
+      projectionDirectory,
+      eventReader: new SqliteProjectionEventReader({ driver, eventStorePath: sourcePath }),
+      builder: new ImmutableProjectionBuilder({ driver, projectionDirectory, now: () => NOW }),
+      faultInjector: { hit(boundary): void {
+        if (boundary === "after-v2-generation-install-before-manifest") throw new Error("post-install");
+      } },
+    });
+    await assert.rejects(() => faulted.ensurePublished(BINDING, 1n, 10_000), /post-install/u);
+
+    const interrupted = new V2ProjectionBuildCoordinator({
+      projectionDirectory,
+      eventReader: new SqliteProjectionEventReader({ driver, eventStorePath: sourcePath }),
+      builder: new ImmutableProjectionBuilder({ driver, projectionDirectory, now: () => NOW }),
+      faultInjector: { hit(boundary): void {
+        if (boundary === "after-v2-retirement-rename-before-complete") {
+          throw new Error("rename-before-complete");
+        }
+      } },
+    });
+    await assert.rejects(
+      () => interrupted.ensurePublished(BINDING, 1n, 10_000),
+      /rename-before-complete/u,
+    );
+    const afterFault = JSON.parse(readFileSync(journalPath, "utf8")) as {
+      retirements: readonly { state: string }[];
+    };
+    assert.equal(afterFault.retirements[0]?.state, "intent");
+    assert.equal(existsSync(join(projectionDirectory, "projections-2-1.sqlite")), false);
+    rmSync(join(projectionDirectory, PROJECTION_MANIFEST_PUBLICATION_LOCK_FILENAME));
+    const restart = spawnSync(process.execPath, ["--input-type=module", "--eval", `
+      import { DatabaseSync } from "node:sqlite";
+      import { ImmutableProjectionBuilder } from "./dist-test/src/orchestrator/projections/builder.js";
+      import { V2ProjectionBuildCoordinator } from "./dist-test/src/orchestrator/projections/coordinator.js";
+      import { SqliteProjectionEventReader } from "./dist-test/src/orchestrator/projections/event-reader.js";
+      import { NodeSqliteDriver } from "./dist-test/src/orchestrator/storage/node-sqlite-driver.js";
+
+      const driver = new NodeSqliteDriver({ DatabaseSync });
+      const coordinator = new V2ProjectionBuildCoordinator({
+        projectionDirectory: ${JSON.stringify(projectionDirectory)},
+        eventReader: new SqliteProjectionEventReader({ driver, eventStorePath: ${JSON.stringify(sourcePath)} }),
+        builder: new ImmutableProjectionBuilder({
+          driver,
+          projectionDirectory: ${JSON.stringify(projectionDirectory)},
+          now: () => ${JSON.stringify(NOW)},
+        }),
+      });
+      await coordinator.ensurePublished(${JSON.stringify(BINDING)}, 1n, 10_000);
+    `], { cwd: process.cwd(), encoding: "utf8" });
+    assert.equal(restart.status, 0, restart.stderr);
+    const retiredName = readdirSync(projectionDirectory).find((name) => (
+      /^\.projections-2-retired-[0-9a-f]{32}\.sqlite$/u.test(name)
+    ));
+    assert.notEqual(retiredName, undefined);
+    const afterRestart = JSON.parse(readFileSync(journalPath, "utf8")) as {
+      retirements: readonly { state: string; image: { ctimeNs: string } }[];
+    };
+    assert.equal(afterRestart.retirements[0]?.state, "retired");
+    assert.equal(
+      afterRestart.retirements[0]?.image.ctimeNs,
+      lstatSync(join(projectionDirectory, retiredName!), { bigint: true }).ctimeNs.toString(),
+    );
+    assert.equal(existsSync(join(projectionDirectory, "projections-2-1.sqlite")), false);
+    source.close();
+  });
+
+  it("rejects ctime-changed retired evidence after its journal record is complete", async () => {
+    const root = mkdtempSync(join(tmpdir(), "projection-v2-retired-evidence-ctime-"));
+    roots.push(root);
+    const sourcePath = join(root, "events.sqlite");
+    const projectionDirectory = join(root, "projections");
+    const source = sourceDatabase(sourcePath);
+    append(source, 1);
+    const driver = new NodeSqliteDriver({ DatabaseSync });
+    const faulted = new V2ProjectionBuildCoordinator({
+      projectionDirectory,
+      eventReader: new SqliteProjectionEventReader({ driver, eventStorePath: sourcePath }),
+      builder: new ImmutableProjectionBuilder({ driver, projectionDirectory, now: () => NOW }),
+      faultInjector: { hit(boundary): void {
+        if (boundary === "after-v2-generation-install-before-manifest") throw new Error("post-install");
+      } },
+    });
+    await assert.rejects(() => faulted.ensurePublished(BINDING, 1n, 10_000), /post-install/u);
+
+    const reconciler = new V2ProjectionBuildCoordinator({
+      projectionDirectory,
+      eventReader: new SqliteProjectionEventReader({ driver, eventStorePath: sourcePath }),
+      builder: new ImmutableProjectionBuilder({ driver, projectionDirectory, now: () => NOW }),
+    });
+    await reconciler.ensurePublished(BINDING, 1n, 10_000);
+    const retiredName = readdirSync(projectionDirectory).find((name) => (
+      /^\.projections-2-retired-[0-9a-f]{32}\.sqlite$/u.test(name)
+    ));
+    assert.notEqual(retiredName, undefined);
+    const retiredPath = join(projectionDirectory, retiredName!);
+    const ctimeBefore = lstatSync(retiredPath, { bigint: true }).ctimeNs;
+    const temporaryPath = join(projectionDirectory, ".retired-evidence-ctime.tmp");
+    renameSync(retiredPath, temporaryPath);
+    renameSync(temporaryPath, retiredPath);
+    assert.notEqual(lstatSync(retiredPath, { bigint: true }).ctimeNs, ctimeBefore);
+
+    const restarted = new V2ProjectionBuildCoordinator({
+      projectionDirectory,
+      eventReader: new SqliteProjectionEventReader({ driver, eventStorePath: sourcePath }),
+      builder: new ImmutableProjectionBuilder({ driver, projectionDirectory, now: () => NOW }),
+    });
+    await assert.rejects(
+      () => restarted.ensurePublished(BINDING, 1n, 10_000),
+      /PROJECTION_PUBLICATION_RECOVERY_REQUIRED/u,
+    );
+    assert.equal(existsSync(retiredPath), true);
+    assert.equal(existsSync(join(projectionDirectory, PROJECTION_MANIFEST_PUBLICATION_LOCK_FILENAME)), true);
+    source.close();
+  });
+
   it("migrates a prior canonical retired V2 generation high-water journal during reconciliation", async () => {
     const root = mkdtempSync(join(tmpdir(), "projection-v2-legacy-journal-"));
     roots.push(root);
@@ -516,6 +641,68 @@ describe("projection build coordinator", () => {
     );
     assert.equal(readFileSync(journalPath, "utf8"), journalBytes);
     assert.equal(readFileSync(retiredPath, "utf8"), "retained evidence");
+    assert.equal(existsSync(join(projectionDirectory, PROJECTION_MANIFEST_PUBLICATION_LOCK_FILENAME)), true);
+    source.close();
+  });
+
+  it("rejects unjournaled retired evidence before source access", async () => {
+    const root = mkdtempSync(join(tmpdir(), "projection-v2-unjournaled-retired-"));
+    roots.push(root);
+    const sourcePath = join(root, "events.sqlite");
+    const projectionDirectory = join(root, "projections");
+    const source = sourceDatabase(sourcePath);
+    append(source, 1);
+    const driver = new NodeSqliteDriver({ DatabaseSync });
+    const healthy = new V2ProjectionBuildCoordinator({
+      projectionDirectory,
+      eventReader: new SqliteProjectionEventReader({ driver, eventStorePath: sourcePath }),
+      builder: new ImmutableProjectionBuilder({ driver, projectionDirectory, now: () => NOW }),
+    });
+    await healthy.ensurePublished(BINDING, 1n, 10_000);
+    const retiredPath = join(projectionDirectory, `.projections-2-retired-${"a".repeat(32)}.sqlite`);
+    writeFileSync(retiredPath, "unjournaled retained evidence", "utf8");
+
+    const recovery = new V2ProjectionBuildCoordinator({
+      projectionDirectory,
+      eventReader: { async openCommittedSnapshot() { throw new Error("source must not run"); } },
+      builder: { async buildV2() { throw new Error("builder must not run"); } },
+    });
+    await assert.rejects(
+      () => recovery.ensurePublished(BINDING, 1n, 10_000),
+      /PROJECTION_PUBLICATION_RECOVERY_REQUIRED/u,
+    );
+    assert.equal(existsSync(retiredPath), true);
+    assert.equal(existsSync(join(projectionDirectory, PROJECTION_MANIFEST_PUBLICATION_LOCK_FILENAME)), true);
+    source.close();
+  });
+
+  it("rejects legacy quarantine evidence before source access", async () => {
+    const root = mkdtempSync(join(tmpdir(), "projection-v2-legacy-quarantine-"));
+    roots.push(root);
+    const sourcePath = join(root, "events.sqlite");
+    const projectionDirectory = join(root, "projections");
+    const source = sourceDatabase(sourcePath);
+    append(source, 1);
+    const driver = new NodeSqliteDriver({ DatabaseSync });
+    const healthy = new V2ProjectionBuildCoordinator({
+      projectionDirectory,
+      eventReader: new SqliteProjectionEventReader({ driver, eventStorePath: sourcePath }),
+      builder: new ImmutableProjectionBuilder({ driver, projectionDirectory, now: () => NOW }),
+    });
+    await healthy.ensurePublished(BINDING, 1n, 10_000);
+    const quarantinePath = join(projectionDirectory, `.projections-2-quarantine-${"b".repeat(32)}.sqlite`);
+    writeFileSync(quarantinePath, "legacy quarantine evidence", "utf8");
+
+    const recovery = new V2ProjectionBuildCoordinator({
+      projectionDirectory,
+      eventReader: { async openCommittedSnapshot() { throw new Error("source must not run"); } },
+      builder: { async buildV2() { throw new Error("builder must not run"); } },
+    });
+    await assert.rejects(
+      () => recovery.ensurePublished(BINDING, 1n, 10_000),
+      /PROJECTION_PUBLICATION_RECOVERY_REQUIRED/u,
+    );
+    assert.equal(existsSync(quarantinePath), true);
     assert.equal(existsSync(join(projectionDirectory, PROJECTION_MANIFEST_PUBLICATION_LOCK_FILENAME)), true);
     source.close();
   });
