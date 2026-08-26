@@ -604,11 +604,11 @@ export class V2ProjectionBuildCoordinator {
           reconciled.highestObservedGeneration,
           identity,
         );
-        this.#assertDeadline(expiresAt, requiredEventPosition, current);
         // A completed reconciliation is durable in the journal. Ordinary
         // source/build failures can release the cooperative lock; any later
         // publication ambiguity poisons its nested manifest attempt itself.
         retainLock = false;
+        this.#assertDeadline(expiresAt, requiredEventPosition, current);
         if (current !== null && BigInt(current.manifest.terminalEventPosition) >= requiredEventPosition) {
           return current;
         }

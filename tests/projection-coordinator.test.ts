@@ -2451,6 +2451,32 @@ describe("projection build coordinator", () => {
     }
   });
 
+  it("releases the V2 publication lock after an expired sufficient-generation request", async () => {
+    const fixture = await v2DeadlineFixture();
+    try {
+      const calls = fixture.calls;
+      fixture.setNow(() => 50);
+
+      await assert.rejects(
+        () => fixture.coordinator.ensurePublished(BINDING, 1n, 0),
+        (error: unknown) => error instanceof ProjectionLagError
+          && error.requiredEventPosition === 1n
+          && error.availableEventPosition === 1n,
+      );
+      fixture.setNow(() => 0);
+
+      const published = await fixture.coordinator.ensurePublished(
+        BINDING,
+        1n,
+        FUNCTIONAL_TEST_DEADLINE_MS,
+      );
+      assert.equal(published.manifest.terminalEventPosition, "1");
+      assert.deepEqual(fixture.calls, calls);
+    } finally {
+      fixture.source.close();
+    }
+  });
+
   it("returns V2 projection lag when a positive deadline elapses before its current-generation return", async () => {
     const fixture = await v2DeadlineFixture();
     try {
