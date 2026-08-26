@@ -193,4 +193,3 @@ Expected: `APPROVED` with no Critical or Important findings, or concrete file-an
 - [ ] **Step 3: Make the bounded handoff statement**
 
 Report the exact commits, all three fresh full-gate outcomes, both review outcomes, and clean status. State only that Task 5R's addressed Subproject 3 release-gate blocker is resolved if every check is green. Do not state that V2 is routed, deployed, or generally PROD-ready; Task 6, Task 7, and the later cutover controls remain separate work.
-
