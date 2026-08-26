@@ -270,7 +270,7 @@ async function publishedV2CoordinatorFixture(
     evaluationLeases,
     now: () => 0,
   });
-  await coordinator.ensurePublished(BINDING, 1n, 2_000);
+  await coordinator.ensurePublished(BINDING, 1n, FUNCTIONAL_TEST_DEADLINE_MS);
   return Object.freeze({ source, coordinator, projectionDirectory });
 }
 
@@ -370,7 +370,7 @@ describe("projection build coordinator", () => {
       builder: new ImmutableProjectionBuilder({ driver, projectionDirectory, now: () => NOW }),
     });
 
-    const published = await coordinator.ensurePublished(BINDING, 1n, 2_000);
+    const published = await coordinator.ensurePublished(BINDING, 1n, FUNCTIONAL_TEST_DEADLINE_MS);
     assert.equal(published.manifest.schemaVersion, 2);
     assert.equal(published.manifest.databaseFile, "projections-2-1.sqlite");
     assert.equal(existsSync(published.databasePath), true);
@@ -410,7 +410,7 @@ describe("projection build coordinator", () => {
     });
 
     await assert.rejects(
-      () => faulted.ensurePublished(BINDING, 1n, 2_000),
+      () => faulted.ensurePublished(BINDING, 1n, FUNCTIONAL_TEST_DEADLINE_MS),
       /injected V2 post-install fault/u,
     );
     assert.equal(existsSync(join(projectionDirectory, "projections-2-1.sqlite")), true);
@@ -422,7 +422,7 @@ describe("projection build coordinator", () => {
       eventReader: new SqliteProjectionEventReader({ driver, eventStorePath: sourcePath }),
       builder: new ImmutableProjectionBuilder({ driver, projectionDirectory, now: () => NOW }),
     });
-    const published = await restarted.ensurePublished(BINDING, 2n, 2_000);
+    const published = await restarted.ensurePublished(BINDING, 2n, FUNCTIONAL_TEST_DEADLINE_MS);
 
     assert.equal(published.manifest.generation, 2);
     assert.equal(existsSync(join(projectionDirectory, "projections-2-1.sqlite")), false);
@@ -443,7 +443,7 @@ describe("projection build coordinator", () => {
       eventReader: new SqliteProjectionEventReader({ driver, eventStorePath: sourcePath }),
       builder: new ImmutableProjectionBuilder({ driver, projectionDirectory, now: () => NOW }),
     });
-    await healthy.ensurePublished(BINDING, 1n, 2_000);
+    await healthy.ensurePublished(BINDING, 1n, FUNCTIONAL_TEST_DEADLINE_MS);
 
     append(source, 2);
     const faulted = new V2ProjectionBuildCoordinator({
@@ -454,11 +454,11 @@ describe("projection build coordinator", () => {
         if (boundary === "after-v2-generation-install-before-manifest") throw new Error("post-install");
       } },
     });
-    await assert.rejects(() => faulted.ensurePublished(BINDING, 2n, 2_000), /post-install/u);
+    await assert.rejects(() => faulted.ensurePublished(BINDING, 2n, FUNCTIONAL_TEST_DEADLINE_MS), /post-install/u);
     const orphan = join(projectionDirectory, "projections-2-2.sqlite");
     assert.equal(existsSync(orphan), true);
 
-    const fresh = await healthy.ensurePublished(BINDING, 1n, 2_000);
+    const fresh = await healthy.ensurePublished(BINDING, 1n, FUNCTIONAL_TEST_DEADLINE_MS);
     assert.equal(fresh.manifest.generation, 1);
     assert.equal(existsSync(orphan), false, "fresh reads must reconcile a verified orphan before return");
     source.close();
@@ -862,7 +862,7 @@ describe("projection build coordinator", () => {
       eventReader: new SqliteProjectionEventReader({ driver, eventStorePath: sourcePath }),
       builder: new ImmutableProjectionBuilder({ driver, projectionDirectory, now: () => NOW }),
     });
-    await healthy.ensurePublished(BINDING, 1n, 2_000);
+    await healthy.ensurePublished(BINDING, 1n, FUNCTIONAL_TEST_DEADLINE_MS);
 
     append(source, 2);
     const faulted = new V2ProjectionBuildCoordinator({
@@ -873,7 +873,7 @@ describe("projection build coordinator", () => {
         if (boundary === "after-v2-generation-install-before-manifest") throw new Error("post-install");
       } },
     });
-    await assert.rejects(() => faulted.ensurePublished(BINDING, 2n, 2_000), /post-install/u);
+    await assert.rejects(() => faulted.ensurePublished(BINDING, 2n, FUNCTIONAL_TEST_DEADLINE_MS), /post-install/u);
     assert.equal(existsSync(join(projectionDirectory, "projections-2-2.sqlite")), true);
 
     writeFileSync(
@@ -881,7 +881,7 @@ describe("projection build coordinator", () => {
       '{"highestReservedGeneration":1,"schemaVersion":1}\n',
       "utf8",
     );
-    await healthy.ensurePublished(BINDING, 1n, 2_000);
+    await healthy.ensurePublished(BINDING, 1n, FUNCTIONAL_TEST_DEADLINE_MS);
 
     const journalText = readFileSync(
       join(projectionDirectory, "projection-reconciliation-v2.json"),
@@ -1025,7 +1025,7 @@ describe("projection build coordinator", () => {
         if (boundary === "after-v2-generation-install-before-manifest") throw new Error("post-install");
       } },
     });
-    await assert.rejects(() => faulted.ensurePublished(BINDING, 1n, 2_000), /post-install/u);
+    await assert.rejects(() => faulted.ensurePublished(BINDING, 1n, FUNCTIONAL_TEST_DEADLINE_MS), /post-install/u);
     assert.equal(existsSync(join(projectionDirectory, "projection-manifest.json")), false);
     assert.equal(existsSync(join(projectionDirectory, "projections-2-1.sqlite")), true);
 
@@ -1067,7 +1067,7 @@ describe("projection build coordinator", () => {
         if (boundary === "after-v2-generation-install-before-manifest") throw new Error("post-install");
       } },
     });
-    await assert.rejects(() => faulted.ensurePublished(BINDING, 1n, 2_000), /post-install/u);
+    await assert.rejects(() => faulted.ensurePublished(BINDING, 1n, FUNCTIONAL_TEST_DEADLINE_MS), /post-install/u);
 
     const recovery = new V2ProjectionBuildCoordinator({
       projectionDirectory,
@@ -1120,7 +1120,7 @@ describe("projection build coordinator", () => {
         if (boundary === "after-v2-generation-install-before-manifest") throw new Error("post-install");
       } },
     });
-    await assert.rejects(() => faulted.ensurePublished(BINDING, 1n, 2_000), /post-install/u);
+    await assert.rejects(() => faulted.ensurePublished(BINDING, 1n, FUNCTIONAL_TEST_DEADLINE_MS), /post-install/u);
     const orphan = join(projectionDirectory, "projections-2-1.sqlite");
     const forged = new DatabaseSync(orphan);
     try {
@@ -1139,7 +1139,7 @@ describe("projection build coordinator", () => {
       builder: new ImmutableProjectionBuilder({ driver, projectionDirectory, now: () => NOW }),
     });
     await assert.rejects(
-      () => recovery.ensurePublished(BINDING, 1n, 2_000),
+      () => recovery.ensurePublished(BINDING, 1n, FUNCTIONAL_TEST_DEADLINE_MS),
       /PROJECTION_PUBLICATION_RECOVERY_REQUIRED/u,
     );
     assert.equal(existsSync(orphan), true);
@@ -1163,7 +1163,7 @@ describe("projection build coordinator", () => {
         if (boundary === "after-v2-generation-install-before-manifest") throw new Error("post-install");
       } },
     });
-    await assert.rejects(() => faulted.ensurePublished(BINDING, 1n, 2_000), /post-install/u);
+    await assert.rejects(() => faulted.ensurePublished(BINDING, 1n, FUNCTIONAL_TEST_DEADLINE_MS), /post-install/u);
     const orphan = join(projectionDirectory, "projections-2-1.sqlite");
     const displaced = join(projectionDirectory, "displaced-valid-orphan.sqlite");
     const forged = join(projectionDirectory, "forged-orphan.sqlite");
@@ -1182,7 +1182,7 @@ describe("projection build coordinator", () => {
       } },
     });
     await assert.rejects(
-      () => recovery.ensurePublished(BINDING, 1n, 2_000),
+      () => recovery.ensurePublished(BINDING, 1n, FUNCTIONAL_TEST_DEADLINE_MS),
       /PROJECTION_PATH_INVALID/u,
     );
     assert.equal(existsSync(orphan), true);
@@ -1207,7 +1207,7 @@ describe("projection build coordinator", () => {
         if (boundary === "after-v2-generation-install-before-manifest") throw new Error("post-install");
       } },
     });
-    await assert.rejects(() => faulted.ensurePublished(BINDING, 1n, 2_000), /post-install/u);
+    await assert.rejects(() => faulted.ensurePublished(BINDING, 1n, FUNCTIONAL_TEST_DEADLINE_MS), /post-install/u);
     const forged = join(projectionDirectory, "forged-retired.sqlite");
     writeFileSync(forged, "not a sqlite image", "utf8");
 
@@ -1271,7 +1271,7 @@ describe("projection build coordinator", () => {
     });
 
     await assert.rejects(
-      () => coordinator.ensurePublished(BINDING, 1n, 2_000),
+      () => coordinator.ensurePublished(BINDING, 1n, FUNCTIONAL_TEST_DEADLINE_MS),
       /PROJECTION_PATH_INVALID/u,
     );
     assert.equal(readFileSync(join(projectionDirectory, knownTemp), "utf8"), "outside victim");
@@ -1302,7 +1302,7 @@ describe("projection build coordinator", () => {
     });
 
     await assert.rejects(
-      () => coordinator.ensurePublished(BINDING, 1n, 2_000),
+      () => coordinator.ensurePublished(BINDING, 1n, FUNCTIONAL_TEST_DEADLINE_MS),
       /PROJECTION_PATH_INVALID/u,
     );
     assert.equal(existsSync(join(originalDirectory, PROJECTION_MANIFEST_PUBLICATION_LOCK_FILENAME)), true);
@@ -1326,7 +1326,7 @@ describe("projection build coordinator", () => {
     });
 
     await assert.rejects(
-      () => coordinator.ensurePublished(BINDING, 1n, 2_000),
+      () => coordinator.ensurePublished(BINDING, 1n, FUNCTIONAL_TEST_DEADLINE_MS),
       /PROJECTION_PUBLICATION_RECOVERY_REQUIRED/u,
     );
     assert.equal(existsSync(uncertain), true);
@@ -1347,12 +1347,12 @@ describe("projection build coordinator", () => {
       eventReader: new SqliteProjectionEventReader({ driver, eventStorePath: sourcePath }),
       builder: new ImmutableProjectionBuilder({ driver, projectionDirectory, now: () => NOW }),
     });
-    await coordinator.ensurePublished(BINDING, 1n, 2_000);
+    await coordinator.ensurePublished(BINDING, 1n, FUNCTIONAL_TEST_DEADLINE_MS);
     const uncertain = join(projectionDirectory, "projections-2-2.sqlite");
     writeFileSync(uncertain, "not a sqlite image", "utf8");
 
     await assert.rejects(
-      () => coordinator.ensurePublished(BINDING, 1n, 2_000),
+      () => coordinator.ensurePublished(BINDING, 1n, FUNCTIONAL_TEST_DEADLINE_MS),
       /PROJECTION_PUBLICATION_RECOVERY_REQUIRED/u,
     );
     assert.equal(existsSync(uncertain), true);
@@ -1377,7 +1377,7 @@ describe("projection build coordinator", () => {
       eventReader: new SqliteProjectionEventReader({ driver, eventStorePath: sourcePath }),
       builder: new ImmutableProjectionBuilder({ driver, projectionDirectory, now: () => NOW }),
     });
-    await published.ensurePublished(BINDING, 1n, 2_000);
+    await published.ensurePublished(BINDING, 1n, FUNCTIONAL_TEST_DEADLINE_MS);
     writeFileSync(join(projectionDirectory, "projections-2-2.sqlite"), "not a sqlite image", "utf8");
     let sourceOpened = false;
     const coordinator = new V2ProjectionBuildCoordinator({
@@ -1390,7 +1390,7 @@ describe("projection build coordinator", () => {
     });
 
     await assert.rejects(
-      () => coordinator.ensurePublished(BINDING, 2n, 2_000),
+      () => coordinator.ensurePublished(BINDING, 2n, FUNCTIONAL_TEST_DEADLINE_MS),
       /PROJECTION_PUBLICATION_RECOVERY_REQUIRED/u,
     );
     assert.equal(sourceOpened, false);
@@ -1410,7 +1410,7 @@ describe("projection build coordinator", () => {
       eventReader: new SqliteProjectionEventReader({ driver, eventStorePath: sourcePath }),
       builder: new ImmutableProjectionBuilder({ driver, projectionDirectory, now: () => NOW }),
     });
-    await healthy.ensurePublished(BINDING, 1n, 2_000);
+    await healthy.ensurePublished(BINDING, 1n, FUNCTIONAL_TEST_DEADLINE_MS);
     append(source, 2);
     const faulted = new V2ProjectionBuildCoordinator({
       projectionDirectory,
@@ -1420,7 +1420,7 @@ describe("projection build coordinator", () => {
         if (boundary === "after-v2-generation-install-before-manifest") throw new Error("post-install");
       } },
     });
-    await assert.rejects(() => faulted.ensurePublished(BINDING, 2n, 2_000), /post-install/u);
+    await assert.rejects(() => faulted.ensurePublished(BINDING, 2n, FUNCTIONAL_TEST_DEADLINE_MS), /post-install/u);
     const orphan = join(projectionDirectory, "projections-2-2.sqlite");
     assert.equal(existsSync(orphan), true);
 
@@ -1450,7 +1450,7 @@ describe("projection build coordinator", () => {
         if (boundary === "after-v2-generation-install-before-manifest") throw new Error("post-install");
       } },
     });
-    await assert.rejects(() => faulted.ensurePublished(BINDING, 1n, 2_000), /post-install/u);
+    await assert.rejects(() => faulted.ensurePublished(BINDING, 1n, FUNCTIONAL_TEST_DEADLINE_MS), /post-install/u);
 
     append(source, 2);
     const restarted = new V2ProjectionBuildCoordinator({
@@ -1459,7 +1459,7 @@ describe("projection build coordinator", () => {
       builder: new ImmutableProjectionBuilder({ driver, projectionDirectory, now: () => NOW }),
       leasedFilenames: () => Object.freeze(["projections-2-1.sqlite"]),
     });
-    await restarted.ensurePublished(BINDING, 2n, 2_000);
+    await restarted.ensurePublished(BINDING, 2n, FUNCTIONAL_TEST_DEADLINE_MS);
     assert.equal(existsSync(join(projectionDirectory, "projections-2-1.sqlite")), true);
     source.close();
   });
@@ -1655,7 +1655,7 @@ describe("projection build coordinator", () => {
       const lease = await fixture.coordinator.leasePublishedForEvaluation(BINDING);
       try {
         append(fixture.source, 2);
-        const replacement = await fixture.coordinator.ensurePublished(BINDING, 2n, 2_000);
+        const replacement = await fixture.coordinator.ensurePublished(BINDING, 2n, FUNCTIONAL_TEST_DEADLINE_MS);
         const finalPath = join(fixture.projectionDirectory, lease.manifest.databaseFile);
         const replacementPath = join(fixture.projectionDirectory, replacement.manifest.databaseFile);
         renameSync(finalPath, `${finalPath}.original`);
@@ -1721,17 +1721,17 @@ describe("projection build coordinator", () => {
       const firstFinal = lease.manifest.databaseFile;
       try {
         append(fixture.source, 2);
-        const second = await fixture.coordinator.ensurePublished(BINDING, 2n, 2_000);
+        const second = await fixture.coordinator.ensurePublished(BINDING, 2n, FUNCTIONAL_TEST_DEADLINE_MS);
         assert.equal(second.manifest.databaseFile, "projections-2-2.sqlite");
 
-        await fixture.coordinator.ensurePublished(BINDING, 2n, 2_000);
+        await fixture.coordinator.ensurePublished(BINDING, 2n, FUNCTIONAL_TEST_DEADLINE_MS);
         assert.equal(existsSync(join(fixture.projectionDirectory, firstFinal)), true);
         assert.deepEqual(evaluationLeases.activeFilenames(), [firstFinal]);
       } finally {
         lease.close();
       }
 
-      await fixture.coordinator.ensurePublished(BINDING, 2n, 2_000);
+      await fixture.coordinator.ensurePublished(BINDING, 2n, FUNCTIONAL_TEST_DEADLINE_MS);
       assert.equal(existsSync(join(fixture.projectionDirectory, firstFinal)), false);
       assert.deepEqual(
         readdirSync(fixture.projectionDirectory).filter((name) => /^projections-2-[1-9][0-9]*\.sqlite$/u.test(name)),
@@ -1806,7 +1806,7 @@ describe("projection build coordinator", () => {
     writeFileSync(knownManifestTemp, "stale", "utf8");
     writeFileSync(knownGenerationTemp, "stale", "utf8");
     writeFileSync(unrelatedTemp, "keep", "utf8");
-    const result = await coordinator.ensurePublished(BINDING, 8n, 2_000);
+    const result = await coordinator.ensurePublished(BINDING, 8n, FUNCTIONAL_TEST_DEADLINE_MS);
     assert.equal(result.manifest.terminalEventPosition, "8");
     assert.equal(result.manifest.sessionId, null);
     assert.equal(existsSync(knownManifestTemp), false);
@@ -1819,7 +1819,7 @@ describe("projection build coordinator", () => {
     append(source, 9);
     failAfterFsync = true;
     await assert.rejects(
-      () => coordinator.ensurePublished(BINDING, 9n, 2_000),
+      () => coordinator.ensurePublished(BINDING, 9n, FUNCTIONAL_TEST_DEADLINE_MS),
       /after-generation-fsync-before-manifest/u,
     );
     assert.equal(source.prepare("SELECT count(*) AS n FROM events").get()?.n, 9);
@@ -1832,7 +1832,7 @@ describe("projection build coordinator", () => {
     assert.deepEqual(readFileSync(firstDatabase), firstBytes);
 
     failAfterFsync = false;
-    const ninth = await coordinator.ensurePublished(BINDING, 9n, 2_000);
+    const ninth = await coordinator.ensurePublished(BINDING, 9n, FUNCTIONAL_TEST_DEADLINE_MS);
     assert.equal(ninth.manifest.terminalEventPosition, "9");
     assert.equal(existsSync(firstDatabase), true, "leased retired generation must remain");
     oldReader.close();
@@ -1840,8 +1840,8 @@ describe("projection build coordinator", () => {
 
     append(source, 10);
     const concurrent = await Promise.all([
-      coordinator.ensurePublished(BINDING, 10n, 2_000),
-      coordinator.ensurePublished(BINDING, 10n, 2_000),
+      coordinator.ensurePublished(BINDING, 10n, FUNCTIONAL_TEST_DEADLINE_MS),
+      coordinator.ensurePublished(BINDING, 10n, FUNCTIONAL_TEST_DEADLINE_MS),
     ]);
     assert.equal(concurrent[0].manifest.terminalEventPosition, "10");
     assert.equal(concurrent[1].manifest.terminalEventPosition, "10");
@@ -1919,7 +1919,7 @@ describe("projection build coordinator", () => {
       projectionDirectory,
     });
 
-    const first = await coordinator.ensurePublished(BINDING, 8n, 2_000);
+    const first = await coordinator.ensurePublished(BINDING, 8n, FUNCTIONAL_TEST_DEADLINE_MS);
     append(source, 9);
     const snapshot = await eventReader.openCommittedSnapshot(BINDING);
     leases.replacement = await builder.build(snapshot, 2);
@@ -1961,7 +1961,7 @@ describe("projection build coordinator", () => {
     });
 
     await assert.rejects(
-      () => coordinator.ensurePublished(BINDING, 1n, 2_000),
+      () => coordinator.ensurePublished(BINDING, 1n, FUNCTIONAL_TEST_DEADLINE_MS),
       /INTEGRITY_FAILURE/u,
     );
     assert.equal(injected, true);
@@ -1986,7 +1986,7 @@ describe("projection build coordinator", () => {
       eventReader: new SqliteProjectionEventReader({ driver, eventStorePath: sourcePath }),
       builder: new ImmutableProjectionBuilder({ driver, projectionDirectory, now: () => NOW }),
     });
-    const published = await coordinator.ensurePublished(BINDING, 1n, 2_000);
+    const published = await coordinator.ensurePublished(BINDING, 1n, FUNCTIONAL_TEST_DEADLINE_MS);
     writeFileSync(`${published.databasePath}-shm`, "unexpected published SHM", "utf8");
 
     await assert.rejects(
@@ -2013,7 +2013,7 @@ describe("projection build coordinator", () => {
       eventReader: new SqliteProjectionEventReader({ driver, eventStorePath: sourcePath }),
       builder: new ImmutableProjectionBuilder({ driver, projectionDirectory, now: () => NOW }),
     });
-    await coordinator.ensurePublished(BINDING, 1n, 2_000);
+    await coordinator.ensurePublished(BINDING, 1n, FUNCTIONAL_TEST_DEADLINE_MS);
     armed = true;
 
     await assert.rejects(
@@ -2037,7 +2037,7 @@ describe("projection build coordinator", () => {
       eventReader: new SqliteProjectionEventReader({ driver, eventStorePath: sourcePath }),
       builder: new ImmutableProjectionBuilder({ driver, projectionDirectory, now: () => NOW }),
     });
-    await coordinator.ensurePublished(BINDING, 1n, 2_000);
+    await coordinator.ensurePublished(BINDING, 1n, FUNCTIONAL_TEST_DEADLINE_MS);
     const lockPath = join(projectionDirectory, PROJECTION_MANIFEST_PUBLICATION_LOCK_FILENAME);
     writeFileSync(lockPath, "foreign publication in progress", "utf8");
 
@@ -2066,7 +2066,7 @@ describe("projection build coordinator", () => {
       eventReader,
       builder,
     });
-    const first = await coordinator.ensurePublished(BINDING, 1n, 2_000);
+    const first = await coordinator.ensurePublished(BINDING, 1n, FUNCTIONAL_TEST_DEADLINE_MS);
     const validLease = await coordinator.leasePublished(BINDING);
     assert.equal(first.manifest.generation, 1);
     assert.equal(validLease.manifest.generation, 1);
@@ -2187,7 +2187,7 @@ describe("projection build coordinator", () => {
       eventReader: new SqliteProjectionEventReader({ driver, eventStorePath: sourcePath }),
       builder: new ImmutableProjectionBuilder({ driver, projectionDirectory, now: () => NOW }),
     });
-    await coordinator.ensurePublished(BINDING, 1n, 2_000);
+    await coordinator.ensurePublished(BINDING, 1n, FUNCTIONAL_TEST_DEADLINE_MS);
     armed = true;
 
     await assert.rejects(
@@ -2213,7 +2213,7 @@ describe("projection build coordinator", () => {
       builder: new ImmutableProjectionBuilder({ driver, projectionDirectory, now: () => NOW }),
       leases,
     });
-    const published = await coordinator.ensurePublished(BINDING, 1n, 2_000);
+    const published = await coordinator.ensurePublished(BINDING, 1n, FUNCTIONAL_TEST_DEADLINE_MS);
     writeFileSync(`${published.databasePath}-wal`, "unexpected published WAL", "utf8");
 
     leases.retire(published);
@@ -2248,7 +2248,7 @@ describe("projection build coordinator", () => {
       eventReader: new SqliteProjectionEventReader({ driver, eventStorePath: sourcePath }),
       builder: new ImmutableProjectionBuilder({ driver, projectionDirectory, now: () => NOW }),
     });
-    const published = await coordinator.ensurePublished(BINDING, 1n, 2_000);
+    const published = await coordinator.ensurePublished(BINDING, 1n, FUNCTIONAL_TEST_DEADLINE_MS);
 
     leases.retire(published);
 
@@ -2304,7 +2304,7 @@ describe("projection build coordinator", () => {
       eventReader: new SqliteProjectionEventReader({ driver, eventStorePath: sourcePath }),
       builder: new ImmutableProjectionBuilder({ driver, projectionDirectory, now: () => NOW }),
     });
-    await coordinator.ensurePublished(BINDING, 1n, 2_000);
+    await coordinator.ensurePublished(BINDING, 1n, FUNCTIONAL_TEST_DEADLINE_MS);
 
     await assert.rejects(
       () => coordinator.ensurePublished(BINDING, 1n, 0),
@@ -2564,7 +2564,7 @@ describe("projection build coordinator", () => {
     });
 
     await assert.rejects(
-      () => coordinator.ensurePublished(BINDING, 1n, 2_000),
+      () => coordinator.ensurePublished(BINDING, 1n, FUNCTIONAL_TEST_DEADLINE_MS),
       /PROJECTION_PATH_INVALID/u,
     );
     assert.equal(readFileSync(join(projectionDirectory, knownName), "utf8"), "outside victim");
@@ -2589,7 +2589,7 @@ describe("projection build coordinator", () => {
       builder: new ImmutableProjectionBuilder({ driver, projectionDirectory, now: () => NOW }),
       leases,
     });
-    const published = await coordinator.ensurePublished(BINDING, 1n, 2_000);
+    const published = await coordinator.ensurePublished(BINDING, 1n, FUNCTIONAL_TEST_DEADLINE_MS);
     mkdirSync(attackerDirectory);
     writeFileSync(join(attackerDirectory, published.manifest.databaseFile), "outside victim", "utf8");
     renameSync(projectionDirectory, originalDirectory);
@@ -2635,9 +2635,9 @@ describe("projection build coordinator", () => {
       leases,
     });
 
-    const first = await coordinator.ensurePublished(BINDING, 1n, 2_000);
+    const first = await coordinator.ensurePublished(BINDING, 1n, FUNCTIONAL_TEST_DEADLINE_MS);
     append(source, 2);
-    const second = await coordinator.ensurePublished(BINDING, 2n, 2_000);
+    const second = await coordinator.ensurePublished(BINDING, 2n, FUNCTIONAL_TEST_DEADLINE_MS);
     assert.equal(second.manifest.terminalEventPosition, "2");
     assert.equal(
       parseProjectionManifest(

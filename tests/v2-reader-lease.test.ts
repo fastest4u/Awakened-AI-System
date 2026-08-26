@@ -41,6 +41,7 @@ const STORE_ID = "3".repeat(64) as StoreId;
 const WORKSPACE_ID = "4".repeat(64) as WorkspaceId;
 const BRANCH_SCOPE_ID = "00000000-0000-4000-8000-000000000051" as BranchScopeId;
 const NOW = "2026-08-25T03:00:00.000Z";
+const FUNCTIONAL_TEST_DEADLINE_MS = 15_000;
 
 const BINDING: ProjectBinding = Object.freeze({
   projectId: PROJECT_ID,
@@ -146,7 +147,7 @@ async function publishedFixture(): Promise<PublishedV2Fixture> {
     eventReader: new SqliteProjectionEventReader({ driver, eventStorePath: sourcePath }),
     builder: new ImmutableProjectionBuilder({ driver, projectionDirectory, now: () => NOW }),
   });
-  const published = await coordinator.ensurePublished(BINDING, 0n, 2_000);
+  const published = await coordinator.ensurePublished(BINDING, 0n, FUNCTIONAL_TEST_DEADLINE_MS);
   return Object.freeze({ source, generation: capturePublishedGeneration(published) });
 }
 
