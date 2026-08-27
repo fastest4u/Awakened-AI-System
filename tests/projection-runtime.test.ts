@@ -19,6 +19,7 @@ import type {
   RetrievalCandidateRepository,
   RetrievalItem,
 } from "../src/orchestrator/retrieval/contracts.js";
+import type { RetrievalRanker } from "../src/orchestrator/retrieval/ranking.js";
 import { InternalRetrievalService } from "../src/orchestrator/retrieval/service.js";
 import { createInternalProjectionRuntime } from "../src/orchestrator/runtime/projection-runtime.js";
 
@@ -109,6 +110,38 @@ function lease(onClose: () => void): ProjectionReaderLease {
 }
 
 describe("internal projection runtime seam", () => {
+  it("carries the internal custom ordering contract into retrieval", async () => {
+    let closed = 0;
+    const coordinator: ProjectionBuildCoordinator = {
+      async ensurePublished() {
+        return Object.freeze({
+          manifest: MANIFEST,
+          projectionDirectory: "internal-projections",
+          databasePath: "projection-runtime.sqlite",
+          directoryIdentity: Object.freeze({
+            canonicalPath: "internal-projections",
+            device: "1",
+            inode: "2",
+          }),
+        }) as PublishedProjectionGeneration;
+      },
+      async leasePublished() { return lease(() => { closed += 1; }); },
+    };
+    const ranker: RetrievalRanker = { select(eligible) { return eligible; } };
+    const runtime = createInternalProjectionRuntime({ coordinator, candidates: CANDIDATES, ranker });
+
+    const result = await runtime.retrieval.retrieve(Object.freeze({
+      binding: BINDING,
+      query: "runtime:projection",
+      limit: 10,
+      tokenBudget: 1_000,
+      consistency: Object.freeze({ requiredEventPosition: 42n, deadlineMs: 250 }),
+    }));
+
+    assert.deepEqual(result.items.map((item) => item.id), [ITEM.id]);
+    assert.equal(closed, 1);
+  });
+
   it("publishes to the consistency barrier before leasing and retrieving", async () => {
     const calls: string[] = [];
     let closed = 0;

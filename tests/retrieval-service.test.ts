@@ -22,7 +22,16 @@ import {
   RETRIEVAL_LIMITS,
   type InternalRetrievalRequest,
   type ProjectionLeaseProvider,
+  type RetrievalCandidate,
+  type RetrievalCandidateRepository,
+  type RetrievalConflictGroup,
+  type RetrievalItem,
 } from "../src/orchestrator/retrieval/contracts.js";
+import {
+  estimateCandidateTokens,
+  type FusedCandidate,
+  type RetrievalRanker,
+} from "../src/orchestrator/retrieval/ranking.js";
 import { InternalRetrievalService } from "../src/orchestrator/retrieval/service.js";
 
 const PROJECT_ID = "1".repeat(64) as ProjectId;
@@ -123,7 +132,174 @@ function request(overrides: Partial<InternalRetrievalRequest> = {}): InternalRet
   });
 }
 
+function staticItem(id: string, overrides: Partial<RetrievalItem> = {}): RetrievalItem {
+  return Object.freeze({
+    id,
+    kind: "canonical",
+    projectId: PROJECT_ID,
+    workspaceId: WORKSPACE_ID,
+    branchScopeId: BRANCH_SCOPE_ID,
+    branchRef: BINDING.branchRef,
+    sessionId: null,
+    visibility: "project",
+    status: "verified",
+    confidence: "high",
+    verificationMethod: "committed-event",
+    validFrom: "2026-01-01T00:00:00.000Z",
+    validTo: null,
+    knownFromEventPosition: 7n,
+    sourceEventPosition: 8n,
+    summary: "ranker fixture",
+    normalizedKey: `ranker:${id}`,
+    anchor: null,
+    freshness: "fresh",
+    conflictGroupId: null,
+    supersedingItemId: null,
+    retrievalFeedbackScoreUnits: 0,
+    ...overrides,
+  });
+}
+
+function exactCandidate(id: string, rank: number, item: RetrievalItem): RetrievalCandidate {
+  return Object.freeze({ candidateId: id, channel: "exact", rank, item });
+}
+
+function staticRepository(
+  candidates: readonly RetrievalCandidate[],
+  conflictGroups: readonly RetrievalConflictGroup[] = [],
+): RetrievalCandidateRepository {
+  const collection = Object.freeze({
+    channels: Object.freeze([Object.freeze({ channel: "exact" as const, candidates })]),
+    eligibleItemCount: candidates.length,
+    droppedItemCount: 0,
+    truncated: false,
+    conflictGroups,
+  });
+  return Object.freeze({ collectEligible() { return collection; } });
+}
+
+function serviceWith(
+  ranker: RetrievalRanker,
+  candidates: RetrievalCandidateRepository,
+  onClose: () => void,
+): InternalRetrievalService {
+  const lease = createLease(onClose);
+  return new InternalRetrievalService({
+    projections: { async pin() { return lease; } },
+    candidates,
+    ranker,
+  });
+}
+
 describe("internal retrieval service", () => {
+  it("applies shared result bounds after a custom ranker reorders exact fused references", async () => {
+    const first = staticItem("00000000-0000-4000-8000-000000000528");
+    const second = staticItem("00000000-0000-4000-8000-000000000529");
+    const candidates = staticRepository(Object.freeze([
+      exactCandidate("canonical:first", 1, first),
+      exactCandidate("canonical:second", 2, second),
+    ]));
+    let observed: readonly FusedCandidate[] | undefined;
+    let returned: readonly FusedCandidate[] | undefined;
+    const ranker: RetrievalRanker = {
+      select(eligible) {
+        observed = eligible;
+        returned = Object.freeze([...eligible].reverse());
+        return returned;
+      },
+    };
+    let closed = 0;
+
+    const result = await serviceWith(ranker, candidates, () => { closed += 1; }).retrieve(
+      request({ limit: 1 }),
+    );
+
+    assert.deepEqual(result.items.map((item) => item.id), [second.id]);
+    assert.equal(result.candidateCount, 2);
+    assert.equal(result.redactedDropCounts.byReason.resultLimit, 1);
+    assert.equal(returned?.every((candidate) => observed?.includes(candidate) === true), true);
+    assert.equal(closed, 1);
+  });
+
+  it("fails closed when a custom ranker returns a cloned fused candidate", async () => {
+    const first = staticItem("00000000-0000-4000-8000-000000000530");
+    const second = staticItem("00000000-0000-4000-8000-000000000531");
+    const candidates = staticRepository(Object.freeze([
+      exactCandidate("canonical:first", 1, first),
+      exactCandidate("canonical:second", 2, second),
+    ]));
+    const invalidRanker: RetrievalRanker = {
+      select(eligible) {
+        return Object.freeze([{ ...eligible[0]! }, ...eligible.slice(1)]);
+      },
+    };
+    let closed = 0;
+
+    await assert.rejects(
+      () => serviceWith(invalidRanker, candidates, () => { closed += 1; }).retrieve(request()),
+      (error: unknown) => error instanceof InternalRetrievalError
+        && error.code === "RETRIEVAL_RANKER_INVALID",
+    );
+
+    assert.equal(closed, 1);
+  });
+
+  it("uses the shared selector's conflict, drop, and explanation bounds after custom ranking", async () => {
+    const conflictGroupId = "ranker:conflict";
+    const first = staticItem("00000000-0000-4000-8000-000000000532", {
+      status: "conflicted",
+      normalizedKey: "ranker:conflict:A",
+      summary: "A",
+      conflictGroupId,
+    });
+    const second = staticItem("00000000-0000-4000-8000-000000000533", {
+      status: "conflicted",
+      normalizedKey: "ranker:conflict:B",
+      summary: "B",
+      conflictGroupId,
+    });
+    const later = staticItem("00000000-0000-4000-8000-000000000534", {
+      normalizedKey: "ranker:later",
+      summary: "C",
+    });
+    const candidates = staticRepository(Object.freeze([
+      exactCandidate("canonical:conflict:A", 1, first),
+      exactCandidate("canonical:conflict:B", 2, second),
+      exactCandidate("canonical:later", 3, later),
+    ]), Object.freeze([Object.freeze({
+      conflictGroupId,
+      eligibleMemberCount: 2,
+      returnedMemberCount: 2,
+      truncated: false,
+      cursor: "opaque-conflict-cursor",
+    })]));
+    const ranker: RetrievalRanker = { select(eligible) { return eligible; } };
+    const tokenBudget = estimateCandidateTokens({ id: `canonical:${first.id}`, item: first });
+
+    const result = await serviceWith(ranker, candidates, () => undefined).retrieve(
+      request({ tokenBudget, explain: true }),
+    );
+
+    assert.deepEqual(result.items.map((item) => item.id), [first.id]);
+    assert.deepEqual(result.conflicts.map((conflict) => ({
+      id: conflict.conflictGroupId,
+      selected: conflict.selectedMemberCount,
+      truncated: conflict.truncated,
+    })), [{
+      id: conflictGroupId,
+      selected: 1,
+      truncated: true,
+    }]);
+    assert.match(result.conflicts[0]?.cursor ?? "", /^retrieval-conflict-v1:1:/u);
+    assert.equal(result.conflictTruncated, true);
+    assert.equal(result.redactedDropCounts.byReason.tokenBudget, 1);
+    assert.equal(result.redactedDropCounts.byReason.conflictSuppressed, 1);
+    assert.equal(result.explanation?.conflicts.truncated, true);
+    assert.equal(result.explanation?.dropped.byReason.tokenBudget, 1);
+    assert.equal(result.explanation?.dropped.byReason.conflictSuppressed, 1);
+    assert.equal(result.explanation?.channels[0]?.selectedCount, 1);
+  });
+
   it("pins the required generation, returns only the bound project, and always closes the lease", async () => {
     let closed = 0;
     const lease = createLease(() => { closed += 1; });

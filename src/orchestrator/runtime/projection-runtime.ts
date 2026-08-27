@@ -2,9 +2,9 @@ import type { ProjectionBuildCoordinator } from "../projections/coordinator.js";
 import type {
   ProjectionLeaseProvider,
   RetrievalCandidateRepository,
-  RetrievalRanker,
   VectorCandidateChannel,
 } from "../retrieval/contracts.js";
+import type { RetrievalRanker } from "../retrieval/ranking.js";
 import { InternalRetrievalService } from "../retrieval/service.js";
 
 export interface InternalProjectionRuntimeDependencies {

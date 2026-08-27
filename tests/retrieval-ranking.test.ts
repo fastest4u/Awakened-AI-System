@@ -13,12 +13,14 @@ import type {
   InternalRetrievalRequest,
   RetrievalItem,
 } from "../src/orchestrator/retrieval/contracts.js";
+import { InternalRetrievalError } from "../src/orchestrator/retrieval/contracts.js";
 import {
   DEFAULT_RANKING_POLICY,
   RANKING_UNIT_SCALE,
   fuseCandidates,
   rerankCandidates,
   selectRankedCandidates,
+  validateCustomRanking,
   weightedRrf,
   type RankingPolicy,
 } from "../src/orchestrator/retrieval/ranking.js";
@@ -192,6 +194,58 @@ describe("deterministic retrieval ranking", () => {
       Object.keys(ranked[0]?.features ?? {}).sort(),
       [...DEFAULT_RANKING_POLICY.rerankFeatureNames].sort(),
     );
+  });
+
+  it("accepts a custom ranking that reverses the exact fused candidate references", () => {
+    const fused = fuseCandidates([[
+      { id: "canonical:A", rank: 1, channel: "exact" as const },
+      { id: "canonical:B", rank: 2, channel: "exact" as const },
+    ]], DEFAULT_RANKING_POLICY);
+
+    const ranked = validateCustomRanking([...fused].reverse(), fused);
+
+    assert.deepEqual(ranked.map((candidate) => candidate.id), ["canonical:B", "canonical:A"]);
+    assert.equal(ranked[0], fused[1]);
+    assert.equal(ranked[1], fused[0]);
+    assert.equal(Object.isFrozen(ranked), true);
+  });
+
+  it("rejects cloned, foreign, duplicate, and incomplete custom rankings", () => {
+    const fused = fuseCandidates([[
+      { id: "canonical:A", rank: 1, channel: "exact" as const },
+      { id: "canonical:B", rank: 2, channel: "exact" as const },
+    ]], DEFAULT_RANKING_POLICY);
+    const foreign = fuseCandidates([[
+      { id: "canonical:foreign", rank: 1, channel: "exact" as const },
+    ]], DEFAULT_RANKING_POLICY)[0];
+    const invalidRankings = [
+      [{ ...fused[0] }, fused[1]],
+      [fused[0], foreign],
+      [fused[0], fused[0]],
+      [fused[0]],
+    ] as const;
+
+    for (const ranked of invalidRankings) {
+      assert.throws(
+        () => validateCustomRanking(ranked, fused),
+        (error: unknown) => error instanceof InternalRetrievalError
+          && error.code === "RETRIEVAL_RANKER_INVALID",
+      );
+    }
+  });
+
+  it("preserves caller ranking order when selecting a limited result", () => {
+    const fused = fuseCandidates([[
+      { id: "canonical:A", rank: 1, channel: "exact" as const },
+      { id: "canonical:B", rank: 2, channel: "exact" as const },
+    ]], DEFAULT_RANKING_POLICY);
+
+    const selected = selectRankedCandidates([...fused].reverse(), {
+      limit: 1,
+      tokenBudget: 10,
+    }, DEFAULT_RANKING_POLICY);
+
+    assert.deepEqual(selected.candidates.map((candidate) => candidate.id), ["canonical:B"]);
   });
 
   it("keeps conflict alternatives together across diversity and marks an opaque cursor on budget truncation", () => {

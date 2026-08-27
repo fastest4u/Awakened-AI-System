@@ -12,7 +12,6 @@ import {
   type RetrievalCandidateRepository,
   type RetrievalChannelResult,
   type RetrievalItem,
-  type RetrievalRanker,
   type ValidatedInternalRetrievalRequest,
   type VectorCacheManifestV1,
   type VectorCandidateChannel,
@@ -44,11 +43,13 @@ import {
   fuseCandidates,
   rerankCandidates,
   selectRankedCandidates,
+  validateCustomRanking,
   type FusedCandidate,
   type RankedConflictGroup,
   type RankedSelection,
   type RankingCandidate,
   type RationalScore,
+  type RetrievalRanker,
 } from "./ranking.js";
 import {
   disabledVectorChannel,
@@ -101,12 +102,6 @@ type MutableDropCounts = Record<RedactedDropReason, number>;
 interface FilteredCandidates {
   readonly collection: RetrievalCandidateCollection;
   readonly defensiveDrops: Readonly<MutableDropCounts>;
-}
-
-interface DefaultRankingOutcome {
-  readonly fused: readonly FusedCandidate[];
-  readonly selection: RankedSelection;
-  readonly items: readonly RankedInternalRetrievalResultItem[];
 }
 
 function emptyDropCounts(): MutableDropCounts {
@@ -279,55 +274,6 @@ function resultItems(selection: RankedSelection): readonly RankedInternalRetriev
   }));
 }
 
-function defaultRank(
-  fused: readonly FusedCandidate[],
-  request: ValidatedInternalRetrievalRequest,
-): DefaultRankingOutcome {
-  const reranked = rerankCandidates(fused, request, DEFAULT_RANKING_POLICY);
-  const selection = selectRankedCandidates(reranked, {
-    limit: request.limit,
-    tokenBudget: request.tokenBudget,
-  }, DEFAULT_RANKING_POLICY);
-  return Object.freeze({
-    fused,
-    selection,
-    items: resultItems(selection),
-  });
-}
-
-function customRank(
-  ranker: RetrievalRanker,
-  eligible: RetrievalCandidateCollection,
-  request: ValidatedInternalRetrievalRequest,
-  manifest: ProjectionManifestV1,
-): Readonly<{
-  readonly result: InternalRetrievalResult;
-  readonly items: readonly RankedInternalRetrievalResultItem[];
-}> {
-  const allowed = new Map<string, RetrievalItem>();
-  for (const channel of eligible.channels) {
-    for (const candidate of channel.candidates) {
-      allowed.set(`${candidate.item.kind}:${candidate.item.id}`, candidate.item);
-    }
-  }
-  const result = ranker.select(eligible, request, manifest);
-  const seen = new Set<string>();
-  const items: RankedInternalRetrievalResultItem[] = [];
-  for (const selected of result.items) {
-    const key = `${selected.kind}:${selected.id}`;
-    const item = allowed.get(key);
-    if (item === undefined || seen.has(key)) continue;
-    seen.add(key);
-    items.push(Object.freeze({
-      ...item,
-      channels: Object.freeze([...selected.channels]),
-      selectionReason: selected.selectionReason,
-      conflictGroupId: item.conflictGroupId,
-    }));
-  }
-  return Object.freeze({ result, items: Object.freeze(items) });
-}
-
 function channelContributions(
   eligible: RetrievalCandidateCollection,
   fused: readonly FusedCandidate[],
@@ -360,7 +306,7 @@ function channelContributions(
 function redactedDropCounts(
   eligible: RetrievalCandidateCollection,
   defensiveDrops: Readonly<MutableDropCounts>,
-  selection: RankedSelection | null,
+  selection: RankedSelection,
 ): RedactedDropCounts {
   const counts = emptyDropCounts();
   for (const [reason, count] of Object.entries(defensiveDrops) as Array<[
@@ -375,12 +321,10 @@ function redactedDropCounts(
     eligible.truncated ? 1 : 0,
     eligible.eligibleItemCount - materialized,
   );
-  if (selection !== null) {
-    counts.diversity += selection.droppedByReason.diversity;
-    counts.resultLimit += selection.droppedByReason.resultLimit;
-    counts.tokenBudget += selection.droppedByReason.tokenBudget;
-    counts.conflictSuppressed += selection.droppedByReason.conflictSuppressed;
-  }
+  counts.diversity += selection.droppedByReason.diversity;
+  counts.resultLimit += selection.droppedByReason.resultLimit;
+  counts.tokenBudget += selection.droppedByReason.tokenBudget;
+  counts.conflictSuppressed += selection.droppedByReason.conflictSuppressed;
   const byReason = Object.freeze(counts);
   return Object.freeze({
     total: Object.values(byReason).reduce((total, count) => total + count, 0),
@@ -532,27 +476,17 @@ export class InternalRetrievalService {
       const filtered = filterCandidates(collected, request);
       const vector = await searchOptionalVectorChannel(this.#vectorChannel, request, lease);
       const fused = fuseCandidates(rankingChannels(filtered.collection), DEFAULT_RANKING_POLICY);
-
-      let items: readonly RankedInternalRetrievalResultItem[];
-      let conflicts: readonly RankedConflictGroup[];
-      let selection: RankedSelection | null;
-      let candidateCount: number;
-      let rankedTruncated: boolean;
-      if (this.#customRanker === undefined) {
-        const ranked = defaultRank(fused, request);
-        items = ranked.items;
-        conflicts = ranked.selection.conflicts;
-        selection = ranked.selection;
-        candidateCount = ranked.fused.length;
-        rankedTruncated = ranked.selection.truncated;
-      } else {
-        const ranked = customRank(this.#customRanker, filtered.collection, request, manifest);
-        items = ranked.items;
-        conflicts = Object.freeze([]);
-        selection = null;
-        candidateCount = ranked.result.candidateCount;
-        rankedTruncated = ranked.result.truncated || items.length < ranked.result.items.length;
-      }
+      const ranked = this.#customRanker === undefined
+        ? rerankCandidates(fused, request, DEFAULT_RANKING_POLICY)
+        : validateCustomRanking(this.#customRanker.select(fused, request), fused);
+      const selection = selectRankedCandidates(ranked, {
+        limit: request.limit,
+        tokenBudget: request.tokenBudget,
+      }, DEFAULT_RANKING_POLICY);
+      const items = resultItems(selection);
+      const conflicts = selection.conflicts;
+      const candidateCount = fused.length;
+      const rankedTruncated = selection.truncated;
 
       const selectedIds = new Set(items.map((item) => `${item.kind}:${item.id}`));
       const dropCounts = redactedDropCounts(

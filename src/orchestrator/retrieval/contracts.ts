@@ -8,7 +8,6 @@ import type {
   ProjectBinding,
   ProjectionItemStatus,
 } from "../projections/contracts.js";
-import type { ProjectionManifestV1 } from "../projections/manifest.js";
 import type { ProjectionReaderLease } from "../projections/reader-lease.js";
 
 const SQLITE_INT64_MAX = 9_223_372_036_854_775_807n;
@@ -29,6 +28,7 @@ export type InternalRetrievalErrorCode =
   | "GLOBAL_SCOPE_DENIED"
   | "PROJECTION_SCOPE_MISMATCH"
   | "RETRIEVAL_PROJECTION_INVALID"
+  | "RETRIEVAL_RANKER_INVALID"
   | "RETRIEVAL_REQUEST_INVALID";
 
 export class InternalRetrievalError extends Error {
@@ -220,14 +220,6 @@ export interface RetrievalCandidateRepository {
     lease: ProjectionReaderLease,
     request: InternalRetrievalRequest,
   ): RetrievalCandidateCollection;
-}
-
-export interface RetrievalRanker {
-  select(
-    eligible: RetrievalCandidateCollection,
-    request: ValidatedInternalRetrievalRequest,
-    manifest: ProjectionManifestV1,
-  ): InternalRetrievalResult;
 }
 
 function invalid(): never {

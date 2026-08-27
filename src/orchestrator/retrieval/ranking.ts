@@ -1,10 +1,12 @@
 import { createHash } from "node:crypto";
 
-import type {
-  InternalRetrievalRequest,
-  RetrievalChannel,
-  RetrievalChannelResult,
-  RetrievalItem,
+import {
+  InternalRetrievalError,
+  type InternalRetrievalRequest,
+  type RetrievalChannel,
+  type RetrievalChannelResult,
+  type RetrievalItem,
+  type ValidatedInternalRetrievalRequest,
 } from "./contracts.js";
 
 const CHANNELS = Object.freeze([
@@ -134,6 +136,13 @@ export interface RerankedCandidate extends FusedCandidate {
   readonly rerankScore: RationalScore;
 }
 
+export interface RetrievalRanker {
+  select(
+    eligible: readonly FusedCandidate[],
+    request: ValidatedInternalRetrievalRequest,
+  ): readonly FusedCandidate[];
+}
+
 export interface RankedConflictGroup {
   readonly conflictGroupId: string;
   readonly totalMemberCount: number;
@@ -144,7 +153,7 @@ export interface RankedConflictGroup {
 }
 
 export interface RankedSelection {
-  readonly candidates: readonly RerankedCandidate[];
+  readonly candidates: readonly FusedCandidate[];
   readonly conflicts: readonly RankedConflictGroup[];
   readonly usedTokens: number;
   readonly truncated: boolean;
@@ -596,6 +605,25 @@ export function rerankCandidates(
   return Object.freeze(reranked);
 }
 
+export function validateCustomRanking(
+  ranked: readonly FusedCandidate[],
+  eligible: readonly FusedCandidate[],
+): readonly FusedCandidate[] {
+  if (ranked.length !== eligible.length) {
+    throw new InternalRetrievalError("RETRIEVAL_RANKER_INVALID");
+  }
+  const expected = new Set(eligible);
+  for (const candidate of ranked) {
+    if (!expected.delete(candidate)) {
+      throw new InternalRetrievalError("RETRIEVAL_RANKER_INVALID");
+    }
+  }
+  if (expected.size !== 0) {
+    throw new InternalRetrievalError("RETRIEVAL_RANKER_INVALID");
+  }
+  return Object.freeze([...ranked]);
+}
+
 export function estimateCandidateTokens(candidate: Pick<FusedCandidate, "id" | "item">): number {
   const item = candidate.item;
   const value = item === undefined
@@ -625,25 +653,21 @@ function conflictCursor(
 }
 
 export function selectRankedCandidates(
-  candidates: readonly RerankedCandidate[],
+  candidates: readonly FusedCandidate[],
   bounds: Readonly<{ readonly limit: number; readonly tokenBudget: number }>,
   policy: RankingPolicy = DEFAULT_RANKING_POLICY,
 ): RankedSelection {
   assertPolicy(policy);
   positiveInteger(bounds.limit, "retrieval result limit");
   positiveInteger(bounds.tokenBudget, "retrieval token budget");
-  const ordered = [...candidates].sort((left, right) => (
-    compareRationalScores(right.rerankScore, left.rerankScore)
-    || left.bestRank - right.bestRank
-    || compareText(left.id, right.id)
-  ));
+  const ordered = [...candidates];
   const seen = new Set<string>();
   for (const candidate of ordered) {
     if (seen.has(candidate.id)) throw new TypeError("duplicate reranked candidate id");
     seen.add(candidate.id);
   }
 
-  const groups = new Map<string, RerankedCandidate[]>();
+  const groups = new Map<string, FusedCandidate[]>();
   for (const candidate of ordered) {
     if (candidate.conflictGroupId === null) continue;
     const group = groups.get(candidate.conflictGroupId) ?? [];
@@ -651,7 +675,7 @@ export function selectRankedCandidates(
     groups.set(candidate.conflictGroupId, group);
   }
 
-  const selected: RerankedCandidate[] = [];
+  const selected: FusedCandidate[] = [];
   const selectedIds = new Set<string>();
   const processedGroups = new Set<string>();
   const sourceCounts = new Map<string, number>();
@@ -661,7 +685,7 @@ export function selectRankedCandidates(
   const droppedIds = new Set<string>();
   const dropped = { diversity: 0, resultLimit: 0, tokenBudget: 0, conflictSuppressed: 0 };
 
-  const admit = (candidate: RerankedCandidate, bypassDiversity: boolean): "selected" | "limit" | "budget" | "diversity" => {
+  const admit = (candidate: FusedCandidate, bypassDiversity: boolean): "selected" | "limit" | "budget" | "diversity" => {
     if (selected.length >= bounds.limit) {
       dropped.resultLimit += 1;
       droppedIds.add(candidate.id);
