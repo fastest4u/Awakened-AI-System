@@ -239,4 +239,3 @@ Require evidence-backed approval that the two milestone tests and 29 functional 
 - [ ] **Step 2: Complete verification and prepare branch integration options**
 
 Use superpowers:verification-before-completion with the recorded current evidence, then use superpowers:finishing-a-development-branch. Report Task 5R release-gate completion only if every review and gate is green. Do not deploy, route V2 traffic, or claim whole-product production readiness without a separately approved cutover task.
-
