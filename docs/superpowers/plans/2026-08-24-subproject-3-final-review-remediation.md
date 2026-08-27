@@ -473,6 +473,50 @@ path, or V2 routing surface changes.
 **Tech Stack:** Node.js 24, TypeScript, Node test runner, SQLite-backed
 retrieval fixtures.
 
+#### Execution-order correction: migrate every contract consumer atomically
+
+The original task split incorrectly treated the `RetrievalRanker` relocation
+as independently compilable. The type is imported by `service.ts` and
+`projection-runtime.ts`; `service.ts` also invokes the old
+`select(collection, request, manifest)` signature. Removing the old contract
+therefore breaks the complete TypeScript build until all five source modules
+are migrated together. This is a task-order correction only: it changes no
+approved behavior, boundary, or file scope.
+
+The following order is normative and supersedes the standalone GREEN and
+commit steps in Tasks 6.1 through 6.3 below:
+
+1. Write the ranking, service, and runtime tests described in Tasks 6.1–6.3
+   before adding or changing production code for their respective behavior.
+   Run `npm run test:build` and the three focused compiled tests; record the
+   expected RED failure from the absent custom-order contract and current
+   custom-result bypass.
+2. Apply the source changes described in Tasks 6.1 Step 3, 6.2 Step 3, and
+   6.3 Step 3 as one atomic migration: update the error union and remove the
+   old contract; add the ranking contract, identity validator, and
+   order-preserving selector; converge the service to one selector; then move
+   both consumer type imports to `ranking.ts`.
+3. Run one complete GREEN verification:
+
+   ```bash
+   npm run test:build
+   node --test --test-concurrency=1 dist-test/tests/retrieval-ranking.test.js dist-test/tests/retrieval-service.test.js dist-test/tests/projection-runtime.test.js
+   npm run typecheck
+   ```
+
+   The build must pass before any implementation commit. It is not acceptable
+   to commit a partial type migration that leaves `service.ts` or
+   `projection-runtime.ts` importing the removed contract.
+4. Commit the seven implementation/test files together:
+
+   ```bash
+   git add src/orchestrator/retrieval/contracts.ts src/orchestrator/retrieval/ranking.ts src/orchestrator/retrieval/service.ts src/orchestrator/runtime/projection-runtime.ts tests/retrieval-ranking.test.ts tests/retrieval-service.test.ts tests/projection-runtime.test.ts
+   git commit -m "fix: enforce retrieval bounds after custom ranking"
+   ```
+
+Tasks 6.1–6.3 still define the exact test cases and source-level acceptance
+criteria. They are no longer separately compiling commits.
+
 **Files:**
 - Modify: `src/orchestrator/retrieval/contracts.ts`
 - Modify: `src/orchestrator/retrieval/ranking.ts`
