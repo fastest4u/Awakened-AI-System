@@ -457,77 +457,360 @@ git commit -m "fix: pin verified projection bytes in reader leases"
 
 ### Task 6: Enforce bounds after custom ranking
 
+**Approved amendment:**
+[Task 6 Custom-Ranker Bounds Amendment](../specs/2026-08-27-task-6-custom-ranker-bounds-amendment.md)
+
+**Goal:** Make custom ranking an internal ordering hook that cannot evade the
+same selection limits, conflicts, accounting, or explanation bounds as default
+ranking.
+
+**Architecture:** Filtered candidates are fused once. Default ranking returns
+that fused set in deterministic rerank order; custom ranking returns the exact
+same fused objects in a validated custom order. One order-preserving selector
+then produces every result-derived field. No route, tool, configuration, V1
+path, or V2 routing surface changes.
+
+**Tech Stack:** Node.js 24, TypeScript, Node test runner, SQLite-backed
+retrieval fixtures.
+
 **Files:**
-- Modify: `src/orchestrator/retrieval/service.ts`
+- Modify: `src/orchestrator/retrieval/contracts.ts`
 - Modify: `src/orchestrator/retrieval/ranking.ts`
+- Modify: `src/orchestrator/retrieval/service.ts`
 - Modify: `src/orchestrator/runtime/projection-runtime.ts`
-- Test: `tests/retrieval-service.test.ts`
 - Test: `tests/retrieval-ranking.test.ts`
+- Test: `tests/retrieval-service.test.ts`
 - Test: `tests/projection-runtime.test.ts`
 
-**Interfaces:**
+### Task 6.1: Define the closed custom-order contract
+
+**Files:**
+- Modify: `src/orchestrator/retrieval/contracts.ts`
+- Modify: `src/orchestrator/retrieval/ranking.ts`
+- Test: `tests/retrieval-ranking.test.ts`
+
+- [ ] **Step 1: Write failing identity and order-preservation tests**
+
+Import `InternalRetrievalError` and `validateCustomRanking`. Build a two-item
+fused set with `fuseCandidates`, reverse the original object references, and
+assert the validator returns that reversed array. Create
+`foreignFusedCandidate` with a separate one-item `fuseCandidates` call. Then
+assert that a cloned candidate, that foreign candidate, a duplicate, and a
+missing candidate each fail with the closed error code:
 
 ```ts
-function validateCustomRanking(
-  ranked: readonly FusedCandidate[],
-  eligible: ReadonlyMap<string, FusedCandidate>,
-): readonly FusedCandidate[];
-function selectRankedCandidates(
-  ranked: readonly FusedCandidate[],
-  request: ValidatedInternalRetrievalRequest,
-): RankedSelection;
+const first = { id: "canonical:first", rank: 1, channel: "exact" as const, item: item("first") };
+const second = { id: "canonical:second", rank: 2, channel: "exact" as const, item: item("second") };
+const fused = fuseCandidates([[first, second]], DEFAULT_RANKING_POLICY);
+const foreignFusedCandidate = fuseCandidates([[
+  { id: "canonical:foreign", rank: 1, channel: "exact" as const, item: item("foreign") },
+]], DEFAULT_RANKING_POLICY)[0]!;
+const reversed = Object.freeze([fused[1]!, fused[0]!]);
+assert.deepEqual(validateCustomRanking(reversed, fused), reversed);
+
+for (const invalid of [
+  Object.freeze([{ ...fused[0]! }, fused[1]!]),
+  Object.freeze([foreignFusedCandidate, fused[1]!]),
+  Object.freeze([fused[0]!, fused[0]!]),
+  Object.freeze([fused[0]!]),
+]) {
+  assert.throws(
+    () => validateCustomRanking(invalid, fused),
+    (error: unknown) => error instanceof InternalRetrievalError
+      && error.code === "RETRIEVAL_RANKER_INVALID",
+  );
+}
 ```
 
-Every ranking path validates custom output then calls the same diversity, result,
-token, conflict, and explanation-size selector. A custom ranker can reorder
-supplied candidates only.
+Add a selector assertion whose input is an intentionally reversed fused array
+and whose `limit` is one. It must return the first supplied item, proving the
+selector does not re-sort custom order.
 
-- [ ] **Step 1: Write hostile-ranker red tests**
+- [ ] **Step 2: Run the focused ranking test and confirm it is red**
 
-```ts
-it("applies limit and token budget after a custom ranker", async () => {
-  const result = await serviceWithRanker(() => allEligibleCandidates())
-    .retrieve({ ...request, limit: 1, tokenBudget: 10 });
-  assert.equal(result.items.length, 1);
-});
-it("rejects injected and duplicate custom candidates", async () => {
-  await assert.rejects(() => serviceWithRanker(() => [forgedCandidate]).retrieve(request), /RETRIEVAL_RANKER_INVALID/);
-});
-```
-
-Cover diversity, conflict counts, forged metadata, oversized explanation input,
-and default/custom selector equivalence.
-
-- [ ] **Step 2: Run red**
-
-Run: `npm run test:build && node --test --test-concurrency=1 dist-test/tests/retrieval-service.test.js dist-test/tests/retrieval-ranking.test.js dist-test/tests/projection-runtime.test.js`
-
-Expected: FAIL because custom ranking bypasses hard selection.
-
-- [ ] **Step 3: Validate then select**
-
-```ts
-const ranked = ranker === undefined
-  ? defaultRank(filtered, request)
-  : validateCustomRanking(customRank(ranker, filtered, request), filtered.byId);
-const selection = selectRankedCandidates(ranked, request);
-```
-
-Keep the seam internal and do not register a tool or route. Build explanation
-data from `selection` only.
-
-- [ ] **Step 4: Verify**
-
-Run: `npm run test:subproject-3`
-
-Expected: PASS.
-
-- [ ] **Step 5: Commit**
+Run:
 
 ```bash
-git add src/orchestrator/retrieval/service.ts src/orchestrator/retrieval/ranking.ts src/orchestrator/runtime/projection-runtime.ts tests/retrieval-service.test.ts tests/retrieval-ranking.test.ts tests/projection-runtime.test.ts
-git commit -m "fix: enforce retrieval bounds after custom ranking"
+npm run test:build
+node --test --test-concurrency=1 dist-test/tests/retrieval-ranking.test.js
 ```
+
+Expected: TypeScript fails because `validateCustomRanking` and the new error
+code are not exported, and the current selector requires a
+`RerankedCandidate` then sorts by score.
+
+- [ ] **Step 3: Move the ranker contract to the ranking boundary**
+
+In `contracts.ts`, add `"RETRIEVAL_RANKER_INVALID"` to
+`InternalRetrievalErrorCode`, remove `RetrievalRanker`, and remove the
+ranker-only `ProjectionManifestV1` import. In `ranking.ts`, import
+`InternalRetrievalError` and `ValidatedInternalRetrievalRequest`, then add the
+internal contract and validator:
+
+```ts
+export interface RetrievalRanker {
+  select(
+    eligible: readonly FusedCandidate[],
+    request: ValidatedInternalRetrievalRequest,
+  ): readonly FusedCandidate[];
+}
+
+export function validateCustomRanking(
+  ranked: readonly FusedCandidate[],
+  eligible: readonly FusedCandidate[],
+): readonly FusedCandidate[] {
+  if (ranked.length !== eligible.length) {
+    throw new InternalRetrievalError("RETRIEVAL_RANKER_INVALID");
+  }
+  const expected = new Map(eligible.map((candidate) => [candidate.id, candidate]));
+  const seen = new Set<string>();
+  for (const candidate of ranked) {
+    if (expected.get(candidate.id) !== candidate || seen.has(candidate.id)) {
+      throw new InternalRetrievalError("RETRIEVAL_RANKER_INVALID");
+    }
+    seen.add(candidate.id);
+  }
+  return Object.freeze([...ranked]);
+}
+```
+
+Change `RankedSelection.candidates`, selector input, its conflict-group map,
+and its selected array from `RerankedCandidate` to `FusedCandidate`. Replace
+the selector sort with `const ordered = [...candidates];`; retain its duplicate
+ID guard, diversity, token, result-limit, conflict, and drop logic unchanged.
+
+- [ ] **Step 4: Re-run the focused ranking test and confirm it is green**
+
+Run:
+
+```bash
+npm run test:build
+node --test --test-concurrency=1 dist-test/tests/retrieval-ranking.test.js
+```
+
+Expected: PASS. The default reranker continues to provide score order before
+selection, while valid custom order remains intact.
+
+- [ ] **Step 5: Commit the contract and selector boundary**
+
+```bash
+git add src/orchestrator/retrieval/contracts.ts src/orchestrator/retrieval/ranking.ts tests/retrieval-ranking.test.ts
+git commit -m "fix: validate custom retrieval ordering"
+```
+
+### Task 6.2: Converge service result construction through one selector
+
+**Files:**
+- Modify: `src/orchestrator/retrieval/service.ts`
+- Test: `tests/retrieval-service.test.ts`
+
+- [ ] **Step 1: Add failing service tests for valid and hostile rankers**
+
+Add a static `RetrievalCandidateRepository` fixture with two valid bound items
+and two exact-channel candidates. Use the existing valid lease fixture. Define
+a `RetrievalRanker` that returns `Object.freeze([...eligible].reverse())` and
+retrieve with `limit: 1`. Assert that the returned item is the first custom
+candidate, `candidateCount` is the fused-set size, result-limit accounting is
+nonzero, and the lease closes. Capture the `eligible` parameter and assert
+each returned custom candidate is one of those exact object references.
+
+Create a `serviceWith(ranker)` helper that returns `InternalRetrievalService`
+with `projections.pin()` returning `createLease(onClose)`, the static candidate
+repository, and the supplied ranker. Each test gives that helper its own
+`onClose` counter so it can assert closure after a valid or rejected request.
+
+Add a second ranker that returns a cloned candidate:
+
+```ts
+const invalidRanker: RetrievalRanker = {
+  select(eligible) {
+    return Object.freeze([{ ...eligible[0]! }, ...eligible.slice(1)]);
+  },
+};
+
+await assert.rejects(
+  () => serviceWith(invalidRanker).retrieve(request()),
+  (error: unknown) => error instanceof InternalRetrievalError
+    && error.code === "RETRIEVAL_RANKER_INVALID",
+);
+```
+
+Use one high-impact conflict fixture with a deliberately insufficient token
+budget and `explain: true`: two items share a `conflictGroupId`, use
+`status: "conflicted"`, and declare their group in `conflictGroups`; a third,
+lower-priority non-conflict item follows them. Set the token budget to admit
+only one conflict member. Assert custom ranking returns the selector's conflict
+cursor/truncation, redacted `tokenBudget` and `conflictSuppressed` counts, and
+an explanation derived from the selected set rather than ranker-supplied
+metadata.
+
+- [ ] **Step 2: Run the focused service test and confirm it is red**
+
+Run:
+
+```bash
+npm run test:build
+node --test --test-concurrency=1 dist-test/tests/retrieval-service.test.js
+```
+
+Expected: FAIL because the old ranker receives a collection and returns a
+completed result, while the service leaves `selection` null and conflicts
+empty for custom ranking.
+
+- [ ] **Step 3: Replace parallel custom result handling with a common path**
+
+Import `RetrievalRanker` and `validateCustomRanking` from `ranking.ts`. Delete
+`DefaultRankingOutcome`, `defaultRank`, and `customRank`. After fusion, select
+the ordered fused candidates and build one shared selection:
+
+```ts
+const ranked = this.#customRanker === undefined
+  ? rerankCandidates(fused, request, DEFAULT_RANKING_POLICY)
+  : validateCustomRanking(this.#customRanker.select(fused, request), fused);
+const selection = selectRankedCandidates(ranked, {
+  limit: request.limit,
+  tokenBudget: request.tokenBudget,
+}, DEFAULT_RANKING_POLICY);
+const items = resultItems(selection);
+const candidateCount = fused.length;
+const rankedTruncated = selection.truncated;
+```
+
+Use that same `selection` for `conflicts`, selected IDs, redacted drop counts,
+conflict truncation/cursor, and explanation. Keep the pre-fusion defensive
+filtering, vector diagnostic, manifest parsing, lease closure, and default
+reranker unchanged.
+
+- [ ] **Step 4: Re-run the focused service test and confirm it is green**
+
+Run:
+
+```bash
+npm run test:build
+node --test --test-concurrency=1 dist-test/tests/retrieval-service.test.js
+```
+
+Expected: PASS. Both default and custom paths materialize only from the shared
+selector and a hostile custom ranker fails closed.
+
+- [ ] **Step 5: Commit the service convergence**
+
+```bash
+git add src/orchestrator/retrieval/service.ts tests/retrieval-service.test.ts
+git commit -m "fix: enforce custom retrieval selection bounds"
+```
+
+### Task 6.3: Migrate the runtime dependency seam without widening it
+
+**Files:**
+- Modify: `src/orchestrator/runtime/projection-runtime.ts`
+- Test: `tests/projection-runtime.test.ts`
+
+- [ ] **Step 1: Write a failing runtime ranker-wiring test**
+
+Import `RetrievalRanker` from `ranking.ts`. Create a ranker that returns its
+single eligible fused candidate and pass it to `createInternalProjectionRuntime`:
+
+```ts
+const ranker: RetrievalRanker = {
+  select(eligible) {
+    return eligible;
+  },
+};
+const runtime = createInternalProjectionRuntime({ coordinator, candidates: CANDIDATES, ranker });
+const result = await runtime.retrieval.retrieve(Object.freeze({
+  binding: BINDING,
+  query: "runtime:projection",
+  limit: 10,
+  tokenBudget: 1_000,
+  consistency: Object.freeze({ requiredEventPosition: 42n, deadlineMs: 250 }),
+}));
+assert.deepEqual(result.items.map((candidate) => candidate.id), [ITEM.id]);
+```
+
+The test proves the runtime carries only the internal ordering contract; it
+does not assert, register, or expose any route or tool.
+
+- [ ] **Step 2: Run the focused runtime test and confirm it is red**
+
+Run:
+
+```bash
+npm run test:build
+node --test --test-concurrency=1 dist-test/tests/projection-runtime.test.js
+```
+
+Expected: TypeScript fails until the runtime imports `RetrievalRanker` from
+`ranking.ts` rather than `contracts.ts`.
+
+- [ ] **Step 3: Migrate the type-only runtime import**
+
+Keep `ProjectionLeaseProvider`, `RetrievalCandidateRepository`, and
+`VectorCandidateChannel` imported from `contracts.ts`. Add the type-only
+`RetrievalRanker` import from `../retrieval/ranking.js`; no runtime construction
+or public dependency property changes are allowed.
+
+- [ ] **Step 4: Re-run all focused Task 6 tests and confirm they are green**
+
+Run:
+
+```bash
+npm run test:build
+node --test --test-concurrency=1 dist-test/tests/retrieval-ranking.test.js dist-test/tests/retrieval-service.test.js dist-test/tests/projection-runtime.test.js
+npm run typecheck
+```
+
+Expected: PASS. The revised type seam compiles, custom ordering remains bounded,
+and all existing ranking/runtime behavior remains intact.
+
+- [ ] **Step 5: Commit the runtime type migration**
+
+```bash
+git add src/orchestrator/runtime/projection-runtime.ts tests/projection-runtime.test.ts
+git commit -m "refactor: relocate retrieval ranker contract"
+```
+
+### Task 6.4: Audit the complete Task 6 scope and release evidence
+
+**Files:**
+- Verify: `src/orchestrator/retrieval/contracts.ts`
+- Verify: `src/orchestrator/retrieval/ranking.ts`
+- Verify: `src/orchestrator/retrieval/service.ts`
+- Verify: `src/orchestrator/runtime/projection-runtime.ts`
+- Verify: `tests/retrieval-ranking.test.ts`
+- Verify: `tests/retrieval-service.test.ts`
+- Verify: `tests/projection-runtime.test.ts`
+
+- [ ] **Step 1: Run the full Subproject 3 release gate**
+
+Run:
+
+```bash
+git diff --check
+npm run test:subproject-3
+```
+
+Expected: PASS. The only permitted skip is the established Windows `EPERM`
+symlink capability skip; any failed executable test blocks Task 6.
+
+- [ ] **Step 2: Obtain independent specification and code-quality reviews**
+
+Dispatch fresh read-only reviewers after the implementation commits. The
+specification reviewer verifies exact-object identity validation, one shared
+selector, fail-closed error behavior, and scope boundaries. The code-quality
+reviewer verifies default ordering, custom-order preservation, conflict/drop/
+explanation accounting, test coverage, type-only imports, and the complete
+release evidence.
+
+- [ ] **Step 3: Commit only Task 6 documentation corrections, if reviewers require them**
+
+```bash
+git add docs/superpowers/plans/2026-08-24-subproject-3-final-review-remediation.md
+git commit -m "docs: correct Task 6 release evidence"
+```
+
+Do not commit code outside the three Task 6 implementation commits without a
+new scoped plan step and review.
 
 ### Task 7: Replace answer-driven evaluation with a sealed real harness
 
