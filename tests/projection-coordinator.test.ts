@@ -477,7 +477,7 @@ describe("projection build coordinator", () => {
       eventReader: new SqliteProjectionEventReader({ driver, eventStorePath: sourcePath }),
       builder: new ImmutableProjectionBuilder({ driver, projectionDirectory, now: () => NOW }),
     });
-    await healthy.ensurePublished(BINDING, 1n, 10_000);
+    await healthy.ensurePublished(BINDING, 1n, FUNCTIONAL_TEST_DEADLINE_MS);
 
     append(source, 2);
     const faulted = new V2ProjectionBuildCoordinator({
@@ -488,7 +488,7 @@ describe("projection build coordinator", () => {
         if (boundary === "after-v2-generation-install-before-manifest") throw new Error("post-install");
       } },
     });
-    await assert.rejects(() => faulted.ensurePublished(BINDING, 2n, 10_000), /post-install/u);
+    await assert.rejects(() => faulted.ensurePublished(BINDING, 2n, FUNCTIONAL_TEST_DEADLINE_MS), /post-install/u);
     assert.equal(existsSync(join(projectionDirectory, "projections-2-2.sqlite")), true);
 
     const reconciler = new V2ProjectionBuildCoordinator({
@@ -496,7 +496,7 @@ describe("projection build coordinator", () => {
       eventReader: new SqliteProjectionEventReader({ driver, eventStorePath: sourcePath }),
       builder: new ImmutableProjectionBuilder({ driver, projectionDirectory, now: () => NOW }),
     });
-    await reconciler.ensurePublished(BINDING, 1n, 10_000);
+    await reconciler.ensurePublished(BINDING, 1n, FUNCTIONAL_TEST_DEADLINE_MS);
     assert.equal(existsSync(join(projectionDirectory, "projections-2-2.sqlite")), false);
     const retired = readdirSync(projectionDirectory).filter((name) => (
       /^\.projections-2-retired-[0-9a-f]{32}\.sqlite$/u.test(name)
@@ -532,7 +532,7 @@ describe("projection build coordinator", () => {
       eventReader: new SqliteProjectionEventReader({ driver, eventStorePath: sourcePath }),
       builder: new ImmutableProjectionBuilder({ driver, projectionDirectory, now: () => NOW }),
     });
-    const published = await restarted.ensurePublished(BINDING, 3n, 10_000);
+    const published = await restarted.ensurePublished(BINDING, 3n, FUNCTIONAL_TEST_DEADLINE_MS);
     assert.equal(published.manifest.generation, 3, "a retained V2 final name must remain retired after restart");
     source.close();
   });
@@ -554,7 +554,7 @@ describe("projection build coordinator", () => {
         if (boundary === "after-v2-generation-install-before-manifest") throw new Error("post-install");
       } },
     });
-    await assert.rejects(() => faulted.ensurePublished(BINDING, 1n, 10_000), /post-install/u);
+    await assert.rejects(() => faulted.ensurePublished(BINDING, 1n, FUNCTIONAL_TEST_DEADLINE_MS), /post-install/u);
 
     const interrupted = new V2ProjectionBuildCoordinator({
       projectionDirectory,
@@ -567,7 +567,7 @@ describe("projection build coordinator", () => {
       } },
     });
     await assert.rejects(
-      () => interrupted.ensurePublished(BINDING, 1n, 10_000),
+      () => interrupted.ensurePublished(BINDING, 1n, FUNCTIONAL_TEST_DEADLINE_MS),
       /rename-before-complete/u,
     );
     const afterFault = JSON.parse(readFileSync(journalPath, "utf8")) as {
@@ -593,7 +593,7 @@ describe("projection build coordinator", () => {
           now: () => ${JSON.stringify(NOW)},
         }),
       });
-      await coordinator.ensurePublished(${JSON.stringify(BINDING)}, 1n, 10_000);
+      await coordinator.ensurePublished(${JSON.stringify(BINDING)}, 1n, ${FUNCTIONAL_TEST_DEADLINE_MS});
     `], { cwd: process.cwd(), encoding: "utf8", timeout: 15_000 });
     assert.equal(restart.status, 0, restart.stderr);
     const retiredName = readdirSync(projectionDirectory).find((name) => (
@@ -629,7 +629,7 @@ describe("projection build coordinator", () => {
         if (boundary === "after-v2-generation-install-before-manifest") throw new Error("post-install");
       } },
     });
-    await assert.rejects(() => faulted.ensurePublished(BINDING, 1n, 10_000), /post-install/u);
+    await assert.rejects(() => faulted.ensurePublished(BINDING, 1n, FUNCTIONAL_TEST_DEADLINE_MS), /post-install/u);
 
     const interrupted = new V2ProjectionBuildCoordinator({
       projectionDirectory,
@@ -642,7 +642,7 @@ describe("projection build coordinator", () => {
       } },
     });
     await assert.rejects(
-      () => interrupted.ensurePublished(BINDING, 1n, 10_000),
+      () => interrupted.ensurePublished(BINDING, 1n, FUNCTIONAL_TEST_DEADLINE_MS),
       /intent-before-rename/u,
     );
     const afterFault = JSON.parse(readFileSync(journalPath, "utf8")) as {
@@ -671,7 +671,7 @@ describe("projection build coordinator", () => {
           now: () => ${JSON.stringify(NOW)},
         }),
       });
-      await coordinator.ensurePublished(${JSON.stringify(BINDING)}, 1n, 10_000);
+      await coordinator.ensurePublished(${JSON.stringify(BINDING)}, 1n, ${FUNCTIONAL_TEST_DEADLINE_MS});
     `], { cwd: process.cwd(), encoding: "utf8", timeout: 15_000 });
     assert.equal(restart.status, 0, restart.stderr);
     const retiredName = readdirSync(projectionDirectory).find((name) => (
@@ -715,14 +715,14 @@ describe("projection build coordinator", () => {
         if (boundary === "after-v2-generation-install-before-manifest") throw new Error("post-install");
       } },
     });
-    await assert.rejects(() => faulted.ensurePublished(BINDING, 1n, 10_000), /post-install/u);
+    await assert.rejects(() => faulted.ensurePublished(BINDING, 1n, FUNCTIONAL_TEST_DEADLINE_MS), /post-install/u);
 
     const reconciler = new V2ProjectionBuildCoordinator({
       projectionDirectory,
       eventReader: new SqliteProjectionEventReader({ driver, eventStorePath: sourcePath }),
       builder: new ImmutableProjectionBuilder({ driver, projectionDirectory, now: () => NOW }),
     });
-    await reconciler.ensurePublished(BINDING, 1n, 10_000);
+    await reconciler.ensurePublished(BINDING, 1n, FUNCTIONAL_TEST_DEADLINE_MS);
     const retiredName = readdirSync(projectionDirectory).find((name) => (
       /^\.projections-2-retired-[0-9a-f]{32}\.sqlite$/u.test(name)
     ));
@@ -740,7 +740,7 @@ describe("projection build coordinator", () => {
       builder: new ImmutableProjectionBuilder({ driver, projectionDirectory, now: () => NOW }),
     });
     await assert.rejects(
-      () => restarted.ensurePublished(BINDING, 1n, 10_000),
+      () => restarted.ensurePublished(BINDING, 1n, FUNCTIONAL_TEST_DEADLINE_MS),
       /PROJECTION_PUBLICATION_RECOVERY_REQUIRED/u,
     );
     assert.equal(existsSync(retiredPath), true);
@@ -764,14 +764,14 @@ describe("projection build coordinator", () => {
         if (boundary === "after-v2-generation-install-before-manifest") throw new Error("post-install");
       } },
     });
-    await assert.rejects(() => faulted.ensurePublished(BINDING, 1n, 10_000), /post-install/u);
+    await assert.rejects(() => faulted.ensurePublished(BINDING, 1n, FUNCTIONAL_TEST_DEADLINE_MS), /post-install/u);
 
     const reconciler = new V2ProjectionBuildCoordinator({
       projectionDirectory,
       eventReader: new SqliteProjectionEventReader({ driver, eventStorePath: sourcePath }),
       builder: new ImmutableProjectionBuilder({ driver, projectionDirectory, now: () => NOW }),
     });
-    await reconciler.ensurePublished(BINDING, 1n, 10_000);
+    await reconciler.ensurePublished(BINDING, 1n, FUNCTIONAL_TEST_DEADLINE_MS);
     const retiredName = readdirSync(projectionDirectory).find((name) => (
       /^\.projections-2-retired-[0-9a-f]{32}\.sqlite$/u.test(name)
     ));
@@ -787,7 +787,7 @@ describe("projection build coordinator", () => {
       } },
     });
     await assert.rejects(
-      () => recovery.ensurePublished(BINDING, 1n, 10_000),
+      () => recovery.ensurePublished(BINDING, 1n, FUNCTIONAL_TEST_DEADLINE_MS),
       /PROJECTION_PUBLICATION_RECOVERY_REQUIRED/u,
     );
     assert.equal(existsSync(retiredPath), false);
@@ -811,14 +811,14 @@ describe("projection build coordinator", () => {
         if (boundary === "after-v2-generation-install-before-manifest") throw new Error("post-install");
       } },
     });
-    await assert.rejects(() => faulted.ensurePublished(BINDING, 1n, 10_000), /post-install/u);
+    await assert.rejects(() => faulted.ensurePublished(BINDING, 1n, FUNCTIONAL_TEST_DEADLINE_MS), /post-install/u);
 
     const reconciler = new V2ProjectionBuildCoordinator({
       projectionDirectory,
       eventReader: new SqliteProjectionEventReader({ driver, eventStorePath: sourcePath }),
       builder: new ImmutableProjectionBuilder({ driver, projectionDirectory, now: () => NOW }),
     });
-    await reconciler.ensurePublished(BINDING, 1n, 10_000);
+    await reconciler.ensurePublished(BINDING, 1n, FUNCTIONAL_TEST_DEADLINE_MS);
     const retiredName = readdirSync(projectionDirectory).find((name) => (
       /^\.projections-2-retired-[0-9a-f]{32}\.sqlite$/u.test(name)
     ));
@@ -840,7 +840,7 @@ describe("projection build coordinator", () => {
       } },
     });
     await assert.rejects(
-      () => recovery.ensurePublished(BINDING, 1n, 10_000),
+      () => recovery.ensurePublished(BINDING, 1n, FUNCTIONAL_TEST_DEADLINE_MS),
       /PROJECTION_PUBLICATION_RECOVERY_REQUIRED/u,
     );
     assert.deepEqual(readFileSync(displacedPath), retainedBytes);
@@ -960,7 +960,7 @@ describe("projection build coordinator", () => {
       eventReader: new SqliteProjectionEventReader({ driver, eventStorePath: sourcePath }),
       builder: new ImmutableProjectionBuilder({ driver, projectionDirectory, now: () => NOW }),
     });
-    await healthy.ensurePublished(BINDING, 1n, 10_000);
+    await healthy.ensurePublished(BINDING, 1n, FUNCTIONAL_TEST_DEADLINE_MS);
     const retiredPath = join(projectionDirectory, `.projections-2-retired-${"a".repeat(32)}.sqlite`);
     writeFileSync(retiredPath, "unjournaled retained evidence", "utf8");
 
@@ -970,7 +970,7 @@ describe("projection build coordinator", () => {
       builder: { async buildV2() { throw new Error("builder must not run"); } },
     });
     await assert.rejects(
-      () => recovery.ensurePublished(BINDING, 1n, 10_000),
+      () => recovery.ensurePublished(BINDING, 1n, FUNCTIONAL_TEST_DEADLINE_MS),
       /PROJECTION_PUBLICATION_RECOVERY_REQUIRED/u,
     );
     assert.equal(existsSync(retiredPath), true);
@@ -991,7 +991,7 @@ describe("projection build coordinator", () => {
       eventReader: new SqliteProjectionEventReader({ driver, eventStorePath: sourcePath }),
       builder: new ImmutableProjectionBuilder({ driver, projectionDirectory, now: () => NOW }),
     });
-    await healthy.ensurePublished(BINDING, 1n, 10_000);
+    await healthy.ensurePublished(BINDING, 1n, FUNCTIONAL_TEST_DEADLINE_MS);
     const quarantinePath = join(projectionDirectory, `.projections-2-quarantine-${"b".repeat(32)}.sqlite`);
     writeFileSync(quarantinePath, "legacy quarantine evidence", "utf8");
 
@@ -1001,7 +1001,7 @@ describe("projection build coordinator", () => {
       builder: { async buildV2() { throw new Error("builder must not run"); } },
     });
     await assert.rejects(
-      () => recovery.ensurePublished(BINDING, 1n, 10_000),
+      () => recovery.ensurePublished(BINDING, 1n, FUNCTIONAL_TEST_DEADLINE_MS),
       /PROJECTION_PUBLICATION_RECOVERY_REQUIRED/u,
     );
     assert.equal(existsSync(quarantinePath), true);
@@ -1034,7 +1034,7 @@ describe("projection build coordinator", () => {
       eventReader: { async openCommittedSnapshot() { throw new Error("SOURCE_UNAVAILABLE"); } },
       builder: { async buildV2() { throw new Error("builder must not run"); } },
     });
-    await assert.rejects(() => unavailable.ensurePublished(BINDING, 1n, 10_000), /SOURCE_UNAVAILABLE/u);
+    await assert.rejects(() => unavailable.ensurePublished(BINDING, 1n, FUNCTIONAL_TEST_DEADLINE_MS), /SOURCE_UNAVAILABLE/u);
     assert.equal(existsSync(join(projectionDirectory, "projections-2-1.sqlite")), false);
     assert.match(
       readFileSync(join(projectionDirectory, "projection-reconciliation-v2.json"), "utf8"),
@@ -1046,7 +1046,7 @@ describe("projection build coordinator", () => {
       eventReader: new SqliteProjectionEventReader({ driver, eventStorePath: sourcePath }),
       builder: new ImmutableProjectionBuilder({ driver, projectionDirectory, now: () => NOW }),
     });
-    const published = await restarted.ensurePublished(BINDING, 1n, 10_000);
+    const published = await restarted.ensurePublished(BINDING, 1n, FUNCTIONAL_TEST_DEADLINE_MS);
     assert.equal(published.manifest.generation, 2);
     source.close();
   });
@@ -1077,7 +1077,7 @@ describe("projection build coordinator", () => {
         if (boundary === "after-v2-orphan-reservation-before-quarantine") throw new Error("crash-after-reservation");
       } },
     });
-    await assert.rejects(() => recovery.ensurePublished(BINDING, 1n, 10_000), /crash-after-reservation/u);
+    await assert.rejects(() => recovery.ensurePublished(BINDING, 1n, FUNCTIONAL_TEST_DEADLINE_MS), /crash-after-reservation/u);
     assert.equal(existsSync(join(projectionDirectory, "projections-2-1.sqlite")), true);
     assert.match(
       readFileSync(join(projectionDirectory, "projection-reconciliation-v2.json"), "utf8"),
@@ -1100,7 +1100,7 @@ describe("projection build coordinator", () => {
       } },
       builder: { async buildV2() { throw new Error("builder must not run"); } },
     });
-    await assert.rejects(() => coordinator.ensurePublished(BINDING, 1n, 10_000), /SOURCE_UNAVAILABLE/u);
+    await assert.rejects(() => coordinator.ensurePublished(BINDING, 1n, FUNCTIONAL_TEST_DEADLINE_MS), /SOURCE_UNAVAILABLE/u);
     assert.equal(sawLock, true);
   });
 
@@ -1226,7 +1226,7 @@ describe("projection build coordinator", () => {
       } },
     });
     await assert.rejects(
-      () => recovery.ensurePublished(BINDING, 1n, 10_000),
+      () => recovery.ensurePublished(BINDING, 1n, FUNCTIONAL_TEST_DEADLINE_MS),
       /PROJECTION_PUBLICATION_RECOVERY_REQUIRED/u,
     );
     assert.equal(existsSync(join(projectionDirectory, "displaced-valid-orphan.sqlite")), true);
@@ -1429,7 +1429,7 @@ describe("projection build coordinator", () => {
       eventReader: { async openCommittedSnapshot() { throw new Error("SOURCE_UNAVAILABLE"); } },
       builder: { async buildV2() { throw new Error("builder must not run"); } },
     });
-    await assert.rejects(() => recovery.ensurePublished(BINDING, 2n, 10_000), /SOURCE_UNAVAILABLE/u);
+    await assert.rejects(() => recovery.ensurePublished(BINDING, 2n, FUNCTIONAL_TEST_DEADLINE_MS), /SOURCE_UNAVAILABLE/u);
     assert.equal(existsSync(orphan), false);
     source.close();
   });
@@ -2344,10 +2344,16 @@ describe("projection build coordinator", () => {
     roots.push(root);
     let closed = 0;
     let builds = 0;
+    let resolveSourceOpened = (): void => undefined;
+    const sourceOpened = new Promise<void>((resolve) => { resolveSourceOpened = resolve; });
+    let resolveLateSnapshot = (_snapshot: ProjectionEventSnapshot): void => undefined;
+    const lateSnapshot = new Promise<ProjectionEventSnapshot>((resolve) => { resolveLateSnapshot = resolve; });
+    let resolveClosed = (): void => undefined;
+    const closedOnce = new Promise<void>((resolve) => { resolveClosed = resolve; });
     const eventReader: ProjectionEventReader = {
       async openCommittedSnapshot() {
-        await new Promise<void>((resolve) => setTimeout(resolve, 35));
-        return emptySnapshot(() => { closed += 1; });
+        resolveSourceOpened();
+        return lateSnapshot;
       },
     };
     const coordinator = new DefaultProjectionBuildCoordinator({
@@ -2359,13 +2365,14 @@ describe("projection build coordinator", () => {
           throw new Error("late builder must not run");
         },
       },
+      now: () => 0,
     });
 
-    await assert.rejects(
-      () => coordinator.ensurePublished(BINDING, 1n, 5),
-      (error: unknown) => error instanceof ProjectionLagError,
-    );
-    await new Promise<void>((resolve) => setTimeout(resolve, 50));
+    const publication = coordinator.ensurePublished(BINDING, 1n, 5);
+    await sourceOpened;
+    await assert.rejects(publication, (error: unknown) => error instanceof ProjectionLagError);
+    resolveLateSnapshot(emptySnapshot(() => { closed += 1; resolveClosed(); }));
+    await closedOnce;
     assert.equal(closed, 1);
     assert.equal(builds, 0);
   });
@@ -2374,10 +2381,12 @@ describe("projection build coordinator", () => {
     const root = mkdtempSync(join(tmpdir(), "projection-active-snapshot-deadline-"));
     roots.push(root);
     let closed = 0;
-    let rejectBuild = (_error: Error): void => undefined;
-    const blockedBuild = new Promise<BuiltProjectionGeneration>((_resolve, reject) => {
-      rejectBuild = reject;
-    });
+    let resolveBuilderEntered = (): void => undefined;
+    const builderEntered = new Promise<void>((resolve) => { resolveBuilderEntered = resolve; });
+    let resolveBuild = (_built: BuiltProjectionGeneration): void => undefined;
+    const blockedBuild = new Promise<BuiltProjectionGeneration>((resolve) => { resolveBuild = resolve; });
+    let resolveBuildReturned = (): void => undefined;
+    const buildReturned = new Promise<void>((resolve) => { resolveBuildReturned = resolve; });
     const coordinator = new DefaultProjectionBuildCoordinator({
       projectionDirectory: join(root, "projections"),
       eventReader: {
@@ -2387,18 +2396,20 @@ describe("projection build coordinator", () => {
       },
       builder: {
         async build() {
-          return blockedBuild;
+          resolveBuilderEntered();
+          try { return await blockedBuild; } finally { resolveBuildReturned(); }
         },
       },
+      now: () => 0,
     });
 
-    await assert.rejects(
-      () => coordinator.ensurePublished(BINDING, 1n, 5),
-      (error: unknown) => error instanceof ProjectionLagError,
-    );
+    const publication = coordinator.ensurePublished(BINDING, 1n, 5);
+    await builderEntered;
+    await assert.rejects(publication, (error: unknown) => error instanceof ProjectionLagError);
     assert.equal(closed, 1);
-    rejectBuild(new Error("release blocked build"));
-    await new Promise<void>((resolve) => setTimeout(resolve, 5));
+    resolveBuild(undefined as unknown as BuiltProjectionGeneration);
+    await buildReturned;
+    await new Promise<void>((resolve) => setImmediate(resolve));
   });
 
   it("does not publish a build that completes after its caller deadline", async () => {
