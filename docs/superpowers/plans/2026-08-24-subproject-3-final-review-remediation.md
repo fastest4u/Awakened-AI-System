@@ -566,6 +566,39 @@ for (const invalid of [
 }
 ```
 
+Also add a stateful Proxy/iterable regression. Its first iteration must yield
+the exact reversed fused references; a second iteration must yield
+`foreignFusedCandidate` followed by an eligible reference. Assert the
+validator returns only the reversed eligible references, excludes the foreign
+candidate, and iterates the ranker result exactly once:
+
+```ts
+let iterations = 0;
+const statefulRanking = new Proxy([...fused], {
+  get(target, property, receiver) {
+    if (property === Symbol.iterator) {
+      return function* (): IterableIterator<typeof fused[number]> {
+        iterations += 1;
+        yield* iterations === 1
+          ? [fused[1]!, fused[0]!]
+          : [foreignFusedCandidate, fused[1]!];
+      };
+    }
+    return Reflect.get(target, property, receiver);
+  },
+});
+
+const statefulResult = validateCustomRanking(statefulRanking, fused);
+assert.equal(statefulResult[0], fused[1]!);
+assert.equal(statefulResult[1], fused[0]!);
+assert.equal(statefulResult.includes(foreignFusedCandidate), false);
+assert.equal(iterations, 1);
+```
+
+This regression must fail against a validator that validates one traversal and
+returns a second traversal, because that old two-pass behavior accepts the
+foreign candidate from the second iteration.
+
 Add a selector assertion whose input is an intentionally reversed fused array
 and whose `limit` is one. It must return the first supplied item, proving the
 selector does not re-sort custom order.
@@ -603,18 +636,20 @@ export function validateCustomRanking(
   ranked: readonly FusedCandidate[],
   eligible: readonly FusedCandidate[],
 ): readonly FusedCandidate[] {
-  if (ranked.length !== eligible.length) {
+  const snapshot = [...ranked];
+  if (snapshot.length !== eligible.length) {
     throw new InternalRetrievalError("RETRIEVAL_RANKER_INVALID");
   }
-  const expected = new Map(eligible.map((candidate) => [candidate.id, candidate]));
-  const seen = new Set<string>();
-  for (const candidate of ranked) {
-    if (expected.get(candidate.id) !== candidate || seen.has(candidate.id)) {
+  const expected = new Set(eligible);
+  for (const candidate of snapshot) {
+    if (!expected.delete(candidate)) {
       throw new InternalRetrievalError("RETRIEVAL_RANKER_INVALID");
     }
-    seen.add(candidate.id);
   }
-  return Object.freeze([...ranked]);
+  if (expected.size !== 0) {
+    throw new InternalRetrievalError("RETRIEVAL_RANKER_INVALID");
+  }
+  return Object.freeze(snapshot);
 }
 ```
 
