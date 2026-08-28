@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 import type {
   BranchScopeId,
   ProjectId,
@@ -19,11 +21,12 @@ import type {
 const HASH = /^[0-9a-f]{64}$/u;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 const UNSIGNED_DECIMAL = /^(0|[1-9][0-9]*)$/u;
-const QUERY_ID = /^eval-v1-[0-9]{4}$/u;
 const SAFE_ID = /^[a-z0-9][a-z0-9._:-]{0,127}$/u;
 const CONTROL = /[\u0000-\u001f\u007f]/u;
 const SECRET_BEARING_TEXT = /raw[-_ ]?evidence|authorization|credential|bearer\s|private[-_ ]?key/i;
 const SQLITE_INT64_MAX = 9_223_372_036_854_775_807n;
+const MAX_PLAIN_DATA_DEPTH = 64;
+const MAX_PLAIN_DATA_STRING_BYTES = 1_048_576;
 
 export const RETRIEVAL_EVALUATION_CRITICAL_CLASSES = Object.freeze([
   "identifiers",
@@ -41,6 +44,9 @@ export type RetrievalEvaluationCriticalClass =
   typeof RETRIEVAL_EVALUATION_CRITICAL_CLASSES[number];
 export type RetrievalEvaluationLanguage = "en" | "th" | "mixed";
 export type RetrievalEvaluationRelevanceGrade = 0 | 1 | 2 | 3;
+export type RetrievalEvaluationCorpusVersion =
+  | "retrieval-evaluation-v1"
+  | "retrieval-evaluation-v2";
 
 export interface RetrievalEvaluationEligibleScopeV1 {
   readonly projectId: string;
@@ -101,7 +107,7 @@ export interface RetrievalEvaluationCorpusV1 {
 }
 
 export interface RetrievalEvaluationReport {
-  readonly corpusVersion: "retrieval-evaluation-v1";
+  readonly corpusVersion: RetrievalEvaluationCorpusVersion;
   readonly queryCount: number;
   readonly failedQueryCount: number;
   readonly languageCounts: Readonly<Record<RetrievalEvaluationLanguage, number>>;
@@ -122,6 +128,47 @@ export interface RetrievalEvaluationReport {
   readonly conflictRecall: number;
   readonly conflictPrecision: number;
   readonly unsupportedHighImpactVerifiedClaims: number;
+}
+
+export interface RetrievalEvaluationBundleV2 {
+  readonly schemaVersion: 2;
+  readonly corpusVersion: "retrieval-evaluation-v2";
+  readonly files: Readonly<Record<
+    "source-events.json" | "judgments.json" | "v1-shadow-baseline.json",
+    string
+  >>;
+}
+
+export interface FrozenV1ShadowBaseline {
+  readonly schemaVersion: 1;
+  readonly v1Version: string;
+  readonly judgmentsSha256: string;
+  readonly metrics: RetrievalEvaluationReport;
+  readonly provenanceCommand: string;
+}
+
+export interface SealedRetrievalEvaluationSourceV2 {
+  readonly binding: ProjectBinding;
+  readonly events: readonly Readonly<Record<string, unknown>>[];
+}
+
+export interface RetrievalEvaluationSourceEventsV2 {
+  readonly schemaVersion: 2;
+  readonly corpusVersion: "retrieval-evaluation-v2";
+  readonly sources: readonly SealedRetrievalEvaluationSourceV2[];
+}
+
+export interface RetrievalEvaluationJudgmentsV2 {
+  readonly schemaVersion: 2;
+  readonly corpusVersion: "retrieval-evaluation-v2";
+  readonly queries: readonly RetrievalEvaluationQueryV1[];
+}
+
+export interface SealedRetrievalEvaluationCorpusV2 {
+  readonly bundle: RetrievalEvaluationBundleV2;
+  readonly sources: readonly SealedRetrievalEvaluationSourceV2[];
+  readonly queries: readonly RetrievalEvaluationQueryV1[];
+  readonly baseline: FrozenV1ShadowBaseline;
 }
 
 export type RetrievalEvaluationService = Pick<InternalRetrievalService, "retrieve">;
@@ -156,6 +203,44 @@ function exactRecord(value: unknown, keys: readonly string[]): Record<string, un
   return output;
 }
 
+function arrayItems(
+  value: unknown,
+  minimumLength: number,
+  maximumLength = Number.MAX_SAFE_INTEGER,
+): readonly unknown[] {
+  if (
+    !Array.isArray(value)
+    || Object.getPrototypeOf(value) !== Array.prototype
+    || value.length < minimumLength
+    || value.length > maximumLength
+  ) return invalid();
+  const expectedKeys = [
+    ...Array.from({ length: value.length }, (_, index) => String(index)),
+    "length",
+  ];
+  const ownKeys = Reflect.ownKeys(value);
+  if (
+    ownKeys.length !== expectedKeys.length
+    || ownKeys.some((key) => typeof key !== "string" || !expectedKeys.includes(key))
+  ) return invalid();
+  const lengthDescriptor = Object.getOwnPropertyDescriptor(value, "length");
+  if (
+    lengthDescriptor === undefined
+    || !("value" in lengthDescriptor)
+    || lengthDescriptor.enumerable
+    || lengthDescriptor.value !== value.length
+  ) return invalid();
+  const output: unknown[] = [];
+  for (let index = 0; index < value.length; index += 1) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+    if (descriptor === undefined || !descriptor.enumerable || !("value" in descriptor)) {
+      return invalid();
+    }
+    output.push(descriptor.value);
+  }
+  return Object.freeze(output);
+}
+
 function safeText(value: unknown, maximumBytes: number): string {
   if (
     typeof value !== "string"
@@ -166,6 +251,68 @@ function safeText(value: unknown, maximumBytes: number): string {
     || SECRET_BEARING_TEXT.test(value)
   ) return invalid();
   return value;
+}
+
+function safePropertyName(value: string): string {
+  if (
+    value.length === 0
+    || Buffer.byteLength(value, "utf8") > 512
+    || value.normalize("NFKC") !== value
+    || CONTROL.test(value)
+  ) return invalid();
+  return value;
+}
+
+function clonePlainData(
+  value: unknown,
+  seen: WeakSet<object> = new WeakSet<object>(),
+  depth = 0,
+): unknown {
+  if (depth > MAX_PLAIN_DATA_DEPTH) return invalid();
+  if (value === null || typeof value === "boolean") return value;
+  if (typeof value === "string") return safeText(value, MAX_PLAIN_DATA_STRING_BYTES);
+  if (typeof value === "number") {
+    if (!Number.isFinite(value) || Object.is(value, -0)) return invalid();
+    return value;
+  }
+  if (typeof value !== "object") return invalid();
+  if (seen.has(value)) return invalid();
+  seen.add(value);
+  if (Array.isArray(value)) {
+    const entries = arrayItems(value, 0);
+    return Object.freeze(entries.map((entry) => clonePlainData(entry, seen, depth + 1)));
+  }
+  const prototype = Object.getPrototypeOf(value) as unknown;
+  if (prototype !== Object.prototype && prototype !== null) return invalid();
+  const ownKeys = Reflect.ownKeys(value);
+  if (ownKeys.some((key) => typeof key !== "string")) return invalid();
+  const output: Record<string, unknown> = {};
+  for (const key of ownKeys as string[]) {
+    safePropertyName(key);
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (descriptor === undefined || !descriptor.enumerable || !("value" in descriptor)) {
+      return invalid();
+    }
+    Object.defineProperty(output, key, {
+      configurable: true,
+      enumerable: true,
+      value: clonePlainData(descriptor.value, seen, depth + 1),
+      writable: true,
+    });
+  }
+  return Object.freeze(output);
+}
+
+function plainRecord(value: unknown): Readonly<Record<string, unknown>> {
+  const output = clonePlainData(value);
+  if (typeof output !== "object" || output === null || Array.isArray(output)) return invalid();
+  return output as Readonly<Record<string, unknown>>;
+}
+
+function canonicalSha256(value: unknown): string {
+  const serialized = JSON.stringify(value);
+  if (typeof serialized !== "string") return invalid();
+  return createHash("sha256").update(serialized, "utf8").digest("hex");
 }
 
 function nullableText(value: unknown, maximumBytes: number): string | null {
@@ -276,9 +423,9 @@ function eligibleScope(value: unknown): RetrievalEvaluationEligibleScopeV1 {
 }
 
 function citations(value: unknown): readonly RetrievalEvaluationCitationV1[] {
-  if (!Array.isArray(value) || value.length === 0 || value.length > 50) return invalid();
+  const entries = arrayItems(value, 1, 50);
   const seen = new Set<string>();
-  return Object.freeze(value.map((entry) => {
+  return Object.freeze(entries.map((entry) => {
     const source = exactRecord(entry, ["itemId", "anchor"]);
     const citation = Object.freeze({
       itemId: uuid(source.itemId),
@@ -306,8 +453,8 @@ function expectations(value: unknown): RetrievalEvaluationExpectationsV1 {
     "exactIdentifierPath", "currentSessionCheckpoint", "openFollowUp", "nextAction",
     "semanticParaphrase", "bitemporal", "conflictGroupIds",
   ]);
-  if (!Array.isArray(source.conflictGroupIds) || source.conflictGroupIds.length > 20) return invalid();
-  const conflictGroupIds = source.conflictGroupIds.map((entry) => {
+  const conflictGroupEntries = arrayItems(source.conflictGroupIds, 0, 20);
+  const conflictGroupIds = conflictGroupEntries.map((entry) => {
     const id = safeText(entry, 128);
     if (!SAFE_ID.test(id)) return invalid();
     return id;
@@ -324,21 +471,25 @@ function expectations(value: unknown): RetrievalEvaluationExpectationsV1 {
   });
 }
 
-function evaluationQuery(value: unknown, ordinal: number): RetrievalEvaluationQueryV1 {
+function evaluationQuery(
+  value: unknown,
+  ordinal: number,
+  expectedPrefix: "eval-v1-" | "eval-v2-",
+): RetrievalEvaluationQueryV1 {
   const source = exactRecord(value, [
     "queryId", "language", "criticalClass", "queryText", "eligibleScope",
     "expectedCitations", "judgments", "relevanceGrades", "expectations",
   ]);
   const queryId = safeText(source.queryId, 32);
-  if (!QUERY_ID.test(queryId) || queryId !== `eval-v1-${String(ordinal).padStart(4, "0")}`) return invalid();
+  if (queryId !== `${expectedPrefix}${String(ordinal).padStart(4, "0")}`) return invalid();
   const language = source.language;
   if (!(language === "en" || language === "th" || language === "mixed")) return invalid();
   const criticalClass = source.criticalClass;
   if (!RETRIEVAL_EVALUATION_CRITICAL_CLASSES.includes(
     criticalClass as RetrievalEvaluationCriticalClass,
   )) return invalid();
-  if (!Array.isArray(source.judgments) || source.judgments.length !== 2) return invalid();
-  const parsedJudgments = source.judgments.map(judgment) as unknown as [
+  const judgmentEntries = arrayItems(source.judgments, 2, 2);
+  const parsedJudgments = judgmentEntries.map(judgment) as unknown as [
     RetrievalEvaluationJudgmentV1,
     RetrievalEvaluationJudgmentV1,
   ];
@@ -381,10 +532,11 @@ export function parseRetrievalEvaluationCorpus(value: unknown): RetrievalEvaluat
     || source.corpusVersion !== "retrieval-evaluation-v1"
     || source.fixtureSeed !== "awakened-ai-retrieval-evaluation-v1-fixed-seed"
     || source.evidencePolicy !== "synthetic-identifiers-only"
-    || !Array.isArray(source.queries)
-    || source.queries.length !== 500
   ) return invalid();
-  const queries = Object.freeze(source.queries.map((query, index) => evaluationQuery(query, index + 1)));
+  const queryEntries = arrayItems(source.queries, 500, 500);
+  const queries = Object.freeze(queryEntries.map((query, index) => (
+    evaluationQuery(query, index + 1, "eval-v1-")
+  )));
   if (new Set(queries.map((query) => query.queryId)).size !== queries.length) return invalid();
   if (new Set(queries.map((query) => query.queryText)).size !== queries.length) return invalid();
   for (const criticalClass of RETRIEVAL_EVALUATION_CRITICAL_CLASSES) {
@@ -400,6 +552,240 @@ export function parseRetrievalEvaluationCorpus(value: unknown): RetrievalEvaluat
     evidencePolicy: "synthetic-identifiers-only",
     queries,
   });
+}
+
+function parseBundleManifest(value: unknown): RetrievalEvaluationBundleV2 {
+  const source = exactRecord(value, ["schemaVersion", "corpusVersion", "files"]);
+  if (
+    source.schemaVersion !== 2
+    || source.corpusVersion !== "retrieval-evaluation-v2"
+  ) return invalid();
+  const fileSource = exactRecord(source.files, [
+    "source-events.json",
+    "judgments.json",
+    "v1-shadow-baseline.json",
+  ]);
+  const files = Object.freeze({
+    "source-events.json": hash(fileSource["source-events.json"]),
+    "judgments.json": hash(fileSource["judgments.json"]),
+    "v1-shadow-baseline.json": hash(fileSource["v1-shadow-baseline.json"]),
+  });
+  return Object.freeze({
+    schemaVersion: 2,
+    corpusVersion: "retrieval-evaluation-v2",
+    files,
+  });
+}
+
+function parseProjectBinding(value: unknown): ProjectBinding {
+  const source = exactRecord(value, [
+    "projectId", "vaultId", "storeId", "workspaceId", "branchScopeId", "branchRef", "sessionId",
+  ]);
+  return Object.freeze({
+    projectId: hash(source.projectId) as ProjectId,
+    vaultId: hash(source.vaultId) as VaultId,
+    storeId: hash(source.storeId) as StoreId,
+    workspaceId: hash(source.workspaceId) as WorkspaceId,
+    branchScopeId: nullableUuid(source.branchScopeId) as BranchScopeId | null,
+    branchRef: nullableText(source.branchRef, 1_024),
+    sessionId: nullableUuid(source.sessionId),
+  });
+}
+
+function parseSourceEventsV2(value: unknown): RetrievalEvaluationSourceEventsV2 {
+  const source = exactRecord(value, ["schemaVersion", "corpusVersion", "sources"]);
+  if (
+    source.schemaVersion !== 2
+    || source.corpusVersion !== "retrieval-evaluation-v2"
+  ) return invalid();
+  const sourceEntries = arrayItems(source.sources, 1);
+  const seenBindings = new Set<string>();
+  const seenEventIds = new Set<string>();
+  const seenIdempotencyKeys = new Set<string>();
+  const sources = sourceEntries.map((entry): SealedRetrievalEvaluationSourceV2 => {
+    const sourceRecord = exactRecord(entry, ["binding", "events"]);
+    const binding = parseProjectBinding(sourceRecord.binding);
+    const bindingKey = JSON.stringify(binding);
+    if (seenBindings.has(bindingKey)) return invalid();
+    seenBindings.add(bindingKey);
+    const eventEntries = arrayItems(sourceRecord.events, 1);
+    const events = eventEntries.map((eventValue) => {
+      const event = plainRecord(eventValue);
+      const eventId = uuid(event.eventId);
+      const idempotencyKey = safeText(event.idempotencyKey, 256);
+      if (seenEventIds.has(eventId) || seenIdempotencyKeys.has(idempotencyKey)) return invalid();
+      seenEventIds.add(eventId);
+      seenIdempotencyKeys.add(idempotencyKey);
+      if (event.globalPosition !== undefined) decimal(event.globalPosition);
+      if (event.streamVersion !== undefined) decimal(event.streamVersion);
+      for (const hashField of ["payloadHash", "previousGlobalHash", "eventHash"] as const) {
+        if (event[hashField] !== undefined) hash(event[hashField]);
+      }
+      return event;
+    });
+    return Object.freeze({ binding, events: Object.freeze(events) });
+  });
+  return Object.freeze({
+    schemaVersion: 2,
+    corpusVersion: "retrieval-evaluation-v2",
+    sources: Object.freeze(sources),
+  });
+}
+
+function parseJudgmentsV2(value: unknown): RetrievalEvaluationJudgmentsV2 {
+  const source = exactRecord(value, ["schemaVersion", "corpusVersion", "queries"]);
+  if (
+    source.schemaVersion !== 2
+    || source.corpusVersion !== "retrieval-evaluation-v2"
+  ) return invalid();
+  const queryEntries = arrayItems(source.queries, 1);
+  const queries = Object.freeze(queryEntries.map((query, index) => (
+    evaluationQuery(query, index + 1, "eval-v2-")
+  )));
+  if (new Set(queries.map((query) => query.queryId)).size !== queries.length) return invalid();
+  if (new Set(queries.map((query) => query.queryText)).size !== queries.length) return invalid();
+  return Object.freeze({
+    schemaVersion: 2,
+    corpusVersion: "retrieval-evaluation-v2",
+    queries,
+  });
+}
+
+function nonnegativeInteger(value: unknown): number {
+  if (!Number.isSafeInteger(value) || Object.is(value, -0) || Number(value) < 0) return invalid();
+  return Number(value);
+}
+
+function unitInterval(value: unknown): number {
+  if (
+    typeof value !== "number"
+    || !Number.isFinite(value)
+    || Object.is(value, -0)
+    || value < 0
+    || value > 1
+  ) return invalid();
+  return value;
+}
+
+function parseFrozenReport(
+  value: unknown,
+  queries: readonly RetrievalEvaluationQueryV1[],
+): RetrievalEvaluationReport {
+  const source = exactRecord(value, [
+    "corpusVersion", "queryCount", "failedQueryCount", "languageCounts",
+    "criticalClassCounts", "crossProjectContamination", "recallAt10", "mrr",
+    "ndcgAt10", "citationPrecision", "citationRecall", "staleActiveMemoryRate",
+    "exactIdentifierPathRecall", "currentSessionCheckpointRecallAt10",
+    "openFollowUpRecallAt10", "nextActionRecallAt10", "semanticParaphraseRecallAt10",
+    "bitemporalAccuracy", "conflictRecall", "conflictPrecision",
+    "unsupportedHighImpactVerifiedClaims",
+  ]);
+  if (source.corpusVersion !== "retrieval-evaluation-v1") return invalid();
+  const queryCount = nonnegativeInteger(source.queryCount);
+  const failedQueryCount = nonnegativeInteger(source.failedQueryCount);
+  if (queryCount !== queries.length || failedQueryCount > queryCount) return invalid();
+
+  const languageSource = exactRecord(source.languageCounts, ["en", "th", "mixed"]);
+  const languageCounts = Object.freeze({
+    en: nonnegativeInteger(languageSource.en),
+    th: nonnegativeInteger(languageSource.th),
+    mixed: nonnegativeInteger(languageSource.mixed),
+  });
+  for (const language of ["en", "th", "mixed"] as const) {
+    if (languageCounts[language] !== queries.filter((query) => query.language === language).length) {
+      return invalid();
+    }
+  }
+
+  const classSource = exactRecord(
+    source.criticalClassCounts,
+    RETRIEVAL_EVALUATION_CRITICAL_CLASSES,
+  );
+  const criticalClassCounts = Object.freeze(Object.fromEntries(
+    RETRIEVAL_EVALUATION_CRITICAL_CLASSES.map((criticalClass) => [
+      criticalClass,
+      nonnegativeInteger(classSource[criticalClass]),
+    ]),
+  )) as Readonly<Record<RetrievalEvaluationCriticalClass, number>>;
+  for (const criticalClass of RETRIEVAL_EVALUATION_CRITICAL_CLASSES) {
+    if (
+      criticalClassCounts[criticalClass]
+      !== queries.filter((query) => query.criticalClass === criticalClass).length
+    ) return invalid();
+  }
+
+  return Object.freeze({
+    corpusVersion: "retrieval-evaluation-v1",
+    queryCount,
+    failedQueryCount,
+    languageCounts,
+    criticalClassCounts,
+    crossProjectContamination: nonnegativeInteger(source.crossProjectContamination),
+    recallAt10: unitInterval(source.recallAt10),
+    mrr: unitInterval(source.mrr),
+    ndcgAt10: unitInterval(source.ndcgAt10),
+    citationPrecision: unitInterval(source.citationPrecision),
+    citationRecall: unitInterval(source.citationRecall),
+    staleActiveMemoryRate: unitInterval(source.staleActiveMemoryRate),
+    exactIdentifierPathRecall: unitInterval(source.exactIdentifierPathRecall),
+    currentSessionCheckpointRecallAt10: unitInterval(source.currentSessionCheckpointRecallAt10),
+    openFollowUpRecallAt10: unitInterval(source.openFollowUpRecallAt10),
+    nextActionRecallAt10: unitInterval(source.nextActionRecallAt10),
+    semanticParaphraseRecallAt10: unitInterval(source.semanticParaphraseRecallAt10),
+    bitemporalAccuracy: unitInterval(source.bitemporalAccuracy),
+    conflictRecall: unitInterval(source.conflictRecall),
+    conflictPrecision: unitInterval(source.conflictPrecision),
+    unsupportedHighImpactVerifiedClaims: nonnegativeInteger(
+      source.unsupportedHighImpactVerifiedClaims,
+    ),
+  });
+}
+
+function parseFrozenV1ShadowBaseline(
+  value: unknown,
+  queries: readonly RetrievalEvaluationQueryV1[],
+): FrozenV1ShadowBaseline {
+  const source = exactRecord(value, [
+    "schemaVersion", "v1Version", "judgmentsSha256", "metrics", "provenanceCommand",
+  ]);
+  if (source.schemaVersion !== 1) return invalid();
+  const judgmentsSha256 = hash(source.judgmentsSha256);
+  if (judgmentsSha256 !== canonicalSha256(queries)) return invalid();
+  return Object.freeze({
+    schemaVersion: 1,
+    v1Version: safeText(source.v1Version, 256),
+    judgmentsSha256,
+    metrics: parseFrozenReport(source.metrics, queries),
+    provenanceCommand: safeText(source.provenanceCommand, 2_048),
+  });
+}
+
+export function parseSealedRetrievalEvaluationBundle(
+  manifest: unknown,
+  sourceEvents: unknown,
+  judgments: unknown,
+  baseline: unknown,
+): SealedRetrievalEvaluationCorpusV2 {
+  try {
+    const bundle = parseBundleManifest(manifest);
+    const sourceArtifact = parseSourceEventsV2(sourceEvents);
+    const judgmentsArtifact = parseJudgmentsV2(judgments);
+    const parsedBaseline = parseFrozenV1ShadowBaseline(baseline, judgmentsArtifact.queries);
+    if (
+      bundle.files["source-events.json"] !== canonicalSha256(sourceArtifact)
+      || bundle.files["judgments.json"] !== canonicalSha256(judgmentsArtifact)
+      || bundle.files["v1-shadow-baseline.json"] !== canonicalSha256(parsedBaseline)
+    ) return invalid();
+    return Object.freeze({
+      bundle,
+      sources: sourceArtifact.sources,
+      queries: judgmentsArtifact.queries,
+      baseline: parsedBaseline,
+    });
+  } catch (error) {
+    if (error instanceof RetrievalEvaluationCorpusError) throw error;
+    return invalid();
+  }
 }
 
 interface RetrievalEvaluationOutcome {

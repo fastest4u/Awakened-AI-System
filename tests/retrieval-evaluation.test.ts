@@ -15,10 +15,13 @@ import type { ProjectionManifestV1 } from "../src/orchestrator/projections/manif
 import type { ProjectionReaderLease } from "../src/orchestrator/projections/reader-lease.js";
 import {
   RETRIEVAL_EVALUATION_CRITICAL_CLASSES,
+  RetrievalEvaluationCorpusError,
   evaluateRetrieval,
   parseRetrievalEvaluationCorpus,
+  parseSealedRetrievalEvaluationBundle,
   type RetrievalEvaluationCorpusV1,
   type RetrievalEvaluationQueryV1,
+  type SealedRetrievalEvaluationCorpusV2,
 } from "../src/orchestrator/retrieval/evaluation.js";
 import type {
   InternalRetrievalRequest,
@@ -36,6 +39,505 @@ const FIXTURE_URL = new URL(
   import.meta.url,
 );
 const EXPECTED_CANONICAL_SHA256 = "963020e36f6860522b545c749024db0672e87fb703ab762b5c53fa3d62402f99";
+
+type UnknownRecord = Record<string, unknown>;
+
+interface SealedV2Inputs {
+  readonly manifest: UnknownRecord;
+  readonly sourceEvents: UnknownRecord;
+  readonly judgments: UnknownRecord;
+  readonly baseline: UnknownRecord;
+}
+
+function canonicalSha256(value: unknown): string {
+  return createHash("sha256").update(JSON.stringify(value), "utf8").digest("hex");
+}
+
+function sealV2Artifacts(
+  sourceEvents: UnknownRecord,
+  judgments: UnknownRecord,
+  baseline: UnknownRecord,
+): SealedV2Inputs {
+  return {
+    manifest: {
+      schemaVersion: 2,
+      corpusVersion: "retrieval-evaluation-v2",
+      files: {
+        "source-events.json": canonicalSha256(sourceEvents),
+        "judgments.json": canonicalSha256(judgments),
+        "v1-shadow-baseline.json": canonicalSha256(baseline),
+      },
+    },
+    sourceEvents,
+    judgments,
+    baseline,
+  };
+}
+
+function createValidSealedV2Inputs(): SealedV2Inputs {
+  const projectId = "a".repeat(64);
+  const vaultId = "b".repeat(64);
+  const storeId = "c".repeat(64);
+  const workspaceId = "d".repeat(64);
+  const itemId = "10000000-0000-4000-8000-000000000001";
+  const binding = {
+    projectId,
+    vaultId,
+    storeId,
+    workspaceId,
+    branchScopeId: null,
+    branchRef: null,
+    sessionId: null,
+  };
+  const sourceEvents = {
+    schemaVersion: 2,
+    corpusVersion: "retrieval-evaluation-v2",
+    sources: [{
+      binding,
+      events: [{
+        globalPosition: "1",
+        eventId: "20000000-0000-4000-8000-000000000001",
+        idempotencyKey: "eval-source-command-0001",
+        eventType: "MemorySourceRecorded",
+        payload: {
+          itemId,
+          summary: "Synthetic source for strict bundle parsing",
+        },
+      }],
+    }],
+  };
+  const relevanceGrades = { [itemId]: 3 };
+  const query = {
+    queryId: "eval-v2-0001",
+    language: "en",
+    criticalClass: "identifiers",
+    queryText: "Find synthetic identifier ADR-EVAL-0001",
+    eligibleScope: {
+      projectId,
+      vaultId,
+      storeId,
+      workspaceId,
+      branchScopeId: null,
+      branchRef: null,
+      sessionId: null,
+      visibility: "project",
+      validAt: null,
+      knownAt: null,
+      requiredEventPosition: "1",
+      deadlineMs: 1_000,
+    },
+    expectedCitations: [{ itemId, anchor: "memory://synthetic/item-0001" }],
+    judgments: [
+      { judgeId: "judge-a", relevanceGrades },
+      { judgeId: "judge-b", relevanceGrades },
+    ],
+    relevanceGrades,
+    expectations: {
+      exactIdentifierPath: true,
+      currentSessionCheckpoint: false,
+      openFollowUp: false,
+      nextAction: false,
+      semanticParaphrase: false,
+      bitemporal: false,
+      conflictGroupIds: [],
+    },
+  };
+  const judgments = {
+    schemaVersion: 2,
+    corpusVersion: "retrieval-evaluation-v2",
+    queries: [query],
+  };
+  const baseline = {
+    schemaVersion: 1,
+    v1Version: "retrieval-evaluation-v1-shadow-test",
+    judgmentsSha256: canonicalSha256(judgments.queries),
+    metrics: {
+      corpusVersion: "retrieval-evaluation-v1",
+      queryCount: 1,
+      failedQueryCount: 0,
+      languageCounts: { en: 1, th: 0, mixed: 0 },
+      criticalClassCounts: {
+        identifiers: 1,
+        "code-artifacts": 0,
+        "session-continuity": 0,
+        "follow-ups": 0,
+        "stale-superseded-facts": 0,
+        conflicts: 0,
+        "cross-project-near-duplicates": 0,
+        "semantic-paraphrases": 0,
+        "temporal-boundaries": 0,
+      },
+      crossProjectContamination: 0,
+      recallAt10: 1,
+      mrr: 1,
+      ndcgAt10: 1,
+      citationPrecision: 1,
+      citationRecall: 1,
+      staleActiveMemoryRate: 0,
+      exactIdentifierPathRecall: 1,
+      currentSessionCheckpointRecallAt10: 0,
+      openFollowUpRecallAt10: 0,
+      nextActionRecallAt10: 0,
+      semanticParaphraseRecallAt10: 0,
+      bitemporalAccuracy: 0,
+      conflictRecall: 0,
+      conflictPrecision: 0,
+      unsupportedHighImpactVerifiedClaims: 0,
+    },
+    provenanceCommand: "npm run test:retrieval-evaluation",
+  };
+  return sealV2Artifacts(sourceEvents, judgments, baseline);
+}
+
+function parseSealedInputs(inputs: SealedV2Inputs): SealedRetrievalEvaluationCorpusV2 {
+  return parseSealedRetrievalEvaluationBundle(
+    inputs.manifest,
+    inputs.sourceEvents,
+    inputs.judgments,
+    inputs.baseline,
+  );
+}
+
+function assertCorpusInvalid(action: () => unknown): void {
+  assert.throws(action, (error: unknown) => (
+    error instanceof RetrievalEvaluationCorpusError
+    && error.message === "RETRIEVAL_EVALUATION_CORPUS_INVALID"
+    && error.name === "RetrievalEvaluationCorpusError"
+  ));
+}
+
+function withSecondQuery(
+  inputs: SealedV2Inputs,
+  secondOverrides: Readonly<Record<string, unknown>>,
+): SealedV2Inputs {
+  const first = (inputs.judgments.queries as UnknownRecord[])[0];
+  assert.ok(first);
+  const second = {
+    ...first,
+    queryId: "eval-v2-0002",
+    queryText: "Find a second synthetic identifier ADR-EVAL-0002",
+    ...secondOverrides,
+  };
+  const queries = [first, second];
+  const judgments = { ...inputs.judgments, queries };
+  const metrics = inputs.baseline.metrics as UnknownRecord;
+  const criticalClassCounts = metrics.criticalClassCounts as UnknownRecord;
+  const baseline = {
+    ...inputs.baseline,
+    judgmentsSha256: canonicalSha256(queries),
+    metrics: {
+      ...metrics,
+      queryCount: 2,
+      languageCounts: { en: 2, th: 0, mixed: 0 },
+      criticalClassCounts: { ...criticalClassCounts, identifiers: 2 },
+    },
+  };
+  return sealV2Artifacts(inputs.sourceEvents, judgments, baseline);
+}
+
+describe("sealed V2 retrieval evaluation bundle", () => {
+  it("accepts a canonical bundle and returns defensive deep-frozen plain data", () => {
+    const inputs = createValidSealedV2Inputs();
+
+    const corpus = parseSealedInputs(inputs);
+
+    assert.equal(corpus.bundle.schemaVersion, 2);
+    assert.equal(corpus.bundle.corpusVersion, "retrieval-evaluation-v2");
+    assert.equal(corpus.sources.length, 1);
+    assert.equal(corpus.sources[0]?.events.length, 1);
+    assert.equal(corpus.queries.length, 1);
+    assert.equal(corpus.queries[0]?.queryId, "eval-v2-0001");
+    assert.equal(corpus.baseline.judgmentsSha256, canonicalSha256(corpus.queries));
+    assert.equal(corpus.baseline.metrics.corpusVersion, "retrieval-evaluation-v1");
+    assert.notEqual(corpus.bundle, inputs.manifest);
+    assert.notEqual(corpus.sources, inputs.sourceEvents.sources);
+    assert.equal(Object.isFrozen(corpus), true);
+    assert.equal(Object.isFrozen(corpus.bundle), true);
+    assert.equal(Object.isFrozen(corpus.bundle.files), true);
+    assert.equal(Object.isFrozen(corpus.sources), true);
+    assert.equal(Object.isFrozen(corpus.sources[0]), true);
+    assert.equal(Object.isFrozen(corpus.sources[0]?.binding), true);
+    assert.equal(Object.isFrozen(corpus.sources[0]?.events), true);
+    assert.equal(Object.isFrozen(corpus.sources[0]?.events[0]), true);
+    assert.equal(Object.isFrozen(corpus.queries), true);
+    assert.equal(Object.isFrozen(corpus.baseline), true);
+    assert.equal(Object.isFrozen(corpus.baseline.metrics), true);
+    assert.equal(Object.isFrozen(corpus.baseline.metrics.languageCounts), true);
+  });
+
+  it("rejects structurally valid source, judgments, baseline, and manifest hash tampering", () => {
+    const inputs = createValidSealedV2Inputs();
+    const sources = inputs.sourceEvents.sources as UnknownRecord[];
+    const primary = sources[0];
+    assert.ok(primary);
+    const events = primary.events as UnknownRecord[];
+    const firstEvent = events[0];
+    assert.ok(firstEvent);
+    const payload = firstEvent.payload as UnknownRecord;
+    const changedSourceEvents = {
+      ...inputs.sourceEvents,
+      sources: [{
+        ...primary,
+        events: [{
+          ...firstEvent,
+          payload: { ...payload, summary: "Changed but structurally valid synthetic source" },
+        }],
+      }],
+    };
+    const queries = inputs.judgments.queries as UnknownRecord[];
+    const firstQuery = queries[0];
+    assert.ok(firstQuery);
+    const changedJudgments = {
+      ...inputs.judgments,
+      queries: [{
+        ...firstQuery,
+        eligibleScope: {
+          ...(firstQuery.eligibleScope as UnknownRecord),
+          deadlineMs: 2_000,
+        },
+      }],
+    };
+    const changedBaseline = {
+      ...inputs.baseline,
+      v1Version: "retrieval-evaluation-v1-shadow-changed",
+    };
+    const files = inputs.manifest.files as UnknownRecord;
+    const changedManifest = {
+      ...inputs.manifest,
+      files: { ...files, "source-events.json": "0".repeat(64) },
+    };
+    const mutations = [
+      [inputs.manifest, changedSourceEvents, inputs.judgments, inputs.baseline],
+      [inputs.manifest, inputs.sourceEvents, changedJudgments, inputs.baseline],
+      [inputs.manifest, inputs.sourceEvents, inputs.judgments, changedBaseline],
+      [changedManifest, inputs.sourceEvents, inputs.judgments, inputs.baseline],
+    ] as const;
+
+    for (const [manifestValue, sourceValue, judgmentsValue, baselineValue] of mutations) {
+      assertCorpusInvalid(() => parseSealedRetrievalEvaluationBundle(
+        manifestValue,
+        sourceValue,
+        judgmentsValue,
+        baselineValue,
+      ));
+    }
+  });
+
+  it("rejects unknown, accessor, inherited, symbolic, and non-enumerable data without invoking accessors", () => {
+    const inputs = createValidSealedV2Inputs();
+    assertCorpusInvalid(() => parseSealedRetrievalEvaluationBundle(
+      { ...inputs.manifest, unexpected: true },
+      inputs.sourceEvents,
+      inputs.judgments,
+      inputs.baseline,
+    ));
+
+    let accessorInvoked = false;
+    const accessorManifest = { ...inputs.manifest };
+    Object.defineProperty(accessorManifest, "files", {
+      enumerable: true,
+      get() {
+        accessorInvoked = true;
+        return inputs.manifest.files;
+      },
+    });
+    assertCorpusInvalid(() => parseSealedRetrievalEvaluationBundle(
+      accessorManifest,
+      inputs.sourceEvents,
+      inputs.judgments,
+      inputs.baseline,
+    ));
+    assert.equal(accessorInvoked, false);
+
+    const sources = inputs.sourceEvents.sources as UnknownRecord[];
+    const primary = sources[0];
+    assert.ok(primary);
+    const firstEvent = (primary.events as UnknownRecord[])[0];
+    assert.ok(firstEvent);
+
+    const accessorEvent = { ...firstEvent };
+    delete accessorEvent.eventId;
+    Object.defineProperty(accessorEvent, "eventId", {
+      enumerable: true,
+      get() {
+        accessorInvoked = true;
+        return firstEvent.eventId;
+      },
+    });
+    const accessorSource = {
+      ...inputs.sourceEvents,
+      sources: [{ ...primary, events: [accessorEvent] }],
+    };
+    assertCorpusInvalid(() => parseSealedRetrievalEvaluationBundle(
+      inputs.manifest,
+      accessorSource,
+      inputs.judgments,
+      inputs.baseline,
+    ));
+    assert.equal(accessorInvoked, false);
+
+    const inheritedEvent = Object.assign(
+      Object.create({ inherited: true }) as UnknownRecord,
+      firstEvent,
+    );
+    const inheritedSource = {
+      ...inputs.sourceEvents,
+      sources: [{ ...primary, events: [inheritedEvent] }],
+    };
+    assertCorpusInvalid(() => parseSealedRetrievalEvaluationBundle(
+      inputs.manifest,
+      inheritedSource,
+      inputs.judgments,
+      inputs.baseline,
+    ));
+
+    const symbolEvent = { ...firstEvent };
+    Object.defineProperty(symbolEvent, Symbol("hidden"), { enumerable: true, value: "hidden" });
+    const symbolSource = {
+      ...inputs.sourceEvents,
+      sources: [{ ...primary, events: [symbolEvent] }],
+    };
+    assertCorpusInvalid(() => parseSealedRetrievalEvaluationBundle(
+      inputs.manifest,
+      symbolSource,
+      inputs.judgments,
+      inputs.baseline,
+    ));
+
+    const nonEnumerableEvent = { ...firstEvent };
+    Object.defineProperty(nonEnumerableEvent, "hidden", { enumerable: false, value: "hidden" });
+    const nonEnumerableSource = {
+      ...inputs.sourceEvents,
+      sources: [{ ...primary, events: [nonEnumerableEvent] }],
+    };
+    assertCorpusInvalid(() => parseSealedRetrievalEvaluationBundle(
+      inputs.manifest,
+      nonEnumerableSource,
+      inputs.judgments,
+      inputs.baseline,
+    ));
+  });
+
+  it("rejects NFKC-unstable, malformed-hash, and credential-bearing data", () => {
+    const inputs = createValidSealedV2Inputs();
+    const sources = inputs.sourceEvents.sources as UnknownRecord[];
+    const primary = sources[0];
+    assert.ok(primary);
+    const firstEvent = (primary.events as UnknownRecord[])[0];
+    assert.ok(firstEvent);
+    const payload = firstEvent.payload as UnknownRecord;
+    for (const summary of ["ＮＦＫＣ unstable", "Bearer synthetic-secret"]) {
+      const changedSource = {
+        ...inputs.sourceEvents,
+        sources: [{
+          ...primary,
+          events: [{ ...firstEvent, payload: { ...payload, summary } }],
+        }],
+      };
+      const resealed = sealV2Artifacts(changedSource, inputs.judgments, inputs.baseline);
+      assertCorpusInvalid(() => parseSealedInputs(resealed));
+    }
+
+    const files = inputs.manifest.files as UnknownRecord;
+    assertCorpusInvalid(() => parseSealedRetrievalEvaluationBundle(
+      {
+        ...inputs.manifest,
+        files: { ...files, "judgments.json": "not-a-lowercase-sha256" },
+      },
+      inputs.sourceEvents,
+      inputs.judgments,
+      inputs.baseline,
+    ));
+  });
+
+  it("rejects duplicate source bindings, event IDs, and idempotency keys across the bundle", () => {
+    const inputs = createValidSealedV2Inputs();
+    const sources = inputs.sourceEvents.sources as UnknownRecord[];
+    const primary = sources[0];
+    assert.ok(primary);
+    const firstEvent = (primary.events as UnknownRecord[])[0];
+    assert.ok(firstEvent);
+
+    const duplicateCases = [
+      { ...firstEvent, idempotencyKey: "eval-source-command-0002" },
+      {
+        ...firstEvent,
+        eventId: "20000000-0000-4000-8000-000000000002",
+      },
+    ];
+    for (const duplicate of duplicateCases) {
+      const changedSource = {
+        ...inputs.sourceEvents,
+        sources: [{ ...primary, events: [firstEvent, duplicate] }],
+      };
+      const resealed = sealV2Artifacts(changedSource, inputs.judgments, inputs.baseline);
+      assertCorpusInvalid(() => parseSealedInputs(resealed));
+    }
+
+    const distinctEvent = {
+      ...firstEvent,
+      eventId: "20000000-0000-4000-8000-000000000002",
+      idempotencyKey: "eval-source-command-0002",
+    };
+    const duplicateBindingSource = {
+      ...inputs.sourceEvents,
+      sources: [primary, { ...primary, events: [distinctEvent] }],
+    };
+    const resealed = sealV2Artifacts(
+      duplicateBindingSource,
+      inputs.judgments,
+      inputs.baseline,
+    );
+    assertCorpusInvalid(() => parseSealedInputs(resealed));
+  });
+
+  it("rejects duplicate query IDs and duplicate query text after all bundle hashes are resealed", () => {
+    const inputs = createValidSealedV2Inputs();
+    const first = (inputs.judgments.queries as UnknownRecord[])[0];
+    assert.ok(first);
+    const duplicateId = withSecondQuery(inputs, {
+      queryId: first.queryId,
+      queryText: "Find a unique second synthetic identifier",
+    });
+    const duplicateText = withSecondQuery(inputs, { queryText: first.queryText });
+
+    assertCorpusInvalid(() => parseSealedInputs(duplicateId));
+    assertCorpusInvalid(() => parseSealedInputs(duplicateText));
+  });
+
+  it("rejects a non-V1 or count-divergent frozen shadow baseline", () => {
+    const inputs = createValidSealedV2Inputs();
+    const metrics = inputs.baseline.metrics as UnknownRecord;
+    for (const changedMetrics of [
+      { ...metrics, corpusVersion: "retrieval-evaluation-v2" },
+      { ...metrics, queryCount: 2 },
+    ]) {
+      const changedBaseline = { ...inputs.baseline, metrics: changedMetrics };
+      const resealed = sealV2Artifacts(
+        inputs.sourceEvents,
+        inputs.judgments,
+        changedBaseline,
+      );
+      assertCorpusInvalid(() => parseSealedInputs(resealed));
+    }
+  });
+
+  it("rejects negative-zero metrics that compact JSON would collapse to zero", () => {
+    const inputs = createValidSealedV2Inputs();
+    const metrics = inputs.baseline.metrics as UnknownRecord;
+    const changedBaseline = {
+      ...inputs.baseline,
+      metrics: { ...metrics, staleActiveMemoryRate: -0 },
+    };
+    const resealed = sealV2Artifacts(
+      inputs.sourceEvents,
+      inputs.judgments,
+      changedBaseline,
+    );
+
+    assertCorpusInvalid(() => parseSealedInputs(resealed));
+  });
+});
 
 function readCorpus(): RetrievalEvaluationCorpusV1 {
   return parseRetrievalEvaluationCorpus(
