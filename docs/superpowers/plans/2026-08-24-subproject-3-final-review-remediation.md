@@ -891,91 +891,748 @@ git commit -m "docs: correct Task 6 release evidence"
 Do not commit code outside the three Task 6 implementation commits without a
 new scoped plan step and review.
 
-### Task 7: Replace answer-driven evaluation with a sealed real harness
+### Task 7: Implement the sealed real Version 2 retrieval evaluator
+
+**Approved design:** `docs/superpowers/specs/2026-08-28-task-7-sealed-real-evaluation-design.md`
+
+**Goal:** Replace the answer-driven integration evaluation with a sealed,
+reproducible black-box measurement of authenticated synthetic events through a
+real Version 2 projection, evaluator lease, Version 2 candidate adapter, and
+`InternalRetrievalService`.
+
+**Architecture:** `evaluation.ts` owns strict, cross-platform canonical parsing
+of the four-artifact bundle and its aggregate metric contract. The test owns a
+test-only bridge from `InternalRetrievalService`'s current Version 1-shaped
+`ProjectionLeaseProvider` seam to the real V2 evaluator lease: its manifest
+view exists only so the service can perform its existing scope/position check;
+the candidate repository receives the original `V2ProjectionReaderLease` and
+never opens a Version 1 database, uses a pathname, or participates in runtime
+routing. This avoids changing the public Version 1 contract while testing the
+actual V2 builder, verified detached image, and V2 adapter.
+
+**Files and responsibilities:**
+
+- Modify: `src/orchestrator/retrieval/evaluation.ts` — parse the sealed V2
+  bundle, validate canonical hashes and the frozen baseline, issue only
+  vector-disabled requests, score V2 reports, and enforce thresholds/baseline.
+- Modify: `tests/retrieval-evaluation.test.ts` — replace answer-derived
+  integration fixtures with an authenticated SQLite source, real V2
+  coordinator/lease/adapter harness, parser tests, and metric arithmetic tests.
+- Create: `tests/fixtures/retrieval-evaluation/v2/source-events.json` — the
+  deterministic, authenticated synthetic input events including one excluded
+  cross-project near duplicate.
+- Create: `tests/fixtures/retrieval-evaluation/v2/judgments.json` — 500 or
+  more independently judged queries and their scope, citations, relevance, and
+  expected relations; it contains no candidate-answer mapping.
+- Create: `tests/fixtures/retrieval-evaluation/v2/v1-shadow-baseline.json` —
+  reviewed immutable aggregate metrics for this judgments hash.
+- Create: `tests/fixtures/retrieval-evaluation/v2/manifest.json` — the exact
+  V2 bundle version and SHA-256 values of the parsed canonical JSON artifacts.
+- Modify: `scripts/run-retrieval-evaluation.js` — admit only the compiled
+  sealed-evaluation target and emit aggregate report output.
+- Modify: `tests/ci-lifecycle-gates.test.ts` — reject restored answer maps,
+  evaluation vector opt-in, and any V2 production registration/import.
+- Modify: `docs/superpowers/plans/2026-08-24-subproject-3-final-review-remediation.md`
+  — check off Task 7 only after every command and review below has evidence.
+
+**Shared contracts to add before using them in later steps:**
+
+```ts
+export type RetrievalEvaluationCorpusVersion =
+  | "retrieval-evaluation-v1"
+  | "retrieval-evaluation-v2";
+
+export interface RetrievalEvaluationBundleV2 {
+  readonly schemaVersion: 2;
+  readonly corpusVersion: "retrieval-evaluation-v2";
+  readonly files: Readonly<Record<
+    "source-events.json" | "judgments.json" | "v1-shadow-baseline.json",
+    string
+  >>;
+}
+
+export interface FrozenV1ShadowBaseline {
+  readonly schemaVersion: 1;
+  readonly v1Version: string;
+  readonly judgmentsSha256: string;
+  readonly metrics: RetrievalEvaluationReport;
+  readonly provenanceCommand: string;
+}
+
+export interface SealedRetrievalEvaluationSourceV2 {
+  readonly binding: ProjectBinding;
+  readonly events: readonly Readonly<Record<string, unknown>>[];
+}
+
+export interface RetrievalEvaluationSourceEventsV2 {
+  readonly schemaVersion: 2;
+  readonly corpusVersion: "retrieval-evaluation-v2";
+  readonly sources: readonly SealedRetrievalEvaluationSourceV2[];
+}
+
+export interface RetrievalEvaluationJudgmentsV2 {
+  readonly schemaVersion: 2;
+  readonly corpusVersion: "retrieval-evaluation-v2";
+  readonly queries: readonly RetrievalEvaluationQueryV1[];
+}
+
+export interface SealedRetrievalEvaluationCorpusV2 {
+  readonly bundle: RetrievalEvaluationBundleV2;
+  readonly sources: readonly SealedRetrievalEvaluationSourceV2[];
+  readonly queries: readonly RetrievalEvaluationQueryV1[];
+  readonly baseline: FrozenV1ShadowBaseline;
+}
+
+export function parseSealedRetrievalEvaluationBundle(
+  manifest: unknown,
+  sourceEvents: unknown,
+  judgments: unknown,
+  baseline: unknown,
+): SealedRetrievalEvaluationCorpusV2;
+
+export function assertSealedEvaluationVectorDisabled(
+  vector: Readonly<{ readonly enabled: boolean }>,
+): asserts vector is Readonly<{ readonly enabled: false }>;
+
+export async function evaluateSealedRetrieval(
+  corpus: SealedRetrievalEvaluationCorpusV2,
+  service: RetrievalEvaluationService,
+): Promise<RetrievalEvaluationReport>;
+
+export async function evaluateRetrievalQueries(
+  queries: readonly RetrievalEvaluationQueryV1[],
+  corpusVersion: RetrievalEvaluationCorpusVersion,
+  service: RetrievalEvaluationService,
+): Promise<RetrievalEvaluationReport>;
+```
+
+`RetrievalEvaluationReport.corpusVersion` becomes
+`RetrievalEvaluationCorpusVersion`; it stays frozen and aggregate-only. Keep
+`RetrievalEvaluationCorpusError` as the existing zero-argument class, so every
+malformed, tampered, noncanonical, unsafe, or baseline-regressing bundle throws
+exactly `RETRIEVAL_EVALUATION_CORPUS_INVALID` without changing its public
+constructor.
+
+#### Task 7.1: Define and seal the four-artifact V2 contract
 
 **Files:**
-- Modify: `src/orchestrator/retrieval/evaluation.ts`
-- Modify: `tests/retrieval-evaluation.test.ts`
+
+- Modify: `src/orchestrator/retrieval/evaluation.ts:95-442`
+- Modify: `tests/retrieval-evaluation.test.ts:1-295`
 - Create: `tests/fixtures/retrieval-evaluation/v2/source-events.json`
 - Create: `tests/fixtures/retrieval-evaluation/v2/judgments.json`
 - Create: `tests/fixtures/retrieval-evaluation/v2/v1-shadow-baseline.json`
 - Create: `tests/fixtures/retrieval-evaluation/v2/manifest.json`
-- Modify: `scripts/run-retrieval-evaluation.js`
-- Test: `tests/ci-lifecycle-gates.test.ts`
 
-**Interfaces:**
+- [ ] **Step 1: Replace the V1-only fixture read helper with a V2 bundle read helper and write its failing parser tests.**
 
-```ts
-export interface RetrievalEvaluationBundleV2 {
-  readonly corpusVersion: "retrieval-evaluation-v2";
-  readonly files: Readonly<Record<"source-events.json" | "judgments.json" | "v1-shadow-baseline.json", string>>;
-}
-export interface FrozenV1ShadowBaseline {
-  readonly v1Version: string;
-  readonly corpusSha256: string;
-  readonly metrics: RetrievalEvaluationMetrics;
-  readonly provenanceCommand: string;
-}
-```
+  Import `parseSealedRetrievalEvaluationBundle` and define four `URL` values
+  under `tests/fixtures/retrieval-evaluation/v2/`. Parse the JSON values
+  separately; do not concatenate raw file bytes. Add this helper and the
+  following red tests before writing the parser:
 
-The harness seeds authoritative synthetic events, uses the actual projection
-reader/builder/coordinator/verified lease/candidate repository/service, and
-never maps a query ID or text to an answer. Vectors are disabled for all 500+
-requests.
+  ```ts
+  function readSealedBundle(): SealedRetrievalEvaluationCorpusV2 {
+    return parseSealedRetrievalEvaluationBundle(
+      JSON.parse(readFileSync(MANIFEST_URL, "utf8")) as unknown,
+      JSON.parse(readFileSync(SOURCE_EVENTS_URL, "utf8")) as unknown,
+      JSON.parse(readFileSync(JUDGMENTS_URL, "utf8")) as unknown,
+      JSON.parse(readFileSync(BASELINE_URL, "utf8")) as unknown,
+    );
+  }
 
-- [ ] **Step 1: Write bundle and black-box red tests**
+  it("accepts only a sealed canonical V2 bundle", () => {
+    const corpus = readSealedBundle();
+    assert.equal(corpus.bundle.schemaVersion, 2);
+    assert.equal(corpus.bundle.corpusVersion, "retrieval-evaluation-v2");
+    assert.equal(corpus.sources.length, 2);
+    assert.equal(corpus.sources.flatMap((source) => source.events).length, 505);
+    assert.equal(corpus.queries.length, 504);
+    assert.equal(corpus.baseline.judgmentsSha256, canonicalSha256(corpus.queries));
+    assert.equal(Object.isFrozen(corpus), true);
+  });
 
-```ts
-it("builds sealed source events then measures real retrieval", async () => {
-  const harness = await createSealedEvaluationHarness(bundle);
-  const report = await runEvaluation(harness.service, bundle.judgments);
-  assert.equal(report.crossProjectContamination, 0);
-  assert.ok(report.recallAt10 >= bundle.baseline.metrics.recallAt10);
-});
-it("rejects a changed corpus, baseline, or enabled vector channel", () => {
-  assert.throws(() => loadBundle(tamperedManifest), /RETRIEVAL_EVALUATION_CORPUS_INVALID/);
-});
-```
+  it("rejects each sealed artifact when its canonical JSON or declared hash changes", () => {
+    const manifest = readJson(MANIFEST_URL);
+    const events = readJson(SOURCE_EVENTS_URL) as {
+      readonly sources: readonly { readonly binding: unknown; readonly events: readonly unknown[] }[];
+    };
+    const judgments = readJson(JUDGMENTS_URL);
+    const baseline = readJson(BASELINE_URL);
+    const [primary, competing] = events.sources;
+    assert.ok(primary);
+    assert.ok(competing);
+    const mutations = [
+      [manifest, {
+        ...events,
+        sources: [{ ...primary, events: [...primary.events, primary.events[0]] }, competing],
+      }, judgments, baseline],
+      [manifest, events, { ...judgments, queries: judgments.queries.slice(1) }, baseline],
+      [manifest, events, judgments, { ...baseline, judgmentsSha256: "0".repeat(64) }],
+      [{ ...manifest, files: { ...manifest.files, "judgments.json": "0".repeat(64) } }, events, judgments, baseline],
+    ] as const;
+    for (const [changedManifest, changedEvents, changedJudgments, changedBaseline] of mutations) {
+      assert.throws(
+        () => parseSealedRetrievalEvaluationBundle(
+          changedManifest,
+          changedEvents,
+          changedJudgments,
+          changedBaseline,
+        ),
+        /RETRIEVAL_EVALUATION_CORPUS_INVALID/,
+      );
+    }
+  });
+  ```
 
-Require 500+ judged queries and 50+ in every critical class. Source events must
-actually produce the tested relations and a cross-project near duplicate.
+  Make each mutation actually selected inside the loop by passing its returned
+  artifact in the relevant parser argument. Also cover: an extra own field,
+  an accessor property, NFKC-unstable text, duplicate `eventId`, duplicate
+  `queryId`, duplicate query text, a raw-evidence/credential-bearing string,
+  a non-64-character hash, and a V1 baseline whose `metrics.corpusVersion` is
+  not `"retrieval-evaluation-v1"`. Each must throw the existing corpus error
+  without invoking an accessor.
 
-- [ ] **Step 2: Run red**
 
-Run: `npm run test:retrieval-evaluation`
+- [ ] **Step 2: Add the four deterministic JSON artifacts in their final schema.**
 
-Expected: FAIL because the current test creates a candidate from the answer key.
+  Commit a static `source-events.json` exact-key object with
+  `schemaVersion: 2`, `corpusVersion: "retrieval-evaluation-v2"`, and two
+  `sources` records. Each source record has exact keys `binding` and `events`;
+  each event array has its own ascending contiguous event positions and
+  authenticated hash chain. This separation is required because
+  `SqliteProjectionEventReader` fails closed when a single project store
+  contains another project's event. The primary source contains exactly 504
+  events and the competing source contains exactly one event, for 505 static
+  events in total.
 
-- [ ] **Step 3: Implement sealed build-to-query evaluation**
+  Every event has the exact stored-event field set used by
+  `decodeProjectionEvent` — including `globalPosition` and `streamVersion` as
+  decimal strings, canonical `payloadJson`, `payloadHash`,
+  `previousGlobalHash`, and `eventHash` — and no empty text field. The test's
+  `hydrateStoredEvent` recomputes payload and chain hashes from the static
+  record and asserts equality before inserting each row in its source's
+  authenticated SQLite event store. The primary source starts a session at
+  position 1, records a valid `SessionCheckpointRecorded` at position 2, and
+  contains `MemorySourceRecorded` schema-2 events for the remaining source
+  facts. This is intentionally Version-1-decodable as well as Version-2
+  decodable so the frozen V1 shadow can be reproduced from the same primary
+  event stream without changing V1 code.
 
-```ts
-const bundle = parseSealedBundle(readJson(manifestPath));
-verifyBundleHashes(bundle, fixtureDirectory);
-const coordinator = await buildRealProjectionFromAuthoritativeEvents(bundle.sourceEvents);
-const service = new InternalRetrievalService({
-  projections: realProjectionProvider(coordinator),
-  candidates: new SqliteRetrievalCandidateRepository(),
-});
-```
+  Allocate 56 judged primary-project relations to each of the nine existing
+  critical classes for 504 total queries: 18 English, 19 Thai, and 19 mixed per
+  class. The checkpoint's task summary, `next-action` work items, open
+  follow-ups, and file/artifact rows materialize the session-continuity,
+  next-action, follow-up, and code-artifact relations. The schema-2 memory
+  events materialize identifiers, semantic paraphrases, conflicts,
+  stale/superseded transitions, and valid-time boundaries. The sole competing
+  source event has a distinct project binding but the same normalized key and
+  summary as one selected primary event. Build it in its own real V2
+  coordinator, then prove the primary binding's real V2 retrieval result
+  excludes it while the competing coordinator's own V2 query can retrieve it.
+  Judgments identify expected visible relations; they never synthesize result
+  objects.
 
-Fixture data contains synthetic identifiers only and exact SHA-256 hashes. Count
-contamination over every returned item before metric deduplication. Compare every
-V2 metric with absolute thresholds and the frozen V1 baseline. Unit fake
-services remain only for parser/metric arithmetic tests.
+  Commit `judgments.json` as the exact-key object
+  `{ "schemaVersion": 2, "corpusVersion": "retrieval-evaluation-v2", "queries": [...] }`.
+  Its static query IDs are `eval-v2-0001` through `eval-v2-0504`; every query
+  has all existing `RetrievalEvaluationQueryV1` fields, two distinct judge IDs
+  with matching reviewed relevance grades, positive cited items, and a source
+  item ID in `source-events.json`. It contains no map, answer, candidate,
+  expected-result, or query-text-to-item-id lookup field.
 
-- [ ] **Step 4: Verify**
+  Commit `v1-shadow-baseline.json` as the exact-key
+  `FrozenV1ShadowBaseline` object whose `v1Version` is
+  `"retrieval-evaluation-v1-shadow-2026-08-28"`, whose
+  `provenanceCommand` is `"npm run test:retrieval-evaluation"`, and whose
+  `metrics` is the full aggregate `RetrievalEvaluationReport` from the real
+  Version 1 shadow build of the exact primary event source and 504 parsed
+  judgments. Add the real-V1-shadow assertion in Task 7.2 before committing:
+  it must `deepEqual` the generated V1 aggregate report and the static baseline
+  metrics, and must confirm the static `judgmentsSha256` is
+  `canonicalSha256(parsedJudgments.queries)`. This makes every numeric value in
+  the committed baseline an independently reproducible V1 result, not a
+  fabricated threshold or a V2-derived value.
 
-Run: `npm run test:retrieval-evaluation && node --test --test-concurrency=1 dist-test/tests/ci-lifecycle-gates.test.js`
+  Commit `manifest.json` as the exact-key
+  `RetrievalEvaluationBundleV2` object. Its three `files` values are the
+  SHA-256 values of the three parsed, validated, compact-`JSON.stringify`
+  artifact objects; the parser recomputes all three values before evaluation.
+  The manifest does not contain hashes of raw checkout bytes. All four
+  artifacts contain only synthetic identifiers, fixed timestamps, and the
+  declared safe aggregate/provenance values.
 
-Expected: PASS with sealed report, 500+ queries, zero contamination, vectors
-disabled, and no baseline regression.
+- [ ] **Step 3: Run only the new parser test to prove the contract is absent.**
 
-- [ ] **Step 5: Commit**
+  Run: `npm run test:build && node --test --test-concurrency=1 dist-test/tests/retrieval-evaluation.test.js`
 
-```bash
-git add src/orchestrator/retrieval/evaluation.ts tests/retrieval-evaluation.test.ts tests/fixtures/retrieval-evaluation/v2 scripts/run-retrieval-evaluation.js tests/ci-lifecycle-gates.test.ts
-git commit -m "test: measure retrieval using sealed real projections"
-```
+  Expected: FAIL at TypeScript compilation because
+  `parseSealedRetrievalEvaluationBundle`, its types, and the V2 fixture reader
+  are absent. Do not continue if the test passes while the old
+  `createEvaluationService` query-to-answer map still drives integration
+  metrics.
+
+- [ ] **Step 4: Implement strict V2 parsing and canonical hashing in `evaluation.ts`.**
+
+  Keep the existing exact-own-property helpers and extend them with these
+  concrete rules:
+
+  ```ts
+  function canonicalSha256(value: unknown): string {
+    return createHash("sha256").update(JSON.stringify(value), "utf8").digest("hex");
+  }
+
+  export function parseSealedRetrievalEvaluationBundle(
+    manifestValue: unknown,
+    sourceValue: unknown,
+    judgmentsValue: unknown,
+    baselineValue: unknown,
+  ): SealedRetrievalEvaluationCorpusV2 {
+    const bundle = parseBundleManifest(manifestValue);
+    const sourceArtifact = parseSourceEventsV2(sourceValue);
+    const judgmentsArtifact = parseJudgmentsV2(judgmentsValue);
+    const baseline = parseFrozenV1ShadowBaseline(baselineValue, judgmentsArtifact.queries);
+    if (
+      bundle.files["source-events.json"] !== canonicalSha256(sourceArtifact)
+      || bundle.files["judgments.json"] !== canonicalSha256(judgmentsArtifact)
+      || bundle.files["v1-shadow-baseline.json"] !== canonicalSha256(baseline)
+    ) return invalid();
+    return Object.freeze({
+      bundle,
+      sources: sourceArtifact.sources,
+      queries: judgmentsArtifact.queries,
+      baseline,
+    });
+  }
+  ```
+
+  `parseSourceEventsV2` returns a frozen
+  `RetrievalEvaluationSourceEventsV2` object and validates the exact top-level
+  `sources` wrapper, two distinct source bindings, and a separate ascending
+  contiguous event chain in each source. It rejects duplicate event
+  IDs/idempotency keys across the whole bundle, exact stored-event key
+  violations, unsafe NFKC text, secret-bearing text, and payload/binding
+  mismatch. `parseJudgmentsV2` returns a frozen
+  `RetrievalEvaluationJudgmentsV2` object and reuses strict query parsing after
+  changing its expected prefix to `eval-v2-`; it validates exact V2 wrapper
+  keys and coverage. `parseFrozenV1ShadowBaseline` validates the complete
+  aggregate report shape, requires a V1 `corpusVersion`, checks its counts
+  against `queries`, and compares `judgmentsSha256` to the canonical hash of
+  the parsed `queries` array. Return defensively frozen arrays, records, and
+  nested values. Import `createHash` from `node:crypto`; do not calculate a
+  hash from source bytes or mutate a fixture object.
+
+- [ ] **Step 5: Re-run the parser tests and freeze the contract commit.**
+
+  Run: `npm run test:build && node --test --test-concurrency=1 --test-reporter=spec dist-test/tests/retrieval-evaluation.test.js`
+
+  Expected: the V2 parser/fixture tests pass; old V1 parser arithmetic tests
+  may remain only if they are explicitly isolated from an answer-derived
+  integration service.
+
+  ```bash
+  git add src/orchestrator/retrieval/evaluation.ts tests/retrieval-evaluation.test.ts tests/fixtures/retrieval-evaluation/v2
+  git commit -m "test: seal the V2 retrieval evaluation corpus"
+  ```
+
+#### Task 7.2: Build the real V2 evaluator harness and remove answer-derived integration results
+
+**Files:**
+
+- Modify: `tests/retrieval-evaluation.test.ts:1-420`
+- Modify: `src/orchestrator/retrieval/evaluation.ts:365-520`
+
+- [ ] **Step 1: Write the failing real-harness test before deleting the answer map.**
+
+  Add the test below. Define `createRealV2EvaluationHarness` in this test file,
+  not production runtime code.
+
+  ```ts
+  it("builds authenticated source events into a real V2 evaluator lease and scores only real V2 results", async () => {
+    const corpus = readSealedBundle();
+    const harness = await createRealV2EvaluationHarness(corpus);
+    const report = await evaluateSealedRetrieval(corpus, harness.service);
+
+    assert.equal(harness.sourceEventCount, corpus.sources.flatMap((source) => source.events).length);
+    assert.equal(harness.v2LeaseCount, corpus.queries.length);
+    assert.equal(harness.v1RepositoryCalls, 0);
+    assert.equal(report.corpusVersion, "retrieval-evaluation-v2");
+    assert.equal(report.queryCount, corpus.queries.length);
+    assert.equal(report.failedQueryCount, 0);
+    assert.equal(report.crossProjectContamination, 0);
+    assert.equal(Object.isFrozen(report), true);
+    assert.doesNotMatch(JSON.stringify(report), /queryText|expectedCitations|relevanceGrades|projectId|databasePath/);
+  });
+  ```
+
+  Add a test that opens the evaluator lease from the coordinator, swaps the
+  published database pathname for another V2 image, and still gets the
+  original result through `V2SqliteRetrievalCandidateRepository`. This is the
+  evaluation-specific proof that retrieval reads the verified detached image,
+  not the published path.
+
+- [ ] **Step 2: Run the focused test and record the expected red failure.**
+
+  Run: `npm run test:build && node --test --test-concurrency=1 --test-name-pattern="builds authenticated source events" dist-test/tests/retrieval-evaluation.test.js`
+
+  Expected: FAIL because the current `createEvaluationService` builds results
+  from `Map<queryText, query>` and no V2 source/lease/candidate harness exists.
+
+- [ ] **Step 3: Build the harness with actual source authentication, V2 projection publication, and the V2 candidate adapter.**
+
+  In `tests/retrieval-evaluation.test.ts`, use `DatabaseSync`,
+  `NodeSqliteDriver`, `SqliteProjectionEventReader`,
+  `ImmutableProjectionBuilder`, `DefaultProjectionBuildCoordinator`,
+  `V2ProjectionBuildCoordinator`, `SqliteRetrievalCandidateRepository`,
+  `V2SqliteRetrievalCandidateRepository`, `canonicalJson`, `payloadHash`, and
+  `eventHash`. Hydrate each sealed source record, write it to one canonical
+  event-store SQLite database per source binding, recompute/check its payload
+  and chain hashes, and open it through `SqliteProjectionEventReader`. Never
+  feed a hand-made `ProjectionEventSnapshot` directly to either evaluator.
+
+  Use this test-only adapter shape, preserving the original V2 lease in a
+  private test-only property:
+
+  ```ts
+  interface EvaluationLeaseView extends ProjectionReaderLease {
+    readonly evaluatorLease: V2ProjectionReaderLease;
+  }
+
+  function serviceManifestView(manifest: ProjectionManifestV2): ProjectionManifestV1 {
+    return Object.freeze({
+      schemaVersion: 1,
+      projectId: manifest.projectId,
+      vaultId: manifest.vaultId,
+      storeId: manifest.storeId,
+      workspaceId: manifest.workspaceId,
+      branchScopeId: manifest.branchScopeId,
+      branchRef: manifest.branchRef,
+      sessionId: null,
+      generation: manifest.generation,
+      terminalEventPosition: manifest.terminalEventPosition,
+      terminalEventHash: manifest.terminalEventHash,
+      databaseFile: "v2-evaluation-lease.sqlite",
+      databaseSha256: manifest.databaseSha256,
+      coreChecksums: Object.freeze({
+        sessionTree: manifest.coreChecksums.sessionTree,
+        canonicalItems: manifest.coreChecksums.canonicalItems,
+        tasksFollowups: manifest.coreChecksums.tasksFollowups,
+        artifactsFiles: manifest.coreChecksums.artifactsFiles,
+        entityGraph: manifest.coreChecksums.entityGraph,
+        lexicalChunks: manifest.coreChecksums.lexicalChunks,
+        retrievalFeedback: manifest.coreChecksums.retrievalFeedback,
+      }),
+      createdAt: manifest.createdAt,
+    });
+  }
+
+  const projections: ProjectionLeaseProvider = {
+    async pin(binding, consistency): Promise<EvaluationLeaseView> {
+      await coordinator.ensurePublished(binding, consistency.requiredEventPosition, consistency.deadlineMs);
+      const evaluatorLease = await coordinator.leasePublishedForEvaluation(binding);
+      return Object.freeze({
+        manifest: serviceManifestView(evaluatorLease.manifest),
+        databasePath: "v2-evaluation-lease.sqlite",
+        evaluatorLease,
+        close: () => evaluatorLease.close(),
+      });
+    },
+  };
+
+  const candidates: RetrievalCandidateRepository = {
+    collectEligible(lease, request) {
+      const view = lease as EvaluationLeaseView;
+      return new V2SqliteRetrievalCandidateRepository().collectEligible(view.evaluatorLease, request);
+    },
+  };
+
+  const service = new InternalRetrievalService({ projections, candidates });
+  ```
+
+  The manifest view is only metadata for the already-existing service scope and
+  event-position verification. Assert in the test that no V1 candidate
+  repository is instantiated, `databasePath` is never read by `candidates`,
+  and the V2 adapter receives the `V2ProjectionReaderLease` returned by
+  `leasePublishedForEvaluation`. Do not import this bridge outside this test
+  file; do not modify `InternalProjectionRuntime`, `service.ts`, V1 lease
+  interfaces, or V1 candidate code.
+
+  Build the primary source a second time with the actual legacy coordinator and
+  legacy candidate repository solely to reproduce the immutable baseline; it
+  is not used by the V2 harness or V2 acceptance path:
+
+  ```ts
+  const v1Coordinator = new DefaultProjectionBuildCoordinator({
+    projectionDirectory: join(root, "v1-projections"),
+    eventReader: primaryEventReader,
+    builder: new ImmutableProjectionBuilder({ driver, projectionDirectory: join(root, "v1-projections"), now: () => NOW }),
+    now: () => 0,
+  });
+  await v1Coordinator.ensurePublished(PRIMARY_BINDING, 504n, 15_000);
+  const v1Service = new InternalRetrievalService({
+    projections: {
+      async pin(binding, consistency) {
+        await v1Coordinator.ensurePublished(binding, consistency.requiredEventPosition, consistency.deadlineMs);
+        return v1Coordinator.leasePublished(binding);
+      },
+    },
+    candidates: new SqliteRetrievalCandidateRepository(),
+  });
+  const v1Report = await evaluateRetrievalQueries(
+    corpus.queries,
+    "retrieval-evaluation-v1",
+    v1Service,
+  );
+  assert.deepEqual(v1Report, corpus.baseline.metrics);
+  ```
+
+  The primary event stream remains V1-decodable: `SessionStarted` is ignored
+  by the legacy decoder, the checkpoint populates legacy checkpoints,
+  follow-ups, next actions, and artifacts, and schema-2 memory events populate
+  canonical/temporal/conflict rows. Build the competing source only with its
+  own V2 coordinator; no primary reader may open a store containing its event.
+
+  Delete `createEvaluationService`, `channelFor`, `kindFor`, and `itemFor`
+  from the integration path. A small synthetic retrieval service is permitted
+  only in the two metric-arithmetic tests that prove macro averaging and
+  duplicate-id behavior; its fixture must be declared adjacent to those tests
+  and must not read the V2 bundle or emit the release report.
+
+- [ ] **Step 4: Extend V2 scoring so requests are vector-disabled and reports compare to the frozen baseline.**
+
+  In `evaluation.ts`, have `evaluateRetrievalQueries` perform the common metric
+  accumulation for already parsed judgments and have `evaluateRetrieval` call
+  it after V1 parsing. `evaluateSealedRetrieval` calls it with the V2 corpus
+  version before running V2 acceptance. Change `requestFor` to build this exact
+  option and reject
+  any other option before `service.retrieve` is reached:
+
+  ```ts
+  const vector = Object.freeze({ enabled: false as const });
+  assertSealedEvaluationVectorDisabled(vector);
+  return Object.freeze({
+    binding,
+    query: query.queryText,
+    limit: 10,
+    tokenBudget: 32_768,
+    candidateLimit: 512,
+    explain: false,
+    includeGlobal: false,
+    visibility: scope.visibility,
+    vector,
+    consistency: Object.freeze({
+      requiredEventPosition: BigInt(scope.requiredEventPosition),
+      deadlineMs: scope.deadlineMs,
+    }),
+    ...(scope.sessionId === null ? {} : { sessionId: scope.sessionId }),
+    ...(scope.validAt === null ? {} : { validAt: scope.validAt }),
+    ...(scope.knownAt === null ? {} : { knownAt: BigInt(scope.knownAt) }),
+  });
+  ```
+
+  `assertSealedEvaluationVectorDisabled` throws `RetrievalEvaluationCorpusError`
+  when `enabled !== false`. `evaluateSealedRetrieval` parses the bundle again,
+  invokes the existing outcome logic for its V2 queries, sets
+  `corpusVersion: "retrieval-evaluation-v2"`, then calls
+  `assertV2Acceptance(report, baseline)`. That helper must require exactly:
+
+  ```ts
+  report.failedQueryCount === 0
+  report.crossProjectContamination === 0
+  report.recallAt10 >= 0.95
+  report.mrr >= 0.90
+  report.ndcgAt10 >= 0.90
+  report.citationPrecision >= 0.95
+  report.citationRecall >= 0.95
+  report.staleActiveMemoryRate <= 0.01
+  report.exactIdentifierPathRecall === 1
+  report.currentSessionCheckpointRecallAt10 === 1
+  report.openFollowUpRecallAt10 === 1
+  report.nextActionRecallAt10 === 1
+  report.semanticParaphraseRecallAt10 >= 0.90
+  report.bitemporalAccuracy >= 0.95
+  report.conflictRecall === 1
+  report.conflictPrecision === 1
+  report.unsupportedHighImpactVerifiedClaims === 0
+  ```
+
+  Compare all higher-is-better numeric metrics with `>= baseline.metrics`; for
+  `staleActiveMemoryRate` and `unsupportedHighImpactVerifiedClaims`, compare
+  with `<= baseline.metrics`. Compare counts only for the specified zero
+  acceptance rules and corpus coverage. A failed comparison throws
+  `RETRIEVAL_EVALUATION_CORPUS_INVALID` and never updates the baseline.
+
+- [ ] **Step 5: Add the adversarial real-path tests and run the harness to green.**
+
+  Add these exact assertions:
+
+  ```ts
+  it("rejects an enabled vector before the V2 lease provider is called", () => {
+    let pins = 0;
+    const service = new InternalRetrievalService({
+      projections: { async pin() { pins += 1; throw new Error("must not pin"); } },
+      candidates: { collectEligible() { throw new Error("must not collect"); } },
+    });
+    assert.throws(() => assertSealedEvaluationVectorDisabled({ enabled: true }), /RETRIEVAL_EVALUATION_CORPUS_INVALID/);
+    assert.equal(pins, 0);
+    void service;
+  });
+
+  it("counts injected cross-project output before duplicate-item metric collapsing", async () => {
+    const corpus = readSealedBundle();
+    const harness = await createRealV2EvaluationHarness(corpus);
+    const contaminated = withInjectedCrossProjectResult(harness.service, corpus.queries[0]!);
+    const report = await evaluateSealedRetrievalUnchecked(corpus, contaminated);
+    assert.equal(report.crossProjectContamination, 1);
+  });
+  ```
+
+  `evaluateSealedRetrievalUnchecked` is a test-only call to the existing metric
+  accumulator before acceptance comparison; it must not be exported. Add a
+  separate test proving that the real source contains the near duplicate but
+  the unwrapped real V2 service returns none for it. Run:
+
+  `npm run test:retrieval-evaluation`
+
+  Expected: PASS with one aggregate-only V2 report, at least 500 requests,
+  zero unwrapped contamination, all absolute thresholds, and no frozen
+  baseline regression.
+
+- [ ] **Step 6: Commit the real evaluator conversion.**
+
+  ```bash
+  git add src/orchestrator/retrieval/evaluation.ts tests/retrieval-evaluation.test.ts
+  git commit -m "test: evaluate retrieval through sealed V2 projections"
+  ```
+
+#### Task 7.3: Lock the runner and CI against evaluation or production-routing shortcuts
+
+**Files:**
+
+- Modify: `scripts/run-retrieval-evaluation.js:1-42`
+- Modify: `tests/ci-lifecycle-gates.test.ts:1-470`
+- Modify: `tests/retrieval-evaluation.test.ts:1-460`
+
+- [ ] **Step 1: Write failing runner and source-structure guard tests.**
+
+  Add a `ci-lifecycle-gates` test that reads the normalized sources and rejects
+  all of the following:
+
+  ```ts
+  const evaluationTest = source("tests/retrieval-evaluation.test.ts");
+  assert.doesNotMatch(evaluationTest, /new Map\(corpus\.queries\.map\(\(query\) => \[/);
+  assert.doesNotMatch(evaluationTest, /byText\.get\(request\.query\)/);
+  assert.doesNotMatch(evaluationTest, /function (?:itemFor|channelFor|kindFor)\(/);
+  assert.match(evaluationTest, /new V2ProjectionBuildCoordinator\(/);
+  assert.match(evaluationTest, /leasePublishedForEvaluation\(/);
+  assert.match(evaluationTest, /new V2SqliteRetrievalCandidateRepository\(/);
+  assert.match(evaluationTest, /new InternalRetrievalService\(/);
+  assert.match(evaluationTest, /vector:\s*Object\.freeze\(\{ enabled: false/);
+  ```
+
+  Add source checks that V2 imports remain absent from
+  `src/orchestrator/runtime/projection-runtime.ts`, all protected Version 1
+  paths, `src/app.ts`, `src/index.ts`, controllers, schemas, and services;
+  assert no `memory_retrieval*`/`memory_projection*` production tool is
+  registered. Finally, invoke `scripts/run-retrieval-evaluation.js` with a
+  second compiled test path and assert it exits nonzero with
+  `RETRIEVAL_EVALUATION_TARGET_INVALID`.
+
+- [ ] **Step 2: Run the isolation guard red.**
+
+  Run: `npm run test:build && node --test --test-concurrency=1 --test-name-pattern="Subproject 3 evaluation" dist-test/tests/ci-lifecycle-gates.test.js`
+
+  Expected: FAIL until the guard recognizes the sealed harness and the runner
+  verifies its exact compiled target.
+
+- [ ] **Step 3: Harden the runner and CI checks.**
+
+  Preserve its current exact resolved target comparison, then reject a missing
+  compiled file and require the V2 report marker emitted by the test:
+
+  ```js
+  if (requested !== evaluationTest || !existsSync(evaluationTest)) {
+    throw new Error("RETRIEVAL_EVALUATION_TARGET_INVALID");
+  }
+  const child = spawn(process.execPath, [
+    "--test", "--test-concurrency=1", "--test-reporter=spec", evaluationTest,
+  ], {
+    cwd: root,
+    shell: false,
+    stdio: "inherit",
+    env: { ...process.env, RETRIEVAL_EVALUATION_REPORT: "sealed-v2" },
+  });
+  ```
+
+  In the evaluation test, emit `JSON.stringify(report)` only when the env value
+  is exactly `"sealed-v2"`, and assert `report.corpusVersion` is V2 before
+  writing. The runner must not log source events, queries, baseline fixture
+  content, bindings, or paths. Add the structural checks from Step 1 to the
+  existing internal-only gate without relaxing its protected V1 diff check.
+
+- [ ] **Step 4: Run all focused Task 7 checks.**
+
+  Run: `npm run typecheck && npm run test:retrieval-evaluation && node --test --test-concurrency=1 --test-reporter=spec dist-test/tests/ci-lifecycle-gates.test.js`
+
+  Expected: PASS. The only permitted executable-test skip is the established
+  Windows `EPERM` symlink capability skip; any evaluator, source integrity,
+  baseline, vector, routing, or TypeScript failure blocks this task.
+
+- [ ] **Step 5: Commit the permanent shortcut guards.**
+
+  ```bash
+  git add scripts/run-retrieval-evaluation.js tests/retrieval-evaluation.test.ts tests/ci-lifecycle-gates.test.ts
+  git commit -m "test: guard sealed V2 retrieval evaluation"
+  ```
+
+#### Task 7.4: Evidence, full gates, and independent review
+
+**Files:**
+
+- Modify: `docs/superpowers/plans/2026-08-24-subproject-3-final-review-remediation.md`
+
+- [ ] **Step 1: Run the complete Subproject 3 gate from a clean working tree.**
+
+  Run: `npm run test:subproject-3`
+
+  Expected: exit 0; the runner prints exactly one aggregate V2 report, every
+  projection/retrieval/lifecycle gate passes, and no test other than the known
+  Windows symlink capability case is skipped.
+
+- [ ] **Step 2: Run the broader release verification.**
+
+  Run: `npm run check:runtime && npm run typecheck && npm run test:build && npm run test:build-artifacts && npm test`
+
+  Expected: exit 0 for every command. On the first failure, preserve its full
+  command/output, stop the completion claim, and remediate under a newly
+  approved scoped step if it falls outside Task 7's authorized files.
+
+- [ ] **Step 3: Complete independent specification and code-quality reviews.**
+
+  Review the final diff against the approved Task 7 design. Verify all nine
+  authorized scope paths only, no answer-derived integration behavior, real V2
+  evaluator lease/adapter use, no V2 runtime/tool/routing wiring, static
+  source-event/judgment/baseline hashes, aggregate-only output, the acceptance
+  inequalities, and immutable V1 baseline semantics. Fix review findings,
+  re-run the focused command plus the affected full command, and commit each
+  scoped correction separately.
+
+- [ ] **Step 4: Record evidence and mark the Task 7 checkboxes only after verified success.**
+
+  Record the exact Node version, OS, commit SHA, every command above, pass/fail
+  counts, permitted skip count, V2 aggregate report, protected-path diff
+  result, and review conclusions in the existing Task 7 section. Do not state
+  that V2 is production-ready: this task produces sealed pre-shadow evidence
+  only; Subprojects 4 and 5 retain the shadow, recovery, privacy, and routing
+  approval gates.
+
+  ```bash
+  git add docs/superpowers/plans/2026-08-24-subproject-3-final-review-remediation.md
+  git commit -m "docs: record Task 7 sealed evaluation evidence"
+  git status --short
+  ```
+
+  Expected: the final status output is empty.
 
 ### Task 8: Complete release gates and request final review
 
