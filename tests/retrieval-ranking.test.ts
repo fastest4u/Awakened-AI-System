@@ -210,6 +210,37 @@ describe("deterministic retrieval ranking", () => {
     assert.equal(Object.isFrozen(ranked), true);
   });
 
+  it("snapshots a stateful custom ranking once before validating its references", () => {
+    const fused = fuseCandidates([[
+      { id: "canonical:A", rank: 1, channel: "exact" as const },
+      { id: "canonical:B", rank: 2, channel: "exact" as const },
+    ]], DEFAULT_RANKING_POLICY);
+    const foreign = fuseCandidates([[
+      { id: "canonical:foreign", rank: 1, channel: "exact" as const },
+    ]], DEFAULT_RANKING_POLICY)[0];
+    let iterations = 0;
+    const statefulRanking = new Proxy([...fused], {
+      get(target, property, receiver) {
+        if (property === Symbol.iterator) {
+          return function* (): IterableIterator<typeof fused[number]> {
+            iterations += 1;
+            yield* iterations === 1
+              ? [fused[1], fused[0]]
+              : [foreign, fused[1]];
+          };
+        }
+        return Reflect.get(target, property, receiver);
+      },
+    });
+
+    const ranked = validateCustomRanking(statefulRanking, fused);
+
+    assert.equal(ranked[0], fused[1]);
+    assert.equal(ranked[1], fused[0]);
+    assert.equal(ranked.includes(foreign), false);
+    assert.equal(iterations, 1);
+  });
+
   it("rejects cloned, foreign, duplicate, and incomplete custom rankings", () => {
     const fused = fuseCandidates([[
       { id: "canonical:A", rank: 1, channel: "exact" as const },

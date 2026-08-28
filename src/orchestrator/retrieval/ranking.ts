@@ -609,11 +609,12 @@ export function validateCustomRanking(
   ranked: readonly FusedCandidate[],
   eligible: readonly FusedCandidate[],
 ): readonly FusedCandidate[] {
-  if (ranked.length !== eligible.length) {
+  const snapshot = [...ranked];
+  if (snapshot.length !== eligible.length) {
     throw new InternalRetrievalError("RETRIEVAL_RANKER_INVALID");
   }
   const expected = new Set(eligible);
-  for (const candidate of ranked) {
+  for (const candidate of snapshot) {
     if (!expected.delete(candidate)) {
       throw new InternalRetrievalError("RETRIEVAL_RANKER_INVALID");
     }
@@ -621,7 +622,7 @@ export function validateCustomRanking(
   if (expected.size !== 0) {
     throw new InternalRetrievalError("RETRIEVAL_RANKER_INVALID");
   }
-  return Object.freeze([...ranked]);
+  return Object.freeze(snapshot);
 }
 
 export function estimateCandidateTokens(candidate: Pick<FusedCandidate, "id" | "item">): number {
