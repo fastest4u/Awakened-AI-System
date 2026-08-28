@@ -23,6 +23,10 @@ import {
   type RetrievalEvaluationQueryV1,
   type SealedRetrievalEvaluationCorpusV2,
 } from "../src/orchestrator/retrieval/evaluation.js";
+import {
+  eventHash as storedEventHash,
+  payloadHash as storedPayloadHash,
+} from "../src/orchestrator/crypto/event-hash.js";
 import type {
   InternalRetrievalRequest,
   ProjectionLeaseProvider,
@@ -33,14 +37,93 @@ import type {
   RetrievalItemKind,
 } from "../src/orchestrator/retrieval/contracts.js";
 import { InternalRetrievalService } from "../src/orchestrator/retrieval/service.js";
+import { canonicalJson } from "../src/orchestrator/serialization/canonical-json.js";
 
 const FIXTURE_URL = new URL(
   "../../tests/fixtures/retrieval-evaluation/v1/corpus.json",
   import.meta.url,
 );
+const V2_SOURCE_EVENTS_FIXTURE_URL = new URL(
+  "../../tests/fixtures/retrieval-evaluation/v2/source-events.json",
+  import.meta.url,
+);
+const V2_JUDGMENTS_FIXTURE_URL = new URL(
+  "../../tests/fixtures/retrieval-evaluation/v2/judgments.json",
+  import.meta.url,
+);
 const EXPECTED_CANONICAL_SHA256 = "963020e36f6860522b545c749024db0672e87fb703ab762b5c53fa3d62402f99";
+const STORED_EVENT_ENVELOPE_KEYS = Object.freeze([
+  "globalPosition", "eventId", "projectId", "vaultId", "storeId", "workspaceId",
+  "branchScopeId", "branchRef", "streamId", "streamType", "streamVersion", "eventType",
+  "eventSchemaVersion", "sessionId", "parentSessionId", "actorRole", "agentId",
+  "clientInstanceId", "correlationId", "causationId", "commandId", "idempotencyKey",
+  "commandEventIndex", "occurredAt", "recordedAt", "visibilityScope", "confidence",
+  "verificationStatus", "sourceRefs", "evidenceRefs", "evidenceDigests", "payload",
+  "payloadJson", "payloadHash", "previousGlobalHash", "eventHash", "lifecycleIntentJson",
+] as const);
+const ANSWER_DERIVED_FIELDS = new Set([
+  "answer", "answers", "candidate", "candidates", "expectedResult", "expectedResults",
+  "queryTextToItem", "queryTextToItemId", "queryTextToItemLookup",
+]);
 
 type UnknownRecord = Record<string, unknown>;
+
+function record(value: unknown, label: string): UnknownRecord {
+  assert.equal(typeof value, "object", `${label} must be an object`);
+  assert.notEqual(value, null, `${label} must be non-null`);
+  assert.equal(Array.isArray(value), false, `${label} must not be an array`);
+  return value as UnknownRecord;
+}
+
+function rawStoredEventHashInput(event: UnknownRecord): UnknownRecord {
+  return {
+    globalPosition: event.globalPosition,
+    eventId: event.eventId,
+    projectId: event.projectId,
+    vaultId: event.vaultId,
+    storeId: event.storeId,
+    workspaceId: event.workspaceId,
+    branchScopeId: event.branchScopeId,
+    branchRef: event.branchRef,
+    streamId: event.streamId,
+    streamType: event.streamType,
+    streamVersion: event.streamVersion,
+    eventType: event.eventType,
+    eventSchemaVersion: event.eventSchemaVersion,
+    sessionId: event.sessionId,
+    parentSessionId: event.parentSessionId,
+    actorRole: event.actorRole,
+    agentId: event.agentId,
+    clientInstanceId: event.clientInstanceId,
+    correlationId: event.correlationId,
+    causationId: event.causationId,
+    commandId: event.commandId,
+    idempotencyKey: event.idempotencyKey,
+    commandEventIndex: event.commandEventIndex,
+    occurredAt: event.occurredAt,
+    recordedAt: event.recordedAt,
+    visibilityScope: event.visibilityScope,
+    confidence: event.confidence,
+    verificationStatus: event.verificationStatus,
+    sourceRefs: event.sourceRefs,
+    evidenceRefs: event.evidenceRefs,
+    evidenceDigests: event.evidenceDigests,
+    payloadHash: event.payloadHash,
+    previousGlobalHash: event.previousGlobalHash,
+  };
+}
+
+function assertNoAnswerDerivedFields(value: unknown, label: string): void {
+  if (Array.isArray(value)) {
+    for (const [index, entry] of value.entries()) assertNoAnswerDerivedFields(entry, `${label}[${index}]`);
+    return;
+  }
+  if (typeof value !== "object" || value === null) return;
+  for (const [key, entry] of Object.entries(value)) {
+    assert.equal(ANSWER_DERIVED_FIELDS.has(key), false, `${label}.${key} is answer-derived`);
+    assertNoAnswerDerivedFields(entry, `${label}.${key}`);
+  }
+}
 
 interface SealedV2Inputs {
   readonly manifest: UnknownRecord;
@@ -536,6 +619,153 @@ describe("sealed V2 retrieval evaluation bundle", () => {
     );
 
     assertCorpusInvalid(() => parseSealedInputs(resealed));
+  });
+});
+
+describe("static deterministic V2 retrieval evaluation fixtures", () => {
+  it("materializes complete source chains and independently judged raw cases", () => {
+    const sourceArtifact = record(
+      JSON.parse(readFileSync(V2_SOURCE_EVENTS_FIXTURE_URL, "utf8")) as unknown,
+      "source-events fixture",
+    );
+    const judgmentsArtifact = record(
+      JSON.parse(readFileSync(V2_JUDGMENTS_FIXTURE_URL, "utf8")) as unknown,
+      "judgments fixture",
+    );
+
+    assert.deepEqual(Object.keys(sourceArtifact), ["schemaVersion", "corpusVersion", "sources"]);
+    assert.equal(sourceArtifact.schemaVersion, 2);
+    assert.equal(sourceArtifact.corpusVersion, "retrieval-evaluation-v2");
+    assert.deepEqual(Object.keys(judgmentsArtifact), ["schemaVersion", "corpusVersion", "queries"]);
+    assert.equal(judgmentsArtifact.schemaVersion, 2);
+    assert.equal(judgmentsArtifact.corpusVersion, "retrieval-evaluation-v2");
+
+    const sources = sourceArtifact.sources;
+    assert.ok(Array.isArray(sources));
+    assert.equal(sources.length, 2);
+    const primary = record(sources[0], "primary source");
+    const competing = record(sources[1], "competing source");
+    assert.deepEqual(Object.keys(primary), ["binding", "events"]);
+    assert.deepEqual(Object.keys(competing), ["binding", "events"]);
+    assert.notDeepEqual(primary.binding, competing.binding);
+
+    const primaryEvents = primary.events;
+    const competingEvents = competing.events;
+    assert.ok(Array.isArray(primaryEvents));
+    assert.ok(Array.isArray(competingEvents));
+    assert.equal(primaryEvents.length, 504);
+    assert.equal(competingEvents.length, 1);
+
+    const primaryItemIds = new Set<string>();
+    const primaryMemoryPayloads: UnknownRecord[] = [];
+    for (const [sourceIndex, rawEvents] of [primaryEvents, competingEvents].entries()) {
+      let previousHash = "0".repeat(64);
+      for (const [eventIndex, rawEvent] of rawEvents.entries()) {
+        const event = record(rawEvent, `sources[${sourceIndex}].events[${eventIndex}]`);
+        assert.deepEqual(
+          [...Object.keys(event)].sort(),
+          [...STORED_EVENT_ENVELOPE_KEYS].sort(),
+        );
+        assert.equal(event.globalPosition, String(eventIndex + 1));
+        assert.equal(event.streamVersion, String(eventIndex + 1));
+        assert.equal(event.previousGlobalHash, previousHash);
+        assert.equal(event.lifecycleIntentJson, null);
+        if (typeof event.payloadJson !== "string") assert.fail("payloadJson must be a string");
+        if (typeof event.payloadHash !== "string") assert.fail("payloadHash must be a string");
+        if (typeof event.eventHash !== "string") assert.fail("eventHash must be a string");
+        const parsedPayload = JSON.parse(event.payloadJson) as unknown;
+        assert.deepEqual(parsedPayload, event.payload);
+        assert.equal(canonicalJson(parsedPayload), event.payloadJson);
+        assert.equal(storedPayloadHash(parsedPayload), event.payloadHash);
+        assert.equal(storedEventHash(rawStoredEventHashInput(event)), event.eventHash);
+        previousHash = event.eventHash;
+      }
+    }
+
+    const firstPrimary = record(primaryEvents[0], "primary SessionStarted event");
+    const secondPrimary = record(primaryEvents[1], "primary SessionCheckpointRecorded event");
+    assert.equal(firstPrimary.eventType, "SessionStarted");
+    assert.equal(firstPrimary.eventSchemaVersion, 1);
+    assert.equal(secondPrimary.eventType, "SessionCheckpointRecorded");
+    assert.equal(secondPrimary.eventSchemaVersion, 1);
+    for (const [eventIndex, rawEvent] of primaryEvents.slice(2).entries()) {
+      const event = record(rawEvent, `primary MemorySourceRecorded event ${eventIndex + 3}`);
+      assert.equal(event.eventType, "MemorySourceRecorded");
+      assert.equal(event.eventSchemaVersion, 2);
+      const payload = record(event.payload, `primary MemorySourceRecorded payload ${eventIndex + 3}`);
+      assert.equal(payload.sourceVersion, 2);
+      assert.equal(typeof payload.itemId, "string");
+      primaryItemIds.add(payload.itemId as string);
+      primaryMemoryPayloads.push(payload);
+    }
+    assert.equal(primaryItemIds.size, 502);
+
+    const competingEvent = record(competingEvents[0], "competing source event");
+    assert.equal(competingEvent.eventType, "MemorySourceRecorded");
+    assert.equal(competingEvent.eventSchemaVersion, 2);
+    const competingPayload = record(competingEvent.payload, "competing source payload");
+    assert.ok(primaryMemoryPayloads.some((payload) => (
+      payload.normalizedKey === competingPayload.normalizedKey
+      && payload.summary === competingPayload.summary
+    )));
+
+    const queries = judgmentsArtifact.queries;
+    assert.ok(Array.isArray(queries));
+    assert.equal(queries.length, 504);
+    const classCounts = new Map<string, number>();
+    const languageCounts = new Map<string, number>();
+    for (const [index, rawQuery] of queries.entries()) {
+      const query = record(rawQuery, `queries[${index}]`);
+      assert.deepEqual([...Object.keys(query)].sort(), [
+        "queryId", "language", "criticalClass", "queryText", "eligibleScope",
+        "expectedCitations", "judgments", "relevanceGrades", "expectations",
+      ].sort());
+      assert.equal(query.queryId, `eval-v2-${String(index + 1).padStart(4, "0")}`);
+      assert.equal(typeof query.queryText, "string");
+      assert.equal((query.queryText as string).normalize("NFKC"), query.queryText);
+      assert.equal(typeof query.criticalClass, "string");
+      assert.equal(typeof query.language, "string");
+      classCounts.set(query.criticalClass as string, (classCounts.get(query.criticalClass as string) ?? 0) + 1);
+      languageCounts.set(query.language as string, (languageCounts.get(query.language as string) ?? 0) + 1);
+
+      const grades = record(query.relevanceGrades, `queries[${index}].relevanceGrades`);
+      const positiveItemIds = Object.entries(grades).filter(([, grade]) => grade > 0).map(([itemId]) => itemId);
+      assert.ok(positiveItemIds.length > 0);
+      assert.ok(positiveItemIds.every((itemId) => primaryItemIds.has(itemId)));
+      assert.ok(Array.isArray(query.expectedCitations));
+      assert.ok(query.expectedCitations.length > 0);
+      for (const rawCitation of query.expectedCitations) {
+        const citation = record(rawCitation, `queries[${index}].expectedCitations`);
+        assert.ok(primaryItemIds.has(citation.itemId as string));
+        assert.ok((grades[citation.itemId as string] as number | undefined) > 0);
+      }
+
+      assert.ok(Array.isArray(query.judgments));
+      assert.equal(query.judgments.length, 2);
+      const firstJudgment = record(query.judgments[0], `queries[${index}].judgments[0]`);
+      const secondJudgment = record(query.judgments[1], `queries[${index}].judgments[1]`);
+      assert.notEqual(firstJudgment.judgeId, secondJudgment.judgeId);
+      assert.deepEqual(firstJudgment.relevanceGrades, grades);
+      assert.deepEqual(secondJudgment.relevanceGrades, grades);
+      assertNoAnswerDerivedFields(query, `queries[${index}]`);
+    }
+    for (const criticalClass of RETRIEVAL_EVALUATION_CRITICAL_CLASSES) {
+      assert.equal(classCounts.get(criticalClass), 56, `${criticalClass} needs exactly 56 cases`);
+    }
+    assert.equal(languageCounts.get("en"), 162);
+    assert.equal(languageCounts.get("th"), 171);
+    assert.equal(languageCounts.get("mixed"), 171);
+    for (const criticalClass of RETRIEVAL_EVALUATION_CRITICAL_CLASSES) {
+      const classQueries = queries.map((query) => record(query, "query"))
+        .filter((query) => query.criticalClass === criticalClass);
+      assert.equal(classQueries.filter((query) => query.language === "en").length, 18);
+      assert.equal(classQueries.filter((query) => query.language === "th").length, 19);
+      assert.equal(classQueries.filter((query) => query.language === "mixed").length, 19);
+    }
+    assert.doesNotMatch(
+      JSON.stringify({ sourceArtifact, judgmentsArtifact }),
+      /raw[-_ ]?evidence|authorization|credential|bearer\s|private[-_ ]?key/i,
+    );
   });
 });
 
