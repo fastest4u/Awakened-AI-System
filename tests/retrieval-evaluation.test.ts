@@ -1300,28 +1300,32 @@ describe("sealed V2 threshold predicate", () => {
         label,
       );
     };
+    const rejectAbsolute = (
+      label: string,
+      changes: Partial<RetrievalEvaluationReport>,
+    ): void => reject(label, changes, changes);
 
     assert.doesNotThrow(() => assertSealedRetrievalThresholds(report, sealed.baseline.metrics));
     const integrated = await evaluateSealedRetrieval(sealed, fixture.service);
     assert.equal(integrated.corpusVersion, "retrieval-evaluation-v2");
 
-    reject("failed query count", { failedQueryCount: 1 });
-    reject("cross-project contamination", { crossProjectContamination: 1 });
-    reject("recall", { recallAt10: 0.949 });
-    reject("MRR", { mrr: 0.899 });
-    reject("NDCG", { ndcgAt10: 0.899 });
-    reject("citation precision", { citationPrecision: 0.949 });
-    reject("citation recall", { citationRecall: 0.949 });
-    reject("stale-active rate", { staleActiveMemoryRate: 0.011 });
-    reject("exact identifier", { exactIdentifierPathRecall: 0.999 });
-    reject("checkpoint", { currentSessionCheckpointRecallAt10: 0.999 });
-    reject("open follow-up", { openFollowUpRecallAt10: 0.999 });
-    reject("next action", { nextActionRecallAt10: 0.999 });
-    reject("semantic paraphrase", { semanticParaphraseRecallAt10: 0.899 });
-    reject("bitemporal", { bitemporalAccuracy: 0.949 });
-    reject("conflict recall", { conflictRecall: 0.999 });
-    reject("conflict precision", { conflictPrecision: 0.999 });
-    reject("unsupported high-impact claims", { unsupportedHighImpactVerifiedClaims: 1 });
+    rejectAbsolute("failed query count", { failedQueryCount: 1 });
+    rejectAbsolute("cross-project contamination", { crossProjectContamination: 1 });
+    rejectAbsolute("recall", { recallAt10: 0.949 });
+    rejectAbsolute("MRR", { mrr: 0.899 });
+    rejectAbsolute("NDCG", { ndcgAt10: 0.899 });
+    rejectAbsolute("citation precision", { citationPrecision: 0.949 });
+    rejectAbsolute("citation recall", { citationRecall: 0.949 });
+    rejectAbsolute("stale-active rate", { staleActiveMemoryRate: 0.011 });
+    rejectAbsolute("exact identifier", { exactIdentifierPathRecall: 0.999 });
+    rejectAbsolute("checkpoint", { currentSessionCheckpointRecallAt10: 0.999 });
+    rejectAbsolute("open follow-up", { openFollowUpRecallAt10: 0.999 });
+    rejectAbsolute("next action", { nextActionRecallAt10: 0.999 });
+    rejectAbsolute("semantic paraphrase", { semanticParaphraseRecallAt10: 0.899 });
+    rejectAbsolute("bitemporal", { bitemporalAccuracy: 0.949 });
+    rejectAbsolute("conflict recall", { conflictRecall: 0.999 });
+    rejectAbsolute("conflict precision", { conflictPrecision: 0.999 });
+    rejectAbsolute("unsupported high-impact claims", { unsupportedHighImpactVerifiedClaims: 1 });
 
     for (const metric of [
       "recallAt10", "mrr", "ndcgAt10", "citationPrecision", "citationRecall",
