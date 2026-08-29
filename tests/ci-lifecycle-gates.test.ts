@@ -38,6 +38,25 @@ const EXTENDED_PRODUCTION_ENTRY_PATHS = [
   "src/services", "src/workers", "src/orchestrator/runtime",
 ] as const;
 
+const SEALED_EVALUATOR_BASE = "68e77fa10165c99243ded1e8c1c80d1e0f7da92f";
+const VALID_V2_AGGREGATE = Object.freeze({
+  corpusVersion: "retrieval-evaluation-v2",
+  queryCount: 504,
+  failedQueryCount: 0,
+  languageCounts: Object.freeze({ en: 162, th: 171, mixed: 171 }),
+  criticalClassCounts: Object.freeze({
+    identifiers: 56, "code-artifacts": 56, "session-continuity": 56, "follow-ups": 56,
+    "stale-superseded-facts": 56, conflicts: 56, "cross-project-near-duplicates": 56,
+    "semantic-paraphrases": 56, "temporal-boundaries": 56,
+  }),
+  crossProjectContamination: 0,
+  recallAt10: 1, mrr: 1, ndcgAt10: 1, citationPrecision: 1, citationRecall: 1,
+  staleActiveMemoryRate: 0, exactIdentifierPathRecall: 1, currentSessionCheckpointRecallAt10: 1,
+  openFollowUpRecallAt10: 1, nextActionRecallAt10: 1, semanticParaphraseRecallAt10: 1,
+  bitemporalAccuracy: 1, conflictRecall: 1, conflictPrecision: 1,
+  unsupportedHighImpactVerifiedClaims: 0,
+});
+
 function typescriptFiles(directory: string): readonly string[] {
   const files: string[] = [];
   const visit = (relativeDirectory: string): void => {
@@ -124,14 +143,6 @@ function sealedEvaluationRequestFactory(evaluator: string): string {
   );
 }
 
-function assertNoAnswerDrivenLookup(evaluator: string): void {
-  assert.doesNotMatch(
-    evaluator,
-    /(?:queryTextToItem(?:Id|Lookup)?|(?:Object\.fromEntries|new\s+Map(?:<[^>]*>)?)\s*\(\s*[\s\S]{0,512}?\.map\s*\(\s*(?:\(\s*)?([A-Za-z_$][\w$]*)(?:\s*,[^)]*)?\s*\)?\s*=>\s*\[\s*\1\.queryText\s*,)/,
-    "the measured evaluator must not contain an answer-driven lookup",
-  );
-}
-
 function assertSealedEvaluationRequestFactory(requestFor: string): void {
   assert.match(
     requestFor,
@@ -143,6 +154,15 @@ function assertSealedEvaluationRequestFactory(requestFor: string): void {
     /assertSealedEvaluationVectorDisabled\(vector\);/,
     "sealed request factory must enforce disabled vectors",
   );
+}
+
+function assertRealBridgeDataflow(bridge: string): void {
+  assert.match(bridge, /service:\s*new InternalRetrievalService\(\{ projections, candidates \}\),/, "real bridge service must use projections and candidates");
+  assert.match(bridge, /const original = originalLeases\.get\(lease\);[\s\S]*?return adapter\.collectEligible\(original, request\);/, "real bridge candidates must delegate the preserved lease");
+}
+
+function assertNoV2EntryWiring(entry: string): void {
+  assert.doesNotMatch(entry, /(?:from\s+|import\s*\(|require\s*\()["'][^"']*(?:\/(?:projections|retrieval)\/(?:v2-[^"']*|evaluation)|\/runtime\/(?:projection-runtime|v2-[^"']*))[^"']*["']/, "V2 entry wiring is forbidden");
 }
 
 function runRetrievalEvaluation(...targets: readonly string[]) {
@@ -540,7 +560,7 @@ test("workflow parser rejects directives, document markers, tabs, and exotic blo
 test("Subproject 3 evaluation runner rejects malformed aggregate-looking TAP output", () => {
   const malformedThenValid = [
     '# {"corpusVersion":"retrieval-evaluation-v2"',
-    '{"corpusVersion":"retrieval-evaluation-v2"}',
+    JSON.stringify(VALID_V2_AGGREGATE),
     "",
   ].join("\n");
   const result = runRetrievalEvaluationWithChildOutput(malformedThenValid);
@@ -548,12 +568,16 @@ test("Subproject 3 evaluation runner rejects malformed aggregate-looking TAP out
   assert.match(`${result.stdout}\n${result.stderr}`, /RETRIEVAL_EVALUATION_REPORT_INVALID/);
 });
 
-test("Subproject 3 evaluation guard rejects generic answer lookup tables", () => {
-  for (const lookup of [
-    "const byPrompt = Object.fromEntries(corpus.queries.map((row) => [row.queryText, row.expectedCitations]));",
-    "const replay = new Map(corpus.queries.map((entry) => [entry.queryText, entry.relevanceGrades]));",
+test("Subproject 3 evaluation runner rejects aggregate shape and leakage", () => {
+  for (const invalid of [
+    { ...VALID_V2_AGGREGATE, queryText: "leak" },
+    { ...VALID_V2_AGGREGATE, languageCounts: { en: 162, th: 171 } },
+    { ...VALID_V2_AGGREGATE, recallAt10: 1.1 },
+    { ...VALID_V2_AGGREGATE, failedQueryCount: 505 },
   ]) {
-    assert.throws(() => assertNoAnswerDrivenLookup(lookup), /answer-driven lookup/);
+    const result = runRetrievalEvaluationWithChildOutput(`${JSON.stringify(invalid)}\n`);
+    assert.notEqual(result.status, 0, "invalid aggregate shape must fail closed");
+    assert.match(`${result.stdout}\n${result.stderr}`, /RETRIEVAL_EVALUATION_REPORT_INVALID/);
   }
 });
 
@@ -568,6 +592,26 @@ test("Subproject 3 evaluation guard binds the sealed production request factory"
     () => assertSealedEvaluationRequestFactory(requestFor.replace("assertSealedEvaluationVectorDisabled(vector);", "")),
     /sealed request factory must enforce disabled vectors/,
   );
+});
+
+test("Subproject 3 evaluation guard proves real bridge dataflow", () => {
+  const evaluator = source("tests/retrieval-evaluation.test.ts");
+  const bridge = realV2BridgeImplementation(evaluator);
+  assert.throws(
+    () => assertRealBridgeDataflow(bridge.replace("service: new InternalRetrievalService({ projections, candidates }),", "service: replacementService,")),
+    /real bridge service/,
+  );
+  assert.throws(
+    () => assertRealBridgeDataflow(bridge.replace("return adapter.collectEligible(original, request);", "return answerReplay.get(request.query);")),
+    /preserved lease/,
+  );
+});
+
+test("Subproject 3 evaluation guard rejects dynamic V2 entry wiring", () => {
+  for (const dynamic of [
+    'async function load() { return import("../orchestrator/retrieval/evaluation.js"); }',
+    'const load = () => require("../orchestrator/runtime/projection-runtime.js");',
+  ]) assert.throws(() => assertNoV2EntryWiring(dynamic), /V2 entry wiring/);
 });
 
 test("Subproject 3 evaluation guard covers every production entry surface", () => {
@@ -609,12 +653,14 @@ test("Subproject 3 evaluation and projection runtime remain internal-only", () =
     { cwd: fileURLToPath(ROOT), encoding: "utf8" },
   ).trim();
   assert.equal(protectedDiff, "", "Version 1 production paths must remain byte-unchanged");
+  const sealedSourceDiff = execFileSync(
+    "git",
+    ["diff", "--name-only", SEALED_EVALUATOR_BASE, "--", "src"],
+    { cwd: fileURLToPath(ROOT), encoding: "utf8" },
+  ).trim();
+  assert.equal(sealedSourceDiff, "", "Task 7C must not change production source after the sealed evaluator baseline");
   for (const path of PRODUCTION_ENTRY_SOURCE_PATHS) {
-    assert.doesNotMatch(
-      source(path),
-      /from\s+["'][^"']*(?:\/(?:projections|retrieval)\/(?:v2-[^"']*|evaluation)|\/runtime\/(?:projection-runtime|v2-[^"']*))["']/,
-      `${path} must not import a Version 2 projection, retrieval, or runtime module`,
-    );
+    assertNoV2EntryWiring(source(path));
     assert.doesNotMatch(
       source(path),
       /\bmemory_(?:retrieval|projection)\w*/,
@@ -630,8 +676,8 @@ test("Subproject 3 evaluation and projection runtime remain internal-only", () =
   const realV2Test = realV2HarnessTestBody(evaluator);
   const realV2Bridge = realV2BridgeImplementation(evaluator);
   const sealedRequest = sealedEvaluationRequestFactory(measuredEvaluator);
-  assertNoAnswerDrivenLookup(measuredEvaluator);
   assertSealedEvaluationRequestFactory(sealedRequest);
+  assertRealBridgeDataflow(realV2Bridge);
   assert.match(
     realV2Test,
     /const bridge = await createV2EvaluationBridge\(\s*harness\.primaryV2Coordinator,\s*harness\.primary\.binding,\s*\);[\s\S]*?const v2Report = await evaluateSealedRetrieval\(\s*harness\.corpus,\s*bridge\.service\s*\);/,

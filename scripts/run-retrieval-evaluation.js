@@ -14,6 +14,18 @@ const REPORT_INVALID = "RETRIEVAL_EVALUATION_REPORT_INVALID";
 const TEST_FAILED = "RETRIEVAL_EVALUATION_TEST_FAILED";
 const REPORT_ENVIRONMENT = "sealed-v2";
 const REPORT_CORPUS_VERSION = "retrieval-evaluation-v2";
+const LANGUAGE_KEYS = ["en", "th", "mixed"];
+const CLASS_KEYS = [
+  "identifiers", "code-artifacts", "session-continuity", "follow-ups", "stale-superseded-facts",
+  "conflicts", "cross-project-near-duplicates", "semantic-paraphrases", "temporal-boundaries",
+];
+const COUNT_KEYS = ["queryCount", "failedQueryCount", "crossProjectContamination", "unsupportedHighImpactVerifiedClaims"];
+const METRIC_KEYS = [
+  "recallAt10", "mrr", "ndcgAt10", "citationPrecision", "citationRecall", "staleActiveMemoryRate",
+  "exactIdentifierPathRecall", "currentSessionCheckpointRecallAt10", "openFollowUpRecallAt10",
+  "nextActionRecallAt10", "semanticParaphraseRecallAt10", "bitemporalAccuracy", "conflictRecall", "conflictPrecision",
+];
+const REPORT_KEYS = ["corpusVersion", ...COUNT_KEYS, "languageCounts", "criticalClassCounts", ...METRIC_KEYS];
 const { NODE_TEST_CONTEXT: _nodeTestContext, ...runnerEnvironment } = process.env;
 
 function requestedEvaluationTarget() {
@@ -36,16 +48,40 @@ function aggregateReport(output) {
     } catch {
       throw new Error(REPORT_INVALID);
     }
-    if (
-      typeof report !== "object"
-      || report === null
-      || Array.isArray(report)
-      || report.corpusVersion !== REPORT_CORPUS_VERSION
-    ) throw new Error(REPORT_INVALID);
-    reports.push(JSON.stringify(report));
+    reports.push(JSON.stringify(validReport(report)));
   }
   if (reports.length !== 1) throw new Error(REPORT_INVALID);
   return reports[0];
+}
+
+function exactRecord(value, keys) {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) throw new Error(REPORT_INVALID);
+  const actual = Object.keys(value);
+  if (actual.length !== keys.length || actual.some((key) => !keys.includes(key))) throw new Error(REPORT_INVALID);
+  return value;
+}
+
+function nonnegative(value) {
+  if (!Number.isSafeInteger(value) || value < 0) throw new Error(REPORT_INVALID);
+  return value;
+}
+
+function unitInterval(value) {
+  if (!Number.isFinite(value) || value < 0 || value > 1) throw new Error(REPORT_INVALID);
+  return value;
+}
+
+function validReport(value) {
+  const report = exactRecord(value, REPORT_KEYS);
+  if (report.corpusVersion !== REPORT_CORPUS_VERSION) throw new Error(REPORT_INVALID);
+  for (const key of COUNT_KEYS) nonnegative(report[key]);
+  if (report.failedQueryCount > report.queryCount) throw new Error(REPORT_INVALID);
+  const languageCounts = exactRecord(report.languageCounts, LANGUAGE_KEYS);
+  const criticalClassCounts = exactRecord(report.criticalClassCounts, CLASS_KEYS);
+  for (const key of LANGUAGE_KEYS) nonnegative(languageCounts[key]);
+  for (const key of CLASS_KEYS) nonnegative(criticalClassCounts[key]);
+  for (const key of METRIC_KEYS) unitInterval(report[key]);
+  return report;
 }
 
 function runEvaluation() {
