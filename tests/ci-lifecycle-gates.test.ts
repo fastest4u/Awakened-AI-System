@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
-import { readFileSync, readdirSync } from "node:fs";
-import { fileURLToPath } from "node:url";
+import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 
 const ROOT = new URL("../../", import.meta.url);
@@ -31,6 +33,11 @@ const PROTECTED_VERSION_ONE_PATHS = [
   "src/app.ts", "src/index.ts", "src/controllers", "src/schemas", "src/services",
 ] as const;
 
+const EXTENDED_PRODUCTION_ENTRY_PATHS = [
+  "src/app.ts", "src/index.ts", "src/cli.ts", "src/cli", "src/controllers", "src/schemas",
+  "src/services", "src/workers", "src/orchestrator/runtime",
+] as const;
+
 function typescriptFiles(directory: string): readonly string[] {
   const files: string[] = [];
   const visit = (relativeDirectory: string): void => {
@@ -45,6 +52,17 @@ function typescriptFiles(directory: string): readonly string[] {
 }
 
 const PRODUCTION_CONTROLLER_PATHS = typescriptFiles("src/controllers");
+const PRODUCTION_ENTRY_SOURCE_PATHS = Object.freeze([
+  "src/app.ts",
+  "src/index.ts",
+  "src/cli.ts",
+  ...typescriptFiles("src/cli"),
+  ...PRODUCTION_CONTROLLER_PATHS,
+  ...typescriptFiles("src/schemas"),
+  ...typescriptFiles("src/services"),
+  ...typescriptFiles("src/workers"),
+  ...typescriptFiles("src/orchestrator/runtime"),
+]);
 const PROTECTED_VERSION_ONE_SOURCE_PATHS = Object.freeze([
   "src/app.ts",
   "src/index.ts",
@@ -54,7 +72,7 @@ const PROTECTED_VERSION_ONE_SOURCE_PATHS = Object.freeze([
 ]);
 
 function productionToolNames(): readonly string[] {
-  return Object.freeze(["src/app.ts", ...PRODUCTION_CONTROLLER_PATHS].flatMap((path) => (
+  return Object.freeze(PRODUCTION_ENTRY_SOURCE_PATHS.flatMap((path) => (
     [...source(path).matchAll(/registerTool\(\s*["']([^"']+)["']/g)]
       .map((match) => match[1]!)
   )));
@@ -97,12 +115,33 @@ function realV2BridgeImplementation(evaluator: string): string {
   );
 }
 
-function realV2RequestFactory(evaluator: string): string {
+function sealedEvaluationRequestFactory(evaluator: string): string {
   return sourceBetween(
     evaluator,
-    "function directSourceRequest(",
-    "\nfunction candidateItemIds(",
-    "real V2 request factory",
+    "function requestFor(",
+    "\n/** Sealed V2 evaluation never permits vector retrieval into its measured result. */",
+    "sealed evaluation request factory",
+  );
+}
+
+function assertNoAnswerDrivenLookup(evaluator: string): void {
+  assert.doesNotMatch(
+    evaluator,
+    /(?:queryTextToItem(?:Id|Lookup)?|(?:Object\.fromEntries|new\s+Map(?:<[^>]*>)?)\s*\(\s*[\s\S]{0,512}?\.map\s*\(\s*(?:\(\s*)?([A-Za-z_$][\w$]*)(?:\s*,[^)]*)?\s*\)?\s*=>\s*\[\s*\1\.queryText\s*,)/,
+    "the measured evaluator must not contain an answer-driven lookup",
+  );
+}
+
+function assertSealedEvaluationRequestFactory(requestFor: string): void {
+  assert.match(
+    requestFor,
+    /const vector = Object\.freeze\(\{ enabled: false \} as const\);/,
+    "sealed request factory must disable vector retrieval",
+  );
+  assert.match(
+    requestFor,
+    /assertSealedEvaluationVectorDisabled\(vector\);/,
+    "sealed request factory must enforce disabled vectors",
   );
 }
 
@@ -112,6 +151,37 @@ function runRetrievalEvaluation(...targets: readonly string[]) {
     ["scripts/run-retrieval-evaluation.js", ...targets],
     { cwd: fileURLToPath(ROOT), encoding: "utf8" },
   );
+}
+
+function runRetrievalEvaluationWithChildOutput(output: string) {
+  const directory = mkdtempSync(join(tmpdir(), "retrieval-evaluation-runner-"));
+  const loader = join(directory, "mock-child-process.mjs");
+  const mockedChildProcess = [
+    'import { EventEmitter } from "node:events";',
+    "export function spawn() {",
+    "  const child = new EventEmitter();",
+    "  child.stdout = new EventEmitter();",
+    "  child.stderr = new EventEmitter();",
+    `  queueMicrotask(() => { child.stdout.emit("data", Buffer.from(${JSON.stringify(output)})); child.emit("close", 0, null); });`,
+    "  return child;",
+    "}",
+  ].join("\n");
+  writeFileSync(loader, [
+    `const childProcess = ${JSON.stringify(`data:text/javascript,${encodeURIComponent(mockedChildProcess)}`)};`,
+    "export async function resolve(specifier, context, nextResolve) {",
+    '  if (specifier === "node:child_process") return { url: childProcess, shortCircuit: true };',
+    "  return nextResolve(specifier, context);",
+    "}",
+  ].join("\n"));
+  try {
+    return spawnSync(
+      process.execPath,
+      ["--experimental-loader", pathToFileURL(loader).href, "scripts/run-retrieval-evaluation.js"],
+      { cwd: fileURLToPath(ROOT), encoding: "utf8" },
+    );
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
 }
 
 const PLAIN_WORKFLOW_KEY = "[A-Za-z][A-Za-z0-9_-]*";
@@ -467,6 +537,49 @@ test("workflow parser rejects directives, document markers, tabs, and exotic blo
   }
 });
 
+test("Subproject 3 evaluation runner rejects malformed aggregate-looking TAP output", () => {
+  const malformedThenValid = [
+    '# {"corpusVersion":"retrieval-evaluation-v2"',
+    '{"corpusVersion":"retrieval-evaluation-v2"}',
+    "",
+  ].join("\n");
+  const result = runRetrievalEvaluationWithChildOutput(malformedThenValid);
+  assert.notEqual(result.status, 0, "a malformed aggregate-looking line must fail closed");
+  assert.match(`${result.stdout}\n${result.stderr}`, /RETRIEVAL_EVALUATION_REPORT_INVALID/);
+});
+
+test("Subproject 3 evaluation guard rejects generic answer lookup tables", () => {
+  for (const lookup of [
+    "const byPrompt = Object.fromEntries(corpus.queries.map((row) => [row.queryText, row.expectedCitations]));",
+    "const replay = new Map(corpus.queries.map((entry) => [entry.queryText, entry.relevanceGrades]));",
+  ]) {
+    assert.throws(() => assertNoAnswerDrivenLookup(lookup), /answer-driven lookup/);
+  }
+});
+
+test("Subproject 3 evaluation guard binds the sealed production request factory", () => {
+  const requestFor = sealedEvaluationRequestFactory(source("src/orchestrator/retrieval/evaluation.ts"));
+  assertSealedEvaluationRequestFactory(requestFor);
+  assert.throws(
+    () => assertSealedEvaluationRequestFactory(requestFor.replace("enabled: false", "enabled: true")),
+    /sealed request factory must disable vector retrieval/,
+  );
+  assert.throws(
+    () => assertSealedEvaluationRequestFactory(requestFor.replace("assertSealedEvaluationVectorDisabled(vector);", "")),
+    /sealed request factory must enforce disabled vectors/,
+  );
+});
+
+test("Subproject 3 evaluation guard covers every production entry surface", () => {
+  for (const path of EXTENDED_PRODUCTION_ENTRY_PATHS) {
+    assert.ok(
+      PRODUCTION_ENTRY_SOURCE_PATHS.includes(path)
+        || PRODUCTION_ENTRY_SOURCE_PATHS.some((candidate) => candidate.startsWith(`${path}/`)),
+      `${path} must be scanned for V2 routing`,
+    );
+  }
+});
+
 test("Subproject 3 evaluation and projection runtime remain internal-only", () => {
   const toolNames = productionToolNames();
   assert.equal(toolNames.includes("memory_retrievalExplain"), false);
@@ -496,11 +609,11 @@ test("Subproject 3 evaluation and projection runtime remain internal-only", () =
     { cwd: fileURLToPath(ROOT), encoding: "utf8" },
   ).trim();
   assert.equal(protectedDiff, "", "Version 1 production paths must remain byte-unchanged");
-  for (const path of PROTECTED_VERSION_ONE_SOURCE_PATHS) {
+  for (const path of PRODUCTION_ENTRY_SOURCE_PATHS) {
     assert.doesNotMatch(
       source(path),
-      /orchestrator\/(?:projections|retrieval|runtime\/projection-runtime)/,
-      `${path} must not import the Version 2 projection runtime`,
+      /from\s+["'][^"']*(?:\/(?:projections|retrieval)\/(?:v2-[^"']*|evaluation)|\/runtime\/(?:projection-runtime|v2-[^"']*))["']/,
+      `${path} must not import a Version 2 projection, retrieval, or runtime module`,
     );
     assert.doesNotMatch(
       source(path),
@@ -513,19 +626,12 @@ test("Subproject 3 evaluation and projection runtime remain internal-only", () =
   assert.doesNotMatch(runtime, /(?:\bV2\b|\/v2-[\w-]*|\bv2-[\w-]*)/i, "V2 must remain evaluator-only");
 
   const evaluator = source("tests/retrieval-evaluation.test.ts");
+  const measuredEvaluator = source("src/orchestrator/retrieval/evaluation.ts");
   const realV2Test = realV2HarnessTestBody(evaluator);
   const realV2Bridge = realV2BridgeImplementation(evaluator);
-  const realV2Request = realV2RequestFactory(evaluator);
-  assert.doesNotMatch(
-    realV2Test,
-    /(?:queryTextToItem(?:Id|Lookup)?|new\s+Map\s*\(\s*[^)]*\.queries)/,
-    "the real V2 evaluator must not restore an answer-driven query map",
-  );
-  assert.doesNotMatch(
-    realV2Request,
-    /vector:\s*(?:Object\.freeze\(\s*)?\{\s*enabled:\s*true\b/,
-    "the real V2 evaluator must keep vector evaluation disabled",
-  );
+  const sealedRequest = sealedEvaluationRequestFactory(measuredEvaluator);
+  assertNoAnswerDrivenLookup(measuredEvaluator);
+  assertSealedEvaluationRequestFactory(sealedRequest);
   assert.match(
     realV2Test,
     /const bridge = await createV2EvaluationBridge\(\s*harness\.primaryV2Coordinator,\s*harness\.primary\.binding,\s*\);[\s\S]*?const v2Report = await evaluateSealedRetrieval\(\s*harness\.corpus,\s*bridge\.service\s*\);/,

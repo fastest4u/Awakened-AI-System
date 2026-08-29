@@ -26,24 +26,26 @@ function requestedEvaluationTarget() {
 }
 
 function aggregateReport(output) {
-  const reports = output
-    .split(/\r?\n/)
-    .map((line) => line.slice(line.indexOf("{")).trim())
-    .filter((line) => line.startsWith("{") && line.endsWith("}"));
-  if (reports.length !== 1) throw new Error(REPORT_INVALID);
-  let report;
-  try {
-    report = JSON.parse(reports[0]);
-  } catch {
-    throw new Error(REPORT_INVALID);
+  const reports = [];
+  for (const line of output.split(/\r?\n/)) {
+    const candidate = line.trim().replace(/^#\s*/, "");
+    if (!candidate.startsWith("{")) continue;
+    let report;
+    try {
+      report = JSON.parse(candidate);
+    } catch {
+      throw new Error(REPORT_INVALID);
+    }
+    if (
+      typeof report !== "object"
+      || report === null
+      || Array.isArray(report)
+      || report.corpusVersion !== REPORT_CORPUS_VERSION
+    ) throw new Error(REPORT_INVALID);
+    reports.push(JSON.stringify(report));
   }
-  if (
-    typeof report !== "object"
-    || report === null
-    || Array.isArray(report)
-    || report.corpusVersion !== REPORT_CORPUS_VERSION
-  ) throw new Error(REPORT_INVALID);
-  return JSON.stringify(report);
+  if (reports.length !== 1) throw new Error(REPORT_INVALID);
+  return reports[0];
 }
 
 function runEvaluation() {
