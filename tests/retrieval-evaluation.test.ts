@@ -1,8 +1,18 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
-import { describe, it } from "node:test";
+import {
+  copyFileSync,
+  mkdtempSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
+import { afterEach, describe, it } from "node:test";
 
+import type { JsonValue } from "../src/orchestrator/contracts/event.js";
 import type {
   BranchScopeId,
   ProjectId,
@@ -11,12 +21,25 @@ import type {
   WorkspaceId,
 } from "../src/orchestrator/identity/contracts.js";
 import type { ProjectBinding } from "../src/orchestrator/projections/contracts.js";
-import type { ProjectionManifestV1 } from "../src/orchestrator/projections/manifest.js";
+import { ImmutableProjectionBuilder } from "../src/orchestrator/projections/builder.js";
+import {
+  DefaultProjectionBuildCoordinator,
+  V2ProjectionBuildCoordinator,
+} from "../src/orchestrator/projections/coordinator.js";
+import { SqliteProjectionEventReader } from "../src/orchestrator/projections/event-reader.js";
+import type {
+  ProjectionManifestV1,
+  ProjectionManifestV2,
+} from "../src/orchestrator/projections/manifest.js";
 import type { ProjectionReaderLease } from "../src/orchestrator/projections/reader-lease.js";
+import type { V2ProjectionReaderLease } from "../src/orchestrator/projections/v2-reader-lease.js";
 import {
   RETRIEVAL_EVALUATION_CRITICAL_CLASSES,
   RetrievalEvaluationCorpusError,
+  assertSealedEvaluationVectorDisabled,
   evaluateRetrieval,
+  evaluateRetrievalQueries,
+  evaluateSealedRetrieval,
   parseRetrievalEvaluationCorpus,
   parseSealedRetrievalEvaluationBundle,
   type RetrievalEvaluationCorpusV1,
@@ -37,7 +60,12 @@ import type {
   RetrievalItemKind,
 } from "../src/orchestrator/retrieval/contracts.js";
 import { InternalRetrievalService } from "../src/orchestrator/retrieval/service.js";
+import { SqliteRetrievalCandidateRepository } from "../src/orchestrator/retrieval/candidates.js";
+import { V2SqliteRetrievalCandidateRepository } from "../src/orchestrator/retrieval/v2-candidates.js";
+import { PROJECT_MEMORY_APPLICATION_ID } from "../src/orchestrator/runtime/runtime-capabilities.js";
 import { canonicalJson } from "../src/orchestrator/serialization/canonical-json.js";
+import { NodeSqliteDriver } from "../src/orchestrator/storage/node-sqlite-driver.js";
+import { GENESIS_GLOBAL_HASH } from "../src/orchestrator/storage/event-store.js";
 
 const FIXTURE_URL = new URL(
   "../../tests/fixtures/retrieval-evaluation/v1/corpus.json",
@@ -49,6 +77,14 @@ const V2_SOURCE_EVENTS_FIXTURE_URL = new URL(
 );
 const V2_JUDGMENTS_FIXTURE_URL = new URL(
   "../../tests/fixtures/retrieval-evaluation/v2/judgments.json",
+  import.meta.url,
+);
+const V2_V1_SHADOW_BASELINE_FIXTURE_URL = new URL(
+  "../../tests/fixtures/retrieval-evaluation/v2/v1-shadow-baseline.json",
+  import.meta.url,
+);
+const V2_MANIFEST_FIXTURE_URL = new URL(
+  "../../tests/fixtures/retrieval-evaluation/v2/manifest.json",
   import.meta.url,
 );
 const EXPECTED_CANONICAL_SHA256 = "963020e36f6860522b545c749024db0672e87fb703ab762b5c53fa3d62402f99";
@@ -729,7 +765,9 @@ describe("static deterministic V2 retrieval evaluation fixtures", () => {
       languageCounts.set(query.language as string, (languageCounts.get(query.language as string) ?? 0) + 1);
 
       const grades = record(query.relevanceGrades, `queries[${index}].relevanceGrades`);
-      const positiveItemIds = Object.entries(grades).filter(([, grade]) => grade > 0).map(([itemId]) => itemId);
+      const positiveItemIds = Object.entries(grades)
+        .filter(([, grade]) => typeof grade === "number" && grade > 0)
+        .map(([itemId]) => itemId);
       assert.ok(positiveItemIds.length > 0);
       assert.ok(positiveItemIds.every((itemId) => primaryItemIds.has(itemId)));
       assert.ok(Array.isArray(query.expectedCitations));
@@ -737,7 +775,7 @@ describe("static deterministic V2 retrieval evaluation fixtures", () => {
       for (const rawCitation of query.expectedCitations) {
         const citation = record(rawCitation, `queries[${index}].expectedCitations`);
         assert.ok(primaryItemIds.has(citation.itemId as string));
-        assert.ok((grades[citation.itemId as string] as number | undefined) > 0);
+        assert.ok((grades[citation.itemId as string] as number | undefined ?? 0) > 0);
       }
 
       assert.ok(Array.isArray(query.judgments));
@@ -756,7 +794,7 @@ describe("static deterministic V2 retrieval evaluation fixtures", () => {
     assert.equal(languageCounts.get("th"), 171);
     assert.equal(languageCounts.get("mixed"), 171);
     for (const criticalClass of RETRIEVAL_EVALUATION_CRITICAL_CLASSES) {
-      const classQueries = queries.map((query) => record(query, "query"))
+      const classQueries: UnknownRecord[] = queries.map((query) => record(query, "query"))
         .filter((query) => query.criticalClass === criticalClass);
       assert.equal(classQueries.filter((query) => query.language === "en").length, 18);
       assert.equal(classQueries.filter((query) => query.language === "th").length, 19);
@@ -766,6 +804,476 @@ describe("static deterministic V2 retrieval evaluation fixtures", () => {
       JSON.stringify({ sourceArtifact, judgmentsArtifact }),
       /raw[-_ ]?evidence|authorization|credential|bearer\s|private[-_ ]?key/i,
     );
+  });
+});
+
+const realHarnessRoots: string[] = [];
+afterEach(() => {
+  for (const root of realHarnessRoots.splice(0)) rmSync(root, { recursive: true, force: true });
+});
+
+interface StaticSealedV2Inputs {
+  readonly manifest: UnknownRecord;
+  readonly sourceEvents: UnknownRecord;
+  readonly judgments: UnknownRecord;
+  readonly baseline: UnknownRecord;
+  readonly corpus: SealedRetrievalEvaluationCorpusV2;
+}
+
+function readStaticSealedV2Inputs(): StaticSealedV2Inputs {
+  const manifest = record(JSON.parse(readFileSync(V2_MANIFEST_FIXTURE_URL, "utf8")) as unknown, "manifest");
+  const sourceEvents = record(
+    JSON.parse(readFileSync(V2_SOURCE_EVENTS_FIXTURE_URL, "utf8")) as unknown,
+    "source-events",
+  );
+  const judgments = record(
+    JSON.parse(readFileSync(V2_JUDGMENTS_FIXTURE_URL, "utf8")) as unknown,
+    "judgments",
+  );
+  const baseline = record(
+    JSON.parse(readFileSync(V2_V1_SHADOW_BASELINE_FIXTURE_URL, "utf8")) as unknown,
+    "v1 shadow baseline",
+  );
+  return Object.freeze({
+    manifest,
+    sourceEvents,
+    judgments,
+    baseline,
+    corpus: parseSealedRetrievalEvaluationBundle(manifest, sourceEvents, judgments, baseline),
+  });
+}
+
+function rawText(source: UnknownRecord, key: string): string {
+  const value = source[key];
+  assert.equal(typeof value, "string", `${key} must be a string`);
+  return value as string;
+}
+
+function rawInteger(source: UnknownRecord, key: string): number {
+  const value = source[key];
+  assert.equal(typeof value, "number", `${key} must be a number`);
+  assert.equal(Number.isSafeInteger(value), true, `${key} must be an integer`);
+  return value as number;
+}
+
+function rawNullableText(source: UnknownRecord, key: string): string | null {
+  const value = source[key];
+  assert.ok(value === null || typeof value === "string", `${key} must be text or null`);
+  return value as string | null;
+}
+
+interface AuthenticatedSourceStore {
+  readonly binding: ProjectBinding;
+  readonly eventStorePath: string;
+  readonly terminalPosition: bigint;
+}
+
+function createAuthenticatedSourceStore(
+  root: string,
+  source: SealedRetrievalEvaluationCorpusV2["sources"][number],
+  ordinal: number,
+): AuthenticatedSourceStore {
+  const eventStorePath = join(root, `source-${ordinal}.sqlite`);
+  const database = new DatabaseSync(eventStorePath);
+  try {
+    database.exec(`
+      PRAGMA application_id = ${PROJECT_MEMORY_APPLICATION_ID};
+      PRAGMA journal_mode = WAL;
+      PRAGMA synchronous = FULL;
+      CREATE TABLE project_meta(singleton INTEGER PRIMARY KEY, project_id TEXT, vault_id TEXT, store_id TEXT) STRICT;
+      CREATE TABLE events(
+        global_position INTEGER PRIMARY KEY, event_id TEXT, project_id TEXT, vault_id TEXT,
+        store_id TEXT, workspace_id TEXT, branch_scope_id TEXT, branch_ref TEXT,
+        stream_id TEXT, stream_type TEXT, stream_version INTEGER, event_type TEXT,
+        event_schema_version INTEGER, session_id TEXT, parent_session_id TEXT,
+        actor_role TEXT, agent_id TEXT, client_instance_id TEXT, correlation_id TEXT,
+        causation_id TEXT, command_id TEXT, idempotency_key TEXT, command_event_index INTEGER,
+        occurred_at TEXT, recorded_at TEXT, visibility_scope TEXT, confidence TEXT,
+        verification_status TEXT, source_refs_json TEXT, evidence_refs_json TEXT,
+        evidence_digests_json TEXT, payload_json TEXT, payload_hash TEXT,
+        previous_global_hash TEXT, event_hash TEXT, lifecycle_intent_json TEXT
+      ) STRICT;
+    `);
+    database.prepare("INSERT INTO project_meta VALUES (1, ?, ?, ?)").run(
+      source.binding.projectId,
+      source.binding.vaultId,
+      source.binding.storeId,
+    );
+    const insert = database.prepare(`
+      INSERT INTO events(
+        global_position, event_id, project_id, vault_id, store_id, workspace_id,
+        branch_scope_id, branch_ref, stream_id, stream_type, stream_version, event_type,
+        event_schema_version, session_id, parent_session_id, actor_role, agent_id,
+        client_instance_id, correlation_id, causation_id, command_id, idempotency_key,
+        command_event_index, occurred_at, recorded_at, visibility_scope, confidence,
+        verification_status, source_refs_json, evidence_refs_json, evidence_digests_json,
+        payload_json, payload_hash, previous_global_hash, event_hash, lifecycle_intent_json
+      ) VALUES (
+        $globalPosition, $eventId, $projectId, $vaultId, $storeId, $workspaceId,
+        $branchScopeId, $branchRef, $streamId, $streamType, $streamVersion, $eventType,
+        $eventSchemaVersion, $sessionId, $parentSessionId, $actorRole, $agentId,
+        $clientInstanceId, $correlationId, $causationId, $commandId, $idempotencyKey,
+        $commandEventIndex, $occurredAt, $recordedAt, $visibilityScope, $confidence,
+        $verificationStatus, $sourceRefsJson, $evidenceRefsJson, $evidenceDigestsJson,
+        $payloadJson, $payloadHash, $previousGlobalHash, $eventHash, $lifecycleIntentJson
+      )
+    `);
+    let previousGlobalHash = GENESIS_GLOBAL_HASH;
+    for (const [index, rawEvent] of source.events.entries()) {
+      const event = record(rawEvent, `source ${ordinal} event ${index + 1}`);
+      const payload = event.payload as JsonValue;
+      const payloadJson = canonicalJson(payload);
+      const recomputedPayloadHash = storedPayloadHash(payload);
+      const recomputedEventHash = storedEventHash(rawStoredEventHashInput(event));
+      assert.equal(rawText(event, "payloadJson"), payloadJson);
+      assert.equal(rawText(event, "payloadHash"), recomputedPayloadHash);
+      assert.equal(rawText(event, "previousGlobalHash"), previousGlobalHash);
+      assert.equal(rawText(event, "eventHash"), recomputedEventHash);
+      insert.run({
+        $globalPosition: BigInt(rawText(event, "globalPosition")),
+        $eventId: rawText(event, "eventId"),
+        $projectId: rawText(event, "projectId"),
+        $vaultId: rawText(event, "vaultId"),
+        $storeId: rawText(event, "storeId"),
+        $workspaceId: rawText(event, "workspaceId"),
+        $branchScopeId: rawNullableText(event, "branchScopeId"),
+        $branchRef: rawNullableText(event, "branchRef"),
+        $streamId: rawText(event, "streamId"),
+        $streamType: rawText(event, "streamType"),
+        $streamVersion: BigInt(rawText(event, "streamVersion")),
+        $eventType: rawText(event, "eventType"),
+        $eventSchemaVersion: rawInteger(event, "eventSchemaVersion"),
+        $sessionId: rawNullableText(event, "sessionId"),
+        $parentSessionId: rawNullableText(event, "parentSessionId"),
+        $actorRole: rawText(event, "actorRole"),
+        $agentId: rawText(event, "agentId"),
+        $clientInstanceId: rawText(event, "clientInstanceId"),
+        $correlationId: rawText(event, "correlationId"),
+        $causationId: rawNullableText(event, "causationId"),
+        $commandId: rawText(event, "commandId"),
+        $idempotencyKey: rawText(event, "idempotencyKey"),
+        $commandEventIndex: rawInteger(event, "commandEventIndex"),
+        $occurredAt: rawText(event, "occurredAt"),
+        $recordedAt: rawText(event, "recordedAt"),
+        $visibilityScope: rawText(event, "visibilityScope"),
+        $confidence: rawText(event, "confidence"),
+        $verificationStatus: rawText(event, "verificationStatus"),
+        $sourceRefsJson: canonicalJson(event.sourceRefs as JsonValue),
+        $evidenceRefsJson: canonicalJson(event.evidenceRefs as JsonValue),
+        $evidenceDigestsJson: canonicalJson(event.evidenceDigests as JsonValue),
+        $payloadJson: payloadJson,
+        $payloadHash: recomputedPayloadHash,
+        $previousGlobalHash: previousGlobalHash,
+        $eventHash: recomputedEventHash,
+        $lifecycleIntentJson: rawNullableText(event, "lifecycleIntentJson"),
+      });
+      previousGlobalHash = recomputedEventHash;
+    }
+  } finally {
+    database.close();
+  }
+  const terminal = source.events.at(-1);
+  assert.ok(terminal);
+  return Object.freeze({
+    binding: source.binding,
+    eventStorePath,
+    terminalPosition: BigInt(rawText(record(terminal, "terminal event"), "globalPosition")),
+  });
+}
+
+function v1ManifestView(manifest: ProjectionManifestV2): ProjectionManifestV1 {
+  const checksums = manifest.coreChecksums;
+  return Object.freeze({
+    schemaVersion: 1,
+    projectId: manifest.projectId,
+    vaultId: manifest.vaultId,
+    storeId: manifest.storeId,
+    workspaceId: manifest.workspaceId,
+    branchScopeId: manifest.branchScopeId,
+    branchRef: manifest.branchRef,
+    sessionId: manifest.sessionId,
+    generation: manifest.generation,
+    terminalEventPosition: manifest.terminalEventPosition,
+    terminalEventHash: manifest.terminalEventHash,
+    databaseFile: `projections-1-${String(manifest.generation)}.sqlite`,
+    databaseSha256: manifest.databaseSha256,
+    coreChecksums: Object.freeze({
+      sessionTree: checksums.sessionTree,
+      canonicalItems: checksums.canonicalItems,
+      tasksFollowups: checksums.tasksFollowups,
+      artifactsFiles: checksums.artifactsFiles,
+      entityGraph: checksums.entityGraph,
+      lexicalChunks: checksums.lexicalChunks,
+      retrievalFeedback: checksums.retrievalFeedback,
+    }),
+    createdAt: manifest.createdAt,
+  });
+}
+
+interface RealEvaluationHarness {
+  readonly corpus: SealedRetrievalEvaluationCorpusV2;
+  readonly primary: AuthenticatedSourceStore;
+  readonly competing: AuthenticatedSourceStore;
+  readonly v1Coordinator: DefaultProjectionBuildCoordinator;
+  readonly primaryV2Coordinator: V2ProjectionBuildCoordinator;
+  readonly competingV2Coordinator: V2ProjectionBuildCoordinator;
+  readonly primaryV2DatabasePath: string;
+  readonly competingV2DatabasePath: string;
+}
+
+async function createRealEvaluationHarness(): Promise<RealEvaluationHarness> {
+  const staticInputs = readStaticSealedV2Inputs();
+  assert.equal(staticInputs.corpus.sources.length, 2);
+  const root = mkdtempSync(join(tmpdir(), "retrieval-evaluation-v2-"));
+  realHarnessRoots.push(root);
+  const [primarySource, competingSource] = staticInputs.corpus.sources;
+  assert.ok(primarySource);
+  assert.ok(competingSource);
+  const primary = createAuthenticatedSourceStore(root, primarySource, 1);
+  const competing = createAuthenticatedSourceStore(root, competingSource, 2);
+  const driver = new NodeSqliteDriver({ DatabaseSync });
+  const primaryV1Directory = join(root, "primary-v1");
+  const primaryV2Directory = join(root, "primary-v2");
+  const competingV2Directory = join(root, "competing-v2");
+  const v1Coordinator = new DefaultProjectionBuildCoordinator({
+    projectionDirectory: primaryV1Directory,
+    eventReader: new SqliteProjectionEventReader({ driver, eventStorePath: primary.eventStorePath }),
+    builder: new ImmutableProjectionBuilder({ driver, projectionDirectory: primaryV1Directory }),
+  });
+  const primaryV2Coordinator = new V2ProjectionBuildCoordinator({
+    projectionDirectory: primaryV2Directory,
+    eventReader: new SqliteProjectionEventReader({ driver, eventStorePath: primary.eventStorePath }),
+    builder: new ImmutableProjectionBuilder({ driver, projectionDirectory: primaryV2Directory }),
+  });
+  const competingV2Coordinator = new V2ProjectionBuildCoordinator({
+    projectionDirectory: competingV2Directory,
+    eventReader: new SqliteProjectionEventReader({ driver, eventStorePath: competing.eventStorePath }),
+    builder: new ImmutableProjectionBuilder({ driver, projectionDirectory: competingV2Directory }),
+  });
+  await v1Coordinator.ensurePublished(primary.binding, primary.terminalPosition, 30_000);
+  const primaryV2 = await primaryV2Coordinator.ensurePublished(
+    primary.binding,
+    primary.terminalPosition,
+    30_000,
+  );
+  const competingV2 = await competingV2Coordinator.ensurePublished(
+    competing.binding,
+    competing.terminalPosition,
+    30_000,
+  );
+  return Object.freeze({
+    corpus: staticInputs.corpus,
+    primary,
+    competing,
+    v1Coordinator,
+    primaryV2Coordinator,
+    competingV2Coordinator,
+    primaryV2DatabasePath: primaryV2.databasePath,
+    competingV2DatabasePath: competingV2.databasePath,
+  });
+}
+
+function createRealV1EvaluationService(
+  coordinator: DefaultProjectionBuildCoordinator,
+  binding: ProjectBinding,
+): InternalRetrievalService {
+  const projections: ProjectionLeaseProvider = {
+    async pin(requestBinding): Promise<ProjectionReaderLease> {
+      assert.deepEqual(requestBinding, binding);
+      return coordinator.leasePublished(requestBinding);
+    },
+  };
+  return new InternalRetrievalService({
+    projections,
+    candidates: new SqliteRetrievalCandidateRepository(),
+  });
+}
+
+interface V2EvaluationBridge {
+  readonly service: InternalRetrievalService;
+  readonly originalLeaseAdapter: V2SqliteRetrievalCandidateRepository;
+  readonly originalLease: V2ProjectionReaderLease;
+  readonly databasePathReads: () => number;
+  readonly adapterCalls: () => number;
+  close(): void;
+}
+
+async function createV2EvaluationBridge(
+  coordinator: V2ProjectionBuildCoordinator,
+  binding: ProjectBinding,
+): Promise<V2EvaluationBridge> {
+  const originalLeases = new WeakMap<ProjectionReaderLease, V2ProjectionReaderLease>();
+  const adapter = new V2SqliteRetrievalCandidateRepository();
+  const originalLease = await coordinator.leasePublishedForEvaluation(binding);
+  let databasePathReads = 0;
+  let adapterCalls = 0;
+  let closed = false;
+  const projections: ProjectionLeaseProvider = {
+    async pin(requestBinding): Promise<ProjectionReaderLease> {
+      assert.deepEqual(requestBinding, binding);
+      assert.equal(closed, false, "V2 evaluation bridge must retain its verified lease");
+      let view: ProjectionReaderLease;
+      view = Object.freeze({
+        manifest: v1ManifestView(originalLease.manifest),
+        get databasePath(): string {
+          databasePathReads += 1;
+          throw new Error("V2 evaluation bridge must not read a V1 database path");
+        },
+        close(): void {
+          originalLeases.delete(view);
+        },
+      });
+      originalLeases.set(view, originalLease);
+      return view;
+    },
+  };
+  const candidates: RetrievalCandidateRepository = {
+    collectEligible(lease, request): RetrievalCandidateCollection {
+      const original = originalLeases.get(lease);
+      assert.ok(original, "V2 candidate adapter must receive its preserved original lease");
+      adapterCalls += 1;
+      return adapter.collectEligible(original, request);
+    },
+  };
+  return Object.freeze({
+    service: new InternalRetrievalService({ projections, candidates }),
+    originalLeaseAdapter: adapter,
+    originalLease,
+    databasePathReads: () => databasePathReads,
+    adapterCalls: () => adapterCalls,
+    close(): void {
+      if (closed) return;
+      closed = true;
+      originalLease.close();
+    },
+  });
+}
+
+function directSourceRequest(
+  binding: ProjectBinding,
+  eventPosition: bigint,
+  sessionId: string,
+  query: string,
+): InternalRetrievalRequest {
+  return Object.freeze({
+    binding,
+    query,
+    limit: 10,
+    tokenBudget: 32_768,
+    consistency: Object.freeze({ requiredEventPosition: eventPosition, deadlineMs: 30_000 }),
+    candidateLimit: 512,
+    explain: false,
+    includeGlobal: false,
+    visibility: "session",
+    vector: Object.freeze({ enabled: false }),
+    sessionId,
+    validAt: "2026-08-28T00:00:00.000Z",
+    knownAt: eventPosition,
+  });
+}
+
+function candidateItemIds(collection: RetrievalCandidateCollection): readonly string[] {
+  return Object.freeze(collection.channels.flatMap((channel) => (
+    channel.candidates.map((candidate) => candidate.item.id)
+  )));
+}
+
+describe("real sealed V1/V2 retrieval evaluator harness", () => {
+  it("hydrates authenticated sources, reproduces V1, and seals V2 through the detached lease bridge", async () => {
+    const harness = await createRealEvaluationHarness();
+    const v1Service = createRealV1EvaluationService(harness.v1Coordinator, harness.primary.binding);
+    const v1Report = await evaluateRetrievalQueries(
+      harness.corpus.queries,
+      "retrieval-evaluation-v1",
+      v1Service,
+    );
+    if (process.env.RETRIEVAL_EVALUATION_REAL_REPORT === "1") {
+      process.stdout.write(`${JSON.stringify(v1Report)}\n`);
+    }
+    assert.deepEqual(v1Report, harness.corpus.baseline.metrics);
+
+    const bridge = await createV2EvaluationBridge(
+      harness.primaryV2Coordinator,
+      harness.primary.binding,
+    );
+    try {
+      const v2Report = await evaluateSealedRetrieval(harness.corpus, bridge.service);
+    assert.equal(v2Report.corpusVersion, "retrieval-evaluation-v2");
+    assert.equal(Object.isFrozen(v2Report), true);
+    assert.doesNotMatch(JSON.stringify(v2Report), /queryText|expectedCitations|relevanceGrades|projectId/);
+    assert.equal(bridge.databasePathReads(), 0);
+    assert.equal(bridge.adapterCalls(), harness.corpus.queries.length);
+
+    const primaryEvent = record(harness.corpus.sources[0]!.events[2], "primary memory event");
+    const primaryPayload = record(primaryEvent.payload, "primary memory payload");
+    {
+      const primaryRequest = directSourceRequest(
+        harness.primary.binding,
+        harness.primary.terminalPosition,
+        rawText(primaryEvent, "sessionId"),
+        rawText(primaryPayload, "normalizedKey"),
+      );
+      const baselineCandidates = candidateItemIds(
+        bridge.originalLeaseAdapter.collectEligible(bridge.originalLease, primaryRequest),
+      );
+      assert.ok(baselineCandidates.includes(rawText(primaryPayload, "itemId")));
+      const competingEvent = record(harness.corpus.sources[1]!.events[0], "competing memory event");
+      const competingPayload = record(competingEvent.payload, "competing memory payload");
+      assert.equal(baselineCandidates.includes(rawText(competingPayload, "itemId")), false);
+
+      const originalPath = harness.primaryV2DatabasePath;
+      const displacedPath = `${originalPath}.sealed-original`;
+      renameSync(originalPath, displacedPath);
+      copyFileSync(harness.competingV2DatabasePath, originalPath);
+      assert.deepEqual(
+        candidateItemIds(bridge.originalLeaseAdapter.collectEligible(bridge.originalLease, primaryRequest)),
+        baselineCandidates,
+      );
+      rmSync(originalPath, { force: true });
+      renameSync(displacedPath, originalPath);
+
+      const competingLease = await harness.competingV2Coordinator.leasePublishedForEvaluation(
+        harness.competing.binding,
+      );
+      try {
+        const competingRequest = directSourceRequest(
+          harness.competing.binding,
+          harness.competing.terminalPosition,
+          rawText(competingEvent, "sessionId"),
+          rawText(competingPayload, "normalizedKey"),
+        );
+        assert.ok(candidateItemIds(bridge.originalLeaseAdapter.collectEligible(
+          competingLease,
+          competingRequest,
+        )).includes(rawText(competingPayload, "itemId")));
+      } finally {
+        competingLease.close();
+      }
+    }
+
+    const [firstQuery] = harness.corpus.queries;
+    assert.ok(firstQuery);
+    const contaminated = Object.freeze({
+      async retrieve(request: InternalRetrievalRequest) {
+        const result = await bridge.service.retrieve(request);
+        if (request.query !== firstQuery.queryText) return result;
+        const first = result.items[0];
+        assert.ok(first);
+        return Object.freeze({
+          ...result,
+          items: Object.freeze([first, Object.freeze({ ...first, projectId: harness.competing.binding.projectId })]),
+        });
+      },
+    });
+    const contaminationReport = await evaluateRetrievalQueries(
+      Object.freeze([firstQuery]),
+      "retrieval-evaluation-v2",
+      contaminated,
+    );
+    assert.equal(contaminationReport.crossProjectContamination, 1);
+    } finally {
+      bridge.close();
+    }
   });
 });
 
@@ -1029,6 +1537,38 @@ describe("immutable bilingual retrieval evaluation corpus", () => {
 });
 
 describe("retrieval evaluation metrics", () => {
+  it("hard-disables sealed vectors before any retrieval and accumulates V2 reports", async () => {
+    let retrievals = 0;
+    assert.throws(
+      () => assertSealedEvaluationVectorDisabled(Object.freeze({ enabled: true })),
+      (error: unknown) => error instanceof RetrievalEvaluationCorpusError,
+    );
+    assert.doesNotThrow(() => assertSealedEvaluationVectorDisabled(Object.freeze({ enabled: false })));
+
+    const corpus = readCorpus();
+    const fixture = createEvaluationService(corpus);
+    const service = Object.freeze({
+      async retrieve(request: InternalRetrievalRequest) {
+        retrievals += 1;
+        assert.ok(request.vector);
+        assert.equal(request.vector.enabled, false);
+        assert.equal(Object.isFrozen(request.vector), true);
+        return fixture.service.retrieve(request);
+      },
+    });
+
+    const report = await evaluateRetrievalQueries(
+      Object.freeze([corpus.queries[0]!]),
+      "retrieval-evaluation-v2",
+      service,
+    );
+
+    assert.equal(report.corpusVersion, "retrieval-evaluation-v2");
+    assert.equal(report.queryCount, 1);
+    assert.equal(report.failedQueryCount, 0);
+    assert.equal(retrievals, 1);
+  });
+
   it("meets every Subproject 3 threshold on the committed 500-query corpus", async () => {
     const corpus = readCorpus();
     const fixture = createEvaluationService(corpus);

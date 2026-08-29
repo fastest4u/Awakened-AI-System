@@ -818,6 +818,8 @@ function requestFor(query: RetrievalEvaluationQueryV1): InternalRetrievalRequest
     branchRef: scope.branchRef,
     sessionId: null,
   });
+  const vector = Object.freeze({ enabled: false } as const);
+  assertSealedEvaluationVectorDisabled(vector);
   return Object.freeze({
     binding,
     query: query.queryText,
@@ -831,11 +833,18 @@ function requestFor(query: RetrievalEvaluationQueryV1): InternalRetrievalRequest
     explain: false,
     includeGlobal: false,
     visibility: scope.visibility,
-    vector: Object.freeze({ enabled: false }),
+    vector,
     ...(scope.sessionId === null ? {} : { sessionId: scope.sessionId }),
     ...(scope.validAt === null ? {} : { validAt: scope.validAt }),
     ...(scope.knownAt === null ? {} : { knownAt: BigInt(scope.knownAt) }),
   });
+}
+
+/** Sealed V2 evaluation never permits vector retrieval into its measured result. */
+export function assertSealedEvaluationVectorDisabled(
+  vector: Readonly<{ readonly enabled: boolean }> | undefined,
+): asserts vector is Readonly<{ readonly enabled: false }> {
+  if (vector?.enabled !== false) invalid();
 }
 
 function relevantIds(query: RetrievalEvaluationQueryV1): readonly string[] {
@@ -947,13 +956,17 @@ function subgroupRecall(
   return mean(outcomes.filter((outcome) => select(outcome.query)).map((outcome) => outcome.recallAt10));
 }
 
-export async function evaluateRetrieval(
-  corpus: RetrievalEvaluationCorpusV1,
+export async function evaluateRetrievalQueries(
+  queries: readonly RetrievalEvaluationQueryV1[],
+  corpusVersion: RetrievalEvaluationCorpusVersion,
   service: RetrievalEvaluationService,
 ): Promise<RetrievalEvaluationReport> {
-  const validated = parseRetrievalEvaluationCorpus(corpus);
+  if (
+    corpusVersion !== "retrieval-evaluation-v1"
+    && corpusVersion !== "retrieval-evaluation-v2"
+  ) return invalid();
   const outcomes: RetrievalEvaluationOutcome[] = [];
-  for (const query of validated.queries) outcomes.push(await evaluateOne(query, service));
+  for (const query of queries) outcomes.push(await evaluateOne(query, service));
   const returnedCitationCount = sum(outcomes, (outcome) => outcome.returnedCitationCount);
   const expectedCitationCount = sum(outcomes, (outcome) => outcome.expectedCitationCount);
   const returnedItemCount = sum(outcomes, (outcome) => outcome.returnedItemCount);
@@ -961,18 +974,18 @@ export async function evaluateRetrieval(
   const expectedConflictCount = sum(outcomes, (outcome) => outcome.expectedConflictCount);
   const bitemporal = outcomes.filter((outcome) => outcome.query.expectations.bitemporal);
   const languageCounts = Object.freeze({
-    en: validated.queries.filter((query) => query.language === "en").length,
-    th: validated.queries.filter((query) => query.language === "th").length,
-    mixed: validated.queries.filter((query) => query.language === "mixed").length,
+    en: queries.filter((query) => query.language === "en").length,
+    th: queries.filter((query) => query.language === "th").length,
+    mixed: queries.filter((query) => query.language === "mixed").length,
   });
   const criticalClassCounts = Object.freeze(Object.fromEntries(
     RETRIEVAL_EVALUATION_CRITICAL_CLASSES.map((criticalClass) => [
       criticalClass,
-      validated.queries.filter((query) => query.criticalClass === criticalClass).length,
+      queries.filter((query) => query.criticalClass === criticalClass).length,
     ]),
   )) as Readonly<Record<RetrievalEvaluationCriticalClass, number>>;
   return Object.freeze({
-    corpusVersion: "retrieval-evaluation-v1",
+    corpusVersion,
     queryCount: outcomes.length,
     failedQueryCount: outcomes.filter((outcome) => outcome.failed).length,
     languageCounts,
@@ -1015,4 +1028,62 @@ export async function evaluateRetrieval(
       (outcome) => outcome.unsupportedHighImpactVerifiedClaims,
     ),
   });
+}
+
+export async function evaluateRetrieval(
+  corpus: RetrievalEvaluationCorpusV1,
+  service: RetrievalEvaluationService,
+): Promise<RetrievalEvaluationReport> {
+  const validated = parseRetrievalEvaluationCorpus(corpus);
+  return evaluateRetrievalQueries(validated.queries, "retrieval-evaluation-v1", service);
+}
+
+function assertSealedRetrievalThresholds(
+  report: RetrievalEvaluationReport,
+  baseline: RetrievalEvaluationReport,
+): void {
+  if (
+    report.failedQueryCount !== 0
+    || report.crossProjectContamination !== 0
+    || report.recallAt10 < 0.95
+    || report.mrr < 0.90
+    || report.ndcgAt10 < 0.90
+    || report.citationPrecision < 0.95
+    || report.citationRecall < 0.95
+    || report.staleActiveMemoryRate > 0.01
+    || report.exactIdentifierPathRecall !== 1
+    || report.currentSessionCheckpointRecallAt10 !== 1
+    || report.openFollowUpRecallAt10 !== 1
+    || report.nextActionRecallAt10 !== 1
+    || report.semanticParaphraseRecallAt10 < 0.90
+    || report.bitemporalAccuracy < 0.95
+    || report.conflictRecall !== 1
+    || report.conflictPrecision !== 1
+    || report.unsupportedHighImpactVerifiedClaims !== 0
+  ) return invalid();
+  for (const metric of [
+    "recallAt10", "mrr", "ndcgAt10", "citationPrecision", "citationRecall",
+    "exactIdentifierPathRecall", "currentSessionCheckpointRecallAt10",
+    "openFollowUpRecallAt10", "nextActionRecallAt10", "semanticParaphraseRecallAt10",
+    "bitemporalAccuracy", "conflictRecall", "conflictPrecision",
+  ] as const) {
+    if (report[metric] < baseline[metric]) return invalid();
+  }
+  if (
+    report.staleActiveMemoryRate > baseline.staleActiveMemoryRate
+    || report.unsupportedHighImpactVerifiedClaims > baseline.unsupportedHighImpactVerifiedClaims
+  ) return invalid();
+}
+
+export async function evaluateSealedRetrieval(
+  corpus: SealedRetrievalEvaluationCorpusV2,
+  service: RetrievalEvaluationService,
+): Promise<RetrievalEvaluationReport> {
+  const report = await evaluateRetrievalQueries(
+    corpus.queries,
+    "retrieval-evaluation-v2",
+    service,
+  );
+  assertSealedRetrievalThresholds(report, corpus.baseline.metrics);
+  return report;
 }
