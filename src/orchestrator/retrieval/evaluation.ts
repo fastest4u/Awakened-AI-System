@@ -1038,7 +1038,8 @@ export async function evaluateRetrieval(
   return evaluateRetrievalQueries(validated.queries, "retrieval-evaluation-v1", service);
 }
 
-function assertSealedRetrievalThresholds(
+/** Pure sealed aggregate gate shared by the evaluator and its valid-report tests. */
+export function assertSealedRetrievalThresholds(
   report: RetrievalEvaluationReport,
   baseline: RetrievalEvaluationReport,
 ): void {

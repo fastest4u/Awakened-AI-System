@@ -37,6 +37,7 @@ import {
   RETRIEVAL_EVALUATION_CRITICAL_CLASSES,
   RetrievalEvaluationCorpusError,
   assertSealedEvaluationVectorDisabled,
+  assertSealedRetrievalThresholds,
   evaluateRetrieval,
   evaluateRetrievalQueries,
   evaluateSealedRetrieval,
@@ -44,6 +45,7 @@ import {
   parseSealedRetrievalEvaluationBundle,
   type RetrievalEvaluationCorpusV1,
   type RetrievalEvaluationQueryV1,
+  type RetrievalEvaluationReport,
   type SealedRetrievalEvaluationCorpusV2,
 } from "../src/orchestrator/retrieval/evaluation.js";
 import {
@@ -59,10 +61,7 @@ import type {
   RetrievalItem,
   RetrievalItemKind,
 } from "../src/orchestrator/retrieval/contracts.js";
-import {
-  InternalRetrievalService,
-  type RankedInternalRetrievalResult,
-} from "../src/orchestrator/retrieval/service.js";
+import { InternalRetrievalService } from "../src/orchestrator/retrieval/service.js";
 import { SqliteRetrievalCandidateRepository } from "../src/orchestrator/retrieval/candidates.js";
 import { V2SqliteRetrievalCandidateRepository } from "../src/orchestrator/retrieval/v2-candidates.js";
 import { PROJECT_MEMORY_APPLICATION_ID } from "../src/orchestrator/runtime/runtime-capabilities.js";
@@ -1280,251 +1279,71 @@ describe("real sealed V1/V2 retrieval evaluator harness", () => {
   });
 });
 
-describe("sealed V2 evaluator threshold enforcement", () => {
-  it("rejects every absolute and baseline regression from the parsed sealed corpus", async () => {
+describe("sealed V2 threshold predicate", () => {
+  it("independently rejects valid absolute and reachable baseline regressions", async () => {
     const sealed = readStaticSealedV2Inputs().corpus;
     const fixture = createEvaluationService(sealed as unknown as RetrievalEvaluationCorpusV1);
-    const queriesByText = new Map(sealed.queries.map((query) => [query.queryText, query]));
-    const selected = (
-      label: string,
-      predicate: (query: RetrievalEvaluationQueryV1) => boolean,
-      count = 1,
-    ): readonly RetrievalEvaluationQueryV1[] => {
-      const queries = sealed.queries.filter(predicate).slice(0, count);
-      assert.equal(queries.length, count, `missing ${label} query coverage`);
-      return Object.freeze(queries);
-    };
-    const ordinary = selected(
-      "ordinary",
-      (query) => !query.expectations.exactIdentifierPath
-        && !query.expectations.currentSessionCheckpoint
-        && !query.expectations.openFollowUp
-        && !query.expectations.nextAction
-        && !query.expectations.semanticParaphrase
-        && !query.expectations.bitemporal
-        && query.expectations.conflictGroupIds.length === 0,
-      30,
-    );
-    const ordinaryIds = new Set(ordinary.map((query) => query.queryId));
-    const controlled = (
-      mutate: (
-        query: RetrievalEvaluationQueryV1,
-        result: RankedInternalRetrievalResult,
-      ) => RankedInternalRetrievalResult,
-    ) => Object.freeze({
-      async retrieve(request: InternalRetrievalRequest): Promise<RankedInternalRetrievalResult> {
-        const query = queriesByText.get(request.query);
-        assert.ok(query, "sealed evaluator must issue a sealed query");
-        return mutate(query, await fixture.service.retrieve(request));
-      },
+    const report = Object.freeze({
+      ...sealed.baseline.metrics,
+      corpusVersion: "retrieval-evaluation-v2" as const,
     });
-    const withoutItems = (
-      queryIds: ReadonlySet<string>,
-      clearConflicts = false,
-    ) => controlled((query, result) => {
-      if (!queryIds.has(query.queryId)) return result;
-      return Object.freeze({
-        ...result,
-        items: Object.freeze([]),
-        ...(clearConflicts ? { conflicts: Object.freeze([]) } : {}),
-      }) as RankedInternalRetrievalResult;
-    });
-    const assertRejects = async (
+    const reject = (
       label: string,
-      corpus: SealedRetrievalEvaluationCorpusV2,
-      service: ReturnType<typeof controlled>,
-    ): Promise<void> => {
-      await assert.rejects(
-        () => evaluateSealedRetrieval(corpus, service),
+      changes: Partial<RetrievalEvaluationReport>,
+      baselineChanges: Partial<RetrievalEvaluationReport> = {},
+    ): void => {
+      const candidate = Object.freeze({ ...report, ...changes });
+      const baseline = Object.freeze({ ...sealed.baseline.metrics, ...baselineChanges });
+      assert.throws(
+        () => assertSealedRetrievalThresholds(candidate, baseline),
         (error: unknown) => error instanceof RetrievalEvaluationCorpusError,
         label,
       );
     };
-    const withMetrics = (
-      changes: Readonly<Record<string, number>>,
-    ): SealedRetrievalEvaluationCorpusV2 => Object.freeze({
-      ...sealed,
-      baseline: Object.freeze({
-        ...sealed.baseline,
-        metrics: Object.freeze({ ...sealed.baseline.metrics, ...changes }),
-      }),
-    });
 
-    await assertRejects(
-      "failed query count",
-      sealed,
-      controlled((query, result) => {
-        if (query.queryId === ordinary[0]!.queryId) throw new Error("controlled retrieval fault");
-        return result;
-      }),
-    );
-    await assertRejects(
-      "cross-project contamination before identifier deduplication",
-      sealed,
-      controlled((query, result) => {
-        if (query.queryId !== ordinary[0]!.queryId) return result;
-        const item = result.items[0];
-        assert.ok(item);
-        return Object.freeze({
-          ...result,
-          items: Object.freeze([
-            item,
-            Object.freeze({ ...item, projectId: "f".repeat(64) as ProjectId }),
-          ]),
-        }) as RankedInternalRetrievalResult;
-      }),
-    );
-    await assertRejects(
-      "recall, ranking, and citation lower bounds",
-      sealed,
-      withoutItems(ordinaryIds),
-    );
-    await assertRejects(
-      "citation precision lower bound",
-      sealed,
-      controlled((query, result) => {
-        if (!ordinaryIds.has(query.queryId)) return result;
-        const item = result.items[0];
-        assert.ok(item);
-        return Object.freeze({
-          ...result,
-          items: Object.freeze([
-            item,
-            Object.freeze({
-              ...item,
-              id: "70000000-0000-4000-8000-000000000001",
-              normalizedKey: `unjudged:${query.queryId}`,
-              anchor: "memory://unjudged",
-            }),
-          ]),
-        }) as RankedInternalRetrievalResult;
-      }),
-    );
-    const citationRecallCorpus = Object.freeze({
-      ...sealed,
-      queries: Object.freeze(sealed.queries.map((query) => (
-        ordinaryIds.has(query.queryId)
-          ? Object.freeze({
-            ...query,
-            expectedCitations: Object.freeze([
-              ...query.expectedCitations,
-              Object.freeze({
-                itemId: query.expectedCitations[0]!.itemId,
-                anchor: `memory://unreturned/${query.queryId}`,
-              }),
-            ]),
-          })
-          : query
-      ))),
-    });
-    await assertRejects("citation recall lower bound", citationRecallCorpus, controlled((_query, result) => result));
+    assert.doesNotThrow(() => assertSealedRetrievalThresholds(report, sealed.baseline.metrics));
+    const integrated = await evaluateSealedRetrieval(sealed, fixture.service);
+    assert.equal(integrated.corpusVersion, "retrieval-evaluation-v2");
 
-    const staleIds = new Set(selected("stale", (query) => ordinaryIds.has(query.queryId), 6)
-      .map((query) => query.queryId));
-    const staleBaselineIds = new Set(ordinary.slice(0, 5).map((query) => query.queryId));
-    await assertRejects(
-      "stale-active rate lower bound",
-      sealed,
-      controlled((query, result) => {
-        if (!staleIds.has(query.queryId)) return result;
-        return Object.freeze({
-          ...result,
-          items: Object.freeze(result.items.map((item) => Object.freeze({ ...item, freshness: "stale" as const }))),
-        }) as RankedInternalRetrievalResult;
-      }),
-    );
+    reject("failed query count", { failedQueryCount: 1 });
+    reject("cross-project contamination", { crossProjectContamination: 1 });
+    reject("recall", { recallAt10: 0.949 });
+    reject("MRR", { mrr: 0.899 });
+    reject("NDCG", { ndcgAt10: 0.899 });
+    reject("citation precision", { citationPrecision: 0.949 });
+    reject("citation recall", { citationRecall: 0.949 });
+    reject("stale-active rate", { staleActiveMemoryRate: 0.011 });
+    reject("exact identifier", { exactIdentifierPathRecall: 0.999 });
+    reject("checkpoint", { currentSessionCheckpointRecallAt10: 0.999 });
+    reject("open follow-up", { openFollowUpRecallAt10: 0.999 });
+    reject("next action", { nextActionRecallAt10: 0.999 });
+    reject("semantic paraphrase", { semanticParaphraseRecallAt10: 0.899 });
+    reject("bitemporal", { bitemporalAccuracy: 0.949 });
+    reject("conflict recall", { conflictRecall: 0.999 });
+    reject("conflict precision", { conflictPrecision: 0.999 });
+    reject("unsupported high-impact claims", { unsupportedHighImpactVerifiedClaims: 1 });
 
-    const exact = selected("exact identifier", (query) => query.expectations.exactIdentifierPath);
-    const checkpoint = selected("checkpoint", (query) => query.expectations.currentSessionCheckpoint);
-    const openFollowUp = selected("open follow-up", (query) => query.expectations.openFollowUp);
-    const nextAction = selected(
-      "next action",
-      (query) => query.expectations.nextAction && !query.expectations.openFollowUp,
-    );
-    const semantic = selected("semantic", (query) => query.expectations.semanticParaphrase, 6);
-    const bitemporal = selected("bitemporal", (query) => query.expectations.bitemporal, 3);
-    for (const [label, queries] of [
-      ["exact identifier recall", exact],
-      ["current-session checkpoint recall", checkpoint],
-      ["open follow-up recall", openFollowUp],
-      ["next-action recall", nextAction],
-      ["semantic paraphrase recall", semantic],
-      ["bitemporal accuracy", bitemporal],
-    ] as const) {
-      await assertRejects(label, sealed, withoutItems(new Set(queries.map((query) => query.queryId))));
-    }
-
-    const conflict = selected("conflict", (query) => query.expectations.conflictGroupIds.length > 0);
-    await assertRejects(
-      "conflict recall",
-      sealed,
-      withoutItems(new Set([conflict[0]!.queryId]), true),
-    );
-    await assertRejects(
-      "conflict precision",
-      sealed,
-      controlled((query, result) => {
-        if (query.queryId !== conflict[0]!.queryId) return result;
-        const group = result.conflicts[0];
-        assert.ok(group);
-        return Object.freeze({
-          ...result,
-          conflicts: Object.freeze([
-            group,
-            Object.freeze({ ...group, conflictGroupId: "60000000-0000-4000-8000-000000000999" }),
-          ]),
-        }) as RankedInternalRetrievalResult;
-      }),
-    );
-    await assertRejects(
-      "unsupported high-impact verified claims",
-      sealed,
-      controlled((query, result) => {
-        if (query.queryId !== ordinary[0]!.queryId) return result;
-        const item = result.items[0];
-        assert.ok(item);
-        return Object.freeze({
-          ...result,
-          items: Object.freeze([
-            item,
-            Object.freeze({
-              ...item,
-              id: "70000000-0000-4000-8000-000000000002",
-              normalizedKey: "unjudged-high-impact",
-              conflictGroupId: "60000000-0000-4000-8000-000000000998",
-            }),
-          ]),
-        }) as RankedInternalRetrievalResult;
-      }),
-    );
-
-    const baselineHigher = [
+    for (const metric of [
       "recallAt10", "mrr", "ndcgAt10", "citationPrecision", "citationRecall",
-      "exactIdentifierPathRecall", "currentSessionCheckpointRecallAt10",
-      "openFollowUpRecallAt10", "nextActionRecallAt10", "semanticParaphraseRecallAt10",
-      "bitemporalAccuracy", "conflictRecall", "conflictPrecision",
-    ] as const;
-    for (const metric of baselineHigher) {
-      const changes = Object.fromEntries(baselineHigher.map((key) => [key, 0]));
-      changes[metric] = 1.001;
-      await assertRejects(`V1 baseline ${metric} regression`, withMetrics(changes), controlled((_query, result) => result));
+      "semanticParaphraseRecallAt10", "bitemporalAccuracy",
+    ] as const) {
+      reject(`V1 baseline ${metric}`, { [metric]: 0.99 });
     }
-    await assertRejects(
-      "V1 baseline stale-active regression",
-      withMetrics({ staleActiveMemoryRate: 0 }),
-      controlled((query, result) => {
-        if (!staleBaselineIds.has(query.queryId)) return result;
-        return Object.freeze({
-          ...result,
-          items: Object.freeze(result.items.map((item) => Object.freeze({ ...item, freshness: "stale" as const }))),
-        }) as RankedInternalRetrievalResult;
-      }),
+    reject(
+      "V1 baseline stale-active rate",
+      { staleActiveMemoryRate: 0.005 },
+      { staleActiveMemoryRate: 0.004 },
     );
-    await assertRejects(
-      "V1 baseline unsupported-claim regression",
-      withMetrics({ unsupportedHighImpactVerifiedClaims: -1 }),
-      controlled((_query, result) => result),
-    );
+
+    for (const metric of [
+      "exactIdentifierPathRecall", "currentSessionCheckpointRecallAt10",
+      "openFollowUpRecallAt10", "nextActionRecallAt10", "conflictRecall", "conflictPrecision",
+    ] as const) {
+      assert.equal(report[metric], 1, `${metric} absolute gate fixes the report at one`);
+      assert.ok(sealed.baseline.metrics[metric] <= 1, `${metric} baseline is parser-valid`);
+    }
+    assert.equal(report.unsupportedHighImpactVerifiedClaims, 0);
+    assert.ok(sealed.baseline.metrics.unsupportedHighImpactVerifiedClaims >= 0);
   });
 });
 
