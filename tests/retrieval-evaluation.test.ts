@@ -1189,9 +1189,6 @@ describe("real sealed V1/V2 retrieval evaluator harness", () => {
       "retrieval-evaluation-v1",
       v1Service,
     );
-    if (process.env.RETRIEVAL_EVALUATION_REAL_REPORT === "1") {
-      process.stdout.write(`${JSON.stringify(v1Report)}\n`);
-    }
     assert.deepEqual(v1Report, harness.corpus.baseline.metrics);
 
     const bridge = await createV2EvaluationBridge(
@@ -1203,6 +1200,9 @@ describe("real sealed V1/V2 retrieval evaluator harness", () => {
     assert.equal(v2Report.corpusVersion, "retrieval-evaluation-v2");
     assert.equal(Object.isFrozen(v2Report), true);
     assert.doesNotMatch(JSON.stringify(v2Report), /queryText|expectedCitations|relevanceGrades|projectId/);
+    if (process.env.RETRIEVAL_EVALUATION_REAL_REPORT === "sealed-v2") {
+      process.stdout.write(`${JSON.stringify(v2Report)}\n`);
+    }
     assert.equal(bridge.databasePathReads(), 0);
     assert.equal(bridge.adapterCalls(), harness.corpus.queries.length);
 
@@ -1669,7 +1669,6 @@ describe("retrieval evaluation metrics", () => {
     assert.equal(Object.isFrozen(report), true);
     const aggregateOnly = JSON.stringify(report);
     assert.doesNotMatch(aggregateOnly, /queryText|expectedCitations|relevanceGrades|projectId/);
-    if (process.env.RETRIEVAL_EVALUATION_REPORT === "1") process.stdout.write(`${aggregateOnly}\n`);
   });
 
   it("computes macro ranking metrics instead of merely counting queries", async () => {

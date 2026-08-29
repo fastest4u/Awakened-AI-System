@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { readFileSync, readdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
@@ -65,6 +65,22 @@ function subproject3Script(): string {
   const script = packageJson.scripts?.["test:subproject-3"];
   if (typeof script !== "string") assert.fail("test:subproject-3 must exist");
   return script;
+}
+
+function realV2EvaluatorSource(): string {
+  const evaluator = source("tests/retrieval-evaluation.test.ts");
+  const start = evaluator.indexOf("async function createRealEvaluationHarness");
+  const end = evaluator.indexOf("function createEvaluationService", start);
+  assert.ok(start >= 0 && end > start, "real V2 evaluator source must have stable bounds");
+  return evaluator.slice(start, end);
+}
+
+function runRetrievalEvaluation(...targets: readonly string[]) {
+  return spawnSync(
+    process.execPath,
+    ["scripts/run-retrieval-evaluation.js", ...targets],
+    { cwd: fileURLToPath(ROOT), encoding: "utf8" },
+  );
 }
 
 const PLAIN_WORKFLOW_KEY = "[A-Za-z][A-Za-z0-9_-]*";
@@ -455,5 +471,60 @@ test("Subproject 3 evaluation and projection runtime remain internal-only", () =
       /orchestrator\/(?:projections|retrieval|runtime\/projection-runtime)/,
       `${path} must not import the Version 2 projection runtime`,
     );
+    assert.doesNotMatch(
+      source(path),
+      /\bmemory_(?:retrieval|projection)\w*/,
+      `${path} must not expose a Version 2 retrieval or projection tool`,
+    );
   }
+
+  const runtime = source("src/orchestrator/runtime/projection-runtime.ts");
+  assert.doesNotMatch(runtime, /(?:\bV2\b|\/v2-[\w-]*|\bv2-[\w-]*)/i, "V2 must remain evaluator-only");
+
+  const evaluator = source("tests/retrieval-evaluation.test.ts");
+  const realV2 = realV2EvaluatorSource();
+  assert.doesNotMatch(
+    realV2,
+    /(?:queryTextToItem(?:Id|Lookup)?|new\s+Map\s*\(\s*[^)]*\.queries)/,
+    "the real V2 evaluator must not restore an answer-driven query map",
+  );
+  assert.doesNotMatch(
+    realV2,
+    /vector:\s*(?:Object\.freeze\(\s*)?\{\s*enabled:\s*true\b/,
+    "the real V2 evaluator must keep vector evaluation disabled",
+  );
+  for (const requiredPath of [
+    "V2ProjectionBuildCoordinator",
+    "leasePublishedForEvaluation",
+    "V2SqliteRetrievalCandidateRepository",
+    "collectEligible",
+  ]) {
+    assert.match(realV2, new RegExp(requiredPath), `the real V2 evaluator must retain ${requiredPath}`);
+  }
+  const reportAssertion = evaluator.indexOf('assert.equal(v2Report.corpusVersion, "retrieval-evaluation-v2")');
+  const reportWrite = evaluator.indexOf("process.stdout.write");
+  assert.ok(reportAssertion >= 0 && reportWrite > reportAssertion, "V2 report version must be checked before output");
+  assert.match(
+    evaluator,
+    /process\.env\.RETRIEVAL_EVALUATION_REAL_REPORT === "sealed-v2"/,
+    "only the sealed runner may enable the aggregate V2 report",
+  );
+
+  const invalid = runRetrievalEvaluation(
+    "dist-test/tests/retrieval-evaluation.test.js",
+    "dist-test/tests/ci-lifecycle-gates.test.js",
+  );
+  assert.notEqual(invalid.status, 0, "the runner must reject a second test target");
+  assert.match(`${invalid.stdout}\n${invalid.stderr}`, /RETRIEVAL_EVALUATION_TARGET_INVALID/);
+
+  const normal = runRetrievalEvaluation();
+  assert.equal(normal.status, 0, normal.stderr);
+  assert.match(normal.stdout, /^\{[^\n]*"corpusVersion":"retrieval-evaluation-v2"[^\n]*\}\r?\n$/);
+  const aggregate = JSON.parse(normal.stdout) as Record<string, unknown>;
+  assert.equal(aggregate.corpusVersion, "retrieval-evaluation-v2");
+  assert.doesNotMatch(
+    normal.stdout,
+    /queryText|expectedCitations|relevanceGrades|projectId|source-events|judgments\.json|v1-shadow-baseline|[A-Za-z]:\\|\/tmp\//,
+    "runner output must contain only the aggregate V2 report",
+  );
 });
