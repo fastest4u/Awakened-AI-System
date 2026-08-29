@@ -67,12 +67,43 @@ function subproject3Script(): string {
   return script;
 }
 
-function realV2EvaluatorSource(): string {
-  const evaluator = source("tests/retrieval-evaluation.test.ts");
-  const start = evaluator.indexOf("async function createRealEvaluationHarness");
-  const end = evaluator.indexOf("function createEvaluationService", start);
-  assert.ok(start >= 0 && end > start, "real V2 evaluator source must have stable bounds");
+function sourceBetween(
+  evaluator: string,
+  startMarker: string,
+  endMarker: string,
+  label: string,
+): string {
+  const start = evaluator.indexOf(startMarker);
+  const end = evaluator.indexOf(endMarker, start + startMarker.length);
+  assert.ok(start >= 0 && end > start, `${label} must have stable bounds`);
   return evaluator.slice(start, end);
+}
+
+function realV2HarnessTestBody(evaluator: string): string {
+  return sourceBetween(
+    evaluator,
+    '  it("hydrates authenticated sources, reproduces V1, and seals V2 through the detached lease bridge", async () => {',
+    '\n  });\n});\n\ndescribe("sealed V2 threshold predicate", () => {',
+    "real V2 harness test",
+  );
+}
+
+function realV2BridgeImplementation(evaluator: string): string {
+  return sourceBetween(
+    evaluator,
+    "async function createV2EvaluationBridge(",
+    "\nfunction directSourceRequest(",
+    "real V2 bridge implementation",
+  );
+}
+
+function realV2RequestFactory(evaluator: string): string {
+  return sourceBetween(
+    evaluator,
+    "function directSourceRequest(",
+    "\nfunction candidateItemIds(",
+    "real V2 request factory",
+  );
 }
 
 function runRetrievalEvaluation(...targets: readonly string[]) {
@@ -482,25 +513,34 @@ test("Subproject 3 evaluation and projection runtime remain internal-only", () =
   assert.doesNotMatch(runtime, /(?:\bV2\b|\/v2-[\w-]*|\bv2-[\w-]*)/i, "V2 must remain evaluator-only");
 
   const evaluator = source("tests/retrieval-evaluation.test.ts");
-  const realV2 = realV2EvaluatorSource();
+  const realV2Test = realV2HarnessTestBody(evaluator);
+  const realV2Bridge = realV2BridgeImplementation(evaluator);
+  const realV2Request = realV2RequestFactory(evaluator);
   assert.doesNotMatch(
-    realV2,
+    realV2Test,
     /(?:queryTextToItem(?:Id|Lookup)?|new\s+Map\s*\(\s*[^)]*\.queries)/,
     "the real V2 evaluator must not restore an answer-driven query map",
   );
   assert.doesNotMatch(
-    realV2,
+    realV2Request,
     /vector:\s*(?:Object\.freeze\(\s*)?\{\s*enabled:\s*true\b/,
     "the real V2 evaluator must keep vector evaluation disabled",
   );
-  for (const requiredPath of [
-    "V2ProjectionBuildCoordinator",
-    "leasePublishedForEvaluation",
-    "V2SqliteRetrievalCandidateRepository",
-    "collectEligible",
-  ]) {
-    assert.match(realV2, new RegExp(requiredPath), `the real V2 evaluator must retain ${requiredPath}`);
-  }
+  assert.match(
+    realV2Test,
+    /const bridge = await createV2EvaluationBridge\(\s*harness\.primaryV2Coordinator,\s*harness\.primary\.binding,\s*\);[\s\S]*?const v2Report = await evaluateSealedRetrieval\(\s*harness\.corpus,\s*bridge\.service\s*\);/,
+    "the named V2 harness test must bridge its primary coordinator before sealed retrieval",
+  );
+  assert.match(
+    realV2Bridge,
+    /const originalLease = await coordinator\.leasePublishedForEvaluation\(binding\);/,
+    "the bounded V2 bridge must acquire its coordinator evaluation lease",
+  );
+  assert.match(
+    realV2Bridge,
+    /const original = originalLeases\.get\(lease\);[\s\S]*?return adapter\.collectEligible\(original, request\);/,
+    "the bounded V2 bridge must adapt eligible candidates from the preserved lease",
+  );
   const reportAssertion = evaluator.indexOf('assert.equal(v2Report.corpusVersion, "retrieval-evaluation-v2")');
   const reportWrite = evaluator.indexOf("process.stdout.write");
   assert.ok(reportAssertion >= 0 && reportWrite > reportAssertion, "V2 report version must be checked before output");
