@@ -1336,7 +1336,6 @@ describe("sealed V2 threshold predicate", () => {
     reject(
       "V1 baseline stale-active rate",
       { staleActiveMemoryRate: 0.005 },
-      { staleActiveMemoryRate: 0.004 },
     );
 
     for (const metric of [
