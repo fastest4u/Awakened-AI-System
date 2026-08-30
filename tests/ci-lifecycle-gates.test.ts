@@ -104,6 +104,26 @@ function subproject3Script(): string {
   return script;
 }
 
+const REQUIRED_SUBPROJECT_THREE_FOCUSED_TESTS = Object.freeze([
+  "lifecycle-command-store",
+  "lifecycle-contracts",
+  "cli.orchestrator-admin",
+  "project-binding.service",
+  "project-store-bootstrap",
+  "runtime-capabilities",
+  "stored-event-authenticator",
+]);
+
+function assertRequiredSubprojectThreeFocusedTests(script: string): void {
+  for (const target of REQUIRED_SUBPROJECT_THREE_FOCUSED_TESTS) {
+    assert.match(
+      script,
+      new RegExp(`dist-test/tests/${target.replace(/[.]/g, "\\.")}\\.test\\.js`),
+      `Subproject 3 focused gate must include ${target}.test.js`,
+    );
+  }
+}
+
 interface ProductionIsolationSource {
   readonly path: string;
   readonly contents: string;
@@ -655,8 +675,13 @@ test("Subproject 3 evaluation guard covers every production entry surface", () =
 
 test("Subproject 3 focused gate includes lifecycle isolation and rejects answer-derived evaluation", () => {
   const script = subproject3Script();
-  assert.match(script, /lifecycle-command-store\.test\.js/);
-  assert.match(script, /lifecycle-contracts\.test\.js/);
+  assertRequiredSubprojectThreeFocusedTests(script);
+  for (const target of REQUIRED_SUBPROJECT_THREE_FOCUSED_TESTS) {
+    assert.throws(
+      () => assertRequiredSubprojectThreeFocusedTests(script.replace(`${target}.test.js`, "")),
+      new RegExp(target.replace(/[.]/g, "\\.")),
+    );
+  }
 
   assert.throws(
     () => assertProductionIsolation([{
