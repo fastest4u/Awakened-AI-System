@@ -81,6 +81,46 @@ describe("Task 18 lifecycle fixture infrastructure", () => {
     );
   });
 
+  it("rejects a Git probe diagnostic attached to a non-Git fixture error", async () => {
+    const root = mkdtempSync(join(tmpdir(), "task18-fixture-invalid-git-diagnostic-"));
+    roots.push(root);
+    const controlledFixturePath = writeControlledFixture(root, `
+      process.send?.({ type: "ready", childId: "invalid-git-diagnostic", pid: process.pid });
+      process.on("message", (message) => {
+        process.send?.({
+          type: "error",
+          requestId: message.requestId,
+          code: "FIXTURE_PROTOCOL_ERROR",
+          message: "FIXTURE_PROTOCOL_ERROR",
+          gitProbeDiagnostic: {
+            phase: "binding",
+            reason: "COMMAND_FAILED",
+            probes: [{
+              argv: ["rev-parse", "--show-toplevel"],
+              cwd: "C:\\\\fixture-probe",
+              status: null,
+              stdout: "",
+              stderr: "",
+              spawnError: null
+            }]
+          }
+        });
+      });
+    `);
+    client = new LifecycleFixtureClient({
+      fixturePath: controlledFixturePath,
+      timeoutMs: 5_000,
+      cleanupTimeoutMs: 5_000,
+    });
+
+    await client.ready();
+    try {
+      await assert.rejects(client.binding(), /invalid child fixture message/i);
+    } finally {
+      await client.forceCleanup();
+    }
+  });
+
   it("uses a JSON fork transport and closes a fixture cooperatively", async () => {
     client = new LifecycleFixtureClient({
       fixturePath: FIXTURE_PATH,

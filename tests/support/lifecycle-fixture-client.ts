@@ -617,7 +617,10 @@ export function isLifecycleFixtureChildMessage(value: unknown): value is Lifecyc
         && isNonemptyString(observed.requestId)
         && isNonemptyString(observed.code)
         && isNonemptyString(observed.message)
-        && (observed.gitProbeDiagnostic === undefined || isGitProbeDiagnostic(observed.gitProbeDiagnostic));
+        && (
+          observed.gitProbeDiagnostic === undefined
+          || (observed.code === "GIT_PROBE_FAILED" && isGitProbeDiagnostic(observed.gitProbeDiagnostic))
+        );
     case "key-request":
       return hasExactKeys(observed, ["type", "requestId", "payload"])
         && isNonemptyString(observed.requestId);
