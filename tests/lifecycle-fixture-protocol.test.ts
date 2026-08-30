@@ -290,9 +290,14 @@ describe("Task 18 lifecycle fixture infrastructure", () => {
     const gitlessPath = join(root, "gitless-path");
     mkdirSync(vaultRoot, { recursive: true });
     mkdirSync(gitlessPath);
+    const gitlessEnvironment: NodeJS.ProcessEnv = { PATH: gitlessPath };
+    for (const key of ["SystemRoot", "WINDIR", "ComSpec", "TEMP", "TMP", "NODE_PATH"] as const) {
+      const value = process.env[key];
+      if (value !== undefined) gitlessEnvironment[key] = value;
+    }
     client = new LifecycleFixtureClient({
       fixturePath: FIXTURE_PATH,
-      env: { ...process.env, PATH: gitlessPath },
+      env: gitlessEnvironment,
       timeoutMs: 5_000,
       cleanupTimeoutMs: 5_000,
     });
