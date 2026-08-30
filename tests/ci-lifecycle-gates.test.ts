@@ -104,6 +104,35 @@ function subproject3Script(): string {
   return script;
 }
 
+interface ProductionIsolationSource {
+  readonly path: string;
+  readonly contents: string;
+}
+
+function assertProductionIsolation(sources: readonly ProductionIsolationSource[]): void {
+  for (const candidate of sources) {
+    if (PRODUCTION_ENTRY_SOURCE_PATHS.includes(candidate.path)) {
+      assert.doesNotMatch(
+        candidate.contents,
+        /(?:from\s+|import\s*\(|require\s*\()["'][^"']*(?:\/(?:projections|retrieval)\/(?:v2-[^"']*|evaluation)|\/runtime\/(?:projection-runtime|v2-[^"']*))[^"]*["']|registerTool\(\s*["']memory_(?:retrieval|projection)/,
+        `V2_PRODUCTION_ISOLATION: ${candidate.path} must not wire Version 2 production behavior`,
+      );
+    }
+    if (candidate.path === "tests/retrieval-evaluation.test.ts") {
+      assert.doesNotMatch(
+        candidate.contents,
+        /\b(?:answerReplay|answersByQuery|expectedAnswers)\b/,
+        "V2_PRODUCTION_ISOLATION: evaluator fixtures must not derive retrieval answers",
+      );
+      assert.match(
+        candidate.contents,
+        /assertNoAnswerDerivedFields\(query, `queries\[\$\{index\}\]`\);/,
+        "V2_PRODUCTION_ISOLATION: evaluator fixtures must reject answer-derived fields",
+      );
+    }
+  }
+}
+
 function sourceBetween(
   evaluator: string,
   startMarker: string,
@@ -622,6 +651,31 @@ test("Subproject 3 evaluation guard covers every production entry surface", () =
       `${path} must be scanned for V2 routing`,
     );
   }
+});
+
+test("Subproject 3 focused gate includes lifecycle isolation and rejects answer-derived evaluation", () => {
+  const script = subproject3Script();
+  assert.match(script, /lifecycle-command-store\.test\.js/);
+  assert.match(script, /lifecycle-contracts\.test\.js/);
+
+  assert.throws(
+    () => assertProductionIsolation([{
+      path: "src/index.ts",
+      contents: `${source("src/index.ts")}\nserver.registerTool("memory_retrievalV2", {});`,
+    }]),
+    /V2_PRODUCTION_ISOLATION/,
+  );
+  assert.throws(
+    () => assertProductionIsolation([{
+      path: "tests/retrieval-evaluation.test.ts",
+      contents: `${source("tests/retrieval-evaluation.test.ts")}\nconst answerReplay = new Map();`,
+    }]),
+    /V2_PRODUCTION_ISOLATION/,
+  );
+  assert.doesNotThrow(() => assertProductionIsolation([
+    ...PRODUCTION_ENTRY_SOURCE_PATHS.map((path) => ({ path, contents: source(path) })),
+    { path: "tests/retrieval-evaluation.test.ts", contents: source("tests/retrieval-evaluation.test.ts") },
+  ]));
 });
 
 test("Subproject 3 evaluation and projection runtime remain internal-only", () => {
