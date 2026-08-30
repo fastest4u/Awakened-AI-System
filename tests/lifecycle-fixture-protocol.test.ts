@@ -242,6 +242,55 @@ describe("Task 18 lifecycle fixture infrastructure", () => {
     assert.ok((started.payload as Record<string, unknown>).projectId !== undefined);
   });
 
+  it("returns bounded real Git probe diagnostics when the fixture cannot spawn git", async () => {
+    const root = mkdtempSync(join(tmpdir(), "task18-fixture-git-probe-"));
+    roots.push(root);
+    const projectRoot = join(root, "project");
+    const vaultRoot = join(projectRoot, "memory");
+    const gitlessPath = join(root, "gitless-path");
+    mkdirSync(vaultRoot, { recursive: true });
+    mkdirSync(gitlessPath);
+    client = new LifecycleFixtureClient({
+      fixturePath: FIXTURE_PATH,
+      env: { ...process.env, PATH: gitlessPath },
+      timeoutMs: 5_000,
+      cleanupTimeoutMs: 5_000,
+    });
+
+    await client.ready();
+    const failure = await client.binding({
+      projectRoot,
+      vaultRoot,
+      clientInstanceId: "task18-fixture-git-probe",
+    });
+    assert.equal(failure.type, "error");
+    assert.equal(failure.code, "GIT_PROBE_FAILED");
+    const diagnostic = (failure as typeof failure & {
+      readonly gitProbeDiagnostic?: {
+        readonly phase: unknown;
+        readonly reason: unknown;
+        readonly probes: readonly {
+          readonly argv: unknown;
+          readonly cwd: unknown;
+          readonly status: unknown;
+          readonly stdout: unknown;
+          readonly stderr: unknown;
+          readonly spawnError: unknown;
+        }[];
+      };
+    }).gitProbeDiagnostic;
+    assert.equal(diagnostic?.phase, "bootstrap");
+    assert.equal(diagnostic?.reason, "COMMAND_FAILED");
+    assert.equal(diagnostic?.probes.length, 1);
+    assert.deepEqual(diagnostic?.probes[0]?.argv, ["rev-parse", "--show-toplevel"]);
+    assert.equal(diagnostic?.probes[0]?.cwd, projectRoot);
+    assert.equal(diagnostic?.probes[0]?.status, null);
+    assert.equal(diagnostic?.probes[0]?.stdout, "");
+    assert.equal(diagnostic?.probes[0]?.stderr, "");
+    assert.equal((diagnostic?.probes[0]?.spawnError as { readonly code?: unknown } | null)?.code, "ENOENT");
+    assert.ok(typeof (diagnostic?.probes[0]?.spawnError as { readonly message?: unknown } | null)?.message === "string");
+  });
+
   it("acknowledges explicit project binding and open before it reports started", async () => {
     const root = mkdtempSync(join(tmpdir(), "task18-fixture-protocol-"));
     roots.push(root);

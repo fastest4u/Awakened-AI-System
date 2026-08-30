@@ -2,6 +2,7 @@ import { fork, type ChildProcess, type ForkOptions } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { ProjectBindingService } from "../../src/orchestrator/identity/project-binding.service.js";
+import type { GitWorkspaceResolutionReason } from "../../src/orchestrator/identity/git-workspace.resolver.js";
 import { WorkerProjectStoreIdentityProbe } from "../../src/orchestrator/runtime/project-store-identity-probe.js";
 import type {
   CapabilityKeyPurpose,
@@ -111,7 +112,23 @@ export type LifecycleFixtureErrorMessage = {
   readonly requestId: string;
   readonly code: string;
   readonly message: string;
+  readonly gitProbeDiagnostic?: LifecycleFixtureGitProbeDiagnostic;
 };
+
+export interface LifecycleFixtureGitProbeRecord {
+  readonly argv: readonly string[];
+  readonly cwd: string;
+  readonly status: number | null;
+  readonly stdout: string;
+  readonly stderr: string;
+  readonly spawnError: { readonly code: string | null; readonly message: string } | null;
+}
+
+export interface LifecycleFixtureGitProbeDiagnostic {
+  readonly phase: "bootstrap" | "binding";
+  readonly reason: GitWorkspaceResolutionReason | null;
+  readonly probes: readonly LifecycleFixtureGitProbeRecord[];
+}
 export interface LifecycleFixtureCloseMessage {
   readonly type: "close";
   readonly requestId: string;
@@ -483,6 +500,57 @@ function isNonemptyString(value: unknown): value is string {
   return typeof value === "string" && value.length > 0;
 }
 
+const MAX_GIT_PROBES = 16;
+const MAX_GIT_ARGV = 8;
+const MAX_GIT_TEXT_CHARS = 8 * 1024;
+const GIT_WORKSPACE_RESOLUTION_REASONS = new Set<GitWorkspaceResolutionReason>([
+  "COMMAND_FAILED",
+  "GIT_DIR_OUTSIDE_COMMON_DIR",
+  "MALFORMED_OUTPUT",
+  "PATH_CANONICALIZATION_FAILED",
+  "UNBORN_HEAD",
+  "UNEXPECTED_STDERR",
+]);
+
+function isGitProbeText(value: unknown, allowEmpty = true): value is string {
+  return typeof value === "string"
+    && (allowEmpty || value.length > 0)
+    && value.length <= MAX_GIT_TEXT_CHARS
+    && !value.includes("\0");
+}
+
+function isGitProbeRecord(value: unknown): value is LifecycleFixtureGitProbeRecord {
+  return isRecord(value)
+    && hasExactKeys(value, ["argv", "cwd", "status", "stdout", "stderr", "spawnError"])
+    && Array.isArray(value.argv)
+    && value.argv.length > 0
+    && value.argv.length <= MAX_GIT_ARGV
+    && value.argv.every((argument) => isGitProbeText(argument, false))
+    && isGitProbeText(value.cwd, false)
+    && (value.status === null || Number.isSafeInteger(value.status))
+    && isGitProbeText(value.stdout)
+    && isGitProbeText(value.stderr)
+    && (
+      value.spawnError === null
+      || (
+        isRecord(value.spawnError)
+        && hasExactKeys(value.spawnError, ["code", "message"])
+        && (value.spawnError.code === null || isGitProbeText(value.spawnError.code, false))
+        && isGitProbeText(value.spawnError.message, false)
+      )
+    );
+}
+
+function isGitProbeDiagnostic(value: unknown): value is LifecycleFixtureGitProbeDiagnostic {
+  return isRecord(value)
+    && hasExactKeys(value, ["phase", "reason", "probes"])
+    && (value.phase === "bootstrap" || value.phase === "binding")
+    && (value.reason === null || GIT_WORKSPACE_RESOLUTION_REASONS.has(value.reason as GitWorkspaceResolutionReason))
+    && Array.isArray(value.probes)
+    && value.probes.length <= MAX_GIT_PROBES
+    && value.probes.every(isGitProbeRecord);
+}
+
 function isPayloadCommand(value: Record<string, unknown>, type: LifecycleFixtureRequestBarrier): boolean {
   return value.type === type
     && hasExactKeys(value, ["type", "requestId"], ["payload"])
@@ -545,10 +613,11 @@ export function isLifecycleFixtureChildMessage(value: unknown): value is Lifecyc
         && isNonemptyString(observed.requestId)
         && isResultRequest(observed.operation);
     case "error":
-      return hasExactKeys(observed, ["type", "requestId", "code", "message"])
+      return hasExactKeys(observed, ["type", "requestId", "code", "message"], ["gitProbeDiagnostic"])
         && isNonemptyString(observed.requestId)
         && isNonemptyString(observed.code)
-        && isNonemptyString(observed.message);
+        && isNonemptyString(observed.message)
+        && (observed.gitProbeDiagnostic === undefined || isGitProbeDiagnostic(observed.gitProbeDiagnostic));
     case "key-request":
       return hasExactKeys(observed, ["type", "requestId", "payload"])
         && isNonemptyString(observed.requestId);

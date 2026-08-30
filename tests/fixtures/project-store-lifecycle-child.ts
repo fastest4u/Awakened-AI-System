@@ -1,6 +1,14 @@
 import { randomBytes, randomUUID } from "node:crypto";
+import { spawnSync } from "node:child_process";
 import { MessageChannel, Worker, type MessagePort } from "node:worker_threads";
 import type { ProjectContext } from "../../src/orchestrator/identity/contracts.js";
+import {
+  GitWorkspaceResolutionError,
+  GitWorkspaceResolver,
+  type GitCommandResult,
+  type GitCommandRunner,
+  type GitWorkspaceResolutionReason,
+} from "../../src/orchestrator/identity/git-workspace.resolver.js";
 import {
   ProjectBindingService,
 } from "../../src/orchestrator/identity/project-binding.service.js";
@@ -36,6 +44,113 @@ type FixtureMessage = {
   readonly requestId?: unknown;
   readonly payload?: unknown;
 };
+
+const MAX_GIT_PROBES = 16;
+const MAX_GIT_ARGV = 8;
+const MAX_GIT_TEXT_CHARS = 8 * 1024;
+
+type GitProbeRecord = {
+  readonly argv: readonly string[];
+  readonly cwd: string;
+  readonly status: number | null;
+  readonly stdout: string;
+  readonly stderr: string;
+  readonly spawnError: { readonly code: string | null; readonly message: string } | null;
+};
+
+type GitProbeDiagnostic = {
+  readonly phase: "bootstrap" | "binding";
+  readonly reason: GitWorkspaceResolutionReason | null;
+  readonly probes: readonly GitProbeRecord[];
+};
+
+function boundedGitText(value: string): string {
+  if (value.includes("\0")) throw new Error("FIXTURE_GIT_PROBE_NUL");
+  return value.slice(0, MAX_GIT_TEXT_CHARS);
+}
+
+function gitOutput(value: string | Buffer | undefined): string {
+  return boundedGitText(value === undefined ? "" : Buffer.isBuffer(value) ? value.toString("utf8") : value);
+}
+
+class RecordingGitCommandRunner implements GitCommandRunner {
+  readonly #records: GitProbeRecord[] = [];
+
+  run(cwd: string, args: string[]): GitCommandResult {
+    const result = spawnSync("git", args, {
+      cwd,
+      encoding: "utf8",
+      shell: false,
+      windowsHide: true,
+      timeout: 5000,
+      maxBuffer: 1024 * 1024,
+    });
+    if (this.#records.length < MAX_GIT_PROBES) {
+      const spawnError = result.error === undefined ? null : {
+        code: typeof (result.error as NodeJS.ErrnoException).code === "string"
+          ? boundedGitText((result.error as NodeJS.ErrnoException).code!)
+          : null,
+        message: boundedGitText(result.error.message),
+      };
+      this.#records.push(Object.freeze({
+        argv: Object.freeze(args.slice(0, MAX_GIT_ARGV).map(boundedGitText)),
+        cwd: boundedGitText(cwd),
+        status: result.status,
+        stdout: gitOutput(result.stdout),
+        stderr: gitOutput(result.stderr),
+        spawnError: spawnError === null ? null : Object.freeze(spawnError),
+      }));
+    }
+    return {
+      exitCode: result.status ?? 1,
+      stdout: gitOutput(result.stdout),
+      stderr: gitOutput(result.stderr) || (result.error === undefined ? "" : boundedGitText(result.error.message)),
+    };
+  }
+
+  diagnostic(
+    phase: GitProbeDiagnostic["phase"],
+    reason: GitWorkspaceResolutionReason | null,
+  ): GitProbeDiagnostic {
+    return Object.freeze({ phase, reason, probes: Object.freeze([...this.#records]) });
+  }
+}
+
+type FixtureGitProbeFailure = Error & {
+  readonly code: "GIT_PROBE_FAILED";
+  readonly gitProbeDiagnostic: GitProbeDiagnostic;
+};
+
+function gitProbeFailure(
+  phase: GitProbeDiagnostic["phase"],
+  runner: RecordingGitCommandRunner,
+  failure: unknown,
+): FixtureGitProbeFailure | undefined {
+  if (failure instanceof GitWorkspaceResolutionError && failure.code === "GIT_PROBE_FAILED") {
+    const error = new Error(failure.message) as FixtureGitProbeFailure;
+    Object.assign(error, {
+      code: "GIT_PROBE_FAILED" as const,
+      gitProbeDiagnostic: runner.diagnostic(phase, failure.reason),
+    });
+    return error;
+  }
+  if (
+    typeof failure === "object" && failure !== null
+    && "code" in failure && (failure as { readonly code?: unknown }).code === "GIT_PROBE_FAILED"
+  ) {
+    const reason = (failure as { readonly reason?: unknown }).reason;
+    const error = new Error(errorCode(failure)) as FixtureGitProbeFailure;
+    Object.assign(error, {
+      code: "GIT_PROBE_FAILED" as const,
+      gitProbeDiagnostic: runner.diagnostic(
+        phase,
+        typeof reason === "string" ? reason as GitWorkspaceResolutionReason : null,
+      ),
+    });
+    return error;
+  }
+  return undefined;
+}
 
 const WORKER_URL = new URL("../../src/workers/project-store.worker.js", import.meta.url);
 const RUNTIME_WORKER_URL = new URL("./project-store-lifecycle-runtime-worker.js", import.meta.url);
@@ -277,14 +392,30 @@ function errorCode(error: unknown): string {
   return error instanceof Error && error.message.length > 0 ? error.message : "FIXTURE_ERROR";
 }
 
-function error(message: FixtureMessage, code: string): void {
+function gitProbeFailureDiagnostic(error: unknown): GitProbeDiagnostic | undefined {
+  if (
+    typeof error === "object" && error !== null
+    && "gitProbeDiagnostic" in error
+  ) {
+    return (error as { readonly gitProbeDiagnostic?: GitProbeDiagnostic }).gitProbeDiagnostic;
+  }
+  return undefined;
+}
+
+function error(message: FixtureMessage, code: string, gitProbeDiagnostic?: GitProbeDiagnostic): void {
   const id = requestId(message);
   if (id === undefined) {
     process.exitCode = 1;
     process.disconnect?.();
     return;
   }
-  send({ type: "error", requestId: id, code, message: code });
+  send({
+    type: "error",
+    requestId: id,
+    code,
+    message: code,
+    ...(code === "GIT_PROBE_FAILED" && gitProbeDiagnostic !== undefined ? { gitProbeDiagnostic } : {}),
+  });
 }
 
 function selectDirectFault(payload: JsonRecord): { readonly boundary: "ownership-recovery"; readonly point: LifecycleFaultPoint } {
@@ -335,10 +466,16 @@ async function establish(
   if (typeof clientInstanceId !== "string" || clientInstanceId.length === 0) {
     throw new Error("FIXTURE_PROTOCOL_ERROR");
   }
-  await new DefaultProjectStoreBootstrapService().initialize({
-    projectRoot: payload.projectRoot,
-    vaultRoot: payload.vaultRoot,
-  });
+  const gitRunner = new RecordingGitCommandRunner();
+  const workspaceResolver = new GitWorkspaceResolver(gitRunner);
+  try {
+    await new DefaultProjectStoreBootstrapService({ workspaceResolver }).initialize({
+      projectRoot: payload.projectRoot,
+      vaultRoot: payload.vaultRoot,
+    });
+  } catch (failure) {
+    throw gitProbeFailure("bootstrap", gitRunner, failure) ?? failure;
+  }
   const service = new ProjectBindingService({
     // Real-process concurrency deliberately starts 32 independent fixtures at
     // once.  Let the identity probe share the fixture's bounded startup budget
@@ -348,6 +485,7 @@ async function establish(
       workerUrl: WORKER_URL,
       requestTimeoutMs: 45_000,
     }),
+    workspaceResolver,
   });
   const resolution = await service.establish({
     source: "explicit-cli",
@@ -361,7 +499,9 @@ async function establish(
   if (!resolution.ok) {
     const failure = new Error(resolution.message) as Error & { code: string };
     failure.code = resolution.code;
-    throw failure;
+    const reason = resolution.details.reason;
+    if (typeof reason === "string") Object.assign(failure, { reason });
+    throw gitProbeFailure("binding", gitRunner, failure) ?? failure;
   }
   return {
     binding: resolution.binding,
@@ -687,15 +827,15 @@ async function handle(value: unknown): Promise<void> {
   const type = message.type;
   if (typeof type !== "string") return error(message, "FIXTURE_PROTOCOL_ERROR");
   if (type === "start") {
-    try { await start(message); } catch (failure) { error(message, errorCode(failure)); }
+    try { await start(message); } catch (failure) { error(message, errorCode(failure), gitProbeFailureDiagnostic(failure)); }
     return;
   }
   if (type === "binding") {
-    try { await binding(message); } catch (failure) { error(message, errorCode(failure)); }
+    try { await binding(message); } catch (failure) { error(message, errorCode(failure), gitProbeFailureDiagnostic(failure)); }
     return;
   }
   if (type === "open") {
-    try { await open(message); } catch (failure) { error(message, errorCode(failure)); }
+    try { await open(message); } catch (failure) { error(message, errorCode(failure), gitProbeFailureDiagnostic(failure)); }
     return;
   }
   if (type === "barrier-arm") {
