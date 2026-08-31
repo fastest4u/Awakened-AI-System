@@ -42,6 +42,29 @@ function runGitFixtureSetup(cwd: string, args: string[]): void {
   assert.equal(result.status, 0, `${args.join(" ")}: ${diagnostic}`);
 }
 
+function spawnResultForGitRunnerTest(input: {
+  status: number | null;
+  stdout: string;
+  stderr: string;
+  error?: Error;
+}): ReturnType<typeof spawnSync> {
+  return {
+    pid: 1,
+    output: [null, input.stdout, input.stderr],
+    stdout: input.stdout,
+    stderr: input.stderr,
+    status: input.status,
+    signal: null,
+    error: input.error,
+  } as ReturnType<typeof spawnSync>;
+}
+
+function runnerWithGitSpawnForRetryTest(
+  replacement: typeof spawnSync,
+): SpawnSyncGitCommandRunner {
+  return new SpawnSyncGitCommandRunner(replacement);
+}
+
 describe("GitWorkspaceResolver", () => {
   let root: string | undefined;
 
@@ -419,6 +442,76 @@ describe("GitWorkspaceResolver", () => {
     assert.equal(result.exitCode, 0);
     assert.match(result.stdout, /^git version /);
     assert.equal(existsSync(sentinel), false);
+  });
+
+  it("retries a Git launch exactly once after ETIMEDOUT", () => {
+    const cwd = process.cwd();
+    const args = ["rev-parse", "--show-toplevel"];
+    const calls: Array<{ command: string; cwd: unknown; args: string[] }> = [];
+    const outcomes = [
+      spawnResultForGitRunnerTest({
+        status: null,
+        stdout: "",
+        stderr: "",
+        error: Object.assign(new Error("spawnSync git ETIMEDOUT"), { code: "ETIMEDOUT" }),
+      }),
+      spawnResultForGitRunnerTest({ status: 0, stdout: "C:\\retry-success\n", stderr: "" }),
+    ];
+    const gitSpawn = ((command: string, argv: readonly string[], options: { cwd?: unknown }) => {
+      calls.push({ command, cwd: options.cwd, args: [...argv] });
+      return outcomes.shift()!;
+    }) as unknown as typeof spawnSync;
+
+    const result = runnerWithGitSpawnForRetryTest(gitSpawn).run(cwd, args);
+
+    assert.deepEqual(result, { exitCode: 0, stdout: "C:\\retry-success\n", stderr: "" });
+    assert.deepEqual(calls, [
+      { command: "git", cwd, args },
+      { command: "git", cwd, args },
+    ]);
+  });
+
+  it("does not retry another Git launch error", () => {
+    const cwd = process.cwd();
+    const args = ["rev-parse", "--show-toplevel"];
+    const calls: Array<{ command: string; cwd: unknown; args: string[] }> = [];
+    const outcomes = [
+      spawnResultForGitRunnerTest({
+        status: null,
+        stdout: "",
+        stderr: "",
+        error: Object.assign(new Error("spawnSync git ENOENT"), { code: "ENOENT" }),
+      }),
+      spawnResultForGitRunnerTest({ status: 0, stdout: "must-not-be-used\n", stderr: "" }),
+    ];
+    const gitSpawn = ((command: string, argv: readonly string[], options: { cwd?: unknown }) => {
+      calls.push({ command, cwd: options.cwd, args: [...argv] });
+      return outcomes.shift()!;
+    }) as unknown as typeof spawnSync;
+
+    const result = runnerWithGitSpawnForRetryTest(gitSpawn).run(cwd, args);
+
+    assert.deepEqual(result, { exitCode: 1, stdout: "", stderr: "" });
+    assert.deepEqual(calls, [{ command: "git", cwd, args }]);
+  });
+
+  it("does not retry a normal failed Git command", () => {
+    const cwd = process.cwd();
+    const args = ["rev-parse", "--show-toplevel"];
+    const calls: Array<{ command: string; cwd: unknown; args: string[] }> = [];
+    const outcomes = [
+      spawnResultForGitRunnerTest({ status: 128, stdout: "", stderr: "not a repository\n" }),
+      spawnResultForGitRunnerTest({ status: 0, stdout: "must-not-be-used\n", stderr: "" }),
+    ];
+    const gitSpawn = ((command: string, argv: readonly string[], options: { cwd?: unknown }) => {
+      calls.push({ command, cwd: options.cwd, args: [...argv] });
+      return outcomes.shift()!;
+    }) as unknown as typeof spawnSync;
+
+    const result = runnerWithGitSpawnForRetryTest(gitSpawn).run(cwd, args);
+
+    assert.deepEqual(result, { exitCode: 128, stdout: "", stderr: "not a repository\n" });
+    assert.deepEqual(calls, [{ command: "git", cwd, args }]);
   });
 
   it("gives linked worktrees with spaces and Thai segments distinct stable identities", () => {
