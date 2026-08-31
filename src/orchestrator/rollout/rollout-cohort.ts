@@ -85,7 +85,6 @@ export function decodeRolloutRevision(input: unknown): RolloutRevision {
 
     return deepFreeze(revision);
   } catch (error) {
-    if (error instanceof RolloutControlPlaneError) throw error;
     return invalidInput();
   }
 }
@@ -132,7 +131,6 @@ function decodeRolloutCohortBinding(input: unknown): RolloutCohortBinding {
       workspaceId,
     });
   } catch (error) {
-    if (error instanceof RolloutControlPlaneError) throw error;
     return invalidInput();
   }
 }

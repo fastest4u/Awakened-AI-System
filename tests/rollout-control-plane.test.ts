@@ -142,6 +142,23 @@ describe("rollout control-plane deterministic cohorts", () => {
     assertInputInvalid(() => decodeRolloutRevision(hiddenInput));
   });
 
+  it("normalizes hostile proxy trap errors to input-invalid", () => {
+    const scopeDenied = () => new RolloutControlPlaneError("ROLLOUT_SCOPE_DENIED");
+    const hostileRevision = new Proxy(REVISION_INPUT, {
+      getPrototypeOf: () => {
+        throw scopeDenied();
+      },
+    });
+    const hostileBinding = new Proxy(BINDING, {
+      getPrototypeOf: () => {
+        throw scopeDenied();
+      },
+    });
+
+    assertInputInvalid(() => decodeRolloutRevision(hostileRevision));
+    assertInputInvalid(() => cohortBucket(decodeRolloutRevision(REVISION_INPUT), hostileBinding));
+  });
+
   it("strictly validates cohort bindings", () => {
     const revision = decodeRolloutRevision(REVISION_INPUT);
     const inheritedBinding = Object.create(BINDING) as typeof BINDING;
