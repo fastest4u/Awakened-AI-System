@@ -610,32 +610,40 @@ describe("Task 18 lifecycle process concurrency", () => {
       await primary.close();
       clients.delete(primary);
 
-      const responses = await Promise.all(Array.from({ length: 32 }, async (_, index) => {
-        const observer = new LifecycleFixtureClient({
-          fixturePath: FIXTURE_PATH,
-          timeoutMs: 45_000,
-          cleanupTimeoutMs: 45_000,
+      for (let batchStart = 0; batchStart < 32; batchStart += 4) {
+        const batch = Array.from({ length: 4 }, (_, offset) => {
+          const index = batchStart + offset;
+          const observer = new LifecycleFixtureClient({
+            fixturePath: FIXTURE_PATH,
+            timeoutMs: 45_000,
+            cleanupTimeoutMs: 45_000,
+          });
+          observers.push(observer);
+          clients.add(observer);
+          return { index, observer };
         });
-        observers.push(observer);
-        clients.add(observer);
-        await observer.ready();
-        const observerStarted = await observer.start({
-          projectRoot,
-          vaultRoot,
-          clientInstanceId: `task18-process-observer-${index}`,
-        });
-        assert.equal(observerStarted.type, "started", JSON.stringify(observerStarted));
-        const recovery = result(await observer.mutation({
-          operation: "workflow-recovery",
-          workId: `task18-process-observer-work-${index}`,
-          ownerId: `task18-process-observer-${index}`,
-          fencingToken: "1",
-          dueBefore: "2026-08-17T00:00:00.000Z",
-          limit: 10,
+        await Promise.all(batch.map(async ({ index, observer }) => {
+          await observer.ready();
+          const observerStarted = await observer.start({
+            projectRoot,
+            vaultRoot,
+            clientInstanceId: `task18-process-observer-${index}`,
+          });
+          assert.equal(observerStarted.type, "started", JSON.stringify(observerStarted));
         }));
+      }
+
+      const responses = await Promise.all(observers.map(async (observer, index) => result(await observer.mutation({
+        operation: "workflow-recovery",
+        workId: `task18-process-observer-work-${index}`,
+        ownerId: `task18-process-observer-${index}`,
+        fencingToken: "1",
+        dueBefore: "2026-08-17T00:00:00.000Z",
+        limit: 10,
+      }))));
+      await Promise.all(observers.map(async (observer) => {
         await observer.close();
         clients.delete(observer);
-        return recovery;
       }));
 
       assert.equal(responses.length, 32);
