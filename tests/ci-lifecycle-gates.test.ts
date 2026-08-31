@@ -744,7 +744,7 @@ test("Subproject 3 evaluation and projection runtime remain internal-only", () =
   assert.deepEqual(
     sealedSourceDiff === "" ? [] : sealedSourceDiff.split(/\r?\n/),
     APPROVED_SEALED_SOURCE_DIFF,
-    "only the approved Task 8 Git runner remediation may change production source after the sealed evaluator baseline",
+    "only the approved sealed-source remediations may change production source after the sealed evaluator baseline",
   );
   for (const path of PRODUCTION_ENTRY_SOURCE_PATHS) {
     assertNoV2EntryWiring(source(path));
