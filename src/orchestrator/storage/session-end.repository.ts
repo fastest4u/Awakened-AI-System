@@ -2033,6 +2033,20 @@ export class SessionEndWorkflowRepository {
       $finalEndingScopeBindingsJson: finalEndingScopeBindingsJson,
     } satisfies SqliteParams);
     if (!changed(result)) throw new LifecycleError("EVENT_CONFLICT");
+    this.#faultInjector.hit(
+      "final-checkpoint",
+      "after-write-before-commit",
+      {
+        projectId: projectId as LifecycleFaultContext["projectId"],
+        sessionId: sessionId as LifecycleFaultContext["sessionId"],
+        workflowId: workflowId as LifecycleFaultContext["workflowId"],
+        commandId: rootCommandId,
+        idempotencyKeyHash: null,
+        workId: null,
+        eventPosition: checkpointEventPosition.toString(),
+        materializationRevision: null,
+      },
+    );
     void checkpointId;
   }
 
