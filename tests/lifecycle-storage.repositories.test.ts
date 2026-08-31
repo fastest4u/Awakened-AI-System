@@ -312,13 +312,15 @@ describe("immutable child transfer tickets", () => {
 
   it("inserts canonical ticket evidence and claims only the nullable claim group", () => {
     const runs: Array<{ readonly sql: string; readonly params: SqliteParams | undefined }> = [];
+    let claimReads = 0;
     const connection = new RecordingConnection((sql, kind, params) => {
       if (kind === "run") {
         runs.push({ sql, params });
         return { changes: 1n, lastInsertRowid: 1n };
       }
       if (kind === "get" && /FROM child_transfer_tickets/iu.test(sql)) {
-        return claimedTicketRow();
+        claimReads += 1;
+        return claimReads === 1 ? unclaimedTicketRow() : claimedTicketRow();
       }
       throw new Error(`unexpected SQL: ${sql}`);
     });
@@ -363,6 +365,9 @@ describe("immutable child transfer tickets", () => {
 
   it("returns EVENT_CONFLICT to every loser and preserves the source lineage", () => {
     const connection = new RecordingConnection((sql, kind) => {
+      if (kind === "get" && /FROM child_transfer_tickets/iu.test(sql)) {
+        return unclaimedTicketRow();
+      }
       if (kind === "run" && /UPDATE child_transfer_tickets/iu.test(sql)) {
         return { changes: 0n, lastInsertRowid: 0n };
       }
@@ -391,15 +396,18 @@ describe("immutable child transfer tickets", () => {
     assert.equal(inserted?.$createdAt, MAX_CANONICAL_TIMESTAMP);
 
     let claimed: SqliteParams | undefined;
+    let claimReads = 0;
     const claimConnection = new RecordingConnection((_sql, kind, params) => {
       if (kind === "run") {
         claimed = params;
         return { changes: 1n, lastInsertRowid: 0n };
       }
       if (kind === "get") {
+        claimReads += 1;
         const row: SqliteRow = {
-          ...claimedTicketRow(),
-          claimed_at: MAX_CANONICAL_TIMESTAMP,
+          ...(claimReads === 1
+            ? unclaimedTicketRow()
+            : { ...claimedTicketRow(), claimed_at: MAX_CANONICAL_TIMESTAMP }),
         };
         return row;
       }
