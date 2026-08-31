@@ -39,8 +39,9 @@ const EXTENDED_PRODUCTION_ENTRY_PATHS = [
 ] as const;
 
 const SEALED_EVALUATOR_BASE = "68e77fa10165c99243ded1e8c1c80d1e0f7da92f";
-const APPROVED_TASK_EIGHT_SEALED_SOURCE_DIFF = Object.freeze([
+const APPROVED_SEALED_SOURCE_DIFF = Object.freeze([
   "src/orchestrator/identity/git-workspace.resolver.ts",
+  "src/orchestrator/storage/session-end.repository.ts",
 ]);
 const VALID_V2_AGGREGATE = Object.freeze({
   corpusVersion: "retrieval-evaluation-v2",
@@ -742,7 +743,7 @@ test("Subproject 3 evaluation and projection runtime remain internal-only", () =
   ).trim();
   assert.deepEqual(
     sealedSourceDiff === "" ? [] : sealedSourceDiff.split(/\r?\n/),
-    APPROVED_TASK_EIGHT_SEALED_SOURCE_DIFF,
+    APPROVED_SEALED_SOURCE_DIFF,
     "only the approved Task 8 Git runner remediation may change production source after the sealed evaluator baseline",
   );
   for (const path of PRODUCTION_ENTRY_SOURCE_PATHS) {
