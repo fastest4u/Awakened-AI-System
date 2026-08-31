@@ -599,11 +599,11 @@ describe("Task 18 lifecycle crash recovery", () => {
       assert.equal(started.type, "started");
       eventsPath = (started.payload as Record<string, unknown>).eventsPath as string;
       const selected = valueOf(await first.fault({
-        boundary: "ownership-recovery",
+        boundary: "workflow-phase",
         point: "after-commit-before-response",
       }));
       assert.deepEqual(selected, {
-        boundary: "ownership-recovery",
+        boundary: "workflow-phase",
         point: "after-commit-before-response",
         armed: true,
       });

@@ -164,7 +164,10 @@ let started = false;
 let closing = false;
 let closeResourcesPromise: Promise<void> | undefined;
 let queue = Promise.resolve();
-let directFault: { readonly boundary: "ownership-recovery"; readonly point: LifecycleFaultPoint } | undefined;
+let directFault: {
+  readonly boundary: "ownership-recovery" | "workflow-phase";
+  readonly point: LifecycleFaultPoint;
+} | undefined;
 let responseDeliveryFault: {
   readonly boundary: "response-delivery";
   readonly point: "after-commit-before-response";
@@ -418,14 +421,20 @@ function error(message: FixtureMessage, code: string, gitProbeDiagnostic?: GitPr
   });
 }
 
-function selectDirectFault(payload: JsonRecord): { readonly boundary: "ownership-recovery"; readonly point: LifecycleFaultPoint } {
+function selectDirectFault(payload: JsonRecord): {
+  readonly boundary: "ownership-recovery" | "workflow-phase";
+  readonly point: LifecycleFaultPoint;
+} {
   const keys = Object.keys(payload);
   if (keys.length !== 2 || keys.some((key) => key !== "boundary" && key !== "point")) {
     throw new Error("FIXTURE_PROTOCOL_ERROR");
   }
   const boundary = requiredString(payload, "boundary");
   const point = requiredString(payload, "point") as LifecycleFaultPoint;
-  if (boundary !== "ownership-recovery" || !SQLITE_FAULT_POINTS.has(point)) {
+  if (
+    (boundary !== "ownership-recovery" || !SQLITE_FAULT_POINTS.has(point))
+    && (boundary !== "workflow-phase" || point !== "after-commit-before-response")
+  ) {
     throw new Error("FIXTURE_PROTOCOL_ERROR");
   }
   return Object.freeze({ boundary, point });
