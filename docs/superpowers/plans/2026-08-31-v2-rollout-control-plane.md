@@ -17,7 +17,7 @@
 - [x] Task 1: implemented in `beb9473` and `56eec64`; spec and quality reviews approved; focused tests 14/14.
 - [x] Task 2: committed in `1441b7c` and hardened in `50308d2`; migration gate 236/236, final focused gate 66/66, and spec/quality reviews approved.
 - [x] Task 3: committed in `27100d1`; focused gate 49/49, typecheck, spec review, and quality review approved.
-- [ ] Task 4: default-deny state machine.
+- [x] Task 4: committed in `153990b`; focused gate 84/84, typecheck, spec review, and quality review approved.
 - [ ] Task 5: sealed CI contract.
 - [ ] Task 6: release verification and final reviews.
 
