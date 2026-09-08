@@ -41,7 +41,7 @@ CREATE TABLE rollout_revisions (
   FOREIGN KEY (project_id) REFERENCES project_meta(project_id),
   FOREIGN KEY (project_id, parent_revision_id)
     REFERENCES rollout_revisions(project_id, revision_id)
-) STRICT;
+) STRICT, WITHOUT ROWID;
 
 CREATE TABLE rollout_transitions (
   project_id TEXT NOT NULL,
@@ -85,7 +85,7 @@ CREATE TABLE rollout_transitions (
   FOREIGN KEY (project_id) REFERENCES project_meta(project_id),
   FOREIGN KEY (project_id, revision_id)
     REFERENCES rollout_revisions(project_id, revision_id)
-) STRICT;
+) STRICT, WITHOUT ROWID;
 
 CREATE TABLE rollout_control_state (
   singleton INTEGER PRIMARY KEY CHECK (singleton = 1),

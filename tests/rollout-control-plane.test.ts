@@ -307,10 +307,10 @@ describe("schema-6 rollout control-plane storage", () => {
       ]],
     ]);
     for (const [table, columns] of expectedColumns) {
-      const schema = connection.prepare(`
-        SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = $table
-      `).get({ $table: table });
-      assert.match(String(schema?.sql), /\)\s*STRICT$/);
+      const tableMetadata = connection.prepare("PRAGMA table_list").all()
+        .find((row) => String(row.name) === table);
+      assert.equal(tableMetadata?.strict, 1n);
+      assert.equal(tableMetadata?.wr, table === "rollout_control_state" ? 0n : 1n);
       assert.deepEqual(
         connection.prepare(`PRAGMA table_info(${table})`).all().map((row) => String(row.name)),
         columns,
@@ -410,6 +410,41 @@ describe("schema-6 rollout control-plane storage", () => {
     );
   });
 
+  it("rejects rowid replacement inserts with fresh revision keys", () => {
+    const connection = currentMigrationConnection();
+    insertRevision(connection);
+
+    assert.throws(() => connection.prepare(`
+      INSERT OR REPLACE INTO rollout_revisions(
+        rowid, project_id, revision_id, parent_revision_id,
+        build_identity_hash, migration_identity_hash, configuration_checksum,
+        v1_baseline_checksum, cohort_algorithm_version, cohort_salt,
+        cohort_basis_points, created_at
+      ) VALUES (
+        1, $projectId, $revisionId, NULL,
+        $buildIdentityHash, $migrationIdentityHash, $configurationChecksum,
+        $v1BaselineChecksum, 1, $cohortSalt, 500, $createdAt
+      )
+    `).run({
+      $projectId: PROJECT_ID,
+      $revisionId: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+      $buildIdentityHash: "a".repeat(64),
+      $migrationIdentityHash: "b".repeat(64),
+      $configurationChecksum: "c".repeat(64),
+      $v1BaselineChecksum: "d".repeat(64),
+      $cohortSalt: "e".repeat(64),
+      $createdAt: "2026-09-01T00:00:00.000Z",
+    }), /rowid/);
+
+    assert.deepEqual({ ...connection.prepare(`
+      SELECT project_id, revision_id, created_at FROM rollout_revisions
+    `).get() }, {
+      project_id: PROJECT_ID,
+      revision_id: REVISION_INPUT.revisionId,
+      created_at: NOW,
+    });
+  });
+
   for (const conflictKey of ["transition_id", "approval_id", "approval_nonce_digest"] as const) {
     it(`rejects replacement inserts that reuse an immutable transition ${conflictKey}`, () => {
       const connection = currentMigrationConnection();
@@ -444,6 +479,48 @@ describe("schema-6 rollout control-plane storage", () => {
       });
     });
   }
+
+  it("rejects rowid replacement inserts with fresh transition keys", () => {
+    const connection = currentMigrationConnection();
+    insertRevision(connection);
+    insertTransition(connection);
+
+    assert.throws(() => connection.prepare(`
+      INSERT OR REPLACE INTO rollout_transitions(
+        rowid, project_id, transition_id, revision_id,
+        from_mode, to_mode, prior_state_generation, next_state_generation,
+        approval_id, approval_nonce_digest, actor_fingerprint, evidence_digest,
+        reason_code, recorded_at
+      ) VALUES (
+        1, $projectId, $transitionId, $revisionId,
+        'off', 'shadow', 0, 1,
+        $approvalId, $approvalNonceDigest, $actorFingerprint, $evidenceDigest,
+        'rewritten', $recordedAt
+      )
+    `).run({
+      $projectId: PROJECT_ID,
+      $transitionId: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+      $revisionId: REVISION_INPUT.revisionId,
+      $approvalId: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+      $approvalNonceDigest: "3".repeat(64),
+      $actorFingerprint: "4".repeat(64),
+      $evidenceDigest: "5".repeat(64),
+      $recordedAt: "2026-09-01T00:00:00.000Z",
+    }), /rowid/);
+
+    assert.deepEqual({ ...connection.prepare(`
+      SELECT project_id, transition_id, approval_id, approval_nonce_digest,
+        reason_code, recorded_at
+      FROM rollout_transitions
+    `).get() }, {
+      project_id: PROJECT_ID,
+      transition_id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+      approval_id: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+      approval_nonce_digest: "f".repeat(64),
+      reason_code: "operator-approved",
+      recorded_at: NOW,
+    });
+  });
 
   it("permits a one-generation state advance linked to its appended transition", () => {
     const connection = currentMigrationConnection();
