@@ -1,6 +1,6 @@
 # V2 progressive-canary production rollout design
 
-**Status:** Approved design — implementation and deployment are not yet authorized
+**Status:** Approved design — control-plane slice implementation authorized; production activation and deployment remain gated
 **Date:** 2026-08-31
 **Decision:** Version 2 becomes the eventual production-primary runtime through a progressive canary, an auditable control plane, and a fenced rollback.
 
@@ -47,7 +47,9 @@ Only the control plane may move between modes. A transition requires the prior s
 
 ## 4. Deterministic cohort and request semantics
 
-For **canary**, the same canonical project ID and workspace ID always resolve to the same result for one rollout revision. The router computes a stable cryptographic digest of revision ID, cohort-algorithm version, cohort salt, project ID, and workspace ID; maps it to 10,000 buckets; and selects V2 when its bucket is below the approved basis-point percentage. Increasing a percentage only adds cohorts and never reshuffles existing ones. Raw inputs and the digest are never emitted in telemetry.
+For **canary**, the same canonical project ID and workspace ID always resolve to the same bucket within one rollout lineage. The immutable root revision is the cohort assignment identity; each approved child remains the active configuration and audit identity. The router computes a stable cryptographic digest of the root revision ID, cohort-algorithm version, cohort salt, project ID, and workspace ID; maps it to 10,000 buckets; and selects V2 when its bucket is below the approved child revision's basis-point percentage. Every parent-child edge must retain the algorithm and salt and must not decrease the percentage. Increasing a percentage therefore only adds cohorts and never reshuffles existing ones. Raw inputs and the digest are never emitted in telemetry.
+
+Implementation clarification (2026-09-08): hashing each new child revision ID would reshuffle cohorts and contradict the preceding invariant. The internal control plane resolves and validates the persisted parent chain, rejects missing, cyclic, foreign, malformed, or inconsistent ancestors, and passes the actual root revision to the existing bucket helper. This requires no additional stored fields or public routing. A cohort membership query alone never authorizes traffic.
 
 The only percentage sequence is **1% → 5% → 25% → 50% → 100%**. Each increase creates a new approved revision derived from the previous one, not an in-place mutation. Cohorts with incomplete identity, ambiguous scope, unsupported schema, or an unverified capability fail closed; they do not become V2 traffic by default.
 

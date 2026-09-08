@@ -12,6 +12,19 @@
 
 ## Scope
 
+### Execution status — 2026-09-08
+
+- [x] Task 1: implemented in `beb9473` and `56eec64`; spec and quality reviews approved; focused tests 14/14.
+- [ ] Task 2: schema 6 implementation resumed from preserved, uncommitted changes.
+- [ ] Task 3: connection-bound repository.
+- [ ] Task 4: default-deny state machine.
+- [ ] Task 5: sealed CI contract.
+- [ ] Task 6: release verification and final reviews.
+
+Task 1 clarification: every integer basis-point value from 0 through 10,000 is valid; the original rejection example using 101 was a typo. Canary activation thresholds are constrained separately in Task 4.
+
+Task 4 correctness clarification: new immutable child IDs must not reshuffle the cohort. Keep the Task 1 hash helper unchanged; resolve the persisted lineage root in the internal service and use that actual root for bucket assignment while comparing against the requested child's threshold. This uses existing parent links and adds no schema fields or public routing.
+
 This plan implements only delivery slice 1 from the approved V2 rollout specification:
 
 - durable revision, approval, transition, state, and redacted evidence-reference records;
@@ -96,7 +109,7 @@ describe("V2 rollout cohorts", () => {
   it("rejects hostile revisions and foreign scope", () => {
     assert.throws(() => decodeRolloutRevision(Object.create(REVISION)), /ROLLOUT_INPUT_INVALID/);
     assert.throws(
-      () => decodeRolloutRevision({ ...REVISION, cohortBasisPoints: 101 }),
+      () => decodeRolloutRevision({ ...REVISION, cohortBasisPoints: 10001 }),
       /ROLLOUT_INPUT_INVALID/,
     );
     assert.throws(
@@ -459,6 +472,8 @@ git commit -m "feat: persist rollout control transitions"
 Use a real repository and verify:
 
 - createRevision persists an immutable revision and rejects an invalid parent;
+- a child retains its parent's cohort salt and algorithm, and lineage membership never drops a previously selected workspace when the percentage grows through children and grandchildren;
+- cohort membership rejects missing, cyclic, foreign, malformed, or inconsistent parent chains without changing durable state;
 - a unique approved off-to-shadow transition succeeds;
 - stale generation, replayed approval ID, replayed approval nonce, and an invalid graph edge fail closed;
 - shadow-to-canary, canary-to-primary, rollback-pending, and read-only-recovery activation throw ROLLOUT_V2_ROUTING_DISABLED; and
@@ -550,8 +565,11 @@ export class RolloutControlPlane {
   createRevision(input: unknown): RolloutRevision;
   state(projectId: string): RolloutControlState;
   transition(input: unknown): RolloutControlState;
+  isSelectedCanaryCohort(input: unknown): boolean;
 }
 ~~~
+
+`isSelectedCanaryCohort` accepts exactly the own enumerable data fields `projectId`, `revisionId`, and `workspaceId`. In one repository transaction it loads the requested revision and iteratively resolves its persisted root. Reject cycles, missing or foreign parents, malformed revisions, salt/algorithm changes, and decreasing thresholds. Compute `cohortBucket(root, { projectId, workspaceId }) < requested.cohortBasisPoints` using the actual immutable root, never a synthetic revision. This is an internal membership calculation, not permission to route traffic. Prove monotonic membership across at least a root, child, and grandchild with unchanged salt and increasing thresholds. Keep the existing standalone helper's formula and signature unchanged.
 
 Use one frozen transition graph:
 
@@ -568,7 +586,7 @@ const NEXT_MODES: Readonly<Record<RolloutMode, readonly RolloutMode[]>> = Object
 
 Decode exact input before opening a transaction. Within the repository transaction, load current state, verify expected mode/generation, load the named revision, call the promotion gate before appendTransition, then append the transition and perform CAS. Reject canary revisions unless their basis points are 100, 500, 2500, 5000, or 10000. For a same-mode canary change, require a child revision with a strictly larger basis-point value.
 
-createRevision must decode the revision through decodeRolloutRevision, reject a duplicate revision ID, and, when parentRevisionId is non-null, load that parent from the same project before insert. A child revision must retain the parent cohort algorithm version and must not have fewer basis points than its parent; a canary child must have strictly more basis points than its canary parent.
+createRevision must decode the revision through decodeRolloutRevision, reject a duplicate revision ID, and, when parentRevisionId is non-null, validate that parent's entire lineage in the same project before insert. A child revision must retain the parent cohort algorithm version and salt and must not have fewer basis points than its parent; a canary child must have strictly more basis points than its canary parent.
 
 Construct the record passed to appendTransition with the current generation and the supplied redacted approval values; do not derive an approval ID or nonce:
 
