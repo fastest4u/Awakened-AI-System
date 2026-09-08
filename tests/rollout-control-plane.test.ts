@@ -11,6 +11,11 @@ import {
   RolloutControlPlaneError,
 } from "../src/orchestrator/rollout/rollout-cohort.js";
 import { NodeSqliteDriver } from "../src/orchestrator/storage/node-sqlite-driver.js";
+import {
+  type RolloutStateCasInput,
+  type RolloutTransition,
+  SqliteRolloutControlPlaneRepository,
+} from "../src/orchestrator/storage/rollout-control-plane.repository.js";
 import type { SqliteConnection } from "../src/orchestrator/storage/sqlite-driver.js";
 import { applyCurrentProjectStoreSchema } from "./support/current-project-store-schema.js";
 
@@ -143,6 +148,56 @@ function insertTransition(
     $actorFingerprint: overrides.actor_fingerprint ?? "1".repeat(64),
     $evidenceDigest: overrides.evidence_digest ?? "2".repeat(64),
     $recordedAt: NOW,
+  });
+}
+
+const REPOSITORY_TRANSITION_ID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+const REPOSITORY_APPROVAL_ID = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+const REPOSITORY_NONCE_DIGEST = "f".repeat(64);
+
+function rolloutTransition(overrides: Partial<RolloutTransition> = {}): RolloutTransition {
+  return Object.freeze({
+    projectId: PROJECT_ID,
+    transitionId: REPOSITORY_TRANSITION_ID,
+    revisionId: REVISION_INPUT.revisionId,
+    fromMode: "off",
+    toMode: "shadow",
+    priorStateGeneration: 0n,
+    nextStateGeneration: 1n,
+    approvalId: REPOSITORY_APPROVAL_ID,
+    approvalNonceDigest: REPOSITORY_NONCE_DIGEST,
+    actorFingerprint: "1".repeat(64),
+    evidenceDigest: "2".repeat(64),
+    reasonCode: "operator-approved",
+    recordedAt: NOW,
+    ...overrides,
+  });
+}
+
+function rolloutCas(overrides: Partial<RolloutStateCasInput> = {}): RolloutStateCasInput {
+  return Object.freeze({
+    expectedMode: "off",
+    expectedGeneration: 0n,
+    revisionId: REVISION_INPUT.revisionId,
+    nextMode: "shadow",
+    nextGeneration: 1n,
+    transitionId: REPOSITORY_TRANSITION_ID,
+    updatedAt: NOW,
+    ...overrides,
+  });
+}
+
+function persistShadowState(repository: SqliteRolloutControlPlaneRepository): void {
+  repository.transact(PROJECT_ID, (transaction) => {
+    transaction.insertRevision(decodeRolloutRevision(REVISION_INPUT));
+    transaction.appendTransition(rolloutTransition());
+    transaction.compareAndSetState(rolloutCas());
+  });
+}
+
+function assertRolloutError(code: RolloutControlPlaneError["code"], action: () => unknown): void {
+  assert.throws(action, (error: unknown) => {
+    return error instanceof RolloutControlPlaneError && error.code === code;
   });
 }
 
@@ -550,5 +605,286 @@ describe("schema-6 rollout control-plane storage", () => {
       state_generation: 1n,
       last_transition_id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
     });
+  });
+});
+
+describe("SQLite rollout control-plane repository", () => {
+  for (const field of [
+    "projectId", "revisionId", "buildIdentityHash", "migrationIdentityHash",
+    "configurationChecksum", "v1BaselineChecksum", "cohortSalt",
+  ] as const) {
+    it(`rejects a revision with a newline-suffixed ${field} before writing`, () => {
+      const connection = currentMigrationConnection();
+      const repository = new SqliteRolloutControlPlaneRepository(connection);
+      const revision = inputWith({ [field]: `${REVISION_INPUT[field]}\n` }) as ReturnType<typeof decodeRolloutRevision>;
+
+      assertInputInvalid(() => repository.transact(PROJECT_ID, (transaction) => transaction.insertRevision(revision)));
+      assert.equal(connection.prepare("SELECT COUNT(*) AS count FROM rollout_revisions").get()?.count, 0n);
+    });
+  }
+
+  it("persists and returns a deep-frozen revision and off-to-shadow state transition atomically", () => {
+    const connection = currentMigrationConnection();
+    const repository = new SqliteRolloutControlPlaneRepository(connection);
+
+    const state = repository.transact(PROJECT_ID, (transaction) => {
+      const initial = transaction.readState();
+      assert.deepEqual(initial, {
+        projectId: PROJECT_ID,
+        revisionId: null,
+        mode: "off",
+        stateGeneration: 0n,
+        lastTransitionId: null,
+        updatedAt: NOW,
+      });
+      assert.equal(Object.isFrozen(initial), true);
+
+      transaction.insertRevision(decodeRolloutRevision(REVISION_INPUT));
+      const storedRevision = transaction.readRevision(REVISION_INPUT.revisionId);
+      assert.deepEqual(storedRevision, REVISION_INPUT);
+      assert.equal(Object.isFrozen(storedRevision), true);
+
+      transaction.appendTransition(rolloutTransition());
+      const compareAndSetResult = transaction.compareAndSetState(rolloutCas());
+      assert.equal(compareAndSetResult, undefined);
+      return transaction.readState();
+    });
+
+    assert.deepEqual(state, {
+      projectId: PROJECT_ID,
+      revisionId: REVISION_INPUT.revisionId,
+      mode: "shadow",
+      stateGeneration: 1n,
+      lastTransitionId: REPOSITORY_TRANSITION_ID,
+      updatedAt: NOW,
+    });
+    assert.equal(Object.isFrozen(state), true);
+    assert.equal(connection.prepare("SELECT COUNT(*) AS count FROM rollout_revisions").get()?.count, 1n);
+    assert.equal(connection.prepare("SELECT COUNT(*) AS count FROM rollout_transitions").get()?.count, 1n);
+  });
+
+  it("maps a malformed stored state row to rollout integrity failure", () => {
+    const connection = currentMigrationConnection();
+    const wrappedConnection: SqliteConnection = {
+      exec: (sql) => connection.exec(sql),
+      prepare(sql) {
+        const statement = connection.prepare(sql);
+        if (!sql.includes("FROM rollout_control_state WHERE singleton = 1")) return statement;
+        return {
+          run: (params) => statement.run(params),
+          get(params) {
+            const row = statement.get(params);
+            return row === undefined ? undefined : { ...row, state_generation: "malformed" };
+          },
+          all: (params) => statement.all(params),
+          iterate: (params) => statement.iterate(params),
+        };
+      },
+      close: () => connection.close(),
+    };
+    const repository = new SqliteRolloutControlPlaneRepository(wrappedConnection);
+
+    assertRolloutError("ROLLOUT_INTEGRITY_FAILURE", () => repository.transact(
+      PROJECT_ID,
+      (transaction) => transaction.readState(),
+    ));
+  });
+
+  it("maps an unexpected successful CAS change count to rollout integrity failure and rolls back", () => {
+    const connection = currentMigrationConnection();
+    const wrappedConnection: SqliteConnection = {
+      exec: (sql) => connection.exec(sql),
+      prepare(sql) {
+        const statement = connection.prepare(sql);
+        if (!/^\s*UPDATE rollout_control_state/.test(sql)) return statement;
+        return {
+          run(params) {
+            const result = statement.run(params);
+            return { ...result, changes: 2n };
+          },
+          get: (params) => statement.get(params),
+          all: (params) => statement.all(params),
+          iterate: (params) => statement.iterate(params),
+        };
+      },
+      close: () => connection.close(),
+    };
+    const repository = new SqliteRolloutControlPlaneRepository(wrappedConnection);
+
+    assertRolloutError("ROLLOUT_INTEGRITY_FAILURE", () => repository.transact(PROJECT_ID, (transaction) => {
+      transaction.insertRevision(decodeRolloutRevision(REVISION_INPUT));
+      transaction.appendTransition(rolloutTransition());
+      transaction.compareAndSetState(rolloutCas());
+    }));
+
+    assert.equal(connection.prepare("SELECT COUNT(*) AS count FROM rollout_revisions").get()?.count, 0n);
+    assert.equal(connection.prepare("SELECT COUNT(*) AS count FROM rollout_transitions").get()?.count, 0n);
+    assert.equal(connection.prepare("SELECT mode FROM rollout_control_state").get()?.mode, "off");
+  });
+
+  it("rolls back a distinct revision and transition when the state CAS is stale", () => {
+    const connection = currentMigrationConnection();
+    const repository = new SqliteRolloutControlPlaneRepository(connection);
+    persistShadowState(repository);
+    const revision = decodeRolloutRevision(inputWith({
+      revisionId: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+      parentRevisionId: REVISION_INPUT.revisionId,
+      createdAt: "2026-08-31T00:00:00.001Z",
+    }));
+    const transition = rolloutTransition({
+      transitionId: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+      revisionId: revision.revisionId,
+      fromMode: "shadow",
+      toMode: "canary",
+      priorStateGeneration: 1n,
+      nextStateGeneration: 2n,
+      approvalId: "ffffffff-ffff-4fff-8fff-ffffffffffff",
+      approvalNonceDigest: "3".repeat(64),
+      recordedAt: "2026-08-31T00:00:00.001Z",
+    });
+
+    assertRolloutError("ROLLOUT_STATE_CONFLICT", () => repository.transact(PROJECT_ID, (transaction) => {
+      transaction.insertRevision(revision);
+      transaction.appendTransition(transition);
+      transaction.compareAndSetState(rolloutCas({
+        expectedMode: "off",
+        expectedGeneration: 0n,
+        revisionId: revision.revisionId,
+        nextMode: "canary",
+        nextGeneration: 1n,
+        transitionId: transition.transitionId,
+        updatedAt: transition.recordedAt,
+      }));
+    }));
+
+    assert.equal(connection.prepare("SELECT COUNT(*) AS count FROM rollout_revisions").get()?.count, 1n);
+    assert.equal(connection.prepare("SELECT COUNT(*) AS count FROM rollout_transitions").get()?.count, 1n);
+    assert.equal(repository.transact(PROJECT_ID, (transaction) => transaction.readState()).mode, "shadow");
+  });
+
+  for (const conflict of ["approval ID", "approval nonce"] as const) {
+    it(`maps a duplicate ${conflict} to state conflict and rolls back the whole transaction`, () => {
+      const connection = currentMigrationConnection();
+      const repository = new SqliteRolloutControlPlaneRepository(connection);
+      persistShadowState(repository);
+      const revision = decodeRolloutRevision(inputWith({
+        revisionId: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+        parentRevisionId: REVISION_INPUT.revisionId,
+        createdAt: "2026-08-31T00:00:00.001Z",
+      }));
+      const transition = rolloutTransition({
+        transitionId: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+        revisionId: revision.revisionId,
+        fromMode: "shadow",
+        toMode: "canary",
+        priorStateGeneration: 1n,
+        nextStateGeneration: 2n,
+        approvalId: conflict === "approval ID"
+          ? REPOSITORY_APPROVAL_ID
+          : "ffffffff-ffff-4fff-8fff-ffffffffffff",
+        approvalNonceDigest: conflict === "approval nonce"
+          ? REPOSITORY_NONCE_DIGEST
+          : "3".repeat(64),
+        recordedAt: "2026-08-31T00:00:00.001Z",
+      });
+
+      assertRolloutError("ROLLOUT_STATE_CONFLICT", () => repository.transact(PROJECT_ID, (transaction) => {
+        transaction.insertRevision(revision);
+        transaction.appendTransition(transition);
+      }));
+
+      assert.equal(connection.prepare("SELECT COUNT(*) AS count FROM rollout_revisions").get()?.count, 1n);
+      assert.equal(connection.prepare("SELECT COUNT(*) AS count FROM rollout_transitions").get()?.count, 1n);
+      assert.equal(repository.transact(PROJECT_ID, (transaction) => transaction.readState()).stateGeneration, 1n);
+    });
+  }
+
+  it("preserves a callback error and rolls back partial writes even when rollback reports failure", () => {
+    const connection = currentMigrationConnection();
+    const rollbackFailure = new Error("synthetic rollback failure");
+    const wrappedConnection: SqliteConnection = {
+      exec(sql) {
+        if (sql === "ROLLBACK") {
+          connection.exec(sql);
+          throw rollbackFailure;
+        }
+        connection.exec(sql);
+      },
+      prepare: (sql) => connection.prepare(sql),
+      close: () => connection.close(),
+    };
+    const repository = new SqliteRolloutControlPlaneRepository(wrappedConnection);
+    const callbackFailure = new Error("callback failed");
+
+    assert.throws(() => repository.transact(PROJECT_ID, (transaction) => {
+      transaction.insertRevision(decodeRolloutRevision(REVISION_INPUT));
+      transaction.appendTransition(rolloutTransition());
+      throw callbackFailure;
+    }), (error: unknown) => error === callbackFailure);
+
+    assert.equal(connection.prepare("SELECT COUNT(*) AS count FROM rollout_revisions").get()?.count, 0n);
+    assert.equal(connection.prepare("SELECT COUNT(*) AS count FROM rollout_transitions").get()?.count, 0n);
+    assert.equal(connection.prepare("SELECT mode FROM rollout_control_state").get()?.mode, "off");
+  });
+
+  it("quarantines a connection when rollback fails before execution while preserving the callback error", () => {
+    const connection = currentMigrationConnection();
+    let beginCount = 0;
+    const wrappedConnection: SqliteConnection = {
+      exec(sql) {
+        if (sql === "BEGIN IMMEDIATE") beginCount += 1;
+        if (sql === "ROLLBACK") throw new Error("synthetic rollback failure");
+        connection.exec(sql);
+      },
+      prepare: (sql) => connection.prepare(sql),
+      close: () => connection.close(),
+    };
+    const repository = new SqliteRolloutControlPlaneRepository(wrappedConnection);
+    const callbackFailure = new Error("callback failed");
+
+    assert.throws(() => repository.transact(PROJECT_ID, (transaction) => {
+      transaction.insertRevision(decodeRolloutRevision(REVISION_INPUT));
+      throw callbackFailure;
+    }), (error: unknown) => error === callbackFailure);
+
+    assertRolloutError("ROLLOUT_INTEGRITY_FAILURE", () => repository.transact(
+      PROJECT_ID,
+      (transaction) => transaction.readState(),
+    ));
+    assert.equal(beginCount, 1);
+  });
+
+  it("rejects Promise and thenable callback results and rolls back before commit", () => {
+    const connection = currentMigrationConnection();
+    const repository = new SqliteRolloutControlPlaneRepository(connection);
+    const results: readonly unknown[] = [
+      Promise.resolve("asynchronous"),
+      Object.freeze({ then: () => undefined }),
+    ];
+
+    for (const result of results) {
+      assertRolloutError("ROLLOUT_INPUT_INVALID", () => repository.transact(PROJECT_ID, (transaction) => {
+        transaction.insertRevision(decodeRolloutRevision(REVISION_INPUT));
+        return result;
+      }));
+      assert.equal(connection.prepare("SELECT COUNT(*) AS count FROM rollout_revisions").get()?.count, 0n);
+      assert.equal(connection.prepare("SELECT mode FROM rollout_control_state").get()?.mode, "off");
+    }
+  });
+
+  it("rejects a nested transaction without corrupting its outer transaction", () => {
+    const connection = currentMigrationConnection();
+    const repository = new SqliteRolloutControlPlaneRepository(connection);
+
+    const state = repository.transact(PROJECT_ID, (transaction) => {
+      assertRolloutError("ROLLOUT_STATE_CONFLICT", () => repository.transact(
+        PROJECT_ID,
+        (nested) => nested.readState(),
+      ));
+      return transaction.readState();
+    });
+
+    assert.equal(state.mode, "off");
+    assert.equal(repository.transact(PROJECT_ID, (transaction) => transaction.readState()).mode, "off");
   });
 });
