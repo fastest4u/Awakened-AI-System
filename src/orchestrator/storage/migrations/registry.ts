@@ -6,6 +6,7 @@ import { sessionEndEffectiveStateMigration } from "./0004-session-end-effective-
 import {
   sessionEndFinalCheckpointTransitionMigration,
 } from "./0005-session-end-final-checkpoint-transition.js";
+import { v2RolloutControlPlaneMigration } from "./0006-v2-rollout-control-plane.js";
 
 export const PROJECT_STORE_MIGRATIONS: readonly Migration[] = Object.freeze([
   eventCoreMigration,
@@ -13,6 +14,7 @@ export const PROJECT_STORE_MIGRATIONS: readonly Migration[] = Object.freeze([
   qualifiedCheckpointCoverageMigration,
   sessionEndEffectiveStateMigration,
   sessionEndFinalCheckpointTransitionMigration,
+  v2RolloutControlPlaneMigration,
 ] as const);
 
-export const CURRENT_PROJECT_STORE_SCHEMA_VERSION = 5;
+export const CURRENT_PROJECT_STORE_SCHEMA_VERSION = 6;

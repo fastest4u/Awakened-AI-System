@@ -243,12 +243,12 @@ describe("DefaultProjectStoreBootstrapService", () => {
       assert.equal(meta?.vault_id, result.descriptor.vaultId);
       assert.equal(meta?.store_id, result.manifest.storeId);
       assert.equal(meta?.schema_version, BigInt(CURRENT_PROJECT_STORE_SCHEMA_VERSION));
-      assert.equal(meta?.schema_version, 5n);
+      assert.equal(meta?.schema_version, 6n);
       assert.equal(result.manifest.schemaVersion, 1);
       assert.deepEqual(
         database.prepare("SELECT version FROM schema_migrations ORDER BY version").all()
           .map((row) => row.version),
-        [1n, 2n, 3n, 4n, 5n],
+        [1n, 2n, 3n, 4n, 5n, 6n],
       );
       assert.deepEqual(
         database.prepare("SELECT version, name FROM schema_migrations ORDER BY version").all()
@@ -601,7 +601,11 @@ describe("DefaultProjectStoreBootstrapService", () => {
       await new DefaultProjectStoreBootstrapService().initialize({ projectRoot, vaultRoot });
       unlinkSync(expected.manifest);
       const database = new DatabaseSync(expected.events);
-      database.exec("DROP TRIGGER project_meta_identity_immutable");
+      // Deliberately corrupt identity despite the rollout state's project foreign key.
+      database.exec(`
+        PRAGMA foreign_keys = OFF;
+        DROP TRIGGER project_meta_identity_immutable;
+      `);
       database.prepare(`
         UPDATE project_meta SET project_id = $projectId WHERE singleton = 1
       `).run({ $projectId: "99999999-9999-4999-8999-999999999999" });
