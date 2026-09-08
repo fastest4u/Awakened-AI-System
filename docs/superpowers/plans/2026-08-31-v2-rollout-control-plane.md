@@ -15,8 +15,8 @@
 ### Execution status — 2026-09-08
 
 - [x] Task 1: implemented in `beb9473` and `56eec64`; spec and quality reviews approved; focused tests 14/14.
-- [ ] Task 2: schema 6 implementation resumed from preserved, uncommitted changes.
-- [ ] Task 3: connection-bound repository.
+- [x] Task 2: committed in `1441b7c` and hardened in `50308d2`; migration gate 236/236, final focused gate 66/66, and spec/quality reviews approved.
+- [ ] Task 3: connection-bound repository in progress.
 - [ ] Task 4: default-deny state machine.
 - [ ] Task 5: sealed CI contract.
 - [ ] Task 6: release verification and final reviews.
@@ -300,9 +300,9 @@ rollout_control_state(
 )
 ~~~
 
-All three tables are STRICT. Use composite project/revision and project/transition foreign keys, lowercase-hash length checks, a mode CHECK containing the six modes from Task 1, basis points constrained to 0 through 10,000, and a unique project/approval ID plus project/approval nonce digest. Insert one off state from project_meta.
+All three tables are STRICT. The immutable revision and transition tables also use WITHOUT ROWID to exclude replacement through hidden row identities. Use composite project/revision and project/transition foreign keys, exact lowercase-hash text and byte-length checks, a mode CHECK containing the six modes from Task 1, basis points constrained to 0 through 10,000, and a unique project/approval ID plus project/approval nonce digest. Insert one off state from project_meta.
 
-Create four immutability triggers that reject UPDATE and DELETE on revisions/transitions with ROLLOUT_IMMUTABLE. Create an update trigger on rollout_control_state that permits only generation plus one and requires an existing transition matching project, prior mode, next mode, generation pair, active revision, and last transition ID. Every other state-row mutation aborts with ROLLOUT_STATE_TRANSITION_INVALID.
+Create four immutability triggers that reject UPDATE and DELETE on revisions/transitions with ROLLOUT_IMMUTABLE. Also reject INSERT conflicts across every immutable unique key before SQLite can perform replacement. Create an update trigger on rollout_control_state that permits only generation plus one and requires an existing transition matching project, prior mode, next mode, generation pair, active revision, and last transition ID. Every other state-row mutation aborts with ROLLOUT_STATE_TRANSITION_INVALID.
 
 Register the migration after 0005 and set CURRENT_PROJECT_STORE_SCHEMA_VERSION to 6. Update smoke-worker.js from [1,2,3,4,5] and schemaVersion !== 5 to [1,2,3,4,5,6] and schemaVersion !== 6. Do not remove the disabled lifecycle worker smoke probe.
 
