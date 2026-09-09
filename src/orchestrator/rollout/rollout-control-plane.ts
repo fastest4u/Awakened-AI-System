@@ -126,6 +126,16 @@ export class RolloutControlPlane {
     return this.repository.transact(decodedProjectId, (transaction) => transaction.readState());
   }
 
+  public revision(projectId: string, revisionId: string): RolloutRevision {
+    const decodedProjectId = decodeUuidInput(projectId);
+    const decodedRevisionId = decodeUuidInput(revisionId);
+    return this.repository.transact(decodedProjectId, (transaction) => {
+      const revision = transaction.readRevision(decodedRevisionId);
+      if (revision === null) fail("ROLLOUT_TRANSITION_DENIED");
+      return revision;
+    });
+  }
+
   public transition(input: unknown): RolloutControlState {
     const request = decodeTransitionRequest(input);
 

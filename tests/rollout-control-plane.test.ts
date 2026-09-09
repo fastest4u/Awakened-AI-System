@@ -1039,6 +1039,23 @@ describe("default-deny rollout control plane", () => {
     assert.equal(connection.prepare("SELECT COUNT(*) AS count FROM rollout_revisions").get()?.count, 1n);
   });
 
+  it("reads an immutable revision by exact project and revision identity", () => {
+    const connection = currentMigrationConnection();
+    const control = new RolloutControlPlane(new SqliteRolloutControlPlaneRepository(connection));
+    const expected = control.createRevision(revisionWith(ROOT_ID, null, 100));
+
+    const revision = control.revision(PROJECT_ID, ROOT_ID);
+
+    assert.deepEqual(revision, expected);
+    assert.equal(Object.isFrozen(revision), true);
+    assertRolloutError(
+      "ROLLOUT_TRANSITION_DENIED",
+      () => control.revision(PROJECT_ID, "20000000-0000-4000-8000-000000000002"),
+    );
+    assertRolloutError("ROLLOUT_INPUT_INVALID", () => control.revision(`${PROJECT_ID}\n`, ROOT_ID));
+    assertRolloutError("ROLLOUT_INPUT_INVALID", () => control.revision(PROJECT_ID, `${ROOT_ID}\n`));
+  });
+
   it("uses the persisted lineage root so 1%-to-100% cohort growth never deselects a workspace", () => {
     const connection = currentMigrationConnection();
     const control = new RolloutControlPlane(new SqliteRolloutControlPlaneRepository(connection));
