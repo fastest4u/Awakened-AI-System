@@ -10,6 +10,18 @@
 
 **Spec:** [2026-08-24 Subproject 3 Final-Review Remediation Design](../specs/2026-08-24-subproject-3-final-review-remediation-design.md)
 
+## Current Status (verified 2026-09-09)
+
+> [!NOTE]
+> This section is the authoritative completion record. Unchecked micro-step boxes below preserve the original execution instructions, including conditional and superseded steps; they are not the current completion ledger.
+
+- [x] Tasks 1–5 completed: shared event authentication, bounded snapshots, complete schema V2 materialization, durable generation adoption/reconciliation, and verified reader leases.
+- [x] Tasks 6 and 6.1–6.4 completed: bounded post-ranker selection, closed custom-order semantics, one result-construction path, a narrow runtime seam, and complete release evidence.
+- [x] Task 7 completed: sealed real V2 retrieval evaluation over the production-shaped build → publish → lease → repository → service path.
+- [x] Task 8 completed: focused and full release gates, independent review, and final remediation in commits `8026cfd` and `9991e4d`.
+- [x] Latest release evidence: Node.js 24.16.0, SQLite 3.53.0 with WAL/FTS5, runtime/typecheck/build/artifact checks passed, Subproject 3 phase 508 passed / 0 failed / 1 expected Windows symlink skip, sealed corpus 504/504 with every metric equal to 1 and zero contamination, final gate 100/100, and the full suite 2287 passed / 0 failed / 13 expected skips (2300 total).
+- [x] Production boundary remains unchanged: V2 projection/retrieval is internal-only, public MCP composition remains V1-only, and this remediation does not enable V2 production routing.
+
 ## Global Constraints
 
 - Do not alter `src/app.ts`, `src/index.ts`, `src/controllers`, `src/schemas`, or `src/services` to route Version 2.
@@ -1635,6 +1647,8 @@ constructor.
   Expected: the final status output is empty.
 
 ### Task 8: Complete release gates and request final review
+
+**Completion:** [x] Completed. The authoritative verification evidence and routing boundary are recorded in **Current Status** above; the task steps below are retained as the historical execution procedure.
 
 **Files:**
 - Modify: `package.json`

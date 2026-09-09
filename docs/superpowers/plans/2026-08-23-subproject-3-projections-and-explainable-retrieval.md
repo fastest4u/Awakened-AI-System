@@ -10,6 +10,23 @@
 
 **Spec:** docs/superpowers/specs/2026-08-23-subproject-3-projections-and-explainable-retrieval-design.md
 
+## Current Status (verified 2026-09-09)
+
+> [!NOTE]
+> This section is the authoritative completion record. Unchecked micro-step boxes below preserve the original execution instructions, including conditional and superseded steps; they are not the current completion ledger.
+
+- [x] Task 1 completed: strict projection-source and fold contracts.
+- [x] Task 2 completed: independent projection schema and manifest.
+- [x] Task 3 completed: asynchronous generation build, verification, and publication.
+- [x] Task 4 completed: full projection-integrity replay.
+- [x] Task 5 completed: internal retrieval eligibility and local candidate channels.
+- [x] Task 6 completed: deterministic ranking, conflict handling, and redacted explanations.
+- [x] Task 7 completed: optional local vector-cache fallback with vectors disabled by default.
+- [x] Task 8 completed: immutable bilingual evaluation harness and internal runtime seam.
+- [x] The [final-review remediation plan](2026-08-24-subproject-3-final-review-remediation.md) completed all review findings and release gates in commits `8026cfd` and `9991e4d`.
+- [x] Latest release evidence: Node.js 24.16.0, SQLite 3.53.0 with WAL/FTS5, runtime/typecheck/build/artifact checks passed, Subproject 3 phase 508 passed / 0 failed / 1 expected Windows symlink skip, sealed corpus 504/504 with every metric equal to 1 and zero contamination, final gate 100/100, and the full suite 2287 passed / 0 failed / 13 expected skips (2300 total).
+- [x] Production boundary remains unchanged: V2 projection/retrieval is internal-only, public MCP composition remains V1-only, and Subproject 3 completion does not authorize V2 production routing.
+
 ## Global Constraints
 
 - Preserve Task 19 isolation: do not change src/app.ts, src/index.ts, src/controllers, src/schemas, or src/services to route a production request through Version 2.
@@ -684,6 +701,8 @@ Run: git add src/orchestrator/retrieval/evaluation.ts src/orchestrator/runtime/p
 Run: git commit -m "test: gate V2 retrieval readiness"
 
 ## Final Verification and Subproject 3 Exit Review
+
+**Exit status:** [x] Completed and independently remediated. The authoritative release evidence and production boundary are recorded in **Current Status** above; the checklist below is retained as the historical acceptance procedure.
 
 - [ ] Inspect the full branch diff and confirm every projection change is outside V1 production routes and no .superpowers scratch artifact is staged.
 - [ ] Run npm run check:runtime, npm run typecheck, npm test, npm run test:subproject-2, npm run test:subproject-3, npm run build, and npm run test:build-artifacts from a clean linked worktree.
