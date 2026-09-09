@@ -69,6 +69,74 @@ function assertMigrationError(
   assert.throws(action, (error: unknown) => error instanceof ShadowMigrationError && error.code === code);
 }
 
+function proxyEntryPoints(): readonly Readonly<{
+  name: string;
+  target: object;
+  code: ShadowMigrationError["code"];
+  invoke(input: unknown): unknown;
+}>[] {
+  return [
+    {
+      name: "policy decoder",
+      target: POLICY,
+      code: "MIGRATION_POLICY_INVALID",
+      invoke: decodeShadowMigrationPolicyV1,
+    },
+    {
+      name: "policy checksum",
+      target: POLICY,
+      code: "MIGRATION_POLICY_INVALID",
+      invoke: (input) => shadowMigrationPolicyChecksum(input as typeof POLICY),
+    },
+    {
+      name: "configuration decoder",
+      target: CONFIGURATION,
+      code: "MIGRATION_POLICY_INVALID",
+      invoke: decodeShadowMigrationConfigurationV1,
+    },
+    {
+      name: "configuration checksum",
+      target: CONFIGURATION,
+      code: "MIGRATION_POLICY_INVALID",
+      invoke: (input) => shadowMigrationConfigurationChecksum(input as typeof CONFIGURATION),
+    },
+    {
+      name: "migration identity",
+      target: IDENTITY_INPUT,
+      code: "MIGRATION_SOURCE_INVALID",
+      invoke: (input) => shadowMigrationIdentity(input as typeof IDENTITY_INPUT),
+    },
+  ];
+}
+
+function countedProxy(
+  target: object,
+  behavior: "forward" | "throw",
+): Readonly<{ proxy: object; calls(): number }> {
+  let calls = 0;
+  const trap = (): void => {
+    calls += 1;
+    if (behavior === "throw") throw new Error("HOSTILE_PROXY_TRAP");
+  };
+  return {
+    proxy: new Proxy(target, {
+      getPrototypeOf(value) {
+        trap();
+        return Reflect.getPrototypeOf(value);
+      },
+      ownKeys(value) {
+        trap();
+        return Reflect.ownKeys(value);
+      },
+      getOwnPropertyDescriptor(value, key) {
+        trap();
+        return Reflect.getOwnPropertyDescriptor(value, key);
+      },
+    }),
+    calls: () => calls,
+  };
+}
+
 test("migration policy accepts every exact minimum and maximum and pins its domain-separated checksum", () => {
   const maximum = decodeShadowMigrationPolicyV1(POLICY);
   const minimum = decodeShadowMigrationPolicyV1(MINIMUM_POLICY);
@@ -277,5 +345,29 @@ test("migration identity and deterministic UUID inputs fail closed", () => {
         args[2],
       ),
     );
+  }
+});
+
+test("all record entry points reject forwarding proxies without executing user traps", () => {
+  for (const entry of proxyEntryPoints()) {
+    const counted = countedProxy(entry.target, "forward");
+    assertMigrationError(entry.code, () => entry.invoke(counted.proxy));
+    assert.equal(counted.calls(), 0, entry.name);
+  }
+});
+
+test("all record entry points reject throwing proxies without executing user traps", () => {
+  for (const entry of proxyEntryPoints()) {
+    const counted = countedProxy(entry.target, "throw");
+    assertMigrationError(entry.code, () => entry.invoke(counted.proxy));
+    assert.equal(counted.calls(), 0, entry.name);
+  }
+});
+
+test("all record entry points reject revoked proxies with their existing error codes", () => {
+  for (const entry of proxyEntryPoints()) {
+    const revocable = Proxy.revocable(entry.target, {});
+    revocable.revoke();
+    assertMigrationError(entry.code, () => entry.invoke(revocable.proxy));
   }
 });

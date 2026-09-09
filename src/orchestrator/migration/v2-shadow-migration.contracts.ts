@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { types as utilTypes } from "node:util";
 import { canonicalJson } from "../serialization/canonical-json.js";
 
 export const SHADOW_MIGRATION_PHASES = Object.freeze([
@@ -215,7 +216,9 @@ function sha256(value: string): string {
 }
 
 function strictRecord(input: unknown, keys: readonly string[]): Record<string, unknown> {
-  if (typeof input !== "object" || input === null || Array.isArray(input)) invalid();
+  if (typeof input !== "object" || input === null) invalid();
+  if (utilTypes.isProxy(input)) invalid();
+  if (Array.isArray(input)) invalid();
   const prototype = Object.getPrototypeOf(input);
   if (prototype !== Object.prototype && prototype !== null) invalid();
 
