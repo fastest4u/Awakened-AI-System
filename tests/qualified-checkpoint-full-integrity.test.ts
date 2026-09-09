@@ -2019,16 +2019,32 @@ function removeCurrentCoverageEndpoint(
   fixture.connection.exec("PRAGMA foreign_keys = ON");
 }
 
+function quoteIdentifier(value: string): string {
+  return `"${value.replaceAll('"', '""')}"`;
+}
+
 function persistentSnapshot(connection: SqliteConnection): string {
   const tables = connection.prepare(`
     SELECT name FROM sqlite_schema
     WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
     ORDER BY name
   `).all().map((row) => String(row.name));
-  return JSON.stringify(tables.map((table) => ({
-    table,
-    rows: connection.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all(),
-  })), (_key, value: unknown) => (
+  return JSON.stringify(tables.map((table) => {
+    const columns = connection.prepare(`PRAGMA table_info(${quoteIdentifier(table)})`).all() as Array<{
+      name: string;
+      pk: number | bigint;
+    }>;
+    const primaryKey = columns.filter((column) => Number(column.pk) > 0)
+      .sort((left, right) => Number(left.pk) - Number(right.pk));
+    const order = (primaryKey.length > 0 ? primaryKey : columns)
+      .map((column) => quoteIdentifier(column.name)).join(", ");
+    return {
+      table,
+      rows: connection.prepare(
+        `SELECT * FROM ${quoteIdentifier(table)} ORDER BY ${order}`,
+      ).all(),
+    };
+  }), (_key, value: unknown) => (
     typeof value === "bigint" ? value.toString() : value
   ));
 }
@@ -9651,12 +9667,12 @@ it("full integrity rerenders and verifies provider-keyed fingerprint lineage", a
       },
     },
   );
-  assert.deepEqual(migratedVersions, [3, 4, 5]);
+  assert.deepEqual(migratedVersions, [3, 4, 5, 6]);
   assert.equal(
     migrated.connection.prepare(`
       SELECT schema_version FROM project_meta WHERE singleton = 1
     `).get()?.schema_version,
-    5n,
+    6n,
   );
   const liveEquivalent = createFixture();
   addChildFork(liveEquivalent);
