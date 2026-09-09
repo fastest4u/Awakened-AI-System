@@ -1,6 +1,6 @@
 # V2 Shadow Migration and Compatibility Parity Design
 
-**Status:** Design approved in chat; written specification awaiting approval; implementation is not yet authorized
+**Status:** Written specification approved on 2026-09-09; implementation requires the separately approved implementation plan
 **Date:** 2026-09-09
 **Parent design:** [V2 progressive-canary production rollout](2026-08-31-v2-progressive-canary-production-rollout-design.md)
 **Delivery slice:** 2 of 5
