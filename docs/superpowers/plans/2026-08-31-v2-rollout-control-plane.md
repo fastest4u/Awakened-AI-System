@@ -19,7 +19,7 @@
 - [x] Task 3: committed in `27100d1`; focused gate 49/49, typecheck, spec review, and quality review approved.
 - [x] Task 4: committed in `153990b`; focused gate 84/84, typecheck, spec review, and quality review approved.
 - [x] Task 5: committed in `72edb60`; rollout gate 188/188, Subproject 3 gate, build-artifact checks, typecheck, spec review, and quality review approved.
-- [ ] Task 6: release verification and final reviews.
+- [x] Task 6: verified at `04badf8`; runtime, typecheck, build, artifact, rollout (188/188), Subproject 3 (508 pass + 1 expected skip; 504/504 corpus; 100/100 final), and full regression (2287 pass, 0 fail, 13 expected skips) gates passed; source audit is V1-only and both final reviews approved.
 
 Task 1 clarification: every integer basis-point value from 0 through 10,000 is valid; the original rejection example using 101 was a typo. Canary activation thresholds are constrained separately in Task 4.
 
@@ -722,7 +722,7 @@ git commit -m "test: seal V2 rollout control plane"
 - Verify: all files in Tasks 1 through 5
 - Verify: docs/superpowers/specs/2026-08-31-v2-progressive-canary-production-rollout-design.md
 
-- [ ] **Step 1: Run complete verification.**
+- [x] **Step 1: Run complete verification.**
 
 Run from C:\Users\Server\.codex\worktrees\subproject-3-projections:
 
@@ -740,7 +740,7 @@ git status --short --branch
 
 Expected: every command exits 0; npm test reports zero failures; git diff --check prints nothing; status is clean after task commits.
 
-- [ ] **Step 2: Audit source boundaries.**
+- [x] **Step 2: Audit source boundaries.**
 
 Run:
 
@@ -752,12 +752,12 @@ git log --oneline --max-count=6
 
 Expected: no production entry imports the rollout layer or registers a V2 public tool; source differences contain exactly the seven sealed paths; and the log contains the five focused commits.
 
-- [ ] **Step 3: Request spec review, then quality review.**
+- [x] **Step 3: Request spec review, then quality review.**
 
 First use a fresh reviewer to compare every task acceptance condition to the approved V2 rollout specification. Resolve every Critical or Important finding with a failing regression test before implementation adjustment.
 
 Only after that reviewer has no open Critical or Important finding, use a fresh quality reviewer to inspect exact-input/deep-freeze behavior, hash and UUID validation, BEGIN IMMEDIATE/CAS/rollback behavior, immutable triggers, cohort monotonicity, redaction, default denial of V2-serving modes, and continued V1-only MCP composition. Rerun Step 1 after every fix and record final output.
 
-- [ ] **Step 4: Keep active mode off.**
+- [x] **Step 4: Keep active mode off.**
 
 This slice is complete only as a disabled internal control plane. Do not create a shadow revision in a user store, add public routing, or claim V2 production readiness. The next plan must cover shadow migration and compatibility parity before V2 caller traffic.
