@@ -39,8 +39,13 @@ const EXTENDED_PRODUCTION_ENTRY_PATHS = [
 ] as const;
 
 const SEALED_EVALUATOR_BASE = "68e77fa10165c99243ded1e8c1c80d1e0f7da92f";
-const APPROVED_SEALED_SOURCE_DIFF = Object.freeze([
+const APPROVED_SEALED_AND_ROLLOUT_SOURCE_DIFF = Object.freeze([
   "src/orchestrator/identity/git-workspace.resolver.ts",
+  "src/orchestrator/rollout/rollout-cohort.ts",
+  "src/orchestrator/rollout/rollout-control-plane.ts",
+  "src/orchestrator/storage/migrations/0006-v2-rollout-control-plane.ts",
+  "src/orchestrator/storage/migrations/registry.ts",
+  "src/orchestrator/storage/rollout-control-plane.repository.ts",
   "src/orchestrator/storage/session-end.repository.ts",
 ]);
 const VALID_V2_AGGREGATE = Object.freeze({
@@ -114,6 +119,7 @@ const REQUIRED_SUBPROJECT_THREE_FOCUSED_TESTS = Object.freeze([
   "cli.orchestrator-admin",
   "project-binding.service",
   "project-store-bootstrap",
+  "rollout-control-plane",
   "runtime-capabilities",
   "stored-event-authenticator",
 ]);
@@ -133,12 +139,23 @@ interface ProductionIsolationSource {
   readonly contents: string;
 }
 
+const JAVASCRIPT_TRIVIA = String.raw`(?:\s|\/\*[\s\S]*?\*\/|\/\/[^\r\n]*(?:\r?\n|$))`;
+const FORBIDDEN_V2_PRODUCTION_MODULE_WIRING = new RegExp(
+  String.raw`(?:from(?:${JAVASCRIPT_TRIVIA})+|import(?:(?:${JAVASCRIPT_TRIVIA})*\((?:${JAVASCRIPT_TRIVIA})*|(?:${JAVASCRIPT_TRIVIA})+)|require(?:${JAVASCRIPT_TRIVIA})*\((?:${JAVASCRIPT_TRIVIA})*)["'][^"']*(?:\/(?:projections|retrieval)\/(?:v2-[^"']*|evaluation)|\/runtime\/(?:projection-runtime|v2-[^"']*)|\/orchestrator\/rollout\/)[^"']*["']`,
+);
+const FORBIDDEN_V2_PRODUCTION_TOOL_REGISTRATION = /registerTool\(\s*["']memory_(?:retrieval|projection)/;
+
 function assertProductionIsolation(sources: readonly ProductionIsolationSource[]): void {
   for (const candidate of sources) {
     if (PRODUCTION_ENTRY_SOURCE_PATHS.includes(candidate.path)) {
       assert.doesNotMatch(
         candidate.contents,
-        /(?:from\s+|import\s*\(|require\s*\()["'][^"']*(?:\/(?:projections|retrieval)\/(?:v2-[^"']*|evaluation)|\/runtime\/(?:projection-runtime|v2-[^"']*))[^"]*["']|registerTool\(\s*["']memory_(?:retrieval|projection)/,
+        FORBIDDEN_V2_PRODUCTION_MODULE_WIRING,
+        `V2_PRODUCTION_ISOLATION: ${candidate.path} must not wire Version 2 production behavior`,
+      );
+      assert.doesNotMatch(
+        candidate.contents,
+        FORBIDDEN_V2_PRODUCTION_TOOL_REGISTRATION,
         `V2_PRODUCTION_ISOLATION: ${candidate.path} must not wire Version 2 production behavior`,
       );
     }
@@ -215,7 +232,7 @@ function assertRealBridgeDataflow(bridge: string): void {
 }
 
 function assertNoV2EntryWiring(entry: string): void {
-  assert.doesNotMatch(entry, /(?:from\s+|import\s*\(|require\s*\()["'][^"']*(?:\/(?:projections|retrieval)\/(?:v2-[^"']*|evaluation)|\/runtime\/(?:projection-runtime|v2-[^"']*))[^"']*["']/, "V2 entry wiring is forbidden");
+  assert.doesNotMatch(entry, FORBIDDEN_V2_PRODUCTION_MODULE_WIRING, "V2 entry wiring is forbidden");
 }
 
 function runRetrievalEvaluation(...targets: readonly string[]) {
@@ -363,14 +380,24 @@ function workflowSteps(job: string, ownerJob = "unknown"): readonly WorkflowStep
     });
 }
 
-function assertNoJobIf(job: string, label: string): void {
+function assertNoJobBypass(job: string, label: string): void {
   assert.doesNotMatch(job, /^    if:\s*/m, `${label} must not declare if`);
+  assert.doesNotMatch(
+    job,
+    /^    continue-on-error:\s*/m,
+    `${label} must not declare continue-on-error`,
+  );
 }
 
 function requiredStep(job: string, name: string): WorkflowStep {
   const step = workflowSteps(job).find((candidate) => candidate.name === name);
   assert.ok(step, `missing executable ${name} step`);
   assert.equal(yamlScalar(step.body, "if"), null, `${name} must not declare if`);
+  assert.equal(
+    yamlScalar(step.body, "continue-on-error"),
+    null,
+    `${name} must not declare continue-on-error`,
+  );
   return step;
 }
 
@@ -398,9 +425,9 @@ function assertWorkflowReleaseContract(ci: string, stress: string): void {
   assert.ok(releaseGates, "CI must have a release-gates job");
   assert.ok(minimumRuntime, "CI must retain the minimum-runtime rejection job");
   assert.ok(stressJob, "stress workflow must have a stress job");
-  assertNoJobIf(releaseGates!, "release-gates job");
-  assertNoJobIf(minimumRuntime!, "minimum-runtime-rejection job");
-  assertNoJobIf(stressJob!, "stress job");
+  assertNoJobBypass(releaseGates!, "release-gates job");
+  assertNoJobBypass(minimumRuntime!, "minimum-runtime-rejection job");
+  assertNoJobBypass(stressJob!, "stress job");
   const checkouts = [...ciJobs.entries(), ...stressJobs.entries()]
     .flatMap(([ownerJob, job]) => workflowSteps(job, ownerJob))
     .filter((step) => step.name === "Check out repository");
@@ -413,6 +440,11 @@ function assertWorkflowReleaseContract(ci: string, stress: string): void {
   assert.equal(yamlScalar(requiredStep(releaseGates!, "Run lifecycle release gates").body, "run"), "npm run test:subproject-2");
   assert.equal(yamlScalar(requiredStep(releaseGates!, "Require immutable lifecycle base commit").body, "run"), `git cat-file -e "${BASE}^{commit}"`);
   assert.equal(yamlScalar(requiredStep(releaseGates!, "Protect Version 1 production routing").body, "run"), `git diff --exit-code ${BASE} -- src/app.ts src/index.ts src/controllers src/schemas src/services`);
+  assert.equal(yamlScalar(requiredStep(releaseGates!, "Run V2 rollout control-plane gate").body, "run"), "npm run test:rollout-control-plane");
+  const releaseSteps = workflowSteps(releaseGates!);
+  const protectedRoutingIndex = releaseSteps.findIndex((step) => step.name === "Protect Version 1 production routing");
+  const rolloutGateIndex = releaseSteps.findIndex((step) => step.name === "Run V2 rollout control-plane gate");
+  assert.equal(rolloutGateIndex, protectedRoutingIndex + 1, "the rollout control-plane gate must immediately follow the Version 1 routing guard");
   assert.equal(yamlScalar(requiredStep(releaseGates!, "Build").body, "run"), "npm run build");
   assert.equal(yamlScalar(requiredStep(releaseGates!, "Test build artifacts").body, "run"), "npm run test:build-artifacts");
   assert.equal(workflowSteps(minimumRuntime!).filter((step) => step.name === "Check out repository").length, 1);
@@ -457,8 +489,8 @@ test("release configuration gates lifecycle V2 without production routing", () =
   assertWorkflowReleaseContract(ci, stress);
 
   const smoke = source("scripts/smoke-worker.js");
-  assert.match(smoke, /\[1,2,3,4,5\]/);
-  assert.match(smoke, /schemaVersion !== 5/);
+  assert.match(smoke, /\[1,2,3,4,5,6\]/);
+  assert.match(smoke, /schemaVersion !== 6/);
   assert.match(smoke, /manifest\.schemaVersion !== 1/);
   assert.match(smoke, new RegExp(FROZEN_0002));
   assert.match(smoke, new RegExp(FROZEN_0002_SQL));
@@ -490,6 +522,23 @@ test("workflow parser closes conditional, scalar, and upload-owner bypasses", ()
       stress,
     ),
     /release-gates job must not declare if/,
+  );
+  assert.throws(
+    () => assertWorkflowReleaseContract(
+      ci.replace("  release-gates:\n", "  release-gates:\n    continue-on-error: true\n"),
+      stress,
+    ),
+    /release-gates job must not declare continue-on-error/,
+  );
+  assert.throws(
+    () => assertWorkflowReleaseContract(
+      ci.replace(
+        "      - name: Run V2 rollout control-plane gate\n        run: npm run test:rollout-control-plane",
+        "      - name: Run V2 rollout control-plane gate\n        continue-on-error: true\n        run: npm run test:rollout-control-plane",
+      ),
+      stress,
+    ),
+    /Run V2 rollout control-plane gate must not declare continue-on-error/,
   );
 
   const quotedUnnamedUpload = stress.replace(
@@ -661,10 +710,27 @@ test("Subproject 3 evaluation guard proves real bridge dataflow", () => {
 });
 
 test("Subproject 3 evaluation guard rejects dynamic V2 entry wiring", () => {
-  for (const dynamic of [
+  for (const forbiddenWiring of [
     'async function load() { return import("../orchestrator/retrieval/evaluation.js"); }',
     'const load = () => require("../orchestrator/runtime/projection-runtime.js");',
-  ]) assert.throws(() => assertNoV2EntryWiring(dynamic), /V2 entry wiring/);
+    'const controlPlane = await import("../orchestrator/rollout/rollout-control-plane.js");',
+    'import { cohortBucket } from "../orchestrator/rollout/rollout-cohort.js";',
+    'import "../orchestrator/rollout/x.js";',
+    'const controlPlane = await import ( "../orchestrator/rollout/x.js" );',
+    'const controlPlane = require ( "../orchestrator/rollout/x.js" );',
+    'const controlPlane = import/*x*/("../orchestrator/rollout/x.js");',
+    'import/*x*/"../orchestrator/rollout/x.js";',
+    'const controlPlane = require/*x*/("../orchestrator/rollout/x.js");',
+    'const controlPlane = import// x\n("../orchestrator/rollout/x.js");',
+    'import// x\n"../orchestrator/rollout/x.js";',
+    'const controlPlane = require// x\n("../orchestrator/rollout/x.js");',
+  ]) {
+    assert.throws(() => assertNoV2EntryWiring(forbiddenWiring), /V2 entry wiring/);
+    assert.throws(
+      () => assertProductionIsolation([{ path: "src/index.ts", contents: forbiddenWiring }]),
+      /V2_PRODUCTION_ISOLATION/,
+    );
+  }
 });
 
 test("Subproject 3 evaluation guard covers every production entry surface", () => {
@@ -678,8 +744,19 @@ test("Subproject 3 evaluation guard covers every production entry surface", () =
 });
 
 test("Subproject 3 focused gate includes lifecycle isolation and rejects answer-derived evaluation", () => {
+  const packageJson = JSON.parse(source("package.json")) as { scripts?: Record<string, string> };
+  assert.equal(
+    packageJson.scripts?.["test:rollout-control-plane"],
+    "npm run test:build && node --test --test-concurrency=1 --test-reporter=spec dist-test/tests/rollout-control-plane.test.js dist-test/tests/migration-registry.test.js dist-test/tests/project-store-bootstrap.test.js dist-test/tests/project-store-upgrade.test.js dist-test/tests/project-store-upgrade-phase-runner.test.js dist-test/tests/ci-lifecycle-gates.test.js",
+    "test:rollout-control-plane must be exact and ordered",
+  );
   const script = subproject3Script();
   assertRequiredSubprojectThreeFocusedTests(script);
+  assert.match(
+    script,
+    /dist-test\/tests\/rollout-control-plane\.test\.js dist-test\/tests\/ci-lifecycle-gates\.test\.js/,
+    "rollout-control-plane must run immediately before ci-lifecycle-gates",
+  );
   for (const target of REQUIRED_SUBPROJECT_THREE_FOCUSED_TESTS) {
     assert.throws(
       () => assertRequiredSubprojectThreeFocusedTests(script.replace(`${target}.test.js`, "")),
@@ -743,7 +820,7 @@ test("Subproject 3 evaluation and projection runtime remain internal-only", () =
   ).trim();
   assert.deepEqual(
     sealedSourceDiff === "" ? [] : sealedSourceDiff.split(/\r?\n/),
-    APPROVED_SEALED_SOURCE_DIFF,
+    APPROVED_SEALED_AND_ROLLOUT_SOURCE_DIFF,
     "only the approved sealed-source remediations may change production source after the sealed evaluator baseline",
   );
   for (const path of PRODUCTION_ENTRY_SOURCE_PATHS) {

@@ -53,6 +53,9 @@ jobs:
       - name: Protect Version 1 production routing
         run: git diff --exit-code 0e375d4643d4b630f36f874a3bb192e96739ac46 -- src/app.ts src/index.ts src/controllers src/schemas src/services
 
+      - name: Run V2 rollout control-plane gate
+        run: npm run test:rollout-control-plane
+
       - name: Build
         run: npm run build
 
