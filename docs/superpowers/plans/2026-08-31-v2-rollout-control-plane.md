@@ -18,7 +18,7 @@
 - [x] Task 2: committed in `1441b7c` and hardened in `50308d2`; migration gate 236/236, final focused gate 66/66, and spec/quality reviews approved.
 - [x] Task 3: committed in `27100d1`; focused gate 49/49, typecheck, spec review, and quality review approved.
 - [x] Task 4: committed in `153990b`; focused gate 84/84, typecheck, spec review, and quality review approved.
-- [ ] Task 5: sealed CI contract.
+- [x] Task 5: committed in `72edb60`; rollout gate 188/188, Subproject 3 gate, build-artifact checks, typecheck, spec review, and quality review approved.
 - [ ] Task 6: release verification and final reviews.
 
 Task 1 clarification: every integer basis-point value from 0 through 10,000 is valid; the original rejection example using 101 was a typo. Canary activation thresholds are constrained separately in Task 4.
