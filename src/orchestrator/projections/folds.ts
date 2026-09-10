@@ -1,3 +1,7 @@
+import {
+  isProjectionProjectStoreIdentity,
+  isProjectionWorkspaceIdentity,
+} from "./contracts.js";
 import type {
   ArtifactProjection,
   CanonicalItemProjection,
@@ -137,7 +141,10 @@ function binding(value: unknown): ProjectBinding {
   const row = exact(value, [
     "projectId", "vaultId", "storeId", "workspaceId", "branchScopeId", "branchRef", "sessionId",
   ]);
-  for (const key of ["projectId", "vaultId", "storeId", "workspaceId"] as const) hash(row[key]);
+  for (const key of ["projectId", "vaultId", "storeId"] as const) {
+    if (!isProjectionProjectStoreIdentity(row[key])) return integrity();
+  }
+  if (!isProjectionWorkspaceIdentity(row.workspaceId)) return integrity();
   if (row.branchScopeId !== null) uuid(row.branchScopeId);
   nullableText(row.branchRef, 1_024);
   if (row.sessionId !== null) uuid(row.sessionId);

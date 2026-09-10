@@ -7,6 +7,22 @@ import type {
   WorkspaceId,
 } from "../identity/contracts.js";
 
+const PROJECTION_UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
+const PROJECTION_SHA256 = /^[0-9a-f]{64}$/u;
+
+/**
+ * Production project-store identities are UUIDv4 values; sealed evaluator
+ * fixtures retain their legacy content-addressed identities during migration.
+ */
+export function isProjectionProjectStoreIdentity(value: unknown): value is string {
+  return typeof value === "string" && (PROJECTION_UUID_V4.test(value) || PROJECTION_SHA256.test(value));
+}
+
+/** Workspace identity remains content-addressed for every projection source. */
+export function isProjectionWorkspaceIdentity(value: unknown): value is string {
+  return typeof value === "string" && PROJECTION_SHA256.test(value);
+}
+
 /**
  * Authenticated source authority for known projection events. The event store's
  * canonical bytes and established payload hash are authoritative; `payload` is

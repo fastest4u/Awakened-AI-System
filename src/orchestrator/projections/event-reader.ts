@@ -9,7 +9,11 @@ import type {
   SqliteDriver,
   SqliteRow,
 } from "../storage/sqlite-driver.js";
-import type { ProjectBinding } from "./contracts.js";
+import {
+  isProjectionProjectStoreIdentity,
+  isProjectionWorkspaceIdentity,
+  type ProjectBinding,
+} from "./contracts.js";
 
 const DEFAULT_BUSY_TIMEOUT_MS = 5_000;
 export const MAX_PROJECTION_SOURCE_EVENTS = 100_000;
@@ -128,10 +132,10 @@ function validateBinding(binding: ProjectBinding): ProjectBinding {
   if (
     typeof binding !== "object"
     || binding === null
-    || !HASH.test(binding.projectId)
-    || !HASH.test(binding.vaultId)
-    || !HASH.test(binding.storeId)
-    || !HASH.test(binding.workspaceId)
+    || !isProjectionProjectStoreIdentity(binding.projectId)
+    || !isProjectionProjectStoreIdentity(binding.vaultId)
+    || !isProjectionProjectStoreIdentity(binding.storeId)
+    || !isProjectionWorkspaceIdentity(binding.workspaceId)
     || (binding.branchScopeId !== null && !UUID.test(binding.branchScopeId))
     || (binding.branchRef !== null && (binding.branchRef.length === 0 || binding.branchRef.includes("\0")))
     || binding.sessionId !== null

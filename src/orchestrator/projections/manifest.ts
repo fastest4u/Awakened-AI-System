@@ -5,7 +5,11 @@ import { isAbsolute, join, normalize, relative, resolve, sep } from "node:path";
 import { AtomicArtifactReplacer } from "../materialization/atomic-artifact-replacer.js";
 import { LifecycleError } from "../lifecycle/errors.js";
 import { canonicalJson } from "../serialization/canonical-json.js";
-import type { ProjectBinding } from "./contracts.js";
+import {
+  isProjectionProjectStoreIdentity,
+  isProjectionWorkspaceIdentity,
+  type ProjectBinding,
+} from "./contracts.js";
 import { PROJECTION_NAMES, type ProjectionName } from "./checksum.js";
 import {
   filesystemStableProjectionDirectoryOperations,
@@ -233,9 +237,10 @@ function assertNullableBranchRef(value: unknown): asserts value is string | null
 
 function validateExpectedBinding(value: unknown): ProjectBinding {
   const source = exactRecord(value, BINDING_KEYS);
-  for (const key of ["projectId", "vaultId", "storeId", "workspaceId"] as const) {
-    assertHash(source[key]);
+  for (const key of ["projectId", "vaultId", "storeId"] as const) {
+    if (!isProjectionProjectStoreIdentity(source[key])) invalid();
   }
+  if (!isProjectionWorkspaceIdentity(source.workspaceId)) invalid();
   assertNullableUuid(source.branchScopeId);
   assertNullableBranchRef(source.branchRef);
   assertNullableUuid(source.sessionId);
@@ -288,9 +293,10 @@ export function parseProjectionManifest(
   const source = exactRecord(value, MANIFEST_KEYS);
   const expected = validateExpectedBinding(expectedBinding);
   if (source.schemaVersion !== 1 || source.sessionId !== null || !sameScope(source, expected)) invalid();
-  for (const key of ["projectId", "vaultId", "storeId", "workspaceId"] as const) {
-    assertHash(source[key]);
+  for (const key of ["projectId", "vaultId", "storeId"] as const) {
+    if (!isProjectionProjectStoreIdentity(source[key])) invalid();
   }
+  if (!isProjectionWorkspaceIdentity(source.workspaceId)) invalid();
   assertNullableUuid(source.branchScopeId);
   assertNullableBranchRef(source.branchRef);
   if (
@@ -336,7 +342,10 @@ export function parseProjectionManifestV2(
   const source = exactRecord(value, MANIFEST_V2_KEYS);
   const expected = validateExpectedBinding(expectedBinding);
   if (source.schemaVersion !== 2 || source.sessionId !== null || !sameScope(source, expected)) invalid();
-  for (const key of ["projectId", "vaultId", "storeId", "workspaceId"] as const) assertHash(source[key]);
+  for (const key of ["projectId", "vaultId", "storeId"] as const) {
+    if (!isProjectionProjectStoreIdentity(source[key])) invalid();
+  }
+  if (!isProjectionWorkspaceIdentity(source.workspaceId)) invalid();
   assertNullableUuid(source.branchScopeId);
   assertNullableBranchRef(source.branchRef);
   if (!Number.isSafeInteger(source.generation) || Number(source.generation) < 1 || Number(source.generation) > 2_147_483_647) {

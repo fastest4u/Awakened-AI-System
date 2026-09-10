@@ -25,6 +25,15 @@ const BINDING: ProjectBinding = Object.freeze({
   branchRef: "refs/heads/projection-contracts",
   sessionId: "00000000-0000-4000-8000-000000000042",
 });
+const PRODUCTION_BINDING: ProjectBinding = Object.freeze({
+  projectId: "11111111-1111-4111-8111-111111111111" as ProjectBinding["projectId"],
+  vaultId: "22222222-2222-4222-8222-222222222222" as ProjectBinding["vaultId"],
+  storeId: "33333333-3333-4333-8333-333333333333" as ProjectBinding["storeId"],
+  workspaceId: "a".repeat(64) as ProjectBinding["workspaceId"],
+  branchScopeId: null,
+  branchRef: null,
+  sessionId: null,
+});
 const ITEM_ID = "00000000-0000-4000-8000-000000000044";
 const EVENT_ID = "00000000-0000-4000-8000-000000000046";
 const OCCURRED_AT = "2026-08-23T01:00:00.000Z";
@@ -257,6 +266,14 @@ function governedEvent(
 }
 
 describe("projection folds", () => {
+  it("restores production UUID project, vault, and store identities with hashed workspace identity", () => {
+    const folded = foldProjectionEvent(
+      emptyProjectionFoldState(),
+      memoryEvent(42n, { binding: PRODUCTION_BINDING }),
+    );
+    assert.deepEqual(folded.binding, PRODUCTION_BINDING);
+  });
+
   it("binds the complete source scope and folds canonical state deterministically", () => {
     const initial = emptyProjectionFoldState();
     const folded = foldProjectionEvent(initial, memoryEvent(42n));

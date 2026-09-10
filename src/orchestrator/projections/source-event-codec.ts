@@ -14,6 +14,10 @@ import {
   type LifecycleEventType,
 } from "../lifecycle/contracts/events.js";
 import { canonicalJson } from "../serialization/canonical-json.js";
+import {
+  isProjectionProjectStoreIdentity,
+  isProjectionWorkspaceIdentity,
+} from "./contracts.js";
 import type {
   CheckpointArtifactItem,
   CheckpointFileItem,
@@ -179,6 +183,18 @@ function nullableUuid(value: unknown): string | null {
 function hash(value: unknown): string {
   const decoded = boundedString(value, 64);
   if (!HASH.test(decoded)) return integrity();
+  return decoded;
+}
+
+function projectStoreIdentity(value: unknown): string {
+  const decoded = boundedString(value, 64);
+  if (!isProjectionProjectStoreIdentity(decoded)) return integrity();
+  return decoded;
+}
+
+function workspaceIdentity(value: unknown): string {
+  const decoded = boundedString(value, 64);
+  if (!isProjectionWorkspaceIdentity(decoded)) return integrity();
   return decoded;
 }
 
@@ -421,10 +437,10 @@ function assertGovernedRowIdsUnique(
 function decodeBinding(value: unknown): ProjectBinding {
   const source = exactRecord(value, BINDING_KEYS);
   return Object.freeze({
-    projectId: hash(source.projectId) as ProjectId,
-    vaultId: hash(source.vaultId) as VaultId,
-    storeId: hash(source.storeId) as StoreId,
-    workspaceId: hash(source.workspaceId) as WorkspaceId,
+    projectId: projectStoreIdentity(source.projectId) as ProjectId,
+    vaultId: projectStoreIdentity(source.vaultId) as VaultId,
+    storeId: projectStoreIdentity(source.storeId) as StoreId,
+    workspaceId: workspaceIdentity(source.workspaceId) as WorkspaceId,
     branchScopeId: nullableUuid(source.branchScopeId) as BranchScopeId | null,
     branchRef: nullableBoundedString(source.branchRef, 1_024),
     sessionId: nullableUuid(source.sessionId),

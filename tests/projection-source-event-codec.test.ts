@@ -10,7 +10,10 @@ import type {
   WorkspaceId,
 } from "../src/orchestrator/identity/contracts.js";
 import { payloadHash as eventPayloadHash } from "../src/orchestrator/crypto/event-hash.js";
-import { PROJECTION_SOURCE_AUTHORITY_V1 } from "../src/orchestrator/projections/contracts.js";
+import {
+  PROJECTION_SOURCE_AUTHORITY_V1,
+  type ProjectBinding,
+} from "../src/orchestrator/projections/contracts.js";
 import {
   decodeProjectionEvent,
   validateProjectionEvent,
@@ -45,6 +48,15 @@ const EDGE_ID = "00000000-0000-4000-8000-000000000062";
 const BRANCH_REF = "refs/heads/projection-contracts";
 const OCCURRED_AT = "2026-08-23T01:00:00.000Z";
 const RECORDED_AT = "2026-08-23T01:00:01.000Z";
+const PRODUCTION_BINDING: ProjectBinding = Object.freeze({
+  projectId: "11111111-1111-4111-8111-111111111111" as ProjectId,
+  vaultId: "22222222-2222-4222-8222-222222222222" as VaultId,
+  storeId: "33333333-3333-4333-8333-333333333333" as StoreId,
+  workspaceId: "a".repeat(64) as WorkspaceId,
+  branchScopeId: null,
+  branchRef: null,
+  sessionId: null,
+});
 
 function binding(sessionId: string | null = SESSION_ID) {
   return {
@@ -103,6 +115,21 @@ function storedEvent(
     lifecycleIntentJson: null,
     ...overrides,
   };
+}
+
+function storedMemorySourceEvent(sourceBinding: ProjectBinding): StoredEvent {
+  const payload = memoryPayload({ binding: sourceBinding });
+  return storedEvent("MemorySourceRecorded", payload, {
+    projectId: sourceBinding.projectId,
+    vaultId: sourceBinding.vaultId,
+    storeId: sourceBinding.storeId,
+    workspaceId: sourceBinding.workspaceId,
+    branchScopeId: sourceBinding.branchScopeId,
+    branchRef: sourceBinding.branchRef,
+    sessionId: sourceBinding.sessionId,
+    payloadJson: canonicalJson(payload),
+    payloadHash: eventPayloadHash(payload),
+  });
 }
 
 function checkpointPayload(): JsonValue {
@@ -292,6 +319,32 @@ function childForkedPayload(): JsonValue {
 }
 
 describe("projection source event codec", () => {
+  it("accepts production UUID project, vault, and store identities with hashed workspace identity", () => {
+    const decoded = decodeProjectionEvent(storedMemorySourceEvent(PRODUCTION_BINDING));
+    assert.equal(decoded.kind, "projected");
+    if (decoded.kind === "projected") {
+      assert.equal(decoded.event.kind, "memory-source");
+      assert.deepEqual(decoded.event.binding, PRODUCTION_BINDING);
+    }
+  });
+
+  it("retains sealed SHA-256 evaluator identities", () => {
+    assert.doesNotThrow(() => decodeProjectionEvent(storedMemorySourceEvent(binding(null))));
+  });
+
+  it("rejects noncanonical and mixed-case identity tokens", () => {
+    for (const projectId of [
+      "project",
+      "11111111-1111-1111-1111-111111111111",
+      "A".repeat(64),
+    ]) {
+      assert.throws(
+        () => decodeProjectionEvent(storedMemorySourceEvent({ ...PRODUCTION_BINDING, projectId: projectId as ProjectId })),
+        /INTEGRITY_FAILURE/u,
+      );
+    }
+  });
+
   it("decodes a strict lifecycle checkpoint into only the allowed projection fields", () => {
     const decoded = decodeProjectionEvent(storedEvent("SessionCheckpointRecorded", checkpointPayload()));
     assert.equal(decoded.kind, "projected");

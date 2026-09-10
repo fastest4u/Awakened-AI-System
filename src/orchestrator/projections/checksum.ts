@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 
 import { canonicalJson } from "../serialization/canonical-json.js";
+import { isProjectionProjectStoreIdentity } from "./contracts.js";
 
 export const PROJECTION_NAMES = Object.freeze([
   "sessionTree",
@@ -17,7 +18,6 @@ export type ProjectionName = (typeof PROJECTION_NAMES)[number];
 export type CanonicalProjectionValue = null | boolean | number | string;
 export type CanonicalProjectionRow = Readonly<Record<string, CanonicalProjectionValue>>;
 
-const HASH = /^[0-9a-f]{64}$/u;
 const MAX_ROWS = 100_000;
 const MAX_COLUMNS = 64;
 const MAX_KEY_BYTES = 128;
@@ -90,8 +90,7 @@ export function projectionCoreChecksum(
     || !Number.isSafeInteger(schemaVersion)
     || schemaVersion < 1
     || schemaVersion > 2_147_483_647
-    || typeof projectId !== "string"
-    || !HASH.test(projectId)
+    || !isProjectionProjectStoreIdentity(projectId)
     || typeof terminalEventPosition !== "bigint"
     || terminalEventPosition < 0n
     || terminalEventPosition > SQLITE_INT64_MAX

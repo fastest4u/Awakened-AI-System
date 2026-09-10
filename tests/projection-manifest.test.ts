@@ -40,6 +40,15 @@ const BINDING: ProjectBinding = Object.freeze({
   branchRef: "refs/heads/projection-contracts",
   sessionId: null,
 });
+const PRODUCTION_BINDING: ProjectBinding = Object.freeze({
+  projectId: "11111111-1111-4111-8111-111111111111" as ProjectBinding["projectId"],
+  vaultId: "22222222-2222-4222-8222-222222222222" as ProjectBinding["vaultId"],
+  storeId: "33333333-3333-4333-8333-333333333333" as ProjectBinding["storeId"],
+  workspaceId: "a".repeat(64) as ProjectBinding["workspaceId"],
+  branchScopeId: null,
+  branchRef: null,
+  sessionId: null,
+});
 const HASH = "a".repeat(64);
 const CORE_CHECKSUMS = Object.freeze({
   artifactsFiles: "c".repeat(64),
@@ -196,6 +205,21 @@ afterEach(() => {
 });
 
 describe("immutable projection manifest", () => {
+  it("parses production UUID project, vault, and store identities with hashed workspace identity", () => {
+    const parsed = parseProjectionManifest(manifest({
+      projectId: PRODUCTION_BINDING.projectId,
+      vaultId: PRODUCTION_BINDING.vaultId,
+      storeId: PRODUCTION_BINDING.storeId,
+      workspaceId: PRODUCTION_BINDING.workspaceId,
+      branchScopeId: PRODUCTION_BINDING.branchScopeId,
+      branchRef: PRODUCTION_BINDING.branchRef,
+    }), PRODUCTION_BINDING);
+    assert.equal(parsed.projectId, PRODUCTION_BINDING.projectId);
+    assert.equal(parsed.vaultId, PRODUCTION_BINDING.vaultId);
+    assert.equal(parsed.storeId, PRODUCTION_BINDING.storeId);
+    assert.equal(parsed.workspaceId, PRODUCTION_BINDING.workspaceId);
+  });
+
   it("parses exact own data and binds every project/workspace/branch scope field", () => {
     const parsed = parseProjectionManifest(manifest(), BINDING);
 

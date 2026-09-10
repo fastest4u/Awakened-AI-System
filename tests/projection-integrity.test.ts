@@ -59,6 +59,8 @@ import type {
   SqliteDriver,
   SqliteOpenOptions,
   SqliteParams,
+  SqliteRow,
+  SqliteRunResult,
   SqliteStatement,
 } from "../src/orchestrator/storage/sqlite-driver.js";
 import { applyCurrentProjectStoreSchema } from "./support/current-project-store-schema.js";
@@ -86,9 +88,49 @@ const BINDING: ProjectBinding = Object.freeze({
   branchRef: BRANCH_REF,
   sessionId: null,
 });
+const PRODUCTION_BINDING: ProjectBinding = Object.freeze({
+  projectId: "11111111-1111-4111-8111-111111111111" as ProjectId,
+  vaultId: "22222222-2222-4222-8222-222222222222" as VaultId,
+  storeId: "33333333-3333-4333-8333-333333333333" as StoreId,
+  workspaceId: "a".repeat(64) as WorkspaceId,
+  branchScopeId: null,
+  branchRef: null,
+  sessionId: null,
+});
 
 const roots: string[] = [];
 const connections: SqliteConnection[] = [];
+
+function productionIdentityReaderDriver(): SqliteDriver {
+  return {
+    open(): SqliteConnection {
+      return {
+        exec(): void { /* snapshot transaction seam */ },
+        prepare(sql: string): SqliteStatement {
+          return {
+            run(): SqliteRunResult { return { changes: 0n, lastInsertRowid: 0n }; },
+            get(): SqliteRow | undefined {
+              if (sql.includes("FROM project_meta")) {
+                return {
+                  project_id: PRODUCTION_BINDING.projectId,
+                  vault_id: PRODUCTION_BINDING.vaultId,
+                  store_id: PRODUCTION_BINDING.storeId,
+                };
+              }
+              if (sql.includes("count(*) AS event_count")) {
+                return { event_count: 0n, maximum_row_bytes: 0n, aggregate_bytes: 0n };
+              }
+              return undefined;
+            },
+            all(): SqliteRow[] { return []; },
+            *iterate(): IterableIterator<SqliteRow> { /* empty committed snapshot */ },
+          };
+        },
+        close(): void { /* snapshot closes cleanly */ },
+      };
+    },
+  };
+}
 
 afterEach(() => {
   for (const connection of connections.splice(0)) {
@@ -467,6 +509,26 @@ function observingFullEventRows(onRow: () => void): SqliteDriver {
 }
 
 describe("full projection integrity replay", () => {
+  it("opens a committed snapshot for production UUID project-store identities", async () => {
+    const snapshot = await new SqliteProjectionEventReader({
+      driver: productionIdentityReaderDriver(),
+      eventStorePath: "production-identities.sqlite",
+    }).openCommittedSnapshot(PRODUCTION_BINDING);
+    assert.deepEqual(snapshot.binding, PRODUCTION_BINDING);
+    assert.equal(snapshot.eventCount, 0);
+    snapshot.close();
+  });
+
+  it("accepts a production UUID project identity in the projection checksum domain", () => {
+    assert.doesNotThrow(() => projectionCoreChecksum(
+      "sessionTree",
+      2,
+      PRODUCTION_BINDING.projectId,
+      0n,
+      [],
+    ));
+  });
+
   it("returns a frozen pass report only for an exact authoritative replay", async () => {
     const fixture = await createFixture();
     const sourceBefore = databaseSha256(fixture.sourcePath);
