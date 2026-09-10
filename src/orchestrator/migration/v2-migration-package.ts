@@ -403,7 +403,14 @@ export async function sealV2MigrationPackage(input: SealV2MigrationPackageInput)
       quarantine(temporary);
       temporary = undefined;
       assertBeforeDeadline(ordinal);
-      return openSealedV2MigrationPackage({ rootPath: target, expectedMigrationIdentity: migrationIdentity });
+      const adopted = openSealedV2MigrationPackage({ rootPath: target, expectedMigrationIdentity: migrationIdentity });
+      try {
+        assertBeforeDeadline(ordinal);
+        return adopted;
+      } catch (error) {
+        adopted.close();
+        throw error;
+      }
     } catch (error) {
       if (error instanceof ShadowMigrationError && error.code === "MIGRATION_IDENTITY_CONFLICT") {
         const targetExists = (() => { try { lstatSync(target); return true; } catch { return false; } })();
