@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { readFileSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import test from "node:test";
 import { verifyV1SourceCopy } from "../src/orchestrator/migration/v1-source-copy.js";
@@ -7,7 +7,7 @@ import {
   openSealedV2MigrationPackage,
   sealV2MigrationPackage,
 } from "../src/orchestrator/migration/v2-migration-package.js";
-import { ShadowMigrationError } from "../src/orchestrator/migration/v2-shadow-migration.contracts.js";
+import { decodeShadowMigrationPolicyV1, ShadowMigrationError, shadowMigrationConfigurationChecksum, shadowMigrationPolicyChecksum } from "../src/orchestrator/migration/v2-shadow-migration.contracts.js";
 import { createV2ShadowMigrationFixture } from "./support/v2-shadow-migration-fixture.js";
 
 function identityConflict(error: unknown): boolean {
@@ -24,10 +24,102 @@ test("seals identical logical packages independent of absolute path", async (t) 
   assert.equal(left.migrationIdentity, right.migrationIdentity);
   assert.deepEqual([...left.records()].map((record) => record.descriptor), [...right.records()].map((record) => record.descriptor));
   assert.deepEqual([...left.records()].map((record) => record.descriptor.kind), ["source-event", "source-event", "legacy-artifact", "legacy-artifact"]);
+  assert.deepEqual([...left.records()].map((record) => record.descriptor.sourceIdentity), fixture.sourceEvents.map((event) => event.eventId).concat(fixture.manifest.legacyArtifacts.map((artifact) => artifact.sha256)));
+  assert.deepEqual([...source.events()].map((event) => event.globalPosition), [1n, 2n]);
+  assert.deepEqual([...left.records()].slice(2).map((record) => record.descriptor.relativePath), ["legacy/one.md", "legacy/two.md"]);
   source.assertUnchanged();
   left.close();
   right.close();
   source.close();
+});
+
+test("rejects delayed record iteration after package tampering or close", async (t) => {
+  // Removing consumption-time authentication/lifecycle checks exposes changed bytes after iterable acquisition.
+  const fixture = await createV2ShadowMigrationFixture(t);
+  const source = await verifyV1SourceCopy(fixture.verificationInput);
+  const sealed = await sealV2MigrationPackage({ ...fixture.packageInput, source, packageRoot: fixture.packageRootA });
+  const delayed = [...sealed.records()][0]!.readChunks();
+  const eventPath = join(sealed.rootPath, "events.ndjson");
+  const bytes = readFileSync(eventPath); bytes[0] ^= 1; writeFileSync(eventPath, bytes);
+  assert.throws(() => [...delayed], identityConflict);
+  const secondSealed = await sealV2MigrationPackage({ ...fixture.packageInput, source, packageRoot: fixture.packageRootB });
+  const second = [...secondSealed.records()][0]!.readChunks();
+  secondSealed.close();
+  assert.throws(() => [...second], identityConflict);
+  const reopened = openSealedV2MigrationPackage({ rootPath: join(fixture.packageRootB, secondSealed.migrationIdentity), expectedMigrationIdentity: secondSealed.migrationIdentity });
+  const deferredFailure = [...reopened.records()][0]!.readChunks();
+  renameSync(join(reopened.rootPath, "events.ndjson"), join(fixture.root, "removed-events.ndjson"));
+  assert.throws(() => [...deferredFailure], identityConflict);
+  reopened.close();
+  sealed.close();
+  source.close();
+});
+
+test("pins sealed package filesystem identities across byte-identical replacement", async (t) => {
+  // Reopening by logical checksum alone misses pathname replacement of a held package.
+  const fixture = await createV2ShadowMigrationFixture(t);
+  const source = await verifyV1SourceCopy(fixture.verificationInput);
+  const sealed = await sealV2MigrationPackage({ ...fixture.packageInput, source, packageRoot: fixture.packageRootA });
+  const path = join(sealed.rootPath, "events.ndjson");
+  const moved = join(fixture.root, "same-events.ndjson");
+  renameSync(path, moved); copyFileSync(moved, path);
+  assert.throws(() => sealed.assertUnchanged(), identityConflict);
+  sealed.close(); source.close();
+});
+
+test("rejects source-overlapping staging roots before creating a package", async (t) => {
+  // Removing source/package root separation writes a new package into the immutable source copy.
+  const fixture = await createV2ShadowMigrationFixture(t);
+  const source = await verifyV1SourceCopy(fixture.verificationInput);
+  const baseline = await sealV2MigrationPackage({ ...fixture.packageInput, source, packageRoot: fixture.packageRootA });
+  baseline.close();
+  await assert.rejects(sealV2MigrationPackage({ ...fixture.packageInput, source, packageRoot: fixture.sourceRoot }), (error: unknown) => error instanceof ShadowMigrationError && error.code === "MIGRATION_SOURCE_INVALID");
+  assert.equal(readdirSync(fixture.sourceRoot).some((entry) => entry.startsWith(".v2-migration-package-") || entry.startsWith(".quarantine-")), false);
+  assert.equal(existsSync(join(fixture.sourceRoot, baseline.migrationIdentity)), false);
+  source.close();
+});
+
+test("rejects records that cannot fit the sealed batch limits", async (t) => {
+  // Removing pre-write batch accounting accepts a package record larger than maxBatchBytes.
+  const fixture = await createV2ShadowMigrationFixture(t);
+  const source = await verifyV1SourceCopy(fixture.verificationInput);
+  const policy = decodeShadowMigrationPolicyV1({ ...fixture.policy, maxBatchEvents: 1, maxBatchBytes: 1 });
+  const configurationChecksum = shadowMigrationConfigurationChecksum({ schemaVersion: 1, policyChecksum: shadowMigrationPolicyChecksum(policy), packageFormatVersion: 1, migrationAlgorithmVersion: 1, expectedDifferencePolicyVersion: 1 });
+  await assert.rejects(sealV2MigrationPackage({ ...fixture.packageInput, policy, configurationChecksum, source, packageRoot: fixture.packageRootA }), (error: unknown) => error instanceof ShadowMigrationError && error.code === "MIGRATION_LIMIT_EXCEEDED");
+  source.close();
+});
+
+test("rejects expiry during artifact copying before publication", async (t) => {
+  // Removing bounded-copy deadline checks permits final artifact fsync/publication after expiry.
+  const fixture = await createV2ShadowMigrationFixture(t);
+  const source = await verifyV1SourceCopy(fixture.verificationInput);
+  const baseline = await sealV2MigrationPackage({ ...fixture.packageInput, source, packageRoot: fixture.packageRootB });
+  baseline.close();
+  const originalNow = Date.now;
+  let now = 0;
+  Date.now = () => now;
+  const originalArtifacts = [...source.legacyArtifacts()];
+  const delayedSource = { ...source, legacyArtifacts() {
+    return originalArtifacts.map((artifact, index) => index === originalArtifacts.length - 1 ? {
+      ...artifact,
+      readChunks(): Iterable<Uint8Array> { return (function* () { for (const chunk of artifact.readChunks()) { yield chunk; now = 300_001; } })(); },
+    } : artifact).values();
+  } };
+  try {
+    await assert.rejects(sealV2MigrationPackage({ ...fixture.packageInput, source: delayedSource, packageRoot: fixture.packageRootA }), (error: unknown) => error instanceof ShadowMigrationError && error.code === "MIGRATION_LIMIT_EXCEEDED");
+    assert.equal(existsSync(join(fixture.packageRootA, baseline.migrationIdentity)), false);
+  } finally { Date.now = originalNow; source.close(); }
+});
+
+test("rejects unexpected empty artifact directories on open and held handles", async (t) => {
+  // Treating directories as traversal-only lets a non-exact existing target be adopted.
+  const fixture = await createV2ShadowMigrationFixture(t);
+  const source = await verifyV1SourceCopy(fixture.verificationInput);
+  const sealed = await sealV2MigrationPackage({ ...fixture.packageInput, source, packageRoot: fixture.packageRootA });
+  mkdirSync(join(sealed.rootPath, "artifacts", "unexpected-empty"));
+  assert.throws(() => openSealedV2MigrationPackage({ rootPath: sealed.rootPath, expectedMigrationIdentity: sealed.migrationIdentity }), identityConflict);
+  assert.throws(() => sealed.assertUnchanged(), identityConflict);
+  sealed.close(); source.close();
 });
 
 test("rejects a package whose event bytes were replaced", async (t) => {

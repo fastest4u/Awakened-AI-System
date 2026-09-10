@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import {
   closeSync,
+  fstatSync,
   fsyncSync,
   lstatSync,
   mkdirSync,
@@ -8,8 +9,8 @@ import {
   openSync,
   readSync,
   readdirSync,
+  realpathSync,
   renameSync,
-  statSync,
   writeSync,
 } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
@@ -97,9 +98,10 @@ export interface OpenSealedV2MigrationPackageInput {
 
 interface RecordLocation {
   readonly descriptor: V2MigrationRecordDescriptorV1;
-  readonly path: string;
-  readonly offset: number;
+  readonly bytes: Uint8Array;
 }
+
+interface PackageIdentity { readonly path: string; readonly device: bigint; readonly inode: bigint; readonly size: bigint; readonly directory: boolean; }
 
 function conflict(): never {
   throw new ShadowMigrationError("MIGRATION_IDENTITY_CONFLICT", Object.freeze({}));
@@ -159,29 +161,52 @@ function assertPackageTree(rootPath: string): void {
   walk(rootPath);
 }
 
-function writeAll(handle: number, bytes: Uint8Array): void {
+function capturePackageIdentities(rootPath: string): readonly PackageIdentity[] {
+  const identities: PackageIdentity[] = [];
+  const capture = (path: string): void => {
+    const stat = lstatSync(path, { bigint: true });
+    if (stat.isSymbolicLink() || (!stat.isDirectory() && (!stat.isFile() || stat.nlink !== 1n))) conflict();
+    identities.push(Object.freeze({ path: relative(rootPath, path), device: stat.dev, inode: stat.ino, size: stat.size, directory: stat.isDirectory() }));
+    if (stat.isDirectory()) for (const entry of readdirSync(path, { withFileTypes: true })) capture(join(path, entry.name));
+  };
+  capture(rootPath);
+  return Object.freeze(identities.sort((left, right) => left.path.localeCompare(right.path)));
+}
+
+function assertPackageIdentities(rootPath: string, expected: readonly PackageIdentity[]): void {
+  const actual = capturePackageIdentities(rootPath);
+  if (actual.length !== expected.length) conflict();
+  for (let index = 0; index < actual.length; index += 1) {
+    const left = actual[index]!; const right = expected[index]!;
+    if (left.path !== right.path || left.device !== right.device || left.inode !== right.inode || left.size !== right.size || left.directory !== right.directory) conflict();
+  }
+}
+
+function writeAll(handle: number, bytes: Uint8Array, assertDeadline?: () => void): void {
   let offset = 0;
   while (offset < bytes.length) {
+    assertDeadline?.();
     const written = writeSync(handle, bytes, offset, bytes.length - offset, null);
     if (!Number.isSafeInteger(written) || written <= 0 || written > bytes.length - offset) conflict();
     offset += written;
   }
 }
 
-function writeFileDurably(path: string, chunks: Iterable<Uint8Array>): { readonly bytes: number; readonly sha256: string } {
+function writeFileDurably(path: string, chunks: Iterable<Uint8Array>, assertDeadline?: () => void): { readonly bytes: number; readonly sha256: string } {
   let handle: number | undefined;
   const hash = createHash("sha256");
   let bytes = 0;
   try {
     handle = openSync(path, "wx", 0o600);
     for (const chunk of chunks) {
+      assertDeadline?.();
       if (!(chunk instanceof Uint8Array) || chunk.length > MAX_CHUNK_BYTES) conflict();
-      writeAll(handle, chunk);
+      writeAll(handle, chunk, assertDeadline);
       hash.update(chunk);
       bytes += chunk.length;
       if (!Number.isSafeInteger(bytes)) conflict();
     }
-    fsyncSync(handle);
+    assertDeadline?.(); fsyncSync(handle); assertDeadline?.();
     return Object.freeze({ bytes, sha256: hash.digest("hex") });
   } finally {
     if (handle !== undefined) closeSync(handle);
@@ -270,9 +295,13 @@ export async function sealV2MigrationPackage(input: SealV2MigrationPackageInput)
   const source = input.source;
   let temporary: string | undefined;
   try {
-    source.assertUnchanged();
+    const sourceRoot = normalized(realpathSync(source.sourceRoot));
+    const stagingRoot = normalized(realpathSync(packageRoot));
+    if (sourceRoot === stagingRoot || contained(sourceRoot, stagingRoot) || contained(stagingRoot, sourceRoot)) sourceInvalid();
     const deadlineAt = Date.now() + policy.deadlineMs;
     const assertBeforeDeadline = (ordinal: number): void => { if (Date.now() > deadlineAt) limitExceeded(ordinal); };
+    assertBeforeDeadline(0);
+    source.assertUnchanged();
     temporary = mkdtempSync(join(packageRoot, ".v2-migration-package-"));
     assertDirectory(temporary);
     const eventsPath = join(temporary, "events.ndjson");
@@ -283,6 +312,15 @@ export async function sealV2MigrationPackage(input: SealV2MigrationPackageInput)
     const descriptors: V2MigrationRecordDescriptorV1[] = [];
     let sourceBytes = 0;
     let eventCount = 0;
+    let batchEvents = 0;
+    let batchBytes = 0;
+    const reserveBatch = (bytes: number, ordinal: number): void => {
+      assertBeforeDeadline(ordinal);
+      if (bytes > policy.maxBatchBytes) limitExceeded(ordinal);
+      if (batchEvents === policy.maxBatchEvents || batchBytes + bytes > policy.maxBatchBytes) { batchEvents = 0; batchBytes = 0; }
+      if (batchEvents >= policy.maxBatchEvents || batchBytes + bytes > policy.maxBatchBytes) limitExceeded(ordinal);
+      batchEvents += 1; batchBytes += bytes;
+    };
     try {
       let priorPosition = -1n;
       for (const event of source.events()) {
@@ -292,13 +330,14 @@ export async function sealV2MigrationPackage(input: SealV2MigrationPackageInput)
         if (payloadBytes > policy.maxEventBytes || sourceBytes + payloadBytes > policy.maxAggregateBytes) limitExceeded(eventCount);
         const bytes = Buffer.from(`${canonicalEventEnvelope(event)}\n`, "utf8");
         if (bytes.length > MAX_EVENT_LINE_BYTES) limitExceeded(eventCount);
-        writeAll(eventHandle, bytes);
+        reserveBatch(bytes.length - 1, eventCount);
+        writeAll(eventHandle, bytes, () => assertBeforeDeadline(eventCount));
         descriptors.push(eventDescriptor(event, eventCount, bytes.subarray(0, bytes.length - 1)));
         sourceBytes += payloadBytes;
         eventCount += 1;
         priorPosition = event.globalPosition;
       }
-      fsyncSync(eventHandle);
+      assertBeforeDeadline(eventCount); fsyncSync(eventHandle); assertBeforeDeadline(eventCount);
     } finally { closeSync(eventHandle); }
     if (eventCount !== source.manifest.eventCount) sourceInvalid();
     let ordinal = eventCount;
@@ -309,6 +348,7 @@ export async function sealV2MigrationPackage(input: SealV2MigrationPackageInput)
       if (previousPath !== undefined && previousPath >= relativePath) sourceInvalid();
       const artifactPath = safePath(artifactsPath, relativePath);
       if (artifact.descriptor.size > policy.maxEventBytes || sourceBytes + artifact.descriptor.size > policy.maxAggregateBytes) limitExceeded(ordinal);
+      reserveBatch(artifact.descriptor.size, ordinal);
       mkdirSync(dirname(artifactPath), { recursive: true, mode: 0o700 });
       let directory = dirname(artifactPath);
       while (contained(artifactsPath, directory) || directory === artifactsPath) {
@@ -317,7 +357,7 @@ export async function sealV2MigrationPackage(input: SealV2MigrationPackageInput)
         directory = dirname(directory);
       }
       artifact.assertUnchanged();
-      const copied = writeFileDurably(artifactPath, artifact.readChunks());
+      const copied = writeFileDurably(artifactPath, artifact.readChunks(), () => assertBeforeDeadline(ordinal));
       artifact.assertUnchanged();
       if (copied.bytes !== artifact.descriptor.size) sourceInvalid();
       descriptors.push(artifactDescriptor(artifact, ordinal, copied.bytes, copied.sha256));
@@ -326,20 +366,26 @@ export async function sealV2MigrationPackage(input: SealV2MigrationPackageInput)
       previousPath = relativePath;
     }
     if (sourceBytes !== source.manifest.aggregateSourceBytes || sourceBytes > policy.maxAggregateBytes) sourceInvalid();
+    assertBeforeDeadline(ordinal);
     const manifest = createManifest(source, descriptors, eventCount, sourceBytes, input);
     const migrationIdentity = identityFor(manifest);
+    assertBeforeDeadline(ordinal);
     new AtomicArtifactReplacer({ durableBase: temporary }).replace({
       targetPath: join(temporary, "package-manifest.json"),
       tempPath: join(temporary, `.package-manifest-${randomUUID()}.tmp`),
       bytes: Buffer.from(canonicalJson(manifest), "utf8"),
     });
     for (const directory of [...artifactDirectories].sort((left, right) => right.length - left.length)) fsyncDirectory(directory);
+    assertBeforeDeadline(ordinal);
     fsyncDirectory(temporary);
+    assertBeforeDeadline(ordinal);
     source.assertUnchanged();
+    assertBeforeDeadline(ordinal);
     const verified = openSealedV2MigrationPackage({ rootPath: temporary, expectedMigrationIdentity: migrationIdentity });
     verified.close();
     const target = join(packageRoot, migrationIdentity);
     try {
+      assertBeforeDeadline(ordinal);
       const existing = openSealedV2MigrationPackage({ rootPath: target, expectedMigrationIdentity: migrationIdentity });
       if (existing.manifest.packageChecksum !== manifest.packageChecksum || canonicalJson(existing.manifest) !== canonicalJson(manifest)) {
         existing.close();
@@ -356,6 +402,7 @@ export async function sealV2MigrationPackage(input: SealV2MigrationPackageInput)
       }
     }
     if (temporary === undefined) conflict();
+    assertBeforeDeadline(ordinal);
     renameSync(temporary, target);
     temporary = undefined;
     fsyncDirectory(packageRoot);
@@ -413,7 +460,9 @@ function* readChunks(path: string, offset: number, length: number | undefined): 
   let handle: number | undefined;
   try {
     handle = openSync(path, "r");
-    const size = Number(statSync(path, { bigint: true }).size);
+    const opened = fstatSync(handle, { bigint: true });
+    if (!opened.isFile() || opened.nlink !== 1n) conflict();
+    const size = Number(opened.size);
     const remaining = length ?? size - offset;
     if (!Number.isSafeInteger(remaining) || remaining < 0 || offset < 0 || offset + remaining > size) conflict();
     let cursor = offset;
@@ -426,6 +475,8 @@ function* readChunks(path: string, offset: number, length: number | undefined): 
       left -= read;
       yield Uint8Array.from(buffer.subarray(0, read));
     }
+    const after = fstatSync(handle, { bigint: true });
+    if (after.dev !== opened.dev || after.ino !== opened.ino || after.size !== opened.size || !after.isFile() || after.nlink !== 1n) conflict();
   } finally { if (handle !== undefined) closeSync(handle); }
 }
 
@@ -434,7 +485,6 @@ function lineLocations(rootPath: string, manifest: V2MigrationPackageManifestV1)
   const eventDescriptors = manifest.recordDescriptors.slice(0, manifest.eventCount);
   const locations: RecordLocation[] = [];
   let pending = Buffer.alloc(0);
-  let offset = 0;
   let ordinal = 0;
   for (const chunk of readChunks(path, 0, undefined)) {
     pending = Buffer.concat([pending, chunk]);
@@ -452,8 +502,7 @@ function lineLocations(rootPath: string, manifest: V2MigrationPackageManifestV1)
         || (event as { eventId?: unknown }).eventId !== descriptor.sourceIdentity) {
         throw new ShadowMigrationError("MIGRATION_IDENTITY_CONFLICT", Object.freeze({ category: "canonical-record", ordinal }));
       }
-      locations.push(Object.freeze({ descriptor, path, offset }));
-      offset += newline + 1;
+      locations.push(Object.freeze({ descriptor, bytes: Uint8Array.from(value) }));
       pending = pending.subarray(newline + 1);
     }
   }
@@ -467,6 +516,11 @@ function assertExactPackageLayout(rootPath: string, manifest: V2MigrationPackage
   const artifactRoot = join(rootPath, "artifacts");
   assertDirectory(artifactRoot);
   const expected = new Set(manifest.recordDescriptors.slice(manifest.eventCount).map((descriptor) => descriptor.relativePath!));
+  const expectedDirectories = new Set<string>([""]);
+  for (const file of expected) {
+    let directory = dirname(file).split(sep).join("/");
+    while (directory !== "." && directory !== "") { expectedDirectories.add(directory); directory = dirname(directory).split(sep).join("/"); }
+  }
   const actual = new Set<string>();
   const walk = (directory: string): void => {
     for (const entry of readdirSync(directory, { withFileTypes: true })) {
@@ -474,7 +528,7 @@ function assertExactPackageLayout(rootPath: string, manifest: V2MigrationPackage
       const suffix = relative(artifactRoot, path).split(sep).join("/");
       const stat = lstatSync(path, { bigint: true });
       if (stat.isSymbolicLink()) conflict();
-      if (stat.isDirectory()) walk(path);
+      if (stat.isDirectory()) { if (!expectedDirectories.has(suffix)) conflict(); walk(path); }
       else if (stat.isFile() && stat.nlink === 1n) actual.add(suffix);
       else conflict();
     }
@@ -489,6 +543,7 @@ export function openSealedV2MigrationPackage(input: OpenSealedV2MigrationPackage
       || typeof input.expectedMigrationIdentity !== "string" || !HASH.test(input.expectedMigrationIdentity)) conflict();
     const rootPath = normalized(input.rootPath);
     assertPackageTree(rootPath);
+    const identities = capturePackageIdentities(rootPath);
     const manifest = parseManifest(join(rootPath, "package-manifest.json"));
     const migrationIdentity = identityFor(manifest);
     if (migrationIdentity !== input.expectedMigrationIdentity) conflict();
@@ -496,16 +551,17 @@ export function openSealedV2MigrationPackage(input: OpenSealedV2MigrationPackage
     const locations = lineLocations(rootPath, manifest);
     for (const descriptor of manifest.recordDescriptors.slice(manifest.eventCount)) {
       const path = safePath(join(rootPath, "artifacts"), descriptor.relativePath!);
-      const hash = createHash("sha256");
-      let length = 0;
-      for (const chunk of readChunks(path, 0, undefined)) { hash.update(chunk); length += chunk.length; }
-      if (length !== descriptor.byteLength || hash.digest("hex") !== descriptor.contentSha256) conflict();
-      locations.push(Object.freeze({ descriptor, path, offset: 0 }));
+      const chunks = [...readChunks(path, 0, undefined)];
+      const bytes = Buffer.concat(chunks.map((chunk) => Buffer.from(chunk)));
+      if (bytes.length !== descriptor.byteLength || sha256(bytes) !== descriptor.contentSha256) conflict();
+      locations.push(Object.freeze({ descriptor, bytes: Uint8Array.from(bytes) }));
     }
+    assertPackageIdentities(rootPath, identities);
     let closed = false;
     const requireOpen = (): void => { if (closed) conflict(); };
     const assertUnchanged = (): void => {
       requireOpen();
+      assertPackageIdentities(rootPath, identities);
       const verified = openSealedV2MigrationPackage({ rootPath, expectedMigrationIdentity: migrationIdentity });
       if (canonicalJson(verified.manifest) !== canonicalJson(manifest)) conflict();
       verified.close();
@@ -514,7 +570,14 @@ export function openSealedV2MigrationPackage(input: OpenSealedV2MigrationPackage
       requireOpen();
       assertUnchanged();
       return locations.map((location) => Object.freeze({ descriptor: location.descriptor,
-        readChunks(): Iterable<Uint8Array> { requireOpen(); assertUnchanged(); return readChunks(location.path, location.offset, location.descriptor.byteLength); },
+        readChunks(): Iterable<Uint8Array> {
+          return (function* (): Iterable<Uint8Array> {
+            for (let offset = 0; offset < location.bytes.length; offset += MAX_CHUNK_BYTES) {
+              requireOpen(); assertUnchanged();
+              yield Uint8Array.from(location.bytes.subarray(offset, offset + MAX_CHUNK_BYTES));
+            }
+          })();
+        },
       })).values();
     };
     return Object.freeze({ rootPath, migrationIdentity, manifest, records, assertUnchanged, close(): void { closed = true; } });
