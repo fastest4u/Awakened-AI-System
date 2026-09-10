@@ -90,6 +90,7 @@ export interface SealV2MigrationPackageInput {
   readonly buildIdentityHash: string;
   readonly configurationChecksum: string;
   readonly now?: () => number;
+  readonly onPhase?: (phase: "existing-target-final-open" | "fresh-target-final-open") => void;
 }
 
 export interface OpenSealedV2MigrationPackageInput {
@@ -405,6 +406,7 @@ export async function sealV2MigrationPackage(input: SealV2MigrationPackageInput)
       assertBeforeDeadline(ordinal);
       const adopted = openSealedV2MigrationPackage({ rootPath: target, expectedMigrationIdentity: migrationIdentity });
       try {
+        input.onPhase?.("existing-target-final-open");
         assertBeforeDeadline(ordinal);
         return adopted;
       } catch (error) {
@@ -412,6 +414,7 @@ export async function sealV2MigrationPackage(input: SealV2MigrationPackageInput)
         throw error;
       }
     } catch (error) {
+      if (error instanceof ShadowMigrationError && error.code !== "MIGRATION_IDENTITY_CONFLICT") throw error;
       if (error instanceof ShadowMigrationError && error.code === "MIGRATION_IDENTITY_CONFLICT") {
         const targetExists = (() => { try { lstatSync(target); return true; } catch { return false; } })();
         if (targetExists) throw error;
@@ -424,7 +427,7 @@ export async function sealV2MigrationPackage(input: SealV2MigrationPackageInput)
     fsyncDirectory(packageRoot);
     assertBeforeDeadline(ordinal);
     const published = openSealedV2MigrationPackage({ rootPath: target, expectedMigrationIdentity: migrationIdentity });
-    try { assertBeforeDeadline(ordinal); return published; } catch (error) { published.close(); throw error; }
+    try { input.onPhase?.("fresh-target-final-open"); assertBeforeDeadline(ordinal); return published; } catch (error) { published.close(); throw error; }
   } catch (error) {
     if (temporary !== undefined) quarantine(temporary);
     if (error instanceof ShadowMigrationError) throw error;
@@ -557,6 +560,25 @@ function assertExactPackageLayout(rootPath: string, manifest: V2MigrationPackage
   if (actual.size !== expected.size || [...actual].some((path) => !expected.has(path))) conflict();
 }
 
+function verifiedRecordLocations(rootPath: string, manifest: V2MigrationPackageManifestV1): RecordLocation[] {
+  assertExactPackageLayout(rootPath, manifest);
+  const locations = lineLocations(rootPath, manifest);
+  for (const descriptor of manifest.recordDescriptors.slice(manifest.eventCount)) {
+    const path = safePath(join(rootPath, "artifacts"), descriptor.relativePath!);
+    const hash = createHash("sha256"); let length = 0;
+    for (const chunk of readChunks(path, 0, undefined)) { hash.update(chunk); length += chunk.length; }
+    if (length !== descriptor.byteLength || hash.digest("hex") !== descriptor.contentSha256) conflict();
+    locations.push(Object.freeze({ descriptor, path, offset: 0 }));
+  }
+  return locations;
+}
+
+function assertPackageContent(rootPath: string, expectedManifest: V2MigrationPackageManifestV1): void {
+  const currentManifest = parseManifest(join(rootPath, "package-manifest.json"));
+  if (canonicalJson(currentManifest) !== canonicalJson(expectedManifest)) conflict();
+  verifiedRecordLocations(rootPath, expectedManifest);
+}
+
 export function openSealedV2MigrationPackage(input: OpenSealedV2MigrationPackageInput): SealedV2MigrationPackage {
   try {
     if (typeof input !== "object" || input === null || typeof input.rootPath !== "string" || !isAbsolute(input.rootPath)
@@ -567,29 +589,29 @@ export function openSealedV2MigrationPackage(input: OpenSealedV2MigrationPackage
     const manifest = parseManifest(join(rootPath, "package-manifest.json"));
     const migrationIdentity = identityFor(manifest);
     if (migrationIdentity !== input.expectedMigrationIdentity) conflict();
-    assertExactPackageLayout(rootPath, manifest);
-    const locations = lineLocations(rootPath, manifest);
-    for (const descriptor of manifest.recordDescriptors.slice(manifest.eventCount)) {
-      const path = safePath(join(rootPath, "artifacts"), descriptor.relativePath!);
-      const hash = createHash("sha256"); let length = 0;
-      for (const chunk of readChunks(path, 0, undefined)) { hash.update(chunk); length += chunk.length; }
-      if (length !== descriptor.byteLength || hash.digest("hex") !== descriptor.contentSha256) conflict();
-      locations.push(Object.freeze({ descriptor, path, offset: 0 }));
-    }
+    const locations = verifiedRecordLocations(rootPath, manifest);
     assertPackageIdentities(rootPath, identities);
     let closed = false;
     const requireOpen = (): void => { if (closed) conflict(); };
-    const assertUnchanged = (): void => {
+    const assertMetadataUnchanged = (): void => {
       requireOpen();
       held(() => assertPackageIdentities(rootPath, identities));
     };
+    const assertUnchanged = (): void => {
+      requireOpen();
+      held(() => {
+        assertPackageIdentities(rootPath, identities);
+        assertPackageContent(rootPath, manifest);
+        assertPackageIdentities(rootPath, identities);
+      });
+    };
     const records = (): Iterable<V2MigrationPackageRecordV1> => {
       requireOpen();
-      assertUnchanged();
+      assertMetadataUnchanged();
       return locations.map((location) => Object.freeze({ descriptor: location.descriptor,
         readChunks(): Iterable<Uint8Array> {
           return (function* (): Iterable<Uint8Array> {
-            requireOpen(); assertUnchanged();
+            requireOpen(); assertMetadataUnchanged();
             const bytes = held(() => {
               const chunks = [...readChunks(location.path, location.offset, location.descriptor.byteLength)];
               const value = Buffer.concat(chunks.map((chunk) => Buffer.from(chunk)));
@@ -597,7 +619,7 @@ export function openSealedV2MigrationPackage(input: OpenSealedV2MigrationPackage
               return Uint8Array.from(value);
             });
             for (let offset = 0; offset < bytes.length; offset += MAX_CHUNK_BYTES) {
-              requireOpen(); assertUnchanged();
+              requireOpen(); assertMetadataUnchanged();
               yield Uint8Array.from(bytes.subarray(offset, offset + MAX_CHUNK_BYTES));
             }
           })();

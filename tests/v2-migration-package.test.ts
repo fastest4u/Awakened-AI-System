@@ -67,15 +67,62 @@ test("redacts a removed package root during deferred record consumption", async 
   sealed.close(); source.close();
 });
 
-test("enforces expiry after exact-target verification and after final publication", async (t) => {
-  // Returning success after a verification/finalization-time deadline expiry violates the sealed policy.
+test("classifies expiry during named existing-target final adoption", async (t) => {
+  // A deadline crossing after the exact target is reopened must remain a limit error, not an identity conflict.
   const fixture = await createV2ShadowMigrationFixture(t);
   const source = await verifyV1SourceCopy(fixture.verificationInput);
   const initial = await sealV2MigrationPackage({ ...fixture.packageInput, source, packageRoot: fixture.packageRootA });
-  let calls = 0;
-  const expiresLate = () => (++calls > 20 ? 300_001 : 0);
-  await assert.rejects(sealV2MigrationPackage({ ...fixture.packageInput, source, packageRoot: fixture.packageRootA, now: expiresLate }), (error: unknown) => error instanceof ShadowMigrationError && error.code === "MIGRATION_LIMIT_EXCEEDED");
+  let now = 0;
+  await assert.rejects(sealV2MigrationPackage({ ...fixture.packageInput, source, packageRoot: fixture.packageRootA, now: () => now,
+    onPhase: (phase: string) => { if (phase === "existing-target-final-open") now = 300_001; },
+  }), (error: unknown) => error instanceof ShadowMigrationError && error.code === "MIGRATION_LIMIT_EXCEEDED");
+  assert.equal(existsSync(join(fixture.packageRootA, initial.migrationIdentity)), true);
+  openSealedV2MigrationPackage({ rootPath: join(fixture.packageRootA, initial.migrationIdentity), expectedMigrationIdentity: initial.migrationIdentity }).close();
   initial.close(); source.close();
+});
+
+test("classifies expiry during named fresh-target final completion", async (t) => {
+  // Publication is durable before final open, but the caller still receives the deadline result.
+  const fixture = await createV2ShadowMigrationFixture(t);
+  const source = await verifyV1SourceCopy(fixture.verificationInput);
+  const identitySource = await sealV2MigrationPackage({ ...fixture.packageInput, source, packageRoot: fixture.packageRootA });
+  let now = 0;
+  await assert.rejects(sealV2MigrationPackage({ ...fixture.packageInput, source, packageRoot: fixture.packageRootB, now: () => now,
+    onPhase: (phase: string) => { if (phase === "fresh-target-final-open") now = 300_001; },
+  }), (error: unknown) => error instanceof ShadowMigrationError && error.code === "MIGRATION_LIMIT_EXCEEDED");
+  assert.equal(existsSync(join(fixture.packageRootB, identitySource.migrationIdentity)), true);
+  openSealedV2MigrationPackage({ rootPath: join(fixture.packageRootB, identitySource.migrationIdentity), expectedMigrationIdentity: identitySource.migrationIdentity }).close();
+  identitySource.close(); source.close();
+});
+
+test("held assertion rejects same-size events content tampering", async (t) => {
+  const fixture = await createV2ShadowMigrationFixture(t);
+  const source = await verifyV1SourceCopy(fixture.verificationInput);
+  const sealed = await sealV2MigrationPackage({ ...fixture.packageInput, source, packageRoot: fixture.packageRootA });
+  const path = join(sealed.rootPath, "events.ndjson");
+  const bytes = readFileSync(path); bytes[0] ^= 1; writeFileSync(path, bytes);
+  assert.throws(() => sealed.assertUnchanged(), identityConflict);
+  sealed.close(); source.close();
+});
+
+test("held assertion rejects same-size artifact content tampering", async (t) => {
+  const fixture = await createV2ShadowMigrationFixture(t);
+  const source = await verifyV1SourceCopy(fixture.verificationInput);
+  const sealed = await sealV2MigrationPackage({ ...fixture.packageInput, source, packageRoot: fixture.packageRootA });
+  const path = join(sealed.rootPath, "artifacts", "legacy", "one.md");
+  const bytes = readFileSync(path); bytes[0] ^= 1; writeFileSync(path, bytes);
+  assert.throws(() => sealed.assertUnchanged(), identityConflict);
+  sealed.close(); source.close();
+});
+
+test("held assertion rejects same-size manifest content tampering", async (t) => {
+  const fixture = await createV2ShadowMigrationFixture(t);
+  const source = await verifyV1SourceCopy(fixture.verificationInput);
+  const sealed = await sealV2MigrationPackage({ ...fixture.packageInput, source, packageRoot: fixture.packageRootA });
+  const path = join(sealed.rootPath, "package-manifest.json");
+  const bytes = readFileSync(path); bytes[0] ^= 1; writeFileSync(path, bytes);
+  assert.throws(() => sealed.assertUnchanged(), identityConflict);
+  sealed.close(); source.close();
 });
 
 test("pins sealed package filesystem identities across byte-identical replacement", async (t) => {
