@@ -55,6 +55,29 @@ test("rejects delayed record iteration after package tampering or close", async 
   source.close();
 });
 
+test("redacts a removed package root during deferred record consumption", async (t) => {
+  // Native held-handle filesystem failures must never expose the package root.
+  const fixture = await createV2ShadowMigrationFixture(t);
+  const source = await verifyV1SourceCopy(fixture.verificationInput);
+  const sealed = await sealV2MigrationPackage({ ...fixture.packageInput, source, packageRoot: fixture.packageRootA });
+  const delayed = [...sealed.records()][0]!.readChunks();
+  renameSync(sealed.rootPath, join(fixture.root, "moved-package"));
+  assert.throws(() => [...delayed], (error: unknown) => error instanceof ShadowMigrationError
+    && error.code === "MIGRATION_IDENTITY_CONFLICT" && !String(error).includes(sealed.rootPath));
+  sealed.close(); source.close();
+});
+
+test("enforces expiry after exact-target verification and after final publication", async (t) => {
+  // Returning success after a verification/finalization-time deadline expiry violates the sealed policy.
+  const fixture = await createV2ShadowMigrationFixture(t);
+  const source = await verifyV1SourceCopy(fixture.verificationInput);
+  const initial = await sealV2MigrationPackage({ ...fixture.packageInput, source, packageRoot: fixture.packageRootA });
+  let calls = 0;
+  const expiresLate = () => (++calls > 20 ? 300_001 : 0);
+  await assert.rejects(sealV2MigrationPackage({ ...fixture.packageInput, source, packageRoot: fixture.packageRootA, now: expiresLate }), (error: unknown) => error instanceof ShadowMigrationError && error.code === "MIGRATION_LIMIT_EXCEEDED");
+  initial.close(); source.close();
+});
+
 test("pins sealed package filesystem identities across byte-identical replacement", async (t) => {
   // Reopening by logical checksum alone misses pathname replacement of a held package.
   const fixture = await createV2ShadowMigrationFixture(t);

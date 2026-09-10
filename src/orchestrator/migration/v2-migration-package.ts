@@ -89,6 +89,7 @@ export interface SealV2MigrationPackageInput {
   readonly policy: ShadowMigrationPolicyV1;
   readonly buildIdentityHash: string;
   readonly configurationChecksum: string;
+  readonly now?: () => number;
 }
 
 export interface OpenSealedV2MigrationPackageInput {
@@ -98,13 +99,18 @@ export interface OpenSealedV2MigrationPackageInput {
 
 interface RecordLocation {
   readonly descriptor: V2MigrationRecordDescriptorV1;
-  readonly bytes: Uint8Array;
+  readonly path: string;
+  readonly offset: number;
 }
 
 interface PackageIdentity { readonly path: string; readonly device: bigint; readonly inode: bigint; readonly size: bigint; readonly directory: boolean; }
 
 function conflict(): never {
   throw new ShadowMigrationError("MIGRATION_IDENTITY_CONFLICT", Object.freeze({}));
+}
+
+function held<T>(operation: () => T): T {
+  try { return operation(); } catch (error) { if (error instanceof ShadowMigrationError) throw error; conflict(); }
 }
 
 function sourceInvalid(): never {
@@ -298,8 +304,9 @@ export async function sealV2MigrationPackage(input: SealV2MigrationPackageInput)
     const sourceRoot = normalized(realpathSync(source.sourceRoot));
     const stagingRoot = normalized(realpathSync(packageRoot));
     if (sourceRoot === stagingRoot || contained(sourceRoot, stagingRoot) || contained(stagingRoot, sourceRoot)) sourceInvalid();
-    const deadlineAt = Date.now() + policy.deadlineMs;
-    const assertBeforeDeadline = (ordinal: number): void => { if (Date.now() > deadlineAt) limitExceeded(ordinal); };
+    const now = input.now ?? Date.now;
+    const deadlineAt = now() + policy.deadlineMs;
+    const assertBeforeDeadline = (ordinal: number): void => { if (now() > deadlineAt) limitExceeded(ordinal); };
     assertBeforeDeadline(0);
     source.assertUnchanged();
     temporary = mkdtempSync(join(packageRoot, ".v2-migration-package-"));
@@ -392,8 +399,10 @@ export async function sealV2MigrationPackage(input: SealV2MigrationPackageInput)
         conflict();
       }
       existing.close();
+      assertBeforeDeadline(ordinal);
       quarantine(temporary);
       temporary = undefined;
+      assertBeforeDeadline(ordinal);
       return openSealedV2MigrationPackage({ rootPath: target, expectedMigrationIdentity: migrationIdentity });
     } catch (error) {
       if (error instanceof ShadowMigrationError && error.code === "MIGRATION_IDENTITY_CONFLICT") {
@@ -406,7 +415,9 @@ export async function sealV2MigrationPackage(input: SealV2MigrationPackageInput)
     renameSync(temporary, target);
     temporary = undefined;
     fsyncDirectory(packageRoot);
-    return openSealedV2MigrationPackage({ rootPath: target, expectedMigrationIdentity: migrationIdentity });
+    assertBeforeDeadline(ordinal);
+    const published = openSealedV2MigrationPackage({ rootPath: target, expectedMigrationIdentity: migrationIdentity });
+    try { assertBeforeDeadline(ordinal); return published; } catch (error) { published.close(); throw error; }
   } catch (error) {
     if (temporary !== undefined) quarantine(temporary);
     if (error instanceof ShadowMigrationError) throw error;
@@ -485,6 +496,7 @@ function lineLocations(rootPath: string, manifest: V2MigrationPackageManifestV1)
   const eventDescriptors = manifest.recordDescriptors.slice(0, manifest.eventCount);
   const locations: RecordLocation[] = [];
   let pending = Buffer.alloc(0);
+  let offset = 0;
   let ordinal = 0;
   for (const chunk of readChunks(path, 0, undefined)) {
     pending = Buffer.concat([pending, chunk]);
@@ -502,7 +514,8 @@ function lineLocations(rootPath: string, manifest: V2MigrationPackageManifestV1)
         || (event as { eventId?: unknown }).eventId !== descriptor.sourceIdentity) {
         throw new ShadowMigrationError("MIGRATION_IDENTITY_CONFLICT", Object.freeze({ category: "canonical-record", ordinal }));
       }
-      locations.push(Object.freeze({ descriptor, bytes: Uint8Array.from(value) }));
+      locations.push(Object.freeze({ descriptor, path, offset }));
+      offset += newline + 1;
       pending = pending.subarray(newline + 1);
     }
   }
@@ -551,20 +564,17 @@ export function openSealedV2MigrationPackage(input: OpenSealedV2MigrationPackage
     const locations = lineLocations(rootPath, manifest);
     for (const descriptor of manifest.recordDescriptors.slice(manifest.eventCount)) {
       const path = safePath(join(rootPath, "artifacts"), descriptor.relativePath!);
-      const chunks = [...readChunks(path, 0, undefined)];
-      const bytes = Buffer.concat(chunks.map((chunk) => Buffer.from(chunk)));
-      if (bytes.length !== descriptor.byteLength || sha256(bytes) !== descriptor.contentSha256) conflict();
-      locations.push(Object.freeze({ descriptor, bytes: Uint8Array.from(bytes) }));
+      const hash = createHash("sha256"); let length = 0;
+      for (const chunk of readChunks(path, 0, undefined)) { hash.update(chunk); length += chunk.length; }
+      if (length !== descriptor.byteLength || hash.digest("hex") !== descriptor.contentSha256) conflict();
+      locations.push(Object.freeze({ descriptor, path, offset: 0 }));
     }
     assertPackageIdentities(rootPath, identities);
     let closed = false;
     const requireOpen = (): void => { if (closed) conflict(); };
     const assertUnchanged = (): void => {
       requireOpen();
-      assertPackageIdentities(rootPath, identities);
-      const verified = openSealedV2MigrationPackage({ rootPath, expectedMigrationIdentity: migrationIdentity });
-      if (canonicalJson(verified.manifest) !== canonicalJson(manifest)) conflict();
-      verified.close();
+      held(() => assertPackageIdentities(rootPath, identities));
     };
     const records = (): Iterable<V2MigrationPackageRecordV1> => {
       requireOpen();
@@ -572,9 +582,16 @@ export function openSealedV2MigrationPackage(input: OpenSealedV2MigrationPackage
       return locations.map((location) => Object.freeze({ descriptor: location.descriptor,
         readChunks(): Iterable<Uint8Array> {
           return (function* (): Iterable<Uint8Array> {
-            for (let offset = 0; offset < location.bytes.length; offset += MAX_CHUNK_BYTES) {
+            requireOpen(); assertUnchanged();
+            const bytes = held(() => {
+              const chunks = [...readChunks(location.path, location.offset, location.descriptor.byteLength)];
+              const value = Buffer.concat(chunks.map((chunk) => Buffer.from(chunk)));
+              if (value.length !== location.descriptor.byteLength || sha256(value) !== location.descriptor.contentSha256) conflict();
+              return Uint8Array.from(value);
+            });
+            for (let offset = 0; offset < bytes.length; offset += MAX_CHUNK_BYTES) {
               requireOpen(); assertUnchanged();
-              yield Uint8Array.from(location.bytes.subarray(offset, offset + MAX_CHUNK_BYTES));
+              yield Uint8Array.from(bytes.subarray(offset, offset + MAX_CHUNK_BYTES));
             }
           })();
         },
