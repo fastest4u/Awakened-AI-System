@@ -88,7 +88,7 @@ CREATE TABLE v2_shadow_compatibility_outbox (
   project_id TEXT NOT NULL, migration_identity TEXT NOT NULL, outbox_id TEXT NOT NULL,
   source_ordinal INTEGER NOT NULL CHECK (source_ordinal >= 0), imported_event_id TEXT NOT NULL,
   imported_global_position INTEGER NOT NULL CHECK (imported_global_position > 0), ${hash("imported_event_hash")},
-  ${hash("triggering_payload_hash")}, relative_path TEXT NOT NULL CHECK (length(relative_path) BETWEEN 1 AND 1024),
+  ${hash("triggering_payload_hash")}, relative_path TEXT NOT NULL CHECK (length(relative_path) BETWEEN 1 AND 1024 AND relative_path NOT GLOB '/*' AND relative_path NOT GLOB '\\*' AND relative_path NOT GLOB '[A-Za-z]:*'),
   byte_length INTEGER NOT NULL CHECK (byte_length >= 0), ${hash("content_sha256")},
   materialization_revision INTEGER NOT NULL CHECK (materialization_revision > 0), recorded_at TEXT NOT NULL,
   PRIMARY KEY (project_id, migration_identity, outbox_id), UNIQUE (project_id, migration_identity, source_ordinal),
@@ -115,6 +115,10 @@ CREATE TRIGGER v2_shadow_migration_transitions_sequence BEFORE INSERT ON v2_shad
 WHEN NEW.ordinal <> COALESCE((SELECT max(ordinal) + 1 FROM v2_shadow_migration_transitions WHERE project_id = NEW.project_id AND migration_identity = NEW.migration_identity), 0)
   OR NEW.phase <> CASE NEW.ordinal WHEN 0 THEN 'snapshot-verified' WHEN 1 THEN 'package-sealed' WHEN 2 THEN 'import-committed' WHEN 3 THEN 'projection-verified' WHEN 4 THEN 'parity-complete' WHEN 5 THEN 'compatibility-complete' END
   OR NEW.prior_transition_hash <> COALESCE((SELECT transition_hash FROM v2_shadow_migration_transitions WHERE project_id = NEW.project_id AND migration_identity = NEW.migration_identity ORDER BY ordinal DESC LIMIT 1), '${"0".repeat(64)}')
+BEGIN SELECT RAISE(ABORT, 'V2_SHADOW_IMMUTABLE'); END;
+
+CREATE TRIGGER v2_shadow_migration_attempts_sequence BEFORE INSERT ON v2_shadow_migration_attempts
+WHEN NEW.attempt_ordinal <> COALESCE((SELECT max(attempt_ordinal) + 1 FROM v2_shadow_migration_attempts WHERE project_id = NEW.project_id AND migration_identity = NEW.migration_identity), 0)
 BEGIN SELECT RAISE(ABORT, 'V2_SHADOW_IMMUTABLE'); END;
 
 ${immutable("v2_shadow_migration_runs", "project_id = NEW.project_id AND migration_identity = NEW.migration_identity")}

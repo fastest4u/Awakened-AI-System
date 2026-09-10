@@ -187,7 +187,7 @@ describe("V2 shadow migration SQLite evidence repository", () => {
   it("rejects cross-project runs, duplicate immutable identities, and conflicting imported receipts", () => {
     const value = committedFixture();
     assert.throws(() => value.repository.transact(OTHER_PROJECT_ID, MIGRATION_IDENTITY, (tx) => tx.insertRun(run())), ledgerFailure);
-    assert.throws(() => value.repository.transact(PROJECT_ID, MIGRATION_IDENTITY, (tx) => tx.insertRun(run())), ledgerFailure);
+    assert.throws(() => value.repository.transact(PROJECT_ID, MIGRATION_IDENTITY, (tx) => tx.insertRun({ ...run(), packageChecksum: "0".repeat(64) })), ledgerFailure);
     assert.throws(() => value.repository.transact(PROJECT_ID, MIGRATION_IDENTITY, (tx) => tx.insertImportedRecords([
       { ...receipt(), sourceRecordHash: "0".repeat(64) },
     ])), ledgerFailure);
@@ -212,7 +212,57 @@ describe("V2 shadow migration SQLite evidence repository", () => {
     assert.equal(value.repository.transact(PROJECT_ID, MIGRATION_IDENTITY, (tx) => tx.readRun()), null);
     assert.throws(() => value.repository.transact(PROJECT_ID, MIGRATION_IDENTITY, () => Promise.resolve()), ledgerFailure);
   });
+
+  it("rejects rooted compatibility paths and requires independently contiguous attempts", () => {
+    const value = fixture();
+    value.repository.transact(PROJECT_ID, MIGRATION_IDENTITY, (tx) => {
+      tx.insertRun(run()); tx.insertImportedRecords([receipt()]);
+      assert.throws(() => tx.appendAttemptEvidence({ ...attempt(7), attemptOrdinal: 7 }), ledgerFailure);
+      tx.appendAttemptEvidence(attempt(0));
+      assert.throws(() => tx.appendAttemptEvidence(attempt(2)), ledgerFailure);
+    });
+    for (const relativePath of ["/unix-root", "C:/windows-root", "\\\\server\\share"]) {
+      assert.throws(() => value.connection.prepare(`INSERT INTO v2_shadow_compatibility_outbox(
+        project_id,migration_identity,outbox_id,source_ordinal,imported_event_id,imported_global_position,imported_event_hash,triggering_payload_hash,relative_path,byte_length,content_sha256,materialization_revision,recorded_at
+      ) VALUES ($p,$m,$id,0,$event,10,$hash,$hash,$path,1,$hash,1,$at)`).run({
+        $p: PROJECT_ID, $m: MIGRATION_IDENTITY, $id: "00000000-0000-4000-8000-000000000040", $event: receipt().importedEventId,
+        $hash: "b".repeat(64), $path: relativePath, $at: NOW,
+      }));
+    }
+  });
+
+  it("idempotently replays exact evidence, preserves busy errors, and deep-freezes JSON", () => {
+    const value = committedFixture();
+    value.repository.transact(PROJECT_ID, MIGRATION_IDENTITY, (tx) => {
+      tx.insertRun(run()); tx.appendTransition(transition(0, "snapshot-verified", GENESIS)); tx.appendAttemptEvidence(attempt(0));
+      tx.insertImportedRecords([receipt()]); tx.insertExpectedDifferenceRules([rule()]); tx.insertParityReport(report());
+      tx.enqueueCompatibility([outbox()]); tx.claimCompatibility(claim()); tx.acknowledgeCompatibility(acknowledgement());
+      const stored = tx.readParityReport()!; assert.equal(Object.isFrozen(stored.report.findings), true);
+    });
+    const busy = new Error("SQLITE_BUSY: database is locked");
+    const repository = new SqliteV2ShadowMigrationRepository({ exec: value.connection.exec.bind(value.connection), prepare: () => { throw busy; }, close: value.connection.close.bind(value.connection) });
+    assert.throws(() => repository.readVerifiedTransitions(PROJECT_ID, MIGRATION_IDENTITY), (error: unknown) => error === busy);
+  });
+
+  it("preserves callback failures, quarantines rollback-failed connections, and rejects custom thenables", () => {
+    const value = fixture();
+    const callbackFailure = new Error("callback failure");
+    const wrapped: SqliteConnection = { exec(sql) { if (sql === "ROLLBACK") throw new Error("rollback failure"); value.connection.exec(sql); }, prepare: value.connection.prepare.bind(value.connection), close: value.connection.close.bind(value.connection) };
+    const poisoned = new SqliteV2ShadowMigrationRepository(wrapped);
+    assert.throws(() => poisoned.transact(PROJECT_ID, MIGRATION_IDENTITY, (tx) => { tx.insertRun(run()); throw callbackFailure; }), (error: unknown) => error === callbackFailure);
+    assert.throws(() => poisoned.transact(PROJECT_ID, MIGRATION_IDENTITY, (tx) => tx.readRun()), ledgerFailure);
+    const clean = fixture();
+    assert.throws(() => clean.repository.transact(PROJECT_ID, MIGRATION_IDENTITY, (tx) => { tx.insertRun(run()); return Object.freeze({ then() {} }); }), ledgerFailure);
+    assert.equal(clean.repository.transact(PROJECT_ID, MIGRATION_IDENTITY, (tx) => tx.readRun()), null);
+  });
 });
+
+function attempt(attemptOrdinal: number) {
+  return { projectId: PROJECT_ID, migrationIdentity: MIGRATION_IDENTITY, attemptOrdinal,
+    attemptId: `00000000-0000-4000-8000-${String(30 + attemptOrdinal).padStart(12, "0")}`, phase: "snapshot-verified" as const,
+    operation: "verify", operationAttemptIndex: 0, outcomeCategory: "retryable-failure" as const,
+    safeErrorCode: "SQLITE_BUSY", priorCommittedPhase: null, evidenceDigest: "f".repeat(64), recordedAt: NOW };
+}
 
 function ledgerFailure(error: unknown): boolean {
   return error instanceof ShadowMigrationError && error.code === "MIGRATION_LEDGER_INTEGRITY_FAILURE";
