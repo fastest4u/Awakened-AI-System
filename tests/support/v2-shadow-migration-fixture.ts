@@ -14,7 +14,12 @@ import { BranchScopeRepository } from "../../src/orchestrator/storage/branch-sco
 import { MaintenanceFence } from "../../src/orchestrator/storage/maintenance-fence.js";
 import { NodeSqliteDriver } from "../../src/orchestrator/storage/node-sqlite-driver.js";
 import { CURRENT_PROJECT_STORE_SCHEMA_VERSION } from "../../src/orchestrator/storage/migrations/registry.js";
-import { decodeShadowMigrationPolicyV1 } from "../../src/orchestrator/migration/v2-shadow-migration.contracts.js";
+import {
+  decodeShadowMigrationConfigurationV1,
+  decodeShadowMigrationPolicyV1,
+  shadowMigrationConfigurationChecksum,
+  shadowMigrationPolicyChecksum,
+} from "../../src/orchestrator/migration/v2-shadow-migration.contracts.js";
 import type { SourceFileDescriptorV1, V1SourceCopyManifestV1 } from "../../src/orchestrator/migration/v1-source-copy.js";
 import { applyCurrentProjectStoreSchema } from "./current-project-store-schema.js";
 import { canonicalMkdtemp } from "./canonical-temp.js";
@@ -41,7 +46,9 @@ export async function createV2ShadowMigrationFixture(t: TestContext, options: { 
   const sourceRoot = join(root, "copy");
   const liveStoreRoot = join(root, "live-store");
   const liveVaultRoot = join(root, "live-vault");
-  for (const path of [sourceRoot, liveStoreRoot, liveVaultRoot, join(sourceRoot, "legacy")]) mkdirSync(path);
+  const packageRootA = join(root, "package-root-a");
+  const packageRootB = join(root, "package-root-b");
+  for (const path of [sourceRoot, liveStoreRoot, liveVaultRoot, packageRootA, packageRootB, join(sourceRoot, "legacy")]) mkdirSync(path);
   const liveEventStorePath = join(liveStoreRoot, "events.sqlite");
   const sourceDatabasePath = join(sourceRoot, "events.sqlite");
   const manifestPath = join(sourceRoot, "manifest.json");
@@ -102,8 +109,16 @@ export async function createV2ShadowMigrationFixture(t: TestContext, options: { 
     initialBackoffMs: 500, maxBackoffMs: 2000, expectedDifferencePolicyVersion: 1, maxExpectedDifferenceRuleAgeMs: 604_800_000 });
   const verificationInput = { driver, sourceRoot, manifestPath, liveEventStorePath, liveLegacyArtifactRoot: liveVaultRoot,
     expectedBinding: projectionBinding, policy };
+  const configurationChecksum = shadowMigrationConfigurationChecksum(decodeShadowMigrationConfigurationV1({
+    schemaVersion: 1,
+    policyChecksum: shadowMigrationPolicyChecksum(policy),
+    packageFormatVersion: 1,
+    migrationAlgorithmVersion: 1,
+    expectedDifferencePolicyVersion: policy.expectedDifferencePolicyVersion,
+  }));
   return { root, sourceRoot, manifestPath, sourceDatabasePath, liveEventStorePath, liveVaultRoot, projectionBinding,
-    sourceEvents, manifest, driver, policy, verificationInput,
+    sourceEvents, manifest, driver, policy, verificationInput, packageRootA, packageRootB,
+    packageInput: Object.freeze({ policy, buildIdentityHash: digest("fixture-build-identity"), configurationChecksum }),
     writeManifest(value: V1SourceCopyManifestV1) { writeFileSync(manifestPath, canonicalJson(sealManifest(value))); },
   };
 }
