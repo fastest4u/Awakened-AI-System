@@ -173,7 +173,8 @@ export function decodeV1SourceCopyManifestV1(input: unknown): V1SourceCopyManife
 interface DirectoryIdentity { readonly path: string; readonly device: bigint; readonly inode: bigint }
 interface Capture { readonly path: string; readonly descriptor: SourceFileDescriptorV1 }
 function sameStat(left: BigIntStats, right: BigIntStats): boolean {
-  return left.dev === right.dev && left.ino === right.ino && left.size === right.size && left.ctimeNs === right.ctimeNs;
+  return left.nlink === 1n && right.nlink === 1n
+    && left.dev === right.dev && left.ino === right.ino && left.size === right.size && left.ctimeNs === right.ctimeNs;
 }
 /** Check the lexical path before opening anything: realpath alone would hide a junction. */
 function checkComponents(path: string, directories?: Map<string, DirectoryIdentity>): BigIntStats {
@@ -195,13 +196,13 @@ function checkComponents(path: string, directories?: Map<string, DirectoryIdenti
 }
 function readCapture(path: string, relativePath: string, directories: Map<string, DirectoryIdentity>, collect = false, maximum = Number.MAX_SAFE_INTEGER, copyTo?: string): { capture: Capture; bytes: Buffer } {
   const initial = checkComponents(path, directories);
-  if (!initial.isFile() || initial.size > BigInt(Number.MAX_SAFE_INTEGER)) fail();
+  if (!initial.isFile() || initial.nlink !== 1n || initial.size > BigInt(Number.MAX_SAFE_INTEGER)) fail();
   if (initial.size > BigInt(maximum)) fail("MIGRATION_LIMIT_EXCEEDED", "file");
   const fd = openSync(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
   let output: number | undefined;
   try {
     const opened = fstatSync(fd, { bigint: true });
-    if (!opened.isFile() || !sameStat(initial, opened)) fail();
+    if (!opened.isFile() || opened.nlink !== 1n || !sameStat(initial, opened)) fail();
     if (copyTo !== undefined) output = openSync(copyTo, "wx", 0o600);
     const digest = createHash("sha256");
     const chunks: Buffer[] = [];

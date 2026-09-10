@@ -62,6 +62,52 @@ test("rejects a source whose file identity aliases live authority", async (t) =>
   await assert.rejects(verifyV1SourceCopy(f.verificationInput), redacted());
 });
 
+test("rejects an artifact hardlinked to live-vault authority before SQLite opens with redacted errors", async (t) => {
+  const f = await createV2ShadowMigrationFixture(t);
+  const artifactPath = join(f.sourceRoot, "legacy/one.md");
+  const livePath = join(f.liveVaultRoot, "SECRET-live-artifact.md");
+  copyFileSync(artifactPath, livePath);
+  rmSync(artifactPath);
+  linkSync(livePath, artifactPath);
+  assert.equal(lstatSync(artifactPath, { bigint: true }).nlink, 2n);
+  f.writeManifest({ ...f.manifest, legacyArtifacts: f.manifest.legacyArtifacts.map((d) => ({
+    ...d, ...describeSourceFile(f.sourceRoot, d.relativePath),
+  })) });
+  let opens = 0;
+  const driver: SqliteDriver = { open(path, options) { opens++; return f.driver.open(path, options); } };
+  await assert.rejects(verifyV1SourceCopy({ ...f.verificationInput, driver }), redacted());
+  assert.equal(opens, 0);
+});
+
+for (const relativePath of ["events.sqlite", "events.sqlite-wal", "events.sqlite-shm", "legacy/one.md", "manifest.json"]) {
+  test(`rejects a unique declared ${relativePath} with an undeclared external hardlink before SQLite opens`, async (t) => {
+    const f = await createV2ShadowMigrationFixture(t);
+    const path = join(f.sourceRoot, relativePath);
+    linkSync(path, join(f.root, "SECRET-external-alias"));
+    assert.equal(lstatSync(path, { bigint: true }).nlink, 2n);
+    // Reseal after link creation so descriptor ctime checks cannot mask missing link-count validation.
+    f.writeManifest({ ...f.manifest, database: describeSourceFile(f.sourceRoot, f.manifest.database.relativePath),
+      sqliteSidecars: f.manifest.sqliteSidecars.map((d) => describeSourceFile(f.sourceRoot, d.relativePath)),
+      legacyArtifacts: f.manifest.legacyArtifacts.map((d) => ({ ...d, ...describeSourceFile(f.sourceRoot, d.relativePath) })),
+    });
+    let opens = 0;
+    const driver: SqliteDriver = { open(path, options) { opens++; return f.driver.open(path, options); } };
+    await assert.rejects(verifyV1SourceCopy({ ...f.verificationInput, driver }), redacted());
+    assert.equal(opens, 0);
+  });
+
+  test(`detects a new external hardlink to ${relativePath} after verification`, async (t) => {
+    const f = await createV2ShadowMigrationFixture(t);
+    const verified = await verifyV1SourceCopy(f.verificationInput);
+    try {
+      const path = join(f.sourceRoot, relativePath);
+      linkSync(path, join(f.root, "SECRET-later-alias"));
+      assert.equal(lstatSync(path, { bigint: true }).nlink, 2n);
+      assert.throws(() => verified.assertUnchanged(), redacted("MIGRATION_SOURCE_MUTATED"));
+    } finally { verified.close(); }
+  });
+}
+
 for (const root of ["store", "vault", "ancestor", "descendant"] as const) test(`rejects ${root} root containment before SQLite open`, async (t) => {
   const f = await createV2ShadowMigrationFixture(t);
   const sourceRoot = root === "store" ? join(f.root, "live-store") : root === "vault" ? f.liveVaultRoot : root === "ancestor" ? f.root : join(f.liveVaultRoot, "child");
