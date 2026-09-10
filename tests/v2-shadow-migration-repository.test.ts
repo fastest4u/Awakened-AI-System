@@ -255,6 +255,36 @@ describe("V2 shadow migration SQLite evidence repository", () => {
     assert.throws(() => clean.repository.transact(PROJECT_ID, MIGRATION_IDENTITY, (tx) => { tx.insertRun(run()); return Object.freeze({ then() {} }); }), ledgerFailure);
     assert.equal(clean.repository.transact(PROJECT_ID, MIGRATION_IDENTITY, (tx) => tx.readRun()), null);
   });
+
+  it("exposes exact strict metadata, keys, foreign keys, and all immutable insert guards", () => {
+    const value = fixture();
+    const expected: Readonly<Record<string, readonly string[]>> = {
+      v2_shadow_migration_runs:["project_id","migration_identity","rollout_revision_id","package_checksum","source_manifest_checksum","source_terminal_position","source_terminal_hash","configuration_checksum","policy_checksum","build_identity_hash","created_at"],
+      v2_shadow_migration_transitions:["project_id","migration_identity","ordinal","attempt_id","phase","prior_transition_hash","transition_hash","evidence_digest","recorded_at"],
+      v2_shadow_migration_attempts:["project_id","migration_identity","attempt_ordinal","attempt_id","phase","operation","operation_attempt_index","outcome_category","safe_error_code","prior_committed_phase","evidence_digest","recorded_at"],
+      v2_shadow_imported_records:["project_id","migration_identity","source_ordinal","source_kind","source_record_hash","imported_event_id","imported_global_position","imported_event_hash","recorded_at"],
+      v2_shadow_expected_difference_rules:["project_id","migration_identity","rule_id","policy_version","category","projection_name","selector_json","predicate_json","rationale_digest","approver_fingerprint","approval_reference_digest","issued_at","expires_at","rollout_revision_id","rule_checksum"],
+      v2_shadow_parity_reports:["project_id","migration_identity","report_id","package_checksum","compared_event_position","compared_event_hash","v1_manifest_checksum","v2_manifest_checksum","v1_core_checksums_digest","v2_core_checksums_digest","retrieval_vector_checksum","equal_count","expected_difference_count","blocking_divergence_count","report_json","report_checksum","recorded_at"],
+      v2_shadow_compatibility_outbox:["project_id","migration_identity","outbox_id","source_ordinal","imported_event_id","imported_global_position","imported_event_hash","triggering_payload_hash","relative_path","byte_length","content_sha256","materialization_revision","recorded_at"],
+      v2_shadow_compatibility_claims:["project_id","migration_identity","outbox_id","claim_id","claim_owner_fingerprint","claimed_at"],
+      v2_shadow_compatibility_acknowledgements:["project_id","migration_identity","outbox_id","acknowledgement_id","claim_id","acknowledged_imported_position","materialization_revision","target_content_sha256","acknowledgement_checksum","acknowledged_at"],
+    };
+    for (const [table, columns] of Object.entries(expected)) {
+      const info=value.connection.prepare(`PRAGMA table_info(${table})`).all(); assert.deepEqual(info.map((row)=>row.name),columns);
+      assert.ok(info.every((row)=>row.type === "TEXT" || row.type === "INTEGER"));
+      const sql=String(value.connection.prepare("SELECT sql FROM sqlite_schema WHERE type='table' AND name=$name").get({$name:table})?.sql);
+      assert.match(sql,/STRICT, WITHOUT ROWID/); assert.ok(value.connection.prepare(`PRAGMA index_list(${table})`).all().some((row)=>row.unique===1n));
+      for(const suffix of ["no_replace","no_update","no_delete"]) assert.ok(value.connection.prepare("SELECT 1 FROM sqlite_schema WHERE type='trigger' AND name=$name").get({$name:`${table}_${suffix}`}));
+    }
+  });
+
+  it("enforces raw hash, foreign-key, unique, and replace boundaries for every evidence table", () => {
+    const value=committedFixture(); const tables=["v2_shadow_migration_runs","v2_shadow_migration_transitions","v2_shadow_migration_attempts","v2_shadow_imported_records","v2_shadow_expected_difference_rules","v2_shadow_parity_reports","v2_shadow_compatibility_outbox","v2_shadow_compatibility_claims","v2_shadow_compatibility_acknowledgements"];
+    for(const table of tables) assert.throws(()=>value.connection.exec(`INSERT OR REPLACE INTO ${table} SELECT * FROM ${table}`));
+    assert.throws(()=>value.connection.prepare(`INSERT INTO v2_shadow_migration_runs SELECT $project,migration_identity,rollout_revision_id,package_checksum,source_manifest_checksum,source_terminal_position,source_terminal_hash,configuration_checksum,policy_checksum,build_identity_hash,created_at FROM v2_shadow_migration_runs`).run({$project:OTHER_PROJECT_ID}));
+    assert.throws(()=>value.connection.prepare(`INSERT INTO v2_shadow_imported_records SELECT project_id,migration_identity,1,source_kind,source_record_hash,imported_event_id,imported_global_position,imported_event_hash,recorded_at FROM v2_shadow_imported_records`).run());
+    for(const bad of ["A".repeat(64), `${"a".repeat(64)}\0`, "a".repeat(63)]) assert.throws(()=>value.connection.prepare(`INSERT INTO v2_shadow_migration_runs SELECT project_id,$identity,rollout_revision_id,package_checksum,source_manifest_checksum,source_terminal_position,source_terminal_hash,configuration_checksum,policy_checksum,build_identity_hash,created_at FROM v2_shadow_migration_runs`).run({$identity:bad}));
+  });
 });
 
 function attempt(attemptOrdinal: number) {
