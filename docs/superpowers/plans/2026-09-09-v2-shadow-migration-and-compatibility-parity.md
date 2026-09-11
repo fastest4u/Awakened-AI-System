@@ -31,12 +31,12 @@
 
 ## Execution Status
 
-- [ ] Task 1: strict migration contracts, policy/configuration checksums, and identity binding.
-- [ ] Task 2: production-compatible projection identity codecs.
-- [ ] Task 3: immutable production-shaped V1 source verification.
-- [ ] Task 4: canonical content-addressed migration package.
-- [ ] Task 5: schema-7 append-only ledger, attempts, parity, and compatibility evidence.
-- [ ] Task 6: deterministic committed V2 shadow import.
+- [x] Task 1: strict migration contracts, policy/configuration checksums, and identity binding.
+- [x] Task 2: production-compatible projection identity codecs.
+- [x] Task 3: immutable production-shaped V1 source verification.
+- [x] Task 4: canonical content-addressed migration package.
+- [x] Task 5: schema-7 append-only ledger, attempts, parity, and compatibility evidence.
+- [x] Task 6: deterministic committed V2 shadow import.
 - [ ] Task 7: projection input reconstructed only from committed imports.
 - [ ] Task 8: verified V1-reference and V2-shadow projection publication.
 - [ ] Task 9: expected-difference governance, row parity, and sealed retrieval parity.
@@ -1127,6 +1127,8 @@ git commit -m "feat: persist V2 shadow migration evidence"
 **Files:**
 - Create: `src/orchestrator/migration/v2-shadow-importer.ts`
 - Create: `tests/v2-shadow-importer.test.ts`
+- Correct upstream dependency: `src/orchestrator/migration/v2-migration-package.ts`
+- Test upstream dependency: `tests/v2-migration-package.test.ts`
 - Reuse: `src/orchestrator/storage/event-store.ts:40-110`
 - Reuse: `src/orchestrator/storage/event-append-transaction.ts:48-49,1480-1833`
 
@@ -1134,7 +1136,9 @@ git commit -m "feat: persist V2 shadow migration evidence"
 - Consumes: `SealedV2MigrationPackage`, `EventStore`, `SqliteEventAppendStatements`, `MaintenanceFence`, `BranchScopeRepository`, migration repository transactions, and policy batch limits.
 - Produces: `V2ShadowImportResult`, `V2ShadowImporter.import(input)`, exact wrapper payloads, and deterministic replay receipts.
 
-- [ ] **Step 1: Write import RED tests with production EventStore.**
+**Implementation correction (2026-09-11):** Task 4 omitted the `createdAt` field consumed by Step 4 below. Add the required canonical timestamp to the exact package manifest, copying only the verified `source.manifest.createdAt`; include it in the existing package checksum and migration identity. Reject missing or invalid timestamps without a fallback. This corrects the local producer/consumer contract; it does not change the approved rollout boundary. Task 6 is complete at `8f2c3d6` after independent specification and quality approval; round 2 package-inclusive gate passed 98/98 and round 3 importer/EventStore gate passed 76/76, with build and typecheck passing.
+
+- [x] **Step 1: Write import RED tests with production EventStore.**
 
 Prove wrapper events are committed/authenticated, batch limits use the stricter of migration policy and event-store bounds, three isolated imports produce identical event IDs/hashes, replay is a no-op, package identity reuse with changed bytes conflicts, and a crash after commit is reconciled by the same deterministic command:
 
@@ -1162,7 +1166,7 @@ test("reconciles after commit-before-ledger-receipt without a second semantic ap
 });
 ```
 
-- [ ] **Step 2: Run importer tests and verify RED.**
+- [x] **Step 2: Run importer tests and verify RED.**
 
 Run:
 
@@ -1173,7 +1177,7 @@ node --test --test-concurrency=1 --test-reporter=spec dist-test/tests/v2-shadow-
 
 Expected: compilation fails because the importer and wrapper contracts do not exist.
 
-- [ ] **Step 3: Define exact wrapper events and deterministic batch planning.**
+- [x] **Step 3: Define exact wrapper events and deterministic batch planning.**
 
 Use two event types in one migration stream `v2-shadow-import/<migrationIdentity>`:
 
@@ -1258,15 +1262,17 @@ const maxBytes = Math.min(policy.maxBatchBytes, MAX_CANONICAL_COMMAND_BYTES);
 
 Start a new batch before either next event would exceed `maxEvents` or the canonical command would exceed `maxBytes`; a single event beyond `maxEventBytes` fails `MIGRATION_LIMIT_EXCEEDED`.
 
-- [ ] **Step 4: Append deterministic commands and reconcile receipts.**
+- [x] **Step 4: Append deterministic commands and reconcile receipts.**
 
 For batch ordinal `b`, derive command ID, idempotency key, correlation ID, event IDs, recorded time, and public response exclusively from migration identity/package contents. Instantiate an `EventStore` per batch with a deterministic UUID closure seeded by the source ordinals in that batch and a deterministic clock derived from `manifest.createdAt + b milliseconds`.
+
+Wrapper principal metadata is internal migration metadata: use the existing least-authority `untrusted` role and a domain-prefixed client instance identity derived from `migrationIdentity`. Presenting caller role/client identity and checkout branch metadata must not change wrapper hashes. Preserve the original principal and scope provenance exactly inside authenticated `sourceEvent`; do not mutate the caller context or add lifecycle authority. Verify determinism across genuinely distinct input contexts as well as isolated stores.
 
 Each pending event uses `visibilityScope: "project"`, empty evidence arrays, `confidence: "high"`, `verificationStatus: "verified"`, and a source reference `migration:<migrationIdentity>:<sourceOrdinal>`. Use `eventType: "V1ProjectionSourceImported"` for source events and `eventType: "V1LegacyArtifactImported"` for artifacts.
 
 After `EventStore.append`, read the exact committed stored events by returned positions, match payload migration identity/ordinal/hash, and insert `ImportedRecordReceipt` rows in the ledger transaction. If append returns `COMMAND_OUTCOME_UNKNOWN`, repeat the same deterministic append: a committed batch returns the deduplicated stored response; an absent batch commits once; a conflicting response fails `MIGRATION_IDENTITY_CONFLICT`. Never issue a new command ID for the same batch.
 
-- [ ] **Step 5: Run importer and event-store regression tests.**
+- [x] **Step 5: Run importer and event-store regression tests.**
 
 Run:
 
@@ -1278,7 +1284,7 @@ npm run typecheck
 
 Expected: all tests pass; imported event IDs/hashes are deterministic across isolated stores; replay adds no events; unknown outcome cannot duplicate data.
 
-- [ ] **Step 6: Commit deterministic import.**
+- [x] **Step 6: Commit deterministic import.**
 
 ```powershell
 git add src/orchestrator/migration/v2-shadow-importer.ts tests/v2-shadow-importer.test.ts
