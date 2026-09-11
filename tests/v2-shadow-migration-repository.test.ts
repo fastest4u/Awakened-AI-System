@@ -149,19 +149,177 @@ function committedFixture(): ReturnType<typeof fixture> {
   return value;
 }
 
+const EVIDENCE_TABLES = [
+  "v2_shadow_migration_runs",
+  "v2_shadow_migration_transitions",
+  "v2_shadow_migration_attempts",
+  "v2_shadow_imported_records",
+  "v2_shadow_expected_difference_rules",
+  "v2_shadow_parity_reports",
+  "v2_shadow_compatibility_outbox",
+  "v2_shadow_compatibility_claims",
+  "v2_shadow_compatibility_acknowledgements",
+] as const;
+type EvidenceTable = typeof EVIDENCE_TABLES[number];
+type DeclaredType = "TEXT" | "INTEGER";
+type ColumnSpec = readonly [name: string, type: DeclaredType, notNull: 0 | 1, primaryKeyOrdinal: number];
+
+const TABLE_COLUMNS: Readonly<Record<EvidenceTable, readonly ColumnSpec[]>> = {
+  v2_shadow_migration_runs: [
+    ["project_id", "TEXT", 1, 1], ["migration_identity", "TEXT", 1, 2], ["rollout_revision_id", "TEXT", 1, 0],
+    ["package_checksum", "TEXT", 1, 0], ["source_manifest_checksum", "TEXT", 1, 0], ["source_terminal_position", "INTEGER", 1, 0],
+    ["source_terminal_hash", "TEXT", 1, 0], ["configuration_checksum", "TEXT", 1, 0], ["policy_checksum", "TEXT", 1, 0],
+    ["build_identity_hash", "TEXT", 1, 0], ["created_at", "TEXT", 1, 0],
+  ],
+  v2_shadow_migration_transitions: [
+    ["project_id", "TEXT", 1, 1], ["migration_identity", "TEXT", 1, 2], ["ordinal", "INTEGER", 1, 3],
+    ["attempt_id", "TEXT", 1, 0], ["phase", "TEXT", 1, 0], ["prior_transition_hash", "TEXT", 1, 0],
+    ["transition_hash", "TEXT", 1, 0], ["evidence_digest", "TEXT", 1, 0], ["recorded_at", "TEXT", 1, 0],
+  ],
+  v2_shadow_migration_attempts: [
+    ["project_id", "TEXT", 1, 1], ["migration_identity", "TEXT", 1, 2], ["attempt_ordinal", "INTEGER", 1, 3],
+    ["attempt_id", "TEXT", 1, 0], ["phase", "TEXT", 1, 0], ["operation", "TEXT", 1, 0],
+    ["operation_attempt_index", "INTEGER", 1, 0], ["outcome_category", "TEXT", 1, 0], ["safe_error_code", "TEXT", 1, 0],
+    ["prior_committed_phase", "TEXT", 0, 0], ["evidence_digest", "TEXT", 1, 0], ["recorded_at", "TEXT", 1, 0],
+  ],
+  v2_shadow_imported_records: [
+    ["project_id", "TEXT", 1, 1], ["migration_identity", "TEXT", 1, 2], ["source_ordinal", "INTEGER", 1, 3],
+    ["source_kind", "TEXT", 1, 0], ["source_record_hash", "TEXT", 1, 0], ["imported_event_id", "TEXT", 1, 0],
+    ["imported_global_position", "INTEGER", 1, 0], ["imported_event_hash", "TEXT", 1, 0], ["recorded_at", "TEXT", 1, 0],
+  ],
+  v2_shadow_expected_difference_rules: [
+    ["project_id", "TEXT", 1, 1], ["migration_identity", "TEXT", 1, 2], ["rule_id", "TEXT", 1, 3],
+    ["policy_version", "INTEGER", 1, 0], ["category", "TEXT", 1, 0], ["projection_name", "TEXT", 1, 0],
+    ["selector_json", "TEXT", 1, 0], ["predicate_json", "TEXT", 1, 0], ["rationale_digest", "TEXT", 1, 0],
+    ["approver_fingerprint", "TEXT", 1, 0], ["approval_reference_digest", "TEXT", 1, 0], ["issued_at", "TEXT", 1, 0],
+    ["expires_at", "TEXT", 1, 0], ["rollout_revision_id", "TEXT", 1, 0], ["rule_checksum", "TEXT", 1, 0],
+  ],
+  v2_shadow_parity_reports: [
+    ["project_id", "TEXT", 1, 1], ["migration_identity", "TEXT", 1, 2], ["report_id", "TEXT", 1, 3],
+    ["package_checksum", "TEXT", 1, 0], ["compared_event_position", "INTEGER", 1, 0], ["compared_event_hash", "TEXT", 1, 0],
+    ["v1_manifest_checksum", "TEXT", 1, 0], ["v2_manifest_checksum", "TEXT", 1, 0], ["v1_core_checksums_digest", "TEXT", 1, 0],
+    ["v2_core_checksums_digest", "TEXT", 1, 0], ["retrieval_vector_checksum", "TEXT", 1, 0], ["equal_count", "INTEGER", 1, 0],
+    ["expected_difference_count", "INTEGER", 1, 0], ["blocking_divergence_count", "INTEGER", 1, 0], ["report_json", "TEXT", 1, 0],
+    ["report_checksum", "TEXT", 1, 0], ["recorded_at", "TEXT", 1, 0],
+  ],
+  v2_shadow_compatibility_outbox: [
+    ["project_id", "TEXT", 1, 1], ["migration_identity", "TEXT", 1, 2], ["outbox_id", "TEXT", 1, 3],
+    ["source_ordinal", "INTEGER", 1, 0], ["imported_event_id", "TEXT", 1, 0], ["imported_global_position", "INTEGER", 1, 0],
+    ["imported_event_hash", "TEXT", 1, 0], ["triggering_payload_hash", "TEXT", 1, 0], ["relative_path", "TEXT", 1, 0],
+    ["byte_length", "INTEGER", 1, 0], ["content_sha256", "TEXT", 1, 0], ["materialization_revision", "INTEGER", 1, 0],
+    ["recorded_at", "TEXT", 1, 0],
+  ],
+  v2_shadow_compatibility_claims: [
+    ["project_id", "TEXT", 1, 1], ["migration_identity", "TEXT", 1, 2], ["outbox_id", "TEXT", 1, 3],
+    ["claim_id", "TEXT", 1, 0], ["claim_owner_fingerprint", "TEXT", 1, 0], ["claimed_at", "TEXT", 1, 0],
+  ],
+  v2_shadow_compatibility_acknowledgements: [
+    ["project_id", "TEXT", 1, 1], ["migration_identity", "TEXT", 1, 2], ["outbox_id", "TEXT", 1, 3],
+    ["acknowledgement_id", "TEXT", 1, 0], ["claim_id", "TEXT", 1, 0], ["acknowledged_imported_position", "INTEGER", 1, 0],
+    ["materialization_revision", "INTEGER", 1, 0], ["target_content_sha256", "TEXT", 1, 0], ["acknowledgement_checksum", "TEXT", 1, 0],
+    ["acknowledged_at", "TEXT", 1, 0],
+  ],
+};
+
+const TABLE_INDEXES: Readonly<Record<EvidenceTable, readonly string[]>> = {
+  v2_shadow_migration_runs: ["pk:project_id,migration_identity"],
+  v2_shadow_migration_transitions: [
+    "pk:project_id,migration_identity,ordinal", "u:project_id,migration_identity,phase", "u:project_id,migration_identity,transition_hash",
+  ],
+  v2_shadow_migration_attempts: ["pk:project_id,migration_identity,attempt_ordinal", "u:project_id,migration_identity,attempt_id"],
+  v2_shadow_imported_records: [
+    "pk:project_id,migration_identity,source_ordinal", "u:project_id,imported_event_id", "u:project_id,imported_global_position",
+  ],
+  v2_shadow_expected_difference_rules: ["pk:project_id,migration_identity,rule_id", "u:project_id,migration_identity,rule_checksum"],
+  v2_shadow_parity_reports: ["pk:project_id,migration_identity,report_id", "u:project_id,migration_identity,report_checksum"],
+  v2_shadow_compatibility_outbox: ["pk:project_id,migration_identity,outbox_id", "u:project_id,migration_identity,source_ordinal"],
+  v2_shadow_compatibility_claims: ["pk:project_id,migration_identity,outbox_id", "u:project_id,migration_identity,claim_id"],
+  v2_shadow_compatibility_acknowledgements: ["pk:project_id,migration_identity,outbox_id", "u:project_id,migration_identity,acknowledgement_id"],
+};
+
+const TABLE_FOREIGN_KEYS: Readonly<Record<EvidenceTable, readonly (readonly string[])[]>> = {
+  v2_shadow_migration_runs: [["project_id->rollout_revisions.project_id|NO ACTION|NO ACTION|NONE", "rollout_revision_id->rollout_revisions.revision_id|NO ACTION|NO ACTION|NONE"]],
+  v2_shadow_migration_transitions: [["project_id->v2_shadow_migration_runs.project_id|NO ACTION|NO ACTION|NONE", "migration_identity->v2_shadow_migration_runs.migration_identity|NO ACTION|NO ACTION|NONE"]],
+  v2_shadow_migration_attempts: [["project_id->v2_shadow_migration_runs.project_id|NO ACTION|NO ACTION|NONE", "migration_identity->v2_shadow_migration_runs.migration_identity|NO ACTION|NO ACTION|NONE"]],
+  v2_shadow_imported_records: [["project_id->v2_shadow_migration_runs.project_id|NO ACTION|NO ACTION|NONE", "migration_identity->v2_shadow_migration_runs.migration_identity|NO ACTION|NO ACTION|NONE"]],
+  v2_shadow_expected_difference_rules: [
+    ["project_id->rollout_revisions.project_id|NO ACTION|NO ACTION|NONE", "rollout_revision_id->rollout_revisions.revision_id|NO ACTION|NO ACTION|NONE"],
+    ["project_id->v2_shadow_migration_runs.project_id|NO ACTION|NO ACTION|NONE", "migration_identity->v2_shadow_migration_runs.migration_identity|NO ACTION|NO ACTION|NONE"],
+  ],
+  v2_shadow_parity_reports: [["project_id->v2_shadow_migration_runs.project_id|NO ACTION|NO ACTION|NONE", "migration_identity->v2_shadow_migration_runs.migration_identity|NO ACTION|NO ACTION|NONE"]],
+  v2_shadow_compatibility_outbox: [
+    ["project_id->v2_shadow_imported_records.project_id|NO ACTION|NO ACTION|NONE", "migration_identity->v2_shadow_imported_records.migration_identity|NO ACTION|NO ACTION|NONE", "source_ordinal->v2_shadow_imported_records.source_ordinal|NO ACTION|NO ACTION|NONE"],
+  ],
+  v2_shadow_compatibility_claims: [
+    ["project_id->v2_shadow_compatibility_outbox.project_id|NO ACTION|NO ACTION|NONE", "migration_identity->v2_shadow_compatibility_outbox.migration_identity|NO ACTION|NO ACTION|NONE", "outbox_id->v2_shadow_compatibility_outbox.outbox_id|NO ACTION|NO ACTION|NONE"],
+  ],
+  v2_shadow_compatibility_acknowledgements: [
+    ["project_id->v2_shadow_compatibility_claims.project_id|NO ACTION|NO ACTION|NONE", "migration_identity->v2_shadow_compatibility_claims.migration_identity|NO ACTION|NO ACTION|NONE", "outbox_id->v2_shadow_compatibility_claims.outbox_id|NO ACTION|NO ACTION|NONE"],
+  ],
+};
+
+const MALFORMED_HASH_VALUES = [
+  "A".repeat(64),
+  `${"a".repeat(64)}\0`,
+  `${"a".repeat(32)}\0${"a".repeat(32)}`,
+  "a".repeat(63),
+  "a".repeat(65),
+] as const;
+const HASH_COLUMN = /(?:_hash|_checksum|_digest|_fingerprint|_sha256)$/;
+
+function hashColumns(table: EvidenceTable): readonly string[] {
+  return TABLE_COLUMNS[table].map(([name]) => name).filter((name) => HASH_COLUMN.test(name) || (table === "v2_shadow_migration_runs" && name === "migration_identity"));
+}
+
+function assertErrorMessage(action: () => unknown, pattern: RegExp, label: string): void {
+  assert.throws(action, (error: unknown) => error instanceof Error && pattern.test(error.message), label);
+}
+
+function triggerNamesFor(table: EvidenceTable): readonly string[] {
+  const names = [`${table}_no_replace`, `${table}_no_update`, `${table}_no_delete`];
+  if (table === "v2_shadow_migration_transitions" || table === "v2_shadow_migration_attempts") names.push(`${table}_sequence`);
+  return names.sort();
+}
+
 describe("V2 shadow migration SQLite evidence repository", () => {
   it("creates the exact strict schema, index, foreign-key and immutable-trigger boundary", () => {
     const value = fixture();
     const tables = value.connection.prepare("SELECT name, sql FROM sqlite_schema WHERE type = 'table' AND name GLOB 'v2_shadow_*' ORDER BY name").all();
-    assert.deepEqual(tables.map((row) => row.name), [
-      "v2_shadow_compatibility_acknowledgements", "v2_shadow_compatibility_claims", "v2_shadow_compatibility_outbox",
-      "v2_shadow_expected_difference_rules", "v2_shadow_imported_records", "v2_shadow_migration_attempts",
-      "v2_shadow_migration_runs", "v2_shadow_migration_transitions", "v2_shadow_parity_reports",
-    ]);
-    for (const row of tables) assert.match(String(row.sql), /STRICT, WITHOUT ROWID/);
-    const triggers = value.connection.prepare("SELECT name FROM sqlite_schema WHERE type = 'trigger' AND name GLOB 'v2_shadow_*' ORDER BY name").all().map((row) => String(row.name));
-    for (const table of tables.map((row) => String(row.name))) {
-      assert.ok(triggers.includes(`${table}_no_update`)); assert.ok(triggers.includes(`${table}_no_delete`));
+    assert.deepEqual(tables.map((row) => String(row.name)).sort(), [...EVIDENCE_TABLES].sort());
+    for (const table of EVIDENCE_TABLES) {
+      const info = value.connection.prepare(`PRAGMA table_info(${table})`).all();
+      assert.deepEqual(
+        info.map((row) => [String(row.name), String(row.type), Number(row.notnull), Number(row.pk)]),
+        TABLE_COLUMNS[table],
+        `${table} exact ordered columns/types`,
+      );
+      const sql = String(value.connection.prepare("SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = $name").get({ $name: table })?.sql);
+      assert.match(sql, /STRICT, WITHOUT ROWID/);
+      const indexes = value.connection.prepare(`PRAGMA index_list(${table})`).all();
+      const observedIndexes = indexes.map((index) => {
+        const columns = value.connection.prepare(`PRAGMA index_info(${String(index.name)})`).all()
+          .sort((left, right) => Number(left.seqno) - Number(right.seqno))
+          .map((column) => String(column.name)).join(",");
+        return `${String(index.origin)}:${columns}`;
+      }).sort();
+      assert.deepEqual(observedIndexes, [...TABLE_INDEXES[table]].sort(), `${table} exact PK/UNIQUE index columns`);
+      const foreignKeyGroups = new Map<string, Array<{ seq: number; definition: string }>>();
+      for (const foreignKey of value.connection.prepare(`PRAGMA foreign_key_list(${table})`).all()) {
+        const id = String(foreignKey.id);
+        const definitions = foreignKeyGroups.get(id) ?? [];
+        definitions.push({
+          seq: Number(foreignKey.seq),
+          definition: `${String(foreignKey.from)}->${String(foreignKey.table)}.${String(foreignKey.to)}|${String(foreignKey.on_update)}|${String(foreignKey.on_delete)}|${String(foreignKey.match)}`,
+        });
+        foreignKeyGroups.set(id, definitions);
+      }
+      const foreignKeys = [...foreignKeyGroups.values()]
+        .map((definitions) => definitions.sort((left, right) => left.seq - right.seq).map(({ definition }) => definition).join(","))
+        .sort();
+      const expectedForeignKeys = TABLE_FOREIGN_KEYS[table].map((definitions) => definitions.join(",")).sort();
+      assert.deepEqual(foreignKeys, expectedForeignKeys, `${table} exact foreign-key definitions`);
+      const triggers = value.connection.prepare("SELECT name FROM sqlite_schema WHERE type = 'trigger' AND tbl_name = $table ORDER BY name").all({ $table: table }).map((row) => String(row.name)).sort();
+      assert.deepEqual(triggers, [...triggerNamesFor(table)], `${table} exact trigger set`);
     }
   });
 
@@ -195,11 +353,9 @@ describe("V2 shadow migration SQLite evidence repository", () => {
 
   it("makes every semantic evidence table append-only", () => {
     const value = committedFixture();
-    for (const table of ["v2_shadow_migration_runs", "v2_shadow_migration_transitions", "v2_shadow_migration_attempts",
-      "v2_shadow_imported_records", "v2_shadow_expected_difference_rules", "v2_shadow_parity_reports",
-      "v2_shadow_compatibility_outbox", "v2_shadow_compatibility_claims", "v2_shadow_compatibility_acknowledgements"]) {
-      assert.throws(() => value.connection.exec(`UPDATE ${table} SET project_id = project_id`));
-      assert.throws(() => value.connection.exec(`DELETE FROM ${table}`));
+    for (const table of EVIDENCE_TABLES) {
+      assertErrorMessage(() => value.connection.exec(`UPDATE ${table} SET project_id = project_id`), /V2_SHADOW_IMMUTABLE/, `${table} permits UPDATE`);
+      assertErrorMessage(() => value.connection.exec(`DELETE FROM ${table}`), /V2_SHADOW_IMMUTABLE/, `${table} permits DELETE`);
     }
   });
 
@@ -279,11 +435,84 @@ describe("V2 shadow migration SQLite evidence repository", () => {
   });
 
   it("enforces raw hash, foreign-key, unique, and replace boundaries for every evidence table", () => {
-    const value=committedFixture(); const tables=["v2_shadow_migration_runs","v2_shadow_migration_transitions","v2_shadow_migration_attempts","v2_shadow_imported_records","v2_shadow_expected_difference_rules","v2_shadow_parity_reports","v2_shadow_compatibility_outbox","v2_shadow_compatibility_claims","v2_shadow_compatibility_acknowledgements"];
-    for(const table of tables) assert.throws(()=>value.connection.exec(`INSERT OR REPLACE INTO ${table} SELECT * FROM ${table}`));
-    assert.throws(()=>value.connection.prepare(`INSERT INTO v2_shadow_migration_runs SELECT $project,migration_identity,rollout_revision_id,package_checksum,source_manifest_checksum,source_terminal_position,source_terminal_hash,configuration_checksum,policy_checksum,build_identity_hash,created_at FROM v2_shadow_migration_runs`).run({$project:OTHER_PROJECT_ID}));
-    assert.throws(()=>value.connection.prepare(`INSERT INTO v2_shadow_imported_records SELECT project_id,migration_identity,1,source_kind,source_record_hash,imported_event_id,imported_global_position,imported_event_hash,recorded_at FROM v2_shadow_imported_records`).run());
-    for(const bad of ["A".repeat(64), `${"a".repeat(64)}\0`, "a".repeat(63)]) assert.throws(()=>value.connection.prepare(`INSERT INTO v2_shadow_migration_runs SELECT project_id,$identity,rollout_revision_id,package_checksum,source_manifest_checksum,source_terminal_position,source_terminal_hash,configuration_checksum,policy_checksum,build_identity_hash,created_at FROM v2_shadow_migration_runs`).run({$identity:bad}));
+    const value = committedFixture();
+    for (const table of EVIDENCE_TABLES) {
+      assertErrorMessage(
+        () => value.connection.exec(`INSERT OR REPLACE INTO ${table} SELECT * FROM ${table}`),
+        /V2_SHADOW_IMMUTABLE/,
+        `${table} permits INSERT OR REPLACE`,
+      );
+    }
+    assertErrorMessage(
+      () => value.connection.prepare(`INSERT INTO v2_shadow_migration_runs SELECT $project,migration_identity,rollout_revision_id,package_checksum,source_manifest_checksum,source_terminal_position,source_terminal_hash,configuration_checksum,policy_checksum,build_identity_hash,created_at FROM v2_shadow_migration_runs`).run({ $project: OTHER_PROJECT_ID }),
+      /FOREIGN KEY constraint failed/,
+      "runs permits a cross-project revision",
+    );
+    assertErrorMessage(
+      () => value.connection.prepare(`INSERT INTO v2_shadow_imported_records SELECT project_id,migration_identity,1,source_kind,source_record_hash,imported_event_id,imported_global_position,imported_event_hash,recorded_at FROM v2_shadow_imported_records`).run(),
+      /V2_SHADOW_IMMUTABLE/,
+      "imported records permit a non-primary replacement",
+    );
+    const uniqueValue = committedFixture();
+    uniqueValue.connection.exec("DROP TRIGGER v2_shadow_imported_records_no_replace");
+    assertErrorMessage(
+      () => uniqueValue.connection.prepare(`INSERT INTO v2_shadow_imported_records SELECT project_id,migration_identity,1,source_kind,source_record_hash,imported_event_id,imported_global_position,imported_event_hash,recorded_at FROM v2_shadow_imported_records`).run(),
+      /UNIQUE constraint failed/,
+      "imported records retain non-primary unique indexes",
+    );
+  });
+
+  it("parameterizes every hash guard with independent CHECK failures", () => {
+    const value = committedFixture();
+    value.connection.exec("PRAGMA foreign_keys = OFF");
+    for (const table of EVIDENCE_TABLES) {
+      const columns = TABLE_COLUMNS[table].map(([name]) => name);
+      const sql = String(value.connection.prepare("SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = $name").get({ $name: table })?.sql)
+        .replace(/\s+/g, " ");
+      value.connection.exec(`DROP TRIGGER ${table}_no_update`);
+      for (const column of hashColumns(table)) {
+        assert.ok(sql.includes(`length(${column}) = 64 AND length(CAST(${column} AS BLOB)) = 64 AND ${column} NOT GLOB '*[^0-9a-f]*'`), `${table}.${column} lacks byte-exact lowercase guard`);
+        for (const bad of MALFORMED_HASH_VALUES) {
+          assertErrorMessage(
+            () => value.connection.prepare(`UPDATE ${table} SET ${column} = $bad`).run({ $bad: bad }),
+            /CHECK constraint failed/,
+            `${table}.${column} accepts malformed hash ${JSON.stringify(bad)}`,
+          );
+        }
+      }
+    }
+  });
+
+  it("rejects raw cross-project and wrong-migration-identity relationships for every child", () => {
+    const value = committedFixture();
+    for (const table of EVIDENCE_TABLES) {
+      const columns = TABLE_COLUMNS[table].map(([name]) => name);
+      const projectVariant = columns.map((column) => column === "project_id" ? "$otherProject" : column).join(",");
+      assertErrorMessage(
+        () => value.connection.prepare(`INSERT INTO ${table} (${columns.join(",")}) SELECT ${projectVariant} FROM ${table}`).run({ $otherProject: OTHER_PROJECT_ID }),
+        /FOREIGN KEY constraint failed/,
+        `${table} accepts a cross-project child row`,
+      );
+      assert.equal(Number(value.connection.prepare(`SELECT count(*) AS count FROM ${table} WHERE project_id = $project`).get({ $project: OTHER_PROJECT_ID })?.count), 0);
+      if (table !== "v2_shadow_migration_runs") {
+        const migrationVariant = columns.map((column) => {
+          if (column === "migration_identity") return "$otherMigration";
+          if (table === "v2_shadow_imported_records" && column === "imported_event_id") return "$otherEvent";
+          if (table === "v2_shadow_imported_records" && column === "imported_global_position") return "$otherPosition";
+          return column;
+        }).join(",");
+        assertErrorMessage(
+          () => value.connection.prepare(`INSERT INTO ${table} (${columns.join(",")}) SELECT ${migrationVariant} FROM ${table}`).run(
+            table === "v2_shadow_imported_records"
+              ? { $otherMigration: "b".repeat(64), $otherEvent: "00000000-0000-4000-8000-000000000011", $otherPosition: 11n }
+              : { $otherMigration: "b".repeat(64) },
+          ),
+          /FOREIGN KEY constraint failed/,
+          `${table} accepts an unparented migration identity`,
+        );
+        assert.equal(Number(value.connection.prepare(`SELECT count(*) AS count FROM ${table} WHERE project_id = $project AND migration_identity = $migration`).get({ $project: PROJECT_ID, $migration: "b".repeat(64) })?.count), 0);
+      }
+    }
   });
 });
 
