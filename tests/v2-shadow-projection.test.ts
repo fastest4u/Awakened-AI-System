@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import childProcess from "node:child_process";
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import { randomUUID } from "node:crypto";
 import { existsSync, lstatSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
@@ -10,6 +13,8 @@ import { sealV2MigrationPackage } from "../src/orchestrator/migration/v2-migrati
 import { V2ShadowImporter } from "../src/orchestrator/migration/v2-shadow-importer.js";
 import { V2ShadowProjectionPublisher, v1ProjectionBaselineChecksum } from "../src/orchestrator/migration/v2-shadow-projection.js";
 import { ShadowMigrationError, shadowMigrationPolicyChecksum } from "../src/orchestrator/migration/v2-shadow-migration.contracts.js";
+import { ProjectionIntegrityService } from "../src/orchestrator/projections/integrity.js";
+import { LifecycleError } from "../src/orchestrator/lifecycle/errors.js";
 import { canonicalJson } from "../src/orchestrator/serialization/canonical-json.js";
 import { BranchScopeRepository } from "../src/orchestrator/storage/branch-scope.repository.js";
 import { SqliteEventStoreStatements } from "../src/orchestrator/storage/event-store.js";
@@ -19,7 +24,8 @@ import { SqliteV2ShadowMigrationRepository } from "../src/orchestrator/storage/v
 import { applyCurrentProjectStoreSchema } from "./support/current-project-store-schema.js";
 import { createV2ShadowMigrationFixture, digest } from "./support/v2-shadow-migration-fixture.js";
 
-async function fixture(t: test.TestContext, corruptV2 = false, crashV1 = false, revisionBaseline?: string) {
+async function fixture(t: test.TestContext, corruptV2 = false, crashV1 = false, revisionBaseline?: string,
+  mismatchedRevision?: "build" | "migration" | "configuration") {
   let cleanup = () => {};
   t.after(() => cleanup());
   const f = await createV2ShadowMigrationFixture(t);
@@ -35,13 +41,14 @@ async function fixture(t: test.TestContext, corruptV2 = false, crashV1 = false, 
   connection.exec(v2ShadowMigration.sql);
   const repository = new SqliteV2ShadowMigrationRepository(connection);
   let crashPending = crashV1;
-  const publisher = new V2ShadowProjectionPublisher({ driver: f.driver, connection, repository, eventStorePath,
+  const publisherOptions = { driver: f.driver, connection, eventStorePath,
     liveEventStorePath: f.liveEventStorePath, liveVaultRoot: f.liveVaultRoot,
     v1ProjectionDirectory: v1Directory, v2ProjectionDirectory: v2Directory, policy: f.policy,
     faultInjector: { hit(boundary: string, path: string) {
       if (corruptV2 && boundary === "before-v2-integrity") writeFileSync(path, "tampered");
       if (crashPending && boundary === "before-v1-manifest") { crashPending = false; throw new Error("crash"); }
-    } } });
+    } } };
+  const publisher = new V2ShadowProjectionPublisher(publisherOptions);
   const baselineInput = { source, sealedPackage };
   const sourceBytes = readFileSync(f.sourceDatabasePath);
   let orphanBytes: Buffer | undefined;
@@ -54,8 +61,11 @@ async function fixture(t: test.TestContext, corruptV2 = false, crashV1 = false, 
   if (orphanBytes) assert.deepEqual(readFileSync(preparedV1.generation.databasePath), orphanBytes);
   assert.deepEqual(readFileSync(f.sourceDatabasePath), sourceBytes);
   const revisionId = randomUUID();
-  connection.prepare("INSERT INTO rollout_revisions(project_id,revision_id,parent_revision_id,build_identity_hash,migration_identity_hash,configuration_checksum,v1_baseline_checksum,cohort_algorithm_version,cohort_salt,cohort_basis_points,created_at) VALUES ($p,$r,NULL,$h,$h,$h,$b,1,$h,0,$n)")
-    .run({ $p: f.projectionBinding.projectId, $r: revisionId, $h: "a".repeat(64), $b: revisionBaseline ?? preparedV1.baselineChecksum, $n: f.manifest.createdAt });
+  connection.prepare("INSERT INTO rollout_revisions(project_id,revision_id,parent_revision_id,build_identity_hash,migration_identity_hash,configuration_checksum,v1_baseline_checksum,cohort_algorithm_version,cohort_salt,cohort_basis_points,created_at) VALUES ($p,$r,NULL,$build,$migration,$configuration,$b,1,$h,0,$n)")
+    .run({ $p: f.projectionBinding.projectId, $r: revisionId, $h: "a".repeat(64), $b: revisionBaseline ?? preparedV1.baselineChecksum, $n: f.manifest.createdAt,
+      $build: mismatchedRevision === "build" ? digest("unrelated-build") : sealedPackage.manifest.buildIdentityHash,
+      $migration: mismatchedRevision === "migration" ? digest("unrelated-migration") : sealedPackage.migrationIdentity,
+      $configuration: mismatchedRevision === "configuration" ? digest("unrelated-configuration") : sealedPackage.manifest.configurationChecksum });
   repository.transact(f.projectionBinding.projectId, sealedPackage.migrationIdentity, tx => {
     tx.insertRun({ projectId: f.projectionBinding.projectId, migrationIdentity: sealedPackage.migrationIdentity, rolloutRevisionId: revisionId,
       packageChecksum: sealedPackage.manifest.packageChecksum, sourceManifestChecksum: source.manifest.manifestChecksum,
@@ -83,7 +93,7 @@ async function fixture(t: test.TestContext, corruptV2 = false, crashV1 = false, 
       evidenceDigest: digest("import"), recordedAt: f.manifest.createdAt };
     tx.appendTransition({ ...body, transitionHash: digest(`project-memory/v2-shadow-migration-transition/v1\n${canonicalJson(body)}`) });
   });
-  return { ...f, source, sealedPackage, connection, preparedV1, publisher,
+  return { ...f, source, sealedPackage, connection, preparedV1, publisher, publisherOptions,
     input: { ...baselineInput, preparedV1, rolloutRevisionId: revisionId },
     phases: () => repository.transact(f.projectionBinding.projectId, sealedPackage.migrationIdentity, tx => tx.readTransitions().map(v => v.phase)) };
 }
@@ -152,13 +162,117 @@ test("rejects committed wrapper tamper before projection verification", async t 
   assert.equal(f.phases().includes("projection-verified"), false);
 });
 
+for (const identity of ["build", "migration", "configuration"] as const) test(`rejects unrelated revision ${identity} identity`, async t => {
+  const f = await fixture(t, false, false, undefined, identity);
+  await assert.rejects(f.publisher.publishV2(f.input), (error: unknown) => error instanceof ShadowMigrationError && error.code === "PROJECTION_INTEGRITY_FAILURE");
+  assert.equal(f.phases().includes("projection-verified"), false);
+  assert.equal(existsSync(join(f.root, "v2-shadow", "projection-manifest.json")), false);
+});
+
+for (const destination of ["unrelated", "protected"] as const) test(`never transacts through an injected ${destination} repository`, async t => {
+  const f = await fixture(t);
+  const path = destination === "protected" ? f.liveEventStorePath : join(f.root, "unrelated.sqlite");
+  const other = f.driver.open(path, { mode: destination === "protected" ? "read-only-existing" : "create", busyTimeoutMs: 5000 });
+  const before = readFileSync(path);
+  let transactions = 0;
+  const repository = new SqliteV2ShadowMigrationRepository({
+    prepare: sql => other.prepare(sql), close() {},
+    exec(sql) { if (/BEGIN/i.test(sql)) transactions++; other.exec(sql); },
+  });
+  try {
+    const options = { ...f.publisherOptions, repository };
+    await new V2ShadowProjectionPublisher(options).publishV2(f.input);
+    assert.equal(transactions, 0);
+    assert.deepEqual(readFileSync(path), before);
+    assert.equal(f.phases().includes("projection-verified"), true);
+  } finally { other.close(); }
+});
+
+for (const boundary of ["private-database", "pinned-image", "v1-lease", "committed-snapshot"] as const) test(`redacts ${boundary} cleanup failure and releases remaining resources`, async t => {
+  const f = await fixture(t);
+  const protectedPaths = [f.sourceDatabasePath, f.liveEventStorePath, f.preparedV1.generation.databasePath]
+    .flatMap(path => [path, `${path}-wal`, `${path}-shm`].filter(existsSync));
+  const before = protectedPaths.map(path => readFileSync(path));
+  let injected = false;
+  let databaseClosed = 0;
+  let pinnedClosed = 0;
+  let rolledBack = false;
+  let snapshotClosed = false;
+  let leaseReleased = false;
+  const imageIdentity = lstatSync(f.preparedV1.generation.databasePath, { bigint: true });
+  const nativeClose = DatabaseSync.prototype.close;
+  const fileClose = fs.closeSync;
+  const spawn = childProcess.spawnSync;
+  t.mock.method(DatabaseSync.prototype, "close", function(this: DatabaseSync) {
+    let privateV1 = false;
+    try { privateV1 = this.prepare("PRAGMA database_list").all().some(row => row.name === "main" && row.file === "")
+      && this.prepare("SELECT schema_version FROM projection_metadata WHERE project_id IS NOT NULL").get()?.schema_version === 1; } catch { /* reference schema connection */ }
+    nativeClose.call(this);
+    if (privateV1) {
+      databaseClosed++;
+      if (boundary === "private-database" && !injected) { injected = true; throw new Error("sensitive-close-failure"); }
+    }
+  });
+  t.mock.method(fs, "closeSync", (fd: number) => {
+    const stat = fs.fstatSync(fd, { bigint: true });
+    const pinned = stat.dev === imageIdentity.dev && stat.ino === imageIdentity.ino;
+    fileClose(fd);
+    if (pinned) {
+      pinnedClosed++;
+      assert.throws(() => fs.fstatSync(fd));
+      if (boundary === "pinned-image" && !injected) { injected = true; throw new Error("sensitive-close-failure"); }
+    }
+  });
+  t.mock.method(childProcess, "spawnSync", (...args: any[]) => {
+    const result = Reflect.apply(spawn, childProcess, args);
+    if (args[1]?.[2] === "release-manifest-lock" && args[1]?.[3] === f.publisherOptions.v1ProjectionDirectory) {
+      assert.equal(result.status, 0);
+      leaseReleased = true;
+      if (boundary === "v1-lease" && !injected) { injected = true; throw new Error("sensitive-close-failure"); }
+    }
+    return result;
+  });
+  syncBuiltinESMExports();
+  let armSnapshot = false;
+  const publisher = new V2ShadowProjectionPublisher({ ...f.publisherOptions,
+    faultInjector: { hit(point) { if (point === "before-v2-integrity") armSnapshot = true; } },
+    driver: { open(path, options) {
+      const connection = f.driver.open(path, options);
+      if (boundary !== "committed-snapshot" || !armSnapshot || path !== f.publisherOptions.eventStorePath) return connection;
+      return { prepare: sql => connection.prepare(sql),
+        exec(sql) { connection.exec(sql); if (sql === "ROLLBACK") rolledBack = true; },
+        close() { connection.close(); snapshotClosed = true; injected = true; throw new Error("sensitive-close-failure"); } };
+    } },
+  });
+  try {
+    // Direct integrity calls must redact cleanup errors too, not only the publisher wrapper.
+    if (boundary === "private-database" || boundary === "pinned-image") {
+      const service = new ProjectionIntegrityService({ driver: f.driver, eventStorePath: f.publisherOptions.eventStorePath,
+        projectionDirectory: f.publisherOptions.v1ProjectionDirectory });
+      assert.throws(() => service.verifyV1Generation(f.source.projectionSnapshot, f.preparedV1.generation),
+        (error: unknown) => error instanceof LifecycleError && error.code === "INTEGRITY_FAILURE" && error.cause === undefined);
+      assert.equal(databaseClosed, 1); assert.equal(pinnedClosed, 1);
+      injected = false;
+    }
+    await assert.rejects(publisher.publishV2(f.input), (error: unknown) => error instanceof ShadowMigrationError
+      && !JSON.stringify(error).includes("sensitive") && error.cause === undefined);
+    assert.equal(injected, true);
+    assert.ok(databaseClosed > 0); assert.ok(pinnedClosed > 0); assert.equal(leaseReleased, true);
+    assert.equal(existsSync(join(f.publisherOptions.v1ProjectionDirectory, ".projection-manifest.publish.lock")), false);
+    if (boundary === "committed-snapshot") { assert.equal(rolledBack, true); assert.equal(snapshotClosed, true); }
+    assert.equal(f.phases().includes("projection-verified"), false);
+    protectedPaths.forEach((path, i) => assert.deepEqual(readFileSync(path), before[i]));
+    f.source.assertUnchanged(); f.sealedPackage.assertUnchanged();
+  } finally { t.mock.restoreAll(); syncBuiltinESMExports(); }
+});
+
 test("rejects a protected source destination before consulting the target connection", async t => {
   const f = await fixture(t);
   let queries = 0;
   const connection = { exec: (sql: string) => f.connection.exec(sql), close() {},
     prepare(sql: string) { queries++; return f.connection.prepare(sql); } };
   const publisher = new V2ShadowProjectionPublisher({ driver: f.driver, connection,
-    repository: new SqliteV2ShadowMigrationRepository(connection), eventStorePath: f.sourceDatabasePath,
+    eventStorePath: f.sourceDatabasePath,
     liveEventStorePath: f.liveEventStorePath, liveVaultRoot: f.liveVaultRoot,
     v1ProjectionDirectory: f.preparedV1.generation.projectionDirectory, v2ProjectionDirectory: join(f.root, "v2-shadow"), policy: f.policy });
   await assert.rejects(publisher.publishV2(f.input), (error: unknown) => error instanceof ShadowMigrationError);

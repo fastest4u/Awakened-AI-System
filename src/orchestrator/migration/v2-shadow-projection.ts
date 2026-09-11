@@ -12,7 +12,7 @@ import { canonicalJson } from "../serialization/canonical-json.js";
 import { EventStoreError } from "../storage/event-store.js";
 import { isPrimarySqliteBusy } from "../storage/event-append-transaction.js";
 import type { SqliteConnection, SqliteDriver } from "../storage/sqlite-driver.js";
-import type { SqliteV2ShadowMigrationRepository } from "../storage/v2-shadow-migration.repository.js";
+import { SqliteV2ShadowMigrationRepository } from "../storage/v2-shadow-migration.repository.js";
 import { decodeV1SourceCopyManifestV1, type VerifiedV1SourceCopy } from "./v1-source-copy.js";
 import type { SealedV2MigrationPackage } from "./v2-migration-package.js";
 import { V2ImportedProjectionEventReader } from "./v2-imported-event-reader.js";
@@ -42,7 +42,6 @@ export interface ShadowProjectionInput extends V1ProjectionBaselineInput {
 export interface V2ShadowProjectionPublisherOptions {
   readonly driver: SqliteDriver;
   readonly connection: SqliteConnection;
-  readonly repository: SqliteV2ShadowMigrationRepository;
   readonly eventStorePath: string;
   readonly liveEventStorePath: string;
   readonly liveVaultRoot: string;
@@ -177,6 +176,8 @@ export class V2ShadowProjectionPublisher {
       if (typeof database?.file !== "string") failure();
       const connected = pathIdentity(database.file, false);
       if (target.dev !== connected.dev || target.ino !== connected.ino || (target.dev === live.dev && target.ino === live.ino)) failure();
+      // Transaction authority comes only from the connection authenticated above.
+      const repository = new SqliteV2ShadowMigrationRepository(this.#options.connection);
       const prepared = input.preparedV1;
       const binding = input.source.projectionSnapshot.binding;
       const manifest = input.sealedPackage.manifest;
@@ -185,15 +186,17 @@ export class V2ShadowProjectionPublisher {
         || prepared.terminalEventHash !== manifest.terminalEventHash || baseline !== prepared.baselineChecksum) failure();
       const adopted = await this.prepareV1Baseline(input);
       if (canonicalJson(adopted) !== canonicalJson(prepared)) failure();
-      const checkRun = () => this.#options.repository.transact(binding.projectId, input.sealedPackage.migrationIdentity, tx => {
+      const checkRun = () => repository.transact(binding.projectId, input.sealedPackage.migrationIdentity, tx => {
         const run = tx.readRun();
         if (!run || run.rolloutRevisionId !== input.rolloutRevisionId || run.packageChecksum !== manifest.packageChecksum
           || run.sourceManifestChecksum !== manifest.sourceManifestChecksum || run.sourceTerminalHash !== manifest.terminalEventHash
           || run.sourceTerminalPosition !== BigInt(manifest.terminalEventPosition) || run.configurationChecksum !== manifest.configurationChecksum
           || run.buildIdentityHash !== manifest.buildIdentityHash || run.policyChecksum !== shadowMigrationPolicyChecksum(this.#options.policy)) failure();
-        const revision = this.#options.connection.prepare("SELECT v1_baseline_checksum FROM rollout_revisions WHERE project_id=$p AND revision_id=$r")
+        const revision = this.#options.connection.prepare("SELECT v1_baseline_checksum,build_identity_hash,migration_identity_hash,configuration_checksum FROM rollout_revisions WHERE project_id=$p AND revision_id=$r")
           .get({ $p: binding.projectId, $r: run.rolloutRevisionId });
-        if (revision?.v1_baseline_checksum !== baseline) failure();
+        if (revision?.v1_baseline_checksum !== baseline || revision.build_identity_hash !== manifest.buildIdentityHash
+          || revision.migration_identity_hash !== input.sealedPackage.migrationIdentity
+          || revision.configuration_checksum !== manifest.configurationChecksum) failure();
         const phases = tx.readTransitions();
         if (phases.length < 3 || phases[2]!.phase !== "import-committed") failure();
       });
@@ -213,7 +216,7 @@ export class V2ShadowProjectionPublisher {
       input.source.assertUnchanged(); input.sealedPackage.assertUnchanged(); remaining(); checkRun();
       const v2ManifestChecksum = hash(canonicalJson(v2.manifest));
       const evidenceDigest = hash(canonicalJson({ v1ManifestChecksum: hash(canonicalJson(prepared.generation.manifest)), v2ManifestChecksum, v1BaselineChecksum: baseline }));
-      this.#options.repository.transact(binding.projectId, input.sealedPackage.migrationIdentity, tx => {
+      repository.transact(binding.projectId, input.sealedPackage.migrationIdentity, tx => {
         const phases = tx.readTransitions();
         if (phases[3]) { if (phases[3].phase !== "projection-verified" || phases[3].evidenceDigest !== evidenceDigest) failure(); return; }
         if (phases.length !== 3) failure();

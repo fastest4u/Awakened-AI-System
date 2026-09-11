@@ -262,3 +262,177 @@ test at dist-test\tests\projection-integrity.test.js:85:5
   }
 
 ```
+
+## Independent-review fix round 1 (2026-09-11)
+
+Base: `36c5f9d015ddd94e99d95c49072286a4bdf926b2`. Scope: publisher, narrow V1 integrity cleanup, publisher tests, and this report only. Controller plan changes are excluded.
+
+### Changes and review response
+
+1. Removed the independently injectable repository from `V2ShadowProjectionPublisherOptions`. Publication constructs `SqliteV2ShadowMigrationRepository` from the already file-identity-verified target connection, before its first transaction. Regression callers deliberately supply an obsolete excess repository property backed by a real unrelated or protected fixture database: neither receives a transaction; publication evidence goes to the verified target only. No live user store is opened.
+2. The referenced immutable revision must match the authenticated package build identity, sealed migration identity, configuration checksum, and prepared V1 baseline. Success fixtures now use the actual identities; each unrelated revision identity has its own rejection test before V2 publication.
+3. Native private-database and pinned-descriptor close failures are caught separately so both cleanup attempts occur, followed by a fresh redacted integrity failure. This changes only the new V1 verification/recovery method, not existing `verify()` or coordinator/default behavior.
+4. Cleanup tests instrument real native operations: private database close, pinned descriptor close, stable-directory lease-release subprocess, and Task 7 committed reader connection close. Each operation actually releases its resource before throwing an injected sensitive error. Tests cover direct integrity redaction, remaining resource release, snapshot rollback/close, absence of the on-disk publication lock, unchanged protected main/WAL/SHM and published-image bytes, source/package unchanged assertions, and no `projection-verified` transition. No shared timeout/retry policy or cleanup implementation outside approved scope is changed.
+
+### RED evidence
+
+An initial `npm run test:build` exited 1 for test-only TS2322: mode `read-only` is not in the production driver union. Corrected to `read-only-existing`; subsequent build exited 0. This compiler error is not behavior RED.
+
+Command (after successful test build):
+
+```text
+node --test --test-concurrency=1 --test-reporter=spec --test-name-pattern='unrelated revision|injected .* repository' dist-test/tests/v2-shadow-projection.test.js
+```
+
+Observed output, exit 1:
+
+```text
+FAIL rejects unrelated revision build identity: AssertionError [ERR_ASSERTION]: Missing expected rejection.
+FAIL rejects unrelated revision migration identity: AssertionError [ERR_ASSERTION]: Missing expected rejection.
+FAIL rejects unrelated revision configuration identity: AssertionError [ERR_ASSERTION]: Missing expected rejection.
+FAIL never transacts through an injected unrelated repository: ShadowMigrationError MIGRATION_LEDGER_INTEGRITY_FAILURE
+FAIL never transacts through an injected protected repository: ShadowMigrationError MIGRATION_SOURCE_MUTATED
+tests 5; suites 0; pass 0; fail 5; cancelled 0; skipped 0; todo 0; duration_ms 32938.052
+```
+
+The initial protected test opened the authenticated source copy, changing its SQLite sidecar identity and triggering source authentication before repository use. That case is not counted as authority RED. It was corrected to use the isolated fixture's protected live-store path, without touching any real live store. The next serial build exited 0.
+
+Command:
+
+```text
+node --test --test-concurrency=1 --test-reporter=spec --test-name-pattern='injected protected repository|cleanup failure' dist-test/tests/v2-shadow-projection.test.js
+```
+
+Observed output, exit 1:
+
+```text
+FAIL never transacts through an injected protected repository: ShadowMigrationError MIGRATION_LEDGER_INTEGRITY_FAILURE
+FAIL redacts private-database cleanup failure and releases remaining resources:
+  AssertionError [ERR_ASSERTION]: The validation function is expected to return "true". Received false
+  Caught error: Error: sensitive-close-failure
+  at #inspectV1Generation (dist-test/src/orchestrator/projections/integrity.js:1172:27)
+  at ProjectionIntegrityService.verifyV1Generation (dist-test/src/orchestrator/projections/integrity.js:1118:51)
+FAIL redacts pinned-image cleanup failure and releases remaining resources:
+  AssertionError [ERR_ASSERTION]: The validation function is expected to return "true". Received false
+  Caught error: Error: sensitive-close-failure
+  at Object.close (dist-test/src/orchestrator/projections/integrity.js:180:17)
+  at #inspectV1Generation (dist-test/src/orchestrator/projections/integrity.js:1175:25)
+PASS redacts v1-lease cleanup failure and releases remaining resources
+PASS redacts committed-snapshot cleanup failure and releases remaining resources
+tests 5; suites 0; pass 2; fail 3; cancelled 0; skipped 0; todo 0; duration_ms 23257.8803
+```
+
+The last two tests establish already-correct cleanup behavior; they are not claimed as RED. The private image cleanup tests prove the additional direct integrity error leak before the implementation change.
+
+### Focused GREEN
+
+After minimal implementation fixes, `npm run test:build` exited 0. Command:
+
+```text
+node --test --test-concurrency=1 --test-reporter=spec --test-name-pattern='unrelated revision|injected .* repository|cleanup failure' dist-test/tests/v2-shadow-projection.test.js
+```
+
+Observed output, exit 0:
+
+```text
+PASS rejects unrelated revision build identity
+PASS rejects unrelated revision migration identity
+PASS rejects unrelated revision configuration identity
+PASS never transacts through an injected unrelated repository
+PASS never transacts through an injected protected repository
+PASS redacts private-database cleanup failure and releases remaining resources
+PASS redacts pinned-image cleanup failure and releases remaining resources
+PASS redacts v1-lease cleanup failure and releases remaining resources
+PASS redacts committed-snapshot cleanup failure and releases remaining resources
+tests 9; suites 0; pass 9; fail 0; cancelled 0; skipped 0; todo 0; duration_ms 49442.3454
+```
+
+Following that run, final tests were strengthened with unchanged sidecar/source/package assertions and on-disk lease absence; the normal fixture no longer passes the removed repository option. The final covering gate below verifies those assertions. All builds and runtime gates in this fix round are serialized; no concurrent test-output rebuild occurs.
+
+### Final covering verification and self-review
+
+Final `npm run test:build` exited 0, then the following covering gate exited 0 (58 tests, 58 pass, 0 fail/cancelled/skip/todo, 2 suites, 286760.0265 ms):
+
+```text
+node --test --test-concurrency=1 --test-reporter=spec dist-test/tests/v2-shadow-projection.test.js dist-test/tests/projection-integrity.test.js
+```
+
+Complete final covering output:
+
+```text
+▶ committed snapshot integrity
+  ✔ verifies exact historical V1 and V2 schema images with authenticated legacy hash bindings (6900.4159ms)
+  ✔ authenticates original events and checks the pinned published image without source-path replay (3669.5936ms)
+✔ committed snapshot integrity (10571.615ms)
+▶ full projection integrity replay
+  ✔ opens a committed snapshot for production UUID project-store identities (1.5919ms)
+  ✔ accepts a production UUID project identity in the projection checksum domain (1.157ms)
+  ✔ returns a frozen pass report only for an exact authoritative replay (3843.4708ms)
+  ✔ rejects a re-signed WAL-only mutation that a pathname reader observes (3458.3184ms)
+  ✔ maps a published generation sidecar to manifest-path integrity failure (3536.806ms)
+  ✔ maps a non-ENOENT exact sidecar lstat failure through integrity verification (4013.3442ms)
+  ✔ rejects a sidecar introduced at either pinned-image inspection boundary (9043.1779ms)
+  ✔ replays a scale generation through the bounded linear core (4268.2651ms)
+  ✔ does not sort the full expected projection while comparing a scale generation (3935.4641ms)
+  ✔ fails closed when authoritative replay exceeds its configured event bound (3572.7602ms)
+  ✔ fails closed when authoritative replay exceeds its configured byte bound (3976.0697ms)
+  ✔ reuses stored-event authentication to reject authoritative metadata tamper (3452.0029ms)
+  ✔ rejects an oversized stored payload before a full event row reaches JavaScript (3494.4707ms)
+  ✔ rejects a same-byte generation replacement race before opening SQLite (3415.644ms)
+  ✔ keeps descriptor-captured A bytes across an A-to-B-to-A generation pathname swap (3505.9934ms)
+  ✔ does not create or clean any scratch inspection pathname (4944.7025ms)
+  ✔ opens the pinned byte image only through in-memory deserialization (1.6058ms)
+  ✔ detects a missing derived row after outer hashes are recomputed (4557.9526ms)
+  ✔ detects an extra derived row after outer hashes are recomputed (3773.8134ms)
+  ✔ detects provenance-tampered V2 rows after database and logical hashes are recomputed (4063.3279ms)
+  ✔ detects canonical row reordering even though logical core rows are unchanged (3516.5544ms)
+  ✔ detects cross-project rows after outer hashes are recomputed (3499.1842ms)
+  ✔ detects noncanonical derived values after outer hashes are recomputed (3631.7081ms)
+  ✔ detects a checksum-mismatched manifest without touching either database (3468.4004ms)
+  ✔ maps manifest scope identity mismatch to the safe integrity contract (4689.3821ms)
+  ✔ rejects a valid V1 manifest before any V2 source or projection byte path is opened (4724.8261ms)
+  ✔ detects projection metadata and terminal identity tampering (8637.789ms)
+  ✔ accepts a valid unpublished V2 image through the shared semantic validator (3423.0259ms)
+  ✔ detects invalid derived references after outer hashes are recomputed (9380.8554ms)
+  ✔ rejects a re-signed unpublished V2 image with a corrupt cross-table reference (3949.368ms)
+  ✔ detects FTS index tampering even when core rows and checksums are unchanged (3630.2281ms)
+  ✔ rejects a re-signed unpublished V2 image with FTS semantic tampering (3951.3384ms)
+  ✔ detects a dropped required retrieval index after the database hash is re-signed (3582.4576ms)
+  ✔ detects persistent FTS rank configuration tampering after the database hash is re-signed (3628.7172ms)
+  ✔ detects rank-sensitive FTS docsize tampering after the database hash is re-signed (3822.1866ms)
+  ✔ rejects database bytes that no longer match the published manifest (5260.5005ms)
+✔ full projection integrity replay (143659.298ms)
+✔ publishes both projection generations at the exact source position (8657.6596ms)
+✔ adopts a prepared V1 baseline without rewriting its published bytes (4909.6234ms)
+✔ recovers after generation installation before baseline manifest without rewriting the image (15155.3706ms)
+✔ refuses orphan adoption after UPDATE corruption (6571.917ms)
+✔ refuses orphan adoption after CREATE corruption (4093.4833ms)
+✔ refuses orphan adoption after UPDATE corruption (3950.679ms)
+✔ rejects an immutable revision with a different baseline (5160.413ms)
+✔ does not record projection-verified after V1 generation tamper (4095.1043ms)
+✔ does not record projection-verified after V2 generation tamper (7241.4726ms)
+✔ rejects committed wrapper tamper before projection verification (5250.4529ms)
+✔ rejects unrelated revision build identity (5009.3321ms)
+✔ rejects unrelated revision migration identity (4353.0887ms)
+✔ rejects unrelated revision configuration identity (6156.4107ms)
+✔ never transacts through an injected unrelated repository (9432.7ms)
+✔ never transacts through an injected protected repository (9126.1796ms)
+✔ redacts private-database cleanup failure and releases remaining resources (4430.1911ms)
+✔ redacts pinned-image cleanup failure and releases remaining resources (8898.3785ms)
+✔ redacts v1-lease cleanup failure and releases remaining resources (7030.5814ms)
+✔ redacts committed-snapshot cleanup failure and releases remaining resources (8136.2267ms)
+✔ rejects a protected source destination before consulting the target connection (4101.0316ms)
+ℹ tests 58
+ℹ suites 2
+ℹ pass 58
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 286760.0265
+
+```
+
+`npm run typecheck` exited 0 after the covering gate; output was `> tsc --noEmit` with no diagnostics. Self-review: all three review findings addressed; real repository transaction ownership is no longer injectable, every required revision identity is checked, both V1 cleanup resources are attempted and redacted, and four cleanup boundaries are covered. Existing synchronous `verify()` and shared coordinator/lease implementation are unchanged. Tests restore builtin instrumentation before fixture cleanup and perform real publication/authentication/native cleanup. `git diff --check` for scoped files exited 0 with only repository LF-to-CRLF notices.
+
+The original 128/133 broad-gate outcome, isolated coordinator 4/4, original covering 49/49, and all original caveats above remain unchanged. Per controller instruction, no amended six-file gate was run in this fix round; scoped re-review and one clean full gate remain required before Task 8 closure.

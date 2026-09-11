@@ -1322,7 +1322,12 @@ export class ProjectionIntegrityService {
         databaseFile: "projections-1-1.sqlite", databaseSha256: pinned.sha256, coreChecksums, createdAt }, snapshot.binding);
       return Object.freeze({ manifest: verifiedManifest, projectionDirectory: this.#options.projectionDirectory, databasePath: paths.databasePath });
     } catch { return integrity(); }
-    finally { try { database?.close(); } finally { pinned?.close(); } }
+    finally {
+      let cleanupFailed = false;
+      try { database?.close(); } catch { cleanupFailed = true; }
+      try { pinned?.close(); } catch { cleanupFailed = true; }
+      if (cleanupFailed) integrity();
+    }
   }
 
   verify(binding: ProjectBinding, manifestValue: unknown): ProjectionIntegrityReport {
