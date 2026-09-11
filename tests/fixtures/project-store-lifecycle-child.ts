@@ -1,12 +1,9 @@
 import { randomBytes, randomUUID } from "node:crypto";
-import { spawnSync } from "node:child_process";
 import { MessageChannel, Worker, type MessagePort } from "node:worker_threads";
 import type { ProjectContext } from "../../src/orchestrator/identity/contracts.js";
 import {
   GitWorkspaceResolutionError,
   GitWorkspaceResolver,
-  type GitCommandResult,
-  type GitCommandRunner,
   type GitWorkspaceResolutionReason,
 } from "../../src/orchestrator/identity/git-workspace.resolver.js";
 import {
@@ -37,6 +34,7 @@ import {
   type LifecycleFixtureBarrierTarget,
   type LifecycleFixtureParentMessage,
 } from "../support/lifecycle-fixture-client.js";
+import { RecordingGitCommandRunner, type GitProbeDiagnostic } from "../support/recording-git-command-runner.js";
 
 type JsonRecord = Record<string, unknown>;
 type FixtureMessage = {
@@ -44,77 +42,6 @@ type FixtureMessage = {
   readonly requestId?: unknown;
   readonly payload?: unknown;
 };
-
-const MAX_GIT_PROBES = 16;
-const MAX_GIT_ARGV = 8;
-const MAX_GIT_TEXT_CHARS = 8 * 1024;
-
-type GitProbeRecord = {
-  readonly argv: readonly string[];
-  readonly cwd: string;
-  readonly status: number | null;
-  readonly stdout: string;
-  readonly stderr: string;
-  readonly spawnError: { readonly code: string | null; readonly message: string } | null;
-};
-
-type GitProbeDiagnostic = {
-  readonly phase: "bootstrap" | "binding";
-  readonly reason: GitWorkspaceResolutionReason | null;
-  readonly probes: readonly GitProbeRecord[];
-};
-
-function boundedGitText(value: string): string {
-  if (value.includes("\0")) throw new Error("FIXTURE_GIT_PROBE_NUL");
-  return value.slice(0, MAX_GIT_TEXT_CHARS);
-}
-
-function gitOutput(value: string | Buffer | undefined): string {
-  return boundedGitText(value === undefined ? "" : Buffer.isBuffer(value) ? value.toString("utf8") : value);
-}
-
-class RecordingGitCommandRunner implements GitCommandRunner {
-  readonly #records: GitProbeRecord[] = [];
-
-  run(cwd: string, args: string[]): GitCommandResult {
-    const result = spawnSync("git", args, {
-      cwd,
-      encoding: "utf8",
-      shell: false,
-      windowsHide: true,
-      timeout: 5000,
-      maxBuffer: 1024 * 1024,
-    });
-    if (this.#records.length < MAX_GIT_PROBES) {
-      const spawnError = result.error === undefined ? null : {
-        code: typeof (result.error as NodeJS.ErrnoException).code === "string"
-          ? boundedGitText((result.error as NodeJS.ErrnoException).code!)
-          : null,
-        message: boundedGitText(result.error.message),
-      };
-      this.#records.push(Object.freeze({
-        argv: Object.freeze(args.slice(0, MAX_GIT_ARGV).map(boundedGitText)),
-        cwd: boundedGitText(cwd),
-        status: result.status,
-        stdout: gitOutput(result.stdout),
-        stderr: gitOutput(result.stderr),
-        spawnError: spawnError === null ? null : Object.freeze(spawnError),
-      }));
-    }
-    return {
-      exitCode: result.status ?? 1,
-      stdout: gitOutput(result.stdout),
-      stderr: gitOutput(result.stderr) || (result.error === undefined ? "" : boundedGitText(result.error.message)),
-    };
-  }
-
-  diagnostic(
-    phase: GitProbeDiagnostic["phase"],
-    reason: GitWorkspaceResolutionReason | null,
-  ): GitProbeDiagnostic {
-    return Object.freeze({ phase, reason, probes: Object.freeze([...this.#records]) });
-  }
-}
 
 type FixtureGitProbeFailure = Error & {
   readonly code: "GIT_PROBE_FAILED";

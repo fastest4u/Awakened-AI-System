@@ -10,6 +10,7 @@ import {
 } from "node:worker_threads";
 import type { ProjectContext } from "../../src/orchestrator/identity/contracts.js";
 import type { SourceStateFingerprintV1 } from "../../src/orchestrator/lifecycle/contracts/checkpoint.js";
+import { decodeLifecycleSemanticCommandDraft } from "../../src/orchestrator/lifecycle/contracts/commands.js";
 import {
   CapabilityService,
   CHILD_BINDING_GRANT_DOMAIN,
@@ -845,8 +846,8 @@ async function executeProtectedSemantic(
   return record(response);
 }
 
-function rootCheckpointCommand(root: ActiveRoot): RecordValue {
-  return Object.freeze({
+function rootCheckpointCommand(root: ActiveRoot, overrides: RecordValue): RecordValue {
+  const command = {
     commandType: "record-checkpoint",
     commandId: randomUUID(),
     idempotencyKey: `task18-root-checkpoint/${randomUUID()}`,
@@ -875,17 +876,23 @@ function rootCheckpointCommand(root: ActiveRoot): RecordValue {
       testResults: [],
       materialClaims: [],
     },
-  });
+  };
+  for (const key of ["expectedStreamVersion", "expectedBaseEventPosition", "draft"] as const) {
+    if (Object.hasOwn(overrides, key)) Object.assign(command, { [key]: overrides[key] });
+  }
+  // Decode the complete internally owned command before creating its authority witness.
+  // The production decoder also validates exact checkpoint draft fields and scalar bounds.
+  return Object.freeze({ ...decodeLifecycleSemanticCommandDraft(command) });
 }
 
-async function recordRootCheckpoint(): Promise<RecordValue> {
+async function recordRootCheckpoint(overrides: RecordValue): Promise<RecordValue> {
   const root = activeRoot;
   if (root === null) throw new Error("TASK18_RUNTIME_PROTOCOL_ERROR");
   const response = await executeProtectedSemantic(
     backend,
     active.context,
     "record-checkpoint",
-    rootCheckpointCommand(root),
+    rootCheckpointCommand(root, overrides),
     {
       authoritySessionId: root.sessionId,
       targetSessionId: root.sessionId,
@@ -1757,9 +1764,11 @@ parentPort.on("message", (message: unknown) => {
         }
         case "record-root-checkpoint": {
           const payload = record(request.payload);
-          exactFields(payload, ["operation"]);
+          if (Object.keys(payload).some(key => !["operation", "expectedStreamVersion", "expectedBaseEventPosition", "draft"].includes(key))) {
+            throw new Error("TASK18_RUNTIME_PROTOCOL_ERROR");
+          }
           if (payload.operation !== "record-root-checkpoint") throw new Error("TASK18_RUNTIME_PROTOCOL_ERROR");
-          const value = await recordRootCheckpoint();
+          const value = await recordRootCheckpoint(payload);
           parentPort!.postMessage({ type: "result", requestId, value });
           return;
         }

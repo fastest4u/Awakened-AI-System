@@ -9,6 +9,7 @@ import type {
   ProjectionItemStatus,
 } from "../projections/contracts.js";
 import type { ProjectionReaderLease } from "../projections/reader-lease.js";
+import { isProjectionProjectStoreIdentity } from "../projections/contracts.js";
 
 const SQLITE_INT64_MAX = 9_223_372_036_854_775_807n;
 const HASH = /^[0-9a-f]{64}$/u;
@@ -273,9 +274,10 @@ function binding(value: unknown): ProjectBinding {
     ["projectId", "vaultId", "storeId", "workspaceId", "branchScopeId", "branchRef", "sessionId"],
     ["projectId", "vaultId", "storeId", "workspaceId", "branchScopeId", "branchRef", "sessionId"],
   );
-  for (const key of ["projectId", "vaultId", "storeId", "workspaceId"] as const) {
-    if (typeof source[key] !== "string" || !HASH.test(source[key])) return invalid();
+  for (const key of ["projectId", "vaultId", "storeId"] as const) {
+    if (!isProjectionProjectStoreIdentity(source[key])) return invalid();
   }
+  if (typeof source.workspaceId !== "string" || !HASH.test(source.workspaceId)) return invalid();
   if (source.branchScopeId !== null
     && (typeof source.branchScopeId !== "string" || !UUID.test(source.branchScopeId))) return invalid();
   if (source.branchRef !== null

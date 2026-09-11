@@ -1,4 +1,6 @@
 import { createHash } from "node:crypto";
+import { types as utilTypes } from "node:util";
+import { decodeLifecycleIntentWitness } from "../lifecycle/lifecycle-intent-witness.js";
 
 import type {
   BranchScopeId,
@@ -7,7 +9,7 @@ import type {
   VaultId,
   WorkspaceId,
 } from "../identity/contracts.js";
-import type { ProjectBinding } from "../projections/contracts.js";
+import { isProjectionProjectStoreIdentity, type ProjectBinding } from "../projections/contracts.js";
 import type {
   InternalRetrievalRequest,
   InternalRetrievalResultItem,
@@ -309,6 +311,57 @@ function plainRecord(value: unknown): Readonly<Record<string, unknown>> {
   return output as Readonly<Record<string, unknown>>;
 }
 
+/** A serialized production witness is structured authority metadata, not user text.
+ * Only the direct event field uses this path; its original bytes remain sealed. */
+function sourceWitnessString(value: unknown): string | null {
+  if (value === null) return null;
+  if (typeof value !== "string" || value.length === 0 || Buffer.byteLength(value, "utf8") > MAX_PLAIN_DATA_STRING_BYTES
+    || value.normalize("NFKC") !== value || CONTROL.test(value)) return invalid();
+  const witness = decodeLifecycleIntentWitness(value);
+  const structuralAuthorizationKeys = new Set([
+    "intent.authorization", "intent.authorization.authorizationKind", "intent.authorization.authorizationSessionId",
+    "persistedAssertions.authorizationKind", "persistedAssertions.authorizationSessionId",
+  ]);
+  const scan = (entry: unknown, path: readonly string[], depth: number): void => {
+    if (depth > MAX_PLAIN_DATA_DEPTH) return invalid();
+    if (entry === null || typeof entry === "boolean") return;
+    if (typeof entry === "string") { safeText(entry, MAX_PLAIN_DATA_STRING_BYTES); return; }
+    if (typeof entry === "number") { if (!Number.isFinite(entry) || Object.is(entry, -0)) return invalid(); return; }
+    if (typeof entry !== "object" || utilTypes.isProxy(entry)) return invalid();
+    if (Array.isArray(entry)) { arrayItems(entry, 0).forEach((child, i) => scan(child, [...path, String(i)], depth + 1)); return; }
+    const prototype = Object.getPrototypeOf(entry);
+    if (prototype !== Object.prototype && prototype !== null) return invalid();
+    for (const key of Reflect.ownKeys(entry)) {
+      if (typeof key !== "string") return invalid();
+      safePropertyName(key);
+      const next = [...path, key];
+      if (!structuralAuthorizationKeys.has(next.join("."))) safeText(key, 512);
+      const descriptor = Object.getOwnPropertyDescriptor(entry, key);
+      if (!descriptor || !descriptor.enumerable || !("value" in descriptor)) return invalid();
+      scan(descriptor.value, next, depth + 1);
+    }
+  };
+  scan(witness, [], 1);
+  return value;
+}
+
+function sourceEventRecord(value: unknown): Readonly<Record<string, unknown>> {
+  if (typeof value !== "object" || value === null || utilTypes.isProxy(value) || Array.isArray(value)) return invalid();
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) return invalid();
+  const seen = new WeakSet<object>([value]);
+  const output: Record<string, unknown> = {};
+  for (const key of Reflect.ownKeys(value)) {
+    if (typeof key !== "string") return invalid();
+    safePropertyName(key);
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (!descriptor || !descriptor.enumerable || !("value" in descriptor)) return invalid();
+    Object.defineProperty(output, key, { enumerable: true, value: key === "lifecycleIntentJson"
+      ? sourceWitnessString(descriptor.value) : clonePlainData(descriptor.value, seen, 1) });
+  }
+  return Object.freeze(output);
+}
+
 function canonicalSha256(value: unknown): string {
   const serialized = JSON.stringify(value);
   if (typeof serialized !== "string") return invalid();
@@ -327,6 +380,11 @@ function hash(value: unknown): string {
 
 function uuid(value: unknown): string {
   if (typeof value !== "string" || !UUID.test(value)) return invalid();
+  return value;
+}
+
+function projectStoreIdentity(value: unknown): string {
+  if (!isProjectionProjectStoreIdentity(value)) return invalid();
   return value;
 }
 
@@ -407,9 +465,9 @@ function eligibleScope(value: unknown): RetrievalEvaluationEligibleScopeV1 {
     return invalid();
   }
   return Object.freeze({
-    projectId: hash(source.projectId),
-    vaultId: hash(source.vaultId),
-    storeId: hash(source.storeId),
+    projectId: projectStoreIdentity(source.projectId),
+    vaultId: projectStoreIdentity(source.vaultId),
+    storeId: projectStoreIdentity(source.storeId),
     workspaceId: hash(source.workspaceId),
     branchScopeId: nullableUuid(source.branchScopeId),
     branchRef: nullableText(source.branchRef, 1_024),
@@ -582,9 +640,9 @@ function parseProjectBinding(value: unknown): ProjectBinding {
     "projectId", "vaultId", "storeId", "workspaceId", "branchScopeId", "branchRef", "sessionId",
   ]);
   return Object.freeze({
-    projectId: hash(source.projectId) as ProjectId,
-    vaultId: hash(source.vaultId) as VaultId,
-    storeId: hash(source.storeId) as StoreId,
+    projectId: projectStoreIdentity(source.projectId) as ProjectId,
+    vaultId: projectStoreIdentity(source.vaultId) as VaultId,
+    storeId: projectStoreIdentity(source.storeId) as StoreId,
     workspaceId: hash(source.workspaceId) as WorkspaceId,
     branchScopeId: nullableUuid(source.branchScopeId) as BranchScopeId | null,
     branchRef: nullableText(source.branchRef, 1_024),
@@ -610,7 +668,7 @@ function parseSourceEventsV2(value: unknown): RetrievalEvaluationSourceEventsV2 
     seenBindings.add(bindingKey);
     const eventEntries = arrayItems(sourceRecord.events, 1);
     const events = eventEntries.map((eventValue) => {
-      const event = plainRecord(eventValue);
+      const event = sourceEventRecord(eventValue);
       const eventId = uuid(event.eventId);
       const idempotencyKey = safeText(event.idempotencyKey, 256);
       if (seenEventIds.has(eventId) || seenIdempotencyKeys.has(idempotencyKey)) return invalid();

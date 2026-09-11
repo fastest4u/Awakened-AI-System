@@ -18,7 +18,7 @@ import { isPrimarySqliteBusy } from "../storage/event-append-transaction.js";
 import type { SqliteDriver, SqliteConnection, SqliteRow } from "../storage/sqlite-driver.js";
 import { authenticateStoredEvent, type StoredEventChainCursor } from "../integrity/stored-event-authenticator.js";
 import { canonicalJson } from "../serialization/canonical-json.js";
-import { verifyLegacyProjectionConnection, type BuiltProjectionGeneration } from "./builder.js";
+import { readVerifiedLegacyProjectionConnection, type BuiltProjectionGeneration } from "./builder.js";
 import {
   PROJECTION_NAMES,
   projectionCoreChecksum,
@@ -41,6 +41,7 @@ import {
   parseProjectionManifest,
   verifyProjectionPublicationPaths,
   type ProjectionManifestV2,
+  type ProjectionNameV1,
   type ProjectionPathInspection,
 } from "./manifest.js";
 import { PROJECTION_SCHEMA_SQL_V1, PROJECTION_SCHEMA_SQL_V2, PROJECTION_SCHEMA_SQL_V1_LEGACY, PROJECTION_SCHEMA_SQL_V2_LEGACY, PROJECTION_SCHEMA_VERSION } from "./schema.js";
@@ -84,6 +85,18 @@ export interface ProjectionIntegrityReport {
 }
 
 type ProjectionRows = Readonly<Record<ProjectionName, readonly CanonicalProjectionRow[]>>;
+export type VerifiedCanonicalProjectionSnapshot = Readonly<{
+  binding: ProjectBinding; terminalEventPosition: bigint; terminalEventHash: string;
+}> & (Readonly<{ schemaVersion: 1; coreChecksums: Readonly<Record<ProjectionNameV1, string>>;
+  rows: Readonly<Record<ProjectionNameV1, readonly CanonicalProjectionRow[]>> }>
+  | Readonly<{ schemaVersion: 2; coreChecksums: Readonly<Record<ProjectionName, string>>; rows: ProjectionRows }>);
+
+export function readVerifiedCanonicalProjectionSnapshot(
+  binding: ProjectBinding, manifestValue: unknown,
+  options: ProjectionIntegrityServiceOptions & Readonly<{ sourceSnapshot: ProjectionEventSnapshot }>,
+): VerifiedCanonicalProjectionSnapshot {
+  return new ProjectionIntegrityService(options).readCanonicalSnapshot(binding, manifestValue, options.sourceSnapshot);
+}
 type ExpectedProjectionRows = Readonly<
   Record<ProjectionName, ReadonlyMap<string, CanonicalProjectionRow>>
 >;
@@ -1128,7 +1141,8 @@ function inspectGeneration(
   directoryIdentity: ProjectionDirectoryIdentity,
   pathInspection: ProjectionPathInspection,
   faultInjector?: ProjectionIntegrityFaultInjector,
-): void {
+): ProjectionRows {
+  let verifiedRows: ProjectionRows | undefined;
   assertProjectionSidecarsAbsent(path, pathInspection);
   const generationIdentity = captureGenerationIdentity(path);
   if (!sameProjectionDirectoryIdentity(
@@ -1176,6 +1190,7 @@ function inspectGeneration(
       ) return integrity();
       pinnedImage.assertUnchanged();
       database.exec("COMMIT");
+      verifiedRows = rows;
     } catch (error) {
       try { database.exec("ROLLBACK"); } catch { /* preserve integrity failure */ }
       throw error;
@@ -1191,6 +1206,8 @@ function inspectGeneration(
       )
     ) return integrity();
     pinnedImage.assertUnchanged();
+    if (!verifiedRows) return integrity();
+    return verifiedRows;
   } finally {
     pinnedImage.close();
   }
@@ -1202,6 +1219,47 @@ function* committedSnapshotEvents(snapshot: ProjectionEventSnapshot): Iterable<S
     if (error instanceof ShadowMigrationError || (error instanceof EventStoreError && error.code === "SQLITE_BUSY") || isPrimarySqliteBusy(error)) throw error;
     throw new ShadowMigrationError("MIGRATION_LEDGER_INTEGRITY_FAILURE");
   }
+}
+
+function authenticateProjectionSnapshot(
+  snapshot: ProjectionEventSnapshot, binding: ProjectBinding,
+  manifest: Pick<ProjectionManifestV2, "terminalEventPosition" | "terminalEventHash">,
+  options: ProjectionIntegrityServiceOptions, consume: (source: StoredEvent) => void,
+): void {
+  const fields = ["projectId", "vaultId", "storeId", "workspaceId", "branchScopeId", "branchRef"] as const;
+  const maxEvents = options.maxReplayEvents ?? MAX_PROJECTION_SOURCE_EVENTS;
+  const maxBytes = options.maxReplayBytes ?? MAX_PROJECTION_SOURCE_BYTES;
+  if (!Number.isSafeInteger(maxEvents) || maxEvents < 0 || maxEvents > MAX_PROJECTION_SOURCE_EVENTS
+    || !Number.isSafeInteger(maxBytes) || maxBytes < 0 || maxBytes > MAX_PROJECTION_SOURCE_BYTES
+    || fields.some(key => snapshot.binding[key] !== binding[key]) || snapshot.binding.sessionId !== null
+    || !Number.isSafeInteger(snapshot.eventCount) || snapshot.eventCount < 0 || snapshot.eventCount > maxEvents
+    || !Number.isSafeInteger(snapshot.aggregateBytes) || snapshot.aggregateBytes < 0 || snapshot.aggregateBytes > maxBytes
+    || snapshot.terminalEventPosition !== BigInt(manifest.terminalEventPosition)
+    || snapshot.terminalEventHash !== manifest.terminalEventHash) return integrity();
+  let cursor: StoredEventChainCursor = { expectedPosition: 1n, previousEventHash: "0".repeat(64) };
+  let count = 0;
+  let bytes = 0;
+  for (const source of committedSnapshotEvents(snapshot)) {
+    if (++count > maxEvents || count > snapshot.eventCount || fields.some(key => source[key] !== binding[key])) return integrity();
+    const authenticated = authenticateStoredEvent(source, cursor);
+    cursor = authenticated.nextCursor;
+    // Complete stored row domain, including nullable and numeric columns (8 bytes each).
+    let rowBytes = 0;
+    for (const key of ["globalPosition", "eventId", "projectId", "vaultId", "storeId", "workspaceId", "branchScopeId", "branchRef",
+      "streamId", "streamType", "streamVersion", "eventType", "eventSchemaVersion", "sessionId", "parentSessionId", "actorRole", "agentId",
+      "clientInstanceId", "correlationId", "causationId", "commandId", "idempotencyKey", "commandEventIndex", "occurredAt", "recordedAt",
+      "visibilityScope", "confidence", "verificationStatus", "sourceRefs", "evidenceRefs", "evidenceDigests", "payloadJson", "payloadHash",
+      "previousGlobalHash", "eventHash", "lifecycleIntentJson"] as const) {
+      const value = source[key];
+      rowBytes += ["sourceRefs", "evidenceRefs", "evidenceDigests"].includes(key)
+        ? Buffer.byteLength(canonicalJson(value), "utf8") : typeof value === "string" ? Buffer.byteLength(value, "utf8") : 8;
+    }
+    bytes += rowBytes;
+    if (rowBytes > 1024 * 1024 || bytes > maxBytes || bytes > snapshot.aggregateBytes) return integrity();
+    consume(source);
+  }
+  if (count !== snapshot.eventCount || bytes !== snapshot.aggregateBytes || cursor.expectedPosition - 1n !== snapshot.terminalEventPosition
+    || cursor.previousEventHash !== snapshot.terminalEventHash) return integrity();
 }
 
 export class ProjectionIntegrityService {
@@ -1216,50 +1274,25 @@ export class ProjectionIntegrityService {
 
   /** Verifies a caller-owned committed snapshot; the caller retains close ownership. */
   verifyCommittedSnapshot(binding: ProjectBinding, manifestValue: unknown, snapshot: ProjectionEventSnapshot): ProjectionIntegrityReport {
+    const verified = this.#readCommittedSnapshot(binding, manifestValue, snapshot);
+    return Object.freeze({ status: "passed", terminalEventPosition: String(verified.terminalEventPosition) });
+  }
+
+  #readCommittedSnapshot(binding: ProjectBinding, manifestValue: unknown, snapshot: ProjectionEventSnapshot): VerifiedCanonicalProjectionSnapshot {
     try {
       const manifest = parseProjectionManifestV2(manifestValue, binding);
-      const fields = ["projectId", "vaultId", "storeId", "workspaceId", "branchScopeId", "branchRef"] as const;
-      const maxEvents = this.#options.maxReplayEvents ?? MAX_PROJECTION_SOURCE_EVENTS;
-      const maxBytes = this.#options.maxReplayBytes ?? MAX_PROJECTION_SOURCE_BYTES;
-      if (!Number.isSafeInteger(maxEvents) || maxEvents < 0 || maxEvents > MAX_PROJECTION_SOURCE_EVENTS
-        || !Number.isSafeInteger(maxBytes) || maxBytes < 0 || maxBytes > MAX_PROJECTION_SOURCE_BYTES
-        || fields.some(key => snapshot.binding[key] !== binding[key]) || snapshot.binding.sessionId !== null
-        || !Number.isSafeInteger(snapshot.eventCount) || snapshot.eventCount < 0 || snapshot.eventCount > maxEvents
-        || !Number.isSafeInteger(snapshot.aggregateBytes) || snapshot.aggregateBytes < 0 || snapshot.aggregateBytes > maxBytes
-        || snapshot.terminalEventPosition !== BigInt(manifest.terminalEventPosition)
-        || snapshot.terminalEventHash !== manifest.terminalEventHash) return integrity();
       const accumulator = new ProjectionFoldAccumulator();
-      let cursor: StoredEventChainCursor = { expectedPosition: 1n, previousEventHash: "0".repeat(64) };
-      let count = 0;
-      let bytes = 0;
-      for (const source of committedSnapshotEvents(snapshot)) {
-        if (++count > maxEvents || count > snapshot.eventCount || fields.some(key => source[key] !== binding[key])) return integrity();
-        const authenticated = authenticateStoredEvent(source, cursor);
-        cursor = authenticated.nextCursor;
-        // Complete stored row domain, including nullable and numeric columns (8 bytes each).
-        let rowBytes = 0;
-        for (const key of ["globalPosition", "eventId", "projectId", "vaultId", "storeId", "workspaceId", "branchScopeId", "branchRef",
-          "streamId", "streamType", "streamVersion", "eventType", "eventSchemaVersion", "sessionId", "parentSessionId", "actorRole", "agentId",
-          "clientInstanceId", "correlationId", "causationId", "commandId", "idempotencyKey", "commandEventIndex", "occurredAt", "recordedAt",
-          "visibilityScope", "confidence", "verificationStatus", "sourceRefs", "evidenceRefs", "evidenceDigests", "payloadJson", "payloadHash",
-          "previousGlobalHash", "eventHash", "lifecycleIntentJson"] as const) {
-          const value = source[key];
-          rowBytes += ["sourceRefs", "evidenceRefs", "evidenceDigests"].includes(key)
-            ? Buffer.byteLength(canonicalJson(value), "utf8") : typeof value === "string" ? Buffer.byteLength(value, "utf8") : 8;
-        }
-        bytes += rowBytes;
-        if (rowBytes > 1024 * 1024 || bytes > maxBytes || bytes > snapshot.aggregateBytes) return integrity();
+      authenticateProjectionSnapshot(snapshot, binding, manifest, this.#options, source => {
         const decoded = decodeProjectionEvent(source);
         if (decoded.kind === "projected") accumulator.append(decoded.event);
-      }
-      if (count !== snapshot.eventCount || bytes !== snapshot.aggregateBytes || cursor.expectedPosition - 1n !== snapshot.terminalEventPosition
-        || cursor.previousEventHash !== snapshot.terminalEventHash) return integrity();
+      });
       const directory = captureProjectionDirectoryIdentity(this.#options.projectionDirectory);
       const inspection = this.#options.pathInspection ?? filesystemProjectionPathInspection;
       const paths = verifyProjectionPublicationPaths(this.#options.projectionDirectory, manifest.databaseFile, inspection);
-      inspectGeneration(paths.databasePath, binding, manifest, rowsFromState(accumulator.finish()),
+      const rows = inspectGeneration(paths.databasePath, binding, manifest, rowsFromState(accumulator.finish()),
         this.#options.busyTimeoutMs ?? DEFAULT_BUSY_TIMEOUT_MS, directory, inspection, this.#options.faultInjector);
-      return Object.freeze({ status: "passed", terminalEventPosition: manifest.terminalEventPosition });
+      return Object.freeze({ schemaVersion: 2, binding: Object.freeze({ ...binding }), rows, coreChecksums: manifest.coreChecksums,
+        terminalEventPosition: BigInt(manifest.terminalEventPosition), terminalEventHash: manifest.terminalEventHash });
     } catch (error) {
       // A lazy committed reader can fail during iteration. Preserve only its safe classification.
       const codes: readonly ShadowMigrationErrorCode[] = ["MIGRATION_POLICY_INVALID", "MIGRATION_SOURCE_INVALID", "MIGRATION_SOURCE_MUTATED",
@@ -1272,6 +1305,25 @@ export class ProjectionIntegrityService {
   }
 
   /** Reopens descriptor-pinned V1 bytes; all SQL, including FTS writes, is detached. */
+  readCanonicalSnapshot(binding: ProjectBinding, manifestValue: unknown, snapshot: ProjectionEventSnapshot): VerifiedCanonicalProjectionSnapshot {
+    const descriptor = typeof manifestValue === "object" && manifestValue !== null
+      ? Object.getOwnPropertyDescriptor(manifestValue, "schemaVersion") : undefined;
+    if (!descriptor || !("value" in descriptor)) return integrity();
+    if (descriptor.value === 2) return this.#readCommittedSnapshot(binding, manifestValue, snapshot);
+    const manifest = parseProjectionManifest(manifestValue, binding);
+    const events: StoredEvent[] = [];
+    authenticateProjectionSnapshot(snapshot, binding, manifest, this.#options, source => events.push(source));
+    const verifiedSource = Object.freeze({ ...snapshot, events: () => events });
+    let rows: Readonly<Record<ProjectionNameV1, readonly CanonicalProjectionRow[]>> | undefined;
+    this.#inspectV1Generation(verifiedSource, manifest.createdAt, { manifest,
+      projectionDirectory: this.#options.projectionDirectory,
+      databasePath: verifyProjectionPublicationPaths(this.#options.projectionDirectory, manifest.databaseFile).databasePath,
+    }, value => { rows = value; });
+    if (!rows) return integrity();
+    return Object.freeze({ schemaVersion: 1, binding: Object.freeze({ ...binding }), rows, coreChecksums: manifest.coreChecksums,
+      terminalEventPosition: BigInt(manifest.terminalEventPosition), terminalEventHash: manifest.terminalEventHash });
+  }
+
   verifyV1Generation(snapshot: ProjectionEventSnapshot, generation: BuiltProjectionGeneration): ProjectionIntegrityReport {
     const verified = this.#inspectV1Generation(snapshot, generation.manifest.createdAt, generation);
     return Object.freeze({ status: "passed", terminalEventPosition: verified.manifest.terminalEventPosition });
@@ -1282,7 +1334,8 @@ export class ProjectionIntegrityService {
     return this.#inspectV1Generation(snapshot, createdAt);
   }
 
-  #inspectV1Generation(snapshot: ProjectionEventSnapshot, createdAt: string, generation?: BuiltProjectionGeneration): BuiltProjectionGeneration {
+  #inspectV1Generation(snapshot: ProjectionEventSnapshot, createdAt: string, generation?: BuiltProjectionGeneration,
+    onVerified?: (rows: Readonly<Record<ProjectionNameV1, readonly CanonicalProjectionRow[]>>) => void): BuiltProjectionGeneration {
     let pinned: PinnedGenerationImage | undefined;
     let database: DatabaseSync | undefined;
     try {
@@ -1311,8 +1364,9 @@ export class ProjectionIntegrityService {
           };
         },
       };
-      const coreChecksums = verifyLegacyProjectionConnection(connection, snapshot,
+      const verified = readVerifiedLegacyProjectionConnection(connection, snapshot,
         { generation: manifest?.generation ?? 1, createdAt }, manifest?.coreChecksums);
+      const { coreChecksums } = verified;
       assertProjectionSidecarsAbsent(paths.databasePath);
       pinned.assertUnchanged();
       if (!sameGenerationIdentity(identity, captureGenerationIdentity(paths.databasePath))
@@ -1320,6 +1374,7 @@ export class ProjectionIntegrityService {
       const verifiedManifest = manifest ?? parseProjectionManifest({ schemaVersion: 1, ...snapshot.binding, sessionId: null,
         generation: 1, terminalEventPosition: String(snapshot.terminalEventPosition), terminalEventHash: snapshot.terminalEventHash,
         databaseFile: "projections-1-1.sqlite", databaseSha256: pinned.sha256, coreChecksums, createdAt }, snapshot.binding);
+      onVerified?.(verified.rows);
       return Object.freeze({ manifest: verifiedManifest, projectionDirectory: this.#options.projectionDirectory, databasePath: paths.databasePath });
     } catch { return integrity(); }
     finally {

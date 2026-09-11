@@ -20,6 +20,7 @@ import { SqliteRetrievalCandidateRepository } from "../src/orchestrator/retrieva
 import {
   InternalRetrievalError,
   RETRIEVAL_LIMITS,
+  validateInternalRetrievalRequest,
   type InternalRetrievalRequest,
   type ProjectionLeaseProvider,
   type RetrievalCandidate,
@@ -131,6 +132,25 @@ function request(overrides: Partial<InternalRetrievalRequest> = {}): InternalRet
     ...overrides,
   });
 }
+
+it("accepts production or legacy binding identities without weakening request guards", () => {
+  const uuid = "12345678-abcd-4abc-8abc-123456789012";
+  assert.deepEqual(validateInternalRetrievalRequest(request()).binding, BINDING);
+  const production = { ...BINDING, projectId: uuid as ProjectId, vaultId: uuid as VaultId, storeId: uuid as StoreId };
+  assert.deepEqual(validateInternalRetrievalRequest(request({ binding: production })).binding, production);
+  for (const field of ["projectId", "vaultId", "storeId"] as const) {
+    for (const value of [uuid.toUpperCase(), uuid.replace("-4abc-", "-1abc-"), uuid.slice(1), "g".repeat(64), "a".repeat(63), `${uuid}\0`, 7, null]) {
+      assert.throws(() => validateInternalRetrievalRequest(request({ binding: { ...production, [field]: value } as ProjectBinding })));
+    }
+  }
+  assert.throws(() => validateInternalRetrievalRequest(request({ binding: { ...production, workspaceId: uuid as WorkspaceId } })));
+  assert.throws(() => validateInternalRetrievalRequest(request({ binding: { ...production, sessionId: uuid } as ProjectBinding })));
+  let reads = 0;
+  const accessor = { ...production };
+  Object.defineProperty(accessor, "projectId", { enumerable: true, get() { reads++; return uuid; } });
+  assert.throws(() => validateInternalRetrievalRequest(request({ binding: accessor })));
+  assert.equal(reads, 0);
+});
 
 function staticItem(id: string, overrides: Partial<RetrievalItem> = {}): RetrievalItem {
   return Object.freeze({

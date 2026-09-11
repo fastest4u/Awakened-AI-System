@@ -40,6 +40,7 @@ import { SqliteProjectionEventReader, type ProjectionEventSnapshot } from "../sr
 import {
   assertUnpublishedProjectionV2Image,
   ProjectionIntegrityService,
+  readVerifiedCanonicalProjectionSnapshot,
 } from "../src/orchestrator/projections/integrity.js";
 import {
   parseProjectionManifest,
@@ -104,6 +105,29 @@ const PRODUCTION_BINDING: ProjectBinding = Object.freeze({
 const roots: string[] = [];
 
 describe("committed snapshot integrity", () => {
+  it("exports frozen native seven/eight domain rows only from the verified private image", async () => {
+    const f = await createFixture();
+    const reader = new SqliteProjectionEventReader({ driver, eventStorePath: f.sourcePath });
+    const buildSnapshot = await reader.openCommittedSnapshot(BINDING);
+    const directory = join(dirname(f.projectionDirectory), "native-v1");
+    const generation = await new ImmutableProjectionBuilder({ driver, projectionDirectory: directory, now: () => NOW }).build(buildSnapshot, 1);
+    buildSnapshot.close();
+    for (const [manifest, projectionDirectory, version] of [[generation.manifest, directory, 1], [f.manifest, f.projectionDirectory, 2]] as const) {
+      const sourceSnapshot = await reader.openCommittedSnapshot(BINDING);
+      try {
+        const result = readVerifiedCanonicalProjectionSnapshot(BINDING, manifest, { driver, eventStorePath: "unused", projectionDirectory, sourceSnapshot });
+        assert.equal(result.schemaVersion, version);
+        assert.equal(Object.keys(result.coreChecksums).length, version === 1 ? 7 : 8);
+        assert.equal(Object.hasOwn(result.rows, "sessionCheckpoints"), version === 2);
+        assert.equal(result.rows.canonicalItems.length, 2);
+        assert.equal(Object.isFrozen(result.rows.canonicalItems[0]), true);
+        assert.equal(Object.isFrozen(result.rows.canonicalItems), true);
+        assert.equal(Object.isFrozen(result.rows), true);
+        assert.equal(Object.hasOwn(result, "databasePath"), false);
+        assert.equal(Object.hasOwn(result, "database"), false);
+      } finally { sourceSnapshot.close(); }
+    }
+  });
   it("verifies exact historical V1 and V2 schema images with authenticated legacy hash bindings", async () => {
     const f = await createFixture();
     const historical: SqliteDriver = { open(path, options) {
@@ -124,7 +148,7 @@ describe("committed snapshot integrity", () => {
       } finally { verifySnapshot.close(); }
     } finally { snapshot.close(); }
     const directory = join(dirname(f.projectionDirectory), "legacy-v2");
-    const generation = await new V2ProjectionBuildCoordinator({ eventReader: reader, projectionDirectory: directory,
+    const generation = await new V2ProjectionBuildCoordinator({ eventReader: reader, projectionDirectory: directory, now: () => 0,
       builder: new ImmutableProjectionBuilder({ driver: historical, projectionDirectory: directory, now: () => NOW }) }).ensurePublished(BINDING, BigInt(f.manifest.terminalEventPosition), 10_000);
     assert.equal(new ProjectionIntegrityService({ driver, eventStorePath: f.sourcePath, projectionDirectory: directory }).verify(BINDING, generation.manifest).status, "passed");
   });
@@ -421,6 +445,8 @@ async function createFixture(options: FixtureOptions = {}): Promise<Fixture> {
   connections.splice(connections.indexOf(connection), 1);
   const generation = await new V2ProjectionBuildCoordinator({
     projectionDirectory,
+    // Semantic fixture setup is independent of wall-clock performance; deadline contracts have dedicated controls.
+    now: () => 0,
     eventReader: new SqliteProjectionEventReader({ driver, eventStorePath: sourcePath }),
     builder: new ImmutableProjectionBuilder({ driver, projectionDirectory, now: () => NOW }),
   }).ensurePublished(BINDING, expectedStreamVersion, 10_000);

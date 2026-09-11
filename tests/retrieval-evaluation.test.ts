@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import { createV2ShadowMigrationFixture } from "./support/v2-shadow-migration-fixture.js";
 import {
   copyFileSync,
   mkdtempSync,
@@ -318,6 +319,74 @@ function parseSealedInputs(inputs: SealedV2Inputs): SealedRetrievalEvaluationCor
     inputs.baseline,
   );
 }
+
+describe("sealed corpus production identity boundary", () => {
+  function withIdentity(value: string): SealedV2Inputs {
+    const inputs = createValidSealedV2Inputs();
+    const replace = (v: unknown): unknown => {
+      if (Array.isArray(v)) return v.map(replace);
+      if (v === null || typeof v !== "object") return v;
+      return Object.fromEntries(Object.entries(v).map(([k, entry]) => [k,
+        ["projectId", "vaultId", "storeId"].includes(k) ? value : replace(entry)]));
+    };
+    const sources = replace(inputs.sourceEvents) as UnknownRecord;
+    const judgments = replace(inputs.judgments) as UnknownRecord;
+    const baseline = { ...inputs.baseline, judgmentsSha256: canonicalSha256(judgments.queries) };
+    return sealV2Artifacts(sources, judgments, baseline);
+  }
+  it("seals production UUID identities while retaining the legacy corpus contract", () => {
+    const uuid = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+    const parsed = parseSealedInputs(withIdentity(uuid));
+    assert.equal(parsed.sources[0]!.binding.projectId, uuid);
+    assert.equal(parsed.queries[0]!.eligibleScope.storeId, uuid);
+    assert.equal(parseSealedInputs(createValidSealedV2Inputs()).sources[0]!.binding.projectId, "a".repeat(64));
+  });
+  it("rejects malformed, uppercase, wrong-version and padded production identities", () => {
+    for (const id of ["aaaaaaaa-bbbb-3ccc-8ddd-eeeeeeeeeeee", "AAAAAAAA-BBBB-4CCC-8DDD-EEEEEEEEEEEE",
+      "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee\0", "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeeee", "a".repeat(63), " a".repeat(32)]) {
+      assertCorpusInvalid(() => parseSealedInputs(withIdentity(id)));
+    }
+  });
+});
+
+describe("sealed corpus production witness boundary", () => {
+  it("preserves real writer witness bytes and rejects unsafe strings or misplaced witness exceptions", async t => {
+    const f = await createV2ShadowMigrationFixture(t, { parityCorpus: true, legacyArtifacts: false });
+    const original = createValidSealedV2Inputs();
+    const queries = (original.judgments.queries as UnknownRecord[]).map(query => ({ ...query,
+      eligibleScope: { ...(query.eligibleScope as UnknownRecord), ...f.projectionBinding, sessionId: f.sourceEvents[0]!.sessionId,
+        visibility: "session", requiredEventPosition: f.manifest.terminalEventPosition } }));
+    const judgments = { ...original.judgments, queries };
+    const baseline = { ...original.baseline, judgmentsSha256: canonicalSha256(queries) };
+    const events = JSON.parse(JSON.stringify(f.sourceEvents, (_key, value: unknown) => typeof value === "bigint" ? value.toString() : value)) as UnknownRecord[];
+    const sources = { schemaVersion: 2, corpusVersion: "retrieval-evaluation-v2", sources: [{ binding: f.projectionBinding, events }] };
+    const sealed = sealV2Artifacts(sources, judgments, baseline);
+    const parsed = parseSealedInputs(sealed);
+    const witness = events[0]!.lifecycleIntentJson;
+    assert.equal(typeof witness, "string");
+    assert.equal(parsed.sources[0]!.events[0]!.lifecycleIntentJson, witness);
+    assert.equal(parsed.bundle.files["source-events.json"], canonicalSha256(sources));
+    assert.deepEqual(Object.keys(parsed.sources[0]!.events[0]!), Object.keys(events[0]!));
+    const altered = (edit: (event: UnknownRecord) => void) => {
+      const next = structuredClone(sources); edit(next.sources[0]!.events[0]!);
+      return sealV2Artifacts(next, judgments, baseline);
+    };
+    for (const bad of ["{", `${witness} `, "x".repeat(1_048_577), canonicalJson({ ...JSON.parse(String(witness)), extra: true }), JSON.parse(String(witness))]) {
+      assertCorpusInvalid(() => parseSealedInputs(altered(event => { event.lifecycleIntentJson = bad; })));
+    }
+    for (const text of ["authorization user text", "credential secret", "pmcap1.bearer", "Ａ", "line\nbreak"]) {
+      const changed = JSON.parse(String(witness)); changed.intent.command.continuityKey = text;
+      assertCorpusInvalid(() => parseSealedInputs(altered(event => { event.lifecycleIntentJson = canonicalJson(changed); })));
+    }
+    assertCorpusInvalid(() => parseSealedInputs(altered(event => { event.extra = { lifecycleIntentJson: witness }; })));
+    assertCorpusInvalid(() => parseSealedInputs(altered(event => { event.summary = witness; })));
+    const accessor = structuredClone(sources);
+    let reads = 0;
+    Object.defineProperty(accessor.sources[0]!.events[0]!, "lifecycleIntentJson", { enumerable: true, get() { reads++; return witness; } });
+    assertCorpusInvalid(() => parseSealedRetrievalEvaluationBundle(sealed.manifest, accessor, judgments, baseline));
+    assert.equal(reads, 0);
+  });
+});
 
 function assertCorpusInvalid(action: () => unknown): void {
   assert.throws(action, (error: unknown) => (

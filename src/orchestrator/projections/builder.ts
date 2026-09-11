@@ -833,6 +833,16 @@ export function verifyLegacyProjectionConnection(
   metadata: Pick<ProjectionManifestV1, "generation" | "createdAt">,
   expectedChecksums?: ProjectionManifestV1["coreChecksums"],
 ): ProjectionManifestV1["coreChecksums"] {
+  return readVerifiedLegacyProjectionConnection(connection, snapshot, metadata, expectedChecksums).coreChecksums;
+}
+
+/** The rows and checksums come from the same detached image verified here. */
+export function readVerifiedLegacyProjectionConnection(
+  connection: SqliteConnection,
+  snapshot: ProjectionEventSnapshot,
+  metadata: Pick<ProjectionManifestV1, "generation" | "createdAt">,
+  expectedChecksums?: ProjectionManifestV1["coreChecksums"],
+): Readonly<{ rows: LegacyProjectionRows; coreChecksums: ProjectionManifestV1["coreChecksums"] }> {
   const rows = legacyRowsFromState(foldLegacy(snapshot));
   verifyLegacyStructure(connection, snapshot, metadata.generation, rows);
   if (connection.prepare("SELECT created_at FROM projection_metadata WHERE singleton=1").get()?.created_at !== metadata.createdAt) return failure("PROJECTION_STRUCTURE_INVALID");
@@ -841,7 +851,8 @@ export function verifyLegacyProjectionConnection(
     checksums[name] = projectionCoreChecksum(name, 1, snapshot.binding.projectId, snapshot.terminalEventPosition, rows[name]);
     if (expectedChecksums && checksums[name] !== expectedChecksums[name]) return failure("PROJECTION_CHECKSUM_INVALID");
   }
-  return verifyLegacyPersistedChecksums(connection, snapshot, Object.freeze(checksums));
+  const coreChecksums = verifyLegacyPersistedChecksums(connection, snapshot, Object.freeze(checksums));
+  return Object.freeze({ rows: persistedLegacyRows(connection), coreChecksums });
 }
 
 export class ImmutableProjectionBuilder {

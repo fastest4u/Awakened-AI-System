@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { canonicalJson } from "../serialization/canonical-json.js";
+import { decodeExpectedDifferenceRuleV1 } from "../parity/v2-expected-difference.js";
 import { ShadowMigrationError, SHADOW_MIGRATION_PHASES, type ShadowMigrationPhase } from "../migration/v2-shadow-migration.contracts.js";
 import type { ProjectionName } from "../projections/checksum.js";
 import type { SqliteConnection, SqliteParams, SqliteRow } from "./sqlite-driver.js";
@@ -104,7 +105,21 @@ function decodeReceiptInput(v: ImportedRecordReceipt): ImportedRecordReceipt { r
 function receiptParams(v: ImportedRecordReceipt): SqliteParams { return {$project_id:v.projectId,$migration_identity:v.migrationIdentity,$source_ordinal:BigInt(v.sourceOrdinal),$source_kind:v.sourceKind,$source_record_hash:v.sourceRecordHash,$imported_event_id:v.importedEventId,$imported_global_position:v.importedGlobalPosition,$imported_event_hash:v.importedEventHash,$recorded_at:v.recordedAt}; }
 
 const ruleKeys=["project_id","migration_identity","rule_id","policy_version","category","projection_name","selector_json","predicate_json","rationale_digest","approver_fingerprint","approval_reference_digest","issued_at","expires_at","rollout_revision_id","rule_checksum"] as const;
-function decodeRule(input: SqliteRow): StoredExpectedDifferenceRule { const v=row(input,ruleKeys); const category=string(v.category); if(category!=="semantic-value"&&category!=="representation") integrity(); const selector=json(v.selector_json) as StoredExpectedDifferenceRule["selector"]; const predicate=json(v.predicate_json) as StoredExpectedDifferenceRule["predicate"]; const checksumValue=hash(v.rule_checksum); if(checksum({selector,predicate})!==checksumValue) integrity(); return Object.freeze({projectId:uuid(v.project_id),migrationIdentity:hash(v.migration_identity),ruleId:bounded(v.rule_id,256),policyVersion:integer(v.policy_version,1),category,projectionName:string(v.projection_name) as ProjectionName,selector,predicate,rationaleDigest:hash(v.rationale_digest),approverFingerprint:hash(v.approver_fingerprint),approvalReferenceDigest:hash(v.approval_reference_digest),issuedAt:timestamp(v.issued_at),expiresAt:timestamp(v.expires_at),rolloutRevisionId:uuid(v.rollout_revision_id),ruleChecksum:checksumValue}); }
+function decodeRule(input: SqliteRow): StoredExpectedDifferenceRule {
+  const v = row(input, ruleKeys);
+  const selector = row(json(v.selector_json) as SqliteRow, ["rowIdentityHash", "fieldPath"]);
+  try {
+    const rule = decodeExpectedDifferenceRuleV1({ schemaVersion: 1, migrationIdentity: v.migration_identity,
+      ruleId: v.rule_id, policyVersion: integer(v.policy_version, 1), category: v.category, projection: v.projection_name,
+      rowIdentityHash: selector.rowIdentityHash, fieldPath: selector.fieldPath, predicate: json(v.predicate_json),
+      rationaleDigest: v.rationale_digest, approverFingerprint: v.approver_fingerprint,
+      approvalReferenceDigest: v.approval_reference_digest, issuedAt: v.issued_at, expiresAt: v.expires_at,
+      rolloutRevisionId: v.rollout_revision_id, ruleChecksum: v.rule_checksum });
+    const { schemaVersion: _, projection, rowIdentityHash, fieldPath, ...governance } = rule;
+    return Object.freeze({ projectId: uuid(v.project_id), ...governance, projectionName: projection,
+      selector: Object.freeze({ rowIdentityHash, fieldPath }) });
+  } catch { return integrity(); }
+}
 function decodeRuleInput(v: StoredExpectedDifferenceRule): StoredExpectedDifferenceRule { return decodeRule({project_id:v.projectId,migration_identity:v.migrationIdentity,rule_id:v.ruleId,policy_version:BigInt(v.policyVersion),category:v.category,projection_name:v.projectionName,selector_json:canonicalJson(v.selector),predicate_json:canonicalJson(v.predicate),rationale_digest:v.rationaleDigest,approver_fingerprint:v.approverFingerprint,approval_reference_digest:v.approvalReferenceDigest,issued_at:v.issuedAt,expires_at:v.expiresAt,rollout_revision_id:v.rolloutRevisionId,rule_checksum:v.ruleChecksum}); }
 function ruleParams(v: StoredExpectedDifferenceRule): SqliteParams { return {$project_id:v.projectId,$migration_identity:v.migrationIdentity,$rule_id:v.ruleId,$policy_version:BigInt(v.policyVersion),$category:v.category,$projection_name:v.projectionName,$selector_json:canonicalJson(v.selector),$predicate_json:canonicalJson(v.predicate),$rationale_digest:v.rationaleDigest,$approver_fingerprint:v.approverFingerprint,$approval_reference_digest:v.approvalReferenceDigest,$issued_at:v.issuedAt,$expires_at:v.expiresAt,$rollout_revision_id:v.rolloutRevisionId,$rule_checksum:v.ruleChecksum}; }
 

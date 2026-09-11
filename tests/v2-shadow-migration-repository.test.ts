@@ -7,6 +7,7 @@ import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, it } from "node:test";
 import { ShadowMigrationError, type ShadowMigrationPhase } from "../src/orchestrator/migration/v2-shadow-migration.contracts.js";
 import { canonicalJson } from "../src/orchestrator/serialization/canonical-json.js";
+import { expectedDifferenceRuleChecksum } from "../src/orchestrator/parity/v2-expected-difference.js";
 import { v2ShadowMigration } from "../src/orchestrator/storage/migrations/0007-v2-shadow-migration.js";
 import { NodeSqliteDriver } from "../src/orchestrator/storage/node-sqlite-driver.js";
 import {
@@ -102,8 +103,31 @@ function rule(): StoredExpectedDifferenceRule {
     category: "semantic-value", projectionName: "canonicalItems", selector, predicate, rationaleDigest: "8".repeat(64),
     approverFingerprint: "9".repeat(64), approvalReferenceDigest: "a".repeat(64), issuedAt: NOW,
     expiresAt: "2026-09-12T00:00:00.000Z", rolloutRevisionId: REVISION_ID,
-    ruleChecksum: hash({ selector, predicate }) });
+    ruleChecksum: expectedDifferenceRuleChecksum({ schemaVersion: 1, migrationIdentity: MIGRATION_IDENTITY, ruleId: "rule-1", policyVersion: 1,
+      category: "semantic-value", projection: "canonicalItems", ...selector, predicate, rationaleDigest: "8".repeat(64),
+      approverFingerprint: "9".repeat(64), approvalReferenceDigest: "a".repeat(64), issuedAt: NOW,
+      expiresAt: "2026-09-12T00:00:00.000Z", rolloutRevisionId: REVISION_ID }) });
 }
+
+describe("complete expected-difference governance", () => {
+  it("round trips the public checksum and rejects altered governance before writes", () => {
+    const f = fixture();
+    f.repository.transact(PROJECT_ID, MIGRATION_IDENTITY, tx => tx.insertRun(run()));
+    for (const changed of [ { rationaleDigest: "b".repeat(64) }, { approverFingerprint: "c".repeat(64) },
+      { approvalReferenceDigest: "d".repeat(64) }, { issuedAt: "2026-09-10T00:00:00.000Z" },
+      { expiresAt: "2026-09-13T00:00:00.000Z" }, { policyVersion: 2 },
+      { rolloutRevisionId: "66666666-6666-4666-8666-666666666666" },
+      { ruleChecksum: hash({ selector: rule().selector, predicate: rule().predicate }) } ]) {
+      assert.throws(() => f.repository.transact(PROJECT_ID, MIGRATION_IDENTITY, tx => tx.insertExpectedDifferenceRules([{ ...rule(), ...changed }])),
+        (error: unknown) => error instanceof ShadowMigrationError && error.code === "MIGRATION_LEDGER_INTEGRITY_FAILURE");
+    }
+    f.repository.transact(PROJECT_ID, MIGRATION_IDENTITY, tx => {
+      assert.equal(tx.readExpectedDifferenceRules().length, 0);
+      tx.insertExpectedDifferenceRules([rule()]);
+      assert.deepEqual(tx.readExpectedDifferenceRules(), [rule()]);
+    });
+  });
+});
 
 function report(): StoredParityReport {
   const value = Object.freeze({ schemaVersion: 1, findings: [] });
