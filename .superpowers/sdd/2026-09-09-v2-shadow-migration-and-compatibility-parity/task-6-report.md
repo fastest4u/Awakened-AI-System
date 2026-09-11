@@ -66,3 +66,22 @@ Task 6 requires each batch time to be `manifest.createdAt + batchOrdinal millise
 - `node --test --test-concurrency=1 --test-reporter=spec dist-test/tests/v2-migration-package.test.js dist-test/tests/v2-shadow-importer.test.js dist-test/tests/event-store.test.js dist-test/tests/event-append-transaction.test.js` — 98 tests, 98 passed, 0 failed.
 - `npm run typecheck` — exited 0.
 - `git diff --check` — exited 0; only line-ending notices were emitted. The controller-owned tracked implementation-plan change remained untouched and is excluded from this Task 6 commit.
+
+## Fix round 3
+
+- Replaced caller-derived hash-bearing wrapper context with a dedicated immutable internal migration context. It retains the manifest-verified project/vault/store/workspace binding, uses least-authority `untrusted`, uses `v2-shadow-importer:<migrationIdentity>` as the client identity, and is always non-Git/branch-neutral.
+- Caller context is not mutated. Existing manifest binding checks remain before internal context construction, while embedded authenticated source-event principal and branch provenance remain byte-exact.
+- The three-target regression now varies caller actor roles, client instance IDs, Git/non-Git workspace shape, branch metadata, and supplied branch scope, then compares complete stored authenticated event chains and import results.
+- Replay and commit-before-receipt recovery retry under a different maintenance/Git caller, proving the same deterministic command is reused without caller metadata entering authenticated migration evidence.
+
+### RED evidence
+
+- `npm run test:build` — exited 0 with test-only changes.
+- `node --test --test-concurrency=1 --test-reporter=spec --test-name-pattern="commits exact|produces identical" dist-test/tests/v2-shadow-importer.test.js` — exited 1; 2 tests, 0 passed, 2 failed. Stored wrapper role was caller `primary` rather than `untrusted`, and a maintenance/Git caller changed the terminal event hash and `importedEventsChecksum` for the same sealed package.
+
+### GREEN evidence
+
+- `npm run test:build` — exited 0.
+- `node --test --test-concurrency=1 --test-reporter=spec --test-name-pattern="commits exact|produces identical|reconciles commit-before-receipt" dist-test/tests/v2-shadow-importer.test.js` — 3 tests, 3 passed, 0 failed.
+- `node --test --test-concurrency=1 --test-reporter=spec dist-test/tests/v2-shadow-importer.test.js dist-test/tests/event-store.test.js dist-test/tests/event-append-transaction.test.js` — 76 tests, 76 passed, 0 failed.
+- `npm run typecheck` — exited 0.

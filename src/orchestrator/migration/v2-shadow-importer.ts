@@ -31,6 +31,7 @@ export class V2ShadowImporter {
     const manifest = sealedPackage.manifest;
     const identity = sealedPackage.migrationIdentity;
     if (context.binding.projectId !== manifest.projectId || context.binding.vaultId !== manifest.vaultId || context.binding.storeId !== manifest.storeId || context.binding.workspaceId !== manifest.workspaceId) sourceInvalid();
+    const migrationContext = internalMigrationContext(context, identity, manifest.createdAt);
     sealedPackage.assertUnchanged();
     const prior = this.dependencies.repository.transact(manifest.projectId, identity, (tx) => {
       const run = tx.readRun();
@@ -40,13 +41,13 @@ export class V2ShadowImporter {
     if (prior.length > manifest.recordDescriptors.length) conflict();
     const priorByOrdinal = new Map(prior.map((receipt) => [receipt.sourceOrdinal, receipt]));
     let replayed = true;
-    streamBatches(sealedPackage, this.dependencies.policy, context, (batch, batchOrdinal) => {
+    streamBatches(sealedPackage, this.dependencies.policy, migrationContext, (batch, batchOrdinal) => {
       const receipts = batch.map((record) => priorByOrdinal.get(record.ordinal)).filter((receipt): receipt is ImportedRecordReceipt => receipt !== undefined);
       if (receipts.length !== 0 && receipts.length !== batch.length) conflict();
       if (receipts.length === batch.length) {
-        const planned = planCommand(context, sealedPackage, batch, batchOrdinal);
-        for (const [index, receipt] of receipts.entries()) assertReceipt(this.dependencies.connection, receipt, batch[index]!, planned.recordedAt, context.binding.projectId);
-      } else { replayed = false; this.appendBatch(context, sealedPackage, batch, batchOrdinal); }
+        const planned = planCommand(migrationContext, sealedPackage, batch, batchOrdinal);
+        for (const [index, receipt] of receipts.entries()) assertReceipt(this.dependencies.connection, receipt, batch[index]!, planned.recordedAt, migrationContext.binding.projectId);
+      } else { replayed = false; this.appendBatch(migrationContext, sealedPackage, batch, batchOrdinal); }
     });
     const receipts = this.dependencies.repository.transact(manifest.projectId, identity, (tx) => tx.readImportedRecords());
     if (receipts.length !== manifest.recordDescriptors.length) conflict();
@@ -81,6 +82,36 @@ export class V2ShadowImporter {
     }
   }
 
+}
+
+function internalMigrationContext(
+  caller: ProjectContext,
+  migrationIdentity: string,
+  createdAt: string,
+): ProjectContext {
+  const root = `v2-shadow-import/${migrationIdentity}`;
+  const workspace = Object.freeze({ kind: "non-git" as const, workspaceRoot: root, workspaceId: caller.binding.workspaceId });
+  const binding = Object.freeze({
+    projectBindingId: `v2-shadow-import:${migrationIdentity}`,
+    generation: 1,
+    contextFingerprint: `v2-shadow-import:${migrationIdentity}`,
+    source: "explicit-cli" as const,
+    projectId: caller.binding.projectId,
+    vaultId: caller.binding.vaultId,
+    storeId: caller.binding.storeId,
+    workspaceId: caller.binding.workspaceId,
+    clientNamespace: "v2-shadow-importer",
+    clientInstanceId: `v2-shadow-importer:${migrationIdentity}`,
+    actorRole: "untrusted" as const,
+    projectRoot: root,
+    vaultRoot: `${root}/vault`,
+    descriptorPath: `${root}/vault/.project-memory.json`,
+    storeRoute: Object.freeze({ kind: "vault-local" as const, storeRoot: root, eventsPath: `${root}/events.sqlite`,
+      storeManifestPath: `${root}/store.json`, projectionManifestPath: `${root}/projection.json` }),
+    workspace,
+    establishedAt: createdAt,
+  });
+  return Object.freeze({ binding, workspace, checkedAt: createdAt });
 }
 
 function planRecord(record: V2MigrationPackageRecordV1, identity: string, index: number): PlannedRecord {

@@ -85,10 +85,28 @@ function canonicalCommandBytes(f: Awaited<ReturnType<typeof fixture>>): number {
     idempotencyKey: field(first, "idempotency_key"), publicResponse: response };
   return Buffer.byteLength(canonicalJson(material), "utf8");
 }
-function siblingTarget(f: Awaited<ReturnType<typeof fixture>>, name: string) {
+function variedCallerContext(
+  base: ProjectContext,
+  root: string,
+  name: string,
+  options: Readonly<{ actorRole: ProjectContext["binding"]["actorRole"]; clientInstanceId: string; git: boolean }>,
+): ProjectContext {
+  const workspace = options.git ? { kind: "git" as const, worktreeRoot: `${root}/${name}-worktree`,
+    gitDir: `${root}/${name}-git`, gitCommonDir: `${root}/${name}-common`, headCommit: "b".repeat(40),
+    branchRef: `refs/heads/${name}`, detached: false, workspaceId: base.binding.workspaceId }
+    : { kind: "non-git" as const, workspaceRoot: `${root}/${name}-non-git`, workspaceId: base.binding.workspaceId };
+  return { ...base, workspace, branchScopeId: randomUUID(), binding: { ...base.binding,
+    actorRole: options.actorRole, clientInstanceId: options.clientInstanceId, workspace } } as ProjectContext;
+}
+function siblingTarget(
+  f: Awaited<ReturnType<typeof fixture>>,
+  name: string,
+  options: Readonly<{ actorRole: ProjectContext["binding"]["actorRole"]; clientInstanceId: string; git: boolean }>,
+) {
   const path = `${f.sourceFixture.root}/${name}.sqlite`; const connection = driver.open(path, { mode: "create", busyTimeoutMs: 5000 });
   applyCurrentProjectStoreSchema(connection, f.sourceFixture.projectionBinding, NOW); connection.exec(v2ShadowMigration.sql);
-  const context = { ...f.context, binding: { ...f.context.binding, storeRoute: { ...f.context.binding.storeRoute, eventsPath: path } } } as ProjectContext;
+  const context = variedCallerContext({ ...f.context, binding: { ...f.context.binding,
+    storeRoute: { ...f.context.binding.storeRoute, eventsPath: path } } } as ProjectContext, f.sourceFixture.root, name, options);
   const revisionId = randomUUID(); connection.prepare("INSERT INTO rollout_revisions(project_id,revision_id,parent_revision_id,build_identity_hash,migration_identity_hash,configuration_checksum,v1_baseline_checksum,cohort_algorithm_version,cohort_salt,cohort_basis_points,created_at) VALUES ($p,$r,NULL,$h,$h,$h,$h,1,$h,0,$n)").run({ $p: context.binding.projectId, $r: revisionId, $h: "a".repeat(64), $n: NOW });
   const repository = new SqliteV2ShadowMigrationRepository(connection); repository.transact(context.binding.projectId, f.sealedPackage.migrationIdentity, tx => tx.insertRun({
     projectId: context.binding.projectId, migrationIdentity: f.sealedPackage.migrationIdentity, rolloutRevisionId: revisionId,
@@ -141,37 +159,48 @@ test("uses manifest creation time plus batch ordinal for every package shape and
 test("commits exact wrapper payloads and metadata and replays as a no-op", async t => {
   const f = await fixture(t);
   try {
+    const originalCaller = structuredClone(f.context);
     const first = f.importer.import({ context: f.context, sealedPackage: f.sealedPackage });
-    assert.deepEqual(f.importer.import({ context: f.context, sealedPackage: f.sealedPackage }), { ...first, deduplicated: true });
+    const replayContext = variedCallerContext(f.context, f.sourceFixture.root, "replay", {
+      actorRole: "maintenance", clientInstanceId: randomUUID(), git: true });
+    const originalReplayCaller = structuredClone(replayContext);
+    assert.deepEqual(f.importer.import({ context: replayContext, sealedPackage: f.sealedPackage }), { ...first, deduplicated: true });
+    assert.deepEqual(f.context, originalCaller); assert.deepEqual(replayContext, originalReplayCaller);
     const events = storedEvents(f.connection); assert.deepEqual(events.map(event => event.eventId), first.eventIds);
     for (const [ordinal, event] of events.entries()) {
       const descriptor = f.sealedPackage.manifest.recordDescriptors[ordinal]!; const payload = event.payload as Record<string, unknown>;
       assert.equal(event.streamId, `v2-shadow-import/${f.sealedPackage.migrationIdentity}`); assert.equal(event.streamType, "migration");
+      assert.equal(event.actorRole, "untrusted"); assert.equal(event.clientInstanceId, `v2-shadow-importer:${f.sealedPackage.migrationIdentity}`);
+      assert.equal(event.branchScopeId, null); assert.equal(event.branchRef, null);
       assert.equal(event.visibilityScope, "project"); assert.equal(event.confidence, "high"); assert.equal(event.verificationStatus, "verified");
       assert.deepEqual(event.sourceRefs, [`migration:${f.sealedPackage.migrationIdentity}:${ordinal}`]); assert.deepEqual(event.evidenceRefs, []); assert.deepEqual(event.evidenceDigests, []);
       assert.equal(payload.schemaVersion, 1); assert.equal(payload.migrationIdentity, f.sealedPackage.migrationIdentity); assert.equal(payload.sourceOrdinal, ordinal); assert.equal(payload.sourceRecordHash, descriptor.contentSha256);
       if (descriptor.kind === "source-event") { assert.equal(event.eventType, "V1ProjectionSourceImported");
         assert.deepEqual(Object.keys(payload).sort(), ["migrationIdentity","schemaVersion","sourceEvent","sourceOrdinal","sourceRecordHash"].sort());
-        assert.equal(Object.hasOwn(payload.sourceEvent as object, "payload"), false); assert.equal(Object.hasOwn(payload.sourceEvent as object, "payloadJson"), true);
+        const sourceEvent = payload.sourceEvent as Record<string, unknown>; const original = f.sourceFixture.sourceEvents[ordinal]!;
+        assert.equal(Object.hasOwn(sourceEvent, "payload"), false); assert.equal(Object.hasOwn(sourceEvent, "payloadJson"), true);
+        assert.equal(sourceEvent.actorRole, original.actorRole); assert.equal(sourceEvent.clientInstanceId, original.clientInstanceId);
+        assert.equal(sourceEvent.branchScopeId, original.branchScopeId); assert.equal(sourceEvent.branchRef, original.branchRef);
       } else { assert.equal(event.eventType, "V1LegacyArtifactImported");
         assert.deepEqual(Object.keys(payload).sort(), ["contentSha256","contentUtf8","migrationIdentity","relativePath","schemaVersion","sourceOrdinal","sourceRecordHash"].sort()); }
     }
   } finally { f.close(); }
 });
 test("produces identical authenticated event chains and results in three isolated stores", async t => {
-  const first = await fixture(t); const second = siblingTarget(first, "determinism-b"); const third = siblingTarget(first, "determinism-c");
+  // Feeding caller principal or checkout metadata into wrapper events changes authenticated migration evidence across targets.
+  const first = await fixture(t);
+  const second = siblingTarget(first, "determinism-b", { actorRole: "maintenance", clientInstanceId: randomUUID(), git: true });
+  const third = siblingTarget(first, "determinism-c", { actorRole: "untrusted", clientInstanceId: randomUUID(), git: false });
   try {
     const targets = [first, second, third]; const results = targets.map(target => target.importer.import({ context: target.context, sealedPackage: first.sealedPackage }));
     assert.deepEqual(results[1], results[0]); assert.deepEqual(results[2], results[0]);
     const chains = targets.map(target => storedEvents(target.connection));
-    const signature = (events: readonly StoredEvent[]) => events.map(event => ({ position: event.globalPosition, eventId: event.eventId,
-      payloadHash: event.payloadHash, previousGlobalHash: event.previousGlobalHash, eventHash: event.eventHash }));
-    assert.deepEqual(signature(chains[1]!), signature(chains[0]!)); assert.deepEqual(signature(chains[2]!), signature(chains[0]!));
+    assert.deepEqual(chains[1], chains[0]); assert.deepEqual(chains[2], chains[0]);
     for (const events of chains) { let cursor = { expectedPosition: 1n, previousEventHash: GENESIS_GLOBAL_HASH };
       for (const event of events) cursor = authenticateStoredEvent(event, cursor).nextCursor; }
   } finally { third.close(); second.close(); first.close(); }
 });
-test("reconciles commit-before-receipt unknown outcome with the original command and no duplicate", async t => { let failed=false; const faults: EventStoreFaultInjector={hit(boundary){if(!failed&&boundary==="after-commit-before-response"){failed=true;throw Error("lost")}}}; const f=await fixture(t,faults); try { assert.throws(()=>f.importer.import({context:f.context,sealedPackage:f.sealedPackage}),unknown); const recovered=f.importer.import({context:f.context,sealedPackage:f.sealedPackage}); assert.equal(Number(f.connection.prepare("SELECT count(*) AS count FROM events").get()?.count),recovered.recordCount); assert.equal(new Set(recovered.eventIds).size,recovered.eventIds.length); } finally { f.close(); } });
+test("reconciles commit-before-receipt unknown outcome with the original command and no duplicate", async t => { let failed=false; const faults: EventStoreFaultInjector={hit(boundary){if(!failed&&boundary==="after-commit-before-response"){failed=true;throw Error("lost")}}}; const f=await fixture(t,faults); try { assert.throws(()=>f.importer.import({context:f.context,sealedPackage:f.sealedPackage}),unknown); const retryContext=variedCallerContext(f.context,f.sourceFixture.root,"unknown-retry",{actorRole:"maintenance",clientInstanceId:randomUUID(),git:true}); const recovered=f.importer.import({context:retryContext,sealedPackage:f.sealedPackage}); assert.equal(Number(f.connection.prepare("SELECT count(*) AS count FROM events").get()?.count),recovered.recordCount); assert.equal(new Set(recovered.eventIds).size,recovered.eventIds.length); } finally { f.close(); } });
 test("fails the same migration/package identity with changed bytes before writing", async t => { const f=await fixture(t); try {
   appendFileSync(join(f.sealedPackage.rootPath, "events.ndjson"), " ");
   assert.throws(()=>f.importer.import({context:f.context,sealedPackage:f.sealedPackage}),e=>e instanceof ShadowMigrationError&&e.code==="MIGRATION_IDENTITY_CONFLICT");
