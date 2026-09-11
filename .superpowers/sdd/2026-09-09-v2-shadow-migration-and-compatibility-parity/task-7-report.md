@@ -65,3 +65,40 @@ Project memory lifecycle used the correct vault `C:/Users/Server/Desktop/Awakene
 - Reader resource bounds above are deliberately fail-closed; importing a package is not a promise that a larger target chain can be replayed within these bounds.
 - Schema 7 remains unregistered until Task 13; tests explicitly apply its SQL after the current schema.
 - Tasks 8–14 and independent review remain controller-owned follow-up work. No public V2 activation is authorized.
+
+## Fix round 1 — capacity and operational classification
+
+Review baseline: `f314c58e86040c332846e65fd7b094896ea0f69f`. Read the complete Task 7 review and verified both Important findings against the implementation and production error helpers. This section supersedes the initial report's blanket ledger-integrity error description. Fix scope is reader, reader tests, and this report only; the controller's concurrent unstaged implementation-plan edit is intentionally excluded.
+
+Capacity checks now throw `MIGRATION_LIMIT_EXCEEDED` separately from structural/chain/receipt integrity checks. This covers source manifest count/aggregate bytes, target replay count/aggregate/per-row bytes, reconstructed source row size, and reconstructed source snapshot aggregate bytes. Existing numeric ceilings remain unchanged. Typed limit failures survive open, deferred iteration, and explicit-close catch boundaries.
+
+The normalized failure contract approved for Task 11 is:
+
+| Input classification | Returned safe form |
+| --- | --- |
+| `ShadowMigrationError` with one of the 12 explicitly allowlisted current `ShadowMigrationErrorCode` values | Fresh `ShadowMigrationError(code, Object.freeze({}))`; `message === code`, empty frozen `safeDetails`, no original cause or stack |
+| Native primary SQLite busy recognized by production `isPrimarySqliteBusy` (including extended codes whose primary result is busy), or already-typed `EventStoreError` with code `SQLITE_BUSY` | Fresh `EventStoreError("SQLITE_BUSY", Object.freeze({ retryable: true }))`; `message === "SQLITE_BUSY"`, no original cause/details/stack |
+| Any other failure, including unknown typed codes, message-only busy, untyped code-only busy, native locked/I/O, or error metadata that throws during classification | Fresh redacted `ShadowMigrationError("MIGRATION_LEDGER_INTEGRITY_FAILURE", Object.freeze({}))` |
+
+The migration-code allowlist is explicit, not a prefix check. Existing migration classifications retain only their code; this reader adds no retryability to them. Task 11 should recognize the safe `EventStoreError` busy form above and retain its own outcome/reconciliation policy for other migration codes. No new transient category, retry loop, public API route, dependency, or activation was added.
+
+Cleanup runs before normalization. Open/iteration failures preserve their original classification even when rollback and close also fail. Explicit close attempts both operations exactly once and preserves the first cleanup failure; repeated close remains a no-op. Error-code metadata is captured once before allowlist validation and error reconstruction, so an accessor cannot swap in an unvalidated second value. Classification exceptions fall back to the safe ledger error after resources have already been released.
+
+Regression evidence:
+
+- Initial build passed. Focused `node --test --test-concurrency=1 --test-reporter=spec --test-name-pattern='capacity:|classification:' dist-test/tests/v2-imported-event-reader.test.js` established RED: 19/62 passed, 43 failed on expected lost capacity/migration/busy classifications. Exact target count/byte ceilings already passed; +1 exposed the incorrect error code.
+- After the primary correction, all original 62 tests passed. An additional accessor-code regression established a second RED: 62/65 passed, with both new open/lazy cases exposing the unvalidated second code read. Capturing the code once fixed this, as verified by the final gate.
+- Target boundary probes cover exact/+1 values for 100,000 rows, 64 MiB aggregate stored-row bytes, and 1 MiB per-row bytes. They override only aggregate metadata returned at the SQLite driver seam; underlying committed rows, receipts, and cryptographic authentication are real. Exact values reach successful reconstruction, while +1 rejects before event iteration and closes once.
+- Source manifest count/aggregate boundary probes use explicitly substituted matching manifest metadata to isolate the capacity predicate. Exact values reach an injected downstream open marker; +1 rejects before opening SQLite. These are predicate-isolation tests, not claims of physically importing 100,000 events or 64 MiB.
+- Open/lazy probes cover every allowlisted migration code, native primary/extended busy, typed busy, unknown/locked/I/O/non-typed failures, throwing classification metadata, simultaneous operation/rollback/close failures, and changing code accessors. Safe message/details/cause/stack properties and one-time rollback/close counts are asserted.
+
+Final commands and results:
+
+```powershell
+npm run test:build
+node --test --test-concurrency=1 --test-reporter=spec dist-test/tests/v2-imported-event-reader.test.js dist-test/tests/projection-source-event-codec.test.js dist-test/tests/stored-event-authenticator.test.js
+npm run typecheck
+git diff --check -- src/orchestrator/migration/v2-imported-event-reader.ts tests/v2-imported-event-reader.test.ts
+```
+
+Build exit 0; exact required three-file gate **148/148 passed** (124 reader, 20 codec, 4 authenticator), zero failures/skips; typecheck exit 0; scoped diff whitespace check exit 0. Inspected the complete reader/test diff. No unrelated full-suite rerun or shared-fixture edit occurred in this fix round. The controller-owned plan remains unstaged and untouched. Project memory startup/context/self-check used the correct vault; an insight records safe classification/redaction and single-read error metadata. Session closure follows the scoped commit with verification enabled. The TDD, systematic debugging, code-review reception, and verification skills guided this fix round.

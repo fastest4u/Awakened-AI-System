@@ -5,11 +5,12 @@ import type { ProjectBinding } from "../projections/contracts.js";
 import { MAX_PROJECTION_SOURCE_BYTES, MAX_PROJECTION_SOURCE_EVENTS, type ProjectionEventReader, type ProjectionEventSnapshot } from "../projections/event-reader.js";
 import { decodeProjectionEvent } from "../projections/source-event-codec.js";
 import { canonicalJson } from "../serialization/canonical-json.js";
-import { GENESIS_GLOBAL_HASH } from "../storage/event-store.js";
+import { EventStoreError, GENESIS_GLOBAL_HASH } from "../storage/event-store.js";
+import { isPrimarySqliteBusy } from "../storage/event-append-transaction.js";
 import type { SqliteConnection, SqliteDriver, SqliteRow } from "../storage/sqlite-driver.js";
 import { decodeV1SourceCopyManifestV1, type V1SourceCopyManifestV1 } from "./v1-source-copy.js";
 import type { SealedV2MigrationPackage, V2MigrationRecordDescriptorV1 } from "./v2-migration-package.js";
-import { deterministicMigrationUuid, ShadowMigrationError } from "./v2-shadow-migration.contracts.js";
+import { deterministicMigrationUuid, ShadowMigrationError, type ShadowMigrationErrorCode } from "./v2-shadow-migration.contracts.js";
 
 export interface V2ImportedProjectionEventReaderOptions {
   readonly driver: SqliteDriver;
@@ -35,9 +36,27 @@ const column = (field: string): string => field.replace(/[A-Z]/g, character => `
   + (JSON_FIELDS.has(field) ? "_json" : "");
 const COLUMNS = SOURCE_FIELDS.map(column);
 const ROW_BYTES = COLUMNS.map(name => `CASE WHEN ${name} IS NULL THEN 8 WHEN typeof(${name}) IN ('text','blob') THEN length(CAST(${name} AS BLOB)) ELSE 8 END`).join(" + ");
+const SAFE_MIGRATION_CODES: ReadonlySet<ShadowMigrationErrorCode> = new Set([
+  "MIGRATION_POLICY_INVALID", "MIGRATION_SOURCE_INVALID", "MIGRATION_SOURCE_MUTATED", "MIGRATION_LIMIT_EXCEEDED",
+  "MIGRATION_IDENTITY_CONFLICT", "MIGRATION_LEDGER_INTEGRITY_FAILURE", "MIGRATION_OUTCOME_UNKNOWN", "MIGRATION_RETRY_EXHAUSTED",
+  "PROJECTION_INTEGRITY_FAILURE", "PARITY_RULE_INVALID", "PARITY_BLOCKING_DIVERGENCE", "COMPATIBILITY_INTEGRITY_FAILURE",
+]);
 
 function integrity(): never { throw new ShadowMigrationError("MIGRATION_LEDGER_INTEGRITY_FAILURE", Object.freeze({})); }
-function protect<T>(operation: () => T): T { try { return operation(); } catch { return integrity(); } }
+function limit(): never { throw new ShadowMigrationError("MIGRATION_LIMIT_EXCEEDED", Object.freeze({})); }
+/** Preserve only established classifications, never original messages, details, or causes. */
+function normalizedFailure(error: unknown): ShadowMigrationError | EventStoreError {
+  try {
+    if (error instanceof ShadowMigrationError) {
+      const code = error.code;
+      if (SAFE_MIGRATION_CODES.has(code)) return new ShadowMigrationError(code, Object.freeze({}));
+    } else if ((error instanceof EventStoreError && error.code === "SQLITE_BUSY") || isPrimarySqliteBusy(error)) {
+      return new EventStoreError("SQLITE_BUSY", Object.freeze({ retryable: true }));
+    }
+  } catch { /* Hostile or malformed error metadata is unclassified, and cannot escape redaction. */ }
+  return new ShadowMigrationError("MIGRATION_LEDGER_INTEGRITY_FAILURE", Object.freeze({}));
+}
+function protect<T>(operation: () => T): T { try { return operation(); } catch (error) { throw normalizedFailure(error); } }
 function exact(value: unknown, fields: readonly string[]): Record<string, unknown> {
   if (typeof value !== "object" || value === null || Array.isArray(value)) integrity();
   const keys = Object.keys(value);
@@ -102,7 +121,10 @@ export class V2ImportedProjectionEventReader implements ProjectionEventReader {
       if (closed) return;
       closed = true;
       if (connection === undefined) return;
-      try { connection.exec("ROLLBACK"); } finally { connection.close(); }
+      let failure: { readonly error: unknown } | undefined;
+      try { connection.exec("ROLLBACK"); } catch (error) { failure = { error }; }
+      try { connection.close(); } catch (error) { failure ??= { error }; }
+      if (failure !== undefined) throw failure.error;
     };
     try {
       const source = decodeV1SourceCopyManifestV1(options.sourceManifest);
@@ -113,8 +135,8 @@ export class V2ImportedProjectionEventReader implements ProjectionEventReader {
       if (source.manifestChecksum !== manifest.sourceManifestChecksum
         || ["projectId", "vaultId", "storeId", "workspaceId", "eventCount", "aggregateSourceBytes", "terminalEventPosition", "terminalEventHash", "createdAt"].some(
           key => source[key as keyof V1SourceCopyManifestV1] !== manifest[key as keyof typeof manifest])
-        || source.legacyArtifacts.length !== manifest.legacyArtifactCount
-        || manifest.eventCount > MAX_PROJECTION_SOURCE_EVENTS || manifest.aggregateSourceBytes > MAX_PROJECTION_SOURCE_BYTES) integrity();
+        || source.legacyArtifacts.length !== manifest.legacyArtifactCount) integrity();
+      if (manifest.eventCount > MAX_PROJECTION_SOURCE_EVENTS || manifest.aggregateSourceBytes > MAX_PROJECTION_SOURCE_BYTES) limit();
       const binding = Object.freeze(Object.fromEntries(BINDING_FIELDS.map(key => [key, key === "sessionId" ? null : source[key]]))) as unknown as ProjectBinding;
       exact(requested, BINDING_FIELDS);
       if (!sameBinding(requested, binding) || requested.sessionId !== null) integrity();
@@ -136,7 +158,9 @@ export class V2ImportedProjectionEventReader implements ProjectionEventReader {
       if (stream?.count !== ledger.count) integrity();
       const bounds = connection.prepare(`SELECT count(*) AS count, coalesce(sum(${ROW_BYTES}),0) AS bytes, coalesce(max(${ROW_BYTES}),0) AS maximum FROM events WHERE global_position <= $terminal`).get({ $terminal: terminal });
       if (bounds === undefined || typeof bounds.count !== "bigint" || typeof bounds.bytes !== "bigint" || typeof bounds.maximum !== "bigint"
-        || bounds.count > BigInt(MAX_PROJECTION_SOURCE_EVENTS) || bounds.bytes > BigInt(MAX_PROJECTION_SOURCE_BYTES) || bounds.maximum > BigInt(MAX_EVENT_BYTES)) integrity();
+        || bounds.count < 0n || bounds.bytes < 0n || bounds.maximum < 0n) integrity();
+      if (bounds.count > BigInt(MAX_PROJECTION_SOURCE_EVENTS) || bounds.bytes > BigInt(MAX_PROJECTION_SOURCE_BYTES)
+        || bounds.maximum > BigInt(MAX_EVENT_BYTES)) limit();
       const rows = connection.prepare(`SELECT ${COLUMNS.join(",")} FROM events WHERE global_position <= $terminal ORDER BY global_position`);
       const receiptAt = connection.prepare("SELECT * FROM v2_shadow_imported_records WHERE project_id=$p AND migration_identity=$m AND source_ordinal=$o");
       let aggregateBytes = 0;
@@ -188,15 +212,16 @@ export class V2ImportedProjectionEventReader implements ProjectionEventReader {
           sourceCursor = authenticated.nextCursor;
           packageBytes += authenticated.byteLength;
           const bytes = sourceRowBytes(reconstructed);
-          if (bytes > MAX_EVENT_BYTES) integrity();
+          if (bytes > MAX_EVENT_BYTES) limit();
           aggregateBytes += bytes;
           eventCount += 1;
         } else packageBytes += descriptor.byteLength;
         ordinal += 1;
       }
       if (targetCursor.expectedPosition !== terminal + 1n || ordinal !== manifest.recordDescriptors.length
-        || eventCount !== manifest.eventCount || packageBytes !== manifest.aggregateSourceBytes || aggregateBytes > MAX_PROJECTION_SOURCE_BYTES
+        || eventCount !== manifest.eventCount || packageBytes !== manifest.aggregateSourceBytes
         || sourceCursor.expectedPosition !== decimal(manifest.terminalEventPosition, 0n) + 1n || sourceCursor.previousEventHash !== manifest.terminalEventHash) integrity();
+      if (aggregateBytes > MAX_PROJECTION_SOURCE_BYTES) limit();
       const requireOpen = (): void => { if (closed) integrity(); };
       return Object.freeze({ binding, eventCount, aggregateBytes, terminalEventPosition: decimal(manifest.terminalEventPosition, 0n),
         terminalEventHash: manifest.terminalEventHash,
@@ -220,14 +245,17 @@ export class V2ImportedProjectionEventReader implements ProjectionEventReader {
                 yield event;
               }
               requireOpen();
-            } catch { try { close(); } catch { /* preserve redacted integrity failure */ } integrity(); }
+            } catch (error) {
+              try { close(); } catch { /* Preserve the operation's failure after attempting all cleanup. */ }
+              throw normalizedFailure(error);
+            }
           })();
         },
         close(): void { protect(close); },
       });
-    } catch {
-      try { close(); } catch { /* preserve redacted integrity failure */ }
-      return integrity();
+    } catch (error) {
+      try { close(); } catch { /* Preserve the operation's failure after attempting all cleanup. */ }
+      throw normalizedFailure(error);
     }
   }
 }

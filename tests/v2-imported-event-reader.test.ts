@@ -7,11 +7,11 @@ import { verifyV1SourceCopy } from "../src/orchestrator/migration/v1-source-copy
 import { sealV2MigrationPackage } from "../src/orchestrator/migration/v2-migration-package.js";
 import { V2ImportedProjectionEventReader } from "../src/orchestrator/migration/v2-imported-event-reader.js";
 import { V2ShadowImporter } from "../src/orchestrator/migration/v2-shadow-importer.js";
-import { deterministicMigrationUuid, ShadowMigrationError, shadowMigrationPolicyChecksum } from "../src/orchestrator/migration/v2-shadow-migration.contracts.js";
+import { deterministicMigrationUuid, ShadowMigrationError, shadowMigrationPolicyChecksum, type ShadowMigrationErrorCode } from "../src/orchestrator/migration/v2-shadow-migration.contracts.js";
 import { canonicalJson } from "../src/orchestrator/serialization/canonical-json.js";
 import { BranchScopeRepository } from "../src/orchestrator/storage/branch-scope.repository.js";
-import { EventStore, SqliteEventStoreStatements } from "../src/orchestrator/storage/event-store.js";
-import type { SqliteDriver } from "../src/orchestrator/storage/sqlite-driver.js";
+import { EventStore, EventStoreError, SqliteEventStoreStatements } from "../src/orchestrator/storage/event-store.js";
+import type { SqliteDriver, SqliteRow } from "../src/orchestrator/storage/sqlite-driver.js";
 import { MaintenanceFence } from "../src/orchestrator/storage/maintenance-fence.js";
 import { v2ShadowMigration } from "../src/orchestrator/storage/migrations/0007-v2-shadow-migration.js";
 import { SqliteV2ShadowMigrationRepository } from "../src/orchestrator/storage/v2-shadow-migration.repository.js";
@@ -355,5 +355,162 @@ test("does not normalize malformed reference arrays from authenticated package r
   for (const field of ["sourceRefs", "evidenceRefs", "evidenceDigests"] as const) await t.test(field, async child => {
     const f = await importedPackageFixture(child, true, { corruptSource: event => ({ ...event, [field]: "" }) as unknown as StoredEvent });
     await assert.rejects(f.reader.openCommittedSnapshot(f.projectionBinding), integrity);
+  });
+});
+
+const MIGRATION_CODES: readonly ShadowMigrationErrorCode[] = ["MIGRATION_POLICY_INVALID", "MIGRATION_SOURCE_INVALID",
+  "MIGRATION_SOURCE_MUTATED", "MIGRATION_LIMIT_EXCEEDED", "MIGRATION_IDENTITY_CONFLICT", "MIGRATION_LEDGER_INTEGRITY_FAILURE",
+  "MIGRATION_OUTCOME_UNKNOWN", "MIGRATION_RETRY_EXHAUSTED", "PROJECTION_INTEGRITY_FAILURE", "PARITY_RULE_INVALID",
+  "PARITY_BLOCKING_DIVERGENCE", "COMPATIBILITY_INTEGRITY_FAILURE"];
+const PRIVATE_FAILURE = "PRIVATE_ERROR_MESSAGE_DETAILS_CAUSE";
+function safeMigration(code: ShadowMigrationErrorCode): (error: unknown) => boolean {
+  return error => {
+    assert.ok(error instanceof ShadowMigrationError);
+    assert.equal(error.code, code);
+    assert.equal(error.message, code);
+    assert.deepEqual(error.safeDetails, {});
+    assert.ok(Object.isFrozen(error.safeDetails));
+    assert.equal(error.cause, undefined);
+    assert.ok(!String(error.stack).includes(PRIVATE_FAILURE));
+    return true;
+  };
+}
+const safeBusy = (error: unknown): boolean => {
+  assert.ok(error instanceof EventStoreError);
+  assert.equal(error.code, "SQLITE_BUSY"); assert.equal(error.message, "SQLITE_BUSY");
+  assert.deepEqual(error.details, { retryable: true }); assert.ok(Object.isFrozen(error.details));
+  assert.equal(error.cause, undefined); assert.ok(!String(error.stack).includes(PRIVATE_FAILURE));
+  return true;
+};
+function readerProbe(f: Fixture, options: { stage?: "open" | "lazy"; error?: unknown;
+  rollbackError?: unknown; closeError?: unknown; bounds?: SqliteRow } = {}) {
+  let closes = 0; let rollbacks = 0; let eventIterations = 0; let boundReads = 0;
+  const driver: SqliteDriver = { open(path, openOptions) {
+    const connection = f.driver.open(path, openOptions);
+    return { exec(sql) {
+      if (sql === "ROLLBACK") { rollbacks++; if ("rollbackError" in options) throw options.rollbackError; }
+      connection.exec(sql);
+    }, close() {
+      closes++; connection.close(); if ("closeError" in options) throw options.closeError;
+    }, prepare(sql) {
+      if ((options.stage === "open" && sql.includes("FROM project_meta"))
+        || (options.stage === "lazy" && sql.includes("FROM events WHERE global_position=$position"))) throw options.error;
+      const statement = connection.prepare(sql);
+      return { run: params => statement.run(params), all: params => statement.all(params), iterate(params) {
+        if (sql.includes("FROM events")) eventIterations++;
+        return statement.iterate(params);
+      }, get(params) {
+        const result = statement.get(params);
+        if (sql.includes("AS maximum FROM events")) { boundReads++; return { ...result, ...options.bounds }; }
+        return result;
+      } };
+    } };
+  } };
+  return { reader: new V2ImportedProjectionEventReader({ ...f.options, driver }),
+    counts: () => ({ closes, rollbacks, eventIterations, boundReads }) };
+}
+
+test("capacity: exact target count and byte ceilings pass while +1 reports a limit", async t => {
+  const f = await importedPackageFixture(t);
+  // Inject only SQLite aggregate metadata; durable rows, receipts, and authentication stay real.
+  for (const [field, maximum] of [["count", 100_000n], ["bytes", 67_108_864n], ["maximum", 1_048_576n]] as const) {
+    for (const delta of [0n, 1n]) await t.test(`${field}+${delta}`, async () => {
+      const probe = readerProbe(f, { bounds: { [field]: maximum + delta } });
+      if (delta === 0n) {
+        const snapshot = await probe.reader.openCommittedSnapshot(f.projectionBinding);
+        assert.deepEqual([...snapshot.events()], f.sourceEvents); snapshot.close();
+      } else await assert.rejects(probe.reader.openCommittedSnapshot(f.projectionBinding), safeMigration("MIGRATION_LIMIT_EXCEEDED"));
+      assert.equal(probe.counts().boundReads, 1);
+      assert.equal(probe.counts().eventIterations, delta === 0n ? 1 : 0);
+      assert.equal(probe.counts().closes, 1); assert.equal(probe.counts().rollbacks, 1);
+    });
+  }
+});
+
+test("capacity: source manifest count and byte ceilings preserve limit classification", async t => {
+  const f = await importedPackageFixture(t);
+  for (const [field, maximum] of [["eventCount", 100_000], ["aggregateSourceBytes", 67_108_864]] as const) {
+    for (const delta of [0, 1]) await t.test(`${field}+${delta}`, async () => {
+      const sourceManifest = sealManifest({ ...f.source.manifest, [field]: maximum + delta });
+      let opens = 0;
+      const reader = new V2ImportedProjectionEventReader({ ...f.options, sourceManifest,
+        sealedPackage: { ...f.sealedPackage, manifest: { ...f.sealedPackage.manifest,
+          sourceManifestChecksum: sourceManifest.manifestChecksum, [field]: maximum + delta } },
+        driver: { open() { opens++; throw new ShadowMigrationError("MIGRATION_SOURCE_MUTATED"); } } });
+      // Exact boundary passes capacity and reaches this explicit downstream marker; +1 never opens SQLite.
+      await assert.rejects(reader.openCommittedSnapshot(f.projectionBinding), safeMigration(delta === 0
+        ? "MIGRATION_SOURCE_MUTATED" : "MIGRATION_LIMIT_EXCEEDED"));
+      assert.equal(opens, delta === 0 ? 1 : 0);
+    });
+  }
+});
+
+test("classification: preserves and redacts every allowlisted migration code at open and lazy read", async t => {
+  const f = await importedPackageFixture(t);
+  for (const stage of ["open", "lazy"] as const) for (const code of MIGRATION_CODES) await t.test(`${stage}/${code}`, async () => {
+    const original = new ShadowMigrationError(code, { private: PRIVATE_FAILURE }, { cause: new Error(PRIVATE_FAILURE) });
+    original.message = PRIVATE_FAILURE;
+    const probe = readerProbe(f, { stage, error: original, closeError: new Error(PRIVATE_FAILURE) });
+    if (stage === "open") await assert.rejects(probe.reader.openCommittedSnapshot(f.projectionBinding), safeMigration(code));
+    else {
+      const snapshot = await probe.reader.openCommittedSnapshot(f.projectionBinding);
+      assert.throws(() => snapshot.events()[Symbol.iterator]().next(), safeMigration(code)); snapshot.close();
+    }
+    assert.equal(probe.counts().closes, 1); assert.equal(probe.counts().rollbacks, 1);
+  });
+});
+
+test("classification: preserves primary busy only and redacts all operational metadata", async t => {
+  const f = await importedPackageFixture(t);
+  const cases: readonly [string, unknown, (error: unknown) => boolean][] = [
+    ["native primary", Object.assign(new Error(PRIVATE_FAILURE), { errcode: 5 }), safeBusy],
+    ["native extended busy", Object.assign(new Error(PRIVATE_FAILURE), { errcode: 517 }), safeBusy],
+    ["typed busy", new EventStoreError("SQLITE_BUSY", { retryable: false, private: PRIVATE_FAILURE }), safeBusy],
+    ["locked", Object.assign(new Error(PRIVATE_FAILURE), { errcode: 6 }), safeMigration("MIGRATION_LEDGER_INTEGRITY_FAILURE")],
+    ["I/O", Object.assign(new Error(PRIVATE_FAILURE), { errcode: 10, code: "EIO" }), safeMigration("MIGRATION_LEDGER_INTEGRITY_FAILURE")],
+    ["message only", new Error("SQLITE_BUSY"), safeMigration("MIGRATION_LEDGER_INTEGRITY_FAILURE")],
+    ["untyped code only", { code: "SQLITE_BUSY" }, safeMigration("MIGRATION_LEDGER_INTEGRITY_FAILURE")],
+    ["unknown typed code", new EventStoreError("PRIVATE_UNKNOWN_ERROR", { retryable: true }), safeMigration("MIGRATION_LEDGER_INTEGRITY_FAILURE")],
+    ["unknown migration code", new ShadowMigrationError("PRIVATE_UNKNOWN_ERROR" as ShadowMigrationErrorCode), safeMigration("MIGRATION_LEDGER_INTEGRITY_FAILURE")],
+    ["classification getter throws", Object.defineProperty({}, "errcode", { get() { throw new Error(PRIVATE_FAILURE); } }), safeMigration("MIGRATION_LEDGER_INTEGRITY_FAILURE")],
+  ];
+  for (const stage of ["open", "lazy"] as const) for (const [name, error, expected] of cases) await t.test(`${stage}/${name}`, async () => {
+    const probe = readerProbe(f, { stage, error, rollbackError: new Error(PRIVATE_FAILURE), closeError: new Error(PRIVATE_FAILURE) });
+    if (stage === "open") await assert.rejects(probe.reader.openCommittedSnapshot(f.projectionBinding), expected);
+    else {
+      const snapshot = await probe.reader.openCommittedSnapshot(f.projectionBinding);
+      assert.throws(() => snapshot.events()[Symbol.iterator]().next(), expected); snapshot.close();
+    }
+    assert.equal(probe.counts().closes, 1); assert.equal(probe.counts().rollbacks, 1);
+  });
+});
+
+test("classification: explicit close preserves the first safe failure and still releases once", async t => {
+  const f = await importedPackageFixture(t);
+  for (const phase of ["rollback", "close", "both"] as const) await t.test(phase, async () => {
+    const probe = readerProbe(f, {
+      ...(phase !== "close" ? { rollbackError: new ShadowMigrationError("MIGRATION_LIMIT_EXCEEDED", { private: PRIVATE_FAILURE }) } : {}),
+      ...(phase !== "rollback" ? { closeError: new EventStoreError("SQLITE_BUSY", { private: PRIVATE_FAILURE }) } : {}),
+    });
+    const snapshot = await probe.reader.openCommittedSnapshot(f.projectionBinding);
+    assert.throws(() => snapshot.close(), phase === "close" ? safeBusy : safeMigration("MIGRATION_LIMIT_EXCEEDED"));
+    snapshot.close();
+    assert.equal(probe.counts().closes, 1); assert.equal(probe.counts().rollbacks, 1);
+  });
+});
+
+test("classification: snapshots an allowlisted migration code before reconstructing the safe error", async t => {
+  const f = await importedPackageFixture(t);
+  for (const stage of ["open", "lazy"] as const) await t.test(stage, async () => {
+    let reads = 0;
+    const original = new ShadowMigrationError("MIGRATION_LIMIT_EXCEEDED");
+    Object.defineProperty(original, "code", { get() { return ++reads === 1 ? "MIGRATION_LIMIT_EXCEEDED" : PRIVATE_FAILURE; } });
+    const probe = readerProbe(f, { stage, error: original });
+    if (stage === "open") await assert.rejects(probe.reader.openCommittedSnapshot(f.projectionBinding), safeMigration("MIGRATION_LIMIT_EXCEEDED"));
+    else {
+      const snapshot = await probe.reader.openCommittedSnapshot(f.projectionBinding);
+      assert.throws(() => snapshot.events()[Symbol.iterator]().next(), safeMigration("MIGRATION_LIMIT_EXCEEDED")); snapshot.close();
+    }
+    assert.equal(reads, 1); assert.equal(probe.counts().closes, 1);
   });
 });
