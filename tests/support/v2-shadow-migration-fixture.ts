@@ -40,7 +40,8 @@ export function sealManifest(value: Omit<V1SourceCopyManifestV1, "manifestChecks
   return { ...body, manifestChecksum: digest(canonicalJson(body)) };
 }
 
-export async function createV2ShadowMigrationFixture(t: TestContext, options: { aliasLiveStore?: boolean } = {}) {
+export async function createV2ShadowMigrationFixture(t: TestContext,
+  options: { aliasLiveStore?: boolean; sourceEventCount?: 0 | 2; legacyArtifacts?: boolean } = {}) {
   const root = canonicalMkdtemp("v2-shadow-source-");
   t.after(() => rmSync(root, { recursive: true, force: true }));
   const sourceRoot = join(root, "copy");
@@ -53,6 +54,7 @@ export async function createV2ShadowMigrationFixture(t: TestContext, options: { 
   const sourceDatabasePath = join(sourceRoot, "events.sqlite");
   const manifestPath = join(sourceRoot, "manifest.json");
   const driver = new NodeSqliteDriver({ DatabaseSync });
+  const sourceEventCount = options.sourceEventCount ?? 2;
   const now = "2026-09-10T00:00:00.000Z";
   const projectionBinding = { projectId: "11111111-1111-4111-8111-111111111111",
     vaultId: "22222222-2222-4222-8222-222222222222", storeId: "33333333-3333-4333-8333-333333333333",
@@ -70,7 +72,7 @@ export async function createV2ShadowMigrationFixture(t: TestContext, options: { 
   try {
     applyCurrentProjectStoreSchema(connection, projectionBinding, now);
     const store = new EventStore(connection, new SqliteEventStoreStatements(connection), new MaintenanceFence(), new BranchScopeRepository(), () => now);
-    store.append({ context, commandId: randomUUID(), idempotencyKey: "migration-fixture", commandType: "RecordProjectionSources",
+    if (sourceEventCount > 0) store.append({ context, commandId: randomUUID(), idempotencyKey: "migration-fixture", commandType: "RecordProjectionSources",
       correlationId: randomUUID(), agentId: "migration-fixture", expectedStreamVersion: 0n, streamId: "migration-fixture", streamType: "memory",
       events: ["First source", "Second source"].map((summary, ordinal) => ({
         eventType: "MemorySourceRecorded", eventSchemaVersion: 1, occurredAt: now, visibilityScope: "project" as const,
@@ -86,13 +88,13 @@ export async function createV2ShadowMigrationFixture(t: TestContext, options: { 
     for (const suffix of ["-wal", "-shm"]) copyFileSync(`${liveEventStorePath}${suffix}`, `${sourceDatabasePath}${suffix}`);
   } finally { connection.close(); }
   const sourceEvents: StoredEvent[] = [];
-  replayCommittedProjectionEvents(projectionBinding, { driver, eventStorePath: liveEventStorePath, terminalEventPosition: 2n }, (event) => {
+  replayCommittedProjectionEvents(projectionBinding, { driver, eventStorePath: liveEventStorePath, terminalEventPosition: BigInt(sourceEventCount) }, (event) => {
     decodeProjectionEvent(event);
     sourceEvents.push(event);
   });
   writeFileSync(join(sourceRoot, "legacy", "one.md"), "# Decision\nKeep V1 authoritative.\n", "utf8");
   writeFileSync(join(sourceRoot, "legacy", "two.md"), "# Insight\nตรวจสอบ immutable copy.\n", "utf8");
-  const legacyArtifacts = ["legacy/one.md", "legacy/two.md"].map((path) => ({
+  const legacyArtifacts = (options.legacyArtifacts === false ? [] : ["legacy/one.md", "legacy/two.md"]).map((path) => ({
     ...describeSourceFile(sourceRoot, path), mediaType: "text/markdown; charset=utf-8" as const,
   }));
   const manifest = sealManifest({ schemaVersion: 1, copyFormatVersion: 1,
@@ -102,7 +104,7 @@ export async function createV2ShadowMigrationFixture(t: TestContext, options: { 
     sqliteSidecars: ["events.sqlite-wal", "events.sqlite-shm"].map((path) => describeSourceFile(sourceRoot, path)), legacyArtifacts,
     eventCount: sourceEvents.length, aggregateSourceBytes: sourceEvents.reduce((sum, event) => sum + Buffer.byteLength(event.payloadJson), 0)
       + legacyArtifacts.reduce((sum, artifact) => sum + artifact.size, 0),
-    terminalEventPosition: "2", terminalEventHash: sourceEvents.at(-1)!.eventHash, createdAt: now, authorizedActorFingerprint: digest("fixture-actor") });
+    terminalEventPosition: String(sourceEventCount), terminalEventHash: sourceEvents.at(-1)?.eventHash ?? "0".repeat(64), createdAt: now, authorizedActorFingerprint: digest("fixture-actor") });
   writeFileSync(manifestPath, canonicalJson(manifest));
   const policy = decodeShadowMigrationPolicyV1({ schemaVersion: 1, maxEvents: 100_000, maxAggregateBytes: 67_108_864,
     maxEventBytes: 1_048_576, maxBatchEvents: 1000, maxBatchBytes: 8_388_608, deadlineMs: 300_000, maxRetries: 3,
