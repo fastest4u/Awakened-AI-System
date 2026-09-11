@@ -37,7 +37,7 @@
 - [x] Task 4: canonical content-addressed migration package.
 - [x] Task 5: schema-7 append-only ledger, attempts, parity, and compatibility evidence.
 - [x] Task 6: deterministic committed V2 shadow import.
-- [ ] Task 7: projection input reconstructed only from committed imports.
+- [x] Task 7: projection input reconstructed only from committed imports.
 - [ ] Task 8: verified V1-reference and V2-shadow projection publication.
 - [ ] Task 9: expected-difference governance, row parity, and sealed retrieval parity.
 - [ ] Task 10: isolated compatibility materialization.
@@ -45,6 +45,8 @@
 - [ ] Task 12: three-run rehearsal plus fourth-run no-op evidence.
 - [ ] Task 13: schema registry, focused gate, CI, and bundled smoke sealing.
 - [ ] Task 14: production-shaped rehearsal and independent specification, quality, and security reviews.
+
+Task 7 closure (2026-09-11): implementation `f314c58e86040c332846e65fd7b094896ea0f69f`, reviewed correction `b6c9dab575bbe18e18b6463072adcbb31cb0220c`; focused gate 148/148, build/typecheck passed, independent specification/quality review approved. Tasks 8–14 remain open; V2 is not activated.
 
 ## File Structure
 
@@ -100,7 +102,7 @@
 - Consumes: `canonicalJson(value: unknown): string`, `RolloutRevision`, and `RolloutControlPlaneError`.
 - Produces: `ShadowMigrationPhase`, `ShadowMigrationPolicyV1`, `ShadowMigrationConfigurationV1`, `ShadowMigrationError`, `decodeShadowMigrationPolicyV1`, `decodeShadowMigrationConfigurationV1`, `shadowMigrationPolicyChecksum`, `shadowMigrationConfigurationChecksum`, `shadowMigrationIdentity`, `deterministicMigrationUuid`, and `RolloutControlPlane.revision(projectId, revisionId)`.
 
-- [ ] **Step 1: Write failing exact-input and boundary tests.**
+- [x] **Step 1: Write failing exact-input and boundary tests.**
 
 Create tests that use null-prototype records, accessors, symbols, unknown fields, every minimum/maximum, and one value beyond every bound. Pin canonical output and domain strings:
 
@@ -177,7 +179,7 @@ test("phase order and deterministic identities are frozen", () => {
 });
 ```
 
-- [ ] **Step 2: Run the focused tests and verify RED.**
+- [x] **Step 2: Run the focused tests and verify RED.**
 
 Run:
 
@@ -188,7 +190,7 @@ node --test --test-concurrency=1 --test-reporter=spec dist-test/tests/v2-shadow-
 
 Expected: compilation fails because the migration contract module and `RolloutControlPlane.revision` do not exist.
 
-- [ ] **Step 3: Add the exact contract and hash implementation.**
+- [x] **Step 3: Add the exact contract and hash implementation.**
 
 Use these public shapes and domains; the decoder must inspect own enumerable data descriptors before value access and deep-freeze its result:
 
@@ -292,7 +294,7 @@ Add `revision(projectId, revisionId)` as a read-only service method that uses th
 
 `decodeShadowMigrationConfigurationV1` must require `policyChecksum === shadowMigrationPolicyChecksum(policy)` at the runner boundary and require `expectedDifferencePolicyVersion` to equal the policy field. The rollout revision binds the result of `shadowMigrationConfigurationChecksum`, not the policy checksum alone.
 
-- [ ] **Step 4: Run contract and rollout tests.**
+- [x] **Step 4: Run contract and rollout tests.**
 
 Run:
 
@@ -304,7 +306,7 @@ npm run typecheck
 
 Expected: all tests pass; malformed objects fail before accessor execution; policy hashes and deterministic UUIDs are stable.
 
-- [ ] **Step 5: Commit the migration contract.**
+- [x] **Step 5: Commit the migration contract.**
 
 ```powershell
 git add src/orchestrator/migration/v2-shadow-migration.contracts.ts src/orchestrator/rollout/rollout-control-plane.ts tests/v2-shadow-migration-contracts.test.ts tests/rollout-control-plane.test.ts
@@ -329,7 +331,7 @@ git commit -m "feat: define V2 shadow migration contracts"
 - Consumes: production `ProjectId`/`VaultId`/`StoreId` UUIDv4 values, SHA-256 `WorkspaceId`, optional UUID branch scope, and the existing sealed evaluator's SHA-256 synthetic identity fixtures.
 - Produces: one shared `decodeProjectionIdentityToken(value, kind)` rule used by reader, source codec, folds, manifest, and checksums without relaxing any arbitrary-string boundary.
 
-- [ ] **Step 1: Add production-identity RED cases before changing decoders.**
+- [x] **Step 1: Add production-identity RED cases before changing decoders.**
 
 Copy one existing valid projection source/manifest/fold fixture and replace only project, vault, and store identities with canonical UUIDv4 values while keeping the workspace identity as lowercase SHA-256. Pin the compatibility boundary:
 
@@ -365,7 +367,7 @@ test("projection authority rejects noncanonical and mixed-case identity tokens",
 
 Add equivalent UUID cases to manifest parsing, fold restoration, projection checksum, and event-reader snapshot tests.
 
-- [ ] **Step 2: Run projection identity tests and verify RED.**
+- [x] **Step 2: Run projection identity tests and verify RED.**
 
 Run:
 
@@ -376,7 +378,7 @@ node --test --test-concurrency=1 --test-reporter=spec dist-test/tests/projection
 
 Expected: the new production UUID cases fail with `INTEGRITY_FAILURE` or `PROJECTION_CHECKSUM_INVALID`; existing hash fixtures remain green.
 
-- [ ] **Step 3: Centralize the transitional strict identity rule.**
+- [x] **Step 3: Centralize the transitional strict identity rule.**
 
 Export from `contracts.ts` and reuse everywhere:
 
@@ -395,7 +397,7 @@ export function isProjectionWorkspaceIdentity(value: unknown): value is string {
 
 Project, vault, and store accept only UUIDv4 (production) or lowercase SHA-256 (sealed evaluator compatibility). Workspace remains lowercase SHA-256. Branch scope remains UUID and branch refs retain the current NUL/non-empty checks. Replace local all-fields-are-hash checks in event reader, source codec, folds, manifest, and checksum with the shared predicates. Do not change event payload decoding, fold semantics, checksum domains, manifest schema versions, or public routing.
 
-- [ ] **Step 4: Run the complete projection gate.**
+- [x] **Step 4: Run the complete projection gate.**
 
 Run:
 
@@ -407,7 +409,7 @@ npm run typecheck
 
 Expected: production UUID and sealed hash identities both pass; malformed strings, wrong UUID versions, uppercase hashes, and scope mismatches fail closed.
 
-- [ ] **Step 5: Commit production identity compatibility.**
+- [x] **Step 5: Commit production identity compatibility.**
 
 ```powershell
 git add src/orchestrator/projections/contracts.ts src/orchestrator/projections/event-reader.ts src/orchestrator/projections/source-event-codec.ts src/orchestrator/projections/folds.ts src/orchestrator/projections/manifest.ts src/orchestrator/projections/checksum.ts tests/projection-source-event-codec.test.ts tests/projection-folds.test.ts tests/projection-manifest.test.ts tests/projection-integrity.test.ts
@@ -427,7 +429,7 @@ git commit -m "fix: accept production projection identities"
 - Consumes: `ShadowMigrationPolicyV1`, `ProjectBinding`, `SqliteDriver`, `replayCommittedProjectionEvents`, and canonical path helpers.
 - Produces: `V1SourceCopyManifestV1`, `VerifiedV1SourceCopy`, `decodeV1SourceCopyManifestV1`, and `verifyV1SourceCopy(input)`.
 
-- [ ] **Step 1: Generate a real source fixture and write failing verification tests.**
+- [x] **Step 1: Generate a real source fixture and write failing verification tests.**
 
 The support helper must bootstrap the current store, append events through `EventStore`, checkpoint WAL consistently, write two UTF-8 legacy artifacts, calculate a canonical manifest, and return cleanup paths. Test success plus alias, symlink, hostile relative path, bad sidecar hash, wrong binding, unsupported schema, event-chain tamper, source limit, and post-run mutation:
 
@@ -466,7 +468,7 @@ test("rejects a source whose file identity aliases live authority", async (t) =>
 });
 ```
 
-- [ ] **Step 2: Run the source-copy tests and verify RED.**
+- [x] **Step 2: Run the source-copy tests and verify RED.**
 
 Run:
 
@@ -477,7 +479,7 @@ node --test --test-concurrency=1 --test-reporter=spec dist-test/tests/v1-source-
 
 Expected: compilation fails because the verifier and fixture helper do not exist.
 
-- [ ] **Step 3: Implement stable manifest and file-identity verification.**
+- [x] **Step 3: Implement stable manifest and file-identity verification.**
 
 Use exact manifest keys and return only a frozen handle. The handle owns the read-only snapshot and closes it exactly once:
 
@@ -547,7 +549,7 @@ Verification order is fixed:
 
 Always close the projection snapshot on a failed verification path. Error `safeDetails` may contain only a category and ordinal, never a source path or artifact name.
 
-- [ ] **Step 4: Run verifier, projection-reader, and integrity tests.**
+- [x] **Step 4: Run verifier, projection-reader, and integrity tests.**
 
 Run:
 
@@ -559,7 +561,7 @@ npm run typecheck
 
 Expected: all tests pass; source files remain byte-identical; all negative cases return only typed redacted errors.
 
-- [ ] **Step 5: Commit immutable source verification.**
+- [x] **Step 5: Commit immutable source verification.**
 
 ```powershell
 git add src/orchestrator/migration/v1-source-copy.ts tests/support/v2-shadow-migration-fixture.ts tests/v1-source-copy.test.ts
@@ -578,7 +580,7 @@ git commit -m "feat: verify immutable V1 migration sources"
 - Consumes: `VerifiedV1SourceCopy`, `ShadowMigrationPolicyV1`, `shadowMigrationIdentity`, build/configuration hashes, and canonical JSON.
 - Produces: `V2MigrationPackageManifestV1`, `SealedV2MigrationPackage`, `sealV2MigrationPackage(input)`, and `openSealedV2MigrationPackage(input)`.
 
-- [ ] **Step 1: Write failing deterministic-package and tamper tests.**
+- [x] **Step 1: Write failing deterministic-package and tamper tests.**
 
 Pin record order as source events by `globalPosition`, followed by legacy artifacts by normalized relative path. Verify same input in two different absolute staging roots produces the same logical checksums and migration identity:
 
@@ -608,7 +610,7 @@ test("rejects package replacement and descriptor/value tamper", async (t) => {
 });
 ```
 
-- [ ] **Step 2: Run package tests and verify RED.**
+- [x] **Step 2: Run package tests and verify RED.**
 
 Run:
 
@@ -619,7 +621,7 @@ node --test --test-concurrency=1 --test-reporter=spec dist-test/tests/v2-migrati
 
 Expected: compilation fails because the package writer/reader are absent.
 
-- [ ] **Step 3: Implement canonical streaming package publication.**
+- [x] **Step 3: Implement canonical streaming package publication.**
 
 The package layout is exact and contains no absolute source path:
 
@@ -700,7 +702,7 @@ const migrationIdentity = shadowMigrationIdentity({
 
 Package sealing does not require a rollout revision because the revision cannot know `migrationIdentityHash` until this checksum exists. Return the verified `migrationIdentity`, `packageChecksum`, and `configurationChecksum`; Task 8 prepares the V1 baseline, and Task 11 requires the immutable rollout revision to match all three values before the first import append.
 
-- [ ] **Step 4: Run deterministic package tests.**
+- [x] **Step 4: Run deterministic package tests.**
 
 Run:
 
@@ -712,7 +714,7 @@ npm run typecheck
 
 Expected: all tests pass; two paths yield identical logical checksums; all tamper and replacement cases fail closed; source re-verification remains green.
 
-- [ ] **Step 5: Commit package sealing.**
+- [x] **Step 5: Commit package sealing.**
 
 ```powershell
 git add src/orchestrator/migration/v2-migration-package.ts tests/v2-migration-package.test.ts
@@ -730,7 +732,7 @@ git commit -m "feat: seal V2 migration packages"
 - Consumes: migration phases and errors from Task 1, `RolloutRevision`, `SqliteConnection`, and canonical JSON/hash helpers.
 - Produces: `V2ShadowMigrationRun`, `V2ShadowMigrationTransition`, `ImportedRecordReceipt`, `StoredParityReport`, `CompatibilityOutboxRecord`, `CompatibilityAcknowledgement`, `V2ShadowMigrationTransaction`, and `SqliteV2ShadowMigrationRepository`.
 
-- [ ] **Step 1: Write migration/repository RED tests against real SQLite.**
+- [x] **Step 1: Write migration/repository RED tests against real SQLite.**
 
 Cover clean schema creation, exact columns/indexes/triggers, strict types, cross-project foreign keys, duplicate identities, out-of-order phases, transition-hash tamper, imported-record conflicts, immutable rules/reports/outbox/acknowledgements, nested transactions, synchronous callback enforcement, rollback, and connection poison after rollback failure:
 
@@ -767,7 +769,7 @@ test("all semantic evidence rows are immutable", () => {
 });
 ```
 
-- [ ] **Step 2: Run repository tests and verify RED.**
+- [x] **Step 2: Run repository tests and verify RED.**
 
 Run:
 
@@ -778,7 +780,7 @@ node --test --test-concurrency=1 --test-reporter=spec dist-test/tests/v2-shadow-
 
 Expected: compilation fails because migration 0007 and its repository do not exist.
 
-- [ ] **Step 3: Create the guarded schema.**
+- [x] **Step 3: Create the guarded schema.**
 
 Migration `version: 7`, name `v2-shadow-migration`, must create these STRICT, WITHOUT ROWID tables:
 
@@ -953,7 +955,7 @@ Strict row decoders must canonical-parse `selector_json`, `predicate_json`, and 
 
 Add `BEFORE UPDATE` and `BEFORE DELETE` abort triggers named `<table>_no_update` and `<table>_no_delete` for every table. Add `BEFORE INSERT` guards that reject replacement conflicts with `V2_SHADOW_IMMUTABLE`; a transition guard requires `ordinal = prior ordinal + 1`, exact next phase, and prior hash equality. Attempt rows have their own monotonically increasing `attempt_ordinal` and never consume or unblock a committed phase.
 
-- [ ] **Step 4: Implement strict transaction and reconciliation reads.**
+- [x] **Step 4: Implement strict transaction and reconciliation reads.**
 
 Use a synchronous callback transaction like the rollout repository. Public operations are exact:
 
@@ -1103,7 +1105,7 @@ export class SqliteV2ShadowMigrationRepository {
 
 Decode every SQLite row with exact keys, bigint int64 checks, canonical timestamps, UUID/hash checks, and canonical JSON round-trip. Recompute transition hashes using domain `project-memory/v2-shadow-migration-transition/v1` on every read. SQLite busy errors remain available to the runner for retry classification; immutability, decoding, order, or hash errors become `MIGRATION_LEDGER_INTEGRITY_FAILURE`.
 
-- [ ] **Step 5: Run schema/repository verification.**
+- [x] **Step 5: Run schema/repository verification.**
 
 Run:
 
@@ -1115,7 +1117,7 @@ npm run typecheck
 
 Expected: all tests pass; the repository is transaction-bound, append-only, fail-closed, and returns frozen decoded data.
 
-- [ ] **Step 6: Commit schema 7 repository work.**
+- [x] **Step 6: Commit schema 7 repository work.**
 
 ```powershell
 git add src/orchestrator/storage/migrations/0007-v2-shadow-migration.ts src/orchestrator/storage/v2-shadow-migration.repository.ts tests/v2-shadow-migration-repository.test.ts
@@ -1303,7 +1305,7 @@ git commit -m "feat: import deterministic V2 shadow events"
 - Consumes: `ProjectionEventReader`, committed wrapper events, package manifest, import receipts, and production stored-event authentication.
 - Produces: `V2ImportedProjectionEventReader` and a `ProjectionEventSnapshot` whose binding/terminal position/hash are the verified original V1 snapshot values.
 
-- [ ] **Step 1: Write committed-authority RED tests.**
+- [x] **Step 1: Write committed-authority RED tests.**
 
 ```ts
 test("reconstructs source events only when wrapper and ledger receipts agree", async (t) => {
@@ -1327,7 +1329,7 @@ test("rejects package bytes that were never committed as wrapper events", async 
 
 Also cover duplicate/missing/reordered ordinals, wrapper payload tamper, receipt event-ID/position/hash mismatch, artifact wrapper appearing as a projection source, nested import wrapper, wrong migration identity, wrong source binding, broken original event chain, and close idempotence.
 
-- [ ] **Step 2: Run imported-reader tests and verify RED.**
+- [x] **Step 2: Run imported-reader tests and verify RED.**
 
 Run:
 
@@ -1338,7 +1340,7 @@ node --test --test-concurrency=1 --test-reporter=spec dist-test/tests/v2-importe
 
 Expected: compilation fails because the committed-import reader does not exist.
 
-- [ ] **Step 3: Implement the authenticated reconstruction boundary.**
+- [x] **Step 3: Implement the authenticated reconstruction boundary.**
 
 The public reader surface is exact:
 
@@ -1361,7 +1363,7 @@ export class V2ImportedProjectionEventReader implements ProjectionEventReader {
 
 Use the package's source binding as snapshot authority; do not substitute the target wrapper-event binding or wrapper terminal position.
 
-- [ ] **Step 4: Run reader and source-codec tests.**
+- [x] **Step 4: Run reader and source-codec tests.**
 
 Run:
 
@@ -1373,7 +1375,7 @@ npm run typecheck
 
 Expected: all tests pass; only committed/authenticated wrappers can become projection input; original event identity and chain remain exact.
 
-- [ ] **Step 5: Commit the committed-import reader.**
+- [x] **Step 5: Commit the committed-import reader.**
 
 ```powershell
 git add src/orchestrator/migration/v2-imported-event-reader.ts tests/v2-imported-event-reader.test.ts
@@ -1385,6 +1387,8 @@ git commit -m "feat: read projections from committed imports"
 **Files:**
 - Create: `src/orchestrator/migration/v2-shadow-projection.ts`
 - Create: `tests/v2-shadow-projection.test.ts`
+- Modify: `src/orchestrator/projections/integrity.ts` (narrow committed-snapshot verification seam; preserve existing `verify()` behavior)
+- Test: `tests/projection-integrity.test.ts`
 - Reuse: `src/orchestrator/projections/builder.ts:829-1018`
 - Reuse: `src/orchestrator/projections/coordinator.ts:544-705`
 - Reuse: `src/orchestrator/projections/integrity.ts:1183-1240`
@@ -1392,6 +1396,8 @@ git commit -m "feat: read projections from committed imports"
 **Interfaces:**
 - Consumes: the verified V1 source snapshot, `V2ImportedProjectionEventReader`, `ImmutableProjectionBuilder`, `V2ProjectionBuildCoordinator`, `ProjectionIntegrityService`, package/ledger identities, and rollout `v1BaselineChecksum`.
 - Produces: `PreparedV1ProjectionBaseline`, `ShadowProjectionResult`, `v1ProjectionBaselineChecksum`, `V2ShadowProjectionPublisher.prepareV1Baseline(input)`, and `V2ShadowProjectionPublisher.publishV2(input)`.
+
+**Producer/consumer correction (2026-09-11):** The current integrity service can replay only an event-store path; it cannot consume the Task 7 reader. Add a separate committed-snapshot verification method that authenticates original events and enforces binding, terminal, count, and byte limits while reusing the existing row/image checks. Keep the existing SQLite `verify()` entry unchanged. The publisher must obtain this snapshot from Task 7 and close it reliably. Use `preparedV1.generation.manifest`, as declared by the interface below. Fixture setup must prepare the baseline before target import, then bind the rollout revision and import; the original shorthand example below is not permission to import before baseline preparation.
 
 - [ ] **Step 1: Write real publication RED tests.**
 
@@ -1406,9 +1412,9 @@ test("publishes both projection generations at the exact source position", async
     ...fixture.projectionInput,
     preparedV1,
   });
-  assert.equal(result.v1.manifest.terminalEventPosition, fixture.package.manifest.terminalEventPosition);
+  assert.equal(result.v1.generation.manifest.terminalEventPosition, fixture.package.manifest.terminalEventPosition);
   assert.equal(result.v2.manifest.terminalEventPosition, fixture.package.manifest.terminalEventPosition);
-  assert.equal(result.v1.manifest.terminalEventHash, fixture.package.manifest.terminalEventHash);
+  assert.equal(result.v1.generation.manifest.terminalEventHash, fixture.package.manifest.terminalEventHash);
   assert.equal(result.v2.manifest.terminalEventHash, fixture.package.manifest.terminalEventHash);
   assert.equal(result.v1BaselineChecksum, fixture.rolloutRevision.v1BaselineChecksum);
   assert.deepEqual(fixture.repository.phases(), [
@@ -1481,7 +1487,7 @@ export interface PreparedV1ProjectionBaseline {
 }
 ```
 
-Require V1 and V2 binding fields, terminal position, and terminal hash to equal the sealed package; require the calculated V1 baseline to equal the rollout revision. Run `ProjectionIntegrityService.verify` for V2 with the committed-import reader and verify the V1 database SHA/core checksums by reopening its immutable image. Only then append `projection-verified` with evidence digest over both manifests and baseline hashes.
+Require V1 and V2 binding fields, terminal position, and terminal hash to equal the sealed package; require the calculated V1 baseline to equal the rollout revision. Run the separate `ProjectionIntegrityService` committed-snapshot verification method for V2 with a snapshot from the committed-import reader, and verify the V1 database SHA/core checksums by reopening its immutable image. Only then append `projection-verified` with evidence digest over both manifests and baseline hashes.
 
 - [ ] **Step 4: Run full projection regression.**
 
