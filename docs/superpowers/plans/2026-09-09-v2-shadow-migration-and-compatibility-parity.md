@@ -38,7 +38,7 @@
 - [x] Task 5: schema-7 append-only ledger, attempts, parity, and compatibility evidence.
 - [x] Task 6: deterministic committed V2 shadow import.
 - [x] Task 7: projection input reconstructed only from committed imports.
-- [ ] Task 8: verified V1-reference and V2-shadow projection publication.
+- [x] Task 8: verified V1-reference and V2-shadow projection publication.
 - [ ] Task 9: expected-difference governance, row parity, and sealed retrieval parity.
 - [ ] Task 10: isolated compatibility materialization.
 - [ ] Task 11: durable orchestration, retry, and reconciliation.
@@ -46,7 +46,9 @@
 - [ ] Task 13: schema registry, focused gate, CI, and bundled smoke sealing.
 - [ ] Task 14: production-shaped rehearsal and independent specification, quality, and security reviews.
 
-Task 7 closure (2026-09-11): implementation `f314c58e86040c332846e65fd7b094896ea0f69f`, reviewed correction `b6c9dab575bbe18e18b6463072adcbb31cb0220c`; focused gate 148/148, build/typecheck passed, independent specification/quality review approved. Tasks 8–14 remain open; V2 is not activated.
+Task 7 closure (2026-09-11): implementation `f314c58e86040c332846e65fd7b094896ea0f69f`, reviewed correction `b6c9dab575bbe18e18b6463072adcbb31cb0220c`; focused gate 148/148, build/typecheck passed, independent specification/quality review approved.
+
+Task 8 closure (2026-09-11): implementation `36c5f9d015ddd94e99d95c49072286a4bdf926b2`, reviewed correction `375aa6fa780f1870ca0f9c470f153e46cebd08df`; independent specification/quality review approved all three findings. Final clean six-file gate 143/143, zero failures/skips, build/typecheck passed on the reviewed code. Earlier 128/133 gate failure remains recorded, not relabeled. Tasks 9–14 remain open; V1 remains sole caller authority and V2 is not activated.
 
 ## File Structure
 
@@ -1389,6 +1391,10 @@ git commit -m "feat: read projections from committed imports"
 - Create: `tests/v2-shadow-projection.test.ts`
 - Modify: `src/orchestrator/projections/integrity.ts` (narrow committed-snapshot verification seam; preserve existing `verify()` behavior)
 - Test: `tests/projection-integrity.test.ts`
+- Modify: `src/orchestrator/projections/builder.ts` (narrow legacy private-image connection verification helper; preserve existing build behavior)
+- Test: `tests/projection-builder.test.ts` (only covering helper regressions if needed)
+- Modify: `src/orchestrator/projections/schema.ts` (align only V1/V2 project/vault/store metadata predicates with the approved identity codec)
+- Test: `tests/projection-schema.test.ts`
 - Reuse: `src/orchestrator/projections/builder.ts:829-1018`
 - Reuse: `src/orchestrator/projections/coordinator.ts:544-705`
 - Reuse: `src/orchestrator/projections/integrity.ts:1183-1240`
@@ -1399,7 +1405,11 @@ git commit -m "feat: read projections from committed imports"
 
 **Producer/consumer correction (2026-09-11):** The current integrity service can replay only an event-store path; it cannot consume the Task 7 reader. Add a separate committed-snapshot verification method that authenticates original events and enforces binding, terminal, count, and byte limits while reusing the existing row/image checks. Keep the existing SQLite `verify()` entry unchanged. The publisher must obtain this snapshot from Task 7 and close it reliably. Use `preparedV1.generation.manifest`, as declared by the interface below. Fixture setup must prepare the baseline before target import, then bind the rollout revision and import; the original shorthand example below is not permission to import before baseline preparation.
 
-- [ ] **Step 1: Write real publication RED tests.**
+For the V1 image recheck, expose a narrow `verifyLegacyProjectionConnection` helper from the builder to reuse its legacy structure, canonical row/core-checksum, and FTS checks. Its connection must be a private deserialized in-memory image owned and closed by the integrity service; the helper's FTS integrity command must never write the published image or source. Keep dependencies one-way from integrity to builder and preserve the normal builder behavior. Test published-image tamper, unchanged original/published bytes, and cleanup failures. This does not implement Task 9's canonical snapshot export early.
+
+Task 2's production identity codec also applies at the SQLite projection metadata boundary: align the six V1/V2 project/vault/store CHECK predicates with exact UUIDv4 or legacy lowercase SHA256. Keep workspace SHA256-only, preserve identity values, schema versions, row layouts, and frozen event-store migrations. The integrity schema checker must retain support for genuine legacy-hash images using the exact historical CHECK shape as well as the current strict shape; no arbitrary schema relaxation is allowed. Add production-writer UUID and direct SQL acceptance/rejection regressions, including the historical image case.
+
+- [x] **Step 1: Write real publication RED tests.**
 
 Use separate absolute directories for the V1 reference and V2 shadow generations. Prove both manifests bind to the original source terminal position/hash, V2 integrity replays from committed imports, rollout baseline checksum is exact, and a target wrapper event or published database tamper fails before the phase transition:
 
@@ -1433,7 +1443,7 @@ test("does not record projection-verified after generation tamper", async (t) =>
 });
 ```
 
-- [ ] **Step 2: Run projection publication tests and verify RED.**
+- [x] **Step 2: Run projection publication tests and verify RED.**
 
 Run:
 
@@ -1444,9 +1454,13 @@ node --test --test-concurrency=1 --test-reporter=spec dist-test/tests/v2-shadow-
 
 Expected: compilation fails because the Slice-2 projection publisher and baseline checksum do not exist.
 
-- [ ] **Step 3: Build deterministic reference and shadow generations.**
+- [x] **Step 3: Build deterministic reference and shadow generations.**
 
 Before import, open a snapshot directly from the verified read-only V1 source. Instantiate the V1 builder with `now: () => package.manifest.createdAt`, call `ImmutableProjectionBuilder.build(snapshot, 1)` in the isolated V1-reference directory, reopen/verify its immutable bytes, and return `PreparedV1ProjectionBaseline`. This value supplies `v1BaselineChecksum` when the rollout revision is created or checked.
+
+Persist the verified V1 manifest with the existing atomic manifest publisher under the isolated V1 publication lease. Repeated `prepareV1Baseline` calls must capture, parse, and fully verify the existing manifest/image against the same source/package and return the identical baseline without rewriting it. Cover the unknown-outcome gap after generation publication but before manifest publication; reconcile only with authenticated expected source/package identity, never by trusting orphan metadata or deleting/rebuilding the existing image.
+
+For this bounded orphan case only, the integrity service may recover the fixed baseline generation by pinning its raw image, verifying exact V1 schema against the existing canonical schema source, replay-derived rows/core checksums, and all expected metadata including the package clock. Derive the candidate manifest solely from verified source/package binding and terminal identity, fixed generation/name, replay checksums, and the verified pinned image SHA. The builder helper may return frozen replay checksums and compare optional expected checksums when a manifest already exists. Revalidate source/package/directory/image before atomic manifest adoption; reject malformed or tampered orphans without modifying them. Reuse existing schema-checking machinery and preserve its V2 default behavior.
 
 After import, open only the committed-import reader from Task 7, instantiate the V2 builder with the same deterministic `now`, and call `V2ProjectionBuildCoordinator.ensurePublished(binding, terminalPosition, remainingDeadlineMs)` in the isolated V2 directory. The publisher must re-read and verify the already prepared V1 generation before comparison; it never rebuilds V1 from package bytes or target wrapper events.
 
@@ -1489,19 +1503,19 @@ export interface PreparedV1ProjectionBaseline {
 
 Require V1 and V2 binding fields, terminal position, and terminal hash to equal the sealed package; require the calculated V1 baseline to equal the rollout revision. Run the separate `ProjectionIntegrityService` committed-snapshot verification method for V2 with a snapshot from the committed-import reader, and verify the V1 database SHA/core checksums by reopening its immutable image. Only then append `projection-verified` with evidence digest over both manifests and baseline hashes.
 
-- [ ] **Step 4: Run full projection regression.**
+- [x] **Step 4: Run full projection regression.**
 
 Run:
 
 ```powershell
 npm run test:build
-node --test --test-concurrency=1 --test-reporter=spec dist-test/tests/v2-shadow-projection.test.js dist-test/tests/projection-builder.test.js dist-test/tests/projection-coordinator.test.js dist-test/tests/projection-integrity.test.js dist-test/tests/v2-reader-lease.test.js
+node --test --test-concurrency=1 --test-reporter=spec dist-test/tests/v2-shadow-projection.test.js dist-test/tests/projection-schema.test.js dist-test/tests/projection-builder.test.js dist-test/tests/projection-coordinator.test.js dist-test/tests/projection-integrity.test.js dist-test/tests/v2-reader-lease.test.js
 npm run typecheck
 ```
 
 Expected: all tests pass; both generations are position-aligned; no path-based trust or uncommitted package read can enter the V2 projection.
 
-- [ ] **Step 5: Commit verified projection publication.**
+- [x] **Step 5: Commit verified projection publication.**
 
 ```powershell
 git add src/orchestrator/migration/v2-shadow-projection.ts tests/v2-shadow-projection.test.ts
@@ -1514,20 +1528,35 @@ git commit -m "feat: verify V2 shadow projections"
 - Create: `src/orchestrator/parity/v2-expected-difference.ts`
 - Create: `src/orchestrator/parity/v2-snapshot-parity.ts`
 - Create: `tests/v2-snapshot-parity.test.ts`
+- Modify: `tests/support/v2-shadow-migration-fixture.ts` (production-backed parity/retrieval factories; preserve existing fixture defaults)
 - Modify: `src/orchestrator/projections/integrity.ts:400-470,1183-1240`
 - Test: `tests/projection-integrity.test.ts`
+- Modify: `src/orchestrator/storage/v2-shadow-migration.repository.ts` (narrow governed-rule checksum mapping; preserve schema and unrelated ledger behavior)
+- Test: `tests/v2-shadow-migration-repository.test.ts`
+- Modify: `src/orchestrator/projections/builder.ts` (expose verified schema-V1 logical rows through the existing private-image helper without duplicating table definitions or changing normal builds)
+- Test: `tests/projection-builder.test.ts` (only if the helper change needs additional coverage beyond the new integrity/parity tests)
 
 **Interfaces:**
 - Consumes: verified V1/V2 projection generations, rollout revision/migration identity, migration policy rule version/age, repository rule/report operations, existing canonical projection row readers, `SealedRetrievalEvaluationCorpusV2`, and two internal retrieval services bound to the pinned V1/V2 generations.
-- Produces: `ExpectedDifferenceRuleV1`, `decodeExpectedDifferenceRuleV1`, `ParityClassification`, `RedactedParityFindingV1`, `SealedRetrievalParityV1`, `SnapshotParityReportV1`, `readVerifiedCanonicalProjectionSnapshot`, and `compareV1V2Snapshots(input)`.
+- Produces: `ExpectedDifferenceRuleV1`, `decodeExpectedDifferenceRuleV1`, `expectedDifferenceRuleChecksum`, `ParityClassification`, `RedactedParityFindingV1`, `SealedRetrievalParityV1`, `SnapshotParityReportV1`, `SnapshotParityReportJsonV1`, `serializeSnapshotParityReport`, `snapshotParityReportChecksum`, `readVerifiedCanonicalProjectionSnapshot`, and `compareV1V2Snapshots(input)`.
+
+**Producer/consumer corrections (2026-09-11):** The repository currently hashes only `{ selector, predicate }` for an expected-difference rule. Replace that provisional mapping with one shared pure checksum over the complete public `ExpectedDifferenceRuleV1` envelope excluding only `ruleChecksum`, prefixed by `project-memory/v2-expected-difference-rule/v1\n`. The stored shape maps `projectionName` to `projection`, flattens `selector`, and supplies fixed `schemaVersion: 1`; all remaining governance, approval, time, revision, and migration fields must be preserved and authenticated. Keep project scoping enforced by the repository/run binding. No schema-7 DDL or frozen migration change is needed; reject the obsolete narrow checksum rather than accepting two meanings. Cover public-to-storage round trips and altered governance fields under an unchanged checksum in real SQLite tests.
+
+`compareV1V2Snapshots` is asynchronous because sealed retrieval evaluation is asynchronous. Use the declared `sealedRetrieval` field consistently. Keep `comparedEventPosition` as bigint in memory, but expose an explicit JSON-safe report serializer that encodes it as exact canonical decimal text, with no lossy Number conversion or global bigint patch. Calculate `reportChecksum` as SHA-256 of canonical JSON of that redacted body excluding its own checksum; store that body in `StoredParityReport.report` and the identical checksum in the checksum column. On adoption, decode the body and verify all duplicated identity/count/hash columns agree before using its evidence. Test values beyond Number.MAX_SAFE_INTEGER at the serialization boundary, stored-body consistency, and deterministic no-plaintext output.
+
+The pure rule module exports `expectedDifferenceRuleChecksum(rule: Omit<ExpectedDifferenceRuleV1, "ruleChecksum">): string`; it must not import the repository that consumes it. The parity module exports `SnapshotParityReportJsonV1 = Readonly<Omit<SnapshotParityReportV1, "comparedEventPosition"> & { comparedEventPosition: string }>`, `serializeSnapshotParityReport(report: SnapshotParityReportV1): SnapshotParityReportJsonV1`, and `snapshotParityReportChecksum(report: Omit<SnapshotParityReportV1, "reportChecksum">): string` with the exact body mapping above. Validate own-data inputs before canonicalizing; do not invoke caller accessors or silently discard extra keys.
+
+Before any rule/report/phase transaction, enforce the same target connection ownership restored by Task 8: the repository used for writes must be constructed from the file-identity-verified isolated target connection, not independently injected from an unchecked store. Verify the run/revision/package/terminal bindings before accepting evidence; test wrong/protected target refusal. Preserve the protected-root and error-redaction contracts, and raise a concrete narrow shared-helper need before widening runtime file scope.
+
+For retrieval, retain the existing V1 candidate repository for the V1 lease. The V2 side must use `V2SqliteRetrievalCandidateRepository` with the original verified V2 evaluation lease/private image. A narrowly scoped V1 metadata facade for `InternalRetrievalService` may follow the existing bridge in `tests/retrieval-evaluation.test.ts`; map each request facade to its retained original V2 lease, reject V1 pathname access, and close per-query facades and retained leases at their correct ownership boundaries. Do not widen the shared V1 manifest decoder, candidate repository, or production composition. Test the original lease identity, prohibited pathname access, and cleanup on success and failure.
 
 - [ ] **Step 1: Write parity/rule RED tests.**
 
 Cover exact equality, one exact governed difference, blocking semantic difference, every never-excludable category, expired/future/revision-mismatched/migration-mismatched/checksum-mismatched rule, wildcard selector, multiple matching rules, projection-position mismatch, an internally invalid declared/recomputed core checksum, sealed retrieval result/citation/ranking drift, plaintext absence, and deterministic report checksum:
 
 ```ts
-test("classifies one exact approved difference without exposing values", () => {
-  const fixture = parityFixture({ difference: "summary-hash" });
+test("classifies one exact approved difference without exposing values", async (t) => {
+  const fixture = await parityFixture(t, { difference: "summary-hash" });
   const rule = approvedRule({
     category: "semantic-value",
     projection: "canonicalItems",
@@ -1536,11 +1565,11 @@ test("classifies one exact approved difference without exposing values", () => {
     v1ValueHash: fixture.v1ValueHash,
     v2ValueHash: fixture.v2ValueHash,
   });
-  const report = compareV1V2Snapshots({ ...fixture.input, rules: [rule] });
+  const report = await compareV1V2Snapshots({ ...fixture.input, rules: [rule] });
   assert.equal(report.equalCount > 0, true);
   assert.equal(report.expectedDifferenceCount, 1);
   assert.equal(report.blockingDivergenceCount, 0);
-  assert.equal(JSON.stringify(report).includes(fixture.plaintextSummary), false);
+  assert.equal(JSON.stringify(serializeSnapshotParityReport(report)).includes(fixture.plaintextSummary), false);
 });
 
 test("never permits a rule to normalize authority or core checksum", () => {
@@ -1557,14 +1586,14 @@ test("never permits a rule to normalize authority or core checksum", () => {
   }
 });
 
-test("compares the sealed retrieval corpus through both pinned generations", async () => {
-  const fixture = sealedRetrievalParityFixture();
+test("compares the sealed retrieval corpus through both pinned generations", async (t) => {
+  const fixture = await sealedRetrievalParityFixture(t);
   const report = await compareV1V2Snapshots(fixture.input);
-  assert.equal(report.retrieval.queryCount, fixture.corpus.queries.length);
-  assert.equal(report.retrieval.blockingDivergenceCount, 0);
-  assert.equal(report.retrieval.v1ThresholdsPassed, true);
-  assert.equal(report.retrieval.v2ThresholdsPassed, true);
-  assert.equal(JSON.stringify(report).includes(fixture.queryPlaintextSentinel), false);
+  assert.equal(report.sealedRetrieval.queryCount, fixture.corpus.queries.length);
+  assert.equal(report.sealedRetrieval.blockingDivergenceCount, 0);
+  assert.equal(report.sealedRetrieval.v1ThresholdsPassed, true);
+  assert.equal(report.sealedRetrieval.v2ThresholdsPassed, true);
+  assert.equal(JSON.stringify(serializeSnapshotParityReport(report)).includes(fixture.queryPlaintextSentinel), false);
 });
 ```
 
@@ -1581,26 +1610,42 @@ Expected: compilation fails because the rule decoder, verified canonical snapsho
 
 - [ ] **Step 3: Expose canonical rows only after projection verification.**
 
-Refactor the existing integrity reader without duplicating table definitions:
+Refactor the existing integrity reader without duplicating table definitions. Preserve schema-native rows and checksums first, then construct the schema-aware comparison views required by spec 3.7. V1 has only the seven `ProjectionNameV1` domains; never invent a persisted V1 `sessionCheckpoints` checksum. Use the existing V1 manifest names and this discriminated shape:
 
 ```ts
-export interface VerifiedCanonicalProjectionSnapshot {
-  readonly schemaVersion: 1 | 2;
+interface VerifiedCanonicalProjectionSnapshotBase {
   readonly binding: ProjectBinding;
   readonly terminalEventPosition: bigint;
   readonly terminalEventHash: string;
-  readonly coreChecksums: Readonly<Record<ProjectionName, string>>;
-  readonly rows: Readonly<Record<ProjectionName, readonly CanonicalProjectionRow[]>>;
 }
+
+export type VerifiedCanonicalProjectionSnapshot = VerifiedCanonicalProjectionSnapshotBase & (
+  | Readonly<{
+      schemaVersion: 1;
+      coreChecksums: Readonly<Record<ProjectionNameV1, string>>;
+      rows: Readonly<Record<ProjectionNameV1, readonly CanonicalProjectionRow[]>>;
+    }>
+  | Readonly<{
+      schemaVersion: 2;
+      coreChecksums: Readonly<Record<ProjectionName, string>>;
+      rows: Readonly<Record<ProjectionName, readonly CanonicalProjectionRow[]>>;
+    }>
+);
 
 export function readVerifiedCanonicalProjectionSnapshot(
   binding: ProjectBinding,
   manifestValue: unknown,
-  options: ProjectionIntegrityServiceOptions,
+  options: ProjectionIntegrityServiceOptions & Readonly<{
+    sourceSnapshot: ProjectionEventSnapshot;
+  }>,
 ): VerifiedCanonicalProjectionSnapshot;
 ```
 
 This function must use the existing manifest parser, stable file identity, immutable image, schema/table/index checks, canonical row conversion, and core-checksum verification. It returns deep-frozen logical rows only after all checks pass and never returns the database handle or path. V1 schema-1 and V2 schema-2 core checksum strings are not required to equal one another; each side's declared checksum must equal its own recomputed canonical rows. A declared/recomputed mismatch on either side is the never-excludable `core-checksum` integrity category.
+
+The explicit caller-owned source snapshot is required: V1 receives the verified source-copy snapshot; V2 receives only a snapshot opened through Task 7's committed-import reader. Reuse Task 8's authentication/image machinery and retain existing `verify()` behavior. Extract rows from the same pinned private image that passed verification, not a later pathname reopen. A narrow builder helper may return the verified V1 rows together with their checksums; preserve Task 8's existing checksum-only helper contract by delegation if needed. Caller closes each supplied snapshot reliably, and no source/package bytes may substitute for committed V2 input.
+
+The comparison view must explicitly distinguish native storage from logical equivalence. V1 `sessionTree` is the latest checkpoint per session, so its checkpoint fields compare with the latest authenticated V2 `sessionCheckpoints` row for that session, not with V2's lifecycle-shaped `sessionTree`. Check full V2 checkpoint history and lifecycle authority against the authenticated original source sequence, including exact counts/order/IDs; those fields are never exception-eligible. Likewise, V2 `source_event_id`/anchor and scope/provenance must be verified against their exact authenticated original events, never dropped merely because V1 does not persist the same column. Preserve native core checksums separately from these views. For other schema-only representation fields, use explicit deterministic field mappings or report a governed/blocking difference; distinguish an absent field from a present null. No unknown row/field or unmappable authority state may silently become equal. Cover a real nonempty checkpoint history, metadata/provenance tamper, missing versus null, and both native schema domains in tests.
 
 - [ ] **Step 4: Implement immutable rule decoding and unique matching.**
 
@@ -1658,7 +1703,7 @@ export interface RedactedParityFindingV1 {
 
 Hash canonical scalar values with domain `project-memory/v2-parity-value/v1`; hash field paths before report output. The report contains only terminal identities, manifest/core-checksum digests, counts, findings, matched rule IDs, sealed retrieval parity, and `reportChecksum` over canonical redacted JSON.
 
-For sealed retrieval parity, pin reader leases for both generations, build two `InternalRetrievalService` instances with `SqliteRetrievalCandidateRepository`, call `evaluateSealedRetrieval` for absolute threshold evidence, and also run every sealed query through both services. Canonicalize each result to item IDs, statuses, visibility, source-event positions, citation identities, ranks, conflict closure, and temporal eligibility; hash the canonical result and citation vector per query. Vector/provider channels remain disabled as required by `assertSealedEvaluationVectorDisabled`. Classify mismatched result/citation/order hashes through the same exact-rule engine; identity/scope/temporal/conflict/citation-integrity drift is never excludable.
+For sealed retrieval parity, pin reader leases for both generations, build two `InternalRetrievalService` instances with the V1 repository and lease-preserving V2 adapter described above, call `evaluateSealedRetrieval` for absolute threshold evidence, and also run every sealed query through both services. Canonicalize each result to item IDs, statuses, visibility, source-event positions, citation identities, ranks, conflict closure, and temporal eligibility; hash the canonical result and citation vector per query. Vector/provider channels remain disabled as required by `assertSealedEvaluationVectorDisabled`. Classify mismatched result/citation/order hashes through the same exact-rule engine; identity/scope/temporal/conflict/citation-integrity drift is never excludable.
 
 ```ts
 export interface SealedRetrievalParityV1 {
@@ -1702,7 +1747,7 @@ Run:
 
 ```powershell
 npm run test:build
-node --test --test-concurrency=1 --test-reporter=spec dist-test/tests/v2-snapshot-parity.test.js dist-test/tests/projection-integrity.test.js dist-test/tests/projection-schema.test.js dist-test/tests/retrieval-evaluation.test.js
+node --test --test-concurrency=1 --test-reporter=spec dist-test/tests/v2-snapshot-parity.test.js dist-test/tests/projection-integrity.test.js dist-test/tests/projection-schema.test.js dist-test/tests/retrieval-evaluation.test.js dist-test/tests/v2-shadow-migration-repository.test.js dist-test/tests/projection-builder.test.js
 npm run typecheck
 ```
 
@@ -2170,12 +2215,14 @@ const APPROVED_SEALED_AND_ROLLOUT_SOURCE_DIFF = Object.freeze([
   "src/orchestrator/migration/v2-shadow-projection.ts",
   "src/orchestrator/parity/v2-expected-difference.ts",
   "src/orchestrator/parity/v2-snapshot-parity.ts",
+  "src/orchestrator/projections/builder.ts",
   "src/orchestrator/projections/checksum.ts",
   "src/orchestrator/projections/contracts.ts",
   "src/orchestrator/projections/event-reader.ts",
   "src/orchestrator/projections/folds.ts",
   "src/orchestrator/projections/integrity.ts",
   "src/orchestrator/projections/manifest.ts",
+  "src/orchestrator/projections/schema.ts",
   "src/orchestrator/projections/source-event-codec.ts",
   "src/orchestrator/rollout/rollout-cohort.ts",
   "src/orchestrator/rollout/rollout-control-plane.ts",
