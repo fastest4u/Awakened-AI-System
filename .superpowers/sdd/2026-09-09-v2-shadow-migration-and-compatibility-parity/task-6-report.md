@@ -32,3 +32,15 @@ Status: DONE
 - Combined regression gate: 64 tests, 64 passed, 0 failed (`v2-shadow-importer`, `event-store`, and `event-append-transaction`).
 - `npm run typecheck`: passed.
 - Coverage includes exact wrapper streams/types/source refs/metadata, full production authentication, three-store deterministic IDs/hashes/checksum/positions, policy and EventStore count/byte exact and plus-one boundaries, oversized single-event zero-write failure, malformed artifacts, changed package bytes, committed-response/receipt conflicts, unknown-outcome recovery, replay, and result immutability.
+
+## Fix round 1
+
+- Replaced complete-package planning with incremental bounded-batch consumption; a regression proves the first count-bounded batch is durably appended before the next package record is consumed.
+- Corrected `maxEventBytes` to use the authenticated source record byte length. Exact bytes pass and plus one fails with zero writes; full canonical command sizing remains exclusively under the batch/EventStore limits.
+- Hardened receipt replay by loading the exact durable event at the receipt position, resolving its predecessor, authenticating it with the production authenticator, and checking receipt position/hash/time plus wrapper type, payload, stream, and source reference.
+- RED selector initially failed 7/7 across eager consumption, source-byte exact boundary, and independent receipt position/hash/time/missing-event cases. After remediation it passed 7/7.
+- Final importer suite passed 19/19. Final combined importer/EventStore/event-append regression gate passed 71/71, and `npm run typecheck` passed.
+
+### Remaining specification blocker
+
+Task 6 requires each batch time to be `manifest.createdAt + batchOrdinal milliseconds`, but the approved `V2MigrationPackageManifestV1` contract has no `createdAt` member. Adding it canonically requires changing Task 4's manifest key set, package writer, parser/checksum behavior, and tests outside the Task 6 two-file implementation scope. This fix round therefore does not invent an epoch or silently expand the package contract; deterministic package-clock compliance remains blocked pending explicit scope/authority expansion.

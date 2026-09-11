@@ -54,6 +54,12 @@ function artifactPackage(base: SealedV2MigrationPackage, bytes: Uint8Array, over
   return packageFromRecords(base, [{ descriptor: { schemaVersion: 1, ordinal: 0, kind: "legacy-artifact", sourceIdentity: hash,
     relativePath: "legacy/large.md", byteLength: override.byteLength ?? bytes.length, contentSha256: override.contentSha256 ?? hash }, *readChunks() { yield bytes; } }]);
 }
+function streamingPackage(base: SealedV2MigrationPackage, connection: SqliteConnection): SealedV2MigrationPackage {
+  const package_ = repeatedSourcePackage(base, 2); const records = [...package_.records()];
+  return { ...package_, *records() { yield records[0]!;
+    if (Number(connection.prepare("SELECT count(*) AS count FROM events").get()?.count) === 0) throw new Error("EAGER_PACKAGE_MATERIALIZATION");
+    yield records[1]!; } };
+}
 function importerWithPolicy(f: Awaited<ReturnType<typeof fixture>>, policy: ShadowMigrationPolicyV1): V2ShadowImporter {
   return new V2ShadowImporter({ connection: f.connection, statements: new SqliteEventStoreStatements(f.connection), maintenance: new MaintenanceFence(),
     branchScopes: new BranchScopeRepository(), repository: f.repository, policy });
@@ -155,6 +161,11 @@ test("uses the policy event-count boundary exactly and starts a new batch at plu
   } finally { over.close(); exact.close(); }
 });
 
+test("streams one bounded batch before consuming the next package record", async t => { const f=await fixture(t); try {
+  const package_=streamingPackage(f.sealedPackage,f.connection); const importer=importerWithPolicy(f,{...f.policy,maxBatchEvents:1} as ShadowMigrationPolicyV1);
+  assert.equal(importer.import({context:f.context,sealedPackage:package_}).recordCount,2); assert.deepEqual(commandGroupSizes(f),[1,1]);
+} finally { f.close(); } });
+
 test("uses the EventStore event-count boundary exactly and starts a new batch at plus one", async t => {
   const exact = await fixture(t); const over = await fixture(t);
   try {
@@ -179,6 +190,15 @@ test("uses full canonical-command bytes for the policy exact and plus-one bounda
       .import({ context: over.context, sealedPackage: overPackage }), limitExceeded);
     assert.equal(Number(over.connection.prepare("SELECT count(*) AS count FROM events").get()?.count), 0);
   } finally { over.close(); exact.close(); probe.close(); }
+});
+
+test("applies maxEventBytes to authenticated source-record bytes at exact and plus-one boundaries", async t => {
+  const exact=await fixture(t); const over=await fixture(t); const bytes=Buffer.from("x".repeat(64));
+  try { const exactPackage=artifactPackage(exact.sealedPackage,bytes); const overPackage=artifactPackage(over.sealedPackage,bytes);
+    assert.equal(importerWithPolicy(exact,{...exact.policy,maxEventBytes:64} as ShadowMigrationPolicyV1).import({context:exact.context,sealedPackage:exactPackage}).recordCount,1);
+    assert.throws(()=>importerWithPolicy(over,{...over.policy,maxEventBytes:63} as ShadowMigrationPolicyV1).import({context:over.context,sealedPackage:overPackage}),limitExceeded);
+    assert.equal(Number(over.connection.prepare("SELECT count(*) AS count FROM events").get()?.count),0);
+  } finally { over.close(); exact.close(); }
 });
 
 test("uses the EventStore canonical-byte boundary exactly and classifies plus one as a migration limit", async t => {
@@ -241,6 +261,24 @@ test("accepts exact imported receipts on replay and rejects a conflicting receip
       error => error instanceof ShadowMigrationError && error.code === "MIGRATION_IDENTITY_CONFLICT");
     assert.equal(Number(conflict.connection.prepare("SELECT count(*) AS count FROM events").get()?.count), 0);
   } finally { conflict.close(); exact.close(); }
+});
+
+test("rejects independently mismatched receipt position, hash, time, and missing durable event", async t => {
+  for (const variant of ["position","hash","time","missing"] as const) await t.test(variant, async child => {
+    let failed=false; const faults: EventStoreFaultInjector={hit(boundary){if(!failed&&boundary==="after-commit-before-response"){failed=true;throw Error("lost")}}};
+    const f=await fixture(child,variant==="missing"?undefined:faults); const package_=artifactPackage(f.sealedPackage,Buffer.from("receipt"));
+    try {
+      if(variant!=="missing") assert.throws(()=>f.importer.import({context:f.context,sealedPackage:package_}),unknown);
+      const event=f.connection.prepare("SELECT global_position,event_hash,recorded_at FROM events LIMIT 1").get(); const descriptor=package_.manifest.recordDescriptors[0]!;
+      f.repository.transact(f.context.binding.projectId,package_.migrationIdentity,tx=>tx.insertImportedRecords([{projectId:f.context.binding.projectId,
+        migrationIdentity:package_.migrationIdentity,sourceOrdinal:0,sourceKind:descriptor.kind,sourceRecordHash:descriptor.contentSha256,
+        importedEventId:deterministicMigrationUuid("event",package_.migrationIdentity,0),
+        importedGlobalPosition:variant==="position"?2n:(event?.global_position as bigint|undefined)??1n,
+        importedEventHash:variant==="hash"?"f".repeat(64):(event?.event_hash as string|undefined)??"f".repeat(64),
+        recordedAt:variant==="time"?"2026-09-10T00:00:01.000Z":(event?.recorded_at as string|undefined)??NOW}]));
+      assert.throws(()=>f.importer.import({context:f.context,sealedPackage:package_}),error=>error instanceof ShadowMigrationError&&error.code==="MIGRATION_IDENTITY_CONFLICT");
+    } finally { f.close(); }
+  });
 });
 
 test("returns immutable result arrays", async t => { const f=await fixture(t); try {
