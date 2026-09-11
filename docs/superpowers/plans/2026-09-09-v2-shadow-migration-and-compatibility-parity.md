@@ -39,7 +39,7 @@
 - [x] Task 6: deterministic committed V2 shadow import.
 - [x] Task 7: projection input reconstructed only from committed imports.
 - [x] Task 8: verified V1-reference and V2-shadow projection publication.
-- [ ] Task 9: expected-difference governance, row parity, and sealed retrieval parity.
+- [x] Task 9: expected-difference governance, row parity, and sealed retrieval parity.
 - [ ] Task 10: isolated compatibility materialization.
 - [ ] Task 11: durable orchestration, retry, and reconciliation.
 - [ ] Task 12: three-run rehearsal plus fourth-run no-op evidence.
@@ -49,6 +49,8 @@
 Task 7 closure (2026-09-11): implementation `f314c58e86040c332846e65fd7b094896ea0f69f`, reviewed correction `b6c9dab575bbe18e18b6463072adcbb31cb0220c`; focused gate 148/148, build/typecheck passed, independent specification/quality review approved.
 
 Task 8 closure (2026-09-11): implementation `36c5f9d015ddd94e99d95c49072286a4bdf926b2`, reviewed correction `375aa6fa780f1870ca0f9c470f153e46cebd08df`; independent specification/quality review approved all three findings. Final clean six-file gate 143/143, zero failures/skips, build/typecheck passed on the reviewed code. Earlier 128/133 gate failure remains recorded, not relabeled. Tasks 9–14 remain open; V1 remains sole caller authority and V2 is not activated.
+
+Task 9 closure (2026-09-12): implementation `9c7481a112799ae59cc122ebaaf0ced7a61ce556`; clean nine-file gate 122/122, zero failures/skips, build/typecheck passed. Additional Git-helper/resolver/protocol/lifecycle gate 63/63 and unchanged coordinator deadline controls 8/8 passed. Independent review identified one missing wrong-connection ownership regression; test-only fix `f3d966503a56007fdf8c594ed92ca21276c2351c` passed focused 1/1, complete parity 14/14, fresh build/typecheck and diff checks. Scoped re-review accepted specification and quality with no remaining findings. The 122/122 gate precedes the test-only fix; it is not described as a rerun. Earlier failed gates remain recorded, not relabeled. Task9 and its seven steps are complete; Tasks10–14 remain open. STOP HERE at the user's request: do not begin Task10 without a new request. Existing later-task preflight notes are preparation only. V1 remains the sole caller authority; no V2 activation, production-primary claim or deployment.
 
 ## File Structure
 
@@ -65,9 +67,14 @@ Task 8 closure (2026-09-11): implementation `36c5f9d015ddd94e99d95c49072286a4bdf
 | `src/orchestrator/parity/v2-expected-difference.ts` | Exact immutable rule decoder, forbidden-category guard, time/revision/migration binding, and unique-match resolution. |
 | `src/orchestrator/parity/v2-snapshot-parity.ts` | Snapshot-aligned row/field comparison, typed classifications, redacted report construction, and checksum calculation. |
 | `src/orchestrator/materialization/v2-shadow-compatibility.materializer.ts` | Exact compatibility-outbox claim, isolated path enforcement, atomic byte publication, durable acknowledgement, and reconciliation. |
+| `src/orchestrator/materialization/stable-compatibility-directory.ts` | Internal pinned-directory preparation, publication and durable verification client; no repository authority. |
+| `src/orchestrator/materialization/stable-compatibility-directory.worker.ts` | Hidden bounded child using relative operations and the unchanged atomic replacer under a verified directory identity. |
 | `src/orchestrator/migration/v2-shadow-migration-runner.ts` | Phase orchestration, bounded retry/backoff, durable resume, fail-closed reconciliation, source re-verification, and final result. |
 | `src/orchestrator/migration/v2-shadow-migration-evidence.ts` | Canonical redacted release-evidence document and checksum. |
+| `src/orchestrator/migration/v2-shadow-migration-rehearsal.ts` | Internal compiled rehearsal composition; not imported by any public production entry point. |
 | `scripts/run-v2-shadow-migration-rehearsal.js` | Explicit command-line entry for three clean runs plus a fourth no-op against configured isolated roots. |
+| `scripts/smoke-v2-shadow-compatibility.js` | Built-only internal worker smoke, later extended with rehearsal entry refusal checks. |
+| `scripts/build.js` | Adds separate internal worker/rehearsal artifacts without changing public V1 composition. |
 | `tests/support/v2-shadow-migration-fixture.ts` | Generates production-shaped SQLite/WAL sources, manifests, rollout revisions, isolated targets, and deterministic fault seams using production writers. |
 | `tests/v2-shadow-migration-contracts.test.ts` | Policy, identity, phase, error, and revision-binding contract tests. |
 | `tests/v1-source-copy.test.ts` | Source alias/symlink/replacement/schema/scope/limit/chain and mutation tests. |
@@ -1535,6 +1542,15 @@ git commit -m "feat: verify V2 shadow projections"
 - Test: `tests/v2-shadow-migration-repository.test.ts`
 - Modify: `src/orchestrator/projections/builder.ts` (expose verified schema-V1 logical rows through the existing private-image helper without duplicating table definitions or changing normal builds)
 - Test: `tests/projection-builder.test.ts` (only if the helper change needs additional coverage beyond the new integrity/parity tests)
+- Modify: `src/orchestrator/retrieval/evaluation.ts` (six production-or-legacy identity decoders and narrowly scoped source-event lifecycle witness parsing; preserve generic secret guards and evaluation semantics)
+- Test: `tests/retrieval-evaluation.test.ts` (production UUID/witness round trip, malformed identities/witnesses, secret rejection, and legacy corpus preservation)
+- Modify: `src/orchestrator/retrieval/contracts.ts` (only internal request binding project/vault/store identity validation through the existing shared predicate)
+- Test: `tests/retrieval-service.test.ts` (production/legacy request identity acceptance and hostile identity rejection; existing service behavior unchanged)
+- Modify: `tests/fixtures/project-store-lifecycle-runtime-worker.ts` (optional validated root-checkpoint fixture overrides only; private authority/defaults unchanged)
+- Create: `tests/v2-parity-lifecycle-fixture.test.ts` (default operation, valid repeated checkpoint/artifact history, malformed/authority override rejection)
+- Create: `tests/support/recording-git-command-runner.ts` (bounded fixture diagnostic decorator around the unchanged production Git runner)
+- Create: `tests/recording-git-command-runner.test.ts` (production delegation, bounded retry and diagnostic regression)
+- Modify: `tests/fixtures/project-store-lifecycle-child.ts` (extract only the existing recording Git runner into the test helper; no lifecycle/context/protocol changes)
 
 **Interfaces:**
 - Consumes: verified V1/V2 projection generations, rollout revision/migration identity, migration policy rule version/age, repository rule/report operations, existing canonical projection row readers, `SealedRetrievalEvaluationCorpusV2`, and two internal retrieval services bound to the pinned V1/V2 generations.
@@ -1548,26 +1564,46 @@ The pure rule module exports `expectedDifferenceRuleChecksum(rule: Omit<Expected
 
 Before any rule/report/phase transaction, enforce the same target connection ownership restored by Task 8: the repository used for writes must be constructed from the file-identity-verified isolated target connection, not independently injected from an unchecked store. Verify the run/revision/package/terminal bindings before accepting evidence; test wrong/protected target refusal. Preserve the protected-root and error-redaction contracts, and raise a concrete narrow shared-helper need before widening runtime file scope.
 
+The Task 8 target guard is private. Keep the equivalent narrow path/connection identity and protected source/package/live/projection-root checks private in the new parity module, revalidating before write transactions; do not widen Task 8's runtime scope just to extract a helper. These checks never authorize reopening a supplied independent repository.
+
+The governed integration fixture must use a real, source-authenticated schema difference: V1 omits artifact `symbol`, whereas V2 persists present null for V1-compatible checkpoint artifacts. Non-null symbol comes from governed schema-3 memory sources, which the V1 decoder/fold rejects; do not widen that boundary to manufacture the fixture. Absence remains distinct from present null/value. Use a separate exact representation rule for each eligible metadata-only difference, including `commit_hash` and `heading` if the comparison view exposes their corresponding absent/null distinction; never silently omit extra fields to force a single finding. The fixture must pass ordinary image/source integrity; do not mutate a summary or inject unverified rows to manufacture an approved difference. A changed summary belongs in the blocking integrity matrix because both authentic writers preserve it. Follow-up active/terminal status is protected authority and is never exception-eligible. Independent retrieval/citation drift remains blocking even when a metadata representation rule matches. Cover unsupported source rejection separately.
+
 For retrieval, retain the existing V1 candidate repository for the V1 lease. The V2 side must use `V2SqliteRetrievalCandidateRepository` with the original verified V2 evaluation lease/private image. A narrowly scoped V1 metadata facade for `InternalRetrievalService` may follow the existing bridge in `tests/retrieval-evaluation.test.ts`; map each request facade to its retained original V2 lease, reject V1 pathname access, and close per-query facades and retained leases at their correct ownership boundaries. Do not widen the shared V1 manifest decoder, candidate repository, or production composition. Test the original lease identity, prohibited pathname access, and cleanup on success and failure.
 
-- [ ] **Step 1: Write parity/rule RED tests.**
+The sealed evaluator's `eligibleScope()` and `parseProjectBinding()` still require legacy 64-hex project/vault/store IDs. Align only these six field decoders with `isProjectionProjectStoreIdentity` from `projections/contracts.ts`: exact lowercase UUIDv4 or legacy lowercase 64-hex, without coercion. Keep workspace hash-only, existing event/session/branch UUID rules, source authentication, bundle hashing, corpus minimums, thresholds and evaluator behavior unchanged. Parse the production UUID fixture through the actual sealed bundle parser and evaluate the migrated pinned generations; never cast an unsealed corpus or substitute unrelated legacy-hash stores. Test both accepted identity domains and wrong UUID version/case/length/NUL/malformed input.
+
+**Request-boundary correction (2026-09-11):** The unchanged `validateInternalRetrievalRequest` calls a private binding decoder that still requires all project/vault/store/workspace fields to be 64-hex, before any lease is pinned. Align only project/vault/store with `isProjectionProjectStoreIdentity`; workspace stays hash-only. Preserve exact own-data decoding, null binding sessionId, existing request session/branch/visibility/global-scope rules, bounds, normalization of query text, lease checks and service behavior. Cover both valid identity domains and wrong UUID version/case/length/NUL/non-string identities for each field, workspace UUID refusal, and getter non-invocation. Real UUID-backed V1/V2 service execution remains covered by the parity integration; do not introduce a facade that changes project identity or bypasses request validation. No candidate/eligibility/service behavior changes or public route edits are authorized. Add the existing retrieval-service test file to the final gate and propagate this internal source path to Task13's allowance.
+
+**Production witness correction (2026-09-11):** `plainRecord(event)` currently applies a generic secret-text regexp to the whole serialized `lifecycleIntentJson`; valid canonical production witnesses necessarily contain schema keys `authorization`, `authorizationKind` and `authorizationSessionId`. At the direct source-event property only, add a private strict witness-string path using the unchanged `decodeLifecycleIntentWitness`. Preserve the original string byte-for-byte and its property order in the sealed source hash. Require the existing primitive/UTF-8 size/NFKC/control/depth/descriptor rules, exact canonical production witness decoding and its secret/proof/bearer rejection. Apply the evaluator's existing secret-text checks to actual witness string values and all non-schema structural keys; only the exact authorization structural keys at their decoder-defined locations are exempt from that text scan. The same names in user text, nested arbitrary JSON or other event/query fields remain forbidden. No generic `safeText`/regexp relaxation, substring replacement of authoritative bytes, nullification/omission of witnesses, unsealed corpus cast or production witness/authenticator change is allowed. Null/absent legacy witness behavior stays unchanged. Add production-writer witness round-trip/source-hash preservation, malformed/noncanonical/extra-key/secret/bearer/NFKC/oversize rejection, accessor-with-zero-invocation and wrong-location tests. Full source/event-chain authentication and all evaluator thresholds remain mandatory downstream; this parsing seam does not itself grant event authority.
+
+For the production-backed Task 9 test fixture, existing synthetic corpus payloads may be replayed through the appropriate production writers under fresh UUID bindings before source-copy verification/sealing: use the current authorized LifecycleCommandStore/start/checkpoint path for the lifecycle prefix and EventStore for ordinary memory records. Generic memory commands cannot substitute for lifecycle authorization. This test-data construction does not authorize identity normalization of an already sealed/runtime source. Preserve source event types/versions, payload semantics, and every scoped distinction needed by the queries; use actual writer hashes/witnesses. Map any newly assigned synthetic IDs consistently to fixture identity/citation references before sealing, and use actual emitted counts/positions rather than forcing historical counts. A fixed representative subset covering all nine existing critical classes may be sealed for the focused integration fixture, with unchanged query texts/judgments and absolute thresholds, explicit identity and insertion-position reference mapping as bounded below, and genuinely measured V1 baseline metrics for that subset. Evaluate every query in that newly sealed subset and record its selected IDs/source counts and writer helper/mapping in the report. Preserve shipped fixture JSON and the full 500-query evaluator regression in the final gate; the subset is not whole-rehearsal evidence. Do not relax authorization/trigger/citation/decoder rules, synthesize candidates from answers, or invent baseline metrics.
+
+**Fixture stream/order correction (2026-09-11):** Original corpus memory records carry session visibility and a non-null session binding. Preserve their original session stream semantics; the unchanged V2 fold advances that session's latestStreamVersion for each such material event. A separate memory stream starting at version1 is invalid and must not be compensated by nulling scope or changing the fold. For the optional additional history/artifact checkpoint, emit it through the authorized lifecycle writer immediately after the initial checkpoint, before replaying the original memory records. Preserve the relative order and contents of all original records. Derive stream versions/counts from the resulting writer sequence and translate only fixture event-position references by the insertion: original memory positions3..504 become4..505, and the selected queries' knownAt/required terminal504 becomes505. Apply the same exact translation to any actual position/citation references before sealing; do not rewrite IDs/text/judgments or arbitrarily scale numeric fields. No extra checkpoint means no insertion/position translation. Record the mapping and genuinely remeasure the V1 subset baseline. This test-only preparation is not mutation of a sealed/runtime corpus, and no Task7/8 producer or source/fold decoder change is authorized.
+
+**Focused query coverage correction (2026-09-11):** Cover every expectation subgroup consumed by the unchanged absolute metric gate, not only the nine critical-class labels. Use the fixed original query IDs `0001/0057/0113/0169/0170/0225/0281/0337/0393/0449` (all with the existing `eval-v2-` prefix): adding `0170` supplies the missing next-action denominator without removing another query. Preserve texts, judgments, scopes, thresholds and the exact fixture identity/position translation; genuinely remeasure the ten-query baseline. Keep the full shipped 500-query final regression unchanged. Fixture rollout revisions must be created through the existing production `RolloutControlPlane.createRevision` after V1 baseline preparation and remain off, as required by the global production-writer constraint.
+
+**Pure ordering negative fixture correction (2026-09-11):** The fixed ten queries each return one item, so reversing those results does not test ordering. Keep that standard fixture unchanged. In a separate optional ranking-only fixture mode, append exactly two new schema-2 memory records through the existing production EventStore after the original sequence and before source-copy verification/sealing. Use two distinct valid fixture-owned item identities, the same eligible session/project scope, and a unique common lexical token absent from the original source; construct source content and two-item relevance/citation judgments independently before querying. Preserve every original event/query and its temporal semantics; derive actual counts/positions from the writer (506 events without the optional history checkpoint), and bind the new query's knownAt/required position to the new terminal. Add exactly one dedicated query for that pair to the otherwise unchanged ten-query corpus, genuinely measure/seal its V1 baseline, and prove both unmodified V1/V2 services return the same two real items/citations with passing absolute thresholds. The negative fault may then only swap those two actual V2 result objects; membership, fields, citations, scope and source positions remain identical. Assert the swap was nontrivial, per-query ordered evidence differs and parity blocks without phase advancement. Do not substitute a membership-changing fault for pure-order coverage, infer candidate rows from judgments, modify production retrieval behavior, or export a runtime seam only for this test. No shipped corpus or standard fixture changes.
+
+**Functional integrity fixture clock correction (2026-09-12):** Inventory confirms exactly two V2 setup coordinators in `tests/projection-integrity.test.ts`: common `createFixture` publication and the historical V2 image publication. These construct semantic integrity fixtures, not caller-deadline tests. Configure only those two instances with the existing injected coordinator clock `now: () => 0`, matching the established `publishedV2CoordinatorFixture` in coordinator tests. Retain both `10_000` caller arguments, builder timestamps, real SQLite/source authentication/publication and every integrity assertion. This is a new Task9 test-only scope ruling, not a claim that the older Task5R amendment already authorized this file. Do not change production coordinator clocks/checks, stable-directory `MUTATION_TIMEOUT_MS = 5_000`, runtime timeout values, shared helpers, or release configuration; these functional fixtures no longer constitute wall-clock performance evidence. After build, run the complete integrity file and the unchanged compiled coordinator cases selected by `--test-name-pattern='deadline|expir'` serially, preserving explicit V1/V2 zero/elapsed/no-late-publication/lock-release assertions. Then require a clean complete eight-file Task9 gate and typecheck on the amended code. Keep both failed complete runs and the unchanged four-case diagnostic distinct. A recurring native-child timeout remains a blocker requiring its own diagnosis, never an automatic timeout increase or retry loop.
+
+**Production-faithful Git fixture correction (2026-09-12):** The private child's recording Git runner duplicates production spawning but omits the current production runner's one `ETIMEDOUT` retry. This observed contract drift is independently actionable; it does not establish the cause of full-gate37908's unclassified `GIT_PROBE_FAILED`, which did not recur in focused56912. Extract only the existing recording runner, diagnostic types and bounds into `tests/support/recording-git-command-runner.ts`. Delegate execution to the unchanged `SpawnSyncGitCommandRunner` using its existing injected spawn boundary, recording each actual attempt; do not copy the retry selector. Preserve the existing caps (16 probes, 8 arguments, 8 KiB text), NUL rejection and frozen diagnostic snapshots. Return the production runner's result without diagnostic truncation changing command semantics. The child imports this helper; lifecycle authorization, context, messages and client forwarding remain unchanged. Preserve scoped parity diagnostics as typed phase/reason/status/error-code only, with no paths, arguments or raw output. Add deterministic boundary tests for timeout-then-success, repeated timeout stopping at two attempts, non-timeout and failed-exit no retry, exact options/arguments, production return semantics, and bounded immutable diagnostics. The existing real Git resolver and Gitless-PATH protocol tests remain unchanged. Build, then serially run the new helper, existing git-workspace resolver, lifecycle protocol and parity lifecycle fixture tests; follow with a clean complete nine-file Task9 gate and typecheck. No production source edits, new retry policy, timeout/buffer/shell/env changes or broad fixture extraction. This supersedes the older no-child-edit restriction only for this extraction/delegation. Add the helper regression to the future Task13 focused gate; do not implement Task13 now.
+
+The existing private lifecycle fixture's `record-root-checkpoint` currently hardcodes version/base position 1 and an empty draft. Extend only that test worker operation with optional strictly validated expected stream version, expected base event position and checkpoint draft data. Preserve existing defaults exactly. Use production command/checkpoint decoders; retain root/session/project/binding/agent and capability material internally, with no authority/context/arbitrary command override. Existing generic child/client forwarding should remain unchanged. The dedicated fixture test must prove the default call still works, a second valid checkpoint with artifact metadata is produced through the real authorized path, and malformed/extra/authority override fields fail before semantic writes. Reuse this fixture from the scoped V2 test helper rather than extracting or duplicating the broad runtime factory setup.
+
+- [x] **Step 1: Write parity/rule RED tests.**
 
 Cover exact equality, one exact governed difference, blocking semantic difference, every never-excludable category, expired/future/revision-mismatched/migration-mismatched/checksum-mismatched rule, wildcard selector, multiple matching rules, projection-position mismatch, an internally invalid declared/recomputed core checksum, sealed retrieval result/citation/ranking drift, plaintext absence, and deterministic report checksum:
 
 ```ts
-test("classifies one exact approved difference without exposing values", async (t) => {
-  const fixture = await parityFixture(t, { difference: "summary-hash" });
-  const rule = approvedRule({
-    category: "semantic-value",
-    projection: "canonicalItems",
-    rowIdentityHash: fixture.rowIdentityHash,
-    fieldPath: "summary",
-    v1ValueHash: fixture.v1ValueHash,
-    v2ValueHash: fixture.v2ValueHash,
-  });
-  const report = await compareV1V2Snapshots({ ...fixture.input, rules: [rule] });
+test("classifies exact approved metadata differences without exposing values", async (t) => {
+  const fixture = await parityFixture(t, { difference: "artifact-symbol-representation" });
+  const rules = fixture.metadataDifferences.map((difference) => approvedRule({
+    ...difference, category: "representation", projection: "artifactsFiles",
+  }));
+  const report = await compareV1V2Snapshots({ ...fixture.input, rules });
   assert.equal(report.equalCount > 0, true);
-  assert.equal(report.expectedDifferenceCount, 1);
+  assert.equal(report.expectedDifferenceCount, rules.length);
+  assert.equal(rules.length > 0, true);
   assert.equal(report.blockingDivergenceCount, 0);
   assert.equal(JSON.stringify(serializeSnapshotParityReport(report)).includes(fixture.plaintextSummary), false);
 });
@@ -1597,7 +1633,7 @@ test("compares the sealed retrieval corpus through both pinned generations", asy
 });
 ```
 
-- [ ] **Step 2: Run parity tests and verify RED.**
+- [x] **Step 2: Run parity tests and verify RED.**
 
 Run:
 
@@ -1608,7 +1644,7 @@ node --test --test-concurrency=1 --test-reporter=spec dist-test/tests/v2-snapsho
 
 Expected: compilation fails because the rule decoder, verified canonical snapshot reader, and parity engine do not exist.
 
-- [ ] **Step 3: Expose canonical rows only after projection verification.**
+- [x] **Step 3: Expose canonical rows only after projection verification.**
 
 Refactor the existing integrity reader without duplicating table definitions. Preserve schema-native rows and checksums first, then construct the schema-aware comparison views required by spec 3.7. V1 has only the seven `ProjectionNameV1` domains; never invent a persisted V1 `sessionCheckpoints` checksum. Use the existing V1 manifest names and this discriminated shape:
 
@@ -1647,7 +1683,7 @@ The explicit caller-owned source snapshot is required: V1 receives the verified 
 
 The comparison view must explicitly distinguish native storage from logical equivalence. V1 `sessionTree` is the latest checkpoint per session, so its checkpoint fields compare with the latest authenticated V2 `sessionCheckpoints` row for that session, not with V2's lifecycle-shaped `sessionTree`. Check full V2 checkpoint history and lifecycle authority against the authenticated original source sequence, including exact counts/order/IDs; those fields are never exception-eligible. Likewise, V2 `source_event_id`/anchor and scope/provenance must be verified against their exact authenticated original events, never dropped merely because V1 does not persist the same column. Preserve native core checksums separately from these views. For other schema-only representation fields, use explicit deterministic field mappings or report a governed/blocking difference; distinguish an absent field from a present null. No unknown row/field or unmappable authority state may silently become equal. Cover a real nonempty checkpoint history, metadata/provenance tamper, missing versus null, and both native schema domains in tests.
 
-- [ ] **Step 4: Implement immutable rule decoding and unique matching.**
+- [x] **Step 4: Implement immutable rule decoding and unique matching.**
 
 Use exact fields:
 
@@ -1678,7 +1714,7 @@ export interface ExpectedDifferenceRuleV1 {
 
 Reject `*`, empty path segments, array wildcards, prototype keys, executable strings, fields outside the canonical comparison value, noncanonical timestamps, issued time after run start, expiry at/before run start, age beyond `maxExpectedDifferenceRuleAgeMs`, or any binding/checksum mismatch. A finding must match zero or one rule; two matches are `PARITY_RULE_INVALID`.
 
-- [ ] **Step 5: Compare aligned snapshots and persist a redacted report.**
+- [x] **Step 5: Compare aligned snapshots and persist a redacted report.**
 
 Before row comparison require exact equality of binding and terminal position/hash. Compare projections in `PROJECTION_NAMES` order; rows by canonical identity key; fields by sorted name. Classify each comparison as:
 
@@ -1702,6 +1738,8 @@ export interface RedactedParityFindingV1 {
 ```
 
 Hash canonical scalar values with domain `project-memory/v2-parity-value/v1`; hash field paths before report output. The report contains only terminal identities, manifest/core-checksum digests, counts, findings, matched rule IDs, sealed retrieval parity, and `reportChecksum` over canonical redacted JSON.
+
+**Bounded sample correction (2026-09-11):** Cap `findings` at 128 deterministic redacted samples. Select blocking findings first, then expected differences, then equal findings; preserve canonical comparison order within each class. All counts, matched rule IDs, full source/row validation and retrieval result-vector checksums cover every comparison, including findings beyond the sample cap. Accumulate bounded samples while counting, rather than retaining an unbounded all-field findings array and truncating only at serialization. The report decoder permits total counts larger than sampled counts, enforces the cap and count/class consistency, and never derives completeness from the sample. Persist/adopt the exact capped body using the existing checksum contract. Cover more than 128 comparisons, blocking/expected results beyond the early equal range, deterministic ordering/hash and serializer cap rejection. This is an internal report-format bound, not a migration-policy/configuration change or a source/query coverage reduction.
 
 For sealed retrieval parity, pin reader leases for both generations, build two `InternalRetrievalService` instances with the V1 repository and lease-preserving V2 adapter described above, call `evaluateSealedRetrieval` for absolute threshold evidence, and also run every sealed query through both services. Canonicalize each result to item IDs, statuses, visibility, source-event positions, citation identities, ranks, conflict closure, and temporal eligibility; hash the canonical result and citation vector per query. Vector/provider channels remain disabled as required by `assertSealedEvaluationVectorDisabled`. Classify mismatched result/citation/order hashes through the same exact-rule engine; identity/scope/temporal/conflict/citation-integrity drift is never excludable.
 
@@ -1741,22 +1779,22 @@ export interface SnapshotParityReportV1 {
 
 Persist rules first, then the report. If any row or retrieval blocking count is nonzero, persist the red report and throw `PARITY_BLOCKING_DIVERGENCE` without appending `parity-complete`; otherwise append the phase with the report checksum as evidence.
 
-- [ ] **Step 6: Run parity, integrity, and redaction verification.**
+- [x] **Step 6: Run parity, integrity, and redaction verification.**
 
 Run:
 
 ```powershell
 npm run test:build
-node --test --test-concurrency=1 --test-reporter=spec dist-test/tests/v2-snapshot-parity.test.js dist-test/tests/projection-integrity.test.js dist-test/tests/projection-schema.test.js dist-test/tests/retrieval-evaluation.test.js dist-test/tests/v2-shadow-migration-repository.test.js dist-test/tests/projection-builder.test.js
+node --test --test-concurrency=1 --test-reporter=spec dist-test/tests/v2-snapshot-parity.test.js dist-test/tests/projection-integrity.test.js dist-test/tests/projection-schema.test.js dist-test/tests/retrieval-evaluation.test.js dist-test/tests/v2-shadow-migration-repository.test.js dist-test/tests/projection-builder.test.js dist-test/tests/v2-parity-lifecycle-fixture.test.js dist-test/tests/retrieval-service.test.js dist-test/tests/recording-git-command-runner.test.js
 npm run typecheck
 ```
 
 Expected: all tests pass; blocking reports are durably visible but cannot advance the ledger; no raw row value appears in stored reports or thrown errors.
 
-- [ ] **Step 7: Commit parity governance.**
+- [x] **Step 7: Commit parity governance.**
 
 ```powershell
-git add src/orchestrator/parity/v2-expected-difference.ts src/orchestrator/parity/v2-snapshot-parity.ts src/orchestrator/projections/integrity.ts tests/v2-snapshot-parity.test.ts tests/projection-integrity.test.ts
+git add src/orchestrator/parity/v2-expected-difference.ts src/orchestrator/parity/v2-snapshot-parity.ts src/orchestrator/projections/builder.ts src/orchestrator/projections/integrity.ts src/orchestrator/retrieval/evaluation.ts src/orchestrator/retrieval/contracts.ts src/orchestrator/storage/v2-shadow-migration.repository.ts tests/v2-snapshot-parity.test.ts tests/projection-integrity.test.ts tests/projection-builder.test.ts tests/retrieval-evaluation.test.ts tests/retrieval-service.test.ts tests/v2-shadow-migration-repository.test.ts tests/support/v2-shadow-migration-fixture.ts tests/fixtures/project-store-lifecycle-runtime-worker.ts tests/v2-parity-lifecycle-fixture.test.ts tests/support/recording-git-command-runner.ts tests/recording-git-command-runner.test.ts tests/fixtures/project-store-lifecycle-child.ts
 git commit -m "feat: prove V1 V2 snapshot parity"
 ```
 
@@ -1764,14 +1802,39 @@ git commit -m "feat: prove V1 V2 snapshot parity"
 
 **Files:**
 - Create: `src/orchestrator/materialization/v2-shadow-compatibility.materializer.ts`
+- Create: `src/orchestrator/materialization/stable-compatibility-directory.ts`
+- Create: `src/orchestrator/materialization/stable-compatibility-directory.worker.ts`
 - Create: `tests/v2-shadow-compatibility.test.ts`
+- Create: `tests/stable-compatibility-directory.test.ts`
+- Create: `scripts/smoke-v2-shadow-compatibility.js`
+- Modify: `scripts/build.js` (separate internal worker artifact only)
 - Modify: `src/orchestrator/migration/v2-shadow-importer.ts`
 - Test: `tests/v2-shadow-importer.test.ts`
+- Modify: `src/orchestrator/storage/v2-shadow-migration.repository.ts` (scoped all-outbox/claim reads using existing strict decoders; no DDL change)
+- Test: `tests/v2-shadow-migration-repository.test.ts`
+- Modify: `tests/support/v2-shadow-migration-fixture.ts` (production-backed compatibility fixture and importer constructor alignment only)
+- Modify: `tests/v2-imported-event-reader.test.ts` and `tests/v2-shadow-projection.test.ts` (importer constructor alignment only if required; retain their existing behavior tests)
 - Reuse: `src/orchestrator/materialization/atomic-artifact-replacer.ts:21-180`
 
 **Interfaces:**
 - Consumes: committed `V1LegacyArtifactImported` wrapper events, import receipts, compatibility outbox/claim/acknowledgement repository operations, isolated root, live V1 vault root, and atomic replacement.
 - Produces: `V2ShadowCompatibilityMaterializer.materializePending(input)` and `CompatibilityMaterializationResult`.
+
+**Producer/consumer corrections (2026-09-11):** Add `readCompatibilityOutbox(): readonly CompatibilityOutboxRecord[]` and `readCompatibilityClaims(): readonly CompatibilityClaim[]` to `V2ShadowMigrationTransaction`, scoped by its existing project/migration and guarded by the same active transaction lifetime. Use existing strict row decoders, frozen rows/arrays, and deterministic source-ordinal/outbox-ID ordering respectively. Preserve pending-only reads. Cover acknowledged rows remaining visible, cross-scope exclusion, immutable returned values and escaped-transaction refusal with real SQLite tests. Full outbox/claim evidence is necessary for an authenticated completed no-op; a pending-only list is not proof of completeness.
+
+The importer must construct its receipt/outbox repository from the same `dependencies.connection` used for committed EventStore readback; an independent injected repository must not control these transactions. Remove that obsolete constructor dependency and align only its scoped test/fixture call sites, with a wrong-store repository regression proving it cannot receive writes. Preserve the existing EventStore fault/replay tests and other dependency behavior. The materializer likewise owns a repository constructed from its file-identity-verified isolated target connection and validates protected roots plus run/package bindings before any claim/acknowledgement transaction.
+
+Receipt/outbox insertion is atomic in the repository transaction after exact EventStore commit readback. If receipt insertion exists on replay, require its exact outbox row, including after acknowledgement; missing, conflicting, extra or source-event-kind outboxes fail closed rather than being silently backfilled. A normal unknown EventStore commit with neither receipt nor outbox may reconcile the exact deterministic EventStore replay and insert both together. Cover receipt-transaction rollback, acknowledgement followed by importer replay, and conflicting outbox rejection without new events/revisions. Constructor alignment must not change wrapper identities, clocks or source semantics.
+
+**Stable publication correction (2026-09-11):** The unchanged `AtomicArtifactReplacer` validates absolute paths before later mutations; post-hoc root checks cannot prevent a redirected write. Add the narrowly scoped V2 client/worker above. The client exposes asynchronous parent preparation, publish-or-reconcile, and verify-only operations, bound to captured root/parent identities, forbidden authority identities, validated relative components, an attempt token, exact byte length/SHA-256, and the remaining migration deadline. Repository claims and acknowledgements remain outside this filesystem helper. Verify-only must not create a missing directory or rewrite bytes.
+
+The hidden child verifies its `.` identity on entry and executes the existing replacer with a complete operations adapter: map only its verified final parent to `.` and the exact approved target/temp tokens to validated single basenames. Open/write/rename/unlink/mkdir must never fall back to absolute mutation paths. Nested parents are prepared one component at a time from an existing verified parent using nonrecursive relative mkdir, strict entry-parent flush, and verified child entry. Reject symbolic/junction/noncanonical aliases and hardlinked files. Preserve V1 replacer, materializer, projection stable-directory and directory-durability defaults unchanged.
+
+Keep descriptors inside the child; verify lstat/fstat device/inode, regular-file type, link count one, exact descriptor-read bytes/hash and target/temp identity continuity. Use exclusive unpredictable attempt temps, never open an existing target for writing, and invoke the unchanged replacer rather than duplicating its publication sequence. Cleanup may remove only this attempt's proven-owned temp; EEXIST does not confer ownership. Ambiguous cleanup retains the isolated entry; never delete a target as rollback or perform pathname/glob cleanup. Ancestor redirection remains anchored to the verified original directory or rejects before mutation. Tests must inject at the underlying operation boundary, not only before a final check. This model assumes the isolated directory is controlled by the migration owner; it does not claim atomic leaf compare-and-swap or protection from arbitrary same-user host compromise. Evidence must state this limit, and any observed violation of protected-root isolation blocks the task rather than being reclassified as an expected difference.
+
+Open and retain the verified directory descriptor with `r+` on Windows and `r` on Linux, then fsync that exact descriptor after entry changes. Propagate every open, identity, flush, unsupported-capability and close failure; no portable silent fallback. Reconciliation reopens/verifies exact installed bytes and re-establishes file and parent durability before acknowledgement. A replacement followed by lost worker response, timeout, flush failure or acknowledgement uncertainty remains unknown until exact claim/outbox/import/target reconciliation; installed matching bytes must not be replaced again. Use bounded exact stdin/stdout messages, correlated request identity and redacted typed failures; no payloads in arguments/logs or raw child errors. Child process windows stay hidden, and no main-process cwd change is allowed.
+
+Build `src/orchestrator/materialization/stable-compatibility-directory.worker.ts` separately as `dist/internal/stable-compatibility-directory.worker.js`, using the existing Node target/build conventions. Resolve the worker as a sibling of the internal bundled rehearsal module (Task12) and of the emitted materialization helper under `dist-test`; do not rely on source TypeScript or `dist-test` at production runtime. The built-only smoke script exercises the real compiled worker against disposable isolated/protected fixtures, exact-byte publication plus verified no-op, malformed request rejection, and no protected mutations. No public entry import or automatic worker execution is introduced.
 
 - [ ] **Step 1: Add importer-outbox and materializer RED tests.**
 
@@ -1845,6 +1908,8 @@ export interface CompatibilityMaterializationResult {
 
 Derive `outboxId` with deterministic migration UUID purpose `claim` plus source ordinal. `materializationRevision` equals the source ordinal plus one. Replaying the batch must find the exact existing outbox row; any field difference is `MIGRATION_IDENTITY_CONFLICT`.
 
+Use that same deterministic `claim` UUID for the claim and acknowledgement IDs in their distinct table namespaces; do not invent a new UUID purpose or change the frozen identity algorithm. Bind `claimOwnerFingerprint` to SHA-256 of `project-memory/v2-shadow-compatibility-owner/v1\n` followed by the migration identity, never a process ID or absolute path. Outbox `recordedAt` equals its exact receipt time. Claim and acknowledgement times use the source/package creation instant plus source ordinal milliseconds. The acknowledgement checksum remains the repository's existing canonical complete acknowledgement body excluding its own checksum, with bigint fields encoded as exact decimal strings.
+
 - [ ] **Step 4: Implement exact claim, committed-event read, and atomic publication.**
 
 `materializePending` must canonicalize isolated/live roots, reject identity equality or containment, capture the isolated root identity, and process outbox rows by source ordinal. For each row:
@@ -1852,11 +1917,15 @@ Derive `outboxId` with deterministic migration UUID purpose `claim` plus source 
 1. Insert or read the deterministic claim and require exact outbox/import identities.
 2. Read the wrapper event from the target event store by exact global position; authenticate it and decode `V1LegacyArtifactImportedV1`.
 3. Require payload migration identity, source ordinal, record hash, relative path, UTF-8 byte length, triggering payload hash, and content SHA-256 to match both receipt and outbox.
-4. Resolve the path with `resolveContainedProjectPath`, reject symbolic ancestors/target, and call `AtomicArtifactReplacer.replace` with the exact bytes.
-5. Reopen the target through a file descriptor, verify root/target identities and SHA-256, fsync the file and parent directory, then append the acknowledgement.
+4. Resolve the lexical path with `resolveContainedProjectPath`, then use the pinned V2 directory client to reject aliases and call `AtomicArtifactReplacer.replace` inside its verified child with exact bytes and relative-only operations.
+5. Require verified descriptor bytes/root/target identity plus strict file/parent durability from that client, revalidate run/claim/connection identity, then append the acknowledgement.
 6. On a replace/acknowledgement interruption, verify target bytes plus claim/outbox/import rows; append the same acknowledgement only if all identities match. Otherwise throw `MIGRATION_OUTCOME_UNKNOWN` or `COMPATIBILITY_INTEGRITY_FAILURE` without replacing again.
 
 Use an injected deterministic acknowledgement clock derived from `sourceManifest.createdAt + sourceOrdinal milliseconds`; performance timing uses a separate monotonic observer. Return only counts, highest acknowledged source ordinal, target position, aggregate bytes, and an artifact-set checksum over `(relativePathHash, byteLength, contentSha256, materializationRevision)`.
+
+On every call, including a completed no-op, verify all expected artifact descriptors against exact committed receipts/outboxes/claims/acknowledgements and durable target bytes; reject extras or omissions. Reconstruct the result over the full acknowledged set, not merely rows processed in this invocation. Preserve distinct position domains: highest acknowledged imported position is a wrapper-event position, not the original source terminal event position. An authenticated zero-artifact package succeeds with zero count/bytes, null maxima/revision and a deterministic empty-set checksum; all expected source records must still be committed. Task11 completion uses this complete-set proof, never numerical equality between unrelated position domains.
+
+The stable-worker fault matrix covers replaced root/ancestors before child entry, nested mkdir, immediately before exclusive open and rename, replaced target/temp regular inode/symlink/hardlink, occupied temp, cleanup after write/fsync/close/rename failure, actual rename before lost response, strict directory flush failure, and timeout. Assert protected directory entries, identities/link counts and contents as well as actual mutating-operation targets; unchanged final bytes alone are insufficient. A retained owned temp is an explicit isolated outcome, not silently deleted. Platform-specific authority cases must actually run on the Windows/Linux release matrix; skipped privilege cases are not proof. Unit/fault tests and a local successful fsync call do not claim power-loss durability or universal filesystem support.
 
 - [ ] **Step 5: Run compatibility and existing materializer regression.**
 
@@ -1864,8 +1933,10 @@ Run:
 
 ```powershell
 npm run test:build
-node --test --test-concurrency=1 --test-reporter=spec dist-test/tests/v2-shadow-importer.test.js dist-test/tests/v2-shadow-compatibility.test.js dist-test/tests/compatibility-log-materializer.test.js dist-test/tests/lifecycle-materialization-queue.test.js
+node --test --test-concurrency=1 --test-reporter=spec dist-test/tests/v2-shadow-importer.test.js dist-test/tests/v2-shadow-compatibility.test.js dist-test/tests/stable-compatibility-directory.test.js dist-test/tests/v2-shadow-migration-repository.test.js dist-test/tests/v2-imported-event-reader.test.js dist-test/tests/v2-shadow-projection.test.js dist-test/tests/atomic-artifact-replacer.test.js dist-test/tests/compatibility-log-materializer.test.js dist-test/tests/lifecycle-materialization-queue.test.js
 npm run typecheck
+npm run build
+node scripts/smoke-v2-shadow-compatibility.js
 ```
 
 Expected: all tests pass; live V1 bytes are untouched; committed wrapper events are the only compatibility payload source; rerun is a verified no-op.
@@ -1873,7 +1944,7 @@ Expected: all tests pass; live V1 bytes are untouched; committed wrapper events 
 - [ ] **Step 6: Commit isolated compatibility materialization.**
 
 ```powershell
-git add src/orchestrator/migration/v2-shadow-importer.ts src/orchestrator/materialization/v2-shadow-compatibility.materializer.ts tests/v2-shadow-importer.test.ts tests/v2-shadow-compatibility.test.ts
+git add src/orchestrator/migration/v2-shadow-importer.ts src/orchestrator/materialization/v2-shadow-compatibility.materializer.ts src/orchestrator/materialization/stable-compatibility-directory.ts src/orchestrator/materialization/stable-compatibility-directory.worker.ts src/orchestrator/storage/v2-shadow-migration.repository.ts tests/v2-shadow-importer.test.ts tests/v2-shadow-compatibility.test.ts tests/stable-compatibility-directory.test.ts tests/v2-shadow-migration-repository.test.ts tests/v2-imported-event-reader.test.ts tests/v2-shadow-projection.test.ts tests/support/v2-shadow-migration-fixture.ts scripts/build.js scripts/smoke-v2-shadow-compatibility.js
 git commit -m "feat: materialize isolated V2 compatibility artifacts"
 ```
 
@@ -2022,12 +2093,17 @@ git commit -m "feat: orchestrate V2 shadow migration"
 
 **Files:**
 - Create: `src/orchestrator/migration/v2-shadow-migration-evidence.ts`
+- Create: `src/orchestrator/migration/v2-shadow-migration-rehearsal.ts`
 - Create: `scripts/run-v2-shadow-migration-rehearsal.js`
 - Create: `tests/v2-shadow-migration-rehearsal.test.ts`
+- Modify: `scripts/build.js` (separate internal rehearsal artifact only)
+- Modify: `scripts/smoke-v2-shadow-compatibility.js` (compiled rehearsal entry refusal checks; retain worker smoke)
 
 **Interfaces:**
 - Consumes: four verified runner results, source pre/post identities, process/runtime versions, performance/resource observations, test summaries, and review dispositions.
 - Produces: `V2ShadowMigrationEvidenceV1`, `buildV2ShadowMigrationEvidence(input)`, `writeV2ShadowMigrationEvidence(input)`, and a command-line rehearsal exit status.
+
+**Compiled composition correction (2026-09-11):** Put internal preparation/runner composition in `v2-shadow-migration-rehearsal.ts` and bundle it separately to `dist/internal/v2-shadow-migration-rehearsal.js`. The explicit JavaScript command imports only that built internal entry; it must not import source TypeScript or `dist-test`, or route through `src/index.ts`, `src/cli.ts`, a public worker, or a public service. Resolve the Task10 compatibility worker as sibling `stable-compatibility-directory.worker.js` within `dist/internal`. Preserve existing public build entries unchanged. The internal module's import performs no filesystem mutation or automatic run. Extend built smoke to load this exact artifact and reject missing/invalid configuration without mutation; the full rehearsal tests cover valid execution through the explicit command. Do not create package/CI command aliases until Task13.
 
 - [ ] **Step 1: Write evidence and rehearsal RED tests.**
 
@@ -2141,6 +2217,8 @@ Run:
 npm run test:build
 node --test --test-concurrency=1 --test-reporter=spec dist-test/tests/v2-shadow-migration-rehearsal.test.js dist-test/tests/v2-shadow-migration-runner.test.js
 npm run typecheck
+npm run build
+node scripts/smoke-v2-shadow-compatibility.js
 ```
 
 Expected: all tests pass; the three-run vector is byte-identical; the fourth run adds no semantic row/event/artifact; every red fixture exits nonzero without leaking plaintext.
@@ -2148,7 +2226,7 @@ Expected: all tests pass; the three-run vector is byte-identical; the fourth run
 - [ ] **Step 6: Commit rehearsal evidence tooling.**
 
 ```powershell
-git add src/orchestrator/migration/v2-shadow-migration-evidence.ts scripts/run-v2-shadow-migration-rehearsal.js tests/v2-shadow-migration-rehearsal.test.ts
+git add src/orchestrator/migration/v2-shadow-migration-evidence.ts src/orchestrator/migration/v2-shadow-migration-rehearsal.ts scripts/run-v2-shadow-migration-rehearsal.js tests/v2-shadow-migration-rehearsal.test.ts scripts/build.js scripts/smoke-v2-shadow-compatibility.js
 git commit -m "test: add V2 shadow migration rehearsal"
 ```
 
@@ -2176,11 +2254,13 @@ Change expectations to migration names `[event-core, session-lifecycle, qualifie
 In `ci-lifecycle-gates.test.ts`, require exact scripts:
 
 ```json
-"test:v2-shadow-migration": "npm run test:build && node --test --test-concurrency=1 --test-reporter=spec dist-test/tests/v2-shadow-migration-contracts.test.js dist-test/tests/v1-source-copy.test.js dist-test/tests/v2-migration-package.test.js dist-test/tests/v2-shadow-migration-repository.test.js dist-test/tests/v2-shadow-importer.test.js dist-test/tests/v2-imported-event-reader.test.js dist-test/tests/v2-shadow-projection.test.js dist-test/tests/v2-snapshot-parity.test.js dist-test/tests/v2-shadow-compatibility.test.js dist-test/tests/v2-shadow-migration-runner.test.js dist-test/tests/v2-shadow-migration-rehearsal.test.js dist-test/tests/ci-lifecycle-gates.test.js",
+"test:v2-shadow-migration": "npm run test:build && node --test --test-concurrency=1 --test-reporter=spec dist-test/tests/v2-shadow-migration-contracts.test.js dist-test/tests/v1-source-copy.test.js dist-test/tests/v2-migration-package.test.js dist-test/tests/v2-shadow-migration-repository.test.js dist-test/tests/v2-shadow-importer.test.js dist-test/tests/v2-imported-event-reader.test.js dist-test/tests/v2-shadow-projection.test.js dist-test/tests/v2-parity-lifecycle-fixture.test.js dist-test/tests/recording-git-command-runner.test.js dist-test/tests/v2-snapshot-parity.test.js dist-test/tests/stable-compatibility-directory.test.js dist-test/tests/v2-shadow-compatibility.test.js dist-test/tests/v2-shadow-migration-runner.test.js dist-test/tests/v2-shadow-migration-rehearsal.test.js dist-test/tests/ci-lifecycle-gates.test.js",
 "rehearse:v2-shadow-migration": "npm run build && node scripts/run-v2-shadow-migration-rehearsal.js"
 ```
 
 Require a release-gates step named `Run V2 shadow migration gate` with command `npm run test:v2-shadow-migration`, immediately after the rollout-control-plane gate and before build-artifact tests. Keep `Protect Version 1 production routing` byte-for-byte unchanged.
+
+Extend `test:build-artifacts` exactly to `npm run build && node scripts/smoke-worker.js && node scripts/smoke-v2-shadow-compatibility.js`. Seal both internal artifact paths/build entries and ensure the public bundles/entry imports remain V1-only. The Task9 lifecycle fixture and Task10 stable-directory tests above are part of the focused Windows/Linux gate, not optional local-only tests.
 
 - [ ] **Step 2: Run CI-contract and migration tests and verify RED.**
 
@@ -2204,12 +2284,15 @@ Extend the sorted sealed source list with only these new/modified internal paths
 ```ts
 const APPROVED_SEALED_AND_ROLLOUT_SOURCE_DIFF = Object.freeze([
   "src/orchestrator/identity/git-workspace.resolver.ts",
+  "src/orchestrator/materialization/stable-compatibility-directory.ts",
+  "src/orchestrator/materialization/stable-compatibility-directory.worker.ts",
   "src/orchestrator/materialization/v2-shadow-compatibility.materializer.ts",
   "src/orchestrator/migration/v1-source-copy.ts",
   "src/orchestrator/migration/v2-imported-event-reader.ts",
   "src/orchestrator/migration/v2-migration-package.ts",
   "src/orchestrator/migration/v2-shadow-importer.ts",
   "src/orchestrator/migration/v2-shadow-migration-evidence.ts",
+  "src/orchestrator/migration/v2-shadow-migration-rehearsal.ts",
   "src/orchestrator/migration/v2-shadow-migration-runner.ts",
   "src/orchestrator/migration/v2-shadow-migration.contracts.ts",
   "src/orchestrator/migration/v2-shadow-projection.ts",
@@ -2224,6 +2307,8 @@ const APPROVED_SEALED_AND_ROLLOUT_SOURCE_DIFF = Object.freeze([
   "src/orchestrator/projections/manifest.ts",
   "src/orchestrator/projections/schema.ts",
   "src/orchestrator/projections/source-event-codec.ts",
+  "src/orchestrator/retrieval/contracts.ts",
+  "src/orchestrator/retrieval/evaluation.ts",
   "src/orchestrator/rollout/rollout-cohort.ts",
   "src/orchestrator/rollout/rollout-control-plane.ts",
   "src/orchestrator/storage/migrations/0006-v2-rollout-control-plane.ts",
