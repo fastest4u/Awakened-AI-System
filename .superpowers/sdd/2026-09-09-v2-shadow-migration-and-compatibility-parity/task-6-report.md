@@ -44,3 +44,25 @@ Status: DONE
 ### Remaining specification blocker
 
 Task 6 requires each batch time to be `manifest.createdAt + batchOrdinal milliseconds`, but the approved `V2MigrationPackageManifestV1` contract has no `createdAt` member. Adding it canonically requires changing Task 4's manifest key set, package writer, parser/checksum behavior, and tests outside the Task 6 two-file implementation scope. This fix round therefore does not invent an epoch or silently expand the package contract; deterministic package-clock compliance remains blocked pending explicit scope/authority expansion.
+
+## Fix round 2
+
+- The controller authorized the smallest upstream dependency repair in the package contract: required `createdAt` is copied from the already verified source manifest, retained in the exact manifest key set, and included in the existing canonical package checksum and derived migration identity.
+- Strict reopen validation rejects missing and unknown keys plus malformed, non-canonical, and impossible timestamp forms. A valid timestamp alteration with the old checksum/identity is rejected.
+- The importer now derives its sole batch clock from `manifest.createdAt + batchOrdinal milliseconds`; source-event time and the invented 1970 artifact fallback are removed.
+- The importer clock fixture deliberately separates package creation time (`2026-09-10T00:00:10.000Z`) from source-event recorded time (`2026-09-10T00:00:00.000Z`). Exact stored `occurredAt` and `recordedAt` are covered for source-only, artifact-only, mixed, multi-batch, and replay imports.
+
+### RED evidence
+
+- `npm run test:build` — exited 1 with two expected `TS2339` errors because `V2MigrationPackageManifestV1.createdAt` did not exist.
+- After the minimal package-contract amendment, `npm run test:build` — exited 0.
+- `node --test --test-concurrency=1 --test-reporter=spec dist-test/tests/v2-migration-package.test.js` — 22 tests, 22 passed, 0 failed.
+- `node --test --test-concurrency=1 --test-reporter=spec --test-name-pattern="uses manifest creation time" dist-test/tests/v2-shadow-importer.test.js` — exited 1; 5 tests, 0 passed, 5 failed. Source-only/mixed/multi-batch used source-event time and artifact-only used the 1970 fallback instead of package creation time.
+
+### GREEN evidence
+
+- `npm run test:build` — exited 0.
+- `node --test --test-concurrency=1 --test-reporter=spec dist-test/tests/v2-migration-package.test.js dist-test/tests/v2-shadow-importer.test.js` — 46 tests, 46 passed, 0 failed.
+- `node --test --test-concurrency=1 --test-reporter=spec dist-test/tests/v2-migration-package.test.js dist-test/tests/v2-shadow-importer.test.js dist-test/tests/event-store.test.js dist-test/tests/event-append-transaction.test.js` — 98 tests, 98 passed, 0 failed.
+- `npm run typecheck` — exited 0.
+- `git diff --check` — exited 0; only line-ending notices were emitted. The controller-owned tracked implementation-plan change remained untouched and is excluded from this Task 6 commit.

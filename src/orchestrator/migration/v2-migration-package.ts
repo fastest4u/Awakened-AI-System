@@ -33,7 +33,7 @@ const MAX_CHUNK_BYTES = 64 * 1024;
 const MAX_EVENT_LINE_BYTES = 2 * 1024 * 1024;
 const MANIFEST_KEYS = ["schemaVersion", "packageFormatVersion", "migrationAlgorithmVersion", "projectId", "vaultId", "storeId",
   "workspaceId", "sourceManifestChecksum", "eventCount", "legacyArtifactCount", "aggregateSourceBytes", "terminalEventPosition",
-  "terminalEventHash", "recordDescriptors", "recordsChecksum", "buildIdentityHash", "configurationChecksum", "creationReasonCode",
+  "terminalEventHash", "createdAt", "recordDescriptors", "recordsChecksum", "buildIdentityHash", "configurationChecksum", "creationReasonCode",
   "packageChecksum"] as const;
 const DESCRIPTOR_KEYS = ["schemaVersion", "ordinal", "kind", "sourceIdentity", "relativePath", "byteLength", "contentSha256"] as const;
 
@@ -61,6 +61,7 @@ export interface V2MigrationPackageManifestV1 {
   readonly aggregateSourceBytes: number;
   readonly terminalEventPosition: string;
   readonly terminalEventHash: string;
+  readonly createdAt: string;
   readonly recordDescriptors: readonly V2MigrationRecordDescriptorV1[];
   readonly recordsChecksum: string;
   readonly buildIdentityHash: string;
@@ -272,7 +273,7 @@ function createManifest(
     projectId: sourceManifest.projectId, vaultId: sourceManifest.vaultId, storeId: sourceManifest.storeId,
     workspaceId: sourceManifest.workspaceId, sourceManifestChecksum: sourceManifest.manifestChecksum, eventCount,
     legacyArtifactCount: records.length - eventCount, aggregateSourceBytes, terminalEventPosition: sourceManifest.terminalEventPosition,
-    terminalEventHash: sourceManifest.terminalEventHash, recordDescriptors: Object.freeze([...records]),
+    terminalEventHash: sourceManifest.terminalEventHash, createdAt: sourceManifest.createdAt, recordDescriptors: Object.freeze([...records]),
     recordsChecksum: descriptorChecksum(records), buildIdentityHash: input.buildIdentityHash,
     configurationChecksum: input.configurationChecksum, creationReasonCode: "production-shaped-rehearsal" as const });
   return Object.freeze({ ...body, packageChecksum: manifestChecksum(body) });
@@ -452,6 +453,8 @@ function parseManifest(path: string): V2MigrationPackageManifestV1 {
   for (const id of [manifest.projectId, manifest.vaultId, manifest.storeId]) if (typeof id !== "string" || !UUID.test(id)) conflict();
   if (typeof manifest.workspaceId !== "string" || !HASH.test(manifest.workspaceId) || !HASH.test(manifest.terminalEventHash)
     || !/^(0|[1-9][0-9]*)$/u.test(manifest.terminalEventPosition)) conflict();
+  if (typeof manifest.createdAt !== "string" || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u.test(manifest.createdAt)
+    || Number.isNaN(Date.parse(manifest.createdAt)) || new Date(manifest.createdAt).toISOString() !== manifest.createdAt) conflict();
   for (const numeric of [manifest.eventCount, manifest.legacyArtifactCount, manifest.aggregateSourceBytes]) if (!Number.isSafeInteger(numeric) || numeric < 0) conflict();
   const descriptors = manifest.recordDescriptors.map((descriptor, ordinal) => {
     if (typeof descriptor !== "object" || descriptor === null || Reflect.ownKeys(descriptor).length !== DESCRIPTOR_KEYS.length

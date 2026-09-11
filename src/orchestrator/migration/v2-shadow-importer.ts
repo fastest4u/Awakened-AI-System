@@ -125,9 +125,7 @@ function streamBatches(package_: SealedV2MigrationPackage, policy: ShadowMigrati
 
 function planCommand(context: ProjectContext, package_: SealedV2MigrationPackage, batch: readonly PlannedRecord[], batchOrdinal: number): PlannedCommand {
   const identity = package_.migrationIdentity; const eventIds = Object.freeze(batch.map((record) => record.eventId));
-  const sourceTime = batch.find((record) => record.kind === "source-event")?.payload as V1ProjectionSourceImportedV1 | undefined;
-  const baseTime = sourceTime?.sourceEvent.recordedAt ?? "1970-01-01T00:00:00.000Z";
-  const recordedAt = new Date(Date.parse(baseTime) + batchOrdinal).toISOString();
+  const recordedAt = new Date(Date.parse(package_.manifest.createdAt) + batchOrdinal).toISOString();
   const publicResponse: ImportResponse = { schemaVersion: 1, migrationIdentity: identity, packageChecksum: package_.manifest.packageChecksum, batchOrdinal, eventIds: [...eventIds] };
   const command: AppendCommand<ImportResponse> = { context, commandId: deterministicMigrationUuid("command", identity, batchOrdinal),
     idempotencyKey: `v2-shadow-import:${identity}:${batchOrdinal}`, commandType: "ImportV2ShadowBatch",

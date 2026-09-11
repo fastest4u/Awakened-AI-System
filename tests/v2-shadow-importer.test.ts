@@ -23,8 +23,11 @@ import { applyCurrentProjectStoreSchema } from "./support/current-project-store-
 import { createV2ShadowMigrationFixture } from "./support/v2-shadow-migration-fixture.js";
 
 const driver = new NodeSqliteDriver({ DatabaseSync }); const NOW = "2026-09-10T00:00:00.000Z";
+const PACKAGE_CREATED_AT = "2026-09-10T00:00:10.000Z";
 async function fixture(t: test.TestContext, faultInjector?: EventStoreFaultInjector) {
-  const sourceFixture = await createV2ShadowMigrationFixture(t); const source = await verifyV1SourceCopy(sourceFixture.verificationInput);
+  const sourceFixture = await createV2ShadowMigrationFixture(t);
+  sourceFixture.writeManifest({ ...sourceFixture.manifest, createdAt: PACKAGE_CREATED_AT });
+  const source = await verifyV1SourceCopy(sourceFixture.verificationInput);
   const sealedPackage = await sealV2MigrationPackage({ ...sourceFixture.packageInput, source, packageRoot: sourceFixture.packageRootA });
   const connection = driver.open(`${sourceFixture.root}/target.sqlite`, { mode: "create", busyTimeoutMs: 5000 }); applyCurrentProjectStoreSchema(connection, sourceFixture.projectionBinding, NOW); connection.exec(v2ShadowMigration.sql);
   const workspace = { kind: "non-git" as const, workspaceRoot: sourceFixture.root, workspaceId: sourceFixture.projectionBinding.workspaceId };
@@ -111,6 +114,30 @@ function storedEvents(connection: SqliteConnection): StoredEvent[] {
     payload: JSON.parse(field(row, "payload_json")), payloadJson: field(row, "payload_json"), payloadHash: field(row, "payload_hash"),
     previousGlobalHash: field(row, "previous_global_hash"), eventHash: field(row, "event_hash"), lifecycleIntentJson: row.lifecycle_intent_json as string | null }));
 }
+test("uses manifest creation time plus batch ordinal for every package shape and replay", async t => {
+  // Reintroducing source-event time or an epoch fallback makes at least one package shape store the wrong deterministic clock.
+  for (const shape of ["source-only", "artifact-only", "mixed", "multi-batch"] as const) await t.test(shape, async child => {
+    const f = await fixture(child);
+    try {
+      const allRecords = [...f.sealedPackage.records()];
+      const package_ = shape === "source-only" ? packageFromRecords(f.sealedPackage, [allRecords[0]!])
+        : shape === "artifact-only" ? artifactPackage(f.sealedPackage, Buffer.from("clock"))
+        : shape === "multi-batch" ? repeatedSourcePackage(f.sealedPackage, 3)
+        : f.sealedPackage;
+      const importer = shape === "multi-batch"
+        ? importerWithPolicy(f, { ...f.policy, maxBatchEvents: 2 } as ShadowMigrationPolicyV1)
+        : f.importer;
+      const first = importer.import({ context: f.context, sealedPackage: package_ });
+      const expected = shape === "multi-batch"
+        ? ["2026-09-10T00:00:10.000Z", "2026-09-10T00:00:10.000Z", "2026-09-10T00:00:10.001Z"]
+        : Array(first.recordCount).fill("2026-09-10T00:00:10.000Z");
+      assert.deepEqual(storedEvents(f.connection).map(event => event.occurredAt), expected);
+      assert.deepEqual(storedEvents(f.connection).map(event => event.recordedAt), expected);
+      assert.deepEqual(importer.import({ context: f.context, sealedPackage: package_ }), { ...first, deduplicated: true });
+      assert.deepEqual(storedEvents(f.connection).map(event => [event.occurredAt, event.recordedAt]), expected.map(value => [value, value]));
+    } finally { f.close(); }
+  });
+});
 test("commits exact wrapper payloads and metadata and replays as a no-op", async t => {
   const f = await fixture(t);
   try {

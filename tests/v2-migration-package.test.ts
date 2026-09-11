@@ -1,17 +1,45 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import test from "node:test";
+import { canonicalJson } from "../src/orchestrator/serialization/canonical-json.js";
 import { verifyV1SourceCopy } from "../src/orchestrator/migration/v1-source-copy.js";
 import {
   openSealedV2MigrationPackage,
   sealV2MigrationPackage,
+  type V2MigrationPackageManifestV1,
 } from "../src/orchestrator/migration/v2-migration-package.js";
-import { decodeShadowMigrationPolicyV1, ShadowMigrationError, shadowMigrationConfigurationChecksum, shadowMigrationPolicyChecksum } from "../src/orchestrator/migration/v2-shadow-migration.contracts.js";
+import { decodeShadowMigrationPolicyV1, ShadowMigrationError, shadowMigrationConfigurationChecksum, shadowMigrationIdentity, shadowMigrationPolicyChecksum } from "../src/orchestrator/migration/v2-shadow-migration.contracts.js";
 import { createV2ShadowMigrationFixture } from "./support/v2-shadow-migration-fixture.js";
 
 function identityConflict(error: unknown): boolean {
   return error instanceof ShadowMigrationError && error.code === "MIGRATION_IDENTITY_CONFLICT";
+}
+
+function rewriteManifest(
+  manifestPath: string,
+  mutate: (manifest: Record<string, unknown>) => void,
+  rechecksum: boolean,
+): V2MigrationPackageManifestV1 {
+  const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as Record<string, unknown>;
+  mutate(manifest);
+  if (rechecksum) {
+    const { packageChecksum: ignored, ...body } = manifest;
+    void ignored;
+    manifest.packageChecksum = createHash("sha256")
+      .update(`project-memory/v2-shadow-migration-package/v1\n${canonicalJson(body)}`, "utf8")
+      .digest("hex");
+  }
+  writeFileSync(manifestPath, canonicalJson(manifest));
+  return manifest as unknown as V2MigrationPackageManifestV1;
+}
+
+function identityFor(manifest: V2MigrationPackageManifestV1): string {
+  return shadowMigrationIdentity({ projectId: manifest.projectId, storeId: manifest.storeId,
+    sourceManifestChecksum: manifest.sourceManifestChecksum, terminalEventHash: manifest.terminalEventHash,
+    packageChecksum: manifest.packageChecksum, migrationAlgorithmVersion: 1, buildIdentityHash: manifest.buildIdentityHash,
+    configurationChecksum: manifest.configurationChecksum });
 }
 
 test("seals identical logical packages independent of absolute path", async (t) => {
@@ -20,6 +48,8 @@ test("seals identical logical packages independent of absolute path", async (t) 
   const source = await verifyV1SourceCopy(fixture.verificationInput);
   const left = await sealV2MigrationPackage({ ...fixture.packageInput, source, packageRoot: fixture.packageRootA });
   const right = await sealV2MigrationPackage({ ...fixture.packageInput, source, packageRoot: fixture.packageRootB });
+  assert.equal(left.manifest.createdAt, fixture.manifest.createdAt);
+  assert.equal(right.manifest.createdAt, fixture.manifest.createdAt);
   assert.equal(left.manifest.packageChecksum, right.manifest.packageChecksum);
   assert.equal(left.migrationIdentity, right.migrationIdentity);
   assert.deepEqual([...left.records()].map((record) => record.descriptor), [...right.records()].map((record) => record.descriptor));
@@ -30,6 +60,42 @@ test("seals identical logical packages independent of absolute path", async (t) 
   source.assertUnchanged();
   left.close();
   right.close();
+  const reopened = openSealedV2MigrationPackage({ rootPath: left.rootPath, expectedMigrationIdentity: left.migrationIdentity });
+  assert.equal(reopened.manifest.createdAt, fixture.manifest.createdAt);
+  reopened.close();
+  source.close();
+});
+
+test("requires one canonical real source creation timestamp in the sealed manifest", async (t) => {
+  // Omitting the package timestamp or accepting malformed/non-canonical/impossible values breaks the deterministic import clock.
+  for (const variant of ["missing", "unknown", "malformed", "noncanonical", "impossible"] as const) await t.test(variant, async (child) => {
+    const fixture = await createV2ShadowMigrationFixture(child);
+    const source = await verifyV1SourceCopy(fixture.verificationInput);
+    const sealed = await sealV2MigrationPackage({ ...fixture.packageInput, source, packageRoot: fixture.packageRootA });
+    const manifestPath = join(sealed.rootPath, "package-manifest.json");
+    sealed.close();
+    const changed = rewriteManifest(manifestPath, (manifest) => {
+      if (variant === "missing") delete manifest.createdAt;
+      else if (variant === "unknown") manifest.unexpectedTimestamp = fixture.manifest.createdAt;
+      else if (variant === "malformed") manifest.createdAt = "not-a-timestamp";
+      else if (variant === "noncanonical") manifest.createdAt = "2026-09-10T07:00:00.000+07:00";
+      else manifest.createdAt = "2026-02-30T00:00:00.000Z";
+    }, true);
+    assert.throws(() => openSealedV2MigrationPackage({ rootPath: sealed.rootPath, expectedMigrationIdentity: identityFor(changed) }), identityConflict);
+    source.close();
+  });
+});
+
+test("binds createdAt through package checksum and migration identity", async (t) => {
+  // Excluding createdAt from the canonical checksum permits a stale-checksum package clock substitution.
+  const fixture = await createV2ShadowMigrationFixture(t);
+  const source = await verifyV1SourceCopy(fixture.verificationInput);
+  const sealed = await sealV2MigrationPackage({ ...fixture.packageInput, source, packageRoot: fixture.packageRootA });
+  const manifestPath = join(sealed.rootPath, "package-manifest.json");
+  const originalIdentity = sealed.migrationIdentity;
+  sealed.close();
+  rewriteManifest(manifestPath, (manifest) => { manifest.createdAt = "2026-09-10T00:00:01.000Z"; }, false);
+  assert.throws(() => openSealedV2MigrationPackage({ rootPath: sealed.rootPath, expectedMigrationIdentity: originalIdentity }), identityConflict);
   source.close();
 });
 
