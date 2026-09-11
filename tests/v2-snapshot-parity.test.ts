@@ -6,7 +6,9 @@ import { ShadowMigrationError } from "../src/orchestrator/migration/v2-shadow-mi
 import { canonicalJson } from "../src/orchestrator/serialization/canonical-json.js";
 import { decodeExpectedDifferenceRuleV1, expectedDifferenceRuleChecksum, type ExpectedDifferenceRuleV1 } from "../src/orchestrator/parity/v2-expected-difference.js";
 import { compareV1V2Snapshots, parityRowIdentityHash, serializeSnapshotParityReport, snapshotParityReportChecksum, type SnapshotParityReportV1 } from "../src/orchestrator/parity/v2-snapshot-parity.js";
-import { createSnapshotParityFixture } from "./support/v2-shadow-migration-fixture.js";
+import { createSnapshotParityFixture, createV2ShadowMigrationFixture } from "./support/v2-shadow-migration-fixture.js";
+import { v2ShadowMigration } from "../src/orchestrator/storage/migrations/0007-v2-shadow-migration.js";
+import type { SqliteConnection, SqliteStatement } from "../src/orchestrator/storage/sqlite-driver.js";
 import { InternalRetrievalService } from "../src/orchestrator/retrieval/service.js";
 import { V2SqliteRetrievalCandidateRepository } from "../src/orchestrator/retrieval/v2-candidates.js";
 import { V2ProjectionBuildCoordinator } from "../src/orchestrator/projections/coordinator.js";
@@ -96,6 +98,38 @@ test("compares authenticated pinned generations and persists deterministic redac
   const protectedBytes = readFileSync(f.liveEventStorePath);
   await assert.rejects(compareV1V2Snapshots({ ...f.input, eventStorePath: f.liveEventStorePath }));
   assert.deepEqual(readFileSync(f.liveEventStorePath), protectedBytes);
+  // Keep the valid target pathname: this refusal must reach the actual main
+  // connection identity, not the earlier protected-root or later schema guards.
+  const other = await createV2ShadowMigrationFixture(t);
+  const wrong = other.driver.open(other.liveEventStorePath, { mode: "existing", busyTimeoutMs: 5000 });
+  try {
+    wrong.exec(v2ShadowMigration.sql);
+    const databaseState = (connection: SqliteConnection) => connection.prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").all()
+      .map(({ name }) => [name, connection.prepare(`SELECT * FROM "${String(name).replaceAll('"', '""')}"`).all()
+        .map(row => JSON.stringify(row, (_key, value: unknown) => typeof value === "bigint" ? value.toString() : value)).sort()]);
+    const beforeTarget = databaseState(f.connection), beforeWrong = databaseState(wrong);
+    const changesBefore = wrong.prepare("SELECT total_changes() AS count").get()!.count;
+    const calls: string[] = [];
+    const forwarded: SqliteConnection = {
+      exec(sql) { calls.push(`exec:${sql}`); wrong.exec(sql); },
+      close() { calls.push("close"); wrong.close(); },
+      prepare(sql) {
+        calls.push(`prepare:${sql}`);
+        const statement = wrong.prepare(sql);
+        return Object.fromEntries((["all", "get", "run", "iterate"] as const).map(method => [method,
+          (...args: Parameters<SqliteStatement[typeof method]>) => { calls.push(`${method}:${sql}`); return statement[method](...args); },
+        ])) as unknown as SqliteStatement;
+      },
+    };
+    await assert.rejects(compareV1V2Snapshots({ ...f.input, connection: forwarded }),
+      (error: unknown) => error instanceof ShadowMigrationError && error.code === "MIGRATION_LEDGER_INTEGRITY_FAILURE");
+    assert.deepEqual(calls, ["prepare:PRAGMA database_list", "all:PRAGMA database_list"]);
+    assert.equal(wrong.prepare("SELECT total_changes() AS count").get()!.count, changesBefore);
+    assert.deepEqual(databaseState(wrong), beforeWrong);
+    assert.deepEqual(databaseState(f.connection), beforeTarget);
+    assert.equal(f.storedReport(), null);
+    assert.equal(f.phases().at(-1), "projection-verified");
+  } finally { wrong.close(); }
   await assert.rejects(compareV1V2Snapshots({ ...f.input, sealedRetrieval: { corpus: { ...f.corpus, queries: f.corpus.queries.slice(1) } } }));
   assert.ok(f.storedReport() === null, "an unsealed corpus must fail before report writes");
   const validRule = f.metadataRules[0]!;
