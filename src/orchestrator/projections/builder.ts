@@ -826,6 +826,24 @@ function foldLegacy(snapshot: ProjectionEventSnapshot): LegacyProjectionFoldStat
   return accumulator.finish();
 }
 
+/** Caller must supply a detached private image: FTS integrity performs an INSERT. */
+export function verifyLegacyProjectionConnection(
+  connection: SqliteConnection,
+  snapshot: ProjectionEventSnapshot,
+  metadata: Pick<ProjectionManifestV1, "generation" | "createdAt">,
+  expectedChecksums?: ProjectionManifestV1["coreChecksums"],
+): ProjectionManifestV1["coreChecksums"] {
+  const rows = legacyRowsFromState(foldLegacy(snapshot));
+  verifyLegacyStructure(connection, snapshot, metadata.generation, rows);
+  if (connection.prepare("SELECT created_at FROM projection_metadata WHERE singleton=1").get()?.created_at !== metadata.createdAt) return failure("PROJECTION_STRUCTURE_INVALID");
+  const checksums = {} as Record<LegacyProjectionName, string>;
+  for (const name of LEGACY_PROJECTION_NAMES) {
+    checksums[name] = projectionCoreChecksum(name, 1, snapshot.binding.projectId, snapshot.terminalEventPosition, rows[name]);
+    if (expectedChecksums && checksums[name] !== expectedChecksums[name]) return failure("PROJECTION_CHECKSUM_INVALID");
+  }
+  return verifyLegacyPersistedChecksums(connection, snapshot, Object.freeze(checksums));
+}
+
 export class ImmutableProjectionBuilder {
   readonly #driver: SqliteDriver;
   readonly #projectionDirectory: string;

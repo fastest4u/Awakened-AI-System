@@ -12,11 +12,31 @@ import {
 import {
   createProjectionSchema,
   PROJECTION_SCHEMA_VERSION,
+  PROJECTION_SCHEMA_SQL_V1,
+  PROJECTION_SCHEMA_SQL_V2,
 } from "../src/orchestrator/projections/schema.js";
 import { DEFAULT_BUSY_TIMEOUT_MS } from "../src/orchestrator/runtime/runtime-capabilities.js";
 import { NodeSqliteDriver } from "../src/orchestrator/storage/node-sqlite-driver.js";
 
 const roots: string[] = [];
+
+describe("projection metadata production identity domain", () => {
+  for (const [version, sql] of [[1, PROJECTION_SCHEMA_SQL_V1], [2, PROJECTION_SCHEMA_SQL_V2]] as const) {
+    it(`schema ${version} accepts UUIDv4 and legacy hashes and rejects malformed identities`, () => {
+      const database = new DatabaseSync(":memory:");
+      try {
+        database.exec(sql);
+        const update = database.prepare("UPDATE projection_metadata SET project_id=$id,vault_id=$id,store_id=$id,workspace_id=$workspace,generation=1,terminal_event_position=0,terminal_event_hash=$hash,created_at='2026-09-10T00:00:00.000Z' WHERE singleton=1");
+        const valid = "11111111-1111-4111-8111-111111111111";
+        for (const id of [valid, "a".repeat(64)]) assert.doesNotThrow(() => update.run({ $id: id, $workspace: "b".repeat(64), $hash: "0".repeat(64) }));
+        for (const id of ["11111111-1111-1111-8111-111111111111", "11111111-1111-4111-7111-111111111111", "G".repeat(64), valid.toUpperCase().replace("1111", "ABCD"), "1".repeat(36), valid + "x", valid + "\0suffix", "a".repeat(64) + "\0suffix", valid.slice(0, 8) + "\0" + valid.slice(9)]) {
+          assert.throws(() => update.run({ $id: id, $workspace: "b".repeat(64), $hash: "0".repeat(64) }));
+        }
+        assert.throws(() => update.run({ $id: valid, $workspace: valid, $hash: "0".repeat(64) }));
+      } finally { database.close(); }
+    });
+  }
+});
 
 afterEach(() => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });

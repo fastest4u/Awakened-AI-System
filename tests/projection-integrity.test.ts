@@ -12,7 +12,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, it } from "node:test";
 
@@ -36,7 +36,7 @@ import {
   type ProjectionName,
 } from "../src/orchestrator/projections/checksum.js";
 import type { ProjectBinding } from "../src/orchestrator/projections/contracts.js";
-import { SqliteProjectionEventReader } from "../src/orchestrator/projections/event-reader.js";
+import { SqliteProjectionEventReader, type ProjectionEventSnapshot } from "../src/orchestrator/projections/event-reader.js";
 import {
   assertUnpublishedProjectionV2Image,
   ProjectionIntegrityService,
@@ -54,6 +54,7 @@ import {
 } from "../src/orchestrator/storage/event-store.js";
 import { MaintenanceFence } from "../src/orchestrator/storage/maintenance-fence.js";
 import { NodeSqliteDriver } from "../src/orchestrator/storage/node-sqlite-driver.js";
+import { PROJECTION_SCHEMA_SQL_V1, PROJECTION_SCHEMA_SQL_V1_LEGACY, PROJECTION_SCHEMA_SQL_V2, PROJECTION_SCHEMA_SQL_V2_LEGACY } from "../src/orchestrator/projections/schema.js";
 import type {
   SqliteConnection,
   SqliteDriver,
@@ -64,6 +65,8 @@ import type {
   SqliteStatement,
 } from "../src/orchestrator/storage/sqlite-driver.js";
 import { applyCurrentProjectStoreSchema } from "./support/current-project-store-schema.js";
+import { ShadowMigrationError } from "../src/orchestrator/migration/v2-shadow-migration.contracts.js";
+import { EventStoreError } from "../src/orchestrator/storage/event-store.js";
 
 const PROJECT_ID = "1".repeat(64) as ProjectId;
 const OTHER_PROJECT_ID = "9".repeat(64) as ProjectId;
@@ -99,6 +102,68 @@ const PRODUCTION_BINDING: ProjectBinding = Object.freeze({
 });
 
 const roots: string[] = [];
+
+describe("committed snapshot integrity", () => {
+  it("verifies exact historical V1 and V2 schema images with authenticated legacy hash bindings", async () => {
+    const f = await createFixture();
+    const historical: SqliteDriver = { open(path, options) {
+      const connection = driver.open(path, options);
+      return { close: () => connection.close(), prepare: sql => connection.prepare(sql),
+        exec(sql) { connection.exec(sql === PROJECTION_SCHEMA_SQL_V1 ? PROJECTION_SCHEMA_SQL_V1_LEGACY : sql === PROJECTION_SCHEMA_SQL_V2 ? PROJECTION_SCHEMA_SQL_V2_LEGACY : sql); } };
+    } };
+    const reader = new SqliteProjectionEventReader({ driver, eventStorePath: f.sourcePath });
+    const snapshot = await reader.openCommittedSnapshot(BINDING);
+    try {
+      const directory = join(dirname(f.projectionDirectory), "legacy-v1");
+      const generation = await new ImmutableProjectionBuilder({ driver: historical, projectionDirectory: directory, now: () => NOW }).build(snapshot, 1);
+      const verifySnapshot = await reader.openCommittedSnapshot(BINDING);
+      try {
+        const bytes = readFileSync(generation.databasePath);
+        assert.equal(new ProjectionIntegrityService({ driver, eventStorePath: f.sourcePath, projectionDirectory: directory }).verifyV1Generation(verifySnapshot, generation).status, "passed");
+        assert.deepEqual(readFileSync(generation.databasePath), bytes);
+      } finally { verifySnapshot.close(); }
+    } finally { snapshot.close(); }
+    const directory = join(dirname(f.projectionDirectory), "legacy-v2");
+    const generation = await new V2ProjectionBuildCoordinator({ eventReader: reader, projectionDirectory: directory,
+      builder: new ImmutableProjectionBuilder({ driver: historical, projectionDirectory: directory, now: () => NOW }) }).ensurePublished(BINDING, BigInt(f.manifest.terminalEventPosition), 10_000);
+    assert.equal(new ProjectionIntegrityService({ driver, eventStorePath: f.sourcePath, projectionDirectory: directory }).verify(BINDING, generation.manifest).status, "passed");
+  });
+  it("authenticates original events and checks the pinned published image without source-path replay", async () => {
+    const f = await createFixture();
+    const snapshot = await new SqliteProjectionEventReader({ driver, eventStorePath: f.sourcePath }).openCommittedSnapshot(BINDING);
+    try {
+      const service = new ProjectionIntegrityService({ driver, eventStorePath: "unused", projectionDirectory: f.projectionDirectory });
+      const events = [...snapshot.events()];
+      const repeatable = { ...snapshot, events: () => events };
+      assert.equal(service.verifyCommittedSnapshot(BINDING, f.manifest, repeatable).status, "passed");
+      for (const original of [new ShadowMigrationError("MIGRATION_SOURCE_MUTATED", { secret: "sensitive" }),
+        new EventStoreError("SQLITE_BUSY", { sensitive: "value" }), new EventStoreError("COMMAND_TOO_LARGE"), new Error("sensitive unknown failure")]) {
+        assert.throws(() => service.verifyCommittedSnapshot(BINDING, f.manifest, { ...repeatable, events() { throw original; } }),
+          (error: unknown) => {
+            assert.notEqual(error, original);
+            if (original instanceof EventStoreError && original.code === "SQLITE_BUSY") return error instanceof EventStoreError && error.code === "SQLITE_BUSY";
+            return error instanceof ShadowMigrationError && error.code === (original instanceof ShadowMigrationError ? original.code : "MIGRATION_LEDGER_INTEGRITY_FAILURE")
+              && Object.keys(error.safeDetails).length === 0 && error.cause === undefined;
+          });
+      }
+      const cases: ProjectionEventSnapshot[] = [
+        { ...repeatable, eventCount: snapshot.eventCount + 1 },
+        { ...repeatable, aggregateBytes: snapshot.aggregateBytes + 1 },
+        { ...repeatable, terminalEventHash: "a".repeat(64) },
+        { ...repeatable, binding: { ...snapshot.binding, branchRef: "wrong" } },
+        { ...snapshot, events: () => events.map((e, i) => i ? e : { ...e, payloadJson: "{}" }) },
+        { ...snapshot, events: () => events.slice(1) },
+      ];
+      for (const bad of cases) expectIntegrityFailure(() => service.verifyCommittedSnapshot(BINDING, f.manifest, bad));
+      for (const limits of [{ maxReplayEvents: 2 }, { maxReplayBytes: 256 }]) {
+        const bounded = new ProjectionIntegrityService({ driver, eventStorePath: "unused", projectionDirectory: f.projectionDirectory, ...limits });
+        expectIntegrityFailure(() => bounded.verifyCommittedSnapshot(BINDING, f.manifest, repeatable));
+      }
+      mutateDatabase(f, "UPDATE canonical_items SET summary='tampered'");
+      expectIntegrityFailure(() => service.verifyCommittedSnapshot(BINDING, f.manifest, repeatable));
+    } finally { snapshot.close(); }
+  });
+});
 const connections: SqliteConnection[] = [];
 
 function productionIdentityReaderDriver(): SqliteDriver {

@@ -2,7 +2,7 @@ import type { SqliteConnection } from "../storage/sqlite-driver.js";
 
 export const PROJECTION_SCHEMA_VERSION = 2 as const;
 
-export const PROJECTION_SCHEMA_SQL_V1 = `
+export const PROJECTION_SCHEMA_SQL_V1_LEGACY = `
   CREATE TABLE projection_metadata (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
     schema_version INTEGER NOT NULL CHECK (schema_version = 1),
@@ -206,7 +206,7 @@ export const PROJECTION_SCHEMA_SQL_V1 = `
     ON retrieval_feedback(project_id, item_id, source_event_position DESC, feedback_id);
 `;
 
-export const PROJECTION_SCHEMA_SQL_V2 = `
+export const PROJECTION_SCHEMA_SQL_V2_LEGACY = `
   CREATE TABLE projection_metadata (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
     schema_version INTEGER NOT NULL CHECK (schema_version = 2),
@@ -440,6 +440,22 @@ export const PROJECTION_SCHEMA_SQL_V2 = `
   CREATE INDEX retrieval_feedback_item_idx
     ON retrieval_feedback(project_id, item_id, source_event_position DESC, feedback_id);
 `;
+
+function productionIdentitySchema(sql: string): string {
+  for (const field of ["project_id", "vault_id", "store_id"]) {
+    const legacy = `(length(${field}) = 64 AND ${field} NOT GLOB '*[^0-9a-f]*')`;
+    const uuid = `(length(${field}) = 36 AND ${field} NOT GLOB '*[^0-9a-f-]*'
+      AND length(replace(${field}, '-', '')) = 32
+      AND substr(${field}, 9, 1) = '-' AND substr(${field}, 14, 1) = '-'
+      AND substr(${field}, 19, 1) = '-' AND substr(${field}, 24, 1) = '-'
+      AND substr(${field}, 15, 1) = '4' AND substr(${field}, 20, 1) GLOB '[89ab]')`;
+    sql = sql.replace(legacy, `(length(CAST(${field} AS BLOB)) = length(${field}) AND (${legacy} OR ${uuid}))`);
+  }
+  return sql;
+}
+
+export const PROJECTION_SCHEMA_SQL_V1 = productionIdentitySchema(PROJECTION_SCHEMA_SQL_V1_LEGACY);
+export const PROJECTION_SCHEMA_SQL_V2 = productionIdentitySchema(PROJECTION_SCHEMA_SQL_V2_LEGACY);
 
 export function createProjectionSchema(connection: SqliteConnection): void {
   connection.exec("BEGIN IMMEDIATE");

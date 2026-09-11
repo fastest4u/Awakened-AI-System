@@ -11,7 +11,14 @@ import { resolve } from "node:path";
 import { DatabaseSync, type StatementSync } from "node:sqlite";
 
 import { LifecycleError } from "../lifecycle/errors.js";
-import type { SqliteDriver } from "../storage/sqlite-driver.js";
+import type { StoredEvent } from "../contracts/event.js";
+import { ShadowMigrationError, type ShadowMigrationErrorCode } from "../migration/v2-shadow-migration.contracts.js";
+import { EventStoreError } from "../storage/event-store.js";
+import { isPrimarySqliteBusy } from "../storage/event-append-transaction.js";
+import type { SqliteDriver, SqliteConnection, SqliteRow } from "../storage/sqlite-driver.js";
+import { authenticateStoredEvent, type StoredEventChainCursor } from "../integrity/stored-event-authenticator.js";
+import { canonicalJson } from "../serialization/canonical-json.js";
+import { verifyLegacyProjectionConnection, type BuiltProjectionGeneration } from "./builder.js";
 import {
   PROJECTION_NAMES,
   projectionCoreChecksum,
@@ -22,17 +29,21 @@ import type { ProjectBinding, ProjectionFoldState } from "./contracts.js";
 import {
   replayCommittedProjectionEvents,
   type CommittedProjectionReplayResult,
+  type ProjectionEventSnapshot,
+  MAX_PROJECTION_SOURCE_EVENTS,
+  MAX_PROJECTION_SOURCE_BYTES,
 } from "./event-reader.js";
 import { ProjectionFoldAccumulator } from "./folds.js";
 import {
   assertProjectionSidecarsAbsent,
   filesystemProjectionPathInspection,
   parseProjectionManifestV2,
+  parseProjectionManifest,
   verifyProjectionPublicationPaths,
   type ProjectionManifestV2,
   type ProjectionPathInspection,
 } from "./manifest.js";
-import { PROJECTION_SCHEMA_SQL_V2, PROJECTION_SCHEMA_VERSION } from "./schema.js";
+import { PROJECTION_SCHEMA_SQL_V1, PROJECTION_SCHEMA_SQL_V2, PROJECTION_SCHEMA_SQL_V1_LEGACY, PROJECTION_SCHEMA_SQL_V2_LEGACY, PROJECTION_SCHEMA_VERSION } from "./schema.js";
 import { decodeProjectionEvent } from "./source-event-codec.js";
 import {
   captureProjectionDirectoryIdentity,
@@ -748,17 +759,22 @@ function ftsConfigRows(database: DatabaseSync): readonly Readonly<Record<string,
   return Object.freeze(rows);
 }
 
-function assertCanonicalSchema(database: DatabaseSync): void {
+function assertCanonicalSchema(database: DatabaseSync, version: 1 | 2 = 2, binding?: ProjectBinding): void {
   const reference = new DatabaseSync(":memory:", {
     enableDoubleQuotedStringLiterals: false,
     allowExtension: false,
   });
   try {
-    reference.exec(PROJECTION_SCHEMA_SQL_V2);
-    if (
-      !sameRecords(schemaRows(database), schemaRows(reference), ["type", "name", "tbl_name", "sql"])
-      || !sameRecords(ftsConfigRows(database), ftsConfigRows(reference), ["k", "v"])
-    ) return integrity();
+    reference.exec(version === 1 ? PROJECTION_SCHEMA_SQL_V1 : PROJECTION_SCHEMA_SQL_V2);
+    if (sameRecords(schemaRows(database), schemaRows(reference), ["type", "name", "tbl_name", "sql"])
+      && sameRecords(ftsConfigRows(database), ftsConfigRows(reference), ["k", "v"])) return;
+    if (!binding || ![binding.projectId, binding.vaultId, binding.storeId].every(id => HASH.test(id))) return integrity();
+    const legacy = new DatabaseSync(":memory:");
+    try {
+      legacy.exec(version === 1 ? PROJECTION_SCHEMA_SQL_V1_LEGACY : PROJECTION_SCHEMA_SQL_V2_LEGACY);
+      if (!sameRecords(schemaRows(database), schemaRows(legacy), ["type", "name", "tbl_name", "sql"])
+        || !sameRecords(ftsConfigRows(database), ftsConfigRows(legacy), ["k", "v"])) return integrity();
+    } finally { legacy.close(); }
   } finally {
     reference.close();
   }
@@ -1076,7 +1092,7 @@ export function assertUnpublishedProjectionV2Image(
   try {
     database = openImmutableProjectionImage(bytes);
     database.exec("BEGIN");
-    assertCanonicalSchema(database);
+    assertCanonicalSchema(database, 2, binding);
     const terminalEventPosition = assertUnpublishedV2Metadata(database, filename, binding);
     assertSqliteIntegrity(database);
     const checksums = persistedCoreChecksums(database);
@@ -1138,7 +1154,7 @@ function inspectGeneration(
       ) return integrity();
       pinnedImage.assertUnchanged();
       database.exec("PRAGMA trusted_schema = OFF; BEGIN");
-      assertCanonicalSchema(database);
+      assertCanonicalSchema(database, 2, binding);
       assertMetadata(database, binding, manifest);
       assertSqliteIntegrity(database);
       const rows = readExactRows(
@@ -1180,6 +1196,14 @@ function inspectGeneration(
   }
 }
 
+function* committedSnapshotEvents(snapshot: ProjectionEventSnapshot): Iterable<StoredEvent> {
+  try { yield* snapshot.events(); }
+  catch (error) {
+    if (error instanceof ShadowMigrationError || (error instanceof EventStoreError && error.code === "SQLITE_BUSY") || isPrimarySqliteBusy(error)) throw error;
+    throw new ShadowMigrationError("MIGRATION_LEDGER_INTEGRITY_FAILURE");
+  }
+}
+
 export class ProjectionIntegrityService {
   readonly #options: ProjectionIntegrityServiceOptions;
 
@@ -1188,6 +1212,117 @@ export class ProjectionIntegrityService {
       ...options,
       busyTimeoutMs: options.busyTimeoutMs ?? DEFAULT_BUSY_TIMEOUT_MS,
     });
+  }
+
+  /** Verifies a caller-owned committed snapshot; the caller retains close ownership. */
+  verifyCommittedSnapshot(binding: ProjectBinding, manifestValue: unknown, snapshot: ProjectionEventSnapshot): ProjectionIntegrityReport {
+    try {
+      const manifest = parseProjectionManifestV2(manifestValue, binding);
+      const fields = ["projectId", "vaultId", "storeId", "workspaceId", "branchScopeId", "branchRef"] as const;
+      const maxEvents = this.#options.maxReplayEvents ?? MAX_PROJECTION_SOURCE_EVENTS;
+      const maxBytes = this.#options.maxReplayBytes ?? MAX_PROJECTION_SOURCE_BYTES;
+      if (!Number.isSafeInteger(maxEvents) || maxEvents < 0 || maxEvents > MAX_PROJECTION_SOURCE_EVENTS
+        || !Number.isSafeInteger(maxBytes) || maxBytes < 0 || maxBytes > MAX_PROJECTION_SOURCE_BYTES
+        || fields.some(key => snapshot.binding[key] !== binding[key]) || snapshot.binding.sessionId !== null
+        || !Number.isSafeInteger(snapshot.eventCount) || snapshot.eventCount < 0 || snapshot.eventCount > maxEvents
+        || !Number.isSafeInteger(snapshot.aggregateBytes) || snapshot.aggregateBytes < 0 || snapshot.aggregateBytes > maxBytes
+        || snapshot.terminalEventPosition !== BigInt(manifest.terminalEventPosition)
+        || snapshot.terminalEventHash !== manifest.terminalEventHash) return integrity();
+      const accumulator = new ProjectionFoldAccumulator();
+      let cursor: StoredEventChainCursor = { expectedPosition: 1n, previousEventHash: "0".repeat(64) };
+      let count = 0;
+      let bytes = 0;
+      for (const source of committedSnapshotEvents(snapshot)) {
+        if (++count > maxEvents || count > snapshot.eventCount || fields.some(key => source[key] !== binding[key])) return integrity();
+        const authenticated = authenticateStoredEvent(source, cursor);
+        cursor = authenticated.nextCursor;
+        // Complete stored row domain, including nullable and numeric columns (8 bytes each).
+        let rowBytes = 0;
+        for (const key of ["globalPosition", "eventId", "projectId", "vaultId", "storeId", "workspaceId", "branchScopeId", "branchRef",
+          "streamId", "streamType", "streamVersion", "eventType", "eventSchemaVersion", "sessionId", "parentSessionId", "actorRole", "agentId",
+          "clientInstanceId", "correlationId", "causationId", "commandId", "idempotencyKey", "commandEventIndex", "occurredAt", "recordedAt",
+          "visibilityScope", "confidence", "verificationStatus", "sourceRefs", "evidenceRefs", "evidenceDigests", "payloadJson", "payloadHash",
+          "previousGlobalHash", "eventHash", "lifecycleIntentJson"] as const) {
+          const value = source[key];
+          rowBytes += ["sourceRefs", "evidenceRefs", "evidenceDigests"].includes(key)
+            ? Buffer.byteLength(canonicalJson(value), "utf8") : typeof value === "string" ? Buffer.byteLength(value, "utf8") : 8;
+        }
+        bytes += rowBytes;
+        if (rowBytes > 1024 * 1024 || bytes > maxBytes || bytes > snapshot.aggregateBytes) return integrity();
+        const decoded = decodeProjectionEvent(source);
+        if (decoded.kind === "projected") accumulator.append(decoded.event);
+      }
+      if (count !== snapshot.eventCount || bytes !== snapshot.aggregateBytes || cursor.expectedPosition - 1n !== snapshot.terminalEventPosition
+        || cursor.previousEventHash !== snapshot.terminalEventHash) return integrity();
+      const directory = captureProjectionDirectoryIdentity(this.#options.projectionDirectory);
+      const inspection = this.#options.pathInspection ?? filesystemProjectionPathInspection;
+      const paths = verifyProjectionPublicationPaths(this.#options.projectionDirectory, manifest.databaseFile, inspection);
+      inspectGeneration(paths.databasePath, binding, manifest, rowsFromState(accumulator.finish()),
+        this.#options.busyTimeoutMs ?? DEFAULT_BUSY_TIMEOUT_MS, directory, inspection, this.#options.faultInjector);
+      return Object.freeze({ status: "passed", terminalEventPosition: manifest.terminalEventPosition });
+    } catch (error) {
+      // A lazy committed reader can fail during iteration. Preserve only its safe classification.
+      const codes: readonly ShadowMigrationErrorCode[] = ["MIGRATION_POLICY_INVALID", "MIGRATION_SOURCE_INVALID", "MIGRATION_SOURCE_MUTATED",
+        "MIGRATION_LIMIT_EXCEEDED", "MIGRATION_IDENTITY_CONFLICT", "MIGRATION_LEDGER_INTEGRITY_FAILURE", "MIGRATION_OUTCOME_UNKNOWN",
+        "MIGRATION_RETRY_EXHAUSTED", "PROJECTION_INTEGRITY_FAILURE", "PARITY_RULE_INVALID", "PARITY_BLOCKING_DIVERGENCE", "COMPATIBILITY_INTEGRITY_FAILURE"];
+      if (error instanceof ShadowMigrationError && codes.includes(error.code)) throw new ShadowMigrationError(error.code);
+      if ((error instanceof EventStoreError && error.code === "SQLITE_BUSY") || isPrimarySqliteBusy(error)) throw new EventStoreError("SQLITE_BUSY", { retryable: true });
+      return integrity();
+    }
+  }
+
+  /** Reopens descriptor-pinned V1 bytes; all SQL, including FTS writes, is detached. */
+  verifyV1Generation(snapshot: ProjectionEventSnapshot, generation: BuiltProjectionGeneration): ProjectionIntegrityReport {
+    const verified = this.#inspectV1Generation(snapshot, generation.manifest.createdAt, generation);
+    return Object.freeze({ status: "passed", terminalEventPosition: verified.manifest.terminalEventPosition });
+  }
+
+  /** Recover only the fixed baseline orphan under the caller's publication lease. */
+  recoverV1Generation(snapshot: ProjectionEventSnapshot, createdAt: string): BuiltProjectionGeneration {
+    return this.#inspectV1Generation(snapshot, createdAt);
+  }
+
+  #inspectV1Generation(snapshot: ProjectionEventSnapshot, createdAt: string, generation?: BuiltProjectionGeneration): BuiltProjectionGeneration {
+    let pinned: PinnedGenerationImage | undefined;
+    let database: DatabaseSync | undefined;
+    try {
+      const manifest = generation ? parseProjectionManifest(generation.manifest, snapshot.binding) : undefined;
+      const directory = captureProjectionDirectoryIdentity(this.#options.projectionDirectory);
+      const paths = verifyProjectionPublicationPaths(this.#options.projectionDirectory, manifest?.databaseFile ?? "projections-1-1.sqlite");
+      if (generation && (generation.projectionDirectory !== this.#options.projectionDirectory || generation.databasePath !== paths.databasePath
+        || manifest!.terminalEventPosition !== String(snapshot.terminalEventPosition) || manifest!.terminalEventHash !== snapshot.terminalEventHash)) return integrity();
+      assertProjectionSidecarsAbsent(paths.databasePath);
+      const identity = captureGenerationIdentity(paths.databasePath);
+      pinned = readGenerationImage(paths.databasePath, identity);
+      if (manifest && pinned.sha256 !== manifest.databaseSha256) return integrity();
+      database = openImmutableProjectionImage(pinned.bytes);
+      assertCanonicalSchema(database, 1, snapshot.binding);
+      database.exec("PRAGMA query_only=OFF");
+      const native = database;
+      const connection: SqliteConnection = {
+        exec(sql) { native.exec(sql); }, close() { native.close(); },
+        prepare(sql) {
+          const s = statement(native, sql);
+          return {
+            get(params) { return (params ? s.get(params) : s.get()) as SqliteRow | undefined; },
+            all(params) { return (params ? s.all(params) : s.all()) as SqliteRow[]; },
+            iterate(params) { return (params ? s.iterate(params) : s.iterate()) as IterableIterator<SqliteRow>; },
+            run(params) { const r = params ? s.run(params) : s.run(); return { changes: BigInt(r.changes), lastInsertRowid: BigInt(r.lastInsertRowid) }; },
+          };
+        },
+      };
+      const coreChecksums = verifyLegacyProjectionConnection(connection, snapshot,
+        { generation: manifest?.generation ?? 1, createdAt }, manifest?.coreChecksums);
+      assertProjectionSidecarsAbsent(paths.databasePath);
+      pinned.assertUnchanged();
+      if (!sameGenerationIdentity(identity, captureGenerationIdentity(paths.databasePath))
+        || !sameProjectionDirectoryIdentity(directory, captureProjectionDirectoryIdentity(this.#options.projectionDirectory))) return integrity();
+      const verifiedManifest = manifest ?? parseProjectionManifest({ schemaVersion: 1, ...snapshot.binding, sessionId: null,
+        generation: 1, terminalEventPosition: String(snapshot.terminalEventPosition), terminalEventHash: snapshot.terminalEventHash,
+        databaseFile: "projections-1-1.sqlite", databaseSha256: pinned.sha256, coreChecksums, createdAt }, snapshot.binding);
+      return Object.freeze({ manifest: verifiedManifest, projectionDirectory: this.#options.projectionDirectory, databasePath: paths.databasePath });
+    } catch { return integrity(); }
+    finally { try { database?.close(); } finally { pinned?.close(); } }
   }
 
   verify(binding: ProjectBinding, manifestValue: unknown): ProjectionIntegrityReport {
