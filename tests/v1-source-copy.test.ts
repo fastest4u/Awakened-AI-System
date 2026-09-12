@@ -8,6 +8,103 @@ import { decodeV1SourceCopyManifestV1, verifyV1SourceCopy } from "../src/orchest
 import { ShadowMigrationError } from "../src/orchestrator/migration/v2-shadow-migration.contracts.js";
 import type { SqliteDriver } from "../src/orchestrator/storage/sqlite-driver.js";
 import { createV2ShadowMigrationFixture, describeSourceFile, sealManifest } from "./support/v2-shadow-migration-fixture.js";
+import { createShadowMigrationInvocationDeadline } from "../src/orchestrator/migration/v2-shadow-migration-runtime.js";
+
+test("shared deadline expiry after real replay closes scratch and preserves typed timeout", async (t) => {
+  const f = await createV2ShadowMigrationFixture(t);
+  let now = 0, closed = 0, scratchPath = "";
+  const deadline = createShadowMigrationInvocationDeadline(1000, () => now);
+  t.after(() => deadline.dispose());
+  const paths = [f.manifestPath, f.sourceDatabasePath, f.liveEventStorePath,
+    ...f.manifest.sqliteSidecars.map(row => join(f.sourceRoot, row.relativePath)),
+    ...f.manifest.legacyArtifacts.map(row => join(f.sourceRoot, row.relativePath))];
+  const before = paths.map(path => readFileSync(path));
+  const driver: SqliteDriver = { open(path, options) {
+    scratchPath = path;
+    const connection = f.driver.open(path, options);
+    return { ...connection, prepare: sql => connection.prepare(sql), exec: sql => connection.exec(sql),
+      close() { connection.close(); closed++; now = 1000; } };
+  } };
+  const input = { ...f.verificationInput, driver, invocationDeadline: deadline };
+  await assert.rejects(verifyV1SourceCopy(input), redacted("MIGRATION_RETRY_EXHAUSTED"));
+  assert.equal(closed, 1);
+  assert.equal(existsSync(scratchPath), false);
+  paths.forEach((path, index) => assert.deepEqual(readFileSync(path), before[index]));
+});
+
+test("shared source budget narrows native SQLite timeout without changing read-only mode", async (t) => {
+  const f = await createV2ShadowMigrationFixture(t);
+  let now = 0, timeout: number | undefined, mode: string | undefined;
+  const deadline = createShadowMigrationInvocationDeadline(1000, () => now);
+  t.after(() => deadline.dispose());
+  now = 250;
+  const driver: SqliteDriver = { open(path, options) {
+    timeout = options.busyTimeoutMs; mode = options.mode;
+    return f.driver.open(path, options);
+  } };
+  const source = await verifyV1SourceCopy({ ...f.verificationInput, driver, invocationDeadline: deadline });
+  try { assert.equal(timeout, 750); assert.equal(mode, "read-only-existing"); }
+  finally { source.close(); }
+});
+
+test("held source iterators reject later consumption after shared deadline exhaustion", async (t) => {
+  const f = await createV2ShadowMigrationFixture(t);
+  let now = 0;
+  const deadline = createShadowMigrationInvocationDeadline(1000, () => now);
+  t.after(() => deadline.dispose());
+  const source = await verifyV1SourceCopy({ ...f.verificationInput, invocationDeadline: deadline });
+  try {
+    const events = source.events()[Symbol.iterator](), artifacts = source.legacyArtifacts()[Symbol.iterator]();
+    const firstArtifact = artifacts.next().value!;
+    const chunks = firstArtifact.readChunks()[Symbol.iterator]();
+    now = 1000;
+    for (const operation of [() => events.next(), () => artifacts.next(), () => chunks.next(), () => source.assertUnchanged()]) {
+      assert.throws(operation, redacted("MIGRATION_RETRY_EXHAUSTED"));
+    }
+  } finally { source.close(); }
+});
+
+test("optional source deadline decoding rejects proxy input without invoking descriptor traps", async (t) => {
+  const f = await createV2ShadowMigrationFixture(t);
+  let traps = 0;
+  const input = new Proxy(f.verificationInput, { getOwnPropertyDescriptor() { traps++; throw new Error("SECRET"); } });
+  await assert.rejects(verifyV1SourceCopy(input), redacted());
+  assert.equal(traps, 0);
+});
+
+test("shared deadline during authenticated source replay closes the native reader and scratch", async (t) => {
+  const f = await createV2ShadowMigrationFixture(t);
+  let now = 0, closed = 0, scratchPath = "", visited = 0;
+  const deadline = createShadowMigrationInvocationDeadline(1000, () => now);
+  t.after(() => deadline.dispose());
+  const driver: SqliteDriver = { open(path, options) {
+    scratchPath = path;
+    const connection = f.driver.open(path, options);
+    return { exec: sql => connection.exec(sql), close() { closed++; connection.close(); }, prepare(sql) {
+      const statement = connection.prepare(sql);
+      return { run: params => statement.run(params), all: params => statement.all(params), get: params => statement.get(params),
+        *iterate(params) { for (const row of statement.iterate(params)) { visited++; now = 1000; yield row; } } };
+    } };
+  } };
+  await assert.rejects(verifyV1SourceCopy({ ...f.verificationInput, driver, invocationDeadline: deadline }), redacted("MIGRATION_RETRY_EXHAUSTED"));
+  assert.equal(visited, 1); assert.equal(closed, 1); assert.equal(existsSync(scratchPath), false);
+});
+
+test("cooperative source deadline lets native open settle then closes it before subsequent SQL", async (t) => {
+  const f = await createV2ShadowMigrationFixture(t);
+  let now = 0, opened = 0, closed = 0, prepared = 0, scratchPath = "";
+  const deadline = createShadowMigrationInvocationDeadline(1000, () => now);
+  t.after(() => deadline.dispose());
+  const driver: SqliteDriver = { open(path, options) {
+    // The synchronous native call settles. The deadline forbids subsequent work, not this call's completion.
+    const connection = f.driver.open(path, options);
+    opened++; scratchPath = path; now = 1000;
+    return { exec: sql => connection.exec(sql), prepare(sql) { prepared++; return connection.prepare(sql); },
+      close() { closed++; connection.close(); } };
+  } };
+  await assert.rejects(verifyV1SourceCopy({ ...f.verificationInput, driver, invocationDeadline: deadline }), redacted("MIGRATION_RETRY_EXHAUSTED"));
+  assert.equal(opened, 1); assert.equal(closed, 1); assert.equal(prepared, 0); assert.equal(existsSync(scratchPath), false);
+});
 
 function redacted(code: ShadowMigrationError["code"] = "MIGRATION_SOURCE_INVALID") {
   return (error: unknown) => {

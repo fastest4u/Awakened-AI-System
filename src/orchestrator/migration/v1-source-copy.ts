@@ -11,6 +11,7 @@ import { canonicalJson } from "../serialization/canonical-json.js";
 import { CURRENT_PROJECT_STORE_SCHEMA_VERSION } from "../storage/migrations/registry.js";
 import type { SqliteDriver } from "../storage/sqlite-driver.js";
 import { decodeShadowMigrationPolicyV1, ShadowMigrationError, type ShadowMigrationErrorCode, type ShadowMigrationPolicyV1 } from "./v2-shadow-migration.contracts.js";
+import type { ShadowMigrationInvocationDeadline } from "./v2-shadow-migration-runtime.js";
 
 export interface SourceFileDescriptorV1 {
   readonly relativePath: string;
@@ -59,6 +60,7 @@ export interface VerifiedV1SourceCopy {
   close(): void;
 }
 export interface VerifyV1SourceCopyInput {
+  readonly invocationDeadline?: ShadowMigrationInvocationDeadline;
   readonly driver: SqliteDriver;
   readonly sourceRoot: string;
   readonly manifestPath: string;
@@ -194,7 +196,8 @@ function checkComponents(path: string, directories?: Map<string, DirectoryIdenti
   }
   return stat;
 }
-function readCapture(path: string, relativePath: string, directories: Map<string, DirectoryIdentity>, collect = false, maximum = Number.MAX_SAFE_INTEGER, copyTo?: string): { capture: Capture; bytes: Buffer } {
+function readCapture(path: string, relativePath: string, directories: Map<string, DirectoryIdentity>, collect = false, maximum = Number.MAX_SAFE_INTEGER, copyTo?: string, deadline?: ShadowMigrationInvocationDeadline): { capture: Capture; bytes: Buffer } {
+  deadline?.remainingMs();
   const initial = checkComponents(path, directories);
   if (!initial.isFile() || initial.nlink !== 1n || initial.size > BigInt(Number.MAX_SAFE_INTEGER)) fail();
   if (initial.size > BigInt(maximum)) fail("MIGRATION_LIMIT_EXCEEDED", "file");
@@ -209,6 +212,7 @@ function readCapture(path: string, relativePath: string, directories: Map<string
     const buffer = Buffer.alloc(64 * 1024);
     let length = 0;
     for (;;) {
+      deadline?.remainingMs();
       const count = readSync(fd, buffer, 0, buffer.length, null);
       if (!count) break;
       length += count;
@@ -217,6 +221,7 @@ function readCapture(path: string, relativePath: string, directories: Map<string
       if (output !== undefined) {
         let offset = 0;
         while (offset < count) {
+          deadline?.remainingMs();
           const written = writeSync(output, buffer, offset, count - offset);
           if (written < 1) fail();
           offset += written;
@@ -226,6 +231,7 @@ function readCapture(path: string, relativePath: string, directories: Map<string
     }
     if (length !== Number(initial.size) || !sameStat(opened, fstatSync(fd, { bigint: true }))
       || !sameStat(initial, checkComponents(path, directories))) fail();
+    deadline?.remainingMs();
     return { capture: { path, descriptor: Object.freeze({ relativePath, device: String(opened.dev), inode: String(opened.ino),
       size: Number(opened.size), ctimeNs: String(opened.ctimeNs), sha256: digest.digest("hex") }) }, bytes: Buffer.concat(chunks) };
   } finally {
@@ -255,7 +261,8 @@ function freezeEvent(event: StoredEvent): StoredEvent {
 
 /** SQLite read-only WAL connections still update SHM. Confine those writes to scratch. */
 function workingImage(sourceRoot: string, liveDatabase: string, liveRoot: string, manifest: V1SourceCopyManifestV1,
-  directories: Map<string, DirectoryIdentity>): { databasePath: string; close(): void } {
+  directories: Map<string, DirectoryIdentity>, deadline?: ShadowMigrationInvocationDeadline): { databasePath: string; close(): void } {
+  deadline?.remainingMs();
   const temporaryRoot = canonicalExistingDirectory(tmpdir());
   checkComponents(temporaryRoot);
   if ([sourceRoot, dirname(liveDatabase), liveRoot].some((protectedRoot) => contains(protectedRoot, temporaryRoot))) fail();
@@ -277,12 +284,13 @@ function workingImage(sourceRoot: string, liveDatabase: string, liveRoot: string
   try {
     if (overlaps(directory, sourceRoot) || overlaps(directory, dirname(liveDatabase)) || overlaps(directory, liveRoot)) fail();
     for (const declared of [manifest.database, ...manifest.sqliteSidecars]) {
+      deadline?.remainingMs();
       const suffix = declared === manifest.database ? "" : declared.relativePath.slice(manifest.database.relativePath.length);
       const destination = join(directory, `events.sqlite${suffix}`);
       const copied = readCapture(join(sourceRoot, declared.relativePath), declared.relativePath, directories, false,
-        Number.MAX_SAFE_INTEGER, destination).capture.descriptor;
+        Number.MAX_SAFE_INTEGER, destination, deadline).capture.descriptor;
       if (!equalDescriptor(copied, declared)) fail("MIGRATION_SOURCE_MUTATED");
-      const scratch = readCapture(destination, declared.relativePath, new Map()).capture.descriptor;
+      const scratch = readCapture(destination, declared.relativePath, new Map(), false, Number.MAX_SAFE_INTEGER, undefined, deadline).capture.descriptor;
       if (scratch.size !== declared.size || scratch.sha256 !== declared.sha256
         || (scratch.device === declared.device && scratch.inode === declared.inode)) fail();
     }
@@ -292,7 +300,11 @@ function workingImage(sourceRoot: string, liveDatabase: string, liveRoot: string
 
 export async function verifyV1SourceCopy(input: VerifyV1SourceCopyInput): Promise<VerifiedV1SourceCopy> {
   try {
-    const supplied = record(input, ["driver", "sourceRoot", "manifestPath", "liveEventStorePath", "liveLegacyArtifactRoot", "expectedBinding", "policy"]);
+    if (typeof input !== "object" || input === null || utilTypes.isProxy(input)) fail();
+    const supplied = record(input, ["driver", "sourceRoot", "manifestPath", "liveEventStorePath", "liveLegacyArtifactRoot", "expectedBinding", "policy",
+      ...(Object.getOwnPropertyDescriptor(input, "invocationDeadline") === undefined ? [] : ["invocationDeadline"])]);
+    const deadline = supplied.invocationDeadline as ShadowMigrationInvocationDeadline | undefined;
+    deadline?.remainingMs();
     for (const key of ["sourceRoot", "manifestPath", "liveEventStorePath", "liveLegacyArtifactRoot"] as const) {
       if (typeof supplied[key] !== "string" || !supplied[key] || supplied[key].includes("\0")) fail();
     }
@@ -308,7 +320,7 @@ export async function verifyV1SourceCopy(input: VerifyV1SourceCopyInput): Promis
     assertContainedPath(sourceRoot, manifestPath);
     const manifestRelative = sourceRelativePath(relative(sourceRoot, manifestPath).split(sep).join("/"));
     // This is the only manifest read for decoding; later reads solely revalidate bytes.
-    const manifestRead = readCapture(manifestPath, manifestRelative, directories, true, MAX_MANIFEST_BYTES);
+    const manifestRead = readCapture(manifestPath, manifestRelative, directories, true, MAX_MANIFEST_BYTES, undefined, deadline);
     const manifest = decodeV1SourceCopyManifestV1(JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(manifestRead.bytes)) as unknown);
     const policy = decodeShadowMigrationPolicyV1(supplied.policy);
     const expected = binding(supplied.expectedBinding);
@@ -317,6 +329,7 @@ export async function verifyV1SourceCopy(input: VerifyV1SourceCopyInput): Promis
       || manifest.legacyArtifacts.length > policy.maxEvents) fail("MIGRATION_LIMIT_EXCEEDED", "manifest");
     let logicalBytes = 0;
     for (const artifact of manifest.legacyArtifacts) {
+      deadline?.remainingMs();
       if (artifact.size > policy.maxEventBytes) fail("MIGRATION_LIMIT_EXCEEDED", "artifact");
       logicalBytes += artifact.size;
       if (!Number.isSafeInteger(logicalBytes) || logicalBytes > policy.maxAggregateBytes) fail("MIGRATION_LIMIT_EXCEEDED", "artifact");
@@ -327,6 +340,7 @@ export async function verifyV1SourceCopy(input: VerifyV1SourceCopyInput): Promis
     const artifactBytes: Buffer[] = [];
     const allDescriptors = [manifest.database, ...manifest.sqliteSidecars, ...manifest.legacyArtifacts];
     for (const declared of allDescriptors) {
+      deadline?.remainingMs();
       const folded = declared.relativePath.toLowerCase();
       if (paths.has(folded)) fail();
       paths.add(folded);
@@ -335,6 +349,7 @@ export async function verifyV1SourceCopy(input: VerifyV1SourceCopyInput): Promis
       if (!checkComponents(path, directories).isFile()) fail();
     }
     for (const sidecar of manifest.sqliteSidecars) {
+      deadline?.remainingMs();
       if (![`${manifest.database.relativePath}-wal`, `${manifest.database.relativePath}-shm`].includes(sidecar.relativePath)) fail();
     }
     const databasePath = join(sourceRoot, manifest.database.relativePath);
@@ -350,10 +365,11 @@ export async function verifyV1SourceCopy(input: VerifyV1SourceCopyInput): Promis
     };
     checkSidecars();
     for (let ordinal = 0; ordinal < allDescriptors.length; ordinal++) {
+      deadline?.remainingMs();
       const declared = allDescriptors[ordinal]!;
       const isArtifact = ordinal > manifest.sqliteSidecars.length;
       const read = readCapture(join(sourceRoot, declared.relativePath), declared.relativePath, directories, isArtifact,
-        isArtifact ? policy.maxEventBytes : Number.MAX_SAFE_INTEGER);
+        isArtifact ? policy.maxEventBytes : Number.MAX_SAFE_INTEGER, undefined, deadline);
       if (!equalDescriptor(read.capture.descriptor, declared)) fail();
       const identity = `${declared.device}:${declared.inode}`;
       if (identities.has(identity)) fail();
@@ -369,50 +385,69 @@ export async function verifyV1SourceCopy(input: VerifyV1SourceCopyInput): Promis
     }
     const assertUnchanged = (): void => {
       try {
+        deadline?.remainingMs();
         for (const directory of directories.values()) {
+          deadline?.remainingMs();
           const stat = checkComponents(directory.path);
           if (!stat.isDirectory() || stat.dev !== directory.device || stat.ino !== directory.inode) fail();
         }
         checkSidecars();
         for (const capture of captures) {
-          if (!equalDescriptor(capture.descriptor, readCapture(capture.path, capture.descriptor.relativePath, directories).capture.descriptor)) fail();
+          if (!equalDescriptor(capture.descriptor, readCapture(capture.path, capture.descriptor.relativePath, directories, false, Number.MAX_SAFE_INTEGER, undefined, deadline).capture.descriptor)) fail();
         }
-      } catch { fail("MIGRATION_SOURCE_MUTATED", "source"); }
+        deadline?.remainingMs();
+      } catch (error) {
+        if (error instanceof ShadowMigrationError && error.code === "MIGRATION_RETRY_EXHAUSTED") throw error;
+        fail("MIGRATION_SOURCE_MUTATED", "source");
+      }
     };
     const driver = supplied.driver as SqliteDriver;
     const checkedDriver: SqliteDriver = { open(path, options) {
       assertUnchanged();
-      const connection = driver.open(path, options);
+      const connection = driver.open(path, deadline === undefined ? options
+        : { ...options, busyTimeoutMs: Math.min(options.busyTimeoutMs, deadline.remainingMs()) });
       try {
+        deadline?.remainingMs();
         const row = connection.prepare("SELECT schema_version FROM project_meta WHERE singleton = 1").get();
         if (row?.schema_version !== BigInt(manifest.sourceSchemaVersion) && row?.schema_version !== manifest.sourceSchemaVersion) fail();
         const terminal = connection.prepare("SELECT coalesce(max(global_position), 0) AS terminal_position FROM events").get();
         if (terminal?.terminal_position !== BigInt(manifest.terminalEventPosition)
           && terminal?.terminal_position !== Number(manifest.terminalEventPosition)) fail();
+        deadline?.remainingMs();
         return connection;
       } catch (error) { try { connection.close(); } catch { /* preserve the verification failure */ } throw error; }
     } };
     const sourceEvents: StoredEvent[] = [];
-    const scratch = workingImage(sourceRoot, liveDatabase, liveRoot, manifest, directories);
+    const scratch = workingImage(sourceRoot, liveDatabase, liveRoot, manifest, directories, deadline);
     let replay: ReturnType<typeof replayCommittedProjectionEvents>;
     try {
       replay = replayCommittedProjectionEvents(expected, { driver: checkedDriver, eventStorePath: scratch.databasePath,
         terminalEventPosition: BigInt(manifest.terminalEventPosition), maxEvents: policy.maxEvents }, (event) => {
         // The production replay authenticates each canonical payload before this callback.
+        deadline?.remainingMs();
         const bytes = Buffer.byteLength(event.payloadJson, "utf8");
         logicalBytes += bytes;
         if (bytes > policy.maxEventBytes || logicalBytes > policy.maxAggregateBytes) fail("MIGRATION_LIMIT_EXCEEDED", "event", sourceEvents.length);
         sourceEvents.push(freezeEvent(event));
       });
     } finally { scratch.close(); }
+    deadline?.remainingMs();
     if (sourceEvents.length !== manifest.eventCount || replay.eventCount !== manifest.eventCount
       || logicalBytes !== manifest.aggregateSourceBytes || replay.terminalEventPosition.toString() !== manifest.terminalEventPosition
       || replay.terminalEventHash !== manifest.terminalEventHash) fail();
     assertUnchanged();
     Object.freeze(sourceEvents);
     let closed = false;
-    const requireOpen = (): void => { if (closed) fail(); };
-    const events = (): Iterable<StoredEvent> => { requireOpen(); return sourceEvents.values(); };
+    const requireOpen = (): void => { if (closed) fail(); deadline?.remainingMs(); };
+    const values = <T>(items: readonly T[]): Iterable<T> => {
+      requireOpen();
+      if (deadline === undefined) return items.values();
+      return (function* () {
+        for (const item of items) { requireOpen(); yield item; }
+        requireOpen();
+      })();
+    };
+    const events = (): Iterable<StoredEvent> => values(sourceEvents);
     const close = (): void => { if (closed) return; closed = true; };
     const artifacts = Object.freeze(manifest.legacyArtifacts.map((descriptor, ordinal) => Object.freeze({ descriptor,
       readChunks(): Iterable<Uint8Array> {
@@ -420,12 +455,13 @@ export async function verifyV1SourceCopy(input: VerifyV1SourceCopyInput): Promis
         const bytes = artifactBytes[ordinal]!;
         return (function* () { for (let offset = 0; offset < bytes.length; offset += 64 * 1024) {
           requireOpen(); yield Uint8Array.from(bytes.subarray(offset, offset + 64 * 1024));
-        } })();
+        } if (deadline !== undefined) requireOpen(); })();
       }, assertUnchanged,
     })));
     const projectionSnapshot: ProjectionEventSnapshot = Object.freeze({ binding: expected, ...replay, events, close });
+    deadline?.remainingMs();
     return Object.freeze({ sourceRoot, manifest, projectionSnapshot, events,
-      legacyArtifacts(): Iterable<VerifiedLegacyArtifact> { requireOpen(); return artifacts.values(); }, assertUnchanged, close });
+      legacyArtifacts(): Iterable<VerifiedLegacyArtifact> { return values(artifacts); }, assertUnchanged, close });
   } catch (error) {
     if (error instanceof ShadowMigrationError) {
       return fail(error.code, error.code === "MIGRATION_LIMIT_EXCEEDED" ? "limit" : "source");
