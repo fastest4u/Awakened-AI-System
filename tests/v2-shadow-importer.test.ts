@@ -10,9 +10,10 @@ import { verifyV1SourceCopy } from "../src/orchestrator/migration/v1-source-copy
 import { sealV2MigrationPackage, type SealedV2MigrationPackage, type V2MigrationPackageRecordV1 } from "../src/orchestrator/migration/v2-migration-package.js";
 import { V2ShadowImporter } from "../src/orchestrator/migration/v2-shadow-importer.js";
 import { deterministicMigrationUuid, ShadowMigrationError, shadowMigrationPolicyChecksum, type ShadowMigrationPolicyV1 } from "../src/orchestrator/migration/v2-shadow-migration.contracts.js";
+import { createShadowMigrationInvocationDeadline } from "../src/orchestrator/migration/v2-shadow-migration-runtime.js";
 import { canonicalJson } from "../src/orchestrator/serialization/canonical-json.js";
 import { BranchScopeRepository } from "../src/orchestrator/storage/branch-scope.repository.js";
-import { GENESIS_GLOBAL_HASH, MAX_CANONICAL_COMMAND_BYTES, SqliteEventStoreStatements, type EventAppendStatements, type EventStoreFaultInjector } from "../src/orchestrator/storage/event-store.js";
+import { GENESIS_GLOBAL_HASH, MAX_CANONICAL_COMMAND_BYTES, MAX_EVENTS_PER_COMMAND, SqliteEventStoreStatements, type EventAppendStatements, type EventStoreFaultInjector } from "../src/orchestrator/storage/event-store.js";
 import { MaintenanceFence } from "../src/orchestrator/storage/maintenance-fence.js";
 import { v2ShadowMigration } from "../src/orchestrator/storage/migrations/0007-v2-shadow-migration.js";
 import { NodeSqliteDriver } from "../src/orchestrator/storage/node-sqlite-driver.js";
@@ -24,19 +25,228 @@ import { createV2ShadowMigrationFixture } from "./support/v2-shadow-migration-fi
 
 const driver = new NodeSqliteDriver({ DatabaseSync }); const NOW = "2026-09-10T00:00:00.000Z";
 const PACKAGE_CREATED_AT = "2026-09-10T00:00:10.000Z";
-async function fixture(t: test.TestContext, faultInjector?: EventStoreFaultInjector) {
-  const sourceFixture = await createV2ShadowMigrationFixture(t);
+async function fixture(t: test.TestContext, faultInjector?: EventStoreFaultInjector, bindTarget = false,
+  sourceOptions: Parameters<typeof createV2ShadowMigrationFixture>[1] = {}) {
+  const sourceFixture = await createV2ShadowMigrationFixture(t, sourceOptions);
   sourceFixture.writeManifest({ ...sourceFixture.manifest, createdAt: PACKAGE_CREATED_AT });
   const source = await verifyV1SourceCopy(sourceFixture.verificationInput);
   const sealedPackage = await sealV2MigrationPackage({ ...sourceFixture.packageInput, source, packageRoot: sourceFixture.packageRootA });
-  const connection = driver.open(`${sourceFixture.root}/target.sqlite`, { mode: "create", busyTimeoutMs: 5000 }); applyCurrentProjectStoreSchema(connection, sourceFixture.projectionBinding, NOW); connection.exec(v2ShadowMigration.sql);
+  const eventStorePath = join(sourceFixture.root, "target.sqlite");
+  let connection = driver.open(eventStorePath, { mode: "create", busyTimeoutMs: 5000 }); applyCurrentProjectStoreSchema(connection, sourceFixture.projectionBinding, NOW); connection.exec(v2ShadowMigration.sql);
+  if (bindTarget) { connection.close(); connection = driver.open(eventStorePath, { mode: "existing", busyTimeoutMs: 5000, bindFileIdentity: true }); }
   const workspace = { kind: "non-git" as const, workspaceRoot: sourceFixture.root, workspaceId: sourceFixture.projectionBinding.workspaceId };
   const context = { workspace, checkedAt: NOW, binding: { ...sourceFixture.projectionBinding, projectBindingId: randomUUID(), generation: 1, contextFingerprint: "shadow", source: "explicit-cli", clientNamespace: "shadow-test", clientInstanceId: randomUUID(), actorRole: "primary", projectRoot: sourceFixture.root, vaultRoot: sourceFixture.liveVaultRoot, descriptorPath: `${sourceFixture.liveVaultRoot}/.project-memory.json`, storeRoute: { kind: "vault-local", storeRoot: sourceFixture.root, eventsPath: `${sourceFixture.root}/target.sqlite`, storeManifestPath: `${sourceFixture.root}/store.json`, projectionManifestPath: `${sourceFixture.root}/projection.json` }, workspace, establishedAt: NOW } } as unknown as ProjectContext;
-  const revisionId = randomUUID(); connection.prepare("INSERT INTO rollout_revisions(project_id,revision_id,parent_revision_id,build_identity_hash,migration_identity_hash,configuration_checksum,v1_baseline_checksum,cohort_algorithm_version,cohort_salt,cohort_basis_points,created_at) VALUES ($p,$r,NULL,$h,$h,$h,$h,1,$h,0,$n)").run({ $p: context.binding.projectId, $r: revisionId, $h: "a".repeat(64), $n: NOW });
+  const revisionId = randomUUID(); connection.prepare("INSERT INTO rollout_revisions(project_id,revision_id,parent_revision_id,build_identity_hash,migration_identity_hash,configuration_checksum,v1_baseline_checksum,cohort_algorithm_version,cohort_salt,cohort_basis_points,created_at) VALUES ($p,$r,NULL,$b,$m,$c,$h,1,$h,0,$n)").run({
+    $p: context.binding.projectId, $r: revisionId, $b: sealedPackage.manifest.buildIdentityHash,
+    $m: sealedPackage.migrationIdentity, $c: sealedPackage.manifest.configurationChecksum, $h: "a".repeat(64), $n: NOW });
   const repository = new SqliteV2ShadowMigrationRepository(connection); repository.transact(context.binding.projectId, sealedPackage.migrationIdentity, tx => tx.insertRun({ projectId: context.binding.projectId, migrationIdentity: sealedPackage.migrationIdentity, rolloutRevisionId: revisionId, packageChecksum: sealedPackage.manifest.packageChecksum, sourceManifestChecksum: sealedPackage.manifest.sourceManifestChecksum, sourceTerminalPosition: BigInt(sealedPackage.manifest.terminalEventPosition), sourceTerminalHash: sealedPackage.manifest.terminalEventHash, configurationChecksum: sealedPackage.manifest.configurationChecksum, policyChecksum: shadowMigrationPolicyChecksum(sourceFixture.policy), buildIdentityHash: sealedPackage.manifest.buildIdentityHash, createdAt: NOW }));
-  return { connection, context, sealedPackage, repository, policy: sourceFixture.policy, sourceFixture, close: () => { sealedPackage.close(); source.close(); connection.close(); }, importer: new V2ShadowImporter({ connection, statements: new SqliteEventStoreStatements(connection), maintenance: new MaintenanceFence(), branchScopes: new BranchScopeRepository(), policy: sourceFixture.policy, faultInjector }) };
+  return { connection, context, eventStorePath, sealedPackage, repository, policy: sourceFixture.policy, sourceFixture, close: () => { sealedPackage.close(); source.close(); connection.close(); }, importer: new V2ShadowImporter({ connection, statements: new SqliteEventStoreStatements(connection), maintenance: new MaintenanceFence(), branchScopes: new BranchScopeRepository(), policy: sourceFixture.policy, faultInjector, ...(bindTarget ? { eventStorePath } : {}) }) };
 }
 const unknown = (error: unknown) => error instanceof ShadowMigrationError && error.code === "MIGRATION_OUTCOME_UNKNOWN";
+
+test("read-only reconciliation classifies a genuinely bound empty target as absent", async t => {
+  // Consulting caller-supplied statements or entering a semantic write path breaks checked-target-only absence proof.
+  const f = await fixture(t, undefined, true);
+  try {
+    const result = f.importer.reconcile({ context: f.context, sealedPackage: f.sealedPackage });
+    assert.deepEqual(result, { status: "absent" });
+    assert.equal(Number(f.connection.prepare("SELECT count(*) AS n FROM events").get()!.n), 0);
+    assert.equal(Number(f.connection.prepare("SELECT count(*) AS n FROM v2_shadow_imported_records").get()!.n), 0);
+    assert.equal(Number(f.connection.prepare("SELECT count(*) AS n FROM v2_shadow_compatibility_outbox").get()!.n), 0);
+  } finally { f.close(); }
+});
+
+test("read-only reconciliation returns the exact deterministic committed result without writes", async t => {
+  // Recomputing a different result or repairing evidence during reconciliation breaks whole-import idempotency.
+  const f = await fixture(t, undefined, true);
+  try {
+    const imported = f.importer.import({ context: f.context, sealedPackage: f.sealedPackage });
+    const before = f.connection.prepare("SELECT (SELECT count(*) FROM events) AS events,(SELECT count(*) FROM command_dedup) AS dedup,(SELECT count(*) FROM v2_shadow_imported_records) AS receipts,(SELECT count(*) FROM v2_shadow_compatibility_outbox) AS outboxes").get();
+    const reconciled = f.importer.reconcile({ context: f.context, sealedPackage: f.sealedPackage });
+    assert.deepEqual(reconciled, { status: "committed", result: { ...imported, deduplicated: true } });
+    const after = f.connection.prepare("SELECT (SELECT count(*) FROM events) AS events,(SELECT count(*) FROM command_dedup) AS dedup,(SELECT count(*) FROM v2_shadow_imported_records) AS receipts,(SELECT count(*) FROM v2_shadow_compatibility_outbox) AS outboxes").get();
+    assert.deepEqual(after, before);
+    assert.equal(Object.isFrozen(reconciled), true);
+    if (reconciled.status === "committed") {
+      assert.equal(Object.isFrozen(reconciled.result), true);
+      assert.equal(Object.isFrozen(reconciled.result.eventIds), true);
+    }
+  } finally { f.close(); }
+});
+
+test("reconciliation authenticates a valid empty package as committed", async t => {
+  // Treating zero expected effects as absent loses the distinction between a valid no-op import and a missing import.
+  const f = await fixture(t, undefined, true, { sourceEventCount: 0, legacyArtifacts: false });
+  try {
+    const reconciled = f.importer.reconcile({ context: f.context, sealedPackage: f.sealedPackage });
+    assert.deepEqual(reconciled, { status: "committed", result: {
+      schemaVersion: 1, migrationIdentity: f.sealedPackage.migrationIdentity,
+      packageChecksum: f.sealedPackage.manifest.packageChecksum, recordCount: 0, eventIds: [],
+      firstImportedPosition: null, terminalImportedPosition: null, terminalImportedEventHash: "0".repeat(64),
+      importedEventsChecksum: createHash("sha256").update(canonicalJson([])).digest("hex"), deduplicated: true } });
+    assert.equal(Number(f.connection.prepare("SELECT count(*) AS n FROM events").get()!.n), 0);
+  } finally { f.close(); }
+});
+
+test("reconciliation ignores a distinct real foreign statement set", async t => {
+  // Consulting injectable statements lets a checked empty target inherit committed proof from another native store.
+  const target = await fixture(t, undefined, true);
+  const foreign = await fixture(t);
+  try {
+    foreign.importer.import({ context: foreign.context, sealedPackage: foreign.sealedPackage });
+    const importer = new V2ShadowImporter({ connection: target.connection,
+      statements: new SqliteEventStoreStatements(foreign.connection), maintenance: new MaintenanceFence(),
+      branchScopes: new BranchScopeRepository(), policy: target.policy, eventStorePath: target.eventStorePath });
+    assert.deepEqual(importer.reconcile({ context: target.context, sealedPackage: target.sealedPackage }), { status: "absent" });
+    assert.equal(Number(target.connection.prepare("SELECT count(*) AS n FROM events").get()!.n), 0);
+  } finally { foreign.close(); target.close(); }
+});
+
+test("reconciliation reports a real commit-before-receipt outcome as unknown and never repairs it", async t => {
+  // Missing receipts/outboxes after an authenticated EventStore commit is partial evidence, not committed or absent.
+  let lost = false;
+  const f = await fixture(t, { hit(boundary) { if (!lost && boundary === "after-commit-before-response") {
+    lost = true; throw new Error("lost-import-response"); } } }, true);
+  try {
+    assert.throws(() => f.importer.import({ context: f.context, sealedPackage: f.sealedPackage }), unknown);
+    const beforeEvents = Number(f.connection.prepare("SELECT count(*) AS n FROM events").get()!.n);
+    assert.deepEqual(f.importer.reconcile({ context: f.context, sealedPackage: f.sealedPackage }),
+      { status: "unknown", safeErrorCode: "MIGRATION_OUTCOME_UNKNOWN" });
+    assert.equal(Number(f.connection.prepare("SELECT count(*) AS n FROM events").get()!.n), beforeEvents);
+    assert.equal(Number(f.connection.prepare("SELECT count(*) AS n FROM v2_shadow_imported_records").get()!.n), 0);
+    assert.equal(Number(f.connection.prepare("SELECT count(*) AS n FROM v2_shadow_compatibility_outbox").get()!.n), 0);
+    const recovered = f.importer.import({ context: f.context, sealedPackage: f.sealedPackage });
+    assert.equal(Number(f.connection.prepare("SELECT count(*) AS n FROM events").get()!.n), recovered.recordCount);
+    assert.equal(Number(f.connection.prepare("SELECT count(*) AS n FROM v2_shadow_compatibility_outbox").get()!.n), 2);
+  } finally { f.close(); }
+});
+
+test("reconciliation requires genuine matching open-time target provenance before reads", async t => {
+  // Path text, wrappers, unbound opens, closed handles, and a different target must not authorize SQL evidence reads.
+  for (const variant of ["missing", "unbound", "forged", "wrong-target", "closed"] as const) await t.test(variant, async child => {
+    const f = await fixture(child, undefined, variant !== "unbound");
+    const other = variant === "wrong-target" ? await fixture(child, undefined, true) : undefined;
+    const statements = new SqliteEventStoreStatements(f.connection);
+    let connection: SqliteConnection = f.connection;
+    let eventStorePath: string | undefined = f.eventStorePath;
+    if (variant === "missing") eventStorePath = undefined;
+    if (variant === "forged") connection = { exec: sql => f.connection.exec(sql), prepare: sql => f.connection.prepare(sql), close() {} };
+    if (variant === "wrong-target") eventStorePath = other!.eventStorePath;
+    if (variant === "closed") f.connection.close();
+    const importer = new V2ShadowImporter({ connection, statements,
+      maintenance: new MaintenanceFence(), branchScopes: new BranchScopeRepository(), policy: f.policy,
+      ...(eventStorePath === undefined ? {} : { eventStorePath }) });
+    try {
+      assert.throws(() => importer.reconcile({ context: f.context, sealedPackage: f.sealedPackage }));
+      if (variant !== "closed") assert.equal(Number(f.connection.prepare("SELECT count(*) AS n FROM events").get()!.n), 0);
+    } finally {
+      other?.close();
+      if (variant === "closed") { try { f.close(); } catch { /* the native handle was deliberately closed */ } }
+      else f.close();
+    }
+  });
+});
+
+test("append-then-shared-deadline expiry stays unknown without receipts and a fresh invocation completes once", async t => {
+  // Resetting the deadline or continuing after the committed append would write receipts/outbox or another batch after expiry.
+  let now = 0;
+  const f = await fixture(t, { hit(boundary) { if (boundary === "after-commit-before-response") now = 10; } }, true);
+  const deadline = createShadowMigrationInvocationDeadline(10, () => now);
+  try {
+    assert.throws(() => f.importer.import({ context: f.context, sealedPackage: f.sealedPackage,
+      invocationDeadline: deadline }), unknown);
+    assert.equal(Number(f.connection.prepare("SELECT count(*) AS n FROM events").get()!.n), 4);
+    assert.equal(Number(f.connection.prepare("SELECT count(*) AS n FROM v2_shadow_imported_records").get()!.n), 0);
+    assert.equal(Number(f.connection.prepare("SELECT count(*) AS n FROM v2_shadow_compatibility_outbox").get()!.n), 0);
+    assert.deepEqual(f.importer.reconcile({ context: f.context, sealedPackage: f.sealedPackage,
+      invocationDeadline: deadline }), { status: "unknown", safeErrorCode: "MIGRATION_RETRY_EXHAUSTED" });
+    const fresh = createShadowMigrationInvocationDeadline(100_000);
+    const recovered = f.importer.import({ context: f.context, sealedPackage: f.sealedPackage, invocationDeadline: fresh });
+    assert.equal(recovered.recordCount, 4);
+    assert.equal(Number(f.connection.prepare("SELECT count(*) AS n FROM events").get()!.n), 4);
+    assert.equal(Number(f.connection.prepare("SELECT count(*) AS n FROM v2_shadow_compatibility_outbox").get()!.n), 2);
+    fresh.dispose();
+  } finally { deadline.dispose(); f.close(); }
+});
+
+test("one completed batch of a real multi-batch import reconciles as unknown", async t => {
+  // Classifying each batch independently would report committed even though the whole import stopped before its terminal batch.
+  let lost = false;
+  const f = await fixture(t, { hit(boundary) { if (!lost && boundary === "after-commit-before-response") {
+    lost = true; throw new Error("lost-first-batch-response"); } } }, true,
+  { sourceEventCount: MAX_EVENTS_PER_COMMAND + 1, legacyArtifacts: false });
+  try {
+    assert.throws(() => f.importer.import({ context: f.context, sealedPackage: f.sealedPackage }), unknown);
+    assert.equal(Number(f.connection.prepare("SELECT count(*) AS n FROM events").get()!.n), MAX_EVENTS_PER_COMMAND);
+    assert.deepEqual(f.importer.reconcile({ context: f.context, sealedPackage: f.sealedPackage }),
+      { status: "unknown", safeErrorCode: "MIGRATION_OUTCOME_UNKNOWN" });
+    assert.equal(Number(f.connection.prepare("SELECT count(*) AS n FROM v2_shadow_imported_records").get()!.n), 0);
+    const recovered = f.importer.import({ context: f.context, sealedPackage: f.sealedPackage });
+    assert.equal(recovered.recordCount, MAX_EVENTS_PER_COMMAND + 1);
+    assert.equal(Number(f.connection.prepare("SELECT count(*) AS n FROM events").get()!.n), MAX_EVENTS_PER_COMMAND + 1);
+  } finally { f.close(); }
+});
+
+test("reconciliation rejects contradictory command, response, event, receipt, and outbox evidence", async t => {
+  // Any authenticated-looking but contradictory present value must fail terminally instead of becoming absent or retryable.
+  for (const variant of ["command", "response", "event", "receipt", "outbox"] as const) await t.test(variant, async child => {
+    const f = await fixture(child, undefined, true);
+    try {
+      f.importer.import({ context: f.context, sealedPackage: f.sealedPackage });
+      const table = variant === "command" || variant === "response" ? "command_dedup"
+        : variant === "event" ? "events" : variant === "receipt" ? "v2_shadow_imported_records"
+        : "v2_shadow_compatibility_outbox";
+      const triggers = f.connection.prepare("SELECT name FROM sqlite_master WHERE type='trigger' AND tbl_name=$table").all({ $table: table });
+      for (const trigger of triggers) f.connection.exec(`DROP TRIGGER "${String(trigger.name).replaceAll('"', '""')}"`);
+      if (variant === "command") f.connection.prepare("UPDATE command_dedup SET command_id=$id WHERE project_id=$p")
+        .run({ $id: randomUUID(), $p: f.context.binding.projectId });
+      else if (variant === "response") f.connection.prepare("UPDATE command_dedup SET response_hash=$h WHERE project_id=$p")
+        .run({ $h: "f".repeat(64), $p: f.context.binding.projectId });
+      else if (variant === "event") f.connection.prepare("UPDATE events SET payload_hash=$h WHERE project_id=$p AND global_position=1")
+        .run({ $h: "f".repeat(64), $p: f.context.binding.projectId });
+      else if (variant === "receipt") f.connection.prepare("UPDATE v2_shadow_imported_records SET source_record_hash=$h WHERE project_id=$p AND source_ordinal=0")
+        .run({ $h: "f".repeat(64), $p: f.context.binding.projectId });
+      else f.connection.prepare("UPDATE v2_shadow_compatibility_outbox SET content_sha256=$h WHERE project_id=$p AND outbox_id=(SELECT outbox_id FROM v2_shadow_compatibility_outbox WHERE project_id=$p ORDER BY source_ordinal LIMIT 1)")
+        .run({ $h: "f".repeat(64), $p: f.context.binding.projectId });
+      assert.throws(() => f.importer.reconcile({ context: f.context, sealedPackage: f.sealedPackage }),
+        error => error instanceof ShadowMigrationError && error.code === "MIGRATION_IDENTITY_CONFLICT");
+    } finally { f.close(); }
+  });
+});
+
+test("a real SQLite transaction-entry read uncertainty returns unknown without writes", async t => {
+  // Treating a busy/ambiguous read as stable absence would authorize an unsafe retry.
+  const f = await fixture(t, undefined, true);
+  const blocker = driver.open(f.eventStorePath, { mode: "existing", busyTimeoutMs: 5000 });
+  try {
+    blocker.exec("BEGIN IMMEDIATE");
+    const result = f.importer.reconcile({ context: f.context, sealedPackage: f.sealedPackage });
+    assert.deepEqual(result, { status: "unknown", safeErrorCode: "MIGRATION_OUTCOME_UNKNOWN" });
+    assert.equal(Number(f.connection.prepare("SELECT count(*) AS n FROM events").get()!.n), 0);
+    assert.equal(Number(f.connection.prepare("SELECT count(*) AS n FROM v2_shadow_imported_records").get()!.n), 0);
+  } finally { try { blocker.exec("ROLLBACK"); } finally { blocker.close(); f.close(); } }
+});
+
+test("reconciliation spends the supplied deadline again immediately before returning", async t => {
+  // An early-only budget check would return stable absence after the invocation expired during proof construction.
+  const f = await fixture(t, undefined, true);
+  try {
+    let probes = 0;
+    const counting = { signal: new AbortController().signal, remainingMs(): number { probes += 1; return 1000; } };
+    assert.deepEqual(f.importer.reconcile({ context: f.context, sealedPackage: f.sealedPackage,
+      invocationDeadline: counting }), { status: "absent" });
+    assert.ok(probes > 3);
+    let lateProbes = 0;
+    const expiresAtReturn = { signal: new AbortController().signal, remainingMs(): number {
+      lateProbes += 1;
+      if (lateProbes === probes) throw new ShadowMigrationError("MIGRATION_RETRY_EXHAUSTED");
+      return 1000;
+    } };
+    assert.deepEqual(f.importer.reconcile({ context: f.context, sealedPackage: f.sealedPackage,
+      invocationDeadline: expiresAtReturn }), { status: "unknown", safeErrorCode: "MIGRATION_RETRY_EXHAUSTED" });
+    assert.equal(lateProbes, probes);
+  } finally { f.close(); }
+});
 
 test("enqueues one exact immutable outbox per committed artifact in the receipt store", async t => {
   const f = await fixture(t);

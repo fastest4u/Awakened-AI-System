@@ -4,19 +4,26 @@ import { payloadHash } from "../crypto/event-hash.js";
 import { authenticateStoredEvent } from "../integrity/stored-event-authenticator.js";
 import type { ProjectContext } from "../identity/contracts.js";
 import { canonicalJson } from "../serialization/canonical-json.js";
-import { EventStore, EventStoreError, GENESIS_GLOBAL_HASH, MAX_CANONICAL_COMMAND_BYTES, MAX_EVENTS_PER_COMMAND, type EventAppendStatements } from "../storage/event-store.js";
+import { EventStore, EventStoreError, GENESIS_GLOBAL_HASH, MAX_CANONICAL_COMMAND_BYTES, MAX_EVENTS_PER_COMMAND,
+  SqliteEventStoreStatements, type EventAppendStatements } from "../storage/event-store.js";
+import { EventAppendTransaction } from "../storage/event-append-transaction.js";
 import { BranchScopeRepository } from "../storage/branch-scope.repository.js";
 import { MaintenanceFence } from "../storage/maintenance-fence.js";
 import type { SqliteConnection, SqliteRow } from "../storage/sqlite-driver.js";
+import { assertBoundSqliteConnectionIdentity } from "../storage/node-sqlite-driver.js";
 import { SqliteV2ShadowMigrationRepository, type CompatibilityOutboxRecord, type ImportedRecordReceipt } from "../storage/v2-shadow-migration.repository.js";
-import { deterministicMigrationUuid, ShadowMigrationError, type ShadowMigrationPolicyV1 } from "./v2-shadow-migration.contracts.js";
+import { captureCompatibilityPath } from "../materialization/stable-compatibility-directory.js";
+import { deterministicMigrationUuid, ShadowMigrationError, shadowMigrationConfigurationChecksum,
+  shadowMigrationPolicyChecksum, type ShadowMigrationPolicyV1 } from "./v2-shadow-migration.contracts.js";
 import type { SealedV2MigrationPackage, V2MigrationPackageRecordV1 } from "./v2-migration-package.js";
+import type { ShadowMigrationInvocationDeadline, ShadowMigrationReconciliation } from "./v2-shadow-migration-runtime.js";
 
 export interface V1ProjectionSourceImportedV1 { readonly schemaVersion: 1; readonly migrationIdentity: string; readonly sourceOrdinal: number; readonly sourceRecordHash: string; readonly sourceEvent: Readonly<{ globalPosition: string; eventId: string; projectId: string; vaultId: string; storeId: string; workspaceId: string; branchScopeId: string | null; branchRef: string | null; streamId: string; streamType: string; streamVersion: string; eventType: string; eventSchemaVersion: number; sessionId: string | null; parentSessionId: string | null; actorRole: string; agentId: string; clientInstanceId: string; correlationId: string; causationId: string | null; commandId: string; idempotencyKey: string; commandEventIndex: number; occurredAt: string; recordedAt: string; visibilityScope: string; confidence: string; verificationStatus: string; sourceRefs: readonly string[]; evidenceRefs: readonly []; evidenceDigests: readonly []; payloadJson: string; payloadHash: string; previousGlobalHash: string; eventHash: string; lifecycleIntentJson: string | null; }>; }
 export interface V1LegacyArtifactImportedV1 { readonly schemaVersion: 1; readonly migrationIdentity: string; readonly sourceOrdinal: number; readonly sourceRecordHash: string; readonly relativePath: string; readonly contentSha256: string; readonly contentUtf8: string; }
 export interface V2ShadowImportResult { readonly schemaVersion: 1; readonly migrationIdentity: string; readonly packageChecksum: string; readonly recordCount: number; readonly eventIds: readonly string[]; readonly firstImportedPosition: bigint | null; readonly terminalImportedPosition: bigint | null; readonly terminalImportedEventHash: string; readonly importedEventsChecksum: string; readonly deduplicated: boolean; }
-export interface V2ShadowImportInput { readonly context: ProjectContext; readonly sealedPackage: SealedV2MigrationPackage; }
-export interface V2ShadowImporterDependencies { readonly connection: SqliteConnection; readonly statements: EventAppendStatements; readonly maintenance: MaintenanceFence; readonly branchScopes: BranchScopeRepository; readonly policy: ShadowMigrationPolicyV1; readonly faultInjector?: ConstructorParameters<typeof EventStore>[6]; }
+export interface V2ShadowImportInput { readonly context: ProjectContext; readonly sealedPackage: SealedV2MigrationPackage;
+  readonly invocationDeadline?: ShadowMigrationInvocationDeadline; }
+export interface V2ShadowImporterDependencies { readonly connection: SqliteConnection; readonly statements: EventAppendStatements; readonly maintenance: MaintenanceFence; readonly branchScopes: BranchScopeRepository; readonly policy: ShadowMigrationPolicyV1; readonly eventStorePath?: string; readonly faultInjector?: ConstructorParameters<typeof EventStore>[6]; }
 
 type ImportedPayload = V1ProjectionSourceImportedV1 | V1LegacyArtifactImportedV1;
 type PlannedRecord = Readonly<{ ordinal: number; kind: "source-event" | "legacy-artifact"; sourceRecordHash: string; sourceByteLength: number; payload: ImportedPayload; eventId: string; }>;
@@ -32,59 +39,228 @@ export class V2ShadowImporter {
 
   public import(input: V2ShadowImportInput): V2ShadowImportResult {
     const { context, sealedPackage } = input;
+    let mutationOccurred = false;
+    const rawBoundary = importBoundary(this.dependencies, input.invocationDeadline, false);
+    const boundary = (): void => {
+      try { rawBoundary(); }
+      catch (error) {
+        if (mutationOccurred && error instanceof ShadowMigrationError && error.code === "MIGRATION_RETRY_EXHAUSTED") {
+          throw new ShadowMigrationError("MIGRATION_OUTCOME_UNKNOWN", Object.freeze({}));
+        }
+        throw error;
+      }
+    };
+    boundary();
     const manifest = sealedPackage.manifest;
     const identity = sealedPackage.migrationIdentity;
     if (context.binding.projectId !== manifest.projectId || context.binding.vaultId !== manifest.vaultId || context.binding.storeId !== manifest.storeId || context.binding.workspaceId !== manifest.workspaceId) sourceInvalid();
     const migrationContext = internalMigrationContext(context, identity, manifest.createdAt);
-    sealedPackage.assertUnchanged();
+    sealedPackage.assertUnchanged(); boundary();
     const evidence = this.repository.transact(manifest.projectId, identity, (tx) => {
+      boundary();
       const run = tx.readRun();
       if (run === null || run.packageChecksum !== manifest.packageChecksum || run.sourceManifestChecksum !== manifest.sourceManifestChecksum) conflict();
       return { receipts: tx.readImportedRecords(), outboxes: tx.readCompatibilityOutbox() };
     });
+    boundary();
     const prior = evidence.receipts;
     if (evidence.outboxes.some(row => !prior.some(receipt => receipt.sourceOrdinal === row.sourceOrdinal && receipt.sourceKind === "legacy-artifact"))) conflict();
     if (prior.length > manifest.recordDescriptors.length) conflict();
     const priorByOrdinal = new Map(prior.map((receipt) => [receipt.sourceOrdinal, receipt]));
     let replayed = true;
     streamBatches(sealedPackage, this.dependencies.policy, migrationContext, (batch, batchOrdinal) => {
+      boundary();
       const receipts = batch.map((record) => priorByOrdinal.get(record.ordinal)).filter((receipt): receipt is ImportedRecordReceipt => receipt !== undefined);
       if (receipts.length !== 0 && receipts.length !== batch.length) conflict();
       if (receipts.length === batch.length) {
         const planned = planCommand(migrationContext, sealedPackage, batch, batchOrdinal);
         for (const [index, receipt] of receipts.entries()) {
           const record = batch[index]!;
-          assertReceipt(this.dependencies.connection, receipt, record, planned.recordedAt, migrationContext.binding.projectId);
+          assertReceipt(this.dependencies.connection, receipt, record, planned.recordedAt, migrationContext.binding.projectId, boundary);
           const expected = compatibilityRecord(receipt, record);
           const actual = evidence.outboxes.filter(row => row.sourceOrdinal === record.ordinal);
           if (expected === null ? actual.length !== 0 : actual.length !== 1 || !sameOutbox(actual[0]!, expected)) conflict();
         }
-      } else { replayed = false; this.appendBatch(migrationContext, sealedPackage, batch, batchOrdinal); }
-    });
-    const receipts = this.repository.transact(manifest.projectId, identity, (tx) => tx.readImportedRecords());
+      } else {
+        replayed = false;
+        mutationOccurred = this.appendBatch(migrationContext, sealedPackage, batch, batchOrdinal, boundary, input.invocationDeadline)
+          || mutationOccurred;
+      }
+    }, boundary);
+    boundary();
+    const receipts = this.repository.transact(manifest.projectId, identity, (tx) => { boundary(); return tx.readImportedRecords(); });
     if (receipts.length !== manifest.recordDescriptors.length) conflict();
     const ordered = [...receipts].sort((left, right) => left.sourceOrdinal - right.sourceOrdinal);
-    const first = ordered[0] ?? null;
-    const terminal = ordered.at(-1) ?? null;
-    sealedPackage.assertUnchanged();
-    return Object.freeze({ schemaVersion: 1, migrationIdentity: identity, packageChecksum: manifest.packageChecksum, recordCount: manifest.recordDescriptors.length,
-      eventIds: Object.freeze(ordered.map((receipt) => receipt.importedEventId)), firstImportedPosition: first?.importedGlobalPosition ?? null,
-      terminalImportedPosition: terminal?.importedGlobalPosition ?? null, terminalImportedEventHash: terminal?.importedEventHash ?? "0".repeat(64),
-      importedEventsChecksum: checksum(ordered.map((receipt) => ({ ordinal: receipt.sourceOrdinal, eventId: receipt.importedEventId, position: receipt.importedGlobalPosition.toString(), eventHash: receipt.importedEventHash }))),
-      deduplicated: replayed });
+    sealedPackage.assertUnchanged(); boundary();
+    return importResult(sealedPackage, ordered, replayed);
   }
 
-  private appendBatch(context: ProjectContext, package_: SealedV2MigrationPackage, batch: readonly PlannedRecord[], batchOrdinal: number): void {
-    if (batch.length === 0) return;
+  public reconcile(input: V2ShadowImportInput): ShadowMigrationReconciliation<V2ShadowImportResult> {
+    const authority = boundTarget(this.dependencies, true);
+    authority();
+    const deadline = input.invocationDeadline;
+    const boundary = (): void => { deadline?.remainingMs(); authority(); };
+    try {
+      boundary();
+      const { context, sealedPackage } = input;
+      const manifest = sealedPackage.manifest;
+      const identity = sealedPackage.migrationIdentity;
+      if (context.binding.projectId !== manifest.projectId || context.binding.vaultId !== manifest.vaultId
+        || context.binding.storeId !== manifest.storeId || context.binding.workspaceId !== manifest.workspaceId) sourceInvalid();
+      const migrationContext = internalMigrationContext(context, identity, manifest.createdAt);
+      const policyChecksum = shadowMigrationPolicyChecksum(this.dependencies.policy);
+      if (manifest.configurationChecksum !== shadowMigrationConfigurationChecksum({ schemaVersion: 1, policyChecksum,
+        packageFormatVersion: 1, migrationAlgorithmVersion: 1,
+        expectedDifferencePolicyVersion: this.dependencies.policy.expectedDifferencePolicyVersion })) conflict();
+      sealedPackage.assertUnchanged(); boundary();
+      const productionStatements = new SqliteEventStoreStatements(this.dependencies.connection);
+      const evidence = this.repository.transact(manifest.projectId, identity, tx => {
+        boundary();
+        const run = tx.readRun();
+        boundary();
+        if (run === null || run.projectId !== manifest.projectId || run.migrationIdentity !== identity
+          || run.packageChecksum !== manifest.packageChecksum || run.sourceManifestChecksum !== manifest.sourceManifestChecksum
+          || run.sourceTerminalPosition !== BigInt(manifest.terminalEventPosition)
+          || run.sourceTerminalHash !== manifest.terminalEventHash || run.configurationChecksum !== manifest.configurationChecksum
+          || run.policyChecksum !== policyChecksum
+          || run.buildIdentityHash !== manifest.buildIdentityHash) conflict();
+        const revision = this.dependencies.connection.prepare("SELECT build_identity_hash,migration_identity_hash,configuration_checksum FROM rollout_revisions WHERE project_id=$p AND revision_id=$r")
+          .get({ $p: manifest.projectId, $r: run.rolloutRevisionId });
+        boundary();
+        if (revision?.build_identity_hash !== manifest.buildIdentityHash || revision.migration_identity_hash !== identity
+          || revision.configuration_checksum !== manifest.configurationChecksum) conflict();
+        const receipts = tx.readImportedRecords();
+        boundary();
+        const outboxes = tx.readCompatibilityOutbox();
+        boundary();
+        const plannedRecords: PlannedRecord[] = [];
+        const recordedAtByOrdinal = new Map<number, string>();
+        let committedBatches = 0;
+        let absentBatches = 0;
+        streamBatches(sealedPackage, this.dependencies.policy, migrationContext, (batch, batchOrdinal) => {
+          boundary();
+          const planned = planCommand(migrationContext, sealedPackage, batch, batchOrdinal);
+          const append = new EventAppendTransaction(this.dependencies.connection, productionStatements,
+            this.dependencies.maintenance, this.dependencies.branchScopes, deterministicIds(planned.eventIds));
+          const prepared = append.prepare(planned.command, planned.recordedAt);
+          boundary();
+          const replay = append.findReplay(prepared, null);
+          boundary();
+          const commandRows = this.dependencies.connection.prepare("SELECT * FROM events WHERE project_id=$p AND command_id=$c ORDER BY command_event_index")
+            .all({ $p: manifest.projectId, $c: planned.command.commandId });
+          if (replay === null) {
+            const command = productionStatements.findCommandId(manifest.projectId, planned.command.commandId);
+            if (command !== undefined) conflict();
+            if (commandRows.length !== 0) {
+              if (commandRows.length > batch.length) conflict();
+              for (const [index, row] of commandRows.entries()) {
+                const record = batch[index];
+                if (record === undefined) conflict();
+                assertDurableEvent(authenticateDurable(this.dependencies.connection, row, boundary), record, planned.recordedAt, manifest.projectId);
+              }
+            }
+            absentBatches += 1;
+          } else {
+            if (replay.eventIds.length !== planned.eventIds.length
+              || replay.eventIds.some((eventId, index) => eventId !== planned.eventIds[index])
+              || canonicalJson(replay.response) !== canonicalJson(planned.command.publicResponse)
+              || replay.firstGlobalPosition > replay.lastGlobalPosition
+              || replay.lastGlobalPosition - replay.firstGlobalPosition + 1n !== BigInt(batch.length)) conflict();
+            readCommitted(this.dependencies.connection, manifest.projectId, batch,
+              replay.firstGlobalPosition, replay.lastGlobalPosition, planned.recordedAt, boundary);
+            if (commandRows.length !== batch.length) conflict();
+            committedBatches += 1;
+          }
+          for (const record of batch) { plannedRecords.push(record); recordedAtByOrdinal.set(record.ordinal, planned.recordedAt); }
+        }, boundary);
+        boundary();
+        if (plannedRecords.length !== manifest.recordDescriptors.length) sourceInvalid();
+        const recordByOrdinal = new Map(plannedRecords.map(record => [record.ordinal, record]));
+        const receiptByOrdinal = new Map<number, ImportedRecordReceipt>();
+        for (const receipt of receipts) {
+          if (receiptByOrdinal.has(receipt.sourceOrdinal)) conflict();
+          const record = recordByOrdinal.get(receipt.sourceOrdinal);
+          const recordedAt = recordedAtByOrdinal.get(receipt.sourceOrdinal);
+          if (record === undefined || recordedAt === undefined) conflict();
+          assertReceipt(this.dependencies.connection, receipt, record, recordedAt, manifest.projectId, boundary);
+          receiptByOrdinal.set(receipt.sourceOrdinal, receipt);
+        }
+        const outboxByOrdinal = new Map<number, CompatibilityOutboxRecord>();
+        for (const outbox of outboxes) {
+          if (outboxByOrdinal.has(outbox.sourceOrdinal)) conflict();
+          const record = recordByOrdinal.get(outbox.sourceOrdinal);
+          const receipt = receiptByOrdinal.get(outbox.sourceOrdinal);
+          if (record === undefined || receipt === undefined) conflict();
+          const expected = compatibilityRecord(receipt, record);
+          if (expected === null || !sameOutbox(outbox, expected)) conflict();
+          outboxByOrdinal.set(outbox.sourceOrdinal, outbox);
+        }
+        const ownedEvents = this.dependencies.connection.prepare("SELECT event_id FROM events WHERE project_id=$p AND stream_id=$s ORDER BY stream_version")
+          .all({ $p: manifest.projectId, $s: `v2-shadow-import/${identity}` });
+        boundary();
+        const ownedDedup = this.dependencies.connection.prepare("SELECT command_id,idempotency_key FROM command_dedup WHERE project_id=$p AND idempotency_key GLOB $prefix")
+          .all({ $p: manifest.projectId, $prefix: `v2-shadow-import:${identity}:*` });
+        boundary();
+        const expectedEventIds = plannedRecords.map(record => record.eventId);
+        if (ownedEvents.some((row, index) => typeof row.event_id !== "string" || row.event_id !== expectedEventIds[index])) conflict();
+        if (ownedDedup.length > committedBatches) conflict();
+        const expectedOutboxes = plannedRecords.filter(record => record.kind === "legacy-artifact").length;
+        if (plannedRecords.length === 0) {
+          if (ownedEvents.length !== 0 || ownedDedup.length !== 0 || receipts.length !== 0 || outboxes.length !== 0) conflict();
+          return Object.freeze({ status: "committed" as const, result: importResult(sealedPackage, [], true) });
+        }
+        const fullyAbsent = committedBatches === 0 && absentBatches > 0 && ownedEvents.length === 0
+          && ownedDedup.length === 0 && receipts.length === 0 && outboxes.length === 0;
+        if (fullyAbsent) return Object.freeze({ status: "absent" as const });
+        const fullyCommitted = absentBatches === 0 && committedBatches > 0
+          && ownedEvents.length === plannedRecords.length && ownedDedup.length === committedBatches
+          && receipts.length === plannedRecords.length && outboxes.length === expectedOutboxes
+          && plannedRecords.every(record => receiptByOrdinal.has(record.ordinal)
+            && (record.kind === "source-event" || outboxByOrdinal.has(record.ordinal)));
+        if (fullyCommitted) return Object.freeze({ status: "committed" as const,
+          result: importResult(sealedPackage, receipts, true) });
+        return Object.freeze({ status: "unknown" as const, safeErrorCode: "MIGRATION_OUTCOME_UNKNOWN" as const });
+      });
+      boundary(); sealedPackage.assertUnchanged(); boundary();
+      return evidence;
+    } catch (error) {
+      if (error instanceof ShadowMigrationError) {
+        if (error.code === "MIGRATION_RETRY_EXHAUSTED") {
+          return Object.freeze({ status: "unknown", safeErrorCode: "MIGRATION_RETRY_EXHAUSTED" });
+        }
+        throw error;
+      }
+      if (error instanceof EventStoreError && ["IDEMPOTENCY_CONFLICT", "INTEGRITY_FAILURE", "PROJECT_IDENTITY_MISMATCH", "COMMAND_INVALID"].includes(error.code)) conflict();
+      return Object.freeze({ status: "unknown", safeErrorCode: "MIGRATION_OUTCOME_UNKNOWN" });
+    }
+  }
+
+  private appendBatch(context: ProjectContext, package_: SealedV2MigrationPackage, batch: readonly PlannedRecord[], batchOrdinal: number,
+    boundary: () => void, deadline?: ShadowMigrationInvocationDeadline): boolean {
+    if (batch.length === 0) return false;
+    boundary();
     const identity = package_.migrationIdentity;
     const planned = planCommand(context, package_, batch, batchOrdinal);
+    const faultInjector = { hit: (point: Parameters<NonNullable<V2ShadowImporterDependencies["faultInjector"]>["hit"]>[0],
+      context_: Parameters<NonNullable<V2ShadowImporterDependencies["faultInjector"]>["hit"]>[1]): void => {
+      this.dependencies.faultInjector?.hit(point, context_);
+      try { boundary(); }
+      catch (error) { if (error instanceof ShadowMigrationError && error.code === "MIGRATION_RETRY_EXHAUSTED") {
+        throw new EventStoreError("MIGRATION_RETRY_EXHAUSTED"); } throw error; }
+    } };
     const eventStore = new EventStore(this.dependencies.connection, this.dependencies.statements, this.dependencies.maintenance, this.dependencies.branchScopes,
-      () => planned.recordedAt, deterministicIds(planned.eventIds), this.dependencies.faultInjector);
+      () => planned.recordedAt, deterministicIds(planned.eventIds), faultInjector);
+    let durableMutation = false;
     try {
       const result = eventStore.append(planned.command);
+      durableMutation = !result.deduplicated;
+      boundary();
       if (canonicalJson(result.response) !== canonicalJson(planned.command.publicResponse) || result.eventIds.length !== batch.length || result.eventIds.some((id, index) => id !== planned.eventIds[index])) conflict();
-      const receipts = readCommitted(this.dependencies.connection, context.binding.projectId, batch, result.firstGlobalPosition, result.lastGlobalPosition, planned.recordedAt);
+      const receipts = readCommitted(this.dependencies.connection, context.binding.projectId, batch,
+        result.firstGlobalPosition, result.lastGlobalPosition, planned.recordedAt, boundary);
+      boundary();
       this.repository.transact(context.binding.projectId, identity, (tx) => {
+        boundary();
         const existing = tx.readImportedRecords();
         const outboxes = tx.readCompatibilityOutbox();
         if (outboxes.some(row => !existing.some(receipt => receipt.sourceOrdinal === row.sourceOrdinal && receipt.sourceKind === "legacy-artifact"))) conflict();
@@ -101,15 +277,61 @@ export class V2ShadowImporter {
           const row = compatibilityRecord(receipt, batch[index]!); return row === null ? [] : [row];
         }));
       });
+      durableMutation = true;
+      boundary();
+      return durableMutation;
     } catch (error) {
-      if (error instanceof ShadowMigrationError) throw error;
+      if (error instanceof ShadowMigrationError) {
+        if (durableMutation && error.code === "MIGRATION_RETRY_EXHAUSTED") {
+          throw new ShadowMigrationError("MIGRATION_OUTCOME_UNKNOWN", Object.freeze({ batchOrdinal }), { cause: error });
+        }
+        throw error;
+      }
+      if (error instanceof EventStoreError && error.code === "MIGRATION_RETRY_EXHAUSTED") {
+        throw new ShadowMigrationError("MIGRATION_RETRY_EXHAUSTED", Object.freeze({ batchOrdinal }), { cause: error });
+      }
       if (error instanceof EventStoreError && error.code === "COMMAND_OUTCOME_UNKNOWN") throw new ShadowMigrationError("MIGRATION_OUTCOME_UNKNOWN", Object.freeze({ batchOrdinal }), { cause: error });
       if (error instanceof EventStoreError && error.code === "COMMAND_TOO_LARGE") limit(batch[0]!.ordinal);
       if (error instanceof EventStoreError) throw new ShadowMigrationError("MIGRATION_IDENTITY_CONFLICT", Object.freeze({ batchOrdinal }), { cause: error });
+      if (durableMutation && deadline?.signal.aborted) throw new ShadowMigrationError("MIGRATION_OUTCOME_UNKNOWN", Object.freeze({ batchOrdinal }), { cause: error });
       throw error;
     }
   }
 
+}
+
+function boundTarget(dependencies: V2ShadowImporterDependencies, required: boolean): () => void {
+  const path = dependencies.eventStorePath;
+  if (path === undefined) {
+    if (required) conflict();
+    return (): void => {};
+  }
+  const identity = captureCompatibilityPath(path, false);
+  return (): void => {
+    assertBoundSqliteConnectionIdentity(dependencies.connection, path, identity);
+    const current = captureCompatibilityPath(path, false);
+    if (current.device !== identity.device || current.inode !== identity.inode) conflict();
+  };
+}
+
+function importBoundary(dependencies: V2ShadowImporterDependencies, deadline: ShadowMigrationInvocationDeadline | undefined,
+  requireBoundTarget: boolean): () => void {
+  const authority = boundTarget(dependencies, requireBoundTarget);
+  return (): void => { deadline?.remainingMs(); authority(); };
+}
+
+function importResult(package_: SealedV2MigrationPackage, receipts: readonly ImportedRecordReceipt[], deduplicated: boolean): V2ShadowImportResult {
+  const ordered = [...receipts].sort((left, right) => left.sourceOrdinal - right.sourceOrdinal);
+  const first = ordered[0] ?? null;
+  const terminal = ordered.at(-1) ?? null;
+  return Object.freeze({ schemaVersion: 1, migrationIdentity: package_.migrationIdentity,
+    packageChecksum: package_.manifest.packageChecksum, recordCount: package_.manifest.recordDescriptors.length,
+    eventIds: Object.freeze(ordered.map(receipt => receipt.importedEventId)), firstImportedPosition: first?.importedGlobalPosition ?? null,
+    terminalImportedPosition: terminal?.importedGlobalPosition ?? null,
+    terminalImportedEventHash: terminal?.importedEventHash ?? "0".repeat(64),
+    importedEventsChecksum: checksum(ordered.map(receipt => ({ ordinal: receipt.sourceOrdinal,
+      eventId: receipt.importedEventId, position: receipt.importedGlobalPosition.toString(), eventHash: receipt.importedEventHash }))),
+    deduplicated });
 }
 
 function compatibilityRecord(receipt: ImportedRecordReceipt, record: PlannedRecord): CompatibilityOutboxRecord | null {
@@ -155,10 +377,14 @@ function internalMigrationContext(
   return Object.freeze({ binding, workspace, checkedAt: createdAt });
 }
 
-function planRecord(record: V2MigrationPackageRecordV1, identity: string, index: number): PlannedRecord {
+function planRecord(record: V2MigrationPackageRecordV1, identity: string, index: number, boundary: () => void = () => {}): PlannedRecord {
+  boundary();
   const descriptor = record.descriptor;
   if (descriptor.ordinal !== index || !HASH.test(descriptor.contentSha256)) sourceInvalid();
-  const bytes = Buffer.concat([...record.readChunks()].map((chunk) => Buffer.from(chunk)));
+  const chunks: Buffer[] = [];
+  for (const chunk of record.readChunks()) { boundary(); chunks.push(Buffer.from(chunk)); }
+  boundary();
+  const bytes = Buffer.concat(chunks);
   if (bytes.length !== descriptor.byteLength || checksum(bytes) !== descriptor.contentSha256) sourceInvalid();
   const sourceRecordHash = descriptor.contentSha256;
   if (descriptor.kind === "legacy-artifact") {
@@ -176,23 +402,25 @@ function planRecord(record: V2MigrationPackageRecordV1, identity: string, index:
 }
 
 function streamBatches(package_: SealedV2MigrationPackage, policy: ShadowMigrationPolicyV1, context: ProjectContext,
-  consume: (batch: readonly PlannedRecord[], batchOrdinal: number) => void): void {
+  consume: (batch: readonly PlannedRecord[], batchOrdinal: number) => void, boundary: () => void = () => {}): void {
   const maxEvents = Math.min(policy.maxBatchEvents, MAX_EVENTS_PER_COMMAND); const maxBytes = Math.min(policy.maxBatchBytes, MAX_CANONICAL_COMMAND_BYTES);
   let batch: PlannedRecord[] = []; let ordinal = 0; let batchOrdinal = 0;
   for (const sourceRecord of package_.records()) {
-    const record = planRecord(sourceRecord, package_.migrationIdentity, ordinal);
+    boundary();
+    const record = planRecord(sourceRecord, package_.migrationIdentity, ordinal, boundary);
     if (record.sourceByteLength > policy.maxEventBytes) limit(record.ordinal);
     let candidate = [...batch, record];
     if (candidate.length > maxEvents || commandBytes(planCommand(context, package_, candidate, batchOrdinal).command) > maxBytes) {
       if (batch.length === 0) limit(record.ordinal);
-      consume(Object.freeze(batch), batchOrdinal++); batch = []; candidate = [record];
+      boundary(); consume(Object.freeze(batch), batchOrdinal++); boundary(); batch = []; candidate = [record];
       if (commandBytes(planCommand(context, package_, candidate, batchOrdinal).command) > maxBytes) limit(record.ordinal);
     }
     batch = candidate; ordinal += 1;
-    if (batch.length === maxEvents) { consume(Object.freeze(batch), batchOrdinal++); batch = []; }
+    if (batch.length === maxEvents) { boundary(); consume(Object.freeze(batch), batchOrdinal++); boundary(); batch = []; }
   }
+  boundary();
   if (ordinal !== package_.manifest.recordDescriptors.length) sourceInvalid();
-  if (batch.length > 0) consume(Object.freeze(batch), batchOrdinal);
+  if (batch.length > 0) { consume(Object.freeze(batch), batchOrdinal); boundary(); }
 }
 
 function planCommand(context: ProjectContext, package_: SealedV2MigrationPackage, batch: readonly PlannedRecord[], batchOrdinal: number): PlannedCommand {
@@ -242,11 +470,14 @@ function storedEvent(row: SqliteRow): StoredEvent {
     payload: rowJson<JsonValue>(row,"payload_json"), payloadJson: rowString(row,"payload_json"), payloadHash: rowString(row,"payload_hash"), previousGlobalHash: rowString(row,"previous_global_hash"),
     eventHash: rowString(row,"event_hash"), lifecycleIntentJson: rowNullableString(row,"lifecycle_intent_json") };
 }
-function authenticateDurable(connection: SqliteConnection, row: SqliteRow): StoredEvent {
+function authenticateDurable(connection: SqliteConnection, row: SqliteRow, boundary: () => void = () => {}): StoredEvent {
+  boundary();
   const event = storedEvent(row); let previousEventHash = GENESIS_GLOBAL_HASH;
   if (event.globalPosition > 1n) { const prior = connection.prepare("SELECT event_hash FROM events WHERE global_position=$position").get({$position:event.globalPosition-1n});
     if (prior === undefined) conflict(); previousEventHash = rowString(prior,"event_hash"); }
+  boundary();
   try { authenticateStoredEvent(event,{expectedPosition:event.globalPosition,previousEventHash}); } catch { conflict(); }
+  boundary();
   return event;
 }
 function assertDurableEvent(event: StoredEvent, record: PlannedRecord, recordedAt: string, projectId: string): void {
@@ -257,21 +488,30 @@ function assertDurableEvent(event: StoredEvent, record: PlannedRecord, recordedA
     ||canonicalJson(event.payload)!==canonicalJson(record.payload as unknown as JsonValue)
     ||canonicalJson(event.sourceRefs as unknown as JsonValue)!==canonicalJson([`migration:${identity}:${record.ordinal}`])) conflict();
 }
-function assertReceipt(connection: SqliteConnection, receipt: ImportedRecordReceipt, record: PlannedRecord, recordedAt: string, projectId: string): void {
+function assertReceipt(connection: SqliteConnection, receipt: ImportedRecordReceipt, record: PlannedRecord, recordedAt: string, projectId: string,
+  boundary: () => void = () => {}): void {
+  boundary();
   const identity=(record.payload as {migrationIdentity:string}).migrationIdentity;
   if(receipt.projectId!==projectId||receipt.migrationIdentity!==identity||receipt.sourceOrdinal!==record.ordinal||receipt.sourceKind!==record.kind
     ||receipt.sourceRecordHash!==record.sourceRecordHash||receipt.importedEventId!==record.eventId||receipt.recordedAt!==recordedAt) conflict();
   const row=connection.prepare("SELECT * FROM events WHERE project_id=$projectId AND global_position=$position").get({$projectId:projectId,$position:receipt.importedGlobalPosition});
-  if(row===undefined) conflict(); const event=authenticateDurable(connection,row);
+  boundary();
+  if(row===undefined) conflict(); const event=authenticateDurable(connection,row,boundary);
   if(event.eventId!==receipt.importedEventId||event.eventHash!==receipt.importedEventHash) conflict(); assertDurableEvent(event,record,recordedAt,projectId);
+  boundary();
 }
 
-function readCommitted(connection: SqliteConnection, projectId: string, records: readonly PlannedRecord[], first: bigint, last: bigint, recordedAt: string): readonly ImportedRecordReceipt[] {
+function readCommitted(connection: SqliteConnection, projectId: string, records: readonly PlannedRecord[], first: bigint, last: bigint, recordedAt: string,
+  boundary: () => void = () => {}): readonly ImportedRecordReceipt[] {
+  boundary();
   const rows = connection.prepare("SELECT * FROM events WHERE project_id=$projectId AND global_position BETWEEN $first AND $last ORDER BY global_position").all({ $projectId: projectId, $first: first, $last: last });
+  boundary();
   if (rows.length !== records.length) conflict();
-  return Object.freeze(rows.map((row, index) => { const record = records[index]!; const event=authenticateDurable(connection,row); assertDurableEvent(event,record,recordedAt,projectId);
+  const receipts = rows.map((row, index) => { boundary(); const record = records[index]!; const event=authenticateDurable(connection,row,boundary); assertDurableEvent(event,record,recordedAt,projectId);
     return Object.freeze({ projectId, migrationIdentity: (record.payload as { migrationIdentity: string }).migrationIdentity, sourceOrdinal: record.ordinal, sourceKind: record.kind,
-      sourceRecordHash: record.sourceRecordHash, importedEventId: record.eventId, importedGlobalPosition: event.globalPosition, importedEventHash: event.eventHash, recordedAt }); }));
+      sourceRecordHash: record.sourceRecordHash, importedEventId: record.eventId, importedGlobalPosition: event.globalPosition, importedEventHash: event.eventHash, recordedAt }); });
+  boundary();
+  return Object.freeze(receipts);
 }
 
 function deterministicIds(ids: readonly string[]): () => string { let index = 0; return () => ids[index++] ?? deterministicMigrationUuid("event", "0".repeat(64), index); }

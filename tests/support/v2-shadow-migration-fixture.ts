@@ -12,7 +12,7 @@ import type { ProjectBinding } from "../../src/orchestrator/projections/contract
 import { replayCommittedProjectionEvents } from "../../src/orchestrator/projections/event-reader.js";
 import { decodeProjectionEvent } from "../../src/orchestrator/projections/source-event-codec.js";
 import { canonicalJson } from "../../src/orchestrator/serialization/canonical-json.js";
-import { EventStore, SqliteEventStoreStatements } from "../../src/orchestrator/storage/event-store.js";
+import { EventStore, MAX_EVENTS_PER_COMMAND, SqliteEventStoreStatements } from "../../src/orchestrator/storage/event-store.js";
 import { BranchScopeRepository } from "../../src/orchestrator/storage/branch-scope.repository.js";
 import { MaintenanceFence } from "../../src/orchestrator/storage/maintenance-fence.js";
 import { NodeSqliteDriver } from "../../src/orchestrator/storage/node-sqlite-driver.js";
@@ -64,7 +64,7 @@ export function sealManifest(value: Omit<V1SourceCopyManifestV1, "manifestChecks
 }
 
 export async function createV2ShadowMigrationFixture(t: TestContext,
-  options: { aliasLiveStore?: boolean; sourceEventCount?: 0 | 2; legacyArtifacts?: boolean;
+  options: { aliasLiveStore?: boolean; sourceEventCount?: number; legacyArtifacts?: boolean;
     parityCorpus?: boolean; artifactMetadata?: boolean; checkpointHistory?: boolean; rankingPair?: boolean } = {}) {
   const root = canonicalMkdtemp("v2-shadow-source-");
   t.after(() => rmSync(root, { recursive: true, force: true }));
@@ -194,15 +194,24 @@ export async function createV2ShadowMigrationFixture(t: TestContext,
       }
       sourceEventCount = Number(connection.prepare("SELECT count(*) AS count FROM events").get()!.count);
       await lifecycle!.dispose(); lifecycle = undefined;
-    } else if (sourceEventCount > 0) store.append({ context, commandId: randomUUID(), idempotencyKey: "migration-fixture", commandType: "RecordProjectionSources",
-      correlationId: randomUUID(), agentId: "migration-fixture", expectedStreamVersion: 0n, streamId: "migration-fixture", streamType: "memory",
-      events: ["First source", "Second source"].map((summary, ordinal) => ({
-        eventType: "MemorySourceRecorded", eventSchemaVersion: 1, occurredAt: now, visibilityScope: "project" as const,
-        confidence: "high" as const, verificationStatus: "verified" as const,
-        payload: { sourceVersion: 1, binding: { ...projectionBinding }, itemId: randomUUID(), normalizedKey: `decision:fixture-${ordinal}`,
-          status: "verified", confidence: "high", verificationMethod: "production-event-writer", validFrom: now, validTo: null,
-          summary, contentHash: digest(summary) }, sourceRefs: [], evidenceRefs: [], evidenceDigests: [],
-      })), outbox: [], publicResponse: { recorded: true } });
+    } else if (sourceEventCount > 0) {
+      if (!Number.isSafeInteger(sourceEventCount) || sourceEventCount > 100_000) throw new Error("FIXTURE_SOURCE_EVENT_COUNT_INVALID");
+      const events = Array.from({ length: sourceEventCount }, (_, ordinal) => {
+        const summary = `Production fixture source ${ordinal + 1}`;
+        return { eventType: "MemorySourceRecorded", eventSchemaVersion: 1, occurredAt: now,
+          visibilityScope: "project" as const, confidence: "high" as const, verificationStatus: "verified" as const,
+          payload: { sourceVersion: 1, binding: { ...projectionBinding }, itemId: randomUUID(), normalizedKey: `decision:fixture-${ordinal}`,
+            status: "verified", confidence: "high", verificationMethod: "production-event-writer", validFrom: now, validTo: null,
+            summary, contentHash: digest(summary) }, sourceRefs: [], evidenceRefs: [], evidenceDigests: [] };
+      });
+      for (let offset = 0; offset < events.length; offset += MAX_EVENTS_PER_COMMAND) {
+        const batch = events.slice(offset, offset + MAX_EVENTS_PER_COMMAND);
+        store.append({ context, commandId: randomUUID(), idempotencyKey: `migration-fixture-${offset}`,
+          commandType: "RecordProjectionSources", correlationId: randomUUID(), agentId: "migration-fixture",
+          expectedStreamVersion: BigInt(offset), streamId: "migration-fixture", streamType: "memory",
+          events: batch, outbox: [], publicResponse: { recorded: true } });
+      }
+    }
     const checkpoint = connection.prepare("PRAGMA wal_checkpoint(TRUNCATE)").get();
     if (checkpoint?.busy !== 0n) throw new Error("Fixture checkpoint did not complete");
     if (options.aliasLiveStore) linkSync(liveEventStorePath, sourceDatabasePath);

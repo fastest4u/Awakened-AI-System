@@ -21,10 +21,13 @@ import { canonicalJson } from "../serialization/canonical-json.js";
 import {
   ShadowMigrationError,
   decodeShadowMigrationPolicyV1,
+  shadowMigrationConfigurationChecksum,
   shadowMigrationIdentity,
+  shadowMigrationPolicyChecksum,
   type ShadowMigrationPolicyV1,
 } from "./v2-shadow-migration.contracts.js";
 import type { VerifiedLegacyArtifact, VerifiedV1SourceCopy } from "./v1-source-copy.js";
+import type { ShadowMigrationInvocationDeadline, ShadowMigrationReconciliation } from "./v2-shadow-migration-runtime.js";
 
 const PACKAGE_DOMAIN = "project-memory/v2-shadow-migration-package/v1";
 const HASH = /^[0-9a-f]{64}$/u;
@@ -90,13 +93,25 @@ export interface SealV2MigrationPackageInput {
   readonly policy: ShadowMigrationPolicyV1;
   readonly buildIdentityHash: string;
   readonly configurationChecksum: string;
+  readonly invocationDeadline?: ShadowMigrationInvocationDeadline;
   readonly now?: () => number;
-  readonly onPhase?: (phase: "existing-target-final-open" | "fresh-target-final-open") => void;
+  readonly onPhase?: (phase: "existing-target-final-open" | "after-final-rename-before-response" | "fresh-target-final-open") => void;
 }
 
 export interface OpenSealedV2MigrationPackageInput {
   readonly rootPath: string;
   readonly expectedMigrationIdentity: string;
+  readonly invocationDeadline?: ShadowMigrationInvocationDeadline;
+}
+
+export interface ReconcileSealedV2MigrationPackageInput {
+  readonly source: VerifiedV1SourceCopy;
+  readonly packageRoot: string;
+  readonly policy: ShadowMigrationPolicyV1;
+  readonly buildIdentityHash: string;
+  readonly configurationChecksum: string;
+  readonly expectedMigrationIdentity: string;
+  readonly invocationDeadline?: ShadowMigrationInvocationDeadline;
 }
 
 interface RecordLocation {
@@ -145,20 +160,24 @@ function safePath(root: string, relativePath: string): string {
   return path;
 }
 
-function assertDirectory(path: string): void {
+function assertDirectory(path: string, assertDeadline?: () => void): void {
+  assertDeadline?.();
   const stat = lstatSync(path, { bigint: true });
   if (!stat.isDirectory() || stat.isSymbolicLink()) conflict();
 }
 
-function assertRegularFile(path: string): void {
+function assertRegularFile(path: string, assertDeadline?: () => void): void {
+  assertDeadline?.();
   const stat = lstatSync(path, { bigint: true });
   if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1n) conflict();
 }
 
-function assertPackageTree(rootPath: string): void {
-  assertDirectory(rootPath);
+function assertPackageTree(rootPath: string, assertDeadline?: () => void): void {
+  assertDirectory(rootPath, assertDeadline);
   const walk = (directory: string): void => {
+    assertDeadline?.();
     for (const entry of readdirSync(directory, { withFileTypes: true })) {
+      assertDeadline?.();
       const path = join(directory, entry.name);
       const stat = lstatSync(path, { bigint: true });
       if (stat.isSymbolicLink()) conflict();
@@ -169,9 +188,10 @@ function assertPackageTree(rootPath: string): void {
   walk(rootPath);
 }
 
-function capturePackageIdentities(rootPath: string): readonly PackageIdentity[] {
+function capturePackageIdentities(rootPath: string, assertDeadline?: () => void): readonly PackageIdentity[] {
   const identities: PackageIdentity[] = [];
   const capture = (path: string): void => {
+    assertDeadline?.();
     const stat = lstatSync(path, { bigint: true });
     if (stat.isSymbolicLink() || (!stat.isDirectory() && (!stat.isFile() || stat.nlink !== 1n))) conflict();
     identities.push(Object.freeze({ path: relative(rootPath, path), device: stat.dev, inode: stat.ino, size: stat.size, directory: stat.isDirectory() }));
@@ -181,8 +201,8 @@ function capturePackageIdentities(rootPath: string): readonly PackageIdentity[] 
   return Object.freeze(identities.sort((left, right) => left.path.localeCompare(right.path)));
 }
 
-function assertPackageIdentities(rootPath: string, expected: readonly PackageIdentity[]): void {
-  const actual = capturePackageIdentities(rootPath);
+function assertPackageIdentities(rootPath: string, expected: readonly PackageIdentity[], assertDeadline?: () => void): void {
+  const actual = capturePackageIdentities(rootPath, assertDeadline);
   if (actual.length !== expected.length) conflict();
   for (let index = 0; index < actual.length; index += 1) {
     const left = actual[index]!; const right = expected[index]!;
@@ -302,13 +322,18 @@ export async function sealV2MigrationPackage(input: SealV2MigrationPackageInput)
   const packageRoot = normalized(input.packageRoot);
   const source = input.source;
   let temporary: string | undefined;
+  let finalPublicationPossible = false;
   try {
     const sourceRoot = normalized(realpathSync(source.sourceRoot));
     const stagingRoot = normalized(realpathSync(packageRoot));
     if (sourceRoot === stagingRoot || contained(sourceRoot, stagingRoot) || contained(stagingRoot, sourceRoot)) sourceInvalid();
+    const suppliedDeadline = input.invocationDeadline;
     const now = input.now ?? Date.now;
-    const deadlineAt = now() + policy.deadlineMs;
-    const assertBeforeDeadline = (ordinal: number): void => { if (now() > deadlineAt) limitExceeded(ordinal); };
+    const deadlineAt = suppliedDeadline === undefined ? now() + policy.deadlineMs : 0;
+    const assertBeforeDeadline = (ordinal: number): void => {
+      if (suppliedDeadline !== undefined) suppliedDeadline.remainingMs();
+      else if (now() > deadlineAt) limitExceeded(ordinal);
+    };
     assertBeforeDeadline(0);
     source.assertUnchanged();
     temporary = mkdtempSync(join(packageRoot, ".v2-migration-package-"));
@@ -390,12 +415,14 @@ export async function sealV2MigrationPackage(input: SealV2MigrationPackageInput)
     assertBeforeDeadline(ordinal);
     source.assertUnchanged();
     assertBeforeDeadline(ordinal);
-    const verified = openSealedV2MigrationPackage({ rootPath: temporary, expectedMigrationIdentity: migrationIdentity });
+    const verified = openSealedV2MigrationPackage({ rootPath: temporary, expectedMigrationIdentity: migrationIdentity,
+      ...(suppliedDeadline === undefined ? {} : { invocationDeadline: suppliedDeadline }) });
     verified.close();
     const target = join(packageRoot, migrationIdentity);
     try {
       assertBeforeDeadline(ordinal);
-      const existing = openSealedV2MigrationPackage({ rootPath: target, expectedMigrationIdentity: migrationIdentity });
+      const existing = openSealedV2MigrationPackage({ rootPath: target, expectedMigrationIdentity: migrationIdentity,
+        ...(suppliedDeadline === undefined ? {} : { invocationDeadline: suppliedDeadline }) });
       if (existing.manifest.packageChecksum !== manifest.packageChecksum || canonicalJson(existing.manifest) !== canonicalJson(manifest)) {
         existing.close();
         conflict();
@@ -405,7 +432,8 @@ export async function sealV2MigrationPackage(input: SealV2MigrationPackageInput)
       quarantine(temporary);
       temporary = undefined;
       assertBeforeDeadline(ordinal);
-      const adopted = openSealedV2MigrationPackage({ rootPath: target, expectedMigrationIdentity: migrationIdentity });
+      const adopted = openSealedV2MigrationPackage({ rootPath: target, expectedMigrationIdentity: migrationIdentity,
+        ...(suppliedDeadline === undefined ? {} : { invocationDeadline: suppliedDeadline }) });
       try {
         input.onPhase?.("existing-target-final-open");
         assertBeforeDeadline(ordinal);
@@ -423,23 +451,32 @@ export async function sealV2MigrationPackage(input: SealV2MigrationPackageInput)
     }
     if (temporary === undefined) conflict();
     assertBeforeDeadline(ordinal);
+    finalPublicationPossible = true;
     renameSync(temporary, target);
     temporary = undefined;
     fsyncDirectory(packageRoot);
     assertBeforeDeadline(ordinal);
-    const published = openSealedV2MigrationPackage({ rootPath: target, expectedMigrationIdentity: migrationIdentity });
+    input.onPhase?.("after-final-rename-before-response");
+    assertBeforeDeadline(ordinal);
+    const published = openSealedV2MigrationPackage({ rootPath: target, expectedMigrationIdentity: migrationIdentity,
+      ...(suppliedDeadline === undefined ? {} : { invocationDeadline: suppliedDeadline }) });
     try { input.onPhase?.("fresh-target-final-open"); assertBeforeDeadline(ordinal); return published; } catch (error) { published.close(); throw error; }
   } catch (error) {
     if (temporary !== undefined) quarantine(temporary);
+    if (finalPublicationPossible && (!(error instanceof ShadowMigrationError)
+      || error.code === "MIGRATION_RETRY_EXHAUSTED" || error.code === "MIGRATION_LIMIT_EXCEEDED")) {
+      throw new ShadowMigrationError("MIGRATION_OUTCOME_UNKNOWN", Object.freeze({}));
+    }
     if (error instanceof ShadowMigrationError) throw error;
     sourceInvalid();
   }
 }
 
-function parseManifest(path: string): V2MigrationPackageManifestV1 {
-  assertRegularFile(path);
+function parseManifest(path: string, assertDeadline?: () => void): V2MigrationPackageManifestV1 {
+  assertRegularFile(path, assertDeadline);
+  assertDeadline?.();
   if (Number(lstatSync(path, { bigint: true }).size) > 64 * 1024 * 1024) conflict();
-  const bytes = Buffer.concat([...readChunks(path, 0, undefined)].map((chunk) => Buffer.from(chunk)));
+  const bytes = Buffer.concat([...readChunks(path, 0, undefined, assertDeadline)].map((chunk) => Buffer.from(chunk)));
   if (bytes.length === 0 || bytes.length > 64 * 1024 * 1024) conflict();
   let value: unknown;
   try { value = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes)); } catch { conflict(); }
@@ -479,11 +516,13 @@ function isSafeRelativePath(relativePath: string): boolean {
     && relativePath.split("/").every((part) => part.length > 0 && part !== "." && part !== "..");
 }
 
-function* readChunks(path: string, offset: number, length: number | undefined): Iterable<Uint8Array> {
-  assertRegularFile(path);
+function* readChunks(path: string, offset: number, length: number | undefined, assertDeadline?: () => void): Iterable<Uint8Array> {
+  assertRegularFile(path, assertDeadline);
   let handle: number | undefined;
   try {
+    assertDeadline?.();
     handle = openSync(path, "r");
+    assertDeadline?.();
     const opened = fstatSync(handle, { bigint: true });
     if (!opened.isFile() || opened.nlink !== 1n) conflict();
     const size = Number(opened.size);
@@ -492,6 +531,7 @@ function* readChunks(path: string, offset: number, length: number | undefined): 
     let cursor = offset;
     let left = remaining;
     while (left > 0) {
+      assertDeadline?.();
       const buffer = Buffer.allocUnsafe(Math.min(MAX_CHUNK_BYTES, left));
       const read = readSync(handle, buffer, 0, buffer.length, cursor);
       if (read <= 0 || read > buffer.length) conflict();
@@ -499,23 +539,26 @@ function* readChunks(path: string, offset: number, length: number | undefined): 
       left -= read;
       yield Uint8Array.from(buffer.subarray(0, read));
     }
+    assertDeadline?.();
     const after = fstatSync(handle, { bigint: true });
     if (after.dev !== opened.dev || after.ino !== opened.ino || after.size !== opened.size || !after.isFile() || after.nlink !== 1n) conflict();
   } finally { if (handle !== undefined) closeSync(handle); }
 }
 
-function lineLocations(rootPath: string, manifest: V2MigrationPackageManifestV1): RecordLocation[] {
+function lineLocations(rootPath: string, manifest: V2MigrationPackageManifestV1, assertDeadline?: () => void): RecordLocation[] {
   const path = join(rootPath, "events.ndjson");
   const eventDescriptors = manifest.recordDescriptors.slice(0, manifest.eventCount);
   const locations: RecordLocation[] = [];
   let pending = Buffer.alloc(0);
   let offset = 0;
   let ordinal = 0;
-  for (const chunk of readChunks(path, 0, undefined)) {
+  for (const chunk of readChunks(path, 0, undefined, assertDeadline)) {
+    assertDeadline?.();
     pending = Buffer.concat([pending, chunk]);
     if (pending.length > MAX_EVENT_LINE_BYTES + MAX_CHUNK_BYTES) conflict();
     let newline: number;
     while ((newline = pending.indexOf(0x0a)) >= 0) {
+      assertDeadline?.();
       const value = pending.subarray(0, newline);
       const descriptor = eventDescriptors[ordinal++];
       if (descriptor === undefined || value.length !== descriptor.byteLength || sha256(value) !== descriptor.contentSha256) {
@@ -536,11 +579,12 @@ function lineLocations(rootPath: string, manifest: V2MigrationPackageManifestV1)
   return locations;
 }
 
-function assertExactPackageLayout(rootPath: string, manifest: V2MigrationPackageManifestV1): void {
+function assertExactPackageLayout(rootPath: string, manifest: V2MigrationPackageManifestV1, assertDeadline?: () => void): void {
+  assertDeadline?.();
   const rootEntries = readdirSync(rootPath, { withFileTypes: true }).map((entry) => entry.name).sort();
   if (canonicalJson(rootEntries) !== canonicalJson(["artifacts", "events.ndjson", "package-manifest.json"])) conflict();
   const artifactRoot = join(rootPath, "artifacts");
-  assertDirectory(artifactRoot);
+  assertDirectory(artifactRoot, assertDeadline);
   const expected = new Set(manifest.recordDescriptors.slice(manifest.eventCount).map((descriptor) => descriptor.relativePath!));
   const expectedDirectories = new Set<string>([""]);
   for (const file of expected) {
@@ -549,7 +593,9 @@ function assertExactPackageLayout(rootPath: string, manifest: V2MigrationPackage
   }
   const actual = new Set<string>();
   const walk = (directory: string): void => {
+    assertDeadline?.();
     for (const entry of readdirSync(directory, { withFileTypes: true })) {
+      assertDeadline?.();
       const path = join(directory, entry.name);
       const suffix = relative(artifactRoot, path).split(sep).join("/");
       const stat = lstatSync(path, { bigint: true });
@@ -563,49 +609,51 @@ function assertExactPackageLayout(rootPath: string, manifest: V2MigrationPackage
   if (actual.size !== expected.size || [...actual].some((path) => !expected.has(path))) conflict();
 }
 
-function verifiedRecordLocations(rootPath: string, manifest: V2MigrationPackageManifestV1): RecordLocation[] {
-  assertExactPackageLayout(rootPath, manifest);
-  const locations = lineLocations(rootPath, manifest);
+function verifiedRecordLocations(rootPath: string, manifest: V2MigrationPackageManifestV1, assertDeadline?: () => void): RecordLocation[] {
+  assertExactPackageLayout(rootPath, manifest, assertDeadline);
+  const locations = lineLocations(rootPath, manifest, assertDeadline);
   for (const descriptor of manifest.recordDescriptors.slice(manifest.eventCount)) {
+    assertDeadline?.();
     const path = safePath(join(rootPath, "artifacts"), descriptor.relativePath!);
     const hash = createHash("sha256"); let length = 0;
-    for (const chunk of readChunks(path, 0, undefined)) { hash.update(chunk); length += chunk.length; }
+    for (const chunk of readChunks(path, 0, undefined, assertDeadline)) { assertDeadline?.(); hash.update(chunk); length += chunk.length; }
     if (length !== descriptor.byteLength || hash.digest("hex") !== descriptor.contentSha256) conflict();
     locations.push(Object.freeze({ descriptor, path, offset: 0 }));
   }
   return locations;
 }
 
-function assertPackageContent(rootPath: string, expectedManifest: V2MigrationPackageManifestV1): void {
-  const currentManifest = parseManifest(join(rootPath, "package-manifest.json"));
+function assertPackageContent(rootPath: string, expectedManifest: V2MigrationPackageManifestV1, assertDeadline?: () => void): void {
+  const currentManifest = parseManifest(join(rootPath, "package-manifest.json"), assertDeadline);
   if (canonicalJson(currentManifest) !== canonicalJson(expectedManifest)) conflict();
-  verifiedRecordLocations(rootPath, expectedManifest);
+  verifiedRecordLocations(rootPath, expectedManifest, assertDeadline);
 }
 
-export function openSealedV2MigrationPackage(input: OpenSealedV2MigrationPackageInput): SealedV2MigrationPackage {
-  try {
+function openSealedV2MigrationPackageCore(input: OpenSealedV2MigrationPackageInput): SealedV2MigrationPackage {
     if (typeof input !== "object" || input === null || typeof input.rootPath !== "string" || !isAbsolute(input.rootPath)
       || typeof input.expectedMigrationIdentity !== "string" || !HASH.test(input.expectedMigrationIdentity)) conflict();
+    const assertDeadline = input.invocationDeadline === undefined ? undefined : (): void => { input.invocationDeadline!.remainingMs(); };
+    assertDeadline?.();
     const rootPath = normalized(input.rootPath);
-    assertPackageTree(rootPath);
-    const identities = capturePackageIdentities(rootPath);
-    const manifest = parseManifest(join(rootPath, "package-manifest.json"));
+    assertPackageTree(rootPath, assertDeadline);
+    const identities = capturePackageIdentities(rootPath, assertDeadline);
+    const manifest = parseManifest(join(rootPath, "package-manifest.json"), assertDeadline);
     const migrationIdentity = identityFor(manifest);
     if (migrationIdentity !== input.expectedMigrationIdentity) conflict();
-    const locations = verifiedRecordLocations(rootPath, manifest);
-    assertPackageIdentities(rootPath, identities);
+    const locations = verifiedRecordLocations(rootPath, manifest, assertDeadline);
+    assertPackageIdentities(rootPath, identities, assertDeadline);
     let closed = false;
-    const requireOpen = (): void => { if (closed) conflict(); };
+    const requireOpen = (): void => { assertDeadline?.(); if (closed) conflict(); };
     const assertMetadataUnchanged = (): void => {
       requireOpen();
-      held(() => assertPackageIdentities(rootPath, identities));
+      held(() => assertPackageIdentities(rootPath, identities, assertDeadline));
     };
     const assertUnchanged = (): void => {
       requireOpen();
       held(() => {
-        assertPackageIdentities(rootPath, identities);
-        assertPackageContent(rootPath, manifest);
-        assertPackageIdentities(rootPath, identities);
+        assertPackageIdentities(rootPath, identities, assertDeadline);
+        assertPackageContent(rootPath, manifest, assertDeadline);
+        assertPackageIdentities(rootPath, identities, assertDeadline);
       });
     };
     const records = (): Iterable<V2MigrationPackageRecordV1> => {
@@ -616,7 +664,7 @@ export function openSealedV2MigrationPackage(input: OpenSealedV2MigrationPackage
           return (function* (): Iterable<Uint8Array> {
             requireOpen(); assertMetadataUnchanged();
             const bytes = held(() => {
-              const chunks = [...readChunks(location.path, location.offset, location.descriptor.byteLength)];
+              const chunks = [...readChunks(location.path, location.offset, location.descriptor.byteLength, assertDeadline)];
               const value = Buffer.concat(chunks.map((chunk) => Buffer.from(chunk)));
               if (value.length !== location.descriptor.byteLength || sha256(value) !== location.descriptor.contentSha256) conflict();
               return Uint8Array.from(value);
@@ -629,9 +677,123 @@ export function openSealedV2MigrationPackage(input: OpenSealedV2MigrationPackage
         },
       })).values();
     };
+    assertDeadline?.();
     return Object.freeze({ rootPath, migrationIdentity, manifest, records, assertUnchanged, close(): void { closed = true; } });
+}
+
+export function openSealedV2MigrationPackage(input: OpenSealedV2MigrationPackageInput): SealedV2MigrationPackage {
+  try {
+    return openSealedV2MigrationPackageCore(input);
   } catch (error) {
     if (error instanceof ShadowMigrationError) throw error;
     conflict();
+  }
+}
+
+interface StableDirectoryIdentity { readonly device: bigint; readonly inode: bigint; }
+function canonicalDirectoryIdentity(path: string): StableDirectoryIdentity {
+  if (typeof path !== "string" || !isAbsolute(path) || resolve(path) !== path
+    || normalized(realpathSync.native(path)) !== normalized(path)) sourceInvalid();
+  let cursor = path;
+  while (true) {
+    const stat = lstatSync(cursor, { bigint: true });
+    if (stat.isSymbolicLink() || !stat.isDirectory()) sourceInvalid();
+    const parent = dirname(cursor);
+    if (parent === cursor) break;
+    cursor = parent;
+  }
+  const stat = lstatSync(path, { bigint: true });
+  return Object.freeze({ device: stat.dev, inode: stat.ino });
+}
+function sameDirectory(path: string, expected: StableDirectoryIdentity): boolean {
+  try {
+    const current = canonicalDirectoryIdentity(path);
+    return current.device === expected.device && current.inode === expected.inode;
+  } catch {
+    return false;
+  }
+}
+function canonicalConfigurationChecksum(policy: ShadowMigrationPolicyV1): string {
+  return shadowMigrationConfigurationChecksum({ schemaVersion: 1,
+    policyChecksum: shadowMigrationPolicyChecksum(policy), packageFormatVersion: 1,
+    migrationAlgorithmVersion: 1, expectedDifferencePolicyVersion: policy.expectedDifferencePolicyVersion });
+}
+function exactPackageBindings(source: VerifiedV1SourceCopy, manifest: V2MigrationPackageManifestV1,
+  policy: ShadowMigrationPolicyV1, buildIdentityHash: string, configurationChecksum: string): void {
+  const sourceManifest = source.manifest;
+  const canonicalConfiguration = canonicalConfigurationChecksum(policy);
+  if (configurationChecksum !== canonicalConfiguration || manifest.configurationChecksum !== configurationChecksum
+    || manifest.buildIdentityHash !== buildIdentityHash || manifest.sourceManifestChecksum !== sourceManifest.manifestChecksum
+    || manifest.projectId !== sourceManifest.projectId || manifest.vaultId !== sourceManifest.vaultId
+    || manifest.storeId !== sourceManifest.storeId || manifest.workspaceId !== sourceManifest.workspaceId
+    || manifest.eventCount !== sourceManifest.eventCount
+    || manifest.legacyArtifactCount !== sourceManifest.legacyArtifacts.length
+    || manifest.aggregateSourceBytes !== sourceManifest.aggregateSourceBytes
+    || manifest.terminalEventPosition !== sourceManifest.terminalEventPosition
+    || manifest.terminalEventHash !== sourceManifest.terminalEventHash
+    || manifest.createdAt !== sourceManifest.createdAt) sourceInvalid();
+}
+function reconciliationUnknown(code: "MIGRATION_OUTCOME_UNKNOWN" | "MIGRATION_RETRY_EXHAUSTED"):
+ShadowMigrationReconciliation<SealedV2MigrationPackage> {
+  return Object.freeze({ status: "unknown", safeErrorCode: code });
+}
+
+export function reconcileSealedV2MigrationPackage(input: ReconcileSealedV2MigrationPackageInput):
+ShadowMigrationReconciliation<SealedV2MigrationPackage> {
+  let opened: SealedV2MigrationPackage | undefined;
+  try {
+    if (typeof input !== "object" || input === null || typeof input.packageRoot !== "string"
+      || typeof input.expectedMigrationIdentity !== "string" || !HASH.test(input.expectedMigrationIdentity)
+      || typeof input.buildIdentityHash !== "string" || !HASH.test(input.buildIdentityHash)
+      || typeof input.configurationChecksum !== "string" || !HASH.test(input.configurationChecksum)) sourceInvalid();
+    const deadline = input.invocationDeadline;
+    const check = (): void => { deadline?.remainingMs(); };
+    check();
+    const policy = decodeShadowMigrationPolicyV1(input.policy);
+    if (input.configurationChecksum !== canonicalConfigurationChecksum(policy)) sourceInvalid();
+    const packageRoot = resolve(input.packageRoot);
+    if (packageRoot !== input.packageRoot) sourceInvalid();
+    const parentIdentity = canonicalDirectoryIdentity(packageRoot);
+    const sourceRoot = normalized(realpathSync.native(input.source.sourceRoot));
+    const normalizedRoot = normalized(packageRoot);
+    if (sourceRoot === normalizedRoot || contained(sourceRoot, normalizedRoot) || contained(normalizedRoot, sourceRoot)) sourceInvalid();
+    input.source.assertUnchanged();
+    check();
+    const target = join(packageRoot, input.expectedMigrationIdentity);
+    let targetExists = true;
+    try { lstatSync(target); } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      targetExists = false;
+    }
+    check();
+    if (!targetExists) {
+      if (!sameDirectory(packageRoot, parentIdentity)) return reconciliationUnknown("MIGRATION_OUTCOME_UNKNOWN");
+      try { lstatSync(target); return reconciliationUnknown("MIGRATION_OUTCOME_UNKNOWN"); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+      input.source.assertUnchanged();
+      check();
+      return Object.freeze({ status: "absent" });
+    }
+    opened = openSealedV2MigrationPackageCore({ rootPath: target,
+      expectedMigrationIdentity: input.expectedMigrationIdentity,
+      ...(deadline === undefined ? {} : { invocationDeadline: deadline }) });
+    exactPackageBindings(input.source, opened.manifest, policy, input.buildIdentityHash, input.configurationChecksum);
+    input.source.assertUnchanged();
+    opened.assertUnchanged();
+    if (!sameDirectory(packageRoot, parentIdentity)) {
+      opened.close(); opened = undefined;
+      return reconciliationUnknown("MIGRATION_OUTCOME_UNKNOWN");
+    }
+    check();
+    const result = opened;
+    opened = undefined;
+    return Object.freeze({ status: "committed", result });
+  } catch (error) {
+    opened?.close();
+    if (error instanceof ShadowMigrationError) {
+      if (error.code === "MIGRATION_RETRY_EXHAUSTED") return reconciliationUnknown("MIGRATION_RETRY_EXHAUSTED");
+      throw error;
+    }
+    return reconciliationUnknown("MIGRATION_OUTCOME_UNKNOWN");
   }
 }

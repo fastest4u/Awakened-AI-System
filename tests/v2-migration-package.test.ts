@@ -7,10 +7,12 @@ import { canonicalJson } from "../src/orchestrator/serialization/canonical-json.
 import { verifyV1SourceCopy } from "../src/orchestrator/migration/v1-source-copy.js";
 import {
   openSealedV2MigrationPackage,
+  reconcileSealedV2MigrationPackage,
   sealV2MigrationPackage,
   type V2MigrationPackageManifestV1,
 } from "../src/orchestrator/migration/v2-migration-package.js";
 import { decodeShadowMigrationPolicyV1, ShadowMigrationError, shadowMigrationConfigurationChecksum, shadowMigrationIdentity, shadowMigrationPolicyChecksum } from "../src/orchestrator/migration/v2-shadow-migration.contracts.js";
+import { createShadowMigrationInvocationDeadline } from "../src/orchestrator/migration/v2-shadow-migration-runtime.js";
 import { createV2ShadowMigrationFixture } from "./support/v2-shadow-migration-fixture.js";
 
 function identityConflict(error: unknown): boolean {
@@ -64,6 +66,203 @@ test("seals identical logical packages independent of absolute path", async (t) 
   assert.equal(reopened.manifest.createdAt, fixture.manifest.createdAt);
   reopened.close();
   source.close();
+});
+
+test("reconciles only an absent exact target or a fully authenticated sealed package", async (t) => {
+  // Publishing during an absent probe or accepting a package without its source/configuration bindings breaks read-only recovery.
+  const fixture = await createV2ShadowMigrationFixture(t);
+  const source = await verifyV1SourceCopy(fixture.verificationInput);
+  const sealed = await sealV2MigrationPackage({ ...fixture.packageInput, source, packageRoot: fixture.packageRootA });
+  const input = { source, policy: fixture.policy, buildIdentityHash: fixture.packageInput.buildIdentityHash,
+    configurationChecksum: fixture.packageInput.configurationChecksum, expectedMigrationIdentity: sealed.migrationIdentity };
+  const absent = reconcileSealedV2MigrationPackage({ ...input, packageRoot: fixture.packageRootB });
+  assert.deepEqual(absent, { status: "absent" });
+  assert.equal(readdirSync(fixture.packageRootB).length, 0);
+  const committed = reconcileSealedV2MigrationPackage({ ...input, packageRoot: fixture.packageRootA });
+  assert.equal(committed.status, "committed");
+  if (committed.status === "committed") {
+    assert.equal(committed.result.migrationIdentity, sealed.migrationIdentity);
+    committed.result.assertUnchanged();
+    committed.result.close();
+  }
+  sealed.close();
+  source.close();
+});
+
+test("package reconciliation rechecks the same deadline before committed return", async (t) => {
+  // Granting a fresh reconciliation budget or omitting the final check can return a committed handle after expiry.
+  const fixture = await createV2ShadowMigrationFixture(t);
+  const source = await verifyV1SourceCopy(fixture.verificationInput);
+  const sealed = await sealV2MigrationPackage({ ...fixture.packageInput, source, packageRoot: fixture.packageRootA });
+  const common = { source, packageRoot: fixture.packageRootA, policy: fixture.policy,
+    buildIdentityHash: fixture.packageInput.buildIdentityHash,
+    configurationChecksum: fixture.packageInput.configurationChecksum,
+    expectedMigrationIdentity: sealed.migrationIdentity };
+  let probes = 0;
+  const counting = { signal: new AbortController().signal, remainingMs(): number { probes += 1; return 1000; } };
+  const first = reconcileSealedV2MigrationPackage({ ...common, invocationDeadline: counting });
+  assert.equal(first.status, "committed"); if (first.status === "committed") first.result.close();
+  let late = 0;
+  const expiring = { signal: new AbortController().signal, remainingMs(): number {
+    late += 1;
+    if (late === probes) throw new ShadowMigrationError("MIGRATION_RETRY_EXHAUSTED");
+    return 1000;
+  } };
+  assert.deepEqual(reconcileSealedV2MigrationPackage({ ...common, invocationDeadline: expiring }),
+    { status: "unknown", safeErrorCode: "MIGRATION_RETRY_EXHAUSTED" });
+  assert.equal(late, probes);
+  sealed.assertUnchanged(); sealed.close(); source.close();
+});
+
+test("retains one supplied invocation deadline in opened handles and deferred iterators", async (t) => {
+  // Replacing the caller budget while opening or iterating permits late package consumption after the invocation expired.
+  const fixture = await createV2ShadowMigrationFixture(t);
+  const source = await verifyV1SourceCopy(fixture.verificationInput);
+  const sealed = await sealV2MigrationPackage({ ...fixture.packageInput, source, packageRoot: fixture.packageRootA });
+  let now = 0;
+  const deadline = createShadowMigrationInvocationDeadline(10, () => now);
+  const opened = openSealedV2MigrationPackage({ rootPath: sealed.rootPath,
+    expectedMigrationIdentity: sealed.migrationIdentity, invocationDeadline: deadline });
+  const chunks = [...opened.records()][0]!.readChunks();
+  now = 10;
+  assert.throws(() => [...chunks], (error: unknown) => error instanceof ShadowMigrationError
+    && error.code === "MIGRATION_RETRY_EXHAUSTED");
+  opened.close();
+  deadline.dispose();
+  sealed.close();
+  source.close();
+});
+
+test("opening spends the supplied deadline immediately before returning a handle", async (t) => {
+  // Omitting the late open check can return an already-expired package authority.
+  const fixture = await createV2ShadowMigrationFixture(t);
+  const source = await verifyV1SourceCopy(fixture.verificationInput);
+  const sealed = await sealV2MigrationPackage({ ...fixture.packageInput, source, packageRoot: fixture.packageRootA });
+  let probes = 0;
+  const counting = { signal: new AbortController().signal, remainingMs(): number { probes += 1; return 1000; } };
+  openSealedV2MigrationPackage({ rootPath: sealed.rootPath, expectedMigrationIdentity: sealed.migrationIdentity,
+    invocationDeadline: counting }).close();
+  let late = 0;
+  const expiring = { signal: new AbortController().signal, remainingMs(): number {
+    late += 1;
+    if (late === probes) throw new ShadowMigrationError("MIGRATION_RETRY_EXHAUSTED");
+    return 1000;
+  } };
+  assert.throws(() => openSealedV2MigrationPackage({ rootPath: sealed.rootPath,
+    expectedMigrationIdentity: sealed.migrationIdentity, invocationDeadline: expiring }),
+  (error: unknown) => error instanceof ShadowMigrationError && error.code === "MIGRATION_RETRY_EXHAUSTED");
+  assert.equal(late, probes);
+  sealed.close(); source.close();
+});
+
+test("reconciliation distinguishes partial and contradictory final targets without changing either", async (t) => {
+  // Treating every failed open as corruption or every present directory as committed breaks the three-way proof.
+  const partialFixture = await createV2ShadowMigrationFixture(t);
+  const partialSource = await verifyV1SourceCopy(partialFixture.verificationInput);
+  const identitySource = await sealV2MigrationPackage({ ...partialFixture.packageInput, source: partialSource,
+    packageRoot: partialFixture.packageRootA });
+  const partialPath = join(partialFixture.packageRootB, identitySource.migrationIdentity);
+  mkdirSync(partialPath);
+  const common = { source: partialSource, policy: partialFixture.policy,
+    buildIdentityHash: partialFixture.packageInput.buildIdentityHash,
+    configurationChecksum: partialFixture.packageInput.configurationChecksum,
+    expectedMigrationIdentity: identitySource.migrationIdentity };
+  assert.deepEqual(reconcileSealedV2MigrationPackage({ ...common, packageRoot: partialFixture.packageRootB }),
+    { status: "unknown", safeErrorCode: "MIGRATION_OUTCOME_UNKNOWN" });
+  assert.deepEqual(readdirSync(partialPath), []);
+
+  const conflictFixture = await createV2ShadowMigrationFixture(t);
+  const conflictSource = await verifyV1SourceCopy(conflictFixture.verificationInput);
+  const conflictPackage = await sealV2MigrationPackage({ ...conflictFixture.packageInput, source: conflictSource,
+    packageRoot: conflictFixture.packageRootA });
+  const eventPath = join(conflictPackage.rootPath, "events.ndjson");
+  const before = readFileSync(eventPath); const changed = Buffer.from(before); changed[0] ^= 1; writeFileSync(eventPath, changed);
+  assert.throws(() => reconcileSealedV2MigrationPackage({ source: conflictSource,
+    packageRoot: conflictFixture.packageRootA, policy: conflictFixture.policy,
+    buildIdentityHash: conflictFixture.packageInput.buildIdentityHash,
+    configurationChecksum: conflictFixture.packageInput.configurationChecksum,
+    expectedMigrationIdentity: conflictPackage.migrationIdentity }), identityConflict);
+  assert.deepEqual(readFileSync(eventPath), changed);
+  conflictPackage.close(); conflictSource.close(); identitySource.close(); partialSource.close();
+});
+
+test("returns unknown when the verified package parent identity changes during an absent proof", async (t) => {
+  // Returning absent after parent replacement would bind ENOENT to an unauthenticated directory generation.
+  const fixture = await createV2ShadowMigrationFixture(t);
+  const source = await verifyV1SourceCopy(fixture.verificationInput);
+  const sealed = await sealV2MigrationPackage({ ...fixture.packageInput, source, packageRoot: fixture.packageRootA });
+  const moved = `${fixture.packageRootB}-moved`;
+  let checks = 0;
+  const invocationDeadline = { signal: new AbortController().signal, remainingMs(): number {
+    checks += 1;
+    if (checks === 3) { renameSync(fixture.packageRootB, moved); mkdirSync(fixture.packageRootB); }
+    return 1000;
+  } };
+  assert.deepEqual(reconcileSealedV2MigrationPackage({ source, packageRoot: fixture.packageRootB,
+    policy: fixture.policy, buildIdentityHash: fixture.packageInput.buildIdentityHash,
+    configurationChecksum: fixture.packageInput.configurationChecksum,
+    expectedMigrationIdentity: sealed.migrationIdentity, invocationDeadline }),
+  { status: "unknown", safeErrorCode: "MIGRATION_OUTCOME_UNKNOWN" });
+  assert.deepEqual(readdirSync(fixture.packageRootB), []);
+  assert.deepEqual(readdirSync(moved), []);
+  sealed.close(); source.close();
+});
+
+test("classifies a lost response at the real post-rename boundary as unknown", async (t) => {
+  // A failure after the final rename may have published the exact target and cannot be reported as absent or retryable.
+  const fixture = await createV2ShadowMigrationFixture(t);
+  const source = await verifyV1SourceCopy(fixture.verificationInput);
+  const identitySource = await sealV2MigrationPackage({ ...fixture.packageInput, source, packageRoot: fixture.packageRootA });
+  await assert.rejects(sealV2MigrationPackage({ ...fixture.packageInput, source, packageRoot: fixture.packageRootB,
+    onPhase(phase) { if (phase === "after-final-rename-before-response") throw new Error("lost-package-response"); } }),
+  (error: unknown) => error instanceof ShadowMigrationError && error.code === "MIGRATION_OUTCOME_UNKNOWN");
+  const recovered = reconcileSealedV2MigrationPackage({ source, packageRoot: fixture.packageRootB,
+    policy: fixture.policy, buildIdentityHash: fixture.packageInput.buildIdentityHash,
+    configurationChecksum: fixture.packageInput.configurationChecksum,
+    expectedMigrationIdentity: identitySource.migrationIdentity });
+  assert.equal(recovered.status, "committed");
+  if (recovered.status === "committed") recovered.result.close();
+  identitySource.close(); source.close();
+});
+
+test("preserves one shared deadline classification before and after final publication", async (t) => {
+  // Converting both sides of the rename boundary to one retry class would make unsafe retries indistinguishable.
+  const beforeFixture = await createV2ShadowMigrationFixture(t);
+  const beforeSource = await verifyV1SourceCopy(beforeFixture.verificationInput);
+  const identitySource = await sealV2MigrationPackage({ ...beforeFixture.packageInput, source: beforeSource,
+    packageRoot: beforeFixture.packageRootA });
+  let beforeExpired = false;
+  const beforeDeadline = { signal: new AbortController().signal, remainingMs(): number {
+    if (beforeExpired) throw new ShadowMigrationError("MIGRATION_RETRY_EXHAUSTED");
+    return 1000;
+  } };
+  const artifacts = [...beforeSource.legacyArtifacts()];
+  const delayedSource = { ...beforeSource, legacyArtifacts() { return artifacts.map((artifact, index) => index === 0 ? {
+    ...artifact, readChunks(): Iterable<Uint8Array> { return (function* () {
+      for (const chunk of artifact.readChunks()) { yield chunk; beforeExpired = true; }
+    })(); },
+  } : artifact).values(); } };
+  await assert.rejects(sealV2MigrationPackage({ ...beforeFixture.packageInput, source: delayedSource,
+    packageRoot: beforeFixture.packageRootB, invocationDeadline: beforeDeadline }),
+  (error: unknown) => error instanceof ShadowMigrationError && error.code === "MIGRATION_RETRY_EXHAUSTED");
+  assert.equal(existsSync(join(beforeFixture.packageRootB, identitySource.migrationIdentity)), false);
+
+  const afterFixture = await createV2ShadowMigrationFixture(t);
+  const afterSource = await verifyV1SourceCopy(afterFixture.verificationInput);
+  const afterIdentitySource = await sealV2MigrationPackage({ ...afterFixture.packageInput, source: afterSource,
+    packageRoot: afterFixture.packageRootA });
+  let afterExpired = false;
+  const afterDeadline = { signal: new AbortController().signal, remainingMs(): number {
+    if (afterExpired) throw new ShadowMigrationError("MIGRATION_RETRY_EXHAUSTED");
+    return 1000;
+  } };
+  await assert.rejects(async () => {
+    await sealV2MigrationPackage({ ...afterFixture.packageInput, source: afterSource,
+      packageRoot: afterFixture.packageRootB, invocationDeadline: afterDeadline,
+      onPhase(phase) { if (phase === "after-final-rename-before-response") afterExpired = true; } });
+  }, (error: unknown) => error instanceof ShadowMigrationError && error.code === "MIGRATION_OUTCOME_UNKNOWN");
+  assert.equal(existsSync(join(afterFixture.packageRootB, afterIdentitySource.migrationIdentity)), true);
+  afterIdentitySource.close(); identitySource.close(); beforeSource.close(); afterSource.close();
 });
 
 test("requires one canonical real source creation timestamp in the sealed manifest", async (t) => {
@@ -147,15 +346,15 @@ test("classifies expiry during named existing-target final adoption", async (t) 
   initial.close(); source.close();
 });
 
-test("classifies expiry during named fresh-target final completion", async (t) => {
-  // Publication is durable before final open, but the caller still receives the deadline result.
+test("classifies expiry after named fresh-target publication as unknown", async (t) => {
+  // Publication is durable before final open, so expiry cannot prove whether the caller lost a successful response.
   const fixture = await createV2ShadowMigrationFixture(t);
   const source = await verifyV1SourceCopy(fixture.verificationInput);
   const identitySource = await sealV2MigrationPackage({ ...fixture.packageInput, source, packageRoot: fixture.packageRootA });
   let now = 0;
   await assert.rejects(sealV2MigrationPackage({ ...fixture.packageInput, source, packageRoot: fixture.packageRootB, now: () => now,
     onPhase: (phase: string) => { if (phase === "fresh-target-final-open") now = 300_001; },
-  }), (error: unknown) => error instanceof ShadowMigrationError && error.code === "MIGRATION_LIMIT_EXCEEDED");
+  }), (error: unknown) => error instanceof ShadowMigrationError && error.code === "MIGRATION_OUTCOME_UNKNOWN");
   assert.equal(existsSync(join(fixture.packageRootB, identitySource.migrationIdentity)), true);
   openSealedV2MigrationPackage({ rootPath: join(fixture.packageRootB, identitySource.migrationIdentity), expectedMigrationIdentity: identitySource.migrationIdentity }).close();
   identitySource.close(); source.close();
