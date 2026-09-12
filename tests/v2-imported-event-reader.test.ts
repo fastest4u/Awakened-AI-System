@@ -55,7 +55,7 @@ async function importedPackageFixture(t: test.TestContext, importRecords = true,
     configurationChecksum: sealedPackage.manifest.configurationChecksum, policyChecksum: shadowMigrationPolicyChecksum(f.policy),
     buildIdentityHash: sealedPackage.manifest.buildIdentityHash, createdAt: NOW }));
   const importer = new V2ShadowImporter({ connection, statements: new SqliteEventStoreStatements(connection),
-    maintenance: new MaintenanceFence(), branchScopes: new BranchScopeRepository(), repository, policy: f.policy });
+    maintenance: new MaintenanceFence(), branchScopes: new BranchScopeRepository(), policy: f.policy });
   if (importRecords) importer.import({ context, sealedPackage });
   cleanup = () => { connection.close(); sealedPackage.close(); source.close(); };
   const options = { driver: f.driver, eventStorePath, sealedPackage, sourceManifest: source.manifest };
@@ -85,7 +85,12 @@ test("rejects missing source and artifact receipts", async t => {
   for (const ordinal of [0, 1, 2, 3]) await t.test(`ordinal ${ordinal}`, async child => {
     const f = await importedPackageFixture(child);
     f.connection.exec("DROP TRIGGER v2_shadow_imported_records_no_delete");
-    f.connection.prepare("DELETE FROM v2_shadow_imported_records WHERE source_ordinal=$o").run({ $o: ordinal });
+    f.connection.exec("DROP TRIGGER v2_shadow_compatibility_outbox_no_delete");
+    const scope = { $p: f.context.binding.projectId, $m: f.sealedPackage.migrationIdentity, $o: ordinal };
+    const outbox = f.connection.prepare("DELETE FROM v2_shadow_compatibility_outbox WHERE project_id=$p AND migration_identity=$m AND source_ordinal=$o").run(scope);
+    assert.equal(Number(outbox.changes), ordinal < 2 ? 0 : 1);
+    const receipt = f.connection.prepare("DELETE FROM v2_shadow_imported_records WHERE project_id=$p AND migration_identity=$m AND source_ordinal=$o").run(scope);
+    assert.equal(Number(receipt.changes), 1);
     await assert.rejects(f.reader.openCommittedSnapshot(f.projectionBinding), integrity);
   });
 });

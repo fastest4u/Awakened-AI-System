@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import type { AppendCommand, JsonValue, StoredEvent } from "../contracts/event.js";
+import { payloadHash } from "../crypto/event-hash.js";
 import { authenticateStoredEvent } from "../integrity/stored-event-authenticator.js";
 import type { ProjectContext } from "../identity/contracts.js";
 import { canonicalJson } from "../serialization/canonical-json.js";
@@ -7,7 +8,7 @@ import { EventStore, EventStoreError, GENESIS_GLOBAL_HASH, MAX_CANONICAL_COMMAND
 import { BranchScopeRepository } from "../storage/branch-scope.repository.js";
 import { MaintenanceFence } from "../storage/maintenance-fence.js";
 import type { SqliteConnection, SqliteRow } from "../storage/sqlite-driver.js";
-import { SqliteV2ShadowMigrationRepository, type ImportedRecordReceipt } from "../storage/v2-shadow-migration.repository.js";
+import { SqliteV2ShadowMigrationRepository, type CompatibilityOutboxRecord, type ImportedRecordReceipt } from "../storage/v2-shadow-migration.repository.js";
 import { deterministicMigrationUuid, ShadowMigrationError, type ShadowMigrationPolicyV1 } from "./v2-shadow-migration.contracts.js";
 import type { SealedV2MigrationPackage, V2MigrationPackageRecordV1 } from "./v2-migration-package.js";
 
@@ -15,7 +16,7 @@ export interface V1ProjectionSourceImportedV1 { readonly schemaVersion: 1; reado
 export interface V1LegacyArtifactImportedV1 { readonly schemaVersion: 1; readonly migrationIdentity: string; readonly sourceOrdinal: number; readonly sourceRecordHash: string; readonly relativePath: string; readonly contentSha256: string; readonly contentUtf8: string; }
 export interface V2ShadowImportResult { readonly schemaVersion: 1; readonly migrationIdentity: string; readonly packageChecksum: string; readonly recordCount: number; readonly eventIds: readonly string[]; readonly firstImportedPosition: bigint | null; readonly terminalImportedPosition: bigint | null; readonly terminalImportedEventHash: string; readonly importedEventsChecksum: string; readonly deduplicated: boolean; }
 export interface V2ShadowImportInput { readonly context: ProjectContext; readonly sealedPackage: SealedV2MigrationPackage; }
-export interface V2ShadowImporterDependencies { readonly connection: SqliteConnection; readonly statements: EventAppendStatements; readonly maintenance: MaintenanceFence; readonly branchScopes: BranchScopeRepository; readonly repository: SqliteV2ShadowMigrationRepository; readonly policy: ShadowMigrationPolicyV1; readonly faultInjector?: ConstructorParameters<typeof EventStore>[6]; }
+export interface V2ShadowImporterDependencies { readonly connection: SqliteConnection; readonly statements: EventAppendStatements; readonly maintenance: MaintenanceFence; readonly branchScopes: BranchScopeRepository; readonly policy: ShadowMigrationPolicyV1; readonly faultInjector?: ConstructorParameters<typeof EventStore>[6]; }
 
 type ImportedPayload = V1ProjectionSourceImportedV1 | V1LegacyArtifactImportedV1;
 type PlannedRecord = Readonly<{ ordinal: number; kind: "source-event" | "legacy-artifact"; sourceRecordHash: string; sourceByteLength: number; payload: ImportedPayload; eventId: string; }>;
@@ -24,7 +25,10 @@ type PlannedCommand = Readonly<{ recordedAt: string; eventIds: readonly string[]
 const HASH = /^[0-9a-f]{64}$/;
 
 export class V2ShadowImporter {
-  public constructor(private readonly dependencies: V2ShadowImporterDependencies) {}
+  private readonly repository: SqliteV2ShadowMigrationRepository;
+  public constructor(private readonly dependencies: V2ShadowImporterDependencies) {
+    this.repository = new SqliteV2ShadowMigrationRepository(dependencies.connection);
+  }
 
   public import(input: V2ShadowImportInput): V2ShadowImportResult {
     const { context, sealedPackage } = input;
@@ -33,11 +37,13 @@ export class V2ShadowImporter {
     if (context.binding.projectId !== manifest.projectId || context.binding.vaultId !== manifest.vaultId || context.binding.storeId !== manifest.storeId || context.binding.workspaceId !== manifest.workspaceId) sourceInvalid();
     const migrationContext = internalMigrationContext(context, identity, manifest.createdAt);
     sealedPackage.assertUnchanged();
-    const prior = this.dependencies.repository.transact(manifest.projectId, identity, (tx) => {
+    const evidence = this.repository.transact(manifest.projectId, identity, (tx) => {
       const run = tx.readRun();
       if (run === null || run.packageChecksum !== manifest.packageChecksum || run.sourceManifestChecksum !== manifest.sourceManifestChecksum) conflict();
-      return tx.readImportedRecords();
+      return { receipts: tx.readImportedRecords(), outboxes: tx.readCompatibilityOutbox() };
     });
+    const prior = evidence.receipts;
+    if (evidence.outboxes.some(row => !prior.some(receipt => receipt.sourceOrdinal === row.sourceOrdinal && receipt.sourceKind === "legacy-artifact"))) conflict();
     if (prior.length > manifest.recordDescriptors.length) conflict();
     const priorByOrdinal = new Map(prior.map((receipt) => [receipt.sourceOrdinal, receipt]));
     let replayed = true;
@@ -46,10 +52,16 @@ export class V2ShadowImporter {
       if (receipts.length !== 0 && receipts.length !== batch.length) conflict();
       if (receipts.length === batch.length) {
         const planned = planCommand(migrationContext, sealedPackage, batch, batchOrdinal);
-        for (const [index, receipt] of receipts.entries()) assertReceipt(this.dependencies.connection, receipt, batch[index]!, planned.recordedAt, migrationContext.binding.projectId);
+        for (const [index, receipt] of receipts.entries()) {
+          const record = batch[index]!;
+          assertReceipt(this.dependencies.connection, receipt, record, planned.recordedAt, migrationContext.binding.projectId);
+          const expected = compatibilityRecord(receipt, record);
+          const actual = evidence.outboxes.filter(row => row.sourceOrdinal === record.ordinal);
+          if (expected === null ? actual.length !== 0 : actual.length !== 1 || !sameOutbox(actual[0]!, expected)) conflict();
+        }
       } else { replayed = false; this.appendBatch(migrationContext, sealedPackage, batch, batchOrdinal); }
     });
-    const receipts = this.dependencies.repository.transact(manifest.projectId, identity, (tx) => tx.readImportedRecords());
+    const receipts = this.repository.transact(manifest.projectId, identity, (tx) => tx.readImportedRecords());
     if (receipts.length !== manifest.recordDescriptors.length) conflict();
     const ordered = [...receipts].sort((left, right) => left.sourceOrdinal - right.sourceOrdinal);
     const first = ordered[0] ?? null;
@@ -72,7 +84,23 @@ export class V2ShadowImporter {
       const result = eventStore.append(planned.command);
       if (canonicalJson(result.response) !== canonicalJson(planned.command.publicResponse) || result.eventIds.length !== batch.length || result.eventIds.some((id, index) => id !== planned.eventIds[index])) conflict();
       const receipts = readCommitted(this.dependencies.connection, context.binding.projectId, batch, result.firstGlobalPosition, result.lastGlobalPosition, planned.recordedAt);
-      this.dependencies.repository.transact(context.binding.projectId, identity, (tx) => tx.insertImportedRecords(receipts));
+      this.repository.transact(context.binding.projectId, identity, (tx) => {
+        const existing = tx.readImportedRecords();
+        const outboxes = tx.readCompatibilityOutbox();
+        if (outboxes.some(row => !existing.some(receipt => receipt.sourceOrdinal === row.sourceOrdinal && receipt.sourceKind === "legacy-artifact"))) conflict();
+        for (const [index, receipt] of receipts.entries()) {
+          const found = existing.find(value => value.sourceOrdinal === receipt.sourceOrdinal);
+          if (found === undefined) continue;
+          if (Object.keys(receipt).some(key => found[key as keyof ImportedRecordReceipt] !== receipt[key as keyof ImportedRecordReceipt])) conflict();
+          const expected = compatibilityRecord(receipt, batch[index]!);
+          const actual = outboxes.filter(row => row.sourceOrdinal === receipt.sourceOrdinal);
+          if (expected === null ? actual.length !== 0 : actual.length !== 1 || !sameOutbox(actual[0]!, expected)) conflict();
+        }
+        tx.insertImportedRecords(receipts);
+        tx.enqueueCompatibility(receipts.flatMap((receipt, index) => {
+          const row = compatibilityRecord(receipt, batch[index]!); return row === null ? [] : [row];
+        }));
+      });
     } catch (error) {
       if (error instanceof ShadowMigrationError) throw error;
       if (error instanceof EventStoreError && error.code === "COMMAND_OUTCOME_UNKNOWN") throw new ShadowMigrationError("MIGRATION_OUTCOME_UNKNOWN", Object.freeze({ batchOrdinal }), { cause: error });
@@ -82,6 +110,19 @@ export class V2ShadowImporter {
     }
   }
 
+}
+
+function compatibilityRecord(receipt: ImportedRecordReceipt, record: PlannedRecord): CompatibilityOutboxRecord | null {
+  if (record.kind !== "legacy-artifact") return null;
+  const payload = record.payload as V1LegacyArtifactImportedV1;
+  return Object.freeze({ projectId: receipt.projectId, migrationIdentity: receipt.migrationIdentity,
+    outboxId: deterministicMigrationUuid("claim", receipt.migrationIdentity, receipt.sourceOrdinal), sourceOrdinal: receipt.sourceOrdinal,
+    importedEventId: receipt.importedEventId, importedGlobalPosition: receipt.importedGlobalPosition, importedEventHash: receipt.importedEventHash,
+    triggeringPayloadHash: payloadHash(payload as unknown as JsonValue), relativePath: payload.relativePath, byteLength: record.sourceByteLength,
+    contentSha256: payload.contentSha256, materializationRevision: BigInt(receipt.sourceOrdinal + 1), recordedAt: receipt.recordedAt });
+}
+function sameOutbox(left: CompatibilityOutboxRecord, right: CompatibilityOutboxRecord): boolean {
+  return Object.keys(right).every(key => left[key as keyof CompatibilityOutboxRecord] === right[key as keyof CompatibilityOutboxRecord]);
 }
 
 function internalMigrationContext(

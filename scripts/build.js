@@ -103,6 +103,18 @@ async function build() {
         packages: 'external',
     });
 
+    console.log('🧵 Bundling isolated compatibility worker (dist/internal/stable-compatibility-directory.worker.js)...');
+    await esbuild.build({
+        entryPoints: ['src/orchestrator/materialization/stable-compatibility-directory.worker.ts'],
+        bundle: true,
+        platform: 'node',
+        format: 'esm',
+        outfile: path.join(outDir, 'internal', 'stable-compatibility-directory.worker.js'),
+        target: 'node24.16',
+        minify: true,
+        packages: 'external',
+    });
+
     writeFileSync(
         path.join(outDir, 'build-info.json'),
         `${JSON.stringify({

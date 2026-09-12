@@ -34,9 +34,134 @@ async function fixture(t: test.TestContext, faultInjector?: EventStoreFaultInjec
   const context = { workspace, checkedAt: NOW, binding: { ...sourceFixture.projectionBinding, projectBindingId: randomUUID(), generation: 1, contextFingerprint: "shadow", source: "explicit-cli", clientNamespace: "shadow-test", clientInstanceId: randomUUID(), actorRole: "primary", projectRoot: sourceFixture.root, vaultRoot: sourceFixture.liveVaultRoot, descriptorPath: `${sourceFixture.liveVaultRoot}/.project-memory.json`, storeRoute: { kind: "vault-local", storeRoot: sourceFixture.root, eventsPath: `${sourceFixture.root}/target.sqlite`, storeManifestPath: `${sourceFixture.root}/store.json`, projectionManifestPath: `${sourceFixture.root}/projection.json` }, workspace, establishedAt: NOW } } as unknown as ProjectContext;
   const revisionId = randomUUID(); connection.prepare("INSERT INTO rollout_revisions(project_id,revision_id,parent_revision_id,build_identity_hash,migration_identity_hash,configuration_checksum,v1_baseline_checksum,cohort_algorithm_version,cohort_salt,cohort_basis_points,created_at) VALUES ($p,$r,NULL,$h,$h,$h,$h,1,$h,0,$n)").run({ $p: context.binding.projectId, $r: revisionId, $h: "a".repeat(64), $n: NOW });
   const repository = new SqliteV2ShadowMigrationRepository(connection); repository.transact(context.binding.projectId, sealedPackage.migrationIdentity, tx => tx.insertRun({ projectId: context.binding.projectId, migrationIdentity: sealedPackage.migrationIdentity, rolloutRevisionId: revisionId, packageChecksum: sealedPackage.manifest.packageChecksum, sourceManifestChecksum: sealedPackage.manifest.sourceManifestChecksum, sourceTerminalPosition: BigInt(sealedPackage.manifest.terminalEventPosition), sourceTerminalHash: sealedPackage.manifest.terminalEventHash, configurationChecksum: sealedPackage.manifest.configurationChecksum, policyChecksum: shadowMigrationPolicyChecksum(sourceFixture.policy), buildIdentityHash: sealedPackage.manifest.buildIdentityHash, createdAt: NOW }));
-  return { connection, context, sealedPackage, repository, policy: sourceFixture.policy, sourceFixture, close: () => { sealedPackage.close(); source.close(); connection.close(); }, importer: new V2ShadowImporter({ connection, statements: new SqliteEventStoreStatements(connection), maintenance: new MaintenanceFence(), branchScopes: new BranchScopeRepository(), repository, policy: sourceFixture.policy, faultInjector }) };
+  return { connection, context, sealedPackage, repository, policy: sourceFixture.policy, sourceFixture, close: () => { sealedPackage.close(); source.close(); connection.close(); }, importer: new V2ShadowImporter({ connection, statements: new SqliteEventStoreStatements(connection), maintenance: new MaintenanceFence(), branchScopes: new BranchScopeRepository(), policy: sourceFixture.policy, faultInjector }) };
 }
 const unknown = (error: unknown) => error instanceof ShadowMigrationError && error.code === "MIGRATION_OUTCOME_UNKNOWN";
+
+test("enqueues one exact immutable outbox per committed artifact in the receipt store", async t => {
+  const f = await fixture(t);
+  try {
+    f.importer.import({ context: f.context, sealedPackage: f.sealedPackage });
+    const rows = f.repository.transact(f.context.binding.projectId, f.sealedPackage.migrationIdentity, tx => tx.readPendingCompatibility());
+    assert.equal(rows.length, 2);
+    for (const row of rows) {
+      const descriptor = f.sealedPackage.manifest.recordDescriptors[row.sourceOrdinal]!;
+      const event = f.connection.prepare("SELECT * FROM events WHERE global_position=$p").get({ $p: row.importedGlobalPosition })!;
+      assert.deepEqual(row, { projectId: f.context.binding.projectId, migrationIdentity: f.sealedPackage.migrationIdentity,
+        outboxId: deterministicMigrationUuid("claim", f.sealedPackage.migrationIdentity, row.sourceOrdinal), sourceOrdinal: row.sourceOrdinal,
+        importedEventId: event.event_id, importedGlobalPosition: event.global_position, importedEventHash: event.event_hash,
+        triggeringPayloadHash: event.payload_hash, relativePath: descriptor.relativePath, byteLength: descriptor.byteLength,
+        contentSha256: descriptor.contentSha256, materializationRevision: BigInt(row.sourceOrdinal + 1), recordedAt: event.recorded_at });
+      assert.ok(Object.isFrozen(row));
+    }
+    assert.ok(Object.isFrozen(rows));
+  } finally { f.close(); }
+});
+
+test("ignores an independently supplied repository and writes only the committed event store", async t => {
+  const f = await fixture(t); const other = await fixture(t);
+  try {
+    const dependencies = { connection: f.connection, statements: new SqliteEventStoreStatements(f.connection),
+      maintenance: new MaintenanceFence(), branchScopes: new BranchScopeRepository(), policy: f.policy, repository: other.repository };
+    new V2ShadowImporter(dependencies).import({ context: f.context, sealedPackage: f.sealedPackage });
+    assert.equal(f.repository.transact(f.context.binding.projectId, f.sealedPackage.migrationIdentity, tx => tx.readImportedRecords()).length, 4);
+    assert.equal(Number(other.connection.prepare("SELECT count(*) AS n FROM v2_shadow_imported_records").get()!.n), 0);
+    assert.equal(Number(other.connection.prepare("SELECT count(*) AS n FROM v2_shadow_compatibility_outbox").get()!.n), 0);
+  } finally { other.close(); f.close(); }
+});
+
+test("rolls back receipts with outbox failure and reconciles the committed EventStore replay", async t => {
+  const f = await fixture(t); let failOutbox = true;
+  const connection: SqliteConnection = { close: () => f.connection.close(), exec: sql => f.connection.exec(sql),
+    prepare(sql) { if (failOutbox && sql.startsWith("INSERT INTO v2_shadow_compatibility_outbox")) throw new Error("receipt-outbox-test-failure");
+      return f.connection.prepare(sql); } };
+  const importer = new V2ShadowImporter({ connection, statements: new SqliteEventStoreStatements(connection),
+    maintenance: new MaintenanceFence(), branchScopes: new BranchScopeRepository(), policy: f.policy });
+  try {
+    assert.throws(() => importer.import({ context: f.context, sealedPackage: f.sealedPackage }), /receipt-outbox-test-failure/);
+    assert.equal(Number(f.connection.prepare("SELECT count(*) AS n FROM events").get()!.n), 4);
+    assert.equal(Number(f.connection.prepare("SELECT count(*) AS n FROM v2_shadow_imported_records").get()!.n), 0);
+    assert.equal(Number(f.connection.prepare("SELECT count(*) AS n FROM v2_shadow_compatibility_outbox").get()!.n), 0);
+    failOutbox = false;
+    importer.import({ context: f.context, sealedPackage: f.sealedPackage });
+    assert.equal(Number(f.connection.prepare("SELECT count(*) AS n FROM events").get()!.n), 4);
+    assert.equal(Number(f.connection.prepare("SELECT count(*) AS n FROM v2_shadow_compatibility_outbox").get()!.n), 2);
+  } finally { f.close(); }
+});
+
+test("replays acknowledged outboxes exactly without new events or revisions", async t => {
+  const f = await fixture(t);
+  try {
+    const first = f.importer.import({ context: f.context, sealedPackage: f.sealedPackage });
+    f.repository.transact(f.context.binding.projectId, f.sealedPackage.migrationIdentity, tx => {
+      for (const row of tx.readPendingCompatibility()) {
+        const time = new Date(Date.parse(f.sealedPackage.manifest.createdAt) + row.sourceOrdinal).toISOString();
+        tx.claimCompatibility({ projectId: row.projectId, migrationIdentity: row.migrationIdentity, outboxId: row.outboxId,
+          claimId: row.outboxId, claimOwnerFingerprint: createHash("sha256").update(`project-memory/v2-shadow-compatibility-owner/v1\n${row.migrationIdentity}`).digest("hex"), claimedAt: time });
+        const body = { projectId: row.projectId, migrationIdentity: row.migrationIdentity, outboxId: row.outboxId,
+          acknowledgementId: row.outboxId, claimId: row.outboxId, acknowledgedImportedPosition: row.importedGlobalPosition,
+          materializationRevision: row.materializationRevision, targetContentSha256: row.contentSha256, acknowledgedAt: time };
+        tx.acknowledgeCompatibility({ ...body, acknowledgementChecksum: createHash("sha256").update(canonicalJson({ ...body,
+          acknowledgedImportedPosition: body.acknowledgedImportedPosition.toString(), materializationRevision: body.materializationRevision.toString() })).digest("hex") });
+      }
+    });
+    assert.deepEqual(f.importer.import({ context: f.context, sealedPackage: f.sealedPackage }), { ...first, deduplicated: true });
+    assert.equal(Number(f.connection.prepare("SELECT count(*) AS n FROM events").get()!.n), 4);
+    assert.equal(Number(f.connection.prepare("SELECT count(*) AS n FROM v2_shadow_compatibility_outbox").get()!.n), 2);
+    assert.equal(Number(f.connection.prepare("SELECT count(*) AS n FROM rollout_revisions").get()!.n), 1);
+  } finally { f.close(); }
+});
+
+test("refuses receipt replay with missing or conflicting artifact outbox without backfill", async t => {
+  for (const variant of ["missing", "conflicting", "source-kind"] as const) await t.test(variant, async child => {
+    let interrupted = false;
+    const f = await fixture(child, { hit(boundary) { if (!interrupted && boundary === "after-commit-before-response") {
+      interrupted = true; throw new Error("lost"); } } });
+    try {
+      assert.throws(() => f.importer.import({ context: f.context, sealedPackage: f.sealedPackage }), unknown);
+      const events = storedEvents(f.connection);
+      f.repository.transact(f.context.binding.projectId, f.sealedPackage.migrationIdentity, tx => {
+        tx.insertImportedRecords(events.map((event, ordinal) => ({ projectId: event.projectId, migrationIdentity: f.sealedPackage.migrationIdentity,
+          sourceOrdinal: ordinal, sourceKind: f.sealedPackage.manifest.recordDescriptors[ordinal]!.kind,
+          sourceRecordHash: f.sealedPackage.manifest.recordDescriptors[ordinal]!.contentSha256,
+          importedEventId: event.eventId, importedGlobalPosition: event.globalPosition, importedEventHash: event.eventHash, recordedAt: event.recordedAt })));
+        if (variant !== "missing") {
+          const ordinal = variant === "source-kind" ? 0 : 2, event = events[ordinal]!;
+          tx.enqueueCompatibility([{ projectId: event.projectId, migrationIdentity: f.sealedPackage.migrationIdentity,
+            sourceOrdinal: ordinal, outboxId: deterministicMigrationUuid("claim", f.sealedPackage.migrationIdentity, ordinal),
+            importedEventId: event.eventId, importedGlobalPosition: event.globalPosition, importedEventHash: event.eventHash,
+            triggeringPayloadHash: event.payloadHash, relativePath: "legacy/conflict.md", byteLength: 1, contentSha256: "f".repeat(64),
+            materializationRevision: BigInt(ordinal + 1), recordedAt: event.recordedAt }]);
+        }
+      });
+      assert.throws(() => f.importer.import({ context: f.context, sealedPackage: f.sealedPackage }),
+        error => error instanceof ShadowMigrationError && error.code === "MIGRATION_IDENTITY_CONFLICT");
+      assert.equal(Number(f.connection.prepare("SELECT count(*) AS n FROM events").get()!.n), 4);
+      assert.equal(Number(f.connection.prepare("SELECT count(*) AS n FROM v2_shadow_compatibility_outbox").get()!.n), variant === "missing" ? 0 : 1);
+    } finally { f.close(); }
+  });
+});
+
+test("does not backfill an outbox when an exact receipt appears after EventStore commit readback", async t => {
+  let f: Awaited<ReturnType<typeof fixture>>;
+  f = await fixture(t, { hit(boundary) {
+    if (boundary !== "after-commit-before-response") return;
+    const events = storedEvents(f.connection);
+    f.repository.transact(f.context.binding.projectId, f.sealedPackage.migrationIdentity, tx => {
+      tx.insertImportedRecords(events.map((event, ordinal) => ({ projectId: event.projectId,
+        migrationIdentity: f.sealedPackage.migrationIdentity, sourceOrdinal: ordinal,
+        sourceKind: f.sealedPackage.manifest.recordDescriptors[ordinal]!.kind,
+        sourceRecordHash: f.sealedPackage.manifest.recordDescriptors[ordinal]!.contentSha256,
+        importedEventId: event.eventId, importedGlobalPosition: event.globalPosition, importedEventHash: event.eventHash, recordedAt: event.recordedAt })));
+    });
+  } });
+  try {
+    assert.throws(() => f.importer.import({ context: f.context, sealedPackage: f.sealedPackage }),
+      error => error instanceof ShadowMigrationError && error.code === "MIGRATION_IDENTITY_CONFLICT");
+    assert.equal(Number(f.connection.prepare("SELECT count(*) AS n FROM events").get()!.n), 4);
+    assert.equal(Number(f.connection.prepare("SELECT count(*) AS n FROM v2_shadow_compatibility_outbox").get()!.n), 0);
+  } finally { f.close(); }
+});
 const limitExceeded = (error: unknown) => error instanceof ShadowMigrationError && error.code === "MIGRATION_LIMIT_EXCEEDED";
 
 function recordBytes(record: V2MigrationPackageRecordV1): Buffer { return Buffer.concat([...record.readChunks()].map(chunk => Buffer.from(chunk))); }
@@ -65,7 +190,7 @@ function streamingPackage(base: SealedV2MigrationPackage, connection: SqliteConn
 }
 function importerWithPolicy(f: Awaited<ReturnType<typeof fixture>>, policy: ShadowMigrationPolicyV1): V2ShadowImporter {
   return new V2ShadowImporter({ connection: f.connection, statements: new SqliteEventStoreStatements(f.connection), maintenance: new MaintenanceFence(),
-    branchScopes: new BranchScopeRepository(), repository: f.repository, policy });
+    branchScopes: new BranchScopeRepository(), policy });
 }
 function commandGroupSizes(f: Awaited<ReturnType<typeof fixture>>): number[] {
   return f.connection.prepare("SELECT count(*) AS count FROM events GROUP BY command_id ORDER BY min(global_position)").all().map(row => Number(row.count));
@@ -115,7 +240,7 @@ function siblingTarget(
     configurationChecksum: f.sealedPackage.manifest.configurationChecksum, policyChecksum: shadowMigrationPolicyChecksum(f.policy),
     buildIdentityHash: f.sealedPackage.manifest.buildIdentityHash, createdAt: NOW }));
   return { connection, context, importer: new V2ShadowImporter({ connection, statements: new SqliteEventStoreStatements(connection),
-    maintenance: new MaintenanceFence(), branchScopes: new BranchScopeRepository(), repository, policy: f.policy }), close: () => connection.close() };
+    maintenance: new MaintenanceFence(), branchScopes: new BranchScopeRepository(), policy: f.policy }), close: () => connection.close() };
 }
 function storedEvents(connection: SqliteConnection): StoredEvent[] {
   return connection.prepare("SELECT * FROM events ORDER BY global_position").all().map((row: Record<string, unknown>) => ({
@@ -296,7 +421,7 @@ test("rejects a tampered committed response while reconciling unknown outcome", 
       stored.response = { schemaVersion: 1, tampered: true }; return { ...found, responseJson: canonicalJson(stored) }; };
       const value = Reflect.get(target, property); return typeof value === "function" ? value.bind(target) : value; } }) as EventAppendStatements;
     const importer = new V2ShadowImporter({ connection: f.connection, statements, maintenance: new MaintenanceFence(),
-      branchScopes: new BranchScopeRepository(), repository: f.repository, policy: f.policy, faultInjector: faults });
+      branchScopes: new BranchScopeRepository(), policy: f.policy, faultInjector: faults });
     assert.throws(() => importer.import({ context: f.context, sealedPackage: f.sealedPackage }),
       error => error instanceof ShadowMigrationError && error.code === "MIGRATION_IDENTITY_CONFLICT");
     assert.equal(Number(f.connection.prepare("SELECT count(*) AS count FROM events").get()?.count), f.sealedPackage.manifest.recordDescriptors.length);

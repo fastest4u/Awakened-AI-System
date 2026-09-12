@@ -173,6 +173,42 @@ function committedFixture(): ReturnType<typeof fixture> {
   return value;
 }
 
+it("retains acknowledged outboxes and claims as scoped immutable complete evidence", () => {
+  const f = committedFixture();
+  let escaped: { readCompatibilityOutbox(): readonly CompatibilityOutboxRecord[]; readCompatibilityClaims(): readonly CompatibilityClaim[] };
+  f.repository.transact(PROJECT_ID, MIGRATION_IDENTITY, tx => {
+    escaped = tx as unknown as typeof escaped;
+    assert.deepEqual(escaped.readCompatibilityOutbox(), [outbox()]);
+    assert.deepEqual(escaped.readCompatibilityClaims(), [claim()]);
+    assert.deepEqual(tx.readPendingCompatibility(), []);
+    for (const rows of [escaped.readCompatibilityOutbox(), escaped.readCompatibilityClaims()]) {
+      assert.ok(Object.isFrozen(rows)); assert.ok(Object.isFrozen(rows[0]));
+    }
+  });
+  for (const [p, m] of [[OTHER_PROJECT_ID, MIGRATION_IDENTITY], [PROJECT_ID, "f".repeat(64)]]) {
+    f.repository.transact(p!, m!, tx => {
+      const reads = tx as unknown as typeof escaped;
+      assert.deepEqual(reads.readCompatibilityOutbox(), []); assert.deepEqual(reads.readCompatibilityClaims(), []);
+    });
+  }
+  assert.throws(() => escaped!.readCompatibilityOutbox(), ShadowMigrationError);
+  assert.throws(() => escaped!.readCompatibilityClaims(), ShadowMigrationError);
+});
+
+it("orders complete outboxes by source ordinal and claims by outbox identity", () => {
+  const f = committedFixture();
+  const nextReceipt = { ...receipt(), sourceOrdinal: 1, importedEventId: "00000000-0000-4000-8000-000000000011", importedGlobalPosition: 11n };
+  const nextOutbox = { ...outbox(), outboxId: "00000000-0000-4000-8000-000000000019", sourceOrdinal: 1,
+    importedEventId: nextReceipt.importedEventId, importedGlobalPosition: 11n, relativePath: "legacy/two.md", materializationRevision: 2n };
+  const nextClaim = { ...claim(), outboxId: nextOutbox.outboxId, claimId: "00000000-0000-4000-8000-000000000019" };
+  f.repository.transact(PROJECT_ID, MIGRATION_IDENTITY, tx => {
+    tx.insertImportedRecords([nextReceipt]); tx.enqueueCompatibility([nextOutbox]); tx.claimCompatibility(nextClaim);
+    assert.deepEqual(tx.readCompatibilityOutbox(), [outbox(), nextOutbox]);
+    assert.deepEqual(tx.readCompatibilityClaims(), [nextClaim, claim()]);
+    assert.deepEqual(tx.readPendingCompatibility(), [nextOutbox]);
+  });
+});
+
 const EVIDENCE_TABLES = [
   "v2_shadow_migration_runs",
   "v2_shadow_migration_transitions",

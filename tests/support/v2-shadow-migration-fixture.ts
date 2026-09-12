@@ -247,6 +247,49 @@ export async function createV2ShadowMigrationFixture(t: TestContext,
   };
 }
 
+/** Compatibility source and target produced by the current writers, schema and isolated importer. */
+export async function createCompatibilityFixture(t: TestContext, options: { legacyArtifacts?: boolean } = {}) {
+  let cleanup = () => {}; t.after(() => cleanup());
+  const f = await createV2ShadowMigrationFixture(t, options);
+  const source = await verifyV1SourceCopy(f.verificationInput); cleanup = () => source.close();
+  const sealedPackage = await sealV2MigrationPackage({ ...f.packageInput, source, packageRoot: f.packageRootA });
+  cleanup = () => { try { sealedPackage.close(); } finally { source.close(); } };
+  const eventStorePath = join(f.root, "compatibility-target.sqlite"), isolatedRoot = join(f.root, "compatibility"); mkdirSync(isolatedRoot);
+  const connection = f.driver.open(eventStorePath, { mode: "create", busyTimeoutMs: 5000 });
+  cleanup = () => { try { connection.close(); } finally { try { sealedPackage.close(); } finally { source.close(); } } };
+  applyCurrentProjectStoreSchema(connection, f.projectionBinding, f.manifest.createdAt); connection.exec(v2ShadowMigration.sql);
+  const repository = new SqliteV2ShadowMigrationRepository(connection), rolloutRevisionId = randomUUID();
+  const v1ProjectionDirectory = join(f.root, "compatibility-v1"), v2ProjectionDirectory = join(f.root, "compatibility-v2");
+  mkdirSync(v1ProjectionDirectory); mkdirSync(v2ProjectionDirectory);
+  const prepared = await new V2ShadowProjectionPublisher({ driver: f.driver, connection, eventStorePath,
+    liveEventStorePath: f.liveEventStorePath, liveVaultRoot: f.liveVaultRoot, v1ProjectionDirectory, v2ProjectionDirectory, policy: f.policy })
+    .prepareV1Baseline({ source, sealedPackage });
+  new RolloutControlPlane(new SqliteRolloutControlPlaneRepository(connection)).createRevision({
+    projectId: f.projectionBinding.projectId, revisionId: rolloutRevisionId, parentRevisionId: null,
+    buildIdentityHash: sealedPackage.manifest.buildIdentityHash, migrationIdentityHash: sealedPackage.migrationIdentity,
+    configurationChecksum: sealedPackage.manifest.configurationChecksum, v1BaselineChecksum: prepared.baselineChecksum,
+    cohortAlgorithmVersion: 1, cohortSalt: digest("compatibility-salt"), cohortBasisPoints: 0, createdAt: f.manifest.createdAt });
+  repository.transact(f.projectionBinding.projectId, sealedPackage.migrationIdentity, tx => tx.insertRun({
+    projectId: f.projectionBinding.projectId, migrationIdentity: sealedPackage.migrationIdentity, rolloutRevisionId,
+    packageChecksum: sealedPackage.manifest.packageChecksum, sourceManifestChecksum: f.manifest.manifestChecksum,
+    sourceTerminalPosition: BigInt(f.manifest.terminalEventPosition), sourceTerminalHash: f.manifest.terminalEventHash,
+    configurationChecksum: sealedPackage.manifest.configurationChecksum, policyChecksum: shadowMigrationPolicyChecksum(f.policy),
+    buildIdentityHash: sealedPackage.manifest.buildIdentityHash, createdAt: f.manifest.createdAt }));
+  const workspace = { kind: "non-git" as const, workspaceRoot: f.root, workspaceId: f.projectionBinding.workspaceId };
+  const context: ProjectContext = { workspace, checkedAt: f.manifest.createdAt, binding: { ...f.projectionBinding,
+    projectBindingId: randomUUID(), generation: 1, contextFingerprint: "compatibility", source: "explicit-cli", clientNamespace: "compatibility-test",
+    clientInstanceId: randomUUID(), actorRole: "primary", projectRoot: f.root, vaultRoot: f.liveVaultRoot,
+    descriptorPath: join(f.liveVaultRoot, ".project-memory.json"), workspace, establishedAt: f.manifest.createdAt,
+    storeRoute: { kind: "vault-local", storeRoot: f.root, eventsPath: eventStorePath,
+      storeManifestPath: join(f.root, "store.json"), projectionManifestPath: join(f.root, "projection.json") } } };
+  new V2ShadowImporter({ connection, statements: new SqliteEventStoreStatements(connection), maintenance: new MaintenanceFence(),
+    branchScopes: new BranchScopeRepository(), policy: f.policy }).import({ context, sealedPackage });
+  return { ...f, source, sealedPackage, connection, repository, rolloutRevisionId, isolatedRoot, eventStorePath,
+    input: { source, sealedPackage, rolloutRevisionId },
+    materializerOptions: { driver: f.driver, connection, eventStorePath, isolatedRoot,
+      liveEventStorePath: f.liveEventStorePath, liveVaultRoot: f.liveVaultRoot, policy: f.policy } };
+}
+
 /** Fresh production UUID fixture, fully written before source-copy verification. */
 export async function createSnapshotParityFixture(t: TestContext, options: { artifactMetadata?: boolean; checkpointHistory?: boolean; rankingPair?: boolean } = {}) {
   let cleanup = () => {};
@@ -292,7 +335,7 @@ export async function createSnapshotParityFixture(t: TestContext, options: { art
     projectRoot: f.root, vaultRoot: f.liveVaultRoot, descriptorPath: join(f.liveVaultRoot, ".project-memory.json"), workspace, establishedAt: f.manifest.createdAt,
     storeRoute: { kind: "vault-local", storeRoot: f.root, eventsPath: eventStorePath, storeManifestPath: join(f.root, "store.json"), projectionManifestPath: join(f.root, "projection.json") } } };
   new V2ShadowImporter({ connection, statements: new SqliteEventStoreStatements(connection), maintenance: new MaintenanceFence(),
-    branchScopes: new BranchScopeRepository(), repository, policy: f.policy }).import({ context, sealedPackage });
+    branchScopes: new BranchScopeRepository(), policy: f.policy }).import({ context, sealedPackage });
   repository.transact(f.projectionBinding.projectId, sealedPackage.migrationIdentity, tx => {
     const body = { projectId: f.projectionBinding.projectId, migrationIdentity: sealedPackage.migrationIdentity, ordinal: 2, attemptId: randomUUID(),
       phase: "import-committed" as const, priorTransitionHash: tx.readTransitions().at(-1)!.transitionHash, evidenceDigest: digest("import"), recordedAt: f.manifest.createdAt };

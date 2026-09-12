@@ -86,7 +86,7 @@ async function fixture(t: test.TestContext, corruptV2 = false, crashV1 = false, 
     projectRoot: f.root, vaultRoot: f.liveVaultRoot, descriptorPath: join(f.liveVaultRoot, ".project-memory.json"), workspace, establishedAt: f.manifest.createdAt,
     storeRoute: { kind: "vault-local", storeRoot: f.root, eventsPath: eventStorePath, storeManifestPath: join(f.root, "store.json"), projectionManifestPath: join(f.root, "projection.json") } } } as ProjectContext;
   new V2ShadowImporter({ connection, statements: new SqliteEventStoreStatements(connection), maintenance: new MaintenanceFence(),
-    branchScopes: new BranchScopeRepository(), repository, policy: f.policy }).import({ context, sealedPackage });
+    branchScopes: new BranchScopeRepository(), policy: f.policy }).import({ context, sealedPackage });
   repository.transact(f.projectionBinding.projectId, sealedPackage.migrationIdentity, tx => {
     const body = { projectId: f.projectionBinding.projectId, migrationIdentity: sealedPackage.migrationIdentity, ordinal: 2,
       attemptId: randomUUID(), phase: "import-committed" as const, priorTransitionHash: tx.readTransitions().at(-1)!.transitionHash,
