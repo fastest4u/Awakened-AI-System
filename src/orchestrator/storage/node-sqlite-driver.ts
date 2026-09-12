@@ -254,9 +254,8 @@ class NodeSqliteStatement implements SqliteStatement {
 class NodeSqliteConnection implements SqliteConnection {
   readonly #database: NativeDatabase;
 
-  constructor(database: NativeDatabase, binding?: BoundFileIdentity) {
+  constructor(database: NativeDatabase) {
     this.#database = database;
-    if (binding !== undefined) { boundConnections.set(this, binding); Object.freeze(this); }
   }
 
   exec(sql: string): void {
@@ -271,6 +270,16 @@ class NodeSqliteConnection implements SqliteConnection {
     boundConnections.delete(this);
     this.#database.close();
   }
+}
+
+// Module-owned return path only: an instance's reachable constructor cannot register provenance.
+function validatedConnection(database: NativeDatabase, binding: BoundFileIdentity | undefined): SqliteConnection {
+  const connection = new NodeSqliteConnection(database);
+  if (binding !== undefined) {
+    boundConnections.set(connection, binding);
+    Object.freeze(connection);
+  }
+  return connection;
 }
 
 export class NodeSqliteDriver implements SqliteDriver {
@@ -327,7 +336,7 @@ export class NodeSqliteDriver implements SqliteDriver {
       if (options.mode === "read-only-existing") {
         verifyWal(preflight);
         if (binding !== undefined) assertSameBoundFile(binding);
-        return new NodeSqliteConnection(preflight, binding);
+        return validatedConnection(preflight, binding);
       }
       preflight.close();
       preflight = undefined;
@@ -343,7 +352,7 @@ export class NodeSqliteDriver implements SqliteDriver {
       verifyProjectIdentity(database);
       configureWritableConnection(database, options.busyTimeoutMs);
       if (binding !== undefined) assertSameBoundFile(binding);
-      return new NodeSqliteConnection(database, binding);
+      return validatedConnection(database, binding);
     } catch (error) {
       database?.close();
       throw this.capabilityFailure("SQLite existing-store hardening failed", error);

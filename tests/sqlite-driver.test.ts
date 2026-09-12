@@ -5,6 +5,7 @@ import {
   lstatSync,
   linkSync,
   readFileSync,
+  readdirSync,
   realpathSync,
   renameSync,
   symlinkSync,
@@ -44,6 +45,37 @@ function createBindingDatabase(path: string): void {
 }
 
 describe("opt-in SQLite open-time file binding", () => {
+  for (const route of ["instance", "prototype"] as const) it(`refuses fabricated binding through the ${route} constructor`, async () => {
+    const { assertBoundSqliteConnectionIdentity: check } = await import(bindingModuleUrl);
+    const directory = realpathSync.native(temporaryDirectory());
+    const target = join(directory, "target.sqlite"), protectedPath = join(directory, "protected.sqlite");
+    createBindingDatabase(target); createBindingDatabase(protectedPath);
+    const expected = physicalIdentity(target);
+    assert.notDeepEqual(physicalIdentity(protectedPath), expected);
+    const genuine = new NodeSqliteDriver({ DatabaseSync }).open(target, boundOptions);
+    let native: DatabaseSync | undefined, forged: SqliteConnection | undefined;
+    try {
+      native = new DatabaseSync(protectedPath, { readOnly: true });
+      const snapshot = () => readdirSync(directory).sort().map(name => {
+        const path = join(directory, name), stat = lstatSync(path, { bigint: true });
+        return { name, device: stat.dev, inode: stat.ino, links: stat.nlink, bytes: readFileSync(path) };
+      });
+      const before = snapshot();
+      const Constructor = (route === "instance" ? genuine.constructor : Object.getPrototypeOf(genuine).constructor) as
+        new (database: DatabaseSync, binding: { path: string; device: string; inode: string }) => SqliteConnection;
+      try {
+        forged = new Constructor(native, { path: target, ...expected });
+        check(genuine, target, expected);
+        assert.throws(() => check(forged, target, expected), errorHasCode("SQLITE_CAPABILITY_MISSING"));
+      } finally {
+        assert.deepEqual(snapshot(), before);
+      }
+    } finally {
+      try { if (forged !== undefined) forged.close(); else native?.close(); }
+      finally { genuine.close(); }
+    }
+  });
+
   it("binds only genuine open native wrappers and refuses unbound copied forged and closed connections", async () => {
     const { assertBoundSqliteConnectionIdentity: check } = await import(bindingModuleUrl);
     assert.equal(typeof check, "function");
