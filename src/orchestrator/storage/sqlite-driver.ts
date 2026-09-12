@@ -23,6 +23,8 @@ export interface SqliteConnection {
 export interface SqliteOpenOptions {
   mode: "create" | "existing" | "read-only-existing";
   busyTimeoutMs: number;
+  /** Internal opt-in provenance of an existing file's stable open-time identity. */
+  bindFileIdentity?: true;
 }
 
 export interface SqliteDriver {

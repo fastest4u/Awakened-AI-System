@@ -6,6 +6,7 @@ import { resolveContainedProjectPath } from "../identity/canonical-path.js";
 import { canonicalJson } from "../serialization/canonical-json.js";
 import { replayCommittedProjectionEvents } from "../projections/event-reader.js";
 import type { SqliteConnection, SqliteDriver } from "../storage/sqlite-driver.js";
+import { assertBoundSqliteConnectionIdentity } from "../storage/node-sqlite-driver.js";
 import { SqliteV2ShadowMigrationRepository, type CompatibilityAcknowledgement, type CompatibilityClaim,
   type CompatibilityOutboxRecord, type V2ShadowMigrationTransaction } from "../storage/v2-shadow-migration.repository.js";
 import type { VerifiedV1SourceCopy } from "../migration/v1-source-copy.js";
@@ -81,6 +82,7 @@ export class V2ShadowCompatibilityMaterializer {
       for (const protectedRoot of forbiddenRoots) if (overlap(protectedRoot, options.eventStorePath)) fail();
       const checkConnection = () => {
         remaining(); source.assertUnchanged(); package_.assertUnchanged();
+        assertBoundSqliteConnectionIdentity(options.connection, options.eventStorePath, targetIdentity);
         if (!sameIdentity(targetIdentity, captureCompatibilityPath(options.eventStorePath, false))) fail();
         const database = options.connection.prepare("PRAGMA database_list").all().find(row => row.name === "main");
         if (typeof database?.file !== "string" || !sameIdentity(targetIdentity, captureCompatibilityPath(database.file, false))) fail();
@@ -106,6 +108,8 @@ export class V2ShadowCompatibilityMaterializer {
       };
       const initial = transact(tx => ({ receipts: tx.readImportedRecords(), outboxes: tx.readCompatibilityOutbox(),
         claims: tx.readCompatibilityClaims(), acknowledgements: tx.readCompatibilityAcknowledgements() }));
+      const initialClaimIds = new Set(initial.claims.map(claim => claim.outboxId));
+      const initialAcknowledgementIds = new Set(initial.acknowledgements.map(ack => ack.outboxId));
       // Production wrapper/source codecs and complete chain authentication also prove the zero-artifact case.
       const snapshot = await new V2ImportedProjectionEventReader({ driver: options.driver, eventStorePath: options.eventStorePath,
         sealedPackage: package_, sourceManifest: source.manifest }).openCommittedSnapshot(binding);
@@ -163,16 +167,17 @@ export class V2ShadowCompatibilityMaterializer {
       const checkEvidence = (tx: V2ShadowMigrationTransaction, complete = false) => {
         if (!equal(tx.readImportedRecords(), initial.receipts) || !equal(tx.readCompatibilityOutbox(), initial.outboxes)) fail();
         const claims = tx.readCompatibilityClaims(), acks = tx.readCompatibilityAcknowledgements();
+        const claimIds = new Set(claims.map(claim => claim.outboxId));
         for (const claim of claims) if (!equal(claim, expectedClaims.get(claim.outboxId))) fail();
-        for (const ack of acks) if (!equal(ack, expectedAcks.get(ack.outboxId)) || !claims.some(claim => claim.outboxId === ack.outboxId)) fail();
+        for (const ack of acks) if (!equal(ack, expectedAcks.get(ack.outboxId)) || !claimIds.has(ack.outboxId)) fail();
         if (complete && (claims.length !== expected.length || acks.length !== expected.length)) fail();
         for (const event of events.values()) assertEvent(event);
       };
       transact(tx => checkEvidence(tx));
       for (const row of initial.outboxes) {
         const artifact = { relativePath: row.relativePath, byteLength: row.byteLength, contentSha256: row.contentSha256, remainingMs: remaining() };
-        const priorClaim = initial.claims.some(claim => claim.outboxId === row.outboxId);
-        const priorAck = initial.acknowledgements.some(ack => ack.outboxId === row.outboxId);
+        const priorClaim = initialClaimIds.has(row.outboxId);
+        const priorAck = initialAcknowledgementIds.has(row.outboxId);
         if (!priorAck) { uncertain = true; transact(tx => { checkEvidence(tx); tx.claimCompatibility(expectedClaims.get(row.outboxId)!); }); }
         if (priorClaim || priorAck) await stable.verifyOnly(artifact);
         else {

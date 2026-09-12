@@ -1,14 +1,99 @@
 import assert from "node:assert/strict";
-import { lstatSync, readFileSync, readdirSync, unlinkSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, unlinkSync } from "node:fs";
+import { dirname, join } from "node:path";
 import test from "node:test";
 import { ShadowMigrationError } from "../src/orchestrator/migration/v2-shadow-migration.contracts.js";
 import { createCompatibilityFixture } from "./support/v2-shadow-migration-fixture.js";
 import { createHash } from "node:crypto";
 import { deterministicMigrationUuid } from "../src/orchestrator/migration/v2-shadow-migration.contracts.js";
 import type { SqliteConnection } from "../src/orchestrator/storage/sqlite-driver.js";
+import { DatabaseSync, type StatementSync } from "node:sqlite";
+import { applyCurrentProjectStoreSchema } from "./support/current-project-store-schema.js";
+import { v2ShadowMigration } from "../src/orchestrator/storage/migrations/0007-v2-shadow-migration.js";
 
 const moduleUrl = new URL("../src/orchestrator/materialization/v2-shadow-compatibility.materializer.js", import.meta.url).href;
+test("rejects a transparent connection wrapper before the first compatibility claim", async t => {
+  const { V2ShadowCompatibilityMaterializer } = await import(moduleUrl), f = await createCompatibilityFixture(t);
+  let transactions = 0;
+  const wrapper: SqliteConnection = { close: () => {}, prepare: sql => f.connection.prepare(sql), exec(sql) {
+    if (sql.startsWith("BEGIN")) transactions++; f.connection.exec(sql);
+  } };
+  await assert.rejects(new V2ShadowCompatibilityMaterializer({ ...f.materializerOptions, connection: wrapper }).materializePending(f.input),
+    (error: unknown) => error instanceof ShadowMigrationError && error.code === "COMPATIBILITY_INTEGRITY_FAILURE");
+  assert.equal(transactions, 0); assert.deepEqual(readdirSync(f.isolatedRoot), []);
+  assert.equal(f.repository.transact(f.projectionBinding.projectId, f.sealedPackage.migrationIdentity, tx => tx.readCompatibilityClaims()).length, 0);
+});
+
+test("refuses stale physical connection authority at entry and later claim or acknowledgement checks", async t => {
+  for (const boundary of ["entry", "claim", "acknowledgement"] as const) await t.test(boundary, async child => {
+    const { V2ShadowCompatibilityMaterializer } = await import(moduleUrl); let transactions = 0;
+    class ObservedDatabase extends DatabaseSync {
+      override exec(sql: string): void { if (sql.startsWith("BEGIN")) transactions++; super.exec(sql); }
+    }
+    const f = await createCompatibilityFixture(child, { database: ObservedDatabase });
+    const replacement = join(f.root, "replacement.sqlite"), second = f.driver.open(replacement, { mode: "create", busyTimeoutMs: 5000 });
+    const evidence = (connection: SqliteConnection) => ["v2_shadow_imported_records", "v2_shadow_compatibility_outbox", "v2_shadow_compatibility_claims", "v2_shadow_compatibility_acknowledgements"]
+      .map(table => connection.prepare(`SELECT count(*) AS n FROM ${table}`).get()!.n);
+    try { applyCurrentProjectStoreSchema(second, f.projectionBinding, f.manifest.createdAt); second.exec(v2ShadowMigration.sql);
+      assert.deepEqual(second.prepare("SELECT project_id,vault_id,store_id FROM project_meta").get(), f.connection.prepare("SELECT project_id,vault_id,store_id FROM project_meta").get());
+      assert.deepEqual(evidence(second), [0n, 0n, 0n, 0n]); }
+    finally { second.close(); }
+    const physical = (path: string) => { const stat = lstatSync(path, { bigint: true }); return { device: stat.dev, inode: stat.ino, links: stat.nlink }; };
+    const protectedSnapshot = (path: string): unknown => {
+      const stat = lstatSync(path); return { identity: physical(path), entries: stat.isDirectory()
+        ? readdirSync(path).sort().map(name => ({ name, value: protectedSnapshot(join(path, name)) }))
+        : createHash("sha256").update(readFileSync(path)).digest("hex") };
+    };
+    const protectedBefore = [protectedSnapshot(f.liveVaultRoot), protectedSnapshot(dirname(f.liveEventStorePath))];
+    const identityA = physical(f.eventStorePath), identityB = physical(replacement), bytesB = readFileSync(replacement);
+    let attempted = false, swapped = false, baseline = evidence(f.connection), attemptsBefore = 0;
+    let retained = f.eventStorePath, bytesA = readFileSync(f.eventStorePath), isolatedBefore: unknown;
+    const denied: string[] = [];
+    const attempt = () => {
+      attempted = true; baseline = evidence(f.connection); attemptsBefore = transactions;
+      bytesA = readFileSync(f.eventStorePath); isolatedBefore = protectedSnapshot(f.isolatedRoot);
+      const parent = dirname(f.eventStorePath);
+      // Prefer moving the complete directory so an existing WAL stays with A on platforms permitting the move.
+      try { renameSync(parent, `${parent}-retained`); mkdirSync(parent); retained = join(`${parent}-retained`, "events.sqlite"); swapped = true; }
+      catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        if (process.platform !== "win32" || !["EBUSY", "EPERM", "EACCES"].includes(code ?? "")) throw error;
+        denied.push(`ancestor:${code}`);
+        try { renameSync(f.eventStorePath, `${f.eventStorePath}.retained`); retained = `${f.eventStorePath}.retained`; swapped = true; }
+        catch (ancestorError) {
+          const ancestorCode = (ancestorError as NodeJS.ErrnoException).code;
+          if (! ["EBUSY", "EPERM", "EACCES"].includes(ancestorCode ?? "")) throw ancestorError;
+          denied.push(`file:${ancestorCode}`);
+        }
+      }
+      if (swapped) {
+        renameSync(replacement, f.eventStorePath);
+        const named = f.connection.prepare("PRAGMA database_list").all().find(row => row.name === "main")!.file;
+        assert.deepEqual(physical(String(named)), identityB); // The old pathname check would see B, not the held A.
+      }
+    };
+    if (boundary === "entry") attempt();
+    const materializer = new V2ShadowCompatibilityMaterializer({ ...f.materializerOptions, operationNow: () => {
+      if (!attempted && (boundary === "claim" ? transactions === 2 : boundary === "acknowledgement" && existsSync(join(f.isolatedRoot, "legacy/one.md")))) {
+        attempt(); if (!swapped) throw new Error("Windows prevented disposable replacement");
+      }
+      return 0;
+    } });
+    if (boundary !== "entry" || swapped) await assert.rejects(materializer.materializePending(f.input),
+      (error: unknown) => error instanceof ShadowMigrationError && ["COMPATIBILITY_INTEGRITY_FAILURE", "MIGRATION_OUTCOME_UNKNOWN"].includes(error.code));
+    assert.equal(attempted, true); assert.equal(transactions, attemptsBefore);
+    assert.deepEqual(evidence(f.connection), baseline);
+    assert.deepEqual(physical(retained), identityA); assert.deepEqual(readFileSync(retained), bytesA);
+    assert.deepEqual(protectedSnapshot(f.isolatedRoot), isolatedBefore);
+    assert.equal(baseline[3], 0n); assert.deepEqual([protectedSnapshot(f.liveVaultRoot), protectedSnapshot(dirname(f.liveEventStorePath))], protectedBefore);
+    if (swapped) { assert.deepEqual(physical(f.eventStorePath), identityB); assert.deepEqual(readFileSync(f.eventStorePath), bytesB); }
+    else {
+      assert.equal(denied.length, 2); child.diagnostic(`Windows ${boundary} replacement prevented (${denied.join(",")}); not stale-handle refusal proof`);
+      assert.deepEqual(physical(f.eventStorePath), identityA); assert.deepEqual(physical(replacement), identityB); assert.deepEqual(readFileSync(replacement), bytesB);
+    }
+    if (boundary !== "acknowledgement") assert.deepEqual(readdirSync(f.isolatedRoot), []);
+  });
+});
 test("publishes exact committed artifact bytes below only the isolated root and proves a complete no-op", async t => {
   const { V2ShadowCompatibilityMaterializer } = await import(moduleUrl);
   const f = await createCompatibilityFixture(t), materializer = new V2ShadowCompatibilityMaterializer(f.materializerOptions);
@@ -50,12 +135,15 @@ test("authenticates zero-artifact imports and returns null maxima and an empty-s
 
 test("reconciles replacement before acknowledgement failure without rewriting installed bytes or exposing plaintext", async t => {
   const { V2ShadowCompatibilityMaterializer } = await import(moduleUrl);
-  const f = await createCompatibilityFixture(t); let interrupt = true;
-  const connection: SqliteConnection = { close: () => f.connection.close(), exec: sql => f.connection.exec(sql), prepare(sql) {
-    if (interrupt && sql.startsWith("INSERT INTO v2_shadow_compatibility_acknowledgements")) throw new Error("sensitive bytes and absolute target must not escape");
-    return f.connection.prepare(sql);
-  } };
-  const materializer = new V2ShadowCompatibilityMaterializer({ ...f.materializerOptions, connection });
+  let interrupt = true;
+  class AcknowledgementFaultDatabase extends DatabaseSync {
+    override prepare(sql: string): StatementSync {
+      if (interrupt && sql.startsWith("INSERT INTO v2_shadow_compatibility_acknowledgements")) throw new Error("sensitive bytes and absolute target must not escape");
+      return super.prepare(sql);
+    }
+  }
+  const f = await createCompatibilityFixture(t, { database: AcknowledgementFaultDatabase });
+  const materializer = new V2ShadowCompatibilityMaterializer(f.materializerOptions);
   await assert.rejects(materializer.materializePending(f.input), (error: unknown) => {
     assert.ok(error instanceof ShadowMigrationError); assert.equal(error.code, "MIGRATION_OUTCOME_UNKNOWN");
     assert.doesNotMatch(JSON.stringify(error) + error.message, /sensitive|absolute target|Keep V1|ตรวจสอบ/); return true;

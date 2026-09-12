@@ -2,12 +2,18 @@ import { strict as assert } from "node:assert";
 import { execFileSync } from "node:child_process";
 import {
   existsSync,
+  lstatSync,
+  linkSync,
+  readFileSync,
+  realpathSync,
+  renameSync,
+  symlinkSync,
   mkdtempSync,
   mkdirSync,
   rmSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { DatabaseSync, StatementSync } from "node:sqlite";
 import { afterEach, describe, it } from "node:test";
 import {
@@ -20,11 +26,142 @@ import {
 } from "../src/orchestrator/runtime/runtime-capabilities.js";
 import { NodeSqliteDriver } from "../src/orchestrator/storage/node-sqlite-driver.js";
 import type {
+  SqliteConnection,
   SqliteOpenOptions,
   SqliteParams,
 } from "../src/orchestrator/storage/sqlite-driver.js";
+import { applyCurrentProjectStoreSchema } from "./support/current-project-store-schema.js";
 
 const temporaryDirectories: string[] = [];
+const bindingModuleUrl = new URL("../src/orchestrator/storage/node-sqlite-driver.js", import.meta.url).href;
+const boundOptions: SqliteOpenOptions & { bindFileIdentity: true } = { mode: "existing", busyTimeoutMs: DEFAULT_BUSY_TIMEOUT_MS, bindFileIdentity: true };
+const physicalIdentity = (path: string) => { const stat = lstatSync(path, { bigint: true }); return { device: String(stat.dev), inode: String(stat.ino) }; };
+function createBindingDatabase(path: string): void {
+  const connection = new NodeSqliteDriver({ DatabaseSync }).open(path, { mode: "create", busyTimeoutMs: DEFAULT_BUSY_TIMEOUT_MS });
+  try { applyCurrentProjectStoreSchema(connection, { projectId: "11111111-1111-4111-8111-111111111111",
+    vaultId: "22222222-2222-4222-8222-222222222222", storeId: "33333333-3333-4333-8333-333333333333" }, "2026-09-12T00:00:00.000Z"); }
+  finally { connection.close(); }
+}
+
+describe("opt-in SQLite open-time file binding", () => {
+  it("binds only genuine open native wrappers and refuses unbound copied forged and closed connections", async () => {
+    const { assertBoundSqliteConnectionIdentity: check } = await import(bindingModuleUrl);
+    assert.equal(typeof check, "function");
+    const path = join(realpathSync.native(temporaryDirectory()), "bound.sqlite"); createBindingDatabase(path);
+    const driver = new NodeSqliteDriver({ DatabaseSync }), connection = driver.open(path, boundOptions);
+    const expected = physicalIdentity(path);
+    try {
+      check(connection, path, expected);
+      const wrapper: SqliteConnection = { exec: sql => connection.exec(sql), prepare: sql => connection.prepare(sql), close: () => {} };
+      for (const falseConnection of [wrapper, { ...connection }, Object.create(Object.getPrototypeOf(connection)), {}])
+        assert.throws(() => check(falseConnection, path, expected), errorHasCode("SQLITE_CAPABILITY_MISSING"));
+      const unbound = driver.open(path, { mode: "existing", busyTimeoutMs: DEFAULT_BUSY_TIMEOUT_MS });
+      try { assert.throws(() => check(unbound, path, expected), errorHasCode("SQLITE_CAPABILITY_MISSING")); }
+      finally { unbound.close(); }
+      const readOnly = driver.open(path, { ...boundOptions, mode: "read-only-existing" });
+      try { check(readOnly, path, expected); assert.equal(readOnly.prepare("PRAGMA foreign_keys").get()?.foreign_keys, 1n); }
+      finally { readOnly.close(); }
+    } finally { connection.close(); }
+    assert.throws(() => check(connection, path, expected), errorHasCode("SQLITE_CAPABILITY_MISSING"));
+  });
+
+  it("rejects invalid opt-in and create before opening any native handle", () => {
+    let opened = 0;
+    class CountedDatabase extends DatabaseSync { constructor(...args: ConstructorParameters<typeof DatabaseSync>) { opened++; super(...args); } }
+    const driver = new NodeSqliteDriver({ DatabaseSync: CountedDatabase }), directory = realpathSync.native(temporaryDirectory());
+    for (const options of [{ ...boundOptions, mode: "create" }, { ...boundOptions, bindFileIdentity: false }, { ...boundOptions, bindFileIdentity: "true" }]) {
+      const path = join(directory, "must-not-create.sqlite");
+      assert.throws(() => { driver.open(path, options as SqliteOpenOptions).close(); }, errorHasCode("SQLITE_CAPABILITY_MISSING"));
+      assert.equal(existsSync(path), false);
+    }
+    assert.equal(opened, 0);
+  });
+
+  it("rejects missing noncanonical junction and hardlinked bound paths before native open", () => {
+    const directory = realpathSync.native(temporaryDirectory()), path = join(directory, "bound.sqlite"); createBindingDatabase(path);
+    const hardlink = join(directory, "hardlink.sqlite"); linkSync(path, hardlink);
+    const alias = join(directory, "alias"); symlinkSync(directory, alias, process.platform === "win32" ? "junction" : "dir");
+    let opened = 0;
+    class CountedDatabase extends DatabaseSync { constructor(...args: ConstructorParameters<typeof DatabaseSync>) { opened++; super(...args); } }
+    const driver = new NodeSqliteDriver({ DatabaseSync: CountedDatabase });
+    for (const invalid of [join(directory, "missing.sqlite"), `${directory}/../not-normalized.sqlite`, hardlink, join(alias, "bound.sqlite")])
+      assert.throws(() => { driver.open(invalid, boundOptions).close(); }, errorHasCode("SQLITE_CAPABILITY_MISSING"));
+    assert.equal(opened, 0); assert.equal(lstatSync(path).nlink, 2);
+  });
+
+  for (const nativeOpen of [1, 2]) it(`rejects persistent substitution after native constructor ${nativeOpen} before writable hardening`, t => {
+    const directory = realpathSync.native(temporaryDirectory()), owned = join(directory, "owned"); mkdirSync(owned);
+    const path = join(owned, "a.sqlite"), replacement = join(directory, "b.sqlite"); createBindingDatabase(path); createBindingDatabase(replacement);
+    const beforeA = readFileSync(path), beforeB = readFileSync(replacement), idA = physicalIdentity(path), idB = physicalIdentity(replacement);
+    let opens = 0, hardenings = 0, swapped = false; const denied: string[] = [];
+    class ReplacedDatabase extends DatabaseSync {
+      constructor(...args: ConstructorParameters<typeof DatabaseSync>) {
+        super(...args); opens++;
+        if (opens === nativeOpen) {
+          try { renameSync(path, join(owned, "retained.sqlite")); swapped = true; }
+          catch (error) {
+            const code = (error as NodeJS.ErrnoException).code;
+            if (process.platform !== "win32" || !["EPERM", "EACCES", "EBUSY"].includes(code ?? "")) { super.close(); throw error; }
+            denied.push(`file:${code}`);
+            try { renameSync(owned, `${owned}-retained`); mkdirSync(owned); swapped = true; }
+            catch (ancestorError) {
+              const ancestorCode = (ancestorError as NodeJS.ErrnoException).code;
+              if (process.platform !== "win32" || !["EPERM", "EACCES", "EBUSY"].includes(ancestorCode ?? "")) { super.close(); throw ancestorError; }
+              denied.push(`ancestor:${ancestorCode}`);
+            }
+          }
+          if (swapped) renameSync(replacement, path);
+        }
+      }
+      override prepare(sql: string): StatementSync {
+        if (sql === "PRAGMA journal_mode = WAL") hardenings++;
+        return super.prepare(sql);
+      }
+    }
+    let connection: SqliteConnection | undefined, failure: unknown;
+    try { connection = new NodeSqliteDriver({ DatabaseSync: ReplacedDatabase }).open(path, boundOptions); }
+    catch (error) { failure = error; } finally { connection?.close(); }
+    if (!swapped) {
+      assert.equal(denied.length, 2); t.diagnostic(`Windows native-open replacement prevented (${denied.join(",")}); stale-handle guard not exercised`);
+      assert.deepEqual(physicalIdentity(path), idA); assert.deepEqual(readFileSync(path), beforeA);
+      assert.deepEqual(physicalIdentity(replacement), idB); assert.deepEqual(readFileSync(replacement), beforeB); return;
+    }
+    assert.ok(failure); errorHasCode("SQLITE_CAPABILITY_MISSING")(failure); assert.equal(hardenings, 0);
+    assert.deepEqual(physicalIdentity(path), idB); assert.deepEqual(readFileSync(path), beforeB);
+    const retained = existsSync(join(owned, "retained.sqlite")) ? join(owned, "retained.sqlite") : join(`${owned}-retained`, basename(path));
+    assert.deepEqual(physicalIdentity(retained), idA); assert.deepEqual(readFileSync(retained), beforeA);
+  });
+
+  it("refuses a stale bound native connection when the current pathname names another physical store", async t => {
+    const { assertBoundSqliteConnectionIdentity: check } = await import(bindingModuleUrl);
+    const directory = realpathSync.native(temporaryDirectory()), owned = join(directory, "owned"); mkdirSync(owned);
+    const path = join(owned, "a.sqlite"), replacement = join(directory, "b.sqlite"); createBindingDatabase(path); createBindingDatabase(replacement);
+    const idA = physicalIdentity(path), idB = physicalIdentity(replacement), beforeA = readFileSync(path), beforeB = readFileSync(replacement);
+    const connection = new NodeSqliteDriver({ DatabaseSync }).open(path, boundOptions); let swapped = false;
+    try {
+      try { renameSync(path, join(owned, "retained.sqlite")); swapped = true; }
+      catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        if (process.platform !== "win32" || !["EPERM", "EACCES", "EBUSY"].includes(code ?? "")) throw error;
+        try { renameSync(owned, `${owned}-retained`); mkdirSync(owned); swapped = true; }
+        catch (ancestorError) {
+          const ancestorCode = (ancestorError as NodeJS.ErrnoException).code;
+          if (! ["EPERM", "EACCES", "EBUSY"].includes(ancestorCode ?? "")) throw ancestorError;
+          t.diagnostic(`Windows stale-handle setup prevented (file:${code},ancestor:${ancestorCode}); not stale-handle refusal proof`);
+        }
+      }
+      if (swapped) {
+        renameSync(replacement, path);
+        const named = connection.prepare("PRAGMA database_list").all().find(row => row.name === "main")?.file;
+        assert.equal(typeof named, "string"); assert.deepEqual(physicalIdentity(String(named)), idB);
+        assert.throws(() => check(connection, path, idB), errorHasCode("SQLITE_CAPABILITY_MISSING"));
+        assert.deepEqual(readFileSync(path), beforeB);
+        const retained = existsSync(join(owned, "retained.sqlite")) ? join(owned, "retained.sqlite") : join(`${owned}-retained`, basename(path));
+        assert.deepEqual(physicalIdentity(retained), idA); assert.deepEqual(readFileSync(retained), beforeA);
+      } else { assert.deepEqual(physicalIdentity(path), idA); assert.deepEqual(readFileSync(path), beforeA); assert.deepEqual(readFileSync(replacement), beforeB); }
+    } finally { connection.close(); }
+  });
+});
 
 function temporaryDirectory(): string {
   const directory = mkdtempSync(join(tmpdir(), "project-memory-driver-test-"));

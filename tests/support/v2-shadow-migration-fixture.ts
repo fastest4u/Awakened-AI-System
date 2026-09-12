@@ -248,15 +248,16 @@ export async function createV2ShadowMigrationFixture(t: TestContext,
 }
 
 /** Compatibility source and target produced by the current writers, schema and isolated importer. */
-export async function createCompatibilityFixture(t: TestContext, options: { legacyArtifacts?: boolean } = {}) {
+export async function createCompatibilityFixture(t: TestContext, options: { legacyArtifacts?: boolean; database?: typeof DatabaseSync } = {}) {
   let cleanup = () => {}; t.after(() => cleanup());
   const f = await createV2ShadowMigrationFixture(t, options);
   const source = await verifyV1SourceCopy(f.verificationInput); cleanup = () => source.close();
   const sealedPackage = await sealV2MigrationPackage({ ...f.packageInput, source, packageRoot: f.packageRootA });
   cleanup = () => { try { sealedPackage.close(); } finally { source.close(); } };
-  const eventStorePath = join(f.root, "compatibility-target.sqlite"), isolatedRoot = join(f.root, "compatibility"); mkdirSync(isolatedRoot);
-  const connection = f.driver.open(eventStorePath, { mode: "create", busyTimeoutMs: 5000 });
-  cleanup = () => { try { connection.close(); } finally { try { sealedPackage.close(); } finally { source.close(); } } };
+  const targetDirectory = join(f.root, "compatibility-store"), isolatedRoot = join(f.root, "compatibility"); mkdirSync(isolatedRoot); mkdirSync(targetDirectory);
+  const eventStorePath = join(targetDirectory, "events.sqlite");
+  let connection = f.driver.open(eventStorePath, { mode: "create", busyTimeoutMs: 5000 }), connectionOpen = true;
+  cleanup = () => { try { if (connectionOpen) connection.close(); } finally { try { sealedPackage.close(); } finally { source.close(); } } };
   applyCurrentProjectStoreSchema(connection, f.projectionBinding, f.manifest.createdAt); connection.exec(v2ShadowMigration.sql);
   const repository = new SqliteV2ShadowMigrationRepository(connection), rolloutRevisionId = randomUUID();
   const v1ProjectionDirectory = join(f.root, "compatibility-v1"), v2ProjectionDirectory = join(f.root, "compatibility-v2");
@@ -284,7 +285,10 @@ export async function createCompatibilityFixture(t: TestContext, options: { lega
       storeManifestPath: join(f.root, "store.json"), projectionManifestPath: join(f.root, "projection.json") } } };
   new V2ShadowImporter({ connection, statements: new SqliteEventStoreStatements(connection), maintenance: new MaintenanceFence(),
     branchScopes: new BranchScopeRepository(), policy: f.policy }).import({ context, sealedPackage });
-  return { ...f, source, sealedPackage, connection, repository, rolloutRevisionId, isolatedRoot, eventStorePath,
+  connection.close(); connectionOpen = false;
+  connection = new NodeSqliteDriver({ DatabaseSync: options.database ?? DatabaseSync }).open(eventStorePath,
+    { mode: "existing", busyTimeoutMs: 5000, bindFileIdentity: true }); connectionOpen = true;
+  return { ...f, source, sealedPackage, connection, repository: new SqliteV2ShadowMigrationRepository(connection), rolloutRevisionId, isolatedRoot, eventStorePath,
     input: { source, sealedPackage, rolloutRevisionId },
     materializerOptions: { driver: f.driver, connection, eventStorePath, isolatedRoot,
       liveEventStorePath: f.liveEventStorePath, liveVaultRoot: f.liveVaultRoot, policy: f.policy } };
