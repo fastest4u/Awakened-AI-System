@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import fs from "node:fs";
 import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import { join } from "node:path";
 import test from "node:test";
 import { canonicalJson } from "../src/orchestrator/serialization/canonical-json.js";
@@ -133,6 +135,33 @@ test("retains one supplied invocation deadline in opened handles and deferred it
   source.close();
 });
 
+test("record iterators retain the original deadline and check every advance after acquisition", async (t) => {
+  // Returning an array iterator or rereading the caller input lets close/expiry/replaced-budget advances escape checks.
+  const fixture = await createV2ShadowMigrationFixture(t);
+  const source = await verifyV1SourceCopy(fixture.verificationInput);
+  const sealed = await sealV2MigrationPackage({ ...fixture.packageInput, source, packageRoot: fixture.packageRootA });
+  let expired = false;
+  const originalDeadline = { signal: new AbortController().signal, remainingMs(): number {
+    if (expired) throw new ShadowMigrationError("MIGRATION_RETRY_EXHAUSTED");
+    return 1000;
+  } };
+  const replacementDeadline = { signal: new AbortController().signal, remainingMs: () => 1000 };
+  const openInput = { rootPath: sealed.rootPath, expectedMigrationIdentity: sealed.migrationIdentity,
+    invocationDeadline: originalDeadline };
+  const opened = openSealedV2MigrationPackage(openInput);
+  const iterator = opened.records()[Symbol.iterator]();
+  assert.equal(iterator.next().done, false);
+  (openInput as { invocationDeadline: typeof replacementDeadline }).invocationDeadline = replacementDeadline;
+  expired = true;
+  assert.throws(() => iterator.next(), (error: unknown) => error instanceof ShadowMigrationError
+    && error.code === "MIGRATION_RETRY_EXHAUSTED");
+  expired = false;
+  const closeIterator = opened.records()[Symbol.iterator]();
+  opened.close();
+  assert.throws(() => closeIterator.next(), identityConflict);
+  sealed.close(); source.close();
+});
+
 test("opening spends the supplied deadline immediately before returning a handle", async (t) => {
   // Omitting the late open check can return an already-expired package authority.
   const fixture = await createV2ShadowMigrationFixture(t);
@@ -186,6 +215,53 @@ test("reconciliation distinguishes partial and contradictory final targets witho
   conflictPackage.close(); conflictSource.close(); identitySource.close(); partialSource.close();
 });
 
+test("manifest-present partial package layouts reconcile as unknown without mutation", async (t) => {
+  // Treating an authenticated manifest plus missing required package entries as byte corruption loses partial-publication recovery.
+  for (const missing of ["events.ndjson", "artifacts"] as const) await t.test(`missing ${missing}`, async child => {
+    const fixture = await createV2ShadowMigrationFixture(child);
+    const source = await verifyV1SourceCopy(fixture.verificationInput);
+    const sealed = await sealV2MigrationPackage({ ...fixture.packageInput, source, packageRoot: fixture.packageRootA });
+    const partialPath = join(fixture.packageRootB, sealed.migrationIdentity);
+    mkdirSync(partialPath);
+    copyFileSync(join(sealed.rootPath, "package-manifest.json"), join(partialPath, "package-manifest.json"));
+    if (missing === "events.ndjson") mkdirSync(join(partialPath, "artifacts"));
+    else copyFileSync(join(sealed.rootPath, "events.ndjson"), join(partialPath, "events.ndjson"));
+    const before = readdirSync(partialPath);
+    assert.deepEqual(reconcileSealedV2MigrationPackage({ source, packageRoot: fixture.packageRootB,
+      policy: fixture.policy, buildIdentityHash: fixture.packageInput.buildIdentityHash,
+      configurationChecksum: fixture.packageInput.configurationChecksum,
+      expectedMigrationIdentity: sealed.migrationIdentity }),
+    { status: "unknown", safeErrorCode: "MIGRATION_OUTCOME_UNKNOWN" });
+    assert.deepEqual(readdirSync(partialPath), before);
+    sealed.close(); source.close();
+  });
+});
+
+for (const failureAt of ["initial-open", "final-verification"] as const) test(`native ${failureAt} package reads reconcile as unknown`, async (t) => {
+  // Converting native stat/read uncertainty through the public conflict wrapper incorrectly proves corruption.
+  const fixture = await createV2ShadowMigrationFixture(t);
+  const source = await verifyV1SourceCopy(fixture.verificationInput);
+  const sealed = await sealV2MigrationPackage({ ...fixture.packageInput, source, packageRoot: fixture.packageRootA });
+  const original = fs.lstatSync;
+  let targetStats = 0;
+  const failAt = failureAt === "initial-open" ? 2 : 5;
+  const mocked = t.mock.method(fs, "lstatSync", ((...args: unknown[]) => {
+    if (String(args[0]) === sealed.rootPath && ++targetStats === failAt) {
+      throw Object.assign(new Error("transparent package stat denial"), { code: "EACCES" });
+    }
+    return Reflect.apply(original, fs, args as Parameters<typeof original>);
+  }) as typeof fs.lstatSync);
+  syncBuiltinESMExports();
+  try {
+    assert.deepEqual(reconcileSealedV2MigrationPackage({ source, packageRoot: fixture.packageRootA,
+      policy: fixture.policy, buildIdentityHash: fixture.packageInput.buildIdentityHash,
+      configurationChecksum: fixture.packageInput.configurationChecksum,
+      expectedMigrationIdentity: sealed.migrationIdentity }),
+    { status: "unknown", safeErrorCode: "MIGRATION_OUTCOME_UNKNOWN" });
+    assert.ok(targetStats >= failAt);
+  } finally { mocked.mock.restore(); syncBuiltinESMExports(); sealed.close(); source.close(); }
+});
+
 test("returns unknown when the verified package parent identity changes during an absent proof", async (t) => {
   // Returning absent after parent replacement would bind ENOENT to an unauthenticated directory generation.
   const fixture = await createV2ShadowMigrationFixture(t);
@@ -203,6 +279,30 @@ test("returns unknown when the verified package parent identity changes during a
     configurationChecksum: fixture.packageInput.configurationChecksum,
     expectedMigrationIdentity: sealed.migrationIdentity, invocationDeadline }),
   { status: "unknown", safeErrorCode: "MIGRATION_OUTCOME_UNKNOWN" });
+  assert.deepEqual(readdirSync(fixture.packageRootB), []);
+  assert.deepEqual(readdirSync(moved), []);
+  sealed.close(); source.close();
+});
+
+test("absent reconciliation rechecks the parent after the second genuine source assertion", async (t) => {
+  // Omitting the final stable-parent check binds the completed source proof to a replaced parent directory generation.
+  const fixture = await createV2ShadowMigrationFixture(t);
+  const source = await verifyV1SourceCopy(fixture.verificationInput);
+  const sealed = await sealV2MigrationPackage({ ...fixture.packageInput, source, packageRoot: fixture.packageRootA });
+  const moved = `${fixture.packageRootB}-during-source-revalidation`;
+  let sourceAssertions = 0;
+  const replacingSource = { ...source, assertUnchanged(): void {
+    source.assertUnchanged();
+    sourceAssertions += 1;
+    if (sourceAssertions === 2) { renameSync(fixture.packageRootB, moved); mkdirSync(fixture.packageRootB); }
+  } };
+  assert.deepEqual(reconcileSealedV2MigrationPackage({ source: replacingSource,
+    packageRoot: fixture.packageRootB, policy: fixture.policy,
+    buildIdentityHash: fixture.packageInput.buildIdentityHash,
+    configurationChecksum: fixture.packageInput.configurationChecksum,
+    expectedMigrationIdentity: sealed.migrationIdentity }),
+  { status: "unknown", safeErrorCode: "MIGRATION_OUTCOME_UNKNOWN" });
+  assert.equal(sourceAssertions, 2);
   assert.deepEqual(readdirSync(fixture.packageRootB), []);
   assert.deepEqual(readdirSync(moved), []);
   sealed.close(); source.close();

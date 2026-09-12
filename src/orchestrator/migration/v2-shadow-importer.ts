@@ -9,7 +9,7 @@ import { EventStore, EventStoreError, GENESIS_GLOBAL_HASH, MAX_CANONICAL_COMMAND
 import { EventAppendTransaction } from "../storage/event-append-transaction.js";
 import { BranchScopeRepository } from "../storage/branch-scope.repository.js";
 import { MaintenanceFence } from "../storage/maintenance-fence.js";
-import type { SqliteConnection, SqliteRow } from "../storage/sqlite-driver.js";
+import { SqliteCapabilityError, type SqliteConnection, type SqliteRow } from "../storage/sqlite-driver.js";
 import { assertBoundSqliteConnectionIdentity } from "../storage/node-sqlite-driver.js";
 import { SqliteV2ShadowMigrationRepository, type CompatibilityOutboxRecord, type ImportedRecordReceipt } from "../storage/v2-shadow-migration.repository.js";
 import { captureCompatibilityPath } from "../materialization/stable-compatibility-directory.js";
@@ -50,57 +50,64 @@ export class V2ShadowImporter {
         throw error;
       }
     };
-    boundary();
-    const manifest = sealedPackage.manifest;
-    const identity = sealedPackage.migrationIdentity;
-    if (context.binding.projectId !== manifest.projectId || context.binding.vaultId !== manifest.vaultId || context.binding.storeId !== manifest.storeId || context.binding.workspaceId !== manifest.workspaceId) sourceInvalid();
-    const migrationContext = internalMigrationContext(context, identity, manifest.createdAt);
-    sealedPackage.assertUnchanged(); boundary();
-    const evidence = this.repository.transact(manifest.projectId, identity, (tx) => {
+    try {
       boundary();
-      const run = tx.readRun();
-      if (run === null || run.packageChecksum !== manifest.packageChecksum || run.sourceManifestChecksum !== manifest.sourceManifestChecksum) conflict();
-      return { receipts: tx.readImportedRecords(), outboxes: tx.readCompatibilityOutbox() };
-    });
-    boundary();
-    const prior = evidence.receipts;
-    if (evidence.outboxes.some(row => !prior.some(receipt => receipt.sourceOrdinal === row.sourceOrdinal && receipt.sourceKind === "legacy-artifact"))) conflict();
-    if (prior.length > manifest.recordDescriptors.length) conflict();
-    const priorByOrdinal = new Map(prior.map((receipt) => [receipt.sourceOrdinal, receipt]));
-    let replayed = true;
-    streamBatches(sealedPackage, this.dependencies.policy, migrationContext, (batch, batchOrdinal) => {
+      const manifest = sealedPackage.manifest;
+      const identity = sealedPackage.migrationIdentity;
+      if (context.binding.projectId !== manifest.projectId || context.binding.vaultId !== manifest.vaultId || context.binding.storeId !== manifest.storeId || context.binding.workspaceId !== manifest.workspaceId) sourceInvalid();
+      const migrationContext = internalMigrationContext(context, identity, manifest.createdAt);
+      sealedPackage.assertUnchanged(); boundary();
+      const evidence = this.repository.transact(manifest.projectId, identity, (tx) => {
+        boundary();
+        const run = tx.readRun();
+        if (run === null || run.packageChecksum !== manifest.packageChecksum || run.sourceManifestChecksum !== manifest.sourceManifestChecksum) conflict();
+        return { receipts: tx.readImportedRecords(), outboxes: tx.readCompatibilityOutbox() };
+      });
       boundary();
-      const receipts = batch.map((record) => priorByOrdinal.get(record.ordinal)).filter((receipt): receipt is ImportedRecordReceipt => receipt !== undefined);
-      if (receipts.length !== 0 && receipts.length !== batch.length) conflict();
-      if (receipts.length === batch.length) {
-        const planned = planCommand(migrationContext, sealedPackage, batch, batchOrdinal);
-        for (const [index, receipt] of receipts.entries()) {
-          const record = batch[index]!;
-          assertReceipt(this.dependencies.connection, receipt, record, planned.recordedAt, migrationContext.binding.projectId, boundary);
-          const expected = compatibilityRecord(receipt, record);
-          const actual = evidence.outboxes.filter(row => row.sourceOrdinal === record.ordinal);
-          if (expected === null ? actual.length !== 0 : actual.length !== 1 || !sameOutbox(actual[0]!, expected)) conflict();
+      const prior = evidence.receipts;
+      if (evidence.outboxes.some(row => !prior.some(receipt => receipt.sourceOrdinal === row.sourceOrdinal && receipt.sourceKind === "legacy-artifact"))) conflict();
+      if (prior.length > manifest.recordDescriptors.length) conflict();
+      const priorByOrdinal = new Map(prior.map((receipt) => [receipt.sourceOrdinal, receipt]));
+      let replayed = true;
+      streamBatches(sealedPackage, this.dependencies.policy, migrationContext, (batch, batchOrdinal) => {
+        boundary();
+        const receipts = batch.map((record) => priorByOrdinal.get(record.ordinal)).filter((receipt): receipt is ImportedRecordReceipt => receipt !== undefined);
+        if (receipts.length !== 0 && receipts.length !== batch.length) conflict();
+        if (receipts.length === batch.length) {
+          const planned = planCommand(migrationContext, sealedPackage, batch, batchOrdinal);
+          for (const [index, receipt] of receipts.entries()) {
+            const record = batch[index]!;
+            assertReceipt(this.dependencies.connection, receipt, record, planned.recordedAt, migrationContext.binding.projectId, boundary);
+            const expected = compatibilityRecord(receipt, record);
+            const actual = evidence.outboxes.filter(row => row.sourceOrdinal === record.ordinal);
+            if (expected === null ? actual.length !== 0 : actual.length !== 1 || !sameOutbox(actual[0]!, expected)) conflict();
+          }
+        } else {
+          replayed = false;
+          mutationOccurred = this.appendBatch(migrationContext, sealedPackage, batch, batchOrdinal, boundary, input.invocationDeadline)
+            || mutationOccurred;
         }
-      } else {
-        replayed = false;
-        mutationOccurred = this.appendBatch(migrationContext, sealedPackage, batch, batchOrdinal, boundary, input.invocationDeadline)
-          || mutationOccurred;
+      }, boundary);
+      boundary();
+      const receipts = this.repository.transact(manifest.projectId, identity, (tx) => { boundary(); return tx.readImportedRecords(); });
+      if (receipts.length !== manifest.recordDescriptors.length) conflict();
+      const ordered = [...receipts].sort((left, right) => left.sourceOrdinal - right.sourceOrdinal);
+      sealedPackage.assertUnchanged(); boundary();
+      return importResult(sealedPackage, ordered, replayed);
+    } catch (error) {
+      if (mutationOccurred && error instanceof ShadowMigrationError && error.code === "MIGRATION_RETRY_EXHAUSTED") {
+        throw new ShadowMigrationError("MIGRATION_OUTCOME_UNKNOWN", Object.freeze({}), { cause: error });
       }
-    }, boundary);
-    boundary();
-    const receipts = this.repository.transact(manifest.projectId, identity, (tx) => { boundary(); return tx.readImportedRecords(); });
-    if (receipts.length !== manifest.recordDescriptors.length) conflict();
-    const ordered = [...receipts].sort((left, right) => left.sourceOrdinal - right.sourceOrdinal);
-    sealedPackage.assertUnchanged(); boundary();
-    return importResult(sealedPackage, ordered, replayed);
+      throw error;
+    }
   }
 
   public reconcile(input: V2ShadowImportInput): ShadowMigrationReconciliation<V2ShadowImportResult> {
-    const authority = boundTarget(this.dependencies, true);
-    authority();
-    const deadline = input.invocationDeadline;
-    const boundary = (): void => { deadline?.remainingMs(); authority(); };
     try {
+      const authority = boundTarget(this.dependencies, true);
+      authority();
+      const deadline = input.invocationDeadline;
+      const boundary = (): void => { deadline?.remainingMs(); authority(); };
       boundary();
       const { context, sealedPackage } = input;
       const manifest = sealedPackage.manifest;
@@ -175,6 +182,17 @@ export class V2ShadowImporter {
         }, boundary);
         boundary();
         if (plannedRecords.length !== manifest.recordDescriptors.length) sourceInvalid();
+        const expectedEventStatement = this.dependencies.connection.prepare("SELECT * FROM events WHERE event_id=$eventId");
+        for (const record of plannedRecords) {
+          boundary();
+          const row = expectedEventStatement.get({ $eventId: record.eventId });
+          boundary();
+          if (row !== undefined) {
+            const recordedAt = recordedAtByOrdinal.get(record.ordinal);
+            if (recordedAt === undefined) conflict();
+            assertDurableEvent(authenticateDurable(this.dependencies.connection, row, boundary), record, recordedAt, manifest.projectId);
+          }
+        }
         const recordByOrdinal = new Map(plannedRecords.map(record => [record.ordinal, record]));
         const receiptByOrdinal = new Map<number, ImportedRecordReceipt>();
         for (const receipt of receipts) {
@@ -262,9 +280,12 @@ export class V2ShadowImporter {
       this.repository.transact(context.binding.projectId, identity, (tx) => {
         boundary();
         const existing = tx.readImportedRecords();
+        boundary();
         const outboxes = tx.readCompatibilityOutbox();
+        boundary();
         if (outboxes.some(row => !existing.some(receipt => receipt.sourceOrdinal === row.sourceOrdinal && receipt.sourceKind === "legacy-artifact"))) conflict();
         for (const [index, receipt] of receipts.entries()) {
+          boundary();
           const found = existing.find(value => value.sourceOrdinal === receipt.sourceOrdinal);
           if (found === undefined) continue;
           if (Object.keys(receipt).some(key => found[key as keyof ImportedRecordReceipt] !== receipt[key as keyof ImportedRecordReceipt])) conflict();
@@ -272,10 +293,14 @@ export class V2ShadowImporter {
           const actual = outboxes.filter(row => row.sourceOrdinal === receipt.sourceOrdinal);
           if (expected === null ? actual.length !== 0 : actual.length !== 1 || !sameOutbox(actual[0]!, expected)) conflict();
         }
-        tx.insertImportedRecords(receipts);
-        tx.enqueueCompatibility(receipts.flatMap((receipt, index) => {
-          const row = compatibilityRecord(receipt, batch[index]!); return row === null ? [] : [row];
-        }));
+        boundary();
+        for (const receipt of receipts) { boundary(); tx.insertImportedRecords([receipt]); boundary(); }
+        for (const [index, receipt] of receipts.entries()) {
+          boundary();
+          const row = compatibilityRecord(receipt, batch[index]!);
+          if (row !== null) { tx.enqueueCompatibility([row]); boundary(); }
+        }
+        boundary();
       });
       durableMutation = true;
       boundary();
@@ -308,7 +333,8 @@ function boundTarget(dependencies: V2ShadowImporterDependencies, required: boole
   }
   const identity = captureCompatibilityPath(path, false);
   return (): void => {
-    assertBoundSqliteConnectionIdentity(dependencies.connection, path, identity);
+    try { assertBoundSqliteConnectionIdentity(dependencies.connection, path, identity); }
+    catch (error) { if (error instanceof SqliteCapabilityError) conflict(); throw error; }
     const current = captureCompatibilityPath(path, false);
     if (current.device !== identity.device || current.inode !== identity.inode) conflict();
   };

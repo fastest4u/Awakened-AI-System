@@ -34,6 +34,7 @@ const HASH = /^[0-9a-f]{64}$/u;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 const MAX_CHUNK_BYTES = 64 * 1024;
 const MAX_EVENT_LINE_BYTES = 2 * 1024 * 1024;
+class PackageReadUncertainError extends Error {}
 const MANIFEST_KEYS = ["schemaVersion", "packageFormatVersion", "migrationAlgorithmVersion", "projectId", "vaultId", "storeId",
   "workspaceId", "sourceManifestChecksum", "eventCount", "legacyArtifactCount", "aggregateSourceBytes", "terminalEventPosition",
   "terminalEventHash", "createdAt", "recordDescriptors", "recordsChecksum", "buildIdentityHash", "configurationChecksum", "creationReasonCode",
@@ -86,6 +87,8 @@ export interface SealedV2MigrationPackage {
   assertUnchanged(): void;
   close(): void;
 }
+
+const rawPackageAssertions = new WeakMap<SealedV2MigrationPackage, () => void>();
 
 export interface SealV2MigrationPackageInput {
   readonly source: VerifiedV1SourceCopy;
@@ -579,10 +582,16 @@ function lineLocations(rootPath: string, manifest: V2MigrationPackageManifestV1,
   return locations;
 }
 
-function assertExactPackageLayout(rootPath: string, manifest: V2MigrationPackageManifestV1, assertDeadline?: () => void): void {
+function assertExactPackageLayout(rootPath: string, manifest: V2MigrationPackageManifestV1, assertDeadline?: () => void,
+  uncertainPartialLayout = false): void {
   assertDeadline?.();
   const rootEntries = readdirSync(rootPath, { withFileTypes: true }).map((entry) => entry.name).sort();
-  if (canonicalJson(rootEntries) !== canonicalJson(["artifacts", "events.ndjson", "package-manifest.json"])) conflict();
+  const requiredRootEntries = ["artifacts", "events.ndjson", "package-manifest.json"];
+  if (rootEntries.some(entry => !requiredRootEntries.includes(entry))) conflict();
+  if (requiredRootEntries.some(entry => !rootEntries.includes(entry))) {
+    if (uncertainPartialLayout) throw new PackageReadUncertainError();
+    conflict();
+  }
   const artifactRoot = join(rootPath, "artifacts");
   assertDirectory(artifactRoot, assertDeadline);
   const expected = new Set(manifest.recordDescriptors.slice(manifest.eventCount).map((descriptor) => descriptor.relativePath!));
@@ -606,11 +615,16 @@ function assertExactPackageLayout(rootPath: string, manifest: V2MigrationPackage
     }
   };
   walk(artifactRoot);
-  if (actual.size !== expected.size || [...actual].some((path) => !expected.has(path))) conflict();
+  if ([...actual].some((path) => !expected.has(path))) conflict();
+  if (actual.size !== expected.size) {
+    if (uncertainPartialLayout) throw new PackageReadUncertainError();
+    conflict();
+  }
 }
 
-function verifiedRecordLocations(rootPath: string, manifest: V2MigrationPackageManifestV1, assertDeadline?: () => void): RecordLocation[] {
-  assertExactPackageLayout(rootPath, manifest, assertDeadline);
+function verifiedRecordLocations(rootPath: string, manifest: V2MigrationPackageManifestV1, assertDeadline?: () => void,
+  uncertainPartialLayout = false): RecordLocation[] {
+  assertExactPackageLayout(rootPath, manifest, assertDeadline, uncertainPartialLayout);
   const locations = lineLocations(rootPath, manifest, assertDeadline);
   for (const descriptor of manifest.recordDescriptors.slice(manifest.eventCount)) {
     assertDeadline?.();
@@ -623,16 +637,19 @@ function verifiedRecordLocations(rootPath: string, manifest: V2MigrationPackageM
   return locations;
 }
 
-function assertPackageContent(rootPath: string, expectedManifest: V2MigrationPackageManifestV1, assertDeadline?: () => void): void {
+function assertPackageContent(rootPath: string, expectedManifest: V2MigrationPackageManifestV1, assertDeadline?: () => void,
+  uncertainPartialLayout = false): void {
   const currentManifest = parseManifest(join(rootPath, "package-manifest.json"), assertDeadline);
   if (canonicalJson(currentManifest) !== canonicalJson(expectedManifest)) conflict();
-  verifiedRecordLocations(rootPath, expectedManifest, assertDeadline);
+  verifiedRecordLocations(rootPath, expectedManifest, assertDeadline, uncertainPartialLayout);
 }
 
-function openSealedV2MigrationPackageCore(input: OpenSealedV2MigrationPackageInput): SealedV2MigrationPackage {
+function openSealedV2MigrationPackageCore(input: OpenSealedV2MigrationPackageInput,
+  uncertainPartialLayout = false): SealedV2MigrationPackage {
     if (typeof input !== "object" || input === null || typeof input.rootPath !== "string" || !isAbsolute(input.rootPath)
       || typeof input.expectedMigrationIdentity !== "string" || !HASH.test(input.expectedMigrationIdentity)) conflict();
-    const assertDeadline = input.invocationDeadline === undefined ? undefined : (): void => { input.invocationDeadline!.remainingMs(); };
+    const invocationDeadline = input.invocationDeadline;
+    const assertDeadline = invocationDeadline === undefined ? undefined : (): void => { invocationDeadline.remainingMs(); };
     assertDeadline?.();
     const rootPath = normalized(input.rootPath);
     assertPackageTree(rootPath, assertDeadline);
@@ -640,7 +657,7 @@ function openSealedV2MigrationPackageCore(input: OpenSealedV2MigrationPackageInp
     const manifest = parseManifest(join(rootPath, "package-manifest.json"), assertDeadline);
     const migrationIdentity = identityFor(manifest);
     if (migrationIdentity !== input.expectedMigrationIdentity) conflict();
-    const locations = verifiedRecordLocations(rootPath, manifest, assertDeadline);
+    const locations = verifiedRecordLocations(rootPath, manifest, assertDeadline, uncertainPartialLayout);
     assertPackageIdentities(rootPath, identities, assertDeadline);
     let closed = false;
     const requireOpen = (): void => { assertDeadline?.(); if (closed) conflict(); };
@@ -648,37 +665,46 @@ function openSealedV2MigrationPackageCore(input: OpenSealedV2MigrationPackageInp
       requireOpen();
       held(() => assertPackageIdentities(rootPath, identities, assertDeadline));
     };
-    const assertUnchanged = (): void => {
+    const assertUnchangedRaw = (): void => {
       requireOpen();
-      held(() => {
-        assertPackageIdentities(rootPath, identities, assertDeadline);
-        assertPackageContent(rootPath, manifest, assertDeadline);
-        assertPackageIdentities(rootPath, identities, assertDeadline);
-      });
+      assertPackageIdentities(rootPath, identities, assertDeadline);
+      assertPackageContent(rootPath, manifest, assertDeadline, uncertainPartialLayout);
+      assertPackageIdentities(rootPath, identities, assertDeadline);
     };
+    const assertUnchanged = (): void => { held(assertUnchangedRaw); };
     const records = (): Iterable<V2MigrationPackageRecordV1> => {
       requireOpen();
       assertMetadataUnchanged();
-      return locations.map((location) => Object.freeze({ descriptor: location.descriptor,
-        readChunks(): Iterable<Uint8Array> {
-          return (function* (): Iterable<Uint8Array> {
-            requireOpen(); assertMetadataUnchanged();
-            const bytes = held(() => {
-              const chunks = [...readChunks(location.path, location.offset, location.descriptor.byteLength, assertDeadline)];
-              const value = Buffer.concat(chunks.map((chunk) => Buffer.from(chunk)));
-              if (value.length !== location.descriptor.byteLength || sha256(value) !== location.descriptor.contentSha256) conflict();
-              return Uint8Array.from(value);
-            });
-            for (let offset = 0; offset < bytes.length; offset += MAX_CHUNK_BYTES) {
-              requireOpen(); assertMetadataUnchanged();
-              yield Uint8Array.from(bytes.subarray(offset, offset + MAX_CHUNK_BYTES));
-            }
-          })();
-        },
-      })).values();
+      return (function* (): Iterable<V2MigrationPackageRecordV1> {
+        let index = 0;
+        while (true) {
+          requireOpen(); assertMetadataUnchanged();
+          const location = locations[index++];
+          if (location === undefined) return;
+          yield Object.freeze({ descriptor: location.descriptor,
+            readChunks(): Iterable<Uint8Array> {
+              return (function* (): Iterable<Uint8Array> {
+                requireOpen(); assertMetadataUnchanged();
+                const bytes = held(() => {
+                  const chunks = [...readChunks(location.path, location.offset, location.descriptor.byteLength, assertDeadline)];
+                  const value = Buffer.concat(chunks.map((chunk) => Buffer.from(chunk)));
+                  if (value.length !== location.descriptor.byteLength || sha256(value) !== location.descriptor.contentSha256) conflict();
+                  return Uint8Array.from(value);
+                });
+                for (let offset = 0; offset < bytes.length; offset += MAX_CHUNK_BYTES) {
+                  requireOpen(); assertMetadataUnchanged();
+                  yield Uint8Array.from(bytes.subarray(offset, offset + MAX_CHUNK_BYTES));
+                }
+              })();
+            },
+          });
+        }
+      })();
     };
     assertDeadline?.();
-    return Object.freeze({ rootPath, migrationIdentity, manifest, records, assertUnchanged, close(): void { closed = true; } });
+    const result = Object.freeze({ rootPath, migrationIdentity, manifest, records, assertUnchanged, close(): void { closed = true; } });
+    rawPackageAssertions.set(result, assertUnchangedRaw);
+    return result;
 }
 
 export function openSealedV2MigrationPackage(input: OpenSealedV2MigrationPackageInput): SealedV2MigrationPackage {
@@ -772,14 +798,21 @@ ShadowMigrationReconciliation<SealedV2MigrationPackage> {
       catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
       input.source.assertUnchanged();
       check();
+      if (!sameDirectory(packageRoot, parentIdentity)) return reconciliationUnknown("MIGRATION_OUTCOME_UNKNOWN");
+      try { lstatSync(target); return reconciliationUnknown("MIGRATION_OUTCOME_UNKNOWN"); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+      if (!sameDirectory(packageRoot, parentIdentity)) return reconciliationUnknown("MIGRATION_OUTCOME_UNKNOWN");
+      check();
       return Object.freeze({ status: "absent" });
     }
     opened = openSealedV2MigrationPackageCore({ rootPath: target,
       expectedMigrationIdentity: input.expectedMigrationIdentity,
-      ...(deadline === undefined ? {} : { invocationDeadline: deadline }) });
+      ...(deadline === undefined ? {} : { invocationDeadline: deadline }) }, true);
     exactPackageBindings(input.source, opened.manifest, policy, input.buildIdentityHash, input.configurationChecksum);
     input.source.assertUnchanged();
-    opened.assertUnchanged();
+    const assertUnchangedRaw = rawPackageAssertions.get(opened);
+    if (assertUnchangedRaw === undefined) conflict();
+    assertUnchangedRaw();
     if (!sameDirectory(packageRoot, parentIdentity)) {
       opened.close(); opened = undefined;
       return reconciliationUnknown("MIGRATION_OUTCOME_UNKNOWN");
