@@ -150,6 +150,58 @@ test("reconciliation rejects an expected event id committed under another comman
   } finally { f.close(); }
 });
 
+test("reconciliation rejects exact expected-stream wrapper evidence under a foreign command owner", async t => {
+  // Omitting planCommand's commandId/idempotencyKey lets authenticated same-stream evidence owned by another command degrade to unknown.
+  const f = await fixture(t, undefined, true);
+  try {
+    const identity = f.sealedPackage.migrationIdentity;
+    const sourceRecord = [...f.sealedPackage.records()][0]!;
+    const canonicalSourceEvent = JSON.parse(Buffer.concat([...sourceRecord.readChunks()]
+      .map(chunk => Buffer.from(chunk))).toString("utf8")) as Record<string, unknown>;
+    const { payload: omittedSourcePayload, ...sourceEvent } = canonicalSourceEvent;
+    void omittedSourcePayload;
+    const wrapperPayload = { schemaVersion: 1, migrationIdentity: identity, sourceOrdinal: 0,
+      sourceRecordHash: sourceRecord.descriptor.contentSha256, sourceEvent };
+    const expectedEventId = deterministicMigrationUuid("event", identity, 0);
+    const foreignCommandId = randomUUID();
+    const foreignIdempotencyKey = "foreign-owner-on-expected-migration-stream";
+    const store = new EventStore(f.connection, new SqliteEventStoreStatements(f.connection), new MaintenanceFence(),
+      new BranchScopeRepository(), () => f.sealedPackage.manifest.createdAt, () => expectedEventId);
+    store.append({ context: f.context, commandId: foreignCommandId, idempotencyKey: foreignIdempotencyKey,
+      commandType: "ImportV2ShadowBatch", correlationId: deterministicMigrationUuid("command", identity, 1_000_000),
+      agentId: "v2-shadow-importer", expectedStreamVersion: 0n, streamId: `v2-shadow-import/${identity}`,
+      streamType: "migration", outbox: [], publicResponse: { foreignOwner: true },
+      events: [{ eventType: "V1ProjectionSourceImported", eventSchemaVersion: 1,
+        occurredAt: f.sealedPackage.manifest.createdAt, visibilityScope: "project", confidence: "high",
+        verificationStatus: "verified", payload: wrapperPayload as never,
+        sourceRefs: [`migration:${identity}:0`], evidenceRefs: [], evidenceDigests: [] }] });
+    const row = f.connection.prepare("SELECT project_id,command_id,idempotency_key,stream_id,stream_type,event_id,event_type,event_schema_version,"
+      + "occurred_at,recorded_at,visibility_scope,confidence,verification_status,payload_json,source_refs_json "
+      + "FROM events WHERE event_id=$eventId")
+      .get({ $eventId: expectedEventId });
+    assert.equal(row?.project_id, f.context.binding.projectId);
+    assert.equal(row?.command_id, foreignCommandId);
+    assert.equal(row?.idempotency_key, foreignIdempotencyKey);
+    assert.equal(row?.stream_id, `v2-shadow-import/${identity}`);
+    assert.equal(row?.stream_type, "migration");
+    assert.equal(row?.event_id, expectedEventId);
+    assert.equal(row?.event_type, "V1ProjectionSourceImported");
+    assert.equal(row?.event_schema_version, 1n);
+    assert.equal(row?.occurred_at, f.sealedPackage.manifest.createdAt);
+    assert.equal(row?.recorded_at, f.sealedPackage.manifest.createdAt);
+    assert.equal(row?.visibility_scope, "project");
+    assert.equal(row?.confidence, "high");
+    assert.equal(row?.verification_status, "verified");
+    assert.equal(row?.payload_json, canonicalJson(wrapperPayload as never));
+    assert.equal(row?.source_refs_json, canonicalJson([`migration:${identity}:0`]));
+    assert.throws(() => f.importer.reconcile({ context: f.context, sealedPackage: f.sealedPackage }),
+      error => error instanceof ShadowMigrationError && error.code === "MIGRATION_IDENTITY_CONFLICT");
+    assert.equal(f.connection.prepare("SELECT count(*) AS n FROM events").get()!.n, 1n);
+    assert.equal(f.connection.prepare("SELECT count(*) AS n FROM v2_shadow_imported_records").get()!.n, 0n);
+    assert.equal(f.connection.prepare("SELECT count(*) AS n FROM v2_shadow_compatibility_outbox").get()!.n, 0n);
+  } finally { f.close(); }
+});
+
 test("later loss of genuine bound target authority is terminal", async t => {
   // Mapping the Task10 checker refusal through the broad read-I/O catch incorrectly returns retryable unknown.
   const f = await fixture(t, undefined, true);

@@ -142,6 +142,7 @@ export class V2ShadowImporter {
         boundary();
         const plannedRecords: PlannedRecord[] = [];
         const recordedAtByOrdinal = new Map<number, string>();
+        const plannedCommandByOrdinal = new Map<number, PlannedCommand>();
         let committedBatches = 0;
         let absentBatches = 0;
         streamBatches(sealedPackage, this.dependencies.policy, migrationContext, (batch, batchOrdinal) => {
@@ -178,7 +179,11 @@ export class V2ShadowImporter {
             if (commandRows.length !== batch.length) conflict();
             committedBatches += 1;
           }
-          for (const record of batch) { plannedRecords.push(record); recordedAtByOrdinal.set(record.ordinal, planned.recordedAt); }
+          for (const record of batch) {
+            plannedRecords.push(record);
+            recordedAtByOrdinal.set(record.ordinal, planned.recordedAt);
+            plannedCommandByOrdinal.set(record.ordinal, planned);
+          }
         }, boundary);
         boundary();
         if (plannedRecords.length !== manifest.recordDescriptors.length) sourceInvalid();
@@ -189,8 +194,12 @@ export class V2ShadowImporter {
           boundary();
           if (row !== undefined) {
             const recordedAt = recordedAtByOrdinal.get(record.ordinal);
-            if (recordedAt === undefined) conflict();
-            assertDurableEvent(authenticateDurable(this.dependencies.connection, row, boundary), record, recordedAt, manifest.projectId);
+            const planned = plannedCommandByOrdinal.get(record.ordinal);
+            if (recordedAt === undefined || planned === undefined) conflict();
+            const event = authenticateDurable(this.dependencies.connection, row, boundary);
+            assertDurableEvent(event, record, recordedAt, manifest.projectId);
+            if (event.commandId !== planned.command.commandId
+              || event.idempotencyKey !== planned.command.idempotencyKey) conflict();
           }
         }
         const recordByOrdinal = new Map(plannedRecords.map(record => [record.ordinal, record]));
