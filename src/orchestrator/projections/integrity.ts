@@ -1348,7 +1348,7 @@ export class ProjectionIntegrityService {
       const identity = captureGenerationIdentity(paths.databasePath);
       pinned = readGenerationImage(paths.databasePath, identity);
       if (manifest && pinned.sha256 !== manifest.databaseSha256) return integrity();
-      database = openImmutableProjectionImage(pinned.bytes);
+      database = openImmutableProjectionImage(pinned.bytes, this.#options.busyTimeoutMs ?? DEFAULT_BUSY_TIMEOUT_MS);
       assertCanonicalSchema(database, 1, snapshot.binding);
       database.exec("PRAGMA query_only=OFF");
       const native = database;
