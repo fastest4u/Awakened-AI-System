@@ -269,17 +269,43 @@ function workingImage(sourceRoot: string, liveDatabase: string, liveRoot: string
   const directory = canonicalExistingDirectory(mkdtempSync(join(temporaryRoot, "v1-source-verification-")));
   const identity = checkComponents(directory);
   let closed = false;
-  const close = (): void => {
-    if (closed) return;
-    closed = true;
+  const assertOwnedDirectory = (): void => {
     const current = checkComponents(directory);
     if (!current.isDirectory() || current.dev !== identity.dev || current.ino !== identity.ino) fail();
+  };
+  const transientCleanupError = (error: unknown): boolean =>
+    ["EBUSY", "EAGAIN", "EINTR"].includes((error as NodeJS.ErrnoException)?.code ?? "");
+  const close = (): void => {
+    if (closed) return;
+    assertOwnedDirectory();
+    let cleanupError: unknown;
+    const retry: string[] = [];
     // Only remove verifier-owned leaf names, never recurse through a substituted tree.
     for (const suffix of ["", "-wal", "-shm", "-journal"]) {
+      assertOwnedDirectory();
       try { unlinkSync(join(directory, `events.sqlite${suffix}`)); }
-      catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+      catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+        if (transientCleanupError(error)) retry.push(suffix);
+        else cleanupError ??= error;
+      }
     }
-    rmdirSync(directory);
+    // Finish the other safe leaves first. Cleanup gets one immediate retry per
+    // transient failure, not a renewed invocation or migration retry budget.
+    for (const suffix of retry) {
+      assertOwnedDirectory();
+      try { unlinkSync(join(directory, `events.sqlite${suffix}`)); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") cleanupError ??= error; }
+    }
+    if (cleanupError !== undefined) throw cleanupError;
+    assertOwnedDirectory();
+    try { rmdirSync(directory); }
+    catch (error) {
+      if (!transientCleanupError(error)) throw error;
+      assertOwnedDirectory();
+      rmdirSync(directory);
+    }
+    closed = true;
   };
   try {
     if (overlaps(directory, sourceRoot) || overlaps(directory, dirname(liveDatabase)) || overlaps(directory, liveRoot)) fail();
@@ -420,6 +446,7 @@ export async function verifyV1SourceCopy(input: VerifyV1SourceCopyInput): Promis
     const sourceEvents: StoredEvent[] = [];
     const scratch = workingImage(sourceRoot, liveDatabase, liveRoot, manifest, directories, deadline);
     let replay: ReturnType<typeof replayCommittedProjectionEvents>;
+    let replayFailed = false;
     try {
       replay = replayCommittedProjectionEvents(expected, { driver: checkedDriver, eventStorePath: scratch.databasePath,
         terminalEventPosition: BigInt(manifest.terminalEventPosition), maxEvents: policy.maxEvents }, (event) => {
@@ -430,7 +457,18 @@ export async function verifyV1SourceCopy(input: VerifyV1SourceCopyInput): Promis
         if (bytes > policy.maxEventBytes || logicalBytes > policy.maxAggregateBytes) fail("MIGRATION_LIMIT_EXCEEDED", "event", sourceEvents.length);
         sourceEvents.push(freezeEvent(event));
       });
-    } finally { scratch.close(); }
+      deadline?.remainingMs();
+    } catch (error) {
+      replayFailed = true;
+      throw error;
+    } finally {
+      try { scratch.close(); }
+      catch (error) {
+        // A secondary cleanup failure must not replace the primary replay error.
+        // Without a primary error, failed cleanup still refuses successful return.
+        if (!replayFailed) { deadline?.remainingMs(); throw error; }
+      }
+    }
     deadline?.remainingMs();
     if (sourceEvents.length !== manifest.eventCount || replay.eventCount !== manifest.eventCount
       || logicalBytes !== manifest.aggregateSourceBytes || replay.terminalEventPosition.toString() !== manifest.terminalEventPosition

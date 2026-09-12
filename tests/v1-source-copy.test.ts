@@ -1,14 +1,94 @@
 import assert from "node:assert/strict";
-import { appendFileSync, copyFileSync, existsSync, linkSync, lstatSync, mkdirSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import fs, { appendFileSync, copyFileSync, existsSync, linkSync, lstatSync, mkdirSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+import { dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import test from "node:test";
+import test, { type TestContext } from "node:test";
 import { inspect } from "node:util";
 import { decodeV1SourceCopyManifestV1, verifyV1SourceCopy } from "../src/orchestrator/migration/v1-source-copy.js";
 import { ShadowMigrationError } from "../src/orchestrator/migration/v2-shadow-migration.contracts.js";
 import type { SqliteDriver } from "../src/orchestrator/storage/sqlite-driver.js";
 import { createV2ShadowMigrationFixture, describeSourceFile, sealManifest } from "./support/v2-shadow-migration-fixture.js";
 import { createShadowMigrationInvocationDeadline } from "../src/orchestrator/migration/v2-shadow-migration-runtime.js";
+
+async function scratchCleanupFaultFixture(t: TestContext, fault: "one-shot" | "persistent" | "substitute", expire: boolean) {
+  const f = await createV2ShadowMigrationFixture(t);
+  let now = 0, scratchPath = "", closed = 0, injected = 0;
+  let cleanupIdentity: Readonly<{ dev: bigint; ino: bigint }> | undefined;
+  const attempted: string[] = [];
+  const deadline = createShadowMigrationInvocationDeadline(1000, () => now);
+  const paths = [f.manifestPath, f.sourceDatabasePath, f.liveEventStorePath,
+    ...f.manifest.sqliteSidecars.map(row => join(f.sourceRoot, row.relativePath)),
+    ...f.manifest.legacyArtifacts.map(row => join(f.sourceRoot, row.relativePath))];
+  const before = paths.map(path => readFileSync(path));
+  const originalUnlink = fs.unlinkSync;
+  const mocked = t.mock.method(fs, "unlinkSync", (path: fs.PathLike) => {
+    if (typeof path !== "string" || !scratchPath || !["", "-wal", "-shm", "-journal"].some(suffix => path === scratchPath + suffix)) return originalUnlink(path);
+    attempted.push(path.slice(scratchPath.length));
+    if (path === scratchPath + "-wal" && fault !== "substitute" && (injected === 0 || fault === "persistent")) {
+      injected++;
+      throw Object.assign(new Error("SECRET cleanup failure"), { code: "EBUSY" });
+    }
+    originalUnlink(path);
+    if (path === scratchPath && fault === "substitute" && injected++ === 0) {
+      const directory = dirname(scratchPath);
+      renameSync(directory, join(f.root, "displaced-scratch"));
+      mkdirSync(directory);
+      cleanupIdentity = lstatSync(directory, { bigint: true });
+      writeFileSync(scratchPath + "-wal", "substituted-directory-sentinel");
+    }
+  });
+  syncBuiltinESMExports();
+  t.after(() => {
+    mocked.mock.restore(); syncBuiltinESMExports(); deadline.dispose();
+    if (!scratchPath || !existsSync(dirname(scratchPath))) return;
+    const current = lstatSync(dirname(scratchPath), { bigint: true });
+    assert.equal(current.dev, cleanupIdentity?.dev); assert.equal(current.ino, cleanupIdentity?.ino);
+    assert.equal(current.isSymbolicLink(), false);
+    for (const suffix of ["", "-wal", "-shm", "-journal"]) {
+      try { originalUnlink(scratchPath + suffix); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+    }
+    fs.rmdirSync(dirname(scratchPath));
+  });
+  const driver: SqliteDriver = { open(path, options) {
+    scratchPath = path; cleanupIdentity = lstatSync(dirname(path), { bigint: true });
+    const connection = f.driver.open(path, options);
+    return { prepare: sql => connection.prepare(sql), exec: sql => connection.exec(sql),
+      close() { connection.close(); closed++; if (expire) now = 1000; } };
+  } };
+  return { input: { ...f.verificationInput, driver, invocationDeadline: deadline }, attempted,
+    scratchPath: () => scratchPath, closed: () => closed, injected: () => injected,
+    assertAuthorityUnchanged() { paths.forEach((path, i) => assert.deepEqual(readFileSync(path), before[i])); } };
+}
+
+test("scratch cleanup preserves expired replay error and exhausts remaining leaves before one bounded retry", async (t) => {
+  const f = await scratchCleanupFaultFixture(t, "one-shot", true);
+  await assert.rejects(verifyV1SourceCopy(f.input), redacted("MIGRATION_RETRY_EXHAUSTED"));
+  assert.equal(f.closed(), 1); assert.equal(f.injected(), 1);
+  assert.ok(f.attempted.indexOf("-shm") < f.attempted.lastIndexOf("-wal"));
+  assert.ok(f.attempted.indexOf("-journal") < f.attempted.lastIndexOf("-wal"));
+  assert.equal(existsSync(dirname(f.scratchPath())), false);
+  f.assertAuthorityUnchanged();
+});
+
+test("scratch cleanup failure after successful replay refuses success and leaves only unremovable owned bytes", async (t) => {
+  const f = await scratchCleanupFaultFixture(t, "persistent", false);
+  await assert.rejects(verifyV1SourceCopy(f.input), redacted());
+  assert.equal(f.closed(), 1); assert.equal(f.injected(), 2);
+  assert.deepEqual(fs.readdirSync(dirname(f.scratchPath())), ["events.sqlite-wal"]);
+  assert.ok(f.attempted.includes("-shm")); assert.ok(f.attempted.includes("-journal"));
+  f.assertAuthorityUnchanged();
+});
+
+test("scratch cleanup rejects directory substitution between owned leaves without masking expiry", async (t) => {
+  const f = await scratchCleanupFaultFixture(t, "substitute", true);
+  await assert.rejects(verifyV1SourceCopy(f.input), redacted("MIGRATION_RETRY_EXHAUSTED"));
+  assert.equal(f.closed(), 1);
+  assert.deepEqual(f.attempted, [""]);
+  assert.equal(readFileSync(f.scratchPath() + "-wal", "utf8"), "substituted-directory-sentinel");
+  f.assertAuthorityUnchanged();
+});
 
 test("shared deadline expiry after real replay closes scratch and preserves typed timeout", async (t) => {
   const f = await createV2ShadowMigrationFixture(t);
