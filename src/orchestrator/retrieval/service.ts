@@ -1,5 +1,7 @@
 import { ProjectionLagError } from "../projections/coordinator.js";
 import { parseProjectionManifest, type ProjectionManifestV1 } from "../projections/manifest.js";
+import { ShadowMigrationError } from "../migration/v2-shadow-migration.contracts.js";
+import type { ShadowMigrationInvocationDeadline } from "../migration/v2-shadow-migration-runtime.js";
 import {
   InternalRetrievalError,
   validateInternalRetrievalRequest,
@@ -430,19 +432,36 @@ async function searchOptionalVectorChannel(
   channel: VectorCandidateChannel | undefined,
   request: ValidatedInternalRetrievalRequest,
   lease: Parameters<VectorCandidateChannel["search"]>[1],
+  invocationDeadline?: ShadowMigrationInvocationDeadline,
 ): Promise<VectorChannelDiagnostic> {
+  checkInvocationDeadline(invocationDeadline);
   if (!request.vector.enabled || channel === undefined) {
     return vectorDiagnostic(disabledVectorChannel(), request);
   }
+  let diagnostic: VectorChannelDiagnostic;
   try {
     const result = await withVectorDeadline(
       request.consistency.deadlineMs,
       (signal) => channel.search(request, lease, signal),
     );
-    return vectorDiagnostic(result, request);
-  } catch {
-    return vectorDiagnostic(unavailableVectorChannel(), request);
+    diagnostic = vectorDiagnostic(result, request);
+  } catch (error) {
+    if (error instanceof ShadowMigrationError && error.code === "MIGRATION_RETRY_EXHAUSTED") {
+      throw error;
+    }
+    diagnostic = vectorDiagnostic(unavailableVectorChannel(), request);
   }
+  checkInvocationDeadline(invocationDeadline);
+  return diagnostic;
+}
+
+function checkInvocationDeadline(deadline: ShadowMigrationInvocationDeadline | undefined): number | undefined {
+  if (deadline === undefined) return undefined;
+  const remaining = deadline.remainingMs();
+  if (deadline.signal.aborted || !Number.isSafeInteger(remaining) || remaining < 1) {
+    throw new ShadowMigrationError("MIGRATION_RETRY_EXHAUSTED");
+  }
+  return remaining;
 }
 
 export class InternalRetrievalService {
@@ -458,10 +477,24 @@ export class InternalRetrievalService {
     this.#vectorChannel = options.vectorChannel;
   }
 
-  async retrieve(input: InternalRetrievalRequest): Promise<RankedInternalRetrievalResult> {
-    const request = validateInternalRetrievalRequest(input);
+  async retrieve(
+    input: InternalRetrievalRequest,
+    invocationDeadline?: ShadowMigrationInvocationDeadline,
+  ): Promise<RankedInternalRetrievalResult> {
+    const validated = validateInternalRetrievalRequest(input);
+    const remaining = checkInvocationDeadline(invocationDeadline);
+    const request = remaining === undefined ? validated : Object.freeze({
+      ...validated,
+      consistency: Object.freeze({
+        ...validated.consistency,
+        deadlineMs: Math.min(validated.consistency.deadlineMs, remaining),
+      }),
+    });
     const lease = await this.#projections.pin(request.binding, request.consistency);
+    let primaryFailure: Readonly<{ error: unknown }> | undefined;
+    let result: RankedInternalRetrievalResult;
     try {
+      checkInvocationDeadline(invocationDeadline);
       let manifest: ProjectionManifestV1;
       try {
         manifest = parseProjectionManifest(lease.manifest, request.binding);
@@ -472,17 +505,24 @@ export class InternalRetrievalService {
       if (available < request.consistency.requiredEventPosition) {
         throw new ProjectionLagError(request.consistency.requiredEventPosition, available);
       }
+      checkInvocationDeadline(invocationDeadline);
       const collected = this.#candidates.collectEligible(lease, request);
+      checkInvocationDeadline(invocationDeadline);
       const filtered = filterCandidates(collected, request);
-      const vector = await searchOptionalVectorChannel(this.#vectorChannel, request, lease);
+      checkInvocationDeadline(invocationDeadline);
+      const vector = await searchOptionalVectorChannel(this.#vectorChannel, request, lease, invocationDeadline);
+      checkInvocationDeadline(invocationDeadline);
       const fused = fuseCandidates(rankingChannels(filtered.collection), DEFAULT_RANKING_POLICY);
+      checkInvocationDeadline(invocationDeadline);
       const ranked = this.#customRanker === undefined
         ? rerankCandidates(fused, request, DEFAULT_RANKING_POLICY)
         : validateCustomRanking(this.#customRanker.select(fused, request), fused);
+      checkInvocationDeadline(invocationDeadline);
       const selection = selectRankedCandidates(ranked, {
         limit: request.limit,
         tokenBudget: request.tokenBudget,
       }, DEFAULT_RANKING_POLICY);
+      checkInvocationDeadline(invocationDeadline);
       const items = resultItems(selection);
       const conflicts = selection.conflicts;
       const candidateCount = fused.length;
@@ -517,9 +557,19 @@ export class InternalRetrievalService {
         conflictCursor,
         channels: Object.freeze({ vector }),
       });
-      return withExplanation(base, request, manifest);
+      result = withExplanation(base, request, manifest);
+      checkInvocationDeadline(invocationDeadline);
+    } catch (error) {
+      primaryFailure = { error };
+      throw error;
     } finally {
-      lease.close();
+      try {
+        lease.close();
+      } catch (error) {
+        if (primaryFailure === undefined) throw error;
+      }
     }
+    checkInvocationDeadline(invocationDeadline);
+    return result;
   }
 }

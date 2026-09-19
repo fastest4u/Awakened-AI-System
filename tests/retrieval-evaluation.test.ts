@@ -69,6 +69,8 @@ import { PROJECT_MEMORY_APPLICATION_ID } from "../src/orchestrator/runtime/runti
 import { canonicalJson } from "../src/orchestrator/serialization/canonical-json.js";
 import { NodeSqliteDriver } from "../src/orchestrator/storage/node-sqlite-driver.js";
 import { GENESIS_GLOBAL_HASH } from "../src/orchestrator/storage/event-store.js";
+import { ShadowMigrationError } from "../src/orchestrator/migration/v2-shadow-migration.contracts.js";
+import type { ShadowMigrationInvocationDeadline } from "../src/orchestrator/migration/v2-shadow-migration-runtime.js";
 
 const FIXTURE_URL = new URL(
   "../../tests/fixtures/retrieval-evaluation/v1/corpus.json",
@@ -1679,6 +1681,30 @@ describe("immutable bilingual retrieval evaluation corpus", () => {
 });
 
 describe("retrieval evaluation metrics", () => {
+  it("passes one shared runtime deadline without changing the sealed query limit and propagates expiry", async () => {
+    const corpus = readCorpus();
+    const query = corpus.queries[0]!;
+    const deadline: ShadowMigrationInvocationDeadline = {
+      signal: new AbortController().signal,
+      remainingMs: () => 50,
+    };
+    let calls = 0;
+    const service = Object.freeze({
+      async retrieve(request: InternalRetrievalRequest, received?: ShadowMigrationInvocationDeadline) {
+        calls += 1;
+        assert.equal(received, deadline);
+        assert.equal(request.consistency.deadlineMs, query.eligibleScope.deadlineMs);
+        throw new ShadowMigrationError("MIGRATION_RETRY_EXHAUSTED");
+      },
+    });
+
+    await assert.rejects(
+      evaluateRetrievalQueries([query], "retrieval-evaluation-v2", service, deadline),
+      (error: unknown) => error instanceof ShadowMigrationError && error.code === "MIGRATION_RETRY_EXHAUSTED",
+    );
+    assert.equal(calls, 1);
+  });
+
   it("hard-disables sealed vectors before any retrieval and accumulates V2 reports", async () => {
     let retrievals = 0;
     assert.throws(

@@ -1,10 +1,12 @@
-import { createHash, randomUUID } from "node:crypto";
+import { createHash } from "node:crypto";
 import { lstatSync, realpathSync } from "node:fs";
 import { dirname, isAbsolute, join, normalize, relative, sep } from "node:path";
 import { types as utilTypes } from "node:util";
 import { ShadowMigrationError, decodeShadowMigrationPolicyV1, shadowMigrationPolicyChecksum } from "../migration/v2-shadow-migration.contracts.js";
+import type { VerifiedV1SourceCopy } from "../migration/v1-source-copy.js";
+import { shadowMigrationPhaseMetadata, type ShadowMigrationInvocationDeadline, type ShadowMigrationReconciliation } from "../migration/v2-shadow-migration-runtime.js";
 import { V2ImportedProjectionEventReader } from "../migration/v2-imported-event-reader.js";
-import { v1ProjectionBaselineChecksum, type ShadowProjectionInput, type ShadowProjectionResult, type V2ShadowProjectionPublisherOptions } from "../migration/v2-shadow-projection.js";
+import { V2ShadowProjectionPublisher, v1ProjectionBaselineChecksum, type ShadowProjectionInput, type ShadowProjectionResult, type V2ShadowProjectionPublisherOptions } from "../migration/v2-shadow-projection.js";
 import { ImmutableProjectionBuilder } from "../projections/builder.js";
 import { DefaultProjectionBuildCoordinator, V2ProjectionBuildCoordinator } from "../projections/coordinator.js";
 import { SqliteProjectionEventReader } from "../projections/event-reader.js";
@@ -18,7 +20,8 @@ import { V2SqliteRetrievalCandidateRepository } from "../retrieval/v2-candidates
 import { InternalRetrievalService, type RankedInternalRetrievalResult } from "../retrieval/service.js";
 import { assertSealedEvaluationVectorDisabled, evaluateSealedRetrieval, parseSealedRetrievalEvaluationBundle, type SealedRetrievalEvaluationCorpusV2, type RetrievalEvaluationQueryV1 } from "../retrieval/evaluation.js";
 import type { InternalRetrievalRequest } from "../retrieval/contracts.js";
-import { SqliteV2ShadowMigrationRepository, type StoredParityReport, type V2ShadowMigrationTransaction } from "../storage/v2-shadow-migration.repository.js";
+import { SqliteV2ShadowMigrationRepository, type StoredExpectedDifferenceRule, type StoredParityReport, type V2ShadowMigrationTransaction } from "../storage/v2-shadow-migration.repository.js";
+import { assertBoundSqliteConnectionIdentity } from "../storage/node-sqlite-driver.js";
 import { decodeExpectedDifferenceRuleV1, type ExpectedDifferenceRuleV1 } from "./v2-expected-difference.js";
 import { PROJECTION_NAMES, type ProjectionName } from "../projections/checksum.js";
 import { canonicalJson } from "../serialization/canonical-json.js";
@@ -101,31 +104,62 @@ function assertOwnJson(value: unknown, ancestors = new Set<object>(), depth = 0)
     for (const item of Object.values(record(value, keys as string[]))) assertOwnJson(item, ancestors, depth + 1);
   } finally { ancestors.delete(value); }
 }
-function verifiedCorpus(input: SnapshotParityInput): SealedRetrievalEvaluationCorpusV2 {
-  const supplied = record(input.sealedRetrieval, ["corpus"]).corpus;
+function checkInvocationDeadline(deadline: ShadowMigrationInvocationDeadline | undefined): number | undefined {
+  if (deadline === undefined) return undefined;
+  const remaining = deadline.remainingMs();
+  if (deadline.signal.aborted || !Number.isSafeInteger(remaining) || remaining < 1) {
+    throw new ShadowMigrationError("MIGRATION_RETRY_EXHAUSTED");
+  }
+  return remaining;
+}
+
+export function authenticateSealedRetrievalSource(
+  supplied: SealedRetrievalEvaluationCorpusV2,
+  source: VerifiedV1SourceCopy,
+  invocationDeadline?: ShadowMigrationInvocationDeadline,
+): SealedRetrievalEvaluationCorpusV2 {
+  checkInvocationDeadline(invocationDeadline);
+  source.assertUnchanged();
+  checkInvocationDeadline(invocationDeadline);
   assertOwnJson(supplied);
   const c = record(supplied, ["bundle", "sources", "queries", "baseline"]);
   const corpus = parseSealedRetrievalEvaluationBundle(c.bundle,
     { schemaVersion: 2, corpusVersion: "retrieval-evaluation-v2", sources: c.sources },
     { schemaVersion: 2, corpusVersion: "retrieval-evaluation-v2", queries: c.queries }, c.baseline);
-  const binding = input.source.projectionSnapshot.binding;
+  checkInvocationDeadline(invocationDeadline);
+  const binding = source.projectionSnapshot.binding;
   const sources = corpus.sources.filter(source => BINDING_FIELDS.every(key => source.binding[key] === binding[key]));
-  if (sources.length !== 1 || sources[0]!.events.length !== input.source.projectionSnapshot.eventCount) failure();
+  if (sources.length !== 1 || sources[0]!.events.length !== source.projectionSnapshot.eventCount) failure();
   let ordinal = 0;
-  for (const event of input.source.projectionSnapshot.events()) {
+  for (const event of source.projectionSnapshot.events()) {
+    checkInvocationDeadline(invocationDeadline);
     const expected = sources[0]!.events[ordinal++];
     // The sealed artifact carries the exact stored envelope, including original
     // payload/witness strings; only the bigint transport fields become decimals.
     const json = Object.fromEntries(Object.entries(event).map(([key, value]) => [key, typeof value === "bigint" ? value.toString() : value]));
     if (!expected || canonicalJson(expected) !== canonicalJson(json)) failure();
+    checkInvocationDeadline(invocationDeadline);
   }
   if (ordinal !== sources[0]!.events.length) failure();
   for (const query of corpus.queries) {
+    checkInvocationDeadline(invocationDeadline);
     const request = queryRequest(query);
     if (BINDING_FIELDS.some(key => request.binding[key] !== binding[key])
-      || request.consistency.requiredEventPosition !== input.source.projectionSnapshot.terminalEventPosition) failure();
+      || request.consistency.requiredEventPosition !== source.projectionSnapshot.terminalEventPosition) failure();
+    checkInvocationDeadline(invocationDeadline);
   }
+  source.assertUnchanged();
+  checkInvocationDeadline(invocationDeadline);
   return corpus;
+}
+
+function verifiedCorpus(input: SnapshotParityInput): SealedRetrievalEvaluationCorpusV2 {
+  const supplied = record(input.sealedRetrieval, ["corpus"]).corpus;
+  return authenticateSealedRetrievalSource(
+    supplied as SealedRetrievalEvaluationCorpusV2,
+    input.source,
+    input.invocationDeadline,
+  );
 }
 function reportBody(input: unknown): Omit<SnapshotParityReportJsonV1, "reportChecksum"> {
   const v = record(input, REPORT_KEYS);
@@ -185,6 +219,7 @@ export interface SnapshotParityInput extends ShadowProjectionInput, Omit<V2Shado
   readonly runStartedAt: string;
   readonly rules: readonly ExpectedDifferenceRuleV1[];
   readonly sealedRetrieval: Readonly<{ corpus: SealedRetrievalEvaluationCorpusV2 }>;
+  readonly faultInjector?: Readonly<{ hit(boundary: "after-report-before-phase4"): void }>;
 }
 const BINDING_FIELDS = ["projectId", "vaultId", "storeId", "workspaceId", "branchScopeId", "branchRef", "sessionId"] as const;
 const ROW_KEYS: Readonly<Record<ProjectionName, readonly string[]>> = {
@@ -218,6 +253,10 @@ function overlaps(left: string, right: string): boolean {
 function verifyTarget(input: SnapshotParityInput): void {
   input.source.assertUnchanged(); input.sealedPackage.assertUnchanged();
   const target = pathIdentity(input.eventStorePath, false);
+  try {
+    assertBoundSqliteConnectionIdentity(input.connection, input.eventStorePath,
+      { device: String(target.dev), inode: String(target.ino) });
+  } catch { failure(); }
   const roots = [input.source.sourceRoot, input.sealedPackage.rootPath, input.liveVaultRoot, dirname(input.liveEventStorePath), input.v1ProjectionDirectory, input.v2ProjectionDirectory];
   for (const root of roots) { pathIdentity(root, true); if (overlaps(root, input.eventStorePath)) failure(); }
   const source = pathIdentity(join(input.source.sourceRoot, input.source.manifest.database.relativePath), false);
@@ -230,6 +269,95 @@ function verifyTarget(input: SnapshotParityInput): void {
     for (const root of roots.slice(0, 4)) if (overlaps(root, directory) || overlaps(directory, root)) failure();
   }
   if (overlaps(input.v1ProjectionDirectory, input.v2ProjectionDirectory) || overlaps(input.v2ProjectionDirectory, input.v1ProjectionDirectory)) failure();
+}
+
+function validateParityRules(
+  input: SnapshotParityInput,
+  policy: ReturnType<typeof decodeShadowMigrationPolicyV1>,
+): readonly ExpectedDifferenceRuleV1[] {
+  const started = Date.parse(input.runStartedAt);
+  if (!Number.isFinite(started) || new Date(started).toISOString() !== input.runStartedAt) failure();
+  const rules = Object.freeze(array(input.rules).map(decodeExpectedDifferenceRuleV1));
+  if (new Set(rules.map(rule => rule.ruleId)).size !== rules.length) {
+    throw new ShadowMigrationError("PARITY_RULE_INVALID");
+  }
+  for (const rule of rules) {
+    if (rule.policyVersion !== policy.expectedDifferencePolicyVersion
+      || rule.rolloutRevisionId !== input.rolloutRevisionId
+      || rule.migrationIdentity !== input.sealedPackage.migrationIdentity
+      || Date.parse(rule.issuedAt) > started
+      || Date.parse(rule.expiresAt) <= started
+      || started - Date.parse(rule.issuedAt) > policy.maxExpectedDifferenceRuleAgeMs) {
+      throw new ShadowMigrationError("PARITY_RULE_INVALID");
+    }
+  }
+  return rules;
+}
+
+function expectedStoredRules(
+  input: SnapshotParityInput,
+  rules: readonly ExpectedDifferenceRuleV1[],
+): readonly StoredExpectedDifferenceRule[] {
+  const projectId = input.source.projectionSnapshot.binding.projectId;
+  return Object.freeze(rules.map(rule => {
+    const { schemaVersion: _, projection, rowIdentityHash, fieldPath, ...governance } = rule;
+    return Object.freeze({ projectId, ...governance, projectionName: projection,
+      selector: Object.freeze({ rowIdentityHash, fieldPath }) });
+  }));
+}
+
+function parityManifestChecksums(input: SnapshotParityInput): readonly [string, string] {
+  return Object.freeze([
+    digest(canonicalJson(input.projections.v1.generation.manifest)),
+    digest(canonicalJson(input.projections.v2.manifest)),
+  ]);
+}
+
+function validatedParityTransaction<T>(
+  input: SnapshotParityInput,
+  policy: ReturnType<typeof decodeShadowMigrationPolicyV1>,
+  callback: (
+    tx: V2ShadowMigrationTransaction,
+    phases: ReturnType<V2ShadowMigrationTransaction["readTransitions"]>,
+    manifestChecksums: readonly [string, string],
+  ) => T,
+): T {
+  checkInvocationDeadline(input.invocationDeadline);
+  verifyTarget(input);
+  checkInvocationDeadline(input.invocationDeadline);
+  const binding = input.source.projectionSnapshot.binding;
+  const packageManifest = input.sealedPackage.manifest;
+  const v1Manifest = input.projections.v1.generation.manifest;
+  const manifestChecksums = parityManifestChecksums(input);
+  const repository = new SqliteV2ShadowMigrationRepository(input.connection);
+  const result = repository.transact(binding.projectId, input.sealedPackage.migrationIdentity, tx => {
+    checkInvocationDeadline(input.invocationDeadline);
+    const run = tx.readRun();
+    const phases = tx.readTransitions();
+    checkInvocationDeadline(input.invocationDeadline);
+    const phase3 = phases[3];
+    const expectedPhase3 = shadowMigrationPhaseMetadata(input.sealedPackage.migrationIdentity, input.source.manifest.createdAt, 3);
+    if (!run || run.rolloutRevisionId !== input.rolloutRevisionId || run.packageChecksum !== packageManifest.packageChecksum
+      || run.sourceManifestChecksum !== input.source.manifest.manifestChecksum || run.sourceManifestChecksum !== packageManifest.sourceManifestChecksum
+      || run.sourceTerminalPosition !== BigInt(packageManifest.terminalEventPosition) || run.sourceTerminalHash !== packageManifest.terminalEventHash
+      || run.configurationChecksum !== packageManifest.configurationChecksum || run.buildIdentityHash !== packageManifest.buildIdentityHash
+      || run.policyChecksum !== shadowMigrationPolicyChecksum(policy) || !phase3 || phase3.phase !== "projection-verified"
+      || phase3.ordinal !== 3 || phase3.priorTransitionHash !== phases[2]?.transitionHash
+      || phase3.attemptId !== expectedPhase3.attemptId || phase3.recordedAt !== expectedPhase3.recordedAt) failure();
+    const revision = input.connection.prepare("SELECT v1_baseline_checksum,build_identity_hash,migration_identity_hash,configuration_checksum FROM rollout_revisions WHERE project_id=$p AND revision_id=$r")
+      .get({ $p: binding.projectId, $r: run.rolloutRevisionId });
+    checkInvocationDeadline(input.invocationDeadline);
+    if (!revision || revision.v1_baseline_checksum !== v1ProjectionBaselineChecksum(v1Manifest)
+      || revision.build_identity_hash !== run.buildIdentityHash || revision.migration_identity_hash !== run.migrationIdentity
+      || revision.configuration_checksum !== run.configurationChecksum
+      || phase3.evidenceDigest !== digest(canonicalJson({ v1ManifestChecksum: manifestChecksums[0], v2ManifestChecksum: manifestChecksums[1], v1BaselineChecksum: revision.v1_baseline_checksum }))) failure();
+    checkInvocationDeadline(input.invocationDeadline);
+    return callback(tx, phases, manifestChecksums);
+  });
+  checkInvocationDeadline(input.invocationDeadline);
+  verifyTarget(input);
+  checkInvocationDeadline(input.invocationDeadline);
+  return result;
 }
 
 /** Each request receives only a metadata facade; the V2 adapter retains its original private-image lease. */
@@ -273,53 +401,168 @@ function retrievalVector(result: RankedInternalRetrievalResult) {
       conflictGroupId: item.conflictGroupId, supersedingItemId: item.supersedingItemId })) };
 }
 
+function reconstructedStoredReport(
+  input: SnapshotParityInput,
+  policy: ReturnType<typeof decodeShadowMigrationPolicyV1>,
+  corpus: SealedRetrievalEvaluationCorpusV2,
+  expectedRules: readonly StoredExpectedDifferenceRule[],
+  stored: StoredParityReport,
+  manifestChecksums: readonly [string, string],
+): SnapshotParityReportV1 {
+  const body = decodeStoredReportBody(stored.report);
+  if (digest(canonicalJson(body)) !== stored.reportChecksum || stored.reportId !== stored.reportChecksum) failure();
+  const report = Object.freeze({
+    ...body,
+    comparedEventPosition: BigInt(body.comparedEventPosition),
+    reportChecksum: stored.reportChecksum,
+  }) as SnapshotParityReportV1;
+  serializeSnapshotParityReport(report);
+  const expectedMetadata = shadowMigrationPhaseMetadata(input.sealedPackage.migrationIdentity, input.source.manifest.createdAt, 4);
+  if (stored.projectId !== input.source.projectionSnapshot.binding.projectId
+    || stored.migrationIdentity !== input.sealedPackage.migrationIdentity
+    || stored.packageChecksum !== input.sealedPackage.manifest.packageChecksum
+    || stored.comparedEventPosition !== input.source.projectionSnapshot.terminalEventPosition
+    || stored.comparedEventHash !== input.source.projectionSnapshot.terminalEventHash
+    || stored.v1ManifestChecksum !== manifestChecksums[0] || stored.v2ManifestChecksum !== manifestChecksums[1]
+    || stored.v1CoreChecksumsDigest !== digest(canonicalJson(input.projections.v1.generation.manifest.coreChecksums))
+    || stored.v2CoreChecksumsDigest !== digest(canonicalJson(input.projections.v2.manifest.coreChecksums))
+    || stored.retrievalVectorChecksum !== report.sealedRetrieval.resultVectorChecksum
+    || stored.equalCount !== report.equalCount || stored.expectedDifferenceCount !== report.expectedDifferenceCount
+    || stored.blockingDivergenceCount !== report.blockingDivergenceCount || stored.recordedAt !== expectedMetadata.recordedAt
+    || report.rolloutRevisionId !== input.rolloutRevisionId || report.migrationIdentity !== input.sealedPackage.migrationIdentity
+    || report.packageChecksum !== input.sealedPackage.manifest.packageChecksum
+    || report.comparedEventPosition !== input.source.projectionSnapshot.terminalEventPosition
+    || report.comparedEventHash !== input.source.projectionSnapshot.terminalEventHash
+    || report.v1ManifestChecksum !== manifestChecksums[0] || report.v2ManifestChecksum !== manifestChecksums[1]
+    || report.comparisonPolicyVersion !== policy.expectedDifferencePolicyVersion
+    || report.matchedRuleIds.some(ruleId => !expectedRules.some(rule => rule.ruleId === ruleId))
+    || report.sealedRetrieval.corpusVersion !== corpus.bundle.corpusVersion
+    || report.sealedRetrieval.queryCount !== corpus.queries.length
+    || report.blockingDivergenceCount !== 0 || report.sealedRetrieval.blockingDivergenceCount !== 0) failure();
+  return report;
+}
+
+function unknownParityProof(code: "MIGRATION_OUTCOME_UNKNOWN" | "MIGRATION_RETRY_EXHAUSTED" = "MIGRATION_OUTCOME_UNKNOWN") {
+  return Object.freeze({ status: "unknown" as const, safeErrorCode: code });
+}
+
+export async function reconcileV1V2Snapshots(
+  input: SnapshotParityInput,
+): Promise<ShadowMigrationReconciliation<SnapshotParityReportV1>> {
+  let readingEvidence = false;
+  try {
+    checkInvocationDeadline(input.invocationDeadline);
+    verifyTarget(input);
+    const policy = decodeShadowMigrationPolicyV1(input.policy);
+    const rules = validateParityRules(input, policy);
+    const corpus = verifiedCorpus(input);
+    checkInvocationDeadline(input.invocationDeadline);
+    const publisher = new V2ShadowProjectionPublisher({
+      driver: input.driver,
+      connection: input.connection,
+      eventStorePath: input.eventStorePath,
+      liveEventStorePath: input.liveEventStorePath,
+      liveVaultRoot: input.liveVaultRoot,
+      v1ProjectionDirectory: input.v1ProjectionDirectory,
+      v2ProjectionDirectory: input.v2ProjectionDirectory,
+      policy: input.policy,
+    });
+    const projections = await publisher.reconcileV2(input);
+    checkInvocationDeadline(input.invocationDeadline);
+    verifyTarget(input);
+    if (projections.status === "unknown") return unknownParityProof(
+      projections.safeErrorCode === "MIGRATION_RETRY_EXHAUSTED" ? "MIGRATION_RETRY_EXHAUSTED" : "MIGRATION_OUTCOME_UNKNOWN",
+    );
+    if (projections.status !== "committed") return unknownParityProof();
+    if (canonicalJson(projections.result) !== canonicalJson(input.projections)) failure();
+    const expectedRules = expectedStoredRules(input, rules);
+    readingEvidence = true;
+    const proof = validatedParityTransaction(input, policy, (tx, phases, manifestChecksums) => {
+      checkInvocationDeadline(input.invocationDeadline);
+      const storedRules = tx.readExpectedDifferenceRules();
+      const storedReport = tx.readParityReport();
+      checkInvocationDeadline(input.invocationDeadline);
+      const phase4 = phases[4];
+      const byRuleId = new Map(expectedRules.map(rule => [rule.ruleId, rule]));
+      for (const storedRule of storedRules) {
+        const expected = byRuleId.get(storedRule.ruleId);
+        if (!expected || canonicalJson(storedRule) !== canonicalJson(expected)) failure();
+      }
+      if (storedRules.length > expectedRules.length) failure();
+      const allAbsent = storedRules.length === 0 && storedReport === null && phase4 === undefined;
+      if (allAbsent) return Object.freeze({ status: "absent" as const });
+      const report = storedReport === null ? undefined
+        : reconstructedStoredReport(input, policy, corpus, expectedRules, storedReport, manifestChecksums);
+      if (phase4 !== undefined) {
+        const metadata = shadowMigrationPhaseMetadata(input.sealedPackage.migrationIdentity, input.source.manifest.createdAt, 4);
+        if (phase4.phase !== "parity-complete" || phase4.ordinal !== 4
+          || phase4.priorTransitionHash !== phases[3]!.transitionHash
+          || phase4.attemptId !== metadata.attemptId || phase4.recordedAt !== metadata.recordedAt
+          || (report !== undefined && phase4.evidenceDigest !== report.reportChecksum)) failure();
+      }
+      if (storedRules.length !== expectedRules.length || report === undefined || phase4 === undefined) return unknownParityProof();
+      return Object.freeze({ status: "committed" as const, result: report });
+    });
+    checkInvocationDeadline(input.invocationDeadline);
+    verifyTarget(input);
+    authenticateSealedRetrievalSource(corpus, input.source, input.invocationDeadline);
+    checkInvocationDeadline(input.invocationDeadline);
+    return proof;
+  } catch (error) {
+    if (error instanceof ShadowMigrationError) {
+      if (error.code === "MIGRATION_RETRY_EXHAUSTED") return unknownParityProof("MIGRATION_RETRY_EXHAUSTED");
+      if (error.code === "MIGRATION_OUTCOME_UNKNOWN") return unknownParityProof();
+      throw new ShadowMigrationError(error.code);
+    }
+    if (readingEvidence) return unknownParityProof();
+    throw new ShadowMigrationError("PROJECTION_INTEGRITY_FAILURE");
+  }
+}
+
 export async function compareV1V2Snapshots(input: SnapshotParityInput): Promise<SnapshotParityReportV1> {
   let v1Lease: ProjectionReaderLease | undefined;
   let bridge: ReturnType<typeof createV2ParityRetrievalBridge> | undefined;
   let failed = false;
+  let mayHaveCommitted = false;
   try {
+    checkInvocationDeadline(input.invocationDeadline);
     verifyTarget(input);
+    checkInvocationDeadline(input.invocationDeadline);
     const policy = decodeShadowMigrationPolicyV1(input.policy);
-    const started = Date.parse(input.runStartedAt);
-    if (!Number.isFinite(started) || new Date(started).toISOString() !== input.runStartedAt) failure();
-    const rules = Object.freeze(array(input.rules).map(decodeExpectedDifferenceRuleV1));
-    if (new Set(rules.map(rule => rule.ruleId)).size !== rules.length) throw new ShadowMigrationError("PARITY_RULE_INVALID");
-    for (const rule of rules) if (rule.policyVersion !== policy.expectedDifferencePolicyVersion
-      || rule.rolloutRevisionId !== input.rolloutRevisionId || rule.migrationIdentity !== input.sealedPackage.migrationIdentity
-      || Date.parse(rule.issuedAt) > started || Date.parse(rule.expiresAt) <= started
-      || started - Date.parse(rule.issuedAt) > policy.maxExpectedDifferenceRuleAgeMs) throw new ShadowMigrationError("PARITY_RULE_INVALID");
+    const rules = validateParityRules(input, policy);
     const corpus = verifiedCorpus(input);
-    const repository = new SqliteV2ShadowMigrationRepository(input.connection);
     const binding = input.source.projectionSnapshot.binding, packageManifest = input.sealedPackage.manifest;
     const v1Manifest = input.projections.v1.generation.manifest, v2Manifest = input.projections.v2.manifest;
-    const manifestChecksums = [digest(canonicalJson(v1Manifest)), digest(canonicalJson(v2Manifest))] as const;
+    const manifestChecksums = parityManifestChecksums(input);
     const transact = <T>(callback: (tx: V2ShadowMigrationTransaction) => T): T => {
-      verifyTarget(input);
-      return repository.transact(binding.projectId, input.sealedPackage.migrationIdentity, tx => {
-        const run = tx.readRun(), phases = tx.readTransitions();
-        if (!run || run.rolloutRevisionId !== input.rolloutRevisionId || run.packageChecksum !== packageManifest.packageChecksum
-          || run.sourceManifestChecksum !== input.source.manifest.manifestChecksum || run.sourceManifestChecksum !== packageManifest.sourceManifestChecksum
-          || run.sourceTerminalPosition !== BigInt(packageManifest.terminalEventPosition) || run.sourceTerminalHash !== packageManifest.terminalEventHash
-          || run.configurationChecksum !== packageManifest.configurationChecksum || run.buildIdentityHash !== packageManifest.buildIdentityHash
-          || run.policyChecksum !== shadowMigrationPolicyChecksum(policy) || phases[3]?.phase !== "projection-verified") failure();
-        const revision = input.connection.prepare("SELECT v1_baseline_checksum,build_identity_hash,migration_identity_hash,configuration_checksum FROM rollout_revisions WHERE project_id=$p AND revision_id=$r")
-          .get({ $p: binding.projectId, $r: run.rolloutRevisionId });
-        if (!revision || revision.v1_baseline_checksum !== v1ProjectionBaselineChecksum(v1Manifest)
-          || revision.build_identity_hash !== run.buildIdentityHash || revision.migration_identity_hash !== run.migrationIdentity
-          || revision.configuration_checksum !== run.configurationChecksum
-          || phases[3].evidenceDigest !== digest(canonicalJson({ v1ManifestChecksum: manifestChecksums[0], v2ManifestChecksum: manifestChecksums[1], v1BaselineChecksum: revision.v1_baseline_checksum }))) failure();
-        return callback(tx);
-      });
+      return validatedParityTransaction(input, policy, callback);
     };
     transact(() => undefined);
+    const nativeRemaining = checkInvocationDeadline(input.invocationDeadline);
+    const busyTimeoutMs = nativeRemaining === undefined ? undefined : Math.min(5000, nativeRemaining);
     const imported = new V2ImportedProjectionEventReader({ driver: input.driver, eventStorePath: input.eventStorePath,
-      sealedPackage: input.sealedPackage, sourceManifest: input.source.manifest });
+      sealedPackage: input.sealedPackage, sourceManifest: input.source.manifest,
+      ...(busyTimeoutMs === undefined ? {} : { busyTimeoutMs }) });
     const committed = await imported.openCommittedSnapshot(binding);
     let left: VerifiedCanonicalProjectionSnapshot, right: VerifiedCanonicalProjectionSnapshot;
+    let snapshotFailure: unknown;
     try {
-      left = readVerifiedCanonicalProjectionSnapshot(binding, v1Manifest, { ...input, projectionDirectory: input.v1ProjectionDirectory, sourceSnapshot: input.source.projectionSnapshot });
-      right = readVerifiedCanonicalProjectionSnapshot(binding, v2Manifest, { ...input, projectionDirectory: input.v2ProjectionDirectory, sourceSnapshot: committed });
-    } finally { committed.close(); }
+      checkInvocationDeadline(input.invocationDeadline);
+      verifyTarget(input);
+      const v1InspectionRemaining = checkInvocationDeadline(input.invocationDeadline);
+      left = readVerifiedCanonicalProjectionSnapshot(binding, v1Manifest, { driver: input.driver, eventStorePath: input.eventStorePath,
+        projectionDirectory: input.v1ProjectionDirectory,
+        sourceSnapshot: input.source.projectionSnapshot,
+        ...(v1InspectionRemaining === undefined ? {} : { busyTimeoutMs: Math.min(5000, v1InspectionRemaining) }) });
+      const v2InspectionRemaining = checkInvocationDeadline(input.invocationDeadline);
+      right = readVerifiedCanonicalProjectionSnapshot(binding, v2Manifest, { driver: input.driver, eventStorePath: input.eventStorePath,
+        projectionDirectory: input.v2ProjectionDirectory, sourceSnapshot: committed,
+        ...(v2InspectionRemaining === undefined ? {} : { busyTimeoutMs: Math.min(5000, v2InspectionRemaining) }) });
+      checkInvocationDeadline(input.invocationDeadline);
+    } catch (error) { snapshotFailure = error; throw error; }
+    finally { try { committed.close(); } catch (error) { if (snapshotFailure === undefined) throw error; } }
+    verifyTarget(input);
+    checkInvocationDeadline(input.invocationDeadline);
     if (left.schemaVersion !== 1 || right.schemaVersion !== 2 || BINDING_FIELDS.some(key => left.binding[key] !== right.binding[key])
       || left.terminalEventPosition !== right.terminalEventPosition || left.terminalEventHash !== right.terminalEventHash
       || String(left.terminalEventPosition) !== packageManifest.terminalEventPosition || left.terminalEventHash !== packageManifest.terminalEventHash) failure();
@@ -342,19 +585,23 @@ export async function compareV1V2Snapshots(input: SnapshotParityInput): Promise<
     };
     const latest = new Map<string, typeof right.rows.sessionCheckpoints[number]>();
     for (const row of right.rows.sessionCheckpoints) {
+      checkInvocationDeadline(input.invocationDeadline);
       const key = String(row.session_id), prior = latest.get(key);
       if (!prior || BigInt(String(row.source_event_position)) > BigInt(String(prior.source_event_position))) latest.set(key, row);
     }
     for (const projection of PROJECTION_NAMES) {
+      checkInvocationDeadline(input.invocationDeadline);
       if (projection === "sessionCheckpoints") continue; // Complete history and lifecycle already matched to authenticated source, independently of the V1 latest-only view.
       const v2Rows = projection === "sessionTree" ? [...latest.values()] : right.rows[projection];
       const l = new Map(left.rows[projection].map(row => [rowIdentityKey(projection, row), row]));
       const r = new Map(v2Rows.map(row => [rowIdentityKey(projection, row), row]));
       for (const key of [...new Set([...l.keys(), ...r.keys()])].sort()) {
+        checkInvocationDeadline(input.invocationDeadline);
         const identityHash = digest("project-memory/v2-parity-row/v1\n" + key);
         const a = l.get(key), b = r.get(key);
         if (!a || !b) { finding(projection, identityHash, "row", parityValueHash(a ? true : undefined), parityValueHash(b ? true : undefined), "identity"); continue; }
         for (const field of [...new Set([...Object.keys(a), ...Object.keys(b)])].sort()) {
+          checkInvocationDeadline(input.invocationDeadline);
           // These V2-only columns were checked against the exact original source event by the integrity reader.
           if (field === "source_event_id" || field === "anchor") continue;
           const metadata = projection === "artifactsFiles" && ["symbol", "commit_hash", "heading"].includes(field);
@@ -370,8 +617,12 @@ export async function compareV1V2Snapshots(input: SnapshotParityInput): Promise<
     const v2Coordinator = new V2ProjectionBuildCoordinator({ eventReader: imported,
       builder: new ImmutableProjectionBuilder({ driver: input.driver, projectionDirectory: input.v2ProjectionDirectory }), projectionDirectory: input.v2ProjectionDirectory });
     v1Lease = await v1Coordinator.leasePublished(binding);
+    checkInvocationDeadline(input.invocationDeadline);
+    verifyTarget(input);
     const original = await v2Coordinator.leasePublishedForEvaluation(binding);
     bridge = createV2ParityRetrievalBridge(original);
+    checkInvocationDeadline(input.invocationDeadline);
+    verifyTarget(input);
     if (canonicalJson(v1Lease.manifest) !== canonicalJson(v1Manifest) || canonicalJson(original.manifest) !== canonicalJson(v2Manifest)) failure();
     const retainedV1 = v1Lease;
     const v1Service = new InternalRetrievalService({ projections: { async pin(requestBinding) {
@@ -379,15 +630,27 @@ export async function compareV1V2Snapshots(input: SnapshotParityInput): Promise<
       return Object.freeze({ manifest: retainedV1.manifest, databasePath: retainedV1.databasePath, close() {} });
     } }, candidates: new SqliteRetrievalCandidateRepository() });
     let v1ThresholdsPassed = false, v2ThresholdsPassed = false;
-    try { await evaluateSealedRetrieval(corpus, v1Service); v1ThresholdsPassed = true; } catch { /* recorded below without raw diagnostics */ }
-    try { await evaluateSealedRetrieval(corpus, bridge.service); v2ThresholdsPassed = true; } catch { /* recorded below without raw diagnostics */ }
+    try { await evaluateSealedRetrieval(corpus, v1Service, input.invocationDeadline); v1ThresholdsPassed = true; }
+    catch (error) { if (error instanceof ShadowMigrationError && error.code === "MIGRATION_RETRY_EXHAUSTED") throw error; }
+    checkInvocationDeadline(input.invocationDeadline);
+    verifyTarget(input);
+    try { await evaluateSealedRetrieval(corpus, bridge.service, input.invocationDeadline); v2ThresholdsPassed = true; }
+    catch (error) { if (error instanceof ShadowMigrationError && error.code === "MIGRATION_RETRY_EXHAUSTED") throw error; }
+    checkInvocationDeadline(input.invocationDeadline);
+    verifyTarget(input);
     const vectors: unknown[] = [];
     for (const query of corpus.queries) {
+      checkInvocationDeadline(input.invocationDeadline);
       const request = queryRequest(query), id = digest(query.queryId);
       if (BINDING_FIELDS.some(key => request.binding[key] !== binding[key]) || request.consistency.requiredEventPosition !== left.terminalEventPosition) failure();
       let a: RankedInternalRetrievalResult | undefined, b: RankedInternalRetrievalResult | undefined;
-      try { a = await v1Service.retrieve(request); } catch { /* safe failure vector */ }
-      try { b = await bridge.service.retrieve(request); } catch { /* safe failure vector */ }
+      try { a = await v1Service.retrieve(request, input.invocationDeadline); }
+      catch (error) { if (error instanceof ShadowMigrationError && error.code === "MIGRATION_RETRY_EXHAUSTED") throw error; }
+      checkInvocationDeadline(input.invocationDeadline);
+      try { b = await bridge.service.retrieve(request, input.invocationDeadline); }
+      catch (error) { if (error instanceof ShadowMigrationError && error.code === "MIGRATION_RETRY_EXHAUSTED") throw error; }
+      checkInvocationDeadline(input.invocationDeadline);
+      verifyTarget(input);
       const av = a ? retrievalVector(a) : null, bv = b ? retrievalVector(b) : null;
       const ah = digest(canonicalJson(av)), bh = digest(canonicalJson(bv));
       const classification = finding("canonicalItems", id, "retrieval-result", ah, bh, "authority");
@@ -409,17 +672,21 @@ export async function compareV1V2Snapshots(input: SnapshotParityInput): Promise<
         ...retrievalCounts, resultVectorChecksum: digest(canonicalJson(vectors)) }) });
     const report = Object.freeze({ ...body, reportChecksum: snapshotParityReportChecksum(body) });
     const { reportChecksum, ...jsonBody } = serializeSnapshotParityReport(report);
-    transact(tx => tx.insertExpectedDifferenceRules(rules.map(rule => {
-      const { schemaVersion: _, projection, rowIdentityHash, fieldPath, ...governance } = rule;
-      return { projectId: binding.projectId, ...governance, projectionName: projection, selector: { rowIdentityHash, fieldPath } };
-    })));
+    const phase4Metadata = shadowMigrationPhaseMetadata(report.migrationIdentity, input.source.manifest.createdAt, 4);
+    checkInvocationDeadline(input.invocationDeadline);
+    verifyTarget(input);
+    mayHaveCommitted = true;
+    transact(tx => tx.insertExpectedDifferenceRules(expectedStoredRules(input, rules)));
+    checkInvocationDeadline(input.invocationDeadline);
     const stored: StoredParityReport = { projectId: binding.projectId, migrationIdentity: report.migrationIdentity, reportId: reportChecksum,
       packageChecksum: report.packageChecksum, comparedEventPosition: report.comparedEventPosition, comparedEventHash: report.comparedEventHash,
       v1ManifestChecksum: report.v1ManifestChecksum, v2ManifestChecksum: report.v2ManifestChecksum,
       v1CoreChecksumsDigest: report.v1CoreChecksumsDigest, v2CoreChecksumsDigest: report.v2CoreChecksumsDigest,
       retrievalVectorChecksum: report.sealedRetrieval.resultVectorChecksum, equalCount: report.equalCount,
       expectedDifferenceCount: report.expectedDifferenceCount, blockingDivergenceCount: report.blockingDivergenceCount,
-      report: jsonBody, reportChecksum, recordedAt: input.runStartedAt };
+      report: jsonBody, reportChecksum, recordedAt: phase4Metadata.recordedAt };
+    checkInvocationDeadline(input.invocationDeadline);
+    verifyTarget(input);
     transact(tx => {
       const existing = tx.readParityReport();
       if (existing) {
@@ -431,18 +698,36 @@ export async function compareV1V2Snapshots(input: SnapshotParityInput): Promise<
         }
       } else tx.insertParityReport(stored);
     });
+    checkInvocationDeadline(input.invocationDeadline);
+    verifyTarget(input);
+    input.faultInjector?.hit("after-report-before-phase4");
+    checkInvocationDeadline(input.invocationDeadline);
     if (report.blockingDivergenceCount || report.sealedRetrieval.blockingDivergenceCount) throw new ShadowMigrationError("PARITY_BLOCKING_DIVERGENCE");
+    verifyTarget(input);
     transact(tx => {
       const phases = tx.readTransitions();
-      if (phases[4]) { if (phases[4].phase !== "parity-complete" || phases[4].evidenceDigest !== reportChecksum) failure(); return; }
+      if (phases[4]) {
+        if (phases[4].phase !== "parity-complete" || phases[4].ordinal !== 4
+          || phases[4].priorTransitionHash !== phases[3]!.transitionHash
+          || phases[4].evidenceDigest !== reportChecksum || phases[4].attemptId !== phase4Metadata.attemptId
+          || phases[4].recordedAt !== phase4Metadata.recordedAt) failure();
+        return;
+      }
       const transition = { projectId: binding.projectId, migrationIdentity: report.migrationIdentity, ordinal: 4,
-        attemptId: randomUUID(), phase: "parity-complete" as const, priorTransitionHash: phases[3]!.transitionHash, evidenceDigest: reportChecksum, recordedAt: input.runStartedAt };
+        attemptId: phase4Metadata.attemptId, phase: "parity-complete" as const, priorTransitionHash: phases[3]!.transitionHash,
+        evidenceDigest: reportChecksum, recordedAt: phase4Metadata.recordedAt };
       tx.appendTransition({ ...transition, transitionHash: digest("project-memory/v2-shadow-migration-transition/v1\n" + canonicalJson(transition)) });
     });
+    checkInvocationDeadline(input.invocationDeadline);
+    verifyTarget(input);
     return report;
   } catch (error) {
     failed = true;
-    if (error instanceof ShadowMigrationError) throw new ShadowMigrationError(error.code);
+    if (error instanceof ShadowMigrationError) {
+      if (mayHaveCommitted && error.code === "MIGRATION_RETRY_EXHAUSTED") throw new ShadowMigrationError("MIGRATION_OUTCOME_UNKNOWN");
+      throw new ShadowMigrationError(error.code);
+    }
+    if (mayHaveCommitted) throw new ShadowMigrationError("MIGRATION_OUTCOME_UNKNOWN");
     throw new ShadowMigrationError("PROJECTION_INTEGRITY_FAILURE");
   } finally {
     let closeFailed = false;
@@ -450,6 +735,10 @@ export async function compareV1V2Snapshots(input: SnapshotParityInput): Promise<
     try { v1Lease?.close(); } catch { closeFailed = true; }
     // Attempt every owned close, preserve an existing typed failure, and never
     // expose raw storage/lease diagnostics from an otherwise successful operation.
-    if (closeFailed && !failed) throw new ShadowMigrationError("PROJECTION_INTEGRITY_FAILURE");
+    if (closeFailed && !failed) throw new ShadowMigrationError(mayHaveCommitted ? "MIGRATION_OUTCOME_UNKNOWN" : "PROJECTION_INTEGRITY_FAILURE");
+    if (!failed && !closeFailed) {
+      try { checkInvocationDeadline(input.invocationDeadline); }
+      catch { throw new ShadowMigrationError(mayHaveCommitted ? "MIGRATION_OUTCOME_UNKNOWN" : "MIGRATION_RETRY_EXHAUSTED"); }
+    }
   }
 }

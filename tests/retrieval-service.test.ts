@@ -34,6 +34,8 @@ import {
   type RetrievalRanker,
 } from "../src/orchestrator/retrieval/ranking.js";
 import { InternalRetrievalService } from "../src/orchestrator/retrieval/service.js";
+import { ShadowMigrationError } from "../src/orchestrator/migration/v2-shadow-migration.contracts.js";
+import type { ShadowMigrationInvocationDeadline } from "../src/orchestrator/migration/v2-shadow-migration-runtime.js";
 
 const PROJECT_ID = "1".repeat(64) as ProjectId;
 const OTHER_PROJECT_ID = "9".repeat(64) as ProjectId;
@@ -212,6 +214,61 @@ function serviceWith(
 }
 
 describe("internal retrieval service", () => {
+  it("settles a pending pin, narrows its timeout, closes once, and preserves deadline over close failure", async () => {
+    let releasePin!: (lease: ProjectionReaderLease) => void;
+    const pending = new Promise<ProjectionReaderLease>((resolve) => { releasePin = resolve; });
+    let closed = 0;
+    let pinDeadline: number | undefined;
+    let checks = 0;
+    const deadline: ShadowMigrationInvocationDeadline = {
+      signal: new AbortController().signal,
+      remainingMs() {
+        checks += 1;
+        if (checks > 1) throw new ShadowMigrationError("MIGRATION_RETRY_EXHAUSTED");
+        return 25;
+      },
+    };
+    const service = new InternalRetrievalService({
+      projections: {
+        async pin(_binding, consistency) {
+          pinDeadline = consistency?.deadlineMs;
+          return pending;
+        },
+      },
+      candidates: staticRepository([]),
+    });
+
+    const retrieval = service.retrieve(request({ consistency: { requiredEventPosition: 12n, deadlineMs: 100 } }), deadline);
+    await Promise.resolve();
+    assert.equal(pinDeadline, 25);
+    releasePin(createLease(() => { closed += 1; throw new Error("secondary-close-failure"); }));
+    await assert.rejects(retrieval, (error: unknown) => (
+      error instanceof ShadowMigrationError && error.code === "MIGRATION_RETRY_EXHAUSTED"
+    ));
+    assert.equal(closed, 1);
+  });
+
+  it("preserves a typed migration timeout raised by the vector channel", async () => {
+    let closed = 0;
+    const service = new InternalRetrievalService({
+      projections: { async pin() { return createLease(() => { closed += 1; }); } },
+      candidates: staticRepository([]),
+      vectorChannel: {
+        async search() {
+          throw new ShadowMigrationError("MIGRATION_RETRY_EXHAUSTED");
+        },
+      },
+    });
+
+    await assert.rejects(
+      service.retrieve(request({ vector: Object.freeze({ enabled: true }) })),
+      (error: unknown) => (
+        error instanceof ShadowMigrationError && error.code === "MIGRATION_RETRY_EXHAUSTED"
+      ),
+    );
+    assert.equal(closed, 1);
+  });
+
   it("applies shared result bounds after a custom ranker reorders exact fused references", async () => {
     const first = staticItem("00000000-0000-4000-8000-000000000528");
     const second = staticItem("00000000-0000-4000-8000-000000000529");

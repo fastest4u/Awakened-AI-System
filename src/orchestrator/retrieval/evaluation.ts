@@ -1,6 +1,8 @@
 import { createHash } from "node:crypto";
 import { types as utilTypes } from "node:util";
 import { decodeLifecycleIntentWitness } from "../lifecycle/lifecycle-intent-witness.js";
+import { ShadowMigrationError } from "../migration/v2-shadow-migration.contracts.js";
+import type { ShadowMigrationInvocationDeadline } from "../migration/v2-shadow-migration-runtime.js";
 
 import type {
   BranchScopeId,
@@ -990,11 +992,25 @@ function outcomeFor(
 async function evaluateOne(
   query: RetrievalEvaluationQueryV1,
   service: RetrievalEvaluationService,
+  invocationDeadline?: ShadowMigrationInvocationDeadline,
 ): Promise<RetrievalEvaluationOutcome> {
+  checkInvocationDeadline(invocationDeadline);
   try {
-    return outcomeFor(query, await service.retrieve(requestFor(query)));
-  } catch {
+    const result = await service.retrieve(requestFor(query), invocationDeadline);
+    checkInvocationDeadline(invocationDeadline);
+    return outcomeFor(query, result);
+  } catch (error) {
+    if (error instanceof ShadowMigrationError && error.code === "MIGRATION_RETRY_EXHAUSTED") throw error;
+    checkInvocationDeadline(invocationDeadline);
     return outcomeFor(query, null);
+  }
+}
+
+function checkInvocationDeadline(deadline: ShadowMigrationInvocationDeadline | undefined): void {
+  if (deadline === undefined) return;
+  const remaining = deadline.remainingMs();
+  if (deadline.signal.aborted || !Number.isSafeInteger(remaining) || remaining < 1) {
+    throw new ShadowMigrationError("MIGRATION_RETRY_EXHAUSTED");
   }
 }
 
@@ -1018,13 +1034,19 @@ export async function evaluateRetrievalQueries(
   queries: readonly RetrievalEvaluationQueryV1[],
   corpusVersion: RetrievalEvaluationCorpusVersion,
   service: RetrievalEvaluationService,
+  invocationDeadline?: ShadowMigrationInvocationDeadline,
 ): Promise<RetrievalEvaluationReport> {
+  checkInvocationDeadline(invocationDeadline);
   if (
     corpusVersion !== "retrieval-evaluation-v1"
     && corpusVersion !== "retrieval-evaluation-v2"
   ) return invalid();
   const outcomes: RetrievalEvaluationOutcome[] = [];
-  for (const query of queries) outcomes.push(await evaluateOne(query, service));
+  for (const query of queries) {
+    checkInvocationDeadline(invocationDeadline);
+    outcomes.push(await evaluateOne(query, service, invocationDeadline));
+    checkInvocationDeadline(invocationDeadline);
+  }
   const returnedCitationCount = sum(outcomes, (outcome) => outcome.returnedCitationCount);
   const expectedCitationCount = sum(outcomes, (outcome) => outcome.expectedCitationCount);
   const returnedItemCount = sum(outcomes, (outcome) => outcome.returnedItemCount);
@@ -1042,7 +1064,7 @@ export async function evaluateRetrievalQueries(
       queries.filter((query) => query.criticalClass === criticalClass).length,
     ]),
   )) as Readonly<Record<RetrievalEvaluationCriticalClass, number>>;
-  return Object.freeze({
+  const report = Object.freeze({
     corpusVersion,
     queryCount: outcomes.length,
     failedQueryCount: outcomes.filter((outcome) => outcome.failed).length,
@@ -1086,14 +1108,19 @@ export async function evaluateRetrievalQueries(
       (outcome) => outcome.unsupportedHighImpactVerifiedClaims,
     ),
   });
+  checkInvocationDeadline(invocationDeadline);
+  return report;
 }
 
 export async function evaluateRetrieval(
   corpus: RetrievalEvaluationCorpusV1,
   service: RetrievalEvaluationService,
+  invocationDeadline?: ShadowMigrationInvocationDeadline,
 ): Promise<RetrievalEvaluationReport> {
+  checkInvocationDeadline(invocationDeadline);
   const validated = parseRetrievalEvaluationCorpus(corpus);
-  return evaluateRetrievalQueries(validated.queries, "retrieval-evaluation-v1", service);
+  checkInvocationDeadline(invocationDeadline);
+  return evaluateRetrievalQueries(validated.queries, "retrieval-evaluation-v1", service, invocationDeadline);
 }
 
 /** Pure sealed aggregate gate shared by the evaluator and its valid-report tests. */
@@ -1137,12 +1164,17 @@ export function assertSealedRetrievalThresholds(
 export async function evaluateSealedRetrieval(
   corpus: SealedRetrievalEvaluationCorpusV2,
   service: RetrievalEvaluationService,
+  invocationDeadline?: ShadowMigrationInvocationDeadline,
 ): Promise<RetrievalEvaluationReport> {
+  checkInvocationDeadline(invocationDeadline);
   const report = await evaluateRetrievalQueries(
     corpus.queries,
     "retrieval-evaluation-v2",
     service,
+    invocationDeadline,
   );
+  checkInvocationDeadline(invocationDeadline);
   assertSealedRetrievalThresholds(report, corpus.baseline.metrics);
+  checkInvocationDeadline(invocationDeadline);
   return report;
 }

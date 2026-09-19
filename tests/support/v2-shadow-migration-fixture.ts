@@ -314,11 +314,11 @@ export async function createSnapshotParityFixture(t: TestContext, options: { art
   cleanup = () => { try { sealedPackage.close(); } finally { source.close(); } };
   const eventStorePath = join(f.root, "target.sqlite"), v1ProjectionDirectory = join(f.root, "v1"), v2ProjectionDirectory = join(f.root, "v2");
   mkdirSync(v1ProjectionDirectory); mkdirSync(v2ProjectionDirectory);
-  const connection = f.driver.open(eventStorePath, { mode: "create", busyTimeoutMs: 5000 });
+  let connection = f.driver.open(eventStorePath, { mode: "create", busyTimeoutMs: 5000 });
   cleanup = () => { try { connection.close(); } finally { try { sealedPackage.close(); } finally { source.close(); } } };
   applyCurrentProjectStoreSchema(connection, f.projectionBinding, f.manifest.createdAt);
   connection.exec(v2ShadowMigration.sql);
-  const repository = new SqliteV2ShadowMigrationRepository(connection);
+  let repository = new SqliteV2ShadowMigrationRepository(connection);
   const publisherOptions = { driver: f.driver, connection, eventStorePath, liveEventStorePath: f.liveEventStorePath,
     liveVaultRoot: f.liveVaultRoot, v1ProjectionDirectory, v2ProjectionDirectory, policy: f.policy };
   const publisher = new V2ShadowProjectionPublisher(publisherOptions);
@@ -355,6 +355,10 @@ export async function createSnapshotParityFixture(t: TestContext, options: { art
     tx.appendTransition({ ...body, transitionHash: digest("project-memory/v2-shadow-migration-transition/v1\n" + canonicalJson(body)) });
   });
   const projections = await publisher.publishV2({ source, sealedPackage, preparedV1, rolloutRevisionId });
+  connection.close();
+  connection = f.driver.open(eventStorePath, { mode: "existing", busyTimeoutMs: 5000, bindFileIdentity: true });
+  repository = new SqliteV2ShadowMigrationRepository(connection);
+  publisherOptions.connection = connection;
   const rawJudgments = JSON.parse(readFileSync(new URL("../../../tests/fixtures/retrieval-evaluation/v2/judgments.json", import.meta.url), "utf8")) as { queries: RetrievalEvaluationQueryV1[] };
   const seen = new Set<string>();
   const chosen = rawJudgments.queries.filter(q => {
