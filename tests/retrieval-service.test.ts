@@ -269,6 +269,40 @@ describe("internal retrieval service", () => {
     assert.equal(closed, 1);
   });
 
+  it("resamples the shared deadline immediately before optional vector work", async () => {
+    let checks = 0;
+    let observedVectorDeadline: number | undefined;
+    const deadline: ShadowMigrationInvocationDeadline = {
+      signal: new AbortController().signal,
+      remainingMs() {
+        checks += 1;
+        return checks < 6 ? 100 : 7;
+      },
+    };
+    const service = new InternalRetrievalService({
+      projections: { async pin() { return createLease(() => undefined); } },
+      candidates: staticRepository([]),
+      vectorChannel: {
+        async search(vectorRequest) {
+          observedVectorDeadline = vectorRequest.consistency.deadlineMs;
+          return Object.freeze({
+            used: false,
+            failureCode: null,
+            candidates: Object.freeze([]),
+            manifest: null,
+          });
+        },
+      },
+    });
+
+    await service.retrieve(request({
+      consistency: { requiredEventPosition: 12n, deadlineMs: 100 },
+      vector: Object.freeze({ enabled: true }),
+    }), deadline);
+
+    assert.equal(observedVectorDeadline, 7);
+  });
+
   it("applies shared result bounds after a custom ranker reorders exact fused references", async () => {
     const first = staticItem("00000000-0000-4000-8000-000000000528");
     const second = staticItem("00000000-0000-4000-8000-000000000529");

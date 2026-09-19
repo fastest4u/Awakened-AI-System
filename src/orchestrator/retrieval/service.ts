@@ -434,17 +434,24 @@ async function searchOptionalVectorChannel(
   lease: Parameters<VectorCandidateChannel["search"]>[1],
   invocationDeadline?: ShadowMigrationInvocationDeadline,
 ): Promise<VectorChannelDiagnostic> {
-  checkInvocationDeadline(invocationDeadline);
+  const remaining = checkInvocationDeadline(invocationDeadline);
   if (!request.vector.enabled || channel === undefined) {
     return vectorDiagnostic(disabledVectorChannel(), request);
   }
+  const vectorRequest = remaining === undefined ? request : Object.freeze({
+    ...request,
+    consistency: Object.freeze({
+      ...request.consistency,
+      deadlineMs: Math.min(request.consistency.deadlineMs, remaining),
+    }),
+  });
   let diagnostic: VectorChannelDiagnostic;
   try {
     const result = await withVectorDeadline(
-      request.consistency.deadlineMs,
-      (signal) => channel.search(request, lease, signal),
+      vectorRequest.consistency.deadlineMs,
+      (signal) => channel.search(vectorRequest, lease, signal),
     );
-    diagnostic = vectorDiagnostic(result, request);
+    diagnostic = vectorDiagnostic(result, vectorRequest);
   } catch (error) {
     if (error instanceof ShadowMigrationError && error.code === "MIGRATION_RETRY_EXHAUSTED") {
       throw error;

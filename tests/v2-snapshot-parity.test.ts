@@ -15,7 +15,7 @@ import { InternalRetrievalService } from "../src/orchestrator/retrieval/service.
 import { V2SqliteRetrievalCandidateRepository } from "../src/orchestrator/retrieval/v2-candidates.js";
 import { V2ProjectionBuildCoordinator } from "../src/orchestrator/projections/coordinator.js";
 import type { V2ProjectionReaderLease } from "../src/orchestrator/projections/v2-reader-lease.js";
-import { SqliteV2ShadowMigrationRepository } from "../src/orchestrator/storage/v2-shadow-migration.repository.js";
+import { SqliteV2ShadowMigrationRepository, type StoredExpectedDifferenceRule, type V2ShadowMigrationTransaction } from "../src/orchestrator/storage/v2-shadow-migration.repository.js";
 import { parseSealedRetrievalEvaluationBundle, type RetrievalEvaluationQueryV1, type SealedRetrievalEvaluationCorpusV2 } from "../src/orchestrator/retrieval/evaluation.js";
 
 function approvedRule(): ExpectedDifferenceRuleV1 {
@@ -66,6 +66,125 @@ function reportBody(): Omit<SnapshotParityReportV1, "reportChecksum"> {
       blockingDivergenceCount: 0, resultVectorChecksum: "2".repeat(64) } };
 }
 
+function replaceProductionParityReport(
+  fixture: Awaited<ReturnType<typeof createSnapshotParityFixture>>,
+  report: Omit<SnapshotParityReportV1, "reportChecksum">,
+): void {
+  const reportChecksum = snapshotParityReportChecksum(report);
+  const storedJson = serializeSnapshotParityReport({ ...report, reportChecksum });
+  const { reportChecksum: _checksum, ...storedBody } = storedJson;
+  const phase4 = fixture.repository.transact(
+    fixture.projectionBinding.projectId,
+    fixture.sealedPackage.migrationIdentity,
+    tx => tx.readTransitions()[4]!,
+  );
+  const { transitionHash: _transitionHash, ...phaseBody } = phase4;
+  const rewrittenPhase = { ...phaseBody, evidenceDigest: reportChecksum };
+  const transitionHash = createHash("sha256")
+    .update("project-memory/v2-shadow-migration-transition/v1\n" + canonicalJson(rewrittenPhase))
+    .digest("hex");
+  const reportTrigger = fixture.connection.prepare(
+    "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='v2_shadow_parity_reports_no_update'",
+  ).get()!;
+  const phaseTrigger = fixture.connection.prepare(
+    "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='v2_shadow_migration_transitions_no_update'",
+  ).get()!;
+  fixture.connection.exec("DROP TRIGGER v2_shadow_parity_reports_no_update");
+  fixture.connection.exec("DROP TRIGGER v2_shadow_migration_transitions_no_update");
+  try {
+    fixture.connection.prepare(`
+      UPDATE v2_shadow_parity_reports
+      SET report_id=$checksum, report_json=$report, report_checksum=$checksum
+      WHERE project_id=$project AND migration_identity=$migration
+    `).run({
+      $checksum: reportChecksum,
+      $report: canonicalJson(storedBody),
+      $project: fixture.projectionBinding.projectId,
+      $migration: fixture.sealedPackage.migrationIdentity,
+    });
+    fixture.connection.prepare(`
+      UPDATE v2_shadow_migration_transitions
+      SET evidence_digest=$evidence, transition_hash=$transition
+      WHERE project_id=$project AND migration_identity=$migration AND ordinal=4
+    `).run({
+      $evidence: reportChecksum,
+      $transition: transitionHash,
+      $project: fixture.projectionBinding.projectId,
+      $migration: fixture.sealedPackage.migrationIdentity,
+    });
+  } finally {
+    fixture.connection.exec(String(reportTrigger.sql));
+    fixture.connection.exec(String(phaseTrigger.sql));
+  }
+}
+
+async function reconcileReadOnly(
+  connection: SqliteConnection,
+  input: Parameters<typeof reconcileV1V2Snapshots>[0],
+): ReturnType<typeof reconcileV1V2Snapshots> {
+  const retrieve = InternalRetrievalService.prototype.retrieve;
+  let retrievals = 0;
+  const changesBefore = connection.prepare("SELECT total_changes() AS count").get()!.count;
+  InternalRetrievalService.prototype.retrieve = async function (...args) {
+    retrievals += 1;
+    return retrieve.apply(this, args);
+  };
+  try {
+    return await reconcileV1V2Snapshots(input);
+  } finally {
+    InternalRetrievalService.prototype.retrieve = retrieve;
+    assert.equal(retrievals, 0);
+    assert.equal(connection.prepare("SELECT total_changes() AS count").get()!.count, changesBefore);
+  }
+}
+
+function storedRule(
+  fixture: Awaited<ReturnType<typeof createSnapshotParityFixture>>,
+  rule: ExpectedDifferenceRuleV1,
+): StoredExpectedDifferenceRule {
+  const { schemaVersion: _, projection, rowIdentityHash, fieldPath, ...governance } = rule;
+  return Object.freeze({
+    projectId: fixture.projectionBinding.projectId,
+    ...governance,
+    projectionName: projection,
+    selector: Object.freeze({ rowIdentityHash, fieldPath }),
+  });
+}
+
+function appendProductionPhase4(
+  fixture: Awaited<ReturnType<typeof createSnapshotParityFixture>>,
+  override: Readonly<{ attemptId?: string; recordedAt?: string }> = {},
+): void {
+  fixture.repository.transact(
+    fixture.projectionBinding.projectId,
+    fixture.sealedPackage.migrationIdentity,
+    tx => {
+      const phases = tx.readTransitions();
+      const metadata = shadowMigrationPhaseMetadata(
+        fixture.sealedPackage.migrationIdentity,
+        fixture.manifest.createdAt,
+        4,
+      );
+      const transition = {
+        projectId: fixture.projectionBinding.projectId,
+        migrationIdentity: fixture.sealedPackage.migrationIdentity,
+        ordinal: 4,
+        attemptId: override.attemptId ?? metadata.attemptId,
+        phase: "parity-complete" as const,
+        priorTransitionHash: phases[3]!.transitionHash,
+        evidenceDigest: createHash("sha256").update("partial-parity-evidence").digest("hex"),
+        recordedAt: override.recordedAt ?? metadata.recordedAt,
+      };
+      tx.appendTransition({
+        ...transition,
+        transitionHash: createHash("sha256")
+          .update("project-memory/v2-shadow-migration-transition/v1\n" + canonicalJson(transition))
+          .digest("hex"),
+      });
+    },
+  );
+}
+
 test("authenticates the complete sealed retrieval source without slicing its queries", async t => {
   const fixture = await createSnapshotParityFixture(t);
   const authenticated = authenticateSealedRetrievalSource(fixture.corpus, fixture.input.source);
@@ -102,6 +221,76 @@ test("authenticates the complete sealed retrieval source without slicing its que
     },
   }, ...fixture.corpus.queries.slice(1)]);
   assert.throws(() => authenticateSealedRetrievalSource(queryRebound, fixture.input.source));
+});
+
+test("expires cooperatively while recursively validating the supplied sealed corpus", async t => {
+  const fixture = await createSnapshotParityFixture(t);
+  let armed = false;
+  let armedChecks = 0;
+  const source = {
+    ...fixture.input.source,
+    assertUnchanged() {
+      fixture.input.source.assertUnchanged();
+      armed = true;
+    },
+  } as typeof fixture.input.source;
+  const deadline = {
+    signal: new AbortController().signal,
+    remainingMs() {
+      if (armed && ++armedChecks > 1) throw new ShadowMigrationError("MIGRATION_RETRY_EXHAUSTED");
+      return 1000;
+    },
+  };
+  const last = fixture.corpus.queries.at(-1)!;
+  const invalidLateCorpus = {
+    ...fixture.corpus,
+    queries: [...fixture.corpus.queries.slice(0, -1), { ...last, queryId: "" }],
+  } as typeof fixture.corpus;
+  const changesBefore = fixture.connection.prepare("SELECT total_changes() AS count").get()!.count;
+
+  assert.throws(
+    () => authenticateSealedRetrievalSource(invalidLateCorpus, source, deadline),
+    (error: unknown) => error instanceof ShadowMigrationError
+      && error.code === "MIGRATION_RETRY_EXHAUSTED",
+  );
+  assert.equal(fixture.connection.prepare("SELECT total_changes() AS count").get()!.count, changesBefore);
+});
+
+test("expires cooperatively while decoding and validating expected-difference rules", async t => {
+  const fixture = await createSnapshotParityFixture(t, { artifactMetadata: true });
+  let armed = false;
+  let armedChecks = 0;
+  const source = {
+    ...fixture.input.source,
+    assertUnchanged() {
+      fixture.input.source.assertUnchanged();
+      armed = true;
+    },
+  } as typeof fixture.input.source;
+  const deadline = {
+    signal: new AbortController().signal,
+    remainingMs() {
+      if (armed && ++armedChecks > 1) throw new ShadowMigrationError("MIGRATION_RETRY_EXHAUSTED");
+      return 1000;
+    },
+  };
+  const valid = fixture.metadataRules[0]!;
+  const invalidLate = { ...valid, ruleChecksum: "0".repeat(64) };
+  const changesBefore = fixture.connection.prepare("SELECT total_changes() AS count").get()!.count;
+
+  await assert.rejects(
+    compareV1V2Snapshots({
+      ...fixture.input,
+      source,
+      rules: [valid, invalidLate],
+      invocationDeadline: deadline,
+    }),
+    (error: unknown) => error instanceof ShadowMigrationError
+      && error.code === "MIGRATION_RETRY_EXHAUSTED",
+  );
+  assert.equal(fixture.connection.prepare("SELECT total_changes() AS count").get()!.count, changesBefore);
+  assert.equal(fixture.storedReport(), null);
+  assert.equal(fixture.phases().at(-1), "projection-verified");
 });
 
 test("reconciles absent, report-only unknown, fresh adoption, and deterministic committed parity read-only", async t => {
@@ -157,13 +346,13 @@ test("reconciles absent, report-only unknown, fresh adoption, and deterministic 
   );
   assert.ok(fixture.storedReport());
   assert.equal(fixture.phases().at(-1), "projection-verified");
-  assert.deepEqual(await reconcileV1V2Snapshots(fixture.input), {
+  assert.deepEqual(await reconcileReadOnly(fixture.connection, fixture.input), {
     status: "unknown",
     safeErrorCode: "MIGRATION_OUTCOME_UNKNOWN",
   });
 
   const adopted = await compareV1V2Snapshots({ ...fixture.input, runStartedAt: "2026-09-10T13:00:00.000Z" });
-  const committed = await reconcileV1V2Snapshots(fixture.input);
+  const committed = await reconcileReadOnly(fixture.connection, fixture.input);
   assert.equal(committed.status, "committed");
   if (committed.status !== "committed") throw new Error("unreachable");
   assert.deepEqual(committed.result, adopted);
@@ -181,8 +370,128 @@ test("reconciles absent, report-only unknown, fresh adoption, and deterministic 
     fixture.connection.prepare("UPDATE v2_shadow_migration_transitions SET attempt_id=$a WHERE ordinal=4")
       .run({ $a: "00000000-0000-4000-8000-000000000004" });
   } finally { fixture.connection.exec(String(trigger.sql)); }
-  await assert.rejects(reconcileV1V2Snapshots(fixture.input),
+  await assert.rejects(reconcileReadOnly(fixture.connection, fixture.input),
     (error: unknown) => error instanceof ShadowMigrationError && error.code === "MIGRATION_LEDGER_INTEGRITY_FAILURE");
+});
+
+test("rejects checksum-valid committed reports whose authenticated claims contradict their columns or thresholds", async t => {
+  const fixture = await createSnapshotParityFixture(t);
+  const valid = await compareV1V2Snapshots(fixture.input);
+  const { reportChecksum: _, ...validBody } = valid;
+  const retrieve = InternalRetrievalService.prototype.retrieve;
+  let reconciliationRetrievals = 0;
+  InternalRetrievalService.prototype.retrieve = async function (...args) {
+    reconciliationRetrievals += 1;
+    return retrieve.apply(this, args);
+  };
+  try {
+    const contradictions: readonly Omit<SnapshotParityReportV1, "reportChecksum">[] = [
+      { ...validBody, v1CoreChecksumsDigest: "0".repeat(64) },
+      {
+        ...validBody,
+        sealedRetrieval: { ...validBody.sealedRetrieval, v2ThresholdsPassed: false },
+      },
+    ];
+    for (const contradiction of contradictions) {
+      replaceProductionParityReport(fixture, contradiction);
+      const changesBefore = fixture.connection.prepare("SELECT total_changes() AS count").get()!.count;
+      await assert.rejects(
+        reconcileV1V2Snapshots(fixture.input),
+        (error: unknown) => error instanceof ShadowMigrationError
+          && error.code === "MIGRATION_LEDGER_INTEGRITY_FAILURE",
+      );
+      assert.equal(reconciliationRetrievals, 0);
+      assert.equal(fixture.connection.prepare("SELECT total_changes() AS count").get()!.count, changesBefore);
+    }
+  } finally {
+    InternalRetrievalService.prototype.retrieve = retrieve;
+  }
+});
+
+test("covers the read-only reconciliation matrix for partial, contradictory, deterministic, and expired evidence", async t => {
+  const partial = await createSnapshotParityFixture(t, { artifactMetadata: true });
+  const storedRules = partial.metadataRules.map(rule => storedRule(partial, rule));
+  partial.repository.transact(
+    partial.projectionBinding.projectId,
+    partial.sealedPackage.migrationIdentity,
+    tx => tx.insertExpectedDifferenceRules(storedRules.slice(0, 1)),
+  );
+  assert.deepEqual(await reconcileReadOnly(partial.connection, {
+    ...partial.input,
+    rules: partial.metadataRules,
+  }), { status: "unknown", safeErrorCode: "MIGRATION_OUTCOME_UNKNOWN" });
+
+  partial.repository.transact(
+    partial.projectionBinding.projectId,
+    partial.sealedPackage.migrationIdentity,
+    tx => tx.insertExpectedDifferenceRules(storedRules.slice(1)),
+  );
+  assert.deepEqual(await reconcileReadOnly(partial.connection, {
+    ...partial.input,
+    rules: partial.metadataRules,
+  }), { status: "unknown", safeErrorCode: "MIGRATION_OUTCOME_UNKNOWN" });
+
+  appendProductionPhase4(partial);
+  assert.deepEqual(await reconcileReadOnly(partial.connection, {
+    ...partial.input,
+    rules: partial.metadataRules,
+  }), { status: "unknown", safeErrorCode: "MIGRATION_OUTCOME_UNKNOWN" });
+
+  const contradictoryRules = partial.metadataRules.map((rule, index) => index === 1
+    ? independentlyReseal({ ...rule, rationaleDigest: "0".repeat(64) })
+    : rule);
+  await assert.rejects(
+    reconcileReadOnly(partial.connection, { ...partial.input, rules: contradictoryRules }),
+    (error: unknown) => error instanceof ShadowMigrationError
+      && error.code === "MIGRATION_LEDGER_INTEGRITY_FAILURE",
+  );
+
+  let armed = false;
+  let armedChecks = 0;
+  const deadline = {
+    signal: new AbortController().signal,
+    remainingMs() {
+      if (armed && ++armedChecks > 4) throw new ShadowMigrationError("MIGRATION_RETRY_EXHAUSTED");
+      return 1000;
+    },
+  };
+  const transact = SqliteV2ShadowMigrationRepository.prototype.transact;
+  SqliteV2ShadowMigrationRepository.prototype.transact = function <T>(
+    this: SqliteV2ShadowMigrationRepository,
+    projectId: string,
+    migrationIdentity: string,
+    callback: (tx: V2ShadowMigrationTransaction) => T,
+  ): T {
+    return transact.call(this, projectId, migrationIdentity, tx => callback(Object.freeze({
+      ...tx,
+      readExpectedDifferenceRules() {
+        const rules = tx.readExpectedDifferenceRules();
+        armed = true;
+        return rules;
+      },
+    }) as V2ShadowMigrationTransaction)) as T;
+  };
+  try {
+    assert.deepEqual(await reconcileReadOnly(partial.connection, {
+      ...partial.input,
+      rules: contradictoryRules,
+      invocationDeadline: deadline,
+    }), { status: "unknown", safeErrorCode: "MIGRATION_RETRY_EXHAUSTED" });
+    assert.equal(armedChecks, 5);
+  } finally {
+    SqliteV2ShadowMigrationRepository.prototype.transact = transact;
+  }
+
+  const deterministic = await createSnapshotParityFixture(t);
+  appendProductionPhase4(deterministic, {
+    attemptId: "00000000-0000-4000-8000-000000000099",
+    recordedAt: "2026-09-10T00:00:00.001Z",
+  });
+  await assert.rejects(
+    reconcileReadOnly(deterministic.connection, deterministic.input),
+    (error: unknown) => error instanceof ShadowMigrationError
+      && error.code === "MIGRATION_LEDGER_INTEGRITY_FAILURE",
+  );
 });
 
 test("shared expiry after retrieval and before evidence writes leaves parity evidence absent", async t => {
@@ -223,6 +532,148 @@ test("shared expiry after retrieval and before evidence writes leaves parity evi
   const storedRules = fixture.repository.transact(fixture.projectionBinding.projectId, fixture.sealedPackage.migrationIdentity,
     tx => tx.readExpectedDifferenceRules());
   assert.deepEqual(storedRules, []);
+});
+
+test("classifies expiry at each evidence transaction boundary without late writes", async t => {
+  const transact = SqliteV2ShadowMigrationRepository.prototype.transact;
+  const deadlineState = () => {
+    let expired = false;
+    return {
+      expire() { expired = true; },
+      deadline: {
+        signal: new AbortController().signal,
+        remainingMs() {
+          if (expired) throw new ShadowMigrationError("MIGRATION_RETRY_EXHAUSTED");
+          return 1000;
+        },
+      },
+    };
+  };
+
+  const entry = await createSnapshotParityFixture(t);
+  const entryDeadline = deadlineState();
+  let entryTransactions = 0;
+  SqliteV2ShadowMigrationRepository.prototype.transact = function (this: SqliteV2ShadowMigrationRepository, ...args) {
+    entryTransactions += 1;
+    if (entryTransactions === 2) entryDeadline.expire();
+    return transact.apply(this, args);
+  } as typeof SqliteV2ShadowMigrationRepository.prototype.transact;
+  try {
+    await assert.rejects(
+      compareV1V2Snapshots({ ...entry.input, invocationDeadline: entryDeadline.deadline }),
+      (error: unknown) => error instanceof ShadowMigrationError && error.code === "MIGRATION_RETRY_EXHAUSTED",
+    );
+  } finally {
+    SqliteV2ShadowMigrationRepository.prototype.transact = transact;
+  }
+  assert.equal(entry.storedReport(), null);
+  assert.equal(entry.phases().at(-1), "projection-verified");
+
+  const reportRead = await createSnapshotParityFixture(t);
+  const reportDeadline = deadlineState();
+  let reportTransactions = 0;
+  SqliteV2ShadowMigrationRepository.prototype.transact = function <T>(
+    this: SqliteV2ShadowMigrationRepository,
+    projectId: string,
+    migrationIdentity: string,
+    callback: (tx: V2ShadowMigrationTransaction) => T,
+  ): T {
+    reportTransactions += 1;
+    if (reportTransactions !== 3) return transact.call(this, projectId, migrationIdentity, callback) as T;
+    return transact.call(this, projectId, migrationIdentity, tx => callback(Object.freeze({
+      ...tx,
+      readParityReport() {
+        const report = tx.readParityReport();
+        reportDeadline.expire();
+        return report;
+      },
+    }) as V2ShadowMigrationTransaction)) as T;
+  };
+  try {
+    await assert.rejects(
+      compareV1V2Snapshots({ ...reportRead.input, invocationDeadline: reportDeadline.deadline }),
+      (error: unknown) => error instanceof ShadowMigrationError && error.code === "MIGRATION_RETRY_EXHAUSTED",
+    );
+  } finally {
+    SqliteV2ShadowMigrationRepository.prototype.transact = transact;
+  }
+  assert.equal(reportRead.storedReport(), null);
+  assert.equal(reportRead.phases().at(-1), "projection-verified");
+
+  const phaseRead = await createSnapshotParityFixture(t);
+  const phaseDeadline = deadlineState();
+  let phaseTransactions = 0;
+  SqliteV2ShadowMigrationRepository.prototype.transact = function <T>(
+    this: SqliteV2ShadowMigrationRepository,
+    projectId: string,
+    migrationIdentity: string,
+    callback: (tx: V2ShadowMigrationTransaction) => T,
+  ): T {
+    phaseTransactions += 1;
+    if (phaseTransactions !== 4) return transact.call(this, projectId, migrationIdentity, callback) as T;
+    let reads = 0;
+    return transact.call(this, projectId, migrationIdentity, tx => callback(Object.freeze({
+      ...tx,
+      readTransitions() {
+        const phases = tx.readTransitions();
+        reads += 1;
+        if (reads === 2) phaseDeadline.expire();
+        return phases;
+      },
+    }) as V2ShadowMigrationTransaction)) as T;
+  };
+  try {
+    await assert.rejects(
+      compareV1V2Snapshots({ ...phaseRead.input, invocationDeadline: phaseDeadline.deadline }),
+      (error: unknown) => error instanceof ShadowMigrationError && error.code === "MIGRATION_OUTCOME_UNKNOWN",
+    );
+  } finally {
+    SqliteV2ShadowMigrationRepository.prototype.transact = transact;
+  }
+  assert.ok(phaseRead.storedReport());
+  assert.equal(phaseRead.phases().at(-1), "projection-verified");
+
+  const betweenRules = await createSnapshotParityFixture(t, { artifactMetadata: true });
+  const ruleDeadline = deadlineState();
+  let ruleTransactions = 0;
+  SqliteV2ShadowMigrationRepository.prototype.transact = function <T>(
+    this: SqliteV2ShadowMigrationRepository,
+    projectId: string,
+    migrationIdentity: string,
+    callback: (tx: V2ShadowMigrationTransaction) => T,
+  ): T {
+    ruleTransactions += 1;
+    if (ruleTransactions !== 2) return transact.call(this, projectId, migrationIdentity, callback) as T;
+    let inserts = 0;
+    return transact.call(this, projectId, migrationIdentity, tx => callback(Object.freeze({
+      ...tx,
+      insertExpectedDifferenceRules(rules: Parameters<V2ShadowMigrationTransaction["insertExpectedDifferenceRules"]>[0]) {
+        tx.insertExpectedDifferenceRules(rules);
+        inserts += 1;
+        if (inserts === 1) ruleDeadline.expire();
+      },
+    }) as V2ShadowMigrationTransaction)) as T;
+  };
+  try {
+    await assert.rejects(
+      compareV1V2Snapshots({
+        ...betweenRules.input,
+        rules: betweenRules.metadataRules,
+        invocationDeadline: ruleDeadline.deadline,
+      }),
+      (error: unknown) => error instanceof ShadowMigrationError && error.code === "MIGRATION_RETRY_EXHAUSTED",
+    );
+  } finally {
+    SqliteV2ShadowMigrationRepository.prototype.transact = transact;
+  }
+  const storedRules = betweenRules.repository.transact(
+    betweenRules.projectionBinding.projectId,
+    betweenRules.sealedPackage.migrationIdentity,
+    tx => tx.readExpectedDifferenceRules(),
+  );
+  assert.deepEqual(storedRules, []);
+  assert.equal(betweenRules.storedReport(), null);
+  assert.equal(betweenRules.phases().at(-1), "projection-verified");
 });
 
 test("closes an acquired imported snapshot when the shared deadline expires after acquisition", async t => {
@@ -322,6 +773,8 @@ test("compares authenticated pinned generations and persists deterministic redac
     const changesBefore = wrong.prepare("SELECT total_changes() AS count").get()!.count;
     await assert.rejects(compareV1V2Snapshots({ ...f.input, connection: wrong }),
       (error: unknown) => error instanceof ShadowMigrationError && error.code === "MIGRATION_LEDGER_INTEGRITY_FAILURE");
+    await assert.rejects(reconcileReadOnly(wrong, { ...f.input, connection: wrong }),
+      (error: unknown) => error instanceof ShadowMigrationError && error.code === "MIGRATION_LEDGER_INTEGRITY_FAILURE");
     assert.equal(wrong.prepare("SELECT total_changes() AS count").get()!.count, changesBefore);
     assert.deepEqual(databaseState(wrong), beforeWrong);
     assert.deepEqual(databaseState(f.connection), beforeTarget);
@@ -338,6 +791,9 @@ test("compares authenticated pinned generations and persists deterministic redac
       },
     };
     await assert.rejects(compareV1V2Snapshots({ ...f.input, connection: forwarded }),
+      (error: unknown) => error instanceof ShadowMigrationError && error.code === "MIGRATION_LEDGER_INTEGRITY_FAILURE");
+    assert.deepEqual(calls, []);
+    await assert.rejects(reconcileReadOnly(wrong, { ...f.input, connection: forwarded }),
       (error: unknown) => error instanceof ShadowMigrationError && error.code === "MIGRATION_LEDGER_INTEGRITY_FAILURE");
     assert.deepEqual(calls, []);
     assert.equal(wrong.prepare("SELECT total_changes() AS count").get()!.count, changesBefore);
@@ -412,17 +868,29 @@ test("governs each real absent-null artifact field while verifying complete chec
   assert.equal(report.findings.filter(finding => finding.classification === "PARITY_EXPECTED_DIFFERENCE").length, 3);
   assert.ok(report.findings.length <= 128);
   assert.equal(JSON.stringify(serializeSnapshotParityReport(report)).includes(f.plaintextSentinel), false);
-  const proof = await reconcileV1V2Snapshots({ ...f.input, rules: f.metadataRules });
+  const changesBeforeNoOp = f.connection.prepare("SELECT total_changes() AS count").get()!.count;
+  assert.deepEqual(await compareV1V2Snapshots({ ...f.input, rules: f.metadataRules }), report);
+  assert.equal(f.connection.prepare("SELECT total_changes() AS count").get()!.count, changesBeforeNoOp);
+  const proof = await reconcileReadOnly(f.connection, { ...f.input, rules: f.metadataRules });
   assert.equal(proof.status, "committed");
   const changesBeforeInvalidResume = f.connection.prepare("SELECT total_changes() AS count").get()!.count;
   await assert.rejects(compareV1V2Snapshots({ ...f.input, rules: f.metadataRules, runStartedAt: f.metadataRules[0]!.expiresAt }), invalidRule);
-  await assert.rejects(reconcileV1V2Snapshots({ ...f.input, rules: f.metadataRules, runStartedAt: "2026-09-09T23:59:59.999Z" }), invalidRule);
+  await assert.rejects(reconcileReadOnly(f.connection, {
+    ...f.input,
+    rules: f.metadataRules,
+    runStartedAt: "2026-09-09T23:59:59.999Z",
+  }), invalidRule);
+  await assert.rejects(reconcileReadOnly(f.connection, {
+    ...f.input,
+    rules: f.metadataRules,
+    runStartedAt: f.metadataRules[0]!.expiresAt,
+  }), invalidRule);
   const tooOld = f.metadataRules.map(rule => independentlyReseal({
     ...rule,
     issuedAt: "2026-09-02T00:00:00.000Z",
     expiresAt: "2026-09-20T00:00:00.000Z",
   }));
-  await assert.rejects(reconcileV1V2Snapshots({ ...f.input, rules: tooOld }), invalidRule);
+  await assert.rejects(reconcileReadOnly(f.connection, { ...f.input, rules: tooOld }), invalidRule);
   assert.equal(f.connection.prepare("SELECT total_changes() AS count").get()!.count, changesBeforeInvalidResume);
 });
 
@@ -432,7 +900,7 @@ test("persists a blocking metadata report without advancing the ledger", async t
   assert.equal(f.storedReport()!.blockingDivergenceCount, 3);
   assert.equal((f.storedReport()!.report.findings as { classification: string }[]).filter(finding => finding.classification === "PARITY_BLOCKING_DIVERGENCE").length, 3);
   assert.equal(f.phases().at(-1), "projection-verified");
-  await assert.rejects(reconcileV1V2Snapshots(f.input),
+  await assert.rejects(reconcileReadOnly(f.connection, f.input),
     (error: unknown) => error instanceof ShadowMigrationError && error.code === "MIGRATION_LEDGER_INTEGRITY_FAILURE");
 });
 
