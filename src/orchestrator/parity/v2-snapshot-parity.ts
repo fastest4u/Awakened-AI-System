@@ -62,25 +62,44 @@ const CATEGORIES = ["semantic-value", "representation", "identity", "authority",
   "citation-integrity", "temporal-eligibility", "conflict-integrity", "retrieval-threshold"] as const;
 function failure(): never { throw new ShadowMigrationError("MIGRATION_LEDGER_INTEGRITY_FAILURE"); }
 function digest(value: string): string { return createHash("sha256").update(value, "utf8").digest("hex"); }
-function record(input: unknown, keys: readonly string[]): Record<string, unknown> {
+function record(
+  input: unknown,
+  keys: readonly string[],
+  invocationDeadline?: ShadowMigrationInvocationDeadline,
+): Record<string, unknown> {
   if (typeof input !== "object" || input === null || utilTypes.isProxy(input) || Array.isArray(input)) failure();
   const prototype = Object.getPrototypeOf(input);
   if (prototype !== Object.prototype && prototype !== null) failure();
   const actual = Reflect.ownKeys(input);
-  if (actual.length !== keys.length || actual.some(key => typeof key !== "string" || !keys.includes(key))) failure();
+  if (actual.length !== keys.length) failure();
+  const expectedKeys = new Set<string>();
+  for (const key of keys) {
+    checkInvocationDeadline(invocationDeadline);
+    expectedKeys.add(key);
+  }
+  for (const key of actual) {
+    checkInvocationDeadline(invocationDeadline);
+    if (typeof key !== "string" || !expectedKeys.has(key)) failure();
+  }
   const result: Record<string, unknown> = Object.create(null);
   for (const key of keys) {
+    checkInvocationDeadline(invocationDeadline);
     const descriptor = Object.getOwnPropertyDescriptor(input, key);
     if (!descriptor || !descriptor.enumerable || !("value" in descriptor)) failure();
     result[key] = descriptor.value;
   }
   return result;
 }
-function array(input: unknown, maximum = 1_000_000): readonly unknown[] {
+function array(
+  input: unknown,
+  maximum = 1_000_000,
+  invocationDeadline?: ShadowMigrationInvocationDeadline,
+): readonly unknown[] {
   if (typeof input !== "object" || input === null || utilTypes.isProxy(input) || !Array.isArray(input)
     || Object.getPrototypeOf(input) !== Array.prototype || input.length > maximum) failure();
   if (Reflect.ownKeys(input).length !== input.length + 1) failure();
   return Object.freeze(Array.from({ length: input.length }, (_, i) => {
+    checkInvocationDeadline(invocationDeadline);
     const d = Object.getOwnPropertyDescriptor(input, String(i));
     if (!d || !d.enumerable || !("value" in d)) failure();
     return d.value as unknown;
@@ -105,15 +124,18 @@ function assertOwnJson(
   ancestors.add(value);
   try {
     if (Array.isArray(value)) {
-      for (const item of array(value)) {
+      for (const item of array(value, 1_000_000, invocationDeadline)) {
         checkInvocationDeadline(invocationDeadline);
         assertOwnJson(item, invocationDeadline, ancestors, depth + 1);
       }
       return;
     }
     const keys = Reflect.ownKeys(value);
-    if (keys.some(key => typeof key !== "string")) failure();
-    for (const item of Object.values(record(value, keys as string[]))) {
+    for (const key of keys) {
+      checkInvocationDeadline(invocationDeadline);
+      if (typeof key !== "string") failure();
+    }
+    for (const item of Object.values(record(value, keys as string[], invocationDeadline))) {
       checkInvocationDeadline(invocationDeadline);
       assertOwnJson(item, invocationDeadline, ancestors, depth + 1);
     }
@@ -137,7 +159,7 @@ export function authenticateSealedRetrievalSource(
   source.assertUnchanged();
   checkInvocationDeadline(invocationDeadline);
   assertOwnJson(supplied, invocationDeadline);
-  const c = record(supplied, ["bundle", "sources", "queries", "baseline"]);
+  const c = record(supplied, ["bundle", "sources", "queries", "baseline"], invocationDeadline);
   const corpus = parseSealedRetrievalEvaluationBundle(c.bundle,
     { schemaVersion: 2, corpusVersion: "retrieval-evaluation-v2", sources: c.sources },
     { schemaVersion: 2, corpusVersion: "retrieval-evaluation-v2", queries: c.queries }, c.baseline);
@@ -178,7 +200,7 @@ export function authenticateSealedRetrievalSource(
 }
 
 function verifiedCorpus(input: SnapshotParityInput): SealedRetrievalEvaluationCorpusV2 {
-  const supplied = record(input.sealedRetrieval, ["corpus"]).corpus;
+  const supplied = record(input.sealedRetrieval, ["corpus"], input.invocationDeadline).corpus;
   return authenticateSealedRetrievalSource(
     supplied as SealedRetrievalEvaluationCorpusV2,
     input.source,
@@ -303,7 +325,7 @@ function validateParityRules(
   const started = Date.parse(input.runStartedAt);
   if (!Number.isFinite(started) || new Date(started).toISOString() !== input.runStartedAt) failure();
   const decoded: ExpectedDifferenceRuleV1[] = [];
-  for (const supplied of array(input.rules)) {
+  for (const supplied of array(input.rules, 1_000_000, input.invocationDeadline)) {
     checkInvocationDeadline(input.invocationDeadline);
     decoded.push(decodeExpectedDifferenceRuleV1(supplied));
     checkInvocationDeadline(input.invocationDeadline);

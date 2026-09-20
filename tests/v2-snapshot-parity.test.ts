@@ -223,10 +223,11 @@ test("authenticates the complete sealed retrieval source without slicing its que
   assert.throws(() => authenticateSealedRetrievalSource(queryRebound, fixture.input.source));
 });
 
-test("expires cooperatively while recursively validating the supplied sealed corpus", async t => {
+test("expires during owned corpus descriptor traversal before validating the remaining tail", async t => {
   const fixture = await createSnapshotParityFixture(t);
   let armed = false;
   let armedChecks = 0;
+  let tailGetterCalls = 0;
   const source = {
     ...fixture.input.source,
     assertUnchanged() {
@@ -237,29 +238,56 @@ test("expires cooperatively while recursively validating the supplied sealed cor
   const deadline = {
     signal: new AbortController().signal,
     remainingMs() {
-      if (armed && ++armedChecks > 1) throw new ShadowMigrationError("MIGRATION_RETRY_EXHAUSTED");
+      if (armed && ++armedChecks > 15) throw new ShadowMigrationError("MIGRATION_RETRY_EXHAUSTED");
       return 1000;
     },
   };
-  const last = fixture.corpus.queries.at(-1)!;
-  const invalidLateCorpus = {
-    ...fixture.corpus,
-    queries: [...fixture.corpus.queries.slice(0, -1), { ...last, queryId: "" }],
-  } as typeof fixture.corpus;
+  const invalidLateCorpus = { ...fixture.corpus };
+  Object.defineProperty(invalidLateCorpus, "baseline", {
+    configurable: true,
+    enumerable: true,
+    get() {
+      tailGetterCalls += 1;
+      return fixture.corpus.baseline;
+    },
+  });
+  const getOwnPropertyDescriptor = Object.getOwnPropertyDescriptor;
+  const visitedDescriptors: PropertyKey[] = [];
+  Object.getOwnPropertyDescriptor = ((object: object, propertyKey: PropertyKey) => {
+    if (object === invalidLateCorpus) visitedDescriptors.push(propertyKey);
+    return getOwnPropertyDescriptor(object, propertyKey);
+  }) as typeof Object.getOwnPropertyDescriptor;
+  const retrieve = InternalRetrievalService.prototype.retrieve;
+  let retrievals = 0;
+  InternalRetrievalService.prototype.retrieve = async function (...args) {
+    retrievals += 1;
+    return retrieve.apply(this, args);
+  };
   const changesBefore = fixture.connection.prepare("SELECT total_changes() AS count").get()!.count;
 
-  assert.throws(
-    () => authenticateSealedRetrievalSource(invalidLateCorpus, source, deadline),
-    (error: unknown) => error instanceof ShadowMigrationError
-      && error.code === "MIGRATION_RETRY_EXHAUSTED",
-  );
+  let caught: unknown;
+  try {
+    authenticateSealedRetrievalSource(invalidLateCorpus as typeof fixture.corpus, source, deadline);
+  } catch (error) {
+    caught = error;
+  } finally {
+    InternalRetrievalService.prototype.retrieve = retrieve;
+    Object.getOwnPropertyDescriptor = getOwnPropertyDescriptor;
+  }
+  assert.deepEqual(visitedDescriptors, ["bundle"]);
+  assert(caught instanceof ShadowMigrationError);
+  assert.equal(caught.code, "MIGRATION_RETRY_EXHAUSTED");
+  assert.equal(armedChecks, 16);
+  assert.equal(tailGetterCalls, 0);
+  assert.equal(retrievals, 0);
   assert.equal(fixture.connection.prepare("SELECT total_changes() AS count").get()!.count, changesBefore);
 });
 
-test("expires cooperatively while decoding and validating expected-difference rules", async t => {
+test("expires during owned rule-array traversal before decoding the remaining tail", async t => {
   const fixture = await createSnapshotParityFixture(t, { artifactMetadata: true });
   let armed = false;
   let armedChecks = 0;
+  let tailGetterCalls = 0;
   const source = {
     ...fixture.input.source,
     assertUnchanged() {
@@ -270,24 +298,54 @@ test("expires cooperatively while decoding and validating expected-difference ru
   const deadline = {
     signal: new AbortController().signal,
     remainingMs() {
-      if (armed && ++armedChecks > 1) throw new ShadowMigrationError("MIGRATION_RETRY_EXHAUSTED");
+      if (armed && ++armedChecks > 3) throw new ShadowMigrationError("MIGRATION_RETRY_EXHAUSTED");
       return 1000;
     },
   };
   const valid = fixture.metadataRules[0]!;
-  const invalidLate = { ...valid, ruleChecksum: "0".repeat(64) };
+  const invalidLateRules = [valid, valid];
+  Object.defineProperty(invalidLateRules, "1", {
+    configurable: true,
+    enumerable: true,
+    get() {
+      tailGetterCalls += 1;
+      return valid;
+    },
+  });
+  const getOwnPropertyDescriptor = Object.getOwnPropertyDescriptor;
+  const visitedDescriptors: PropertyKey[] = [];
+  Object.getOwnPropertyDescriptor = ((object: object, propertyKey: PropertyKey) => {
+    if (object === invalidLateRules) visitedDescriptors.push(propertyKey);
+    return getOwnPropertyDescriptor(object, propertyKey);
+  }) as typeof Object.getOwnPropertyDescriptor;
+  const retrieve = InternalRetrievalService.prototype.retrieve;
+  let retrievals = 0;
+  InternalRetrievalService.prototype.retrieve = async function (...args) {
+    retrievals += 1;
+    return retrieve.apply(this, args);
+  };
   const changesBefore = fixture.connection.prepare("SELECT total_changes() AS count").get()!.count;
 
-  await assert.rejects(
-    compareV1V2Snapshots({
+  let caught: unknown;
+  try {
+    await compareV1V2Snapshots({
       ...fixture.input,
       source,
-      rules: [valid, invalidLate],
+      rules: invalidLateRules,
       invocationDeadline: deadline,
-    }),
-    (error: unknown) => error instanceof ShadowMigrationError
-      && error.code === "MIGRATION_RETRY_EXHAUSTED",
-  );
+    });
+  } catch (error) {
+    caught = error;
+  } finally {
+    InternalRetrievalService.prototype.retrieve = retrieve;
+    Object.getOwnPropertyDescriptor = getOwnPropertyDescriptor;
+  }
+  assert.deepEqual(visitedDescriptors, ["0"]);
+  assert(caught instanceof ShadowMigrationError);
+  assert.equal(caught.code, "MIGRATION_RETRY_EXHAUSTED");
+  assert.equal(armedChecks, 4);
+  assert.equal(tailGetterCalls, 0);
+  assert.equal(retrievals, 0);
   assert.equal(fixture.connection.prepare("SELECT total_changes() AS count").get()!.count, changesBefore);
   assert.equal(fixture.storedReport(), null);
   assert.equal(fixture.phases().at(-1), "projection-verified");
