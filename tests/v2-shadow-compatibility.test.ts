@@ -352,6 +352,54 @@ test("Task11E replay cleanup preserves callback expiry after real iteration and 
 });
 
 const moduleUrl = new URL("../src/orchestrator/materialization/v2-shadow-compatibility.materializer.js", import.meta.url).href;
+test("Task11E fix1 native rejection distinguishes retained expiry from read uncertainty on old evidence", async t => {
+  for (const method of ["materializePending", "reconcile"] as const) await t.test(method, async child => {
+    const { V2ShadowCompatibilityMaterializer } = await import(moduleUrl), f = await createCompatibilityFixture(child);
+    const materializer = new V2ShadowCompatibilityMaterializer({ ...f.materializerOptions, operationNow: () => 0 });
+    await materializer.materializePending(f.input);
+    const before = ledger(f), protectedBefore = [tree(f.isolatedRoot), tree(f.source.sourceRoot), tree(f.sealedPackage.rootPath), tree(f.liveVaultRoot)];
+    for (const variant of ["live-budget", "expired-retained-budget", "terminal-integrity", "no-deadline"] as const) await child.test(variant, async () => {
+      let time = 0, settled = 0;
+      const deadline = variant === "no-deadline" ? undefined : createShadowMigrationInvocationDeadline(30000, () => time);
+      let replacement: ReturnType<typeof createShadowMigrationInvocationDeadline> | undefined;
+      const input = { ...f.input, invocationDeadline: deadline }, original = StableCompatibilityDirectory.prototype.verifyOnly;
+      StableCompatibilityDirectory.prototype.verifyOnly = async function (...args) {
+        await original.apply(this, args); settled++;
+        if (variant === "expired-retained-budget" || variant === "terminal-integrity") time = 30000;
+        if (variant === "expired-retained-budget") {
+          replacement = createShadowMigrationInvocationDeadline(30000, () => 0); input.invocationDeadline = replacement;
+        }
+        // Simulated lost/failed response after real native settlement, not an actual native timer firing.
+        throw new ShadowMigrationError(variant === "terminal-integrity" ? "COMPATIBILITY_INTEGRITY_FAILURE" : "MIGRATION_OUTCOME_UNKNOWN");
+      };
+      try {
+        if (method === "reconcile" && (variant === "live-budget" || variant === "no-deadline")) {
+          assert.deepEqual(await materializer[method](input), { status: "unknown", safeErrorCode: "MIGRATION_OUTCOME_UNKNOWN" });
+        } else await assert.rejects(materializer[method](input), codeIs(variant === "expired-retained-budget" ? "MIGRATION_RETRY_EXHAUSTED"
+          : variant === "terminal-integrity" ? "COMPATIBILITY_INTEGRITY_FAILURE" : "MIGRATION_OUTCOME_UNKNOWN"));
+      } finally { StableCompatibilityDirectory.prototype.verifyOnly = original; deadline?.dispose(); replacement?.dispose(); }
+      assert.equal(settled, 1); assert.deepEqual(ledger(f), before); f.source.assertUnchanged(); f.sealedPackage.assertUnchanged();
+      assert.deepEqual([tree(f.isolatedRoot), tree(f.source.sourceRoot), tree(f.sealedPackage.rootPath), tree(f.liveVaultRoot)], protectedBefore);
+    });
+  });
+});
+
+test("Task11E fix1 rejected native publication after a possible mutation remains unknown on expiry", async t => {
+  const { V2ShadowCompatibilityMaterializer } = await import(moduleUrl), f = await createCompatibilityFixture(t);
+  let time = 0, settled = 0; const deadline = createShadowMigrationInvocationDeadline(30000, () => time);
+  const original = StableCompatibilityDirectory.prototype.publishOrReconcile;
+  const protectedBefore = [tree(f.source.sourceRoot), tree(f.sealedPackage.rootPath), tree(f.liveVaultRoot)];
+  StableCompatibilityDirectory.prototype.publishOrReconcile = async function (...args) {
+    await original.apply(this, args); settled++; time = 30000; throw new ShadowMigrationError("MIGRATION_OUTCOME_UNKNOWN");
+  };
+  try { await assert.rejects(new V2ShadowCompatibilityMaterializer(f.materializerOptions).materializePending({ ...f.input,
+    invocationDeadline: deadline }), codeIs("MIGRATION_OUTCOME_UNKNOWN")); }
+  finally { StableCompatibilityDirectory.prototype.publishOrReconcile = original; deadline.dispose(); }
+  assert.equal(settled, 1); const evidence = ledger(f); assert.equal(evidence.claims.length, 1); assert.equal(evidence.acks.length, 0);
+  assert.equal(readFileSync(join(f.isolatedRoot, "legacy/one.md"), "utf8"), "# Decision\nKeep V1 authoritative.\n");
+  assert.equal(existsSync(join(f.isolatedRoot, "legacy/two.md")), false);
+  assert.deepEqual([tree(f.source.sourceRoot), tree(f.sealedPackage.rootPath), tree(f.liveVaultRoot)], protectedBefore);
+});
 test("rejects a transparent connection wrapper before the first compatibility claim", async t => {
   const { V2ShadowCompatibilityMaterializer } = await import(moduleUrl), f = await createCompatibilityFixture(t);
   let transactions = 0;

@@ -82,6 +82,7 @@ export class V2ShadowCompatibilityMaterializer {
 
   async #execute(input: CompatibilityMaterializationInput, readOnly: boolean): Promise<ShadowMigrationReconciliation<CompatibilityMaterializationResult>> {
     let possibleMutation = false;
+    let remainingSharedBudget: (() => number) | undefined;
     try {
       const options = this.#options, policy = decodeShadowMigrationPolicyV1(options.policy);
       const deadline = input.invocationDeadline;
@@ -96,6 +97,7 @@ export class V2ShadowCompatibilityMaterializer {
         const elapsed = now() - start;
         if (!Number.isFinite(elapsed) || elapsed < 0 || elapsed >= policy.deadlineMs) throw new ShadowMigrationError("MIGRATION_LIMIT_EXCEEDED");
         return Math.max(1, Math.floor(policy.deadlineMs - elapsed)); };
+      if (deadline) remainingSharedBudget = remaining;
       const equal = (a: unknown, b: unknown) => canonicalJson(decimal(a, remaining)) === canonicalJson(decimal(b, remaining));
       remaining();
       const source = input.source, package_ = input.sealedPackage, manifest = package_.manifest, migration = package_.migrationIdentity;
@@ -270,6 +272,14 @@ export class V2ShadowCompatibilityMaterializer {
       return Object.freeze({ status: "committed", result });
     } catch (error) {
       if (error instanceof ShadowMigrationError && SAFE_CODES.has(error.code)) {
+        // A rejected native read can outlive the retained budget without creating a new mutation.
+        if (!possibleMutation && error.code === "MIGRATION_OUTCOME_UNKNOWN" && remainingSharedBudget) {
+          try { remainingSharedBudget(); }
+          catch (budgetError) {
+            if (budgetError instanceof ShadowMigrationError && budgetError.code === "MIGRATION_RETRY_EXHAUSTED")
+              throw new ShadowMigrationError("MIGRATION_RETRY_EXHAUSTED");
+          }
+        }
         if (possibleMutation && (error.code === "MIGRATION_RETRY_EXHAUSTED" || error.code === "MIGRATION_LIMIT_EXCEEDED")) fail(true);
         if (readOnly && error.code === "MIGRATION_OUTCOME_UNKNOWN") return Object.freeze({ status: "unknown", safeErrorCode: error.code });
         throw new ShadowMigrationError(error.code);
