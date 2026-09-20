@@ -10,6 +10,346 @@ import type { SqliteConnection } from "../src/orchestrator/storage/sqlite-driver
 import { DatabaseSync, type StatementSync } from "node:sqlite";
 import { applyCurrentProjectStoreSchema } from "./support/current-project-store-schema.js";
 import { v2ShadowMigration } from "../src/orchestrator/storage/migrations/0007-v2-shadow-migration.js";
+import { createShadowMigrationInvocationDeadline } from "../src/orchestrator/migration/v2-shadow-migration-runtime.js";
+import { StableCompatibilityDirectory } from "../src/orchestrator/materialization/stable-compatibility-directory.js";
+import { V2ImportedProjectionEventReader } from "../src/orchestrator/migration/v2-imported-event-reader.js";
+
+const codeIs = (code: string) => (error: unknown) => error instanceof ShadowMigrationError && error.code === code;
+const ledger = (f: Awaited<ReturnType<typeof createCompatibilityFixture>>) => f.repository.transact(
+  f.projectionBinding.projectId, f.sealedPackage.migrationIdentity, tx => ({ run: tx.readRun(), receipts: tx.readImportedRecords(),
+    outbox: tx.readCompatibilityOutbox(), claims: tx.readCompatibilityClaims(), acks: tx.readCompatibilityAcknowledgements() }));
+function tree(path: string): unknown {
+  const stat = lstatSync(path, { bigint: true });
+  return { inode: stat.ino, bytes: stat.isDirectory() ? readdirSync(path).sort().map(name => [name, tree(join(path, name))])
+    : createHash("sha256").update(readFileSync(path)).digest("hex") };
+}
+
+test("Task11E exhausted shared budget refuses all new claims", async t => {
+  const { V2ShadowCompatibilityMaterializer } = await import(moduleUrl), f = await createCompatibilityFixture(t);
+  let time = 0; const deadline = createShadowMigrationInvocationDeadline(30000, () => time);
+  const before = ledger(f); time = 30000;
+  try { await assert.rejects(new V2ShadowCompatibilityMaterializer(f.materializerOptions).materializePending({ ...f.input,
+    invocationDeadline: deadline }), codeIs("MIGRATION_RETRY_EXHAUSTED")); }
+  finally { deadline.dispose(); }
+  assert.deepEqual(ledger(f), before); assert.deepEqual(readdirSync(f.isolatedRoot), []);
+});
+
+test("Task11E proves absent and zero committed without semantic writes or parent preparation", async t => {
+  for (const legacyArtifacts of [true, false]) await t.test(String(legacyArtifacts), async child => {
+    const { V2ShadowCompatibilityMaterializer } = await import(moduleUrl);
+    let armed = false, writes = 0;
+    class ReadObserver extends DatabaseSync {
+      override prepare(sql: string): StatementSync { if (armed && /^(INSERT|UPDATE|DELETE)/i.test(sql)) { writes++; throw new Error("proof write"); } return super.prepare(sql); }
+    }
+    const f = await createCompatibilityFixture(child, { legacyArtifacts, database: ReadObserver });
+    const before = ledger(f), protectedBefore = [tree(f.source.sourceRoot), tree(f.sealedPackage.rootPath), tree(f.liveVaultRoot)];
+    const original = StableCompatibilityDirectory.prototype.prepareParent; let prepares = 0;
+    StableCompatibilityDirectory.prototype.prepareParent = async function (...args) { prepares++; return original.apply(this, args); };
+    armed = true;
+    try {
+      const materializer = new V2ShadowCompatibilityMaterializer(f.materializerOptions);
+      assert.equal(typeof materializer.reconcile, "function");
+      const result = await materializer.reconcile(f.input); assert.ok(Object.isFrozen(result));
+      if (legacyArtifacts) assert.deepEqual(result, { status: "absent" });
+      else {
+        assert.equal(result.status, "committed"); assert.ok(Object.isFrozen(result.result));
+        assert.equal(result.result.acknowledgedCount, 0); assert.equal(result.result.aggregateBytes, 0);
+        assert.equal(result.result.highestAcknowledgedSourceOrdinal, null); assert.equal(result.result.acknowledgedImportedPosition, null);
+        assert.equal(result.result.materializationRevision, null); assert.equal(result.result.deduplicated, true);
+        assert.equal(result.result.artifactSetChecksum, "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945");
+      }
+    } finally { armed = false; StableCompatibilityDirectory.prototype.prepareParent = original; }
+    assert.equal(writes, 0); assert.equal(prepares, 0); assert.deepEqual(ledger(f), before);
+    assert.deepEqual(readdirSync(f.isolatedRoot), []); assert.deepEqual([tree(f.source.sourceRoot), tree(f.sealedPackage.rootPath), tree(f.liveVaultRoot)], protectedBefore);
+  });
+});
+
+test("Task11E actual replace and committed acknowledgement faults reconcile without duplicate ack or rewrite", async t => {
+  for (const boundary of ["after-compatibility-replace", "after-compatibility-ack"] as const) await t.test(boundary, async child => {
+    const { V2ShadowCompatibilityMaterializer } = await import(moduleUrl), f = await createCompatibilityFixture(child);
+    let reached = 0;
+    const materializer = new V2ShadowCompatibilityMaterializer({ ...f.materializerOptions, fault: (point: string) => {
+      if (point !== boundary) return; reached++;
+      assert.equal(readFileSync(join(f.isolatedRoot, "legacy/one.md"), "utf8"), "# Decision\nKeep V1 authoritative.\n");
+      assert.equal(ledger(f).acks.length, boundary === "after-compatibility-ack" ? 1 : 0);
+      throw new Error("lost acknowledgement response");
+    } });
+    await assert.rejects(materializer.materializePending(f.input), codeIs("MIGRATION_OUTCOME_UNKNOWN")); assert.equal(reached, 1);
+    const before = ledger(f), targetBefore = tree(f.isolatedRoot);
+    const clean = new V2ShadowCompatibilityMaterializer(f.materializerOptions);
+    assert.deepEqual(await clean.reconcile(f.input), { status: "unknown", safeErrorCode: "MIGRATION_OUTCOME_UNKNOWN" });
+    assert.deepEqual(ledger(f), before); assert.deepEqual(tree(f.isolatedRoot), targetBefore);
+    const inode = lstatSync(join(f.isolatedRoot, "legacy/one.md"), { bigint: true }).ino;
+    const completed = await clean.materializePending(f.input);
+    assert.equal(ledger(f).acks.length, 2); assert.equal(lstatSync(join(f.isolatedRoot, "legacy/one.md"), { bigint: true }).ino, inode);
+    const committedBefore = ledger(f), bytesBefore = tree(f.isolatedRoot);
+    assert.deepEqual(await clean.reconcile(f.input), { status: "committed", result: { ...completed, deduplicated: true } });
+    assert.deepEqual(ledger(f), committedBefore); assert.deepEqual(tree(f.isolatedRoot), bytesBefore);
+  });
+});
+
+test("Task11E complete acknowledgements preserve terminal missing and contradictory target failures", async t => {
+  for (const variant of ["missing", "contradictory"] as const) await t.test(variant, async child => {
+    const { V2ShadowCompatibilityMaterializer } = await import(moduleUrl), f = await createCompatibilityFixture(child);
+    const materializer = new V2ShadowCompatibilityMaterializer(f.materializerOptions);
+    await materializer.materializePending(f.input);
+    const target = join(f.isolatedRoot, "legacy/one.md"); unlinkSync(target);
+    if (variant === "contradictory") renameSync(join(f.isolatedRoot, "legacy/two.md"), target);
+    const before = ledger(f), files = tree(f.isolatedRoot);
+    assert.equal(typeof materializer.reconcile, "function");
+    await assert.rejects(materializer.reconcile(f.input), codeIs("COMPATIBILITY_INTEGRITY_FAILURE"));
+    assert.deepEqual(ledger(f), before); assert.deepEqual(tree(f.isolatedRoot), files);
+  });
+});
+
+test("Task11E snapshot expiry closes acquired resources and preserves the primary deadline over cleanup failure", async t => {
+  const { V2ShadowCompatibilityMaterializer } = await import(moduleUrl), f = await createCompatibilityFixture(t);
+  let time = 0, closed = 0; const deadline = createShadowMigrationInvocationDeadline(30000, () => time);
+  const original = V2ImportedProjectionEventReader.prototype.openCommittedSnapshot;
+  V2ImportedProjectionEventReader.prototype.openCommittedSnapshot = async function (...args) {
+    const snapshot = await original.apply(this, args); time = 30000;
+    return { ...snapshot, close() { snapshot.close(); closed++; throw new Error("cleanup failure must not erase deadline"); } };
+  };
+  const before = ledger(f);
+  try { await assert.rejects(new V2ShadowCompatibilityMaterializer(f.materializerOptions).materializePending({ ...f.input,
+    invocationDeadline: deadline }), codeIs("MIGRATION_RETRY_EXHAUSTED")); }
+  finally { deadline.dispose(); V2ImportedProjectionEventReader.prototype.openCommittedSnapshot = original; }
+  assert.equal(closed, 1); assert.deepEqual(ledger(f), before); assert.deepEqual(readdirSync(f.isolatedRoot), []);
+});
+
+test("Task11E refuses replaced isolated root after awaited source proof even for absent artifacts", async t => {
+  const { V2ShadowCompatibilityMaterializer } = await import(moduleUrl), f = await createCompatibilityFixture(t);
+  const original = V2ImportedProjectionEventReader.prototype.openCommittedSnapshot; let swapped = false;
+  V2ImportedProjectionEventReader.prototype.openCommittedSnapshot = async function (...args) {
+    const snapshot = await original.apply(this, args);
+    renameSync(f.isolatedRoot, `${f.isolatedRoot}-retained`); mkdirSync(f.isolatedRoot); swapped = true;
+    return snapshot;
+  };
+  const before = ledger(f);
+  try { await assert.rejects(new V2ShadowCompatibilityMaterializer(f.materializerOptions).reconcile(f.input), codeIs("COMPATIBILITY_INTEGRITY_FAILURE")); }
+  finally { V2ImportedProjectionEventReader.prototype.openCommittedSnapshot = original; }
+  assert.equal(swapped, true); assert.deepEqual(ledger(f), before); assert.deepEqual(readdirSync(f.isolatedRoot), []);
+});
+
+test("Task11E read failure cannot prove absence and partial claims never invoke target verification", async t => {
+  let armed = false, reads = 0;
+  class FailedRead extends DatabaseSync {
+    override prepare(sql: string): StatementSync {
+      if (armed && sql.startsWith("SELECT * FROM v2_shadow_compatibility_claims")) { reads++; throw new Error("unobservable read"); }
+      return super.prepare(sql);
+    }
+  }
+  const { V2ShadowCompatibilityMaterializer } = await import(moduleUrl), f = await createCompatibilityFixture(t, { database: FailedRead });
+  const materializer = new V2ShadowCompatibilityMaterializer(f.materializerOptions), before = ledger(f);
+  armed = true;
+  try { assert.deepEqual(await materializer.reconcile(f.input), { status: "unknown", safeErrorCode: "MIGRATION_OUTCOME_UNKNOWN" }); }
+  finally { armed = false; }
+  assert.equal(reads, 1); assert.deepEqual(ledger(f), before);
+  let claims = 0;
+  const migration = f.sealedPackage.migrationIdentity, id = deterministicMigrationUuid("claim", migration, 2);
+  f.repository.transact(f.projectionBinding.projectId, migration, tx => tx.claimCompatibility({ projectId: f.projectionBinding.projectId,
+    migrationIdentity: migration, outboxId: id, claimId: id,
+    claimOwnerFingerprint: createHash("sha256").update(`project-memory/v2-shadow-compatibility-owner/v1\n${migration}`).digest("hex"), claimedAt: "2026-09-10T00:00:00.002Z" }));
+  const original = StableCompatibilityDirectory.prototype.verifyOnly;
+  StableCompatibilityDirectory.prototype.verifyOnly = async function (...args) { claims++; return original.apply(this, args); };
+  const claimed = ledger(f);
+  try { assert.deepEqual(await materializer.reconcile(f.input), { status: "unknown", safeErrorCode: "MIGRATION_OUTCOME_UNKNOWN" }); }
+  finally { StableCompatibilityDirectory.prototype.verifyOnly = original; }
+  assert.equal(claims, 0); assert.deepEqual(ledger(f), claimed); assert.deepEqual(readdirSync(f.isolatedRoot), []);
+});
+
+test("Task11E expiry after each committed ack remains unknown and no-op expiry remains retry exhausted", async t => {
+  for (const at of [1, 2]) await t.test(`ack-${at}`, async child => {
+    const { V2ShadowCompatibilityMaterializer } = await import(moduleUrl), f = await createCompatibilityFixture(child);
+    let time = 0, acks = 0; const deadline = createShadowMigrationInvocationDeadline(30000, () => time);
+    try { await assert.rejects(new V2ShadowCompatibilityMaterializer({ ...f.materializerOptions, fault: (point: string) => {
+      if (point === "after-compatibility-ack" && ++acks === at) time = 30000;
+    } }).materializePending({ ...f.input, invocationDeadline: deadline }), codeIs("MIGRATION_OUTCOME_UNKNOWN")); }
+    finally { deadline.dispose(); }
+    assert.equal(acks, at); assert.equal(ledger(f).acks.length, at); assert.equal(ledger(f).claims.length, at);
+    const clean = new V2ShadowCompatibilityMaterializer(f.materializerOptions); await clean.materializePending(f.input);
+    const before = ledger(f), targets = tree(f.isolatedRoot); let verified = 0; time = 0;
+    const noopDeadline = createShadowMigrationInvocationDeadline(30000, () => time), original = StableCompatibilityDirectory.prototype.verifyOnly;
+    StableCompatibilityDirectory.prototype.verifyOnly = async function (...args) {
+      const result = await original.apply(this, args); if (++verified === 2) time = 30000; return result;
+    };
+    try { await assert.rejects(clean.materializePending({ ...f.input, invocationDeadline: noopDeadline }), codeIs("MIGRATION_RETRY_EXHAUSTED")); }
+    finally { noopDeadline.dispose(); StableCompatibilityDirectory.prototype.verifyOnly = original; }
+    assert.equal(verified, 2); assert.deepEqual(ledger(f), before); assert.deepEqual(tree(f.isolatedRoot), targets);
+  });
+});
+
+test("Task11E samples child and imported-reader timeouts after prior transactions and awaits and zeroes payload bytes", async t => {
+  let armed = false, time = 0, commits = 0;
+  class TimedCommit extends DatabaseSync {
+    override exec(sql: string): void { super.exec(sql); if (armed && sql === "COMMIT") { time += 500; commits++; } }
+  }
+  const { V2ShadowCompatibilityMaterializer } = await import(moduleUrl), f = await createCompatibilityFixture(t, { database: TimedCommit });
+  const deadline = createShadowMigrationInvocationDeadline(30000, () => time), native: number[] = [], payloads: Uint8Array[] = [];
+  const prepare = StableCompatibilityDirectory.prototype.prepareParent, publish = StableCompatibilityDirectory.prototype.publishOrReconcile;
+  const verify = StableCompatibilityDirectory.prototype.verifyOnly; let verified = 0;
+  const opens: number[] = [], driver = { ...f.driver, open: f.driver.open.bind(f.driver) };
+  driver.open = (path, options) => { if (armed) opens.push(options.busyTimeoutMs); return f.driver.open(path, options); };
+  StableCompatibilityDirectory.prototype.prepareParent = async function (path, remainingMs) {
+    assert.equal(remainingMs, 30000 - time); native.push(remainingMs);
+    const result = await prepare.call(this, path, remainingMs); time += 700; return result;
+  };
+  StableCompatibilityDirectory.prototype.publishOrReconcile = async function (input) {
+    assert.equal(input.remainingMs, 30000 - time); native.push(input.remainingMs); payloads.push(input.bytes);
+    const result = await publish.call(this, input); time += 300; return result;
+  };
+  StableCompatibilityDirectory.prototype.verifyOnly = async function (input) {
+    assert.equal(input.remainingMs, 30000 - time); verified++;
+    const result = await verify.call(this, input); time += 200; return result;
+  };
+  armed = true;
+  try { const materializer = new V2ShadowCompatibilityMaterializer({ ...f.materializerOptions, driver });
+    const result = await materializer.materializePending({ ...f.input, invocationDeadline: deadline }); assert.equal(result.acknowledgedCount, 2);
+    const noOp = await materializer.materializePending({ ...f.input, invocationDeadline: deadline }); assert.equal(noOp.deduplicated, true);
+  }
+  finally { armed = false; deadline.dispose(); StableCompatibilityDirectory.prototype.prepareParent = prepare;
+    StableCompatibilityDirectory.prototype.publishOrReconcile = publish; StableCompatibilityDirectory.prototype.verifyOnly = verify; }
+  assert.equal(verified, 2);
+  assert.ok(commits >= 5); assert.equal(native.length, 4); assert.ok(native[1]! < native[0]!); assert.ok(opens.length >= 2);
+  assert.ok(opens.every(value => value > 0 && value <= 5000)); assert.equal(payloads.length, 2);
+  for (const bytes of payloads) assert.ok(bytes.every(value => value === 0));
+});
+
+test("Task11E expiry inside an actual claim transaction rolls back without inventing a durable mutation", async t => {
+  let armed = false, time = 0, inserted = 0;
+  class ExpireClaim extends DatabaseSync {
+    override prepare(sql: string): StatementSync {
+      const statement = super.prepare(sql);
+      if (armed && sql.startsWith("INSERT INTO v2_shadow_compatibility_claims")) {
+        const run = statement.run.bind(statement);
+        statement.run = ((...args: Parameters<typeof run>) => { const result = run(...args); inserted++; time = 30000; return result; }) as typeof statement.run;
+      }
+      return statement;
+    }
+  }
+  const { V2ShadowCompatibilityMaterializer } = await import(moduleUrl), f = await createCompatibilityFixture(t, { database: ExpireClaim });
+  const deadline = createShadowMigrationInvocationDeadline(30000, () => time), before = ledger(f); armed = true;
+  try { await assert.rejects(new V2ShadowCompatibilityMaterializer(f.materializerOptions).materializePending({ ...f.input,
+    invocationDeadline: deadline }), codeIs("MIGRATION_RETRY_EXHAUSTED")); }
+  finally { armed = false; deadline.dispose(); }
+  assert.equal(inserted, 1); assert.deepEqual(ledger(f), before); assert.deepEqual(readdirSync(f.isolatedRoot), []);
+});
+
+test("Task11E imported reads use the remainder consumed by a real transaction and proof expiry cannot become absence", async t => {
+  let armed = false, time = 0, commits = 0;
+  class LateCommit extends DatabaseSync {
+    override exec(sql: string): void { super.exec(sql); if (armed && sql === "COMMIT") { commits++; time = 27000; } }
+  }
+  const { V2ShadowCompatibilityMaterializer } = await import(moduleUrl), f = await createCompatibilityFixture(t, { database: LateCommit });
+  const before = ledger(f), deadline = createShadowMigrationInvocationDeadline(30000, () => time), opens: number[] = [];
+  const driver = { open: (path: Parameters<typeof f.driver.open>[0], options: Parameters<typeof f.driver.open>[1]) => {
+    opens.push(options.busyTimeoutMs); assert.equal(options.busyTimeoutMs, 3000); return f.driver.open(path, options);
+  } };
+  armed = true;
+  try { assert.deepEqual(await new V2ShadowCompatibilityMaterializer({ ...f.materializerOptions, driver }).reconcile({ ...f.input,
+    invocationDeadline: deadline }), { status: "absent" }); }
+  finally { armed = false; deadline.dispose(); }
+  assert.ok(commits >= 2); assert.equal(opens.length, 2); assert.deepEqual(ledger(f), before);
+  const expired = createShadowMigrationInvocationDeadline(30000, () => time); time += 30000;
+  try { await assert.rejects(new V2ShadowCompatibilityMaterializer(f.materializerOptions).reconcile({ ...f.input, invocationDeadline: expired }),
+    codeIs("MIGRATION_RETRY_EXHAUSTED")); }
+  finally { expired.dispose(); }
+  assert.deepEqual(ledger(f), before); assert.deepEqual(readdirSync(f.isolatedRoot), []);
+});
+
+test("Task11E settles native preparation then refuses expired publication without abandoning work", async t => {
+  const { V2ShadowCompatibilityMaterializer } = await import(moduleUrl), f = await createCompatibilityFixture(t);
+  let time = 0, prepared = 0, published = 0; const deadline = createShadowMigrationInvocationDeadline(30000, () => time);
+  const prepare = StableCompatibilityDirectory.prototype.prepareParent, publish = StableCompatibilityDirectory.prototype.publishOrReconcile;
+  StableCompatibilityDirectory.prototype.prepareParent = async function (...args) { const result = await prepare.apply(this, args); prepared++; time = 30000; return result; };
+  StableCompatibilityDirectory.prototype.publishOrReconcile = async function (...args) { published++; return publish.apply(this, args); };
+  try { await assert.rejects(new V2ShadowCompatibilityMaterializer(f.materializerOptions).materializePending({ ...f.input, invocationDeadline: deadline }),
+    codeIs("MIGRATION_OUTCOME_UNKNOWN")); }
+  finally { deadline.dispose(); StableCompatibilityDirectory.prototype.prepareParent = prepare; StableCompatibilityDirectory.prototype.publishOrReconcile = publish; }
+  assert.equal(prepared, 1); assert.equal(published, 0); assert.equal(ledger(f).claims.length, 1); assert.equal(ledger(f).acks.length, 0);
+  assert.deepEqual(readdirSync(join(f.isolatedRoot, "legacy")), []);
+});
+
+test("Task11E proof authenticates zero and nonzero run receipt event claim and ack evidence", async t => {
+  for (const variant of ["zero-run", "zero-receipt", "event", "claim", "ack"] as const) await t.test(variant, async child => {
+    const { V2ShadowCompatibilityMaterializer } = await import(moduleUrl), f = await createCompatibilityFixture(child, { legacyArtifacts: !variant.startsWith("zero") });
+    const materializer = new V2ShadowCompatibilityMaterializer(f.materializerOptions);
+    if (variant === "ack") await materializer.materializePending(f.input);
+    if (variant === "claim") {
+      await assert.rejects(new V2ShadowCompatibilityMaterializer({ ...f.materializerOptions, fault: () => { throw new Error("boundary"); } }).materializePending(f.input));
+    }
+    const table = variant === "zero-run" ? "v2_shadow_migration_runs" : variant === "zero-receipt" ? "v2_shadow_imported_records"
+      : variant === "event" ? "events" : variant === "claim" ? "v2_shadow_compatibility_claims" : "v2_shadow_compatibility_acknowledgements";
+    for (const row of f.connection.prepare("SELECT name FROM sqlite_master WHERE type='trigger' AND tbl_name=$t").all({ $t: table })) {
+      f.connection.exec(`DROP TRIGGER "${String(row.name).replace(/"/g, '""')}"`);
+    }
+    const update = variant === "zero-run" ? "build_identity_hash='ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff'"
+      : variant === "zero-receipt" ? "recorded_at='2026-09-10T00:00:01.000Z'"
+      : variant === "event" ? "actor_role='maintenance'"
+      : variant === "claim" ? "claimed_at='2026-09-10T00:00:01.000Z'" : "acknowledged_at='2026-09-10T00:00:01.000Z'";
+    f.connection.exec(`UPDATE ${table} SET ${update}`);
+    const rows = f.connection.prepare(`SELECT * FROM ${table}`).all(), targets = tree(f.isolatedRoot);
+    await assert.rejects(materializer.reconcile(f.input), (error: unknown) => error instanceof ShadowMigrationError
+      && ["COMPATIBILITY_INTEGRITY_FAILURE", "MIGRATION_LEDGER_INTEGRITY_FAILURE", "PROJECTION_INTEGRITY_FAILURE"].includes(error.code));
+    assert.deepEqual(f.connection.prepare(`SELECT * FROM ${table}`).all(), rows); assert.deepEqual(tree(f.isolatedRoot), targets);
+  });
+});
+
+test("Task11E unobservable target response remains unknown and unknown typed codes are redacted", async t => {
+  const { V2ShadowCompatibilityMaterializer } = await import(moduleUrl), f = await createCompatibilityFixture(t);
+  const materializer = new V2ShadowCompatibilityMaterializer(f.materializerOptions); await materializer.materializePending(f.input);
+  const before = ledger(f), targets = tree(f.isolatedRoot), original = StableCompatibilityDirectory.prototype.verifyOnly;
+  for (const kind of ["transient", "unallowlisted"] as const) {
+    let verified = 0;
+    StableCompatibilityDirectory.prototype.verifyOnly = async function (...args) {
+      await original.apply(this, args); verified++;
+      throw kind === "transient" ? new ShadowMigrationError("MIGRATION_OUTCOME_UNKNOWN") : new ShadowMigrationError("secret-code" as never);
+    };
+    try { assert.deepEqual(await materializer.reconcile(f.input), { status: "unknown", safeErrorCode: "MIGRATION_OUTCOME_UNKNOWN" }); }
+    finally { StableCompatibilityDirectory.prototype.verifyOnly = original; }
+    assert.equal(verified, 1); assert.deepEqual(ledger(f), before); assert.deepEqual(tree(f.isolatedRoot), targets);
+  }
+});
+
+test("Task11E cooperatively stops an actual eager evidence traversal before visiting another receipt", async t => {
+  const { V2ShadowCompatibilityMaterializer } = await import(moduleUrl), f = await createCompatibilityFixture(t);
+  const before = ledger(f), entries = Object.entries; let time = 0, visited = 0;
+  const deadline = createShadowMigrationInvocationDeadline(30000, () => time);
+  Object.entries = ((value: object) => {
+    const result = entries(value);
+    if (Object.hasOwn(value, "sourceKind") && Object.hasOwn(value, "importedGlobalPosition")) { visited++; time = 30000; }
+    return result;
+  }) as typeof Object.entries;
+  try { await assert.rejects(new V2ShadowCompatibilityMaterializer(f.materializerOptions).materializePending({ ...f.input, invocationDeadline: deadline }),
+    codeIs("MIGRATION_RETRY_EXHAUSTED")); }
+  finally { Object.entries = entries; deadline.dispose(); }
+  assert.equal(visited, 1); assert.deepEqual(ledger(f), before); assert.deepEqual(readdirSync(f.isolatedRoot), []);
+});
+
+test("Task11E replay cleanup preserves callback expiry after real iteration and real close", async t => {
+  const { V2ShadowCompatibilityMaterializer } = await import(moduleUrl), f = await createCompatibilityFixture(t);
+  let time = 0, opens = 0, visited = 0, closed = 0;
+  const deadline = createShadowMigrationInvocationDeadline(30000, () => time), before = ledger(f);
+  const driver = { open: (path: Parameters<typeof f.driver.open>[0], options: Parameters<typeof f.driver.open>[1]) => {
+    const connection = f.driver.open(path, options);
+    if (++opens !== 2) return connection;
+    const prepare = connection.prepare.bind(connection), close = connection.close.bind(connection);
+    connection.prepare = sql => {
+      const statement = prepare(sql), iterate = statement.iterate.bind(statement);
+      statement.iterate = function* (params) {
+        for (const row of iterate(params)) { visited++; time = 30000; yield row; }
+      };
+      return statement;
+    };
+    connection.close = () => { close(); closed++; throw new Error("secondary replay close failure"); };
+    return connection;
+  } };
+  try { await assert.rejects(new V2ShadowCompatibilityMaterializer({ ...f.materializerOptions, driver }).materializePending({ ...f.input,
+    invocationDeadline: deadline }), codeIs("MIGRATION_RETRY_EXHAUSTED")); }
+  finally { deadline.dispose(); }
+  assert.equal(opens, 2); assert.equal(visited, 1); assert.equal(closed, 1);
+  assert.deepEqual(ledger(f), before); assert.deepEqual(readdirSync(f.isolatedRoot), []);
+});
 
 const moduleUrl = new URL("../src/orchestrator/materialization/v2-shadow-compatibility.materializer.js", import.meta.url).href;
 test("rejects a transparent connection wrapper before the first compatibility claim", async t => {
