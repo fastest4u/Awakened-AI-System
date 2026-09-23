@@ -10,7 +10,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { canonicalJson } from "../src/orchestrator/serialization/canonical-json.js";
 import { buildV2ShadowMigrationEvidence, buildV2ShadowMigrationPreflightFailureEvidence,
   reserveV2ShadowMigrationEvidence, writeV2ShadowMigrationEvidence,
-  hasRequiredApprovedV2ShadowMigrationReviews, type V2ShadowMigrationEvidenceV1,
+  hasRequiredApprovedV2ShadowMigrationReviews, V2ShadowMigrationEvidenceError, type V2ShadowMigrationEvidenceV1,
 } from "../src/orchestrator/migration/v2-shadow-migration-evidence.js";
 import { V2ShadowMigrationRunner, V2ShadowMigrationPreflightFailure, readV2ShadowMigrationPreflightEvidence } from "../src/orchestrator/migration/v2-shadow-migration-runner.js";
 import { createShadowMigrationRunnerFixture } from "./support/v2-shadow-migration-fixture.js";
@@ -96,6 +96,27 @@ test("review subset stays incomplete and changes-required cannot produce green e
   assert.equal(result.gates.some((gate: { status: string }) => gate.status === "failed"), true);
   assert.equal(hasRequiredApprovedV2ShadowMigrationReviews(result), false);
   assert.throws(() => buildV2ShadowMigrationEvidence({ ...input(), reviews: [review, review] }));
+});
+const typedInvalid = (error: unknown) => error instanceof V2ShadowMigrationEvidenceError && error.code === "EVIDENCE_INVALID";
+for (const [kind, credential] of [["project", "sk-proj-" + "a".repeat(32)], ["anthropic", "sk-ant-api03-" + "b".repeat(32)], ["github", "ghp_" + "c".repeat(36)]] as const) {
+  test(`credential-shaped ${kind} strings refuse in nested labels and dynamic keys`, () => {
+    // Deliberately fake credentials; no provider/account/source authority is implied.
+    for (const value of [credential, `fixture_${credential}_label`]) {
+      assert.throws(() => buildV2ShadowMigrationEvidence({ ...input(), tests: [{ name: value, passed: 1, failed: 0, skipped: 0 }] }), typedInvalid);
+      assert.throws(() => buildV2ShadowMigrationEvidence({ ...input(), parity: { ...input().parity, ruleIds: [value] } }), typedInvalid);
+      assert.throws(() => buildV2ShadowMigrationEvidence({ ...input(), gates: [{ name: value, status: "passed", evidenceDigest: H }] }), typedInvalid);
+      assert.throws(() => buildV2ShadowMigrationEvidence({ ...input(), counts: { [value]: 1 } }), typedInvalid);
+    }
+  });
+}
+test("review prerequisite rejects null and other invalid roots with typed evidence errors", () => {
+  for (const value of [null, undefined, false, true, 0, "metadata", [], {}])
+    assert.throws(() => hasRequiredApprovedV2ShadowMigrationReviews(value as unknown as V2ShadowMigrationEvidenceV1), typedInvalid);
+});
+test("writer rejects a null evidence root with typed error before evidence publication", async t => {
+  const root = directory(t), reservation = await reserveV2ShadowMigrationEvidence({ outputPath: join(root, "success.json"), protectedRoots: [], timeoutMs: 5000 });
+  await assert.rejects(writeV2ShadowMigrationEvidence({ reservation, evidence: null as unknown as V2ShadowMigrationEvidenceV1 }), typedInvalid);
+  assert.deepEqual(fs.readdirSync(root), [CONTROL]);
 });
 test("review prerequisite checks evidence checksum before inspecting synthetic disposition fields", () => {
   const reviews = ["specification", "implementation-quality", "security"].map(kind => ({ kind, disposition: "approved", evidenceDigest: H }));

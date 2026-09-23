@@ -52,8 +52,9 @@ export class V2ShadowMigrationEvidenceError extends Error {
 function invalid(): never { throw new V2ShadowMigrationEvidenceError("EVIDENCE_INVALID"); }
 function refused(): never { throw new V2ShadowMigrationEvidenceError("EVIDENCE_OUTPUT_REFUSED"); }
 function unknown(): never { throw new V2ShadowMigrationEvidenceError("EVIDENCE_OUTCOME_UNKNOWN"); }
+const CREDENTIAL = /(?:^|[^a-z0-9])(?:sk[-_](?:[a-z0-9]+-)*[a-z0-9_-]{16,}|ghp_[a-z0-9]{16,}|(?:sk|AKIA)[-_]?[a-z0-9]{16})/i;
 function safeString(value: string): void {
-  if (value.length > 256 || /[\\/\x00-\x1f]|[a-z]:|-----BEGIN|\b(?:sk|AKIA)[-_]?[a-z0-9]{16}|plaintext|sentinel|password|secret|payload|rationale|approver/i.test(value)) invalid();
+  if (value.length > 256 || /[\\/\x00-\x1f]|[a-z]:|-----BEGIN|plaintext|sentinel|password|secret|payload|rationale|approver/i.test(value) || CREDENTIAL.test(value)) invalid();
 }
 /** Copy own data only; never invoke caller getters, proxies or serialization hooks. */
 function capture(value: unknown, depth = 0, budget = { nodes: 0 }, ancestors = new Set<object>()): any {
@@ -169,7 +170,8 @@ export function buildV2ShadowMigrationPreflightFailureEvidence(failure: unknown)
   const carrier = readV2ShadowMigrationPreflightEvidence(failure); if (!carrier) invalid(); return sealed(failureBody(carrier), FAILURE_DOMAIN);
 }
 function documentBytes(input: unknown, failure: boolean): { bytes: Buffer; evidenceChecksum: string } {
-  const v = capture(input), { evidenceChecksum, ...body } = v; string(evidenceChecksum, HASH);
+  const v = capture(input); if (!v || typeof v !== "object" || Array.isArray(v)) invalid();
+  const { evidenceChecksum, ...body } = v; string(evidenceChecksum, HASH);
   const expected = failure ? sealed(failureBody(body), FAILURE_DOMAIN) : buildV2ShadowMigrationEvidence(body);
   if (canonicalJson(v) !== canonicalJson(expected)) invalid();
   return { bytes: Buffer.from(canonicalJson(expected) + "\n"), evidenceChecksum };
