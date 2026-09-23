@@ -31,6 +31,13 @@ interface ImportResponse { readonly [key: string]: JsonValue; readonly schemaVer
 type PlannedCommand = Readonly<{ recordedAt: string; eventIds: readonly string[]; command: AppendCommand<ImportResponse>; }>;
 const HASH = /^[0-9a-f]{64}$/;
 
+type BatchObservation = Readonly<{ maxBatchEvents: number; maxBatchBytes: number }>;
+const acceptedBatchObservations = new WeakMap<object, BatchObservation>();
+/** Process-local measurement provenance, available only for the original accepted result. */
+export function readV2ShadowImportBatchObservation(result: unknown): BatchObservation | undefined {
+  return typeof result === "object" && result !== null ? acceptedBatchObservations.get(result) : undefined;
+}
+
 export class V2ShadowImporter {
   private readonly repository: SqliteV2ShadowMigrationRepository;
   public constructor(private readonly dependencies: V2ShadowImporterDependencies) {
@@ -40,6 +47,7 @@ export class V2ShadowImporter {
   public import(input: V2ShadowImportInput): V2ShadowImportResult {
     const { context, sealedPackage } = input;
     let mutationOccurred = false;
+    let maxBatchEvents = 0, maxBatchBytes = 0, finalizedBatches = 0;
     const rawBoundary = importBoundary(this.dependencies, input.invocationDeadline, false);
     const boundary = (): void => {
       try { rawBoundary(); }
@@ -71,10 +79,10 @@ export class V2ShadowImporter {
       let replayed = true;
       streamBatches(sealedPackage, this.dependencies.policy, migrationContext, (batch, batchOrdinal) => {
         boundary();
+        const planned = planCommand(migrationContext, sealedPackage, batch, batchOrdinal);
         const receipts = batch.map((record) => priorByOrdinal.get(record.ordinal)).filter((receipt): receipt is ImportedRecordReceipt => receipt !== undefined);
         if (receipts.length !== 0 && receipts.length !== batch.length) conflict();
         if (receipts.length === batch.length) {
-          const planned = planCommand(migrationContext, sealedPackage, batch, batchOrdinal);
           for (const [index, receipt] of receipts.entries()) {
             const record = batch[index]!;
             assertReceipt(this.dependencies.connection, receipt, record, planned.recordedAt, migrationContext.binding.projectId, boundary);
@@ -84,16 +92,22 @@ export class V2ShadowImporter {
           }
         } else {
           replayed = false;
-          mutationOccurred = this.appendBatch(migrationContext, sealedPackage, batch, batchOrdinal, boundary, input.invocationDeadline)
+          mutationOccurred = this.appendBatch(migrationContext, sealedPackage, batch, batchOrdinal, planned, boundary, input.invocationDeadline)
             || mutationOccurred;
         }
+        maxBatchEvents = Math.max(maxBatchEvents, batch.length);
+        maxBatchBytes = Math.max(maxBatchBytes, commandBytes(planned.command));
+        finalizedBatches += 1;
       }, boundary);
       boundary();
       const receipts = this.repository.transact(manifest.projectId, identity, (tx) => { boundary(); return tx.readImportedRecords(); });
       if (receipts.length !== manifest.recordDescriptors.length) conflict();
       const ordered = [...receipts].sort((left, right) => left.sourceOrdinal - right.sourceOrdinal);
       sealedPackage.assertUnchanged(); boundary();
-      return importResult(sealedPackage, ordered, replayed);
+      if ((finalizedBatches === 0) !== (ordered.length === 0)) conflict();
+      const result = importResult(sealedPackage, ordered, replayed);
+      acceptedBatchObservations.set(result, Object.freeze({ maxBatchEvents, maxBatchBytes }));
+      return result;
     } catch (error) {
       if (mutationOccurred && error instanceof ShadowMigrationError && error.code === "MIGRATION_RETRY_EXHAUSTED") {
         throw new ShadowMigrationError("MIGRATION_OUTCOME_UNKNOWN", Object.freeze({}), { cause: error });
@@ -103,6 +117,7 @@ export class V2ShadowImporter {
   }
 
   public reconcile(input: V2ShadowImportInput): ShadowMigrationReconciliation<V2ShadowImportResult> {
+    let maxBatchEvents = 0, maxBatchBytes = 0, finalizedBatches = 0;
     try {
       const authority = boundTarget(this.dependencies, true);
       authority();
@@ -179,6 +194,9 @@ export class V2ShadowImporter {
             if (commandRows.length !== batch.length) conflict();
             committedBatches += 1;
           }
+          maxBatchEvents = Math.max(maxBatchEvents, batch.length);
+          maxBatchBytes = Math.max(maxBatchBytes, commandBytes(planned.command));
+          finalizedBatches += 1;
           for (const record of batch) {
             plannedRecords.push(record);
             recordedAtByOrdinal.set(record.ordinal, planned.recordedAt);
@@ -249,6 +267,10 @@ export class V2ShadowImporter {
         return Object.freeze({ status: "unknown" as const, safeErrorCode: "MIGRATION_OUTCOME_UNKNOWN" as const });
       });
       boundary(); sealedPackage.assertUnchanged(); boundary();
+      if (evidence.status === "committed") {
+        if ((finalizedBatches === 0) !== (evidence.result.recordCount === 0)) conflict();
+        acceptedBatchObservations.set(evidence.result, Object.freeze({ maxBatchEvents, maxBatchBytes }));
+      }
       return evidence;
     } catch (error) {
       if (error instanceof ShadowMigrationError) {
@@ -263,11 +285,10 @@ export class V2ShadowImporter {
   }
 
   private appendBatch(context: ProjectContext, package_: SealedV2MigrationPackage, batch: readonly PlannedRecord[], batchOrdinal: number,
-    boundary: () => void, deadline?: ShadowMigrationInvocationDeadline): boolean {
+    planned: PlannedCommand, boundary: () => void, deadline?: ShadowMigrationInvocationDeadline): boolean {
     if (batch.length === 0) return false;
     boundary();
     const identity = package_.migrationIdentity;
-    const planned = planCommand(context, package_, batch, batchOrdinal);
     const faultInjector = { hit: (point: Parameters<NonNullable<V2ShadowImporterDependencies["faultInjector"]>["hit"]>[0],
       context_: Parameters<NonNullable<V2ShadowImporterDependencies["faultInjector"]>["hit"]>[1]): void => {
       this.dependencies.faultInjector?.hit(point, context_);

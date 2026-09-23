@@ -8,7 +8,7 @@ import type { StoredEvent } from "../src/orchestrator/contracts/event.js";
 import { authenticateStoredEvent } from "../src/orchestrator/integrity/stored-event-authenticator.js";
 import { verifyV1SourceCopy } from "../src/orchestrator/migration/v1-source-copy.js";
 import { openSealedV2MigrationPackage, sealV2MigrationPackage, type SealedV2MigrationPackage, type V2MigrationPackageRecordV1 } from "../src/orchestrator/migration/v2-migration-package.js";
-import { V2ShadowImporter } from "../src/orchestrator/migration/v2-shadow-importer.js";
+import { V2ShadowImporter, readV2ShadowImportBatchObservation } from "../src/orchestrator/migration/v2-shadow-importer.js";
 import { deterministicMigrationUuid, ShadowMigrationError, shadowMigrationPolicyChecksum, type ShadowMigrationPolicyV1 } from "../src/orchestrator/migration/v2-shadow-migration.contracts.js";
 import { createShadowMigrationInvocationDeadline } from "../src/orchestrator/migration/v2-shadow-migration-runtime.js";
 import { canonicalJson } from "../src/orchestrator/serialization/canonical-json.js";
@@ -44,6 +44,43 @@ async function fixture(t: test.TestContext, faultInjector?: EventStoreFaultInjec
 }
 const unknown = (error: unknown) => error instanceof ShadowMigrationError && error.code === "MIGRATION_OUTCOME_UNKNOWN";
 const retryExhausted = (error: unknown) => error instanceof ShadowMigrationError && error.code === "MIGRATION_RETRY_EXHAUSTED";
+
+test("batch observations belong only to genuine accepted import and committed reconciliation results", async t => {
+  // Copied results cannot confer measurement provenance; replay reports processed geometry rather than zero writes.
+  const f = await fixture(t, undefined, true);
+  try {
+    const absent = f.importer.reconcile({ context: f.context, sealedPackage: f.sealedPackage });
+    assert.equal(readV2ShadowImportBatchObservation(absent), undefined);
+    const result = f.importer.import({ context: f.context, sealedPackage: f.sealedPackage });
+    const observed = readV2ShadowImportBatchObservation(result);
+    assert.ok(Object.isFrozen(result));
+    assert.ok(observed);
+    assert.ok(Object.isFrozen(observed));
+    assert.deepEqual(Object.keys(observed).sort(), ["maxBatchBytes", "maxBatchEvents"]);
+    assert.equal(observed.maxBatchEvents, 4);
+    assert.ok(observed.maxBatchBytes > f.sealedPackage.manifest.recordDescriptors.reduce((n, record) => n + record.byteLength, 0));
+    assert.ok(observed.maxBatchBytes < f.policy.maxBatchBytes);
+    let traps = 0;
+    const hostile = new Proxy(result, { get() { traps++; throw new Error("unexpected result access"); },
+      getPrototypeOf() { traps++; throw new Error("unexpected prototype access"); } });
+    const getter = Object.defineProperty({}, "maxBatchBytes", { get() { traps++; throw new Error("unexpected value access"); } });
+    for (const forged of [undefined, null, {}, Object.freeze({ ...result }), structuredClone(result),
+      Object.create(result), new Proxy(result, {}), hostile, getter, { result, ...observed }]) {
+      assert.equal(readV2ShadowImportBatchObservation(forged), undefined);
+    }
+    assert.equal(traps, 0);
+    assert.equal(Reflect.set(observed, "maxBatchBytes", 0), false);
+    const replay = f.importer.import({ context: f.context, sealedPackage: f.sealedPackage });
+    assert.equal(replay.deduplicated, true);
+    assert.deepEqual(readV2ShadowImportBatchObservation(replay), observed);
+    const reconciled = f.importer.reconcile({ context: f.context, sealedPackage: f.sealedPackage });
+    assert.equal(reconciled.status, "committed");
+    if (reconciled.status !== "committed") assert.fail("expected committed reconciliation");
+    assert.equal(readV2ShadowImportBatchObservation(reconciled), undefined);
+    assert.deepEqual(readV2ShadowImportBatchObservation(reconciled.result), observed);
+    assert.equal(f.connection.prepare("SELECT count(*) AS n FROM events").get()!.n, 4n);
+  } finally { f.close(); }
+});
 
 function observedConnection(base: SqliteConnection,
   after: (sql: string, operation: "run" | "get" | "all" | "iterate") => void): SqliteConnection {
@@ -280,14 +317,20 @@ test("reconciliation reports a real commit-before-receipt outcome as unknown and
   const f = await fixture(t, { hit(boundary) { if (!lost && boundary === "after-commit-before-response") {
     lost = true; throw new Error("lost-import-response"); } } }, true);
   try {
-    assert.throws(() => f.importer.import({ context: f.context, sealedPackage: f.sealedPackage }), unknown);
+    let failure: unknown;
+    assert.throws(() => f.importer.import({ context: f.context, sealedPackage: f.sealedPackage }), error => {
+      failure = error; return unknown(error);
+    });
+    assert.equal(readV2ShadowImportBatchObservation(failure), undefined);
     const beforeEvents = Number(f.connection.prepare("SELECT count(*) AS n FROM events").get()!.n);
-    assert.deepEqual(f.importer.reconcile({ context: f.context, sealedPackage: f.sealedPackage }),
-      { status: "unknown", safeErrorCode: "MIGRATION_OUTCOME_UNKNOWN" });
+    const unresolved = f.importer.reconcile({ context: f.context, sealedPackage: f.sealedPackage });
+    assert.deepEqual(unresolved, { status: "unknown", safeErrorCode: "MIGRATION_OUTCOME_UNKNOWN" });
+    assert.equal(readV2ShadowImportBatchObservation(unresolved), undefined);
     assert.equal(Number(f.connection.prepare("SELECT count(*) AS n FROM events").get()!.n), beforeEvents);
     assert.equal(Number(f.connection.prepare("SELECT count(*) AS n FROM v2_shadow_imported_records").get()!.n), 0);
     assert.equal(Number(f.connection.prepare("SELECT count(*) AS n FROM v2_shadow_compatibility_outbox").get()!.n), 0);
     const recovered = f.importer.import({ context: f.context, sealedPackage: f.sealedPackage });
+    assert.deepEqual(readV2ShadowImportBatchObservation(recovered), { maxBatchEvents: 4, maxBatchBytes: canonicalCommandBytes(f) });
     assert.equal(Number(f.connection.prepare("SELECT count(*) AS n FROM events").get()!.n), recovered.recordCount);
     assert.equal(Number(f.connection.prepare("SELECT count(*) AS n FROM v2_shadow_compatibility_outbox").get()!.n), 2);
   } finally { f.close(); }
@@ -578,8 +621,10 @@ function commandGroupSizes(f: Awaited<ReturnType<typeof fixture>>): number[] {
   return f.connection.prepare("SELECT count(*) AS count FROM events GROUP BY command_id ORDER BY min(global_position)").all().map(row => Number(row.count));
 }
 function field(row: Record<string, unknown>, key: string): string { assert.equal(typeof row[key], "string"); return row[key] as string; }
-function canonicalCommandBytes(f: Awaited<ReturnType<typeof fixture>>): number {
-  const rows = f.connection.prepare("SELECT * FROM events ORDER BY global_position").all(); assert.ok(rows.length > 0); const first = rows[0]!;
+function canonicalCommandBytes(f: Awaited<ReturnType<typeof fixture>>, commandId?: string): number {
+  const rows = commandId === undefined ? f.connection.prepare("SELECT * FROM events ORDER BY global_position").all()
+    : f.connection.prepare("SELECT * FROM events WHERE command_id=$id ORDER BY global_position").all({ $id: commandId });
+  assert.ok(rows.length > 0); const first = rows[0]!;
   const stored = f.connection.prepare("SELECT response_json FROM command_dedup WHERE command_id=$id").get({ $id: field(first, "command_id") }); assert.ok(stored);
   const response = (JSON.parse(field(stored!, "response_json")) as { response: unknown }).response;
   const material = { commandId: field(first, "command_id"), commandType: "ImportV2ShadowBatch", projectId: field(first, "project_id"),
@@ -719,9 +764,142 @@ test("uses the policy event-count boundary exactly and starts a new batch at plu
     const exactPackage = repeatedSourcePackage(exact.sealedPackage, 2); const overPackage = repeatedSourcePackage(over.sealedPackage, 3);
     const exactImporter = importerWithPolicy(exact, { ...exact.policy, maxBatchEvents: 2 } as ShadowMigrationPolicyV1);
     const overImporter = importerWithPolicy(over, { ...over.policy, maxBatchEvents: 2 } as ShadowMigrationPolicyV1);
-    exactImporter.import({ context: exact.context, sealedPackage: exactPackage }); overImporter.import({ context: over.context, sealedPackage: overPackage });
+    const exactResult = exactImporter.import({ context: exact.context, sealedPackage: exactPackage });
+    const overResult = overImporter.import({ context: over.context, sealedPackage: overPackage });
     assert.deepEqual(commandGroupSizes(exact), [2]); assert.deepEqual(commandGroupSizes(over), [2, 1]);
+    assert.equal(readV2ShadowImportBatchObservation(exactResult)!.maxBatchEvents, 2);
+    assert.equal(readV2ShadowImportBatchObservation(overResult)!.maxBatchEvents, 2);
   } finally { over.close(); exact.close(); }
+});
+
+test("observes finalized exact-limit and partial batches while excluding oversized candidates", async t => {
+  // Measuring speculative candidates would report three events or bytes above the accepted two-event command.
+  const probe = await fixture(t), target = await fixture(t);
+  try {
+    const probeResult = probe.importer.import({ context: probe.context, sealedPackage: repeatedSourcePackage(probe.sealedPackage, 2) });
+    const exactBytes = canonicalCommandBytes(probe);
+    assert.deepEqual(readV2ShadowImportBatchObservation(probeResult), { maxBatchEvents: 2, maxBatchBytes: exactBytes });
+    const importer = importerWithPolicy(target, { ...target.policy, maxBatchBytes: exactBytes });
+    const package_ = repeatedSourcePackage(target.sealedPackage, 3);
+    const result = importer.import({ context: target.context, sealedPackage: package_ });
+    assert.deepEqual(commandGroupSizes(target), [2, 1]);
+    const observation = readV2ShadowImportBatchObservation(result);
+    assert.deepEqual(observation, { maxBatchEvents: 2, maxBatchBytes: exactBytes });
+    assert.deepEqual(readV2ShadowImportBatchObservation(importer.import({ context: target.context, sealedPackage: package_ })), observation);
+    assert.equal(target.connection.prepare("SELECT count(*) AS n FROM events").get()!.n, 3n);
+  } finally { target.close(); probe.close(); }
+});
+
+test("observes UTF-8 command and response overhead rather than source bytes or policy ceilings", async t => {
+  // Payload character length and descriptor byte length both omit canonical command/response overhead.
+  const f = await fixture(t);
+  try {
+    const bytes = Buffer.from("\u0e44\u0e17\u0e22\ud83d\udd12\n".repeat(20));
+    const result = f.importer.import({ context: f.context, sealedPackage: artifactPackage(f.sealedPackage, bytes) });
+    const exactBytes = canonicalCommandBytes(f);
+    assert.deepEqual(readV2ShadowImportBatchObservation(result), { maxBatchEvents: 1, maxBatchBytes: exactBytes });
+    assert.ok(exactBytes > bytes.length);
+    assert.ok(bytes.length > bytes.toString("utf8").length);
+    assert.ok(exactBytes < Math.min(f.policy.maxBatchBytes, MAX_CANONICAL_COMMAND_BYTES));
+  } finally { f.close(); }
+});
+
+test("only an authenticated empty import or committed empty reconciliation reports zero batch geometry", async t => {
+  const f = await fixture(t, undefined, true, { sourceEventCount: 0, legacyArtifacts: false });
+  try {
+    const result = f.importer.import({ context: f.context, sealedPackage: f.sealedPackage });
+    assert.deepEqual(readV2ShadowImportBatchObservation(result), { maxBatchEvents: 0, maxBatchBytes: 0 });
+    const reconciled = f.importer.reconcile({ context: f.context, sealedPackage: f.sealedPackage });
+    assert.equal(reconciled.status, "committed");
+    if (reconciled.status !== "committed") assert.fail("expected empty committed result");
+    assert.deepEqual(readV2ShadowImportBatchObservation(reconciled.result), { maxBatchEvents: 0, maxBatchBytes: 0 });
+    assert.equal(readV2ShadowImportBatchObservation(Object.freeze({ ...result })), undefined);
+  } finally { f.close(); }
+});
+
+test("mixed receipt replay and new partial batch observations use maxima across the entire accepted resume", async t => {
+  // Observing only newly appended work would report the final single event instead of the verified 128-event replay batch.
+  let appends = 0;
+  const f = await fixture(t, { hit(point) {
+    if (point === "before-begin" && ++appends === 2) throw new Error("stop-before-second-batch");
+  } }, true, { sourceEventCount: MAX_EVENTS_PER_COMMAND + 1, legacyArtifacts: false });
+  try {
+    let failure: unknown;
+    assert.throws(() => f.importer.import({ context: f.context, sealedPackage: f.sealedPackage }), error => {
+      failure = error; return error instanceof ShadowMigrationError;
+    });
+    assert.equal(readV2ShadowImportBatchObservation(failure), undefined);
+    assert.equal(f.connection.prepare("SELECT count(*) AS n FROM events").get()!.n, 128n);
+    assert.equal(f.connection.prepare("SELECT count(*) AS n FROM v2_shadow_imported_records").get()!.n, 128n);
+    const unresolved = f.importer.reconcile({ context: f.context, sealedPackage: f.sealedPackage });
+    assert.deepEqual(unresolved, { status: "unknown", safeErrorCode: "MIGRATION_OUTCOME_UNKNOWN" });
+    assert.equal(readV2ShadowImportBatchObservation(unresolved), undefined);
+    const resumed = f.importer.import({ context: f.context, sealedPackage: f.sealedPackage });
+    assert.equal(resumed.deduplicated, false);
+    assert.deepEqual(commandGroupSizes(f), [128, 1]);
+    const commands = f.connection.prepare("SELECT command_id FROM events GROUP BY command_id").all();
+    const maxBytes = Math.max(...commands.map(row => canonicalCommandBytes(f, field(row, "command_id"))));
+    const expected = { maxBatchEvents: 128, maxBatchBytes: maxBytes };
+    assert.deepEqual(readV2ShadowImportBatchObservation(resumed), expected);
+    const noOp = f.importer.import({ context: f.context, sealedPackage: f.sealedPackage });
+    assert.equal(noOp.deduplicated, true);
+    assert.deepEqual(readV2ShadowImportBatchObservation(noOp), expected);
+    const committed = f.importer.reconcile({ context: f.context, sealedPackage: f.sealedPackage });
+    if (committed.status !== "committed") assert.fail("expected complete reconciliation");
+    assert.deepEqual(readV2ShadowImportBatchObservation(committed.result), expected);
+    assert.equal(f.connection.prepare("SELECT count(*) AS n FROM events").get()!.n, 129n);
+    assert.equal(f.connection.prepare("SELECT count(*) AS n FROM v2_shadow_imported_records").get()!.n, 129n);
+    assert.equal(appends, 3, "receipt replay never invokes another append");
+  } finally { f.close(); }
+});
+
+test("observation collection never performs a second package traversal or payload read", async t => {
+  // A telemetry replay pass would read the package or a record twice during one invocation.
+  const f = await fixture(t, undefined, true);
+  let traversals = 0, recordReads = 0;
+  const package_ = { ...f.sealedPackage, *records() {
+    assert.equal(++traversals, 1);
+    for (const record of f.sealedPackage.records()) yield { ...record, *readChunks() {
+      recordReads++; yield* record.readChunks();
+    } };
+  } };
+  try {
+    for (const operation of ["import", "import", "reconcile"] as const) {
+      traversals = 0; recordReads = 0;
+      const outcome = f.importer[operation]({ context: f.context, sealedPackage: package_ });
+      const result = "status" in outcome ? (outcome.status === "committed" ? outcome.result : assert.fail("expected committed")) : outcome;
+      assert.equal(readV2ShadowImportBatchObservation(result)!.maxBatchEvents, 4);
+      assert.equal(traversals, 1);
+      assert.equal(recordReads, 4);
+    }
+    assert.equal(f.connection.prepare("SELECT count(*) AS n FROM events").get()!.n, 4n);
+  } finally { f.close(); }
+});
+
+test("a failed final source check never returns a successful batch observation", async t => {
+  // Registering/returning before final source acceptance would let measured but unaccepted work escape as successful evidence.
+  for (const operation of ["import", "reconcile"] as const) await t.test(operation, async child => {
+    const f = await fixture(child, undefined, true);
+    try {
+      if (operation === "reconcile") f.importer.import({ context: f.context, sealedPackage: f.sealedPackage });
+      let assertions = 0, failure: unknown, returned: unknown;
+      const package_ = { ...f.sealedPackage, assertUnchanged() {
+        f.sealedPackage.assertUnchanged();
+        if (++assertions === 2) throw new ShadowMigrationError("MIGRATION_SOURCE_MUTATED");
+      } };
+      assert.throws(() => { returned = f.importer[operation]({ context: f.context, sealedPackage: package_ }); }, error => {
+        failure = error; return error instanceof ShadowMigrationError && error.code === "MIGRATION_SOURCE_MUTATED";
+      });
+      assert.equal(assertions, 2);
+      assert.equal(returned, undefined);
+      assert.equal(readV2ShadowImportBatchObservation(failure), undefined);
+      assert.equal(readV2ShadowImportBatchObservation(returned), undefined);
+      assert.equal(f.connection.prepare("SELECT count(*) AS n FROM events").get()!.n, 4n);
+      const accepted = f.importer.reconcile({ context: f.context, sealedPackage: f.sealedPackage });
+      if (accepted.status !== "committed") assert.fail("expected later accepted reconciliation");
+      assert.deepEqual(readV2ShadowImportBatchObservation(accepted.result), { maxBatchEvents: 4, maxBatchBytes: canonicalCommandBytes(f) });
+    } finally { f.close(); }
+  });
 });
 
 test("streams one bounded batch before consuming the next package record", async t => { const f=await fixture(t); try {
@@ -733,8 +911,11 @@ test("uses the EventStore event-count boundary exactly and starts a new batch at
   const exact = await fixture(t); const over = await fixture(t);
   try {
     const exactPackage = repeatedSourcePackage(exact.sealedPackage, 128); const overPackage = repeatedSourcePackage(over.sealedPackage, 129);
-    exact.importer.import({ context: exact.context, sealedPackage: exactPackage }); over.importer.import({ context: over.context, sealedPackage: overPackage });
+    const exactResult = exact.importer.import({ context: exact.context, sealedPackage: exactPackage });
+    const overResult = over.importer.import({ context: over.context, sealedPackage: overPackage });
     assert.deepEqual(commandGroupSizes(exact), [128]); assert.deepEqual(commandGroupSizes(over), [128, 1]);
+    assert.equal(readV2ShadowImportBatchObservation(exactResult)!.maxBatchEvents, 128);
+    assert.equal(readV2ShadowImportBatchObservation(overResult)!.maxBatchEvents, 128);
   } finally { over.close(); exact.close(); }
 });
 
@@ -747,8 +928,10 @@ test("uses full canonical-command bytes for the policy exact and plus-one bounda
     const exactBytes = canonicalCommandBytes(probe);
     const exactPackage = artifactPackage(exact.sealedPackage, Buffer.from("x"));
     const overPackage = artifactPackage(over.sealedPackage, Buffer.from("x"));
-    assert.equal(importerWithPolicy(exact, { ...exact.policy, maxBatchBytes: exactBytes } as ShadowMigrationPolicyV1)
-      .import({ context: exact.context, sealedPackage: exactPackage }).recordCount, 1);
+    const result = importerWithPolicy(exact, { ...exact.policy, maxBatchBytes: exactBytes } as ShadowMigrationPolicyV1)
+      .import({ context: exact.context, sealedPackage: exactPackage });
+    assert.equal(result.recordCount, 1);
+    assert.deepEqual(readV2ShadowImportBatchObservation(result), { maxBatchEvents: 1, maxBatchBytes: exactBytes });
     assert.throws(() => importerWithPolicy(over, { ...over.policy, maxBatchBytes: exactBytes - 1 } as ShadowMigrationPolicyV1)
       .import({ context: over.context, sealedPackage: overPackage }), limitExceeded);
     assert.equal(Number(over.connection.prepare("SELECT count(*) AS count FROM events").get()?.count), 0);
@@ -773,7 +956,9 @@ test("uses the EventStore canonical-byte boundary exactly and classifies plus on
     const overPackage = artifactPackage(over.sealedPackage, Buffer.alloc(exactContentBytes + 1, 0x78));
     const wide = { ...exact.policy, maxEventBytes: MAX_CANONICAL_COMMAND_BYTES + 1,
       maxBatchBytes: MAX_CANONICAL_COMMAND_BYTES + 1, maxAggregateBytes: MAX_CANONICAL_COMMAND_BYTES * 2 } as ShadowMigrationPolicyV1;
-    assert.equal(importerWithPolicy(exact, wide).import({ context: exact.context, sealedPackage: exactPackage }).recordCount, 1);
+    const result = importerWithPolicy(exact, wide).import({ context: exact.context, sealedPackage: exactPackage });
+    assert.equal(result.recordCount, 1);
+    assert.deepEqual(readV2ShadowImportBatchObservation(result), { maxBatchEvents: 1, maxBatchBytes: MAX_CANONICAL_COMMAND_BYTES });
     assert.equal(canonicalCommandBytes(exact), MAX_CANONICAL_COMMAND_BYTES);
     assert.throws(() => importerWithPolicy(over, wide).import({ context: over.context, sealedPackage: overPackage }), limitExceeded);
     assert.equal(Number(over.connection.prepare("SELECT count(*) AS count FROM events").get()?.count), 0);
