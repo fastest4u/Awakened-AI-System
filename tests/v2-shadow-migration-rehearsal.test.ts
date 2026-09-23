@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test, { type TestContext } from "node:test";
 import * as fs from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join, relative, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import childProcess from "node:child_process";
 import { syncBuiltinESMExports } from "node:module";
@@ -17,6 +17,215 @@ import { createShadowMigrationRunnerFixture, createSnapshotParityFixture } from 
 import { shadowMigrationPolicyChecksum } from "../src/orchestrator/migration/v2-shadow-migration.contracts.js";
 
 let compiledPreflight: Promise<any> | undefined;
+// This snapshot is independent of the original Git administration and captures current bytes,
+// including uncommitted additions/deletions. It is synthetic functional evidence only.
+function cleanBuildFixture(t: TestContext): string {
+  const original = resolve(fileURLToPath(new URL("../../", import.meta.url)));
+  const root = fs.realpathSync(fs.mkdtempSync(join(tmpdir(), "v2-clean-build-")));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const captures = new Map<string, Buffer>(), directories = new Map<string, string[]>(); let total = 0;
+  const originalHead = fixtureGit(original, ["rev-parse", "HEAD"]);
+  const originalStatus = fixtureGit(original, ["status", "--porcelain=v1", "--untracked-files=all"]);
+  const indexPath = resolve(original, fixtureGit(original, ["rev-parse", "--git-path", "index"]).trim());
+  const indexBytes = fs.readFileSync(indexPath);
+  function copy(name: string): void {
+    if (captures.has(name)) return;
+    const source = join(original, name), stat = fs.lstatSync(source);
+    assert.equal(stat.isSymbolicLink(), false);
+    if (stat.isDirectory()) {
+      const children = fs.readdirSync(source).filter(child => child !== "node_modules").sort();
+      directories.set(name, children);
+      for (const child of children) copy(join(name, child));
+      return;
+    }
+    assert.ok(stat.isFile());
+    const bytes = fs.readFileSync(source); total += bytes.length;
+    assert.ok(total <= 256 * 1024 * 1024 && captures.size < 20000, "bounded current-byte fixture");
+    captures.set(name, bytes); fs.mkdirSync(dirname(join(root, name)), { recursive: true });
+    fs.writeFileSync(join(root, name), bytes);
+  }
+  for (const name of ["src", "package.json", "package-lock.json", "tsconfig.json", ".gitignore",
+    "scripts/build.js", "scripts/run-v2-shadow-migration-rehearsal.js"]) copy(name);
+  const packages = new Set<string>();
+  function dependency(name: string, from: string): void {
+    let cursor = from, found: string | undefined;
+    while (cursor.startsWith(original)) {
+      const candidate = join(cursor, "node_modules", name);
+      if (fs.existsSync(join(candidate, "package.json"))) { found = candidate; break; }
+      const parent = dirname(cursor); if (parent === cursor) break; cursor = parent;
+    }
+    assert.ok(found, `installed fixture dependency ${name}`);
+    if (packages.has(found)) return; packages.add(found);
+    copy(relative(original, found));
+    const pkg = JSON.parse(fs.readFileSync(join(found, "package.json"), "utf8"));
+    for (const child of Object.keys(pkg.dependencies ?? {})) dependency(child, found);
+    // esbuild's one installed native tool is optional, platform-specific build input.
+    for (const child of Object.keys(pkg.optionalDependencies ?? {})) {
+      if (fs.existsSync(join(original, "node_modules", child, "package.json"))) dependency(child, found);
+    }
+  }
+  for (const name of ["esbuild", "javascript-obfuscator", "typescript", "zod"]) dependency(name, original);
+  for (const [name, bytes] of captures) {
+    assert.deepEqual(fs.readFileSync(join(original, name)), bytes, "capture correspondence at source");
+    assert.deepEqual(fs.readFileSync(join(root, name)), bytes, "capture correspondence at destination");
+  }
+  for (const [name, children] of directories) assert.deepEqual(fs.readdirSync(join(original, name)).filter(child => child !== "node_modules").sort(), children,
+    "capture correspondence includes additions and deletions");
+  fixtureGit(root, ["init", "--quiet"]);
+  fixtureGit(root, ["add", "--", "."]);
+  fixtureGit(root, ["commit", "--quiet", "-m", "synthetic current-byte build fixture"]);
+  assert.equal(fixtureGit(root, ["status", "--porcelain=v1", "--untracked-files=all"]), "");
+  assert.ok(fs.statSync(join(root, ".git")).isDirectory());
+  assert.equal(fixtureGit(original, ["rev-parse", "HEAD"]), originalHead);
+  assert.equal(fixtureGit(original, ["status", "--porcelain=v1", "--untracked-files=all"]), originalStatus);
+  assert.deepEqual(fs.readFileSync(indexPath), indexBytes, "the original index is not mutated");
+  return root;
+}
+function fixtureGit(root: string, args: string[]): string {
+  const env = Object.fromEntries(Object.entries(process.env).filter(([name]) => !name.startsWith("GIT_")));
+  Object.assign(env, { GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: process.platform === "win32" ? "NUL" : "/dev/null", GIT_TERMINAL_PROMPT: "0" });
+  return childProcess.execFileSync("git", ["--no-optional-locks", "-c", "core.autocrlf=false", "-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false",
+    "-c", "user.name=Synthetic Fixture", "-c", "user.email=fixture@invalid", ...args], { cwd: root, env, encoding: "utf8", windowsHide: true });
+}
+function fixtureBuild(root: string) {
+  return childProcess.spawnSync(process.execPath, ["scripts/build.js"], { cwd: root, encoding: "utf8", windowsHide: true, timeout: 180000, maxBuffer: 2 * 1024 * 1024 });
+}
+test("clean current-byte fixture validates provenance and refuses stale or corrupted build state before import", async t => {
+  const root = cleanBuildFixture(t), manifestPath = join(root, "dist/internal/v2-shadow-migration-build.json");
+  const built = fixtureBuild(root); assert.equal(built.status, 0, built.stdout + built.stderr);
+  const originalManifest = fs.readFileSync(manifestPath), manifest = JSON.parse(originalManifest.toString());
+  assert.equal(manifest.eligible, true); assert.equal(manifest.commit, fixtureGit(root, ["rev-parse", "HEAD"]).trim());
+  assert.match(manifest.buildIdentityHash, /^[0-9a-f]{64}$/);
+  assert.ok(manifest.inputs.some((entry: any) => entry.path.startsWith("node_modules/zod/")));
+  await t.test("measured loader preserves exact ordinary esbuild output and complete input set", async () => {
+    const esbuild = await import("esbuild");
+    const actualInputs = new Set<string>();
+    for (const [entry, artifact, external] of [
+      ["src/orchestrator/migration/v2-shadow-migration-rehearsal.ts", "dist/internal/v2-shadow-migration-rehearsal.js", false],
+      ["src/orchestrator/materialization/stable-compatibility-directory.worker.ts", "dist/internal/stable-compatibility-directory.worker.js", true],
+    ] as const) {
+      const result = await esbuild.build({ absWorkingDir: root, entryPoints: [entry], bundle: true, platform: "node", format: "esm",
+        target: "node24.16", minify: true, write: false, metafile: true, ...(external ? { packages: "external" as const } : {}) });
+      assert.deepEqual(Buffer.from(result.outputFiles![0]!.contents), fs.readFileSync(join(root, artifact)));
+      for (const name of Object.keys(result.metafile!.inputs)) actualInputs.add(name);
+    }
+    assert.deepEqual(manifest.inputs.map((input: any) => input.path), [...actualInputs].sort());
+  });
+  const command = pathToFileURL(join(root, "scripts/run-v2-shadow-migration-rehearsal.js")).href;
+  const validate = (identity = manifest.buildIdentityHash) => childProcess.spawnSync(process.execPath,
+    ["--input-type=module", "-e", `const m = await import(${JSON.stringify(command)}); try { const h = m.validateV2ShadowMigrationBuild(${JSON.stringify(identity)}); h.assertUnchanged(); } catch { process.exit(7); }`],
+    { cwd: root, encoding: "utf8", windowsHide: true, timeout: 30000 });
+  assert.equal(validate().status, 0);
+  await t.test("supplied identity mismatch refuses", () => assert.equal(validate("0".repeat(64)).status, 7));
+  for (const name of ["src/orchestrator/migration/v2-shadow-migration-rehearsal.ts", "tsconfig.json", "scripts/build.js",
+    "node_modules/zod/v3/types.js", "node_modules/esbuild/lib/main.js", "node_modules/typescript/lib/typescript.js", "dist/internal/v2-shadow-migration-rehearsal.js",
+    "dist/internal/stable-compatibility-directory.worker.js", "scripts/run-v2-shadow-migration-rehearsal.js"]) {
+    await t.test(`changed ${name} refuses`, () => {
+      const path = join(root, name), bytes = fs.readFileSync(path);
+      try { fs.appendFileSync(path, "\n "); assert.equal(validate().status, 7); }
+      finally { fs.writeFileSync(path, bytes); }
+    });
+  }
+  await t.test("malformed, noncanonical and unknown manifest fields refuse", () => {
+    for (const bytes of ["{}", "not-json", JSON.stringify({ ...manifest, surprise: true }), originalManifest.toString() + " "]) {
+      try { fs.writeFileSync(manifestPath, bytes); assert.equal(validate().status, 7); }
+      finally { fs.writeFileSync(manifestPath, originalManifest); }
+    }
+  });
+  await t.test("missing manifest refuses", () => {
+    fs.unlinkSync(manifestPath); try { assert.equal(validate().status, 7); } finally { fs.writeFileSync(manifestPath, originalManifest); }
+  });
+  await t.test("new undeclared resolution metadata refuses", () => {
+    const file = join(root, "node_modules/zod/v3/package.json");
+    try { fs.writeFileSync(file, '{"type":"module"}'); assert.equal(validate().status, 7); }
+    finally { fs.unlinkSync(file); }
+  });
+  await t.test("finalization handoff detects dependency changes", async () => {
+    const module = await import(command), handoff = module.validateV2ShadowMigrationBuild(manifest.buildIdentityHash);
+    const path = join(root, "node_modules/zod/v3/types.js"), bytes = fs.readFileSync(path);
+    try { fs.appendFileSync(path, "\n "); assert.throws(() => handoff.assertUnchanged()); }
+    finally { fs.writeFileSync(path, bytes); }
+  });
+  await t.test("operational invocation refuses without importing a changed bundle or touching selected paths", () => {
+    const marker = join(root, "must-not-exist"), artifact = join(root, "dist/internal/v2-shadow-migration-rehearsal.js"), bytes = fs.readFileSync(artifact);
+    fs.writeFileSync(artifact, `import {writeFileSync} from 'node:fs'; writeFileSync(${JSON.stringify(marker)},'bad');`);
+    try {
+      assert.equal(validate().status, 7); assert.equal(fs.existsSync(marker), false);
+      const result = childProcess.spawnSync(process.execPath, ["scripts/run-v2-shadow-migration-rehearsal.js", "--config", marker,
+        "--source-root", marker, "--work-root", marker, "--package-root", marker, "--evidence-output", marker],
+      { cwd: root, encoding: "utf8", windowsHide: true });
+      assert.notEqual(result.status, 0); assert.equal(result.stdout, ""); assert.equal(fs.existsSync(marker), false);
+      assert.equal(result.stderr.trim(), "REHEARSAL_COMPOSITION_UNAVAILABLE");
+    } finally { fs.writeFileSync(artifact, bytes); }
+  });
+  await t.test("clean changed HEAD does not reuse prior manifest", () => {
+    fixtureGit(root, ["commit", "--quiet", "--allow-empty", "-m", "different fixture commit"]);
+    assert.equal(validate().status, 7);
+  });
+  await t.test("dirty build invalidates eligibility permanently even after source restoration", () => {
+    const file = join(root, "src/orchestrator/migration/v2-shadow-migration-rehearsal.ts"), bytes = fs.readFileSync(file);
+    fs.appendFileSync(file, "\n ");
+    try { const result = fixtureBuild(root); assert.equal(result.status, 0, result.stdout + result.stderr); }
+    finally { fs.writeFileSync(file, bytes); }
+    assert.deepEqual(JSON.parse(fs.readFileSync(manifestPath, "utf8")), { schemaVersion: 1, eligible: false });
+    assert.equal(validate().status, 7);
+  });
+  await t.test("a missed installed input refuses instead of trusting metafile byte counts", () => {
+    const script = join(root, "scripts/build.js"), bytes = fs.readFileSync(script);
+    const text = bytes.toString().replace("filter: /.*/, namespace: 'file'", "filter: /[.]ts$/, namespace: 'file'");
+    assert.notEqual(text, bytes.toString(), "negative fixture must bypass JS loader interception");
+    try {
+      fs.writeFileSync(script, text); const result = fixtureBuild(root);
+      assert.notEqual(result.status, 0); assert.match(result.stderr, /REHEARSAL_BUILD_INVALID/);
+      assert.equal(JSON.parse(fs.readFileSync(manifestPath, "utf8")).eligible, false);
+    } finally { fs.writeFileSync(script, bytes); }
+  });
+  for (const [ordinal, name] of ["node_modules/zod/v3/types.js", "dist/internal/v2-shadow-migration-rehearsal.js"].entries()) {
+  await t.test(`late byte change to ${name} refuses manifest publication`, () => {
+    const dependency = join(root, name), bytes = fs.readFileSync(dependency);
+    const directory = join(root, ".superpowers"); fs.mkdirSync(directory, { recursive: true });
+    const preload = join(directory, `late-change-${ordinal}.mjs`), marker = join(directory, `changed-${ordinal}`);
+    fs.writeFileSync(preload, `import fs from 'node:fs'; import {syncBuiltinESMExports} from 'node:module';
+      const open=fs.openSync, close=fs.closeSync, selected=new Set(); let fired=false;
+      fs.openSync=(...args)=>{ const fd=open(...args); if (args[0]===${JSON.stringify(dependency)}) selected.add(fd); return fd; };
+      fs.closeSync=(fd)=>{close(fd); if(selected.delete(fd)&&!fired){fired=true; fs.appendFileSync(${JSON.stringify(dependency)},'\\n ');fs.writeFileSync(${JSON.stringify(marker)},'changed');}};
+      syncBuiltinESMExports();`);
+    try {
+      const result = childProcess.spawnSync(process.execPath, ["--import", pathToFileURL(preload).href, "scripts/build.js"],
+        { cwd: root, encoding: "utf8", windowsHide: true, timeout: 180000, maxBuffer: 2 * 1024 * 1024 });
+      assert.ok(fs.existsSync(marker), "the exact-load boundary was actually perturbed");
+      assert.notEqual(result.status, 0); assert.match(result.stderr, /REHEARSAL_BUILD_INVALID/);
+      assert.equal(JSON.parse(fs.readFileSync(manifestPath, "utf8")).eligible, false);
+    } finally { fs.writeFileSync(dependency, bytes); }
+  });
+  }
+  await t.test("dynamic runtime load refuses the actual private build", () => {
+    const entry = join(root, "src/orchestrator/migration/v2-shadow-migration-rehearsal.ts"), bytes = fs.readFileSync(entry);
+    try {
+      fs.appendFileSync(entry, "\nvoid import(process.env.UNDECLARED_PRIVATE_MODULE!);\n");
+      const result = fixtureBuild(root); assert.notEqual(result.status, 0); assert.match(result.stderr, /REHEARSAL_BUILD_INVALID/);
+      assert.equal(JSON.parse(fs.readFileSync(manifestPath, "utf8")).eligible, false);
+    } finally { fs.writeFileSync(entry, bytes); }
+  });
+  await t.test("missing command at build startup invalidates the previously eligible manifest", () => {
+    const file = join(root, "scripts/run-v2-shadow-migration-rehearsal.js"), bytes = fs.readFileSync(file);
+    fs.writeFileSync(manifestPath, originalManifest); fs.unlinkSync(file);
+    try { assert.notEqual(fixtureBuild(root).status, 0); assert.equal(JSON.parse(fs.readFileSync(manifestPath, "utf8")).eligible, false); }
+    finally { fs.writeFileSync(file, bytes); }
+  });
+});
+test("private build provenance is emitted explicitly and command import is inert", async () => {
+  await preflightArtifact();
+  const root = fileURLToPath(new URL("../../", import.meta.url));
+  const manifest = join(root, "dist/internal/v2-shadow-migration-build.json");
+  assert.equal(fs.existsSync(manifest), true, "the producer must emit explicit private build eligibility");
+  const command = join(root, "scripts/run-v2-shadow-migration-rehearsal.js");
+  assert.equal(fs.existsSync(command), true, "a pre-import validation boundary must exist");
+  const imported = childProcess.spawnSync(process.execPath, ["--input-type=module", "-e", `const m = await import(${JSON.stringify(pathToFileURL(command).href)}); if (typeof m.validateV2ShadowMigrationBuild !== 'function') process.exit(3);`],
+    { cwd: root, encoding: "utf8", windowsHide: true });
+  assert.equal(imported.status, 0, imported.stderr);
+  assert.equal(imported.stdout, "");
+});
 function preflightArtifact(): Promise<any> {
   return compiledPreflight ??= (async () => {
     const root = fileURLToPath(new URL("../../", import.meta.url));
