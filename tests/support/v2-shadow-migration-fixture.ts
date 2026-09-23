@@ -38,6 +38,19 @@ import { DefaultProjectionBuildCoordinator, V2ProjectionBuildCoordinator } from 
 import { V2ImportedProjectionEventReader } from "../../src/orchestrator/migration/v2-imported-event-reader.js";
 import { ImmutableProjectionBuilder } from "../../src/orchestrator/projections/builder.js";
 import { SqliteProjectionEventReader } from "../../src/orchestrator/projections/event-reader.js";
+import { IndexRepository } from "../../src/repositories/index.repository.js";
+import { NoteRepository } from "../../src/repositories/note.repository.js";
+import { AuditService } from "../../src/services/audit.service.js";
+import { MemoryCompactionService } from "../../src/services/memory-compaction.service.js";
+import { MemoryFollowUpService } from "../../src/services/memory-follow-up.service.js";
+import { MemoryLifecycleService } from "../../src/services/memory-lifecycle.service.js";
+import { MemoryQueryService } from "../../src/services/memory-query.service.js";
+import { MemoryTemplateService } from "../../src/services/memory-template.service.js";
+import { MemoryUsageService } from "../../src/services/memory-usage.service.js";
+import { MemoryWorkflowService } from "../../src/services/memory-workflow.service.js";
+import { NoteService } from "../../src/services/note.service.js";
+import { VaultHealthService } from "../../src/services/vault-health.service.js";
+import { VaultService } from "../../src/services/vault.service.js";
 import { InternalRetrievalService } from "../../src/orchestrator/retrieval/service.js";
 import { SqliteRetrievalCandidateRepository } from "../../src/orchestrator/retrieval/candidates.js";
 import { evaluateRetrievalQueries, evaluateSealedRetrieval, parseSealedRetrievalEvaluationBundle, type RetrievalEvaluationQueryV1 } from "../../src/orchestrator/retrieval/evaluation.js";
@@ -304,10 +317,10 @@ export async function createCompatibilityFixture(t: TestContext, options: { lega
 }
 
 /** Fresh production UUID fixture, fully written before source-copy verification. */
-export async function createSnapshotParityFixture(t: TestContext, options: { artifactMetadata?: boolean; checkpointHistory?: boolean; rankingPair?: boolean } = {}) {
+export async function createSnapshotParityFixture(t: TestContext, options: { artifactMetadata?: boolean; checkpointHistory?: boolean; rankingPair?: boolean; legacyArtifacts?: boolean } = {}) {
   let cleanup = () => {};
   t.after(() => cleanup());
-  const f = await createV2ShadowMigrationFixture(t, { ...options, parityCorpus: true, legacyArtifacts: false });
+  const f = await createV2ShadowMigrationFixture(t, { ...options, parityCorpus: true, legacyArtifacts: options.legacyArtifacts ?? false });
   const source = await verifyV1SourceCopy(f.verificationInput);
   cleanup = () => source.close();
   const sealedPackage = await sealV2MigrationPackage({ ...f.packageInput, source, packageRoot: f.packageRootA });
@@ -416,8 +429,51 @@ export async function createSnapshotParityFixture(t: TestContext, options: { art
   });
   const input: SnapshotParityInput = { ...publisherOptions, source, sealedPackage, preparedV1, rolloutRevisionId, projections,
     runStartedAt: f.manifest.createdAt, rules: [], sealedRetrieval: { corpus } };
-  return { ...f, source, sealedPackage, connection, repository, input, corpus, metadataRules, plaintextSentinel: "Sensitive parity metadata sentinel",
+  return { ...f, source, sealedPackage, connection, repository, input, corpus, metadataRules, context, plaintextSentinel: "Sensitive parity metadata sentinel",
     chosenQueryIds: chosen.map(q => q.queryId), rankingPair,
     phases: () => repository.transact(f.projectionBinding.projectId, sealedPackage.migrationIdentity, tx => tx.readTransitions().map(v => v.phase)),
     storedReport: () => repository.transact(f.projectionBinding.projectId, sealedPackage.migrationIdentity, tx => tx.readParityReport()) };
+}
+
+/** Real V1 workflow port seeded only in the caller's disposable test vault. */
+export function createRunnerV1CallerControl(vaultRoot: string) {
+  const vault = new VaultService(vaultRoot), usage = new MemoryUsageService(vaultRoot);
+  const query = new MemoryQueryService(vault, new IndexRepository(), usage);
+  const notes = new NoteService(new NoteRepository(vault)), lifecycle = new MemoryLifecycleService(vaultRoot);
+  lifecycle.start({ taskArea: "disposable Task11F V1 caller preservation control" });
+  return new MemoryWorkflowService(vault, query, new VaultHealthService(vault), notes, new MemoryTemplateService(),
+    new AuditService(vaultRoot), usage, new MemoryCompactionService(query, notes), lifecycle, new MemoryFollowUpService(vault));
+}
+
+/** A separately bootstrapped, empty runner target; producer fixture artifacts are reference evidence only. */
+export async function createShadowMigrationRunnerFixture(t: TestContext, options: { legacyArtifacts?: boolean; artifactMetadata?: boolean;
+  reference?: Awaited<ReturnType<typeof createSnapshotParityFixture>> } = {}) {
+  const f = options.reference ?? await createSnapshotParityFixture(t, options);
+  const prefix = `runner-${randomUUID()}`;
+  const eventStorePath = join(f.root, `${prefix}-target.sqlite`);
+  const packageRoot = join(f.root, `${prefix}-packages`), v1ProjectionRoot = join(f.root, `${prefix}-v1`),
+    v2ProjectionRoot = join(f.root, `${prefix}-v2`), compatibilityRoot = join(f.root, `${prefix}-compatibility`);
+  for (const root of [packageRoot, v1ProjectionRoot, v2ProjectionRoot, compatibilityRoot]) mkdirSync(root);
+  const target = f.driver.open(eventStorePath, { mode: "create", busyTimeoutMs: 5000 });
+  const rolloutRevisionId = f.input.rolloutRevisionId;
+  try {
+    applyCurrentProjectStoreSchema(target, f.projectionBinding, f.manifest.createdAt);
+    target.exec(v2ShadowMigration.sql);
+    new RolloutControlPlane(new SqliteRolloutControlPlaneRepository(target)).createRevision({
+      projectId: f.projectionBinding.projectId, revisionId: rolloutRevisionId, parentRevisionId: null,
+      buildIdentityHash: f.packageInput.buildIdentityHash, migrationIdentityHash: f.sealedPackage.migrationIdentity,
+      configurationChecksum: f.packageInput.configurationChecksum, v1BaselineChecksum: f.input.preparedV1.baselineChecksum,
+      cohortAlgorithmVersion: 1, cohortSalt: digest("runner-salt"), cohortBasisPoints: 0, createdAt: f.manifest.createdAt });
+  } finally { target.close(); }
+  const targetContext: ProjectContext = { ...f.context, binding: { ...f.context.binding,
+    storeRoute: { ...f.context.binding.storeRoute, eventsPath: eventStorePath } } };
+  const configuration = decodeShadowMigrationConfigurationV1({ schemaVersion: 1, policyChecksum: shadowMigrationPolicyChecksum(f.policy),
+    packageFormatVersion: 1, migrationAlgorithmVersion: 1, expectedDifferencePolicyVersion: f.policy.expectedDifferencePolicyVersion });
+  const runnerInput = { projectId: f.projectionBinding.projectId, rolloutRevisionId, targetContext,
+    sourceRoot: f.sourceRoot, sourceManifestPath: f.manifestPath, liveEventStorePath: f.liveEventStorePath,
+    liveLegacyArtifactRoot: f.liveVaultRoot, packageRoot, v1ProjectionRoot, v2ProjectionRoot, compatibilityRoot,
+    buildIdentityHash: f.packageInput.buildIdentityHash, configuration, policy: f.policy,
+    sealedRetrieval: { corpus: f.corpus, expectedBundle: f.corpus.bundle }, expectedDifferenceRules: [],
+    creationReasonCode: "production-shaped-rehearsal" as const };
+  return { ...f, eventStorePath, runnerInput };
 }

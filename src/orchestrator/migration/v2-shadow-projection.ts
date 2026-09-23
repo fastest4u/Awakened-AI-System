@@ -53,7 +53,7 @@ export interface V2ShadowProjectionPublisherOptions {
   readonly v2ProjectionDirectory: string;
   readonly policy: ShadowMigrationPolicyV1;
   readonly operationNow?: () => number;
-  readonly faultInjector?: Readonly<{ hit(boundary: "before-v2-integrity" | "before-v1-manifest", databasePath: string): void }>;
+  readonly faultInjector?: Readonly<{ hit(boundary: "before-v2-integrity" | "before-v1-manifest", databasePath: string): void | Promise<void> }>;
 }
 const BINDING_FIELDS = ["projectId", "vaultId", "storeId", "workspaceId", "branchScopeId", "branchRef"] as const;
 const SAFE_CODES: ReadonlySet<ShadowMigrationErrorCode> = new Set([
@@ -502,9 +502,11 @@ export class V2ShadowProjectionPublisher {
         this.#unchanged(input, operation);
         if (!sameProjectionDirectoryIdentity(lease.directoryIdentity, captureProjectionDirectoryIdentity(directory))) failure();
         if (captured.state === "missing") {
-          this.#options.faultInjector?.hit("before-v1-manifest", generation.databasePath);
+          const pending = this.#options.faultInjector?.hit("before-v1-manifest", generation.databasePath);
+          if (pending !== undefined) await pending;
           operation.check();
           this.#unchanged(input, operation);
+          if (!sameProjectionDirectoryIdentity(lease.directoryIdentity, captureProjectionDirectoryIdentity(directory))) failure();
           this.#integrity(directory, operation).verifyV1Generation(snapshot, generation);
           operation.check(); operation.mayHavePublished = true;
           publishProjectionManifest({ projectionDirectory: directory, manifest: generation.manifest,
@@ -545,8 +547,10 @@ export class V2ShadowProjectionPublisher {
       operation.check();
       if (v2.manifest.terminalEventPosition !== manifest.terminalEventPosition || v2.manifest.terminalEventHash !== manifest.terminalEventHash
         || BINDING_FIELDS.some(key => v2.manifest[key] !== binding[key]) || v2.manifest.createdAt !== manifest.createdAt) failure();
-      this.#options.faultInjector?.hit("before-v2-integrity", v2.databasePath);
+      const pending = this.#options.faultInjector?.hit("before-v2-integrity", v2.databasePath);
+      if (pending !== undefined) await pending;
       operation.check();
+      this.#unchanged(input, operation); checkRun();
       const snapshot = await reader.openCommittedSnapshot();
       await owned(() => snapshot.close(), async () => {
         operation.check(); this.#integrity(this.#options.v2ProjectionDirectory, operation).verifyCommittedSnapshot(binding, v2.manifest, snapshot);

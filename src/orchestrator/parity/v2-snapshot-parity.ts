@@ -265,7 +265,7 @@ export interface SnapshotParityInput extends ShadowProjectionInput, Omit<V2Shado
   readonly runStartedAt: string;
   readonly rules: readonly ExpectedDifferenceRuleV1[];
   readonly sealedRetrieval: Readonly<{ corpus: SealedRetrievalEvaluationCorpusV2 }>;
-  readonly faultInjector?: Readonly<{ hit(boundary: "after-report-before-phase4"): void }>;
+  readonly faultInjector?: Readonly<{ hit(boundary: "after-report-before-phase4"): void | Promise<void> }>;
 }
 const BINDING_FIELDS = ["projectId", "vaultId", "storeId", "workspaceId", "branchScopeId", "branchRef", "sessionId"] as const;
 const ROW_KEYS: Readonly<Record<ProjectionName, readonly string[]>> = {
@@ -819,7 +819,20 @@ export async function compareV1V2Snapshots(input: SnapshotParityInput): Promise<
     });
     checkInvocationDeadline(input.invocationDeadline);
     verifyTarget(input);
-    input.faultInjector?.hit("after-report-before-phase4");
+    const hookImages = input.faultInjector === undefined ? [] : [retainedV1.databasePath, input.projections.v2.databasePath]
+      .map(path => ({ path, identity: pathIdentity(path, false) }));
+    const pending = input.faultInjector?.hit("after-report-before-phase4");
+    if (pending !== undefined) await pending;
+    checkInvocationDeadline(input.invocationDeadline);
+    verifyTarget(input);
+    input.source.assertUnchanged(); input.sealedPackage.assertUnchanged();
+    for (const image of hookImages) {
+      checkInvocationDeadline(input.invocationDeadline);
+      const current = pathIdentity(image.path, false);
+      if (["dev", "ino", "size", "ctimeNs", "mtimeNs"].some(key =>
+        current[key as keyof typeof current] !== image.identity[key as keyof typeof current])) failure();
+    }
+    if (canonicalJson(retainedV1.manifest) !== canonicalJson(v1Manifest) || canonicalJson(original.manifest) !== canonicalJson(v2Manifest)) failure();
     checkInvocationDeadline(input.invocationDeadline);
     if (report.blockingDivergenceCount || report.sealedRetrieval.blockingDivergenceCount) throw new ShadowMigrationError("PARITY_BLOCKING_DIVERGENCE");
     verifyTarget(input);

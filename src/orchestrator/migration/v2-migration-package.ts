@@ -98,7 +98,7 @@ export interface SealV2MigrationPackageInput {
   readonly configurationChecksum: string;
   readonly invocationDeadline?: ShadowMigrationInvocationDeadline;
   readonly now?: () => number;
-  readonly onPhase?: (phase: "existing-target-final-open" | "after-final-rename-before-response" | "fresh-target-final-open") => void;
+  readonly onPhase?: (phase: "existing-target-final-open" | "after-final-rename-before-response" | "fresh-target-final-open") => void | Promise<void>;
 }
 
 export interface OpenSealedV2MigrationPackageInput {
@@ -438,11 +438,15 @@ export async function sealV2MigrationPackage(input: SealV2MigrationPackageInput)
       const adopted = openSealedV2MigrationPackage({ rootPath: target, expectedMigrationIdentity: migrationIdentity,
         ...(suppliedDeadline === undefined ? {} : { invocationDeadline: suppliedDeadline }) });
       try {
-        input.onPhase?.("existing-target-final-open");
+        const pending = input.onPhase?.("existing-target-final-open");
+        if (pending !== undefined) await pending;
         assertBeforeDeadline(ordinal);
+        source.assertUnchanged(); adopted.assertUnchanged(); assertBeforeDeadline(ordinal);
         return adopted;
       } catch (error) {
-        adopted.close();
+        try { adopted.close(); } catch { /* preserve the primary failure */ }
+        if (error instanceof ShadowMigrationError && error.code !== "MIGRATION_RETRY_EXHAUSTED") throw error;
+        assertBeforeDeadline(ordinal);
         throw error;
       }
     } catch (error) {
@@ -459,11 +463,18 @@ export async function sealV2MigrationPackage(input: SealV2MigrationPackageInput)
     temporary = undefined;
     fsyncDirectory(packageRoot);
     assertBeforeDeadline(ordinal);
-    input.onPhase?.("after-final-rename-before-response");
+    const pending = input.onPhase?.("after-final-rename-before-response");
+    if (pending !== undefined) await pending;
     assertBeforeDeadline(ordinal);
+    source.assertUnchanged(); assertBeforeDeadline(ordinal);
     const published = openSealedV2MigrationPackage({ rootPath: target, expectedMigrationIdentity: migrationIdentity,
       ...(suppliedDeadline === undefined ? {} : { invocationDeadline: suppliedDeadline }) });
-    try { input.onPhase?.("fresh-target-final-open"); assertBeforeDeadline(ordinal); return published; } catch (error) { published.close(); throw error; }
+    try {
+      const pending = input.onPhase?.("fresh-target-final-open");
+      if (pending !== undefined) await pending;
+      assertBeforeDeadline(ordinal); source.assertUnchanged(); published.assertUnchanged(); assertBeforeDeadline(ordinal);
+      return published;
+    } catch (error) { try { published.close(); } catch { /* preserve the primary failure */ } throw error; }
   } catch (error) {
     if (temporary !== undefined) quarantine(temporary);
     if (finalPublicationPossible && (!(error instanceof ShadowMigrationError)
