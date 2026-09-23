@@ -13,7 +13,187 @@ import { buildV2ShadowMigrationEvidence, buildV2ShadowMigrationPreflightFailureE
   hasRequiredApprovedV2ShadowMigrationReviews, V2ShadowMigrationEvidenceError, type V2ShadowMigrationEvidenceV1,
 } from "../src/orchestrator/migration/v2-shadow-migration-evidence.js";
 import { V2ShadowMigrationRunner, V2ShadowMigrationPreflightFailure, readV2ShadowMigrationPreflightEvidence } from "../src/orchestrator/migration/v2-shadow-migration-runner.js";
-import { createShadowMigrationRunnerFixture } from "./support/v2-shadow-migration-fixture.js";
+import { createShadowMigrationRunnerFixture, createSnapshotParityFixture } from "./support/v2-shadow-migration-fixture.js";
+import { shadowMigrationPolicyChecksum } from "../src/orchestrator/migration/v2-shadow-migration.contracts.js";
+
+let compiledPreflight: Promise<any> | undefined;
+function preflightArtifact(): Promise<any> {
+  return compiledPreflight ??= (async () => {
+    const root = fileURLToPath(new URL("../../", import.meta.url));
+    const built = childProcess.spawnSync(process.execPath, ["scripts/build.js"], { cwd: root, windowsHide: true, encoding: "utf8", timeout: 180000, maxBuffer: 1024 * 1024 });
+    assert.equal(built.status, 0, built.stdout + built.stderr);
+    const entry = new URL("../../dist/internal/v2-shadow-migration-rehearsal.js", import.meta.url);
+    assert.equal(fs.existsSync(entry), true, "the actual production build must emit the private preflight artifact");
+    return import(entry.href);
+  })();
+}
+
+test("compiled rehearsal preflight authenticates the entire pinned corpus without mutating selected roots", async t => {
+  const module = await preflightArtifact();
+  const f = await createSnapshotParityFixture(t, { rankingPair: true, legacyArtifacts: true });
+  const bundleRoot = join(f.root, "preflight-corpus"); fs.mkdirSync(bundleRoot);
+  const artifacts = {
+    "manifest.json": f.corpus.bundle,
+    "source-events.json": { schemaVersion: 2, corpusVersion: "retrieval-evaluation-v2", sources: f.corpus.sources },
+    "judgments.json": { schemaVersion: 2, corpusVersion: "retrieval-evaluation-v2", queries: f.corpus.queries },
+    "v1-shadow-baseline.json": f.corpus.baseline,
+  };
+  for (const [name, value] of Object.entries(artifacts)) fs.writeFileSync(join(bundleRoot, name), JSON.stringify(value));
+  const configuration = { schemaVersion: 1, policyChecksum: shadowMigrationPolicyChecksum(f.policy), packageFormatVersion: 1,
+    migrationAlgorithmVersion: 1, expectedDifferencePolicyVersion: f.policy.expectedDifferencePolicyVersion };
+  const supplied = { sourceRoot: f.sourceRoot, sourceManifestPath: f.manifestPath, liveEventStorePath: f.liveEventStorePath,
+    liveLegacyArtifactRoot: f.liveVaultRoot, expectedBinding: f.projectionBinding, configuration, policy: f.policy,
+    expectedDifferenceRules: [], sealedRetrieval: { bundleRoot, expectedBundle: f.corpus.bundle } };
+  await t.test("compiled decoder captures valid branch-scoped settings without invoking caller behavior", () => {
+    const branched = { ...supplied, expectedBinding: { ...f.projectionBinding, branchScopeId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", branchRef: "refs/heads/rehearsal" } };
+    const result = module.decodeV2ShadowMigrationRehearsalPreflightInput(branched);
+    assert.deepEqual(result.expectedBinding, branched.expectedBinding);
+    branched.expectedBinding.branchRef = "refs/heads/changed";
+    assert.equal(result.expectedBinding.branchRef, "refs/heads/rehearsal");
+    assert.ok(Object.isFrozen(result.expectedBinding));
+    assert.equal(module.decodeV2ShadowMigrationRehearsalPreflightInput({ ...branched,
+      expectedBinding: { ...branched.expectedBinding, branchRef: null } }).expectedBinding.branchRef, null);
+    assert.throws(() => module.decodeV2ShadowMigrationRehearsalPreflightInput({ ...branched,
+      expectedBinding: { ...branched.expectedBinding, branchScopeId: "a".repeat(64) } }));
+  });
+  await t.test("compiled configuration preserves every supplied nonempty rule field", () => {
+    const rules = f.metadataRules.map(rule => ({ ...rule, predicate: { ...rule.predicate } }));
+    const captured = module.decodeV2ShadowMigrationRehearsalPreflightInput({ ...supplied, expectedDifferenceRules: rules });
+    assert.equal(captured.expectedDifferenceRules.length, 3);
+    assert.deepEqual(captured.expectedDifferenceRules, f.metadataRules);
+    assert.ok(Object.isFrozen(captured.expectedDifferenceRules[0].predicate));
+    rules[0]!.rationaleDigest = "0".repeat(64);
+    assert.equal(captured.expectedDifferenceRules[0].rationaleDigest, f.metadataRules[0]!.rationaleDigest);
+  });
+  await t.test("compiled configuration refuses duplicate rule IDs", () => {
+    assert.throws(() => module.decodeV2ShadowMigrationRehearsalPreflightInput({ ...supplied,
+      expectedDifferenceRules: [f.metadataRules[0], f.metadataRules[0]] }), { code: "MIGRATION_SOURCE_INVALID" });
+  });
+  await t.test("compiled configuration refuses a checksum-valid rule from a different policy version", () => {
+    const { ruleChecksum: _checksum, ...original } = f.metadataRules[0]!;
+    const body = { ...original, policyVersion: f.policy.expectedDifferencePolicyVersion + 1 };
+    const rule = { ...body, ruleChecksum: hash("project-memory/v2-expected-difference-rule/v1\n" + canonicalJson(body)) };
+    assert.throws(() => module.decodeV2ShadowMigrationRehearsalPreflightInput({ ...supplied,
+      expectedDifferenceRules: [rule] }), { code: "MIGRATION_SOURCE_INVALID" });
+  });
+  const snapshot = (root: string): unknown => fs.readdirSync(root, { withFileTypes: true }).map(entry => {
+    const path = join(root, entry.name), stat = fs.lstatSync(path, { bigint: true });
+    return [entry.name, String(stat.dev), String(stat.ino), String(stat.nlink), entry.isDirectory() ? snapshot(path) : hash(fs.readFileSync(path).toString("base64"))];
+  });
+  const before = snapshot(f.root);
+  let opened = 0, closed = 0;
+  const driver = { open: (...args: Parameters<typeof f.driver.open>) => {
+    opened++; const connection = f.driver.open(...args);
+    return { prepare: connection.prepare.bind(connection), exec: connection.exec.bind(connection), close() { connection.close(); closed++; } };
+  } };
+  const checked = await module.preflightV2ShadowMigrationRehearsal(supplied, { driver });
+  try {
+    assert.deepEqual(checked.corpus, f.corpus);
+    assert.equal(checked.corpus.queries.length, 11, "all intended queries, including the extra ranking pair, survive the loader");
+    assert.equal(checked.source.manifest.manifestChecksum, f.manifest.manifestChecksum);
+    assert.ok(Object.isFrozen(checked.input.sealedRetrieval.expectedBundle.files));
+    assert.ok(Object.isFrozen(checked.corpus.queries[0].eligibleScope));
+    checked.assertUnchanged(); assert.deepEqual(snapshot(f.root), before);
+  } finally { checked.close(); }
+  assert.equal(opened, closed, "all verifier working-image connections close");
+  assert.throws(() => checked.assertUnchanged());
+  checked.close();
+
+  await t.test("missing malformed oversize wrong-pin and source-mismatched artifacts refuse without target writes", async () => {
+    const file = join(bundleRoot, "judgments.json"), original = fs.readFileSync(file);
+    const reject = async (value: unknown) => {
+      const baseline = snapshot(f.root);
+      await assert.rejects(module.preflightV2ShadowMigrationRehearsal(value, { driver }));
+      assert.deepEqual(snapshot(f.root), baseline); assert.equal(opened, closed);
+    };
+    for (const name of Object.keys(artifacts)) {
+      const missing = join(bundleRoot, name); fs.renameSync(missing, missing + ".held");
+      try { await reject(supplied); } finally { fs.renameSync(missing + ".held", missing); }
+    }
+    fs.writeFileSync(file, "{invalid SOURCE_PLAINTEXT_SENTINEL"); await reject(supplied); fs.writeFileSync(file, original);
+    const smallPolicy = { ...f.policy, maxAggregateBytes: original.length - 1 };
+    await reject({ ...supplied, policy: smallPolicy, configuration: { ...configuration, policyChecksum: shadowMigrationPolicyChecksum(smallPolicy) } });
+    await reject({ ...supplied, sealedRetrieval: { bundleRoot, expectedBundle: { ...f.corpus.bundle, files: { ...f.corpus.bundle.files, "judgments.json": "0".repeat(64) } } } });
+    await reject({ ...supplied, expectedBinding: { ...f.projectionBinding, projectId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" } });
+    const events = { ...artifacts["source-events.json"], sources: f.corpus.sources.map(source => ({ ...source,
+      events: source.events.map((event, ordinal) => ordinal === 0 ? { ...event, recordedAt: "2026-09-09T00:00:00.000Z" } : event) })) };
+    const changedBundle = { ...f.corpus.bundle, files: { ...f.corpus.bundle.files, "source-events.json": hash(JSON.stringify(events)) } };
+    fs.writeFileSync(join(bundleRoot, "source-events.json"), JSON.stringify(events)); fs.writeFileSync(join(bundleRoot, "manifest.json"), JSON.stringify(changedBundle));
+    await reject({ ...supplied, sealedRetrieval: { bundleRoot, expectedBundle: changedBundle } });
+    fs.writeFileSync(join(bundleRoot, "source-events.json"), JSON.stringify(artifacts["source-events.json"]));
+    fs.writeFileSync(join(bundleRoot, "manifest.json"), JSON.stringify(artifacts["manifest.json"]));
+  });
+
+  await t.test("captured corpus identity is rechecked and closure invalidates handoff", async () => {
+    const result = await module.preflightV2ShadowMigrationRehearsal(supplied, { driver });
+    const file = join(bundleRoot, "judgments.json"), original = fs.readFileSync(file);
+    try { fs.writeFileSync(file, Buffer.concat([original, Buffer.from(" ")])); assert.throws(() => result.assertUnchanged()); }
+    finally { result.close(); fs.writeFileSync(file, original); }
+    assert.equal(opened, closed);
+  });
+
+  await t.test("the combined corpus byte limit accepts the exact bound and rejects one byte less", async () => {
+    const total = Object.keys(artifacts).reduce((bytes, name) => bytes + fs.statSync(join(bundleRoot, name)).size, 0);
+    assert.ok(total >= f.manifest.aggregateSourceBytes, "corpus boundary is independent of the source logical byte ceiling");
+    const policy = { ...f.policy, maxAggregateBytes: total };
+    const bounded = { ...supplied, policy, configuration: { ...configuration, policyChecksum: shadowMigrationPolicyChecksum(policy) } };
+    const result = await module.preflightV2ShadowMigrationRehearsal(bounded, { driver }); result.close();
+    const smaller = { ...policy, maxAggregateBytes: total - 1 }, initial = opened;
+    await assert.rejects(module.preflightV2ShadowMigrationRehearsal({ ...bounded, policy: smaller,
+      configuration: { ...configuration, policyChecksum: shadowMigrationPolicyChecksum(smaller) } }, { driver }), { code: "MIGRATION_LIMIT_EXCEEDED" });
+    assert.equal(opened, initial);
+  });
+
+  await t.test("a corpus replacement during source verification refuses and closes every opened connection", async () => {
+    const file = join(bundleRoot, "judgments.json"), original = fs.readFileSync(file); let changed = false;
+    const mutatingDriver = { open: (...args: Parameters<typeof driver.open>) => {
+      const connection = driver.open(...args);
+      if (!changed) { changed = true; fs.renameSync(file, file + ".held"); fs.writeFileSync(file, original); }
+      return connection;
+    } };
+    try { await assert.rejects(module.preflightV2ShadowMigrationRehearsal(supplied, { driver: mutatingDriver })); }
+    finally { if (changed) { fs.unlinkSync(file); fs.renameSync(file + ".held", file); } }
+    assert.equal(changed, true); assert.equal(opened, closed);
+  });
+
+  await t.test("source mutation after preflight refuses handoff and closing prevents source event reuse", async () => {
+    const result = await module.preflightV2ShadowMigrationRehearsal(supplied, { driver });
+    const original = fs.readFileSync(f.manifestPath);
+    try { fs.appendFileSync(f.manifestPath, " "); assert.throws(() => result.assertUnchanged(), { code: "MIGRATION_SOURCE_MUTATED" }); }
+    finally { result.close(); fs.writeFileSync(f.manifestPath, original); }
+    assert.throws(() => result.source.events());
+  });
+
+  await t.test("strict input rejects accessors proxies aliases hardlinks and foreign fields before source open", async () => {
+    const initial = opened; let traps = 0;
+    const bad = [undefined, null, {}, { ...supplied, unexpected: true }, { ...supplied, configuration: { ...configuration, policyChecksum: "0".repeat(64) } },
+      Object.defineProperty({ ...supplied }, "policy", { get() { traps++; return f.policy; } }),
+      new Proxy(supplied, { ownKeys() { traps++; return []; } }),
+      { ...supplied, sealedRetrieval: { ...supplied.sealedRetrieval, bundleRoot: bundleRoot + "/../preflight-corpus" } }];
+    for (const value of bad) await assert.rejects(module.preflightV2ShadowMigrationRehearsal(value, { driver }));
+    const linked = join(bundleRoot, "linked.json"); fs.linkSync(join(bundleRoot, "manifest.json"), linked);
+    try { await assert.rejects(module.preflightV2ShadowMigrationRehearsal(supplied, { driver })); } finally { fs.unlinkSync(linked); }
+    assert.equal(traps, 0); assert.equal(opened, initial);
+    const alias = join(f.root, "corpus-alias"); fs.symlinkSync(bundleRoot, alias, process.platform === "win32" ? "junction" : "dir");
+    try { await assert.rejects(module.preflightV2ShadowMigrationRehearsal({ ...supplied, sealedRetrieval: { ...supplied.sealedRetrieval, bundleRoot: alias } }, { driver })); }
+    finally { fs.unlinkSync(alias); }
+    assert.equal(opened, initial);
+  });
+});
+
+test("fresh private preflight import and invalid entry input perform no filesystem mutation", async () => {
+  await preflightArtifact();
+  const entry = new URL("../../dist/internal/v2-shadow-migration-rehearsal.js", import.meta.url).href;
+  const script = `import fs from 'node:fs'; import {syncBuiltinESMExports} from 'node:module'; import assert from 'node:assert/strict';
+    let writes=0; for(const key of ['writeFileSync','mkdirSync','mkdtempSync','renameSync','linkSync','unlinkSync','rmSync','rmdirSync','writeSync'])
+      fs[key]=()=>{ writes++; throw new Error('unexpected write'); }; syncBuiltinESMExports();
+    const entry=await import(${JSON.stringify(entry)});
+    for(const input of [undefined,null,{}]) await assert.rejects(entry.preflightV2ShadowMigrationRehearsal(input,{driver:{open(){throw new Error('unexpected open');}}}));
+    assert.equal(writes,0); console.log('PASS inert import and invalid configuration');`;
+  const result = childProcess.spawnSync(process.execPath, ["--input-type=module", "--eval", script], { encoding: "utf8", windowsHide: true, timeout: 10000 });
+  assert.equal(result.status, 0, result.stderr); assert.equal(result.stderr, "");
+  assert.equal(result.stdout.trim(), "PASS inert import and invalid configuration");
+});
 
 const hash = (text: string) => createHash("sha256").update(text).digest("hex");
 const H = "a".repeat(64);

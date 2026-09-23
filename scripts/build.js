@@ -115,6 +115,19 @@ async function build() {
         packages: 'external',
     });
 
+    // Private read-only preparation; no eligible rehearsal manifest is emitted here.
+    // Unlike public entries, embed the existing zod dependency in this private bundle.
+    console.log('Bundling private V2 rehearsal preflight...');
+    await esbuild.build({
+        entryPoints: ['src/orchestrator/migration/v2-shadow-migration-rehearsal.ts'],
+        bundle: true,
+        platform: 'node',
+        format: 'esm',
+        outfile: path.join(outDir, 'internal', 'v2-shadow-migration-rehearsal.js'),
+        target: 'node24.16',
+        minify: true,
+    });
+
     writeFileSync(
         path.join(outDir, 'build-info.json'),
         `${JSON.stringify({

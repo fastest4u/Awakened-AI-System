@@ -4,10 +4,12 @@ import { createHash, randomBytes } from 'node:crypto';
 import { lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { isAbsolute, join, relative, sep } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const worker = fileURLToPath(new URL('../dist/internal/stable-compatibility-directory.worker.js', import.meta.url));
+const rehearsal = fileURLToPath(new URL('../dist/internal/v2-shadow-migration-rehearsal.js', import.meta.url));
 assert.ok(lstatSync(worker).isFile());
+assert.ok(lstatSync(rehearsal).isFile());
 const tempBase = realpathSync.native(tmpdir());
 const root = realpathSync.native(mkdtempSync(join(tempBase, 'v2-compatibility-built-smoke-')));
 const scope = relative(tempBase, root);
@@ -43,4 +45,19 @@ try {
   assert.deepEqual(identity(join(protectedRoot, 'sentinel.md')), protectedBefore);
   assert.equal(readFileSync(join(protectedRoot, 'sentinel.md'), 'utf8'), 'protected');
   console.log('PASS built compatibility worker: exact publication, durable verified no-op, malformed rejection, protected identity/links/bytes unchanged');
+  const preflight = spawnSync(process.execPath, ['--input-type=module', '--eval', `
+    import assert from 'node:assert/strict';
+    const entry = await import(${JSON.stringify(pathToFileURL(rehearsal).href)});
+    for (const input of [undefined, null, {}]) {
+      await assert.rejects(entry.preflightV2ShadowMigrationRehearsal(input, { driver: { open() { throw new Error('unexpected open'); } } }),
+        { code: 'MIGRATION_SOURCE_INVALID' });
+    }
+  `], { cwd: isolated, windowsHide: true, encoding: 'utf8', timeout: 10000, maxBuffer: 16384 });
+  assert.equal(preflight.status, 0, preflight.stderr); assert.equal(preflight.stderr, ''); assert.equal(preflight.stdout, '');
+  assert.deepEqual(readdirSync(isolated), ['artifact.md']);
+  assert.deepEqual(identity(join(isolated, 'artifact.md')), installed);
+  assert.deepEqual(readFileSync(join(isolated, 'artifact.md')), bytes);
+  assert.deepEqual(readdirSync(protectedRoot), ['sentinel.md']);
+  assert.deepEqual(identity(join(protectedRoot, 'sentinel.md')), protectedBefore);
+  console.log('PASS built rehearsal preflight: inert import and missing/invalid configuration refusal without selected-root mutation');
 } finally { rmSync(root, { recursive: true, force: true }); }
