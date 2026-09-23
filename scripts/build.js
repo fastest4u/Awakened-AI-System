@@ -11,13 +11,14 @@ const outFile = path.join(outDir, 'index.js');
 // Only builtins execute before invalidation, including when a dependency/command cannot load.
 mkdirSync(path.join(outDir, 'internal'), { recursive: true });
 writeFileSync(path.join(outDir, 'internal', 'v2-shadow-migration-build.json'), '{"eligible":false,"schemaVersion":1}\n');
-const { default: esbuild } = await import('esbuild');
-const { default: obfuscator } = await import('javascript-obfuscator');
-const { default: ts } = await import('typescript');
 const { rehearsalManifestPath, rehearsalArtifactPaths, rehearsalRecipePaths, rehearsalBuildRoot,
-    readBuildBytes, measureBuildFiles, assertBuildFiles, assertBuildResolutionMetadata, cleanBuildHead, assertCommittedBuildFiles,
+    readBuildBytes, measureBuildFiles, assertBuildFiles, assertBuildResolutionMetadata, assertBuildToolResolution, cleanBuildHead, assertCommittedBuildFiles,
     buildRuntimeIdentity, buildToolIdentity, privateBuildIdentity, buildCanonical, buildDigest, buildRefusal,
 } = await import('./run-v2-shadow-migration-rehearsal.js');
+const selectedTools = assertBuildToolResolution();
+const { default: esbuild } = await import(selectedTools.esbuild);
+const { default: obfuscator } = await import('javascript-obfuscator');
+const { default: ts } = await import(selectedTools.typescript);
 const packageJson = JSON.parse(readFileSync(path.resolve(__dirname, '../package.json'), 'utf8'));
 
 function assertClosedSyntax(name, bytes, emitted = false) {
@@ -236,6 +237,7 @@ async function build() {
     assertBuildFiles(recipes); assertBuildFiles(commandBefore);
     const artifacts = measureBuildFiles(rehearsalArtifactPaths);
     measured.assertArtifacts(artifacts);
+    assertBuildToolResolution();
     if (initialHead !== null && cleanBuildHead() === initialHead) {
         assertCommittedBuildFiles([...recipes, ...captured.inputs, artifacts[2]]);
         assertBuildFiles(recipes); assertBuildFiles(captured.inputs); assertBuildFiles(artifacts);

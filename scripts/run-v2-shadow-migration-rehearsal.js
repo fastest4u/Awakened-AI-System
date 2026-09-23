@@ -1,9 +1,9 @@
 import * as fs from 'node:fs';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
-import { isBuiltin } from 'node:module';
+import { createRequire, isBuiltin } from 'node:module';
 
 // Private trusted-producer consistency helpers. These grant no source/target authority.
 export const rehearsalBuildRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -11,10 +11,11 @@ export const rehearsalManifestPath = 'dist/internal/v2-shadow-migration-build.js
 export const rehearsalArtifactPaths = Object.freeze(['dist/internal/stable-compatibility-directory.worker.js',
     'dist/internal/v2-shadow-migration-rehearsal.js', 'scripts/run-v2-shadow-migration-rehearsal.js']);
 const nativePackage = `node_modules/@esbuild/${process.platform}-${process.arch}`;
+const nativeSubpath = process.platform === 'win32' ? 'esbuild.exe' : 'bin/esbuild';
 export const rehearsalRecipePaths = Object.freeze(['package.json', 'package-lock.json', 'tsconfig.json', 'scripts/build.js',
     'node_modules/zod/package.json', 'node_modules/esbuild/package.json', 'node_modules/esbuild/lib/main.js',
     'node_modules/typescript/package.json', 'node_modules/typescript/lib/typescript.js',
-    `${nativePackage}/package.json`, `${nativePackage}/${process.platform === 'win32' ? 'esbuild.exe' : 'bin/esbuild'}`].sort());
+    `${nativePackage}/package.json`, `${nativePackage}/${nativeSubpath}`].sort());
 const DOMAIN = 'project-memory/v2-shadow-migration-private-build/v1\n';
 const HASH = /^[0-9a-f]{64}$/;
 const MAX_FILE = 32 * 1024 * 1024, MAX_TOTAL = 128 * 1024 * 1024;
@@ -81,6 +82,34 @@ export function assertBuildResolutionMetadata(names) {
             parent = path.posix.dirname(parent);
         }
     }
+}
+export function assertBuildToolResolution() {
+    try {
+        if (process.env.ESBUILD_BINARY_PATH) buildRefusal();
+        // Refuse nearer namespaces explicitly, including on cached finalization checks.
+        // Node may cache a prior resolution; their newly added files must not be hidden.
+        for (const name of ['scripts/node_modules', 'node_modules/esbuild/node_modules', 'node_modules/esbuild/lib/node_modules',
+            'node_modules/typescript/node_modules', 'node_modules/typescript/lib/node_modules']) {
+            try { fs.lstatSync(path.join(rehearsalBuildRoot, name)); buildRefusal(); }
+            catch (error) { if (error.code !== 'ENOENT') throw error; }
+        }
+        const entries = { esbuild: 'node_modules/esbuild/lib/main.js', typescript: 'node_modules/typescript/lib/typescript.js' };
+        const native = `${nativePackage}/${nativeSubpath}`;
+        assertBuildResolutionMetadata([...Object.values(entries), native, 'scripts/run-v2-shadow-migration-rehearsal.js']);
+        const selected = {};
+        for (const [name, entry] of Object.entries(entries)) {
+            // This module and build.js share scripts/, hence the same ESM lookup scope.
+            // import.meta.resolve also honors import-conditional package exports.
+            const actual = import.meta.resolve(name), expected = pathToFileURL(checkedPath(entry)).href;
+            if (actual !== expected) buildRefusal();
+            selected[name] = actual;
+        }
+        // Match the installed wrapper's own CommonJS package-subpath resolution.
+        // No missing-package fallback, downloaded binary or alternate path is admitted.
+        const fromWrapper = createRequire(selected.esbuild);
+        if (fromWrapper.resolve(`${nativePackage.slice('node_modules/'.length)}/${nativeSubpath}`) !== checkedPath(native)) buildRefusal();
+        return Object.freeze(selected);
+    } catch { buildRefusal(); }
 }
 function git(args) {
     const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('GIT_')));
@@ -170,6 +199,7 @@ export function validateV2ShadowMigrationBuild(buildIdentityHash) {
                 || !readBuildBytes(rehearsalManifestPath, 256 * 1024).equals(bytes)
                 || buildCanonical(buildRuntimeIdentity()) !== buildCanonical(value.runtime)) buildRefusal();
             assertBuildFiles(value.recipes); assertBuildFiles(value.inputs); assertBuildFiles(value.artifacts);
+            assertBuildToolResolution();
             assertBuildResolutionMetadata(value.inputs.map(entry => entry.path));
             assertCommittedBuildFiles([...value.recipes, ...value.inputs, value.artifacts[2]]);
             if (cleanBuildHead() !== value.commit) buildRefusal();

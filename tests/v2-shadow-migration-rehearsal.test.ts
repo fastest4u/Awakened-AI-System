@@ -64,7 +64,7 @@ function cleanBuildFixture(t: TestContext): string {
       if (fs.existsSync(join(original, "node_modules", child, "package.json"))) dependency(child, found);
     }
   }
-  for (const name of ["esbuild", "javascript-obfuscator", "typescript", "zod"]) dependency(name, original);
+  for (const name of ["esbuild", "javascript-obfuscator", "typescript", "zod"]) dependency(name, name === "zod" ? original : join(original, "scripts"));
   for (const [name, bytes] of captures) {
     assert.deepEqual(fs.readFileSync(join(original, name)), bytes, "capture correspondence at source");
     assert.deepEqual(fs.readFileSync(join(root, name)), bytes, "capture correspondence at destination");
@@ -90,6 +90,70 @@ function fixtureGit(root: string, args: string[]): string {
 function fixtureBuild(root: string) {
   return childProcess.spawnSync(process.execPath, ["scripts/build.js"], { cwd: root, encoding: "utf8", windowsHide: true, timeout: 180000, maxBuffer: 2 * 1024 * 1024 });
 }
+test("tool loader resolution cannot escape the measured clean fixture", async t => {
+  const root = cleanBuildFixture(t), manifestPath = join(root, "dist/internal/v2-shadow-migration-build.json");
+  const baseline = fixtureBuild(root); assert.equal(baseline.status, 0, baseline.stdout + baseline.stderr);
+  const baselineManifest = fs.readFileSync(manifestPath), manifest = JSON.parse(baselineManifest.toString());
+  const commandUrl = pathToFileURL(join(root, "scripts/run-v2-shadow-migration-rehearsal.js")).href;
+  const module = await import(commandUrl), handoff = module.validateV2ShadowMigrationBuild(manifest.buildIdentityHash);
+  const validate = (identity: string) => childProcess.spawnSync(process.execPath,
+    ["--input-type=module", "-e", `const m=await import(${JSON.stringify(commandUrl)});try{m.validateV2ShadowMigrationBuild(${JSON.stringify(identity)});}catch{process.exit(7);}`],
+    { cwd: root, encoding: "utf8", windowsHide: true, timeout: 30000 });
+  const diagnosticDirectory = join(root, ".superpowers"); fs.mkdirSync(diagnosticDirectory);
+  for (const [ordinal, variant] of ["local-esbuild", "local-typescript", "redirect-esbuild-main", "redirect-typescript-import", "nested-native"].entries()) {
+    const tool = variant.includes("typescript") ? "typescript" : "esbuild";
+    const packagePath = join(root, "node_modules", tool, "package.json"), packageBytes = fs.readFileSync(packagePath);
+    const pkg = JSON.parse(packageBytes.toString()), marker = join(diagnosticDirectory, `executed-${ordinal}`);
+    let selected: string, ownedDirectory: string | undefined;
+    if (variant.startsWith("local-")) {
+      ownedDirectory = join(root, "scripts/node_modules", tool); fs.mkdirSync(ownedDirectory, { recursive: true });
+      selected = join(ownedDirectory, "index.cjs");
+      fs.writeFileSync(join(ownedDirectory, "package.json"), JSON.stringify({ name: tool, version: pkg.version, main: "index.cjs" }));
+      fs.writeFileSync(selected, `require('node:fs').writeFileSync(${JSON.stringify(marker)},'executed'); module.exports=require('../../../node_modules/${tool}/lib/${tool === "esbuild" ? "main" : "typescript"}.js');`);
+    } else if (variant.startsWith("redirect-")) {
+      selected = join(root, "node_modules", tool, "redirect.cjs");
+      fs.writeFileSync(selected, `require('node:fs').writeFileSync(${JSON.stringify(marker)},'executed'); module.exports=require('./lib/${tool === "esbuild" ? "main" : "typescript"}.js');`);
+      fs.writeFileSync(packagePath, JSON.stringify(variant.endsWith("-main") ? { ...pkg, main: "redirect.cjs" }
+        : { ...pkg, exports: { ".": { import: "./redirect.cjs", require: "./lib/typescript.js" } } }));
+    } else {
+      const packageName = `@esbuild/${process.platform}-${process.arch}`, native = process.platform === "win32" ? "esbuild.exe" : "bin/esbuild";
+      ownedDirectory = join(root, "node_modules/esbuild/node_modules", packageName);
+      selected = join(ownedDirectory, native); fs.mkdirSync(dirname(selected), { recursive: true });
+      fs.copyFileSync(join(root, "node_modules", packageName, "package.json"), join(ownedDirectory, "package.json"));
+      fs.copyFileSync(join(root, "node_modules", packageName, native), selected);
+      if (process.platform !== "win32") fs.chmodSync(selected, 0o755);
+    }
+    try {
+      fs.writeFileSync(manifestPath, baselineManifest);
+      assert.equal(fixtureGit(root, ["status", "--porcelain=v1", "--untracked-files=all"]), "", "redirected tools remain genuinely Git-clean");
+      await t.test(`${variant} is refused by fresh validator and existing handoff`, () => {
+        assert.equal(validate(manifest.buildIdentityHash).status, 7);
+        assert.throws(() => handoff.assertUnchanged());
+      });
+      await t.test(`${variant} cannot produce eligible provenance with the same version`, () => {
+        const built = fixtureBuild(root), produced = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+        t.diagnostic(`${variant}: native build exit=${built.status}, eligible=${produced.eligible}, alternate entry executed=${fs.existsSync(marker)}`);
+        assert.ok(Number.isInteger(built.status) && built.status! > 0, "same-version loader redirection must refuse with a native nonzero exit");
+        assert.equal(produced.eligible, false);
+        assert.equal(fs.existsSync(marker), false, "alternate tool entry must not execute before refusal");
+      });
+      await t.test(`${variant} post-build alternate bytes cannot evade validation`, () => {
+        const produced = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+        fs.appendFileSync(selected, "\n ");
+        // A refused producer must not make this pass solely via its ineligible sentinel.
+        if (!produced.eligible) fs.writeFileSync(manifestPath, baselineManifest);
+        assert.equal(validate(produced.buildIdentityHash ?? manifest.buildIdentityHash).status, 7);
+        assert.throws(() => handoff.assertUnchanged());
+      });
+    } finally {
+      fs.writeFileSync(packagePath, packageBytes);
+      if (ownedDirectory) fs.rmSync(ownedDirectory, { recursive: true, force: true }); else fs.unlinkSync(selected);
+      for (const name of ["scripts/node_modules", "node_modules/esbuild/node_modules/@esbuild", "node_modules/esbuild/node_modules"]) {
+        const directory = join(root, name); if (fs.existsSync(directory) && fs.readdirSync(directory).length === 0) fs.rmdirSync(directory);
+      }
+    }
+  }
+});
 test("clean current-byte fixture validates provenance and refuses stale or corrupted build state before import", async t => {
   const root = cleanBuildFixture(t), manifestPath = join(root, "dist/internal/v2-shadow-migration-build.json");
   const built = fixtureBuild(root); assert.equal(built.status, 0, built.stdout + built.stderr);
