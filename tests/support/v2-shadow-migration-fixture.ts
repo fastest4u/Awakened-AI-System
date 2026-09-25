@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { execFileSync } from "node:child_process";
 import { copyFileSync, linkSync, lstatSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -7,6 +8,10 @@ import { LifecycleFixtureClient, type LifecycleFixtureJsonValue } from "./lifecy
 import { LifecycleTestKeyBroker } from "./lifecycle-test-key-broker.js";
 import { decodeCheckpointDraft } from "../../src/orchestrator/lifecycle/contracts/checkpoint.js";
 import type { ProjectContext } from "../../src/orchestrator/identity/contracts.js";
+import { GitWorkspaceResolver } from "../../src/orchestrator/identity/git-workspace.resolver.js";
+import { ProjectBindingService } from "../../src/orchestrator/identity/project-binding.service.js";
+import { WorkerProjectStoreIdentityProbe } from "../../src/orchestrator/runtime/project-store-identity-probe.js";
+import { RecordingGitCommandRunner } from "./recording-git-command-runner.js";
 import type { StoredEvent, PendingEvent, JsonValue } from "../../src/orchestrator/contracts/event.js";
 import type { ProjectBinding } from "../../src/orchestrator/projections/contracts.js";
 import { replayCommittedProjectionEvents } from "../../src/orchestrator/projections/event-reader.js";
@@ -78,15 +83,25 @@ export function sealManifest(value: Omit<V1SourceCopyManifestV1, "manifestChecks
 
 export async function createV2ShadowMigrationFixture(t: TestContext,
   options: { aliasLiveStore?: boolean; sourceEventCount?: number; legacyArtifacts?: boolean;
-    parityCorpus?: boolean; artifactMetadata?: boolean; checkpointHistory?: boolean; rankingPair?: boolean } = {}) {
+    parityCorpus?: boolean; artifactMetadata?: boolean; checkpointHistory?: boolean; rankingPair?: boolean;
+    branchBoundSource?: boolean } = {}) {
   const root = canonicalMkdtemp("v2-shadow-source-");
   t.after(() => rmSync(root, { recursive: true, force: true }));
   const sourceRoot = join(root, "copy");
   const liveStoreRoot = join(root, "live-store");
-  const liveVaultRoot = options.parityCorpus ? join(liveStoreRoot, "memory") : join(root, "live-vault");
+  const parityCorpus = Boolean(options.parityCorpus || options.branchBoundSource);
+  const liveVaultRoot = parityCorpus ? join(liveStoreRoot, "memory") : join(root, "live-vault");
   const packageRootA = join(root, "package-root-a");
   const packageRootB = join(root, "package-root-b");
   for (const path of [sourceRoot, liveStoreRoot, liveVaultRoot, packageRootA, packageRootB, join(sourceRoot, "legacy")]) mkdirSync(path);
+  if (options.branchBoundSource) {
+    execFileSync("git", ["init", "--initial-branch=task12c3", liveStoreRoot], { stdio: "ignore", windowsHide: true });
+    execFileSync("git", ["-C", liveStoreRoot, "config", "user.email", "task12c3@example.invalid"], { stdio: "ignore", windowsHide: true });
+    execFileSync("git", ["-C", liveStoreRoot, "config", "user.name", "Task 12C3 Fixture"], { stdio: "ignore", windowsHide: true });
+    writeFileSync(join(liveStoreRoot, "README.md"), "# Disposable Task 12C3 source\n", "utf8");
+    execFileSync("git", ["-C", liveStoreRoot, "add", "README.md"], { stdio: "ignore", windowsHide: true });
+    execFileSync("git", ["-C", liveStoreRoot, "commit", "-m", "Seed disposable branch-bound source"], { stdio: "ignore", windowsHide: true });
+  }
   let liveEventStorePath = join(liveStoreRoot, "events.sqlite");
   const sourceDatabasePath = join(sourceRoot, "events.sqlite");
   const manifestPath = join(sourceRoot, "manifest.json");
@@ -97,10 +112,11 @@ export async function createV2ShadowMigrationFixture(t: TestContext,
     vaultId: "22222222-2222-4222-8222-222222222222", storeId: "33333333-3333-4333-8333-333333333333",
     workspaceId: "a".repeat(64), branchScopeId: null, branchRef: null, sessionId: null } as ProjectBinding;
   let lifecycle: LifecycleFixtureClient | undefined;
+  let branchSourceContext: ProjectContext | undefined;
   let sessionId: string | undefined;
   let checkpointDraft: ReturnType<typeof decodeCheckpointDraft> | undefined;
   const identities = new Map<string, string | null>();
-  const insertedCheckpoint = Boolean(options.parityCorpus && (options.artifactMetadata || options.checkpointHistory));
+  const insertedCheckpoint = Boolean(parityCorpus && (options.artifactMetadata || options.checkpointHistory));
   const fixturePosition = (position: string | null): string | null => position === null ? null
     : insertedCheckpoint && BigInt(position) >= 3n ? String(BigInt(position) + 1n) : position;
   const fixtureScope = (value: unknown): unknown => {
@@ -109,7 +125,7 @@ export async function createV2ShadowMigrationFixture(t: TestContext,
     if (typeof value !== "object" || value === null) return value;
     return Object.fromEntries(Object.entries(value).map(([key, v]) => [key, fixtureScope(v)]));
   };
-  if (options.parityCorpus) {
+  if (parityCorpus) {
     lifecycle = new LifecycleFixtureClient({ fixturePath: new URL("../fixtures/project-store-lifecycle-child.js", import.meta.url),
       timeoutMs: 15000, cleanupTimeoutMs: 15000, keyBroker: new LifecycleTestKeyBroker() });
     try {
@@ -137,6 +153,30 @@ export async function createV2ShadowMigrationFixture(t: TestContext,
           workspaceId: String(event.workspace_id), branchScopeId: event.branch_scope_id as string | null, branchRef: event.branch_ref as string | null, sessionId: null } as ProjectBinding;
         sessionId = String(event.session_id);
       } finally { probe.close(); }
+      if (options.branchBoundSource) {
+        if (projectionBinding.branchScopeId === null || projectionBinding.branchRef === null)
+          throw new Error("PARITY_FIXTURE_GIT_SOURCE_MISSING");
+        const resolution = await new ProjectBindingService({
+          identityProbe: new WorkerProjectStoreIdentityProbe({
+            workerUrl: new URL("../../src/workers/project-store.worker.js", import.meta.url),
+            requestTimeoutMs: 45_000,
+          }),
+          workspaceResolver: new GitWorkspaceResolver(new RecordingGitCommandRunner()),
+        }).establish({
+          source: "explicit-cli", projectRoot: liveStoreRoot, vaultRoot: liveVaultRoot,
+          clientNamespace: "task12c3-source-fixture", clientInstanceId: "task12c3-event-writer",
+          actorRole: "primary", generation: 1,
+        });
+        if (!resolution.ok) throw new Error("PARITY_FIXTURE_GIT_BINDING_FAILED:" + resolution.code);
+        const workspace = resolution.binding.workspace;
+        if (workspace.kind !== "git" || workspace.branchRef !== projectionBinding.branchRef
+          || resolution.binding.projectId !== projectionBinding.projectId
+          || resolution.binding.vaultId !== projectionBinding.vaultId
+          || resolution.binding.storeId !== projectionBinding.storeId
+          || resolution.binding.workspaceId !== projectionBinding.workspaceId)
+          throw new Error("PARITY_FIXTURE_GIT_BINDING_MISMATCH");
+        branchSourceContext = { binding: resolution.binding, workspace, checkedAt: new Date().toISOString() };
+      }
       const original = JSON.parse(readFileSync(new URL("../../../tests/fixtures/retrieval-evaluation/v2/source-events.json", import.meta.url), "utf8"));
       for (const key of ["projectId", "vaultId", "storeId", "workspaceId", "branchScopeId", "branchRef"] as const) {
         identities.set(original.sources[0].binding[key], projectionBinding[key]);
@@ -166,9 +206,9 @@ export async function createV2ShadowMigrationFixture(t: TestContext,
   } };
   const connection = driver.open(liveEventStorePath, { mode: "create", busyTimeoutMs: 5000 });
   try {
-    if (!options.parityCorpus) applyCurrentProjectStoreSchema(connection, projectionBinding, now);
+    if (!parityCorpus) applyCurrentProjectStoreSchema(connection, projectionBinding, now);
     const store = new EventStore(connection, new SqliteEventStoreStatements(connection), new MaintenanceFence(), new BranchScopeRepository(), () => now);
-    if (options.parityCorpus) {
+    if (parityCorpus) {
       const original = JSON.parse(readFileSync(new URL("../../../tests/fixtures/retrieval-evaluation/v2/source-events.json", import.meta.url), "utf8")) as { sources: { events: Record<string, unknown>[] }[] };
       const events = original.sources[0]!.events.slice(2).map(value => fixtureScope(value) as Record<string, unknown>);
       if (options.rankingPair) {
@@ -191,7 +231,8 @@ export async function createV2ShadowMigrationFixture(t: TestContext,
           expectedBaseEventPosition: "2", draft })) as LifecycleFixtureJsonValue);
         if (result.type !== "result") throw new Error(`PARITY_FIXTURE_HISTORY_FAILED:${result.type === "error" ? result.code : "PROTOCOL"}`);
       }
-      const sourceContext: ProjectContext = { ...context, binding: { ...context.binding, clientInstanceId: "retrieval-evaluation-fixture-client" } };
+      const sourceContext: ProjectContext = branchSourceContext ?? { ...context,
+        binding: { ...context.binding, clientInstanceId: "retrieval-evaluation-fixture-client" } };
       let ordinal = 0;
       const writer = new EventStore(connection, new SqliteEventStoreStatements(connection), new MaintenanceFence(), new BranchScopeRepository(), () => now,
         () => String(events[ordinal++]!.eventId));
@@ -243,7 +284,7 @@ export async function createV2ShadowMigrationFixture(t: TestContext,
   }));
   const manifest = sealManifest({ schemaVersion: 1, copyFormatVersion: 1,
     projectId: projectionBinding.projectId, vaultId: projectionBinding.vaultId, storeId: projectionBinding.storeId,
-    workspaceId: projectionBinding.workspaceId, branchScopeId: null, branchRef: null,
+    workspaceId: projectionBinding.workspaceId, branchScopeId: projectionBinding.branchScopeId, branchRef: projectionBinding.branchRef,
     sourceSchemaVersion: CURRENT_PROJECT_STORE_SCHEMA_VERSION, database: describeSourceFile(sourceRoot, "events.sqlite"),
     sqliteSidecars: ["events.sqlite-wal", "events.sqlite-shm"].map((path) => describeSourceFile(sourceRoot, path)), legacyArtifacts,
     eventCount: sourceEvents.length, aggregateSourceBytes: sourceEvents.reduce((sum, event) => sum + Buffer.byteLength(event.payloadJson), 0)
@@ -317,7 +358,8 @@ export async function createCompatibilityFixture(t: TestContext, options: { lega
 }
 
 /** Fresh production UUID fixture, fully written before source-copy verification. */
-export async function createSnapshotParityFixture(t: TestContext, options: { artifactMetadata?: boolean; checkpointHistory?: boolean; rankingPair?: boolean; legacyArtifacts?: boolean } = {}) {
+export async function createSnapshotParityFixture(t: TestContext, options: { artifactMetadata?: boolean; checkpointHistory?: boolean;
+  rankingPair?: boolean; legacyArtifacts?: boolean; branchBoundSource?: boolean } = {}) {
   let cleanup = () => {};
   t.after(() => cleanup());
   const f = await createV2ShadowMigrationFixture(t, { ...options, parityCorpus: true, legacyArtifacts: options.legacyArtifacts ?? false });
@@ -447,7 +489,7 @@ export function createRunnerV1CallerControl(vaultRoot: string) {
 
 /** A separately bootstrapped, empty runner target; producer fixture artifacts are reference evidence only. */
 export async function createShadowMigrationRunnerFixture(t: TestContext, options: { legacyArtifacts?: boolean; artifactMetadata?: boolean;
-  reference?: Awaited<ReturnType<typeof createSnapshotParityFixture>> } = {}) {
+  branchBoundSource?: boolean; reference?: Awaited<ReturnType<typeof createSnapshotParityFixture>> } = {}) {
   const f = options.reference ?? await createSnapshotParityFixture(t, options);
   const prefix = `runner-${randomUUID()}`;
   const eventStorePath = join(f.root, `${prefix}-target.sqlite`);
@@ -470,6 +512,7 @@ export async function createShadowMigrationRunnerFixture(t: TestContext, options
   const configuration = decodeShadowMigrationConfigurationV1({ schemaVersion: 1, policyChecksum: shadowMigrationPolicyChecksum(f.policy),
     packageFormatVersion: 1, migrationAlgorithmVersion: 1, expectedDifferencePolicyVersion: f.policy.expectedDifferencePolicyVersion });
   const runnerInput = { projectId: f.projectionBinding.projectId, rolloutRevisionId, targetContext,
+    expectedSourceBinding: f.projectionBinding,
     sourceRoot: f.sourceRoot, sourceManifestPath: f.manifestPath, liveEventStorePath: f.liveEventStorePath,
     liveLegacyArtifactRoot: f.liveVaultRoot, packageRoot, v1ProjectionRoot, v2ProjectionRoot, compatibilityRoot,
     buildIdentityHash: f.packageInput.buildIdentityHash, configuration, policy: f.policy,

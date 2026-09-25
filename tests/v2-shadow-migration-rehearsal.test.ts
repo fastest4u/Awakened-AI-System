@@ -23,6 +23,7 @@ import { BranchScopeRepository } from "../src/orchestrator/storage/branch-scope.
 import type { V2ShadowMigrationRunResult } from "../src/orchestrator/migration/v2-shadow-migration-runner.js";
 import { expectedDifferenceRuleChecksum } from "../src/orchestrator/parity/v2-expected-difference.js";
 import { openImmutableProjectionImage } from "../src/orchestrator/projections/integrity.js";
+import { verifyV1SourceCopy } from "../src/orchestrator/migration/v1-source-copy.js";
 
 let compiledPreflight: Promise<any> | undefined;
 // This snapshot is independent of the original Git administration and captures current bytes,
@@ -164,6 +165,26 @@ test("immutable projection image is readable without project-store metadata", as
   try {
     assert.ok(Number(database.prepare("SELECT count(*) AS n FROM session_tree").get()!.n) > 0);
   } finally { database.close(); }
+});
+test("branch-bound source fixture is sealed from production Git/lifecycle events", async t => {
+  const f = await createSnapshotParityFixture(t, { branchBoundSource: true, rankingPair: true });
+  assert.match(f.projectionBinding.branchRef!, /^refs\/heads\//);
+  assert.ok(f.projectionBinding.branchScopeId);
+  const manifest = JSON.parse(fs.readFileSync(f.manifestPath, "utf8"));
+  assert.equal(manifest.branchRef, f.projectionBinding.branchRef);
+  assert.equal(manifest.branchScopeId, f.projectionBinding.branchScopeId);
+  assert.deepEqual(manifest, f.manifest);
+  const liveEvents = f.driver.open(f.liveEventStorePath, { mode: "read-only-existing", busyTimeoutMs: 5000 });
+  try {
+    const rows = liveEvents.prepare("SELECT branch_scope_id,branch_ref,event_hash FROM events ORDER BY global_position").all();
+    assert.equal(rows.length, f.sourceEvents.length);
+    assert.deepEqual(rows.map(row => [row.branch_scope_id, row.branch_ref, row.event_hash]),
+      f.sourceEvents.map(event => [event.branchScopeId, event.branchRef, event.eventHash]));
+    assert.ok(rows.every(row => row.branch_scope_id === f.projectionBinding.branchScopeId
+      && row.branch_ref === f.projectionBinding.branchRef));
+  } finally { liveEvents.close(); }
+  const verified = await verifyV1SourceCopy(f.verificationInput);
+  verified.close();
 });
 test("retains synthetic functional evidence from the fresh compiled rehearsal command", async t => {
   const buildRoot = cleanBuildFixture(t), built = fixtureBuild(buildRoot);
