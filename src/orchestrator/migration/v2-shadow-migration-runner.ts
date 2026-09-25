@@ -3,6 +3,7 @@ import { isAbsolute, relative, sep } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { types as utilTypes } from "node:util";
 import type { ProjectContext } from "../identity/contracts.js";
+import { isProjectionProjectStoreIdentity, isProjectionWorkspaceIdentity, type ProjectBinding as ProjectionProjectBinding } from "../projections/contracts.js";
 import type { SqliteConnection, SqliteDriver } from "../storage/sqlite-driver.js";
 import type { RetrievalEvaluationBundleV2, SealedRetrievalEvaluationCorpusV2 } from "../retrieval/evaluation.js";
 import { decodeExpectedDifferenceRuleV1, type ExpectedDifferenceRuleV1 } from "../parity/v2-expected-difference.js";
@@ -37,6 +38,7 @@ export type ShadowMigrationFaultBoundary = typeof SHADOW_MIGRATION_FAULT_BOUNDAR
 export interface ShadowMigrationFaultInjector { hit(boundary: ShadowMigrationFaultBoundary): void | Promise<void>; }
 export interface V2ShadowMigrationRunInput {
   readonly projectId: string; readonly rolloutRevisionId: string; readonly targetContext: ProjectContext;
+  readonly expectedSourceBinding: ProjectionProjectBinding;
   readonly sourceRoot: string; readonly sourceManifestPath: string; readonly liveEventStorePath: string;
   readonly liveLegacyArtifactRoot: string; readonly packageRoot: string; readonly v1ProjectionRoot: string;
   readonly v2ProjectionRoot: string; readonly compatibilityRoot: string; readonly buildIdentityHash: string;
@@ -79,7 +81,7 @@ function capture<T>(value: T, deadline?: ShadowMigrationInvocationDeadline, ance
   ancestors.delete(value);
   return Object.freeze(result) as T;
 }
-const INPUT_KEYS = ["projectId", "rolloutRevisionId", "targetContext", "sourceRoot", "sourceManifestPath", "liveEventStorePath",
+const INPUT_KEYS = ["projectId", "rolloutRevisionId", "targetContext", "expectedSourceBinding", "sourceRoot", "sourceManifestPath", "liveEventStorePath",
   "liveLegacyArtifactRoot", "packageRoot", "v1ProjectionRoot", "v2ProjectionRoot", "compatibilityRoot", "buildIdentityHash",
   "configuration", "policy", "sealedRetrieval", "expectedDifferenceRules", "creationReasonCode"] as const;
 function inputFields(value: unknown): V2ShadowMigrationRunInput {
@@ -153,6 +155,23 @@ export class V2ShadowMigrationRunner {
     };
     try {
       input = Object.freeze({ ...capture({ ...fields, policy: undefined, configuration: undefined }, deadline), policy, configuration });
+      const sourceBinding = input.expectedSourceBinding;
+      const bindingKeys = ["projectId", "vaultId", "storeId", "workspaceId", "branchScopeId", "branchRef", "sessionId"];
+      if (typeof sourceBinding !== "object" || sourceBinding === null || Array.isArray(sourceBinding)) fail("MIGRATION_SOURCE_INVALID");
+      const sourceKeys = Reflect.ownKeys(sourceBinding);
+      if (sourceKeys.length !== bindingKeys.length || sourceKeys.some(key => typeof key !== "string" || !bindingKeys.includes(key))) fail("MIGRATION_SOURCE_INVALID");
+      // capture has already rejected proxies, symbols, accessors and hidden properties.
+      for (const key of ["projectId", "vaultId", "storeId"] as const)
+        if (!isProjectionProjectStoreIdentity(sourceBinding[key])) fail("MIGRATION_SOURCE_INVALID");
+      const branchScopeUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
+      if (!isProjectionWorkspaceIdentity(sourceBinding.workspaceId) || sourceBinding.sessionId !== null
+        || (sourceBinding.branchScopeId !== null && (typeof sourceBinding.branchScopeId !== "string" || !branchScopeUuid.test(sourceBinding.branchScopeId)))
+        || (sourceBinding.branchRef !== null && (typeof sourceBinding.branchRef !== "string" || !sourceBinding.branchRef || sourceBinding.branchRef.includes("\0")))) fail("MIGRATION_SOURCE_INVALID");
+      const targetBinding = input.targetContext.binding;
+      if (sourceBinding.projectId !== targetBinding.projectId || sourceBinding.vaultId !== targetBinding.vaultId
+        || sourceBinding.storeId !== targetBinding.storeId || sourceBinding.workspaceId !== targetBinding.workspaceId
+        || sourceBinding.branchScopeId !== (input.targetContext.branchScopeId ?? null)
+        || (input.targetContext.workspace.kind === "git" && sourceBinding.branchRef !== input.targetContext.workspace.branchRef)) fail("MIGRATION_IDENTITY_CONFLICT");
       if (input.creationReasonCode !== "production-shaped-rehearsal" || input.projectId !== input.targetContext.binding.projectId
         || configuration.policyChecksum !== shadowMigrationPolicyChecksum(policy)
         || configuration.expectedDifferencePolicyVersion !== policy.expectedDifferencePolicyVersion) fail("MIGRATION_POLICY_INVALID");
@@ -397,14 +416,11 @@ export class V2ShadowMigrationRunner {
         || revision.configurationChecksum !== configurationChecksum) fail("MIGRATION_IDENTITY_CONFLICT");
       locator = revision.migrationIdentityHash;
       rules();
-      const binding = input.targetContext.binding;
       source = await execute("source-verify", "snapshot-verified", async () => {
         source?.close(); source = undefined;
         source = await verifyV1SourceCopy({ driver: this.#options.driver, sourceRoot: input.sourceRoot, manifestPath: input.sourceManifestPath,
           liveEventStorePath: input.liveEventStorePath, liveLegacyArtifactRoot: input.liveLegacyArtifactRoot,
-          expectedBinding: { projectId: binding.projectId, vaultId: binding.vaultId, storeId: binding.storeId, workspaceId: binding.workspaceId,
-            branchScopeId: input.targetContext.branchScopeId ?? null,
-            branchRef: input.targetContext.workspace.kind === "git" ? input.targetContext.workspace.branchRef : null, sessionId: null }, policy, invocationDeadline: deadline });
+          expectedBinding: sourceBinding, policy, invocationDeadline: deadline });
         const pending = fault("after-source-verified"); if (pending !== undefined) await pending;
         const parsed = authenticateSealedRetrievalSource(input.sealedRetrieval.corpus, source, deadline);
         if (canonicalJson(parsed.bundle) !== canonicalJson(input.sealedRetrieval.expectedBundle)) fail("MIGRATION_SOURCE_INVALID");

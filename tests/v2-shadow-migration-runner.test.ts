@@ -1,5 +1,11 @@
 import assert from "node:assert/strict";
-import { readFileSync, readdirSync, appendFileSync, existsSync } from "node:fs";
+import { readFileSync, readdirSync, appendFileSync, existsSync, copyFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import type { V2ShadowMigrationRunInput } from "../src/orchestrator/migration/v2-shadow-migration-runner.js";
+import { ProjectBindingService } from "../src/orchestrator/identity/project-binding.service.js";
+import { GitWorkspaceResolver } from "../src/orchestrator/identity/git-workspace.resolver.js";
+import { WorkerProjectStoreIdentityProbe } from "../src/orchestrator/runtime/project-store-identity-probe.js";
+import { RecordingGitCommandRunner } from "./support/recording-git-command-runner.js";
 import { setImmediate as nextTurn } from "node:timers/promises";
 import test from "node:test";
 import { DatabaseSync, type StatementSync } from "node:sqlite";
@@ -43,6 +49,95 @@ function independentlySealedCorpus(corpus: SealedRetrievalEvaluationCorpusV2, qu
     "source-events.json": jsonHash(source), "judgments.json": jsonHash(judgments), "v1-shadow-baseline.json": jsonHash(baseline),
   } }, source, judgments, baseline);
 }
+
+test("source binding rejects malformed own-data contracts before target writes", async t => {
+  const f = await createShadowMigrationRunnerFixture(t);
+  const sentinel = "sensitive-source-binding";
+  let traps = 0;
+  const malformed = [
+    ["missing input key", undefined],
+    ["missing binding key", Object.fromEntries(Object.entries(f.projectionBinding).filter(([key]) => key !== "branchRef"))],
+    ["extra key", { ...f.projectionBinding, unexpected: sentinel }],
+    ["accessor", Object.defineProperty({ ...f.projectionBinding }, "branchRef", { enumerable: true, get() { traps++; throw new Error(sentinel); } })],
+    ["proxy", new Proxy({ ...f.projectionBinding }, { ownKeys() { traps++; throw new Error(sentinel); } })],
+    ["nonenumerable", Object.defineProperty({ ...f.projectionBinding }, "branchRef", { value: sentinel, enumerable: false })],
+    ["symbol", { ...f.projectionBinding, [Symbol(sentinel)]: sentinel }],
+    ["null", null],
+    ["array", []],
+    ...["projectId", "vaultId", "storeId", "workspaceId", "branchScopeId"].map(key => [key, { ...f.projectionBinding, [key]: sentinel }]),
+    ["session", { ...f.projectionBinding, sessionId: randomUUID() }],
+    ["empty ref", { ...f.projectionBinding, branchRef: "" }],
+    ["NUL ref", { ...f.projectionBinding, branchRef: sentinel + "\u0000" }],
+  ] as const;
+  for (const [name, expectedSourceBinding] of malformed) await t.test(String(name), async () => {
+    const changed: Record<string, unknown> = { ...f.runnerInput, expectedSourceBinding };
+    if (expectedSourceBinding === undefined) delete changed.expectedSourceBinding;
+    await assert.rejects(new V2ShadowMigrationRunner({ driver: f.driver, utcNow: () => f.manifest.createdAt })
+      .run(changed as unknown as V2ShadowMigrationRunInput), error => {
+        assert.ok(error instanceof ShadowMigrationError); assert.equal(error.code, "MIGRATION_SOURCE_INVALID");
+        assert.equal(String(error).includes(sentinel), false); return true;
+      });
+    for (const root of [f.runnerInput.packageRoot, f.runnerInput.v1ProjectionRoot, f.runnerInput.v2ProjectionRoot, f.runnerInput.compatibilityRoot])
+      assert.deepEqual(readdirSync(root), []);
+    const target = f.driver.open(f.eventStorePath, { mode: "read-only-existing", busyTimeoutMs: 5000 });
+    try { assert.equal(target.prepare("SELECT count(*) AS n FROM v2_shadow_migration_runs").get()!.n, 0n); }
+    finally { target.close(); }
+  });
+  assert.equal(traps, 0);
+});
+
+test("source binding conflicts with target identity before target writes", async t => {
+  const f = await createShadowMigrationRunnerFixture(t);
+  for (const key of ["projectId", "vaultId", "storeId", "workspaceId", "branchScopeId"] as const) await t.test(key, async () => {
+    const changed = { ...f.runnerInput, expectedSourceBinding: { ...f.projectionBinding,
+      [key]: key === "workspaceId" ? "b".repeat(64) : randomUUID() } };
+    await assert.rejects(new V2ShadowMigrationRunner({ driver: f.driver, utcNow: () => f.manifest.createdAt }).run(changed),
+      error => error instanceof ShadowMigrationError && error.code === "MIGRATION_IDENTITY_CONFLICT");
+    for (const root of [f.runnerInput.packageRoot, f.runnerInput.v1ProjectionRoot, f.runnerInput.v2ProjectionRoot, f.runnerInput.compatibilityRoot])
+      assert.deepEqual(readdirSync(root), []);
+    const target = f.driver.open(f.eventStorePath, { mode: "read-only-existing", busyTimeoutMs: 5000 });
+    try { assert.equal(target.prepare("SELECT count(*) AS n FROM v2_shadow_migration_runs").get()!.n, 0n); }
+    finally { target.close(); }
+  });
+});
+
+test("source binding preserves a real Git target branch-ref invariant", async t => {
+  const f = await createShadowMigrationRunnerFixture(t, { branchBoundSource: true });
+  const projectRoot = dirname(f.liveVaultRoot);
+  const resolution = await new ProjectBindingService({
+    identityProbe: new WorkerProjectStoreIdentityProbe({ workerUrl: new URL("../src/workers/project-store.worker.js", import.meta.url), requestTimeoutMs: 45000 }),
+    workspaceResolver: new GitWorkspaceResolver(new RecordingGitCommandRunner()),
+  }).establish({ source: "explicit-cli", projectRoot, vaultRoot: f.liveVaultRoot,
+    clientNamespace: "task12c3-target-test", clientInstanceId: "task12c3-target", actorRole: "primary", generation: 1 });
+  assert.ok(resolution.ok);
+  assert.equal(resolution.binding.workspace.kind, "git");
+  const eventStorePath = join(projectRoot, "direct-runner-target.sqlite");
+  copyFileSync(f.eventStorePath, eventStorePath);
+  const targetContext = { binding: { ...resolution.binding, storeRoute: { ...resolution.binding.storeRoute, eventsPath: eventStorePath } },
+    workspace: resolution.binding.workspace, checkedAt: f.manifest.createdAt, branchScopeId: f.projectionBinding.branchScopeId! };
+  const changed = { ...f.runnerInput, targetContext, expectedSourceBinding: { ...f.projectionBinding, branchRef: "refs/heads/different-valid-source" } };
+  await assert.rejects(new V2ShadowMigrationRunner({ driver: f.driver, utcNow: () => f.manifest.createdAt }).run(changed),
+    error => error instanceof ShadowMigrationError && error.code === "MIGRATION_IDENTITY_CONFLICT");
+  for (const root of [f.runnerInput.packageRoot, f.runnerInput.v1ProjectionRoot, f.runnerInput.v2ProjectionRoot, f.runnerInput.compatibilityRoot])
+    assert.deepEqual(readdirSync(root), []);
+  const target = f.driver.open(eventStorePath, { mode: "read-only-existing", busyTimeoutMs: 5000 });
+  try { assert.equal(target.prepare("SELECT count(*) AS n FROM v2_shadow_migration_runs").get()!.n, 0n); }
+  finally { target.close(); }
+});
+
+test("source binding is captured before caller mutation and source verification", async t => {
+  const f = await createShadowMigrationRunnerFixture(t, { branchBoundSource: true });
+  const expectedSourceBinding = { ...f.projectionBinding };
+  const input = { ...f.runnerInput, expectedSourceBinding,
+    targetContext: { ...f.runnerInput.targetContext, branchScopeId: f.projectionBinding.branchScopeId! } };
+  const pending = new V2ShadowMigrationRunner({ driver: f.driver, utcNow: () => f.manifest.createdAt })
+    .run(input);
+  // run captures synchronously before its first awaited source operation.
+  expectedSourceBinding.branchRef = "refs/heads/caller-mutated";
+  const result = await pending;
+  assert.equal(result.status, "compatibility-complete");
+  assert.equal(result.sourceManifestChecksum, f.manifest.manifestChecksum);
+});
 
 test("Task11F exported fault boundaries are the exact frozen internal contract", () => {
   assert.equal(Object.isFrozen(SHADOW_MIGRATION_FAULT_BOUNDARIES), true);

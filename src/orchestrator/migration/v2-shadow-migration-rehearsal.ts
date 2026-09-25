@@ -467,6 +467,7 @@ export async function runV2ShadowMigrationRehearsal(supplied: unknown, build: Re
         } finally { connection.close(); }
         lastInput = { projectId: template.projectId, rolloutRevisionId: template.revisionId,
           targetContext: targetContext(preflightInput.expectedBinding, lastPaths.root, lastPaths.eventStorePath, template),
+          expectedSourceBinding: preflightInput.expectedBinding,
           sourceRoot: preflightInput.sourceRoot, sourceManifestPath: preflightInput.sourceManifestPath,
           liveEventStorePath: preflightInput.liveEventStorePath, liveLegacyArtifactRoot: preflightInput.liveLegacyArtifactRoot,
           packageRoot: lastPaths.packageRoot, v1ProjectionRoot: lastPaths.v1ProjectionRoot, v2ProjectionRoot: lastPaths.v2ProjectionRoot,

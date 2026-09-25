@@ -186,6 +186,49 @@ test("branch-bound source fixture is sealed from production Git/lifecycle events
   const verified = await verifyV1SourceCopy(f.verificationInput);
   verified.close();
 });
+test("branch-bound compiled rehearsal accepts the authenticated source binding", async t => {
+  const buildRoot = cleanBuildFixture(t), built = fixtureBuild(buildRoot);
+  assert.equal(built.status, 0, built.stdout + built.stderr);
+  const build = JSON.parse(fs.readFileSync(join(buildRoot, "dist/internal/v2-shadow-migration-build.json"), "utf8"));
+  assert.equal(build.eligible, true);
+  const f = await createSnapshotParityFixture(t, { branchBoundSource: true, rankingPair: true, legacyArtifacts: true });
+  const corpusRoot = join(f.root, "branch-command-corpus"); fs.mkdirSync(corpusRoot);
+  const artifacts = { "manifest.json": f.corpus.bundle,
+    "source-events.json": { schemaVersion: 2, corpusVersion: "retrieval-evaluation-v2", sources: f.corpus.sources },
+    "judgments.json": { schemaVersion: 2, corpusVersion: "retrieval-evaluation-v2", queries: f.corpus.queries },
+    "v1-shadow-baseline.json": f.corpus.baseline };
+  for (const [name, value] of Object.entries(artifacts)) fs.writeFileSync(join(corpusRoot, name), JSON.stringify(value));
+  const configuration = { schemaVersion: 1 as const, policyChecksum: shadowMigrationPolicyChecksum(f.policy), packageFormatVersion: 1 as const,
+    migrationAlgorithmVersion: 1 as const, expectedDifferencePolicyVersion: f.policy.expectedDifferencePolicyVersion };
+  const config = { sourceManifestPath: f.manifestPath, liveEventStorePath: f.liveEventStorePath, liveLegacyArtifactRoot: f.liveVaultRoot,
+    expectedBinding: f.projectionBinding, configuration, policy: f.policy, expectedDifferenceRules: [],
+    sealedRetrieval: { bundleRoot: corpusRoot, expectedBundle: f.corpus.bundle }, buildIdentityHash: build.buildIdentityHash,
+    rolloutRevisionTemplate: { projectId: f.projectionBinding.projectId, revisionId: f.input.rolloutRevisionId, parentRevisionId: null,
+      buildIdentityHash: build.buildIdentityHash, configurationChecksum: shadowMigrationConfigurationChecksum(configuration),
+      cohortAlgorithmVersion: 1, cohortSalt: hash("branch-command-salt"), cohortBasisPoints: 0, createdAt: f.manifest.createdAt },
+    tests: [{ name: "branch-bound-current-byte-build", passed: 1, failed: 0, skipped: 0 }], reviews: [] };
+  const configPath = join(f.root, "branch-command.json"); fs.writeFileSync(configPath, JSON.stringify(config));
+  const workRoot = join(f.root, "branch-command-work"), packageRoot = join(f.root, "branch-command-packages");
+  fs.mkdirSync(workRoot); fs.mkdirSync(packageRoot);
+  const outputParent = directory(t), output = join(outputParent, "branch-functional.json");
+  const protectedBefore = [f.sourceRoot, corpusRoot, f.liveVaultRoot].map(treeIdentity);
+  const result = childProcess.spawnSync(process.execPath, ["scripts/run-v2-shadow-migration-rehearsal.js", "--config", configPath,
+    "--source-root", f.sourceRoot, "--package-root", packageRoot, "--work-root", workRoot, "--evidence-output", output],
+    { cwd: buildRoot, env: { ...process.env, NODE_ENV: "production-rehearsal" }, encoding: "utf8", windowsHide: true, timeout: 1200000 });
+  assert.equal(result.status, 0, result.stdout + result.stderr);
+  assert.equal(result.stderr, "");
+  const evidence = JSON.parse(fs.readFileSync(output, "utf8")) as V2ShadowMigrationEvidenceV1;
+  assert.equal(evidence.deterministicRuns.length, 3);
+  for (const run of evidence.deterministicRuns) {
+    assert.equal(run.deduplicated, false);
+    assert.deepEqual(run.determinismVector, evidence.noOpRun.determinismVector);
+  }
+  assert.equal(evidence.noOpRun.deduplicated, true);
+  assert.equal(evidence.parity.blocking, 0);
+  assert.equal(evidence.sourceBeforeChecksum, evidence.sourceAfterChecksum);
+  assert.deepEqual([f.sourceRoot, corpusRoot, f.liveVaultRoot].map(treeIdentity), protectedBefore);
+});
+
 test("retains synthetic functional evidence from the fresh compiled rehearsal command", async t => {
   const buildRoot = cleanBuildFixture(t), built = fixtureBuild(buildRoot);
   assert.equal(built.status, 0, built.stdout + built.stderr);
