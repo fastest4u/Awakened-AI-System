@@ -455,7 +455,7 @@ export async function runV2ShadowMigrationRehearsal(supplied: unknown, build: Re
     initial.close(); initial = undefined;
     const results: V2ShadowMigrationRunResult[] = [], runs: DeterministicRunEvidenceV1[] = [];
     let lastInput!: V2ShadowMigrationRunInput, lastPaths!: ReturnType<typeof makeTarget>, semanticBefore = "", artifactsBefore = "";
-    let retries = 0, schemaVersion = 0, sqliteVersion = "";
+    let retries = 0, passThreeRetries = 0, schemaVersion = 0, sqliteVersion = "";
     for (const ordinal of [1, 2, 3, 4] as const) {
       assertPins(roots); build.assertUnchanged();
       if (ordinal < 4) {
@@ -480,7 +480,10 @@ export async function runV2ShadowMigrationRehearsal(supplied: unknown, build: Re
       const observed = readRunEvidence(driver, lastInput, result, ordinal);
       if (result.deduplicated !== (ordinal === 4) || result.migrationIdentity !== revision.migrationIdentityHash
         || (runs.length && canonicalJson(observed.run.determinismVector) !== canonicalJson(runs[0]!.determinismVector))) invalid();
-      results.push(result); runs.push(observed.run); retries += ordinal === 4 ? 0 : observed.retries;
+      const newRetries = ordinal === 4 ? observed.retries - passThreeRetries : observed.retries;
+      if (newRetries < 0) invalid();
+      results.push(result); runs.push(observed.run); retries += newRetries;
+      if (ordinal === 3) passThreeRetries = observed.retries;
       schemaVersion = observed.schemaVersion; sqliteVersion = observed.sqliteVersion;
       if (ordinal >= 3) {
         const semantic = semanticDigest(driver, lastPaths.eventStorePath, preflightInput.policy);

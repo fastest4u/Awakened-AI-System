@@ -332,10 +332,25 @@ test("retains synthetic functional evidence from the fresh compiled rehearsal co
   await refused("protected evidence destination refuses", args.map(value => value === output ? join(f.sourceRoot, "evidence.json") : value));
   const trace = join(f.root, "command-observations.jsonl"), hook = join(f.root, "command-observations.mjs");
   fs.writeFileSync(hook, `import fs from 'node:fs';import {syncBuiltinESMExports} from 'node:module';
+    import {DatabaseSync} from 'node:sqlite';
     const record=value=>fs.appendFileSync(${JSON.stringify(trace)},JSON.stringify(value)+'\\n');
+    let run3Created=false, revisionReads=0, semanticSeen=false, pending=0;
+    const nativePrepare=DatabaseSync.prototype.prepare;
+    DatabaseSync.prototype.prepare=function(sql,...rest){
+      if(run3Created&&sql.includes('FROM rollout_revisions WHERE project_id')&&++revisionReads===2)pending=3;
+      if(run3Created&&!semanticSeen&&sql==="SELECT name FROM sqlite_schema WHERE type='table' AND name NOT GLOB 'sqlite_*' ORDER BY name"){
+        semanticSeen=true;pending=4}
+      return nativePrepare.call(this,sql,...rest)};
+    const nativeExec=DatabaseSync.prototype.exec;
+    DatabaseSync.prototype.exec=function(sql,...rest){
+      if(sql!=='BEGIN IMMEDIATE'||pending===0)return nativeExec.call(this,sql,...rest);
+      const pass=pending;pending=0;const locker=new DatabaseSync(${JSON.stringify(join(workRoot, "run-3/events.sqlite"))});
+      nativeExec.call(locker,'BEGIN IMMEDIATE');
+      try{return nativeExec.call(this,sql,...rest)}catch(error){record({kind:'writer-retry',pass,errcode:error?.errcode});throw error}
+      finally{nativeExec.call(locker,'ROLLBACK');locker.close()}};
     const mkdir=fs.mkdirSync;fs.mkdirSync=(path,...rest)=>{const result=mkdir(path,...rest);
       const ordinal=${JSON.stringify([1, 2, 3].map(n => join(workRoot, `run-${n}`)))}.indexOf(path);
-      if(ordinal>=0)record({kind:'run-created',ordinal:ordinal+1,utcMs:Date.now()});return result;};
+      if(ordinal>=0){if(ordinal===2)run3Created=true;record({kind:'run-created',ordinal:ordinal+1,utcMs:Date.now()})}return result;};
     const usage=process.resourceUsage;process.resourceUsage=()=>{const value=usage();record({kind:'rss-cutoff',rawMaxRSS:value.maxRSS,
       outputExists:fs.existsSync(${JSON.stringify(output)})});return value;};syncBuiltinESMExports();`);
   const result = childProcess.spawnSync(process.execPath, ["--import", pathToFileURL(hook).href, ...args], { cwd: buildRoot, env: { ...process.env, NODE_ENV: "production-rehearsal" },
@@ -370,10 +385,20 @@ test("retains synthetic functional evidence from the fresh compiled rehearsal co
   assert.equal(document.noOpRun.deduplicated, true); assert.equal(document.parity.blocking, 0);
   assert.ok(document.performance.maxBatchEvents > 0); assert.ok(document.performance.maxBatchBytes > 0);
   assert.ok(document.performance.peakRssBytes > 0); assert.equal(document.performance.peakRssBytes % 1024, 0);
+  const retryConnection = f.driver.open(join(workRoot, "run-3/events.sqlite"), { mode: "read-only-existing", busyTimeoutMs: 5000 });
+  try {
+    const rows = retryConnection.prepare("SELECT outcome_category, safe_error_code FROM v2_shadow_migration_attempts ORDER BY attempt_ordinal").all();
+    assert.deepEqual(rows.map(row => ({ ...row })), [
+      { outcome_category: "retryable-failure", safe_error_code: "SQLITE_BUSY" },
+      { outcome_category: "retryable-failure", safe_error_code: "SQLITE_BUSY" },
+    ]);
+  } finally { retryConnection.close(); }
+  assert.equal(document.performance.retries, 2, "pass-three and newly observed pass-four attempts count once each");
   const observed = fs.readFileSync(trace, "utf8").trim().split("\n").map(line => JSON.parse(line));
-  assert.deepEqual(observed.map(value => value.kind), ["run-created", "run-created", "run-created", "rss-cutoff"]);
+  assert.deepEqual(observed.map(value => value.kind), ["run-created", "run-created", "run-created", "writer-retry", "writer-retry", "rss-cutoff"]);
   assert.ok(observed[0].utcMs < observed[1].utcMs && observed[1].utcMs < observed[2].utcMs, "real passes begin under different actual clocks");
-  assert.equal(observed[3].outputExists, false); assert.equal(document.performance.peakRssBytes, observed[3].rawMaxRSS * 1024);
+  assert.deepEqual(observed.slice(3, 5).map(value => [value.pass, value.errcode & 0xff]), [[3, 5], [4, 5]]);
+  assert.equal(observed[5].outputExists, false); assert.equal(document.performance.peakRssBytes, observed[5].rawMaxRSS * 1024);
   assert.ok(document.gates.length > 0 && document.gates.every(g => g.status === "passed"));
   assert.equal(bytes.includes(f.root), false); assert.equal(bytes.includes(buildRoot), false);
   assert.deepEqual([f.sourceRoot, corpusRoot, f.liveVaultRoot].map(treeIdentity), protectedBefore);
