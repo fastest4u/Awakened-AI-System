@@ -8,6 +8,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const worker = fileURLToPath(new URL('../dist/internal/stable-compatibility-directory.worker.js', import.meta.url));
 const rehearsal = fileURLToPath(new URL('../dist/internal/v2-shadow-migration-rehearsal.js', import.meta.url));
+const command = fileURLToPath(new URL('./run-v2-shadow-migration-rehearsal.js', import.meta.url));
 assert.ok(lstatSync(worker).isFile());
 assert.ok(lstatSync(rehearsal).isFile());
 const tempBase = realpathSync.native(tmpdir());
@@ -51,7 +52,10 @@ try {
     for (const input of [undefined, null, {}]) {
       await assert.rejects(entry.preflightV2ShadowMigrationRehearsal(input, { driver: { open() { throw new Error('unexpected open'); } } }),
         { code: 'MIGRATION_SOURCE_INVALID' });
+      await assert.rejects(entry.runV2ShadowMigrationRehearsal(input, { assertUnchanged() { throw new Error('unexpected build handoff'); } }),
+        { code: 'MIGRATION_SOURCE_INVALID' });
     }
+    assert.throws(() => entry.readV2ShadowRehearsalResources([], {}), { code: 'MIGRATION_SOURCE_INVALID' });
   `], { cwd: isolated, windowsHide: true, encoding: 'utf8', timeout: 10000, maxBuffer: 16384 });
   assert.equal(preflight.status, 0, preflight.stderr); assert.equal(preflight.stderr, ''); assert.equal(preflight.stdout, '');
   assert.deepEqual(readdirSync(isolated), ['artifact.md']);
@@ -59,5 +63,10 @@ try {
   assert.deepEqual(readFileSync(join(isolated, 'artifact.md')), bytes);
   assert.deepEqual(readdirSync(protectedRoot), ['sentinel.md']);
   assert.deepEqual(identity(join(protectedRoot, 'sentinel.md')), protectedBefore);
-  console.log('PASS built rehearsal preflight: inert import and missing/invalid configuration refusal without selected-root mutation');
+  const refused = spawnSync(process.execPath, [command, '--unknown', isolated], { cwd: isolated, windowsHide: true,
+    env: { ...process.env, NODE_ENV: 'production-rehearsal' }, encoding: 'utf8', timeout: 10000, maxBuffer: 16384 });
+  assert.equal(refused.status, 1); assert.equal(refused.stdout, ''); assert.equal(refused.stderr, 'REHEARSAL_REFUSED\n');
+  assert.deepEqual(readdirSync(isolated), ['artifact.md']); assert.deepEqual(identity(join(isolated, 'artifact.md')), installed);
+  assert.deepEqual(readFileSync(join(isolated, 'artifact.md')), bytes);
+  console.log('PASS built rehearsal: inert import, invalid preflight/composition/resource refusal, strict CLI refusal and selected-root preservation');
 } finally { rmSync(root, { recursive: true, force: true }); }

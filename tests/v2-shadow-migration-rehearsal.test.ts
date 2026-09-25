@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import childProcess from "node:child_process";
-import { syncBuiltinESMExports } from "node:module";
+import { isBuiltin, syncBuiltinESMExports } from "node:module";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { canonicalJson } from "../src/orchestrator/serialization/canonical-json.js";
 import { buildV2ShadowMigrationEvidence, buildV2ShadowMigrationPreflightFailureEvidence,
@@ -13,8 +13,16 @@ import { buildV2ShadowMigrationEvidence, buildV2ShadowMigrationPreflightFailureE
   hasRequiredApprovedV2ShadowMigrationReviews, V2ShadowMigrationEvidenceError, type V2ShadowMigrationEvidenceV1,
 } from "../src/orchestrator/migration/v2-shadow-migration-evidence.js";
 import { V2ShadowMigrationRunner, V2ShadowMigrationPreflightFailure, readV2ShadowMigrationPreflightEvidence } from "../src/orchestrator/migration/v2-shadow-migration-runner.js";
-import { createShadowMigrationRunnerFixture, createSnapshotParityFixture } from "./support/v2-shadow-migration-fixture.js";
-import { shadowMigrationPolicyChecksum } from "../src/orchestrator/migration/v2-shadow-migration.contracts.js";
+import { createCompatibilityFixture, createShadowMigrationRunnerFixture, createSnapshotParityFixture } from "./support/v2-shadow-migration-fixture.js";
+import { shadowMigrationPolicyChecksum, shadowMigrationConfigurationChecksum } from "../src/orchestrator/migration/v2-shadow-migration.contracts.js";
+import { readV2ShadowRehearsalResources } from "../src/orchestrator/migration/v2-shadow-migration-rehearsal.js";
+import { readV2ShadowImportBatchObservation, V2ShadowImporter } from "../src/orchestrator/migration/v2-shadow-importer.js";
+import { SqliteEventStoreStatements } from "../src/orchestrator/storage/event-store.js";
+import { MaintenanceFence } from "../src/orchestrator/storage/maintenance-fence.js";
+import { BranchScopeRepository } from "../src/orchestrator/storage/branch-scope.repository.js";
+import type { V2ShadowMigrationRunResult } from "../src/orchestrator/migration/v2-shadow-migration-runner.js";
+import { expectedDifferenceRuleChecksum } from "../src/orchestrator/parity/v2-expected-difference.js";
+import { openImmutableProjectionImage } from "../src/orchestrator/projections/integrity.js";
 
 let compiledPreflight: Promise<any> | undefined;
 // This snapshot is independent of the original Git administration and captures current bytes,
@@ -90,6 +98,269 @@ function fixtureGit(root: string, args: string[]): string {
 function fixtureBuild(root: string) {
   return childProcess.spawnSync(process.execPath, ["scripts/build.js"], { cwd: root, encoding: "utf8", windowsHide: true, timeout: 180000, maxBuffer: 2 * 1024 * 1024 });
 }
+function treeIdentity(root: string): unknown {
+  const stat = fs.lstatSync(root, { bigint: true });
+  return [String(stat.dev), String(stat.ino), String(stat.nlink), stat.isDirectory()
+    ? fs.readdirSync(root).sort().map(name => [name, treeIdentity(join(root, name))])
+    : createHash("sha256").update(fs.readFileSync(root)).digest("hex")];
+}
+test("private builtin loader exception is path-specific and closed before and after bundling", async t => {
+  const root = cleanBuildFixture(t), manifestPath = join(root, "dist/internal/v2-shadow-migration-build.json");
+  const built = fixtureBuild(root); assert.equal(built.status, 0, built.stdout + built.stderr);
+  const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8")); assert.equal(manifest.eligible, true);
+  assert.ok(manifest.inputs.some((input: any) => input.path === "src/orchestrator/storage/schema-fingerprint.ts"));
+  const entry = pathToFileURL(join(root, "dist/internal/v2-shadow-migration-rehearsal.js")).href;
+  const imported = childProcess.spawnSync(process.execPath, ["--input-type=module", "-e", `await import(${JSON.stringify(entry)});`],
+    { cwd: root, encoding: "utf8", windowsHide: true, timeout: 30000 });
+  assert.equal(imported.status, 0, imported.stderr); assert.equal(imported.stdout, ""); assert.equal(imported.stderr, "");
+  for (const [name, mutate] of [
+    ["nonbuiltin", (text: string) => text.replace('require("node:sqlite")', 'require("unmeasured-module")')],
+    ["computed", (text: string) => text.replace('require("node:sqlite")', 'require(process.env.PRIVATE_SQLITE!)')],
+    ["extra argument", (text: string) => text.replace('require("node:sqlite")', 'require("node:sqlite", "extra")')],
+    ["escaped loader", (text: string) => text + '\nexport const escapedLoader = require;\n'],
+    ["reassigned loader", (text: string) => text.replace('const require =', 'let require =') + '\nrequire = (() => null) as any;\n'],
+    ["aliased factory", (text: string) => text + '\nconst escapedFactory = createRequire;\n'],
+  ] as const) await t.test(name, () => {
+    const path = join(root, "src/orchestrator/storage/schema-fingerprint.ts"), bytes = fs.readFileSync(path);
+    try {
+      const changed = mutate(bytes.toString()); assert.notEqual(changed, bytes.toString()); fs.writeFileSync(path, changed);
+      const result = fixtureBuild(root); assert.notEqual(result.status, 0); assert.match(result.stderr, /REHEARSAL_BUILD_INVALID/);
+      assert.equal(JSON.parse(fs.readFileSync(manifestPath, "utf8")).eligible, false);
+    } finally { fs.writeFileSync(path, bytes); }
+  });
+  await t.test("the same loader in another measured source refuses", () => {
+    const path = join(root, "src/orchestrator/migration/v2-shadow-migration-rehearsal.ts"), bytes = fs.readFileSync(path);
+    try {
+      fs.appendFileSync(path, '\nimport {createRequire} from "node:module"; const require = createRequire(import.meta.url); require("node:sqlite");\n');
+      const result = fixtureBuild(root); assert.notEqual(result.status, 0); assert.match(result.stderr, /REHEARSAL_BUILD_INVALID/);
+    } finally { fs.writeFileSync(path, bytes); }
+  });
+  await t.test("emitted renamed bindings cannot escape the independent AST proof", async () => {
+    const ts = (await import("typescript")).default;
+    const buildText = fs.readFileSync(join(root, "scripts/build.js"), "utf8");
+    const body = buildText.slice(buildText.indexOf("function assertClosedSyntax("), buildText.indexOf("function measuredPrivateBuild("));
+    assert.ok(body.startsWith("function assertClosedSyntax("));
+    // Execute the exact producer checker, not a copied test implementation.
+    const check = new Function("ts", "isBuiltin", "buildRefusal", body + ";return assertClosedSyntax;")(
+      ts, isBuiltin, () => { throw new Error("REHEARSAL_BUILD_INVALID"); });
+    const emitted = 'import{createRequire as factory}from"node:module";var loader=factory(import.meta.url);function load(){return loader("node:sqlite")}';
+    assert.doesNotThrow(() => check("dist/internal/v2-shadow-migration-rehearsal.js", Buffer.from(emitted), true));
+    for (const changed of [emitted.replace('"node:sqlite"', '"unmeasured"'), emitted.replace('"node:sqlite"', 'process.env.LOAD'),
+      emitted.replace('loader("node:sqlite")', 'loader("node:sqlite",1)'), emitted + ';const alias=loader;', emitted + ';loader=other;',
+      emitted + ';const alias=factory;', emitted.replace('factory(import.meta.url)', 'factory(other)'),
+      emitted.replace('loader("node:sqlite")', 'loader.call(null,"node:sqlite")'), emitted + ';function hidden(loader){return loader("node:sqlite")}',
+      emitted + ';export{loader};']) {
+      assert.throws(() => check("dist/internal/v2-shadow-migration-rehearsal.js", Buffer.from(changed), true), /REHEARSAL_BUILD_INVALID/);
+    }
+  });
+});
+test("immutable projection image is readable without project-store metadata", async t => {
+  const f = await createSnapshotParityFixture(t, { rankingPair: true, legacyArtifacts: true });
+  const path = f.input.projections.v2.databasePath;
+  assert.throws(() => f.driver.open(path, { mode: "read-only-existing", busyTimeoutMs: 5000 }),
+    /SQLite application identity does not match project memory/);
+  const bytes = fs.readFileSync(path);
+  const database = openImmutableProjectionImage(bytes);
+  try {
+    assert.ok(Number(database.prepare("SELECT count(*) AS n FROM session_tree").get()!.n) > 0);
+  } finally { database.close(); }
+});
+test("retains synthetic functional evidence from the fresh compiled rehearsal command", async t => {
+  const buildRoot = cleanBuildFixture(t), built = fixtureBuild(buildRoot);
+  assert.equal(built.status, 0, built.stdout + built.stderr);
+  const build = JSON.parse(fs.readFileSync(join(buildRoot, "dist/internal/v2-shadow-migration-build.json"), "utf8"));
+  assert.equal(build.eligible, true);
+  const f = await createSnapshotParityFixture(t, { rankingPair: true, legacyArtifacts: true });
+  const corpusRoot = join(f.root, "command-corpus"); fs.mkdirSync(corpusRoot);
+  const artifacts = { "manifest.json": f.corpus.bundle,
+    "source-events.json": { schemaVersion: 2, corpusVersion: "retrieval-evaluation-v2", sources: f.corpus.sources },
+    "judgments.json": { schemaVersion: 2, corpusVersion: "retrieval-evaluation-v2", queries: f.corpus.queries },
+    "v1-shadow-baseline.json": f.corpus.baseline };
+  for (const [name, value] of Object.entries(artifacts)) fs.writeFileSync(join(corpusRoot, name), JSON.stringify(value));
+  const configuration = { schemaVersion: 1 as const, policyChecksum: shadowMigrationPolicyChecksum(f.policy), packageFormatVersion: 1 as const,
+    migrationAlgorithmVersion: 1 as const, expectedDifferencePolicyVersion: f.policy.expectedDifferencePolicyVersion };
+  const config = { sourceManifestPath: f.manifestPath, liveEventStorePath: f.liveEventStorePath, liveLegacyArtifactRoot: f.liveVaultRoot,
+    expectedBinding: f.projectionBinding, configuration, policy: f.policy, expectedDifferenceRules: [],
+    sealedRetrieval: { bundleRoot: corpusRoot, expectedBundle: f.corpus.bundle }, buildIdentityHash: build.buildIdentityHash,
+    rolloutRevisionTemplate: { projectId: f.projectionBinding.projectId, revisionId: f.input.rolloutRevisionId, parentRevisionId: null,
+      buildIdentityHash: build.buildIdentityHash, configurationChecksum: shadowMigrationConfigurationChecksum(configuration),
+      cohortAlgorithmVersion: 1, cohortSalt: hash("synthetic-command-salt"), cohortBasisPoints: 0, createdAt: f.manifest.createdAt },
+    tests: [{ name: "synthetic-current-byte-build", passed: 1, failed: 0, skipped: 0 }], reviews: [] };
+  const configPath = join(f.root, "command.json"); fs.writeFileSync(configPath, JSON.stringify(config));
+  const workRoot = join(f.root, "command-work"), packageRoot = join(f.root, "command-packages");
+  fs.mkdirSync(workRoot); fs.mkdirSync(packageRoot);
+  const retained = process.env.V2_SHADOW_MIGRATION_TEST_EVIDENCE_OUTPUT;
+  let outputParent: string, output: string;
+  if (retained !== undefined) {
+    assert.equal(resolve(retained), retained, "retained destination must be absolute and canonical");
+    output = retained; outputParent = dirname(output);
+    if (!fs.existsSync(outputParent)) { assert.equal(fs.realpathSync.native(dirname(outputParent)), dirname(outputParent)); fs.mkdirSync(outputParent); }
+    assert.equal(fs.realpathSync.native(outputParent), outputParent); assert.deepEqual(fs.readdirSync(outputParent), []);
+    ownedDirectories.set(outputParent, fs.lstatSync(outputParent, { bigint: true }));
+  } else { outputParent = directory(t); output = join(outputParent, "synthetic-functional.json"); }
+  const protectedBefore = [f.sourceRoot, corpusRoot, f.liveVaultRoot].map(treeIdentity);
+  const args = ["scripts/run-v2-shadow-migration-rehearsal.js", "--config", configPath, "--source-root", f.sourceRoot,
+    "--package-root", packageRoot, "--work-root", workRoot, "--evidence-output", output];
+  const refused = async (name: string, changedArgs = args, changedConfig: unknown = config, environment = "production-rehearsal") => t.test(name, () => {
+    const before = [workRoot, packageRoot, outputParent].map(treeIdentity);
+    fs.writeFileSync(configPath, JSON.stringify(changedConfig));
+    try {
+      const observed = childProcess.spawnSync(process.execPath, changedArgs, { cwd: buildRoot,
+        env: { ...process.env, NODE_ENV: environment }, encoding: "utf8", windowsHide: true, timeout: 60000 });
+      assert.equal(observed.status, 1, observed.stdout + observed.stderr); assert.equal(observed.stdout, "");
+      assert.equal(observed.stderr, "REHEARSAL_REFUSED\n");
+      assert.deepEqual([workRoot, packageRoot, outputParent].map(treeIdentity), before, "refusal precedes targets and reservation");
+      assert.deepEqual([f.sourceRoot, corpusRoot, f.liveVaultRoot].map(treeIdentity), protectedBefore);
+    } finally { fs.writeFileSync(configPath, JSON.stringify(config)); }
+  });
+  await refused("wrong environment refuses before selected writes", args, config, "production");
+  await refused("missing flag refuses", args.slice(0, -2));
+  await refused("duplicate flag refuses", args.map(value => value === "--work-root" ? "--source-root" : value));
+  await refused("unknown flag refuses", args.map(value => value === "--work-root" ? "--unknown-root" : value));
+  await refused("relative selected path refuses", args.map(value => value === workRoot ? "relative" : value));
+  await refused("unknown configuration refuses", args, { ...config, unexpected: true });
+  await refused("mismatched build identity refuses", args, { ...config, buildIdentityHash: "0".repeat(64) });
+  await refused("unapproved corpus refuses", args, { ...config, sealedRetrieval: { ...config.sealedRetrieval,
+    expectedBundle: { ...f.corpus.bundle, files: { ...f.corpus.bundle.files, "judgments.json": "0".repeat(64) } } } });
+  await refused("sensitive supplied test labels refuse", args, { ...config, tests: [{ name: "sk-secret-test-token", passed: 1, failed: 0, skipped: 0 }] });
+  await refused("source-work alias refuses", args.map(value => value === workRoot ? f.sourceRoot : value));
+  await refused("package-work alias refuses", args.map(value => value === workRoot ? packageRoot : value));
+  await refused("protected evidence destination refuses", args.map(value => value === output ? join(f.sourceRoot, "evidence.json") : value));
+  const trace = join(f.root, "command-observations.jsonl"), hook = join(f.root, "command-observations.mjs");
+  fs.writeFileSync(hook, `import fs from 'node:fs';import {syncBuiltinESMExports} from 'node:module';
+    const record=value=>fs.appendFileSync(${JSON.stringify(trace)},JSON.stringify(value)+'\\n');
+    const mkdir=fs.mkdirSync;fs.mkdirSync=(path,...rest)=>{const result=mkdir(path,...rest);
+      const ordinal=${JSON.stringify([1, 2, 3].map(n => join(workRoot, `run-${n}`)))}.indexOf(path);
+      if(ordinal>=0)record({kind:'run-created',ordinal:ordinal+1,utcMs:Date.now()});return result;};
+    const usage=process.resourceUsage;process.resourceUsage=()=>{const value=usage();record({kind:'rss-cutoff',rawMaxRSS:value.maxRSS,
+      outputExists:fs.existsSync(${JSON.stringify(output)})});return value;};syncBuiltinESMExports();`);
+  const result = childProcess.spawnSync(process.execPath, ["--import", pathToFileURL(hook).href, ...args], { cwd: buildRoot, env: { ...process.env, NODE_ENV: "production-rehearsal" },
+    encoding: "utf8", windowsHide: true, timeout: 1200000, maxBuffer: 1024 * 1024 });
+  assert.equal(result.status, 0, result.stdout + result.stderr);
+  assert.equal(result.stderr, "");
+  const bytes = fs.readFileSync(output, "utf8"), document = JSON.parse(bytes) as V2ShadowMigrationEvidenceV1;
+  const stat = fs.lstatSync(output, { bigint: true }); assert.equal(stat.nlink, 1n);
+  const { evidenceChecksum, ...body } = document;
+  assert.equal(evidenceChecksum, hash("project-memory/v2-shadow-migration-evidence/v1\n" + canonicalJson(body)));
+  assert.equal(bytes, canonicalJson(document) + "\n"); assert.deepEqual(document.reviews, []);
+  assert.equal(document.commit, build.commit); assert.equal(document.buildIdentityHash, build.buildIdentityHash);
+  assert.equal(document.counts.retrievalQueries, f.corpus.queries.length); assert.equal(f.corpus.queries.length, 11);
+  const expectedPath = f.input.projections.v2.databasePath, expectedStat = fs.lstatSync(expectedPath, { bigint: true });
+  assert.ok(expectedStat.isFile() && expectedStat.nlink === 1n && expectedStat.size <= 128n * 1024n * 1024n);
+  const expectedBytes = fs.readFileSync(expectedPath);
+  assert.equal(createHash("sha256").update(expectedBytes).digest("hex"), f.input.projections.v2.manifest.databaseSha256);
+  const expectedProjection = openImmutableProjectionImage(expectedBytes);
+  try {
+    for (const [name, table] of [["projectedLifecycleSessions", "session_tree"], ["projectedCheckpoints", "session_checkpoints"],
+      ["projectedFollowUps", "tasks_followups"]] as const)
+      assert.equal(document.counts[name], Number(expectedProjection.prepare(`SELECT count(*) AS n FROM ${table}`).get()!.n));
+  } finally { expectedProjection.close(); }
+  assert.equal(fs.lstatSync(expectedPath, { bigint: true }).ino, expectedStat.ino);
+  assert.equal(createHash("sha256").update(fs.readFileSync(expectedPath)).digest("hex"), f.input.projections.v2.manifest.databaseSha256);
+  assert.ok(document.counts.projectedLifecycleSessions! > 0); assert.ok(document.counts.projectedCheckpoints! > 0);
+  assert.equal(document.counts.projectedFollowUps, 0, "the sealed corpus has no structured follow-up records");
+  assert.equal(document.counts.sourceScopeProvenanceRecords, f.manifest.eventCount);
+  assert.equal(document.sourceBeforeChecksum, document.sourceAfterChecksum);
+  assert.equal(document.deterministicRuns.length, 3);
+  for (const run of document.deterministicRuns) { assert.equal(run.deduplicated, false); assert.deepEqual(run.determinismVector, document.noOpRun.determinismVector); }
+  assert.equal(document.noOpRun.deduplicated, true); assert.equal(document.parity.blocking, 0);
+  assert.ok(document.performance.maxBatchEvents > 0); assert.ok(document.performance.maxBatchBytes > 0);
+  assert.ok(document.performance.peakRssBytes > 0); assert.equal(document.performance.peakRssBytes % 1024, 0);
+  const observed = fs.readFileSync(trace, "utf8").trim().split("\n").map(line => JSON.parse(line));
+  assert.deepEqual(observed.map(value => value.kind), ["run-created", "run-created", "run-created", "rss-cutoff"]);
+  assert.ok(observed[0].utcMs < observed[1].utcMs && observed[1].utcMs < observed[2].utcMs, "real passes begin under different actual clocks");
+  assert.equal(observed[3].outputExists, false); assert.equal(document.performance.peakRssBytes, observed[3].rawMaxRSS * 1024);
+  assert.ok(document.gates.length > 0 && document.gates.every(g => g.status === "passed"));
+  assert.equal(bytes.includes(f.root), false); assert.equal(bytes.includes(buildRoot), false);
+  assert.deepEqual([f.sourceRoot, corpusRoot, f.liveVaultRoot].map(treeIdentity), protectedBefore);
+  assert.equal(fs.existsSync(join(outputParent, CONTROL)), false);
+  const repeated = childProcess.spawnSync(process.execPath, args, { cwd: buildRoot, env: { ...process.env, NODE_ENV: "production-rehearsal" },
+    encoding: "utf8", windowsHide: true, timeout: 30000 });
+  assert.equal(repeated.status, 1); assert.equal(fs.readFileSync(output, "utf8"), bytes);
+  assert.equal(fs.lstatSync(output, { bigint: true }).ino, stat.ino);
+  await t.test("expired rules use current UTC and publish only genuine pre-run failure evidence", () => {
+    const failureWork = join(f.root, "expired-work"), failurePackages = join(f.root, "expired-packages"), failureOutput = directory(t);
+    fs.mkdirSync(failureWork); fs.mkdirSync(failurePackages);
+    const { ruleChecksum: _old, ...originalRule } = f.metadataRules[0]!;
+    const rule = { ...originalRule, migrationIdentity: document.migrationIdentity,
+      issuedAt: new Date(Date.now() - 60000).toISOString(), expiresAt: new Date(Date.now() - 30000).toISOString() };
+    const expiredConfig = { ...config, expectedDifferenceRules: [{ ...rule, ruleChecksum: expectedDifferenceRuleChecksum(rule) }] };
+    fs.writeFileSync(configPath, JSON.stringify(expiredConfig));
+    try {
+      const expiredArgs = args.map(value => value === workRoot ? failureWork : value === packageRoot ? failurePackages
+        : value === output ? join(failureOutput, "success.json") : value);
+      const expired = childProcess.spawnSync(process.execPath, expiredArgs, { cwd: buildRoot,
+        env: { ...process.env, NODE_ENV: "production-rehearsal" }, encoding: "utf8", windowsHide: true, timeout: 120000 });
+      assert.equal(expired.status, 1); assert.equal(expired.stdout, ""); assert.equal(expired.stderr, "REHEARSAL_REFUSED\n");
+      assert.deepEqual(fs.readdirSync(failureOutput).sort(), [CONTROL, FAILURE].sort());
+      const failureBytes = fs.readFileSync(join(failureOutput, FAILURE), "utf8"), failure = JSON.parse(failureBytes);
+      const { evidenceChecksum: checksum, ...failureBody } = failure;
+      assert.equal(checksum, hash("project-memory/v2-shadow-migration-preflight-failure-evidence/v1\n" + canonicalJson(failureBody)));
+      assert.equal(failureBytes, canonicalJson(failure) + "\n"); assert.equal(failureBytes.includes(f.root), false);
+      assert.equal(failure.rolloutRevisionId, config.rolloutRevisionTemplate.revisionId);
+      const connection = f.driver.open(join(failureWork, "run-1/events.sqlite"), { mode: "read-only-existing", busyTimeoutMs: 5000 });
+      try { assert.equal(connection.prepare("SELECT count(*) AS n FROM v2_shadow_migration_runs").get()!.n, 0n); }
+      finally { connection.close(); }
+    } finally { fs.writeFileSync(configPath, JSON.stringify(config)); }
+  });
+  for (const scenario of ["link-side-effect", "child-death", "lost-response"] as const) await t.test(`actual built publisher ${scenario} retains uncertain outcome`, async () => {
+    const destination = directory(t), faultOutput = join(destination, "success.json");
+    const bodies = {
+      "link-side-effect": "const link=fs.linkSync;fs.linkSync=(a,b)=>{link(a,b);throw new Error('synthetic-secret')};",
+      "child-death": "const link=fs.linkSync;fs.linkSync=(a,b)=>{link(a,b);process.exit(9)};",
+      "lost-response": "const write=process.stdout.write.bind(process.stdout);process.stdout.write=(text,callback)=>{if(String(text).includes('published')){if(callback)callback();return true}return write(text,callback)};",
+    };
+    const restore = childHook(t, bodies[scenario], join(buildRoot, "dist/internal/v2-shadow-migration-rehearsal.js"));
+    try {
+      const reservation = await reserveV2ShadowMigrationEvidence({ outputPath: faultOutput, protectedRoots: [], timeoutMs: 5000 });
+      await assert.rejects(writeV2ShadowMigrationEvidence({ reservation, evidence: document }), (error: any) => error.code === "EVIDENCE_OUTCOME_UNKNOWN"
+        && !error.message.includes("synthetic-secret"));
+    } finally { restore(); }
+    assert.equal(fs.readFileSync(faultOutput, "utf8"), bytes, "original genuine finalized document, not reconstructed evidence");
+    assert.equal(fs.statSync(faultOutput).nlink, scenario === "lost-response" ? 1 : 2);
+    if (scenario !== "lost-response") assert.ok(fs.existsSync(join(destination, CONTROL)));
+  });
+  t.diagnostic(`synthetic functional evidence checksum ${evidenceChecksum}; fixture commit ${build.commit}`);
+  if (!retained) removeOwnedFile(outputParent, output.slice(outputParent.length + 1), { device: String(stat.dev), inode: String(stat.ino) }, bytes);
+});
+test("resource aggregation uses genuine component maxima and refuses absent provenance or invalid RSS", async t => {
+  const observations = [], results: V2ShadowMigrationRunResult[] = [];
+  const large = await createSnapshotParityFixture(t), small = await createCompatibilityFixture(t);
+  const workspace = { kind: "non-git" as const, workspaceRoot: small.root, workspaceId: small.projectionBinding.workspaceId };
+  const smallContext = { ...large.context, workspace, binding: { ...large.context.binding, ...small.projectionBinding, workspace,
+    projectRoot: small.root, vaultRoot: small.liveVaultRoot,
+    storeRoute: { ...large.context.binding.storeRoute, storeRoot: dirname(small.eventStorePath), eventsPath: small.eventStorePath } } };
+  for (const f of [large, { ...small, context: smallContext }]) {
+    const imported = new V2ShadowImporter({ connection: f.connection, statements: new SqliteEventStoreStatements(f.connection),
+      maintenance: new MaintenanceFence(), branchScopes: new BranchScopeRepository(), policy: f.policy })
+      .import({ context: f.context, sealedPackage: f.sealedPackage });
+    const observed = readV2ShadowImportBatchObservation(imported); assert.ok(observed); observations.push(observed);
+    // Only the parent holder is synthetic; the opaque importer result is never copied or mocked.
+    results.push({ import: imported } as V2ShadowMigrationRunResult);
+  }
+  const all = [results[0]!, results[1]!, results[0]!, results[1]!];
+  const policy = { schemaVersion: 1, maxBatchEvents: Math.max(...observations.map(value => value.maxBatchEvents)),
+    maxBatchBytes: Math.max(...observations.map(value => value.maxBatchBytes)) } as Parameters<typeof readV2ShadowRehearsalResources>[1];
+  assert.notEqual(observations[0]!.maxBatchEvents, observations[1]!.maxBatchEvents);
+  const original = process.resourceUsage;
+  try {
+    process.resourceUsage = () => ({ ...original(), maxRSS: 17 });
+    const measured = readV2ShadowRehearsalResources(all, policy);
+    assert.deepEqual(measured, { maxBatchEvents: policy.maxBatchEvents, maxBatchBytes: policy.maxBatchBytes, peakRssBytes: 17 * 1024 });
+    assert.ok(Object.isFrozen(measured));
+    for (const supplied of [[], all.slice(1), [...all, results[0]!], all.map(result => ({ ...result, import: { ...result.import } })),
+      [{ import: {} }, ...all.slice(1)]]) assert.throws(() => readV2ShadowRehearsalResources(supplied as V2ShadowMigrationRunResult[], policy));
+    assert.throws(() => readV2ShadowRehearsalResources(all, { ...policy, maxBatchEvents: policy.maxBatchEvents - 1 }));
+    assert.throws(() => readV2ShadowRehearsalResources(all, { ...policy, maxBatchBytes: policy.maxBatchBytes - 1 }));
+    for (const maxRSS of [NaN, Infinity, -1, 0.5, Number.MAX_SAFE_INTEGER, undefined]) {
+      process.resourceUsage = () => ({ ...original(), maxRSS: maxRSS as number });
+      assert.throws(() => readV2ShadowRehearsalResources(all, policy));
+    }
+    process.resourceUsage = () => { throw new Error("synthetic RSS unavailable"); };
+    assert.throws(() => readV2ShadowRehearsalResources(all, policy));
+  } finally { process.resourceUsage = original; }
+});
+
 test("tool loader resolution cannot escape the measured clean fixture", async t => {
   const root = cleanBuildFixture(t), manifestPath = join(root, "dist/internal/v2-shadow-migration-build.json");
   const baseline = fixtureBuild(root); assert.equal(baseline.status, 0, baseline.stdout + baseline.stderr);
@@ -219,7 +490,7 @@ test("clean current-byte fixture validates provenance and refuses stale or corru
         "--source-root", marker, "--work-root", marker, "--package-root", marker, "--evidence-output", marker],
       { cwd: root, encoding: "utf8", windowsHide: true });
       assert.notEqual(result.status, 0); assert.equal(result.stdout, ""); assert.equal(fs.existsSync(marker), false);
-      assert.equal(result.stderr.trim(), "REHEARSAL_COMPOSITION_UNAVAILABLE");
+      assert.equal(result.stderr.trim(), "REHEARSAL_REFUSED");
     } finally { fs.writeFileSync(artifact, bytes); }
   });
   await t.test("clean changed HEAD does not reuse prior manifest", () => {
@@ -317,6 +588,21 @@ test("compiled rehearsal preflight authenticates the entire pinned corpus withou
   const supplied = { sourceRoot: f.sourceRoot, sourceManifestPath: f.manifestPath, liveEventStorePath: f.liveEventStorePath,
     liveLegacyArtifactRoot: f.liveVaultRoot, expectedBinding: f.projectionBinding, configuration, policy: f.policy,
     expectedDifferenceRules: [], sealedRetrieval: { bundleRoot, expectedBundle: f.corpus.bundle } };
+  await t.test("fresh bounded preflights preserve identity and detect same-byte corpus replacement", async () => {
+    const first = await module.preflightV2ShadowMigrationRehearsal(supplied, { driver: f.driver });
+    const identity = first.identity; first.close();
+    assert.ok(identity, "C3 needs immutable cross-preflight source and corpus identity");
+    assert.ok(Object.isFrozen(identity));
+    const second = await module.preflightV2ShadowMigrationRehearsal(supplied, { driver: f.driver });
+    try { assert.deepEqual(second.identity, identity); } finally { second.close(); }
+    const file = join(bundleRoot, "judgments.json"), original = fs.readFileSync(file);
+    fs.renameSync(file, file + ".held"); fs.writeFileSync(file, original);
+    try {
+      const replaced = await module.preflightV2ShadowMigrationRehearsal(supplied, { driver: f.driver });
+      try { assert.notEqual(replaced.identity.corpusChecksum, identity.corpusChecksum); }
+      finally { replaced.close(); }
+    } finally { fs.unlinkSync(file); fs.renameSync(file + ".held", file); }
+  });
   await t.test("compiled decoder captures valid branch-scoped settings without invoking caller behavior", () => {
     const branched = { ...supplied, expectedBinding: { ...f.projectionBinding, branchScopeId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", branchRef: "refs/heads/rehearsal" } };
     const result = module.decodeV2ShadowMigrationRehearsalPreflightInput(branched);
@@ -637,13 +923,15 @@ test("publication child does not inherit parent execution flags or NODE_OPTIONS"
 });
 
 // Native process boundary instrumentation is test-owned. Production has no injection API or mode.
-function childHook(t: TestContext, source: string): () => void {
+function childHook(t: TestContext, source: string, builtEntry?: string): () => void {
   const root = directory(t), hook = join(root, "fault.mjs");
   const bytes = `import fs from 'node:fs'; import {syncBuiltinESMExports} from 'node:module';\n${source}\nsyncBuiltinESMExports();\n`;
   fs.writeFileSync(hook, bytes, { flag: "wx" }); const stat = fs.statSync(hook, { bigint: true });
   const nativeSpawn = childProcess.spawn;
-  const mocked = t.mock.method(childProcess, "spawn", ((command: string, args: string[], options: object) =>
-    nativeSpawn(command, ["--import", pathToFileURL(hook).href, ...args], options)) as typeof nativeSpawn);
+  const mocked = t.mock.method(childProcess, "spawn", ((command: string, args: string[], options: object) => {
+    if (builtEntry) assert.equal(args[1], "--v2-shadow-migration-evidence-child");
+    return nativeSpawn(command, ["--import", pathToFileURL(hook).href, ...(builtEntry ? [builtEntry, ...args.slice(1)] : args)], options);
+  }) as typeof nativeSpawn);
   syncBuiltinESMExports(); return () => { mocked.mock.restore(); syncBuiltinESMExports(); removeOwnedFile(root, "fault.mjs", { device: String(stat.dev), inode: String(stat.ino) }, bytes); };
 }
 test("strict directory-flush refusal retains exclusively acquired reservation", async t => {

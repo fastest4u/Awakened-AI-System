@@ -209,7 +209,43 @@ export function validateV2ShadowMigrationBuild(buildIdentityHash) {
     } catch { buildRefusal(); }
 }
 
+async function runCommand(args) {
+    if (process.env.NODE_ENV !== 'production-rehearsal') buildRefusal();
+    const names = ['--config', '--source-root', '--package-root', '--work-root', '--evidence-output'];
+    if (args.length !== names.length * 2) buildRefusal();
+    const values = new Map();
+    for (let index = 0; index < args.length; index += 2) {
+        const name = args[index], value = args[index + 1];
+        if (!names.includes(name) || values.has(name) || !value || !path.isAbsolute(value) || path.normalize(value) !== value || value.includes('\0')) buildRefusal();
+        values.set(name, value);
+    }
+    const configPath = values.get('--config');
+    let cursor = configPath;
+    while (true) {
+        const stat = fs.lstatSync(cursor);
+        if (stat.isSymbolicLink() || fs.realpathSync.native(cursor) !== cursor) buildRefusal();
+        const parent = path.dirname(cursor); if (parent === cursor) break; cursor = parent;
+    }
+    const configBytes = readAbsoluteBuildBytes(configPath, 1024 * 1024);
+    const config = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(configBytes));
+    if (!config || typeof config !== 'object' || Array.isArray(config)) buildRefusal();
+    const build = validateV2ShadowMigrationBuild(config.buildIdentityHash);
+    const originalConfig = fs.lstatSync(configPath, { bigint: true });
+    const assertUnchanged = () => {
+        build.assertUnchanged();
+        const current = fs.lstatSync(configPath, { bigint: true });
+        if (current.dev !== originalConfig.dev || current.ino !== originalConfig.ino
+            || !readAbsoluteBuildBytes(configPath, 1024 * 1024).equals(configBytes)) buildRefusal();
+    };
+    assertUnchanged();
+    // The manifest and all consumed artifacts were checked before this sole built import.
+    const entry = await import(pathToFileURL(path.join(rehearsalBuildRoot, 'dist/internal/v2-shadow-migration-rehearsal.js')).href);
+    const result = await entry.runV2ShadowMigrationRehearsal({ config, sourceRoot: values.get('--source-root'),
+        packageRoot: values.get('--package-root'), workRoot: values.get('--work-root'), evidenceOutput: values.get('--evidence-output') },
+        { commit: build.commit, buildIdentityHash: build.buildIdentityHash, protectedRoots: [rehearsalBuildRoot, configPath], assertUnchanged });
+    process.stdout.write(JSON.stringify(result) + '\n');
+    if (result.gates.some(gate => gate.status !== 'passed')) process.exitCode = 1;
+}
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-    // C2 deliberately cannot execute operational flags or publish eligible results.
-    process.stderr.write('REHEARSAL_COMPOSITION_UNAVAILABLE\n'); process.exitCode = 1;
+    runCommand(process.argv.slice(2)).catch(() => { process.stderr.write('REHEARSAL_REFUSED\n'); process.exitCode = 1; });
 }

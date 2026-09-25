@@ -24,13 +24,50 @@ const packageJson = JSON.parse(readFileSync(path.resolve(__dirname, '../package.
 function assertClosedSyntax(name, bytes, emitted = false) {
     const source = ts.createSourceFile(name, bytes.toString('utf8'), ts.ScriptTarget.Latest, true);
     if (source.parseDiagnostics.length) buildRefusal();
+    const nodes = [];
+    function collect(node) { nodes.push(node); ts.forEachChild(node, collect); }
+    collect(source);
+    const permitted = new Set(), loaderNames = new Set();
+    // One unchanged production module lazily loads one Node builtin. Prove every
+    // binding use, independently again after esbuild renames the emitted bindings.
+    if (emitted || name === 'src/orchestrator/storage/schema-fingerprint.ts') {
+        const imports = nodes.filter(node => ts.isImportSpecifier(node) && (node.propertyName ?? node.name).text === 'createRequire');
+        if (imports.length > 1) buildRefusal();
+        for (const specifier of imports) {
+            const declaration = specifier.parent.parent.parent;
+            if (!ts.isImportDeclaration(declaration) || !ts.isStringLiteral(declaration.moduleSpecifier)
+                || declaration.moduleSpecifier.text !== 'node:module' || declaration.importClause.isTypeOnly || specifier.isTypeOnly
+                || (!emitted && specifier.name.text !== 'createRequire')) buildRefusal();
+            const factory = specifier.name.text;
+            permitted.add(specifier.name); if (specifier.propertyName) permitted.add(specifier.propertyName);
+            loaderNames.add(factory);
+            const factories = nodes.filter(node => ts.isCallExpression(node) && ts.isIdentifier(node.expression) && node.expression.text === factory);
+            if (factories.length !== 1) buildRefusal();
+            const call = factories[0], argument = call.arguments[0], binding = call.parent;
+            if (call.questionDotToken || call.arguments.length !== 1 || !ts.isPropertyAccessExpression(argument)
+                || argument.name.text !== 'url' || !ts.isMetaProperty(argument.expression)
+                || argument.expression.keywordToken !== ts.SyntaxKind.ImportKeyword || argument.expression.name.text !== 'meta'
+                || !ts.isVariableDeclaration(binding) || binding.initializer !== call || !ts.isIdentifier(binding.name)
+                || !ts.isVariableDeclarationList(binding.parent)
+                || (!emitted && (!(binding.parent.flags & ts.NodeFlags.Const) || binding.name.text !== 'require'))) buildRefusal();
+            permitted.add(call.expression); permitted.add(binding.name); loaderNames.add(binding.name.text);
+            const calls = nodes.filter(node => ts.isCallExpression(node) && ts.isIdentifier(node.expression) && node.expression.text === binding.name.text);
+            if (calls.length !== 1) buildRefusal();
+            for (const builtin of calls) {
+                if (builtin.questionDotToken || builtin.arguments.length !== 1 || !ts.isStringLiteral(builtin.arguments[0])
+                    || builtin.arguments[0].text !== 'node:sqlite') buildRefusal();
+                permitted.add(builtin.expression);
+            }
+        }
+    }
     function visit(node) {
         if (ts.isCallExpression(node) && node.expression.kind === ts.SyntaxKind.ImportKeyword
             && (emitted || node.arguments.length !== 1 || !ts.isStringLiteral(node.arguments[0]) || !isBuiltin(node.arguments[0].text))) buildRefusal();
         const ordinaryRequireMethod = node.text === 'require' && node.parent && ((ts.isPropertyAccessExpression(node.parent)
             && node.parent.name === node && node.parent.expression.kind === ts.SyntaxKind.ThisKeyword)
             || ((ts.isMethodDeclaration(node.parent) || ts.isMethodSignature(node.parent)) && node.parent.name === node));
-        if (ts.isIdentifier(node) && !ordinaryRequireMethod && ['require', 'createRequire', 'eval', 'Function'].includes(node.text)) buildRefusal();
+        if (ts.isIdentifier(node) && !permitted.has(node)
+            && (loaderNames.has(node.text) || (!ordinaryRequireMethod && ['require', 'createRequire', 'eval', 'Function'].includes(node.text)))) buildRefusal();
         if (ts.isElementAccessExpression(node) && ts.isStringLiteral(node.argumentExpression)
             && ['require', 'createRequire', 'eval', 'Function'].includes(node.argumentExpression.text)) buildRefusal();
         if (emitted && (ts.isImportDeclaration(node) || ts.isExportDeclaration(node)) && node.moduleSpecifier
