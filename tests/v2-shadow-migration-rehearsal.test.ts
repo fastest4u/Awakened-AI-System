@@ -13,7 +13,7 @@ import { buildV2ShadowMigrationEvidence, buildV2ShadowMigrationPreflightFailureE
   hasRequiredApprovedV2ShadowMigrationReviews, V2ShadowMigrationEvidenceError, type V2ShadowMigrationEvidenceV1,
 } from "../src/orchestrator/migration/v2-shadow-migration-evidence.js";
 import { V2ShadowMigrationRunner, V2ShadowMigrationPreflightFailure, readV2ShadowMigrationPreflightEvidence } from "../src/orchestrator/migration/v2-shadow-migration-runner.js";
-import { createCompatibilityFixture, createShadowMigrationRunnerFixture, createSnapshotParityFixture } from "./support/v2-shadow-migration-fixture.js";
+import { createCompatibilityFixture, createShadowMigrationRunnerFixture, createSnapshotParityFixture, sealManifest } from "./support/v2-shadow-migration-fixture.js";
 import { shadowMigrationPolicyChecksum, shadowMigrationConfigurationChecksum } from "../src/orchestrator/migration/v2-shadow-migration.contracts.js";
 import { readV2ShadowRehearsalResources } from "../src/orchestrator/migration/v2-shadow-migration-rehearsal.js";
 import { readV2ShadowImportBatchObservation, V2ShadowImporter } from "../src/orchestrator/migration/v2-shadow-importer.js";
@@ -186,55 +186,12 @@ test("branch-bound source fixture is sealed from production Git/lifecycle events
   const verified = await verifyV1SourceCopy(f.verificationInput);
   verified.close();
 });
-test("branch-bound compiled rehearsal accepts the authenticated source binding", async t => {
+async function compiledCommandFixture(t: TestContext, branchBoundSource: boolean) {
   const buildRoot = cleanBuildFixture(t), built = fixtureBuild(buildRoot);
   assert.equal(built.status, 0, built.stdout + built.stderr);
   const build = JSON.parse(fs.readFileSync(join(buildRoot, "dist/internal/v2-shadow-migration-build.json"), "utf8"));
   assert.equal(build.eligible, true);
-  const f = await createSnapshotParityFixture(t, { branchBoundSource: true, rankingPair: true, legacyArtifacts: true });
-  const corpusRoot = join(f.root, "branch-command-corpus"); fs.mkdirSync(corpusRoot);
-  const artifacts = { "manifest.json": f.corpus.bundle,
-    "source-events.json": { schemaVersion: 2, corpusVersion: "retrieval-evaluation-v2", sources: f.corpus.sources },
-    "judgments.json": { schemaVersion: 2, corpusVersion: "retrieval-evaluation-v2", queries: f.corpus.queries },
-    "v1-shadow-baseline.json": f.corpus.baseline };
-  for (const [name, value] of Object.entries(artifacts)) fs.writeFileSync(join(corpusRoot, name), JSON.stringify(value));
-  const configuration = { schemaVersion: 1 as const, policyChecksum: shadowMigrationPolicyChecksum(f.policy), packageFormatVersion: 1 as const,
-    migrationAlgorithmVersion: 1 as const, expectedDifferencePolicyVersion: f.policy.expectedDifferencePolicyVersion };
-  const config = { sourceManifestPath: f.manifestPath, liveEventStorePath: f.liveEventStorePath, liveLegacyArtifactRoot: f.liveVaultRoot,
-    expectedBinding: f.projectionBinding, configuration, policy: f.policy, expectedDifferenceRules: [],
-    sealedRetrieval: { bundleRoot: corpusRoot, expectedBundle: f.corpus.bundle }, buildIdentityHash: build.buildIdentityHash,
-    rolloutRevisionTemplate: { projectId: f.projectionBinding.projectId, revisionId: f.input.rolloutRevisionId, parentRevisionId: null,
-      buildIdentityHash: build.buildIdentityHash, configurationChecksum: shadowMigrationConfigurationChecksum(configuration),
-      cohortAlgorithmVersion: 1, cohortSalt: hash("branch-command-salt"), cohortBasisPoints: 0, createdAt: f.manifest.createdAt },
-    tests: [{ name: "branch-bound-current-byte-build", passed: 1, failed: 0, skipped: 0 }], reviews: [] };
-  const configPath = join(f.root, "branch-command.json"); fs.writeFileSync(configPath, JSON.stringify(config));
-  const workRoot = join(f.root, "branch-command-work"), packageRoot = join(f.root, "branch-command-packages");
-  fs.mkdirSync(workRoot); fs.mkdirSync(packageRoot);
-  const outputParent = directory(t), output = join(outputParent, "branch-functional.json");
-  const protectedBefore = [f.sourceRoot, corpusRoot, f.liveVaultRoot].map(treeIdentity);
-  const result = childProcess.spawnSync(process.execPath, ["scripts/run-v2-shadow-migration-rehearsal.js", "--config", configPath,
-    "--source-root", f.sourceRoot, "--package-root", packageRoot, "--work-root", workRoot, "--evidence-output", output],
-    { cwd: buildRoot, env: { ...process.env, NODE_ENV: "production-rehearsal" }, encoding: "utf8", windowsHide: true, timeout: 1200000 });
-  assert.equal(result.status, 0, result.stdout + result.stderr);
-  assert.equal(result.stderr, "");
-  const evidence = JSON.parse(fs.readFileSync(output, "utf8")) as V2ShadowMigrationEvidenceV1;
-  assert.equal(evidence.deterministicRuns.length, 3);
-  for (const run of evidence.deterministicRuns) {
-    assert.equal(run.deduplicated, false);
-    assert.deepEqual(run.determinismVector, evidence.noOpRun.determinismVector);
-  }
-  assert.equal(evidence.noOpRun.deduplicated, true);
-  assert.equal(evidence.parity.blocking, 0);
-  assert.equal(evidence.sourceBeforeChecksum, evidence.sourceAfterChecksum);
-  assert.deepEqual([f.sourceRoot, corpusRoot, f.liveVaultRoot].map(treeIdentity), protectedBefore);
-});
-
-test("retains synthetic functional evidence from the fresh compiled rehearsal command", async t => {
-  const buildRoot = cleanBuildFixture(t), built = fixtureBuild(buildRoot);
-  assert.equal(built.status, 0, built.stdout + built.stderr);
-  const build = JSON.parse(fs.readFileSync(join(buildRoot, "dist/internal/v2-shadow-migration-build.json"), "utf8"));
-  assert.equal(build.eligible, true);
-  const f = await createSnapshotParityFixture(t, { rankingPair: true, legacyArtifacts: true });
+  const f = await createSnapshotParityFixture(t, { branchBoundSource, rankingPair: true, legacyArtifacts: true });
   const corpusRoot = join(f.root, "command-corpus"); fs.mkdirSync(corpusRoot);
   const artifacts = { "manifest.json": f.corpus.bundle,
     "source-events.json": { schemaVersion: 2, corpusVersion: "retrieval-evaluation-v2", sources: f.corpus.sources },
@@ -253,6 +210,87 @@ test("retains synthetic functional evidence from the fresh compiled rehearsal co
   const configPath = join(f.root, "command.json"); fs.writeFileSync(configPath, JSON.stringify(config));
   const workRoot = join(f.root, "command-work"), packageRoot = join(f.root, "command-packages");
   fs.mkdirSync(workRoot); fs.mkdirSync(packageRoot);
+  return { buildRoot, build, f, corpusRoot, config, configPath, workRoot, packageRoot };
+}
+
+test("branch-bound compiled rehearsal accepts the authenticated source binding", async t => {
+  const { buildRoot, build, f, corpusRoot, config, configPath, workRoot, packageRoot } = await compiledCommandFixture(t, true);
+  const outputParent = directory(t), output = join(outputParent, "branch-functional.json");
+  const protectedBefore = [f.sourceRoot, corpusRoot, f.liveVaultRoot].map(treeIdentity);
+  const args = ["scripts/run-v2-shadow-migration-rehearsal.js", "--config", configPath,
+    "--source-root", f.sourceRoot, "--package-root", packageRoot, "--work-root", workRoot, "--evidence-output", output];
+  const mismatchedRoot = join(f.root, "disposable-mismatched-source");
+  fs.cpSync(f.sourceRoot, mismatchedRoot, { recursive: true });
+  const mismatchedManifestPath = join(mismatchedRoot, "manifest.json");
+  fs.writeFileSync(mismatchedManifestPath, canonicalJson(sealManifest({ ...f.manifest, branchRef: "refs/heads/wrong-sealed-copy" })));
+  const refused = async (name: string, changedConfig: unknown, changedArgs = args) => t.test(name, () => {
+    const selectedBefore = [workRoot, packageRoot, outputParent].map(treeIdentity);
+    const sourcesBefore = [f.sourceRoot, corpusRoot, f.liveVaultRoot, mismatchedRoot].map(treeIdentity);
+    fs.writeFileSync(configPath, JSON.stringify(changedConfig));
+    try {
+      const rejected = childProcess.spawnSync(process.execPath, changedArgs,
+        { cwd: buildRoot, env: { ...process.env, NODE_ENV: "production-rehearsal" }, encoding: "utf8", windowsHide: true, timeout: 60000 });
+      assert.equal(rejected.status, 1, rejected.stdout + rejected.stderr);
+      assert.equal(rejected.stdout, ""); assert.equal(rejected.stderr, "REHEARSAL_REFUSED\n");
+      assert.deepEqual([workRoot, packageRoot, outputParent].map(treeIdentity), selectedBefore, "refusal precedes selected writes");
+      assert.deepEqual([f.sourceRoot, corpusRoot, f.liveVaultRoot, mismatchedRoot].map(treeIdentity), sourcesBefore);
+    } finally { fs.writeFileSync(configPath, JSON.stringify(config)); }
+  });
+  assert.notEqual(f.projectionBinding.branchRef, "refs/heads/wrong-branch");
+  await refused("valid-looking wrong branch ref refuses before writes",
+    { ...config, expectedBinding: { ...f.projectionBinding, branchRef: "refs/heads/wrong-branch" } });
+  const wrongScope = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  assert.notEqual(f.projectionBinding.branchScopeId, wrongScope);
+  await refused("wrong branch scope UUID refuses before writes",
+    { ...config, expectedBinding: { ...f.projectionBinding, branchScopeId: wrongScope } });
+  await refused("mismatched sealed manifest copy refuses before writes",
+    { ...config, sourceManifestPath: mismatchedManifestPath },
+    args.map(value => value === f.sourceRoot ? mismatchedRoot : value));
+  const result = childProcess.spawnSync(process.execPath, args,
+    { cwd: buildRoot, env: { ...process.env, NODE_ENV: "production-rehearsal" }, encoding: "utf8", windowsHide: true, timeout: 1200000 });
+  assert.equal(result.status, 0, result.stdout + result.stderr);
+  assert.equal(result.stderr, "");
+  const bytes = fs.readFileSync(output, "utf8"), evidence = JSON.parse(bytes) as V2ShadowMigrationEvidenceV1;
+  const { evidenceChecksum, ...body } = evidence;
+  assert.equal(evidenceChecksum, hash("project-memory/v2-shadow-migration-evidence/v1\n" + canonicalJson(body)));
+  assert.equal(bytes, canonicalJson(evidence) + "\n");
+  assert.equal(evidence.sourceManifestChecksum, f.manifest.manifestChecksum);
+  assert.equal(evidence.counts.sourceScopeProvenanceRecords, f.manifest.eventCount);
+  assert.ok(f.manifest.eventCount > 2, "the real full source-bound corpus was imported");
+  assert.equal(evidence.deterministicRuns.length, 3);
+  for (const [index, run] of evidence.deterministicRuns.entries()) {
+    assert.equal(run.runOrdinal, index + 1);
+    assert.equal(run.deduplicated, false);
+    assert.deepEqual(run.determinismVector, evidence.noOpRun.determinismVector);
+    assert.ok(fs.statSync(join(workRoot, `run-${index + 1}/events.sqlite`)).isFile());
+  }
+  assert.equal(evidence.noOpRun.runOrdinal, 4);
+  assert.equal(evidence.noOpRun.deduplicated, true);
+  assert.equal(evidence.noOpRun.determinismVector.sourceRecordCount, f.manifest.eventCount + f.manifest.legacyArtifacts.length);
+  assert.equal(evidence.noOpRun.determinismVector.compatibilityArtifactSetChecksum, evidence.compatibility.artifactSetChecksum);
+  const noOpGate = evidence.gates.find(gate => gate.name === "fourth-semantic-no-op");
+  assert.ok(noOpGate); assert.equal(noOpGate.status, "passed");
+  assert.match(noOpGate.evidenceDigest, /^[a-f0-9]{64}$/, "published digest binds unchanged semantic rows and artifacts");
+  assert.equal(evidence.parity.blocking, 0);
+  assert.equal(evidence.sourceBeforeChecksum, evidence.sourceAfterChecksum);
+  const target = f.driver.open(join(workRoot, "run-3/events.sqlite"), { mode: "read-only-existing", busyTimeoutMs: 5000 });
+  try {
+    const wrappers = target.prepare("SELECT branch_scope_id,branch_ref,payload_json FROM events WHERE event_type='V1ProjectionSourceImported' ORDER BY global_position").all();
+    assert.equal(wrappers.length, f.manifest.eventCount);
+    for (const [ordinal, wrapper] of wrappers.entries()) {
+      assert.equal(wrapper.branch_scope_id, null, "target wrapper remains non-Git-scoped");
+      assert.equal(wrapper.branch_ref, null, "target wrapper has no fabricated Git branch");
+      const sourceEvent = JSON.parse(String(wrapper.payload_json)).sourceEvent;
+      assert.equal(sourceEvent.branchScopeId, f.projectionBinding.branchScopeId);
+      assert.equal(sourceEvent.branchRef, f.projectionBinding.branchRef);
+      assert.equal(sourceEvent.eventHash, f.sourceEvents[ordinal]!.eventHash);
+    }
+  } finally { target.close(); }
+  assert.deepEqual([f.sourceRoot, corpusRoot, f.liveVaultRoot].map(treeIdentity), protectedBefore);
+});
+
+test("retains synthetic functional evidence from the fresh compiled rehearsal command", async t => {
+  const { buildRoot, build, f, corpusRoot, config, configPath, workRoot, packageRoot } = await compiledCommandFixture(t, false);
   const retained = process.env.V2_SHADOW_MIGRATION_TEST_EVIDENCE_OUTPUT;
   let outputParent: string, output: string;
   if (retained !== undefined) {
@@ -284,6 +322,8 @@ test("retains synthetic functional evidence from the fresh compiled rehearsal co
   await refused("relative selected path refuses", args.map(value => value === workRoot ? "relative" : value));
   await refused("unknown configuration refuses", args, { ...config, unexpected: true });
   await refused("mismatched build identity refuses", args, { ...config, buildIdentityHash: "0".repeat(64) });
+  await refused("config-only branch string against unbranched source refuses before writes", args,
+    { ...config, expectedBinding: { ...f.projectionBinding, branchRef: "refs/heads/config-only" } });
   await refused("unapproved corpus refuses", args, { ...config, sealedRetrieval: { ...config.sealedRetrieval,
     expectedBundle: { ...f.corpus.bundle, files: { ...f.corpus.bundle.files, "judgments.json": "0".repeat(64) } } } });
   await refused("sensitive supplied test labels refuse", args, { ...config, tests: [{ name: "sk-secret-test-token", passed: 1, failed: 0, skipped: 0 }] });
