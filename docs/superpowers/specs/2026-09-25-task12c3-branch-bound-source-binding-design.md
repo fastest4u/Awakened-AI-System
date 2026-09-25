@@ -1,9 +1,9 @@
 # Task 12C3 branch-bound source binding design
 
-**Status:** Written for user review; not yet approved for implementation
+**Status:** Written design approved by user on 2026-09-25; implementation plan pending review
 **Date:** 2026-09-25
 **Parent:** [V2 shadow migration and compatibility parity design](2026-09-09-v2-shadow-migration-and-compatibility-parity-design.md), [Task 12 plan](../plans/2026-09-09-v2-shadow-migration-and-compatibility-parity.md)
-**Decision already approved in conversation:** Support an authenticated branch-bound V1 source in the private rehearsal, rather than permanently restricting rehearsal to unbranched sources. This document specifies how; conversational approval does not approve this written text or authorize implementation.
+**Decision approved:** Support an authenticated branch-bound V1 source in the private rehearsal, rather than permanently restricting rehearsal to unbranched sources. The user approved this written design on 2026-09-25; that approval does not yet approve the implementation plan or authorize code changes.
 
 ## 1. Purpose and current failure
 
