@@ -9,7 +9,6 @@ import { deterministicMigrationUuid } from "../src/orchestrator/migration/v2-sha
 import type { SqliteConnection } from "../src/orchestrator/storage/sqlite-driver.js";
 import { DatabaseSync, type StatementSync } from "node:sqlite";
 import { applyCurrentProjectStoreSchema } from "./support/current-project-store-schema.js";
-import { v2ShadowMigration } from "../src/orchestrator/storage/migrations/0007-v2-shadow-migration.js";
 import { createShadowMigrationInvocationDeadline } from "../src/orchestrator/migration/v2-shadow-migration-runtime.js";
 import { StableCompatibilityDirectory } from "../src/orchestrator/materialization/stable-compatibility-directory.js";
 import { V2ImportedProjectionEventReader } from "../src/orchestrator/migration/v2-imported-event-reader.js";
@@ -422,7 +421,7 @@ test("refuses stale physical connection authority at entry and later claim or ac
     const replacement = join(f.root, "replacement.sqlite"), second = f.driver.open(replacement, { mode: "create", busyTimeoutMs: 5000 });
     const evidence = (connection: SqliteConnection) => ["v2_shadow_imported_records", "v2_shadow_compatibility_outbox", "v2_shadow_compatibility_claims", "v2_shadow_compatibility_acknowledgements"]
       .map(table => connection.prepare(`SELECT count(*) AS n FROM ${table}`).get()!.n);
-    try { applyCurrentProjectStoreSchema(second, f.projectionBinding, f.manifest.createdAt); second.exec(v2ShadowMigration.sql);
+    try { applyCurrentProjectStoreSchema(second, f.projectionBinding, f.manifest.createdAt);
       assert.deepEqual(second.prepare("SELECT project_id,vault_id,store_id FROM project_meta").get(), f.connection.prepare("SELECT project_id,vault_id,store_id FROM project_meta").get());
       assert.deepEqual(evidence(second), [0n, 0n, 0n, 0n]); }
     finally { second.close(); }

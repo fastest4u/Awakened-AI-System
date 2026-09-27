@@ -38,6 +38,7 @@ import {
 import { NodeSqliteDriver } from "../src/orchestrator/storage/node-sqlite-driver.js";
 import {
   MigrationRunner,
+  migrationChecksum,
   type MigrationApplyMode,
 } from "../src/orchestrator/storage/migration-runner.js";
 import type { Migration } from "../src/orchestrator/storage/migration.js";
@@ -243,19 +244,20 @@ describe("DefaultProjectStoreBootstrapService", () => {
       assert.equal(meta?.vault_id, result.descriptor.vaultId);
       assert.equal(meta?.store_id, result.manifest.storeId);
       assert.equal(meta?.schema_version, BigInt(CURRENT_PROJECT_STORE_SCHEMA_VERSION));
-      assert.equal(meta?.schema_version, 6n);
+      assert.equal(meta?.schema_version, 7n);
       assert.equal(result.manifest.schemaVersion, 1);
       assert.deepEqual(
         database.prepare("SELECT version FROM schema_migrations ORDER BY version").all()
           .map((row) => row.version),
-        [1n, 2n, 3n, 4n, 5n, 6n],
+        [1n, 2n, 3n, 4n, 5n, 6n, 7n],
       );
       assert.deepEqual(
-        database.prepare("SELECT version, name FROM schema_migrations ORDER BY version").all()
-          .map((row) => ({ version: row.version, name: row.name })),
+        database.prepare("SELECT version, name, checksum FROM schema_migrations ORDER BY version").all()
+          .map((row) => ({ version: row.version, name: row.name, checksum: row.checksum })),
         PROJECT_STORE_MIGRATIONS.map((migration) => ({
           version: BigInt(migration.version),
           name: migration.name,
+          checksum: migrationChecksum(migration),
         })),
       );
       const maintenance = database

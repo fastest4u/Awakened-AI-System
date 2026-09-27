@@ -9667,12 +9667,12 @@ it("full integrity rerenders and verifies provider-keyed fingerprint lineage", a
       },
     },
   );
-  assert.deepEqual(migratedVersions, [3, 4, 5, 6]);
+  assert.deepEqual(migratedVersions, [3, 4, 5, 6, 7]);
   assert.equal(
     migrated.connection.prepare(`
       SELECT schema_version FROM project_meta WHERE singleton = 1
     `).get()?.schema_version,
-    6n,
+    7n,
   );
   const liveEquivalent = createFixture();
   addChildFork(liveEquivalent);

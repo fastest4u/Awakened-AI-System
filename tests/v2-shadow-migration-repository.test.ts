@@ -8,7 +8,6 @@ import { afterEach, describe, it } from "node:test";
 import { ShadowMigrationError, type ShadowMigrationPhase } from "../src/orchestrator/migration/v2-shadow-migration.contracts.js";
 import { canonicalJson } from "../src/orchestrator/serialization/canonical-json.js";
 import { expectedDifferenceRuleChecksum } from "../src/orchestrator/parity/v2-expected-difference.js";
-import { v2ShadowMigration } from "../src/orchestrator/storage/migrations/0007-v2-shadow-migration.js";
 import { NodeSqliteDriver } from "../src/orchestrator/storage/node-sqlite-driver.js";
 import {
   SqliteV2ShadowMigrationRepository,
@@ -64,7 +63,6 @@ function fixture(): { connection: SqliteConnection; repository: SqliteV2ShadowMi
   const connection = driver.open(join(root, "events.sqlite"), { mode: "create", busyTimeoutMs: 1000 });
   connections.push(connection);
   applyCurrentProjectStoreSchema(connection, { projectId: PROJECT_ID, vaultId: VAULT_ID, storeId: STORE_ID }, NOW);
-  connection.exec(v2ShadowMigration.sql);
   connection.prepare(`INSERT INTO rollout_revisions(
     project_id, revision_id, parent_revision_id, build_identity_hash, migration_identity_hash,
     configuration_checksum, v1_baseline_checksum, cohort_algorithm_version, cohort_salt,

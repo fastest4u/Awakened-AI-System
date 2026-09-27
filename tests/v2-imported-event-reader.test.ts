@@ -13,7 +13,6 @@ import { BranchScopeRepository } from "../src/orchestrator/storage/branch-scope.
 import { EventStore, EventStoreError, SqliteEventStoreStatements } from "../src/orchestrator/storage/event-store.js";
 import type { SqliteDriver, SqliteRow } from "../src/orchestrator/storage/sqlite-driver.js";
 import { MaintenanceFence } from "../src/orchestrator/storage/maintenance-fence.js";
-import { v2ShadowMigration } from "../src/orchestrator/storage/migrations/0007-v2-shadow-migration.js";
 import { SqliteV2ShadowMigrationRepository } from "../src/orchestrator/storage/v2-shadow-migration.repository.js";
 import { applyCurrentProjectStoreSchema } from "./support/current-project-store-schema.js";
 import { createV2ShadowMigrationFixture, sealManifest } from "./support/v2-shadow-migration-fixture.js";
@@ -36,7 +35,6 @@ async function importedPackageFixture(t: test.TestContext, importRecords = true,
   const eventStorePath = `${f.root}/target.sqlite`;
   const connection = f.driver.open(eventStorePath, { mode: "create", busyTimeoutMs: 5000 });
   applyCurrentProjectStoreSchema(connection, f.projectionBinding, NOW);
-  connection.exec(v2ShadowMigration.sql);
   const workspace = { kind: "non-git" as const, workspaceRoot: f.root, workspaceId: f.projectionBinding.workspaceId };
   const context = { workspace, checkedAt: NOW, binding: { ...f.projectionBinding, projectBindingId: randomUUID(),
     generation: 1, contextFingerprint: "shadow", source: "explicit-cli", clientNamespace: "shadow-test",

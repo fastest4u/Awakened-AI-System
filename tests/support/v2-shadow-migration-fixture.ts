@@ -22,7 +22,6 @@ import { BranchScopeRepository } from "../../src/orchestrator/storage/branch-sco
 import { MaintenanceFence } from "../../src/orchestrator/storage/maintenance-fence.js";
 import { NodeSqliteDriver } from "../../src/orchestrator/storage/node-sqlite-driver.js";
 import { CURRENT_PROJECT_STORE_SCHEMA_VERSION } from "../../src/orchestrator/storage/migrations/registry.js";
-import { v2ShadowMigration } from "../../src/orchestrator/storage/migrations/0007-v2-shadow-migration.js";
 import {
   decodeShadowMigrationConfigurationV1,
   decodeShadowMigrationPolicyV1,
@@ -321,7 +320,7 @@ export async function createCompatibilityFixture(t: TestContext, options: { lega
   const eventStorePath = join(targetDirectory, "events.sqlite");
   let connection = f.driver.open(eventStorePath, { mode: "create", busyTimeoutMs: 5000 }), connectionOpen = true;
   cleanup = () => { try { if (connectionOpen) connection.close(); } finally { try { sealedPackage.close(); } finally { source.close(); } } };
-  applyCurrentProjectStoreSchema(connection, f.projectionBinding, f.manifest.createdAt); connection.exec(v2ShadowMigration.sql);
+  applyCurrentProjectStoreSchema(connection, f.projectionBinding, f.manifest.createdAt);
   const repository = new SqliteV2ShadowMigrationRepository(connection), rolloutRevisionId = randomUUID();
   const v1ProjectionDirectory = join(f.root, "compatibility-v1"), v2ProjectionDirectory = join(f.root, "compatibility-v2");
   mkdirSync(v1ProjectionDirectory); mkdirSync(v2ProjectionDirectory);
@@ -372,7 +371,6 @@ export async function createSnapshotParityFixture(t: TestContext, options: { art
   let connection = f.driver.open(eventStorePath, { mode: "create", busyTimeoutMs: 5000 });
   cleanup = () => { try { connection.close(); } finally { try { sealedPackage.close(); } finally { source.close(); } } };
   applyCurrentProjectStoreSchema(connection, f.projectionBinding, f.manifest.createdAt);
-  connection.exec(v2ShadowMigration.sql);
   let repository = new SqliteV2ShadowMigrationRepository(connection);
   const publisherOptions = { driver: f.driver, connection, eventStorePath, liveEventStorePath: f.liveEventStorePath,
     liveVaultRoot: f.liveVaultRoot, v1ProjectionDirectory, v2ProjectionDirectory, policy: f.policy };
@@ -500,7 +498,6 @@ export async function createShadowMigrationRunnerFixture(t: TestContext, options
   const rolloutRevisionId = f.input.rolloutRevisionId;
   try {
     applyCurrentProjectStoreSchema(target, f.projectionBinding, f.manifest.createdAt);
-    target.exec(v2ShadowMigration.sql);
     new RolloutControlPlane(new SqliteRolloutControlPlaneRepository(target)).createRevision({
       projectId: f.projectionBinding.projectId, revisionId: rolloutRevisionId, parentRevisionId: null,
       buildIdentityHash: f.packageInput.buildIdentityHash, migrationIdentityHash: f.sealedPackage.migrationIdentity,

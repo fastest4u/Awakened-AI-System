@@ -238,7 +238,7 @@ function createBundledUpgradeFixture(): {
   };
 }
 
-it("bundled upgrade applies 2 through 6", async () => {
+it("bundled upgrade applies 2 through 7", async () => {
   const fixture = createBundledUpgradeFixture();
   const worker = new Worker(
     new URL("../src/workers/project-store.worker.js", import.meta.url),
@@ -284,7 +284,7 @@ it("bundled upgrade applies 2 through 6", async () => {
       readonly appliedVersions: readonly number[];
       readonly integrity: { readonly ok: boolean };
     };
-    assert.deepEqual(result.appliedVersions, [2, 3, 4, 5, 6]);
+    assert.deepEqual(result.appliedVersions, [2, 3, 4, 5, 6, 7]);
     assert.equal(result.integrity.ok, true);
     assert.deepEqual(phases, ["quiesce-required", "quiesce-complete", "result"]);
 
@@ -293,13 +293,13 @@ it("bundled upgrade applies 2 through 6", async () => {
       assert.deepEqual(
         database.prepare("SELECT version FROM schema_migrations ORDER BY version")
           .all().map((row) => Number(row.version)),
-        [1, 2, 3, 4, 5, 6],
+        [1, 2, 3, 4, 5, 6, 7],
       );
       assert.equal(
         Number(database.prepare(`
           SELECT schema_version FROM project_meta WHERE singleton = 1
         `).get()?.schema_version),
-        6,
+        7,
       );
     } finally {
       database.close();

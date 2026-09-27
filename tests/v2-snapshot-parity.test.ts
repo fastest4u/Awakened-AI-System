@@ -9,7 +9,6 @@ import { canonicalJson } from "../src/orchestrator/serialization/canonical-json.
 import { decodeExpectedDifferenceRuleV1, expectedDifferenceRuleChecksum, type ExpectedDifferenceRuleV1 } from "../src/orchestrator/parity/v2-expected-difference.js";
 import { authenticateSealedRetrievalSource, compareV1V2Snapshots, parityRowIdentityHash, reconcileV1V2Snapshots, serializeSnapshotParityReport, snapshotParityReportChecksum, type SnapshotParityReportV1 } from "../src/orchestrator/parity/v2-snapshot-parity.js";
 import { createSnapshotParityFixture, createV2ShadowMigrationFixture } from "./support/v2-shadow-migration-fixture.js";
-import { v2ShadowMigration } from "../src/orchestrator/storage/migrations/0007-v2-shadow-migration.js";
 import type { SqliteConnection, SqliteDriver, SqliteStatement } from "../src/orchestrator/storage/sqlite-driver.js";
 import { InternalRetrievalService } from "../src/orchestrator/retrieval/service.js";
 import { V2SqliteRetrievalCandidateRepository } from "../src/orchestrator/retrieval/v2-candidates.js";
@@ -823,7 +822,6 @@ test("compares authenticated pinned generations and persists deterministic redac
   const other = await createV2ShadowMigrationFixture(t);
   const wrong = other.driver.open(other.liveEventStorePath, { mode: "existing", busyTimeoutMs: 5000, bindFileIdentity: true });
   try {
-    wrong.exec(v2ShadowMigration.sql);
     const databaseState = (connection: SqliteConnection) => connection.prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").all()
       .map(({ name }) => [name, connection.prepare(`SELECT * FROM "${String(name).replaceAll('"', '""')}"`).all()
         .map(row => JSON.stringify(row, (_key, value: unknown) => typeof value === "bigint" ? value.toString() : value)).sort()]);

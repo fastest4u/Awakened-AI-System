@@ -24,7 +24,6 @@ import { canonicalJson } from "../src/orchestrator/serialization/canonical-json.
 import { BranchScopeRepository } from "../src/orchestrator/storage/branch-scope.repository.js";
 import { SqliteEventStoreStatements } from "../src/orchestrator/storage/event-store.js";
 import { MaintenanceFence } from "../src/orchestrator/storage/maintenance-fence.js";
-import { v2ShadowMigration } from "../src/orchestrator/storage/migrations/0007-v2-shadow-migration.js";
 import { SqliteV2ShadowMigrationRepository } from "../src/orchestrator/storage/v2-shadow-migration.repository.js";
 import type { SqliteConnection, SqliteStatement } from "../src/orchestrator/storage/sqlite-driver.js";
 import { applyCurrentProjectStoreSchema } from "./support/current-project-store-schema.js";
@@ -44,7 +43,6 @@ async function fixture(t: test.TestContext, corruptV2 = false, crashV1 = false, 
   let connection = f.driver.open(eventStorePath, { mode: "create", busyTimeoutMs: 5000 });
   cleanup = () => { connection.close(); sealedPackage.close(); source.close(); };
   applyCurrentProjectStoreSchema(connection, f.projectionBinding, f.manifest.createdAt);
-  connection.exec(v2ShadowMigration.sql);
   connection.close();
   connection = f.driver.open(eventStorePath, { mode: "existing", busyTimeoutMs: 5000, bindFileIdentity: true });
   const repository = new SqliteV2ShadowMigrationRepository(connection);

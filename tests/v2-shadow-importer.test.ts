@@ -15,7 +15,6 @@ import { canonicalJson } from "../src/orchestrator/serialization/canonical-json.
 import { BranchScopeRepository } from "../src/orchestrator/storage/branch-scope.repository.js";
 import { EventStore, GENESIS_GLOBAL_HASH, MAX_CANONICAL_COMMAND_BYTES, MAX_EVENTS_PER_COMMAND, SqliteEventStoreStatements, type EventAppendStatements, type EventStoreFaultInjector } from "../src/orchestrator/storage/event-store.js";
 import { MaintenanceFence } from "../src/orchestrator/storage/maintenance-fence.js";
-import { v2ShadowMigration } from "../src/orchestrator/storage/migrations/0007-v2-shadow-migration.js";
 import { NodeSqliteDriver } from "../src/orchestrator/storage/node-sqlite-driver.js";
 import type { SqliteConnection } from "../src/orchestrator/storage/sqlite-driver.js";
 import { SqliteV2ShadowMigrationRepository } from "../src/orchestrator/storage/v2-shadow-migration.repository.js";
@@ -32,7 +31,7 @@ async function fixture(t: test.TestContext, faultInjector?: EventStoreFaultInjec
   const source = await verifyV1SourceCopy(sourceFixture.verificationInput);
   const sealedPackage = await sealV2MigrationPackage({ ...sourceFixture.packageInput, source, packageRoot: sourceFixture.packageRootA });
   const eventStorePath = join(sourceFixture.root, "target.sqlite");
-  let connection = driver.open(eventStorePath, { mode: "create", busyTimeoutMs: 5000 }); applyCurrentProjectStoreSchema(connection, sourceFixture.projectionBinding, NOW); connection.exec(v2ShadowMigration.sql);
+  let connection = driver.open(eventStorePath, { mode: "create", busyTimeoutMs: 5000 }); applyCurrentProjectStoreSchema(connection, sourceFixture.projectionBinding, NOW);
   if (bindTarget) { connection.close(); connection = driver.open(eventStorePath, { mode: "existing", busyTimeoutMs: 5000, bindFileIdentity: true }); }
   const workspace = { kind: "non-git" as const, workspaceRoot: sourceFixture.root, workspaceId: sourceFixture.projectionBinding.workspaceId };
   const context = { workspace, checkedAt: NOW, binding: { ...sourceFixture.projectionBinding, projectBindingId: randomUUID(), generation: 1, contextFingerprint: "shadow", source: "explicit-cli", clientNamespace: "shadow-test", clientInstanceId: randomUUID(), actorRole: "primary", projectRoot: sourceFixture.root, vaultRoot: sourceFixture.liveVaultRoot, descriptorPath: `${sourceFixture.liveVaultRoot}/.project-memory.json`, storeRoute: { kind: "vault-local", storeRoot: sourceFixture.root, eventsPath: `${sourceFixture.root}/target.sqlite`, storeManifestPath: `${sourceFixture.root}/store.json`, projectionManifestPath: `${sourceFixture.root}/projection.json` }, workspace, establishedAt: NOW } } as unknown as ProjectContext;
@@ -656,7 +655,7 @@ function siblingTarget(
   options: Readonly<{ actorRole: ProjectContext["binding"]["actorRole"]; clientInstanceId: string; git: boolean }>,
 ) {
   const path = `${f.sourceFixture.root}/${name}.sqlite`; const connection = driver.open(path, { mode: "create", busyTimeoutMs: 5000 });
-  applyCurrentProjectStoreSchema(connection, f.sourceFixture.projectionBinding, NOW); connection.exec(v2ShadowMigration.sql);
+  applyCurrentProjectStoreSchema(connection, f.sourceFixture.projectionBinding, NOW);
   const context = variedCallerContext({ ...f.context, binding: { ...f.context.binding,
     storeRoute: { ...f.context.binding.storeRoute, eventsPath: path } } } as ProjectContext, f.sourceFixture.root, name, options);
   const revisionId = randomUUID(); connection.prepare("INSERT INTO rollout_revisions(project_id,revision_id,parent_revision_id,build_identity_hash,migration_identity_hash,configuration_checksum,v1_baseline_checksum,cohort_algorithm_version,cohort_salt,cohort_basis_points,created_at) VALUES ($p,$r,NULL,$h,$h,$h,$h,1,$h,0,$n)").run({ $p: context.binding.projectId, $r: revisionId, $h: "a".repeat(64), $n: NOW });
