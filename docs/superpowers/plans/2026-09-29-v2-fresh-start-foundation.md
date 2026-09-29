@@ -10,7 +10,7 @@
 
 **Spec:** `docs/superpowers/specs/2026-09-29-v2-fresh-start-production-design.md`, approved 2026-09-29. Read it together with `docs/superpowers/plans/2026-09-29-v2-fresh-start-delivery-roadmap.md`; this plan implements F1, not all production work.
 
-**Status:** Written implementation plan for review; no task below has been implemented. Preserve the user's Subagent-Driven execution method after plan review.
+**Status:** Approved for Subagent-Driven execution on 2026-09-29. Implementation in progress; checkboxes require actual verification and independent review.
 
 ## Global Constraints
 
@@ -51,7 +51,7 @@ The six tasks below belong to the **F1 foundation increment**. F2/F3/F4 in the r
 
 No new file may become a second generic event store. Reuse `DefaultProjectStoreBootstrapService`, `ProjectBindingService`, `ProjectStoreRouter`, `ProjectStoreExecutor`, `EventAppendTransaction`, `MaintenanceFence`, and existing canonical JSON/hash/identity validators. Read their actual signatures before edits.
 
-## Foundation Task 1: Schema 8, strict contracts, and transactional repository
+## Task 1: Schema 8, strict contracts, and transactional repository
 
 **Files:** Create the contracts, migration, repository and fixture files above; create `tests/fresh-start-repository.test.ts`. Modify `src/orchestrator/storage/migrations/registry.ts`, `tests/migration-registry.test.ts`, `tests/project-store-bootstrap.test.ts`, `tests/project-store-upgrade.test.ts`, `tests/project-store-upgrade-phase-runner.test.ts`, `tests/qualified-checkpoint-migration.test.ts`, `tests/session-end-effective-state-migration.test.ts`, `tests/rollout-control-plane.test.ts`, `scripts/smoke-worker.js`, and the matching current-schema assertion in `tests/ci-lifecycle-gates.test.ts`. Those files are current-schema consumers, not permission to change old migration SQL or unrelated CI behavior.
 
@@ -106,7 +106,7 @@ Bind those assertion values/functions to actual fixture SQL/repository calls, no
 - [ ] **Step 4: Update the listed current-registry/upgrade expectations to version 8 and run the Step 2 command plus `tests/project-store-bootstrap.test.js`, `tests/project-store-upgrade.test.js`, and `tests/project-store-upgrade-phase-runner.test.js` under `dist-test/`.** Do not mechanically rewrite tests explicitly proving historical schema 7. Expected: all selected tests pass, with migrations 1-7 retaining their previous checksums.
 - [ ] **Step 5: Review and commit only this task's files as `feat: add fresh-start deployment schema and contracts`.** Record actual commands/counts and any still-applicable pending checks.
 
-## Foundation Task 2: Explicit initialization, safe resume, and V1 separation
+## Task 2: Explicit initialization, safe resume, and V1 separation
 
 **Files:** Create `fresh-start-initializer.ts`, `fresh-start-paths.ts`, and `tests/fresh-start-initializer.test.ts`; extend `tests/support/fresh-start-fixture.ts`. Reuse the existing bootstrap/descriptor/router/projection components; modify `project-store-bootstrap.service.ts` only if a narrowly scoped publication/resume hook is necessary, preserving all existing callers.
 
@@ -136,7 +136,7 @@ The fixture must actually remove only its owned test database for the missing-fi
 - [ ] **Step 4: Rerun the Step 2 test plus `dist-test/tests/project-store-bootstrap.test.js` and `dist-test/tests/project-binding.service.test.js`.** Expected: pass, no foreign/overlapping path modification, same identities after every recoverable interruption.
 - [ ] **Step 5: Review and commit as `feat: initialize isolated fresh-start V2 stores`.**
 
-## Foundation Task 3: Closed activation state machine and approval boundary
+## Task 3: Closed activation state machine and approval boundary
 
 **Files:** Create `fresh-start-control-plane.ts`, `operator-approval.ts`, and `tests/fresh-start-control-plane.test.ts`; extend contracts/repository only for Task 1's declared transition interface.
 
@@ -166,7 +166,7 @@ Release replacement follows Disabled -> Prepared with a newly verified release; 
 - [ ] **Step 4: Rerun Step 2 plus `dist-test/tests/fresh-start-repository.test.js` and `dist-test/tests/rollout-control-plane.test.js`.** Expected: pass; old percentage-canary behavior unchanged and fresh production promotion still denied.
 - [ ] **Step 5: Review and commit as `feat: enforce fresh-start activation policy`.**
 
-## Foundation Task 4: Admission inside authoritative transactions and recovery fencing
+## Task 4: Admission inside authoritative transactions and recovery fencing
 
 **Files:** Create `fresh-start-admission.ts`, `tests/fresh-start-admission.test.ts`, and `tests/fixtures/fresh-start-admission-child.ts`. Modify `src/orchestrator/fresh-start/fresh-start-control-plane.ts`, `src/orchestrator/storage/event-append-transaction.ts`, `src/orchestrator/storage/event-store.ts`, `src/orchestrator/lifecycle/lifecycle-command.store.ts`, `src/orchestrator/lifecycle/lifecycle-operational.store.ts`, `src/orchestrator/runtime/project-store-executor.ts`, `src/orchestrator/runtime/project-store-worker-backend.ts`, `src/orchestrator/runtime/project-store-worker-runtime.ts`, `src/orchestrator/runtime/worker-protocol.ts`, `src/orchestrator/runtime/lifecycle-worker-runtime.factory.ts`, and `src/workers/project-store.worker.ts` where required to transport/enforce a trusted release identity. Include corresponding tests `tests/event-store.test.ts`, `tests/lifecycle-command-store.test.ts`, `tests/lifecycle-worker-runtime.test.ts`, and `tests/lifecycle-worker-protocol.test.ts` where their interfaces change.
 
@@ -196,7 +196,7 @@ Use process barriers and production append APIs, not fabricated dedup rows. Incl
 - [ ] **Step 4: Run Step 2 plus `dist-test/tests/event-store.test.js`, `dist-test/tests/lifecycle-command-store.test.js`, `dist-test/tests/lifecycle-worker-runtime.test.js`, `dist-test/tests/lifecycle-worker-protocol.test.js`, and `dist-test/tests/maintenance-fence.test.js`.** Expected: pass, unchanged idempotency/recovery semantics and no stale post-fence semantic append.
 - [ ] **Step 5: Review and commit as `feat: fence fresh-start request admission at commit`.**
 
-## Foundation Task 5: Separate compiled entry points and prepared-only diagnostics
+## Task 5: Separate compiled entry points and prepared-only diagnostics
 
 **Files:** Create the `src/v2/` and entry files in the structure table plus `tests/v2-foundation-entry.test.ts` and `docs/v2-fresh-start-operations.md`. Modify `scripts/build.js` and `package.json` only for new bundles/scripts; preserve `src/app.ts` and the existing V1 registrations. Any later worker composition must enter through the explicit factory below.
 
@@ -221,7 +221,7 @@ The V1 access count must come from instrumented filesystem boundaries or an inac
 - [ ] **Step 4: Run `npm run build`, `npm run test:build`, and `node --test --test-concurrency=1 dist-test/tests/v2-foundation-entry.test.js`.** Expected: both bundles exist, compiled process tests pass and the existing V1 entry is unchanged.
 - [ ] **Step 5: Review and commit as `feat: add prepared-only V2 service entry points`.**
 
-## Foundation Task 6: Focused gate, isolation contract and handoff evidence
+## Task 6: Focused gate, isolation contract and handoff evidence
 
 **Files:** Create `scripts/run-v2-fresh-start-foundation.js`, `scripts/smoke-v2-fresh-start.js`, and `tests/ci-fresh-start-foundation.test.ts`. Modify `package.json`, `.github/workflows/ci.yml`, `tests/ci-lifecycle-gates.test.ts`, and the operations document narrowly. Create `docs/superpowers/evidence/2026-09-29-v2-fresh-start-foundation.md` only when actual results exist.
 
