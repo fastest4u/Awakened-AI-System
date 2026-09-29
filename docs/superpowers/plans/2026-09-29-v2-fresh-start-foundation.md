@@ -10,7 +10,7 @@
 
 **Spec:** `docs/superpowers/specs/2026-09-29-v2-fresh-start-production-design.md`, approved 2026-09-29. Read it together with `docs/superpowers/plans/2026-09-29-v2-fresh-start-delivery-roadmap.md`; this plan implements F1, not all production work.
 
-**Status:** Approved for Subagent-Driven execution on 2026-09-29. Implementation in progress; checkboxes require actual verification and independent review.
+**Status:** Approved for Subagent-Driven execution on 2026-09-29. Task 1 implemented and independently reviewed at `9f13206`; Tasks 2-6 pending. Production implementation remains incomplete.
 
 ## Global Constraints
 
@@ -84,7 +84,7 @@ Import `ProjectId`, `VaultId`, and `StoreId` from `identity/contracts.ts`. Expor
 
 Use these exact state-change field names: `expectedMode`, `expectedGeneration: bigint`, `expectedReleaseId`, `nextMode`, `nextReleaseId`, `transitionId`, `authorization`, `evidenceDigest`, `recoveryPosition: bigint | null`, `recoveryHash: string | null`, and `recordedAt`. `authorization` is a closed union of `{ kind: 'operator'; approvalId; nonceDigest; actorFingerprint; requestDigest }` and `{ kind: 'automatic-stop'; reasonCode }`; the reason codes are `integrity-failure | privacy-failure | binding-failure | recovery-failure`. All unannotated ID/digest/timestamp fields are canonical strings. The repository persists audit metadata but does not accept it as proof; Task 3 supplies it only after trusted verification. Keep the production repository out of public controller dependencies.
 
-- [ ] **Step 1: Add schema/repository tests and their owned temporary fixture.** Assertions include:
+- [x] **Step 1: Add schema/repository tests and their owned temporary fixture.** Assertions include:
 
 ```ts
 it('installs prepared without semantic events', () => {
@@ -101,10 +101,12 @@ it('rejects duplicate installation and immutable-record rewrites', () => {
 
 Bind those assertion values/functions to actual fixture SQL/repository calls, not constants. Add table-driven malformed input, wrong identity, foreign release, rollback on failure, reused approval, stale CAS, transaction escape and unexpected async-return cases. Add schema-7-to-8 migration and old-profile preservation tests.
 
-- [ ] **Step 2: Run `npm run test:build`, then `node --test --test-concurrency=1 dist-test/tests/fresh-start-repository.test.js dist-test/tests/migration-registry.test.js`.** Establish failure from the missing new contract/schema or behavior; do not damage existing code to create a failure.
-- [ ] **Step 3: Implement contracts and migration 8, register it, and implement repository operations.** Use separate `fresh_start_installation`, `fresh_start_releases`, `fresh_start_transitions`, and `fresh_start_control_state` tables. Keep old rollout rows/semantics unchanged. Enforce finite states and adjacent generations in SQL as well as TypeScript. New tables remain empty for existing legacy-profile stores.
-- [ ] **Step 4: Update the listed current-registry/upgrade expectations to version 8 and run the Step 2 command plus `tests/project-store-bootstrap.test.js`, `tests/project-store-upgrade.test.js`, and `tests/project-store-upgrade-phase-runner.test.js` under `dist-test/`.** Do not mechanically rewrite tests explicitly proving historical schema 7. Expected: all selected tests pass, with migrations 1-7 retaining their previous checksums.
-- [ ] **Step 5: Review and commit only this task's files as `feat: add fresh-start deployment schema and contracts`.** Record actual commands/counts and any still-applicable pending checks.
+- [x] **Step 2: Run `npm run test:build`, then `node --test --test-concurrency=1 dist-test/tests/fresh-start-repository.test.js dist-test/tests/migration-registry.test.js`.** Establish failure from the missing new contract/schema or behavior; do not damage existing code to create a failure.
+- [x] **Step 3: Implement contracts and migration 8, register it, and implement repository operations.** Use separate `fresh_start_installation`, `fresh_start_releases`, `fresh_start_transitions`, and `fresh_start_control_state` tables. Keep old rollout rows/semantics unchanged. Enforce finite states and adjacent generations in SQL as well as TypeScript. New tables remain empty for existing legacy-profile stores.
+- [x] **Step 4: Update the listed current-registry/upgrade expectations to version 8 and run the Step 2 command plus `tests/project-store-bootstrap.test.js`, `tests/project-store-upgrade.test.js`, and `tests/project-store-upgrade-phase-runner.test.js` under `dist-test/`.** Do not mechanically rewrite tests explicitly proving historical schema 7. Expected: all selected tests pass, with migrations 1-7 retaining their previous checksums.
+- [x] **Step 5: Review and commit only this task's files as `feat: add fresh-start deployment schema and contracts`.** Record actual commands/counts and any still-applicable pending checks.
+
+Task 1 evidence: `baf03f2` implementation and `9f13206` scoped transaction-lifetime fixes. Final compile native0; repository10/10, registry11/11, bootstrap24/24, upgrade50/50 and phase-runner4/4 passed across focused runs. The original combined97-case run had one stale bootstrap expectation (96pass/1fail), subsequently corrected and rerun24/24; it is not relabeled as a green combined run. Independent spec/quality review and scoped fix re-review passed. Compiled smoke and aggregate remain Task6. Internal callbacks are trusted synchronous code; arbitrary hostile Promise subclass runtime behavior is not sandboxed.
 
 ## Task 2: Explicit initialization, safe resume, and V1 separation
 
