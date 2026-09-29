@@ -35,6 +35,17 @@ export type FreshStartStateChange = Readonly<{
   recoveryPosition: bigint | null; recoveryHash: string | null; recordedAt: string;
 }>;
 
+/** Internal server API only: operator envelopes are never public MCP arguments. */
+export type FreshStartTransitionRequest = Readonly<{
+  identity: FreshStartIdentity; expectedGeneration: bigint; expectedMode: FreshStartMode;
+  expectedReleaseId: string; nextMode: FreshStartMode; nextRelease: FreshStartRelease;
+  approvalEnvelope: Uint8Array;
+}>;
+export type FreshStartAutomaticStop = Readonly<{
+  identity: FreshStartIdentity; expectedGeneration: bigint; target: "read-only-recovery" | "disabled";
+  reasonCode: Extract<FreshStartAuthorization, { kind: "automatic-stop" }>["reasonCode"];
+}>;
+
 export type FreshStartErrorCode =
   | "FRESH_START_INPUT_INVALID" | "FRESH_START_IDENTITY_MISMATCH"
   | "FRESH_START_RELEASE_MISMATCH" | "FRESH_START_ALREADY_INITIALIZED"
@@ -45,7 +56,10 @@ export type FreshStartErrorCode =
   | "FRESH_START_PATH_INVALID" | "FRESH_START_PATH_CHANGED"
   | "FRESH_START_RECOVERY_REQUIRED" | "FRESH_START_DESTINATION_NOT_EMPTY"
   | "FRESH_START_JOURNAL_MISMATCH" | "FRESH_START_INITIALIZATION_BUSY"
-  | "FRESH_START_PREPARATION_REQUIRED";
+  | "FRESH_START_PREPARATION_REQUIRED" | "FRESH_START_RELEASE_NOT_READY"
+  | "FRESH_START_EDGE_FORBIDDEN" | "FRESH_START_APPROVAL_INVALID"
+  | "FRESH_START_APPROVAL_BINDING_MISMATCH" | "FRESH_START_EVIDENCE_INVALID"
+  | "FRESH_START_EVIDENCE_BINDING_MISMATCH";
 
 export class FreshStartError extends Error {
   constructor(readonly code: FreshStartErrorCode) {
@@ -121,6 +135,32 @@ export function decodeFreshStartGenesis(value: unknown): FreshStartGenesis {
 
 export function decodeFreshStartIdentity(value: unknown): FreshStartIdentity {
   return Object.freeze(identity(record(value, ["projectId", "vaultId", "storeId"])));
+}
+
+function generation(value: unknown): bigint {
+  if (typeof value !== "bigint" || value < 0n || value >= FRESH_START_MAX_GENERATION) invalid();
+  return value;
+}
+function mode(value: unknown): FreshStartMode {
+  if (!["prepared", "active", "read-only-recovery", "disabled"].includes(value as string)) invalid();
+  return value as FreshStartMode;
+}
+export function decodeFreshStartTransitionRequest(value: unknown): FreshStartTransitionRequest {
+  const source = record(value, ["identity", "expectedGeneration", "expectedMode", "expectedReleaseId", "nextMode", "nextRelease", "approvalEnvelope"]);
+  const bytes = source.approvalEnvelope;
+  if (!(bytes instanceof Uint8Array) || bytes.byteLength === 0 || bytes.byteLength > 65_536
+    || bytes.buffer instanceof SharedArrayBuffer) invalid();
+  return Object.freeze({ identity: decodeFreshStartIdentity(source.identity),
+    expectedGeneration: generation(source.expectedGeneration), expectedMode: mode(source.expectedMode),
+    expectedReleaseId: uuid(source.expectedReleaseId), nextMode: mode(source.nextMode),
+    nextRelease: decodeFreshStartRelease(source.nextRelease), approvalEnvelope: new Uint8Array(bytes) });
+}
+export function decodeFreshStartAutomaticStop(value: unknown): FreshStartAutomaticStop {
+  const source = record(value, ["identity", "expectedGeneration", "target", "reasonCode"]);
+  if (source.target !== "disabled" && source.target !== "read-only-recovery") invalid();
+  if (!["integrity-failure", "privacy-failure", "binding-failure", "recovery-failure"].includes(source.reasonCode as string)) invalid();
+  return Object.freeze({ identity: decodeFreshStartIdentity(source.identity), expectedGeneration: generation(source.expectedGeneration),
+    target: source.target, reasonCode: source.reasonCode as FreshStartAutomaticStop["reasonCode"] });
 }
 
 export function decodeFreshStartStateChange(value: unknown): FreshStartStateChange {
