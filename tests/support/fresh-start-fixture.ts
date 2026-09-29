@@ -1,5 +1,5 @@
-import { randomUUID } from "node:crypto";
-import { mkdtempSync, rmSync } from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -10,6 +10,8 @@ import { GENESIS_GLOBAL_HASH } from "../../src/orchestrator/storage/event-append
 import { NodeSqliteDriver } from "../../src/orchestrator/storage/node-sqlite-driver.js";
 import type { SqliteConnection } from "../../src/orchestrator/storage/sqlite-driver.js";
 import { applyCurrentProjectStoreSchema } from "./current-project-store-schema.js";
+import { expectedSchemaFingerprint } from "../../src/orchestrator/storage/schema-fingerprint.js";
+import { PROJECT_STORE_MIGRATIONS } from "../../src/orchestrator/storage/migrations/registry.js";
 
 export const FRESH_NOW = "2026-09-29T00:00:00.000Z";
 export const FRESH_IDENTITY = Object.freeze({
@@ -60,4 +62,28 @@ export function freshStore(): { connection: SqliteConnection; cleanup(): void } 
   });
   applyCurrentProjectStoreSchema(connection, FRESH_IDENTITY, FRESH_NOW);
   return { connection, cleanup(): void { connection.close(); rmSync(root, { recursive: true, force: true }); } };
+}
+
+/** All content here is owned synthetic test data, including the archive sentinel. */
+export function freshInitializationFixture() {
+  const projectRoot = mkdtempSync(join(tmpdir(), "fresh-initialization-"));
+  const v2VaultRoot = join(projectRoot, "v2-vault");
+  const v1ArchiveRoot = join(projectRoot, "v1-archive");
+  mkdirSync(v2VaultRoot); mkdirSync(v1ArchiveRoot);
+  const sentinel = join(v1ArchiveRoot, "sentinel.txt");
+  writeFileSync(sentinel, "synthetic archive must remain untouched");
+  const artifact = join(projectRoot, "owned-test-build.js");
+  writeFileSync(artifact, "export const fixtureBuild = 'foundation-owned-artifact';\n");
+  const inspectBuild = () => createHash("sha256").update(readFileSync(artifact)).digest("hex");
+  const { projectId: _projectId, vaultId: _vaultId, storeId: _storeId, ...release } = freshRelease({
+    buildIdentityHash: inspectBuild(), schemaIdentityHash: expectedSchemaFingerprint(PROJECT_STORE_MIGRATIONS),
+  });
+  return {
+    input: { projectRoot, v2VaultRoot, v1ArchiveRoot, initializationId: randomUUID(), release },
+    dependencies: { inspectBuild, actorFingerprint: createHash("sha256").update("owned-local-test-operator").digest("hex") },
+    sentinel, artifact,
+    journalPath: join(v2VaultRoot, ".memory-mcp", "fresh-start-init.json"),
+    databasePath: join(v2VaultRoot, ".memory-mcp", "v2", "events.sqlite"),
+    cleanup: () => rmSync(projectRoot, { recursive: true, force: true }),
+  };
 }

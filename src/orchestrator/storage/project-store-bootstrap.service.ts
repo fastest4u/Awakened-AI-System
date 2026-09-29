@@ -129,6 +129,9 @@ export interface ProjectStoreBootstrapDependencies {
   randomId: () => string;
   faultInjector: ProjectStoreBootstrapFaultInjector;
   syncDirectory?: DirectorySync;
+  /** Internal initialization owner may durably reserve identity before publication. */
+  reserveStoreId?: (descriptor: ProjectDescriptorV1, route: ProjectStoreRoute) => StoreId;
+  beforeStorePublish?: (route: ProjectStoreRoute) => void | Promise<void>;
 }
 
 interface ResolvedProjectStoreBootstrapDependencies
@@ -423,6 +426,8 @@ export class DefaultProjectStoreBootstrapService implements ProjectStoreBootstra
       faultInjector: dependencies.faultInjector
         ?? NO_PROJECT_STORE_BOOTSTRAP_FAULTS,
       syncDirectory: dependencies.syncDirectory ?? fsyncDirectory,
+      reserveStoreId: dependencies.reserveStoreId,
+      beforeStorePublish: dependencies.beforeStorePublish,
     };
   }
 
@@ -594,7 +599,8 @@ export class DefaultProjectStoreBootstrapService implements ProjectStoreBootstra
       throw bootstrapFailure("SQLITE_CAPABILITY_MISSING");
     }
 
-    const storeId = this.#dependencies.randomId() as StoreId;
+    const storeId = this.#dependencies.reserveStoreId?.(descriptor, route)
+      ?? this.#dependencies.randomId() as StoreId;
     const temporaryReservation = reserveSqlitePath(
       route.storeRoot,
       (id) => `.events.sqlite.bootstrap-${id}.tmp`,
@@ -671,6 +677,7 @@ export class DefaultProjectStoreBootstrapService implements ProjectStoreBootstra
         "pristine-unpublished",
       );
       fsyncFile(temporaryPath);
+      await this.#dependencies.beforeStorePublish?.(route);
       try {
         linkSync(temporaryPath, route.eventsPath);
         publishedByThisContender = true;
