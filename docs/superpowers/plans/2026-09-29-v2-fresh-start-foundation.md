@@ -10,7 +10,7 @@
 
 **Spec:** `docs/superpowers/specs/2026-09-29-v2-fresh-start-production-design.md`, approved 2026-09-29. Read it together with `docs/superpowers/plans/2026-09-29-v2-fresh-start-delivery-roadmap.md`; this plan implements F1, not all production work.
 
-**Status:** Approved for Subagent-Driven execution on 2026-09-29. Task 1 implemented and independently reviewed at `9f13206`; Tasks 2-6 pending. Production implementation remains incomplete.
+**Status:** Approved for Subagent-Driven execution on 2026-09-29. Tasks 1-2 implemented and independently reviewed through `4e3bb20`; Tasks 3-6 pending. Production implementation remains incomplete.
 
 ## Global Constraints
 
@@ -118,7 +118,7 @@ The initialization ID binds a durable, exclusive `fresh-start-init.json` journal
 
 Initial preparation is an explicit local operator action through `v2-admin`, not an ordinary content request. Persist its preparation intent digest and trusted local actor audit identity alongside the receipt; neither comes from a model-visible approval Boolean. Bind preparation to the inspected build/schema and completed foundation checks. This authorizes only prepared state, not Active. Construct the empty-generation receipt after its actual projection checks pass; do not use an all-zero placeholder checksum for a projection.
 
-- [ ] **Step 1: Add fresh, resume and path-boundary tests.** Include real Windows junction/case aliases where supported, ancestor/descendant overlap, a nonempty directory, duplicate initialize, same journal resume, foreign journal refusal, missing database after completion, and concurrent initialization. Assert stable descriptor/store IDs on resume and unchanged V1 sentinel content/metadata.
+- [x] **Step 1: Add fresh, resume and path-boundary tests.** Include real Windows junction/case aliases where supported, ancestor/descendant overlap, a nonempty directory, duplicate initialize, same journal resume, foreign journal refusal, missing database after completion, and concurrent initialization. Assert stable descriptor/store IDs on resume and unchanged V1 sentinel content/metadata.
 
 ```ts
 it('does not turn missing acknowledged storage into fresh data', async () => {
@@ -133,10 +133,12 @@ it('rejects archive overlap before creating a descriptor', async () => {
 
 The fixture must actually remove only its owned test database for the missing-file case and inspect the resulting filesystem. Fault-inject at each journal/store/receipt publication boundary and resume in a new instance.
 
-- [ ] **Step 2: Run `npm run test:build`, then `node --test --test-concurrency=1 dist-test/tests/fresh-start-initializer.test.js`; confirm the new cases fail before implementation.**
-- [ ] **Step 3: Implement path checks and the three initializer operations.** Use explicit canonical project routing, reserve the journal exclusively before bootstrap, fsync/atomic publication patterns already present, and never reset an existing destination. Resolve and recheck path identity before publication. Do not copy V1 data or enumerate V1 contents. Keep incomplete initialization closed to request admission.
-- [ ] **Step 4: Rerun the Step 2 test plus `dist-test/tests/project-store-bootstrap.test.js` and `dist-test/tests/project-binding.service.test.js`.** Expected: pass, no foreign/overlapping path modification, same identities after every recoverable interruption.
-- [ ] **Step 5: Review and commit as `feat: initialize isolated fresh-start V2 stores`.**
+- [x] **Step 2: Run `npm run test:build`, then `node --test --test-concurrency=1 dist-test/tests/fresh-start-initializer.test.js`; confirm the new cases fail before implementation.**
+- [x] **Step 3: Implement path checks and the three initializer operations.** Use explicit canonical project routing, reserve the journal exclusively before bootstrap, fsync/atomic publication patterns already present, and never reset an existing destination. Resolve and recheck path identity before publication. Do not copy V1 data or enumerate V1 contents. Keep incomplete initialization closed to request admission.
+- [x] **Step 4: Rerun the Step 2 test plus `dist-test/tests/project-store-bootstrap.test.js` and `dist-test/tests/project-binding.service.test.js`.** Expected: pass, no foreign/overlapping path modification, same identities after every recoverable interruption.
+- [x] **Step 5: Review and commit as `feat: initialize isolated fresh-start V2 stores`.**
+
+Task 2 evidence: implementation `4e3bb20`; serialized `npm run test:build` native0 followed by initializer/bootstrap/binding tests native0, 86/86 passed (23 initializer, 24 bootstrap, 39 binding), no skips. Independent spec/quality review approved without findings. Real Windows junction/case and two-process contention checks ran. Abrupt process death may leave an exclusive operation lock and requires controlled recovery; no automatic lock stealing or full killed-process recovery is claimed. Task5 still supplies actual compiled-deployment measurement; F3 owns verified operational recovery.
 
 ## Task 3: Closed activation state machine and approval boundary
 
