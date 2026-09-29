@@ -76,9 +76,15 @@ it("recovery waits for a real held writer and records its committed tail", async
     await writer.message("admitted"); writer.process.send("continue");
     assert.equal((await writer.message("writer-held")).type, "writer-held");
     const stopper = child(path, "stop", gate); owned.push(stopper);
-    await stopper.message("ready"); writeFileSync(gate, "release");
-    const committed = await writer.message("result"); const stopped = await stopper.message("result");
-    assert.equal(committed.type, "result"); assert.equal(stopped.position, "1");
+    assert.deepEqual(await stopper.message("contention-observed"), { type: "contention-observed", boundary: "BEGIN IMMEDIATE", nativeErrcode: 5 });
+    assert.equal(fixture.connection.prepare("SELECT generation FROM fresh_start_control_state").get()?.generation, 1n);
+    writeFileSync(gate, "release");
+    const committed = await writer.message("result");
+    assert.equal(committed.type, "result"); assert.equal(committed.position, "1");
+    // The fixture retries only after the holder's actual commit, not on a timed guess.
+    stopper.process.send("retry-stop");
+    const stopped = await stopper.message("result");
+    assert.equal(stopped.type, "result"); assert.equal(stopped.position, "1");
     assert.equal(stopped.hash, fixture.connection.prepare("SELECT event_hash FROM events").get()?.event_hash);
   } finally { for (const item of owned) await closeChild(item.process); fixture.cleanup(); }
 });

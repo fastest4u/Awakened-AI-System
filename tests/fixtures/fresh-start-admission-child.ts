@@ -16,6 +16,7 @@ import { DENY_FRESH_START_PROMOTION } from "../../src/orchestrator/fresh-start/o
 import { LifecycleCommandStore, type LifecycleCommandEnvelope } from "../../src/orchestrator/lifecycle/lifecycle-command.store.js";
 import type { RootStartCommandV2 } from "../../src/orchestrator/lifecycle/contracts/commands.js";
 import { buildLifecycleIntentWitness } from "../../src/orchestrator/lifecycle/lifecycle-intent-witness.js";
+import type { SqliteConnection } from "../../src/orchestrator/storage/sqlite-driver.js";
 
 export function lifecycleEnvelope(): LifecycleCommandEnvelope {
   const basic = command();
@@ -37,7 +38,7 @@ export function lifecycleEnvelope(): LifecycleCommandEnvelope {
 
 if (process.send && process.argv[2]) {
   const [path, mode, gate] = process.argv.slice(2) as [string, string, string];
-  const connection = new NodeSqliteDriver({ DatabaseSync }).open(path, { mode: "existing", busyTimeoutMs: 10000 });
+  const connection = new NodeSqliteDriver({ DatabaseSync }).open(path, { mode: "existing", busyTimeoutMs: mode === "stop" ? 100 : 10000 });
   const trusted = { identity: FRESH_IDENTITY, releaseId: "44444444-4444-4444-8444-444444444444", measuredBuildHash: "a".repeat(64), generation: 1n };
   bindFreshStartAdmissionContext(connection, trusted);
   const finish = (value: unknown) => { connection.close(); process.send?.(value, () => process.disconnect()); };
@@ -69,7 +70,39 @@ if (process.send && process.argv[2]) {
       finish({ type: "result" });
     } catch (error) { finish({ type: "error", code: (error as { code?: string }).code ?? "UNTYPED_ERROR" }); }
   };
-  if (mode === "stop") { process.send({ type: "ready" }); perform(); }
+  if (mode === "stop") {
+    let contention: { boundary: string; nativeErrcode: number } | undefined;
+    // Observe, but never manufacture, the native failure under the production stop call.
+    const observedConnection: SqliteConnection = {
+      exec(sql) {
+        try { connection.exec(sql); }
+        catch (error) {
+          if (sql === "BEGIN IMMEDIATE" && typeof error === "object" && error !== null
+            && "errcode" in error && error.errcode === 5) contention = { boundary: sql, nativeErrcode: error.errcode };
+          throw error;
+        }
+      },
+      prepare: sql => connection.prepare(sql),
+      close: () => connection.close(),
+    };
+    try {
+      new FreshStartControlPlane(new SqliteFreshStartRepository(observedConnection), DENY_FRESH_START_PROMOTION, DENY_FRESH_START_PROMOTION)
+        .stop({ identity: FRESH_IDENTITY, expectedGeneration: 1n, target: "read-only-recovery", reasonCode: "integrity-failure" });
+      finish({ type: "error", code: "CONTENTION_NOT_OBSERVED" });
+    } catch (error) {
+      if (contention === undefined || (error as { code?: string }).code !== "FRESH_START_STORAGE_FAILURE") {
+        finish({ type: "error", code: (error as { code?: string }).code ?? "CONTENTION_NOT_OBSERVED" });
+      } else {
+        const timeout = setTimeout(() => finish({ type: "error", code: "RETRY_GATE_TIMEOUT" }), 10000);
+        process.once("message", value => {
+          clearTimeout(timeout);
+          if (value === "retry-stop") perform();
+          else finish({ type: "error", code: "RETRY_GATE_INVALID" });
+        });
+        process.send({ type: "contention-observed", ...contention });
+      }
+    }
+  }
   else {
     new FreshStartAdmissionGuard(connection).assertRequestAllowed({ ...trusted, operation: "semantic-mutation" });
     process.send({ type: "admitted" });
