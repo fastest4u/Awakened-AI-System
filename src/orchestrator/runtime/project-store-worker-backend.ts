@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import { FreshStartAdmissionGuard, assertFreshStartConnectionAllowed, bindFreshStartAdmissionContext } from "../fresh-start/fresh-start-admission.js";
+import { FreshStartError } from "../fresh-start/contracts.js";
 import {
   mkdtempSync,
   realpathSync,
@@ -48,6 +50,8 @@ import type { LifecycleWorkerRuntimeFactoryPort } from "./lifecycle-worker-runti
 import type { LifecycleWorkerRuntime } from "./lifecycle-worker-runtime.js";
 import {
   decodeAppendCommandWire,
+  decodeFreshStartContextWire,
+  encodeFreshStartContextWire,
   decodeIntegrityProviderRequestWire,
   decodeIntegrityReport,
   decodeMaintenanceLeaseWire,
@@ -66,6 +70,8 @@ import {
   type WorkerBindingAssertion,
   type WorkerRequest,
   type WorkerSuccessData,
+  type FreshStartContextWire,
+  type FreshStartOpenWire,
 } from "./worker-protocol.js";
 
 const POSITIVE_SAFE_INTEGER = (value: number): boolean => Number.isSafeInteger(value) && value > 0;
@@ -81,6 +87,8 @@ export class ProjectStoreWorkerBackendError extends Error {
 }
 
 export interface ProjectStoreWorkerBackendOptions {
+  /** Independently measures the executing deployment; absence keeps fresh stores closed. */
+  readonly trustedFreshStartBuildInspector?: () => string;
   selfUrl: URL;
   executorLeaseMs: number;
   appendRetryDeadlineMs: number;
@@ -371,7 +379,7 @@ export class ProjectStoreWorkerBackend implements WorkerRuntimeBackend {
       case "inspectExisting":
         return inspectProjectStoreIdentity(request.route, request.expected);
       case "open":
-        return this.open(request.binding);
+        return this.open(request.binding, request.freshStart);
       case "append": {
         const active = this.requireActive(request.binding);
         return this.append(active, request.command);
@@ -491,8 +499,9 @@ export class ProjectStoreWorkerBackend implements WorkerRuntimeBackend {
     };
   }
 
-  private async open(binding: unknown): Promise<WorkerSuccessData> {
+  private async open(binding: unknown, freshStartWire?: FreshStartContextWire): Promise<WorkerSuccessData> {
     if (this.#active !== null || this.#closed) failure("PROJECT_BINDING_REQUIRED");
+    const requestedFresh = freshStartWire === undefined ? undefined : decodeFreshStartContextWire(freshStartWire);
     const context = decodeWorkerBinding(binding);
     const path = canonicalEventsPath(context.binding.storeRoute);
 
@@ -526,6 +535,14 @@ export class ProjectStoreWorkerBackend implements WorkerRuntimeBackend {
         { projectId: context.binding.projectId, vaultId: context.binding.vaultId },
         context.binding.storeId,
       );
+      if (requestedFresh !== undefined) {
+        if (requestedFresh.identity.projectId !== context.binding.projectId || requestedFresh.identity.vaultId !== context.binding.vaultId
+          || requestedFresh.identity.storeId !== context.binding.storeId) throw new FreshStartError("FRESH_START_IDENTITY_MISMATCH");
+        const measuredBuildHash = this.#options.trustedFreshStartBuildInspector?.();
+        if (measuredBuildHash === undefined) throw new FreshStartError("FRESH_START_CONTEXT_REQUIRED");
+        if (measuredBuildHash !== requestedFresh.measuredBuildHash) throw new FreshStartError("FRESH_START_BUILD_MISMATCH");
+        bindFreshStartAdmissionContext(connection, { ...requestedFresh, measuredBuildHash });
+      }
       const eventStore = this.#options.eventStoreFactory?.(connection, maintenance)
         ?? new EventStore(
           connection,
@@ -545,6 +562,13 @@ export class ProjectStoreWorkerBackend implements WorkerRuntimeBackend {
       }
       connection.exec("BEGIN IMMEDIATE");
       registrationBegan = true;
+      assertFreshStartConnectionAllowed(connection, "command-recovery");
+      let freshStart: FreshStartOpenWire | undefined;
+      if (requestedFresh !== undefined) {
+        const admission = new FreshStartAdmissionGuard(connection).assertRequestAllowed({ ...requestedFresh, operation: "command-recovery" });
+        if (admission.generation !== requestedFresh.generation) throw new FreshStartError("FRESH_START_ADMISSION_STALE");
+        freshStart = Object.freeze({ ...encodeFreshStartContextWire(requestedFresh), eventPosition: admission.eventPosition.toString(), eventHash: admission.eventHash });
+      }
       maintenance.registerExecutor(
         connection,
         context.binding.projectId,
@@ -571,6 +595,7 @@ export class ProjectStoreWorkerBackend implements WorkerRuntimeBackend {
         bindingGeneration: context.binding.generation,
         contextFingerprint: context.binding.contextFingerprint,
         executorId,
+        ...(freshStart === undefined ? {} : { freshStart }),
       };
     } catch (error) {
       if (registrationBegan) {
@@ -622,6 +647,7 @@ export class ProjectStoreWorkerBackend implements WorkerRuntimeBackend {
     request: Extract<WorkerRequest, { type: "lifecycle" }>,
   ): Promise<WorkerSuccessData> {
     try {
+      if (request.operation.kind === "query") assertFreshStartConnectionAllowed(active.connection, "content-read");
       const result = await active.lifecycleRuntime!.execute(request.operation, active.context);
       const semanticUnknown = request.operation.kind === "semantic"
         && typeof result.result === "object"

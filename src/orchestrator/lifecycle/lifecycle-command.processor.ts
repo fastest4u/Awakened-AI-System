@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { assertFreshStartHousekeepingAllowed } from "../fresh-start/fresh-start-admission.js";
 import type {
   JsonValue,
   LifecycleReplayExpectation,
@@ -1219,6 +1220,7 @@ export class LifecycleCommandProcessor {
     try {
       this.#connection.exec("BEGIN IMMEDIATE");
       transactionBegan = true;
+      assertFreshStartHousekeepingAllowed(this.#connection);
       const authority = this.#authority.get(
         this.#connection,
         context.binding.projectId,

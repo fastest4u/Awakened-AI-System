@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import { activateFreshTestStore } from "./support/fresh-start-fixture.js";
 import { mkdtempSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -3840,6 +3841,50 @@ describe("LifecycleCommandProcessor root lease renewal", () => {
 });
 
 describe("LifecycleQueryService protected root reads", () => {
+  it("fresh recovery refuses an otherwise valid protected content read in the read transaction", async () => {
+    const Processor = await loadProcessorConstructor(); const QueryService = await loadQueryConstructor();
+    assert.ok(Processor && QueryService);
+    const item = fixture(Processor);
+    try {
+      const identity = { projectId: PROJECT_ID, vaultId: VAULT_ID, storeId: STORE_ID };
+      const fresh = await activateFreshTestStore(item.connection, identity);
+      const primary = context("primary-1");
+      const started = success(item.processor.startRoot(primary, preparedStart(primary, startCommand(90139, "fresh-query-thread"))));
+      const read = protectedReadOperation(item, primary, started, 90140, "read-session-status");
+      const query = new QueryService({ connection: item.connection, authorityRepository: item.authority, capabilityService: item.capabilities });
+      fresh.control.stop({ identity, expectedGeneration: 1n, target: "read-only-recovery", reasonCode: "integrity-failure" });
+      assert.throws(() => query.read(primary, read), { code: "FRESH_START_CONTENT_UNVERIFIED" });
+      fresh.control.stop({ identity, expectedGeneration: 2n, target: "disabled", reasonCode: "integrity-failure" });
+      await fresh.control.transition({ identity, expectedGeneration: 3n, expectedMode: "disabled", expectedReleaseId: fresh.release.releaseId,
+        nextMode: "prepared", nextRelease: fresh.release, approvalEnvelope: new Uint8Array([1]) });
+      assert.throws(() => query.read(primary, read), { code: "FRESH_START_CONTENT_UNVERIFIED" });
+    } finally { item.connection.close(); }
+  });
+
+  it("fresh recovery permits signed root lease renewal but disabled mode refuses without authority effects", async () => {
+    const Processor = await loadProcessorConstructor(); assert.ok(Processor);
+    const item = fixture(Processor);
+    try {
+      const identity = { projectId: PROJECT_ID, vaultId: VAULT_ID, storeId: STORE_ID };
+      const fresh = await activateFreshTestStore(item.connection, identity);
+      const primary = context("primary-1");
+      const prepared = preparedStart(primary, startCommand(90141, "fresh-lease-thread"));
+      const started = success(item.processor.startRoot(primary, prepared));
+      const beforeAuthority = item.authority.get(item.connection, PROJECT_ID, started.publicResult.sessionId);
+      const beforeEvents = item.connection.prepare("SELECT count(*) AS n FROM events").get()?.n;
+      fresh.control.stop({ identity, expectedGeneration: 1n, target: "read-only-recovery", reasonCode: "integrity-failure" });
+      const replay = success(item.processor.startRoot(primary, prepared));
+      assert.deepEqual(replay.publicResult, started.publicResult);
+      assert.doesNotThrow(() => item.processor.renewRootLease(primary, renewalOperation(item, primary, started, 90142)));
+      assert.deepEqual(item.authority.get(item.connection, PROJECT_ID, started.publicResult.sessionId), beforeAuthority);
+      fresh.control.stop({ identity, expectedGeneration: 2n, target: "disabled", reasonCode: "integrity-failure" });
+      const beforeLease = item.leases.current(item.connection, PROJECT_ID, started.publicResult.sessionId);
+      assert.throws(() => item.processor.renewRootLease(primary, renewalOperation(item, primary, started, 90143)), { code: "FRESH_START_ADMISSION_DENIED" });
+      assert.deepEqual(item.leases.current(item.connection, PROJECT_ID, started.publicResult.sessionId), beforeLease);
+      assert.equal(item.connection.prepare("SELECT count(*) AS n FROM events").get()?.n, beforeEvents);
+      assert.equal(item.connection.prepare("SELECT count(*) AS n FROM command_dedup").get()?.n, 1n);
+    } finally { item.connection.close(); }
+  });
   it("returns only bounded allowlisted tree, status, and association summaries without effects", async () => {
     const Processor = await loadProcessorConstructor();
     const QueryService = await loadQueryConstructor();

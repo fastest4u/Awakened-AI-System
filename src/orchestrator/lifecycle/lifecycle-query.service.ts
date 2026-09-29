@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { assertFreshStartConnectionAllowed } from "../fresh-start/fresh-start-admission.js";
 import type { ProjectContext } from "../identity/contracts.js";
 import { MAX_CANONICAL_TIMESTAMP_MS } from "../runtime/clock.js";
 import type { SessionAuthorityRecord } from "../storage/lifecycle-storage.types.js";
@@ -424,6 +425,7 @@ export class LifecycleQueryService {
     try {
       this.#connection.exec("BEGIN DEFERRED");
       transactionBegan = true;
+      assertFreshStartConnectionAllowed(this.#connection, "content-read");
       const authority = this.#authority.get(
         this.#connection,
         context.binding.projectId,

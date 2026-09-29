@@ -53,13 +53,15 @@ export class FreshStartControlPlane {
     return this.repository.transact(request.identity, tx => {
       const state = checkedState(tx, request);
       if (!tx.release(request.nextRelease.releaseId)) tx.insertRelease(request.nextRelease);
+      const fence = request.nextMode === "read-only-recovery" || request.nextMode === "disabled"
+        ? tx.captureRecoveryFence(state.generation) : null;
       return tx.transition({ expectedMode: state.mode, expectedGeneration: state.generation,
         expectedReleaseId: state.releaseId, nextMode: request.nextMode, nextReleaseId: request.nextRelease.releaseId,
         transitionId: randomUUID(), authorization: { kind: "operator", approvalId: approval.approvalId,
           nonceDigest: approval.nonceDigest, actorFingerprint: approval.actorFingerprint, requestDigest },
         evidenceDigest: request.nextRelease.evidenceDigest,
-        // Task 4 captures the real fence under this same writer transaction.
-        recoveryPosition: state.recoveryPosition, recoveryHash: state.recoveryHash, recordedAt: new Date().toISOString() });
+        recoveryPosition: fence?.eventPosition ?? state.recoveryPosition,
+        recoveryHash: fence?.eventHash ?? state.recoveryHash, recordedAt: new Date().toISOString() });
     });
   }
 
@@ -72,12 +74,12 @@ export class FreshStartControlPlane {
       edge(state.mode, request.target);
       const release = tx.release(state.releaseId);
       if (!release) throw new FreshStartError("FRESH_START_RELEASE_MISMATCH");
+      const fence = tx.captureRecoveryFence(state.generation);
       return tx.transition({ expectedMode: state.mode, expectedGeneration: state.generation,
         expectedReleaseId: state.releaseId, nextMode: request.target, nextReleaseId: state.releaseId,
         transitionId: randomUUID(), authorization: { kind: "automatic-stop", reasonCode: request.reasonCode },
         evidenceDigest: release.evidenceDigest,
-        // No fabricated zero fence: Task 4 supplies actual same-transaction capture.
-        recoveryPosition: state.recoveryPosition, recoveryHash: state.recoveryHash, recordedAt: new Date().toISOString() });
+        recoveryPosition: fence.eventPosition, recoveryHash: fence.eventHash, recordedAt: new Date().toISOString() });
     });
   }
 }

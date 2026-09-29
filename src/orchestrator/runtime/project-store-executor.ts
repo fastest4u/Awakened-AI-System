@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { snapshotFreshStartContext, type FreshStartTrustedContext } from "../fresh-start/fresh-start-admission.js";
 import { realpathSync, statSync } from "node:fs";
 import { resolve } from "node:path";
 import { Worker } from "node:worker_threads";
@@ -58,6 +59,7 @@ import {
   encodeMaintenanceLeaseWire,
   encodeWorkerBinding,
   encodeWorkerBindingAssertion,
+  encodeFreshStartContextWire,
   type WorkerMessage,
   type WorkerNotification,
   type WorkerOpenResult,
@@ -98,6 +100,8 @@ const DEFINITIVE_LIFECYCLE_ERROR_CODES = new Set<string>(
 );
 
 export interface ProjectStoreExecutorOptions {
+  /** Trusted composition only; never copied from public tool parameters. */
+  freshStart?: FreshStartTrustedContext;
   workerUrl: URL;
   context: ProjectContext;
   maxPending: number;
@@ -552,7 +556,7 @@ export class ProjectStoreExecutor {
     dependencies: Partial<ProjectStoreExecutorDependencies> = {},
   ) {
     validateOptions(options);
-    this.#options = options;
+    this.#options = Object.freeze({ ...options, ...(options.freshStart === undefined ? {} : { freshStart: snapshotFreshStartContext(options.freshStart) }) });
     this.#dependencies = {
       workerFactory: dependencies.workerFactory ?? defaultWorkerFactory,
       scheduler: dependencies.scheduler ?? DEFAULT_SCHEDULER,
@@ -604,6 +608,7 @@ export class ProjectStoreExecutor {
         id: "",
         type: "open",
         binding: encodeWorkerBinding(this.#options.context),
+        ...(this.#options.freshStart === undefined ? {} : { freshStart: encodeFreshStartContextWire(this.#options.freshStart) }),
       }, "control") as WorkerOpenResult;
       const authorityError = openAuthorityError(this.#options.context, result);
       if (authorityError !== null) {

@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { assertFreshStartConnectionAllowed, assertFreshStartHousekeepingAllowed, isFreshStartConnection } from "../fresh-start/fresh-start-admission.js";
 import { isPrimarySqliteBusy } from "../storage/event-append-transaction.js";
 import type { ProjectId } from "../identity/contracts.js";
 import type { SqliteConnection } from "../storage/sqlite-driver.js";
@@ -317,7 +318,7 @@ function callbackBoundaryFailure(work: LifecycleOperationalWorkIdentity): never 
   throw new LifecycleOperationalStoreError("LIFECYCLE_INPUT_INVALID", work);
 }
 
-function guardedFacade<T extends object>(value: T, work: LifecycleOperationalWorkIdentity): {
+function guardedFacade<T extends object>(value: T, work: LifecycleOperationalWorkIdentity, connection: SqliteConnection): {
   readonly facade: T;
   readonly scope: TransactionCallbackScope;
 } {
@@ -328,7 +329,7 @@ function guardedFacade<T extends object>(value: T, work: LifecycleOperationalWor
   const active = (): void => {
     if (!scope.active) callbackBoundaryFailure(work);
   };
-  function guardResult(result: unknown): unknown {
+  function guardResult(result: unknown, path = ""): unknown {
     synchronousCallbackResult(result, work);
     if (typeof result === "function") {
       const prior = callableWrappers.get(result);
@@ -341,7 +342,7 @@ function guardedFacade<T extends object>(value: T, work: LifecycleOperationalWor
       return wrapper;
     }
     if (Array.isArray(result)) return Object.freeze(result.map((item) => guardResult(item)));
-    if (typeof result === "object" && result !== null) return wrap(result);
+    if (typeof result === "object" && result !== null) return wrap(result, path);
     return result;
   }
   function dataMember(
@@ -361,7 +362,7 @@ function guardedFacade<T extends object>(value: T, work: LifecycleOperationalWor
     }
     return { found: true, value: descriptor.value };
   }
-  function wrap(current: object): object {
+  function wrap(current: object, path = ""): object {
     const prior = proxies.get(current);
     if (prior !== undefined) return prior;
     const target = Object.create(null) as Record<PropertyKey, unknown>;
@@ -381,12 +382,18 @@ function guardedFacade<T extends object>(value: T, work: LifecycleOperationalWor
           if (priorWrapper !== undefined) return priorWrapper;
           const wrapper = (...args: unknown[]): unknown => {
             active();
+            if (isFreshStartConnection(connection)) {
+              const allowed = (path === "workflows" && ["claim", "renew", "release", "claimNext"].includes(String(property)))
+                || (path === "outbox" && ["claimNext", "renewClaim", "recordFailure"].includes(String(property)));
+              if (allowed) assertFreshStartHousekeepingAllowed(connection);
+              else assertFreshStartConnectionAllowed(connection, "semantic-mutation");
+            }
             return guardResult(Reflect.apply(member, current, args) as unknown);
           };
           wrappers.set(property, wrapper);
           return wrapper;
         }
-        return guardResult(member);
+        return guardResult(member, path === "" ? String(property) : `${path}.${String(property)}`);
       },
       has: (_target, property) => { active(); return dataMember(current, property).found; },
       ownKeys: () => { active(); return Reflect.ownKeys(current); },
@@ -596,8 +603,9 @@ function invokeSynchronousTransactionCallback<TTransaction extends object, T, TR
   work: LifecycleOperationalWorkIdentity,
   callback: (guarded: TTransaction) => T,
   transform: (result: T) => TResult,
+  connection: SqliteConnection,
 ): TResult {
-  const guarded = guardedFacade(transaction, work);
+  const guarded = guardedFacade(transaction, work, connection);
   try {
     return transform(synchronousCallbackResult(callback(guarded.facade), work));
   } finally {
@@ -666,6 +674,11 @@ export class LifecycleOperationalStore {
     try {
       this.#connection.exec("BEGIN IMMEDIATE");
       transactionBegan = true;
+      const housekeeping = workSnapshot.kind === "workflow-selection" || workSnapshot.kind === "outbox-selection"
+        || (workSnapshot.kind === "workflow" && ["claim", "renew", "release"].includes(workSnapshot.operation))
+        || (workSnapshot.kind === "outbox" && ["claim", "renew", "record-failure"].includes(workSnapshot.operation));
+      if (housekeeping) assertFreshStartHousekeepingAllowed(this.#connection);
+      else assertFreshStartConnectionAllowed(this.#connection, "semantic-mutation");
       if (workSnapshot.kind !== "outbox" || workSnapshot.operation !== "materialize") {
         this.#faults.hit(faultBoundary, "before-write", faultContext);
       }
@@ -689,6 +702,7 @@ export class LifecycleOperationalStore {
         workSnapshot,
         onCurrent,
         immutableOperationalSnapshot,
+        this.#connection,
       );
       if (workSnapshot.kind !== "outbox" || workSnapshot.operation !== "materialize") {
         this.#faults.hit(faultBoundary, "after-write-before-commit", faultContext);

@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import { assertFreshStartConnectionAllowed } from "../fresh-start/fresh-start-admission.js";
+import { FreshStartError } from "../fresh-start/contracts.js";
 import type {
   AppendCommand,
   AppendResult,
@@ -687,7 +689,8 @@ function isPrimarySqliteBusy(error: unknown): boolean {
     && (error.errcode & 0xff) === 5;
 }
 
-function normalizeEventStoreError(error: unknown): EventStoreError {
+function normalizeEventStoreError(error: unknown): EventStoreError | FreshStartError {
+  if (error instanceof FreshStartError) return error;
   if (error instanceof EventStoreError) return error;
   if (error instanceof MaintenanceFenceError) {
     if (error.code === "MAINTENANCE_QUIESCING") {
@@ -1534,6 +1537,7 @@ export class EventAppendTransaction {
       prepared.command.idempotencyKey,
     );
     if (prior === undefined) return null;
+    assertFreshStartConnectionAllowed(this.connection, "command-recovery");
     const authorizationMatches = expectation === null
       ? prior.authorizationRecord === null
       : prior.authorizationRecord !== null
@@ -1580,6 +1584,7 @@ export class EventAppendTransaction {
       throw new EventStoreError("IDEMPOTENCY_CONFLICT");
     }
     const decoded = decodeStoredResponse<T>(prior.responseJson, prior.responseHash, true);
+    assertFreshStartConnectionAllowed(this.connection, "command-recovery");
     if (prior.authorizationRecord.kind === "initial-authority") {
       if (!isPlainRecord(decoded.response)
         || decoded.response.sessionId !== prior.authorizationRecord.targetSessionId) {
@@ -1604,6 +1609,7 @@ export class EventAppendTransaction {
   }
 
   assertAppendAllowed(): void {
+    assertFreshStartConnectionAllowed(this.connection, "semantic-mutation");
     this.maintenance.assertAppendAllowed(this.connection);
   }
 
@@ -1665,6 +1671,7 @@ export class EventAppendTransaction {
   }
 
   appendPlanned<T extends JsonValue>(plannedInput: PlannedEventAppend<T>): EventAppendBatch<T> {
+    assertFreshStartConnectionAllowed(this.connection, "semantic-mutation");
     const planned = requirePlanned(plannedInput);
     const prepared = planned[PLANNED];
     const { command } = prepared;

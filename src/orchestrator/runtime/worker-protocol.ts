@@ -5,6 +5,7 @@ import type {
   PendingEvent,
   PendingOutbox,
 } from "../contracts/event.js";
+import { snapshotFreshStartContext, type FreshStartTrustedContext } from "../fresh-start/fresh-start-admission.js";
 import type {
   BranchScopeId,
   ProjectContext,
@@ -274,6 +275,32 @@ export interface WorkerPingResult {
 
 export interface WorkerOpenResult extends WorkerBindingAssertion {
   executorId: string;
+  freshStart?: FreshStartOpenWire;
+}
+
+export interface FreshStartContextWire {
+  readonly identity: { readonly projectId: string; readonly vaultId: string; readonly storeId: string };
+  readonly releaseId: string; readonly measuredBuildHash: string; readonly generation: string;
+}
+export interface FreshStartOpenWire extends FreshStartContextWire {
+  readonly eventPosition: string; readonly eventHash: string;
+}
+export function decodeFreshStartContextWire(value: unknown): FreshStartTrustedContext {
+  const source = exact(value, ["identity", "releaseId", "measuredBuildHash", "generation"]);
+  try {
+    return snapshotFreshStartContext({ identity: decodeIdentity(source.identity) as FreshStartTrustedContext["identity"],
+      releaseId: string(source.releaseId), measuredBuildHash: string(source.measuredBuildHash), generation: decimal(source.generation) });
+  } catch { return invalid(); }
+}
+export function encodeFreshStartContextWire(value: FreshStartTrustedContext): FreshStartContextWire {
+  const context = snapshotFreshStartContext(value);
+  return Object.freeze({ ...context, generation: context.generation.toString() });
+}
+function decodeFreshStartOpenWire(value: unknown): FreshStartOpenWire {
+  const source = exact(value, ["identity", "releaseId", "measuredBuildHash", "generation", "eventPosition", "eventHash"]);
+  const { eventPosition, eventHash, ...context } = source;
+  if (typeof eventHash !== "string" || !HASH.test(eventHash)) invalid();
+  return Object.freeze({ ...encodeFreshStartContextWire(decodeFreshStartContextWire(context)), eventPosition: decimal(eventPosition).toString(), eventHash });
 }
 
 export const MAX_INTEGRITY_PROVIDER_INPUT_BYTES = 4 * 1024 * 1024;
@@ -291,7 +318,7 @@ export type WorkerRequest =
   | { id: string; type: "ping" }
   | { id: string; type: "verifyIdentity"; route: ProjectStoreRouteWire; expected: StoreIdentityWire }
   | { id: string; type: "inspectExisting"; route: ProjectStoreRouteWire; expected: StoreIdentityExpectationWire }
-  | { id: string; type: "open"; binding: WorkerBinding }
+  | { id: string; type: "open"; binding: WorkerBinding; freshStart?: FreshStartContextWire }
   | { id: string; type: "append"; binding: WorkerBindingAssertion; command: AppendCommandWire }
   | { id: string; type: "lifecycle"; binding: WorkerBindingAssertion; operation: LifecycleWorkerOperationWire }
   | { id: string; type: "quickIntegrity"; binding: WorkerBindingAssertion; tailLimit: number }
@@ -714,9 +741,10 @@ export function decodeWorkerRequest(value: unknown): WorkerRequest {
       exact(value, ["id", "type", "route", "expected"]);
       return { id, type, route: decodeRoute(request.route), expected: decodeIdentityExpectation(request.expected) };
     case "open":
-      exact(value, ["id", "type", "binding"]);
+      exact(value, Object.hasOwn(request, "freshStart") ? ["id", "type", "binding", "freshStart"] : ["id", "type", "binding"]);
       decodeWorkerBinding(request.binding);
-      return { id, type, binding: request.binding as WorkerBinding };
+      return { id, type, binding: request.binding as WorkerBinding,
+        ...(Object.hasOwn(request, "freshStart") ? { freshStart: encodeFreshStartContextWire(decodeFreshStartContextWire(request.freshStart)) } : {}) };
     case "append":
       exact(value, ["id", "type", "binding", "command"]);
       return { id, type, binding: decodeAssertion(request.binding), command: decodeAppendCommandWireShape(request.command) };
@@ -910,8 +938,10 @@ function decodePing(value: unknown): WorkerPingResult {
 }
 
 function decodeOpen(value: unknown): WorkerOpenResult {
+  const source = record(value);
   const result = exact(value, [
     "projectId", "vaultId", "storeId", "bindingGeneration", "contextFingerprint", "executorId",
+    ...(Object.hasOwn(source, "freshStart") ? ["freshStart"] : []),
   ]);
   return { ...decodeAssertion({
     projectId: result.projectId,
@@ -919,7 +949,8 @@ function decodeOpen(value: unknown): WorkerOpenResult {
     storeId: result.storeId,
     bindingGeneration: result.bindingGeneration,
     contextFingerprint: result.contextFingerprint,
-  }), executorId: string(result.executorId) };
+  }), executorId: string(result.executorId),
+    ...(Object.hasOwn(source, "freshStart") ? { freshStart: decodeFreshStartOpenWire(source.freshStart) } : {}) };
 }
 
 function assertDecodedLifecycleProjectBinding(
@@ -955,7 +986,23 @@ function decodeSuccessForType(
       return { verified: true };
     }
     case "inspectExisting": return decodeIdentity(value);
-    case "open": return decodeOpen(value);
+    case "open": {
+      const opened = decodeOpen(value);
+      if (request?.type === "open") {
+        if ((request.freshStart === undefined) !== (opened.freshStart === undefined)) invalid();
+        if (request.freshStart && opened.freshStart) {
+          const expected = request.freshStart;
+          const actual = opened.freshStart;
+          if (expected.releaseId !== actual.releaseId || expected.measuredBuildHash !== actual.measuredBuildHash
+            || expected.generation !== actual.generation
+            || expected.identity.projectId !== actual.identity.projectId || expected.identity.vaultId !== actual.identity.vaultId
+            || expected.identity.storeId !== actual.identity.storeId
+            || actual.identity.projectId !== request.binding.projectId || actual.identity.vaultId !== request.binding.vaultId
+            || actual.identity.storeId !== request.binding.storeId) invalid();
+        }
+      }
+      return opened;
+    }
     case "append": return encodeAppendResultWire(decodeAppendResultWire(value));
     case "lifecycle": {
       if (request?.type !== "lifecycle") invalid();

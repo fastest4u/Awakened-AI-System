@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { assertFreshStartConnectionAllowed } from "../fresh-start/fresh-start-admission.js";
 import type {
   AppendCommand,
   AppendResult,
@@ -2148,6 +2149,7 @@ export class LifecycleCommandStore {
       transactionBegan = true;
       const replay = this.#events.findLifecycleReplay<T>(envelope);
       if (replay !== null) {
+        assertFreshStartConnectionAllowed(this.#connection, "command-recovery");
         const replayAuthorization = replay.authorizationRecord === null
           ? null
           : immutableSnapshot(replay.authorizationRecord);
@@ -2175,6 +2177,7 @@ export class LifecycleCommandStore {
       this.#faults.hit("event-append", "before-write", faultContext);
       this.#events.assertCommandIdentityAvailable(envelope);
       this.#events.assertAppendAllowed();
+      assertFreshStartConnectionAllowed(this.#connection, "semantic-mutation");
       const rawTransaction = this.#transaction(this.#connection);
       const projected = projectCommandTransaction(this.#coverageRepository === undefined
         ? rawTransaction

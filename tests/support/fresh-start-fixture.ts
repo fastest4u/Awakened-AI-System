@@ -12,6 +12,27 @@ import type { SqliteConnection } from "../../src/orchestrator/storage/sqlite-dri
 import { applyCurrentProjectStoreSchema } from "./current-project-store-schema.js";
 import { expectedSchemaFingerprint } from "../../src/orchestrator/storage/schema-fingerprint.js";
 import { PROJECT_STORE_MIGRATIONS } from "../../src/orchestrator/storage/migrations/registry.js";
+import { SqliteFreshStartRepository } from "../../src/orchestrator/fresh-start/fresh-start.repository.js";
+import { FreshStartControlPlane } from "../../src/orchestrator/fresh-start/fresh-start-control-plane.js";
+import { TrustedFreshStartEvidenceVerifier, TrustedOperatorApprovalVerifier } from "../../src/orchestrator/fresh-start/operator-approval.js";
+import { bindFreshStartAdmissionContext } from "../../src/orchestrator/fresh-start/fresh-start-admission.js";
+
+/** Owned-test verifier only. Production promotion remains closed. */
+export async function activateFreshTestStore(connection: SqliteConnection, identity: FreshStartIdentity = FRESH_IDENTITY) {
+  const release = freshRelease({ ...identity, schemaIdentityHash: expectedSchemaFingerprint(PROJECT_STORE_MIGRATIONS) });
+  const genesis = freshGenesis({ ...identity, projectionChecksums: Object.fromEntries(PROJECTION_NAMES.map(name => [name, projectionCoreChecksum(name, 2, identity.projectId, 0n, [])])) });
+  const repository = new SqliteFreshStartRepository(connection);
+  repository.transact(identity, tx => tx.install(genesis, release));
+  const approvals = new TrustedOperatorApprovalVerifier(async (_bytes, requestDigest) => ({ identity,
+    approvalId: randomUUID(), nonceDigest: createHash("sha256").update(randomUUID()).digest("hex"),
+    actorFingerprint: "2".repeat(64), requestDigest, evidenceDigest: release.evidenceDigest }));
+  const control = new FreshStartControlPlane(repository, approvals, new TrustedFreshStartEvidenceVerifier(async value => value));
+  await control.transition({ identity, expectedGeneration: 0n, expectedMode: "prepared", expectedReleaseId: release.releaseId,
+    nextMode: "active", nextRelease: release, approvalEnvelope: new Uint8Array([1]) });
+  const trusted = { identity, releaseId: release.releaseId, measuredBuildHash: release.buildIdentityHash, generation: 1n };
+  bindFreshStartAdmissionContext(connection, trusted);
+  return { control, repository, release, trusted };
+}
 
 export const FRESH_NOW = "2026-09-29T00:00:00.000Z";
 export const FRESH_IDENTITY = Object.freeze({

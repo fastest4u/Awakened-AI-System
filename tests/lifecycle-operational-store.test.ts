@@ -38,6 +38,7 @@ class OperationalConnection implements SqliteConnection {
   }
 
   prepare(sql: string): SqliteStatement {
+    if (sql === "SELECT 1 AS present FROM sqlite_schema WHERE type = 'table' AND name = 'fresh_start_installation'") return { get: () => undefined } as SqliteStatement;
     throw new Error(`operational store must not prepare arbitrary SQL: ${sql}`);
   }
   close(): void {}

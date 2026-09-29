@@ -1,4 +1,5 @@
 import type { SqliteConnection, SqliteRow } from "../storage/sqlite-driver.js";
+import { FreshStartAdmissionGuard, type FreshStartRecoveryFence } from "./fresh-start-admission.js";
 import {
   decodeFreshStartGenesis, decodeFreshStartIdentity, decodeFreshStartRelease,
   decodeFreshStartStateChange, FreshStartError,
@@ -13,6 +14,7 @@ export interface FreshStartTransaction {
   install(genesis: FreshStartGenesis, release: FreshStartRelease): void;
   insertRelease(release: FreshStartRelease): void;
   transition(input: FreshStartStateChange): FreshStartState;
+  captureRecoveryFence(expectedGeneration: bigint): FreshStartRecoveryFence;
 }
 
 function fail(code: ConstructorParameters<typeof FreshStartError>[0]): never { throw new FreshStartError(code); }
@@ -127,6 +129,10 @@ export class SqliteFreshStartRepository {
       };
       const tx: FreshStartTransaction = Object.freeze({
         installation, state, release,
+        captureRecoveryFence: (expectedGeneration: bigint): FreshStartRecoveryFence => {
+          requireLive();
+          return new FreshStartAdmissionGuard(this.#connection).captureRecoveryFence(expected, expectedGeneration);
+        },
         install: (genesisInput: FreshStartGenesis, releaseInput: FreshStartRelease): void => {
           requireLive();
           if (installation() !== null) fail("FRESH_START_ALREADY_INITIALIZED");

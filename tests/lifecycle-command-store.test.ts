@@ -184,7 +184,10 @@ class TransactionConnection implements SqliteConnection {
     }
   }
 
-  prepare(_sql: string): SqliteStatement { throw new Error("raw SQL must remain private"); }
+  prepare(sql: string): SqliteStatement {
+    if (sql === "SELECT 1 AS present FROM sqlite_schema WHERE type = 'table' AND name = 'fresh_start_installation'") return { get: () => undefined } as SqliteStatement;
+    throw new Error("raw SQL must remain private");
+  }
   close(): void {}
 }
 
