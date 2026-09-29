@@ -10,7 +10,7 @@
 
 **Spec:** `docs/superpowers/specs/2026-09-29-v2-fresh-start-production-design.md`, approved 2026-09-29. Read it together with `docs/superpowers/plans/2026-09-29-v2-fresh-start-delivery-roadmap.md`; this plan implements F1, not all production work.
 
-**Status:** Approved for Subagent-Driven execution on 2026-09-29. Tasks 1-2 implemented and independently reviewed through `4e3bb20`; Tasks 3-6 pending. Production implementation remains incomplete.
+**Status:** Approved for Subagent-Driven execution on 2026-09-29. Tasks 1-3 implemented and independently reviewed through `b234374`; Tasks 4-6 pending. Production implementation remains incomplete.
 
 ## Global Constraints
 
@@ -148,7 +148,7 @@ Task 2 evidence: implementation `4e3bb20`; serialized `npm run test:build` nativ
 
 `OperatorApprovalVerifier.verify(envelope: Uint8Array, requestDigest: string): Promise<VerifiedOperatorApproval>` returns a non-publicly-constructible value with approval ID, nonce digest, actor fingerprint and request/evidence binding. `FreshStartEvidenceVerifier.verify(release: FreshStartRelease): Promise<VerifiedFreshStartEvidence>` binds all release hashes and target identities, not just a Boolean. Factory functions for these verified values are private to trusted implementations. F1's production implementation is `DENY_FRESH_START_PROMOTION`, which rejects all availability-increasing transitions with `FRESH_START_RELEASE_NOT_READY`. Test verifier fixtures must stay out of production bundles; the real verified-release and operator-key implementations belong to F3 of the roadmap.
 
-- [ ] **Step 1: Add the exact allowed-edge matrix and rejection tests.** Prepared -> Active/Disabled, Active -> Read-only recovery/Disabled, Read-only recovery -> Active/Disabled, Disabled -> Prepared. Test stale expected generation, replayed approval, wrong project/store/build/evidence, forged verified result, and conflicting concurrent transitions. Availability increases and release replacements always require verified approval/evidence; automatic stop only reduces availability.
+- [x] **Step 1: Add the exact allowed-edge matrix and rejection tests.** Prepared -> Active/Disabled, Active -> Read-only recovery/Disabled, Read-only recovery -> Active/Disabled, Disabled -> Prepared. Test stale expected generation, replayed approval, wrong project/store/build/evidence, forged verified result, and conflicting concurrent transitions. Availability increases and release replacements always require verified approval/evidence; automatic stop only reduces availability.
 
 ```ts
 it('production verifier cannot promote a prepared release', async () => {
@@ -163,12 +163,14 @@ it('consumes one approval only once across concurrent attempts', async () => {
 
 Use actual concurrent repository connections for the second assertion. A fake verifying port tests state policy only; it is never treated as real production approval evidence.
 
-- [ ] **Step 2: Run `npm run test:build`, then `node --test --test-concurrency=1 dist-test/tests/fresh-start-control-plane.test.js`; verify meaningful failure.**
-- [ ] **Step 3: Implement strict transition validation and verification before mutation, then recheck state/identity inside the repository transaction.** Audit and CAS atomically; consume approvals once. Preserve the old `RolloutControlPlane` and its closed default gate.
+- [x] **Step 2: Run `npm run test:build`, then `node --test --test-concurrency=1 dist-test/tests/fresh-start-control-plane.test.js`; verify meaningful failure.**
+- [x] **Step 3: Implement strict transition validation and verification before mutation, then recheck state/identity inside the repository transaction.** Audit and CAS atomically; consume approvals once. Preserve the old `RolloutControlPlane` and its closed default gate.
 
 Release replacement follows Disabled -> Prepared with a newly verified release; there is no Active -> Active replacement shortcut. Reopening an unchanged store is not a preparation transition. The production foundation may perform explicit local preparation and automatic availability reduction, but cannot increase availability to Active.
-- [ ] **Step 4: Rerun Step 2 plus `dist-test/tests/fresh-start-repository.test.js` and `dist-test/tests/rollout-control-plane.test.js`.** Expected: pass; old percentage-canary behavior unchanged and fresh production promotion still denied.
-- [ ] **Step 5: Review and commit as `feat: enforce fresh-start activation policy`.**
+- [x] **Step 4: Rerun Step 2 plus `dist-test/tests/fresh-start-repository.test.js` and `dist-test/tests/rollout-control-plane.test.js`.** Expected: pass; old percentage-canary behavior unchanged and fresh production promotion still denied.
+- [x] **Step 5: Review and commit as `feat: enforce fresh-start activation policy`.**
+
+Task 3 evidence: implementation `b234374`; serialized compile native0 and control/repository/legacy-rollout tests native0, 140/140 passed (45+10+85), no skips. Independent spec/quality review approved without findings. Trusted provider boundaries privately mint runtime-authentic values; fixtures are not real release evidence and the shipped verifier denies promotion. Task4 must replace the temporary preserved recovery-fence fields with same-transaction actual capture before F1 completion.
 
 ## Task 4: Admission inside authoritative transactions and recovery fencing
 
