@@ -214,10 +214,19 @@ export class SqliteFreshStartRepository {
         },
       });
       const result = operation(tx);
-      if (result !== null && (typeof result === "object" || typeof result === "function") && typeof (result as { then?: unknown }).then === "function") {
-        fail("FRESH_START_ASYNC_TRANSACTION");
-      }
       live = false;
+      if (result !== null && (typeof result === "object" || typeof result === "function")) {
+        try {
+          if (result instanceof Promise) {
+            void Promise.prototype.then.call(result, undefined, () => undefined);
+            fail("FRESH_START_ASYNC_TRANSACTION");
+          }
+          if (typeof Reflect.get(result, "then") === "function") fail("FRESH_START_ASYNC_TRANSACTION");
+        } catch (error) {
+          if (error instanceof FreshStartError) throw error;
+          fail("FRESH_START_ASYNC_TRANSACTION");
+        }
+      }
       storage(() => this.#connection.exec("COMMIT"));
       begun = false;
       return result;

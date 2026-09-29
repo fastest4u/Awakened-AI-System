@@ -1,4 +1,5 @@
 import { strict as assert } from "node:assert";
+import { spawnSync } from "node:child_process";
 import { afterEach, describe, it } from "node:test";
 
 import { decodeFreshStartGenesis, decodeFreshStartRelease } from "../src/orchestrator/fresh-start/contracts.js";
@@ -90,6 +91,46 @@ describe("fresh-start repository", () => {
     assert.throws(() => escaped?.state(), { code: "FRESH_START_TRANSACTION_CLOSED" });
     assert.throws(() => repository.transact(FRESH_IDENTITY, () => repository.transact(FRESH_IDENTITY, (tx) => tx.state())), { code: "FRESH_START_TRANSACTION_REENTRANT" });
     assert.throws(() => repository.transact(FRESH_IDENTITY, () => Promise.resolve(1)), { code: "FRESH_START_ASYNC_TRANSACTION" });
+  });
+
+  it("revokes a returned transaction before inspecting getters and proxies", () => {
+    for (const wrap of [
+      (action: () => void): object => ({ get then(): undefined { action(); return undefined; } }),
+      (action: () => void): object => new Proxy({}, { get(_target, key): undefined { if (key === "then") action(); return undefined; } }),
+    ]) {
+      const { repository } = fixture();
+      assert.throws(() => repository.transact(FRESH_IDENTITY, (tx) => wrap(() => tx.install(freshGenesis(), freshRelease()))), {
+        code: "FRESH_START_TRANSACTION_CLOSED",
+      });
+      assert.equal(repository.transact(FRESH_IDENTITY, (tx) => tx.installation()), null);
+    }
+  });
+
+  it("observes rejected native Promises and revoked async continuations without process rejection", () => {
+    for (const operation of [
+      "() => Promise.reject(new Error('rejected promise'))",
+      "async (tx) => { await Promise.resolve(); tx.state(); }",
+    ]) {
+      const script = `
+        import { freshStore, FRESH_IDENTITY } from './dist-test/tests/support/fresh-start-fixture.js';
+        import { SqliteFreshStartRepository } from './dist-test/src/orchestrator/fresh-start/fresh-start.repository.js';
+        const store = freshStore();
+        const repository = new SqliteFreshStartRepository(store.connection);
+        let code;
+        try { repository.transact(FRESH_IDENTITY, ${operation}); }
+        catch (error) { code = error.code; }
+        if (code !== 'FRESH_START_ASYNC_TRANSACTION') throw Error('wrong synchronous error: ' + code);
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        if (repository.transact(FRESH_IDENTITY, (tx) => tx.installation()) !== null) throw Error('transaction mutated');
+        store.cleanup();
+        process.stdout.write('observed and closed\\n');
+      `;
+      const child = spawnSync(process.execPath, ["--unhandled-rejections=strict", "--input-type=module", "-e", script], {
+        cwd: process.cwd(), encoding: "utf8", timeout: 10_000,
+      });
+      assert.equal(child.status, 0, child.stderr || child.error?.message);
+      assert.match(child.stdout, /observed and closed/u);
+    }
   });
 
   it("uses adjacent generation CAS and consumes approval identity once", () => {
