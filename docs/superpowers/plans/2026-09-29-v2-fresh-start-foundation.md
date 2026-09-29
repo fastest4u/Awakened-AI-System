@@ -10,7 +10,7 @@
 
 **Spec:** `docs/superpowers/specs/2026-09-29-v2-fresh-start-production-design.md`, approved 2026-09-29. Read it together with `docs/superpowers/plans/2026-09-29-v2-fresh-start-delivery-roadmap.md`; this plan implements F1, not all production work.
 
-**Status:** Approved for Subagent-Driven execution on 2026-09-29. Tasks 1-3 implemented and independently reviewed through `b234374`; Tasks 4-6 pending. Production implementation remains incomplete.
+**Status:** Approved for Subagent-Driven execution on 2026-09-29. Tasks 1-4 implemented and independently reviewed through `3ed54d1`; Tasks 5-6 pending. Production implementation remains incomplete.
 
 ## Global Constraints
 
@@ -182,7 +182,7 @@ Require the guard in the shared append path before any new semantic event and be
 
 `captureRecoveryFence` uses the already-open transaction owned by the control-plane transition and never nests `BEGIN`. Task 3's `stop` and operator recovery transition both use this capture before committing the new state. In this foundation, recovery content reads remain denied because no verified public content-view provider is installed yet; later composition may allow them only with its verified view. An internal authorized dedup probe may recover committed command status without authorizing a new append.
 
-- [ ] **Step 1: Add process-backed transaction-race tests.** Hold one real writer around `BEGIN IMMEDIATE`, change state through another connection/process, release the barrier, and assert a commit before the fence or a typed refusal after it. Exercise generic and lifecycle appends, bounded authority mutations, dedup replay, wrong release/build, missing receipt, and legacy unaffected behavior.
+- [x] **Step 1: Add process-backed transaction-race tests.** Hold one real writer around `BEGIN IMMEDIATE`, change state through another connection/process, release the barrier, and assert a commit before the fence or a typed refusal after it. Exercise generic and lifecycle appends, bounded authority mutations, dedup replay, wrong release/build, missing receipt, and legacy unaffected behavior.
 
 ```ts
 it('rejects a request admitted before a completed recovery transition', async () => {
@@ -197,10 +197,12 @@ it('recovery does not create a second semantic result', async () => {
 
 Use process barriers and production append APIs, not fabricated dedup rows. Include timeout/error cleanup of owned child processes.
 
-- [ ] **Step 2: Run `npm run test:build`, then `node --test --test-concurrency=1 dist-test/tests/fresh-start-admission.test.js`; observe failures from missing enforcement.**
-- [ ] **Step 3: Wire request and transaction checks into every owned mutation entry point.** Transition to recovery and capture the last committed event/hash under the same write serialization; treat that as the conservative acknowledged boundary. Existing in-flight commits finish before that fence or are refused after it. Keep any data-changing recovery capability operator-only. No path may report writes drained before the actual fence is recorded.
-- [ ] **Step 4: Run Step 2 plus `dist-test/tests/event-store.test.js`, `dist-test/tests/lifecycle-command-store.test.js`, `dist-test/tests/lifecycle-worker-runtime.test.js`, `dist-test/tests/lifecycle-worker-protocol.test.js`, and `dist-test/tests/maintenance-fence.test.js`.** Expected: pass, unchanged idempotency/recovery semantics and no stale post-fence semantic append.
-- [ ] **Step 5: Review and commit as `feat: fence fresh-start request admission at commit`.**
+- [x] **Step 2: Run `npm run test:build`, then `node --test --test-concurrency=1 dist-test/tests/fresh-start-admission.test.js`; observe failures from missing enforcement.**
+- [x] **Step 3: Wire request and transaction checks into every owned mutation entry point.** Transition to recovery and capture the last committed event/hash under the same write serialization; treat that as the conservative acknowledged boundary. Existing in-flight commits finish before that fence or are refused after it. Keep any data-changing recovery capability operator-only. No path may report writes drained before the actual fence is recorded.
+- [x] **Step 4: Run Step 2 plus `dist-test/tests/event-store.test.js`, `dist-test/tests/lifecycle-command-store.test.js`, `dist-test/tests/lifecycle-worker-runtime.test.js`, `dist-test/tests/lifecycle-worker-protocol.test.js`, and `dist-test/tests/maintenance-fence.test.js`.** Expected: pass, unchanged idempotency/recovery semantics and no stale post-fence semantic append.
+- [x] **Step 5: Review and commit as `feat: fence fresh-start request admission at commit`.**
+
+Task 4 evidence: `cc76224` implementation plus `3ed54d1` test-only native-contention fix. Serial compilation and ten focused files passed 270/270, native0. Independent review identified that the original pre-BEGIN child-ready signal did not prove contention; the corrected fixture observes real SQLITE_BUSY during production stop before releasing the held writer, then explicitly retries after confirmed commit. Fresh compilation and admission26/26 passed, native0, and scoped re-review accepted. The prior broader run is not represented as newly rerun. Narrow additional owned-transaction guards in `lifecycle-command.processor.ts` and `lifecycle-query.service.ts` plus their tests were approved as R17/R18. Recovery capture now replaces Task3's temporary preserved fields in both operator and automatic paths. Recorded tail is a conservative committed boundary, not a full-history verifier/public content view. Task5 still wires actual independent compiled-build measurement; F1 public content remains denied.
 
 ## Task 5: Separate compiled entry points and prepared-only diagnostics
 
