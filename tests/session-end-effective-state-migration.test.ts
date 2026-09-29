@@ -60,9 +60,9 @@ const context = {
   },
 } as ProjectContext;
 
-it("preserves migration 0004 and registers schema-7 shadow migration", () => {
-  assert.equal(CURRENT_PROJECT_STORE_SCHEMA_VERSION, 7);
-  assert.deepEqual(PROJECT_STORE_MIGRATIONS.map((migration) => migration.version), [1, 2, 3, 4, 5, 6, 7]);
+it("preserves migration 0004 and registers schema-8 fresh-start migration", () => {
+  assert.equal(CURRENT_PROJECT_STORE_SCHEMA_VERSION, 8);
+  assert.deepEqual(PROJECT_STORE_MIGRATIONS.map((migration) => migration.version), [1, 2, 3, 4, 5, 6, 7, 8]);
   assert.equal(migrationChecksum(sessionLifecycleMigration), "85666a0bdee4455068f03a81e9d3720df172d15fce6d8e6f0cb3f5f7d0a81293");
   assert.equal(
     createHash("sha256").update(readFileSync(resolve(

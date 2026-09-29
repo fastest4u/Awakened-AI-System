@@ -489,8 +489,8 @@ test("release configuration gates lifecycle V2 without production routing", () =
   assertWorkflowReleaseContract(ci, stress);
 
   const smoke = source("scripts/smoke-worker.js");
-  assert.match(smoke, /\[1,2,3,4,5,6\]/);
-  assert.match(smoke, /schemaVersion !== 6/);
+  assert.match(smoke, /\[1,2,3,4,5,6,7,8\]/);
+  assert.match(smoke, /schemaVersion !== 8/);
   assert.match(smoke, /manifest\.schemaVersion !== 1/);
   assert.match(smoke, new RegExp(FROZEN_0002));
   assert.match(smoke, new RegExp(FROZEN_0002_SQL));

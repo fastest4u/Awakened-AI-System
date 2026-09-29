@@ -2373,8 +2373,8 @@ describe("qualified checkpoint migration", () => {
   });
 
   it("freezes schema-3 registry, manifest, migration-2 bytes, and old-reader fencing", () => {
-    assert.deepEqual(PROJECT_STORE_MIGRATIONS.map((migration) => migration.version), [1, 2, 3, 4, 5, 6, 7]);
-    assert.equal(CURRENT_PROJECT_STORE_SCHEMA_VERSION, 7);
+    assert.deepEqual(PROJECT_STORE_MIGRATIONS.map((migration) => migration.version), [1, 2, 3, 4, 5, 6, 7, 8]);
+    assert.equal(CURRENT_PROJECT_STORE_SCHEMA_VERSION, 8);
     assert.equal(parseStoreManifest({
       schemaVersion: 1,
       storeId: STORE_ID,

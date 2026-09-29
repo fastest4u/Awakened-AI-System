@@ -8,6 +8,7 @@ import {
 } from "./0005-session-end-final-checkpoint-transition.js";
 import { v2RolloutControlPlaneMigration } from "./0006-v2-rollout-control-plane.js";
 import { v2ShadowMigration } from "./0007-v2-shadow-migration.js";
+import { v2FreshStartMigration } from "./0008-v2-fresh-start.js";
 
 export const PROJECT_STORE_MIGRATIONS: readonly Migration[] = Object.freeze([
   eventCoreMigration,
@@ -17,6 +18,7 @@ export const PROJECT_STORE_MIGRATIONS: readonly Migration[] = Object.freeze([
   sessionEndFinalCheckpointTransitionMigration,
   v2RolloutControlPlaneMigration,
   v2ShadowMigration,
+  v2FreshStartMigration,
 ] as const);
 
-export const CURRENT_PROJECT_STORE_SCHEMA_VERSION = 7;
+export const CURRENT_PROJECT_STORE_SCHEMA_VERSION = 8;
