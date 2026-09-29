@@ -1,6 +1,6 @@
 # V2 fresh-start production design
 
-**Status:** Draft for written-spec review; no production activation authorized by this document.
+**Status:** Written spec approved by the user on 2026-09-29; implementation planning authorized. Production activation remains separately gated.
 **Date:** 2026-09-29
 **Source baseline:** `9aa3a46` on `codex/subproject-3-projections`. Existing uncommitted Task 13B changes are excluded from this design's implementation claims.
 
@@ -10,7 +10,7 @@ The user wants to use V2 as the primary production memory system, starting with 
 
 Success means that the user's normal memory workflow can start a session, record durable memory and checkpoints, retrieve it in later sessions, close sessions correctly, and recover acknowledged writes after a process failure through the public V2 service. An internal evaluator passing tests is not this outcome.
 
-This document proposes the implementation and activation contract for that outcome. It does not claim that the public runtime, privacy controls, or operational recovery are already complete. Approval of this written spec permits implementation planning; production activation remains a separate decision against actual release evidence.
+This document defines the approved implementation and activation contract for that outcome. It does not claim that the public runtime, privacy controls, or operational recovery are already complete. Approval of this written spec permits implementation planning; production activation remains a separate decision against actual release evidence.
 
 ## 2. Alternatives and selected direction
 
@@ -20,7 +20,7 @@ This document proposes the implementation and activation contract for that outco
 | Add a mode switch inside the existing Markdown service | One executable and familiar configuration | Every old controller and automatic write path becomes a mixed-runtime routing boundary; mistakes could read or change V1 |
 | Continue the V1 shadow migration rollout | Preserves historical memory and the existing V1 rollback model | Conflicts with the selected empty start and requires a source the live Markdown vault does not provide to the current SQLite migration runner |
 
-The proposed implementation uses the first approach. A distinct V2 entry point composes the existing event store, lifecycle runtime, projection runtime, and retrieval service with V2 public adapters. It never constructs the V1 note repository or scans the archive.
+The approved approach uses the first option. A distinct V2 entry point composes the existing event store, lifecycle runtime, projection runtime, and retrieval service with V2 public adapters. It never constructs the V1 note repository or scans the archive.
 
 ## 3. Verified starting point and remaining gaps
 
@@ -37,7 +37,7 @@ The work therefore includes public V2 tool adapters, the fresh-start activation 
 
 ## 4. Fresh identity, storage, and archive boundary
 
-Use an explicit V2 vault root separate from `memory`, with `memory-v2` under the project as the proposed default. Resolve its real location before initialization and reject overlap with the V1 archive, including nested paths and filesystem aliases. Do not create it automatically as a side effect of an ordinary memory request.
+Use an explicit V2 vault root separate from `memory`, with `memory-v2` under the project as the default proposed to the operator. Resolve its real location before initialization and reject overlap with the V1 archive, including nested paths and filesystem aliases. Do not create it automatically as a side effect of an ordinary memory request.
 
 The existing descriptor and router remain authoritative for actual placement:
 
@@ -115,7 +115,7 @@ A snapshot from before a successful write is not a lossless rollback. If verifie
 
 Implement the backup service using the proven SQLite backup capability and existing maintenance-fence primitives; their availability alone does not prove that the complete backup/restore workflow exists. Never copy a live WAL database as an ordinary file and call it verified. Include descriptor/manifest, events, required encrypted evidence, key-recovery dependencies, integrity hashes, schema/build metadata, and replay/erasure positions. Core replay does not call external providers.
 
-Proposed initial operational policy: verified backup before an upgrade, at least hourly while the service is active, and on orderly shutdown when new committed data exists. Surface an overdue backup as unhealthy and block further release promotion; never report an incomplete backup as usable. The release report must state measured recovery time and the actual data-loss exposure for complete storage loss. It may not promise zero loss when the only surviving copy is an older backup. Backup retention and capacity are explicit operator configuration; this design authorizes no automatic deletion of historical V1/V2 content or existing backups.
+Initial operational policy: verified backup before an upgrade, at least hourly while the service is active, and on orderly shutdown when new committed data exists. Surface an overdue backup as unhealthy and block further release promotion; never report an incomplete backup as usable. The release report must state measured recovery time and the actual data-loss exposure for complete storage loss. It may not promise zero loss when the only surviving copy is an older backup. Backup retention and capacity are explicit operator configuration; this design authorizes no automatic deletion of historical V1/V2 content or existing backups.
 
 ## 9. Verification and activation evidence
 
@@ -136,7 +136,7 @@ The release gate report binds the build/schema/configuration/capability identiti
 
 For this fresh-start profile, replace the old V1 shadow period and percentage canary with isolated rehearsal followed by one explicitly approved project/workspace deployment. Expanding to another binding requires its own approval and evidence. The old five-stage 24-hour/1,000-operation canary schedule is not inherited. After activation, verify a real normal session, durable write, subsequent retrieval, and backup/status on the deployed build before reporting live operation verified. This is functional deployment evidence, not a claim that a short pilot proves long-term reliability.
 
-Status language is explicit: **implementation incomplete**, **ready for activation**, **active pending live verification**, or **live operation verified for the declared capabilities**. Approval of this draft cannot be cited as activation approval.
+Status language is explicit: **implementation incomplete**, **ready for activation**, **active pending live verification**, or **live operation verified for the declared capabilities**. Approval of this spec cannot be cited as activation approval.
 
 ## 10. Delivery scope and relationship to prior work
 
@@ -149,7 +149,7 @@ This document is an umbrella amendment for the selected deployment profile. Keep
 
 The implementation plan must enumerate concrete files, acceptance evidence, and remaining dependencies for these increments. If a prerequisite requires a separate subsystem design, identify it there rather than silently removing the requirement or claiming this umbrella is complete. Each increment is independently reviewable; production traffic begins only when all applicable release prerequisites pass.
 
-On approval, this profile supersedes the V1-source migration, V1/V2 parity, compatibility catch-up, V1 fallback, V1 rollback, and percentage-canary requirements of the 2026-08-31 rollout design **for this fresh-start deployment only**. Other safety requirements remain applicable. The older migration-capable rollout remains a separate supported development path; do not rewrite its historical results.
+This approved profile supersedes the V1-source migration, V1/V2 parity, compatibility catch-up, V1 fallback, V1 rollback, and percentage-canary requirements of the 2026-08-31 rollout design **for this fresh-start deployment only**. Other safety requirements remain applicable. The older migration-capable rollout remains a separate supported development path; do not rewrite its historical results.
 
 Slice 2 Task 14 live-V1 migration rehearsal is not required for this profile. It is not marked passed or completed: record it as outside the selected fresh-start release scope when updating the roadmap after approval. Preserve the current uncommitted Task 13B files and evidence until reviewed under their actual scope. Neither that task nor Subprojects 4/5 become complete merely because fresh start removes migration.
 
@@ -164,4 +164,4 @@ Slice 2 Task 14 live-V1 migration rehearsal is not required for this profile. It
 
 ## 12. Self-review record
 
-Checked against the inspected source and prior approved designs: no fictional V1 SQLite source, no destructive fresh reset, no empty-snapshot rollback after real writes, no silent V1 fallback, no implied global/provider support, and no claim that historical tests verify unimplemented public composition. Deployment paths, capability changes, operational policy, and replacement of the prior canary procedure are proposals in this written spec pending review.
+Checked against the inspected source and prior approved designs: no fictional V1 SQLite source, no destructive fresh reset, no empty-snapshot rollback after real writes, no silent V1 fallback, no implied global/provider support, and no claim that historical tests verify unimplemented public composition. The user approved this written profile after reviewing commit `96bc4ea`; deployment still requires actual release evidence and separate activation approval.

@@ -4,6 +4,8 @@
 **Date:** 2026-08-31
 **Decision:** Version 2 becomes the eventual production-primary runtime through a progressive canary, an auditable control plane, and a fenced rollback.
 
+**Deployment-profile amendment (2026-09-29):** The user selected and approved an empty V2 with a separate read-only V1 archive. For that deployment only, [the fresh-start profile](2026-09-29-v2-fresh-start-production-design.md) replaces the V1 migration/parity/fallback/rollback and percentage-canary requirements below. This historical migration-capable profile remains intact; its completed work is not production activation evidence for fresh start. See [the current delivery roadmap](../plans/2026-09-29-v2-fresh-start-delivery-roadmap.md).
+
 ## 1. Purpose and current boundary
 
 The intended end state is real Version 2 primary production traffic. It is not the current state. The current runtime deliberately returns LIFECYCLE_V2_DISABLED when no V2 runtime is installed, and the sealed CI release gate rejects public V2 routing. Those protections are correct for the evaluator-only boundary and must not be removed or bypassed.
