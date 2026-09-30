@@ -10,7 +10,7 @@
 
 **Spec:** `docs/superpowers/specs/2026-09-29-v2-fresh-start-production-design.md`, approved 2026-09-29. Read it together with `docs/superpowers/plans/2026-09-29-v2-fresh-start-delivery-roadmap.md`; this plan implements F1, not all production work.
 
-**Status:** Approved for Subagent-Driven execution on 2026-09-29. Tasks 1-4 implemented and independently reviewed through `3ed54d1`; Tasks 5-6 pending. Production implementation remains incomplete.
+**Status:** Approved for Subagent-Driven execution on 2026-09-29. Tasks 1-5 implemented and independently reviewed through `03c4829`; Task 6 pending. Production implementation remains incomplete.
 
 ## Global Constraints
 
@@ -212,7 +212,7 @@ Task 4 evidence: `cc76224` implementation plus `3ed54d1` test-only native-conten
 
 Choose bundles `dist/v2.js` (stdio MCP) and `dist/v2-admin.js` (local operator CLI). Add `start:v2` using `check:runtime` then `node dist/v2.js`. The CLI supports exactly `initialize-fresh`, `resume-initialization`, and `status` with explicit `--project-root`, `--v2-vault-root`, `--v1-archive-root`, and release-manifest input; it has **no activate command in F1**. The V2 server exposes a read-only `memory_v2Status` diagnostic and rejects content tool invocation with `FRESH_START_RELEASE_NOT_READY`. It neither creates a store on startup nor registers existing Markdown controllers. Keep future content-adapter dependencies behind a typed composition boundary, with no testing-only injection from environment variables.
 
-- [ ] **Step 1: Add process-level entry tests.** Missing/dynamic roots fail before any file creation; status does not scan V1; repeated server starts reopen one identity; content calls and activation attempts are refused; `stdout` contains only protocol messages. Test environment errors containing a credential sentinel and require the sentinel to be absent from diagnostics.
+- [x] **Step 1: Add process-level entry tests.** Missing/dynamic roots fail before any file creation; status does not scan V1; repeated server starts reopen one identity; content calls and activation attempts are refused; `stdout` contains only protocol messages. Test environment errors containing a credential sentinel and require the sentinel to be absent from diagnostics.
 
 ```ts
 it('compiled foundation cannot enable production through configuration', async () => {
@@ -224,10 +224,12 @@ it('compiled foundation cannot enable production through configuration', async (
 
 The V1 access count must come from instrumented filesystem boundaries or an inaccessible sentinel archive exercised by the actual process; do not infer it from an empty result alone.
 
-- [ ] **Step 2: Run `npm run test:build`, then `node --test --test-concurrency=1 dist-test/tests/v2-foundation-entry.test.js`; confirm the missing entry/config behavior fails.**
-- [ ] **Step 3: Implement config, prepared composition, stdio diagnostics and CLI routing, then add both bundles to the build.** Keep diagnostics redacted and install only the deny-by-default promotion verifier. Document the exact commands as available only after this task builds, and document the unsupported content state clearly.
-- [ ] **Step 4: Run `npm run build`, `npm run test:build`, and `node --test --test-concurrency=1 dist-test/tests/v2-foundation-entry.test.js`.** Expected: both bundles exist, compiled process tests pass and the existing V1 entry is unchanged.
-- [ ] **Step 5: Review and commit as `feat: add prepared-only V2 service entry points`.**
+- [x] **Step 2: Run `npm run test:build`, then `node --test --test-concurrency=1 dist-test/tests/v2-foundation-entry.test.js`; confirm the missing entry/config behavior fails.**
+- [x] **Step 3: Implement config, prepared composition, stdio diagnostics and CLI routing, then add both bundles to the build.** Keep diagnostics redacted and install only the deny-by-default promotion verifier. Document the exact commands as available only after this task builds, and document the unsupported content state clearly.
+- [x] **Step 4: Run `npm run build`, `npm run test:build`, and `node --test --test-concurrency=1 dist-test/tests/v2-foundation-entry.test.js`.** Expected: both bundles exist, compiled process tests pass and the existing V1 entry is unchanged.
+- [x] **Step 5: Review and commit as `feat: add prepared-only V2 service entry points`.**
+
+Task 5 evidence: `084ac1a` implementation plus `03c4829` hardlink-read fix. Build and compilation native0; six-file focused integration131/131, current-byte loader9/9 and provenance25/25 passed in separately recorded runs. Independent review identified actual V1 bytes read through an outside-archive hardlink. Two compiled-process regressions demonstrated the defect before the fix; opened-handle single-link/bigint identity validation now precedes bounded reads. Fresh build/compilation and complete entry9/9 passed, native0, and scoped independent re-review accepted. No full suite was run for this task. Actual measured admin/server/worker deployment identities are F1 integrity evidence, not signed F3 release evidence; the shipped verifier still denies promotion and content. Task6 owns aggregate checks and CI reconciliation.
 
 ## Task 6: Focused gate, isolation contract and handoff evidence
 
