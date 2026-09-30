@@ -61,6 +61,8 @@ Existing [policy tests](../../../tests/session-end-policy.test.ts#L71) explicitl
 
 Task 1 commit `a49b955` adds only the fixed manifest/pure verifier/tests. Preserved GREEN log records 95/95 pass with zero fail/cancel/skip/todo and 478.3478 ms; preserved typecheck is native 0. Independent spec and quality reviews accepted it. These establish synthetic unit behavior only, including exact membership, duplicate equality, attribution, correlation, ordering, hostile input and metadata budgets (64 observations, 65,536 frame bytes, 262,144 total bytes). They establish no host feed, private boundary or retention.
 
+Final whole-preparation review identified scalar allocation before rejection. Local verifier/test repair `a05d7f8` adds cheap primitive/code-unit bounds before the required existing canonical parsers; production validators are unchanged. Actual focused RED proves allocation on 54 safely bounded parse paths; final whole-file GREEN is 96/96, native 0, zero fail/cancel/skip, with typecheck native 0 and accepted independent scoped fix re-review. The earlier 95-test result remains historical at `a49b955`, not relabeled for changed source. This additional unit proof changes none of the nine actual-host statuses or the strict retention disposition.
+
 Production redaction before authenticated full-content encryption, key recovery, governance and erasure remain separate undelivered obligations. Host ordering proof, an encrypted authority pending store, or a weaker-policy unit pass cannot satisfy them. Preserve `requireFullEvidence=true`, `contentRetained:false`, `EVIDENCE_CAPTURE_INCOMPLETE`, empty V2 and no V1 import/retrieval/fallback.
 
 ## Stop and next permitted diagnostic
