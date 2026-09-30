@@ -5,6 +5,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { tmpdir } from "node:os";
 import { join, relative, sep } from "node:path";
 import test from "node:test";
+import ts from "typescript";
 
 const ROOT = new URL("../../", import.meta.url);
 
@@ -256,12 +257,47 @@ const PREPARED_IMPORTS: Readonly<Record<string, readonly string[]>> = {
   "src/orchestrator/runtime/project-store-worker-backend.ts": ["src/orchestrator/fresh-start/fresh-start-admission.ts", "src/orchestrator/fresh-start/contracts.ts"],
   "src/orchestrator/runtime/worker-protocol.ts": ["src/orchestrator/fresh-start/fresh-start-admission.ts"],
 };
-const LITERAL_MODULE_WIRING = new RegExp(
-  String.raw`(?:from(?:${JAVASCRIPT_TRIVIA})+|import(?:(?:${JAVASCRIPT_TRIVIA})*\((?:${JAVASCRIPT_TRIVIA})*|(?:${JAVASCRIPT_TRIVIA})+)|require(?:${JAVASCRIPT_TRIVIA})*\((?:${JAVASCRIPT_TRIVIA})*)["']([^"']+)["']`, "g",
-);
-const UNSUPPORTED_TEMPLATE_MODULE_WIRING = new RegExp(
-  String.raw`(?:import|require)(?:${JAVASCRIPT_TRIVIA})*\((?:${JAVASCRIPT_TRIVIA})*\x60`,
-);
+function canonicalModuleSpecifiers(candidate: ProductionIsolationSource): readonly string[] {
+  // Parse source as data: never execute it or interpret a quoted prefix as the
+  // whole argument. Parentheses, operators, spreads and options remain AST nodes.
+  const parsed = ts.createSourceFile(candidate.path, candidate.contents, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+  const specifiers: string[] = [];
+  const readLiteral = (node: ts.Node): void => {
+    assert.ok(ts.isStringLiteral(node), "V2_PRODUCTION_ISOLATION: unsupported module call shape");
+    const raw = node.getText(parsed);
+    assert.ok((raw.startsWith('"') && raw.endsWith('"')) || (raw.startsWith("'") && raw.endsWith("'")),
+      "V2_PRODUCTION_ISOLATION: unsupported module call shape");
+    assert.ok(!raw.includes("\\"), "V2_PRODUCTION_ISOLATION: unsupported escaped module literal");
+    specifiers.push(raw.slice(1, -1));
+  };
+  const visit = (node: ts.Node): void => {
+    if (ts.isImportDeclaration(node) || ts.isExportDeclaration(node)) {
+      if (node.moduleSpecifier) readLiteral(node.moduleSpecifier);
+    } else if (ts.isExternalModuleReference(node)) {
+      assert.ok(node.expression, "V2_PRODUCTION_ISOLATION: unsupported module call shape");
+      readLiteral(node.expression);
+    } else if (ts.isImportTypeNode(node)) {
+      assert.ok(ts.isLiteralTypeNode(node.argument), "V2_PRODUCTION_ISOLATION: unsupported module call shape");
+      readLiteral(node.argument.literal);
+    } else if (ts.isCallExpression(node)) {
+      let callee: ts.Expression = node.expression;
+      while (ts.isParenthesizedExpression(callee) || ts.isAsExpression(callee)
+        || ts.isTypeAssertionExpression(callee) || ts.isNonNullExpression(callee) || ts.isSatisfiesExpression(callee)) callee = callee.expression;
+      if (callee.kind === ts.SyntaxKind.ImportKeyword || (ts.isIdentifier(callee) && callee.text === "require")) {
+        assert.ok(callee === node.expression && !node.questionDotToken && !node.typeArguments
+          && node.arguments.length === 1 && !node.arguments.hasTrailingComma,
+        "V2_PRODUCTION_ISOLATION: unsupported module call shape");
+        const argument = node.arguments[0]!;
+        assert.ok(!ts.isTemplateExpression(argument) && !ts.isNoSubstitutionTemplateLiteral(argument),
+          "V2_PRODUCTION_ISOLATION: unsupported template module argument");
+        readLiteral(argument);
+      }
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(parsed);
+  return specifiers;
+}
 
 function normalizedModuleTarget(caller: string, specifier: string): string | null {
   // This fence intentionally accepts canonical literal spellings only. Raw
@@ -279,12 +315,12 @@ function normalizedModuleTarget(caller: string, specifier: string): string | nul
 function assertProductionIsolation(sources: readonly ProductionIsolationSource[]): void {
   for (const candidate of sources) {
     if (PRODUCTION_ENTRY_SOURCE_PATHS.includes(candidate.path)) {
-      assert.doesNotMatch(candidate.contents, UNSUPPORTED_TEMPLATE_MODULE_WIRING, "V2_PRODUCTION_ISOLATION: unsupported template module argument");
+      const specifiers = canonicalModuleSpecifiers(candidate);
       assert.doesNotMatch(candidate.contents, FORBIDDEN_SHADOW_PRODUCTION_MODULE_WIRING, `V2_PRODUCTION_ISOLATION: ${candidate.path} must not import migration/parity/materialization`);
       assert.doesNotMatch(candidate.contents, /(?:from|import|require)[\s\S]{0,40}["'][^"']*(?:tests\/|fixtures\/)[^"']*["']/, "V2_PRODUCTION_ISOLATION: no test fixture wiring");
       assert.doesNotMatch(candidate.contents, FORBIDDEN_SHADOW_ENVIRONMENT, "V2_PRODUCTION_ISOLATION: no environment activation");
-      for (const edge of candidate.contents.matchAll(LITERAL_MODULE_WIRING)) {
-        const target = normalizedModuleTarget(candidate.path, edge[1]!);
+      for (const specifier of specifiers) {
+        const target = normalizedModuleTarget(candidate.path, specifier);
         if (target === "src/v2.ts" || target === "src/v2-admin.ts" || target?.startsWith("src/v2/")
           || target?.startsWith("src/orchestrator/fresh-start/")) assert.ok(
           PREPARED_IMPORTS[candidate.path]?.includes(target), "V2_PRODUCTION_ISOLATION: unapproved prepared composition edge");
@@ -1196,6 +1232,36 @@ test("prepared composition authorizes normalized caller-target pairs rather than
     'import "../v2/../v2/./build-identity.js";',
   ]) assert.doesNotThrow(() => assertProductionIsolation([{ path: "src/workers/project-store.worker.ts", contents }]));
   assert.doesNotThrow(() => assertProductionIsolation([{ path: "src/v2/app.ts", contents: 'import "./composition.js";' }]));
+});
+
+for (const [label, argumentsSource] of [
+  ["concatenation", '"../v2" + ".js"'],
+  ["parenthesized", '("../v2.js")'],
+  ["variable", 'target'],
+  ["conditional", 'true ? "../v2.js" : "node:fs"'],
+  ["comma expression", '(0, "../v2.js")'],
+  ["spread", '...["../v2.js"]'],
+  ["missing", ''],
+  ["extra argument", '"node:fs", "../v2.js"'],
+  ["type assertion", '"../v2.js" as string'],
+] as const) test(`prepared composition rejects complete unsupported call shape: ${label}`, () => {
+  for (const loader of ["import", "require"]) {
+    for (const trivia of ["", " /* before */ ", " // before\n"]) {
+      const contents = `const target = "../v2.js"; const entry = ${loader}${trivia}( /* argument */ ${argumentsSource} /* end */ );`;
+      assert.throws(() => assertProductionIsolation([{ path: "src/workers/project-store.worker.ts", contents }]),
+        /V2_PRODUCTION_ISOLATION: unsupported module call shape/, contents);
+    }
+  }
+});
+
+test("prepared composition accepts complete canonical syntax with trivia and static exports", () => {
+  for (const contents of [
+    'const entry = import /* before */ ( /* argument */ "../v2/build-identity.js" /* end */ );',
+    "const entry = require // before\n ( // argument\n '../v2/../v2/./build-identity.js' // end\n );",
+    'import /* before */ { inspect } from /* target */ "../v2/build-identity.js";',
+    'export /* before */ { inspect } from /* target */ "../v2/build-identity.js";',
+    'export * from "../v2/build-identity.js";',
+  ]) assert.doesNotThrow(() => assertProductionIsolation([{ path: "src/workers/project-store.worker.ts", contents }]), contents);
 });
 
 test("Subproject 3 evaluation guard covers every production entry surface", () => {
