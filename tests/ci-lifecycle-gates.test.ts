@@ -3,7 +3,7 @@ import { execFileSync, spawnSync } from "node:child_process";
 import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, relative, sep } from "node:path";
 import test from "node:test";
 
 const ROOT = new URL("../../", import.meta.url);
@@ -244,21 +244,30 @@ const FORBIDDEN_SHADOW_ENVIRONMENT = /process\s*\.\s*env\s*(?:\.\s*[A-Za-z0-9_]*
 // Only these reviewed prepared-composition edges may cross the old V1-only
 // fence. No directory-prefix exemption grants future callers the same access.
 const PREPARED_IMPORTS: Readonly<Record<string, readonly string[]>> = {
-  "src/v2.ts": ["./v2/app.js", "./v2/config.js"],
-  "src/v2-admin.ts": ["./v2/admin.js", "./v2/config.js"],
-  "src/v2/admin.ts": ["../orchestrator/fresh-start/fresh-start-initializer.js", "../orchestrator/fresh-start/fresh-start-paths.js", "../orchestrator/fresh-start/contracts.js"],
-  "src/v2/app.ts": ["../orchestrator/fresh-start/contracts.js"],
-  "src/v2/config.ts": ["../orchestrator/fresh-start/contracts.js", "../orchestrator/fresh-start/fresh-start-paths.js"],
-  "src/v2/composition.ts": ["../orchestrator/fresh-start/fresh-start-initializer.js", "../orchestrator/fresh-start/fresh-start-paths.js", "../orchestrator/fresh-start/contracts.js", "../orchestrator/fresh-start/fresh-start.repository.js", "../orchestrator/fresh-start/operator-approval.js"],
-  "src/v2/build-identity.ts": ["../orchestrator/fresh-start/contracts.js"],
-  "src/workers/project-store.worker.ts": ["../v2/build-identity.js"],
-  "src/orchestrator/runtime/project-store-executor.ts": ["../fresh-start/fresh-start-admission.js"],
-  "src/orchestrator/runtime/project-store-worker-backend.ts": ["../fresh-start/fresh-start-admission.js", "../fresh-start/contracts.js"],
-  "src/orchestrator/runtime/worker-protocol.ts": ["../fresh-start/fresh-start-admission.js"],
+  "src/v2.ts": ["src/v2/app.ts", "src/v2/config.ts"],
+  "src/v2-admin.ts": ["src/v2/admin.ts", "src/v2/config.ts"],
+  "src/v2/admin.ts": ["src/orchestrator/fresh-start/fresh-start-initializer.ts", "src/orchestrator/fresh-start/fresh-start-paths.ts", "src/orchestrator/fresh-start/contracts.ts", "src/v2/build-identity.ts", "src/v2/config.ts", "src/v2/composition.ts"],
+  "src/v2/app.ts": ["src/orchestrator/fresh-start/contracts.ts", "src/v2/composition.ts", "src/v2/config.ts"],
+  "src/v2/config.ts": ["src/orchestrator/fresh-start/contracts.ts", "src/orchestrator/fresh-start/fresh-start-paths.ts"],
+  "src/v2/composition.ts": ["src/orchestrator/fresh-start/fresh-start-initializer.ts", "src/orchestrator/fresh-start/fresh-start-paths.ts", "src/orchestrator/fresh-start/contracts.ts", "src/orchestrator/fresh-start/fresh-start.repository.ts", "src/orchestrator/fresh-start/operator-approval.ts", "src/v2/build-identity.ts", "src/v2/config.ts"],
+  "src/v2/build-identity.ts": ["src/orchestrator/fresh-start/contracts.ts"],
+  "src/workers/project-store.worker.ts": ["src/v2/build-identity.ts"],
+  "src/orchestrator/runtime/project-store-executor.ts": ["src/orchestrator/fresh-start/fresh-start-admission.ts"],
+  "src/orchestrator/runtime/project-store-worker-backend.ts": ["src/orchestrator/fresh-start/fresh-start-admission.ts", "src/orchestrator/fresh-start/contracts.ts"],
+  "src/orchestrator/runtime/worker-protocol.ts": ["src/orchestrator/fresh-start/fresh-start-admission.ts"],
 };
-const PREPARED_MODULE_WIRING = new RegExp(
-  String.raw`(?:from(?:${JAVASCRIPT_TRIVIA})+|import(?:(?:${JAVASCRIPT_TRIVIA})*\((?:${JAVASCRIPT_TRIVIA})*|(?:${JAVASCRIPT_TRIVIA})+)|require(?:${JAVASCRIPT_TRIVIA})*\((?:${JAVASCRIPT_TRIVIA})*)["']([^"']*(?:\/fresh-start\/|\/v2\/)[^"']*)["']`, "g",
+const LITERAL_MODULE_WIRING = new RegExp(
+  String.raw`(?:from(?:${JAVASCRIPT_TRIVIA})+|import(?:(?:${JAVASCRIPT_TRIVIA})*\((?:${JAVASCRIPT_TRIVIA})*|(?:${JAVASCRIPT_TRIVIA})+)|require(?:${JAVASCRIPT_TRIVIA})*\((?:${JAVASCRIPT_TRIVIA})*)["']([^"']+)["']`, "g",
 );
+
+function normalizedModuleTarget(caller: string, specifier: string): string | null {
+  // Bare packages/builtins are not repository-relative modules. Resolve file
+  // URLs and relative literals as Node does before testing the protected target.
+  if (!specifier.startsWith(".") && !specifier.startsWith("/") && !specifier.startsWith("file:")) return null;
+  const url = new URL(specifier, new URL(caller, ROOT));
+  const target = relative(fileURLToPath(ROOT), fileURLToPath(url)).split(sep).join("/").toLowerCase();
+  return target.replace(/\.js$/, ".ts");
+}
 
 function assertProductionIsolation(sources: readonly ProductionIsolationSource[]): void {
   for (const candidate of sources) {
@@ -266,8 +275,12 @@ function assertProductionIsolation(sources: readonly ProductionIsolationSource[]
       assert.doesNotMatch(candidate.contents, FORBIDDEN_SHADOW_PRODUCTION_MODULE_WIRING, `V2_PRODUCTION_ISOLATION: ${candidate.path} must not import migration/parity/materialization`);
       assert.doesNotMatch(candidate.contents, /(?:from|import|require)[\s\S]{0,40}["'][^"']*(?:tests\/|fixtures\/)[^"']*["']/, "V2_PRODUCTION_ISOLATION: no test fixture wiring");
       assert.doesNotMatch(candidate.contents, FORBIDDEN_SHADOW_ENVIRONMENT, "V2_PRODUCTION_ISOLATION: no environment activation");
-      for (const edge of candidate.contents.matchAll(PREPARED_MODULE_WIRING)) assert.ok(
-        PREPARED_IMPORTS[candidate.path]?.includes(edge[1]!), "V2_PRODUCTION_ISOLATION: unapproved prepared composition edge");
+      for (const edge of candidate.contents.matchAll(LITERAL_MODULE_WIRING)) {
+        const target = normalizedModuleTarget(candidate.path, edge[1]!);
+        if (target === "src/v2.ts" || target === "src/v2-admin.ts" || target?.startsWith("src/v2/")
+          || target?.startsWith("src/orchestrator/fresh-start/")) assert.ok(
+          PREPARED_IMPORTS[candidate.path]?.includes(target), "V2_PRODUCTION_ISOLATION: unapproved prepared composition edge");
+      }
       assert.doesNotMatch(
         candidate.contents,
         FORBIDDEN_V2_PRODUCTION_MODULE_WIRING,
@@ -1111,10 +1124,46 @@ test("shadow isolation rejects public migration/parity tools and environment act
 
 test("prepared composition permits exact reviewed edges while refusing fresh-start wiring in V1", () => {
   assert.doesNotThrow(() => assertProductionIsolation(PRODUCTION_ENTRY_SOURCE_PATHS.map(path => ({ path, contents: source(path) }))));
-  for (const path of ["src/index.ts", "src/app.ts", "src/v2.ts", "src/v2/app.ts"]) {
+  for (const [path, specifier] of [
+    ["src/index.ts", "./orchestrator/fresh-start/fresh-start-control-plane.js"],
+    ["src/app.ts", "./orchestrator/fresh-start/fresh-start-control-plane.js"],
+    ["src/v2.ts", "./orchestrator/fresh-start/fresh-start-control-plane.js"],
+    ["src/v2/app.ts", "../orchestrator/fresh-start/fresh-start-control-plane.js"],
+  ] as const) {
     assert.throws(() => assertProductionIsolation([{ path,
-      contents: 'import { activate } from "../orchestrator/fresh-start/fresh-start-control-plane.js";' }]), /unapproved prepared composition edge/);
+      contents: `import { activate } from "${specifier}";` }]), /unapproved prepared composition edge/);
   }
+});
+
+test("prepared composition rejects normalized executable entry imports from the worker", () => {
+  for (const contents of [
+    'import "../v2.js";',
+    'import "../v2-admin.js";',
+    'const entry = import("../v2.js");',
+    'const entry = require("../v2-admin.js");',
+    'export { runV2Server } from "../v2.js";',
+    'import "../v2/../v2.js";',
+  ]) assert.throws(() => assertProductionIsolation([{ path: "src/workers/project-store.worker.ts", contents }]),
+    /unapproved prepared composition edge/, contents);
+});
+
+test("prepared composition rejects unapproved same-directory composition imports", () => {
+  for (const contents of [
+    'import "./composition.js";',
+    'const composition = import("./composition.js");',
+    'const composition = require("./composition.js");',
+    'export { createV2Foundation } from "./composition.js";',
+    'import "./../v2/./composition.js";',
+  ]) assert.throws(() => assertProductionIsolation([{ path: "src/v2/build-identity.ts", contents }]),
+    /unapproved prepared composition edge/, contents);
+});
+
+test("prepared composition authorizes normalized caller-target pairs rather than import spelling", () => {
+  for (const contents of [
+    'import "../v2/build-identity.js";',
+    'import "../v2/../v2/./build-identity.js";',
+  ]) assert.doesNotThrow(() => assertProductionIsolation([{ path: "src/workers/project-store.worker.ts", contents }]));
+  assert.doesNotThrow(() => assertProductionIsolation([{ path: "src/v2/app.ts", contents: 'import "./composition.js";' }]));
 });
 
 test("Subproject 3 evaluation guard covers every production entry surface", () => {

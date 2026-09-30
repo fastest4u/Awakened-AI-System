@@ -1,6 +1,6 @@
 # V2 fresh-start Foundation evidence — 2026-09-30
 
-Status: **Task 6 implementation verified locally; independent Task 6 review, whole-F1 review and the root-owned complete suite are pending. Production implementation is incomplete.** Do not read this document as Foundation acceptance or authorization to activate V2. The shipped promotion verifier still denies activation; public content remains unavailable.
+Status: **Task 6 fix round 1 verified locally; scoped independent re-review, whole-F1 review and the root-owned complete suite are pending. Production implementation is incomplete.** Do not read this document as Foundation acceptance or authorization to activate V2. The shipped promotion verifier still denies activation; public content remains unavailable.
 
 ## Candidate and scope
 
@@ -36,6 +36,8 @@ After those gates, a runner-only self-review refinement unreferenced owned proce
 Two intermediate checks deliberately remained failures until corrected: the first runner check was native 1 (6/8), revealing Node's inherited `NODE_TEST_CONTEXT` could suppress child tests yet return zero; the second was native 1 (7/8), revealing Node's alphabetical discovery reordered multiple arguments. The final runner removes that inherited test-runner context only in its own orchestration children and launches each explicit target serially. Controlled compiler exit 23, real test failure, timeout 124, cancellation 130, tree termination and competing-output refusal now have observed passing assertions. No V2 production environment bypass was introduced. A patch-generation replacement-string escaping error caused one intermediate test compilation failure; it was corrected before the final gate.
 
 ## Preserved historical CI lane
+
+Independent Task 6 review found that the original prepared-import test guard missed worker imports of the executable V2 entries and same-directory composition imports. Fix round 1 normalizes literal targets relative to their caller and validates explicit caller/target pairs, including the existing intra-V2 edges. No unauthorized production import was found, and no source allowance/baseline or production behavior changed. Three new mutations failed before repair (native 1, 0/3); the final eight selected import/isolation tests passed (native 0, 8/8, zero skips, 319.8473ms) after test compilation native 0. Logs are `task-6-fix1-*.log`; final test-source SHA256 is `303aaeb5f72d87660de9c4d1aff9e8802d44bf14e60c4e08b6adc2baa25028eb`. Earlier 122/30-test and build results retain their original inputs; neither slow evaluation nor the full suite was repeated for this guard-only repair.
 
 The preserved Task 13B checkout was inspected read-only. Its previous dirty work is not declared passed or copied wholesale. Reconciliation retains the exact nineteen-file synthetic migration alias and private rehearsal alias, strict closed workflow grammar, unique steps, full-history checkout, immutable base and V1 fences, rollout gate, stress lane, minimum-runtime rejection, and classified upload policy. The single named Build step now follows Typecheck and precedes full tests; Foundation and artifact checks follow rollout and synthetic migration.
 
