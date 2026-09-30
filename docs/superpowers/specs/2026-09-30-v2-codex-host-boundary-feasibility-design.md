@@ -1,6 +1,6 @@
 # V2 Codex desktop host-boundary feasibility design
 
-**Status:** Written specification awaiting user review. The user approved the host-first direction on 2026-09-30; that is not approval of this written artifact, an executable plan, host configuration or production activation.
+**Status:** Referenced design authority for the preparation plan explicitly approved by the user on 2026-09-30. The [approved preparation plan](../plans/2026-09-30-v2-codex-host-probe-preparation.md) implements only independent synthetic verification and read-only qualification. This does not approve real-host setup, trust/configuration changes, a new user-owned conversation or production activation; the remaining actual-host requirements still need a reviewed mechanism-specific execution addendum.
 **Authority:** Approved fresh-start production design and delivery roadmap; applicable umbrella sections 9, 10, 14, 19 and 21.8.
 **Target:** The user's current Codex desktop, with empty project-local V2 and no V1 import, retrieval or fallback.
 
@@ -104,6 +104,6 @@ After written-spec approval, prepare the small host-first executable plan using 
 
 After a successful probe, design the production adapter and raw-evidence/governance integration from the proven seams. A production verified V2 read-lease/consistency adapter can be planned independently after F1 acceptance; it is not evidence that the host/privacy boundary is solved.
 
-Self-review: no placeholder host API, unproved desktop impossibility, real-transcript access, plaintext fallback, model-visible bearer field, premature completed end, counterfeit full-adapter claim, automatic client switch or deployment. Unknown capability is an explicit discovery outcome, not a missing success prerequisite silently waived. This written spec remains awaiting the user's review.
+Self-review: no placeholder host API, unproved desktop impossibility, real-transcript access, plaintext fallback, model-visible bearer field, premature completed end, counterfeit full-adapter claim, automatic client switch or deployment. Unknown capability is an explicit discovery outcome, not a missing success prerequisite silently waived. The preparation plan is approved; actual-host execution and the remaining production work are not accepted by that approval.
 
 References: approved `2026-09-29-v2-fresh-start-production-design.md`; delivery roadmap full-visible prerequisite; umbrella sections 9/10/14/19/21.8; `authority-material-adapter.ts`; `contracts/session-end.ts`; existing F2 host-boundary/doc/acceptance reports. Official mechanism background: [Hooks](https://learn.chatgpt.com/docs/hooks), [App server](https://learn.chatgpt.com/docs/app-server). These links describe candidates, not support proof for the current desktop.
