@@ -138,3 +138,36 @@ it("manifest and every frame are frozen against caller mutation", () => {
   assert.throws(() => Object.assign(manifest, { manifestVersion: 2 }), TypeError);
   assert.deepEqual(verifySyntheticHostObservations(manifest, manifest.frames), { ok: true, uniqueFrameCount: 11 });
 });
+
+it("rejects overlong ASCII metadata before Unicode allocation", { concurrency: false }, () => {
+  const fields = [
+    ["frameId", 36], ["projectId", 36], ["workspaceId", 36], ["sessionId", 36],
+    ["childId", 36], ["correlationId", 36], ["previousFrameId", 36],
+    ["contentHash", 64], ["ordinal", 19],
+  ] as const;
+  const originalFrom = Array.from;
+  const allocations: { field: string; codeUnits: number; count: number }[] = [];
+  let watched: string;
+  let count = 0;
+  // Synchronous, narrowly owned instrumentation observes the actual parser path.
+  // Inputs are at most 4096 code units; this never attempts memory exhaustion.
+  Array.from = ((...args: unknown[]) => {
+    if (args[0] === watched) count++;
+    return Reflect.apply(originalFrom, Array, args);
+  }) as typeof Array.from;
+  try {
+    for (const [field, maximum] of fields) {
+      for (const value of ["x".repeat(maximum + 1), "x".repeat(4096), "😀".repeat(Math.floor(maximum / 2) + 1)]) {
+        watched = value;
+        count = 0;
+        const frames = changed(4, { [field]: value });
+        assert.deepEqual(verifySyntheticHostObservations(manifest, frames), { ok: false, reason: "input-invalid" });
+        assert.deepEqual(verifySyntheticHostObservations({ ...manifest, frames } as SyntheticExpectedManifest, manifest.frames), { ok: false, reason: "input-invalid" });
+        allocations.push({ field, codeUnits: value.length, count });
+      }
+    }
+  } finally {
+    Array.from = originalFrom;
+  }
+  assert.deepEqual(allocations.filter(a => a.count !== 0), [], "oversize scalar must not reach Array.from in either observations or expected manifest");
+});

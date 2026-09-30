@@ -36,12 +36,18 @@ function boundedArray(value: unknown, maximum: number): readonly unknown[] {
 
 function parseFrame(value: unknown): SyntheticProbeFrameV1 {
   const record = exactRecord(value, FRAME_KEYS, "frame");
-  const uuid = <T extends string>(v: unknown, field: string): T => parseLifecycleId<T>(parseBoundedString(v, field, 36), field);
-  const hash = parseBoundedString(record.contentHash, "contentHash", 64);
+  const boundedAscii = (v: unknown, field: string, maximum: number): string => {
+    // Canonical UUID/hash/decimal fields are ASCII. Bound code units before the
+    // shared scalar parser allocates Array.from(v) to count Unicode scalars.
+    if (typeof v !== "string" || v.length > maximum) return invalid();
+    return parseBoundedString(v, field, maximum);
+  };
+  const uuid = <T extends string>(v: unknown, field: string): T => parseLifecycleId<T>(boundedAscii(v, field, 36), field);
+  const hash = boundedAscii(record.contentHash, "contentHash", 64);
   if (!/^[0-9a-f]{64}$/.test(hash)) invalid();
   return {
     frameId: uuid<EvidenceFrameId>(record.frameId, "frameId"),
-    ordinal: parseDecimalString(parseBoundedString(record.ordinal, "ordinal", 19), "ordinal"),
+    ordinal: parseDecimalString(boundedAscii(record.ordinal, "ordinal", 19), "ordinal"),
     category: parseEnum(record.category, CATEGORIES, "category"),
     projectId: uuid(record.projectId, "projectId"), workspaceId: uuid(record.workspaceId, "workspaceId"),
     sessionId: uuid<SessionId>(record.sessionId, "sessionId"),
