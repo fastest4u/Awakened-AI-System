@@ -708,7 +708,8 @@ class InternalPlanStoreConnection implements SqliteConnection {
     this.statements.push(sql.trim().replace(/\s+/gu, " ").toUpperCase());
   }
 
-  prepare(_sql: string): SqliteStatement {
+  prepare(sql: string): SqliteStatement {
+    if (sql === "SELECT 1 AS present FROM sqlite_schema WHERE type = 'table' AND name = 'fresh_start_installation'") return { get: () => undefined } as SqliteStatement;
     throw new Error("internal plan harness does not issue raw SQL");
   }
 
@@ -2091,7 +2092,10 @@ describe("CheckpointService transactional enrichment", () => {
       const statements: string[] = [];
       const connection = {
         exec(sql: string) { statements.push(sql.trim().toUpperCase()); },
-        prepare(): SqliteStatement { throw new Error("replay must not prepare SQL through the connection facade"); },
+        prepare(sql: string): SqliteStatement {
+          if (sql === "SELECT 1 AS present FROM sqlite_schema WHERE type = 'table' AND name = 'fresh_start_installation'") return { get: () => undefined } as SqliteStatement;
+          throw new Error("replay must not prepare SQL through the connection facade");
+        },
         close() {},
       } as SqliteConnection;
       const events = {
