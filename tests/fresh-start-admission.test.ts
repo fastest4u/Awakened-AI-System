@@ -130,13 +130,15 @@ async function active(installedRelease = release) {
   return { ...fixture, repository, control, store };
 }
 
-it("the shipped worker refuses a fresh opening without a trusted deployment inspector", async () => {
+it("the unbundled worker refuses a fresh opening without a measured deployment", async () => {
   const fixture = await active();
   const path = fixture.connection.prepare("PRAGMA database_list").get()?.file as string;
   const executor = new ProjectStoreExecutor({ workerUrl: new URL("../src/workers/project-store.worker.js", import.meta.url),
     context: context(dirname(path), path), freshStart: trusted, maxPending: 4, requestTimeoutMs: 10000,
     closeTimeoutMs: 5000, executorLeaseMs: 15000, heartbeatIntervalMs: 5000 });
-  try { await assert.rejects(executor.open(), { code: "FRESH_START_CONTEXT_REQUIRED" }); }
+  // The compiled production entry supplies an independent inspector. Plain tsc
+  // output has neither its embedded generation nor a deployment manifest.
+  try { await assert.rejects(executor.open(), { code: "FRESH_START_BUILD_MISMATCH" }); }
   finally { await executor.close().catch(() => undefined); fixture.cleanup(); }
 });
 

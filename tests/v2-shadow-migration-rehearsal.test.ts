@@ -54,7 +54,7 @@ function cleanBuildFixture(t: TestContext): string {
     fs.writeFileSync(join(root, name), bytes);
   }
   for (const name of ["src", "package.json", "package-lock.json", "tsconfig.json", ".gitignore",
-    "scripts/build.js", "scripts/run-v2-shadow-migration-rehearsal.js"]) copy(name);
+    "scripts/build.js", "scripts/fresh-start-build.js", "scripts/run-v2-shadow-migration-rehearsal.js"]) copy(name);
   const packages = new Set<string>();
   function dependency(name: string, from: string): void {
     let cursor = from, found: string | undefined;
@@ -73,7 +73,8 @@ function cleanBuildFixture(t: TestContext): string {
       if (fs.existsSync(join(original, "node_modules", child, "package.json"))) dependency(child, found);
     }
   }
-  for (const name of ["esbuild", "javascript-obfuscator", "typescript", "zod"]) dependency(name, name === "zod" ? original : join(original, "scripts"));
+  for (const name of ["esbuild", "javascript-obfuscator", "typescript", "zod", "@modelcontextprotocol/sdk"])
+    dependency(name, name === "zod" || name === "@modelcontextprotocol/sdk" ? original : join(original, "scripts"));
   for (const [name, bytes] of captures) {
     assert.deepEqual(fs.readFileSync(join(original, name)), bytes, "capture correspondence at source");
     assert.deepEqual(fs.readFileSync(join(root, name)), bytes, "capture correspondence at destination");
@@ -560,6 +561,7 @@ test("clean current-byte fixture validates provenance and refuses stale or corru
   const originalManifest = fs.readFileSync(manifestPath), manifest = JSON.parse(originalManifest.toString());
   assert.equal(manifest.eligible, true); assert.equal(manifest.commit, fixtureGit(root, ["rev-parse", "HEAD"]).trim());
   assert.match(manifest.buildIdentityHash, /^[0-9a-f]{64}$/);
+  assert.ok(manifest.recipes.some((entry: any) => entry.path === "scripts/fresh-start-build.js"));
   assert.ok(manifest.inputs.some((entry: any) => entry.path.startsWith("node_modules/zod/")));
   await t.test("measured loader preserves exact ordinary esbuild output and complete input set", async () => {
     const esbuild = await import("esbuild");
@@ -581,7 +583,7 @@ test("clean current-byte fixture validates provenance and refuses stale or corru
     { cwd: root, encoding: "utf8", windowsHide: true, timeout: 30000 });
   assert.equal(validate().status, 0);
   await t.test("supplied identity mismatch refuses", () => assert.equal(validate("0".repeat(64)).status, 7));
-  for (const name of ["src/orchestrator/migration/v2-shadow-migration-rehearsal.ts", "tsconfig.json", "scripts/build.js",
+  for (const name of ["src/orchestrator/migration/v2-shadow-migration-rehearsal.ts", "tsconfig.json", "scripts/build.js", "scripts/fresh-start-build.js",
     "node_modules/zod/v3/types.js", "node_modules/esbuild/lib/main.js", "node_modules/typescript/lib/typescript.js", "dist/internal/v2-shadow-migration-rehearsal.js",
     "dist/internal/stable-compatibility-directory.worker.js", "scripts/run-v2-shadow-migration-rehearsal.js"]) {
     await t.test(`changed ${name} refuses`, () => {

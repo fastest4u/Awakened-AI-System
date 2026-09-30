@@ -11,6 +11,8 @@ const outFile = path.join(outDir, 'index.js');
 // Only builtins execute before invalidation, including when a dependency/command cannot load.
 mkdirSync(path.join(outDir, 'internal'), { recursive: true });
 writeFileSync(path.join(outDir, 'internal', 'v2-shadow-migration-build.json'), '{"eligible":false,"schemaVersion":1}\n');
+writeFileSync(path.join(outDir, 'v2-build.json'), '{"schemaVersion":1,"incomplete":true}\n');
+const { freshStartBuild } = await import('./fresh-start-build.js');
 const { rehearsalManifestPath, rehearsalArtifactPaths, rehearsalRecipePaths, rehearsalBuildRoot,
     readBuildBytes, measureBuildFiles, assertBuildFiles, assertBuildResolutionMetadata, assertBuildToolResolution, cleanBuildHead, assertCommittedBuildFiles,
     buildRuntimeIdentity, buildToolIdentity, privateBuildIdentity, buildCanonical, buildDigest, buildRefusal,
@@ -140,6 +142,7 @@ async function build() {
     const config = JSON.parse(readBuildBytes('tsconfig.json'));
     if (config.extends) buildRefusal();
     const measured = measuredPrivateBuild();
+    const freshStart = freshStartBuild(outDir);
 
     console.log('🚀 Step 1: Bundling with esbuild...');
     await esbuild.build({
@@ -204,7 +207,7 @@ async function build() {
     });
 
     console.log('🧵 Step 4: Bundling project-store worker (dist/workers/project-store.worker.js)...');
-    await esbuild.build({
+    const storeWorkerBuild = await esbuild.build({
         entryPoints: ['src/workers/project-store.worker.ts'],
         bundle: true,
         platform: 'node',
@@ -212,8 +215,33 @@ async function build() {
         outfile: path.join(outDir, 'workers', 'project-store.worker.js'),
         target: 'node24.16',
         minify: true,
-        packages: 'external',
+        ...freshStart.options,
     });
+    freshStart.accept(storeWorkerBuild);
+
+    console.log('Bundling prepared-only V2 service and local administration...');
+    const v2Build = await esbuild.build({
+        entryPoints: ['src/v2.ts'],
+        bundle: true,
+        platform: 'node',
+        format: 'esm',
+        outfile: path.join(outDir, 'v2.js'),
+        target: 'node24.16',
+        minify: true,
+        ...freshStart.options,
+    });
+    freshStart.accept(v2Build);
+    const v2AdminBuild = await esbuild.build({
+        entryPoints: ['src/v2-admin.ts'],
+        bundle: true,
+        platform: 'node',
+        format: 'esm',
+        outfile: path.join(outDir, 'v2-admin.js'),
+        target: 'node24.16',
+        minify: true,
+        ...freshStart.options,
+    });
+    freshStart.accept(v2AdminBuild);
 
     console.log('🧵 Step 5: Bundling upgrade phase worker (dist/workers/project-store-upgrade-phase.worker.js)...');
     await esbuild.build({
@@ -283,7 +311,8 @@ async function build() {
         writeFileSync(path.join(rehearsalBuildRoot, rehearsalManifestPath), buildCanonical({ ...body, buildIdentityHash: privateBuildIdentity(body) }) + '\n');
     }
 
-    console.log('✅ Build completed successfully! Output: dist/index.js (MCP server) + dist/cli.js (memory-vault CLI) + dist/workers/project-store.worker.js + dist/workers/project-store-upgrade-phase.worker.js');
+    freshStart.finish();
+    console.log('✅ Build completed successfully! Output: V1 server/CLI, V2 foundation server/admin, workers and private rehearsal artifacts.');
 }
 
 build().catch((error) => {

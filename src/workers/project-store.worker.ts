@@ -1,4 +1,5 @@
 import { parentPort, workerData } from "node:worker_threads";
+import { inspectV2Build } from "../v2/build-identity.js";
 import {
   ProjectStoreWorkerBackend,
   ProjectStoreWorkerBackendError,
@@ -325,6 +326,7 @@ if (role.role === "upgrade") {
     : DEFAULT_APPEND_RETRY_DEADLINE_MS;
   const backend = new ProjectStoreWorkerBackend({
     selfUrl,
+    trustedFreshStartBuildInspector: () => inspectV2Build(selfUrl.href),
     executorLeaseMs,
     appendRetryDeadlineMs,
   });
