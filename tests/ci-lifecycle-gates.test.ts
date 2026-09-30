@@ -259,8 +259,15 @@ const PREPARED_IMPORTS: Readonly<Record<string, readonly string[]>> = {
 const LITERAL_MODULE_WIRING = new RegExp(
   String.raw`(?:from(?:${JAVASCRIPT_TRIVIA})+|import(?:(?:${JAVASCRIPT_TRIVIA})*\((?:${JAVASCRIPT_TRIVIA})*|(?:${JAVASCRIPT_TRIVIA})+)|require(?:${JAVASCRIPT_TRIVIA})*\((?:${JAVASCRIPT_TRIVIA})*)["']([^"']+)["']`, "g",
 );
+const UNSUPPORTED_TEMPLATE_MODULE_WIRING = new RegExp(
+  String.raw`(?:import|require)(?:${JAVASCRIPT_TRIVIA})*\((?:${JAVASCRIPT_TRIVIA})*\x60`,
+);
 
 function normalizedModuleTarget(caller: string, specifier: string): string | null {
+  // This fence intentionally accepts canonical literal spellings only. Raw
+  // JavaScript escapes are not URL escapes; never normalize them as path text
+  // or execute source to decode them (including escaped relative prefixes).
+  assert.ok(!specifier.includes("\\"), "V2_PRODUCTION_ISOLATION: unsupported escaped module literal");
   // Bare packages/builtins are not repository-relative modules. Resolve file
   // URLs and relative literals as Node does before testing the protected target.
   if (!specifier.startsWith(".") && !specifier.startsWith("/") && !specifier.startsWith("file:")) return null;
@@ -272,6 +279,7 @@ function normalizedModuleTarget(caller: string, specifier: string): string | nul
 function assertProductionIsolation(sources: readonly ProductionIsolationSource[]): void {
   for (const candidate of sources) {
     if (PRODUCTION_ENTRY_SOURCE_PATHS.includes(candidate.path)) {
+      assert.doesNotMatch(candidate.contents, UNSUPPORTED_TEMPLATE_MODULE_WIRING, "V2_PRODUCTION_ISOLATION: unsupported template module argument");
       assert.doesNotMatch(candidate.contents, FORBIDDEN_SHADOW_PRODUCTION_MODULE_WIRING, `V2_PRODUCTION_ISOLATION: ${candidate.path} must not import migration/parity/materialization`);
       assert.doesNotMatch(candidate.contents, /(?:from|import|require)[\s\S]{0,40}["'][^"']*(?:tests\/|fixtures\/)[^"']*["']/, "V2_PRODUCTION_ISOLATION: no test fixture wiring");
       assert.doesNotMatch(candidate.contents, FORBIDDEN_SHADOW_ENVIRONMENT, "V2_PRODUCTION_ISOLATION: no environment activation");
@@ -1156,6 +1164,30 @@ test("prepared composition rejects unapproved same-directory composition imports
     'import "./../v2/./composition.js";',
   ]) assert.throws(() => assertProductionIsolation([{ path: "src/v2/build-identity.ts", contents }]),
     /unapproved prepared composition edge/, contents);
+});
+
+for (const [label, path, specifier] of [
+  ["Unicode executable entry", "src/workers/project-store.worker.ts", String.raw`../v\u0032.js`],
+  ["hex executable entry", "src/workers/project-store.worker.ts", String.raw`../v\x32-admin.js`],
+  ["escaped same-directory composition", "src/v2/build-identity.ts", String.raw`\u002e/composition.js`],
+] as const) test(`prepared composition rejects unsupported escaped literals: ${label}`, () => {
+  for (const contents of [
+    `import "${specifier}";`,
+    `import { value } from '${specifier}';`,
+    `const entry = import("${specifier}");`,
+    `const entry = require('${specifier}');`,
+    `export * from "${specifier}";`,
+  ]) assert.throws(() => assertProductionIsolation([{ path, contents }]),
+    /V2_PRODUCTION_ISOLATION: unsupported escaped module literal/, contents);
+});
+
+test("prepared composition rejects unsupported template module arguments", () => {
+  for (const contents of [
+    'const entry = import(`../v2.js`);',
+    'const entry = require(`../v2-admin.js`);',
+    'const entry = import(/* trivia */ `../v${2}.js`);',
+  ]) assert.throws(() => assertProductionIsolation([{ path: "src/workers/project-store.worker.ts", contents }]),
+    /V2_PRODUCTION_ISOLATION: unsupported template module argument/, contents);
 });
 
 test("prepared composition authorizes normalized caller-target pairs rather than import spelling", () => {
