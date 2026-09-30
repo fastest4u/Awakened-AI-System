@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash, randomUUID } from "node:crypto";
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -175,6 +175,37 @@ test("release mismatch and malformed local manifests fail without creating a sto
     const result = f.admin("initialize-fresh"); assert.equal(result.status, 1); assert.match(result.stderr, /FRESH_START_RELEASE_MISMATCH/); assert.equal(existsSync(f.v2VaultRoot), false);
     writeFileSync(join(f.projectRoot, "release.json"), `{${sentinel}`);
     const bad = f.admin("initialize-fresh"); assert.equal(bad.status, 1); assert.ok(!bad.stderr.includes(sentinel)); assert.equal(existsSync(f.v2VaultRoot), false);
+  } finally { f.cleanup(); }
+});
+
+for (const substitute of [false, true]) test(`release manifest refuses archive hardlink content before reading: ${substitute ? "stat/open substitution" : "existing alias"}`, () => {
+  const f = fixture();
+  try {
+    const source = join(f.v1ArchiveRoot, "release-source.json"), alias = join(f.projectRoot, "release.json");
+    const readLog = join(f.projectRoot, "alias-read.log"), swapLog = join(f.projectRoot, "alias-swap.log");
+    writeFileSync(source, JSON.stringify({ credential: sentinel }));
+    if (substitute) writeFileSync(alias, "{}");
+    else linkSync(source, alias);
+    const identity = lstatSync(source, { bigint: true });
+    if (!substitute) {
+      assert.equal(lstatSync(alias, { bigint: true }).ino, identity.ino);
+      assert.equal(identity.nlink, 2n);
+    }
+    // Observe the actual source inode through either a path or descriptor, so an
+    // outside-archive alias cannot evade the existing lexical-path monitor.
+    writeFileSync(f.monitor, readFileSync(f.monitor, "utf8") + `\n(() => {
+const alias=${JSON.stringify(alias)},source=${JSON.stringify(source)},readLog=${JSON.stringify(readLog)},swapLog=${JSON.stringify(swapLog)};
+const stat=fs.statSync.bind(fs),fstat=fs.fstatSync.bind(fs),lstat=fs.lstatSync.bind(fs);
+if(${substitute}){let swapped=false;fs.lstatSync=function(x,...args){const result=lstat(x,...args);if(!swapped&&x===alias){swapped=true;fs.unlinkSync(alias);fs.linkSync(source,alias);append(swapLog,'swapped\\n');}return result;};}
+function isSource(x){try{const s=typeof x==='number'?fstat(x,{bigint:true}):stat(x,{bigint:true});return String(s.dev)===${JSON.stringify(String(identity.dev))}&&String(s.ino)===${JSON.stringify(String(identity.ino))};}catch{return false;}}
+for(const name of ['readFileSync','readSync','readvSync']){const original=fs[name];fs[name]=function(x,...args){const sourceRead=isSource(x);const result=original.call(this,x,...args);if(sourceRead)append(readLog,'archive-alias-content-read\\n');return result;};}
+require('node:module').syncBuiltinESMExports();})();`);
+    const result = f.admin("initialize-fresh");
+    assert.equal(result.status, 1); assert.equal(result.stdout, "");
+    assert.match(result.stderr, /FRESH_START_INPUT_INVALID/); assert.ok(!result.stderr.includes(sentinel));
+    if (substitute) assert.equal(existsSync(swapLog), true, "stat/open substitution did not run");
+    assert.equal(existsSync(readLog), false, "compiled admin read archive content through an outside alias or descriptor");
+    assert.equal(existsSync(f.v2VaultRoot), false);
   } finally { f.cleanup(); }
 });
 

@@ -48,7 +48,7 @@ node dist/v2-admin.js resume-initialization --project-root "C:\project" --v2-vau
 node dist/v2-admin.js status --project-root "C:\project" --v2-vault-root "C:\project\memory-v2" --v1-archive-root "C:\project\memory" --release-manifest "C:\operator\prepared-release.json"
 ```
 
-Keep the release manifest outside V1. Initialization and resume print the validated V2 destination to local stderr before use; stdout contains only the redacted status JSON. The local OS account and machine identify the preparer through a one-way fingerprint. Resume requires the same initialization identity, release, paths and local actor. There is no `activate` command and no public operator-approval field.
+Keep the release manifest outside V1 as an independent, single-link regular file; hardlinked manifests are refused before content is read. Initialization and resume print the validated V2 destination to local stderr before use; stdout contains only the redacted status JSON. The local OS account and machine identify the preparer through a one-way fingerprint. Resume requires the same initialization identity, release, paths and local actor. There is no `activate` command and no public operator-approval field.
 
 Storage placement retains the existing router: non-Git stores use `<V2 vault>/.memory-mcp/v2`; Git-backed stores use `<gitCommonDir>/project-memory/<projectId>/v2`. The descriptor lives in `<V2 vault>/.memory-mcp/project-identity.json`.
 

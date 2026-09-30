@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { lstatSync, readFileSync, realpathSync } from "node:fs";
+import { closeSync, fstatSync, lstatSync, openSync, readSync, realpathSync } from "node:fs";
 import { hostname, userInfo } from "node:os";
 import { isAbsolute } from "node:path";
 import { FreshStartInitializer, type FreshStartInitializeInput } from "../orchestrator/fresh-start/fresh-start-initializer.js";
@@ -23,6 +23,35 @@ function input(argv: readonly string[]): { command: string; values: Record<strin
   return { command, values };
 }
 
+function readReleaseManifest(path: string): string {
+  const before = lstatSync(path, { bigint: true });
+  if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1n || before.size > 16384n) throw new Error();
+  const handle = openSync(path, "r");
+  try {
+    const unchanged = () => {
+      for (const actual of [fstatSync(handle, { bigint: true }), lstatSync(path, { bigint: true })]) {
+        if (!actual.isFile() || actual.isSymbolicLink() || actual.nlink !== 1n) throw new Error();
+        for (const key of ["dev", "ino", "size", "mtimeNs", "ctimeNs"] as const)
+          if (actual[key] !== before[key]) throw new Error();
+      }
+      if (realpathSync.native(path) !== path) throw new Error();
+    };
+    // Bind both the single-link requirement and identity to the actual reader,
+    // before its first content read, even if the checked pathname was replaced.
+    unchanged();
+    const bytes = Buffer.alloc(Number(before.size) + 1);
+    let used = 0;
+    while (used < bytes.length) {
+      const count = readSync(handle, bytes, used, bytes.length - used, null);
+      if (count === 0) break;
+      used += count;
+    }
+    unchanged();
+    if (used !== Number(before.size)) throw new Error();
+    return bytes.subarray(0, used).toString("utf8");
+  } finally { closeSync(handle); }
+}
+
 export async function runV2Admin(argv: readonly string[]): Promise<FreshStartStatus> {
   const { command, values } = input(argv);
   const dummy = "00000000-0000-4000-8000-000000000000";
@@ -35,9 +64,7 @@ export async function runV2Admin(argv: readonly string[]): Promise<FreshStartSta
   if (freshStartPathContains(paths.v1ArchiveRoot, manifestPath)) throw new FreshStartError("FRESH_START_PATH_OVERLAP");
   let manifest: { initializationId: string; release: FreshStartInitializeInput["release"] };
   try {
-    const path = manifestPath, stat = lstatSync(path);
-    if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 16384) throw new Error();
-    const raw = JSON.parse(readFileSync(path, "utf8"));
+    const raw = JSON.parse(readReleaseManifest(manifestPath));
     if (!raw || typeof raw !== "object" || Object.keys(raw).sort().join(",") !== "initializationId,release"
       || typeof raw.initializationId !== "string" || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u.test(raw.initializationId)
       || !raw.release || typeof raw.release !== "object" || ["projectId", "vaultId", "storeId"].some(key => Object.hasOwn(raw.release, key))) throw new Error();
