@@ -1,6 +1,8 @@
 # V2 fresh-start Foundation evidence — 2026-09-30
 
-Status: **Task 6 fix round 2 verified locally; scoped independent re-review, whole-F1 review and the root-owned complete suite are pending. Production implementation is incomplete.** Do not read this document as Foundation acceptance or authorization to activate V2. The shipped promotion verifier still denies activation; public content remains unavailable.
+Status: **Foundation complete, production implementation incomplete.** Task 6 specification/quality review, whole-F1 review with its scoped fix re-review, the five-fixture correction review and the required complete increment regression are accepted. The frozen `npm test` on `1d41c51` ended native 0 on 2026-09-30: 3,187 tests, 3,171 passed, zero failures/cancellations and 16 explicit skips. This accepts F1 only, not activation. The shipped promotion verifier still denies activation; public content remains unavailable.
+
+The earlier run records below preserve their original inputs and intermediate failures. Statements that a review/full suite was pending describe those historical checkpoints; the final reconciliation section supplies the current disposition. They are not relabeled as one combined rerun or immutable binary release.
 
 ## Candidate and scope
 
@@ -25,7 +27,7 @@ No live V1 content was read, imported, searched, displayed, modified, or used as
 | V1 byte fence versus `0e375d4643d4b630f36f874a3bb192e96739ac46` | 0 | `src/app.ts`, `src/index.ts`, controllers, schemas, services |
 | All actual tracked migrations `000[1-7]*` versus `2836eda4ce3f4808c811d6abea98e196f708cb1a` | 0 | Seven files unchanged; migration 8 remains additive |
 | Task 6 `src` diff versus its source base | 0 | No production-source edits in Task 6 |
-| Complete `npm test` | **Pending root gate** | Not run by Task 6; root runs once on the frozen reviewed candidate |
+| Complete `npm test`, corrected frozen candidate `1d41c51` | 0 | 3,187 tests / 238 suites; 3,171 pass, 0 fail/cancel/todo, 16 skips; reporter duration 10,028,765.353 ms |
 
 Raw logs, native outcomes, source/config byte hashes and per-build identities are retained under the ignored plan workspace `.superpowers/sdd/2026-09-29-v2-fresh-start-foundation/` in `task-6-*.log`, `task-6-foundation-inputs.md`, `task-6-report.md` and the final run manifest. Source text goldens normalize line endings; deployed artifacts are hashed as actual native bytes.
 
@@ -122,3 +124,49 @@ The whole-F1 review found one Important remaining guard gap: matching only a quo
 Genuine RED: compilation native 0, ten selected new tests native 1 (one canonical/trivia control passed, nine failed). Eight failures were missing refusals; the type-assertion case was refused only later by the target check, not at the required shape boundary. Intermediate compilation then exited native 2 because the inferred callee variable type was too narrow; an explicit `ts.Expression` annotation corrected it. No tests ran after that failed compilation. Final compilation native 0; selected covering tests native 0, 22/22 passed, zero skips, 1406.6926ms. Coverage includes concatenation, parentheses, variables, conditionals, comma expressions, spread/missing/extra arguments, type assertions, templates, raw escapes, whitespace/block/line-comment trivia, static imports/exports, approved aliases, and real shipped sources. Logs: `task-6-final-wave-*.log`. Final test-source native-byte SHA256: `feaaa0dd6f7762bb6697d168f3c3a6b0ae0a3fe8715a2cc27fa1387c91dfd3da`.
 
 This appends R26 to the carried R1–R25 record. The one final scoped re-review and root-owned frozen complete suite remain pending. No production build, artifact gate, slow evaluator, whole Foundation gate, hosted CI or full suite was rerun in this wave; earlier results retain their original input correspondence. Production implementation remains incomplete and activation remains unavailable.
+
+## Final F1 reconciliation — 2026-09-30
+
+Reviewed code/guard fixes are accepted through `5a17c68238ffda6cc87e14bf79742386129849b9`. The final scoped review addressed the whole-F1 review's one remaining Important finding, with no new Critical/Important or Minor findings. That review was not repeated. The initial full regression on that source genuinely ended native 1: 3,187 tests, 3,166 pass, five failures, 16 skips and zero cancellations. Its original raw output is retained; the failures are not hidden or reclassified as success.
+
+The five failures were strictly test-fixture drift in three files. Correction `bd3592998685baff6749d8c7c44106c45d4c0ece` adds only the exact installation-absence query to two strict legacy connection doubles and updates current-registry expectations to schema 8 in MigrationRunner and provider-keyed qualified-integrity fixtures. Historical migration/rollback assertions and all production/configuration bytes remain unchanged. One compilation and the three entire files passed 71/71, native 0, zero skip/cancel; independent spec and quality review accepted the exact batch. Later fingerprint-lineage assertions were actually reached. The final aggregate below, not the 71-test scope alone, closes the increment.
+
+Before the corrected aggregate, fresh `npm run typecheck` and combined `npm run test:build-artifacts` (including its real build and compiled smokes) ended native 0 on clean `1d41c5186a022e83774b7f3e9f941b137947be0c`. Earlier 122/122 Foundation and other scoped results keep their original input identities; the current full suite covers the reviewed later test corrections. No unnecessary per-fixture repository run or repeated broad review was added.
+
+### Complete corrected aggregate
+
+- Run: `full-suite-1790771147267-22720`; command `npm test`; source `1d41c5186a022e83774b7f3e9f941b137947be0c`.
+- Capture start/end: `2026-09-30T12:25:47.268Z` / `2026-09-30T15:13:40.057Z`; native test exit and capture-wrapper exit both 0, signal null, launchFailure false, captureErrors empty.
+- Actual summary: 3,187 tests, 238 suites, 3,171 passed, 0 failed/cancelled/todo, 16 skipped; reporter duration `10028765.353 ms`. Skips remain skips; hosted CI/Linux/stress capabilities not exercised here are not claimed passed.
+- No indented or top-level failure markers in the complete stdout. Stderr is empty. stdout SHA-256 `ca678d77ffe63e3e5fa60e7ed6e43f5f7c7011a74581acfd854023a0918018cc`; stderr SHA-256 `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`.
+- Capture reports `sourceUnchanged:true`, `configurationUnchanged:true`. Post-compilation and native-end snapshots contain the same 794 files / 145 compiled test files, with zero changed/removed/added files and the same source commit. This is endpoint correspondence, not continuous binary attestation.
+
+Configuration SHA-256 values are identical before/after:
+
+| Input | SHA-256 |
+| --- | --- |
+| `package.json` | `81108d6a08b9fb01d060b919306e54b23378649356a62468b22e5885bc625b59` |
+| `package-lock.json` | `307e5857f8803f7bdc9ba4bacc1f3a11840291d23852d49e4d3bc14fb8d08006` |
+| `tsconfig.json` | `378b844a67cb3ce6606a93fc21980c9b7ef441b5fac129988920984d3ece95e7` |
+| `tsconfig.test.json` | `ba64c0e92b67ce747d4e348b3281600a0e9cab489637649e6c82e188bef409ad` |
+| `.github/workflows/ci.yml` | `cd46e2d12358e093649fc8d464520a0a04efac61071997a5f0900d144f18e498` |
+
+The suite owns a root deployment rebuild. Initial build identity was `bb9ae1015c3a733ef67619616e56be5e5675a0314d47b89e928173a92570102d`; final identity is `917a8696bb87fb67c2b1ebd8ef5cf5a4e287365a28eedc73267b397af0331f83`. The four deployment outputs changed (generation nonce); `deploymentArtifactsUnchanged:false` is retained, not silently rewritten. This accepts a source/config regression run, **not** a single immutable F3 release. Both sets of raw artifact hashes remain in the capture result.
+
+Final deployment-output SHA-256:
+
+| Artifact | SHA-256 |
+| --- | --- |
+| `dist/v2-build.json` | `a344a0cce28433be9ef01479df7a5e5609c6474d283e9a3fce2cac87d4e396ff` |
+| `dist/v2.js` | `826bcf3a0177eac6cb018c7a0b3deed40330fbd61b45f1dc032d4ad2ebd6bd9b` |
+| `dist/v2-admin.js` | `9ee1f084a72b5030828a01c8aac4afdb117121c879e5fd43848384416e64b0f3` |
+| `dist/workers/project-store.worker.js` | `b4ee164593fcf3f2ac4c295fc1a3f3e6f464a863d53d756469578233c9e1e6da` |
+
+Preserved ignored evidence includes the original and corrected `full-suite-*.stdout.log/.stderr.log/.result.json`, `compiled-inputs-1790771441729-21012.json`, `compiled-inputs-1790781276434-6892.json`, `f1-final-wave-rereview.md`, `f1-fixture-alignment-review.md` and the exact fixture batch report/diff. No live V1 migration, client configuration, deployment, hosted CI, push/merge or external upload occurred. F2 public memory/privacy/actual Codex host proof, F3 recovery/exact release and F4 authorized cutover/live checks remain mandatory.
+
+### Remaining controller rulings (R27–R30)
+
+- Ruling R27: One exact three-child existing-compiled checkpoint diagnostic could obtain missing runtime stacks while the original full run continued, using owned fixture roots and no compiler/build/source write. This was failure-driven diagnosis, not a green reassurance rerun. Cost if wrong: shared-output/resource interference would invalidate affected evidence and require serial verification; partial/diagnostic results never imply success.
+- Ruling R28: One exact existing-compiled failed fingerprint-lineage diagnostic could obtain the unavailable assertion stack; no compile/build/source edit or root-artifact change. It confirmed stale current-schema expectations, not a provider defect. Cost if wrong: discovered interference would invalidate affected evidence; original failures and timing remain distinct from the diagnosis.
+- Ruling R29: Correct all five confirmed fixture failures in one three-file batch, permitting only exact installation-absence lookup and current schema-8 target literals; preserve historical assertions and production enforcement, compile once, run whole affected files and obtain one scoped review. Cost if wrong: a newly reached failure or changed historical assertion blocks acceptance; the original native-1 aggregate remains intact.
+- Ruling R30: Separate the actual native test outcome from mutable deployment-output equality in the ignored capture helper. Preserve both initial/final identities and hashes, unchanged-source/config requirements and native/signal/launch/capture failures. This does not waive the aggregate or establish F3 immutable release proof. Cost if wrong: an unattributed artifact change cannot support a binary-release claim and requires attribution; this evidence remains source regression only.
