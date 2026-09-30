@@ -1,0 +1,108 @@
+# V2 fresh-start Foundation evidence — 2026-09-30
+
+Status: **Task 6 implementation verified locally; independent Task 6 review, whole-F1 review and the root-owned complete suite are pending. Production implementation is incomplete.** Do not read this document as Foundation acceptance or authorization to activate V2. The shipped promotion verifier still denies activation; public content remains unavailable.
+
+## Candidate and scope
+
+Production source: `e109f03c9e7c5519deb62ce9d76353424714d6ca` on `codex/v2-fresh-start`; Task 6 changes only its scoped scripts, tests, package/CI configuration and documentation. The Task 6 commit is the commit introducing this evidence. Accepted implementation predecessors include Task 5 `084ac1a` and archive-manifest fix `03c4829`, independently reviewed before this task.
+
+Local platform actually exercised: Windows x64, Node 24.16.0, npm 11.13, SQLite 3.53.0. CI retains Ubuntu and Windows jobs and Node 22.22.3 rejection. Those hosted jobs and Linux behavior were **not executed in this session**.
+
+No live V1 content was read, imported, searched, displayed, modified, or used as fallback. Archive tests used owned synthetic sentinels and instrumented actual compiled filesystem calls. Required V1 canonical metadata inspection is distinct from prohibited content access. No reset, client change, deployment, push, merge or external upload occurred.
+
+## Actual verification
+
+| Command/check | Native outcome | Actual coverage |
+| --- | --- | --- |
+| `npm run test:build`, initial RED | 0 | New test file compiled before implementation |
+| `node --test --test-concurrency=1 dist-test/tests/ci-fresh-start-foundation.test.js`, initial RED | 1 | 8 cases: 1 pass, 7 fail; first assertion was missing focused Foundation alias; runner/smoke absent |
+| `npm run typecheck` | 0 | Production TypeScript |
+| `npm run build` | 0 | Eight reviewed entries, including V2 server/admin and measured worker |
+| `npm run test:v2-fresh-start-foundation` | 0 | One compile; repository 10/10, initializer 23/23, control plane 45/45, admission 26/26, compiled entry 9/9, Foundation CI 9/9; total 122/122, zero skips |
+| `npm run test:build-artifacts` | 0 | Actual compiled worker and schema-8 upgrade; compatibility worker; private rehearsal refusal; fresh-start prepared identity/restart/redaction/content denial/archive isolation |
+| `node --test --test-concurrency=1 --test-reporter=spec dist-test/tests/ci-lifecycle-gates.test.js dist-test/tests/runtime-capabilities.test.js` | 0 | 30/30, zero skips, 202.922 seconds; includes actual sealed retrieval evaluator |
+| Final runner-only refinement: `node --test --test-concurrency=1 --test-reporter=spec dist-test/tests/ci-fresh-start-foundation.test.js` | 0 | 9/9, zero skips, 19.951 seconds; after bounded-exit refinement described below |
+| V1 byte fence versus `0e375d4643d4b630f36f874a3bb192e96739ac46` | 0 | `src/app.ts`, `src/index.ts`, controllers, schemas, services |
+| All actual tracked migrations `000[1-7]*` versus `2836eda4ce3f4808c811d6abea98e196f708cb1a` | 0 | Seven files unchanged; migration 8 remains additive |
+| Task 6 `src` diff versus its source base | 0 | No production-source edits in Task 6 |
+| Complete `npm test` | **Pending root gate** | Not run by Task 6; root runs once on the frozen reviewed candidate |
+
+Raw logs, native outcomes, source/config byte hashes and per-build identities are retained under the ignored plan workspace `.superpowers/sdd/2026-09-29-v2-fresh-start-foundation/` in `task-6-*.log`, `task-6-foundation-inputs.md`, `task-6-report.md` and the final run manifest. Source text goldens normalize line endings; deployed artifacts are hashed as actual native bytes.
+
+The Foundation run measured build identity `d7e9a1964d51edef808ef6e62a78ce0516956dfca600a108ae3db479342a93ec`. The artifact gate subsequently rebuilt the same production sources, yielding a new per-build generation. These are separate actual runs, not one fabricated combined deployment.
+
+After those gates, a runner-only self-review refinement unreferenced owned process handles when OS termination cannot be confirmed, retaining the output lock while allowing bounded failure exit. The final nine-case runner/CI check passed against runner SHA256 `e879b90ee2d228077039732718635fea302d260c89566daeaf92ef5945f83a20`. The earlier 122/122 run is retained with its original input hash and is not relabeled as testing these later runner bytes. Production artifacts, compiled tests and package/CI inputs were unchanged; the root-owned full suite remains pending.
+
+Two intermediate checks deliberately remained failures until corrected: the first runner check was native 1 (6/8), revealing Node's inherited `NODE_TEST_CONTEXT` could suppress child tests yet return zero; the second was native 1 (7/8), revealing Node's alphabetical discovery reordered multiple arguments. The final runner removes that inherited test-runner context only in its own orchestration children and launches each explicit target serially. Controlled compiler exit 23, real test failure, timeout 124, cancellation 130, tree termination and competing-output refusal now have observed passing assertions. No V2 production environment bypass was introduced. A patch-generation replacement-string escaping error caused one intermediate test compilation failure; it was corrected before the final gate.
+
+## Preserved historical CI lane
+
+The preserved Task 13B checkout was inspected read-only. Its previous dirty work is not declared passed or copied wholesale. Reconciliation retains the exact nineteen-file synthetic migration alias and private rehearsal alias, strict closed workflow grammar, unique steps, full-history checkout, immutable base and V1 fences, rollout gate, stress lane, minimum-runtime rejection, and classified upload policy. The single named Build step now follows Typecheck and precedes full tests; Foundation and artifact checks follow rollout and synthetic migration.
+
+The future CI upload selects exactly `${{ runner.temp }}/v2-shadow-migration-functional/evidence.json`, named `v2-shadow-migration-functional-synthetic-${{ matrix.os }}-${{ github.run_id }}-${{ github.run_attempt }}`, with missing-file error and retention 14 days. The existing real fixture producer emits constrained, redacted functional evidence; this is not authorized live-V1 rehearsal or production proof. It also executes in ordinary `npm test`; no duplicate local nineteen-file run was added. The root's complete suite is still required.
+
+Automatic approval review initially rejected the upload configuration and source-allowlist update. The human then explicitly approved the exact synthetic destination/content/name/retention and the exact 63 reviewed source paths at the source base (26 Foundation paths), with no wildcard or baseline change. Scoped retries succeeded. This did not authorize a push, hosted run or current upload. The V1 byte fence, denied public migration/test-fixture/generic append exposure, and exact prepared-composition import edges remain executable checks.
+
+## Remaining limitations and dependencies
+
+- F1 callbacks are trusted synchronous internal code, not an arbitrary hostile JavaScript/SQL sandbox. Native Promise misuse and escaped callback capabilities are covered; rollback-failure recovery remains unverified.
+- Initialization interruption tests inject exceptions at publication boundaries and resume with a new instance. Abrupt OS death can leave `fresh-start-operation.lock`; F1 fails closed. Never remove a lock while a competing writer may be alive. A verified operator recovery procedure remains F3.
+- Recovery captures the real committed tail in the same writer transaction. The Task 4 race evidence observes native `SQLITE_BUSY` before releasing a held writer and retries only inside the fixture after confirmed commit. This conservative fence is not a verified public readable snapshot.
+- F1 measures actual compiled deployment artifacts and runtime, with an independent worker check. This is local artifact integrity, not signed/clean-source F3 release evidence.
+- F2 must deliver public memory operations, content schemas, privacy/governance and verified readable-view semantics through the delivered admission boundary.
+- F3 must deliver production evidence/verifier implementation, backup/restore/replay and verified recovery procedures, release provenance and the actual promotion gate.
+- F4 owns operational archive protection, separately approved client cutover and live verification. F1's path-safety metadata checks do not freeze an archive or switch a client.
+
+## Controller rulings carried forward
+
+The following reproduces every R1–R24 ruling from the controller ledger, including the stated costs if wrong. Ledger order is retained.
+
+- Ruling R1: Add `FreshStartTransaction.insertRelease(release): void` for Task 3's Disabled -> Prepared replacement. It checks installation identity, adds an immutable release only, and does not activate or overwrite anything. Cost if wrong: narrow API adjustment before Task 3; no external state impact.
+
+- Ruling R2: Initialization must distinguish its exclusive owned journal from foreign pre-existing content. Never waive emptiness for unowned files. Cost if wrong: fresh initialization refuses safely; tests must expose recovery gaps.
+
+- Ruling R3: Required canonical-path metadata inspection of V1 is allowed; reading/enumerating historical content is forbidden. Tests instrument content access, not required path stat/realpath. Cost if wrong: privacy boundary misunderstood; review must retain explicit content prohibition.
+
+- Ruling R4: Approved plan test budget prevails: focused tests each task, applicable aggregate gate once at increment boundary, no per-task full suite. Cost if wrong: cross-component issue found at final boundary rather than earlier.
+
+- Ruling R5: Normalize headings from Foundation Task N to Task N for provided task-brief helper, with no scope change. Cost if wrong: documentation heading references only.
+
+- Ruling R6: Root alone performs memory lifecycle start/context/selfcheck/end for this delegated session to avoid known singleton supersession. Agents return durable evidence to root; no direct vault edits. Cost if wrong: individual agent activity logged in root session rather than separate sessions.
+
+- Ruling R7: Enable repository-local Git core.longpaths for Windows checkout, after native worktree creation failed on existing long test filenames. No global setting changed. Cost if wrong: local Git configuration can be unset; filenames themselves unchanged.
+
+- Ruling R8: Task 2's preparation binding to completed foundation checks means the actual local preparation preflight (canonical paths, runtime/schema/build inspection, empty event state and verified empty projection), not a fabricated claim that the entire six-task release gate has already finished. Persist a digest of those actual checks and operator intent. F3's production release evidence remains separate and the shipped F1 promotion verifier denies activation. This resolves a self-test/initialization dependency without claiming missing verification. Cost if wrong: preparation evidence format needs revision before F3; no content availability is enabled.
+
+- Ruling R9: Later task owners may narrowly extend contracts.ts's closed FreshStartErrorCode union for the path/initialization/approval/admission/entry errors their briefs require. Task1 correctly avoided speculative later codes; adding required typed errors is not permission to weaken existing decoders/state-change contracts. Cost if wrong: error contract versioning adjustment before public F2 composition.
+
+- Ruling R10: Task2 may require an internal constructor build-inspection port because actual compiled fresh-start deployment artifacts are delivered in Task5. Missing/unverified inspector fails closed; tests hash their owned fixture artifacts. Task5 must supply real consistent measured deployment identity across admin/server/worker. Existing private migration rehearsal build evidence is not substituted. Cost if wrong: internal constructor/measurement adapter changes before F1 completion; production promotion stays closed.
+
+- Task2 Ruling R12: narrow optional bootstrap constructor hooks reserveStoreId(descriptor,route) and beforeStorePublish path recheck are within Task2's allowed publication/resume seam. Default behavior for existing callers stays unchanged. Journal durably reserves canonical IDs before publication; initialize-local cannot recreate acknowledged/published missing data. Sync/await semantics must enforce completion at the real boundary. Cost if wrong: internal bootstrap seam adjustment; no external activation or source content access.
+
+- Task 1: fix round 1/5 (2 addressed,0 open; async rejection and escaped getter/proxy; commits baf03f2..9f13206). Ruling R11: trusted synchronous internal callbacks, not an arbitrary hostile-JavaScript sandbox; ordinary accidental native Promise rejection remains covered. Reviewer withdrew adversarial Symbol.species variant after finding no production use and confirming no general standard observation without mutating caller/global state. Cost if wrong: future hostile/custom Promise integration needs explicit contract. Final reviewer must see task-1-rereview-1.md and rollback-failure limitation.
+
+- Task2 Ruling R13: The approved interruption contract is fault injection at each publication boundary followed by resume in a new instance. Abrupt OS death may leave the exclusive operation.lock and must fail closed; do not add unsafe stale-lock stealing or claim complete killed-process recovery. Carry the stale-lock/manual recovery procedure limitation to the Task2 report, final review, operations documentation and F3. Cost if wrong: an operator must perform a separately verified recovery procedure after an abrupt death before initialization can resume; availability is reduced, not data silently recreated.
+
+- Ruling R14: Task3 uses trusted server-provider boundary classes that strictly decode/copy/freeze provider results and privately mint runtime-provenance values. No exported raw mint helper, test registration, env bypass or MCP-supplied provider. Constructors are server DI, not proof of authenticated operator consent; F3 supplies real verifiers and F1's shipped verifier stays closed. Tests use fake providers inside that trusted boundary and must reject structural forged results outside it. Cost if wrong: F3 adapter contract needs revision; production activation stays unavailable.
+
+- Ruling R15: Task3's internal policy-only recovery transitions may preserve existing fence values, null until Task4 wires capture, without fabricating zero or claiming writes drained. Task4 must capture actual committed position/hash in the same writer transaction for both operator and automatic recovery. Task3 is not exposed as a standalone production entry. Cost if wrong: incomplete admission boundary until Task4; final F1 gate must not accept it unresolved.
+
+- Ruling R16: Task4 may add FreshStartTransaction.captureRecoveryFence() as a transaction-lifetime-checked delegate using the repository-owned connection and guard, with no raw connection exposure or nested BEGIN. Backend may have a trustedFreshStartBuildInspector internal option; missing measurement refuses fresh opening, worker measurement is independent of requested/echoed hash, and Task5 wires real compiled artifacts. Validate actual release schema identity too. Cost if wrong: narrow internal API needs adaptation before Task5; final F1 cannot pass without real measurement wiring and both recovery paths captured.
+
+- Ruling R17: Add narrow lifecycle-command.processor.ts guard integration plus affected focused tests to Task4 scope, because renewRootLease owns a separate BEGIN IMMEDIATE near1220. Root inspected the actual transaction. Classify that lease operation against explicit housekeeping policy; do not treat every bounded operation as safe. A module-private WeakMap of immutable connection context registered by trusted composition is acceptable, with no command bypass or fresh-missing fallback. Cost if wrong: additional bounded-operation regression; verify actual side effects and preserve legacy behavior.
+
+- Ruling R18: Add a narrow lifecycle-query.service.ts read() admission check inside its existing BEGIN DEFERRED before authority/content reads, because factory-returned runtimes can bypass the outer backend check. Root inspected read() near418 and activeChildDiagnostic's delegation near513. The guard and returned data share one snapshot; no wrapper-only check or nested transaction. Valid authorized direct-runtime negative test plus legacy query regression required. Cost if wrong: protected read behavior regression; keep implementation to this owned boundary and preserve legacy semantics.
+
+- Ruling R19: Task5 may add src/v2/build-identity.ts and, if separation materially helps, scripts/fresh-start-build.js. Independent F1 deployment measurement binds the three actual compiled V2/admin/worker entries and execution dependencies using bundled dependencies, embedded per-build generation nonce, exact emitted artifact hashes and runtime identity. Missing/mismatch refuses with redacted typed errors. Preserve legacy worker behavior, private migration sealing and installed dependency versions. A rebuild may change the identity; release manifests bind the exact build. This is not signed or clean-source F3 release evidence and does not enable promotion. Cost if wrong: internal measurement/release-manifest format must be adjusted before F3; production availability remains closed.
+
+- Ruling R20: Task5 may narrowly update tests/v2-shadow-migration-rehearsal.test.ts's current-byte build fixture to capture scripts/fresh-start-build.js and actual dependencies required by newly bundled V2 entries. Existing fixture copies only old build scripts and esbuild/obfuscator/TypeScript/zod; build.js now unconditionally imports the new helper and builds MCP SDK entries. Preserve capture correspondence, source/index immutability, clean fixture and private migration sealing assertions. Verify the affected real fixture build; do not alter migration business logic or label the old migration release gate complete. Cost if wrong: fixture dependency snapshot adjustment; production behavior unchanged, legacy regression evidence must remain truthful.
+
+- Ruling R21: Task6 may move the single CI Build after Typecheck and before npm test; compiled entry cases require the actual built V2/admin/measurement artifacts in a clean checkout. Reconcile exact-step assertions while preserving lifecycle/immutable-base/V1 byte fence/rollout and classified synthetic migration coverage, plus Foundation and artifact checks. Audit task-6-ci-reconciliation-audit.md is read-only and establishes no old migration gate pass. Cost if wrong: CI execution ordering correction; verify executable workflow contract without weakening legacy or minimum-runtime/stress checks.
+
+- Ruling R22: Add scripts/fresh-start-build.js to rehearsalRecipePaths in scripts/run-v2-shadow-migration-rehearsal.js and the existing stale/corrupted recipe test loop. The new helper executes during build and must be included in direct recipe byte measurement while preserving old clean-source/tool/input/artifact/sealing checks. This is a dependency/provenance integration, not a demonstrated prior bypass; ordinary dirty edits are already rejected by cleanBuildHead. One relevant stale-helper rejection check suffices if entry/worker inputs remain unchanged. Cost if wrong: recipe snapshot adjustment/rebuild of sealed private artifacts; no promotion enabled. Necessary narrow integration under R19's preservation requirement, not an expansion of migration scope.
+
+- Ruling R23: Reject multi-link release manifests before any content read, retain canonical/archive/regular-file guards and redacted typed errors; test actual compiled hardlink alias and actual reader boundary, not only pathname-under-archive instrumentation. File-handle-bound metadata may be used for reader consistency; no unrelated filesystem redesign. Cost if wrong: deliberately hardlinked local manifest must be supplied as independent ordinary file; archive content privacy retained and no promotion enabled. Scoped defect correction is authorized; fresh re-review must inspect084ac1a..fixHEAD only.
+
+- Ruling R24 / direct human scope: exact reviewed current source allowance is63 paths at e109f03 versus sealed68e77fa,26Foundation paths since2836eda. No wildcard/baseline replacement and V1 byte fence plus public migration/generic-append denial unchanged. Root measured protectedV1 native0/no differences. Human explicitly approved this exact reconciliation and historical functional-synthetic/OS/run/attempt artifact naming within one redacted syntheticJSON/retention14, excluding push/launch/uploadnow/liveV1/credentials. Accepted ADR and exact authorization file persisted; original implementer resumes blocked scoped changes. A transient owned CI-parser edit contains duplicated text; root flagged its actual location for mechanical repair before verification, no new runtime scope.
+
+R24 cost if wrong: correct the exact source allowance or synthetic transport classification and repeat affected CI review; no current external upload or production activation is authorized.

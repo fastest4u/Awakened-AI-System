@@ -8,6 +8,41 @@ import test from "node:test";
 
 const ROOT = new URL("../../", import.meta.url);
 
+const MIGRATION_OUTPUT = "${{ runner.temp }}/v2-shadow-migration-functional/evidence.json";
+const SHADOW_MIGRATION_TESTS = [
+  "sqlite-driver", "v2-shadow-migration-contracts", "v2-shadow-migration-runtime", "v1-source-copy",
+  "v2-migration-package", "v2-shadow-migration-repository", "v2-shadow-importer", "v2-imported-event-reader",
+  "v2-shadow-projection", "v2-parity-lifecycle-fixture", "recording-git-command-runner", "v2-snapshot-parity",
+  "retrieval-evaluation", "retrieval-service", "stable-compatibility-directory", "v2-shadow-compatibility",
+  "v2-shadow-migration-runner", "v2-shadow-migration-rehearsal", "ci-lifecycle-gates",
+];
+const SHADOW_MIGRATION_SCRIPT = "npm run test:build && node --test --test-concurrency=1 --test-reporter=spec "
+  + SHADOW_MIGRATION_TESTS.map(name => `dist-test/tests/${name}.test.js`).join(" ");
+
+function assertMigrationScripts(scripts: Record<string, string>, producer: string): void {
+  assert.equal(scripts["test:v2-shadow-migration"], SHADOW_MIGRATION_SCRIPT, "exact complete migration producer gate");
+  assert.equal(scripts["rehearse:v2-shadow-migration"], "npm run build && node scripts/run-v2-shadow-migration-rehearsal.js");
+  assert.equal(scripts["test:build-artifacts"], "npm run build && node scripts/smoke-worker.js && node scripts/smoke-v2-shadow-compatibility.js && node scripts/smoke-v2-fresh-start.js");
+  // Identity/coverage only. Executing this production-backed case proves the
+  // finalized content, immutable publication and redaction; YAML cannot do that.
+  assert.match(producer, /^test\("retains synthetic functional evidence from the fresh compiled rehearsal command", async t => \{$/m);
+}
+const MIGRATION_GATE = [
+  "      - name: Run V2 shadow migration gate",
+  "        env:",
+  `          V2_SHADOW_MIGRATION_TEST_EVIDENCE_OUTPUT: ${MIGRATION_OUTPUT}`,
+  "        run: npm run test:v2-shadow-migration",
+].join("\n");
+const MIGRATION_UPLOAD = [
+  "      - name: Upload V2 shadow migration functional synthetic evidence",
+  "        uses: actions/upload-artifact@v7",
+  "        with:",
+  "          name: v2-shadow-migration-functional-synthetic-${{ matrix.os }}-${{ github.run_id }}-${{ github.run_attempt }}",
+  `          path: ${MIGRATION_OUTPUT}`,
+  "          if-no-files-found: error",
+  "          retention-days: 14",
+].join("\n");
+
 function source(path: string): string {
   return readFileSync(new URL(path, ROOT), "utf8").replace(/\r\n?/g, "\n");
 }
@@ -40,13 +75,69 @@ const EXTENDED_PRODUCTION_ENTRY_PATHS = [
 
 const SEALED_EVALUATOR_BASE = "68e77fa10165c99243ded1e8c1c80d1e0f7da92f";
 const APPROVED_SEALED_AND_ROLLOUT_SOURCE_DIFF = Object.freeze([
+  "src/orchestrator/fresh-start/contracts.ts",
+  "src/orchestrator/fresh-start/fresh-start-admission.ts",
+  "src/orchestrator/fresh-start/fresh-start-control-plane.ts",
+  "src/orchestrator/fresh-start/fresh-start-initializer.ts",
+  "src/orchestrator/fresh-start/fresh-start-paths.ts",
+  "src/orchestrator/fresh-start/fresh-start.repository.ts",
+  "src/orchestrator/fresh-start/operator-approval.ts",
   "src/orchestrator/identity/git-workspace.resolver.ts",
+  "src/orchestrator/lifecycle/lifecycle-command.processor.ts",
+  "src/orchestrator/lifecycle/lifecycle-command.store.ts",
+  "src/orchestrator/lifecycle/lifecycle-operational.store.ts",
+  "src/orchestrator/lifecycle/lifecycle-query.service.ts",
+  "src/orchestrator/materialization/stable-compatibility-directory.ts",
+  "src/orchestrator/materialization/stable-compatibility-directory.worker.ts",
+  "src/orchestrator/materialization/v2-shadow-compatibility.materializer.ts",
+  "src/orchestrator/migration/v1-source-copy.ts",
+  "src/orchestrator/migration/v2-imported-event-reader.ts",
+  "src/orchestrator/migration/v2-migration-package.ts",
+  "src/orchestrator/migration/v2-shadow-importer.ts",
+  "src/orchestrator/migration/v2-shadow-migration-evidence.ts",
+  "src/orchestrator/migration/v2-shadow-migration-rehearsal.ts",
+  "src/orchestrator/migration/v2-shadow-migration-runner.ts",
+  "src/orchestrator/migration/v2-shadow-migration-runtime.ts",
+  "src/orchestrator/migration/v2-shadow-migration.contracts.ts",
+  "src/orchestrator/migration/v2-shadow-projection.ts",
+  "src/orchestrator/parity/v2-expected-difference.ts",
+  "src/orchestrator/parity/v2-snapshot-parity.ts",
+  "src/orchestrator/projections/builder.ts",
+  "src/orchestrator/projections/checksum.ts",
+  "src/orchestrator/projections/contracts.ts",
+  "src/orchestrator/projections/event-reader.ts",
+  "src/orchestrator/projections/folds.ts",
+  "src/orchestrator/projections/integrity.ts",
+  "src/orchestrator/projections/manifest.ts",
+  "src/orchestrator/projections/schema.ts",
+  "src/orchestrator/projections/source-event-codec.ts",
+  "src/orchestrator/retrieval/contracts.ts",
+  "src/orchestrator/retrieval/evaluation.ts",
+  "src/orchestrator/retrieval/service.ts",
   "src/orchestrator/rollout/rollout-cohort.ts",
   "src/orchestrator/rollout/rollout-control-plane.ts",
+  "src/orchestrator/runtime/project-store-executor.ts",
+  "src/orchestrator/runtime/project-store-worker-backend.ts",
+  "src/orchestrator/runtime/worker-protocol.ts",
+  "src/orchestrator/storage/event-append-transaction.ts",
   "src/orchestrator/storage/migrations/0006-v2-rollout-control-plane.ts",
+  "src/orchestrator/storage/migrations/0007-v2-shadow-migration.ts",
+  "src/orchestrator/storage/migrations/0008-v2-fresh-start.ts",
   "src/orchestrator/storage/migrations/registry.ts",
+  "src/orchestrator/storage/node-sqlite-driver.ts",
+  "src/orchestrator/storage/project-store-bootstrap.service.ts",
   "src/orchestrator/storage/rollout-control-plane.repository.ts",
   "src/orchestrator/storage/session-end.repository.ts",
+  "src/orchestrator/storage/sqlite-driver.ts",
+  "src/orchestrator/storage/v2-shadow-migration.repository.ts",
+  "src/v2-admin.ts",
+  "src/v2.ts",
+  "src/v2/admin.ts",
+  "src/v2/app.ts",
+  "src/v2/build-identity.ts",
+  "src/v2/composition.ts",
+  "src/v2/config.ts",
+  "src/workers/project-store.worker.ts",
 ]);
 const VALID_V2_AGGREGATE = Object.freeze({
   corpusVersion: "retrieval-evaluation-v2",
@@ -81,6 +172,7 @@ function typescriptFiles(directory: string): readonly string[] {
 
 const PRODUCTION_CONTROLLER_PATHS = typescriptFiles("src/controllers");
 const PRODUCTION_ENTRY_SOURCE_PATHS = Object.freeze([
+  "src/v2.ts", "src/v2-admin.ts", ...typescriptFiles("src/v2"),
   "src/app.ts",
   "src/index.ts",
   "src/cli.ts",
@@ -143,11 +235,39 @@ const JAVASCRIPT_TRIVIA = String.raw`(?:\s|\/\*[\s\S]*?\*\/|\/\/[^\r\n]*(?:\r?\n
 const FORBIDDEN_V2_PRODUCTION_MODULE_WIRING = new RegExp(
   String.raw`(?:from(?:${JAVASCRIPT_TRIVIA})+|import(?:(?:${JAVASCRIPT_TRIVIA})*\((?:${JAVASCRIPT_TRIVIA})*|(?:${JAVASCRIPT_TRIVIA})+)|require(?:${JAVASCRIPT_TRIVIA})*\((?:${JAVASCRIPT_TRIVIA})*)["'][^"']*(?:\/(?:projections|retrieval)\/(?:v2-[^"']*|evaluation)|\/runtime\/(?:projection-runtime|v2-[^"']*)|\/orchestrator\/rollout\/)[^"']*["']`,
 );
-const FORBIDDEN_V2_PRODUCTION_TOOL_REGISTRATION = /registerTool\(\s*["']memory_(?:retrieval|projection)/;
+const FORBIDDEN_SHADOW_PRODUCTION_MODULE_WIRING = new RegExp(
+  String.raw`(?:from(?:${JAVASCRIPT_TRIVIA})+|import(?:(?:${JAVASCRIPT_TRIVIA})*\((?:${JAVASCRIPT_TRIVIA})*|(?:${JAVASCRIPT_TRIVIA})+)|require(?:${JAVASCRIPT_TRIVIA})*\((?:${JAVASCRIPT_TRIVIA})*)["'][^"']*(?:\/(?:migration|parity)\/|\/materialization\/(?:v2-shadow-compatibility|stable-compatibility-directory))[^"']*["']`,
+);
+const FORBIDDEN_V2_PRODUCTION_TOOL_REGISTRATION = /registerTool\(\s*["']memory_(?:retrieval|projection|migration|parity|appendEvent|eventAppend)/;
+const FORBIDDEN_SHADOW_ENVIRONMENT = /process\s*\.\s*env\s*(?:\.\s*[A-Za-z0-9_]*(?:V2|SHADOW_MIGRATION)[A-Za-z0-9_]*|\[\s*["'][^"']*(?:V2|SHADOW_MIGRATION)[^"']*["']\s*\])/i;
+
+// Only these reviewed prepared-composition edges may cross the old V1-only
+// fence. No directory-prefix exemption grants future callers the same access.
+const PREPARED_IMPORTS: Readonly<Record<string, readonly string[]>> = {
+  "src/v2.ts": ["./v2/app.js", "./v2/config.js"],
+  "src/v2-admin.ts": ["./v2/admin.js", "./v2/config.js"],
+  "src/v2/admin.ts": ["../orchestrator/fresh-start/fresh-start-initializer.js", "../orchestrator/fresh-start/fresh-start-paths.js", "../orchestrator/fresh-start/contracts.js"],
+  "src/v2/app.ts": ["../orchestrator/fresh-start/contracts.js"],
+  "src/v2/config.ts": ["../orchestrator/fresh-start/contracts.js", "../orchestrator/fresh-start/fresh-start-paths.js"],
+  "src/v2/composition.ts": ["../orchestrator/fresh-start/fresh-start-initializer.js", "../orchestrator/fresh-start/fresh-start-paths.js", "../orchestrator/fresh-start/contracts.js", "../orchestrator/fresh-start/fresh-start.repository.js", "../orchestrator/fresh-start/operator-approval.js"],
+  "src/v2/build-identity.ts": ["../orchestrator/fresh-start/contracts.js"],
+  "src/workers/project-store.worker.ts": ["../v2/build-identity.js"],
+  "src/orchestrator/runtime/project-store-executor.ts": ["../fresh-start/fresh-start-admission.js"],
+  "src/orchestrator/runtime/project-store-worker-backend.ts": ["../fresh-start/fresh-start-admission.js", "../fresh-start/contracts.js"],
+  "src/orchestrator/runtime/worker-protocol.ts": ["../fresh-start/fresh-start-admission.js"],
+};
+const PREPARED_MODULE_WIRING = new RegExp(
+  String.raw`(?:from(?:${JAVASCRIPT_TRIVIA})+|import(?:(?:${JAVASCRIPT_TRIVIA})*\((?:${JAVASCRIPT_TRIVIA})*|(?:${JAVASCRIPT_TRIVIA})+)|require(?:${JAVASCRIPT_TRIVIA})*\((?:${JAVASCRIPT_TRIVIA})*)["']([^"']*(?:\/fresh-start\/|\/v2\/)[^"']*)["']`, "g",
+);
 
 function assertProductionIsolation(sources: readonly ProductionIsolationSource[]): void {
   for (const candidate of sources) {
     if (PRODUCTION_ENTRY_SOURCE_PATHS.includes(candidate.path)) {
+      assert.doesNotMatch(candidate.contents, FORBIDDEN_SHADOW_PRODUCTION_MODULE_WIRING, `V2_PRODUCTION_ISOLATION: ${candidate.path} must not import migration/parity/materialization`);
+      assert.doesNotMatch(candidate.contents, /(?:from|import|require)[\s\S]{0,40}["'][^"']*(?:tests\/|fixtures\/)[^"']*["']/, "V2_PRODUCTION_ISOLATION: no test fixture wiring");
+      assert.doesNotMatch(candidate.contents, FORBIDDEN_SHADOW_ENVIRONMENT, "V2_PRODUCTION_ISOLATION: no environment activation");
+      for (const edge of candidate.contents.matchAll(PREPARED_MODULE_WIRING)) assert.ok(
+        PREPARED_IMPORTS[candidate.path]?.includes(edge[1]!), "V2_PRODUCTION_ISOLATION: unapproved prepared composition edge");
       assert.doesNotMatch(
         candidate.contents,
         FORBIDDEN_V2_PRODUCTION_MODULE_WIRING,
@@ -233,6 +353,7 @@ function assertRealBridgeDataflow(bridge: string): void {
 
 function assertNoV2EntryWiring(entry: string): void {
   assert.doesNotMatch(entry, FORBIDDEN_V2_PRODUCTION_MODULE_WIRING, "V2 entry wiring is forbidden");
+  assert.doesNotMatch(entry, FORBIDDEN_SHADOW_PRODUCTION_MODULE_WIRING, "V2 entry wiring is forbidden");
 }
 
 function runRetrievalEvaluation(...targets: readonly string[]) {
@@ -342,8 +463,12 @@ function assertCanonicalWorkflowGrammar(yaml: string, label: string): void {
 
 function workflowJobs(yaml: string): ReadonlyMap<string, string> {
   const jobs = new Map<string, string>();
-  const matches = [...yaml.matchAll(/^  ([a-z][a-z0-9_-]*):\n([\s\S]*?)(?=^  [a-z][a-z0-9_-]*:|(?![\s\S]))/gm)];
-  for (const match of matches) jobs.set(match[1]!, match[0]!);
+  const jobSection = yaml.slice(yaml.indexOf("\njobs:\n") + "\njobs:\n".length);
+  const matches = [...jobSection.matchAll(/^  ([a-z][a-z0-9_-]*):\n([\s\S]*?)(?=^  [a-z][a-z0-9_-]*:|(?![\s\S]))/gm)];
+  for (const match of matches) {
+    assert.ok(!jobs.has(match[1]!), "duplicate workflow job");
+    jobs.set(match[1]!, match[0]!);
+  }
   return jobs;
 }
 
@@ -363,7 +488,8 @@ function normalizeYamlScalar(raw: string): string {
 }
 
 function yamlScalar(block: string, key: string): string | null {
-  const match = new RegExp(`(?:^|\\n)\\s*${key}:\\s*(.+)$`, "m").exec(block);
+  const indent = key === "max-parallel" ? 6 : ["path", "fetch-depth"].includes(key) ? 10 : 8;
+  const match = new RegExp(`^ {${indent}}${key}: *(.*)$`, "m").exec(block);
   return match === null ? null : normalizeYamlScalar(match[1]!);
 }
 
@@ -390,7 +516,9 @@ function assertNoJobBypass(job: string, label: string): void {
 }
 
 function requiredStep(job: string, name: string): WorkflowStep {
-  const step = workflowSteps(job).find((candidate) => candidate.name === name);
+  const candidates = workflowSteps(job).filter((candidate) => candidate.name === name);
+  assert.equal(candidates.length, 1, `exactly one executable ${name} step is required`);
+  const step = candidates[0];
   assert.ok(step, `missing executable ${name} step`);
   assert.equal(yamlScalar(step.body, "if"), null, `${name} must not declare if`);
   assert.equal(
@@ -414,11 +542,74 @@ function workflowActions(job: string, ownerJob: string): readonly {
     })));
 }
 
+// This is deliberately a closed subset, not a general YAML parser. Validate
+// hierarchy before the bounded scalar readers can see a nested or duplicate key.
+function assertWorkflowStructure(yaml: string): void {
+  const maps: Record<string, readonly string[]> = {
+    "": ["name", "on", "permissions", "concurrency", "jobs"],
+    "on": ["push", "pull_request", "workflow_dispatch", "schedule"],
+    "on/schedule/*": ["cron"],
+    "permissions": ["contents"],
+    "concurrency": ["group", "cancel-in-progress"],
+    "jobs": ["release-gates", "minimum-runtime-rejection", "stress"],
+    "jobs/*": ["name", "runs-on", "strategy", "steps", "if", "continue-on-error"],
+    "jobs/*/strategy": ["fail-fast", "max-parallel", "matrix"],
+    "jobs/*/strategy/matrix": ["os", "node-version"],
+    "jobs/*/steps/*": ["name", "uses", "run", "shell", "with", "env", "if", "continue-on-error"],
+    "jobs/*/steps/*/with": ["name", "path", "if-no-files-found", "retention-days", "fetch-depth", "node-version"],
+    "jobs/*/steps/*/env": ["V2_SHADOW_MIGRATION_TEST_EVIDENCE_OUTPUT"],
+  };
+  const lists = new Set(["on/schedule", "jobs/*/steps", "jobs/*/strategy/matrix/os", "jobs/*/strategy/matrix/node-version"]);
+  type Frame = { indent: number; path: string; list: boolean; keys: Set<string> };
+  const stack: Frame[] = [{ indent: 0, path: "", list: false, keys: new Set() }];
+  for (const line of structuralWorkflowLines(yaml)) {
+    if (!line.trim() || line.trimStart().startsWith("#")) continue;
+    const indent = /^ */.exec(line)![0].length;
+    while (stack.length > 1 && indent < stack[stack.length - 1]!.indent) stack.pop();
+    let frame = stack[stack.length - 1]!;
+    assert.equal(indent, frame.indent, "unsupported YAML nesting or indentation");
+    let text = line.trim();
+    if (text.startsWith("- ")) {
+      assert.ok(frame.list, "list requires an approved sequence parent");
+      text = text.slice(2);
+      if (frame.path.includes("/matrix/")) {
+        assert.ok(/^(?:[a-z][a-z0-9-]*|"[0-9.]+")$/.test(text), "matrix items must be literal scalars");
+        continue;
+      }
+      frame = { indent: indent + 2, path: `${frame.path}/*`, list: false, keys: new Set() };
+      stack.push(frame);
+    } else assert.equal(frame.list, false, "sequence item must begin with dash");
+    const pair = /^([A-Za-z][A-Za-z0-9_-]*):(?: (.*))?$/.exec(text);
+    assert.ok(pair, "mapping must be a canonical key/value");
+    const key = pair[1]!, value = pair[2] ?? "";
+    assert.ok(maps[frame.path]?.includes(key), `unsupported YAML key or parent: ${frame.path}/${key}`);
+    assert.ok(!frame.keys.has(key), `duplicate YAML key: ${frame.path}/${key}`);
+    frame.keys.add(key);
+    const child = frame.path === "jobs" ? "jobs/*" : frame.path ? `${frame.path}/${key}` : key;
+    if (maps[child] || lists.has(child)) {
+      assert.equal(value, "", `container must not have a scalar: ${child}`);
+      stack.push({ indent: frame.indent + 2, path: child, list: lists.has(child), keys: new Set() });
+    } else {
+      assert.ok(value !== "" || frame.path === "on", `scalar must not be a nested mapping: ${child}`);
+      if (value === "|") assert.equal(key, "run");
+    }
+  }
+}
+
+function compactStep(body: string): string {
+  return body.split("\n").filter(line => line.trim() !== "" && !line.trimStart().startsWith("#"))
+    .map(line => line.trim()).join("\n");
+}
+
 function assertWorkflowReleaseContract(ci: string, stress: string): void {
   assertCanonicalWorkflowGrammar(ci, "CI workflow");
   assertCanonicalWorkflowGrammar(stress, "stress workflow");
+  assertWorkflowStructure(ci);
+  assertWorkflowStructure(stress);
   const ciJobs = workflowJobs(ci);
   const stressJobs = workflowJobs(stress);
+  assert.deepEqual([...ciJobs.keys()], ["release-gates", "minimum-runtime-rejection"]);
+  assert.deepEqual([...stressJobs.keys()], ["stress"]);
   const releaseGates = ciJobs.get("release-gates");
   const minimumRuntime = ciJobs.get("minimum-runtime-rejection");
   const stressJob = stressJobs.get("stress");
@@ -428,6 +619,17 @@ function assertWorkflowReleaseContract(ci: string, stress: string): void {
   assertNoJobBypass(releaseGates!, "release-gates job");
   assertNoJobBypass(minimumRuntime!, "minimum-runtime-rejection job");
   assertNoJobBypass(stressJob!, "stress job");
+  for (const job of [...ciJobs.values(), ...stressJobs.values()]) {
+    const steps = workflowSteps(job);
+    const names = steps.map(step => step.name);
+    assert.ok(names.every(name => name !== null), "every executable step must be named");
+    assert.equal(new Set(names).size, names.length, "duplicate executable step name");
+    for (const step of steps) {
+      if (step.name !== "Upload stress logs") requiredStep(job, step.name!);
+      assert.equal(yamlScalar(step.body, "continue-on-error"), null, "no step may suppress failures");
+      if (step.name !== "Run V2 shadow migration gate") assert.equal(yamlScalar(step.body, "env"), null);
+    }
+  }
   const checkouts = [...ciJobs.entries(), ...stressJobs.entries()]
     .flatMap(([ownerJob, job]) => workflowSteps(job, ownerJob))
     .filter((step) => step.name === "Check out repository");
@@ -436,6 +638,8 @@ function assertWorkflowReleaseContract(ci: string, stress: string): void {
     assert.equal(yamlScalar(checkout.body, "if"), null, "checkout must not declare if");
     assert.equal(yamlScalar(checkout.body, "uses"), "actions/checkout@v6");
     assert.equal(yamlScalar(checkout.body, "fetch-depth"), "0");
+    assert.equal(compactStep(checkout.body), "name: Check out repository\nuses: actions/checkout@v6\nwith:\nfetch-depth: 0",
+      "checkout must retain its exact full-history configuration");
   }
   assert.equal(yamlScalar(requiredStep(releaseGates!, "Run lifecycle release gates").body, "run"), "npm run test:subproject-2");
   assert.equal(yamlScalar(requiredStep(releaseGates!, "Require immutable lifecycle base commit").body, "run"), `git cat-file -e "${BASE}^{commit}"`);
@@ -447,13 +651,44 @@ function assertWorkflowReleaseContract(ci: string, stress: string): void {
   assert.equal(rolloutGateIndex, protectedRoutingIndex + 1, "the rollout control-plane gate must immediately follow the Version 1 routing guard");
   assert.equal(yamlScalar(requiredStep(releaseGates!, "Build").body, "run"), "npm run build");
   assert.equal(yamlScalar(requiredStep(releaseGates!, "Test build artifacts").body, "run"), "npm run test:build-artifacts");
+  const expectedReleaseSteps = [
+    "name: Check out repository\nuses: actions/checkout@v6\nwith:\nfetch-depth: 0",
+    "name: Set up Node.js\nuses: actions/setup-node@v6\nwith:\nnode-version: ${{ matrix.node-version }}",
+    "name: Install dependencies\nrun: npm ci",
+    "name: Check runtime capabilities\nrun: npm run check:runtime",
+    "name: Typecheck\nrun: npm run typecheck",
+    "name: Build\nrun: npm run build",
+    "name: Run tests\nrun: npm test",
+    "name: Run lifecycle release gates\nrun: npm run test:subproject-2",
+    `name: Require immutable lifecycle base commit\nrun: git cat-file -e "${BASE}^{commit}"`,
+    `name: Protect Version 1 production routing\nrun: git diff --exit-code ${BASE} -- src/app.ts src/index.ts src/controllers src/schemas src/services`,
+    "name: Run V2 rollout control-plane gate\nrun: npm run test:rollout-control-plane",
+    compactStep(MIGRATION_GATE.replace("      - ", "")),
+    "name: Run V2 fresh-start foundation gate\nrun: npm run test:v2-fresh-start-foundation",
+    "name: Test build artifacts\nrun: npm run test:build-artifacts",
+    compactStep(MIGRATION_UPLOAD.replace("      - ", "")),
+  ];
+  assert.deepEqual(releaseSteps.map(step => compactStep(step.body)), expectedReleaseSteps,
+    "release steps must match the exact unconditional producer/build/upload order");
+  assert.equal(ci.split("V2_SHADOW_MIGRATION_TEST_EVIDENCE_OUTPUT").length - 1, 1, "exactly one producer output setting");
+  assert.ok(!stress.includes("V2_SHADOW_MIGRATION_TEST_EVIDENCE_OUTPUT"), "stress must not select migration output");
   assert.equal(workflowSteps(minimumRuntime!).filter((step) => step.name === "Check out repository").length, 1);
-  assert.match(stressJob!, /max-parallel: 1/);
+  assert.equal(yamlScalar(stressJob!, "max-parallel"), "1", "stress must remain serial");
+  assert.deepEqual(workflowSteps(stressJob!).map(step => step.name), [
+    "Check out repository", "Set up Node.js", "Install dependencies", "Build tests",
+    "Run default and lifecycle concurrent, crash, and security tests", "Run release stress test",
+    "Run lifecycle stress test", "Upload stress logs",
+  ], "stress gate and uploader order must remain unchanged");
+  assert.deepEqual(workflowSteps(minimumRuntime!).map(step => step.name), [
+    "Check out repository", "Set up Node.js 22.22.3", "Require the documented minimum-runtime rejection",
+  ]);
   assert.match(requiredStep(stressJob!, "Run default and lifecycle concurrent, crash, and security tests").body, /event-store\.concurrent\.test\.js.*event-store\.crash\.test\.js.*lifecycle\.concurrent\.test\.js.*lifecycle\.crash\.test\.js.*lifecycle\.security\.test\.js/s);
   assert.match(requiredStep(stressJob!, "Run release stress test").body, /npm run test:stress/);
   assert.match(requiredStep(stressJob!, "Run lifecycle stress test").body, /npm run test:lifecycle-stress/);
-  const actions = [...ciJobs.entries(), ...stressJobs.entries()]
-    .flatMap(([ownerJob, job]) => workflowActions(job, ownerJob));
+  const actions = [
+    ...[...ciJobs].flatMap(([ownerJob, job]) => workflowActions(job, ownerJob).map(action => ({ ...action, workflow: "ci.yml" }))),
+    ...[...stressJobs].flatMap(([ownerJob, job]) => workflowActions(job, ownerJob).map(action => ({ ...action, workflow: "sqlite-stress.yml" }))),
+  ];
   for (const action of actions) {
     assert.ok(action.uses.length > 0, "workflow action must have a non-empty uses scalar");
     if (action.withPath !== null) {
@@ -461,15 +696,35 @@ function assertWorkflowReleaseContract(ci: string, stress: string): void {
     }
   }
   const uploads = actions.filter((action) => action.uses.startsWith("actions/upload-artifact@"));
-  assert.equal(uploads.length, 1, "exactly one upload-artifact v7 step is allowed");
-  const [upload] = uploads;
-  assert.equal(upload?.step.ownerJob, "stress", "upload artifact must belong to stress");
-  assert.equal(upload?.uses, "actions/upload-artifact@v7");
-  assert.equal(yamlScalar(upload?.step.body ?? "", "if"), "always()", "upload must use exact always() reachability");
-  assert.equal(upload?.withPath, "ci-logs/sqlite-stress-${{ matrix.os }}.log");
-  assert.match(upload?.step.body ?? "", /retention-days: 14/);
-  assert.doesNotMatch(upload?.withPath ?? "", /\*\.sqlite\*|\.memory-mcp|pending[-_ ]?(authorization|credential)|\.md\b/i);
+  assert.equal(uploads.length, 2, "exactly two classified upload-artifact slots are allowed");
+  assert.deepEqual(uploads.map(upload => ({ workflow: upload.workflow, owner: upload.step.ownerJob,
+    step: upload.step.name, action: upload.uses })), [
+    { workflow: "ci.yml", owner: "release-gates", step: "Upload V2 shadow migration functional synthetic evidence", action: "actions/upload-artifact@v7" },
+    { workflow: "sqlite-stress.yml", owner: "stress", step: "Upload stress logs", action: "actions/upload-artifact@v7" },
+  ], "upload manifest must preserve workflow, owner, step, action and classification order");
+  const stressUpload = uploads[1]!;
+  assert.equal(compactStep(stressUpload.step.body), [
+    "name: Upload stress logs", "if: ${{ always() }}", "uses: actions/upload-artifact@v7", "with:",
+    "name: sqlite-stress-logs-${{ matrix.os }}-${{ github.run_id }}-${{ github.run_attempt }}",
+    "path: ci-logs/sqlite-stress-${{ matrix.os }}.log", "if-no-files-found: error", "retention-days: 14",
+  ].join("\n"), "stress upload must retain its exact historical transport policy");
+  assert.equal(workflowSteps(stressJob!).at(-1)?.name, "Upload stress logs", "stress upload must follow its gates");
 }
+
+test("migration package scripts require the complete compiled producer and both built smokes", () => {
+  const scripts = (JSON.parse(source("package.json")) as { scripts: Record<string, string> }).scripts;
+  const producer = source("tests/v2-shadow-migration-rehearsal.test.ts");
+  assertMigrationScripts(scripts, producer);
+  for (const replacement of [
+    SHADOW_MIGRATION_SCRIPT.replace(" dist-test/tests/v2-shadow-migration-rehearsal.test.js", ""),
+    SHADOW_MIGRATION_SCRIPT.replace(" --test-reporter=spec", " --test-reporter=spec --test-name-pattern=preflight"),
+    SHADOW_MIGRATION_SCRIPT + " || true", "echo '{}' > evidence.json", "cp stale.json evidence.json",
+  ]) assert.throws(() => assertMigrationScripts({ ...scripts, "test:v2-shadow-migration": replacement }, producer));
+  assert.throws(() => assertMigrationScripts(scripts, producer.replace(
+    'test("retains synthetic functional evidence', 'test.skip("retains synthetic functional evidence')));
+  assert.throws(() => assertMigrationScripts(scripts, producer.replace(
+    "retains synthetic functional evidence from the fresh compiled rehearsal command", "preflight refusal only")));
+});
 
 test("release configuration gates lifecycle V2 without production routing", () => {
   const packageJson = JSON.parse(source("package.json")) as { scripts?: Record<string, string> };
@@ -491,6 +746,8 @@ test("release configuration gates lifecycle V2 without production routing", () =
   const smoke = source("scripts/smoke-worker.js");
   assert.match(smoke, /\[1,2,3,4,5,6,7,8\]/);
   assert.match(smoke, /schemaVersion !== 8/);
+  assert.match(smoke, /migration0007\?\.name !== "v2-shadow-migration"/);
+  assert.match(smoke, /migration0007\?\.checksum !== "fc3becb6329a7bcbc9c6775c436260a61cca6dffa432f8817bc583623df2c32a"/);
   assert.match(smoke, /manifest\.schemaVersion !== 1/);
   assert.match(smoke, new RegExp(FROZEN_0002));
   assert.match(smoke, new RegExp(FROZEN_0002_SQL));
@@ -511,6 +768,109 @@ test("release configuration gates lifecycle V2 without production routing", () =
   assert.match(smoke, /LIFECYCLE_V2_DISABLED/);
   assert.match(smoke, /zero lifecycle event\/dedup\/workflow effect/);
   assert.match(smoke, /event_count.*dedup_count.*workflow_count/s);
+});
+
+test("workflow parser rejects duplicate jobs, mappings, and executable steps", () => {
+  const ci = source(".github/workflows/ci.yml"), stress = source(".github/workflows/sqlite-stress.yml");
+  for (const mutated of [
+    ci.replace("  release-gates:\n", "  release-gates:\n    if: false\n  release-gates:\n"),
+    ci.replace("    steps:\n", "    steps:\n      - run: echo forged\n    steps:\n"),
+    ci.replace("        run: npm run build", "        run: npm run build\n        run: echo stale"),
+    ci.replace("      - name: Build\n", "      - name: Build\n        run: echo forged\n\n      - name: Build\n"),
+  ]) {
+    assert.notEqual(mutated, ci);
+    assert.throws(() => assertWorkflowReleaseContract(mutated, stress));
+  }
+});
+
+test("workflow parser accepts only the two classified upload slots", () => {
+  assert.doesNotThrow(() => assertWorkflowReleaseContract(source(".github/workflows/ci.yml"), source(".github/workflows/sqlite-stress.yml")));
+});
+
+test("workflow parser preserves exact stress scalar policy and checkout ownership", () => {
+  const ci = source(".github/workflows/ci.yml"), stress = source(".github/workflows/sqlite-stress.yml");
+  for (const mutated of [
+    stress.replace("max-parallel: 1", "max-parallel: 10"),
+    stress.replace("retention-days: 14", "retention-days: 140"),
+    stress.replace("if-no-files-found: error", "if-no-files-found: warn"),
+    stress.replace("if: ${{ always() }}", "if: success()"),
+    stress.replace("uses: actions/upload-artifact@v7", "uses: actions/upload-artifact@v6"),
+    stress.replace("          fetch-depth: 0", "          fetch-depth: 0\n          path: alternate-checkout"),
+  ]) {
+    assert.notEqual(mutated, stress);
+    assert.throws(() => assertWorkflowReleaseContract(ci, mutated));
+  }
+});
+
+test("workflow scalar readers reject shell-block text masquerading as the serial setting", () => {
+  const ci = source(".github/workflows/ci.yml"), stress = source(".github/workflows/sqlite-stress.yml");
+  const forged = stress.replace("      max-parallel: 1\n", "")
+    .replace("        run: |\n", "        run: |\n          max-parallel: 1\n");
+  assert.notEqual(forged, stress);
+  assert.throws(() => assertWorkflowReleaseContract(ci, forged), /stress must remain serial/);
+});
+
+test("workflow parser rejects synthetic upload identity, policy, owner, and order substitutions", () => {
+  const ci = source(".github/workflows/ci.yml"), stress = source(".github/workflows/sqlite-stress.yml");
+  const mutations = [
+    ci.replace(MIGRATION_UPLOAD, ""),
+    ci.replace(MIGRATION_UPLOAD, `${MIGRATION_UPLOAD}\n${MIGRATION_UPLOAD}`),
+    ...[["@v7", "@v6"], ["name: Upload V2", "name: Renamed V2"],
+      ["functional-synthetic-", "production-rehearsal-"], ["retention-days: 14", "retention-days: 140"],
+      ["if-no-files-found: error", "if-no-files-found: ignore"],
+      ["        with:", "        if: success()\n        with:"],
+      ["        with:", "        continue-on-error: true\n        with:"],
+    ].map(([from, to]) => ci.replace(MIGRATION_UPLOAD, MIGRATION_UPLOAD.replace(from!, to!))),
+    ci.replace(MIGRATION_UPLOAD, "").replace("      - name: Build\n", `${MIGRATION_UPLOAD}\n      - name: Build\n`),
+    ci.replace(MIGRATION_UPLOAD, "").replace("    name: Reject Node", `${MIGRATION_UPLOAD}\n    name: Reject Node`),
+    ci.replace(MIGRATION_UPLOAD, "").replace("    steps:\n", `    nested:\n      steps:\n${MIGRATION_UPLOAD.split("\n").map(line => `  ${line}`).join("\n")}\n    steps:\n`),
+  ];
+  for (const mutated of mutations) {
+    assert.notEqual(mutated, ci);
+    assert.throws(() => assertWorkflowReleaseContract(mutated, stress));
+  }
+  assert.throws(() => assertWorkflowReleaseContract(ci.replace(MIGRATION_UPLOAD, ""), `${stress}\n${MIGRATION_UPLOAD}\n`));
+});
+
+test("workflow parser rejects payload paths and nonliteral evidence transport", () => {
+  const ci = source(".github/workflows/ci.yml"), stress = source(".github/workflows/sqlite-stress.yml");
+  for (const path of [
+    "${{ runner.temp }}/v2-shadow-migration-functional", "${{ runner.temp }}/**/*.json",
+    "${{ runner.temp }}/v2-shadow-migration-functional/../evidence.json", "${{ inputs.evidence }}",
+    "source-copy/evidence.json", "package/evidence.json", "events.sqlite", "events.sqlite-wal",
+    "compatibility.md", "command.log", "evidence.json.tmp", "evidence.json.reservation",
+    `${MIGRATION_OUTPUT} other.json`, `|\n            ${MIGRATION_OUTPUT}\n            source.sqlite`,
+  ]) {
+    const mutated = ci.replace(`          path: ${MIGRATION_OUTPUT}`, `          path: ${path}`);
+    assert.notEqual(mutated, ci);
+    assert.throws(() => assertWorkflowReleaseContract(mutated, stress), path);
+  }
+});
+
+test("workflow parser binds output exclusively to the fresh producer gate", () => {
+  const ci = source(".github/workflows/ci.yml"), stress = source(".github/workflows/sqlite-stress.yml");
+  const env = `        env:\n          V2_SHADOW_MIGRATION_TEST_EVIDENCE_OUTPUT: ${MIGRATION_OUTPUT}\n`;
+  const mutations = [
+    ci.replace(MIGRATION_GATE, ""),
+    ...[["        env:", "        if: always()\n        env:"],
+      ["        env:", "        continue-on-error: false\n        env:"],
+      ["npm run test:v2-shadow-migration", "echo '{}' > evidence.json"],
+      ["npm run test:v2-shadow-migration", "cp stale.json evidence.json"],
+      ["npm run test:v2-shadow-migration", "npm run test:v2-shadow-migration || true"],
+      ["        run:", "        nested:\n          run:"],
+    ].map(([from, to]) => ci.replace(MIGRATION_GATE, MIGRATION_GATE.replace(from!, to!))),
+    ci.replace(env, "").replace("        run: npm run build", `${env}        run: npm run build`),
+    ci.replace(env, "").replace("jobs:\n", `env:\n  V2_SHADOW_MIGRATION_TEST_EVIDENCE_OUTPUT: ${MIGRATION_OUTPUT}\njobs:\n`),
+    ci.replace(env, env.replace(MIGRATION_OUTPUT, "${{ inputs.path }}")),
+    ci.replace(env, `${env}          NODE_ENV: production\n`),
+    ci.replace("      - name: Build\n", "      - name: Forge evidence\n        run: cp stale.json evidence.json\n      - name: Build\n"),
+    ci.replace(MIGRATION_UPLOAD, MIGRATION_UPLOAD.replace("          path:", "          nested:\n            path:")),
+    ci.replace(MIGRATION_UPLOAD, MIGRATION_UPLOAD.replace("          path:", "          path: source.sqlite\n          path:")),
+  ];
+  for (const mutated of mutations) {
+    assert.notEqual(mutated, ci);
+    assert.throws(() => assertWorkflowReleaseContract(mutated, stress));
+  }
 });
 
 test("workflow parser closes conditional, scalar, and upload-owner bypasses", () => {
@@ -545,7 +905,7 @@ test("workflow parser closes conditional, scalar, and upload-owner bypasses", ()
     "      - name: Upload stress logs\n        if: ${{ always() }}\n        uses: actions/upload-artifact@v7",
     "      - uses: \"actions/upload-artifact@v7\"\n        if: '${{ always() }}'",
   );
-  assert.doesNotThrow(() => assertWorkflowReleaseContract(ci, quotedUnnamedUpload));
+  assert.throws(() => assertWorkflowReleaseContract(ci, quotedUnnamedUpload), /every executable step must be named/);
 
   const uploadBlock = [
     "      - uses: actions/upload-artifact@v7",
@@ -559,14 +919,14 @@ test("workflow parser closes conditional, scalar, and upload-owner bypasses", ()
       ci.replace("\n  minimum-runtime-rejection:", `\n${uploadBlock}\n\n  minimum-runtime-rejection:`),
       stress.replace(/\n      - name: Upload stress logs[\s\S]*$/m, "\n"),
     ),
-    /upload artifact must belong to stress/,
+    /every executable step must be named/,
   );
 
   const extraUploader = stress.replace(
     "      - name: Upload stress logs",
     `${uploadBlock.replace("actions/upload-artifact@v7", "actions/upload-artifact@v6")}\n\n      - name: Upload stress logs`,
   );
-  assert.throws(() => assertWorkflowReleaseContract(ci, extraUploader), /exactly one upload-artifact/);
+  assert.throws(() => assertWorkflowReleaseContract(ci, extraUploader), /every executable step must be named/);
 });
 
 test("workflow parser rejects quoted conditional keys before reading jobs", () => {
@@ -711,6 +1071,9 @@ test("Subproject 3 evaluation guard proves real bridge dataflow", () => {
 
 test("Subproject 3 evaluation guard rejects dynamic V2 entry wiring", () => {
   for (const forbiddenWiring of [
+    'import "../orchestrator/migration/v2-shadow-migration-runner.js";',
+    'const parity = import("../parity/v2-snapshot-parity.js");',
+    'const worker = require("../materialization/stable-compatibility-directory.js");',
     'async function load() { return import("../orchestrator/retrieval/evaluation.js"); }',
     'const load = () => require("../orchestrator/runtime/projection-runtime.js");',
     'const controlPlane = await import("../orchestrator/rollout/rollout-control-plane.js");',
@@ -730,6 +1093,27 @@ test("Subproject 3 evaluation guard rejects dynamic V2 entry wiring", () => {
       () => assertProductionIsolation([{ path: "src/index.ts", contents: forbiddenWiring }]),
       /V2_PRODUCTION_ISOLATION/,
     );
+  }
+});
+
+test("shadow isolation rejects public migration/parity tools and environment activation on every entry", () => {
+  for (const path of PRODUCTION_ENTRY_SOURCE_PATHS) {
+    for (const contents of [
+      'server.registerTool("memory_migrationRun", {});',
+      'server.registerTool("memory_parityCompare", {});',
+      'server.registerTool("memory_appendEvent", {});',
+      'import "../../tests/support/fresh-start-fixture.js";',
+      'if (process.env.V2_SHADOW_ENABLED) activate();',
+      'if (process.env["V2_MIGRATION_ENABLED"]) activate();',
+    ]) assert.throws(() => assertProductionIsolation([{ path, contents }]), /V2_PRODUCTION_ISOLATION/);
+  }
+});
+
+test("prepared composition permits exact reviewed edges while refusing fresh-start wiring in V1", () => {
+  assert.doesNotThrow(() => assertProductionIsolation(PRODUCTION_ENTRY_SOURCE_PATHS.map(path => ({ path, contents: source(path) }))));
+  for (const path of ["src/index.ts", "src/app.ts", "src/v2.ts", "src/v2/app.ts"]) {
+    assert.throws(() => assertProductionIsolation([{ path,
+      contents: 'import { activate } from "../orchestrator/fresh-start/fresh-start-control-plane.js";' }]), /unapproved prepared composition edge/);
   }
 });
 
