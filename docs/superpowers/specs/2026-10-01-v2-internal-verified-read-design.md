@@ -4,7 +4,7 @@ Status: Written specification explicitly approved by the user on 2026-10-01 with
 
 Source inspected: `de2fee723322a28c915b26dfcfa5466203deadff` on `codex/v2-fresh-start`.
 
-Restart amendment: the user explicitly approved the [written conservative Task 5 amendment](2026-10-01-v2-verified-read-restart-amendment.md), presented at `e6e1f67`, on 2026-10-01. Sections 6 and 8 below now include that rule. The corresponding amended Task 5 plan steps await review; this does not accept Task 5 or authorize production activation.
+Restart amendment: the user explicitly approved the [written conservative Task 5 amendment](2026-10-01-v2-verified-read-restart-amendment.md), presented at `e6e1f67`, on 2026-10-01. Sections 6 and 8 below now include that rule. The user approved the corresponding amended Task 5 steps with `go` after reviewing `9a705ab`; implementation is independently accepted at `5921627` plus `428ae46`. Task 6 integration remains pending; neither approval nor Task 5 acceptance authorizes production activation.
 
 ## 1. Outcome and limits
 

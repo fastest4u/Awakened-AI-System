@@ -1,6 +1,6 @@
 # V2 verified-read Task 5: conservative restart amendment
 
-Status: **Written amendment approved by the user on 2026-10-01.** The user replied `อนุมัติ` to the explicit written-review request for this artifact at `e6e1f67`, after earlier approving the approach “ห้ามเริ่มจนลบเสร็จจริง”. The original [verified-read design](2026-10-01-v2-internal-verified-read-design.md) and [implementation plan](../plans/2026-10-01-v2-internal-verified-read.md) now reflect this contract; the amended Task 5 plan steps await review before implementation resumes. Historical Tasks 1–4 acceptance remains unchanged. This is not Task 5 acceptance or production activation.
+Status: **Written amendment approved by the user on 2026-10-01.** The user replied `อนุมัติ` to the explicit written-review request for this artifact at `e6e1f67`, after earlier approving the approach “ห้ามเริ่มจนลบเสร็จจริง”. The original [verified-read design](2026-10-01-v2-internal-verified-read-design.md) and [implementation plan](../plans/2026-10-01-v2-internal-verified-read.md) now reflect this contract; the user approved the amended Task 5 steps with `go` at `9a705ab`, and Task 5 implementation/review is accepted at `5921627` plus `428ae46`. Historical Tasks 1–4 acceptance remains unchanged. Written-spec approval alone was not Task 5 acceptance; the separate implementation/review evidence now supplies that acceptance, not production activation.
 
 ## 1. Outcome and reason
 
@@ -44,7 +44,7 @@ Use deterministic barriers around the actual ownership I/O seam, real owned file
 
 ## 5. Scope and handoff
 
-Keep the selected Subagent-Driven method and existing worktree. Preserve the six unaccepted Task 5 candidate files and existing evidence while the amended Task 5 plan steps await review. Written approval authorizes reconciling the Task 5 plan/brief for its existing review checkpoints before implementation resumes; it does not authorize deployment, live configuration/trust changes, transcript/credential reads, V1 import/fallback, public content enablement, push or hosted CI.
+Keep the selected Subagent-Driven method and existing worktree. The six original Task 5 candidate files and scoped fix are now committed and independently accepted; preserve their reports/evidence. Written approval and the subsequent amended-plan approval authorized the completed Task 5 correction and its existing review checkpoints; it does not authorize deployment, live configuration/trust changes, transcript/credential reads, V1 import/fallback, public content enablement, push or hosted CI.
 
 F2 public native memory/privacy and actual Codex desktop integration, F3 recovery of newly acknowledged V2 data plus exact-release evidence, and F4 explicitly approved activation/live verification remain unfinished. This amendment cannot certify PROD-ready, recovered content or actual host capture.
 
