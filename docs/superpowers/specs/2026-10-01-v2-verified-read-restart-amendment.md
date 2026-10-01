@@ -4,7 +4,7 @@ Status: **Written amendment approved by the user on 2026-10-01.** The user repli
 
 ## 1. Outcome and reason
 
-Prevent an old read owner from deleting a replacement owner's intent during cooperative completion. The pending Task 5 implementation marks `verified-read-owner.json` as `complete`, then removes that pathname asynchronously. If another repository automatically reclaims that `complete` record first, it can install a new intent while the old removal is still pending. The old removal can then delete the new intent.
+Prevent an old read owner from deleting a replacement owner's intent during cooperative completion. The pre-amendment Task 5 candidate marked `verified-read-owner.json` as `complete`, then removed that pathname asynchronously. If another repository automatically reclaimed that `complete` record first, it could install a new intent while the old removal was still pending. The old removal could then delete the new intent. The accepted implementation refuses this replacement until actual removal.
 
 Change the restart rule, not the resource or process architecture: **an existing record never authorizes automatic replacement, including a record whose state is `complete`.** A new owner can start only through exclusive creation after the old ownership record has actually been removed.
 
@@ -40,7 +40,7 @@ The cooperative guarantee assumes participating repositories obey these rules; i
 | Removal/update error or unresolved I/O | Cleanup remains incomplete/unavailable; no successful receipt or replacement launch |
 | Duplicate/late completion | Settled caller outcome is unchanged; old quarantined adapter does not resume; a later owner's bytes/identity are preserved |
 
-Use deterministic barriers around the actual ownership I/O seam, real owned filesystem records and the production repository. Do not test merely a fake delayed promise or delete production guards to manufacture RED. Extend the exact Task 5 ownership/supervisor tests first, observe genuine race/refusal RED, then implement the smallest correction and run their final serialized group plus typecheck. Preserve existing native synchronous-hang and independently owned writer checks. Independent spec/quality review is required before Task 5 acceptance; the existing Task 6 compiled gate remains pending. No multi-hour V1 migration replay is a prerequisite for this fresh-start correction.
+Use deterministic barriers around the actual ownership I/O seam, real owned filesystem records and the production repository. Do not test merely a fake delayed promise or delete production guards to manufacture RED. Extend the exact Task 5 ownership/supervisor tests first, observe genuine race/refusal RED, then implement the smallest correction and run their final serialized group plus typecheck. Preserve existing native synchronous-hang and independently owned writer checks. Independent spec/quality review was completed before Task 5 acceptance; Task 6 compiled integration and final review are now also accepted through `b948ed7`, with [source-qualified evidence](../evidence/2026-10-01-v2-internal-verified-read.md). No multi-hour V1 migration replay is a prerequisite for this fresh-start correction.
 
 ## 5. Scope and handoff
 
