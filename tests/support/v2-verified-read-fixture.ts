@@ -1,10 +1,42 @@
-import { createHash } from "node:crypto";
-import { lstatSync, mkdtempSync, realpathSync } from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
+import { lstatSync, mkdirSync, mkdtempSync, realpathSync, renameSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type { ProjectionManifestV2 } from "../../src/orchestrator/projections/manifest.js";
 import type { ProjectionDirectoryIdentity } from "../../src/orchestrator/projections/stable-directory.js";
+import type { ReadFence, VerifiedReadBinding, VerifiedReadRequest } from "../../src/orchestrator/verified-read/contracts.js";
+import type { SqliteConnection } from "../../src/orchestrator/storage/sqlite-driver.js";
+import { NodeSqliteDriver } from "../../src/orchestrator/storage/node-sqlite-driver.js";
+import { applyCurrentProjectStoreSchema } from "./current-project-store-schema.js";
+import { freshGenesis, freshRelease, FRESH_IDENTITY, FRESH_NOW } from "./fresh-start-fixture.js";
+import { expectedSchemaFingerprint } from "../../src/orchestrator/storage/schema-fingerprint.js";
+import { PROJECT_STORE_MIGRATIONS } from "../../src/orchestrator/storage/migrations/registry.js";
+import { SqliteFreshStartRepository } from "../../src/orchestrator/fresh-start/fresh-start.repository.js";
+import { FreshStartControlPlane } from "../../src/orchestrator/fresh-start/fresh-start-control-plane.js";
+import { TrustedFreshStartEvidenceVerifier, TrustedOperatorApprovalVerifier } from "../../src/orchestrator/fresh-start/operator-approval.js";
+import { bindFreshStartAdmissionContext } from "../../src/orchestrator/fresh-start/fresh-start-admission.js";
+import { EventStore, SqliteEventStoreStatements } from "../../src/orchestrator/storage/event-store.js";
+import { MaintenanceFence } from "../../src/orchestrator/storage/maintenance-fence.js";
+import { BranchScopeRepository } from "../../src/orchestrator/storage/branch-scope.repository.js";
+import { command } from "../fixtures/fresh-start-admission-child.js";
+import { ImmutableProjectionBuilder } from "../../src/orchestrator/projections/builder.js";
+import { openCommittedProjectionEventSnapshot } from "../../src/orchestrator/projections/event-reader.js";
+import { publishProjectionManifest } from "../../src/orchestrator/projections/manifest.js";
+
+// Dynamic lookup lets the initial TDD run assert the absent implementation without a compiler error.
+export type AdmissionConstructor = new (connection: SqliteConnection, binding: VerifiedReadBinding, measuredBuildHash: string) => {
+  capture(request: VerifiedReadRequest): ReadFence;
+  revalidate(fence: ReadFence, manifest: ProjectionManifestV2): void;
+};
+export async function readAdmissionConstructor(): Promise<AdmissionConstructor | undefined> {
+  const modulePath = "../../src/orchestrator/verified-read/admission.js";
+  try { return (await import(modulePath) as { SqliteVerifiedReadAdmission: AdmissionConstructor }).SqliteVerifiedReadAdmission; }
+  catch (error) {
+    if ((error as { code?: string }).code === "ERR_MODULE_NOT_FOUND") return undefined;
+    throw error;
+  }
+}
 
 export const READ_UUID = "11111111-1111-4111-8111-111111111111";
 export const READ_HASH = "a".repeat(64);
@@ -62,4 +94,79 @@ export function ownedReadImage(updateSql = ""): Readonly<{ bytes: Uint8Array; ma
       createdAt: "2026-10-01T00:00:00.000Z" }) as ProjectionManifestV2;
     return Object.freeze({ bytes, manifest });
   } finally { database.close(); }
+}
+
+/** Real schema-8 authority exists only inside this owned synthetic fixture. */
+export async function makeActiveReadFixture(measuredBuildHash = READ_HASH) {
+  const Admission = await readAdmissionConstructor();
+  if (!Admission) throw new Error("Task 3 admission implementation is absent");
+  const root = realpathSync.native(mkdtempSync(join(tmpdir(), "v2-active-read-")));
+  const rootStat = lstatSync(root, { bigint: true });
+  const directory = (name: string): ProjectionDirectoryIdentity => {
+    const canonicalPath = join(root, name); mkdirSync(canonicalPath);
+    const stat = lstatSync(canonicalPath, { bigint: true });
+    return Object.freeze({ canonicalPath, device: String(stat.dev), inode: String(stat.ino) });
+  };
+  const projectionDirectory = directory("projection");
+  const executorStateDirectory = directory("executor-state");
+  const deploymentDirectory = directory("deployment");
+  const path = join(root, "events.sqlite");
+  const driver = new NodeSqliteDriver({ DatabaseSync });
+  const writer = driver.open(path, { mode: "create", busyTimeoutMs: 1000 });
+  let reader: SqliteConnection | undefined;
+  const cleanup = (): void => {
+    try { reader?.close(); } finally { writer.close(); }
+    const current = lstatSync(root, { bigint: true });
+    if (!current.isDirectory() || current.isSymbolicLink() || realpathSync.native(root) !== root
+      || current.dev !== rootStat.dev || current.ino !== rootStat.ino) throw new Error("owned fixture root changed");
+    rmSync(root, { recursive: true, force: true });
+  };
+  try {
+    applyCurrentProjectStoreSchema(writer, FRESH_IDENTITY, FRESH_NOW);
+    const release = freshRelease({ buildIdentityHash: measuredBuildHash,
+      schemaIdentityHash: expectedSchemaFingerprint(PROJECT_STORE_MIGRATIONS) });
+    const repository = new SqliteFreshStartRepository(writer);
+    repository.transact(FRESH_IDENTITY, tx => tx.install(freshGenesis(), release));
+    const approvals = new TrustedOperatorApprovalVerifier(async (_bytes, requestDigest) => ({ identity: FRESH_IDENTITY,
+      approvalId: randomUUID(), nonceDigest: createHash("sha256").update(randomUUID()).digest("hex"),
+      actorFingerprint: "2".repeat(64), requestDigest, evidenceDigest: release.evidenceDigest }));
+    const control = new FreshStartControlPlane(repository, approvals, new TrustedFreshStartEvidenceVerifier(async value => value));
+    await control.transition({ identity: FRESH_IDENTITY, expectedGeneration: 0n, expectedMode: "prepared",
+      expectedReleaseId: release.releaseId, nextMode: "active", nextRelease: release, approvalEnvelope: new Uint8Array([1]) });
+    bindFreshStartAdmissionContext(writer, { identity: FRESH_IDENTITY, releaseId: release.releaseId, measuredBuildHash, generation: 1n });
+    const stat = lstatSync(path, { bigint: true });
+    const binding: VerifiedReadBinding = Object.freeze({ projectionBinding: Object.freeze({ ...FRESH_IDENTITY,
+      workspaceId: command().context.binding.workspaceId, branchScopeId: null, branchRef: null, sessionId: null }),
+      expectedRelease: release, controlGeneration: "1", session: null,
+      eventsFile: Object.freeze({ path, device: String(stat.dev), inode: String(stat.ino) }),
+      projectionDirectory, executorStateDirectory, deploymentDirectory, compositionEpoch: "fixture-epoch" });
+    reader = driver.open(path, { mode: "read-only-existing", bindFileIdentity: true, busyTimeoutMs: 1000 });
+    const admission = new Admission(reader, binding, measuredBuildHash);
+    const request: VerifiedReadRequest = Object.freeze({ operation: "verify-published-view", consistency: "project-strong", minimumEventPosition: "0", budgetMs: 5000 });
+    const store = new EventStore(writer, new SqliteEventStoreStatements(writer), new MaintenanceFence(), new BranchScopeRepository(), () => FRESH_NOW);
+    let appendNumber = 0;
+    const append = () => {
+      const value = command(); appendNumber += 1;
+      const result = store.append({ ...value, commandId: randomUUID(), correlationId: randomUUID(), idempotencyKey: `read:${appendNumber}`,
+        streamId: `read-stream-${appendNumber}` });
+      return { position: result.lastGlobalPosition.toString(), hash: writer.prepare("SELECT event_hash FROM events WHERE global_position = $position")
+        .get({ $position: result.lastGlobalPosition })!.event_hash as string };
+    };
+    let generation = 0;
+    const publish = async () => {
+      const snapshot = openCommittedProjectionEventSnapshot(binding.projectionBinding, { driver, eventStorePath: path, busyTimeoutMs: 1000 });
+      try {
+        const staged = await new ImmutableProjectionBuilder({ driver, projectionDirectory: projectionDirectory.canonicalPath, now: () => FRESH_NOW })
+          .buildV2(snapshot, ++generation);
+        publishProjectionManifest({ projectionDirectory: projectionDirectory.canonicalPath, manifest: staged.manifest,
+          expectedBinding: binding.projectionBinding }, { beforeManifestInstall: { install(directory) {
+            renameSync(staged.temporaryDatabasePath, join(directory, staged.manifest.databaseFile));
+          } } });
+        return staged.manifest;
+      } finally { snapshot.close(); }
+    };
+    const manifest = await publish();
+    return { root, path, reader, writer, binding, measuredBuildHash, identity: FRESH_IDENTITY, release,
+      repository, control, admission, request, manifest, append, publish, cleanup };
+  } catch (error) { try { cleanup(); } catch { /* preserve setup failure */ } throw error; }
 }
