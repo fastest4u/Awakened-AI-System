@@ -242,8 +242,14 @@ export function createVerifiedReadAdapter(input: VerifiedReadBinding, dependenci
     lane.started = true; lane.phase = "startup";
     try {
       lane.inFlight++; const existing = await deps.ownership.inspect(); lane.inFlight--;
+      // Retained ownership must quarantine even when the response settled while inspection was pending.
+      // Do not let the generic ineligible/no-child path label someone else's record positively closed.
+      if (existing) {
+        if (!lane.settled) settle(lane, deps.now() >= lane.deadline ? "WORKER_TIMEOUT"
+          : deps.currentEpoch() !== lane.ids.laneEpoch ? "FRESH_START_ADMISSION_STALE" : "WORKER_UNAVAILABLE");
+        expireCleanup(lane); return;
+      }
       if (!eligible(lane)) { progressCleanup(lane); return; }
-      if (existing) { settle(lane, "WORKER_UNAVAILABLE"); expireCleanup(lane); return; }
       lane.inFlight++;
       await deps.ownership.begin({ schemaVersion: 1, bindingFingerprint: fingerprint, buildHash: binding.expectedRelease.buildIdentityHash,
         supervisorId, ids: lane.ids, lockToken: lane.token }); lane.recordOwned = true; lane.inFlight--;

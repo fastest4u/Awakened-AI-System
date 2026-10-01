@@ -201,6 +201,31 @@ test("existing complete record quarantines the supervisor without launching or m
     await assert.rejects(f.adapter.verify(f.request), { code: "WORKER_UNAVAILABLE" }); assert.equal(await readFile(path, "utf8"), bytes);
   } finally { await f.dispose(); }
 });
+for (const cause of ["timeout", "undelivered timeout", "cancellation", "epoch"] as const) test(`existing ownership after ${cause} retains quarantine with primary ${cause === "timeout" || cause === "cancellation" ? "already settled" : "discovered on return"}`, async () => {
+  const f = await fixture(); const path = join(f.binding.executorStateDirectory.canonicalPath, "verified-read-owner.json");
+  const bytes = JSON.stringify({ schemaVersion: 1, bindingFingerprint: READ_HASH, buildHash: READ_HASH, supervisorId: "prior-supervisor",
+    ids: readBootstrap().ids, lockToken: "a".repeat(32), state: "complete", pid: 4321 });
+  const reached = deferred(); const gate = deferred(); const inspect = f.ownership.inspect.bind(f.ownership);
+  f.ownership.inspect = async () => { const record = await inspect(); assert.equal(record?.state, "complete"); reached.resolve(); await gate.promise; return record; };
+  const controller = new AbortController(); const expected = cause === "timeout" || cause === "undelivered timeout" ? "WORKER_TIMEOUT" : cause === "cancellation" ? "WORKER_CLOSED" : "FRESH_START_ADMISSION_STALE";
+  try {
+    await fsPromises.writeFile(path, bytes);
+    let settled = false;
+    const outcome = f.adapter.verify({ ...f.request, budgetMs: 2000 }, { signal: controller.signal })
+      .then(value => { settled = true; return value; }, error => { settled = true; return error as { code: string }; });
+    await reached.promise;
+    if (cause === "timeout") { f.clock.advance(2000); assert.equal((await outcome as { code: string }).code, expected); f.clock.advance(500); }
+    else if (cause === "undelivered timeout") f.clock.advance(2500, false);
+    else { f.clock.advance(500); if (cause === "cancellation") { controller.abort(); assert.equal((await outcome as { code: string }).code, expected); } else f.setEpoch("changed-epoch"); }
+    await turn(); assert.equal(settled, cause === "timeout" || cause === "cancellation");
+    gate.resolve(); assert.equal((await outcome as { code: string }).code, expected);
+    await until(() => f.adapter.diagnostic().cleanup !== "pending");
+    assert.equal(f.adapter.diagnostic().cleanup, "incomplete"); assert.equal(f.adapter.diagnostic().pendingCount, 1);
+    assert.equal(f.adapter.diagnostic().code, expected); assert.equal(f.processes.length, 0); assert.equal(await readFile(path, "utf8"), bytes);
+    await assert.rejects(f.adapter.verify(f.request), { code: "WORKER_UNAVAILABLE" });
+    assert.equal((await outcome as { code: string }).code, expected); assert.equal(await readFile(path, "utf8"), bytes);
+  } finally { gate.resolve(); await f.dispose(); }
+});
 test("cleanup terminal without actual exit retains evidence at the original single cleanup deadline", async () => {
   const f = await fixture(); try {
     const pending = f.adapter.verify({ ...f.request, budgetMs: 2000 }); const rejected = assert.rejects(pending, { code: "WORKER_TIMEOUT" });
