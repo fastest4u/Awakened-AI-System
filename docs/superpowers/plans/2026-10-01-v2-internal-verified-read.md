@@ -10,7 +10,7 @@
 
 **Spec:** [Approved internal verified-read design](../specs/2026-10-01-v2-internal-verified-read-design.md), reviewed at `37d31d1aab52fe8e42f8c2c335a9d8ea037a7055`.
 
-**Status:** Plan prepared for user review; no task below is implemented by this document. Reuse the existing isolated `codex/v2-fresh-start` worktree. This is one F2 subsystem, not the F2/F3/F4 release plan.
+**Status:** Execution approved by the user on 2026-10-01 with `เริ่มทำแบบ Subagent-Driven`, reviewing plan commit `1d215cb`. Task 1 is implemented at `caeb0de`, focused tests 9/9 and compiler/typecheck native 0, with spec/quality review approved. Tasks 2-6 are not complete. Reuse the existing isolated `codex/v2-fresh-start` worktree. This is one F2 subsystem, not the F2/F3/F4 release plan.
 
 ## Global Constraints
 
@@ -57,17 +57,17 @@ Define `ReadReply` as version/IDs plus `kind`: `stage` with `phase: admission | 
 
 Export `decodeVerifiedReadRequest(value: unknown, session: TrustedReadSession | null): VerifiedReadRequest`, `decodeReadBootstrap(value: unknown): ReadBootstrap`, `decodeReadCancel(value: unknown): ReadCancel`, `decodeReadReply(value: unknown): ReadReply`, `decodeCleanupBootstrap(value: unknown): CleanupBootstrap`, `decodeCleanupReply(value: unknown): CleanupReply`, `decodeVerifiedReadReceipt(value: unknown): VerifiedReadReceipt`, and `verifiedReadFailure(error: unknown): VerifiedReadFailure` from `protocol.ts`. Also export `resolveVerifiedReadBudget(consistency: VerifiedReadRequest["consistency"], budgetMs?: number): number` for trusted caller normalization; omitted budget selects the approved default, while the IPC decoder still requires an explicit budget. IDs/epoch are 1..128 UTF-8 bytes, composition-owned epoch; directory/filename path fields are at most 2048 UTF-8 bytes each and the complete bootstrap still at most 8 KiB. No path is copied to diagnostic/error fields.
 
-- [ ] **Step 1 — Write failing tests.** Pin defaults at caller normalization, explicit wire budget, INT64 decimal strings, all exact receipt keys, session minimum and per-message limits. Include these assertions and named cases: `accessors are not invoked`, `multibyte branch bound`, `no escaped handle/content/credential keys`, and every approved error mapping.
+- [x] **Step 1 — Write failing tests.** Pin defaults at caller normalization, explicit wire budget, INT64 decimal strings, all exact receipt keys, session minimum and per-message limits. Include these assertions and named cases: `accessors are not invoked`, `multibyte branch bound`, `no escaped handle/content/credential keys`, and every approved error mapping.
 
   ```ts
   assert.throws(() => decodeVerifiedReadRequest({ operation: "verify-published-view", consistency: "project-strong", minimumEventPosition: "01", budgetMs: 5000 }, null), { code: "FRESH_START_INPUT_INVALID" });
   assert.equal(decodeVerifiedReadRequest({ operation: "verify-published-view", consistency: "project-strong", minimumEventPosition: "0", budgetMs: 0 }, null).budgetMs, 0);
   assert.throws(() => decodeVerifiedReadRequest({ operation: "sql", consistency: "project-strong", minimumEventPosition: "0", budgetMs: 30001 }, null), { code: "FRESH_START_INPUT_INVALID" });
   ```
-- [ ] **Step 2 — Record RED.** Compile and run `node --test --test-concurrency=1 --test-reporter=spec dist-test/tests/v2-internal-verified-read-contracts.test.js`; expect missing exports or the exact new assertions to fail.
-- [ ] **Step 3 — Implement contracts/codecs.** Use descriptor-first bounded plain-record copying and canonical wire-size checks before expensive serialization/allocation. Envelope IDs are opaque nonempty bounded strings; lane epoch is composition-owned, token exactly 32 lowercase hex. Preserve hashes/UUID/scope and 1024-byte branch-ref rules; do not reuse a lifecycle mutation decoder. Normalize absent caller budget to 2000/5000 before wire encoding without hiding arrival time.
-- [ ] **Step 4 — Record GREEN.** Run the same compiler/test commands plus `npm run typecheck`; require native 0 and all named contract cases passing, without raw inputs in errors.
-- [ ] **Step 5 — Review and commit.** Exact task paths only; message `feat(v2): define private verified-read protocol`.
+- [x] **Step 2 — Record RED.** Compile and run `node --test --test-concurrency=1 --test-reporter=spec dist-test/tests/v2-internal-verified-read-contracts.test.js`; expect missing exports or the exact new assertions to fail.
+- [x] **Step 3 — Implement contracts/codecs.** Use descriptor-first bounded plain-record copying and canonical wire-size checks before expensive serialization/allocation. Envelope IDs are opaque nonempty bounded strings; lane epoch is composition-owned, token exactly 32 lowercase hex. Preserve hashes/UUID/scope and 1024-byte branch-ref rules; do not reuse a lifecycle mutation decoder. Normalize absent caller budget to 2000/5000 before wire encoding without hiding arrival time.
+- [x] **Step 4 — Record GREEN.** Run the same compiler/test commands plus `npm run typecheck`; require native 0 and all named contract cases passing, without raw inputs in errors.
+- [x] **Step 5 — Review and commit.** Exact task paths only; message `feat(v2): define private verified-read protocol`.
 
 ## Task 2: Subprocess-free immutable capture and shared validation
 
@@ -156,4 +156,4 @@ Spec sections 1-3: Tasks 1/6 public/private/approval boundaries. Section 4: Task
 
 Inline self-review: interfaces/receipt/ID fields match across tasks; pure module extraction prevents helper imports, not just runtime method calls; legacy raw helper remains intact; actual schema/file provenance and committed anchors checked; timeout/cleanup/native evidence separate; late ownership work and stale messages cannot launch/succeed; exact five-artifact identity and affected copied-deployment tests included; no parallel compiler or broad assurance replay; no nonexistent read-refresh API or public-content enablement. All six deliverables have their own RED/GREEN/review/commit cycle. This is plan review, not implementation evidence.
 
-Please review this executable plan. The already selected Subagent-Driven method will be used after confirmation; do not request that method again. Finishing these six tasks still leaves native public retrieval/write/governance, actual desktop capture/private closure/privacy, F3 recovery/exact release and F4 approved cutover/live proof.
+The user approved this executable plan and Subagent-Driven execution; do not request either again. Finishing these six tasks still leaves native public retrieval/write/governance, actual desktop capture/private closure/privacy, F3 recovery/exact release and F4 approved cutover/live proof.
