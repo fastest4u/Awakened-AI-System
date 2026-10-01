@@ -45,7 +45,7 @@ jobs:
         run: npm run build
 
       - name: Run tests
-        run: npm test
+        run: npm run test:all
 
       - name: Run lifecycle release gates
         run: npm run test:subproject-2

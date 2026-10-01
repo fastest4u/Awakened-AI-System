@@ -1,8 +1,38 @@
 import assert from "node:assert/strict";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { it } from "node:test";
+import { NodeSqliteDriver } from "../src/orchestrator/storage/node-sqlite-driver.js";
 import { ownedReadImage, readScope, READ_HASH } from "./support/v2-verified-read-fixture.js";
 import { readProjectionImageMetadata, ProjectionImageMetadataError } from "../src/orchestrator/projections/image-metadata.js";
 import { deserializableImage, openImmutableProjectionImage } from "../src/orchestrator/projections/immutable-image.js";
+
+it("immutable projection image is readable without project-store metadata", () => {
+  const root = mkdtempSync(join(tmpdir(), "projection-only-image-"));
+  const path = join(root, "projection.sqlite");
+  try {
+    const producer = new DatabaseSync(path);
+    try {
+      producer.exec(`CREATE VIRTUAL TABLE lexical_chunks_fts USING fts5(content);
+        CREATE TABLE session_tree(session_id TEXT PRIMARY KEY);
+        INSERT INTO session_tree VALUES('synthetic-owned-session');`);
+      assert.equal(producer.prepare("PRAGMA application_id").get()!.application_id, 0);
+      assert.equal(producer.prepare("SELECT count(*) AS n FROM sqlite_schema WHERE name='project_meta'").get()!.n, 0);
+    } finally { producer.close(); }
+    const driver = new NodeSqliteDriver({ DatabaseSync });
+    assert.throws(() => driver.open(path, { mode: "read-only-existing", busyTimeoutMs: 5000 }),
+      /SQLite application identity does not match project memory/);
+    const bytes = readFileSync(path);
+    rmSync(path); // The immutable reader must use its owned bytes after the source path is gone.
+    const database = openImmutableProjectionImage(bytes);
+    try {
+      assert.ok(Number(database.prepare("SELECT count(*) AS n FROM session_tree").get()!.n) > 0);
+      assert.equal(database.prepare("SELECT session_id FROM session_tree").get()!.session_id, "synthetic-owned-session");
+    } finally { database.close(); }
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
 
 it("copies exact scalar metadata and SQLite int64 positions from a detached guarded image", async () => {
   const fixture = ownedReadImage();

@@ -24,7 +24,7 @@ function assertFoundationWorkflow(workflow: any) {
   };
   const typecheck = required("Typecheck", "npm run typecheck");
   const build = required("Build", "npm run build");
-  const tests = required("Run tests", "npm test");
+  const tests = required("Run tests", "npm run test:all");
   const foundation = required("Run V2 fresh-start foundation gate", "npm run test:v2-fresh-start-foundation");
   const artifacts = required("Test build artifacts", "npm run test:build-artifacts");
   assert.equal(build, typecheck + 1); assert.equal(tests, build + 1);
@@ -34,7 +34,7 @@ function assertFoundationWorkflow(workflow: any) {
 test("CI executes Foundation and builds before the full suite without bypasses", () => {
   const workflow = parse(readFileSync(join(root, ".github/workflows/ci.yml"), "utf8"));
   assertFoundationWorkflow(workflow);
-  for (const mutation of ["missing", "duplicate", "skip", "ignore", "forged", "late-build"]) {
+  for (const mutation of ["missing", "duplicate", "skip", "ignore", "forged", "late-build", "reduced-default"]) {
     const changed = structuredClone(workflow), steps = changed.jobs["release-gates"].steps;
     const gate = steps.find((step: any) => step.name === "Run V2 fresh-start foundation gate");
     if (mutation === "missing") steps.splice(steps.indexOf(gate), 1);
@@ -42,6 +42,7 @@ test("CI executes Foundation and builds before the full suite without bypasses",
     if (mutation === "skip") gate.if = "false";
     if (mutation === "ignore") gate["continue-on-error"] = true;
     if (mutation === "forged") gate.run = "echo passed";
+    if (mutation === "reduced-default") steps.find((step: any) => step.name === "Run tests").run = "npm test";
     if (mutation === "late-build") {
       const build = steps.find((step: any) => step.name === "Build"); steps.splice(steps.indexOf(build), 1); steps.push(build);
     }

@@ -715,7 +715,7 @@ function assertWorkflowReleaseContract(ci: string, stress: string): void {
     "name: Check runtime capabilities\nrun: npm run check:runtime",
     "name: Typecheck\nrun: npm run typecheck",
     "name: Build\nrun: npm run build",
-    "name: Run tests\nrun: npm test",
+    "name: Run tests\nrun: npm run test:all",
     "name: Run lifecycle release gates\nrun: npm run test:subproject-2",
     `name: Require immutable lifecycle base commit\nrun: git cat-file -e "${BASE}^{commit}"`,
     `name: Protect Version 1 production routing\nrun: git diff --exit-code ${BASE} -- src/app.ts src/index.ts src/controllers src/schemas src/services`,
@@ -842,6 +842,14 @@ test("workflow parser rejects duplicate jobs, mappings, and executable steps", (
 
 test("workflow parser accepts only the two classified upload slots", () => {
   assert.doesNotThrow(() => assertWorkflowReleaseContract(source(".github/workflows/ci.yml"), source(".github/workflows/sqlite-stress.yml")));
+});
+
+test("workflow full-suite gate rejects fallback to the reduced default profile", () => {
+  const ci = source(".github/workflows/ci.yml"), stress = source(".github/workflows/sqlite-stress.yml");
+  assertWorkflowReleaseContract(ci, stress);
+  const reduced = ci.replace("run: npm run test:all", "run: npm test");
+  assert.notEqual(reduced, ci);
+  assert.throws(() => assertWorkflowReleaseContract(reduced, stress));
 });
 
 test("workflow parser preserves exact stress scalar policy and checkout ownership", () => {

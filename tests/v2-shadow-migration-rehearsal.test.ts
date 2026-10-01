@@ -156,17 +156,6 @@ test("private builtin loader exception is path-specific and closed before and af
     }
   });
 });
-test("immutable projection image is readable without project-store metadata", async t => {
-  const f = await createSnapshotParityFixture(t, { rankingPair: true, legacyArtifacts: true });
-  const path = f.input.projections.v2.databasePath;
-  assert.throws(() => f.driver.open(path, { mode: "read-only-existing", busyTimeoutMs: 5000 }),
-    /SQLite application identity does not match project memory/);
-  const bytes = fs.readFileSync(path);
-  const database = openImmutableProjectionImage(bytes);
-  try {
-    assert.ok(Number(database.prepare("SELECT count(*) AS n FROM session_tree").get()!.n) > 0);
-  } finally { database.close(); }
-});
 test("branch-bound source fixture is sealed from production Git/lifecycle events", async t => {
   const f = await createSnapshotParityFixture(t, { branchBoundSource: true, rankingPair: true });
   assert.match(f.projectionBinding.branchRef!, /^refs\/heads\//);
