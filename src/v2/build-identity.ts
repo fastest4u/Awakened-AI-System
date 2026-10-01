@@ -8,7 +8,8 @@ import { assertMinimumNodeVersion } from "../orchestrator/runtime/runtime-capabi
 
 // Replaced only by the build recipe, never by environment or request input.
 declare const __V2_DEPLOYMENT_ID__: string;
-const artifactNames = ["v2.js", "v2-admin.js", "workers/project-store.worker.js"] as const;
+const artifactNames = ["v2.js", "v2-admin.js", "workers/project-store.worker.js",
+  "internal/v2-internal-verified-read.js", "internal/v2-internal-verified-read-cleanup.js"] as const;
 const digest = (bytes: Uint8Array | string) => createHash("sha256").update(bytes).digest("hex");
 function fail(): never { throw new FreshStartError("FRESH_START_BUILD_MISMATCH"); }
 function exact(value: unknown, names: readonly string[]): Record<string, unknown> {
@@ -27,7 +28,7 @@ function bytes(path: string, maximum: number): Buffer {
 
 /** Independent local integrity measurement, not production release attestation.
  * The embedded generation binds the loaded code to this exact emitted deployment.
- * All JS dependencies of these three entries are bundled; only Node builtins remain.
+ * All JS dependencies of these five entries are bundled; only Node builtins remain.
  */
 export function inspectV2Build(entryUrl: string = import.meta.url): string {
   try {
@@ -35,7 +36,11 @@ export function inspectV2Build(entryUrl: string = import.meta.url): string {
     if (typeof __V2_DEPLOYMENT_ID__ !== "string") fail();
     const entry = fileURLToPath(entryUrl);
     const directory = dirname(entry);
-    const root = entry.endsWith("project-store.worker.js") ? dirname(directory) : directory;
+    // Enumerated entries only: neither arbitrary suffixes nor caller-chosen roots.
+    const roots = artifactNames.map(name => name.includes("/") ? dirname(directory) : directory);
+    const index = artifactNames.findIndex((name, i) => join(roots[i]!, name) === entry);
+    if (index < 0) fail();
+    const root = roots[index]!;
     if (!artifactNames.some(name => join(root, name) === entry)) fail();
     const manifest = exact(JSON.parse(bytes(join(root, "v2-build.json"), 16384).toString("utf8")),
       ["schemaVersion", "deploymentId", "runtime", "artifacts", "buildIdentityHash"]);

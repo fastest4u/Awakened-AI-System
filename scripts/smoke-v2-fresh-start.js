@@ -19,7 +19,8 @@ const archive = join(root, 'archive'), vault = join(root, 'memory-v2'), releaseI
 let child;
 let childClosed = true;
 try {
-  for (const path of ['v2.js', 'v2-admin.js', 'workers/project-store.worker.js']) assert.ok(lstatSync(join(deployment, path)).isFile());
+  for (const path of ['v2.js', 'v2-admin.js', 'workers/project-store.worker.js',
+    'internal/v2-internal-verified-read.js', 'internal/v2-internal-verified-read-cleanup.js']) assert.ok(lstatSync(join(deployment, path)).isFile());
   const build = JSON.parse(readFileSync(join(deployment, 'v2-build.json'), 'utf8'));
   mkdirSync(archive); writeFileSync(join(archive, 'sentinel.txt'), secret);
   const sentinel = lstatSync(join(archive, 'sentinel.txt'), { bigint: true });

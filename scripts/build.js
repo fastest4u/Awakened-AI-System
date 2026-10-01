@@ -23,7 +23,7 @@ const { default: obfuscator } = await import('javascript-obfuscator');
 const { default: ts } = await import(selectedTools.typescript);
 const packageJson = JSON.parse(readFileSync(path.resolve(__dirname, '../package.json'), 'utf8'));
 
-function assertClosedSyntax(name, bytes, emitted = false) {
+function assertClosedSyntax(name, bytes, emitted = false, isolated = false) {
     const source = ts.createSourceFile(name, bytes.toString('utf8'), ts.ScriptTarget.Latest, true);
     if (source.parseDiagnostics.length) buildRefusal();
     const nodes = [];
@@ -34,7 +34,7 @@ function assertClosedSyntax(name, bytes, emitted = false) {
     // binding use, independently again after esbuild renames the emitted bindings.
     if (emitted || name === 'src/orchestrator/storage/schema-fingerprint.ts') {
         const imports = nodes.filter(node => ts.isImportSpecifier(node) && (node.propertyName ?? node.name).text === 'createRequire');
-        if (imports.length > 1) buildRefusal();
+        if (imports.length > (isolated && emitted ? 2 : 1)) buildRefusal();
         for (const specifier of imports) {
             const declaration = specifier.parent.parent.parent;
             if (!ts.isImportDeclaration(declaration) || !ts.isStringLiteral(declaration.moduleSpecifier)
@@ -54,7 +54,7 @@ function assertClosedSyntax(name, bytes, emitted = false) {
                 || (!emitted && (!(binding.parent.flags & ts.NodeFlags.Const) || binding.name.text !== 'require'))) buildRefusal();
             permitted.add(call.expression); permitted.add(binding.name); loaderNames.add(binding.name.text);
             const calls = nodes.filter(node => ts.isCallExpression(node) && ts.isIdentifier(node.expression) && node.expression.text === binding.name.text);
-            if (calls.length !== 1) buildRefusal();
+            if (calls.length !== 1 && !(isolated && emitted && factory === '__v2CreateRequire' && calls.length === 0)) buildRefusal();
             for (const builtin of calls) {
                 if (builtin.questionDotToken || builtin.arguments.length !== 1 || !ts.isStringLiteral(builtin.arguments[0])
                     || builtin.arguments[0].text !== 'node:sqlite') buildRefusal();
@@ -63,6 +63,9 @@ function assertClosedSyntax(name, bytes, emitted = false) {
         }
     }
     function visit(node) {
+        if (isolated && (ts.isImportDeclaration(node) || ts.isExportDeclaration(node)) && node.moduleSpecifier
+            && ts.isStringLiteral(node.moduleSpecifier) && /^(node:)?(child_process|worker_threads)$/.test(node.moduleSpecifier.text)) buildRefusal();
+        if (isolated && ts.isPropertyAccessExpression(node) && node.name.text === 'getBuiltinModule') buildRefusal();
         if (ts.isCallExpression(node) && node.expression.kind === ts.SyntaxKind.ImportKeyword
             && (emitted || node.arguments.length !== 1 || !ts.isStringLiteral(node.arguments[0]) || !isBuiltin(node.arguments[0].text))) buildRefusal();
         const ordinaryRequireMethod = node.text === 'require' && node.parent && ((ts.isPropertyAccessExpression(node.parent)
@@ -142,7 +145,7 @@ async function build() {
     const config = JSON.parse(readBuildBytes('tsconfig.json'));
     if (config.extends) buildRefusal();
     const measured = measuredPrivateBuild();
-    const freshStart = freshStartBuild(outDir);
+    const freshStart = freshStartBuild(outDir, (name, bytes, emitted) => assertClosedSyntax(name, bytes, emitted, true));
 
     console.log('🚀 Step 1: Bundling with esbuild...');
     await esbuild.build({
@@ -242,6 +245,16 @@ async function build() {
         ...freshStart.options,
     });
     freshStart.accept(v2AdminBuild);
+
+    console.log('Bundling measured isolated V2 verified-read and cleanup entries...');
+    for (const [entry, artifact] of [
+        ['src/v2/internal-verified-read.entry.ts', 'internal/v2-internal-verified-read.js'],
+        ['src/v2/internal-verified-read-cleanup.entry.ts', 'internal/v2-internal-verified-read-cleanup.js'],
+    ]) {
+        const result = await esbuild.build({ entryPoints: [entry], bundle: true, platform: 'node', format: 'esm',
+            outfile: path.join(outDir, artifact), target: 'node24.16', minify: true, ...freshStart.options });
+        freshStart.accept(result);
+    }
 
     console.log('🧵 Step 5: Bundling upgrade phase worker (dist/workers/project-store-upgrade-phase.worker.js)...');
     await esbuild.build({

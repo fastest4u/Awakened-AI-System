@@ -213,9 +213,9 @@ test("missing and altered compiled deployment files fail closed in copied deploy
   const f = fixture();
   try {
     f.manifest(); assert.equal(f.admin("initialize-fresh").status, 0);
-    for (const target of ["v2-build.json", "workers/project-store.worker.js", "v2-admin.js"]) {
+    for (const target of ["v2-build.json", "workers/project-store.worker.js", "v2-admin.js", "internal/v2-internal-verified-read.js", "internal/v2-internal-verified-read-cleanup.js"]) {
       const deployment = join(f.projectRoot, randomUUID()); mkdirSync(deployment);
-      for (const file of ["v2.js", "v2-admin.js", "v2-build.json", "workers/project-store.worker.js"]) { mkdirSync(resolve(deployment, file, ".."), { recursive: true }); cpSync(join(root, "dist", file), join(deployment, file)); }
+      for (const file of ["v2.js", "v2-admin.js", "v2-build.json", "workers/project-store.worker.js", "internal/v2-internal-verified-read.js", "internal/v2-internal-verified-read-cleanup.js"]) { mkdirSync(resolve(deployment, file, ".."), { recursive: true }); cpSync(join(root, "dist", file), join(deployment, file)); }
       if (target === "v2-build.json") unlinkSync(join(deployment, target));
       else writeFileSync(join(deployment, target), readFileSync(join(deployment, target), "utf8") + "\n// altered owned fixture\n");
       const result = f.admin("status", deployment); assert.equal(result.status, 1); assert.match(result.stderr, /FRESH_START_BUILD_MISMATCH/);
