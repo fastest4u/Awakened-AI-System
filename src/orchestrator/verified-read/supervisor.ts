@@ -113,6 +113,7 @@ export function createVerifiedReadAdapter(input: VerifiedReadBinding, dependenci
   }
   function expireCleanup(lane: Lane) {
     if (lane.done || lane.incomplete) return;
+    if (!lane.settled) settle(lane, deps.now() >= lane.deadline ? deadlineFailure(lane) : "WORKER_UNAVAILABLE");
     lane.incomplete = true; quarantine = true; lane.phase = "cleanup"; deps.clear(lane.graceTimer); deps.clear(lane.cleanupTimer);
     stopProcess(lane.read); stopProcess(lane.cleanupChild); detach(lane.read, true); detach(lane.cleanupChild, true);
     if (lane.recordOwned && !lane.recordClosed) void deps.ownership.retainIncomplete(lane.ids).catch(() => undefined);
@@ -135,19 +136,26 @@ export function createVerifiedReadAdapter(input: VerifiedReadBinding, dependenci
   function fail(lane: Lane, failure: VerifiedReadFailureCode) {
     if (lane.done || lane.incomplete) return; settle(lane, failure);
     if (active !== lane) { const index = queue.indexOf(lane); if (index !== -1) queue.splice(index, 1); return; }
-    if (lane.cleanupStarted === undefined) {
-      lane.cleanupStarted = deps.now(); lane.phase = "cleanup";
-      lane.cleanupTimer = deps.schedule(() => expireCleanup(lane), CLEANUP_MS);
-      if (lane.read && !lane.read.exited) {
+    beginCleanup(lane); lane.phase = "cleanup";
+    if (cleanupLive(lane)) {
+      if (lane.read && !lane.read.exited && lane.graceTimer === undefined) {
         try { lane.read.port.send({ version: 1, ids: lane.ids, kind: "cancel" }); } catch { /* grace/terminate still apply */ }
-        lane.graceTimer = deps.schedule(() => { if (cleanupLive(lane)) stopProcess(lane.read); }, 100);
+        lane.graceTimer = deps.schedule(() => { if (cleanupLive(lane)) stopProcess(lane.read); }, Math.min(100, CLEANUP_MS - (deps.now() - lane.cleanupStarted!)));
       }
     }
     progressCleanup(lane);
   }
+  function beginCleanup(lane: Lane) {
+    if (lane.cleanupStarted !== undefined) return;
+    lane.cleanupStarted = deps.now();
+    lane.cleanupTimer = deps.schedule(() => expireCleanup(lane), CLEANUP_MS);
+  }
+  function deadlineFailure(lane: Lane): VerifiedReadFailureCode {
+    return lane.phase === "projection-wait" ? "PROJECTION_LAG" : "WORKER_TIMEOUT";
+  }
   function eligible(lane: Lane): boolean {
     if (lane.done || lane.incomplete || lane.settled) return false;
-    if (deps.now() >= lane.deadline) { fail(lane, "WORKER_TIMEOUT"); return false; }
+    if (deps.now() >= lane.deadline) { fail(lane, deadlineFailure(lane)); return false; }
     if (deps.currentEpoch() !== lane.ids.laneEpoch) { fail(lane, "FRESH_START_ADMISSION_STALE"); return false; }
     return true;
   }
@@ -195,10 +203,11 @@ export function createVerifiedReadAdapter(input: VerifiedReadBinding, dependenci
         if (!matches(reply.ids, lane.ids) || state.terminal || state.exited) throw error("WORKER_PROTOCOL_ERROR");
         if (reply.kind === "stage") {
           if (PHASES[state.stage++] !== reply.phase) throw error("WORKER_PROTOCOL_ERROR");
+          // A stage carries no authoritative required position; do not invent a positions pair from caller minima.
           if (!lane.settled) lane.phase = reply.phase;
         } else {
           state.terminal = reply;
-          if (reply.kind === "success") { if (state.stage !== PHASES.length) throw error("WORKER_PROTOCOL_ERROR"); validateSuccess(lane, reply); }
+          if (reply.kind === "success") { if (state.stage !== PHASES.length) throw error("WORKER_PROTOCOL_ERROR"); validateSuccess(lane, reply); beginCleanup(lane); }
           if (reply.kind === "failure") { lane.positions = reply.failure.positions; fail(lane, reply.failure.code); }
           if (reply.kind === "cleanup" && (reply.cleanup !== "complete" || !["released", "absent"].includes(reply.outcome))) expireCleanup(lane);
         }
@@ -288,7 +297,7 @@ export function createVerifiedReadAdapter(input: VerifiedReadBinding, dependenci
         const number = ++sequence; const lane: Lane = { sequence: number, ids: Object.freeze({ requestId: `${supervisorId}:${number}`, attemptId: randomUUID(), laneEpoch: binding.compositionEpoch }),
           request, deadline: arrival + request.budgetMs, token: randomBytes(16).toString("hex"), resolve, reject, settled: false,
           phase: "queue", code: null, positions: null, inFlight: 0, started: false, recordOwned: false, recordClosed: false, recordClosing: false, incomplete: false, done: false };
-        lane.responseTimer = deps.schedule(() => fail(lane, "WORKER_TIMEOUT"), Math.max(0, lane.deadline - deps.now()));
+        lane.responseTimer = deps.schedule(() => fail(lane, deadlineFailure(lane)), Math.max(0, lane.deadline - deps.now()));
         if (options?.signal) { const signal = options.signal; const abort = () => fail(lane, "WORKER_CLOSED"); signal.addEventListener("abort", abort, { once: true }); lane.abort = () => signal.removeEventListener("abort", abort); }
         queue.push(lane); pump();
       });

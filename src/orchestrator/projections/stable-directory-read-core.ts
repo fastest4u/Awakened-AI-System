@@ -16,10 +16,12 @@ const TOKEN = /^[0-9a-f]{32}$/u;
 const GENERATION = /^projections-2-([1-9][0-9]{0,9})\.sqlite$/u;
 const RETAINED = ["previous", "attempted", "displaced", "failed"]
   .map(kind => `.projection-manifest.${kind}-`);
+type CwdManifestSnapshot = Extract<StableProjectionManifestSnapshot, { state: "missing" }>
+  | (Extract<StableProjectionManifestSnapshot, { state: "present" }> & { readonly ctimeNs: string });
 
 export interface CwdProjectionReadCore {
   assertDirectory(): void;
-  captureManifest(): StableProjectionManifestSnapshot;
+  captureManifest(): CwdManifestSnapshot;
   acquireLock(token: string): "acquired" | "busy";
   captureGeneration(token: string, filename: string, maximumBytes: number): StableProjectionGenerationImage;
   releaseOwnedLock(token: string, allowAbsent: boolean): "released" | "absent" | "poisoned";
@@ -94,7 +96,7 @@ export function createCwdProjectionReadCore(expected: ProjectionDirectoryIdentit
   }
   return Object.freeze({
     assertDirectory,
-    captureManifest(): StableProjectionManifestSnapshot {
+    captureManifest(): CwdManifestSnapshot {
       assertDirectory();
       try { lstatSync(MANIFEST, { bigint: true }); }
       catch (error) {
@@ -103,7 +105,7 @@ export function createCwdProjectionReadCore(expected: ProjectionDirectoryIdentit
         return Object.freeze({ state: "missing", directoryIdentity });
       }
       const image = captureFile(MANIFEST, MAX_MANIFEST_BYTES);
-      return Object.freeze({ state: "present", directoryIdentity,
+      return Object.freeze({ state: "present", directoryIdentity, ctimeNs: image.ctimeNs,
         fileIdentity: Object.freeze({ device: image.device, inode: image.inode, size: image.size, sha256: image.sha256 }),
         bytesBase64: image.bytes.toString("base64") });
     },

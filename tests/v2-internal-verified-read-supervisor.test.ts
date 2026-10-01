@@ -93,6 +93,74 @@ test("success waits for normal actual exit and async record closure with a final
     f.setEpoch("new-epoch"); gate.resolve(); await assert.rejects(pending, { code: "FRESH_START_ADMISSION_STALE" });
   } finally { gate.resolve(); await f.dispose(); }
 });
+for (const deliverTimer of [true, false]) test(`normal success delayed actual exit expires its own cleanup window (timer ${deliverTimer})`, async () => {
+  const f = await fixture();
+  try {
+    let settlements = 0; const outcome = f.adapter.verify({ ...f.request, budgetMs: 10000 }).then(value => { settlements++; return value; }, cause => { settlements++; return cause; });
+    await until(() => !!f.processes[0]?.bootstrap()); const child = f.processes[0]!;
+    child.stages(); child.events.emit("message", child.success()); f.clock.advance(2001, deliverTimer);
+    if (!deliverTimer) child.events.emit("exit", 0, null);
+    await turn(); assert.equal(settlements, 1, "normal shutdown must settle at its fixed cleanup limit, before the longer response limit");
+    assert.equal((await outcome).code, "WORKER_UNAVAILABLE"); assert.equal(f.adapter.diagnostic().cleanup, "incomplete");
+    child.events.emit("exit", 0, null); f.clock.advance(10000); await turn(); assert.equal(settlements, 1);
+    await assert.rejects(f.adapter.verify(f.request), { code: "WORKER_UNAVAILABLE" });
+  } finally { await f.dispose(); }
+});
+test("normal success held actual ownership unlink expires before longer response and late removal only permits a fresh adapter", async t => {
+  const f = await fixture(); const { create, Repository } = await modules();
+  const target = join(f.binding.executorStateDirectory.canonicalPath, "verified-read-owner.json");
+  const reached = deferred(), release = deferred(), removed = deferred(); const unlink = fsPromises.unlink; let held = false;
+  const wrapper = t.mock.method(fsPromises, "unlink", async (path: Parameters<typeof unlink>[0]) => {
+    if (String(path) === target && !held) { held = true; reached.resolve(); await release.promise; await unlink(path); removed.resolve(); }
+    else await unlink(path);
+  }); syncBuiltinESMExports();
+  try {
+    let settlements = 0; const outcome = f.adapter.verify({ ...f.request, budgetMs: 10000 }).then(value => { settlements++; return value; }, cause => { settlements++; return cause; });
+    await until(() => !!f.processes[0]?.bootstrap()); const child = f.processes[0]!;
+    child.stages(); child.events.emit("message", child.success()); child.events.emit("exit", 0, null);
+    await reached.promise; f.clock.advance(2001); await turn();
+    assert.equal(settlements, 1, "held native unlink must not borrow the longer response budget");
+    assert.equal((await outcome).code, "WORKER_UNAVAILABLE"); assert.equal(f.adapter.diagnostic().cleanup, "incomplete");
+    assert.equal(JSON.parse(await readFile(target, "utf8")).state, "complete");
+    release.resolve(); await removed.promise; assert.equal(await f.ownership.inspect(), null);
+    assert.equal(settlements, 1); await assert.rejects(f.adapter.verify(f.request), { code: "WORKER_UNAVAILABLE" });
+    const processes: ProcessPort[] = []; const fresh = create(f.binding, { ownership: new Repository(f.binding.executorStateDirectory), now: f.clock.now,
+      schedule: f.clock.schedule, clear: f.clock.clear, currentEpoch: () => "epoch", spawnOwned() { const port = new ProcessPort(); processes.push(port); return port; } });
+    const next = fresh.verify({ ...f.request, budgetMs: 10000 }); await until(() => !!processes[0]?.bootstrap());
+    processes[0]!.stages(); processes[0]!.events.emit("message", processes[0]!.success()); processes[0]!.events.emit("exit", 0, null);
+    assert.equal((await next).projectionGeneration, 1); assert.equal((await fresh.close()).cleanup, "complete");
+    assert.equal(f.adapter.diagnostic().cleanup, "incomplete");
+  } finally { release.resolve(); if (held) await removed.promise; await f.ownership.inspect().catch(() => undefined); wrapper.mock.restore(); syncBuiltinESMExports(); await f.dispose(); }
+});
+test("timely normal shutdown and real ownership removal succeed within the cleanup window", async () => {
+  const f = await fixture(); try {
+    const pending = f.adapter.verify({ ...f.request, budgetMs: 10000 }); await until(() => !!f.processes[0]?.bootstrap());
+    const child = f.processes[0]!; child.stages(); child.events.emit("message", child.success()); f.clock.advance(1999);
+    child.events.emit("exit", 0, null); assert.equal((await pending).projectionGeneration, 1);
+    assert.equal(await f.ownership.inspect(), null); assert.equal(f.adapter.diagnostic().cleanup, "complete");
+  } finally { await f.dispose(); }
+});
+for (const cancel of [false, true]) test(`normal cleanup window is not reset by later ${cancel ? "cancellation" : "response expiry"}`, async () => {
+  const f = await fixture(); const controller = new AbortController(); try {
+    const outcome = f.adapter.verify({ ...f.request, budgetMs: cancel ? 10000 : 1500 }, { signal: controller.signal }).catch(cause => cause);
+    await until(() => !!f.processes[0]?.bootstrap()); const child = f.processes[0]!;
+    child.stages(); child.events.emit("message", child.success()); f.clock.advance(1500); if (cancel) controller.abort();
+    assert.equal((await outcome).code, cancel ? "WORKER_CLOSED" : "WORKER_TIMEOUT");
+    f.clock.advance(500); assert.equal(f.adapter.diagnostic().cleanup, "incomplete"); assert.equal(child.terminations, 1);
+  } finally { await f.dispose(); }
+});
+for (const phase of ["admission", "projection-wait", "capture"]) for (const deliverTimer of [true, false]) test(`parent expiry classifies ${phase} with timer ${deliverTimer}`, async () => {
+  const f = await fixture(); try {
+    const outcome = f.adapter.verify({ ...f.request, budgetMs: 2000, minimumEventPosition: "5" }).catch(cause => cause);
+    await until(() => !!f.processes[0]?.bootstrap()); const child = f.processes[0]!;
+    child.events.emit("message", { version: 1, ids: child.bootstrap().ids, kind: "stage", phase: "admission", observedProjectionPosition: null });
+    if (phase !== "admission") child.events.emit("message", { version: 1, ids: child.bootstrap().ids, kind: "stage", phase: "projection-wait", observedProjectionPosition: "3" });
+    if (phase === "capture") child.events.emit("message", { version: 1, ids: child.bootstrap().ids, kind: "stage", phase: "capture", observedProjectionPosition: "5" });
+    f.clock.advance(2000, deliverTimer); if (!deliverTimer) child.events.emit("message", child.success());
+    assert.equal((await outcome).code, phase === "projection-wait" ? "PROJECTION_LAG" : "WORKER_TIMEOUT");
+    assert.equal(f.adapter.diagnostic().positions, null, "stage observation cannot supply the missing authoritative required tail");
+  } finally { await f.dispose(); }
+});
 for (const fault of ["missing-close", "stage-order", "unknown-id", "duplicate", "stdout", "stderr", "abnormal-exit", "late-output", "late-message", "async-error"]) test(`refuses ${fault} without success`, async () => {
   const f = await fixture(); try {
     const pending = f.adapter.verify(f.request); const rejected = assert.rejects(pending); await until(() => !!f.processes[0]?.bootstrap()); const child = f.processes[0]!;

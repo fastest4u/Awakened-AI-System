@@ -131,7 +131,7 @@ test("native abortable wait rejection is reported as cancellation rather than wo
   controls.deps.wait = async (ms, signal) => { setImmediate(() => controls.controller.abort()); await wait(ms, undefined, { signal }); };
   failure(await execute(bootstrap(f), controls.deps), "WORKER_CLOSED"); assert.equal(existsSync(lock), false);
 }));
-for (const phase of ["projection-wait", "capture", "revalidate"] as const) {
+for (const phase of ["projection-wait", "capture", "validate", "revalidate"] as const) {
   test(`recovery transition at ${phase} barrier denies detached receipt`, async () => withFixture(async (f, execute) => {
     const { deps } = dependencies(f, { stage: reply => { if (reply.phase === phase) stop(f); } });
     failure(await execute(bootstrap(f), deps), "FRESH_START_CONTENT_UNVERIFIED"); assert.equal(existsSync(lock), false);
@@ -150,6 +150,50 @@ test("replacement publication between initial observation and locked capture is 
   try { failure(await execute(bootstrap(f), dependencies(f).deps), "INTEGRITY_FAILURE");
     assert.equal(replaced, true); assert.equal(existsSync(lock), false); }
   finally { fs.openSync = original; syncBuiltinESMExports(); }
+}));
+for (const mutation of ["changed-sha", "identical-replacement", "same-inode-rewrite", "missing", "unchanged"] as const) {
+  test(`locked manifest ${mutation} at actual generation read boundary preserves continuity`, async () => withFixture(async (f, execute) => {
+    const originalRead = fs.readFileSync, originalOpen = fs.openSync; let imageFd: number | undefined, reached = false;
+    fs.openSync = ((path: fs.PathLike, ...args: unknown[]) => {
+      const fd = Reflect.apply(originalOpen, fs, [path, ...args]) as number;
+      if (String(path) === f.manifest.databaseFile) imageFd = fd;
+      return fd;
+    }) as typeof fs.openSync;
+    fs.readFileSync = ((path: fs.PathOrFileDescriptor, ...args: unknown[]) => {
+      const bytes = Reflect.apply(originalRead, fs, [path, ...args]);
+      if (imageFd !== undefined && path === imageFd && !reached) {
+        reached = true; assert.equal(readFileSync(lock, "utf8"), "b".repeat(32));
+        if (mutation === "missing") unlinkSync("projection-manifest.json");
+        else if (mutation === "same-inode-rewrite") {
+          const before = fs.lstatSync("projection-manifest.json", { bigint: true });
+          writeFileSync("projection-manifest.json", originalRead("projection-manifest.json"));
+          const after = fs.lstatSync("projection-manifest.json", { bigint: true });
+          assert.equal(after.ino, before.ino); assert.notEqual(after.ctimeNs, before.ctimeNs);
+        }
+        else if (mutation !== "unchanged") {
+          const replacement = mutation === "changed-sha" ? Buffer.from(JSON.stringify({ ...f.manifest, databaseSha256: "f".repeat(64) })) : originalRead("projection-manifest.json");
+          writeFileSync("manifest-replacement", replacement); fs.renameSync("manifest-replacement", "projection-manifest.json");
+        }
+      }
+      return bytes;
+    }) as typeof fs.readFileSync;
+    syncBuiltinESMExports();
+    try {
+      const reply = await execute(bootstrap(f), dependencies(f).deps); assert.equal(reached, true);
+      if (mutation === "unchanged") { assert.equal(reply.kind, "success"); if (reply.kind === "success") assert.deepEqual(reply.closed, { image: true, reader: true, lock: true }); }
+      else failure(reply, "PROJECTION_PATH_INVALID");
+      assert.equal(existsSync(lock), false);
+    } finally { fs.readFileSync = originalRead; fs.openSync = originalOpen; syncBuiltinESMExports(); }
+  }));
+}
+test("capture phase is reported before the actual generation descriptor is opened", async () => withFixture(async (f, execute) => {
+  const controls = dependencies(f); const open = fs.openSync; let observed: string | undefined;
+  fs.openSync = ((path: fs.PathLike, ...args: unknown[]) => {
+    if (String(path) === f.manifest.databaseFile) { const last = controls.stages.at(-1); observed = last?.kind === "stage" ? last.phase : undefined; }
+    return Reflect.apply(open, fs, [path, ...args]);
+  }) as typeof fs.openSync; syncBuiltinESMExports();
+  try { assert.equal((await execute(bootstrap(f), controls.deps)).kind, "success"); assert.equal(observed, "capture"); }
+  finally { fs.openSync = open; syncBuiltinESMExports(); }
 }));
 for (const suffix of ["-wal", "-shm"]) test(`image ${suffix} sidecar refuses actual image capture`, async () => withFixture(async (f, execute) => {
   writeFileSync(f.manifest.databaseFile + suffix, "owned sidecar");
@@ -281,7 +325,7 @@ test("owner opens genuine readonly-existing reader with floored fractional remai
 }));
 
 test("foreign token replacement after actual capture is preserved and leaves cleanup incomplete", async () => withFixture(async (f, execute) => {
-  const { deps } = dependencies(f, { stage: reply => { if (reply.phase === "capture") writeFileSync(lock, "c".repeat(32)); } });
+  const { deps } = dependencies(f, { stage: reply => { if (reply.phase === "validate") writeFileSync(lock, "c".repeat(32)); } });
   failure(await execute(bootstrap(f), deps), "PROJECTION_PATH_INVALID", "incomplete");
   assert.equal(readFileSync(lock, "utf8"), "c".repeat(32)); assert.equal(existsSync(f.manifest.databaseFile), true);
 }));

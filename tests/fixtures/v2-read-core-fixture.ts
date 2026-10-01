@@ -32,7 +32,9 @@ if (scenario === "valid") {
   const direct = capture();
   const { filesystemStableProjectionDirectoryOperations: legacy } = await import("../../src/orchestrator/projections/stable-directory.js");
   assert.deepEqual(direct, legacy.readGenerationImage(expected.canonicalPath, expected, TOKEN, GENERATION));
-  assert.deepEqual(second, legacy.captureManifest(expected.canonicalPath, expected));
+  const { ctimeNs, ...legacyFields } = second;
+  assert.equal(ctimeNs, fs.lstatSync(MANIFEST, { bigint: true }).ctimeNs.toString());
+  assert.deepEqual(legacyFields, legacy.captureManifest(expected.canonicalPath, expected));
   assert.equal(Object.isFrozen(direct), true);
   assert.equal(Object.isFrozen(direct.identity), true);
   fs.writeFileSync(GENERATION, "changed");

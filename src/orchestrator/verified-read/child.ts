@@ -60,10 +60,10 @@ export async function executeVerifiedRead(bootstrap: ReadBootstrap, dependencies
     if (core.releaseOwnedLock(input.lockToken, false) !== "released") fail("PROJECTION_PATH_INVALID");
     lockClosed = true; lockOwned = false;
   };
-  const manifest = (): ProjectionManifestV2 | null => {
+  const manifest = () => {
     checkpoint(); const captured = core.captureManifest(); checkpoint();
     if (captured.state === "missing") return null;
-    try { return parseProjectionManifestV2(JSON.parse(Buffer.from(captured.bytesBase64, "base64").toString("utf8")) as unknown, input.binding.projectionBinding); }
+    try { return { snapshot: captured, value: parseProjectionManifestV2(JSON.parse(Buffer.from(captured.bytesBase64, "base64").toString("utf8")) as unknown, input.binding.projectionBinding) }; }
     catch { return fail("INTEGRITY_FAILURE"); }
   };
   const lag = (required: string, observed: string | null): never => {
@@ -85,8 +85,8 @@ export async function executeVerifiedRead(bootstrap: ReadBootstrap, dependencies
     let waits = 0, observed: string | null = null, selected: ProjectionManifestV2;
     let capturedBytes: Uint8Array;
     while (true) {
-      const candidate = manifest(); observed = candidate?.terminalEventPosition ?? null;
-      if (candidate && BigInt(candidate.terminalEventPosition) >= BigInt(fence.requiredPosition)) {
+      const candidate = manifest(); observed = candidate?.value.terminalEventPosition ?? null;
+      if (candidate && BigInt(candidate.value.terminalEventPosition) >= BigInt(fence.requiredPosition)) {
         checkpoint();
         // A throwing acquire can leave partial evidence: it proves no ownership and is never released here.
         lockClosed = false;
@@ -94,10 +94,19 @@ export async function executeVerifiedRead(bootstrap: ReadBootstrap, dependencies
         if (acquired === "busy") lockClosed = true;
         else {
           lockOwned = true; lockAttempted = false; checkpoint();
-          const locked = manifest(); observed = locked?.terminalEventPosition ?? null;
-          if (locked && BigInt(locked.terminalEventPosition) >= BigInt(fence.requiredPosition)) {
-            const captured = core.captureGeneration(input.lockToken, locked.databaseFile, 64 * 1024 * 1024); checkpoint();
-            selected = locked; capturedBytes = captured.bytes; stage("capture", observed); break;
+          const locked = manifest(); observed = locked?.value.terminalEventPosition ?? null;
+          if (locked && BigInt(locked.value.terminalEventPosition) >= BigInt(fence.requiredPosition)) {
+            stage("capture", observed);
+            const captured = core.captureGeneration(input.lockToken, locked.value.databaseFile, 64 * 1024 * 1024); checkpoint();
+            // Compare the real locked bytes AND provenance after named image capture, before releasing this token.
+            const after = core.captureManifest(); checkpoint();
+            if (after.state !== "present" || after.ctimeNs !== locked.snapshot.ctimeNs
+              || after.bytesBase64 !== locked.snapshot.bytesBase64
+              || after.fileIdentity.device !== locked.snapshot.fileIdentity.device
+              || after.fileIdentity.inode !== locked.snapshot.fileIdentity.inode
+              || after.fileIdentity.size !== locked.snapshot.fileIdentity.size
+              || after.fileIdentity.sha256 !== locked.snapshot.fileIdentity.sha256) fail("PROJECTION_PATH_INVALID");
+            selected = locked.value; capturedBytes = captured.bytes; break;
           }
           closeLock(); checkpoint();
         }
