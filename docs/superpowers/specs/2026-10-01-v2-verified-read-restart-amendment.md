@@ -1,6 +1,6 @@
 # V2 verified-read Task 5: conservative restart amendment
 
-Status: **Written amendment awaiting user review.** On 2026-10-01 the user approved the approach “ห้ามเริ่มจนลบเสร็จจริง” and authorized writing this amendment first. That approval did not authorize implementation of this changed contract or production activation. The original [verified-read design](2026-10-01-v2-internal-verified-read-design.md) and [implementation plan](../plans/2026-10-01-v2-internal-verified-read.md) retain their historical approval and acceptance state until this amendment is reviewed.
+Status: **Written amendment approved by the user on 2026-10-01.** The user replied `อนุมัติ` to the explicit written-review request for this artifact at `e6e1f67`, after earlier approving the approach “ห้ามเริ่มจนลบเสร็จจริง”. The original [verified-read design](2026-10-01-v2-internal-verified-read-design.md) and [implementation plan](../plans/2026-10-01-v2-internal-verified-read.md) now reflect this contract; the amended Task 5 plan steps await review before implementation resumes. Historical Tasks 1–4 acceptance remains unchanged. This is not Task 5 acceptance or production activation.
 
 ## 1. Outcome and reason
 
@@ -44,7 +44,7 @@ Use deterministic barriers around the actual ownership I/O seam, real owned file
 
 ## 5. Scope and handoff
 
-Keep the selected Subagent-Driven method and existing worktree. Preserve the six unaccepted Task 5 candidate files and existing evidence while this written amendment awaits review. Written approval authorizes reconciling the Task 5 plan/brief for its existing review checkpoints before implementation resumes; it does not authorize deployment, live configuration/trust changes, transcript/credential reads, V1 import/fallback, public content enablement, push or hosted CI.
+Keep the selected Subagent-Driven method and existing worktree. Preserve the six unaccepted Task 5 candidate files and existing evidence while the amended Task 5 plan steps await review. Written approval authorizes reconciling the Task 5 plan/brief for its existing review checkpoints before implementation resumes; it does not authorize deployment, live configuration/trust changes, transcript/credential reads, V1 import/fallback, public content enablement, push or hosted CI.
 
 F2 public native memory/privacy and actual Codex desktop integration, F3 recovery of newly acknowledged V2 data plus exact-release evidence, and F4 explicitly approved activation/live verification remain unfinished. This amendment cannot certify PROD-ready, recovered content or actual host capture.
 
