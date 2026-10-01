@@ -1,7 +1,7 @@
 import { decodeFreshStartGenesis, decodeFreshStartIdentity, decodeFreshStartRelease, FreshStartError,
   type FreshStartGenesis, type FreshStartIdentity, type FreshStartMode, type FreshStartRelease, type FreshStartState } from "../fresh-start/contracts.js";
 import { parseProjectionManifestV2, type ProjectionManifestV2 } from "../projections/manifest-codec.js";
-import { GENESIS_GLOBAL_HASH } from "../storage/event-append-transaction.js";
+import { GENESIS_GLOBAL_HASH } from "../storage/event-chain-constants.js";
 import { assertBoundSqliteConnectionIdentity } from "../storage/node-sqlite-driver.js";
 import { inspectStoreSchema, requireCurrentStoreSchema } from "../storage/schema-compatibility.js";
 import type { SqliteConnection, SqliteRow } from "../storage/sqlite-driver.js";

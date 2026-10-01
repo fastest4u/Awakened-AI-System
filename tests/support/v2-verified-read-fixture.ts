@@ -107,25 +107,33 @@ export async function makeActiveReadFixture(measuredBuildHash = READ_HASH) {
     const stat = lstatSync(canonicalPath, { bigint: true });
     return Object.freeze({ canonicalPath, device: String(stat.dev), inode: String(stat.ino) });
   };
-  const projectionDirectory = directory("projection");
-  const executorStateDirectory = directory("executor-state");
-  const deploymentDirectory = directory("deployment");
   const path = join(root, "events.sqlite");
   const driver = new NodeSqliteDriver({ DatabaseSync });
-  const writer = driver.open(path, { mode: "create", busyTimeoutMs: 1000 });
+  let writer: SqliteConnection | undefined;
   let reader: SqliteConnection | undefined;
   const cleanup = (): void => {
-    try { reader?.close(); } finally { writer.close(); }
-    const current = lstatSync(root, { bigint: true });
-    if (!current.isDirectory() || current.isSymbolicLink() || realpathSync.native(root) !== root
-      || current.dev !== rootStat.dev || current.ino !== rootStat.ino) throw new Error("owned fixture root changed");
-    rmSync(root, { recursive: true, force: true });
+    let failure: unknown;
+    const attempt = (operation: () => void) => { try { operation(); } catch (error) { failure ??= error; } };
+    attempt(() => { const owned = reader; reader = undefined; owned?.close(); });
+    attempt(() => { const owned = writer; writer = undefined; owned?.close(); });
+    attempt(() => {
+      const current = lstatSync(root, { bigint: true });
+      if (!current.isDirectory() || current.isSymbolicLink() || realpathSync.native(root) !== root
+        || current.dev !== rootStat.dev || current.ino !== rootStat.ino) throw new Error("owned fixture root changed");
+      rmSync(root, { recursive: true, force: true });
+    });
+    if (failure !== undefined) throw failure;
   };
   try {
-    applyCurrentProjectStoreSchema(writer, FRESH_IDENTITY, FRESH_NOW);
+    const projectionDirectory = directory("projection");
+    const executorStateDirectory = directory("executor-state");
+    const deploymentDirectory = directory("deployment");
+    const ownedWriter = driver.open(path, { mode: "create", busyTimeoutMs: 1000 });
+    writer = ownedWriter;
+    applyCurrentProjectStoreSchema(ownedWriter, FRESH_IDENTITY, FRESH_NOW);
     const release = freshRelease({ buildIdentityHash: measuredBuildHash,
       schemaIdentityHash: expectedSchemaFingerprint(PROJECT_STORE_MIGRATIONS) });
-    const repository = new SqliteFreshStartRepository(writer);
+    const repository = new SqliteFreshStartRepository(ownedWriter);
     repository.transact(FRESH_IDENTITY, tx => tx.install(freshGenesis(), release));
     const approvals = new TrustedOperatorApprovalVerifier(async (_bytes, requestDigest) => ({ identity: FRESH_IDENTITY,
       approvalId: randomUUID(), nonceDigest: createHash("sha256").update(randomUUID()).digest("hex"),
@@ -133,7 +141,7 @@ export async function makeActiveReadFixture(measuredBuildHash = READ_HASH) {
     const control = new FreshStartControlPlane(repository, approvals, new TrustedFreshStartEvidenceVerifier(async value => value));
     await control.transition({ identity: FRESH_IDENTITY, expectedGeneration: 0n, expectedMode: "prepared",
       expectedReleaseId: release.releaseId, nextMode: "active", nextRelease: release, approvalEnvelope: new Uint8Array([1]) });
-    bindFreshStartAdmissionContext(writer, { identity: FRESH_IDENTITY, releaseId: release.releaseId, measuredBuildHash, generation: 1n });
+    bindFreshStartAdmissionContext(ownedWriter, { identity: FRESH_IDENTITY, releaseId: release.releaseId, measuredBuildHash, generation: 1n });
     const stat = lstatSync(path, { bigint: true });
     const binding: VerifiedReadBinding = Object.freeze({ projectionBinding: Object.freeze({ ...FRESH_IDENTITY,
       workspaceId: command().context.binding.workspaceId, branchScopeId: null, branchRef: null, sessionId: null }),
@@ -143,13 +151,13 @@ export async function makeActiveReadFixture(measuredBuildHash = READ_HASH) {
     reader = driver.open(path, { mode: "read-only-existing", bindFileIdentity: true, busyTimeoutMs: 1000 });
     const admission = new Admission(reader, binding, measuredBuildHash);
     const request: VerifiedReadRequest = Object.freeze({ operation: "verify-published-view", consistency: "project-strong", minimumEventPosition: "0", budgetMs: 5000 });
-    const store = new EventStore(writer, new SqliteEventStoreStatements(writer), new MaintenanceFence(), new BranchScopeRepository(), () => FRESH_NOW);
+    const store = new EventStore(ownedWriter, new SqliteEventStoreStatements(ownedWriter), new MaintenanceFence(), new BranchScopeRepository(), () => FRESH_NOW);
     let appendNumber = 0;
     const append = () => {
       const value = command(); appendNumber += 1;
       const result = store.append({ ...value, commandId: randomUUID(), correlationId: randomUUID(), idempotencyKey: `read:${appendNumber}`,
         streamId: `read-stream-${appendNumber}` });
-      return { position: result.lastGlobalPosition.toString(), hash: writer.prepare("SELECT event_hash FROM events WHERE global_position = $position")
+      return { position: result.lastGlobalPosition.toString(), hash: ownedWriter.prepare("SELECT event_hash FROM events WHERE global_position = $position")
         .get({ $position: result.lastGlobalPosition })!.event_hash as string };
     };
     let generation = 0;
@@ -166,7 +174,7 @@ export async function makeActiveReadFixture(measuredBuildHash = READ_HASH) {
       } finally { snapshot.close(); }
     };
     const manifest = await publish();
-    return { root, path, reader, writer, binding, measuredBuildHash, identity: FRESH_IDENTITY, release,
+    return { root, path, reader, writer: ownedWriter, binding, measuredBuildHash, identity: FRESH_IDENTITY, release,
       repository, control, admission, request, manifest, append, publish, cleanup };
   } catch (error) { try { cleanup(); } catch { /* preserve setup failure */ } throw error; }
 }

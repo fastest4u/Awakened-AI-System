@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { GENESIS_GLOBAL_HASH } from "./event-chain-constants.js";
 import { assertFreshStartConnectionAllowed } from "../fresh-start/fresh-start-admission.js";
 import { FreshStartError } from "../fresh-start/contracts.js";
 import type {
@@ -49,7 +50,7 @@ import type {
 
 export const MAX_EVENTS_PER_COMMAND = 128;
 export const MAX_CANONICAL_COMMAND_BYTES = 4 * 1024 * 1024;
-export const GENESIS_GLOBAL_HASH = "0".repeat(64);
+export { GENESIS_GLOBAL_HASH } from "./event-chain-constants.js";
 export const PREVIOUS_PENDING_EVENT_CAUSATION = "project-memory/previous-pending-event/v1";
 
 export type EventStoreFaultBoundary =

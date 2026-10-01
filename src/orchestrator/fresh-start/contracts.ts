@@ -1,7 +1,7 @@
 import type { ProjectId, StoreId, VaultId } from "../identity/contracts.js";
 import { PROJECTION_NAMES, projectionCoreChecksum } from "../projections/checksum.js";
 import { PROJECTION_SCHEMA_VERSION } from "../projections/schema.js";
-import { GENESIS_GLOBAL_HASH } from "../storage/event-append-transaction.js";
+import { GENESIS_GLOBAL_HASH } from "../storage/event-chain-constants.js";
 
 export type FreshStartMode = "prepared" | "active" | "read-only-recovery" | "disabled";
 export type FreshStartIdentity = Readonly<{ projectId: ProjectId; vaultId: VaultId; storeId: StoreId }>;
