@@ -13,8 +13,8 @@ const artifacts = ["v2.js", "v2-admin.js", "workers/project-store.worker.js",
   "internal/v2-internal-verified-read.js", "internal/v2-internal-verified-read-cleanup.js"];
 const deployment = join(process.cwd(), "dist");
 const measured = () => JSON.parse(readFileSync(join(deployment, "v2-build.json"), "utf8"));
-async function fixture() {
-  const f = await makeActiveReadFixture(measured().buildIdentityHash);
+async function fixture(buildHash = measured().buildIdentityHash) {
+  const f = await makeActiveReadFixture(buildHash);
   try {
     for (const name of [...artifacts, "v2-build.json"]) {
       const target = join(f.binding.deploymentDirectory.canonicalPath, name);
@@ -95,13 +95,22 @@ for (const child of ["read", "cleanup"] as const) {
       const good = await ipc(join(f.binding.deploymentDirectory.canonicalPath, file), f.binding.projectionDirectory.canonicalPath, input(f, child));
       assert.equal(good.code, 0, good.stderr); assert.equal(good.messages.at(-1).kind, child === "read" ? "success" : "cleanup");
       if (child === "cleanup") assert.equal(good.messages.at(-1).cleanup, "complete");
-      for (const entry of [join(f.binding.deploymentDirectory.canonicalPath, file), fileURLToPath(new URL(`../src/v2/internal-verified-read${child === "cleanup" ? "-cleanup" : ""}.entry.js`, import.meta.url))]) {
-        const value = await ipc(entry, f.binding.projectionDirectory.canonicalPath, input(f, child, "f".repeat(64)));
-        assert.equal(value.messages.at(-1).kind, child === "read" ? "failure" : "cleanup");
-        if (child === "read") assert.equal(value.messages.at(-1).failure.code, "FRESH_START_BUILD_MISMATCH");
-        else assert.equal(value.messages.at(-1).cleanup, "incomplete");
-      }
+      const unbundled = fileURLToPath(new URL(`../src/v2/internal-verified-read${child === "cleanup" ? "-cleanup" : ""}.entry.js`, import.meta.url));
+      const value = await ipc(unbundled, f.binding.projectionDirectory.canonicalPath, input(f, child));
+      assert.equal(value.messages.at(-1).kind, child === "read" ? "failure" : "cleanup");
+      if (child === "read") assert.equal(value.messages.at(-1).failure.code, "FRESH_START_BUILD_MISMATCH");
+      else assert.equal(value.messages.at(-1).cleanup, "incomplete");
     } finally { f.cleanup(); }
+    // The wrong parent hash also matches real stored authority. Only independent
+    // inspection of the unchanged measured bundles can reject this composition.
+    const echo = await fixture("f".repeat(64));
+    try {
+      const file = `v2-internal-verified-read${child === "cleanup" ? "-cleanup" : ""}.js`;
+      const value = await ipc(join(echo.binding.deploymentDirectory.canonicalPath, file), echo.binding.projectionDirectory.canonicalPath, input(echo, child));
+      assert.equal(value.messages.at(-1).kind, child === "read" ? "failure" : "cleanup");
+      if (child === "read") { assert.equal(value.messages.at(-1).failure.code, "FRESH_START_BUILD_MISMATCH"); assert.equal(value.messages.filter(value => value.kind === "stage").length, 0); }
+      else assert.equal(value.messages.at(-1).cleanup, "incomplete");
+    } finally { echo.cleanup(); }
   });
   for (const fault of ["missing", "tampered", "wrong-deployment", "wrong-runtime", "wrong-build"] as const) test(`${child} independently refuses ${fault} copied deployment`, async () => {
     const f = await fixture();

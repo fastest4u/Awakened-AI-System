@@ -64,9 +64,13 @@ test("changed output lock is refused and foreign replacement is preserved", asyn
   try { assert.equal(await run({ root: f.root }), 1); assert.equal(readFileSync(join(f.root, ".fresh-start-foundation.lock"), "utf8"), "replacement"); }
   finally { f.cleanup(); }
 });
-test("unconfirmed native process-tree cleanup retains output ownership", { skip: process.platform !== "win32", timeout: 10000 }, async () => {
+test("unconfirmed native process-tree cleanup retains output ownership", { skip: process.platform !== "win32", timeout: 10000 }, async t => {
   const run = await gate(), f = fixture();
-  f.put("scripts/build.js", "import{spawn}from'node:child_process';spawn(process.execPath,['-e','setTimeout(()=>{},1800)'],{stdio:'inherit',windowsHide:true});process.exit(0);");
+  f.put("scripts/build.js", "import{spawn}from'node:child_process';import{writeFileSync}from'node:fs';const child=spawn(process.execPath,['-e','setTimeout(()=>{},1800)'],{stdio:'inherit',windowsHide:true});writeFileSync('created-processes.json',JSON.stringify({parentPid:process.pid,descendantPid:child.pid,execPath:process.execPath}));process.exit(0);");
   try { assert.equal(await run({ root: f.root, timeoutMs: 500 }), 1); assert.equal(existsSync(join(f.root, ".fresh-start-foundation.lock")), true);
-    await new Promise(resolve => setTimeout(resolve, 2000)); } finally { f.cleanup(); }
+  } finally {
+    // No elapsed-time or PID-based closure assertion. The fixture's unresolved
+    // output owner and exact process identities remain available for inspection.
+    t.diagnostic(`uncertain owned fixture retained: ${f.root}; processes=${existsSync(join(f.root, "created-processes.json")) ? readFileSync(join(f.root, "created-processes.json"), "utf8") : "creation-unobserved"}`);
+  }
 });
