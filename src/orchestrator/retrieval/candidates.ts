@@ -11,6 +11,7 @@ import {
   type ProjectionManifestV2,
 } from "../projections/manifest.js";
 import type { ProjectionReaderLease } from "../projections/reader-lease.js";
+import { ProjectionImageMetadataError, readProjectionImageMetadata } from "../projections/image-metadata.js";
 import {
   InternalRetrievalError,
   validateInternalRetrievalRequest,
@@ -226,27 +227,12 @@ function verifyMetadata(
   database: DatabaseSync,
   manifest: RetrievalProjectionManifest,
 ): void {
-  const statement = database.prepare(`
-    SELECT project_id, vault_id, store_id, workspace_id, branch_scope_id, branch_ref,
-           session_id, generation, terminal_event_position, terminal_event_hash
-    FROM projection_metadata WHERE singleton = $singleton AND schema_version = $schemaVersion
-  `);
-  statement.setReadBigInts(true);
-  const metadata = statement.get({ $singleton: 1, $schemaVersion: manifest.schemaVersion });
-  if (metadata === undefined) return projectionInvalid();
-  const source = row(metadata);
-  if (
-    source.project_id !== manifest.projectId
-    || source.vault_id !== manifest.vaultId
-    || source.store_id !== manifest.storeId
-    || source.workspace_id !== manifest.workspaceId
-    || source.branch_scope_id !== manifest.branchScopeId
-    || source.branch_ref !== manifest.branchRef
-    || source.session_id !== null
-    || numberValue(source, "generation") !== manifest.generation
-    || bigintValue(source, "terminal_event_position") !== BigInt(manifest.terminalEventPosition)
-    || source.terminal_event_hash !== manifest.terminalEventHash
-  ) throw new InternalRetrievalError("PROJECTION_SCOPE_MISMATCH");
+  try { readProjectionImageMetadata(database, manifest); }
+  catch (error) {
+    if (!(error instanceof ProjectionImageMetadataError)) throw error;
+    if (error.kind === "malformed") return projectionInvalid();
+    throw new InternalRetrievalError("PROJECTION_SCOPE_MISMATCH");
+  }
 }
 
 function normalized(value: string): string {

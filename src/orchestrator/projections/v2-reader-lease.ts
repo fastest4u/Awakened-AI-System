@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
 
 import { LifecycleError } from "../lifecycle/errors.js";
-import { openImmutableProjectionImage } from "./integrity.js";
+import { openImmutableProjectionImage } from "./immutable-image.js";
 import type { ProjectionManifestV2 } from "./manifest.js";
 import type {
   StableProjectionGenerationImage,

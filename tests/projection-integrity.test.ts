@@ -6,6 +6,7 @@ import {
   lstatSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
   realpathSync,
   renameSync,
   rmSync,
@@ -39,6 +40,7 @@ import type { ProjectBinding } from "../src/orchestrator/projections/contracts.j
 import { SqliteProjectionEventReader, type ProjectionEventSnapshot } from "../src/orchestrator/projections/event-reader.js";
 import {
   assertUnpublishedProjectionV2Image,
+  openImmutableProjectionImage,
   ProjectionIntegrityService,
   readVerifiedCanonicalProjectionSnapshot,
 } from "../src/orchestrator/projections/integrity.js";
@@ -919,21 +921,38 @@ describe("full projection integrity replay", () => {
     ]);
   });
 
-  it("opens the pinned byte image only through in-memory deserialization", () => {
-    const source = readFileSync(
-      join(process.cwd(), "src", "orchestrator", "projections", "integrity.ts"),
-      "utf8",
-    );
-
-    assert.match(source, /new DatabaseSync\(\s*":memory:"/);
-    assert.match(source, /\.deserialize\(\s*deserializableImage\(pinnedImage\.bytes\)\s*\)/);
-    assert.match(source, /const result = Uint8Array\.from\(bytes\)/);
-    assert.equal(source.match(/openSync\(path,\s*"r"\)/g)?.length, 1);
-    assert.doesNotMatch(source, /function hashGeneration\(/);
-    assert.doesNotMatch(
-      source,
-      /PRIVATE_INSPECTION|mkdtempSync|project-memory-projection-integrity-|after-private-root-validation-before-cleanup/,
-    );
+  it("opens the pinned byte image only through in-memory deserialization", async () => {
+    const fixture = await createFixture();
+    const sourceBefore = readFileSync(fixture.sourcePath);
+    const projectionBefore = readFileSync(fixture.databasePath);
+    const sourceStat = lstatSync(fixture.sourcePath, { bigint: true });
+    const projectionStat = lstatSync(fixture.databasePath, { bigint: true });
+    const root = dirname(fixture.projectionDirectory);
+    const rootEntries = readdirSync(root).sort();
+    const projectionEntries = readdirSync(fixture.projectionDirectory).sort();
+    const bytes = Uint8Array.from(projectionBefore);
+    bytes[18] = 2;
+    bytes[19] = 2;
+    const rawBefore = Uint8Array.from(bytes);
+    const database = openImmutableProjectionImage(bytes, 35);
+    try {
+      assert.equal(database.prepare("PRAGMA database_list").all().find(row => row.name === "main")?.file, "");
+      assert.equal(database.prepare("SELECT count(*) AS n FROM lexical_chunks").get()?.n, 2);
+      assert.equal(database.prepare("PRAGMA query_only").get()?.query_only, 1);
+      assert.equal(database.prepare("PRAGMA trusted_schema").get()?.trusted_schema, 0);
+      assert.equal(database.prepare("PRAGMA foreign_keys").get()?.foreign_keys, 1);
+      assert.equal(database.prepare("PRAGMA busy_timeout").get()?.timeout, 35);
+      assert.throws(() => database.exec("DELETE FROM lexical_chunks"));
+      assert.deepEqual(bytes, rawBefore, "normalization must preserve the pinned raw-byte SHA domain");
+    } finally { database.close(); }
+    assert.deepEqual(readFileSync(fixture.sourcePath), sourceBefore);
+    assert.deepEqual(readFileSync(fixture.databasePath), projectionBefore);
+    for (const [path, before] of [[fixture.sourcePath, sourceStat], [fixture.databasePath, projectionStat]] as const) {
+      const after = lstatSync(path, { bigint: true });
+      assert.deepEqual([after.dev, after.ino, after.size, after.ctimeNs], [before.dev, before.ino, before.size, before.ctimeNs]);
+    }
+    assert.deepEqual(readdirSync(root).sort(), rootEntries);
+    assert.deepEqual(readdirSync(fixture.projectionDirectory).sort(), projectionEntries);
   });
 
   it("detects a missing derived row after outer hashes are recomputed", async () => {
