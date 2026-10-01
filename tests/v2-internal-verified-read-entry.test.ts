@@ -4,6 +4,9 @@ import { cpSync, existsSync, lstatSync, mkdirSync, readFileSync, unlinkSync, wri
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
+import { createHash } from "node:crypto";
+import { pathToFileURL } from "node:url";
+import { canonicalJson } from "../src/orchestrator/serialization/canonical-json.js";
 import { createVerifiedReadAdapter } from "../src/orchestrator/verified-read/supervisor.js";
 import { FreshStartAdmissionGuard } from "../src/orchestrator/fresh-start/fresh-start-admission.js";
 import { makeActiveReadFixture } from "./support/v2-verified-read-fixture.js";
@@ -13,6 +16,25 @@ const artifacts = ["v2.js", "v2-admin.js", "workers/project-store.worker.js",
   "internal/v2-internal-verified-read.js", "internal/v2-internal-verified-read-cleanup.js"];
 const deployment = join(process.cwd(), "dist");
 const measured = () => JSON.parse(readFileSync(join(deployment, "v2-build.json"), "utf8"));
+const manifestDigest = (manifest: any) => {
+  const { buildIdentityHash: _ignored, ...body } = manifest;
+  return createHash("sha256").update(canonicalJson(body)).digest("hex");
+};
+async function comparisonMutation(entry: string, fault: "wrong-deployment" | "wrong-runtime", expectedHash: string) {
+  const sourceUrl = new URL("../src/v2/build-identity.js", import.meta.url);
+  let source = readFileSync(sourceUrl, "utf8");
+  const guard = fault === "wrong-deployment" ? "manifest.deploymentId !== __V2_DEPLOYMENT_ID__"
+    : "runtime.nodeVersion !== process.versions.node";
+  assert.equal(source.split(guard).length, 2, "mutation must remove exactly the intended compiled production comparison");
+  source = source.replace(guard, "false").replace(/from (["'])(\.[^"']+)\1/g,
+    (_match, _quote, relative) => `from ${JSON.stringify(new URL(relative, sourceUrl).href)}`);
+  source = `const __V2_DEPLOYMENT_ID__=${JSON.stringify(measured().deploymentId)};\n${source}`;
+  const inspector = await import(`data:text/javascript;base64,${Buffer.from(source).toString("base64")}`);
+  // This is a narrowly mutated inspector over genuine artifact bytes, never a
+  // fabricated positive deployment/child claim. All other checks remain real.
+  assert.equal(inspector.inspectV2Build(pathToFileURL(entry).href), expectedHash,
+    "another mismatch masked the targeted identity comparison");
+}
 async function fixture(buildHash = measured().buildIdentityHash) {
   const f = await makeActiveReadFixture(buildHash);
   try {
@@ -113,7 +135,13 @@ for (const child of ["read", "cleanup"] as const) {
     } finally { echo.cleanup(); }
   });
   for (const fault of ["missing", "tampered", "wrong-deployment", "wrong-runtime", "wrong-build"] as const) test(`${child} independently refuses ${fault} copied deployment`, async () => {
-    const f = await fixture();
+    const negative = measured();
+    if (fault === "wrong-deployment") negative.deploymentId = "11111111-1111-4111-8111-111111111111";
+    if (fault === "wrong-runtime") negative.runtime.nodeVersion = "0.0.0";
+    if (fault === "wrong-deployment" || fault === "wrong-runtime") negative.buildIdentityHash = manifestDigest(negative);
+    // Real synthetic stored/request authority agrees with the forged negative
+    // digest, so neither stale digest nor admission mismatch can mask refusal.
+    const f = await fixture(fault === "wrong-deployment" || fault === "wrong-runtime" ? negative.buildIdentityHash : measured().buildIdentityHash);
     try {
       const file = `internal/v2-internal-verified-read${child === "cleanup" ? "-cleanup" : ""}.js`;
       // Run the other entry for a missing/tampered child: both entries must measure all five artifacts.
@@ -123,15 +151,20 @@ for (const child of ["read", "cleanup"] as const) {
       if (fault === "missing") unlinkSync(join(f.copied, file));
       else if (fault === "tampered") writeFileSync(join(f.copied, file), readFileSync(join(f.copied, file), "utf8") + "\n// owned tamper\n");
       else {
-        const manifest = JSON.parse(readFileSync(join(f.copied, "v2-build.json"), "utf8"));
-        if (fault === "wrong-deployment") manifest.deploymentId = "11111111-1111-4111-8111-111111111111";
-        if (fault === "wrong-runtime") manifest.runtime.nodeVersion = "0.0.0";
+        const manifest = negative;
         if (fault === "wrong-build") manifest.buildIdentityHash = "f".repeat(64);
         writeFileSync(join(f.copied, "v2-build.json"), JSON.stringify(manifest));
       }
       const value = await ipc(entry, f.binding.projectionDirectory.canonicalPath, input(f, running));
       if (running === "read") assert.equal(value.messages.at(-1).failure.code, "FRESH_START_BUILD_MISMATCH");
       else assert.equal(value.messages.at(-1).cleanup, "incomplete");
+      if (fault === "wrong-deployment" || fault === "wrong-runtime") {
+        assert.equal(value.messages.filter(message => message.kind === "stage").length, 0);
+        assert.equal(existsSync(join(f.binding.executorStateDirectory.canonicalPath, "verified-read-owner.json")), false);
+        assert.equal(existsSync(join(f.binding.projectionDirectory.canonicalPath, ".projection-manifest.publish.lock")), false);
+        for (const name of artifacts) assert.deepEqual(readFileSync(join(f.copied, name)), readFileSync(join(deployment, name)));
+        await comparisonMutation(entry, fault, f.measuredBuildHash);
+      }
     } finally { f.cleanup(); }
   });
 }

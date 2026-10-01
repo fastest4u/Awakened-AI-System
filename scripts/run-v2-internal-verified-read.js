@@ -11,57 +11,88 @@ const targets = ['v2-internal-verified-read-contracts', 'stable-directory-read-c
   'v2-internal-verified-read-gate', 'projection-manifest', 'projection-integrity', 'v2-reader-lease', 'retrieval-candidates',
   'v2-retrieval-candidates', 'fresh-start-admission', 'sqlite-driver', 'v2-foundation-entry', 'ci-fresh-start-foundation', 'event-append-transaction'];
 
-/** One response deadline for all stages; only owned termination has a separate 5s observation. */
+const jobBridge = fileURLToPath(new URL('./v2-verified-read-job.ps1', import.meta.url));
+const powershell = 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe';
+
+/** One response deadline; advancement requires positive kernel Job closure,
+ * direct stage exit and drained output. Unsupported containment fails closed.
+ */
 function runChild(args, root, deadline, signal) {
   return new Promise(resolveResult => {
     if (signal?.aborted) { resolveResult({ code: 130, uncertain: false }); return; }
     if (performance.now() >= deadline) { resolveResult({ code: 124, uncertain: false }); return; }
+    if (process.platform !== 'win32') { resolveResult({ code: 1, uncertain: true }); return; }
     const env = { ...process.env }; delete env.NODE_TEST_CONTEXT;
-    const child = spawn(process.execPath, args, { cwd: root, stdio: ['ignore', 'pipe', 'pipe'], shell: false,
-      env, windowsHide: true, detached: process.platform !== 'win32' });
-    // Actual close includes output drainage; a descendant retaining either pipe
-    // cannot be mistaken for positive closure of the owned process tree.
-    child.stdout.pipe(process.stdout, { end: false }); child.stderr.pipe(process.stderr, { end: false });
-    let finished = false, stopped = 0, exited, killer, killerClosed = true, cleanupTimer, cleanupDeadline;
+    const child = spawn(powershell, ['-NoProfile', '-NonInteractive', '-File', jobBridge],
+      { cwd: root, stdio: ['pipe', 'pipe', 'pipe'], shell: false, env, windowsHide: true });
+    child.stderr.pipe(process.stderr, { end: false });
+    let finished = false, stopped = 0, ready = false, started = false, directExit = false, proof, buffer = '', cleanupTimer, cleanupDeadline;
     const cancel = () => stop(130);
     const timer = setTimeout(() => stop(124), Math.max(1, deadline - performance.now()));
     function finish(code, uncertain = false) {
       if (finished) return;
+      if (!uncertain && cleanupDeadline !== undefined && performance.now() >= cleanupDeadline) { code = 1; uncertain = true; }
       finished = true; clearTimeout(timer); clearTimeout(cleanupTimer); signal?.removeEventListener('abort', cancel);
-      if (uncertain) { child.stdout.destroy(); child.stderr.destroy(); child.unref(); killer?.unref(); }
-      resolveResult({ code, uncertain });
+      if (uncertain) {
+        // Only this exact spawned helper handle is terminated. Its Job has
+        // kill-on-close, but missing positive query proof still retains output.
+        try { child.kill('SIGKILL'); } catch {}
+        child.stdin.destroy(); child.stdout.destroy(); child.stderr.destroy(); child.unref();
+      } else child.stdin.end();
+      resolveResult({ code, uncertain, closure: uncertain ? undefined : 'windows-job-active-zero' });
     }
-    function observe() {
-      if (cleanupDeadline !== undefined && performance.now() >= cleanupDeadline) { finish(1, true); return; }
-      if (exited !== undefined && killerClosed) finish(stopped || exited);
+    function beginCleanup() {
+      if (cleanupDeadline !== undefined) return;
+      cleanupDeadline = performance.now() + 5000;
+      cleanupTimer = setTimeout(() => finish(1, true), Math.max(1, cleanupDeadline - performance.now()));
     }
     function stop(code) {
       if (stopped || finished) return;
-      stopped = code; cleanupDeadline = performance.now() + 5000;
-      cleanupTimer = setTimeout(() => {
-        try { child.kill('SIGKILL'); killer?.kill('SIGKILL'); } catch {}
-        finish(1, true);
-      }, 5000);
-      if (!child.pid) { finish(1, true); return; }
-      if (process.platform === 'win32') {
-        killerClosed = false;
-        // Absolute OS executable, scoped solely to the child this gate created.
-        killer = spawn(join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'taskkill.exe'),
-          ['/PID', String(child.pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true, shell: false });
-        killer.once('error', () => { try { child.kill('SIGKILL'); } catch {} finish(1, true); });
-        killer.once('close', result => {
-          killerClosed = true;
-          if (result !== 0) { finish(1, true); return; }
-          observe();
-        });
-      } else {
-        try { process.kill(-child.pid, 'SIGKILL'); }
-        catch (error) { if (error.code !== 'ESRCH') { finish(1, true); return; } }
-        observe();
-      }
+      stopped = code;
+      beginCleanup();
+      if (ready) child.stdin.write(`${code}\n`);
     }
-    child.once('error', () => finish(1, stopped !== 0));
-    child.once('close', (code, childSignal) => { exited = childSignal ? 1 : code ?? 1; observe(); });
+    child.stdin.on('error', () => finish(1, true));
+    child.stdout.on('data', bytes => {
+      if (finished) return;
+      buffer += bytes.toString('utf8');
+      try {
+        let newline;
+        while ((newline = buffer.indexOf('\n')) !== -1) {
+          const line = buffer.slice(0, newline).trim(); buffer = buffer.slice(newline + 1);
+          if (line.length > 16384) throw new Error('JOB_FRAME_TOO_LARGE');
+          const value = JSON.parse(line);
+          if (value.kind === 'ready' && Object.keys(value).length === 1 && !ready && !proof) {
+            const remaining = Math.max(0, Math.floor(deadline - performance.now()));
+            if (!remaining && !stopped) stop(124);
+            ready = true;
+            const encoded = value => Buffer.from(value, 'utf8').toString('base64');
+            child.stdin.write([encoded(process.execPath), encoded(root), String(remaining), String(stopped), String(args.length), ...args.map(encoded)].join('\n') + '\n');
+          } else if (value.kind === 'started' && ready && !started && !proof && Object.keys(value).length === 1) started = true;
+          else if (value.kind === 'direct-exit' && started && !directExit && !proof && Object.keys(value).length === 3
+            && Number.isInteger(value.nativeCode) && Number.isSafeInteger(value.activeProcesses) && value.activeProcesses >= 0) {
+            directExit = true;
+            if (value.nativeCode !== 0) beginCleanup();
+            process.stdout.write(JSON.stringify({ gate: 'v2-internal-verified-read', observation: 'direct-child-exit',
+              code: value.nativeCode, activeProcesses: value.activeProcesses }) + '\n');
+          } else if ((value.kind === 'stdout' || value.kind === 'stderr') && started && !proof
+            && Object.keys(value).length === 2 && typeof value.bytes === 'string'
+            && /^[A-Za-z0-9+/]*={0,2}$/.test(value.bytes)) {
+            // Stage bytes never become protocol frames: only the private bridge
+            // can emit metadata from its separately captured native pipes.
+            (value.kind === 'stdout' ? process.stdout : process.stderr).write(Buffer.from(value.bytes, 'base64'));
+          } else if (value.kind === 'closure' && ready && (!started || directExit) && !proof && Object.keys(value).length === 3
+            && value.activeProcesses === 0 && Number.isInteger(value.nativeCode)) proof = value;
+          else throw new Error('JOB_FRAME_INVALID');
+        }
+        if (buffer.length > 16384) throw new Error('JOB_FRAME_TOO_LARGE');
+      } catch { finish(1, true); }
+    });
+    child.once('error', () => finish(1, true));
+    child.once('close', (code, childSignal) => {
+      if (code !== 0 || childSignal || !proof || buffer.trim()) finish(1, true);
+      else finish(stopped || proof.nativeCode);
+    });
     signal?.addEventListener('abort', cancel, { once: true }); if (signal?.aborted) cancel();
   });
 }
@@ -84,7 +115,7 @@ export async function runVerifiedReadGate({ root = repository, timeoutMs = 90000
     for (const [stage, args] of stages) {
       const started = performance.now(); const child = await runChild(args, root, deadline, signal);
       process.stdout.write(JSON.stringify({ gate: 'v2-internal-verified-read', stage, code: child.code,
-        durationMs: performance.now() - started, elapsedMs: performance.now() - arrival, cleanup: child.uncertain ? 'incomplete' : 'complete' }) + '\n');
+        durationMs: performance.now() - started, elapsedMs: performance.now() - arrival, cleanup: child.uncertain ? 'incomplete' : 'complete', closure: child.closure }) + '\n');
       result = child.code;
       if (child.uncertain) { retainLock = true; result = 1; break; }
       if (result !== 0) break;
