@@ -1,6 +1,6 @@
 # V2 internal verified-read admission and consistency design
 
-Status: Conversational scope, ownership and executor/deadline sections approved by the user on 2026-10-01. This written specification awaits user review. No implementation plan or production activation is approved by this document.
+Status: Written specification explicitly approved by the user on 2026-10-01 with `อนุมัติสเปก V2 verified-read written`, reviewing commit `37d31d1aab52fe8e42f8c2c335a9d8ea037a7055`. Implementation planning is authorized; the executable plan still requires review before implementation. Production activation remains separately gated.
 
 Source inspected: `de2fee723322a28c915b26dfcfa5466203deadff` on `codex/v2-fresh-start`.
 

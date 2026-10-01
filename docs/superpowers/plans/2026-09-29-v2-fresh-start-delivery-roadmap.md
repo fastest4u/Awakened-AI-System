@@ -17,6 +17,8 @@ The approved design spans independent subsystems. Keep one executable plan per s
 
 F2-F4 are implementation dependencies, not a new request for the user to repeat the approved fresh-start decision. Write their detailed plans from the delivered interfaces instead of inventing integration APIs before those interfaces exist. Any actual change to approved behavior must be called out separately.
 
+Update 2026-10-01: The user approved the [internal verified-read written design](../specs/2026-10-01-v2-internal-verified-read-design.md) at `37d31d1`. Its [six-task implementation plan](2026-10-01-v2-internal-verified-read.md) is prepared for review, not executed. This metadata-receipt subsystem does not deliver public retrieval or complete F2. F3 concerns newly acknowledged V2 data and the actual release; the removed live-V1 migration requirement is not reintroduced.
+
 ## Requirements coverage
 
 | Approved spec section | Owning increment |
