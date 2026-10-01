@@ -21,6 +21,13 @@ export type VerifiedReadBinding = Readonly<{
   compositionEpoch: string;
 }>;
 export type ReadMessageIds = Readonly<{ requestId: string; attemptId: string; laneEpoch: string }>;
+export type ReadLaunchIntent = Readonly<{
+  schemaVersion: 1; bindingFingerprint: string; buildHash: string; supervisorId: string;
+  ids: ReadMessageIds; lockToken: string;
+}>;
+export type ReadOwnershipRecord = ReadLaunchIntent & Readonly<{
+  state: "launch-intent" | "child-observed" | "complete" | "incomplete"; pid: number | null;
+}>;
 export type ReadBootstrap = Readonly<{
   version: 1; ids: ReadMessageIds; binding: VerifiedReadBinding;
   request: VerifiedReadRequest; lockToken: string; remainingMs: number;
