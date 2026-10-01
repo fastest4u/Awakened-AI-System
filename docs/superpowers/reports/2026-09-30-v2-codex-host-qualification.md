@@ -1,6 +1,6 @@
 # V2 Codex host qualification — 2026-09-30
 
-Report version: 1. Disposition: **host-capability-unverified**. This completes the preparation report, not the actual-host probe or F2. No supported, release-pinned complete feed, private authority boundary or private finalization path has been established for the calling desktop conversation. This is not a finding that the desktop is incapable.
+Report version: 2; read-only discovery updated 2026-10-01. Disposition: **host-capability-unverified**. This completes the preparation report, not the actual-host probe or F2. No supported, release-pinned complete feed, private authority boundary or private finalization path has been established for the calling desktop conversation. This is not a finding that the desktop is incapable.
 
 ## Source and observation identities
 
@@ -11,6 +11,7 @@ Task 2 source BASE is `a49b955f840f204f59c1e77d5c410c1cb1861cc5`; approved plan 
 | Installed desktop package | Earlier root-owned non-secret inventory: `26.928.1915.0`; not re-inventoried or bound to this conversation |
 | Process file | Earlier `ChatGPT` file version `154.0.8037.57`; no demonstrated link to the calling conversation; Codex process metadata did not establish serving host |
 | CLI | Earlier `0.154`; separate from installed desktop and serving host |
+| Displayed About metadata (user-reported, 2026-10-01) | `ChatGPT`, `Powered by Codex & OWL`, version `26.928.21956`, released 2026-09-30; supplied directly by the user from the current app. This establishes the reported UI version, not an independently bound serving process, supported capture mechanism or actual-host run |
 | Actual serving host/build | `unverified` |
 | Actual mechanism/release/schema | `unverified`; current documentation is candidate background, not installed-release attestation |
 | Synthetic host authorization/binding | `unverified`; no new conversation, owned store or actual-host setup authorized/executed in this slice |
@@ -30,6 +31,12 @@ Focused Git comparison from accepted F1 source `1d41c5186a022e83774b7f3e9f941b13
 Official OpenAI [Hooks](https://learn.chatgpt.com/docs/hooks) was fetched on 2026-09-30. Candidate fields: common `session_id`, nullable `transcript_path`, `cwd`, `hook_event_name`, `model`; turn-scoped `turn_id`; tool `tool_name`, `tool_input`, `tool_response`; subagent `agent_id`, `agent_type`, nullable `agent_transcript_path`; Stop's nullable `last_assistant_message`. Subagent common session IDs identify the parent. Hosted tools and some specialized paths escape tool hooks; transcript format is unstable. Hook context can be model-visible; `systemMessage` surfaces in UI/events and `suppressOutput` is unimplemented. Stop supplies latest text, not a complete intermediate feed. SessionEnd is main-thread-only, advisory, synchronous, triggered by archive/delete, normal close or 30-minute detached idle; switching conversations is insufficient. Sources: fetched page lines 1230–1298, 1373–1410, 1426–1433, 1519–1528, 1612–1659.
 
 Inference for this probe: those documented limitations do not qualify hooks alone as the required complete/private/durable boundary. They do not exclude every possible desktop mechanism. Context7 `/openai/codex` GitHub-main snippets and app-server/custom-client background do not pin installed support. No undocumented attachment, transcript watcher, custom-client replacement or field merely labeled private qualifies.
+
+### Read-only discovery update — 2026-10-01
+
+Official [Record & Replay](https://learn.chatgpt.com/docs/extend/record-and-replay) describes recording a demonstrated computer workflow on macOS to create a skill. It is not documentation of the complete conversation-evidence feed required here. The current [App server](https://learn.chatgpt.com/docs/app-server) documents client-owned connections and turn/item events; it does not establish a third-party attachment to this existing Windows desktop conversation. These are scoped documentation findings, not a conclusion that every desktop integration is unsupported.
+
+An official-domain search for the exact reported `26.928.21956` version found no matching release-specific interface documentation. Search absence is not proof of impossibility. No actual-host capture, private-boundary instrumentation, persistence/retry or completion experiment ran. All nine matrix rows and the strict retention disposition remain unchanged; accepted synthetic preparation evidence is not rerun or upgraded into actual-host proof.
 
 ## Section 7 proof matrix
 
@@ -69,6 +76,6 @@ Production redaction before authenticated full-content encryption, key recovery,
 
 Stop before driver/setup: no hook installation/trust/configuration, host capture, new user-owned conversation, replacement client, production mutation or activation was performed. No setup request is issued for an unqualified mechanism.
 
-Next permitted read-only diagnostic: inspect the calling desktop's displayed About/version metadata and compare it to release-specific official mechanism/schema documentation, without reading command lines, environments, client configuration or transcripts. Record whether those non-secret observations actually bind the serving host. Then seek a documented complete visible-frame feed and independently observable private authority/finalization boundary for that exact release; absent direct evidence, retain `host-capability-unverified`.
+The user has supplied the displayed About/version metadata; do not request it again. Next permitted read-only diagnostic: obtain release-specific official interface/schema documentation, or developer clarification, for a supported attachment to the existing desktop conversation and its complete visible-frame/private authority/finalization boundaries. Any support contact requires separate user authorization; none was sent. Independently bind the serving host before an eventual authorized probe. Do not read command lines, environments, client configuration or transcripts; absent direct evidence, retain `host-capability-unverified`.
 
 A viable qualified mechanism would require a separately reviewed execution addendum naming exact files/config/trust actions, protected storage, pinned schema/full-content bounds, independently observable surfaces, one total deadline, authorized synthetic conversation/owned store, lost-response/reconnect case, all nine matrix rows, process ownership and recoverable cleanup. Preparation approval supplies no authority for those host actions. F2 production work, F3 recovery/release and F4 separately approved activation remain outstanding.
