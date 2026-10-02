@@ -59,8 +59,8 @@ test("no escaped handle/content/credential keys", () => {
 test("per-message limits, opaque IDs and tokens", () => {
   const input = readBootstrap();
   assert.equal(decodeReadBootstrap(input).ids.attemptId, "attempt");
-  for (const requestId of ["", "é".repeat(65)]) assert.throws(() => decodeReadCancel({ version: 1, ids: { ...input.ids, requestId }, kind: "cancel" }), invalid);
-  assert.equal(decodeReadCancel({ version: 1, ids: { ...input.ids, requestId: "é".repeat(64) }, kind: "cancel" }).kind, "cancel");
+  for (const requestId of ["", "é".repeat(65)]) assert.throws(() => decodeReadCancel({ version: 2, ids: { ...input.ids, requestId }, kind: "cancel" }), invalid);
+  assert.equal(decodeReadCancel({ version: 2, ids: { ...input.ids, requestId: "é".repeat(64) }, kind: "cancel" }).kind, "cancel");
   for (const lockToken of ["A".repeat(32), "a".repeat(31)]) assert.throws(() => decodeReadBootstrap({ ...input, lockToken }), invalid);
   assert.throws(() => decodeReadBootstrap({ ...input, binding: { ...input.binding, eventsFile: { ...input.binding.eventsFile, path: "é".repeat(1025) } } }), invalid);
   const huge = readBootstrap(); for (const directory of [huge.binding.projectionDirectory, huge.binding.executorStateDirectory, huge.binding.deploymentDirectory]) directory.canonicalPath = "\\".repeat(2048);
@@ -69,10 +69,10 @@ test("per-message limits, opaque IDs and tokens", () => {
   for (const remainingMs of [-1, 30001, NaN, Infinity]) assert.throws(() => decodeReadBootstrap({ ...input, remainingMs }), invalid);
   assert.equal(decodeReadBootstrap({ ...input, remainingMs: 0.5 }).remainingMs, 0.5);
   assert.throws(() => decodeReadBootstrap({ ...input, binding: { ...input.binding, compositionEpoch: "é".repeat(65) } }), invalid);
-  assert.throws(() => decodeReadReply({ version: 1, ids: input.ids, kind: "stage", phase: "capture", observedProjectionPosition: "x".repeat(16385) }), invalid);
+  assert.throws(() => decodeReadReply({ version: 2, ids: input.ids, kind: "stage", phase: "capture", observedProjectionPosition: "x".repeat(16385) }), invalid);
 });
 test("exact reply, fence and cleanup variants", () => {
-  const ids = readBootstrap().ids; const base = { version: 1, ids };
+  const ids = readBootstrap().ids; const base = { version: 2, ids };
   for (const phase of ["admission", "projection-wait", "capture", "validate", "revalidate"])
     assert.equal(decodeReadReply({ ...base, kind: "stage", phase, observedProjectionPosition: null }).kind, "stage");
   const success = { ...base, kind: "success", receipt: readReceipt(), fence: { controlGeneration: "0", releaseId: READ_UUID, capturedPosition: "0", capturedHash: READ_HASH, requiredPosition: "0" }, closed: { image: true, reader: true, lock: true } };
@@ -81,11 +81,11 @@ test("exact reply, fence and cleanup variants", () => {
   assert.throws(() => decodeReadReply({ ...success, fence: { ...success.fence, capturedPosition: "01" } }), invalid);
   assert.equal(decodeReadReply({ ...base, kind: "failure", failure: { code: "PROJECTION_LAG", cleanup: "incomplete", positions: { required: "1", observed: "0" } } }).kind, "failure");
   assert.throws(() => decodeReadReply({ ...base, kind: "failure", failure: { code: "WORKER_TIMEOUT", cleanup: "pending", positions: { required: "1", observed: null } } }), invalid);
-  const cleanup = { ...base, directory: readBootstrap().binding.projectionDirectory, lockToken: "a".repeat(32), expectedBuildHash: READ_HASH, remainingMs: 2000 };
+  const cleanup = { ...base, version: 1, directory: readBootstrap().binding.projectionDirectory, lockToken: "a".repeat(32), expectedBuildHash: READ_HASH, remainingMs: 2000 };
   assert.equal(decodeCleanupBootstrap(cleanup).remainingMs, 2000);
   assert.throws(() => decodeCleanupBootstrap({ ...cleanup, remainingMs: 2001 }), invalid);
-  for (const outcome of ["released", "absent", "poisoned", "failed"]) assert.equal(decodeCleanupReply({ ...base, kind: "cleanup", outcome, cleanup: "complete" }).kind, "cleanup");
-  assert.throws(() => decodeCleanupReply({ ...base, kind: "cleanup", outcome: "unknown", cleanup: "complete" }), invalid);
+  for (const outcome of ["released", "absent", "poisoned", "failed"]) assert.equal(decodeCleanupReply({ ...base, version: 1, kind: "cleanup", outcome, cleanup: "complete" }).kind, "cleanup");
+  assert.throws(() => decodeCleanupReply({ ...base, version: 1, kind: "cleanup", outcome: "unknown", cleanup: "complete" }), invalid);
   assert.throws(() => decodeReadCancel({ ...base, kind: "cancel", reason: "secret" }), invalid);
   for (const decode of [decodeReadBootstrap, decodeReadCancel, decodeReadReply, decodeCleanupBootstrap, decodeCleanupReply, decodeVerifiedReadReceipt]) {
     assert.throws(() => decode(null), invalid);

@@ -17,7 +17,7 @@ function protocolFailure(): void {
 function finish(reply: ReadTerminalReply): void {
   if (terminal) return;
   terminal = true;
-  const final = protocolFault ? { version: 1 as const, ids: reply.ids, kind: "failure" as const,
+  const final = protocolFault ? { version: 2 as const, ids: reply.ids, kind: "failure" as const,
     failure: { code: "WORKER_PROTOCOL_ERROR" as const, cleanup: reply.kind === "failure" ? reply.failure.cleanup : "complete" as const, positions: null } } : reply;
   if (!process.send || !process.connected) { process.exitCode = 1; disconnect(); return; }
   process.send(decodeReadReply(final), error => { if (error) process.exitCode = 1; disconnect(); });

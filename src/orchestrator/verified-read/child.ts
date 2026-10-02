@@ -43,7 +43,7 @@ export async function executeVerifiedRead(bootstrap: ReadBootstrap, dependencies
     return Math.max(0, Math.floor(budget));
   };
   const stage = (phase: ReadPhase, observedProjectionPosition: string | null = null): void => {
-    checkpoint(); dependencies.emitStage(Object.freeze({ version: 1, ids: input.ids, kind: "stage", phase, observedProjectionPosition }));
+    checkpoint(); dependencies.emitStage(Object.freeze({ version: 2, ids: input.ids, kind: "stage", phase, observedProjectionPosition }));
     checkpoint();
   };
   const closeImage = (): void => {
@@ -70,6 +70,8 @@ export async function executeVerifiedRead(bootstrap: ReadBootstrap, dependencies
     throw Object.assign(new Error("PROJECTION_LAG"), { code: "PROJECTION_LAG", positions: Object.freeze({ required, observed }) });
   };
   try {
+    // Content execution is deliberately unavailable until same-image integration (Task 5).
+    if (input.request.operation !== "verify-published-view") fail("FRESH_START_INPUT_INVALID");
     checkpoint(); const measured = dependencies.inspectBuild(); checkpoint();
     if (!/^[0-9a-f]{64}$/u.test(measured) || measured !== input.binding.expectedRelease.buildIdentityHash) fail("FRESH_START_BUILD_MISMATCH");
     // Openers own native allocation until return; a throw cannot prove their hidden cleanup completed.
@@ -135,7 +137,7 @@ export async function executeVerifiedRead(bootstrap: ReadBootstrap, dependencies
     admission.revalidate(fence, selected); checkpoint();
     // Linearizes at final authority observation. Closure is still required before any terminal success.
     closeReader(); checkpoint();
-    return Object.freeze({ version: 1, ids: input.ids, kind: "success", receipt, fence,
+    return Object.freeze({ version: 2, ids: input.ids, kind: "success", receipt: Object.freeze({ ...receipt, operation: "verify-published-view" as const }), fence,
       closed: Object.freeze({ image: true, reader: true, lock: true }) });
   } catch (error) { primary = error; }
   // Each resource gets one close attempt. Cleanup errors never replace the primary failure.
@@ -143,6 +145,6 @@ export async function executeVerifiedRead(bootstrap: ReadBootstrap, dependencies
     try { close(); } catch (error) { primary ??= error; }
   }
   const failure = verifiedReadFailure(primary);
-  return Object.freeze({ version: 1, ids: input.ids, kind: "failure", failure: Object.freeze({ ...failure,
+  return Object.freeze({ version: 2, ids: input.ids, kind: "failure", failure: Object.freeze({ ...failure,
     cleanup: imageClosed && readerClosed && lockClosed ? "complete" : "incomplete" }) });
 }

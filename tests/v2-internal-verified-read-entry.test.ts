@@ -60,7 +60,7 @@ async function ipc(entry: string, cwd: string, input: object) {
 }
 const ids = { requestId: "entry-test", attemptId: "attempt-test", laneEpoch: "fixture-epoch" };
 function input(f: Awaited<ReturnType<typeof fixture>>, kind: "read" | "cleanup", hash = f.measuredBuildHash) {
-  return kind === "read" ? { version: 1, ids, binding: { ...f.binding, expectedRelease: { ...f.release, buildIdentityHash: hash } },
+  return kind === "read" ? { version: 2, ids, binding: { ...f.binding, expectedRelease: { ...f.release, buildIdentityHash: hash } },
     request: f.request, lockToken: "a".repeat(32), remainingMs: 5000 }
     : { version: 1, ids, directory: f.binding.projectionDirectory, lockToken: "a".repeat(32), expectedBuildHash: hash, remainingMs: 2000 };
 }

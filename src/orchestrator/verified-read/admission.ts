@@ -58,7 +58,7 @@ export class SqliteVerifiedReadAdmission {
 
   constructor(connection: SqliteConnection, binding: VerifiedReadBinding, independentlyMeasuredBuildHash: string) {
     // Reuse the descriptor-first bounded Task 1 snapshot; the dummy request never reads caller properties.
-    this.#binding = decodeReadBootstrap({ version: 1, ids: { requestId: "admission", attemptId: "admission", laneEpoch: "admission" },
+    this.#binding = decodeReadBootstrap({ version: 2, ids: { requestId: "admission", attemptId: "admission", laneEpoch: "admission" },
       binding, request: { operation: "verify-published-view", consistency: "project-strong", minimumEventPosition: MAX_POSITION.toString(), budgetMs: 0 },
       lockToken: "0".repeat(32), remainingMs: 0 }).binding;
     if (typeof independentlyMeasuredBuildHash !== "string" || !HASH.test(independentlyMeasuredBuildHash)) fail("FRESH_START_BUILD_MISMATCH");

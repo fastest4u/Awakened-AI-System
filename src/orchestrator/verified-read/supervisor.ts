@@ -86,7 +86,7 @@ function nativeProcess(binding: VerifiedReadBinding, kind: "read" | "cleanup"): 
 /** Private composition factory. All response work, including initial ownership inspection, shares arrival time. */
 export function createVerifiedReadAdapter(input: VerifiedReadBinding, dependencies?: VerifiedReadSupervisorDependencies): VerifiedReadAdapter {
   // The existing descriptor-first decoder bounds copying and never invokes caller accessors/toJSON.
-  const binding = decodeReadBootstrap({ version: 1, ids: { requestId: "copy", attemptId: "copy", laneEpoch: "copy" }, binding: input,
+  const binding = decodeReadBootstrap({ version: 2, ids: { requestId: "copy", attemptId: "copy", laneEpoch: "copy" }, binding: input,
     request: { operation: "verify-published-view", consistency: "project-strong", minimumEventPosition: "9223372036854775807", budgetMs: 0 },
     lockToken: "0".repeat(32), remainingMs: 0 }).binding;
   const deps: VerifiedReadSupervisorDependencies = dependencies ?? { ownership: new VerifiedReadOwnershipRepository(binding.executorStateDirectory),
@@ -139,7 +139,7 @@ export function createVerifiedReadAdapter(input: VerifiedReadBinding, dependenci
     beginCleanup(lane); lane.phase = "cleanup";
     if (cleanupLive(lane)) {
       if (lane.read && !lane.read.exited && lane.graceTimer === undefined) {
-        try { lane.read.port.send({ version: 1, ids: lane.ids, kind: "cancel" }); } catch { /* grace/terminate still apply */ }
+        try { lane.read.port.send({ version: 2, ids: lane.ids, kind: "cancel" }); } catch { /* grace/terminate still apply */ }
         lane.graceTimer = deps.schedule(() => { if (cleanupLive(lane)) stopProcess(lane.read); }, Math.min(100, CLEANUP_MS - (deps.now() - lane.cleanupStarted!)));
       }
     }
@@ -186,7 +186,7 @@ export function createVerifiedReadAdapter(input: VerifiedReadBinding, dependenci
     const { receipt, fence } = reply; const scope = { ...binding.projectionBinding, sessionId: lane.request.consistency === "session-strong" ? binding.session?.sessionId ?? null : null };
     const required = [BigInt(fence.capturedPosition), BigInt(lane.request.minimumEventPosition), BigInt(binding.session?.minimumEventPosition ?? "0")]
       .reduce((left, right) => left > right ? left : right);
-    if (receipt.consistency !== lane.request.consistency || Object.keys(scope).some(key => scope[key as keyof typeof scope] !== receipt.scope[key as keyof typeof scope])
+    if (receipt.operation !== lane.request.operation || receipt.consistency !== lane.request.consistency || Object.keys(scope).some(key => scope[key as keyof typeof scope] !== receipt.scope[key as keyof typeof scope])
       || receipt.releaseId !== binding.expectedRelease.releaseId || receipt.controlGeneration !== binding.controlGeneration
       || fence.releaseId !== receipt.releaseId || fence.controlGeneration !== receipt.controlGeneration || fence.requiredPosition !== receipt.requiredEventPosition
       || BigInt(receipt.projectionEventPosition) < required || BigInt(fence.requiredPosition) !== required
@@ -269,7 +269,7 @@ export function createVerifiedReadAdapter(input: VerifiedReadBinding, dependenci
       if (port.pid === undefined) throw error("WORKER_UNAVAILABLE");
       lane.inFlight++; await deps.ownership.observeChild(lane.ids, port.pid); lane.inFlight--;
       if (!eligible(lane)) { progressCleanup(lane); return; }
-      port.send({ version: 1, ids: lane.ids, binding, request: lane.request, lockToken: lane.token, remainingMs: Math.max(0, lane.deadline - deps.now()) });
+      port.send({ version: 2, ids: lane.ids, binding, request: lane.request, lockToken: lane.token, remainingMs: Math.max(0, lane.deadline - deps.now()) });
     } catch (cause) {
       lane.inFlight = Math.max(0, lane.inFlight - 1);
       // Failed durable operations can have published before rejecting. Preserve that uncertainty.
@@ -290,6 +290,8 @@ export function createVerifiedReadAdapter(input: VerifiedReadBinding, dependenci
       return new Promise((resolve, reject) => {
         let request: VerifiedReadRequest;
         try { request = decodeVerifiedReadRequest(value, binding.session); } catch { reject(error("FRESH_START_INPUT_INVALID")); return; }
+        // verify returns only the unchanged metadata receipt. Native execution is integrated in Task 5.
+        if (request.operation !== "verify-published-view") { reject(error("FRESH_START_INPUT_INVALID")); return; }
         if (deps.now() >= arrival + request.budgetMs) { reject(error("WORKER_TIMEOUT")); return; }
         if (closing || options?.signal?.aborted) { reject(error("WORKER_CLOSED")); return; }
         if (quarantine) { reject(error("WORKER_UNAVAILABLE")); return; }
