@@ -5,7 +5,10 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type { ProjectionManifestV2 } from "../../src/orchestrator/projections/manifest.js";
 import type { ProjectionDirectoryIdentity } from "../../src/orchestrator/projections/stable-directory.js";
-import type { ReadFence, VerifiedReadBinding, VerifiedReadRequest } from "../../src/orchestrator/verified-read/contracts.js";
+import type { ReadFence, TrustedReadSession, VerifiedReadBinding, VerifiedReadRequest } from "../../src/orchestrator/verified-read/contracts.js";
+import type { AppendCommand, JsonValue } from "../../src/orchestrator/contracts/event.js";
+import type { BranchScopeId, ProjectContext } from "../../src/orchestrator/identity/contracts.js";
+import { computeProjectContextFingerprint } from "../../src/orchestrator/identity/project-binding.service.js";
 import type { SqliteConnection } from "../../src/orchestrator/storage/sqlite-driver.js";
 import { NodeSqliteDriver } from "../../src/orchestrator/storage/node-sqlite-driver.js";
 import { applyCurrentProjectStoreSchema } from "./current-project-store-schema.js";
@@ -19,7 +22,7 @@ import { bindFreshStartAdmissionContext } from "../../src/orchestrator/fresh-sta
 import { EventStore, SqliteEventStoreStatements } from "../../src/orchestrator/storage/event-store.js";
 import { MaintenanceFence } from "../../src/orchestrator/storage/maintenance-fence.js";
 import { BranchScopeRepository } from "../../src/orchestrator/storage/branch-scope.repository.js";
-import { command } from "../fixtures/fresh-start-admission-child.js";
+import { command, context as fixtureProjectContext } from "../fixtures/fresh-start-admission-child.js";
 import { ImmutableProjectionBuilder } from "../../src/orchestrator/projections/builder.js";
 import { openCommittedProjectionEventSnapshot } from "../../src/orchestrator/projections/event-reader.js";
 import { publishProjectionManifest } from "../../src/orchestrator/projections/manifest.js";
@@ -97,7 +100,8 @@ export function ownedReadImage(updateSql = ""): Readonly<{ bytes: Uint8Array; ma
 }
 
 /** Real schema-8 authority exists only inside this owned synthetic fixture. */
-export async function makeActiveReadFixture(measuredBuildHash = READ_HASH) {
+export type ReadFixtureOptions = Readonly<{ branchScopeId?: string | null; branchRef?: string | null; session?: TrustedReadSession | null }>;
+export async function makeActiveReadFixture(measuredBuildHash = READ_HASH, options: ReadFixtureOptions = {}) {
   const Admission = await readAdmissionConstructor();
   if (!Admission) throw new Error("Task 3 admission implementation is absent");
   const root = realpathSync.native(mkdtempSync(join(tmpdir(), "v2-active-read-")));
@@ -142,23 +146,39 @@ export async function makeActiveReadFixture(measuredBuildHash = READ_HASH) {
     await control.transition({ identity: FRESH_IDENTITY, expectedGeneration: 0n, expectedMode: "prepared",
       expectedReleaseId: release.releaseId, nextMode: "active", nextRelease: release, approvalEnvelope: new Uint8Array([1]) });
     bindFreshStartAdmissionContext(ownedWriter, { identity: FRESH_IDENTITY, releaseId: release.releaseId, measuredBuildHash, generation: 1n });
+    const projectContext: ProjectContext = fixtureProjectContext(root, path);
+    const branchScopes = new BranchScopeRepository({ randomId: () => options.branchScopeId as BranchScopeId });
+    if (options.branchScopeId != null || options.branchRef != null) {
+      if (options.branchScopeId == null) throw new Error("synthetic branch scope required");
+      const workspace = { kind: "git" as const, worktreeRoot: root, gitDir: join(root, ".git"),
+        gitCommonDir: join(root, ".git"), headCommit: "a".repeat(40), branchRef: options.branchRef ?? null,
+        detached: options.branchRef == null, workspaceId: projectContext.workspace.workspaceId };
+      projectContext.workspace = workspace;
+      projectContext.binding.workspace = workspace;
+      projectContext.branchScopeId = branchScopes.resolveOrCreate(ownedWriter, FRESH_IDENTITY.projectId, workspace, FRESH_NOW);
+      projectContext.binding.contextFingerprint = computeProjectContextFingerprint(projectContext.binding);
+    }
     const stat = lstatSync(path, { bigint: true });
     const binding: VerifiedReadBinding = Object.freeze({ projectionBinding: Object.freeze({ ...FRESH_IDENTITY,
-      workspaceId: command().context.binding.workspaceId, branchScopeId: null, branchRef: null, sessionId: null }),
-      expectedRelease: release, controlGeneration: "1", session: null,
+      workspaceId: projectContext.binding.workspaceId, branchScopeId: projectContext.branchScopeId ?? null,
+      branchRef: projectContext.workspace.kind === "git" ? projectContext.workspace.branchRef : null, sessionId: null }),
+      expectedRelease: release, controlGeneration: "1", session: options.session ?? null,
       eventsFile: Object.freeze({ path, device: String(stat.dev), inode: String(stat.ino) }),
       projectionDirectory, executorStateDirectory, deploymentDirectory, compositionEpoch: "fixture-epoch" });
     reader = driver.open(path, { mode: "read-only-existing", bindFileIdentity: true, busyTimeoutMs: 1000 });
     const admission = new Admission(reader, binding, measuredBuildHash);
     const request: VerifiedReadRequest = Object.freeze({ operation: "verify-published-view", consistency: "project-strong", minimumEventPosition: "0", budgetMs: 5000 });
-    const store = new EventStore(ownedWriter, new SqliteEventStoreStatements(ownedWriter), new MaintenanceFence(), new BranchScopeRepository(), () => FRESH_NOW);
+    const store = new EventStore(ownedWriter, new SqliteEventStoreStatements(ownedWriter), new MaintenanceFence(), branchScopes, () => FRESH_NOW);
+    const appendSynthetic = (value: AppendCommand<JsonValue>) => {
+      const result = store.append({ ...value, context: projectContext });
+      return Object.freeze({ position: result.lastGlobalPosition.toString(), hash: ownedWriter.prepare("SELECT event_hash FROM events WHERE global_position = $position")
+        .get({ $position: result.lastGlobalPosition })!.event_hash as string });
+    };
     let appendNumber = 0;
     const append = () => {
       const value = command(); appendNumber += 1;
-      const result = store.append({ ...value, commandId: randomUUID(), correlationId: randomUUID(), idempotencyKey: `read:${appendNumber}`,
+      return appendSynthetic({ ...value, commandId: randomUUID(), correlationId: randomUUID(), idempotencyKey: `read:${appendNumber}`,
         streamId: `read-stream-${appendNumber}` });
-      return { position: result.lastGlobalPosition.toString(), hash: ownedWriter.prepare("SELECT event_hash FROM events WHERE global_position = $position")
-        .get({ $position: result.lastGlobalPosition })!.event_hash as string };
     };
     let generation = 0;
     const publish = async () => {
@@ -175,6 +195,6 @@ export async function makeActiveReadFixture(measuredBuildHash = READ_HASH) {
     };
     const manifest = await publish();
     return { root, path, reader, writer: ownedWriter, binding, measuredBuildHash, identity: FRESH_IDENTITY, release,
-      repository, control, admission, request, manifest, append, publish, cleanup };
+      repository, control, admission, request, manifest, projectContext, append, appendSynthetic, publish, cleanup };
   } catch (error) { try { cleanup(); } catch { /* preserve setup failure */ } throw error; }
 }

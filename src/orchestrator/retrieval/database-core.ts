@@ -16,6 +16,7 @@ import {
   type RetrievalChannelResult,
   type RetrievalConflictGroup,
   type RetrievalFreshness,
+  type RetrievalEligibilityContext,
   type RetrievalItem,
   type RetrievalItemStatus,
   type ValidatedInternalRetrievalRequest,
@@ -242,10 +243,9 @@ function ftsExpression(query: string): string | null {
   return terms.map((term) => `"${term.replaceAll('"', '""')}"`).join(" AND ");
 }
 
-function channelParameters(
-  request: ValidatedInternalRetrievalRequest,
+function eligibilityParameters(
+  request: RetrievalEligibilityContext,
   terminalPosition: bigint,
-  query: string,
 ): Readonly<Record<string, SqliteParameter>> {
   const visibility = request.visibility
     ?? (request.sessionId === undefined ? "branch" : "session");
@@ -263,9 +263,16 @@ function channelParameters(
     $visibilityLevel: visibilityLevel,
     $sessionId: request.sessionId ?? null,
     $branchRef: request.binding.branchRef,
-    $query: query,
-    $scanLimit: request.candidateLimit + 1,
   });
+}
+
+function channelParameters(
+  request: ValidatedInternalRetrievalRequest,
+  terminalPosition: bigint,
+  query: string,
+): Readonly<Record<string, SqliteParameter>> {
+  return Object.freeze({ ...eligibilityParameters(request, terminalPosition),
+    $query: query, $scanLimit: request.candidateLimit + 1 });
 }
 
 function lexicalItem(
@@ -897,4 +904,53 @@ export function collectEligibleFromProjectionDatabase(
     truncated: collected.truncated,
     conflictGroups: collected.conflictGroups,
   });
+}
+
+export type CanonicalLookupContext = RetrievalEligibilityContext & Readonly<{ id: string }>;
+export type CanonicalLookup = Readonly<{
+  item: RetrievalItem | null;
+  eligibleConflictMemberCount: number | null;
+}>;
+
+/** Exact, case-sensitive ID lookup. Never interprets an ID as a search key. */
+export function getCanonicalFromProjectionDatabase(
+  database: DatabaseSync,
+  manifest: ProjectionManifestV2,
+  context: CanonicalLookupContext,
+): CanonicalLookup {
+  try {
+    verifyMetadata(database, manifest);
+    const terminalPosition = BigInt(manifest.terminalEventPosition);
+    const parameters = { ...eligibilityParameters(context, terminalPosition), $id: context.id };
+    const rows = preparedRows(database, `
+      SELECT item.project_id, item.session_id, item.item_id, item.normalized_key,
+             item.conflict_group_id, item.superseding_item_id, item.status,
+             item.confidence, item.verification_method, item.valid_from, item.valid_to,
+             item.summary, item.known_from_event_position, item.source_event_position
+      FROM canonical_items AS item
+      WHERE ${CANONICAL_ELIGIBILITY_SQL} AND item.item_id = $id COLLATE BINARY
+      LIMIT 2
+    `, parameters);
+    if (rows.length > 1) return projectionInvalid();
+    if (rows.length === 0) return Object.freeze({ item: null, eligibleConflictMemberCount: null });
+    const item = canonicalItem(rows[0]!, manifest, terminalPosition);
+    if (item.knownFromEventPosition > item.sourceEventPosition) return projectionInvalid();
+    if (!isEligible(item, context, context.binding)) {
+      return Object.freeze({ item: null, eligibleConflictMemberCount: null });
+    }
+    let eligibleConflictMemberCount: number | null = null;
+    if (item.conflictGroupId !== null) {
+      const counts = preparedRows(database, `
+        SELECT count(*) AS member_count FROM canonical_items AS item
+        WHERE ${CANONICAL_ELIGIBILITY_SQL} AND item.conflict_group_id = $groupId
+      `, { ...parameters, $groupId: item.conflictGroupId });
+      if (counts.length !== 1) return projectionInvalid();
+      eligibleConflictMemberCount = numberValue(counts[0]!, "member_count");
+      if (eligibleConflictMemberCount < 1) return projectionInvalid();
+    }
+    return Object.freeze({ item, eligibleConflictMemberCount });
+  } catch (error) {
+    if (error instanceof InternalRetrievalError) throw error;
+    return projectionInvalid();
+  }
 }

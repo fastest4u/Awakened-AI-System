@@ -76,6 +76,10 @@ export interface InternalRetrievalRequest {
   readonly vector?: RetrievalVectorOptions;
 }
 
+/** Query-free scope and temporal authority shared by search and exact lookup. */
+export type RetrievalEligibilityContext = Readonly<Pick<InternalRetrievalRequest,
+  "binding" | "sessionId" | "visibility" | "validAt" | "knownAt">>;
+
 export interface ValidatedInternalRetrievalRequest extends InternalRetrievalRequest {
   readonly candidateLimit: number;
   readonly explain: boolean;

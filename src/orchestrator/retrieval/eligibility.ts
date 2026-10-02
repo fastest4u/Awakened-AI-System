@@ -1,6 +1,6 @@
 import type { ProjectBinding } from "../projections/contracts.js";
 import type {
-  InternalRetrievalRequest,
+  RetrievalEligibilityContext,
   RetrievalItem,
 } from "./contracts.js";
 
@@ -19,7 +19,7 @@ const VISIBILITY_LEVEL: Readonly<Record<RetrievalItem["visibility"], number>> = 
 export function workspaceVisible(
   item: RetrievalItem,
   binding: ProjectBinding,
-  _request: InternalRetrievalRequest,
+  _request: RetrievalEligibilityContext,
 ): boolean {
   return item.workspaceId === binding.workspaceId;
 }
@@ -27,7 +27,7 @@ export function workspaceVisible(
 export function branchVisible(
   item: RetrievalItem,
   binding: ProjectBinding,
-  _request: InternalRetrievalRequest,
+  _request: RetrievalEligibilityContext,
 ): boolean {
   return item.branchScopeId === binding.branchScopeId
     && item.branchRef === binding.branchRef;
@@ -35,7 +35,7 @@ export function branchVisible(
 
 export function sessionVisible(
   item: RetrievalItem,
-  request: InternalRetrievalRequest,
+  request: RetrievalEligibilityContext,
 ): boolean {
   const requested = request.visibility
     ?? (request.sessionId === undefined ? "branch" : "session");
@@ -50,7 +50,7 @@ export function statusVisible(item: RetrievalItem): boolean {
 
 export function temporalVisible(
   item: RetrievalItem,
-  request: InternalRetrievalRequest,
+  request: RetrievalEligibilityContext,
 ): boolean {
   if (
     request.knownAt !== undefined
@@ -70,7 +70,7 @@ export function freshnessVisible(item: RetrievalItem): boolean {
 
 export function isEligible(
   item: RetrievalItem,
-  request: InternalRetrievalRequest,
+  request: RetrievalEligibilityContext,
   binding: ProjectBinding,
 ): boolean {
   return item.projectId === binding.projectId
