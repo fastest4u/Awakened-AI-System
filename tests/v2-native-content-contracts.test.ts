@@ -189,6 +189,52 @@ test("content_relationships_and_metadata_shape", async () => {
   catch (error) { assert.equal((error as Error).message, "FRESH_START_INPUT_INVALID"); }
 });
 
+for (const operation of ["search-projected-content", "get-canonical-record"] as const) {
+  const foreignSession = "22222222-2222-4222-8222-222222222222";
+  for (const scenario of [
+    { name: "bound foreign project", bound: true, sessionId: foreignSession, visibility: "project" },
+    { name: "bound foreign branch", bound: true, sessionId: foreignSession, visibility: "branch" },
+    { name: "sessionless foreign project", bound: false, sessionId: foreignSession, visibility: "project" },
+    { name: "sessionless foreign branch", bound: false, sessionId: foreignSession, visibility: "branch" },
+    { name: "bound trusted project", bound: true, sessionId: READ_UUID, visibility: "project" },
+    { name: "bound trusted branch", bound: true, sessionId: READ_UUID, visibility: "branch" },
+    { name: "bound null session", bound: true, sessionId: null, visibility: "session" },
+    { name: "sessionless null session", bound: false, sessionId: null, visibility: "session" },
+    { name: "bound foreign session", bound: true, sessionId: foreignSession, visibility: "session" },
+  ]) {
+    test(`item_session direct rejects ${operation} ${scenario.name}`, async () => {
+      const api = await load<ContentApi>("content-protocol");
+      const binding = { ...readBootstrap().binding, session: scenario.bound ? { sessionId: READ_UUID, minimumEventPosition: "0" } : null };
+      const scope = { ...selectionScope(), sessionId: binding.session?.sessionId ?? null, visibility: scenario.bound ? "session" : "branch" };
+      const forged = operation === "search-projected-content"
+        ? { ...search(), selectionScope: scope, items: [{ ...searchItem(), sessionId: scenario.sessionId, visibility: scenario.visibility }] }
+        : { ...get(), selectionScope: scope, item: { ...item(), sessionId: scenario.sessionId, visibility: scenario.visibility } };
+      const req = request(operation, operation === "search-projected-content" ? { query: "needle" } : { id: "Case-ID " });
+      assert.equal(receipt(operation).scope.sessionId, null); // Project-strong receipt does not erase trusted selection authority.
+      const decoded = api.decodeNativeContentResult(forged); // No malformed envelope or exact-ID substitution masks the boundary.
+      assert.throws(() => api.assertNativeContentMatchesRequest(decoded, req, binding, receipt(operation)), invalid);
+    });
+  }
+  for (const scenario of [
+    { name: "bound trusted session", bound: true, sessionId: READ_UUID, visibility: "session" },
+    { name: "bound null project", bound: true, sessionId: null, visibility: "project" },
+    { name: "bound null branch", bound: true, sessionId: null, visibility: "branch" },
+    { name: "sessionless null project", bound: false, sessionId: null, visibility: "project" },
+    { name: "sessionless null branch", bound: false, sessionId: null, visibility: "branch" },
+  ]) {
+    test(`item_session direct accepts ${operation} ${scenario.name}`, async () => {
+      const api = await load<ContentApi>("content-protocol");
+      const binding = { ...readBootstrap().binding, session: scenario.bound ? { sessionId: READ_UUID, minimumEventPosition: "0" } : null };
+      const scope = { ...selectionScope(), sessionId: binding.session?.sessionId ?? null, visibility: scenario.bound ? "session" : "branch" };
+      const content = operation === "search-projected-content"
+        ? { ...search(), selectionScope: scope, items: [{ ...searchItem(), sessionId: scenario.sessionId, visibility: scenario.visibility }] }
+        : { ...get(), selectionScope: scope, item: { ...item(), sessionId: scenario.sessionId, visibility: scenario.visibility } };
+      assert.doesNotThrow(() => api.assertNativeContentMatchesRequest(content,
+        request(operation, operation === "search-projected-content" ? { query: "needle" } : { id: "Case-ID " }), binding, receipt(operation)));
+    });
+  }
+}
+
 test("complete_reply_escaped_byte_boundary", async () => {
   const api = await load<ContentApi>("content-protocol");
   const content = { ...search(), items: Array.from({ length: 7 }, (_, i) => ({ ...searchItem(), id: String(i), text: "" })) };

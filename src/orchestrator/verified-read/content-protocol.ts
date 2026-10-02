@@ -146,6 +146,7 @@ export function assertNativeContentMatchesRequest(content: NativeContentResult, 
   for (const value of items) {
     if (value.projectId !== expected.projectId || value.workspaceId !== expected.workspaceId || value.branchScopeId !== expected.branchScopeId || value.branchRef !== expected.branchRef
       || VISIBILITIES.indexOf(value.visibility) > VISIBILITIES.indexOf(expected.visibility)
+      || (value.sessionId !== null && value.visibility !== "session")
       || (value.visibility === "session" && (expected.sessionId === null || value.sessionId !== expected.sessionId))
       || ["retracted", "expired", "erased-evidence"].includes(value.status)
       || BigInt(value.knownFromEventPosition) > BigInt(value.sourceEventPosition) || BigInt(value.sourceEventPosition) > imagePosition) invalid();

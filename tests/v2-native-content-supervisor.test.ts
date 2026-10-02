@@ -56,10 +56,10 @@ class Port {
       closed: { image: true, reader: true, lock: true }, ...(b.request.operation === "verify-published-view" ? {} : { content }) };
   }
 }
-async function fixture() {
+async function fixture(boundSession = true) {
   const directory = ownedReadDirectory(); const clock = new Clock(); const ports: Port[] = []; let epoch = "epoch";
   const binding = decodeReadBootstrap({ ...readBootstrap(), binding: { ...readBootstrap().binding, executorStateDirectory: directory,
-    session: { sessionId: NATIVE_SESSION, minimumEventPosition: "0" } } }).binding;
+    session: boundSession ? { sessionId: NATIVE_SESSION, minimumEventPosition: "0" } : null } }).binding;
   const ownership = new VerifiedReadOwnershipRepository(directory);
   const adapter = createVerifiedReadAdapter(binding, { ownership, now: clock.now, schedule: clock.schedule, clear: clock.clear,
     currentEpoch: () => epoch, spawnOwned() { const port = new Port(); ports.push(port); return port; } });
@@ -123,6 +123,67 @@ for (const fault of ["session-scope", "get-id", "get-kind", "operation", "positi
     } finally { await f.dispose(); }
   });
 }
+for (const operation of ["search-projected-content", "get-canonical-record"] as const) {
+  const foreignSession = "22222222-2222-4222-8222-222222222222";
+  for (const scenario of [
+    { name: "bound foreign project", bound: true, sessionId: foreignSession, visibility: "project" },
+    { name: "bound foreign branch", bound: true, sessionId: foreignSession, visibility: "branch" },
+    { name: "sessionless foreign project", bound: false, sessionId: foreignSession, visibility: "project" },
+    { name: "sessionless foreign branch", bound: false, sessionId: foreignSession, visibility: "branch" },
+    { name: "bound trusted project", bound: true, sessionId: NATIVE_SESSION, visibility: "project" },
+    { name: "bound trusted branch", bound: true, sessionId: NATIVE_SESSION, visibility: "branch" },
+    { name: "bound null session", bound: true, sessionId: null, visibility: "session" },
+    { name: "sessionless null session", bound: false, sessionId: null, visibility: "session" },
+    { name: "bound foreign session", bound: true, sessionId: foreignSession, visibility: "session" },
+  ]) {
+    test(`item_session supervisor rejects ${operation} ${scenario.name}`, async () => {
+      const f = await fixture(scenario.bound);
+      try {
+        const pending = f.query(operation === "search-projected-content" ? nativeSearchRequest() : nativeGetRequest("record"));
+        const rejected = assert.rejects(pending, { code: "WORKER_PROTOCOL_ERROR" });
+        await until(() => !!f.ports[0]?.boot()); const p = f.ports[0]!; p.stages();
+        const reply = p.success(); assert.equal(reply.receipt.scope.sessionId, null);
+        assert.equal(reply.content.selectionScope.sessionId, scenario.bound ? NATIVE_SESSION : null);
+        const value = operation === "search-projected-content" ? reply.content.items[0] : reply.content.item;
+        value.sessionId = scenario.sessionId; value.visibility = scenario.visibility;
+        p.events.emit("message", reply); p.events.emit("exit", 0, null);
+        // Complete the exact owned cleanup after the refused read exit; no uncertainty/timeout masks rejection.
+        const cleanup = f.ports[1];
+        if (cleanup) {
+          const boot = cleanup.sent[0] as CleanupBootstrap;
+          cleanup.events.emit("message", { version: 1, ids: boot.ids, kind: "cleanup", outcome: "absent", cleanup: "complete" });
+          cleanup.events.emit("exit", 0, null);
+        }
+        await rejected;
+        assert.equal((await f.adapter.close()).cleanup, "complete");
+        assert.equal(await f.ownership.inspect(), null);
+      } finally { await f.dispose(); }
+    });
+  }
+  for (const scenario of [
+    { name: "bound trusted session", bound: true, sessionId: NATIVE_SESSION, visibility: "session" },
+    { name: "bound null project", bound: true, sessionId: null, visibility: "project" },
+    { name: "bound null branch", bound: true, sessionId: null, visibility: "branch" },
+    { name: "sessionless null project", bound: false, sessionId: null, visibility: "project" },
+    { name: "sessionless null branch", bound: false, sessionId: null, visibility: "branch" },
+  ]) {
+    test(`item_session supervisor accepts ${operation} ${scenario.name}`, async () => {
+      const f = await fixture(scenario.bound);
+      try {
+        const pending = f.query(operation === "search-projected-content" ? nativeSearchRequest() : nativeGetRequest("record"));
+        await until(() => !!f.ports[0]?.boot()); const p = f.ports[0]!; p.stages(); const reply = p.success();
+        assert.equal(reply.receipt.scope.sessionId, null);
+        const value = operation === "search-projected-content" ? reply.content.items[0] : reply.content.item;
+        value.sessionId = scenario.sessionId; value.visibility = scenario.visibility;
+        p.events.emit("message", reply); p.events.emit("exit", 0, null);
+        const result = await pending;
+        assert.equal(result.content.selectionScope.sessionId, scenario.bound ? NATIVE_SESSION : null);
+        assert.equal(f.ports.length, 1); assert.equal(await f.ownership.inspect(), null);
+      } finally { await f.dispose(); }
+    });
+  }
+}
+
 test("original_budget_and_cleanup_preserve_primary_failure", async () => {
   for (const primary of ["WORKER_TIMEOUT", "INTEGRITY_FAILURE"] as const) {
     const f = await fixture(); try {
