@@ -1,6 +1,6 @@
-import { parseProjectionManifestV2 } from "../projections/manifest.js";
+import { parseProjectionManifestV2 } from "../projections/manifest-codec.js";
 import type { V2ProjectionReaderLease } from "../projections/v2-reader-lease.js";
-import { collectEligibleFromProjectionDatabase } from "./candidates.js";
+import { collectEligibleFromProjectionDatabase } from "./database-core.js";
 import {
   InternalRetrievalError,
   type InternalRetrievalRequest,
