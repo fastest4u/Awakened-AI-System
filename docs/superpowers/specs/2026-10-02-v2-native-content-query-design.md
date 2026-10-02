@@ -1,6 +1,6 @@
 # V2 native search and canonical-record get design
 
-Status: Approach A conversationally approved by the user on 2026-10-02 with `อนุมัติแนวทาง A`. This written specification is prepared for human review, not yet approved. No executable plan or implementation is authorized by that reply. The execution method remains the already selected Subagent-Driven method. Production activation is separately gated.
+Status: Approach A conversationally approved with `อนุมัติแนวทาง A`; the written specification at `bedee3d71b93a49a4e23854185247887b7f43f60` was approved by the user on 2026-10-02 with `อนุมัติสเปก V2 native content written`. The [executable plan](../plans/2026-10-02-v2-native-content-query.md) is prepared for human review; implementation starts only after that review. The execution method remains the already selected Subagent-Driven method. Production activation is separately gated.
 
 Design source: `018953d3c0385f8dac27e27056fae1ba2010f064` on `codex/v2-fresh-start`. Private metadata-only verified-read Tasks 1–6 remain accepted through implementation source `b948ed7c21354dca61ab6cfd2b3c519ea7a1f6cd`; see [their acceptance evidence](../evidence/2026-10-01-v2-internal-verified-read.md). This design extends that boundary; it neither reopens those tasks nor claims fresh execution of their tests on the documentation HEAD.
 
