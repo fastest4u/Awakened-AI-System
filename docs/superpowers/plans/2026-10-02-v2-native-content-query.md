@@ -12,6 +12,8 @@
 
 Status: Human approved this plan at `eb63704f79579d0c5e30e93041839c0e1db432ee` on 2026-10-02 with `อนุมัติแผน`; implementation is authorized within its scope. Preserve the selected Subagent-Driven method. These are six **Native content Tasks**, not a reopening of the accepted private metadata-only Tasks 1–6. Task heading order is normalized for the Superpowers brief extractor; requirements are unchanged.
 
+Execution progress: Native content Task 1 accepted at `71a1c57bf09281d739416faaa1009bc603f86cda` after compile-success RED, focused ten-target GREEN 58/58 (no skips), and independent specification PASS / code-quality APPROVED with no actionable findings. Tasks 2–6 remain pending; this extraction is not native-content integration or whole-system production acceptance.
+
 ## Global Constraints
 
 - Fresh empty V2, no V1 import/search/fallback or parity facade in the query route; only owned synthetic stores are used for this increment.
@@ -100,7 +102,7 @@ resultItems(selection: RankedSelection): readonly InternalRetrievalResultItem[];
 
 The existing `RankedInternalRetrievalResultItem` is structurally the same item plus already-present conflictGroupId; retain its service export without a runtime service import in the pure module. Pure modules consume only codec/metadata, contracts, eligibility, ranking and pure explanation types; no filesystem opening, stable-directory helper, leases, migration deadline/provider/custom-ranker orchestration.
 
-- [ ] **Step 1: Write `database_core_exports_and_preserves_native_and_legacy_queries` and `selection_core_preserves_complete_ranking_conversion`.** Reuse owned images from existing candidate tests, not active production paths. For the conversion test use one conflicted candidate with source position 7n, key `entity`, feedback 1200 and group eligible count 3/cursor `opaque`; assert:
+- [x] **Step 1: Write `database_core_exports_and_preserves_native_and_legacy_queries` and `selection_core_preserves_complete_ranking_conversion`.** Reuse owned images from existing candidate tests, not active production paths. For the conversion test use one conflicted candidate with source position 7n, key `entity`, feedback 1200 and group eligible count 3/cursor `opaque`; assert:
 
 ```typescript
 assert.equal(typeof core.collectEligibleFromProjectionDatabase, "function");
@@ -116,10 +118,10 @@ assert.deepEqual(pureSelectedItems, legacySelectedItems);
 ```
 
 Include a defensively denied conflict member to pin scoped counts, and equal-score/source/entity diversity plus feedback order. The test's source-graph assertion follows runtime imports and rejects helper, filesystem-opening, subprocess/thread/provider paths.
-- [ ] **Step 2: Run RED** with `npm run test:build`, then the exact two compiled new test files. Expected: export-presence assertion fails, compilation succeeds.
-- [ ] **Step 3: Implement the declared exports and delegate wrappers.** Move existing bodies, not ranking weights/selector behavior. Runtime manifest types/decoding must use `manifest-codec.ts` and metadata verification `image-metadata.ts`; `candidates.ts` retains pathname/opening and its existing exported database seam as a re-export. `v2-candidates.ts` delegates pure queries after its current lease validation; `service.ts` calls the full `rankingChannels`, never raw `collection.channels` directly in fusion. Preserve source-aware feedback, highImpact, conflict totals/cursor and custom ranker/explain/vector orchestration outside the core.
-- [ ] **Step 4: Run GREEN** after one `npm run test:build`: exact compiled files `retrieval-database-core`, `retrieval-selection-core`, `retrieval-candidates`, `v2-retrieval-candidates`, `retrieval-service`, `retrieval-ranking`, `retrieval-eligibility`, `projection-runtime`, `retrieval-explain`, `retrieval-vector-cache` (each under `dist-test/tests/*.test.js`, same serial node command). Expected: exit 0; unchanged wrapper ordering/bounds/feature behavior. If source inspection shows a changed parity/evaluation input, refresh only its affected named case and record that reason; do not sweep migration suites.
-- [ ] **Step 5: Review and commit the extracted deliverable** after exact spec/quality gates. Stage only the five production files and two new tests named above; `git diff --cached --check`, then `git commit -m "refactor: extract pure retrieval database and selection cores"`. Record focused evidence and source commit; do not mark native content integration complete.
+- [x] **Step 2: Run RED** with `npm run test:build`, then the exact two compiled new test files. Expected: export-presence assertion fails, compilation succeeds.
+- [x] **Step 3: Implement the declared exports and delegate wrappers.** Move existing bodies, not ranking weights/selector behavior. Runtime manifest types/decoding must use `manifest-codec.ts` and metadata verification `image-metadata.ts`; `candidates.ts` retains pathname/opening and its existing exported database seam as a re-export. `v2-candidates.ts` delegates pure queries after its current lease validation; `service.ts` calls the full `rankingChannels`, never raw `collection.channels` directly in fusion. Preserve source-aware feedback, highImpact, conflict totals/cursor and custom ranker/explain/vector orchestration outside the core.
+- [x] **Step 4: Run GREEN** after one `npm run test:build`: exact compiled files `retrieval-database-core`, `retrieval-selection-core`, `retrieval-candidates`, `v2-retrieval-candidates`, `retrieval-service`, `retrieval-ranking`, `retrieval-eligibility`, `projection-runtime`, `retrieval-explain`, `retrieval-vector-cache` (each under `dist-test/tests/*.test.js`, same serial node command). Expected: exit 0; unchanged wrapper ordering/bounds/feature behavior. If source inspection shows a changed parity/evaluation input, refresh only its affected named case and record that reason; do not sweep migration suites.
+- [x] **Step 5: Review and commit the extracted deliverable** after exact spec/quality gates. Stage only the five production files and two new tests named above; `git diff --cached --check`, then `git commit -m "refactor: extract pure retrieval database and selection cores"`. Record focused evidence and source commit; do not mark native content integration complete.
 
 ### Task 2: Native content — Exact content contracts and version-2 read wire
 
