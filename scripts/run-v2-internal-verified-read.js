@@ -106,11 +106,13 @@ function runChild(args, root, deadline, signal, profile) {
 }
 
 /** Internal fixture seam; the CLI always runs this checkout's fixed operation. */
-export async function runVerifiedReadGate({ root = repository, timeoutMs = 900000, signal, profile = 'metadata' } = {}) {
+export async function runVerifiedReadGate({ root = repository, timeoutMs, signal, profile = 'metadata' } = {}) {
   const arrival = performance.now(); let descriptor, identity, lock, retainLock = false, result = 1;
   try {
     if (profile !== 'metadata' && profile !== 'native-content') throw new Error('VERIFIED_READ_PROFILE_INVALID');
-    if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 900000) throw new Error('VERIFIED_READ_DEADLINE_INVALID');
+    const maximumMs = profile === 'native-content' ? 1500000 : 900000;
+    if (timeoutMs === undefined) timeoutMs = maximumMs;
+    if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > maximumMs) throw new Error('VERIFIED_READ_DEADLINE_INVALID');
     const deadline = arrival + timeoutMs;
     if (signal?.aborted) return 130;
     root = realpathSync.native(root); lock = join(root, '.fresh-start-foundation.lock');
@@ -123,7 +125,7 @@ export async function runVerifiedReadGate({ root = repository, timeoutMs = 90000
       ['smoke', [join(root, 'scripts/smoke-v2-fresh-start.js')]]];
     for (const [stage, args] of stages) {
       const started = performance.now(); const child = await runChild(args, root, deadline, signal, profile);
-      process.stdout.write(JSON.stringify({ gate: 'v2-internal-verified-read', profile, stage, code: child.code,
+      process.stdout.write(JSON.stringify({ gate: 'v2-internal-verified-read', profile, totalMs: timeoutMs, stage, code: child.code,
         durationMs: performance.now() - started, elapsedMs: performance.now() - arrival, cleanup: child.uncertain ? 'incomplete' : 'complete', closure: child.closure }) + '\n');
       result = child.code;
       if (child.uncertain) { retainLock = true; result = 1; break; }

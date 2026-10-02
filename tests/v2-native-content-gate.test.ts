@@ -3,6 +3,9 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync,
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { spawnSync } from "node:child_process";
+import childProcess from "node:child_process";
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import test from "node:test";
 
 const nativeNames = ["retrieval-database-core", "retrieval-selection-core", "v2-native-content-contracts", "v2-native-content-query",
@@ -71,10 +74,53 @@ test("native_profile_preserves_default_and_owns_outputs", { skip: process.platfo
       assert.equal(f.events.filter(e => e.stage === "compile").length, 1);
       assert.equal(f.events.length - 3, profile ? 33 : 20);
       assert.ok(f.events.every(e => e.profile === (profile ?? "metadata") && e.closure === "windows-job-active-zero" && e.cleanup === "complete"));
+      assert.ok(f.events.every(e => e.totalMs === (profile ? 1500000 : 900000)), "each stage must retain its selected profile default total");
       assert.equal(existsSync(join(f.root, ".fresh-start-foundation.lock")), false);
     } finally { f.put("descendant-release", "release"); controller.abort(); await pending; f.cleanup(); }
   }
 });
+test("profile totals admit only safe bounded overrides before output ownership or native launch", { skip: process.platform !== "win32" }, async t => {
+  const run = await gate();
+  const aborted = new AbortController(); aborted.abort();
+  const originalOpen = fs.openSync, originalSpawn = childProcess.spawn;
+  let observedRoot = "", lockOpens = 0, launches = 0;
+  t.mock.method(fs, "openSync", ((...args: Parameters<typeof originalOpen>) => {
+    if (args[0] === join(observedRoot, ".fresh-start-foundation.lock")) lockOpens++;
+    return originalOpen(...args);
+  }) as typeof originalOpen);
+  t.mock.method(childProcess, "spawn", ((...args: Parameters<typeof originalSpawn>) => {
+    if (args[2]?.cwd === observedRoot) launches++;
+    return originalSpawn(...args);
+  }) as typeof originalSpawn); syncBuiltinESMExports();
+  try {
+  for (const [profile, maximum] of [["native-content", 1500000], ["metadata", 900000]] as const) {
+    const f = fixture();
+    observedRoot = f.root; lockOpens = 0; launches = 0;
+    try {
+      for (const timeoutMs of [0, -1, 0.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1, maximum + 1, "1", null]) {
+        assert.equal(await run({ root: f.root, profile, timeoutMs: timeoutMs as number, signal: aborted.signal }), 1);
+        assert.deepEqual(f.trace(), []); assert.equal(existsSync(join(f.root, ".fresh-start-foundation.lock")), false);
+        assert.equal(lockOpens, 0); assert.equal(launches, 0);
+      }
+      assert.equal(await run({ root: f.root, profile, timeoutMs: 1, signal: aborted.signal }), 130);
+      assert.equal(lockOpens, 0); assert.equal(launches, 0);
+      // Real owned build sentinel proves valid maxima reach the stage runner;
+      // it stops before compile, rather than repeating a complete profile.
+      f.put("scripts/build.js", "import{appendFileSync}from'node:fs';appendFileSync('trace','build\\n');process.exit(37);");
+      for (const timeoutMs of profile === "native-content" ? [900001, 1500000] : [900000]) {
+        const before = f.events.length;
+        assert.equal(await f.run(run, { profile, timeoutMs }), 37);
+        assert.equal(f.events.length, before + 1); assert.equal(f.events.at(-1).stage, "build");
+        assert.equal(lockOpens, before + 1); assert.equal(launches, before + 1);
+        assert.equal(f.events.at(-1).totalMs, timeoutMs);
+        assert.equal(f.events.at(-1).closure, "windows-job-active-zero");
+        assert.equal(existsSync(join(f.root, ".fresh-start-foundation.lock")), false);
+      }
+    } finally { f.cleanup(); }
+  }
+  } finally { t.mock.restoreAll(); syncBuiltinESMExports(); }
+});
+
 test("native profile refuses unknown profile and both no-argument CLIs refuse extra argv before a child", async () => {
   const run = await gate(), f = fixture();
   try { assert.equal(await run({ root: f.root, profile: "arbitrary" }), 1); assert.deepEqual(f.trace(), []);
