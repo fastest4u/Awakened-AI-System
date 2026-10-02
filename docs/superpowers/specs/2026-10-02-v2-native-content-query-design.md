@@ -4,6 +4,8 @@ Status: Approach A conversationally approved with `อนุมัติแน�
 
 Design source: `018953d3c0385f8dac27e27056fae1ba2010f064` on `codex/v2-fresh-start`. Private metadata-only verified-read Tasks 1–6 remain accepted through implementation source `b948ed7c21354dca61ab6cfd2b3c519ea7a1f6cd`; see [their acceptance evidence](../evidence/2026-10-01-v2-internal-verified-read.md). This design extends that boundary; it neither reopens those tasks nor claims fresh execution of their tests on the documentation HEAD.
 
+Implementation status (2026-10-02): private native-content runtime accepted through `bb9bee4ccfe097ebe1e1929955d2bea296f1a0a4`, after six per-Task reviews, whole-increment review and one I1 fix/scoped re-review with no residual findings. [Accepted native evidence](../evidence/2026-10-02-v2-native-content-query.md) distinguishes the original fixed33 gate from later amended affected checks, actual failures/skips and current measured identity. This status-only documentation follow-up is not freshly built source, a clean release, public/host qualification or PROD activation; all contracts and F2–F4 exclusions remain unchanged.
+
 ## 1. Agreed outcome and scope
 
 Advance fresh-start V2 from a verification receipt to real content retrieval: bounded search and exact canonical-record get, executed in the existing owned read child against the same captured and verified V2 projection image. The user wants V2 as primary memory through the current Codex desktop, starting empty with no V1 import, search or fallback. Preserve that outcome and [the approved fresh-start profile](2026-09-29-v2-fresh-start-production-design.md).
@@ -129,7 +131,7 @@ Preserve the separate fixed 2000 ms cleanup observation window (including at mos
 
 ## 7. Verification to require in the executable plan
 
-These are proof obligations for future implementation, not tests already run for this specification:
+These binding proof obligations are addressed by the [accepted implementation evidence](../evidence/2026-10-02-v2-native-content-query.md), with explicit source-specific measurements and retained limitations; the table remains the verification contract, not a claim that every later documentation HEAD was rebuilt:
 
 | Area | Required focused evidence |
 | --- | --- |
