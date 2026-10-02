@@ -4,6 +4,8 @@ import { isBuiltin } from 'node:module';
 import path from 'node:path';
 
 const digest = bytes => createHash('sha256').update(bytes).digest('hex');
+const pureRetrievalInputs = new Set(['database-core.ts', 'selection-core.ts', 'contracts.ts', 'eligibility.ts', 'ranking.ts']
+    .map(name => 'src/orchestrator/retrieval/' + name));
 function canonical(value) {
     if (Array.isArray(value)) return '[' + value.map(canonical).join(',') + ']';
     if (value && typeof value === 'object') return '{' + Object.keys(value).sort().map(key => JSON.stringify(key) + ':' + canonical(value[key])).join(',') + '}';
@@ -49,7 +51,8 @@ export function freshStartBuild(outDir, inspectIsolatedSyntax) {
             if (names.slice(3).includes(name)) {
                 const inputs = Object.entries(result.metafile.inputs).map(([inputName, input]) => {
                     const captured = captures.get(inputName);
-                    if (!captured || captured.entry.bytes !== input.bytes || /\/(?:stable-directory|builder|coordinator|integrity|manifest)\.ts$|\/retrieval\/|\/workers\//.test(inputName)) throw new Error('FRESH_START_BUILD_MISMATCH');
+                    if (!captured || captured.entry.bytes !== input.bytes || /\/(?:stable-directory|builder|coordinator|integrity|manifest)\.ts$|\/workers\//.test(inputName)
+                        || (inputName.includes('/retrieval/') && !pureRetrievalInputs.has(inputName))) throw new Error('FRESH_START_BUILD_MISMATCH');
                     inspectIsolatedSyntax(inputName, captured.bytes, false);
                     for (const imported of input.imports) if (/^(node:)?(child_process|worker_threads)$/.test(imported.path)) throw new Error('FRESH_START_BUILD_MISMATCH');
                     return captured.entry;

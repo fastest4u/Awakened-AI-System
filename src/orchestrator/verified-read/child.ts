@@ -7,8 +7,10 @@ import { readProjectionImageMetadata } from "../projections/image-metadata.js";
 import { assertBoundSqliteConnectionIdentity, NodeSqliteDriver } from "../storage/node-sqlite-driver.js";
 import type { SqliteConnection } from "../storage/sqlite-driver.js";
 import { SqliteVerifiedReadAdmission } from "./admission.js";
-import type { ReadBootstrap, ReadPhase, ReadReply, ReadTerminalReply, VerifiedReadReceipt } from "./contracts.js";
-import { decodeReadBootstrap, decodeVerifiedReadReceipt, verifiedReadFailure } from "./protocol.js";
+import type { ReadBootstrap, ReadPhase, ReadReply, ReadSuccessBase, ReadTerminalReply, VerifiedReadReceipt } from "./contracts.js";
+import { decodeReadBootstrap, decodeReadReply, decodeVerifiedReadReceipt, verifiedReadFailure } from "./protocol.js";
+import { queryNativeContent } from "./content-query.js";
+import { buildNativeContentResult } from "./content-result.js";
 
 /** Fixed owner closures only. Never transported in bootstrap, argv or environment. */
 export interface VerifiedReadChildDependencies {
@@ -20,7 +22,7 @@ export interface VerifiedReadChildDependencies {
 }
 function fail(code: string): never { throw new Error(code); }
 
-/** Metadata certification of an already published image; never builds or repairs publication. */
+/** Reads the already published verified image; never builds or repairs publication. */
 export async function executeVerifiedRead(bootstrap: ReadBootstrap, dependencies: VerifiedReadChildDependencies): Promise<ReadTerminalReply> {
   const started = dependencies.now();
   const input = decodeReadBootstrap(bootstrap);
@@ -70,8 +72,6 @@ export async function executeVerifiedRead(bootstrap: ReadBootstrap, dependencies
     throw Object.assign(new Error("PROJECTION_LAG"), { code: "PROJECTION_LAG", positions: Object.freeze({ required, observed }) });
   };
   try {
-    // Content execution is deliberately unavailable until same-image integration (Task 5).
-    if (input.request.operation !== "verify-published-view") fail("FRESH_START_INPUT_INVALID");
     checkpoint(); const measured = dependencies.inspectBuild(); checkpoint();
     if (!/^[0-9a-f]{64}$/u.test(measured) || measured !== input.binding.expectedRelease.buildIdentityHash) fail("FRESH_START_BUILD_MISMATCH");
     // Openers own native allocation until return; a throw cannot prove their hidden cleanup completed.
@@ -132,13 +132,23 @@ export async function executeVerifiedRead(bootstrap: ReadBootstrap, dependencies
       releaseId: fence.releaseId, controlGeneration: fence.controlGeneration, requiredEventPosition: fence.requiredPosition,
       projectionGeneration: metadata.generation, projectionEventPosition: metadata.terminalEventPosition,
       projectionEventHash: metadata.terminalEventHash, imageSha256: sha256, verification: "image-scope-position-and-active-admission" });
+    // Prospective full terminal reserves packing capacity only. Closure below remains mandatory.
+    const base: ReadSuccessBase = { version: 2, ids: input.ids, kind: "success", receipt, fence,
+      closed: Object.freeze({ image: true, reader: true, lock: true }) };
+    let content;
+    if (input.request.operation !== "verify-published-view") {
+      stage("query", selected.terminalEventPosition);
+      const candidate = queryNativeContent(image, selected, { request: input.request, binding: input.binding, receipt, remainingMs: checkpoint() });
+      checkpoint(); content = buildNativeContentResult(candidate, base); checkpoint();
+    }
     closeImage(); closeLock(); checkpoint();
     stage("revalidate", selected.terminalEventPosition);
     admission.revalidate(fence, selected); checkpoint();
     // Linearizes at final authority observation. Closure is still required before any terminal success.
     closeReader(); checkpoint();
-    return Object.freeze({ version: 2, ids: input.ids, kind: "success", receipt: Object.freeze({ ...receipt, operation: "verify-published-view" as const }), fence,
-      closed: Object.freeze({ image: true, reader: true, lock: true }) });
+    const terminal = decodeReadReply({ ...base, ...(content === undefined ? {} : { content }) }); checkpoint();
+    if (terminal.kind !== "success") fail("WORKER_PROTOCOL_ERROR");
+    return terminal;
   } catch (error) { primary = error; }
   // Each resource gets one close attempt. Cleanup errors never replace the primary failure.
   for (const close of [closeImage, closeLock, closeReader]) {

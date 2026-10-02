@@ -1,8 +1,9 @@
-import { writeFileSync } from "node:fs";
+import { writeFileSync, readFileSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { createCwdProjectionReadCore } from "../../src/orchestrator/projections/stable-directory-read-core.js";
 import { releaseOwnedReadLock } from "../../src/orchestrator/verified-read/cleanup.js";
 import { decodeCleanupBootstrap, decodeReadBootstrap } from "../../src/orchestrator/verified-read/protocol.js";
+import { executeVerifiedRead } from "../../src/orchestrator/verified-read/child.js";
 
 // Fault selection exists only in this test executable, never production argv/env/bootstrap.
 const kind = process.argv[2];
@@ -21,6 +22,26 @@ if (kind === "writer") {
     writeFileSync("read-blocked", "owned-lock-acquired-before-synchronous-wait");
     Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0);
     throw new Error("infinite wait unexpectedly returned");
+  });
+} else if (kind === "query-hang") {
+  process.once("message", async value => {
+    const bootstrap = decodeReadBootstrap(value); let queryObserved = false;
+    const prepare = DatabaseSync.prototype.prepare;
+    DatabaseSync.prototype.prepare = function (sql) {
+      // Fixed canonical SELECT only, after executeVerifiedRead has validated the same detached image.
+      if (/SELECT item\.project_id, item\.session_id, item\.item_id, item\.normalized_key/u.test(sql)
+        && /FROM canonical_items AS item/u.test(sql) && /item\.item_id = \$id COLLATE BINARY/u.test(sql)) {
+        if (!queryObserved || readFileSync(".projection-manifest.publish.lock", "utf8") !== bootstrap.lockToken) throw new Error("query boundary not owned");
+        writeFileSync("query-blocked", "validated-image-owned-lock-fixed-canonical-query");
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0);
+        throw new Error("infinite query wait unexpectedly returned");
+      }
+      return prepare.call(this, sql);
+    };
+    const reply = await executeVerifiedRead(bootstrap, { inspectBuild: () => "a".repeat(64), now: () => performance.now(),
+      wait: async ms => { await new Promise(resolve => setTimeout(resolve, ms)); }, signal: new AbortController().signal,
+      emitStage(stage) { if (stage.phase === "query") queryObserved = true; process.send!(stage); } });
+    process.send!(reply, sendError => { if (sendError) process.exitCode = 1; process.disconnect(); });
   });
 } else if (kind === "cleanup") {
   process.once("message", value => {

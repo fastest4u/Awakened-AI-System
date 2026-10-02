@@ -278,13 +278,20 @@ test("unknown partial acquisition evidence is preserved without falsely completi
   } finally { fs.writeSync = original; syncBuiltinESMExports(); }
 }));
 
-test("production entry runtime source closure has no helper, publisher, retrieval or process/thread dependency", () => {
+test("production entry runtime source closure permits only exact pure retrieval paths and no helper, publisher or process/thread dependency", () => {
   // This architectural constraint catches introducing a forbidden runtime import, including transitively.
   const sourceRoot = fileURLToPath(new URL("../../src/", import.meta.url));
   const visited = new Set<string>();
+  const pureRetrievalPaths = new Set(["database-core.ts", "selection-core.ts", "contracts.ts", "eligibility.ts", "ranking.ts"]
+    .map(name => join(sourceRoot, "orchestrator/retrieval", name).replaceAll("\\", "/")));
+  const permitted = (path: string) => !/\/(?:stable-directory|builder|coordinator|integrity|manifest)\.ts$|\/workers\//u.test(path)
+    && (!path.includes("/retrieval/") || pureRetrievalPaths.has(path));
+  for (const name of ["candidates.ts", "v2-candidates.ts", "service.ts", "explain.ts", "providers/vector.ts", "lease.ts"]) {
+    assert.equal(permitted(join(sourceRoot, "orchestrator/retrieval", name).replaceAll("\\", "/")), false);
+  }
   const inspect = (path: string): void => {
     if (visited.has(path)) return; visited.add(path);
-    assert.doesNotMatch(path.replaceAll("\\", "/"), /\/(?:stable-directory|builder|coordinator|integrity|manifest)\.ts$|\/retrieval\/|\/workers\//u);
+    assert.equal(permitted(path.replaceAll("\\", "/")), true, `forbidden runtime input ${path}`);
     const source = ts.createSourceFile(path, readFileSync(path, "utf8"), ts.ScriptTarget.Latest, true);
     for (const statement of source.statements) {
       if (!ts.isImportDeclaration(statement) && !ts.isExportDeclaration(statement)) continue;
@@ -309,6 +316,7 @@ test("production entry runtime source closure has no helper, publisher, retrieva
   };
   inspect(join(sourceRoot, "v2/internal-verified-read.entry.ts"));
   inspect(join(sourceRoot, "v2/internal-verified-read-cleanup.entry.ts"));
+  for (const path of pureRetrievalPaths) assert.ok([...visited].some(value => value.replaceAll("\\", "/") === path), `expected reviewed dependency ${path}`);
   assert.ok(visited.size > 4);
 });
 

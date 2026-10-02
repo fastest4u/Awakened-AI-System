@@ -5,7 +5,9 @@ import { join } from "node:path";
 import { performance } from "node:perf_hooks";
 import type { Socket } from "node:net";
 import type { CleanupBootstrap, CleanupReply, ReadBootstrap, ReadCancel, ReadMessageIds, ReadPhase, ReadReply,
-  VerifiedReadBinding, VerifiedReadDiagnostic, VerifiedReadFailureCode, VerifiedReadReceipt, VerifiedReadRequest } from "./contracts.js";
+  MetadataVerifiedReadRequest, VerifiedReadBinding, VerifiedReadDiagnostic, VerifiedReadFailureCode, VerifiedReadReceipt, VerifiedReadRequest } from "./contracts.js";
+import type { VerifiedContentReadRequest, VerifiedContentReadResult } from "./content-contracts.js";
+import { assertNativeContentMatchesRequest } from "./content-protocol.js";
 import { decodeCleanupReply, decodeReadBootstrap, decodeReadReply, decodeVerifiedReadRequest, verifiedReadFailure } from "./protocol.js";
 import { VerifiedReadOwnershipRepository } from "./ownership.js";
 
@@ -29,18 +31,21 @@ export interface VerifiedReadSupervisorDependencies {
   spawnOwned(kind: "read" | "cleanup"): OwnedReadProcess;
 }
 export interface VerifiedReadAdapter {
-  verify(request: VerifiedReadRequest, options?: { signal?: AbortSignal }): Promise<VerifiedReadReceipt>;
+  verify(request: MetadataVerifiedReadRequest, options?: { signal?: AbortSignal }): Promise<VerifiedReadReceipt>;
+  query(request: VerifiedContentReadRequest, options?: { signal?: AbortSignal }): Promise<VerifiedContentReadResult>;
   diagnostic(): VerifiedReadDiagnostic;
   close(): Promise<VerifiedReadDiagnostic>;
 }
 const PHASES: ReadPhase[] = ["admission", "projection-wait", "capture", "validate", "revalidate"];
+const CONTENT_PHASES: ReadPhase[] = ["admission", "projection-wait", "capture", "validate", "query", "revalidate"];
+type SuccessCandidate = Extract<ReadReply, { kind: "success" }>;
 const CLEANUP_MS = 2000;
 function error(code: VerifiedReadFailureCode) { return Object.assign(new Error(code), { code }); }
 function matches(a: ReadMessageIds, b: ReadMessageIds): boolean { return a.requestId === b.requestId && a.attemptId === b.attemptId && a.laneEpoch === b.laneEpoch; }
 type ProcessState = { port: OwnedReadProcess; kind: "read" | "cleanup"; exited: boolean; normal: boolean; terminated: boolean;
   listeners: (() => void)[]; stdout: number; stderr: number; messages: number; stage: number; terminal?: ReadReply | CleanupReply };
 type Lane = { sequence: number; ids: ReadMessageIds; request: VerifiedReadRequest; deadline: number; token: string;
-  resolve(value: VerifiedReadReceipt): void; reject(reason: unknown): void; settled: boolean; responseTimer?: unknown; abort?: () => void;
+  resolve(value: VerifiedReadReceipt | VerifiedContentReadResult): void; reject(reason: unknown): void; settled: boolean; responseTimer?: unknown; abort?: () => void;
   phase: VerifiedReadDiagnostic["phase"]; code: VerifiedReadFailureCode | null; positions: VerifiedReadDiagnostic["positions"];
   inFlight: number; started: boolean; recordOwned: boolean; recordClosed: boolean; recordClosing: boolean;
   read?: ProcessState; cleanupChild?: ProcessState; cleanupStarted?: number; cleanupTimer?: unknown; graceTimer?: unknown;
@@ -100,9 +105,10 @@ export function createVerifiedReadAdapter(input: VerifiedReadBinding, dependenci
   const diagnostic = (): VerifiedReadDiagnostic => Object.freeze({ ...(active ? { attemptId: active.ids.attemptId, phase: active.phase,
     code: active.code, cleanup: active.incomplete ? "incomplete" as const : "pending" as const, positions: active.positions } : last), pendingCount: count() });
   function notifyClosed() { if (closing && (!active || active.incomplete)) { const value = diagnostic(); for (const resolve of closeWaiters.splice(0)) resolve(value); } }
-  function settle(lane: Lane, failure?: VerifiedReadFailureCode, receipt?: VerifiedReadReceipt) {
+  function settle(lane: Lane, failure?: VerifiedReadFailureCode, candidate?: SuccessCandidate) {
     if (lane.settled) return; lane.settled = true; deps.clear(lane.responseTimer); lane.abort?.();
-    if (failure) { lane.code ??= failure; lane.reject(error(failure)); } else lane.resolve(receipt!);
+    if (failure) { lane.code ??= failure; lane.reject(error(failure)); }
+    else lane.resolve(candidate!.content === undefined ? candidate!.receipt : Object.freeze({ receipt: candidate!.receipt, content: candidate!.content }));
   }
   function stopProcess(state: ProcessState | undefined) {
     if (!state || state.exited || state.terminated) return; state.terminated = true;
@@ -124,11 +130,11 @@ export function createVerifiedReadAdapter(input: VerifiedReadBinding, dependenci
     if (lane.cleanupStarted !== undefined && deps.now() - lane.cleanupStarted >= CLEANUP_MS) { expireCleanup(lane); return false; }
     return true;
   }
-  function finish(lane: Lane, receipt?: VerifiedReadReceipt) {
+  function finish(lane: Lane, candidate?: SuccessCandidate) {
     if (!cleanupLive(lane)) return;
-    if (receipt && !eligible(lane)) return;
+    if (candidate && !eligible(lane)) return;
     lane.done = true; deps.clear(lane.cleanupTimer); deps.clear(lane.graceTimer); detach(lane.read); detach(lane.cleanupChild);
-    if (receipt) settle(lane, undefined, receipt);
+    if (candidate) settle(lane, undefined, candidate);
     closedThrough = Math.max(closedThrough, lane.sequence);
     last = { attemptId: lane.ids.attemptId, phase: closing ? "closed" : "idle", code: lane.code, cleanup: "complete", pendingCount: 0, positions: lane.positions };
     if (active === lane) active = undefined; notifyClosed(); pump();
@@ -159,14 +165,14 @@ export function createVerifiedReadAdapter(input: VerifiedReadBinding, dependenci
     if (deps.currentEpoch() !== lane.ids.laneEpoch) { fail(lane, "FRESH_START_ADMISSION_STALE"); return false; }
     return true;
   }
-  async function closeRecord(lane: Lane, receipt?: VerifiedReadReceipt) {
+  async function closeRecord(lane: Lane, candidate?: SuccessCandidate) {
     if (lane.recordClosing || lane.inFlight || !cleanupLive(lane)) return;
     lane.recordClosing = true; lane.inFlight++;
     try {
       if (lane.recordOwned && !lane.recordClosed) { await deps.ownership.complete(lane.ids); lane.recordClosed = true; }
       lane.inFlight--; lane.recordClosing = false;
       if (!cleanupLive(lane)) return;
-      if (receipt && !lane.settled) { if (eligible(lane)) finish(lane, receipt); }
+      if (candidate && !lane.settled) { if (eligible(lane)) finish(lane, candidate); }
       else finish(lane);
     } catch { lane.inFlight--; lane.recordClosing = false; if (!lane.settled) fail(lane, "WORKER_UNAVAILABLE"); expireCleanup(lane); }
   }
@@ -191,23 +197,33 @@ export function createVerifiedReadAdapter(input: VerifiedReadBinding, dependenci
       || fence.releaseId !== receipt.releaseId || fence.controlGeneration !== receipt.controlGeneration || fence.requiredPosition !== receipt.requiredEventPosition
       || BigInt(receipt.projectionEventPosition) < required || BigInt(fence.requiredPosition) !== required
       || (receipt.projectionEventPosition === fence.capturedPosition && receipt.projectionEventHash !== fence.capturedHash)) throw error("WORKER_PROTOCOL_ERROR");
+    if (lane.request.operation !== "verify-published-view") {
+      if (reply.content === undefined) throw error("WORKER_PROTOCOL_ERROR");
+      assertNativeContentMatchesRequest(reply.content, lane.request, binding, receipt);
+    }
   }
   function observe(lane: Lane, port: OwnedReadProcess, kind: "read" | "cleanup"): ProcessState {
     const state: ProcessState = { port, kind, exited: false, normal: false, terminated: false, listeners: [], stdout: 0, stderr: 0, messages: 0, stage: 0 };
     state.listeners.push(port.onMessage(value => {
       if (!cleanupLive(lane) || oldLane(value)) return;
-      if (kind === "read" && !lane.settled && !eligible(lane)) return;
+      if (kind === "read" && (lane.settled || !eligible(lane))) return;
       try {
         if (++state.messages > 8) throw error("WORKER_PROTOCOL_ERROR");
         const reply = kind === "read" ? decodeReadReply(value) : decodeCleanupReply(value);
         if (!matches(reply.ids, lane.ids) || state.terminal || state.exited) throw error("WORKER_PROTOCOL_ERROR");
         if (reply.kind === "stage") {
-          if (PHASES[state.stage++] !== reply.phase) throw error("WORKER_PROTOCOL_ERROR");
+          const phases = lane.request.operation === "verify-published-view" ? PHASES : CONTENT_PHASES;
+          if (phases[state.stage++] !== reply.phase) throw error("WORKER_PROTOCOL_ERROR");
           // A stage carries no authoritative required position; do not invent a positions pair from caller minima.
           if (!lane.settled) lane.phase = reply.phase;
         } else {
-          state.terminal = reply;
-          if (reply.kind === "success") { if (state.stage !== PHASES.length) throw error("WORKER_PROTOCOL_ERROR"); validateSuccess(lane, reply); beginCleanup(lane); }
+          if (reply.kind === "success") {
+            if (state.stage !== (lane.request.operation === "verify-published-view" ? PHASES : CONTENT_PHASES).length) throw error("WORKER_PROTOCOL_ERROR");
+            validateSuccess(lane, reply);
+            if (!eligible(lane)) return;
+            // Retain only the exact decoded/frozen, request-correlated candidate, never receipt-only state.
+            state.terminal = reply; beginCleanup(lane);
+          } else state.terminal = reply;
           if (reply.kind === "failure") { lane.positions = reply.failure.positions; fail(lane, reply.failure.code); }
           if (reply.kind === "cleanup" && (reply.cleanup !== "complete" || !["released", "absent"].includes(reply.outcome))) expireCleanup(lane);
         }
@@ -225,7 +241,7 @@ export function createVerifiedReadAdapter(input: VerifiedReadBinding, dependenci
       if (kind === "read" && !lane.settled) {
         if (!eligible(lane)) return;
         if (!state.normal || state.terminal?.kind !== "success") fail(lane, "WORKER_UNAVAILABLE");
-        else void closeRecord(lane, state.terminal.receipt);
+        else void closeRecord(lane, state.terminal);
       } else if (kind === "cleanup" && (!state.normal || state.terminal?.kind !== "cleanup")) expireCleanup(lane);
       else progressCleanup(lane);
     }));
@@ -283,15 +299,12 @@ export function createVerifiedReadAdapter(input: VerifiedReadBinding, dependenci
     const lane = queue.shift(); if (!lane) return;
     if (!eligible(lane)) { pump(); return; } active = lane; void start(lane);
   }
-  return Object.freeze({
-    diagnostic,
-    verify(value: VerifiedReadRequest, options?: { signal?: AbortSignal }): Promise<VerifiedReadReceipt> {
+  function enqueue(value: VerifiedReadRequest, content: boolean, options?: { signal?: AbortSignal }): Promise<VerifiedReadReceipt | VerifiedContentReadResult> {
       const arrival = deps.now();
       return new Promise((resolve, reject) => {
         let request: VerifiedReadRequest;
         try { request = decodeVerifiedReadRequest(value, binding.session); } catch { reject(error("FRESH_START_INPUT_INVALID")); return; }
-        // verify returns only the unchanged metadata receipt. Native execution is integrated in Task 5.
-        if (request.operation !== "verify-published-view") { reject(error("FRESH_START_INPUT_INVALID")); return; }
+        if ((request.operation !== "verify-published-view") !== content) { reject(error("FRESH_START_INPUT_INVALID")); return; }
         if (deps.now() >= arrival + request.budgetMs) { reject(error("WORKER_TIMEOUT")); return; }
         if (closing || options?.signal?.aborted) { reject(error("WORKER_CLOSED")); return; }
         if (quarantine) { reject(error("WORKER_UNAVAILABLE")); return; }
@@ -303,6 +316,14 @@ export function createVerifiedReadAdapter(input: VerifiedReadBinding, dependenci
         if (options?.signal) { const signal = options.signal; const abort = () => fail(lane, "WORKER_CLOSED"); signal.addEventListener("abort", abort, { once: true }); lane.abort = () => signal.removeEventListener("abort", abort); }
         queue.push(lane); pump();
       });
+    }
+  return Object.freeze({
+    diagnostic,
+    verify(value: MetadataVerifiedReadRequest, options?: { signal?: AbortSignal }) {
+      return enqueue(value, false, options) as Promise<VerifiedReadReceipt>;
+    },
+    query(value: VerifiedContentReadRequest, options?: { signal?: AbortSignal }) {
+      return enqueue(value, true, options) as Promise<VerifiedContentReadResult>;
     },
     close(): Promise<VerifiedReadDiagnostic> {
       closing = true; for (const lane of queue.splice(0)) settle(lane, "WORKER_CLOSED");

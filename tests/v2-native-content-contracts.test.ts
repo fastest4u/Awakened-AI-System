@@ -204,19 +204,19 @@ test("complete_reply_escaped_byte_boundary", async () => {
   assert.throws(() => decodeReadReply(envelope), invalid);
 });
 
-test("decoded_content_execution_fails_closed_until_same_image_integration", async () => {
+test("decoded content requires fixed build admission and metadata verify still refuses content", async () => {
   for (const input of [request(), request("get-canonical-record", { id: "Case-ID " })]) {
     const bootstrap = decodeReadBootstrap({ ...readBootstrap(), version: 2, request: input });
     const terminal = await executeVerifiedRead(bootstrap, { now: () => 0, signal: new AbortController().signal,
-      inspectBuild() { throw new Error("build inspection must not precede unavailable content refusal"); },
-      async wait() { throw new Error("content refusal must not wait"); },
-      emitStage() { throw new Error("content refusal must not emit metadata stages"); } });
+      inspectBuild() { return "b".repeat(64); },
+      async wait() { throw new Error("build refusal must not wait"); },
+      emitStage() { throw new Error("build refusal must not emit stages"); } });
     assert.deepEqual(terminal, { version: 2, ids: bootstrap.ids, kind: "failure",
-      failure: { code: "FRESH_START_INPUT_INVALID", cleanup: "complete", positions: null } });
+      failure: { code: "FRESH_START_BUILD_MISMATCH", cleanup: "complete", positions: null } });
     const directory = ownedReadDirectory();
     try {
       const adapter = createVerifiedReadAdapter({ ...bootstrap.binding, executorStateDirectory: directory });
-      await assert.rejects(adapter.verify(bootstrap.request), invalid);
+      await assert.rejects(adapter.verify(bootstrap.request as unknown as Parameters<typeof adapter.verify>[0]), invalid);
       assert.equal(adapter.diagnostic().pendingCount, 0);
       assert.equal((await adapter.close()).cleanup, "complete");
     } finally { rmSync(directory.canonicalPath, { recursive: true, force: true }); }
