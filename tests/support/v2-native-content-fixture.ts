@@ -1,6 +1,6 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
-import { readFileSync } from "node:fs";
-import { join } from "node:path";
+import { cpSync, lstatSync, mkdirSync, readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import type { AppendCommand, JsonValue } from "../../src/orchestrator/contracts/event.js";
 import { openImmutableProjectionImage } from "../../src/orchestrator/projections/immutable-image.js";
@@ -235,4 +235,24 @@ export async function makeNativeContentFixture(buildHash = READ_HASH, options: R
     return Object.freeze({ database, manifest, close: () => database.close() });
   };
   return { ...fixture, appendCorpus, captureImage };
+}
+
+/** Current measured artifacts only, with the same identity-checked internal directory as production. */
+export async function deployMeasuredNativeFixture(options: ReadFixtureOptions = {}): Promise<NativeContentFixture> {
+  const deployment = join(process.cwd(), "dist");
+  const measured = JSON.parse(readFileSync(join(deployment, "v2-build.json"), "utf8"));
+  const fixture = await makeNativeContentFixture(measured.buildIdentityHash, options);
+  try {
+    const artifacts = ["v2.js", "v2-admin.js", "workers/project-store.worker.js",
+      "internal/v2-internal-verified-read.js", "internal/v2-internal-verified-read-cleanup.js"];
+    if (JSON.stringify(measured.artifacts.map((value: { path: string }) => value.path)) !== JSON.stringify(artifacts)) throw new Error("measured artifact set changed");
+    for (const name of [...artifacts, "v2-build.json"]) {
+      const target = join(fixture.binding.deploymentDirectory.canonicalPath, name);
+      mkdirSync(dirname(target), { recursive: true }); cpSync(join(deployment, name), target);
+    }
+    const canonicalPath = join(fixture.binding.deploymentDirectory.canonicalPath, "internal");
+    const identity = lstatSync(canonicalPath, { bigint: true });
+    return { ...fixture, binding: Object.freeze({ ...fixture.binding,
+      deploymentDirectory: Object.freeze({ canonicalPath, device: String(identity.dev), inode: String(identity.ino) }) }) };
+  } catch (error) { fixture.cleanup(); throw error; }
 }

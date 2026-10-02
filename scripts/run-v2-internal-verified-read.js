@@ -10,6 +10,14 @@ const targets = ['v2-internal-verified-read-contracts', 'stable-directory-read-c
   'v2-internal-verified-read-ownership', 'v2-internal-verified-read-supervisor', 'v2-internal-verified-read-entry',
   'v2-internal-verified-read-gate', 'projection-manifest', 'projection-integrity', 'v2-reader-lease', 'retrieval-candidates',
   'v2-retrieval-candidates', 'fresh-start-admission', 'sqlite-driver', 'v2-foundation-entry', 'ci-fresh-start-foundation', 'event-append-transaction'];
+const nativeTargets = ['retrieval-database-core', 'retrieval-selection-core', 'v2-native-content-contracts', 'v2-native-content-query',
+  'v2-native-content-result', 'v2-native-content-child', 'v2-native-content-supervisor', 'v2-native-content-entry', 'v2-native-content-gate',
+  'v2-internal-verified-read-contracts', 'v2-internal-verified-read-admission', 'v2-internal-verified-read-child',
+  'v2-internal-verified-read-cleanup', 'v2-internal-verified-read-ownership', 'v2-internal-verified-read-supervisor',
+  'v2-internal-verified-read-entry', 'v2-internal-verified-read-gate', 'retrieval-candidates', 'v2-retrieval-candidates',
+  'retrieval-eligibility', 'retrieval-ranking', 'retrieval-service', 'projection-runtime', 'retrieval-explain', 'retrieval-vector-cache',
+  'stable-directory-read-core', 'projection-image-metadata', 'projection-manifest', 'projection-integrity', 'v2-reader-lease',
+  'v2-foundation-entry', 'ci-fresh-start-foundation', 'ci-lifecycle-gates'];
 
 const jobBridge = fileURLToPath(new URL('./v2-verified-read-job.ps1', import.meta.url));
 const powershell = 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe';
@@ -17,7 +25,7 @@ const powershell = 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.e
 /** One response deadline; advancement requires positive kernel Job closure,
  * direct stage exit and drained output. Unsupported containment fails closed.
  */
-function runChild(args, root, deadline, signal) {
+function runChild(args, root, deadline, signal, profile) {
   return new Promise(resolveResult => {
     if (signal?.aborted) { resolveResult({ code: 130, uncertain: false }); return; }
     if (performance.now() >= deadline) { resolveResult({ code: 124, uncertain: false }); return; }
@@ -74,7 +82,7 @@ function runChild(args, root, deadline, signal) {
             directExit = true;
             if (value.nativeCode !== 0) beginCleanup();
             process.stdout.write(JSON.stringify({ gate: 'v2-internal-verified-read', observation: 'direct-child-exit',
-              code: value.nativeCode, activeProcesses: value.activeProcesses }) + '\n');
+              profile, code: value.nativeCode, activeProcesses: value.activeProcesses }) + '\n');
           } else if ((value.kind === 'stdout' || value.kind === 'stderr') && started && !proof
             && Object.keys(value).length === 2 && typeof value.bytes === 'string'
             && /^[A-Za-z0-9+/]*={0,2}$/.test(value.bytes)) {
@@ -98,9 +106,10 @@ function runChild(args, root, deadline, signal) {
 }
 
 /** Internal fixture seam; the CLI always runs this checkout's fixed operation. */
-export async function runVerifiedReadGate({ root = repository, timeoutMs = 900000, signal } = {}) {
+export async function runVerifiedReadGate({ root = repository, timeoutMs = 900000, signal, profile = 'metadata' } = {}) {
   const arrival = performance.now(); let descriptor, identity, lock, retainLock = false, result = 1;
   try {
+    if (profile !== 'metadata' && profile !== 'native-content') throw new Error('VERIFIED_READ_PROFILE_INVALID');
     if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 900000) throw new Error('VERIFIED_READ_DEADLINE_INVALID');
     const deadline = arrival + timeoutMs;
     if (signal?.aborted) return 130;
@@ -110,11 +119,11 @@ export async function runVerifiedReadGate({ root = repository, timeoutMs = 90000
     identity = fstatSync(descriptor, { bigint: true });
     const stages = [['build', [join(root, 'scripts/build.js')]],
       ['compile', [join(root, 'node_modules/typescript/bin/tsc'), '-p', 'tsconfig.test.json']],
-      ...targets.map(name => [name, ['--test', '--test-concurrency=1', '--test-reporter=spec', join(root, `dist-test/tests/${name}.test.js`)]]),
+      ...(profile === 'metadata' ? targets : nativeTargets).map(name => [name, ['--test', '--test-concurrency=1', '--test-reporter=spec', join(root, `dist-test/tests/${name}.test.js`)]]),
       ['smoke', [join(root, 'scripts/smoke-v2-fresh-start.js')]]];
     for (const [stage, args] of stages) {
-      const started = performance.now(); const child = await runChild(args, root, deadline, signal);
-      process.stdout.write(JSON.stringify({ gate: 'v2-internal-verified-read', stage, code: child.code,
+      const started = performance.now(); const child = await runChild(args, root, deadline, signal, profile);
+      process.stdout.write(JSON.stringify({ gate: 'v2-internal-verified-read', profile, stage, code: child.code,
         durationMs: performance.now() - started, elapsedMs: performance.now() - arrival, cleanup: child.uncertain ? 'incomplete' : 'complete', closure: child.closure }) + '\n');
       result = child.code;
       if (child.uncertain) { retainLock = true; result = 1; break; }
@@ -137,7 +146,9 @@ export async function runVerifiedReadGate({ root = repository, timeoutMs = 90000
       } finally { if (descriptor !== undefined) { try { closeSync(descriptor); } catch {} } }
     }
   }
-  if (result === 0) process.stdout.write('PASS internal verified-read: measured build, one compile, twenty serial files and smoke\n');
+  if (result === 0) process.stdout.write(profile === 'metadata'
+    ? 'PASS internal verified-read: measured build, one compile, twenty serial files and smoke\n'
+    : `PASS native content: measured build, one compile, ${nativeTargets.length} serial files and smoke\n`);
   return result;
 }
 

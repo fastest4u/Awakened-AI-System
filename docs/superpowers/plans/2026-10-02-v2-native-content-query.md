@@ -372,7 +372,7 @@ assert.equal(v1SentinelReads, 0);
 assert.equal(v1SentinelWrites, 0);
 assert.deepEqual(publicTools, ["memory_v2Status"]);
 assert.equal(publicStatus.productionReady, false);
-assert.equal(configuration.requireFullEvidence, true);
+assert.equal(effectiveEvidencePolicy.requireFullEvidence, true);
 assert.equal(artifactCount, 5);
 assert.equal(defaultMetadataTrace.testStages.length, 20);
 assert.equal(nativeTrace.testStages.length, 33);
@@ -380,6 +380,8 @@ assert.equal(nativeTrace.buildStages, 1);
 assert.equal(nativeTrace.compileStages, 1);
 assert.equal(overlappingOutputOwners, 0);
 ```
+
+Controller preflight clarification (2026-10-02): `effectiveEvidencePolicy` is returned by the existing production `deriveEffectiveQualityPolicyV1` with synthetic trusted=true/requested=false inputs; assert the actual coverage-only classifier refuses success with `EVIDENCE_CAPTURE_INCOMPLETE`. This proves policy-helper behavior, not compiled launch/live configuration. `V2LaunchConfig` has paths and releaseId only; actual requireFullEvidence=true wiring before primary cutover remains F2. No runtime field/wiring, spec change or new human approval is inferred.
 
 Gate tests use small owned stage fixtures, not recursively executing all gate suites. Prove shared lock refusal, unknown profile/extra argv no child, positive Job tree active-zero before next stage, timeout/cancel and uncertain lock retained. Production actual blocked read uses Task 5's fixed test process port separately; assert responsiveness, exact read/cleanup exits/record removal and unrelated writer survival. Bundle negative controls isolate wrong deployment/source echo/unbundled code refusal independently from stored authority mismatch; instrument owned V1 sentinel, never live vault. Source AND emitted closures deny subprocess/thread/helper facades; cleanup graph stays query-free.
 - [ ] **Step 2: Run RED** after successful compile: exact `v2-native-content-gate.test.js` with synthetic stage fixtures. Expected fixed-profile/wrapper behavioral failure, not a missing old artifact mistaken for new build proof. Source-only closure checks can already pass from Task 5; actual compiled operations cannot be called acceptance until Step 5 builds current source.

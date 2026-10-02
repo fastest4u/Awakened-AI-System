@@ -19,7 +19,7 @@ async function gate() {
   const url = new URL("../../scripts/run-v2-internal-verified-read.js", import.meta.url).href;
   let module: any; try { module = await import(url); } catch (error) { if ((error as any).code !== "ERR_MODULE_NOT_FOUND") throw error; }
   assert.equal(typeof module?.runVerifiedReadGate, "function", "dedicated total-budget verified-read gate is absent");
-  return module.runVerifiedReadGate as (options: { root: string; timeoutMs?: number; signal?: AbortSignal }) => Promise<number>;
+  return module.runVerifiedReadGate as (options: { root: string; timeoutMs?: number; signal?: AbortSignal; profile?: "metadata" | "native-content" }) => Promise<number>;
 }
 function fixture(fault = "") {
   const root = realpathSync.native(mkdtempSync(join(tmpdir(), "verified-read-gate-")));
@@ -32,7 +32,7 @@ function fixture(fault = "") {
   for (const name of names) put(`dist-test/tests/${name}.test.js`, `${record}import{test}from'node:test';test('${name}',()=>{log('${name}');${fault === "test" && name === names[3] ? "throw Error('fixture-native-test-failure')" : ""}});`);
   put("scripts/smoke-v2-fresh-start.js", `${record}log('smoke');${fault === "smoke" ? "process.exit(29)" : ""}`);
   return { root, trace: () => existsSync(join(root, "trace")) ? readFileSync(join(root, "trace"), "utf8").trim().split("\n") : [], put,
-    run(run: Awaited<ReturnType<typeof gate>>, options: { timeoutMs?: number; signal?: AbortSignal } = {}) {
+    run(run: Awaited<ReturnType<typeof gate>>, options: { timeoutMs?: number; signal?: AbortSignal; profile?: "metadata" | "native-content" } = {}) {
       const events: { cleanup?: string; closure?: string }[] = []; const write = process.stdout.write; let buffer = "";
       const preAborted = options.signal?.aborted === true;
       process.stdout.write = function (this: typeof process.stdout, chunk: any, ...args: any[]) {
@@ -209,7 +209,7 @@ test("original build waits for confirmed descendant closure before compile and o
     if (!await f.cleanup()) t.diagnostic(`RED/unconfirmed fixture retained: ${f.root}`);
   }
 });
-test("loss of native helper proof stops at original build and retains output ownership", { ...native, timeout: 20000 }, async t => {
+test("native-content loss of helper proof stops at original build and retains shared output ownership", { ...native, timeout: 20000 }, async t => {
   const run = await gate(), f = fixture();
   f.put("descendant.cjs", "const fs=require('node:fs');fs.writeFileSync('descendant-ready','ready');setInterval(()=>{if(fs.existsSync('descendant-check'))fs.writeFileSync('descendant-ack','alive');},10);");
   f.put("scripts/build.js", "import{spawn}from'node:child_process';import{existsSync,appendFileSync}from'node:fs';appendFileSync('trace','build\\n');spawn(process.execPath,['descendant.cjs'],{stdio:'ignore',windowsHide:true,detached:true}).unref();while(!existsSync('descendant-ready'))await new Promise(r=>setTimeout(r,10));appendFileSync('trace','parent-exiting\\n');process.exit(0);");
@@ -230,7 +230,7 @@ test("loss of native helper proof stops at original build and retains output own
     }
     return child;
   }) as typeof original); syncBuiltinESMExports();
-  const pending = f.run(run, { timeoutMs: 10000, signal: controller.signal });
+  const pending = f.run(run, { timeoutMs: 10000, signal: controller.signal, profile: "native-content" });
   try {
     await waitFor(() => existsSync(join(f.root, "descendant-ready")) && f.trace().includes("parent-exiting"));
     await waitFor(() => directExit !== undefined); assert.equal(directExit.nativeCode, 0); assert.ok(directExit.activeProcesses > 0);
