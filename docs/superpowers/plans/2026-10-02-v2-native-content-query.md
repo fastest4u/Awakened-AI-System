@@ -10,7 +10,7 @@
 
 **Spec:** [Approved native-content design](../specs/2026-10-02-v2-native-content-query-design.md), approved at `bedee3d71b93a49a4e23854185247887b7f43f60` with `อนุมัติสเปก V2 native content written` on 2026-10-02.
 
-Status: Prepared for human plan review; no implementation authorized yet. Preserve the selected Subagent-Driven method. These are six **Native content Tasks**, not a reopening of the accepted private metadata-only Tasks 1–6.
+Status: Human approved this plan at `eb63704f79579d0c5e30e93041839c0e1db432ee` on 2026-10-02 with `อนุมัติแผน`; implementation is authorized within its scope. Preserve the selected Subagent-Driven method. These are six **Native content Tasks**, not a reopening of the accepted private metadata-only Tasks 1–6. Task heading order is normalized for the Superpowers brief extractor; requirements are unchanged.
 
 ## Global Constraints
 
@@ -80,7 +80,7 @@ All paths below are repository-relative; interfaces are private, with no new pub
 
 Tests are named in their owning Tasks. Existing cleanup entry, ownership implementation, publisher, migration, public V2 app/composition and build identity's five-artifact list are not feature-edit targets.
 
-### Native content Task 1: Extract database and selection primitives without changing wrappers
+### Task 1: Native content — Extract database and selection primitives without changing wrappers
 
 **Files:** Create `src/orchestrator/retrieval/{database-core,selection-core}.ts`; modify `src/orchestrator/retrieval/{candidates,v2-candidates,service}.ts`; create `tests/{retrieval-database-core,retrieval-selection-core}.test.ts`. Existing regressions are listed in Step 4.
 
@@ -121,7 +121,7 @@ Include a defensively denied conflict member to pin scoped counts, and equal-sco
 - [ ] **Step 4: Run GREEN** after one `npm run test:build`: exact compiled files `retrieval-database-core`, `retrieval-selection-core`, `retrieval-candidates`, `v2-retrieval-candidates`, `retrieval-service`, `retrieval-ranking`, `retrieval-eligibility`, `projection-runtime`, `retrieval-explain`, `retrieval-vector-cache` (each under `dist-test/tests/*.test.js`, same serial node command). Expected: exit 0; unchanged wrapper ordering/bounds/feature behavior. If source inspection shows a changed parity/evaluation input, refresh only its affected named case and record that reason; do not sweep migration suites.
 - [ ] **Step 5: Review and commit the extracted deliverable** after exact spec/quality gates. Stage only the five production files and two new tests named above; `git diff --cached --check`, then `git commit -m "refactor: extract pure retrieval database and selection cores"`. Record focused evidence and source commit; do not mark native content integration complete.
 
-### Native content Task 2: Exact content contracts and version-2 read wire
+### Task 2: Native content — Exact content contracts and version-2 read wire
 
 **Files:** Create `src/orchestrator/verified-read/{content-contracts,wire-data,content-protocol}.ts` and `tests/v2-native-content-contracts.test.ts`; modify `verified-read/{contracts,protocol,admission,child,supervisor}.ts`, `src/v2/internal-verified-read.entry.ts`, `tests/support/v2-verified-read-fixture.ts`, `tests/fixtures/v2-verified-read-process-fixture.ts`, and affected `tests/v2-internal-verified-read-{contracts,admission,child,supervisor,entry}.test.ts` read-version expectations. Cleanup's independent v1 values are not replaced.
 
@@ -185,7 +185,7 @@ assert.throws(() => assertNativeContentMatchesRequest(wrongScopeResult, request,
 - [ ] **Step 4: Run GREEN** after one compile: new contracts and existing `v2-internal-verified-read-{contracts,admission,child,supervisor,cleanup,ownership}` compiled files. Expected exit 0, metadata no query stage/content, strict new read v2, independent cleanup v1/ownership v1/restart unchanged. Save compiled-entry behavior for Task 6's measured rebuild; do not use old `dist` to claim new-source acceptance.
 - [ ] **Step 5: Review and commit** only the Task 2 named files actually changed and new test, with exact staging and `git diff --cached --check`; `git commit -m "feat: define bounded native content read protocol v2"`. Keep this independent deliverable's temporary content refusal explicit.
 
-### Native content Task 3: Fixed native search and ID-only canonical lookup
+### Task 3: Native content — Fixed native search and ID-only canonical lookup
 
 **Files:** Create `src/orchestrator/verified-read/content-query.ts`, `tests/support/v2-native-content-fixture.ts`, `tests/v2-native-content-query.test.ts`; modify `retrieval/{database-core,contracts,eligibility}.ts` and additive synthetic seam in `tests/support/v2-verified-read-fixture.ts`.
 
@@ -229,7 +229,7 @@ Pin candidate/provisional/verified/conflicted/superseded fidelity; deny retracte
 - [ ] **Step 4: Run GREEN** after one compile: `v2-native-content-query`, `retrieval-database-core`, `retrieval-selection-core`, `retrieval-candidates`, `v2-retrieval-candidates`, `retrieval-eligibility`, `retrieval-service`, `retrieval-ranking`. Expected exit 0, truthful empty/absence and no key/successor substitution. Record fixture sources and actual schema/hash; `ownedReadImage` is not content acceptance.
 - [ ] **Step 5: Review and commit** exact Task 3 files with staged diff check; `git commit -m "feat: query native V2 search and exact canonical records"`. Backend unit acceptance does not remove Task 2's temporary child refusal.
 
-### Native content Task 4: Detached DTOs and conservative complete-envelope packing
+### Task 4: Native content — Detached DTOs and conservative complete-envelope packing
 
 **Files:** Create `src/orchestrator/verified-read/content-result.ts` and `tests/v2-native-content-result.test.ts`.
 
@@ -259,7 +259,7 @@ Also exercise scalar 2048/2049, container 128/129, mandatory descriptors exceedi
 - [ ] **Step 4: Run GREEN** after one compile: `v2-native-content-result`, `v2-native-content-contracts`, `v2-native-content-query`, `retrieval-ranking`, `retrieval-selection-core`. Expected exit 0 and unchanged legacy policy/selector; new suppression is confined to the separately named content-bounds policy.
 - [ ] **Step 5: Review and commit** exactly the new source/test after staged diff check; `git commit -m "feat: bound detached native content by complete envelopes"`.
 
-### Native content Task 5: Execute queries in the owned lane and release only settled content
+### Task 5: Native content — Execute queries in the owned lane and release only settled content
 
 **Files:** Modify `src/orchestrator/verified-read/{child,supervisor}.ts`, `scripts/fresh-start-build.js`, `tests/fixtures/v2-verified-read-process-fixture.ts`; create `tests/v2-native-content-{child,supervisor}.test.ts`; update `tests/v2-internal-verified-read-child.test.ts`'s source graph and affected metadata child/supervisor test doubles. Admission/entry already speak v2 from Task 2; change them only if a concrete integration assertion identifies required dispatch typing, not admission policy.
 
@@ -298,7 +298,7 @@ Queue+startup+query+packing+exit share one original budget; zero-budget/no child
 - [ ] **Step 6: Run GREEN** after one compile: new child/supervisor plus `v2-native-content-{contracts,query,result}`, existing `v2-internal-verified-read-{admission,child,supervisor,cleanup,ownership}`. Expected exit 0; source closure admits only reviewed pure paths, actual blocked process parent remains responsive and no late/early content escapes. Record uncertain cleanup roots without deleting them.
 - [ ] **Step 7: Review and commit** exact changed Task 5 paths with staged diff check; `git commit -m "feat: execute native content inside settled verified read lanes"`. Real emitted bundle acceptance remains Task 6, not an old-build claim.
 
-### Native content Task 6: Measured compiled acceptance and one fixed targeted gate
+### Task 6: Native content — Measured compiled acceptance and one fixed targeted gate
 
 **Files:** Modify `scripts/run-v2-internal-verified-read.js`, `package.json`, `tests/v2-internal-verified-read-gate.test.ts`, `tests/ci-lifecycle-gates.test.ts`, `tests/support/v2-native-content-fixture.ts`; create `scripts/run-v2-native-content.js`, `tests/v2-native-content-{entry,gate}.test.ts`. Verify Task 5's build/source closure without repeating its edits. After acceptance create `docs/superpowers/evidence/2026-10-02-v2-native-content-query.md` and update this plan/spec plus `docs/superpowers/plans/2026-09-29-v2-fresh-start-delivery-roadmap.md` status only.
 
@@ -382,4 +382,4 @@ Coverage map: spec 1 scope/public limits → Global Constraints and Task 6; spec
 
 Main-agent inline self-review completed during plan preparation: each specification section maps to a Task; checkbox actions/commands and neighboring interfaces were checked; all five Review Focus cases have named owning tests; signatures/assertions replace implementation transcripts. Corrected source-closure permit sequencing into Task 5 so its regression can pass before Task 6, made synthetic fixture types explicit, and kept default vs native gate counts separate. Fixtures are explicitly new or additive, not assumed existing content support. Cleanup v1 and ownership v1 are separate from read v2. Plan-writing verification is docs-only and does not substitute for any future executable result.
 
-Human review is pending. Ask whether this plan captures the approved increment, then wait before implementation. Preserve Subagent-Driven; do not ask for the execution-method choice again. This plan delivers the private native content backend, not full F2/F3/F4 or actual PROD activation.
+Human review completed with `อนุมัติแผน` on 2026-10-02. Execute continuously within the approved scope using Subagent-Driven; do not ask for the execution-method choice again. This plan delivers the private native content backend, not full F2/F3/F4 or actual PROD activation.
