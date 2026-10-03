@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import type { PreparedRetainedEvidenceCommandV1 } from "../src/orchestrator/privacy/retained-evidence-worker-protocol.js";
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import {
@@ -212,6 +213,96 @@ class ManualScheduler implements ExecutorScheduler {
     while (this.#timeouts.size > 0) this.runNext();
   }
 }
+
+function retainedPrepared(): PreparedRetainedEvidenceCommandV1 {
+  const sessionId = "33333333-3333-4333-8333-333333333333";
+  return { command: { version: 1, commandType: "retain-evidence-batch", commandId: COMMAND_ID,
+    idempotencyKey: "22222222-2222-4222-8222-222222222222", targetSessionId: sessionId,
+    conversationId: "44444444-4444-4444-8444-444444444444", frames: [{ frameId: "55555555-5555-4555-8555-555555555555",
+      ordinal: "0", role: "user", category: "user-message", occurredAt: NOW, mediaType: "text/plain; charset=utf-8",
+      content: "visible synthetic frame", previousFrameId: null, toolCorrelationId: null, artifactHashes: [] }] },
+    authorization: { kind: "protected", authoritySessionId: sessionId as never, targetSessionId: sessionId as never,
+      proof: { proofVersion: 1, target: "semantic-command", proofNonce: "66666666-6666-4666-8666-666666666666", proofFingerprint: "a".repeat(64) }, approval: null, childBindingGrant: null } };
+}
+
+describe("private retained executor outcomes", () => {
+  it("before-post weakened preparation refuses with zero posts", async () => {
+    const { executor, worker } = await fakeExecutor();
+    const before = worker.posted.length, original = retainedPrepared();
+    assert.throws(() => executor.retainEvidence({ ...original, authorization: { ...original.authorization, proof: null } } as PreparedRetainedEvidenceCommandV1), { code: "SESSION_CAPABILITY_INVALID" });
+    assert.equal(worker.posted.length, before);
+    worker.emit("exit", 1); await executor.close();
+  });
+  it("worker replacement recovery IDs and malformed delivery preserve the local original identity", async () => {
+    for (const mode of ["unknown", "unsafe-failure", "messageerror", "bad-success"] as const) {
+      const { executor, worker } = await fakeExecutor();
+      const original = retainedPrepared(), pending = executor.retainEvidence(original); void pending.catch(() => undefined);
+      const request = worker.posted.at(-1)!;
+      if (mode === "messageerror") worker.emit("messageerror", new Error("synthetic private delivery failure"));
+      else if (mode === "bad-success") worker.respond(request, { accepted: true });
+      else worker.emit("message", { id: request.id, ok: false, error: { code: mode === "unknown" ? "COMMAND_OUTCOME_UNKNOWN" : "NATIVE_SECRET",
+        message: mode === "unknown" ? "COMMAND_OUTCOME_UNKNOWN" : "unsafe synthetic detail", details: { commandId: randomUUID(), idempotencyKey: randomUUID() } } });
+      await assert.rejects(pending, error => {
+        assert.ok(error instanceof ProjectStoreWorkerError); assert.equal(error.code, "COMMAND_OUTCOME_UNKNOWN");
+        assert.equal(error.details.commandId, original.command.commandId); assert.equal(error.details.idempotencyKey, original.command.idempotencyKey); return true;
+      });
+      assert.throws(() => executor.retainEvidence(original)); await executor.close();
+    }
+  });
+  it("retained response delivery fault after success returns original unknown IDs and poison", async () => {
+    const { executor, worker } = await fakeExecutor({}, { lifecycleFaultInjector: { hit(boundary, _point, context) {
+      if (boundary === "response-delivery" && context.commandId === COMMAND_ID) throw new Error("synthetic delivery fault");
+    } } });
+    const original = retainedPrepared(), pending = executor.retainEvidence(original);
+    worker.respond(worker.posted.at(-1)!, { deduplicated: false, firstGlobalPosition: "1", lastGlobalPosition: "1", finalStreamVersion: "1",
+      eventIds: ["77777777-7777-4777-8777-777777777777"], responseHash: "b".repeat(64), response: {
+        resultVersion: 1, operation: "retain-evidence-batch", retentionFormat: "redacted-encrypted-v1", targetSessionId: original.command.targetSessionId,
+        conversationId: original.command.conversationId, commandId: original.command.commandId, idempotencyKey: original.command.idempotencyKey,
+        evidenceIds: ["88888888-8888-4888-8888-888888888888"], eventPosition: "1", finalStreamVersion: "1" } });
+    await assert.rejects(pending, error => {
+      assert.ok(error instanceof ProjectStoreWorkerError); assert.equal(error.code, "COMMAND_OUTCOME_UNKNOWN");
+      assert.equal(error.details.commandId, original.command.commandId); assert.equal(error.details.idempotencyKey, original.command.idempotencyKey); return true;
+    });
+    assert.throws(() => executor.retainEvidence(original)); await executor.close();
+  });
+  it("queue full posts nothing", async () => {
+    const { executor, worker } = await fakeExecutor({ maxPending: 1 });
+    const first = executor.retainEvidence(retainedPrepared());
+    void first.catch(() => undefined);
+    const posts = worker.posted.length;
+    await assert.rejects(executor.retainEvidence(retainedPrepared()), errorCode("STORE_QUEUE_FULL"));
+    assert.equal(worker.posted.length, posts);
+    worker.emit("exit", 1);
+    await assert.rejects(first, errorCode("COMMAND_OUTCOME_UNKNOWN"));
+    await executor.close();
+  });
+  it("posted retention timeout is outcome unknown with original IDs and poison", async () => {
+    const { executor, worker, scheduler } = await fakeExecutor();
+    const original = retainedPrepared();
+    const pending = executor.retainEvidence(original);
+    void pending.catch(() => undefined);
+    assert.equal(worker.posted.at(-1)?.type, "retained-evidence");
+    scheduler.runNext();
+    await assert.rejects(pending, error => {
+      assert.ok(error instanceof ProjectStoreWorkerError);
+      assert.equal(error.code, "COMMAND_OUTCOME_UNKNOWN");
+      assert.equal(error.details.commandId, original.command.commandId);
+      assert.equal(error.details.idempotencyKey, original.command.idempotencyKey);
+      return true;
+    });
+    assert.equal(worker.terminateCalls, 1);
+    assert.throws(() => executor.retainEvidence(original));
+    await executor.close();
+  });
+  it("unposted failure is not a committed result and poisons older posted retention", async () => {
+    const { executor, worker } = await fakeExecutor();
+    const older = executor.retainEvidence(retainedPrepared()); void older.catch(() => undefined);
+    worker.throwOnPost = true;
+    await assert.rejects(executor.retainEvidence(retainedPrepared()), errorCode("WORKER_UNAVAILABLE"));
+    await assert.rejects(older, errorCode("COMMAND_OUTCOME_UNKNOWN"));
+    await executor.close();
+  });
+});
 
 class FakeWorker extends EventEmitter implements WorkerLike {
   readonly posted: WorkerRequest[] = [];

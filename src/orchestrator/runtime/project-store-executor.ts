@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import type { RetainedEvidenceReceiptV1 } from "../privacy/evidence-contracts.js";
+import { encodePreparedRetainedEvidenceCommand, type PreparedRetainedEvidenceCommandV1 } from "../privacy/retained-evidence-worker-protocol.js";
 import { snapshotFreshStartContext, type FreshStartTrustedContext } from "../fresh-start/fresh-start-admission.js";
 import { realpathSync, statSync } from "node:fs";
 import { resolve } from "node:path";
@@ -638,6 +640,14 @@ export class ProjectStoreExecutor {
     )).then((value) => decodeAppendResultWire(value) as AppendResult<T>);
   }
 
+  retainEvidence(prepared: PreparedRetainedEvidenceCommandV1): Promise<AppendResult<RetainedEvidenceReceiptV1>> {
+    this.assertCallable(["open"]);
+    const wire = encodePreparedRetainedEvidenceCommand(prepared);
+    return this.request({ id: "", type: "retained-evidence", binding: encodeWorkerBindingAssertion(this.#options.context), prepared: wire },
+      "mutation", semanticIdentity(this.#options.context.binding.projectId, prepared.command.commandId, prepared.command.idempotencyKey))
+      .then(value => decodeAppendResultWire(value) as AppendResult<RetainedEvidenceReceiptV1>);
+  }
+
   executeLifecycleMutation<C extends LifecycleSemanticCommandDraft>(
     command: PreparedLifecycleWorkerCommand<C>,
   ): Promise<LifecycleExecutionResult<LifecycleResultFor<C>>> {
@@ -1043,7 +1053,7 @@ export class ProjectStoreExecutor {
     }
     const id = `${this.#dependencies.randomId()}:${++this.#sequence}`;
     const candidate = { ...request, id } as WorkerRequest;
-    const completeRequest = candidate.type === "lifecycle"
+    const completeRequest = candidate.type === "lifecycle" || candidate.type === "retained-evidence"
       ? decodeWorkerRequest(candidate)
       : candidate;
     return new Promise<unknown>((resolveRequest, rejectRequest) => {
@@ -1127,7 +1137,7 @@ export class ProjectStoreExecutor {
       }
     } else {
       try {
-        if (pending.identity?.kind !== "semantic") {
+        if (pending.identity?.kind !== "semantic" || pending.request.type === "retained-evidence") {
           this.#invokeResponseDeliveryFault(pending.identity);
         }
       } catch {

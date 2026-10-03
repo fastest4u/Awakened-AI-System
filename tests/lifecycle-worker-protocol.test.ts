@@ -1,5 +1,12 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
+it("coverage lifecycle protocol rejects the private retain command", () => {
+  const command = { version: 1, commandType: "retain-evidence-batch", commandId: IDS.command, idempotencyKey: IDS.grant,
+    targetSessionId: IDS.session, conversationId: IDS.work, frames: [{ frameId: IDS.nonce, ordinal: "0", role: "user", category: "user-message",
+      occurredAt: "2026-10-03T00:00:00.000Z", mediaType: "text/plain; charset=utf-8", content: "synthetic visible frame", previousFrameId: null, toolCorrelationId: null, artifactHashes: [] }] };
+  for (const operation of ["retain-evidence-batch", "record-evidence-batch"]) assert.throws(() => decodeLifecycleWorkerOperationWire({ kind: "semantic", operation,
+    prepared: { command, candidateIntentHash: OTHER_HASH, authorization: protectedAuthorization() } }));
+});
 import type { JsonValue } from "../src/orchestrator/contracts/event.js";
 import type { ProjectContext } from "../src/orchestrator/identity/contracts.js";
 import type {

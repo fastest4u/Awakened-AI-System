@@ -5,6 +5,8 @@ import type {
   PendingEvent,
   PendingOutbox,
 } from "../contracts/event.js";
+import { assertRetainedEvidenceWireSize, decodePreparedRetainedEvidenceCommand, decodeRetainedEvidenceWorkerResponse, decodeRetainedEvidenceWorkerSuccess,
+  type PreparedRetainedEvidenceCommandWireV1, type RetainedEvidenceWorkerSuccessV1 } from "../privacy/retained-evidence-worker-protocol.js";
 import { snapshotFreshStartContext, type FreshStartTrustedContext } from "../fresh-start/fresh-start-admission.js";
 import type {
   BranchScopeId,
@@ -321,6 +323,7 @@ export type WorkerRequest =
   | { id: string; type: "open"; binding: WorkerBinding; freshStart?: FreshStartContextWire }
   | { id: string; type: "append"; binding: WorkerBindingAssertion; command: AppendCommandWire }
   | { id: string; type: "lifecycle"; binding: WorkerBindingAssertion; operation: LifecycleWorkerOperationWire }
+  | { id: string; type: "retained-evidence"; binding: WorkerBindingAssertion; prepared: PreparedRetainedEvidenceCommandWireV1 }
   | { id: string; type: "quickIntegrity"; binding: WorkerBindingAssertion; tailLimit: number }
   | { id: string; type: "fullIntegrity"; binding: WorkerBindingAssertion }
   | { id: string; type: "quiesce"; binding: WorkerBindingAssertion; lease: MaintenanceLeaseWire }
@@ -332,6 +335,7 @@ export type WorkerSuccessData =
   | StoreIdentityWire
   | AppendResultWire
   | LifecycleWorkerSuccessWire
+  | RetainedEvidenceWorkerSuccessV1
   | IntegrityReport
   | { verified: true }
   | { quiesced: true; epoch: string; connectionClosed: true }
@@ -748,6 +752,15 @@ export function decodeWorkerRequest(value: unknown): WorkerRequest {
     case "append":
       exact(value, ["id", "type", "binding", "command"]);
       return { id, type, binding: decodeAssertion(request.binding), command: decodeAppendCommandWireShape(request.command) };
+    case "retained-evidence": {
+      exact(value, ["id", "type", "binding", "prepared"]);
+      assertRetainedEvidenceWireSize(value);
+      const assertion = decodeAssertion(request.binding);
+      if (![assertion.projectId, assertion.vaultId, assertion.storeId].every(item => /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(item))) invalid();
+      const prepared = decodePreparedRetainedEvidenceCommand(request.prepared);
+      const physical = exact(request.prepared, ["command", "authorization"]);
+      return Object.freeze({ id, type, binding: Object.freeze(assertion), prepared: Object.freeze({ command: physical.command as string, authorization: prepared.authorization }) });
+    }
     case "lifecycle":
       exact(value, ["id", "type", "binding", "operation"]);
       const binding = decodeAssertion(request.binding);
@@ -1004,6 +1017,10 @@ function decodeSuccessForType(
       return opened;
     }
     case "append": return encodeAppendResultWire(decodeAppendResultWire(value));
+    case "retained-evidence": {
+      if (request?.type !== "retained-evidence") invalid();
+      return decodeRetainedEvidenceWorkerSuccess(value, decodePreparedRetainedEvidenceCommand(request.prepared));
+    }
     case "lifecycle": {
       if (request?.type !== "lifecycle") invalid();
       const decoded = decodeLifecycleWorkerSuccessForOperation(
@@ -1093,6 +1110,7 @@ export function decodeWorkerResponseForRequest(
   value: unknown,
   request: WorkerRequest,
 ): WorkerResponse {
+  if (request.type === "retained-evidence") return decodeRetainedEvidenceWorkerResponse(value, request.id, decodePreparedRetainedEvidenceCommand(request.prepared));
   const response = record(value);
   if (response.id !== request.id) invalid();
   if (response.ok === false) return decodeFailure(value);

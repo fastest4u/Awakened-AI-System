@@ -115,6 +115,8 @@ const APPROVED_SEALED_AND_ROLLOUT_SOURCE_DIFF = Object.freeze([
   "src/orchestrator/privacy/retained-evidence-codec.ts",
   "src/orchestrator/privacy/retained-evidence-intent.ts",
   "src/orchestrator/privacy/retained-evidence-reader.ts",
+  "src/orchestrator/privacy/retained-evidence-runtime.factory.ts",
+  "src/orchestrator/privacy/retained-evidence-worker-protocol.ts",
   "src/orchestrator/privacy/retained-evidence.repository.ts",
   "src/orchestrator/privacy/retained-evidence.service.ts",
   "src/orchestrator/projections/builder.ts",

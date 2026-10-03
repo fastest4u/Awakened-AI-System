@@ -1,4 +1,7 @@
 import { randomUUID } from "node:crypto";
+import { RetainedEvidenceError } from "../privacy/evidence-contracts.js";
+import { decodePreparedRetainedEvidenceCommand, decodeRetainedEvidenceWorkerResponse } from "../privacy/retained-evidence-worker-protocol.js";
+import type { RetainedEvidenceRuntime, RetainedEvidenceRuntimeFactoryPort } from "../privacy/retained-evidence-runtime.factory.js";
 import { FreshStartAdmissionGuard, assertFreshStartConnectionAllowed, bindFreshStartAdmissionContext } from "../fresh-start/fresh-start-admission.js";
 import { FreshStartError } from "../fresh-start/contracts.js";
 import {
@@ -94,6 +97,7 @@ export interface ProjectStoreWorkerBackendOptions {
   appendRetryDeadlineMs: number;
   readonly keyProvider?: CapabilityKeyProvider;
   readonly lifecycleRuntimeFactory?: LifecycleWorkerRuntimeFactoryPort;
+  readonly retainedEvidenceRuntimeFactory?: RetainedEvidenceRuntimeFactoryPort;
   afterReadOnlyIdentityVerified?: () => void;
   integrityWorkerFactory?: (
     url: URL,
@@ -346,6 +350,7 @@ interface ActiveStore {
   maintenance: MaintenanceFence;
   eventStore: EventStore;
   lifecycleRuntime: LifecycleWorkerRuntime | null;
+  retainedEvidenceRuntime: RetainedEvidenceRuntime | null;
   executorId: string;
 }
 
@@ -388,6 +393,8 @@ export class ProjectStoreWorkerBackend implements WorkerRuntimeBackend {
         const active = this.requireActive(request.binding);
         if (active.lifecycleRuntime === null) failure("LIFECYCLE_V2_DISABLED");
         return this.lifecycle(active, request);
+      case "retained-evidence":
+        return this.retainEvidence(this.requireActive(request.binding), request);
       case "quickIntegrity": {
         const active = this.requireActive(request.binding);
         return this.integrityInChild(active, request);
@@ -525,6 +532,7 @@ export class ProjectStoreWorkerBackend implements WorkerRuntimeBackend {
       busyTimeoutMs: DEFAULT_BUSY_TIMEOUT_MS,
     });
     let lifecycleRuntime: LifecycleWorkerRuntime | null = null;
+    let retainedEvidenceRuntime: RetainedEvidenceRuntime | null = null;
     let registrationBegan = false;
     try {
       const maintenance = this.#options.maintenanceFactory?.() ?? new MaintenanceFence();
@@ -560,6 +568,11 @@ export class ProjectStoreWorkerBackend implements WorkerRuntimeBackend {
           keyProvider: this.#options.keyProvider,
         });
       }
+      if (this.#options.retainedEvidenceRuntimeFactory !== undefined && this.#options.keyProvider !== undefined) {
+        try {
+          retainedEvidenceRuntime = this.#options.retainedEvidenceRuntimeFactory.create({ connection, maintenanceFence: maintenance, keyProvider: this.#options.keyProvider });
+        } catch { throw new RetainedEvidenceError("RETAINED_EVIDENCE_UNAVAILABLE"); }
+      }
       connection.exec("BEGIN IMMEDIATE");
       registrationBegan = true;
       assertFreshStartConnectionAllowed(connection, "command-recovery");
@@ -586,6 +599,7 @@ export class ProjectStoreWorkerBackend implements WorkerRuntimeBackend {
         maintenance,
         eventStore,
         lifecycleRuntime,
+        retainedEvidenceRuntime,
         executorId,
       };
       return {
@@ -639,6 +653,38 @@ export class ProjectStoreWorkerBackend implements WorkerRuntimeBackend {
         }
       }
       throw error;
+    }
+  }
+
+  private async retainEvidence(active: ActiveStore, request: Extract<WorkerRequest, { type: "retained-evidence" }>): Promise<WorkerSuccessData> {
+    if (active.retainedEvidenceRuntime === null) throw new RetainedEvidenceError("RETAINED_EVIDENCE_UNAVAILABLE");
+    const prepared = decodePreparedRetainedEvidenceCommand(request.prepared);
+    const original = { commandId: prepared.command.commandId, idempotencyKey: prepared.command.idempotencyKey };
+    let returned = false;
+    try {
+      const result = await retryPrimarySqliteBusy(() => {
+        try { return active.retainedEvidenceRuntime!.execute(prepared, active.context); }
+        catch (error) {
+          // The retained service emits this code only after establishing rollback/pre-BEGIN absence.
+          // Raw native busy or unknown-outcome errors never enter this retry branch.
+          if (error instanceof RetainedEvidenceError && error.code === "SQLITE_BUSY") throw new EventStoreError("SQLITE_BUSY", { retryable: true });
+          throw error;
+        }
+      }, { deadlineMs: this.#options.appendRetryDeadlineMs });
+      returned = true;
+      const response = decodeRetainedEvidenceWorkerResponse({ id: request.id, ok: true, data: encodeAppendResultWire(result) }, request.id, prepared);
+      if (!response.ok) throw new RetainedEvidenceError("INTEGRITY_FAILURE");
+      return response.data;
+    } catch (error) {
+      const safe = returned || (error instanceof RetainedEvidenceError && error.code === "COMMAND_OUTCOME_UNKNOWN")
+        ? new RetainedEvidenceError("COMMAND_OUTCOME_UNKNOWN", original)
+        : error instanceof RetainedEvidenceError ? new RetainedEvidenceError(error.code, error.details)
+          : error instanceof EventStoreError && error.code === "SQLITE_BUSY" ? new RetainedEvidenceError("SQLITE_BUSY")
+            : new RetainedEvidenceError("RETAINED_EVIDENCE_UNAVAILABLE");
+      if (safe.code === "COMMAND_OUTCOME_UNKNOWN") {
+        try { await this.closeHandles(active); } catch { /* Parent poisons and terminates on the original recovery IDs. */ }
+      }
+      throw safe;
     }
   }
 
