@@ -29,7 +29,7 @@ describe("event-store runtime contract", () => {
     assert.match(lock.packages[""].devDependencies["@types/node"], /^\^24\./);
     assert.equal(readFileSync(join(root, ".node-version"), "utf8").trim(), "24.16.0");
     assert.doesNotMatch(build, /target:\s*['"]node22/);
-    assert.equal(build.match(/target:\s*['"]node24\.16['"]/g)?.length, 8);
+    assert.equal(build.match(/target:\s*['"]node24\.16['"]/g)?.length, 9);
     assert.deepEqual([...build.matchAll(/entryPoints:\s*\['([^']+)'\]/g)].map(match => match[1]).sort(), [
       "src/index.ts", "src/cli.ts", "src/workers/project-store.worker.ts", "src/workers/project-store-upgrade-phase.worker.ts",
       "src/orchestrator/materialization/stable-compatibility-directory.worker.ts", "src/orchestrator/migration/v2-shadow-migration-rehearsal.ts",
