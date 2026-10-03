@@ -3,6 +3,11 @@ import { lstatSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { DatabaseSync } from "node:sqlite";
+import { Worker, MessageChannel, receiveMessageOnPort, isMainThread, workerData, parentPort, threadId, type MessagePort } from "node:worker_threads";
+import type { CapabilityKeyProvider } from "../../src/orchestrator/lifecycle/authority/capability-key-provider.js";
+import { bindFreshStartAdmissionContext } from "../../src/orchestrator/fresh-start/fresh-start-admission.js";
+import type { AppendResult } from "../../src/orchestrator/contracts/event.js";
+import type { RetainedEvidenceReceiptV1 } from "../../src/orchestrator/privacy/evidence-contracts.js";
 import type { JsonValue } from "../../src/orchestrator/contracts/event.js";
 import type { ProjectContext } from "../../src/orchestrator/identity/contracts.js";
 import { computeProjectContextFingerprint } from "../../src/orchestrator/identity/project-binding.service.js";
@@ -43,26 +48,36 @@ type FixtureCore = { writer: SqliteConnection; root: string; projectContext: Pro
 
 /** Test-only scoped provider; independent random purpose keys never leave memory. */
 export class SyntheticEvidenceProvider implements EvidenceKeyProvider {
-  private readonly keys = new Map<EvidenceKeyPurpose, Buffer>();
-  private readonly states = new Map<EvidenceKeyPurpose, "available" | "revoked" | "unavailable">();
+  private readonly keys = new Map<string, Buffer>();
+  private readonly states = new Map<string, "available" | "revoked" | "unavailable">();
+  private readonly versions = new Map<EvidenceKeyPurpose, string>();
+  readonly calls = { wrap: 0, fingerprint: 0, commitment: 0, current: 0 };
   constructor(private readonly scope: EvidenceKeyScope) {
-    for (const p of ["data-key-wrap", "original-input-commitment", "redacted-content-fingerprint"] as const) this.keys.set(p, randomBytes(32));
+    for (const p of ["data-key-wrap", "original-input-commitment", "redacted-content-fingerprint"] as const) this.rotate(p);
+  }
+  rotate(purpose: EvidenceKeyPurpose): EvidenceKeyRefV1 {
+    const version = String(BigInt(this.versions.get(purpose) ?? "0") + 1n);
+    this.versions.set(purpose, version); this.keys.set(`${purpose}/${version}`, randomBytes(32));
+    return { keyId: `synthetic/${purpose}`, version };
   }
   currentKey(scope: EvidenceKeyScope, purpose: EvidenceKeyPurpose): EvidenceKeyRefV1 {
-    const ref = Object.freeze({ keyId: `synthetic/${purpose}`, version: "1" });
+    this.calls.current++;
+    const ref = Object.freeze({ keyId: `synthetic/${purpose}`, version: this.versions.get(purpose)! });
     if (this.status(scope, purpose, ref) !== "available") throw new Error("synthetic key unavailable");
     return ref;
   }
   status(scope: EvidenceKeyScope, purpose: EvidenceKeyPurpose, ref: EvidenceKeyRefV1): "available" | "revoked" | "unavailable" {
-    if (scope.projectId !== this.scope.projectId || scope.storeId !== this.scope.storeId || ref.keyId !== `synthetic/${purpose}` || ref.version !== "1" || !this.keys.has(purpose)) return "unavailable";
-    return this.states.get(purpose) ?? "available";
+    if (scope.projectId !== this.scope.projectId || scope.storeId !== this.scope.storeId || ref.keyId !== `synthetic/${purpose}` || !this.keys.has(`${purpose}/${ref.version}`)) return "unavailable";
+    return this.states.get(`${purpose}/${ref.version}`) ?? "available";
   }
-  setStatus(purpose: EvidenceKeyPurpose, status: "available" | "revoked" | "unavailable"): void { this.states.set(purpose, status); }
+  setStatus(purpose: EvidenceKeyPurpose, status: "available" | "revoked" | "unavailable", version = this.versions.get(purpose)!): void { this.states.set(`${purpose}/${version}`, status); }
+  forget(purpose: EvidenceKeyPurpose, version: string): void { const id = `${purpose}/${version}`; this.keys.get(id)?.fill(0); this.keys.delete(id); }
   private key(scope: EvidenceKeyScope, purpose: EvidenceKeyPurpose, ref: EvidenceKeyRefV1): Buffer {
     if (this.status(scope, purpose, ref) !== "available") throw new Error("synthetic key unavailable");
-    return this.keys.get(purpose)!;
+    return this.keys.get(`${purpose}/${ref.version}`)!;
   }
   wrap(scope: EvidenceKeyScope, ref: EvidenceKeyRefV1, key: Uint8Array, aad: Uint8Array): WrappedEvidenceKeyV1 {
+    this.calls.wrap++;
     const nonce = randomBytes(12), cipher = createCipheriv("aes-256-gcm", this.key(scope, "data-key-wrap", ref), nonce, { authTagLength: 16 });
     cipher.setAAD(aad);
     return { formatVersion: 1, keyRef: { ...ref }, algorithm: "AES-256-GCM", nonce: nonce.toString("base64url"),
@@ -75,6 +90,7 @@ export class SyntheticEvidenceProvider implements EvidenceKeyProvider {
     try { return Buffer.concat([first, cipher.final()]); } finally { first.fill(0); }
   }
   mac(scope: EvidenceKeyScope, purpose: "original-input-commitment" | "redacted-content-fingerprint", ref: EvidenceKeyRefV1, domain: string, bytes: Uint8Array): Uint8Array {
+    this.calls[purpose === "original-input-commitment" ? "commitment" : "fingerprint"]++;
     return createHmac("sha256", this.key(scope, purpose, ref)).update(domain).update("\n").update(bytes).digest();
   }
   close(): void { for (const key of this.keys.values()) key.fill(0); this.keys.clear(); }
@@ -82,7 +98,8 @@ export class SyntheticEvidenceProvider implements EvidenceKeyProvider {
 function retainedLifecycleSetup(fixture: FixtureCore, childContext: ProjectContext) {
   const context = fixture.projectContext;
   const broker = new LifecycleTestKeyBroker({ seed: `native-query/${randomUUID()}` });
-  const clock = { now: () => FRESH_NOW, nowMs: () => BigInt(Date.parse(FRESH_NOW)) };
+  let clockMs = BigInt(Date.parse(FRESH_NOW));
+  const clock = { now: () => new Date(Number(clockMs)).toISOString(), nowMs: () => clockMs };
   let nextSessionId: string | undefined;
   const ids = { uuid: () => { const value = nextSessionId; nextSessionId = undefined; return value ?? randomUUID(); },
     bytes: (length: number) => randomBytes(length) };
@@ -179,6 +196,28 @@ function retainedLifecycleSetup(fixture: FixtureCore, childContext: ProjectConte
       } finally { material.handle.destroy(); if (material.kind === "root") material.resumeToken?.destroy(); }
     },
     broker, capabilities,
+    async resumeAfterExpiry(sessionId: string, descriptor: AuthorityMaterialDescriptorV1, incoming: ProjectContext) {
+      const lease = new SessionLeaseRepository().current(fixture.writer, common.projectId, sessionId)!;
+      clockMs = lease.expiresAtMs;
+      const generation = new SessionAuthorityRepository().get(fixture.writer, common.projectId, sessionId)!.ownerGeneration!.toString();
+      const command = decodeLifecycleSemanticCommandDraft({ commandType: "root-resume", commandId: randomUUID(), idempotencyKey: `retained-resume/${randomUUID()}`,
+        agentId: "fixture-agent", expectedProjectId: common.projectId, expectedVaultId: common.vaultId, expectedWorkspaceId: common.workspaceId,
+        expectedBranchRef: null, sessionId, continuityKey: null, resumePolicy: "exact", expectedOwnerGeneration: generation });
+      const scope = { ...common, presentingClientInstanceId: incoming.binding.clientInstanceId, targetClientInstanceId: incoming.binding.clientInstanceId,
+        authorizationKind: "protected" as const, authorizationSessionId: sessionId, targetSessionId: sessionId,
+        capabilityKind: "root-resume-token" as const, capabilityGeneration: generation };
+      const witness = buildLifecycleIntentWitness(command, scope);
+      const material = capabilities.reconstructForTarget(descriptor, { actorRole: "primary", clientInstanceId: common.presentingClientInstanceId });
+      try {
+        if (material.kind !== "root" || !material.resumeToken) throw new Error("synthetic resume material unavailable");
+        const { internalWorkflowId: _w, internalWorkflowGeneration: _g, internalPlannedWorkId: _p, authorizationKind: _k, authorizationSessionId: _s, ...proofScope } = scope;
+        const proof = createCapabilityProof(material.resumeToken, { ...proofScope, authoritySessionId: sessionId, proofVersion: 1, target: "semantic-command",
+          commandId: command.commandId, idempotencyKey: command.idempotencyKey, intentHash: witness.intentHash, proofNonce: randomUUID() });
+        const result = await runtime.execute(decodeLifecycleWorkerOperationWire({ kind: "semantic", operation: "root-resume", prepared: { command,
+          candidateIntentHash: witness.intentHash, authorization: { kind: "protected", authoritySessionId: sessionId, targetSessionId: sessionId, proof, approval: null, childBindingGrant: null } } }), incoming);
+        return result.result as unknown as { publicResult: { ownerGeneration: string }; authorityMaterial: { descriptor: AuthorityMaterialDescriptorV1 } };
+      } finally { material.handle.destroy(); if (material.kind === "root") material.resumeToken?.destroy(); }
+    },
     execute,
     executeForContext: (operation: LifecycleWorkerOperationWire, context: ProjectContext) => runtime.execute(operation, context),
     async forkChild(sessionId: string, descriptor: AuthorityMaterialDescriptorV1, directAccessRequested = true) {
@@ -227,8 +266,11 @@ export async function makeRetainedEvidenceFixture(options: { readonly faults?: R
   let live: SqliteConnection | undefined = driver.open(path, { mode: "create", busyTimeoutMs: 1000 });
   const connection: SqliteConnection = { exec: sql => live!.exec(sql), prepare: sql => live!.prepare(sql), close: () => { const old = live; live = undefined; old?.close(); } };
   let lifecycle: ReturnType<typeof retainedLifecycleSetup> | undefined;
+  const workers = new Map<Worker, Promise<number>>();
+  const workerExits: number[] = [];
   const provider = new SyntheticEvidenceProvider({ projectId: FRESH_IDENTITY.projectId, storeId: FRESH_IDENTITY.storeId });
-  const cleanup = () => {
+  const cleanup = async () => {
+    if (workers.size) await Promise.all([...workers].map(async ([worker, exited]) => { await worker.terminate(); await exited; }));
     lifecycle?.close(); provider.close(); connection.close();
     const current = lstatSync(root, { bigint: true });
     if (!current.isDirectory() || current.isSymbolicLink() || realpathSync.native(root) !== root || current.dev !== identity.dev || current.ino !== identity.ino) throw new Error("owned fixture root changed");
@@ -264,7 +306,7 @@ export async function makeRetainedEvidenceFixture(options: { readonly faults?: R
       rules: Object.freeze([Object.freeze({ kind: "token" as const, ruleId: "synthetic-token", prefix: "fixture_" })]) });
     const rows = () => Object.fromEntries(["events", "command_dedup", "retained_evidence_blobs", "retained_evidence_stream_heads", "retained_evidence_command_authorizations"].map(table => [table, connection.prepare(`SELECT * FROM ${table}`).all()]));
     const repository = new RetainedEvidenceRepository(connection, (boundary, commandId, idempotencyKey) => options.faults?.hit(boundary, commandId, idempotencyKey));
-    const events = new EventAppendTransaction(connection, new SqliteEventAppendStatements(connection), new MaintenanceFence(), new BranchScopeRepository());
+    let events = new EventAppendTransaction(connection, new SqliteEventAppendStatements(connection), new MaintenanceFence(), new BranchScopeRepository());
     const retainedAuthority = new RetainedEvidenceAuthorityVerifier({ connection, capabilities: lifecycle.capabilities });
     const service = (overrides: Partial<RetainedEvidenceServiceOptions> = {}) => new RetainedEvidenceService({ connection, events, repository,
       authority: retainedAuthority, provider, policy: () => policy, now: () => FRESH_NOW, faults: options.faults, ...overrides });
@@ -304,10 +346,107 @@ export async function makeRetainedEvidenceFixture(options: { readonly faults?: R
           candidateIntentHash: witness.intentHash, authorization: { kind: "protected", authoritySessionId: authorizer.sessionId, targetSessionId, proof, approval: null, childBindingGrant: null } } }), context);
       } finally { material.handle.destroy(); if (material.kind === "root") material.resumeToken?.destroy(); }
     };
-    return { root, path, connection, projectContext, childContext, provider, policy, rootAuthority, childAuthority, authoritySnapshot,
-      lifecycle, admission, repository, events, retainedAuthority, service, invocation, protectedLifecycle, rows, cleanup,
-      // Stable connection facade retains its genuine admission; capability/provider objects and historical key status stay alive.
-      reopen() { connection.close(); live = driver.open(path, { mode: "existing", busyTimeoutMs: 1000 }); },
+    // Keys stay in the surviving parent providers. Private ports transport scoped operations,
+    // never provider keys or disk bootstrap files. Each worker owns a native SQLite connection.
+    const prepareWorker = (command: unknown, selectedPolicy = policy, hold = true) => {
+      const request = invocation(command), channel = new MessageChannel(), barrier = new SharedArrayBuffer(4);
+      const worker = new Worker(new URL(import.meta.url), { workerData: { retainedFixtureWorker: true, path,
+        context: request.context, command: request.input.command, authorization: request.authorization,
+        trusted: admission.trusted, policy: selectedPolicy, port: channel.port2, barrier, hold }, transferList: [channel.port2] });
+      request.input.canonicalOriginalBytes.fill(0);
+      let lastRequestId = 0;
+      channel.port1.on("message", (message: { id: number; family: "evidence" | "capability"; method: string; args: unknown[] }) => {
+        let value: unknown;
+        try {
+          if (message.id !== ++lastRequestId || !["evidence", "capability"].includes(message.family)) throw new Error("invalid fixture request");
+          const scope = message.args[0] as EvidenceKeyScope;
+          if (scope?.projectId !== FRESH_IDENTITY.projectId || scope?.storeId !== FRESH_IDENTITY.storeId) throw new Error("foreign fixture scope");
+          const allowed = message.family === "evidence" ? ["currentKey", "status", "wrap", "unwrap", "mac"] : ["currentKey", "status", "mac", "verify", "fingerprint", "seal", "open"];
+          if (!allowed.includes(message.method)) throw new Error("invalid fixture operation");
+          const target = message.family === "evidence" ? provider : lifecycle!.broker;
+          value = Reflect.apply(Reflect.get(target, message.method) as (...args: unknown[]) => unknown, target, message.args);
+          channel.port1.postMessage({ id: message.id, ok: true, value });
+        } catch { channel.port1.postMessage({ id: message.id, ok: false }); }
+        finally {
+          for (const arg of message.args) {
+            if (arg instanceof Uint8Array) arg.fill(0);
+            else if (arg && typeof arg === "object" && "bytes" in arg && arg.bytes instanceof Uint8Array) arg.bytes.fill(0);
+          }
+          if (value instanceof Uint8Array) value.fill(0);
+        }
+      });
+      let resolveReached!: (value: RetainedPreparationObservation) => void, rejectReached!: (reason: unknown) => void;
+      const reached = new Promise<RetainedPreparationObservation>((resolve, reject) => { resolveReached = resolve; rejectReached = reject; });
+      // Attach rejection handlers immediately; a failing assertion must still allow fixture cleanup.
+      void reached.catch(() => undefined);
+      let response: RetainedWorkerResult | undefined;
+      worker.on("message", (message: { prepared?: RetainedPreparationObservation; result?: RetainedWorkerResult }) => {
+        if (message.prepared) resolveReached(message.prepared);
+        if (message.result) response = message.result;
+      });
+      const exited = new Promise<number>((resolve, reject) => {
+        worker.on("error", () => { rejectReached(new Error("retained fixture worker failed")); reject(new Error("retained fixture worker failed")); });
+        worker.on("exit", code => { workers.delete(worker); workerExits.push(code); channel.port1.close();
+          rejectReached(new Error("worker exited before preparation")); resolve(code); });
+      });
+      workers.set(worker, exited);
+      const result = exited.then(code => { if (code !== 0 || !response) throw new Error("retained fixture worker did not close successfully"); return response; });
+      void result.catch(() => undefined);
+      return { reached, result, release() { Atomics.store(new Int32Array(barrier), 0, 1); Atomics.notify(new Int32Array(barrier), 0); } };
     };
-  } catch (error) { try { cleanup(); } catch { /* preserve original setup failure */ } throw error; }
+    return { root, path, connection, projectContext, childContext, provider, policy, rootAuthority, childAuthority, authoritySnapshot,
+      lifecycle, admission, repository, get events() { return events; }, retainedAuthority, service, invocation, protectedLifecycle, rows, cleanup, prepareWorker, workerExits,
+      // Stable connection facade retains its genuine admission; capability/provider objects and historical key status stay alive.
+      reopen() { connection.close(); live = driver.open(path, { mode: "existing", busyTimeoutMs: 1000 });
+        events = new EventAppendTransaction(connection, new SqliteEventAppendStatements(connection), new MaintenanceFence(), new BranchScopeRepository()); },
+    };
+  } catch (error) { try { await cleanup(); } catch { /* preserve original setup failure */ } throw error; }
+}
+
+export type RetainedPreparationObservation = { threadId: number; policyVersion: string; commitmentVersion: string; wrapVersion: string; wrapCalls: number };
+type RetainedWorkerResult = { ok: true; value: AppendResult<RetainedEvidenceReceiptV1> } | { ok: false; code: string; details: unknown };
+
+// This entry point is test-only; it does not add a production runtime/provider composition.
+if (!isMainThread && (workerData as { retainedFixtureWorker?: boolean }).retainedFixtureWorker) {
+  const data = workerData as { path: string; context: ProjectContext; command: unknown; authorization: RetainedEvidenceInvocationV1["authorization"];
+    trusted: Parameters<typeof bindFreshStartAdmissionContext>[1]; policy: TrustedRedactionPolicyV1; port: MessagePort; barrier: SharedArrayBuffer; hold: boolean };
+  const pause = new Int32Array(new SharedArrayBuffer(4));
+  let sequence = 0, wrapCalls = 0, wrapVersion = "", commitmentVersion = "";
+  const rpc = (family: "evidence" | "capability", method: string, args: unknown[]): unknown => {
+    const id = ++sequence, deadline = Date.now() + 15000;
+    data.port.postMessage({ id, family, method, args });
+    while (Date.now() < deadline) {
+      const message = receiveMessageOnPort(data.port)?.message as { id: number; ok: boolean; value: unknown } | undefined;
+      if (message) { if (message.id !== id || !message.ok) throw new Error("synthetic provider operation refused"); return message.value; }
+      Atomics.wait(pause, 0, 0, 1);
+    }
+    throw new Error("synthetic provider operation timed out");
+  };
+  const capabilityProvider = Object.fromEntries(["currentKey", "status", "mac", "verify", "fingerprint", "seal", "open"].map(method =>
+    [method, (...args: unknown[]) => rpc("capability", method, args)])) as unknown as CapabilityKeyProvider;
+  const evidenceProvider = Object.fromEntries(["currentKey", "status", "wrap", "unwrap", "mac"].map(method =>
+    [method, (...args: unknown[]) => {
+      if (method === "wrap") { wrapCalls++; wrapVersion = (args[1] as EvidenceKeyRefV1).version; }
+      if (method === "mac" && args[1] === "original-input-commitment") commitmentVersion = (args[2] as EvidenceKeyRefV1).version;
+      return rpc("evidence", method, args);
+    }])) as unknown as EvidenceKeyProvider;
+  const connection = new NodeSqliteDriver({ DatabaseSync }).open(data.path, { mode: "existing", busyTimeoutMs: 1000 });
+  try {
+    bindFreshStartAdmissionContext(connection, data.trusted);
+    const capabilities = new CapabilityService({ keyProvider: capabilityProvider,
+      clock: { nowMs: () => BigInt(Date.parse(FRESH_NOW)) }, nonceSource: { uuid: randomUUID, bytes: randomBytes } });
+    const policy = Object.freeze({ ...data.policy, rules: Object.freeze(data.policy.rules.map(rule => Object.freeze(rule))) });
+    const service = new RetainedEvidenceService({ connection, repository: new RetainedEvidenceRepository(connection),
+      events: new EventAppendTransaction(connection, new SqliteEventAppendStatements(connection), new MaintenanceFence(), new BranchScopeRepository()),
+      authority: new RetainedEvidenceAuthorityVerifier({ connection, capabilities }), provider: evidenceProvider, policy: () => policy, now: () => FRESH_NOW,
+      faults: { hit(boundary) { if (boundary === "before-begin") {
+        parentPort!.postMessage({ prepared: { threadId, policyVersion: policy.policyVersion, commitmentVersion, wrapVersion, wrapCalls } });
+        if (data.hold && Atomics.wait(new Int32Array(data.barrier), 0, 0, 15000) === "timed-out") throw new Error("preparation barrier timed out");
+      } } } });
+    const value = service.retain({ context: data.context, input: decodeRetainEvidenceBatch(data.command), authorization: data.authorization });
+    parentPort!.postMessage({ result: { ok: true, value } });
+  } catch (error) {
+    parentPort!.postMessage({ result: { ok: false, code: error instanceof Error && "code" in error ? error.code : "FIXTURE_FAILURE",
+      details: error instanceof Error && "details" in error ? error.details : {} } });
+  } finally { connection.close(); data.port.close(); parentPort!.close(); }
 }

@@ -302,11 +302,11 @@ test("forged parent mirror and changed authority after verification refuse on th
   request.input.canonicalOriginalBytes.fill(0);
 });
 
-test("existing prior is refused and generic replay cannot disclose retained authorization", async t => {
+test("authorized original retry succeeds and generic replay cannot disclose retained authorization", async t => {
   const f = await makeRetainedEvidenceFixture(); t.after(f.cleanup);
-  const command = batch(f); f.service().retain(f.invocation(command));
+  const command = batch(f); const accepted = f.service().retain(f.invocation(command));
   const prior = f.repository.findPrior(command.commandId, command.idempotencyKey)!, before = snapshot(f);
-  assert.throws(() => f.service().retain(f.invocation(command)), { code: "IDEMPOTENCY_CONFLICT" });
+  assert.deepEqual(f.service().retain(f.invocation(command)), { ...accepted, deduplicated: true });
   const generic = f.events.prepare({ context: f.projectContext, commandId: command.commandId, idempotencyKey: command.idempotencyKey,
     commandType: "generic", correlationId: randomUUID(), agentId: "synthetic", expectedStreamVersion: 0n, streamId: "generic", streamType: "generic",
     events: [{ eventType: "Synthetic", eventSchemaVersion: 1, occurredAt: FRESH_NOW, visibilityScope: "project", confidence: "high",

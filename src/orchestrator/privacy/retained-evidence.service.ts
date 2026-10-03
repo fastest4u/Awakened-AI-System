@@ -1,16 +1,17 @@
 import type { AppendCommand, AppendResult, JsonValue } from "../contracts/event.js";
 import type { SqliteConnection } from "../storage/sqlite-driver.js";
-import { isPrimarySqliteBusy, type EventAppendTransaction } from "../storage/event-append-transaction.js";
+import { isPrimarySqliteBusy, type EventAppendTransaction, type PreparedEventAppend } from "../storage/event-append-transaction.js";
 import type { EvidenceKeyProvider } from "./evidence-key-provider.js";
 import { redactEvidence, type TrustedRedactionPolicyV1 } from "./redaction.js";
-import { assertRetainedEvidenceCommitBundle, type RetainedEvidenceRepository } from "./retained-evidence.repository.js";
+import { assertRetainedEvidenceCommitBundle, type RetainedEvidenceRepository, type RetainedEvidencePriorV1 } from "./retained-evidence.repository.js";
 import type { RetainedEvidenceAuthorityVerifier, RetainedEvidenceInvocationV1 } from "./retained-evidence-authority.js";
 import { RETAINED_EVIDENCE_ERROR_CODES, RetainedEvidenceError, decodeRetainedEvidenceReceipt, decodeRetainEvidenceBatch, type RetainedEvidenceReceiptV1, type RetainedEvidenceErrorCode } from "./evidence-contracts.js";
-import { buildRetainedEvidenceIntent } from "./retained-evidence-intent.js";
-import { evidenceProviderCall } from "./evidence-key-provider.js";
+import { buildRetainedEvidenceIntent, RETAINED_EVIDENCE_ORIGINAL_DOMAIN, type RetainedEvidenceAuthoritySnapshotV1 } from "./retained-evidence-intent.js";
+import { evidenceProviderCall, evidenceMacInput, evidenceMac, requireEvidenceKey } from "./evidence-key-provider.js";
 import { sealEvidenceItem } from "./evidence-envelope.js";
 import { decodeEvidenceBatchRetainedPayload, decodeRetainedEvidenceStoredResult } from "./retained-evidence-codec.js";
-import { randomUUID } from "node:crypto";
+import { randomUUID, timingSafeEqual } from "node:crypto";
+import { canonicalJson } from "../serialization/canonical-json.js";
 export type RetainedEvidenceFaultBoundary = "before-begin" | "after-event" | "after-blobs" | "after-head" | "after-auth" | "after-dedup" | "before-commit" | "after-commit-before-response";
 export interface RetainedEvidenceFaultInjector { hit(boundary: RetainedEvidenceFaultBoundary, commandId: string, idempotencyKey: string): void; }
 export interface RetainedEvidenceServiceOptions { readonly connection: SqliteConnection; readonly events: EventAppendTransaction; readonly repository: RetainedEvidenceRepository; readonly authority: RetainedEvidenceAuthorityVerifier; readonly provider: EvidenceKeyProvider; readonly policy: () => TrustedRedactionPolicyV1; readonly now: () => string; readonly faults?: RetainedEvidenceFaultInjector; }
@@ -22,12 +23,39 @@ export class RetainedEvidenceService {
     const recovery = { commandId: command.commandId, idempotencyKey: command.idempotencyKey };
     const hit = (boundary: RetainedEvidenceFaultBoundary) => this.options.faults?.hit(boundary, command.commandId, command.idempotencyKey);
     let began = false, commitAttempted = false, commitSucceeded = false;
+    let prepared: PreparedEventAppend<RetainedEvidenceReceiptV1> | undefined;
+    const replay = (prior: RetainedEvidencePriorV1, current: RetainedEvidenceAuthoritySnapshotV1): AppendResult<RetainedEvidenceReceiptV1> => {
+      // The authenticated prior fixes policy identity and all generation/scope fences.
+      // Only its historical original-input MAC is needed; no policy, wrap or fingerprint work.
+      if (canonicalJson(current) !== canonicalJson(prior.authorization)) throw new RetainedEvidenceError("SESSION_HANDLE_STALE");
+      const scope = { projectId: current.projectId, storeId: current.storeId };
+      let bytes: Buffer | undefined;
+      try {
+        const ref = requireEvidenceKey(provider, scope, "original-input-commitment", prior.witness.originalCommitmentKeyRef);
+        bytes = evidenceMacInput(scope, ref, input.canonicalOriginalBytes.toString("utf8"));
+        const commitment = evidenceMac(provider, scope, "original-input-commitment", ref, RETAINED_EVIDENCE_ORIGINAL_DOMAIN, bytes);
+        if (!timingSafeEqual(Buffer.from(commitment, "hex"), Buffer.from(prior.witness.originalInputCommitment, "hex"))) throw new RetainedEvidenceError("IDEMPOTENCY_CONFLICT");
+      } catch (error) {
+        if (error instanceof RetainedEvidenceError && error.code === "RETAINED_EVIDENCE_KEY_UNAVAILABLE") throw new RetainedEvidenceError(error.code, recovery);
+        throw error;
+      } finally { bytes?.fill(0); }
+      return events.result({ events: [prior.event], storedResponse: prior.result, responseHash: prior.responseHash }, true);
+    };
     try {
       if (!input.canonicalOriginalBytes.equals(invocation.input.canonicalOriginalBytes)) throw new RetainedEvidenceError("RETAINED_EVIDENCE_INPUT_INVALID");
       const verified = authority.verify({ ...invocation, input });
       const admitted = authority.revalidate(verified);
-      // Task 5 supplies authorized pinned-key equality/replay. Existing identities refuse here.
-      if (repository.findPrior(command.commandId, command.idempotencyKey)) throw new RetainedEvidenceError("IDEMPOTENCY_CONFLICT");
+      const prior = repository.findPrior(command.commandId, command.idempotencyKey);
+      if (prior) {
+        replay(prior, admitted);
+        connection.exec("BEGIN IMMEDIATE"); began = true;
+        events.assertAppendAllowed();
+        const authoritativePrior = repository.findPrior(command.commandId, command.idempotencyKey);
+        if (!authoritativePrior) throw new RetainedEvidenceError("INTEGRITY_FAILURE");
+        const result = replay(authoritativePrior, authority.revalidate(verified));
+        connection.exec("ROLLBACK"); began = false;
+        return result;
+      }
       events.assertAppendAllowed();
       const expectedHead = repository.readHead(command.targetSessionId, command.conversationId);
       repository.assertCanContinue(input, expectedHead);
@@ -57,9 +85,15 @@ export class RetainedEvidenceService {
           visibilityScope: "session", sessionId: command.targetSessionId, ...(admitted.parentSessionId === null ? {} : { parentSessionId: admitted.parentSessionId }),
           confidence: "high", verificationStatus: "unverified", sourceRefs: [], evidenceRefs: receipt.evidenceIds,
           evidenceDigests: items.map(item => ({ ciphertextHash: item.ciphertextHash, keyedFingerprint: item.keyedFingerprint })), payload: payload as unknown as JsonValue }], outbox: [], publicResponse: receipt };
-      const prepared = events.prepareRetainedEvidence(plan, append, payload, items);
+      prepared = events.prepareRetainedEvidence(plan, append, payload, items);
       hit("before-begin"); connection.exec("BEGIN IMMEDIATE"); began = true;
-      if (repository.findPrior(command.commandId, command.idempotencyKey)) throw new RetainedEvidenceError("IDEMPOTENCY_CONFLICT");
+      const winner = repository.findPrior(command.commandId, command.idempotencyKey);
+      if (winner) {
+        events.assertAppendAllowed();
+        const result = replay(winner, authority.revalidate(verified));
+        connection.exec("ROLLBACK"); began = false;
+        return result;
+      }
       events.assertCommandIdAvailable(prepared); events.assertAppendAllowed();
       const currentAuthority = authority.revalidate(verified);
       const currentHead = repository.readHead(command.targetSessionId, command.conversationId);
@@ -87,6 +121,9 @@ export class RetainedEvidenceService {
       if (isPrimarySqliteBusy(error)) throw new RetainedEvidenceError("SQLITE_BUSY");
       const code = error instanceof Error && "code" in error && typeof error.code === "string" ? error.code : "RETAINED_EVIDENCE_UNAVAILABLE";
       throw new RetainedEvidenceError(RETAINED_EVIDENCE_ERROR_CODES.includes(code as RetainedEvidenceErrorCode) ? code as RetainedEvidenceErrorCode : "RETAINED_EVIDENCE_UNAVAILABLE");
-    } finally { input.canonicalOriginalBytes.fill(0); invocation.input.canonicalOriginalBytes.fill(0); }
+    } finally {
+      if (prepared) events.discardRetainedEvidence(prepared);
+      input.canonicalOriginalBytes.fill(0); invocation.input.canonicalOriginalBytes.fill(0);
+    }
   }
 }

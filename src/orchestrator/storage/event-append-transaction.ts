@@ -1557,6 +1557,14 @@ export class EventAppendTransaction {
       .get({ $p: projectId, $c: commandId, $i: idempotencyKey })) throw new EventStoreError("IDEMPOTENCY_CONFLICT");
   }
 
+  /** Revoke a completed/losing preparation and release its nondurable encrypted bundle. */
+  discardRetainedEvidence(prepared: PreparedEventAppend<RetainedEvidenceReceiptV1>): void {
+    const state = retainedPrepared.get(prepared);
+    if (!state || state.transaction !== this) return;
+    retainedPrepared.delete(prepared);
+    retainedPlans.delete(state.plan);
+  }
+
   prepare<T extends JsonValue>(
     command: AppendCommand<T>,
     recordedAt: string,
