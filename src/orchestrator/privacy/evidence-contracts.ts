@@ -40,11 +40,12 @@ export interface RetainEvidenceBatchCommandV1 {
   readonly targetSessionId: string; readonly conversationId: string; readonly frames: readonly RetainedEvidenceFrameV1[];
 }
 export interface BoundedEvidenceInputV1 { readonly command: RetainEvidenceBatchCommandV1; readonly canonicalOriginalBytes: Buffer; }
-export interface RetainedEvidenceReceiptV1 {
+/** JSON-compatible response shape; decoding freezes the owned receipt and IDs. */
+export type RetainedEvidenceReceiptV1 = {
   readonly resultVersion: 1; readonly operation: "retain-evidence-batch"; readonly retentionFormat: "redacted-encrypted-v1";
   readonly targetSessionId: string; readonly conversationId: string; readonly commandId: string; readonly idempotencyKey: string;
-  readonly evidenceIds: readonly string[]; readonly eventPosition: string; readonly finalStreamVersion: string;
-}
+  readonly evidenceIds: string[]; readonly eventPosition: string; readonly finalStreamVersion: string;
+};
 const INVALID = "RETAINED_EVIDENCE_INPUT_INVALID";
 function refuse(code: RetainedEvidenceErrorCode = INVALID): never { throw new RetainedEvidenceError(code); }
 export function assertRetainedByteLimit(actualBytes: number, maximumBytes: number): void {

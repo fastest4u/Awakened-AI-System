@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import type { AppendResult } from "../src/orchestrator/contracts/event.js";
 import { canonicalJson } from "../src/orchestrator/serialization/canonical-json.js";
-import { assertRetainedByteLimit, decodeRetainEvidenceBatch, decodeRetainedEvidenceReceipt, RetainedEvidenceError } from "../src/orchestrator/privacy/evidence-contracts.js";
+import { assertRetainedByteLimit, decodeRetainEvidenceBatch, decodeRetainedEvidenceReceipt, RetainedEvidenceError, type RetainedEvidenceReceiptV1 } from "../src/orchestrator/privacy/evidence-contracts.js";
 
 const invalid = { code: "RETAINED_EVIDENCE_INPUT_INVALID" };
 const limit = { code: "RETAINED_EVIDENCE_LIMIT_EXCEEDED" };
@@ -115,6 +116,16 @@ test("receipt is a closed frozen selector-only envelope", () => {
   assert.throws(() => decodeRetainedEvidenceReceipt({ ...receipt(), resultVersion: 2 }), unsupported);
   assert.throws(() => decodeRetainedEvidenceReceipt({ ...receipt(), evidenceIds: [id(9), id(9)] }), invalid);
   assert.throws(() => decodeRetainedEvidenceReceipt({ ...receipt(), eventPosition: "9223372036854775808" }), invalid);
+});
+test("receipt is JSON-compatible for the existing AppendResult consumer and stays frozen", () => {
+  const result: AppendResult<RetainedEvidenceReceiptV1> = {
+    deduplicated: false, firstGlobalPosition: 1n, lastGlobalPosition: 1n, finalStreamVersion: 1n,
+    eventIds: [id(10)], response: decodeRetainedEvidenceReceipt(receipt()), responseHash: "0".repeat(64),
+  };
+  assert.equal(result.response.operation, "retain-evidence-batch");
+  assert.ok(Object.isFrozen(result.response)); assert.ok(Object.isFrozen(result.response.evidenceIds));
+  assert.equal(Reflect.set(result.response.evidenceIds, "0", id(30)), false);
+  assert.equal(result.response.evidenceIds[0], id(9));
 });
 test("byte guard refuses invalid accounting and errors contain only closed safe codes", () => {
   assert.doesNotThrow(() => assertRetainedByteLimit(16_384, 16_384)); assert.throws(() => assertRetainedByteLimit(16_385, 16_384), limit);
