@@ -52,12 +52,12 @@ function request(f: RetainedEvidenceFixture, value: unknown) {
   return decodeWorkerRequest({ id: randomUUID(), type: "retained-evidence", binding: encodeWorkerBindingAssertion(f.projectContext),
     prepared: encodePreparedRetainedEvidenceCommand(prepared(f, value)) });
 }
-async function nativeExecutor(f: RetainedEvidenceFixture, compose = true, options: { loseAcknowledgement?: boolean; observeReply?: (value: unknown) => void; output?: Buffer[] } = {}) {
+async function nativeExecutor(f: RetainedEvidenceFixture, compose = true, options: { loseAcknowledgement?: boolean; observeReply?: (value: unknown) => void; output?: (stream: "stdout" | "stderr", bytes: Buffer) => void } = {}) {
   const channel = new MessageChannel();
   const worker = new Worker(WORKER_URL, { workerData: { port: channel.port2, policy: f.policy,
     buildHash: f.admission.trusted.measuredBuildHash, compose }, transferList: [channel.port2], stdout: true, stderr: true });
-  worker.stdout.on("data", bytes => { options.output?.push(Buffer.from(bytes)); });
-  worker.stderr.on("data", bytes => { options.output?.push(Buffer.from(bytes)); });
+  worker.stdout.on("data", bytes => { options.output?.("stdout", Buffer.from(bytes)); });
+  worker.stderr.on("data", bytes => { options.output?.("stderr", Buffer.from(bytes)); });
   const exits: number[] = [];
   const exited = new Promise<number>(resolve => worker.on("exit", code => { exits.push(code); channel.port1.close(); resolve(code); }));
   let sequence = 0;
@@ -161,9 +161,49 @@ test("fixed retained runner rejects unknown groups before compiler or build", as
 });
 
 const encodeObserved = (value: unknown) => Buffer.from(JSON.stringify(value, (_key, item: unknown) => typeof item === "bigint" ? item.toString() : item));
-function scanSurfaces(surfaces: readonly Buffer[], needles: readonly Buffer[]): boolean {
-  return surfaces.every(surface => needles.every(needle => !surface.includes(needle)));
+function scanSurfaces(surfaces: readonly Buffer[], needles: readonly Buffer[], sources: readonly unknown[] = surfaces): boolean {
+  assert.equal(sources.length, surfaces.length, "every observation requires its actual source identity");
+  const streams = new Map<unknown, Buffer[]>();
+  surfaces.forEach((bytes, index) => {
+    const chunks = streams.get(sources[index]);
+    if (chunks) chunks.push(bytes); else streams.set(sources[index], [bytes]);
+  });
+  for (const chunks of streams.values()) {
+    // Only successive observations of this same source are reassembled. A row,
+    // file snapshot or reply has its own identity, never a fabricated mixed stream.
+    const joined = Buffer.concat(chunks);
+    try { if (needles.some(needle => joined.includes(needle))) return false; }
+    finally { joined.fill(0); }
+  }
+  return true;
 }
+function dataKeyNeedles(key: Buffer): Buffer[] {
+  const typed = new Uint8Array(key);
+  try { return [Buffer.from(key), Buffer.from(key.toString("hex")), Buffer.from(key.toString("base64")), Buffer.from(key.toString("base64url")),
+    encodeObserved([...key]), encodeObserved(typed)]; }
+  finally { typed.fill(0); }
+}
+
+test("secrecy scanner detects split originals and key encodings within interleaved streams", () => {
+  const original = Buffer.from(`private-${randomUUID()}`), key = randomBytes(32), needles = [original, ...dataKeyNeedles(key)];
+  const encodedKey = Buffer.from(key.toString("base64url"));
+  const surfaces = [Buffer.from(original.subarray(0, 9)), Buffer.from("unrelated"), Buffer.from(original.subarray(9)),
+    Buffer.from(encodedKey.subarray(0, 7)), Buffer.from("another-stream"), Buffer.from(encodedKey.subarray(7))];
+  try {
+    assert.equal(scanSurfaces(surfaces.slice(0, 3), needles, ["stdout-A", "stderr-B", "stdout-A"]), false, "split original escaped its actual stream");
+    assert.equal(scanSurfaces(surfaces.slice(3), needles, ["stderr-C", "stdout-D", "stderr-C"]), false, "split encoded key escaped its actual stream");
+    assert.equal(scanSurfaces([surfaces[0]!, surfaces[2]!], needles, ["separate-A", "separate-B"]), true, "unrelated streams must not be joined");
+  } finally { for (const bytes of [original, key, encodedKey, ...needles, ...surfaces]) bytes.fill(0); }
+});
+
+test("secrecy scanner detects actual Uint8Array JSON directly and nested", () => {
+  const key = randomBytes(32), needles = dataKeyNeedles(key), bytes = new Uint8Array(key);
+  const direct = encodeObserved(bytes), nested = encodeObserved({ envelope: { data: bytes } });
+  try {
+    assert.equal(scanSurfaces([direct], needles), false, "typed-array object serialization escaped scanning");
+    assert.equal(scanSurfaces([nested], needles), false, "nested typed-array object serialization escaped scanning");
+  } finally { for (const value of [key, bytes, direct, nested, ...needles]) value.fill(0); }
+});
 function durableSurfaces(f: RetainedEvidenceFixture) {
   const tables = f.connection.prepare("SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name").all();
   const rows = tables.map(row => encodeObserved(f.connection.prepare(`SELECT * FROM "${String(row.name).replaceAll('"', '""')}"`).all()));
@@ -187,6 +227,8 @@ function durableSurfaces(f: RetainedEvidenceFixture) {
 // and provider exceptions escaping the real private/native boundaries.
 test("synthetic originals absent from durable and output surfaces", async t => {
   const f = await makeRetainedEvidenceFixture(), surfaces: Buffer[] = [], dataKeys: Buffer[] = [];
+  const sources: unknown[] = [];
+  const observe = (bytes: Buffer, source: unknown = Symbol()) => { surfaces.push(bytes); sources.push(source); };
   const secret = `fixture_${randomBytes(20).toString("hex")}`, original = `visible-${randomUUID()} ${secret}`;
   const needles: Buffer[] = [Buffer.from(secret), Buffer.from(original)];
   const wrap = f.provider.wrap.bind(f.provider), unwrap = f.provider.unwrap.bind(f.provider);
@@ -194,21 +236,21 @@ test("synthetic originals absent from durable and output surfaces", async t => {
   f.provider.wrap = (...args) => { dataKeys.push(Buffer.from(args[2])); wrapped++; if (providerFailure) throw new Error(secret); return wrap(...args); };
   f.provider.unwrap = (...args) => { const value = unwrap(...args); dataKeys.push(Buffer.from(value)); unwrapped++; return value; };
   const value = () => { const result = command(f.rootAuthority.sessionId); result.frames[0]!.content = original; return result; };
-  const snapshot = () => { const durable = durableSurfaces(f); surfaces.push(...durable.buffers); snapshots++; tableCount = durable.tables; fileCount += durable.files; };
-  const observeError = (error: unknown) => { const value = error as any; surfaces.push(encodeObserved({ name: value.name, message: value.message, code: value.code, details: value.details, stack: value.stack })); return true; };
+  const snapshot = () => { const durable = durableSurfaces(f); durable.buffers.forEach(bytes => observe(bytes)); snapshots++; tableCount = durable.tables; fileCount += durable.files; };
+  const observeError = (error: unknown) => { const value = error as any; observe(encodeObserved({ name: value.name, message: value.message, code: value.code, details: value.details, stack: value.stack })); return true; };
   const stdout = process.stdout.write, stderr = process.stderr.write;
   // Preserve node:test's private transport; observation must not swallow its records.
   process.stdout.write = function (this: typeof process.stdout, chunk: any, ...args: any[]) {
-    surfaces.push(Buffer.isBuffer(chunk) ? Buffer.from(chunk) : Buffer.from(String(chunk)));
+    observe(Buffer.isBuffer(chunk) ? Buffer.from(chunk) : Buffer.from(String(chunk)), "parent-stdout");
     return Reflect.apply(stdout, this, [chunk, ...args]);
   } as typeof stdout;
   process.stderr.write = function (this: typeof process.stderr, chunk: any, ...args: any[]) {
-    surfaces.push(Buffer.isBuffer(chunk) ? Buffer.from(chunk) : Buffer.from(String(chunk)));
+    observe(Buffer.isBuffer(chunk) ? Buffer.from(chunk) : Buffer.from(String(chunk)), "parent-stderr");
     return Reflect.apply(stderr, this, [chunk, ...args]);
   } as typeof stderr;
   try {
-    const native = await nativeExecutor(f, true, { output: surfaces, observeReply: reply => surfaces.push(encodeObserved(reply)) });
-    try { surfaces.push(encodeObserved(await native.executor.retainEvidence(prepared(f, value())))); }
+    const native = await nativeExecutor(f, true, { output: (stream, bytes) => observe(bytes, `successful-native-${stream}`), observeReply: reply => observe(encodeObserved(reply)) });
+    try { observe(encodeObserved(await native.executor.retainEvidence(prepared(f, value())))); }
     finally { await native.close(); }
     snapshot();
     const item = JSON.parse(String(f.connection.prepare("SELECT encrypted_item_json FROM retained_evidence_blobs").get()!.encrypted_item_json));
@@ -216,7 +258,7 @@ test("synthetic originals absent from durable and output surfaces", async t => {
     assert.ok(!String(redacted.content).includes(secret), "authenticated content still contains synthetic credential");
     // A native provider failure still uses the parent provider's actual wrap boundary.
     providerFailure = true;
-    const failed = await nativeExecutor(f, true, { output: surfaces, observeReply: reply => surfaces.push(encodeObserved(reply)) });
+    const failed = await nativeExecutor(f, true, { output: (stream, bytes) => observe(bytes, `failed-native-${stream}`), observeReply: reply => observe(encodeObserved(reply)) });
     try { await assert.rejects(failed.executor.retainEvidence(prepared(f, value())), observeError); }
     finally { await failed.close(); providerFailure = false; }
     snapshot();
@@ -235,17 +277,17 @@ test("synthetic originals absent from durable and output surfaces", async t => {
     a.release(); const accepted = await a.result; b.release(); const replay = await b.result;
     assert.ok(accepted.ok && replay.ok, "native race did not complete");
     if (accepted.ok && replay.ok) assert.deepEqual(accepted.value.response, replay.value.response);
-    surfaces.push(encodeObserved(accepted), encodeObserved(replay)); snapshot();
+    observe(encodeObserved(accepted)); observe(encodeObserved(replay)); snapshot();
     assert.deepEqual(f.workerExits, [0, 0]);
     // Scan actual generated human report bytes as well as actual native/process output.
     const report = join(process.cwd(), "docs/superpowers/reports/2026-10-02-v2-retained-evidence-acceptance.md");
-    if (existsSync(report)) surfaces.push(readFileSync(report));
+    if (existsSync(report)) observe(readFileSync(report));
     assert.ok(wrapped >= 5 && unwrapped === 1, "actual wrap/unwrap DATA-key observations missing");
-    for (const key of dataKeys) needles.push(key, Buffer.from(key.toString("hex")), Buffer.from(key.toString("base64")), Buffer.from(key.toString("base64url")), encodeObserved([...key]));
+    for (const key of dataKeys) needles.push(...dataKeyNeedles(key));
     // Negative control proves the scanner rejects an observed buffer carrying a key or original.
-    assert.equal(scanSurfaces([Buffer.from(original)], needles), false);
-    assert.equal(scanSurfaces([Buffer.from(dataKeys[0]!)], needles), false);
-    assert.equal(scanSurfaces(surfaces, needles), true, "synthetic private bytes found in observed surface");
+    assert.equal(scanSurfaces([needles[1]!], needles), false);
+    assert.equal(scanSurfaces([dataKeys[0]!], needles), false);
+    assert.equal(scanSurfaces(surfaces, needles, sources), true, "synthetic private bytes found in observed surface");
   } finally {
     process.stdout.write = stdout; process.stderr.write = stderr;
     for (const bytes of [...dataKeys, ...needles, ...surfaces]) bytes.fill(0);
