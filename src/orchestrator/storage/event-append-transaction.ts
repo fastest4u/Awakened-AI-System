@@ -1518,6 +1518,10 @@ export class EventAppendTransaction {
     const admitted = requireRetainedEvidenceAuthority(this.connection, state.authority, state.command);
     const payload = decodeEvidenceBatchRetainedPayload(payloadInput), w = payload.witness;
     const items = itemsInput.map(decodeEncryptedEvidenceItem), command = immutableSnapshot(append);
+    const receipt = decodeRetainedEvidenceReceipt(command.publicResponse);
+    if (receipt.commandId !== w.commandId || receipt.idempotencyKey !== w.idempotencyKey
+      || receipt.targetSessionId !== w.targetSessionId || receipt.conversationId !== w.conversationId
+      || canonical(receipt.evidenceIds) !== canonical(items.map(item => item.binding.evidenceId))) throw new EventStoreError("COMMAND_INVALID");
     const event = command.events[0];
     const frames = state.command.frames.map(({ content: _content, ...frame }) => frame);
     if (canonical(admitted) !== canonical(w.authority) || w.commandId !== state.command.commandId || w.idempotencyKey !== state.command.idempotencyKey

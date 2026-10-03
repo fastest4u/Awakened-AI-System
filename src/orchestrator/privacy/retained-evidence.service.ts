@@ -21,7 +21,7 @@ export class RetainedEvidenceService {
     const input = decodeRetainEvidenceBatch(invocation.input.command), command = input.command;
     const recovery = { commandId: command.commandId, idempotencyKey: command.idempotencyKey };
     const hit = (boundary: RetainedEvidenceFaultBoundary) => this.options.faults?.hit(boundary, command.commandId, command.idempotencyKey);
-    let began = false, commitAttempted = false;
+    let began = false, commitAttempted = false, commitSucceeded = false;
     try {
       if (!input.canonicalOriginalBytes.equals(invocation.input.canonicalOriginalBytes)) throw new RetainedEvidenceError("RETAINED_EVIDENCE_INPUT_INVALID");
       const verified = authority.verify({ ...invocation, input });
@@ -77,12 +77,12 @@ export class RetainedEvidenceService {
       events.insertDedup(prepared, committed, null); hit("after-dedup");
       const result = events.result(committed);
       decodeRetainedEvidenceStoredResult(committed.storedResponse);
-      hit("before-commit"); commitAttempted = true; connection.exec("COMMIT"); began = false;
+      hit("before-commit"); commitAttempted = true; connection.exec("COMMIT"); commitSucceeded = true; began = false;
       hit("after-commit-before-response"); return result;
     } catch (error) {
       let rollbackFailed = false;
       if (began) try { connection.exec("ROLLBACK"); began = false; } catch { rollbackFailed = true; }
-      if (rollbackFailed || (commitAttempted && !isPrimarySqliteBusy(error))) throw new RetainedEvidenceError("COMMAND_OUTCOME_UNKNOWN", recovery);
+      if (commitSucceeded || rollbackFailed || (commitAttempted && !isPrimarySqliteBusy(error))) throw new RetainedEvidenceError("COMMAND_OUTCOME_UNKNOWN", recovery);
       if (error instanceof RetainedEvidenceError) throw error;
       if (isPrimarySqliteBusy(error)) throw new RetainedEvidenceError("SQLITE_BUSY");
       const code = error instanceof Error && "code" in error && typeof error.code === "string" ? error.code : "RETAINED_EVIDENCE_UNAVAILABLE";

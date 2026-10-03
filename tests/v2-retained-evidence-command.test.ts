@@ -5,7 +5,7 @@ import { makeRetainedEvidenceFixture } from "./support/retained-evidence-fixture
 import { decodeRetainEvidenceBatch } from "../src/orchestrator/privacy/evidence-contracts.js";
 import { RetainedEvidenceService } from "../src/orchestrator/privacy/retained-evidence.service.js";
 import { RetainedEvidenceAuthorityVerifier } from "../src/orchestrator/privacy/retained-evidence-authority.js";
-import { EventAppendTransaction, SqliteEventAppendStatements } from "../src/orchestrator/storage/event-append-transaction.js";
+import { EventAppendTransaction, SqliteEventAppendStatements, isPrimarySqliteBusy } from "../src/orchestrator/storage/event-append-transaction.js";
 import { MaintenanceFence } from "../src/orchestrator/storage/maintenance-fence.js";
 import { BranchScopeRepository } from "../src/orchestrator/storage/branch-scope.repository.js";
 import { FRESH_NOW } from "./support/fresh-start-fixture.js";
@@ -61,6 +61,10 @@ test("authorized batch commits one complete bundle", async t => {
   assert.deepEqual(rows, { retainedEvents: 1n, blobs: 2n, authorizations: 1n, dedup: 1n, heads: 1n, canonicalItems: 0n });
   const prior = f.repository.findPrior(input.command.commandId, input.command.idempotencyKey)!;
   assert.deepEqual(prior.event.evidenceRefs, result.response.evidenceIds);
+  assert.equal(result.response.commandId, input.command.commandId);
+  assert.equal(result.response.idempotencyKey, input.command.idempotencyKey);
+  assert.equal(result.response.targetSessionId, input.command.targetSessionId);
+  assert.equal(result.response.conversationId, input.command.conversationId);
   const items = f.connection.prepare("SELECT encrypted_item_json FROM retained_evidence_blobs ORDER BY item_index").all().map(row => decodeEncryptedEvidenceItem(JSON.parse(row.encrypted_item_json as string)));
   assert.deepEqual(items.map(item => item.binding.frameId), [first.frameId, second.frameId]);
   assert.deepEqual(prior.event.evidenceRefs, items.map(item => item.binding.evidenceId));
@@ -385,3 +389,62 @@ test("copied generic planned events cannot acquire retained append authority", a
   } finally { f.connection.exec("ROLLBACK"); }
   assert.equal(snapshot(f), before);
 });
+
+const durableSnapshot = (f: RetainedEvidenceFixture) => JSON.stringify([
+  "events", "streams", "branch_scopes", "outbox", "retained_evidence_blobs", "retained_evidence_stream_heads",
+  "retained_evidence_command_authorizations", "command_dedup",
+].map(table => [table, f.connection.prepare(`SELECT * FROM ${table}`).all()]), (_k, v: unknown) => typeof v === "bigint" ? v.toString() : v);
+
+for (const boundary of ["after-dedup", "after-commit-before-response"] as const) {
+  test(`primary busy at ${boundary} preserves actual commit outcome`, async t => {
+    const busy = Object.assign(new Error("synthetic primary busy"), { errcode: 5 });
+    assert.equal(isPrimarySqliteBusy(busy), true);
+    const f = await makeRetainedEvidenceFixture({ faults: { hit(at) { if (at === boundary) throw busy; } } }); t.after(f.cleanup);
+    const command = batch(f), before = durableSnapshot(f);
+    if (boundary === "after-commit-before-response") {
+      assert.throws(() => f.service().retain(f.invocation(command)), {
+        code: "COMMAND_OUTCOME_UNKNOWN", details: { commandId: command.commandId, idempotencyKey: command.idempotencyKey },
+      });
+      const prior = f.repository.findPrior(command.commandId, command.idempotencyKey);
+      assert.ok(prior);
+      assert.equal(prior.event.eventType, "EvidenceBatchRetained");
+      assert.equal(f.connection.prepare("SELECT count(*) AS n FROM retained_evidence_blobs").get()!.n, 1n);
+      assert.equal(f.connection.prepare("SELECT count(*) AS n FROM retained_evidence_stream_heads").get()!.n, 1n);
+      assert.equal(f.connection.prepare("SELECT count(*) AS n FROM retained_evidence_command_authorizations").get()!.n, 1n);
+    } else {
+      assert.throws(() => f.service().retain(f.invocation(command)), { code: "SQLITE_BUSY", details: {} });
+      assert.equal(f.repository.findPrior(command.commandId, command.idempotencyKey), null);
+      assert.equal(durableSnapshot(f), before);
+    }
+  });
+}
+
+for (const mismatch of ["commandId", "idempotencyKey", "targetSessionId", "conversationId", "unrelated-evidence", "reversed-evidence", "missing-evidence"] as const) {
+  test(`protected receipt ${mismatch} mismatch refuses before preparation`, async t => {
+    const f = await makeRetainedEvidenceFixture(); t.after(f.cleanup);
+    const first = frame(), second = frame({ ordinal: "1", previousFrameId: first.frameId });
+    const command = batch(f, { frames: [first, second] }), before = durableSnapshot(f);
+    const prepare = f.events.prepareRetainedEvidence.bind(f.events);
+    let reachedPrepare = false;
+    let primitiveRefusal: unknown;
+    f.events.prepareRetainedEvidence = (plan, append, payload, items) => {
+      reachedPrepare = true;
+      assert.equal(items.length, 2);
+      assert.deepEqual(append.publicResponse.evidenceIds, items.map(item => item.binding.evidenceId));
+      const receipt = append.publicResponse;
+      const changed = mismatch === "unrelated-evidence" ? { ...receipt, evidenceIds: [randomUUID(), receipt.evidenceIds[1]!] }
+        : mismatch === "reversed-evidence" ? { ...receipt, evidenceIds: [...receipt.evidenceIds].reverse() }
+        : mismatch === "missing-evidence" ? { ...receipt, evidenceIds: receipt.evidenceIds.slice(0, 1) }
+        : { ...receipt, [mismatch]: randomUUID() };
+      try { return prepare(plan, { ...append, publicResponse: changed }, payload, items); }
+      catch (error) {
+        primitiveRefusal = error;
+        throw error;
+      }
+    };
+    assert.throws(() => f.service().retain(f.invocation(command)), { code: "RETAINED_EVIDENCE_UNAVAILABLE" });
+    assert.equal(reachedPrepare, true);
+    assert.equal(primitiveRefusal instanceof Error && "code" in primitiveRefusal ? primitiveRefusal.code : null, "COMMAND_INVALID");
+    assert.equal(durableSnapshot(f), before);
+  });
+}
