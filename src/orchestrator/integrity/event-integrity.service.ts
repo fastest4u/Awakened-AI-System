@@ -1,4 +1,6 @@
 import { readFileSync } from "node:fs";
+import { assertRetainedStoredEvent, decodeRetainedEvidenceAuthority, decodeRetainedEvidenceStoredResult, retainedEvidenceIntentHash, verifyRetainedEvidenceTransport } from "../privacy/retained-evidence-codec.js";
+import { retainedStringMetrics } from "../privacy/evidence-contracts.js";
 import {
   commandHash,
   outboxHash,
@@ -24,7 +26,7 @@ import {
   decodePendingLifecycleOutboxV1,
   type LifecycleMaterializationPayloadV1,
 } from "../lifecycle/materialization-queue.port.js";
-import { GENESIS_GLOBAL_HASH } from "../storage/event-store.js";
+import { GENESIS_GLOBAL_HASH } from "../storage/event-chain-constants.js";
 import type { Migration } from "../storage/migration.js";
 import { migrationChecksum } from "../storage/migration-runner.js";
 import { PROJECT_STORE_MIGRATIONS } from "../storage/migrations/registry.js";
@@ -54,6 +56,56 @@ import {
 } from "./stored-event-authenticator.js";
 
 export const DEFAULT_QUICK_TAIL_EVENTS = 256;
+/** Provider-free event/blob/authorization/result/head join, shared with private reads.
+ * Earlier batches remain readable when the authenticated conversation head advances. */
+export function assertStoredRetainedEvidenceCorrespondence(connection: SqliteConnection, event: StoredEvent): void {
+  const invalid = (): never => { throw new Error("INTEGRITY_FAILURE"); };
+  const parsed = (row: SqliteRow, key: string): unknown => {
+    const value = row[key]; if (typeof value !== "string") return invalid();
+    retainedStringMetrics(value, 2_097_152, "INTEGRITY_FAILURE"); return JSON.parse(value) as unknown;
+  };
+  try {
+    const payload = assertRetainedStoredEvent(event); if (payload === null) return;
+    const w = payload.witness, params = { $p: event.projectId, $c: event.commandId, $i: event.idempotencyKey };
+    if (event.streamType !== "retained-evidence" || event.streamId !== `retained-evidence/${w.targetSessionId}/${w.conversationId}`
+      || event.sourceRefs.length !== 0 || (event.lifecycleIntentJson !== undefined && event.lifecycleIntentJson !== null)) invalid();
+    const a = connection.prepare("SELECT * FROM retained_evidence_command_authorizations WHERE project_id=$p AND command_id=$c AND idempotency_key=$i").get(params);
+    const d = connection.prepare("SELECT * FROM command_dedup WHERE project_id=$p AND command_id=$c AND idempotency_key=$i").get(params);
+    if (!a || !d || a.event_id !== event.eventId || a.event_position !== event.globalPosition) invalid();
+    const authorization = decodeRetainedEvidenceAuthority(parsed(a!, "authorization_json"));
+    const result = decodeRetainedEvidenceStoredResult(parsed(d!, "response_json")), receipt = result.response;
+    if (canonicalJson(authorization) !== a!.authorization_json || canonicalJson(authorization) !== canonicalJson(w.authority)
+      || d!.state !== "committed" || d!.command_type !== "retain-evidence-batch" || d!.command_hash !== retainedEvidenceIntentHash(w)
+      || d!.lifecycle_authorization_kind !== null || d!.outbox_order_json !== "[]"
+      || d!.first_global_position !== event.globalPosition || d!.last_global_position !== event.globalPosition || d!.final_stream_version !== event.streamVersion
+      || d!.event_ids_json !== canonicalJson([event.eventId]) || d!.response_json !== canonicalJson(result) || d!.response_hash !== responseHash(result)
+      || result.eventIds[0] !== event.eventId || result.firstGlobalPosition !== String(event.globalPosition) || result.finalStreamVersion !== String(event.streamVersion)
+      || receipt.commandId !== event.commandId || receipt.idempotencyKey !== event.idempotencyKey || receipt.targetSessionId !== w.targetSessionId
+      || receipt.conversationId !== w.conversationId || canonicalJson(receipt.evidenceIds) !== canonicalJson(event.evidenceRefs)) invalid();
+    const rows = connection.prepare("SELECT * FROM retained_evidence_blobs WHERE project_id=$p AND event_id=$e ORDER BY item_index").all({ $p: event.projectId, $e: event.eventId });
+    if (rows.length !== payload.items.length) invalid();
+    for (let index = 0; index < rows.length; index++) {
+      const row = rows[index]!, item = verifyRetainedEvidenceTransport(parsed(row, "encrypted_item_json")), b = item.binding;
+      const { formatVersion: _v, algorithm: _a, nonce: _n, tag: _t, ciphertext: _c, wrappedKey: _k, ...metadata } = item;
+      if (canonicalJson(item) !== row.encrypted_item_json || canonicalJson(metadata) !== canonicalJson(payload.items[index])
+        || row.project_id !== b.projectId || row.vault_id !== b.vaultId || row.store_id !== b.storeId || row.evidence_id !== b.evidenceId || row.event_id !== b.eventId
+        || row.event_position !== event.globalPosition || row.command_id !== event.commandId || row.idempotency_key !== event.idempotencyKey || row.item_index !== BigInt(index)
+        || row.target_session_id !== b.targetSessionId || row.conversation_id !== b.conversationId || row.frame_id !== b.frameId || row.ordinal !== BigInt(item.frame.ordinal)) invalid();
+    }
+    const stream = { $p: event.projectId, $t: w.targetSessionId, $c: w.conversationId };
+    const head = connection.prepare("SELECT * FROM retained_evidence_stream_heads WHERE project_id=$p AND target_session_id=$t AND conversation_id=$c").get(stream);
+    const latest = connection.prepare("SELECT * FROM retained_evidence_blobs WHERE project_id=$p AND target_session_id=$t AND conversation_id=$c ORDER BY ordinal DESC LIMIT 1").get(stream);
+    const counts = connection.prepare("SELECT count(*) AS frames, count(DISTINCT event_id) AS batches, min(ordinal) AS first, max(ordinal) AS last FROM retained_evidence_blobs WHERE project_id=$p AND target_session_id=$t AND conversation_id=$c").get(stream);
+    if (!head || !latest || !counts || counts.first !== 0n || counts.frames !== (counts.last as bigint) + 1n
+      || head.last_frame_id !== latest.frame_id || head.last_ordinal !== latest.ordinal || head.version !== counts.batches
+      || event.streamVersion > (head.version as bigint)) invalid();
+    const first = w.frames[0]!;
+    if (first.ordinal !== "0") {
+      const previous = connection.prepare("SELECT frame_id FROM retained_evidence_blobs WHERE project_id=$p AND target_session_id=$t AND conversation_id=$c AND ordinal=$o").get({ ...stream, $o: BigInt(first.ordinal) - 1n });
+      if (!previous || previous.frame_id !== first.previousFrameId) invalid();
+    } else if (first.previousFrameId !== null) invalid();
+  } catch { invalid(); }
+}
 export const MAX_QUICK_TAIL_EVENTS = 4096;
 export const MAX_INTEGRITY_RANGE_EVENTS = 4096;
 const SQLITE_INT64_MAX = 9_223_372_036_854_775_807n;
@@ -1113,7 +1165,9 @@ export class EventIntegrityService {
 
     try {
       this.validateLifecycleOutboxDescriptors(command, rows);
-      const expectedHash = command.lifecycleAuthorizationKind === null
+      const expectedHash = command.commandType === "retain-evidence-batch"
+        ? this.reconstructRetainedEvidenceHash(command, rows)
+        : command.lifecycleAuthorizationKind === null
         ? this.reconstructCommandHash(command, rows)
         : this.reconstructLifecycleIntentHash(command, rows);
       if (expectedHash !== command.commandHash) {
@@ -1634,6 +1688,16 @@ export class EventIntegrityService {
     });
   }
 
+  private reconstructRetainedEvidenceHash(command: CommandRow, rows: readonly SqliteRow[]): string {
+    try {
+      if (rows.length !== 1 || command.lifecycleAuthorizationKind !== null) throw new Error();
+      const event = storedEventForAuthentication(rows[0]!);
+      const payload = assertRetainedStoredEvent(event); if (!payload) throw new Error();
+      assertStoredRetainedEvidenceCorrespondence(this.connection, event);
+      return retainedEvidenceIntentHash(payload.witness);
+    } catch { throw new CommandWitnessInvalidError("COMMAND_WITNESS_INVALID"); }
+  }
+
   private checkEventRows(
     context: ProjectContext,
     rows: readonly SqliteRow[],
@@ -1654,10 +1718,12 @@ export class EventIntegrityService {
       const globalPosition = position.toString();
       const streamId = stringValue(row, "stream_id");
       try {
-        authenticateStoredEvent(storedEventForAuthentication(row), {
+        const stored = storedEventForAuthentication(row);
+        authenticateStoredEvent(stored, {
           expectedPosition,
           previousEventHash: expectedPreviousHash ?? "",
         });
+        assertStoredRetainedEvidenceCorrespondence(this.connection, stored);
       } catch (error) {
         if (error instanceof StoredEventAuthenticationError) {
           if (error.failures.position) {

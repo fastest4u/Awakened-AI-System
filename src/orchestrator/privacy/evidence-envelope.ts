@@ -1,9 +1,9 @@
 import type { EvidenceKeyProvider, EvidenceKeyRefV1, WrappedEvidenceKeyV1 } from "./evidence-key-provider.js";
 import type { RedactedEvidenceFrameV1 } from "./redaction.js";
 import { boundedRetainedJson, retainedExactRecord, RetainedEvidenceError } from "./evidence-contracts.js";
-import { createCipheriv, createDecipheriv, createHash, randomBytes, timingSafeEqual } from "node:crypto";
+import { createCipheriv, createDecipheriv, randomBytes, timingSafeEqual } from "node:crypto";
 import { canonicalJson } from "../serialization/canonical-json.js";
-import { decodeEncryptedEvidenceItem, decodeEvidenceFrameMetadata, decodeEvidenceItemBinding, decodeRedactedEvidencePlaintext, decodeWrappedEvidenceKey, RETAINED_EVIDENCE_BUNDLE_BYTES } from "./retained-evidence-codec.js";
+import { decodeEncryptedEvidenceItem, decodeEvidenceFrameMetadata, decodeEvidenceItemBinding, decodeRedactedEvidencePlaintext, decodeWrappedEvidenceKey, RETAINED_EVIDENCE_BUNDLE_BYTES, retainedEvidenceCipherHash as cipherHash, retainedEvidenceWrapHash as wrapHash, verifyRetainedEvidenceTransport } from "./retained-evidence-codec.js";
 import { evidenceMac, evidenceMacInput, evidenceProviderCall, requireEvidenceKey } from "./evidence-key-provider.js";
 import { RETAINED_EVIDENCE_REDACTED_DOMAIN } from "./retained-evidence-intent.js";
 export type EvidenceItemBindingV1 = {
@@ -27,10 +27,6 @@ export type EncryptedEvidenceItemV1 = EvidenceItemMetadataV1 & {
   readonly wrappedKey: WrappedEvidenceKeyV1;
 };
 export type EvidenceSealKeysV1 = { readonly wrapKeyRef: EvidenceKeyRefV1; readonly fingerprintKeyRef: EvidenceKeyRefV1 };
-function cipherHash(item: Pick<EncryptedEvidenceItemV1, "formatVersion" | "algorithm" | "binding" | "frame" | "wrapKeyRef" | "fingerprintKeyRef" | "nonce" | "tag" | "ciphertext">): string {
-  return createHash("sha256").update(canonicalJson({ formatVersion: item.formatVersion, algorithm: item.algorithm, binding: item.binding, frame: item.frame, wrapKeyRef: item.wrapKeyRef, fingerprintKeyRef: item.fingerprintKeyRef, nonce: item.nonce, tag: item.tag, ciphertext: item.ciphertext })).digest("hex");
-}
-function wrapHash(wrappedKey: WrappedEvidenceKeyV1): string { return createHash("sha256").update(canonicalJson(wrappedKey)).digest("hex"); }
 function equalHash(left: string, right: string): boolean { return timingSafeEqual(Buffer.from(left, "hex"), Buffer.from(right, "hex")); }
 function integrity(): never { throw new RetainedEvidenceError("INTEGRITY_FAILURE"); }
 export function sealEvidenceItem(binding: EvidenceItemBindingV1, frame: RedactedEvidenceFrameV1, provider: EvidenceKeyProvider, keys?: EvidenceSealKeysV1): EncryptedEvidenceItemV1 {
@@ -62,8 +58,8 @@ export function sealEvidenceItem(binding: EvidenceItemBindingV1, frame: Redacted
 export function openEvidenceItem(binding: EvidenceItemBindingV1, item: EncryptedEvidenceItemV1, provider: EvidenceKeyProvider): RedactedEvidenceFrameV1 {
   let expected: EvidenceItemBindingV1; let stored: EncryptedEvidenceItemV1;
   try {
-    expected = decodeEvidenceItemBinding(binding); stored = decodeEncryptedEvidenceItem(item);
-    if (canonicalJson(expected) !== canonicalJson(stored.binding) || !equalHash(cipherHash(stored), stored.ciphertextHash) || !equalHash(wrapHash(stored.wrappedKey), stored.wrappedKeyHash)) integrity();
+    expected = decodeEvidenceItemBinding(binding); stored = verifyRetainedEvidenceTransport(item);
+    if (canonicalJson(expected) !== canonicalJson(stored.binding)) integrity();
   } catch { return integrity(); }
   const scope = Object.freeze({ projectId: expected.projectId, storeId: expected.storeId });
   requireEvidenceKey(provider, scope, "data-key-wrap", stored.wrapKeyRef); requireEvidenceKey(provider, scope, "redacted-content-fingerprint", stored.fingerprintKeyRef);

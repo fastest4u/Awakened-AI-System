@@ -1,4 +1,5 @@
 import type { StoredEvent } from "../contracts/event.js";
+import { assertRetainedStoredEvent } from "../privacy/retained-evidence-codec.js";
 import { payloadHash } from "../crypto/event-hash.js";
 import type {
   BranchScopeId,
@@ -599,8 +600,10 @@ function decodeStoredEventEnvelope(value: unknown): DecodedStoredEvent {
   oneOf(record.confidence, ["high", "medium", "low", "guess"] as const);
   oneOf(record.verificationStatus, ["unverified", "provisional", "verified", "conflicted"] as const);
   for (const reference of strictArray(record.sourceRefs, 128)) boundedString(reference, 2_048);
-  if (strictArray(record.evidenceRefs, 0).length !== 0) return integrity();
-  if (strictArray(record.evidenceDigests, 0).length !== 0) return integrity();
+  // This branch inspects recognized retained canonical bytes only. Historical unknown
+  // payload objects and bytes remain opaque, while their evidence arrays stay empty.
+  const retained = assertRetainedStoredEvent(record as unknown as StoredEvent);
+  if (retained !== null && payloadHash(retained) !== record.payloadHash) return integrity();
   hash(record.payloadHash);
   hash(record.previousGlobalHash);
   hash(record.eventHash);

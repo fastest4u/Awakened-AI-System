@@ -1,4 +1,5 @@
 import type { JsonValue, StoredEvent } from "../contracts/event.js";
+import { assertRetainedStoredEvent } from "../privacy/retained-evidence-codec.js";
 import { LifecycleError } from "../lifecycle/errors.js";
 import type {
   LifecycleCommandTransaction,
@@ -524,7 +525,7 @@ function storedEventFromRow(row: SqliteRow): StoredEvent {
   ) {
     return integrity();
   }
-  return Object.freeze({
+  const event = Object.freeze({
     globalPosition: rowBigint(row, "global_position"),
     eventId: rowString(row, "event_id"),
     projectId: rowString(row, "project_id") as StoredEvent["projectId"],
@@ -563,6 +564,8 @@ function storedEventFromRow(row: SqliteRow): StoredEvent {
     eventHash: rowString(row, "event_hash"),
     lifecycleIntentJson,
   } as StoredEvent);
+  try { assertRetainedStoredEvent(event); } catch { return integrity(); }
+  return event;
 }
 
 function comparableStoredEvent(event: StoredEvent): JsonValue {

@@ -8,6 +8,25 @@ import { canonicalJson } from "../serialization/canonical-json.js";
 import type { JsonValue } from "../contracts/event.js";
 import type { RedactionSpanV1 } from "./redaction.js";
 import { types } from "node:util";
+import { createHash } from "node:crypto";
+export const RETAINED_EVIDENCE_COMMAND_DOMAIN = "project-memory/retained-evidence-command/v1";
+/** The single stable witness hash producer; no provider or plaintext dependency. */
+export function retainedEvidenceIntentHash(witness: RetainedEvidenceIntentWitnessV1): string {
+  const decoded = decodeRetainedEvidenceIntentWitness(witness);
+  return createHash("sha256").update(RETAINED_EVIDENCE_COMMAND_DOMAIN).update("\n").update(boundedRetainedJson(decoded, RETAINED_EVIDENCE_LIMITS.batchBytes).canonical).digest("hex");
+}
+export function retainedEvidenceCipherHash(item: Pick<EncryptedEvidenceItemV1, "formatVersion" | "algorithm" | "binding" | "frame" | "wrapKeyRef" | "fingerprintKeyRef" | "nonce" | "tag" | "ciphertext">): string {
+  return createHash("sha256").update(canonicalJson({ formatVersion: item.formatVersion, algorithm: item.algorithm, binding: item.binding, frame: item.frame, wrapKeyRef: item.wrapKeyRef, fingerprintKeyRef: item.fingerprintKeyRef, nonce: item.nonce, tag: item.tag, ciphertext: item.ciphertext })).digest("hex");
+}
+export function retainedEvidenceWrapHash(wrappedKey: WrappedEvidenceKeyV1): string { return createHash("sha256").update(canonicalJson(wrappedKey)).digest("hex"); }
+/** Committed transport digests only. This does not prove GCM or HMAC plaintext meaning. */
+export function verifyRetainedEvidenceTransport(value: unknown): EncryptedEvidenceItemV1 {
+  try {
+    const item = decodeEncryptedEvidenceItem(value);
+    if (retainedEvidenceCipherHash(item) !== item.ciphertextHash || retainedEvidenceWrapHash(item.wrappedKey) !== item.wrappedKeyHash) integrity();
+    return item;
+  } catch { return integrity(); }
+}
 export const RETAINED_EVIDENCE_BUNDLE_BYTES = 2_097_152;
 export type EvidenceBatchRetainedPayloadV1 = { readonly formatVersion: 1; readonly witness: RetainedEvidenceIntentWitnessV1; readonly items: EvidenceItemMetadataV1[] };
 const FORMAT = "RETAINED_EVIDENCE_FORMAT_UNSUPPORTED";

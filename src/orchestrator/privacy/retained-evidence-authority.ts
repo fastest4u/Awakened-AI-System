@@ -8,15 +8,21 @@ import { commandHash } from "../crypto/event-hash.js";
 import { canonicalJson } from "../serialization/canonical-json.js";
 import type { SqliteConnection } from "../storage/sqlite-driver.js";
 import type { RetainedEvidenceAuthoritySnapshotV1 } from "./retained-evidence-intent.js";
+import type { RetainedEvidenceReadInvocationV1 } from "./retained-evidence-reader.js";
+import type { BoundedOperationProofTargetV1 } from "../lifecycle/authority/capability-codec.js";
+import { parseCanonicalTimestamp } from "../lifecycle/contracts/identifiers.js";
 import { boundedRetainedJson, decodeRetainEvidenceBatch, retainedExactRecord, RetainedEvidenceError, RETAINED_EVIDENCE_LIMITS, type BoundedEvidenceInputV1, type RetainEvidenceBatchCommandV1 } from "./evidence-contracts.js";
 import { decodeRetainedEvidenceAuthority } from "./retained-evidence-codec.js";
 
 export interface RetainedEvidenceInvocationV1 { readonly context: ProjectContext; readonly input: BoundedEvidenceInputV1; readonly authorization: SemanticCommandAuthorization; }
 declare const verifiedBrand: unique symbol;
 export interface VerifiedRetainedEvidenceAuthority { readonly [verifiedBrand]: true; }
+declare const readBrand: unique symbol;
+export interface VerifiedRetainedEvidenceReadAuthority { readonly [readBrand]: true; }
 type ProofScope = Omit<SemanticCommandProofTargetV1, "proofVersion" | "target" | "commandId" | "idempotencyKey" | "intentHash" | "proofNonce">;
 type VerifiedState = { readonly connection: SqliteConnection; readonly verifier: RetainedEvidenceAuthorityVerifier; readonly invocation: RetainedEvidenceInvocationV1; readonly commandCanonical: string; readonly snapshot: RetainedEvidenceAuthoritySnapshotV1; readonly operation: "retain-evidence-batch" };
 const verified = new WeakMap<object, VerifiedState>();
+const verifiedReads = new WeakMap<object, { connection: SqliteConnection; verifier: RetainedEvidenceAuthorityVerifier; invocation: RetainedEvidenceReadInvocationV1; snapshot: RetainedEvidenceAuthoritySnapshotV1 }>();
 const refuse = (code: "SESSION_CAPABILITY_INVALID" | "SESSION_NOT_FOUND" | "SESSION_HANDLE_STALE" | "SESSION_OWNERSHIP_MISMATCH" | "INTEGRITY_FAILURE" = "SESSION_CAPABILITY_INVALID"): never => { throw new RetainedEvidenceError(code); };
 
 /** Shared private-boundary proof builder. The original command is a bounded canonical STRING
@@ -35,6 +41,13 @@ export function requireRetainedEvidenceAuthority(connection: SqliteConnection, h
   if (!state || state.connection !== connection || state.operation !== "retain-evidence-batch"
     || boundedRetainedJson(command, RETAINED_EVIDENCE_LIMITS.batchBytes).canonical !== state.commandCanonical) return refuse();
   return state.verifier.revalidate(handle);
+}
+
+/** Read provenance is connection-bound and disjoint from write handles. */
+export function requireRetainedEvidenceReadAuthority(connection: SqliteConnection, handle: VerifiedRetainedEvidenceReadAuthority, evidenceId: string, recorded: RetainedEvidenceAuthoritySnapshotV1): RetainedEvidenceAuthoritySnapshotV1 {
+  const state = verifiedReads.get(handle);
+  if (!state || state.connection !== connection) return refuse();
+  return state.verifier.revalidateRead(handle, evidenceId, recorded);
 }
 
 function storedHandle(context: ProjectContext, row: SessionAuthorityRecord): StoredCapabilityMaterialV1 {
@@ -67,18 +80,12 @@ export class RetainedEvidenceAuthorityVerifier {
   readonly #capabilities: CapabilityService;
   readonly #repository = new SessionAuthorityRepository();
   constructor(options: { connection: SqliteConnection; capabilities: CapabilityService }) { this.#connection = options.connection; this.#capabilities = options.capabilities; }
-  private inspect(invocation: RetainedEvidenceInvocationV1): RetainedEvidenceAuthoritySnapshotV1 {
-    const { context, input } = invocation, b = context.binding;
-    const a = retainedExactRecord(invocation.authorization, ["kind", "authoritySessionId", "targetSessionId", "proof", "approval", "childBindingGrant"]);
-    if (a.kind !== "protected" || a.proof === null || a.approval !== null || a.childBindingGrant !== null
-      || a.targetSessionId !== input.command.targetSessionId || typeof a.authoritySessionId !== "string") return refuse();
-    const proof = retainedExactRecord(a.proof, ["proofVersion", "target", "proofNonce", "proofFingerprint"]);
-    if (proof.proofVersion !== 1 || proof.target !== "semantic-command" || typeof proof.proofNonce !== "string"
-      || typeof proof.proofFingerprint !== "string") return refuse();
+  private inspectScope(context: ProjectContext, authoritySessionId: string, targetSessionId: string): { snapshot: RetainedEvidenceAuthoritySnapshotV1; material: StoredCapabilityMaterialV1; scope: ProofScope } {
+    const b = context.binding;
     const identity = this.#connection.prepare("SELECT project_id, vault_id, store_id FROM project_meta WHERE singleton = 1").get();
     if (!identity || identity.project_id !== b.projectId || identity.vault_id !== b.vaultId || identity.store_id !== b.storeId) refuse("SESSION_OWNERSHIP_MISMATCH");
-    const authorizer = this.#repository.get(this.#connection, b.projectId, a.authoritySessionId);
-    const target = this.#repository.get(this.#connection, b.projectId, input.command.targetSessionId);
+    const authorizer = this.#repository.get(this.#connection, b.projectId, authoritySessionId);
+    const target = this.#repository.get(this.#connection, b.projectId, targetSessionId);
     if (!authorizer || !target) return refuse("SESSION_NOT_FOUND");
     current(authorizer); current(target);
     if (authorizer.workspaceId !== b.workspaceId || target.workspaceId !== b.workspaceId
@@ -105,15 +112,59 @@ export class RetainedEvidenceAuthorityVerifier {
       presentingActorRole: b.actorRole, presentingClientInstanceId: b.clientInstanceId,
       targetActorRole: b.actorRole, targetClientInstanceId: b.clientInstanceId,
       capabilityKind: material.claims.kind, capabilityGeneration: material.claims.capabilityGeneration };
-    this.#capabilities.verifyProof(material, retainedEvidenceProofTarget(input, scope, proof.proofNonce), {
-      proofVersion: 1, target: "semantic-command", proofNonce: proof.proofNonce, proofFingerprint: proof.proofFingerprint });
-    return decodeRetainedEvidenceAuthority({ projectId: b.projectId, vaultId: b.vaultId, storeId: b.storeId, workspaceId: b.workspaceId,
+    const snapshot = decodeRetainedEvidenceAuthority({ projectId: b.projectId, vaultId: b.vaultId, storeId: b.storeId, workspaceId: b.workspaceId,
       clientNamespace: b.clientNamespace, presentingActorRole: b.actorRole, presentingClientInstanceId: b.clientInstanceId,
       targetActorRole: b.actorRole, targetClientInstanceId: b.clientInstanceId, authorizationSessionId: authorizer.sessionId,
       targetSessionId: target.sessionId, parentSessionId: target.parentSessionId, rootSessionId: root.sessionId,
       rootOwnerGeneration: root.ownerGeneration.toString(), authorizingOwnerGeneration: authorizer.ownerGeneration?.toString() ?? null,
       authorizingCapabilityGeneration: authorizer.childCapabilityGeneration?.toString() ?? null, targetOwnerGeneration: target.ownerGeneration?.toString() ?? null,
       targetCapabilityGeneration: target.childCapabilityGeneration?.toString() ?? null, capabilityKind: material.claims.kind });
+    return { snapshot, material, scope };
+  }
+  private inspect(invocation: RetainedEvidenceInvocationV1): RetainedEvidenceAuthoritySnapshotV1 {
+    const { context, input } = invocation;
+    const a = retainedExactRecord(invocation.authorization, ["kind", "authoritySessionId", "targetSessionId", "proof", "approval", "childBindingGrant"]);
+    if (a.kind !== "protected" || a.proof === null || a.approval !== null || a.childBindingGrant !== null
+      || a.targetSessionId !== input.command.targetSessionId || typeof a.authoritySessionId !== "string") return refuse();
+    const proof = retainedExactRecord(a.proof, ["proofVersion", "target", "proofNonce", "proofFingerprint"]);
+    if (proof.proofVersion !== 1 || proof.target !== "semantic-command" || typeof proof.proofNonce !== "string"
+      || typeof proof.proofFingerprint !== "string") return refuse();
+    const { snapshot, material, scope } = this.inspectScope(context, a.authoritySessionId, input.command.targetSessionId);
+    this.#capabilities.verifyProof(material, retainedEvidenceProofTarget(input, scope, proof.proofNonce), {
+      proofVersion: 1, target: "semantic-command", proofNonce: proof.proofNonce, proofFingerprint: proof.proofFingerprint });
+    return snapshot;
+  }
+  private inspectRead(invocation: RetainedEvidenceReadInvocationV1): RetainedEvidenceAuthoritySnapshotV1 {
+    const a = retainedExactRecord(invocation.authorization, ["kind", "authoritySessionId", "targetSessionId", "proof", "audience"]);
+    if (a.kind !== "bounded-operation" || typeof a.authoritySessionId !== "string" || a.targetSessionId !== invocation.targetSessionId) refuse();
+    const proof = retainedExactRecord(a.proof, ["proofVersion", "target", "proofNonce", "proofFingerprint"]);
+    if (proof.proofVersion !== 1 || proof.target !== "bounded-operation" || typeof proof.proofNonce !== "string" || typeof proof.proofFingerprint !== "string") refuse();
+    const { material, snapshot } = this.inspectScope(invocation.context, a.authoritySessionId as string, invocation.targetSessionId);
+    const target = retainedEvidenceReadProofTarget(invocation, material.claims.capabilityGeneration, proof.proofNonce as string);
+    const audience = retainedExactRecord(a.audience, ["presentingActorRole", "presentingClientInstanceId", "targetActorRole", "targetClientInstanceId"]);
+    if (audience.presentingActorRole !== target.presentingActorRole || audience.presentingClientInstanceId !== target.presentingClientInstanceId
+      || audience.targetActorRole !== target.targetActorRole || audience.targetClientInstanceId !== target.targetClientInstanceId) refuse();
+    // The existing verifier owns the real clock, nonce, MAC and expiry horizon.
+    this.#capabilities.verifyProof(material, target, { proofVersion: 1, target: "bounded-operation", proofNonce: proof.proofNonce as string, proofFingerprint: proof.proofFingerprint as string });
+    return snapshot;
+  }
+  verifyRead(invocation: RetainedEvidenceReadInvocationV1): VerifiedRetainedEvidenceReadAuthority {
+    try {
+      retainedExactRecord(invocation, ["context", "operationId", "requestId", "evidenceId", "targetSessionId", "expiresAt", "authorization"]);
+      const owned = boundedRetainedJson(invocation, 16_384).snapshot as unknown as RetainedEvidenceReadInvocationV1;
+      const snapshot = this.inspectRead(owned), handle = Object.freeze(Object.create(null)) as VerifiedRetainedEvidenceReadAuthority;
+      verifiedReads.set(handle, { connection: this.#connection, verifier: this, invocation: owned, snapshot });
+      return handle;
+    } catch { return refuse(); }
+  }
+  revalidateRead(handle: VerifiedRetainedEvidenceReadAuthority, evidenceId: string, recorded: RetainedEvidenceAuthoritySnapshotV1): RetainedEvidenceAuthoritySnapshotV1 {
+    const state = verifiedReads.get(handle);
+    if (!state || state.connection !== this.#connection || state.verifier !== this || state.invocation.evidenceId !== evidenceId) return refuse();
+    try {
+      const snapshot = this.inspectRead(state.invocation);
+      if (canonicalJson(snapshot) !== canonicalJson(state.snapshot) || canonicalJson(snapshot) !== canonicalJson(decodeRetainedEvidenceAuthority(recorded))) refuse("SESSION_HANDLE_STALE");
+      return snapshot;
+    } catch { return refuse(); }
   }
   verify(invocation: RetainedEvidenceInvocationV1): VerifiedRetainedEvidenceAuthority {
     const input = decodeRetainEvidenceBatch(invocation.input.command);
@@ -136,4 +187,19 @@ export class RetainedEvidenceAuthorityVerifier {
     if (canonicalJson(currentSnapshot) !== canonicalJson(state.snapshot)) refuse("SESSION_HANDLE_STALE");
     return currentSnapshot;
   }
+}
+
+/** Trusted scope and exact read selectors are recomputed, never caller-supplied hashes. */
+export function retainedEvidenceReadProofTarget(invocation: RetainedEvidenceReadInvocationV1, capabilityGeneration: string, proofNonce: string): BoundedOperationProofTargetV1 {
+  const uuid = (value: string): string => { if (!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(value)) refuse(); return value; };
+  const b = invocation.context.binding;
+  try { parseCanonicalTimestamp(invocation.expiresAt, "retained-read"); } catch { refuse(); }
+  const selectors = { projectId: b.projectId, vaultId: b.vaultId, storeId: b.storeId, workspaceId: b.workspaceId, clientNamespace: b.clientNamespace,
+    evidenceId: uuid(invocation.evidenceId), targetSessionId: uuid(invocation.targetSessionId), authoritySessionId: uuid(invocation.authorization.authoritySessionId),
+    presentingActorRole: b.actorRole, presentingClientInstanceId: b.clientInstanceId, targetActorRole: b.actorRole, targetClientInstanceId: b.clientInstanceId,
+    operationId: uuid(invocation.operationId), requestId: uuid(invocation.requestId), expiresAt: invocation.expiresAt };
+  return { proofVersion: 1, target: "bounded-operation", operationType: "read-retained-evidence", operationId: selectors.operationId, requestId: selectors.requestId,
+    operationHash: commandHash({ proofPurpose: "read-retained-evidence/v1", ...selectors }), authoritySessionId: selectors.authoritySessionId, targetSessionId: selectors.targetSessionId,
+    presentingActorRole: b.actorRole, presentingClientInstanceId: b.clientInstanceId, targetActorRole: b.actorRole, targetClientInstanceId: b.clientInstanceId,
+    capabilityGeneration, proofNonce, expiresAt: invocation.expiresAt };
 }

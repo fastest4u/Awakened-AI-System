@@ -1,9 +1,10 @@
 import type { ReadonlyJsonValue, StoredEvent } from "../contracts/event.js";
+import { assertRetainedStoredEvent } from "../privacy/retained-evidence-codec.js";
 import {
   authenticateStoredEvent,
   type StoredEventChainCursor,
 } from "../integrity/stored-event-authenticator.js";
-import { GENESIS_GLOBAL_HASH } from "../storage/event-store.js";
+import { GENESIS_GLOBAL_HASH } from "../storage/event-chain-constants.js";
 import type {
   SqliteConnection,
   SqliteDriver,
@@ -198,8 +199,8 @@ function storedEvent(row: SqliteRow): StoredEvent {
     confidence,
     verificationStatus,
     sourceRefs: stringArray(row, "source_refs_json"),
-    evidenceRefs: emptyArray(row, "evidence_refs_json"),
-    evidenceDigests: emptyArray(row, "evidence_digests_json"),
+    evidenceRefs: Object.freeze(json(string(row, "evidence_refs_json"))) as StoredEvent["evidenceRefs"],
+    evidenceDigests: Object.freeze(json(string(row, "evidence_digests_json"))) as StoredEvent["evidenceDigests"],
     payload,
     payloadJson,
     payloadHash: string(row, "payload_hash"),
@@ -207,6 +208,7 @@ function storedEvent(row: SqliteRow): StoredEvent {
     eventHash: string(row, "event_hash"),
     lifecycleIntentJson: nullableString(row, "lifecycle_intent_json"),
   });
+  try { assertRetainedStoredEvent(result); } catch { return integrity(); }
   return result;
 }
 

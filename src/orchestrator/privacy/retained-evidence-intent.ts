@@ -4,8 +4,7 @@ import type { TrustedRedactionPolicyV1 } from "./redaction.js";
 import { boundedRetainedJson, retainedExactRecord, RETAINED_EVIDENCE_LIMITS, RetainedEvidenceError, type BoundedEvidenceInputV1 } from "./evidence-contracts.js";
 import { decodeRetainedEvidenceAuthority, decodeRetainedEvidenceIntentWitness, retainedIdentifier } from "./retained-evidence-codec.js";
 import { evidenceMac, evidenceMacInput, requireEvidenceKey } from "./evidence-key-provider.js";
-import { createHash } from "node:crypto";
-export const RETAINED_EVIDENCE_COMMAND_DOMAIN = "project-memory/retained-evidence-command/v1";
+export { retainedEvidenceIntentHash, RETAINED_EVIDENCE_COMMAND_DOMAIN } from "./retained-evidence-codec.js";
 export const RETAINED_EVIDENCE_ORIGINAL_DOMAIN = "retained-evidence-original-input/v1";
 export const RETAINED_EVIDENCE_REDACTED_DOMAIN = "retained-evidence-redacted-content/v1";
 /** Nonsecret snapshot only; not an authorization handle. */
@@ -44,8 +43,4 @@ export function buildRetainedEvidenceIntent(input: BoundedEvidenceInputV1, admit
     const frames = input.command.frames.map(({ content: _content, ...frame }) => ({ ...frame, artifactHashes: [...frame.artifactHashes] }));
     return decodeRetainedEvidenceIntentWitness({ witnessVersion: 1, commandType: "retain-evidence-batch", authority, commandId: input.command.commandId, idempotencyKey: input.command.idempotencyKey, targetSessionId: input.command.targetSessionId, conversationId: input.command.conversationId, frames, policyId, policyVersion, originalCommitmentKeyRef, fingerprintKeyRef, originalInputCommitment });
   } finally { canonical?.fill(0); macInput?.fill(0); }
-}
-export function retainedEvidenceIntentHash(witness: RetainedEvidenceIntentWitnessV1): string {
-  const decoded = decodeRetainedEvidenceIntentWitness(witness);
-  return createHash("sha256").update(RETAINED_EVIDENCE_COMMAND_DOMAIN).update("\n").update(boundedRetainedJson(decoded, RETAINED_EVIDENCE_LIMITS.batchBytes).canonical).digest("hex");
 }

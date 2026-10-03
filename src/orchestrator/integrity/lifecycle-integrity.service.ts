@@ -1,4 +1,7 @@
 import { createHash } from "node:crypto";
+import { assertRetainedStoredEvent } from "../privacy/retained-evidence-codec.js";
+import { assertStoredRetainedEvidenceCorrespondence } from "./event-integrity.service.js";
+import { authenticateStoredEvent } from "./stored-event-authenticator.js";
 import type { StoredEvent } from "../contracts/event.js";
 import { outboxHash, payloadHash } from "../crypto/event-hash.js";
 import { canonicalJson } from "../serialization/canonical-json.js";
@@ -3945,7 +3948,17 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
       eventHash: row.event_hash,
       lifecycleIntentJson: nullableString("lifecycle_intent_json"),
     } as unknown as StoredEvent;
+    this.authenticateRetainedReplayEvent(event);
     return deeplyFreeze(event);
+  }
+
+  private authenticateRetainedReplayEvent(event: StoredEvent): void {
+    try {
+      if (assertRetainedStoredEvent(event) !== null) {
+        authenticateStoredEvent(event, { expectedPosition: event.globalPosition, previousEventHash: event.previousGlobalHash });
+        assertStoredRetainedEvidenceCorrespondence(this.connection, event);
+      }
+    } catch { throw new LifecycleError("INTEGRITY_FAILURE"); }
   }
 
   private checkLatestEvidenceEventProjection(context: ProjectContext): void {
@@ -4550,7 +4563,7 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
       || typeof row.event_hash !== "string"
       || !LOWER_HASH.test(row.event_hash)
     ) throw new LifecycleError("INTEGRITY_FAILURE");
-    return Object.freeze({
+    const event = Object.freeze({
       globalPosition: position,
       eventId: row.event_id,
       projectId: row.project_id,
@@ -4595,6 +4608,8 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
         ? row.lifecycle_intent_json
         : null,
     } as unknown as StoredEvent);
+    this.authenticateRetainedReplayEvent(event);
+    return event;
   }
 
   private decodeStoredLifecycleEvent(

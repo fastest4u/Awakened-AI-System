@@ -2,6 +2,7 @@ import type { StoredEvent } from "../contracts/event.js";
 import { eventHash, payloadHash } from "../crypto/event-hash.js";
 import { decodeLifecycleIntentWitness } from "../lifecycle/lifecycle-intent-witness.js";
 import { canonicalJson } from "../serialization/canonical-json.js";
+import { assertRetainedStoredEvent } from "../privacy/retained-evidence-codec.js";
 
 export interface StoredEventChainCursor {
   readonly expectedPosition: bigint;
@@ -79,6 +80,7 @@ export function authenticateStoredEvent(
   let canonicalPayloadJson: string | undefined;
   let computedPayloadHash: string | undefined;
   try {
+    assertRetainedStoredEvent(event);
     const payload = JSON.parse(event.payloadJson) as unknown;
     canonicalPayloadJson = canonicalJson(payload);
     computedPayloadHash = payloadHash(payload);
