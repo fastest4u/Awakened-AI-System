@@ -1,5 +1,12 @@
 import assert from "node:assert/strict";
 import { randomBytes, randomUUID } from "node:crypto";
+import { existsSync, readFileSync, readdirSync, lstatSync, mkdtempSync, realpathSync, rmSync, mkdirSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { tmpdir } from "node:os";
+import { spawn, spawnSync } from "node:child_process";
+import { once } from "node:events";
+import { createHash } from "node:crypto";
 import { MessageChannel, Worker } from "node:worker_threads";
 import { DatabaseSync } from "node:sqlite";
 import { test } from "node:test";
@@ -14,6 +21,11 @@ import { MaintenanceFence } from "../src/orchestrator/storage/maintenance-fence.
 import { makeRetainedEvidenceFixture, type RetainedEvidenceFixture } from "./support/retained-evidence-fixture.js";
 import { FRESH_NOW, FRESH_IDENTITY } from "./support/fresh-start-fixture.js";
 import type { RetainedEvidenceFaultInjector } from "../src/orchestrator/privacy/retained-evidence.service.js";
+import { classifyCoverageOnlyVerificationTerminalActionV1, deriveEffectiveQualityPolicyV1 } from "../src/orchestrator/lifecycle/session-end-policy.js";
+import { openEvidenceItem } from "../src/orchestrator/privacy/evidence-envelope.js";
+import { canonicalJson } from "../src/orchestrator/serialization/canonical-json.js";
+import { computeProjectContextFingerprint } from "../src/orchestrator/identity/project-binding.service.js";
+import { context as storeContext } from "./fixtures/fresh-start-admission-child.js";
 
 const WORKER_URL = new URL("./fixtures/project-store-retained-evidence-worker.js", import.meta.url);
 function factory(f: RetainedEvidenceFixture, faults?: RetainedEvidenceFaultInjector) {
@@ -40,10 +52,12 @@ function request(f: RetainedEvidenceFixture, value: unknown) {
   return decodeWorkerRequest({ id: randomUUID(), type: "retained-evidence", binding: encodeWorkerBindingAssertion(f.projectContext),
     prepared: encodePreparedRetainedEvidenceCommand(prepared(f, value)) });
 }
-async function nativeExecutor(f: RetainedEvidenceFixture, compose = true) {
+async function nativeExecutor(f: RetainedEvidenceFixture, compose = true, options: { loseAcknowledgement?: boolean; observeReply?: (value: unknown) => void; output?: Buffer[] } = {}) {
   const channel = new MessageChannel();
   const worker = new Worker(WORKER_URL, { workerData: { port: channel.port2, policy: f.policy,
-    buildHash: f.admission.trusted.measuredBuildHash, compose }, transferList: [channel.port2] });
+    buildHash: f.admission.trusted.measuredBuildHash, compose }, transferList: [channel.port2], stdout: true, stderr: true });
+  worker.stdout.on("data", bytes => { options.output?.push(Buffer.from(bytes)); });
+  worker.stderr.on("data", bytes => { options.output?.push(Buffer.from(bytes)); });
   const exits: number[] = [];
   const exited = new Promise<number>(resolve => worker.on("exit", code => { exits.push(code); channel.port1.close(); resolve(code); }));
   let sequence = 0;
@@ -67,9 +81,25 @@ async function nativeExecutor(f: RetainedEvidenceFixture, compose = true) {
       if (value instanceof Uint8Array) value.fill(0);
     }
   });
+  let retainedId: string | undefined;
+  const proxy: WorkerLike = {
+    postMessage(value) { if ((value as any)?.type === "retained-evidence") retainedId = (value as any).id; worker.postMessage(value); },
+    terminate: () => worker.terminate(),
+    on(event: any, listener: any) {
+      if (event === "message") worker.on("message", value => {
+        if (value.id === retainedId) {
+          options.observeReply?.(value);
+          if (options.loseAcknowledgement && value.ok === true) { void worker.terminate(); return; }
+        }
+        listener(value);
+      });
+      else worker.on(event, listener);
+      return this;
+    },
+  };
   const executor = new ProjectStoreExecutor({ workerUrl: WORKER_URL, context: f.projectContext, freshStart: f.admission.trusted,
     maxPending: 128, requestTimeoutMs: 15_000, closeTimeoutMs: 5_000, executorLeaseMs: 15_000, heartbeatIntervalMs: 5_000 },
-    { workerFactory: () => worker as WorkerLike });
+    { workerFactory: () => proxy });
   try { await executor.open(); } catch (error) { await executor.close(); await exited; throw error; }
   return { executor, exits, async close() { await executor.close(); await exited; assert.equal(exits.length, 1); } };
 }
@@ -92,6 +122,249 @@ test("private wire preserves original command and separately protected proof", a
       assert.deepEqual(decoded.authorization, invocation.authorization);
     } finally { invocation.input.canonicalOriginalBytes.fill(0); }
   } finally { await fixture.cleanup(); }
+});
+
+// Catches acknowledgement loss being mistaken for rollback or replaced on restart.
+test("compiled private composition retains and reopens synthetic batch", async t => {
+  const f = await makeRetainedEvidenceFixture();
+  try {
+    const original = command(f.rootAuthority.sessionId); let observed: any;
+    const first = await nativeExecutor(f, true, { loseAcknowledgement: true, observeReply: value => { observed = value; } });
+    try { await assert.rejects(first.executor.retainEvidence(prepared(f, original)), { code: "COMMAND_OUTCOME_UNKNOWN", details: { commandId: original.commandId, idempotencyKey: original.idempotencyKey } }); }
+    finally { await first.close(); }
+    assert.ok(observed?.ok === true, "successful native commit reply was not observed");
+    const accepted = observed.data, rows = f.rows();
+    for (const purpose of ["data-key-wrap", "original-input-commitment", "redacted-content-fingerprint"] as const) f.provider.rotate(purpose);
+    f.reopen(); const second = await nativeExecutor(f);
+    try {
+      const reopened = await second.executor.retainEvidence(prepared(f, original));
+      assert.deepEqual(reopened.response, accepted.response); assert.deepEqual(reopened.eventIds, accepted.eventIds);
+      assert.equal(reopened.deduplicated, true); assert.deepEqual(f.rows(), rows);
+    } finally { await second.close(); }
+    const policy = deriveEffectiveQualityPolicyV1({ trustedProfiles: [{ profileId: "retained-acceptance", profileVersion: 1, required: true, weight: 1 }], optionalProfiles: [], requestedProfileIds: [],
+      requestedQualityThreshold: 0, trustedMinimumQualityThreshold: 0, trustedRequireFullEvidence: true,
+      requestedRequireFullEvidence: false, trustedRequireMaterialization: false, requestedRequireMaterialization: false });
+    assert.equal(policy.requireFullEvidence, true);
+    assert.throws(() => classifyCoverageOnlyVerificationTerminalActionV1(policy, { action: "record-verification-passed" }), { code: "EVIDENCE_CAPTURE_INCOMPLETE" });
+    t.diagnostic(JSON.stringify({ scope: "synthetic-native-retained-reopen", workerExits: [...first.exits, ...second.exits], strictPolicyRefused: true }));
+  } finally { await f.cleanup(); }
+});
+
+test("fixed retained runner rejects unknown groups before compiler or build", async () => {
+  const url = new URL("../../scripts/run-v2-retained-evidence.js", import.meta.url);
+  let module: any;
+  try { module = await import(url.href); } catch (error) { if ((error as any).code !== "ERR_MODULE_NOT_FOUND") throw error; }
+  assert.equal(typeof module?.runRetainedEvidenceGate, "function", "fixed retained acceptance runner is absent");
+  assert.equal(await module.runRetainedEvidenceGate({ group: "unknown" }), 1);
+  const result = spawnSync(process.execPath, [fileURLToPath(url), "--group", "unknown"], { encoding: "utf8", windowsHide: true });
+  assert.equal(result.status, 1); assert.match(result.stderr, /RETAINED_EVIDENCE_ARGUMENTS_INVALID/);
+});
+
+const encodeObserved = (value: unknown) => Buffer.from(JSON.stringify(value, (_key, item: unknown) => typeof item === "bigint" ? item.toString() : item));
+function scanSurfaces(surfaces: readonly Buffer[], needles: readonly Buffer[]): boolean {
+  return surfaces.every(surface => needles.every(needle => !surface.includes(needle)));
+}
+function durableSurfaces(f: RetainedEvidenceFixture) {
+  const tables = f.connection.prepare("SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name").all();
+  const rows = tables.map(row => encodeObserved(f.connection.prepare(`SELECT * FROM "${String(row.name).replaceAll('"', '""')}"`).all()));
+  const files: Buffer[] = [], names: string[] = [];
+  function visit(root: string) {
+    for (const item of readdirSync(root, { withFileTypes: true })) {
+      assert.equal(item.isSymbolicLink(), false, "unexpected link in owned storage");
+      const path = join(root, item.name);
+      if (item.isDirectory()) visit(path);
+      else if (item.isFile()) { files.push(readFileSync(path)); names.push(item.name); }
+      else assert.fail("unexpected owned storage entry");
+    }
+  }
+  visit(f.root);
+  assert.ok(tables.some(row => row.name === "outbox"));
+  assert.ok(names.includes("events.sqlite") && names.includes("events.sqlite-wal"), "live database and WAL must be scanned before close");
+  return { buffers: [...rows, ...files], tables: tables.length, files: files.length };
+}
+
+// Catches plaintext durable writes, error interpolation, losing ciphertext/key leaks,
+// and provider exceptions escaping the real private/native boundaries.
+test("synthetic originals absent from durable and output surfaces", async t => {
+  const f = await makeRetainedEvidenceFixture(), surfaces: Buffer[] = [], dataKeys: Buffer[] = [];
+  const secret = `fixture_${randomBytes(20).toString("hex")}`, original = `visible-${randomUUID()} ${secret}`;
+  const needles: Buffer[] = [Buffer.from(secret), Buffer.from(original)];
+  const wrap = f.provider.wrap.bind(f.provider), unwrap = f.provider.unwrap.bind(f.provider);
+  let wrapped = 0, unwrapped = 0, providerFailure = false, snapshots = 0, tableCount = 0, fileCount = 0;
+  f.provider.wrap = (...args) => { dataKeys.push(Buffer.from(args[2])); wrapped++; if (providerFailure) throw new Error(secret); return wrap(...args); };
+  f.provider.unwrap = (...args) => { const value = unwrap(...args); dataKeys.push(Buffer.from(value)); unwrapped++; return value; };
+  const value = () => { const result = command(f.rootAuthority.sessionId); result.frames[0]!.content = original; return result; };
+  const snapshot = () => { const durable = durableSurfaces(f); surfaces.push(...durable.buffers); snapshots++; tableCount = durable.tables; fileCount += durable.files; };
+  const observeError = (error: unknown) => { const value = error as any; surfaces.push(encodeObserved({ name: value.name, message: value.message, code: value.code, details: value.details, stack: value.stack })); return true; };
+  const stdout = process.stdout.write, stderr = process.stderr.write;
+  // Preserve node:test's private transport; observation must not swallow its records.
+  process.stdout.write = function (this: typeof process.stdout, chunk: any, ...args: any[]) {
+    surfaces.push(Buffer.isBuffer(chunk) ? Buffer.from(chunk) : Buffer.from(String(chunk)));
+    return Reflect.apply(stdout, this, [chunk, ...args]);
+  } as typeof stdout;
+  process.stderr.write = function (this: typeof process.stderr, chunk: any, ...args: any[]) {
+    surfaces.push(Buffer.isBuffer(chunk) ? Buffer.from(chunk) : Buffer.from(String(chunk)));
+    return Reflect.apply(stderr, this, [chunk, ...args]);
+  } as typeof stderr;
+  try {
+    const native = await nativeExecutor(f, true, { output: surfaces, observeReply: reply => surfaces.push(encodeObserved(reply)) });
+    try { surfaces.push(encodeObserved(await native.executor.retainEvidence(prepared(f, value())))); }
+    finally { await native.close(); }
+    snapshot();
+    const item = JSON.parse(String(f.connection.prepare("SELECT encrypted_item_json FROM retained_evidence_blobs").get()!.encrypted_item_json));
+    const redacted = openEvidenceItem(item.binding, item, f.provider);
+    assert.ok(!String(redacted.content).includes(secret), "authenticated content still contains synthetic credential");
+    // A native provider failure still uses the parent provider's actual wrap boundary.
+    providerFailure = true;
+    const failed = await nativeExecutor(f, true, { output: surfaces, observeReply: reply => surfaces.push(encodeObserved(reply)) });
+    try { await assert.rejects(failed.executor.retainEvidence(prepared(f, value())), observeError); }
+    finally { await failed.close(); providerFailure = false; }
+    snapshot();
+    let armed = false;
+    const baseFactory = factory(f, { hit(boundary) { if (boundary === "before-begin") armed = true; } });
+    const backend = await openedBackend(f, { create(input) {
+      const exec = input.connection.exec.bind(input.connection);
+      input.connection.exec = sql => { if (armed && sql === "COMMIT") throw new Error(secret); return exec(sql); };
+      return baseFactory.create(input);
+    } });
+    try { await assert.rejects(backend.dispatch(request(f, value())), observeError); }
+    finally { await backend.close(); }
+    snapshot();
+    const raced = value(), a = f.prepareWorker(raced); await a.reached;
+    const b = f.prepareWorker(raced); await b.reached;
+    a.release(); const accepted = await a.result; b.release(); const replay = await b.result;
+    assert.ok(accepted.ok && replay.ok, "native race did not complete");
+    if (accepted.ok && replay.ok) assert.deepEqual(accepted.value.response, replay.value.response);
+    surfaces.push(encodeObserved(accepted), encodeObserved(replay)); snapshot();
+    assert.deepEqual(f.workerExits, [0, 0]);
+    // Scan actual generated human report bytes as well as actual native/process output.
+    const report = join(process.cwd(), "docs/superpowers/reports/2026-10-02-v2-retained-evidence-acceptance.md");
+    if (existsSync(report)) surfaces.push(readFileSync(report));
+    assert.ok(wrapped >= 5 && unwrapped === 1, "actual wrap/unwrap DATA-key observations missing");
+    for (const key of dataKeys) needles.push(key, Buffer.from(key.toString("hex")), Buffer.from(key.toString("base64")), Buffer.from(key.toString("base64url")), encodeObserved([...key]));
+    // Negative control proves the scanner rejects an observed buffer carrying a key or original.
+    assert.equal(scanSurfaces([Buffer.from(original)], needles), false);
+    assert.equal(scanSurfaces([Buffer.from(dataKeys[0]!)], needles), false);
+    assert.equal(scanSurfaces(surfaces, needles), true, "synthetic private bytes found in observed surface");
+  } finally {
+    process.stdout.write = stdout; process.stderr.write = stderr;
+    for (const bytes of [...dataKeys, ...needles, ...surfaces]) bytes.fill(0);
+    await f.cleanup();
+  }
+  t.diagnostic(JSON.stringify({ scope: "raw-storage-all-tables-outbox-WAL-output-errors-report", snapshots, tableCount, fileCount, wrapped, unwrapped, observations: surfaces.length, raceWorkerExits: f.workerExits }));
+});
+
+test("shared fixed-stage runner observes actual native output and refuses overlapping output ownership", { skip: process.platform !== "win32" }, async t => {
+  const module = await import(new URL("../../scripts/run-v2-internal-verified-read.js", import.meta.url).href);
+  assert.equal(typeof module.runFixedStages, "function");
+  const root = realpathSync.native(mkdtempSync(join(tmpdir(), "retained-gate-"))), identity = lstatSync(root, { bigint: true });
+  const receipts: any[] = [], output: Buffer[] = []; let entered!: () => void, release!: () => void;
+  const started = new Promise<void>(resolve => { entered = resolve; }), held = new Promise<void>(resolve => { release = resolve; });
+  const stages = () => [["probe", ["-e", "process.stdout.write('observed-native-output');process.stderr.write('observed-native-error')"]]];
+  const run = module.runFixedStages({ root, maximumMs: 30000, timeoutMs: 30000, profile: "fixture", stages,
+    beforeStages: async () => { entered(); await held; }, forwardOutput: false,
+    observeOutput: (_stage: string, _kind: string, bytes: Buffer) => output.push(Buffer.from(bytes)), observeStage: (value: unknown) => receipts.push(value) });
+  try {
+    await started;
+    assert.equal(await module.runFixedStages({ root, maximumMs: 30000, timeoutMs: 30000, profile: "fixture", stages }), 1);
+    const retained = await import(new URL("../../scripts/run-v2-retained-evidence.js", import.meta.url).href);
+    assert.equal(await retained.runRetainedEvidenceGate({ root }), 1);
+    assert.equal(receipts.length, 0); release(); assert.equal(await run, 0);
+    assert.equal(receipts.length, 1); assert.equal(receipts[0].nativeCode, 0); assert.equal(receipts[0].cleanup, "complete");
+    assert.equal(receipts[0].closure, "windows-job-active-zero");
+    assert.ok(Buffer.concat(output).includes(Buffer.from("observed-native-output")));
+    assert.ok(Buffer.concat(output).includes(Buffer.from("observed-native-error")));
+    assert.equal(existsSync(join(root, ".fresh-start-foundation.lock")), false);
+    t.diagnostic(JSON.stringify({ scope: "shared-fixed-stages", nativeCode: receipts[0].nativeCode, closure: receipts[0].closure, outputBytes: Buffer.concat(output).length }));
+  } finally {
+    release(); await run;
+    const current = lstatSync(root, { bigint: true });
+    if (!existsSync(join(root, ".fresh-start-foundation.lock")) && current.dev === identity.dev && current.ino === identity.ino && !current.isSymbolicLink()) rmSync(root, { recursive: true });
+  }
+});
+
+// This is the real measured prepared deployment, never the synthetic active fixture.
+test("compiled prepared service remains status only", async t => {
+  const root = realpathSync.native(mkdtempSync(join(tmpdir(), "retained-prepared-"))), identity = lstatSync(root, { bigint: true });
+  const vault = join(root, "vault"), archive = join(root, "archive"), releaseId = randomUUID(), outputs: Buffer[] = [];
+  const build = JSON.parse(readFileSync(join(process.cwd(), "dist/v2-build.json"), "utf8"));
+  for (const artifact of build.artifacts) assert.equal(createHash("sha256").update(readFileSync(join(process.cwd(), "dist", artifact.path))).digest("hex"), artifact.sha256);
+  const hash = (value: unknown) => createHash("sha256").update(canonicalJson(value)).digest("hex");
+  const env = { ...process.env, MEMORY_PROJECT_ROOT: root, MEMORY_V2_VAULT_PATH: vault, MEMORY_V1_ARCHIVE_PATH: archive, MEMORY_V2_RELEASE_ID: releaseId };
+  mkdirSync(archive);
+  writeFileSync(join(root, "release.json"), JSON.stringify({ initializationId: randomUUID(), release: { profileVersion: 1, releaseId,
+    buildIdentityHash: build.buildIdentityHash, schemaIdentityHash: "f10eb1976f2fd97d899163d930a91e21f66daaccf448a76334d5c9b13ffd6df1",
+    configurationHash: hash({ projectRoot: root, v2VaultRoot: vault, v1ArchiveRoot: archive, releaseId }),
+    capabilityManifestHash: hash({ profile: "fresh-start", version: 1, tools: ["memory_v2Status"], content: "unavailable" }),
+    recoveryPolicyHash: hash({ profile: "fresh-start", version: 1, productionReady: false, promotion: "closed" }),
+    evidenceDigest: hash({ purpose: "retained-prepared-admission" }), createdAt: new Date().toISOString() } }));
+  const admin = (operation: string) => {
+    const result = spawnSync(process.execPath, [join(process.cwd(), "dist/v2-admin.js"), operation, "--project-root", root,
+      "--v2-vault-root", vault, "--v1-archive-root", archive, "--release-manifest", join(root, "release.json")], { env, encoding: "utf8", windowsHide: true, timeout: 20000 });
+    assert.equal(result.error, undefined, "measured admin did not close"); outputs.push(Buffer.from(result.stdout), Buffer.from(result.stderr)); return result;
+  };
+  let allClosed = true;
+  try {
+    const initialized = admin("initialize-fresh"); assert.equal(initialized.status, 0, "measured preparation failed");
+    const status = JSON.parse(initialized.stdout); assert.equal(status.mode, "prepared"); assert.equal(status.productionReady, false);
+    const promotion = admin("activate"); assert.equal(promotion.status, 1); assert.match(promotion.stderr, /FRESH_START_RELEASE_NOT_READY/);
+    const child = spawn(process.execPath, [join(process.cwd(), "dist/v2.js")], { env, windowsHide: true, stdio: ["pipe", "pipe", "pipe"] });
+    allClosed = false;
+    const closed = new Promise<number | null>(resolve => child.once("close", code => { allClosed = true; resolve(code); }));
+    let pending = "", sequence = 0; const replies = new Map<number, (value: any) => void>();
+    child.stderr.on("data", bytes => outputs.push(Buffer.from(bytes)));
+    child.stdout.on("data", bytes => {
+      outputs.push(Buffer.from(bytes)); pending += bytes.toString("utf8");
+      let end: number;
+      while ((end = pending.indexOf("\n")) >= 0) {
+        const line = pending.slice(0, end); pending = pending.slice(end + 1);
+        try { const value = JSON.parse(line); replies.get(value.id)?.(value); } catch { child.kill(); }
+      }
+    });
+    async function call(method: string, params: unknown) {
+      const id = ++sequence; let timer: ReturnType<typeof setTimeout> | undefined;
+      try { return await new Promise<any>((resolve, reject) => {
+        timer = setTimeout(() => reject(new Error("measured protocol deadline")), 15000);
+        replies.set(id, resolve); child.stdin.write(JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n");
+      }); } finally { clearTimeout(timer); replies.delete(id); }
+    }
+    let childCode: number | null;
+    try {
+      await call("initialize", { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "retained-acceptance", version: "1" } });
+      child.stdin.write('{"jsonrpc":"2.0","method":"notifications/initialized"}\n');
+      const publicTools = (await call("tools/list", {})).result.tools.map((tool: any) => tool.name);
+      assert.deepEqual(publicTools, ["memory_v2Status"]);
+      const publicStatus = JSON.parse((await call("tools/call", { name: "memory_v2Status", arguments: {} })).result.content[0].text);
+      assert.equal(publicStatus.productionReady, false); assert.deepEqual(publicStatus, status);
+      for (const name of ["retain-evidence-batch", "memory_sessionEnd", "memory_v2Activate"])
+        assert.equal((await call("tools/call", { name, arguments: {} })).error.data.code, "FRESH_START_RELEASE_NOT_READY");
+    } finally {
+      child.stdin.end(); const timer = setTimeout(() => child.kill(), 3000);
+      try { childCode = await closed; } finally { clearTimeout(timer); }
+    }
+    assert.equal(childCode, 0, "measured service did not close cleanly");
+    const path = join(vault, ".memory-mcp/v2/events.sqlite"), context = storeContext(join(vault, ".memory-mcp/v2"), path);
+    const scope = { projectId: status.projectId, vaultId: status.vaultId, storeId: status.storeId };
+    Object.assign(context.binding, scope); context.binding.contextFingerprint = computeProjectContextFingerprint(context.binding);
+    const worker = new Worker(pathToFileURL(join(process.cwd(), "dist/workers/project-store.worker.js")), { workerData: { role: "store", executorLeaseMs: 15000, heartbeatIntervalMs: 5000, appendRetryDeadlineMs: 1000 }, stdout: true, stderr: true });
+    allClosed = false;
+    worker.stdout.on("data", bytes => outputs.push(Buffer.from(bytes))); worker.stderr.on("data", bytes => outputs.push(Buffer.from(bytes)));
+    const exit = once(worker, "exit"); let workerCode: number;
+    try {
+      const reply = once(worker, "message"), timer = setTimeout(() => { void worker.terminate(); }, 15000);
+      worker.postMessage({ id: "open", type: "open", binding: encodeWorkerBinding(context), freshStart: { identity: scope, releaseId, generation: "0", measuredBuildHash: build.buildIdentityHash } });
+      let response: any; try { [response] = await Promise.race([reply, exit.then(() => { throw new Error("measured worker exited before refusal"); })]); } finally { clearTimeout(timer); }
+      outputs.push(encodeObserved(response)); assert.equal(response.ok, false); assert.equal(response.error.code, "FRESH_START_ADMISSION_DENIED");
+    } finally { await worker.terminate(); [workerCode] = await exit; allClosed = true; }
+    assert.ok(outputs.every(bytes => !bytes.includes(Buffer.from(root))), "measured output disclosed owned path");
+    t.diagnostic(JSON.stringify({ scope: "measured-prepared-status-refusal", buildIdentityHash: build.buildIdentityHash, childCode, workerCode,
+      workerTermination: "intentional-after-admission-refusal", desktopQualification: "nine-rows-unverified" }));
+  } finally {
+    for (const bytes of outputs) bytes.fill(0);
+    const current = lstatSync(root, { bigint: true });
+    assert.ok(allClosed && current.dev === identity.dev && current.ino === identity.ino && !current.isSymbolicLink(), "prepared cleanup unconfirmed; preserving owned root");
+    rmSync(root, { recursive: true });
+  }
 });
 test("private wire rejects weakened authorization and caller hash", () => {
   const original = command(randomUUID());

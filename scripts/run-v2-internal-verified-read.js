@@ -25,7 +25,7 @@ const powershell = 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.e
 /** One response deadline; advancement requires positive kernel Job closure,
  * direct stage exit and drained output. Unsupported containment fails closed.
  */
-function runChild(args, root, deadline, signal, profile) {
+function runChild(args, root, deadline, signal, profile, observeOutput, forwardOutput = true) {
   return new Promise(resolveResult => {
     if (signal?.aborted) { resolveResult({ code: 130, uncertain: false }); return; }
     if (performance.now() >= deadline) { resolveResult({ code: 124, uncertain: false }); return; }
@@ -33,7 +33,7 @@ function runChild(args, root, deadline, signal, profile) {
     const env = { ...process.env }; delete env.NODE_TEST_CONTEXT;
     const child = spawn(powershell, ['-NoProfile', '-NonInteractive', '-File', jobBridge],
       { cwd: root, stdio: ['pipe', 'pipe', 'pipe'], shell: false, env, windowsHide: true });
-    child.stderr.pipe(process.stderr, { end: false });
+    child.stderr.on('data', bytes => { observeOutput?.('bridge-stderr', bytes); if (forwardOutput) process.stderr.write(bytes); });
     let finished = false, stopped = 0, ready = false, started = false, directExit = false, proof, buffer = '', cleanupTimer, cleanupDeadline;
     const cancel = () => stop(130);
     const timer = setTimeout(() => stop(124), Math.max(1, deadline - performance.now()));
@@ -47,7 +47,7 @@ function runChild(args, root, deadline, signal, profile) {
         try { child.kill('SIGKILL'); } catch {}
         child.stdin.destroy(); child.stdout.destroy(); child.stderr.destroy(); child.unref();
       } else child.stdin.end();
-      resolveResult({ code, uncertain, closure: uncertain ? undefined : 'windows-job-active-zero' });
+      resolveResult({ code, nativeCode: proof?.nativeCode, uncertain, closure: uncertain ? undefined : 'windows-job-active-zero' });
     }
     function beginCleanup() {
       if (cleanupDeadline !== undefined) return;
@@ -81,14 +81,15 @@ function runChild(args, root, deadline, signal, profile) {
             && Number.isInteger(value.nativeCode) && Number.isSafeInteger(value.activeProcesses) && value.activeProcesses >= 0) {
             directExit = true;
             if (value.nativeCode !== 0) beginCleanup();
-            process.stdout.write(JSON.stringify({ gate: 'v2-internal-verified-read', observation: 'direct-child-exit',
+            if (forwardOutput) process.stdout.write(JSON.stringify({ gate: 'v2-internal-verified-read', observation: 'direct-child-exit',
               profile, code: value.nativeCode, activeProcesses: value.activeProcesses }) + '\n');
           } else if ((value.kind === 'stdout' || value.kind === 'stderr') && started && !proof
             && Object.keys(value).length === 2 && typeof value.bytes === 'string'
             && /^[A-Za-z0-9+/]*={0,2}$/.test(value.bytes)) {
             // Stage bytes never become protocol frames: only the private bridge
             // can emit metadata from its separately captured native pipes.
-            (value.kind === 'stdout' ? process.stdout : process.stderr).write(Buffer.from(value.bytes, 'base64'));
+            const bytes = Buffer.from(value.bytes, 'base64'); observeOutput?.(value.kind, bytes);
+            if (forwardOutput) (value.kind === 'stdout' ? process.stdout : process.stderr).write(bytes);
           } else if (value.kind === 'closure' && ready && (!started || directExit) && !proof && Object.keys(value).length === 3
             && value.activeProcesses === 0 && Number.isInteger(value.nativeCode)) proof = value;
           else throw new Error('JOB_FRAME_INVALID');
@@ -107,10 +108,24 @@ function runChild(args, root, deadline, signal, profile) {
 
 /** Internal fixture seam; the CLI always runs this checkout's fixed operation. */
 export async function runVerifiedReadGate({ root = repository, timeoutMs, signal, profile = 'metadata' } = {}) {
+  if (profile !== 'metadata' && profile !== 'native-content') { process.stderr.write('VERIFIED_READ_GATE_FAILED\n'); return 1; }
+  const maximumMs = profile === 'native-content' ? 1500000 : 900000;
+  return runFixedStages({ root, timeoutMs, maximumMs, signal, profile,
+    stages: root => [['build', [join(root, 'scripts/build.js')]],
+      ['compile', [join(root, 'node_modules/typescript/bin/tsc'), '-p', 'tsconfig.test.json']],
+      ...(profile === 'metadata' ? targets : nativeTargets).map(name => [name, ['--test', '--test-concurrency=1', '--test-reporter=spec', join(root, `dist-test/tests/${name}.test.js`)]]),
+      ['smoke', [join(root, 'scripts/smoke-v2-fresh-start.js')]]],
+    passed: profile === 'metadata' ? 'PASS internal verified-read: measured build, one compile, twenty serial files and smoke\n'
+      : `PASS native content: measured build, one compile, ${nativeTargets.length} serial files and smoke\n` });
+}
+
+/** Internal fixed-runner seam, never exposed as arbitrary CLI stages or roots.
+ * Owns the common exclusive output lock and native closure before advancement. */
+export async function runFixedStages({ root = repository, timeoutMs, maximumMs, signal, profile, stages,
+  beforeStages, afterStages, observeOutput, observeStage, forwardOutput = true,
+  gate = 'v2-internal-verified-read', failure = 'VERIFIED_READ_GATE_FAILED', passed = '' }) {
   const arrival = performance.now(); let descriptor, identity, lock, retainLock = false, result = 1;
   try {
-    if (profile !== 'metadata' && profile !== 'native-content') throw new Error('VERIFIED_READ_PROFILE_INVALID');
-    const maximumMs = profile === 'native-content' ? 1500000 : 900000;
     if (timeoutMs === undefined) timeoutMs = maximumMs;
     if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > maximumMs) throw new Error('VERIFIED_READ_DEADLINE_INVALID');
     const deadline = arrival + timeoutMs;
@@ -119,22 +134,25 @@ export async function runVerifiedReadGate({ root = repository, timeoutMs, signal
     try { descriptor = openSync(lock, 'wx', 0o600); }
     catch (error) { if (error.code === 'EEXIST') throw new Error('FOUNDATION_OUTPUT_BUSY'); throw error; }
     identity = fstatSync(descriptor, { bigint: true });
-    const stages = [['build', [join(root, 'scripts/build.js')]],
-      ['compile', [join(root, 'node_modules/typescript/bin/tsc'), '-p', 'tsconfig.test.json']],
-      ...(profile === 'metadata' ? targets : nativeTargets).map(name => [name, ['--test', '--test-concurrency=1', '--test-reporter=spec', join(root, `dist-test/tests/${name}.test.js`)]]),
-      ['smoke', [join(root, 'scripts/smoke-v2-fresh-start.js')]]];
-    for (const [stage, args] of stages) {
-      const started = performance.now(); const child = await runChild(args, root, deadline, signal, profile);
-      process.stdout.write(JSON.stringify({ gate: 'v2-internal-verified-read', profile, totalMs: timeoutMs, stage, code: child.code,
-        durationMs: performance.now() - started, elapsedMs: performance.now() - arrival, cleanup: child.uncertain ? 'incomplete' : 'complete', closure: child.closure }) + '\n');
+    await beforeStages?.(root);
+    for (const [stage, args] of stages(root)) {
+      const started = performance.now(); const child = await runChild(args, root, deadline, signal, profile,
+        observeOutput && ((kind, bytes) => observeOutput(stage, kind, bytes)), forwardOutput);
+      const receipt = { gate, profile, totalMs: timeoutMs, stage, code: child.code,
+        durationMs: performance.now() - started, elapsedMs: performance.now() - arrival, cleanup: child.uncertain ? 'incomplete' : 'complete', closure: child.closure };
       result = child.code;
+      // Set uncertainty before invoking any observer: a throwing consumer cannot release the lock.
+      if (child.uncertain) retainLock = true;
+      if (observeStage) await observeStage({ ...receipt, nativeCode: child.nativeCode }, root);
+      else process.stdout.write(JSON.stringify(receipt) + '\n');
       if (child.uncertain) { retainLock = true; result = 1; break; }
       if (result !== 0) break;
     }
     if (signal?.aborted && result === 0) result = 130;
     if (performance.now() >= deadline && result === 0) result = 124;
+    if (result === 0) await afterStages?.(root);
   } catch (error) {
-    process.stderr.write((error.message === 'FOUNDATION_OUTPUT_BUSY' ? error.message : 'VERIFIED_READ_GATE_FAILED') + '\n');
+    process.stderr.write((error.message === 'FOUNDATION_OUTPUT_BUSY' ? error.message : failure) + '\n');
     result = 1;
   } finally {
     if (descriptor !== undefined) {
@@ -148,9 +166,7 @@ export async function runVerifiedReadGate({ root = repository, timeoutMs, signal
       } finally { if (descriptor !== undefined) { try { closeSync(descriptor); } catch {} } }
     }
   }
-  if (result === 0) process.stdout.write(profile === 'metadata'
-    ? 'PASS internal verified-read: measured build, one compile, twenty serial files and smoke\n'
-    : `PASS native content: measured build, one compile, ${nativeTargets.length} serial files and smoke\n`);
+  if (result === 0) process.stdout.write(passed);
   return result;
 }
 
