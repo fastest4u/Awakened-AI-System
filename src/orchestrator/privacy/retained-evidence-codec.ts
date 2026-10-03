@@ -3,7 +3,7 @@ import type { EvidenceItemBindingV1, EvidenceItemMetadataV1, EncryptedEvidenceIt
 import type { EvidenceKeyRefV1, WrappedEvidenceKeyV1 } from "./evidence-key-provider.js";
 import type { RetainedEvidenceAuthoritySnapshotV1, RetainedEvidenceIntentWitnessV1 } from "./retained-evidence-intent.js";
 import { assertRetainedByteLimit, boundedRetainedJson, decodeRetainEvidenceBatch, decodeRetainedEvidenceReceipt, retainedDataEntries, retainedExactRecord, retainedStringMetrics, RETAINED_EVIDENCE_LIMITS, RetainedEvidenceError, type RetainedEvidenceReceiptV1 } from "./evidence-contracts.js";
-import { parseCanonicalTimestamp, parseUnsignedDecimal } from "../lifecycle/contracts/identifiers.js";
+import { parseCanonicalTimestamp, parseCanonicalUuid, parseUnsignedDecimal } from "../lifecycle/contracts/identifiers.js";
 import { canonicalJson } from "../serialization/canonical-json.js";
 import type { JsonValue } from "../contracts/event.js";
 import type { RedactionSpanV1 } from "./redaction.js";
@@ -19,6 +19,8 @@ export function retainedIdentifier(value: unknown): string {
   const metrics = retainedStringMetrics(value, 512, FORMAT); if (metrics.scalars === 0 || metrics.scalars > 128) closed(); return value as string;
 }
 function hash(value: unknown): string { if (typeof value !== "string" || !/^[0-9a-f]{64}$/.test(value)) closed(); return value; }
+/** Existing trusted scope identity permits canonical lowercase UUID versions 1-5. */
+function scopeUuid(value: unknown): string { try { return parseCanonicalUuid(value, "retained-scope"); } catch { return closed(); } }
 function uuid(value: unknown): string { if (typeof value !== "string" || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(value)) closed(); return value; }
 function decimal(value: unknown, positive = false): string { try { const n = parseUnsignedDecimal(value, "retained"); if (positive && n === 0n) closed(); return value as string; } catch { return closed(); } }
 function nullableUuid(value: unknown): string | null { return value === null ? null : uuid(value); }
@@ -46,7 +48,7 @@ export function decodeWrappedEvidenceKey(value: unknown): WrappedEvidenceKeyV1 {
 export function decodeEvidenceItemBinding(value: unknown): EvidenceItemBindingV1 {
   const r = record(value, ["formatVersion", "projectId", "vaultId", "storeId", "evidenceId", "eventId", "targetSessionId", "conversationId", "frameId", "mediaType", "policyId", "policyVersion"]);
   if (r.formatVersion !== 1) closed();
-  return Object.freeze({ formatVersion: 1, projectId: hash(r.projectId), vaultId: hash(r.vaultId), storeId: hash(r.storeId), evidenceId: uuid(r.evidenceId), eventId: uuid(r.eventId), targetSessionId: uuid(r.targetSessionId), conversationId: uuid(r.conversationId), frameId: uuid(r.frameId), mediaType: media(r.mediaType), policyId: retainedIdentifier(r.policyId), policyVersion: retainedIdentifier(r.policyVersion) });
+  return Object.freeze({ formatVersion: 1, projectId: scopeUuid(r.projectId), vaultId: scopeUuid(r.vaultId), storeId: scopeUuid(r.storeId), evidenceId: uuid(r.evidenceId), eventId: uuid(r.eventId), targetSessionId: uuid(r.targetSessionId), conversationId: uuid(r.conversationId), frameId: uuid(r.frameId), mediaType: media(r.mediaType), policyId: retainedIdentifier(r.policyId), policyVersion: retainedIdentifier(r.policyVersion) });
 }
 const FRAME_FIELDS = ["frameId", "ordinal", "role", "category", "occurredAt", "mediaType", "previousFrameId", "toolCorrelationId", "artifactHashes"];
 function validateFrameSequence(frames: readonly EvidenceFrameMetadataV1[]): void {
@@ -73,7 +75,7 @@ function principalId(value: unknown): string {
 export function decodeRetainedEvidenceAuthority(value: unknown): RetainedEvidenceAuthoritySnapshotV1 {
   const r = record(value, AUTHORITY_FIELDS);
   if (!["root-session-handle", "root-resume-token", "child-session-handle"].includes(r.capabilityKind as string)) closed();
-  const snapshot: RetainedEvidenceAuthoritySnapshotV1 = Object.freeze({ ...rootAuthorityMetadata(r), projectId: hash(r.projectId), vaultId: hash(r.vaultId), storeId: hash(r.storeId), workspaceId: hash(r.workspaceId), clientNamespace: principalId(r.clientNamespace), presentingActorRole: actor(r.presentingActorRole), presentingClientInstanceId: principalId(r.presentingClientInstanceId), targetActorRole: actor(r.targetActorRole), targetClientInstanceId: principalId(r.targetClientInstanceId), authorizationSessionId: uuid(r.authorizationSessionId), targetSessionId: uuid(r.targetSessionId), parentSessionId: nullableUuid(r.parentSessionId), authorizingOwnerGeneration: nullableGeneration(r.authorizingOwnerGeneration), authorizingCapabilityGeneration: nullableGeneration(r.authorizingCapabilityGeneration), targetOwnerGeneration: nullableGeneration(r.targetOwnerGeneration), targetCapabilityGeneration: nullableGeneration(r.targetCapabilityGeneration), capabilityKind: r.capabilityKind as RetainedEvidenceAuthoritySnapshotV1["capabilityKind"] });
+  const snapshot: RetainedEvidenceAuthoritySnapshotV1 = Object.freeze({ ...rootAuthorityMetadata(r), projectId: scopeUuid(r.projectId), vaultId: scopeUuid(r.vaultId), storeId: scopeUuid(r.storeId), workspaceId: hash(r.workspaceId), clientNamespace: principalId(r.clientNamespace), presentingActorRole: actor(r.presentingActorRole), presentingClientInstanceId: principalId(r.presentingClientInstanceId), targetActorRole: actor(r.targetActorRole), targetClientInstanceId: principalId(r.targetClientInstanceId), authorizationSessionId: uuid(r.authorizationSessionId), targetSessionId: uuid(r.targetSessionId), parentSessionId: nullableUuid(r.parentSessionId), authorizingOwnerGeneration: nullableGeneration(r.authorizingOwnerGeneration), authorizingCapabilityGeneration: nullableGeneration(r.authorizingCapabilityGeneration), targetOwnerGeneration: nullableGeneration(r.targetOwnerGeneration), targetCapabilityGeneration: nullableGeneration(r.targetCapabilityGeneration), capabilityKind: r.capabilityKind as RetainedEvidenceAuthoritySnapshotV1["capabilityKind"] });
   // Root ownership and child direct-access fences are distinct nullable columns.
   if (snapshot.authorizingOwnerGeneration === null ? snapshot.authorizingCapabilityGeneration === null : snapshot.authorizingCapabilityGeneration !== null) closed();
   if (snapshot.parentSessionId === null ? snapshot.targetOwnerGeneration === null || snapshot.targetCapabilityGeneration !== null : snapshot.targetOwnerGeneration !== null) closed();
@@ -120,8 +122,10 @@ export function decodeEvidenceBatchRetainedPayload(value: unknown): EvidenceBatc
 }
 export function assertRetainedStoredEvent(event: StoredEvent): EvidenceBatchRetainedPayloadV1 | null {
   try {
-    if (list(event.evidenceRefs, 0).length !== 0 || list(event.evidenceDigests, 0).length !== 0) integrity();
-    if (event.eventType !== "EvidenceBatchRetained") return null;
+    if (event.eventType !== "EvidenceBatchRetained") {
+      if (list(event.evidenceRefs, 0).length !== 0 || list(event.evidenceDigests, 0).length !== 0) integrity();
+      return null;
+    }
     if (event.eventSchemaVersion !== 1 || event.commandEventIndex !== 0 || event.visibilityScope !== "session") integrity();
     // Existing authenticated readers preserve canonical bytes and may discard the redundant cache.
     // Inspect only its plain-container shape; never enumerate it or invoke nested accessors.
@@ -131,6 +135,16 @@ export function assertRetainedStoredEvent(event: StoredEvent): EvidenceBatchReta
     retainedStringMetrics(event.payloadJson, RETAINED_EVIDENCE_BUNDLE_BYTES, "INTEGRITY_FAILURE");
     const parsed: unknown = JSON.parse(event.payloadJson);
     const payload = decodeEvidenceBatchRetainedPayload(parsed); const w = payload.witness; const a = w.authority;
+    const refs = list(event.evidenceRefs, RETAINED_EVIDENCE_LIMITS.frames).map(uuid);
+    const digests = list(event.evidenceDigests, RETAINED_EVIDENCE_LIMITS.frames).map(value => {
+      const pair = record(value, ["ciphertextHash", "keyedFingerprint"]);
+      return { ciphertextHash: hash(pair.ciphertextHash), keyedFingerprint: hash(pair.keyedFingerprint) };
+    });
+    if (refs.length !== payload.items.length || digests.length !== payload.items.length) integrity();
+    for (let index = 0; index < payload.items.length; index++) {
+      const item = payload.items[index]!; const digest = digests[index]!;
+      if (refs[index] !== item.binding.evidenceId || digest.ciphertextHash !== item.ciphertextHash || digest.keyedFingerprint !== item.keyedFingerprint) integrity();
+    }
     if (w.commandId !== event.commandId || w.idempotencyKey !== event.idempotencyKey || w.targetSessionId !== event.sessionId || a.parentSessionId !== event.parentSessionId || a.projectId !== event.projectId || a.vaultId !== event.vaultId || a.storeId !== event.storeId || a.workspaceId !== event.workspaceId || a.presentingActorRole !== event.actorRole || a.presentingClientInstanceId !== event.clientInstanceId || payload.items.some(item => item.binding.eventId !== event.eventId) || canonicalJson(payload) !== event.payloadJson) integrity();
     return payload;
   } catch { return integrity(); }

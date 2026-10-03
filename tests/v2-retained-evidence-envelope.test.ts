@@ -8,18 +8,20 @@ import { redactEvidence, type TrustedRedactionPolicyV1 } from "../src/orchestrat
 import { sealEvidenceItem, openEvidenceItem, type EvidenceItemBindingV1, type EncryptedEvidenceItemV1 } from "../src/orchestrator/privacy/evidence-envelope.js";
 import type { EvidenceKeyProvider, EvidenceKeyPurpose, EvidenceKeyRefV1, EvidenceKeyScope, WrappedEvidenceKeyV1 } from "../src/orchestrator/privacy/evidence-key-provider.js";
 import { buildRetainedEvidenceIntent, retainedEvidenceIntentHash, type RetainedEvidenceAuthoritySnapshotV1 } from "../src/orchestrator/privacy/retained-evidence-intent.js";
-import { assertRetainedEvidenceBundle, assertRetainedStoredEvent, decodeEvidenceBatchRetainedPayload, decodeEvidenceKeyRef, decodeEncryptedEvidenceItem, decodeRetainedEvidenceIntentWitness, decodeRetainedEvidenceStoredResult, decodeWrappedEvidenceKey, type EvidenceBatchRetainedPayloadV1 } from "../src/orchestrator/privacy/retained-evidence-codec.js";
+import { assertRetainedEvidenceBundle, assertRetainedStoredEvent, decodeEvidenceBatchRetainedPayload, decodeEvidenceItemBinding, decodeEvidenceKeyRef, decodeEncryptedEvidenceItem, decodeRetainedEvidenceAuthority, decodeRetainedEvidenceIntentWitness, decodeRetainedEvidenceStoredResult, decodeWrappedEvidenceKey, type EvidenceBatchRetainedPayloadV1 } from "../src/orchestrator/privacy/retained-evidence-codec.js";
 
 const integrity = { code: "INTEGRITY_FAILURE" };
 const unavailable = { code: "RETAINED_EVIDENCE_KEY_UNAVAILABLE" };
 const unsupported = { code: "RETAINED_EVIDENCE_FORMAT_UNSUPPORTED" };
 const limit = { code: "RETAINED_EVIDENCE_LIMIT_EXCEEDED" };
 function id(n: number) { return `00000000-0000-4000-8000-${n.toString(16).padStart(12, "0")}`; }
-const scope = { projectId: "a".repeat(64), storeId: "c".repeat(64) };
+// Actual trusted identity shapes from tests/support/fresh-start-fixture.ts:39-41.
+const genuineScope = { projectId: "11111111-1111-4111-8111-111111111111", vaultId: "22222222-2222-4222-8222-222222222222", storeId: "33333333-3333-4333-8333-333333333333" };
+const scope = { projectId: genuineScope.projectId, storeId: genuineScope.storeId };
 const ref = (purpose: EvidenceKeyPurpose, version = "1"): EvidenceKeyRefV1 => ({ keyId: `synthetic:${purpose}`, version });
 const policy: TrustedRedactionPolicyV1 = Object.freeze({ policyId: "synthetic-policy", policyVersion: "1", rules: Object.freeze([Object.freeze({ kind: "token", ruleId: "synthetic-token", prefix: "fixture_" })]) });
 const authority: RetainedEvidenceAuthoritySnapshotV1 = {
-  ...scope, vaultId: "b".repeat(64), workspaceId: "d".repeat(64), clientNamespace: "synthetic-client",
+  ...scope, vaultId: genuineScope.vaultId, workspaceId: "d".repeat(64), clientNamespace: "synthetic-client",
   presentingActorRole: "primary", presentingClientInstanceId: "synthetic-instance", targetActorRole: "primary", targetClientInstanceId: "synthetic-instance",
   authorizationSessionId: id(3), targetSessionId: id(3), parentSessionId: null,
   rootSessionId: id(3), rootOwnerGeneration: "1",
@@ -55,16 +57,41 @@ class SyntheticProvider implements EvidenceKeyProvider {
     const result = createHmac("sha256", this.key(s, p, r)).update(domain).update("\n").update(bytes).digest(); this.macOutputs.push(result); return result;
   }
 }
-function fixture(content: unknown = "visible fixture_alpha") { const input = decodeRetainEvidenceBatch(command(content)); const provider = new SyntheticProvider(); const frame = redactEvidence(input, policy).frames[0]!; return { input, provider, frame }; }
+function fixture(content: unknown = "visible fixture_alpha", count = 1) { const input = decodeRetainEvidenceBatch(command(content, count)); const provider = new SyntheticProvider(); const frames = redactEvidence(input, policy).frames; const frame = frames[0]!; return { input, provider, frame, frames }; }
 function changed(bytes: string): string { const b = Buffer.from(bytes, "base64url"); b[0] = b[0]! ^ 1; return b.toString("base64url"); }
 function copy<T>(value: T): T { return JSON.parse(JSON.stringify(value)) as T; }
 function metadata(item: EncryptedEvidenceItemV1) { const { binding: b, frame, wrapKeyRef, fingerprintKeyRef, ciphertextHash, wrappedKeyHash, keyedFingerprint } = item; return { binding: b, frame, wrapKeyRef, fingerprintKeyRef, ciphertextHash, wrappedKeyHash, keyedFingerprint }; }
-function payloadFixture() {
-  const f = fixture(); try { const witness = buildRetainedEvidenceIntent(f.input, authority, policy, keys, f.provider); const item = sealEvidenceItem(binding(), f.frame, f.provider); return { provider: f.provider, item, payload: { formatVersion: 1 as const, witness, items: [metadata(item)] } }; } finally { f.input.canonicalOriginalBytes.fill(0); }
+function payloadFixture(count = 1) {
+  const f = fixture(undefined, count); try { const witness = buildRetainedEvidenceIntent(f.input, authority, policy, keys, f.provider); const items = f.frames.map((frame, n) => sealEvidenceItem(binding(n), frame, f.provider)); return { provider: f.provider, item: items[0]!, payload: { formatVersion: 1 as const, witness, items: items.map(metadata) } }; } finally { f.input.canonicalOriginalBytes.fill(0); }
 }
 function stored(payload: EvidenceBatchRetainedPayloadV1): StoredEvent {
-  return { globalPosition: 1n, eventId: id(200), projectId: scope.projectId as StoredEvent["projectId"], vaultId: authority.vaultId as StoredEvent["vaultId"], storeId: scope.storeId as StoredEvent["storeId"], workspaceId: authority.workspaceId as StoredEvent["workspaceId"], branchScopeId: null, branchRef: null, streamId: id(3), streamType: "session", streamVersion: 1n, eventType: "EvidenceBatchRetained", eventSchemaVersion: 1, sessionId: id(3), parentSessionId: null, actorRole: "primary", agentId: "synthetic-agent", clientInstanceId: "synthetic-instance", correlationId: id(4), causationId: null, commandId: id(1), idempotencyKey: id(2), commandEventIndex: 0, occurredAt: "2026-10-02T01:02:03.004Z", recordedAt: "2026-10-02T01:02:03.004Z", visibilityScope: "session", confidence: "high", verificationStatus: "verified", sourceRefs: [], evidenceRefs: [], evidenceDigests: [], payload, payloadJson: canonicalJson(payload), payloadHash: "0".repeat(64), previousGlobalHash: "0".repeat(64), eventHash: "0".repeat(64) };
+  return linked({ globalPosition: 1n, eventId: id(200), projectId: scope.projectId as StoredEvent["projectId"], vaultId: authority.vaultId as StoredEvent["vaultId"], storeId: scope.storeId as StoredEvent["storeId"], workspaceId: authority.workspaceId as StoredEvent["workspaceId"], branchScopeId: null, branchRef: null, streamId: id(3), streamType: "session", streamVersion: 1n, eventType: "EvidenceBatchRetained", eventSchemaVersion: 1, sessionId: id(3), parentSessionId: null, actorRole: "primary", agentId: "synthetic-agent", clientInstanceId: "synthetic-instance", correlationId: id(4), causationId: null, commandId: id(1), idempotencyKey: id(2), commandEventIndex: 0, occurredAt: "2026-10-02T01:02:03.004Z", recordedAt: "2026-10-02T01:02:03.004Z", visibilityScope: "session", confidence: "high", verificationStatus: "verified", sourceRefs: [], evidenceRefs: [], evidenceDigests: [], payload, payloadJson: canonicalJson(payload), payloadHash: "0".repeat(64), previousGlobalHash: "0".repeat(64), eventHash: "0".repeat(64) }, payload);
 }
+function linked(event: StoredEvent, payload: EvidenceBatchRetainedPayloadV1): StoredEvent {
+  // Local retained branch seam; do not relax the global legacy empty-evidence StoredEvent type.
+  return { ...event, evidenceRefs: payload.items.map(item => item.binding.evidenceId), evidenceDigests: payload.items.map(item => ({ ciphertextHash: item.ciphertextHash, keyedFingerprint: item.keyedFingerprint })) } as unknown as StoredEvent;
+}
+test("trusted scope UUIDs follow existing versions while workspace hashes and new UUIDv4 selectors remain distinct", () => {
+  const b = { ...binding(), ...genuineScope }; const a = { ...authority, ...genuineScope };
+  assert.deepEqual(decodeEvidenceItemBinding(b), b); assert.deepEqual(decodeRetainedEvidenceAuthority(a), a);
+  for (const field of ["projectId", "vaultId", "storeId"] as const) {
+    for (const version of [1, 2, 3, 4, 5]) { const value = `abcdefab-cdef-${version}123-8123-abcdefabcdef`; assert.equal(decodeEvidenceItemBinding({ ...b, [field]: value })[field], value); assert.equal(decodeRetainedEvidenceAuthority({ ...a, [field]: value })[field], value); }
+    for (const value of ["a".repeat(64), "abcdefab-cdef-6123-8123-abcdefabcdef", "ABCDEFAB-CDEF-4123-8123-ABCDEFABCDEF", "abcdefab-cdef-4123-7123-abcdefabcdef", null]) { assert.throws(() => decodeEvidenceItemBinding({ ...b, [field]: value }), unsupported); assert.throws(() => decodeRetainedEvidenceAuthority({ ...a, [field]: value }), unsupported); }
+  }
+  assert.throws(() => decodeRetainedEvidenceAuthority({ ...a, workspaceId: genuineScope.projectId }), unsupported);
+  for (const field of ["evidenceId", "eventId", "targetSessionId", "conversationId", "frameId"] as const) assert.throws(() => decodeEvidenceItemBinding({ ...b, [field]: "abcdefab-cdef-1123-8123-abcdefabcdef" }), unsupported);
+});
+test("retained events require exact ordered evidence refs and digest pairs while legacy events require emptiness", () => {
+  const f = payloadFixture(2); const event = linked(stored(f.payload), f.payload);
+  assert.deepEqual(assertRetainedStoredEvent(event), f.payload);
+  const refs = f.payload.items.map(item => item.binding.evidenceId); const digests = f.payload.items.map(item => ({ ciphertextHash: item.ciphertextHash, keyedFingerprint: item.keyedFingerprint }));
+  for (const evidenceRefs of [undefined, [], refs.slice(1), [...refs].reverse(), [id(999), refs[1]], [...refs, id(999)], [null, refs[1]], { 0: refs[0], 1: refs[1] }]) assert.throws(() => assertRetainedStoredEvent({ ...event, evidenceRefs } as unknown as StoredEvent), integrity);
+  for (const evidenceDigests of [undefined, [], digests.slice(1), [...digests].reverse(), [...digests, digests[0]], [{ ...digests[0], ciphertextHash: "f".repeat(64) }, digests[1]], [{ ...digests[0], keyedFingerprint: "f".repeat(64) }, digests[1]], [{ ...digests[0], wrappedKeyHash: f.payload.items[0]!.wrappedKeyHash }, digests[1]], [{ ciphertextHash: digests[0]!.ciphertextHash }, digests[1]], [null, digests[1]]]) assert.throws(() => assertRetainedStoredEvent({ ...event, evidenceDigests } as unknown as StoredEvent), integrity);
+  let invoked = false; const accessor = [{ get ciphertextHash() { invoked = true; return digests[0]!.ciphertextHash; }, keyedFingerprint: digests[0]!.keyedFingerprint }, digests[1]];
+  assert.throws(() => assertRetainedStoredEvent({ ...event, evidenceDigests: accessor } as unknown as StoredEvent), integrity); assert.equal(invoked, false);
+  assert.equal(assertRetainedStoredEvent({ ...event, eventType: "Other", evidenceRefs: [], evidenceDigests: [] }), null);
+  assert.throws(() => assertRetainedStoredEvent({ ...event, eventType: "Other" }), integrity);
+});
 
 // Break caught: key/nonce reuse or retaining a cleartext wrapper instead of AES-GCM ciphertext.
 test("each item uses independent data key and nonce", () => {
@@ -206,7 +233,7 @@ test("root and child witnesses preserve actual nullable fences and admitted root
 test("stored event validates exact retained correspondence and keeps legacy empty evidence", () => {
   const f = payloadFixture(); const event = stored(f.payload); assert.deepEqual(assertRetainedStoredEvent(event), f.payload);
   for (const mutation of [{ eventId: id(999) }, { commandId: id(999) }, { idempotencyKey: id(999) }, { sessionId: id(999) }, { projectId: "f".repeat(64) }, { workspaceId: "f".repeat(64) }, { parentSessionId: id(999) }, { actorRole: "maintenance" }, { clientInstanceId: "other" }, { eventSchemaVersion: 2 }, { commandEventIndex: 1 }]) assert.throws(() => assertRetainedStoredEvent({ ...event, ...mutation } as StoredEvent), integrity);
-  assert.equal(assertRetainedStoredEvent({ ...event, eventType: "Other" }), null);
+  assert.equal(assertRetainedStoredEvent({ ...event, eventType: "Other", evidenceRefs: [], evidenceDigests: [] }), null);
   assert.throws(() => assertRetainedStoredEvent({ ...event, eventType: "Other", evidenceRefs: [id(100)] } as unknown as StoredEvent), integrity);
   assert.throws(() => assertRetainedStoredEvent({ ...event, evidenceDigests: [{ ciphertextHash: "0".repeat(64), keyedFingerprint: "0".repeat(64) }] } as unknown as StoredEvent), integrity);
 });
