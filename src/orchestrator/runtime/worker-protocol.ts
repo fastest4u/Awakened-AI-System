@@ -756,7 +756,7 @@ export function decodeWorkerRequest(value: unknown): WorkerRequest {
       exact(value, ["id", "type", "binding", "prepared"]);
       assertRetainedEvidenceWireSize(value);
       const assertion = decodeAssertion(request.binding);
-      if (![assertion.projectId, assertion.vaultId, assertion.storeId].every(item => /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(item))) invalid();
+      if (![assertion.projectId, assertion.vaultId, assertion.storeId].every(item => LIFECYCLE_BINDING_UUID.test(item))) invalid();
       const prepared = decodePreparedRetainedEvidenceCommand(request.prepared);
       const physical = exact(request.prepared, ["command", "authorization"]);
       return Object.freeze({ id, type, binding: Object.freeze(assertion), prepared: Object.freeze({ command: physical.command as string, authorization: prepared.authorization }) });

@@ -126,6 +126,57 @@ test("decoded private request owns its command text and protected authorization 
     assert.notEqual(decoded.prepared.authorization.proof!.proofFingerprint, "b".repeat(64));
   } finally { await f.cleanup(); }
 });
+test("private request preserves canonical UUID1-5 for every existing scope identity", async t => {
+  const f = await makeRetainedEvidenceFixture();
+  try {
+    const wire = encodePreparedRetainedEvidenceCommand(prepared(f, command(f.rootAuthority.sessionId)));
+    const scopes = [
+      [1, "abcdefab-1234-1234-8123-123456789abc"],
+      [2, "abcdefab-1234-2234-8123-123456789abc"],
+      [3, "abcdefab-1234-3234-8123-123456789abc"],
+      [4, "abcdefab-1234-4234-8123-123456789abc"],
+      [5, "abcdefab-1234-5234-8123-123456789abc"],
+    ] as const;
+    for (const field of ["projectId", "vaultId", "storeId"] as const) {
+      for (const [version, identity] of scopes) await t.test(`${field} UUIDv${version}`, () => {
+        const binding = { ...encodeWorkerBindingAssertion(f.projectContext), [field]: identity };
+        const decoded = decodeWorkerRequest({ id: "compatibility", type: "retained-evidence", binding, prepared: wire });
+        assert.equal(decoded.type, "retained-evidence");
+        if (decoded.type !== "retained-evidence") throw new Error("wrong lane");
+        assert.equal(decoded.binding[field], identity);
+        assert.equal(decoded.prepared.authorization.proof!.proofFingerprint, wire.authorization.proof!.proofFingerprint);
+      });
+    }
+  } finally { await f.cleanup(); }
+});
+test("private request still refuses malformed scopes and non-v4 new selectors", async () => {
+  const f = await makeRetainedEvidenceFixture();
+  try {
+    const p = prepared(f, command(f.rootAuthority.sessionId)), wire = encodePreparedRetainedEvidenceCommand(p);
+    for (const field of ["projectId", "vaultId", "storeId"] as const) {
+      for (const identity of ["not-a-uuid", "ABCDEFAB-1234-5234-8123-123456789ABC", "abcdefab-1234-0234-8123-123456789abc",
+        "abcdefab-1234-6234-8123-123456789abc", "abcdefab-1234-5234-7123-123456789abc", " abcdefab-1234-5234-8123-123456789abc"]) {
+        assert.throws(() => decodeWorkerRequest({ id: "invalid-scope", type: "retained-evidence",
+          binding: { ...encodeWorkerBindingAssertion(f.projectContext), [field]: identity }, prepared: wire }), { code: "WORKER_PROTOCOL_INVALID" });
+      }
+    }
+    for (const identity of ["abcdefab-1234-1234-8123-123456789abc", "abcdefab-1234-2234-8123-123456789abc",
+      "abcdefab-1234-3234-8123-123456789abc", "abcdefab-1234-5234-8123-123456789abc"]) {
+      for (const field of ["commandId", "idempotencyKey", "targetSessionId", "conversationId"] as const) {
+        assert.throws(() => encodePreparedRetainedEvidenceCommand({ ...p, command: { ...p.command, [field]: identity } }), { code: "RETAINED_EVIDENCE_INPUT_INVALID" });
+      }
+      for (const field of ["frameId", "previousFrameId", "toolCorrelationId"] as const) {
+        const frame = { ...p.command.frames[0]!, [field]: identity,
+          ...(field === "previousFrameId" ? { ordinal: "1" } : {}),
+          ...(field === "toolCorrelationId" ? { role: "tool", category: "tool-input" } : {}) };
+        assert.throws(() => encodePreparedRetainedEvidenceCommand({ ...p, command: { ...p.command, frames: [frame] } }), { code: "RETAINED_EVIDENCE_INPUT_INVALID" });
+      }
+      assert.throws(() => encodePreparedRetainedEvidenceCommand({ ...p, authorization: { ...p.authorization, authoritySessionId: identity } }), { code: "SESSION_CAPABILITY_INVALID" });
+      assert.throws(() => encodePreparedRetainedEvidenceCommand({ ...p, authorization: { ...p.authorization,
+        proof: { ...p.authorization.proof!, proofNonce: identity } } }), { code: "SESSION_CAPABILITY_INVALID" });
+    }
+  } finally { await f.cleanup(); }
+});
 
 test("native private worker dispatch and reopened executor replay preserve exact receipt and ciphertext", async () => {
   const f = await makeRetainedEvidenceFixture();
