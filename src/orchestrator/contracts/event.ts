@@ -316,8 +316,8 @@ export interface StoredEvent {
   readonly confidence: Confidence;
   readonly verificationStatus: VerificationStatus;
   readonly sourceRefs: readonly string[];
-  readonly evidenceRefs: readonly [];
-  readonly evidenceDigests: readonly [];
+  readonly evidenceRefs: readonly string[];
+  readonly evidenceDigests: readonly Readonly<EvidenceDigest>[];
   readonly payload: ReadonlyJsonValue;
   readonly payloadJson: string;
   readonly payloadHash: string;

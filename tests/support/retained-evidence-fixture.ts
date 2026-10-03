@@ -32,6 +32,11 @@ import type { RetainedEvidenceAuthoritySnapshotV1 } from "../../src/orchestrator
 import type { TrustedRedactionPolicyV1 } from "../../src/orchestrator/privacy/redaction.js";
 import { canonicalJson } from "../../src/orchestrator/serialization/canonical-json.js";
 import { RetainedEvidenceRepository } from "../../src/orchestrator/privacy/retained-evidence.repository.js";
+import { RetainedEvidenceService, type RetainedEvidenceFaultInjector, type RetainedEvidenceServiceOptions } from "../../src/orchestrator/privacy/retained-evidence.service.js";
+import { RetainedEvidenceAuthorityVerifier, retainedEvidenceProofTarget, type RetainedEvidenceInvocationV1 } from "../../src/orchestrator/privacy/retained-evidence-authority.js";
+import { decodeRetainEvidenceBatch } from "../../src/orchestrator/privacy/evidence-contracts.js";
+import { EventAppendTransaction, SqliteEventAppendStatements } from "../../src/orchestrator/storage/event-append-transaction.js";
+import { BranchScopeRepository } from "../../src/orchestrator/storage/branch-scope.repository.js";
 
 const READ_HASH = "a".repeat(64);
 type FixtureCore = { writer: SqliteConnection; root: string; projectContext: ProjectContext; binding: { projectionBinding: { branchRef: null } } };
@@ -175,14 +180,16 @@ function retainedLifecycleSetup(fixture: FixtureCore, childContext: ProjectConte
     },
     broker, capabilities,
     execute,
-    async forkChild(sessionId: string, descriptor: AuthorityMaterialDescriptorV1) {
+    executeForContext: (operation: LifecycleWorkerOperationWire, context: ProjectContext) => runtime.execute(operation, context),
+    async forkChild(sessionId: string, descriptor: AuthorityMaterialDescriptorV1, directAccessRequested = true) {
       const record = new SessionAuthorityRepository().get(fixture.writer, common.projectId, sessionId)!;
       const version = fixture.writer.prepare("SELECT current_version FROM streams WHERE stream_id = $id").get({ $id: `session/${sessionId}` })!.current_version as bigint;
       const cmd = decodeLifecycleSemanticCommandDraft({ commandType: "fork-child", commandId: randomUUID(), idempotencyKey: `retained-child/${randomUUID()}`,
         agentId: "fixture-agent", expectedProjectId: common.projectId, expectedVaultId: common.vaultId, expectedWorkspaceId: common.workspaceId,
         expectedBranchRef: null, parentSessionId: sessionId, expectedStreamVersion: version.toString(),
-        assignment: { assignmentId: randomUUID(), summary: "Owned synthetic child", scope: "retained-fixture" }, directAccessRequested: true });
-      const target = { actorRole: "untrusted" as const, clientInstanceId: childContext.binding.clientInstanceId };
+        assignment: { assignmentId: randomUUID(), summary: "Owned synthetic child", scope: "retained-fixture" }, directAccessRequested });
+      const target = directAccessRequested ? { actorRole: "untrusted" as const, clientInstanceId: childContext.binding.clientInstanceId }
+        : { actorRole: "primary" as const, clientInstanceId: context.binding.clientInstanceId };
       const witness = buildLifecycleIntentWitness(cmd, { ...common, targetActorRole: target.actorRole, targetClientInstanceId: target.clientInstanceId,
         authorizationKind: "protected", authorizationSessionId: sessionId, targetSessionId: sessionId,
         capabilityKind: "root-session-handle", capabilityGeneration: record.ownerGeneration!.toString() });
@@ -202,7 +209,7 @@ function retainedLifecycleSetup(fixture: FixtureCore, childContext: ProjectConte
           commandId: cmd.commandId, idempotencyKey: cmd.idempotencyKey, intentHash: witness.intentHash, proofNonce: randomUUID() });
         const result = await execute(decodeLifecycleWorkerOperationWire({ kind: "semantic", operation: "fork-child", prepared: { command: cmd, candidateIntentHash: witness.intentHash,
           authorization: { kind: "protected", authoritySessionId: sessionId, targetSessionId: sessionId, proof, approval: null,
-            childBindingGrant: { ...claims, mac: Buffer.from(mac).toString("base64url") } } } }));
+            childBindingGrant: directAccessRequested ? { ...claims, mac: Buffer.from(mac).toString("base64url") } : null } } }));
         const committed = result.result as unknown as { publicResult: { childSessionId: string }; authorityMaterial: { descriptor: AuthorityMaterialDescriptorV1 } };
         return { sessionId: committed.publicResult.childSessionId, descriptor: committed.authorityMaterial.descriptor, target };
       } finally { bytes.fill(0); mac?.fill(0); material.handle.destroy(); if (material.kind === "root") material.resumeToken?.destroy(); }
@@ -213,7 +220,7 @@ function retainedLifecycleSetup(fixture: FixtureCore, childContext: ProjectConte
 
 export type RetainedEvidenceFixture = Awaited<ReturnType<typeof makeRetainedEvidenceFixture>>;
 /** Real migration/control-plane/root/child setup in an identity-checked disposable directory. */
-export async function makeRetainedEvidenceFixture() {
+export async function makeRetainedEvidenceFixture(options: { readonly faults?: RetainedEvidenceFaultInjector } = {}) {
   const root = realpathSync.native(mkdtempSync(join(tmpdir(), "retained-evidence-")));
   const identity = lstatSync(root, { bigint: true });
   const path = join(root, "events.sqlite"), driver = new NodeSqliteDriver({ DatabaseSync });
@@ -245,8 +252,8 @@ export async function makeRetainedEvidenceFixture() {
       return { ...FRESH_IDENTITY, workspaceId: projectContext.binding.workspaceId, clientNamespace: projectContext.binding.clientNamespace,
         presentingActorRole: authorizingSessionId === sessionId ? "primary" : "untrusted",
         presentingClientInstanceId: authorizingSessionId === sessionId ? rootAuthority.target.clientInstanceId : childAuthority.target.clientInstanceId,
-        targetActorRole: targetSessionId === sessionId ? "primary" : "untrusted",
-        targetClientInstanceId: targetSessionId === sessionId ? rootAuthority.target.clientInstanceId : childAuthority.target.clientInstanceId,
+        targetActorRole: authorizingSessionId === sessionId ? "primary" : "untrusted",
+        targetClientInstanceId: authorizingSessionId === sessionId ? rootAuthority.target.clientInstanceId : childAuthority.target.clientInstanceId,
         authorizationSessionId: authorizingSessionId, targetSessionId, parentSessionId: target.parentSessionId,
         rootSessionId: sessionId, rootOwnerGeneration: rootRecord.ownerGeneration!.toString(),
         authorizingOwnerGeneration: authorizer.ownerGeneration?.toString() ?? null, authorizingCapabilityGeneration: authorizer.childCapabilityGeneration?.toString() ?? null,
@@ -256,8 +263,49 @@ export async function makeRetainedEvidenceFixture() {
     const policy: TrustedRedactionPolicyV1 = Object.freeze({ policyId: "retained-synthetic-policy", policyVersion: "1",
       rules: Object.freeze([Object.freeze({ kind: "token" as const, ruleId: "synthetic-token", prefix: "fixture_" })]) });
     const rows = () => Object.fromEntries(["events", "command_dedup", "retained_evidence_blobs", "retained_evidence_stream_heads", "retained_evidence_command_authorizations"].map(table => [table, connection.prepare(`SELECT * FROM ${table}`).all()]));
+    const repository = new RetainedEvidenceRepository(connection, (boundary, commandId, idempotencyKey) => options.faults?.hit(boundary, commandId, idempotencyKey));
+    const events = new EventAppendTransaction(connection, new SqliteEventAppendStatements(connection), new MaintenanceFence(), new BranchScopeRepository());
+    const retainedAuthority = new RetainedEvidenceAuthorityVerifier({ connection, capabilities: lifecycle.capabilities });
+    const service = (overrides: Partial<RetainedEvidenceServiceOptions> = {}) => new RetainedEvidenceService({ connection, events, repository,
+      authority: retainedAuthority, provider, policy: () => policy, now: () => FRESH_NOW, faults: options.faults, ...overrides });
+    const invocation = (value: unknown, authorizer: { sessionId: string; descriptor: AuthorityMaterialDescriptorV1; target: { actorRole: "primary" | "untrusted"; clientInstanceId: string } } = rootAuthority,
+      context: ProjectContext = authorizer.target.actorRole === "primary" ? projectContext : childContext): RetainedEvidenceInvocationV1 => {
+      const input = decodeRetainEvidenceBatch(value), b = context.binding;
+      const record = authorityRepository.get(connection, b.projectId, authorizer.sessionId)!;
+      const material = lifecycle!.capabilities.reconstructForTarget(authorizer.descriptor, authorizer.target);
+      try {
+        const scope = { projectId: b.projectId, vaultId: b.vaultId, storeId: b.storeId, workspaceId: b.workspaceId, clientNamespace: b.clientNamespace,
+          authoritySessionId: authorizer.sessionId, targetSessionId: input.command.targetSessionId, presentingActorRole: b.actorRole,
+          presentingClientInstanceId: b.clientInstanceId, targetActorRole: b.actorRole, targetClientInstanceId: b.clientInstanceId,
+          capabilityKind: record.sessionKind === "root" ? "root-session-handle" as const : "child-session-handle" as const,
+          capabilityGeneration: (record.sessionKind === "root" ? record.ownerGeneration : record.childCapabilityGeneration)!.toString() };
+        const proof = createCapabilityProof(material.handle, retainedEvidenceProofTarget(input, scope, randomUUID()));
+        return { context, input, authorization: { kind: "protected", authoritySessionId: authorizer.sessionId as never,
+          targetSessionId: input.command.targetSessionId as never, proof, approval: null, childBindingGrant: null } };
+      } catch (error) { input.canonicalOriginalBytes.fill(0); throw error; }
+      finally { material.handle.destroy(); if (material.kind === "root") material.resumeToken?.destroy(); }
+    };
+    const protectedLifecycle = async (draft: unknown, targetSessionId: string, authorizer = rootAuthority as { sessionId: string; descriptor: AuthorityMaterialDescriptorV1; target: { actorRole: "primary" | "untrusted"; clientInstanceId: string } }) => {
+      const context = authorizer.target.actorRole === "primary" ? projectContext : childContext, b = context.binding;
+      const command = decodeLifecycleSemanticCommandDraft(draft);
+      const record = authorityRepository.get(connection, b.projectId, authorizer.sessionId)!;
+      const scope = { projectId: b.projectId, vaultId: b.vaultId, storeId: b.storeId, workspaceId: b.workspaceId, clientNamespace: b.clientNamespace,
+        authoritySessionId: authorizer.sessionId, targetSessionId, presentingActorRole: b.actorRole, presentingClientInstanceId: b.clientInstanceId,
+        targetActorRole: b.actorRole, targetClientInstanceId: b.clientInstanceId, capabilityKind: record.sessionKind === "root" ? "root-session-handle" as const : "child-session-handle" as const,
+        capabilityGeneration: (record.sessionKind === "root" ? record.ownerGeneration : record.childCapabilityGeneration)!.toString() };
+      const { authoritySessionId: _authorityId, ...assertionScope } = scope;
+      const witness = buildLifecycleIntentWitness(command, { ...assertionScope, authorizationKind: "protected", authorizationSessionId: scope.authoritySessionId,
+        internalWorkflowId: null, internalWorkflowGeneration: null, internalPlannedWorkId: null });
+      const material = lifecycle!.capabilities.reconstructForTarget(authorizer.descriptor, authorizer.target);
+      try {
+        const proof = createCapabilityProof(material.handle, { ...scope, proofVersion: 1, target: "semantic-command", commandId: command.commandId,
+          idempotencyKey: command.idempotencyKey, intentHash: witness.intentHash, proofNonce: randomUUID() });
+        return await lifecycle!.executeForContext(decodeLifecycleWorkerOperationWire({ kind: "semantic", operation: command.commandType, prepared: { command,
+          candidateIntentHash: witness.intentHash, authorization: { kind: "protected", authoritySessionId: authorizer.sessionId, targetSessionId, proof, approval: null, childBindingGrant: null } } }), context);
+      } finally { material.handle.destroy(); if (material.kind === "root") material.resumeToken?.destroy(); }
+    };
     return { root, path, connection, projectContext, childContext, provider, policy, rootAuthority, childAuthority, authoritySnapshot,
-      lifecycle, admission, repository: new RetainedEvidenceRepository(connection), rows, cleanup,
+      lifecycle, admission, repository, events, retainedAuthority, service, invocation, protectedLifecycle, rows, cleanup,
       // Stable connection facade retains its genuine admission; capability/provider objects and historical key status stay alive.
       reopen() { connection.close(); live = driver.open(path, { mode: "existing", busyTimeoutMs: 1000 }); },
     };

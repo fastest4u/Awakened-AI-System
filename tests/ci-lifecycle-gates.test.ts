@@ -76,6 +76,7 @@ const EXTENDED_PRODUCTION_ENTRY_PATHS = [
 
 const SEALED_EVALUATOR_BASE = "68e77fa10165c99243ded1e8c1c80d1e0f7da92f";
 const APPROVED_SEALED_AND_ROLLOUT_SOURCE_DIFF = Object.freeze([
+  "src/orchestrator/contracts/event.ts",
   "src/orchestrator/fresh-start/contracts.ts",
   "src/orchestrator/fresh-start/fresh-start-admission.ts",
   "src/orchestrator/fresh-start/fresh-start-control-plane.ts",
@@ -107,9 +108,11 @@ const APPROVED_SEALED_AND_ROLLOUT_SOURCE_DIFF = Object.freeze([
   "src/orchestrator/privacy/evidence-envelope.ts",
   "src/orchestrator/privacy/evidence-key-provider.ts",
   "src/orchestrator/privacy/redaction.ts",
+  "src/orchestrator/privacy/retained-evidence-authority.ts",
   "src/orchestrator/privacy/retained-evidence-codec.ts",
   "src/orchestrator/privacy/retained-evidence-intent.ts",
   "src/orchestrator/privacy/retained-evidence.repository.ts",
+  "src/orchestrator/privacy/retained-evidence.service.ts",
   "src/orchestrator/projections/builder.ts",
   "src/orchestrator/projections/checksum.ts",
   "src/orchestrator/projections/contracts.ts",

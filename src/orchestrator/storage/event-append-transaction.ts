@@ -2,6 +2,12 @@ import { randomUUID } from "node:crypto";
 import { GENESIS_GLOBAL_HASH } from "./event-chain-constants.js";
 import { assertFreshStartConnectionAllowed } from "../fresh-start/fresh-start-admission.js";
 import { FreshStartError } from "../fresh-start/contracts.js";
+import { requireRetainedEvidenceAuthority, type VerifiedRetainedEvidenceAuthority } from "../privacy/retained-evidence-authority.js";
+import { decodeRetainedEvidenceReceipt, type RetainEvidenceBatchCommandV1, type RetainedEvidenceReceiptV1 } from "../privacy/evidence-contracts.js";
+import { decodeEvidenceBatchRetainedPayload, decodeEncryptedEvidenceItem, assertRetainedStoredEvent, decodeRetainedEvidenceStoredResult, type EvidenceBatchRetainedPayloadV1 } from "../privacy/retained-evidence-codec.js";
+import { retainedEvidenceIntentHash } from "../privacy/retained-evidence-intent.js";
+import type { EncryptedEvidenceItemV1 } from "../privacy/evidence-envelope.js";
+import { assertRetainedEvidenceCommitBundle } from "../privacy/retained-evidence.repository.js";
 import type {
   AppendCommand,
   AppendResult,
@@ -347,6 +353,7 @@ function validateAppendCommand<T extends JsonValue>(
   command: AppendCommand<T>,
   recordedAt: string,
   randomId: () => string,
+  retained = false,
 ): ValidatedAppendCommand {
   if (!isPlainRecord(command)) throw new EventStoreError("COMMAND_INVALID");
   validateProjectContext(command);
@@ -374,6 +381,8 @@ function validateAppendCommand<T extends JsonValue>(
     || command.events.length > MAX_EVENTS_PER_COMMAND) {
     throw new EventStoreError("EVENT_BATCH_SIZE_INVALID");
   }
+  if (!retained && (command.commandType === "retain-evidence-batch"
+    || command.events.some(event => event.eventType === "EvidenceBatchRetained"))) throw new EventStoreError("COMMAND_INVALID");
   if (command.expectedStreamVersion > SQLITE_INT64_MAX - BigInt(command.events.length)) {
     throw new EventStoreError("EXPECTED_STREAM_VERSION_INVALID");
   }
@@ -417,7 +426,7 @@ function validateAppendCommand<T extends JsonValue>(
     if (event.visibilityScope === "session" && !nonEmptyString(event.sessionId)) {
       throw new EventStoreError("SESSION_NOT_FOUND");
     }
-    if (event.evidenceRefs.length !== 0 || event.evidenceDigests.length !== 0) {
+    if (!retained && (event.evidenceRefs.length !== 0 || event.evidenceDigests.length !== 0)) {
       throw new EventStoreError("EVIDENCE_NOT_AVAILABLE_IN_SUBPROJECT_1");
     }
     const json = canonical(event.payload);
@@ -441,8 +450,8 @@ function validateAppendCommand<T extends JsonValue>(
       verificationStatus: event.verificationStatus,
       payload: event.payload,
       sourceRefs: event.sourceRefs,
-      evidenceRefs: [] as JsonValue[],
-      evidenceDigests: [] as JsonValue[],
+      evidenceRefs: retained ? event.evidenceRefs : [] as JsonValue[],
+      evidenceDigests: retained ? event.evidenceDigests.map(digest => ({ ciphertextHash: digest.ciphertextHash, keyedFingerprint: digest.keyedFingerprint })) : [] as JsonValue[],
     };
   });
 
@@ -657,8 +666,8 @@ function materializeEvents<T extends JsonValue>(
       confidence: pending.confidence,
       verificationStatus: pending.verificationStatus,
       sourceRefs: Object.freeze([...pending.sourceRefs]),
-      evidenceRefs: Object.freeze([]) as readonly [],
-      evidenceDigests: Object.freeze([]) as readonly [],
+      evidenceRefs: Object.freeze([...pending.evidenceRefs]),
+      evidenceDigests: Object.freeze(pending.evidenceDigests.map(digest => Object.freeze({ ...digest }))),
       payload: immutableSnapshot(pending.payload),
       payloadJson: validated.payloadJson[index]!,
       payloadHash: validated.payloadHashes[index]!,
@@ -1311,8 +1320,8 @@ export class SqliteEventAppendStatements implements EventAppendStatements {
       $confidence: event.confidence,
       $verificationStatus: event.verificationStatus,
       $sourceRefsJson: canonical(event.sourceRefs),
-      $evidenceRefsJson: "[]",
-      $evidenceDigestsJson: "[]",
+      $evidenceRefsJson: canonical(event.evidenceRefs),
+      $evidenceDigestsJson: canonical(event.evidenceDigests),
       $payloadJson: event.payloadJson,
       $payloadHash: event.payloadHash,
       $previousGlobalHash: event.previousGlobalHash,
@@ -1456,6 +1465,11 @@ export interface LifecycleReplayProbe {
 
 const PREPARED = Symbol("prepared-event-append");
 const PLANNED = Symbol("planned-event-append");
+declare const retainedPlanBrand: unique symbol;
+export interface RetainedEvidenceEventPlan { readonly eventId: string; readonly [retainedPlanBrand]: true; }
+const retainedPlans = new WeakMap<object, { readonly transaction: EventAppendTransaction; readonly authority: VerifiedRetainedEvidenceAuthority; readonly command: RetainEvidenceBatchCommandV1 }>();
+const retainedPrepared = new WeakMap<object, { readonly transaction: EventAppendTransaction; readonly plan: RetainedEvidenceEventPlan; readonly items: readonly EncryptedEvidenceItemV1[] }>();
+const retainedPlanned = new WeakMap<object, EventAppendTransaction>();
 
 type InternalPrepared<T extends JsonValue> = PreparedEventAppend<T> & {
   readonly [PREPARED]: ValidatedAppendCommand;
@@ -1488,6 +1502,56 @@ export class EventAppendTransaction {
     private readonly randomId: () => string = randomUUID,
     private readonly faultInjector: EventStoreFaultInjector = NO_EVENT_STORE_FAULTS,
   ) {}
+
+  planRetainedEvidenceIdentity(authority: VerifiedRetainedEvidenceAuthority, command: RetainEvidenceBatchCommandV1): RetainedEvidenceEventPlan {
+    requireRetainedEvidenceAuthority(this.connection, authority, command);
+    const eventId = this.randomId();
+    if (!LOWER_UUID.test(eventId)) throw new EventStoreError("EVENT_ID_INVALID");
+    const plan = Object.freeze(Object.assign(Object.create(null) as object, { eventId })) as RetainedEvidenceEventPlan;
+    retainedPlans.set(plan, { transaction: this, authority, command });
+    return plan;
+  }
+
+  prepareRetainedEvidence(plan: RetainedEvidenceEventPlan, append: AppendCommand<RetainedEvidenceReceiptV1>, payloadInput: EvidenceBatchRetainedPayloadV1, itemsInput: readonly EncryptedEvidenceItemV1[]): PreparedEventAppend<RetainedEvidenceReceiptV1> {
+    const state = retainedPlans.get(plan);
+    if (!state || state.transaction !== this) throw new EventStoreError("COMMAND_INVALID");
+    const admitted = requireRetainedEvidenceAuthority(this.connection, state.authority, state.command);
+    const payload = decodeEvidenceBatchRetainedPayload(payloadInput), w = payload.witness;
+    const items = itemsInput.map(decodeEncryptedEvidenceItem), command = immutableSnapshot(append);
+    const event = command.events[0];
+    const frames = state.command.frames.map(({ content: _content, ...frame }) => frame);
+    if (canonical(admitted) !== canonical(w.authority) || w.commandId !== state.command.commandId || w.idempotencyKey !== state.command.idempotencyKey
+      || w.targetSessionId !== state.command.targetSessionId || w.conversationId !== state.command.conversationId || canonical(w.frames) !== canonical(frames)
+      || command.commandId !== w.commandId || command.idempotencyKey !== w.idempotencyKey || command.commandType !== "retain-evidence-batch"
+      || command.streamType !== "retained-evidence" || command.streamId !== `retained-evidence/${w.targetSessionId}/${w.conversationId}`
+      || command.outbox.length !== 0 || command.events.length !== 1 || command.lifecycleIntentWitness !== undefined || !event
+      || event.eventType !== "EvidenceBatchRetained" || event.eventSchemaVersion !== 1 || event.sessionId !== admitted.targetSessionId
+      || (event.parentSessionId ?? null) !== admitted.parentSessionId || event.visibilityScope !== "session" || event.sourceRefs.length !== 0
+      || canonical(event.payload) !== canonical(payload) || items.length !== payload.items.length
+      || command.context.binding.projectId !== admitted.projectId || command.context.binding.vaultId !== admitted.vaultId
+      || command.context.binding.storeId !== admitted.storeId || command.context.binding.workspaceId !== admitted.workspaceId
+      || command.context.binding.clientNamespace !== admitted.clientNamespace || command.context.binding.actorRole !== admitted.presentingActorRole
+      || command.context.binding.clientInstanceId !== admitted.presentingClientInstanceId) throw new EventStoreError("COMMAND_INVALID");
+    for (const [i, item] of items.entries()) {
+      const { formatVersion: _v, algorithm: _a, nonce: _n, tag: _t, ciphertext: _c, wrappedKey: _k, ...metadata } = item;
+      if (item.binding.eventId !== plan.eventId || canonical(metadata) !== canonical(payload.items[i])) throw new EventStoreError("COMMAND_INVALID");
+    }
+    if (canonical(event.evidenceRefs) !== canonical(items.map(item => item.binding.evidenceId))
+      || canonical(event.evidenceDigests) !== canonical(items.map(item => ({ ciphertextHash: item.ciphertextHash, keyedFingerprint: item.keyedFingerprint })))) throw new EventStoreError("COMMAND_INVALID");
+    if (!this.statements.matchesProjectIdentity(admitted.projectId, admitted.vaultId, admitted.storeId)) throw new EventStoreError("PROJECT_IDENTITY_MISMATCH");
+    const recordedAt = event.occurredAt;
+    const validated = immutableSnapshot(validateAppendCommand(command, recordedAt, () => plan.eventId, true));
+    const prepared = Object.freeze({ command, recordedAt, commandHash: retainedEvidenceIntentHash(w),
+      storedEventIds: Object.freeze([plan.eventId]), [PREPARED]: validated }) as InternalPrepared<RetainedEvidenceReceiptV1>;
+    retainedPrepared.set(prepared, { transaction: this, plan, items: Object.freeze(items) });
+    return prepared;
+  }
+
+  private refuseRetainedReplay(projectId: string, commandId: string, idempotencyKey: string): void {
+    if (!this.connection.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='retained_evidence_command_authorizations'").get()) return;
+    if (this.connection.prepare("SELECT 1 FROM retained_evidence_command_authorizations WHERE project_id=$p AND (command_id=$c OR idempotency_key=$i)")
+      .get({ $p: projectId, $c: commandId, $i: idempotencyKey })) throw new EventStoreError("IDEMPOTENCY_CONFLICT");
+  }
 
   prepare<T extends JsonValue>(
     command: AppendCommand<T>,
@@ -1538,6 +1602,7 @@ export class EventAppendTransaction {
       prepared.command.idempotencyKey,
     );
     if (prior === undefined) return null;
+    this.refuseRetainedReplay(prepared.command.context.binding.projectId, prior.commandId, prepared.command.idempotencyKey);
     assertFreshStartConnectionAllowed(this.connection, "command-recovery");
     const authorizationMatches = expectation === null
       ? prior.authorizationRecord === null
@@ -1572,6 +1637,7 @@ export class EventAppendTransaction {
       probe.idempotencyKey,
     );
     if (prior === undefined) return null;
+    this.refuseRetainedReplay(probe.context.binding.projectId, prior.commandId, probe.idempotencyKey);
     if (prior.commandId !== probe.commandId
       || prior.commandHash !== probe.authoritativeIntentHash
       || prior.authorizationRecord === null
@@ -1619,8 +1685,13 @@ export class EventAppendTransaction {
   ): PlannedEventAppend<T> {
     const prepared = requirePrepared(preparedInput);
     const { command } = prepared;
+    const retained = retainedPrepared.get(prepared);
+    if (command.commandType === "retain-evidence-batch" && (!retained || retained.transaction !== this)) throw new EventStoreError("COMMAND_INVALID");
+    if (!retained && command.events.some(event => event.eventType === "EvidenceBatchRetained"
+      || event.evidenceRefs.length !== 0 || event.evidenceDigests.length !== 0)) throw new EventStoreError("COMMAND_INVALID");
     const branchScopeId = command.context.workspace.kind === "git"
-      ? this.branchScopes.resolveOrCreate(
+      ? retained ? this.branchScopes.inspect(this.connection, command.context.binding.projectId, command.context.workspace) ?? undefined
+        : this.branchScopes.resolveOrCreate(
           this.connection,
           command.context.binding.projectId,
           {
@@ -1636,7 +1707,7 @@ export class EventAppendTransaction {
       command.streamId,
     );
     if (stream === undefined) {
-      this.statements.insertStream(
+      if (!retained) this.statements.insertStream(
         command.context.binding.projectId,
         command.streamId,
         command.streamType,
@@ -1661,14 +1732,28 @@ export class EventAppendTransaction {
       this.statements.readGlobalTail(),
       branchScopeId,
     );
-    const storedResponse = buildStoredCommandResponse(command.publicResponse, events);
-    return Object.freeze({
+    if (retained) {
+      const event = events[0]!, payload = assertRetainedStoredEvent(event);
+      if (!payload) throw new EventStoreError("COMMAND_INVALID");
+      const last = payload.witness.frames.at(-1)!;
+      // This pure complete-budget guard excludes expectedHead. No caller can skip it
+      // by invoking protected writer primitives directly after preparation.
+      assertRetainedEvidenceCommitBundle({ event, items: retained.items, authorization: payload.witness.authority, expectedHead: null,
+        nextHead: { targetSessionId: payload.witness.targetSessionId, conversationId: payload.witness.conversationId,
+          lastFrameId: last.frameId, lastOrdinal: last.ordinal, version: String(event.streamVersion) } });
+    }
+    const publicResponse = retained ? { ...decodeRetainedEvidenceReceipt(command.publicResponse), eventPosition: String(events[0]!.globalPosition), finalStreamVersion: String(events[0]!.streamVersion) } : command.publicResponse;
+    const storedResponse = buildStoredCommandResponse(publicResponse, events) as StoredCommandResponse<T>;
+    if (retained) decodeRetainedEvidenceStoredResult(storedResponse);
+    const planned = Object.freeze({
       plannedOnly: true as const,
       events: Object.freeze(events),
       storedResponse,
       responseHash: responseHash(storedResponse),
       [PLANNED]: prepared,
     }) as InternalPlanned<T>;
+    if (retained) retainedPlanned.set(planned, this);
+    return planned;
   }
 
   appendPlanned<T extends JsonValue>(plannedInput: PlannedEventAppend<T>): EventAppendBatch<T> {
@@ -1676,6 +1761,17 @@ export class EventAppendTransaction {
     const planned = requirePlanned(plannedInput);
     const prepared = planned[PLANNED];
     const { command } = prepared;
+    const retained = retainedPrepared.get(prepared);
+    if (command.commandType === "retain-evidence-batch" && (!retained || retainedPlanned.get(planned) !== this)) throw new EventStoreError("COMMAND_INVALID");
+    if (!retained && planned.events.some(event => event.eventType === "EvidenceBatchRetained"
+      || event.evidenceRefs.length !== 0 || event.evidenceDigests.length !== 0)) throw new EventStoreError("COMMAND_INVALID");
+    if (retained) {
+      if (retained.transaction !== this) throw new EventStoreError("COMMAND_INVALID");
+      this.maintenance.assertAppendAllowed(this.connection);
+      const stream = this.statements.readStream(command.context.binding.projectId, command.streamId);
+      if (stream === undefined) this.statements.insertStream(command.context.binding.projectId, command.streamId, command.streamType, prepared.recordedAt);
+      else if (stream.streamType !== command.streamType || stream.currentVersion !== command.expectedStreamVersion) throw new EventStoreError("EVENT_CONFLICT");
+    }
     const faultContext: EventStoreFaultContext = {
       projectId: command.context.binding.projectId,
       commandId: command.commandId,
@@ -1735,6 +1831,19 @@ export class EventAppendTransaction {
   ): void {
     const prepared = requirePrepared(preparedInput);
     const validated = prepared[PREPARED];
+    const retained = retainedPrepared.get(prepared);
+    if (prepared.command.commandType === "retain-evidence-batch" && (!retained || retained.transaction !== this)) throw new EventStoreError("COMMAND_INVALID");
+    if (!retained && batch.events.some(event => event.eventType === "EvidenceBatchRetained"
+      || event.evidenceRefs.length !== 0 || event.evidenceDigests.length !== 0)) throw new EventStoreError("COMMAND_INVALID");
+    if (retained) {
+      if (retained.transaction !== this || authorization !== null || batch.events.length !== 1) throw new EventStoreError("COMMAND_INVALID");
+      const event = batch.events[0]!;
+      assertRetainedStoredEvent(event); decodeRetainedEvidenceStoredResult(batch.storedResponse);
+      const row = this.connection.prepare("SELECT authorization_json FROM retained_evidence_command_authorizations WHERE project_id=$p AND command_id=$c AND idempotency_key=$i AND event_id=$e")
+        .get({ $p: event.projectId, $c: event.commandId, $i: event.idempotencyKey, $e: event.eventId });
+      const state = retainedPlans.get(retained.plan)!;
+      if (!row || row.authorization_json !== canonical(requireRetainedEvidenceAuthority(this.connection, state.authority, state.command))) throw new EventStoreError("COMMAND_INVALID");
+    }
     if (authorization === null) {
       if (validated.lifecycleIntentJson !== null) {
         throw new EventStoreError("COMMAND_INVALID", { field: "authorization" });
