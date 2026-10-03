@@ -14,6 +14,22 @@ function policy(rules: TrustedRedactionRuleV1[] = [], policyId = "policy-1"): Tr
 function redact(content: unknown, rules: TrustedRedactionRuleV1[] = [], json = false) { const bounded = input(content, json); try { return redactEvidence(bounded, policy(rules)); } finally { bounded.canonicalOriginalBytes.fill(0); } }
 function absent(result: unknown, value: string) { assert.equal(JSON.stringify(result).includes(value), false, "redacted encryption input must exclude matched value"); }
 
+test("mandatory secret_key and aws_secret_access_key JSON fields redact without optional rules", () => {
+  const secret = "synthetic-catalogue-json-credential";
+  const result = redact({ secret_key: secret, aws_secret_access_key: secret }, [], true);
+  absent(result, secret);
+  assert.equal(result.spanCount, 2);
+  assert.deepEqual(result.frames[0]!.content, { secret_key: "[REDACTED]", aws_secret_access_key: "[REDACTED]" });
+  assert.ok(result.frames[0]!.manifest.every(span => span.ruleId === "builtin:credential-field"));
+});
+test("mandatory secret_key and aws_secret_access_key text assignments redact without optional rules", () => {
+  const secret = "synthetic-catalogue-text-credential";
+  const result = redact(`secret_key=${secret}\naws_secret_access_key: ${secret}`);
+  absent(result, secret);
+  assert.equal(result.spanCount, 2);
+  assert.equal(result.frames[0]!.content, "secret_key=[REDACTED]\naws_secret_access_key: [REDACTED]");
+  assert.ok(result.frames[0]!.manifest.every(span => span.ruleId === "builtin:credential-field"));
+});
 test("mandatory credential fields authorization headers and private-key blocks redact with no optional rules", () => {
   const secret = "synthetic-credential-value";
   const content = { password: secret, nested: { api_key: secret, authorization: `Bearer ${secret}` }, harmless: "visible", key: `-----BEGIN PRIVATE KEY-----\n${secret}\n-----END PRIVATE KEY-----` };

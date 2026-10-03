@@ -15,7 +15,7 @@ const PLACEHOLDER = "[REDACTED]";
 const CREDENTIAL_RULE = "builtin:credential-field";
 const AUTHORIZATION_RULE = "builtin:authorization-header";
 const PRIVATE_KEY_RULE = "builtin:private-key-block";
-const CREDENTIAL_FIELDS = new Set(["password", "passwd", "secret", "clientsecret", "apikey", "accesstoken", "refreshtoken", "token", "privatekey", "credential", "credentials"]);
+const CREDENTIAL_FIELDS = new Set(["password", "passwd", "secret", "secretkey", "awssecretaccesskey", "clientsecret", "apikey", "accesstoken", "refreshtoken", "token", "privatekey", "credential", "credentials"]);
 function unavailable(): never { throw new RetainedEvidenceError(POLICY); }
 function fieldName(value: string): string { return value.toLowerCase().replace(/[_-]/g, ""); }
 function fieldRule(value: string): string | undefined {
