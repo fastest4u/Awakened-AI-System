@@ -38,9 +38,9 @@ require('node:module').syncBuiltinESMExports();`);
   const manifest = join(root, 'release.json');
   writeFileSync(manifest, JSON.stringify({ initializationId: randomUUID(), release: {
     profileVersion: 1, releaseId, buildIdentityHash: build.buildIdentityHash,
-    // Independently checked schema-8 golden; changed schema must update the
+    // Independently checked schema-9 golden; changed schema must update the
     // reviewed release contract, not silently bless the runtime's own answer.
-    schemaIdentityHash: '2dd25f0de16cdd89a1022b83fcaa35cf21c59374c132b2a2094db96adf4856a2',
+    schemaIdentityHash: 'f10eb1976f2fd97d899163d930a91e21f66daaccf448a76334d5c9b13ffd6df1',
     configurationHash: hash({ projectRoot: root, v2VaultRoot: vault, v1ArchiveRoot: archive, releaseId }),
     capabilityManifestHash: hash({ profile: 'fresh-start', version: 1, tools: ['memory_v2Status'], content: 'unavailable' }),
     recoveryPolicyHash: hash({ profile: 'fresh-start', version: 1, productionReady: false, promotion: 'closed' }),
@@ -55,7 +55,7 @@ require('node:module').syncBuiltinESMExports();`);
   };
   const prepared = admin('initialize-fresh'); assert.equal(prepared.status, 0, prepared.stderr);
   const status = JSON.parse(prepared.stdout);
-  assert.equal(status.mode, 'prepared'); assert.equal(status.generation, '0'); assert.equal(status.schemaVersion, 8);
+  assert.equal(status.mode, 'prepared'); assert.equal(status.generation, '0'); assert.equal(status.schemaVersion, 9);
   assert.equal(status.productionReady, false); assert.equal(status.buildIdentityHash, build.buildIdentityHash);
   assert.equal(status.releaseId, releaseId);
   assert.deepEqual(Object.keys(status).sort(), ['profile', 'profileVersion', 'projectId', 'vaultId', 'storeId', 'releaseId',

@@ -103,6 +103,13 @@ const APPROVED_SEALED_AND_ROLLOUT_SOURCE_DIFF = Object.freeze([
   "src/orchestrator/migration/v2-shadow-projection.ts",
   "src/orchestrator/parity/v2-expected-difference.ts",
   "src/orchestrator/parity/v2-snapshot-parity.ts",
+  "src/orchestrator/privacy/evidence-contracts.ts",
+  "src/orchestrator/privacy/evidence-envelope.ts",
+  "src/orchestrator/privacy/evidence-key-provider.ts",
+  "src/orchestrator/privacy/redaction.ts",
+  "src/orchestrator/privacy/retained-evidence-codec.ts",
+  "src/orchestrator/privacy/retained-evidence-intent.ts",
+  "src/orchestrator/privacy/retained-evidence.repository.ts",
   "src/orchestrator/projections/builder.ts",
   "src/orchestrator/projections/checksum.ts",
   "src/orchestrator/projections/contracts.ts",
@@ -135,6 +142,7 @@ const APPROVED_SEALED_AND_ROLLOUT_SOURCE_DIFF = Object.freeze([
   "src/orchestrator/storage/migrations/0006-v2-rollout-control-plane.ts",
   "src/orchestrator/storage/migrations/0007-v2-shadow-migration.ts",
   "src/orchestrator/storage/migrations/0008-v2-fresh-start.ts",
+  "src/orchestrator/storage/migrations/0009-retained-evidence.ts",
   "src/orchestrator/storage/migrations/registry.ts",
   "src/orchestrator/storage/node-sqlite-driver.ts",
   "src/orchestrator/storage/project-store-bootstrap.service.ts",
@@ -828,8 +836,8 @@ test("release configuration gates lifecycle V2 without production routing", () =
   assertWorkflowReleaseContract(ci, stress);
 
   const smoke = source("scripts/smoke-worker.js");
-  assert.match(smoke, /\[1,2,3,4,5,6,7,8\]/);
-  assert.match(smoke, /schemaVersion !== 8/);
+  assert.match(smoke, /\[1,2,3,4,5,6,7,8,9\]/);
+  assert.match(smoke, /schemaVersion !== 9/);
   assert.match(smoke, /migration0007\?\.name !== "v2-shadow-migration"/);
   assert.match(smoke, /migration0007\?\.checksum !== "fc3becb6329a7bcbc9c6775c436260a61cca6dffa432f8817bc583623df2c32a"/);
   assert.match(smoke, /manifest\.schemaVersion !== 1/);
