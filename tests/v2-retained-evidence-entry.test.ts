@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { tmpdir } from "node:os";
 import { spawn, spawnSync } from "node:child_process";
+import { StringDecoder } from "node:string_decoder";
 import { once } from "node:events";
 import { createHash } from "node:crypto";
 import { MessageChannel, Worker } from "node:worker_threads";
@@ -158,6 +159,61 @@ test("fixed retained runner rejects unknown groups before compiler or build", as
   assert.equal(await module.runRetainedEvidenceGate({ group: "unknown" }), 1);
   const result = spawnSync(process.execPath, [fileURLToPath(url), "--group", "unknown"], { encoding: "utf8", windowsHide: true });
   assert.equal(result.status, 1); assert.match(result.stderr, /RETAINED_EVIDENCE_ARGUMENTS_INVALID/);
+});
+
+const nestedSpecSummary = ["✔ nested fixture (1ms)", "ℹ tests 1", "ℹ suites 0", "ℹ pass 1", "ℹ fail 0",
+  "ℹ cancelled 0", "ℹ skipped 0", "ℹ todo 0", "ℹ duration_ms 2", ""].join("\n");
+const outerSpecSummary = ["✔ outer fixture (3ms)", "ℹ tests 7", "ℹ suites 2", "ℹ pass 4", "ℹ fail 0",
+  "ℹ cancelled 0", "ℹ skipped 2", "ℹ todo 1", "ℹ duration_ms 12.25", ""].join("\n");
+
+test("fixed retained runner selects the final outer spec summary after forwarded nested summaries", async () => {
+  const { parseFinalSpecCounts } = await import(new URL("../../scripts/run-v2-retained-evidence.js", import.meta.url).href);
+  const output = nestedSpecSummary + nestedSpecSummary + outerSpecSummary;
+  for (const stdout of [output, output.replaceAll("\n", "\r\n")]) {
+    assert.deepEqual(parseFinalSpecCounts(stdout), { tests: 7, suites: 2, pass: 4, fail: 0, cancelled: 0, skipped: 2, todo: 1 });
+  }
+});
+
+test("fixed retained runner never falls back to a nested summary when the final footer is incomplete", async () => {
+  const { parseFinalSpecCounts } = await import(new URL("../../scripts/run-v2-retained-evidence.js", import.meta.url).href);
+  const cases = [
+    ["missing", "✔ outer fixture (3ms)\n"],
+    ["partial", "✔ outer fixture (3ms)\nℹ tests 7\nℹ suites 2\n"],
+    ["truncated terminator", outerSpecSummary.slice(0, -1)],
+    ["missing duration", outerSpecSummary.replace("ℹ duration_ms 12.25\n", "")],
+    ["malformed count", outerSpecSummary.replace("ℹ tests 7", "ℹ tests unknown")],
+    ["reordered fields", outerSpecSummary.replace("ℹ suites 2\nℹ pass 4", "ℹ pass 4\nℹ suites 2")],
+    ["duplicate field", outerSpecSummary.replace("ℹ pass 4", "ℹ pass 4\nℹ pass 4")],
+    ["duplicate opener", outerSpecSummary.replace("ℹ tests 7", "ℹ tests 7\nℹ tests 7")],
+    ["adjacent conflicting footers", nestedSpecSummary + outerSpecSummary.replace("✔ outer fixture (3ms)\n", "")],
+    ["trailing fragment", outerSpecSummary + "ℹ tests"],
+    ["trailing result", outerSpecSummary + "✔ unfinished outer fixture (4ms)\n"]
+  ];
+  for (const [name, footer] of cases) assert.deepEqual(parseFinalSpecCounts(nestedSpecSummary + footer), {}, name);
+});
+
+test("fixed retained runner refuses unsafe or contradictory spec counts", async () => {
+  const { parseFinalSpecCounts } = await import(new URL("../../scripts/run-v2-retained-evidence.js", import.meta.url).href);
+  const cases = [
+    ["wrong disposition total", outerSpecSummary.replace("ℹ tests 7", "ℹ tests 8")],
+    ["unsafe tests", outerSpecSummary.replace("ℹ tests 7", "ℹ tests 9007199254740992")],
+    ["unsafe suites", outerSpecSummary.replace("ℹ suites 2", "ℹ suites 9007199254740992")],
+    ["negative count", outerSpecSummary.replace("ℹ cancelled 0", "ℹ cancelled -1")],
+    ["fractional count", outerSpecSummary.replace("ℹ skipped 2", "ℹ skipped 2.5")],
+    ["noncanonical count", outerSpecSummary.replace("ℹ pass 4", "ℹ pass 04")],
+    ["nonfinite duration", outerSpecSummary.replace("ℹ duration_ms 12.25", "ℹ duration_ms Infinity")],
+    ["contradictory failure appendix", outerSpecSummary + "\n✖ failing tests:\n\ntest at fixture.js:1:1\n✖ failed fixture\n"]
+  ];
+  for (const [name, stdout] of cases) assert.deepEqual(parseFinalSpecCounts(stdout), {}, name);
+});
+
+test("fixed retained runner keeps coherent failure counts without merging a later summary fragment", async () => {
+  const { parseFinalSpecCounts } = await import(new URL("../../scripts/run-v2-retained-evidence.js", import.meta.url).href);
+  const failed = ["✖ outer fixture (3ms)", "ℹ tests 4", "ℹ suites 1", "ℹ pass 1", "ℹ fail 1", "ℹ cancelled 1",
+    "ℹ skipped 1", "ℹ todo 0", "ℹ duration_ms 8.5", "", "✖ failing tests:", "", "test at fixture.js:1:1",
+    "✖ failed fixture", "  Error: fixture failure", ""].join("\n");
+  assert.deepEqual(parseFinalSpecCounts(nestedSpecSummary + failed), { tests: 4, suites: 1, pass: 1, fail: 1, cancelled: 1, skipped: 1, todo: 0 });
+  assert.deepEqual(parseFinalSpecCounts(nestedSpecSummary + failed + "ℹ tests 8\n"), {});
 });
 
 const encodeObserved = (value: unknown) => Buffer.from(JSON.stringify(value, (_key, item: unknown) => typeof item === "bigint" ? item.toString() : item));
@@ -318,6 +374,29 @@ test("shared fixed-stage runner observes actual native output and refuses overla
     assert.ok(Buffer.concat(output).includes(Buffer.from("observed-native-error")));
     assert.equal(existsSync(join(root, ".fresh-start-foundation.lock")), false);
     t.diagnostic(JSON.stringify({ scope: "shared-fixed-stages", nativeCode: receipts[0].nativeCode, closure: receipts[0].closure, outputBytes: Buffer.concat(output).length }));
+    const failedReceipts: any[] = [], failedDecoder = new StringDecoder("utf8");
+    let failedStdout = "", decodedChunks = 0;
+    const nestedOutput = nestedSpecSummary + nestedSpecSummary + outerSpecSummary;
+    const failedCode = await module.runFixedStages({ root, maximumMs: 30000, timeoutMs: 30000, profile: "fixture", forwardOutput: false,
+      stages: () => [["native-failure", ["-e", `process.stdout.write(${JSON.stringify(nestedOutput)});process.exitCode=17`]],
+        ["must-not-run", ["-e", "process.exitCode=0"]]],
+      observeOutput: (_stage: string, kind: string, bytes: Buffer) => {
+        if (kind === "stdout") for (let offset = 0; offset < bytes.length; offset++) {
+          // Rechunk real captured native bytes deterministically, including the
+          // multibyte spec markers, through the decoder used by the receipt path.
+          failedStdout += failedDecoder.write(bytes.subarray(offset, offset + 1)); decodedChunks++;
+        }
+      },
+      observeStage: (value: unknown) => failedReceipts.push(value) });
+    failedStdout += failedDecoder.end();
+    assert.equal(decodedChunks, Buffer.byteLength(nestedOutput));
+    assert.deepEqual(retained.parseFinalSpecCounts(failedStdout),
+      { tests: 7, suites: 2, pass: 4, fail: 0, cancelled: 0, skipped: 2, todo: 1 });
+    assert.equal(failedCode, 17); assert.equal(failedReceipts.length, 1); assert.equal(failedReceipts[0].nativeCode, 17);
+    assert.equal(failedReceipts[0].cleanup, "complete"); assert.equal(failedReceipts[0].closure, "windows-job-active-zero");
+    assert.equal(existsSync(join(root, ".fresh-start-foundation.lock")), false);
+    t.diagnostic(JSON.stringify({ scope: "chunked-passing-counts-native-failure", decodedChunks,
+      nativeCode: failedReceipts[0].nativeCode, closure: failedReceipts[0].closure }));
   } finally {
     release(); await run;
     const current = lstatSync(root, { bigint: true });

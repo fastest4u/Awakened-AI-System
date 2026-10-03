@@ -62,6 +62,33 @@ function compiledIdentity(root) {
   return { files: inputs.length, sha256: sha(JSON.stringify(inputs)) };
 }
 
+/** Internal receipt parser seam; native exit and closure remain independent. */
+export function parseFinalSpecCounts(stdout) {
+  const lines = stdout.split(/\r?\n/);
+  if (lines.pop() !== '') return {};
+  const keys = ['tests', 'suites', 'pass', 'fail', 'cancelled', 'skipped', 'todo'];
+  const summaryLine = line => /^ℹ (?:tests|suites|pass|fail|cancelled|skipped|todo|duration_ms)(?: |$)/.test(line);
+  // Locate the final summary field, even when malformed or incomplete. Never
+  // fall back to an earlier complete footer forwarded by a nested test runner.
+  const end = lines.findLastIndex(summaryLine), start = end - keys.length;
+  if (start < 0 || summaryLine(lines.slice(0, start).findLast(line => line !== '') ?? '')) return {};
+  const counts = {};
+  for (const [index, key] of keys.entries()) {
+    const match = new RegExp(`^ℹ ${key} (0|[1-9]\\d*)$`).exec(lines[start + index]);
+    if (!match || !Number.isSafeInteger(Number(match[1]))) return {};
+    counts[key] = Number(match[1]);
+  }
+  const duration = /^ℹ duration_ms ((?:0|[1-9]\d*)(?:\.\d+)?)$/.exec(lines[end]);
+  const total = counts.pass + counts.fail + counts.cancelled + counts.skipped + counts.todo;
+  if (!duration || !Number.isFinite(Number(duration[1])) || !Number.isSafeInteger(total) || total !== counts.tests) return {};
+  // Successful spec output ends at its footer. On native failures Node appends
+  // its explicit failure report; it must agree with the same complete counts.
+  const suffix = lines.slice(end + 1);
+  if (suffix.length && (counts.fail + counts.cancelled === 0 || suffix[0] !== '' || suffix[1] !== '✖ failing tests:'
+    || suffix[2] !== '' || !suffix[3]?.startsWith('test at '))) return {};
+  return counts;
+}
+
 /** Internal owned-root seam; both CLI profiles remain fixed. No caller-supplied stages/files. */
 export async function runRetainedEvidenceGate({ root = repository, group = 'focused', timeoutMs = 1500000, signal } = {}) {
   if (!['focused', 'acceptance'].includes(group)) { process.stderr.write('RETAINED_EVIDENCE_ARGUMENTS_INVALID\n'); return 1; }
@@ -87,11 +114,7 @@ export async function runRetainedEvidenceGate({ root = repository, group = 'focu
     observeStage(receipt, currentRoot) {
       const value = streams.get(receipt.stage) ?? { bytes: 0, hash: createHash('sha256'), stdout: '', stderr: '', overflow: false };
       value.stdout += value.decoder?.end() ?? '';
-      const counts = {};
-      for (const key of ['tests', 'suites', 'pass', 'fail', 'cancelled', 'skipped', 'todo']) {
-        const found = [...value.stdout.matchAll(new RegExp(`^ℹ ${key} (\\d+)\\r?$`, 'gm'))];
-        if (found.length === 1) counts[key] = Number(found[0][1]);
-      }
+      const counts = parseFinalSpecCounts(value.stdout);
       const isTest = stages.find(([name]) => name === receipt.stage)?.[1][0] === '--test';
       const validCounts = !isTest || Number.isSafeInteger(counts.tests) && counts.tests > 0 && counts.fail === 0 && counts.cancelled === 0
         && counts.pass + counts.skipped + counts.todo === counts.tests;
