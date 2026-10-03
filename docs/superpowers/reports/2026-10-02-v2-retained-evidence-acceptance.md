@@ -1,6 +1,6 @@
 # Private retained-evidence qualification
 
-Status: Native qualification complete on `a5d743d8517c41a081bad9b189307cca23bb6a48`, pending final whole-increment evidence/documentation review. No Task 8/foundation acceptance, F2 completion, release qualification or activation is claimed.
+Status: Task 8 and the private F2-A retained-evidence foundation are independently accepted after final whole-increment evidence/documentation review of `ad3a983..7767b0f`. Native qualification remains on `a5d743d8517c41a081bad9b189307cca23bb6a48`. F2 completion, release qualification and activation are not claimed.
 
 Task 8's implementation base is `e21e577c76b73059dc2dc910c3bec815a72a1125`; the approved whole-increment source base is `ad3a983cc13a040dbcf3e21b9d2540bd3eeeb1de`. The exact tested candidate, complete native matrix and measured identities are recorded below. The fixed local runner is `node scripts/run-v2-retained-evidence.js --group acceptance`; its default `focused` profile builds prerequisites and runs the eight retained-evidence files. Both profiles share the existing exclusive output owner and Windows Job closure implementation. Unknown CLI groups/files are refused.
 
@@ -12,7 +12,7 @@ Secrecy checks inspect actual rows from every SQLite table including outbox, own
 
 The nine desktop qualification rows remain `host-capability-unverified`. Remaining F2 work includes public workflows, governed canonical memory, erasure/restoration fences, operational rotation/key recovery, large-frame support, actual desktop capture/private persistence and finalization. F3 still owns new-V2 data backup/restore and exact-release qualification. F4 still requires approved live cutover and verification. No V1 migration, host transcript/configuration access, network provider, installation, deployment or activation was performed.
 
-Historical F1/private-read/native-content evidence retains its original scope, failures, platform skips and uncertain roots. Task 8 does not relabel those records as a clean release. Foundation acceptance requires independent Task 8 and whole-increment review after the recorded verification.
+Historical F1/private-read/native-content evidence retains its original scope, failures, platform skips and uncertain roots. Task 8 does not relabel those records as a clean release. Independent Task 8 and whole-increment reviews accepted only the approved private F2-A foundation after the recorded verification.
 
 
 ## Completed native qualification
@@ -59,7 +59,7 @@ The emitted entry group passed 55/55 on this run's measured build. Its assertion
 
 Post-run read-only checks confirmed the same HEAD, clean tracked status, an absent `.fresh-start-foundation.lock`, and no remaining native/compiler/test session. Source, compiled-tree and artifact identities above are the actual final qualification identities, not measurements inferred from another candidate.
 
-This report and the roadmap are the only tracked changes after the tested source commit. Their containing commit is a later documentation-only handoff; its exact SHA is recorded in the controller/task handoff rather than embedded into its own contents. No self-hash loop, new product build or qualification of a different runtime candidate is claimed. Final whole-increment evidence/documentation review remains pending.
+This report and the roadmap are the only tracked changes after the tested source commit. The reviewed documentation handoff is `7767b0f6f11fa275fb84518e50e50d97c73799d2`, not a runtime qualification. This factual acceptance annotation is a subsequent documentation-only closure; its exact SHA is recorded in the controller/task handoff rather than embedded into its own contents. No self-hash loop, new product build or qualification of a different runtime candidate is claimed. Final whole-increment evidence/documentation review and controller acceptance are complete for Task 8/private F2-A foundation only.
 
 ## Fixed underlying commands
 
@@ -100,7 +100,7 @@ The first storage output digest was `b9b530fe7ac27356b9fda6f304be55c50d3ece8ecf3
 
 ## Review findings and seven-topic disposition
 
-The strongest initial whole-source review read the complete 613443-byte/7787-line `ad3a983..1cefcb0` diff, all eight task reports and the then-current 27 rulings. It found no Critical/Important source issue at that time and retained five nonblocking Minors. The later native accounting fact produced Important addendum `I-FINAL-1`. The same narrow round 4 correction is the single combined final corrective wave: scoped review of `1cefcb0..a5d743d` marks it addressed with no new Critical/Important. The same strongest reviewer has also completed the native/fix supplement, confirming I-FINAL-1 addressed and no new blocking source finding. Final documentation review and controller acceptance remain pending.
+The strongest initial whole-source review read the complete 613443-byte/7787-line `ad3a983..1cefcb0` diff, all eight task reports and the then-current 27 rulings. It found no Critical/Important source issue at that time and retained five nonblocking Minors. The later native accounting fact produced Important addendum `I-FINAL-1`. The same narrow round 4 correction is the single combined final corrective wave: scoped review of `1cefcb0..a5d743d` marks it addressed with no new Critical/Important. The same strongest reviewer has also completed the native/fix supplement, confirming I-FINAL-1 addressed and no new blocking source finding. Final whole-increment review of `ad3a983cc13a040dbcf3e21b9d2540bd3eeeb1de..7767b0f6f11fa275fb84518e50e50d97c73799d2` now accepts the approved private F2-A increment: no Critical or Important findings remain open, I-FINAL-1 is addressed, and the same five Minors remain explicit nonblocking follow-ups. Controller acceptance covers Task 8/private F2-A foundation only.
 
 The five Minor follow-ups are retained explicitly:
 
