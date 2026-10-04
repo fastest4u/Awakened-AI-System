@@ -28,7 +28,7 @@ The release workflow qualifies a candidate; it does not deploy, create tags/bran
 
 ## Complete nonlegacy test profile
 
-PR feedback and release qualification both use the existing `npm test` command and `scripts/run-test-profile.js`. This is the complete default profile, not a newly selected small unit-test list. Keep test compilation, serial runner settings, argument refusal and exit/signal propagation unchanged.
+PR feedback and release qualification both use the existing `npm test` command and `scripts/run-test-profile.js`. This is the complete default profile, not a newly selected small unit-test list. A separate human-approved bounded scheduling amendment on 2026-10-04 permits only the exact top-level compiled files `qualified-checkpoint-migration.test.js`, `session-end-effective-state-migration.test.js` and `qualified-checkpoint-quick-integrity.test.js` to run first in one native harness with `--test-concurrency=2`. Drain that harness fully before every other selected file runs in a second harness with `--test-concurrency=1`; future files and nested lookalikes remain serial. Omit empty cohorts safely. Keep test compilation, argument refusal, reporter, environment/cwd/spawn controls and exit/signal propagation. A normal failure in either cohort fails the aggregate, with the serial remainder still executed after a normally completed first cohort; signals or spawn errors stop continuation with failure. This scheduling amendment is separate from installation-policy A and does not authorize its implementation. Full-suite and actual workload timing qualification remain pending.
 
 Only these exact root-relative compiled test filenames are excluded:
 

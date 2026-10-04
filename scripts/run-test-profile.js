@@ -20,6 +20,12 @@ const legacyDataMigrationTests = new Set([
   "v2-shadow-migration-runner.test.js",
   "v2-shadow-migration-rehearsal.test.js",
 ]);
+// Only these reviewed, top-level files own independent temporary SQLite stores.
+const pairedTests = new Set([
+  "qualified-checkpoint-migration.test.js",
+  "session-end-effective-state-migration.test.js",
+  "qualified-checkpoint-quick-integrity.test.js",
+]);
 
 // Internal fixture seam; the CLI always uses this checkout's compiled tests.
 export function selectDefaultTests(testRoot = compiledTests) {
@@ -35,20 +41,33 @@ export function selectDefaultTests(testRoot = compiledTests) {
 }
 
 export async function runDefaultTests(testRoot = compiledTests, executable = process.execPath) {
-  const targets = selectDefaultTests(testRoot).map(path => relative(root, path));
+  const paired = [];
+  const serial = [];
+  for (const path of selectDefaultTests(testRoot)) {
+    const name = relative(testRoot, path).replaceAll("\\", "/");
+    (pairedTests.has(name) ? paired : serial).push(relative(root, path));
+  }
   // A runner launched from node:test must start a fresh native test harness.
   const { NODE_TEST_CONTEXT: _context, ...environment } = process.env;
-  const result = await new Promise((resolveRun, rejectRun) => {
-    const child = spawn(executable, ["--test", "--test-concurrency=1", "--test-reporter=spec", ...targets], {
-      cwd: root, shell: false, windowsHide: true, stdio: "inherit", env: environment,
+  let exitCode = 0;
+  for (const [targets, concurrency] of [[paired, 2], [serial, 1]]) {
+    if (targets.length === 0) continue;
+    const result = await new Promise((resolveRun, rejectRun) => {
+      const child = spawn(executable, ["--test", `--test-concurrency=${concurrency}`, "--test-reporter=spec", ...targets], {
+        cwd: root, shell: false, windowsHide: true, stdio: "inherit", env: environment,
+      });
+      child.once("error", rejectRun);
+      child.once("close", (code, signal) => resolveRun({ code, signal }));
     });
-    child.once("error", rejectRun);
-    child.once("close", (code, signal) => resolveRun({ code, signal }));
-  });
-  if (result.signal !== null) {
-    try { process.kill(process.pid, result.signal); }
-    catch { process.exitCode = 1; }
-  } else process.exitCode = result.code ?? 1;
+    if (result.signal !== null) {
+      process.exitCode = 1;
+      try { process.kill(process.pid, result.signal); }
+      catch { /* Preserve failure if this platform cannot relay the signal. */ }
+      return;
+    }
+    if (result.code !== 0 && exitCode === 0) exitCode = result.code ?? 1;
+  }
+  process.exitCode = exitCode;
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

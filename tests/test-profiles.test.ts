@@ -21,6 +21,11 @@ const retained = [
   "qualified-checkpoint-migration", "session-end-effective-state-migration", "project-store-bootstrap",
   "project-store-upgrade", "project-store-upgrade-phase-runner", "projection-image-metadata",
 ].map(name => `${name}.test.js`);
+const paired = [
+  "qualified-checkpoint-migration.test.js",
+  "qualified-checkpoint-quick-integrity.test.js",
+  "session-end-effective-state-migration.test.js",
+];
 const fullCommand = 'npm run test:build && node --test --test-concurrency=1 --test-reporter=spec "dist-test/tests/**/*.test.js"';
 
 async function profile() {
@@ -54,6 +59,149 @@ function run(f: ReturnType<typeof fixture>, executable?: string) {
     env: { ...process.env, NODE_TEST_CONTEXT: "child-v8" },
   });
 }
+
+// Real test processes coordinate through private fixture files. Removing the
+// two-file cohort, admitting a lookalike, or starting the remainder early breaks this proof.
+function schedulingFixture(failures: string[] = []) {
+  const serial = ["a.test.js", "future-migration.test.js", "z.test.js",
+    "nested/qualified-checkpoint-migration.test.js",
+    "nested/qualified-checkpoint-quick-integrity.test.js",
+    "nested/session-end-effective-state-migration.test.js"];
+  const f = fixture([...excluded, ...paired, ...serial]);
+  for (const name of [...paired, ...serial]) {
+    const isPaired = paired.includes(name);
+    writeFileSync(join(f.tests, name), `const {test}=require('node:test'); const fs=require('node:fs'); const assert=require('node:assert/strict');
+const log=${JSON.stringify(join(f.path, "order.log"))};
+const record=event=>fs.appendFileSync(log,event+':'+${JSON.stringify(name)}+'\\n');
+test(${JSON.stringify(name)},async()=>{
+  assert.equal(process.cwd(),${JSON.stringify(join(root, "."))});
+  record('start');
+  ${isPaired ? `fs.writeFileSync(${JSON.stringify(join(f.path, `${name}.started`))},'started');
+  const peers=${JSON.stringify(paired.filter(other => other !== name).map(other => join(f.path, `${other}.started`)))};
+  const deadline=Date.now()+1500;
+  while(!peers.some(peer=>fs.existsSync(peer)) && Date.now()<deadline) await new Promise(r=>setTimeout(r,5));` : ""}
+  await new Promise(r=>setTimeout(r,${isPaired ? 75 : 5}));
+  record('end');
+  ${isPaired ? "setTimeout(()=>record('drained'),75);" : ""}
+  ${failures.includes(name) ? `throw Error(${JSON.stringify(`controlled failure:${name}`)});` : ""}
+});`);
+  }
+  return f;
+}
+
+test("default runner pairs only the exact three isolated files, drains their harness, and keeps the complete remainder serial", async () => {
+  await profile();
+  const f = schedulingFixture();
+  try {
+    const result = run(f);
+    assert.equal(result.status, 0, result.stderr + result.stdout);
+    const events = readFileSync(join(f.path, "order.log"), "utf8").trim().split("\n");
+    const starts = events.filter(event => event.startsWith("start:")).map(event => event.slice(6));
+    assert.deepEqual([...starts].sort(), [
+      "a.test.js", "future-migration.test.js", "z.test.js",
+      "nested/qualified-checkpoint-migration.test.js", "nested/qualified-checkpoint-quick-integrity.test.js",
+      "nested/session-end-effective-state-migration.test.js",
+      "qualified-checkpoint-migration.test.js", "qualified-checkpoint-quick-integrity.test.js",
+      "session-end-effective-state-migration.test.js",
+    ].sort());
+    assert.equal(new Set(starts).size, 9);
+    const active = new Set<string>();
+    const drained = new Set<string>();
+    let maximumPaired = 0;
+    let serialStarted = false;
+    for (const event of events) {
+      const separator = event.indexOf(":");
+      const kind = event.slice(0, separator);
+      const name = event.slice(separator + 1);
+      if (kind === "drained") { drained.add(name); continue; }
+      if (kind === "end") { assert.ok(active.delete(name), event); continue; }
+      assert.equal(kind, "start");
+      if (paired.includes(name)) {
+        assert.equal(serialStarted, false, "eligible files must run before every serial file");
+        active.add(name);
+        maximumPaired = Math.max(maximumPaired, active.size);
+        assert.ok(active.size <= 2, "the eligible cohort must never exceed two active files");
+      } else {
+        serialStarted = true;
+        assert.deepEqual([...drained].sort(), [...paired].sort(), "the entire cohort child harness must drain first");
+        assert.equal(active.size, 0, "the remainder must stay serial");
+        active.add(name);
+      }
+    }
+    assert.equal(maximumPaired, 2, "the eligible files must actually overlap");
+    assert.equal(active.size, 0);
+    assert.doesNotMatch(result.stdout + result.stderr, /excluded legacy fixture was executed|TAP version/);
+  } finally { f.cleanup(); }
+});
+
+for (const [label, failures] of [
+  ["first cohort", ["qualified-checkpoint-migration.test.js"]],
+  ["serial remainder", ["a.test.js"]],
+  ["both cohorts", ["qualified-checkpoint-migration.test.js", "a.test.js"]],
+] as const) {
+  test(`default runner preserves failure from ${label} while executing every selected file`, async () => {
+    await profile();
+    const f = schedulingFixture([...failures]);
+    try {
+      const result = run(f);
+      assert.equal(result.status, 1, result.stderr + result.stdout);
+      const events = readFileSync(join(f.path, "order.log"), "utf8").trim().split("\n");
+      assert.equal(events.filter(event => event.startsWith("start:")).length, 9);
+      assert.ok(events.indexOf("start:a.test.js") > events.indexOf("end:session-end-effective-state-migration.test.js"),
+        "the serial remainder must execute after a normally completed cohort even when it fails");
+      for (const name of failures) assert.ok((result.stdout + result.stderr).includes(`controlled failure:${name}`));
+    } finally { f.cleanup(); }
+  });
+}
+
+test("default runner safely omits an empty serial remainder", async () => {
+  await profile();
+  const f = fixture([...excluded, "qualified-checkpoint-migration.test.js"]);
+  try {
+    const result = run(f);
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(readFileSync(join(f.path, "order.log"), "utf8"),
+      "start:qualified-checkpoint-migration.test.js\nend:qualified-checkpoint-migration.test.js\n");
+    assert.match(result.stdout, /ℹ tests 1/);
+    assert.doesNotMatch(result.stdout + result.stderr, /excluded legacy fixture was executed/);
+  } finally { f.cleanup(); }
+});
+
+test("default runner stops before the serial remainder on a cohort spawn error", async () => {
+  await profile();
+  const f = fixture([...excluded, ...paired, "a.test.js"]);
+  // Record attempts while preserving the real native spawn and its ENOENT event.
+  // An absent test log alone cannot detect a second attempt at the missing executable.
+  const attempts = join(f.path, "spawn-attempts.log");
+  writeFileSync(f.wrapper, `import childProcess from 'node:child_process';
+import {syncBuiltinESMExports} from 'node:module'; import {appendFileSync} from 'node:fs';
+const nativeSpawn=childProcess.spawn;
+childProcess.spawn=(...args)=>{appendFileSync(${JSON.stringify(attempts)},'attempt\\n');return nativeSpawn(...args);};
+syncBuiltinESMExports();
+const {runDefaultTests}=await import(${JSON.stringify(pathToFileURL(runner).href)});
+await runDefaultTests(${JSON.stringify(f.tests)},process.argv[2]);`);
+  try {
+    const result = run(f, join(f.path, "missing-node-executable"));
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /ENOENT/);
+    assert.equal(readFileSync(attempts, "utf8"), "attempt\n", "spawn errors must stop before any second cohort attempt");
+    assert.equal(existsSync(join(f.path, "order.log")), false);
+  } finally { f.cleanup(); }
+});
+
+test("default runner stops after a cohort signal and preserves native signal termination", {
+  skip: process.platform === "win32" ? "Windows reports process termination as an exit code, not a POSIX signal" : false,
+}, async () => {
+  await profile();
+  const f = fixture([...excluded, "qualified-checkpoint-migration.test.js", "z.test.js"]);
+  writeFileSync(join(f.tests, "qualified-checkpoint-migration.test.js"), "process.kill(process.ppid,'SIGTERM'); setInterval(()=>{},1000).unref();");
+  try {
+    const result = run(f);
+    assert.equal(result.signal, "SIGTERM");
+    assert.equal(result.status, null);
+    assert.equal(existsSync(join(f.path, "order.log")), false);
+  } finally { f.cleanup(); }
+});
 
 test("package profiles compile once, retain the full entry and runtime prechecks, and alias the migration producer", () => {
   const scripts = JSON.parse(readFileSync(join(root, "package.json"), "utf8")).scripts;
