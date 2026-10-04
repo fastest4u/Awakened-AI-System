@@ -124,7 +124,7 @@ function roleFixtures(): CiWorkflowSet {
       "",
       "jobs:",
       "  qualification:",
-      "    name: V2 release qualification Node ${{ matrix.node-version }} on ${{ matrix.os }}",
+      "    name: V2 release qualification on ${{ matrix.os }}",
       "    runs-on: ${{ matrix.os }}",
       "    strategy:",
       "      fail-fast: false",
