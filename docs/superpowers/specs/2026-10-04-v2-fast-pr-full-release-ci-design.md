@@ -1,6 +1,6 @@
 # V2 fast PR feedback and full release qualification design
 
-**Status:** Written amendment awaiting human review. The human selected option 1 and approved its concrete three-role design on 2026-10-04. That approval permits writing, reviewing and locally committing this document; it does not approve this written artifact or an executable plan in advance.
+**Status:** Written amendment approved by the human on 2026-10-04 at commit `aac794056c724ef0bf5b1d582794dfd3142b518d`, together with the reconciled remediation specification. The implementation plan remains subject to review; no implementation or hosted execution is approved by this status.
 
 **Outcome:** Stop requiring legacy V1 data-migration replay on every PR or before a fresh-start V2 release, while retaining complete nonlegacy regression coverage and the distinct qualification guarantees required before release. V2 starts empty and does not import, retrieve or fall back to live V1 Markdown data.
 
@@ -117,4 +117,4 @@ Green CI is not whole-system PROD readiness. Operational key handling, public V2
 - Source contract owners: `scripts/run-test-profile.js`, `tests/test-profiles.test.ts`, `tests/ci-lifecycle-gates.test.ts`, `tests/ci-fresh-start-foundation.test.ts`, `scripts/run-v2-fresh-start-foundation.js` and `package.json`.
 - GitHub documents [manual dispatch and default-branch availability](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/manually-run-a-workflow), [workflow concurrency](https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/control-workflow-concurrency) and [skipped required checks](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/skip-workflow-runs).
 
-Next action is human review of this amendment and the reconciled remediation specification. Written approval permits implementation planning, not code changes, publication or production activation.
+Next action is implementation planning from this approved amendment and the reconciled remediation specification. Plan review and execution-method confirmation precede code changes; publication and production activation require separate authority.

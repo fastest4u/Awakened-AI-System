@@ -1,6 +1,6 @@
 # V2 hosted CI remediation design
 
-**Status:** Written specification awaiting human review together with the [fast PR and full V2 release CI amendment](2026-10-04-v2-fast-pr-full-release-ci-design.md). The human approved direction A, the conversational remediation design and the concrete CI-role amendment on 2026-10-04. Neither written artifact has yet been approved.
+**Status:** Written specification approved by the human on 2026-10-04 at commit `aac794056c724ef0bf5b1d582794dfd3142b518d`, together with the [fast PR and full V2 release CI amendment](2026-10-04-v2-fast-pr-full-release-ci-design.md). Implementation plans remain subject to review; this status does not approve their execution.
 
 **Outcome:** Close the hosted CI failures before continuing operational key handling and public V2 workflows. Establish the rejecting conditions, repair their proven causes without weakening existing contracts, and qualify the final candidate on Ubuntu and Windows.
 
@@ -109,4 +109,4 @@ Green CI closes this remediation slice only. Operational keys, public V2 workflo
 - [Failed hosted CI run](https://github.com/fastest4u/Awakened-AI-System/actions/runs/37142753116).
 - Source owners at the recorded head: `scripts/build.js`, `scripts/run-v2-shadow-migration-rehearsal.js`, `src/orchestrator/projections/stable-directory.ts`, `tests/support/canonical-temp.ts`, `tests/support/fresh-start-fixture.ts`, and the representative tests named above.
 
-Next action is human review of this specification and the linked CI amendment. After written approval, prepare separate bounded plans for CI-role contracts and causal diagnosis, with reviewed execution methods before implementation. This document neither claims the root causes are known nor approves implementation or production deployment.
+Next action is separate bounded implementation plans for CI-role contracts and causal diagnosis, with plan review and execution-method confirmation before implementation. This document neither claims the root causes are known nor approves implementation or production deployment.
