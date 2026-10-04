@@ -1,6 +1,6 @@
 # V2 build installation policy A design
 
-**Status:** The human approved conversational option A on 2026-10-04. This written specification is awaiting human review. The approval permits writing, reviewing and locally committing the design, not implementation, installation or hosted execution.
+**Status:** The human approved conversational option A and then this written specification on 2026-10-04. Its [implementation plan](../plans/2026-10-04-v2-build-installation-policy-a.md) awaits human review. Written-spec approval permits planning, not implementation, installation or hosted execution.
 
 **Outcome:** Prevent esbuild's optional CLI hardlink optimization during locked dependency installation, replace the omitted setup assurance with a reviewed capability check, and retain the existing single-link build contract. This is the next CI remediation slice for fresh empty V2, not whole-system PROD qualification.
 
@@ -134,4 +134,4 @@ Accept this installation slice only after reviewed setup disposition, independen
 
 Completing this slice does not make V2 production ready. Operational key storage/rotation/recovery, governed public memory and lifecycle/retrieval workflows, complete-visible Codex capture and all nine actual-host proofs, backup/restore of newly acknowledged V2 data, exact release qualification and separately approved activation remain in the [fresh-start roadmap](../plans/2026-09-29-v2-fresh-start-delivery-roadmap.md).
 
-Next action is human review of this written specification and the narrow parent reconciliations. Only after approval should writing-plans prepare the implementation plan; preserve Subagent-Driven execution for that later approved plan.
+Next action is human review of the written implementation plan; preserve Subagent-Driven execution after that plan is approved. The separately approved bounded default-test scheduling direction does not expand this installation slice's owners or grant hosted-action authority.
