@@ -2,11 +2,17 @@ name: CI
 
 on:
   push:
+    branches:
+      - main
   pull_request:
   workflow_dispatch:
 
 permissions:
   contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   release-gates:
@@ -44,39 +50,14 @@ jobs:
       - name: Build
         run: npm run build
 
-      - name: Run tests
-        run: npm run test:all
-
-      - name: Run lifecycle release gates
-        run: npm run test:subproject-2
-
       - name: Require immutable lifecycle base commit
         run: git cat-file -e "0e375d4643d4b630f36f874a3bb192e96739ac46^{commit}"
 
       - name: Protect Version 1 production routing
         run: git diff --exit-code 0e375d4643d4b630f36f874a3bb192e96739ac46 -- src/app.ts src/index.ts src/controllers src/schemas src/services
 
-      - name: Run V2 rollout control-plane gate
-        run: npm run test:rollout-control-plane
-
-      - name: Run V2 shadow migration gate
-        env:
-          V2_SHADOW_MIGRATION_TEST_EVIDENCE_OUTPUT: ${{ runner.temp }}/v2-shadow-migration-functional/evidence.json
-        run: npm run test:v2-shadow-migration
-
-      - name: Run V2 fresh-start foundation gate
-        run: npm run test:v2-fresh-start-foundation
-
-      - name: Test build artifacts
-        run: npm run test:build-artifacts
-
-      - name: Upload V2 shadow migration functional synthetic evidence
-        uses: actions/upload-artifact@v7
-        with:
-          name: v2-shadow-migration-functional-synthetic-${{ matrix.os }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/v2-shadow-migration-functional/evidence.json
-          if-no-files-found: error
-          retention-days: 14
+      - name: Run tests
+        run: npm test
 
   minimum-runtime-rejection:
     name: Reject Node 22.22.3

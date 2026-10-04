@@ -17,7 +17,7 @@ const excluded = [
 const retained = [
   "v2-parity-lifecycle-fixture", "sqlite-driver", "recording-git-command-runner", "retrieval-evaluation",
   "retrieval-service", "stable-compatibility-directory", "ci-lifecycle-gates", "projection-integrity",
-  "runtime-capabilities", "migration-runner", "migration-registry", "session-lifecycle-migration",
+  "ci-workflow-roles", "ci-fresh-start-foundation", "runtime-capabilities", "migration-runner", "migration-registry", "session-lifecycle-migration",
   "qualified-checkpoint-migration", "session-end-effective-state-migration", "project-store-bootstrap",
   "project-store-upgrade", "project-store-upgrade-phase-runner", "projection-image-metadata",
 ].map(name => `${name}.test.js`);
@@ -31,7 +31,7 @@ async function profile() {
   };
 }
 
-function fixture(files = [...excluded, ...retained, "future-migration.test.js", "nested/v2-shadow-migration-rehearsal.test.js"]) {
+function fixture(files = [...excluded, ...retained, "future-migration.test.js", "ci-release-identity.test.js", "nested/v1-source-copy.test.js", "nested/v2-shadow-migration-rehearsal.test.js"]) {
   const path = mkdtempSync(join(tmpdir(), "test-profile-"));
   const tests = join(path, "tests");
   for (const name of files) {
@@ -87,7 +87,7 @@ test("default selector includes future migration names and nested lookalikes wit
   const f = fixture();
   try {
     const names = selectDefaultTests(f.tests).map(path => relative(f.tests, path).replaceAll("\\", "/")).sort();
-    assert.deepEqual(names, [...retained, "future-migration.test.js", "nested/v2-shadow-migration-rehearsal.test.js"].sort());
+    assert.deepEqual(names, [...retained, "future-migration.test.js", "ci-release-identity.test.js", "nested/v1-source-copy.test.js", "nested/v2-shadow-migration-rehearsal.test.js"].sort());
     assert.equal(new Set(names).size, names.length);
   } finally { f.cleanup(); }
 });

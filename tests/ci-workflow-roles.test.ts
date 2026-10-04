@@ -1,6 +1,35 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import test from "node:test";
 import { assertCiWorkflowSet, requiredStep, type CiWorkflowSet } from "./support/ci-workflow-contract.js";
+
+test("CI roles require the four actual saved owners", () => {
+  const root = new URL("../../", import.meta.url);
+  const workflows = {
+    pr: readFileSync(new URL(".github/workflows/ci.yml", root), "utf8").replace(/\r\n?/g, "\n"),
+    release: readFileSync(new URL(".github/workflows/v2-release-qualification.yml", root), "utf8").replace(/\r\n?/g, "\n"),
+    legacy: readFileSync(new URL(".github/workflows/v2-legacy-regression.yml", root), "utf8").replace(/\r\n?/g, "\n"),
+    stress: readFileSync(new URL(".github/workflows/sqlite-stress.yml", root), "utf8").replace(/\r\n?/g, "\n"),
+  };
+  assertCiWorkflowSet(workflows);
+  for (const [name, command, id] of [
+    ["Run tests", "npm test", "tests"],
+    ["Run lifecycle release gates", "npm run test:subproject-2", "lifecycle"],
+    ["Run V2 rollout control-plane gate", "npm run test:rollout-control-plane", "rollout"],
+    ["Run V2 fresh-start foundation gate", "npm run test:v2-fresh-start-foundation", "foundation"],
+    ["Test build artifacts", "npm run test:build-artifacts", "artifacts"],
+  ]) {
+    const block = `      - name: ${name}\n        id: ${id}\n        run: ${command}`;
+    assert.ok(workflows.release.includes(block), name);
+    for (const changed of [
+      workflows.release.replace(block, ""),
+      workflows.release.replace(block, `${block}\n${block}`),
+      workflows.release.replace(block, block.replace("        id:", "        if: false\n        id:")),
+      workflows.release.replace(block, block.replace("        id:", "        continue-on-error: true\n        id:")),
+      workflows.release.replace(block, block.replace(`run: ${command}`, "run: echo passed")),
+    ]) assert.throws(() => assertCiWorkflowSet({ ...workflows, release: changed }), name);
+  }
+});
 
 // Hand-reviewed owner fixtures: expectations are independent of the validator.
 function roleFixtures(): CiWorkflowSet {
@@ -58,15 +87,15 @@ function roleFixtures(): CiWorkflowSet {
       "      - name: Build",
       "        run: npm run build",
       "",
-      "      - name: Run tests",
-      "        run: npm test",
-      "",
       "      - name: Require immutable lifecycle base commit",
       "        run: git cat-file -e \"0e375d4643d4b630f36f874a3bb192e96739ac46^{commit}\"",
       "",
       "      - name: Protect Version 1 production routing",
       "        run: git diff --exit-code 0e375d4643d4b630f36f874a3bb192e96739ac46 -- src/app.ts src/index.ts src/controllers src/schemas src/services",
       "",
+      "",
+      "      - name: Run tests",
+      "        run: npm test",
       "",
       "  minimum-runtime-rejection:",
       "    name: Reject Node 22.22.3",
@@ -199,6 +228,12 @@ function roleFixtures(): CiWorkflowSet {
       "        id: build",
       "        run: npm run build",
       "",
+      "      - name: Require immutable lifecycle base commit",
+      "        run: git cat-file -e \"0e375d4643d4b630f36f874a3bb192e96739ac46^{commit}\"",
+      "",
+      "      - name: Protect Version 1 production routing",
+      "        run: git diff --exit-code 0e375d4643d4b630f36f874a3bb192e96739ac46 -- src/app.ts src/index.ts src/controllers src/schemas src/services",
+      "",
       "      - name: Run tests",
       "        id: tests",
       "        run: npm test",
@@ -206,12 +241,6 @@ function roleFixtures(): CiWorkflowSet {
       "      - name: Run lifecycle release gates",
       "        id: lifecycle",
       "        run: npm run test:subproject-2",
-      "",
-      "      - name: Require immutable lifecycle base commit",
-      "        run: git cat-file -e \"0e375d4643d4b630f36f874a3bb192e96739ac46^{commit}\"",
-      "",
-      "      - name: Protect Version 1 production routing",
-      "        run: git diff --exit-code 0e375d4643d4b630f36f874a3bb192e96739ac46 -- src/app.ts src/index.ts src/controllers src/schemas src/services",
       "",
       "      - name: Run V2 rollout control-plane gate",
       "        id: rollout",
@@ -261,6 +290,9 @@ function roleFixtures(): CiWorkflowSet {
       "",
       "      - name: Install dependencies",
       "        run: npm ci",
+      "",
+      "      - name: Check runtime capabilities",
+      "        run: npm run check:runtime",
       "",
       "      - name: Run V2 shadow migration gate",
       "        env:",
@@ -476,4 +508,41 @@ test("CI roles reject role crossing and extra owner keys", () => {
   const fixture = roleFixtures();
   assert.throws(() => assertCiWorkflowSet({ ...fixture, pr: fixture.release, release: fixture.pr }));
   assert.throws(() => assertCiWorkflowSet({ ...fixture, unknown: fixture.pr } as CiWorkflowSet));
+});
+
+test("CI roles reject legacy schedules and release cancellation", () => {
+  const fixture = roleFixtures();
+  assert.throws(() => assertCiWorkflowSet({ ...fixture, legacy: fixture.legacy.replace("on:\n", 'on:\n  schedule:\n    - cron: "0 3 * * 1"\n') }));
+  assert.throws(() => assertCiWorkflowSet({ ...fixture, release: fixture.release.replace("jobs:\n", "concurrency:\n  group: release\n  cancel-in-progress: true\n\njobs:\n") }));
+});
+
+test("CI roles concurrency fixtures collide only for the same PR", () => {
+  const root = new URL("../../", import.meta.url);
+  const workflows = {
+    pr: readFileSync(new URL(".github/workflows/ci.yml", root), "utf8").replace(/\r\n?/g, "\n"),
+    release: readFileSync(new URL(".github/workflows/v2-release-qualification.yml", root), "utf8").replace(/\r\n?/g, "\n"),
+    legacy: readFileSync(new URL(".github/workflows/v2-legacy-regression.yml", root), "utf8").replace(/\r\n?/g, "\n"),
+    stress: readFileSync(new URL(".github/workflows/sqlite-stress.yml", root), "utf8").replace(/\r\n?/g, "\n"),
+  };
+  assertCiWorkflowSet(workflows);
+  const group = /^  group: (.+)$/m.exec(workflows.pr)![1]!;
+  const cancel = /^  cancel-in-progress: (.+)$/m.exec(workflows.pr)![1]!;
+  // Data fixtures exercise the pinned expression's identity semantics. Hosted
+  // scheduling and cancellation outcomes require separately authorized runs.
+  const cases = [
+    { event: "pull_request", pr: 7, run: 10, group: "CI-pull_request-7", cancel: true },
+    { event: "pull_request", pr: 7, run: 11, group: "CI-pull_request-7", cancel: true },
+    { event: "pull_request", pr: 8, run: 12, group: "CI-pull_request-8", cancel: true },
+    { event: "push", pr: null, run: 13, group: "CI-push-13", cancel: false },
+    { event: "push", pr: null, run: 14, group: "CI-push-14", cancel: false },
+    { event: "workflow_dispatch", pr: null, run: 15, group: "CI-workflow_dispatch-15", cancel: false },
+    { event: "workflow_dispatch", pr: null, run: 16, group: "CI-workflow_dispatch-16", cancel: false },
+  ] as const;
+  for (const input of cases) {
+    const actual = group.replace("${{ github.workflow }}", "CI")
+      .replace("${{ github.event_name }}", input.event)
+      .replace("${{ github.event.pull_request.number || github.run_id }}", String(input.pr || input.run));
+    assert.equal(actual, input.group);
+    assert.equal(cancel === "${{ github.event_name == 'pull_request' }}" && input.event === "pull_request", input.cancel);
+  }
 });

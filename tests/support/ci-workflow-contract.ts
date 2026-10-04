@@ -1,23 +1,6 @@
 import assert from "node:assert/strict";
 
 export type CiWorkflowSet = Readonly<{ pr: string; release: string; legacy: string; stress: string }>;
-const BASE = "0e375d4643d4b630f36f874a3bb192e96739ac46";
-const MIGRATION_OUTPUT = "${{ runner.temp }}/v2-shadow-migration-functional/evidence.json";
-const MIGRATION_GATE = [
-  "      - name: Run V2 shadow migration gate",
-  "        env:",
-  `          V2_SHADOW_MIGRATION_TEST_EVIDENCE_OUTPUT: ${MIGRATION_OUTPUT}`,
-  "        run: npm run test:v2-shadow-migration",
-].join("\n");
-const MIGRATION_UPLOAD = [
-  "      - name: Upload V2 shadow migration functional synthetic evidence",
-  "        uses: actions/upload-artifact@v7",
-  "        with:",
-  "          name: v2-shadow-migration-functional-synthetic-${{ matrix.os }}-${{ github.run_id }}-${{ github.run_attempt }}",
-  `          path: ${MIGRATION_OUTPUT}`,
-  "          if-no-files-found: error",
-  "          retention-days: 14",
-].join("\n");
 const PLAIN_WORKFLOW_KEY = "[A-Za-z][A-Za-z0-9_-]*";
 const PLAIN_MAPPING_LINE = new RegExp(`^ *${PLAIN_WORKFLOW_KEY}:(?: .*)?$`);
 const PLAIN_LIST_MAPPING_LINE = new RegExp(`^ *- ${PLAIN_WORKFLOW_KEY}:(?: .*)?$`);
@@ -152,19 +135,6 @@ function requiredJobStep(job: string, name: string): WorkflowStep {
   return step;
 }
 
-function workflowActions(job: string, ownerJob: string): readonly {
-  readonly step: WorkflowStep;
-  readonly uses: string;
-  readonly withPath: string | null;
-}[] {
-  return workflowSteps(job, ownerJob).flatMap((step) => [...step.body.matchAll(/(?:^|\n)\s*uses:\s*(.+)$/gm)]
-    .map((match) => ({
-      step,
-      uses: normalizeYamlScalar(match[1]!),
-      withPath: yamlScalar(step.body, "path"),
-    })));
-}
-
 // This is deliberately a closed subset, not a general YAML parser. Validate
 // hierarchy before the bounded scalar readers can see a nested or duplicate key.
 function assertWorkflowStructure(yaml: string, roles = false): ReadonlyMap<string, string> {
@@ -239,117 +209,6 @@ function compactStep(body: string): string {
   return body.split("\n").filter(line => line.trim() !== "" && !line.trimStart().startsWith("#"))
     .map(line => line.trim()).join("\n");
 }
-
-export function assertLegacyCiWorkflowContract(ci: string, stress: string): void {
-  assertCanonicalWorkflowGrammar(ci, "CI workflow");
-  assertCanonicalWorkflowGrammar(stress, "stress workflow");
-  assertWorkflowStructure(ci);
-  assertWorkflowStructure(stress);
-  const ciJobs = workflowJobs(ci);
-  const stressJobs = workflowJobs(stress);
-  assert.deepEqual([...ciJobs.keys()], ["release-gates", "minimum-runtime-rejection"]);
-  assert.deepEqual([...stressJobs.keys()], ["stress"]);
-  const releaseGates = ciJobs.get("release-gates");
-  const minimumRuntime = ciJobs.get("minimum-runtime-rejection");
-  const stressJob = stressJobs.get("stress");
-  assert.ok(releaseGates, "CI must have a release-gates job");
-  assert.ok(minimumRuntime, "CI must retain the minimum-runtime rejection job");
-  assert.ok(stressJob, "stress workflow must have a stress job");
-  assertNoJobBypass(releaseGates!, "release-gates job");
-  assertNoJobBypass(minimumRuntime!, "minimum-runtime-rejection job");
-  assertNoJobBypass(stressJob!, "stress job");
-  for (const job of [...ciJobs.values(), ...stressJobs.values()]) {
-    const steps = workflowSteps(job);
-    const names = steps.map(step => step.name);
-    assert.ok(names.every(name => name !== null), "every executable step must be named");
-    assert.equal(new Set(names).size, names.length, "duplicate executable step name");
-    for (const step of steps) {
-      if (step.name !== "Upload stress logs") requiredJobStep(job, step.name!);
-      assert.equal(yamlScalar(step.body, "continue-on-error"), null, "no step may suppress failures");
-      if (step.name !== "Run V2 shadow migration gate") assert.equal(yamlScalar(step.body, "env"), null);
-    }
-  }
-  const checkouts = [...ciJobs.entries(), ...stressJobs.entries()]
-    .flatMap(([ownerJob, job]) => workflowSteps(job, ownerJob))
-    .filter((step) => step.name === "Check out repository");
-  assert.equal(checkouts.length, 3, "every checkout site must be explicit");
-  for (const checkout of checkouts) {
-    assert.equal(yamlScalar(checkout.body, "if"), null, "checkout must not declare if");
-    assert.equal(yamlScalar(checkout.body, "uses"), "actions/checkout@v6");
-    assert.equal(yamlScalar(checkout.body, "fetch-depth"), "0");
-    assert.equal(compactStep(checkout.body), "name: Check out repository\nuses: actions/checkout@v6\nwith:\nfetch-depth: 0",
-      "checkout must retain its exact full-history configuration");
-  }
-  assert.equal(yamlScalar(requiredJobStep(releaseGates!, "Run lifecycle release gates").body, "run"), "npm run test:subproject-2");
-  assert.equal(yamlScalar(requiredJobStep(releaseGates!, "Require immutable lifecycle base commit").body, "run"), `git cat-file -e "${BASE}^{commit}"`);
-  assert.equal(yamlScalar(requiredJobStep(releaseGates!, "Protect Version 1 production routing").body, "run"), `git diff --exit-code ${BASE} -- src/app.ts src/index.ts src/controllers src/schemas src/services`);
-  assert.equal(yamlScalar(requiredJobStep(releaseGates!, "Run V2 rollout control-plane gate").body, "run"), "npm run test:rollout-control-plane");
-  const releaseSteps = workflowSteps(releaseGates!);
-  const protectedRoutingIndex = releaseSteps.findIndex((step) => step.name === "Protect Version 1 production routing");
-  const rolloutGateIndex = releaseSteps.findIndex((step) => step.name === "Run V2 rollout control-plane gate");
-  assert.equal(rolloutGateIndex, protectedRoutingIndex + 1, "the rollout control-plane gate must immediately follow the Version 1 routing guard");
-  assert.equal(yamlScalar(requiredJobStep(releaseGates!, "Build").body, "run"), "npm run build");
-  assert.equal(yamlScalar(requiredJobStep(releaseGates!, "Test build artifacts").body, "run"), "npm run test:build-artifacts");
-  const expectedReleaseSteps = [
-    "name: Check out repository\nuses: actions/checkout@v6\nwith:\nfetch-depth: 0",
-    "name: Set up Node.js\nuses: actions/setup-node@v6\nwith:\nnode-version: ${{ matrix.node-version }}",
-    "name: Install dependencies\nrun: npm ci",
-    "name: Check runtime capabilities\nrun: npm run check:runtime",
-    "name: Typecheck\nrun: npm run typecheck",
-    "name: Build\nrun: npm run build",
-    "name: Run tests\nrun: npm run test:all",
-    "name: Run lifecycle release gates\nrun: npm run test:subproject-2",
-    `name: Require immutable lifecycle base commit\nrun: git cat-file -e "${BASE}^{commit}"`,
-    `name: Protect Version 1 production routing\nrun: git diff --exit-code ${BASE} -- src/app.ts src/index.ts src/controllers src/schemas src/services`,
-    "name: Run V2 rollout control-plane gate\nrun: npm run test:rollout-control-plane",
-    compactStep(MIGRATION_GATE.replace("      - ", "")),
-    "name: Run V2 fresh-start foundation gate\nrun: npm run test:v2-fresh-start-foundation",
-    "name: Test build artifacts\nrun: npm run test:build-artifacts",
-    compactStep(MIGRATION_UPLOAD.replace("      - ", "")),
-  ];
-  assert.deepEqual(releaseSteps.map(step => compactStep(step.body)), expectedReleaseSteps,
-    "release steps must match the exact unconditional producer/build/upload order");
-  assert.equal(ci.split("V2_SHADOW_MIGRATION_TEST_EVIDENCE_OUTPUT").length - 1, 1, "exactly one producer output setting");
-  assert.ok(!stress.includes("V2_SHADOW_MIGRATION_TEST_EVIDENCE_OUTPUT"), "stress must not select migration output");
-  assert.equal(workflowSteps(minimumRuntime!).filter((step) => step.name === "Check out repository").length, 1);
-  assert.equal(yamlScalar(stressJob!, "max-parallel"), "1", "stress must remain serial");
-  assert.deepEqual(workflowSteps(stressJob!).map(step => step.name), [
-    "Check out repository", "Set up Node.js", "Install dependencies", "Build tests",
-    "Run default and lifecycle concurrent, crash, and security tests", "Run release stress test",
-    "Run lifecycle stress test", "Upload stress logs",
-  ], "stress gate and uploader order must remain unchanged");
-  assert.deepEqual(workflowSteps(minimumRuntime!).map(step => step.name), [
-    "Check out repository", "Set up Node.js 22.22.3", "Require the documented minimum-runtime rejection",
-  ]);
-  assert.match(requiredJobStep(stressJob!, "Run default and lifecycle concurrent, crash, and security tests").body, /event-store\.concurrent\.test\.js.*event-store\.crash\.test\.js.*lifecycle\.concurrent\.test\.js.*lifecycle\.crash\.test\.js.*lifecycle\.security\.test\.js/s);
-  assert.match(requiredJobStep(stressJob!, "Run release stress test").body, /npm run test:stress/);
-  assert.match(requiredJobStep(stressJob!, "Run lifecycle stress test").body, /npm run test:lifecycle-stress/);
-  const actions = [
-    ...[...ciJobs].flatMap(([ownerJob, job]) => workflowActions(job, ownerJob).map(action => ({ ...action, workflow: "ci.yml" }))),
-    ...[...stressJobs].flatMap(([ownerJob, job]) => workflowActions(job, ownerJob).map(action => ({ ...action, workflow: "sqlite-stress.yml" }))),
-  ];
-  for (const action of actions) {
-    assert.ok(action.uses.length > 0, "workflow action must have a non-empty uses scalar");
-    if (action.withPath !== null) {
-      assert.doesNotMatch(action.withPath, /\*\.sqlite\*|\.memory-mcp|pending[-_ ]?(authorization|credential)|\.md\b/i);
-    }
-  }
-  const uploads = actions.filter((action) => action.uses.startsWith("actions/upload-artifact@"));
-  assert.equal(uploads.length, 2, "exactly two classified upload-artifact slots are allowed");
-  assert.deepEqual(uploads.map(upload => ({ workflow: upload.workflow, owner: upload.step.ownerJob,
-    step: upload.step.name, action: upload.uses })), [
-    { workflow: "ci.yml", owner: "release-gates", step: "Upload V2 shadow migration functional synthetic evidence", action: "actions/upload-artifact@v7" },
-    { workflow: "sqlite-stress.yml", owner: "stress", step: "Upload stress logs", action: "actions/upload-artifact@v7" },
-  ], "upload manifest must preserve workflow, owner, step, action and classification order");
-  const stressUpload = uploads[1]!;
-  assert.equal(compactStep(stressUpload.step.body), [
-    "name: Upload stress logs", "if: ${{ always() }}", "uses: actions/upload-artifact@v7", "with:",
-    "name: sqlite-stress-logs-${{ matrix.os }}-${{ github.run_id }}-${{ github.run_attempt }}",
-    "path: ci-logs/sqlite-stress-${{ matrix.os }}.log", "if-no-files-found: error", "retention-days: 14",
-  ].join("\n"), "stress upload must retain its exact historical transport policy");
-  assert.equal(workflowSteps(stressJob!).at(-1)?.name, "Upload stress logs", "stress upload must follow its gates");
-}
-
 
 export const VALIDATE_QUALIFICATION_INPUTS = [
   "$ErrorActionPreference = \"Stop\"",
@@ -442,16 +301,16 @@ const ROLE_POLICY = {
             "run: npm run build",
 ].join("\n"),
           [
-            "name: Run tests",
-            "run: npm test",
-].join("\n"),
-          [
             "name: Require immutable lifecycle base commit",
             "run: git cat-file -e \"0e375d4643d4b630f36f874a3bb192e96739ac46^{commit}\"",
 ].join("\n"),
           [
             "name: Protect Version 1 production routing",
             "run: git diff --exit-code 0e375d4643d4b630f36f874a3bb192e96739ac46 -- src/app.ts src/index.ts src/controllers src/schemas src/services",
+].join("\n"),
+          [
+            "name: Run tests",
+            "run: npm test",
 ].join("\n"),
         ],
       },
@@ -604,6 +463,14 @@ const ROLE_POLICY = {
             "run: npm run build",
 ].join("\n"),
           [
+            "name: Require immutable lifecycle base commit",
+            "run: git cat-file -e \"0e375d4643d4b630f36f874a3bb192e96739ac46^{commit}\"",
+].join("\n"),
+          [
+            "name: Protect Version 1 production routing",
+            "run: git diff --exit-code 0e375d4643d4b630f36f874a3bb192e96739ac46 -- src/app.ts src/index.ts src/controllers src/schemas src/services",
+].join("\n"),
+          [
             "name: Run tests",
             "id: tests",
             "run: npm test",
@@ -612,14 +479,6 @@ const ROLE_POLICY = {
             "name: Run lifecycle release gates",
             "id: lifecycle",
             "run: npm run test:subproject-2",
-].join("\n"),
-          [
-            "name: Require immutable lifecycle base commit",
-            "run: git cat-file -e \"0e375d4643d4b630f36f874a3bb192e96739ac46^{commit}\"",
-].join("\n"),
-          [
-            "name: Protect Version 1 production routing",
-            "run: git diff --exit-code 0e375d4643d4b630f36f874a3bb192e96739ac46 -- src/app.ts src/index.ts src/controllers src/schemas src/services",
 ].join("\n"),
           [
             "name: Run V2 rollout control-plane gate",
@@ -680,6 +539,10 @@ const ROLE_POLICY = {
           [
             "name: Install dependencies",
             "run: npm ci",
+].join("\n"),
+          [
+            "name: Check runtime capabilities",
+            "run: npm run check:runtime",
 ].join("\n"),
           [
             "name: Run V2 shadow migration gate",

@@ -7,6 +7,7 @@ import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import test from "node:test";
 import { parse } from "yaml";
+import { assertCiWorkflowSet } from "./support/ci-workflow-contract.js";
 
 const root = fileURLToPath(new URL("../../", import.meta.url));
 const runner = join(root, "scripts/run-v2-fresh-start-foundation.js");
@@ -15,34 +16,39 @@ const targets = ["fresh-start-repository", "fresh-start-initializer", "fresh-sta
 const success = "PASS fresh-start foundation: six files completed";
 
 function assertFoundationWorkflow(workflow: any) {
-  const steps = workflow.jobs["release-gates"].steps as Record<string, unknown>[];
-  const required = (name: string, run: string) => {
+  const steps = workflow.jobs.qualification.steps as Record<string, unknown>[];
+  const required = (name: string, run: string, id: string) => {
     const matches = steps.filter(step => step.name === name);
     assert.equal(matches.length, 1, `exactly one ${name}`);
-    assert.deepEqual(matches[0], { name, run });
+    assert.deepEqual(matches[0], { name, id, run });
     return steps.indexOf(matches[0]!);
   };
-  const typecheck = required("Typecheck", "npm run typecheck");
-  const build = required("Build", "npm run build");
-  const tests = required("Run tests", "npm run test:all");
-  const foundation = required("Run V2 fresh-start foundation gate", "npm run test:v2-fresh-start-foundation");
-  const artifacts = required("Test build artifacts", "npm run test:build-artifacts");
-  assert.equal(build, typecheck + 1); assert.equal(tests, build + 1);
-  assert.equal(steps[foundation - 1]?.name, "Run V2 shadow migration gate"); assert.equal(artifacts, foundation + 1);
+  const typecheck = required("Typecheck", "npm run typecheck", "typecheck");
+  const build = required("Build", "npm run build", "build");
+  const tests = required("Run tests", "npm test", "tests");
+  const foundation = required("Run V2 fresh-start foundation gate", "npm run test:v2-fresh-start-foundation", "foundation");
+  const artifacts = required("Test build artifacts", "npm run test:build-artifacts", "artifacts");
+  assert.equal(build, typecheck + 1); assert.ok(tests > build);
+  assert.ok(foundation > tests); assert.equal(artifacts, foundation + 1);
 }
 
 test("CI executes Foundation and builds before the full suite without bypasses", () => {
-  const workflow = parse(readFileSync(join(root, ".github/workflows/ci.yml"), "utf8"));
+  const pr = readFileSync(join(root, ".github/workflows/ci.yml"), "utf8").replace(/\r\n?/g, "\n");
+  const release = readFileSync(join(root, ".github/workflows/v2-release-qualification.yml"), "utf8").replace(/\r\n?/g, "\n");
+  const legacy = readFileSync(join(root, ".github/workflows/v2-legacy-regression.yml"), "utf8").replace(/\r\n?/g, "\n");
+  const stress = readFileSync(join(root, ".github/workflows/sqlite-stress.yml"), "utf8").replace(/\r\n?/g, "\n");
+  assertCiWorkflowSet({ pr, release, legacy, stress });
+  const workflow = parse(release);
   assertFoundationWorkflow(workflow);
-  for (const mutation of ["missing", "duplicate", "skip", "ignore", "forged", "late-build", "reduced-default"]) {
-    const changed = structuredClone(workflow), steps = changed.jobs["release-gates"].steps;
+  for (const mutation of ["missing", "duplicate", "skip", "ignore", "forged", "late-build", "incomplete-tests"]) {
+    const changed = structuredClone(workflow), steps = changed.jobs.qualification.steps;
     const gate = steps.find((step: any) => step.name === "Run V2 fresh-start foundation gate");
     if (mutation === "missing") steps.splice(steps.indexOf(gate), 1);
     if (mutation === "duplicate") steps.push({ ...gate });
     if (mutation === "skip") gate.if = "false";
     if (mutation === "ignore") gate["continue-on-error"] = true;
     if (mutation === "forged") gate.run = "echo passed";
-    if (mutation === "reduced-default") steps.find((step: any) => step.name === "Run tests").run = "npm test";
+    if (mutation === "incomplete-tests") steps.find((step: any) => step.name === "Run tests").run = "node --test dist-test/tests/runtime-capabilities.test.js";
     if (mutation === "late-build") {
       const build = steps.find((step: any) => step.name === "Build"); steps.splice(steps.indexOf(build), 1); steps.push(build);
     }

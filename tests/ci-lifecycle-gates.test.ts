@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { join, relative, sep } from "node:path";
 import test from "node:test";
 import ts from "typescript";
-import { assertLegacyCiWorkflowContract } from "./support/ci-workflow-contract.js";
+import { assertCiWorkflowSet } from "./support/ci-workflow-contract.js";
 
 const ROOT = new URL("../../", import.meta.url);
 
@@ -33,7 +33,7 @@ const MIGRATION_GATE = [
   "      - name: Run V2 shadow migration gate",
   "        env:",
   `          V2_SHADOW_MIGRATION_TEST_EVIDENCE_OUTPUT: ${MIGRATION_OUTPUT}`,
-  "        run: npm run test:v2-shadow-migration",
+  "        run: npm run test:migration",
 ].join("\n");
 const MIGRATION_UPLOAD = [
   "      - name: Upload V2 shadow migration functional synthetic evidence",
@@ -498,11 +498,6 @@ function runRetrievalEvaluationWithChildOutput(output: string) {
   }
 }
 
-// Exact old-layout compatibility only; Task 2 changes all owners atomically.
-function assertWorkflowReleaseContract(ci: string, stress: string): void {
-  assertLegacyCiWorkflowContract(ci, stress);
-}
-
 test("migration package scripts require the complete compiled producer and both built smokes", () => {
   const scripts = (JSON.parse(source("package.json")) as { scripts: Record<string, string> }).scripts;
   const producer = source("tests/v2-shadow-migration-rehearsal.test.ts");
@@ -531,9 +526,11 @@ test("release configuration gates lifecycle V2 without production routing", () =
     assert.match(script, new RegExp(`dist-test/tests/${name.replace(/[.]/g, "\\.")}\\.test\\.js`));
   }
 
+  const release = source(".github/workflows/v2-release-qualification.yml");
+  const legacy = source(".github/workflows/v2-legacy-regression.yml");
   const ci = source(".github/workflows/ci.yml");
   const stress = source(".github/workflows/sqlite-stress.yml");
-  assertWorkflowReleaseContract(ci, stress);
+  assertCiWorkflowSet({ pr: ci, release, legacy, stress });
 
   const smoke = source("scripts/smoke-worker.js");
   assert.match(smoke, /\[1,2,3,4,5,6,7,8,9\]/);
@@ -563,6 +560,8 @@ test("release configuration gates lifecycle V2 without production routing", () =
 });
 
 test("workflow parser rejects duplicate jobs, mappings, and executable steps", () => {
+  const release = source(".github/workflows/v2-release-qualification.yml");
+  const legacy = source(".github/workflows/v2-legacy-regression.yml");
   const ci = source(".github/workflows/ci.yml"), stress = source(".github/workflows/sqlite-stress.yml");
   for (const mutated of [
     ci.replace("  release-gates:\n", "  release-gates:\n    if: false\n  release-gates:\n"),
@@ -571,23 +570,30 @@ test("workflow parser rejects duplicate jobs, mappings, and executable steps", (
     ci.replace("      - name: Build\n", "      - name: Build\n        run: echo forged\n\n      - name: Build\n"),
   ]) {
     assert.notEqual(mutated, ci);
-    assert.throws(() => assertWorkflowReleaseContract(mutated, stress));
+    assert.throws(() => assertCiWorkflowSet({ pr: mutated, release, legacy, stress }));
   }
 });
 
 test("workflow parser accepts only the two classified upload slots", () => {
-  assert.doesNotThrow(() => assertWorkflowReleaseContract(source(".github/workflows/ci.yml"), source(".github/workflows/sqlite-stress.yml")));
+  const release = source(".github/workflows/v2-release-qualification.yml");
+  const legacy = source(".github/workflows/v2-legacy-regression.yml");
+  const ci = source(".github/workflows/ci.yml"), stress = source(".github/workflows/sqlite-stress.yml");
+  assert.doesNotThrow(() => assertCiWorkflowSet({ pr: ci, release, legacy, stress }));
 });
 
-test("workflow full-suite gate rejects fallback to the reduced default profile", () => {
+test("workflow complete nonlegacy gate rejects an incomplete test-command substitution", () => {
+  const release = source(".github/workflows/v2-release-qualification.yml");
+  const legacy = source(".github/workflows/v2-legacy-regression.yml");
   const ci = source(".github/workflows/ci.yml"), stress = source(".github/workflows/sqlite-stress.yml");
-  assertWorkflowReleaseContract(ci, stress);
-  const reduced = ci.replace("run: npm run test:all", "run: npm test");
+  assertCiWorkflowSet({ pr: ci, release, legacy, stress });
+  const reduced = ci.replace("run: npm test", "run: node --test dist-test/tests/runtime-capabilities.test.js");
   assert.notEqual(reduced, ci);
-  assert.throws(() => assertWorkflowReleaseContract(reduced, stress));
+  assert.throws(() => assertCiWorkflowSet({ pr: reduced, release, legacy, stress }));
 });
 
 test("workflow parser preserves exact stress scalar policy and checkout ownership", () => {
+  const release = source(".github/workflows/v2-release-qualification.yml");
+  const legacy = source(".github/workflows/v2-legacy-regression.yml");
   const ci = source(".github/workflows/ci.yml"), stress = source(".github/workflows/sqlite-stress.yml");
   for (const mutated of [
     stress.replace("max-parallel: 1", "max-parallel: 10"),
@@ -598,20 +604,24 @@ test("workflow parser preserves exact stress scalar policy and checkout ownershi
     stress.replace("          fetch-depth: 0", "          fetch-depth: 0\n          path: alternate-checkout"),
   ]) {
     assert.notEqual(mutated, stress);
-    assert.throws(() => assertWorkflowReleaseContract(ci, mutated));
+    assert.throws(() => assertCiWorkflowSet({ pr: ci, release, legacy, stress: mutated }));
   }
 });
 
 test("workflow scalar readers reject shell-block text masquerading as the serial setting", () => {
+  const release = source(".github/workflows/v2-release-qualification.yml");
+  const legacy = source(".github/workflows/v2-legacy-regression.yml");
   const ci = source(".github/workflows/ci.yml"), stress = source(".github/workflows/sqlite-stress.yml");
   const forged = stress.replace("      max-parallel: 1\n", "")
     .replace("        run: |\n", "        run: |\n          max-parallel: 1\n");
   assert.notEqual(forged, stress);
-  assert.throws(() => assertWorkflowReleaseContract(ci, forged), /stress must remain serial/);
+  assert.throws(() => assertCiWorkflowSet({ pr: ci, release, legacy, stress: forged }), /stress\/stress matrix and check identity/);
 });
 
 test("workflow parser rejects synthetic upload identity, policy, owner, and order substitutions", () => {
-  const ci = source(".github/workflows/ci.yml"), stress = source(".github/workflows/sqlite-stress.yml");
+  const pr = source(".github/workflows/ci.yml");
+  const release = source(".github/workflows/v2-release-qualification.yml");
+  const ci = source(".github/workflows/v2-legacy-regression.yml"), stress = source(".github/workflows/sqlite-stress.yml");
   const mutations = [
     ci.replace(MIGRATION_UPLOAD, ""),
     ci.replace(MIGRATION_UPLOAD, `${MIGRATION_UPLOAD}\n${MIGRATION_UPLOAD}`),
@@ -621,19 +631,25 @@ test("workflow parser rejects synthetic upload identity, policy, owner, and orde
       ["        with:", "        if: success()\n        with:"],
       ["        with:", "        continue-on-error: true\n        with:"],
     ].map(([from, to]) => ci.replace(MIGRATION_UPLOAD, MIGRATION_UPLOAD.replace(from!, to!))),
-    ci.replace(MIGRATION_UPLOAD, "").replace("      - name: Build\n", `${MIGRATION_UPLOAD}\n      - name: Build\n`),
-    ci.replace(MIGRATION_UPLOAD, "").replace("    name: Reject Node", `${MIGRATION_UPLOAD}\n    name: Reject Node`),
+    ci.replace(MIGRATION_UPLOAD, "").replace("      - name: Check runtime capabilities\n", `${MIGRATION_UPLOAD}\n      - name: Check runtime capabilities\n`),
+    ci.replace("  legacy-regression:", "  minimum-runtime-rejection:"),
     ci.replace(MIGRATION_UPLOAD, "").replace("    steps:\n", `    nested:\n      steps:\n${MIGRATION_UPLOAD.split("\n").map(line => `  ${line}`).join("\n")}\n    steps:\n`),
   ];
   for (const mutated of mutations) {
     assert.notEqual(mutated, ci);
-    assert.throws(() => assertWorkflowReleaseContract(mutated, stress));
+    assert.throws(() => assertCiWorkflowSet({ pr, release, legacy: mutated, stress }));
   }
-  assert.throws(() => assertWorkflowReleaseContract(ci.replace(MIGRATION_UPLOAD, ""), `${stress}\n${MIGRATION_UPLOAD}\n`));
+  assert.throws(() => assertCiWorkflowSet({
+    pr: pr.replace("    name: Reject Node", `${MIGRATION_UPLOAD}\n    name: Reject Node`),
+    release, legacy: ci.replace(MIGRATION_UPLOAD, ""), stress,
+  }));
+  assert.throws(() => assertCiWorkflowSet({ pr, release, legacy: ci.replace(MIGRATION_UPLOAD, ""), stress: `${stress}\n${MIGRATION_UPLOAD}\n` }));
 });
 
 test("workflow parser rejects payload paths and nonliteral evidence transport", () => {
-  const ci = source(".github/workflows/ci.yml"), stress = source(".github/workflows/sqlite-stress.yml");
+  const pr = source(".github/workflows/ci.yml");
+  const release = source(".github/workflows/v2-release-qualification.yml");
+  const ci = source(".github/workflows/v2-legacy-regression.yml"), stress = source(".github/workflows/sqlite-stress.yml");
   for (const path of [
     "${{ runner.temp }}/v2-shadow-migration-functional", "${{ runner.temp }}/**/*.json",
     "${{ runner.temp }}/v2-shadow-migration-functional/../evidence.json", "${{ inputs.evidence }}",
@@ -643,61 +659,56 @@ test("workflow parser rejects payload paths and nonliteral evidence transport", 
   ]) {
     const mutated = ci.replace(`          path: ${MIGRATION_OUTPUT}`, `          path: ${path}`);
     assert.notEqual(mutated, ci);
-    assert.throws(() => assertWorkflowReleaseContract(mutated, stress), path);
+    assert.throws(() => assertCiWorkflowSet({ pr, release, legacy: mutated, stress }), path);
   }
 });
 
 test("workflow parser binds output exclusively to the fresh producer gate", () => {
-  const ci = source(".github/workflows/ci.yml"), stress = source(".github/workflows/sqlite-stress.yml");
+  const pr = source(".github/workflows/ci.yml");
+  const release = source(".github/workflows/v2-release-qualification.yml");
+  const ci = source(".github/workflows/v2-legacy-regression.yml"), stress = source(".github/workflows/sqlite-stress.yml");
   const env = `        env:\n          V2_SHADOW_MIGRATION_TEST_EVIDENCE_OUTPUT: ${MIGRATION_OUTPUT}\n`;
   const mutations = [
     ci.replace(MIGRATION_GATE, ""),
     ...[["        env:", "        if: always()\n        env:"],
       ["        env:", "        continue-on-error: false\n        env:"],
-      ["npm run test:v2-shadow-migration", "echo '{}' > evidence.json"],
-      ["npm run test:v2-shadow-migration", "cp stale.json evidence.json"],
-      ["npm run test:v2-shadow-migration", "npm run test:v2-shadow-migration || true"],
+      ["npm run test:migration", "echo '{}' > evidence.json"],
+      ["npm run test:migration", "cp stale.json evidence.json"],
+      ["npm run test:migration", "npm run test:migration || true"],
       ["        run:", "        nested:\n          run:"],
     ].map(([from, to]) => ci.replace(MIGRATION_GATE, MIGRATION_GATE.replace(from!, to!))),
-    ci.replace(env, "").replace("        run: npm run build", `${env}        run: npm run build`),
+    ci.replace(env, "").replace("        run: npm run check:runtime", `${env}        run: npm run check:runtime`),
     ci.replace(env, "").replace("jobs:\n", `env:\n  V2_SHADOW_MIGRATION_TEST_EVIDENCE_OUTPUT: ${MIGRATION_OUTPUT}\njobs:\n`),
     ci.replace(env, env.replace(MIGRATION_OUTPUT, "${{ inputs.path }}")),
     ci.replace(env, `${env}          NODE_ENV: production\n`),
-    ci.replace("      - name: Build\n", "      - name: Forge evidence\n        run: cp stale.json evidence.json\n      - name: Build\n"),
+    ci.replace("      - name: Check runtime capabilities\n", "      - name: Forge evidence\n        run: cp stale.json evidence.json\n      - name: Check runtime capabilities\n"),
     ci.replace(MIGRATION_UPLOAD, MIGRATION_UPLOAD.replace("          path:", "          nested:\n            path:")),
     ci.replace(MIGRATION_UPLOAD, MIGRATION_UPLOAD.replace("          path:", "          path: source.sqlite\n          path:")),
   ];
   for (const mutated of mutations) {
     assert.notEqual(mutated, ci);
-    assert.throws(() => assertWorkflowReleaseContract(mutated, stress));
+    assert.throws(() => assertCiWorkflowSet({ pr, release, legacy: mutated, stress }));
   }
 });
 
 test("workflow parser closes conditional, scalar, and upload-owner bypasses", () => {
+  const release = source(".github/workflows/v2-release-qualification.yml");
+  const legacy = source(".github/workflows/v2-legacy-regression.yml");
   const ci = source(".github/workflows/ci.yml");
   const stress = source(".github/workflows/sqlite-stress.yml");
   assert.throws(
-    () => assertWorkflowReleaseContract(
-      ci.replace("  release-gates:\n", "  release-gates:\n    if: ${{ !true }}\n"),
-      stress,
-    ),
+    () => assertCiWorkflowSet({ pr: ci.replace("  release-gates:\n", "  release-gates:\n    if: ${{ !true }}\n"), release, legacy, stress }),
     /release-gates job must not declare if/,
   );
   assert.throws(
-    () => assertWorkflowReleaseContract(
-      ci.replace("  release-gates:\n", "  release-gates:\n    continue-on-error: true\n"),
-      stress,
-    ),
+    () => assertCiWorkflowSet({ pr: ci.replace("  release-gates:\n", "  release-gates:\n    continue-on-error: true\n"), release, legacy, stress }),
     /release-gates job must not declare continue-on-error/,
   );
   assert.throws(
-    () => assertWorkflowReleaseContract(
-      ci.replace(
-        "      - name: Run V2 rollout control-plane gate\n        run: npm run test:rollout-control-plane",
-        "      - name: Run V2 rollout control-plane gate\n        continue-on-error: true\n        run: npm run test:rollout-control-plane",
-      ),
-      stress,
-    ),
+    () => assertCiWorkflowSet({ pr: ci, release: release.replace(
+        "      - name: Run V2 rollout control-plane gate\n        id: rollout\n        run: npm run test:rollout-control-plane",
+        "      - name: Run V2 rollout control-plane gate\n        id: rollout\n        continue-on-error: true\n        run: npm run test:rollout-control-plane",
+      ), legacy, stress }),
     /Run V2 rollout control-plane gate must not declare continue-on-error/,
   );
 
@@ -705,7 +716,7 @@ test("workflow parser closes conditional, scalar, and upload-owner bypasses", ()
     "      - name: Upload stress logs\n        if: ${{ always() }}\n        uses: actions/upload-artifact@v7",
     "      - uses: \"actions/upload-artifact@v7\"\n        if: '${{ always() }}'",
   );
-  assert.throws(() => assertWorkflowReleaseContract(ci, quotedUnnamedUpload), /every executable step must be named/);
+  assert.throws(() => assertCiWorkflowSet({ pr: ci, release, legacy, stress: quotedUnnamedUpload }), /every executable step must be named/);
 
   const uploadBlock = [
     "      - uses: actions/upload-artifact@v7",
@@ -715,10 +726,8 @@ test("workflow parser closes conditional, scalar, and upload-owner bypasses", ()
     "          retention-days: 14",
   ].join("\n");
   assert.throws(
-    () => assertWorkflowReleaseContract(
-      ci.replace("\n  minimum-runtime-rejection:", `\n${uploadBlock}\n\n  minimum-runtime-rejection:`),
-      stress.replace(/\n      - name: Upload stress logs[\s\S]*$/m, "\n"),
-    ),
+    () => assertCiWorkflowSet({ pr: ci.replace("\n  minimum-runtime-rejection:", `\n${uploadBlock}\n\n  minimum-runtime-rejection:`), release, legacy,
+      stress: stress.replace(/\n      - name: Upload stress logs[\s\S]*$/m, "\n") }),
     /every executable step must be named/,
   );
 
@@ -726,22 +735,23 @@ test("workflow parser closes conditional, scalar, and upload-owner bypasses", ()
     "      - name: Upload stress logs",
     `${uploadBlock.replace("actions/upload-artifact@v7", "actions/upload-artifact@v6")}\n\n      - name: Upload stress logs`,
   );
-  assert.throws(() => assertWorkflowReleaseContract(ci, extraUploader), /every executable step must be named/);
+  assert.throws(() => assertCiWorkflowSet({ pr: ci, release, legacy, stress: extraUploader }), /every executable step must be named/);
 });
 
 test("workflow parser rejects quoted conditional keys before reading jobs", () => {
+  const release = source(".github/workflows/v2-release-qualification.yml");
+  const legacy = source(".github/workflows/v2-legacy-regression.yml");
   const ci = source(".github/workflows/ci.yml");
   const stress = source(".github/workflows/sqlite-stress.yml");
   assert.throws(
-    () => assertWorkflowReleaseContract(
-      ci.replace("  release-gates:\n", "  release-gates:\n    \"if\": ${{ !true }}\n"),
-      stress,
-    ),
+    () => assertCiWorkflowSet({ pr: ci.replace("  release-gates:\n", "  release-gates:\n    \"if\": ${{ !true }}\n"), release, legacy, stress }),
     /quoted YAML mapping key/,
   );
 });
 
 test("workflow parser rejects quoted action keys before enumerating uploads", () => {
+  const release = source(".github/workflows/v2-release-qualification.yml");
+  const legacy = source(".github/workflows/v2-legacy-regression.yml");
   const ci = source(".github/workflows/ci.yml");
   const stress = source(".github/workflows/sqlite-stress.yml");
   const hiddenQuotedUpload = stress.replace(
@@ -753,10 +763,12 @@ test("workflow parser rejects quoted action keys before enumerating uploads", ()
       "      - name: Upload stress logs",
     ].join("\n"),
   );
-  assert.throws(() => assertWorkflowReleaseContract(ci, hiddenQuotedUpload), /quoted YAML mapping key/);
+  assert.throws(() => assertCiWorkflowSet({ pr: ci, release, legacy, stress: hiddenQuotedUpload }), /quoted YAML mapping key/);
 });
 
 test("workflow parser rejects flow-style actions before enumerating uploads", () => {
+  const release = source(".github/workflows/v2-release-qualification.yml");
+  const legacy = source(".github/workflows/v2-legacy-regression.yml");
   const ci = source(".github/workflows/ci.yml");
   const stress = source(".github/workflows/sqlite-stress.yml");
   const hiddenFlowUpload = stress.replace(
@@ -767,10 +779,12 @@ test("workflow parser rejects flow-style actions before enumerating uploads", ()
       "      - name: Upload stress logs",
     ].join("\n"),
   );
-  assert.throws(() => assertWorkflowReleaseContract(ci, hiddenFlowUpload), /flow-style YAML/);
+  assert.throws(() => assertCiWorkflowSet({ pr: ci, release, legacy, stress: hiddenFlowUpload }), /flow-style YAML/);
 });
 
 test("workflow parser rejects YAML anchors, aliases, merges, and tags in structural grammar", () => {
+  const release = source(".github/workflows/v2-release-qualification.yml");
+  const legacy = source(".github/workflows/v2-legacy-regression.yml");
   const ci = source(".github/workflows/ci.yml");
   const stress = source(".github/workflows/sqlite-stress.yml");
   const mutations = [
@@ -780,18 +794,20 @@ test("workflow parser rejects YAML anchors, aliases, merges, and tags in structu
     ci.replace("    name: Node", "    name: !ci_tag Node"),
   ];
   for (const mutatedCi of mutations) {
-    assert.throws(() => assertWorkflowReleaseContract(mutatedCi, stress), /unsupported YAML (?:anchor|alias|merge key|tag)/);
+    assert.throws(() => assertCiWorkflowSet({ pr: mutatedCi, release, legacy, stress }), /unsupported YAML (?:anchor|alias|merge key|tag)/);
   }
 });
 
 test("workflow parser rejects explicit YAML keys and values before reading jobs or actions", () => {
+  const release = source(".github/workflows/v2-release-qualification.yml");
+  const legacy = source(".github/workflows/v2-legacy-regression.yml");
   const ci = source(".github/workflows/ci.yml");
   const stress = source(".github/workflows/sqlite-stress.yml");
   const explicitCondition = ci.replace(
     "  release-gates:\n",
     ["  release-gates:", "    ? if", "    : ${{ !true }}", ""].join("\n"),
   );
-  assert.throws(() => assertWorkflowReleaseContract(explicitCondition, stress), /explicit YAML key/);
+  assert.throws(() => assertCiWorkflowSet({ pr: explicitCondition, release, legacy, stress }), /explicit YAML key/);
 
   const hiddenExplicitUpload = stress.replace(
     "      - name: Upload stress logs",
@@ -802,10 +818,12 @@ test("workflow parser rejects explicit YAML keys and values before reading jobs 
       "      - name: Upload stress logs",
     ].join("\n"),
   );
-  assert.throws(() => assertWorkflowReleaseContract(ci, hiddenExplicitUpload), /explicit YAML key/);
+  assert.throws(() => assertCiWorkflowSet({ pr: ci, release, legacy, stress: hiddenExplicitUpload }), /explicit YAML key/);
 });
 
 test("workflow parser rejects directives, document markers, tabs, and exotic block scalars", () => {
+  const release = source(".github/workflows/v2-release-qualification.yml");
+  const legacy = source(".github/workflows/v2-legacy-regression.yml");
   const ci = source(".github/workflows/ci.yml");
   const stress = source(".github/workflows/sqlite-stress.yml");
   const mutations = [
@@ -815,7 +833,7 @@ test("workflow parser rejects directives, document markers, tabs, and exotic blo
     ci.replace("    name: Node", "    name: >"),
   ];
   for (const mutatedCi of mutations) {
-    assert.throws(() => assertWorkflowReleaseContract(mutatedCi, stress), /(?:directive|document marker|tab|block scalar)/);
+    assert.throws(() => assertCiWorkflowSet({ pr: mutatedCi, release, legacy, stress }), /(?:directive|document marker|tab|block scalar)/);
   }
 });
 
@@ -1058,6 +1076,34 @@ test("Subproject 3 focused gate includes lifecycle isolation and rejects answer-
   ]));
 });
 
+function assertCurrentSourceInventories(): void {
+  const protectedDiff = execFileSync(
+    "git",
+    ["diff", "--name-only", BASE, "--", ...PROTECTED_VERSION_ONE_PATHS],
+    { cwd: fileURLToPath(ROOT), encoding: "utf8" },
+  ).trim();
+  assert.equal(protectedDiff, "", "Version 1 production paths must remain byte-unchanged");
+  const sealedSourceDiff = execFileSync(
+    "git",
+    ["diff", "--name-only", SEALED_EVALUATOR_BASE, "--", "src"],
+    { cwd: fileURLToPath(ROOT), encoding: "utf8" },
+  ).trim();
+  assert.deepEqual(
+    sealedSourceDiff === "" ? [] : sealedSourceDiff.split(/\r?\n/),
+    APPROVED_SEALED_AND_ROLLOUT_SOURCE_DIFF,
+    "only the approved sealed-source remediations may change production source after the sealed evaluator baseline",
+  );
+}
+
+test("CI roles preserve immutable routing and sealed source inventory", () => {
+  const pr = source(".github/workflows/ci.yml");
+  const release = source(".github/workflows/v2-release-qualification.yml");
+  const legacy = source(".github/workflows/v2-legacy-regression.yml");
+  const stress = source(".github/workflows/sqlite-stress.yml");
+  assertCiWorkflowSet({ pr, release, legacy, stress });
+  assertCurrentSourceInventories();
+});
+
 test("Subproject 3 evaluation and projection runtime remain internal-only", () => {
   const toolNames = productionToolNames();
   assert.equal(toolNames.includes("memory_retrievalExplain"), false);
@@ -1081,22 +1127,7 @@ test("Subproject 3 evaluation and projection runtime remain internal-only", () =
     "corpus evaluation must finish before the isolation gate",
   );
 
-  const protectedDiff = execFileSync(
-    "git",
-    ["diff", "--name-only", BASE, "--", ...PROTECTED_VERSION_ONE_PATHS],
-    { cwd: fileURLToPath(ROOT), encoding: "utf8" },
-  ).trim();
-  assert.equal(protectedDiff, "", "Version 1 production paths must remain byte-unchanged");
-  const sealedSourceDiff = execFileSync(
-    "git",
-    ["diff", "--name-only", SEALED_EVALUATOR_BASE, "--", "src"],
-    { cwd: fileURLToPath(ROOT), encoding: "utf8" },
-  ).trim();
-  assert.deepEqual(
-    sealedSourceDiff === "" ? [] : sealedSourceDiff.split(/\r?\n/),
-    APPROVED_SEALED_AND_ROLLOUT_SOURCE_DIFF,
-    "only the approved sealed-source remediations may change production source after the sealed evaluator baseline",
-  );
+  assertCurrentSourceInventories();
   for (const path of PRODUCTION_ENTRY_SOURCE_PATHS) {
     assertNoV2EntryWiring(source(path));
     assert.doesNotMatch(
