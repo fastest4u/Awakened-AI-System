@@ -16,6 +16,50 @@ export const rehearsalRecipePaths = Object.freeze(['package.json', 'package-lock
     'node_modules/zod/package.json', 'node_modules/esbuild/package.json', 'node_modules/esbuild/lib/main.js',
     'node_modules/typescript/package.json', 'node_modules/typescript/lib/typescript.js',
     `${nativePackage}/package.json`, `${nativePackage}/${nativeSubpath}`].sort());
+export function createCiDiagnosticCollector(write) {
+    let incomplete = false;
+    const encountered = new Set();
+    function closed(value, keys) {
+        if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('invalid');
+        const descriptors = Object.getOwnPropertyDescriptors(value);
+        if (Reflect.ownKeys(descriptors).length !== keys.length || keys.some(key => !descriptors[key]
+            || !Object.hasOwn(descriptors[key], 'value'))) throw new Error('invalid');
+        return Object.fromEntries(keys.map(key => [key, descriptors[key].value]));
+    }
+    const cases = ['recipe-measurement', 'regular-control', 'link-control', 'size-control', 'read-control', 'identity-control', 'path-control',
+        'coordinator-control', 'manifest-control', 'integrity-control', 'admission-control', 'durability-control', 'cleanup-control'];
+    const predicate = value => typeof value === 'boolean' || value === 'unknown';
+    const decimal = value => value === 'unknown' || typeof value === 'string' && /^(0|[1-9][0-9]*)$/.test(value);
+    return { observe(record) {
+        if (incomplete) return false;
+        try {
+            const family = Object.getOwnPropertyDescriptor(record, 'family')?.value;
+            const build = family === 'build';
+            const sanitized = closed(record, ['schemaVersion', 'family', 'caseId', 'platform', 'boundary', 'phase',
+                ...(build ? ['recipeId'] : []), 'reason', 'observed']);
+            if (sanitized.schemaVersion !== 1 || !cases.includes(sanitized.caseId)
+                || !['aix', 'android', 'darwin', 'freebsd', 'linux', 'openbsd', 'sunos', 'win32', 'cygwin', 'netbsd'].includes(sanitized.platform)) throw new Error('invalid');
+            const predicates = build ? ['regular', 'singleLink', 'withinSizeLimit', 'descriptorEqual', 'pathEqual', 'sizeEqual', 'mtimeEqual', 'ctimeEqual']
+                : ['absolute', 'normalized', 'resolved', 'statSuccess', 'nativeRealpathSuccess', 'directory', 'symlink', 'canonicalEqual', 'relativeAbsolute', 'parentEscape', 'walkReachedBase'];
+            const counts = build ? ['linkCount', 'size', 'limit'] : [];
+            sanitized.observed = closed(sanitized.observed, [...predicates, ...counts, 'operation', 'errorCode']);
+            if (predicates.some(key => !predicate(sanitized.observed[key])) || counts.some(key => !decimal(sanitized.observed[key]))
+                || !['lstat', 'realpath', 'open', 'fstat', 'read', 'close', 'none', 'unknown'].includes(sanitized.observed.operation)
+                || !['ENOENT', 'EACCES', 'EPERM', 'EINVAL', 'EIO', 'none', 'unknown'].includes(sanitized.observed.errorCode)) throw new Error('invalid');
+            if (build ? sanitized.phase !== 'guard-observation' || !rehearsalRecipePaths.includes(sanitized.recipeId)
+                || !['recipe-path', 'descriptor-before', 'read', 'descriptor-after'].includes(sanitized.boundary)
+                || !['path', 'non-regular', 'link-count', 'size', 'short-read', 'identity-change', 'filesystem', 'unknown'].includes(sanitized.reason)
+                : !['coordinator', 'manifest', 'integrity', 'fresh-admission', 'durable-directory'].includes(family)
+                || sanitized.boundary !== 'path-snapshot' || sanitized.phase !== 'pre-boundary-snapshot'
+                || !['snapshot', 'filesystem'].includes(sanitized.reason)) throw new Error('invalid');
+            const key = `${sanitized.caseId}:${sanitized.boundary}`;
+            if (encountered.size >= 16 || encountered.has(key)) throw new Error('invalid');
+            const line = JSON.stringify(sanitized);
+            if (Buffer.byteLength(line, 'utf8') > 2048) throw new Error('invalid');
+            write(line); encountered.add(key); return true;
+        } catch { incomplete = true; return false; }
+    }, get incomplete() { return incomplete; } };
+}
 const DOMAIN = 'project-memory/v2-shadow-migration-private-build/v1\n';
 const HASH = /^[0-9a-f]{64}$/;
 const MAX_FILE = 32 * 1024 * 1024, MAX_TOTAL = 128 * 1024 * 1024;
@@ -26,42 +70,83 @@ export function buildCanonical(value) {
     if (value && typeof value === 'object') return `{${Object.keys(value).sort().map(k => `${JSON.stringify(k)}:${buildCanonical(value[k])}`).join(',')}}`;
     return JSON.stringify(value);
 }
-function checkedPath(name) {
+function observeBuild(observation, name, boundary, reason, observed = {}) {
+    if (!observation) return;
+    try {
+        observation.observe({ schemaVersion: 1, family: 'build', caseId: observation.caseId, platform: process.platform,
+            boundary, phase: 'guard-observation', recipeId: name, reason, observed: {
+                regular: 'unknown', singleLink: 'unknown', withinSizeLimit: 'unknown', linkCount: 'unknown', size: 'unknown', limit: 'unknown',
+                descriptorEqual: 'unknown', pathEqual: 'unknown', sizeEqual: 'unknown', mtimeEqual: 'unknown', ctimeEqual: 'unknown',
+                operation: 'none', errorCode: 'none', ...observed } });
+    } catch { /* Observation never replaces a product outcome. */ }
+}
+function observedFilesystem(observation, name, boundary, operation, action) {
+    if (!observation) return action();
+    try { return action(); }
+    catch (error) {
+        let code;
+        try { code = Object.getOwnPropertyDescriptor(error, 'code')?.value; } catch { /* Unavailable error metadata stays unknown. */ }
+        observeBuild(observation, name, boundary, 'filesystem', { operation,
+            errorCode: ['ENOENT', 'EACCES', 'EPERM', 'EINVAL', 'EIO'].includes(code) ? code : 'unknown' });
+        throw error;
+    }
+}
+function observedRefusal(observation, name, boundary, reason, observed) {
+    observeBuild(observation, name, boundary, reason, observed); buildRefusal();
+}
+function checkedPath(name, observation) {
     if (typeof name !== 'string' || name.length > 240 || !/^[a-zA-Z0-9_@./-]+$/.test(name)
-        || name.split('/').some(p => !p || p === '.' || p === '..')) buildRefusal();
+        || name.split('/').some(p => !p || p === '.' || p === '..')) observedRefusal(observation, name, 'recipe-path', 'path');
     const absolute = path.join(rehearsalBuildRoot, name);
     let cursor = rehearsalBuildRoot;
     for (const part of name.split('/')) {
         cursor = path.join(cursor, part);
-        if (fs.lstatSync(cursor).isSymbolicLink()) buildRefusal();
+        if (observedFilesystem(observation, name, 'recipe-path', 'lstat', () => fs.lstatSync(cursor)).isSymbolicLink())
+            observedRefusal(observation, name, 'recipe-path', 'path');
     }
-    if (fs.realpathSync(absolute) !== absolute) buildRefusal();
+    if (observedFilesystem(observation, name, 'recipe-path', 'realpath', () => fs.realpathSync(absolute)) !== absolute)
+        observedRefusal(observation, name, 'recipe-path', 'path');
     return absolute;
 }
-export function readBuildBytes(name, maximum = MAX_FILE) {
-    return readAbsoluteBuildBytes(checkedPath(name), maximum);
+export function readBuildBytes(name, maximum = MAX_FILE, observation) {
+    return readAbsoluteBuildBytes(checkedPath(name, observation), maximum, observation, name);
 }
-function readAbsoluteBuildBytes(absolute, maximum) {
-    const fd = fs.openSync(absolute, 'r');
+function readAbsoluteBuildBytes(absolute, maximum, observation, name) {
+    const fd = observedFilesystem(observation, name, 'descriptor-before', 'open', () => fs.openSync(absolute, 'r'));
     try {
-        const before = fs.fstatSync(fd, { bigint: true });
-        if (!before.isFile() || before.nlink !== 1n || before.size > BigInt(maximum)) buildRefusal();
+        const before = observedFilesystem(observation, name, 'descriptor-before', 'fstat', () => fs.fstatSync(fd, { bigint: true }));
+        const regular = before.isFile(), singleLink = regular ? before.nlink === 1n : 'unknown';
+        const withinSizeLimit = singleLink === true ? before.size <= BigInt(maximum) : 'unknown';
+        if (!regular || singleLink === false || withinSizeLimit === false) observedRefusal(observation, name, 'descriptor-before',
+            !regular ? 'non-regular' : singleLink === false ? 'link-count' : 'size',
+            { regular, singleLink, withinSizeLimit, linkCount: String(before.nlink), size: String(before.size), limit: String(maximum) });
         const bytes = Buffer.alloc(Number(before.size)); let offset = 0;
         while (offset < bytes.length) {
-            const count = fs.readSync(fd, bytes, offset, bytes.length - offset, offset);
-            if (count === 0) buildRefusal(); offset += count;
+            const count = observedFilesystem(observation, name, 'read', 'read', () => fs.readSync(fd, bytes, offset, bytes.length - offset, offset));
+            if (count === 0) observedRefusal(observation, name, 'read', 'short-read',
+                { regular, singleLink, withinSizeLimit, linkCount: String(before.nlink), size: String(before.size), limit: String(maximum) }); offset += count;
         }
-        const after = fs.fstatSync(fd, { bigint: true }), leaf = fs.lstatSync(absolute, { bigint: true });
-        for (const stat of [after, leaf]) if (!stat.isFile() || stat.nlink !== 1n || stat.dev !== before.dev || stat.ino !== before.ino
-            || stat.size !== before.size || stat.mtimeNs !== before.mtimeNs || stat.ctimeNs !== before.ctimeNs) buildRefusal();
+        const after = observedFilesystem(observation, name, 'descriptor-after', 'fstat', () => fs.fstatSync(fd, { bigint: true })),
+            leaf = observedFilesystem(observation, name, 'descriptor-after', 'lstat', () => fs.lstatSync(absolute, { bigint: true }));
+        for (const stat of [after, leaf]) {
+            const finalRegular = stat.isFile(), finalSingleLink = finalRegular ? stat.nlink === 1n : 'unknown';
+            const identityEqual = finalSingleLink === true ? stat.dev === before.dev && stat.ino === before.ino : 'unknown';
+            const sizeEqual = identityEqual === true ? stat.size === before.size : 'unknown';
+            const mtimeEqual = sizeEqual === true ? stat.mtimeNs === before.mtimeNs : 'unknown';
+            const ctimeEqual = mtimeEqual === true ? stat.ctimeNs === before.ctimeNs : 'unknown';
+            if (!finalRegular || finalSingleLink === false || identityEqual === false || sizeEqual === false || mtimeEqual === false || ctimeEqual === false)
+                observedRefusal(observation, name, 'descriptor-after', !finalRegular ? 'non-regular' : finalSingleLink === false ? 'link-count' : 'identity-change',
+                    { regular: finalRegular, singleLink: finalSingleLink, withinSizeLimit: 'unknown', linkCount: String(stat.nlink), size: String(stat.size), limit: String(maximum),
+                        descriptorEqual: stat === after ? identityEqual : true, pathEqual: stat === leaf ? identityEqual : 'unknown', sizeEqual, mtimeEqual, ctimeEqual });
+        }
         return bytes;
-    } finally { fs.closeSync(fd); }
+    } finally { observedFilesystem(observation, name, 'descriptor-after', 'close', () => fs.closeSync(fd)); }
 }
-export function measureBuildFiles(names) {
+export function measureBuildFiles(names, observation) {
     if (names.length > 512 || new Set(names).size !== names.length) buildRefusal();
     let total = 0;
     return [...names].sort().map(name => {
-        const bytes = readBuildBytes(name); total += bytes.length;
+        const bytes = readBuildBytes(name, MAX_FILE, observation); total += bytes.length;
         if (total > MAX_TOTAL) buildRefusal();
         return { path: name, bytes: bytes.length, sha256: buildDigest(bytes) };
     });

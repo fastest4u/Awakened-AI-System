@@ -14,7 +14,7 @@ writeFileSync(path.join(outDir, 'internal', 'v2-shadow-migration-build.json'), '
 writeFileSync(path.join(outDir, 'v2-build.json'), '{"schemaVersion":1,"incomplete":true}\n');
 const { freshStartBuild } = await import('./fresh-start-build.js');
 const { rehearsalManifestPath, rehearsalArtifactPaths, rehearsalRecipePaths, rehearsalBuildRoot,
-    readBuildBytes, measureBuildFiles, assertBuildFiles, assertBuildResolutionMetadata, assertBuildToolResolution, cleanBuildHead, assertCommittedBuildFiles,
+    readBuildBytes, measureBuildFiles, createCiDiagnosticCollector, assertBuildFiles, assertBuildResolutionMetadata, assertBuildToolResolution, cleanBuildHead, assertCommittedBuildFiles,
     buildRuntimeIdentity, buildToolIdentity, privateBuildIdentity, buildCanonical, buildDigest, buildRefusal,
 } = await import('./run-v2-shadow-migration-rehearsal.js');
 const selectedTools = assertBuildToolResolution();
@@ -138,7 +138,15 @@ async function build() {
     }
 
     if (process.cwd() !== rehearsalBuildRoot || process.env.ESBUILD_BINARY_PATH) buildRefusal();
-    const initialHead = cleanBuildHead(), recipes = measureBuildFiles(rehearsalRecipePaths);
+    const initialHead = cleanBuildHead();
+    const diagnostic = createCiDiagnosticCollector(line => process.stderr.write(`CI_DIAGNOSTIC ${line}\n`));
+    let recipes;
+    try { recipes = measureBuildFiles(rehearsalRecipePaths, { caseId: 'recipe-measurement', observe: diagnostic.observe }); }
+    finally {
+        if (diagnostic.incomplete) {
+            try { process.stderr.write('CI_DIAGNOSTIC_INCOMPLETE\n'); } catch { /* Preserve the original measurement result. */ }
+        }
+    }
     const commandBefore = measureBuildFiles(['scripts/run-v2-shadow-migration-rehearsal.js']);
     const runtime = buildRuntimeIdentity(), buildTools = buildToolIdentity();
     if (buildTools.esbuildVersion !== esbuild.version || buildTools.typescriptVersion !== ts.version) buildRefusal();

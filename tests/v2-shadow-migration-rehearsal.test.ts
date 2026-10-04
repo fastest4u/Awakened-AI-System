@@ -26,6 +26,7 @@ import { openImmutableProjectionImage } from "../src/orchestrator/projections/in
 import { verifyV1SourceCopy } from "../src/orchestrator/migration/v1-source-copy.js";
 
 let compiledPreflight: Promise<any> | undefined;
+const nativeRecipePath = `node_modules/@esbuild/${process.platform}-${process.arch}/${process.platform === "win32" ? "esbuild.exe" : "bin/esbuild"}`;
 // This snapshot is independent of the original Git administration and captures current bytes,
 // including uncommitted additions/deletions. It is synthetic functional evidence only.
 function cleanBuildFixture(t: TestContext): string {
@@ -574,7 +575,7 @@ test("clean current-byte fixture validates provenance and refuses stale or corru
   await t.test("supplied identity mismatch refuses", () => assert.equal(validate("0".repeat(64)).status, 7));
   for (const name of ["src/orchestrator/migration/v2-shadow-migration-rehearsal.ts", "tsconfig.json", "scripts/build.js", "scripts/fresh-start-build.js",
     "node_modules/zod/v3/types.js", "node_modules/esbuild/lib/main.js", "node_modules/typescript/lib/typescript.js", "dist/internal/v2-shadow-migration-rehearsal.js",
-    "dist/internal/stable-compatibility-directory.worker.js", "scripts/run-v2-shadow-migration-rehearsal.js"]) {
+    "dist/internal/stable-compatibility-directory.worker.js", "scripts/run-v2-shadow-migration-rehearsal.js", nativeRecipePath]) {
     await t.test(`changed ${name} refuses`, () => {
       const path = join(root, name), bytes = fs.readFileSync(path);
       try { fs.appendFileSync(path, "\n "); assert.equal(validate().status, 7); }
@@ -599,6 +600,12 @@ test("clean current-byte fixture validates provenance and refuses stale or corru
     const module = await import(command), handoff = module.validateV2ShadowMigrationBuild(manifest.buildIdentityHash);
     const path = join(root, "node_modules/zod/v3/types.js"), bytes = fs.readFileSync(path);
     try { fs.appendFileSync(path, "\n "); assert.throws(() => handoff.assertUnchanged()); }
+    finally { fs.writeFileSync(path, bytes); }
+  });
+  await t.test("finalization handoff detects native executable changes", async () => {
+    const module = await import(command), handoff = module.validateV2ShadowMigrationBuild(manifest.buildIdentityHash);
+    const path = join(root, nativeRecipePath), bytes = fs.readFileSync(path);
+    try { fs.appendFileSync(path, "\n "); assert.throws(() => handoff.assertUnchanged(), /REHEARSAL_BUILD_INVALID/); }
     finally { fs.writeFileSync(path, bytes); }
   });
   await t.test("operational invocation refuses without importing a changed bundle or touching selected paths", () => {
@@ -635,7 +642,7 @@ test("clean current-byte fixture validates provenance and refuses stale or corru
       assert.equal(JSON.parse(fs.readFileSync(manifestPath, "utf8")).eligible, false);
     } finally { fs.writeFileSync(script, bytes); }
   });
-  for (const [ordinal, name] of ["node_modules/zod/v3/types.js", "dist/internal/v2-shadow-migration-rehearsal.js"].entries()) {
+  for (const [ordinal, name] of ["node_modules/zod/v3/types.js", "dist/internal/v2-shadow-migration-rehearsal.js", nativeRecipePath].entries()) {
   await t.test(`late byte change to ${name} refuses manifest publication`, () => {
     const dependency = join(root, name), bytes = fs.readFileSync(dependency);
     const directory = join(root, ".superpowers"); fs.mkdirSync(directory, { recursive: true });
