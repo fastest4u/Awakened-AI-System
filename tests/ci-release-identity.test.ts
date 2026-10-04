@@ -206,20 +206,56 @@ for (const kind of ["wrong-head", "swapped", "missing-control", "changed-blob", 
     } finally { f.cleanup(); }
   });
 }
-test("CI qualification checks native Git failure despite matching stdout and owns a fault assertion", () => {
+function assertNativeGitExitFault(target: string): void {
   const f = qualificationFixture();
   try {
     const real = step("Verify candidate and workflow identity");
     // Real Git still runs and returns the matching HEAD; controlled wrapper adds
     // a failing native exit. Removing its check must make this assertion fail.
-    const prefix = '          function git { & $env:V2_CI_FIXTURE_GIT @args; $global:LASTEXITCODE = 39 }\n';
-    const injected = { ...real, body: real.body.replace('          $ErrorActionPreference = "Stop"\n',
-      '          $ErrorActionPreference = "Stop"\n' + prefix) };
-    const env = { ...envFor(f), V2_CI_FIXTURE_GIT: git };
-    refuse(runInline(injected, f, env), "V2_CI_HEAD_UNAVAILABLE");
-    const fault = { ...injected, body: injected.body.replace(/          if \(\$LASTEXITCODE -ne 0\).*\n/g, "") };
-    assert.throws(() => refuse(runInline(fault, f, env), "V2_CI_HEAD_UNAVAILABLE"), /native qualification refusal required/);
-  } finally { f.cleanup(); }
+    // Bound an accidental function self-resolution before it can recurse again.
+    const prefix = [
+      "          $fixtureGitApplication = @(Get-Command -Name $env:V2_CI_FIXTURE_GIT -CommandType Application -ErrorAction Stop)[0].Path",
+      "          $script:fixtureGitDepth = 0",
+      "          function git {",
+      '            if ($script:fixtureGitDepth -gt 0) { throw "V2_CI_FIXTURE_RECURSIVE_RESOLUTION" }',
+      "            $script:fixtureGitDepth = 1",
+      "            $fixtureGitOutput = & $fixtureGitApplication @args",
+      '            if ($LASTEXITCODE -ne 0) { throw "V2_CI_FIXTURE_NATIVE_FAILURE" }',
+      '            [IO.File]::WriteAllText($env:V2_CI_FIXTURE_NATIVE_PROOF, ($fixtureGitOutput -join "`n"))',
+      "            $script:fixtureGitDepth = 0",
+      "            $fixtureGitOutput",
+      "            $global:LASTEXITCODE = 39",
+      "          }",
+      "",
+    ].join("\n");
+    const inject = (scriptBody: string): WorkflowStep => ({ ...real,
+      body: scriptBody.replace('          $ErrorActionPreference = "Stop"\n',
+        '          $ErrorActionPreference = "Stop"\n' + prefix) });
+    const injected = inject(real.body);
+    const proof = join(f.root, "native-git.proof");
+    const env = { ...envFor(f), V2_CI_FIXTURE_GIT: target, V2_CI_FIXTURE_NATIVE_PROOF: proof };
+    const result = installAfter(injected, f, env);
+    assert.equal(existsSync(proof), true, "native Git application must return HEAD; recursive-resolution="
+      + result.stderr.includes("V2_CI_FIXTURE_RECURSIVE_RESOLUTION"));
+    assert.equal(readFileSync(proof, "utf8"), f.candidate);
+    refuse(result, "V2_CI_HEAD_UNAVAILABLE");
+    assert.doesNotMatch(result.stderr, /V2_CI_FIXTURE_(?:RECURSIVE_RESOLUTION|NATIVE_FAILURE)/);
+    assert.equal(existsSync(join(f.root, "install.sentinel")), false);
+    const fault = inject(real.body.replace(/          if \(\$LASTEXITCODE -ne 0\).*\n/g, ""));
+    const falseAcceptance = installAfter(fault, f, env);
+    assert.equal(falseAcceptance.status, 0, falseAcceptance.stderr);
+    assert.throws(() => refuse(falseAcceptance, "V2_CI_HEAD_UNAVAILABLE"), /native qualification refusal required/);
+    assert.equal(readFileSync(join(f.root, "install.sentinel"), "utf8"), "ran");
+  } finally {
+    f.cleanup();
+    assert.equal(existsSync(f.root), false);
+  }
+}
+test("CI qualification checks native Git failure despite matching stdout and owns a fault assertion", () => {
+  assertNativeGitExitFault(git);
+});
+test("CI qualification bare Git target reaches native application before exit fault wrapping", () => {
+  assertNativeGitExitFault("git");
 });
 test("CI qualification precheckout assertion detects an owned validation fault", () => {
   const f = qualificationFixture();
