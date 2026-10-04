@@ -93,6 +93,53 @@ test("CI build diagnostics thread measurement refusal observations", async () =>
     assert.equal(fixture.openDescriptorCount(), 0);
   } finally { fixture.cleanup(); }
 });
+for (const scenario of ["hardlink", "nonregular descriptor fault", "oversize", "short-read", "descriptor-mutation"] as const) {
+  for (const mode of ["default", "observed"] as const) {
+    test(`CI build diagnostics isolate ${scenario} maximum coercion with ${mode} observation`, async () => {
+      const fixture = await ownedReaderFixture();
+      try {
+        if (scenario === "hardlink") fixture.addRecipeHardlink();
+        if (scenario === "nonregular descriptor fault") {
+          // Owned stat fault, not a claim that Windows opens native directories.
+          fixture.setFault((operation, _fd, result) => operation === "fstat" ? Object.assign(result, { isFile: () => false }) : result);
+        }
+        if (scenario === "short-read" || scenario === "descriptor-mutation") {
+          let fired = false;
+          fixture.setFault((operation, _fd, result) => {
+            if (!fired && operation === (scenario === "short-read" ? "fstat" : "read")) {
+              fired = true;
+              if (scenario === "short-read") fs.truncateSync(join(fixture.root, "package.json"), 0);
+              else fs.appendFileSync(join(fixture.root, "package.json"), " ");
+            }
+            return result;
+          });
+        }
+        let stringCoercions = 0, numberCoercions = 0;
+        const maximum = { [Symbol.toPrimitive](hint: string) {
+          if (hint === "string") { stringCoercions++; throw new Error("synthetic telemetry coercion"); }
+          numberCoercions++; return scenario === "oversize" ? 17 : 1024;
+        } };
+        const o = observation(fixture, "read-control");
+        refusal(() => fixture.reader.readBuildBytes("package.json", maximum, mode === "observed" ? o.option : undefined));
+        assert.equal(numberCoercions, scenario === "hardlink" || scenario === "nonregular descriptor fault" ? 0 : 1);
+        assert.equal(stringCoercions, mode === "default" ? 0 : 1);
+        assert.equal(fixture.openDescriptorCount(), 0);
+      } finally { fixture.cleanup(); }
+    });
+  }
+}
+for (const mode of ["default", "observed"] as const) {
+  test(`CI build diagnostics preserve consulted maximum coercion error with ${mode} observation`, async () => {
+    const fixture = await ownedReaderFixture();
+    try {
+      const expected = new Error("synthetic original guard coercion"); let consulted = 0;
+      const maximum = { [Symbol.toPrimitive](hint: string) { assert.equal(hint, "number"); consulted++; throw expected; } };
+      const o = observation(fixture, "size-control");
+      assert.throws(() => fixture.reader.readBuildBytes("package.json", maximum, mode === "observed" ? o.option : undefined), error => error === expected);
+      assert.equal(consulted, 1); assert.equal(o.rows.length, 0); assert.equal(fixture.openDescriptorCount(), 0);
+    } finally { fixture.cleanup(); }
+  });
+}
 for (const [name, caseId, reason] of [["hardlink", "link-control", "link-count"], ["oversize", "size-control", "size"], ["nonregular", "regular-control", "non-regular"]]) {
   test(`CI build diagnostics bind ${name} refusal to the first descriptor`, async () => {
     const fixture = await ownedReaderFixture();

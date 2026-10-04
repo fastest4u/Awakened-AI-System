@@ -77,7 +77,7 @@ function observeBuild(observation, name, boundary, reason, observed = {}) {
             boundary, phase: 'guard-observation', recipeId: name, reason, observed: {
                 regular: 'unknown', singleLink: 'unknown', withinSizeLimit: 'unknown', linkCount: 'unknown', size: 'unknown', limit: 'unknown',
                 descriptorEqual: 'unknown', pathEqual: 'unknown', sizeEqual: 'unknown', mtimeEqual: 'unknown', ctimeEqual: 'unknown',
-                operation: 'none', errorCode: 'none', ...observed } });
+                operation: 'none', errorCode: 'none', ...(typeof observed === 'function' ? observed() : observed) } });
     } catch { /* Observation never replaces a product outcome. */ }
 }
 function observedFilesystem(observation, name, boundary, operation, action) {
@@ -119,12 +119,12 @@ function readAbsoluteBuildBytes(absolute, maximum, observation, name) {
         const withinSizeLimit = singleLink === true ? before.size <= BigInt(maximum) : 'unknown';
         if (!regular || singleLink === false || withinSizeLimit === false) observedRefusal(observation, name, 'descriptor-before',
             !regular ? 'non-regular' : singleLink === false ? 'link-count' : 'size',
-            { regular, singleLink, withinSizeLimit, linkCount: String(before.nlink), size: String(before.size), limit: String(maximum) });
+            () => ({ regular, singleLink, withinSizeLimit, linkCount: String(before.nlink), size: String(before.size), limit: String(maximum) }));
         const bytes = Buffer.alloc(Number(before.size)); let offset = 0;
         while (offset < bytes.length) {
             const count = observedFilesystem(observation, name, 'read', 'read', () => fs.readSync(fd, bytes, offset, bytes.length - offset, offset));
             if (count === 0) observedRefusal(observation, name, 'read', 'short-read',
-                { regular, singleLink, withinSizeLimit, linkCount: String(before.nlink), size: String(before.size), limit: String(maximum) }); offset += count;
+                () => ({ regular, singleLink, withinSizeLimit, linkCount: String(before.nlink), size: String(before.size), limit: String(maximum) })); offset += count;
         }
         const after = observedFilesystem(observation, name, 'descriptor-after', 'fstat', () => fs.fstatSync(fd, { bigint: true })),
             leaf = observedFilesystem(observation, name, 'descriptor-after', 'lstat', () => fs.lstatSync(absolute, { bigint: true }));
@@ -136,8 +136,8 @@ function readAbsoluteBuildBytes(absolute, maximum, observation, name) {
             const ctimeEqual = mtimeEqual === true ? stat.ctimeNs === before.ctimeNs : 'unknown';
             if (!finalRegular || finalSingleLink === false || identityEqual === false || sizeEqual === false || mtimeEqual === false || ctimeEqual === false)
                 observedRefusal(observation, name, 'descriptor-after', !finalRegular ? 'non-regular' : finalSingleLink === false ? 'link-count' : 'identity-change',
-                    { regular: finalRegular, singleLink: finalSingleLink, withinSizeLimit: 'unknown', linkCount: String(stat.nlink), size: String(stat.size), limit: String(maximum),
-                        descriptorEqual: stat === after ? identityEqual : true, pathEqual: stat === leaf ? identityEqual : 'unknown', sizeEqual, mtimeEqual, ctimeEqual });
+                    () => ({ regular: finalRegular, singleLink: finalSingleLink, withinSizeLimit: 'unknown', linkCount: String(stat.nlink), size: String(stat.size), limit: String(maximum),
+                        descriptorEqual: stat === after ? identityEqual : true, pathEqual: stat === leaf ? identityEqual : 'unknown', sizeEqual, mtimeEqual, ctimeEqual }));
         }
         return bytes;
     } finally { observedFilesystem(observation, name, 'descriptor-after', 'close', () => fs.closeSync(fd)); }
