@@ -10,7 +10,7 @@
 
 **Spec:** [Approved installation-policy A design](../specs/2026-10-04-v2-build-installation-policy-a-design.md). Read its complete native digest table and authority boundaries. Parent [CI-role design](../specs/2026-10-04-v2-fast-pr-full-release-ci-design.md) and [causal-remediation design](../specs/2026-10-04-v2-hosted-ci-remediation-design.md) remain binding outside the named amendment.
 
-**Status:** Written specification approved on 2026-10-04; this written plan awaits human review. Preserve the already selected Subagent-Driven method. No checkbox below is implementation or execution evidence.
+**Status:** The human approved this written plan on 2026-10-04 after approving its specification. Execute with the already selected Subagent-Driven method; task checkboxes record only actual accepted implementation/proof. This approval covers the named local owners and owned checks, not publication, hosted execution or PROD activation.
 
 ## Global Constraints
 
@@ -58,12 +58,14 @@ Only one worker owns compiler/generated outputs or native installation/build pro
 
 **Interfaces:** Produce `assertBuildInstallationPolicy(): void`. It reads only its script-derived checkout and throws the existing fixed `REHEARSAL_BUILD_INVALID` on refusal. Internally derive required/optional roots from bounded lock records; do not expose caller-supplied policy or paths. The import-safe CLI `before` invokes it and emits only `BUILD_INSTALLATION_POLICY_OK` on native success.
 
-- [ ] Write real owned-fixture tests named `installation policy accepts reviewed registry setup`, `installation policy rejects changed setup inventory`, and `installation policy rejects root setup and nonregistry sources`. Copy the current package/lock and builtin scripts into an owned root; mutate one exact input per refusal. A clean before-phase fixture has no installed packages and must pass its reviewed lock/root policy. Independently assert exit/result and untouched fixture sentinels, not the source text.
-- [ ] Add CLI controls for missing/unknown/extra phase arguments and import without CLI execution. Show expected RED against the absent checker/new behavior, with native exit and intended assertion.
-- [ ] Implement the exact registry/root classification and complete sorted singleton setup inventory; validate root declarations, package path/name/version and SRI/registry shape. Bind the reviewed esbuild SRI `sha512-HKVLS8dvII+xoKW9kmqxbRKrnWEXfJJr/FZhhJmiqIB0e053QNYFqOBouTMO/k5sID4MvCiUCvv8b9M4h32wIA==`; version/integrity changes refuse. Bind each selected native lock entry to the reviewed version and lock identity rather than untrusted installed bytes. Check this against the actual locked npm implementation, not Context7's newer `latest` source.
-- [ ] Cover added/malformed lock setup entries and applicable root implicit native setup. No unknown setup becomes harmless because `hasInstallScript` is absent. The before phase does not require installed packages; Task 2 owns installed setup disposition. No recursive arbitrary-directory search.
-- [ ] Run `npm run test:build`, then `node --test --test-concurrency=1 --test-reporter=spec --test-name-pattern="installation policy|installation CLI" dist-test/tests/build-installation-policy.test.js`. Expected GREEN: every selected new case passes, zero failed/cancelled, native exit 0. Record platform-unavailable controls separately.
-- [ ] Commit only Task 1 files after self-review; obtain scoped review. Do not install dependencies yet.
+- [x] Write real owned-fixture tests named `installation policy accepts reviewed registry setup`, `installation policy rejects changed setup inventory`, and `installation policy rejects root setup and nonregistry sources`. Copy the current package/lock and builtin scripts into an owned root; mutate one exact input per refusal. A clean before-phase fixture has no installed packages and must pass its reviewed lock/root policy. Independently assert exit/result and untouched fixture sentinels, not the source text.
+- [x] Add CLI controls for missing/unknown/extra phase arguments and import without CLI execution. Show expected RED against the absent checker/new behavior, with native exit and intended assertion.
+- [x] Implement the exact registry/root classification and complete sorted singleton setup inventory; validate root declarations, package path/name/version and SRI/registry shape. Bind the reviewed esbuild SRI `sha512-HKVLS8dvII+xoKW9kmqxbRKrnWEXfJJr/FZhhJmiqIB0e053QNYFqOBouTMO/k5sID4MvCiUCvv8b9M4h32wIA==`; version/integrity changes refuse. Bind each selected native lock entry to the reviewed version and lock identity rather than untrusted installed bytes. Check this against the actual locked npm implementation, not Context7's newer `latest` source.
+- [x] Cover added/malformed lock setup entries and applicable root implicit native setup. No unknown setup becomes harmless because `hasInstallScript` is absent. The before phase does not require installed packages; Task 2 owns installed setup disposition. No recursive arbitrary-directory search.
+- [x] Run `npm run test:build`, then `node --test --test-concurrency=1 --test-reporter=spec --test-name-pattern="installation policy|installation CLI" dist-test/tests/build-installation-policy.test.js`. Expected GREEN: every selected new case passes, zero failed/cancelled, native exit 0. Record platform-unavailable controls separately.
+- [x] Commit only Task 1 files after self-review; obtain scoped review. Do not install dependencies yet.
+
+**Accepted Task 1 evidence:** Commits `1b7b63e` and `2de2af7`; final native focused run 63/63, zero failed/cancelled/skipped, compile exit 0. Independent spec/quality review found two admission gaps; their actual RED/GREEN and scoped re-review closed both. Root independently reran the two amended controls (2/2, exit 0) and the native real-worktree `before` marker. These are local setup-policy controls, not installer, full-suite or hosted qualification.
 
 ## Task 2: Pinned Native Capability and Cross-Invocation Identity
 
@@ -124,4 +126,4 @@ Only one worker owns compiler/generated outputs or native installation/build pro
 - Spec coverage: setup/CLI→Task 1; pinned capability/identity/cleanup→Task 2; before-import Build/recipe/complete copy/finalization→Task 3; all roles/outcomes/closure→Task 4; effective Linux/Windows proof/limits/operator handoff→Task 5.
 - Review Focus 1→Tasks 1–2; 2–3→Task 2; 4→Task 3; 5→Task 4. All have named observable controls.
 - Interface consistency: policy is synchronous; capability is awaited by CLI and Build; reader compatibility is preserved; workflow IDs and env suffixes agree. Only the named helper gains a private snapshot export.
-- No product/test/install/hosted action has been executed by writing this document. Ask the human to review this written plan, then use the preserved Subagent-Driven method after approval.
+- Initial drafting produced no runtime proof. The written plan is now approved; use the preserved Subagent-Driven method and record actual task verification/review before checking completion. Missing installer/cross-platform evidence remains pending, not implicit success.

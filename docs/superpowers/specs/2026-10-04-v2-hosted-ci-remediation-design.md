@@ -6,7 +6,7 @@
 
 This is a CI remediation slice, not a declaration that the whole system is production ready. V2 still starts empty, without importing, retrieving or falling back to live V1 Markdown data.
 
-**Installation amendment:** The human approved the [written installation-policy A specification](2026-10-04-v2-build-installation-policy-a-design.md) on 2026-10-04. Its [implementation plan](../plans/2026-10-04-v2-build-installation-policy-a.md) awaits review. The named script-disabled installation producer, capability proof and exact workflow/recipe owners preserve every single-link/refusal rule and do not admit aliases or vendor-file repair. Written-spec approval permits planning only; prior diagnostic authority does not authorize executing the new producer.
+**Installation amendment:** The human approved the [written installation-policy A specification](2026-10-04-v2-build-installation-policy-a-design.md) and its [written implementation plan](../plans/2026-10-04-v2-build-installation-policy-a.md) on 2026-10-04. That separate plan approval permits named local Subagent-Driven implementation and owned verification, not hosted execution or completed causal proof. The named script-disabled installation producer, capability proof and exact workflow/recipe owners preserve every single-link/refusal rule and do not admit aliases or vendor-file repair. Prior diagnostic authority alone does not authorize a broader producer or repair.
 
 ## Authority and exclusions
 
