@@ -7,7 +7,7 @@ import test from "node:test";
 import { DatabaseSync } from "node:sqlite";
 import { createDirectoryDurably } from "../src/orchestrator/identity/directory-durability.js";
 import { captureProjectionDirectoryIdentity, filesystemStableProjectionDirectoryOperations } from "../src/orchestrator/projections/stable-directory.js";
-import { capturePathSnapshot, createCiDiagnosticCollector, type DiagnosticCase } from "./support/ci-path-diagnostics.js";
+import { capturePathSnapshot, classifyEvidence, createCiDiagnosticCollector, type DiagnosticCase } from "./support/ci-path-diagnostics.js";
 
 // Capture ownership at creation. Cleanup never resolves a later alias to choose its target.
 function owned() {
@@ -70,6 +70,29 @@ function snapshot(directory: string, caseId: DiagnosticCase = "path-control", du
 function refusal(action: () => unknown) {
   assert.throws(action, { message: "PROJECTION_PATH_INVALID" });
 }
+
+test("CI path diagnostics classify parent snapshots and later reads without upgrading to a guard", () => {
+  const f = owned();
+  try {
+    for (const path of [f.root, join(f.root, "precreation")]) {
+      const o = snapshot(path);
+      for (const location of ["guard", "snapshot", "later-read"] as const) {
+        const input = { record: o.row(), collectorIncomplete: o.collector.incomplete,
+          operationCode: "PROJECTION_PATH_INVALID", expectedCode: "PROJECTION_PATH_INVALID", cleanupComplete: true, location };
+        assert.equal(classifyEvidence(input), "snapshot-only");
+        assert.equal(classifyEvidence({ ...input, cleanupComplete: false }), "incomplete");
+        assert.equal(classifyEvidence({ ...input, collectorIncomplete: true }), "incomplete");
+        assert.equal(classifyEvidence({ ...input, operationCode: "ETIMEDOUT" }), "incomplete");
+      }
+    }
+    const row = snapshot(f.root).row();
+    for (const observed of [{ ...row.observed, statSuccess: "unknown" }, { ...row.observed, directory: "unknown" },
+      { ...row.observed, nativeRealpathSuccess: "unknown" }, { ...row.observed, canonicalEqual: "unknown" }]) {
+      assert.equal(classifyEvidence({ record: { ...row, observed }, collectorIncomplete: false,
+        operationCode: "PROJECTION_PATH_INVALID", expectedCode: "PROJECTION_PATH_INVALID", cleanupComplete: true, location: "snapshot" }), "incomplete");
+    }
+  } finally { assert.equal(f.cleanup(), true); }
+});
 
 test("CI path diagnostics compare owned raw and native spellings with the real boundary", t => {
   const f = owned();

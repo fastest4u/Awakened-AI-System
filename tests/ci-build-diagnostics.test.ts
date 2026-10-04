@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { syncBuiltinESMExports } from "node:module";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { classifyEvidence } from "./support/ci-path-diagnostics.js";
 
 const recipeBytes = Buffer.from('{"type":"module"}\n');
 const unknownBuild = { regular: "unknown", singleLink: "unknown", withinSizeLimit: "unknown", linkCount: "unknown", size: "unknown", limit: "unknown",
@@ -15,6 +16,98 @@ function record(caseId = "link-control", boundary = "descriptor-before") {
   return { schemaVersion: 1, family: "build", caseId, platform: process.platform, boundary, phase: "guard-observation", recipeId: "package.json",
     reason: "link-count", observed: { ...unknownBuild, regular: true, singleLink: false, linkCount: "2", size: "18", limit: "1024" } };
 }
+
+function disposition(input: unknown, overrides: Partial<Parameters<typeof classifyEvidence>[0]> = {}) {
+  return classifyEvidence({ record: input, collectorIncomplete: false, operationCode: "REHEARSAL_BUILD_INVALID",
+    expectedCode: "REHEARSAL_BUILD_INVALID", cleanupComplete: true, location: "guard", ...overrides });
+}
+
+test("CI build diagnostics classify actual short-circuit branches without inventing successful predicates", () => {
+  const counted = { linkCount: "2", size: "18", limit: "1024" };
+  const rows = [
+    { boundary: "recipe-path", reason: "path", observed: { ...unknownBuild } },
+    { boundary: "descriptor-before", reason: "non-regular", observed: { ...unknownBuild, ...counted, regular: false } },
+    { boundary: "descriptor-before", reason: "link-count", observed: { ...unknownBuild, ...counted, regular: true, singleLink: false } },
+    { boundary: "descriptor-before", reason: "size", observed: { ...unknownBuild, ...counted, linkCount: "1", size: "1025", regular: true, singleLink: true, withinSizeLimit: false } },
+    { boundary: "read", reason: "short-read", observed: { ...unknownBuild, ...counted, linkCount: "1", regular: true, singleLink: true, withinSizeLimit: true } },
+    { boundary: "descriptor-after", reason: "non-regular", observed: { ...unknownBuild, ...counted, regular: false } },
+    { boundary: "descriptor-after", reason: "link-count", observed: { ...unknownBuild, ...counted, regular: true, singleLink: false, descriptorEqual: true } },
+    { boundary: "descriptor-after", reason: "identity-change", observed: { ...unknownBuild, ...counted, linkCount: "1", regular: true, singleLink: true, descriptorEqual: false } },
+    { boundary: "descriptor-after", reason: "identity-change", observed: { ...unknownBuild, ...counted, linkCount: "1", regular: true, singleLink: true, descriptorEqual: true, sizeEqual: false } },
+    { boundary: "descriptor-after", reason: "identity-change", observed: { ...unknownBuild, ...counted, linkCount: "1", regular: true, singleLink: true, descriptorEqual: true, sizeEqual: true, mtimeEqual: false } },
+    { boundary: "descriptor-after", reason: "identity-change", observed: { ...unknownBuild, ...counted, linkCount: "1", regular: true, singleLink: true, descriptorEqual: true, sizeEqual: true, mtimeEqual: true, ctimeEqual: false } },
+    { boundary: "descriptor-after", reason: "identity-change", observed: { ...unknownBuild, ...counted, linkCount: "1", regular: true, singleLink: true, descriptorEqual: true, pathEqual: false } },
+    { boundary: "descriptor-after", reason: "identity-change", observed: { ...unknownBuild, ...counted, linkCount: "1", regular: true, singleLink: true, descriptorEqual: true, pathEqual: true, sizeEqual: false } },
+  ];
+  for (const row of rows) assert.equal(disposition({ ...record(), ...row }), "exact-refusal", `${row.boundary}/${row.reason}`);
+});
+
+test("CI build diagnostics refuse unavailable required facts and mismatched primary or closure evidence", () => {
+  const row = record();
+  for (const overrides of [
+    { collectorIncomplete: true }, { cleanupComplete: false }, { operationCode: "ETIMEDOUT" },
+    { operationCode: "EIO" }, { operationCode: "none", expectedCode: "none" },
+  ]) assert.equal(disposition(row, overrides), "incomplete");
+  for (const observed of [
+    { ...row.observed, regular: "unknown" }, { ...row.observed, linkCount: "unknown" },
+    { ...row.observed, singleLink: true }, { ...row.observed, withinSizeLimit: true },
+    { ...row.observed, size: "1".repeat(2100) }, { ...row.observed, secret: "private" },
+  ]) assert.equal(disposition({ ...row, observed }), "incomplete");
+  for (const bad of [null, { ...row, rawPath: "private" }, { ...row, reason: "unknown" },
+    { ...row, boundary: "read" }]) assert.equal(disposition(bad), "incomplete");
+  for (const location of ["snapshot", "later-read"] as const) assert.equal(disposition(row, { location }), "snapshot-only");
+});
+
+test("CI build diagnostics classify recognized primary filesystem errors but not cleanup substitutes", () => {
+  for (const [boundary, operation] of [["recipe-path", "lstat"], ["recipe-path", "realpath"],
+    ["descriptor-before", "open"], ["descriptor-before", "fstat"], ["read", "read"],
+    ["descriptor-after", "fstat"], ["descriptor-after", "lstat"]]) {
+    const row = { ...record(), boundary, reason: "filesystem", observed: { ...unknownBuild, operation, errorCode: "ENOENT" } };
+    assert.equal(disposition(row, { operationCode: "ENOENT", expectedCode: "ENOENT" }), "exact-refusal");
+    assert.equal(disposition({ ...row, observed: { ...row.observed, errorCode: "unknown" } },
+      { operationCode: "EISDIR", expectedCode: "EISDIR" }), "incomplete");
+  }
+  assert.equal(disposition({ ...record(), boundary: "descriptor-after", reason: "filesystem",
+    observed: { ...unknownBuild, operation: "close", errorCode: "EIO" } },
+  { operationCode: "EIO", expectedCode: "EIO" }), "incomplete");
+});
+
+test("CI build diagnostics classify from the closed collector copy without exposing getters", () => {
+  let getterCalls = 0;
+  const row = record();
+  Object.defineProperty(row.observed, "regular", { enumerable: true, get() { getterCalls++; throw new Error("private"); } });
+  assert.equal(disposition(row), "incomplete");
+  assert.equal(getterCalls, 0);
+});
+
+test("CI build diagnostics classify the captured native hardlink refusal after owned cleanup", async () => {
+  const fixture = await ownedReaderFixture();
+  const o = observation(fixture, "link-control");
+  let primary = "unavailable", cleanupComplete = false;
+  try {
+    fixture.addRecipeHardlink();
+    try { fixture.reader.readBuildBytes("package.json", 1024, o.option); }
+    catch (error) { if (error instanceof Error) primary = error.message; }
+    assert.equal(primary, "REHEARSAL_BUILD_INVALID");
+    assert.equal(fixture.openDescriptorCount(), 0);
+  } finally { fixture.cleanup(); cleanupComplete = true; }
+  assert.equal(disposition(o.rows[0], { collectorIncomplete: o.collector.incomplete,
+    operationCode: primary, cleanupComplete }), "exact-refusal");
+  assert.equal(disposition(o.rows[0], { collectorIncomplete: true, operationCode: primary, cleanupComplete }), "incomplete");
+});
+
+test("CI build diagnostics refuse missing or contradictory final identity prefixes", () => {
+  const row = { ...record(), boundary: "descriptor-after", reason: "identity-change", observed: {
+    ...unknownBuild, linkCount: "1", size: "18", limit: "1024", regular: true, singleLink: true,
+    descriptorEqual: true, sizeEqual: true, mtimeEqual: true, ctimeEqual: false,
+  } };
+  for (const observed of [
+    { ...row.observed, descriptorEqual: "unknown" }, { ...row.observed, sizeEqual: "unknown" },
+    { ...row.observed, ctimeEqual: "unknown" }, { ...row.observed, pathEqual: false },
+    { ...row.observed, withinSizeLimit: true }, { ...row.observed, descriptorEqual: false },
+  ]) assert.equal(disposition({ ...row, observed }), "incomplete");
+  assert.equal(disposition(undefined), "incomplete");
+});
 
 // Native opens/closes stay real. Faults intervene only after a real owned read/stat.
 async function ownedReaderFixture() {
