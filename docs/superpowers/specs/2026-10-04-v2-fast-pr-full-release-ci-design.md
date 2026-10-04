@@ -6,6 +6,8 @@
 
 This amendment governs CI roles and scheduling in the [hosted CI remediation design](2026-10-04-v2-hosted-ci-remediation-design.md). It replaces that document's requirement to keep workflow structure unchanged, not its refusal policies, diagnostic limits or causal-proof obligations. Faster feedback is an objective, not a measured result or a promise about minutes saved. Scheduling changes do not fix the observed Ubuntu build refusal or Windows nonlegacy failures.
 
+**Installation amendment under review:** The [written installation-policy A specification](2026-10-04-v2-build-installation-policy-a-design.md) adds a proposed before/install/after sequence to all four workflow installation owners and three bound release installation outcomes. It is awaiting written-spec review after conversational approval. Only those named installation changes extend this design; roles, triggers, test membership, source seals, baseline/routing guards and all upload permissions stay unchanged. Implementation still requires its separate approved plan.
+
 ## Authority and unchanged boundaries
 
 After human approval of both written documents, prepare an implementation plan for this bounded CI split. Plan review and execution-method selection precede implementation. Preserve the user's Subagent-Driven preference. A causal-diagnostic implementation plan remains a separate slice under the remediation design.
@@ -22,7 +24,7 @@ Do not delete tests, widen exclusion filters, change the immutable V1 baseline, 
 | V2 release qualification | `.github/workflows/v2-release-qualification.yml` | Manual qualification of an explicit candidate | Complete nonlegacy `npm test` on both supported OSes, runtime/typecheck/measured build, immutable baseline/routing guards, distinct lifecycle/rollout/Foundation/artifact gates |
 | Legacy migration regression | `.github/workflows/v2-legacy-regression.yml` | Manual regression only | Existing `test:migration` producer on the supported OS/runtime matrix and the already authorized single synthetic evidence artifact per matrix job |
 
-The release workflow qualifies a candidate; it does not deploy, create tags/branches or activate production. All three roles retain `contents: read` without adding token permissions. Legacy migration results remain regression results, not a prerequisite for fresh-start V2 PROD. No nightly legacy schedule is introduced. Existing `.github/workflows/sqlite-stress.yml`, its weekly schedule, serial matrix and non-cancelling concurrency remain unchanged.
+The release workflow qualifies a candidate; it does not deploy, create tags/branches or activate production. All three roles retain `contents: read` without adding token permissions. Legacy migration results remain regression results, not a prerequisite for fresh-start V2 PROD. No nightly legacy schedule is introduced. Existing `.github/workflows/sqlite-stress.yml`, its weekly schedule, serial matrix and non-cancelling concurrency remain unchanged under this CI-role split. The separately reviewed installation amendment is the sole proposed exception for its dependency-installation commands and gates; stress tests, logging/exit propagation and upload permissions are preserved.
 
 ## Complete nonlegacy test profile
 
@@ -97,6 +99,8 @@ Update contracts to recognize these three exact owners and their distinct roles,
 PR contracts must require the complete default profile and all core guards. Release contracts must require the exact candidate/control identity checks and every distinct qualifier. Legacy contracts must require the unchanged producer and bounded synthetic upload; PR/release must not inherit that upload or legacy prerequisite. Missing, duplicate, conditionally bypassed or ignored required steps must fail validation.
 
 Keep strict evidence and protected-source checks. Evidence-owner rebinding replaces the existing migration upload slot; it does not add an upload slot or change the stress upload. Role-specific parser and negative-test changes cover only approved scheduling, candidate identity, gate ownership and evidence-owner rebinding. They do not authorize changing immutable baselines, production isolation, prepared composition edges or sealed production-source/file allowlists. Any such change requires separate approval naming exact affected paths and the reason. Adding a CI-role owner to a parser does not implicitly change those inventories, baseline hashes or public V2 routing.
+
+After its own written-spec and plan approval, the installation amendment additionally permits exact parser/test ownership for the before/install/after grammar and bound installation outcomes. It adds no uploaded evidence or source-seal exception. Existing candidate/control and initial-identity checks must remain before installation, with all original product/recorder checks retained at release closure.
 
 All refusals retain their original result, error and exit status. Reporting/cancellation must not conceal failure or claim completion. Existing diagnostic caps and sanitization from the remediation design are unchanged. If role separation exposes an unanticipated trust, acceptance or upload requirement, stop for a concrete amendment rather than weakening a guard to make CI green.
 

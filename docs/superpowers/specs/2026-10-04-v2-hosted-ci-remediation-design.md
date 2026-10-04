@@ -6,6 +6,8 @@
 
 This is a CI remediation slice, not a declaration that the whole system is production ready. V2 still starts empty, without importing, retrieving or falling back to live V1 Markdown data.
 
+**Installation amendment under review:** The human approved conversational option A on 2026-10-04. The [written installation-policy A specification](2026-10-04-v2-build-installation-policy-a-design.md) names the proposed script-disabled installation producer, capability proof and exact workflow/recipe owners. It preserves every single-link/refusal rule and does not admit aliases or vendor-file repair. Its written-spec and plan gates remain separate; prior diagnostic authority does not authorize the new producer.
+
 ## Authority and exclusions
 
 Conversational approval permits writing, reviewing and locally committing this specification. Approval of the written specification will permit preparing an executable implementation plan, not running it. Plan review and execution-method selection must precede product changes or diagnostic execution. Preserve the user's Subagent-Driven preference for that later execution.
@@ -39,6 +41,8 @@ Local source inspection is bound to head `b69b4d2be4e424ca37bcb8f8b75a3a8cfc88d3
 Add bounded observation at this existing measurement boundary, with build-specific reporting owned by `scripts/build.js`. Keep the normal refusal and operational-command error unchanged. Use the descriptor/leaf observations already captured by the check; do not reopen a path, reread source bytes, reorder guards or retry a refusal to collect diagnostics. Report the existing allowlisted recipe identifier, failing phase and predicate outcomes; never accept a file because its diagnostic observation looks legitimate.
 
 The installed esbuild source contains a non-Windows optimization that links the native executable and renames its CLI alias. This supports a hardlink hypothesis, not proof of the failed runner's topology. The existing `tests/v2-shadow-migration-rehearsal.test.ts` fixture copies file bytes and loses link relationships. A later owned synthetic reproducer must retain the relevant topology rather than treating that copy as installation proof.
+
+Later evidence is recorded separately in the installation-policy amendment: run `37203356089` at the published `11ba91ec1a6840cea6e961b4c3789d32f9623b9d` head observed the Ubuntu native recipe refused for actual link count 2. That observation does not identify the other alias or prove a successful installation repair. The historical run/source identities above retain their original meaning.
 
 This specification does not authorize accepting executable hardlinks or changing `nlink` checks. If proof identifies a legitimate producer topology that cannot be repaired while preserving the current contract, stop for a concrete design amendment. Such an amendment must address trusted installation provenance, every admitted alias, hostile additional aliases, and the identity of the executable actually launched through finalization. Preserve the native resolved location, exact bytes, executable usability, dependency metadata and ownership. Unlinking or rewriting an installed/shared dependency is not implicitly authorized. Equal bytes or a familiar pathname are insufficient.
 
@@ -85,6 +89,8 @@ The first execution plan must enumerate exact owned observation files, represent
 Use focused verification during diagnosis and remediation. Do not run the full repository suite after each observation or small fixture change. The later plan selects deterministic representative cases and preserves process-tree ownership, closure receipts and primary failure evidence.
 
 Required build controls include an ordinary regular file, size-bound acceptance/refusal, the observed installed-tool topology, a hostile additional hardlink, non-regular and symlink/parent-symlink paths, truncated reads, descriptor mutation and pathname replacement. Preserve namespace/entry redirects, stale identity, dependency mutation, finalization mutation, exact input/output correspondence and manifest invalidation controls. Add native-executable mutation coverage where the current changed-file loop omits it.
+
+The subsequent causal-diagnostic implementation includes native mutation controls in the changed-file loop and finalization handoff. Retain that coverage when adding installation-policy controls; the earlier conditional instruction is not a claim that those controls are still absent.
 
 Required path controls include a canonical owned directory reaching the real boundary, comparison with the actual failing fixture spelling, lexical invalid paths, native junction/symlink refusal, directory replacement after authorization, durable descendant acceptance and sibling escape rejection. Fresh admission must reach its intended business assertion while forged routes/identities remain refused. Keep platform-unavailable cases explicitly reported; do not silently convert failures into skips.
 
