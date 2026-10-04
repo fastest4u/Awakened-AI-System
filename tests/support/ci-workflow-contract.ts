@@ -241,12 +241,8 @@ export const VERIFY_CANDIDATE_WORKFLOW_IDENTITY = [
   "}",
 ].join("\n");
 
-export const RECORD_QUALIFICATION_IDENTITY = [
-  "$ErrorActionPreference = \"Stop\"",
-  "@'",
-  "import { execFileSync } from \"node:child_process\";",
-  "import { appendFileSync, existsSync, lstatSync, readFileSync, readdirSync } from \"node:fs\";",
-  "import { createHash } from \"node:crypto\";",
+// Independently reviewed literal program fragments; compose only inside this pure policy.
+const QUALIFICATION_CONTEXT_PROGRAM = [
   "const fail = code => { throw new Error(code); };",
   "const git = (...args) => {",
   "  try { return execFileSync(\"git\", args, { encoding: \"utf8\", stdio: [\"ignore\", \"pipe\", \"pipe\"] }).trim(); }",
@@ -265,68 +261,33 @@ export const RECORD_QUALIFICATION_IDENTITY = [
   "    || !/^[1-9][0-9]{0,9}$/.test(attempt ?? \"\")) fail(\"V2_CI_IDENTITY_INVALID\");",
   "  return { schema: 1, candidate, control, os, run, attempt, lock: git(\"rev-parse\", candidate + \":package-lock.json\") };",
   "};",
+];
+
+const QUALIFICATION_PARSE_PROGRAM = [
   "const equal = (a, b) => JSON.stringify(a) === JSON.stringify(b);",
   "const parse = value => {",
   "  if (!value || value.length > 2048) fail(\"V2_CI_PHASE_INVALID\");",
   "  try { return JSON.parse(value); } catch { fail(\"V2_CI_PHASE_INVALID\"); }",
   "};",
+];
+
+const QUALIFICATION_EMIT_PROGRAM = [
   "const emit = value => {",
   "  const receipt = JSON.stringify(value);",
   "  if (receipt.length > 2048 || !process.env.GITHUB_OUTPUT) fail(\"V2_CI_RECORD_INVALID\");",
   "  appendFileSync(process.env.GITHUB_OUTPUT, \"receipt=\" + receipt + \"\\n\");",
   "  console.log(\"V2_CI_RECEIPT \" + receipt);",
   "};",
+];
+
+const QUALIFICATION_REPORT_PROGRAM = [
   "const report = error => {",
   "  const code = /^V2_CI_[A-Z_]+$/.test(error?.message ?? \"\") ? error.message : \"V2_CI_RECORD_INVALID\";",
   "  console.error(code); process.exitCode = 1;",
   "};",
-  "try {",
-  "  const bound = identity();",
-  "  if (!/^[0-9a-f]{40}$/.test(bound.lock)) fail(\"V2_CI_IDENTITY_INVALID\");",
-  "  emit(bound);",
-  "} catch (error) { report(error); }",
-  "'@ | & node --input-type=module",
-  "if ($LASTEXITCODE -ne 0) { throw \"V2_CI_IDENTITY_RECORD_FAILED\" }",
-].join("\n");
-export const RECORD_QUALIFICATION_PHASE = [
-  "$ErrorActionPreference = \"Stop\"",
-  "@'",
-  "import { execFileSync } from \"node:child_process\";",
-  "import { appendFileSync, existsSync, lstatSync, readFileSync, readdirSync } from \"node:fs\";",
-  "import { createHash } from \"node:crypto\";",
-  "const fail = code => { throw new Error(code); };",
-  "const git = (...args) => {",
-  "  try { return execFileSync(\"git\", args, { encoding: \"utf8\", stdio: [\"ignore\", \"pipe\", \"pipe\"] }).trim(); }",
-  "  catch { fail(\"V2_CI_GIT_FAILED\"); }",
-  "};",
-  "const identity = () => {",
-  "  const candidate = process.env.V2_CI_CANDIDATE_SHA?.toLowerCase();",
-  "  const control = process.env.V2_CI_CONTROL_SHA?.toLowerCase();",
-  "  if (!/^[0-9a-f]{40}$/.test(candidate ?? \"\") || !/^[0-9a-f]{40}$/.test(control ?? \"\")",
-  "    || control !== process.env.V2_CI_APPROVED_WORKFLOW_SHA?.toLowerCase()) fail(\"V2_CI_IDENTITY_INVALID\");",
-  "  if (git(\"rev-parse\", \"HEAD\") !== candidate) fail(\"V2_CI_CANDIDATE_MISMATCH\");",
-  "  try { execFileSync(\"git\", [\"diff\", \"--quiet\", \"HEAD\", \"--\"], { stdio: \"pipe\" }); }",
-  "  catch { fail(\"V2_CI_INPUT_CHANGED\"); }",
-  "  const os = process.env.V2_CI_OS, run = process.env.V2_CI_RUN_ID, attempt = process.env.V2_CI_RUN_ATTEMPT;",
-  "  if (![\"ubuntu-latest\", \"windows-latest\"].includes(os) || !/^[1-9][0-9]{0,19}$/.test(run ?? \"\")",
-  "    || !/^[1-9][0-9]{0,9}$/.test(attempt ?? \"\")) fail(\"V2_CI_IDENTITY_INVALID\");",
-  "  return { schema: 1, candidate, control, os, run, attempt, lock: git(\"rev-parse\", candidate + \":package-lock.json\") };",
-  "};",
-  "const equal = (a, b) => JSON.stringify(a) === JSON.stringify(b);",
-  "const parse = value => {",
-  "  if (!value || value.length > 2048) fail(\"V2_CI_PHASE_INVALID\");",
-  "  try { return JSON.parse(value); } catch { fail(\"V2_CI_PHASE_INVALID\"); }",
-  "};",
-  "const emit = value => {",
-  "  const receipt = JSON.stringify(value);",
-  "  if (receipt.length > 2048 || !process.env.GITHUB_OUTPUT) fail(\"V2_CI_RECORD_INVALID\");",
-  "  appendFileSync(process.env.GITHUB_OUTPUT, \"receipt=\" + receipt + \"\\n\");",
-  "  console.log(\"V2_CI_RECEIPT \" + receipt);",
-  "};",
-  "const report = error => {",
-  "  const code = /^V2_CI_[A-Z_]+$/.test(error?.message ?? \"\") ? error.message : \"V2_CI_RECORD_INVALID\";",
-  "  console.error(code); process.exitCode = 1;",
-  "};",
+];
+
+const QUALIFICATION_MEASUREMENT_PROGRAM = [
   "const hash = bytes => createHash(\"sha256\").update(bytes).digest(\"hex\");",
   "const bytes = path => {",
   "  if (!lstatSync(path).isFile() || lstatSync(path).isSymbolicLink()) fail(\"V2_CI_OUTPUT_INVALID\");",
@@ -354,6 +315,39 @@ export const RECORD_QUALIFICATION_PHASE = [
   "  return { compiled: compiled.length ? hash(compiled.join(\"\\n\")) : null,",
   "    manifest: manifest ? hash(manifest) : null, deployment, artifacts };",
   "};",
+];
+
+const QUALIFICATION_MEASURED_IMPORTS = [
+  "import { execFileSync } from \"node:child_process\";",
+  "import { appendFileSync, existsSync, lstatSync, readFileSync, readdirSync } from \"node:fs\";",
+  "import { createHash } from \"node:crypto\";",
+];
+
+function qualificationInlineProgram(lines: readonly string[]): string {
+  return ["$ErrorActionPreference = \"Stop\"", "@'", ...lines,
+    "'@ | & node --input-type=module", "if ($LASTEXITCODE -ne 0) { throw \"V2_CI_IDENTITY_RECORD_FAILED\" }"].join("\n");
+}
+
+export const RECORD_QUALIFICATION_IDENTITY = qualificationInlineProgram([
+  "import { execFileSync } from \"node:child_process\";",
+  "import { appendFileSync } from \"node:fs\";",
+  ...QUALIFICATION_CONTEXT_PROGRAM,
+  ...QUALIFICATION_EMIT_PROGRAM,
+  ...QUALIFICATION_REPORT_PROGRAM,
+  "try {",
+  "  const bound = identity();",
+  "  if (!/^[0-9a-f]{40}$/.test(bound.lock)) fail(\"V2_CI_IDENTITY_INVALID\");",
+  "  emit(bound);",
+  "} catch (error) { report(error); }",
+]);
+
+export const RECORD_QUALIFICATION_PHASE = qualificationInlineProgram([
+  ...QUALIFICATION_MEASURED_IMPORTS,
+  ...QUALIFICATION_CONTEXT_PROGRAM,
+  ...QUALIFICATION_PARSE_PROGRAM,
+  ...QUALIFICATION_EMIT_PROGRAM,
+  ...QUALIFICATION_REPORT_PROGRAM,
+  ...QUALIFICATION_MEASUREMENT_PROGRAM,
   "try {",
   "  const bound = identity(), original = parse(process.env.V2_CI_IDENTITY);",
   "  if (!equal(bound, original)) fail(\"V2_CI_PHASE_INVALID\");",
@@ -363,75 +357,15 @@ export const RECORD_QUALIFICATION_PHASE = [
   "  if (!measured.manifest || (phase !== \"build\" && !measured.compiled)) fail(\"V2_CI_OUTPUT_INVALID\");",
   "  emit({ schema: 1, phase, identity: bound, ...measured });",
   "} catch (error) { report(error); }",
-  "'@ | & node --input-type=module",
-  "if ($LASTEXITCODE -ne 0) { throw \"V2_CI_IDENTITY_RECORD_FAILED\" }",
-].join("\n");
-export const VERIFY_QUALIFICATION_CLOSURE = [
-  "$ErrorActionPreference = \"Stop\"",
-  "@'",
-  "import { execFileSync } from \"node:child_process\";",
-  "import { appendFileSync, existsSync, lstatSync, readFileSync, readdirSync } from \"node:fs\";",
-  "import { createHash } from \"node:crypto\";",
-  "const fail = code => { throw new Error(code); };",
-  "const git = (...args) => {",
-  "  try { return execFileSync(\"git\", args, { encoding: \"utf8\", stdio: [\"ignore\", \"pipe\", \"pipe\"] }).trim(); }",
-  "  catch { fail(\"V2_CI_GIT_FAILED\"); }",
-  "};",
-  "const identity = () => {",
-  "  const candidate = process.env.V2_CI_CANDIDATE_SHA?.toLowerCase();",
-  "  const control = process.env.V2_CI_CONTROL_SHA?.toLowerCase();",
-  "  if (!/^[0-9a-f]{40}$/.test(candidate ?? \"\") || !/^[0-9a-f]{40}$/.test(control ?? \"\")",
-  "    || control !== process.env.V2_CI_APPROVED_WORKFLOW_SHA?.toLowerCase()) fail(\"V2_CI_IDENTITY_INVALID\");",
-  "  if (git(\"rev-parse\", \"HEAD\") !== candidate) fail(\"V2_CI_CANDIDATE_MISMATCH\");",
-  "  try { execFileSync(\"git\", [\"diff\", \"--quiet\", \"HEAD\", \"--\"], { stdio: \"pipe\" }); }",
-  "  catch { fail(\"V2_CI_INPUT_CHANGED\"); }",
-  "  const os = process.env.V2_CI_OS, run = process.env.V2_CI_RUN_ID, attempt = process.env.V2_CI_RUN_ATTEMPT;",
-  "  if (![\"ubuntu-latest\", \"windows-latest\"].includes(os) || !/^[1-9][0-9]{0,19}$/.test(run ?? \"\")",
-  "    || !/^[1-9][0-9]{0,9}$/.test(attempt ?? \"\")) fail(\"V2_CI_IDENTITY_INVALID\");",
-  "  return { schema: 1, candidate, control, os, run, attempt, lock: git(\"rev-parse\", candidate + \":package-lock.json\") };",
-  "};",
-  "const equal = (a, b) => JSON.stringify(a) === JSON.stringify(b);",
-  "const parse = value => {",
-  "  if (!value || value.length > 2048) fail(\"V2_CI_PHASE_INVALID\");",
-  "  try { return JSON.parse(value); } catch { fail(\"V2_CI_PHASE_INVALID\"); }",
-  "};",
-  "const emit = value => {",
-  "  const receipt = JSON.stringify(value);",
-  "  if (receipt.length > 2048 || !process.env.GITHUB_OUTPUT) fail(\"V2_CI_RECORD_INVALID\");",
-  "  appendFileSync(process.env.GITHUB_OUTPUT, \"receipt=\" + receipt + \"\\n\");",
-  "  console.log(\"V2_CI_RECEIPT \" + receipt);",
-  "};",
-  "const report = error => {",
-  "  const code = /^V2_CI_[A-Z_]+$/.test(error?.message ?? \"\") ? error.message : \"V2_CI_RECORD_INVALID\";",
-  "  console.error(code); process.exitCode = 1;",
-  "};",
-  "const hash = bytes => createHash(\"sha256\").update(bytes).digest(\"hex\");",
-  "const bytes = path => {",
-  "  if (!lstatSync(path).isFile() || lstatSync(path).isSymbolicLink()) fail(\"V2_CI_OUTPUT_INVALID\");",
-  "  return readFileSync(path);",
-  "};",
-  "const measure = () => {",
-  "  const compiled = [];",
-  "  const walk = path => {",
-  "    const entry = lstatSync(path);",
-  "    if (entry.isSymbolicLink()) fail(\"V2_CI_OUTPUT_INVALID\");",
-  "    if (entry.isDirectory()) for (const name of readdirSync(path).sort()) walk(path + \"/\" + name);",
-  "    else compiled.push(path + \"\\0\" + hash(bytes(path)));",
-  "  };",
-  "  if (existsSync(\"dist-test\")) walk(\"dist-test\");",
-  "  const manifest = existsSync(\"dist/v2-build.json\") ? bytes(\"dist/v2-build.json\") : null;",
-  "  let deployment = null, artifacts = null;",
-  "  if (manifest) {",
-  "    const parsed = JSON.parse(manifest.toString());",
-  "    if (!/^[A-Za-z0-9-]{1,64}$/.test(parsed.deploymentId ?? \"\")) fail(\"V2_CI_OUTPUT_INVALID\");",
-  "    deployment = parsed.deploymentId;",
-  "    artifacts = hash([\"v2.js\", \"v2-admin.js\", \"workers/project-store.worker.js\",",
-  "      \"internal/v2-internal-verified-read.js\", \"internal/v2-internal-verified-read-cleanup.js\"]",
-  "      .map(path => path + \"\\0\" + hash(bytes(\"dist/\" + path))).join(\"\\n\"));",
-  "  }",
-  "  return { compiled: compiled.length ? hash(compiled.join(\"\\n\")) : null,",
-  "    manifest: manifest ? hash(manifest) : null, deployment, artifacts };",
-  "};",
+]);
+
+export const VERIFY_QUALIFICATION_CLOSURE = qualificationInlineProgram([
+  ...QUALIFICATION_MEASURED_IMPORTS,
+  ...QUALIFICATION_CONTEXT_PROGRAM,
+  ...QUALIFICATION_PARSE_PROGRAM,
+  ...QUALIFICATION_EMIT_PROGRAM,
+  ...QUALIFICATION_REPORT_PROGRAM,
+  ...QUALIFICATION_MEASUREMENT_PROGRAM,
   "try {",
   "  for (const gate of [\"runtime\", \"typecheck\", \"build\", \"tests\", \"lifecycle\", \"rollout\", \"foundation\", \"artifacts\"]) {",
   "    if (process.env[\"V2_CI_OUTCOME_\" + gate.toUpperCase()] !== \"success\") fail(\"V2_CI_OUTCOME_INCOMPLETE\");",
@@ -456,9 +390,7 @@ export const VERIFY_QUALIFICATION_CLOSURE = [
   "  }",
   "  console.log(\"V2_CI_QUALIFICATION_COMPLETE\");",
   "} catch (error) { report(error); }",
-  "'@ | & node --input-type=module",
-  "if ($LASTEXITCODE -ne 0) { throw \"V2_CI_IDENTITY_RECORD_FAILED\" }",
-].join("\n");
+]);
 
 const QUALIFICATION_BINDINGS = [
   "V2_CI_CANDIDATE_SHA: ${{ inputs.candidate_sha }}",
