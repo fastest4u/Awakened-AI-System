@@ -1,7 +1,9 @@
 import * as fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { rehearsalBuildRoot, readBuildBytes, buildCanonical, buildRefusal } from './run-v2-shadow-migration-rehearsal.js';
+import { spawn } from 'node:child_process';
+import { rehearsalBuildRoot, readBuildBytes, readBuildFileSnapshot, assertBuildToolResolution,
+    buildDigest, buildCanonical, buildRefusal } from './run-v2-shadow-migration-rehearsal.js';
 
 const VERSION = '0.28.2';
 const ESBUILD_INTEGRITY = 'sha512-HKVLS8dvII+xoKW9kmqxbRKrnWEXfJJr/FZhhJmiqIB0e053QNYFqOBouTMO/k5sID4MvCiUCvv8b9M4h32wIA==';
@@ -34,6 +36,33 @@ const NATIVE_LOCK_INTEGRITIES = Object.freeze({
     'win32-arm64': 'sha512-PIhhEkE9uPBleRBrQEJpUn7MBnibZzbGzYWPmY3x+YoVg/95zbjB4CxPPOQ8l5tYYM4mMaCthF8/1DIfBQQyWQ==',
     'win32-ia32': 'sha512-YmJbfTlvU7Sdn9BB+4PRES4oB6pxgS37MAONj+hBr/cpXS1aBPKXxNnDbu+QCWPj0o9dgyxeq79g6c5P8KeuYA==',
     'win32-x64': 'sha512-5ebpxr3nWMzrL/rnUI755Jkuee0bHL/Gq0WTF9lvcpv73wAp5eu8MfBUgWK9bhWvZjj7yX8etf/8tI8Ney695g==',
+});
+// Independent reviewed 0.28.2 executable pins from the approved A specification.
+// Mutable installed metadata cannot introduce a trusted native digest.
+const NATIVE_DIGESTS = Object.freeze({
+    '@esbuild/aix-ppc64/bin/esbuild': '6de148b932fc5d3b28a97f9f0bc4de8e2b47db478b8ad679e0eaa6b96e00420d',
+    '@esbuild/android-arm64/bin/esbuild': '84efbbd2cbf21bbfec2aaf304bee79cb2a4a05fe2ea7b861a87f7b8f213ac27d',
+    '@esbuild/darwin-arm64/bin/esbuild': '10b6243df618d374bb2d5c9cfbe7052e1405f6aa4e53a6164f11a91b9f2e1384',
+    '@esbuild/darwin-x64/bin/esbuild': '7fe5c9c905fff0a05d92db98929434ab4d3b6dd92d7a7688922db74380c75df3',
+    '@esbuild/freebsd-arm64/bin/esbuild': '6aba108a68b93064e491bfb1ecfa28843b4d4e504dff0627f53f68f6bb015c01',
+    '@esbuild/freebsd-x64/bin/esbuild': '8a237e222bee0e50556e7b00d83ec2ff43721bf72f19811a5f0ee56f1d40177c',
+    '@esbuild/linux-arm/bin/esbuild': 'd88f751b22095b2f3b42c8c2e8a3f36fabc1705438c5d6e78366b681f8b4e7a5',
+    '@esbuild/linux-arm64/bin/esbuild': '90bd269553d258e80b19e3ccab4f98f0831f87442a2f056510ce24fd1b425fc2',
+    '@esbuild/linux-ia32/bin/esbuild': 'b1e2d87d79f9a2baa0d3043cdf0dc6716f9f2eea66c58f47588641fd6019f36f',
+    '@esbuild/linux-loong64/bin/esbuild': '55a66f9854d6798f36b2b5471db74f2e552481887ea14d8bda1634a512383a43',
+    '@esbuild/linux-mips64el/bin/esbuild': '6bf7921a3af4a801051e056d85c360fe24bb446f488ef3da25f0b8e5cf973db1',
+    '@esbuild/linux-ppc64/bin/esbuild': 'c30df60d09bb0ba4853d7b06e244ce966890d61ce60cadd9b22335f6379c316a',
+    '@esbuild/linux-riscv64/bin/esbuild': '36bdcdc8230eef385838cdfeb0d9a1565cbe4b9ace30097a511d77e894de36a1',
+    '@esbuild/linux-s390x/bin/esbuild': 'bbbc1f92a76a5ca6e2976065222e42b02797363a1f119490dda315f74047741f',
+    '@esbuild/linux-x64/bin/esbuild': 'e1698a3d5c6c0798fee4fd3b5cc816651f460c63d390a7a26ea4beb0b1884100',
+    '@esbuild/netbsd-arm64/bin/esbuild': '62548519d7ae875d060aa8c94bfb8ed38ef191671a5173d9f626bdb6b7516970',
+    '@esbuild/netbsd-x64/bin/esbuild': 'f9d0e59d2b404559e3a0c958164d96960ebf0e04583b878b1d64d8f1c3698fcc',
+    '@esbuild/openbsd-arm64/bin/esbuild': 'e10c45a0b62456632da41df058d7626b2e7cfe710780a2dc7f9f84681753f3aa',
+    '@esbuild/openbsd-x64/bin/esbuild': '720bbe607736716f2ecd37962436c5589d801966e868a2ae4e0e7e62d1e4e887',
+    '@esbuild/sunos-x64/bin/esbuild': '01a3bd9183631ca749f34d15601ea21ba6834614184c5c859f99d54bd683203d',
+    '@esbuild/win32-arm64/esbuild.exe': '530fb3933af14eefe85dfd06502f826e6ef60fdf4e75228ea67c696db312ecb1',
+    '@esbuild/win32-ia32/esbuild.exe': 'b2e62af5c17e00939583be0a0762fdc469f352869a617edc91371b00454c76f0',
+    '@esbuild/win32-x64/esbuild.exe': 'c7bee37877d0aa6a046e52783fa0a2cf1a9ce5579d68bb3083bda99d4bff18ef',
 });
 const ROOT_HOOKS = ['preinstall', 'install', 'postinstall', 'prepublish', 'preprepare', 'prepare', 'postprepare', 'dependencies'];
 const INSTALL_HOOKS = ['preinstall', 'install', 'postinstall'];
@@ -152,16 +181,170 @@ export function assertBuildInstallationPolicy() {
     catch { buildRefusal(); }
 }
 
-// Import is inert. Task 2 adds the after-phase capability check; no partial success.
+function otherPlatform(record) {
+    function admits(values, current) {
+        if (values === undefined) return true;
+        if (!Array.isArray(values) || !values.length || values.some(value => typeof value !== 'string')) buildRefusal();
+        const positive = values.filter(value => !value.startsWith('!'));
+        return !values.includes(`!${current}`) && (positive.length === 0 || positive.includes(current) || positive.includes('any'));
+    }
+    return !admits(record.os, process.platform) || !admits(record.cpu, process.arch);
+}
+
+function assertInstalledSetupDisposition() {
+    const { packages, required, nativeName } = installationPolicy();
+    // Required reachability is independent of mutable optional/devOptional flags.
+    // Dev is included. Every present package's required dependencies/peers must
+    // also exist; an absent platform optional cannot excuse a root-required edge.
+    const requiredPaths = new Set([...required, `node_modules/${nativeName}`]);
+    for (const [name, record] of Object.entries(packages)) {
+        if (name && record.devOptional === true && record.optional !== true) requiredPaths.add(name);
+        if (name && !requiredPaths.has(name) && absent(name)) continue;
+        for (const field of ['dependencies', ...(name === '' ? ['devDependencies'] : []), 'peerDependencies']) {
+            for (const dependency of Object.keys(declarations(record, field))) {
+                if (field === 'dependencies' && Object.hasOwn(declarations(record, 'optionalDependencies'), dependency)) continue;
+                if (field === 'peerDependencies' && record.peerDependenciesMeta?.[dependency]?.optional === true) continue;
+                const resolved = lockedDependency(packages, name, dependency);
+                if (!resolved) buildRefusal();
+                requiredPaths.add(resolved);
+            }
+        }
+    }
+    // Compute the transitive closure even when a falsely optional parent was
+    // absent on the first pass and appeared earlier than its required ancestor.
+    const pending = [...requiredPaths];
+    for (let i = 0; i < pending.length; i++) {
+        const from = pending[i], record = packages[from];
+        for (const field of ['dependencies', 'peerDependencies']) {
+            for (const dependency of Object.keys(declarations(record, field))) {
+                if (field === 'dependencies' && Object.hasOwn(declarations(record, 'optionalDependencies'), dependency)) continue;
+                if (field === 'peerDependencies' && record.peerDependenciesMeta?.[dependency]?.optional === true) continue;
+                const resolved = lockedDependency(packages, from, dependency);
+                if (!resolved) buildRefusal();
+                if (!requiredPaths.has(resolved)) { requiredPaths.add(resolved); pending.push(resolved); }
+            }
+        }
+    }
+    for (const [name, record] of Object.entries(packages)) {
+        if (!name) continue;
+        if (absent(name)) {
+            if (requiredPaths.has(name) || record.optional !== true || !otherPlatform(record)) buildRefusal();
+            continue;
+        }
+        const installed = object(JSON.parse(readBuildBytes(`${name}/package.json`)));
+        const expectedName = name.slice(name.lastIndexOf('node_modules/') + 'node_modules/'.length);
+        if (installed.name !== expectedName || installed.version !== record.version
+            || installed.gypfile !== undefined && typeof installed.gypfile !== 'boolean') buildRefusal();
+        const commands = scripts(installed), hooks = INSTALL_HOOKS.filter(hook => Object.hasOwn(commands, hook));
+        if (hooks.length && (name !== 'node_modules/esbuild' || hooks.length !== 1
+            || hooks[0] !== 'postinstall' || commands.postinstall !== 'node install.js')) buildRefusal();
+        if (installed.gypfile !== false && !Object.hasOwn(commands, 'install') && !Object.hasOwn(commands, 'preinstall')
+            && !absent(`${name}/binding.gyp`)) {
+            readBuildBytes(`${name}/binding.gyp`); buildRefusal();
+        }
+    }
+}
+
+function probeNative(absolute) {
+    return new Promise((resolve, reject) => {
+        let child, failed = false, settled = false, closed = false, cleanup;
+        const output = { stdout: [], stderr: [] }, lengths = { stdout: 0, stderr: 0 };
+        const finish = () => {
+            if (settled) return;
+            settled = true; clearTimeout(deadline); clearTimeout(cleanup);
+            if (failed || !closed) { reject(new Error('REHEARSAL_BUILD_INVALID')); return; }
+            resolve();
+        };
+        const fail = () => {
+            failed = true;
+            if (closed) { finish(); return; }
+            if (cleanup) return;
+            // Invocation deadline remains 10 seconds. This separate bounded
+            // cleanup wait cannot turn timeout/overflow into later success.
+            cleanup = setTimeout(finish, 1000);
+            try { if (!child || !child.kill('SIGKILL')) finish(); }
+            catch { finish(); }
+        };
+        const deadline = setTimeout(fail, 10000);
+        try {
+            child = spawn(absolute, ['--version'], { shell: false, windowsHide: true,
+                stdio: ['ignore', 'pipe', 'pipe'] });
+            for (const stream of ['stdout', 'stderr']) {
+                child[stream].on('data', chunk => {
+                    if (settled || failed) return;
+                    const bytes = Buffer.from(chunk); lengths[stream] += bytes.length;
+                    if (lengths[stream] > 1024 || stream === 'stderr' && bytes.length > 0) { fail(); return; }
+                    output[stream].push(bytes);
+                });
+                child[stream].on('error', fail);
+            }
+            child.on('error', fail);
+            child.on('close', (code, signal) => {
+                closed = true;
+                if (code !== 0 || signal !== null || child.exitCode !== 0 || child.signalCode !== null
+                    || lengths.stderr !== 0 || !/^0\.28\.2\r?\n$/.test(Buffer.concat(output.stdout).toString('utf8'))) failed = true;
+                finish();
+            });
+        } catch { fail(); }
+    });
+}
+
+export async function assertBuildInstallationCapability() {
+    try {
+        assertBuildInstallationPolicy();
+        assertInstalledSetupDisposition();
+        assertBuildToolResolution();
+        const { packages, nativeName } = installationPolicy();
+        const wrapper = object(JSON.parse(readBuildBytes('node_modules/esbuild/package.json')));
+        const typescript = object(JSON.parse(readBuildBytes('node_modules/typescript/package.json')));
+        const nativeRecord = packages[`node_modules/${nativeName}`];
+        const nativeMetadata = object(JSON.parse(readBuildBytes(`node_modules/${nativeName}/package.json`)));
+        const native = `node_modules/${nativeName}/${process.platform === 'win32' ? 'esbuild.exe' : 'bin/esbuild'}`;
+        const pin = NATIVE_DIGESTS[native.slice('node_modules/'.length)];
+        if (!pin || otherPlatform(nativeRecord) || otherPlatform(nativeMetadata)
+            || buildCanonical(nativeMetadata.os) !== buildCanonical(nativeRecord.os)
+            || buildCanonical(nativeMetadata.cpu) !== buildCanonical(nativeRecord.cpu)
+            || wrapper.name !== 'esbuild' || wrapper.version !== VERSION
+            || buildCanonical(declarations(wrapper, 'optionalDependencies')) !== buildCanonical(packages['node_modules/esbuild'].optionalDependencies)
+            || buildCanonical(object(wrapper['esbuild.binaryHashes'])) !== buildCanonical(NATIVE_DIGESTS)
+            || typescript.name !== 'typescript' || typescript.version !== packages['node_modules/typescript'].version) buildRefusal();
+        const names = ['package.json', 'package-lock.json', 'node_modules/esbuild/lib/main.js',
+            'node_modules/typescript/lib/typescript.js', native,
+            ...Object.keys(packages).filter(name => name && !absent(name)).map(name => `${name}/package.json`)];
+        if (names.length > 512 || new Set(names).size !== names.length) buildRefusal();
+        let total = 0;
+        const snapshots = names.map(name => {
+            const value = readBuildFileSnapshot(name); total += value.bytes.length;
+            if (total > 128 * 1024 * 1024) buildRefusal();
+            return { name, ...value };
+        });
+        if (buildDigest(snapshots.find(value => value.name === native).bytes) !== pin) buildRefusal();
+        await probeNative(path.join(rehearsalBuildRoot, native));
+        for (const before of snapshots) {
+            const after = readBuildFileSnapshot(before.name);
+            if (!before.bytes.equals(after.bytes) || buildDigest(before.bytes) !== buildDigest(after.bytes)
+                || Object.keys(before.identity).some(key => before.identity[key] !== after.identity[key])) buildRefusal();
+        }
+        assertBuildInstallationPolicy();
+        assertInstalledSetupDisposition();
+        assertBuildToolResolution();
+    } catch { buildRefusal(); }
+}
+
+// Import is inert. Both CLI phases own their complete assertions.
 if (import.meta.main) {
     try {
         if (!process.argv[1]) buildRefusal();
         const command = path.resolve(process.argv[1]);
         if (pathToFileURL(command).href !== import.meta.url || fs.realpathSync.native(command) !== command) buildRefusal();
         if (process.argv.length !== 3 || !['before', 'after'].includes(process.argv[2])) buildRefusal();
-        if (process.argv[2] !== 'before') buildRefusal();
-        assertBuildInstallationPolicy();
-        process.stdout.write('BUILD_INSTALLATION_POLICY_OK\n');
+        if (process.argv[2] === 'before') {
+            assertBuildInstallationPolicy();
+            process.stdout.write('BUILD_INSTALLATION_POLICY_OK\n');
+        } else {
+            await assertBuildInstallationCapability();
+            process.stdout.write('BUILD_INSTALLATION_CAPABILITY_OK\n');
+        }
     } catch {
         process.stderr.write('REHEARSAL_BUILD_INVALID\n');
         process.exitCode = 1;

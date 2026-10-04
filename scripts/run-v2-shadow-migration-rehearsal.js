@@ -109,9 +109,15 @@ function checkedPath(name, observation) {
     return absolute;
 }
 export function readBuildBytes(name, maximum = MAX_FILE, observation) {
-    return readAbsoluteBuildBytes(checkedPath(name, observation), maximum, observation, name);
+    return readBuildFileSnapshot(name, maximum, observation).bytes;
+}
+export function readBuildFileSnapshot(name, maximum = MAX_FILE, observation) {
+    return readAbsoluteBuildSnapshot(checkedPath(name, observation), maximum, observation, name);
 }
 function readAbsoluteBuildBytes(absolute, maximum, observation, name) {
+    return readAbsoluteBuildSnapshot(absolute, maximum, observation, name).bytes;
+}
+function readAbsoluteBuildSnapshot(absolute, maximum, observation, name) {
     const fd = observedFilesystem(observation, name, 'descriptor-before', 'open', () => fs.openSync(absolute, 'r'));
     try {
         const before = observedFilesystem(observation, name, 'descriptor-before', 'fstat', () => fs.fstatSync(fd, { bigint: true }));
@@ -139,7 +145,8 @@ function readAbsoluteBuildBytes(absolute, maximum, observation, name) {
                     () => ({ regular: finalRegular, singleLink: finalSingleLink, withinSizeLimit: 'unknown', linkCount: String(stat.nlink), size: String(stat.size), limit: String(maximum),
                         descriptorEqual: stat === after ? identityEqual : true, pathEqual: stat === leaf ? identityEqual : 'unknown', sizeEqual, mtimeEqual, ctimeEqual }));
         }
-        return bytes;
+        return { bytes, identity: { dev: before.dev, ino: before.ino, size: before.size,
+            mtimeNs: before.mtimeNs, ctimeNs: before.ctimeNs } };
     } finally { observedFilesystem(observation, name, 'descriptor-after', 'close', () => fs.closeSync(fd)); }
 }
 export function measureBuildFiles(names, observation) {
