@@ -113,6 +113,12 @@ test("installation policy rejects changed setup inventory", async t => {
   });
 });
 
+test("installation policy rejects an array lock version", t => {
+  const root = fixture(t);
+  edit(root, "package-lock.json", lock => { lock.packages["node_modules/yaml"].version = ["2.9.0"]; });
+  refused(root);
+});
+
 test("installation policy rejects root setup and nonregistry sources", async t => {
   for (const hook of ["preinstall", "install", "postinstall", "prepublish", "preprepare", "prepare", "postprepare", "dependencies"]) {
     await t.test(`root ${hook}`, () => {
@@ -161,6 +167,27 @@ test("installation CLI refuses an aliased checkout invocation", t => {
   t.after(() => fs.rmSync(alias, { recursive: true, force: true }));
   const result = unchanged(root, () => before(alias));
   assert.equal(result.status, 1);
+  assert.equal(result.stdout, "");
+  assert.equal(result.stderr, "REHEARSAL_BUILD_INVALID\n");
+});
+
+test("installation CLI refuses a failed canonical resolution", t => {
+  const root = fixture(t), command = join(root, checker), observed = join(root, "canonical-failure-observed.txt");
+  // Force only this command's canonical lookup to fail; all fixture reads and
+  // the real CLI remain native. The owned marker proves this fault was reached.
+  const preload = `import fs from 'node:fs'; const native = fs.realpathSync.native;
+    fs.realpathSync.native = function(input, ...args) {
+      if (input === ${JSON.stringify(command)}) {
+        fs.writeFileSync(${JSON.stringify(observed)}, 'EPERM\\n');
+        throw Object.assign(new Error('owned canonical lookup failure'), { code: 'EPERM' });
+      }
+      return native(input, ...args);
+    };`;
+  const result = unchanged(root, () => spawnSync(process.execPath,
+    ["--import", `data:text/javascript,${encodeURIComponent(preload)}`, command, "before"],
+    { cwd: tmpdir(), encoding: "utf8", windowsHide: true, timeout: 10000, maxBuffer: 4096 }));
+  assert.equal(fs.readFileSync(observed, "utf8"), "EPERM\n", "the direct CLI reached the failed canonical lookup");
+  assert.equal(result.status, 1, String(result.stderr));
   assert.equal(result.stdout, "");
   assert.equal(result.stderr, "REHEARSAL_BUILD_INVALID\n");
 });

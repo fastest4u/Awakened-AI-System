@@ -105,7 +105,7 @@ function installationPolicy() {
         const record = object(raw);
         if (!PACKAGE_PATH.test(packagePath) || packagePath.length > 220
             || packagePath.split('/').some(part => part === '.' || part === '..')
-            || !PACKAGE_VERSION.test(record.version) || Object.hasOwn(record, 'link')
+            || typeof record.version !== 'string' || !PACKAGE_VERSION.test(record.version) || Object.hasOwn(record, 'link')
             || Object.hasOwn(record, 'inBundle') || Object.hasOwn(record, 'workspaces')) buildRefusal();
         const name = packagePath.slice(packagePath.lastIndexOf('node_modules/') + 'node_modules/'.length);
         if (record.name !== undefined && record.name !== name) buildRefusal();
@@ -153,13 +153,11 @@ export function assertBuildInstallationPolicy() {
 }
 
 // Import is inert. Task 2 adds the after-phase capability check; no partial success.
-let invokedAsCommand = false;
-try {
-    invokedAsCommand = !!process.argv[1] && pathToFileURL(fs.realpathSync.native(path.resolve(process.argv[1]))).href === import.meta.url;
-} catch { /* An unrelated importing command does not activate this CLI. */ }
-if (invokedAsCommand) {
+if (import.meta.main) {
     try {
-        if (pathToFileURL(path.resolve(process.argv[1])).href !== import.meta.url) buildRefusal();
+        if (!process.argv[1]) buildRefusal();
+        const command = path.resolve(process.argv[1]);
+        if (pathToFileURL(command).href !== import.meta.url || fs.realpathSync.native(command) !== command) buildRefusal();
         if (process.argv.length !== 3 || !['before', 'after'].includes(process.argv[2])) buildRefusal();
         if (process.argv[2] !== 'before') buildRefusal();
         assertBuildInstallationPolicy();
