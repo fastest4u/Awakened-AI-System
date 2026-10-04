@@ -43,6 +43,7 @@ function cleanBuildFixture(t: TestContext): string {
     const source = join(original, name), stat = fs.lstatSync(source);
     assert.equal(stat.isSymbolicLink(), false);
     if (stat.isDirectory()) {
+      fs.mkdirSync(join(root, name), { recursive: true });
       const children = fs.readdirSync(source).filter(child => child !== "node_modules").sort();
       directories.set(name, children);
       for (const child of children) copy(join(name, child));
@@ -53,36 +54,81 @@ function cleanBuildFixture(t: TestContext): string {
     assert.ok(total <= 256 * 1024 * 1024 && captures.size < 20000, "bounded current-byte fixture");
     captures.set(name, bytes); fs.mkdirSync(dirname(join(root, name)), { recursive: true });
     fs.writeFileSync(join(root, name), bytes);
+    if (process.platform !== "win32") fs.chmodSync(join(root, name), stat.mode & 0o777);
   }
   for (const name of ["src", "package.json", "package-lock.json", "tsconfig.json", ".gitignore",
-    "scripts/build.js", "scripts/fresh-start-build.js", "scripts/run-v2-shadow-migration-rehearsal.js"]) copy(name);
-  const packages = new Set<string>();
-  function dependency(name: string, from: string): void {
-    let cursor = from, found: string | undefined;
-    while (cursor.startsWith(original)) {
-      const candidate = join(cursor, "node_modules", name);
-      if (fs.existsSync(join(candidate, "package.json"))) { found = candidate; break; }
-      const parent = dirname(cursor); if (parent === cursor) break; cursor = parent;
+    "scripts/build.js", "scripts/fresh-start-build.js", "scripts/run-v2-shadow-migration-rehearsal.js", "scripts/check-build-installation.js"]) copy(name);
+  const lock = JSON.parse(captures.get("package-lock.json")!.toString()), packages = lock.packages;
+  assert.equal(lock.lockfileVersion, 3);
+  const required = new Set<string>([`node_modules/@esbuild/${process.platform}-${process.arch}`]);
+  const present = new Set<string>();
+  for (const [name, record] of Object.entries(packages) as [string, any][]) {
+    if (!name) continue;
+    if (record.optional !== true) required.add(name);
+    let cursor = original, installed = true;
+    for (const part of name.split("/")) {
+      cursor = join(cursor, part);
+      let stat: fs.Stats;
+      try { stat = fs.lstatSync(cursor); }
+      catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        installed = false; break;
+      }
+      assert.equal(stat.isSymbolicLink(), false, "package ancestors are not aliases");
+      assert.ok(stat.isDirectory(), "package ancestors and root are directories");
     }
-    assert.ok(found, `installed fixture dependency ${name}`);
-    if (packages.has(found)) return; packages.add(found);
-    copy(relative(original, found));
-    const pkg = JSON.parse(fs.readFileSync(join(found, "package.json"), "utf8"));
-    for (const child of Object.keys(pkg.dependencies ?? {})) dependency(child, found);
-    // esbuild's one installed native tool is optional, platform-specific build input.
-    for (const child of Object.keys(pkg.optionalDependencies ?? {})) {
-      if (fs.existsSync(join(original, "node_modules", child, "package.json"))) dependency(child, found);
+    if (installed) present.add(name);
+  }
+  function dependency(name: string, from: string): string {
+    let cursor = from;
+    while (true) {
+      const candidate = cursor ? `${cursor}/node_modules/${name}` : `node_modules/${name}`;
+      if (Object.hasOwn(packages, candidate)) return candidate;
+      if (!cursor) assert.fail(`required locked fixture dependency ${name}`);
+      const parent = cursor.lastIndexOf("/node_modules/"); cursor = parent < 0 ? "" : cursor.slice(0, parent);
     }
   }
-  for (const name of ["esbuild", "javascript-obfuscator", "typescript", "zod", "@modelcontextprotocol/sdk"])
-    dependency(name, name === "zod" || name === "@modelcontextprotocol/sdk" ? original : join(original, "scripts"));
+  // Derive required edges independently of optional flags, including root dev dependencies
+  // and required peers of every present optional package.
+  const pending = ["", ...required, ...present], visited = new Set<string>();
+  for (let i = 0; i < pending.length; i++) {
+    const name = pending[i]!; if (visited.has(name)) continue; visited.add(name);
+    const record = packages[name]; assert.ok(record);
+    for (const field of ["dependencies", ...(name === "" ? ["devDependencies"] : []), "peerDependencies"]) {
+      for (const child of Object.keys(record[field] ?? {})) {
+        if (field === "dependencies" && Object.hasOwn(record.optionalDependencies ?? {}, child)
+          || field === "peerDependencies" && record.peerDependenciesMeta?.[child]?.optional === true) continue;
+        const resolved = dependency(child, name); required.add(resolved); pending.push(resolved);
+      }
+    }
+  }
+  function admits(values: unknown, current: string): boolean {
+    if (values === undefined) return true;
+    assert.ok(Array.isArray(values) && values.length && values.every(value => typeof value === "string"));
+    const positive = values.filter((value: string) => !value.startsWith("!"));
+    return !values.includes(`!${current}`) && (!positive.length || positive.includes(current) || positive.includes("any"));
+  }
+  for (const [name, record] of Object.entries(packages) as [string, any][]) {
+    if (!name) continue;
+    if (present.has(name)) {
+      assert.ok(fs.existsSync(join(original, name, "package.json")), `installed fixture metadata ${name}`);
+      copy(name);
+    } else {
+      assert.equal(required.has(name), false, `required installed fixture package ${name}`);
+      assert.equal(record.optional, true);
+      assert.ok(!admits(record.os, process.platform) || !admits(record.cpu, process.arch), `absent optional is other-platform ${name}`);
+    }
+  }
   for (const [name, bytes] of captures) {
     assert.deepEqual(fs.readFileSync(join(original, name)), bytes, "capture correspondence at source");
     assert.deepEqual(fs.readFileSync(join(root, name)), bytes, "capture correspondence at destination");
   }
   for (const [name, children] of directories) assert.deepEqual(fs.readdirSync(join(original, name)).filter(child => child !== "node_modules").sort(), children,
     "capture correspondence includes additions and deletions");
+  for (const [name, children] of directories) assert.deepEqual(fs.readdirSync(join(root, name)).filter(child => child !== "node_modules").sort(), children,
+    "directory correspondence at destination");
   fixtureGit(root, ["init", "--quiet"]);
+  fixtureGit(root, ["config", "core.autocrlf", "false"]);
   fixtureGit(root, ["add", "--", "."]);
   fixtureGit(root, ["commit", "--quiet", "-m", "synthetic current-byte build fixture"]);
   assert.equal(fixtureGit(root, ["status", "--porcelain=v1", "--untracked-files=all"]), "");
@@ -90,6 +136,7 @@ function cleanBuildFixture(t: TestContext): string {
   assert.equal(fixtureGit(original, ["rev-parse", "HEAD"]), originalHead);
   assert.equal(fixtureGit(original, ["status", "--porcelain=v1", "--untracked-files=all"]), originalStatus);
   assert.deepEqual(fs.readFileSync(indexPath), indexBytes, "the original index is not mutated");
+  t.diagnostic(`synthetic copy: ${captures.size} files, ${total} bytes, ${directories.size} directories, ${present.size} present locked packages; source/destination/Git/index correspondence checked`);
   return root;
 }
 function fixtureGit(root: string, args: string[]): string {
@@ -107,6 +154,75 @@ function treeIdentity(root: string): unknown {
     ? fs.readdirSync(root).sort().map(name => [name, treeIdentity(join(root, name))])
     : createHash("sha256").update(fs.readFileSync(root)).digest("hex")];
 }
+test("clean build fixture includes every required locked package", t => {
+  const root = cleanBuildFixture(t), lock = JSON.parse(fs.readFileSync(join(root, "package-lock.json"), "utf8"));
+  for (const [name, record] of Object.entries(lock.packages) as [string, any][]) {
+    if (!name || record.optional === true || record.devOptional === true) continue;
+    assert.equal(fs.existsSync(join(root, name, "package.json")), true, `required locked package ${name}`);
+  }
+  for (const name of ["node_modules/source-map", `node_modules/@esbuild/${process.platform}-${process.arch}`])
+    assert.equal(fs.existsSync(join(root, name, "package.json")), true, `present optional ${name}`);
+  const original = resolve(fileURLToPath(new URL("../../", import.meta.url))); let absentOptionals = 0;
+  for (const [name, record] of Object.entries(lock.packages) as [string, any][]) {
+    if (record.optional !== true || record.os?.[0] === process.platform && record.cpu?.[0] === process.arch) continue;
+    try { fs.lstatSync(join(original, name)); }
+    catch (error) {
+      assert.equal((error as NodeJS.ErrnoException).code, "ENOENT");
+      assert.equal(fs.existsSync(join(root, name)), false, `legitimate absent platform optional ${name}`); absentOptionals++;
+    }
+  }
+  assert.ok(absentOptionals > 0, "legitimate other-platform absence remains admitted");
+  assert.equal(fs.existsSync(join(root, "scripts/check-build-installation.js")), true);
+});
+test("clean build fixture refuses unresolved optional aliases and inspection errors", async t => {
+  const original = resolve(fileURLToPath(new URL("../../", import.meta.url)));
+  const lock = JSON.parse(fs.readFileSync(join(original, "package-lock.json"), "utf8"));
+  const optional = Object.entries(lock.packages).find(([name, record]: [string, any]) => name.startsWith("node_modules/@esbuild/")
+    && record.optional === true && (record.os?.[0] !== process.platform || record.cpu?.[0] !== process.arch)
+    && !fs.existsSync(join(original, name)));
+  assert.ok(optional, "the installed source has a legitimate absent other-platform optional");
+  const selected = join(original, optional[0]);
+  for (const scenario of ["dangling alias", "inspection error"]) await t.test(scenario, async child => {
+    const owned = directory(child), target = join(owned, "target"), alias = join(owned, "alias");
+    if (scenario === "dangling alias") {
+      fs.mkdirSync(target); fs.symlinkSync(target, alias, process.platform === "win32" ? "junction" : "dir"); fs.rmdirSync(target);
+      assert.equal(fs.lstatSync(alias).isSymbolicLink(), true);
+      assert.equal(fs.existsSync(alias), false, "the owned alias is actually dangling");
+    }
+    const nativeFs: any = (await import("node:fs")).default, lstat: typeof fs.lstatSync = nativeFs.lstatSync; let reached = false;
+    // Redirect only one absent source leaf to an actual owned alias, or a specific
+    // inspection error. Shared installed bytes, ancestors and Git remain native.
+    nativeFs.lstatSync = ((input: any, ...args: any[]) => {
+      if (input === selected) {
+        reached = true;
+        if (scenario === "dangling alias") return (lstat as any)(alias, ...args);
+        throw Object.assign(new Error("owned optional inspection error"), { code: "EACCES" });
+      }
+      return (lstat as any)(input, ...args);
+    }) as typeof fs.lstatSync;
+    syncBuiltinESMExports();
+    try {
+      assert.throws(() => cleanBuildFixture(child), scenario === "dangling alias" ? /package ancestors are not aliases/
+        : (error: any) => error.code === "EACCES");
+      assert.equal(reached, true, "the exact optional source leaf was inspected");
+    } finally { nativeFs.lstatSync = lstat; syncBuiltinESMExports(); }
+  });
+});
+test("build refuses changed installation policy recipe", async t => {
+  const root = cleanBuildFixture(t), file = join(root, "scripts/check-build-installation.js");
+  const built = fixtureBuild(root); assert.equal(built.status, 0, built.stdout + built.stderr);
+  const manifest = JSON.parse(fs.readFileSync(join(root, "dist/internal/v2-shadow-migration-build.json"), "utf8"));
+  assert.equal(manifest.eligible, true);
+  assert.ok(manifest.recipes.some((entry: any) => entry.path === "scripts/check-build-installation.js"), "installation checker bytes are trusted build recipe inputs");
+  const command = pathToFileURL(join(root, "scripts/run-v2-shadow-migration-rehearsal.js")).href;
+  const module = await import(command), handoff = module.validateV2ShadowMigrationBuild(manifest.buildIdentityHash);
+  fs.appendFileSync(file, "\n ");
+  const result = childProcess.spawnSync(process.execPath, ["--input-type=module", "-e",
+    `const m=await import(${JSON.stringify(command)});try{m.validateV2ShadowMigrationBuild(${JSON.stringify(manifest.buildIdentityHash)});}catch{process.exit(7);}`],
+    { cwd: root, encoding: "utf8", windowsHide: true, timeout: 30000 });
+  assert.equal(result.status, 7, result.stdout + result.stderr);
+  assert.throws(() => handoff.assertUnchanged(), /REHEARSAL_BUILD_INVALID/);
+});
 test("private builtin loader exception is path-specific and closed before and after bundling", async t => {
   const root = cleanBuildFixture(t), manifestPath = join(root, "dist/internal/v2-shadow-migration-build.json");
   const built = fixtureBuild(root); assert.equal(built.status, 0, built.stdout + built.stderr);
@@ -574,6 +690,7 @@ test("clean current-byte fixture validates provenance and refuses stale or corru
   assert.equal(validate().status, 0);
   await t.test("supplied identity mismatch refuses", () => assert.equal(validate("0".repeat(64)).status, 7));
   for (const name of ["src/orchestrator/migration/v2-shadow-migration-rehearsal.ts", "tsconfig.json", "scripts/build.js", "scripts/fresh-start-build.js",
+    "scripts/check-build-installation.js", "package.json", "package-lock.json", "node_modules/esbuild/package.json", "node_modules/typescript/package.json",
     "node_modules/zod/v3/types.js", "node_modules/esbuild/lib/main.js", "node_modules/typescript/lib/typescript.js", "dist/internal/v2-shadow-migration-rehearsal.js",
     "dist/internal/stable-compatibility-directory.worker.js", "scripts/run-v2-shadow-migration-rehearsal.js", nativeRecipePath]) {
     await t.test(`changed ${name} refuses`, () => {
@@ -608,6 +725,14 @@ test("clean current-byte fixture validates provenance and refuses stale or corru
     try { fs.appendFileSync(path, "\n "); assert.throws(() => handoff.assertUnchanged(), /REHEARSAL_BUILD_INVALID/); }
     finally { fs.writeFileSync(path, bytes); }
   });
+  for (const name of ["scripts/check-build-installation.js", "package.json", "node_modules/esbuild/package.json"]) {
+    await t.test(`finalization handoff detects changed ${name}`, async () => {
+      const module = await import(command), handoff = module.validateV2ShadowMigrationBuild(manifest.buildIdentityHash);
+      const file = join(root, name), bytes = fs.readFileSync(file);
+      try { fs.appendFileSync(file, "\n "); assert.throws(() => handoff.assertUnchanged(), /REHEARSAL_BUILD_INVALID/); }
+      finally { fs.writeFileSync(file, bytes); }
+    });
+  }
   await t.test("operational invocation refuses without importing a changed bundle or touching selected paths", () => {
     const marker = join(root, "must-not-exist"), artifact = join(root, "dist/internal/v2-shadow-migration-rehearsal.js"), bytes = fs.readFileSync(artifact);
     fs.writeFileSync(artifact, `import {writeFileSync} from 'node:fs'; writeFileSync(${JSON.stringify(marker)},'bad');`);
@@ -642,20 +767,25 @@ test("clean current-byte fixture validates provenance and refuses stale or corru
       assert.equal(JSON.parse(fs.readFileSync(manifestPath, "utf8")).eligible, false);
     } finally { fs.writeFileSync(script, bytes); }
   });
-  for (const [ordinal, name] of ["node_modules/zod/v3/types.js", "dist/internal/v2-shadow-migration-rehearsal.js", nativeRecipePath].entries()) {
+  for (const [ordinal, name] of ["node_modules/zod/v3/types.js", "dist/internal/v2-shadow-migration-rehearsal.js", nativeRecipePath,
+    "scripts/check-build-installation.js", "package.json", "node_modules/esbuild/package.json"].entries()) {
   await t.test(`late byte change to ${name} refuses manifest publication`, () => {
     const dependency = join(root, name), bytes = fs.readFileSync(dependency);
     const directory = join(root, ".superpowers"); fs.mkdirSync(directory, { recursive: true });
-    const preload = join(directory, `late-change-${ordinal}.mjs`), marker = join(directory, `changed-${ordinal}`);
+    const preload = join(directory, `late-change-${ordinal}.mjs`), marker = join(directory, `changed-${ordinal}`),
+      phaseMarker = join(directory, `admitted-and-captured-${ordinal}`);
     fs.writeFileSync(preload, `import fs from 'node:fs'; import {syncBuiltinESMExports} from 'node:module';
-      const open=fs.openSync, close=fs.closeSync, selected=new Set(); let fired=false;
-      fs.openSync=(...args)=>{ const fd=open(...args); if (args[0]===${JSON.stringify(dependency)}) selected.add(fd); return fd; };
-      fs.closeSync=(fd)=>{close(fd); if(selected.delete(fd)&&!fired){fired=true; fs.appendFileSync(${JSON.stringify(dependency)},'\\n ');fs.writeFileSync(${JSON.stringify(marker)},'changed');}};
+      const open=fs.openSync, write=fs.writeFileSync; let armed=false, fired=false;
+      fs.writeFileSync=(...args)=>{const result=write(...args);if(args[0]===${JSON.stringify(join(root, "dist/build-info.json"))}){
+        armed=true;write(${JSON.stringify(phaseMarker)},'admitted and captured');}return result;};
+      fs.openSync=(...args)=>{if(armed&&!fired&&args[0]===${JSON.stringify(dependency)}){
+        fired=true;fs.appendFileSync(${JSON.stringify(dependency)},'\\n ');write(${JSON.stringify(marker)},'changed');}return open(...args);};
       syncBuiltinESMExports();`);
     try {
       const result = childProcess.spawnSync(process.execPath, ["--import", pathToFileURL(preload).href, "scripts/build.js"],
         { cwd: root, encoding: "utf8", windowsHide: true, timeout: 180000, maxBuffer: 2 * 1024 * 1024 });
-      assert.ok(fs.existsSync(marker), "the exact-load boundary was actually perturbed");
+      assert.equal(fs.readFileSync(phaseMarker, "utf8"), "admitted and captured", "actual Build passed capability, recipe capture and bundling before perturbation");
+      assert.equal(fs.readFileSync(marker, "utf8"), "changed", "the final guarded-load boundary was actually perturbed");
       assert.notEqual(result.status, 0); assert.match(result.stderr, /REHEARSAL_BUILD_INVALID/);
       assert.equal(JSON.parse(fs.readFileSync(manifestPath, "utf8")).eligible, false);
     } finally { fs.writeFileSync(dependency, bytes); }

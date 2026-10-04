@@ -12,6 +12,8 @@ const outFile = path.join(outDir, 'index.js');
 mkdirSync(path.join(outDir, 'internal'), { recursive: true });
 writeFileSync(path.join(outDir, 'internal', 'v2-shadow-migration-build.json'), '{"eligible":false,"schemaVersion":1}\n');
 writeFileSync(path.join(outDir, 'v2-build.json'), '{"schemaVersion":1,"incomplete":true}\n');
+const { assertBuildInstallationCapability } = await import('./check-build-installation.js');
+await assertBuildInstallationCapability();
 const { freshStartBuild } = await import('./fresh-start-build.js');
 const { rehearsalManifestPath, rehearsalArtifactPaths, rehearsalRecipePaths, rehearsalBuildRoot,
     readBuildBytes, measureBuildFiles, createCiDiagnosticCollector, assertBuildFiles, assertBuildResolutionMetadata, assertBuildToolResolution, cleanBuildHead, assertCommittedBuildFiles,

@@ -228,6 +228,42 @@ function installedFixture(t: TestContext): string {
 function nativeRecipe(): string {
   return `node_modules/@esbuild/${process.platform}-${process.arch}/${process.platform === "win32" ? "esbuild.exe" : "bin/esbuild"}`;
 }
+function buildEntryFixture(t: TestContext): string {
+  const root = installedFixture(t);
+  for (const name of ["scripts/build.js", "scripts/fresh-start-build.js"]) fs.copyFileSync(join(source, name), join(root, name));
+  // A real installed wrapper side effect exposes an import before admission.
+  fs.appendFileSync(join(root, "node_modules/esbuild/lib/main.js"),
+    `\nrequire('node:fs').writeFileSync(${JSON.stringify(join(root, "dependency-executed.txt"))}, 'executed');\n`);
+  fs.mkdirSync(join(root, "dist/internal"), { recursive: true });
+  fs.writeFileSync(join(root, "dist/internal/v2-shadow-migration-build.json"), '{"eligible":true}\n');
+  fs.writeFileSync(join(root, "dist/v2-build.json"), '{"incomplete":false}\n');
+  return root;
+}
+function buildEntryRefused(root: string): void {
+  const result = spawnSync(process.execPath, ["scripts/build.js"],
+    { cwd: root, encoding: "utf8", windowsHide: true, timeout: 15000, maxBuffer: 4096 });
+  assert.equal(result.error, undefined); assert.equal(result.signal, null);
+  assert.equal(result.status, 1, String(result.stderr));
+  assert.equal(fs.existsSync(join(root, "dependency-executed.txt")), false, "installed module was not executed");
+  assert.match(String(result.stderr), /REHEARSAL_BUILD_INVALID/);
+  assert.equal(result.stdout, "");
+  assert.equal(fs.existsSync(join(root, "setup-executed.txt")), false);
+  assert.deepEqual(JSON.parse(fs.readFileSync(join(root, "dist/internal/v2-shadow-migration-build.json"), "utf8")), { eligible: false, schemaVersion: 1 });
+  assert.deepEqual(JSON.parse(fs.readFileSync(join(root, "dist/v2-build.json"), "utf8")), { schemaVersion: 1, incomplete: true });
+}
+test("build installation refusal leaves both incomplete manifests", t => {
+  const root = buildEntryFixture(t);
+  edit(root, "node_modules/yaml/package.json", pkg => { pkg.scripts = { install: "node setup-executed.txt" }; });
+  buildEntryRefused(root);
+});
+test("standalone build refuses changed root hook and missing required closure", async t => {
+  for (const scenario of ["root hook", "required closure"]) await t.test(scenario, () => {
+    const root = buildEntryFixture(t);
+    if (scenario === "root hook") edit(root, "package.json", pkg => { pkg.scripts.install = "node setup-executed.txt"; });
+    else fs.rmSync(join(root, "node_modules/fast-glob"), { recursive: true });
+    buildEntryRefused(root);
+  });
+});
 function afterResult(root: string, preload?: string): ReturnType<typeof spawnSync> {
   const inputs = ["package.json", "package-lock.json", "untouched.txt"].map(name => [name, fs.readFileSync(join(root, name))] as const);
   const result = spawnSync(process.execPath, [...(preload ? ["--import", `data:text/javascript,${encodeURIComponent(preload)}`] : []), join(root, checker), "after"],

@@ -13,6 +13,7 @@ export const rehearsalArtifactPaths = Object.freeze(['dist/internal/stable-compa
 const nativePackage = `node_modules/@esbuild/${process.platform}-${process.arch}`;
 const nativeSubpath = process.platform === 'win32' ? 'esbuild.exe' : 'bin/esbuild';
 export const rehearsalRecipePaths = Object.freeze(['package.json', 'package-lock.json', 'tsconfig.json', 'scripts/build.js', 'scripts/fresh-start-build.js',
+    'scripts/check-build-installation.js',
     'node_modules/zod/package.json', 'node_modules/esbuild/package.json', 'node_modules/esbuild/lib/main.js',
     'node_modules/typescript/package.json', 'node_modules/typescript/lib/typescript.js',
     `${nativePackage}/package.json`, `${nativePackage}/${nativeSubpath}`].sort());
