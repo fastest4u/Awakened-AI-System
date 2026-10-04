@@ -7,7 +7,7 @@ import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import test from "node:test";
 import { parse } from "yaml";
-import { assertCiWorkflowSet } from "./support/ci-workflow-contract.js";
+import { assertCiWorkflowSet, RECORD_QUALIFICATION_PHASE } from "./support/ci-workflow-contract.js";
 
 const root = fileURLToPath(new URL("../../", import.meta.url));
 const runner = join(root, "scripts/run-v2-fresh-start-foundation.js");
@@ -29,7 +29,23 @@ function assertFoundationWorkflow(workflow: any) {
   const foundation = required("Run V2 fresh-start foundation gate", "npm run test:v2-fresh-start-foundation", "foundation");
   const artifacts = required("Test build artifacts", "npm run test:build-artifacts", "artifacts");
   assert.equal(build, typecheck + 1); assert.ok(tests > build);
-  assert.ok(foundation > tests); assert.equal(artifacts, foundation + 1);
+  assert.ok(foundation > tests);
+  const records = steps.filter(step => step.name === "Record foundation identity");
+  assert.equal(records.length, 1);
+  assert.deepEqual(records[0], {
+    name: "Record foundation identity", id: "record_foundation", shell: "pwsh",
+    env: {
+      V2_CI_CANDIDATE_SHA: "${{ inputs.candidate_sha }}",
+      V2_CI_APPROVED_WORKFLOW_SHA: "${{ inputs.approved_workflow_sha }}",
+      V2_CI_CONTROL_SHA: "${{ github.workflow_sha }}",
+      V2_CI_OS: "${{ matrix.os }}", V2_CI_RUN_ID: "${{ github.run_id }}",
+      V2_CI_RUN_ATTEMPT: "${{ github.run_attempt }}",
+      V2_CI_IDENTITY: "${{ steps.identity.outputs.receipt }}", V2_CI_PHASE: "foundation",
+    },
+    run: RECORD_QUALIFICATION_PHASE + "\n",
+  });
+  assert.equal(steps.indexOf(records[0]!), foundation + 1);
+  assert.equal(artifacts, foundation + 2);
 }
 
 test("CI executes Foundation and builds before the full suite without bypasses", () => {
