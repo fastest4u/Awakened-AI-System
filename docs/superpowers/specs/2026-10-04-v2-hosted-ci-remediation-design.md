@@ -1,6 +1,6 @@
 # V2 hosted CI remediation design
 
-**Status:** Written specification awaiting human review. The human approved direction A and the conversational component, diagnostic data, error preservation and verification design on 2026-10-04. This document has not yet been approved.
+**Status:** Written specification awaiting human review together with the [fast PR and full V2 release CI amendment](2026-10-04-v2-fast-pr-full-release-ci-design.md). The human approved direction A, the conversational remediation design and the concrete CI-role amendment on 2026-10-04. Neither written artifact has yet been approved.
 
 **Outcome:** Close the hosted CI failures before continuing operational key handling and public V2 workflows. Establish the rejecting conditions, repair their proven causes without weakening existing contracts, and qualify the final candidate on Ubuntu and Windows.
 
@@ -12,7 +12,7 @@ Conversational approval permits writing, reviewing and locally committing this s
 
 No current approval authorizes dependency installation, product builds or tests, hosted CI dispatch, push, merge, live data access, actual Codex capture, credential/configuration changes or PROD activation. The execution plan must distinguish local synthetic work from separately authorized hosted actions. A failed diagnostic does not authorize a broader retry or workaround.
 
-Do not delete tests, disable or relabel gates, increase existing limits/timeouts, change the immutable V1 baseline, expand file allowlists, alter the Node support policy, or introduce new public V2 features. Keep the existing workflow and diagnostic-artifact permissions unchanged. Existing synthetic migration regressions remain regressions; they do not impose a live V1 migration prerequisite on fresh-start V2.
+Do not delete tests, waive required coverage, increase existing limits/timeouts, change the immutable V1 baseline, expand protected source/file allowlists, alter the Node support policy, or introduce new public V2 features. Workflow roles, triggers and qualification ownership are governed by the linked CI amendment; diagnostic-artifact permissions remain unchanged. Existing synthetic migration regressions remain regressions under their separate manual owner, not a fresh-start V2 release prerequisite. Shared and nonlegacy failures still block V2 qualification.
 
 ## Observed failures and source identity
 
@@ -76,7 +76,7 @@ For each family, establish a reproducing failure on bound synthetic inputs, obta
 
 Prefer a minimal correction at the proven producer, fixture or existing implementation boundary. Canonicalizing an owned fixture is permitted only when evidence proves the fixture spelling was invalid and the real policy still rejects hostile aliases and replacements. Derive all downstream fixture paths consistently from the verified root; leave deliberately malformed inputs intact. Preserve ownership-aware cleanup of only the created root; canonicalization must not redirect cleanup to an unrelated target.
 
-Do not waive regular-file/link checks, canonical identity, symlink/junction refusal, durable containment, route binding, mutation detection, provenance or exact build correspondence. An implementation correction may restore an existing documented contract, but a changed acceptance policy, new interface, dependency change, workflow change or newly trusted producer requires a concrete amendment before implementation.
+Do not waive regular-file/link checks, canonical identity, symlink/junction refusal, durable containment, route binding, mutation detection, provenance or exact build correspondence. An implementation correction may restore an existing documented contract, but a changed acceptance policy, new interface, dependency change or newly trusted producer requires a concrete amendment before implementation. Only the CI-role changes specified in the linked amendment are covered by that amendment; other workflow changes require their own concrete review.
 
 The first execution plan must enumerate exact owned observation files, representative cases, commands, bounded resource/process cleanup and diagnostic data. If diagnostics establish a repair not concretely covered by that plan, return with the evidence and prepare the scoped repair plan; do not turn this design into open-ended authority to patch any red test.
 
@@ -94,9 +94,9 @@ Freeze the final candidate before complete qualification. Bind head, base, teste
 
 Close this slice only when all of the following are established:
 
-- Each observed failure family has a causal disposition and corresponding focused regression/hostile evidence; no family is assumed fixed by a neighboring repair.
+- Each observed failure family has a causal disposition; V2-required failures have corresponding focused regression/hostile evidence. Legacy-only unresolved regressions are tracked separately rather than required for fresh-start V2 release. No family is reported fixed by scheduling changes or a neighboring repair.
 - Existing refusal, route, provenance and ownership contracts remain intact, with no removed tests, weakened limits or hidden skips.
-- The final supported Ubuntu and Windows jobs pass build, tests and every downstream gate in the unchanged reviewed workflow; the minimum-runtime rejection remains correct. Hosted execution must first receive its required authority.
+- PR feedback retains the core checks and minimum-runtime rejection. The final candidate passes the complete nonlegacy suite and every distinct V2 release qualifier on supported Ubuntu and Windows under the reviewed role contracts; legacy evidence stays with its separate owner. Hosted execution must first receive its required authority.
 - Reports distinguish failed attempts, successful results, skipped checks and incomplete evidence, and bind every result to its exact tested identity.
 
 Green CI closes this remediation slice only. Operational keys, public V2 workflows, actual selected-host qualification, backup/restore of new V2 data, release proof and separately authorized cutover remain governed by the fresh-start delivery roadmap.
@@ -104,8 +104,9 @@ Green CI closes this remediation slice only. Operational keys, public V2 workflo
 ## References
 
 - [Fresh-start production design](2026-09-29-v2-fresh-start-production-design.md).
+- [Fast PR and full V2 release CI amendment](2026-10-04-v2-fast-pr-full-release-ci-design.md).
 - [Fresh-start delivery roadmap](../plans/2026-09-29-v2-fresh-start-delivery-roadmap.md).
 - [Failed hosted CI run](https://github.com/fastest4u/Awakened-AI-System/actions/runs/37142753116).
 - Source owners at the recorded head: `scripts/build.js`, `scripts/run-v2-shadow-migration-rehearsal.js`, `src/orchestrator/projections/stable-directory.ts`, `tests/support/canonical-temp.ts`, `tests/support/fresh-start-fixture.ts`, and the representative tests named above.
 
-Next action after written-spec approval is an executable plan for the bounded causal-diagnostic slice. This document neither claims the root causes are known nor approves implementation or production deployment.
+Next action is human review of this specification and the linked CI amendment. After written approval, prepare separate bounded plans for CI-role contracts and causal diagnosis, with reviewed execution methods before implementation. This document neither claims the root causes are known nor approves implementation or production deployment.
