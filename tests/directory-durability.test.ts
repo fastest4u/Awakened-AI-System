@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterEach, describe, it } from "node:test";
+import { capturePathSnapshot, createCiDiagnosticCollector } from "./support/ci-path-diagnostics.js";
 import {
   createDirectoryDurably,
   fsyncDirectory,
@@ -20,7 +21,7 @@ function codedError(code: string): Error & { code: string } {
 }
 
 describe("directory durability", () => {
-  it("replays the full parent chain from a known durable base for an existing tree", () => {
+  it("replays the full parent chain from a known durable base for an existing tree", (t) => {
     const root = mkdtempSync(join(tmpdir(), "directory-durability-contender-"));
     roots.push(root);
     const durableBase = join(root, "base");
@@ -28,6 +29,9 @@ describe("directory durability", () => {
     mkdirSync(target, { recursive: true });
     const barriers: string[] = [];
 
+    const collector = createCiDiagnosticCollector(line => t.diagnostic(line));
+    capturePathSnapshot({ family: "durable-directory", caseId: "durability-control", directory: target, durableBase }, collector);
+    try { t.diagnostic(`CI path diagnostics incomplete=${collector.incomplete}`); } catch { /* Informational only. */ }
     createDirectoryDurably(target, durableBase, (path) => barriers.push(path));
 
     assert.deepEqual(barriers, [resolve(durableBase), resolve(durableBase, "nested")]);

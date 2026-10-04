@@ -16,6 +16,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, it } from "node:test";
+import { capturePathSnapshot, createCiDiagnosticCollector } from "./support/ci-path-diagnostics.js";
 
 import { LifecycleError } from "../src/orchestrator/lifecycle/errors.js";
 import type { ProjectBinding } from "../src/orchestrator/projections/contracts.js";
@@ -335,6 +336,9 @@ describe("immutable projection manifest", () => {
     })}\n`;
 
     assert.equal(Buffer.from(serializeProjectionManifest(parsed)).toString("utf8"), expected);
+    const collector = createCiDiagnosticCollector(line => t.diagnostic(line));
+    capturePathSnapshot({ family: "manifest", caseId: "manifest-control", directory: root }, collector);
+    try { t.diagnostic(`CI path diagnostics incomplete=${collector.incomplete}`); } catch { /* Informational only. */ }
     const target = publishProjectionManifest({
       projectionDirectory: root,
       manifest: parsed,

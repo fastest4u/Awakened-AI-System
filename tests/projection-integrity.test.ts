@@ -16,6 +16,7 @@ import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, it } from "node:test";
+import { capturePathSnapshot, createCiDiagnosticCollector } from "./support/ci-path-diagnostics.js";
 
 import type { AppendCommand, JsonValue, PendingEvent } from "../src/orchestrator/contracts/event.js";
 import type {
@@ -373,6 +374,7 @@ interface Fixture {
 }
 
 interface FixtureOptions {
+  readonly beforePublish?: (directory: string) => void;
   readonly events?: readonly PendingEvent[];
   readonly maxReplayEvents?: number;
   readonly maxReplayBytes?: number;
@@ -445,13 +447,15 @@ async function createFixture(options: FixtureOptions = {}): Promise<Fixture> {
 
   connection.close();
   connections.splice(connections.indexOf(connection), 1);
-  const generation = await new V2ProjectionBuildCoordinator({
+  const coordinator = new V2ProjectionBuildCoordinator({
     projectionDirectory,
     // Semantic fixture setup is independent of wall-clock performance; deadline contracts have dedicated controls.
     now: () => 0,
     eventReader: new SqliteProjectionEventReader({ driver, eventStorePath: sourcePath }),
     builder: new ImmutableProjectionBuilder({ driver, projectionDirectory, now: () => NOW }),
-  }).ensurePublished(BINDING, expectedStreamVersion, 10_000);
+  });
+  options.beforePublish?.(projectionDirectory);
+  const generation = await coordinator.ensurePublished(BINDING, expectedStreamVersion, 10_000);
   return {
     sourcePath,
     projectionDirectory,
@@ -622,8 +626,12 @@ describe("full projection integrity replay", () => {
     ));
   });
 
-  it("returns a frozen pass report only for an exact authoritative replay", async () => {
-    const fixture = await createFixture();
+  it("returns a frozen pass report only for an exact authoritative replay", async (t) => {
+    const collector = createCiDiagnosticCollector(line => t.diagnostic(line));
+    const fixture = await createFixture({ beforePublish: directory => {
+      capturePathSnapshot({ family: "integrity", caseId: "integrity-control", directory }, collector);
+      try { t.diagnostic(`CI path diagnostics incomplete=${collector.incomplete}`); } catch { /* Informational only. */ }
+    } });
     const sourceBefore = databaseSha256(fixture.sourcePath);
     const generationBefore = databaseSha256(fixture.databasePath);
     assert.equal(fixture.manifest.databaseSha256, generationBefore);

@@ -25,6 +25,7 @@ import { ProjectStoreExecutor } from "../src/orchestrator/runtime/project-store-
 import { EventAppendTransaction } from "../src/orchestrator/storage/event-append-transaction.js";
 import { LifecycleCommandStore } from "../src/orchestrator/lifecycle/lifecycle-command.store.js";
 import { lifecycleEnvelope } from "./fixtures/fresh-start-admission-child.js";
+import { capturePathSnapshot, createCiDiagnosticCollector } from "./support/ci-path-diagnostics.js";
 
 function child(path: string, mode: string, gate: string) {
   const process = fork(fileURLToPath(new URL("./fixtures/fresh-start-admission-child.js", import.meta.url)), [path, mode, gate], { stdio: ["ignore", "ignore", "pipe", "ipc"] });
@@ -89,7 +90,7 @@ it("recovery waits for a real held writer and records its committed tail", async
   } finally { for (const item of owned) await closeChild(item.process); fixture.cleanup(); }
 });
 
-for (const variant of ["valid", "missing-inspector", "missing-context", "missing-receipt", "wrong-schema", "wrong-build", "wrong-release", "stale-generation"] as const) it(`worker opening independently checks fresh context: ${variant}`, async () => {
+for (const variant of ["valid", "missing-inspector", "missing-context", "missing-receipt", "wrong-schema", "wrong-build", "wrong-release", "stale-generation"] as const) it(`worker opening independently checks fresh context: ${variant}`, async (t) => {
   const fixture = variant === "missing-receipt" ? freshStore() : await active(variant === "wrong-schema" ? { ...release, schemaIdentityHash: "b".repeat(64) } : release);
   const path = fixture.connection.prepare("PRAGMA database_list").get()?.file as string;
   const backend = new ProjectStoreWorkerBackend({ selfUrl: new URL("../src/workers/project-store.worker.js", import.meta.url), executorLeaseMs: 15000, appendRetryDeadlineMs: 1000,
@@ -98,6 +99,11 @@ for (const variant of ["valid", "missing-inspector", "missing-context", "missing
     const request = decodeWorkerRequest({ id: "open", type: "open", binding: encodeWorkerBinding(context(dirname(path), path)), ...(variant === "missing-context" ? {} : { freshStart: {
       ...trusted, generation: variant === "stale-generation" ? "0" : "1", releaseId: variant === "wrong-release" ? randomUUID() : release.releaseId } }) });
     if (variant === "valid") {
+      // Both roles are derived from PRAGMA's file spelling in the parent; neither proves child-local truth.
+      const collector = createCiDiagnosticCollector(line => t.diagnostic(line));
+      capturePathSnapshot({ family: "fresh-admission", caseId: "admission-control", directory: dirname(path) }, collector);
+      capturePathSnapshot({ family: "fresh-admission", caseId: "path-control", directory: path }, collector);
+      try { t.diagnostic(`CI path diagnostics incomplete=${collector.incomplete}`); } catch { /* Informational only. */ }
       const result = await backend.dispatch(request);
       assert.equal((result as { freshStart: { generation: string } }).freshStart.generation, "1");
     } else await assert.rejects(backend.dispatch(request), { code: ({ "missing-inspector": "FRESH_START_CONTEXT_REQUIRED", "missing-context": "FRESH_START_CONTEXT_REQUIRED", "missing-receipt": "FRESH_START_NOT_INITIALIZED", "wrong-schema": "FRESH_START_SCHEMA_MISMATCH", "wrong-build": "FRESH_START_BUILD_MISMATCH", "wrong-release": "FRESH_START_RELEASE_MISMATCH", "stale-generation": "FRESH_START_ADMISSION_STALE" } as const)[variant] });

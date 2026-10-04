@@ -62,6 +62,7 @@ import { PROJECT_MEMORY_APPLICATION_ID } from "../src/orchestrator/runtime/runti
 import { canonicalJson } from "../src/orchestrator/serialization/canonical-json.js";
 import { NodeSqliteDriver } from "../src/orchestrator/storage/node-sqlite-driver.js";
 import { GENESIS_GLOBAL_HASH } from "../src/orchestrator/storage/event-store.js";
+import { capturePathSnapshot, createCiDiagnosticCollector } from "./support/ci-path-diagnostics.js";
 
 const PROJECT_ID = "1".repeat(64) as ProjectId;
 const VAULT_ID = "2".repeat(64) as VaultId;
@@ -356,36 +357,51 @@ class SwapAfterV2EvaluatorLeaseRegistry extends V2ProjectionReaderLeaseRegistry 
 }
 
 describe("projection build coordinator", () => {
-  it("adopts a staged V2 generation before publishing its manifest authority", async () => {
+  it("adopts a staged V2 generation before publishing its manifest authority", async (t) => {
     const root = mkdtempSync(join(tmpdir(), "projection-v2-adoption-"));
     roots.push(root);
     const sourcePath = join(root, "events.sqlite");
     const projectionDirectory = join(root, "projections");
     const source = sourceDatabase(sourcePath);
-    append(source, 1);
-    const driver = new NodeSqliteDriver({ DatabaseSync });
-    const coordinator = new V2ProjectionBuildCoordinator({
-      projectionDirectory,
-      eventReader: new SqliteProjectionEventReader({ driver, eventStorePath: sourcePath }),
-      builder: new ImmutableProjectionBuilder({ driver, projectionDirectory, now: () => NOW }),
-    });
+    const collector = createCiDiagnosticCollector(line => t.diagnostic(line));
+    let primaryFailed = false;
+    try {
+      append(source, 1);
+      const driver = new NodeSqliteDriver({ DatabaseSync });
+      const coordinator = new V2ProjectionBuildCoordinator({
+        projectionDirectory,
+        eventReader: new SqliteProjectionEventReader({ driver, eventStorePath: sourcePath }),
+        builder: new ImmutableProjectionBuilder({ driver, projectionDirectory, now: () => NOW }),
+      });
 
-    const published = await coordinator.ensurePublished(BINDING, 1n, FUNCTIONAL_TEST_DEADLINE_MS);
-    assert.equal(published.manifest.schemaVersion, 2);
-    assert.equal(published.manifest.databaseFile, "projections-2-1.sqlite");
-    assert.equal(existsSync(published.databasePath), true);
-    assert.equal(
-      parseProjectionManifestV2(
-        JSON.parse(readFileSync(join(projectionDirectory, "projection-manifest.json"), "utf8")),
-        BINDING,
-      ).databaseSha256,
-      published.manifest.databaseSha256,
-    );
-    assert.deepEqual(
-      readdirSync(projectionDirectory).filter((name) => name.startsWith(".projections-2-")),
-      [],
-    );
-    source.close();
+      capturePathSnapshot({ family: "coordinator", caseId: "coordinator-control", directory: projectionDirectory }, collector);
+      const published = await coordinator.ensurePublished(BINDING, 1n, FUNCTIONAL_TEST_DEADLINE_MS);
+      assert.equal(published.manifest.schemaVersion, 2);
+      assert.equal(published.manifest.databaseFile, "projections-2-1.sqlite");
+      assert.equal(existsSync(published.databasePath), true);
+      assert.equal(
+        parseProjectionManifestV2(
+          JSON.parse(readFileSync(join(projectionDirectory, "projection-manifest.json"), "utf8")),
+          BINDING,
+        ).databaseSha256,
+        published.manifest.databaseSha256,
+      );
+      assert.deepEqual(
+        readdirSync(projectionDirectory).filter((name) => name.startsWith(".projections-2-")),
+        [],
+      );
+    } catch (error) { primaryFailed = true; throw error; }
+    finally {
+      let closed = false;
+      try { source.close(); closed = true; }
+      catch (error) { if (!primaryFailed) throw error; }
+      finally {
+        try {
+          t.diagnostic(`CI path diagnostics incomplete=${collector.incomplete}`);
+          t.diagnostic(`owned source closure=${closed ? "closed" : "unavailable"}`);
+        } catch { /* Reporting cannot replace the primary outcome or prevent closure. */ }
+      }
+    }
   });
 
   it("reconciles a positively identified V2 orphan after an install-before-manifest fault", async () => {
