@@ -127,6 +127,9 @@ it("the lifecycle authority callback remains fenced with an injected append-port
 });
 async function active(installedRelease = release) {
   const fixture = freshStore();
+  return { ...fixture, ...await initializeActive(fixture, installedRelease) };
+}
+async function initializeActive(fixture: ReturnType<typeof freshStore>, installedRelease: typeof release) {
   const repository = new SqliteFreshStartRepository(fixture.connection);
   repository.transact(FRESH_IDENTITY, tx => tx.install(freshGenesis(), installedRelease));
   const approvals = new TrustedOperatorApprovalVerifier(async (_bytes, requestDigest) => ({ identity: FRESH_IDENTITY,
@@ -135,21 +138,13 @@ async function active(installedRelease = release) {
   await control.transition({ identity: FRESH_IDENTITY, expectedGeneration: 0n, expectedMode: "prepared", expectedReleaseId: installedRelease.releaseId, nextMode: "active", nextRelease: installedRelease, approvalEnvelope: new Uint8Array([1]) });
   bindFreshStartAdmissionContext(fixture.connection, trusted);
   const store = new EventStore(fixture.connection, new SqliteEventStoreStatements(fixture.connection), new MaintenanceFence(), new BranchScopeRepository(), () => FRESH_NOW);
-  return { ...fixture, repository, control, store };
+  return { repository, control, store };
 }
 
 async function activeSpelling(spelling: "raw" | "native") {
   const fixture = freshStoreSpellingFixture(spelling);
   try {
-    const repository = new SqliteFreshStartRepository(fixture.connection);
-    repository.transact(FRESH_IDENTITY, tx => tx.install(freshGenesis(), release));
-    const approvals = new TrustedOperatorApprovalVerifier(async (_bytes, requestDigest) => ({ identity: FRESH_IDENTITY,
-      approvalId: randomUUID(), nonceDigest: randomUUID().replaceAll("-", "").repeat(2), actorFingerprint: "2".repeat(64), requestDigest, evidenceDigest: release.evidenceDigest }));
-    const control = new FreshStartControlPlane(repository, approvals, new TrustedFreshStartEvidenceVerifier(async value => value));
-    await control.transition({ identity: FRESH_IDENTITY, expectedGeneration: 0n, expectedMode: "prepared", expectedReleaseId: release.releaseId, nextMode: "active", nextRelease: release, approvalEnvelope: new Uint8Array([1]) });
-    bindFreshStartAdmissionContext(fixture.connection, trusted);
-    const store = new EventStore(fixture.connection, new SqliteEventStoreStatements(fixture.connection), new MaintenanceFence(), new BranchScopeRepository(), () => FRESH_NOW);
-    return { ...fixture, repository, control, store };
+    return { ...fixture, ...await initializeActive(fixture, release) };
   } catch (primary) {
     // Preserve the initialization failure even if its independent closure is incomplete.
     try { fixture.closeConnection(); fixture.cleanup(); } catch { /* Retain uncertain root. */ }
