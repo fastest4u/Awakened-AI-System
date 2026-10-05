@@ -2,6 +2,8 @@
 
 **Status:** The human approved conversational option A, this written specification and its [written implementation plan](../plans/2026-10-04-v2-build-installation-policy-a.md) on 2026-10-04. The plan's separate approval permits named local Subagent-Driven implementation and owned verification; it does not establish completion or authorize publication, hosted execution or PROD activation.
 
+On2026-10-05 the human explicitly approved adding only `tests/ci-release-identity.test.ts` and `tests/ci-workflow-roles.test.ts` for the two Task4 downstream fixture findings. This amendment aligns independent fixtures, installation outcome/binding lists and mutation anchors with the already-approved contract; it does not change production behavior, gates, dependencies, test-profile membership or external-action authority. Task4 remains pending covering verification and scoped re-review.
+
 **Outcome:** Prevent esbuild's optional CLI hardlink optimization during locked dependency installation, replace the omitted setup assurance with a reviewed capability check, and retain the existing single-link build contract. This is the next CI remediation slice for fresh empty V2, not whole-system PROD qualification.
 
 ## Evidence and limits
@@ -108,6 +110,7 @@ The later plan may change only the following owners for this slice:
 - `scripts/build.js` and `scripts/run-v2-shadow-migration-rehearsal.js` for private assertion wiring, the one new recipe input and unchanged finalization enforcement.
 - `.github/workflows/ci.yml`, `.github/workflows/v2-release-qualification.yml`, `.github/workflows/v2-legacy-regression.yml` and `.github/workflows/sqlite-stress.yml`, solely for exact installation gates/commands and the corresponding release outcome checks.
 - `tests/support/ci-workflow-contract.ts`, `tests/ci-lifecycle-gates.test.ts`, `tests/ci-fresh-start-foundation.test.ts` and `tests/v2-shadow-migration-rehearsal.test.ts`, solely for installation grammar, identity/finalization and focused controls. Foundation's relative product-gate order remains unchanged.
+- `tests/ci-release-identity.test.ts` and `tests/ci-workflow-roles.test.ts`, solely for the authorized Task4 downstream independent fixture/outcome/binding/mutation-anchor alignment. Preserve existing positive acceptance, precise negative refusal boundaries and all six recorder phases.
 - `docs/runbooks/v2-ci-qualification.md` and `docs/v2-fresh-start-operations.md` for the verified installation procedure and its qualification limits.
 - This design and its two parent specifications, then a separate reviewed implementation plan.
 
