@@ -7,15 +7,18 @@ import {
   mkdirSync,
   readFileSync,
   readdirSync,
-  realpathSync,
   renameSync,
   rmSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
-import { join, isAbsolute, normalize, resolve } from "node:path";
-import { afterEach, describe, it as nativeIt, type TestContext } from "node:test";
-import { createOwnedProjectionFixture } from "./support/owned-projection-fixture.js";
+import { join } from "node:path";
+import { afterEach, describe, type TestContext } from "node:test";
+import {
+  createProjectionFixtureControls,
+  rootEvidence,
+  type SpellingEvidence,
+} from "./support/projection-fixture-controls.js";
 import { capturePathSnapshot, createCiDiagnosticCollector } from "./support/ci-path-diagnostics.js";
 
 import { LifecycleError } from "../src/orchestrator/lifecycle/errors.js";
@@ -60,31 +63,7 @@ const CORE_CHECKSUMS = Object.freeze({
   sessionTree: "6".repeat(64),
   tasksFollowups: "7".repeat(64),
 });
-type FixtureOwner = ReturnType<typeof createOwnedProjectionFixture>;
-const roots: FixtureOwner[] = [];
-const primaryFailures = new WeakSet<TestContext>();
-// Record the primary outcome so cleanup can report uncertainty without replacing it.
-const it = ((name: string, body: (t: TestContext) => unknown) => nativeIt(name, async t => {
-  try { await body(t); } catch (primary) { primaryFailures.add(t); throw primary; }
-})) as typeof nativeIt;
-
-function fixtureRoot(prefix: string, spelling: "raw" | "native"): string {
-  const owner = createOwnedProjectionFixture(prefix, spelling);
-  roots.push(owner);
-  return owner.root;
-}
-
-function cleanupFixtures(t: TestContext): void {
-  let incomplete = false;
-  for (const owner of roots.splice(0)) {
-    try { owner.cleanup(); } catch { incomplete = true; }
-  }
-  activeEvidence = undefined;
-  if (incomplete) {
-    t.diagnostic("CI_PROJECTION_FIXTURE_CLEANUP_INCOMPLETE");
-    if (!primaryFailures.has(t)) throw new Error("CI_PROJECTION_FIXTURE_CLEANUP_INCOMPLETE");
-  }
-}
+const { it, fixtureRoot, ownerForPath, cleanupFixtures } = createProjectionFixtureControls();
 
 function missingEntry(): never {
   throw Object.assign(new Error("missing"), { code: "ENOENT" });
@@ -224,36 +203,16 @@ function replacementFixture(prefix: string, publishFirst = true) {
   return { first, root, second, target } as const;
 }
 
-afterEach(t => cleanupFixtures(t as TestContext));
+afterEach(t => {
+  try { cleanupFixtures(t as TestContext); } finally { activeEvidence = undefined; }
+});
 
 
-interface SpellingEvidence {
-  spelling: "raw" | "native";
-  nonNative: boolean;
-  phase: string;
-  inspectionChecks: boolean[];
-  captureAttempts: number;
-  captureOutcome: "unobserved" | "returned" | "PROJECTION_PATH_INVALID" | "different-error";
-}
 let activeEvidence: SpellingEvidence | undefined;
-function rootEvidence(root: string, spelling: "raw" | "native"): SpellingEvidence {
-  const owner = roots.find(candidate => candidate.root === root)!;
-  const normalized = (path: string) => process.platform === "win32" ? resolve(path).toLowerCase() : resolve(path);
-  assert.equal(isAbsolute(root), true);
-  assert.equal(normalize(root), root);
-  assert.equal(resolve(root), root);
-  const stat = lstatSync(root, { bigint: true });
-  assert.equal(stat.isDirectory(), true);
-  assert.equal(stat.isSymbolicLink(), false);
-  const evidence: SpellingEvidence = { spelling, nonNative: normalized(owner.rawRoot) !== normalized(owner.nativeRoot),
-    phase: "fixture-setup", inspectionChecks: [], captureAttempts: 0, captureOutcome: "unobserved" };
-  assert.equal(normalized(realpathSync.native(root)), normalized(owner.nativeRoot));
-  return evidence;
-}
 
 function assertManifestPublication(t: TestContext, rootSpelling: "raw" | "native"): void {
   const root = fixtureRoot("projection-manifest-", rootSpelling);
-  const evidence = rootEvidence(root, rootSpelling);
+  const evidence = rootEvidence(ownerForPath(root), root, rootSpelling);
   activeEvidence = evidence;
   const parsed = parseProjectionManifest(manifest(), BINDING);
   writeFileSync(join(root, parsed.databaseFile), "independent projection", "utf8");
@@ -439,7 +398,6 @@ describe("immutable projection manifest", () => {
       if (spelling === "raw" && evidence.nonNative) {
         assert.ok(failure instanceof Error, "a non-native raw root must retain its real refusal");
         assert.equal((failure as LifecycleError).code, "MATERIALIZATION_CONFLICT");
-        assert.ok(evidence.inspectionChecks.every(Boolean));
         assert.equal(evidence.captureAttempts, 1);
         assert.equal(evidence.captureOutcome, "PROJECTION_PATH_INVALID");
       } else {

@@ -12,10 +12,17 @@ import {
   truncateSync,
   writeFileSync,
 } from "node:fs";
-import { join, relative, isAbsolute, normalize, resolve } from "node:path";
+import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { afterEach, describe, it as nativeIt, type TestContext } from "node:test";
-import { createOwnedProjectionFixture } from "./support/owned-projection-fixture.js";
+import { afterEach, describe, type TestContext } from "node:test";
+import {
+  createProjectionFixtureControls,
+  rootEvidence,
+  forwardingInspection,
+  assertRawProjectionRefusal,
+  samePathSpelling,
+  type SpellingEvidence,
+} from "./support/projection-fixture-controls.js";
 
 import { eventHash, payloadHash } from "../src/orchestrator/crypto/event-hash.js";
 import type {
@@ -81,57 +88,10 @@ const BINDING: ProjectBinding = Object.freeze({
   sessionId: null,
 });
 
-type FixtureOwner = ReturnType<typeof createOwnedProjectionFixture>;
-const roots: FixtureOwner[] = [];
-const primaryFailures = new WeakSet<TestContext>();
-// Record the primary outcome so cleanup can report uncertainty without replacing it.
-const it = ((name: string, body: (t: TestContext) => unknown) => nativeIt(name, async t => {
-  try { await body(t); } catch (primary) { primaryFailures.add(t); throw primary; }
-})) as typeof nativeIt;
-
-function fixtureRoot(prefix: string, spelling: "raw" | "native"): string {
-  const owner = createOwnedProjectionFixture(prefix, spelling);
-  roots.push(owner);
-  return owner.root;
-}
-
-function cleanupFixtures(t: TestContext): void {
-  let incomplete = false;
-  for (const owner of roots.splice(0)) {
-    try { owner.cleanup(); } catch { incomplete = true; }
-  }
-  activeEvidence = undefined;
-  if (incomplete) {
-    t.diagnostic("CI_PROJECTION_FIXTURE_CLEANUP_INCOMPLETE");
-    if (!primaryFailures.has(t)) throw new Error("CI_PROJECTION_FIXTURE_CLEANUP_INCOMPLETE");
-  }
-}
-
-const resourceClosers = new WeakMap<object, () => void>();
-function ownerForPath(path: string): FixtureOwner {
-  const owner = roots.find(candidate => [candidate.rawRoot, candidate.nativeRoot].some(root => {
-    const descendant = relative(root, path);
-    return descendant === "" || (!isAbsolute(descendant) && descendant !== ".." && !descendant.startsWith(`..${process.platform === "win32" ? "\\" : "/"}`));
-  }));
-  if (owner === undefined) throw new Error("CI_PROJECTION_FIXTURE_ROOT_INVALID");
-  return owner;
-}
-function trackResource<T extends { close(): void }>(resource: T, path: string): T {
-  const owner = ownerForPath(path);
-  resourceClosers.set(resource, owner.closeWith(() => resource.close()));
-  return resource;
-}
-function closeOwned(resource: { close(): void }): void {
-  const close = resourceClosers.get(resource);
-  if (close === undefined) throw new Error("CI_PROJECTION_FIXTURE_UNREGISTERED_RESOURCE");
-  close();
-}
-function fixtureDatabase(path: string, options?: ConstructorParameters<typeof DatabaseSync>[1]): DatabaseSync {
-  const owner = ownerForPath(path);
-  try { return trackResource(options === undefined ? new DatabaseSync(path) : new DatabaseSync(path, options), path); }
-  catch (primary) { owner.retain(); throw primary; }
-}
-afterEach(t => cleanupFixtures(t as TestContext));
+const { it, fixtureRoot, ownerForPath, cleanupFixtures, roots, trackResource, closeOwned, fixtureDatabase } = createProjectionFixtureControls();
+afterEach(t => {
+  try { cleanupFixtures(t as TestContext); } finally { activeEvidence = undefined; }
+});
 
 function sourceDatabase(path: string): DatabaseSync {
   const database = fixtureDatabase(path);
@@ -405,47 +365,11 @@ class SwapAfterV2EvaluatorLeaseRegistry extends V2ProjectionReaderLeaseRegistry 
 }
 
 
-interface SpellingEvidence {
-  spelling: "raw" | "native";
-  nonNative: boolean;
-  phase: string;
-  inspectionChecks: boolean[];
-  captureAttempts: number;
-  captureOutcome: "unobserved" | "returned" | "PROJECTION_PATH_INVALID" | "different-error";
-}
 let activeEvidence: SpellingEvidence | undefined;
-function rootEvidence(root: string, spelling: "raw" | "native"): SpellingEvidence {
-  const owner = roots.find(candidate => candidate.root === root)!;
-  const normalized = (path: string) => process.platform === "win32" ? resolve(path).toLowerCase() : resolve(path);
-  assert.equal(isAbsolute(root), true);
-  assert.equal(normalize(root), root);
-  assert.equal(resolve(root), root);
-  const stat = lstatSync(root, { bigint: true });
-  assert.equal(stat.isDirectory(), true);
-  assert.equal(stat.isSymbolicLink(), false);
-  const evidence: SpellingEvidence = { spelling, nonNative: normalized(owner.rawRoot) !== normalized(owner.nativeRoot),
-    phase: "fixture-setup", inspectionChecks: [], captureAttempts: 0, captureOutcome: "unobserved" };
-  assert.equal(normalized(realpathSync.native(root)), normalized(owner.nativeRoot));
-  return evidence;
-}
-function forwardingInspection(evidence: SpellingEvidence, directory: string): ProjectionPathInspection {
-  return {
-    lstat(path) {
-      const stat = lstatSync(path);
-      if (path === directory || path === resolve(directory, "..")) evidence.inspectionChecks.push(stat.isDirectory() && !stat.isSymbolicLink());
-      return stat;
-    },
-    realpath(path) {
-      const actual = realpathSync(path);
-      if (path === directory || path === resolve(directory, "..")) evidence.inspectionChecks.push((process.platform === "win32" ? resolve(actual).toLowerCase() === resolve(path).toLowerCase() : resolve(actual) === resolve(path)));
-      return actual;
-    },
-  };
-}
 
 async function assertV2Adoption(t: TestContext, rootSpelling: "raw" | "native"): Promise<void> {
   const root = fixtureRoot("projection-v2-adoption-", rootSpelling);
-  const evidence = rootEvidence(root, rootSpelling);
+  const evidence = rootEvidence(ownerForPath(root), root, rootSpelling);
   activeEvidence = evidence;
   const sourcePath = join(root, "events.sqlite");
   const projectionDirectory = join(root, "projections");
@@ -518,7 +442,7 @@ describe("projection build coordinator", () => {
       assert.equal(closeAttempts, 1, "setup failure must attempt its acquired native close");
       assert.equal(nativeClosed, true, "injected uncertainty follows a returned native close");
       assert.equal(typeof acquiredPath === "string" && [ownerForPath(root).rawRoot, ownerForPath(root).nativeRoot].some(ownedRoot =>
-        resolve(join(ownedRoot, "events.sqlite")).toLowerCase() === resolve(acquiredPath as string).toLowerCase()), true,
+        samePathSpelling(join(ownedRoot, "events.sqlite"), acquiredPath as string)), true,
       "source opened against a previously proved spelling of the original owned root");
       assert.throws(() => ownerForPath(root).cleanup(), /CI_PROJECTION_FIXTURE_CLEANUP_INCOMPLETE/u);
       assert.equal(existsSync(root), true, "uncertain fixture remains owned and retained");
@@ -538,10 +462,7 @@ describe("projection build coordinator", () => {
       const evidence = activeEvidence!;
       t.diagnostic(`spelling=${spelling} nonNative=${evidence.nonNative} phase=${evidence.phase} inspectionChecks=${JSON.stringify(evidence.inspectionChecks)} captureAttempts=${evidence.captureAttempts} captureOutcome=${evidence.captureOutcome}`);
       if (spelling === "raw" && evidence.nonNative) {
-        assert.ok(failure instanceof Error, "a non-native raw root must retain its real refusal");
-        assert.equal(failure.message, "PROJECTION_PATH_INVALID");
-        assert.ok(evidence.inspectionChecks.every(Boolean));
-        assert.equal(evidence.captureOutcome, "unobserved", "inspection observations do not claim a private stable capture");
+        assertRawProjectionRefusal(failure, evidence);
       } else {
         if (failure !== undefined) throw failure;
         assert.equal(evidence.phase, "business-assertions-completed");
