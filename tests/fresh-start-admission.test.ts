@@ -229,6 +229,8 @@ it("CI fresh default fixture: native spelling before open and owned marker clean
 
 it("CI fresh default fixture: redirected lookup refuses before open", t => {
   const outside = freshStore(), outsidePath = dirname(outside.connection.prepare("PRAGMA database_list").get()!.file as string);
+  const sentinel = join(outsidePath, "outside-sentinel");
+  writeFileSync(sentinel, "preserved");
   const creation = defaultCreation(t);
   let opened = false;
   const openHook = t.mock.method(NodeSqliteDriver.prototype, "open", () => { opened = true; throw new Error("unreachable open"); });
@@ -238,27 +240,32 @@ it("CI fresh default fixture: redirected lookup refuses before open", t => {
     assert.equal(opened, false);
     assertDefaultOwner(creation.owner());
     assert.equal(existsSync(join(creation.owner().path, "events.sqlite")), false);
+    assert.equal(readFileSync(sentinel, "utf8"), "preserved");
   } finally { nativeHook.mock.restore(); openHook.mock.restore(); creation.restore(); outside.cleanup(); }
 });
 
 for (const replacement of ["directory", "junction"] as const) it(`CI fresh default fixture: ${replacement} replacement preserves sentinel`, t => {
-  const creation = defaultCreation(t), fixture = freshStore(), owner = creation.owner(); creation.restore();
-  const outside = freshStore(), outsidePath = resolve(realpathSync.native(dirname(outside.connection.prepare("PRAGMA database_list").get()!.file as string)));
-  const moved = join(outsidePath, "original");
-  const nativeRoot = resolve(realpathSync.native(owner.path));
-  const sentinel = join(replacement === "directory" ? nativeRoot : outsidePath, "sentinel");
-  let replacementIdentity: BigIntStats | undefined;
-  let restored = false;
-  const close = fixture.connection.close.bind(fixture.connection);
-  const closeHook = t.mock.method(fixture.connection, "close", () => {
-    close(); assertDefaultOwner(owner);
-    renameSync(nativeRoot, moved);
-    if (replacement === "directory") mkdirSync(nativeRoot);
-    else symlinkSync(outsidePath, nativeRoot, process.platform === "win32" ? "junction" : "dir");
-    replacementIdentity = lstatSync(nativeRoot, { bigint: true });
-    writeFileSync(sentinel, "preserved");
-  });
+  const creation = defaultCreation(t);
+  let acquiredFixture: ReturnType<typeof freshStore> | undefined, outside: ReturnType<typeof freshStore> | undefined;
+  let restoreClose: (() => void) | undefined, restored = false;
   try {
+    const fixture = freshStore(); acquiredFixture = fixture;
+    const owner = creation.owner(); creation.restore();
+    outside = freshStore();
+    const outsidePath = resolve(realpathSync.native(dirname(outside.connection.prepare("PRAGMA database_list").get()!.file as string)));
+    const moved = join(outsidePath, "original"), nativeRoot = resolve(realpathSync.native(owner.path));
+    const sentinel = join(replacement === "directory" ? nativeRoot : outsidePath, "sentinel");
+    let replacementIdentity: BigIntStats | undefined;
+    const close = fixture.connection.close.bind(fixture.connection);
+    const closeHook = t.mock.method(fixture.connection, "close", () => {
+      close(); assertDefaultOwner(owner);
+      renameSync(nativeRoot, moved);
+      if (replacement === "directory") mkdirSync(nativeRoot);
+      else symlinkSync(outsidePath, nativeRoot, process.platform === "win32" ? "junction" : "dir");
+      replacementIdentity = lstatSync(nativeRoot, { bigint: true });
+      writeFileSync(sentinel, "preserved");
+    });
+    restoreClose = () => closeHook.mock.restore();
     assert.throws(() => fixture.cleanup(), { code: "CI_FRESH_STORE_CLEANUP_INCOMPLETE", message: "CI_FRESH_STORE_CLEANUP_INCOMPLETE" });
     assert.equal(defaultConnectionClosed(fixture), true); assert.ok(replacementIdentity);
     assert.equal(readFileSync(sentinel, "utf8"), "preserved");
@@ -270,9 +277,9 @@ for (const replacement of ["directory", "junction"] as const) it(`CI fresh defau
     assert.throws(() => fixture.cleanup(), { code: "CI_FRESH_STORE_CLEANUP_INCOMPLETE" });
     t.diagnostic("original connection closed; restored original root retained after ownership uncertainty");
   } finally {
-    closeHook.mock.restore(); creation.restore();
-    if (!defaultConnectionClosed(fixture)) fixture.connection.close();
-    if (restored) outside.cleanup(); else outside.connection.close();
+    restoreClose?.(); creation.restore();
+    if (acquiredFixture && !defaultConnectionClosed(acquiredFixture)) acquiredFixture.connection.close();
+    if (outside) { if (restored) outside.cleanup(); else if (!defaultConnectionClosed(outside)) outside.connection.close(); }
   }
 });
 
@@ -298,14 +305,22 @@ it("CI fresh default fixture: open failure preserves primary and retains origina
 });
 
 it("CI fresh default fixture: connection close failure stays primary and retains root", t => {
-  const creation = defaultCreation(t), fixture = freshStore(), owner = creation.owner(); creation.restore();
-  const primary = new Error("owned close fault"), hook = t.mock.method(fixture.connection, "close", () => { throw primary; });
+  const creation = defaultCreation(t);
+  let acquiredFixture: ReturnType<typeof freshStore> | undefined, restoreClose: (() => void) | undefined;
   try {
+    const fixture = freshStore(); acquiredFixture = fixture;
+    const owner = creation.owner(); creation.restore();
+    const primary = new Error("owned close fault"), hook = t.mock.method(fixture.connection, "close", () => { throw primary; });
+    restoreClose = () => hook.mock.restore();
     assert.throws(() => fixture.cleanup(), error => error === primary); assertDefaultOwner(owner);
-  } finally { hook.mock.restore(); creation.restore(); fixture.connection.close(); }
-  assert.equal(defaultConnectionClosed(fixture), true);
-  assert.throws(() => fixture.cleanup(), { code: "CI_FRESH_STORE_CLEANUP_INCOMPLETE", message: "CI_FRESH_STORE_CLEANUP_INCOMPLETE" });
-  assertDefaultOwner(owner);
+    restoreClose(); fixture.connection.close();
+    assert.equal(defaultConnectionClosed(fixture), true);
+    assert.throws(() => fixture.cleanup(), { code: "CI_FRESH_STORE_CLEANUP_INCOMPLETE", message: "CI_FRESH_STORE_CLEANUP_INCOMPLETE" });
+    assertDefaultOwner(owner);
+  } finally {
+    restoreClose?.(); creation.restore();
+    if (acquiredFixture && !defaultConnectionClosed(acquiredFixture)) acquiredFixture.connection.close();
+  }
 });
 
 it("CI fresh default fixture: schema primary survives failed close with root retained", t => {
