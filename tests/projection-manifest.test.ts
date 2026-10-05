@@ -4,18 +4,18 @@ import { createHash } from "node:crypto";
 import {
   existsSync,
   lstatSync,
-  mkdtempSync,
   mkdirSync,
   readFileSync,
   readdirSync,
+  realpathSync,
   renameSync,
   rmSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { afterEach, describe, it } from "node:test";
+import { join, isAbsolute, normalize, resolve } from "node:path";
+import { afterEach, describe, it as nativeIt, type TestContext } from "node:test";
+import { createOwnedProjectionFixture } from "./support/owned-projection-fixture.js";
 import { capturePathSnapshot, createCiDiagnosticCollector } from "./support/ci-path-diagnostics.js";
 
 import { LifecycleError } from "../src/orchestrator/lifecycle/errors.js";
@@ -60,7 +60,31 @@ const CORE_CHECKSUMS = Object.freeze({
   sessionTree: "6".repeat(64),
   tasksFollowups: "7".repeat(64),
 });
-const roots: string[] = [];
+type FixtureOwner = ReturnType<typeof createOwnedProjectionFixture>;
+const roots: FixtureOwner[] = [];
+const primaryFailures = new WeakSet<TestContext>();
+// Record the primary outcome so cleanup can report uncertainty without replacing it.
+const it = ((name: string, body: (t: TestContext) => unknown) => nativeIt(name, async t => {
+  try { await body(t); } catch (primary) { primaryFailures.add(t); throw primary; }
+})) as typeof nativeIt;
+
+function fixtureRoot(prefix: string, spelling: "raw" | "native"): string {
+  const owner = createOwnedProjectionFixture(prefix, spelling);
+  roots.push(owner);
+  return owner.root;
+}
+
+function cleanupFixtures(t: TestContext): void {
+  let incomplete = false;
+  for (const owner of roots.splice(0)) {
+    try { owner.cleanup(); } catch { incomplete = true; }
+  }
+  activeEvidence = undefined;
+  if (incomplete) {
+    t.diagnostic("CI_PROJECTION_FIXTURE_CLEANUP_INCOMPLETE");
+    if (!primaryFailures.has(t)) throw new Error("CI_PROJECTION_FIXTURE_CLEANUP_INCOMPLETE");
+  }
+}
 
 function missingEntry(): never {
   throw Object.assign(new Error("missing"), { code: "ENOENT" });
@@ -183,8 +207,7 @@ function projectionManifest(generation: number) {
 }
 
 function replacementFixture(prefix: string, publishFirst = true) {
-  const root = mkdtempSync(join(tmpdir(), prefix));
-  roots.push(root);
+  const root = fixtureRoot(prefix, "raw");
   const first = projectionManifest(1);
   const second = projectionManifest(2);
   for (const candidate of [first, second]) {
@@ -201,9 +224,102 @@ function replacementFixture(prefix: string, publishFirst = true) {
   return { first, root, second, target } as const;
 }
 
-afterEach(() => {
-  for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
-});
+afterEach(t => cleanupFixtures(t as TestContext));
+
+
+interface SpellingEvidence {
+  spelling: "raw" | "native";
+  nonNative: boolean;
+  phase: string;
+  inspectionChecks: boolean[];
+  captureAttempts: number;
+  captureOutcome: "unobserved" | "returned" | "PROJECTION_PATH_INVALID" | "different-error";
+}
+let activeEvidence: SpellingEvidence | undefined;
+function rootEvidence(root: string, spelling: "raw" | "native"): SpellingEvidence {
+  const owner = roots.find(candidate => candidate.root === root)!;
+  const normalized = (path: string) => process.platform === "win32" ? resolve(path).toLowerCase() : resolve(path);
+  assert.equal(isAbsolute(root), true);
+  assert.equal(normalize(root), root);
+  assert.equal(resolve(root), root);
+  const stat = lstatSync(root, { bigint: true });
+  assert.equal(stat.isDirectory(), true);
+  assert.equal(stat.isSymbolicLink(), false);
+  const evidence: SpellingEvidence = { spelling, nonNative: normalized(owner.rawRoot) !== normalized(owner.nativeRoot),
+    phase: "fixture-setup", inspectionChecks: [], captureAttempts: 0, captureOutcome: "unobserved" };
+  assert.equal(normalized(realpathSync.native(root)), normalized(owner.nativeRoot));
+  return evidence;
+}
+
+function assertManifestPublication(t: TestContext, rootSpelling: "raw" | "native"): void {
+  const root = fixtureRoot("projection-manifest-", rootSpelling);
+  const evidence = rootEvidence(root, rootSpelling);
+  activeEvidence = evidence;
+  const parsed = parseProjectionManifest(manifest(), BINDING);
+  writeFileSync(join(root, parsed.databaseFile), "independent projection", "utf8");
+  const expected = `${JSON.stringify({
+    branchRef: BINDING.branchRef,
+    branchScopeId: BINDING.branchScopeId,
+    coreChecksums: CORE_CHECKSUMS,
+    createdAt: "2026-08-23T02:00:00.000Z",
+    databaseFile: "projections-1-2.sqlite",
+    databaseSha256: "b".repeat(64),
+    generation: 2,
+    projectId: BINDING.projectId,
+    schemaVersion: 1,
+    sessionId: null,
+    storeId: BINDING.storeId,
+    terminalEventHash: HASH,
+    terminalEventPosition: "17",
+    vaultId: BINDING.vaultId,
+    workspaceId: BINDING.workspaceId,
+  })}\n`;
+
+  assert.equal(Buffer.from(serializeProjectionManifest(parsed)).toString("utf8"), expected);
+  const collector = createCiDiagnosticCollector(line => t.diagnostic(line));
+  capturePathSnapshot({ family: "manifest", caseId: "manifest-control", directory: root }, collector);
+  try { t.diagnostic(`CI path diagnostics incomplete=${collector.incomplete}`); } catch { /* Informational only. */ }
+  evidence.phase = "manifest-publication";
+  const target = publishProjectionManifest({
+    projectionDirectory: root,
+    manifest: parsed,
+    expectedBinding: BINDING,
+  }, { directoryOperations: {
+    ...filesystemStableProjectionDirectoryOperations,
+    capture(directory) {
+      evidence.captureAttempts += 1;
+      try {
+        const identity = filesystemStableProjectionDirectoryOperations.capture(directory);
+        evidence.captureOutcome = "returned";
+        return identity;
+      } catch (original) { evidence.captureOutcome = original instanceof Error && original.message === "PROJECTION_PATH_INVALID" ? "PROJECTION_PATH_INVALID" : "different-error"; throw original; }
+    },
+  } });
+  assert.equal(target, join(root, "projection-manifest.json"));
+  assert.equal(readFileSync(target, "utf8"), expected);
+  assert.equal(lstatSync(target).isSymbolicLink(), false);
+  assert.equal(existsSync(join(root, PROJECTION_MANIFEST_PUBLICATION_LOCK_FILENAME)), false);
+  assert.deepEqual(publicationPrivateEntries(root), []);
+
+  evidence.phase = "business-assertions-completed";
+  const outside = fixtureRoot("projection-manifest-outside-", rootSpelling);
+  const alias = join(root, "alias");
+  try {
+    symlinkSync(outside, alias, "junction");
+  } catch (error) {
+    t.diagnostic(`symlink creation unavailable: ${String(error)}`);
+    return;
+  }
+  assert.throws(
+    () => publishProjectionManifest({
+      projectionDirectory: alias,
+      manifest: parsed,
+      expectedBinding: BINDING,
+    }),
+    /PROJECTION_MANIFEST_PATH_INVALID|MATERIALIZATION_CONFLICT/u,
+  );
+  assert.equal(readFileSync(target, "utf8"), expected);
+}
 
 describe("immutable projection manifest", () => {
   it("parses production UUID project, vault, and store identities with hashed workspace identity", () => {
@@ -312,67 +428,29 @@ describe("immutable projection manifest", () => {
     assert.equal(invoked, false);
   });
 
-  it("serializes canonical bytes and publishes only through a safe projection directory", (t) => {
-    const root = mkdtempSync(join(tmpdir(), "projection-manifest-"));
-    roots.push(root);
-    const parsed = parseProjectionManifest(manifest(), BINDING);
-    writeFileSync(join(root, parsed.databaseFile), "independent projection", "utf8");
-    const expected = `${JSON.stringify({
-      branchRef: BINDING.branchRef,
-      branchScopeId: BINDING.branchScopeId,
-      coreChecksums: CORE_CHECKSUMS,
-      createdAt: "2026-08-23T02:00:00.000Z",
-      databaseFile: "projections-1-2.sqlite",
-      databaseSha256: "b".repeat(64),
-      generation: 2,
-      projectId: BINDING.projectId,
-      schemaVersion: 1,
-      sessionId: null,
-      storeId: BINDING.storeId,
-      terminalEventHash: HASH,
-      terminalEventPosition: "17",
-      vaultId: BINDING.vaultId,
-      workspaceId: BINDING.workspaceId,
-    })}\n`;
+  it("serializes canonical bytes and publishes only through a safe projection directory", t => assertManifestPublication(t, "raw"));
 
-    assert.equal(Buffer.from(serializeProjectionManifest(parsed)).toString("utf8"), expected);
-    const collector = createCiDiagnosticCollector(line => t.diagnostic(line));
-    capturePathSnapshot({ family: "manifest", caseId: "manifest-control", directory: root }, collector);
-    try { t.diagnostic(`CI path diagnostics incomplete=${collector.incomplete}`); } catch { /* Informational only. */ }
-    const target = publishProjectionManifest({
-      projectionDirectory: root,
-      manifest: parsed,
-      expectedBinding: BINDING,
-    });
-    assert.equal(target, join(root, "projection-manifest.json"));
-    assert.equal(readFileSync(target, "utf8"), expected);
-    assert.equal(lstatSync(target).isSymbolicLink(), false);
-    assert.equal(existsSync(join(root, PROJECTION_MANIFEST_PUBLICATION_LOCK_FILENAME)), false);
-    assert.deepEqual(publicationPrivateEntries(root), []);
-
-    const outside = mkdtempSync(join(tmpdir(), "projection-manifest-outside-"));
-    roots.push(outside);
-    const alias = join(root, "alias");
-    try {
-      symlinkSync(outside, alias, "junction");
-    } catch (error) {
-      t.diagnostic(`symlink creation unavailable: ${String(error)}`);
-      return;
+  it("projection spelling control: manifest", async t => {
+    for (const spelling of ["raw", "native"] as const) {
+      let failure: unknown;
+      try { await assertManifestPublication(t, spelling); } catch (original) { failure = original; }
+      const evidence = activeEvidence!;
+      t.diagnostic(`spelling=${spelling} nonNative=${evidence.nonNative} phase=${evidence.phase} inspectionChecks=${JSON.stringify(evidence.inspectionChecks)} captureAttempts=${evidence.captureAttempts} captureOutcome=${evidence.captureOutcome}`);
+      if (spelling === "raw" && evidence.nonNative) {
+        assert.ok(failure instanceof Error, "a non-native raw root must retain its real refusal");
+        assert.equal((failure as LifecycleError).code, "MATERIALIZATION_CONFLICT");
+        assert.ok(evidence.inspectionChecks.every(Boolean));
+        assert.equal(evidence.captureAttempts, 1);
+        assert.equal(evidence.captureOutcome, "PROJECTION_PATH_INVALID");
+      } else {
+        if (failure !== undefined) throw failure;
+        assert.equal(evidence.phase, "business-assertions-completed");
+      }
     }
-    assert.throws(
-      () => publishProjectionManifest({
-        projectionDirectory: alias,
-        manifest: parsed,
-        expectedBinding: BINDING,
-      }),
-      /PROJECTION_MANIFEST_PATH_INVALID|MATERIALIZATION_CONFLICT/u,
-    );
-    assert.equal(readFileSync(target, "utf8"), expected);
   });
 
   it("refuses to replace a manifest target that is a symlink", (t) => {
-    const root = mkdtempSync(join(tmpdir(), "projection-manifest-target-"));
-    roots.push(root);
+    const root = fixtureRoot("projection-manifest-target-", "raw");
     const outside = join(root, "outside.json");
     const target = join(root, "projection-manifest.json");
     writeFileSync(outside, "outside", "utf8");
@@ -395,8 +473,7 @@ describe("immutable projection manifest", () => {
   });
 
   it("rejects exact WAL and SHM sibling entries before replacing a manifest", () => {
-    const root = mkdtempSync(join(tmpdir(), "projection-manifest-sidecars-"));
-    roots.push(root);
+    const root = fixtureRoot("projection-manifest-sidecars-", "raw");
     const databaseFile = "projections-1-2.sqlite";
     const databasePath = join(root, databaseFile);
     const target = join(root, "projection-manifest.json");
@@ -429,8 +506,7 @@ describe("immutable projection manifest", () => {
     "after-manifest-replace-before-validation",
   ] as const) {
     it(`preserves the previous manifest when a sidecar appears at ${boundary}`, () => {
-      const root = mkdtempSync(join(tmpdir(), "projection-manifest-publish-race-"));
-      roots.push(root);
+      const root = fixtureRoot("projection-manifest-publish-race-", "raw");
       const oldManifest = parseProjectionManifest(manifest({
         generation: 1,
         databaseFile: "projections-1-1.sqlite",
@@ -521,8 +597,7 @@ describe("immutable projection manifest", () => {
   });
 
   it("does not roll an outer failure over a later successful nested publication", () => {
-    const root = mkdtempSync(join(tmpdir(), "projection-manifest-nested-publish-"));
-    roots.push(root);
+    const root = fixtureRoot("projection-manifest-nested-publish-", "raw");
     const first = parseProjectionManifest(manifest({
       generation: 1,
       databaseFile: "projections-1-1.sqlite",
@@ -579,8 +654,7 @@ describe("immutable projection manifest", () => {
   });
 
   it("retains evidence when a nested publication becomes sidecar-invalid", () => {
-    const root = mkdtempSync(join(tmpdir(), "projection-manifest-nested-invalid-authority-"));
-    roots.push(root);
+    const root = fixtureRoot("projection-manifest-nested-invalid-authority-", "raw");
     const first = projectionManifest(1);
     const second = projectionManifest(2);
     const third = projectionManifest(3);
@@ -640,8 +714,7 @@ describe("immutable projection manifest", () => {
   });
 
   it("retains evidence when an exception follows sidecar-invalid nested publication", () => {
-    const root = mkdtempSync(join(tmpdir(), "projection-manifest-nested-invalid-exception-"));
-    roots.push(root);
+    const root = fixtureRoot("projection-manifest-nested-invalid-exception-", "raw");
     const first = projectionManifest(1);
     const second = projectionManifest(2);
     const third = projectionManifest(3);
@@ -704,8 +777,7 @@ describe("immutable projection manifest", () => {
   });
 
   it("does not claim a later manifest first observed after its own target rename", () => {
-    const root = mkdtempSync(join(tmpdir(), "projection-manifest-post-rename-observation-"));
-    roots.push(root);
+    const root = fixtureRoot("projection-manifest-post-rename-observation-", "raw");
     const first = parseProjectionManifest(manifest({
       generation: 1,
       databaseFile: "projections-1-1.sqlite",
@@ -771,8 +843,7 @@ describe("immutable projection manifest", () => {
   });
 
   it("retains recovery evidence when the installed-target observation reports no authority", () => {
-    const root = mkdtempSync(join(tmpdir(), "projection-manifest-missing-observation-"));
-    roots.push(root);
+    const root = fixtureRoot("projection-manifest-missing-observation-", "raw");
     const first = parseProjectionManifest(manifest({
       generation: 1,
       databaseFile: "projections-1-1.sqlite",
@@ -1239,8 +1310,7 @@ describe("immutable projection manifest", () => {
   });
 
   it("does not restore stale authority when a nested publish starts at rollback entry", () => {
-    const root = mkdtempSync(join(tmpdir(), "projection-manifest-rollback-entry-"));
-    roots.push(root);
+    const root = fixtureRoot("projection-manifest-rollback-entry-", "raw");
     const first = parseProjectionManifest(manifest({
       generation: 1,
       databaseFile: "projections-1-1.sqlite",
@@ -1320,8 +1390,7 @@ describe("immutable projection manifest", () => {
   });
 
   it("does not overwrite external authority installed after the final success snapshot", () => {
-    const root = mkdtempSync(join(tmpdir(), "projection-manifest-external-success-gap-"));
-    roots.push(root);
+    const root = fixtureRoot("projection-manifest-external-success-gap-", "raw");
     const first = parseProjectionManifest(manifest({
       generation: 1,
       databaseFile: "projections-1-1.sqlite",
@@ -1379,8 +1448,7 @@ describe("immutable projection manifest", () => {
   });
 
   it("does not overwrite external authority installed after the final rollback snapshot", () => {
-    const root = mkdtempSync(join(tmpdir(), "projection-manifest-external-rollback-gap-"));
-    roots.push(root);
+    const root = fixtureRoot("projection-manifest-external-rollback-gap-", "raw");
     const first = parseProjectionManifest(manifest({
       generation: 1,
       databaseFile: "projections-1-1.sqlite",
@@ -1444,8 +1512,7 @@ describe("immutable projection manifest", () => {
   });
 
   it("restores prior authority after a nested publication attempt fails before replacement", () => {
-    const root = mkdtempSync(join(tmpdir(), "projection-manifest-nested-failure-"));
-    roots.push(root);
+    const root = fixtureRoot("projection-manifest-nested-failure-", "raw");
     const first = parseProjectionManifest(manifest({
       generation: 1,
       databaseFile: "projections-1-1.sqlite",
@@ -1506,8 +1573,7 @@ describe("immutable projection manifest", () => {
   });
 
   it("fences a cooperative isolated publisher for the complete outer transaction", () => {
-    const root = mkdtempSync(join(tmpdir(), "projection-manifest-process-lock-"));
-    roots.push(root);
+    const root = fixtureRoot("projection-manifest-process-lock-", "raw");
     const first = parseProjectionManifest(manifest({
       generation: 1,
       databaseFile: "projections-1-1.sqlite",
@@ -1554,8 +1620,7 @@ describe("immutable projection manifest", () => {
   });
 
   it("fails closed on a foreign publication lock without stealing or rewriting it", () => {
-    const root = mkdtempSync(join(tmpdir(), "projection-manifest-foreign-lock-"));
-    roots.push(root);
+    const root = fixtureRoot("projection-manifest-foreign-lock-", "raw");
     const first = parseProjectionManifest(manifest({
       generation: 1,
       databaseFile: "projections-1-1.sqlite",
@@ -1588,8 +1653,7 @@ describe("immutable projection manifest", () => {
   });
 
   it("does not replace a manifest source changed after prior capture", () => {
-    const root = mkdtempSync(join(tmpdir(), "projection-manifest-source-cas-"));
-    roots.push(root);
+    const root = fixtureRoot("projection-manifest-source-cas-", "raw");
     const first = parseProjectionManifest(manifest({
       generation: 1,
       databaseFile: "projections-1-1.sqlite",
@@ -1640,8 +1704,7 @@ describe("immutable projection manifest", () => {
   });
 
   it("removes only its own failed first publication when no prior manifest exists", () => {
-    const root = mkdtempSync(join(tmpdir(), "projection-manifest-first-rollback-"));
-    roots.push(root);
+    const root = fixtureRoot("projection-manifest-first-rollback-", "raw");
     const second = parseProjectionManifest(manifest(), BINDING);
     const databasePath = join(root, second.databaseFile);
     const target = join(root, "projection-manifest.json");
@@ -1668,8 +1731,7 @@ describe("immutable projection manifest", () => {
   });
 
   it("does not source rollback bytes through an A-to-B-to-A directory swap", () => {
-    const root = mkdtempSync(join(tmpdir(), "projection-manifest-capture-swap-"));
-    roots.push(root);
+    const root = fixtureRoot("projection-manifest-capture-swap-", "raw");
     const projectionDirectory = join(root, "projections");
     const originalDirectory = join(root, "original-projections");
     const alternateDirectory = join(root, "alternate-projections");
@@ -1760,8 +1822,7 @@ describe("immutable projection manifest", () => {
   });
 
   it("does not roll back through a replaced projection directory", () => {
-    const root = mkdtempSync(join(tmpdir(), "projection-manifest-rollback-directory-"));
-    roots.push(root);
+    const root = fixtureRoot("projection-manifest-rollback-directory-", "raw");
     const projectionDirectory = join(root, "projections");
     const originalDirectory = join(root, "original-projections");
     const alternateDirectory = join(root, "alternate-projections");
@@ -1830,8 +1891,7 @@ describe("immutable projection manifest", () => {
   });
 
   it("treats a symlink-shaped exact sidecar sibling as an integrity failure", () => {
-    const root = mkdtempSync(join(tmpdir(), "projection-manifest-sidecar-shape-"));
-    roots.push(root);
+    const root = fixtureRoot("projection-manifest-sidecar-shape-", "raw");
     const databaseFile = "projections-1-2.sqlite";
     const databasePath = join(root, databaseFile);
     const regularDirectory = {
@@ -1866,8 +1926,7 @@ describe("immutable projection manifest", () => {
   });
 
   it("maps a non-ENOENT exact sidecar lstat failure to integrity failure", () => {
-    const root = mkdtempSync(join(tmpdir(), "projection-manifest-sidecar-error-"));
-    roots.push(root);
+    const root = fixtureRoot("projection-manifest-sidecar-error-", "raw");
     const databaseFile = "projections-1-2.sqlite";
     const databasePath = join(root, databaseFile);
     const regularDirectory = {
@@ -1899,8 +1958,7 @@ describe("immutable projection manifest", () => {
   });
 
   it("fails closed on symlinks through the production path-verification boundary", () => {
-    const root = mkdtempSync(join(tmpdir(), "projection-manifest-inspection-"));
-    roots.push(root);
+    const root = fixtureRoot("projection-manifest-inspection-", "raw");
     const databaseFile = "projections-1-2.sqlite";
     const databasePath = join(root, databaseFile);
     writeFileSync(databasePath, "independent projection", "utf8");

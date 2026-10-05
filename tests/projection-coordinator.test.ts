@@ -3,7 +3,6 @@ import { spawnSync } from "node:child_process";
 import {
   existsSync,
   lstatSync,
-  mkdtempSync,
   mkdirSync,
   readFileSync,
   readdirSync,
@@ -13,10 +12,10 @@ import {
   truncateSync,
   writeFileSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, relative, isAbsolute, normalize, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { afterEach, describe, it } from "node:test";
+import { afterEach, describe, it as nativeIt, type TestContext } from "node:test";
+import { createOwnedProjectionFixture } from "./support/owned-projection-fixture.js";
 
 import { eventHash, payloadHash } from "../src/orchestrator/crypto/event-hash.js";
 import type {
@@ -82,14 +81,61 @@ const BINDING: ProjectBinding = Object.freeze({
   sessionId: null,
 });
 
-const roots: string[] = [];
-afterEach(() => {
-  for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
-});
+type FixtureOwner = ReturnType<typeof createOwnedProjectionFixture>;
+const roots: FixtureOwner[] = [];
+const primaryFailures = new WeakSet<TestContext>();
+// Record the primary outcome so cleanup can report uncertainty without replacing it.
+const it = ((name: string, body: (t: TestContext) => unknown) => nativeIt(name, async t => {
+  try { await body(t); } catch (primary) { primaryFailures.add(t); throw primary; }
+})) as typeof nativeIt;
+
+function fixtureRoot(prefix: string, spelling: "raw" | "native"): string {
+  const owner = createOwnedProjectionFixture(prefix, spelling);
+  roots.push(owner);
+  return owner.root;
+}
+
+function cleanupFixtures(t: TestContext): void {
+  let incomplete = false;
+  for (const owner of roots.splice(0)) {
+    try { owner.cleanup(); } catch { incomplete = true; }
+  }
+  activeEvidence = undefined;
+  if (incomplete) {
+    t.diagnostic("CI_PROJECTION_FIXTURE_CLEANUP_INCOMPLETE");
+    if (!primaryFailures.has(t)) throw new Error("CI_PROJECTION_FIXTURE_CLEANUP_INCOMPLETE");
+  }
+}
+
+const resourceClosers = new WeakMap<object, () => void>();
+function ownerForPath(path: string): FixtureOwner {
+  const owner = roots.find(candidate => [candidate.rawRoot, candidate.nativeRoot].some(root => {
+    const descendant = relative(root, path);
+    return descendant === "" || (!isAbsolute(descendant) && descendant !== ".." && !descendant.startsWith(`..${process.platform === "win32" ? "\\" : "/"}`));
+  }));
+  if (owner === undefined) throw new Error("CI_PROJECTION_FIXTURE_ROOT_INVALID");
+  return owner;
+}
+function trackResource<T extends { close(): void }>(resource: T, path: string): T {
+  const owner = ownerForPath(path);
+  resourceClosers.set(resource, owner.closeWith(() => resource.close()));
+  return resource;
+}
+function closeOwned(resource: { close(): void }): void {
+  const close = resourceClosers.get(resource);
+  if (close === undefined) throw new Error("CI_PROJECTION_FIXTURE_UNREGISTERED_RESOURCE");
+  close();
+}
+function fixtureDatabase(path: string, options?: ConstructorParameters<typeof DatabaseSync>[1]): DatabaseSync {
+  const owner = ownerForPath(path);
+  try { return trackResource(options === undefined ? new DatabaseSync(path) : new DatabaseSync(path, options), path); }
+  catch (primary) { owner.retain(); throw primary; }
+}
+afterEach(t => cleanupFixtures(t as TestContext));
 
 function sourceDatabase(path: string): DatabaseSync {
-  const database = new DatabaseSync(path);
-  database.exec(`
+  const database = fixtureDatabase(path);
+  try { database.exec(`
     PRAGMA application_id = ${PROJECT_MEMORY_APPLICATION_ID};
     PRAGMA journal_mode = WAL;
     PRAGMA synchronous = FULL;
@@ -107,7 +153,11 @@ function sourceDatabase(path: string): DatabaseSync {
       evidence_digests_json TEXT, payload_json TEXT, payload_hash TEXT,
       previous_global_hash TEXT, event_hash TEXT, lifecycle_intent_json TEXT
     ) STRICT;
-  `);
+  `); }
+  catch (primary) {
+    try { closeOwned(database); } catch { ownerForPath(path).retain(); }
+    throw primary;
+  }
   return database;
 }
 
@@ -257,8 +307,7 @@ interface PublishedV2CoordinatorFixture {
 async function publishedV2CoordinatorFixture(
   evaluationLeases?: V2ProjectionReaderLeaseRegistry,
 ): Promise<PublishedV2CoordinatorFixture> {
-  const root = mkdtempSync(join(tmpdir(), "projection-v2-evaluation-lease-"));
-  roots.push(root);
+  const root = fixtureRoot("projection-v2-evaluation-lease-", "raw");
   const sourcePath = join(root, "events.sqlite");
   const projectionDirectory = join(root, "projections");
   const source = sourceDatabase(sourcePath);
@@ -284,8 +333,7 @@ interface V2DeadlineFixture {
 }
 
 async function v2DeadlineFixture(): Promise<V2DeadlineFixture> {
-  const root = mkdtempSync(join(tmpdir(), "projection-v2-deadline-"));
-  roots.push(root);
+  const root = fixtureRoot("projection-v2-deadline-", "raw");
   const sourcePath = join(root, "events.sqlite");
   const projectionDirectory = join(root, "projections");
   const source = sourceDatabase(sourcePath);
@@ -356,57 +404,153 @@ class SwapAfterV2EvaluatorLeaseRegistry extends V2ProjectionReaderLeaseRegistry 
   }
 }
 
-describe("projection build coordinator", () => {
-  it("adopts a staged V2 generation before publishing its manifest authority", async (t) => {
-    const root = mkdtempSync(join(tmpdir(), "projection-v2-adoption-"));
-    roots.push(root);
-    const sourcePath = join(root, "events.sqlite");
-    const projectionDirectory = join(root, "projections");
-    const source = sourceDatabase(sourcePath);
-    const collector = createCiDiagnosticCollector(line => t.diagnostic(line));
-    let primaryFailed = false;
-    try {
-      append(source, 1);
-      const driver = new NodeSqliteDriver({ DatabaseSync });
-      const coordinator = new V2ProjectionBuildCoordinator({
-        projectionDirectory,
-        eventReader: new SqliteProjectionEventReader({ driver, eventStorePath: sourcePath }),
-        builder: new ImmutableProjectionBuilder({ driver, projectionDirectory, now: () => NOW }),
-      });
 
-      capturePathSnapshot({ family: "coordinator", caseId: "coordinator-control", directory: projectionDirectory }, collector);
-      const published = await coordinator.ensurePublished(BINDING, 1n, FUNCTIONAL_TEST_DEADLINE_MS);
-      assert.equal(published.manifest.schemaVersion, 2);
-      assert.equal(published.manifest.databaseFile, "projections-2-1.sqlite");
-      assert.equal(existsSync(published.databasePath), true);
-      assert.equal(
-        parseProjectionManifestV2(
-          JSON.parse(readFileSync(join(projectionDirectory, "projection-manifest.json"), "utf8")),
-          BINDING,
-        ).databaseSha256,
-        published.manifest.databaseSha256,
-      );
-      assert.deepEqual(
-        readdirSync(projectionDirectory).filter((name) => name.startsWith(".projections-2-")),
-        [],
-      );
-    } catch (error) { primaryFailed = true; throw error; }
+interface SpellingEvidence {
+  spelling: "raw" | "native";
+  nonNative: boolean;
+  phase: string;
+  inspectionChecks: boolean[];
+  captureAttempts: number;
+  captureOutcome: "unobserved" | "returned" | "PROJECTION_PATH_INVALID" | "different-error";
+}
+let activeEvidence: SpellingEvidence | undefined;
+function rootEvidence(root: string, spelling: "raw" | "native"): SpellingEvidence {
+  const owner = roots.find(candidate => candidate.root === root)!;
+  const normalized = (path: string) => process.platform === "win32" ? resolve(path).toLowerCase() : resolve(path);
+  assert.equal(isAbsolute(root), true);
+  assert.equal(normalize(root), root);
+  assert.equal(resolve(root), root);
+  const stat = lstatSync(root, { bigint: true });
+  assert.equal(stat.isDirectory(), true);
+  assert.equal(stat.isSymbolicLink(), false);
+  const evidence: SpellingEvidence = { spelling, nonNative: normalized(owner.rawRoot) !== normalized(owner.nativeRoot),
+    phase: "fixture-setup", inspectionChecks: [], captureAttempts: 0, captureOutcome: "unobserved" };
+  assert.equal(normalized(realpathSync.native(root)), normalized(owner.nativeRoot));
+  return evidence;
+}
+function forwardingInspection(evidence: SpellingEvidence, directory: string): ProjectionPathInspection {
+  return {
+    lstat(path) {
+      const stat = lstatSync(path);
+      if (path === directory || path === resolve(directory, "..")) evidence.inspectionChecks.push(stat.isDirectory() && !stat.isSymbolicLink());
+      return stat;
+    },
+    realpath(path) {
+      const actual = realpathSync(path);
+      if (path === directory || path === resolve(directory, "..")) evidence.inspectionChecks.push((process.platform === "win32" ? resolve(actual).toLowerCase() === resolve(path).toLowerCase() : resolve(actual) === resolve(path)));
+      return actual;
+    },
+  };
+}
+
+async function assertV2Adoption(t: TestContext, rootSpelling: "raw" | "native"): Promise<void> {
+  const root = fixtureRoot("projection-v2-adoption-", rootSpelling);
+  const evidence = rootEvidence(root, rootSpelling);
+  activeEvidence = evidence;
+  const sourcePath = join(root, "events.sqlite");
+  const projectionDirectory = join(root, "projections");
+  const source = sourceDatabase(sourcePath);
+  const collector = createCiDiagnosticCollector(line => t.diagnostic(line));
+  let primaryFailed = false;
+  try {
+    append(source, 1);
+    const driver = new NodeSqliteDriver({ DatabaseSync });
+    evidence.phase = "coordinator-constructor";
+    const coordinator = new V2ProjectionBuildCoordinator({
+      pathInspection: forwardingInspection(evidence, projectionDirectory),
+      projectionDirectory,
+      eventReader: new SqliteProjectionEventReader({ driver, eventStorePath: sourcePath }),
+      builder: new ImmutableProjectionBuilder({ driver, projectionDirectory, now: () => NOW }),
+    });
+
+    capturePathSnapshot({ family: "coordinator", caseId: "coordinator-control", directory: projectionDirectory }, collector);
+    evidence.phase = "ensure-published";
+    const published = await coordinator.ensurePublished(BINDING, 1n, FUNCTIONAL_TEST_DEADLINE_MS);
+    assert.equal(published.manifest.schemaVersion, 2);
+    assert.equal(published.manifest.databaseFile, "projections-2-1.sqlite");
+    assert.equal(existsSync(published.databasePath), true);
+    assert.equal(
+      parseProjectionManifestV2(
+        JSON.parse(readFileSync(join(projectionDirectory, "projection-manifest.json"), "utf8")),
+        BINDING,
+      ).databaseSha256,
+      published.manifest.databaseSha256,
+    );
+    assert.deepEqual(
+      readdirSync(projectionDirectory).filter((name) => name.startsWith(".projections-2-")),
+      [],
+    );
+    evidence.phase = "business-assertions-completed";
+  } catch (error) { primaryFailed = true; throw error; }
+  finally {
+    let closed = false;
+    try { closeOwned(source); closed = true; }
+    catch (error) { if (!primaryFailed) throw error; }
     finally {
-      let closed = false;
-      try { source.close(); closed = true; }
-      catch (error) { if (!primaryFailed) throw error; }
-      finally {
-        try {
-          t.diagnostic(`CI path diagnostics incomplete=${collector.incomplete}`);
-          t.diagnostic(`owned source closure=${closed ? "closed" : "unavailable"}`);
-        } catch { /* Reporting cannot replace the primary outcome or prevent closure. */ }
+      try {
+        t.diagnostic(`CI path diagnostics incomplete=${collector.incomplete}`);
+        t.diagnostic(`owned source closure=${closed ? "closed" : "unavailable"}`);
+      } catch { /* Reporting cannot replace the primary outcome or prevent closure. */ }
+    }
+  }
+}
+
+describe("projection build coordinator", () => {
+  it("coordinator fixture retains root when source setup cannot close", () => {
+    const root = fixtureRoot("projection-source-setup-close-", "raw");
+    const setupError = new Error("controlled source setup failure");
+    const closeError = new Error("controlled uncertainty after native close returned");
+    const originalExec = DatabaseSync.prototype.exec;
+    const originalClose = DatabaseSync.prototype.close;
+    let acquired: DatabaseSync | undefined;
+    let nativeClosed = false;
+    let closeAttempts = 0;
+    let acquiredPath: unknown;
+    try {
+      DatabaseSync.prototype.exec = function () { acquired = this; acquiredPath = this.prepare("PRAGMA database_list").get()?.file; throw setupError; };
+      DatabaseSync.prototype.close = function () {
+        closeAttempts += 1;
+        originalClose.call(this);
+        nativeClosed = true;
+        throw closeError;
+      };
+      assert.throws(() => sourceDatabase(join(root, "events.sqlite")), error => error === setupError);
+      assert.equal(closeAttempts, 1, "setup failure must attempt its acquired native close");
+      assert.equal(nativeClosed, true, "injected uncertainty follows a returned native close");
+      assert.equal(typeof acquiredPath === "string" && [ownerForPath(root).rawRoot, ownerForPath(root).nativeRoot].some(ownedRoot =>
+        resolve(join(ownedRoot, "events.sqlite")).toLowerCase() === resolve(acquiredPath as string).toLowerCase()), true,
+      "source opened against a previously proved spelling of the original owned root");
+      assert.throws(() => ownerForPath(root).cleanup(), /CI_PROJECTION_FIXTURE_CLEANUP_INCOMPLETE/u);
+      assert.equal(existsSync(root), true, "uncertain fixture remains owned and retained");
+    } finally {
+      DatabaseSync.prototype.exec = originalExec;
+      DatabaseSync.prototype.close = originalClose;
+      if (acquired !== undefined && !nativeClosed) originalClose.call(acquired);
+      roots.splice(roots.indexOf(ownerForPath(root)), 1);
+    }
+  });
+  it("adopts a staged V2 generation before publishing its manifest authority", t => assertV2Adoption(t, "raw"));
+
+  it("projection spelling control: coordinator", async t => {
+    for (const spelling of ["raw", "native"] as const) {
+      let failure: unknown;
+      try { await assertV2Adoption(t, spelling); } catch (original) { failure = original; }
+      const evidence = activeEvidence!;
+      t.diagnostic(`spelling=${spelling} nonNative=${evidence.nonNative} phase=${evidence.phase} inspectionChecks=${JSON.stringify(evidence.inspectionChecks)} captureAttempts=${evidence.captureAttempts} captureOutcome=${evidence.captureOutcome}`);
+      if (spelling === "raw" && evidence.nonNative) {
+        assert.ok(failure instanceof Error, "a non-native raw root must retain its real refusal");
+        assert.equal(failure.message, "PROJECTION_PATH_INVALID");
+        assert.ok(evidence.inspectionChecks.every(Boolean));
+        assert.equal(evidence.captureOutcome, "unobserved", "inspection observations do not claim a private stable capture");
+      } else {
+        if (failure !== undefined) throw failure;
+        assert.equal(evidence.phase, "business-assertions-completed");
       }
     }
   });
 
   it("reconciles a positively identified V2 orphan after an install-before-manifest fault", async () => {
-    const root = mkdtempSync(join(tmpdir(), "projection-v2-orphan-recovery-"));
-    roots.push(root);
+    const root = fixtureRoot("projection-v2-orphan-recovery-", "raw");
     const sourcePath = join(root, "events.sqlite");
     const projectionDirectory = join(root, "projections");
     const source = sourceDatabase(sourcePath);
@@ -443,12 +587,11 @@ describe("projection build coordinator", () => {
     assert.equal(published.manifest.generation, 2);
     assert.equal(existsSync(join(projectionDirectory, "projections-2-1.sqlite")), false);
     assert.equal(existsSync(join(projectionDirectory, "projections-2-2.sqlite")), true);
-    source.close();
+    closeOwned(source);
   });
 
   it("reconciles an identified V2 orphan even when its active generation already meets the request", async () => {
-    const root = mkdtempSync(join(tmpdir(), "projection-v2-fresh-orphan-"));
-    roots.push(root);
+    const root = fixtureRoot("projection-v2-fresh-orphan-", "raw");
     const sourcePath = join(root, "events.sqlite");
     const projectionDirectory = join(root, "projections");
     const source = sourceDatabase(sourcePath);
@@ -477,12 +620,11 @@ describe("projection build coordinator", () => {
     const fresh = await healthy.ensurePublished(BINDING, 1n, FUNCTIONAL_TEST_DEADLINE_MS);
     assert.equal(fresh.manifest.generation, 1);
     assert.equal(existsSync(orphan), false, "fresh reads must reconcile a verified orphan before return");
-    source.close();
+    closeOwned(source);
   });
 
   it("persists a retired V2 generation high-water across reconciliation and coordinator restart", async () => {
-    const root = mkdtempSync(join(tmpdir(), "projection-v2-retired-high-water-"));
-    roots.push(root);
+    const root = fixtureRoot("projection-v2-retired-high-water-", "raw");
     const sourcePath = join(root, "events.sqlite");
     const projectionDirectory = join(root, "projections");
     const source = sourceDatabase(sourcePath);
@@ -550,12 +692,11 @@ describe("projection build coordinator", () => {
     });
     const published = await restarted.ensurePublished(BINDING, 3n, FUNCTIONAL_TEST_DEADLINE_MS);
     assert.equal(published.manifest.generation, 3, "a retained V2 final name must remain retired after restart");
-    source.close();
+    closeOwned(source);
   });
 
   it("recovers a retirement intent after its rename before journal completion", async () => {
-    const root = mkdtempSync(join(tmpdir(), "projection-v2-retirement-intent-recovery-"));
-    roots.push(root);
+    const root = fixtureRoot("projection-v2-retirement-intent-recovery-", "raw");
     const sourcePath = join(root, "events.sqlite");
     const projectionDirectory = join(root, "projections");
     const journalPath = join(projectionDirectory, "projection-reconciliation-v2.json");
@@ -625,12 +766,11 @@ describe("projection build coordinator", () => {
       lstatSync(join(projectionDirectory, retiredName!), { bigint: true }).ctimeNs.toString(),
     );
     assert.equal(existsSync(join(projectionDirectory, "projections-2-1.sqlite")), false);
-    source.close();
+    closeOwned(source);
   });
 
   it("recovers a retirement intent before its rename in a fresh process", async () => {
-    const root = mkdtempSync(join(tmpdir(), "projection-v2-retirement-intent-prerename-"));
-    roots.push(root);
+    const root = fixtureRoot("projection-v2-retirement-intent-prerename-", "raw");
     const sourcePath = join(root, "events.sqlite");
     const projectionDirectory = join(root, "projections");
     const journalPath = join(projectionDirectory, "projection-reconciliation-v2.json");
@@ -712,12 +852,11 @@ describe("projection build coordinator", () => {
       ).generation,
       2,
     );
-    source.close();
+    closeOwned(source);
   });
 
   it("rejects ctime-changed retired evidence after its journal record is complete", async () => {
-    const root = mkdtempSync(join(tmpdir(), "projection-v2-retired-evidence-ctime-"));
-    roots.push(root);
+    const root = fixtureRoot("projection-v2-retired-evidence-ctime-", "raw");
     const sourcePath = join(root, "events.sqlite");
     const projectionDirectory = join(root, "projections");
     const source = sourceDatabase(sourcePath);
@@ -761,12 +900,11 @@ describe("projection build coordinator", () => {
     );
     assert.equal(existsSync(retiredPath), true);
     assert.equal(existsSync(join(projectionDirectory, PROJECTION_MANIFEST_PUBLICATION_LOCK_FILENAME)), true);
-    source.close();
+    closeOwned(source);
   });
 
   it("rejects missing retired evidence after recovery before the final scan", async () => {
-    const root = mkdtempSync(join(tmpdir(), "projection-v2-retired-evidence-missing-"));
-    roots.push(root);
+    const root = fixtureRoot("projection-v2-retired-evidence-missing-", "raw");
     const sourcePath = join(root, "events.sqlite");
     const projectionDirectory = join(root, "projections");
     const source = sourceDatabase(sourcePath);
@@ -808,12 +946,11 @@ describe("projection build coordinator", () => {
     );
     assert.equal(existsSync(retiredPath), false);
     assert.equal(existsSync(join(projectionDirectory, PROJECTION_MANIFEST_PUBLICATION_LOCK_FILENAME)), true);
-    source.close();
+    closeOwned(source);
   });
 
   it("retains swapped retired evidence after recovery before the final scan", async () => {
-    const root = mkdtempSync(join(tmpdir(), "projection-v2-retired-evidence-swap-"));
-    roots.push(root);
+    const root = fixtureRoot("projection-v2-retired-evidence-swap-", "raw");
     const sourcePath = join(root, "events.sqlite");
     const projectionDirectory = join(root, "projections");
     const source = sourceDatabase(sourcePath);
@@ -862,12 +999,11 @@ describe("projection build coordinator", () => {
     assert.deepEqual(readFileSync(displacedPath), retainedBytes);
     assert.equal(readFileSync(retiredPath, "utf8"), "forged retained evidence");
     assert.equal(existsSync(join(projectionDirectory, PROJECTION_MANIFEST_PUBLICATION_LOCK_FILENAME)), true);
-    source.close();
+    closeOwned(source);
   });
 
   it("migrates a prior canonical retired V2 generation high-water journal during reconciliation", async () => {
-    const root = mkdtempSync(join(tmpdir(), "projection-v2-legacy-journal-"));
-    roots.push(root);
+    const root = fixtureRoot("projection-v2-legacy-journal-", "raw");
     const sourcePath = join(root, "events.sqlite");
     const projectionDirectory = join(root, "projections");
     const source = sourceDatabase(sourcePath);
@@ -914,12 +1050,11 @@ describe("projection build coordinator", () => {
     assert.match(journal.retirements[0]?.retiredFilename ?? "", /^\.projections-2-retired-[0-9a-f]{32}\.sqlite$/u);
     assert.equal(Object.prototype.hasOwnProperty.call(journal, "schemaVersion"), false);
     assert.equal(journalText, `${JSON.stringify(journal)}\n`);
-    source.close();
+    closeOwned(source);
   });
 
   it("rejects a zero retired V2 generation high-water record without rewriting evidence", async () => {
-    const root = mkdtempSync(join(tmpdir(), "projection-v2-zero-retired-generation-"));
-    roots.push(root);
+    const root = fixtureRoot("projection-v2-zero-retired-generation-", "raw");
     const sourcePath = join(root, "events.sqlite");
     const projectionDirectory = join(root, "projections");
     const source = sourceDatabase(sourcePath);
@@ -960,12 +1095,11 @@ describe("projection build coordinator", () => {
     assert.equal(readFileSync(journalPath, "utf8"), journalBytes);
     assert.equal(readFileSync(retiredPath, "utf8"), "retained evidence");
     assert.equal(existsSync(join(projectionDirectory, PROJECTION_MANIFEST_PUBLICATION_LOCK_FILENAME)), true);
-    source.close();
+    closeOwned(source);
   });
 
   it("rejects unjournaled retired evidence before source access", async () => {
-    const root = mkdtempSync(join(tmpdir(), "projection-v2-unjournaled-retired-"));
-    roots.push(root);
+    const root = fixtureRoot("projection-v2-unjournaled-retired-", "raw");
     const sourcePath = join(root, "events.sqlite");
     const projectionDirectory = join(root, "projections");
     const source = sourceDatabase(sourcePath);
@@ -991,12 +1125,11 @@ describe("projection build coordinator", () => {
     );
     assert.equal(existsSync(retiredPath), true);
     assert.equal(existsSync(join(projectionDirectory, PROJECTION_MANIFEST_PUBLICATION_LOCK_FILENAME)), true);
-    source.close();
+    closeOwned(source);
   });
 
   it("rejects legacy quarantine evidence before source access", async () => {
-    const root = mkdtempSync(join(tmpdir(), "projection-v2-legacy-quarantine-"));
-    roots.push(root);
+    const root = fixtureRoot("projection-v2-legacy-quarantine-", "raw");
     const sourcePath = join(root, "events.sqlite");
     const projectionDirectory = join(root, "projections");
     const source = sourceDatabase(sourcePath);
@@ -1022,12 +1155,11 @@ describe("projection build coordinator", () => {
     );
     assert.equal(existsSync(quarantinePath), true);
     assert.equal(existsSync(join(projectionDirectory, PROJECTION_MANIFEST_PUBLICATION_LOCK_FILENAME)), true);
-    source.close();
+    closeOwned(source);
   });
 
   it("does not reuse a reserved V2 final generation after restart without an active manifest", async () => {
-    const root = mkdtempSync(join(tmpdir(), "projection-v2-journal-without-manifest-"));
-    roots.push(root);
+    const root = fixtureRoot("projection-v2-journal-without-manifest-", "raw");
     const sourcePath = join(root, "events.sqlite");
     const projectionDirectory = join(root, "projections");
     const source = sourceDatabase(sourcePath);
@@ -1064,12 +1196,11 @@ describe("projection build coordinator", () => {
     });
     const published = await restarted.ensurePublished(BINDING, 1n, FUNCTIONAL_TEST_DEADLINE_MS);
     assert.equal(published.manifest.generation, 2);
-    source.close();
+    closeOwned(source);
   });
 
   it("durably reserves an orphan before quarantine disposition", async () => {
-    const root = mkdtempSync(join(tmpdir(), "projection-v2-journal-before-quarantine-"));
-    roots.push(root);
+    const root = fixtureRoot("projection-v2-journal-before-quarantine-", "raw");
     const sourcePath = join(root, "events.sqlite");
     const projectionDirectory = join(root, "projections");
     const source = sourceDatabase(sourcePath);
@@ -1100,12 +1231,11 @@ describe("projection build coordinator", () => {
       /"highestReservedGeneration":1/u,
     );
     assert.equal(existsSync(join(projectionDirectory, PROJECTION_MANIFEST_PUBLICATION_LOCK_FILENAME)), true);
-    source.close();
+    closeOwned(source);
   });
 
   it("takes the V2 publication lock before initial source access", async () => {
-    const root = mkdtempSync(join(tmpdir(), "projection-v2-initial-lock-before-source-"));
-    roots.push(root);
+    const root = fixtureRoot("projection-v2-initial-lock-before-source-", "raw");
     const projectionDirectory = join(root, "projections");
     let sawLock = false;
     const coordinator = new V2ProjectionBuildCoordinator({
@@ -1121,8 +1251,7 @@ describe("projection build coordinator", () => {
   });
 
   it("retains a V2 orphan when its terminal metadata no longer matches its persisted core checksums", async () => {
-    const root = mkdtempSync(join(tmpdir(), "projection-v2-orphan-terminal-integrity-"));
-    roots.push(root);
+    const root = fixtureRoot("projection-v2-orphan-terminal-integrity-", "raw");
     const sourcePath = join(root, "events.sqlite");
     const projectionDirectory = join(root, "projections");
     const source = sourceDatabase(sourcePath);
@@ -1138,7 +1267,7 @@ describe("projection build coordinator", () => {
     });
     await assert.rejects(() => faulted.ensurePublished(BINDING, 1n, FUNCTIONAL_TEST_DEADLINE_MS), /post-install/u);
     const orphan = join(projectionDirectory, "projections-2-1.sqlite");
-    const forged = new DatabaseSync(orphan);
+    const forged = fixtureDatabase(orphan);
     try {
       forged.exec(`
         UPDATE projection_metadata
@@ -1146,7 +1275,7 @@ describe("projection build coordinator", () => {
         WHERE singleton = 1
       `);
     } finally {
-      forged.close();
+      closeOwned(forged);
     }
 
     const recovery = new V2ProjectionBuildCoordinator({
@@ -1160,12 +1289,11 @@ describe("projection build coordinator", () => {
     );
     assert.equal(existsSync(orphan), true);
     assert.equal(existsSync(join(projectionDirectory, PROJECTION_MANIFEST_PUBLICATION_LOCK_FILENAME)), true);
-    source.close();
+    closeOwned(source);
   });
 
   it("retains a final V2 orphan after an A-to-B-to-A swap following image capture", async () => {
-    const root = mkdtempSync(join(tmpdir(), "projection-v2-orphan-capture-swap-"));
-    roots.push(root);
+    const root = fixtureRoot("projection-v2-orphan-capture-swap-", "raw");
     const sourcePath = join(root, "events.sqlite");
     const projectionDirectory = join(root, "projections");
     const source = sourceDatabase(sourcePath);
@@ -1204,12 +1332,11 @@ describe("projection build coordinator", () => {
     assert.equal(existsSync(orphan), true);
     assert.equal(readFileSync(forged, "utf8"), "not a sqlite image");
     assert.equal(existsSync(join(projectionDirectory, PROJECTION_MANIFEST_PUBLICATION_LOCK_FILENAME)), true);
-    source.close();
+    closeOwned(source);
   });
 
   it("retains retired evidence when it differs from the validated V2 image", async () => {
-    const root = mkdtempSync(join(tmpdir(), "projection-v2-retired-swap-"));
-    roots.push(root);
+    const root = fixtureRoot("projection-v2-retired-swap-", "raw");
     const sourcePath = join(root, "events.sqlite");
     const projectionDirectory = join(root, "projections");
     const source = sourceDatabase(sourcePath);
@@ -1253,12 +1380,11 @@ describe("projection build coordinator", () => {
       true,
     );
     assert.equal(existsSync(join(projectionDirectory, PROJECTION_MANIFEST_PUBLICATION_LOCK_FILENAME)), true);
-    source.close();
+    closeOwned(source);
   });
 
   it("fails closed if the V2 projection directory swaps after authorization", async () => {
-    const root = mkdtempSync(join(tmpdir(), "projection-v2-directory-swap-"));
-    roots.push(root);
+    const root = fixtureRoot("projection-v2-directory-swap-", "raw");
     const projectionDirectory = join(root, "projections");
     const originalDirectory = join(root, "original-projections");
     const attackerDirectory = join(root, "attacker-projections");
@@ -1295,8 +1421,7 @@ describe("projection build coordinator", () => {
   });
 
   it("takes the V2 publication lock before a directory-swap journal snapshot", async () => {
-    const root = mkdtempSync(join(tmpdir(), "projection-v2-journal-snapshot-swap-"));
-    roots.push(root);
+    const root = fixtureRoot("projection-v2-journal-snapshot-swap-", "raw");
     const projectionDirectory = join(root, "projections");
     const originalDirectory = join(root, "original-projections");
     const attackerDirectory = join(root, "attacker-projections");
@@ -1325,8 +1450,7 @@ describe("projection build coordinator", () => {
   });
 
   it("retains an unreadable final-named V2 candidate rather than deleting on uncertain observation", async () => {
-    const root = mkdtempSync(join(tmpdir(), "projection-v2-orphan-uncertain-"));
-    roots.push(root);
+    const root = fixtureRoot("projection-v2-orphan-uncertain-", "raw");
     const sourcePath = join(root, "events.sqlite");
     const projectionDirectory = join(root, "projections");
     const source = sourceDatabase(sourcePath);
@@ -1347,12 +1471,11 @@ describe("projection build coordinator", () => {
     );
     assert.equal(existsSync(uncertain), true);
     assert.equal(existsSync(join(projectionDirectory, "projection-manifest.json")), false);
-    source.close();
+    closeOwned(source);
   });
 
   it("poisons and retains the publication lock when fresh reconciliation cannot verify a final V2 candidate", async () => {
-    const root = mkdtempSync(join(tmpdir(), "projection-v2-fresh-poison-"));
-    roots.push(root);
+    const root = fixtureRoot("projection-v2-fresh-poison-", "raw");
     const sourcePath = join(root, "events.sqlite");
     const projectionDirectory = join(root, "projections");
     const source = sourceDatabase(sourcePath);
@@ -1377,12 +1500,11 @@ describe("projection build coordinator", () => {
       true,
       "uncertain reconciliation must retain the lock as recovery evidence",
     );
-    source.close();
+    closeOwned(source);
   });
 
   it("reconciles before opening a source snapshot for a non-fresh V2 request", async () => {
-    const root = mkdtempSync(join(tmpdir(), "projection-v2-nonfresh-entry-reconcile-"));
-    roots.push(root);
+    const root = fixtureRoot("projection-v2-nonfresh-entry-reconcile-", "raw");
     const sourcePath = join(root, "events.sqlite");
     const projectionDirectory = join(root, "projections");
     const source = sourceDatabase(sourcePath);
@@ -1410,12 +1532,11 @@ describe("projection build coordinator", () => {
       /PROJECTION_PUBLICATION_RECOVERY_REQUIRED/u,
     );
     assert.equal(sourceOpened, false);
-    source.close();
+    closeOwned(source);
   });
 
   it("removes a verified V2 orphan before a non-fresh source failure", async () => {
-    const root = mkdtempSync(join(tmpdir(), "projection-v2-nonfresh-valid-reconcile-"));
-    roots.push(root);
+    const root = fixtureRoot("projection-v2-nonfresh-valid-reconcile-", "raw");
     const sourcePath = join(root, "events.sqlite");
     const projectionDirectory = join(root, "projections");
     const source = sourceDatabase(sourcePath);
@@ -1447,12 +1568,11 @@ describe("projection build coordinator", () => {
     });
     await assert.rejects(() => recovery.ensurePublished(BINDING, 2n, FUNCTIONAL_TEST_DEADLINE_MS), /SOURCE_UNAVAILABLE/u);
     assert.equal(existsSync(orphan), false);
-    source.close();
+    closeOwned(source);
   });
 
   it("does not reconcile a final V2 generation named by the lease registry", async () => {
-    const root = mkdtempSync(join(tmpdir(), "projection-v2-orphan-lease-"));
-    roots.push(root);
+    const root = fixtureRoot("projection-v2-orphan-lease-", "raw");
     const sourcePath = join(root, "events.sqlite");
     const projectionDirectory = join(root, "projections");
     const source = sourceDatabase(sourcePath);
@@ -1477,21 +1597,21 @@ describe("projection build coordinator", () => {
     });
     await restarted.ensurePublished(BINDING, 2n, FUNCTIONAL_TEST_DEADLINE_MS);
     assert.equal(existsSync(join(projectionDirectory, "projections-2-1.sqlite")), true);
-    source.close();
+    closeOwned(source);
   });
 
   it("acquires a published V2 evaluator lease from a stable private image", async () => {
     const fixture = await publishedV2CoordinatorFixture();
     try {
-      const lease = await fixture.coordinator.leasePublishedForEvaluation(BINDING);
+      const lease = trackResource(await fixture.coordinator.leasePublishedForEvaluation(BINDING), fixture.projectionDirectory);
       try {
         assert.equal(lease.manifest.databaseFile, "projections-2-1.sqlite");
         assertOriginalV2EvaluationLease(lease);
       } finally {
-        lease.close();
+        closeOwned(lease);
       }
     } finally {
-      fixture.source.close();
+      closeOwned(fixture.source);
     }
   });
 
@@ -1532,7 +1652,7 @@ describe("projection build coordinator", () => {
         true,
       );
     } finally {
-      fixture.source.close();
+      closeOwned(fixture.source);
     }
   });
 
@@ -1575,7 +1695,7 @@ describe("projection build coordinator", () => {
         realpathSync.native = nativeRealpath;
       }
     } finally {
-      fixture.source.close();
+      closeOwned(fixture.source);
     }
   });
 
@@ -1595,7 +1715,7 @@ describe("projection build coordinator", () => {
           true,
         );
       } finally {
-        fixture.source.close();
+        closeOwned(fixture.source);
       }
     }
   });
@@ -1615,7 +1735,7 @@ describe("projection build coordinator", () => {
         true,
       );
     } finally {
-      fixture.source.close();
+      closeOwned(fixture.source);
     }
   });
 
@@ -1645,30 +1765,30 @@ describe("projection build coordinator", () => {
         true,
       );
     } finally {
-      fixture.source.close();
+      closeOwned(fixture.source);
     }
   });
 
   it("keeps a V2 evaluator lease usable after its original final file is renamed away", async () => {
     const fixture = await publishedV2CoordinatorFixture();
     try {
-      const lease = await fixture.coordinator.leasePublishedForEvaluation(BINDING);
+      const lease = trackResource(await fixture.coordinator.leasePublishedForEvaluation(BINDING), fixture.projectionDirectory);
       try {
         const finalPath = join(fixture.projectionDirectory, lease.manifest.databaseFile);
         renameSync(finalPath, `${finalPath}.moved`);
         assertOriginalV2EvaluationLease(lease);
       } finally {
-        lease.close();
+        closeOwned(lease);
       }
     } finally {
-      fixture.source.close();
+      closeOwned(fixture.source);
     }
   });
 
   it("keeps a V2 evaluator lease on its original image after another valid final replaces its filename", async () => {
     const fixture = await publishedV2CoordinatorFixture();
     try {
-      const lease = await fixture.coordinator.leasePublishedForEvaluation(BINDING);
+      const lease = trackResource(await fixture.coordinator.leasePublishedForEvaluation(BINDING), fixture.projectionDirectory);
       try {
         append(fixture.source, 2);
         const replacement = await fixture.coordinator.ensurePublished(BINDING, 2n, FUNCTIONAL_TEST_DEADLINE_MS);
@@ -1676,56 +1796,56 @@ describe("projection build coordinator", () => {
         const replacementPath = join(fixture.projectionDirectory, replacement.manifest.databaseFile);
         renameSync(finalPath, `${finalPath}.original`);
         renameSync(replacementPath, finalPath);
-        const replaced = new DatabaseSync(finalPath);
+        const replaced = fixtureDatabase(finalPath);
         try {
           assert.equal(
             Number(replaced.prepare("SELECT terminal_event_position FROM projection_metadata").get()?.terminal_event_position),
             2,
           );
         } finally {
-          replaced.close();
+          closeOwned(replaced);
         }
         assertOriginalV2EvaluationLease(lease);
       } finally {
-        lease.close();
+        closeOwned(lease);
       }
     } finally {
-      fixture.source.close();
+      closeOwned(fixture.source);
     }
   });
 
   it("keeps a V2 evaluator lease usable after its original final file is truncated", async () => {
     const fixture = await publishedV2CoordinatorFixture();
     try {
-      const lease = await fixture.coordinator.leasePublishedForEvaluation(BINDING);
+      const lease = trackResource(await fixture.coordinator.leasePublishedForEvaluation(BINDING), fixture.projectionDirectory);
       try {
         truncateSync(join(fixture.projectionDirectory, lease.manifest.databaseFile), 0);
         assertOriginalV2EvaluationLease(lease);
       } finally {
-        lease.close();
+        closeOwned(lease);
       }
     } finally {
-      fixture.source.close();
+      closeOwned(fixture.source);
     }
   });
 
   it("keeps a V2 evaluator lease on its original image after the final SQLite content changes", async () => {
     const fixture = await publishedV2CoordinatorFixture();
     try {
-      const lease = await fixture.coordinator.leasePublishedForEvaluation(BINDING);
+      const lease = trackResource(await fixture.coordinator.leasePublishedForEvaluation(BINDING), fixture.projectionDirectory);
       try {
-        const final = new DatabaseSync(join(fixture.projectionDirectory, lease.manifest.databaseFile));
+        const final = fixtureDatabase(join(fixture.projectionDirectory, lease.manifest.databaseFile));
         try {
           final.prepare("UPDATE projection_metadata SET created_at = ? WHERE singleton = 1").run("mutated");
         } finally {
-          final.close();
+          closeOwned(final);
         }
         assertOriginalV2EvaluationLease(lease);
       } finally {
-        lease.close();
+        closeOwned(lease);
       }
     } finally {
-      fixture.source.close();
+      closeOwned(fixture.source);
     }
   });
 
@@ -1733,7 +1853,7 @@ describe("projection build coordinator", () => {
     const evaluationLeases = new V2ProjectionReaderLeaseRegistry();
     const fixture = await publishedV2CoordinatorFixture(evaluationLeases);
     try {
-      const lease = await fixture.coordinator.leasePublishedForEvaluation(BINDING);
+      const lease = trackResource(await fixture.coordinator.leasePublishedForEvaluation(BINDING), fixture.projectionDirectory);
       const firstFinal = lease.manifest.databaseFile;
       try {
         append(fixture.source, 2);
@@ -1744,7 +1864,7 @@ describe("projection build coordinator", () => {
         assert.equal(existsSync(join(fixture.projectionDirectory, firstFinal)), true);
         assert.deepEqual(evaluationLeases.activeFilenames(), [firstFinal]);
       } finally {
-        lease.close();
+        closeOwned(lease);
       }
 
       await fixture.coordinator.ensurePublished(BINDING, 2n, FUNCTIONAL_TEST_DEADLINE_MS);
@@ -1765,13 +1885,12 @@ describe("projection build coordinator", () => {
       assert.equal(journal.retirements[0]?.generation, 1);
       assert.equal(journal.retirements[0]?.retiredFilename, retired[0]);
     } finally {
-      fixture.source.close();
+      closeOwned(fixture.source);
     }
   });
 
   it("publishes atomically, preserves crash-window authority, serializes builds, and pins leases", async () => {
-    const root = mkdtempSync(join(tmpdir(), "projection-coordinator-"));
-    roots.push(root);
+    const root = fixtureRoot("projection-coordinator-", "raw");
     const sourcePath = join(root, "events.sqlite");
     const projectionDirectory = join(root, "projections");
     const source = sourceDatabase(sourcePath);
@@ -1830,7 +1949,7 @@ describe("projection build coordinator", () => {
     assert.equal(existsSync(unrelatedTemp), true);
     const firstDatabase = result.databasePath;
     const firstBytes = readFileSync(firstDatabase);
-    const oldReader = await coordinator.leasePublished(BINDING);
+    const oldReader = trackResource(await coordinator.leasePublished(BINDING), projectionDirectory);
 
     append(source, 9);
     failAfterFsync = true;
@@ -1851,7 +1970,7 @@ describe("projection build coordinator", () => {
     const ninth = await coordinator.ensurePublished(BINDING, 9n, FUNCTIONAL_TEST_DEADLINE_MS);
     assert.equal(ninth.manifest.terminalEventPosition, "9");
     assert.equal(existsSync(firstDatabase), true, "leased retired generation must remain");
-    oldReader.close();
+    closeOwned(oldReader);
     assert.equal(existsSync(firstDatabase), true, "retired generation remains for audited reclamation");
 
     append(source, 10);
@@ -1876,12 +1995,11 @@ describe("projection build coordinator", () => {
         && error.availableEventPosition === 10n,
     );
     assert.equal(existsSync(unrelatedTemp), true);
-    source.close();
+    closeOwned(source);
   });
 
   it("rejects a forged chain hash outside the requested projection binding", async () => {
-    const root = mkdtempSync(join(tmpdir(), "projection-cross-scope-chain-"));
-    roots.push(root);
+    const root = fixtureRoot("projection-cross-scope-chain-", "raw");
     const sourcePath = join(root, "events.sqlite");
     const projectionDirectory = join(root, "projections");
     const source = sourceDatabase(sourcePath);
@@ -1893,13 +2011,13 @@ describe("projection build coordinator", () => {
     append(source, 2);
     const driver = new NodeSqliteDriver({ DatabaseSync });
     const eventReader = new SqliteProjectionEventReader({ driver, eventStorePath: sourcePath });
-    const validSnapshot = await eventReader.openCommittedSnapshot(BINDING);
+    const validSnapshot = trackResource(await eventReader.openCommittedSnapshot(BINDING), sourcePath);
     assert.equal(validSnapshot.eventCount, 2);
     assert.deepEqual(
       [...validSnapshot.events()].map((event) => event.globalPosition),
       [2n],
     );
-    validSnapshot.close();
+    closeOwned(validSnapshot);
     source.prepare(`
       UPDATE events SET event_hash = ? WHERE global_position = 1
     `).run("f".repeat(64));
@@ -1914,12 +2032,11 @@ describe("projection build coordinator", () => {
       /INTEGRITY_FAILURE/u,
     );
     assert.equal(existsSync(join(projectionDirectory, "projection-manifest.json")), false);
-    source.close();
+    closeOwned(source);
   });
 
   it("reselects the manifest when publication retires a generation between load and acquire", async () => {
-    const root = mkdtempSync(join(tmpdir(), "projection-lease-race-"));
-    roots.push(root);
+    const root = fixtureRoot("projection-lease-race-", "raw");
     const sourcePath = join(root, "events.sqlite");
     const projectionDirectory = join(root, "projections");
     const source = sourceDatabase(sourcePath);
@@ -1937,22 +2054,21 @@ describe("projection build coordinator", () => {
 
     const first = await coordinator.ensurePublished(BINDING, 8n, FUNCTIONAL_TEST_DEADLINE_MS);
     append(source, 9);
-    const snapshot = await eventReader.openCommittedSnapshot(BINDING);
+    const snapshot = trackResource(await eventReader.openCommittedSnapshot(BINDING), sourcePath);
     leases.replacement = await builder.build(snapshot, 2);
-    snapshot.close();
+    closeOwned(snapshot);
 
-    const lease = await coordinator.leasePublished(BINDING);
+    const lease = trackResource(await coordinator.leasePublished(BINDING), projectionDirectory);
     assert.equal(lease.manifest.generation, 2);
     assert.equal(lease.manifest.terminalEventPosition, "9");
     assert.equal(existsSync(lease.databasePath), true);
     assert.equal(existsSync(first.databasePath), true);
-    lease.close();
-    source.close();
+    closeOwned(lease);
+    closeOwned(source);
   });
 
   it("refuses publication when a generation sidecar appears before manifest replacement", async () => {
-    const root = mkdtempSync(join(tmpdir(), "projection-publication-sidecar-"));
-    roots.push(root);
+    const root = fixtureRoot("projection-publication-sidecar-", "raw");
     const sourcePath = join(root, "events.sqlite");
     const projectionDirectory = join(root, "projections");
     const source = sourceDatabase(sourcePath);
@@ -1986,12 +2102,11 @@ describe("projection build coordinator", () => {
       readFileSync(join(projectionDirectory, "projections-1-1.sqlite-wal"), "utf8"),
       "unexpected published-generation WAL",
     );
-    source.close();
+    closeOwned(source);
   });
 
   it("maps a sidecar added to the published generation to integrity failure on manifest load", async () => {
-    const root = mkdtempSync(join(tmpdir(), "projection-published-sidecar-"));
-    roots.push(root);
+    const root = fixtureRoot("projection-published-sidecar-", "raw");
     const sourcePath = join(root, "events.sqlite");
     const projectionDirectory = join(root, "projections");
     const source = sourceDatabase(sourcePath);
@@ -2011,12 +2126,11 @@ describe("projection build coordinator", () => {
         && error.code === "INTEGRITY_FAILURE",
     );
     assert.equal(readFileSync(`${published.databasePath}-shm`, "utf8"), "unexpected published SHM");
-    source.close();
+    closeOwned(source);
   });
 
   it("maps a non-ENOENT sidecar lstat failure on manifest load to integrity failure", async () => {
-    const root = mkdtempSync(join(tmpdir(), "projection-load-sidecar-error-"));
-    roots.push(root);
+    const root = fixtureRoot("projection-load-sidecar-error-", "raw");
     const sourcePath = join(root, "events.sqlite");
     const projectionDirectory = join(root, "projections");
     const source = sourceDatabase(sourcePath);
@@ -2037,12 +2151,11 @@ describe("projection build coordinator", () => {
       (error: unknown) => error instanceof LifecycleError
         && error.code === "INTEGRITY_FAILURE",
     );
-    source.close();
+    closeOwned(source);
   });
 
   it("fails closed while a manifest publication lock is present", async () => {
-    const root = mkdtempSync(join(tmpdir(), "projection-load-publication-lock-"));
-    roots.push(root);
+    const root = fixtureRoot("projection-load-publication-lock-", "raw");
     const sourcePath = join(root, "events.sqlite");
     const projectionDirectory = join(root, "projections");
     const source = sourceDatabase(sourcePath);
@@ -2064,12 +2177,11 @@ describe("projection build coordinator", () => {
         && error.retryable,
     );
     assert.equal(readFileSync(lockPath, "utf8"), "foreign publication in progress");
-    source.close();
+    closeOwned(source);
   });
 
   it("retains the publication lock and prior hold when installed-manifest observation is ambiguous", async () => {
-    const root = mkdtempSync(join(tmpdir(), "projection-installed-observation-error-"));
-    roots.push(root);
+    const root = fixtureRoot("projection-installed-observation-error-", "raw");
     const sourcePath = join(root, "events.sqlite");
     const projectionDirectory = join(root, "projections");
     const source = sourceDatabase(sourcePath);
@@ -2083,15 +2195,15 @@ describe("projection build coordinator", () => {
       builder,
     });
     const first = await coordinator.ensurePublished(BINDING, 1n, FUNCTIONAL_TEST_DEADLINE_MS);
-    const validLease = await coordinator.leasePublished(BINDING);
+    const validLease = trackResource(await coordinator.leasePublished(BINDING), projectionDirectory);
     assert.equal(first.manifest.generation, 1);
     assert.equal(validLease.manifest.generation, 1);
-    validLease.close();
+    closeOwned(validLease);
 
     append(source, 2);
-    const snapshot = await eventReader.openCommittedSnapshot(BINDING);
+    const snapshot = trackResource(await eventReader.openCommittedSnapshot(BINDING), sourcePath);
     const second = await builder.build(snapshot, 2);
-    snapshot.close();
+    closeOwned(snapshot);
     let installed = false;
     let observationDenied = false;
 
@@ -2156,8 +2268,8 @@ describe("projection build coordinator", () => {
     const lockToken = existsSync(lockPath) ? readFileSync(lockPath, "utf8") : null;
     let readerFailureCode: string | null = null;
     try {
-      const lease = await coordinator.leasePublished(BINDING);
-      lease.close();
+      const lease = trackResource(await coordinator.leasePublished(BINDING), projectionDirectory);
+      closeOwned(lease);
     } catch (error) {
       if (!(error instanceof LifecycleError)) throw error;
       readerFailureCode = error.code;
@@ -2182,12 +2294,11 @@ describe("projection build coordinator", () => {
       sidecarRetained: true,
       readerFailureCode: "MATERIALIZATION_CONFLICT",
     });
-    source.close();
+    closeOwned(source);
   });
 
   it("preserves a lease-boundary sidecar lstat integrity failure", async () => {
-    const root = mkdtempSync(join(tmpdir(), "projection-lease-sidecar-error-"));
-    roots.push(root);
+    const root = fixtureRoot("projection-lease-sidecar-error-", "raw");
     const sourcePath = join(root, "events.sqlite");
     const projectionDirectory = join(root, "projections");
     const source = sourceDatabase(sourcePath);
@@ -2211,12 +2322,11 @@ describe("projection build coordinator", () => {
       (error: unknown) => error instanceof LifecycleError
         && error.code === "INTEGRITY_FAILURE",
     );
-    source.close();
+    closeOwned(source);
   });
 
   it("never reclaims a published generation main file while a sidecar entry exists", async () => {
-    const root = mkdtempSync(join(tmpdir(), "projection-sidecar-reclamation-"));
-    roots.push(root);
+    const root = fixtureRoot("projection-sidecar-reclamation-", "raw");
     const sourcePath = join(root, "events.sqlite");
     const projectionDirectory = join(root, "projections");
     const source = sourceDatabase(sourcePath);
@@ -2237,12 +2347,11 @@ describe("projection build coordinator", () => {
     assert.equal(existsSync(published.databasePath), true);
     assert.equal(readFileSync(`${published.databasePath}-wal`, "utf8"), "unexpected published WAL");
     assert.equal(leases.reclamationIssues().length, 1);
-    source.close();
+    closeOwned(source);
   });
 
   it("preserves main and sidecar when a sidecar appears after the reclamation precheck", async () => {
-    const root = mkdtempSync(join(tmpdir(), "projection-reclamation-race-"));
-    roots.push(root);
+    const root = fixtureRoot("projection-reclamation-race-", "raw");
     const sourcePath = join(root, "events.sqlite");
     const projectionDirectory = join(root, "projections");
     const source = sourceDatabase(sourcePath);
@@ -2275,12 +2384,11 @@ describe("projection build coordinator", () => {
       leases.reclamationIssues().map((issue) => issue.errorCode),
       ["INTEGRITY_FAILURE"],
     );
-    source.close();
+    closeOwned(source);
   });
 
   it("returns projection lag at a zero deadline without starting source or build work", async () => {
-    const root = mkdtempSync(join(tmpdir(), "projection-zero-deadline-"));
-    roots.push(root);
+    const root = fixtureRoot("projection-zero-deadline-", "raw");
     let reads = 0;
     let builds = 0;
     const coordinator = new DefaultProjectionBuildCoordinator({
@@ -2308,8 +2416,7 @@ describe("projection build coordinator", () => {
   });
 
   it("returns projection lag at a zero deadline even when a sufficient generation exists", async () => {
-    const root = mkdtempSync(join(tmpdir(), "projection-existing-zero-deadline-"));
-    roots.push(root);
+    const root = fixtureRoot("projection-existing-zero-deadline-", "raw");
     const sourcePath = join(root, "events.sqlite");
     const projectionDirectory = join(root, "projections");
     const source = sourceDatabase(sourcePath);
@@ -2327,12 +2434,11 @@ describe("projection build coordinator", () => {
       (error: unknown) => error instanceof ProjectionLagError
         && error.availableEventPosition === 1n,
     );
-    source.close();
+    closeOwned(source);
   });
 
   it("maps a synchronously blocking source rejection observed after expiry to projection lag", async () => {
-    const root = mkdtempSync(join(tmpdir(), "projection-blocking-deadline-"));
-    roots.push(root);
+    const root = fixtureRoot("projection-blocking-deadline-", "raw");
     const projectionDirectory = join(root, "projections");
     const coordinator = new DefaultProjectionBuildCoordinator({
       projectionDirectory,
@@ -2356,8 +2462,7 @@ describe("projection build coordinator", () => {
   });
 
   it("bounds a slow source snapshot and closes its late result without invoking the builder", async () => {
-    const root = mkdtempSync(join(tmpdir(), "projection-slow-snapshot-"));
-    roots.push(root);
+    const root = fixtureRoot("projection-slow-snapshot-", "raw");
     let closed = 0;
     let builds = 0;
     let resolveSourceOpened = (): void => undefined;
@@ -2394,8 +2499,7 @@ describe("projection build coordinator", () => {
   });
 
   it("closes an active source snapshot as soon as the build deadline expires", async () => {
-    const root = mkdtempSync(join(tmpdir(), "projection-active-snapshot-deadline-"));
-    roots.push(root);
+    const root = fixtureRoot("projection-active-snapshot-deadline-", "raw");
     let closed = 0;
     let resolveBuilderEntered = (): void => undefined;
     const builderEntered = new Promise<void>((resolve) => { resolveBuilderEntered = resolve; });
@@ -2429,8 +2533,7 @@ describe("projection build coordinator", () => {
   });
 
   it("does not publish a build that completes after its caller deadline", async () => {
-    const root = mkdtempSync(join(tmpdir(), "projection-slow-build-"));
-    roots.push(root);
+    const root = fixtureRoot("projection-slow-build-", "raw");
     const sourcePath = join(root, "events.sqlite");
     const projectionDirectory = join(root, "projections");
     const source = sourceDatabase(sourcePath);
@@ -2455,7 +2558,7 @@ describe("projection build coordinator", () => {
     );
     await new Promise<void>((resolve) => setTimeout(resolve, 70));
     assert.equal(existsSync(join(projectionDirectory, "projection-manifest.json")), false);
-    source.close();
+    closeOwned(source);
   });
 
   it("returns V2 projection lag at a zero deadline when a sufficient generation exists", async () => {
@@ -2474,7 +2577,7 @@ describe("projection build coordinator", () => {
       assert.deepEqual(fixture.calls, calls);
       assert.equal(readFileSync(join(fixture.projectionDirectory, "projection-manifest.json"), "utf8"), manifest);
     } finally {
-      fixture.source.close();
+      closeOwned(fixture.source);
     }
   });
 
@@ -2500,7 +2603,7 @@ describe("projection build coordinator", () => {
       assert.equal(published.manifest.terminalEventPosition, "1");
       assert.deepEqual(fixture.calls, calls);
     } finally {
-      fixture.source.close();
+      closeOwned(fixture.source);
     }
   });
 
@@ -2521,13 +2624,12 @@ describe("projection build coordinator", () => {
       assert.deepEqual(fixture.calls, calls);
       assert.equal(readFileSync(join(fixture.projectionDirectory, "projection-manifest.json"), "utf8"), manifest);
     } finally {
-      fixture.source.close();
+      closeOwned(fixture.source);
     }
   });
 
   it("rejects a symlink-shaped projection directory before cleanup traversal", () => {
-    const root = mkdtempSync(join(tmpdir(), "projection-path-safety-"));
-    roots.push(root);
+    const root = fixtureRoot("projection-path-safety-", "raw");
     const projectionDirectory = join(root, "projections");
     mkdirSync(projectionDirectory);
     const knownTemp = join(projectionDirectory, ".projection-manifest.json.tmp");
@@ -2558,8 +2660,7 @@ describe("projection build coordinator", () => {
   });
 
   it("does not follow a projection directory replaced after cleanup authorization", async () => {
-    const root = mkdtempSync(join(tmpdir(), "projection-cleanup-swap-"));
-    roots.push(root);
+    const root = fixtureRoot("projection-cleanup-swap-", "raw");
     const projectionDirectory = join(root, "projections");
     const originalDirectory = join(root, "original-projections");
     const attackerDirectory = join(root, "attacker-directory");
@@ -2599,8 +2700,7 @@ describe("projection build coordinator", () => {
   });
 
   it("never reclaims through a replaced parent and retries against the pinned directory", async () => {
-    const root = mkdtempSync(join(tmpdir(), "projection-reclaim-parent-swap-"));
-    roots.push(root);
+    const root = fixtureRoot("projection-reclaim-parent-swap-", "raw");
     const sourcePath = join(root, "events.sqlite");
     const projectionDirectory = join(root, "projections");
     const originalDirectory = join(root, "original-projections");
@@ -2641,12 +2741,11 @@ describe("projection build coordinator", () => {
       leases.reclamationIssues().map((issue) => issue.errorCode),
       ["PROJECTION_RECLAMATION_DEFERRED"],
     );
-    source.close();
+    closeOwned(source);
   });
 
   it("keeps publication successful while retaining retired files for audited reclamation", async () => {
-    const root = mkdtempSync(join(tmpdir(), "projection-reclaim-retry-"));
-    roots.push(root);
+    const root = fixtureRoot("projection-reclaim-retry-", "raw");
     const sourcePath = join(root, "events.sqlite");
     const projectionDirectory = join(root, "projections");
     const source = sourceDatabase(sourcePath);
@@ -2684,7 +2783,7 @@ describe("projection build coordinator", () => {
       leases.reclamationIssues().map((issue) => [issue.errorCode, issue.attempts]),
       [["PROJECTION_RECLAMATION_DEFERRED", 2]],
     );
-    source.close();
+    closeOwned(source);
   });
 
   it("has no stable V2 orphan deletion operation", () => {
