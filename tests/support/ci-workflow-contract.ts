@@ -164,7 +164,7 @@ function assertWorkflowStructure(yaml: string, roles = false): ReadonlyMap<strin
     maps["jobs/*/steps/*/env"] = [...maps["jobs/*/steps/*/env"]!,
       "V2_CI_CANDIDATE_SHA", "V2_CI_APPROVED_WORKFLOW_SHA", "V2_CI_CONTROL_SHA",
       "V2_CI_OS", "V2_CI_RUN_ID", "V2_CI_RUN_ATTEMPT", "V2_CI_IDENTITY", "V2_CI_PHASE",
-      ...["runtime", "typecheck", "build", "tests", "lifecycle", "rollout", "foundation", "artifacts"]
+      ...["installation_policy", "installation", "installation_capability", "runtime", "typecheck", "build", "tests", "lifecycle", "rollout", "foundation", "artifacts"]
         .map(id => "V2_CI_OUTCOME_" + id.toUpperCase()),
       ...["build", "tests", "lifecycle", "rollout", "foundation", "artifacts"]
         .flatMap(id => ["V2_CI_RECORD_" + id.toUpperCase(), "V2_CI_PHASE_" + id.toUpperCase()])];
@@ -367,7 +367,7 @@ export const VERIFY_QUALIFICATION_CLOSURE = qualificationInlineProgram([
   ...QUALIFICATION_REPORT_PROGRAM,
   ...QUALIFICATION_MEASUREMENT_PROGRAM,
   "try {",
-  "  for (const gate of [\"runtime\", \"typecheck\", \"build\", \"tests\", \"lifecycle\", \"rollout\", \"foundation\", \"artifacts\"]) {",
+  "  for (const gate of [\"installation_policy\", \"installation\", \"installation_capability\", \"runtime\", \"typecheck\", \"build\", \"tests\", \"lifecycle\", \"rollout\", \"foundation\", \"artifacts\"]) {",
   "    if (process.env[\"V2_CI_OUTCOME_\" + gate.toUpperCase()] !== \"success\") fail(\"V2_CI_OUTCOME_INCOMPLETE\");",
   "  }",
   "  const bound = identity();",
@@ -408,7 +408,7 @@ function qualificationRecordPolicy(name: string, id: string | null, phase?: stri
     run = RECORD_QUALIFICATION_PHASE;
   } else if (id === null) {
     bindings.push("V2_CI_IDENTITY: ${{ steps.identity.outputs.receipt }}");
-    for (const gate of ["runtime", "typecheck", "build", "tests", "lifecycle", "rollout", "foundation", "artifacts"]) {
+    for (const gate of ["installation_policy", "installation", "installation_capability", "runtime", "typecheck", "build", "tests", "lifecycle", "rollout", "foundation", "artifacts"]) {
       bindings.push("V2_CI_OUTCOME_" + gate.toUpperCase() + ": ${{ steps." + gate + ".outcome }}");
     }
     for (const gate of ["build", "tests", "lifecycle", "rollout", "foundation", "artifacts"]) {
@@ -468,8 +468,16 @@ const ROLE_POLICY = {
             "node-version: ${{ matrix.node-version }}",
 ].join("\n"),
           [
+            "name: Check installation policy",
+            "run: node scripts/check-build-installation.js before",
+].join("\n"),
+          [
             "name: Install dependencies",
-            "run: npm ci",
+            "run: npm ci --ignore-scripts --include=dev --include=optional",
+].join("\n"),
+          [
+            "name: Check installation capability",
+            "run: node scripts/check-build-installation.js after",
 ].join("\n"),
           [
             "name: Check runtime capabilities",
@@ -628,8 +636,19 @@ const ROLE_POLICY = {
 ].join("\n"),
           qualificationRecordPolicy("Record qualification identity", "identity"),
           [
+            "name: Check installation policy",
+            "id: installation_policy",
+            "run: node scripts/check-build-installation.js before",
+].join("\n"),
+          [
             "name: Install dependencies",
-            "run: npm ci",
+            "id: installation",
+            "run: npm ci --ignore-scripts --include=dev --include=optional",
+].join("\n"),
+          [
+            "name: Check installation capability",
+            "id: installation_capability",
+            "run: node scripts/check-build-installation.js after",
 ].join("\n"),
           [
             "name: Check runtime capabilities",
@@ -728,8 +747,16 @@ const ROLE_POLICY = {
             "node-version: ${{ matrix.node-version }}",
 ].join("\n"),
           [
+            "name: Check installation policy",
+            "run: node scripts/check-build-installation.js before",
+].join("\n"),
+          [
             "name: Install dependencies",
-            "run: npm ci",
+            "run: npm ci --ignore-scripts --include=dev --include=optional",
+].join("\n"),
+          [
+            "name: Check installation capability",
+            "run: node scripts/check-build-installation.js after",
 ].join("\n"),
           [
             "name: Check runtime capabilities",
@@ -801,8 +828,20 @@ const ROLE_POLICY = {
             "run: |",
             "$logPath = \"ci-logs/sqlite-stress-${{ matrix.os }}.log\"",
             "New-Item -ItemType Directory -Force -Path (Split-Path $logPath) | Out-Null",
-            "Write-Output \"> npm ci\" | Tee-Object -FilePath $logPath -Append",
-            "& npm ci 2>&1 | Tee-Object -FilePath $logPath -Append",
+            "Write-Output \"> node scripts/check-build-installation.js before\" | Tee-Object -FilePath $logPath -Append",
+            "& node scripts/check-build-installation.js before 2>&1 | Tee-Object -FilePath $logPath -Append",
+            "$commandExitCode = $LASTEXITCODE",
+            "if ($commandExitCode -ne 0) {",
+            "exit $commandExitCode",
+            "}",
+            "Write-Output \"> npm ci --ignore-scripts --include=dev --include=optional\" | Tee-Object -FilePath $logPath -Append",
+            "& npm ci --ignore-scripts --include=dev --include=optional 2>&1 | Tee-Object -FilePath $logPath -Append",
+            "$commandExitCode = $LASTEXITCODE",
+            "if ($commandExitCode -ne 0) {",
+            "exit $commandExitCode",
+            "}",
+            "Write-Output \"> node scripts/check-build-installation.js after\" | Tee-Object -FilePath $logPath -Append",
+            "& node scripts/check-build-installation.js after 2>&1 | Tee-Object -FilePath $logPath -Append",
             "$commandExitCode = $LASTEXITCODE",
             "if ($commandExitCode -ne 0) {",
             "exit $commandExitCode",

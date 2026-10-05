@@ -1,12 +1,13 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { tmpdir } from "node:os";
-import { join, relative, sep } from "node:path";
+import { dirname, join, relative, sep } from "node:path";
 import test from "node:test";
 import ts from "typescript";
-import { assertCiWorkflowSet } from "./support/ci-workflow-contract.js";
+import { parse } from "yaml";
+import { assertCiWorkflowSet, requiredStep } from "./support/ci-workflow-contract.js";
 
 const ROOT = new URL("../../", import.meta.url);
 
@@ -557,6 +558,255 @@ test("release configuration gates lifecycle V2 without production routing", () =
   assert.match(smoke, /LIFECYCLE_V2_DISABLED/);
   assert.match(smoke, /zero lifecycle event\/dedup\/workflow effect/);
   assert.match(smoke, /event_count.*dedup_count.*workflow_count/s);
+});
+
+const INSTALLATION_STRESS_RUN = [
+  '$logPath = "ci-logs/sqlite-stress-${{ matrix.os }}.log"',
+  "New-Item -ItemType Directory -Force -Path (Split-Path $logPath) | Out-Null",
+  'Write-Output "> node scripts/check-build-installation.js before" | Tee-Object -FilePath $logPath -Append',
+  "& node scripts/check-build-installation.js before 2>&1 | Tee-Object -FilePath $logPath -Append",
+  "$commandExitCode = $LASTEXITCODE",
+  "if ($commandExitCode -ne 0) {",
+  "  exit $commandExitCode",
+  "}",
+  'Write-Output "> npm ci --ignore-scripts --include=dev --include=optional" | Tee-Object -FilePath $logPath -Append',
+  "& npm ci --ignore-scripts --include=dev --include=optional 2>&1 | Tee-Object -FilePath $logPath -Append",
+  "$commandExitCode = $LASTEXITCODE",
+  "if ($commandExitCode -ne 0) {",
+  "  exit $commandExitCode",
+  "}",
+  'Write-Output "> node scripts/check-build-installation.js after" | Tee-Object -FilePath $logPath -Append',
+  "& node scripts/check-build-installation.js after 2>&1 | Tee-Object -FilePath $logPath -Append",
+  "$commandExitCode = $LASTEXITCODE",
+  "if ($commandExitCode -ne 0) {",
+  "  exit $commandExitCode",
+  "}",
+].join("\n") + "\n";
+
+function installationWorkflows() {
+  return { pr: source(".github/workflows/ci.yml"), release: source(".github/workflows/v2-release-qualification.yml"),
+    legacy: source(".github/workflows/v2-legacy-regression.yml"), stress: source(".github/workflows/sqlite-stress.yml") };
+}
+
+test("installation consumers execute the exact ordered command-scoped sequence in four roles", () => {
+  const workflows = installationWorkflows();
+  assertCiWorkflowSet(workflows);
+  for (const [role, owner] of [["pr", "release-gates"], ["release", "qualification"], ["legacy", "legacy-regression"]] as const) {
+    const steps = parse(workflows[role]).jobs[owner].steps;
+    const expected = role === "release" ? [
+      { name: "Check installation policy", id: "installation_policy", run: "node scripts/check-build-installation.js before" },
+      { name: "Install dependencies", id: "installation", run: "npm ci --ignore-scripts --include=dev --include=optional" },
+      { name: "Check installation capability", id: "installation_capability", run: "node scripts/check-build-installation.js after" },
+    ] : [
+      { name: "Check installation policy", run: "node scripts/check-build-installation.js before" },
+      { name: "Install dependencies", run: "npm ci --ignore-scripts --include=dev --include=optional" },
+      { name: "Check installation capability", run: "node scripts/check-build-installation.js after" },
+    ];
+    const anchor = steps.findIndex((step: any) => step.name === (role === "release" ? "Record qualification identity" : "Set up Node.js"));
+    assert.ok(anchor >= 0);
+    assert.deepEqual(steps.slice(anchor + 1, anchor + 4), expected, role);
+    assert.equal(steps[anchor + 4].name, "Check runtime capabilities");
+  }
+  const stress = parse(workflows.stress).jobs.stress.steps;
+  assert.deepEqual(stress[2], { name: "Install dependencies", shell: "pwsh", run: INSTALLATION_STRESS_RUN });
+  assert.equal(stress[3].name, "Build tests");
+  assert.equal(parse(workflows.pr).jobs["minimum-runtime-rejection"].steps.length, 3);
+});
+
+test("installation grammar refuses missing duplicated reordered conditional ignored or persistent phases", () => {
+  const workflows = installationWorkflows();
+  for (const role of ["pr", "release", "legacy", "stress"] as const) {
+    const original = workflows[role];
+    // Stress repeats the command in its fixed log marker. Mutate the native
+    // invocation itself so refusal cannot be earned by changing display text.
+    const installCommand = (role === "stress" ? "& " : "") + "npm ci --ignore-scripts --include=dev --include=optional";
+    const mutateInstall = (replacement: string) => original.replace(installCommand, (role === "stress" ? "& " : "") + replacement);
+    const mutations = role === "stress" ? [
+      original.replace("& node scripts/check-build-installation.js before", "& node scripts/check-build-installation.js after"),
+      original.replace("& node scripts/check-build-installation.js after", "& node scripts/check-build-installation.js before"),
+      original.replace("          & node scripts/check-build-installation.js before 2>&1 | Tee-Object -FilePath $logPath -Append\n", ""),
+      original.replace("          & node scripts/check-build-installation.js after 2>&1 | Tee-Object -FilePath $logPath -Append\n", ""),
+      original.replace("& node scripts/check-build-installation.js after", "& node scripts/check-build-installation.js after; & node scripts/check-build-installation.js after"),
+      original.replace("          $commandExitCode = $LASTEXITCODE\n", "          $commandExitCode = 0\n"),
+      original.replace("        shell: pwsh", "        if: false\n        shell: pwsh"),
+    ] : [
+      ...["before", "after"].flatMap(phase => {
+        const block = new RegExp(`      - name: Check installation ${phase === "before" ? "policy" : "capability"}\\n(?:        id: [^\\n]+\\n)?        run: node scripts/check-build-installation.js ${phase}\\n`);
+        const match = block.exec(original)?.[0];
+        assert.ok(match, `actual ${role} ${phase} boundary`);
+        return [original.replace(match, ""), original.replace(match, match + "\n" + match),
+          original.replace(match, match.replace("        run:", "        if: false\n        run:")),
+          original.replace(match, match.replace("        run:", "        continue-on-error: true\n        run:")),
+          original.replace(match, match.replace(`node scripts/check-build-installation.js ${phase}`, "echo V2_BUILD_INSTALLATION_OK")),
+          original.replace(match, match.replace(`node scripts/check-build-installation.js ${phase}`, `node scripts/check-build-installation.js ${phase} || true`)),
+        ];
+      }),
+      original.replace("node scripts/check-build-installation.js before", "node scripts/check-build-installation.js after")
+        .replace("node scripts/check-build-installation.js after\n\n      - name: Check runtime", "node scripts/check-build-installation.js before\n\n      - name: Check runtime"),
+    ];
+    mutations.push(
+      mutateInstall("npm ci"),
+      mutateInstall("npm ci --ignore-scripts --include=dev"),
+      mutateInstall("npm config set ignore-scripts true; npm ci --ignore-scripts --include=dev --include=optional"),
+      original.replace("      - name: Install dependencies\n", "      - name: Install dependencies\n        env:\n          NPM_CONFIG_IGNORE_SCRIPTS: true\n"),
+      mutateInstall("echo ignore-scripts=true > .npmrc; npm ci --ignore-scripts --include=dev --include=optional"),
+    );
+    const installation = /      - name: Install dependencies\n[\s\S]*?(?=\n      - name:|(?![\s\S]))/.exec(original)?.[0];
+    assert.ok(installation, `actual ${role} installation owner`);
+    mutations.push(original.replace(installation, ""), original.replace(installation, installation + "\n" + installation),
+      original.replace(installation, installation.replace("        run:", "        if: false\n        run:")),
+      original.replace(installation, installation.replace("        run:", "        continue-on-error: true\n        run:")),
+      mutateInstall("echo V2_BUILD_INSTALLATION_OK"),
+      original.replace(installation, "").replace("      - name: Set up Node.js\n", installation + "\n      - name: Set up Node.js\n"));
+    for (const mutated of mutations) {
+      assert.notEqual(mutated, original, role + " mutation must reach its owner");
+      assert.throws(() => assertCiWorkflowSet({ ...workflows, [role]: mutated }), role);
+    }
+  }
+});
+
+test("release grammar binds each installation outcome to its actual same-job step", () => {
+  const workflows = installationWorkflows();
+  for (const [key, id] of [["INSTALLATION_POLICY", "installation_policy"], ["INSTALLATION", "installation"],
+    ["INSTALLATION_CAPABILITY", "installation_capability"]]) {
+    const binding = `V2_CI_OUTCOME_${key}: \${{ steps.${id}.outcome }}`;
+    assert.ok(workflows.release.includes(binding), `actual ${id} outcome binding`);
+    for (const replacement of ["success", `\${{ steps.${id}.conclusion }}`, `\${{ needs.other.outputs.${id} }}`,
+      "${{ steps.runtime.outcome }}", ""]) {
+      const mutated = workflows.release.replace(binding, `V2_CI_OUTCOME_${key}: ${replacement}`);
+      assert.notEqual(mutated, workflows.release);
+      assert.throws(() => assertCiWorkflowSet({ ...workflows, release: mutated }));
+    }
+    const missing = workflows.release.replace(`          ${binding}\n`, "");
+    assert.notEqual(missing, workflows.release);
+    assert.throws(() => assertCiWorkflowSet({ ...workflows, release: missing }));
+  }
+});
+
+// Execute the deployed inline JavaScript, including real Git identity and the six
+// real recorders. Only synthetic build workload bytes are supplied by the fixture.
+function qualificationProgram(name: string): string {
+  const body = requiredStep(source(".github/workflows/v2-release-qualification.yml"), "qualification", name).body;
+  const match = /          @'\n([\s\S]*?)          '@ \| & node --input-type=module/.exec(body);
+  assert.ok(match, "actual deployed inline program boundary");
+  return match[1]!.split("\n").map(line => line.startsWith("          ") ? line.slice(10) : line).join("\n");
+}
+
+test("actual qualification closure refuses all missing or non-success installation outcomes and removal falsely accepts", () => {
+  const directory = realpathSync.native(mkdtempSync(join(realpathSync.native(tmpdir()), "installation-closure-")));
+  const git = process.platform === "win32" ? "C:/Program Files/Git/cmd/git.exe" : "git";
+  const runGit = (...args: string[]) => {
+    const result = spawnSync(git, args, { cwd: directory, encoding: "utf8", windowsHide: true, timeout: 20000 });
+    assert.equal(result.error, undefined); assert.equal(result.status, 0, result.stderr);
+    return result.stdout.trim();
+  };
+  const environment: Record<string, string | undefined> = { ...process.env };
+  for (const key of Object.keys(environment)) if (key.startsWith("V2_CI_")) delete environment[key];
+  const run = (program: string, env: Record<string, string | undefined>) => {
+    const result = spawnSync(process.execPath, ["--input-type=module"], { input: program, cwd: directory,
+      env, encoding: "utf8", windowsHide: true, timeout: 20000, maxBuffer: 1024 * 1024 });
+    assert.equal(result.error, undefined); assert.notEqual(result.status, null);
+    return result;
+  };
+  try {
+    runGit("init", "--quiet");
+    writeFileSync(join(directory, "package-lock.json"), '{"synthetic":true}\n');
+    writeFileSync(join(directory, ".gitignore"), "dist/\ndist-test/\nreceipt.out\n");
+    runGit("add", ".");
+    runGit("-c", "user.name=Synthetic qualification", "-c", "user.email=qualification@example.invalid",
+      "commit", "--quiet", "-m", "synthetic identity");
+    const sha = runGit("rev-parse", "HEAD");
+    Object.assign(environment, { V2_CI_CANDIDATE_SHA: sha, V2_CI_CONTROL_SHA: sha, V2_CI_APPROVED_WORKFLOW_SHA: sha,
+      V2_CI_OS: "windows-latest", V2_CI_RUN_ID: "12345", V2_CI_RUN_ATTEMPT: "1", GITHUB_OUTPUT: join(directory, "receipt.out") });
+    const receipt = () => readFileSync(join(directory, "receipt.out"), "utf8").trim().split(/\r?\n/).at(-1)!.slice("receipt=".length);
+    const identity = run(qualificationProgram("Record qualification identity"), environment);
+    assert.equal(identity.status, 0, identity.stderr); assert.match(identity.stdout, /^V2_CI_RECEIPT /);
+    environment.V2_CI_IDENTITY = receipt();
+    for (const key of ["INSTALLATION_POLICY", "INSTALLATION", "INSTALLATION_CAPABILITY", "RUNTIME", "TYPECHECK", "BUILD", "TESTS", "LIFECYCLE", "ROLLOUT", "FOUNDATION", "ARTIFACTS"])
+      environment["V2_CI_OUTCOME_" + key] = "success";
+    for (const phase of ["build", "tests", "lifecycle", "rollout", "foundation", "artifacts"]) {
+      const generation = phase === "artifacts" ? "final-generation" : "initial-generation";
+      for (const path of ["v2.js", "v2-admin.js", "workers/project-store.worker.js", "internal/v2-internal-verified-read.js", "internal/v2-internal-verified-read-cleanup.js"]) {
+        mkdirSync(dirname(join(directory, "dist", path)), { recursive: true });
+        writeFileSync(join(directory, "dist", path), generation + ":" + path);
+      }
+      writeFileSync(join(directory, "dist/v2-build.json"), JSON.stringify({ deploymentId: generation }));
+      if (phase !== "build") {
+        mkdirSync(join(directory, "dist-test/tests"), { recursive: true });
+        writeFileSync(join(directory, "dist-test/tests/probe.js"), "compiled:" + phase);
+      }
+      const record = run(qualificationProgram("Record " + phase + " identity"), { ...environment, V2_CI_PHASE: phase });
+      assert.equal(record.status, 0, record.stderr); assert.match(record.stdout, /^V2_CI_RECEIPT /);
+      environment["V2_CI_RECORD_" + phase.toUpperCase()] = "success";
+      environment["V2_CI_PHASE_" + phase.toUpperCase()] = receipt();
+    }
+    const program = qualificationProgram("Verify qualification closure");
+    const complete = run(program, environment);
+    assert.equal(complete.status, 0, complete.stderr);
+    assert.equal(complete.stdout, "V2_CI_QUALIFICATION_COMPLETE\n", "positive identity/recorder/output closure boundary");
+    for (const [key, gate] of [["INSTALLATION_POLICY", "installation_policy"], ["INSTALLATION", "installation"], ["INSTALLATION_CAPABILITY", "installation_capability"]]) {
+      for (const outcome of [undefined, "", "failure", "cancelled", "skipped", "SUCCESS", "V2_BUILD_INSTALLATION_OK"]) {
+        const env = { ...environment, ["V2_CI_OUTCOME_" + key]: outcome };
+        const refused = run(program, env);
+        assert.equal(refused.status, 1, `${key} ${String(outcome)} must refuse at the outcome gate`);
+        assert.equal(refused.stderr, "V2_CI_OUTCOME_INCOMPLETE\n");
+        assert.equal(refused.stdout, "");
+      }
+      const mutant = program.replace(`"${gate}", `, "");
+      assert.notEqual(mutant, program, `remove ${gate} from actual outcome enforcement`);
+      const falselyAccepted = run(mutant, { ...environment, ["V2_CI_OUTCOME_" + key]: undefined });
+      assert.equal(falselyAccepted.status, 0, falselyAccepted.stderr);
+      assert.equal(falselyAccepted.stdout, "V2_CI_QUALIFICATION_COMPLETE\n", "removed-outcome false-acceptance sentinel");
+    }
+  } finally { rmSync(directory, { recursive: true, force: true }); }
+});
+
+test("actual stress installation propagates each reached native failure before later phases", () => {
+  const directory = realpathSync.native(mkdtempSync(join(realpathSync.native(tmpdir()), "installation-stress-")));
+  const powershell = process.platform === "win32" ? "C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe" : "pwsh";
+  const helper = join(directory, "native.cjs");
+  const script = parse(source(".github/workflows/sqlite-stress.yml")).jobs.stress.steps.find((step: any) => step.name === "Install dependencies").run as string;
+  const expected = [["node", "scripts/check-build-installation.js", "before"], ["npm", "ci", "--ignore-scripts", "--include=dev", "--include=optional"], ["node", "scripts/check-build-installation.js", "after"]];
+  try {
+    writeFileSync(helper, `const fs=require('node:fs');const args=process.argv.slice(2);
+fs.appendFileSync('trace.jsonl',JSON.stringify(args)+'\\n');
+const phase=args[0]==='npm'?'installation':args.at(-1);
+process.exit(phase===process.env.FIXTURE_FAILURE?Number(process.env.FIXTURE_EXIT):0);`);
+    const prefix = [
+      "$fixtureNodeApplication = @(Get-Command -Name $env:FIXTURE_NODE -CommandType Application -ErrorAction Stop)[0].Path",
+      "$fixtureHelper = $env:FIXTURE_HELPER",
+      "function node { & $fixtureNodeApplication $fixtureHelper 'node' @args }",
+      "function npm { & $fixtureNodeApplication $fixtureHelper 'npm' @args }",
+    ].join("\n") + "\n";
+    const run = (body: string, phase: string, code: number) => {
+      rmSync(join(directory, "trace.jsonl"), { force: true });
+      const result = spawnSync(powershell, ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command",
+        prefix + body.replaceAll("${{ matrix.os }}", "fixture-os") + '\nWrite-Output "FIXTURE_LATER_BOUNDARY"'],
+      { cwd: directory, encoding: "utf8", windowsHide: true, timeout: 20000, maxBuffer: 1024 * 1024,
+        env: { ...process.env, FIXTURE_NODE: process.execPath, FIXTURE_HELPER: helper, FIXTURE_FAILURE: phase, FIXTURE_EXIT: String(code) } });
+      assert.equal(result.error, undefined, "native owned shell must close within its bound");
+      assert.notEqual(result.status, null);
+      const trace = readFileSync(join(directory, "trace.jsonl"), "utf8").trim().split(/\r?\n/).map(line => JSON.parse(line));
+      return { ...result, trace };
+    };
+    const positive = run(script, "none", 0);
+    assert.equal(positive.status, 0, positive.stderr); assert.deepEqual(positive.trace, expected);
+    assert.match(positive.stdout, /FIXTURE_LATER_BOUNDARY/);
+    for (const [index, phase, code] of [[0, "before", 37], [1, "installation", 41], [2, "after", 43]] as const) {
+      const refusal = run(script, phase, code);
+      assert.deepEqual(refusal.trace, expected.slice(0, index + 1), phase + " reached native boundary");
+      assert.equal(refusal.status, code, refusal.stderr);
+      assert.doesNotMatch(refusal.stdout, /FIXTURE_LATER_BOUNDARY/);
+      const checks = [...script.matchAll(/if \(\$commandExitCode -ne 0\) \{\n  exit \$commandExitCode\n\}/g)];
+      assert.equal(checks.length, 3, "three immediate native failure owners");
+      const target = checks[index]!;
+      const mutant = script.slice(0, target.index!) + script.slice(target.index! + target[0].length);
+      const lostFailure = run(mutant, phase, code);
+      assert.equal(lostFailure.status, 0, lostFailure.stderr);
+      assert.deepEqual(lostFailure.trace, expected);
+      assert.match(lostFailure.stdout, /FIXTURE_LATER_BOUNDARY/, "removed native guard falsely accepts");
+    }
+  } finally { rmSync(directory, { recursive: true, force: true }); }
 });
 
 test("workflow parser rejects duplicate jobs, mappings, and executable steps", () => {

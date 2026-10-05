@@ -128,8 +128,17 @@ jobs:
           '@ | & node --input-type=module
           if ($LASTEXITCODE -ne 0) { throw "V2_CI_IDENTITY_RECORD_FAILED" }
 
+      - name: Check installation policy
+        id: installation_policy
+        run: node scripts/check-build-installation.js before
+
       - name: Install dependencies
-        run: npm ci
+        id: installation
+        run: npm ci --ignore-scripts --include=dev --include=optional
+
+      - name: Check installation capability
+        id: installation_capability
+        run: node scripts/check-build-installation.js after
 
       - name: Check runtime capabilities
         id: runtime
@@ -719,6 +728,9 @@ jobs:
           V2_CI_RUN_ID: ${{ github.run_id }}
           V2_CI_RUN_ATTEMPT: ${{ github.run_attempt }}
           V2_CI_IDENTITY: ${{ steps.identity.outputs.receipt }}
+          V2_CI_OUTCOME_INSTALLATION_POLICY: ${{ steps.installation_policy.outcome }}
+          V2_CI_OUTCOME_INSTALLATION: ${{ steps.installation.outcome }}
+          V2_CI_OUTCOME_INSTALLATION_CAPABILITY: ${{ steps.installation_capability.outcome }}
           V2_CI_OUTCOME_RUNTIME: ${{ steps.runtime.outcome }}
           V2_CI_OUTCOME_TYPECHECK: ${{ steps.typecheck.outcome }}
           V2_CI_OUTCOME_BUILD: ${{ steps.build.outcome }}
@@ -806,7 +818,7 @@ jobs:
               manifest: manifest ? hash(manifest) : null, deployment, artifacts };
           };
           try {
-            for (const gate of ["runtime", "typecheck", "build", "tests", "lifecycle", "rollout", "foundation", "artifacts"]) {
+            for (const gate of ["installation_policy", "installation", "installation_capability", "runtime", "typecheck", "build", "tests", "lifecycle", "rollout", "foundation", "artifacts"]) {
               if (process.env["V2_CI_OUTCOME_" + gate.toUpperCase()] !== "success") fail("V2_CI_OUTCOME_INCOMPLETE");
             }
             const bound = identity();

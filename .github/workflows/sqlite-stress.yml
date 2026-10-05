@@ -40,8 +40,20 @@ jobs:
         run: |
           $logPath = "ci-logs/sqlite-stress-${{ matrix.os }}.log"
           New-Item -ItemType Directory -Force -Path (Split-Path $logPath) | Out-Null
-          Write-Output "> npm ci" | Tee-Object -FilePath $logPath -Append
-          & npm ci 2>&1 | Tee-Object -FilePath $logPath -Append
+          Write-Output "> node scripts/check-build-installation.js before" | Tee-Object -FilePath $logPath -Append
+          & node scripts/check-build-installation.js before 2>&1 | Tee-Object -FilePath $logPath -Append
+          $commandExitCode = $LASTEXITCODE
+          if ($commandExitCode -ne 0) {
+            exit $commandExitCode
+          }
+          Write-Output "> npm ci --ignore-scripts --include=dev --include=optional" | Tee-Object -FilePath $logPath -Append
+          & npm ci --ignore-scripts --include=dev --include=optional 2>&1 | Tee-Object -FilePath $logPath -Append
+          $commandExitCode = $LASTEXITCODE
+          if ($commandExitCode -ne 0) {
+            exit $commandExitCode
+          }
+          Write-Output "> node scripts/check-build-installation.js after" | Tee-Object -FilePath $logPath -Append
+          & node scripts/check-build-installation.js after 2>&1 | Tee-Object -FilePath $logPath -Append
           $commandExitCode = $LASTEXITCODE
           if ($commandExitCode -ne 0) {
             exit $commandExitCode
