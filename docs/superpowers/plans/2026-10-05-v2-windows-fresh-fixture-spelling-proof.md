@@ -10,7 +10,7 @@
 
 **Spec:** [Approved causal-remediation design](../specs/2026-10-04-v2-hosted-ci-remediation-design.md), especially causal proof, owned fixture spelling and preserved route/cleanup contracts. [Installation-policy A](../specs/2026-10-04-v2-build-installation-policy-a-design.md) and [CI-role design](../specs/2026-10-04-v2-fast-pr-full-release-ci-design.md) remain binding outside this narrow follow-up.
 
-**Status:** Draft for human review. Preparation is not approval to edit the fixture/tests or execute diagnostics. Preserve the selected Subagent-Driven method after written-plan approval. This plan proposes exactly three future owners below; it does not expand the earlier installation plan silently.
+**Status:** The human approved this written plan on2026-10-05 in reply to the linked plan at commit `2f3118aa3324cdebfdf75aa30dc691e9b6323c01`. Execute its exactly three named local owners and owned verification with the preserved Subagent-Driven method. This approval does not establish completion or authorize publication, hosted actions or PROD; it does not expand the earlier installation plan silently.
 
 ## Global Constraints
 
@@ -52,7 +52,7 @@ Root native comparison confirmed all11named relevant fixture/diagnostic/guard bl
 
 Sealed runtime route owner `src/orchestrator/runtime/project-store-worker-backend.ts` remains read-only. If its two equality checks cannot be distinguished sufficiently, return with the exact uncertainty for a private-observation amendment; do not introduce a new channel, production reason, caller-controlled path or acceptance bypass here.
 
-## Task1: Owned Fresh Root-Spelling Counterfactual
+## Task 1: Owned Fresh Root-Spelling Counterfactual
 
 **Interfaces:** Add test-only `freshStoreSpellingFixture(spelling: "raw" | "native"): { connection: SqliteConnection; rawRoot: string; nativeRoot: string; openedRoot: string; rawIsNative: boolean; closeConnection(): void; cleanup(): void }` in the existing support owner. No arbitrary caller root. Capture the created raw directory's precise BigInt dev/ino/birth identity before resolving native spelling or creating/opening descendants; both spellings must refer to that same nonsymlink owner. Return paths only to the trusted test process, never diagnostic JSON. `closeConnection()` independently closes the acquired connection and latches its receipt; `cleanup()` first requires/obtains that receipt, verifies the original bound owner and refuses replacement/junction/redirection. Setup failures throw fixed `CI_FRESH_SPELLING_SETUP_INCOMPLETE`; uncertain close/cleanup throws fixed `CI_FRESH_SPELLING_CLEANUP_INCOMPLETE`, never arbitrary filesystem messages. Caller always attempts fixture connection close even if backend close fails, but calls root-removal cleanup only after both closure receipts; otherwise retain the root. An open failure without a positively acquired connection receipt cannot be relabeled closed or authorize removal. Existing two helpers keep their current signatures/behavior.
 
@@ -70,4 +70,4 @@ Consume the existing `active(installedRelease = release)` initialization sequenc
 
 One independently reviewable proof task owns fixture interface, direct-backend assertions and truthful handoff together. Parent causal requirements map to exact raw control/native variation/business reachability/hostile guards/closure; all five Review Focus classes have named Task1 controls. Test helper signatures agree, existing callers remain unchanged, and no sealed owner/channel is added. No further subsystem is implemented by this plan.
 
-Please review this written plan and confirm its exact three-owner scope before implementation. Preserve Subagent-Driven. Plan approval permits named local owned proof/commit/review only; it does not authorize push or a new hosted probe. Complete Task5/final release/whole-system PROD readiness remains open.
+The written plan is approved for execution with Subagent-Driven. Plan approval permits named local owned proof/commit/review only; it does not authorize push or a new hosted probe. Checkboxes record actual accepted work only. Complete Task5/final release/whole-system PROD readiness remains open.
