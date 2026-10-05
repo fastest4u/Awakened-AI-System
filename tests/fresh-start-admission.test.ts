@@ -1,5 +1,5 @@
 import { strict as assert } from "node:assert";
-import { it } from "node:test";
+import { it, type TestContext } from "node:test";
 import { EventStore, SqliteEventStoreStatements } from "../src/orchestrator/storage/event-store.js";
 import { MaintenanceFence } from "../src/orchestrator/storage/maintenance-fence.js";
 import { BranchScopeRepository } from "../src/orchestrator/storage/branch-scope.repository.js";
@@ -187,6 +187,141 @@ function sameOwner(left: string, right: string): boolean {
   return a.isDirectory() && b.isDirectory() && !a.isSymbolicLink() && !b.isSymbolicLink()
     && a.dev === b.dev && a.ino === b.ino && a.birthtimeNs === b.birthtimeNs;
 }
+
+function defaultCreation(t: TestContext) {
+  const original = fs.mkdtempSync;
+  let created: { path: string; identity: BigIntStats } | undefined;
+  const hook = t.mock.method(fs, "mkdtempSync", (...args: Parameters<typeof original>) => {
+    const path = original(...args);
+    created = { path: String(path), identity: lstatSync(path, { bigint: true }) };
+    return path;
+  });
+  syncBuiltinESMExports();
+  return { owner() { assert.ok(created); return created; }, restore() { hook.mock.restore(); syncBuiltinESMExports(); } };
+}
+function assertDefaultOwner(owner: { path: string; identity: BigIntStats }) {
+  const current = lstatSync(owner.path, { bigint: true });
+  assert.equal(current.isDirectory() && !current.isSymbolicLink()
+    && current.dev === owner.identity.dev && current.ino === owner.identity.ino
+    && current.birthtimeNs === owner.identity.birthtimeNs, true);
+}
+function defaultConnectionClosed(fixture: ReturnType<typeof freshStore>): boolean {
+  try { fixture.connection.prepare("SELECT 1").get(); return false; } catch { return true; }
+}
+
+it("CI fresh default fixture: native spelling before open and owned marker cleanup", t => {
+  const creation = defaultCreation(t), originalOpen = NodeSqliteDriver.prototype.open;
+  let openedPath: string | undefined;
+  const hook = t.mock.method(NodeSqliteDriver.prototype, "open", function(this: NodeSqliteDriver, ...args: Parameters<typeof originalOpen>) {
+    openedPath = args[0]; return originalOpen.apply(this, args);
+  });
+  let fixture: ReturnType<typeof freshStore> | undefined;
+  try {
+    fixture = freshStore();
+    const owner = creation.owner(); assertDefaultOwner(owner);
+    assert.equal(openedPath, join(resolve(realpathSync.native(owner.path)), "events.sqlite"));
+    writeFileSync(join(owner.path, "caller-marker"), "owned marker");
+    fixture.cleanup();
+    assert.equal(defaultConnectionClosed(fixture), true);
+    assert.equal(existsSync(owner.path), false);
+  } finally { hook.mock.restore(); creation.restore(); if (fixture && !defaultConnectionClosed(fixture)) fixture.cleanup(); }
+});
+
+it("CI fresh default fixture: redirected lookup refuses before open", t => {
+  const outside = freshStore(), outsidePath = dirname(outside.connection.prepare("PRAGMA database_list").get()!.file as string);
+  const creation = defaultCreation(t);
+  let opened = false;
+  const openHook = t.mock.method(NodeSqliteDriver.prototype, "open", () => { opened = true; throw new Error("unreachable open"); });
+  const nativeHook = t.mock.method(realpathSync, "native", () => outsidePath);
+  try {
+    assert.throws(() => freshStore(), { code: "CI_FRESH_STORE_ROOT_INVALID", message: "CI_FRESH_STORE_ROOT_INVALID" });
+    assert.equal(opened, false);
+    assertDefaultOwner(creation.owner());
+    assert.equal(existsSync(join(creation.owner().path, "events.sqlite")), false);
+  } finally { nativeHook.mock.restore(); openHook.mock.restore(); creation.restore(); outside.cleanup(); }
+});
+
+for (const replacement of ["directory", "junction"] as const) it(`CI fresh default fixture: ${replacement} replacement preserves sentinel`, t => {
+  const creation = defaultCreation(t), fixture = freshStore(), owner = creation.owner(); creation.restore();
+  const outside = freshStore(), outsidePath = resolve(realpathSync.native(dirname(outside.connection.prepare("PRAGMA database_list").get()!.file as string)));
+  const moved = join(outsidePath, "original");
+  const nativeRoot = resolve(realpathSync.native(owner.path));
+  const sentinel = join(replacement === "directory" ? nativeRoot : outsidePath, "sentinel");
+  let replacementIdentity: BigIntStats | undefined;
+  let restored = false;
+  const close = fixture.connection.close.bind(fixture.connection);
+  const closeHook = t.mock.method(fixture.connection, "close", () => {
+    close(); assertDefaultOwner(owner);
+    renameSync(nativeRoot, moved);
+    if (replacement === "directory") mkdirSync(nativeRoot);
+    else symlinkSync(outsidePath, nativeRoot, process.platform === "win32" ? "junction" : "dir");
+    replacementIdentity = lstatSync(nativeRoot, { bigint: true });
+    writeFileSync(sentinel, "preserved");
+  });
+  try {
+    assert.throws(() => fixture.cleanup(), { code: "CI_FRESH_STORE_CLEANUP_INCOMPLETE", message: "CI_FRESH_STORE_CLEANUP_INCOMPLETE" });
+    assert.equal(defaultConnectionClosed(fixture), true); assert.ok(replacementIdentity);
+    assert.equal(readFileSync(sentinel, "utf8"), "preserved");
+    const current = lstatSync(owner.path, { bigint: true });
+    assert.equal(current.dev === replacementIdentity.dev && current.ino === replacementIdentity.ino && current.birthtimeNs === replacementIdentity.birthtimeNs, true);
+    unlinkSync(sentinel);
+    if (replacement === "junction") unlinkSync(nativeRoot); else rmdirSync(nativeRoot);
+    renameSync(moved, nativeRoot); restored = true; assertDefaultOwner(owner);
+    assert.throws(() => fixture.cleanup(), { code: "CI_FRESH_STORE_CLEANUP_INCOMPLETE" });
+    t.diagnostic("original connection closed; restored original root retained after ownership uncertainty");
+  } finally {
+    closeHook.mock.restore(); creation.restore();
+    if (!defaultConnectionClosed(fixture)) fixture.connection.close();
+    if (restored) outside.cleanup(); else outside.connection.close();
+  }
+});
+
+it("CI fresh default fixture: schema failure preserves primary and closes acquired connection", t => {
+  const creation = defaultCreation(t), originalOpen = NodeSqliteDriver.prototype.open, primary = new Error("owned schema fault");
+  let acquired: ReturnType<typeof freshStore> | undefined;
+  const hook = t.mock.method(NodeSqliteDriver.prototype, "open", function(this: NodeSqliteDriver, ...args: Parameters<typeof originalOpen>) {
+    const connection = originalOpen.apply(this, args);
+    acquired = { connection, cleanup() {} }; connection.exec = () => { throw primary; }; return connection;
+  });
+  try {
+    assert.throws(() => freshStore(), error => error === primary);
+    assert.ok(acquired); assert.equal(defaultConnectionClosed(acquired), true);
+    assert.equal(existsSync(creation.owner().path), false);
+  } finally { hook.mock.restore(); creation.restore(); if (acquired && !defaultConnectionClosed(acquired)) acquired.connection.close(); }
+});
+
+it("CI fresh default fixture: open failure preserves primary and retains original root", t => {
+  const creation = defaultCreation(t), primary = new Error("owned open fault");
+  const hook = t.mock.method(NodeSqliteDriver.prototype, "open", () => { throw primary; });
+  try { assert.throws(() => freshStore(), error => error === primary); assertDefaultOwner(creation.owner()); }
+  finally { hook.mock.restore(); creation.restore(); }
+});
+
+it("CI fresh default fixture: connection close failure stays primary and retains root", t => {
+  const creation = defaultCreation(t), fixture = freshStore(), owner = creation.owner(); creation.restore();
+  const primary = new Error("owned close fault"), hook = t.mock.method(fixture.connection, "close", () => { throw primary; });
+  try {
+    assert.throws(() => fixture.cleanup(), error => error === primary); assertDefaultOwner(owner);
+  } finally { hook.mock.restore(); creation.restore(); fixture.connection.close(); }
+  assert.equal(defaultConnectionClosed(fixture), true);
+  assert.throws(() => fixture.cleanup(), { code: "CI_FRESH_STORE_CLEANUP_INCOMPLETE", message: "CI_FRESH_STORE_CLEANUP_INCOMPLETE" });
+  assertDefaultOwner(owner);
+});
+
+it("CI fresh default fixture: schema primary survives failed close with root retained", t => {
+  const creation = defaultCreation(t), originalOpen = NodeSqliteDriver.prototype.open;
+  const primary = new Error("owned setup fault"), closeFailure = new Error("owned setup close fault");
+  let acquired: ReturnType<typeof freshStore> | undefined, restoreClose: (() => void) | undefined;
+  const hook = t.mock.method(NodeSqliteDriver.prototype, "open", function(this: NodeSqliteDriver, ...args: Parameters<typeof originalOpen>) {
+    const connection = originalOpen.apply(this, args); acquired = { connection, cleanup() {} };
+    connection.exec = () => { throw primary; };
+    const closeHook = t.mock.method(connection, "close", () => { throw closeFailure; }); restoreClose = () => closeHook.mock.restore();
+    return connection;
+  });
+  try { assert.throws(() => freshStore(), error => error === primary); assertDefaultOwner(creation.owner()); }
+  finally { restoreClose?.(); hook.mock.restore(); creation.restore(); acquired?.connection.close(); }
+  assert.ok(acquired); assert.equal(defaultConnectionClosed(acquired), true); assertDefaultOwner(creation.owner());
+});
 
 // Catches a wrong root producer, omitted close, or a route guard weakened to admit aliases.
 for (const spelling of ["native", "raw"] as const) it(`CI fresh fixture spelling proof: ${spelling} direct opening`, async t => {

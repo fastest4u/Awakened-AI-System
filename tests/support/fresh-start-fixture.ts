@@ -78,11 +78,56 @@ export function freshGenesis(overrides: Partial<FreshStartGenesis> = {}): FreshS
 
 export function freshStore(): { connection: SqliteConnection; cleanup(): void } {
   const root = mkdtempSync(join(tmpdir(), `fresh-start-${randomUUID()}-`));
-  const connection = new NodeSqliteDriver({ DatabaseSync }).open(join(root, "events.sqlite"), {
-    mode: "create", busyTimeoutMs: 1_000,
-  });
-  applyCurrentProjectStoreSchema(connection, FRESH_IDENTITY, FRESH_NOW);
-  return { connection, cleanup(): void { connection.close(); rmSync(root, { recursive: true, force: true }); } };
+  // Creation authority precedes native lookup and every database-derived identity.
+  const created = lstatSync(root, { bigint: true });
+  const rootCode = "CI_FRESH_STORE_ROOT_INVALID", cleanupCode = "CI_FRESH_STORE_CLEANUP_INCOMPLETE";
+  const fixedError = (code: string) => Object.assign(new Error(code), { code });
+  let nativeRoot: string | undefined, connection: SqliteConnection | undefined;
+  let closed = false, removed = false, incomplete = false;
+  const equalSpelling = (a: string, b: string) => process.platform === "win32" ? a.toLowerCase() === b.toLowerCase() : a === b;
+  function sameOwner(current: BigIntStats): boolean {
+    return created.isDirectory() && !created.isSymbolicLink() && current.isDirectory() && !current.isSymbolicLink()
+      && current.dev === created.dev && current.ino === created.ino && current.birthtimeNs === created.birthtimeNs;
+  }
+  function assertOwner(code: string): void {
+    try {
+      if (nativeRoot === undefined || !sameOwner(lstatSync(root, { bigint: true }))
+        || !sameOwner(lstatSync(nativeRoot, { bigint: true }))
+        || !equalSpelling(resolve(realpathSync.native(root)), nativeRoot)
+        || !equalSpelling(resolve(realpathSync.native(nativeRoot)), nativeRoot)) throw fixedError(code);
+    } catch { throw fixedError(code); }
+  }
+  function cleanup(): void {
+    if (incomplete) throw fixedError(cleanupCode);
+    if (removed) return;
+    if (connection === undefined) { incomplete = true; throw fixedError(cleanupCode); }
+    if (!closed) {
+      try { connection.close(); closed = true; }
+      catch (primary) { incomplete = true; throw primary; }
+    }
+    try {
+      assertOwner(cleanupCode);
+      // Default callers own marker leaves too; only the captured original root grants removal.
+      rmSync(root, { recursive: true, force: true });
+      removed = true;
+    } catch { incomplete = true; throw fixedError(cleanupCode); }
+  }
+  try {
+    if (!created.isDirectory() || created.isSymbolicLink()) throw fixedError(rootCode);
+    try { nativeRoot = resolve(realpathSync.native(root)); } catch { throw fixedError(rootCode); }
+    assertOwner(rootCode);
+    connection = new NodeSqliteDriver({ DatabaseSync }).open(join(nativeRoot, "events.sqlite"), {
+      mode: "create", busyTimeoutMs: 1_000,
+    });
+    applyCurrentProjectStoreSchema(connection, FRESH_IDENTITY, FRESH_NOW);
+    assertOwner(rootCode);
+    return { connection, cleanup };
+  } catch (primary) {
+    // Only a positively acquired and closed connection permits owned cleanup; never replace setup's error.
+    if (connection !== undefined) { try { cleanup(); } catch { incomplete = true; } }
+    else incomplete = true;
+    throw primary;
+  }
 }
 
 /** Opt-in owned spelling experiment only; the default fixtures retain their behavior. */
