@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, rmdirSync, unlinkSync, writeFileSync, type BigIntStats } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
 import type { FreshStartGenesis, FreshStartIdentity, FreshStartRelease } from "../../src/orchestrator/fresh-start/contracts.js";
@@ -83,6 +83,88 @@ export function freshStore(): { connection: SqliteConnection; cleanup(): void } 
   });
   applyCurrentProjectStoreSchema(connection, FRESH_IDENTITY, FRESH_NOW);
   return { connection, cleanup(): void { connection.close(); rmSync(root, { recursive: true, force: true }); } };
+}
+
+/** Opt-in owned spelling experiment only; the default fixtures retain their behavior. */
+export function freshStoreSpellingFixture(spelling: "raw" | "native"): {
+  connection: SqliteConnection; rawRoot: string; nativeRoot: string; openedRoot: string;
+  rawIsNative: boolean; closeConnection(): void; cleanup(): void;
+} {
+  const setupCode = "CI_FRESH_SPELLING_SETUP_INCOMPLETE";
+  const cleanupCode = "CI_FRESH_SPELLING_CLEANUP_INCOMPLETE";
+  const fixedError = (code: string) => Object.assign(new Error(code), { code });
+  let rawRoot: string | undefined, nativeRoot: string | undefined, created: BigIntStats | undefined;
+  let connection: SqliteConnection | undefined;
+  let closed = false, removed = false, incomplete = false;
+  const equalSpelling = (a: string, b: string) => process.platform === "win32" ? a.toLowerCase() === b.toLowerCase() : a === b;
+  function sameOwner(current: BigIntStats): boolean {
+    return created !== undefined && current.isDirectory() && !current.isSymbolicLink()
+      && current.dev === created.dev && current.ino === created.ino && current.birthtimeNs === created.birthtimeNs;
+  }
+  function assertOwner(): void {
+    if (rawRoot === undefined || nativeRoot === undefined
+      || !sameOwner(lstatSync(rawRoot, { bigint: true })) || !sameOwner(lstatSync(nativeRoot, { bigint: true }))
+      || !equalSpelling(resolve(realpathSync.native(rawRoot)), nativeRoot)
+      || !equalSpelling(resolve(realpathSync.native(nativeRoot)), nativeRoot)) throw fixedError(cleanupCode);
+  }
+  function closeConnection(): void {
+    if (incomplete) throw fixedError(cleanupCode);
+    if (closed) return;
+    // A failed open gives no positively acquired connection and cannot grant a close receipt.
+    if (connection === undefined) { incomplete = true; throw fixedError(cleanupCode); }
+    try { connection.close(); closed = true; }
+    catch { incomplete = true; throw fixedError(cleanupCode); }
+  }
+  function cleanup(): void {
+    if (incomplete) throw fixedError(cleanupCode);
+    if (removed) return;
+    try {
+      closeConnection();
+      assertOwner();
+      const root = rawRoot!;
+      // This fixture creates only SQLite leaves. Refuse descendants and links rather than traverse them.
+      const leaves = readdirSync(root).map(name => {
+        if (!["events.sqlite", "events.sqlite-wal", "events.sqlite-shm"].includes(name)) throw fixedError(cleanupCode);
+        const path = join(root, name), identity = lstatSync(path, { bigint: true });
+        if (!identity.isFile() || identity.isSymbolicLink() || identity.nlink !== 1n) throw fixedError(cleanupCode);
+        return { path, identity };
+      });
+      for (const leaf of leaves) {
+        assertOwner();
+        const current = lstatSync(leaf.path, { bigint: true });
+        if (!current.isFile() || current.isSymbolicLink() || current.nlink !== 1n
+          || current.dev !== leaf.identity.dev || current.ino !== leaf.identity.ino
+          || current.birthtimeNs !== leaf.identity.birthtimeNs) throw fixedError(cleanupCode);
+        unlinkSync(leaf.path);
+      }
+      assertOwner();
+      rmdirSync(root);
+      removed = true;
+    } catch { incomplete = true; throw fixedError(cleanupCode); }
+  }
+  try {
+    if (spelling !== "raw" && spelling !== "native") throw fixedError(setupCode);
+    rawRoot = mkdtempSync(join(tmpdir(), `fresh-start-${randomUUID()}-`));
+    // Capture precise creation authority before any native lookup or database descendant exists.
+    created = lstatSync(rawRoot, { bigint: true });
+    if (!created.isDirectory() || created.isSymbolicLink()) throw fixedError(setupCode);
+    nativeRoot = resolve(realpathSync.native(rawRoot));
+    assertOwner();
+    const openedRoot = spelling === "native" ? nativeRoot : rawRoot;
+    connection = new NodeSqliteDriver({ DatabaseSync }).open(join(openedRoot, "events.sqlite"), {
+      mode: "create", busyTimeoutMs: 1_000,
+    });
+    applyCurrentProjectStoreSchema(connection, FRESH_IDENTITY, FRESH_NOW);
+    assertOwner();
+    return { connection, rawRoot, nativeRoot, openedRoot,
+      rawIsNative: equalSpelling(resolve(rawRoot), nativeRoot), closeConnection, cleanup };
+  } catch {
+    // Keep the setup refusal primary; only a separately returned close receipt permits removal.
+    if (connection !== undefined) {
+      try { closeConnection(); cleanup(); } catch { incomplete = true; }
+    } else incomplete = true;
+    throw Object.assign(fixedError(setupCode), { cleanupCode: incomplete ? cleanupCode : "none" });
+  }
 }
 
 /** All content here is owned synthetic test data, including the archive sentinel. */

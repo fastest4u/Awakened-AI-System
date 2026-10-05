@@ -6,7 +6,7 @@ import { BranchScopeRepository } from "../src/orchestrator/storage/branch-scope.
 import { SqliteFreshStartRepository } from "../src/orchestrator/fresh-start/fresh-start.repository.js";
 import { FreshStartControlPlane } from "../src/orchestrator/fresh-start/fresh-start-control-plane.js";
 import { DENY_FRESH_START_PROMOTION } from "../src/orchestrator/fresh-start/operator-approval.js";
-import { freshStore, freshGenesis, freshRelease, FRESH_IDENTITY, FRESH_NOW } from "./support/fresh-start-fixture.js";
+import { freshStore, freshStoreSpellingFixture, freshGenesis, freshRelease, FRESH_IDENTITY, FRESH_NOW } from "./support/fresh-start-fixture.js";
 import { command } from "./fixtures/fresh-start-admission-child.js";
 import { randomUUID } from "node:crypto";
 import { FreshStartAdmissionGuard, bindFreshStartAdmissionContext } from "../src/orchestrator/fresh-start/fresh-start-admission.js";
@@ -18,8 +18,10 @@ import { decodeWorkerRequest, decodeWorkerResponseForRequest, encodeWorkerBindin
 import { context } from "./fixtures/fresh-start-admission-child.js";
 import { fork, type ChildProcess } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import fs, { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, renameSync, rmdirSync, symlinkSync, unlinkSync, writeFileSync, type BigIntStats } from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+import { dirname, join, resolve } from "node:path";
+import { NodeSqliteDriver } from "../src/orchestrator/storage/node-sqlite-driver.js";
 import { ProjectStoreWorkerBackend } from "../src/orchestrator/runtime/project-store-worker-backend.js";
 import { ProjectStoreExecutor } from "../src/orchestrator/runtime/project-store-executor.js";
 import { EventAppendTransaction } from "../src/orchestrator/storage/event-append-transaction.js";
@@ -135,6 +137,223 @@ async function active(installedRelease = release) {
   const store = new EventStore(fixture.connection, new SqliteEventStoreStatements(fixture.connection), new MaintenanceFence(), new BranchScopeRepository(), () => FRESH_NOW);
   return { ...fixture, repository, control, store };
 }
+
+async function activeSpelling(spelling: "raw" | "native") {
+  const fixture = freshStoreSpellingFixture(spelling);
+  try {
+    const repository = new SqliteFreshStartRepository(fixture.connection);
+    repository.transact(FRESH_IDENTITY, tx => tx.install(freshGenesis(), release));
+    const approvals = new TrustedOperatorApprovalVerifier(async (_bytes, requestDigest) => ({ identity: FRESH_IDENTITY,
+      approvalId: randomUUID(), nonceDigest: randomUUID().replaceAll("-", "").repeat(2), actorFingerprint: "2".repeat(64), requestDigest, evidenceDigest: release.evidenceDigest }));
+    const control = new FreshStartControlPlane(repository, approvals, new TrustedFreshStartEvidenceVerifier(async value => value));
+    await control.transition({ identity: FRESH_IDENTITY, expectedGeneration: 0n, expectedMode: "prepared", expectedReleaseId: release.releaseId, nextMode: "active", nextRelease: release, approvalEnvelope: new Uint8Array([1]) });
+    bindFreshStartAdmissionContext(fixture.connection, trusted);
+    const store = new EventStore(fixture.connection, new SqliteEventStoreStatements(fixture.connection), new MaintenanceFence(), new BranchScopeRepository(), () => FRESH_NOW);
+    return { ...fixture, repository, control, store };
+  } catch (primary) {
+    // Preserve the initialization failure even if its independent closure is incomplete.
+    try { fixture.closeConnection(); fixture.cleanup(); } catch { /* Retain uncertain root. */ }
+    throw primary;
+  }
+}
+
+type SpellingFixture = ReturnType<typeof freshStoreSpellingFixture>;
+function spellingBackend() {
+  return new ProjectStoreWorkerBackend({ selfUrl: new URL("../src/workers/project-store.worker.js", import.meta.url),
+    executorLeaseMs: 15000, appendRetryDeadlineMs: 1000, trustedFreshStartBuildInspector: () => "a".repeat(64) });
+}
+function spellingRequest(fixture: SpellingFixture) {
+  const path = join(fixture.openedRoot, "events.sqlite");
+  return decodeWorkerRequest({ id: "open", type: "open", binding: encodeWorkerBinding(context(fixture.openedRoot, path)),
+    freshStart: { ...trusted, generation: "1", releaseId: release.releaseId } });
+}
+function spellingClosure(fixture: SpellingFixture, backend: ProjectStoreWorkerBackend) {
+  let incomplete = false, openingSettled = false, backendClosed = false, connectionClosed = false, rootRemoved = false;
+  return { openingSettled() { openingSettled = true; }, async close() {
+    // An unexpected failed open may swallow its internal close failure; backend.close cannot certify it.
+    if (!openingSettled) incomplete = true;
+    if (!backendClosed) { try { await backend.close(); backendClosed = true; } catch { incomplete = true; } }
+    if (!connectionClosed) { try { fixture.closeConnection(); connectionClosed = true; } catch { incomplete = true; } }
+    if (!incomplete && backendClosed && connectionClosed && !rootRemoved) {
+      try { fixture.cleanup(); rootRemoved = true; } catch { incomplete = true; }
+    }
+    return { backendClosed, connectionClosed, rootRemoved,
+      code: incomplete ? "CI_FRESH_SPELLING_CLEANUP_INCOMPLETE" : "none" };
+  } };
+}
+function connectionIsClosed(fixture: SpellingFixture): boolean {
+  try { fixture.connection.prepare("SELECT 1").get(); return false; } catch { return true; }
+}
+function sameSpelling(left: string, right: string): boolean {
+  return process.platform === "win32" ? left.toLowerCase() === right.toLowerCase() : left === right;
+}
+function sameOwner(left: string, right: string): boolean {
+  const a = lstatSync(left, { bigint: true }), b = lstatSync(right, { bigint: true });
+  return a.isDirectory() && b.isDirectory() && !a.isSymbolicLink() && !b.isSymbolicLink()
+    && a.dev === b.dev && a.ino === b.ino && a.birthtimeNs === b.birthtimeNs;
+}
+
+// Catches a wrong root producer, omitted close, or a route guard weakened to admit aliases.
+for (const spelling of ["native", "raw"] as const) it(`CI fresh fixture spelling proof: ${spelling} direct opening`, async t => {
+  const fixture = await activeSpelling(spelling), backend = spellingBackend(), closure = spellingClosure(fixture, backend);
+  let primary: unknown;
+  try {
+    assert.equal(sameOwner(fixture.rawRoot, fixture.nativeRoot), true);
+    assert.equal(sameSpelling(fixture.nativeRoot, resolve(realpathSync.native(fixture.rawRoot))), true);
+    assert.equal(fixture.rawIsNative, sameSpelling(resolve(fixture.rawRoot), fixture.nativeRoot));
+    assert.equal(fixture.openedRoot === (spelling === "native" ? fixture.nativeRoot : fixture.rawRoot), true);
+    const path = join(fixture.openedRoot, "events.sqlite");
+    const fileCanonical = sameSpelling(resolve(path), resolve(realpathSync.native(path)));
+    const rootCanonical = sameSpelling(resolve(fixture.openedRoot), resolve(dirname(realpathSync.native(path))));
+    const collector = createCiDiagnosticCollector(line => t.diagnostic(line));
+    capturePathSnapshot({ family: "fresh-admission", caseId: "admission-control", directory: fixture.openedRoot }, collector);
+    capturePathSnapshot({ family: "fresh-admission", caseId: "path-control", directory: path }, collector);
+    assert.equal(collector.incomplete, false);
+    if (spelling === "raw" && (!fileCanonical || !rootCanonical)) {
+      await assert.rejects(backend.dispatch(spellingRequest(fixture)), { code: "STORE_ROUTE_INVALID" });
+      closure.openingSettled(); // This guard rejects before any backend connection is acquired.
+      t.diagnostic("raw noncanonical control=observed; exact refusal=STORE_ROUTE_INVALID");
+    } else {
+      assert.equal(fileCanonical && rootCanonical, true);
+      const result = await backend.dispatch(spellingRequest(fixture));
+      closure.openingSettled();
+      assert.equal((result as { freshStart: { generation: string } }).freshStart.generation, "1");
+      t.diagnostic(`${spelling} business generation=1; noncanonical control=${spelling === "raw" ? "unavailable" : "not-selected"}; rawIsNative=${fixture.rawIsNative}`);
+    }
+    fixture.closeConnection();
+    assert.equal(connectionIsClosed(fixture), true);
+  } catch (error) { primary = error; throw error; }
+  finally {
+    const receipt = await closure.close();
+    if (primary === undefined) {
+      assert.deepEqual(receipt, { backendClosed: true, connectionClosed: true, rootRemoved: true, code: "none" });
+      assert.equal(connectionIsClosed(fixture), true);
+      assert.equal(existsSync(fixture.rawRoot), false);
+    } else {
+      try { t.diagnostic(`primary preserved; closure=${receipt.code}; rootRemoved=${receipt.rootRemoved}`); } catch { /* Informational only. */ }
+    }
+  }
+});
+
+// Catches adopting a redirected native lookup rather than the directory captured at creation.
+it("CI fresh fixture spelling proof: lookup redirection refuses before database open", t => {
+  const outside = freshStoreSpellingFixture("native");
+  const originalNative = realpathSync.native;
+  let opened = false;
+  const openHook = t.mock.method(NodeSqliteDriver.prototype, "open", () => { opened = true; throw new Error("unreachable"); });
+  const nativeHook = t.mock.method(realpathSync, "native", () => outside.nativeRoot);
+  try {
+    assert.throws(() => freshStoreSpellingFixture("native"), { code: "CI_FRESH_SPELLING_SETUP_INCOMPLETE", message: "CI_FRESH_SPELLING_SETUP_INCOMPLETE" });
+    assert.equal(opened, false);
+  } finally {
+    nativeHook.mock.restore(); openHook.mock.restore();
+    assert.equal(realpathSync.native === originalNative, true);
+    outside.closeConnection(); outside.cleanup();
+  }
+});
+
+// Catches replacement cleanup deleting an unrelated ordinary directory or native junction target.
+for (const replacement of ["directory", "junction"] as const) it(`CI fresh fixture spelling proof: ${replacement} replacement preserves sentinel`, t => {
+  const fixture = freshStoreSpellingFixture("native"), outside = freshStoreSpellingFixture("native");
+  const moved = join(outside.nativeRoot, "original");
+  let replacementIdentity: BigIntStats | undefined;
+  fixture.closeConnection();
+  try {
+    assert.equal(connectionIsClosed(fixture), true);
+    renameSync(fixture.rawRoot, moved);
+    if (replacement === "directory") mkdirSync(fixture.rawRoot);
+    else symlinkSync(outside.nativeRoot, fixture.rawRoot, process.platform === "win32" ? "junction" : "dir");
+    replacementIdentity = lstatSync(fixture.rawRoot, { bigint: true });
+    const sentinel = join(replacement === "directory" ? fixture.rawRoot : outside.nativeRoot, "sentinel");
+    writeFileSync(sentinel, "preserved");
+    assert.throws(() => fixture.cleanup(), { code: "CI_FRESH_SPELLING_CLEANUP_INCOMPLETE", message: "CI_FRESH_SPELLING_CLEANUP_INCOMPLETE" });
+    assert.equal(readFileSync(sentinel, "utf8") === "preserved", true);
+    // Restore only this test's independently captured replacement; fixture refusal remains latched.
+    unlinkSync(sentinel);
+    const current = lstatSync(fixture.rawRoot, { bigint: true });
+    assert.equal(current.dev === replacementIdentity.dev && current.ino === replacementIdentity.ino && current.birthtimeNs === replacementIdentity.birthtimeNs, true);
+    if (replacement === "junction") unlinkSync(fixture.rawRoot); else rmdirSync(fixture.rawRoot);
+    renameSync(moved, fixture.rawRoot);
+    assert.throws(() => fixture.cleanup(), { code: "CI_FRESH_SPELLING_CLEANUP_INCOMPLETE" });
+    t.diagnostic("replacement root retained; connection closed; cleanup incomplete latched");
+  } finally {
+    if (!connectionIsClosed(fixture)) fixture.connection.close();
+    outside.closeConnection(); outside.cleanup();
+  }
+});
+
+// Catches leaking an acquired connection on schema setup failure, or removing without acquisition.
+it("CI fresh fixture spelling proof: setup failure closes acquired connection", t => {
+  const originalOpen = NodeSqliteDriver.prototype.open;
+  let acquired: ReturnType<typeof originalOpen> | undefined, root: string | undefined, closed = false;
+  const hook = t.mock.method(NodeSqliteDriver.prototype, "open", function(this: NodeSqliteDriver, ...args: Parameters<typeof originalOpen>) {
+    acquired = originalOpen.apply(this, args);
+    root = dirname(args[0]);
+    const close = acquired.close.bind(acquired);
+    acquired.close = () => { close(); closed = true; };
+    acquired.exec = () => { throw new Error("private setup detail"); };
+    return acquired;
+  });
+  try {
+    assert.throws(() => freshStoreSpellingFixture("native"), { code: "CI_FRESH_SPELLING_SETUP_INCOMPLETE", message: "CI_FRESH_SPELLING_SETUP_INCOMPLETE" });
+    assert.equal(closed, true);
+    assert.equal(connectionIsClosed({ connection: acquired } as SpellingFixture), true);
+    assert.equal(root !== undefined && existsSync(root), false);
+  } finally { hook.mock.restore(); if (acquired && !closed) acquired.close(); }
+});
+
+it("CI fresh fixture spelling proof: open failure retains root without closure receipt", t => {
+  const originalMkdtemp = fs.mkdtempSync;
+  let created: string | undefined;
+  const createHook = t.mock.method(fs, "mkdtempSync", (...args: Parameters<typeof originalMkdtemp>) => {
+    const root = originalMkdtemp(...args); created = String(root); return root;
+  });
+  syncBuiltinESMExports();
+  const openHook = t.mock.method(NodeSqliteDriver.prototype, "open", () => { throw new Error("private open detail"); });
+  try {
+    assert.throws(() => freshStoreSpellingFixture("native"), { code: "CI_FRESH_SPELLING_SETUP_INCOMPLETE", message: "CI_FRESH_SPELLING_SETUP_INCOMPLETE" });
+    assert.equal(created !== undefined && existsSync(created), true);
+    t.diagnostic("open failure: connection receipt unavailable; root retained");
+  } finally { openHook.mock.restore(); createHook.mock.restore(); syncBuiltinESMExports(); }
+});
+
+// Catches a failed backend close skipping independent fixture close or a later retry erasing uncertainty.
+it("CI fresh fixture spelling proof: backend close failure still closes fixture and retains root", async t => {
+  const fixture = await activeSpelling("native"), backend = spellingBackend(), closure = spellingClosure(fixture, backend);
+  let restoreHook: (() => void) | undefined, primary: unknown;
+  try {
+    const result = await backend.dispatch(spellingRequest(fixture));
+    closure.openingSettled();
+    assert.equal((result as { freshStart: { generation: string } }).freshStart.generation, "1");
+    const hook = t.mock.method(backend, "close", async () => { throw new Error("private backend close detail"); });
+    restoreHook = () => hook.mock.restore();
+    assert.deepEqual(await closure.close(), { backendClosed: false, connectionClosed: true, rootRemoved: false, code: "CI_FRESH_SPELLING_CLEANUP_INCOMPLETE" });
+    assert.equal(connectionIsClosed(fixture), true);
+    assert.equal(existsSync(fixture.rawRoot), true);
+  } catch (error) { primary = error; throw error; }
+  finally {
+    restoreHook?.();
+    const receipt = await closure.close();
+    if (primary === undefined) {
+      assert.deepEqual(receipt, { backendClosed: true, connectionClosed: true, rootRemoved: false, code: "CI_FRESH_SPELLING_CLEANUP_INCOMPLETE" });
+      t.diagnostic("backend now positively closed; fixture closed independently; root retained after uncertainty");
+    } else {
+      try { t.diagnostic(`primary preserved; closure=${receipt.code}; rootRemoved=${receipt.rootRemoved}`); } catch { /* Informational only. */ }
+    }
+  }
+});
+
+it("CI fresh fixture spelling proof: connection close uncertainty latches cleanup refusal", t => {
+  const fixture = freshStoreSpellingFixture("native");
+  const hook = t.mock.method(fixture.connection, "close", () => { throw new Error("private connection close detail"); });
+  try {
+    assert.throws(() => fixture.closeConnection(), { code: "CI_FRESH_SPELLING_CLEANUP_INCOMPLETE", message: "CI_FRESH_SPELLING_CLEANUP_INCOMPLETE" });
+    assert.throws(() => fixture.cleanup(), { code: "CI_FRESH_SPELLING_CLEANUP_INCOMPLETE" });
+    assert.equal(existsSync(fixture.rawRoot), true);
+  } finally { hook.mock.restore(); fixture.connection.close(); }
+  assert.throws(() => fixture.cleanup(), { code: "CI_FRESH_SPELLING_CLEANUP_INCOMPLETE" });
+  t.diagnostic("connection eventually positively closed; root retained after uncertainty");
+});
 
 it("the unbundled worker refuses a fresh opening without a measured deployment", async () => {
   const fixture = await active();
