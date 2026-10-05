@@ -15,7 +15,7 @@ const git = process.platform === "win32" ? "C:/Program Files/Git/cmd/git.exe" : 
 const powershell = process.platform === "win32"
   ? "C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe" : "pwsh";
 const phases = ["build", "tests", "lifecycle", "rollout", "foundation", "artifacts"];
-const gates = ["runtime", "typecheck", ...phases];
+const gates = ["installation_policy", "installation", "installation_capability", "runtime", "typecheck", ...phases];
 const artifactPaths = ["v2.js", "v2-admin.js", "workers/project-store.worker.js",
   "internal/v2-internal-verified-read.js", "internal/v2-internal-verified-read-cleanup.js"];
 
@@ -132,6 +132,11 @@ function complete(f: Fixture): Record<string, string> {
     env["V2_CI_PHASE_" + phase.toUpperCase()] = value;
     env["V2_CI_RECORD_" + phase.toUpperCase()] = "success";
   }
+  // Refusal controls must start from a reached nominal closure: an omitted
+  // installation outcome must not masquerade as the intended later fault.
+  const nominal = runInline(step("Verify qualification closure"), f, env);
+  assert.equal(nominal.status, 0, nominal.stderr);
+  assert.match(nominal.stdout, /V2_CI_QUALIFICATION_COMPLETE/);
   return env;
 }
 

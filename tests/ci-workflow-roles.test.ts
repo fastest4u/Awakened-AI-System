@@ -13,6 +13,9 @@ test("CI roles require the four actual saved owners", () => {
   };
   assertCiWorkflowSet(workflows);
   for (const [name, command, id] of [
+    ["Check installation policy", "node scripts/check-build-installation.js before", "installation_policy"],
+    ["Install dependencies", "npm ci --ignore-scripts --include=dev --include=optional", "installation"],
+    ["Check installation capability", "node scripts/check-build-installation.js after", "installation_capability"],
     ["Run tests", "npm test", "tests"],
     ["Run lifecycle release gates", "npm run test:subproject-2", "lifecycle"],
     ["Run V2 rollout control-plane gate", "npm run test:rollout-control-plane", "rollout"],
@@ -147,7 +150,7 @@ const fixtureClosureProgram = fixtureInlineProgram([
   ...fixtureMeasuredImports, ...fixtureContextProgram, ...fixtureParseProgram,
   ...fixtureEmitProgram, ...fixtureReportProgram, ...fixtureMeasurementProgram,
   "try {",
-  "  for (const gate of [\"runtime\", \"typecheck\", \"build\", \"tests\", \"lifecycle\", \"rollout\", \"foundation\", \"artifacts\"]) {",
+  "  for (const gate of [\"installation_policy\", \"installation\", \"installation_capability\", \"runtime\", \"typecheck\", \"build\", \"tests\", \"lifecycle\", \"rollout\", \"foundation\", \"artifacts\"]) {",
   "    if (process.env[\"V2_CI_OUTCOME_\" + gate.toUpperCase()] !== \"success\") fail(\"V2_CI_OUTCOME_INCOMPLETE\");",
   "  }",
   "  const bound = identity();",
@@ -195,7 +198,7 @@ function fixturePhaseRecord(phase: string): readonly string[] {
 function fixtureClosureRecord(): readonly string[] {
   return fixtureIdentityRecord("Verify qualification closure", null, fixtureClosureProgram, [
     "V2_CI_IDENTITY: ${{ steps.identity.outputs.receipt }}",
-    ...["runtime", "typecheck", "build", "tests", "lifecycle", "rollout", "foundation", "artifacts"]
+    ...["installation_policy", "installation", "installation_capability", "runtime", "typecheck", "build", "tests", "lifecycle", "rollout", "foundation", "artifacts"]
       .map(id => "V2_CI_OUTCOME_" + id.toUpperCase() + ": ${{ steps." + id + ".outcome }}"),
     ...["build", "tests", "lifecycle", "rollout", "foundation", "artifacts"].flatMap(id => [
       "V2_CI_RECORD_" + id.toUpperCase() + ": ${{ steps.record_" + id + ".outcome }}",
@@ -248,8 +251,14 @@ function roleFixtures(): CiWorkflowSet {
       "        with:",
       "          node-version: ${{ matrix.node-version }}",
       "",
+      "      - name: Check installation policy",
+      "        run: node scripts/check-build-installation.js before",
+      "",
       "      - name: Install dependencies",
-      "        run: npm ci",
+      "        run: npm ci --ignore-scripts --include=dev --include=optional",
+      "",
+      "      - name: Check installation capability",
+      "        run: node scripts/check-build-installation.js after",
       "",
       "      - name: Check runtime capabilities",
       "        run: npm run check:runtime",
@@ -387,8 +396,17 @@ function roleFixtures(): CiWorkflowSet {
       "          node-version: ${{ matrix.node-version }}",
       "",
       ...fixtureIdentityRecord("Record qualification identity", "identity", fixtureInitialProgram),
+      "      - name: Check installation policy",
+      "        id: installation_policy",
+      "        run: node scripts/check-build-installation.js before",
+      "",
       "      - name: Install dependencies",
-      "        run: npm ci",
+      "        id: installation",
+      "        run: npm ci --ignore-scripts --include=dev --include=optional",
+      "",
+      "      - name: Check installation capability",
+      "        id: installation_capability",
+      "        run: node scripts/check-build-installation.js after",
       "",
       "      - name: Check runtime capabilities",
       "        id: runtime",
@@ -469,8 +487,14 @@ function roleFixtures(): CiWorkflowSet {
       "        with:",
       "          node-version: ${{ matrix.node-version }}",
       "",
+      "      - name: Check installation policy",
+      "        run: node scripts/check-build-installation.js before",
+      "",
       "      - name: Install dependencies",
-      "        run: npm ci",
+      "        run: npm ci --ignore-scripts --include=dev --include=optional",
+      "",
+      "      - name: Check installation capability",
+      "        run: node scripts/check-build-installation.js after",
       "",
       "      - name: Check runtime capabilities",
       "        run: npm run check:runtime",
@@ -532,8 +556,20 @@ function roleFixtures(): CiWorkflowSet {
       "        run: |",
       "          $logPath = \"ci-logs/sqlite-stress-${{ matrix.os }}.log\"",
       "          New-Item -ItemType Directory -Force -Path (Split-Path $logPath) | Out-Null",
-      "          Write-Output \"> npm ci\" | Tee-Object -FilePath $logPath -Append",
-      "          & npm ci 2>&1 | Tee-Object -FilePath $logPath -Append",
+      "          Write-Output \"> node scripts/check-build-installation.js before\" | Tee-Object -FilePath $logPath -Append",
+      "          & node scripts/check-build-installation.js before 2>&1 | Tee-Object -FilePath $logPath -Append",
+      "          $commandExitCode = $LASTEXITCODE",
+      "          if ($commandExitCode -ne 0) {",
+      "            exit $commandExitCode",
+      "          }",
+      "          Write-Output \"> npm ci --ignore-scripts --include=dev --include=optional\" | Tee-Object -FilePath $logPath -Append",
+      "          & npm ci --ignore-scripts --include=dev --include=optional 2>&1 | Tee-Object -FilePath $logPath -Append",
+      "          $commandExitCode = $LASTEXITCODE",
+      "          if ($commandExitCode -ne 0) {",
+      "            exit $commandExitCode",
+      "          }",
+      "          Write-Output \"> node scripts/check-build-installation.js after\" | Tee-Object -FilePath $logPath -Append",
+      "          & node scripts/check-build-installation.js after 2>&1 | Tee-Object -FilePath $logPath -Append",
       "          $commandExitCode = $LASTEXITCODE",
       "          if ($commandExitCode -ne 0) {",
       "            exit $commandExitCode",
@@ -627,7 +663,7 @@ const prMutations: readonly [string, string, string][] = [
   ["step bypass", "      - name: Build\n", "      - name: Build\n        if: true\n"],
   ["step failure suppression", "      - name: Build\n", "      - name: Build\n        continue-on-error: false\n"],
   ["unknown owners", "  release-gates:", "  arbitrary-owner:"],
-  ["arbitrary environment keys", "        run: npm ci", "        env:\n          NODE_ENV: production\n        run: npm ci"],
+  ["arbitrary environment keys", "        run: npm ci --ignore-scripts --include=dev --include=optional", "        env:\n          NODE_ENV: production\n        run: npm ci --ignore-scripts --include=dev --include=optional"],
   ["broadened checkout inputs", "          fetch-depth: 0", "          fetch-depth: 0\n          path: alternate"],
   ["broadened setup inputs", "          node-version: ${{ matrix.node-version }}", "          node-version: ${{ matrix.node-version }}\n          fetch-depth: 0"],
   ["reduced or full replacement profile", "run: npm test", "run: npm run test:all"],
@@ -636,12 +672,14 @@ const prMutations: readonly [string, string, string][] = [
 ];
 for (const [label, from, to] of prMutations) test(`CI roles reject ${label}`, () => {
   const fixture = roleFixtures();
+  assertCiWorkflowSet(fixture);
   const pr = fixture.pr.replace(from, to);
   assert.notEqual(pr, fixture.pr);
   assert.throws(() => assertCiWorkflowSet({ ...fixture, pr }));
 });
 for (const directive of ["%YAML 1.2", "---", "..."]) test(`CI roles reject directive or marker ${directive}`, () => {
   const fixture = roleFixtures();
+  assertCiWorkflowSet(fixture);
   assert.throws(() => assertCiWorkflowSet({ ...fixture, pr: directive + "\n" + fixture.pr }));
 });
 
@@ -661,15 +699,18 @@ const releaseMutations: readonly [string, string, string][] = [
 ];
 for (const [label, from, to] of releaseMutations) test(`CI roles reject ${label}`, () => {
   const fixture = roleFixtures();
+  assertCiWorkflowSet(fixture);
   const release = fixture.release.replace(from, to);
   assert.notEqual(release, fixture.release);
   assert.throws(() => assertCiWorkflowSet({ ...fixture, release }));
 });
 for (const name of ["Install dependencies", "Build"]) test(`CI roles reject ${name} before identity checks`, () => {
   const fixture = roleFixtures();
-  const block = name === "Build" ? "      - name: Build\n        id: build\n        run: npm run build\n\n" : "      - name: Install dependencies\n        run: npm ci\n\n";
+  assertCiWorkflowSet(fixture);
+  const block = name === "Build" ? "      - name: Build\n        id: build\n        run: npm run build\n\n" : "      - name: Install dependencies\n        id: installation\n        run: npm ci --ignore-scripts --include=dev --include=optional\n\n";
   assert.ok(fixture.release.includes(block));
   const release = fixture.release.replace(block, "").replace("    steps:\n", "    steps:\n" + block);
+  assert.notEqual(release, fixture.release);
   assert.throws(() => assertCiWorkflowSet({ ...fixture, release }));
 });
 
@@ -681,18 +722,21 @@ for (const [label, from, to] of [
   ["producer output substitution", "V2_SHADOW_MIGRATION_TEST_EVIDENCE_OUTPUT: ${{ runner.temp }}/v2-shadow-migration-functional/evidence.json", "V2_SHADOW_MIGRATION_TEST_EVIDENCE_OUTPUT: stale.json"],
 ] as const) test(`CI roles reject legacy ${label}`, () => {
   const fixture = roleFixtures();
+  assertCiWorkflowSet(fixture);
   const legacy = fixture.legacy.replace(from, to);
   assert.notEqual(legacy, fixture.legacy);
   assert.throws(() => assertCiWorkflowSet({ ...fixture, legacy }));
 });
 test("CI roles reject role crossing and extra owner keys", () => {
   const fixture = roleFixtures();
+  assertCiWorkflowSet(fixture);
   assert.throws(() => assertCiWorkflowSet({ ...fixture, pr: fixture.release, release: fixture.pr }));
   assert.throws(() => assertCiWorkflowSet({ ...fixture, unknown: fixture.pr } as CiWorkflowSet));
 });
 
 test("CI roles reject legacy schedules and release cancellation", () => {
   const fixture = roleFixtures();
+  assertCiWorkflowSet(fixture);
   assert.throws(() => assertCiWorkflowSet({ ...fixture, legacy: fixture.legacy.replace("on:\n", 'on:\n  schedule:\n    - cron: "0 3 * * 1"\n') }));
   assert.throws(() => assertCiWorkflowSet({ ...fixture, release: fixture.release.replace("jobs:\n", "concurrency:\n  group: release\n  cancel-in-progress: true\n\njobs:\n") }));
 });
