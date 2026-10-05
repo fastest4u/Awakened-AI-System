@@ -186,7 +186,7 @@ function projectionManifest(generation: number) {
 }
 
 function replacementFixture(prefix: string, publishFirst = true) {
-  const root = fixtureRoot(prefix, "raw");
+  const root = fixtureRoot(prefix, "native");
   const first = projectionManifest(1);
   const second = projectionManifest(2);
   for (const candidate of [first, second]) {
@@ -387,7 +387,7 @@ describe("immutable projection manifest", () => {
     assert.equal(invoked, false);
   });
 
-  it("serializes canonical bytes and publishes only through a safe projection directory", t => assertManifestPublication(t, "raw"));
+  it("serializes canonical bytes and publishes only through a safe projection directory", t => assertManifestPublication(t, "native"));
 
   it("projection spelling control: manifest", async t => {
     for (const spelling of ["raw", "native"] as const) {
@@ -408,7 +408,7 @@ describe("immutable projection manifest", () => {
   });
 
   it("refuses to replace a manifest target that is a symlink", (t) => {
-    const root = fixtureRoot("projection-manifest-target-", "raw");
+    const root = fixtureRoot("projection-manifest-target-", "native");
     const outside = join(root, "outside.json");
     const target = join(root, "projection-manifest.json");
     writeFileSync(outside, "outside", "utf8");
@@ -431,7 +431,7 @@ describe("immutable projection manifest", () => {
   });
 
   it("rejects exact WAL and SHM sibling entries before replacing a manifest", () => {
-    const root = fixtureRoot("projection-manifest-sidecars-", "raw");
+    const root = fixtureRoot("projection-manifest-sidecars-", "native");
     const databaseFile = "projections-1-2.sqlite";
     const databasePath = join(root, databaseFile);
     const target = join(root, "projection-manifest.json");
@@ -464,7 +464,7 @@ describe("immutable projection manifest", () => {
     "after-manifest-replace-before-validation",
   ] as const) {
     it(`preserves the previous manifest when a sidecar appears at ${boundary}`, () => {
-      const root = fixtureRoot("projection-manifest-publish-race-", "raw");
+      const root = fixtureRoot("projection-manifest-publish-race-", "native");
       const oldManifest = parseProjectionManifest(manifest({
         generation: 1,
         databaseFile: "projections-1-1.sqlite",
@@ -555,7 +555,7 @@ describe("immutable projection manifest", () => {
   });
 
   it("does not roll an outer failure over a later successful nested publication", () => {
-    const root = fixtureRoot("projection-manifest-nested-publish-", "raw");
+    const root = fixtureRoot("projection-manifest-nested-publish-", "native");
     const first = parseProjectionManifest(manifest({
       generation: 1,
       databaseFile: "projections-1-1.sqlite",
@@ -612,7 +612,7 @@ describe("immutable projection manifest", () => {
   });
 
   it("retains evidence when a nested publication becomes sidecar-invalid", () => {
-    const root = fixtureRoot("projection-manifest-nested-invalid-authority-", "raw");
+    const root = fixtureRoot("projection-manifest-nested-invalid-authority-", "native");
     const first = projectionManifest(1);
     const second = projectionManifest(2);
     const third = projectionManifest(3);
@@ -672,7 +672,7 @@ describe("immutable projection manifest", () => {
   });
 
   it("retains evidence when an exception follows sidecar-invalid nested publication", () => {
-    const root = fixtureRoot("projection-manifest-nested-invalid-exception-", "raw");
+    const root = fixtureRoot("projection-manifest-nested-invalid-exception-", "native");
     const first = projectionManifest(1);
     const second = projectionManifest(2);
     const third = projectionManifest(3);
@@ -735,7 +735,7 @@ describe("immutable projection manifest", () => {
   });
 
   it("does not claim a later manifest first observed after its own target rename", () => {
-    const root = fixtureRoot("projection-manifest-post-rename-observation-", "raw");
+    const root = fixtureRoot("projection-manifest-post-rename-observation-", "native");
     const first = parseProjectionManifest(manifest({
       generation: 1,
       databaseFile: "projections-1-1.sqlite",
@@ -801,7 +801,7 @@ describe("immutable projection manifest", () => {
   });
 
   it("retains recovery evidence when the installed-target observation reports no authority", () => {
-    const root = fixtureRoot("projection-manifest-missing-observation-", "raw");
+    const root = fixtureRoot("projection-manifest-missing-observation-", "native");
     const first = parseProjectionManifest(manifest({
       generation: 1,
       databaseFile: "projections-1-1.sqlite",
@@ -1268,7 +1268,7 @@ describe("immutable projection manifest", () => {
   });
 
   it("does not restore stale authority when a nested publish starts at rollback entry", () => {
-    const root = fixtureRoot("projection-manifest-rollback-entry-", "raw");
+    const root = fixtureRoot("projection-manifest-rollback-entry-", "native");
     const first = parseProjectionManifest(manifest({
       generation: 1,
       databaseFile: "projections-1-1.sqlite",
@@ -1348,7 +1348,7 @@ describe("immutable projection manifest", () => {
   });
 
   it("does not overwrite external authority installed after the final success snapshot", () => {
-    const root = fixtureRoot("projection-manifest-external-success-gap-", "raw");
+    const root = fixtureRoot("projection-manifest-external-success-gap-", "native");
     const first = parseProjectionManifest(manifest({
       generation: 1,
       databaseFile: "projections-1-1.sqlite",
@@ -1406,7 +1406,7 @@ describe("immutable projection manifest", () => {
   });
 
   it("does not overwrite external authority installed after the final rollback snapshot", () => {
-    const root = fixtureRoot("projection-manifest-external-rollback-gap-", "raw");
+    const root = fixtureRoot("projection-manifest-external-rollback-gap-", "native");
     const first = parseProjectionManifest(manifest({
       generation: 1,
       databaseFile: "projections-1-1.sqlite",
@@ -1470,7 +1470,7 @@ describe("immutable projection manifest", () => {
   });
 
   it("restores prior authority after a nested publication attempt fails before replacement", () => {
-    const root = fixtureRoot("projection-manifest-nested-failure-", "raw");
+    const root = fixtureRoot("projection-manifest-nested-failure-", "native");
     const first = parseProjectionManifest(manifest({
       generation: 1,
       databaseFile: "projections-1-1.sqlite",
@@ -1531,7 +1531,7 @@ describe("immutable projection manifest", () => {
   });
 
   it("fences a cooperative isolated publisher for the complete outer transaction", () => {
-    const root = fixtureRoot("projection-manifest-process-lock-", "raw");
+    const root = fixtureRoot("projection-manifest-process-lock-", "native");
     const first = parseProjectionManifest(manifest({
       generation: 1,
       databaseFile: "projections-1-1.sqlite",
@@ -1578,7 +1578,7 @@ describe("immutable projection manifest", () => {
   });
 
   it("fails closed on a foreign publication lock without stealing or rewriting it", () => {
-    const root = fixtureRoot("projection-manifest-foreign-lock-", "raw");
+    const root = fixtureRoot("projection-manifest-foreign-lock-", "native");
     const first = parseProjectionManifest(manifest({
       generation: 1,
       databaseFile: "projections-1-1.sqlite",
@@ -1611,7 +1611,7 @@ describe("immutable projection manifest", () => {
   });
 
   it("does not replace a manifest source changed after prior capture", () => {
-    const root = fixtureRoot("projection-manifest-source-cas-", "raw");
+    const root = fixtureRoot("projection-manifest-source-cas-", "native");
     const first = parseProjectionManifest(manifest({
       generation: 1,
       databaseFile: "projections-1-1.sqlite",
@@ -1662,7 +1662,7 @@ describe("immutable projection manifest", () => {
   });
 
   it("removes only its own failed first publication when no prior manifest exists", () => {
-    const root = fixtureRoot("projection-manifest-first-rollback-", "raw");
+    const root = fixtureRoot("projection-manifest-first-rollback-", "native");
     const second = parseProjectionManifest(manifest(), BINDING);
     const databasePath = join(root, second.databaseFile);
     const target = join(root, "projection-manifest.json");
@@ -1689,7 +1689,7 @@ describe("immutable projection manifest", () => {
   });
 
   it("does not source rollback bytes through an A-to-B-to-A directory swap", () => {
-    const root = fixtureRoot("projection-manifest-capture-swap-", "raw");
+    const root = fixtureRoot("projection-manifest-capture-swap-", "native");
     const projectionDirectory = join(root, "projections");
     const originalDirectory = join(root, "original-projections");
     const alternateDirectory = join(root, "alternate-projections");
@@ -1780,7 +1780,7 @@ describe("immutable projection manifest", () => {
   });
 
   it("does not roll back through a replaced projection directory", () => {
-    const root = fixtureRoot("projection-manifest-rollback-directory-", "raw");
+    const root = fixtureRoot("projection-manifest-rollback-directory-", "native");
     const projectionDirectory = join(root, "projections");
     const originalDirectory = join(root, "original-projections");
     const alternateDirectory = join(root, "alternate-projections");
@@ -1849,7 +1849,7 @@ describe("immutable projection manifest", () => {
   });
 
   it("treats a symlink-shaped exact sidecar sibling as an integrity failure", () => {
-    const root = fixtureRoot("projection-manifest-sidecar-shape-", "raw");
+    const root = fixtureRoot("projection-manifest-sidecar-shape-", "native");
     const databaseFile = "projections-1-2.sqlite";
     const databasePath = join(root, databaseFile);
     const regularDirectory = {
@@ -1884,7 +1884,7 @@ describe("immutable projection manifest", () => {
   });
 
   it("maps a non-ENOENT exact sidecar lstat failure to integrity failure", () => {
-    const root = fixtureRoot("projection-manifest-sidecar-error-", "raw");
+    const root = fixtureRoot("projection-manifest-sidecar-error-", "native");
     const databaseFile = "projections-1-2.sqlite";
     const databasePath = join(root, databaseFile);
     const regularDirectory = {
@@ -1916,7 +1916,7 @@ describe("immutable projection manifest", () => {
   });
 
   it("fails closed on symlinks through the production path-verification boundary", () => {
-    const root = fixtureRoot("projection-manifest-inspection-", "raw");
+    const root = fixtureRoot("projection-manifest-inspection-", "native");
     const databaseFile = "projections-1-2.sqlite";
     const databasePath = join(root, databaseFile);
     writeFileSync(databasePath, "independent projection", "utf8");
