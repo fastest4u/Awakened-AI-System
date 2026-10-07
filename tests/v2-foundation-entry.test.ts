@@ -22,7 +22,8 @@ const capabilities = { profile: "fresh-start", version: 1, tools: ["memory_v2Sta
 const recoveryPolicy = { profile: "fresh-start", version: 1, productionReady: false, promotion: "closed" };
 
 function fixture() {
-  const projectRoot = realpathSync(mkdtempSync(join(tmpdir(), "v2-entry-")));
+  // realpathSync.native expands Windows 8.3 short names (e.g. RUNNER~1); the JS realpathSync does not.
+  const projectRoot = realpathSync.native(mkdtempSync(join(tmpdir(), "v2-entry-")));
   const v1ArchiveRoot = join(projectRoot, "archive"); mkdirSync(v1ArchiveRoot);
   writeFileSync(join(v1ArchiveRoot, "sentinel.txt"), sentinel);
   const v2VaultRoot = join(projectRoot, "memory-v2");

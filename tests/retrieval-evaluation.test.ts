@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { canonicalMkdtemp } from "./support/canonical-temp.js";
 import { createHash } from "node:crypto";
 import { createV2ShadowMigrationFixture } from "./support/v2-shadow-migration-fixture.js";
 import {
@@ -1097,7 +1098,7 @@ interface RealEvaluationHarness {
 async function createRealEvaluationHarness(): Promise<RealEvaluationHarness> {
   const staticInputs = readStaticSealedV2Inputs();
   assert.equal(staticInputs.corpus.sources.length, 2);
-  const root = mkdtempSync(join(tmpdir(), "retrieval-evaluation-v2-"));
+  const root = canonicalMkdtemp("retrieval-evaluation-v2-");
   realHarnessRoots.push(root);
   const [primarySource, competingSource] = staticInputs.corpus.sources;
   assert.ok(primarySource);

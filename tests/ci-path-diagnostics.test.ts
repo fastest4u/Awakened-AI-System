@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { closeSync, existsSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync,
   realpathSync, renameSync, rmdirSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, join, relative, resolve, sep } from "node:path";
+import { basename, isAbsolute, join, relative, resolve, sep } from "node:path";
 import test from "node:test";
 import { DatabaseSync } from "node:sqlite";
 import { createDirectoryDurably } from "../src/orchestrator/identity/directory-durability.js";
@@ -119,7 +119,8 @@ test("CI path diagnostics retain lexical refusal and unknown filesystem observat
   const f = owned();
   try {
     for (const invalid of [
-      { path: relative(process.cwd(), f.root), absolute: false, normalized: true },
+      // relative() returns an absolute path across Windows drives (hosted checkout D:, TEMP C:); use an existing cwd-relative directory then.
+      { path: isAbsolute(relative(process.cwd(), f.root)) ? join("..", basename(process.cwd())) : relative(process.cwd(), f.root), absolute: false, normalized: true },
       { path: `${f.root}${sep}..${sep}${basename(f.root)}`, absolute: true, normalized: false },
       { path: `${f.root}${sep}`, absolute: true, normalized: true },
     ]) {
