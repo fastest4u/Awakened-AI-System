@@ -1,9 +1,9 @@
-import type { RetrievalItem } from "../retrieval/contracts.js";
+import { detachNativeContentItem, detachNativeSearchItem } from "./content-items.js";
+import { buildNativeWorkflowResult } from "./workflow-result.js";
 import type { FusedCandidate } from "../retrieval/ranking.js";
-import { selectionReason } from "../retrieval/selection-core.js";
 import {
   NATIVE_CONTENT_BOUNDS_VERSION, NATIVE_CONTENT_RANKING_VERSION,
-  type NativeContentItem, type NativeGetResult, type NativeSearchConflict,
+  type NativeContentResult, type NativeGetResult, type NativeSearchConflict,
   type NativeSearchItem, type NativeSearchResult,
 } from "./content-contracts.js";
 import { decodeNativeContentResult } from "./content-protocol.js";
@@ -13,22 +13,6 @@ import { copyBoundedProtocolData, encodedProtocolBytes } from "./wire-data.js";
 
 function tooLarge(): never {
   throw Object.assign(new Error("V2_CONTENT_RESULT_TOO_LARGE"), { code: "V2_CONTENT_RESULT_TOO_LARGE" });
-}
-function detachedItem(item: RetrievalItem): NativeContentItem {
-  return {
-    id: item.id, kind: item.kind, projectId: item.projectId, workspaceId: item.workspaceId,
-    branchScopeId: item.branchScopeId, branchRef: item.branchRef, sessionId: item.sessionId,
-    visibility: item.visibility, status: item.status, confidence: item.confidence,
-    verificationMethod: item.verificationMethod, validFrom: item.validFrom, validTo: item.validTo,
-    knownFromEventPosition: item.knownFromEventPosition.toString(), sourceEventPosition: item.sourceEventPosition.toString(),
-    textKind: item.kind === "canonical" ? "canonical-summary" : "projection-text", text: item.summary,
-    conflictGroupId: item.conflictGroupId, supersedingItemId: item.supersedingItemId,
-  };
-}
-function searchItem(candidate: FusedCandidate): NativeSearchItem {
-  if (candidate.item === undefined) throw Object.assign(new Error("INTEGRITY_FAILURE"), { code: "INTEGRITY_FAILURE" });
-  return { ...detachedItem(candidate.item), channels: candidate.contributions.map(value => value.channel),
-    selectionReason: selectionReason(candidate) };
 }
 /** Capacity reservation only: prospective closure fields do not attest cleanup or authorize emission. */
 function boundedEnvelope(content: NativeSearchResult | NativeGetResult, base: ReadSuccessBase): NativeSearchResult | NativeGetResult {
@@ -45,17 +29,15 @@ function boundedEnvelope(content: NativeSearchResult | NativeGetResult, base: Re
 }
 
 /** Converts private ranked candidates without changing selection policy or releasing any content. */
-// Task 4 widens this staged return when workflow candidates and packing are implemented.
-export function buildNativeContentResult(candidate: NativeQueryCandidate, base: ReadSuccessBase): NativeSearchResult | NativeGetResult {
-  // Task 4 replaces this staging refusal with complete workflow packing.
+export function buildNativeContentResult(candidate: NativeQueryCandidate, base: ReadSuccessBase): NativeContentResult {
   if (candidate.operation === "list-canonical-records" || candidate.operation === "recent-canonical-records"
     || candidate.operation === "follow-up-radar" || candidate.operation === "build-context-pack") {
-    throw Object.assign(new Error("INTEGRITY_FAILURE"), { code: "INTEGRITY_FAILURE" });
+    return buildNativeWorkflowResult(candidate, base);
   }
   if (candidate.operation === "get-canonical-record") {
     const item = candidate.lookup.item;
     return boundedEnvelope({ operation: candidate.operation, selectionScope: candidate.selectionScope,
-      item: item === null ? null : detachedItem(item),
+      item: item === null ? null : detachNativeContentItem(item),
       conflict: item === null || item.conflictGroupId === null ? null : {
         conflictGroupId: item.conflictGroupId, eligibleMemberCount: candidate.lookup.eligibleConflictMemberCount!,
         returnedMemberCount: 1, truncated: candidate.lookup.eligibleConflictMemberCount! > 1,
@@ -63,7 +45,7 @@ export function buildNativeContentResult(candidate: NativeQueryCandidate, base: 
   }
 
   if (candidate.operation !== "search-projected-content") {
-    const exhaustive = candidate;
+    const exhaustive: never = candidate.operation;
     throw Object.assign(new Error("INTEGRITY_FAILURE"), { code: "INTEGRITY_FAILURE", cause: exhaustive });
   }
   // Only groups appearing in defensive, reranked candidates are considered; collection-only
@@ -114,7 +96,7 @@ export function buildNativeContentResult(candidate: NativeQueryCandidate, base: 
       if (incomplete) selectionTruncated = true;
       if (unit.length === 0) break;
     }
-    const prospectiveItems = [...items, ...unit.map(searchItem)];
+    const prospectiveItems = [...items, ...unit.map(detachNativeSearchItem)];
     try { boundedEnvelope(result(prospectiveItems), base); }
     catch (error) {
       if ((error as { code?: string }).code !== "V2_CONTENT_RESULT_TOO_LARGE") throw error;
