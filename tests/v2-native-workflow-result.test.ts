@@ -121,3 +121,20 @@ test("context_conflict_unit_counts_and_warning_barrier", async () => {
   const whole = asContext(build(context([...expensive, later]), base("build-context-pack"))); assert.equal(whole.items.length, 0); assert.equal(whole.conflicts[0].returnedMemberCount, 0); assert.equal(whole.selectionTruncated, true); assert.equal(whole.conflicts[0].highImpact, true); assert.equal(whole.conflicts[0].truncated, true); assert.ok(oracle(whole, expensive.map(v => v.item!)) <= 2048);
   assert.ok(Object.isFrozen(result) && Object.isFrozen(result.items) && Object.isFrozen(result.conflicts[0]));
 });
+
+// Ranked items consume the same token allowance used by nonduplicate supplementation.
+test("context_ranked_items_exhaust_follow_up_token_allowance", async () => {
+  const build = await packer();
+  const rankedRows = [row("ranked-a", { summary: "a".repeat(1900), normalizedKey: "a".repeat(900) }), row("ranked-b", { summary: "b".repeat(1900), normalizedKey: "b".repeat(900) })];
+  const followUp = follow("supplement", { summary: "f".repeat(1900) });
+  const result = asContext(build(context(rankedRows.map(value => ranked(value)), [followUp]), base("build-context-pack")));
+  assert.deepEqual(result.items.map(value => value.id), ["ranked-a", "ranked-b"]);
+  assert.deepEqual(result.followUps, []); assert.equal(result.selectionTruncated, true);
+  assert.equal(result.candidateBounded, false); assert.equal(result.byteBounded, false);
+  assert.ok(result.items.length < 10); assert.ok(oracle(result, rankedRows) <= 2048);
+  const followUpOnly = asContext(build(context([], [followUp]), base("build-context-pack")));
+  assert.deepEqual(followUpOnly.followUps.map(value => value.id), ["supplement"]);
+  const prospective = { ...result, followUps: followUpOnly.followUps };
+  assert.ok(oracle(prospective, [...rankedRows, followUp]) > 2048, "the shared token charge, not count or bytes, prevents supplementation");
+  assert.ok(Buffer.byteLength(JSON.stringify({ ...base("build-context-pack"), content: prospective })) < 16384);
+});

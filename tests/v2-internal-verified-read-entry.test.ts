@@ -330,3 +330,116 @@ test("async_identity_first_failure_stops_scheduling_before_close_drain", { timeo
     if (handles.every(handle => handle.fd === -1)) f.cleanup(); else { f.reader.close(); f.writer.close(); console.error("Retained uncertain first-failure identity handles"); }
   }
 });
+
+for (const interleaving of ["sibling-completion", "sibling-error", "later-abort"] as const) test(`async_identity_first_close_failure_latches_before_${interleaving}`, { timeout: 20000 }, async t => {
+  const inspector = await identityInspector(), f = await fixture(), abort = new AbortController();
+  const reason = new FreshStartError("FRESH_START_BUILD_MISMATCH"), later = new FreshStartError("FRESH_START_BUILD_MISMATCH");
+  const externalReason = new Error("later owned first-close abort"), ordering: string[] = [];
+  const original = fsPromises.open, originalLstat = fsPromises.lstat, handles: Awaited<ReturnType<typeof original>>[] = [];
+  let rejectClose!: (error: unknown) => void, releaseSiblingClose!: () => void, rejectSiblingRead!: (error: unknown) => void;
+  let releaseStarted!: () => void, releaseReady!: () => void;
+  const started = new Promise<void>(resolve => { releaseStarted = resolve; });
+  const ready = new Promise<void>(resolve => { releaseReady = resolve; });
+  const firstClose = new Promise<void>((_resolve, reject) => { rejectClose = reject; });
+  const siblingClose = new Promise<void>(resolve => { releaseSiblingClose = resolve; });
+  const siblingRead = new Promise<never>((_resolve, reject) => { rejectSiblingRead = reject; });
+  let openedJobs = 0, active = 0, maximum = 0, readyCloses = 0, laterJobStats = 0, closeAttempts = 0;
+  const timer = setTimeout(() => { releaseStarted(); releaseReady(); releaseSiblingClose(); rejectClose(reason); rejectSiblingRead(later); }, 4000);
+  const statMock = t.mock.method(fsPromises, "lstat", (...args: Parameters<typeof originalLstat>) => {
+    if (String(args[0]) === join(f.copied, "workers/project-store.worker.js")) laterJobStats++;
+    return Reflect.apply(originalLstat, fsPromises, args);
+  });
+  const mock = t.mock.method(fsPromises, "open", async (...args: Parameters<typeof original>) => {
+    const handle = await original(...args); handles.push(handle); maximum = Math.max(maximum, ++active);
+    const job = String(args[0]).endsWith("v2-build.json") ? 0 : ++openedJobs;
+    if (openedJobs === 3) releaseStarted();
+    const read = handle.read, close = handle.close;
+    if (job !== 0) (handle as unknown as { read: (options: unknown) => Promise<unknown> }).read = options => {
+      if (job === 1) return siblingRead;
+      return started.then(() => Reflect.apply(read, handle, [options]));
+    };
+    handle.close = function() {
+      closeAttempts++;
+      if (job === 2 || job === 3) {
+        // Return the exact controlled promise awaited by fileIdentity; an adopting wrapper
+        // would let the sibling race happen before the close rejection is locally observed.
+        void close.call(this).then(() => { active--; ordering.push(`real-close-${job}`); if (++readyCloses === 2) releaseReady(); }, rejectClose);
+        return job === 2 ? firstClose : siblingClose;
+      }
+      return close.call(this).then(() => { active--; });
+    };
+    return handle;
+  }); syncBuiltinESMExports();
+  const measurement = inspector.inspectV2BuildAsync(identityEntry(f), abort.signal).then(() => null, (error: unknown) => error);
+  try {
+    await ready;
+    assert.equal(openedJobs, 3); assert.equal(maximum, 3);
+    assert.ok(handles.filter(handle => handle.fd === -1).length >= 3, "manifest and both controlled close handles really closed before injecting rejection");
+    if (interleaving === "sibling-completion") { ordering.push("release-sibling-completion"); releaseSiblingClose(); }
+    ordering.push("reject-first-close"); rejectClose(reason);
+    queueMicrotask(() => {
+      // firstClose is the exact awaited promise: its rejection continuation is
+      // queued before this callback and before the exact sibling read rejects.
+      ordering.push("later-callback");
+      if (interleaving === "later-abort") abort.abort(externalReason);
+      rejectSiblingRead(later); releaseSiblingClose();
+    });
+    const outcome = await measurement;
+    assert.equal(active, 0); assert.ok(handles.every(handle => handle.fd === -1)); assert.equal(closeAttempts, handles.length);
+    assert.ok(ordering.indexOf("real-close-2") < ordering.indexOf("reject-first-close"));
+    assert.ok(ordering.indexOf("reject-first-close") < ordering.indexOf("later-callback"));
+    if (interleaving === "later-abort") { assert.equal(abort.signal.aborted, true); assert.equal(abort.signal.reason, externalReason); }
+    assert.equal(outcome, reason, "first close failure must survive later sibling failure or external abort");
+    assert.equal(laterJobStats, 0, "no later file measurement starts after locally observed close failure");
+    assert.equal(openedJobs, 3, "no fourth job opens"); assert.equal(handles.length, 4); assert.equal(maximum, 3);
+  } finally {
+    releaseStarted(); releaseReady(); releaseSiblingClose(); rejectClose(reason); rejectSiblingRead(later); clearTimeout(timer); await measurement;
+    mock.mock.restore(); statMock.mock.restore(); syncBuiltinESMExports();
+    if (handles.every(handle => handle.fd === -1)) f.cleanup(); else { f.reader.close(); f.writer.close(); console.error("Retained uncertain first-close identity handles"); }
+  }
+});
+
+for (const fault of ["stat-error", "topology"] as const) test(`async_identity_preopen_failure_latches_before_later_abort ${fault}`, { timeout: 20000 }, async t => {
+  const inspector = await identityInspector(), f = await fixture(), abort = new AbortController();
+  const reason = new FreshStartError("FRESH_START_BUILD_MISMATCH"), later = new Error("later owned pre-open abort");
+  const original = fsPromises.open, originalLstat = fsPromises.lstat, handles: Awaited<ReturnType<typeof original>>[] = [];
+  const artifact = join(f.copied, "v2.js"); if (fault === "topology") linkSync(artifact, artifact + ".owned-hardlink");
+  let releaseStarted!: () => void, releaseStat!: () => void, rejectStat!: (error: unknown) => void, releaseReads!: () => void;
+  const started = new Promise<void>(resolve => { releaseStarted = resolve; });
+  const statGate = new Promise<void>((resolve, reject) => { releaseStat = resolve; rejectStat = reject; });
+  const reads = new Promise<void>(resolve => { releaseReads = resolve; });
+  let siblingHandles = 0, initialStatObserved = false, openedJobs = 0, active = 0, maximum = 0, closeAttempts = 0;
+  const markStarted = () => { if (initialStatObserved && siblingHandles === 2) releaseStarted(); };
+  const timer = setTimeout(() => { releaseStarted(); releaseStat(); releaseReads(); }, 4000);
+  const statMock = t.mock.method(fsPromises, "lstat", async (...args: Parameters<typeof originalLstat>) => {
+    const value = await Reflect.apply(originalLstat, fsPromises, args);
+    if (String(args[0]) === artifact) { initialStatObserved = true; markStarted(); await statGate; }
+    return value;
+  });
+  const mock = t.mock.method(fsPromises, "open", async (...args: Parameters<typeof original>) => {
+    const handle = await original(...args); handles.push(handle); maximum = Math.max(maximum, ++active);
+    const manifest = String(args[0]).endsWith("v2-build.json"), read = handle.read, close = handle.close;
+    if (!manifest) {
+      openedJobs++; siblingHandles++; markStarted();
+      (handle as unknown as { read: (options: unknown) => Promise<unknown> }).read = async options => { await reads; return Reflect.apply(read, handle, [options]); };
+    }
+    handle.close = async function() { closeAttempts++; await close.call(this); active--; };
+    return handle;
+  }); syncBuiltinESMExports();
+  const measurement = inspector.inspectV2BuildAsync(identityEntry(f), abort.signal).then(() => null, (error: unknown) => error);
+  try {
+    await started; assert.equal(initialStatObserved, true); assert.equal(siblingHandles, 2);
+    if (fault === "stat-error") rejectStat(reason); else releaseStat();
+    // The stat wrapper settles first, then fileIdentity observes it, then the later abort runs.
+    queueMicrotask(() => queueMicrotask(() => { abort.abort(later); releaseReads(); }));
+    const outcome = await measurement;
+    assert.equal(active, 0); assert.ok(handles.every(handle => handle.fd === -1)); assert.equal(closeAttempts, handles.length);
+    if (fault === "stat-error") assert.equal(outcome, reason);
+    else { assert.notEqual(outcome, later); assert.equal((outcome as FreshStartError).code, "FRESH_START_BUILD_MISMATCH"); }
+    assert.equal(openedJobs, 2); assert.equal(handles.length, 3); assert.equal(maximum, 2);
+  } finally {
+    releaseStarted(); releaseStat(); releaseReads(); clearTimeout(timer); await measurement;
+    mock.mock.restore(); statMock.mock.restore(); syncBuiltinESMExports();
+    if (handles.every(handle => handle.fd === -1)) f.cleanup(); else { f.reader.close(); f.writer.close(); console.error("Retained uncertain pre-open identity handles"); }
+  }
+});

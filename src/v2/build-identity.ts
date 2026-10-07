@@ -91,14 +91,14 @@ function sameFile(before: BigIntStats, after: BigIntStats): boolean {
 }
 /** One reusable chunk per handle; manifest capture alone is bounded at the existing16KiB policy. */
 async function fileIdentity(path: string, maximum: number | undefined, collect: boolean, signal?: AbortSignal, observedFailure?: (error: unknown) => void) {
-  checkpoint(signal);
-  const before = maximum === undefined ? await stat(path, { bigint: true }) : await lstat(path, { bigint: true });
-  checkpoint(signal);
-  if (maximum !== undefined && (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1n
-    || before.size > BigInt(maximum) || await realpath(path) !== resolve(path))) fail();
-  checkpoint(signal);
   let handle: FileHandle | undefined; let failed = false;
   try {
+    checkpoint(signal);
+    const before = maximum === undefined ? await stat(path, { bigint: true }) : await lstat(path, { bigint: true });
+    checkpoint(signal);
+    if (maximum !== undefined && (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1n
+      || before.size > BigInt(maximum) || await realpath(path) !== resolve(path))) fail();
+    checkpoint(signal);
     handle = await open(path, "r"); checkpoint(signal);
     if (!sameFile(before, await handle.stat({ bigint: true }))) fail(); checkpoint(signal);
     const buffer = Buffer.allocUnsafe(CHUNK_BYTES), collected = collect ? Buffer.alloc(Number(before.size)) : undefined;
@@ -120,7 +120,7 @@ async function fileIdentity(path: string, maximum: number | undefined, collect: 
   } catch (error) { failed = true; observedFailure?.(error); throw error; }
   finally {
     // A secondary close error must not replace the primary failure. Other pool handles still drain.
-    try { await handle?.close(); } catch (error) { if (!failed) { checkpoint(signal); throw error; } }
+    try { await handle?.close(); } catch (error) { if (!failed) { checkpoint(signal); observedFailure?.(error); throw error; } }
   }
 }
 async function boundedMeasurement(jobs: ((signal: AbortSignal, observedFailure: (error: unknown) => void) => Promise<void>)[], signal?: AbortSignal): Promise<void> {
