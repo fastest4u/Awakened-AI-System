@@ -421,8 +421,8 @@ interface FixtureOptions {
 }
 
 async function createFixture(options: FixtureOptions = {}): Promise<Fixture> {
-  const root = fixtureRoot("projection-full-integrity-", options.rootSpelling ?? "raw");
-  if (activeEvidence !== undefined) Object.assign(activeEvidence, rootEvidence(ownerForPath(root), root, options.rootSpelling ?? "raw"));
+  const root = fixtureRoot("projection-full-integrity-", options.rootSpelling ?? "native");
+  if (activeEvidence !== undefined) Object.assign(activeEvidence, rootEvidence(ownerForPath(root), root, options.rootSpelling ?? "native"));
   const sourcePath = join(root, "events.sqlite");
   const projectionDirectory = join(root, "projections");
   let connection: SqliteConnection;
@@ -699,7 +699,7 @@ describe("full projection integrity replay", () => {
     ));
   });
 
-  it("returns a frozen pass report only for an exact authoritative replay", t => assertIntegrityReplay(t, "raw"));
+  it("returns a frozen pass report only for an exact authoritative replay", t => assertIntegrityReplay(t, "native"));
 
   it("projection spelling control: integrity", async t => {
     for (const spelling of ["raw", "native"] as const) {

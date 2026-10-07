@@ -1,4 +1,5 @@
 import { strict as assert } from "node:assert";
+import { canonicalMkdtemp } from "./support/canonical-temp.js";
 import { createHmac } from "node:crypto";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -111,7 +112,7 @@ function materializer(): CompatibilityLogMaterializer {
 
 describe("CompatibilityLogMaterializer", () => {
   it("replaces an absent target and acknowledges the exact planned fingerprint", () => {
-    const root = mkdtempSync(join(tmpdir(), "compat-materializer-"));
+    const root = canonicalMkdtemp("compat-materializer-");
     try {
       const current = claim("claimed", plan());
       const ops = operations(current);
@@ -135,7 +136,7 @@ describe("CompatibilityLogMaterializer", () => {
   });
 
   it("accepts a completed replay before lease expiry and does not acknowledge twice", () => {
-    const root = mkdtempSync(join(tmpdir(), "compat-materializer-"));
+    const root = canonicalMkdtemp("compat-materializer-");
     try {
       const target = join(root, ARTIFACT_PATH);
       const ops = operations(claim("completed", plan()));
@@ -157,7 +158,7 @@ describe("CompatibilityLogMaterializer", () => {
   });
 
   it("returns superseded-after-completion without changing bytes", () => {
-    const root = mkdtempSync(join(tmpdir(), "compat-materializer-"));
+    const root = canonicalMkdtemp("compat-materializer-");
     try {
       const target = join(root, ARTIFACT_PATH);
       const ops = operations(claim("completed", plan()), false);
@@ -180,7 +181,7 @@ describe("CompatibilityLogMaterializer", () => {
   });
 
   it("rejects an expired unacknowledged claim and an unproven target", () => {
-    const root = mkdtempSync(join(tmpdir(), "compat-materializer-"));
+    const root = canonicalMkdtemp("compat-materializer-");
     try {
       const expired = Object.freeze({
         ...claim("claimed", plan()),

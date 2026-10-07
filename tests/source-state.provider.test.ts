@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { canonicalMkdtemp } from "./support/canonical-temp.js";
 import { mkdirSync, mkdtempSync, renameSync, rmSync, symlinkSync, truncateSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -71,7 +72,7 @@ function projectFixture(kind: "git" | "non-git"): {
   readonly scope: Readonly<Record<string, unknown>>;
   readonly projectRoot: string;
 } {
-  const projectRoot = mkdtempSync(join(tmpdir(), "source-state-v1-"));
+  const projectRoot = canonicalMkdtemp("source-state-v1-");
   temporaryRoots.push(projectRoot);
   const vaultRoot = join(projectRoot, "memory");
   const descriptorPath = join(vaultRoot, ".project", "descriptor.json");
@@ -287,7 +288,7 @@ describe("SourceStateProvider trusted capture", () => {
     const module = await optionalSourceStateModule();
     const Provider = providerConstructor(module);
     const fixture = projectFixture("git");
-    const gitCommonRoot = mkdtempSync(join(tmpdir(), "source-state-common-"));
+    const gitCommonRoot = canonicalMkdtemp("source-state-common-");
     temporaryRoots.push(gitCommonRoot);
     const storeRoot = join(gitCommonRoot, "project-memory", "project", "v2");
     mkdirSync(storeRoot, { recursive: true });
@@ -409,7 +410,7 @@ describe("SourceStateProvider trusted capture", () => {
     const module = await optionalSourceStateModule();
     const Provider = providerConstructor(module);
     const fixture = projectFixture("non-git");
-    const outside = mkdtempSync(join(tmpdir(), "source-state-outside-"));
+    const outside = canonicalMkdtemp("source-state-outside-");
     temporaryRoots.push(outside);
     const insideDirectory = join(fixture.projectRoot, "inside");
     const displacedDirectory = join(fixture.projectRoot, "inside-before-swap");

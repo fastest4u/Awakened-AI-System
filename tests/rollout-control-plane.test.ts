@@ -423,12 +423,12 @@ describe("schema-6 rollout control-plane storage", () => {
     assert.deepEqual(
       connection.prepare("SELECT version FROM schema_migrations ORDER BY version").all()
         .map((row) => Number(row.version)),
-      [1, 2, 3, 4, 5, 6, 7, 8],
+      [1, 2, 3, 4, 5, 6, 7, 8, 9],
     );
     assert.equal(
       connection.prepare("SELECT schema_version FROM project_meta WHERE singleton = 1")
         .get()?.schema_version,
-      8n,
+      9n,
     );
 
     const expectedColumns = new Map<string, readonly string[]>([

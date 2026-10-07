@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { canonicalMkdtemp } from "./support/canonical-temp.js";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -553,7 +554,7 @@ class RecordingDriver implements SqliteDriver {
 
 describe("projection generation builder", () => {
   it("reads one committed source snapshot and builds an independent immutable generation", async () => {
-    const root = mkdtempSync(join(tmpdir(), "projection-builder-"));
+    const root = canonicalMkdtemp("projection-builder-");
     roots.push(root);
     const sourcePath = join(root, "events.sqlite");
     const projectionDirectory = join(root, "projections");
@@ -664,7 +665,7 @@ describe("projection generation builder", () => {
   });
 
   it("keeps the production V1 build on its historical standalone latest-checkpoint fold", async () => {
-    const root = mkdtempSync(join(tmpdir(), "projection-builder-v1-boundary-"));
+    const root = canonicalMkdtemp("projection-builder-v1-boundary-");
     roots.push(root);
     const sourcePath = join(root, "events.sqlite");
     const projectionDirectory = join(root, "projections");
@@ -707,7 +708,7 @@ describe("projection generation builder", () => {
   });
 
   it("keeps governed schema-3 material out of the production V1 build", async () => {
-    const root = mkdtempSync(join(tmpdir(), "projection-builder-v1-governed-boundary-"));
+    const root = canonicalMkdtemp("projection-builder-v1-governed-boundary-");
     roots.push(root);
     const sourcePath = join(root, "events.sqlite");
     const projectionDirectory = join(root, "projections");
@@ -737,7 +738,7 @@ describe("projection generation builder", () => {
   });
 
   it("builds a production-decodable root/child/checkpoint and every governed V2 relation", async () => {
-    const root = mkdtempSync(join(tmpdir(), "projection-builder-v2-relations-"));
+    const root = canonicalMkdtemp("projection-builder-v2-relations-");
     roots.push(root);
     const sourcePath = join(root, "events.sqlite");
     const projectionDirectory = join(root, "projections");
@@ -893,7 +894,7 @@ describe("projection generation builder", () => {
   });
 
   it("streams authenticated events in ascending order exactly once", async () => {
-    const root = mkdtempSync(join(tmpdir(), "projection-streaming-reader-"));
+    const root = canonicalMkdtemp("projection-streaming-reader-");
     roots.push(root);
     const sourcePath = join(root, "events.sqlite");
     const source = createSource(sourcePath);
@@ -914,7 +915,7 @@ describe("projection generation builder", () => {
   });
 
   it("rejects metadata tamper before a projection event is folded", async () => {
-    const root = mkdtempSync(join(tmpdir(), "projection-source-metadata-tamper-"));
+    const root = canonicalMkdtemp("projection-source-metadata-tamper-");
     roots.push(root);
     const sourcePath = join(root, "events.sqlite");
     const projectionDirectory = join(root, "projections");
@@ -938,7 +939,7 @@ describe("projection generation builder", () => {
   });
 
   it("rejects a final authentication cursor that differs from the captured terminal", async () => {
-    const root = mkdtempSync(join(tmpdir(), "projection-terminal-cursor-"));
+    const root = canonicalMkdtemp("projection-terminal-cursor-");
     roots.push(root);
     const sourcePath = join(root, "events.sqlite");
     const source = createSource(sourcePath);
@@ -954,7 +955,7 @@ describe("projection generation builder", () => {
   });
 
   it("rejects a generation whose persisted rows no longer match its intended core checksums", async () => {
-    const root = mkdtempSync(join(tmpdir(), "projection-persisted-checksum-"));
+    const root = canonicalMkdtemp("projection-persisted-checksum-");
     roots.push(root);
     const sourcePath = join(root, "events.sqlite");
     const source = createSource(sourcePath);
@@ -983,7 +984,7 @@ describe("projection generation builder", () => {
   });
 
   it("runs the FTS external-content integrity check before publishing a generation", async () => {
-    const root = mkdtempSync(join(tmpdir(), "projection-fts-integrity-"));
+    const root = canonicalMkdtemp("projection-fts-integrity-");
     roots.push(root);
     const sourcePath = join(root, "events.sqlite");
     const source = createSource(sourcePath);
@@ -1022,7 +1023,7 @@ describe("projection generation builder", () => {
   });
 
   it("refuses a post-close WAL sidecar before the durable generation rename", async () => {
-    const root = mkdtempSync(join(tmpdir(), "projection-builder-sidecar-"));
+    const root = canonicalMkdtemp("projection-builder-sidecar-");
     roots.push(root);
     const sourcePath = join(root, "events.sqlite");
     const projectionDirectory = join(root, "projections");
@@ -1051,7 +1052,7 @@ describe("projection generation builder", () => {
   });
 
   it("keeps a V2 build staged until the coordinator adopts its verified bytes", async () => {
-    const root = mkdtempSync(join(tmpdir(), "projection-builder-v2-stage-"));
+    const root = canonicalMkdtemp("projection-builder-v2-stage-");
     roots.push(root);
     const sourcePath = join(root, "events.sqlite");
     const projectionDirectory = join(root, "projections");

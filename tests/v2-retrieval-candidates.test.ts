@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { canonicalMkdtemp } from "./support/canonical-temp.js";
 import {
   copyFileSync,
   mkdtempSync,
@@ -164,7 +165,7 @@ interface V2Fixture {
 }
 
 async function createV2Fixture(): Promise<V2Fixture> {
-  const root = mkdtempSync(join(tmpdir(), "v2-retrieval-candidates-"));
+  const root = canonicalMkdtemp("v2-retrieval-candidates-");
   roots.push(root);
   const projectionDirectory = join(root, "projections");
   const sourceEvent = storedMemoryEvent(
@@ -232,7 +233,7 @@ function v1Manifest(): ProjectionManifestV1 {
 }
 
 function createV1Lease(): ProjectionReaderLease {
-  const root = mkdtempSync(join(tmpdir(), "v1-candidate-protection-"));
+  const root = canonicalMkdtemp("v1-candidate-protection-");
   roots.push(root);
   const databasePath = join(root, "projections-1-1.sqlite");
   const database = new DatabaseSync(databasePath);

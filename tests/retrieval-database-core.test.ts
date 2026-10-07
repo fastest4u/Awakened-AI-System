@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { canonicalMkdtemp } from "./support/canonical-temp.js";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -86,7 +87,7 @@ function manifest(): ProjectionManifestV1 {
 }
 
 function createLease(options: { readonly dropFts?: boolean } = {}): ProjectionReaderLease {
-  const root = mkdtempSync(join(tmpdir(), "retrieval-candidates-"));
+  const root = canonicalMkdtemp("retrieval-candidates-");
   roots.push(root);
   const databasePath = join(root, "projections-1-1.sqlite");
   const database = new DatabaseSync(databasePath);
@@ -369,7 +370,7 @@ it("database_core_exports_and_preserves_native_and_legacy_queries", async () => 
   } finally { db.close(); }
 
   // Reuse the builder-owned conflict image pattern from retrieval-candidates.
-  const root = mkdtempSync(join(tmpdir(), "retrieval-database-core-v2-"));
+  const root = canonicalMkdtemp("retrieval-database-core-v2-");
   roots.push(root);
   const events = [
     memoryStoredEvent({ position: 1, itemId: ITEM_ID, normalizedKey: "decision:closure-anchor",

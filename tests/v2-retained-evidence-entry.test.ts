@@ -412,6 +412,7 @@ test("compiled prepared service remains status only", async t => {
   for (const artifact of build.artifacts) assert.equal(createHash("sha256").update(readFileSync(join(process.cwd(), "dist", artifact.path))).digest("hex"), artifact.sha256);
   const hash = (value: unknown) => createHash("sha256").update(canonicalJson(value)).digest("hex");
   const env = { ...process.env, MEMORY_PROJECT_ROOT: root, MEMORY_V2_VAULT_PATH: vault, MEMORY_V1_ARCHIVE_PATH: archive, MEMORY_V2_RELEASE_ID: releaseId };
+  const operatorLine = `Resolved V2 destination: ${JSON.stringify(vault)}\n`;
   mkdirSync(archive);
   writeFileSync(join(root, "release.json"), JSON.stringify({ initializationId: randomUUID(), release: { profileVersion: 1, releaseId,
     buildIdentityHash: build.buildIdentityHash, schemaIdentityHash: "f10eb1976f2fd97d899163d930a91e21f66daaccf448a76334d5c9b13ffd6df1",
@@ -422,7 +423,10 @@ test("compiled prepared service remains status only", async t => {
   const admin = (operation: string) => {
     const result = spawnSync(process.execPath, [join(process.cwd(), "dist/v2-admin.js"), operation, "--project-root", root,
       "--v2-vault-root", vault, "--v1-archive-root", archive, "--release-manifest", join(root, "release.json")], { env, encoding: "utf8", windowsHide: true, timeout: 20000 });
-    assert.equal(result.error, undefined, "measured admin did not close"); outputs.push(Buffer.from(result.stdout), Buffer.from(result.stderr)); return result;
+    assert.equal(result.error, undefined, "measured admin did not close");
+    // The admin CLI deliberately reports its resolved destination to the local operator (src/v2/admin.ts);
+    // only that exact documented line is excluded from the owned-path disclosure check.
+    outputs.push(Buffer.from(result.stdout), Buffer.from(result.stderr.split(operatorLine).join(""))); return result;
   };
   let allClosed = true;
   try {
@@ -477,7 +481,9 @@ test("compiled prepared service remains status only", async t => {
       let response: any; try { [response] = await Promise.race([reply, exit.then(() => { throw new Error("measured worker exited before refusal"); })]); } finally { clearTimeout(timer); }
       outputs.push(encodeObserved(response)); assert.equal(response.ok, false); assert.equal(response.error.code, "FRESH_START_ADMISSION_DENIED");
     } finally { await worker.terminate(); [workerCode] = await exit; allClosed = true; }
-    assert.ok(outputs.every(bytes => !bytes.includes(Buffer.from(root))), "measured output disclosed owned path");
+    // Check raw and JSON-escaped spellings so Windows backslash escaping cannot hide a disclosure.
+    const disclosed = [root, JSON.stringify(root).slice(1, -1)].map(value => Buffer.from(value));
+    assert.ok(outputs.every(bytes => disclosed.every(value => !bytes.includes(value))), "measured output disclosed owned path");
     t.diagnostic(JSON.stringify({ scope: "measured-prepared-status-refusal", buildIdentityHash: build.buildIdentityHash, childCode, workerCode,
       workerTermination: "intentional-after-admission-refusal", desktopQualification: "nine-rows-unverified" }));
   } finally {

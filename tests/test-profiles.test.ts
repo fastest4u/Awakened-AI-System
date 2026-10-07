@@ -189,15 +189,17 @@ await runDefaultTests(${JSON.stringify(f.tests)},process.argv[2]);`);
   } finally { f.cleanup(); }
 });
 
+// Node 24 node:test handles SIGTERM/SIGINT itself ("Interrupted while running", exit status 1),
+// so only an uncatchable signal proves native child signal termination is relayed.
 test("default runner stops after a cohort signal and preserves native signal termination", {
   skip: process.platform === "win32" ? "Windows reports process termination as an exit code, not a POSIX signal" : false,
 }, async () => {
   await profile();
   const f = fixture([...excluded, "qualified-checkpoint-migration.test.js", "z.test.js"]);
-  writeFileSync(join(f.tests, "qualified-checkpoint-migration.test.js"), "process.kill(process.ppid,'SIGTERM'); setInterval(()=>{},1000).unref();");
+  writeFileSync(join(f.tests, "qualified-checkpoint-migration.test.js"), "process.kill(process.ppid,'SIGKILL'); setInterval(()=>{},1000).unref();");
   try {
     const result = run(f);
-    assert.equal(result.signal, "SIGTERM");
+    assert.equal(result.signal, "SIGKILL");
     assert.equal(result.status, null);
     assert.equal(existsSync(join(f.path, "order.log")), false);
   } finally { f.cleanup(); }
@@ -285,13 +287,15 @@ test("default runner surfaces native spawn errors as nonzero failures", async ()
   } finally { f.cleanup(); }
 });
 
+// Node 24 node:test handles SIGTERM/SIGINT itself ("Interrupted while running", exit status 1),
+// so only an uncatchable signal proves native child signal termination is relayed.
 test("default runner preserves native child signal termination", { skip: process.platform === "win32" ? "Windows reports process termination as an exit code, not a POSIX signal" : false }, async () => {
   await profile();
   const f = fixture([...excluded, "signal.test.js"]);
-  writeFileSync(join(f.tests, "signal.test.js"), "process.kill(process.ppid,'SIGTERM'); setInterval(()=>{},1000).unref();");
+  writeFileSync(join(f.tests, "signal.test.js"), "process.kill(process.ppid,'SIGKILL'); setInterval(()=>{},1000).unref();");
   try {
     const result = run(f);
-    assert.equal(result.signal, "SIGTERM");
+    assert.equal(result.signal, "SIGKILL");
     assert.equal(result.status, null);
   } finally { f.cleanup(); }
 });

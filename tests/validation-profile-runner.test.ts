@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { join } from "node:path";
 import { describe, it } from "node:test";
 
 import {
@@ -25,6 +26,10 @@ const WORKFLOW_ID = "55555555-5555-4555-8555-555555555555";
 const CHECKPOINT_ID = "66666666-6666-4666-8666-666666666666";
 const WORKSPACE_ID = "a".repeat(64);
 const CHECKPOINT_FINGERPRINT = "b".repeat(64);
+// Trusted profile paths must be absolute on the host platform; Windows drive paths are not absolute on POSIX.
+const TRUSTED_ROOT = process.platform === "win32" ? "C:\\trusted" : "/trusted";
+const TRUSTED_EXECUTABLE = join(TRUSTED_ROOT, "validator.exe");
+const TRUSTED_WORKSPACE = join(TRUSTED_ROOT, "workspace");
 const SOURCE_STATE: SourceStateFingerprintV1 = Object.freeze({
   sourceStateScopeVersion: 1 as const,
   workspaceId: WORKSPACE_ID as SourceStateFingerprintV1["workspaceId"],
@@ -37,9 +42,9 @@ function profile(overrides: Partial<TrustedValidationProfileEntry> = {}): Truste
   return {
     profileId: "lint",
     profileVersion: 1,
-    executable: "C:\\trusted\\validator.exe",
+    executable: TRUSTED_EXECUTABLE,
     args: ["--strict", "--format", "json"],
-    cwd: "C:\\trusted\\workspace",
+    cwd: TRUSTED_WORKSPACE,
     env: { VALIDATOR_MODE: "strict" },
     timeoutMs: 1_000,
     maxOutputBytes: 2_048,
@@ -196,9 +201,9 @@ describe("trusted validation profile runner", () => {
 
     assert.equal(invocations.length, 1);
     assert.deepEqual(invocations[0], {
-      executable: "C:\\trusted\\validator.exe",
+      executable: TRUSTED_EXECUTABLE,
       args: ["--strict", "--format", "json"],
-      cwd: "C:\\trusted\\workspace",
+      cwd: TRUSTED_WORKSPACE,
       env: { VALIDATOR_MODE: "strict" },
       shell: false,
       timeoutMs: 1_000,

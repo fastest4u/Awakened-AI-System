@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { canonicalMkdtemp } from "./support/canonical-temp.js";
 import { createHash } from "node:crypto";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -136,7 +137,7 @@ function capturePublishedGeneration(
 }
 
 async function publishedFixture(): Promise<PublishedV2Fixture> {
-  const root = mkdtempSync(join(tmpdir(), "v2-reader-lease-"));
+  const root = canonicalMkdtemp("v2-reader-lease-");
   roots.push(root);
   const sourcePath = join(root, "events.sqlite");
   const projectionDirectory = join(root, "projections");
@@ -165,7 +166,7 @@ function imageWith(
 }
 
 function imageBytesWithMetadataCanary(image: StableProjectionGenerationImage): Uint8Array {
-  const root = mkdtempSync(join(tmpdir(), "v2-reader-lease-canary-"));
+  const root = canonicalMkdtemp("v2-reader-lease-canary-");
   roots.push(root);
   const path = join(root, "substituted.sqlite");
   writeFileSync(path, image.bytes);

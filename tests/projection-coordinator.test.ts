@@ -267,7 +267,7 @@ interface PublishedV2CoordinatorFixture {
 async function publishedV2CoordinatorFixture(
   evaluationLeases?: V2ProjectionReaderLeaseRegistry,
 ): Promise<PublishedV2CoordinatorFixture> {
-  const root = fixtureRoot("projection-v2-evaluation-lease-", "raw");
+  const root = fixtureRoot("projection-v2-evaluation-lease-", "native");
   const sourcePath = join(root, "events.sqlite");
   const projectionDirectory = join(root, "projections");
   const source = sourceDatabase(sourcePath);
@@ -293,7 +293,7 @@ interface V2DeadlineFixture {
 }
 
 async function v2DeadlineFixture(): Promise<V2DeadlineFixture> {
-  const root = fixtureRoot("projection-v2-deadline-", "raw");
+  const root = fixtureRoot("projection-v2-deadline-", "native");
   const sourcePath = join(root, "events.sqlite");
   const projectionDirectory = join(root, "projections");
   const source = sourceDatabase(sourcePath);
@@ -421,7 +421,7 @@ async function assertV2Adoption(t: TestContext, rootSpelling: "raw" | "native"):
 
 describe("projection build coordinator", () => {
   it("coordinator fixture retains root when source setup cannot close", () => {
-    const root = fixtureRoot("projection-source-setup-close-", "raw");
+    const root = fixtureRoot("projection-source-setup-close-", "native");
     const setupError = new Error("controlled source setup failure");
     const closeError = new Error("controlled uncertainty after native close returned");
     const originalExec = DatabaseSync.prototype.exec;
@@ -453,7 +453,7 @@ describe("projection build coordinator", () => {
       roots.splice(roots.indexOf(ownerForPath(root)), 1);
     }
   });
-  it("adopts a staged V2 generation before publishing its manifest authority", t => assertV2Adoption(t, "raw"));
+  it("adopts a staged V2 generation before publishing its manifest authority", t => assertV2Adoption(t, "native"));
 
   it("projection spelling control: coordinator", async t => {
     for (const spelling of ["raw", "native"] as const) {
@@ -471,7 +471,7 @@ describe("projection build coordinator", () => {
   });
 
   it("reconciles a positively identified V2 orphan after an install-before-manifest fault", async () => {
-    const root = fixtureRoot("projection-v2-orphan-recovery-", "raw");
+    const root = fixtureRoot("projection-v2-orphan-recovery-", "native");
     const sourcePath = join(root, "events.sqlite");
     const projectionDirectory = join(root, "projections");
     const source = sourceDatabase(sourcePath);
@@ -512,7 +512,7 @@ describe("projection build coordinator", () => {
   });
 
   it("reconciles an identified V2 orphan even when its active generation already meets the request", async () => {
-    const root = fixtureRoot("projection-v2-fresh-orphan-", "raw");
+    const root = fixtureRoot("projection-v2-fresh-orphan-", "native");
     const sourcePath = join(root, "events.sqlite");
     const projectionDirectory = join(root, "projections");
     const source = sourceDatabase(sourcePath);
@@ -545,7 +545,7 @@ describe("projection build coordinator", () => {
   });
 
   it("persists a retired V2 generation high-water across reconciliation and coordinator restart", async () => {
-    const root = fixtureRoot("projection-v2-retired-high-water-", "raw");
+    const root = fixtureRoot("projection-v2-retired-high-water-", "native");
     const sourcePath = join(root, "events.sqlite");
     const projectionDirectory = join(root, "projections");
     const source = sourceDatabase(sourcePath);
@@ -617,7 +617,7 @@ describe("projection build coordinator", () => {
   });
 
   it("recovers a retirement intent after its rename before journal completion", async () => {
-    const root = fixtureRoot("projection-v2-retirement-intent-recovery-", "raw");
+    const root = fixtureRoot("projection-v2-retirement-intent-recovery-", "native");
     const sourcePath = join(root, "events.sqlite");
     const projectionDirectory = join(root, "projections");
     const journalPath = join(projectionDirectory, "projection-reconciliation-v2.json");
@@ -691,7 +691,7 @@ describe("projection build coordinator", () => {
   });
 
   it("recovers a retirement intent before its rename in a fresh process", async () => {
-    const root = fixtureRoot("projection-v2-retirement-intent-prerename-", "raw");
+    const root = fixtureRoot("projection-v2-retirement-intent-prerename-", "native");
     const sourcePath = join(root, "events.sqlite");
     const projectionDirectory = join(root, "projections");
     const journalPath = join(projectionDirectory, "projection-reconciliation-v2.json");
@@ -777,7 +777,7 @@ describe("projection build coordinator", () => {
   });
 
   it("rejects ctime-changed retired evidence after its journal record is complete", async () => {
-    const root = fixtureRoot("projection-v2-retired-evidence-ctime-", "raw");
+    const root = fixtureRoot("projection-v2-retired-evidence-ctime-", "native");
     const sourcePath = join(root, "events.sqlite");
     const projectionDirectory = join(root, "projections");
     const source = sourceDatabase(sourcePath);
@@ -825,7 +825,7 @@ describe("projection build coordinator", () => {
   });
 
   it("rejects missing retired evidence after recovery before the final scan", async () => {
-    const root = fixtureRoot("projection-v2-retired-evidence-missing-", "raw");
+    const root = fixtureRoot("projection-v2-retired-evidence-missing-", "native");
     const sourcePath = join(root, "events.sqlite");
     const projectionDirectory = join(root, "projections");
     const source = sourceDatabase(sourcePath);
@@ -871,7 +871,7 @@ describe("projection build coordinator", () => {
   });
 
   it("retains swapped retired evidence after recovery before the final scan", async () => {
-    const root = fixtureRoot("projection-v2-retired-evidence-swap-", "raw");
+    const root = fixtureRoot("projection-v2-retired-evidence-swap-", "native");
     const sourcePath = join(root, "events.sqlite");
     const projectionDirectory = join(root, "projections");
     const source = sourceDatabase(sourcePath);
@@ -924,7 +924,7 @@ describe("projection build coordinator", () => {
   });
 
   it("migrates a prior canonical retired V2 generation high-water journal during reconciliation", async () => {
-    const root = fixtureRoot("projection-v2-legacy-journal-", "raw");
+    const root = fixtureRoot("projection-v2-legacy-journal-", "native");
     const sourcePath = join(root, "events.sqlite");
     const projectionDirectory = join(root, "projections");
     const source = sourceDatabase(sourcePath);
@@ -975,7 +975,7 @@ describe("projection build coordinator", () => {
   });
 
   it("rejects a zero retired V2 generation high-water record without rewriting evidence", async () => {
-    const root = fixtureRoot("projection-v2-zero-retired-generation-", "raw");
+    const root = fixtureRoot("projection-v2-zero-retired-generation-", "native");
     const sourcePath = join(root, "events.sqlite");
     const projectionDirectory = join(root, "projections");
     const source = sourceDatabase(sourcePath);
@@ -1020,7 +1020,7 @@ describe("projection build coordinator", () => {
   });
 
   it("rejects unjournaled retired evidence before source access", async () => {
-    const root = fixtureRoot("projection-v2-unjournaled-retired-", "raw");
+    const root = fixtureRoot("projection-v2-unjournaled-retired-", "native");
     const sourcePath = join(root, "events.sqlite");
     const projectionDirectory = join(root, "projections");
     const source = sourceDatabase(sourcePath);
@@ -1050,7 +1050,7 @@ describe("projection build coordinator", () => {
   });
 
   it("rejects legacy quarantine evidence before source access", async () => {
-    const root = fixtureRoot("projection-v2-legacy-quarantine-", "raw");
+    const root = fixtureRoot("projection-v2-legacy-quarantine-", "native");
     const sourcePath = join(root, "events.sqlite");
     const projectionDirectory = join(root, "projections");
     const source = sourceDatabase(sourcePath);
@@ -1080,7 +1080,7 @@ describe("projection build coordinator", () => {
   });
 
   it("does not reuse a reserved V2 final generation after restart without an active manifest", async () => {
-    const root = fixtureRoot("projection-v2-journal-without-manifest-", "raw");
+    const root = fixtureRoot("projection-v2-journal-without-manifest-", "native");
     const sourcePath = join(root, "events.sqlite");
     const projectionDirectory = join(root, "projections");
     const source = sourceDatabase(sourcePath);
@@ -1121,7 +1121,7 @@ describe("projection build coordinator", () => {
   });
 
   it("durably reserves an orphan before quarantine disposition", async () => {
-    const root = fixtureRoot("projection-v2-journal-before-quarantine-", "raw");
+    const root = fixtureRoot("projection-v2-journal-before-quarantine-", "native");
     const sourcePath = join(root, "events.sqlite");
     const projectionDirectory = join(root, "projections");
     const source = sourceDatabase(sourcePath);
@@ -1156,7 +1156,7 @@ describe("projection build coordinator", () => {
   });
 
   it("takes the V2 publication lock before initial source access", async () => {
-    const root = fixtureRoot("projection-v2-initial-lock-before-source-", "raw");
+    const root = fixtureRoot("projection-v2-initial-lock-before-source-", "native");
     const projectionDirectory = join(root, "projections");
     let sawLock = false;
     const coordinator = new V2ProjectionBuildCoordinator({
@@ -1172,7 +1172,7 @@ describe("projection build coordinator", () => {
   });
 
   it("retains a V2 orphan when its terminal metadata no longer matches its persisted core checksums", async () => {
-    const root = fixtureRoot("projection-v2-orphan-terminal-integrity-", "raw");
+    const root = fixtureRoot("projection-v2-orphan-terminal-integrity-", "native");
     const sourcePath = join(root, "events.sqlite");
     const projectionDirectory = join(root, "projections");
     const source = sourceDatabase(sourcePath);
@@ -1214,7 +1214,7 @@ describe("projection build coordinator", () => {
   });
 
   it("retains a final V2 orphan after an A-to-B-to-A swap following image capture", async () => {
-    const root = fixtureRoot("projection-v2-orphan-capture-swap-", "raw");
+    const root = fixtureRoot("projection-v2-orphan-capture-swap-", "native");
     const sourcePath = join(root, "events.sqlite");
     const projectionDirectory = join(root, "projections");
     const source = sourceDatabase(sourcePath);
@@ -1257,7 +1257,7 @@ describe("projection build coordinator", () => {
   });
 
   it("retains retired evidence when it differs from the validated V2 image", async () => {
-    const root = fixtureRoot("projection-v2-retired-swap-", "raw");
+    const root = fixtureRoot("projection-v2-retired-swap-", "native");
     const sourcePath = join(root, "events.sqlite");
     const projectionDirectory = join(root, "projections");
     const source = sourceDatabase(sourcePath);
@@ -1305,7 +1305,7 @@ describe("projection build coordinator", () => {
   });
 
   it("fails closed if the V2 projection directory swaps after authorization", async () => {
-    const root = fixtureRoot("projection-v2-directory-swap-", "raw");
+    const root = fixtureRoot("projection-v2-directory-swap-", "native");
     const projectionDirectory = join(root, "projections");
     const originalDirectory = join(root, "original-projections");
     const attackerDirectory = join(root, "attacker-projections");
@@ -1342,7 +1342,7 @@ describe("projection build coordinator", () => {
   });
 
   it("takes the V2 publication lock before a directory-swap journal snapshot", async () => {
-    const root = fixtureRoot("projection-v2-journal-snapshot-swap-", "raw");
+    const root = fixtureRoot("projection-v2-journal-snapshot-swap-", "native");
     const projectionDirectory = join(root, "projections");
     const originalDirectory = join(root, "original-projections");
     const attackerDirectory = join(root, "attacker-projections");
@@ -1371,7 +1371,7 @@ describe("projection build coordinator", () => {
   });
 
   it("retains an unreadable final-named V2 candidate rather than deleting on uncertain observation", async () => {
-    const root = fixtureRoot("projection-v2-orphan-uncertain-", "raw");
+    const root = fixtureRoot("projection-v2-orphan-uncertain-", "native");
     const sourcePath = join(root, "events.sqlite");
     const projectionDirectory = join(root, "projections");
     const source = sourceDatabase(sourcePath);
@@ -1396,7 +1396,7 @@ describe("projection build coordinator", () => {
   });
 
   it("poisons and retains the publication lock when fresh reconciliation cannot verify a final V2 candidate", async () => {
-    const root = fixtureRoot("projection-v2-fresh-poison-", "raw");
+    const root = fixtureRoot("projection-v2-fresh-poison-", "native");
     const sourcePath = join(root, "events.sqlite");
     const projectionDirectory = join(root, "projections");
     const source = sourceDatabase(sourcePath);
@@ -1425,7 +1425,7 @@ describe("projection build coordinator", () => {
   });
 
   it("reconciles before opening a source snapshot for a non-fresh V2 request", async () => {
-    const root = fixtureRoot("projection-v2-nonfresh-entry-reconcile-", "raw");
+    const root = fixtureRoot("projection-v2-nonfresh-entry-reconcile-", "native");
     const sourcePath = join(root, "events.sqlite");
     const projectionDirectory = join(root, "projections");
     const source = sourceDatabase(sourcePath);
@@ -1457,7 +1457,7 @@ describe("projection build coordinator", () => {
   });
 
   it("removes a verified V2 orphan before a non-fresh source failure", async () => {
-    const root = fixtureRoot("projection-v2-nonfresh-valid-reconcile-", "raw");
+    const root = fixtureRoot("projection-v2-nonfresh-valid-reconcile-", "native");
     const sourcePath = join(root, "events.sqlite");
     const projectionDirectory = join(root, "projections");
     const source = sourceDatabase(sourcePath);
@@ -1493,7 +1493,7 @@ describe("projection build coordinator", () => {
   });
 
   it("does not reconcile a final V2 generation named by the lease registry", async () => {
-    const root = fixtureRoot("projection-v2-orphan-lease-", "raw");
+    const root = fixtureRoot("projection-v2-orphan-lease-", "native");
     const sourcePath = join(root, "events.sqlite");
     const projectionDirectory = join(root, "projections");
     const source = sourceDatabase(sourcePath);
@@ -1811,7 +1811,7 @@ describe("projection build coordinator", () => {
   });
 
   it("publishes atomically, preserves crash-window authority, serializes builds, and pins leases", async () => {
-    const root = fixtureRoot("projection-coordinator-", "raw");
+    const root = fixtureRoot("projection-coordinator-", "native");
     const sourcePath = join(root, "events.sqlite");
     const projectionDirectory = join(root, "projections");
     const source = sourceDatabase(sourcePath);
@@ -1920,7 +1920,7 @@ describe("projection build coordinator", () => {
   });
 
   it("rejects a forged chain hash outside the requested projection binding", async () => {
-    const root = fixtureRoot("projection-cross-scope-chain-", "raw");
+    const root = fixtureRoot("projection-cross-scope-chain-", "native");
     const sourcePath = join(root, "events.sqlite");
     const projectionDirectory = join(root, "projections");
     const source = sourceDatabase(sourcePath);
@@ -1957,7 +1957,7 @@ describe("projection build coordinator", () => {
   });
 
   it("reselects the manifest when publication retires a generation between load and acquire", async () => {
-    const root = fixtureRoot("projection-lease-race-", "raw");
+    const root = fixtureRoot("projection-lease-race-", "native");
     const sourcePath = join(root, "events.sqlite");
     const projectionDirectory = join(root, "projections");
     const source = sourceDatabase(sourcePath);
@@ -1989,7 +1989,7 @@ describe("projection build coordinator", () => {
   });
 
   it("refuses publication when a generation sidecar appears before manifest replacement", async () => {
-    const root = fixtureRoot("projection-publication-sidecar-", "raw");
+    const root = fixtureRoot("projection-publication-sidecar-", "native");
     const sourcePath = join(root, "events.sqlite");
     const projectionDirectory = join(root, "projections");
     const source = sourceDatabase(sourcePath);
@@ -2027,7 +2027,7 @@ describe("projection build coordinator", () => {
   });
 
   it("maps a sidecar added to the published generation to integrity failure on manifest load", async () => {
-    const root = fixtureRoot("projection-published-sidecar-", "raw");
+    const root = fixtureRoot("projection-published-sidecar-", "native");
     const sourcePath = join(root, "events.sqlite");
     const projectionDirectory = join(root, "projections");
     const source = sourceDatabase(sourcePath);
@@ -2051,7 +2051,7 @@ describe("projection build coordinator", () => {
   });
 
   it("maps a non-ENOENT sidecar lstat failure on manifest load to integrity failure", async () => {
-    const root = fixtureRoot("projection-load-sidecar-error-", "raw");
+    const root = fixtureRoot("projection-load-sidecar-error-", "native");
     const sourcePath = join(root, "events.sqlite");
     const projectionDirectory = join(root, "projections");
     const source = sourceDatabase(sourcePath);
@@ -2076,7 +2076,7 @@ describe("projection build coordinator", () => {
   });
 
   it("fails closed while a manifest publication lock is present", async () => {
-    const root = fixtureRoot("projection-load-publication-lock-", "raw");
+    const root = fixtureRoot("projection-load-publication-lock-", "native");
     const sourcePath = join(root, "events.sqlite");
     const projectionDirectory = join(root, "projections");
     const source = sourceDatabase(sourcePath);
@@ -2102,7 +2102,7 @@ describe("projection build coordinator", () => {
   });
 
   it("retains the publication lock and prior hold when installed-manifest observation is ambiguous", async () => {
-    const root = fixtureRoot("projection-installed-observation-error-", "raw");
+    const root = fixtureRoot("projection-installed-observation-error-", "native");
     const sourcePath = join(root, "events.sqlite");
     const projectionDirectory = join(root, "projections");
     const source = sourceDatabase(sourcePath);
@@ -2219,7 +2219,7 @@ describe("projection build coordinator", () => {
   });
 
   it("preserves a lease-boundary sidecar lstat integrity failure", async () => {
-    const root = fixtureRoot("projection-lease-sidecar-error-", "raw");
+    const root = fixtureRoot("projection-lease-sidecar-error-", "native");
     const sourcePath = join(root, "events.sqlite");
     const projectionDirectory = join(root, "projections");
     const source = sourceDatabase(sourcePath);
@@ -2247,7 +2247,7 @@ describe("projection build coordinator", () => {
   });
 
   it("never reclaims a published generation main file while a sidecar entry exists", async () => {
-    const root = fixtureRoot("projection-sidecar-reclamation-", "raw");
+    const root = fixtureRoot("projection-sidecar-reclamation-", "native");
     const sourcePath = join(root, "events.sqlite");
     const projectionDirectory = join(root, "projections");
     const source = sourceDatabase(sourcePath);
@@ -2272,7 +2272,7 @@ describe("projection build coordinator", () => {
   });
 
   it("preserves main and sidecar when a sidecar appears after the reclamation precheck", async () => {
-    const root = fixtureRoot("projection-reclamation-race-", "raw");
+    const root = fixtureRoot("projection-reclamation-race-", "native");
     const sourcePath = join(root, "events.sqlite");
     const projectionDirectory = join(root, "projections");
     const source = sourceDatabase(sourcePath);
@@ -2309,7 +2309,7 @@ describe("projection build coordinator", () => {
   });
 
   it("returns projection lag at a zero deadline without starting source or build work", async () => {
-    const root = fixtureRoot("projection-zero-deadline-", "raw");
+    const root = fixtureRoot("projection-zero-deadline-", "native");
     let reads = 0;
     let builds = 0;
     const coordinator = new DefaultProjectionBuildCoordinator({
@@ -2337,7 +2337,7 @@ describe("projection build coordinator", () => {
   });
 
   it("returns projection lag at a zero deadline even when a sufficient generation exists", async () => {
-    const root = fixtureRoot("projection-existing-zero-deadline-", "raw");
+    const root = fixtureRoot("projection-existing-zero-deadline-", "native");
     const sourcePath = join(root, "events.sqlite");
     const projectionDirectory = join(root, "projections");
     const source = sourceDatabase(sourcePath);
@@ -2359,7 +2359,7 @@ describe("projection build coordinator", () => {
   });
 
   it("maps a synchronously blocking source rejection observed after expiry to projection lag", async () => {
-    const root = fixtureRoot("projection-blocking-deadline-", "raw");
+    const root = fixtureRoot("projection-blocking-deadline-", "native");
     const projectionDirectory = join(root, "projections");
     const coordinator = new DefaultProjectionBuildCoordinator({
       projectionDirectory,
@@ -2383,7 +2383,7 @@ describe("projection build coordinator", () => {
   });
 
   it("bounds a slow source snapshot and closes its late result without invoking the builder", async () => {
-    const root = fixtureRoot("projection-slow-snapshot-", "raw");
+    const root = fixtureRoot("projection-slow-snapshot-", "native");
     let closed = 0;
     let builds = 0;
     let resolveSourceOpened = (): void => undefined;
@@ -2420,7 +2420,7 @@ describe("projection build coordinator", () => {
   });
 
   it("closes an active source snapshot as soon as the build deadline expires", async () => {
-    const root = fixtureRoot("projection-active-snapshot-deadline-", "raw");
+    const root = fixtureRoot("projection-active-snapshot-deadline-", "native");
     let closed = 0;
     let resolveBuilderEntered = (): void => undefined;
     const builderEntered = new Promise<void>((resolve) => { resolveBuilderEntered = resolve; });
@@ -2454,7 +2454,7 @@ describe("projection build coordinator", () => {
   });
 
   it("does not publish a build that completes after its caller deadline", async () => {
-    const root = fixtureRoot("projection-slow-build-", "raw");
+    const root = fixtureRoot("projection-slow-build-", "native");
     const sourcePath = join(root, "events.sqlite");
     const projectionDirectory = join(root, "projections");
     const source = sourceDatabase(sourcePath);
@@ -2550,7 +2550,7 @@ describe("projection build coordinator", () => {
   });
 
   it("rejects a symlink-shaped projection directory before cleanup traversal", () => {
-    const root = fixtureRoot("projection-path-safety-", "raw");
+    const root = fixtureRoot("projection-path-safety-", "native");
     const projectionDirectory = join(root, "projections");
     mkdirSync(projectionDirectory);
     const knownTemp = join(projectionDirectory, ".projection-manifest.json.tmp");
@@ -2581,7 +2581,7 @@ describe("projection build coordinator", () => {
   });
 
   it("does not follow a projection directory replaced after cleanup authorization", async () => {
-    const root = fixtureRoot("projection-cleanup-swap-", "raw");
+    const root = fixtureRoot("projection-cleanup-swap-", "native");
     const projectionDirectory = join(root, "projections");
     const originalDirectory = join(root, "original-projections");
     const attackerDirectory = join(root, "attacker-directory");
@@ -2621,7 +2621,7 @@ describe("projection build coordinator", () => {
   });
 
   it("never reclaims through a replaced parent and retries against the pinned directory", async () => {
-    const root = fixtureRoot("projection-reclaim-parent-swap-", "raw");
+    const root = fixtureRoot("projection-reclaim-parent-swap-", "native");
     const sourcePath = join(root, "events.sqlite");
     const projectionDirectory = join(root, "projections");
     const originalDirectory = join(root, "original-projections");
@@ -2666,7 +2666,7 @@ describe("projection build coordinator", () => {
   });
 
   it("keeps publication successful while retaining retired files for audited reclamation", async () => {
-    const root = fixtureRoot("projection-reclaim-retry-", "raw");
+    const root = fixtureRoot("projection-reclaim-retry-", "native");
     const sourcePath = join(root, "events.sqlite");
     const projectionDirectory = join(root, "projections");
     const source = sourceDatabase(sourcePath);
