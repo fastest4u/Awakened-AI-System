@@ -8,6 +8,7 @@ import { createHash } from "node:crypto";
 import { pathToFileURL } from "node:url";
 import { canonicalJson } from "../src/orchestrator/serialization/canonical-json.js";
 import { createVerifiedReadAdapter } from "../src/orchestrator/verified-read/supervisor.js";
+import { FreshStartError } from "../src/orchestrator/fresh-start/contracts.js";
 import { FreshStartAdmissionGuard } from "../src/orchestrator/fresh-start/fresh-start-admission.js";
 import { makeActiveReadFixture } from "./support/v2-verified-read-fixture.js";
 import type { VerifiedReadBinding } from "../src/orchestrator/verified-read/contracts.js";
@@ -282,4 +283,50 @@ for (const remainingMs of [0, 1]) test(`actual_cleanup_receipt_deadline_preserve
     assert.deepEqual(readFileSync(record), originalRecord); assert.deepEqual(readFileSync(lock), originalLock);
     assert.equal((await ownership.inspect())?.lockToken, token);
   } finally { f.reader.close(); f.writer.close(); t.diagnostic(`Retained expired cleanup fixture with original ownership and lock: ${f.root}`); }
+});
+
+test("async_identity_first_failure_stops_scheduling_before_close_drain", { timeout: 20000 }, async t => {
+  const inspector = await identityInspector(), f = await fixture();
+  const original = fsPromises.open, handles: Awaited<ReturnType<typeof original>>[] = [];
+  const reason = new FreshStartError("FRESH_START_BUILD_MISMATCH");
+  let releaseClose!: () => void, releaseSiblings!: () => void, releaseStarted!: () => void;
+  const closeGate = new Promise<void>(resolve => { releaseClose = resolve; });
+  const siblingGate = new Promise<void>(resolve => { releaseSiblings = resolve; });
+  const startedGate = new Promise<void>(resolve => { releaseStarted = resolve; });
+  let openedJobs = 0, failingCloseHeld = false, siblingsClosed = 0, active = 0, maximum = 0;
+  const timer = setTimeout(() => { releaseStarted(); releaseSiblings(); releaseClose(); }, 4000);
+  const mock = t.mock.method(fsPromises, "open", async (...args: Parameters<typeof original>) => {
+    const handle = await original(...args); handles.push(handle); maximum = Math.max(maximum, ++active);
+    const manifest = String(args[0]).endsWith("v2-build.json"), job = manifest ? 0 : ++openedJobs;
+    if (openedJobs === 3) releaseStarted();
+    const read = handle.read, close = handle.close;
+    if (!manifest) (handle as unknown as { read: (options: unknown) => Promise<unknown> }).read = async options => {
+      await startedGate;
+      if (job === 1) throw reason;
+      await siblingGate;
+      return Reflect.apply(read, handle, [options]);
+    };
+    handle.close = async function() {
+      if (job === 1) { failingCloseHeld = true; await closeGate; }
+      try { await close.call(this); } finally { active--; if (job === 2 || job === 3) siblingsClosed++; }
+      if (job === 1) throw new Error("secondary owned close failure");
+    };
+    return handle;
+  }); syncBuiltinESMExports();
+  const measurement = inspector.inspectV2BuildAsync(identityEntry(f)).then(() => null, (error: unknown) => error);
+  const until = async (predicate: () => boolean) => { const deadline = performance.now() + 3000;
+    while (!predicate()) { assert.ok(performance.now() < deadline, "identity interleaving barrier not reached"); await new Promise(resolve => setTimeout(resolve, 5)); } };
+  try {
+    await until(() => failingCloseHeld); releaseSiblings(); await until(() => siblingsClosed === 2);
+    await new Promise(resolve => setTimeout(resolve, 25));
+    const jobsWhileHeld = openedJobs;
+    releaseClose(); assert.equal(await measurement, reason);
+    assert.equal(active, 0); assert.ok(handles.every(handle => handle.fd === -1));
+    assert.equal(jobsWhileHeld, 3, "no further file job opens after failure while close is held");
+    assert.equal(openedJobs, 3); assert.equal(handles.length, 4); assert.equal(maximum, 3);
+  } finally {
+    releaseStarted(); releaseSiblings(); releaseClose(); clearTimeout(timer); await measurement;
+    mock.mock.restore(); syncBuiltinESMExports();
+    if (handles.every(handle => handle.fd === -1)) f.cleanup(); else { f.reader.close(); f.writer.close(); console.error("Retained uncertain first-failure identity handles"); }
+  }
 });

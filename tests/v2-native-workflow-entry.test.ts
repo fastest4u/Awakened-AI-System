@@ -130,7 +130,8 @@ for (const phase of ["query", "packing"] as const) for (const aborted of [false,
         } finally { image.close(); }
       } await until(() => existsSync(join(f.binding.projectionDirectory.canonicalPath, "writer-ready")));
       const writerBytes = readFileSync(join(f.binding.projectionDirectory.canonicalPath, "independent-writer.sqlite"));
-      adapter = createVerifiedReadAdapter(f.binding, { ownership: new VerifiedReadOwnershipRepository(f.binding.executorStateDirectory),
+      const ownership = new VerifiedReadOwnershipRepository(f.binding.executorStateDirectory);
+      adapter = createVerifiedReadAdapter(f.binding, { ownership,
         now: () => performance.now(), schedule: (cb, ms) => setTimeout(cb, ms), clear: timer => clearTimeout(timer as NodeJS.Timeout),
         currentEpoch: () => f.binding.compositionEpoch, spawnOwned(kind) {
           const child = spawnOwned(kind === "read" ? `workflow-${phase}-hang` : "cleanup"); const errors = new Set<(error: unknown) => void>();
@@ -166,10 +167,10 @@ for (const phase of ["query", "packing"] as const) for (const aborted of [false,
         assert.equal(writer.exitCode, null); assert.equal(exits.some(value => value.kind === "writer"), false);
         assert.deepEqual(readFileSync(join(f.binding.projectionDirectory.canonicalPath, "independent-writer.sqlite")), writerBytes);
         assert.equal(existsSync(join(f.binding.projectionDirectory.canonicalPath, ".projection-manifest.publish.lock")), uncertainCleanup);
-        const cleanupPositive = !uncertainCleanup; const ownerAbsent = await new VerifiedReadOwnershipRepository(f.binding.executorStateDirectory).inspect() === null; assert.equal(ownerAbsent, cleanupPositive);
+        const cleanupPositive = !uncertainCleanup; const ownerAbsent = await ownership.inspect() === null; assert.equal(ownerAbsent, cleanupPositive);
         if (uncertainCleanup) {
           assert.equal(readFileSync(join(f.binding.projectionDirectory.canonicalPath, ".projection-manifest.publish.lock"), "utf8"), originalOwnedToken);
-          assert.equal((await new VerifiedReadOwnershipRepository(f.binding.executorStateDirectory).inspect())?.lockToken, originalOwnedToken);
+          assert.equal((await ownership.inspect())?.lockToken, originalOwnedToken);
         }
         assert.ok(exits.findIndex(value => value.kind === `workflow-${phase}-hang`) < exits.findIndex(value => value.kind === "cleanup"));
       } finally { clearInterval(timer); }

@@ -90,7 +90,7 @@ function sameFile(before: BigIntStats, after: BigIntStats): boolean {
     && before.ctimeNs === after.ctimeNs && before.nlink === after.nlink;
 }
 /** One reusable chunk per handle; manifest capture alone is bounded at the existing16KiB policy. */
-async function fileIdentity(path: string, maximum: number | undefined, collect: boolean, signal?: AbortSignal) {
+async function fileIdentity(path: string, maximum: number | undefined, collect: boolean, signal?: AbortSignal, observedFailure?: (error: unknown) => void) {
   checkpoint(signal);
   const before = maximum === undefined ? await stat(path, { bigint: true }) : await lstat(path, { bigint: true });
   checkpoint(signal);
@@ -117,13 +117,13 @@ async function fileIdentity(path: string, maximum: number | undefined, collect: 
       || await realpath(path) !== resolve(path))) fail();
     checkpoint(signal);
     return { length, sha256: sha256.digest("hex"), collected };
-  } catch (error) { failed = true; throw error; }
+  } catch (error) { failed = true; observedFailure?.(error); throw error; }
   finally {
     // A secondary close error must not replace the primary failure. Other pool handles still drain.
     try { await handle?.close(); } catch (error) { if (!failed) { checkpoint(signal); throw error; } }
   }
 }
-async function boundedMeasurement(jobs: ((signal: AbortSignal) => Promise<void>)[], signal?: AbortSignal): Promise<void> {
+async function boundedMeasurement(jobs: ((signal: AbortSignal, observedFailure: (error: unknown) => void) => Promise<void>)[], signal?: AbortSignal): Promise<void> {
   checkpoint(signal);
   const controller = new AbortController(), unset = Symbol("no failure"); let first: unknown = unset, next = 0;
   const refused = (error: unknown) => { if (first === unset) first = error; if (!controller.signal.aborted) controller.abort(error); };
@@ -134,7 +134,7 @@ async function boundedMeasurement(jobs: ((signal: AbortSignal) => Promise<void>)
     await Promise.all(Array.from({ length: MEASUREMENT_CONCURRENCY }, async () => {
       while (next < jobs.length && !controller.signal.aborted) {
         const job = jobs[next++]!;
-        try { await job(controller.signal); } catch (error) { refused(error); return; }
+        try { await job(controller.signal, refused); } catch (error) { refused(error); return; }
       }
     }));
     if (first !== unset) throw first;
@@ -149,10 +149,10 @@ export async function inspectV2BuildAsync(entryUrl: string = import.meta.url, si
     const manifest = manifestBody(header.collected!.toString("utf8")), runtime = runtimePolicy(manifest);
     const artifacts = artifactDescriptors(manifest);
     await boundedMeasurement([
-      async activeSignal => { const actual = await fileIdentity(process.execPath, undefined, false, activeSignal);
+      async (activeSignal, observedFailure) => { const actual = await fileIdentity(process.execPath, undefined, false, activeSignal, observedFailure);
         if (runtime.executableSha256 !== actual.sha256) fail(); },
-      ...artifacts.map((artifact, index) => async (activeSignal: AbortSignal) => {
-        const actual = await fileIdentity(join(root, artifactNames[index]!), 32 * 1024 * 1024, false, activeSignal);
+      ...artifacts.map((artifact, index) => async (activeSignal: AbortSignal, observedFailure: (error: unknown) => void) => {
+        const actual = await fileIdentity(join(root, artifactNames[index]!), 32 * 1024 * 1024, false, activeSignal, observedFailure);
         artifactIdentity(artifact, actual.length, actual.sha256);
       }),
     ], signal);
