@@ -72,12 +72,16 @@ function sourceIdentity(root) {
   if (git(root, ['diff', '--name-only', '-z', 'HEAD', '--', ...visible])) throw new Error(failure);
   if (git(root, ['status', '--porcelain', '--untracked-files=all', '--', ...selectors]).trim()) throw new Error(failure);
   const committed = git(root, ['ls-tree', '-r', '-z', candidate]).split('\0').filter(Boolean).map(entry => {
-    const match = /^(100644|100755) blob ([a-f0-9]{40})\t(.+)$/.exec(entry);
+    const match = /^(\d{6}) (\S+) ([a-f0-9]{40})\t(.+)$/.exec(entry);
     if (!match) throw new Error(failure);
-    return { path: match[3], oid: match[2] };
+    return { mode: match[1], type: match[2], oid: match[3], path: match[4] };
   }).filter(entry => /^(src|tests|scripts)\//.test(entry.path)
     || ['package.json', 'package-lock.json'].includes(entry.path)
-    || /^tsconfig[^/]*\.json$/.test(entry.path)).sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0);
+    || /^tsconfig[^/]*\.json$/.test(entry.path)).map(entry => {
+    // Excluded memory/docs modes cannot impose product-file restrictions.
+    if (!['100644', '100755'].includes(entry.mode) || entry.type !== 'blob') throw new Error(failure);
+    return { path: entry.path, oid: entry.oid };
+  }).sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0);
   const paths = productPaths(root);
   if (!paths.length || !equal(paths, committed.map(entry => entry.path))) throw new Error(failure);
   const inputs = paths.map(path => ({ path, sha256: sha(bytes(root, path)) }));

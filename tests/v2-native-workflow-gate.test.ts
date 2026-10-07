@@ -601,3 +601,40 @@ for (const mode of [
         }
     });
 }
+
+for (const selected of [false, true]) {
+    test(`workflow_gate_fix_N1_${selected ? 'selected_product' : 'excluded_memory_docs'}_mode`, native, async t => {
+        const run = await gate();
+        const f = fixture();
+        const paths = selected ? ['src/reference.ts'] : ['memory/reference.md', 'docs/reference.md'];
+        try {
+            f.git('config', 'core.symlinks', 'false');
+            for (const path of paths) {
+                f.put(path, selected ? 'input.ts' : path.startsWith('memory/') ? 'note.md' : 'input.md');
+                const oid = f.git('hash-object', '-w', '--', path).trim();
+                f.git('update-index', '--add', '--cacheinfo', '120000', oid, path);
+            }
+            f.git('-c', 'user.name=Owned Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '--quiet', '-m', 'owned committed link modes');
+            for (const path of paths) {
+                rmSync(join(f.root, path)); // Known owned file; materialize Git link as regular Windows checkout.
+                f.git('checkout-index', '-f', '-u', '--', path);
+                assert.match(f.git('ls-tree', 'HEAD', '--', path), /^120000 blob [a-f0-9]{40}\t/);
+            }
+            assert.equal(f.git('status', '--porcelain').trim(), '', 'mode fixture must be an actually clean committed candidate');
+            const result = await f.run(run);
+            assert.equal(result, selected ? 1 : 0, selected ? 'selected product mode must refuse' : 'excluded clean memory/docs modes must not block launch');
+            const stages = f.events.filter(e => e.stage);
+            if (selected) {
+                assert.deepEqual(f.trace(), []);
+                assert.equal(stages.length, 0);
+                assert.equal(f.events.some(e => e.observation === 'qualification'), false);
+            } else {
+                assert.deepEqual(f.trace(), ['runtime', 'typecheck', 'build', 'compile', ...names, 'smoke']);
+                assert.equal(stages.length, 34);
+                assert.ok(stages.every(e => e.code === 0 && e.nativeCode === 0 && e.cleanup === 'complete' && e.closure === 'windows-job-active-zero'));
+                assert.equal(f.events.filter(e => e.observation === 'qualification').length, 1);
+            }
+            t.diagnostic(`N1 mode120000 clean fixture: selected=${selected}; stages=${stages.length}`);
+        } finally { f.cleanup(); }
+    });
+}
