@@ -30,8 +30,8 @@ class ProcessPort {
   terminate() { this.terminations++; }
   unref() { this.unrefs++; }
   bootstrap() { return this.sent.find(value => "binding" in value) as ReadBootstrap; }
-  stages() { for (const phase of ["admission", "projection-wait", "capture", "validate", "revalidate"]) this.events.emit("message", { version: 2, ids: this.bootstrap().ids, kind: "stage", phase, observedProjectionPosition: null }); }
-  success() { const boot = this.bootstrap(); return { version: 2, ids: boot.ids, kind: "success", receipt: { ...readReceipt(), consistency: boot.request.consistency },
+  stages() { for (const phase of ["admission", "projection-wait", "capture", "validate", "revalidate"]) this.events.emit("message", { version: 3, ids: this.bootstrap().ids, kind: "stage", phase, observedProjectionPosition: null }); }
+  success() { const boot = this.bootstrap(); return { version: 3, ids: boot.ids, kind: "success", receipt: { ...readReceipt(), consistency: boot.request.consistency },
     fence: { controlGeneration: "0", releaseId: boot.binding.expectedRelease.releaseId, capturedPosition: "0", capturedHash: READ_HASH, requiredPosition: "0" }, closed: { image: true, reader: true, lock: true } }; }
 }
 type Adapter = { verify(request: VerifiedReadRequest, options?: { signal?: AbortSignal }): Promise<VerifiedReadReceipt>; diagnostic(): VerifiedReadDiagnostic; close(): Promise<VerifiedReadDiagnostic> };
@@ -153,9 +153,9 @@ for (const phase of ["admission", "projection-wait", "capture"]) for (const deli
   const f = await fixture(); try {
     const outcome = f.adapter.verify({ ...f.request, budgetMs: 2000, minimumEventPosition: "5" }).catch(cause => cause);
     await until(() => !!f.processes[0]?.bootstrap()); const child = f.processes[0]!;
-    child.events.emit("message", { version: 2, ids: child.bootstrap().ids, kind: "stage", phase: "admission", observedProjectionPosition: null });
-    if (phase !== "admission") child.events.emit("message", { version: 2, ids: child.bootstrap().ids, kind: "stage", phase: "projection-wait", observedProjectionPosition: "3" });
-    if (phase === "capture") child.events.emit("message", { version: 2, ids: child.bootstrap().ids, kind: "stage", phase: "capture", observedProjectionPosition: "5" });
+    child.events.emit("message", { version: 3, ids: child.bootstrap().ids, kind: "stage", phase: "admission", observedProjectionPosition: null });
+    if (phase !== "admission") child.events.emit("message", { version: 3, ids: child.bootstrap().ids, kind: "stage", phase: "projection-wait", observedProjectionPosition: "3" });
+    if (phase === "capture") child.events.emit("message", { version: 3, ids: child.bootstrap().ids, kind: "stage", phase: "capture", observedProjectionPosition: "5" });
     f.clock.advance(2000, deliverTimer); if (!deliverTimer) child.events.emit("message", child.success());
     assert.equal((await outcome).code, phase === "projection-wait" ? "PROJECTION_LAG" : "WORKER_TIMEOUT");
     assert.equal(f.adapter.diagnostic().positions, null, "stage observation cannot supply the missing authoritative required tail");

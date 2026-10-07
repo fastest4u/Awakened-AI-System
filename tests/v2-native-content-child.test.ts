@@ -34,7 +34,7 @@ function controls(f: Fixture, onStage: (reply: Extract<ReadReply, { kind: "stage
   return { deps, stages, advance: (ms: number) => { now += ms; } };
 }
 function boot(f: Fixture, id: string): ReadBootstrap {
-  return decodeReadBootstrap({ version: 2, ids: { requestId: "content", attemptId: "attempt", laneEpoch: "fixture-epoch" },
+  return decodeReadBootstrap({ version: 3, ids: { requestId: "content", attemptId: "attempt", laneEpoch: "fixture-epoch" },
     binding: f.binding, request: nativeGetRequest(id), lockToken: "b".repeat(32), remainingMs: 5000 });
 }
 function failure(reply: ReadTerminalReply, code: string, cleanup = "complete") {

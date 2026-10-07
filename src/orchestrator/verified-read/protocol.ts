@@ -20,7 +20,7 @@ const CODES: readonly VerifiedReadFailureCode[] = [
   "FRESH_START_ADMISSION_DENIED", "FRESH_START_CONTENT_UNVERIFIED", "FRESH_START_ADMISSION_STALE",
   "PROJECTION_LAG", "INTEGRITY_FAILURE", "PROJECTION_SCOPE_MISMATCH", "PROJECTION_PATH_INVALID",
   "MATERIALIZATION_CONFLICT", "WORKER_TIMEOUT", "WORKER_CLOSED", "STORE_QUEUE_FULL",
-  "WORKER_PROTOCOL_ERROR", "WORKER_UNAVAILABLE", "V2_CONTENT_RESULT_TOO_LARGE",
+  "WORKER_PROTOCOL_ERROR", "WORKER_UNAVAILABLE", "V2_CONTENT_RESULT_TOO_LARGE", "V2_CONTENT_CURSOR_STALE",
 ];
 function invalid(): never { throw new FreshStartError("FRESH_START_INPUT_INVALID"); }
 
@@ -94,7 +94,7 @@ function ids(value: unknown): ReadMessageIds {
   const source = record(value, ["requestId", "attemptId", "laneEpoch"]);
   return Object.freeze({ requestId: text(source.requestId, 128), attemptId: text(source.attemptId, 128), laneEpoch: text(source.laneEpoch, 128) });
 }
-function readVersion(value: unknown): 2 { if (value !== 2) invalid(); return 2; }
+function readVersion(value: unknown): 3 { if (value !== 3) invalid(); return 3; }
 function cleanupVersion(value: unknown): 1 { if (value !== 1) invalid(); return 1; }
 function token(value: unknown): string { const result = text(value, 32); if (!/^[0-9a-f]{32}$/u.test(result)) invalid(); return result; }
 function remaining(value: unknown, maximum: number): number {
@@ -183,7 +183,12 @@ export function decodeReadReply(value: unknown): ReadReply {
     if (content.operation !== verified.operation) invalid();
     if (content.operation === "search-projected-content") return Object.freeze({ ...base, receipt: Object.freeze({ ...verified, operation: content.operation }), content: content as NativeSearchResult });
     if (content.operation === "get-canonical-record") return Object.freeze({ ...base, receipt: Object.freeze({ ...verified, operation: content.operation }), content: content as NativeGetResult });
-    return Object.freeze({ ...base, receipt: Object.freeze({ ...verified, operation: content.operation }), content }) as ReadReply;
+    const operation = content.operation;
+    switch (operation) {
+      case "list-canonical-records": case "recent-canonical-records": case "follow-up-radar": case "build-context-pack":
+        return Object.freeze({ ...base, receipt: Object.freeze({ ...verified, operation }), content }) as ReadReply;
+      default: { const exhaustive: never = operation; return exhaustive; }
+    }
   }
   if (kind === "failure") {
     const source = record(input, ["version", "ids", "kind", "failure"]);

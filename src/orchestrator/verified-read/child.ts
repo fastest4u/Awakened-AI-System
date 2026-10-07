@@ -45,7 +45,7 @@ export async function executeVerifiedRead(bootstrap: ReadBootstrap, dependencies
     return Math.max(0, Math.floor(budget));
   };
   const stage = (phase: ReadPhase, observedProjectionPosition: string | null = null): void => {
-    checkpoint(); dependencies.emitStage(Object.freeze({ version: 2, ids: input.ids, kind: "stage", phase, observedProjectionPosition }));
+    checkpoint(); dependencies.emitStage(Object.freeze({ version: 3, ids: input.ids, kind: "stage", phase, observedProjectionPosition }));
     checkpoint();
   };
   const closeImage = (): void => {
@@ -133,7 +133,7 @@ export async function executeVerifiedRead(bootstrap: ReadBootstrap, dependencies
       projectionGeneration: metadata.generation, projectionEventPosition: metadata.terminalEventPosition,
       projectionEventHash: metadata.terminalEventHash, imageSha256: sha256, verification: "image-scope-position-and-active-admission" });
     // Prospective full terminal reserves packing capacity only. Closure below remains mandatory.
-    const base: ReadSuccessBase = { version: 2, ids: input.ids, kind: "success", receipt, fence,
+    const base: ReadSuccessBase = { version: 3, ids: input.ids, kind: "success", receipt, fence,
       closed: Object.freeze({ image: true, reader: true, lock: true }) };
     let content;
     if (input.request.operation !== "verify-published-view") {
@@ -155,6 +155,6 @@ export async function executeVerifiedRead(bootstrap: ReadBootstrap, dependencies
     try { close(); } catch (error) { primary ??= error; }
   }
   const failure = verifiedReadFailure(primary);
-  return Object.freeze({ version: 2, ids: input.ids, kind: "failure", failure: Object.freeze({ ...failure,
+  return Object.freeze({ version: 3, ids: input.ids, kind: "failure", failure: Object.freeze({ ...failure,
     cleanup: imageClosed && readerClosed && lockClosed ? "complete" : "incomplete" }) });
 }

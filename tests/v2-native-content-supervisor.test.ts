@@ -18,7 +18,7 @@ import { nativeGetRequest, nativeSearchRequest, makeNativeContentFixture, NATIVE
 
 const turn = () => new Promise<void>(resolve => setImmediate(resolve));
 async function until(predicate: () => boolean) { for (let i = 0; i < 300 && !predicate(); i++) await new Promise(resolve => setTimeout(resolve, 2)); assert.ok(predicate(), "expected barrier reached"); }
-function deferred() { let resolve!: () => void; const promise = new Promise<void>(done => { resolve = done; }); return { promise, resolve }; }
+function deferred() { let resolved = false; let resolve!: () => void; const promise = new Promise<void>(done => { resolve = () => { resolved = true; done(); }; }); return { promise, resolve, get resolved() { return resolved; } }; }
 class Clock {
   value = 0; timers = new Map<object, { at: number; callback: () => void }>();
   now = () => this.value;
@@ -37,7 +37,7 @@ class Port {
   terminate() { this.kills++; } unref() {}
   boot() { return this.sent.find(x => "binding" in x) as ReadBootstrap; }
   stages() { for (const phase of ["admission", "projection-wait", "capture", "validate", ...(this.boot().request.operation === "verify-published-view" ? [] : ["query"]), "revalidate"])
-    this.events.emit("message", { version: 2, ids: this.boot().ids, kind: "stage", phase, observedProjectionPosition: null }); }
+    this.events.emit("message", { version: 3, ids: this.boot().ids, kind: "stage", phase, observedProjectionPosition: null }); }
   success(): any {
     const b = this.boot(); const receipt = { ...readReceipt(), operation: b.request.operation, consistency: b.request.consistency };
     const selectionScope = { projectId: b.binding.projectionBinding.projectId, workspaceId: b.binding.projectionBinding.workspaceId,
@@ -47,11 +47,23 @@ class Port {
       ...selectionScope, sessionId: null, visibility: "project", status: "verified", confidence: "high", verificationMethod: "committed-event",
       validFrom: null, validTo: null, knownFromEventPosition: "0", sourceEventPosition: "0", textKind: "canonical-summary",
       text: "projected summary", conflictGroupId: null, supersedingItemId: null };
-    const content = b.request.operation === "get-canonical-record" ? { operation: b.request.operation, selectionScope, item, conflict: null }
+    let content: any = b.request.operation === "get-canonical-record" ? { operation: b.request.operation, selectionScope, item, conflict: null }
       : { operation: b.request.operation, selectionScope, rankingPolicyVersion: "retrieval-ranking-v2-shadow-fixed-units",
         contentBoundsVersion: "v2-native-content-bounds-1", items: [{ ...item, channels: ["exact"], selectionReason: "exact" }],
         conflicts: [], candidateBounded: false, selectionTruncated: false, byteBounded: false };
-    return { version: 2, ids: b.ids, kind: "success", receipt,
+    if (b.request.operation === "list-canonical-records" || b.request.operation === "recent-canonical-records") content = {
+      operation: b.request.operation, selectionScope, workflowBoundsVersion: "v2-native-read-workflow-bounds-1",
+      order: b.request.operation === "list-canonical-records" ? "item-id-binary-asc" : "source-event-position-desc-id-binary-asc",
+      items: [{ item, conflict: null }], hasMore: false, nextCursor: null, byteBounded: false };
+    if (b.request.operation === "follow-up-radar") content = { operation: b.request.operation, selectionScope,
+      workflowBoundsVersion: "v2-native-read-workflow-bounds-1", order: "source-event-position-desc-id-binary-asc",
+      items: [{ ...item, kind: "follow-up", status: "open", verificationMethod: "open-follow-up", sessionId: selectionScope.sessionId, visibility: "session", textKind: "projection-text" }],
+      hasMore: false, nextCursor: null, byteBounded: false };
+    if (b.request.operation === "build-context-pack") content = { operation: b.request.operation, selectionScope,
+      rankingPolicyVersion: "retrieval-ranking-v2-shadow-fixed-units", workflowBoundsVersion: "v2-native-read-workflow-bounds-1",
+      items: [{ ...item, channels: ["exact"], selectionReason: "exact" }], conflicts: [], followUps: [],
+      candidateBounded: false, selectionTruncated: false, byteBounded: false };
+    return { version: 3, ids: b.ids, kind: "success", receipt,
       fence: { controlGeneration: "0", releaseId: b.binding.expectedRelease.releaseId, capturedPosition: "0", capturedHash: READ_HASH, requiredPosition: "0" },
       closed: { image: true, reader: true, lock: true }, ...(b.request.operation === "verify-published-view" ? {} : { content }) };
   }
@@ -86,7 +98,7 @@ test("content_candidate_waits_for_exit_and_record_absence", async t => {
     void pending.then(() => { settled = true; }, () => { settled = true; });
     await until(() => !!f.ports[0]?.boot()); const child = f.ports[0]!; child.stages(); child.events.emit("message", child.success());
     await turn(); assert.equal(settled, false);
-    child.events.emit("exit", 0, null); await reached.promise; assert.equal(settled, false);
+    child.events.emit("exit", 0, null); await until(() => reached.resolved); assert.equal(settled, false);
     assert.equal(JSON.parse(await readFile(target, "utf8")).state, "complete");
     const competing = new VerifiedReadOwnershipRepository(f.directory);
     const record = (await competing.inspect())!; const { state: _state, pid: _pid, ...intent } = record;
@@ -185,12 +197,12 @@ for (const operation of ["search-projected-content", "get-canonical-record"] as 
 }
 
 test("original_budget_and_cleanup_preserve_primary_failure", async () => {
-  for (const primary of ["WORKER_TIMEOUT", "INTEGRITY_FAILURE"] as const) {
+  for (const primary of ["WORKER_TIMEOUT", "INTEGRITY_FAILURE", "V2_CONTENT_CURSOR_STALE"] as const) {
     const f = await fixture(); try {
-      const outcome = f.query({ ...nativeGetRequest("record"), budgetMs: 1000 }).catch(cause => cause);
+      const outcome = f.query({ ...(primary === "V2_CONTENT_CURSOR_STALE" ? workflowRequest("list-canonical-records") : nativeGetRequest("record")), budgetMs: 1000 }).catch(cause => cause);
       await until(() => !!f.ports[0]?.boot()); const child = f.ports[0]!;
       if (primary === "WORKER_TIMEOUT") { child.stages(); f.clock.advance(1000); child.events.emit("message", child.success()); }
-      else child.events.emit("message", { version: 2, ids: child.boot().ids, kind: "failure", failure: { code: primary, cleanup: "incomplete", positions: null } });
+      else child.events.emit("message", { version: 3, ids: child.boot().ids, kind: "failure", failure: { code: primary, cleanup: "incomplete", positions: null } });
       assert.equal((await outcome).code, primary); f.clock.advance(2000);
       assert.equal(f.adapter.diagnostic().code, primary); assert.equal(f.adapter.diagnostic().cleanup, "incomplete");
       assert.equal(f.ports.length, 1); assert.equal(await f.ownership.inspect() !== null, true);
@@ -202,7 +214,7 @@ test("epoch change during ownership closure rejects exact validated content cand
   f.ownership.complete = async ids => { reached.resolve(); await gate.promise; return complete(ids); };
   try {
     const outcome = f.query(nativeGetRequest("record")).catch(cause => cause); await until(() => !!f.ports[0]?.boot());
-    const p = f.ports[0]!; p.stages(); p.events.emit("message", p.success()); p.events.emit("exit", 0, null); await reached.promise;
+    const p = f.ports[0]!; p.stages(); p.events.emit("message", p.success()); p.events.emit("exit", 0, null); await until(() => reached.resolved);
     f.setEpoch("changed"); gate.resolve(); assert.equal((await outcome).code, "FRESH_START_ADMISSION_STALE");
   } finally { gate.resolve(); await f.dispose(); }
 });
@@ -239,7 +251,7 @@ test("actual blocked native query preserves parent responsiveness, exact exits a
     while (!await predicate()) { assert.ok(performance.now() < deadline, "real process barrier inconclusive"); await new Promise(resolve => setTimeout(resolve, 10)); } };
   const writer = spawn("writer");
   try {
-    const corpus = await f.appendCorpus(); await f.publish(); await waitFor(() => exists("writer-ready"));
+    await waitFor(() => exists("writer-ready"));
     const writerBytes = await readFile(join(f.binding.projectionDirectory.canonicalPath, "independent-writer.sqlite"));
     adapter = createVerifiedReadAdapter(f.binding, { ownership: new VerifiedReadOwnershipRepository(f.binding.executorStateDirectory),
       now: () => performance.now(), schedule: (cb, ms) => setTimeout(cb, ms), clear: timer => clearTimeout(timer as NodeJS.Timeout),
@@ -257,7 +269,7 @@ test("actual blocked native query preserves parent responsiveness, exact exits a
     assert.equal(typeof method, "function", "native query must use the owned supervisor");
     const arrival = performance.now(); let ticks = 0; const ticker = setInterval(() => ticks++, 10);
     try {
-      const outcome = method!({ ...nativeGetRequest(corpus.ids.canonical), budgetMs: 2000 }).catch(cause => cause);
+      const outcome = method!({ ...nativeGetRequest("abcdefab-cdef-4abc-8abc-abcdefabcdef"), budgetMs: 2000 }).catch(cause => cause);
       await waitFor(() => exists("query-blocked"), 1800);
       assert.equal(await readFile(join(f.binding.projectionDirectory.canonicalPath, "query-blocked"), "utf8"), "validated-image-owned-lock-fixed-canonical-query");
       assert.equal(typeof (await new VerifiedReadOwnershipRepository(f.binding.executorStateDirectory).inspect())?.pid, "number");
@@ -280,4 +292,64 @@ test("actual blocked native query preserves parent responsiveness, exact exits a
     await waitFor(() => children.every(child => child.exitCode !== null || child.signalCode !== null));
     if (closed || !adapter) f.cleanup(); else console.error(`Retained uncertain native query fixture: ${f.root}`);
   }
+});
+
+const workflowOperations = ["list-canonical-records", "recent-canonical-records", "follow-up-radar", "build-context-pack"] as const;
+function workflowRequest(operation: typeof workflowOperations[number]): VerifiedContentReadRequest {
+  return { operation, consistency: "project-strong", minimumEventPosition: "0", budgetMs: 5000,
+    parameters: operation === "build-context-pack" ? { query: "native" } : { limit: 5 } } as VerifiedContentReadRequest;
+}
+for (const operation of workflowOperations) test(`workflow_candidate_waits_for_owned_completion ${operation}`, { timeout: 20000 }, async t => {
+  const f = await fixture(); const gate = deferred(), reached = deferred();
+  const target = join(f.directory.canonicalPath, "verified-read-owner.json"), unlink = fsPromises.unlink;
+  const mock = t.mock.method(fsPromises, "unlink", async (path: Parameters<typeof unlink>[0]) => {
+    if (String(path) === target) { reached.resolve(); await gate.promise; } await unlink(path);
+  }); syncBuiltinESMExports();
+  try {
+    let contentReleased = false; let candidateFailure: unknown; const pending = f.query(workflowRequest(operation)); void pending.then(() => { contentReleased = true; }, error => { candidateFailure = error; });
+    await until(() => !!f.ports[0]?.boot()); const child = f.ports[0]!; child.stages(); child.events.emit("message", child.success());
+    await turn(); assert.equal(candidateFailure, undefined, `nominal workflow refused: ${String(candidateFailure)}`); assert.equal(contentReleased, false); child.events.emit("exit", 0, null); await until(() => reached.resolved);
+    assert.equal(contentReleased, false); assert.notEqual(JSON.parse(await readFile(target, "utf8")), null);
+    gate.resolve(); const result = await pending; assert.equal(result.content.operation, operation);
+    assert.equal(result.receipt.scope.sessionId, null); assert.equal(result.content.selectionScope.sessionId, NATIVE_SESSION);
+    assert.equal(await f.ownership.inspect(), null);
+  } finally { gate.resolve(); mock.mock.restore(); syncBuiltinESMExports(); await f.dispose(); }
+});
+for (const operation of workflowOperations) for (const fault of ["selection", "cursor", "kind", "order", "status", "position"] as const) {
+  test(`workflow supervisor rejects ${operation} ${fault}`, { timeout: 20000 }, async () => {
+    const f = await fixture(); try {
+      const pending = f.query(workflowRequest(operation)); const rejected = assert.rejects(pending, { code: "WORKER_PROTOCOL_ERROR" });
+      await until(() => !!f.ports[0]?.boot()); const child = f.ports[0]!; child.stages(); const reply = child.success();
+      if (fault === "selection") reply.content.selectionScope.sessionId = null;
+      if (fault === "cursor") reply.content.nextCursor = "malformed";
+      if (fault === "order") reply.content.order = "wrong-order";
+      const item = operation === "list-canonical-records" || operation === "recent-canonical-records" ? reply.content.items[0].item : reply.content.items[0];
+      if (fault === "kind") item.kind = "artifact";
+      if (fault === "status") item.status = "retracted";
+      if (fault === "position") item.sourceEventPosition = "1";
+      child.events.emit("message", reply); child.events.emit("exit", 0, null);
+      const cleanup = f.ports[1]; if (cleanup) { const boot = cleanup.sent[0] as CleanupBootstrap;
+        cleanup.events.emit("message", { version: 1, ids: boot.ids, kind: "cleanup", outcome: "absent", cleanup: "complete" }); cleanup.events.emit("exit", 0, null); }
+      await rejected;
+    } finally { await f.dispose(); }
+  });
+}
+
+for (const operation of workflowOperations) for (const fault of ["epoch", "late", "removal"] as const) test(`workflow candidate refuses ${operation} ${fault} at owned closure`, { timeout: 20000 }, async t => {
+  const f = await fixture(); const gate = deferred(), reached = deferred();
+  const target = join(f.directory.canonicalPath, "verified-read-owner.json"), unlink = fsPromises.unlink;
+  const mock = t.mock.method(fsPromises, "unlink", async (path: Parameters<typeof unlink>[0]) => {
+    if (String(path) === target) { reached.resolve(); await gate.promise; if (fault === "removal") throw new Error("owned removal failed"); }
+    await unlink(path);
+  }); syncBuiltinESMExports();
+  try {
+    let contentReleased = false; const outcome = f.query(workflowRequest(operation)).then(result => { contentReleased = true; return result; }, error => error);
+    await until(() => !!f.ports[0]?.boot()); const child = f.ports[0]!; child.stages(); child.events.emit("message", child.success());
+    assert.equal(contentReleased, false); child.events.emit("exit", 0, null); await until(() => reached.resolved);
+    if (fault === "epoch") f.setEpoch("changed");
+    if (fault === "late") f.clock.advance(5000);
+    gate.resolve(); assert.equal((await outcome).code, fault === "epoch" ? "FRESH_START_ADMISSION_STALE" : fault === "late" ? "WORKER_TIMEOUT" : "WORKER_UNAVAILABLE");
+    assert.equal(contentReleased, false);
+    if (fault === "removal") { assert.notEqual(await f.ownership.inspect(), null); assert.equal(f.adapter.diagnostic().cleanup, "incomplete"); }
+  } finally { gate.resolve(); mock.mock.restore(); syncBuiltinESMExports(); await f.dispose(); }
 });

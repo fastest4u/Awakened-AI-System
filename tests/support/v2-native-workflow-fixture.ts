@@ -23,7 +23,7 @@ export function nativeWorkflowReceipt(fixture: NativeContentFixture, request: Na
 /** Closed is capacity reservation for packer tests; it does not acknowledge a running child. */
 export function nativeWorkflowSuccessBase(fixture: NativeContentFixture, request: NativeWorkflowRequest, manifest: ProjectionManifestV2): ReadSuccessBase {
   const receipt = nativeWorkflowReceipt(fixture, request, manifest);
-  return Object.freeze({ version: 2, ids: Object.freeze({ ...readBootstrap().ids }), kind: "success", receipt,
+  return Object.freeze({ version: 3, ids: Object.freeze({ ...readBootstrap().ids }), kind: "success", receipt,
     fence: fixture.admission.capture(request), closed: Object.freeze({ image: true, reader: true, lock: true }) });
 }
 export async function makeNativeWorkflowFixture(buildHash = READ_HASH, options: ReadFixtureOptions = {}): Promise<NativeContentFixture & {

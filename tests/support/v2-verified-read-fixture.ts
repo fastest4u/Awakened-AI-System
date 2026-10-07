@@ -58,7 +58,7 @@ export function readReceipt() {
 }
 export function readBootstrap() {
   const directory = () => ({ canonicalPath: "C:/owned", device: "1", inode: "2" });
-  return { version: 2, ids: { requestId: "request", attemptId: "attempt", laneEpoch: "epoch" },
+  return { version: 3, ids: { requestId: "request", attemptId: "attempt", laneEpoch: "epoch" },
     binding: { projectionBinding: readScope(), expectedRelease: { projectId: READ_UUID, vaultId: READ_UUID,
       storeId: READ_UUID, profileVersion: 1, releaseId: READ_UUID, buildIdentityHash: READ_HASH,
       schemaIdentityHash: READ_HASH, configurationHash: READ_HASH, capabilityManifestHash: READ_HASH,

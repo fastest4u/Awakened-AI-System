@@ -32,7 +32,7 @@ export type ReadOwnershipRecord = ReadLaunchIntent & Readonly<{
   state: "launch-intent" | "child-observed" | "complete" | "incomplete"; pid: number | null;
 }>;
 export type ReadBootstrap = Readonly<{
-  version: 2; ids: ReadMessageIds; binding: VerifiedReadBinding;
+  version: 3; ids: ReadMessageIds; binding: VerifiedReadBinding;
   request: VerifiedReadRequest; lockToken: string; remainingMs: number;
 }>;
 export type VerifiedReadReceipt = Readonly<{
@@ -62,16 +62,16 @@ export type VerifiedReadFailureCode =
   | "PROJECTION_LAG" | "INTEGRITY_FAILURE" | "PROJECTION_SCOPE_MISMATCH"
   | "PROJECTION_PATH_INVALID" | "MATERIALIZATION_CONFLICT"
   | "WORKER_TIMEOUT" | "WORKER_CLOSED" | "STORE_QUEUE_FULL" | "WORKER_PROTOCOL_ERROR" | "WORKER_UNAVAILABLE"
-  | "V2_CONTENT_RESULT_TOO_LARGE";
+  | "V2_CONTENT_RESULT_TOO_LARGE" | "V2_CONTENT_CURSOR_STALE";
 export type ReadFailurePositions = Readonly<{ required: string; observed: string | null }>;
 export type VerifiedReadFailure = Readonly<{
   code: VerifiedReadFailureCode; cleanup: ReadCleanupState; positions: ReadFailurePositions | null;
 }>;
 /** Stage emission is once per phase; lane owners enforce ordering and the message count. */
-export type ReadSuccessBase = Readonly<{ version: 2; ids: ReadMessageIds; kind: "success";
+export type ReadSuccessBase = Readonly<{ version: 3; ids: ReadMessageIds; kind: "success";
   receipt: VerifiedReadReceipt; fence: ReadFence; closed: Readonly<{ image: true; reader: true; lock: true }> }>;
 export type ReadReply =
-  | Readonly<{ version: 2; ids: ReadMessageIds; kind: "stage"; phase: ReadPhase; observedProjectionPosition: string | null }>
+  | Readonly<{ version: 3; ids: ReadMessageIds; kind: "stage"; phase: ReadPhase; observedProjectionPosition: string | null }>
   | (ReadSuccessBase & Readonly<{ receipt: VerifiedReadReceipt & { operation: "verify-published-view" }; content?: never }>)
   | (ReadSuccessBase & Readonly<{ receipt: VerifiedReadReceipt & { operation: "search-projected-content" }; content: NativeSearchResult }>)
   | (ReadSuccessBase & Readonly<{ receipt: VerifiedReadReceipt & { operation: "get-canonical-record" }; content: NativeGetResult }>)
@@ -79,9 +79,9 @@ export type ReadReply =
   | (ReadSuccessBase & Readonly<{ receipt: VerifiedReadReceipt & { operation: "recent-canonical-records" }; content: NativeCanonicalPageResult & { operation: "recent-canonical-records" } }>)
   | (ReadSuccessBase & Readonly<{ receipt: VerifiedReadReceipt & { operation: "follow-up-radar" }; content: NativeRadarResult }>)
   | (ReadSuccessBase & Readonly<{ receipt: VerifiedReadReceipt & { operation: "build-context-pack" }; content: NativeContextResult }>)
-  | Readonly<{ version: 2; ids: ReadMessageIds; kind: "failure"; failure: VerifiedReadFailure }>;
+  | Readonly<{ version: 3; ids: ReadMessageIds; kind: "failure"; failure: VerifiedReadFailure }>;
 export type ReadTerminalReply = Extract<ReadReply, { kind: "success" | "failure" }>;
-export type ReadCancel = Readonly<{ version: 2; ids: ReadMessageIds; kind: "cancel" }>;
+export type ReadCancel = Readonly<{ version: 3; ids: ReadMessageIds; kind: "cancel" }>;
 export type CleanupBootstrap = Readonly<{
   version: 1; ids: ReadMessageIds; directory: ProjectionDirectoryIdentity;
   lockToken: string; expectedBuildHash: string; remainingMs: number;

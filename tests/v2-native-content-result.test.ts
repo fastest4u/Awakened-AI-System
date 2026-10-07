@@ -25,7 +25,7 @@ const tooLarge = { code: "V2_CONTENT_RESULT_TOO_LARGE" };
 const scope = { projectId: READ_UUID, workspaceId: READ_HASH, branchScopeId: null, branchRef: null,
   sessionId: null, visibility: "branch" as const };
 function base(operation: NativeQueryCandidate["operation"] = "search-projected-content"): ReadSuccessBase {
-  return { version: 2, ids: { requestId: "request", attemptId: "attempt", laneEpoch: "epoch" }, kind: "success",
+  return { version: 3, ids: { requestId: "request", attemptId: "attempt", laneEpoch: "epoch" }, kind: "success",
     receipt: { ...decodeVerifiedReadReceipt(readReceipt()), operation, consistency: "project-strong", projectionEventPosition: "9223372036854775807",
       verification: "image-scope-position-and-active-admission" },
     fence: { controlGeneration: "0", releaseId: READ_UUID, capturedPosition: "0", capturedHash: READ_HASH, requiredPosition: "0" },

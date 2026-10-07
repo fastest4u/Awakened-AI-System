@@ -104,10 +104,10 @@ test("workflow_full_bootstrap_terminal_and_independent_copy_limits", async () =>
     if (needed === 1) seed.binding.deploymentDirectory.canonicalPath += "x";
     assert.equal(Buffer.byteLength(JSON.stringify(seed)), target); return seed;
   };
-  assert.equal(decodeReadBootstrap(bootstrapAt(8192)).version, 2);
+  assert.equal(decodeReadBootstrap(bootstrapAt(8192)).version, 3);
   assert.throws(() => decodeReadBootstrap(bootstrapAt(8193)), invalid);
   const content = { ...page(), items: Array.from({ length: 7 }, (_, i) => ({ item: { ...item(String(i)), text: "" }, conflict: null })) };
-  const terminal = { version: 2, ids: readBootstrap().ids, kind: "success", content,
+  const terminal = { version: 3, ids: readBootstrap().ids, kind: "success", content,
     receipt: { ...readReceipt(), operation: "list-canonical-records", projectionEventPosition: "3" },
     fence: { controlGeneration: "0", releaseId: READ_UUID, capturedPosition: "0", capturedHash: READ_HASH, requiredPosition: "0" },
     closed: { image: true, reader: true, lock: true } };

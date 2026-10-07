@@ -59,8 +59,8 @@ test("no escaped handle/content/credential keys", () => {
 test("per-message limits, opaque IDs and tokens", () => {
   const input = readBootstrap();
   assert.equal(decodeReadBootstrap(input).ids.attemptId, "attempt");
-  for (const requestId of ["", "é".repeat(65)]) assert.throws(() => decodeReadCancel({ version: 2, ids: { ...input.ids, requestId }, kind: "cancel" }), invalid);
-  assert.equal(decodeReadCancel({ version: 2, ids: { ...input.ids, requestId: "é".repeat(64) }, kind: "cancel" }).kind, "cancel");
+  for (const requestId of ["", "é".repeat(65)]) assert.throws(() => decodeReadCancel({ version: 3, ids: { ...input.ids, requestId }, kind: "cancel" }), invalid);
+  assert.equal(decodeReadCancel({ version: 3, ids: { ...input.ids, requestId: "é".repeat(64) }, kind: "cancel" }).kind, "cancel");
   for (const lockToken of ["A".repeat(32), "a".repeat(31)]) assert.throws(() => decodeReadBootstrap({ ...input, lockToken }), invalid);
   assert.throws(() => decodeReadBootstrap({ ...input, binding: { ...input.binding, eventsFile: { ...input.binding.eventsFile, path: "é".repeat(1025) } } }), invalid);
   const huge = readBootstrap(); for (const directory of [huge.binding.projectionDirectory, huge.binding.executorStateDirectory, huge.binding.deploymentDirectory]) directory.canonicalPath = "\\".repeat(2048);
@@ -69,10 +69,10 @@ test("per-message limits, opaque IDs and tokens", () => {
   for (const remainingMs of [-1, 30001, NaN, Infinity]) assert.throws(() => decodeReadBootstrap({ ...input, remainingMs }), invalid);
   assert.equal(decodeReadBootstrap({ ...input, remainingMs: 0.5 }).remainingMs, 0.5);
   assert.throws(() => decodeReadBootstrap({ ...input, binding: { ...input.binding, compositionEpoch: "é".repeat(65) } }), invalid);
-  assert.throws(() => decodeReadReply({ version: 2, ids: input.ids, kind: "stage", phase: "capture", observedProjectionPosition: "x".repeat(16385) }), invalid);
+  assert.throws(() => decodeReadReply({ version: 3, ids: input.ids, kind: "stage", phase: "capture", observedProjectionPosition: "x".repeat(16385) }), invalid);
 });
 test("exact reply, fence and cleanup variants", () => {
-  const ids = readBootstrap().ids; const base = { version: 2, ids };
+  const ids = readBootstrap().ids; const base = { version: 3, ids };
   for (const phase of ["admission", "projection-wait", "capture", "validate", "revalidate"])
     assert.equal(decodeReadReply({ ...base, kind: "stage", phase, observedProjectionPosition: null }).kind, "stage");
   const success = { ...base, kind: "success", receipt: readReceipt(), fence: { controlGeneration: "0", releaseId: READ_UUID, capturedPosition: "0", capturedHash: READ_HASH, requiredPosition: "0" }, closed: { image: true, reader: true, lock: true } };
@@ -93,7 +93,7 @@ test("exact reply, fence and cleanup variants", () => {
   }
 });
 test("every approved error mapping and safe unknown fallback", () => {
-  const codes = ["FRESH_START_INPUT_INVALID", "FRESH_START_CONTEXT_REQUIRED", "FRESH_START_NOT_INITIALIZED", "FRESH_START_IDENTITY_MISMATCH", "FRESH_START_PATH_INVALID", "FRESH_START_PATH_CHANGED", "FRESH_START_BUILD_MISMATCH", "FRESH_START_SCHEMA_MISMATCH", "FRESH_START_RELEASE_MISMATCH", "FRESH_START_ADMISSION_DENIED", "FRESH_START_CONTENT_UNVERIFIED", "FRESH_START_ADMISSION_STALE", "PROJECTION_LAG", "INTEGRITY_FAILURE", "PROJECTION_SCOPE_MISMATCH", "PROJECTION_PATH_INVALID", "MATERIALIZATION_CONFLICT", "WORKER_TIMEOUT", "WORKER_CLOSED", "STORE_QUEUE_FULL", "WORKER_PROTOCOL_ERROR", "WORKER_UNAVAILABLE"];
+  const codes = ["FRESH_START_INPUT_INVALID", "FRESH_START_CONTEXT_REQUIRED", "FRESH_START_NOT_INITIALIZED", "FRESH_START_IDENTITY_MISMATCH", "FRESH_START_PATH_INVALID", "FRESH_START_PATH_CHANGED", "FRESH_START_BUILD_MISMATCH", "FRESH_START_SCHEMA_MISMATCH", "FRESH_START_RELEASE_MISMATCH", "FRESH_START_ADMISSION_DENIED", "FRESH_START_CONTENT_UNVERIFIED", "FRESH_START_ADMISSION_STALE", "PROJECTION_LAG", "INTEGRITY_FAILURE", "PROJECTION_SCOPE_MISMATCH", "PROJECTION_PATH_INVALID", "MATERIALIZATION_CONFLICT", "WORKER_TIMEOUT", "WORKER_CLOSED", "STORE_QUEUE_FULL", "WORKER_PROTOCOL_ERROR", "WORKER_UNAVAILABLE", "V2_CONTENT_CURSOR_STALE", "V2_CONTENT_RESULT_TOO_LARGE"];
   for (const code of codes) {
     assert.equal(verifiedReadFailure({ code, message: "C:/secret" }).code, code);
     assert.equal(verifiedReadFailure(new Error(code)).code, code);

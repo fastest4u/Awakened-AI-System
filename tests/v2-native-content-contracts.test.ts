@@ -45,12 +45,12 @@ function get() { return { operation: "get-canonical-record", selectionScope: sel
   conflict: null as null | { conflictGroupId: string; eligibleMemberCount: number; returnedMemberCount: number; truncated: boolean } }; }
 function receipt(operation = "search-projected-content") { return { ...readReceipt(), operation, projectionEventPosition: "3" }; }
 function reply(content: unknown = search()) {
-  return { version: 2, ids: readBootstrap().ids, kind: "success", receipt: receipt(),
+  return { version: 3, ids: readBootstrap().ids, kind: "success", receipt: receipt(),
     fence: { controlGeneration: "0", releaseId: READ_UUID, capturedPosition: "0", capturedHash: READ_HASH, requiredPosition: "0" },
     closed: { image: true, reader: true, lock: true }, content };
 }
 function paddedEnvelope(value: ReturnType<typeof readBootstrap>, target: number) {
-  const seed = structuredClone(value); seed.version = 2;
+  const seed = structuredClone(value); seed.version = 3;
   const paths = [seed.binding.eventsFile, seed.binding.projectionDirectory, seed.binding.executorStateDirectory, seed.binding.deploymentDirectory];
   seed.binding.eventsFile.path = "x";
   for (const directory of paths.slice(1)) (directory as { canonicalPath: string }).canonicalPath = "x";
@@ -82,11 +82,11 @@ test("unicode_and_complete_bootstrap_bounds", () => {
     assert.throws(() => decodeVerifiedReadRequest(request(undefined, parameters), null), invalid);
   const trusted = { sessionId: READ_UUID, minimumEventPosition: "0" };
   assert.doesNotThrow(() => decodeVerifiedReadRequest(request(undefined, { query: "x", visibility: "session", validAt: "2026-10-01T00:00:00.000Z", knownAt: "9223372036854775807" }), trusted));
-  assert.equal(decodeReadBootstrap(paddedEnvelope(readBootstrap(), 8192)).version, 2);
+  assert.equal(decodeReadBootstrap(paddedEnvelope(readBootstrap(), 8192)).version, 3);
   assert.throws(() => decodeReadBootstrap(paddedEnvelope(readBootstrap(), 8193)), invalid);
   // NFKC expansion must not move a normalized outgoing bootstrap past the complete-envelope cap.
   assert.throws(() => decodeReadBootstrap(paddedEnvelope({ ...readBootstrap(), request: request(undefined, { query: "㍿" }) }, 8192)), invalid);
-  const bootstrap = { ...readBootstrap(), version: 2, request: request(undefined, { query: "x".repeat(1024) }) };
+  const bootstrap = { ...readBootstrap(), version: 3, request: request(undefined, { query: "x".repeat(1024) }) };
   for (const directory of [bootstrap.binding.projectionDirectory, bootstrap.binding.executorStateDirectory, bootstrap.binding.deploymentDirectory]) directory.canonicalPath = "\\".repeat(1400);
   assert.throws(() => decodeReadBootstrap(bootstrap), invalid);
 });
@@ -119,13 +119,13 @@ test("strict_v2_variants_and_dense_arrays", async () => {
     assert.equal(wire.encodedProtocolBytes(wire.copyBoundedProtocolData(texts, maximum)), maximum);
     texts[0] += "x"; assert.throws(() => wire.copyBoundedProtocolData(texts, maximum), invalid);
   }
-  for (const wrong of [1, 3, "2"]) {
+  for (const wrong of [1, 2, "3"]) {
     assert.throws(() => decodeReadBootstrap({ ...readBootstrap(), version: wrong }), invalid);
     assert.throws(() => decodeReadReply({ ...reply(), version: wrong }), invalid);
     assert.throws(() => decodeReadCancel({ version: wrong, ids: readBootstrap().ids, kind: "cancel" }), invalid);
   }
-  assert.equal(decodeReadCancel({ version: 2, ids: readBootstrap().ids, kind: "cancel" }).version, 2);
-  assert.equal(decodeReadReply({ version: 2, ids: readBootstrap().ids, kind: "stage", phase: "query", observedProjectionPosition: "3" }).kind, "stage");
+  assert.equal(decodeReadCancel({ version: 3, ids: readBootstrap().ids, kind: "cancel" }).version, 3);
+  assert.equal(decodeReadReply({ version: 3, ids: readBootstrap().ids, kind: "stage", phase: "query", observedProjectionPosition: "3" }).kind, "stage");
   assert.equal(decodeCleanupBootstrap({ version: 1, ids: readBootstrap().ids, directory: readBootstrap().binding.projectionDirectory, lockToken: "a".repeat(32), expectedBuildHash: READ_HASH, remainingMs: 2000 }).version, 1);
   for (const change of [{ items: Array(11).fill(searchItem()) }, { conflicts: Array(65).fill({ conflictGroupId: "g", eligibleMemberCount: 1, returnedMemberCount: 0, highImpact: false, truncated: true }) },
     { items: [{ ...searchItem(), channels: Array(8).fill("exact") }] }, { items: [{ ...searchItem(), channels: ["exact", "exact"] }] }, { items: [{ ...searchItem(), channels: ["sql"] }] },
@@ -252,12 +252,12 @@ test("complete_reply_escaped_byte_boundary", async () => {
 
 test("decoded content requires fixed build admission and metadata verify still refuses content", async () => {
   for (const input of [request(), request("get-canonical-record", { id: "Case-ID " })]) {
-    const bootstrap = decodeReadBootstrap({ ...readBootstrap(), version: 2, request: input });
+    const bootstrap = decodeReadBootstrap({ ...readBootstrap(), version: 3, request: input });
     const terminal = await executeVerifiedRead(bootstrap, { now: () => 0, signal: new AbortController().signal,
       inspectBuild() { return "b".repeat(64); },
       async wait() { throw new Error("build refusal must not wait"); },
       emitStage() { throw new Error("build refusal must not emit stages"); } });
-    assert.deepEqual(terminal, { version: 2, ids: bootstrap.ids, kind: "failure",
+    assert.deepEqual(terminal, { version: 3, ids: bootstrap.ids, kind: "failure",
       failure: { code: "FRESH_START_BUILD_MISMATCH", cleanup: "complete", positions: null } });
     const directory = ownedReadDirectory();
     try {

@@ -55,7 +55,7 @@ for(const mode of ['read','write'])for(const n of mode==='read'?['readFile','ope
     assert.deepEqual(publicTools, ["memory_v2Status"]);
     const publicStatus = JSON.parse((await call("tools/call", { name: "memory_v2Status", arguments: {} })).result.content[0].text);
     assert.equal(publicStatus.productionReady, false);
-    for (const name of ["memory_search", "memory_get", "search-projected-content", "get-canonical-record", "memory_v2Activate"])
+    for (const name of ["memory_search", "memory_get", "search-projected-content", "get-canonical-record", "list-canonical-records", "recent-canonical-records", "build-context-pack", "follow-up-radar", "memory_list", "memory_recent", "memory_contextPack", "memory_followUpRadar", "memory_v2Activate"])
       assert.equal((await call("tools/call", { name, arguments: {} })).error.data.code, "FRESH_START_RELEASE_NOT_READY");
     const accesses = existsSync(log) ? readFileSync(log, "utf8").trim().split("\n") : [];
     const v1SentinelReads = accesses.filter(x => x === "read").length, v1SentinelWrites = accesses.filter(x => x === "write").length;
@@ -127,14 +127,19 @@ test("pure_retrieval_closure_is_exact", () => {
     const inputs = closure.inputs.map((value: any) => value.path);
     assert.deepEqual(inputs.filter((path: string) => path.includes("/retrieval/")).sort(), cleanup ? [] : expected);
     for (const module of ["content-query.ts", "content-result.ts"]) assert.equal(inputs.includes(`src/orchestrator/verified-read/${module}`), !cleanup);
+    const helpers = ["content-data-protocol.ts", "content-items.ts", "content-ranking.ts", "workflow-contracts.ts", "workflow-cursor.ts", "workflow-protocol.ts", "workflow-query.ts", "workflow-result.ts"];
+    if (!cleanup) for (const helper of helpers) assert.equal(inputs.includes(`src/orchestrator/verified-read/${helper}`), true, `missing read helper ${helper}`);
+    else {
+      const allowedShared = ["content-data-protocol.ts", "workflow-contracts.ts", "workflow-cursor.ts", "workflow-protocol.ts"];
+      for (const helper of helpers) if (inputs.includes(`src/orchestrator/verified-read/${helper}`)) assert.ok(allowedShared.includes(helper), `cleanup includes query/packing ${helper}`);
+    }
     assert.ok(!closure.runtimeImports.some((path: string) => /^(node:)?(?:child_process|worker_threads)$/.test(path)));
     assert.ok(!inputs.some((path: string) => /\/(?:stable-directory|builder|coordinator|integrity|manifest)\.ts$|\/workers\/|\/parity\/|\/migration\//.test(path)));
     for (const input of closure.inputs) assert.equal(createHash("sha256").update(readFileSync(input.path)).digest("hex"), input.sha256, `stale source ${input.path}`);
   }
 });
 
-test("compiled_blocked_query_and_uncertain_closure", { timeout: 20000 }, async t => {
-  for (const uncertainCleanup of [false, true]) {
+for (const uncertainCleanup of [false, true]) test(`compiled_blocked_query_and_uncertain_closure uncertain=${uncertainCleanup}`, { timeout: 20000 }, async t => {
     const f = await makeNativeContentFixture(); const children: ReturnType<typeof fork>[] = [];
     const exits: { kind: string; code: number | null; signal: string | null }[] = [];
     let active = 0, maximum = 0, blocked = false, closed = false;
@@ -151,7 +156,8 @@ test("compiled_blocked_query_and_uncertain_closure", { timeout: 20000 }, async t
     try {
       const corpus = await f.appendCorpus(); await f.publish(); await until(() => existsSync(join(f.binding.projectionDirectory.canonicalPath, "writer-ready")));
       const writerBytes = readFileSync(join(f.binding.projectionDirectory.canonicalPath, "independent-writer.sqlite"));
-      adapter = createVerifiedReadAdapter(f.binding, { ownership: new VerifiedReadOwnershipRepository(f.binding.executorStateDirectory),
+      const ownership = new VerifiedReadOwnershipRepository(f.binding.executorStateDirectory);
+      adapter = createVerifiedReadAdapter(f.binding, { ownership,
         now: () => performance.now(), schedule: (cb, ms) => setTimeout(cb, ms), clear: timer => clearTimeout(timer as NodeJS.Timeout),
         currentEpoch: () => f.binding.compositionEpoch, spawnOwned(kind) {
           const child = spawnOwned(kind === "read" ? "query-hang" : "cleanup"); const errors = new Set<(error: unknown) => void>();
@@ -186,7 +192,7 @@ test("compiled_blocked_query_and_uncertain_closure", { timeout: 20000 }, async t
         assert.equal(writer.exitCode, null); assert.equal(exits.some(value => value.kind === "writer"), false);
         assert.deepEqual(readFileSync(join(f.binding.projectionDirectory.canonicalPath, "independent-writer.sqlite")), writerBytes);
         assert.equal(existsSync(join(f.binding.projectionDirectory.canonicalPath, ".projection-manifest.publish.lock")), uncertainCleanup);
-        assert.equal(await new VerifiedReadOwnershipRepository(f.binding.executorStateDirectory).inspect() === null, !uncertainCleanup);
+        assert.equal(await ownership.inspect() === null, !uncertainCleanup);
       } finally { clearInterval(timer); }
       writer.send("stop"); await until(() => exits.some(value => value.kind === "writer"));
       assert.deepEqual(exits.find(value => value.kind === "writer"), { kind: "writer", code: 0, signal: null });
@@ -197,7 +203,6 @@ test("compiled_blocked_query_and_uncertain_closure", { timeout: 20000 }, async t
       await until(() => children.every(child => child.exitCode !== null || child.signalCode !== null));
       if (closed || !adapter && !blocked) f.cleanup(); else { f.reader.close(); f.writer.close(); t.diagnostic(`Uncertain blocked-query root retained with original lock and ownership: ${f.root}`); }
     }
-  }
 });
 
 for (const fault of ["wrong-deployment", "source-echo", "unbundled"] as const) test(`native compiled query independently refuses ${fault}`, async () => {
@@ -218,7 +223,7 @@ for (const fault of ["wrong-deployment", "source-echo", "unbundled"] as const) t
         env: process.platform === "win32" ? { SystemRoot: process.env.SystemRoot, WINDIR: process.env.WINDIR } : {}, stdio: ["ignore", "ignore", "ignore", "ipc"] } as ForkOptions);
       const messages: any[] = []; child.on("message", value => messages.push(value)); const closed = once(child, "close");
       const timer = setTimeout(() => child.kill("SIGKILL"), 10000);
-      try { child.send({ version: 2, ids: { requestId: "native-negative", attemptId: "attempt", laneEpoch: "fixture-epoch" }, binding,
+      try { child.send({ version: 3, ids: { requestId: "native-negative", attemptId: "attempt", laneEpoch: "fixture-epoch" }, binding,
         request: nativeGetRequest("exact"), lockToken: "a".repeat(32), remainingMs: 5000 });
         await closed; assert.equal(messages.at(-1)?.failure?.code, "FRESH_START_BUILD_MISMATCH");
         assert.equal(messages.filter(message => message.kind === "stage").length, 0);

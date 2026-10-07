@@ -36,7 +36,7 @@ async function operation(): Promise<Execute> {
 type Fixture = Awaited<ReturnType<typeof makeActiveReadFixture>>;
 const lock = ".projection-manifest.publish.lock";
 function bootstrap(f: Fixture, remainingMs = 5000): ReadBootstrap {
-  return decodeReadBootstrap({ version: 2, ids: { requestId: "read", attemptId: "attempt", laneEpoch: "epoch" },
+  return decodeReadBootstrap({ version: 3, ids: { requestId: "read", attemptId: "attempt", laneEpoch: "epoch" },
     binding: f.binding, request: { ...f.request, budgetMs: remainingMs }, lockToken: "b".repeat(32), remainingMs });
 }
 async function withFixture(run: (f: Fixture, execute: Execute) => Promise<void>) {
