@@ -6,6 +6,7 @@ import type { TrustedReadSession, VerifiedReadBinding, VerifiedReadReceipt } fro
 import { NATIVE_WORKFLOW_BOUNDS_VERSION } from "./workflow-contracts.js";
 import type { NativeWorkflowRequest, NativeWorkflowResult, NativePageParameters, BuildContextPackRequest, NativeCanonicalPageEntry } from "./workflow-contracts.js";
 import { copyBoundedProtocolData } from "./wire-data.js";
+import { decodeWorkflowCursor, createWorkflowSelectionHash, assertWorkflowCursorMatches } from "./workflow-cursor.js";
 
 function invalid(): never { throw new FreshStartError("FRESH_START_INPUT_INVALID"); }
 function record(value: unknown, allowed: readonly string[], required = allowed): Record<string, unknown> {
@@ -52,6 +53,7 @@ export function decodeNativeWorkflowParameters(operation: NativeWorkflowRequest[
   }
   const limit = Object.hasOwn(source, "limit") ? source.limit : 5;
   if (typeof limit !== "number" || !Number.isInteger(limit) || limit < 1 || limit > 10) invalid();
+  if (Object.hasOwn(source, "cursor")) decodeWorkflowCursor(source.cursor);
   return Object.freeze({ limit, ...filters, ...(Object.hasOwn(source, "cursor") ? { cursor: text(source.cursor, 2048) } : {}) });
 }
 export function decodeNativeWorkflowResult(value: unknown): NativeWorkflowResult {
@@ -85,6 +87,7 @@ export function decodeNativeWorkflowResult(value: unknown): NativeWorkflowResult
   const expectedOrder = operation === "list-canonical-records" ? "item-id-binary-asc" : "source-event-position-desc-id-binary-asc";
   if (source.order !== expectedOrder) invalid();
   const hasMore = boolean(source.hasMore), nextCursor = source.nextCursor === null ? null : text(source.nextCursor, 2048);
+  if (nextCursor !== null) decodeWorkflowCursor(nextCursor);
   if (hasMore !== (nextCursor !== null)) invalid();
   const paging = { selectionScope, workflowBoundsVersion: NATIVE_WORKFLOW_BOUNDS_VERSION as typeof NATIVE_WORKFLOW_BOUNDS_VERSION, hasMore, nextCursor, byteBounded };
   if (operation === "follow-up-radar") {
@@ -122,6 +125,15 @@ export function assertNativeWorkflowMatchesRequest(content: NativeWorkflowResult
   const items = result.operation === "build-context-pack" ? [...result.items, ...result.followUps]
     : result.operation === "follow-up-radar" ? result.items : result.items.map(entry => entry.item);
   if (result.operation !== "build-context-pack" && items.length > ((parameters as NativePageParameters).limit ?? 5)) invalid();
+  if (result.operation !== "build-context-pack" && result.nextCursor !== null) {
+    const cursor = decodeWorkflowCursor(result.nextCursor);
+    assertWorkflowCursorMatches(cursor, { version: 1, operation: result.operation, schemaVersion: 2,
+      selectionHash: createWorkflowSelectionHash(result.operation, binding, expected as NativeSelectionScope, parameters),
+      projectionGeneration: receipt.projectionGeneration, projectionEventPosition: receipt.projectionEventPosition, imageSha256: receipt.imageSha256 });
+    const last = items.at(-1);
+    if (last === undefined || cursor.lastId !== last.id
+      || cursor.lastEventPosition !== (result.operation === "list-canonical-records" ? null : last.sourceEventPosition)) invalid();
+  }
   const visibilities = ["project", "workspace", "branch", "session"];
   for (const item of items) {
     if (item.projectId !== expected.projectId || item.workspaceId !== expected.workspaceId || item.branchScopeId !== expected.branchScopeId || item.branchRef !== expected.branchRef

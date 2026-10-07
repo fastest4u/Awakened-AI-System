@@ -954,3 +954,92 @@ export function getCanonicalFromProjectionDatabase(
     return projectionInvalid();
   }
 }
+
+export type ProjectionPageKey = Readonly<{ id: string; eventPosition: bigint | null }>;
+export type ProjectionCanonicalPage = Readonly<{ items: readonly Readonly<{ item: RetrievalItem; eligibleConflictMemberCount: number | null }>[]; hasMore: boolean }>;
+export type ProjectionFollowUpPage = Readonly<{ items: readonly RetrievalItem[]; hasMore: boolean }>;
+type ProjectionPageContext = RetrievalEligibilityContext & Readonly<{ limit: number; after: ProjectionPageKey | null }>;
+const PAGE_MAX_POSITION = 9223372036854775807n;
+function pageScalar(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0 && Buffer.byteLength(value,"utf8") <= 2048
+    && !/[\u0000-\u001f\u007f]/u.test(value)
+    && [...value].every(character => { const point = character.codePointAt(0)!; return point < 0xd800 || point > 0xdfff; });
+}
+function verifyPageContext(database: DatabaseSync, manifest: ProjectionManifestV2, context: ProjectionPageContext, byPosition: boolean): bigint {
+  if (manifest.schemaVersion !== 2) return projectionInvalid();
+  verifyMetadata(database,manifest);
+  const terminal = BigInt(manifest.terminalEventPosition);
+  if (terminal < 0n || terminal > PAGE_MAX_POSITION) return projectionInvalid();
+  for (const key of ["projectId","vaultId","storeId","workspaceId","branchScopeId","branchRef"] as const)
+    if (manifest[key] !== context.binding[key]) throw new InternalRetrievalError("PROJECTION_SCOPE_MISMATCH");
+  if (!Number.isInteger(context.limit) || context.limit < 1 || context.limit > 10
+    || (context.visibility === "session" && context.sessionId === undefined)
+    || (context.knownAt !== undefined && (typeof context.knownAt !== "bigint" || context.knownAt < 0n || context.knownAt > PAGE_MAX_POSITION)))
+    throw new InternalRetrievalError("RETRIEVAL_REQUEST_INVALID");
+  if (context.after !== null && (!pageScalar(context.after.id)
+    || (byPosition ? typeof context.after.eventPosition !== "bigint" || context.after.eventPosition < 0n || context.after.eventPosition > terminal : context.after.eventPosition !== null)))
+    throw new InternalRetrievalError("RETRIEVAL_REQUEST_INVALID");
+  return terminal;
+}
+function verifyPageItem(item: RetrievalItem, terminal: bigint, context: RetrievalEligibilityContext): void {
+  if (!pageScalar(item.id) || item.knownFromEventPosition > item.sourceEventPosition || item.sourceEventPosition > terminal
+    || item.sourceEventPosition > PAGE_MAX_POSITION || !isEligible(item,context,context.binding)) return projectionInvalid();
+}
+/** SQL applies scope/time eligibility before the fixed keyset and limit-plus-one lookahead. */
+export function collectCanonicalPageFromProjectionDatabase(database: DatabaseSync, manifest: ProjectionManifestV2,
+  context: ProjectionPageContext & Readonly<{ order: "id" | "event" }>): ProjectionCanonicalPage {
+  try {
+    if (context.order !== "id" && context.order !== "event") throw new InternalRetrievalError("RETRIEVAL_REQUEST_INVALID");
+    const terminal = verifyPageContext(database,manifest,context,context.order === "event");
+    const parameters = { ...eligibilityParameters(context,terminal), $afterId: context.after?.id ?? null,
+      $afterPosition: context.after?.eventPosition ?? null, $pageLimit: context.limit + 1 };
+    const keyset = context.order === "id" ? "($afterId IS NULL OR item.item_id COLLATE BINARY > $afterId)"
+      : "($afterId IS NULL OR item.source_event_position < $afterPosition OR (item.source_event_position = $afterPosition AND item.item_id COLLATE BINARY > $afterId))";
+    const ordering = context.order === "id" ? "item.item_id COLLATE BINARY ASC" : "item.source_event_position DESC, item.item_id COLLATE BINARY ASC";
+    const rows = preparedRows(database, `
+      SELECT item.project_id, item.session_id, item.item_id, item.normalized_key,
+             item.conflict_group_id, item.superseding_item_id, item.status, item.confidence, item.verification_method,
+             item.valid_from, item.valid_to, item.summary, item.known_from_event_position, item.source_event_position
+      FROM canonical_items AS item
+      WHERE ${CANONICAL_ELIGIBILITY_SQL} AND ${keyset}
+      ORDER BY ${ordering} LIMIT $pageLimit
+    `,parameters);
+    const decoded = rows.map(source => { const item=canonicalItem(source,manifest,terminal); verifyPageItem(item,terminal,context); return item; });
+    const items = decoded.slice(0,context.limit).map(item => {
+      let eligibleConflictMemberCount: number | null = null;
+      if (item.conflictGroupId !== null) {
+        const counts=preparedRows(database, `SELECT count(*) AS member_count FROM canonical_items AS item
+          WHERE ${CANONICAL_ELIGIBILITY_SQL} AND item.conflict_group_id = $groupId`,{...parameters,$groupId:item.conflictGroupId});
+        if (counts.length !== 1) return projectionInvalid();
+        eligibleConflictMemberCount=numberValue(counts[0]!,"member_count");
+        if (eligibleConflictMemberCount < 1) return projectionInvalid();
+      }
+      return Object.freeze({item,eligibleConflictMemberCount});
+    });
+    return Object.freeze({items:Object.freeze(items),hasMore:decoded.length>context.limit});
+  } catch(error) { if (error instanceof InternalRetrievalError) throw error; return projectionInvalid(); }
+}
+/** Query-free supplementation/radar; a null session still prepares the complete table contract. */
+export function collectFollowUpPageFromProjectionDatabase(database: DatabaseSync, manifest: ProjectionManifestV2,
+  context: ProjectionPageContext): ProjectionFollowUpPage {
+  try {
+    const terminal=verifyPageContext(database,manifest,context,true);
+    const rows=preparedRows(database, `
+      SELECT project_id, session_id, follow_up_id, status, summary, confidence, source_event_position
+      FROM tasks_followups
+      WHERE project_id = $projectId AND session_id = $sessionId AND $visibilityLevel >= 3
+        AND status IN ('open','blocked') AND source_event_position <= $terminalPosition
+        AND ($knownAt IS NULL OR source_event_position <= $knownAt)
+        AND ($afterId IS NULL OR source_event_position < $afterPosition
+          OR (source_event_position = $afterPosition AND follow_up_id COLLATE BINARY > $afterId))
+      ORDER BY source_event_position DESC, follow_up_id COLLATE BINARY ASC LIMIT $pageLimit
+    `,{...eligibilityParameters(context,terminal),$afterId:context.after?.id??null,$afterPosition:context.after?.eventPosition??null,$pageLimit:context.limit+1});
+    const items=rows.map(source => {
+      if (source.status !== "open" && source.status !== "blocked") return projectionInvalid();
+      const item=scopedItem(source,manifest,terminal,{idColumn:"follow_up_id",kind:"follow-up",status:source.status,
+        summaryColumn:"summary",verificationMethod:"open-follow-up"});
+      verifyPageItem(item,terminal,context); return item;
+    });
+    return Object.freeze({items:Object.freeze(items.slice(0,context.limit)),hasMore:items.length>context.limit});
+  } catch(error) { if (error instanceof InternalRetrievalError) throw error; return projectionInvalid(); }
+}

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { decodeVerifiedReadRequest, decodeReadBootstrap, decodeReadReply } from "../src/orchestrator/verified-read/protocol.js";
+import { encodeWorkflowCursor } from "../src/orchestrator/verified-read/workflow-cursor.js";
 import { copyBoundedProtocolData } from "../src/orchestrator/verified-read/wire-data.js";
 import { READ_UUID, READ_HASH, readBootstrap, readReceipt } from "./support/v2-verified-read-fixture.js";
 
@@ -134,11 +135,13 @@ test("workflow_full_bootstrap_terminal_and_independent_copy_limits", async () =>
   assert.throws(() => copyBoundedProtocolData(Object.fromEntries(Array.from({ length: 33 }, (_, i) => [String(i), 0])), 8192), invalid);
   assert.doesNotThrow(() => copyBoundedProtocolData("é".repeat(1024), 8192));
   assert.throws(() => copyBoundedProtocolData("é".repeat(1024) + "x", 8192), invalid);
+  assert.throws(() => decodeVerifiedReadRequest(req("list-canonical-records", { cursor: "é".repeat(1024) }), null), invalid);
   for (const operation of ["list-canonical-records", "recent-canonical-records", "follow-up-radar"])
     for (const cursor of ["x".repeat(2049), "", "x\n", 0]) assert.throws(() => decodeVerifiedReadRequest(req(operation, { cursor }), null), invalid);
   for (const operation of ["list-canonical-records", "recent-canonical-records", "follow-up-radar", "build-context-pack"]) {
     const parameters = operation === "build-context-pack" ? { query: "é".repeat(512), validAt: "2026-10-01T00:00:00.000Z", knownAt: "9223372036854775807" }
-      : { cursor: "é".repeat(1024), limit: 10, validAt: "2026-10-01T00:00:00.000Z", knownAt: "9223372036854775807" };
+      : { cursor: encodeWorkflowCursor({ version: 1, operation: operation as "list-canonical-records" | "recent-canonical-records" | "follow-up-radar", selectionHash: READ_HASH, schemaVersion: 2,
+          projectionGeneration: 1, projectionEventPosition: "3", imageSha256: READ_HASH, lastId: "a", lastEventPosition: operation === "list-canonical-records" ? null : "2" }), limit: 10, validAt: "2026-10-01T00:00:00.000Z", knownAt: "9223372036854775807" };
     const valid = decodeVerifiedReadRequest(req(operation, parameters), null);
     assert.ok(Buffer.byteLength(JSON.stringify(valid)) <= 8192);
     assert.throws(() => decodeVerifiedReadRequest({ ...req(operation, parameters), padding: Array(5).fill("\\".repeat(1024)) }, null), invalid);
@@ -217,4 +220,31 @@ test("workflow_request_scope_and_order_lies", () => {
   for (const key of ["projectId", "sessionId", "ranker", "budget", "order", "sql"])
     assert.throws(() => decodeVerifiedReadRequest(req("list-canonical-records", { [key]: "caller" }), null), invalid);
   assert.doesNotThrow(() => decodeVerifiedReadRequest(req("follow-up-radar"), null));
+});
+
+
+// Break caught: accepting a child-provided continuation key, source position, or authority hash without parent reconstruction.
+test("workflow_returned_cursor_is_independently_bound_to_last_item", async () => {
+  const decoder = await api();
+  const cursorApi = await import("../src/orchestrator/verified-read/workflow-cursor.js") as unknown as {
+    createWorkflowSelectionHash(operation:string,binding:unknown,scope:unknown,filters:unknown):string;
+    encodeWorkflowCursor(cursor:unknown):string;
+  };
+  for (const operation of ["list-canonical-records","recent-canonical-records","follow-up-radar"]) {
+    const radar = operation === "follow-up-radar";
+    const selected = radar ? {...scope(),sessionId:READ_UUID,visibility:"session"} : scope();
+    const binding = {...readBootstrap().binding,...(radar?{session:{sessionId:READ_UUID,minimumEventPosition:"0"}}:{})};
+    const last=radar?{...item(),kind:"follow-up",textKind:"projection-text",status:"blocked",sessionId:READ_UUID,visibility:"session"}:item();
+    const cursor = {version:1,operation,schemaVersion:2,selectionHash:cursorApi.createWorkflowSelectionHash(operation,binding,selected,{}),
+      projectionGeneration:1,projectionEventPosition:"3",imageSha256:READ_HASH,lastId:"a",lastEventPosition:operation==="list-canonical-records"?null:"2"};
+    const result = {...page(operation),selectionScope:selected,items:radar?[last]:[{item:last,conflict:null}],hasMore:true,nextCursor:cursorApi.encodeWorkflowCursor(cursor)};
+    const match = (nextCursor:string,bound:unknown=binding) => decoder.assertNativeWorkflowMatchesRequest({...result,nextCursor},req(operation,{limit:1}),bound,
+      {...readReceipt(),operation,projectionEventPosition:"3"});
+    assert.doesNotThrow(()=>match(result.nextCursor));
+    assert.throws(()=>match(cursorApi.encodeWorkflowCursor({...cursor,lastId:"z"})),invalid);
+    if(operation!=="list-canonical-records") assert.throws(()=>match(cursorApi.encodeWorkflowCursor({...cursor,lastEventPosition:"1"})),invalid);
+    for (const change of [{selectionHash:"b".repeat(64)},{projectionGeneration:2},{projectionEventPosition:"4"},{imageSha256:"c".repeat(64)}])
+      assert.throws(()=>match(cursorApi.encodeWorkflowCursor({...cursor,...change})),{code:"V2_CONTENT_CURSOR_STALE"});
+    assert.throws(()=>match(result.nextCursor,{...binding,controlGeneration:"1"}),{code:"V2_CONTENT_CURSOR_STALE"});
+  }
 });

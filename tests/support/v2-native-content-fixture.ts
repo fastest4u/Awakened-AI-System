@@ -27,7 +27,7 @@ import { LifecycleTestKeyBroker } from "./lifecycle-test-key-broker.js";
 
 /** Genuine authorized lifecycle setup, following project-store-lifecycle-runtime-worker.
  * No workers, host capture, guard bypass or imported parity store are used. */
-function nativeLifecycleSetup(fixture: Awaited<ReturnType<typeof makeActiveReadFixture>>) {
+export function nativeLifecycleSetup(fixture: Awaited<ReturnType<typeof makeActiveReadFixture>>) {
   const context = fixture.projectContext;
   const broker = new LifecycleTestKeyBroker({ seed: `native-query/${randomUUID()}` });
   const clock = { now: () => FRESH_NOW, nowMs: () => BigInt(Date.parse(FRESH_NOW)) };
