@@ -1,7 +1,7 @@
 # V2 native list, recent, context and follow-up read workflows
 
 Date: 2026-10-07.
-Status: **draft written specification for human review**. Subsystem planning follows the already approved fresh-start profile; implementation approval for this extension has not yet been recorded.
+Status: **written specification approved by the human on 2026-10-07** with `อนุมัติ`, for the artifact at c6e653f0da311e990aa7ff7e70a5b51d4c4f15eb (blob d9e00c6d2c612b6b27b1d6f87ffb8e4b3406e8f2), unchanged at d9dbd8d. [Executable plan](../plans/2026-10-07-v2-native-read-workflows.md) is prepared for its required human review; implementation approval remains pending that stage.
 Design baseline: `b1646c1c8d9d04345af6d456be4f5724c7f068d2`.
 Execution preference: preserve the user's existing Subagent-Driven selection after review of this specification and its subsequent executable plan.
 
@@ -114,6 +114,6 @@ Use task-focused RED/GREEN checks and independent task/spec/quality reviews, the
 
 This increment closes private browsing/context/radar semantics only. Public routing, governed writes/lifecycle, operational key custody/rotation/recovery, erasure/restoration fences, actual current-host full visible capture/private finalization, F3 complete backup/restore/release and F4 cutover/live evidence remain required. Preserve `memory_v2Status`-only registration, `productionReady:false`, closed promotion, recovery `FRESH_START_CONTENT_UNVERIFIED`, `requireFullEvidence=true` and `host-capability-unverified`.
 
-After approval of this written design, use Superpowers writing-plans to prepare the exact executable plan for review. Preserve Subagent-Driven; do not request the execution-method choice again. No implementation, host setup, real-content access, merge, release dispatch or production activation is authorized by this draft.
+After approval of this written design, use Superpowers writing-plans to prepare the exact executable plan for review. Preserve Subagent-Driven; do not request the execution-method choice again. No implementation, host setup, real-content access, merge, release dispatch or production activation is authorized by this specification approval.
 
 Self-review: source seams and inherited bounds checked; list/recent distinction explicit; cursor authority and image drift explicit; one-image context and shared budget explicit; session follow-up ownership explicit; no missing schema fields invented; public/privacy/recovery limitations retained; no placeholder interface or readiness claim.
