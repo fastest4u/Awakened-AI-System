@@ -10,7 +10,7 @@
 
 **Spec:** [Approved native read workflows](../specs/2026-10-07-v2-native-read-workflows-design.md). Human replied `อนุมัติ` on 2026-10-07 to the specification at c6e653f0da311e990aa7ff7e70a5b51d4c4f15eb, blob d9e00c6d2c612b6b27b1d6f87ffb8e4b3406e8f2, unchanged at planning HEAD d9dbd8dcf1cd90158d7f54848feed4fc7a9084e9.
 
-Status: **written implementation plan for human review**. Written-spec approval is complete. Preserve the already selected **Subagent-Driven** method; implementation starts after human review of this plan. Product baseline b1646c1c8d9d04345af6d456be4f5724c7f068d2. Prior private metadata/search/get/retained-evidence acceptance is not reopened.
+Status: **human approved this written implementation plan on 2026-10-07** with `อนุมัติ`, for commit 17ccf9b5f14f6eb827fca036078def7d425cb4ee. Written-spec approval is complete. Execute all six tasks using the preserved **Subagent-Driven** method; no repeat stage or method approval is needed. Product baseline b1646c1c8d9d04345af6d456be4f5724c7f068d2. Prior private metadata/search/get/retained-evidence acceptance is not reopened.
 
 ## Global Constraints
 
