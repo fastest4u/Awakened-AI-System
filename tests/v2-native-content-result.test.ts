@@ -3,7 +3,7 @@ import test from "node:test";
 import type { RetrievalItem } from "../src/orchestrator/retrieval/contracts.js";
 import type { RerankedCandidate } from "../src/orchestrator/retrieval/ranking.js";
 import type { NativeQueryCandidate } from "../src/orchestrator/verified-read/content-query.js";
-import type { NativeContentResult, NativeSearchResult, VerifiedContentReadRequest } from "../src/orchestrator/verified-read/content-contracts.js";
+import type { NativeGetResult, NativeSearchResult, VerifiedContentReadRequest } from "../src/orchestrator/verified-read/content-contracts.js";
 import type { ReadSuccessBase, VerifiedReadBinding } from "../src/orchestrator/verified-read/contracts.js";
 import { assertNativeContentMatchesRequest } from "../src/orchestrator/verified-read/content-protocol.js";
 import { decodeVerifiedReadReceipt } from "../src/orchestrator/verified-read/protocol.js";
@@ -11,6 +11,8 @@ import { copyBoundedProtocolData, encodedProtocolBytes } from "../src/orchestrat
 import { readBootstrap, readReceipt, READ_UUID, READ_HASH } from "./support/v2-verified-read-fixture.js";
 
 type SearchCandidate = Extract<NativeQueryCandidate, { operation: "search-projected-content" }>;
+// This existing packer suite covers search/get; workflow packing has its own staged task.
+type NativeContentResult = NativeSearchResult | NativeGetResult;
 type Build = (candidate: NativeQueryCandidate, base: ReadSuccessBase) => NativeContentResult;
 async function packer(): Promise<Build> {
   let api: { buildNativeContentResult?: Build } | undefined;

@@ -1,3 +1,4 @@
+import type { NativeCanonicalPageResult, NativeRadarResult, NativeContextResult } from "./workflow-contracts.js";
 import type { FreshStartRelease } from "../fresh-start/contracts.js";
 import type { ProjectBinding } from "../projections/contracts.js";
 import type { ProjectionDirectoryIdentity } from "../projections/stable-directory.js";
@@ -74,6 +75,10 @@ export type ReadReply =
   | (ReadSuccessBase & Readonly<{ receipt: VerifiedReadReceipt & { operation: "verify-published-view" }; content?: never }>)
   | (ReadSuccessBase & Readonly<{ receipt: VerifiedReadReceipt & { operation: "search-projected-content" }; content: NativeSearchResult }>)
   | (ReadSuccessBase & Readonly<{ receipt: VerifiedReadReceipt & { operation: "get-canonical-record" }; content: NativeGetResult }>)
+  | (ReadSuccessBase & Readonly<{ receipt: VerifiedReadReceipt & { operation: "list-canonical-records" }; content: NativeCanonicalPageResult & { operation: "list-canonical-records" } }>)
+  | (ReadSuccessBase & Readonly<{ receipt: VerifiedReadReceipt & { operation: "recent-canonical-records" }; content: NativeCanonicalPageResult & { operation: "recent-canonical-records" } }>)
+  | (ReadSuccessBase & Readonly<{ receipt: VerifiedReadReceipt & { operation: "follow-up-radar" }; content: NativeRadarResult }>)
+  | (ReadSuccessBase & Readonly<{ receipt: VerifiedReadReceipt & { operation: "build-context-pack" }; content: NativeContextResult }>)
   | Readonly<{ version: 2; ids: ReadMessageIds; kind: "failure"; failure: VerifiedReadFailure }>;
 export type ReadTerminalReply = Extract<ReadReply, { kind: "success" | "failure" }>;
 export type ReadCancel = Readonly<{ version: 2; ids: ReadMessageIds; kind: "cancel" }>;

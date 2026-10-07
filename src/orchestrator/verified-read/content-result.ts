@@ -3,7 +3,7 @@ import type { FusedCandidate } from "../retrieval/ranking.js";
 import { selectionReason } from "../retrieval/selection-core.js";
 import {
   NATIVE_CONTENT_BOUNDS_VERSION, NATIVE_CONTENT_RANKING_VERSION,
-  type NativeContentItem, type NativeContentResult, type NativeSearchConflict,
+  type NativeContentItem, type NativeGetResult, type NativeSearchConflict,
   type NativeSearchItem, type NativeSearchResult,
 } from "./content-contracts.js";
 import { decodeNativeContentResult } from "./content-protocol.js";
@@ -31,17 +31,22 @@ function searchItem(candidate: FusedCandidate): NativeSearchItem {
     selectionReason: selectionReason(candidate) };
 }
 /** Capacity reservation only: prospective closure fields do not attest cleanup or authorize emission. */
-function boundedEnvelope(content: NativeContentResult, base: ReadSuccessBase): NativeContentResult {
+function boundedEnvelope(content: NativeSearchResult | NativeGetResult, base: ReadSuccessBase): NativeSearchResult | NativeGetResult {
   let copied: { content: unknown };
   try {
     copied = copyBoundedProtocolData({ ...base, content }, 16384) as { content: unknown };
     if (encodedProtocolBytes(copied) > 16384) return tooLarge();
   } catch { return tooLarge(); }
-  return decodeNativeContentResult(copied.content);
+  const result = decodeNativeContentResult(copied.content);
+  if (result.operation !== "search-projected-content" && result.operation !== "get-canonical-record") {
+    throw Object.assign(new Error("INTEGRITY_FAILURE"), { code: "INTEGRITY_FAILURE" });
+  }
+  return result;
 }
 
 /** Converts private ranked candidates without changing selection policy or releasing any content. */
-export function buildNativeContentResult(candidate: NativeQueryCandidate, base: ReadSuccessBase): NativeContentResult {
+// Task 4 widens this staged return when workflow candidates and packing are implemented.
+export function buildNativeContentResult(candidate: NativeQueryCandidate, base: ReadSuccessBase): NativeSearchResult | NativeGetResult {
   if (candidate.operation === "get-canonical-record") {
     const item = candidate.lookup.item;
     return boundedEnvelope({ operation: candidate.operation, selectionScope: candidate.selectionScope,
@@ -52,6 +57,10 @@ export function buildNativeContentResult(candidate: NativeQueryCandidate, base: 
       } }, base);
   }
 
+  if (candidate.operation !== "search-projected-content") {
+    const exhaustive: never = candidate;
+    throw Object.assign(new Error("INTEGRITY_FAILURE"), { code: "INTEGRITY_FAILURE", cause: exhaustive });
+  }
   // Only groups appearing in defensive, reranked candidates are considered; collection-only
   // groups can have no eligible observed member and must not disclose counts.
   const groups = new Map<string, FusedCandidate[]>();

@@ -1,6 +1,13 @@
 import { FreshStartError } from "../fresh-start/contracts.js";
 
 function invalid(): never { throw new FreshStartError("FRESH_START_INPUT_INVALID"); }
+function wellFormed(value: string): boolean {
+  for (const character of value) {
+    const point = character.codePointAt(0)!;
+    if (point >= 0xd800 && point <= 0xdfff) return false;
+  }
+  return true;
+}
 /** Copies only own data descriptors. Charging includes escaped keys/strings and JSON punctuation. */
 export function copyBoundedProtocolData(value: unknown, maximumBytes: 8192 | 16384): unknown {
   let bytes = 0, containers = 0;
@@ -8,7 +15,7 @@ export function copyBoundedProtocolData(value: unknown, maximumBytes: 8192 | 163
   const copy = (input: unknown, depth: number): unknown => {
     if (input === null) { charge(4); return null; }
     if (typeof input === "string") {
-      if (input.length > 2048 || Buffer.byteLength(input, "utf8") > 2048) invalid();
+      if (!wellFormed(input) || input.length > 2048 || Buffer.byteLength(input, "utf8") > 2048) invalid();
       charge(Buffer.byteLength(JSON.stringify(input), "utf8")); return input;
     }
     if (typeof input === "boolean") { charge(input ? 4 : 5); return input; }
@@ -41,6 +48,7 @@ export function copyBoundedProtocolData(value: unknown, maximumBytes: 8192 | 163
       if (typeof key !== "string" || key.length > 128) invalid();
       const descriptor = Object.getOwnPropertyDescriptor(input, key);
       if (!descriptor || !descriptor.enumerable || !("value" in descriptor)) invalid();
+      if (!wellFormed(key)) invalid();
       charge(Buffer.byteLength(JSON.stringify(key), "utf8") + 1); descriptors.push([key, descriptor]);
     }
     const output: Record<string, unknown> = Object.create(null) as Record<string, unknown>;

@@ -43,7 +43,16 @@ export function queryNativeContent(
   const started = performance.now();
   // Caller errors retain the existing input family, outside image-error reduction.
   const request = decodeVerifiedReadRequest(context.request, context.binding.session);
-  if (request.operation === "verify-published-view") return fail("INTEGRITY_FAILURE");
+  switch (request.operation) {
+    case "verify-published-view":
+    case "list-canonical-records":
+    case "recent-canonical-records":
+    case "build-context-pack":
+    case "follow-up-radar": return fail("INTEGRITY_FAILURE");
+    case "search-projected-content":
+    case "get-canonical-record": break;
+    default: { const exhaustive: never = request; return exhaustive; }
+  }
   const deadline = started + context.remainingMs;
   const checkDeadline = () => { if (performance.now() >= deadline) fail("WORKER_TIMEOUT"); };
   try {

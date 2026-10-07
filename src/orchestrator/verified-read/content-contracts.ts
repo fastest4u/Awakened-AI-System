@@ -1,17 +1,18 @@
+import type { NativeWorkflowRequest, NativeWorkflowResult } from "./workflow-contracts.js";
 import type { RetrievalChannel, RetrievalItem, RetrievalVisibility } from "../retrieval/contracts.js";
 import type { MetadataVerifiedReadRequest, VerifiedReadReceipt } from "./contracts.js";
 
 export const NATIVE_CONTENT_BOUNDS_VERSION = "v2-native-content-bounds-1";
 export const NATIVE_CONTENT_RANKING_VERSION = "retrieval-ranking-v2-shadow-fixed-units";
 export type NativeContentFilters = Readonly<{ visibility?: RetrievalVisibility; validAt?: string; knownAt?: string }>;
-type ContentReadBase = Readonly<{ consistency: MetadataVerifiedReadRequest["consistency"]; minimumEventPosition: string; budgetMs: number }>;
+export type ContentReadBase = Readonly<{ consistency: MetadataVerifiedReadRequest["consistency"]; minimumEventPosition: string; budgetMs: number }>;
 export type SearchProjectedContentRequest = ContentReadBase & Readonly<{
   operation: "search-projected-content"; parameters: NativeContentFilters & Readonly<{ query: string; limit?: number }>;
 }>;
 export type GetCanonicalRecordRequest = ContentReadBase & Readonly<{
   operation: "get-canonical-record"; parameters: NativeContentFilters & Readonly<{ id: string }>;
 }>;
-export type VerifiedContentReadRequest = SearchProjectedContentRequest | GetCanonicalRecordRequest;
+export type VerifiedContentReadRequest = SearchProjectedContentRequest | GetCanonicalRecordRequest | NativeWorkflowRequest;
 export type NativeSelectionScope = Readonly<{
   projectId: string; workspaceId: string; branchScopeId: string | null; branchRef: string | null;
   sessionId: string | null; visibility: RetrievalVisibility;
@@ -41,5 +42,5 @@ export type NativeSearchResult = Readonly<{
 export type NativeGetResult = Readonly<{
   operation: "get-canonical-record"; selectionScope: NativeSelectionScope; item: NativeContentItem | null; conflict: NativeGetConflict | null;
 }>;
-export type NativeContentResult = NativeSearchResult | NativeGetResult;
+export type NativeContentResult = NativeSearchResult | NativeGetResult | NativeWorkflowResult;
 export type VerifiedContentReadResult = Readonly<{ receipt: VerifiedReadReceipt; content: NativeContentResult }>;

@@ -59,7 +59,7 @@ function session(value: unknown): TrustedReadSession | null {
 function request(value: unknown, trustedSession: TrustedReadSession | null): VerifiedReadRequest {
   if (typeof value !== "object" || value === null) invalid();
   const operation = (value as Record<string, unknown>).operation;
-  if (!["verify-published-view", "search-projected-content", "get-canonical-record"].includes(operation as string)) invalid();
+  if (!["verify-published-view", "search-projected-content", "get-canonical-record", "list-canonical-records", "recent-canonical-records", "build-context-pack", "follow-up-radar"].includes(operation as string)) invalid();
   const source = record(value, operation === "verify-published-view" ? ["operation", "consistency", "minimumEventPosition", "budgetMs"] : ["operation", "consistency", "minimumEventPosition", "budgetMs", "parameters"]);
   if (typeof source.budgetMs !== "number") invalid();
   const mode = consistency(source.consistency);
@@ -129,7 +129,7 @@ export function decodeReadCancel(value: unknown): ReadCancel {
 function receipt(value: unknown): VerifiedReadReceipt {
   const source = record(value, ["operation", "consistency", "scope", "releaseId", "controlGeneration", "requiredEventPosition",
     "projectionGeneration", "projectionEventPosition", "projectionEventHash", "imageSha256", "verification"]);
-  if (!["verify-published-view", "search-projected-content", "get-canonical-record"].includes(source.operation as string) || source.verification !== "image-scope-position-and-active-admission"
+  if (!["verify-published-view", "search-projected-content", "get-canonical-record", "list-canonical-records", "recent-canonical-records", "build-context-pack", "follow-up-radar"].includes(source.operation as string) || source.verification !== "image-scope-position-and-active-admission"
     || typeof source.projectionGeneration !== "number" || !Number.isSafeInteger(source.projectionGeneration)
     || source.projectionGeneration < 1 || source.projectionGeneration > 2147483647) invalid();
   const mode = consistency(source.consistency);
@@ -182,7 +182,8 @@ export function decodeReadReply(value: unknown): ReadReply {
     const content = decodeNativeContentResult(source.content);
     if (content.operation !== verified.operation) invalid();
     if (content.operation === "search-projected-content") return Object.freeze({ ...base, receipt: Object.freeze({ ...verified, operation: content.operation }), content: content as NativeSearchResult });
-    return Object.freeze({ ...base, receipt: Object.freeze({ ...verified, operation: content.operation }), content: content as NativeGetResult });
+    if (content.operation === "get-canonical-record") return Object.freeze({ ...base, receipt: Object.freeze({ ...verified, operation: content.operation }), content: content as NativeGetResult });
+    return Object.freeze({ ...base, receipt: Object.freeze({ ...verified, operation: content.operation }), content }) as ReadReply;
   }
   if (kind === "failure") {
     const source = record(input, ["version", "ids", "kind", "failure"]);

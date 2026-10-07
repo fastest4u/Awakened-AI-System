@@ -268,3 +268,25 @@ test("decoded content requires fixed build admission and metadata verify still r
     } finally { rmSync(directory.canonicalPath, { recursive: true, force: true }); }
   }
 });
+
+// Catches a stable content entry point forgetting a workflow branch or accepting operation-mismatched replies.
+test("stable_content_entry_points_dispatch_workflow_variants_with_correlated_receipts", async () => {
+  const api = await load<ContentApi>("content-protocol");
+  const policy = "v2-native-read-workflow-bounds-1";
+  for (const operation of ["list-canonical-records", "recent-canonical-records", "follow-up-radar", "build-context-pack"]) {
+    const content = operation === "build-context-pack"
+      ? { operation, selectionScope: selectionScope(), workflowBoundsVersion: policy, rankingPolicyVersion: ranking,
+        items: [], conflicts: [], followUps: [], candidateBounded: false, selectionTruncated: false, byteBounded: false }
+      : { operation, selectionScope: selectionScope(), workflowBoundsVersion: policy,
+        order: operation === "list-canonical-records" ? "item-id-binary-asc" : "source-event-position-desc-id-binary-asc",
+        items: [], hasMore: false, nextCursor: null, byteBounded: false };
+    const input = request(operation, operation === "build-context-pack" ? { query: "native" } : {});
+    const decodedRequest = decodeVerifiedReadRequest(input, null);
+    const decodedContent = api.decodeNativeContentResult(content);
+    assert.doesNotThrow(() => api.assertNativeContentMatchesRequest(decodedContent, decodedRequest, readBootstrap().binding, receipt(operation)));
+    assert.equal(decodeReadReply({ ...reply(content), receipt: receipt(operation) }).kind, "success");
+    assert.throws(() => decodeReadReply({ ...reply(content), receipt: receipt("get-canonical-record") }), invalid);
+    const { content: _, ...missing } = reply(content);
+    assert.throws(() => decodeReadReply({ ...missing, receipt: receipt(operation) }), invalid);
+  }
+});
