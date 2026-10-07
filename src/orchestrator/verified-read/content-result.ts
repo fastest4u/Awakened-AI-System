@@ -47,6 +47,11 @@ function boundedEnvelope(content: NativeSearchResult | NativeGetResult, base: Re
 /** Converts private ranked candidates without changing selection policy or releasing any content. */
 // Task 4 widens this staged return when workflow candidates and packing are implemented.
 export function buildNativeContentResult(candidate: NativeQueryCandidate, base: ReadSuccessBase): NativeSearchResult | NativeGetResult {
+  // Task 4 replaces this staging refusal with complete workflow packing.
+  if (candidate.operation === "list-canonical-records" || candidate.operation === "recent-canonical-records"
+    || candidate.operation === "follow-up-radar" || candidate.operation === "build-context-pack") {
+    throw Object.assign(new Error("INTEGRITY_FAILURE"), { code: "INTEGRITY_FAILURE" });
+  }
   if (candidate.operation === "get-canonical-record") {
     const item = candidate.lookup.item;
     return boundedEnvelope({ operation: candidate.operation, selectionScope: candidate.selectionScope,
@@ -58,7 +63,7 @@ export function buildNativeContentResult(candidate: NativeQueryCandidate, base: 
   }
 
   if (candidate.operation !== "search-projected-content") {
-    const exhaustive: never = candidate;
+    const exhaustive = candidate;
     throw Object.assign(new Error("INTEGRITY_FAILURE"), { code: "INTEGRITY_FAILURE", cause: exhaustive });
   }
   // Only groups appearing in defensive, reranked candidates are considered; collection-only

@@ -1,21 +1,20 @@
 import type { DatabaseSync } from "node:sqlite";
 import type { ProjectionManifestV2 } from "../projections/manifest-codec.js";
 import {
-  InternalRetrievalError, validateInternalRetrievalRequest,
+  InternalRetrievalError,
   type RetrievalConflictGroup, type RetrievalEligibilityContext,
 } from "../retrieval/contracts.js";
 import {
-  collectEligibleFromProjectionDatabase, getCanonicalFromProjectionDatabase,
+  getCanonicalFromProjectionDatabase,
   type CanonicalLookup,
 } from "../retrieval/database-core.js";
-import { filterCandidates, rankingChannels } from "../retrieval/selection-core.js";
-import {
-  DEFAULT_RANKING_POLICY, fuseCandidates, rerankCandidates, selectRankedCandidates,
-  type RankedSelection, type RerankedCandidate,
-} from "../retrieval/ranking.js";
+import type { RankedSelection, RerankedCandidate } from "../retrieval/ranking.js";
 import type { NativeSelectionScope, VerifiedContentReadRequest } from "./content-contracts.js";
 import type { VerifiedReadBinding, VerifiedReadReceipt } from "./contracts.js";
 import { decodeVerifiedReadReceipt, decodeVerifiedReadRequest } from "./protocol.js";
+
+import { collectNativeRankedQuery } from "./content-ranking.js";
+import { queryNativeWorkflow, type NativeWorkflowCandidate } from "./workflow-query.js";
 
 export type NativeQueryContext = Readonly<{
   request: VerifiedContentReadRequest;
@@ -23,7 +22,7 @@ export type NativeQueryContext = Readonly<{
   receipt: VerifiedReadReceipt;
   remainingMs: number;
 }>;
-export type NativeQueryCandidate =
+export type NativeQueryCandidate = NativeWorkflowCandidate
   | Readonly<{ operation: "search-projected-content"; selectionScope: NativeSelectionScope;
       rankedCandidates: readonly RerankedCandidate[]; selection: RankedSelection;
       conflictGroups: readonly RetrievalConflictGroup[]; candidateBounded: boolean }>
@@ -44,11 +43,11 @@ export function queryNativeContent(
   // Caller errors retain the existing input family, outside image-error reduction.
   const request = decodeVerifiedReadRequest(context.request, context.binding.session);
   switch (request.operation) {
-    case "verify-published-view":
+    case "verify-published-view": return fail("INTEGRITY_FAILURE");
     case "list-canonical-records":
     case "recent-canonical-records":
     case "build-context-pack":
-    case "follow-up-radar": return fail("INTEGRITY_FAILURE");
+    case "follow-up-radar":
     case "search-projected-content":
     case "get-canonical-record": break;
     default: { const exhaustive: never = request; return exhaustive; }
@@ -97,31 +96,22 @@ export function queryNativeContent(
       checkDeadline();
       return Object.freeze({ operation: request.operation, selectionScope, lookup });
     }
-    const internal = validateInternalRetrievalRequest({ ...eligibility, query: request.parameters.query,
-      limit: request.parameters.limit ?? 5, candidateLimit: 64, tokenBudget: 2048,
-      includeGlobal: false, vector: { enabled: false }, explain: false,
-      consistency: { requiredEventPosition: BigInt(receipt.requiredEventPosition), deadlineMs: context.remainingMs },
-    });
-    const collected = collectEligibleFromProjectionDatabase(database, manifest, internal);
-    checkDeadline();
-    const filtered = filterCandidates(collected, internal).collection;
-    for (const channel of filtered.channels) for (const candidate of channel.candidates) {
-      const item = candidate.item;
-      if (item.knownFromEventPosition > item.sourceEventPosition
-        || item.sourceEventPosition > BigInt(manifest.terminalEventPosition)) return fail("INTEGRITY_FAILURE");
+    if (request.operation !== "search-projected-content") {
+      const result = queryNativeWorkflow(database, manifest, { request, binding: context.binding, receipt,
+        eligibility, selectionScope, remainingMs: Math.max(0, deadline - performance.now()) });
+      checkDeadline();
+      return result;
     }
-    const fused = fuseCandidates(rankingChannels(filtered), DEFAULT_RANKING_POLICY);
+    const ranked = collectNativeRankedQuery(database, manifest, { eligibility, query: request.parameters.query,
+      limit: request.parameters.limit ?? 5, requiredEventPosition: receipt.requiredEventPosition,
+      remainingMs: Math.max(0, deadline - performance.now()) });
     checkDeadline();
-    const rankedCandidates = rerankCandidates(fused, internal, DEFAULT_RANKING_POLICY);
-    const selection = selectRankedCandidates(rankedCandidates, { limit: internal.limit, tokenBudget: internal.tokenBudget }, DEFAULT_RANKING_POLICY);
-    checkDeadline();
-    return Object.freeze({ operation: request.operation, selectionScope, rankedCandidates, selection,
-      conflictGroups: filtered.conflictGroups, candidateBounded: filtered.truncated });
+    return Object.freeze({ operation: request.operation, selectionScope, ...ranked });
   } catch (error) {
     if (error instanceof InternalRetrievalError && error.code === "PROJECTION_SCOPE_MISMATCH") {
       return fail("PROJECTION_SCOPE_MISMATCH");
     }
-    if (error instanceof Error && (error.message === "WORKER_TIMEOUT" || error.message === "PROJECTION_SCOPE_MISMATCH")) throw error;
+    if (error instanceof Error && (error.message === "WORKER_TIMEOUT" || error.message === "PROJECTION_SCOPE_MISMATCH" || (Object.hasOwn(error, "code") && (error as Error & { code?: string }).code === "V2_CONTENT_CURSOR_STALE"))) throw error;
     return fail("INTEGRITY_FAILURE");
   }
 }
