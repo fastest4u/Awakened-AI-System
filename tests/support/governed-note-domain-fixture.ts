@@ -15,10 +15,12 @@ import { GovernedNoteProvenanceRepository } from "../../src/orchestrator/governe
 import { buildGovernedNoteOriginalCommitment, governedNoteSummaryHash } from "../../src/orchestrator/governed-notes/intent.js";
 import type { GovernedNoteCreatedPayloadV1, GovernedNoteStoredReceiptV1 } from "../../src/orchestrator/governed-notes/contracts.js";
 import type { AppendCommand, JsonValue } from "../../src/orchestrator/contracts/event.js";
+import { GovernedNoteService, type GovernedNoteServiceOptions } from "../../src/orchestrator/governed-notes/service.js";
+import { GovernedNoteRepository } from "../../src/orchestrator/governed-notes/repository.js";
 
 export type GovernedNoteDomainFixtureV1 = Awaited<ReturnType<typeof makeGovernedNoteDomainFixture>>;
 /** Isolated direct-domain setup. This is not a same-owner native qualification. */
-export async function makeGovernedNoteDomainFixture() {
+export async function makeGovernedNoteDomainFixture(options: Pick<Partial<GovernedNoteServiceOptions>, "faults" | "policy" | "provider"> = {}) {
   const retained = await makeRetainedEvidenceFixture();
   try {
     let nowMs = BigInt(Date.parse(FRESH_NOW));
@@ -27,6 +29,8 @@ export async function makeGovernedNoteDomainFixture() {
     const capabilities = new CapabilityService({ keyProvider: retained.lifecycle.broker, clock, nonceSource: { uuid: randomUUID, bytes: randomBytes } });
     const { connection, projectContext: rootContext, childContext, provider, policy } = retained;
     const verifier = new GovernedNoteAuthorityVerifier({ connection, capabilities, clock });
+    const events = new EventAppendTransaction(connection, new SqliteEventAppendStatements(connection), new MaintenanceFence(), new BranchScopeRepository(), randomUUID,
+      { hit(point) { if (point === "after-first-insert-before-commit") options.faults?.inject("after-note-event"); } });
     const sources: { root: GovernedNoteProvenanceDescriptorV1[]; child: GovernedNoteProvenanceDescriptorV1[] } = { root: [], child: [] };
     for (const [kind, authorizer, context] of [["root", retained.rootAuthority, rootContext], ["child", retained.childAuthority, childContext]] as const) {
       const invocation = retained.invocation({ version: 1, commandType: "retain-evidence-batch", commandId: randomUUID(), idempotencyKey: randomUUID(), targetSessionId: authorizer.sessionId, conversationId: randomUUID(),
@@ -51,6 +55,7 @@ export async function makeGovernedNoteDomainFixture() {
       finally { material.handle.destroy(); if (material.kind === "root") material.resumeToken?.destroy(); }
     };
     return { connection, rootContext, childContext, capabilities, provider, clock, policy, verifier, sources, retained, scope, mint,
+      service() { return new GovernedNoteService({ connection, events, repository: new GovernedNoteRepository(connection), provenance: new GovernedNoteProvenanceRepository(), authority: verifier, provider, policy: () => policy, clock, ...options }); },
       prepareNote(prepared: PreparedGovernedNoteCreateV1, context: ProjectContext = rootContext) {
         const command = prepared.command, handle = verifier.verifyCreate(prepared, context), authority = verifier.revalidateCreate(handle), binding = verifier.bindingForCreate(handle);
         const tx = new EventAppendTransaction(connection, new SqliteEventAppendStatements(connection), new MaintenanceFence(), new BranchScopeRepository());
