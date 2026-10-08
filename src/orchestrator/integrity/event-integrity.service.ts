@@ -1,5 +1,6 @@
 import { readFileSync } from "node:fs";
 import { assertRetainedStoredEvent, decodeRetainedEvidenceAuthority, decodeRetainedEvidenceStoredResult, retainedEvidenceIntentHash, verifyRetainedEvidenceTransport } from "../privacy/retained-evidence-codec.js";
+import { assertStoredGovernedNoteCorrespondence, GovernedNoteRepository } from "../governed-notes/repository.js";
 import { retainedStringMetrics } from "../privacy/evidence-contracts.js";
 import {
   commandHash,
@@ -1165,7 +1166,9 @@ export class EventIntegrityService {
 
     try {
       this.validateLifecycleOutboxDescriptors(command, rows);
-      const expectedHash = command.commandType === "retain-evidence-batch"
+      const expectedHash = command.commandType === "create-governed-note"
+        ? this.reconstructGovernedNoteHash(command)
+        : command.commandType === "retain-evidence-batch"
         ? this.reconstructRetainedEvidenceHash(command, rows)
         : command.lifecycleAuthorizationKind === null
         ? this.reconstructCommandHash(command, rows)
@@ -1698,6 +1701,13 @@ export class EventIntegrityService {
     } catch { throw new CommandWitnessInvalidError("COMMAND_WITNESS_INVALID"); }
   }
 
+  private reconstructGovernedNoteHash(command: CommandRow): string {
+    try {
+      const prior = new GovernedNoteRepository(this.connection).findGovernedNotePrior(command.commandId, command.idempotencyKey);
+      if (!prior) throw new Error(); return prior.commandHash;
+    } catch { throw new CommandWitnessInvalidError("COMMAND_WITNESS_INVALID"); }
+  }
+
   private checkEventRows(
     context: ProjectContext,
     rows: readonly SqliteRow[],
@@ -1719,10 +1729,15 @@ export class EventIntegrityService {
       const streamId = stringValue(row, "stream_id");
       try {
         const stored = storedEventForAuthentication(row);
-        authenticateStoredEvent(stored, {
-          expectedPosition,
-          previousEventHash: expectedPreviousHash ?? "",
-        });
+        try {
+          authenticateStoredEvent(stored, {
+            expectedPosition,
+            previousEventHash: expectedPreviousHash ?? "",
+          });
+        } finally {
+          // Even a broken incoming chain cursor must not suppress companion authentication.
+          assertStoredGovernedNoteCorrespondence(this.connection, stored);
+        }
         assertStoredRetainedEvidenceCorrespondence(this.connection, stored);
       } catch (error) {
         if (error instanceof StoredEventAuthenticationError) {

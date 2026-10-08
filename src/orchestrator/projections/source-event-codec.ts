@@ -1,4 +1,5 @@
 import type { StoredEvent } from "../contracts/event.js";
+import { assertGovernedNoteMember, isGovernedNoteEvent } from "../governed-notes/pair-validation.js";
 import { assertRetainedStoredEvent } from "../privacy/retained-evidence-codec.js";
 import { payloadHash } from "../crypto/event-hash.js";
 import type {
@@ -1253,6 +1254,13 @@ export function validateProjectionEvent(value: unknown): ProjectionEvent {
 export function decodeProjectionEvent(event: StoredEvent): ProjectionEventDecodeResult {
   try {
     const envelope = decodeStoredEventEnvelope(event);
+    if (isGovernedNoteEvent(event)) {
+      validateKnownPayload(envelope);
+      assertGovernedNoteMember(event);
+      if (event.eventType === "GovernedNoteCreated") {
+        return Object.freeze({ kind: "unprojected", eventPosition: envelope.eventPosition, eventType: envelope.eventType });
+      }
+    }
     if ((LIFECYCLE_EVENT_TYPES as readonly string[]).includes(envelope.eventType)) {
       return decodeLifecycleProjection(validateKnownPayload(envelope));
     }

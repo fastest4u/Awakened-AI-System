@@ -8,6 +8,13 @@ import { GovernedNoteAuthorityVerifier, deriveGovernedNoteBinding, governedNoteC
 import { decodeGovernedNoteCommandV1, decodeGovernedNoteRecoveryV1 } from "../../src/orchestrator/governed-notes/codec.js";
 import type { GovernedNoteCommandV1, GovernedNoteRecoveryIdsV1, PreparedGovernedNoteCreateV1, PreparedGovernedNoteRecoveryV1, GovernedNoteProvenanceDescriptorV1 } from "../../src/orchestrator/governed-notes/contracts.js";
 import type { ProjectContext } from "../../src/orchestrator/identity/contracts.js";
+import { EventAppendTransaction, SqliteEventAppendStatements, governedNotePlannedIds } from "../../src/orchestrator/storage/event-append-transaction.js";
+import { MaintenanceFence } from "../../src/orchestrator/storage/maintenance-fence.js";
+import { BranchScopeRepository } from "../../src/orchestrator/storage/branch-scope.repository.js";
+import { GovernedNoteProvenanceRepository } from "../../src/orchestrator/governed-notes/provenance.repository.js";
+import { buildGovernedNoteOriginalCommitment, governedNoteSummaryHash } from "../../src/orchestrator/governed-notes/intent.js";
+import type { GovernedNoteCreatedPayloadV1, GovernedNoteStoredReceiptV1 } from "../../src/orchestrator/governed-notes/contracts.js";
+import type { AppendCommand, JsonValue } from "../../src/orchestrator/contracts/event.js";
 
 export type GovernedNoteDomainFixtureV1 = Awaited<ReturnType<typeof makeGovernedNoteDomainFixture>>;
 /** Isolated direct-domain setup. This is not a same-owner native qualification. */
@@ -44,6 +51,20 @@ export async function makeGovernedNoteDomainFixture() {
       finally { material.handle.destroy(); if (material.kind === "root") material.resumeToken?.destroy(); }
     };
     return { connection, rootContext, childContext, capabilities, provider, clock, policy, verifier, sources, retained, scope, mint,
+      prepareNote(prepared: PreparedGovernedNoteCreateV1, context: ProjectContext = rootContext) {
+        const command = prepared.command, handle = verifier.verifyCreate(prepared, context), authority = verifier.revalidateCreate(handle), binding = verifier.bindingForCreate(handle);
+        const tx = new EventAppendTransaction(connection, new SqliteEventAppendStatements(connection), new MaintenanceFence(), new BranchScopeRepository());
+        const plan = tx.planGovernedNoteIdentity(handle, command), ids = governedNotePlannedIds(plan);
+        const provenance = new GovernedNoteProvenanceRepository().validate(connection, command.provenance, authority, binding, provider);
+        const keyRef = provider.currentKey({ projectId: authority.projectId, storeId: authority.storeId }, "original-input-commitment");
+        const summary = command.summary.normalize("NFC").trim();
+        const witness = { witnessVersion: 1 as const, commandType: "create-governed-note" as const, commandId: command.commandId, idempotencyKey: command.idempotencyKey, ...ids, recordKind: command.recordKind, confidence: command.confidence, authority, binding, provenance, policyId: "governed-note-fixture", policyVersion: "1", originalCommitmentKeyRef: keyRef, originalInputCommitment: buildGovernedNoteOriginalCommitment(command, authority, binding, keyRef, provider), summaryContentHash: governedNoteSummaryHash(summary), recordedAt: clock.now() };
+        const payload: GovernedNoteCreatedPayloadV1 = { formatVersion: 1, witness };
+        const source = { sourceVersion: 2, binding: { ...binding }, item: { itemId: ids.recordId, normalizedKey: `governed-note/${command.recordKind}/${ids.recordId}`, status: "candidate", confidence: command.confidence, verificationMethod: "governed-note-unverified-v1", validFrom: clock.now(), validTo: null, summary, contentHash: witness.summaryContentHash, conflictGroupId: null, supersedingItemId: null, anchor: null }, followUps: [], artifacts: [], entities: [], aliases: [], edges: [] };
+        const common = { occurredAt: clock.now(), visibilityScope: "session" as const, sessionId: authority.targetSessionId, parentSessionId: authority.parentSessionId ?? undefined, confidence: command.confidence, verificationStatus: "unverified" as const, sourceRefs: [...new Set(provenance.map(p => p.sourceEventId))].sort(), evidenceRefs: [], evidenceDigests: [] };
+        const append: AppendCommand<GovernedNoteStoredReceiptV1> = { context, commandId: command.commandId, idempotencyKey: command.idempotencyKey, commandType: "create-governed-note", correlationId: command.commandId, agentId: "governed-note", streamId: `governed-note/${authority.targetSessionId}/${ids.recordId}`, streamType: "governed-note", expectedStreamVersion: 0n, events: [{ ...common, eventType: "GovernedNoteCreated", eventSchemaVersion: 1, payload: payload as unknown as JsonValue }, { ...common, eventType: "MemorySourceRecorded", eventSchemaVersion: 3, payload: source }], outbox: [], publicResponse: { resultVersion: 1, operation: "create-governed-note", commandId: command.commandId, idempotencyKey: command.idempotencyKey, recordId: ids.recordId, recordKind: command.recordKind, status: "candidate", verificationStatus: "unverified", scope: { ...binding }, sourceEventIds: [ids.noteEventId, ids.sourceEventId], terminalPosition: "1" } };
+        return { tx, plan, ids, handle, append, payload, source };
+      },
       /** Genuine retained-command sources, including direct child authority and conversation continuation. */
       retainSource(options: { child?: boolean; rootOnChild?: boolean; conversationId?: string; ordinal?: string; previousFrameId?: string; frames?: number } = {}) {
         const child = options.child || options.rootOnChild;

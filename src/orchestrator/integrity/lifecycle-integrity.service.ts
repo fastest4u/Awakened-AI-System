@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { assertRetainedStoredEvent } from "../privacy/retained-evidence-codec.js";
 import { assertStoredRetainedEvidenceCorrespondence } from "./event-integrity.service.js";
+import { assertStoredGovernedNoteCorrespondence } from "../governed-notes/repository.js";
 import { authenticateStoredEvent } from "./stored-event-authenticator.js";
 import type { StoredEvent } from "../contracts/event.js";
 import { outboxHash, payloadHash } from "../crypto/event-hash.js";
@@ -3954,6 +3955,7 @@ export class LifecycleIntegrityService implements AsyncIntegrityExtension {
 
   private authenticateRetainedReplayEvent(event: StoredEvent): void {
     try {
+      assertStoredGovernedNoteCorrespondence(this.connection, event);
       if (assertRetainedStoredEvent(event) !== null) {
         authenticateStoredEvent(event, { expectedPosition: event.globalPosition, previousEventHash: event.previousGlobalHash });
         assertStoredRetainedEvidenceCorrespondence(this.connection, event);

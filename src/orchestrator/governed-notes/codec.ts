@@ -7,6 +7,50 @@ import type { BoundedOperationAuthorization, CapabilityProofV1, LifecycleAudienc
 import type { JsonValue } from "../contracts/event.js";
 import { isProjectionProjectStoreIdentity, isProjectionWorkspaceIdentity, type ProjectBinding } from "../projections/contracts.js";
 import { canonicalJson } from "../serialization/canonical-json.js";
+import { decodeRetainedEvidenceAuthority, decodeEvidenceKeyRef } from "../privacy/retained-evidence-codec.js";
+import { createHash } from "node:crypto";
+
+export function decodeGovernedNoteCreatedPayloadV1(value: unknown): C.GovernedNoteCreatedPayloadV1 {
+  const outer = record(snapshot(value, LIMITS.sourceEventBytes), ["formatVersion", "witness"]);
+  if (outer.formatVersion !== 1) refuse();
+  const r = record(outer.witness, ["witnessVersion", "commandType", "commandId", "idempotencyKey", "recordId", "recordKind", "confidence", "authority", "binding", "provenance", "policyId", "policyVersion", "originalCommitmentKeyRef", "originalInputCommitment", "summaryContentHash", "noteEventId", "sourceEventId", "recordedAt"]);
+  if (r.witnessVersion !== 1 || r.commandType !== "create-governed-note") refuse();
+  const a = retained(() => decodeRetainedEvidenceAuthority(r.authority));
+  if ((a.capabilityKind !== "root-session-handle" && a.capabilityKind !== "child-session-handle") || a.authorizationSessionId !== a.targetSessionId || a.presentingActorRole !== a.targetActorRole || a.presentingClientInstanceId !== a.targetClientInstanceId) refuse();
+  for (const g of [a.rootOwnerGeneration, a.authorizingOwnerGeneration, a.authorizingCapabilityGeneration, a.targetOwnerGeneration, a.targetCapabilityGeneration]) if (g !== null) decimal(g);
+  const b = binding(r.binding);
+  for (const k of ["projectId", "vaultId", "storeId", "workspaceId"] as const) if (b[k] !== a[k]) refuse();
+  if (b.sessionId !== a.targetSessionId || !Array.isArray(r.provenance) || r.provenance.length < 1 || r.provenance.length > 64) refuse();
+  let previous = "";
+  const provenance = r.provenance.map(value => {
+    const p = record(value, ["kind", "identity", "sourceEventId", "sourceEventPosition", "sourceEventHash", "sourceCommandId", "sourceIdempotencyKey"]);
+    const kind = enumeration(p.kind, ["source-event", "retained-evidence"] as const), identity = uuid(p.identity), sourceEventId = uuid(p.sourceEventId), key = `${kind}/${identity}`;
+    if (key <= previous || kind === "source-event" && identity !== sourceEventId) refuse(); previous = key;
+    return Object.freeze({ kind, identity, sourceEventId, sourceEventPosition: decimal(p.sourceEventPosition), sourceEventHash: hash(p.sourceEventHash), sourceCommandId: uuid(p.sourceCommandId), sourceIdempotencyKey: uuid(p.sourceIdempotencyKey) });
+  });
+  const noteEventId = uuid(r.noteEventId), sourceEventId = uuid(r.sourceEventId), recordId = uuid(r.recordId);
+  if (new Set([noteEventId, sourceEventId, recordId]).size !== 3) refuse();
+  const witness: C.GovernedNoteWitnessV1 = Object.freeze({ witnessVersion: 1, commandType: "create-governed-note", commandId: uuid(r.commandId), idempotencyKey: uuid(r.idempotencyKey), recordId, recordKind: enumeration(r.recordKind, ["session-log", "insight", "mistake", "adr"] as const), confidence: enumeration(r.confidence, ["high", "medium", "low", "guess"] as const), authority: a as C.GovernedNoteAuthoritySnapshotV1, binding: b, provenance: Object.freeze(provenance), policyId: nonempty(r.policyId), policyVersion: nonempty(r.policyVersion), originalCommitmentKeyRef: retained(() => decodeEvidenceKeyRef(r.originalCommitmentKeyRef)), originalInputCommitment: hash(r.originalInputCommitment), summaryContentHash: hash(r.summaryContentHash), noteEventId, sourceEventId, recordedAt: timestamp(r.recordedAt) });
+  return Object.freeze({ formatVersion: 1, witness });
+}
+
+/** Reserved markers are recognized before structural validation. Unrelated payloads stay opaque. */
+export function isGovernedNoteSourcePayload(value: unknown): boolean {
+  if (value === null || typeof value !== "object") return false;
+  const item = (value as { item?: unknown }).item;
+  if (item === null || typeof item !== "object") return false;
+  const i = item as { normalizedKey?: unknown; verificationMethod?: unknown };
+  return i.verificationMethod === "governed-note-unverified-v1" || typeof i.normalizedKey === "string" && i.normalizedKey.startsWith("governed-note/");
+}
+export function decodeGovernedNoteSourcePayloadV1(value: unknown) {
+  const r = record(snapshot(value, LIMITS.sourceEventBytes), ["sourceVersion", "binding", "item", "followUps", "artifacts", "entities", "aliases", "edges"]);
+  if (r.sourceVersion !== 2) refuse();
+  for (const key of ["followUps", "artifacts", "entities", "aliases", "edges"]) if (!Array.isArray(r[key]) || r[key].length !== 0) refuse();
+  const i = record(r.item, ["itemId", "normalizedKey", "status", "confidence", "verificationMethod", "validFrom", "validTo", "summary", "contentHash", "conflictGroupId", "supersedingItemId", "anchor"]);
+  const itemId = uuid(i.itemId), text = summary(i.summary), contentHash = hash(i.contentHash);
+  if (text !== text.normalize("NFC").trim() || i.status !== "candidate" || i.verificationMethod !== "governed-note-unverified-v1" || i.validTo !== null || i.conflictGroupId !== null || i.supersedingItemId !== null || i.anchor !== null || !["session-log", "insight", "mistake", "adr"].some(kind => i.normalizedKey === `governed-note/${kind}/${itemId}`) || contentHash !== createHash("sha256").update("project-memory/governed-note-summary/v1\n").update(canonicalJson(text)).digest("hex")) refuse();
+  return Object.freeze({ sourceVersion: 2 as const, binding: binding(r.binding), item: Object.freeze({ itemId, normalizedKey: string(i.normalizedKey), status: "candidate" as const, confidence: enumeration(i.confidence, ["high", "medium", "low", "guess"] as const), verificationMethod: "governed-note-unverified-v1", validFrom: timestamp(i.validFrom), validTo: null, summary: text, contentHash, conflictGroupId: null, supersedingItemId: null, anchor: null }), followUps: Object.freeze([]), artifacts: Object.freeze([]), entities: Object.freeze([]), aliases: Object.freeze([]), edges: Object.freeze([]) });
+}
 
 function refuse(code: GovernedNoteErrorCode = "GOVERNED_NOTE_INPUT_INVALID"): never { throw new GovernedNoteError(code); }
 /** Retained helper errors never expose their text or partial recovery details. */

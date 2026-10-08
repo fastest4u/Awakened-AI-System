@@ -1,5 +1,6 @@
 import type { ReadonlyJsonValue, StoredEvent } from "../contracts/event.js";
 import { assertRetainedStoredEvent } from "../privacy/retained-evidence-codec.js";
+import { assertStoredGovernedNoteCorrespondence } from "../governed-notes/repository.js";
 import {
   authenticateStoredEvent,
   type StoredEventChainCursor,
@@ -453,6 +454,7 @@ function openBoundedProjectionEventSnapshot(
             for (const row of rows.iterate({ $terminalEventPosition: terminalEventPosition })) {
               if (released) return integrity();
               const authenticated = authenticateStoredEvent(storedEvent(row), cursor);
+              assertStoredGovernedNoteCorrespondence(connection, authenticated.event);
               cursor = authenticated.nextCursor;
               if (!sameStore(authenticated.event, binding)) return integrity();
               if (sameBinding(authenticated.event, binding)) yield authenticated.event;

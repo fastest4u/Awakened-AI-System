@@ -1,4 +1,9 @@
 import { randomUUID } from "node:crypto";
+import { requireGovernedNoteCreateAuthority, deriveGovernedNoteBinding, type VerifiedGovernedNoteCreateAuthority } from "../governed-notes/authority.js";
+import type { GovernedNoteCommandV1, GovernedNoteCreatedPayloadV1, GovernedNoteStoredReceiptV1, GovernedNoteStoredResultV1 } from "../governed-notes/contracts.js";
+import { decodeGovernedNoteCommandV1, decodeGovernedNoteCreatedPayloadV1, decodeGovernedNoteStoredReceiptV1, isGovernedNoteSourcePayload } from "../governed-notes/codec.js";
+import { governedNoteCommandHash } from "../governed-notes/intent.js";
+import { isGovernedNoteEvent, serialGovernedNoteEvent, validateGovernedNotePair } from "../governed-notes/pair-validation.js";
 import { GENESIS_GLOBAL_HASH } from "./event-chain-constants.js";
 import { assertFreshStartConnectionAllowed } from "../fresh-start/fresh-start-admission.js";
 import { FreshStartError } from "../fresh-start/contracts.js";
@@ -354,8 +359,10 @@ function validateAppendCommand<T extends JsonValue>(
   recordedAt: string,
   randomId: () => string,
   retained = false,
+  governed = false,
 ): ValidatedAppendCommand {
   if (!isPlainRecord(command)) throw new EventStoreError("COMMAND_INVALID");
+  if (!governed && reservedNoteCommand(command)) throw new EventStoreError("COMMAND_INVALID");
   validateProjectContext(command);
   if (typeof command.commandId !== "string" || !UUID.test(command.commandId)) {
     throw new EventStoreError("COMMAND_ID_INVALID");
@@ -1470,6 +1477,23 @@ export interface RetainedEvidenceEventPlan { readonly eventId: string; readonly 
 const retainedPlans = new WeakMap<object, { readonly transaction: EventAppendTransaction; readonly authority: VerifiedRetainedEvidenceAuthority; readonly command: RetainEvidenceBatchCommandV1 }>();
 const retainedPrepared = new WeakMap<object, { readonly transaction: EventAppendTransaction; readonly plan: RetainedEvidenceEventPlan; readonly items: readonly EncryptedEvidenceItemV1[] }>();
 const retainedPlanned = new WeakMap<object, EventAppendTransaction>();
+declare const governedPlanBrand: unique symbol;
+export interface GovernedNoteEventPlan { readonly [governedPlanBrand]: true }
+type NotePlanState = { transaction: EventAppendTransaction; authority: VerifiedGovernedNoteCreateAuthority; command: GovernedNoteCommandV1; ids: Readonly<{ recordId: string; noteEventId: string; sourceEventId: string }>; prepared: boolean };
+const governedPlans = new WeakMap<object, NotePlanState>();
+const governedPrepared = new WeakMap<object, { transaction: EventAppendTransaction; plan: GovernedNoteEventPlan }>();
+const governedPlanned = new WeakMap<object, EventAppendTransaction>();
+const governedBatches = new WeakMap<object, object>();
+export function governedNotePlannedIds(plan: GovernedNoteEventPlan): Readonly<{ recordId: string; noteEventId: string; sourceEventId: string }> {
+  const state = governedPlans.get(plan); if (!state) throw new EventStoreError("COMMAND_INVALID"); return state.ids;
+}
+function reservedNoteCommand(command: AppendCommand<JsonValue>): boolean {
+  return command.commandType === "create-governed-note" || command.streamType === "governed-note" || typeof command.streamId === "string" && command.streamId.startsWith("governed-note/") || Array.isArray(command.events) && command.events.some(e => e.eventType === "GovernedNoteCreated" || e.eventType === "MemorySourceRecorded" && isGovernedNoteSourcePayload(e.payload));
+}
+function noteBudget(events: readonly StoredEvent[], result: GovernedNoteStoredResultV1): void {
+  validateGovernedNotePair(events, result);
+  if (Buffer.byteLength(canonicalJson({ events: events.map(serialGovernedNoteEvent), result }), "utf8") > MAX_CANONICAL_COMMAND_BYTES) throw new EventStoreError("COMMAND_TOO_LARGE");
+}
 
 type InternalPrepared<T extends JsonValue> = PreparedEventAppend<T> & {
   readonly [PREPARED]: ValidatedAppendCommand;
@@ -1502,6 +1526,49 @@ export class EventAppendTransaction {
     private readonly randomId: () => string = randomUUID,
     private readonly faultInjector: EventStoreFaultInjector = NO_EVENT_STORE_FAULTS,
   ) {}
+
+  planGovernedNoteIdentity(authority: VerifiedGovernedNoteCreateAuthority, input: GovernedNoteCommandV1): GovernedNoteEventPlan {
+    const command = decodeGovernedNoteCommandV1(input);
+    requireGovernedNoteCreateAuthority(this.connection, authority, command);
+    const values = [this.randomId(), this.randomId(), this.randomId()];
+    if (new Set(values).size !== 3 || values.some(id => !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(id))) throw new EventStoreError("EVENT_ID_INVALID");
+    const plan = Object.freeze(Object.create(null)) as GovernedNoteEventPlan;
+    governedPlans.set(plan, { transaction: this, authority, command, ids: Object.freeze({ recordId: values[0]!, noteEventId: values[1]!, sourceEventId: values[2]! }), prepared: false });
+    return plan;
+  }
+  prepareGovernedNote(plan: GovernedNoteEventPlan, input: AppendCommand<GovernedNoteStoredReceiptV1>, payloadInput: GovernedNoteCreatedPayloadV1): PreparedEventAppend<GovernedNoteStoredReceiptV1> {
+    const state = governedPlans.get(plan);
+    if (!state || state.transaction !== this || state.prepared) throw new EventStoreError("COMMAND_INVALID");
+    const admitted = requireGovernedNoteCreateAuthority(this.connection, state.authority, state.command), command = immutableSnapshot(input);
+    const payload = decodeGovernedNoteCreatedPayloadV1(payloadInput), w = payload.witness, b = command.context.binding;
+    if (canonical(w.authority) !== canonical(admitted) || canonical(w.binding) !== canonical(deriveGovernedNoteBinding(this.connection, command.context, admitted.targetSessionId)) || w.commandId !== state.command.commandId || w.idempotencyKey !== state.command.idempotencyKey || w.recordKind !== state.command.recordKind || w.confidence !== state.command.confidence || canonical(w.provenance.map(({ kind, identity }) => ({ kind, identity }))) !== canonical(state.command.provenance) || w.recordId !== state.ids.recordId || w.noteEventId !== state.ids.noteEventId || w.sourceEventId !== state.ids.sourceEventId || command.commandType !== "create-governed-note" || command.commandId !== w.commandId || command.idempotencyKey !== w.idempotencyKey || command.streamType !== "governed-note" || command.streamId !== `governed-note/${admitted.targetSessionId}/${w.recordId}` || command.expectedStreamVersion !== 0n || command.events.length !== 2 || command.outbox.length !== 0 || command.lifecycleIntentWitness !== undefined || canonical(command.events[0]!.payload) !== canonical(payload) || b.clientNamespace !== admitted.clientNamespace || b.actorRole !== admitted.presentingActorRole || b.clientInstanceId !== admitted.presentingClientInstanceId) throw new EventStoreError("COMMAND_INVALID");
+    if (!this.statements.matchesProjectIdentity(admitted.projectId, admitted.vaultId, admitted.storeId)) throw new EventStoreError("PROJECT_IDENTITY_MISMATCH");
+    let index = 0;
+    const ids = [state.ids.noteEventId, state.ids.sourceEventId];
+    const validated = immutableSnapshot(validateAppendCommand(command, w.recordedAt, () => ids[index++]!, false, true));
+    const preview = materializeEvents(command, validated, this.statements.readGlobalTail(), w.binding.branchScopeId ?? undefined);
+    const receipt = decodeGovernedNoteStoredReceiptV1(command.publicResponse);
+    noteBudget(preview, buildStoredCommandResponse({ ...receipt, terminalPosition: String(preview[1]!.globalPosition) }, preview));
+    const prepared = Object.freeze({ command, recordedAt: w.recordedAt, commandHash: governedNoteCommandHash(w), storedEventIds: Object.freeze(ids), [PREPARED]: validated }) as InternalPrepared<GovernedNoteStoredReceiptV1>;
+    state.prepared = true; governedPrepared.set(prepared, { transaction: this, plan }); return prepared;
+  }
+  discardGovernedNote(prepared: PreparedEventAppend<GovernedNoteStoredReceiptV1>): void {
+    const state = governedPrepared.get(prepared); if (!state || state.transaction !== this) return;
+    governedPrepared.delete(prepared); governedPlans.delete(state.plan);
+  }
+  private noteState(prepared: PreparedEventAppend<JsonValue>) {
+    const state = governedPrepared.get(prepared);
+    if (!state) { if (reservedNoteCommand(prepared.command)) throw new EventStoreError("COMMAND_INVALID"); return undefined; }
+    const plan = governedPlans.get(state.plan);
+    if (state.transaction !== this || !plan || plan.transaction !== this) throw new EventStoreError("COMMAND_INVALID");
+    requireGovernedNoteCreateAuthority(this.connection, plan.authority, plan.command); return state;
+  }
+  private refuseGovernedReplay(projectId: string, commandId: string, idempotencyKey: string): void {
+    const params = { $p: projectId, $c: commandId, $i: idempotencyKey };
+    if (this.connection.prepare("SELECT 1 FROM command_dedup WHERE project_id=$p AND (command_id=$c OR idempotency_key=$i) AND command_type='create-governed-note'").get(params)) throw new EventStoreError("IDEMPOTENCY_CONFLICT");
+    const rows = this.connection.prepare("SELECT stream_id,stream_type,event_type,payload_json FROM events WHERE project_id=$p AND (command_id=$c OR idempotency_key=$i)").all(params);
+    if (rows.some(r => isGovernedNoteEvent({ streamId: String(r.stream_id), streamType: String(r.stream_type), eventType: String(r.event_type), payloadJson: String(r.payload_json) }))) throw new EventStoreError("IDEMPOTENCY_CONFLICT");
+  }
 
   planRetainedEvidenceIdentity(authority: VerifiedRetainedEvidenceAuthority, command: RetainEvidenceBatchCommandV1): RetainedEvidenceEventPlan {
     requireRetainedEvidenceAuthority(this.connection, authority, command);
@@ -1574,6 +1641,7 @@ export class EventAppendTransaction {
     const validated = immutableSnapshot(
       validateAppendCommand(commandSnapshot, recordedAt, this.randomId),
     );
+    this.refuseGovernedReplay(commandSnapshot.context.binding.projectId, commandSnapshot.commandId, commandSnapshot.idempotencyKey);
     let matchesProjectIdentity: boolean;
     try {
       matchesProjectIdentity = this.statements.matchesProjectIdentity(
@@ -1609,6 +1677,8 @@ export class EventAppendTransaction {
     expectation: LifecycleReplayExpectation | null,
   ): EventAppendReplay<T> | null {
     const prepared = requirePrepared(preparedInput);
+    if (reservedNoteCommand(prepared.command)) throw new EventStoreError("COMMAND_INVALID");
+    this.refuseGovernedReplay(prepared.command.context.binding.projectId, prepared.command.commandId, prepared.command.idempotencyKey);
     const prior = this.statements.findDedup(
       prepared.command.context.binding.projectId,
       prepared.command.idempotencyKey,
@@ -1632,6 +1702,7 @@ export class EventAppendTransaction {
   }
 
   findLifecycleReplay<T extends JsonValue>(probe: LifecycleReplayProbe): EventAppendReplay<T> | null {
+    this.refuseGovernedReplay(probe.context.binding.projectId, probe.commandId, probe.idempotencyKey);
     if (!LOWER_UUID.test(probe.commandId)
       || probe.idempotencyKey.length === 0
       || !HASH.test(probe.authoritativeIntentHash)) {
@@ -1697,12 +1768,14 @@ export class EventAppendTransaction {
   ): PlannedEventAppend<T> {
     const prepared = requirePrepared(preparedInput);
     const { command } = prepared;
+    const governed = this.noteState(prepared);
+    if (!governed) this.refuseGovernedReplay(command.context.binding.projectId, command.commandId, command.idempotencyKey);
     const retained = retainedPrepared.get(prepared);
     if (command.commandType === "retain-evidence-batch" && (!retained || retained.transaction !== this)) throw new EventStoreError("COMMAND_INVALID");
     if (!retained && command.events.some(event => event.eventType === "EvidenceBatchRetained"
       || event.evidenceRefs.length !== 0 || event.evidenceDigests.length !== 0)) throw new EventStoreError("COMMAND_INVALID");
     const branchScopeId = command.context.workspace.kind === "git"
-      ? retained ? this.branchScopes.inspect(this.connection, command.context.binding.projectId, command.context.workspace) ?? undefined
+      ? retained || governed ? this.branchScopes.inspect(this.connection, command.context.binding.projectId, command.context.workspace) ?? undefined
         : this.branchScopes.resolveOrCreate(
           this.connection,
           command.context.binding.projectId,
@@ -1719,7 +1792,7 @@ export class EventAppendTransaction {
       command.streamId,
     );
     if (stream === undefined) {
-      if (!retained) this.statements.insertStream(
+      if (!retained && !governed) this.statements.insertStream(
         command.context.binding.projectId,
         command.streamId,
         command.streamType,
@@ -1754,9 +1827,10 @@ export class EventAppendTransaction {
         nextHead: { targetSessionId: payload.witness.targetSessionId, conversationId: payload.witness.conversationId,
           lastFrameId: last.frameId, lastOrdinal: last.ordinal, version: String(event.streamVersion) } });
     }
-    const publicResponse = retained ? { ...decodeRetainedEvidenceReceipt(command.publicResponse), eventPosition: String(events[0]!.globalPosition), finalStreamVersion: String(events[0]!.streamVersion) } : command.publicResponse;
+    const publicResponse = governed ? { ...decodeGovernedNoteStoredReceiptV1(command.publicResponse), terminalPosition: String(events[1]!.globalPosition) } : retained ? { ...decodeRetainedEvidenceReceipt(command.publicResponse), eventPosition: String(events[0]!.globalPosition), finalStreamVersion: String(events[0]!.streamVersion) } : command.publicResponse;
     const storedResponse = buildStoredCommandResponse(publicResponse, events) as StoredCommandResponse<T>;
     if (retained) decodeRetainedEvidenceStoredResult(storedResponse);
+    if (governed) noteBudget(events, storedResponse as unknown as GovernedNoteStoredResultV1);
     const planned = Object.freeze({
       plannedOnly: true as const,
       events: Object.freeze(events),
@@ -1765,6 +1839,7 @@ export class EventAppendTransaction {
       [PLANNED]: prepared,
     }) as InternalPlanned<T>;
     if (retained) retainedPlanned.set(planned, this);
+    if (governed) governedPlanned.set(planned, this);
     return planned;
   }
 
@@ -1773,12 +1848,21 @@ export class EventAppendTransaction {
     const planned = requirePlanned(plannedInput);
     const prepared = planned[PLANNED];
     const { command } = prepared;
+    const governed = this.noteState(prepared);
+    if (governed) {
+      if (governedPlanned.get(planned) !== this) throw new EventStoreError("COMMAND_INVALID");
+      noteBudget(planned.events, planned.storedResponse as unknown as GovernedNoteStoredResultV1);
+      if (planned.responseHash !== responseHash(planned.storedResponse) || prepared.commandHash !== governedNoteCommandHash(validateGovernedNotePair(planned.events, planned.storedResponse as unknown as GovernedNoteStoredResultV1))) throw new EventStoreError("COMMAND_INVALID");
+      const tail = this.statements.readGlobalTail();
+      if (planned.events[0]!.globalPosition !== tail.globalPosition + 1n || planned.events[0]!.previousGlobalHash !== tail.eventHash) throw new EventStoreError("EVENT_CONFLICT");
+    } else if (planned.events.some(isGovernedNoteEvent)) throw new EventStoreError("COMMAND_INVALID");
+    if (!governed) this.refuseGovernedReplay(command.context.binding.projectId, command.commandId, command.idempotencyKey);
     const retained = retainedPrepared.get(prepared);
     if (command.commandType === "retain-evidence-batch" && (!retained || retainedPlanned.get(planned) !== this)) throw new EventStoreError("COMMAND_INVALID");
     if (!retained && planned.events.some(event => event.eventType === "EvidenceBatchRetained"
       || event.evidenceRefs.length !== 0 || event.evidenceDigests.length !== 0)) throw new EventStoreError("COMMAND_INVALID");
-    if (retained) {
-      if (retained.transaction !== this) throw new EventStoreError("COMMAND_INVALID");
+    if (retained || governed) {
+      if (retained && retained.transaction !== this) throw new EventStoreError("COMMAND_INVALID");
       this.maintenance.assertAppendAllowed(this.connection);
       const stream = this.statements.readStream(command.context.binding.projectId, command.streamId);
       if (stream === undefined) this.statements.insertStream(command.context.binding.projectId, command.streamId, command.streamType, prepared.recordedAt);
@@ -1829,11 +1913,13 @@ export class EventAppendTransaction {
       planned.events.map((event) => immutableSnapshot(event)),
     );
     const committedResponse = immutableSnapshot(planned.storedResponse);
-    return Object.freeze({
+    const batch = Object.freeze({
       events: committedEvents,
       storedResponse: committedResponse,
       responseHash: planned.responseHash,
     });
+    if (governed) { governedBatches.set(batch, prepared); governedPlanned.delete(planned); }
+    return batch;
   }
 
   insertDedup<T extends JsonValue>(
@@ -1843,6 +1929,15 @@ export class EventAppendTransaction {
   ): void {
     const prepared = requirePrepared(preparedInput);
     const validated = prepared[PREPARED];
+    const governed = this.noteState(prepared);
+    if (governed) {
+      if (governedBatches.get(batch) !== prepared || authorization !== null) throw new EventStoreError("COMMAND_INVALID");
+      noteBudget(batch.events, batch.storedResponse as unknown as GovernedNoteStoredResultV1);
+      if (batch.responseHash !== responseHash(batch.storedResponse) || prepared.commandHash !== governedNoteCommandHash(validateGovernedNotePair(batch.events, batch.storedResponse as unknown as GovernedNoteStoredResultV1))) throw new EventStoreError("COMMAND_INVALID");
+    } else {
+      if (batch.events.some(isGovernedNoteEvent)) throw new EventStoreError("COMMAND_INVALID");
+      this.refuseGovernedReplay(prepared.command.context.binding.projectId, prepared.command.commandId, prepared.command.idempotencyKey);
+    }
     const retained = retainedPrepared.get(prepared);
     if (prepared.command.commandType === "retain-evidence-batch" && (!retained || retained.transaction !== this)) throw new EventStoreError("COMMAND_INVALID");
     if (!retained && batch.events.some(event => event.eventType === "EvidenceBatchRetained"
@@ -1948,6 +2043,7 @@ export class EventAppendTransaction {
       prepared.recordedAt,
       authorization,
     );
+    if (governed) governedBatches.delete(batch);
   }
 
   result<T extends JsonValue>(batch: EventAppendBatch<T>, deduplicated = false): AppendResult<T> {
