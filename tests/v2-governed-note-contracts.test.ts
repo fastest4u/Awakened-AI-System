@@ -124,6 +124,77 @@ test("stored and recovery results are exact owned JSON receipts with positive de
   }
   assert.throws(() => codec.decodeGovernedNoteRecoveryResultV1({ ...committed, receipt: { ...receipt(), replay: false } }), invalid);
 });
+test("receipt stored result and committed recovery preserve existing projection scope domains", () => {
+  const patches: Record<string, unknown>[] = [
+    { projectId: "a".repeat(64) }, { vaultId: "c".repeat(64) }, { storeId: "d".repeat(64) },
+    ...[1, 2, 3, 5].flatMap(version => [
+      { branchScopeId: `00000000-0000-${version}000-8000-000000000028` },
+      { sessionId: `00000000-0000-${version}000-8000-000000000029` },
+    ]),
+    { projectId: "a".repeat(64), vaultId: "c".repeat(64), storeId: "d".repeat(64), branchScopeId: "00000000-0000-5000-8000-000000000028", branchRef: "existing-branch", sessionId: "00000000-0000-1000-8000-000000000029" },
+  ];
+  for (const patch of patches) {
+    const value = { ...receipt(), scope: { ...scope, ...patch } };
+    const decoded = codec.decodeGovernedNoteStoredReceiptV1(value);
+    assert.deepEqual(decoded, value); assert.notEqual(decoded.scope, value.scope); assert.ok(Object.isFrozen(decoded.scope));
+    const stored = { eventIds: [id(8), id(9)], firstGlobalPosition: "1", lastGlobalPosition: "2", finalStreamVersion: "2", response: value };
+    assert.deepEqual(codec.decodeGovernedNoteStoredResultV1(stored), stored);
+    const committed = { resultVersion: 1, operation: "recover-governed-note-result", outcome: "committed", receipt: { ...value, replay: true } };
+    assert.deepEqual(codec.decodeGovernedNoteRecoveryResultV1(committed), committed);
+  }
+});
+test("receipt scope still rejects malformed identities and null target session", () => {
+  const patches: Record<string, unknown>[] = [];
+  for (const field of ["projectId", "vaultId", "storeId"]) for (const value of ["A".repeat(64), "a".repeat(63), "g".repeat(64), id(20).replace("4000", "5000"), null]) patches.push({ [field]: value });
+  for (const value of [id(20), "B".repeat(64), "b".repeat(63), null]) patches.push({ workspaceId: value });
+  for (const field of ["branchScopeId", "sessionId"]) for (const value of ["a".repeat(64), id(0xab).toUpperCase(), id(20).replace("4000", "6000"), "malformed"]) patches.push({ [field]: value });
+  patches.push({ sessionId: null });
+  for (const patch of patches) {
+    const value = { ...receipt(), scope: { ...scope, ...patch } };
+    assert.throws(() => codec.decodeGovernedNoteStoredReceiptV1(value), invalid);
+    assert.throws(() => codec.decodeGovernedNoteStoredResultV1({ eventIds: [id(8), id(9)], firstGlobalPosition: "1", lastGlobalPosition: "2", finalStreamVersion: "2", response: value }), invalid);
+    assert.throws(() => codec.decodeGovernedNoteRecoveryResultV1({ resultVersion: 1, operation: "recover-governed-note-result", outcome: "committed", receipt: { ...value, replay: true } }), invalid);
+  }
+});
+test("prepared create and recovery preserve equal existing non-v4 session identities", () => {
+  for (const version of [1, 2, 3, 5]) {
+    const sessionId = `00000000-0000-${version}000-8000-000000000029`;
+    const create = { command: command(), authorization: { ...authorization(), authoritySessionId: sessionId, targetSessionId: sessionId } } as unknown as PreparedGovernedNoteCreateV1;
+    assert.deepEqual(codec.decodePreparedGovernedNoteCreateV1({ command: canonicalJson(create.command), authorization: create.authorization }), create);
+    assert.deepEqual(codec.decodePreparedGovernedNoteCreateV1(codec.encodePreparedGovernedNoteCreateV1(create)), create);
+    const recover = { request: recovery(), authorization: { kind: "bounded-operation", authoritySessionId: sessionId, targetSessionId: sessionId, proof: proof("bounded-operation"), audience } } as unknown as PreparedGovernedNoteRecoveryV1;
+    assert.deepEqual(codec.decodePreparedGovernedNoteRecoveryV1({ request: canonicalJson(recover.request), authorization: recover.authorization }), recover);
+    assert.deepEqual(codec.decodePreparedGovernedNoteRecoveryV1(codec.encodePreparedGovernedNoteRecoveryV1(recover)), recover);
+  }
+});
+test("prepared authorization still refuses malformed or mismatched existing sessions", () => {
+  const sessions = [null, "a".repeat(64), id(0xab).toUpperCase(), id(6).replace("4000", "6000"), "malformed"];
+  const patches = sessions.map(value => ({ authoritySessionId: value, targetSessionId: value }));
+  patches.push({ authoritySessionId: "00000000-0000-5000-8000-000000000029", targetSessionId: "00000000-0000-1000-8000-000000000030" });
+  for (const patch of patches) {
+    const create = { command: command(), authorization: { ...authorization(), ...patch } } as unknown as PreparedGovernedNoteCreateV1;
+    assert.throws(() => codec.encodePreparedGovernedNoteCreateV1(create), invalid);
+    assert.throws(() => codec.decodePreparedGovernedNoteCreateV1({ command: canonicalJson(create.command), authorization: create.authorization }), invalid);
+    const recover = { request: recovery(), authorization: { kind: "bounded-operation", ...patch, proof: proof("bounded-operation"), audience } } as unknown as PreparedGovernedNoteRecoveryV1;
+    assert.throws(() => codec.encodePreparedGovernedNoteRecoveryV1(recover), invalid);
+    assert.throws(() => codec.decodePreparedGovernedNoteRecoveryV1({ request: canonicalJson(recover.request), authorization: recover.authorization }), invalid);
+  }
+});
+test("new governed command record event proof and referenced IDs remain UUIDv4", () => {
+  const nonV4 = "00000000-0000-5000-8000-000000000031";
+  for (const field of ["commandId", "idempotencyKey"]) assert.throws(() => codec.decodeGovernedNoteCommandV1({ ...command(), [field]: nonV4 }), invalid);
+  for (const field of ["operationId", "requestId", "commandId", "idempotencyKey"]) assert.throws(() => codec.decodeGovernedNoteRecoveryV1({ ...recovery(), [field]: nonV4 }), invalid);
+  for (const kind of ["source-event", "retained-evidence"]) assert.throws(() => codec.decodeGovernedNoteCommandV1({ ...command(), provenance: [{ kind, identity: nonV4 }] }), invalid);
+  for (const patch of [{ commandId: nonV4 }, { idempotencyKey: nonV4 }, { recordId: nonV4 }, { sourceEventIds: [nonV4, id(9)] }]) assert.throws(() => codec.decodeGovernedNoteStoredReceiptV1({ ...receipt(), ...patch }), invalid);
+  assert.throws(() => codec.decodeGovernedNoteStoredResultV1({ eventIds: [nonV4, id(9)], firstGlobalPosition: "1", lastGlobalPosition: "2", finalStreamVersion: "2", response: receipt() }), invalid);
+  const sessionId = "00000000-0000-1000-8000-000000000029";
+  const create = { command: command(), authorization: { ...authorization(), authoritySessionId: sessionId, targetSessionId: sessionId, proof: { ...proof(), proofNonce: nonV4 } } } as unknown as PreparedGovernedNoteCreateV1;
+  assert.throws(() => codec.encodePreparedGovernedNoteCreateV1(create), invalid);
+  assert.throws(() => codec.decodePreparedGovernedNoteCreateV1({ command: canonicalJson(create.command), authorization: create.authorization }), invalid);
+  const recover = { request: recovery(), authorization: { kind: "bounded-operation", authoritySessionId: sessionId, targetSessionId: sessionId, proof: { ...proof("bounded-operation"), proofNonce: nonV4 }, audience } } as unknown as PreparedGovernedNoteRecoveryV1;
+  assert.throws(() => codec.encodePreparedGovernedNoteRecoveryV1(recover), invalid);
+  assert.throws(() => codec.decodePreparedGovernedNoteRecoveryV1({ request: canonicalJson(recover.request), authorization: recover.authorization }), invalid);
+});
 test("timing supported endpoints are values not elapsed waits", () => {
   const max = { ...timing, requestTimeoutMs: 2147483647, closeTimeoutMs: 2147483647, appendRetryDeadlineMs: 2147483647, recoveryProofLifetimeMs: 120000 };
   assert.equal(codec.validateGovernedNoteTimingV1(max).requestTimeoutMs, 2147483647); assert.equal(codec.validateGovernedNoteTimingV1(max).recoveryProofLifetimeMs, 120000);

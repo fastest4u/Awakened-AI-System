@@ -5,7 +5,7 @@ import { boundedRetainedJson, retainedDataEntries, retainedExactRecord, retained
 import { parseCanonicalTimestamp, parseCanonicalUuid, parseUnsignedDecimal, type SessionId } from "../lifecycle/contracts/identifiers.js";
 import type { BoundedOperationAuthorization, CapabilityProofV1, LifecycleAudience } from "../lifecycle/contracts/commands.js";
 import type { JsonValue } from "../contracts/event.js";
-import type { ProjectBinding } from "../projections/contracts.js";
+import { isProjectionProjectStoreIdentity, isProjectionWorkspaceIdentity, type ProjectBinding } from "../projections/contracts.js";
 import { canonicalJson } from "../serialization/canonical-json.js";
 
 function refuse(code: GovernedNoteErrorCode = "GOVERNED_NOTE_INPUT_INVALID"): never { throw new GovernedNoteError(code); }
@@ -19,8 +19,15 @@ function record(value: unknown, fields: readonly string[]): Record<string, unkno
 function string(value: unknown, maximum: number = LIMITS.scalarBytes): string { retained(() => retainedStringMetrics(value, maximum)); return value as string; }
 function uuid(value: unknown): string {
   if (typeof value !== "string" || value.length !== 36 || value[14] !== "4") refuse();
+  return canonicalUuid(value);
+}
+/** Existing branch/session identities preserve the lifecycle UUID version domain. */
+function canonicalUuid(value: unknown): string {
   try { return parseCanonicalUuid(value, "governed-note"); } catch { return refuse(); }
 }
+function sessionId(value: unknown): SessionId { return canonicalUuid(value) as SessionId; }
+function projectStoreIdentity(value: unknown): string { if (!isProjectionProjectStoreIdentity(value)) refuse(); return value; }
+function workspaceIdentity(value: unknown): string { if (!isProjectionWorkspaceIdentity(value)) refuse(); return value; }
 function decimal(value: unknown): string {
   try { const parsed = parseUnsignedDecimal(value, "governed-note"); if (parsed < 1n || parsed > 9223372036854775807n) refuse(); return value as string; } catch { return refuse(); }
 }
@@ -83,13 +90,13 @@ function proof(value: unknown, target: CapabilityProofV1["target"]): CapabilityP
 }
 function createAuthorization(value: unknown): C.GovernedNoteProtectedAuthorizationV1 {
   const r = record(snapshot(value, LIMITS.authorizationBytes), ["kind", "authoritySessionId", "targetSessionId", "proof", "approval", "childBindingGrant"]);
-  const authoritySessionId = uuid(r.authoritySessionId) as SessionId; const targetSessionId = uuid(r.targetSessionId) as SessionId;
+  const authoritySessionId = sessionId(r.authoritySessionId); const targetSessionId = sessionId(r.targetSessionId);
   if (r.kind !== "protected" || authoritySessionId !== targetSessionId || r.approval !== null || r.childBindingGrant !== null) refuse();
   return Object.freeze({ kind: "protected", authoritySessionId, targetSessionId, proof: proof(r.proof, "semantic-command"), approval: null, childBindingGrant: null });
 }
 function recoveryAuthorization(value: unknown): BoundedOperationAuthorization {
   const r = record(snapshot(value, LIMITS.authorizationBytes), ["kind", "authoritySessionId", "targetSessionId", "proof", "audience"]);
-  const authoritySessionId = uuid(r.authoritySessionId) as SessionId; const targetSessionId = uuid(r.targetSessionId) as SessionId;
+  const authoritySessionId = sessionId(r.authoritySessionId); const targetSessionId = sessionId(r.targetSessionId);
   if (r.kind !== "bounded-operation" || authoritySessionId !== targetSessionId) refuse();
   const a = record(r.audience, ["presentingActorRole", "presentingClientInstanceId", "targetActorRole", "targetClientInstanceId"]);
   const actor = (value: unknown) => enumeration(value, ["primary", "maintenance", "untrusted"] as const);
@@ -138,8 +145,15 @@ export function decodeGovernedNoteErrorV1(value: unknown, ids: C.GovernedNoteRec
 }
 function binding(value: unknown): C.GovernedNoteStoredReceiptV1["scope"] {
   const r = record(value, ["projectId", "vaultId", "storeId", "workspaceId", "branchScopeId", "branchRef", "sessionId"]);
-  const result = { projectId: uuid(r.projectId), vaultId: uuid(r.vaultId), storeId: uuid(r.storeId), workspaceId: hash(r.workspaceId), branchScopeId: r.branchScopeId === null ? null : uuid(r.branchScopeId), branchRef: r.branchRef === null ? null : nonempty(r.branchRef, 1024), sessionId: uuid(r.sessionId) };
-  return Object.freeze(result) as { [K in keyof ProjectBinding]: ProjectBinding[K] };
+  const result: C.GovernedNoteStoredReceiptV1["scope"] = {
+    projectId: projectStoreIdentity(r.projectId) as ProjectBinding["projectId"],
+    vaultId: projectStoreIdentity(r.vaultId) as ProjectBinding["vaultId"],
+    storeId: projectStoreIdentity(r.storeId) as ProjectBinding["storeId"],
+    workspaceId: workspaceIdentity(r.workspaceId) as ProjectBinding["workspaceId"],
+    branchScopeId: r.branchScopeId === null ? null : canonicalUuid(r.branchScopeId) as ProjectBinding["branchScopeId"],
+    branchRef: r.branchRef === null ? null : nonempty(r.branchRef, 1024), sessionId: sessionId(r.sessionId),
+  };
+  return Object.freeze(result);
 }
 const RECEIPT_FIELDS = ["resultVersion", "operation", "commandId", "idempotencyKey", "recordId", "recordKind", "status", "verificationStatus", "scope", "sourceEventIds", "terminalPosition"];
 function pair(value: unknown): [string, string] {
