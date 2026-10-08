@@ -266,9 +266,11 @@ assert.equal(ownerAbsent, cleanupPositive);
 
 **Files:** Create scripts/run-v2-native-read-workflows.js and tests/v2-native-workflow-gate.test.ts; modify package.json only to add test:v2-native-read-workflows="node scripts/run-v2-native-read-workflows.js". Create docs/superpowers/evidence/2026-10-07-v2-native-read-workflows.md and update this plan's accepted task ledger after reviews. Existing runner/native33/metadata20 scripts and test lists remain unchanged.
 
+**Gate-budget amendment approved on 2026-10-08:** The human replied `อนุมัติ` to raising only this workflow gate's default/maximum from 1,500,000 ms (25 minutes) to **2,100,000 ms (35 minutes)**. The actual old-cap run at `963a1e88f7167edf58791b41c1e146a47b7686ca` expired with native exit124 at stage26 (`v2-internal-verified-read-gate`), after25 successful stages/414 settled passes; interrupted-stage counts are unknown, eight later stages were unlaunched, cleanup was complete/Windows Job-active-zero, and qualification count was zero. Preserve the failed attempt; Task6 acceptance remains pending. Implement the mechanical amendment in exactly the runner, workflow-gate test, this plan and the approved spec; preserve one original clock, exact29/order/34stages, all30 existing test controls/assertions,5000ms gate cleanup and unchanged product/other-profile contracts. Add two focused early native-exit17 default/maximum cases, bringing the workflow-gate inventory to32 tests. Verify current compiler plus only those two named budget cases and the existing no-launch lock/invalid-cap/argv/old-profile test for RED/GREEN. After immutable scoped review and a clean four-owner commit, root runs the one required full exact29/34 gate with fresh build/compile. No other heavy suites or build are part of this amendment's focused checks.
+
 **Interfaces:**
-- Export runNativeReadWorkflowsGate({root=repository,timeoutMs=1500000,signal}={}):Promise<number> from new runner for owned-root tests; no caller-selected stages/files/profiles through CLI.
-- Reuse runFixedStages from run-v2-internal-verified-read.js with profile native-read-workflows, gate v2-native-read-workflows, maximumMs1500000, common exclusive lock/Windows Job closure. CLI rejects every argument, owns SIGINT/SIGTERM abort and safe failure code NATIVE_READ_WORKFLOWS_GATE_FAILED.
+- Export runNativeReadWorkflowsGate({root=repository,timeoutMs=2100000,signal}={}):Promise<number> from new runner for owned-root tests; no caller-selected stages/files/profiles through CLI.
+- Reuse runFixedStages from run-v2-internal-verified-read.js with profile native-read-workflows, gate v2-native-read-workflows, maximumMs2100000, common exclusive lock/Windows Job closure. CLI rejects every argument, owns SIGINT/SIGTERM abort and safe failure code NATIVE_READ_WORKFLOWS_GATE_FAILED.
 - Fixed stages: runtime (scripts/check-runtime.js --json), typecheck (node_modules/typescript/bin/tsc --noEmit), build (scripts/build.js), compile (tsc -p tsconfig.test.json), each exact ordered test file below, then smoke (scripts/smoke-v2-fresh-start.js). One build/compile; **34 stages:4 setup+29 tests+smoke**.
 
 Exact 29 test names (append .test.js under dist-test/tests):
@@ -305,7 +307,7 @@ retrieval-ranking
 ci-lifecycle-gates
 ```
 
-- [ ] **Step 1: Write failing runner tests** `workflow_gate_exact_inventory_and_single_build`, `workflow_gate_preserves_other_profiles_and_lock`, `workflow_gate_refuses_incoherent_receipts_and_identity_drift`. Pin exact29/order/stages34/max1500000/argv refusal/old native33+metadata20 unchanged. Fixed synthetic stage-root tests cover failure/cancel/timeout/Job-active-zero/drain/output lock uncertainty and non-Windows fail-closed before launch; preserve existing Windows-only skip declarations, introduce none into product behavior tests.
+- [ ] **Step 1: Write failing runner tests** `workflow_gate_exact_inventory_and_single_build`, `workflow_gate_preserves_other_profiles_and_lock`, `workflow_gate_refuses_incoherent_receipts_and_identity_drift`. Pin exact29/order/stages34/max2100000/argv refusal/old native33+metadata20 unchanged. Fixed synthetic stage-root tests cover failure/cancel/timeout/Job-active-zero/drain/output lock uncertainty and non-Windows fail-closed before launch; preserve existing Windows-only skip declarations, introduce none into product behavior tests.
 
 Assertion anchors (test-local variables come from the named fixture/observer setup):
 

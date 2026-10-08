@@ -141,14 +141,14 @@ function compiledIdentity(root) {
 }
 
 /** Owned-root test seam. The command line cannot select roots, stages or providers. */
-export async function runNativeReadWorkflowsGate({ root = repository, timeoutMs = 1500000, signal } = {}) {
+export async function runNativeReadWorkflowsGate({ root = repository, timeoutMs = 2100000, signal } = {}) {
   const deadline = performance.now() + timeoutMs;
   const assertWithinBound = () => {
     if (signal?.aborted || performance.now() >= deadline) throw new Error(failure);
   };
   let identity, measurement, compiledMeasurement, qualification;
   const streams = new Map(), receipts = [];
-  const result = await runFixedStages({ root, timeoutMs, maximumMs: 1500000, signal,
+  const result = await runFixedStages({ root, timeoutMs, maximumMs: 2100000, signal,
     profile: 'native-read-workflows', gate: 'v2-native-read-workflows', failure, forwardOutput: false,
     stages: currentRoot => [['runtime', [join(currentRoot, 'scripts/check-runtime.js'), '--json']],
       ['typecheck', [join(currentRoot, 'node_modules/typescript/bin/tsc'), '--noEmit']],

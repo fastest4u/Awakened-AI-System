@@ -269,7 +269,7 @@ test('workflow_gate_exact_inventory_and_single_build', native, async (t) => {
         assert.equal(testStageReceipts.length, 29);
         assert.equal(stageReceipts.filter(e => e.stage === 'build').length, 1);
         assert.equal(stageReceipts.filter(e => e.stage === 'compile').length, 1);
-        assert.ok(stageReceipts.every(e => e.cleanup === 'complete' && e.closure === 'windows-job-active-zero' && e.nativeCode === 0 && e.totalMs === 1500000 && e.profile === 'native-read-workflows'));
+        assert.ok(stageReceipts.every(e => e.cleanup === 'complete' && e.closure === 'windows-job-active-zero' && e.nativeCode === 0 && e.totalMs === 2100000 && e.profile === 'native-read-workflows'));
         assert.ok(testStageReceipts.every(e => e.counts.tests === 1 && e.counts.pass === 1 && e.counts.todo === 0));
         assert.equal(f.events.filter(e => e.observation === 'qualification').length, 1);
         t.diagnostic(`complete JSON emit capture ${JSON.stringify(f.capture)}`);
@@ -278,6 +278,28 @@ test('workflow_gate_exact_inventory_and_single_build', native, async (t) => {
         f.cleanup();
     }
 });
+for (const mode of ['default', 'maximum'] as const)
+    test(`workflow_gate_budget_${mode}_owned_closure`, native, async () => {
+        const run = await gate(), f = fixture();
+        try {
+            f.put('scripts/check-runtime.js', "import{appendFileSync}from'node:fs';appendFileSync('trace','runtime\\n');process.exit(17);");
+            f.commit();
+            assert.equal(await f.run(run, mode === 'default' ? {} : { timeoutMs: 2100000 }), 17);
+            assert.deepEqual(f.trace(), ['runtime']);
+            const stages = f.events.filter(e => e.stage);
+            assert.equal(stages.length, 1);
+            assert.equal(stages[0].stage, 'runtime');
+            assert.equal(stages[0].totalMs, 2100000);
+            assert.equal(stages[0].nativeCode, 17);
+            assert.equal(stages[0].cleanup, 'complete');
+            assert.equal(stages[0].closure, 'windows-job-active-zero');
+            assert.equal(existsSync(join(f.root, '.fresh-start-foundation.lock')), false);
+            assert.equal(f.events.some(e => e.observation === 'qualification'), false);
+        }
+        finally {
+            f.cleanup();
+        }
+    });
 test('workflow_gate_preserves_other_profiles_and_lock', async () => {
     const run = await gate(), f = fixture();
     try {
@@ -290,11 +312,14 @@ test('workflow_gate_preserves_other_profiles_and_lock', async () => {
         assert.equal(readFileSync(join(f.root, '.fresh-start-foundation.lock'), 'utf8'), 'foreign-owner');
         rmSync(join(f.root, '.fresh-start-foundation.lock')); // Positively identified marker created by this test; no launch.
         for (const timeoutMs of [
-            0, -1, 1500001, 1.5, NaN
+            0, -1, 2100001, 1.5, NaN
         ])
             assert.equal(await f.run(run, {
                 timeoutMs
             }), 1);
+        assert.deepEqual(f.trace(), []);
+        assert.equal(f.events.filter(e => e.stage).length, 0);
+        assert.equal(existsSync(join(f.root, '.fresh-start-foundation.lock')), false);
         const c = new AbortController();
         c.abort();
         assert.equal(await f.run(run, {
