@@ -44,6 +44,23 @@ export async function makeGovernedNoteDomainFixture() {
       finally { material.handle.destroy(); if (material.kind === "root") material.resumeToken?.destroy(); }
     };
     return { connection, rootContext, childContext, capabilities, provider, clock, policy, verifier, sources, retained, scope, mint,
+      /** Genuine retained-command sources, including direct child authority and conversation continuation. */
+      retainSource(options: { child?: boolean; rootOnChild?: boolean; conversationId?: string; ordinal?: string; previousFrameId?: string; frames?: number } = {}) {
+        const child = options.child || options.rootOnChild;
+        const authorizer = options.rootOnChild ? retained.rootAuthority : child ? retained.childAuthority : retained.rootAuthority;
+        let previous = options.previousFrameId ?? null;
+        const frames = Array.from({ length: options.frames ?? 1 }, (_, index) => {
+          const frameId = randomUUID(), frame = { frameId, ordinal: String(BigInt(options.ordinal ?? "0") + BigInt(index)), role: "user", category: "user-message", occurredAt: FRESH_NOW,
+            mediaType: "text/plain; charset=utf-8", content: "Retained private input fixture_opaque", previousFrameId: previous, toolCorrelationId: null, artifactHashes: [] };
+          previous = frameId; return frame;
+        });
+        const invocation = retained.invocation({ version: 1, commandType: "retain-evidence-batch", commandId: randomUUID(), idempotencyKey: randomUUID(),
+          targetSessionId: child ? retained.childAuthority.sessionId : retained.rootAuthority.sessionId, conversationId: options.conversationId ?? randomUUID(), frames }, authorizer);
+        try {
+          const result = retained.service().retain(invocation);
+          return { result, command: invocation.input.command, event: retained.repository.findPrior(invocation.input.command.commandId, invocation.input.command.idempotencyKey)!.event };
+        } finally { invocation.input.canonicalOriginalBytes.fill(0); }
+      },
       command(overrides: Partial<GovernedNoteCommandV1> = {}): GovernedNoteCommandV1 {
         return decodeGovernedNoteCommandV1({ version: 1, operation: "create-governed-note", commandId: randomUUID(), idempotencyKey: randomUUID(), recordKind: "insight", summary: " Raw e\u0301 summary ", confidence: "low", provenance: sources.root.map(({ kind, identity }) => ({ kind, identity })), ...overrides });
       },
