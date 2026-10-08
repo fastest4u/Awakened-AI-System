@@ -1,6 +1,6 @@
 import { types } from "node:util";
 import { decodePreparedGovernedNoteCreateV1, decodePreparedGovernedNoteRecoveryV1, encodePreparedGovernedNoteCreateV1, encodePreparedGovernedNoteRecoveryV1 } from "../governed-notes/codec.js";
-import type { PreparedGovernedNoteCreateV1, PreparedGovernedNoteRecoveryV1, GovernedNoteStoredReceiptV1, GovernedNoteRecoveryResultV1, GovernedNoteRecoveryIdsV1 } from "../governed-notes/contracts.js";
+import type { PreparedGovernedNoteCreateV1, PreparedGovernedNoteRecoveryV1, GovernedNoteStoredReceiptV1, GovernedNoteRecoveryResultV1, GovernedNoteRecoveryIdsV1, GovernedNoteCloseObservationV1 } from "../governed-notes/contracts.js";
 import { assertGovernedNoteEnvelopeSize, isGovernedNoteRequest, sanitizeGovernedNoteError } from "../governed-notes/worker-protocol.js";
 import { randomUUID } from "node:crypto";
 import type { RetainedEvidenceReceiptV1 } from "../privacy/evidence-contracts.js";
@@ -545,6 +545,10 @@ export class ProjectStoreExecutor {
   #opened: WorkerOpenResult | null = null;
   #sequence = 0;
   #closePromise: Promise<void> | null = null;
+  readonly #governedOwnerId: string;
+  #governedClosePromise: Promise<GovernedNoteCloseObservationV1> | null = null;
+  #governedCloseDisqualified = false;
+  #normalCloseCompleted = false;
   #quiescePromise: Promise<void> | null = null;
   #openPromise: Promise<WorkerOpenResult> | null = null;
   #terminationPromise: Promise<void> | null = null;
@@ -562,6 +566,7 @@ export class ProjectStoreExecutor {
     dependencies: Partial<ProjectStoreExecutorDependencies> = {},
   ) {
     validateOptions(options);
+    this.#governedOwnerId = randomUUID();
     this.#options = Object.freeze({ ...options, ...(options.freshStart === undefined ? {} : { freshStart: snapshotFreshStartContext(options.freshStart) }) });
     this.#dependencies = {
       workerFactory: dependencies.workerFactory ?? defaultWorkerFactory,
@@ -887,6 +892,7 @@ export class ProjectStoreExecutor {
   }
 
   quiesce(lease: MaintenanceLease): Promise<void> {
+    this.#governedCloseDisqualified = true;
     let encodedLease: ReturnType<typeof encodeMaintenanceLeaseWire>;
     let expectedLease: MaintenanceLease;
     try {
@@ -1026,6 +1032,7 @@ export class ProjectStoreExecutor {
       ownerError = confirmationError(error);
     }
     if (ownerError !== null) {
+      this.#governedCloseDisqualified = true;
       this.#state = "poisoned";
       this.#terminalError = ownerError;
       this.rejectAll(ownerError);
@@ -1049,6 +1056,40 @@ export class ProjectStoreExecutor {
     this.#state = "closing";
     this.#closePromise = this.closeOwned();
     return this.#closePromise;
+  }
+
+  closeForGovernedNoteController(): Promise<GovernedNoteCloseObservationV1> {
+    this.#governedClosePromise ??= this.observeGovernedNoteClose();
+    return this.#governedClosePromise;
+  }
+
+  private async observeGovernedNoteClose(): Promise<GovernedNoteCloseObservationV1> {
+    let failed = false;
+    try {
+      await this.close();
+    } catch {
+      this.#governedCloseDisqualified = true;
+      failed = true;
+    }
+    // Generic close can resolve after an expected exit while termination still
+    // waits. Join existing operations even after failure; never start a second
+    // lifecycle operation or impose another termination deadline.
+    for (const operation of [this.#quiescePromise, this.#observedClosurePromise, this.#terminationPromise]) {
+      try {
+        await operation;
+      } catch {
+        this.#governedCloseDisqualified = true;
+        failed = true;
+      }
+    }
+    if (failed || (this.#observedClosurePromise !== null && this.#state === "poisoned")) {
+      throw new ProjectStoreWorkerError("WORKER_UNAVAILABLE");
+    }
+    return Object.freeze({
+      disposition: this.#normalCloseCompleted && !this.#governedCloseDisqualified
+        ? "graceful-confirmed" : "ownership-uncertain",
+      ownerId: this.#governedOwnerId,
+    });
   }
 
   async invalidateForRebind(next: ProjectContext): Promise<void> {
@@ -1244,6 +1285,7 @@ export class ProjectStoreExecutor {
       this.poisonInBackground(new ProjectStoreWorkerError("WORKER_PROTOCOL_ERROR"));
       return;
     }
+    this.#governedCloseDisqualified = true;
     this.#quiescedNotification = notification;
     this.#expectedTermination = true;
   }
@@ -1252,6 +1294,7 @@ export class ProjectStoreExecutor {
     this.#resolveWorkerExit(exitCode);
     if (this.#expectedTermination) {
       if (this.#pending.size > 0) {
+        this.#governedCloseDisqualified = true;
         const failure = new ProjectStoreWorkerError("WORKER_UNAVAILABLE", {
           abnormalExit: exitCode !== 0,
         });
@@ -1275,6 +1318,7 @@ export class ProjectStoreExecutor {
   }
 
   private failMaintenanceClosure(error: ProjectStoreWorkerError): never {
+    this.#governedCloseDisqualified = true;
     this.#state = "poisoned";
     this.#terminalError = error;
     this.rejectAll(error);
@@ -1301,6 +1345,7 @@ export class ProjectStoreExecutor {
       this.#terminalError = new ProjectStoreWorkerError("WORKER_CLOSED");
     } catch (error) {
       const failure = confirmationError(error);
+      this.#governedCloseDisqualified = true;
       this.#state = "poisoned";
       this.#terminalError = failure;
       this.rejectAll(failure);
@@ -1323,6 +1368,8 @@ export class ProjectStoreExecutor {
   }
 
   private async poison(error: ProjectStoreWorkerError, terminate = true): Promise<void> {
+    // Even a late failure after the closed guard disqualifies release evidence.
+    this.#governedCloseDisqualified = true;
     if (this.#state === "closed") return;
     if (this.#state === "poisoned") {
       if (terminate) await (this.#terminationPromise ?? Promise.resolve());
@@ -1358,15 +1405,24 @@ export class ProjectStoreExecutor {
     let deadline!: object;
     const forced = new Promise<{ kind: "forced" }>((resolveForced) => {
       deadline = this.#dependencies.scheduler.setTimeout(
-        () => resolveForced({ kind: "forced" }),
+        () => {
+          this.#governedCloseDisqualified = true;
+          resolveForced({ kind: "forced" });
+        },
         this.#options.closeTimeoutMs,
       );
     });
     const graceful = (async () => {
       await this.waitForDrain();
-      if (this.#state === "poisoned" || this.#state === "quiesced") return;
+      if (this.#state === "poisoned" || this.#state === "quiesced") {
+        this.#governedCloseDisqualified = true;
+        return;
+      }
+      // Resolution here means request-specific correlation/payload decoding and
+      // the delivery fault check both accepted the close posted after FIFO drain.
       await this.request({ id: "", type: "close" }, "control");
       await this.terminateWorker();
+      this.#normalCloseCompleted = true;
       this.#state = "closed";
     })();
     try {
@@ -1411,6 +1467,7 @@ export class ProjectStoreExecutor {
         this.#resolveWorkerExit(exitCode);
       } catch {
         const failure = terminationFailure();
+        this.#governedCloseDisqualified = true;
         this.#state = "poisoned";
         this.#terminalError = failure;
         this.rejectAll(failure);

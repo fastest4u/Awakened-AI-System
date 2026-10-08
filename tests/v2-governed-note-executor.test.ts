@@ -39,7 +39,7 @@ test("generic append compatibility cannot bypass governed receipt validation or 
 
 import { EventEmitter } from "node:events";
 import { randomBytes, randomUUID } from "node:crypto";
-import { ProjectStoreExecutor, type WorkerLike, type ExecutorScheduler } from "../src/orchestrator/runtime/project-store-executor.js";
+import { ProjectStoreExecutor, type WorkerLike, type ExecutorScheduler, type ProjectStoreExecutorDependencies } from "../src/orchestrator/runtime/project-store-executor.js";
 import { ProjectStoreWorkerBackend, type ProjectStoreWorkerBackendOptions } from "../src/orchestrator/runtime/project-store-worker-backend.js";
 import { ProjectStoreWorkerRuntime } from "../src/orchestrator/runtime/project-store-worker-runtime.js";
 import { encodeWorkerBinding, encodeFreshStartContextWire, decodeWorkerResponseForRequest, type WorkerRequest } from "../src/orchestrator/runtime/worker-protocol.js";
@@ -53,13 +53,15 @@ import type { RetainedEvidenceRuntimeCreateInput } from "../src/orchestrator/pri
 
 const SELF = new URL("../src/workers/project-store.worker.js", import.meta.url);
 const SECRET = "private-provider-exception-do-not-copy";
-function deferred<T>() { let resolve!: (value: T) => void; const promise = new Promise<T>(r => { resolve = r; }); return { promise, resolve }; }
+function deferred<T>() { let resolve!: (value: T) => void; let reject!: (error: unknown) => void; const promise = new Promise<T>((r, j) => { resolve = r; reject = j; }); return { promise, resolve, reject }; }
 const turn = () => new Promise<void>(resolve => setImmediate(resolve));
 class Scheduler implements ExecutorScheduler {
   readonly timers = new Map<object, { callback: () => void; delay: number }>();
-  setTimeout(callback: () => void, delay: number) { const handle = {}; this.timers.set(handle, { callback, delay }); return handle; }
+  readonly created: number[] = [];
+  setTimeout(callback: () => void, delay: number) { const handle = {}; this.created.push(delay); this.timers.set(handle, { callback, delay }); return handle; }
   clearTimeout(handle: object) { this.timers.delete(handle); }
   fire() { const entry = this.timers.entries().next().value; assert.ok(entry); this.timers.delete(entry[0]); entry[1].callback(); }
+  fireDelay(delay: number) { const entry = [...this.timers].find(([, value]) => value.delay === delay); assert.ok(entry); this.timers.delete(entry[0]); entry[1].callback(); }
 }
 class FakeWorker extends EventEmitter implements WorkerLike {
   posted: WorkerRequest[] = []; terminateCalls = 0; throwOnPost = false;
@@ -68,10 +70,10 @@ class FakeWorker extends EventEmitter implements WorkerLike {
   terminate() { this.terminateCalls++; return this.termination.promise; }
   respond(request: WorkerRequest, data: unknown) { this.emit("message", { id: request.id, ok: true, data }); }
 }
-async function parent(f: GovernedNoteDomainFixtureV1, maxPending = 128) {
+async function parent(f: GovernedNoteDomainFixtureV1, maxPending = 128, dependencies: Partial<ProjectStoreExecutorDependencies> = {}) {
   const worker = new FakeWorker(), scheduler = new Scheduler();
   const executor = new ProjectStoreExecutor({ workerUrl: SELF, context: f.rootContext, maxPending, requestTimeoutMs: 15000, closeTimeoutMs: 5000,
-    executorLeaseMs: 15000, heartbeatIntervalMs: 5000, appendRetryDeadlineMs: 15000 }, { workerFactory: () => worker, scheduler, randomId: randomUUID });
+    executorLeaseMs: 15000, heartbeatIntervalMs: 5000, appendRetryDeadlineMs: 15000 }, { workerFactory: () => worker, scheduler, randomId: randomUUID, ...dependencies });
   const opened = executor.open(), request = worker.posted.at(-1)!;
   worker.respond(request, { ...encodeWorkerBindingAssertion(f.rootContext), executorId: randomUUID() }); await opened;
   return { executor, worker, scheduler, async dispose() { worker.emit("exit", 1); worker.termination.resolve(1); await executor.close(); } };
@@ -575,6 +577,234 @@ test("outer envelope proxies are rejected before any generic or parent correlati
         await assert.rejects(pending, safe("COMMAND_OUTCOME_UNKNOWN", ids(p)));
         assert.equal(traps, 0); assert.equal(h.executor.canReuse(), false);
       } finally { await h.dispose(); }
+    });
+  } finally { await f.cleanup(); }
+});
+
+function watched<T>(promise: Promise<T>) {
+  const state = { settled: false };
+  void promise.then(() => { state.settled = true; }, () => { state.settled = true; });
+  return state;
+}
+function closeRequest(worker: FakeWorker) {
+  const request = worker.posted.find(request => request.type === "close");
+  assert.ok(request); return request;
+}
+function integrity(f: GovernedNoteDomainFixtureV1) {
+  return { ok: true, mode: "quick", projectId: f.rootContext.binding.projectId, storeId: f.rootContext.binding.storeId,
+    firstGlobalPosition: "0", lastGlobalPosition: "0", eventsVerified: 0, streamsVerified: 0, commandsVerified: 0,
+    schemaFingerprint: "a".repeat(64), terminalEventHash: "0".repeat(64), issues: [] };
+}
+const closeLease = { epoch: 41n, fencingToken: 41n, ownerId: "maintenance-owner", leaseExpiresAt: "2026-10-09T23:59:59.000Z" };
+
+test("normal close observation waits for FIFO drain, accepted ack, and cached termination", { timeout: 20_000 }, async t => {
+  const f = await makeGovernedNoteDomainFixture();
+  const ownerIds = new Set<string>();
+  try {
+    for (const order of ["observation-first", "close-first", "after-close"] as const) await t.test(order, async () => {
+      const h = await parent(f);
+      try {
+        const read = h.executor.quickIntegrity(); watched(read);
+        const initial = order === "observation-first" ? h.executor.closeForGovernedNoteController() : null;
+        if (initial) watched(initial);
+        const closing = h.executor.close(); watched(closing);
+        assert.strictEqual(h.executor.close(), closing);
+        const observation = initial ?? (order === "close-first" ? h.executor.closeForGovernedNoteController() : null);
+        const progress = observation ? watched(observation) : null;
+        assert.equal(h.worker.posted.some(request => request.type === "close"), false);
+        assert.equal(h.worker.terminateCalls, 0);
+        h.worker.respond(h.worker.posted.at(-1)!, integrity(f)); await read; await turn();
+        assert.equal(h.worker.posted.filter(request => request.type === "close").length, 1);
+        assert.equal(h.worker.terminateCalls, 0);
+        h.worker.respond(closeRequest(h.worker), { closed: true }); await turn();
+        assert.equal(h.worker.terminateCalls, 1);
+        if (progress) assert.equal(progress.settled, false);
+        const timerCount = h.scheduler.created.length;
+        const repeated = order === "after-close" ? null : h.executor.closeForGovernedNoteController(); if (repeated) watched(repeated);
+        assert.equal(h.scheduler.created.length, timerCount);
+        h.worker.termination.resolve(1); await closing;
+        const final = await (observation ?? h.executor.closeForGovernedNoteController());
+        assert.equal(final.disposition, "graceful-confirmed");
+        assert.match(final.ownerId, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+        assert.equal(ownerIds.has(final.ownerId), false); ownerIds.add(final.ownerId);
+        if (repeated) {
+          assert.strictEqual(h.executor.closeForGovernedNoteController(), repeated);
+          if (observation) assert.strictEqual(repeated, observation);
+          assert.strictEqual(await repeated, final);
+        }
+        assert.equal(Object.isFrozen(final), true);
+        assert.equal(h.scheduler.timers.size, 0);
+        assert.equal(h.scheduler.created.filter(delay => delay === 5000).length, 1);
+      } finally { await h.dispose().catch(() => undefined); }
+    });
+  } finally { await f.cleanup(); }
+});
+
+test("pending cached termination has no second deadline even after expected exit and forced generic resolution", { timeout: 20_000 }, async t => {
+  const f = await makeGovernedNoteDomainFixture();
+  try {
+    for (const exitFirst of [false, true]) await t.test(`expected exit before C: ${exitFirst}`, async () => {
+      const h = await parent(f);
+      try {
+        const closing = h.executor.close(), closeState = watched(closing);
+        const observation = h.executor.closeForGovernedNoteController(), observationState = watched(observation);
+        await turn(); h.worker.respond(closeRequest(h.worker), { closed: true }); await turn();
+        assert.equal(h.worker.terminateCalls, 1);
+        const timerCount = h.scheduler.created.length;
+        if (exitFirst) h.worker.emit("exit", 0);
+        h.scheduler.fireDelay(5000); await turn();
+        assert.equal(closeState.settled, exitFirst);
+        assert.equal(observationState.settled, false);
+        const repeat = h.executor.closeForGovernedNoteController(); watched(repeat);
+        assert.equal(h.scheduler.created.length, timerCount);
+        assert.equal(h.scheduler.timers.size, 0);
+        assert.equal(h.worker.terminateCalls, 1);
+        h.worker.termination.resolve(0); await closing;
+        assert.equal((await observation).disposition, "ownership-uncertain");
+        assert.strictEqual(repeat, observation);
+        assert.strictEqual(h.executor.close(), closing);
+      } finally { await h.dispose().catch(() => undefined); }
+    });
+  } finally { await f.cleanup(); }
+});
+
+test("forced resolving close before drain or ack remains uncertain after late ack and exit", { timeout: 20_000 }, async t => {
+  const f = await makeGovernedNoteDomainFixture();
+  try {
+    for (const pendingDrain of [false, true]) await t.test(`drain pending: ${pendingDrain}`, async () => {
+      const h = await parent(f);
+      try {
+        const read = pendingDrain ? h.executor.quickIntegrity() : null; if (read) watched(read);
+        const closing = h.executor.close(); watched(closing);
+        const observation = h.executor.closeForGovernedNoteController(), state = watched(observation);
+        await turn();
+        const saved = h.worker.posted.at(-1)!;
+        h.scheduler.fireDelay(5000); await turn();
+        assert.equal(state.settled, false); assert.equal(h.worker.terminateCalls, 1);
+        h.worker.respond(saved, pendingDrain ? integrity(f) : { closed: true });
+        h.worker.emit("exit", 0); h.worker.termination.resolve(0); await closing;
+        if (read) await assert.rejects(read);
+        const result = await observation;
+        assert.equal(result.disposition, "ownership-uncertain");
+        h.worker.respond(saved, { closed: true }); await turn();
+        assert.equal((await h.executor.closeForGovernedNoteController()).disposition, "ownership-uncertain");
+        assert.equal(h.worker.posted.filter(request => request.type === "close").length, pendingDrain ? 0 : 1);
+        assert.equal(h.worker.terminateCalls, 1);
+      } finally { await h.dispose().catch(() => undefined); }
+    });
+  } finally { await f.cleanup(); }
+});
+
+test("close ack must be exact, correlated, successful, and delivered without fault", { timeout: 20_000 }, async t => {
+  const f = await makeGovernedNoteDomainFixture();
+  try {
+    for (const mode of ["wrong-id", "false", "missing", "extra-payload", "extra-envelope", "error", "delivery-fault", "post-failure"] as const) await t.test(mode, async () => {
+      let failDelivery = false;
+      const h = await parent(f, 128, { lifecycleFaultInjector: { hit() { if (failDelivery) throw new Error(SECRET); } } });
+      try {
+        if (mode === "post-failure") h.worker.throwOnPost = true;
+        const closing = h.executor.close(); watched(closing);
+        const observation = h.executor.closeForGovernedNoteController(); watched(observation);
+        await turn();
+        if (mode !== "post-failure") {
+          const request = closeRequest(h.worker);
+          failDelivery = mode === "delivery-fault";
+          if (mode === "error") h.worker.emit("message", { id: request.id, ok: false, error: { code: "STORE_UNAVAILABLE", message: "STORE_UNAVAILABLE", details: {} } });
+          else h.worker.emit("message", { id: mode === "wrong-id" ? "wrong" : request.id, ok: true,
+            data: mode === "false" ? { closed: false } : mode === "missing" ? {} : mode === "extra-payload" ? { closed: true, extra: true } : { closed: true },
+            ...(mode === "extra-envelope" ? { extra: true } : {}) });
+        }
+        await turn(); assert.equal(h.worker.terminateCalls, 1);
+        h.worker.termination.resolve(1);
+        await assert.rejects(closing);
+        await assert.rejects(observation, safe("WORKER_UNAVAILABLE"));
+        assert.strictEqual(h.executor.closeForGovernedNoteController(), observation);
+        assert.strictEqual(h.executor.close(), closing);
+        assert.equal(h.scheduler.timers.size, 0);
+      } finally { await h.dispose().catch(() => undefined); }
+    });
+  } finally { await f.cleanup(); }
+});
+
+test("poison and already closed without normal sequence cannot attest release", { timeout: 20_000 }, async t => {
+  const f = await makeGovernedNoteDomainFixture();
+  try {
+    for (const mode of ["poison", "unexpected-exit", "poison-after-ack", "late-poison-after-closed"] as const) await t.test(mode, async () => {
+      const h = await parent(f);
+      try {
+        let closing: Promise<void>;
+        if (mode === "poison" || mode === "unexpected-exit") {
+          h.worker.emit(mode === "poison" ? "messageerror" : "exit", 1);
+          closing = h.executor.close(); watched(closing);
+        } else {
+          closing = h.executor.close(); watched(closing); await turn();
+          h.worker.respond(closeRequest(h.worker), { closed: true }); await turn();
+          if (mode === "late-poison-after-closed") h.worker.emit("exit", 0);
+          h.worker.emit("messageerror", new Error(SECRET));
+        }
+        const observation = h.executor.closeForGovernedNoteController(); watched(observation);
+        h.worker.termination.resolve(1); await closing;
+        assert.equal((await observation).disposition, "ownership-uncertain");
+        assert.equal(h.worker.terminateCalls, mode === "unexpected-exit" ? 0 : 1);
+        assert.equal(h.worker.posted.filter(request => request.type === "close").length, mode === "poison" || mode === "unexpected-exit" ? 0 : 1);
+      } finally { await h.dispose().catch(() => undefined); }
+    });
+  } finally { await f.cleanup(); }
+});
+
+test("explicit and autonomous maintenance closure never confirms governed release", { timeout: 20_000 }, async t => {
+  const f = await makeGovernedNoteDomainFixture();
+  try {
+    for (const mode of ["explicit", "autonomous", "explicit-cleanup-failure", "autonomous-cleanup-failure", "expected-exit-with-pending"] as const) await t.test(mode, async () => {
+      const confirmation = deferred<void>(); let ownerCalls = 0;
+      const h = await parent(f, 128, { confirmMaintenanceClosure: () => { ownerCalls++; return confirmation.promise; } });
+      try {
+        const explicit = mode.startsWith("explicit");
+        const quiescing = explicit ? h.executor.quiesce(closeLease) : null; if (quiescing) watched(quiescing);
+        const read = mode === "expected-exit-with-pending" ? h.executor.quickIntegrity() : null; if (read) watched(read);
+        if (explicit) h.worker.respond(h.worker.posted.at(-1)!, { quiesced: true, epoch: "41", connectionClosed: true });
+        h.worker.emit("message", { type: "quiesced", executorId: (await h.executor.open()).executorId,
+          epoch: "41", fencingToken: "41", ownerId: closeLease.ownerId, leaseExpiresAt: closeLease.leaseExpiresAt, connectionClosed: true });
+        h.worker.emit("exit", 0); await turn();
+        const closing = h.executor.close(); watched(closing);
+        const observation = h.executor.closeForGovernedNoteController(), state = watched(observation);
+        if (explicit) assert.strictEqual(closing, quiescing);
+        if (mode !== "expected-exit-with-pending") {
+          await turn(); assert.equal(state.settled, false); assert.equal(ownerCalls, 1);
+          if (mode.endsWith("cleanup-failure")) confirmation.reject(new Error(SECRET)); else confirmation.resolve();
+        } else { await assert.rejects(read!); confirmation.resolve(); }
+        if (mode.endsWith("cleanup-failure")) {
+          await assert.rejects(observation, safe("WORKER_UNAVAILABLE"));
+          if (explicit) await assert.rejects(closing); else await closing;
+        } else {
+          await closing; assert.equal((await observation).disposition, "ownership-uncertain");
+        }
+        assert.equal(h.worker.posted.some(request => request.type === "close"), false);
+        assert.equal(h.worker.terminateCalls, 0);
+      } finally { confirmation.resolve(); await h.dispose().catch(() => undefined); }
+    });
+  } finally { await f.cleanup(); }
+});
+
+test("normal forced and poisoned termination rejection exposes only safe unavailable", { timeout: 20_000 }, async t => {
+  const f = await makeGovernedNoteDomainFixture();
+  try {
+    for (const mode of ["normal", "forced", "poisoned"] as const) await t.test(mode, async () => {
+      const h = await parent(f);
+      try {
+        if (mode === "poisoned") h.worker.emit("messageerror", new Error(SECRET));
+        const closing = h.executor.close(); watched(closing);
+        const observation = h.executor.closeForGovernedNoteController(); watched(observation);
+        await turn();
+        if (mode === "normal") h.worker.respond(closeRequest(h.worker), { closed: true });
+        if (mode === "forced") h.scheduler.fireDelay(5000);
+        await turn(); assert.equal(h.worker.terminateCalls, 1);
+        h.worker.termination.reject(new Error(SECRET));
+        await assert.rejects(closing, safe("WORKER_UNAVAILABLE", { terminationFailed: true }));
+        await assert.rejects(observation, safe("WORKER_UNAVAILABLE"));
+        assert.strictEqual(h.executor.closeForGovernedNoteController(), observation);
+        assert.equal(h.worker.terminateCalls, 1);
+      } finally { await h.dispose().catch(() => undefined); }
     });
   } finally { await f.cleanup(); }
 });

@@ -1793,6 +1793,7 @@ describe("ProjectStoreExecutor bounded lifecycle", () => {
     const { executor, worker } = await fakeExecutor();
     const read = executor.quickIntegrity();
     const close = executor.close();
+    assert.strictEqual(executor.close(), close);
     assert.equal(worker.posted.some((request) => request.type === "close"), false);
     const readRequest = worker.posted.find((request) => request.type === "quickIntegrity")!;
     worker.respond(readRequest, {
@@ -1816,6 +1817,10 @@ describe("ProjectStoreExecutor bounded lifecycle", () => {
     await close;
     assert.equal(worker.terminateCalls, 1);
     assert.ok(worker.lifecycle.lastIndexOf("post") < worker.lifecycle.lastIndexOf("terminate"));
+    const observation = executor.closeForGovernedNoteController();
+    assert.equal((await observation).disposition, "graceful-confirmed");
+    assert.strictEqual(executor.closeForGovernedNoteController(), observation);
+    assert.strictEqual(executor.close(), close);
   });
 
   it("uses one bounded forced termination and makes repeated close idempotent", async () => {
@@ -1829,6 +1834,8 @@ describe("ProjectStoreExecutor bounded lifecycle", () => {
     await first;
     await executor.close();
     assert.equal(worker.terminateCalls, 1);
+    assert.equal((await executor.closeForGovernedNoteController()).disposition, "ownership-uncertain");
+    assert.strictEqual(executor.close(), first);
   });
 
   it("terminates and clears the close deadline after a negative close acknowledgement", async () => {
