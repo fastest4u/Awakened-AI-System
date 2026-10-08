@@ -4,14 +4,15 @@ import type { SqliteConnection } from "../storage/sqlite-driver.js";
 import { EventStoreError, governedNotePlannedIds, isPrimarySqliteBusy, type EventAppendTransaction, type PreparedEventAppend } from "../storage/event-append-transaction.js";
 import type { EvidenceKeyProvider } from "../privacy/evidence-key-provider.js";
 import { redactGovernedNoteSummaryV1, type TrustedRedactionPolicyV1 } from "../privacy/redaction.js";
-import type { GovernedNoteAuthorityVerifier } from "./authority.js";
+import type { GovernedNoteAuthorityVerifier, VerifiedGovernedNoteRecoveryAuthority } from "./authority.js";
 import type { GovernedNotePriorV1, GovernedNoteRepository } from "./repository.js";
 import { GovernedNoteProvenanceKeyUnavailable, type GovernedNoteProvenanceRepository } from "./provenance.repository.js";
-import type { GovernedNoteClockV1, GovernedNoteStoredReceiptV1, PreparedGovernedNoteCreateV1 } from "./contracts.js";
+import type { GovernedNoteClockV1, GovernedNoteStoredReceiptV1, PreparedGovernedNoteCreateV1, PreparedGovernedNoteRecoveryV1, GovernedNoteRecoveryResultV1 } from "./contracts.js";
 import { GOVERNED_NOTE_ERROR_CODES, GovernedNoteError, isRecoveryIdErrorCode, type GovernedNoteErrorCode } from "./errors.js";
-import { decodePreparedGovernedNoteCreateV1, encodePreparedGovernedNoteCreateV1, decodeGovernedNoteCreatedPayloadV1 } from "./codec.js";
+import { decodePreparedGovernedNoteCreateV1, encodePreparedGovernedNoteCreateV1, decodeGovernedNoteCreatedPayloadV1, decodePreparedGovernedNoteRecoveryV1, encodePreparedGovernedNoteRecoveryV1, decodeGovernedNoteRecoveryResultV1 } from "./codec.js";
 import { assertGovernedNoteOriginalEquality, buildGovernedNoteOriginalCommitment, governedNoteSummaryHash } from "./intent.js";
 import { canonicalJson } from "../serialization/canonical-json.js";
+import { assertFreshStartConnectionAllowed } from "../fresh-start/fresh-start-admission.js";
 
 export type GovernedNoteFaultPointV1 = "before-begin" | "after-note-event" | "after-source-event" | "after-dedup" | "before-commit" | "after-commit-before-response" | "recovery-before-final-verify" | "recovery-after-detach" | "recovery-before-commit";
 export interface GovernedNoteFaultInjectorV1 { inject(point: GovernedNoteFaultPointV1): void; }
@@ -24,6 +25,61 @@ export interface GovernedNoteServiceOptions {
 }
 export class GovernedNoteService {
   constructor(private readonly options: GovernedNoteServiceOptions) {}
+  recover(input: PreparedGovernedNoteRecoveryV1, context: ProjectContext): GovernedNoteRecoveryResultV1 {
+    const owned = decodePreparedGovernedNoteRecoveryV1(encodePreparedGovernedNoteRecoveryV1(input));
+    const { connection, authority, repository, faults } = this.options;
+    let handle: VerifiedGovernedNoteRecoveryAuthority | undefined;
+    let candidate: GovernedNoteRecoveryResultV1 | undefined;
+    let failure: GovernedNoteError | undefined;
+    let transactionOpen = false, commitAttempted = false, rollbackFailed = false;
+    const admit = () => assertFreshStartConnectionAllowed(connection, "command-recovery");
+    const unavailable = () => new GovernedNoteError("GOVERNED_NOTE_UNAVAILABLE");
+    try {
+      admit();
+      handle = authority.verifyRecovery(owned, context);
+      connection.exec("BEGIN DEFERRED"); transactionOpen = true;
+      admit();
+      authority.revalidateRecovery(handle);
+      const prior = repository.findGovernedNotePrior(owned.request.commandId, owned.request.idempotencyKey);
+      // Own and validate all nested data before the final clock observation. The
+      // final success envelope is detached only after current authority passes.
+      const result = decodeGovernedNoteRecoveryResultV1(prior
+        ? { resultVersion: 1, operation: "recover-governed-note-result", outcome: "committed", receipt: { ...prior.result.response, replay: true } }
+        : { resultVersion: 1, operation: "recover-governed-note-result", outcome: "not-found", commandId: owned.request.commandId, idempotencyKey: owned.request.idempotencyKey });
+      faults?.inject("recovery-before-final-verify");
+      admit();
+      const current = authority.revalidateRecovery(handle), binding = authority.bindingForRecovery(handle);
+      if (prior && (canonicalJson(current) !== canonicalJson(prior.witness.authority)
+        || canonicalJson(binding) !== canonicalJson(prior.witness.binding))) throw new GovernedNoteError("SESSION_OWNERSHIP_MISMATCH");
+      authority.assertRecoveryUnexpired(handle);
+      candidate = Object.freeze({ ...result });
+      faults?.inject("recovery-after-detach");
+      faults?.inject("recovery-before-commit");
+      // Admission remains held through disposition. Expiry alone after detach
+      // does not revoke the authorization point or renew the bounded proof.
+      admit();
+      commitAttempted = true;
+      connection.exec("COMMIT"); transactionOpen = false;
+    } catch (error) {
+      candidate = undefined;
+      if (transactionOpen) {
+        try { connection.exec("ROLLBACK"); transactionOpen = false; }
+        catch { rollbackFailed = true; }
+      }
+      const code = error instanceof Error && "code" in error && typeof error.code === "string" ? error.code : "GOVERNED_NOTE_UNAVAILABLE";
+      // Read uncertainty never certifies a retry or another uncertain mutation.
+      failure = commitAttempted || rollbackFailed || code === "SQLITE_BUSY" || isRecoveryIdErrorCode(code as GovernedNoteErrorCode)
+        || !(GOVERNED_NOTE_ERROR_CODES as readonly string[]).includes(code)
+        ? unavailable() : new GovernedNoteError(code as GovernedNoteErrorCode);
+    } finally {
+      if (handle) try { authority.discardRecovery(handle); }
+      catch { candidate = undefined; failure = unavailable(); }
+      handle = undefined;
+    }
+    if (failure) throw failure;
+    if (!candidate) throw unavailable();
+    return candidate;
+  }
   create(input: PreparedGovernedNoteCreateV1, context: ProjectContext): AppendResult<GovernedNoteStoredReceiptV1> {
     const owned = decodePreparedGovernedNoteCreateV1(encodePreparedGovernedNoteCreateV1(input));
     const command = owned.command, ids = { commandId: command.commandId, idempotencyKey: command.idempotencyKey };

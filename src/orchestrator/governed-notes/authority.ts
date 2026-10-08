@@ -230,6 +230,15 @@ export class GovernedNoteAuthorityVerifier {
   }
   bindingForCreate(handle: VerifiedGovernedNoteCreateAuthority): ProjectBinding { return this.createState(handle).binding; }
   bindingForRecovery(handle: VerifiedGovernedNoteRecoveryAuthority): ProjectBinding { return this.recoveryState(handle).binding; }
+  /** The service calls this after final live verification, immediately before detach. */
+  assertRecoveryUnexpired(handle: VerifiedGovernedNoteRecoveryAuthority): void {
+    safe(() => this.expiry(this.recoveryState(handle).prepared.request));
+  }
+  /** Revoke this attempt's transient authority even when its read disposition fails. */
+  discardRecovery(handle: VerifiedGovernedNoteRecoveryAuthority): void {
+    this.recoveryState(handle);
+    recoveries.delete(handle);
+  }
 }
 export function requireGovernedNoteCreateAuthority(connection: SqliteConnection, handle: VerifiedGovernedNoteCreateAuthority, command: GovernedNoteCommandV1, expectedBinding?: ProjectBinding): GovernedNoteAuthoritySnapshotV1 {
   return safe(() => {

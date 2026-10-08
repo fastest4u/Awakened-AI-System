@@ -99,6 +99,14 @@ export async function makeGovernedNoteDomainFixture(options: Pick<Partial<Govern
         const s = scope(context), proof = mint(context, governedNoteRecoveryProofTarget(request, context, deriveGovernedNoteBinding(connection, context, s.targetSessionId), s.capabilityGeneration, randomUUID()));
         return { request, authorization: { kind: "bounded-operation", authoritySessionId: s.authoritySessionId as never, targetSessionId: s.targetSessionId as never, proof, audience: { presentingActorRole: s.presentingActorRole, targetActorRole: s.targetActorRole, presentingClientInstanceId: s.presentingClientInstanceId, targetClientInstanceId: s.targetClientInstanceId } } };
       },
+      /** All durable row contents, including authority/control tables, for nonmutation assertions. */
+      rowContents(): string {
+        const tables = connection.prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").all();
+        return JSON.stringify(tables.map(row => {
+          const table = String(row.name).replaceAll('"', '""');
+          return [row.name, connection.prepare(`SELECT * FROM "${table}"`).all()];
+        }), (_key, value: unknown) => typeof value === "bigint" ? value.toString() : value);
+      },
       rows(): Readonly<{ events: number; dedup: number; streams: number; outbox: number; authorization: number }> {
         const count = (table: string) => Number(connection.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get()!.n);
         return Object.freeze({ events: count("events"), dedup: count("command_dedup"), streams: count("streams"), outbox: count("outbox"), authorization: count("retained_evidence_command_authorizations") });
