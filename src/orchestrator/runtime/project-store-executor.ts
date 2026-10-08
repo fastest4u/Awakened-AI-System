@@ -1,3 +1,4 @@
+import { types } from "node:util";
 import { decodePreparedGovernedNoteCreateV1, decodePreparedGovernedNoteRecoveryV1, encodePreparedGovernedNoteCreateV1, encodePreparedGovernedNoteRecoveryV1 } from "../governed-notes/codec.js";
 import type { PreparedGovernedNoteCreateV1, PreparedGovernedNoteRecoveryV1, GovernedNoteStoredReceiptV1, GovernedNoteRecoveryResultV1, GovernedNoteRecoveryIdsV1 } from "../governed-notes/contracts.js";
 import { assertGovernedNoteEnvelopeSize, isGovernedNoteRequest, sanitizeGovernedNoteError } from "../governed-notes/worker-protocol.js";
@@ -1116,10 +1117,12 @@ export class ProjectStoreExecutor {
     try {
       // Known governed responses are bounded while still raw, including errors and
       // malformed data that would otherwise enter a generic decoder first.
+      if (types.isProxy(value)) throw new ProjectStoreWorkerError("WORKER_PROTOCOL_ERROR");
       const id = typeof value === "object" && value !== null ? Object.getOwnPropertyDescriptor(value, "id")?.value as unknown : undefined;
       const expected = typeof id === "string" ? this.#pending.get(id)?.request : undefined;
+      if (typeof id === "string" && expected === undefined) throw new ProjectStoreWorkerError("WORKER_PROTOCOL_ERROR");
       if (expected && isGovernedNoteRequest(expected)) assertGovernedNoteEnvelopeSize(value);
-      message = decodeWorkerMessage(value);
+      message = decodeWorkerMessage(value, expected);
     } catch {
       this.poisonInBackground(new ProjectStoreWorkerError("WORKER_PROTOCOL_ERROR"));
       return;

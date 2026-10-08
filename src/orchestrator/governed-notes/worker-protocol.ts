@@ -1,5 +1,5 @@
 import type { AppendResultWire, WorkerRequest, WorkerResponse } from "../runtime/worker-protocol.js";
-import { RetainedEvidenceError, boundedRetainedJson, retainedDataEntries, retainedExactRecord } from "../privacy/evidence-contracts.js";
+import { RetainedEvidenceError, boundedRetainedJson, retainedExactRecord } from "../privacy/evidence-contracts.js";
 import { decodeGovernedNoteStoredReceiptV1, decodeGovernedNoteStoredResultV1, decodeGovernedNoteRecoveryResultV1, decodeGovernedNoteErrorV1, decodePreparedGovernedNoteCreateV1, decodePreparedGovernedNoteRecoveryV1 } from "./codec.js";
 import { GOVERNED_NOTE_LIMITS, type GovernedNoteRecoveryIdsV1, type GovernedNoteRecoveryResultV1, type GovernedNoteStoredReceiptV1 } from "./contracts.js";
 import { GOVERNED_NOTE_ERROR_CODES, GovernedNoteError, isRecoveryIdErrorCode, type GovernedNoteErrorCode } from "./errors.js";
@@ -61,25 +61,4 @@ export function decodeGovernedNoteWorkerResponse(value: unknown, request: Govern
     if (receipt.scope.sessionId !== request.prepared.authorization.targetSessionId) integrity();
   }
   return { id: request.id, ok: true, data };
-}
-/** Recognize governed shapes before the structurally compatible generic append arm. */
-export function governedNoteSuccessKind(value: unknown): "create" | "recover" | null {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
-  const r = Object.fromEntries(retainedDataEntries(value, GOVERNED_NOTE_LIMITS.transportBytes));
-  if (Object.hasOwn(r, "outcome") || r.operation === "recover-governed-note-result") return "recover";
-  const receipt = r.response;
-  if (typeof receipt === "object" && receipt !== null && !Array.isArray(receipt)) {
-    const s = Object.fromEntries(retainedDataEntries(receipt, GOVERNED_NOTE_LIMITS.transportBytes));
-    if (s.operation === "create-governed-note" || (Object.hasOwn(s, "recordId") && Object.hasOwn(s, "sourceEventIds"))) return "create";
-  }
-  return null;
-}
-export function decodeUnknownGovernedNoteSuccess(value: unknown): GovernedNoteCreateSuccessWireV1 | GovernedNoteRecoveryResultV1 {
-  if (governedNoteSuccessKind(value) === "recover") {
-    const result = decodeGovernedNoteRecoveryResultV1(value);
-    return decodeGovernedNoteRecoverySuccessV1(result, result.outcome === "committed" ? result.receipt : result);
-  }
-  const r = retainedExactRecord(value, ["deduplicated", "firstGlobalPosition", "lastGlobalPosition", "finalStreamVersion", "eventIds", "response", "responseHash"]);
-  const stored = decodeGovernedNoteStoredResultV1({ eventIds: r.eventIds, firstGlobalPosition: r.firstGlobalPosition, lastGlobalPosition: r.lastGlobalPosition, finalStreamVersion: r.finalStreamVersion, response: r.response });
-  return decodeGovernedNoteCreateSuccessV1(value, stored.response);
 }

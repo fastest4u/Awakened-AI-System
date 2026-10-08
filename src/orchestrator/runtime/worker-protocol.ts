@@ -1,6 +1,7 @@
+import { types } from "node:util";
 import { decodePreparedGovernedNoteCreateV1, decodePreparedGovernedNoteRecoveryV1, encodePreparedGovernedNoteCreateV1, encodePreparedGovernedNoteRecoveryV1 } from "../governed-notes/codec.js";
 import type { PreparedGovernedNoteCreateWireV1, PreparedGovernedNoteRecoveryWireV1, GovernedNoteRecoveryResultV1 } from "../governed-notes/contracts.js";
-import { assertGovernedNoteEnvelopeSize, decodeGovernedNoteWorkerResponse, decodeUnknownGovernedNoteSuccess, governedNoteSuccessKind, isGovernedNoteRequest } from "../governed-notes/worker-protocol.js";
+import { assertGovernedNoteEnvelopeSize, decodeGovernedNoteWorkerResponse, isGovernedNoteRequest } from "../governed-notes/worker-protocol.js";
 import type {
   AppendCommand,
   AppendResult,
@@ -73,7 +74,7 @@ function invalid(): never {
 }
 
 function record(value: unknown): Record<string, unknown> {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) invalid();
+  if (typeof value !== "object" || value === null || types.isProxy(value) || Array.isArray(value)) invalid();
   const prototype = Object.getPrototypeOf(value) as unknown;
   if (prototype !== Object.prototype && prototype !== null) invalid();
   for (const key of Reflect.ownKeys(value)) {
@@ -1072,8 +1073,10 @@ function decodeSuccessForType(
   }
 }
 
-function decodeUnknownSuccess(value: unknown): WorkerSuccessData {
-  if (governedNoteSuccessKind(value) !== null) return decodeUnknownGovernedNoteSuccess(value);
+function decodeUnknownSuccess(value: unknown, request?: WorkerRequest): WorkerSuccessData {
+  // Ordinary append responses are arbitrary JSON, including governed-looking
+  // fields. Only the trusted originating request selects the governed union.
+  if (request && isGovernedNoteRequest(request)) return decodeSuccessForType(request.type, value, request);
   const decoders: Array<(input: unknown) => WorkerSuccessData> = [
     decodePing,
     decodeOpen,
@@ -1121,13 +1124,18 @@ function decodeUnknownSuccess(value: unknown): WorkerSuccessData {
   invalid();
 }
 
-export function decodeWorkerResponse(value: unknown): WorkerResponse {
+export function decodeWorkerResponse(value: unknown, request?: WorkerRequest): WorkerResponse {
   const response = record(value);
+  if (request && isGovernedNoteRequest(request)) {
+    // Bound the complete original envelope before generic success normalization.
+    assertGovernedNoteEnvelopeSize(value);
+    if (response.id !== request.id) invalid();
+    if (response.ok === false) return decodeGovernedNoteWorkerResponse(value, request);
+  }
   if (response.ok === false) return decodeFailure(value);
   exact(value, ["id", "ok", "data"]);
   if (response.ok !== true) invalid();
-  if (governedNoteSuccessKind(response.data) !== null) assertGovernedNoteEnvelopeSize(value);
-  return { id: string(response.id), ok: true, data: decodeUnknownSuccess(response.data) };
+  return { id: string(response.id), ok: true, data: decodeUnknownSuccess(response.data, request) };
 }
 
 export function decodeWorkerResponseForRequest(
@@ -1171,9 +1179,9 @@ export function decodeWorkerNotification(value: unknown): WorkerNotification {
   };
 }
 
-export function decodeWorkerMessage(value: unknown): WorkerMessage {
+export function decodeWorkerMessage(value: unknown, request?: WorkerRequest): WorkerMessage {
   const message = record(value);
-  return "id" in message ? decodeWorkerResponse(value) : decodeWorkerNotification(value);
+  return "id" in message ? decodeWorkerResponse(value, request) : decodeWorkerNotification(value);
 }
 
 export type UpgradeWorkerCommand =

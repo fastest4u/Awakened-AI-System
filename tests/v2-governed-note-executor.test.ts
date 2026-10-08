@@ -30,8 +30,10 @@ test("generic append compatibility cannot bypass governed receipt validation or 
   try {
     const p = f.prepareCreate(f.command());
     const data = encodeAppendResultWire(f.service().create(p, f.rootContext));
-    assert.throws(() => decodeWorkerResponse({ id: "r", ok: true, data: { ...data, response: { ...data.response as object, replay: true } } }));
-    assert.throws(() => decodeWorkerResponse({ id: "x".repeat(16384), ok: true, data }));
+    const request = { ...req(f, p), id: "r" };
+    assert.throws(() => decodeWorkerResponse({ id: "r", ok: true, data: { ...data, response: { ...data.response as object, replay: true } } }, request));
+    const oversized = { ...request, id: "x".repeat(16384) };
+    assert.throws(() => decodeWorkerResponse({ id: oversized.id, ok: true, data }, oversized));
   } finally { await f.cleanup(); }
 });
 
@@ -160,12 +162,21 @@ test("both response decoders enforce complete correlated cap and exact operation
     const request = { ...base, id: "r".repeat(16384 - overhead) };
     const envelope = { id: request.id, ok: true, data };
     assert.equal(Buffer.byteLength(JSON.stringify(envelope)), 16384);
-    assert.equal(decodeWorkerResponse(envelope).ok, true); assert.equal(decodeWorkerResponseForRequest(envelope, request).ok, true);
-    for (const decode of [decodeWorkerResponse, (v: unknown) => decodeWorkerResponseForRequest(v, { ...request, id: request.id + "r" })]) assert.throws(() => decode({ ...envelope, id: request.id + "r" }));
+    assert.equal(decodeWorkerResponse(envelope, request).ok, true); assert.equal(decodeWorkerResponseForRequest(envelope, request).ok, true);
+    for (const decode of [(v: unknown) => decodeWorkerResponse(v, { ...request, id: request.id + "r" }), (v: unknown) => decodeWorkerResponseForRequest(v, { ...request, id: request.id + "r" })]) assert.throws(() => decode({ ...envelope, id: request.id + "r" }));
     const other = { commandId: randomUUID(), idempotencyKey: randomUUID() };
     assert.throws(() => decodeGovernedNoteCreateSuccessV1(data, other));
     const recovered = f.service().recover(recovery(f, p), f.rootContext), recoveryRequest = req(f, recovery(f, p));
-    assert.equal(decodeWorkerResponse({ id: recoveryRequest.id, ok: true, data: recovered }).ok, true);
+    assert.equal(decodeWorkerResponse({ id: recoveryRequest.id, ok: true, data: recovered }, recoveryRequest).ok, true);
+    for (const decode of [decodeWorkerResponse, decodeWorkerResponseForRequest]) {
+      assert.throws(() => decode({ id: base.id, ok: true, data: recovered }, base));
+      assert.throws(() => decode({ id: recoveryRequest.id, ok: true, data }, recoveryRequest));
+      assert.throws(() => decode({ id: "wrong-correlation", ok: true, data }, base));
+      for (const field of ["commandId", "idempotencyKey", "operation"] as const) {
+        const changed = { ...data, response: { ...data.response as object, [field]: field === "operation" ? "unrelated-operation" : randomUUID() } };
+        assert.throws(() => decode({ id: base.id, ok: true, data: changed }, base));
+      }
+    }
     assert.throws(() => decodeWorkerResponseForRequest({ id: base.id, ok: true, data: recovered }, base));
     assert.throws(() => decodeWorkerResponseForRequest({ id: recoveryRequest.id, ok: true, data }, recoveryRequest));
     assert.throws(() => decodeGovernedNoteRecoverySuccessV1(recovered, other));
@@ -489,11 +500,81 @@ test("worker validates successful runtime return before transport and preserves 
   } finally { await f.cleanup(); }
 });
 
-test("generic governed recognition never invokes accessors or proxy traps", () => {
+test("generic decoding never invokes accessors or proxy traps", () => {
   let reads = 0;
   const accessor = (key: string) => Object.defineProperty({}, key, { enumerable: true, get() { reads++; return "recover-governed-note-result"; } });
   for (const data of [accessor("operation"), accessor("response"), { response: accessor("operation") }, new Proxy({}, { getOwnPropertyDescriptor() { reads++; throw new Error(SECRET); } })]) {
     assert.throws(() => decodeWorkerResponse({ id: "hostile", ok: true, data }));
     assert.equal(reads, 0);
   }
+});
+
+import type { AppendCommand, JsonValue } from "../src/orchestrator/contracts/event.js";
+function ordinaryAppend(f: GovernedNoteDomainFixtureV1, response: JsonValue): AppendCommand<JsonValue> {
+  return { context: f.rootContext, commandId: randomUUID(), idempotencyKey: randomUUID(), commandType: "business.record", correlationId: randomUUID(), agentId: "ordinary-client",
+    expectedStreamVersion: 0n, streamId: "business:records", streamType: "business", events: [{ eventType: "BusinessRecordCreated", eventSchemaVersion: 1,
+      occurredAt: f.clock.now(), visibilityScope: "project", confidence: "high", verificationStatus: "verified", payload: { accepted: true }, sourceRefs: [], evidenceRefs: [], evidenceDigests: [] }],
+    outbox: [], publicResponse: response };
+}
+function ordinaryResult(response: JsonValue) {
+  return { deduplicated: false, firstGlobalPosition: "1", lastGlobalPosition: "1", finalStreamVersion: "1", eventIds: [randomUUID()], response, responseHash: "a".repeat(64) };
+}
+const ordinaryResponses: readonly (readonly [string, JsonValue])[] = [
+  ["colliding fields", { recordId: "business-id", sourceEventIds: [] }],
+  ["governed create operation literal", { resultVersion: 1, operation: "create-governed-note", recordId: "business-id", sourceEventIds: [] }],
+  ["governed recovery operation literal", { resultVersion: 1, operation: "recover-governed-note-result", outcome: "not-found", recordId: "business-id", sourceEventIds: [] }],
+  ["ordinary response exceeds governed cap", { operation: "create-governed-note", recordId: "business-id", sourceEventIds: [], message: "x".repeat(16384) }],
+  ["nested collision", { response: { recordId: "business-id", sourceEventIds: [] } }],
+  ["array", [{ operation: "create-governed-note", recordId: "business-id", sourceEventIds: [] }]],
+  ["null", null], ["scalar", "create-governed-note"],
+];
+test("ordinary arbitrary append JSON remains valid in generic and request-specific decoding", async t => {
+  const f = await makeGovernedNoteDomainFixture();
+  try {
+    for (const [name, response] of ordinaryResponses) {
+      const command = ordinaryAppend(f, response), h = await parent(f);
+      try {
+        const pending = h.executor.append(command); void pending.catch(() => undefined);
+        const request = h.worker.posted.at(-1)!, envelope = { id: request.id, ok: true, data: ordinaryResult(response) };
+        await t.test(`${name}: request-specific`, () => assert.deepEqual(decodeWorkerResponseForRequest(envelope, request), envelope));
+        await t.test(`${name}: generic default`, () => assert.deepEqual(decodeWorkerResponse(envelope), envelope));
+        h.worker.emit("exit", 1); await assert.rejects(pending);
+      } finally { await h.dispose(); }
+    }
+  } finally { await f.cleanup(); }
+});
+test("ordinary append receipt field collisions do not poison the parent owner", async t => {
+  const f = await makeGovernedNoteDomainFixture();
+  try {
+    for (const [name, response] of ordinaryResponses) await t.test(name, async () => {
+      const h = await parent(f);
+      try {
+        const command = ordinaryAppend(f, response), pending = h.executor.append(command), data = ordinaryResult(response);
+        h.worker.respond(h.worker.posted.at(-1)!, data);
+        const actual = await pending;
+        assert.deepEqual(actual.response, response); assert.equal(actual.firstGlobalPosition, 1n); assert.deepEqual(actual.eventIds, data.eventIds);
+        assert.equal(h.executor.canReuse(), true); assert.equal(h.worker.terminateCalls, 0);
+      } finally { await h.dispose(); }
+    });
+  } finally { await f.cleanup(); }
+});
+test("outer envelope proxies are rejected before any generic or parent correlation trap", async t => {
+  const f = await makeGovernedNoteDomainFixture();
+  try {
+    const p = f.prepareCreate(f.command()), data = encodeAppendResultWire(f.service().create(p, f.rootContext));
+    for (const boundary of ["generic", "parent"] as const) await t.test(boundary, async () => {
+      const h = await parent(f); let traps = 0;
+      try {
+        const pending = h.executor.createGovernedNote(p), request = h.worker.posted.at(-1)!;
+        const proxy = new Proxy({ id: request.id, ok: true, data }, {
+          getPrototypeOf() { traps++; throw new Error(SECRET); },
+          getOwnPropertyDescriptor() { traps++; throw new Error(SECRET); },
+        });
+        if (boundary === "generic") { assert.throws(() => decodeWorkerResponse(proxy)); h.worker.emit("exit", 1); }
+        else h.worker.emit("message", proxy);
+        await assert.rejects(pending, safe("COMMAND_OUTCOME_UNKNOWN", ids(p)));
+        assert.equal(traps, 0); assert.equal(h.executor.canReuse(), false);
+      } finally { await h.dispose(); }
+    });
+  } finally { await f.cleanup(); }
 });
