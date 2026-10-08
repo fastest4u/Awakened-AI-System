@@ -1,3 +1,7 @@
+import { GovernedNoteError } from "../governed-notes/errors.js";
+import { decodePreparedGovernedNoteCreateV1, decodePreparedGovernedNoteRecoveryV1 } from "../governed-notes/codec.js";
+import type { GovernedNoteRuntime, GovernedNoteRuntimeFactoryPort } from "../governed-notes/contracts.js";
+import { decodeGovernedNoteWorkerResponse, governedNoteRequestIds, isGovernedNoteRequest, sanitizeGovernedNoteError, type GovernedNoteWorkerRequest } from "../governed-notes/worker-protocol.js";
 import { randomUUID } from "node:crypto";
 import { RetainedEvidenceError } from "../privacy/evidence-contracts.js";
 import { decodePreparedRetainedEvidenceCommand, decodeRetainedEvidenceWorkerResponse } from "../privacy/retained-evidence-worker-protocol.js";
@@ -97,6 +101,7 @@ export interface ProjectStoreWorkerBackendOptions {
   appendRetryDeadlineMs: number;
   readonly keyProvider?: CapabilityKeyProvider;
   readonly lifecycleRuntimeFactory?: LifecycleWorkerRuntimeFactoryPort;
+  readonly governedNoteRuntimeFactory?: GovernedNoteRuntimeFactoryPort;
   readonly retainedEvidenceRuntimeFactory?: RetainedEvidenceRuntimeFactoryPort;
   afterReadOnlyIdentityVerified?: () => void;
   integrityWorkerFactory?: (
@@ -351,6 +356,7 @@ interface ActiveStore {
   eventStore: EventStore;
   lifecycleRuntime: LifecycleWorkerRuntime | null;
   retainedEvidenceRuntime: RetainedEvidenceRuntime | null;
+  governedNoteRuntime: GovernedNoteRuntime | null;
   executorId: string;
 }
 
@@ -374,6 +380,7 @@ export class ProjectStoreWorkerBackend implements WorkerRuntimeBackend {
   }
 
   async dispatch(request: WorkerRequest): Promise<WorkerSuccessData> {
+    if (isGovernedNoteRequest(request)) return this.governedNote(request);
     if (this.#closed && request.type !== "ping") failure("WORKER_CLOSED");
     switch (request.type) {
       case "ping": return this.ping();
@@ -533,6 +540,7 @@ export class ProjectStoreWorkerBackend implements WorkerRuntimeBackend {
     });
     let lifecycleRuntime: LifecycleWorkerRuntime | null = null;
     let retainedEvidenceRuntime: RetainedEvidenceRuntime | null = null;
+    let governedNoteRuntime: GovernedNoteRuntime | null = null;
     let registrationBegan = false;
     try {
       const maintenance = this.#options.maintenanceFactory?.() ?? new MaintenanceFence();
@@ -573,6 +581,10 @@ export class ProjectStoreWorkerBackend implements WorkerRuntimeBackend {
           retainedEvidenceRuntime = this.#options.retainedEvidenceRuntimeFactory.create({ connection, maintenanceFence: maintenance, keyProvider: this.#options.keyProvider });
         } catch { throw new RetainedEvidenceError("RETAINED_EVIDENCE_UNAVAILABLE"); }
       }
+      if (this.#options.governedNoteRuntimeFactory !== undefined && this.#options.keyProvider !== undefined) {
+        try { governedNoteRuntime = this.#options.governedNoteRuntimeFactory.create({ connection, maintenanceFence: maintenance, keyProvider: this.#options.keyProvider }); }
+        catch { throw new GovernedNoteError("GOVERNED_NOTE_UNAVAILABLE"); }
+      }
       connection.exec("BEGIN IMMEDIATE");
       registrationBegan = true;
       assertFreshStartConnectionAllowed(connection, "command-recovery");
@@ -600,6 +612,7 @@ export class ProjectStoreWorkerBackend implements WorkerRuntimeBackend {
         eventStore,
         lifecycleRuntime,
         retainedEvidenceRuntime,
+        governedNoteRuntime,
         executorId,
       };
       return {
@@ -653,6 +666,36 @@ export class ProjectStoreWorkerBackend implements WorkerRuntimeBackend {
         }
       }
       throw error;
+    }
+  }
+
+  private async governedNote(request: GovernedNoteWorkerRequest): Promise<WorkerSuccessData> {
+    const ids = governedNoteRequestIds(request);
+    let active: ActiveStore | undefined, returned = false;
+    try {
+      active = this.requireActive(request.binding);
+      const runtime = active.governedNoteRuntime;
+      if (runtime === null) throw new GovernedNoteError("GOVERNED_NOTE_UNAVAILABLE");
+      const context = active.context;
+      const data = request.type === "governed-note-create"
+        ? encodeAppendResultWire(await retryPrimarySqliteBusy(() => {
+          const result = runtime.create(decodePreparedGovernedNoteCreateV1(request.prepared), context);
+          returned = true;
+          return result;
+        }, { deadlineMs: this.#options.appendRetryDeadlineMs }))
+        : runtime.recover(decodePreparedGovernedNoteRecoveryV1(request.prepared), context);
+      returned = true;
+      const response = decodeGovernedNoteWorkerResponse({ id: request.id, ok: true, data }, request);
+      if (!response.ok) throw new GovernedNoteError("WORKER_PROTOCOL_ERROR");
+      return response.data;
+    } catch (error) {
+      let safe = sanitizeGovernedNoteError(error, ids);
+      if (request.type === "governed-note-recover" && (safe.code === "COMMAND_OUTCOME_UNKNOWN" || safe.code === "GOVERNED_NOTE_OWNERSHIP_UNCERTAIN")) safe = new GovernedNoteError("WORKER_UNAVAILABLE");
+      if (request.type === "governed-note-create" && (returned || safe.code === "COMMAND_OUTCOME_UNKNOWN")) safe = new GovernedNoteError("COMMAND_OUTCOME_UNKNOWN", ids);
+      if (safe.code === "COMMAND_OUTCOME_UNKNOWN" && active) {
+        try { await this.closeHandles(active); } catch { /* Parent preserves original identity and poisons this owner. */ }
+      }
+      throw safe;
     }
   }
 

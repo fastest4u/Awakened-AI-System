@@ -1,3 +1,6 @@
+import { decodePreparedGovernedNoteCreateV1, decodePreparedGovernedNoteRecoveryV1, encodePreparedGovernedNoteCreateV1, encodePreparedGovernedNoteRecoveryV1 } from "../governed-notes/codec.js";
+import type { PreparedGovernedNoteCreateV1, PreparedGovernedNoteRecoveryV1, GovernedNoteStoredReceiptV1, GovernedNoteRecoveryResultV1, GovernedNoteRecoveryIdsV1 } from "../governed-notes/contracts.js";
+import { assertGovernedNoteEnvelopeSize, isGovernedNoteRequest, sanitizeGovernedNoteError } from "../governed-notes/worker-protocol.js";
 import { randomUUID } from "node:crypto";
 import type { RetainedEvidenceReceiptV1 } from "../privacy/evidence-contracts.js";
 import { encodePreparedRetainedEvidenceCommand, type PreparedRetainedEvidenceCommandV1 } from "../privacy/retained-evidence-worker-protocol.js";
@@ -648,6 +651,31 @@ export class ProjectStoreExecutor {
       .then(value => decodeAppendResultWire(value) as AppendResult<RetainedEvidenceReceiptV1>);
   }
 
+  async createGovernedNote(prepared: PreparedGovernedNoteCreateV1): Promise<AppendResult<GovernedNoteStoredReceiptV1>> {
+    let ids: GovernedNoteRecoveryIdsV1 | null = null;
+    try {
+      const wire = encodePreparedGovernedNoteCreateV1(prepared);
+      const owned = decodePreparedGovernedNoteCreateV1(wire);
+      ids = { commandId: owned.command.commandId, idempotencyKey: owned.command.idempotencyKey };
+      this.assertCallable(["open"]);
+      const result = await this.request({ id: "", type: "governed-note-create", binding: encodeWorkerBindingAssertion(this.#options.context), prepared: wire },
+        "mutation", semanticIdentity(this.#options.context.binding.projectId, ids.commandId, ids.idempotencyKey));
+      return decodeAppendResultWire(result) as AppendResult<GovernedNoteStoredReceiptV1>;
+    } catch (error) { throw sanitizeGovernedNoteError(error, ids); }
+  }
+
+  async recoverGovernedNoteResult(prepared: PreparedGovernedNoteRecoveryV1): Promise<GovernedNoteRecoveryResultV1> {
+    let ids: GovernedNoteRecoveryIdsV1 | null = null;
+    try {
+      const wire = encodePreparedGovernedNoteRecoveryV1(prepared);
+      const owned = decodePreparedGovernedNoteRecoveryV1(wire);
+      ids = { commandId: owned.request.commandId, idempotencyKey: owned.request.idempotencyKey };
+      this.assertCallable(["open"]);
+      return await this.request({ id: "", type: "governed-note-recover", binding: encodeWorkerBindingAssertion(this.#options.context), prepared: wire },
+        "bounded", null) as GovernedNoteRecoveryResultV1;
+    } catch (error) { throw sanitizeGovernedNoteError(error, ids); }
+  }
+
   executeLifecycleMutation<C extends LifecycleSemanticCommandDraft>(
     command: PreparedLifecycleWorkerCommand<C>,
   ): Promise<LifecycleExecutionResult<LifecycleResultFor<C>>> {
@@ -1053,7 +1081,7 @@ export class ProjectStoreExecutor {
     }
     const id = `${this.#dependencies.randomId()}:${++this.#sequence}`;
     const candidate = { ...request, id } as WorkerRequest;
-    const completeRequest = candidate.type === "lifecycle" || candidate.type === "retained-evidence"
+    const completeRequest = candidate.type === "lifecycle" || candidate.type === "retained-evidence" || isGovernedNoteRequest(candidate)
       ? decodeWorkerRequest(candidate)
       : candidate;
     return new Promise<unknown>((resolveRequest, rejectRequest) => {
@@ -1086,6 +1114,11 @@ export class ProjectStoreExecutor {
   private onMessage(value: unknown): void {
     let message: WorkerMessage;
     try {
+      // Known governed responses are bounded while still raw, including errors and
+      // malformed data that would otherwise enter a generic decoder first.
+      const id = typeof value === "object" && value !== null ? Object.getOwnPropertyDescriptor(value, "id")?.value as unknown : undefined;
+      const expected = typeof id === "string" ? this.#pending.get(id)?.request : undefined;
+      if (expected && isGovernedNoteRequest(expected)) assertGovernedNoteEnvelopeSize(value);
       message = decodeWorkerMessage(value);
     } catch {
       this.poisonInBackground(new ProjectStoreWorkerError("WORKER_PROTOCOL_ERROR"));
@@ -1102,7 +1135,16 @@ export class ProjectStoreExecutor {
     }
     let response: WorkerResponse;
     try {
-      response = decodeWorkerResponseForRequest(message, pending.request);
+      response = decodeWorkerResponseForRequest(value, pending.request);
+      if (response.ok && isGovernedNoteRequest(pending.request)) {
+        assertDecodedLifecycleContextBinding(response.data as unknown as JsonValue, this.#options.context);
+        const data = response.data as { response?: GovernedNoteStoredReceiptV1; receipt?: GovernedNoteStoredReceiptV1 };
+        const scope = (data.response ?? data.receipt)?.scope;
+        const context = this.#options.context;
+        if (scope && (scope.branchRef !== (context.workspace.kind === "git" ? context.workspace.branchRef : null)
+          || (context.branchScopeId !== undefined && scope.branchScopeId !== context.branchScopeId)
+          || (context.workspace.kind !== "git" && scope.branchScopeId !== null))) throw new ProjectStoreWorkerError("WORKER_PROTOCOL_ERROR");
+      }
       if (response.ok && pending.request.type === "lifecycle") {
         const success = response.data as LifecycleWorkerSuccessWire;
         assertDecodedLifecycleContextBinding(success.result, this.#options.context);
@@ -1120,7 +1162,9 @@ export class ProjectStoreExecutor {
       );
       const uncertain = reported.code === "COMMAND_OUTCOME_UNKNOWN"
         || reported.code === "OPERATION_OUTCOME_UNKNOWN"
-        || reported.code === "WORKER_PROTOCOL_ERROR";
+        || reported.code === "WORKER_PROTOCOL_ERROR"
+        || (isGovernedNoteRequest(pending.request) && (reported.code === "GOVERNED_NOTE_OWNERSHIP_UNCERTAIN"
+          || (pending.request.type === "governed-note-create" && reported.code === "INTEGRITY_FAILURE")));
       const exactUnknown = uncertain
         ? this.unknownOutcome(pending)
         : null;
@@ -1137,7 +1181,7 @@ export class ProjectStoreExecutor {
       }
     } else {
       try {
-        if (pending.identity?.kind !== "semantic" || pending.request.type === "retained-evidence") {
+        if (pending.identity?.kind !== "semantic" || pending.request.type === "retained-evidence" || pending.request.type === "governed-note-create") {
           this.#invokeResponseDeliveryFault(pending.identity);
         }
       } catch {

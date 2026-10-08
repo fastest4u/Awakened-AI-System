@@ -1,3 +1,5 @@
+import { decodeGovernedNoteWorkerResponse, governedNoteRequestIds, isGovernedNoteRequest, sanitizeGovernedNoteError } from "../governed-notes/worker-protocol.js";
+import { GovernedNoteError } from "../governed-notes/errors.js";
 import type { JsonValue } from "../contracts/event.js";
 import {
   decodeWorkerRequest,
@@ -154,7 +156,7 @@ export class ProjectStoreWorkerRuntime {
       return;
     }
     if (this.#closing) {
-      this.postFailure(request.id, { code: "MAINTENANCE_QUIESCING", details: {} });
+      this.postRequestFailure(request, { code: "MAINTENANCE_QUIESCING", details: {} });
       return;
     }
     if (this.#quiescing) {
@@ -167,11 +169,11 @@ export class ProjectStoreWorkerRuntime {
         } else if (sameMaintenanceLeaseWire(request.lease, this.#observedQuiesce.lease)) {
           this.#observedQuiesce.requestIds.push(request.id);
         } else {
-          this.postFailure(request.id, { code: "MAINTENANCE_QUIESCING", details: {} });
+          this.postRequestFailure(request, { code: "MAINTENANCE_QUIESCING", details: {} });
         }
         return;
       }
-      this.postFailure(request.id, { code: "MAINTENANCE_QUIESCING", details: {} });
+      this.postRequestFailure(request, { code: "MAINTENANCE_QUIESCING", details: {} });
       return;
     }
     if (request.type === "quiesce") this.#quiescing = true;
@@ -187,7 +189,7 @@ export class ProjectStoreWorkerRuntime {
         await this.#backend.close();
         this.#port.postMessage({ id: request.id, ok: true, data: { closed: true } });
       } catch (error) {
-        this.postFailure(request.id, safeError(error));
+        this.postRequestFailure(request, error);
       } finally {
         this.#port.close();
       }
@@ -216,7 +218,7 @@ export class ProjectStoreWorkerRuntime {
           connectionClosed: true,
         });
       } catch (error) {
-        this.postFailure(request.id, safeError(error));
+        this.postRequestFailure(request, error);
       } finally {
         this.#closing = true;
         this.#port.close();
@@ -225,7 +227,11 @@ export class ProjectStoreWorkerRuntime {
     }
     try {
       const data = await this.#backend.dispatch(request);
-      this.#port.postMessage({ id: request.id, ok: true, data });
+      const response = { id: request.id, ok: true, data };
+      if (isGovernedNoteRequest(request)) {
+        try { this.#port.postMessage(decodeGovernedNoteWorkerResponse(response, request)); }
+        catch { throw new GovernedNoteError(request.type === "governed-note-create" ? "COMMAND_OUTCOME_UNKNOWN" : "WORKER_PROTOCOL_ERROR", governedNoteRequestIds(request)); }
+      } else this.#port.postMessage(response);
       if (request.type === "open") {
         this.#binding = {
           projectId: request.binding.projectId,
@@ -242,7 +248,7 @@ export class ProjectStoreWorkerRuntime {
         this.#port.close();
       }
     } catch (error) {
-      this.postFailure(request.id, safeError(error));
+      this.postRequestFailure(request, error);
       if (request.type === "open" || request.type === "verifyIdentity" || request.type === "inspectExisting") {
         this.#closing = true;
         this.#port.close();
@@ -308,6 +314,15 @@ export class ProjectStoreWorkerRuntime {
         this.#port.close();
       }
     }).catch(() => this.stop());
+  }
+
+  private postRequestFailure(request: WorkerRequest, error: unknown): void {
+    if (!isGovernedNoteRequest(request)) { this.postFailure(request.id, safeError(error)); return; }
+    try {
+      const safe = sanitizeGovernedNoteError(error, governedNoteRequestIds(request));
+      const response = decodeGovernedNoteWorkerResponse({ id: request.id, ok: false, error: { code: safe.code, message: safe.message, details: safe.details } }, request);
+      this.#port.postMessage(response);
+    } catch { this.stop(); }
   }
 
   private postFailure(id: string, error: SafeRuntimeError): void {

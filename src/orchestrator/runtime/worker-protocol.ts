@@ -1,3 +1,6 @@
+import { decodePreparedGovernedNoteCreateV1, decodePreparedGovernedNoteRecoveryV1, encodePreparedGovernedNoteCreateV1, encodePreparedGovernedNoteRecoveryV1 } from "../governed-notes/codec.js";
+import type { PreparedGovernedNoteCreateWireV1, PreparedGovernedNoteRecoveryWireV1, GovernedNoteRecoveryResultV1 } from "../governed-notes/contracts.js";
+import { assertGovernedNoteEnvelopeSize, decodeGovernedNoteWorkerResponse, decodeUnknownGovernedNoteSuccess, governedNoteSuccessKind, isGovernedNoteRequest } from "../governed-notes/worker-protocol.js";
 import type {
   AppendCommand,
   AppendResult,
@@ -323,6 +326,8 @@ export type WorkerRequest =
   | { id: string; type: "open"; binding: WorkerBinding; freshStart?: FreshStartContextWire }
   | { id: string; type: "append"; binding: WorkerBindingAssertion; command: AppendCommandWire }
   | { id: string; type: "lifecycle"; binding: WorkerBindingAssertion; operation: LifecycleWorkerOperationWire }
+  | { id: string; type: "governed-note-create"; binding: WorkerBindingAssertion; prepared: PreparedGovernedNoteCreateWireV1 }
+  | { id: string; type: "governed-note-recover"; binding: WorkerBindingAssertion; prepared: PreparedGovernedNoteRecoveryWireV1 }
   | { id: string; type: "retained-evidence"; binding: WorkerBindingAssertion; prepared: PreparedRetainedEvidenceCommandWireV1 }
   | { id: string; type: "quickIntegrity"; binding: WorkerBindingAssertion; tailLimit: number }
   | { id: string; type: "fullIntegrity"; binding: WorkerBindingAssertion }
@@ -330,6 +335,7 @@ export type WorkerRequest =
   | { id: string; type: "close" };
 
 export type WorkerSuccessData =
+  | GovernedNoteRecoveryResultV1
   | WorkerPingResult
   | WorkerOpenResult
   | StoreIdentityWire
@@ -752,6 +758,15 @@ export function decodeWorkerRequest(value: unknown): WorkerRequest {
     case "append":
       exact(value, ["id", "type", "binding", "command"]);
       return { id, type, binding: decodeAssertion(request.binding), command: decodeAppendCommandWireShape(request.command) };
+    case "governed-note-create":
+    case "governed-note-recover": {
+      exact(value, ["id", "type", "binding", "prepared"]);
+      assertGovernedNoteEnvelopeSize(value, 4 * 1024 * 1024);
+      const binding = Object.freeze(decodeAssertion(request.binding));
+      return type === "governed-note-create"
+        ? Object.freeze({ id, type, binding, prepared: encodePreparedGovernedNoteCreateV1(decodePreparedGovernedNoteCreateV1(request.prepared)) })
+        : Object.freeze({ id, type, binding, prepared: encodePreparedGovernedNoteRecoveryV1(decodePreparedGovernedNoteRecoveryV1(request.prepared)) });
+    }
     case "retained-evidence": {
       exact(value, ["id", "type", "binding", "prepared"]);
       assertRetainedEvidenceWireSize(value);
@@ -1016,6 +1031,13 @@ function decodeSuccessForType(
       }
       return opened;
     }
+    case "governed-note-create":
+    case "governed-note-recover": {
+      if (!request || !isGovernedNoteRequest(request)) invalid();
+      const response = decodeGovernedNoteWorkerResponse({ id: request.id, ok: true, data: value }, request);
+      if (!response.ok) invalid();
+      return response.data;
+    }
     case "append": return encodeAppendResultWire(decodeAppendResultWire(value));
     case "retained-evidence": {
       if (request?.type !== "retained-evidence") invalid();
@@ -1051,6 +1073,7 @@ function decodeSuccessForType(
 }
 
 function decodeUnknownSuccess(value: unknown): WorkerSuccessData {
+  if (governedNoteSuccessKind(value) !== null) return decodeUnknownGovernedNoteSuccess(value);
   const decoders: Array<(input: unknown) => WorkerSuccessData> = [
     decodePing,
     decodeOpen,
@@ -1103,6 +1126,7 @@ export function decodeWorkerResponse(value: unknown): WorkerResponse {
   if (response.ok === false) return decodeFailure(value);
   exact(value, ["id", "ok", "data"]);
   if (response.ok !== true) invalid();
+  if (governedNoteSuccessKind(response.data) !== null) assertGovernedNoteEnvelopeSize(value);
   return { id: string(response.id), ok: true, data: decodeUnknownSuccess(response.data) };
 }
 
@@ -1110,6 +1134,7 @@ export function decodeWorkerResponseForRequest(
   value: unknown,
   request: WorkerRequest,
 ): WorkerResponse {
+  if (isGovernedNoteRequest(request)) return decodeGovernedNoteWorkerResponse(value, request);
   if (request.type === "retained-evidence") return decodeRetainedEvidenceWorkerResponse(value, request.id, decodePreparedRetainedEvidenceCommand(request.prepared));
   const response = record(value);
   if (response.id !== request.id) invalid();
