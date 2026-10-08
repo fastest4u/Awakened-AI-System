@@ -4,7 +4,7 @@ import { lstatSync, readFileSync, readdirSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { performance } from 'node:perf_hooks';
 import { StringDecoder } from 'node:string_decoder';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { runFixedStages } from './run-v2-internal-verified-read.js';
 import { parseFinalSpecCounts } from './run-v2-retained-evidence.js';
 
@@ -140,6 +140,53 @@ function compiledIdentity(root) {
   return { files: inputs.length, sha256: sha(canonical(inputs)), listedTests };
 }
 
+/** Best-effort numeric hints for the current spec reporter; never acceptance evidence. */
+export function parseWorkflowFailureDiagnostics(stdout, compiledTestPath, root, failedCount) {
+  const unavailable = { status: 'unavailable', truncated: false, sites: [] };
+  try {
+    if (typeof stdout !== 'string' || stdout.length > 16 * 1024 * 1024 || typeof root !== 'string'
+      || typeof compiledTestPath !== 'string' || !Number.isSafeInteger(failedCount) || failedCount < 1) return unavailable;
+    const expected = compiledTestPath.replaceAll('\\', '/');
+    if (!/^dist-test\/tests\/[a-z0-9-]+\.test\.js$/.test(expected)) return unavailable;
+    const counts = parseFinalSpecCounts(stdout);
+    if (counts.fail !== failedCount || !Number.isSafeInteger(counts.tests) || counts.tests < 1) return unavailable;
+    const absolute = resolve(root, expected), normalize = path => path.replaceAll('\\', '/');
+    const paths = new Set([expected, normalize(absolute), pathToFileURL(absolute).href]);
+    const location = value => {
+      const match = /^(.+):([0-9]+):([0-9]+)$/.exec(value);
+      if (!match || !paths.has(normalize(match[1]))) return;
+      const line = Number(match[2]), column = Number(match[3]);
+      if (Number.isSafeInteger(line) && line > 0 && Number.isSafeInteger(column) && column > 0) return { line, column };
+    };
+    const lines = stdout.split(/\r?\n/), end = lines.findLastIndex(line => line.startsWith('ℹ duration_ms '));
+    const section = lines.slice(end + 1);
+    if (section[0] !== '' || section[1] !== '✖ failing tests:' || section[2] !== '') return unavailable;
+    const sites = []; let current, blocks = 0, matched = 0, truncated = false;
+    for (const line of section.slice(3)) {
+      if (line.startsWith('test at ')) {
+        current = undefined; blocks++;
+        const found = location(line.slice(8));
+        if (!found) continue;
+        matched++;
+        if (sites.length === 16) { truncated = true; continue; }
+        current = { testLine: found.line, testColumn: found.column }; sites.push(current);
+      } else if (current) {
+        const code = /^\s+(?:AssertionError|Error) \[(ERR_ASSERTION|ERR_TEST_FAILURE)\]:/.exec(line)
+          ?? /^\s+code: '(ERR_ASSERTION|ERR_TEST_FAILURE)',?$/.exec(line);
+        if (code && !current.code) current.code = code[1];
+        if (/^\s+failureType: 'testTimeoutFailure',?$/.test(line)) current.kind = 'testTimeoutFailure';
+        const frame = /^\s+at (.+)$/.exec(line);
+        if (frame && current.assertionLine === undefined) {
+          const found = location(/\(([^()]+)\)$/.exec(frame[1])?.[1] ?? frame[1]);
+          if (found) { current.assertionLine = found.line; current.assertionColumn = found.column; }
+        }
+      }
+    }
+    return { status: sites.length === 0 ? 'unavailable' : !truncated && matched === failedCount && blocks === failedCount ? 'matched' : 'partial',
+      truncated, sites };
+  } catch { return unavailable; }
+}
+
 /** Owned-root test seam. The command line cannot select roots, stages or providers. */
 export async function runNativeReadWorkflowsGate({ root = repository, timeoutMs = 2100000, signal } = {}) {
   const deadline = performance.now() + timeoutMs;
@@ -171,6 +218,8 @@ export async function runNativeReadWorkflowsGate({ root = repository, timeoutMs 
       const validCounts = !isTest || Number.isSafeInteger(counts.tests) && counts.tests > 0 && counts.fail === 0
         && counts.cancelled === 0 && counts.todo === 0 && counts.pass + counts.skipped === counts.tests;
       const observed = { ...receipt, counts, outputBytes: stream.bytes, outputSha256: stream.hash.digest('hex'), outputOverflow: stream.overflow };
+      if (isTest && receipt.code !== 0 && !stream.overflow && Number.isSafeInteger(counts.fail) && counts.fail > 0)
+        observed.failureDiagnostics = parseWorkflowFailureDiagnostics(stream.stdout, `dist-test/tests/${receipt.stage}.test.js`, currentRoot, counts.fail);
       receipts.push(observed); emit(observed); stream.stdout = ''; streams.delete(receipt.stage);
       // Preserve an actual primary native failure; its receipt is never qualification.
       if (receipt.code !== 0) return;

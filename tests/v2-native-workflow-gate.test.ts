@@ -7,6 +7,7 @@ import childProcess from 'node:child_process';
 import fs from 'node:fs';
 import { syncBuiltinESMExports } from 'node:module';
 import test from 'node:test';
+import { pathToFileURL } from 'node:url';
 const names = [
     'v2-native-workflow-contracts', 'v2-native-workflow-database', 'v2-native-workflow-cursor', 'v2-native-workflow-query', 'v2-native-workflow-result', 'v2-native-workflow-entry', 'v2-native-workflow-gate', 'v2-native-content-contracts', 'v2-native-content-query', 'v2-native-content-result', 'v2-native-content-child', 'v2-native-content-supervisor', 'v2-native-content-entry', 'v2-native-content-gate', 'v2-internal-verified-read-contracts', 'v2-internal-verified-read-admission', 'v2-internal-verified-read-child', 'v2-internal-verified-read-cleanup', 'v2-internal-verified-read-ownership', 'v2-internal-verified-read-supervisor', 'v2-internal-verified-read-entry', 'v2-internal-verified-read-gate', 'retrieval-database-core', 'retrieval-selection-core', 'retrieval-candidates', 'v2-retrieval-candidates', 'retrieval-eligibility', 'retrieval-ranking', 'ci-lifecycle-gates'
 ];
@@ -27,6 +28,67 @@ async function gate(): Promise<Run> {
     assert.equal(typeof module?.runNativeReadWorkflowsGate, 'function', 'fixed workflow gate export is absent');
     return module.runNativeReadWorkflowsGate;
 }
+type FailureSite = { testLine: number; testColumn: number; assertionLine?: number; assertionColumn?: number;
+    code?: 'ERR_ASSERTION' | 'ERR_TEST_FAILURE'; kind?: 'testTimeoutFailure' };
+type FailureDiagnostics = { status: 'matched' | 'partial' | 'unavailable'; truncated: boolean; sites: FailureSite[] };
+async function failureParser(): Promise<(stdout: string, compiledTestPath: string, root: string, failedCount: number) => FailureDiagnostics> {
+    const module: any = await import(new URL('../../scripts/run-v2-native-read-workflows.js', import.meta.url).href);
+    assert.equal(typeof module.parseWorkflowFailureDiagnostics, 'function', 'safe failure diagnostics helper is absent');
+    return module.parseWorkflowFailureDiagnostics;
+}
+function failedSpec(body: string, fail = 1) {
+    return ['✖ private title canary', `ℹ tests ${fail}`, 'ℹ suites 0', 'ℹ pass 0', `ℹ fail ${fail}`,
+        'ℹ cancelled 0', 'ℹ skipped 0', 'ℹ todo 0', 'ℹ duration_ms 1', '', '✖ failing tests:', '', body, ''].join('\n');
+}
+test('workflow_gate_failure_diagnostics_syntax_order_and_safe_projection', async () => {
+    const parse = await failureParser(), root = process.cwd(), path = 'dist-test/tests/v2-native-workflow-gate.test.js';
+    const absolute = join(root, path), url = pathToFileURL(absolute).href;
+    const stdout = failedSpec([
+        `test at ${path.replaceAll('/', '\\')}:277:5`, '✖ PRIVATE_TITLE_CANARY',
+        '  AssertionError [ERR_ASSERTION]: PRIVATE_MESSAGE_CANARY',
+        `      at TestContext.<anonymous> (${url}:287:20)`,
+        "    code: 'PRIVATE_CODE_CANARY',", '    actual: PRIVATE_ACTUAL_CANARY,',
+        `test at ${absolute.replaceAll('\\', '/')}:277:5`, '✖ PRIVATE_SECOND_TITLE_CANARY',
+        "    code: 'ERR_TEST_FAILURE',", "    failureType: 'testTimeoutFailure',",
+        `      at TestContext.<anonymous> (${join(root, 'outside.test.js')}:900:1)`,
+        `      at TestContext.<anonymous> (${absolute}:282:20)`
+    ].join('\n'), 2);
+    const result = parse(stdout, path, root, 2);
+    assert.deepEqual(result, { status: 'matched', truncated: false, sites: [
+        { testLine: 277, testColumn: 5, assertionLine: 287, assertionColumn: 20, code: 'ERR_ASSERTION' },
+        { testLine: 277, testColumn: 5, assertionLine: 282, assertionColumn: 20, code: 'ERR_TEST_FAILURE', kind: 'testTimeoutFailure' }
+    ] });
+    assert.doesNotMatch(JSON.stringify(result), /PRIVATE_|test\.js|file:|stack|actual|message|title/);
+});
+test('workflow_gate_failure_diagnostics_unavailable_partial_and_foreign_paths', async () => {
+    const parse = await failureParser(), root = process.cwd(), path = 'dist-test/tests/v2-native-workflow-gate.test.js';
+    const unavailable = { status: 'unavailable', truncated: false, sites: [] };
+    for (const body of [
+        `test at ${join(root, 'sibling', path)}:3:1`, `test at ../${path}:3:1`,
+        `test at ${path}:0:1`, `test at ${path}:-1:1`, `test at ${path}:3:0`,
+        `test at ${path}:9007199254740992:1`, `test at ${path}:3:9007199254740992`,
+        `test at ${path}:NaN:1`
+    ]) assert.deepEqual(parse(failedSpec(body), path, root, 1), unavailable);
+    assert.deepEqual(parse('', path, root, 1), unavailable);
+    assert.deepEqual(parse(failedSpec(`test at ${path}:3:1`).replace('ℹ fail 1', 'ℹ fail broken'), path, root, 1), unavailable);
+    assert.deepEqual(parse(failedSpec(`test at ${path}:3:1`), path, root, 2), unavailable);
+    assert.deepEqual(parse(failedSpec(`test at ${path}:3:1`).trimEnd(), path, root, 1), unavailable);
+    const nested = failedSpec(`test at ${path}:500:1`) + '✔ outer passed\nℹ tests 1\nℹ suites 0\nℹ pass 1\nℹ fail 0\nℹ cancelled 0\nℹ skipped 0\nℹ todo 0\nℹ duration_ms 2\n';
+    assert.deepEqual(parse(nested, path, root, 1), unavailable);
+    const partial = failedSpec(`test at ${path}:3:1\n    code: 'PRIVATE_CODE_CANARY',\n    failureType: 'privateFailure',\n      at TestContext.<anonymous> (${join(root, 'sibling', path)}:4:10)\ntest at ../${path}:9:1`, 2);
+    assert.deepEqual(parse(partial, path, root, 2), { status: 'partial', truncated: false, sites: [{ testLine: 3, testColumn: 1 }] });
+    assert.deepEqual(parse(failedSpec(`test at ${path}:3:1\n      at TestContext.<anonymous> (${join(root, path)}:0:1)`), path, root, 1),
+        { status: 'matched', truncated: false, sites: [{ testLine: 3, testColumn: 1 }] });
+});
+test('workflow_gate_failure_diagnostics_sixteen_site_bound', async () => {
+    const parse = await failureParser(), root = process.cwd(), path = 'dist-test/tests/v2-native-workflow-gate.test.js';
+    const result = parse(failedSpec(Array.from({ length: 17 }, (_, index) => `test at ${path}:${index + 1}:1\n    code: 'ERR_ASSERTION',`).join('\n'), 17), path, root, 17);
+    assert.equal(result.status, 'partial');
+    assert.equal(result.truncated, true);
+    assert.equal(result.sites.length, 16);
+    assert.deepEqual(result.sites.map(site => site.testLine), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]);
+    assert.ok(result.sites.every(site => site.testColumn === 1 && site.code === 'ERR_ASSERTION'));
+});
 function fixture() {
     const root = realpathSync.native(mkdtempSync(join(tmpdir(), 'workflow-gate-')));
     const put = (path: string, bytes: string) => {
@@ -248,6 +310,31 @@ const body={schemaVersion:1,deploymentId:'synthetic-owned',runtime:{nodeVersion:
 const native = {
     skip: process.platform !== 'win32', timeout: 180000
 };
+test('workflow_gate_failure_diagnostics_real_native_failed_test', native, async t => {
+    const run = await gate(), f = fixture();
+    try {
+        const path = `dist-test/tests/${names[0]}.test.js`;
+        f.put(path, "import assert from 'node:assert/strict';\nimport test from 'node:test';\ntest('PRIVATE_NATIVE_TITLE_CANARY', () => {\n  assert.fail('PRIVATE_NATIVE_MESSAGE_CANARY');\n});\n");
+        assert.equal(await f.run(run), 1);
+        const stages = f.events.filter(e => e.stage), receipt = stages.at(-1);
+        assert.equal(stages.length, 5);
+        assert.equal(receipt.stage, names[0]);
+        assert.equal(receipt.code, 1);
+        assert.equal(receipt.nativeCode, 1);
+        assert.deepEqual(receipt.counts, { tests: 1, suites: 0, pass: 0, fail: 1, cancelled: 0, skipped: 0, todo: 0 });
+        assert.ok(stages.every(e => e.cleanup === 'complete' && e.closure === 'windows-job-active-zero'));
+        assert.equal(existsSync(join(f.root, '.fresh-start-foundation.lock')), false);
+        assert.equal(f.events.some(e => e.observation === 'qualification'), false);
+        assert.ok(stages.slice(0, 4).every(e => !('failureDiagnostics' in e)));
+        t.diagnostic('actual failed test: native1; coherent fail1/pass0; stages5; complete Job-active-zero; lock absent; no qualification');
+        assert.deepEqual(receipt.failureDiagnostics, { status: 'matched', truncated: false,
+            sites: [{ testLine: 3, testColumn: 1, assertionLine: 4, assertionColumn: 10, code: 'ERR_ASSERTION' }] });
+        const safeJson = JSON.stringify(receipt);
+        assert.doesNotMatch(safeJson, /PRIVATE_NATIVE_|AssertionError|stack|file:/);
+        assert.equal(safeJson.includes(path), false);
+        assert.equal(safeJson.includes(f.root), false);
+    } finally { f.cleanup(); }
+});
 test('workflow_gate_exact_inventory_and_single_build', native, async (t) => {
     const run = await gate(), f = fixture();
     try {
