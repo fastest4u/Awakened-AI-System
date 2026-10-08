@@ -231,10 +231,14 @@ export class GovernedNoteAuthorityVerifier {
   bindingForCreate(handle: VerifiedGovernedNoteCreateAuthority): ProjectBinding { return this.createState(handle).binding; }
   bindingForRecovery(handle: VerifiedGovernedNoteRecoveryAuthority): ProjectBinding { return this.recoveryState(handle).binding; }
 }
-export function requireGovernedNoteCreateAuthority(connection: SqliteConnection, handle: VerifiedGovernedNoteCreateAuthority, command: GovernedNoteCommandV1): GovernedNoteAuthoritySnapshotV1 {
+export function requireGovernedNoteCreateAuthority(connection: SqliteConnection, handle: VerifiedGovernedNoteCreateAuthority, command: GovernedNoteCommandV1, expectedBinding?: ProjectBinding): GovernedNoteAuthoritySnapshotV1 {
   return safe(() => {
     const state = creates.get(handle);
     if (!state || state.connection !== connection || state.operation !== "create-governed-note" || canonicalJson(decodeGovernedNoteCommandV1(command)) !== state.canonical) return refuse();
-    return state.verifier.revalidateCreate(handle);
+    const snapshot = state.verifier.revalidateCreate(handle);
+    // The expected value is only an assertion: authority comes from the owned,
+    // revalidated binding captured with this exact handle and original command.
+    if (expectedBinding !== undefined && canonicalJson(expectedBinding) !== canonicalJson(state.binding)) refuse("SESSION_OWNERSHIP_MISMATCH");
+    return snapshot;
   });
 }

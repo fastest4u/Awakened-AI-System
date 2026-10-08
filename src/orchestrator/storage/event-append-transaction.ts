@@ -1539,9 +1539,24 @@ export class EventAppendTransaction {
   prepareGovernedNote(plan: GovernedNoteEventPlan, input: AppendCommand<GovernedNoteStoredReceiptV1>, payloadInput: GovernedNoteCreatedPayloadV1): PreparedEventAppend<GovernedNoteStoredReceiptV1> {
     const state = governedPlans.get(plan);
     if (!state || state.transaction !== this || state.prepared) throw new EventStoreError("COMMAND_INVALID");
-    const admitted = requireGovernedNoteCreateAuthority(this.connection, state.authority, state.command), command = immutableSnapshot(input);
+    const command = immutableSnapshot(input);
     const payload = decodeGovernedNoteCreatedPayloadV1(payloadInput), w = payload.witness, b = command.context.binding;
-    if (canonical(w.authority) !== canonical(admitted) || canonical(w.binding) !== canonical(deriveGovernedNoteBinding(this.connection, command.context, admitted.targetSessionId)) || w.commandId !== state.command.commandId || w.idempotencyKey !== state.command.idempotencyKey || w.recordKind !== state.command.recordKind || w.confidence !== state.command.confidence || canonical(w.provenance.map(({ kind, identity }) => ({ kind, identity }))) !== canonical(state.command.provenance) || w.recordId !== state.ids.recordId || w.noteEventId !== state.ids.noteEventId || w.sourceEventId !== state.ids.sourceEventId || command.commandType !== "create-governed-note" || command.commandId !== w.commandId || command.idempotencyKey !== w.idempotencyKey || command.streamType !== "governed-note" || command.streamId !== `governed-note/${admitted.targetSessionId}/${w.recordId}` || command.expectedStreamVersion !== 0n || command.events.length !== 2 || command.outbox.length !== 0 || command.lifecycleIntentWitness !== undefined || canonical(command.events[0]!.payload) !== canonical(payload) || b.clientNamespace !== admitted.clientNamespace || b.actorRole !== admitted.presentingActorRole || b.clientInstanceId !== admitted.presentingClientInstanceId) throw new EventStoreError("COMMAND_INVALID");
+    const admitted = requireGovernedNoteCreateAuthority(this.connection, state.authority, state.command, w.binding);
+    const appendBinding = deriveGovernedNoteBinding(this.connection, command.context, admitted.targetSessionId);
+    const authorityMismatch = canonical(w.authority) !== canonical(admitted)
+      || canonical(w.binding) !== canonical(appendBinding)
+      || b.clientNamespace !== admitted.clientNamespace || b.actorRole !== admitted.presentingActorRole
+      || b.clientInstanceId !== admitted.presentingClientInstanceId;
+    const witnessMismatch = w.commandId !== state.command.commandId || w.idempotencyKey !== state.command.idempotencyKey
+      || w.recordKind !== state.command.recordKind || w.confidence !== state.command.confidence
+      || canonical(w.provenance.map(({ kind, identity }) => ({ kind, identity }))) !== canonical(state.command.provenance)
+      || w.recordId !== state.ids.recordId || w.noteEventId !== state.ids.noteEventId || w.sourceEventId !== state.ids.sourceEventId;
+    const appendMismatch = command.commandType !== "create-governed-note" || command.commandId !== w.commandId
+      || command.idempotencyKey !== w.idempotencyKey || command.streamType !== "governed-note"
+      || command.streamId !== `governed-note/${admitted.targetSessionId}/${w.recordId}` || command.expectedStreamVersion !== 0n
+      || command.events.length !== 2 || command.outbox.length !== 0 || command.lifecycleIntentWitness !== undefined
+      || canonical(command.events[0]!.payload) !== canonical(payload);
+    if (authorityMismatch || witnessMismatch || appendMismatch) throw new EventStoreError("COMMAND_INVALID");
     if (!this.statements.matchesProjectIdentity(admitted.projectId, admitted.vaultId, admitted.storeId)) throw new EventStoreError("PROJECT_IDENTITY_MISMATCH");
     let index = 0;
     const ids = [state.ids.noteEventId, state.ids.sourceEventId];

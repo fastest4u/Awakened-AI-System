@@ -22,6 +22,7 @@ import type { StoredEvent, JsonValue } from "../src/orchestrator/contracts/event
 import type { GovernedNoteDomainFixtureV1 } from "./support/governed-note-domain-fixture.js";
 import { checkpointFixture } from "./support/lifecycle-fixtures.js";
 import { computeProjectContextFingerprint } from "../src/orchestrator/identity/project-binding.service.js";
+import type { ProjectContext } from "../src/orchestrator/identity/contracts.js";
 
 type Fixture = GovernedNoteDomainFixtureV1;
 function independentCanonical(value: unknown): string {
@@ -51,6 +52,37 @@ function commit(f: Fixture, input = setup(f)) {
   } catch (error) { f.connection.exec("ROLLBACK"); throw error; }
 }
 function snapshot(f: Fixture) { return Object.fromEntries(["events", "command_dedup", "streams", "outbox"].map(table => [table, f.connection.prepare(`SELECT * FROM ${table}`).all()])); }
+
+test("genuine branch-A plan refuses consistently substituted branch-B append binding before mutation", async t => {
+  const f = await makeGovernedNoteDomainFixture(); t.after(f.cleanup);
+  const contextFor = (branchRef: string): ProjectContext => {
+    const workspace = { kind: "git" as const, workspaceId: f.rootContext.binding.workspaceId, branchRef, headCommit: "a".repeat(40), detached: false, worktreeRoot: f.retained.root, gitDir: join(f.retained.root, ".git"), gitCommonDir: join(f.retained.root, ".git") };
+    const branchScopeId = new BranchScopeRepository().resolveOrCreate(f.connection, f.rootContext.binding.projectId, workspace, f.clock.now());
+    const context = { ...f.rootContext, workspace, branchScopeId, binding: { ...f.rootContext.binding, workspace } };
+    context.binding.contextFingerprint = computeProjectContextFingerprint(context.binding);
+    return context;
+  };
+  const branchA = contextFor("refs/heads/governed-a"), branchB = contextFor("refs/heads/governed-b");
+  const sourceInput = f.retained.invocation({ version: 1, commandType: "retain-evidence-batch", commandId: randomUUID(), idempotencyKey: randomUUID(), targetSessionId: f.retained.rootAuthority.sessionId, conversationId: randomUUID(), frames: [{ frameId: randomUUID(), ordinal: "0", role: "user", category: "user-message", occurredAt: f.clock.now(), mediaType: "text/plain; charset=utf-8", content: "Genuine branch-A attribution", previousFrameId: null, toolCorrelationId: null, artifactHashes: [] }] }, f.retained.rootAuthority, branchA);
+  let sourceEventId: string;
+  try { sourceEventId = f.retained.service().retain(sourceInput).eventIds[0]!; }
+  finally { sourceInput.input.canonicalOriginalBytes.fill(0); }
+  const command = f.command({ provenance: [{ kind: "source-event", identity: sourceEventId }] });
+  const input = f.prepareNote(f.prepareCreate(command, branchA), branchA);
+  const admittedBinding = f.verifier.bindingForCreate(input.handle);
+  assert.equal(admittedBinding.branchRef, branchA.workspace.kind === "git" ? branchA.workspace.branchRef : null);
+  const substitutedBinding = { ...admittedBinding, branchRef: branchB.workspace.kind === "git" ? branchB.workspace.branchRef : null, branchScopeId: branchB.branchScopeId! };
+  const payload = { ...input.payload, witness: { ...input.payload.witness, binding: substitutedBinding } };
+  const append = { ...input.append, context: branchB, publicResponse: { ...input.append.publicResponse, scope: substitutedBinding }, events: [{ ...input.append.events[0]!, payload: payload as unknown as JsonValue }, { ...input.append.events[1]!, payload: { ...input.source, binding: substitutedBinding } }] };
+  const rows = () => ({ ...snapshot(f), branchScopes: f.connection.prepare("SELECT * FROM branch_scopes").all(), authorities: f.connection.prepare("SELECT * FROM session_authority").all(), retained: f.retained.rows() });
+  const before = rows();
+  assert.doesNotThrow(() => f.verifier.revalidateCreate(input.handle));
+  assert.throws(() => input.tx.prepareGovernedNote(input.plan, append, payload), { code: "SESSION_OWNERSHIP_MISMATCH" });
+  assert.deepEqual(rows(), before);
+  assert.deepEqual(f.verifier.bindingForCreate(input.handle), admittedBinding);
+  assert.doesNotThrow(() => input.tx.prepareGovernedNote(input.plan, input.append, input.payload));
+  assert.deepEqual(rows(), before);
+});
 function corrupt(f: Fixture, fn: () => void) {
   const triggers = f.connection.prepare("SELECT name,sql FROM sqlite_schema WHERE type='trigger'").all();
   for (const t of triggers) f.connection.exec(`DROP TRIGGER "${String(t.name).replaceAll('"', '""')}"`);
