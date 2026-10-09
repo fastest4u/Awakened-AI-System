@@ -5,6 +5,7 @@ import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { syncBuiltinESMExports } from 'node:module';
 import test from 'node:test';
+import { createHash } from 'node:crypto';
 
 const names = ['v2-governed-note-contracts', 'v2-governed-note-redaction', 'v2-governed-note-authority',
     'v2-governed-note-provenance', 'v2-governed-note-codec', 'v2-governed-note-command', 'v2-governed-note-replay',
@@ -31,15 +32,37 @@ const footer = 'ℹ tests 1\nℹ suites 0\nℹ pass 1\nℹ fail 0\nℹ cancelled
 
 // All fixtures are retained, especially missing/replaced ownership. No teardown
 // infers release from a PID, elapsed interval, child exit or fabricated Job frame.
-function fixture() {
-    const root = realpathSync.native(mkdtempSync(join(tmpdir(), 'governed-gate-')));
+function physicalSnapshot(root: string): Map<string, string> {
+    const result = new Map<string, string>();
+    function visit(relative: string) {
+        const path = join(root, relative), stat = fs.lstatSync(path, { bigint: true });
+        assert.equal(stat.isSymbolicLink(), false);
+        const actual = realpathSync.native(path);
+        assert.equal(process.platform === 'win32' ? actual.toLowerCase() : actual, process.platform === 'win32' ? path.toLowerCase() : path);
+        if (stat.isDirectory()) {
+            for (const name of fs.readdirSync(path).sort()) visit(relative ? relative + '/' + name : name);
+        } else {
+            assert.ok(stat.isFile()); assert.equal(stat.nlink, 1n);
+            result.set(relative, createHash('sha256').update(readFileSync(path)).digest('hex'));
+        }
+    }
+    visit(''); return result;
+}
+function fixtureGit(root: string, ...args: string[]) {
+    const result = spawnSync('git', ['--git-dir', join(root, '.git'), '--work-tree', root, '-C', root, ...args],
+        { encoding: 'utf8', windowsHide: true, timeout: 10000 });
+    assert.equal(result.status, 0, result.stderr); return result.stdout;
+}
+const record = "import{appendFileSync}from'node:fs';const log=x=>appendFileSync('trace',x+'\\n');";
+let staticSeed: { root: string; files: Map<string, string> } | undefined;
+function seedRoot() {
+    if (staticSeed) {
+        assert.deepEqual(physicalSnapshot(staticSeed.root), staticSeed.files);
+        return staticSeed;
+    }
+    const root = realpathSync.native(mkdtempSync(join(tmpdir(), 'governed-gate-seed-')));
     const put = (path: string, value: string) => { mkdirSync(dirname(join(root, path)), { recursive: true }); writeFileSync(join(root, path), value); };
-    const git = (...args: string[]) => {
-        const result = spawnSync('git', ['--git-dir', join(root, '.git'), '--work-tree', root, '-C', root, ...args],
-            { encoding: 'utf8', windowsHide: true, timeout: 10000 });
-        assert.equal(result.status, 0, result.stderr); return result.stdout;
-    };
-    const record = "import{appendFileSync}from'node:fs';const log=x=>appendFileSync('trace',x+'\\n');";
+    const git = (...args: string[]) => fixtureGit(root, ...args);
     put('package.json', '{"type":"module"}');
     put('.gitignore', 'node_modules/\ndist/\ndist-test/\ntrace\n');
     put('docs/input.md', 'tracked documentation'); put('memory/note.md', 'mutable vault');
@@ -54,14 +77,30 @@ const paths=['v2.js','v2-admin.js','workers/project-store.worker.js','internal/v
 const artifacts=paths.map(path=>{mkdirSync('dist/'+path.split('/').slice(0,-1).join('/'),{recursive:true});writeFileSync('dist/'+path,path);return{path,bytes:Buffer.byteLength(path),sha256:sha(path)}});
 for(const artifact of artifacts.slice(3)){const path='node_modules/synthetic/input.js',bytes=readFileSync(path);writeFileSync('dist/'+artifact.path+'.closure.json',JSON.stringify({artifact,inputs:[{path,bytes:bytes.length,sha256:sha(bytes)}],sourceChecked:true,emittedChecked:true}));}
 const body={schemaVersion:1,deploymentId:'synthetic-owned',runtime:{nodeVersion:process.versions.node,platform:process.platform,arch:process.arch,executableSha256:sha(readFileSync(process.execPath))},artifacts};writeFileSync('dist/v2-build.json',JSON.stringify({...body,buildIdentityHash:sha(canon(body))}));process.exit(0);`);
-    for (const name of names) put(`dist-test/tests/${name}.test.js`, record + `import{test}from'node:test';test('${name}',()=>log('${name}'));`);
-    for (const path of privatePaths) put('dist-test/' + path, 'export {};');
-    put('dist-test/unlisted.map', 'whole compiled tree');
     put('scripts/smoke-worker.js', record + "log('worker-smoke');process.exit(0);");
     put('scripts/smoke-v2-fresh-start.js', record + "log('fresh-start-smoke');process.exit(0);");
     git('init', '--quiet'); git('config', 'core.symlinks', 'false');
     const commit = () => { git('add', '--', 'package.json', '.gitignore', 'src', 'tests', 'scripts', 'docs', 'memory', 'tsconfig.test.json'); git('-c', 'user.name=Owned Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '--quiet', '--allow-empty', '-m', 'owned fixture'); };
     commit();
+    for (const path of ['.git/objects/info/alternates', '.git/objects/info/http-alternates', '.git/commondir', 'dist', 'dist-test', 'trace', '.fresh-start-foundation.lock']) assert.equal(existsSync(join(root, path)), false);
+    staticSeed = { root, files: physicalSnapshot(root) }; return staticSeed;
+}
+function fixture() {
+    const root = realpathSync.native(mkdtempSync(join(tmpdir(), 'governed-gate-')));
+    const source = seedRoot(), seed = source.root;
+    for (const path of source.files.keys()) {
+        const target = join(root, path); mkdirSync(dirname(target), { recursive: true });
+        fs.copyFileSync(join(seed, path), target, fs.constants.COPYFILE_EXCL);
+        const before = fs.lstatSync(join(seed, path), { bigint: true }), after = fs.lstatSync(target, { bigint: true });
+        assert.equal(after.nlink, 1n); assert.notEqual(`${before.dev}:${before.ino}`, `${after.dev}:${after.ino}`);
+    }
+    assert.deepEqual(physicalSnapshot(root), source.files);
+    const put = (path: string, value: string) => { mkdirSync(dirname(join(root, path)), { recursive: true }); writeFileSync(join(root, path), value); };
+    const git = (...args: string[]) => fixtureGit(root, ...args);
+    const commit = () => { git('add', '--', 'package.json', '.gitignore', 'src', 'tests', 'scripts', 'docs', 'memory', 'tsconfig.test.json'); git('-c', 'user.name=Owned Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '--quiet', '--allow-empty', '-m', 'owned fixture'); };
+    for (const name of names) put(`dist-test/tests/${name}.test.js`, record + `import{test}from'node:test';test('${name}',()=>log('${name}'));`);
+    for (const path of privatePaths) put('dist-test/' + path, 'export {};');
+    put('dist-test/unlisted.map', 'whole compiled tree');
     const events: any[] = [], native: any[] = [];
     const trace = () => existsSync(join(root, 'trace')) ? readFileSync(join(root, 'trace'), 'utf8').trim().split('\n') : [];
     let outputFault: ((actual: string) => string) | undefined, protocolFault = '', faultStage = 5;
@@ -123,7 +162,7 @@ const body={schemaVersion:1,deploymentId:'synthetic-owned',runtime:{nodeVersion:
         catch (error) { assert.equal((error as Error).message, failure); return { ok: false, value: undefined }; }
         finally { clearTimeout(watchdog); options.signal?.removeEventListener('abort', cancel); process.stdout.write = write; process.stderr.write = errorWrite; childProcess.spawn = originalSpawn; fs.unlinkSync = unlink; fs.closeSync = close; fs.openSync = open; syncBuiltinESMExports(); }
     }
-    return { root, put, git, commit, events, native, trace, run,
+    return { root, seed, put, git, commit, events, native, trace, run,
         faultOutput(value: (actual: string) => string) { outputFault = value; },
         faultProtocol(value: string) { protocolFault = value; faultStage = 1; },
         observe(value: (event: any) => void) { onEvent = value; },
@@ -132,6 +171,37 @@ const body={schemaVersion:1,deploymentId:'synthetic-owned',runtime:{nodeVersion:
 function refused(f: ReturnType<typeof fixture>, result: { ok: boolean }) {
     assert.equal(result.ok, false); assert.equal(f.events.filter(event => event.observation === 'qualification').length, 0);
 }
+
+test('static seed copies own independent Git and worktree files without inherited evidence', t => {
+    const first = fixture(), second = fixture();
+    const seedBefore = physicalSnapshot(first.seed);
+    assert.equal(first.seed, second.seed);
+    for (const path of seedBefore.keys()) {
+        const seed = fs.lstatSync(join(first.seed, path), { bigint: true });
+        const a = fs.lstatSync(join(first.root, path), { bigint: true });
+        const b = fs.lstatSync(join(second.root, path), { bigint: true });
+        assert.equal(seed.nlink, 1n); assert.equal(a.nlink, 1n); assert.equal(b.nlink, 1n);
+        assert.notEqual(`${seed.dev}:${seed.ino}`, `${a.dev}:${a.ino}`);
+        assert.notEqual(`${a.dev}:${a.ino}`, `${b.dev}:${b.ino}`);
+    }
+    for (const root of [first.seed, first.root, second.root]) {
+        for (const path of ['.fresh-start-foundation.lock', 'trace', 'dist', '.git/objects/info/alternates', '.git/objects/info/http-alternates', '.git/commondir']) assert.equal(existsSync(join(root, path)), false);
+    }
+    assert.equal(existsSync(join(first.seed, 'dist-test')), false);
+    const secondBefore = physicalSnapshot(second.root);
+    first.put('src/input.ts', 'export const changed=2;'); first.commit();
+    assert.deepEqual(physicalSnapshot(first.seed), seedBefore);
+    assert.deepEqual(physicalSnapshot(second.root), secondBefore);
+    assert.equal(first.git('status', '--porcelain').trim(), '');
+    assert.equal(second.git('status', '--porcelain').trim(), '');
+    assert.equal(first.events.length + second.events.length + first.native.length + second.native.length, 0);
+    t.diagnostic(JSON.stringify({ staticSeed: first.seed, seedFiles: seedBefore.size,
+        seedInventorySha256: createHash('sha256').update(JSON.stringify([...seedBefore])).digest('hex'),
+        physicalRoots: [first.seed, first.root, second.root].map(root => {
+            const stat = fs.lstatSync(root, { bigint: true }), index = fs.lstatSync(join(root, '.git/index'), { bigint: true });
+            return { root, dev: stat.dev.toString(), ino: stat.ino.toString(), indexDev: index.dev.toString(), indexIno: index.ino.toString() };
+        }) }));
+});
 
 test('fixed inventory resolves void only after 34 real contained stages and owned final release', { timeout: 180000 }, async () => {
     const f = fixture(); f.put('memory/note.md', 'approved mutable memory');

@@ -1,7 +1,8 @@
 import { randomUUID,randomBytes,createHash } from "node:crypto";
-import { cpSync,existsSync,lstatSync,mkdirSync,mkdtempSync,readFileSync,realpathSync,renameSync } from "node:fs";
+import { closeSync,cpSync,existsSync,fstatSync,lstatSync,mkdirSync,mkdtempSync,openSync,readFileSync,realpathSync,renameSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join,dirname } from "node:path";
+import { join,dirname,parse,resolve,sep } from "node:path";
+import { pathToFileURL } from "node:url";
 import { DatabaseSync } from "node:sqlite";
 import { Worker,MessageChannel } from "node:worker_threads";
 import { FreshStartInitializer } from "../../src/orchestrator/fresh-start/fresh-start-initializer.js";
@@ -25,6 +26,46 @@ import { publishProjectionManifest,PROJECTION_MANIFEST_FILENAME } from "../../sr
 import { activateFreshTestStore,freshRelease } from "./fresh-start-fixture.js";
 import { decodeProvisioning,applyProvisioningControl,OBS,OBSERVATION_BYTES,observationView,readSafeId,type SyntheticGovernedNoteProvisioningV1 } from "./governed-note-local-providers.js";
 export const G10_TIMING:TrustedGovernedNoteTimingV1=Object.freeze({requestTimeoutMs:15000,closeTimeoutMs:5000,recoveryProofLifetimeMs:60000,maxPending:128,executorLeaseMs:15000,heartbeatIntervalMs:5000,appendRetryDeadlineMs:15000,sqliteBusyTimeoutMs:5000});
+
+// Governed tests only. No successful check, worker, or identity proof is cached.
+// Focused callers require a matching source/emitted freeze; the real gate builds
+// and binds source, artifacts and compiled inputs independently of this selector.
+export function governedIdentityWorkerUrl(directory=join(process.cwd(),"dist")):URL {
+ const unavailable=()=>new Error("GOVERNED_IDENTITY_WORKER_UNAVAILABLE");
+ const sha=(bytes:Uint8Array|string)=>createHash("sha256").update(bytes).digest("hex");
+ const canonical=(value:any):string=>Array.isArray(value)?`[${value.map(canonical).join(",")}]`:value&&typeof value==="object"?`{${Object.keys(value).sort().map(key=>`${JSON.stringify(key)}:${canonical(value[key])}`).join(",")}}`:JSON.stringify(value);
+ const samePath=(a:string,b:string)=>process.platform==="win32"?a.toLowerCase()===b.toLowerCase():a===b;
+ function ordinary(path:string,directory:boolean){
+  const absolute=resolve(path),root=parse(absolute).root;let current=root;
+  const parts=absolute.slice(root.length).split(sep).filter(Boolean);
+  for(let i=0;i<parts.length;i++){
+   current=join(current,parts[i]!);const stat=lstatSync(current,{bigint:true}),isDirectory=i<parts.length-1||directory;
+   if(stat.isSymbolicLink()||(isDirectory?!stat.isDirectory():!stat.isFile()||stat.nlink!==1n)||!samePath(realpathSync.native(current),current))throw unavailable();
+  }
+  return lstatSync(absolute,{bigint:true});
+ }
+ function bytes(path:string){
+  const before=ordinary(path,false),fd=openSync(path,"r");
+  try{
+   const opened=fstatSync(fd,{bigint:true});if(opened.dev!==before.dev||opened.ino!==before.ino||opened.nlink!==1n)throw unavailable();
+   const value=readFileSync(fd),after=ordinary(path,false),final=fstatSync(fd,{bigint:true});
+   for(const current of [after,final])if(current.dev!==before.dev||current.ino!==before.ino||current.size!==before.size||current.mtimeNs!==before.mtimeNs||current.nlink!==1n)throw unavailable();
+   return value;
+  }finally{closeSync(fd);}
+ }
+ try{
+  const root=resolve(directory);ordinary(root,true);
+  const manifestPath=join(root,"v2-build.json"),raw=bytes(manifestPath);if(raw.length>1024*1024)throw unavailable();
+  const build=JSON.parse(raw.toString("utf8")),{buildIdentityHash,...body}=build;
+  const runtime={nodeVersion:process.versions.node,platform:process.platform,arch:process.arch,executableSha256:sha(bytes(process.execPath))};
+  const paths=["v2.js","v2-admin.js","workers/project-store.worker.js","internal/v2-internal-verified-read.js","internal/v2-internal-verified-read-cleanup.js"];
+  if(build.schemaVersion!==1||typeof build.deploymentId!=="string"||!build.deploymentId||buildIdentityHash!==sha(canonical(body))||canonical(build.runtime)!==canonical(runtime)||!Array.isArray(build.artifacts)||canonical(build.artifacts.map((entry:any)=>entry.path))!==canonical(paths))throw unavailable();
+  for(const entry of build.artifacts){const actual=bytes(join(root,entry.path));if(entry.bytes!==actual.length||entry.sha256!==sha(actual))throw unavailable();}
+  if(!bytes(manifestPath).equals(raw))throw unavailable();
+  return pathToFileURL(join(root,"workers/project-store.worker.js"));
+ }catch{throw unavailable();}
+}
+
 export interface GovernedNoteNativeFixtureV1 {
  run:GovernedNoteRunV1;fixture:FreshGovernedNoteFixtureV1;permit:GovernedNoteOwnerPermitV1;sourceId:string;rootSessionId:string;childSessionId:string;
  prepareCreate(command:GovernedNoteCommandV1):Promise<PreparedGovernedNoteCreateV1>;
@@ -47,7 +88,7 @@ export async function makeGovernedNoteFixture(options:Readonly<{child?:boolean;s
   freshDirectory=input.freshDirectory;const v2VaultRoot=join(freshDirectory,"vault"),v1ArchiveRoot=join(freshDirectory,"archive");mkdirSync(v2VaultRoot);mkdirSync(v1ArchiveRoot);
   const {projectId:_p,vaultId:_v,storeId:_s,...requested}=freshRelease({releaseId:randomUUID(),buildIdentityHash:manifest.buildIdentityHash,schemaIdentityHash:expectedSchemaFingerprint(PROJECT_STORE_MIGRATIONS)});
   const genesis=await new FreshStartInitializer({inspectBuild:()=>manifest.buildIdentityHash,actorFingerprint:"c".repeat(64)}).initializeFresh({projectRoot:freshDirectory,v2VaultRoot,v1ArchiveRoot,initializationId:randomUUID(),release:requested});
-  const service=new ProjectBindingService({identityProbe:new WorkerProjectStoreIdentityProbe({workerUrl:new URL("../../src/workers/project-store.worker.js",import.meta.url),requestTimeoutMs:5000})});
+   const service=new ProjectBindingService({identityProbe:new WorkerProjectStoreIdentityProbe({workerUrl:governedIdentityWorkerUrl(),requestTimeoutMs:5000})});
   const established=await service.establish({source:"explicit-cli",projectRoot:freshDirectory,vaultRoot:v2VaultRoot,clientNamespace:"g10",clientInstanceId:options.child?"g10-child":"g10-root",actorRole:options.child?"untrusted":"primary",generation:1});
   if(!established.ok)throw new Error("G10_BINDING_REFUSED");const context=await service.revalidate(established.binding);
   const activation=driver.open(context.binding.storeRoute.eventsPath,{mode:"existing",busyTimeoutMs:5000});

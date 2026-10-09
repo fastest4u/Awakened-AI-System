@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { randomUUID } from "node:crypto";
-import { existsSync, linkSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, renameSync, symlinkSync, writeFileSync } from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
+import { cpSync, existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, sep } from "node:path";
 import fs from "node:fs";
@@ -20,6 +20,8 @@ import { freshRelease } from "./support/fresh-start-fixture.js";
 import { expectedSchemaFingerprint } from "../src/orchestrator/storage/schema-fingerprint.js";
 import { PROJECT_STORE_MIGRATIONS } from "../src/orchestrator/storage/migrations/registry.js";
 import type { FreshStartGenesis } from "../src/orchestrator/fresh-start/contracts.js";
+import { governedIdentityWorkerUrl } from "./support/governed-note-fixture.js";
+import { fileURLToPath } from "node:url";
 
 const timing: TrustedGovernedNoteTimingV1 = {requestTimeoutMs: 15000, closeTimeoutMs: 5000, recoveryProofLifetimeMs: 60000, maxPending: 128, executorLeaseMs: 15000, heartbeatIntervalMs: 5000, appendRetryDeadlineMs: 15000, sqliteBusyTimeoutMs: 5000};
 const session = "11111111-1111-1111-8111-111111111111";
@@ -54,7 +56,9 @@ function harness(change: Partial<GovernedNoteRunOptionsV1> = {}) {
     const v2VaultRoot=join(freshDirectory,"vault"),v1ArchiveRoot=join(freshDirectory,"archive");mkdirSync(v2VaultRoot);mkdirSync(v1ArchiveRoot);
     const {projectId:_p,vaultId:_v,storeId:_s,...release}=freshRelease({schemaIdentityHash:expectedSchemaFingerprint(PROJECT_STORE_MIGRATIONS)});
     genesis=await new FreshStartInitializer({inspectBuild:()=>release.buildIdentityHash,actorFingerprint:"c".repeat(64)}).initializeFresh({projectRoot:freshDirectory,v2VaultRoot,v1ArchiveRoot,initializationId:randomUUID(),release});
-    const service=new ProjectBindingService({identityProbe:new WorkerProjectStoreIdentityProbe({workerUrl:new URL("../src/workers/project-store.worker.js",import.meta.url),requestTimeoutMs:5000})});
+    const workerUrl=governedIdentityWorkerUrl();
+    assert.equal(fileURLToPath(workerUrl),join(process.cwd(),"dist/workers/project-store.worker.js"));
+    const service=new ProjectBindingService({identityProbe:new WorkerProjectStoreIdentityProbe({workerUrl,requestTimeoutMs:5000})});
     const binding=await service.establish({source:"explicit-cli",projectRoot:freshDirectory,vaultRoot:v2VaultRoot,clientNamespace:"g09",clientInstanceId:"test",actorRole:"primary",generation:1});
     assert.equal(binding.ok,true);if(!binding.ok) throw new Error("binding setup refused");
     const context=await service.revalidate(binding.binding);
@@ -63,6 +67,28 @@ function harness(change: Partial<GovernedNoteRunOptionsV1> = {}) {
   const run=createGovernedNoteRunV1(options);
   return {run,options,owners,parentDirectory,get initialized(){return initialized;},get directory(){return directory;},get genesis(){assert.ok(genesis);return genesis;},async open(){const fixture=await allocate(run,{parentDirectory});const permit=await run.open(fixture);return {fixture,permit,owner:owners.at(-1)!};}};
 }
+
+test("governed identity worker selection refuses missing or mismatched current artifacts",t=>{
+  const original=join(process.cwd(),"dist"),retainedInputs:string[]=[];
+  for(const fault of ["missing-manifest","malformed-manifest","manifest-identity","runtime","missing-worker","worker-bytes","worker-hardlink","workers-junction"]){
+    const root=realpathSync.native(mkdtempSync(join(tmpdir(),"governed-identity-input-"))),owned=join(root,"dist");retainedInputs.push(root);cpSync(original,owned,{recursive:true});
+    const manifest=join(owned,"v2-build.json"),worker=join(owned,"workers/project-store.worker.js");
+    if(fault==="missing-manifest")renameSync(manifest,join(root,"retained-manifest"));
+    if(fault==="malformed-manifest")writeFileSync(manifest,"{");
+    if(fault==="manifest-identity"||fault==="runtime"){const value=JSON.parse(readFileSync(manifest,"utf8"));if(fault==="manifest-identity")value.buildIdentityHash="0".repeat(64);else {value.runtime.nodeVersion="0.0.0";const {buildIdentityHash:_old,...body}=value;value.buildIdentityHash=createHash("sha256").update(JSON.stringify(body)).digest("hex");}writeFileSync(manifest,JSON.stringify(value));}
+    if(fault==="missing-worker")renameSync(worker,join(root,"retained-worker"));
+    if(fault==="worker-bytes")writeFileSync(worker,"export {};\n");
+    if(fault==="worker-hardlink"){const retained=join(root,"retained-worker");renameSync(worker,retained);linkSync(retained,worker);}
+    if(fault==="workers-junction"){const retained=join(root,"retained-workers");renameSync(join(owned,"workers"),retained);symlinkSync(retained,join(owned,"workers"),"junction");}
+    assert.throws(()=>governedIdentityWorkerUrl(owned),{message:"GOVERNED_IDENTITY_WORKER_UNAVAILABLE"},fault);
+  }
+  // Success cannot cache approval: a later replacement in the same owned copy is refused.
+  const owned=join(realpathSync.native(mkdtempSync(join(tmpdir(),"governed-identity-live-"))),"dist");cpSync(original,owned,{recursive:true});
+  assert.equal(fileURLToPath(governedIdentityWorkerUrl(owned)),join(owned,"workers/project-store.worker.js"));
+  writeFileSync(join(owned,"workers/project-store.worker.js"),"export {};\n");
+  assert.throws(()=>governedIdentityWorkerUrl(owned),{message:"GOVERNED_IDENTITY_WORKER_UNAVAILABLE"});
+  retainedInputs.push(owned);t.diagnostic(JSON.stringify({retainedInputs}));
+});
 
 test("mandatory timing rejects before allocation or owner side effects",()=>{
   for(const bad of [0,2147483648,NaN,1.5,undefined]) assert.throws(()=>harness({timing:{...timing,requestTimeoutMs:bad,appendRetryDeadlineMs:bad} as never}),safe("GOVERNED_NOTE_CONFIG_INVALID"));
