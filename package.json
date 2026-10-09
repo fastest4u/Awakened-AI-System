@@ -12,6 +12,7 @@
     "node": ">=24.16.0"
   },
   "scripts": {
+    "test:v2-governed-summary-commands": "node scripts/run-v2-governed-summary-commands.js",
     "dev": "npm run build && node dist/index.js",
     "start": "node dist/index.js",
     "start:v2": "npm run check:runtime && node dist/v2.js",
