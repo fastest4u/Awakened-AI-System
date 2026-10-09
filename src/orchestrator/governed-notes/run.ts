@@ -1,3 +1,4 @@
+import { decodeGovernedFixtureActionV1, decodeGovernedFixtureResultV1, isGovernedFixtureTransportUncertain, type GovernedFixtureActionV1, type GovernedFixtureResultV1, type GovernedFixtureActionPortV1 } from "./fixture-control.js";
 import type { ProjectContext } from "../identity/contracts.js";
 import type { FreshStartTrustedContext } from "../fresh-start/fresh-start-admission.js";
 import type { ProjectStoreExecutor } from "../runtime/project-store-executor.js";
@@ -13,10 +14,11 @@ import { retainedExactRecord } from "../privacy/evidence-contracts.js";
 import type { GovernedNoteOwnerPermitV1, GovernedNoteRecoveryIdsV1, GovernedNoteStoredReceiptV1 } from "./contracts.js";
 export type GovernedNoteFreshInitializationPortV1 = Readonly<{ initialize(input: Readonly<{freshDirectory: string; fixtureId: string}>): Promise<Readonly<{context: ProjectContext; freshStartContext: FreshStartTrustedContext}>> }>;
 export type GovernedNoteOwnerConstructionV1 = Readonly<{runId: string; fixtureId: string; ownerGeneration: string; context: ProjectContext; freshStartContext: FreshStartTrustedContext; timing: TrustedGovernedNoteTimingV1}>;
-export type GovernedNoteOwnerPortV1 = Readonly<{open(): Promise<void>}> & Pick<ProjectStoreExecutor, "createGovernedNote" | "recoverGovernedNoteResult" | "closeForGovernedNoteController" | "canReuse">;
+export type GovernedNoteOwnerPortV1 = Readonly<{open(): Promise<void>; fixtureActions?: GovernedFixtureActionPortV1}> & Pick<ProjectStoreExecutor, "createGovernedNote" | "recoverGovernedNoteResult" | "closeForGovernedNoteController" | "canReuse">;
 export type GovernedNoteRunOptionsV1 = Readonly<{timing: TrustedGovernedNoteTimingV1; freshInitializer: GovernedNoteFreshInitializationPortV1; ownerFactory: (input: GovernedNoteOwnerConstructionV1) => GovernedNoteOwnerPortV1}>;
 type Phase="RESERVED"|"OPEN"|"RECOVERY_EXCLUSIVE"|"DRAINING"|"RELEASE_CONFIRMED"|"OWNERSHIP_UNCERTAIN";
 type Slot={fixture:AllocatedGovernedNoteFixture;phase:Phase;owner:GovernedNoteOwnerPortV1|null;permit:GovernedNoteOwnerPermitV1|null;creates:number;generation:bigint};
+const fixtureIngress=new WeakMap<GovernedNoteRunV1,(permit:GovernedNoteOwnerPermitV1,action:GovernedFixtureActionV1)=>Promise<GovernedFixtureResultV1>>();
 const allocations=new WeakMap<GovernedNoteRunV1,FreshGovernedNoteAllocation>();
 const UUID=/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 function invalid():never {throw new GovernedNoteError("GOVERNED_NOTE_INPUT_INVALID");}
@@ -56,7 +58,7 @@ export function createGovernedNoteRunV1(options: GovernedNoteRunOptionsV1): Gove
   const slots=new WeakMap<FreshGovernedNoteFixtureV1,Slot>(),permits=new WeakMap<GovernedNoteOwnerPermitV1,Slot>(),releasedOwners=new Set<string>();
   let generation=0n;
   function lookup(permit:GovernedNoteOwnerPermitV1):Slot {const slot=permits.get(permit);if(!slot||slot.permit!==permit)invalid();return slot;}
-  function admit(slot:Slot,ids:GovernedNoteRecoveryIdsV1):void {
+  function admit(slot:Slot,ids:GovernedNoteRecoveryIdsV1|null):void {
     if(slot.phase==="OWNERSHIP_UNCERTAIN")uncertain(slot,ids);
     if(slot.phase==="RECOVERY_EXCLUSIVE"||slot.phase==="DRAINING")busy();
     if(slot.phase!=="OPEN")invalid();
@@ -114,7 +116,30 @@ export function createGovernedNoteRunV1(options: GovernedNoteRunOptionsV1): Gove
       const slot=lookup(permit);if(slot.phase==="OWNERSHIP_UNCERTAIN")uncertain(slot);if(slot.phase!=="RELEASE_CONFIRMED")invalid();slot.phase="RESERVED";return construct(slot);
     },
   });
+  fixtureIngress.set(run,async(permit,action)=>{
+    const slot=lookup(permit),owned=decodeGovernedFixtureActionV1(action);
+    admit(slot,null);if(slot.creates>0)busy();
+    if(!slot.owner!.fixtureActions)throw new GovernedNoteError("GOVERNED_NOTE_UNAVAILABLE");
+    slot.phase="RECOVERY_EXCLUSIVE";
+    let result;
+    try{result=await slot.owner!.fixtureActions.execute(owned);}
+    catch(error){
+      if(owned.kind==="bootstrap"||isGovernedFixtureTransportUncertain(error)||slot.phase as Phase==="OWNERSHIP_UNCERTAIN"||!healthy(slot))return uncertain(slot);
+      try{
+        if(error===null||typeof error!=="object"||types.isProxy(error))return uncertain(slot);
+        const pick=(key:string)=>{const d=Object.getOwnPropertyDescriptor(error,key);if(!d||!("value" in d))invalid();return d.value;};
+        const ids=owned.kind==="prepare-create"?owned.command:owned.kind==="prepare-recovery"?owned:owned.kind==="retain"?owned.prepared.command:null;
+        const decoded=decodeGovernedNoteErrorV1({code:pick("code"),message:pick("message"),details:pick("details")},ids);
+        if(["COMMAND_OUTCOME_UNKNOWN","WORKER_PROTOCOL_ERROR","GOVERNED_NOTE_OWNERSHIP_UNCERTAIN"].includes(decoded.code))return uncertain(slot);
+        slot.phase="OPEN";throw new GovernedNoteError(decoded.code,ids);
+      }catch(failure){if(slot.phase==="OPEN")throw failure;return uncertain(slot);}
+    }
+    try{const decoded=decodeGovernedFixtureResultV1(result,owned);if(slot.phase as Phase!=="RECOVERY_EXCLUSIVE"||!healthy(slot))return uncertain(slot);slot.phase="OPEN";return decoded;}catch{return uncertain(slot);}
+  });
   allocations.set(run,allocation);return run;
 }
 /** Internal allocator bridge: membership is read-only and cannot be registered externally. */
 export async function allocateForGovernedNoteRun(run: GovernedNoteRunV1,input:Readonly<{parentDirectory:string}>):Promise<FreshGovernedNoteFixtureV1> {const allocator=allocations.get(run);if(!allocator)invalid();return allocator.allocate(input);}
+
+/** Trusted composition ingress, deliberately absent from the five-method facade. */
+export async function executeGovernedFixtureActionV1(run:GovernedNoteRunV1,permit:GovernedNoteOwnerPermitV1,action:GovernedFixtureActionV1):Promise<GovernedFixtureResultV1>{const execute=fixtureIngress.get(run);if(!execute)invalid();return execute(permit,action);}

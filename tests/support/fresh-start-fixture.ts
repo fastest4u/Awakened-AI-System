@@ -18,11 +18,20 @@ import { TrustedFreshStartEvidenceVerifier, TrustedOperatorApprovalVerifier } fr
 import { bindFreshStartAdmissionContext } from "../../src/orchestrator/fresh-start/fresh-start-admission.js";
 
 /** Owned-test verifier only. Production promotion remains closed. */
-export async function activateFreshTestStore(connection: SqliteConnection, identity: FreshStartIdentity = FRESH_IDENTITY) {
-  const release = freshRelease({ ...identity, schemaIdentityHash: expectedSchemaFingerprint(PROJECT_STORE_MIGRATIONS) });
+export async function activateFreshTestStore(connection: SqliteConnection, identity: FreshStartIdentity = FRESH_IDENTITY, options: Readonly<{alreadyInitialized?: true}> = {}) {
+  let release = freshRelease({ ...identity, schemaIdentityHash: expectedSchemaFingerprint(PROJECT_STORE_MIGRATIONS) });
   const genesis = freshGenesis({ ...identity, projectionChecksums: Object.fromEntries(PROJECTION_NAMES.map(name => [name, projectionCoreChecksum(name, 2, identity.projectId, 0n, [])])) });
   const repository = new SqliteFreshStartRepository(connection);
-  repository.transact(identity, tx => tx.install(genesis, release));
+  if(options.alreadyInitialized===true){
+    if(arguments.length<2||identity===FRESH_IDENTITY)throw new Error("OWNED_INITIALIZED_IDENTITY_REQUIRED");
+    release=repository.transact(identity,tx=>{
+      const installed=tx.installation(),state=tx.state();
+      if(!installed||!state||state.mode!=="prepared"||state.generation!==0n||state.releaseId!==installed.releaseId)throw new Error("OWNED_INITIALIZED_STATE_INVALID");
+      const stored=tx.release(state.releaseId);
+      if(!stored||["projectId","vaultId","storeId"].some(key=>installed[key as keyof FreshStartIdentity]!==identity[key as keyof FreshStartIdentity]||stored[key as keyof FreshStartIdentity]!==identity[key as keyof FreshStartIdentity]))throw new Error("OWNED_INITIALIZED_IDENTITY_INVALID");
+      return stored;
+    });
+  }else repository.transact(identity, tx => tx.install(genesis, release));
   const approvals = new TrustedOperatorApprovalVerifier(async (_bytes, requestDigest) => ({ identity,
     approvalId: randomUUID(), nonceDigest: createHash("sha256").update(randomUUID()).digest("hex"),
     actorFingerprint: "2".repeat(64), requestDigest, evidenceDigest: release.evidenceDigest }));

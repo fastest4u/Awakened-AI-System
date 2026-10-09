@@ -1,3 +1,4 @@
+import { decodeGovernedFixtureActionV1, decodeGovernedFixtureResultV1, type GovernedFixtureActionV1, type GovernedFixtureResultV1, type GovernedFixtureActionPortV1, type TrustedGovernedFixtureFactoryV1 } from "../governed-notes/fixture-control.js";
 import { GovernedNoteError } from "../governed-notes/errors.js";
 import { decodePreparedGovernedNoteCreateV1, decodePreparedGovernedNoteRecoveryV1 } from "../governed-notes/codec.js";
 import type { GovernedNoteRuntime, GovernedNoteRuntimeFactoryPort } from "../governed-notes/contracts.js";
@@ -101,6 +102,7 @@ export interface ProjectStoreWorkerBackendOptions {
   appendRetryDeadlineMs: number;
   readonly keyProvider?: CapabilityKeyProvider;
   readonly lifecycleRuntimeFactory?: LifecycleWorkerRuntimeFactoryPort;
+  readonly trustedGovernedFixtureFactory?: TrustedGovernedFixtureFactoryV1;
   readonly governedNoteRuntimeFactory?: GovernedNoteRuntimeFactoryPort;
   readonly retainedEvidenceRuntimeFactory?: RetainedEvidenceRuntimeFactoryPort;
   afterReadOnlyIdentityVerified?: () => void;
@@ -357,6 +359,7 @@ interface ActiveStore {
   lifecycleRuntime: LifecycleWorkerRuntime | null;
   retainedEvidenceRuntime: RetainedEvidenceRuntime | null;
   governedNoteRuntime: GovernedNoteRuntime | null;
+  governedFixture: GovernedFixtureActionPortV1 | null;
   executorId: string;
 }
 
@@ -541,6 +544,7 @@ export class ProjectStoreWorkerBackend implements WorkerRuntimeBackend {
     let lifecycleRuntime: LifecycleWorkerRuntime | null = null;
     let retainedEvidenceRuntime: RetainedEvidenceRuntime | null = null;
     let governedNoteRuntime: GovernedNoteRuntime | null = null;
+    let governedFixture: GovernedFixtureActionPortV1 | null = null;
     let registrationBegan = false;
     try {
       const maintenance = this.#options.maintenanceFactory?.() ?? new MaintenanceFence();
@@ -585,6 +589,10 @@ export class ProjectStoreWorkerBackend implements WorkerRuntimeBackend {
         try { governedNoteRuntime = this.#options.governedNoteRuntimeFactory.create({ connection, maintenanceFence: maintenance, keyProvider: this.#options.keyProvider }); }
         catch { throw new GovernedNoteError("GOVERNED_NOTE_UNAVAILABLE"); }
       }
+      if(this.#options.trustedGovernedFixtureFactory!==undefined){
+        if(!lifecycleRuntime||!retainedEvidenceRuntime||!governedNoteRuntime||!this.#options.keyProvider)throw new GovernedNoteError("GOVERNED_NOTE_UNAVAILABLE");
+        governedFixture=this.#options.trustedGovernedFixtureFactory.create({connection,maintenanceFence:maintenance,keyProvider:this.#options.keyProvider,context,lifecycleRuntime,retainedEvidenceRuntime,governedNoteRuntime});
+      }
       connection.exec("BEGIN IMMEDIATE");
       registrationBegan = true;
       assertFreshStartConnectionAllowed(connection, "command-recovery");
@@ -613,6 +621,7 @@ export class ProjectStoreWorkerBackend implements WorkerRuntimeBackend {
         lifecycleRuntime,
         retainedEvidenceRuntime,
         governedNoteRuntime,
+        governedFixture,
         executorId,
       };
       return {
@@ -628,12 +637,19 @@ export class ProjectStoreWorkerBackend implements WorkerRuntimeBackend {
       if (registrationBegan) {
         try { connection.exec("ROLLBACK"); } catch { /* preserve the first open failure */ }
       }
+      try { governedFixture?.dispose(); } catch { /* Preserve open uncertainty and attempt remaining cleanup. */ }
       if (lifecycleRuntime !== null) {
         try { lifecycleRuntime.dispose(); } catch { /* preserve the first open failure */ }
       }
       try { connection.close(); } catch { /* preserve the first open failure */ }
       throw error;
     }
+  }
+
+  async executeTrustedGovernedFixtureAction(binding:WorkerBindingAssertion,action:GovernedFixtureActionV1):Promise<GovernedFixtureResultV1>{
+    const owned=decodeGovernedFixtureActionV1(action),active=this.requireActive(binding);
+    if(!active.governedFixture)throw new GovernedNoteError("GOVERNED_NOTE_UNAVAILABLE");
+    return decodeGovernedFixtureResultV1(await active.governedFixture.execute(owned),owned);
   }
 
   private active(): ActiveStore {
@@ -1020,6 +1036,9 @@ export class ProjectStoreWorkerBackend implements WorkerRuntimeBackend {
       primaryError = error;
       failed = true;
     }
+    try {
+      active.governedFixture?.dispose();
+    } catch (error) { if(!failed){primaryError=error;failed=true;} }
     try {
       active.lifecycleRuntime?.dispose();
     } catch (error) {

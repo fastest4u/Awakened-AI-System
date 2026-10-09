@@ -1,3 +1,5 @@
+import { decodeGovernedFixtureActionV1, decodeGovernedFixtureResultV1, type GovernedFixtureActionV1, type GovernedFixtureResultV1 } from "../governed-notes/fixture-control.js";
+import { decodeWorkerBindingAssertion } from "./worker-protocol.js";
 import { decodeGovernedNoteWorkerResponse, governedNoteRequestIds, isGovernedNoteRequest, sanitizeGovernedNoteError } from "../governed-notes/worker-protocol.js";
 import { GovernedNoteError } from "../governed-notes/errors.js";
 import type { JsonValue } from "../contracts/event.js";
@@ -40,6 +42,7 @@ export interface WorkerRuntimeBackend {
 }
 
 export interface ProjectStoreWorkerRuntimeOptions {
+  trustedGovernedFixtureActions?: Readonly<{execute:(binding:WorkerBindingAssertion,action:GovernedFixtureActionV1)=>Promise<GovernedFixtureResultV1>}>;
   backend: WorkerRuntimeBackend;
   port: WorkerRuntimePort;
   scheduler: WorkerRuntimeScheduler;
@@ -120,6 +123,7 @@ function bindingAssertionFailure(
 }
 
 export class ProjectStoreWorkerRuntime {
+  readonly #trustedGovernedFixtureActions: ProjectStoreWorkerRuntimeOptions["trustedGovernedFixtureActions"];
   readonly #backend: WorkerRuntimeBackend;
   readonly #port: WorkerRuntimePort;
   readonly #scheduler: WorkerRuntimeScheduler;
@@ -140,10 +144,19 @@ export class ProjectStoreWorkerRuntime {
     ) {
       throw new Error("WORKER_CONFIG_INVALID");
     }
+    this.#trustedGovernedFixtureActions=options.trustedGovernedFixtureActions;
     this.#backend = options.backend;
     this.#port = options.port;
     this.#scheduler = options.scheduler;
     this.#heartbeatIntervalMs = options.heartbeatIntervalMs;
+  }
+
+  enqueueTrustedGovernedFixtureAction(binding:WorkerBindingAssertion,action:GovernedFixtureActionV1):Promise<GovernedFixtureResultV1>{
+    const owned=decodeGovernedFixtureActionV1(action),assertion=decodeWorkerBindingAssertion(binding);
+    const check=()=>{if(this.#closing||this.#quiescing||!this.#open||!this.#binding||!this.#trustedGovernedFixtureActions||bindingAssertionFailure(this.#binding,assertion))throw new GovernedNoteError("GOVERNED_NOTE_UNAVAILABLE");};
+    check();
+    const operation=this.#fifo.then(async()=>{check();return decodeGovernedFixtureResultV1(await this.#trustedGovernedFixtureActions!.execute(assertion,owned),owned);});
+    this.#fifo=operation.then(()=>undefined,()=>undefined);return operation;
   }
 
   receive(value: unknown): void {
