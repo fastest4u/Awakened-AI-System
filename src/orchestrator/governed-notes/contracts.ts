@@ -47,6 +47,25 @@ export type GovernedNoteStoredResultV1 = StoredCommandResponse<GovernedNoteStore
 export type GovernedNoteReceiptV1 = GovernedNoteStoredReceiptV1 & { readonly replay: boolean };
 export type GovernedNoteRecoveryResultV1 = Readonly<{ resultVersion: 1; operation: "recover-governed-note-result"; outcome: "committed"; receipt: GovernedNoteReceiptV1 }> | Readonly<{ resultVersion: 1; operation: "recover-governed-note-result"; outcome: "not-found"; commandId: string; idempotencyKey: string }>;
 export type GovernedNoteCloseObservationV1 = Readonly<{ disposition: "graceful-confirmed" | "ownership-uncertain"; ownerId: string }>;
+export type GovernedNoteKind = GovernedNoteCommandV1["recordKind"];
+export type MarkdownNoteContentV1 = Readonly<{ format: "markdown"; body: string }>;
+export type GovernedNoteCommandV2 = Readonly<Omit<GovernedNoteCommandV1, "version"> & { version: 2; content: MarkdownNoteContentV1 }>;
+export type PreparedGovernedNoteCreateV2 = Readonly<{ command: GovernedNoteCommandV2; authorization: GovernedNoteProtectedAuthorizationV1 }>;
+export type PreparedGovernedNoteCreateWireV2 = Readonly<{ command: string; authorization: GovernedNoteProtectedAuthorizationV1 }>;
+export type GovernedNoteRecoveryV2 = Readonly<Omit<GovernedNoteRecoveryV1, "version"> & { version: 2 }>;
+export type PreparedGovernedNoteRecoveryV2 = Readonly<{ request: GovernedNoteRecoveryV2; authorization: BoundedOperationAuthorization }>;
+export type PreparedGovernedNoteRecoveryWireV2 = Readonly<{ request: string; authorization: BoundedOperationAuthorization }>;
+export type GovernedNoteWitnessV2 = Readonly<Omit<GovernedNoteWitnessV1, "witnessVersion"> & { witnessVersion: 2; contentFormat: "markdown"; bodyContentHash: string }>;
+export type GovernedNoteCreatedPayloadV2 = Readonly<{ formatVersion: 2; witness: GovernedNoteWitnessV2 }>;
+export type GovernedNoteSourcePayloadV2 = Readonly<{
+  sourceVersion: 3; binding: ProjectBinding;
+  item: Readonly<{ itemId: string; normalizedKey: string; status: "candidate"; confidence: Confidence; verificationMethod: "governed-note-unverified-v2"; validFrom: string; validTo: null; summary: string; contentHash: string; conflictGroupId: null; supersedingItemId: null; anchor: null; recordKind: GovernedNoteKind; content: MarkdownNoteContentV1 & Readonly<{ contentHash: string }> }>;
+  followUps: readonly never[]; artifacts: readonly never[]; entities: readonly never[]; aliases: readonly never[]; edges: readonly never[];
+}>;
+export type GovernedNoteStoredReceiptV2 = Omit<GovernedNoteStoredReceiptV1, "resultVersion"> & { resultVersion: 2; content: { format: "markdown"; contentHash: string } };
+export type GovernedNoteStoredResultV2 = StoredCommandResponse<GovernedNoteStoredReceiptV2>;
+export type GovernedNoteReceiptV2 = GovernedNoteStoredReceiptV2 & { readonly replay: boolean };
+export type GovernedNoteRecoveryResultV2 = Readonly<{ resultVersion: 2; operation: "recover-governed-note-result"; outcome: "committed"; receipt: GovernedNoteReceiptV1 | GovernedNoteReceiptV2 }> | Readonly<{ resultVersion: 2; operation: "recover-governed-note-result"; outcome: "not-found"; commandId: string; idempotencyKey: string }>;
 export interface GovernedNoteRuntime {
   create(prepared: PreparedGovernedNoteCreateV1, context: ProjectContext): AppendResult<GovernedNoteStoredReceiptV1>;
   recover(prepared: PreparedGovernedNoteRecoveryV1, context: ProjectContext): GovernedNoteRecoveryResultV1;

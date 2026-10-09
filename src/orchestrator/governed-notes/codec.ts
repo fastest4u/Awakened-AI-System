@@ -9,6 +9,7 @@ import { isProjectionProjectStoreIdentity, isProjectionWorkspaceIdentity, type P
 import { canonicalJson } from "../serialization/canonical-json.js";
 import { decodeRetainedEvidenceAuthority, decodeEvidenceKeyRef } from "../privacy/retained-evidence-codec.js";
 import { createHash } from "node:crypto";
+import { assertMarkdownNoteBodyV1, governedNoteBodyHash } from "./body-content.js";
 
 export function decodeGovernedNoteCreatedPayloadV1(value: unknown): C.GovernedNoteCreatedPayloadV1 {
   const outer = record(snapshot(value, LIMITS.sourceEventBytes), ["formatVersion", "witness"]);
@@ -229,4 +230,119 @@ export function validateGovernedNoteTimingV1(value: unknown): C.TrustedGovernedN
     if (r.maxPending !== 128 || r.executorLeaseMs !== 15000 || r.heartbeatIntervalMs !== 5000 || r.sqliteBusyTimeoutMs !== 5000 || r.appendRetryDeadlineMs !== r.requestTimeoutMs) refuse();
     return Object.freeze({ requestTimeoutMs: r.requestTimeoutMs as number, closeTimeoutMs: r.closeTimeoutMs as number, recoveryProofLifetimeMs: r.recoveryProofLifetimeMs as number, maxPending: 128, executorLeaseMs: 15000, heartbeatIntervalMs: 5000, appendRetryDeadlineMs: r.requestTimeoutMs as number, sqliteBusyTimeoutMs: 5000 });
   } catch { return refuse("GOVERNED_NOTE_CONFIG_INVALID"); }
+}
+
+/** V2 keeps every ordinary scalar budget; only the selected owned body is larger. */
+function snapshotV2(value: unknown, maximumBytes: number, bodyPath: readonly string[] | null = null, metadataBytes?: number): JsonValue {
+  let containers = 0; const ancestors = new Set<object>();
+  const isBody = (path: readonly string[]) => bodyPath !== null && path.length === bodyPath.length && path.every((key, n) => key === bodyPath[n]);
+  const visit = (item: unknown, depth: number, path: readonly string[]): JsonValue => {
+    if (typeof item === "string") { if (isBody(path)) assertMarkdownNoteBodyV1(item); else string(item); return item; }
+    if (item === null || typeof item === "boolean") return item;
+    if (typeof item === "number") { if (!Number.isFinite(item)) refuse(); return item; }
+    if (typeof item !== "object" || ancestors.has(item)) refuse();
+    limit(depth, LIMITS.depth); limit(++containers, LIMITS.containers);
+    const entries = retained(() => retainedDataEntries(item, Array.isArray(item) ? LIMITS.arrayElements : LIMITS.fields));
+    ancestors.add(item);
+    const copy: JsonValue[] | { [key: string]: JsonValue } = Array.isArray(item) ? [] : Object.create(null) as { [key: string]: JsonValue };
+    for (const [key, child] of entries) {
+      string(key); const owned = visit(child, depth + 1, [...path, key]);
+      Object.defineProperty(copy, key, { value: owned, enumerable: true, writable: true, configurable: true });
+    }
+    ancestors.delete(item); return copy;
+  };
+  const owned = visit(value, 0, []);
+  // Packing is independently charged after the descriptor-based scalar/structure admission.
+  retained(() => boundedRetainedJson(owned, maximumBytes));
+  if (bodyPath !== null && metadataBytes !== undefined) {
+    const metadata = (item: JsonValue, path: readonly string[]): JsonValue => {
+      if (isBody(path)) return "";
+      if (item === null || typeof item !== "object") return item;
+      if (Array.isArray(item)) return item.map((child, n) => metadata(child, [...path, String(n)]));
+      return Object.fromEntries(Object.entries(item).map(([key, child]) => [key, metadata(child, [...path, key])]));
+    };
+    retained(() => boundedRetainedJson(metadata(owned, []), metadataBytes));
+  }
+  return owned;
+}
+function formatV2(r: Record<string, unknown>, key: string, operation: string): void {
+  if (!Number.isSafeInteger(r[key]) || Number(r[key]) < 1 || typeof r.operation !== "string" || r.operation.length === 0) refuse();
+  if (r[key] !== 2 || r.operation !== operation) refuse("GOVERNED_NOTE_FORMAT_UNSUPPORTED");
+}
+function markdown(value: unknown, withHash = false): C.MarkdownNoteContentV1 & { readonly contentHash?: string } {
+  const r = record(value, withHash ? ["format", "body", "contentHash"] : ["format", "body"]);
+  if (r.format !== "markdown") refuse(); assertMarkdownNoteBodyV1(r.body);
+  const content = Object.freeze({ format: "markdown" as const, body: r.body });
+  if (!withHash) return content;
+  const contentHash = hash(r.contentHash); if (contentHash !== governedNoteBodyHash(content)) refuse();
+  return Object.freeze({ ...content, contentHash });
+}
+export function decodeGovernedNoteCommandV2(value: unknown): C.GovernedNoteCommandV2 {
+  const r = record(snapshotV2(value, 196608, ["content", "body"], 8192), ["version", "operation", "commandId", "idempotencyKey", "recordKind", "summary", "confidence", "provenance", "content"]);
+  formatV2(r, "version", "create-governed-note"); const { content, ...base } = r;
+  const old = decodeGovernedNoteCommandV1({ ...base, version: 1 });
+  return Object.freeze({ ...old, version: 2, content: markdown(content) });
+}
+export function encodeGovernedNoteCommandV2(command: C.GovernedNoteCommandV2): string { return canonicalJson(decodeGovernedNoteCommandV2(command)); }
+export function decodeGovernedNoteRecoveryV2(value: unknown): C.GovernedNoteRecoveryV2 {
+  const r = record(snapshotV2(value, LIMITS.inputBytes), ["version", "operation", "operationId", "requestId", "commandId", "idempotencyKey", "expiresAt"]);
+  formatV2(r, "version", "recover-governed-note-result");
+  return Object.freeze({ ...decodeGovernedNoteRecoveryV1({ ...r, version: 1 }), version: 2 });
+}
+export function encodePreparedGovernedNoteCreateV2(input: C.PreparedGovernedNoteCreateV2): C.PreparedGovernedNoteCreateWireV2 {
+  const r = record(input, ["command", "authorization"]); const command = encodeGovernedNoteCommandV2(r.command as C.GovernedNoteCommandV2), authorization = createAuthorization(r.authorization);
+  const encoded = Object.freeze({ command, authorization }); wire(encoded, "command"); return encoded;
+}
+export function decodePreparedGovernedNoteCreateV2(value: unknown): C.PreparedGovernedNoteCreateV2 {
+  const r = wire(value, "command"); return Object.freeze({ command: parseCanonical(r.command, decodeGovernedNoteCommandV2), authorization: createAuthorization(r.authorization) });
+}
+export function encodePreparedGovernedNoteRecoveryV2(input: C.PreparedGovernedNoteRecoveryV2): C.PreparedGovernedNoteRecoveryWireV2 {
+  const r = record(input, ["request", "authorization"]); const request = decodeGovernedNoteRecoveryV2(r.request), authorization = recoveryAuthorization(r.authorization);
+  const encoded = Object.freeze({ request: canonicalJson(request), authorization }); wire(encoded, "request"); return encoded;
+}
+export function decodePreparedGovernedNoteRecoveryV2(value: unknown): C.PreparedGovernedNoteRecoveryV2 {
+  const r = wire(value, "request"); return Object.freeze({ request: parseCanonical(r.request, decodeGovernedNoteRecoveryV2), authorization: recoveryAuthorization(r.authorization) });
+}
+export function decodeGovernedNoteCreatedPayloadV2(value: unknown): C.GovernedNoteCreatedPayloadV2 {
+  const outer = record(snapshotV2(value, LIMITS.sourceEventBytes), ["formatVersion", "witness"]);
+  if (outer.formatVersion !== 2) refuse();
+  const r = record(outer.witness, ["witnessVersion", "commandType", "commandId", "idempotencyKey", "recordId", "recordKind", "confidence", "authority", "binding", "provenance", "policyId", "policyVersion", "originalCommitmentKeyRef", "originalInputCommitment", "summaryContentHash", "noteEventId", "sourceEventId", "recordedAt", "contentFormat", "bodyContentHash"]);
+  if (r.witnessVersion !== 2 || r.contentFormat !== "markdown") refuse();
+  const { contentFormat, bodyContentHash, ...base } = r;
+  const old = decodeGovernedNoteCreatedPayloadV1({ formatVersion: 1, witness: { ...base, witnessVersion: 1 } });
+  return Object.freeze({ formatVersion: 2, witness: Object.freeze({ ...old.witness, witnessVersion: 2, contentFormat: "markdown", bodyContentHash: hash(bodyContentHash) }) });
+}
+export function decodeGovernedNoteSourcePayloadV2(value: unknown): C.GovernedNoteSourcePayloadV2 {
+  const r = record(snapshotV2(value, LIMITS.sourceEventBytes, ["item", "content", "body"], 65536), ["sourceVersion", "binding", "item", "followUps", "artifacts", "entities", "aliases", "edges"]);
+  if (r.sourceVersion !== 3) refuse();
+  const i = record(r.item, ["itemId", "normalizedKey", "status", "confidence", "verificationMethod", "validFrom", "validTo", "summary", "contentHash", "conflictGroupId", "supersedingItemId", "anchor", "recordKind", "content"]);
+  if (i.verificationMethod !== "governed-note-unverified-v2") refuse();
+  const { recordKind, content, ...base } = i;
+  const kind = enumeration(recordKind, ["session-log", "insight", "mistake", "adr"] as const);
+  const old = decodeGovernedNoteSourcePayloadV1({ ...r, sourceVersion: 2, item: { ...base, verificationMethod: "governed-note-unverified-v1" } });
+  if (old.item.normalizedKey !== `governed-note/${kind}/${old.item.itemId}`) refuse();
+  const decodedContent = markdown(content, true) as C.GovernedNoteSourcePayloadV2["item"]["content"];
+  return Object.freeze({ ...old, sourceVersion: 3, item: Object.freeze({ ...old.item, verificationMethod: "governed-note-unverified-v2", recordKind: kind, content: decodedContent }) });
+}
+function receiptV2(value: unknown, withReplay: boolean): C.GovernedNoteStoredReceiptV2 | C.GovernedNoteReceiptV2 {
+  const r = record(value, [...RECEIPT_FIELDS, "content", ...(withReplay ? ["replay"] : [])]);
+  formatV2(r, "resultVersion", "create-governed-note"); const { content, ...base } = r;
+  const c = record(content, ["format", "contentHash"]); if (c.format !== "markdown") refuse();
+  const old = receipt({ ...base, resultVersion: 1 }, withReplay);
+  return Object.freeze({ ...old, resultVersion: 2, content: Object.freeze({ format: "markdown", contentHash: hash(c.contentHash) }) });
+}
+export function decodeGovernedNoteStoredReceiptV2(value: unknown): C.GovernedNoteStoredReceiptV2 { return receiptV2(snapshotV2(value, LIMITS.resultBytes), false); }
+export function decodeGovernedNoteStoredResultV2(value: unknown): C.GovernedNoteStoredResultV2 {
+  const r = record(snapshotV2(value, LIMITS.resultBytes), ["eventIds", "firstGlobalPosition", "lastGlobalPosition", "finalStreamVersion", "response"]);
+  return Object.freeze({ eventIds: pair(r.eventIds), firstGlobalPosition: decimal(r.firstGlobalPosition), lastGlobalPosition: decimal(r.lastGlobalPosition), finalStreamVersion: decimal(r.finalStreamVersion), response: receiptV2(r.response, false) });
+}
+export function decodeGovernedNoteRecoveryResultV2(value: unknown): C.GovernedNoteRecoveryResultV2 {
+  const owned = snapshotV2(value, LIMITS.resultBytes); const head = retained(() => retainedDataEntries(owned, LIMITS.fields)); const outcome = head.find(([key]) => key === "outcome")?.[1];
+  if (outcome !== "committed" && outcome !== "not-found") refuse();
+  const r = record(owned, outcome === "committed" ? ["resultVersion", "operation", "outcome", "receipt"] : ["resultVersion", "operation", "outcome", "commandId", "idempotencyKey"]);
+  formatV2(r, "resultVersion", "recover-governed-note-result");
+  if (outcome === "not-found") return Object.freeze({ resultVersion: 2, operation: "recover-governed-note-result", outcome, commandId: uuid(r.commandId), idempotencyKey: uuid(r.idempotencyKey) });
+  const entries = retained(() => retainedDataEntries(r.receipt, LIMITS.fields)); const version = entries.find(([key]) => key === "resultVersion")?.[1];
+  const decoded = version === 1 ? receipt(r.receipt, true) as C.GovernedNoteReceiptV1 : version === 2 ? receiptV2(r.receipt, true) as C.GovernedNoteReceiptV2 : refuse();
+  return Object.freeze({ resultVersion: 2, operation: "recover-governed-note-result", outcome, receipt: decoded });
 }
