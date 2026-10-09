@@ -263,8 +263,14 @@ function immutableSnapshot<T>(value: T, ancestors = new Set<object>()): T {
   if (types.isProxy(value) || ancestors.has(value) || !(isPlainArray(value) || isPlainRecord(value))) throw new EventStoreError("COMMAND_INVALID");
   ancestors.add(value);
   try {
+    const keys = Reflect.ownKeys(value);
+    if (Array.isArray(value)) {
+      const length = Object.getOwnPropertyDescriptor(value, "length")!.value as number;
+      // Copying only present properties would silently shorten trailing holes.
+      if (keys.length !== length + 1 || keys.some((key, index) => key !== (index === length ? "length" : String(index)))) throw new EventStoreError("COMMAND_INVALID");
+    }
     const snapshot: Record<string, unknown> | unknown[] = Array.isArray(value) ? [] : Object.create(Object.getPrototypeOf(value)) as Record<string, unknown>;
-    for (const key of Reflect.ownKeys(value)) {
+    for (const key of keys) {
       if (Array.isArray(value) && key === "length") continue;
       const descriptor = Object.getOwnPropertyDescriptor(value, key)!;
       if (typeof key !== "string" || !("value" in descriptor) || !descriptor.enumerable) throw new EventStoreError("COMMAND_INVALID");

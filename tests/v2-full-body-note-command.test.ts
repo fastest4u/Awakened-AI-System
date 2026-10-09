@@ -299,3 +299,39 @@ test("v2_recovery_rollback_poison_survives_new_service_and_later_cleanup", async
   assert.throws(() => v2(f.service()).createV2(f.prepareCreateV2(f.commandV2()), f.rootContext), { code: "GOVERNED_NOTE_UNAVAILABLE" });
   assert.equal(f.rowContents(), before);
 });
+
+for (const location of ["payload", "response"] as const) for (const shape of ["all-hole", "trailing-hole"] as const) {
+  test(`generic_prepare_rejects_${shape}_${location}_arrays_without_mutation`, async t => {
+    const f = await makeGovernedNoteDomainFixture(); t.after(f.cleanup);
+    const { tx, append } = f.prepareNote(f.prepareCreate(f.command())), values: JsonValue[] = new Array(2);
+    if (shape === "trailing-hole") values[0] = "kept";
+    const ordinary: AppendCommand<JsonValue> = { ...append, commandType: "ordinary", streamType: "ordinary", streamId: "ordinary",
+      events: [{ ...append.events[0]!, eventType: "OpaqueHistoric", payload: location === "payload" ? { values } : {} }],
+      publicResponse: location === "response" ? { values } : {} };
+    const before = f.rowContents();
+    assert.throws(() => tx.prepare(ordinary, f.clock.now()), { code: "COMMAND_INVALID", message: "COMMAND_INVALID", details: {} });
+    assert.equal(values.length, 2); assert.equal(Object.hasOwn(values, "1"), false); assert.equal(f.rowContents(), before);
+  });
+}
+
+test("generic_prepare_preserves_dense_arrays_and_refuses_array_accessors_and_proxies", async t => {
+  const f = await makeGovernedNoteDomainFixture(); t.after(f.cleanup);
+  const { tx, append } = f.prepareNote(f.prepareCreate(f.command())), values: JsonValue[] = ["kept", null, { nested: [1, true, []] }];
+  const ordinary = { ...append, commandType: "ordinary", streamType: "ordinary", streamId: "ordinary",
+    events: [{ ...append.events[0]!, eventType: "OpaqueHistoric", payload: { values } }], publicResponse: { values } };
+  const before = f.rowContents(), prepared = tx.prepare(ordinary, f.clock.now());
+  assert.deepEqual(prepared.command.events[0]!.payload, { values: ["kept", null, { nested: [1, true, []] }] });
+  assert.deepEqual(prepared.command.publicResponse, { values: ["kept", null, { nested: [1, true, []] }] });
+  assert.notEqual(prepared.command.publicResponse.values, values); assert.ok(Object.isFrozen(prepared.command.publicResponse.values));
+  let reads = 0;
+  const accessor: JsonValue[] = [];
+  Object.defineProperty(accessor, "0", { enumerable: true, get() { reads++; return "private-array-value"; } });
+  const proxy = new Proxy<JsonValue[]>(["private-array-value"], { get() { reads++; throw new Error("private-array-get"); }, ownKeys() { reads++; throw new Error("private-array-keys"); } });
+  for (const hostile of [accessor, proxy]) for (const location of ["payload", "response"] as const) {
+    const input = { ...ordinary, events: [{ ...ordinary.events[0]!, payload: location === "payload" ? { values: hostile } : { values } }],
+      publicResponse: location === "response" ? { values: hostile } : { values } };
+    assert.throws(() => tx.prepare(input, f.clock.now()), { code: "COMMAND_INVALID", message: "COMMAND_INVALID", details: {} });
+    assert.equal(reads, 0); assert.equal(f.rowContents(), before);
+  }
+  assert.equal(f.rowContents(), before);
+});
