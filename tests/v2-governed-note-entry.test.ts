@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { randomUUID } from "node:crypto";
+import { setTimeout as delay } from "node:timers/promises";
 import { decodeGovernedFixtureActionV1 } from "../src/orchestrator/governed-notes/fixture-control.js";
 import { makeGovernedNoteFixture } from "./support/governed-note-fixture.js";
 
@@ -36,6 +37,45 @@ function commandFor(f:Awaited<ReturnType<typeof makeGovernedNoteFixture>>,summar
  return {version:1 as const,operation:"create-governed-note" as const,commandId:randomUUID(),idempotencyKey:randomUUID(),recordKind:"insight" as const,summary,confidence:"low" as const,provenance:[{kind:"retained-evidence" as const,identity:f.sourceId}]};
 }
 const code=(expected:string)=>(error:unknown)=>typeof error==="object"&&error!==null&&"code"in error&&error.code===expected;
+
+test("failed read rollback terminalizes the same native owner before queued admission",{timeout:120000},async t=>{
+ const f=await makeGovernedNoteFixture({scenario:"read-rollback-failure"});try{
+  const command=commandFor(f),create=await f.prepareCreate(command),recovery=await f.prepareRecovery(command),before=f.observations();
+  const pending=f.run.recover(f.permit,recovery);void pending.catch(()=>undefined);
+  await assert.rejects(f.run.recover(f.permit,recovery),code("GOVERNED_NOTE_OWNER_BUSY"));
+  let failure:unknown;try{await pending;}catch(error){failure=error;}
+  const deadline=Date.now()+5000;
+  while(f.observations().workerExits===0&&f.observations().queuedReplies===0n&&Date.now()<deadline)await delay(10);
+  const after=f.observations();t.diagnostic(JSON.stringify(after,(_k,v:unknown)=>typeof v==="bigint"?v.toString():v));
+  assert.equal(after.failedReadRollbacks,1n);assert.equal(after.queuedRecoveries,1n);
+  assert.equal(after.ownerReusable,false);
+  assert.equal(after.workerExits,1);assert.equal(after.workerExitCode,0);
+  assert.equal(after.queuedDispatches,0n);assert.equal(after.queuedReplies,0n);assert.equal(after.recoveryPosts,before.recoveryPosts+1);
+  assert.equal(after.closedWithReadTransaction,1n);assert.equal(after.openWriterConnectionCount,0);assert.equal(after.detach,0);assert.equal(after.delivery,0);
+  assert.equal(code("GOVERNED_NOTE_OWNERSHIP_UNCERTAIN")(failure),true);
+  assert.deepEqual((failure as {details:unknown}).details,{commandId:command.commandId,idempotencyKey:command.idempotencyKey});
+  await assert.rejects(f.run.recover(f.permit,recovery),code("GOVERNED_NOTE_OWNERSHIP_UNCERTAIN"));
+  await assert.rejects(f.run.create(f.permit,create),code("GOVERNED_NOTE_OWNERSHIP_UNCERTAIN"));
+  await assert.rejects(f.run.close(f.permit),code("GOVERNED_NOTE_UNAVAILABLE"));
+  await assert.rejects(f.run.reopen(f.permit),code("GOVERNED_NOTE_UNAVAILABLE"));
+  await f.cleanup();const final=f.observations();
+  assert.equal(final.ownerReusable,false);assert.equal(final.cleanupDisposition,"ownership-uncertain");assert.equal(final.ownerGeneration,before.ownerGeneration);
+  assert.equal(final.recoveryPosts,after.recoveryPosts);assert.equal(final.createPosts,before.createPosts);assert.equal(final.actionPosts,before.actionPosts);
+  assert.equal(final.safeOutputLeaks,0);assert.equal(final.metricLeaks,0);assert.equal(final.logLeaks,0);
+ }finally{await f.cleanup();}
+});
+
+test("positive read rollback keeps the same native owner reusable",{timeout:120000},async t=>{
+ const f=await makeGovernedNoteFixture({scenario:"read-rollback-success"});try{
+  const command=commandFor(f),prepared=await f.prepareRecovery(command),before=f.observations();
+  await assert.rejects(f.run.recover(f.permit,prepared),error=>{assert.equal(code("GOVERNED_NOTE_UNAVAILABLE")(error),true);assert.deepEqual((error as {details:unknown}).details,{});return true;});
+  const after=f.observations();assert.equal(after.ownerReusable,true);assert.equal(after.readRollbacks,1n);assert.equal(after.failedReadRollbacks,0n);assert.equal(after.transactionOpen,0);assert.equal(after.workerExits,0);
+  assert.equal((await f.run.recover(f.permit,await f.prepareRecovery(command))).outcome,"not-found");
+  await f.run.create(f.permit,await f.prepareCreate(command));assert.equal(f.observations().ownerGeneration,before.ownerGeneration);
+  await f.run.close(f.permit);f.permit=await f.run.reopen(f.permit);assert.ok(f.observations().ownerGeneration>before.ownerGeneration);
+  t.diagnostic(JSON.stringify({positiveRollback:after.readRollbacks.toString(),reused:true,reopened:true}));
+ }finally{await f.cleanup();}
+});
 
 test("own child uses current same-session authority and retained-only provenance",{timeout:120000},async()=>{
  const f=await makeGovernedNoteFixture({child:true});try{

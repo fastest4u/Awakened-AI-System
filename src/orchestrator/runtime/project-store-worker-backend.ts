@@ -1,5 +1,6 @@
 import { decodeGovernedFixtureActionV1, decodeGovernedFixtureResultV1, type GovernedFixtureActionV1, type GovernedFixtureResultV1, type GovernedFixtureActionPortV1, type TrustedGovernedFixtureFactoryV1 } from "../governed-notes/fixture-control.js";
 import { GovernedNoteError } from "../governed-notes/errors.js";
+import { hasUncertainGovernedRecoveryCleanup } from "../governed-notes/service.js";
 import { decodePreparedGovernedNoteCreateV1, decodePreparedGovernedNoteRecoveryV1 } from "../governed-notes/codec.js";
 import type { GovernedNoteRuntime, GovernedNoteRuntimeFactoryPort } from "../governed-notes/contracts.js";
 import { decodeGovernedNoteWorkerResponse, governedNoteRequestIds, isGovernedNoteRequest, sanitizeGovernedNoteError, type GovernedNoteWorkerRequest } from "../governed-notes/worker-protocol.js";
@@ -83,6 +84,12 @@ import {
 } from "./worker-protocol.js";
 
 const POSITIVE_SAFE_INTEGER = (value: number): boolean => Number.isSafeInteger(value) && value > 0;
+
+const terminalGovernedReadErrors = new WeakSet<object>();
+/** Internal identity only: public error codes cannot certify owner health. */
+export function isTerminalGovernedReadOwnerError(error: unknown): boolean {
+  return typeof error === "object" && error !== null && terminalGovernedReadErrors.has(error);
+}
 
 export class ProjectStoreWorkerBackendError extends Error {
   constructor(
@@ -705,6 +712,14 @@ export class ProjectStoreWorkerBackend implements WorkerRuntimeBackend {
       if (!response.ok) throw new GovernedNoteError("WORKER_PROTOCOL_ERROR");
       return response.data;
     } catch (error) {
+      if (active && hasUncertainGovernedRecoveryCleanup(active.connection)) {
+        // Invalidate before yielding. The runtime closes this owner's transport
+        // without an ordinary ACK; actual worker exit poisons its parent owner.
+        this.#closed = true;
+        const terminal = new GovernedNoteError("GOVERNED_NOTE_UNAVAILABLE");
+        terminalGovernedReadErrors.add(terminal);
+        throw terminal;
+      }
       let safe = sanitizeGovernedNoteError(error, ids);
       if (request.type === "governed-note-recover" && (safe.code === "COMMAND_OUTCOME_UNKNOWN" || safe.code === "GOVERNED_NOTE_OWNERSHIP_UNCERTAIN")) safe = new GovernedNoteError("WORKER_UNAVAILABLE");
       if (request.type === "governed-note-create" && (returned || safe.code === "COMMAND_OUTCOME_UNKNOWN")) safe = new GovernedNoteError("COMMAND_OUTCOME_UNKNOWN", ids);

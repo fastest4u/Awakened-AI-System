@@ -23,11 +23,18 @@ export interface GovernedNoteServiceOptions {
   readonly policy: () => TrustedRedactionPolicyV1; readonly clock: GovernedNoteClockV1;
   readonly faults?: GovernedNoteFaultInjectorV1;
 }
+// Cleanup uncertainty belongs to the actual connection, including a new service
+// composed over it. Resource cleanup cannot erase this observation.
+const uncertainRecoveryConnections = new WeakSet<SqliteConnection>();
+export function hasUncertainGovernedRecoveryCleanup(connection: SqliteConnection): boolean {
+  return uncertainRecoveryConnections.has(connection);
+}
 export class GovernedNoteService {
   constructor(private readonly options: GovernedNoteServiceOptions) {}
   recover(input: PreparedGovernedNoteRecoveryV1, context: ProjectContext): GovernedNoteRecoveryResultV1 {
     const owned = decodePreparedGovernedNoteRecoveryV1(encodePreparedGovernedNoteRecoveryV1(input));
     const { connection, authority, repository, faults } = this.options;
+    if (hasUncertainGovernedRecoveryCleanup(connection)) throw new GovernedNoteError("GOVERNED_NOTE_UNAVAILABLE");
     let handle: VerifiedGovernedNoteRecoveryAuthority | undefined;
     let candidate: GovernedNoteRecoveryResultV1 | undefined;
     let failure: GovernedNoteError | undefined;
@@ -64,7 +71,7 @@ export class GovernedNoteService {
       candidate = undefined;
       if (transactionOpen) {
         try { connection.exec("ROLLBACK"); transactionOpen = false; }
-        catch { rollbackFailed = true; }
+        catch { rollbackFailed = true; uncertainRecoveryConnections.add(connection); }
       }
       const code = error instanceof Error && "code" in error && typeof error.code === "string" ? error.code : "GOVERNED_NOTE_UNAVAILABLE";
       // Read uncertainty never certifies a retry or another uncertain mutation.
@@ -84,6 +91,7 @@ export class GovernedNoteService {
     const owned = decodePreparedGovernedNoteCreateV1(encodePreparedGovernedNoteCreateV1(input));
     const command = owned.command, ids = { commandId: command.commandId, idempotencyKey: command.idempotencyKey };
     const { connection, events, authority, repository, provenance, provider } = this.options;
+    if (hasUncertainGovernedRecoveryCleanup(connection)) throw new GovernedNoteError("GOVERNED_NOTE_UNAVAILABLE");
     let transactionOpen = false, commitAttempted = false, commitSucceeded = false, beginBusy = false, rollbackFailed = false;
     let prepared: PreparedEventAppend<GovernedNoteStoredReceiptV1> | undefined;
     let result: AppendResult<GovernedNoteStoredReceiptV1> | undefined, failure: Error | undefined;

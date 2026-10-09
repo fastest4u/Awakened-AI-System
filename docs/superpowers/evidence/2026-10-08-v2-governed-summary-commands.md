@@ -2,7 +2,7 @@
 
 **Actual G11 qualification: PENDING. No passing current-candidate result is claimed.**
 
-Approved spec `c258b1b`, plan `2ed388d` (including G09), and accumulated eleven Rulings govern this private increment. Accepted G10 baseline is `c6db43d6f96851b3a9972ff06233ab1e05638c3c`. G11 runner controls passed48/48; whole-branch review, a clean committed candidate and one actual contained gate must still precede qualification. Qualified runtime HEAD: PENDING. Later documentary-only HEAD: PENDING; documentary publication must not be substituted for the measured runtime commit.
+Approved spec `c258b1b`, plan `2ed388d` (including G09), and accumulated eleven Rulings govern this private increment. Accepted G10 baseline is `c6db43d6f96851b3a9972ff06233ab1e05638c3c`. G11 runner controls passed48/48. Whole review of clean candidate `3f116dd026f6545006f6f9b690da8c2826cb7147` found one Important I1; its correction awaits scoped review before the separately authorized actual contained gate. Qualified runtime HEAD: PENDING. Later documentary-only HEAD: PENDING; documentary publication must not be substituted for the measured runtime commit.
 
 Only `session-log | insight | mistake | adr` summaries become candidate/unverified records with direct retained provenance and current same-session authority. This delivers neither full note bodies nor public note tools, factual verification, session finalization, operational custody or PROD activation.
 
@@ -87,3 +87,9 @@ Root accepted-history carry only (no archive read/extraction/recalculation this 
 ## Focused G11 status
 
 Covering compiler exit0 at UTC epochs1791522087497..1791522122098; same focused gate-control command exit0 at1791522151713..1791522454364,48/48 tests, zero failure/cancelled/skip/todo,302473.4365ms reporter footer. One full synthetic happy inventory and the single Ruling11 negative final-unlink inventory both observed all34 real contained stages. Only the happy fixture published a synthetic qualification; the negative retained the original lock and withheld publication. Full focused provenance, setup/RED/intermediate distinctions and measured Ruling11 cost are in the [verification report](../reports/2026-10-08-v2-governed-summary-commands-verification.md). This is not the actual current-candidate gate result.
+
+## Whole-review recovery cleanup correction
+
+I1 exposed failed read ROLLBACK returning an ordinary safe error while its same worker remained reusable. The scoped correction retains private sticky connection uncertainty, invalidates that backend and terminalizes its runtime FIFO, then lets actual worker exit poison the unchanged executor/controller owner. Later cleanup cannot grant healthy reuse or a new generation. Positive rollback remains healthy. Human-approved original command/idempotency IDs remain preserved for unknown recovery transport outcomes; no mutation receipt or new public wire semantics are invented. This completes the missing Ruling8 disposition rather than adding another Ruling.
+
+Evidence is composite: causal RED4/1pass/3fail; one fresh product build/compile; full affected cohort101/100pass/1fail from a test-only disposition literal; corrected literal plus covering compile and exact native retry1/1. All runs ended naturally. Product and emitted identities stayed unchanged through the assertion correction. Actual exit0/nonreuse/zero queued dispatch/original IDs/no new generation were observed; successful rollback reused normally. The [verification report](../reports/2026-10-08-v2-governed-summary-commands-verification.md) records exact counts, costs, UTC evidence locators and limits. Scoped review and actual gate remain pending. All eleven Rulings, material native limits and full F2/F3/F4/PROD boundaries above remain in force.

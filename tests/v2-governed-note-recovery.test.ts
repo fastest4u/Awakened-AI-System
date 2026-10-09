@@ -170,15 +170,33 @@ for (const outcome of outcomes) for (const fault of ["commit-before", "commit-af
     } } });
     t.after(f.cleanup);
     const { prepared, context } = setup(f, outcome), before = f.rowContents();
-    const exec = f.connection.exec.bind(f.connection); let rollbacks = 0;
+    const laterCreate = fault === "rollback" ? f.prepareCreate(f.command(), context) : undefined;
+    const exec = f.connection.exec.bind(f.connection); let rollbacks = 0, repaired = false;
     f.connection.exec = sql => {
       if (sql === "COMMIT" && fault === "commit-before") throw new Error("private commit before");
       if (sql === "ROLLBACK") { rollbacks++; if (fault === "rollback" && rollbacks === 1) throw new Error("private first cleanup"); }
       exec(sql);
       if (sql === "COMMIT" && fault === "commit-after") throw new Error("private commit after");
     };
-    try { noSuccess(() => f.service().recover(prepared, context), "GOVERNED_NOTE_UNAVAILABLE"); }
-    finally { f.connection.exec = exec; if (fault === "rollback" && rollbacks > 0) exec("ROLLBACK"); }
+    try {
+      noSuccess(() => f.service().recover(prepared, context), "GOVERNED_NOTE_UNAVAILABLE");
+      if (fault === "rollback") {
+        let verificationCalls = 0;
+        const verify = f.verifier.verifyRecovery.bind(f.verifier);
+        f.verifier.verifyRecovery = (...args) => { verificationCalls++; return verify(...args); };
+        // A new service over the same connection cannot resume admission while
+        // the failed cleanup still owns an open read transaction.
+        noSuccess(() => f.service().recover(prepared, context), "GOVERNED_NOTE_UNAVAILABLE");
+        assert.equal(verificationCalls, 0);
+        noSuccess(() => f.service().create(laterCreate!, context), "GOVERNED_NOTE_UNAVAILABLE");
+        exec("ROLLBACK"); repaired = true;
+        const retry = f.prepareRecovery(prepared.request, expiry(f), context);
+        noSuccess(() => f.service().recover(retry, context), "GOVERNED_NOTE_UNAVAILABLE");
+        assert.equal(verificationCalls, 0, "later successful cleanup cannot heal uncertainty");
+        noSuccess(() => f.service().create(laterCreate!, context), "GOVERNED_NOTE_UNAVAILABLE");
+      }
+    }
+    finally { f.connection.exec = exec; if (fault === "rollback" && rollbacks > 0 && !repaired) exec("ROLLBACK"); }
     assert.equal(detached, fault === "rollback" ? 0 : 1);
     if (fault === "rollback") assert.equal(rollbacks, 1);
     assert.equal(f.rowContents(), before);

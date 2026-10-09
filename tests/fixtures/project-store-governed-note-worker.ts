@@ -103,7 +103,7 @@ const lifecycleFactory = new LifecycleWorkerRuntimeFactory({ clock, identitySour
     },
   });
 
-let connection:SqliteConnection|undefined,recovery=false,readCommitExpected=false,lastExpiry="";
+let connection:SqliteConnection|undefined,recovery=false,readCommitExpected=false,lastExpiry="",readFaultInjected=false,queuedRecovery=false,queuedRecoveryId:string|null=null;
 const identities=new Set<SqliteConnection>(),fences=new Set<MaintenanceFence>(),keyProviders=new Set<CapabilityKeyProvider>();
 function observeConnection(input:{connection:SqliteConnection;maintenanceFence:MaintenanceFence;keyProvider:CapabilityKeyProvider}):void{identities.add(input.connection);fences.add(input.maintenanceFence);keyProviders.add(input.keyProvider);Atomics.store(observation,OBS.connections,identities.size);Atomics.store(observation,OBS.fences,fences.size);Atomics.store(observation,OBS.keyProviders,keyProviders.size);connection=input.connection;Atomics.store(observation,OBS.writers,1);}
 function localClock(now:string):void{providers.control({kind:"clock",now});}
@@ -125,6 +125,7 @@ function scanDurable():void{
 const originalEvidenceMac=providers.evidence.mac.bind(providers.evidence);
 providers.evidence.mac=(scope,purpose,ref,domain,bytes)=>{if(config.scenario==="provider-error"&&domain==="governed-note-original-input/v1"){Atomics.add(observation,OBS.providerFailure,1);throw new Error("fixture_exception_marker");}return originalEvidenceMac(scope,purpose,ref,domain,bytes);};
 const governedFactory=new GovernedNoteRuntimeFactory({provider:providers.evidence,policy:()=>providers.state.policy,clock,nonceSource:ids,faults:{inject(point){
+ if(point==="recovery-before-final-verify"&&!readFaultInjected&&["read-rollback-failure","read-rollback-success"].includes(config.scenario)){readFaultInjected=true;throw new GovernedNoteError("GOVERNED_NOTE_UNAVAILABLE");}
  if(point==="recovery-before-final-verify"&&["delay-committed","delay-absent","detach-expired"].includes(config.scenario))localClock(new Date(Date.parse(lastExpiry)+(config.scenario==="detach-expired"?0:-1)).toISOString());
  if(point==="recovery-before-final-verify"&&config.scenario==="admission-denied"){
   const row=connection!.prepare("SELECT release_id FROM fresh_start_control_state").get()!;
@@ -144,9 +145,9 @@ function storedHandle(row:SessionAuthorityRecord):StoredCapabilityMaterialV1{
 }
 const fixtureFactory:TrustedGovernedFixtureFactoryV1={create(input){
  observeConnection(input);providers.publishProviderStatus();const {connection,lifecycleRuntime,retainedEvidenceRuntime}=input;
- const originalClose=connection.close.bind(connection);connection.close=()=>{originalClose();Atomics.store(observation,OBS.writers,0);};
+ const originalClose=connection.close.bind(connection);connection.close=()=>{Atomics.store(times,6,BigInt(Atomics.load(observation,OBS.transaction)));originalClose();Atomics.store(observation,OBS.writers,0);Atomics.store(observation,OBS.transaction,0);};
  const originalExec=connection.exec.bind(connection);
- connection.exec=(sql:string)=>{if(sql==="COMMIT"&&readCommitExpected&&config.scenario==="read-commit-failure"){readCommitExpected=false;Atomics.add(observation,OBS.failedReadCommit,1);throw new Error("fixture_exception_marker");}const result=originalExec(sql);if(sql==="BEGIN DEFERRED")Atomics.store(observation,OBS.transaction,1);if(sql==="COMMIT"||sql==="ROLLBACK"){if(sql==="COMMIT"&&readCommitExpected){Atomics.store(observation,OBS.commit,1);readCommitExpected=false;}Atomics.store(observation,OBS.transaction,0);}return result;};
+ connection.exec=(sql:string)=>{if(sql==="ROLLBACK"&&recovery){Atomics.add(times,4,1n);if(config.scenario==="read-rollback-failure"&&Atomics.load(times,5)===0n){Atomics.add(times,5,1n);throw new Error("fixture_exception_marker");}}if(sql==="COMMIT"&&readCommitExpected&&config.scenario==="read-commit-failure"){readCommitExpected=false;Atomics.add(observation,OBS.failedReadCommit,1);throw new Error("fixture_exception_marker");}const result=originalExec(sql);if(sql==="BEGIN DEFERRED")Atomics.store(observation,OBS.transaction,1);if(sql==="COMMIT"||sql==="ROLLBACK"){if(sql==="COMMIT"&&readCommitExpected){Atomics.store(observation,OBS.commit,1);readCommitExpected=false;}Atomics.store(observation,OBS.transaction,0);}return result;};
  const repository=new SessionAuthorityRepository(),capabilities=new CapabilityService({keyProvider:input.keyProvider,clock,nonceSource:ids});
  const audience=(c:ProjectContext)=>({actorRole:c.binding.actorRole as "primary"|"untrusted",clientInstanceId:c.binding.clientInstanceId});
  function material(sessionId:string,c:ProjectContext){const row=repository.get(connection,c.binding.projectId,sessionId);if(!row)throw new GovernedNoteError("SESSION_CAPABILITY_INVALID");const stored=storedHandle(row),generation=stored.claims.capabilityGeneration;const resolution=capabilities.authorityMaterial({authorityCommitment:row.authorityCommitment,expectedCapabilityGeneration:generation,currentCapabilityGeneration:generation,target:audience(c),materials:[stored]});if(!resolution.descriptor)throw new GovernedNoteError("SESSION_CAPABILITY_INVALID");return {row,generation,value:capabilities.reconstructForTarget(resolution.descriptor,audience(c))};}
@@ -193,8 +194,10 @@ const fixtureFactory:TrustedGovernedFixtureFactoryV1={create(input){
 const backend=new ProjectStoreWorkerBackend({selfUrl:new URL(import.meta.url),executorLeaseMs:data.executorLeaseMs,appendRetryDeadlineMs:data.appendRetryDeadlineMs,keyProvider:providers.capability,trustedFreshStartBuildInspector:()=>config.buildHash,
  lifecycleRuntimeFactory:{create(input){observeConnection(input);const lifecycle=lifecycleFactory.create(input);return {execute:(operation,c)=>lifecycle.execute(operation,c),dispose(){try{lifecycle.dispose();}finally{providers.dispose();}}};}},retainedEvidenceRuntimeFactory:{create(input){observeConnection(input);return retainedFactory.create(input);}},
  governedNoteRuntimeFactory:{create(input){observeConnection(input);const runtime=governedFactory.create(input);return {create(p,c){Atomics.add(observation,OBS.createPosts,1);try{const result=runtime.create(p,c);scanDurable();return result;}catch(error){scanDurable();throw error;}},recover(p,c){Atomics.add(observation,OBS.recoveryPosts,1);recovery=true;try{return runtime.recover(p,c);}finally{recovery=false;}}};}},trustedGovernedFixtureFactory:config.scenario==="missing-factory"?undefined:fixtureFactory});
+const dispatch=backend.dispatch.bind(backend);backend.dispatch=async request=>{if(request.id===queuedRecoveryId)Atomics.add(times,8,1n);return dispatch(request);};
 const runtime=new ProjectStoreWorkerRuntime({backend,trustedGovernedFixtureActions:{execute:(binding,action)=>backend.executeTrustedGovernedFixtureAction(binding,action)},heartbeatIntervalMs:data.heartbeatIntervalMs,
  scheduler:{setInterval:(callback,ms)=>setInterval(callback,ms),clearInterval:handle=>clearInterval(handle as NodeJS.Timeout)},port:{postMessage(value){
+  if((value as {id?:string}).id===queuedRecoveryId){Atomics.add(times,9,1n);return;}
   scanPublic(value,OBS.safeOutputLeaks);scanPublic(Array.from(observation.slice(0,33)),OBS.metricLeaks);
   const r=value as {ok?:boolean;data?:{operation?:string;closed?:boolean}};
   if(r.ok&&r.data?.operation==="recover-governed-note-result"&&config.scenario.startsWith("delay-")&&Atomics.load(observation,OBS.commit)===1){setTimeout(()=>{Atomics.store(times,2,clock.nowMs());Atomics.store(observation,OBS.delivery,1);parentPort!.postMessage(value);},500);return;}
@@ -216,4 +219,11 @@ config.port.on("message",async(value:unknown)=>{
   config.port.postMessage({version:1,requestId:request.requestId,ok:false,error:{code:"GOVERNED_NOTE_UNAVAILABLE",message:"GOVERNED_NOTE_UNAVAILABLE",details:{}}});
  }
 });
-parentPort.on("message",value=>runtime.receive(value));
+parentPort.on("message",value=>{
+ runtime.receive(value);
+ // Fixed startup fault queues one bounded copy behind the actual recovery.
+ // It traverses the real FIFO and backend; it is not a parent control lane.
+ if(config.scenario==="read-rollback-failure"&&!queuedRecovery&&value?.type==="governed-note-recover"){
+  queuedRecovery=true;queuedRecoveryId=randomUUID();Atomics.store(times,7,1n);runtime.receive({...value,id:queuedRecoveryId});
+ }
+});

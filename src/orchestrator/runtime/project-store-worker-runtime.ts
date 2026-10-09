@@ -2,6 +2,7 @@ import { decodeGovernedFixtureActionV1, decodeGovernedFixtureResultV1, type Gove
 import { decodeWorkerBindingAssertion } from "./worker-protocol.js";
 import { decodeGovernedNoteWorkerResponse, governedNoteRequestIds, isGovernedNoteRequest, sanitizeGovernedNoteError } from "../governed-notes/worker-protocol.js";
 import { GovernedNoteError } from "../governed-notes/errors.js";
+import { isTerminalGovernedReadOwnerError } from "./project-store-worker-backend.js";
 import type { JsonValue } from "../contracts/event.js";
 import {
   decodeWorkerRequest,
@@ -136,6 +137,7 @@ export class ProjectStoreWorkerRuntime {
   #binding: WorkerBindingAssertion | null = null;
   #observedQuiesce: { lease: MaintenanceLeaseWire; requestIds: string[] } | null = null;
   #heartbeatInFlight = false;
+  #terminalGovernedRead = false;
 
   constructor(options: ProjectStoreWorkerRuntimeOptions) {
     if (
@@ -160,6 +162,7 @@ export class ProjectStoreWorkerRuntime {
   }
 
   receive(value: unknown): void {
+    if (this.#terminalGovernedRead) return;
     let request: WorkerRequest;
     try {
       request = decodeWorkerRequest(value);
@@ -196,6 +199,9 @@ export class ProjectStoreWorkerRuntime {
   }
 
   private async process(request: WorkerRequest): Promise<void> {
+    // Requests already accepted into FIFO cannot reach dispatch after this
+    // private terminal observation, including an already-enqueued close.
+    if (this.#terminalGovernedRead) return;
     if (request.type === "close") {
       this.clearHeartbeat();
       try {
@@ -261,6 +267,15 @@ export class ProjectStoreWorkerRuntime {
         this.#port.close();
       }
     } catch (error) {
+      if (isTerminalGovernedReadOwnerError(error)) {
+        this.#terminalGovernedRead = true;
+        this.#closing = true;
+        this.clearHeartbeat();
+        // Never publish a normal safe-error ACK for an uncertain read owner.
+        // Existing executor onExit owns poisoning and pending-request failure.
+        void this.#backend.close().catch(() => undefined).finally(() => this.#port.close());
+        return;
+      }
       this.postRequestFailure(request, error);
       if (request.type === "open" || request.type === "verifyIdentity" || request.type === "inspectExisting") {
         this.#closing = true;
