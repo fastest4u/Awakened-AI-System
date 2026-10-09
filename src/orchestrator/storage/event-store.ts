@@ -1,3 +1,4 @@
+import { hasUncertainGovernedRecoveryCleanup } from "../governed-notes/service.js";
 import { randomUUID } from "node:crypto";
 import type {
   AppendCommand,
@@ -51,6 +52,7 @@ export class EventStore {
   append<TResponse extends JsonValue>(
     command: AppendCommand<TResponse>,
   ): AppendResult<TResponse> {
+    if (hasUncertainGovernedRecoveryCleanup(this.connection)) throw new EventStoreError("GOVERNED_NOTE_UNAVAILABLE");
     const transaction = new EventAppendTransaction(
       this.connection,
       this.statements,

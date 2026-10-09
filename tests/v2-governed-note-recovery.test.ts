@@ -80,11 +80,11 @@ for (const outcome of outcomes) for (const boundary of ["before-lookup", "inside
     if (boundary === "before-lookup") disable();
     if (boundary === "inside-read") f.connection.exec = sql => { exec(sql); if (sql === "BEGIN DEFERRED") disable(); };
     let lookups = 0;
-    const find = GovernedNoteRepository.prototype.findGovernedNotePrior;
-    GovernedNoteRepository.prototype.findGovernedNotePrior = function (...args) { lookups++; return find.apply(this, args); };
+    const find = GovernedNoteRepository.prototype.findGovernedNotePriorAny;
+    GovernedNoteRepository.prototype.findGovernedNotePriorAny = function (...args) { lookups++; return find.apply(this, args); };
     const before = f.rowContents();
     try { noSuccess(() => f.service().recover(prepared, context), "FRESH_START_ADMISSION_DENIED"); }
-    finally { f.connection.exec = exec; GovernedNoteRepository.prototype.findGovernedNotePrior = find; }
+    finally { f.connection.exec = exec; GovernedNoteRepository.prototype.findGovernedNotePriorAny = find; }
     assert.equal(changed, true);
     assert.equal(lookups, boundary === "before-lookup" || boundary === "inside-read" ? 0 : 1);
     assert.equal(f.rowContents(), before);
@@ -107,10 +107,10 @@ for (const outcome of outcomes) for (const mismatch of ["release", "build", "sch
     }
     const before = f.rowContents();
     let lookups = 0;
-    const find = GovernedNoteRepository.prototype.findGovernedNotePrior;
-    GovernedNoteRepository.prototype.findGovernedNotePrior = function (...args) { lookups++; return find.apply(this, args); };
+    const find = GovernedNoteRepository.prototype.findGovernedNotePriorAny;
+    GovernedNoteRepository.prototype.findGovernedNotePriorAny = function (...args) { lookups++; return find.apply(this, args); };
     try { noSuccess(() => f.service().recover(prepared, context), { release: "FRESH_START_RELEASE_MISMATCH", build: "FRESH_START_BUILD_MISMATCH", schema: "FRESH_START_SCHEMA_MISMATCH", tail: "FRESH_START_RECOVERY_REQUIRED", freshness: "FRESH_START_ADMISSION_STALE" }[mismatch]); }
-    finally { GovernedNoteRepository.prototype.findGovernedNotePrior = find; }
+    finally { GovernedNoteRepository.prototype.findGovernedNotePriorAny = find; }
     assert.equal(lookups, 0); assert.equal(f.rowContents(), before);
   });
 }

@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import { assertRetainedStoredEvent, decodeRetainedEvidenceAuthority, decodeRetainedEvidenceStoredResult, retainedEvidenceIntentHash, verifyRetainedEvidenceTransport } from "../privacy/retained-evidence-codec.js";
-import { assertStoredGovernedNoteCorrespondence, GovernedNoteRepository } from "../governed-notes/repository.js";
+import { assertStoredGovernedNoteCorrespondenceAny, GovernedNoteRepository } from "../governed-notes/repository.js";
 import { retainedStringMetrics } from "../privacy/evidence-contracts.js";
 import {
   commandHash,
@@ -1703,7 +1703,7 @@ export class EventIntegrityService {
 
   private reconstructGovernedNoteHash(command: CommandRow): string {
     try {
-      const prior = new GovernedNoteRepository(this.connection).findGovernedNotePrior(command.commandId, command.idempotencyKey);
+      const prior = new GovernedNoteRepository(this.connection).findGovernedNotePriorAny(command.commandId, command.idempotencyKey);
       if (!prior) throw new Error(); return prior.commandHash;
     } catch { throw new CommandWitnessInvalidError("COMMAND_WITNESS_INVALID"); }
   }
@@ -1736,7 +1736,7 @@ export class EventIntegrityService {
           });
         } finally {
           // Even a broken incoming chain cursor must not suppress companion authentication.
-          assertStoredGovernedNoteCorrespondence(this.connection, stored);
+          assertStoredGovernedNoteCorrespondenceAny(this.connection, stored);
         }
         assertStoredRetainedEvidenceCorrespondence(this.connection, stored);
       } catch (error) {

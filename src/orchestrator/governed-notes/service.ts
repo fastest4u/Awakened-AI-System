@@ -1,16 +1,17 @@
+import { governedNoteBodyHash } from "./body-content.js";
 import type { AppendCommand, AppendResult, JsonValue } from "../contracts/event.js";
 import type { ProjectContext } from "../identity/contracts.js";
 import type { SqliteConnection } from "../storage/sqlite-driver.js";
 import { EventStoreError, governedNotePlannedIds, isPrimarySqliteBusy, type EventAppendTransaction, type PreparedEventAppend } from "../storage/event-append-transaction.js";
 import type { EvidenceKeyProvider } from "../privacy/evidence-key-provider.js";
-import { redactGovernedNoteSummaryV1, type TrustedRedactionPolicyV1 } from "../privacy/redaction.js";
+import { redactGovernedNoteSummaryV1, redactGovernedNoteContentV2, type TrustedRedactionPolicyV1 } from "../privacy/redaction.js";
 import type { GovernedNoteAuthorityVerifier, VerifiedGovernedNoteRecoveryAuthority } from "./authority.js";
-import type { GovernedNotePriorV1, GovernedNoteRepository } from "./repository.js";
+import type { GovernedNotePrior, GovernedNoteRepository } from "./repository.js";
 import { GovernedNoteProvenanceKeyUnavailable, type GovernedNoteProvenanceRepository } from "./provenance.repository.js";
-import type { GovernedNoteClockV1, GovernedNoteStoredReceiptV1, PreparedGovernedNoteCreateV1, PreparedGovernedNoteRecoveryV1, GovernedNoteRecoveryResultV1 } from "./contracts.js";
+import type { GovernedNoteClockV1, GovernedNoteStoredReceiptV1, PreparedGovernedNoteCreateV1, PreparedGovernedNoteRecoveryV1, GovernedNoteRecoveryResultV1, GovernedNoteStoredReceiptV2, PreparedGovernedNoteCreateV2, PreparedGovernedNoteRecoveryV2, GovernedNoteRecoveryResultV2 } from "./contracts.js";
 import { GOVERNED_NOTE_ERROR_CODES, GovernedNoteError, isRecoveryIdErrorCode, type GovernedNoteErrorCode } from "./errors.js";
-import { decodePreparedGovernedNoteCreateV1, encodePreparedGovernedNoteCreateV1, decodeGovernedNoteCreatedPayloadV1, decodePreparedGovernedNoteRecoveryV1, encodePreparedGovernedNoteRecoveryV1, decodeGovernedNoteRecoveryResultV1 } from "./codec.js";
-import { assertGovernedNoteOriginalEquality, buildGovernedNoteOriginalCommitment, governedNoteSummaryHash } from "./intent.js";
+import { decodePreparedGovernedNoteCreateV1, encodePreparedGovernedNoteCreateV1, decodeGovernedNoteCreatedPayloadV1, decodePreparedGovernedNoteRecoveryV1, encodePreparedGovernedNoteRecoveryV1, decodeGovernedNoteRecoveryResultV1, decodePreparedGovernedNoteCreateV2, encodePreparedGovernedNoteCreateV2, decodeGovernedNoteCreatedPayloadV2, decodePreparedGovernedNoteRecoveryV2, encodePreparedGovernedNoteRecoveryV2, decodeGovernedNoteRecoveryResultV2 } from "./codec.js";
+import { assertGovernedNoteOriginalEquality, buildGovernedNoteOriginalCommitment, governedNoteSummaryHash, assertGovernedNoteOriginalEqualityV2, buildGovernedNoteOriginalCommitmentV2 } from "./intent.js";
 import { canonicalJson } from "../serialization/canonical-json.js";
 import { assertFreshStartConnectionAllowed } from "../fresh-start/fresh-start-admission.js";
 
@@ -32,33 +33,42 @@ export function hasUncertainGovernedRecoveryCleanup(connection: SqliteConnection
 export class GovernedNoteService {
   constructor(private readonly options: GovernedNoteServiceOptions) {}
   recover(input: PreparedGovernedNoteRecoveryV1, context: ProjectContext): GovernedNoteRecoveryResultV1 {
-    const owned = decodePreparedGovernedNoteRecoveryV1(encodePreparedGovernedNoteRecoveryV1(input));
+    return this.recoverOwned(decodePreparedGovernedNoteRecoveryV1(encodePreparedGovernedNoteRecoveryV1(input)), context) as GovernedNoteRecoveryResultV1;
+  }
+  recoverV2(input: PreparedGovernedNoteRecoveryV2, context: ProjectContext): GovernedNoteRecoveryResultV2 {
+    return this.recoverOwned(decodePreparedGovernedNoteRecoveryV2(encodePreparedGovernedNoteRecoveryV2(input)), context) as GovernedNoteRecoveryResultV2;
+  }
+  private recoverOwned(owned: PreparedGovernedNoteRecoveryV1 | PreparedGovernedNoteRecoveryV2, context: ProjectContext): GovernedNoteRecoveryResultV1 | GovernedNoteRecoveryResultV2 {
     const { connection, authority, repository, faults } = this.options;
     if (hasUncertainGovernedRecoveryCleanup(connection)) throw new GovernedNoteError("GOVERNED_NOTE_UNAVAILABLE");
     let handle: VerifiedGovernedNoteRecoveryAuthority | undefined;
-    let candidate: GovernedNoteRecoveryResultV1 | undefined;
+    let candidate: GovernedNoteRecoveryResultV1 | GovernedNoteRecoveryResultV2 | undefined;
     let failure: GovernedNoteError | undefined;
     let transactionOpen = false, commitAttempted = false, rollbackFailed = false;
     const admit = () => assertFreshStartConnectionAllowed(connection, "command-recovery");
     const unavailable = () => new GovernedNoteError("GOVERNED_NOTE_UNAVAILABLE");
     try {
       admit();
-      handle = authority.verifyRecovery(owned, context);
+      handle = owned.request.version === 2 ? authority.verifyRecoveryV2(owned as PreparedGovernedNoteRecoveryV2, context) : authority.verifyRecovery(owned as PreparedGovernedNoteRecoveryV1, context);
       connection.exec("BEGIN DEFERRED"); transactionOpen = true;
       admit();
       authority.revalidateRecovery(handle);
-      const prior = repository.findGovernedNotePrior(owned.request.commandId, owned.request.idempotencyKey);
-      // Own and validate all nested data before the final clock observation. The
-      // final success envelope is detached only after current authority passes.
-      const result = decodeGovernedNoteRecoveryResultV1(prior
-        ? { resultVersion: 1, operation: "recover-governed-note-result", outcome: "committed", receipt: { ...prior.result.response, replay: true } }
-        : { resultVersion: 1, operation: "recover-governed-note-result", outcome: "not-found", commandId: owned.request.commandId, idempotencyKey: owned.request.idempotencyKey });
+      const prior = repository.findGovernedNotePriorAny(owned.request.commandId, owned.request.idempotencyKey);
+      // Own the entire body-free result before the final clock observation.
+      const envelopeVersion = owned.request.version === 2 || prior?.witness.witnessVersion === 2 ? 2 : 1;
+      const envelope = prior
+        ? { resultVersion: envelopeVersion, operation: "recover-governed-note-result", outcome: "committed", receipt: { ...prior.result.response, replay: true } }
+        : { resultVersion: envelopeVersion, operation: "recover-governed-note-result", outcome: "not-found", commandId: owned.request.commandId, idempotencyKey: owned.request.idempotencyKey };
+      const result = (envelopeVersion === 2 ? decodeGovernedNoteRecoveryResultV2 : decodeGovernedNoteRecoveryResultV1)(envelope);
       faults?.inject("recovery-before-final-verify");
       admit();
       const current = authority.revalidateRecovery(handle), binding = authority.bindingForRecovery(handle);
       if (prior && (canonicalJson(current) !== canonicalJson(prior.witness.authority)
         || canonicalJson(binding) !== canonicalJson(prior.witness.binding))) throw new GovernedNoteError("SESSION_OWNERSHIP_MISMATCH");
       authority.assertRecoveryUnexpired(handle);
+      // A V1 caller gets a format refusal only after stored truth and current
+      // authority have both authenticated. Recovery never reopens provenance.
+      if (owned.request.version === 1 && prior?.witness.witnessVersion === 2) throw new GovernedNoteError("GOVERNED_NOTE_FORMAT_UNSUPPORTED");
       candidate = Object.freeze({ ...result });
       faults?.inject("recovery-after-detach");
       faults?.inject("recovery-before-commit");
@@ -88,13 +98,18 @@ export class GovernedNoteService {
     return candidate;
   }
   create(input: PreparedGovernedNoteCreateV1, context: ProjectContext): AppendResult<GovernedNoteStoredReceiptV1> {
-    const owned = decodePreparedGovernedNoteCreateV1(encodePreparedGovernedNoteCreateV1(input));
+    return this.createOwned(decodePreparedGovernedNoteCreateV1(encodePreparedGovernedNoteCreateV1(input)), context) as AppendResult<GovernedNoteStoredReceiptV1>;
+  }
+  createV2(input: PreparedGovernedNoteCreateV2, context: ProjectContext): AppendResult<GovernedNoteStoredReceiptV2> {
+    return this.createOwned(decodePreparedGovernedNoteCreateV2(encodePreparedGovernedNoteCreateV2(input)), context) as AppendResult<GovernedNoteStoredReceiptV2>;
+  }
+  private createOwned(owned: PreparedGovernedNoteCreateV1 | PreparedGovernedNoteCreateV2, context: ProjectContext): AppendResult<GovernedNoteStoredReceiptV1 | GovernedNoteStoredReceiptV2> {
     const command = owned.command, ids = { commandId: command.commandId, idempotencyKey: command.idempotencyKey };
     const { connection, events, authority, repository, provenance, provider } = this.options;
     if (hasUncertainGovernedRecoveryCleanup(connection)) throw new GovernedNoteError("GOVERNED_NOTE_UNAVAILABLE");
     let transactionOpen = false, commitAttempted = false, commitSucceeded = false, beginBusy = false, rollbackFailed = false;
-    let prepared: PreparedEventAppend<GovernedNoteStoredReceiptV1> | undefined;
-    let result: AppendResult<GovernedNoteStoredReceiptV1> | undefined, failure: Error | undefined;
+    let prepared: PreparedEventAppend<GovernedNoteStoredReceiptV1 | GovernedNoteStoredReceiptV2> | undefined;
+    let result: AppendResult<GovernedNoteStoredReceiptV1 | GovernedNoteStoredReceiptV2> | undefined, failure: Error | undefined;
     const unknown = () => new GovernedNoteError("COMMAND_OUTCOME_UNKNOWN", ids);
     // Only this directly observed SQL boundary can establish native busy origin.
     // An append/provider/fault exception with an errcode is not such evidence.
@@ -104,22 +119,24 @@ export class GovernedNoteService {
     };
     const rollback = () => {
       try { connection.exec("ROLLBACK"); transactionOpen = false; }
-      catch (error) { rollbackFailed = true; throw error; }
+      catch (error) { rollbackFailed = true; uncertainRecoveryConnections.add(connection); throw error; }
     };
     const hit = (point: GovernedNoteFaultPointV1) => this.options.faults?.inject(point);
     try {
-      const handle = authority.verifyCreate(owned, context);
+      const handle = command.version === 2 ? authority.verifyCreateV2(owned as PreparedGovernedNoteCreateV2, context) : authority.verifyCreate(owned as PreparedGovernedNoteCreateV1, context);
       events.assertAppendAllowed();
-      const replay = (prior: GovernedNotePriorV1) => {
+      const replay = (prior: GovernedNotePrior) => {
         const current = authority.revalidateCreate(handle), binding = authority.bindingForCreate(handle);
-        assertGovernedNoteOriginalEquality(command, current, binding, prior.witness, provider);
-        return events.result({ events: prior.events, storedResponse: prior.result, responseHash: prior.responseHash }, true);
+        if (command.version === 2 && prior.witness.witnessVersion === 2) assertGovernedNoteOriginalEqualityV2(command, current, binding, prior.witness, provider);
+        else if (command.version === 1 && prior.witness.witnessVersion === 1) assertGovernedNoteOriginalEquality(command, current, binding, prior.witness, provider);
+        else throw new GovernedNoteError("IDEMPOTENCY_CONFLICT");
+        return events.result<GovernedNoteStoredReceiptV1 | GovernedNoteStoredReceiptV2>({ events: prior.events, storedResponse: prior.result, responseHash: prior.responseHash }, true);
       };
-      const prior = repository.findGovernedNotePrior(command.commandId, command.idempotencyKey);
+      const prior = repository.findGovernedNotePriorAny(command.commandId, command.idempotencyKey);
       if (prior) {
         replay(prior);
         hit("before-begin"); begin(); events.assertAppendAllowed();
-        const currentPrior = repository.findGovernedNotePrior(command.commandId, command.idempotencyKey);
+        const currentPrior = repository.findGovernedNotePriorAny(command.commandId, command.idempotencyKey);
         if (!currentPrior) throw new GovernedNoteError("INTEGRITY_FAILURE");
         result = replay(currentPrior);
         rollback();
@@ -128,45 +145,51 @@ export class GovernedNoteService {
         const descriptors = provenance.validate(connection, command.provenance, admitted, binding, provider);
         let policy: TrustedRedactionPolicyV1;
         try { policy = this.options.policy(); } catch { throw new GovernedNoteError("GOVERNED_NOTE_POLICY_UNAVAILABLE"); }
-        const redacted = redactGovernedNoteSummaryV1(command.summary, policy);
+        const redacted = command.version === 2 ? redactGovernedNoteContentV2(command.summary, command.content.body, policy) : redactGovernedNoteSummaryV1(command.summary, policy);
         let keyRef;
         try { keyRef = provider.currentKey({ projectId: admitted.projectId, storeId: admitted.storeId }, "original-input-commitment"); }
         catch { throw new GovernedNoteError("GOVERNED_NOTE_KEY_UNAVAILABLE", ids); }
-        const originalInputCommitment = buildGovernedNoteOriginalCommitment(command, admitted, binding, keyRef, provider);
+        const originalInputCommitment = command.version === 2 ? buildGovernedNoteOriginalCommitmentV2(command, admitted, binding, keyRef, provider) : buildGovernedNoteOriginalCommitment(command, admitted, binding, keyRef, provider);
         // The owning transaction allocates all three IDs once. Never-prepared plans
         // have no discard API; scoped references are released on exit instead.
-        const plan = events.planGovernedNoteIdentity(handle, command), plannedIds = governedNotePlannedIds(plan);
+        const plan = command.version === 2 ? events.planGovernedNoteIdentityV2(handle, command) : events.planGovernedNoteIdentity(handle, command);
+        const plannedIds = governedNotePlannedIds(plan);
         const recordedAt = this.options.clock.now();
-        const payload = decodeGovernedNoteCreatedPayloadV1({ formatVersion: 1, witness: {
-          witnessVersion: 1, commandType: "create-governed-note", ...ids, ...plannedIds,
+        const bodyContent = "body" in redacted ? { format: "markdown" as const, body: redacted.body as string } : null;
+        const bodyHash = bodyContent ? governedNoteBodyHash(bodyContent) : null;
+        const payload = (command.version === 2 ? decodeGovernedNoteCreatedPayloadV2 : decodeGovernedNoteCreatedPayloadV1)({ formatVersion: command.version, witness: {
+          witnessVersion: command.version, commandType: "create-governed-note", ...ids, ...plannedIds,
           recordKind: command.recordKind, confidence: command.confidence, authority: admitted, binding, provenance: descriptors,
           policyId: redacted.policyId, policyVersion: redacted.policyVersion, originalCommitmentKeyRef: keyRef,
           originalInputCommitment, summaryContentHash: governedNoteSummaryHash(redacted.summary), recordedAt,
+          ...(command.version === 2 ? { contentFormat: "markdown", bodyContentHash: bodyHash } : {}),
         } });
         const witness = payload.witness;
-        const source = { sourceVersion: 2, binding: { ...binding }, item: {
+        const source = { sourceVersion: command.version === 2 ? 3 : 2, binding: { ...binding }, item: {
           itemId: plannedIds.recordId, normalizedKey: `governed-note/${command.recordKind}/${plannedIds.recordId}`,
-          status: "candidate", confidence: command.confidence, verificationMethod: "governed-note-unverified-v1",
+          status: "candidate", confidence: command.confidence, verificationMethod: command.version === 2 ? "governed-note-unverified-v2" : "governed-note-unverified-v1",
           validFrom: recordedAt, validTo: null, summary: redacted.summary, contentHash: witness.summaryContentHash,
           conflictGroupId: null, supersedingItemId: null, anchor: null,
+          ...(bodyContent ? { recordKind: command.recordKind, content: { ...bodyContent, contentHash: bodyHash! } } : {}),
         }, followUps: [], artifacts: [], entities: [], aliases: [], edges: [] };
         const headers = { occurredAt: recordedAt, visibilityScope: "session" as const, sessionId: admitted.targetSessionId,
           ...(admitted.parentSessionId === null ? {} : { parentSessionId: admitted.parentSessionId }),
           confidence: command.confidence, verificationStatus: "unverified" as const,
           sourceRefs: [...new Set(descriptors.map(p => p.sourceEventId))].sort(), evidenceRefs: [], evidenceDigests: [] };
-        const append: AppendCommand<GovernedNoteStoredReceiptV1> = {
+        const append: AppendCommand<GovernedNoteStoredReceiptV1 | GovernedNoteStoredReceiptV2> = {
           context, ...ids, commandType: "create-governed-note", correlationId: command.commandId, agentId: "governed-note",
           streamId: `governed-note/${admitted.targetSessionId}/${plannedIds.recordId}`, streamType: "governed-note", expectedStreamVersion: 0n,
-          events: [{ ...headers, eventType: "GovernedNoteCreated", eventSchemaVersion: 1, payload: payload as unknown as JsonValue },
-            { ...headers, eventType: "MemorySourceRecorded", eventSchemaVersion: 3, payload: source }], outbox: [],
-          publicResponse: { resultVersion: 1, operation: "create-governed-note", ...ids, recordId: plannedIds.recordId,
+          events: [{ ...headers, eventType: "GovernedNoteCreated", eventSchemaVersion: command.version === 2 ? 2 : 1, payload: payload as unknown as JsonValue },
+            { ...headers, eventType: "MemorySourceRecorded", eventSchemaVersion: command.version === 2 ? 4 : 3, payload: source }], outbox: [],
+          publicResponse: { resultVersion: command.version, operation: "create-governed-note", ...ids, recordId: plannedIds.recordId,
             recordKind: command.recordKind, status: "candidate", verificationStatus: "unverified", scope: { ...binding },
-            sourceEventIds: [plannedIds.noteEventId, plannedIds.sourceEventId], terminalPosition: "1" },
+            sourceEventIds: [plannedIds.noteEventId, plannedIds.sourceEventId], terminalPosition: "1",
+            ...(command.version === 2 ? { content: { format: "markdown" as const, contentHash: bodyHash! } } : {}) } as GovernedNoteStoredReceiptV1 | GovernedNoteStoredReceiptV2,
         };
-        prepared = events.prepareGovernedNote(plan, append, payload);
+        prepared = payload.formatVersion === 2 ? events.prepareGovernedNoteV2(plan, append as AppendCommand<GovernedNoteStoredReceiptV2>, payload) : events.prepareGovernedNote(plan, append as AppendCommand<GovernedNoteStoredReceiptV1>, payload);
         hit("before-begin"); begin(); events.assertAppendAllowed();
         const current = authority.revalidateCreate(handle), currentBinding = authority.bindingForCreate(handle);
-        const winner = repository.findGovernedNotePrior(command.commandId, command.idempotencyKey);
+        const winner = repository.findGovernedNotePriorAny(command.commandId, command.idempotencyKey);
         if (winner) {
           result = replay(winner);
           rollback();

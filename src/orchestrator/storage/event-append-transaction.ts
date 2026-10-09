@@ -1,9 +1,9 @@
+import { types } from "node:util";
 import { randomUUID } from "node:crypto";
-import { requireGovernedNoteCreateAuthority, deriveGovernedNoteBinding, type VerifiedGovernedNoteCreateAuthority } from "../governed-notes/authority.js";
-import type { GovernedNoteCommandV1, GovernedNoteCreatedPayloadV1, GovernedNoteStoredReceiptV1, GovernedNoteStoredResultV1 } from "../governed-notes/contracts.js";
-import { decodeGovernedNoteCommandV1, decodeGovernedNoteCreatedPayloadV1, decodeGovernedNoteStoredReceiptV1, isGovernedNoteSourcePayload } from "../governed-notes/codec.js";
-import { governedNoteCommandHash } from "../governed-notes/intent.js";
-import { isGovernedNoteEvent, serialGovernedNoteEvent, validateGovernedNotePair } from "../governed-notes/pair-validation.js";
+import { requireGovernedNoteCreateAuthority, requireGovernedNoteCreateAuthorityV2, deriveGovernedNoteBinding, type VerifiedGovernedNoteCreateAuthority } from "../governed-notes/authority.js";
+import type { GovernedNoteCommandV1, GovernedNoteCreatedPayloadV1, GovernedNoteStoredReceiptV1, GovernedNoteStoredResultV1, GovernedNoteCommandV2, GovernedNoteCreatedPayloadV2, GovernedNoteStoredReceiptV2, GovernedNoteStoredResultV2 } from "../governed-notes/contracts.js";
+import { decodeGovernedNoteCommandV1, decodeGovernedNoteCreatedPayloadV1, decodeGovernedNoteStoredReceiptV1, decodeGovernedNoteCommandV2, decodeGovernedNoteCreatedPayloadV2, decodeGovernedNoteStoredReceiptV2, decodeGovernedNoteSourcePayloadV2 } from "../governed-notes/codec.js";
+import { isGovernedNoteEvent, serialGovernedNoteEvent, validateGovernedNotePairAny, governedNoteWitnessHash, isReservedGovernedNoteSource } from "../governed-notes/pair-validation.js";
 import { GENESIS_GLOBAL_HASH } from "./event-chain-constants.js";
 import { assertFreshStartConnectionAllowed } from "../fresh-start/fresh-start-admission.js";
 import { FreshStartError } from "../fresh-start/contracts.js";
@@ -258,19 +258,20 @@ function isPlainArray(value: unknown): value is unknown[] {
   return Array.isArray(value) && Object.getPrototypeOf(value) === Array.prototype;
 }
 
-function immutableSnapshot<T>(value: T): T {
-  if (Array.isArray(value)) {
-    return Object.freeze(value.map((item) => immutableSnapshot(item))) as T;
-  }
+function immutableSnapshot<T>(value: T, ancestors = new Set<object>()): T {
   if (typeof value !== "object" || value === null) return value;
-  if (!isPlainRecord(value)) throw new EventStoreError("COMMAND_INVALID");
-  const snapshot: Record<string, unknown> = Object.getPrototypeOf(value) === null
-    ? Object.create(null) as Record<string, unknown>
-    : {};
-  for (const key of Object.keys(value)) {
-    snapshot[key] = immutableSnapshot(value[key]);
-  }
-  return Object.freeze(snapshot) as T;
+  if (types.isProxy(value) || ancestors.has(value) || !(isPlainArray(value) || isPlainRecord(value))) throw new EventStoreError("COMMAND_INVALID");
+  ancestors.add(value);
+  try {
+    const snapshot: Record<string, unknown> | unknown[] = Array.isArray(value) ? [] : Object.create(Object.getPrototypeOf(value)) as Record<string, unknown>;
+    for (const key of Reflect.ownKeys(value)) {
+      if (Array.isArray(value) && key === "length") continue;
+      const descriptor = Object.getOwnPropertyDescriptor(value, key)!;
+      if (typeof key !== "string" || !("value" in descriptor) || !descriptor.enumerable) throw new EventStoreError("COMMAND_INVALID");
+      Object.defineProperty(snapshot, key, { value: immutableSnapshot(descriptor.value, ancestors), enumerable: true, configurable: true, writable: true });
+    }
+    return Object.freeze(snapshot) as T;
+  } finally { ancestors.delete(value); }
 }
 
 function nonEmptyString(value: unknown): value is string {
@@ -1479,7 +1480,7 @@ const retainedPrepared = new WeakMap<object, { readonly transaction: EventAppend
 const retainedPlanned = new WeakMap<object, EventAppendTransaction>();
 declare const governedPlanBrand: unique symbol;
 export interface GovernedNoteEventPlan { readonly [governedPlanBrand]: true }
-type NotePlanState = { transaction: EventAppendTransaction; authority: VerifiedGovernedNoteCreateAuthority; command: GovernedNoteCommandV1; ids: Readonly<{ recordId: string; noteEventId: string; sourceEventId: string }>; prepared: boolean };
+type NotePlanState = { transaction: EventAppendTransaction; authority: VerifiedGovernedNoteCreateAuthority; command: GovernedNoteCommandV1 | GovernedNoteCommandV2; ids: Readonly<{ recordId: string; noteEventId: string; sourceEventId: string }>; prepared: boolean };
 const governedPlans = new WeakMap<object, NotePlanState>();
 const governedPrepared = new WeakMap<object, { transaction: EventAppendTransaction; plan: GovernedNoteEventPlan }>();
 const governedPlanned = new WeakMap<object, EventAppendTransaction>();
@@ -1488,10 +1489,36 @@ export function governedNotePlannedIds(plan: GovernedNoteEventPlan): Readonly<{ 
   const state = governedPlans.get(plan); if (!state) throw new EventStoreError("COMMAND_INVALID"); return state.ids;
 }
 function reservedNoteCommand(command: AppendCommand<JsonValue>): boolean {
-  return command.commandType === "create-governed-note" || command.streamType === "governed-note" || typeof command.streamId === "string" && command.streamId.startsWith("governed-note/") || Array.isArray(command.events) && command.events.some(e => e.eventType === "GovernedNoteCreated" || e.eventType === "MemorySourceRecorded" && isGovernedNoteSourcePayload(e.payload));
+  return command.commandType === "create-governed-note" || command.streamType === "governed-note" || typeof command.streamId === "string" && command.streamId.startsWith("governed-note/") || Array.isArray(command.events) && command.events.some(e => e.eventType === "GovernedNoteCreated" || e.eventType === "MemorySourceRecorded" && (e.eventSchemaVersion >= 4 || isReservedGovernedNoteSource(e.payload)));
 }
-function noteBudget(events: readonly StoredEvent[], result: GovernedNoteStoredResultV1): void {
-  validateGovernedNotePair(events, result);
+type NoteReceipt = GovernedNoteStoredReceiptV1 | GovernedNoteStoredReceiptV2;
+type NoteResult = GovernedNoteStoredResultV1 | GovernedNoteStoredResultV2;
+function noteReceipt(value: unknown, version: 1 | 2): NoteReceipt {
+  return (version === 2 ? decodeGovernedNoteStoredReceiptV2 : decodeGovernedNoteStoredReceiptV1)(value);
+}
+function noteBudget(events: readonly StoredEvent[], result: NoteResult): void {
+  const witness = validateGovernedNotePairAny(events, result);
+  if (witness.witnessVersion === 2) {
+    const source = decodeGovernedNoteSourcePayloadV2(JSON.parse(events[1]!.payloadJson)), i = source.item, b = source.binding;
+    const encodedBody = Buffer.byteLength(canonicalJson(i.content.body), "utf8");
+    // Prospective content mapping, not an issued read receipt/publication claim.
+    // New notes have no conflict or lifecycle replacement. Use maximum position
+    // widths. The separate 8KiB control reserve covers three 128-byte correlation IDs (<=2304 JSON bytes),
+    // enums/keys,
+    // closure, fence, hashes, bounded decimals and numeric generation; scope is
+    // measured independently. The eventual read lane still packs its real reply.
+    const position = "9223372036854775807";
+    const content = { operation: "get-full-note", noteBoundsVersion: "v2-full-note-bounds-1",
+      selectionScope: { projectId: b.projectId, workspaceId: b.workspaceId, branchScopeId: b.branchScopeId, branchRef: b.branchRef, sessionId: b.sessionId, visibility: "session" },
+      item: { id: i.itemId, kind: "canonical", projectId: b.projectId, workspaceId: b.workspaceId, branchScopeId: b.branchScopeId, branchRef: b.branchRef, sessionId: b.sessionId,
+        visibility: "session", status: i.status, confidence: i.confidence, verificationMethod: i.verificationMethod, validFrom: i.validFrom, validTo: null,
+        knownFromEventPosition: position, sourceEventPosition: position, textKind: "canonical-summary", text: i.summary, conflictGroupId: null, supersedingItemId: null,
+        recordKind: i.recordKind, bodyAvailability: "present", content: { ...i.content, body: "" } }, conflict: null };
+    const metadata = Buffer.byteLength(canonicalJson(content), "utf8") + Buffer.byteLength(canonicalJson(b), "utf8") + 8192;
+    if (encodedBody > 131074 || metadata > 65536 || metadata + encodedBody - 2 > 262144) throw new EventStoreError("COMMAND_TOO_LARGE");
+    // Complete body-free correlation reserve is independent of the event pair.
+    if (Buffer.byteLength(canonicalJson({ resultVersion: 2, operation: "recover-governed-note-result", outcome: "committed", receipt: { ...result.response, replay: true } }), "utf8") + 1024 > 16384) throw new EventStoreError("COMMAND_TOO_LARGE");
+  }
   if (Buffer.byteLength(canonicalJson({ events: events.map(serialGovernedNoteEvent), result }), "utf8") > MAX_CANONICAL_COMMAND_BYTES) throw new EventStoreError("COMMAND_TOO_LARGE");
 }
 
@@ -1528,20 +1555,33 @@ export class EventAppendTransaction {
   ) {}
 
   planGovernedNoteIdentity(authority: VerifiedGovernedNoteCreateAuthority, input: GovernedNoteCommandV1): GovernedNoteEventPlan {
-    const command = decodeGovernedNoteCommandV1(input);
-    requireGovernedNoteCreateAuthority(this.connection, authority, command);
+    return this.planNote(authority, decodeGovernedNoteCommandV1(input));
+  }
+  planGovernedNoteIdentityV2(authority: VerifiedGovernedNoteCreateAuthority, input: GovernedNoteCommandV2): GovernedNoteEventPlan {
+    return this.planNote(authority, decodeGovernedNoteCommandV2(input));
+  }
+  private planNote(authority: VerifiedGovernedNoteCreateAuthority, command: GovernedNoteCommandV1 | GovernedNoteCommandV2): GovernedNoteEventPlan {
+    if (command.version === 2) requireGovernedNoteCreateAuthorityV2(this.connection, authority, command);
+    else requireGovernedNoteCreateAuthority(this.connection, authority, command);
     const values = [this.randomId(), this.randomId(), this.randomId()];
     if (new Set(values).size !== 3 || values.some(id => !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(id))) throw new EventStoreError("EVENT_ID_INVALID");
     const plan = Object.freeze(Object.create(null)) as GovernedNoteEventPlan;
     governedPlans.set(plan, { transaction: this, authority, command, ids: Object.freeze({ recordId: values[0]!, noteEventId: values[1]!, sourceEventId: values[2]! }), prepared: false });
     return plan;
   }
-  prepareGovernedNote(plan: GovernedNoteEventPlan, input: AppendCommand<GovernedNoteStoredReceiptV1>, payloadInput: GovernedNoteCreatedPayloadV1): PreparedEventAppend<GovernedNoteStoredReceiptV1> {
+  prepareGovernedNote(plan: GovernedNoteEventPlan, input: AppendCommand<GovernedNoteStoredReceiptV1>, payload: GovernedNoteCreatedPayloadV1): PreparedEventAppend<GovernedNoteStoredReceiptV1> {
+    return this.prepareNote(plan, input, decodeGovernedNoteCreatedPayloadV1(payload)) as PreparedEventAppend<GovernedNoteStoredReceiptV1>;
+  }
+  prepareGovernedNoteV2(plan: GovernedNoteEventPlan, input: AppendCommand<GovernedNoteStoredReceiptV2>, payload: GovernedNoteCreatedPayloadV2): PreparedEventAppend<GovernedNoteStoredReceiptV2> {
+    return this.prepareNote(plan, input, decodeGovernedNoteCreatedPayloadV2(payload)) as PreparedEventAppend<GovernedNoteStoredReceiptV2>;
+  }
+  private prepareNote(plan: GovernedNoteEventPlan, input: AppendCommand<NoteReceipt>, payload: GovernedNoteCreatedPayloadV1 | GovernedNoteCreatedPayloadV2): PreparedEventAppend<NoteReceipt> {
     const state = governedPlans.get(plan);
     if (!state || state.transaction !== this || state.prepared) throw new EventStoreError("COMMAND_INVALID");
     const command = immutableSnapshot(input);
-    const payload = decodeGovernedNoteCreatedPayloadV1(payloadInput), w = payload.witness, b = command.context.binding;
-    const admitted = requireGovernedNoteCreateAuthority(this.connection, state.authority, state.command, w.binding);
+    const w = payload.witness, b = command.context.binding;
+    if (w.witnessVersion !== state.command.version) throw new EventStoreError("COMMAND_INVALID");
+    const admitted = state.command.version === 2 ? requireGovernedNoteCreateAuthorityV2(this.connection, state.authority, state.command, w.binding) : requireGovernedNoteCreateAuthority(this.connection, state.authority, state.command, w.binding);
     const appendBinding = deriveGovernedNoteBinding(this.connection, command.context, admitted.targetSessionId);
     const authorityMismatch = canonical(w.authority) !== canonical(admitted)
       || canonical(w.binding) !== canonical(appendBinding)
@@ -1562,12 +1602,12 @@ export class EventAppendTransaction {
     const ids = [state.ids.noteEventId, state.ids.sourceEventId];
     const validated = immutableSnapshot(validateAppendCommand(command, w.recordedAt, () => ids[index++]!, false, true));
     const preview = materializeEvents(command, validated, this.statements.readGlobalTail(), w.binding.branchScopeId ?? undefined);
-    const receipt = decodeGovernedNoteStoredReceiptV1(command.publicResponse);
-    noteBudget(preview, buildStoredCommandResponse({ ...receipt, terminalPosition: String(preview[1]!.globalPosition) }, preview));
-    const prepared = Object.freeze({ command, recordedAt: w.recordedAt, commandHash: governedNoteCommandHash(w), storedEventIds: Object.freeze(ids), [PREPARED]: validated }) as InternalPrepared<GovernedNoteStoredReceiptV1>;
+    const receipt = noteReceipt(command.publicResponse, state.command.version);
+    noteBudget(preview, buildStoredCommandResponse({ ...receipt, terminalPosition: String(preview[1]!.globalPosition) }, preview) as NoteResult);
+    const prepared = Object.freeze({ command, recordedAt: w.recordedAt, commandHash: governedNoteWitnessHash(w), storedEventIds: Object.freeze(ids), [PREPARED]: validated }) as InternalPrepared<NoteReceipt>;
     state.prepared = true; governedPrepared.set(prepared, { transaction: this, plan }); return prepared;
   }
-  discardGovernedNote(prepared: PreparedEventAppend<GovernedNoteStoredReceiptV1>): void {
+  discardGovernedNote(prepared: PreparedEventAppend<NoteReceipt>): void {
     const state = governedPrepared.get(prepared); if (!state || state.transaction !== this) return;
     governedPrepared.delete(prepared); governedPlans.delete(state.plan);
   }
@@ -1576,13 +1616,14 @@ export class EventAppendTransaction {
     if (!state) { if (reservedNoteCommand(prepared.command)) throw new EventStoreError("COMMAND_INVALID"); return undefined; }
     const plan = governedPlans.get(state.plan);
     if (state.transaction !== this || !plan || plan.transaction !== this) throw new EventStoreError("COMMAND_INVALID");
-    requireGovernedNoteCreateAuthority(this.connection, plan.authority, plan.command); return state;
+    if (plan.command.version === 2) requireGovernedNoteCreateAuthorityV2(this.connection, plan.authority, plan.command);
+    else requireGovernedNoteCreateAuthority(this.connection, plan.authority, plan.command); return state;
   }
   private refuseGovernedReplay(projectId: string, commandId: string, idempotencyKey: string): void {
     const params = { $p: projectId, $c: commandId, $i: idempotencyKey };
     if (this.connection.prepare("SELECT 1 FROM command_dedup WHERE project_id=$p AND (command_id=$c OR idempotency_key=$i) AND command_type='create-governed-note'").get(params)) throw new EventStoreError("IDEMPOTENCY_CONFLICT");
-    const rows = this.connection.prepare("SELECT stream_id,stream_type,event_type,payload_json FROM events WHERE project_id=$p AND (command_id=$c OR idempotency_key=$i)").all(params);
-    if (rows.some(r => isGovernedNoteEvent({ streamId: String(r.stream_id), streamType: String(r.stream_type), eventType: String(r.event_type), payloadJson: String(r.payload_json) }))) throw new EventStoreError("IDEMPOTENCY_CONFLICT");
+    const rows = this.connection.prepare("SELECT stream_id,stream_type,event_type,event_schema_version,payload_json FROM events WHERE project_id=$p AND (command_id=$c OR idempotency_key=$i)").all(params);
+    if (rows.some(r => isGovernedNoteEvent({ streamId: String(r.stream_id), streamType: String(r.stream_type), eventType: String(r.event_type), payloadJson: String(r.payload_json), eventSchemaVersion: Number(r.event_schema_version) }))) throw new EventStoreError("IDEMPOTENCY_CONFLICT");
   }
 
   planRetainedEvidenceIdentity(authority: VerifiedRetainedEvidenceAuthority, command: RetainEvidenceBatchCommandV1): RetainedEvidenceEventPlan {
@@ -1842,10 +1883,10 @@ export class EventAppendTransaction {
         nextHead: { targetSessionId: payload.witness.targetSessionId, conversationId: payload.witness.conversationId,
           lastFrameId: last.frameId, lastOrdinal: last.ordinal, version: String(event.streamVersion) } });
     }
-    const publicResponse = governed ? { ...decodeGovernedNoteStoredReceiptV1(command.publicResponse), terminalPosition: String(events[1]!.globalPosition) } : retained ? { ...decodeRetainedEvidenceReceipt(command.publicResponse), eventPosition: String(events[0]!.globalPosition), finalStreamVersion: String(events[0]!.streamVersion) } : command.publicResponse;
+    const publicResponse = governed ? { ...noteReceipt(command.publicResponse, governedPlans.get(governed.plan)!.command.version), terminalPosition: String(events[1]!.globalPosition) } : retained ? { ...decodeRetainedEvidenceReceipt(command.publicResponse), eventPosition: String(events[0]!.globalPosition), finalStreamVersion: String(events[0]!.streamVersion) } : command.publicResponse;
     const storedResponse = buildStoredCommandResponse(publicResponse, events) as StoredCommandResponse<T>;
     if (retained) decodeRetainedEvidenceStoredResult(storedResponse);
-    if (governed) noteBudget(events, storedResponse as unknown as GovernedNoteStoredResultV1);
+    if (governed) noteBudget(events, storedResponse as unknown as NoteResult);
     const planned = Object.freeze({
       plannedOnly: true as const,
       events: Object.freeze(events),
@@ -1866,8 +1907,8 @@ export class EventAppendTransaction {
     const governed = this.noteState(prepared);
     if (governed) {
       if (governedPlanned.get(planned) !== this) throw new EventStoreError("COMMAND_INVALID");
-      noteBudget(planned.events, planned.storedResponse as unknown as GovernedNoteStoredResultV1);
-      if (planned.responseHash !== responseHash(planned.storedResponse) || prepared.commandHash !== governedNoteCommandHash(validateGovernedNotePair(planned.events, planned.storedResponse as unknown as GovernedNoteStoredResultV1))) throw new EventStoreError("COMMAND_INVALID");
+      noteBudget(planned.events, planned.storedResponse as unknown as NoteResult);
+      if (planned.responseHash !== responseHash(planned.storedResponse) || prepared.commandHash !== governedNoteWitnessHash(validateGovernedNotePairAny(planned.events, planned.storedResponse as unknown as NoteResult))) throw new EventStoreError("COMMAND_INVALID");
       const tail = this.statements.readGlobalTail();
       if (planned.events[0]!.globalPosition !== tail.globalPosition + 1n || planned.events[0]!.previousGlobalHash !== tail.eventHash) throw new EventStoreError("EVENT_CONFLICT");
     } else if (planned.events.some(isGovernedNoteEvent)) throw new EventStoreError("COMMAND_INVALID");
@@ -1947,8 +1988,8 @@ export class EventAppendTransaction {
     const governed = this.noteState(prepared);
     if (governed) {
       if (governedBatches.get(batch) !== prepared || authorization !== null) throw new EventStoreError("COMMAND_INVALID");
-      noteBudget(batch.events, batch.storedResponse as unknown as GovernedNoteStoredResultV1);
-      if (batch.responseHash !== responseHash(batch.storedResponse) || prepared.commandHash !== governedNoteCommandHash(validateGovernedNotePair(batch.events, batch.storedResponse as unknown as GovernedNoteStoredResultV1))) throw new EventStoreError("COMMAND_INVALID");
+      noteBudget(batch.events, batch.storedResponse as unknown as NoteResult);
+      if (batch.responseHash !== responseHash(batch.storedResponse) || prepared.commandHash !== governedNoteWitnessHash(validateGovernedNotePairAny(batch.events, batch.storedResponse as unknown as NoteResult))) throw new EventStoreError("COMMAND_INVALID");
     } else {
       if (batch.events.some(isGovernedNoteEvent)) throw new EventStoreError("COMMAND_INVALID");
       this.refuseGovernedReplay(prepared.command.context.binding.projectId, prepared.command.commandId, prepared.command.idempotencyKey);
