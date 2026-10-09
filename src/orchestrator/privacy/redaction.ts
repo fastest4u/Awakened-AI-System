@@ -1,6 +1,7 @@
 import type { JsonValue } from "../contracts/event.js";
 import { GOVERNED_NOTE_LIMITS } from "../governed-notes/contracts.js";
 import { GovernedNoteError } from "../governed-notes/errors.js";
+import { assertMarkdownNoteBodyV1 } from "../governed-notes/body-content.js";
 import { canonicalJson } from "../serialization/canonical-json.js";
 import { assertRetainedByteLimit, boundedRetainedJson, retainedDataEntries, retainedExactRecord, retainedStringMetrics, RETAINED_EVIDENCE_LIMITS, RetainedEvidenceError, type BoundedEvidenceInputV1, type RetainedEvidenceFrameV1 } from "./evidence-contracts.js";
 
@@ -29,6 +30,27 @@ export function redactGovernedNoteSummaryV1(summary: string, policy: TrustedReda
   return Object.freeze({ summary: transformed, policyId: trusted.policyId, policyVersion: trusted.policyVersion });
 }
 const POLICY = "RETAINED_EVIDENCE_POLICY_UNAVAILABLE";
+/** One owned policy and one transient span budget; the body stays literal. */
+export function redactGovernedNoteContentV2(summary: string, body: string, policy: TrustedRedactionPolicyV1): Readonly<{ summary: string; body: string; policyId: string; policyVersion: string; spanCount: number }> {
+  const checkSummary = (value: string): void => {
+    try { retainedStringMetrics(value, GOVERNED_NOTE_LIMITS.summaryBytes); }
+    catch (error) { throw new GovernedNoteError(error instanceof RetainedEvidenceError && error.code === "RETAINED_EVIDENCE_LIMIT_EXCEEDED" ? "GOVERNED_NOTE_LIMIT_EXCEEDED" : "GOVERNED_NOTE_INPUT_INVALID"); }
+    if (value.length === 0) throw new GovernedNoteError("GOVERNED_NOTE_INPUT_INVALID");
+  };
+  checkSummary(summary); const normalized = summary.normalize("NFC").trim(); checkSummary(normalized);
+  assertMarkdownNoteBodyV1(body);
+  const manifest: RedactionSpanV1[] = [];
+  try {
+    let trusted: TrustedRedactionPolicyV1, redactedSummary: string, redactedBody: string;
+    try {
+      trusted = trustedPolicy(policy);
+      redactedSummary = transformString(normalized, false, 0, trusted.rules, manifest, GOVERNED_NOTE_LIMITS.spans);
+      redactedBody = transformString(body, false, 0, trusted.rules, manifest, GOVERNED_NOTE_LIMITS.spans);
+    } catch (error) { throw new GovernedNoteError(error instanceof RetainedEvidenceError && error.code === "RETAINED_EVIDENCE_LIMIT_EXCEEDED" ? "GOVERNED_NOTE_LIMIT_EXCEEDED" : "GOVERNED_NOTE_POLICY_UNAVAILABLE"); }
+    checkSummary(redactedSummary); assertMarkdownNoteBodyV1(redactedBody);
+    return Object.freeze({ summary: redactedSummary, body: redactedBody, policyId: trusted.policyId, policyVersion: trusted.policyVersion, spanCount: manifest.length });
+  } finally { manifest.length = 0; }
+}
 const PLACEHOLDER = "[REDACTED]";
 const CREDENTIAL_RULE = "builtin:credential-field";
 const AUTHORIZATION_RULE = "builtin:authorization-header";

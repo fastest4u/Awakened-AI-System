@@ -4,9 +4,9 @@ import { FRESH_NOW } from "./fresh-start-fixture.js";
 import { CapabilityService } from "../../src/orchestrator/lifecycle/capability.service.js";
 import { createCapabilityProof } from "../../src/orchestrator/lifecycle/authority/capability-codec.js";
 import { SessionAuthorityRepository } from "../../src/orchestrator/storage/session-authority.repository.js";
-import { GovernedNoteAuthorityVerifier, deriveGovernedNoteBinding, governedNoteCreateProofTarget, governedNoteRecoveryProofTarget, type GovernedNoteCreateProofScopeV1 } from "../../src/orchestrator/governed-notes/authority.js";
-import { decodeGovernedNoteCommandV1, decodeGovernedNoteRecoveryV1 } from "../../src/orchestrator/governed-notes/codec.js";
-import type { GovernedNoteCommandV1, GovernedNoteRecoveryIdsV1, PreparedGovernedNoteCreateV1, PreparedGovernedNoteRecoveryV1, GovernedNoteProvenanceDescriptorV1 } from "../../src/orchestrator/governed-notes/contracts.js";
+import { GovernedNoteAuthorityVerifier, deriveGovernedNoteBinding, governedNoteCreateProofTarget, governedNoteRecoveryProofTarget, governedNoteCreateProofTargetV2, governedNoteRecoveryProofTargetV2, type GovernedNoteCreateProofScopeV1 } from "../../src/orchestrator/governed-notes/authority.js";
+import { decodeGovernedNoteCommandV1, decodeGovernedNoteRecoveryV1, decodeGovernedNoteCommandV2, decodeGovernedNoteRecoveryV2 } from "../../src/orchestrator/governed-notes/codec.js";
+import type { GovernedNoteCommandV1, GovernedNoteRecoveryIdsV1, PreparedGovernedNoteCreateV1, PreparedGovernedNoteRecoveryV1, GovernedNoteProvenanceDescriptorV1, GovernedNoteCommandV2, PreparedGovernedNoteCreateV2, PreparedGovernedNoteRecoveryV2 } from "../../src/orchestrator/governed-notes/contracts.js";
 import type { ProjectContext } from "../../src/orchestrator/identity/contracts.js";
 import { EventAppendTransaction, SqliteEventAppendStatements, governedNotePlannedIds } from "../../src/orchestrator/storage/event-append-transaction.js";
 import { MaintenanceFence } from "../../src/orchestrator/storage/maintenance-fence.js";
@@ -97,6 +97,18 @@ export async function makeGovernedNoteDomainFixture(options: Pick<Partial<Govern
       prepareRecovery(ids: GovernedNoteRecoveryIdsV1, expiresAt: string, context: ProjectContext = rootContext): PreparedGovernedNoteRecoveryV1 {
         const request = decodeGovernedNoteRecoveryV1({ version: 1, operation: "recover-governed-note-result", operationId: randomUUID(), requestId: randomUUID(), commandId: ids.commandId, idempotencyKey: ids.idempotencyKey, expiresAt });
         const s = scope(context), proof = mint(context, governedNoteRecoveryProofTarget(request, context, deriveGovernedNoteBinding(connection, context, s.targetSessionId), s.capabilityGeneration, randomUUID()));
+        return { request, authorization: { kind: "bounded-operation", authoritySessionId: s.authoritySessionId as never, targetSessionId: s.targetSessionId as never, proof, audience: { presentingActorRole: s.presentingActorRole, targetActorRole: s.targetActorRole, presentingClientInstanceId: s.presentingClientInstanceId, targetClientInstanceId: s.targetClientInstanceId } } };
+      },
+      commandV2(overrides: Partial<GovernedNoteCommandV2> = {}): GovernedNoteCommandV2 {
+        return decodeGovernedNoteCommandV2({ version: 2, operation: "create-governed-note", commandId: randomUUID(), idempotencyKey: randomUUID(), recordKind: "insight", summary: " Raw e\u0301 summary ", confidence: "low", content: { format: "markdown", body: "# Literal note\r\n\tRaw e\u0301 body  \n" }, provenance: sources.root.map(({ kind, identity }) => ({ kind, identity })), ...overrides });
+      },
+      prepareCreateV2(command: GovernedNoteCommandV2, context: ProjectContext = rootContext): PreparedGovernedNoteCreateV2 {
+        const owned = decodeGovernedNoteCommandV2(command), s = scope(context), proof = mint(context, governedNoteCreateProofTargetV2(owned, s, deriveGovernedNoteBinding(connection, context, s.targetSessionId), randomUUID()));
+        return { command: owned, authorization: { kind: "protected", authoritySessionId: s.authoritySessionId as never, targetSessionId: s.targetSessionId as never, proof, approval: null, childBindingGrant: null } };
+      },
+      prepareRecoveryV2(ids: GovernedNoteRecoveryIdsV1, expiresAt: string, context: ProjectContext = rootContext): PreparedGovernedNoteRecoveryV2 {
+        const request = decodeGovernedNoteRecoveryV2({ version: 2, operation: "recover-governed-note-result", operationId: randomUUID(), requestId: randomUUID(), commandId: ids.commandId, idempotencyKey: ids.idempotencyKey, expiresAt });
+        const s = scope(context), proof = mint(context, governedNoteRecoveryProofTargetV2(request, context, deriveGovernedNoteBinding(connection, context, s.targetSessionId), s.capabilityGeneration, randomUUID()));
         return { request, authorization: { kind: "bounded-operation", authoritySessionId: s.authoritySessionId as never, targetSessionId: s.targetSessionId as never, proof, audience: { presentingActorRole: s.presentingActorRole, targetActorRole: s.targetActorRole, presentingClientInstanceId: s.presentingClientInstanceId, targetClientInstanceId: s.targetClientInstanceId } } };
       },
       /** All durable row contents, including authority/control tables, for nonmutation assertions. */

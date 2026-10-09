@@ -12,8 +12,8 @@ import { commandHash } from "../crypto/event-hash.js";
 import { canonicalJson } from "../serialization/canonical-json.js";
 import { boundedRetainedJson, RetainedEvidenceError } from "../privacy/evidence-contracts.js";
 import { decodeRetainedEvidenceAuthority } from "../privacy/retained-evidence-codec.js";
-import type { GovernedNoteCommandV1, GovernedNoteRecoveryV1, GovernedNoteClockV1, GovernedNoteAuthoritySnapshotV1, PreparedGovernedNoteCreateV1, PreparedGovernedNoteRecoveryV1 } from "./contracts.js";
-import { decodeGovernedNoteCommandV1, decodeGovernedNoteRecoveryV1, encodePreparedGovernedNoteCreateV1, decodePreparedGovernedNoteCreateV1, encodePreparedGovernedNoteRecoveryV1, decodePreparedGovernedNoteRecoveryV1 } from "./codec.js";
+import type { GovernedNoteCommandV1, GovernedNoteRecoveryV1, GovernedNoteClockV1, GovernedNoteAuthoritySnapshotV1, PreparedGovernedNoteCreateV1, PreparedGovernedNoteRecoveryV1, GovernedNoteCommandV2, GovernedNoteRecoveryV2, PreparedGovernedNoteCreateV2, PreparedGovernedNoteRecoveryV2 } from "./contracts.js";
+import { decodeGovernedNoteCommandV1, decodeGovernedNoteRecoveryV1, encodePreparedGovernedNoteCreateV1, decodePreparedGovernedNoteCreateV1, encodePreparedGovernedNoteRecoveryV1, decodePreparedGovernedNoteRecoveryV1, decodeGovernedNoteCommandV2, decodeGovernedNoteRecoveryV2, encodePreparedGovernedNoteCreateV2, decodePreparedGovernedNoteCreateV2, encodePreparedGovernedNoteRecoveryV2, decodePreparedGovernedNoteRecoveryV2 } from "./codec.js";
 import { GovernedNoteError, type GovernedNoteErrorCode } from "./errors.js";
 
 declare const createBrand: unique symbol;
@@ -79,9 +79,34 @@ export function governedNoteRecoveryProofTarget(request: GovernedNoteRecoveryV1,
   });
 }
 
+export function governedNoteCreateProofTargetV2(command: GovernedNoteCommandV2, scope: GovernedNoteCreateProofScopeV1, binding: ProjectBinding, proofNonce: string): SemanticCommandProofTargetV1 {
+  return safe(() => {
+    const owned = decodeGovernedNoteCommandV2(command);
+    if (scope.authoritySessionId !== scope.targetSessionId || binding.sessionId !== scope.targetSessionId
+      || scope.presentingActorRole !== scope.targetActorRole || scope.presentingClientInstanceId !== scope.targetClientInstanceId
+      || (scope.capabilityKind !== "root-session-handle" && scope.capabilityKind !== "child-session-handle")) refuse("SESSION_OWNERSHIP_MISMATCH");
+    return decodeCapabilityProofTarget({ ...scope, proofVersion: 1, target: "semantic-command", commandId: owned.commandId, idempotencyKey: owned.idempotencyKey,
+      intentHash: commandHash({ proofPurpose: "create-governed-note/v2", scope, binding, originalCommand: canonicalJson(owned) }), proofNonce: noteNonce(proofNonce) }) as SemanticCommandProofTargetV1;
+  });
+}
+export function governedNoteRecoveryProofTargetV2(request: GovernedNoteRecoveryV2, context: ProjectContext, binding: ProjectBinding, capabilityGeneration: string, proofNonce: string): BoundedOperationProofTargetV1 {
+  return safe(() => {
+    const owned = decodeGovernedNoteRecoveryV2(request), b = context.binding;
+    if (binding.sessionId === null) refuse("SESSION_OWNERSHIP_MISMATCH");
+    const selectors = { projectId: b.projectId, vaultId: b.vaultId, storeId: b.storeId, workspaceId: b.workspaceId, clientNamespace: b.clientNamespace,
+      branchScopeId: binding.branchScopeId, branchRef: binding.branchRef, authoritySessionId: binding.sessionId, targetSessionId: binding.sessionId,
+      commandId: owned.commandId, idempotencyKey: owned.idempotencyKey, operationId: owned.operationId, requestId: owned.requestId,
+      presentingActorRole: b.actorRole, presentingClientInstanceId: b.clientInstanceId, targetActorRole: b.actorRole, targetClientInstanceId: b.clientInstanceId, expiresAt: owned.expiresAt };
+    return decodeCapabilityProofTarget({ proofVersion: 1, target: "bounded-operation", operationType: owned.operation, operationId: owned.operationId, requestId: owned.requestId,
+      operationHash: commandHash({ proofPurpose: "recover-governed-note-result/v2", ...selectors }), authoritySessionId: binding.sessionId, targetSessionId: binding.sessionId,
+      presentingActorRole: b.actorRole, presentingClientInstanceId: b.clientInstanceId, targetActorRole: b.actorRole, targetClientInstanceId: b.clientInstanceId,
+      capabilityGeneration, proofNonce: noteNonce(proofNonce), expiresAt: owned.expiresAt }) as BoundedOperationProofTargetV1;
+  });
+}
+
 type Admitted<P> = Readonly<{ connection: SqliteConnection; verifier: GovernedNoteAuthorityVerifier; prepared: P; context: ProjectContext; canonical: string; snapshot: GovernedNoteAuthoritySnapshotV1; binding: ProjectBinding; operation: string }>;
-const creates = new WeakMap<object, Admitted<PreparedGovernedNoteCreateV1>>();
-const recoveries = new WeakMap<object, Admitted<PreparedGovernedNoteRecoveryV1>>();
+const creates = new WeakMap<object, Admitted<PreparedGovernedNoteCreateV1 | PreparedGovernedNoteCreateV2>>();
+const recoveries = new WeakMap<object, Admitted<PreparedGovernedNoteRecoveryV1 | PreparedGovernedNoteRecoveryV2>>();
 function storedHandle(context: ProjectContext, row: SessionAuthorityRecord): StoredCapabilityMaterialV1 {
   const root = row.sessionKind === "root";
   const generation = root ? row.ownerGeneration : row.childCapabilityGeneration;
@@ -155,22 +180,23 @@ export class GovernedNoteAuthorityVerifier {
       targetCapabilityGeneration: target.childCapabilityGeneration?.toString() ?? null, capabilityKind: material.claims.kind });
     return { snapshot, material, scope };
   }
-  private inspectCreate(prepared: PreparedGovernedNoteCreateV1, context: ProjectContext) {
+  private inspectCreate(prepared: PreparedGovernedNoteCreateV1 | PreparedGovernedNoteCreateV2, context: ProjectContext) {
     const a = prepared.authorization;
     const { snapshot, material, scope } = this.inspectScope(context, a.authoritySessionId, a.targetSessionId);
     const binding = deriveGovernedNoteBinding(this.#connection, context, a.targetSessionId);
-    this.#capabilities.verifyProof(material, governedNoteCreateProofTarget(prepared.command, scope, binding, a.proof!.proofNonce), a.proof!);
+    const target = prepared.command.version === 2 ? governedNoteCreateProofTargetV2(prepared.command, scope, binding, a.proof!.proofNonce) : governedNoteCreateProofTarget(prepared.command, scope, binding, a.proof!.proofNonce);
+    this.#capabilities.verifyProof(material, target, a.proof!);
     return { snapshot, binding };
   }
-  private expiry(request: GovernedNoteRecoveryV1): void {
+  private expiry(request: GovernedNoteRecoveryV1 | GovernedNoteRecoveryV2): void {
     const expiresAt = BigInt(Date.parse(parseCanonicalTimestamp(request.expiresAt, "governed-note")));
     if (this.#clock.nowMs() >= expiresAt) refuse("SESSION_CAPABILITY_EXPIRED");
   }
-  private inspectRecovery(prepared: PreparedGovernedNoteRecoveryV1, context: ProjectContext) {
+  private inspectRecovery(prepared: PreparedGovernedNoteRecoveryV1 | PreparedGovernedNoteRecoveryV2, context: ProjectContext) {
     const a = prepared.authorization;
     const { snapshot, material } = this.inspectScope(context, a.authoritySessionId, a.targetSessionId);
     const binding = deriveGovernedNoteBinding(this.#connection, context, a.targetSessionId);
-    const target = governedNoteRecoveryProofTarget(prepared.request, context, binding, material.claims.capabilityGeneration, a.proof.proofNonce);
+    const target = prepared.request.version === 2 ? governedNoteRecoveryProofTargetV2(prepared.request, context, binding, material.claims.capabilityGeneration, a.proof.proofNonce) : governedNoteRecoveryProofTarget(prepared.request, context, binding, material.claims.capabilityGeneration, a.proof.proofNonce);
     for (const field of ["presentingActorRole", "presentingClientInstanceId", "targetActorRole", "targetClientInstanceId"] as const) {
       if (a.audience[field] !== target[field]) refuse("SESSION_OWNERSHIP_MISMATCH");
     }
@@ -193,6 +219,27 @@ export class GovernedNoteAuthorityVerifier {
     return safe(() => {
       if (prepared.authorization.authoritySessionId !== prepared.authorization.targetSessionId) refuse("SESSION_OWNERSHIP_MISMATCH");
       const owned = decodePreparedGovernedNoteRecoveryV1(encodePreparedGovernedNoteRecoveryV1(prepared));
+      const ownedContext = boundedRetainedJson(context, 8192).snapshot as unknown as ProjectContext;
+      const inspected = this.inspectRecovery(owned, ownedContext), handle = Object.freeze(Object.create(null)) as VerifiedGovernedNoteRecoveryAuthority;
+      recoveries.set(handle, { connection: this.#connection, verifier: this, prepared: owned, context: ownedContext, canonical: canonicalJson(owned.request), operation: "recover-governed-note-result", ...inspected });
+      return handle;
+    });
+  }
+  verifyCreateV2(prepared: PreparedGovernedNoteCreateV2, context: ProjectContext): VerifiedGovernedNoteCreateAuthority {
+    return safe(() => {
+      // Reject broader retained authority before decoding or verifying its proof.
+      if (prepared.authorization.authoritySessionId !== prepared.authorization.targetSessionId) refuse("SESSION_OWNERSHIP_MISMATCH");
+      const owned = decodePreparedGovernedNoteCreateV2(encodePreparedGovernedNoteCreateV2(prepared));
+      const ownedContext = boundedRetainedJson(context, 8192).snapshot as unknown as ProjectContext;
+      const inspected = this.inspectCreate(owned, ownedContext), handle = Object.freeze(Object.create(null)) as VerifiedGovernedNoteCreateAuthority;
+      creates.set(handle, { connection: this.#connection, verifier: this, prepared: owned, context: ownedContext, canonical: canonicalJson(owned.command), operation: "create-governed-note", ...inspected });
+      return handle;
+    });
+  }
+  verifyRecoveryV2(prepared: PreparedGovernedNoteRecoveryV2, context: ProjectContext): VerifiedGovernedNoteRecoveryAuthority {
+    return safe(() => {
+      if (prepared.authorization.authoritySessionId !== prepared.authorization.targetSessionId) refuse("SESSION_OWNERSHIP_MISMATCH");
+      const owned = decodePreparedGovernedNoteRecoveryV2(encodePreparedGovernedNoteRecoveryV2(prepared));
       const ownedContext = boundedRetainedJson(context, 8192).snapshot as unknown as ProjectContext;
       const inspected = this.inspectRecovery(owned, ownedContext), handle = Object.freeze(Object.create(null)) as VerifiedGovernedNoteRecoveryAuthority;
       recoveries.set(handle, { connection: this.#connection, verifier: this, prepared: owned, context: ownedContext, canonical: canonicalJson(owned.request), operation: "recover-governed-note-result", ...inspected });
@@ -243,7 +290,19 @@ export class GovernedNoteAuthorityVerifier {
 export function requireGovernedNoteCreateAuthority(connection: SqliteConnection, handle: VerifiedGovernedNoteCreateAuthority, command: GovernedNoteCommandV1, expectedBinding?: ProjectBinding): GovernedNoteAuthoritySnapshotV1 {
   return safe(() => {
     const state = creates.get(handle);
-    if (!state || state.connection !== connection || state.operation !== "create-governed-note" || canonicalJson(decodeGovernedNoteCommandV1(command)) !== state.canonical) return refuse();
+    if (!state || state.connection !== connection || state.operation !== "create-governed-note" || state.prepared.command.version !== 1 || canonicalJson(decodeGovernedNoteCommandV1(command)) !== state.canonical) return refuse();
+    const snapshot = state.verifier.revalidateCreate(handle);
+    // The expected value is only an assertion: authority comes from the owned,
+    // revalidated binding captured with this exact handle and original command.
+    if (expectedBinding !== undefined && canonicalJson(expectedBinding) !== canonicalJson(state.binding)) refuse("SESSION_OWNERSHIP_MISMATCH");
+    return snapshot;
+  });
+}
+
+export function requireGovernedNoteCreateAuthorityV2(connection: SqliteConnection, handle: VerifiedGovernedNoteCreateAuthority, command: GovernedNoteCommandV2, expectedBinding?: ProjectBinding): GovernedNoteAuthoritySnapshotV1 {
+  return safe(() => {
+    const state = creates.get(handle);
+    if (!state || state.connection !== connection || state.operation !== "create-governed-note" || state.prepared.command.version !== 2 || canonicalJson(decodeGovernedNoteCommandV2(command)) !== state.canonical) return refuse();
     const snapshot = state.verifier.revalidateCreate(handle);
     // The expected value is only an assertion: authority comes from the owned,
     // revalidated binding captured with this exact handle and original command.
