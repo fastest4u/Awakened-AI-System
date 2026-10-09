@@ -4,6 +4,7 @@ import { lstatSync, readFileSync, readdirSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { performance } from 'node:perf_hooks';
 import { StringDecoder } from 'node:string_decoder';
+import { types } from 'node:util';
 import { fileURLToPath } from 'node:url';
 import { runFixedStages } from './run-v2-internal-verified-read.js';
 import { parseFinalSpecCounts } from './run-v2-retained-evidence.js';
@@ -67,7 +68,7 @@ function productPaths(root) {
   }
   return paths.sort();
 }
-function sourceIdentity(root) {
+function sourceIdentity(root, observeInputs) {
   const candidate = git(root, ['rev-parse', 'HEAD']).trim();
   if (!/^[a-f0-9]{40}$/.test(candidate)) throw new Error(failure);
   const selectors = ['src', 'tests', 'scripts', 'package.json', 'package-lock.json', 'tsconfig*.json'];
@@ -93,6 +94,7 @@ function sourceIdentity(root) {
   const inputs = committed.map(entry => ({ ...entry, sha256: sha(bytes(root, entry.path)) }));
   const filtered = git(root, ['hash-object', '--stdin-paths'], committed.map(entry => entry.path).join('\n') + '\n').trim().split(/\r?\n/);
   if (!equal(filtered, committed.map(entry => entry.oid))) throw new Error(failure);
+  observeInputs?.(inputs);
   return { candidate, sourceSha256: sha(canonical(inputs)), sourceFiles: inputs.length, productFiles: paths.length };
 }
 function artifacts(root) {
@@ -149,6 +151,158 @@ function compiledIdentity(root) {
 }
 
 
+
+// Fixed source identities bind diagnostic ordinals, never the textual producer.
+const failureMappings = {
+  "v2-governed-note-entry": {
+    "source": "tests/v2-governed-note-entry.test.ts",
+    "sha256": "f694910b699bbdd48fc678451530e734e410f3e9b3d588680bb3ad2ff2b3cf94",
+    "titles": [
+      "closed fixture actions admit a bounded owned clock snapshot without invoking accessors",
+      "bootstrap proof mint and mutation use one controlled local worker owner",
+      "failed read rollback terminalizes the same native owner before queued admission",
+      "positive read rollback keeps the same native owner reusable",
+      "own child uses current same-session authority and retained-only provenance",
+      "normal reopen preserves provider history and status and historical note replay",
+      "lost downstream CLIENT result and revoked source key retain healthy receipt-only recovery",
+      "delayed committed delivery after worker authorization expiry",
+      "delayed not-found delivery after worker authorization expiry",
+      "detach at expiry refuses committed receipt without renewal",
+      "detach at expiry refuses absence without renewal",
+      "current capability refusal is independent of valid active recovery admission",
+      "injected actual command-recovery guard independently withholds committed and absent results",
+      "missing optional fixture factory refuses safe and closes its initialized owner",
+      "private malformed-control makes healthy executor controller permanently uncertain",
+      "private timeout-control makes healthy executor controller permanently uncertain",
+      "private action-outcome-unknown makes healthy executor controller permanently uncertain",
+      "initialized activation opt-in refuses missing identity/installation and stale or nonprepared state while default stays bare-store",
+      "bounded provisioning and nested action discrimination reject proxies without executing traps",
+      "exclusive fixture action excludes create/recovery/close through acknowledged disposition",
+      "worker-local provider exception markers never enter safe errors or durable diagnostics",
+      "expiry before lookup withholds receipt",
+      "expiry before lookup withholds absence",
+      "injected failed read COMMIT withholds detached receipt",
+      "injected failed read COMMIT withholds detached absence",
+      "missing historical note commitment key refuses create replay while receipt recovery remains available"
+    ]
+  },
+  "v2-governed-note-ownership": {
+    "source": "tests/v2-governed-note-ownership.test.ts",
+    "sha256": "feab26c807734d07c0c3b904f1951c3c97bdbd71e64f7defbb1e326295064df7",
+    "titles": [
+      "governed identity worker selection refuses missing or mismatched current artifacts",
+      "mandatory timing rejects before allocation or owner side effects",
+      "fresh allocation is opaque, contained, and cannot attach a prior directory",
+      "open reserves synchronously before construction and rejects reentrant duplicate open",
+      "active create makes recovery busy and recovery holds exclusive admission through disposition",
+      "normal release alone permits same-run reopen with new generation and invalidates old permit",
+      "identical unavailable error is definitive only on a still healthy owner",
+      "false, throwing and malformed health fail closed before dispatch",
+      "independent health failure at success disposition poisons and late receipt cannot heal",
+      "intentional DRAINING allows admitted creates to settle while rejecting ingress",
+      "queue-full is definitive while protocol, unknown outcome and forced close are absorbing",
+      "malformed and mismatched results or errors never release recovery admission",
+      "constructor, open and reopen uncertainty use empty details and never replace again",
+      "directory and initialized file replacement or hardlinks deny construction",
+      "symlink parents, alias spelling and setup failure never mint an attachable fixture",
+      "returned escaped routes and replacement across async initialization are refused",
+      "exclusive mkdir collision preserves existing contents without initializing or retrying",
+      "invalid inputs and cross-run permits post nothing and do not consume admission",
+      "malformed create scope, ID and envelope disqualify the owner",
+      "R and C integer endpoints use injected scheduler observations without native waiting",
+      "replacement during the first native spelling observation refuses before initializer"
+    ]
+  }
+};
+
+const metadataLimit = 16 * 1024 * 1024;
+const metadataKeys = ['tests', 'suites', 'pass', 'fail', 'cancelled', 'skipped', 'todo'];
+const metadataResult = (reason, status = 'unavailable', candidateOrdinals = []) => ({ version: 1,
+  origin: 'stock-spec-text', authenticity: 'unverified-text', status, candidateOrdinals, reason, phase: 'unavailable' });
+function metadataData(value, key) {
+  if (!value || typeof value !== 'object' || types.isProxy(value)) return undefined;
+  const descriptor = Object.getOwnPropertyDescriptor(value, key);
+  return descriptor && Object.hasOwn(descriptor, 'value') ? descriptor.value : undefined;
+}
+/** Pure internal diagnostic seam. A stock-text candidate is never an authenticated test event. */
+export function deriveStockSpecFailureCandidates(stage, stdout, counts, options) {
+  try {
+    const mapping = typeof stage === 'string' && Object.hasOwn(failureMappings, stage) ? failureMappings[stage] : undefined;
+    if (!mapping) return metadataResult('unknown-stage');
+    if (metadataData(options, 'mappingBound') !== true) return metadataResult('mapping-unavailable');
+    if (metadataData(options, 'outputOverflow') !== false || typeof stdout !== 'string'
+      || stdout.length > metadataLimit || Buffer.byteLength(stdout) > metadataLimit) return metadataResult('overflow');
+    if (/[\x00-\x09\x0b\x0c\x0e-\x1f\x7f]|\r(?!\n)/.test(stdout)) return metadataResult('ansi-or-control');
+    const values = metadataKeys.map(key => metadataData(counts, key));
+    const nativeCode = metadataData(options, 'nativeCode'), own = stage === 'v2-governed-note-ownership';
+    if (!values.every(n => Number.isSafeInteger(n) && n >= 0 && n <= 26)
+      || values[0] !== mapping.titles.length || values[1] !== (own ? 3 : 0)
+      || values[2] + values[3] !== values[0] || values[3] < 1 || values.slice(4).some(n => n !== 0)
+      || !Number.isSafeInteger(nativeCode) || nativeCode < 1 || nativeCode > 0xffffffff) return metadataResult('summary-mismatch');
+    if (!stdout.endsWith('\n')) return metadataResult('missing-footer');
+    const expected = [];
+    const outcome = (name, nesting, ordinal, first, last) => expected.push({ name, nesting, ordinal, first, last });
+    if (own) expected.push({ name: 'governed note ownership', nesting: 0, arrow: true }, { name: 'independent ownership controls', nesting: 1, arrow: true });
+    mapping.titles.forEach((name, index) => {
+      const ordinal = index + 1;
+      outcome(name, own ? (ordinal === 17 || ordinal === 21 ? 1 : 2) : 0, ordinal);
+      if (own && ordinal === 16) outcome('independent ownership controls', 1, undefined, 1, 16);
+      if (own && ordinal === 17) expected.push({ name: 'independent admission controls', nesting: 1, arrow: true });
+      if (own && ordinal === 20) outcome('independent admission controls', 1, undefined, 18, 20);
+    });
+    if (own) outcome('governed note ownership', 0, undefined, 1, 21);
+    const candidates = [], seen = new Set(); let position = 0, summary = -1, suffix = 0;
+    for (let offset = 0; offset < stdout.length;) {
+      const end = stdout.indexOf('\n', offset);
+      if (end < 0) return metadataResult('missing-footer');
+      const stop = end > offset && stdout[end - 1] === '\r' ? end - 1 : end;
+      // Only bounded line prefixes are inspected; arbitrary long bodies are not copied.
+      const line = stdout.slice(offset, Math.min(stop, offset + 1025)), long = stop - offset > 1024;
+      offset = end + 1;
+      const summaryLine = /^ℹ (?:tests|suites|pass|fail|cancelled|skipped|todo|duration_ms)(?: |$)/.test(line);
+      if (summary === 8) {
+        if (summaryLine) return metadataResult('duplicate-footer', 'ambiguous');
+        if (suffix === 0 && line !== '' || suffix === 1 && line !== '✖ failing tests:'
+          || suffix === 2 && line !== '' || suffix === 3 && !line.startsWith('test at ')) return metadataResult('summary-mismatch');
+        suffix++; continue; // Never parse errors, paths, or repeated failure titles.
+      }
+      if (summaryLine || summary >= 0) {
+        if (position !== expected.length || long) return metadataResult('incomplete-inventory');
+        if (summary === -1) summary = 0;
+        if (summary < 7) {
+          if (line !== 'ℹ ' + metadataKeys[summary] + ' ' + values[summary]) return metadataResult('summary-mismatch');
+        } else {
+          const duration = /^ℹ duration_ms ((?:0|[1-9]\d*)(?:\.\d+)?)$/.exec(line);
+          if (!duration || !Number.isFinite(Number(duration[1])) || Number(duration[1]) > 900000) return metadataResult('summary-mismatch');
+        }
+        summary++; continue;
+      }
+      const row = /^( *)([✔✖▶]) (.*)$/.exec(line);
+      if (!row) continue; // Stock spec also forwards arbitrary text; it confers no authority.
+      if (long) return metadataResult('unknown-row');
+      const wanted = expected[position], arrow = row[2] === '▶';
+      let name = row[3];
+      if (!arrow) {
+        const duration = / \(((?:0|[1-9]\d*)(?:\.\d+)?)ms\)$/.exec(name);
+        if (duration) {
+          if (!Number.isFinite(Number(duration[1])) || Number(duration[1]) > 900000) return metadataResult('unknown-row');
+          name = name.slice(0, -duration[0].length);
+        }
+      }
+      const key = (arrow ? 'arrow:' : 'outcome:') + name;
+      if (seen.has(key)) return metadataResult('duplicate-row', 'ambiguous');
+      if (!wanted || name !== wanted.name) return metadataResult('unknown-row');
+      if (row[1].length !== wanted.nesting * 2 || arrow !== Boolean(wanted.arrow)) return metadataResult('order-mismatch');
+      seen.add(key); position++;
+      if (!arrow && wanted.ordinal) { if (row[2] === '✖') candidates.push(wanted.ordinal); }
+      else if (!arrow && (row[2] === '✖') !== candidates.some(n => n >= wanted.first && n <= wanted.last)) return metadataResult('suite-mismatch');
+    }
+    if (summary !== 8 || suffix > 0 && suffix < 4) return metadataResult('missing-footer');
+    if (candidates.length !== values[3]) return metadataResult('summary-mismatch');
+    return metadataResult('consistent-allowlisted-text', 'candidate', candidates);
+  } catch { return metadataResult('malformed-input'); }
+}
+
 const profile = 'governed-summary-commands', gate = 'v2-governed-summary-commands', maximumMs = 900000;
 const dispositions = new WeakMap();
 function refusal(code = 1) {
@@ -174,7 +328,7 @@ function skipIdentities(stage, counts) {
 async function runGate({ root = repository, timeoutMs = maximumMs, signal } = {}) {
   const arrival = performance.now(), deadline = arrival + timeoutMs;
   let boundFailure, identity, runtimeSha256, measurement, compiledMeasurement, qualification, ownedLock;
-  const receipts = [], streams = new Map();
+  const receipts = [], streams = new Map(), mappingBindings = new Map();
   const assertWithinBound = () => {
     if (signal?.aborted || performance.now() >= deadline) {
       boundFailure = signal?.aborted ? 130 : 124; throw refusal(boundFailure);
@@ -204,7 +358,9 @@ async function runGate({ root = repository, timeoutMs = maximumMs, signal } = {}
       ['fresh-start-smoke', [join(currentRoot, 'scripts/smoke-v2-fresh-start.js')]]],
     beforeStages(currentRoot) {
       root = currentRoot; assertOwnedLock(currentRoot);
-      identity = sourceIdentity(currentRoot); runtimeSha256 = sha(readFileSync(process.execPath));
+      identity = sourceIdentity(currentRoot, inputs => {
+        for (const [stage, mapping] of Object.entries(failureMappings)) mappingBindings.set(stage, inputs.some(input => input.path === mapping.source && input.sha256 === mapping.sha256));
+      }); runtimeSha256 = sha(readFileSync(process.execPath));
       assertWithinBound(); emit({ observation: 'candidate', ...identity, runtimeSha256 });
     },
     observeOutput(stage, kind, value) {
@@ -220,7 +376,9 @@ async function runGate({ root = repository, timeoutMs = maximumMs, signal } = {}
       const isTest = names.includes(receipt.stage), counts = isTest ? parseFinalSpecCounts(stream.stdout) : null;
       const validCounts = !isTest || Number.isSafeInteger(counts.tests) && counts.tests > 0 && counts.fail === 0
         && counts.cancelled === 0 && counts.todo === 0 && counts.pass + counts.skipped === counts.tests;
-      const observed = { ...receipt, counts, outputBytes: stream.bytes, outputSha256: stream.hash.digest('hex'), outputOverflow: stream.overflow };
+      const failureMetadata = Object.hasOwn(failureMappings, receipt.stage) && (receipt.nativeCode !== undefined && receipt.nativeCode !== 0 || counts?.fail > 0)
+        ? deriveStockSpecFailureCandidates(receipt.stage, stream.stdout, counts, { nativeCode: receipt.nativeCode, outputOverflow: stream.overflow, mappingBound: mappingBindings.get(receipt.stage) }) : undefined;
+      const observed = { ...receipt, counts, outputBytes: stream.bytes, outputSha256: stream.hash.digest('hex'), outputOverflow: stream.overflow, ...(failureMetadata ? { failureMetadata } : {}) };
       receipts.push(observed); emit(observed); stream.stdout = ''; streams.delete(receipt.stage);
       if (receipt.code !== 0) return; // preserve native nonzero; never qualify it
       if (receipt.stage !== expectedStages[receipts.length - 1] || receipt.nativeCode !== 0

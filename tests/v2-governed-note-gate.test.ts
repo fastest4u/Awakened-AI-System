@@ -824,9 +824,543 @@ test('runtime executable raw identity change refuses before typecheck', { timeou
     finally { (fs as any).readFileSync = original; syncBuiltinESMExports(); }
 });
 
+
+// Ruling15: finite diagnostic text hints; never test-event authentication.
+const metadataTitles: Record<string, string[]> = {
+  "v2-governed-note-entry": [
+    "closed fixture actions admit a bounded owned clock snapshot without invoking accessors",
+    "bootstrap proof mint and mutation use one controlled local worker owner",
+    "failed read rollback terminalizes the same native owner before queued admission",
+    "positive read rollback keeps the same native owner reusable",
+    "own child uses current same-session authority and retained-only provenance",
+    "normal reopen preserves provider history and status and historical note replay",
+    "lost downstream CLIENT result and revoked source key retain healthy receipt-only recovery",
+    "delayed committed delivery after worker authorization expiry",
+    "delayed not-found delivery after worker authorization expiry",
+    "detach at expiry refuses committed receipt without renewal",
+    "detach at expiry refuses absence without renewal",
+    "current capability refusal is independent of valid active recovery admission",
+    "injected actual command-recovery guard independently withholds committed and absent results",
+    "missing optional fixture factory refuses safe and closes its initialized owner",
+    "private malformed-control makes healthy executor controller permanently uncertain",
+    "private timeout-control makes healthy executor controller permanently uncertain",
+    "private action-outcome-unknown makes healthy executor controller permanently uncertain",
+    "initialized activation opt-in refuses missing identity/installation and stale or nonprepared state while default stays bare-store",
+    "bounded provisioning and nested action discrimination reject proxies without executing traps",
+    "exclusive fixture action excludes create/recovery/close through acknowledged disposition",
+    "worker-local provider exception markers never enter safe errors or durable diagnostics",
+    "expiry before lookup withholds receipt",
+    "expiry before lookup withholds absence",
+    "injected failed read COMMIT withholds detached receipt",
+    "injected failed read COMMIT withholds detached absence",
+    "missing historical note commitment key refuses create replay while receipt recovery remains available"
+  ],
+  "v2-governed-note-ownership": [
+    "governed identity worker selection refuses missing or mismatched current artifacts",
+    "mandatory timing rejects before allocation or owner side effects",
+    "fresh allocation is opaque, contained, and cannot attach a prior directory",
+    "open reserves synchronously before construction and rejects reentrant duplicate open",
+    "active create makes recovery busy and recovery holds exclusive admission through disposition",
+    "normal release alone permits same-run reopen with new generation and invalidates old permit",
+    "identical unavailable error is definitive only on a still healthy owner",
+    "false, throwing and malformed health fail closed before dispatch",
+    "independent health failure at success disposition poisons and late receipt cannot heal",
+    "intentional DRAINING allows admitted creates to settle while rejecting ingress",
+    "queue-full is definitive while protocol, unknown outcome and forced close are absorbing",
+    "malformed and mismatched results or errors never release recovery admission",
+    "constructor, open and reopen uncertainty use empty details and never replace again",
+    "directory and initialized file replacement or hardlinks deny construction",
+    "symlink parents, alias spelling and setup failure never mint an attachable fixture",
+    "returned escaped routes and replacement across async initialization are refused",
+    "exclusive mkdir collision preserves existing contents without initializing or retrying",
+    "invalid inputs and cross-run permits post nothing and do not consume admission",
+    "malformed create scope, ID and envelope disqualify the owner",
+    "R and C integer endpoints use injected scheduler observations without native waiting",
+    "replacement during the first native spelling observation refuses before initializer"
+  ]
+};
+const metadataRegistrations = {
+  "v2-governed-note-entry": [
+    {
+      "kind": "test",
+      "name": "closed fixture actions admit a bounded owned clock snapshot without invoking accessors",
+      "options": null,
+      "nesting": 0
+    },
+    {
+      "kind": "test",
+      "name": "bootstrap proof mint and mutation use one controlled local worker owner",
+      "options": "{timeout:120000}",
+      "nesting": 0
+    },
+    {
+      "kind": "test",
+      "name": "failed read rollback terminalizes the same native owner before queued admission",
+      "options": "{timeout:120000}",
+      "nesting": 0
+    },
+    {
+      "kind": "test",
+      "name": "positive read rollback keeps the same native owner reusable",
+      "options": "{timeout:120000}",
+      "nesting": 0
+    },
+    {
+      "kind": "test",
+      "name": "own child uses current same-session authority and retained-only provenance",
+      "options": "{timeout:120000}",
+      "nesting": 0
+    },
+    {
+      "kind": "test",
+      "name": "normal reopen preserves provider history and status and historical note replay",
+      "options": "{timeout:120000}",
+      "nesting": 0
+    },
+    {
+      "kind": "test",
+      "name": "lost downstream CLIENT result and revoked source key retain healthy receipt-only recovery",
+      "options": "{timeout:120000}",
+      "nesting": 0
+    },
+    {
+      "kind": "test",
+      "name": "delayed committed delivery after worker authorization expiry",
+      "options": "{timeout:120000}",
+      "nesting": 0
+    },
+    {
+      "kind": "test",
+      "name": "delayed not-found delivery after worker authorization expiry",
+      "options": "{timeout:120000}",
+      "nesting": 0
+    },
+    {
+      "kind": "test",
+      "name": "detach at expiry refuses committed receipt without renewal",
+      "options": "{timeout:120000}",
+      "nesting": 0
+    },
+    {
+      "kind": "test",
+      "name": "detach at expiry refuses absence without renewal",
+      "options": "{timeout:120000}",
+      "nesting": 0
+    },
+    {
+      "kind": "test",
+      "name": "current capability refusal is independent of valid active recovery admission",
+      "options": "{timeout:120000}",
+      "nesting": 0
+    },
+    {
+      "kind": "test",
+      "name": "injected actual command-recovery guard independently withholds committed and absent results",
+      "options": "{timeout:120000}",
+      "nesting": 0
+    },
+    {
+      "kind": "test",
+      "name": "missing optional fixture factory refuses safe and closes its initialized owner",
+      "options": "{timeout:120000}",
+      "nesting": 0
+    },
+    {
+      "kind": "test",
+      "name": "private malformed-control makes healthy executor controller permanently uncertain",
+      "options": "{timeout:120000}",
+      "nesting": 0
+    },
+    {
+      "kind": "test",
+      "name": "private timeout-control makes healthy executor controller permanently uncertain",
+      "options": "{timeout:120000}",
+      "nesting": 0
+    },
+    {
+      "kind": "test",
+      "name": "private action-outcome-unknown makes healthy executor controller permanently uncertain",
+      "options": "{timeout:120000}",
+      "nesting": 0
+    },
+    {
+      "kind": "test",
+      "name": "initialized activation opt-in refuses missing identity/installation and stale or nonprepared state while default stays bare-store",
+      "options": null,
+      "nesting": 0
+    },
+    {
+      "kind": "test",
+      "name": "bounded provisioning and nested action discrimination reject proxies without executing traps",
+      "options": null,
+      "nesting": 0
+    },
+    {
+      "kind": "test",
+      "name": "exclusive fixture action excludes create/recovery/close through acknowledged disposition",
+      "options": "{timeout:120000}",
+      "nesting": 0
+    },
+    {
+      "kind": "test",
+      "name": "worker-local provider exception markers never enter safe errors or durable diagnostics",
+      "options": "{timeout:120000}",
+      "nesting": 0
+    },
+    {
+      "kind": "test",
+      "name": "expiry before lookup withholds receipt",
+      "options": "{timeout:120000}",
+      "nesting": 0
+    },
+    {
+      "kind": "test",
+      "name": "expiry before lookup withholds absence",
+      "options": "{timeout:120000}",
+      "nesting": 0
+    },
+    {
+      "kind": "test",
+      "name": "injected failed read COMMIT withholds detached receipt",
+      "options": "{timeout:120000}",
+      "nesting": 0
+    },
+    {
+      "kind": "test",
+      "name": "injected failed read COMMIT withholds detached absence",
+      "options": "{timeout:120000}",
+      "nesting": 0
+    },
+    {
+      "kind": "test",
+      "name": "missing historical note commitment key refuses create replay while receipt recovery remains available",
+      "options": "{timeout:120000}",
+      "nesting": 0
+    }
+  ],
+  "v2-governed-note-ownership": [
+    {
+      "kind": "describe",
+      "name": "governed note ownership",
+      "options": "{ concurrency: 1 }",
+      "nesting": 0
+    },
+    {
+      "kind": "describe",
+      "name": "independent ownership controls",
+      "options": "{ concurrency: 2 }",
+      "nesting": 1
+    },
+    {
+      "kind": "test",
+      "name": "governed identity worker selection refuses missing or mismatched current artifacts",
+      "options": null,
+      "nesting": 2
+    },
+    {
+      "kind": "test",
+      "name": "mandatory timing rejects before allocation or owner side effects",
+      "options": null,
+      "nesting": 2
+    },
+    {
+      "kind": "test",
+      "name": "fresh allocation is opaque, contained, and cannot attach a prior directory",
+      "options": "{timeout:20000}",
+      "nesting": 2
+    },
+    {
+      "kind": "test",
+      "name": "open reserves synchronously before construction and rejects reentrant duplicate open",
+      "options": "{timeout:20000}",
+      "nesting": 2
+    },
+    {
+      "kind": "test",
+      "name": "active create makes recovery busy and recovery holds exclusive admission through disposition",
+      "options": "{timeout:20000}",
+      "nesting": 2
+    },
+    {
+      "kind": "test",
+      "name": "normal release alone permits same-run reopen with new generation and invalidates old permit",
+      "options": "{timeout:20000}",
+      "nesting": 2
+    },
+    {
+      "kind": "test",
+      "name": "identical unavailable error is definitive only on a still healthy owner",
+      "options": "{timeout:60000}",
+      "nesting": 2
+    },
+    {
+      "kind": "test",
+      "name": "false, throwing and malformed health fail closed before dispatch",
+      "options": "{timeout:60000}",
+      "nesting": 2
+    },
+    {
+      "kind": "test",
+      "name": "independent health failure at success disposition poisons and late receipt cannot heal",
+      "options": "{timeout:20000}",
+      "nesting": 2
+    },
+    {
+      "kind": "test",
+      "name": "intentional DRAINING allows admitted creates to settle while rejecting ingress",
+      "options": "{timeout:20000}",
+      "nesting": 2
+    },
+    {
+      "kind": "test",
+      "name": "queue-full is definitive while protocol, unknown outcome and forced close are absorbing",
+      "options": "{timeout:60000}",
+      "nesting": 2
+    },
+    {
+      "kind": "test",
+      "name": "malformed and mismatched results or errors never release recovery admission",
+      "options": "{timeout:60000}",
+      "nesting": 2
+    },
+    {
+      "kind": "test",
+      "name": "constructor, open and reopen uncertainty use empty details and never replace again",
+      "options": "{timeout:60000}",
+      "nesting": 2
+    },
+    {
+      "kind": "test",
+      "name": "directory and initialized file replacement or hardlinks deny construction",
+      "options": "{timeout:60000}",
+      "nesting": 2
+    },
+    {
+      "kind": "test",
+      "name": "symlink parents, alias spelling and setup failure never mint an attachable fixture",
+      "options": "{timeout:20000}",
+      "nesting": 2
+    },
+    {
+      "kind": "test",
+      "name": "returned escaped routes and replacement across async initialization are refused",
+      "options": "{timeout:60000}",
+      "nesting": 2
+    },
+    {
+      "kind": "test",
+      "name": "exclusive mkdir collision preserves existing contents without initializing or retrying",
+      "options": null,
+      "nesting": 1
+    },
+    {
+      "kind": "describe",
+      "name": "independent admission controls",
+      "options": "{ concurrency: 2 }",
+      "nesting": 1
+    },
+    {
+      "kind": "test",
+      "name": "invalid inputs and cross-run permits post nothing and do not consume admission",
+      "options": "{timeout:20000}",
+      "nesting": 2
+    },
+    {
+      "kind": "test",
+      "name": "malformed create scope, ID and envelope disqualify the owner",
+      "options": "{timeout:60000}",
+      "nesting": 2
+    },
+    {
+      "kind": "test",
+      "name": "R and C integer endpoints use injected scheduler observations without native waiting",
+      "options": "{timeout:60000}",
+      "nesting": 2
+    },
+    {
+      "kind": "test",
+      "name": "replacement during the first native spelling observation refuses before initializer",
+      "options": null,
+      "nesting": 1
+    }
+  ]
+};
+
+function metadataTranscript(stage: string, failed: number[] = [3], eol = '\n') {
+    const titles = metadataTitles[stage], own = stage.endsWith('ownership');
+    const lines: string[] = [], fail = new Set(failed);
+    const row = (title: string, nesting: number, isFail: boolean) => lines.push('  '.repeat(nesting) + (isFail ? '✖ ' : '✔ ') + title + ' (1ms)');
+    if (own) lines.push('▶ governed note ownership', '  ▶ independent ownership controls');
+    titles.forEach((title, index) => {
+        const ordinal = index + 1; row(title, own ? (ordinal === 17 || ordinal === 21 ? 1 : 2) : 0, fail.has(ordinal));
+        if (own && ordinal === 16) row('independent ownership controls', 1, failed.some(x => x <= 16));
+        if (own && ordinal === 17) lines.push('  ▶ independent admission controls');
+        if (own && ordinal === 20) row('independent admission controls', 1, failed.some(x => x >= 18 && x <= 20));
+    });
+    if (own) row('governed note ownership', 0, failed.length > 0);
+    const counts = { tests: titles.length, suites: own ? 3 : 0, pass: titles.length - failed.length, fail: failed.length, cancelled: 0, skipped: 0, todo: 0 };
+    lines.push(...Object.entries({ ...counts, duration_ms: 1 }).map(([k, v]) => 'ℹ ' + k + ' ' + v));
+    return { text: lines.join(eol) + eol, counts };
+}
+async function metadataParser(): Promise<any> {
+    return (await import(new URL('../../scripts/run-v2-governed-summary-commands.js', import.meta.url).href)).deriveStockSpecFailureCandidates;
+}
+function metadataOptions() { return { nativeCode: 1, outputOverflow: false, mappingBound: true }; }
+function assertMetadataPrivacy(value: any) {
+    assert.deepEqual(Object.keys(value).sort(), ['version', 'origin', 'authenticity', 'status', 'candidateOrdinals', 'reason', 'phase'].sort());
+    assert.equal(value.version, 1); assert.equal(value.origin, 'stock-spec-text'); assert.equal(value.authenticity, 'unverified-text');
+    assert.equal(value.phase, 'unavailable'); assert.ok(Buffer.byteLength(JSON.stringify(value)) <= 1024);
+    assert.doesNotMatch(JSON.stringify(value), /PRIVATE_METADATA|governed identity|fixture|provider|proof|stack/);
+}
+function registerFailureMetadataTests() {
+    nodeTest('failure metadata pure exact entry and nested ownership failures stay unverified', async () => {
+        const derive = await metadataParser();
+        for (const stage of Object.keys(metadataTitles)) for (const failed of [[3], [2, 18], [17, 21]]) {
+            const x = metadataTranscript(stage, failed), result = derive(stage, x.text, x.counts, metadataOptions());
+            assert.equal(result.status, 'candidate'); assert.deepEqual(result.candidateOrdinals, failed); assertMetadataPrivacy(result);
+        }
+    });
+    nodeTest('failure metadata pure final reprints CRLF and split Unicode never duplicate candidates', async () => {
+        const derive = await metadataParser(), { StringDecoder } = await import('node:string_decoder');
+        for (const stage of Object.keys(metadataTitles)) for (const eol of ['\n', '\r\n']) {
+            const x = metadataTranscript(stage, [3], eol), suffix = eol + '✖ failing tests:' + eol + eol + 'test at PRIVATE_METADATA_PATH:1:1' + eol + '✖ ' + metadataTitles[stage][2] + ' (1ms)' + eol + '  PRIVATE_METADATA_BODY' + eol;
+            const bytes = Buffer.from(x.text + suffix), decoder = new StringDecoder('utf8'); let text = '';
+            for (let i = 0; i < bytes.length; i += 2) text += decoder.write(bytes.subarray(i, i + 2)); text += decoder.end();
+            const result = derive(stage, text, x.counts, metadataOptions()); assert.equal(result.status, 'candidate'); assert.deepEqual(result.candidateOrdinals, [3]); assertMetadataPrivacy(result);
+        }
+    });
+    nodeTest('failure metadata pure duplicate unknown missing reordered suite and control rows refuse hints', async () => {
+        const derive = await metadataParser(), stage = 'v2-governed-note-ownership', x = metadataTranscript(stage), lines = x.text.split('\n');
+        const variants = [
+            lines.slice(0, 3).concat(lines[2], lines.slice(3)).join('\n'),
+            x.text.replace(metadataTitles[stage][0], 'PRIVATE_METADATA_UNKNOWN'),
+            lines.filter((_, i) => i !== 3).join('\n'),
+            lines.map((v, i) => i === 2 ? lines[3] : i === 3 ? lines[2] : v).join('\n'),
+            x.text.replace('  ✖ independent ownership controls', '  ✔ independent ownership controls'),
+            x.text.replace('  ▶ independent ownership controls', '  ▶ PRIVATE_METADATA_SUITE'),
+            x.text.replace('    ✔ ', '   ✔ '),
+            '\u001b[31m' + x.text, x.text.replace('(1ms)', '(NaNms)'), x.text.replace('(1ms)', '(Infinityms)'),
+            x.text.replace('(1ms)', '(1ms) # SKIP'), x.text.replace('\n', '\r'), x.text + '\u0000'
+        ];
+        for (const text of variants) { const result = derive(stage, text, x.counts, metadataOptions()); assert.notEqual(result.status, 'candidate'); assert.deepEqual(result.candidateOrdinals, []); assertMetadataPrivacy(result); }
+    });
+    nodeTest('failure metadata pure footer native mapping and overflow eligibility cannot manufacture failures', async () => {
+        const derive = await metadataParser(), stage = 'v2-governed-note-entry', x = metadataTranscript(stage);
+        const variants: [string, any, any][] = [
+            [x.text.trimEnd(), x.counts, metadataOptions()], [x.text, {}, metadataOptions()],
+            [x.text, { ...x.counts, fail: 2 }, metadataOptions()], [x.text, { ...x.counts, cancelled: 1 }, metadataOptions()],
+            [x.text, { ...x.counts, skipped: 1 }, metadataOptions()], [x.text, x.counts, { ...metadataOptions(), nativeCode: 0 }],
+            [x.text, x.counts, { ...metadataOptions(), mappingBound: false }], [x.text, x.counts, { ...metadataOptions(), outputOverflow: true }],
+            ['x'.repeat(16 * 1024 * 1024 + 1), x.counts, metadataOptions()],
+            [footer + x.text, x.counts, metadataOptions()], [x.text + 'ℹ tests broken\n', x.counts, metadataOptions()],
+            [x.text.replace('ℹ fail 1', 'ℹ fail 9007199254740992'), x.counts, metadataOptions()]
+        ];
+        for (const [text, counts, options] of variants) { const result = derive(stage, text, counts, options); assert.notEqual(result.status, 'candidate'); assertMetadataPrivacy(result); }
+        const pass = metadataTranscript(stage, []); assert.notEqual(derive(stage, pass.text, pass.counts, metadataOptions()).status, 'candidate');
+        assert.notEqual(derive('PRIVATE_METADATA_STAGE', x.text, x.counts, metadataOptions()).status, 'candidate');
+    });
+    nodeTest('failure metadata pure coherent injected transcript is a hint and cannot expose payloads', async () => {
+        const derive = await metadataParser(), stage = 'v2-governed-note-entry', x = metadataTranscript(stage);
+        const result = derive(stage, 'PRIVATE_METADATA_SECRET\n' + x.text, x.counts, metadataOptions());
+        assert.equal(result.status, 'candidate'); assert.deepEqual(result.candidateOrdinals, [3]); assertMetadataPrivacy(result);
+        let calls = 0; const accessor = { get fail() { calls++; throw new Error('PRIVATE_METADATA'); } };
+        const proxy = new Proxy({}, { get() { calls++; throw new Error('PRIVATE_METADATA'); }, getOwnPropertyDescriptor() { calls++; throw new Error('PRIVATE_METADATA'); } });
+        for (const input of [null, undefined, 1, [], accessor, proxy]) {
+            for (const result of [derive(stage, x.text, input, metadataOptions()), derive(stage, input, x.counts, metadataOptions()), derive(stage, x.text, x.counts, input)]) {
+                assert.notEqual(result.status, 'candidate'); assertMetadataPrivacy(result);
+            }
+        }
+        assert.equal(calls, 0);
+    });
+    nodeTest('failure metadata pure mapping follows exact original AST titles options nesting and source binding', async () => {
+        const ts = await import('typescript'), derive = await metadataParser();
+        for (const stage of Object.keys(metadataTitles)) {
+            const path = join(process.cwd(), 'tests', stage + '.test.ts'), source = readFileSync(path, 'utf8'), ast = ts.createSourceFile(path, source, ts.ScriptTarget.Latest, true);
+            const actual: { kind: string; name: string; options: string | null; nesting: number }[] = [];
+            let expandedLoops = 0;
+            function literal(node: import('typescript').Expression, environment: Map<string, unknown>): unknown {
+                if (ts.isAsExpression(node) || ts.isParenthesizedExpression(node)) return literal(node.expression, environment);
+                if (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)) return node.text;
+                if (node.kind === ts.SyntaxKind.TrueKeyword) return true;
+                if (node.kind === ts.SyntaxKind.FalseKeyword) return false;
+                if (ts.isIdentifier(node)) { assert.ok(environment.has(node.text)); return environment.get(node.text); }
+                if (ts.isArrayLiteralExpression(node)) { assert.ok(node.elements.length <= 3); return node.elements.map(x => literal(x as import('typescript').Expression, environment)); }
+                if (ts.isConditionalExpression(node)) {
+                    const value = literal(node.condition, environment); assert.equal(typeof value, 'boolean');
+                    return literal(value ? node.whenTrue : node.whenFalse, environment);
+                }
+                if (ts.isTemplateExpression(node)) return node.head.text + node.templateSpans.map(span => {
+                    const value = literal(span.expression, environment); assert.equal(typeof value, 'string'); return value + span.literal.text;
+                }).join('');
+                assert.fail('UNSUPPORTED_FIXED_REGISTRATION_EXPRESSION');
+            }
+            function containsRegistration(node: import('typescript').Node): boolean {
+                if (ts.isCallExpression(node) && ts.isIdentifier(node.expression) && ['test', 'describe'].includes(node.expression.text)) return true;
+                return ts.forEachChild(node, containsRegistration) === true;
+            }
+            function visit(node: import('typescript').Node, environment = new Map<string, unknown>(), nesting = 0) {
+                if (ts.isForOfStatement(node)) {
+                    if (!containsRegistration(node.statement)) return;
+                    assert.ok(ts.isVariableDeclarationList(node.initializer)); assert.equal(node.initializer.declarations.length, 1);
+                    const binding = node.initializer.declarations[0].name, values = literal(node.expression, environment);
+                    assert.ok(Array.isArray(values)); assert.ok(values.length >= 2 && values.length <= 3); expandedLoops++;
+                    for (const value of values) {
+                        const next = new Map(environment);
+                        if (ts.isIdentifier(binding)) next.set(binding.text, value);
+                        else {
+                            assert.ok(ts.isArrayBindingPattern(binding)); assert.ok(Array.isArray(value)); assert.equal(value.length, binding.elements.length);
+                            binding.elements.forEach((element, i) => { assert.ok(ts.isBindingElement(element) && ts.isIdentifier(element.name)); next.set(element.name.text, value[i]); });
+                        }
+                        visit(node.statement, next, nesting);
+                    }
+                    return;
+                }
+                if (ts.isCallExpression(node) && ts.isIdentifier(node.expression) && ['test', 'describe'].includes(node.expression.text)) {
+                    const name = literal(node.arguments[0], environment); assert.equal(typeof name, 'string');
+                    actual.push({ kind: node.expression.text, name: name as string, options: node.arguments.length === 3 ? node.arguments[1].getText(ast) : null, nesting });
+                    if (node.expression.text === 'describe') { const callback = node.arguments.at(-1)!; assert.ok(ts.isArrowFunction(callback)); visit(callback.body, environment, nesting + 1); }
+                    return; // Never traverse or execute test bodies.
+                }
+                ts.forEachChild(node, child => visit(child, environment, nesting));
+            }
+            visit(ast);
+            assert.equal(expandedLoops, stage.endsWith('entry') ? 5 : 0);
+            assert.equal(actual.filter(row => row.kind === 'test').length, stage.endsWith('entry') ? 26 : 21);
+            assert.equal(actual.filter(row => row.kind === 'describe').length, stage.endsWith('entry') ? 0 : 3);
+            assert.equal(metadataTitles[stage].length, stage.endsWith('entry') ? 26 : 21);
+            assert.deepEqual(actual, metadataRegistrations[stage as keyof typeof metadataRegistrations]);
+            assert.equal(createHash('sha256').update(readFileSync(path)).digest('hex'), stage.endsWith('entry')
+                ? 'f694910b699bbdd48fc678451530e734e410f3e9b3d588680bb3ad2ff2b3cf94'
+                : 'feab26c807734d07c0c3b904f1951c3c97bdbd71e64f7defbb1e326295064df7');
+            const x = metadataTranscript(stage); assert.equal(derive(stage, x.text, x.counts, metadataOptions()).status, 'candidate');
+            assert.equal(derive(stage, x.text, x.counts, { ...metadataOptions(), mappingBound: false }).reason, 'mapping-unavailable');
+        }
+    });
+}
+
+test('failure metadata native ownership prefix keeps genuine exit and closure independent of hints', { timeout: 180000 }, async t => {
+    const f = fixture(), stage = 'v2-governed-note-ownership';
+    for (const name of Object.keys(metadataTitles)) f.put('tests/' + name + '.test.ts', readFileSync(join(process.cwd(), 'tests', name + '.test.ts'), 'utf8'));
+    const leaf = (ordinal: number) => 'test(' + JSON.stringify(metadataTitles[stage][ordinal - 1]) + ',()=>{' + (ordinal === 3 ? "throw new Error('PRIVATE_METADATA_NATIVE_CANARY');" : '') + '});';
+    const code = record + "log('" + stage + "');import{test,describe}from'node:test';describe('governed note ownership',{concurrency:1},()=>{describe('independent ownership controls',{concurrency:2},()=>{" + Array.from({ length: 16 }, (_, i) => leaf(i + 1)).join('') + '});' + leaf(17) + "describe('independent admission controls',{concurrency:2},()=>{" + [18, 19, 20].map(leaf).join('') + '});' + leaf(21) + '});';
+    f.put('dist-test/tests/' + stage + '.test.js', code); f.commit(); refused(f, await f.run());
+    assert.deepEqual(f.trace(), ['runtime', 'typecheck', 'build', 'compile', ...names.slice(0, 9)]);
+    const receipts = f.events.filter(event => event.stage); assert.equal(receipts.length, 13); assert.equal(f.native.length, 13);
+    assert.ok(f.native.every(value => value.direct && value.closure && value.closure.activeProcesses === 0 && value.closed));
+    assert.ok(f.native.slice(0, 12).every(value => value.direct.nativeCode === 0 && value.closure.nativeCode === 0));
+    assert.equal(f.native[12].direct.nativeCode, 1); assert.equal(f.native[12].closure.nativeCode, 1);
+    const last = receipts.at(-1); assert.equal(last.code, 1); assert.equal(last.nativeCode, 1); assert.equal(last.cleanup, 'complete');
+    assert.deepEqual(last.counts, { tests: 21, suites: 3, pass: 20, fail: 1, cancelled: 0, skipped: 0, todo: 0 });
+    assert.equal(last.failureMetadata.status, 'candidate'); assert.deepEqual(last.failureMetadata.candidateOrdinals, [3]); assertMetadataPrivacy(last.failureMetadata);
+    assert.equal(receipts.filter(event => event.failureMetadata).length, 1); assert.doesNotMatch(JSON.stringify(f.events), /PRIVATE_METADATA_NATIVE_CANARY/);
+    assert.equal(existsSync(join(f.root, '.fresh-start-foundation.lock')), false);
+    t.diagnostic(JSON.stringify({ metadataIntegration: true, root: f.root, stages: receipts.map(value => ({ stage: value.stage, code: value.code, nativeCode: value.nativeCode, cleanup: value.cleanup, closure: value.closure })), failureMetadata: last.failureMetadata, native: f.native }));
+});
+
 if (isMainThread) {
     const uninstall = installInterruptRouting();
     after(() => { uninstall(); assert.equal(activePools.size, 0); });
+    registerFailureMetadataTests();
     registerIsolationGuards();
     describe('isolated governed controls', { concurrency: 2 }, () => {
         const pool = new ControlPool();
